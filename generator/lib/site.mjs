@@ -983,7 +983,7 @@ function updateSyncTimer() {
   if (!el) return;
   const now = new Date();
   const utcMin = now.getUTCMinutes();
-  if (utcMin === 17) {
+  if (utcMin === 0) {
     el.textContent = 'syncing…';
     el.style.color = 'var(--term-green)';
     return;
@@ -991,8 +991,8 @@ function updateSyncTimer() {
   el.style.color = 'var(--term-cyan)';
   const next = new Date(now);
   next.setUTCSeconds(0, 0);
-  if (utcMin >= 18) next.setUTCHours(next.getUTCHours() + 1);
-  next.setUTCMinutes(17);
+  next.setUTCHours(next.getUTCHours() + 1);
+  next.setUTCMinutes(0);
   const diffSec = Math.max(0, Math.floor((next.getTime() - now.getTime()) / 1000));
   const m = Math.floor(diffSec / 60);
   const s = diffSec % 60;
