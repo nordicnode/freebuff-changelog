@@ -1,4 +1,4 @@
-// generator/lib/llm.mjs — optional AI rewrite layer.
+// generator/lib/llm.mjs - optional AI rewrite layer.
 //
 // Deterministic analysis already produces accurate entries; this layer makes
 // them *readable*. It is strictly enrichment: per-commit results are cached in
@@ -134,7 +134,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         log(`LLM failed for ${e.sha.slice(0, 8)}: ${err.message}`)
         if (isTransientError(err)) {
           isOffline = true
-          log(`LLM endpoint appears offline (${err.message}) — skipping further attempts this run`)
+          log(`LLM endpoint appears offline (${err.message}): skipping further attempts this run`)
           break
         }
         cache[key] = { error: String(err.message).slice(0, 200) }

@@ -1,4 +1,4 @@
-// generator/test/analyze.test.mjs — unit tests for the pure extractors
+// generator/test/analyze.test.mjs - unit tests for the pure extractors
 // (node --test, zero dependencies).
 import test from 'node:test'
 import assert from 'node:assert/strict'

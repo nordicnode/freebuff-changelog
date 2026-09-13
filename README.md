@@ -1,4 +1,4 @@
-# Freebuff Changelog — unofficial changelog generator + static site
+# Freebuff Changelog - unofficial changelog generator + static site
 
 Tracks what actually ships in [CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff),
 a project whose public repo is a **mirror**: a bot pushes opaque
@@ -32,7 +32,7 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
 ```
 
 * `generate` runs hourly in GitHub Actions (`.github/workflows/changelog-sync.yml`)
-  and pushes updated `data/` back — that push triggers the Pages build.
+  and pushes updated `data/` back: that push triggers the Pages build.
 * `build` renders a **fully static site**: one inline stylesheet, zero client JS
   except the search page, system fonts, pre-rendered day/release/archive pages,
   RSS, sitemap, JSON API, `_headers` for edge caching.
@@ -65,7 +65,7 @@ strictly in the diff text:
 | `CHANGELOG_LLM_LIMIT` | max commits summarized per run (default 60) |
 
 AI-titled entries are badged `ai`. Without AI, or on API failure, the
-rule-based summary is used — the site never depends on the LLM.
+rule-based summary is used: the site never depends on the LLM.
 
 ## Deploy on Cloudflare Pages (free)
 
@@ -74,7 +74,7 @@ rule-based summary is used — the site never depends on the LLM.
    output dir `dist`.
 3. Set the final URL as `SITE_URL` in the workflow env (for absolute links,
    RSS, sitemap) or edit `SITE.url` in `generator/lib/site.mjs`.
-4. Enable Actions workflows. Done — site self-updates hourly.
+4. Enable Actions workflows. Done: site self-updates hourly.
 
 ## Site output
 

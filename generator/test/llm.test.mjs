@@ -1,4 +1,4 @@
-// generator/test/llm.test.mjs — tests for the LLM enrichment module
+// generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { parseLlmJson, buildPrompt, enrichWithLlm, llmConfigured } from '../lib/llm.mjs'

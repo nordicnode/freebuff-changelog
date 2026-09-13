@@ -1,4 +1,4 @@
-// generator/test/site.test.mjs — tests for the static site generator
+// generator/test/site.test.mjs - tests for the static site generator
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'

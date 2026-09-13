@@ -1,4 +1,4 @@
-// generator/cli.mjs — entrypoint: generate (analyze upstream → data/) and
+// generator/cli.mjs - entrypoint: generate (analyze upstream -> data/) and
 // build (data/ → dist/ static site).
 //
 //   node generator/cli.mjs generate [--repo URL] [--full]
@@ -96,7 +96,7 @@ async function cmdGenerate (argv) {
     log(`incremental: commits after ${state.lastSha.slice(0, 8)}`)
     commits = await listCommitsRange(REPO_DIR, state.lastSha)
   } else {
-    log(state.lastSha && !isAncestor ? 'history rewritten — full rescan' : 'full scan')
+    log(state.lastSha && !isAncestor ? 'history rewritten: full rescan' : 'full scan')
     commits = await listCommits(REPO_DIR)
   }
 
@@ -219,7 +219,7 @@ async function cmdCatchUp (argv) {
   const existing = await readJson(`${DATA}/changelog.json`, { version: 1, entries: [] })
   let entries = existing.entries || []
   if (!entries.length) {
-    log('no entries found — running generate first')
+    log('no entries found: running generate first')
     await cmdGenerate(argv)
     return
   }
@@ -270,9 +270,9 @@ async function cmdCatchUp (argv) {
       const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 16)
       await git(['commit', '-m', `data: LLM backfill (${nowUtc} UTC)`], ROOT)
       await git(['push', 'origin', currentBranch], ROOT)
-      log('pushed to origin — Cloudflare Pages will deploy automatically.')
+      log('pushed to origin: Cloudflare Pages will deploy automatically.')
     } else {
-      log('data is already up to date — nothing to push.')
+      log('data is already up to date: nothing to push.')
     }
   }
 }
@@ -302,7 +302,7 @@ async function cmdWatch (argv) {
 
 async function cmdBuild () {
   const changelog = await readJson(`${DATA}/changelog.json`, null)
-  if (!changelog) throw new Error('data/changelog.json missing — run generate first')
+  if (!changelog) throw new Error('data/changelog.json missing: run generate first')
   const aiCache = await readJson(`${DATA}/ai-summaries.json`, {})
   if (Object.keys(aiCache).length) {
     const aiBySha = new Map()

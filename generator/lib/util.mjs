@@ -1,4 +1,4 @@
-// generator/lib/util.mjs — small shared helpers, zero dependencies.
+// generator/lib/util.mjs - small shared helpers, zero dependencies.
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'

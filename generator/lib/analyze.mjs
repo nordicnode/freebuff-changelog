@@ -1,4 +1,4 @@
-// generator/lib/analyze.mjs — turns freebuff git history into changelog entries.
+// generator/lib/analyze.mjs - turns freebuff git history into changelog entries.
 //
 // The public repo CodebuffAI/freebuff is a mirror: a bot pushes "Sync public
 // snapshot from freebuff-private" commits whose diffs each contain one real
@@ -102,7 +102,7 @@ export async function extractCleanDiff (repoDir, base, head, maxBytes = 48000) {
   ]
   const out = await git(args, repoDir)
   if (!out) return ''
-  return out.length > maxBytes ? out.slice(0, maxBytes) + '\n\n… [diff truncated — view full diff on GitHub] …\n' : out
+  return out.length > maxBytes ? out.slice(0, maxBytes) + '\n\n… [diff truncated: view full diff on GitHub] …\n' : out
 }
 
 // ---------------------------------------------------------------------------
