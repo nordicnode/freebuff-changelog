@@ -127,16 +127,33 @@ test('buildSite generates valid static site output', async () => {
     assert.equal(searchIdx[0].m, undefined)
     assert.equal(searchIdx[0].ai, undefined)
 
-    // Verify feed.xml contains atom:link and lastBuildDate
+    // Verify feed.xml contains atom:link, stylesheet, and lastBuildDate
     const feedXml = await readFile(join(tmpDist, 'feed.xml'), 'utf8')
     assert.match(feedXml, /<atom:link /)
     assert.match(feedXml, /<lastBuildDate>/)
+    assert.match(feedXml, /xml-stylesheet type="text\/xsl" href="\/feed\.xsl"/)
 
-    // Verify _headers contains wildcard rules, diffs, and CORS
+    // Verify feed.xsl exists and sets data-theme="dark"
+    const feedXsl = await readFile(join(tmpDist, 'feed.xsl'), 'utf8')
+    assert.match(feedXsl, /data-theme="dark"/)
+
+    // Verify favicon files exist
+    const favIco = await readFile(join(tmpDist, 'favicon.ico'))
+    assert.ok(favIco.length > 500)
+    const favSvg = await readFile(join(tmpDist, 'favicon.svg'), 'utf8')
+    assert.match(favSvg, /<svg /)
+
+    // Verify index.html has data-theme="dark" and favicon links
+    assert.match(indexHtml, /<html lang="en" data-theme="dark">/)
+    assert.match(indexHtml, /href="\/favicon\.ico"/)
+
+    // Verify _headers contains wildcard rules, diffs, favicons, and CORS
     const headers = await readFile(join(tmpDist, '_headers'), 'utf8')
     assert.match(headers, /\/day\/\*/)
     assert.match(headers, /\/release\/\*/)
     assert.match(headers, /\/diffs\/\*/)
+    assert.match(headers, /\/favicon\.ico/)
+    assert.match(headers, /\/feed\.xsl/)
     assert.match(headers, /Access-Control-Allow-Origin: \*/)
 
     // Verify 404 contains noindex

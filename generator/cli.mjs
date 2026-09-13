@@ -377,8 +377,10 @@ function MIME (f) {
   if (f.endsWith('.json')) return 'application/json; charset=utf-8'
   if (f.endsWith('.diff')) return 'text/plain; charset=utf-8'
   if (f.endsWith('.xml')) return 'application/rss+xml; charset=utf-8'
+  if (f.endsWith('.xsl')) return 'text/xsl; charset=utf-8'
   if (f.endsWith('.css')) return 'text/css'
   if (f.endsWith('.svg')) return 'image/svg+xml'
+  if (f.endsWith('.ico')) return 'image/x-icon'
   return 'application/octet-stream'
 }
 

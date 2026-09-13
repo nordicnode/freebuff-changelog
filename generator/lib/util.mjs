@@ -47,6 +47,11 @@ export async function writeText (path, text) {
   await writeFile(path, text)
 }
 
+export async function writeBinary (path, buf) {
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, buf)
+}
+
 export function escapeHtml (s) {
   return String(s)
     .replaceAll('&', '&amp;')
