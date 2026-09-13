@@ -86,12 +86,15 @@ test('buildSite generates valid static site output', async () => {
     assert.equal(res.days, 2)
     assert.equal(res.releases, 1)
 
-    // Verify index.html contains permalinks, in-flight nav, and diff-viewer
+    // Verify index.html contains permalinks, in-flight nav, diff-viewer, and sync countdown timer
     const indexHtml = await readFile(join(tmpDist, 'index.html'), 'utf8')
     assert.match(indexHtml, /class="permalink"/)
     assert.match(indexHtml, /href="\/in-flight\/"/)
     assert.match(indexHtml, /class="diff-viewer" data-sha=/)
     assert.match(indexHtml, /View inline diff/)
+    assert.match(indexHtml, /class="sync-badge"/)
+    assert.match(indexHtml, /class="sync-val"/)
+    assert.match(indexHtml, /NEXT SYNC:/)
 
     // Verify collapsible entries: latest commit is open by default, previous commit is collapsed
     assert.match(indexHtml, /<details class="entry major" id="bbbb11112222" open>/)

@@ -106,13 +106,28 @@ header.top{
   user-select:none;
   font-weight:700;
 }
-.live-status{
-  font-size:.72rem;
-  color:var(--term-green);
-  border:1px solid rgba(63,185,80,0.3);
-  padding:1px 7px;
+.sync-badge{
+  font-size:.74rem;
+  color:var(--txt-subtle);
+  border:1px solid var(--term-border);
+  padding:2px 7px;
   border-radius:2px;
-  letter-spacing:.03em;
+  background:rgba(255,255,255,0.02);
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  user-select:none;
+}
+.sync-badge .sync-val{
+  color:var(--term-cyan);
+  font-family:inherit;
+  font-weight:600;
+}
+.sync-badge.syncing{
+  border-color:rgba(63,185,80,0.5);
+}
+.sync-badge.syncing .sync-val{
+  color:var(--term-green);
 }
 nav.term-nav{
   display:flex;
@@ -968,6 +983,7 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
       <span class="term-prompt-sym">&gt;</span>
       <span>${SITE.name}</span>
     </a>
+    <span class="sync-badge" title="Automated upstream sync scheduled hourly at :17 UTC">[sync in <span class="sync-val">--:--</span>]</span>
   </div>
   <nav class="term-nav">
     <a href="/about/" class="${path === '/about/' ? 'active' : ''}">/about</a>
@@ -986,6 +1002,33 @@ ${body}
   </div>
 </footer>
 <script>
+function updateSyncTimer() {
+  const now = new Date();
+  const utcMin = now.getUTCMinutes();
+  let text = '';
+  let syncing = false;
+  if (utcMin === 17) {
+    text = 'syncing…';
+    syncing = true;
+  } else {
+    const next = new Date(now);
+    next.setUTCSeconds(0, 0);
+    if (utcMin >= 18) next.setUTCHours(next.getUTCHours() + 1);
+    next.setUTCMinutes(17);
+    const diffSec = Math.max(0, Math.floor((next.getTime() - now.getTime()) / 1000));
+    const m = Math.floor(diffSec / 60);
+    const s = diffSec % 60;
+    text = m + 'm ' + (s < 10 ? '0' : '') + s + 's';
+  }
+  document.querySelectorAll('.sync-val').forEach(el => { el.textContent = text; });
+  document.querySelectorAll('.sync-badge').forEach(el => {
+    if (syncing) el.classList.add('syncing');
+    else el.classList.remove('syncing');
+  });
+}
+updateSyncTimer();
+setInterval(updateSyncTimer, 1000);
+
 function openHashTarget() {
   const hash = window.location.hash;
   if (!hash) return;
@@ -1302,7 +1345,7 @@ export async function buildSite ({ changelog, openPrs, dist, diffs = new Map() }
     </div>
     <div class="term-footer-bar">
       <span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated ${esc(fmtDateHuman(generated))} UTC</span>
-      <span>COVERAGE: ${esc(first.day)} &rarr; ${esc(last.day)}</span>
+      <span>NEXT SYNC: <span class="sync-val" style="color:var(--term-cyan);font-weight:600">--:--</span> &middot; COVERAGE: ${esc(first.day)} &rarr; ${esc(last.day)}</span>
     </div>
   </div>
 </section>`
