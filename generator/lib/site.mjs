@@ -255,9 +255,6 @@ nav.term-nav a.active{
 .entry:hover{
   border-color:var(--term-border-strong);
 }
-.entry.has-ai{
-  border-left-color:rgba(88,166,255,0.7);
-}
 .entry.major{
   border-left-color:var(--term-amber);
 }
@@ -338,13 +335,6 @@ nav.term-nav a.active{
   border:1px solid var(--term-border);
   color:var(--txt-subtle);
   text-decoration:none;
-}
-.ai-indicator{
-  font-size:.73rem;
-  color:var(--txt-subtle);
-  font-weight:400;
-  letter-spacing:.01em;
-  white-space:nowrap;
 }
 .badge.maj{
   color:var(--term-amber);
@@ -1128,20 +1118,6 @@ function renderDiff(container, text, sha) {
 </body></html>`
 }
 
-function formatAiModel (model) {
-  if (!model) return 'Qwen 3.8 Flash'
-  const raw = String(model).replace(/^[^/]+\//, '')
-  if (/^qwen3\.8-flash$/i.test(raw)) return 'Qwen 3.8 Flash'
-  if (/^qwen2\.5-coder/i.test(raw)) return 'Qwen 2.5 Coder'
-  if (/^claude-3-5-sonnet/i.test(raw)) return 'Claude 3.5 Sonnet'
-  if (/^gpt-4o-mini/i.test(raw)) return 'GPT-4o Mini'
-  if (/^gpt-4o/i.test(raw)) return 'GPT-4o'
-  return raw
-    .split(/[-_]/)
-    .map(w => w ? w[0].toUpperCase() + w.slice(1) : '')
-    .join(' ')
-}
-
 function badges (e) {
   const b = []
   if (e.significance === 'major') b.push('<span class="badge maj">[MAJOR]</span>')
@@ -1242,17 +1218,13 @@ function entryCard (e, diffs, isExpanded = false) {
 <div class="diff-body"><span class="diff-loading">Loading diff…</span></div>
 </details>`
   }
-  const hasAi = Boolean(e.ai?.title || e.ai?.summary)
-  const aiClass = hasAi ? ' has-ai' : ''
-  const aiIndicator = hasAi ? `<span class="ai-indicator">Summarized by ${esc(formatAiModel(e.ai.model))}</span>` : ''
-  return `<details class="entry ${e.significance}${aiClass}" id="${anchor}"${isExpanded ? ' open' : ''}>
+  return `<details class="entry ${e.significance}" id="${anchor}"${isExpanded ? ' open' : ''}>
 <summary class="entry-summary">
   <div class="entry-meta-top">
     <span class="entry-arrow">&gt;</span>
     <span class="commit-ref">commit <a href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${anchor}</a></span>
     <span class="entry-utc">${esc(time)} UTC</span>
     <div class="badges">${badges(e)}</div>
-    ${aiIndicator}
     <a class="permalink" href="/day/${e.day}/#${anchor}" title="Permalink" aria-label="Permalink" onclick="event.stopPropagation()">#</a>
   </div>
   <h3 class="entry-title">${title}</h3>
@@ -1455,8 +1427,7 @@ ${yearSections}`
     t: (e.ai?.title || e.title || deriveTitleSafe(e)).slice(0, 90),
     c: e.category,
     s: e.sha.slice(0, 12),
-    a: e.significance,
-    m: (e.ai?.title || e.ai?.summary) ? formatAiModel(e.ai?.model) : undefined
+    a: e.significance
   }))
   await write(dist, 'search-index.json', JSON.stringify(idxJson))
   await write(dist, 'search/index.html', layout({
@@ -1475,7 +1446,6 @@ ${yearSections}`
     <div class="filter-chips">
       <span class="filter-lbl">FLAGS:</span>
       <button class="filter-chip active" data-filter="">--all</button>
-      <button class="filter-chip" data-filter="ai">--ai</button>
       <button class="filter-chip" data-filter="model">--models</button>
       <button class="filter-chip" data-filter="major">--major</button>
       <button class="filter-chip" data-filter="release">--releases</button>
@@ -1499,9 +1469,9 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
   const go = () => {
     const v = q.value.trim().toLowerCase();
     if (!v) { h.innerHTML = ''; cnt.textContent = ''; return; }
-    const w = v.split(/\\s+/);
+    const w = v.split(/\s+/);
     const hits = ix.filter(e => {
-      const s = (e.t + ' ' + e.c + ' ' + (e.a || '') + (e.m ? ' ai summarized by ' + e.m : '')).toLowerCase();
+      const s = (e.t + ' ' + e.c + ' ' + (e.a || '')).toLowerCase();
       return w.every(x => s.includes(x));
     }).slice(0, 200);
     
@@ -1509,12 +1479,10 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
     h.innerHTML = hits.map(e => {
       const u = '/day/' + e.d + '/#' + e.s;
       const sigTag = e.a === 'major' ? '<span class="badge maj">[MAJOR]</span>' : (e.a === 'notable' ? '<span class="badge not">[NOTABLE]</span>' : '');
-      const aiIndicator = e.m ? ('<span class="ai-indicator">Summarized by ' + esc(e.m) + '</span>') : '';
-      return '<article class="entry ' + (e.a || '') + (e.m ? ' has-ai' : '') + '"><div class="entry-meta-top">' +
+      return '<article class="entry ' + (e.a || '') + '"><div class="entry-meta-top">' +
         '<span class="commit-ref">commit ' + esc(e.s) + '</span>' +
         '<span class="entry-utc">' + esc(e.d) + '</span>' +
         '<div class="badges"><span class="badge cat">[' + esc(e.c) + ']</span>' + sigTag + '</div>' +
-        aiIndicator +
         '</div>' +
         '<h3><a href="' + u + '">' + esc(e.t) + '</a></h3>' +
         '</article>';

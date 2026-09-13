@@ -94,12 +94,12 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /View inline diff/)
 
     // Verify collapsible entries: latest commit is open by default, previous commit is collapsed
-    assert.match(indexHtml, /<details class="entry major has-ai" id="bbbb11112222" open>/)
+    assert.match(indexHtml, /<details class="entry major" id="bbbb11112222" open>/)
     assert.match(indexHtml, /<details class="entry major" id="aaaa11112222">/)
     assert.doesNotMatch(indexHtml, /<details class="entry major" id="aaaa11112222" open>/)
     assert.match(indexHtml, /class="entry-summary"/)
     assert.doesNotMatch(indexHtml, /class="badge ai"/)
-    assert.match(indexHtml, /<span class="ai-indicator">Summarized by Mock Model<\/span>/)
+    assert.doesNotMatch(indexHtml, /Summarized by/)
 
     // Verify day pages contain prev/next pager
     const dayHtml = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
@@ -115,14 +115,14 @@ test('buildSite generates valid static site output', async () => {
     assert.doesNotMatch(inFlightHtml, /undefined/)
     assert.match(inFlightHtml, /#999 by contributor/)
 
-    // Verify search index includes compact fields and ai model indicator
+    // Verify search index includes compact fields without AI disclosure
     const searchIdx = JSON.parse(await readFile(join(tmpDist, 'search-index.json'), 'utf8'))
     assert.equal(searchIdx.length, 2)
     assert.equal(searchIdx[0].u, undefined)
     assert.ok(searchIdx[0].s)
     assert.ok(searchIdx[0].d)
-    assert.equal(searchIdx[0].m, 'Mock Model')
-    assert.equal(searchIdx[1].m, undefined)
+    assert.equal(searchIdx[0].m, undefined)
+    assert.equal(searchIdx[0].ai, undefined)
 
     // Verify feed.xml contains atom:link and lastBuildDate
     const feedXml = await readFile(join(tmpDist, 'feed.xml'), 'utf8')
