@@ -103,6 +103,7 @@ async function cmdGenerate (argv) {
   const existing = await readJson(`${DATA}/changelog.json`, { version: 1, entries: [] })
   const bySha = new Map(existing.entries.map(e => [e.sha, e]))
   let added = 0, updated = 0
+  const newlyAddedEntries = []
 
   for (const c of commits) {
     if (bySha.has(c.sha)) continue
@@ -119,6 +120,7 @@ async function cmdGenerate (argv) {
     decorate(e)
     if (e.skip) { bySha.set(c.sha, { sha: c.sha, skip: true, date: e.date }); continue }
     bySha.set(c.sha, e)
+    newlyAddedEntries.push(e)
     added++
     if (added % 200 === 0) log(`${added} entries so far (${c.sha.slice(0, 8)})`)
   }
@@ -126,21 +128,25 @@ async function cmdGenerate (argv) {
   let entries = [...bySha.values()].filter(e => !e.skip)
   entries.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.sha < b.sha ? -1 : 1))
 
-  if (llmConfigured()) {
-    const getPatch = async (e) => {
-      if (e.kind !== 'sync') return ''
-      const prev = e.prevSha || (await git(['rev-parse', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
-      if (!prev) return ''
-      const files = await diffNameStatus(REPO_DIR, prev, e.sha)
-      const targets = files.map(f => f.path).filter(p => !p.endsWith('bun.lock') && !TEST_RE.test(p)).slice(0, 8)
-      if (!targets.length) return ''
-      return diffPatch(REPO_DIR, prev, e.sha, targets)
+  // Hourly sync behavior: only generate diffs & summarize NEWLY added entries this run.
+  // Backfilling of historical/existing entries is handled by the 1-minute loop (npm run backfill / watch).
+  const toEnrich = (full || !state.lastSha) ? entries : newlyAddedEntries
+  if (toEnrich.length > 0) {
+    await backfillDiffs(toEnrich, 500)
+    if (llmConfigured()) {
+      const getPatch = async (e) => {
+        if (e.kind !== 'sync') return ''
+        const prev = e.prevSha || (await git(['rev-parse', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
+        if (!prev) return ''
+        const files = await diffNameStatus(REPO_DIR, prev, e.sha)
+        const targets = files.map(f => f.path).filter(p => !p.endsWith('bun.lock') && !TEST_RE.test(p)).slice(0, 8)
+        if (!targets.length) return ''
+        return diffPatch(REPO_DIR, prev, e.sha, targets)
+      }
+      const n = await enrichWithLlm(toEnrich, getPatch, DATA)
+      log(`LLM enriched ${n} new entries`)
     }
-    const n = await enrichWithLlm(entries, getPatch, DATA)
-    log(`LLM enriched ${n} entries`)
   }
-
-  await backfillDiffs(entries, 60)
 
   const prevScanned = existing.counts?.commitsScanned || 0
   const changelog = {
@@ -205,11 +211,8 @@ async function listCommitsRange (repoDir, lastSha) {
 // ---------------------------------------------------------------------------
 
 async function cmdCatchUp (argv) {
-  log('running LLM enrichment catch-up…')
-  const head = await ensureRepo()
-
+  const currentBranch = (await git(['branch', '--show-current'], ROOT, { allowFail: true }))?.trim() || 'main'
   try {
-    const currentBranch = (await git(['branch', '--show-current'], ROOT, { allowFail: true }))?.trim() || 'master'
     await git(['pull', '--rebase', 'origin', currentBranch], ROOT, { allowFail: true })
   } catch {}
 
@@ -221,7 +224,16 @@ async function cmdCatchUp (argv) {
     return
   }
 
-  // Ensure diffs exist for all sync entries
+  const syncEntries = entries.filter(e => e.kind === 'sync')
+  const unsummarizedSync = syncEntries.filter(e => !e.ai?.title)
+  log(`[backfill] ${syncEntries.length} total sync entries (${unsummarizedSync.length} remaining to summarize)`)
+
+  if (unsummarizedSync.length === 0) {
+    log('[backfill] all existing sync entries already have AI summaries!')
+    return
+  }
+
+  const head = await ensureRepo()
   await backfillDiffs(entries, 1000)
 
   if (llmConfigured()) {
@@ -234,23 +246,29 @@ async function cmdCatchUp (argv) {
       if (!targets.length) return ''
       return diffPatch(REPO_DIR, prev, e.sha, targets)
     }
-    const envWithLimit = { ...process.env, CHANGELOG_LLM_LIMIT: process.env.CHANGELOG_LLM_LIMIT || '100' }
+    let limit = Number(process.env.CHANGELOG_LLM_LIMIT || 5)
+    const limitIdx = argv.indexOf('--limit')
+    if (limitIdx !== -1 && argv[limitIdx + 1]) {
+      limit = Number(argv[limitIdx + 1]) || limit
+    }
+    const envWithLimit = { ...process.env, CHANGELOG_LLM_LIMIT: String(limit) }
     const n = await enrichWithLlm(entries, getPatch, DATA, envWithLimit, { retryErrors: true })
-    log(`catch-up complete: ${n} entries enriched with LLM`)
+    log(`[backfill] enriched ${n} entries with LLM (${Math.max(0, unsummarizedSync.length - n)} remaining)`)
     if (n > 0) {
       await writeJson(`${DATA}/changelog.json`, existing)
     }
   } else {
-    log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required)')
+    log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env)')
   }
 
   if (argv.includes('--push')) {
     const status = (await git(['status', '--porcelain', 'data/'], ROOT, { allowFail: true })) || ''
     if (status.trim()) {
       log('committing and pushing data to git…')
+      await git(['pull', '--rebase', 'origin', currentBranch], ROOT, { allowFail: true })
       await git(['add', 'data'], ROOT)
-      await git(['commit', '-m', 'data: LLM catch-up and diffs [skip ci]'], ROOT)
-      const currentBranch = (await git(['branch', '--show-current'], ROOT, { allowFail: true }))?.trim() || 'master'
+      const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 16)
+      await git(['commit', '-m', `data: LLM backfill (${nowUtc} UTC) [skip ci]`], ROOT)
       await git(['push', 'origin', currentBranch], ROOT)
       log('pushed to origin — Cloudflare Pages will deploy automatically.')
     } else {
@@ -260,14 +278,22 @@ async function cmdCatchUp (argv) {
 }
 
 async function cmdWatch (argv) {
-  const intervalSec = Number(process.env.WATCH_INTERVAL || 180)
-  log(`starting watch daemon (polling every ${intervalSec}s)… Press Ctrl+C to stop.`)
+  let intervalSec = 60
+  const idx = argv.indexOf('--interval')
+  if (idx !== -1 && argv[idx + 1]) {
+    intervalSec = Number(argv[idx + 1]) || 60
+  } else if (process.env.WATCH_INTERVAL) {
+    intervalSec = Number(process.env.WATCH_INTERVAL) || 60
+  }
+
+  log(`starting backfill loop (running every ${intervalSec}s)… Press Ctrl+C to stop.`)
   while (true) {
     try {
       await cmdCatchUp(argv)
     } catch (err) {
-      log(`watch iteration error: ${err.message}`)
+      log(`backfill loop iteration error: ${err.message}`)
     }
+    log(`sleeping ${intervalSec}s before next cycle…`)
     await new Promise(r => setTimeout(r, intervalSec * 1000))
   }
 }
@@ -361,14 +387,15 @@ function MIME (f) {
 const [, , cmd, ...rest] = process.argv
 if (cmd === 'generate') await cmdGenerate(rest)
 else if (cmd === 'catch-up') await cmdCatchUp(rest)
-else if (cmd === 'watch') await cmdWatch(rest)
+else if (cmd === 'watch' || cmd === 'backfill') await cmdWatch(rest)
 else if (cmd === 'build') await cmdBuild()
 else if (cmd === 'preview') await cmdPreview(Number(rest[0]) || 8788)
 else {
   console.log(`usage:
-  node generator/cli.mjs generate [--full]       # fetch freebuff, analyze new commits
-  node generator/cli.mjs catch-up [--push]      # catch up LLM enrichment & diffs
-  node generator/cli.mjs watch [--push]         # continuous polling daemon
+  node generator/cli.mjs generate [--full]       # analyze upstream freebuff (hourly sync)
+  node generator/cli.mjs catch-up [--push]      # single batch LLM backfill
+  node generator/cli.mjs backfill [--push]      # 1-minute continuous backfill loop
+  node generator/cli.mjs watch [--push]         # alias for backfill
   node generator/cli.mjs build                  # render static site → dist/
   node generator/cli.mjs preview [port]         # local preview of dist/`)
   process.exit(cmd ? 1 : 0)
