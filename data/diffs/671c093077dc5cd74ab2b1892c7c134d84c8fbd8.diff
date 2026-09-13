@@ -1,0 +1,502 @@
+diff --git a/cli/src/hooks/helpers/send-message.ts b/cli/src/hooks/helpers/send-message.ts
+index e8ceb9421..5ff3877a4 100644
+--- a/cli/src/hooks/helpers/send-message.ts
++++ b/cli/src/hooks/helpers/send-message.ts
+@@ -238,9 +238,9 @@ export const prepareUserMessage = async (params: {
+     if (postUserMessage) {
+       next = postUserMessage(next)
+     }
+-    if (next.length > 100) {
+-      next = next.slice(-100)
+-    }
++    // Keep the full transcript: this array is what saveChatState persists to
++    // chat-messages.json, so trimming here would permanently lose history.
++    // Rendering stays cheap because useChatMessages paginates what's shown.
+     return next
+   })
+ 
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index 5ab829609..3af0234e2 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -523,10 +523,11 @@ export const useSendMessage = ({
+         setRunState(runState)
+         setIsRetrying(false)
+ 
+-        setMessages((currentMessages) => {
+-          saveChatState(runState, currentMessages)
+-          return currentMessages
+-        })
++        // Read committed state rather than saving inside a setMessages
++        // updater: the store uses immer, so the updater sees a draft proxy
++        // and JSON.stringify of the (unbounded) transcript through proxy
++        // traps is several times slower.
++        saveChatState(runState, useChatStore.getState().messages)
+         handleRunCompletion({
+           runState,
+           actualCredits,
+diff --git a/cli/src/utils/__tests__/chat-history.test.ts b/cli/src/utils/__tests__/chat-history.test.ts
+index 4c1b618ef..cd4aefd99 100644
+--- a/cli/src/utils/__tests__/chat-history.test.ts
++++ b/cli/src/utils/__tests__/chat-history.test.ts
+@@ -111,6 +111,90 @@ describe('chat-history', () => {
+     expect(chats[0].unreadable).toBe(true)
+   })
+ 
++  test('getAllChats prefers the chat-meta.json sidecar over parsing messages', () => {
++    writeChat('chat-with-meta', 'prompt from messages file')
++    const chatDir = path.join(tempDataDir, 'chats', 'chat-with-meta')
++    const stats = fs.statSync(path.join(chatDir, 'chat-messages.json'))
++    fs.writeFileSync(
++      path.join(chatDir, 'chat-meta.json'),
++      JSON.stringify({
++        messageCount: 42,
++        firstPrompt: 'prompt from meta',
++        messagesSize: stats.size,
++        messagesMtimeMs: stats.mtimeMs,
++      }),
++    )
++
++    const chats = getAllChats()
++
++    expect(chats).toHaveLength(1)
++    expect(chats[0].lastPrompt).toBe('prompt from meta')
++    expect(chats[0].messageCount).toBe(42)
++  })
++
++  test('getAllChats falls back to parsing messages when meta is stale', () => {
++    writeChat('chat-stale-meta', 'prompt from messages file')
++    const chatDir = path.join(tempDataDir, 'chats', 'chat-stale-meta')
++    // Sidecar recorded before the messages file was last rewritten: its
++    // size/mtime no longer match, so it must be ignored
++    fs.writeFileSync(
++      path.join(chatDir, 'chat-meta.json'),
++      JSON.stringify({
++        messageCount: 42,
++        firstPrompt: 'stale prompt from meta',
++        messagesSize: 1,
++        messagesMtimeMs: 1,
++      }),
++    )
++
++    const chats = getAllChats()
++
++    expect(chats).toHaveLength(1)
++    expect(chats[0].lastPrompt).toBe('prompt from messages file')
++    expect(chats[0].messageCount).toBe(1)
++  })
++
++  test('getAllChats still flags a chat unreadable when messages are corrupted after the meta was written', () => {
++    writeChat('chat-corrupt-after-meta', 'healthy prompt')
++    const chatDir = path.join(tempDataDir, 'chats', 'chat-corrupt-after-meta')
++    const messagesPath = path.join(chatDir, 'chat-messages.json')
++    const stats = fs.statSync(messagesPath)
++    fs.writeFileSync(
++      path.join(chatDir, 'chat-meta.json'),
++      JSON.stringify({
++        messageCount: 1,
++        firstPrompt: 'healthy prompt',
++        messagesSize: stats.size,
++        messagesMtimeMs: stats.mtimeMs,
++      }),
++    )
++    // Transcript truncated later (crash mid-write by an older CLI, disk
++    // issue): the sidecar no longer matches, so the corruption must not be
++    // masked by it
++    fs.writeFileSync(messagesPath, '[{"id":"msg-1","variant":"user","con')
++
++    const chats = getAllChats()
++
++    expect(chats).toHaveLength(1)
++    expect(chats[0].unreadable).toBe(true)
++    expect(chats[0].lastPrompt).toBe('(unreadable chat)')
++  })
++
++  test('getAllChats falls back to parsing messages when meta is corrupt', () => {
++    writeChat('chat-bad-meta', 'prompt from messages file')
++    fs.writeFileSync(
++      path.join(tempDataDir, 'chats', 'chat-bad-meta', 'chat-meta.json'),
++      '{"messageCount": tru',
++    )
++
++    const chats = getAllChats()
++
++    expect(chats).toHaveLength(1)
++    expect(chats[0].lastPrompt).toBe('prompt from messages file')
++    expect(chats[0].messageCount).toBe(1)
++    expect(chats[0].unreadable).toBeUndefined()
++  })
++
+   test('getAllChats still hides empty chats', () => {
+     const emptyDir = path.join(tempDataDir, 'chats', 'chat-empty')
+     fs.mkdirSync(emptyDir, { recursive: true })
+diff --git a/cli/src/utils/__tests__/chat-meta.test.ts b/cli/src/utils/__tests__/chat-meta.test.ts
+new file mode 100644
+index 000000000..ac44161ae
+--- /dev/null
++++ b/cli/src/utils/__tests__/chat-meta.test.ts
+@@ -0,0 +1,130 @@
++import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
++import * as fs from 'fs'
++import * as os from 'os'
++import * as path from 'path'
++
++import {
++  CHAT_MESSAGES_FILENAME,
++  CHAT_META_FILENAME,
++  getFirstUserPrompt,
++  readChatMeta,
++  writeChatMeta,
++} from '../chat-meta'
++import {
++  clearChatState,
++  saveChatState,
++  setChatDirOverrideForTesting,
++} from '../run-state-storage'
++
++import type { ChatMessage } from '../../types/chat'
++import type { RunState } from '@codebuff/sdk'
++
++let chatDir = ''
++
++function userMessage(content: string): ChatMessage {
++  return {
++    id: `msg-${content}`,
++    variant: 'user',
++    content,
++    timestamp: new Date().toISOString(),
++    blocks: [],
++  }
++}
++
++/** Write chat-messages.json so writeChatMeta can stat it. */
++function writeMessagesFile(messages: ChatMessage[]): void {
++  fs.writeFileSync(
++    path.join(chatDir, CHAT_MESSAGES_FILENAME),
++    JSON.stringify(messages),
++  )
++}
++
++describe('chat-meta', () => {
++  beforeEach(() => {
++    chatDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codebuff-meta-'))
++    setChatDirOverrideForTesting(chatDir)
++  })
++
++  afterEach(() => {
++    setChatDirOverrideForTesting(undefined)
++    fs.rmSync(chatDir, { recursive: true, force: true })
++  })
++
++  test('getFirstUserPrompt returns first user message, truncated', () => {
++    const messages: ChatMessage[] = [
++      { ...userMessage(''), variant: 'agent' },
++      userMessage('hello there'),
++      userMessage('second prompt'),
++    ]
++    expect(getFirstUserPrompt(messages)).toBe('hello there')
++
++    const long = 'x'.repeat(150)
++    expect(getFirstUserPrompt([userMessage(long)])).toBe(
++      'x'.repeat(97) + '...',
++    )
++    expect(getFirstUserPrompt([])).toBe('(empty chat)')
++  })
++
++  test('writeChatMeta / readChatMeta round trip', () => {
++    const messages = [userMessage('round trip prompt'), userMessage('two')]
++    writeMessagesFile(messages)
++    writeChatMeta(chatDir, messages)
++
++    expect(readChatMeta(chatDir)).toMatchObject({
++      messageCount: 2,
++      firstPrompt: 'round trip prompt',
++    })
++  })
++
++  test('readChatMeta returns null for missing or invalid meta', () => {
++    writeMessagesFile([userMessage('hi')])
++    expect(readChatMeta(chatDir)).toBeNull()
++
++    const metaPath = path.join(chatDir, CHAT_META_FILENAME)
++    fs.writeFileSync(metaPath, '{"messageCount": "not a nu')
++    expect(readChatMeta(chatDir)).toBeNull()
++
++    fs.writeFileSync(metaPath, JSON.stringify({ messageCount: 3 }))
++    expect(readChatMeta(chatDir)).toBeNull()
++  })
++
++  test('readChatMeta returns null when chat-messages.json no longer matches', () => {
++    const messages = [userMessage('original prompt')]
++    writeMessagesFile(messages)
++    writeChatMeta(chatDir, messages)
++    expect(readChatMeta(chatDir)).not.toBeNull()
++
++    // Simulate another writer (e.g. an older CLI) rewriting the transcript
++    // without refreshing the sidecar
++    writeMessagesFile([
++      userMessage('original prompt'),
++      userMessage('a new message the sidecar does not know about'),
++    ])
++    expect(readChatMeta(chatDir)).toBeNull()
++
++    // Messages file deleted entirely
++    fs.rmSync(path.join(chatDir, CHAT_MESSAGES_FILENAME))
++    expect(readChatMeta(chatDir)).toBeNull()
++  })
++
++  test('saveChatState writes the meta sidecar and clearChatState removes it', () => {
++    const runState = { output: undefined } as unknown as RunState
++    const messages = [userMessage('saved prompt')]
++
++    saveChatState(runState, messages)
++
++    const metaPath = path.join(chatDir, CHAT_META_FILENAME)
++    expect(fs.existsSync(metaPath)).toBe(true)
++    expect(readChatMeta(chatDir)).toMatchObject({
++      messageCount: 1,
++      firstPrompt: 'saved prompt',
++    })
++
++    clearChatState()
++    expect(fs.existsSync(metaPath)).toBe(false)
++    expect(fs.existsSync(path.join(chatDir, 'run-state.json'))).toBe(false)
++    expect(fs.existsSync(path.join(chatDir, CHAT_MESSAGES_FILENAME))).toBe(
++      false,
++    )
++  })
++})
+diff --git a/cli/src/utils/chat-history.ts b/cli/src/utils/chat-history.ts
+index e6b07f0a9..63212345d 100644
+--- a/cli/src/utils/chat-history.ts
++++ b/cli/src/utils/chat-history.ts
+@@ -1,6 +1,11 @@
+ import * as fs from 'fs'
+ import path from 'path'
+ 
++import {
++  CHAT_MESSAGES_FILENAME,
++  getFirstUserPrompt,
++  readChatMeta,
++} from './chat-meta'
+ import { CHAT_LOG_FILENAME, logger } from './logger'
+ import { getProjectDataDir } from '../project-files'
+ 
+@@ -21,23 +26,6 @@ function getChatsDir(): string {
+   return path.join(getProjectDataDir(), 'chats')
+ }
+ 
+-/**
+- * Get the first user message from a list of chat messages
+- */
+-function getFirstUserPrompt(messages: ChatMessage[]): string {
+-  for (const msg of messages) {
+-    if (msg?.variant === 'user' && msg.content) {
+-      // Truncate long prompts
+-      const content = msg.content.trim()
+-      if (content.length > 100) {
+-        return content.slice(0, 97) + '...'
+-      }
+-      return content
+-    }
+-  }
+-  return '(empty chat)'
+-}
+-
+ interface ChatDirInfo {
+   chatId: string
+   chatPath: string
+@@ -70,7 +58,7 @@ export function getAllChats(maxChats: number = 500): ChatHistoryEntry[] {
+         chatDirInfos.push({
+           chatId,
+           chatPath,
+-          messagesPath: path.join(chatPath, 'chat-messages.json'),
++          messagesPath: path.join(chatPath, CHAT_MESSAGES_FILENAME),
+           mtime: stat.mtime,
+         })
+       } catch {
+@@ -91,13 +79,24 @@ export function getAllChats(maxChats: number = 500): ChatHistoryEntry[] {
+         let lastPrompt = '(empty chat)'
+ 
+         if (fs.existsSync(info.messagesPath)) {
+-          const content = fs.readFileSync(info.messagesPath, 'utf8')
+-          const messages = JSON.parse(content) as ChatMessage[]
+-          if (!Array.isArray(messages)) {
+-            throw new Error('chat-messages.json is not an array')
++          // Prefer the sidecar summary: transcripts are unbounded, so parsing
++          // every full chat-messages.json here can make /history slow.
++          const meta = readChatMeta(info.chatPath)
++          if (meta) {
++            messageCount = meta.messageCount
++            lastPrompt = meta.firstPrompt
++          } else {
++            // Pre-sidecar chats, or a sidecar that no longer matches the
++            // messages file (rewritten by an older CLI, crash between the
++            // two writes): parse the full file.
++            const content = fs.readFileSync(info.messagesPath, 'utf8')
++            const messages = JSON.parse(content) as ChatMessage[]
++            if (!Array.isArray(messages)) {
++              throw new Error('chat-messages.json is not an array')
++            }
++            messageCount = messages.length
++            lastPrompt = getFirstUserPrompt(messages)
+           }
+-          messageCount = messages.length
+-          lastPrompt = getFirstUserPrompt(messages)
+         }
+ 
+         // Skip empty chats (no messages)
+diff --git a/cli/src/utils/chat-meta.ts b/cli/src/utils/chat-meta.ts
+new file mode 100644
+index 000000000..36ecb6dc5
+--- /dev/null
++++ b/cli/src/utils/chat-meta.ts
+@@ -0,0 +1,90 @@
++import * as fs from 'fs'
++import path from 'path'
++
++import { z } from 'zod'
++
++import { writeFileAtomic } from './write-file-atomic'
++
++import type { ChatMessage } from '../types/chat'
++
++export const CHAT_MESSAGES_FILENAME = 'chat-messages.json'
++export const CHAT_META_FILENAME = 'chat-meta.json'
++
++/**
++ * Small sidecar summary of a chat written alongside chat-messages.json.
++ * Transcripts are unbounded and can grow to many MB, so /history reads this
++ * instead of parsing every full chat-messages.json.
++ *
++ * messagesSize/messagesMtimeMs bind the sidecar to the exact messages file it
++ * summarizes: if the transcript is later rewritten by anything that doesn't
++ * refresh the sidecar (an older CLI version, a crash between the two writes),
++ * readChatMeta rejects the stale sidecar and callers fall back to the full
++ * parse instead of showing outdated data or hiding corruption.
++ */
++const chatMetaSchema = z.object({
++  messageCount: z.number(),
++  firstPrompt: z.string(),
++  messagesSize: z.number(),
++  messagesMtimeMs: z.number(),
++})
++
++export type ChatMeta = z.infer<typeof chatMetaSchema>
++
++/**
++ * Get the first user message from a list of chat messages
++ */
++export function getFirstUserPrompt(messages: ChatMessage[]): string {
++  for (const msg of messages) {
++    if (msg?.variant === 'user' && msg.content) {
++      // Truncate long prompts
++      const content = msg.content.trim()
++      if (content.length > 100) {
++        return content.slice(0, 97) + '...'
++      }
++      return content
++    }
++  }
++  return '(empty chat)'
++}
++
++/**
++ * Write the sidecar for the given chat directory. The chat-messages.json in
++ * that directory must already contain exactly `messages` (its stats are
++ * recorded to bind the sidecar to it).
++ */
++export function writeChatMeta(chatDir: string, messages: ChatMessage[]): void {
++  const stats = fs.statSync(path.join(chatDir, CHAT_MESSAGES_FILENAME))
++  const meta: ChatMeta = {
++    messageCount: messages.length,
++    firstPrompt: getFirstUserPrompt(messages),
++    messagesSize: stats.size,
++    messagesMtimeMs: stats.mtimeMs,
++  }
++  writeFileAtomic(path.join(chatDir, CHAT_META_FILENAME), JSON.stringify(meta))
++}
++
++/**
++ * Read the sidecar for a chat directory. Returns null when it is missing,
++ * unparsable, or stale (chat-messages.json no longer matches the recorded
++ * size/mtime) — callers should fall back to parsing chat-messages.json.
++ */
++export function readChatMeta(chatDir: string): ChatMeta | null {
++  try {
++    const raw = fs.readFileSync(path.join(chatDir, CHAT_META_FILENAME), 'utf8')
++    const parsed = chatMetaSchema.safeParse(JSON.parse(raw))
++    if (!parsed.success) {
++      return null
++    }
++    const meta = parsed.data
++    const stats = fs.statSync(path.join(chatDir, CHAT_MESSAGES_FILENAME))
++    if (
++      stats.size !== meta.messagesSize ||
++      stats.mtimeMs !== meta.messagesMtimeMs
++    ) {
++      return null
++    }
++    return meta
++  } catch {
++    return null
++  }
++}
+diff --git a/cli/src/utils/run-state-storage.ts b/cli/src/utils/run-state-storage.ts
+index e4acebea9..bd1a5afb0 100644
+--- a/cli/src/utils/run-state-storage.ts
++++ b/cli/src/utils/run-state-storage.ts
+@@ -7,6 +7,11 @@ import {
+   getMostRecentChatDir,
+   getProjectDataDir,
+ } from '../project-files'
++import {
++  CHAT_MESSAGES_FILENAME,
++  CHAT_META_FILENAME,
++  writeChatMeta,
++} from './chat-meta'
+ import { logger } from './logger'
+ import { writeFileAtomic } from './write-file-atomic'
+ 
+@@ -14,7 +19,6 @@ import type { ChatMessage, ContentBlock } from '../types/chat'
+ import type { RunState } from '@codebuff/sdk'
+ 
+ const RUN_STATE_FILENAME = 'run-state.json'
+-const CHAT_MESSAGES_FILENAME = 'chat-messages.json'
+ 
+ type SavedChatState = {
+   runState: RunState
+@@ -150,6 +154,10 @@ export function saveChatState(
+     // multiple MB; pretty-printing roughly doubles the write.
+     writeFileAtomic(runStatePath, JSON.stringify(runState))
+     writeFileAtomic(messagesPath, JSON.stringify(messages))
++    // Sidecar summary so /history can list this chat without parsing the
++    // (unbounded) chat-messages.json. Must be written after the messages
++    // file: it records the file's size/mtime to detect staleness.
++    writeChatMeta(resolveCurrentChatDir(), messages)
+   } catch (error) {
+     logger.error(
+       {
+@@ -281,15 +289,16 @@ export function clearChatState(): void {
+   try {
+     const runStatePath = getRunStatePath()
+     const messagesPath = getChatMessagesPath()
++    const metaPath = path.join(resolveCurrentChatDir(), CHAT_META_FILENAME)
+ 
+-    if (fs.existsSync(runStatePath)) {
+-      fs.unlinkSync(runStatePath)
+-    }
+-    if (fs.existsSync(messagesPath)) {
+-      fs.unlinkSync(messagesPath)
++    for (const filePath of [runStatePath, messagesPath, metaPath]) {
++      fs.rmSync(filePath, { force: true })
+     }
+ 
+-    logger.debug({ runStatePath, messagesPath }, 'Cleared chat state files')
++    logger.debug(
++      { runStatePath, messagesPath, metaPath },
++      'Cleared chat state files',
++    )
+   } catch (error) {
+     logger.error(
+       {

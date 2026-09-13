@@ -1,0 +1,167 @@
+diff --git a/common/src/util/file.ts b/common/src/util/file.ts
+index 733081c24..18e0b29e7 100644
+--- a/common/src/util/file.ts
++++ b/common/src/util/file.ts
+@@ -69,6 +69,7 @@ export const ProjectFileContextSchema = z.object({
+   agentTemplates: z.record(z.string(), z.any()).default(() => ({})),
+   customToolDefinitions: customToolDefinitionsSchema,
+   skills: z.record(z.string(), z.any()).optional(),
++  includeHomeSkills: z.boolean().optional(),
+   gitChanges: z.object({
+     status: z.string(),
+     diff: z.string(),
+@@ -99,6 +100,15 @@ export type ProjectFileContext = {
+   agentTemplates: Record<string, any>
+   customToolDefinitions: CustomToolDefinitions
+   skills?: SkillsMap
++  /**
++   * Whether the HOST's home directory may be searched for skills.
++   *
++   * Opt-in, and false by omission, so a server can never search its own
++   * `~/.agents/skills` on behalf of a repo that lives somewhere else. Mirrors
++   * `LoadSkillsOptions.includeHomeSkills`; set it only where the process
++   * belongs to the user whose skills these are.
++   */
++  includeHomeSkills?: boolean
+   gitChanges: {
+     status: string
+     diff: string
+diff --git a/packages/agent-runtime/src/tools/handlers/tool/__tests__/skill.test.ts b/packages/agent-runtime/src/tools/handlers/tool/__tests__/skill.test.ts
+index 3610d054f..85b00525f 100644
+--- a/packages/agent-runtime/src/tools/handlers/tool/__tests__/skill.test.ts
++++ b/packages/agent-runtime/src/tools/handlers/tool/__tests__/skill.test.ts
+@@ -148,3 +148,64 @@ describe('handleSkill', () => {
+     expect(value.content).not.toContain('deploy')
+   })
+ })
++
++describe('handleSkill home-directory opt-in', () => {
++  let projectRoot: string
++  let fakeHome: string
++  let realHomedir: typeof os.homedir
++
++  beforeEach(() => {
++    projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-project-'))
++    fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-home-'))
++    realHomedir = os.homedir
++    // Stand in for the HOST's home. On a server this is the server's own home
++    // while `projectRoot` is someone else's checkout — on Freebuff Cloud, a
++    // Daytona sandbox path.
++    ;(os as any).homedir = () => fakeHome
++  })
++
++  afterEach(() => {
++    ;(os as any).homedir = realHomedir
++    fs.rmSync(projectRoot, { recursive: true, force: true })
++    fs.rmSync(fakeHome, { recursive: true, force: true })
++  })
++
++  it('does NOT read the host home by default', async () => {
++    writeSkill(fakeHome, 'deploy', 'the HOST machine copy')
++
++    const { output } = await callSkill('deploy', { projectRoot, skills: {} })
++    const value = (output as any)[0].value
++
++    // Not found at all: the project has no such skill and home is off-limits.
++    expect(JSON.stringify(value)).not.toContain('the HOST machine copy')
++  })
++
++  it('reads the host home when a caller explicitly opts in', async () => {
++    writeSkill(fakeHome, 'deploy', 'the HOST machine copy')
++
++    const { output } = await callSkill('deploy', {
++      projectRoot,
++      skills: {},
++      includeHomeSkills: true,
++    })
++    const value = (output as any)[0].value
++
++    expect(value.name).toBe('deploy')
++  })
++
++  it('never lets a host-home skill shadow the repo, even when opted in', async () => {
++    // The precedence that made this dangerous: the disk lookup wins over the
++    // pre-loaded cache, so a same-named skill on the server would be served in
++    // place of the repo's. Project must come first regardless.
++    writeSkill(projectRoot, 'deploy', 'the REPO copy')
++    writeSkill(fakeHome, 'deploy', 'the HOST machine copy')
++
++    const { output } = await callSkill('deploy', {
++      projectRoot,
++      skills: {},
++      includeHomeSkills: true,
++    })
++
++    expect(JSON.stringify((output as any)[0].value)).toContain('the REPO copy')
++  })
++})
+diff --git a/packages/agent-runtime/src/tools/handlers/tool/skill.ts b/packages/agent-runtime/src/tools/handlers/tool/skill.ts
+index 923ae3dc2..f2468fec4 100644
+--- a/packages/agent-runtime/src/tools/handlers/tool/skill.ts
++++ b/packages/agent-runtime/src/tools/handlers/tool/skill.ts
+@@ -25,6 +25,7 @@ import type { ProjectFileContext } from '@codebuff/common/util/file'
+ async function loadSkillFromDisk(
+   projectRoot: string,
+   skillName: string,
++  includeHomeSkills: boolean,
+ ): Promise<SkillDefinition | null> {
+   const home = os.homedir()
+   const skillsDirs = [
+@@ -32,8 +33,26 @@ async function loadSkillFromDisk(
+     // This function returns the first match, so highest precedence comes first.
+     path.join(projectRoot, '.agents', SKILLS_DIR_NAME),
+     path.join(projectRoot, '.claude', SKILLS_DIR_NAME),
+-    path.join(home, '.agents', SKILLS_DIR_NAME),
+-    path.join(home, '.claude', SKILLS_DIR_NAME),
++    // OFF BY DEFAULT, and deliberately a parameter rather than a constant.
++    //
++    // `os.homedir()` is the HOST's home, which is only the right place to look
++    // when this process belongs to the user whose skills these are — an
++    // interactive CLI on their own machine. On a server the same call resolves
++    // to the SERVER's home while `projectRoot` points at someone else's
++    // checkout: on Freebuff Cloud that is a Daytona sandbox path, so a skill
++    // sitting in the web server's `~/.agents/skills` would be served in place
++    // of the repo's own, and the result of this lookup WINS over the
++    // pre-loaded cache (`diskSkill ?? skills[name]` below).
++    //
++    // `loadSkills` was given exactly this opt-in
++    // (`LoadSkillsOptions.includeHomeSkills`) for exactly this reason; the fix
++    // never reached this second, independent lookup.
++    ...(includeHomeSkills
++      ? [
++          path.join(home, '.agents', SKILLS_DIR_NAME),
++          path.join(home, '.claude', SKILLS_DIR_NAME),
++        ]
++      : []),
+   ]
+ 
+   for (const skillsDir of skillsDirs) {
+@@ -100,7 +119,11 @@ export const handleSkill = (async (params: {
+   // session (e.g. via `npx skills add`) are picked up with their latest
+   // contents. Fall back to the cache pre-loaded at session start.
+   const diskSkill = fileContext.projectRoot
+-    ? await loadSkillFromDisk(fileContext.projectRoot, name)
++    ? await loadSkillFromDisk(
++        fileContext.projectRoot,
++        name,
++        fileContext.includeHomeSkills === true,
++      )
+     : null
+ 
+   const skill = diskSkill ?? skills[name]
+diff --git a/sdk/src/run-state.ts b/sdk/src/run-state.ts
+index 6eb1121c0..ea0f78bfe 100644
+--- a/sdk/src/run-state.ts
++++ b/sdk/src/run-state.ts
+@@ -734,6 +734,11 @@ export async function initialSessionState(
+     agentTemplates: processedAgentTemplates,
+     customToolDefinitions: processedCustomToolDefinitions,
+     skills,
++    // Carried into the context so the `skill` TOOL's own disk lookup obeys the
++    // same decision as the loader above. They are two independent lookups and
++    // the tool's result wins, so one flag has to govern both or the opt-in is
++    // only half real.
++    includeHomeSkills,
+     gitChanges,
+     changesSinceLastChat: {},
+     shellConfigFiles: {},

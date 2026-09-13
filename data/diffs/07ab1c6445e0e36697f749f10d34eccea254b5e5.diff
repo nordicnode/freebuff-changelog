@@ -1,0 +1,322 @@
+diff --git a/freebuff/runner/README.md b/freebuff/runner/README.md
+index 24fcca4cf..18f420b14 100644
+--- a/freebuff/runner/README.md
++++ b/freebuff/runner/README.md
+@@ -24,6 +24,9 @@ to claim them.
+ - `CONVEX_URL` — deployment URL (e.g. https://<name>.convex.cloud)
+ - `CONVEX_DEPLOY_KEY` — deploy/admin key for that deployment (internal
+   functions + subscriptions). Keep scoped to this service's env.
++- `AXIOM_API_TOKEN` (+ optional `AXIOM_ORG_ID`, `AXIOM_DATASET`,
++  `AXIOM_LOGS_ENABLED`) — ships runner lifecycle / claim / crash logs into the
++  unified `freebuff` dataset as `service=freebuff-runner`.
+ - `CODEBUFF_API_KEY` — Freebuff Web service account PAT
+   (docs/freebuff-web-service-account.md)
+ - `NEXT_PUBLIC_CODEBUFF_APP_URL` — Codebuff backend base URL for the SDK
+diff --git a/freebuff/runner/package.json b/freebuff/runner/package.json
+index 36b605e9a..07a0a799b 100644
+--- a/freebuff/runner/package.json
++++ b/freebuff/runner/package.json
+@@ -11,6 +11,7 @@
+   },
+   "dependencies": {
+     "@codebuff/common": "workspace:*",
++    "@codebuff/logging": "workspace:*",
+     "@codebuff/sdk": "workspace:*",
+     "@daytonaio/sdk": "^0.145.0",
+     "convex": "^1.30.0",
+diff --git a/freebuff/runner/src/eventBatcher.ts b/freebuff/runner/src/eventBatcher.ts
+index 36e5fd981..c8127a65a 100644
+--- a/freebuff/runner/src/eventBatcher.ts
++++ b/freebuff/runner/src/eventBatcher.ts
+@@ -1,4 +1,5 @@
+ import { internal } from '../../web/convex/_generated/api'
++import { logger } from './logger'
+ 
+ import type { RunnerCtx } from './convexBridge'
+ import type { FreebuffRunEvent } from './harness'
+@@ -81,7 +82,7 @@ export function createEventBatcher(params: {
+       chain = chain
+         .then(() => send(events))
+         .catch((error) => {
+-          console.error('[freebuff-runner] stream flush failed', error)
++          logger.error('stream flush failed', { runId, error })
+         })
+     }, FLUSH_INTERVAL_MS)
+   }
+@@ -93,7 +94,7 @@ export function createEventBatcher(params: {
+     chain = chain
+       .then(() => send([]))
+       .catch((error) => {
+-        console.warn('[freebuff-runner] heartbeat failed', error)
++        logger.warn('heartbeat failed', { runId, error })
+       })
+   }, HEARTBEAT_INTERVAL_MS)
+ 
+diff --git a/freebuff/runner/src/logger.ts b/freebuff/runner/src/logger.ts
+new file mode 100644
+index 000000000..325f6cc6b
+--- /dev/null
++++ b/freebuff/runner/src/logger.ts
+@@ -0,0 +1,76 @@
++import { enqueueLogRow, flushLogSink } from '@codebuff/logging'
++
++import type { LogLevel, LogRow } from '@codebuff/common/types/contracts/logs'
++
++const LOG_SERVICE = 'freebuff-runner'
++
++function envName(): string {
++  return process.env.NEXT_PUBLIC_CB_ENVIRONMENT ?? process.env.NODE_ENV ?? 'dev'
++}
++
++function serializeError(error: unknown): unknown {
++  if (error instanceof Error) {
++    return {
++      name: error.name,
++      message: error.message,
++      stack: error.stack,
++    }
++  }
++  return error
++}
++
++function normalizeData(data?: Record<string, unknown>) {
++  if (!data) return {}
++  return {
++    ...data,
++    ...(data && 'error' in data ? { error: serializeError(data.error) } : {}),
++  }
++}
++
++function write(level: LogLevel, message: string, data?: Record<string, unknown>) {
++  const payload = {
++    ...normalizeData(data),
++    runnerId: process.env.RENDER_INSTANCE_ID ?? process.env.FREEBUFF_RUNNER_ID,
++  }
++  const row: LogRow = {
++    id: crypto.randomUUID(),
++    timestamp: new Date(),
++    level,
++    source: 'server',
++    service: LOG_SERVICE,
++    env: envName(),
++    message,
++    client_request_id:
++      typeof data?.runId === 'string' ? String(data.runId) : null,
++    data: payload,
++  }
++
++  enqueueLogRow(row)
++
++  const line = JSON.stringify({
++    source: LOG_SERVICE,
++    level,
++    message,
++    ...payload,
++  })
++  if (level === 'error' || level === 'fatal') {
++    console.error(line)
++  } else if (level === 'warn') {
++    console.warn(line)
++  } else {
++    console.log(line)
++  }
++}
++
++export const logger = {
++  info: (message: string, data?: Record<string, unknown>) =>
++    write('info', message, data),
++  warn: (message: string, data?: Record<string, unknown>) =>
++    write('warn', message, data),
++  error: (
++    message: string,
++    data?: Record<string, unknown> & { error?: unknown },
++  ) => write('error', message, data),
++}
++
++export { flushLogSink }
+diff --git a/freebuff/runner/src/main.ts b/freebuff/runner/src/main.ts
+index f3a4efe52..fcf012fce 100644
+--- a/freebuff/runner/src/main.ts
++++ b/freebuff/runner/src/main.ts
+@@ -10,6 +10,7 @@
+ 
+ import { internal } from '../../web/convex/_generated/api'
+ import { createRunnerCtx, createSubscriptionClient } from './convexBridge'
++import { flushLogSink, logger } from './logger'
+ import { runCliTurn } from './runCliTurn'
+ import { runFreebuffTurn } from './runTurn'
+ 
+@@ -26,6 +27,7 @@ const CONVEX_DEPLOY_KEY = requireEnv('CONVEX_DEPLOY_KEY')
+ // Render sets RENDER_INSTANCE_ID; fall back to a random id in local dev.
+ const RUNNER_ID =
+   process.env.RENDER_INSTANCE_ID ?? `local-${crypto.randomUUID().slice(0, 8)}`
++process.env.FREEBUFF_RUNNER_ID = RUNNER_ID
+ // The work is I/O-bound (waiting on model tokens / Daytona), so one instance
+ // comfortably multiplexes many runs. Backpressure = simply not claiming.
+ const MAX_CONCURRENT_RUNS = Number(process.env.RUNNER_MAX_CONCURRENT_RUNS ?? 25)
+@@ -63,17 +65,6 @@ const activeRuns = new Map<string, ActiveRun>()
+ // concurrency cap and must not be double-claimed from a subscription refire.
+ const claiming = new Set<string>()
+ 
+-function log(message: string, extra?: Record<string, unknown>) {
+-  console.log(
+-    JSON.stringify({
+-      source: 'freebuff-runner',
+-      runnerId: RUNNER_ID,
+-      message,
+-      ...extra,
+-    }),
+-  )
+-}
+-
+ async function executeRun(claim: ClaimedRun & { claimed: true }) {
+   const active: ActiveRun = {
+     runId: claim.runId,
+@@ -96,7 +87,10 @@ async function executeRun(claim: ClaimedRun & { claimed: true }) {
+     (error) => {
+       // Subscription errors are non-fatal: the turn keeps running and user
+       // cancels degrade to the terminal-state guard in recordRunEventBatch.
+-      console.warn('[freebuff-runner] status subscription error', error)
++      logger.warn('status subscription error', {
++        runId: claim.runId,
++        error,
++      })
+     },
+   )
+ 
+@@ -124,13 +118,13 @@ async function executeRun(claim: ClaimedRun & { claimed: true }) {
+             resumeStorageId: result.resumeStorageId,
+           },
+         )
+-        log('run requeued for another instance', {
++        logger.info('run requeued for another instance', {
+           runId: claim.runId,
+           ok: requeued.ok,
+           hasResumeState: !!result.resumeStorageId,
+         })
+       } else {
+-        log('run finished', {
++        logger.info('run finished', {
+           runId: claim.runId,
+           outcome: result.outcome,
+           elapsedMs: Date.now() - startedAt,
+@@ -140,7 +134,7 @@ async function executeRun(claim: ClaimedRun & { claimed: true }) {
+       // runFreebuffTurn reports its own terminal events; reaching here means
+       // even the error path failed (e.g. Convex unreachable). The sweep cron
+       // will reap the run once its heartbeat goes stale.
+-      console.error('[freebuff-runner] run crashed', claim.runId, error)
++      logger.error('run crashed', { runId: claim.runId, error })
+     } finally {
+       active.unsubscribeStatus()
+       activeRuns.delete(claim.runId)
+@@ -167,11 +161,11 @@ async function claimQueued(queue: Array<{ runId: string }>) {
+         { runId, runnerId: RUNNER_ID },
+       )
+       if (claim?.claimed) {
+-        log('claimed run', { runId, resuming: !!claim.resumeStorageId })
++        logger.info('claimed run', { runId, resuming: !!claim.resumeStorageId })
+         await executeRun(claim)
+       }
+     } catch (error) {
+-      console.error('[freebuff-runner] claim failed', runId, error)
++      logger.error('claim failed', { runId, error })
+     } finally {
+       claiming.delete(runId)
+     }
+@@ -187,7 +181,7 @@ function subscribeToQueue() {
+       void claimQueued(lastSeenQueue)
+     },
+     (error) => {
+-      console.error('[freebuff-runner] queue subscription error', error)
++      logger.error('queue subscription error', { error })
+     },
+   )
+ }
+@@ -195,7 +189,7 @@ function subscribeToQueue() {
+ async function gracefulShutdown(signal: string) {
+   if (shutdown.requested) return
+   shutdown.requested = true
+-  log('shutdown requested', { signal, activeRuns: activeRuns.size })
++  logger.info('shutdown requested', { signal, activeRuns: activeRuns.size })
+ 
+   // Each active turn sees shutdown.requested on its next stream callback,
+   // aborts the SDK run, persists resume state, and requeues itself. Render
+@@ -205,18 +199,19 @@ async function gracefulShutdown(signal: string) {
+     await new Promise((resolve) => setTimeout(resolve, 250))
+   }
+   if (activeRuns.size > 0) {
+-    log('shutdown deadline hit with runs still active', {
++    logger.warn('shutdown deadline hit with runs still active', {
+       remaining: [...activeRuns.keys()],
+     })
+   }
+   await subscriptions.close()
++  await flushLogSink()
+   process.exit(0)
+ }
+ 
+ process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'))
+ process.on('SIGINT', () => void gracefulShutdown('SIGINT'))
+ 
+-log('freebuff runner started', {
++logger.info('freebuff runner started', {
+   convexUrl: CONVEX_URL,
+   maxConcurrentRuns: MAX_CONCURRENT_RUNS,
+   turnLimitMs: TURN_LIMIT_MS,
+diff --git a/freebuff/runner/src/runTurn.ts b/freebuff/runner/src/runTurn.ts
+index 792fb7c55..5c23337ea 100644
+--- a/freebuff/runner/src/runTurn.ts
++++ b/freebuff/runner/src/runTurn.ts
+@@ -23,6 +23,7 @@ import {
+   WEBCONTAINER_AGENT_GUIDANCE,
+ } from '../../web/convex/coding_agent/cli_agent/freebuff_bundled_agents'
+ import { createEventBatcher } from './eventBatcher'
++import { logger } from './logger'
+ import {
+   buildCommitMessage,
+   buildDaytonaProjectFiles,
+@@ -89,7 +90,7 @@ async function fetchJsonBlob(url: string): Promise<any | undefined> {
+     if (!response.ok) return undefined
+     return await response.json()
+   } catch (error) {
+-    console.error('[freebuff-runner] failed to fetch run state blob', error)
++    logger.error('failed to fetch run state blob', { error })
+     return undefined
+   }
+ }
+@@ -113,7 +114,7 @@ async function persistRunState(
+     }
+     return storageId
+   } catch (error) {
+-    console.error('[freebuff-runner] failed to persist run state', error)
++    logger.error('failed to persist run state', { error })
+     return undefined
+   }
+ }
+@@ -167,7 +168,7 @@ async function loadImageContents(
+         mediaType: blob.type || 'image/png',
+       })
+     } catch (error) {
+-      console.warn('[freebuff-runner] failed to load image', error)
++      logger.warn('failed to load image', { error })
+     }
+   }
+   return contents
+@@ -417,7 +418,7 @@ export async function runFreebuffTurn(
+               )
+             }
+           } catch (error) {
+-            console.warn('[freebuff-runner] gravity capture failed', error)
++            logger.warn('gravity capture failed', { runId, error })
+           }
+         }
+       },
+@@ -506,7 +507,7 @@ export async function runFreebuffTurn(
+         message: buildCommitMessage(payload.userMessage),
+       })
+     } catch (commitError) {
+-      console.warn('[freebuff-runner] post-run commit failed', commitError)
++      logger.warn('post-run commit failed', { runId, error: commitError })
+       // Non-fatal: still mark the run as completed.
+     }
+ 

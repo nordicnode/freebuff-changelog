@@ -1,0 +1,296 @@
+diff --git a/common/src/types/contracts/database.ts b/common/src/types/contracts/database.ts
+index 6d0364acd..cfd4a00b5 100644
+--- a/common/src/types/contracts/database.ts
++++ b/common/src/types/contracts/database.ts
+@@ -22,6 +22,8 @@ export type GetUserInfoFromApiKeyInput<T extends UserColumn> = {
+   apiKey: string
+   fields: readonly T[]
+   logger: Logger
++  /** ends the lookup, including its retries, when the caller's run is aborted */
++  signal?: AbortSignal
+ }
+ export type GetUserInfoFromApiKeyOutput<T extends UserColumn> = Promise<
+   | {
+@@ -81,6 +83,8 @@ export type StartAgentRunFn = (params: {
+   agentId: string
+   ancestorRunIds: string[]
+   logger: Logger
++  /** ends the request, including its retries, when the caller's run is aborted */
++  signal?: AbortSignal
+ }) => Promise<string | null>
+ 
+ export type FinishAgentRunFn = (params: {
+diff --git a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+index a3d24e38f..bd6269dfc 100644
+--- a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
++++ b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+@@ -157,6 +157,25 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+     clearMockedModules()
+   })
+ 
++  it('an abort during agent-run registration is a cancel, not a failed run', async () => {
++    // registration ends on the run's signal now, so the null it returns under an abort is the
++    // abort itself and must read like every other cancel
++    const controller = new AbortController()
++    const result = await loopAgentSteps({
++      ...loopAgentStepsBaseParams,
++      signal: controller.signal,
++      startAgentRun: async () => {
++        controller.abort()
++        return null
++      },
++    })
++    expect(result.output).toEqual({
++      type: 'error',
++      message: 'Run cancelled by user',
++    })
++    expect(llmCallCount).toBe(0)
++  })
++
+   it('should verify correct STEP behavior - LLM called once after STEP', async () => {
+     // This test verifies that when a programmatic agent yields STEP,
+     // the LLM should be called once in the next iteration
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 87f43dbb8..9a97508e2 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -835,6 +835,16 @@ export async function loopAgentSteps(
+     ancestorRunIds: initialAgentState.ancestorRunIds,
+   })
+   if (!runId) {
++    // registration ends on the run's signal; an abort landing there is a cancel, not a failure
++    if (signal.aborted) {
++      return {
++        agentState: initialAgentState,
++        output: {
++          type: 'error',
++          message: 'Run cancelled by user',
++        },
++      }
++    }
+     throw new Error('Failed to start agent run')
+   }
+   initialAgentState.runId = runId
+diff --git a/sdk/CHANGELOG.md b/sdk/CHANGELOG.md
+index 635e01e2b..263e99fe0 100644
+--- a/sdk/CHANGELOG.md
++++ b/sdk/CHANGELOG.md
+@@ -4,6 +4,8 @@ All notable changes to the @codebuff/sdk package will be documented in this file
+ 
+ ## [Unreleased]
+ 
++- `run()` now returns promptly when its `signal` aborts during the user lookup or agent-run registration that precede the first model request. Those requests had no signal and retried through a backoff, so a socket that never answered held the run for the whole retry budget; they now end on abort and the run resolves with `Run cancelled by user.`
++
+ - Dropped `knowledge.md` from the knowledge-file priority list; the SDK now picks up `AGENTS.md` then `CLAUDE.md` (per directory, and `~/.AGENTS.md`/`~/.CLAUDE.md` in the home directory). Existing `knowledge.md` files are no longer read. The `PRIMARY_KNOWLEDGE_FILE_NAME` export was removed with it; use `KNOWLEDGE_FILE_NAMES[0]`.
+ 
+ ## [0.10.7]
+diff --git a/sdk/src/__tests__/database.test.ts b/sdk/src/__tests__/database.test.ts
+index f10f5fb77..edf8f2b0a 100644
+--- a/sdk/src/__tests__/database.test.ts
++++ b/sdk/src/__tests__/database.test.ts
+@@ -47,6 +47,35 @@ describe('getUserInfoFromApiKey', () => {
+     expect(result).toEqual({ id: 'user-123' })
+   })
+ 
++  test('an abort ends the lookup and its retries instead of waiting out a silent socket', async () => {
++    // a socket that never answers used to hold the run for the whole retry budget with nothing the
++    // caller's abort could reach
++    const fetchMock = mock(
++      (_input: RequestInfo | URL, init?: RequestInit) =>
++        new Promise<Response>((_resolve, reject) => {
++          init?.signal?.addEventListener('abort', () =>
++            reject(new DOMException('The operation was aborted', 'AbortError')),
++          )
++        }),
++    )
++    globalThis.fetch = fetchMock as unknown as typeof fetch
++
++    const controller = new AbortController()
++    const started = Date.now()
++    const lookup = getUserInfoFromApiKey({
++      apiKey: 'aborted-api-key',
++      fields: ['id'],
++      logger: createLoggerMocks(),
++      signal: controller.signal,
++    })
++    setTimeout(() => controller.abort(), 20)
++
++    await expect(lookup).rejects.toThrow()
++    expect(Date.now() - started).toBeLessThan(1_000)
++    // no retry after an abort: the one request, then out
++    expect(fetchMock).toHaveBeenCalledTimes(1)
++  })
++
+   test('merges cached fields and avoids refetching when present', async () => {
+     const fetchMock = mock(async (input: RequestInfo | URL) => {
+       const urlString =
+diff --git a/sdk/src/__tests__/run-cancellation.test.ts b/sdk/src/__tests__/run-cancellation.test.ts
+index b5a8113c8..5995d7c0b 100644
+--- a/sdk/src/__tests__/run-cancellation.test.ts
++++ b/sdk/src/__tests__/run-cancellation.test.ts
+@@ -94,6 +94,37 @@ describe('Run Cancellation Handling', () => {
+     expect(messageHistory.length).toBe(2)
+   })
+ 
++  it('an abort during the user lookup returns a cancelled run, not an auth error', async () => {
++    // the lookup is the first request a run makes; an abort while it hangs must read as a cancel, not "invalid API key"
++    const controller = new AbortController()
++    spyOn(databaseModule, 'getUserInfoFromApiKey').mockImplementation(
++      async (params: { signal?: AbortSignal }) => {
++        expect(params.signal).toBe(controller.signal)
++        controller.abort()
++        throw new Error('Network request failed')
++      },
++    )
++    const mainPrompt = spyOn(
++      mainPromptModule,
++      'callMainPrompt',
++    ).mockImplementation(async () => {
++      throw new Error('the request must never be sent')
++    })
++
++    const client = new CodebuffClient({ apiKey: 'test-key' })
++    const result = await client.run({
++      agent: 'base2',
++      prompt: 'hello',
++      signal: controller.signal,
++    })
++
++    expect(result.output).toMatchObject({
++      type: 'error',
++      message: 'Run cancelled by user.',
++    })
++    expect(mainPrompt).not.toHaveBeenCalled()
++  })
++
+   it('does not duplicate user message when cancelled and server already processed the prompt', async () => {
+     spyOn(databaseModule, 'getUserInfoFromApiKey').mockResolvedValue({
+       id: 'user-123',
+diff --git a/sdk/src/impl/database.ts b/sdk/src/impl/database.ts
+index 337f2c7e5..3f020c4ff 100644
+--- a/sdk/src/impl/database.ts
++++ b/sdk/src/impl/database.ts
+@@ -49,6 +49,10 @@ const agentsResponseSchema = z.object({
+ /**
+  * Fetch with retry logic for transient errors (502, 503, etc.)
+  * Implements exponential backoff between retries.
++ *
++ * `options.signal`, when given, ends the in-flight request AND the retries and backoff sleeps
++ * behind it: a socket that never answers otherwise holds a run for the full retry budget with
++ * nothing the caller's abort can reach.
+  */
+ async function fetchWithRetry(
+   url: URL | string,
+@@ -57,8 +61,19 @@ async function fetchWithRetry(
+ ): Promise<Response> {
+   let lastError: Error | null = null
+   let backoffDelay = RETRY_BACKOFF_BASE_DELAY_MS
++  const signal = options.signal ?? undefined
++  // the aborted check is load-bearing: `abort` never fires on a signal that already has
++  const sleep = (ms: number): Promise<void> =>
++    new Promise((resolve) => {
++      if (signal?.aborted) return resolve()
++      const timer = setTimeout(resolve, ms)
++      signal?.addEventListener('abort', () => (clearTimeout(timer), resolve()), { once: true })
++    })
+ 
+   for (let attempt = 0; attempt <= MAX_RETRIES_PER_MESSAGE; attempt++) {
++    if (signal?.aborted) {
++      throw lastError ?? new DOMException('This operation was aborted', 'AbortError')
++    }
+     try {
+       const response = await fetch(url, options)
+ 
+@@ -73,7 +88,7 @@ async function fetchWithRetry(
+           { status: response.status, attempt: attempt + 1, url: String(url) },
+           `Retryable HTTP error, retrying in ${backoffDelay}ms`,
+         )
+-        await new Promise((resolve) => setTimeout(resolve, backoffDelay))
++        await sleep(backoffDelay)
+         backoffDelay = Math.min(backoffDelay * 2, RETRY_BACKOFF_MAX_DELAY_MS)
+       } else {
+         // Last attempt, return the response even if it's an error
+@@ -82,13 +97,15 @@ async function fetchWithRetry(
+     } catch (error) {
+       // Network-level error (DNS, connection refused, etc.)
+       lastError = error instanceof Error ? error : new Error(String(error))
++      // the caller's abort, not the network: nothing to retry
++      if (signal?.aborted) throw lastError
+ 
+       if (attempt < MAX_RETRIES_PER_MESSAGE) {
+         logger?.warn(
+           { error: getErrorObject(lastError), attempt: attempt + 1, url: String(url) },
+           `Network error, retrying in ${backoffDelay}ms`,
+         )
+-        await new Promise((resolve) => setTimeout(resolve, backoffDelay))
++        await sleep(backoffDelay)
+         backoffDelay = Math.min(backoffDelay * 2, RETRY_BACKOFF_MAX_DELAY_MS)
+       }
+     }
+@@ -101,7 +118,7 @@ async function fetchWithRetry(
+ export async function getUserInfoFromApiKey<T extends UserColumn>(
+   params: GetUserInfoFromApiKeyInput<T>,
+ ): GetUserInfoFromApiKeyOutput<T> {
+-  const { apiKey, fields, logger } = params
++  const { apiKey, fields, logger, signal } = params
+ 
+   const cached = userInfoCache[apiKey]
+   if (cached === null) {
+@@ -138,6 +155,7 @@ export async function getUserInfoFromApiKey<T extends UserColumn>(
+         headers: {
+           Authorization: `Bearer ${apiKey}`,
+         },
++        ...(signal ? { signal } : {}),
+       },
+       logger,
+     )
+@@ -305,7 +323,7 @@ export async function fetchAgentFromDatabase(
+ export async function startAgentRun(
+   params: ParamsOf<StartAgentRunFn>,
+ ): ReturnType<StartAgentRunFn> {
+-  const { apiKey, userId, agentId, ancestorRunIds, logger } = params
++  const { apiKey, userId, agentId, ancestorRunIds, logger, signal } = params
+ 
+   const url = new URL(`/api/v1/agent-runs`, getWebsiteUrl())
+ 
+@@ -323,6 +341,7 @@ export async function startAgentRun(
+           agentId,
+           ancestorRunIds,
+         }),
++        ...(signal ? { signal } : {}),
+       },
+       logger,
+     )
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 21d5a804c..f08694168 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -722,12 +722,22 @@ async function runOnce({
+ 
+   const promptId = Math.random().toString(36).substring(2, 15)
+ 
+-  // Send input
+-  const userInfo = await getUserInfoFromApiKey({
+-    ...agentRuntimeImpl,
+-    apiKey,
+-    fields: ['id'],
+-  })
++  // Send input. The lookup rides the run's signal: a socket that never answers here held the run
++  // for the whole retry budget with the abort unable to reach it.
++  let userInfo: { id: string } | null
++  try {
++    userInfo = await getUserInfoFromApiKey({
++      ...agentRuntimeImpl,
++      apiKey,
++      fields: ['id'],
++      signal,
++    })
++  } catch (error) {
++    if (signal?.aborted) {
++      return getCancelledRunState('Run cancelled by user.')
++    }
++    throw error
++  }
+   if (!userInfo) {
+     return getCancelledRunState('Invalid API key or user not found')
+   }

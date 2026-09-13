@@ -1,0 +1,269 @@
+diff --git a/agents/__tests__/base2.test.ts b/agents/__tests__/base2.test.ts
+index 7f5cf9686..59d823fe4 100644
+--- a/agents/__tests__/base2.test.ts
++++ b/agents/__tests__/base2.test.ts
+@@ -135,10 +135,11 @@ describe('base2 context pruning', () => {
+   })
+ 
+   test.each(['default', 'lite', 'max', 'fast'] as const)(
+-    '%s mode defaults context pruning to 400k tokens without a cache expiry override',
++    '%s mode defaults context pruning to 400k tokens with a 30-minute cache expiry',
+     (mode) => {
+       expect(getContextPrunerParams(mode)).toEqual({
+         maxContextLength: 400_000,
++        cacheExpiryMs: 30 * 60 * 1000,
+       })
+     },
+   )
+@@ -151,6 +152,7 @@ describe('base2 context pruning', () => {
+     (model, maxContextLength) => {
+       expect(getContextPrunerParams('default', { model })).toEqual({
+         maxContextLength,
++        cacheExpiryMs: 30 * 60 * 1000,
+       })
+     },
+   )
+@@ -184,6 +186,7 @@ describe('base2 context pruning', () => {
+     ).toEqual({
+       maxContextLength: 123_000,
+       assistantToolBudget: 10_000,
++      cacheExpiryMs: 30 * 60 * 1000,
+     })
+   })
+ })
+diff --git a/agents/base2/base-deep.ts b/agents/base2/base-deep.ts
+index 58e780eb5..8b31c901d 100644
+--- a/agents/base2/base-deep.ts
++++ b/agents/base2/base-deep.ts
+@@ -320,13 +320,17 @@ export function createBaseDeep(options?: {
+ 7. Lessons — write LESSONS.md, update/create skills, iterative thinker-gpt brainstorm loop`}`,
+     handleSteps: function* ({ params }) {
+       while (true) {
+-        // Run context-pruner before each step.
++        // Run context-pruner before each step. cacheExpiryMs is baked to 30
++        // minutes: the 5-minute default forces a full lossy re-summarization
++        // after any short idle even when the context is nowhere near its limit.
+         yield {
+           toolName: 'spawn_agent_inline',
+           input: {
+             agent_type: 'context-pruner',
+-            params: params ?? {
++            params: {
+               maxContextLength: 400_000,
++              ...(params ?? {}),
++              cacheExpiryMs: 30 * 60 * 1000,
+             },
+           },
+           includeToolCall: false,
+diff --git a/agents/base2/base2.ts b/agents/base2/base2.ts
+index 31b22bac0..debd17e9d 100644
+--- a/agents/base2/base2.ts
++++ b/agents/base2/base2.ts
+@@ -401,6 +401,7 @@ const handleSteps250k: Base2HandleSteps = function* ({ params }) {
+         params: {
+           maxContextLength: 250_000,
+           ...(params ?? {}),
++          cacheExpiryMs: 30 * 60 * 1000,
+         },
+       },
+       includeToolCall: false,
+@@ -420,6 +421,7 @@ const handleSteps400k: Base2HandleSteps = function* ({ params }) {
+         params: {
+           maxContextLength: 400_000,
+           ...(params ?? {}),
++          cacheExpiryMs: 30 * 60 * 1000,
+         },
+       },
+       includeToolCall: false,
+diff --git a/agents/general-agent/general-agent.ts b/agents/general-agent/general-agent.ts
+index f025f5a67..c744d05f6 100644
+--- a/agents/general-agent/general-agent.ts
++++ b/agents/general-agent/general-agent.ts
+@@ -83,12 +83,17 @@ export const createGeneralAgent = (options: {
+       }
+ 
+       while (true) {
+-        // Run context-pruner before each step
++        // Run context-pruner before each step. cacheExpiryMs is baked to 30
++        // minutes: the 5-minute default forces a full lossy re-summarization
++        // after any short idle even when the context is nowhere near its limit.
+         yield {
+           toolName: 'spawn_agent_inline',
+           input: {
+             agent_type: 'context-pruner',
+-            params: params ?? {},
++            params: {
++              ...(params ?? {}),
++              cacheExpiryMs: 30 * 60 * 1000,
++            },
+           },
+           includeToolCall: false,
+         } as any
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 6aacb388b..c965de89d 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -1,8 +1,4 @@
+ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+-import {
+-  isFreeMode,
+-  shouldUseLocalTokenCountForFreebuffDeepseekFlash,
+-} from '@codebuff/common/constants/free-agents'
+ import {
+   supportsAssistantPrefill,
+   supportsCacheControl,
+@@ -26,7 +22,6 @@ import { cloneDeep, mapValues } from 'lodash'
+ import z from 'zod/v4'
+ 
+ import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+-import { callTokenCountAPI } from './llm-api/codebuff-web-api'
+ import { getMCPToolData } from './mcp'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+ import { isThinkOnlyResponse } from './util/think-tags'
+@@ -159,6 +154,10 @@ async function additionalToolDefinitions(
+   })
+ }
+ 
++/** Run-id prefix for runs that skip the run-tracking ledger (context-pruner).
++ *  These ids exist only in-process and must never be sent to the web API. */
++export const UNTRACKED_RUN_ID_PREFIX = 'untracked-'
++
+ export const runAgentStep = async (
+   params: {
+     userId: string | undefined
+@@ -738,6 +737,33 @@ export async function loopAgentSteps(
+   agentState: AgentState
+   output: AgentOutput
+ }> {
++  let agentTemplate = params.agentTemplate
++  if (!agentTemplate) {
++    agentTemplate =
++      (await getAgentTemplate({
++        ...params,
++        agentId: params.agentType,
++      })) ?? undefined
++  }
++  if (!agentTemplate) {
++    throw new Error(`Agent template not found for type: ${params.agentType}`)
++  }
++
++  // The context pruner is a programmatic no-model-call agent spawned before
++  // every main-agent step. Recording its runs in the ledger cost three awaited
++  // web-API round trips (start/step/finish) per main-agent step, so it mints a
++  // local run id and skips run tracking entirely. Matches bundled and
++  // publisher-qualified ids ('context-pruner', 'codebuff/context-pruner@1.0.0').
++  if (agentTemplate.id.includes('context-pruner')) {
++    params = {
++      ...params,
++      startAgentRun: async () =>
++        `${UNTRACKED_RUN_ID_PREFIX}${crypto.randomUUID()}`,
++      addAgentStep: async () => null,
++      finishAgentRun: async () => {},
++    }
++  }
++
+   const {
+     addAgentStep,
+     agentState: initialAgentState,
+@@ -761,18 +787,6 @@ export async function loopAgentSteps(
+     ciEnv,
+   } = params
+ 
+-  let agentTemplate = params.agentTemplate
+-  if (!agentTemplate) {
+-    agentTemplate =
+-      (await getAgentTemplate({
+-        ...params,
+-        agentId: agentType,
+-      })) ?? undefined
+-  }
+-  if (!agentTemplate) {
+-    throw new Error(`Agent template not found for type: ${agentType}`)
+-  }
+-
+   if (signal.aborted) {
+     return {
+       agentState: initialAgentState,
+@@ -990,46 +1004,12 @@ export async function loopAgentSteps(
+         countTokens(system) +
+         countTokensJson(toolsForTokenCount)
+ 
+-      // Free (freebuff) runs never call the token-count web API: the awaited
+-      // per-step round-trip (full history + tools shipped to the server, which
+-      // relays to Anthropic) adds seconds of serial overhead to every step and
+-      // ~1M+ requests/day of web-service load, and free-mode context limits
+-      // don't need Anthropic-exact counts. Paid Codebuff runs keep the
+-      // accurate API count.
+-      if (
+-        isFreeMode(params.costMode) ||
+-        shouldUseLocalTokenCountForFreebuffDeepseekFlash({
+-          agentId: agentTemplate.id,
+-          model: agentTemplate.model,
+-        })
+-      ) {
+-        currentAgentState.contextTokenCount = estimateContextTokensLocally()
+-      } else {
+-        // Check context token count via the web API. Pass the run's apiKey
+-        // explicitly: interactive CLI users don't have CODEBUFF_API_KEY set in
+-        // their environment, so relying on the ciEnv fallback made this call
+-        // fail every step ('Missing Codebuff base URL or API key') and forced
+-        // the less accurate local estimate.
+-        const tokenCountResult = await callTokenCountAPI({
+-          messages: messagesWithStepPrompt,
+-          system,
+-          model: agentTemplate.model,
+-          tools: toolsForTokenCount,
+-          fetch,
+-          logger,
+-          env: { clientEnv, ciEnv },
+-          apiKey: params.apiKey,
+-        })
+-        if (tokenCountResult.inputTokens !== undefined) {
+-          currentAgentState.contextTokenCount = tokenCountResult.inputTokens
+-        } else if (tokenCountResult.error) {
+-          logger.warn(
+-            { error: tokenCountResult.error },
+-            'Failed to get token count from web API',
+-          )
+-          currentAgentState.contextTokenCount = estimateContextTokensLocally()
+-        }
+-      }
++      // Always count locally. The token-count web API round-trip (full
++      // history + tools shipped to the server, which relays to Anthropic)
++      // added seconds of serial overhead to every step; there is no paid mode
++      // anymore that needs Anthropic-exact counts, and context-limit checks
++      // only need an estimate.
++      currentAgentState.contextTokenCount = estimateContextTokensLocally()
+ 
+       // 1. Run programmatic step first if it exists
+       let n: number | undefined = undefined
+diff --git a/packages/agent-runtime/src/tools/handlers/tool/spawn-agent-utils.ts b/packages/agent-runtime/src/tools/handlers/tool/spawn-agent-utils.ts
+index 1223b131f..6a20cebb0 100644
+--- a/packages/agent-runtime/src/tools/handlers/tool/spawn-agent-utils.ts
++++ b/packages/agent-runtime/src/tools/handlers/tool/spawn-agent-utils.ts
+@@ -6,7 +6,10 @@ import {
+ } from '@codebuff/common/util/agent-id-parsing'
+ import { generateCompactId } from '@codebuff/common/util/string'
+ 
+-import { loopAgentSteps } from '../../../run-agent-step'
++import {
++  UNTRACKED_RUN_ID_PREFIX,
++  loopAgentSteps,
++} from '../../../run-agent-step'
+ import { getAgentTemplate } from '../../../templates/agent-registry'
+ import { formatValueForError } from '../../../util/format-value'
+ import {
+@@ -397,7 +400,12 @@ export async function executeSubagent(
+     params: spawnParams,
+   })
+ 
+-  if (result.agentState.runId) {
++  // Untracked runs (context-pruner) have no ledger row, so their ids must not
++  // be reported as children on the parent's tracked steps.
++  if (
++    result.agentState.runId &&
++    !result.agentState.runId.startsWith(UNTRACKED_RUN_ID_PREFIX)
++  ) {
+     parentAgentState.childRunIds.push(result.agentState.runId)
+   }
+ 

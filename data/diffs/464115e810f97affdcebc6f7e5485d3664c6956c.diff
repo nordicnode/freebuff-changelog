@@ -1,0 +1,633 @@
+diff --git a/cli/src/app.tsx b/cli/src/app.tsx
+index 385e121e0..35d32a423 100644
+--- a/cli/src/app.tsx
++++ b/cli/src/app.tsx
+@@ -14,6 +14,7 @@ import { useFreebuffSession } from './hooks/use-freebuff-session'
+ import { useTerminalFocus } from './hooks/use-terminal-focus'
+ import { getProjectRoot, startNewChat } from './project-files'
+ import { useChatHistoryStore } from './state/chat-history-store'
++import { abortActiveRun } from './utils/active-run'
+ import { useChatStore } from './state/chat-store'
+ import type { TopBannerType } from './types/store'
+ import { IS_FREEBUFF } from './utils/constants'
+@@ -153,6 +154,10 @@ export const App = ({
+ 
+   const handleResumeChat = useCallback(
+     (chatId: string) => {
++      // Abort any in-flight run BEFORE resetting the store and switching
++      // chats: an orphaned run would keep checkpointing, and its writes could
++      // land in the resumed chat's directory, overwriting that transcript.
++      abortActiveRun()
+       closeChatHistory()
+       // Reset chat store to clear previous messages before loading the selected chat
+       resetChatStore()
+@@ -162,6 +167,7 @@ export const App = ({
+   )
+ 
+   const handleNewChat = useCallback(() => {
++    abortActiveRun()
+     closeChatHistory()
+     resetChatStore()
+     // Rotate the chat id so the new conversation saves to its own directory
+diff --git a/cli/src/commands/__tests__/new-command-rotates-chat.test.ts b/cli/src/commands/__tests__/new-command-rotates-chat.test.ts
+index 1cb8aa152..47f905cb6 100644
+--- a/cli/src/commands/__tests__/new-command-rotates-chat.test.ts
++++ b/cli/src/commands/__tests__/new-command-rotates-chat.test.ts
+@@ -10,6 +10,10 @@ describe('/new command', () => {
+       '../../project-files.ts',
+       import.meta.url,
+     ).href
++    const activeRunUrl = new URL(
++      '../../utils/active-run.ts',
++      import.meta.url,
++    ).href
+ 
+     const result = Bun.spawnSync({
+       cmd: [
+@@ -18,9 +22,17 @@ describe('/new command', () => {
+         `
+           import { findCommand } from ${JSON.stringify(commandRegistryUrl)}
+           import { getCurrentChatId, setCurrentChatId } from ${JSON.stringify(projectFilesUrl)}
++          import { setActiveRunAborter } from ${JSON.stringify(activeRunUrl)}
+ 
+           setCurrentChatId('previous-chat-id')
+ 
++          // Simulate an in-flight run: record which chat was current when the
++          // abort fired.
++          let abortedAtChatId = null
++          setActiveRunAborter('run-1', () => {
++            abortedAtChatId = getCurrentChatId()
++          })
++
+           const newCommand = findCommand('new')
+           if (!newCommand) throw new Error('new command missing')
+ 
+@@ -43,6 +55,17 @@ describe('/new command', () => {
+               '/new did not rotate the chat id — the next save would overwrite the previous chat',
+             )
+           }
++
++          if (abortedAtChatId === null) {
++            throw new Error(
++              '/new did not abort the in-flight run — an orphaned run would keep checkpointing across the chat switch',
++            )
++          }
++          if (abortedAtChatId !== 'previous-chat-id') {
++            throw new Error(
++              '/new aborted the run only after rotating the chat id — late writes could land in the new chat',
++            )
++          }
+         `,
+       ],
+       cwd: process.cwd(),
+diff --git a/cli/src/commands/command-registry.ts b/cli/src/commands/command-registry.ts
+index 69575c39d..cd38ff005 100644
+--- a/cli/src/commands/command-registry.ts
++++ b/cli/src/commands/command-registry.ts
+@@ -14,6 +14,7 @@ import { useThemeStore } from '../hooks/use-theme'
+ import { WEBSITE_URL } from '../login/constants'
+ import { startNewChat } from '../project-files'
+ import { useChatStore } from '../state/chat-store'
++import { abortActiveRun } from '../utils/active-run'
+ import { useFeedbackStore } from '../state/feedback-store'
+ import { useLoginStore } from '../state/login-store'
+ import { AGENT_MODES, END_SESSION_MESSAGE, IS_FREEBUFF } from '../utils/constants'
+@@ -306,6 +307,12 @@ const ALL_COMMANDS: CommandDefinition[] = [
+     handler: (params, args) => {
+       const trimmedArgs = args.trim()
+ 
++      // Abort any in-flight run BEFORE clearing state and rotating the chat
++      // id: an orphaned run would keep streaming after the switch and its
++      // late checkpoints/final save would persist the old conversation's
++      // state under the new chat (or vice versa).
++      abortActiveRun()
++
+       // Clear the conversation and rotate to a fresh chat directory, so the
+       // next message doesn't overwrite the previous conversation's history
+       params.setMessages(() => [])
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index 1c0dddaca..d3020d7f2 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -16,9 +16,14 @@ import { createRunConfig } from '../utils/create-run-config'
+ import { getAgentIdForMode } from '../utils/freebuff-agent-selection'
+ import { loadAgentDefinitions } from '../utils/local-agent-registry'
+ import { logger } from '../utils/logger'
++import {
++  clearActiveRunAborter,
++  setActiveRunAborter,
++} from '../utils/active-run'
+ import {
+   clearLiveChatStateProvider,
+   loadMostRecentChatState,
++  resolveCurrentChatDir,
+   saveChatState,
+   scheduleCheckpointSave,
+   setLiveChatStateProvider,
+@@ -452,6 +457,15 @@ export const useSendMessage = ({
+       // before any async work, so the router can correctly detect busy state.
+       let actualCredits: number | undefined
+ 
++      // Capture this run's chat directory once, up front. Every save for this
++      // run targets this directory: the current chat id can rotate mid-run
++      // (/new, resuming from /history), and resolving the dir at write time
++      // would persist this run's state over a different chat's transcript.
++      // After a switch the store's messages belong to the new conversation,
++      // so persistence and state adoption below are gated on runChatIsCurrent.
++      const runChatDir = resolveCurrentChatDir()
++      const runChatIsCurrent = () => resolveCurrentChatDir() === runChatDir
++
+       // Checkpoint the turn to disk immediately so that killing the process
+       // (closed terminal, crash) can't lose the user's prompt, then keep the
+       // checkpoint fresh from SDK run-state snapshots while the run streams.
+@@ -467,7 +481,34 @@ export const useSendMessage = ({
+         runState: latestRunStateSnapshot,
+         messages: useChatStore.getState().messages,
+       }))
+-      saveChatState(latestRunStateSnapshot, useChatStore.getState().messages)
++
++      // Let chat switches abort this run so it can't keep streaming (and
++      // persisting) for a conversation the user has left.
++      setActiveRunAborter(aiMessageId, () => {
++        // Already aborted (e.g. Esc, or a second chat switch): don't schedule
++        // again — the store may hold the next conversation's messages by now.
++        if (abortController.signal.aborted) {
++          return
++        }
++        abortController.abort()
++        // The abort listener has synchronously finalized the streaming
++        // message (interruption notice + markComplete), and the caller is
++        // about to switch away from this chat. Queue one final checkpoint of
++        // that exact state: periodic checkpoints only cover up to ~5s ago,
++        // and the post-run save below won't fire once the chat has switched.
++        // scheduleCheckpointSave captures the messages array by reference, so
++        // the store reset that follows the switch can't affect the write.
++        scheduleCheckpointSave(
++          latestRunStateSnapshot,
++          useChatStore.getState().messages,
++          runChatDir,
++        )
++      })
++      saveChatState(
++        latestRunStateSnapshot,
++        useChatStore.getState().messages,
++        runChatDir,
++      )
+ 
+       // Execute SDK run with streaming handlers
+       try {
+@@ -522,12 +563,24 @@ export const useSendMessage = ({
+               : undefined,
+           onStateSnapshot: (snapshot) => {
+             latestRunStateSnapshot = snapshot
++            // Don't persist once the run is aborted or the user has switched
++            // chats: the store's messages then belong to a different
++            // conversation, and checkpointing them into this run's directory
++            // would overwrite that chat's transcript with foreign (possibly
++            // empty) state — the chat would then be hidden from /history.
++            if (abortController.signal.aborted || !runChatIsCurrent()) {
++              return
++            }
+             // Persist asynchronously and coalescing: the periodic snapshot
+             // fires ~every 5s at step boundaries, and a synchronous save of the
+             // (growing) transcript on the render/input thread is what stalls
+             // long sessions. The authoritative synchronous saves below still
+             // capture the final state.
+-            scheduleCheckpointSave(snapshot, useChatStore.getState().messages)
++            scheduleCheckpointSave(
++              snapshot,
++              useChatStore.getState().messages,
++              runChatDir,
++            )
+           },
+         })
+ 
+@@ -554,19 +607,28 @@ export const useSendMessage = ({
+         )
+         const runState = await client.run(runConfig)
+ 
+-        // Finalize: persist state and mark complete
+-        previousRunStateRef.current = runState
+-        setRunState(runState)
+-        setIsRetrying(false)
+-
+-        // Drop any queued/in-flight async checkpoint first so a stale write
+-        // can't land after this authoritative final save.
+-        await settleCheckpointSave()
+-        // Read committed state rather than saving inside a setMessages
+-        // updater: the store uses immer, so the updater sees a draft proxy
+-        // and JSON.stringify of the (unbounded) transcript through proxy
+-        // traps is several times slower.
+-        saveChatState(runState, useChatStore.getState().messages)
++        // Only adopt and persist the result while this run's chat is still
++        // the active one. After a mid-run chat switch (/new, resuming from
++        // /history) the store's messages and run state belong to the new
++        // conversation: saving here would overwrite it with this run's
++        // context, and previousRunStateRef/setRunState would leak this run's
++        // agent state into the other chat. (A plain Esc interrupt keeps the
++        // same chat, so the interrupted turn is still saved as before.)
++        if (runChatIsCurrent()) {
++          // Finalize: persist state and mark complete
++          previousRunStateRef.current = runState
++          setRunState(runState)
++          setIsRetrying(false)
++
++          // Drop any queued/in-flight async checkpoint first so a stale write
++          // can't land after this authoritative final save.
++          await settleCheckpointSave()
++          // Read committed state rather than saving inside a setMessages
++          // updater: the store uses immer, so the updater sees a draft proxy
++          // and JSON.stringify of the (unbounded) transcript through proxy
++          // traps is several times slower.
++          saveChatState(runState, useChatStore.getState().messages, runChatDir)
++        }
+         handleRunCompletion({
+           runState,
+           actualCredits,
+@@ -604,12 +666,16 @@ export const useSendMessage = ({
+           })
+           // Persist the last checkpoint plus the error banner so a restart
+           // after a failed run still shows this turn. Settle async checkpoints
+-          // first so a stale write can't clobber this one.
+-          await settleCheckpointSave()
+-          saveChatState(
+-            latestRunStateSnapshot,
+-            useChatStore.getState().messages,
+-          )
++          // first so a stale write can't clobber this one. Skipped after a
++          // mid-run chat switch — the store's messages belong to the new chat.
++          if (runChatIsCurrent()) {
++            await settleCheckpointSave()
++            saveChatState(
++              latestRunStateSnapshot,
++              useChatStore.getState().messages,
++              runChatDir,
++            )
++          }
+         } else {
+           logger.debug({ error }, '[send-message] Ignoring error after abort')
+         }
+@@ -618,6 +684,7 @@ export const useSendMessage = ({
+         // checkpoint, on error) has been saved above. Owner-guarded so an
+         // aborted run resolving late can't clear a newer run's provider.
+         clearLiveChatStateProvider(aiMessageId)
++        clearActiveRunAborter(aiMessageId)
+         // If this run was aborted, the abort handler already released the chain lock
+         // and queue processing state. Don't touch shared state here to avoid
+         // interfering with any new run that may have started after the abort.
+diff --git a/cli/src/utils/__tests__/run-state-storage.test.ts b/cli/src/utils/__tests__/run-state-storage.test.ts
+index 8b8098bb4..d4d2dd36d 100644
+--- a/cli/src/utils/__tests__/run-state-storage.test.ts
++++ b/cli/src/utils/__tests__/run-state-storage.test.ts
+@@ -616,3 +616,132 @@ describe('scheduleCheckpointSave (async, coalescing)', () => {
+     await expect(settleCheckpointSave()).resolves.toBeUndefined()
+   })
+ })
++
++describe('chat switches while saves are pending', () => {
++  // Regression tests for /history threads being clobbered: save paths used to
++  // be resolved at write time from the mutable current chat id, so a pending
++  // write from chat A could land in chat B's directory after a /new or
++  // /history resume rotated the id in between.
++  const chatDirA = path.join(os.tmpdir(), 'codebuff-test-switch-chat-a')
++  const chatDirB = path.join(os.tmpdir(), 'codebuff-test-switch-chat-b')
++
++  const runState = (marker: string) =>
++    ({ output: { type: 'error', message: marker } }) as unknown as RunState
++
++  const messages = (marker: string): ChatMessage[] => [
++    {
++      id: 'msg-1',
++      variant: 'user',
++      content: marker,
++      timestamp: new Date().toISOString(),
++    },
++  ]
++
++  const messagesFileIn = (dir: string) => path.join(dir, 'chat-messages.json')
++
++  beforeEach(() => {
++    fs.rmSync(chatDirA, { recursive: true, force: true })
++    fs.rmSync(chatDirB, { recursive: true, force: true })
++    setChatDirOverrideForTesting(chatDirA)
++  })
++
++  afterEach(async () => {
++    await settleCheckpointSave()
++    clearLiveChatStateProvider('run-a')
++    setChatDirOverrideForTesting(undefined)
++    fs.rmSync(chatDirA, { recursive: true, force: true })
++    fs.rmSync(chatDirB, { recursive: true, force: true })
++  })
++
++  test('a checkpoint scheduled before a chat switch writes to the original chat dir', async () => {
++    scheduleCheckpointSave(runState('a'), messages('chat A transcript'))
++
++    // Simulate /new or a /history resume rotating the current chat while the
++    // async checkpoint write is still queued.
++    setChatDirOverrideForTesting(chatDirB)
++    await settleCheckpointSave()
++
++    const saved = JSON.parse(
++      fs.readFileSync(messagesFileIn(chatDirA), 'utf8'),
++    ) as ChatMessage[]
++    expect(saved[0].content).toBe('chat A transcript')
++    expect(fs.existsSync(messagesFileIn(chatDirB))).toBe(false)
++  })
++
++  test('checkpoints for different chats do not displace each other', async () => {
++    // Chat A's final flush is queued, then the newly-active chat B schedules
++    // its own checkpoint before the queue drains. Both must be written —
++    // coalescing is per chat, not global.
++    scheduleCheckpointSave(runState('a'), messages('chat A final'), chatDirA)
++    scheduleCheckpointSave(runState('b'), messages('chat B first'), chatDirB)
++
++    await settleCheckpointSave()
++
++    const savedA = JSON.parse(
++      fs.readFileSync(messagesFileIn(chatDirA), 'utf8'),
++    ) as ChatMessage[]
++    const savedB = JSON.parse(
++      fs.readFileSync(messagesFileIn(chatDirB), 'utf8'),
++    ) as ChatMessage[]
++    expect(savedA[0].content).toBe('chat A final')
++    expect(savedB[0].content).toBe('chat B first')
++  })
++
++  test('saveChatState with an explicit chatDir ignores a later chat switch', () => {
++    setChatDirOverrideForTesting(chatDirB)
++
++    // chatDirA was captured while chat A was current (run start).
++    saveChatState(runState('a'), messages('chat A final'), chatDirA)
++
++    const saved = JSON.parse(
++      fs.readFileSync(messagesFileIn(chatDirA), 'utf8'),
++    ) as ChatMessage[]
++    expect(saved[0].content).toBe('chat A final')
++    expect(fs.existsSync(messagesFileIn(chatDirB))).toBe(false)
++  })
++
++  test('flushLiveChatState after a chat switch writes nothing', () => {
++    setLiveChatStateProvider('run-a', () => ({
++      runState: runState('a'),
++      // After the switch the store holds the NEW chat's messages; flushing
++      // them into chat A's directory would replace A's transcript.
++      messages: messages('chat B messages'),
++    }))
++
++    setChatDirOverrideForTesting(chatDirB)
++    flushLiveChatState()
++
++    expect(fs.existsSync(messagesFileIn(chatDirA))).toBe(false)
++    expect(fs.existsSync(messagesFileIn(chatDirB))).toBe(false)
++  })
++
++  test('flushLiveChatState drains queued checkpoints synchronously on exit', () => {
++    // A chat switch aborted the run and queued its final checkpoint, then the
++    // process exits before the async drain runs. The exit flush must write
++    // the queued checkpoint (to chat A) even though the current chat is B.
++    scheduleCheckpointSave(runState('a'), messages('aborted turn'), chatDirA)
++    setChatDirOverrideForTesting(chatDirB)
++
++    flushLiveChatState()
++
++    const saved = JSON.parse(
++      fs.readFileSync(messagesFileIn(chatDirA), 'utf8'),
++    ) as ChatMessage[]
++    expect(saved[0].content).toBe('aborted turn')
++    expect(fs.existsSync(messagesFileIn(chatDirB))).toBe(false)
++  })
++
++  test('flushLiveChatState still writes to the run chat dir when unswitched', () => {
++    setLiveChatStateProvider('run-a', () => ({
++      runState: runState('a'),
++      messages: messages('in-flight prompt'),
++    }))
++
++    flushLiveChatState()
++
++    const saved = JSON.parse(
++      fs.readFileSync(messagesFileIn(chatDirA), 'utf8'),
++    ) as ChatMessage[]
++    expect(saved[0].content).toBe('in-flight prompt')
++  })
++})
+diff --git a/cli/src/utils/active-run.ts b/cli/src/utils/active-run.ts
+new file mode 100644
+index 000000000..aa3b03116
+--- /dev/null
++++ b/cli/src/utils/active-run.ts
+@@ -0,0 +1,22 @@
++// Registry for the in-flight agent run's abort hook. Chat switches (/new,
++// resuming from /history) must stop the active run: an orphaned run would keep
++// streaming invisibly and keep persisting checkpoints for a chat the user has
++// left. ownerId ties the registration to a specific run so a stale run
++// settling late can't clear a newer run's aborter.
++
++let activeRun: { ownerId: string; abort: () => void } | null = null
++
++export function setActiveRunAborter(ownerId: string, abort: () => void): void {
++  activeRun = { ownerId, abort }
++}
++
++export function clearActiveRunAborter(ownerId: string): void {
++  if (activeRun?.ownerId === ownerId) {
++    activeRun = null
++  }
++}
++
++/** Abort the in-flight agent run, if any. Safe to call when idle. */
++export function abortActiveRun(): void {
++  activeRun?.abort()
++}
+diff --git a/cli/src/utils/run-state-storage.ts b/cli/src/utils/run-state-storage.ts
+index 1cfaa04e0..759633b0a 100644
+--- a/cli/src/utils/run-state-storage.ts
++++ b/cli/src/utils/run-state-storage.ts
+@@ -33,6 +33,7 @@ type LiveChatState = {
+ 
+ let liveChatStateProvider: {
+   ownerId: string
++  chatDir: string
+   provide: () => LiveChatState | null
+ } | null = null
+ 
+@@ -40,13 +41,15 @@ let liveChatStateProvider: {
+  * Register a provider for the in-flight chat state. While a run is active,
+  * exit paths call flushLiveChatState() to persist the latest checkpoint so a
+  * quit/crash doesn't lose the turn. ownerId ties the provider to a specific
+- * run so a stale run can't clear a newer run's provider.
++ * run so a stale run can't clear a newer run's provider. The chat directory
++ * is captured at registration time so a later chat switch can't redirect the
++ * flush into a different chat's directory.
+  */
+ export function setLiveChatStateProvider(
+   ownerId: string,
+   provide: () => LiveChatState | null,
+ ): void {
+-  liveChatStateProvider = { ownerId, provide }
++  liveChatStateProvider = { ownerId, chatDir: resolveCurrentChatDir(), provide }
+ }
+ 
+ export function clearLiveChatStateProvider(ownerId: string): void {
+@@ -61,9 +64,31 @@ export function clearLiveChatStateProvider(ownerId: string): void {
+  */
+ export function flushLiveChatState(): void {
+   try {
+-    const state = liveChatStateProvider?.provide()
++    // The process is exiting, so the async drain will never get to run:
++    // write any queued checkpoints synchronously first. Each is bound to the
++    // chat dir captured when it was scheduled. The live provider below may
++    // overwrite one of these with strictly newer state — that order is
++    // intentional.
++    for (const [chatDir, state] of pendingCheckpoints) {
++      saveChatState(state.runState, state.messages, chatDir)
++    }
++    pendingCheckpoints.clear()
++
++    const provider = liveChatStateProvider
++    if (!provider) {
++      return
++    }
++    // The provider reads live store state. Once the user has switched to a
++    // different chat (/new, resuming from /history), that state no longer
++    // matches the provider's chat directory — flushing would overwrite the
++    // run's chat with another conversation's messages. Skip instead; the
++    // run's last checkpoint was flushed from the queue above.
++    if (provider.chatDir !== resolveCurrentChatDir()) {
++      return
++    }
++    const state = provider.provide()
+     if (state) {
+-      saveChatState(state.runState, state.messages)
++      saveChatState(state.runState, state.messages, provider.chatDir)
+     }
+   } catch {
+     // Best-effort - never block process exit.
+@@ -115,7 +140,14 @@ export function setChatDirOverrideForTesting(dir: string | undefined): void {
+   chatDirOverride = dir
+ }
+ 
+-function resolveCurrentChatDir(): string {
++/**
++ * Resolve the directory of the currently active chat. Persistence callers
++ * must capture this at the moment the state is captured (run start, snapshot
++ * time) and pass it through to the save — resolving it again at write time
++ * races with chat switches (/new, resuming from /history) and would write one
++ * chat's transcript into another chat's directory.
++ */
++export function resolveCurrentChatDir(): string {
+   if (chatDirOverride) {
+     fs.mkdirSync(chatDirOverride, { recursive: true })
+     return chatDirOverride
+@@ -140,16 +172,24 @@ export function getChatMessagesPath(): string {
+ }
+ 
+ /**
+- * Save both the RunState and ChatMessage[] to disk
++ * Save both the RunState and ChatMessage[] to disk.
++ *
++ * `chatDir` should be captured when the state itself is captured (e.g. at run
++ * start) and passed through. Defaulting to the current chat dir is only safe
++ * when the caller knows no chat switch can have happened in between.
+  */
+ export function saveChatState(
+   runState: RunState,
+   messages: ChatMessage[],
++  chatDir: string = resolveCurrentChatDir(),
+ ): void {
+   try {
+-    const runStatePath = getRunStatePath()
+-    const messagesPath = getChatMessagesPath()
++    const runStatePath = path.join(chatDir, RUN_STATE_FILENAME)
++    const messagesPath = path.join(chatDir, CHAT_MESSAGES_FILENAME)
+ 
++    // The dir existed when the save was captured, but may have been removed
++    // since (e.g. the chat deleted from /history mid-run).
++    fs.mkdirSync(chatDir, { recursive: true })
+     // Compact JSON: these files are rewritten on every checkpoint and grow to
+     // multiple MB; pretty-printing roughly doubles the write.
+     writeFileAtomic(runStatePath, JSON.stringify(runState))
+@@ -157,7 +197,7 @@ export function saveChatState(
+     // Sidecar summary so /history can list this chat without parsing the
+     // (unbounded) chat-messages.json. Must be written after the messages
+     // file: it records the file's size/mtime to detect staleness.
+-    writeChatMeta(resolveCurrentChatDir(), messages)
++    writeChatMeta(chatDir, messages)
+   } catch (error) {
+     logger.error(
+       {
+@@ -175,12 +215,13 @@ export function saveChatState(
+ async function saveChatStateAsync(
+   runState: RunState,
+   messages: ChatMessage[],
++  chatDir: string,
+ ): Promise<void> {
+   try {
+-    const runStatePath = getRunStatePath()
+-    const messagesPath = getChatMessagesPath()
+-    const chatDir = resolveCurrentChatDir()
++    const runStatePath = path.join(chatDir, RUN_STATE_FILENAME)
++    const messagesPath = path.join(chatDir, CHAT_MESSAGES_FILENAME)
+ 
++    await fs.promises.mkdir(chatDir, { recursive: true })
+     await writeFileAtomicAsync(runStatePath, JSON.stringify(runState))
+     await writeFileAtomicAsync(messagesPath, JSON.stringify(messages))
+     // Sidecar summary so /history can list this chat without parsing the
+@@ -205,32 +246,46 @@ async function saveChatStateAsync(
+ // sessions that periodic stall is what users experience as "freezes". Instead,
+ // schedule the write asynchronously and collapse bursts to a single in-flight
+ // write, always persisting the latest state.
+-let pendingCheckpoint: LiveChatState | null = null
++// Coalesced per chat directory: a burst of checkpoints for the same chat
++// collapses to the latest, but a checkpoint for one chat can never displace a
++// still-queued checkpoint for another (e.g. the final flush of a chat the
++// user just switched away from).
++const pendingCheckpoints = new Map<string, LiveChatState>()
+ let checkpointDrain: Promise<void> | null = null
+ 
+ async function drainCheckpoints(): Promise<void> {
+-  while (pendingCheckpoint) {
+-    const next = pendingCheckpoint
+-    pendingCheckpoint = null
++  while (pendingCheckpoints.size > 0) {
+     // Yield first so serialization never runs on the same tick that scheduled
+-    // us (that tick is often mid-render or handling a keystroke).
++    // us (that tick is often mid-render or handling a keystroke). Entries stay
++    // in the map while we yield, so the synchronous exit flush can still write
++    // them if the process quits before we resume.
+     await new Promise<void>((resolve) => setImmediate(resolve))
+-    await saveChatStateAsync(next.runState, next.messages)
++    const entry = pendingCheckpoints.entries().next()
++    if (entry.done) {
++      break
++    }
++    const [chatDir, state] = entry.value
++    pendingCheckpoints.delete(chatDir)
++    // Write to the chat dir captured at schedule time: the current chat may
++    // have rotated (/new, /history resume) while this write sat in the queue,
++    // and resolving the dir here would dump this state into the wrong chat.
++    await saveChatStateAsync(state.runState, state.messages, chatDir)
+   }
+ }
+ 
+ /**
+  * Schedule an asynchronous, coalescing checkpoint save. Safe to call at a high
+  * rate: only one write runs at a time and intermediate states are dropped in
+- * favor of the latest. Use this for periodic in-flight checkpoints; use the
+- * synchronous saveChatState for one-shot authoritative saves (turn completion,
+- * exit flush).
++ * favor of the latest (per chat). Use this for periodic in-flight checkpoints;
++ * use the synchronous saveChatState for one-shot authoritative saves (turn
++ * completion, exit flush).
+  */
+ export function scheduleCheckpointSave(
+   runState: RunState,
+   messages: ChatMessage[],
++  chatDir: string = resolveCurrentChatDir(),
+ ): void {
+-  pendingCheckpoint = { runState, messages }
++  pendingCheckpoints.set(chatDir, { runState, messages })
+   if (!checkpointDrain) {
+     checkpointDrain = drainCheckpoints().finally(() => {
+       checkpointDrain = null

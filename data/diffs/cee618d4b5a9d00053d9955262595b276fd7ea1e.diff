@@ -1,0 +1,187 @@
+diff --git a/cli/src/hooks/__tests__/holds-live-freebuff-slot.test.ts b/cli/src/hooks/__tests__/holds-live-freebuff-slot.test.ts
+new file mode 100644
+index 000000000..6f4dd35a7
+--- /dev/null
++++ b/cli/src/hooks/__tests__/holds-live-freebuff-slot.test.ts
+@@ -0,0 +1,49 @@
++import { describe, test, expect } from 'bun:test'
++
++import { holdsLiveFreebuffSlot } from '../use-freebuff-session'
++
++import type { FreebuffSessionResponse } from '../../types/freebuff-session'
++
++// Gate predicate for both the message queue (may queued work still be sent?)
++// and slot release (is there a server row to DELETE?). The load-bearing cases
++// are the two 'ended' variants: WITH an instance id we're inside the server's
++// grace window and requests are still admissible; WITHOUT one the session is
++// fully over and any request would be rejected by the chat-completions gate.
++
++const activeSession: FreebuffSessionResponse = {
++  status: 'active',
++  accessTier: 'full',
++  instanceId: 'inst-1',
++  model: 'deepseek/deepseek-v4',
++  admittedAt: new Date().toISOString(),
++  expiresAt: new Date(Date.now() + 60_000).toISOString(),
++  remainingMs: 60_000,
++}
++
++describe('holdsLiveFreebuffSlot', () => {
++  test('active session holds a slot', () => {
++    expect(holdsLiveFreebuffSlot(activeSession)).toBe(true)
++  })
++
++  test('ended WITH instance id (grace window) still holds a slot', () => {
++    expect(
++      holdsLiveFreebuffSlot({ status: 'ended', instanceId: 'inst-1' }),
++    ).toBe(true)
++  })
++
++  test('ended WITHOUT instance id (post-grace) does not hold a slot', () => {
++    expect(holdsLiveFreebuffSlot({ status: 'ended' })).toBe(false)
++  })
++
++  test('null session does not hold a slot', () => {
++    expect(holdsLiveFreebuffSlot(null)).toBe(false)
++  })
++
++  test('pre-join and terminal states do not hold a slot', () => {
++    expect(holdsLiveFreebuffSlot({ status: 'none' })).toBe(false)
++    expect(holdsLiveFreebuffSlot({ status: 'superseded' })).toBe(false)
++    expect(
++      holdsLiveFreebuffSlot({ status: 'takeover_prompt', model: 'm' }),
++    ).toBe(false)
++  })
++})
+diff --git a/cli/src/hooks/use-chat-streaming.ts b/cli/src/hooks/use-chat-streaming.ts
+index b2d2fd524..2b6dbd888 100644
+--- a/cli/src/hooks/use-chat-streaming.ts
++++ b/cli/src/hooks/use-chat-streaming.ts
+@@ -11,11 +11,14 @@ import { authQueryKeys } from './use-auth-query'
+ import { useConnectionStatus } from './use-connection-status'
+ import { useElapsedTime } from './use-elapsed-time'
+ import { useExitHandler } from './use-exit-handler'
++import { holdsLiveFreebuffSlot } from './use-freebuff-session'
+ import { useMessageQueue, type QueuedMessage, type StreamStatus } from './use-message-queue'
+ import { useQueueControls } from './use-queue-controls'
+ import { useQueueUi } from './use-queue-ui'
+ import { useTimeout } from './use-timeout'
+ import { useChatStore } from '../state/chat-store'
++import { useFreebuffSessionStore } from '../state/freebuff-session-store'
++import { IS_FREEBUFF } from '../utils/constants'
+ 
+ import type { ElapsedTimeTracker } from './use-elapsed-time'
+ import type { PendingAttachment } from '../types/store'
+@@ -132,6 +135,16 @@ export function useChatStreaming({
+     }
+   }, [askUserState, mainAgentTimer])
+ 
++  // Freebuff: once the free session is fully over (no live slot — not even
++  // the post-expiry grace window), hold queued messages instead of firing
++  // them. Without this, pending tasks queued before the session ended keep
++  // dispatching after the hard cutoff and get rejected by the server's
++  // session gate one by one. The hold lifts automatically when the user
++  // rejoins (SessionEndedBanner → refreshFreebuffSession → status 'active'),
++  // so queued work resumes in the new session.
++  const freebuffSession = useFreebuffSessionStore((s) => s.session)
++  const sendBlocked = IS_FREEBUFF && !holdsLiveFreebuffSlot(freebuffSession)
++
+   // Message queue
+   const {
+     queuedMessages,
+@@ -156,6 +169,7 @@ export function useChatStreaming({
+       }) ?? Promise.resolve(),
+     isChainInProgressRef,
+     activeAgentStreamsRef,
++    { sendBlocked },
+   )
+ 
+   // Queue UI
+diff --git a/cli/src/hooks/use-freebuff-session.ts b/cli/src/hooks/use-freebuff-session.ts
+index b025289ca..d40a78454 100644
+--- a/cli/src/hooks/use-freebuff-session.ts
++++ b/cli/src/hooks/use-freebuff-session.ts
+@@ -206,11 +206,16 @@ export function getFreebuffInstanceId(): string | undefined {
+   }
+ }
+ 
+-/** True when the session row represents a server-side slot the caller is
++/** True when the session represents a server-side slot the caller is
+  *  holding (active, or in the post-expiry grace window with a live
+- *  instance id). DELETE only matters in those states; otherwise we'd fire a
+- *  spurious request the server has nothing to act on. */
+-function shouldReleaseSlot(current: FreebuffSessionResponse | null): boolean {
++ *  instance id). Chat requests are only admissible in these states — once
++ *  the slot is gone, `getFreebuffInstanceId` returns undefined and the
++ *  server rejects the request — so the message queue gates on this before
++ *  firing queued work. Same predicate gates DELETE on exit: outside these
++ *  states there is no server row to release. */
++export function holdsLiveFreebuffSlot(
++  current: FreebuffSessionResponse | null,
++): boolean {
+   if (!current) return false
+   return (
+     current.status === 'active' ||
+@@ -253,7 +258,7 @@ function toLandingSession(
+  *  server-side sweep is the backstop. */
+ async function releaseFreebuffSlot(): Promise<void> {
+   const current = useFreebuffSessionStore.getState().session
+-  if (!shouldReleaseSlot(current)) return
++  if (!holdsLiveFreebuffSlot(current)) return
+   const { token } = getAuthTokenDetails()
+   if (!token) return
+   try {
+@@ -687,7 +692,7 @@ export function useFreebuffSession(): UseFreebuffSessionResult {
+ 
+       // Fire-and-forget DELETE. Only release if we actually held a slot so
+       // we don't generate spurious DELETEs (e.g. HMR before POST completes).
+-      if (shouldReleaseSlot(current)) {
++      if (holdsLiveFreebuffSlot(current)) {
+         callSession('DELETE', token).catch(() => {})
+       }
+       setSession(null)
+diff --git a/cli/src/hooks/use-message-queue.ts b/cli/src/hooks/use-message-queue.ts
+index cf6a5a7de..64c965116 100644
+--- a/cli/src/hooks/use-message-queue.ts
++++ b/cli/src/hooks/use-message-queue.ts
+@@ -18,7 +18,14 @@ export const useMessageQueue = (
+   sendMessage: (message: QueuedMessage) => Promise<void>,
+   isChainInProgressRef: React.MutableRefObject<boolean>,
+   activeAgentStreamsRef: React.MutableRefObject<number>,
++  opts: {
++    /** External hold on dequeuing (e.g. the freebuff session ended and new
++     *  requests would be rejected). Queued messages are kept, not dropped;
++     *  processing resumes automatically when this flips back to false. */
++    sendBlocked?: boolean
++  } = {},
+ ) => {
++  const sendBlocked = opts.sendBlocked ?? false
+   const [queuedMessages, setQueuedMessages] = useState<QueuedMessage[]>([])
+   const [streamStatus, setStreamStatus] = useState<StreamStatus>('idle')
+   const [canProcessQueue, setCanProcessQueue] = useState<boolean>(true)
+@@ -83,6 +90,17 @@ export const useMessageQueue = (
+       return
+     }
+ 
++    // External hold: sending is currently pointless (e.g. freebuff session
++    // fully ended — requests without a live session are rejected). Leave the
++    // messages queued; the effect below re-runs when sendBlocked flips false.
++    if (sendBlocked) {
++      logger.debug(
++        { queueLength },
++        '[message-queue] Queue blocked: sending unavailable',
++      )
++      return
++    }
++
+     if (!canProcessQueue) {
+       return
+     }
+@@ -193,6 +211,7 @@ export const useMessageQueue = (
+     canProcessQueue,
+     streamStatus,
+     sendMessage,
++    sendBlocked,
+     isChainInProgressRef,
+     activeAgentStreamsRef,
+   ])

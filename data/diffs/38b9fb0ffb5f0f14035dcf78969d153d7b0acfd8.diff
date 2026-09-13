@@ -1,0 +1,1181 @@
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index 50bad5c95..4c4cb7ffa 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -5,6 +5,8 @@ import { safeOpen } from './utils/open-url'
+ import { getAuthToken } from './utils/auth'
+ import { isSponsoredProposalBlock } from './types/chat'
+ import { runSponsoredProposalControl } from './utils/sponsored-proposal-control'
++import { sponsoredRunFor } from './utils/sponsored-run'
++import { useSponsoredProposal } from './hooks/use-sponsored-proposal'
+ import {
+   useCallback,
+   useEffect,
+@@ -265,13 +267,18 @@ export const Chat = ({
+   // transcript rather than kept as its own flag: the menu is a property of a
+   // block, and a second source of truth would go stale the moment a block is
+   // answered or replaced while its menu is open.
++  //
++  // AN OPEN CONSENT COUNTS TOO (COD-339), and it matters more than the menu
++  // does: its Enter answers "run an advertiser's procedure on this machine",
++  // and an Enter that also reached the composer would send a prompt at the same
++  // time as it approved a run.
+   const sponsoredProposalMenuOpen = useMemo(
+     () =>
+       messages.some((message) =>
+         message.blocks?.some(
+           (block) =>
+             isSponsoredProposalBlock(block) &&
+-            block.menuOpen === true &&
++            (block.menuOpen === true || block.consent !== undefined) &&
+             block.answered !== true,
+         ),
+       ),
+@@ -340,6 +347,78 @@ export const Chat = ({
+     },
+   )
+ 
++  /**
++   * Accept, in two halves (COD-339, COD-336 item 4).
++   *
++   * The first half OPENS the consent and writes nothing anywhere -- not
++   * upstream, not on disk. Everything the screen names is known before the
++   * accept, which is exactly what makes a refusal free: there is nothing to
++   * undo. The branch is minted here with the run id it will be created under,
++   * so the branch the screen names is the branch that is cut.
++   */
++  const handleSponsoredProposalAccept = useEvent((target: string) => {
++    const block = findProposalBlock(target)
++    if (!block || block.busy || block.answered || block.consent) return
++    void (async () => {
++      const run = sponsoredRunFor(getProjectRoot())
++      const consent = await run.consentFor(block.proposal)
++      if (!consent.ok) {
++        setMessages((prev) => [...prev, getSystemMessage(consent.message)])
++        return
++      }
++      patchProposalBlock(target, {
++        menuOpen: false,
++        consent: { ...consent.consent, runId: consent.runId },
++        consentIndex: 0,
++      })
++    })()
++  })
++
++  /**
++   * The consent's answer.
++   *
++   * A REFUSAL CLOSES THE SCREEN AND DOES NOTHING ELSE. Not a dismiss, not a
++   * decline recorded upstream -- the user said "not now" to running something,
++   * which is not the same as saying they never want to see it, and conflating
++   * the two would spend a control they did not press.
++   */
++  const handleSponsoredProposalConsent = useEvent(
++    (target: string, approved: boolean) => {
++      const block = findProposalBlock(target)
++      const consent = block?.consent
++      if (!block || !consent) return
++      patchProposalBlock(target, { consent: undefined, consentIndex: 0 })
++      if (!approved) return
++      patchProposalBlock(target, { busy: true })
++      void (async () => {
++        const run = sponsoredRunFor(getProjectRoot())
++        const outcome = await run.accept(block.proposal, consent.runId)
++        // `runStarted` is what makes the poller watch: the row upstream still
++        // reads `offered` until the first poll after the accept, and keying the
++        // cadence on the state alone would slow it down at exactly the moment
++        // watching starts to matter.
++        patchProposalBlock(target, {
++          busy: false,
++          ...(outcome.ok ? { runStarted: true } : {}),
++        })
++        setMessages((prev) => [
++          ...prev,
++          getSystemMessage(
++            outcome.ok
++              ? `Started ${consent.advertiserName}'s sponsored task on ${consent.branch}. Nothing will be pushed.`
++              : 'message' in outcome
++                ? outcome.message
++                : 'The sponsored task was not started.',
++          ),
++        ])
++      })()
++    },
++  )
++
++  // Mounted here rather than inside the card, because the card does not exist
++  // until this hook puts it there (COD-339: nothing polled before it).
++  useSponsoredProposal()
++
+   // Set initial mode from CLI flag on mount
+   useEffect(() => {
+     if (initialMode) {
+@@ -1515,6 +1594,8 @@ export const Chat = ({
+       onResponseAdsNeeded: handleResponseAdsNeeded,
+       onSponsoredProposalMenu: handleSponsoredProposalMenu,
+       onSponsoredProposalDisclose: handleSponsoredProposalDisclose,
++      onSponsoredProposalAccept: handleSponsoredProposalAccept,
++      onSponsoredProposalConsent: handleSponsoredProposalConsent,
+       onSponsoredProposalControl: handleSponsoredProposalControl,
+     })
+   }, [
+diff --git a/cli/src/commands/__tests__/ads-proposal-commands.test.ts b/cli/src/commands/__tests__/ads-proposal-commands.test.ts
+index b1403ca5d..d49f043a3 100644
+--- a/cli/src/commands/__tests__/ads-proposal-commands.test.ts
++++ b/cli/src/commands/__tests__/ads-proposal-commands.test.ts
+@@ -2,10 +2,14 @@ import { SPONSORED_ROW_FIXTURES } from '@codebuff/common/ads/__fixtures__/sponso
+ import { afterEach, describe, expect, test } from 'bun:test'
+ 
+ import {
++  handleProposalAccept,
+   handleProposalDismiss,
+   handleProposalMenu,
++  handleProposalPullRequest,
++  handleProposalRemoveWorktree,
+   liveSponsoredProposal,
+ } from '../ads'
++import { setSponsoredCliAvailability } from '../../utils/sponsored-availability'
+ import { useMessageBlockStore } from '../../state/message-block-store'
+ 
+ import type { ChatMessage, SponsoredProposalContentBlock } from '../../types/chat'
+@@ -117,3 +121,94 @@ describe('liveSponsoredProposal', () => {
+     expect(liveSponsoredProposal([])).toBeNull()
+   })
+ })
++
++/**
++ * Phase 2's three commands (COD-339).
++ *
++ * `/ads:accept-proposal` is the one that matters: it must OPEN the consent and
++ * start nothing, on every path — including the ones where there is nothing to
++ * consent to. The other two are the only route to the two deliberate user
++ * actions after a run, and both have to be honest when there is no run.
++ */
++describe('the Phase 2 commands', () => {
++  test('accept opens the consent, and does not answer the proposal', () => {
++    setSponsoredCliAvailability('available')
++    const calls = recordAcceptCalls()
++    expect(handleProposalAccept(withBlocks(proposalBlock()))).toBeNull()
++    expect(calls).toEqual([['accept', 'acme/deploys']])
++    setSponsoredCliAvailability(null)
++  })
++
++  test('accept says why on a machine that cannot contain a run', () => {
++    // COD-336 item 3, reachable from the command as well as the card: the
++    // command is typed, not clicked, so it does not go through the render-time
++    // gate that hides the control.
++    setSponsoredCliAvailability('unavailable:windows-no-containment')
++    const calls = recordAcceptCalls()
++    const message = handleProposalAccept(withBlocks(proposalBlock()))
++    expect(message).toContain('Windows')
++    expect(calls).toEqual([])
++    setSponsoredCliAvailability(null)
++  })
++
++  test('accept refuses a row that has already been answered', () => {
++    setSponsoredCliAvailability('available')
++    const calls = recordAcceptCalls()
++    const answered = proposalBlock({
++      proposal: {
++        ...SPONSORED_ROW_FIXTURES.committed,
++        _id: 'proposal-1',
++        advertiser_id: 'adv_acme',
++      },
++    })
++    expect(handleProposalAccept(withBlocks(answered))).toContain('already been answered')
++    expect(calls).toEqual([])
++    setSponsoredCliAvailability(null)
++  })
++
++  test('accept with no card on screen says so, and starts nothing', () => {
++    setSponsoredCliAvailability('available')
++    const calls = recordAcceptCalls()
++    expect(handleProposalAccept([])).toBe('No sponsored proposal on screen.')
++    expect(calls).toEqual([])
++    setSponsoredCliAvailability(null)
++  })
++
++  test('the delivery commands are honest when no run has happened', async () => {
++    // Reachable by typing, at any time, with no card and no run. Neither may
++    // throw, and neither may imply something is in flight.
++    expect(await handleProposalPullRequest()).toContain('No sponsored task has run')
++    expect(await handleProposalRemoveWorktree()).toContain('No sponsored task has run')
++  })
++})
++
++function recordAcceptCalls() {
++  const calls: [string, ...unknown[]][] = []
++  useMessageBlockStore.getState().setCallbacks({
++    ...useMessageBlockStore.getState().callbacks,
++    onSponsoredProposalAccept: (target) => calls.push(['accept', target]),
++    onSponsoredProposalConsent: (target, approved) =>
++      calls.push(['consent', target, approved]),
++  })
++  return calls
++}
++
++describe('the commands are reachable by typing them', () => {
++  test('all six sponsored-proposal commands resolve through the registry', async () => {
++    // The card owns no bare keys, so a command that is not in the registry is a
++    // control the user cannot reach at all — and at twenty columns the hint
++    // line has room for two of these names, so the rest are discovered by
++    // typing `/ads:` and reading the menu.
++    const { findCommand } = await import('../command-registry')
++    for (const name of [
++      'ads:proposal',
++      'ads:dismiss-proposal',
++      'ads:accept-proposal',
++      'ads:pull-request',
++      'ads:remove-worktree',
++      'ads:proposals-off',
++    ]) {
++      expect(findCommand(name)?.name, name).toBe(name)
++    }
++  })
++})
+diff --git a/cli/src/commands/ads.ts b/cli/src/commands/ads.ts
+index 58c440e3a..92bcf356f 100644
+--- a/cli/src/commands/ads.ts
++++ b/cli/src/commands/ads.ts
+@@ -8,6 +8,8 @@ import { saveSettings, loadSettings } from '../utils/settings'
+ import { getAuthToken } from '../utils/auth'
+ import { setSponsoredProposalPrefs } from '../utils/sponsored-proposal-api'
+ import { runSponsoredProposalControl } from '../utils/sponsored-proposal-control'
++import { sponsoredCliUnavailableCopy } from '../utils/sponsored-availability'
++import { currentSponsoredRun } from '../utils/sponsored-run'
+ import { isSponsoredProposalBlock } from '../types/chat'
+ 
+ import type {
+@@ -171,6 +173,63 @@ export const handleProposalNeverAdvertiser = (
+     'You will not see proposals from this advertiser again.',
+   )
+ 
++/**
++ * `/ads:accept-proposal` — open the consent screen for the card on screen.
++ *
++ * IT STARTS NOTHING. The command is the gesture; the consent is the decision,
++ * and only the consent can approve a run (COD-336 item 4, adapted for a
++ * terminal in `utils/sponsored-run.ts`). Returns null when it opened one,
++ * because a system line saying "opened" would push the screen it refers to
++ * further up the transcript.
++ */
++export function handleProposalAccept(messages: ChatMessage[]): string | null {
++  const block = liveSponsoredProposal(messages)
++  if (!block) return 'No sponsored proposal on screen.'
++  if (block.proposal.state !== 'offered') {
++    return 'That sponsored task has already been answered.'
++  }
++  const unavailable = sponsoredCliUnavailableCopy()
++  if (unavailable) return unavailable
++  useMessageBlockStore
++    .getState()
++    .callbacks.onSponsoredProposalAccept(block.target)
++  return null
++}
++
++/**
++ * `/ads:pull-request` — turn the run's branch into a pull request.
++ *
++ * THE ONLY PUSH IN THE WHOLE FLOW, and it happens here rather than inside the
++ * run. `createPullRequest` recomputes `committed` from git and verifies the
++ * worktree still points at this repository before either command runs, so this
++ * function is a thin front on those guards and never a second opinion about
++ * whether a push is safe.
++ */
++export async function handleProposalPullRequest(): Promise<string> {
++  const run = currentSponsoredRun()
++  if (!run) return 'No sponsored task has run in this session.'
++  const outcome = await run.createPullRequest()
++  if (!outcome.ok) return outcome.message
++  return outcome.recorded
++    ? `Opened ${outcome.prUrl}`
++    : `Opened ${outcome.prUrl} — Freebuff could not be told about it, which changes nothing about the pull request.`
++}
++
++/**
++ * `/ads:remove-worktree` — discard the workspace a run left behind.
++ *
++ * Named in the interrupt notice as well as here, because an interrupted run is
++ * the moment a user most wants it and the moment they are least likely to go
++ * looking for a command. The run's commits do NOT survive this: the branch goes
++ * with the worktree.
++ */
++export async function handleProposalRemoveWorktree(): Promise<string> {
++  const run = currentSponsoredRun()
++  if (!run) return 'No sponsored task has run in this session.'
++  const outcome = await run.removeWorktree()
++  return outcome.ok ? outcome.message : outcome.message
++}
++
+ /**
+  * Turns sponsored PROPOSALS off. Deliberately separate from `/ads:disable`,
+  * which is the display rail: the two are different channels with different
+diff --git a/cli/src/commands/command-registry.ts b/cli/src/commands/command-registry.ts
+index 9c381796f..860965512 100644
+--- a/cli/src/commands/command-registry.ts
++++ b/cli/src/commands/command-registry.ts
+@@ -3,8 +3,11 @@ import { safeOpen } from '../utils/open-url'
+ import {
+   handleAdsEnable,
+   handleAdsDisable,
++  handleProposalAccept,
+   handleProposalDismiss,
+   handleProposalMenu,
++  handleProposalPullRequest,
++  handleProposalRemoveWorktree,
+   handleProposalNeverAdvertiser,
+   handleProposalReport,
+   handleProposalsOff,
+@@ -252,6 +255,37 @@ const ALL_COMMANDS: CommandDefinition[] = [
+       clearInput(params)
+     },
+   }),
++  // Phase 2 (COD-339): accept, and the two commands that only mean anything
++  // once a run has left a branch behind. `accept-proposal` opens the CONSENT
++  // and starts nothing -- the screen is the decision, and it is refusable.
++  defineCommand({
++    name: 'ads:accept-proposal',
++    handler: (params) => {
++      const message = handleProposalAccept(useChatStore.getState().messages)
++      // Null means the consent screen is up, which is visible on its own.
++      if (message) params.setMessages((prev) => [...prev, getSystemMessage(message)])
++      params.saveToHistory(params.inputValue.trim())
++      clearInput(params)
++    },
++  }),
++  defineCommand({
++    name: 'ads:pull-request',
++    handler: async (params) => {
++      const message = await handleProposalPullRequest()
++      params.setMessages((prev) => [...prev, getSystemMessage(message)])
++      params.saveToHistory(params.inputValue.trim())
++      clearInput(params)
++    },
++  }),
++  defineCommand({
++    name: 'ads:remove-worktree',
++    handler: async (params) => {
++      const message = await handleProposalRemoveWorktree()
++      params.setMessages((prev) => [...prev, getSystemMessage(message)])
++      params.saveToHistory(params.inputValue.trim())
++      clearInput(params)
++    },
++  }),
+   defineCommand({
+     name: 'ads:report-proposal',
+     handler: async (params) => {
+diff --git a/cli/src/components/__tests__/__snapshots__/sponsored-proposal-frames.txt b/cli/src/components/__tests__/__snapshots__/sponsored-proposal-frames.txt
+index b8bc126a9..506994b2f 100644
+--- a/cli/src/components/__tests__/__snapshots__/sponsored-proposal-frames.txt
++++ b/cli/src/components/__tests__/__snapshots__/sponsored-proposal-frames.txt
+@@ -31,7 +31,10 @@
+ │ Add one-click deploys to this project        │
+ │ A sponsored agent can wire Acme Deploys      │
+ │ into your repo on its own branch.            │
+-│ /ads:proposal · /ads:dismiss-proposal        │
++│ It runs here, in its own worktree, and uses  │
++│ your session and credits, like any other     │
++│ task.                                        │
++│ /ads:accept-proposal · /ads:dismiss-proposal │
+ └──────────────────────────────────────────────┘
+ 
+ 
+@@ -47,9 +50,6 @@
+ 
+ 
+ 
+-
+-
+-
+ === offered @ 60 ===
+ ┌──────────────────────────────────────────────────────────┐
+ │ Acme Deploys                                   SPONSORED │
+@@ -57,7 +57,9 @@
+ │ Add one-click deploys to this project                    │
+ │ A sponsored agent can wire Acme Deploys into your repo   │
+ │ on its own branch.                                       │
+-│ /ads:proposal · /ads:dismiss-proposal                    │
++│ It runs here, in its own worktree, and uses your         │
++│ session and credits, like any other task.                │
++│ /ads:accept-proposal · /ads:dismiss-proposal             │
+ └──────────────────────────────────────────────────────────┘
+ 
+ 
+@@ -74,8 +76,6 @@
+ 
+ 
+ 
+-
+-
+ === accepted @ 20 ===
+ ┌──────────────────┐
+ │ SPONSORED        │
+@@ -245,19 +245,19 @@
+ │ Nothing was      │
+ │ pushed to your   │
+ │ repository.      │
++│ Open a pull      │
++│ request with /   │
++│ ads:pull-        │
++│ request, or      │
++│ discard the      │
++│ workspace with / │
++│ ads:remove-      │
++│ worktree.        │
+ │ /ads:proposal    │
+ └──────────────────┘
+ 
+ 
+ 
+-
+-
+-
+-
+-
+-
+-
+-
+ === committed @ 48 ===
+ ┌──────────────────────────────────────────────┐
+ │ Acme Deploys                       SPONSORED │
+@@ -265,6 +265,9 @@
+ │ Add one-click deploys to this project        │
+ │ Committed to sponsored/acme-deploys.         │
+ │ Nothing was pushed to your repository.       │
++│ Open a pull request with /ads:pull-request,  │
++│ or discard the workspace with /ads:remove-   │
++│ worktree.                                    │
+ │ /ads:proposal · /ads:dismiss-proposal        │
+ └──────────────────────────────────────────────┘
+ 
+@@ -281,9 +284,6 @@
+ 
+ 
+ 
+-
+-
+-
+ === committed @ 60 ===
+ ┌──────────────────────────────────────────────────────────┐
+ │ Acme Deploys                                   SPONSORED │
+@@ -291,6 +291,8 @@
+ │ Add one-click deploys to this project                    │
+ │ Committed to sponsored/acme-deploys. Nothing was pushed  │
+ │ to your repository.                                      │
++│ Open a pull request with /ads:pull-request, or discard   │
++│ the workspace with /ads:remove-worktree.                 │
+ │ /ads:proposal · /ads:dismiss-proposal                    │
+ └──────────────────────────────────────────────────────────┘
+ 
+@@ -308,8 +310,6 @@
+ 
+ 
+ 
+-
+-
+ === landed @ 20 ===
+ ┌──────────────────┐
+ │ SPONSORED        │
+@@ -544,3 +544,159 @@
+ 
+ 
+ 
++=== consent @ 20 ===
++┌──────────────────┐
++│ SPONSORED        │
++│ Acme Deploys     │
++│ Sponsored propos │
++│ Add one-click    │
++│ dep…             │
++│ Run Acme         │
++│ Deploys's        │
++│ sponsored task   │
++│ on this machine? │
++│ Add one-click    │
++│ deploys          │
++│ A sponsored      │
++│ agent can wire   │
++│ Acme Deploys     │
++│ into your repo.  │
++│ Folder: /home/   │
++│ dev/app          │
++│ Branch:          │
++│ freebuff/        │
++│ sponsored-acme-  │
++│ deploys-run-1    │
++│ It runs          │
++│ sandboxed in a   │
++
++=== consent @ 48 ===
++┌──────────────────────────────────────────────┐
++│ Acme Deploys                       SPONSORED │
++│ Sponsored proposal                           │
++│ Add one-click deploys to this project        │
++│ A sponsored agent can wire Acme Deploys      │
++│ into your repo on its own branch.            │
++│ It runs here, in its own worktree, and uses  │
++│ your session and credits, like any other     │
++│ task.                                        │
++│ Run Acme Deploys's sponsored task on this    │
++│ machine?                                     │
++│ Add one-click deploys                        │
++│ A sponsored agent can wire Acme Deploys      │
++│ into your repo.                              │
++│ Folder: /home/dev/app                        │
++│ Branch: freebuff/sponsored-acme-deploys-run- │
++│ 1                                            │
++│ It runs sandboxed in a new worktree with no  │
++│ access to your credentials, commits to that  │
++│ branch only, and pushes nothing. It uses     │
++│ your session and credits, like any other     │
++│ task.                                        │
++│ > Not now                                    │
++│   Run it in a worktree                       │
++
++=== consent @ 60 ===
++┌──────────────────────────────────────────────────────────┐
++│ Acme Deploys                                   SPONSORED │
++│ Sponsored proposal                                       │
++│ Add one-click deploys to this project                    │
++│ A sponsored agent can wire Acme Deploys into your repo   │
++│ on its own branch.                                       │
++│ It runs here, in its own worktree, and uses your         │
++│ session and credits, like any other task.                │
++│ Run Acme Deploys's sponsored task on this machine?       │
++│ Add one-click deploys                                    │
++│ A sponsored agent can wire Acme Deploys into your repo.  │
++│ Folder: /home/dev/app                                    │
++│ Branch: freebuff/sponsored-acme-deploys-run-1            │
++│ It runs sandboxed in a new worktree with no access to    │
++│ your credentials, commits to that branch only, and       │
++│ pushes nothing. It uses your session and credits, like   │
++│ any other task.                                          │
++│ > Not now                                                │
++│   Run it in a worktree                                   │
++│ ↑↓ move · enter choose · esc cancel                      │
++└──────────────────────────────────────────────────────────┘
++
++
++
++
++=== offered-windows @ 20 ===
++┌──────────────────┐
++│ SPONSORED        │
++│ Acme Deploys     │
++│ Sponsored propos │
++│ Add one-click    │
++│ dep…             │
++│ Sponsored tasks  │
++│ can’t run on     │
++│ Windows yet:     │
++│ Freebuff has no  │
++│ way to keep an   │
++│ advertiser’s     │
++│ commands inside  │
++│ the workspace    │
++│ on this          │
++│ operating        │
++│ system.          │
++│ /ads:proposal    │
++└──────────────────┘
++
++
++
++
++
++
++=== offered-windows @ 48 ===
++┌──────────────────────────────────────────────┐
++│ Acme Deploys                       SPONSORED │
++│ Sponsored proposal                           │
++│ Add one-click deploys to this project        │
++│ A sponsored agent can wire Acme Deploys      │
++│ into your repo on its own branch.            │
++│ Sponsored tasks can’t run on Windows yet:    │
++│ Freebuff has no way to keep an advertiser’s  │
++│ commands inside the workspace on this        │
++│ operating system.                            │
++│ /ads:proposal · /ads:dismiss-proposal        │
++└──────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== offered-windows @ 60 ===
++┌──────────────────────────────────────────────────────────┐
++│ Acme Deploys                                   SPONSORED │
++│ Sponsored proposal                                       │
++│ Add one-click deploys to this project                    │
++│ A sponsored agent can wire Acme Deploys into your repo   │
++│ on its own branch.                                       │
++│ Sponsored tasks can’t run on Windows yet: Freebuff has   │
++│ no way to keep an advertiser’s commands inside the       │
++│ workspace on this operating system.                      │
++│ /ads:proposal · /ads:dismiss-proposal                    │
++└──────────────────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+diff --git a/cli/src/components/__tests__/message-with-agents.test.tsx b/cli/src/components/__tests__/message-with-agents.test.tsx
+index 41ef5a129..eb9b48ac6 100644
+--- a/cli/src/components/__tests__/message-with-agents.test.tsx
++++ b/cli/src/components/__tests__/message-with-agents.test.tsx
+@@ -93,6 +93,8 @@ const defaultCallbacks = {
+   onResponseAdsNeeded: () => {},
+   onSponsoredProposalMenu: () => {},
+   onSponsoredProposalDisclose: () => {},
++  onSponsoredProposalAccept: () => {},
++  onSponsoredProposalConsent: () => {},
+   onSponsoredProposalControl: () => {},
+ }
+ 
+@@ -213,6 +215,8 @@ describe('MessageBlockStore', () => {
+         onResponseAdsNeeded: () => {},
+   onSponsoredProposalMenu: () => {},
+   onSponsoredProposalDisclose: () => {},
++  onSponsoredProposalAccept: () => {},
++  onSponsoredProposalConsent: () => {},
+   onSponsoredProposalControl: () => {},
+       })
+ 
+@@ -271,6 +275,8 @@ describe('MessageBlockStore', () => {
+         onResponseAdsNeeded: mockFn,
+         onSponsoredProposalMenu: mockFn,
+         onSponsoredProposalDisclose: mockFn,
++        onSponsoredProposalAccept: mockFn,
++        onSponsoredProposalConsent: mockFn,
+         onSponsoredProposalControl: mockFn,
+       })
+ 
+diff --git a/cli/src/components/__tests__/sponsored-proposal-block.test.tsx b/cli/src/components/__tests__/sponsored-proposal-block.test.tsx
+index 709b2c2c4..303a6b57f 100644
+--- a/cli/src/components/__tests__/sponsored-proposal-block.test.tsx
++++ b/cli/src/components/__tests__/sponsored-proposal-block.test.tsx
+@@ -25,14 +25,19 @@ import {
+ } from '@codebuff/common/ads/__fixtures__/sponsored-proposal-rows'
+ import { createTestRenderer } from '@opentui/core/testing'
+ import { createRoot, flushSync } from '@opentui/react'
+-import { afterEach, beforeAll, describe, expect, test } from 'bun:test'
++import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test'
+ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+ import { dirname, join } from 'node:path'
+ 
+ import React from 'react'
+ 
+-import { SponsoredProposalBlock, hintFor } from '../blocks/sponsored-proposal-block'
++import {
++  SponsoredProposalBlock,
++  hintFor,
++  hintMode,
++} from '../blocks/sponsored-proposal-block'
+ import { initializeThemeStore } from '../../hooks/use-theme'
++import { setSponsoredCliAvailability } from '../../utils/sponsored-availability'
+ import { useMessageBlockStore } from '../../state/message-block-store'
+ 
+ import type {
+@@ -43,8 +48,15 @@ import type { SponsoredProposalRow } from '@codebuff/common/ads/sponsored-propos
+ 
+ beforeAll(() => {
+   initializeThemeStore()
++  // PINNED, so every frame below is the same bytes on a Mac, on CI's Linux and
++  // on a Windows box. The card's Accept is gated on what the HOST can contain
++  // (COD-336 item 3), so a snapshot taken from an unpinned probe records the
++  // machine that ran it rather than the card.
++  setSponsoredCliAvailability('available')
+ })
+ 
++afterAll(() => setSponsoredCliAvailability(null))
++
+ const WIDTHS = [20, 48, 60] as const
+ 
+ const blockFor = (
+@@ -88,17 +100,67 @@ describe('every state, at every width', () => {
+     })
+   }
+ 
+-  test('R-3 is waived: there is no Accept control in any state, at any width', async () => {
+-    // Phase 1's acceptance criterion, asserted rather than promised. An Accept
+-    // here would spawn a Cloud thread against a folder that is not a Cloud
+-    // project, so it is absent — not disabled, not stubbed.
+-    for (const state of SPONSORED_FIXTURE_STATES) {
+-      for (const width of WIDTHS) {
+-        const frame = await render(blockFor(SPONSORED_ROW_FIXTURES[state]), width)
+-        expect(frame, `${state} at ${width}`).not.toContain('Start sponsored thread')
+-        expect(frame, `${state} at ${width}`).not.toContain('Accept')
++  test('R-3: the Accept exists only where a run can actually be contained', async () => {
++    // Phase 2 un-waives R-3, and the property that replaces "there is no
++    // Accept" is narrower and more useful: the control tracks the MACHINE.
++    // `offered` is the only state with an answer to give, and a card is drawn
++    // identically everywhere else.
++    setSponsoredCliAvailability('available')
++    const acceptable = await render(
++      blockFor(SPONSORED_ROW_FIXTURES.offered, { menuOpen: true }),
++      60,
++    )
++    expect(acceptable).toContain('Start sponsored thread')
++
++    // COD-336 item 3, as rendered: on Windows the card SAYS why instead of
++    // offering an Accept that cannot work. The reason is the shared copy, so a
++    // terminal never writes its own account of the containment story.
++    setSponsoredCliAvailability('unavailable:windows-no-containment')
++    const refused = await render(
++      blockFor(SPONSORED_ROW_FIXTURES.offered, { menuOpen: true }),
++      60,
++    )
++    expect(refused).not.toContain('Start sponsored thread')
++    expect(refused).toContain('Windows')
++
++    // And no state but `offered` offers one, on either machine.
++    for (const availability of ['available', 'unavailable:windows-no-containment'] as const) {
++      setSponsoredCliAvailability(availability)
++      for (const state of SPONSORED_FIXTURE_STATES) {
++        if (state === 'offered') continue
++        for (const width of WIDTHS) {
++          const frame = await render(
++            blockFor(SPONSORED_ROW_FIXTURES[state], { menuOpen: true }),
++            width,
++          )
++          expect(frame, `${state} at ${width}`).not.toContain('Start sponsored thread')
++        }
+       }
+     }
++    setSponsoredCliAvailability('available')
++  })
++
++  test('the run never starts from the Accept: it opens a consent that can refuse', async () => {
++    // COD-336 item 4, adapted for a surface with no second process to draw a
++    // dialog from. The property that has to hold is that the control which
++    // says "Start sponsored thread" reaches a SCREEN, and only the screen can
++    // approve — so a single keypress can never run an advertiser's procedure.
++    setSponsoredCliAvailability('available')
++    const calls: string[] = []
++    useMessageBlockStore.getState().setCallbacks({
++      onSponsoredProposalAccept: (target: string) => calls.push(`accept:${target}`),
++      onSponsoredProposalConsent: (target: string, approved: boolean) =>
++        calls.push(`consent:${target}:${approved}`),
++    } as never)
++    const consented = await render(
++      blockFor(SPONSORED_ROW_FIXTURES.offered, { consent: CONSENT }),
++      60,
++    )
++    // Everything the boundary promises, said before it happens: where it runs,
++    // on which branch, and what it costs.
++    expect(consented).toContain(CONSENT.branch)
++    expect(consented).toContain('Not now')
++    expect(consented).toContain('uses your session and credits')
+   })
+ 
+   test('R-2 every state offers the same one decline, and names it', async () => {
+@@ -212,6 +274,11 @@ describe('checked-in frames', () => {
+         )
+       }
+     }
++    // PHASE 2's two new renders, at the same three widths (COD-339). The
++    // consent is the screen a run cannot start without, and the Windows card is
++    // the refusal COD-336 item 3 requires -- both are things a diff should show
++    // before a user does.
++    sections.push(...(await extraSections()))
+     const rendered = `${sections.join('\n')}\n`
+     if (process.env.UPDATE_PROPOSAL_FRAMES === '1') {
+       mkdirSync(dirname(SNAPSHOT), { recursive: true })
+@@ -224,6 +291,36 @@ describe('checked-in frames', () => {
+   })
+ })
+ 
++/**
++ * The consent screen and the machine that cannot run one.
++ *
++ * Separated from the state loop above because neither is a STATE of the row: a
++ * consent is a screen over an `offered` card, and the Windows refusal is the
++ * same `offered` card on a different machine.
++ */
++async function extraSections(): Promise<string[]> {
++  const out: string[] = []
++  for (const width of WIDTHS) {
++    const frame = await render(
++      blockFor(SPONSORED_ROW_FIXTURES.offered, { consent: CONSENT }),
++      width,
++    )
++    out.push(`=== consent @ ${width} ===\n${frame.replace(/[ \t]+$/gm, '')}`)
++  }
++  setSponsoredCliAvailability('unavailable:windows-no-containment')
++  try {
++    for (const width of WIDTHS) {
++      const frame = await render(blockFor(SPONSORED_ROW_FIXTURES.offered), width)
++      out.push(
++        `=== offered-windows @ ${width} ===\n${frame.replace(/[ \t]+$/gm, '')}`,
++      )
++    }
++  } finally {
++    setSponsoredCliAvailability('available')
++  }
++  return out
++}
++
+ describe('the block itself', () => {
+   test('is a plain serializable block, not html', () => {
+     // `HtmlContentBlock` cannot survive being written to history and read back,
+@@ -232,10 +329,10 @@ describe('the block itself', () => {
+     expect(JSON.parse(JSON.stringify(block))).toEqual(block)
+   })
+ 
+-  test('the hint names commands while the menu is closed, and keys while it is open', () => {
+-    // The closed hint may not name a bare key, because the card binds none --
+-    // and a hint naming a key that does nothing is worse than no hint.
+-    const closed = hintFor(false)
++  test('the hint names commands while nothing is open, and keys while it is', () => {
++    // A hint with nothing open may not name a bare key, because the card binds
++    // none -- and a hint naming a key that does nothing is worse than no hint.
++    const closed = hintFor('closed')
+     expect(closed).toContain('/ads:proposal')
+     expect(closed).toContain('/ads:dismiss-proposal')
+     // Two columns of padding the card's own `inner` does not account for, so
+@@ -244,33 +341,72 @@ describe('the block itself', () => {
+     for (const key of ['esc dismiss', 'm options', 'enter open PR']) {
+       expect(closed).not.toContain(key)
+     }
+-    // Naming an Accept the surface does not have is how a Phase 1 card starts
+-    // looking like it can run a sponsored thread.
++    // ACCEPT IS NAMED ONLY WHERE THERE IS ONE. `closed` is what a machine that
++    // cannot contain a run renders (Windows, COD-336 item 3), and naming a
++    // control that is not there is how a card starts looking like it can run
++    // something it cannot.
+     expect(closed.toLowerCase()).not.toContain('accept')
+-
+-    // The open menu is the one span the card owns the keyboard, and chat's is
+-    // disabled for exactly it.
+-    expect(hintFor(true)).toContain('esc close')
+-    expect(hintFor(true).toLowerCase()).not.toContain('accept')
++    expect(hintFor('acceptable')).toContain('/ads:accept-proposal')
++
++    // The two spans where the card owns the keyboard, and chat's is disabled
++    // for exactly them.
++    expect(hintFor('menu')).toContain('esc close')
++    expect(hintFor('consent')).toContain('esc cancel')
++    for (const mode of ['menu', 'consent'] as const) {
++      expect(hintFor(mode).length, mode).toBeLessThanOrEqual(44)
++    }
+   })
+ 
+   test('a narrow hint never clips a command mid-token', () => {
+-    // A truncated `/ads:dismiss-propos` teaches a command that does not exist.
+-    for (const width of [0, 1, 5, 13, 20, 30, 36, 37, 44]) {
+-      const hint = hintFor(false, width)
+-      expect(hint.length, `width ${width}`).toBeLessThanOrEqual(width)
+-      if (hint.length > 0) {
+-        for (const token of hint.split(' · ')) {
+-          expect(
+-            ['/ads:proposal', '/ads:dismiss-proposal'],
+-            `width ${width}`,
+-          ).toContain(token)
++    // A truncated `/ads:dismiss-propos` teaches a command that does not exist,
++    // and `/ads:accept-proposa` is the same failure on the new command.
++    const REAL = [
++      '/ads:proposal',
++      '/ads:dismiss-proposal',
++      '/ads:accept-proposal',
++      '/ads:pull-request',
++      '/ads:remove-worktree',
++    ]
++    for (const mode of ['closed', 'acceptable'] as const) {
++      for (const width of [0, 1, 5, 13, 17, 20, 30, 36, 37, 40, 44]) {
++        const hint = hintFor(mode, width)
++        expect(hint.length, `${mode} @ ${width}`).toBeLessThanOrEqual(width)
++        if (hint.length > 0) {
++          for (const token of hint.split(' · ')) {
++            expect(REAL, `${mode} @ ${width}`).toContain(token)
++          }
+         }
+       }
+     }
+   })
++
++  test('the consent screen is the only way a run can start', () => {
++    // `hintMode` is the card's own account of what is reachable, and the
++    // property being pinned is that ACCEPT and CONSENT are never the same
++    // state: accept opens the screen, and only the screen can approve.
++    const offered = blockFor(SPONSORED_ROW_FIXTURES.offered)
++    expect(hintMode(offered, true)).toBe('acceptable')
++    expect(hintMode(offered, false)).toBe('closed')
++    expect(
++      hintMode({ ...offered, consent: CONSENT }, true),
++    ).toBe('consent')
++    // An open consent outranks an open menu: opening it closes the menu, so
++    // the two are never both live and one Enter never has two handlers.
++    expect(
++      hintMode({ ...offered, consent: CONSENT, menuOpen: true }, true),
++    ).toBe('consent')
++  })
+ })
+ 
++const CONSENT = {
++  advertiserName: 'Acme Deploys',
++  headline: 'Add one-click deploys',
++  body: 'A sponsored agent can wire Acme Deploys into your repo.',
++  folder: '/home/dev/app',
++  branch: 'freebuff/sponsored-acme-deploys-run-1',
++  runId: 'run-1',
++}
++
+ /**
+  * WHAT THE CARD DOES WITH A KEYPRESS, which is the finding this section exists
+  * for.
+@@ -303,6 +439,9 @@ describe('the card claims no bare keys while its menu is closed', () => {
+         calls.push(['menu', target, open]),
+       onSponsoredProposalDisclose: (target, open) =>
+         calls.push(['disclose', target, open]),
++      onSponsoredProposalAccept: (target) => calls.push(['accept', target]),
++      onSponsoredProposalConsent: (target, approved) =>
++        calls.push(['consent', target, approved]),
+       onSponsoredProposalControl: (target, control) =>
+         calls.push(['control', target, control]),
+     })
+@@ -367,14 +506,69 @@ describe('the card claims no bare keys while its menu is closed', () => {
+     )
+     await card.press(() => card.input.pressArrow('down'))
+     await card.press(() => card.input.pressEnter())
+-    // Down moved off `why` onto the second item, which the shared menu order
+-    // fixes as never-this-advertiser.
++    // The menu opens on ACCEPT (COD-339: the Accept is the first item, because
++    // this surface has no room for a primary), so one Down lands on `why`.
+     expect(card.calls).toEqual([
+       ['menu', 'acme/deploys', false],
+-      ['control', 'acme/deploys', 'never-advertiser'],
++      ['disclose', 'acme/deploys', true],
+     ])
+   })
+ 
++  test('the menu Accept OPENS the consent and starts nothing', async () => {
++    // The whole of COD-336 item 4 on this surface, as a keypress test: the
++    // first item of the menu reaches `onSponsoredProposalAccept`, which draws
++    // a screen. It does NOT reach a control, and nothing anywhere is written.
++    const card = await mount(
++      blockFor(SPONSORED_ROW_FIXTURES.offered, { menuOpen: true }),
++    )
++    await card.press(() => card.input.pressEnter())
++    expect(card.calls).toEqual([
++      ['menu', 'acme/deploys', false],
++      ['accept', 'acme/deploys'],
++    ])
++  })
++
++  test('the consent starts on Not now, and Esc refuses without writing anything', async () => {
++    // A caret that started on "run it" is a screen an impatient Enter answers
++    // yes, so index 0 is the refusal -- and Esc is a refusal too, reported as
++    // `false` rather than as nothing, so the caller closes the screen.
++    const card = await mount(
++      blockFor(SPONSORED_ROW_FIXTURES.offered, { consent: CONSENT }),
++    )
++    await card.press(() => card.input.pressEnter())
++    expect(card.calls).toEqual([['consent', 'acme/deploys', false]])
++    await card.press(() => card.input.pressEscape())
++    expect(card.calls).toEqual([
++      ['consent', 'acme/deploys', false],
++      ['consent', 'acme/deploys', false],
++    ])
++  })
++
++  test('the consent approves only after the caret is moved onto the run', async () => {
++    const card = await mount(
++      blockFor(SPONSORED_ROW_FIXTURES.offered, { consent: CONSENT }),
++    )
++    await card.press(() => card.input.pressArrow('down'))
++    await card.press(() => card.input.pressEnter())
++    expect(card.calls).toEqual([['consent', 'acme/deploys', true]])
++  })
++
++  test('an open consent takes the keys, and the menu behind it takes none', async () => {
++    // Opening the consent closes the menu, so the two are never both live --
++    // but the block is a plain record and nothing stops both flags being set.
++    // The card resolves it in one direction, always, so one Enter has one
++    // handler.
++    const card = await mount(
++      blockFor(SPONSORED_ROW_FIXTURES.offered, {
++        consent: CONSENT,
++        menuOpen: true,
++      }),
++    )
++    await card.press(() => card.input.pressArrow('down'))
++    await card.press(() => card.input.pressEnter())
++    expect(card.calls).toEqual([['consent', 'acme/deploys', true]])
++  })
++
+   test('Esc closes the MENU and never answers the proposal', async () => {
+     // The old binding dismissed. "I opened this by accident" is the single
+     // most likely reason a user presses Esc here, and recording it as a
+diff --git a/cli/src/components/blocks/sponsored-proposal-block.tsx b/cli/src/components/blocks/sponsored-proposal-block.tsx
+index 8ad94ca0a..084ddf587 100644
+--- a/cli/src/components/blocks/sponsored-proposal-block.tsx
++++ b/cli/src/components/blocks/sponsored-proposal-block.tsx
+@@ -10,6 +10,10 @@ import React, { useCallback, useState } from 'react'
+ 
+ import { useMessageBlockStore } from '../../state/message-block-store'
+ import { isPlainEnterKey } from '../../utils/terminal-enter-detection'
++import {
++  sponsoredCliCanRun,
++  sponsoredCliUnavailableCopy,
++} from '../../utils/sponsored-availability'
+ import { useTheme } from '../../hooks/use-theme'
+ 
+ import type { SponsoredProposalContentBlock } from '../../types/chat'
+@@ -23,8 +27,17 @@ import type { KeyEvent } from '@opentui/core'
+  * machine the web panel and the desktop card run — a card that reads
+  * differently here is a bug rather than a port.
+  *
+- * THERE IS NO ACCEPT CONTROL. Phase 1 ships none: accepting spawns a thread in
+- * an isolated Cloud workspace and the CLI runs against `process.cwd()`.
++ * ACCEPT EXISTS NOW (COD-339) and runs LOCALLY, in a git worktree on this
++ * machine, under the COD-336 boundary. It is not a primary on this surface --
++ * at twenty columns there is no room for one -- so it is the first item of the
++ * menu and the `/ads:accept-proposal` command, and it is drawn only when this
++ * machine can actually contain a run. On Windows the card says why instead
++ * (COD-336 item 3: worse product on Windows is the honest trade).
++ *
++ * Accepting opens the CONSENT panel below rather than starting anything. That
++ * panel is the terminal's stand-in for Desktop's main-process dialog, and the
++ * reasoning for the substitution is in `utils/sponsored-run.ts` -- it is an
++ * adaptation of COD-336 item 4, not a re-opening of it.
+  *
+  * AND WHILE THE MENU IS CLOSED THERE ARE NO KEY BINDINGS AT ALL. `useKeyboard`
+  * is a GLOBAL listener, not a focus-scoped one, so the bare `m`, `esc` and
+@@ -84,12 +97,28 @@ export const SponsoredProposalBlock: React.FC<{
+   const callbacks = useMessageBlockStore((s) => s.callbacks)
+   const [menuIndex, setMenuIndex] = useState(0)
+ 
++  const [consentIndex, setConsentIndex] = useState(0)
++
+   const view = sponsoredProposalViewModel(block.proposal)
+   const width = Math.max(20, availableWidth)
+-  const menu = sponsoredProposalMenu(view.advertiserName)
++  const accept = sponsoredProposalAction(view, 'accept')
++  // The Accept is offered only when this machine can contain a run. An Accept
++  // that refuses is worse than an Accept that is not there with a sentence
++  // beside it saying why -- which is what `unavailable` renders instead.
++  const canRun = sponsoredCliCanRun()
++  const acceptable = accept !== null && canRun && !answeredOrBusy(block)
++  const menu = sponsoredProposalMenu(view.advertiserName, {
++    ...(acceptable && accept ? { acceptLabel: accept.label } : {}),
++  })
+   const openPullRequest = sponsoredProposalAction(view, 'open-pull-request')
+   const answered = block.answered === true
+   const busy = block.busy === true
++  const consent = block.consent ?? null
++  // The refusal sentence, shown only where an Accept would otherwise be: a
++  // terminal that explained the Windows containment story on a `failed` card
++  // would be answering a question nobody asked.
++  const unavailable =
++    view.state === 'offered' && !canRun ? sponsoredCliUnavailableCopy() : null
+ 
+   const onMenuKey = useCallback(
+     (key: SponsoredProposalMenuKey) => {
+@@ -97,6 +126,10 @@ export const SponsoredProposalBlock: React.FC<{
+         callbacks.onSponsoredProposalDisclose(block.target, !block.whyOpen)
+         return
+       }
++      if (key === 'accept') {
++        callbacks.onSponsoredProposalAccept(block.target)
++        return
++      }
+       callbacks.onSponsoredProposalControl(block.target, key)
+     },
+     [block.target, block.whyOpen, callbacks],
+@@ -113,13 +146,42 @@ export const SponsoredProposalBlock: React.FC<{
+   useKeyboard(
+     useCallback(
+       (key: KeyEvent) => {
+-        if (!block.menuOpen) return
++        if (!block.menuOpen && !consent) return
+         const preventDefault = () => {
+           if ('preventDefault' in key && typeof key.preventDefault === 'function') {
+             key.preventDefault()
+           }
+         }
+ 
++        // THE CONSENT OWNS THE KEYBOARD WHILE IT IS OPEN, and it is checked
++        // before the menu because opening it closes the menu -- so the two are
++        // never both live, and an ordering that let them be would put two
++        // handlers on one Enter.
++        //
++        // Esc is REFUSE, and refusing writes nothing at all: the accept has not
++        // happened yet, which is the whole reason the consent comes first. The
++        // row stays `offered`.
++        if (consent) {
++          if (key.name === 'escape') {
++            preventDefault()
++            callbacks.onSponsoredProposalConsent(block.target, false)
++            return
++          }
++          if (key.name === 'up' || key.name === 'down') {
++            preventDefault()
++            setConsentIndex((index) => (index === 0 ? 1 : 0))
++            return
++          }
++          if (isPlainEnterKey(key)) {
++            preventDefault()
++            // INDEX 0 IS "NOT NOW". The destructive-looking choice is not the
++            // default: a consent screen whose caret starts on "run it" is a
++            // consent screen that an impatient Enter answers yes.
++            callbacks.onSponsoredProposalConsent(block.target, consentIndex === 1)
++          }
++          return
++        }
++
+         // Esc closes the MENU and answers nothing. It used to dismiss, which
+         // made the ordinary "I opened this by accident" gesture record a
+         // decline the user never chose -- and, because the binding was global,
+@@ -158,6 +220,8 @@ export const SponsoredProposalBlock: React.FC<{
+         block.menuOpen,
+         block.target,
+         callbacks,
++        consent,
++        consentIndex,
+         menu,
+         menuIndex,
+         onMenuKey,
+@@ -171,6 +235,16 @@ export const SponsoredProposalBlock: React.FC<{
+   // than the list visibly starts on. Tracked as a transition rather than
+   // "reset whenever it is open", because the latter also fires after mount and
+   // would undo a selection the user had already moved.
++  // Same rule for the consent, and it matters more here: the caret must start
++  // on "Not now" every single time it opens, because a caret left on "run it"
++  // by a previous open is a screen an Enter answers yes without being read.
++  const wasConsentOpen = React.useRef(consent !== null)
++  React.useEffect(() => {
++    const open = consent !== null
++    if (open && !wasConsentOpen.current) setConsentIndex(0)
++    wasConsentOpen.current = open
++  }, [consent])
++
+   const wasMenuOpen = React.useRef(block.menuOpen === true)
+   React.useEffect(() => {
+     const open = block.menuOpen === true
+@@ -266,6 +340,16 @@ export const SponsoredProposalBlock: React.FC<{
+             : 'Committed to its own branch. Nothing was pushed to your repository.'}
+         </text>
+       )}
++      {/* DELIVERY IS NAMED HERE RATHER THAN IN THE HINT. The hint line has room
++          for two commands and R-2 spends one of them on the decline, which is
++          the one control every state owes the user. So the two commands that
++          only exist once there is a branch are name
+
+… [diff truncated — view full diff on GitHub] …

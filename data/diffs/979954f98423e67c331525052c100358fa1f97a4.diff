@@ -1,0 +1,387 @@
+diff --git a/cli/src/__tests__/integration/login-flow-instrumentation.test.ts b/cli/src/__tests__/integration/login-flow-instrumentation.test.ts
+new file mode 100644
+index 000000000..2fed4893a
+--- /dev/null
++++ b/cli/src/__tests__/integration/login-flow-instrumentation.test.ts
+@@ -0,0 +1,134 @@
++import { describe, test, expect, mock } from 'bun:test'
++
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
++import { createMockLogger } from '@codebuff/common/testing/mock-types'
++
++import { generateLoginUrl, pollLoginStatus } from '../../login/login-flow'
++import { createMockApiClient } from '../helpers/mock-api-client'
++
++import type { ApiResponse } from '../../utils/codebuff-api'
++
++const createClock = () => {
++  let current = 0
++  return {
++    sleep: async (ms: number) => {
++      current += ms
++    },
++    now: () => current,
++  }
++}
++
++// Typed so `.mock.calls[i]` is `[AnalyticsEvent, props?]` rather than the empty
++// tuple inferred from `mock(() => {})` (which makes indexing a type error).
++const createTrackEventMock = () =>
++  mock((_event: AnalyticsEvent, _properties?: Record<string, any>) => {})
++
++describe('login-flow analytics instrumentation', () => {
++  test('generateLoginUrl emits LOGIN_STARTED on entry and nothing else on success', async () => {
++    const trackEvent = createTrackEventMock()
++    const loginCode = mock(async () => ({
++      ok: true as const,
++      status: 200,
++      data: {
++        loginUrl: 'https://cli.test/login?code=abc',
++        fingerprintHash: 'hash-1',
++        expiresAt: '2030-01-01T00:00:00Z',
++      },
++    }))
++    const apiClient = createMockApiClient({ loginCode })
++
++    await generateLoginUrl(
++      { logger: createMockLogger(), apiClient, trackEvent },
++      { baseUrl: 'https://cli.test', fingerprintId: 'finger-1', via: 'modal' },
++    )
++
++    expect(trackEvent).toHaveBeenCalledTimes(1)
++    expect(trackEvent.mock.calls[0][0]).toBe(AnalyticsEvent.LOGIN_STARTED)
++    expect(trackEvent.mock.calls[0][1]).toEqual({ via: 'modal' })
++  })
++
++  test('generateLoginUrl emits LOGIN_FAILED with reason on a failed URL request', async () => {
++    const trackEvent = createTrackEventMock()
++    const loginCode = mock(
++      async () =>
++        ({ ok: false, status: 500, error: 'boom' }) as ApiResponse<never>,
++    )
++    const apiClient = createMockApiClient({ loginCode })
++
++    await expect(
++      generateLoginUrl(
++        { logger: createMockLogger(), apiClient, trackEvent },
++        {
++          baseUrl: 'https://cli.test',
++          fingerprintId: 'finger-1',
++          via: 'plain_command',
++        },
++      ),
++    ).rejects.toThrow()
++
++    // Two events: the initial LOGIN_STARTED and then LOGIN_FAILED. Match on the
++    // payload rather than the enum identity so the assertion is unambiguous.
++    expect(trackEvent).toHaveBeenCalledTimes(2)
++    expect(trackEvent.mock.calls[0][1]).toEqual({ via: 'plain_command' })
++    const failedCall = trackEvent.mock.calls.find(
++      (c) => c[1]?.reason === 'url_request',
++    )
++    expect(failedCall).toBeDefined()
++    expect(failedCall![1]).toEqual({
++      via: 'plain_command',
++      reason: 'url_request',
++      status: 500,
++    })
++  })
++
++  test('pollLoginStatus emits LOGIN_TIMEOUT with attempts + via', async () => {
++    const trackEvent = createTrackEventMock()
++    const loginStatus = mock(
++      async () => ({ ok: false, status: 401 }) as ApiResponse<{ user?: unknown }>,
++    )
++    const apiClient = createMockApiClient({ loginStatus })
++    const clock = createClock()
++
++    const result = await pollLoginStatus(
++      { sleep: clock.sleep, logger: createMockLogger(), now: clock.now, apiClient, trackEvent },
++      {
++        baseUrl: 'https://cli.test',
++        fingerprintId: 'finger-1',
++        fingerprintHash: 'hash-1',
++        expiresAt: '2030-01-01T00:00:00Z',
++        intervalMs: 10,
++        timeoutMs: 30,
++        via: 'modal',
++      },
++    )
++
++    expect(result.status).toBe('timeout')
++    expect(trackEvent).toHaveBeenCalledTimes(1)
++    expect(trackEvent.mock.calls[0][0]).toBe(AnalyticsEvent.LOGIN_TIMEOUT)
++    expect(trackEvent.mock.calls[0][1]).toMatchObject({ via: 'modal' })
++    expect(trackEvent.mock.calls[0][1]!.attempts).toBeGreaterThan(0)
++  })
++
++  test('pollLoginStatus emits LOGIN_ABORTED when shouldContinue is false', async () => {
++    const trackEvent = createTrackEventMock()
++    const apiClient = createMockApiClient()
++    const clock = createClock()
++
++    const result = await pollLoginStatus(
++      { sleep: clock.sleep, logger: createMockLogger(), now: clock.now, apiClient, trackEvent },
++      {
++        baseUrl: 'https://cli.test',
++        fingerprintId: 'finger-1',
++        fingerprintHash: 'hash-1',
++        expiresAt: '2030-01-01T00:00:00Z',
++        shouldContinue: () => false,
++        via: 'modal',
++      },
++    )
++
++    expect(result.status).toBe('aborted')
++    expect(trackEvent).toHaveBeenCalledTimes(1)
++    expect(trackEvent.mock.calls[0][0]).toBe(AnalyticsEvent.LOGIN_ABORTED)
++    expect(trackEvent.mock.calls[0][1]).toMatchObject({ via: 'modal' })
++  })
++})
+diff --git a/cli/src/hooks/use-fetch-login-url.ts b/cli/src/hooks/use-fetch-login-url.ts
+index dfcecde28..f4eacd116 100644
+--- a/cli/src/hooks/use-fetch-login-url.ts
++++ b/cli/src/hooks/use-fetch-login-url.ts
+@@ -3,6 +3,7 @@ import { safeOpen } from '../utils/open-url'
+ 
+ import { LOGIN_WEBSITE_URL } from '../login/constants'
+ import { generateLoginUrl } from '../login/login-flow'
++import { trackEvent } from '../utils/analytics'
+ import { logger } from '../utils/logger'
+ 
+ interface UseFetchLoginUrlParams {
+@@ -30,10 +31,12 @@ export function useFetchLoginUrl({
+       return generateLoginUrl(
+         {
+           logger,
++          trackEvent,
+         },
+         {
+           baseUrl: LOGIN_WEBSITE_URL,
+           fingerprintId,
++          via: 'modal',
+         },
+       )
+     },
+diff --git a/cli/src/hooks/use-login-polling.ts b/cli/src/hooks/use-login-polling.ts
+index 2aa409eac..082cf5b52 100644
+--- a/cli/src/hooks/use-login-polling.ts
++++ b/cli/src/hooks/use-login-polling.ts
+@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
+ 
+ import { LOGIN_WEBSITE_URL } from '../login/constants'
+ import { pollLoginStatus } from '../login/login-flow'
++import { trackEvent } from '../utils/analytics'
+ import { logger } from '../utils/logger'
+ 
+ import type { User } from '../utils/auth'
+@@ -67,6 +68,7 @@ export function useLoginPolling({
+       {
+         sleep,
+         logger,
++        trackEvent,
+       },
+       {
+         baseUrl: LOGIN_WEBSITE_URL,
+@@ -74,6 +76,7 @@ export function useLoginPolling({
+         fingerprintHash,
+         expiresAt,
+         shouldContinue: () => active,
++        via: 'modal',
+       },
+     )
+       .then((result) => {
+diff --git a/cli/src/login/login-flow.ts b/cli/src/login/login-flow.ts
+index c59d225bd..ee90fc3c9 100644
+--- a/cli/src/login/login-flow.ts
++++ b/cli/src/login/login-flow.ts
+@@ -1,3 +1,5 @@
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
++
+ import { createCodebuffApiClient } from '../utils/codebuff-api'
+ 
+ import type {
+@@ -9,22 +11,39 @@ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ // Re-export for backwards compatibility
+ export type LoginUrlResponse = LoginCodeResponse
+ 
++/**
++ * Which surface initiated the login, recorded on every login-funnel event so
++ * the funnel can be segmented (e.g. modal sign-ins vs. the `login` command).
++ */
++export type LoginVia = 'modal' | 'plain_command'
++
+ export interface GenerateLoginUrlDeps {
+   logger: Logger
+   apiClient?: CodebuffApiClient
++  /**
++   * Emit a login-funnel analytics event. Injected so login-flow stays a pure,
++   * test-friendly module; callers wire in the real `trackEvent`. Omitted in
++   * tests, where it no-ops.
++   */
++  trackEvent?: (event: AnalyticsEvent, properties?: Record<string, any>) => void
+ }
+ 
+ export interface GenerateLoginUrlOptions {
+   baseUrl: string
+   fingerprintId: string
++  via?: LoginVia
+ }
+ 
+ export async function generateLoginUrl(
+   deps: GenerateLoginUrlDeps,
+   options: GenerateLoginUrlOptions,
+ ): Promise<LoginUrlResponse> {
+-  const { logger, apiClient: providedApiClient } = deps
+-  const { baseUrl, fingerprintId } = options
++  const { logger, apiClient: providedApiClient, trackEvent } = deps
++  const { baseUrl, fingerprintId, via } = options
++
++  // A login attempt has begun. This is the top of the login sub-funnel; the
++  // gap between this and a successful `cli.login` is where users are lost.
++  trackEvent?.(AnalyticsEvent.LOGIN_STARTED, { via })
+ 
+   const apiClient =
+     providedApiClient ??
+@@ -42,6 +61,11 @@ export async function generateLoginUrl(
+       },
+       '❌ Failed to request login URL',
+     )
++    trackEvent?.(AnalyticsEvent.LOGIN_FAILED, {
++      via,
++      reason: 'url_request',
++      status: response.status,
++    })
+     throw new Error('Failed to get login URL')
+   }
+ 
+@@ -50,6 +74,11 @@ export async function generateLoginUrl(
+       { status: response.status },
+       '❌ Empty response from login URL',
+     )
++    trackEvent?.(AnalyticsEvent.LOGIN_FAILED, {
++      via,
++      reason: 'url_empty',
++      status: response.status,
++    })
+     throw new Error('Failed to get login URL')
+   }
+ 
+@@ -61,6 +90,7 @@ interface PollLoginStatusDeps {
+   logger: Logger
+   now?: () => number
+   apiClient?: CodebuffApiClient
++  trackEvent?: (event: AnalyticsEvent, properties?: Record<string, any>) => void
+ }
+ 
+ interface PollLoginStatusOptions {
+@@ -71,6 +101,7 @@ interface PollLoginStatusOptions {
+   intervalMs?: number
+   timeoutMs?: number
+   shouldContinue?: () => boolean
++  via?: LoginVia
+ }
+ 
+ export type PollLoginStatusResult =
+@@ -82,7 +113,7 @@ export async function pollLoginStatus(
+   deps: PollLoginStatusDeps,
+   options: PollLoginStatusOptions,
+ ): Promise<PollLoginStatusResult> {
+-  const { sleep, logger, apiClient: providedApiClient } = deps
++  const { sleep, logger, apiClient: providedApiClient, trackEvent } = deps
+   const {
+     baseUrl,
+     fingerprintId,
+@@ -91,6 +122,7 @@ export async function pollLoginStatus(
+     intervalMs = 5000,
+     timeoutMs = 5 * 60 * 1000,
+     shouldContinue,
++    via,
+   } = options
+ 
+   const now = deps.now ?? Date.now
+@@ -106,11 +138,21 @@ export async function pollLoginStatus(
+   while (true) {
+     if (shouldContinue && !shouldContinue()) {
+       logger.warn('🛑 Polling aborted by caller')
++      trackEvent?.(AnalyticsEvent.LOGIN_ABORTED, {
++        via,
++        attempts,
++        durationMs: now() - startTime,
++      })
+       return { status: 'aborted' }
+     }
+ 
+     if (now() - startTime >= timeoutMs) {
+       logger.warn('⌛️ Login polling timed out')
++      trackEvent?.(AnalyticsEvent.LOGIN_TIMEOUT, {
++        via,
++        attempts,
++        durationMs: now() - startTime,
++      })
+       return { status: 'timeout' }
+     }
+ 
+diff --git a/cli/src/login/plain-login.ts b/cli/src/login/plain-login.ts
+index 1835ba239..5aea5b683 100644
+--- a/cli/src/login/plain-login.ts
++++ b/cli/src/login/plain-login.ts
+@@ -34,8 +34,8 @@ export async function runPlainLogin(): Promise<void> {
+   let loginData
+   try {
+     loginData = await generateLoginUrl(
+-      { logger },
+-      { baseUrl: LOGIN_WEBSITE_URL, fingerprintId },
++      { logger, trackEvent },
++      { baseUrl: LOGIN_WEBSITE_URL, fingerprintId, via: 'plain_command' },
+     )
+   } catch (error) {
+     console.error(
+@@ -63,12 +63,13 @@ export async function runPlainLogin(): Promise<void> {
+     })
+ 
+   const result = await pollLoginStatus(
+-    { sleep, logger },
++    { sleep, logger, trackEvent },
+     {
+       baseUrl: LOGIN_WEBSITE_URL,
+       fingerprintId,
+       fingerprintHash: loginData.fingerprintHash,
+       expiresAt: loginData.expiresAt,
++      via: 'plain_command',
+     },
+   )
+ 
+diff --git a/common/src/constants/analytics-events.ts b/common/src/constants/analytics-events.ts
+index 138ea0f08..203b152bf 100644
+--- a/common/src/constants/analytics-events.ts
++++ b/common/src/constants/analytics-events.ts
+@@ -17,6 +17,13 @@ export enum AnalyticsEvent {
+   INVALID_COMMAND = 'cli.invalid_command',
+   KNOWLEDGE_FILE_UPDATED = 'cli.knowledge_file_updated',
+   LOGIN = 'cli.login',
++  // Login funnel — the path between launch and a successful `cli.login`.
++  // Emitted from login-flow.ts (the chokepoint both the modal and the
++  // `login` command share); all tagged with `via` (modal | plain_command).
++  LOGIN_STARTED = 'cli.login_started',
++  LOGIN_FAILED = 'cli.login_failed',
++  LOGIN_TIMEOUT = 'cli.login_timeout',
++  LOGIN_ABORTED = 'cli.login_aborted',
+   SLASH_MENU_ACTIVATED = 'cli.slash_menu_activated',
+   SLASH_COMMAND_USED = 'cli.slash_command_used',
+   TERMINAL_COMMAND_COMPLETED = 'cli.terminal_command_completed',
+diff --git a/common/src/util/analytics-sampling.ts b/common/src/util/analytics-sampling.ts
+index a55e2427b..94b056875 100644
+--- a/common/src/util/analytics-sampling.ts
++++ b/common/src/util/analytics-sampling.ts
+@@ -24,6 +24,10 @@ const ALWAYS_TRACK_EVENTS = new Set<AnalyticsEvent>([
+   AnalyticsEvent.INVALID_COMMAND,
+   AnalyticsEvent.KNOWLEDGE_FILE_UPDATED,
+   AnalyticsEvent.LOGIN,
++  AnalyticsEvent.LOGIN_STARTED,
++  AnalyticsEvent.LOGIN_FAILED,
++  AnalyticsEvent.LOGIN_TIMEOUT,
++  AnalyticsEvent.LOGIN_ABORTED,
+   AnalyticsEvent.TERMINAL_COMMAND_COMPLETED,
+   AnalyticsEvent.UPDATE_CODEBUFF_FAILED,
+   AnalyticsEvent.USER_INPUT,

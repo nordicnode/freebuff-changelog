@@ -1,0 +1,1181 @@
+diff --git a/agents/types/agent-definition.ts b/agents/types/agent-definition.ts
+index 913d20b1a..003dea723 100644
+--- a/agents/types/agent-definition.ts
++++ b/agents/types/agent-definition.ts
+@@ -321,8 +321,14 @@ export interface AgentState {
+   >
+ 
+   /**
+-   * The token count from the Anthropic API.
+-   * This is updated on every agent step via the /api/v1/token-count endpoint.
++   * Estimated size of the next prompt: message history + system prompt + tool
++   * schemas, counted locally with a GPT-4o BPE tokenizer.
++   *
++   * NOT a provider's number, and deliberately not exact. Counting models that
++   * have their own tokenizers with this one biases the estimate low, which the
++   * runtime's compaction budget leaves headroom for. Updated on every agent
++   * step before the model call, again after a mechanical compaction rewrites
++   * the history, and once more when a root agent's turn ends.
+    */
+   contextTokenCount: number
+ }
+diff --git a/cli/src/utils/codebuff-client.ts b/cli/src/utils/codebuff-client.ts
+index 5c1e4bb6c..4f4ab6154 100644
+--- a/cli/src/utils/codebuff-client.ts
++++ b/cli/src/utils/codebuff-client.ts
+@@ -77,6 +77,11 @@ export async function getCodebuffClient(): Promise<CodebuffClient | null> {
+       clientInstance = new CodebuffClient({
+         apiKey,
+         cwd: projectRoot,
++        // Keeps the model's skill list identical to the one the registry shows
++        // (utils/skill-registry.ts). The SDK default is project-only so that a
++        // server embedding it cannot read a home directory by omission; the
++        // CLI runs on the user's machine, so it opts back in.
++        includeHomeSkills: true,
+         agentDefinitions,
+         logger,
+         traceWriter: createTraceWriter(),
+diff --git a/cli/src/utils/skill-registry.ts b/cli/src/utils/skill-registry.ts
+index 8cc8e8480..466840456 100644
+--- a/cli/src/utils/skill-registry.ts
++++ b/cli/src/utils/skill-registry.ts
+@@ -24,10 +24,16 @@ export async function initializeSkillRegistry(): Promise<void> {
+ 
+   try {
+     // Load skills from both global (~/.agents/skills) and project directories
+-    // The SDK handles merging, with project skills overriding global ones
++    // The SDK handles merging, with project skills overriding global ones.
++    //
++    // includeHomeSkills is opt-in and defaults to false, because a server
++    // embedding the SDK must never read a home directory (it would be the
++    // SERVER's). The CLI is the case the flag exists for: it runs on the
++    // user's own machine, so those really are their skills.
+     skillsCache = await sdkLoadSkills({
+       cwd,
+       verbose: false,
++      includeHomeSkills: true,
+     })
+   } catch (error) {
+     logger.warn({ error }, 'Failed to load skills')
+diff --git a/common/package.json b/common/package.json
+index 02cabfef9..a6da0a6df 100644
+--- a/common/package.json
++++ b/common/package.json
+@@ -29,6 +29,7 @@
+     "@types/readable-stream": "^4.0.18",
+     "@types/seedrandom": "^3.0.8",
+     "ai": "^7.0.59",
++    "gray-matter": "^4.0.3",
+     "ignore": "5.3.2",
+     "lodash": "4.17.23",
+     "next-auth": "^4.24.11",
+diff --git a/common/src/types/__tests__/context-token-count-docs.test.ts b/common/src/types/__tests__/context-token-count-docs.test.ts
+new file mode 100644
+index 000000000..031c671f4
+--- /dev/null
++++ b/common/src/types/__tests__/context-token-count-docs.test.ts
+@@ -0,0 +1,75 @@
++import { existsSync, readFileSync } from 'node:fs'
++import { join } from 'node:path'
++
++import { describe, expect, test } from 'bun:test'
++
++/**
++ * `contextTokenCount` is documented twice, in two packages that BOTH publish:
++ * `common` and `agents` are include lines in scripts/public-export-manifest.txt,
++ * so both docstrings ship to the public repo with their comments intact.
++ *
++ * They described the same field differently — one as a local GPT-4o estimate,
++ * the other as "the token count from the Anthropic API … via the
++ * /api/v1/token-count endpoint", an endpoint that no longer exists. An agent
++ * author reading the second one sizes their history against a number the
++ * runtime never asks for. Nothing typechecks a comment, so this is the only
++ * place that can hold the two together.
++ */
++
++// __tests__ → types → src → common → repo root
++const REPO_ROOT = join(import.meta.dir, '..', '..', '..', '..')
++
++const SOURCES = [
++  join(REPO_ROOT, 'common', 'src', 'types', 'session-state.ts'),
++  join(REPO_ROOT, 'agents', 'types', 'agent-definition.ts'),
++  // Local agent templates carry a copy of the same public type. Absent from
++  // the published export, hence the existence check rather than a hard path.
++  join(REPO_ROOT, '.agents', 'types', 'agent-definition.ts'),
++].filter((path) => existsSync(path))
++
++/** The docblock immediately above the `contextTokenCount: number` field. */
++function contextTokenCountDoc(source: string): string {
++  const field = source.indexOf('contextTokenCount: number')
++  expect(field).toBeGreaterThan(-1)
++  const open = source.lastIndexOf('/**', field)
++  expect(open).toBeGreaterThan(-1)
++  return source.slice(open, field)
++}
++
++describe('the contextTokenCount docstrings', () => {
++  test('there is more than one of them, and they all publish', () => {
++    // If this drops to one the rest of the file is trivially true and would
++    // stop meaning anything.
++    expect(SOURCES.length).toBeGreaterThanOrEqual(2)
++  })
++
++  for (const path of SOURCES) {
++    const doc = contextTokenCountDoc(readFileSync(path, 'utf8'))
++    const where = path.slice(REPO_ROOT.length + 1)
++
++    test(`${where} does not promise a provider's number`, () => {
++      // The deleted round trip. A comment that names an endpoint is a comment
++      // someone will try to call.
++      expect(doc, where).not.toContain('/api/v1/token-count')
++      expect(doc.toLowerCase(), where).not.toContain(
++        'token count from the anthropic api',
++      )
++    })
++
++    test(`${where} says what it actually is`, () => {
++      // Local, approximate, and biased low on purpose — all three are load
++      // bearing for anyone deciding what to do at 80%.
++      expect(doc, where).toContain('GPT-4o')
++      expect(doc.toLowerCase(), where).toContain('estimate')
++      expect(doc.toLowerCase(), where).toContain('locally')
++    })
++
++    test(`${where} reads as a sentence`, () => {
++      // The correction that replaced the Anthropic claim dropped a word:
++      // "models that have their own biases it low" has no object. Cheap to
++      // pin, and the reason the two copies disagreed for a release.
++      expect(doc, where).not.toContain('their own biases it low')
++      expect(doc, where).toMatch(/own tokenizers?\b/)
++    })
++  }
++})
+diff --git a/common/src/types/session-state.ts b/common/src/types/session-state.ts
+index a116a5cde..ffd292900 100644
+--- a/common/src/types/session-state.ts
++++ b/common/src/types/session-state.ts
+@@ -45,8 +45,21 @@ export type AgentState = {
+     { description: string | undefined; inputSchema: {} }
+   >
+   /**
+-   * The accurate token count from the Anthropic API.
+-   * This is updated on every agent step via the /api/v1/token-count endpoint.
++   * Estimated size of the next prompt: message history + system prompt + tool
++   * schemas, counted locally with a GPT-4o BPE tokenizer.
++   *
++   * NOT a provider's number. The round trip that used to make it
++   * Anthropic-exact was deleted (run-agent-step.ts, "Always count locally")
++   * because it added seconds of serial overhead per step and nothing left needs
++   * a provider-exact count: the context-limit check only needs an estimate, and
++   * counting models that have their own tokenizers with this one biases the
++   * estimate low — headroom contextPrunerBudgetForModel absorbs deliberately.
++   *
++   * Updated on every agent step before the model call, again after a mechanical
++   * compaction rewrites the history, and once more when the turn ends so the
++   * final value covers the last step's output rather than stopping short of it.
++   * That last recount is for root agents only: a subagent's final count is
++   * discarded with the subagent, and counting it is pure tokenizer cost.
+    */
+   contextTokenCount: number
+ }
+diff --git a/common/src/util/parse-skill.ts b/common/src/util/parse-skill.ts
+new file mode 100644
+index 000000000..97ca9f36c
+--- /dev/null
++++ b/common/src/util/parse-skill.ts
+@@ -0,0 +1,87 @@
++import {
++  createSkillDefinition,
++  SkillFrontmatterSchema,
++  type SkillDefinition,
++} from '../types/skill'
++import matter from 'gray-matter'
++
++/**
++ * Parse and validate one SKILL.md document without touching disk.
++ *
++ * This lives in `common`, not in the SDK where it was born, because callers
++ * that only need to READ a skill document must not be forced to load the SDK
++ * barrel with it. That barrel pulls in tree-sitter, whose `.wasm` is resolved
++ * from disk at import time — fine in the CLI, fatal in a Convex action, where
++ * it fails with "tree-sitter.wasm not found (looked at scriptDir=/var/task/…)"
++ * before any skill code runs. Observed in a real Convex deployment on
++ * 2026-08-18, not predicted: the same import succeeds under Bun locally,
++ * because there the wasm is sitting in node_modules where the resolver expects.
++ *
++ * The SDK re-exports this, so `parseSkillFileContent` remains one function with
++ * one implementation. That matters more than where it lives: the writer in
++ * Freebuff Cloud validates a draft by running the READER over it, and a second
++ * copy would make that check a lookalike instead of the real thing.
++ */
++export function parseSkillFileContent(
++  content: string,
++  options: { directoryName: string; filePath: string; verbose?: boolean },
++): SkillDefinition | null {
++  const { directoryName, filePath, verbose = false } = options
++
++  const parsed = parseFrontmatter(content)
++  if (!parsed) {
++    if (verbose) {
++      console.error(`Invalid frontmatter in skill file: ${filePath}`)
++    }
++    return null
++  }
++
++  const result = SkillFrontmatterSchema.safeParse(parsed.frontmatter)
++  if (!result.success) {
++    if (verbose) {
++      console.error(
++        `Invalid skill frontmatter in ${filePath}: ${result.error.message}`,
++      )
++    }
++    return null
++  }
++
++  const frontmatter = result.data
++
++  // The name has to match the directory, or the loader cannot address the
++  // skill: it finds skills BY directory and keys them by frontmatter name.
++  if (frontmatter.name !== directoryName) {
++    if (verbose) {
++      console.error(
++        `Skill name '${frontmatter.name}' does not match directory name '${directoryName}' in ${filePath}`,
++      )
++    }
++    return null
++  }
++
++  return createSkillDefinition({ frontmatter, content, filePath })
++}
++
++/**
++ * YAML frontmatter between `---` markers at the very top, or `null`.
++ *
++ * Empty frontmatter is `null` rather than an empty object: a SKILL.md with no
++ * `name` cannot be addressed, so there is nothing for a caller to do with it.
++ */
++function parseFrontmatter(content: string): {
++  frontmatter: Record<string, unknown>
++  body: string
++} | null {
++  try {
++    const parsed = matter(content)
++    if (!parsed.data || Object.keys(parsed.data).length === 0) {
++      return null
++    }
++    return {
++      frontmatter: parsed.data as Record<string, unknown>,
++      body: parsed.content,
++    }
++  } catch {
++    return null
++  }
++}
+diff --git a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+index a49dc7927..a3d24e38f 100644
+--- a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
++++ b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+@@ -1338,4 +1338,59 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+       expect(callCount).toBe(MAX_CONSECUTIVE_STREAM_RECOVERIES + 1)
+     })
+   })
++
++  describe('the end-of-turn context recount', () => {
++    // The cancel exit is where the recount earns its keep, and it is also the
++    // only exit where the two behaviours are far apart enough to assert
++    // cleanly. A turn that ends normally re-enters the loop once and re-runs
++    // the in-loop estimate before breaking, so that estimate already covers the
++    // answer; a turn that is cancelled leaves the loop from inside the step,
++    // and the last estimate it took predates everything the model produced.
++    const BIG_PARTIAL_ANSWER = 'here is what I found so far. '.repeat(2000)
++
++    const contextTokensAfterCancelledTurn = async (agentState: AgentState) => {
++      const result = await loopAgentSteps({
++        ...loopAgentStepsBaseParams,
++        agentState,
++        promptAiSdkStream: async function* () {
++          yield { type: 'text' as const, text: BIG_PARTIAL_ANSWER }
++          throw new AbortError('User pressed Ctrl+C')
++        },
++      })
++      return result.agentState.contextTokenCount
++    }
++
++    const withHistory = (extra?: Partial<AgentState>): AgentState => ({
++      ...mockAgentState,
++      messageHistory: [...mockAgentState.messageHistory],
++      contextTokenCount: 0,
++      ...extra,
++    })
++
++    it('leaves the root counting the history the turn actually kept', async () => {
++      // The host persists this number and shows it to the user between turns,
++      // so it has to describe the history the NEXT message is sent on top of —
++      // including the partial answer a cancelled turn preserves.
++      const asRoot = await contextTokensAfterCancelledTurn(withHistory())
++      expect(asRoot).toBeGreaterThan(10_000)
++    })
++
++    it('does not pay to recount a subagent nobody reads', async () => {
++      // Only the root's count leaves the runtime — the host reads
++      // sessionState.mainAgentState. Recounting here tokenizes a spawned
++      // agent's whole history (file-picker, thinker, context-pruner, …) for a
++      // value that is discarded with the agent, which on a one-step subagent
++      // roughly doubles its tokenizer cost.
++      //
++      // Same predicate as the compaction callback: parentId.
++      const asRoot = await contextTokensAfterCancelledTurn(withHistory())
++      const asSubagent = await contextTokensAfterCancelledTurn(
++        withHistory({ parentId: 'parent-agent-id' }),
++      )
++
++      // Not merely different: the subagent's number is the estimate taken
++      // before the model call, which predates everything the model produced.
++      expect(asRoot).toBeGreaterThan(asSubagent * 2)
++    })
++  })
+ })
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 23064d115..3e6a09e25 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -53,6 +53,7 @@ import {
+   buildUserMessageContent,
+   expireMessages,
+ } from './util/messages'
++import { recountContextTokens } from './util/context-token-count'
+ import {
+   countTokens,
+   countTokensJson,
+@@ -994,6 +995,41 @@ export async function loopAgentSteps(
+     },
+   )
+ 
++  // Recount against the history the turn actually ends with.
++  //
++  // Inside the loop the count is taken BEFORE the model call, so the last
++  // step's assistant response and every tool result it produced are missing
++  // from it — systematically the most recently added content, and on a step
++  // that read several files easily tens of thousands of tokens. That was
++  // harmless while the number only fed the compaction check, which runs again
++  // at the top of the next step anyway. It stops being harmless now that hosts
++  // persist it and show it to the user between turns.
++  //
++  // Same formula as estimateContextTokensLocally below, minus the step prompt:
++  // `system` and `toolsForTokenCount` are loop-invariant, and the step prompt
++  // is per-step scaffolding rather than part of the history the next turn is
++  // sent on top of. Once per turn against once per step is not a hot-path cost.
++  //
++  // Root agents only, which is the whole reason the count lives in its own
++  // module with a test: a subagent's final count is discarded with the
++  // subagent, and recounting it tokenizes that agent's entire history for
++  // nobody.
++  const recountContextTokensForTurnEnd = () => {
++    currentAgentState.contextTokenCount = recountContextTokens({
++      agentState: {
++        // `initialAgentState` is the same object `currentAgentState` points at
++        // (every reassignment below assigns it), so this is exactly the
++        // predicate the compaction callback already uses two hundred lines
++        // down: nothing a subagent computes here leaves the subagent.
++        parentId: initialAgentState.parentId,
++        messageHistory: currentAgentState.messageHistory,
++        contextTokenCount: currentAgentState.contextTokenCount,
++      },
++      systemPrompt: system,
++      toolsForTokenCount,
++    })
++  }
++
+   let shouldEndTurn = false
+   let hasRetriedOutputSchema = false
+   let currentPrompt = prompt
+@@ -1234,6 +1270,8 @@ export async function loopAgentSteps(
+       )
+     }
+ 
++    recountContextTokensForTurnEnd()
++
+     await finishAgentRun({
+       ...params,
+       runId,
+@@ -1277,6 +1315,13 @@ export async function loopAgentSteps(
+         'Agent run cancelled by user (abort error)',
+       )
+ 
++      // Same reason as the success path, and it matters more here: the branch
++      // above just appended another message to the history the caller keeps.
++      // Not the last edit, though — the SDK's buildCancelledSessionState drops
++      // unanswered tool calls and appends again at the persistence boundary,
++      // and carries this count across those edits itself.
++      recountContextTokensForTurnEnd()
++
+       await finishAgentRun({
+         ...params,
+         runId,
+@@ -1331,6 +1376,9 @@ export async function loopAgentSteps(
+     const statusCode = apiErrorDetails.statusCode
+ 
+     const status = signal.aborted ? 'cancelled' : 'failed'
++    // A failed turn still leaves history behind, and the host still shows the
++    // user a context reading before their next message.
++    recountContextTokensForTurnEnd()
+     await finishAgentRun({
+       ...params,
+       runId,
+diff --git a/packages/agent-runtime/src/util/__tests__/context-token-count.test.ts b/packages/agent-runtime/src/util/__tests__/context-token-count.test.ts
+new file mode 100644
+index 000000000..c2194d405
+--- /dev/null
++++ b/packages/agent-runtime/src/util/__tests__/context-token-count.test.ts
+@@ -0,0 +1,107 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  adjustContextTokenCountForHistoryEdit,
++  recountContextTokens,
++} from '../context-token-count'
++import { countTokensMessages } from '../token-counter'
++
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++
++const text = (role: 'user' | 'assistant', body: string) =>
++  ({ role, content: [{ type: 'text', text: body }] }) as unknown as Message
++
++const HISTORY: Message[] = [
++  text('user', 'find every caller of loopAgentSteps'.repeat(50)),
++  text('assistant', 'here they are'.repeat(200)),
++]
++
++const SYSTEM = 'you are a coding agent'.repeat(100)
++const TOOLS = { read_files: { description: 'read', inputSchema: {} } }
++
++describe('recountContextTokens', () => {
++  test('counts the history, the system prompt and the tool schemas', () => {
++    const agentState = {
++      messageHistory: HISTORY,
++      contextTokenCount: 1,
++    }
++    const counted = recountContextTokens({
++      agentState,
++      systemPrompt: SYSTEM,
++      toolsForTokenCount: TOOLS,
++    })
++    // Strictly larger than the history alone: the system prompt and tool
++    // schemas are in every request and the compaction budget is enforced
++    // against the total.
++    expect(counted).toBeGreaterThan(countTokensMessages(HISTORY))
++  })
++
++  test('leaves a subagent\'s count alone instead of paying to recompute it', () => {
++    // Only the ROOT agent's count is ever read — the host reads
++    // sessionState.mainAgentState. Every spawned agent (file-picker, thinker,
++    // context-pruner, …) otherwise pays a full countTokensMessages over its
++    // whole history at the end of its run for a number that is discarded with
++    // it, which on a one-step subagent roughly doubles its tokenizer cost.
++    //
++    // The stale sentinel is the assertion: a recount of this history cannot
++    // produce 7 by accident.
++    const agentState = {
++      parentId: 'parent-run-id',
++      messageHistory: HISTORY,
++      contextTokenCount: 7,
++    }
++    expect(
++      recountContextTokens({
++        agentState,
++        systemPrompt: SYSTEM,
++        toolsForTokenCount: TOOLS,
++      }),
++    ).toBe(7)
++  })
++})
++
++describe('adjustContextTokenCountForHistoryEdit', () => {
++  // The count covers history + system + tools, and an edit at the persistence
++  // boundary can only change the history half. Carrying the difference keeps
++  // the other half — which the editor has no way to recompute, having neither
++  // the system prompt nor the tool schemas in scope.
++  const SYSTEM_AND_TOOLS = 9_000
++
++  test('follows an appended message', () => {
++    const nextHistory = [...HISTORY, text('user', 'run cancelled by user')]
++    const adjusted = adjustContextTokenCountForHistoryEdit({
++      contextTokenCount: countTokensMessages(HISTORY) + SYSTEM_AND_TOOLS,
++      previousHistory: HISTORY,
++      nextHistory,
++    })
++    expect(adjusted).toBe(countTokensMessages(nextHistory) + SYSTEM_AND_TOOLS)
++    expect(adjusted).toBeGreaterThan(
++      countTokensMessages(HISTORY) + SYSTEM_AND_TOOLS,
++    )
++  })
++
++  test('follows a dropped message', () => {
++    // dropUnansweredToolCalls can remove a large assistant tool call at the
++    // same boundary, which moves the number the other way.
++    const nextHistory = [HISTORY[0]]
++    expect(
++      adjustContextTokenCountForHistoryEdit({
++        contextTokenCount: countTokensMessages(HISTORY) + SYSTEM_AND_TOOLS,
++        previousHistory: HISTORY,
++        nextHistory,
++      }),
++    ).toBe(countTokensMessages(nextHistory) + SYSTEM_AND_TOOLS)
++  })
++
++  test('never goes negative', () => {
++    // A count from before this shipped can be 0 or unrelated to the history it
++    // is paired with; a negative token count would render as a negative chip.
++    expect(
++      adjustContextTokenCountForHistoryEdit({
++        contextTokenCount: 0,
++        previousHistory: HISTORY,
++        nextHistory: [],
++      }),
++    ).toBe(0)
++  })
++})
+diff --git a/packages/agent-runtime/src/util/context-token-count.ts b/packages/agent-runtime/src/util/context-token-count.ts
+new file mode 100644
+index 000000000..c4de3ff9a
+--- /dev/null
++++ b/packages/agent-runtime/src/util/context-token-count.ts
+@@ -0,0 +1,67 @@
++import { countTokens, countTokensJson, countTokensMessages } from './token-counter'
++
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++
++/** The slice of AgentState this file needs, so the SDK and the step loop can
++ *  both call in without either owning the full type. */
++type CountableAgentState = {
++  parentId?: string
++  messageHistory: Message[]
++  contextTokenCount: number
++}
++
++/**
++ * `contextTokenCount` for an agent whose turn has ended.
++ *
++ * Inside the step loop the count is taken BEFORE the model call, so it never
++ * includes the last step's assistant output or its tool results — systematically
++ * the most recently added content, and on a step that read several files easily
++ * tens of thousands of tokens. Harmless while it only fed the compaction check;
++ * wrong once a host persists it and shows it to the user between turns.
++ *
++ * Root agents only. The host reads `sessionState.mainAgentState`, so a
++ * subagent's final count is discarded along with the subagent — recounting it
++ * would tokenize that agent's entire history for a number nobody reads, which
++ * on a one-step subagent roughly doubles its tokenizer cost. Same predicate the
++ * compaction callback in run-agent-step.ts already uses.
++ */
++export function recountContextTokens(params: {
++  agentState: CountableAgentState
++  systemPrompt: string
++  toolsForTokenCount: unknown
++}): number {
++  const { agentState, systemPrompt, toolsForTokenCount } = params
++  if (agentState.parentId) return agentState.contextTokenCount
++  return (
++    countTokensMessages(agentState.messageHistory) +
++    countTokens(systemPrompt) +
++    countTokensJson(toolsForTokenCount)
++  )
++}
++
++/**
++ * Carry `contextTokenCount` across a history edit made after the last recount.
++ *
++ * The persistence boundary edits history the runtime has already counted: the
++ * SDK drops unanswered tool calls and appends the cancellation / error message
++ * that a resumed run starts from. Leaving the count untouched persists a number
++ * that does not describe the history stored beside it.
++ *
++ * A difference rather than a recount, because the editor holds only the
++ * history: the system prompt and tool schemas are the other half of the number
++ * and are not in scope there. Applying the delta keeps that half exactly, and
++ * the estimate stays internally consistent.
++ */
++export function adjustContextTokenCountForHistoryEdit(params: {
++  contextTokenCount: number
++  previousHistory: Message[]
++  nextHistory: Message[]
++}): number {
++  const { contextTokenCount, previousHistory, nextHistory } = params
++  if (previousHistory === nextHistory) return contextTokenCount
++  const delta =
++    countTokensMessages(nextHistory) - countTokensMessages(previousHistory)
++  // A count carried in from before this shipped need not match its history at
++  // all; a negative token count would reach the composer as a negative chip.
++  return Math.max(0, contextTokenCount + delta)
++}
+diff --git a/sdk/src/__tests__/cancelled-session-state.test.ts b/sdk/src/__tests__/cancelled-session-state.test.ts
+new file mode 100644
+index 000000000..9874cab23
+--- /dev/null
++++ b/sdk/src/__tests__/cancelled-session-state.test.ts
+@@ -0,0 +1,127 @@
++import { countTokensMessages } from '@codebuff/agent-runtime/util/token-counter'
++import { getInitialSessionState } from '@codebuff/common/types/session-state'
++import { getStubProjectFileContext } from '@codebuff/common/util/file'
++import { describe, expect, test } from 'bun:test'
++
++import { buildCancelledSessionState } from '../run'
++
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++import type { SessionState } from '@codebuff/common/types/session-state'
++
++/**
++ * The state a cancelled or errored turn persists is built HERE, after the
++ * runtime's own end-of-turn recount has already run. This function then drops
++ * unanswered tool calls and appends one or two more messages — so whatever it
++ * does to the history, it owes the count the same edit. Otherwise the number
++ * the composer draws describes a history the thread does not have.
++ *
++ * The count covers history + system prompt + tool schemas, and only the first
++ * of those is in scope here, which is why every assertion below is written as
++ * "the count still equals this history plus the same constant".
++ */
++
++/** Tokens the system prompt and tool schemas contribute — untouchable from
++ *  here, and therefore the part that must survive every edit unchanged. */
++const SYSTEM_AND_TOOLS = 9_000
++
++const text = (role: 'user' | 'assistant', body: string) =>
++  ({ role, content: [{ type: 'text', text: body }] }) as unknown as Message
++
++const toolCall = (toolCallId: string) =>
++  ({
++    role: 'assistant',
++    content: [
++      {
++        type: 'tool-call',
++        toolCallId,
++        toolName: 'read_files',
++        input: { paths: ['a.ts', 'b.ts', 'c.ts'] },
++      },
++    ],
++  }) as unknown as Message
++
++function sessionStateWith(messageHistory: Message[]): SessionState {
++  const state = getInitialSessionState(getStubProjectFileContext())
++  state.mainAgentState.messageHistory = messageHistory
++  state.mainAgentState.contextTokenCount =
++    countTokensMessages(messageHistory) + SYSTEM_AND_TOOLS
++  return state
++}
++
++describe('buildCancelledSessionState', () => {
++  test('the count describes the history it persists', () => {
++    // The turn ended, the runtime recounted, and THEN this appended the
++    // cancellation message. Leaving the count alone persists a number that is
++    // short by exactly the messages the user will resume from.
++    const history = [
++      text('user', 'refactor the run loop'.repeat(40)),
++      text('assistant', 'done'.repeat(400)),
++    ]
++    const state = buildCancelledSessionState({
++      sessionState: sessionStateWith(history),
++      runtimeMadeProgress: true,
++      message: 'Run cancelled by user.',
++    })
++
++    expect(state.mainAgentState.messageHistory.length).toBe(history.length + 1)
++    expect(state.mainAgentState.contextTokenCount).toBe(
++      countTokensMessages(state.mainAgentState.messageHistory) +
++        SYSTEM_AND_TOOLS,
++    )
++  })
++
++  test('the count follows the user prompt that gets restored', () => {
++    // Nothing ran, so the prompt is added back here rather than by the runtime
++    // — two appends past the last recount instead of one.
++    const history = [text('assistant', 'earlier turn'.repeat(200))]
++    const prompt = text('user', 'refactor the run loop'.repeat(40))
++    const state = buildCancelledSessionState({
++      sessionState: sessionStateWith(history),
++      runtimeMadeProgress: false,
++      promptMessage: prompt,
++      message: 'Run cancelled by user.',
++    })
++
++    expect(state.mainAgentState.messageHistory.length).toBe(history.length + 2)
++    expect(state.mainAgentState.contextTokenCount).toBe(
++      countTokensMessages(state.mainAgentState.messageHistory) +
++        SYSTEM_AND_TOOLS,
++    )
++  })
++
++  test('the count follows a dropped half-step', () => {
++    // dropUnansweredToolCalls removes an assistant tool call whose result never
++    // arrived — the one edit here that makes the history SMALLER, and on a
++    // multi-file read a large one.
++    const history = [
++      text('user', 'read the runner'.repeat(40)),
++      toolCall('call-1'),
++    ]
++    const state = buildCancelledSessionState({
++      sessionState: sessionStateWith(history),
++      runtimeMadeProgress: true,
++      message: 'Run cancelled by user.',
++    })
++
++    const persisted = state.mainAgentState.messageHistory
++    expect(persisted.some((m) => m.role === 'assistant')).toBe(false)
++    expect(state.mainAgentState.contextTokenCount).toBe(
++      countTokensMessages(persisted) + SYSTEM_AND_TOOLS,
++    )
++  })
++
++  test('does not disturb the live session', () => {
++    // Same contract cloneSessionState exists for: the run is still unwinding
++    // and the caller keeps using the original.
++    const history = [text('user', 'hello')]
++    const live = sessionStateWith(history)
++    const before = live.mainAgentState.contextTokenCount
++    buildCancelledSessionState({
++      sessionState: live,
++      runtimeMadeProgress: true,
++      message: 'Run cancelled by user.',
++    })
++    expect(live.mainAgentState.messageHistory.length).toBe(1)
++    expect(live.mainAgentState.contextTokenCount).toBe(before)
++  })
++})
+diff --git a/sdk/src/__tests__/initial-session-state.test.ts b/sdk/src/__tests__/initial-session-state.test.ts
+index dac7af17c..5b9b97182 100644
+--- a/sdk/src/__tests__/initial-session-state.test.ts
++++ b/sdk/src/__tests__/initial-session-state.test.ts
+@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
+ import os from 'os'
+ import path from 'path'
+ 
+-import { describe, expect, test, beforeEach } from 'bun:test'
++import { describe, expect, test, beforeEach, spyOn } from 'bun:test'
+ import { z } from 'zod/v4'
+ 
+ import { initialSessionState } from '../run-state'
+@@ -402,6 +402,125 @@ describe('Initial Session State', () => {
+     }
+   })
+ 
++  /**
++   * Hosts that embed this runner in a different process from the repo (Freebuff
++   * Cloud: runner in the web server, repo in a Daytona sandbox) must be able to
++   * replace the filesystem walk outright. Without that, the default loader
++   * reads the SERVER's disk and home directory — see `skillsLoader` docs.
++   */
++  describe('skillsLoader', () => {
++    test('replaces the filesystem walk entirely', async () => {
++      const remoteSkill = {
++        name: 'remote-skill',
++        description: 'Came from another machine',
++        content: '---\nname: remote-skill\ndescription: x\n---\nbody',
++        filePath: '/home/daytona/codebase/.agents/skills/remote-skill/SKILL.md',
++      }
++
++      const sessionState = await initialSessionState({
++        // A path that does not exist on this machine, exactly as Cloud passes.
++        cwd: '/home/daytona/codebase',
++        skillsLoader: async () => ({ 'remote-skill': remoteSkill }),
++        projectFiles: { 'src/index.ts': 'console.log("hello");' },
++        fs: mockFs,
++        logger: mockLogger,
++      })
++
++      expect(Object.keys(sessionState.fileContext.skills!)).toEqual([
++        'remote-skill',
++      ])
++      expect(sessionState.fileContext.skills!['remote-skill'].filePath).toBe(
++        remoteSkill.filePath,
++      )
++    })
++
++    test('wins over skillsDir rather than merging with it', async () => {
++      const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'sdk-skills-test-'))
++      try {
++        const skillDir = path.join(tmpDir, 'local-skill')
++        mkdirSync(skillDir, { recursive: true })
++        writeFileSync(
++          path.join(skillDir, 'SKILL.md'),
++          '---\nname: local-skill\ndescription: On this disk\n---\n\nbody\n',
++        )
++
++        const sessionState = await initialSessionState({
++          cwd: '/test-project',
++          skillsDir: tmpDir,
++          skillsLoader: async () => ({}),
++          projectFiles: { 'src/index.ts': 'console.log("hello");' },
++          fs: mockFs,
++          logger: mockLogger,
++        })
++
++        expect(Object.keys(sessionState.fileContext.skills!)).toHaveLength(0)
++      } finally {
++        rmSync(tmpDir, { recursive: true, force: true })
++      }
++    })
++
++    /**
++     * `skillsLoader` is the per-run fix; this is the backstop for a host that
++     * never sets it. Freebuff Cloud reaches the runner through
++     * initialSessionState, so the guard has to hold at THIS entry point and not
++     * only inside loadSkills.
++     */
++    test('a run that sets nothing still cannot read the home directory', async () => {
++      const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'sdk-home-guard-'))
++      const fakeHome = path.join(tempRoot, 'home')
++      const skillDir = path.join(fakeHome, '.claude', 'skills', 'server-skill')
++      mkdirSync(skillDir, { recursive: true })
++      writeFileSync(
++        path.join(skillDir, 'SKILL.md'),
++        '---\nname: server-skill\ndescription: Lives on the server\n---\n\nbody\n',
++      )
++
++      const homedirSpy = spyOn(os, 'homedir').mockReturnValue(fakeHome)
++      try {
++        const sessionState = await initialSessionState({
++          cwd: '/home/daytona/codebase',
++          projectFiles: { 'src/index.ts': 'console.log("hello");' },
++          fs: mockFs,
++          logger: mockLogger,
++        })
++
++        expect(Object.keys(sessionState.fileContext.skills!)).toHaveLength(0)
++
++        // Same call, opted in: proves the seed was discoverable and this test
++        // is not passing because the fixture was wrong.
++        const optedIn = await initialSessionState({
++          cwd: '/home/daytona/codebase',
++          includeHomeSkills: true,
++          projectFiles: { 'src/index.ts': 'console.log("hello");' },
++          fs: mockFs,
++          logger: mockLogger,
++        })
++
++        expect(Object.keys(optedIn.fileContext.skills!)).toEqual([
++          'server-skill',
++        ])
++      } finally {
++        homedirSpy.mockRestore()
++        rmSync(tempRoot, { recursive: true, force: true })
++      }
++    })
++
++    test('a rejecting loader costs the skills, not the run', async () => {
++      const sessionState = await initialSessionState({
++        cwd: '/home/daytona/codebase',
++        skillsLoader: async () => {
++          throw new Error('sandbox unreachable')
++        },
++        projectFiles: { 'src/index.ts': 'console.log("hello");' },
++        fs: mockFs,
++        logger: mockLogger,
++      })
++
++      expect(sessionState.fileContext.skills).toBeDefined()
++      expect(Object.keys(sessionState.fileContext.skills!)).toHaveLength(0)
++    })
++  })
++
+   test('initializes empty agent state correctly', async () => {
+     const projectFiles = {
+       'src/index.ts': 'console.log("Hello world");',
+diff --git a/sdk/src/__tests__/load-skills.test.ts b/sdk/src/__tests__/load-skills.test.ts
+index 0be0cafae..55f9a1b6a 100644
+--- a/sdk/src/__tests__/load-skills.test.ts
++++ b/sdk/src/__tests__/load-skills.test.ts
+@@ -9,7 +9,11 @@ import {
+   SKILL_NAME_MAX_LENGTH,
+ } from '@codebuff/common/constants/skills'
+ 
+-import { loadSkills, parseSkillFileContent } from '../skills/load-skills'
++import {
++  loadSkills,
++  parseSkillFileContent,
++  resolveSkillsDirs,
++} from '../skills/load-skills'
+ 
+ const writeSkill = ({
+   skillsRoot,
+@@ -65,7 +69,8 @@ describe('loadSkills', () => {
+     rmSync(tempRoot, { recursive: true, force: true })
+   })
+ 
+-  test('discovers valid skills from all default search roots', async () => {
++  /** Writes one skill into each of the four possible roots. */
++  const writeSkillInEveryRoot = () => {
+     writeSkill({
+       skillsRoot: path.join(homeDir, '.claude', 'skills'),
+       skillDirName: 'global-claude-skill',
+@@ -82,9 +87,33 @@ describe('loadSkills', () => {
+       skillsRoot: path.join(projectDir, '.agents', 'skills'),
+       skillDirName: 'project-agents-skill',
+     })
++  }
++
++  test('discovers project skills, and by default ONLY project skills', async () => {
++    writeSkillInEveryRoot()
+ 
+     const skills = await loadSkills({ cwd: projectDir })
+ 
++    // The home roots are deliberately absent. A host that embeds this SDK in a
++    // server process would otherwise be served that SERVER's home directory —
++    // see LoadSkillsOptions.includeHomeSkills.
++    expect(Object.keys(skills).sort()).toEqual([
++      'project-agents-skill',
++      'project-claude-skill',
++    ])
++    expect(skills['project-agents-skill']?.description).toBe(
++      'Description for project-agents-skill',
++    )
++  })
++
++  test('discovers skills from all four roots when home skills are opted in', async () => {
++    writeSkillInEveryRoot()
++
++    const skills = await loadSkills({
++      cwd: projectDir,
++      includeHomeSkills: true,
++    })
++
+     expect(Object.keys(skills).sort()).toEqual([
+       'global-agents-skill',
+       'global-claude-skill',
+@@ -94,9 +123,6 @@ describe('loadSkills', () => {
+     expect(skills['global-claude-skill']?.filePath).toBe(
+       path.join(homeDir, '.claude', 'skills', 'global-claude-skill', 'SKILL.md'),
+     )
+-    expect(skills['project-agents-skill']?.description).toBe(
+-      'Description for project-agents-skill',
+-    )
+   })
+ 
+   test('loads skills from an explicit skillsPath only', async () => {
+@@ -146,7 +172,7 @@ describe('loadSkills', () => {
+       description: 'project agents',
+     })
+ 
+-    const skills = await loadSkills({ cwd: projectDir })
++    const skills = await loadSkills({ cwd: projectDir, includeHomeSkills: true })
+ 
+     expect(skills['shared-skill']?.description).toBe('project agents')
+     expect(skills['shared-skill']?.filePath).toBe(
+@@ -166,7 +192,7 @@ describe('loadSkills', () => {
+       description: 'project claude',
+     })
+ 
+-    const skills = await loadSkills({ cwd: projectDir })
++    const skills = await loadSkills({ cwd: projectDir, includeHomeSkills: true })
+ 
+     expect(skills['priority-skill']?.description).toBe('project claude')
+   })
+@@ -364,3 +390,88 @@ describe('parseSkillFileContent', () => {
+     expect(parsed?.content).toBe(content)
+   })
+ })
++
++/**
++ * Guards the home-directory boundary itself.
++ *
++ * The bug these exist for is invisible from the outside: skills load fine, they
++ * are just the WRONG MACHINE's. Freebuff Cloud embeds this runner in the
++ * freebuff/web server process while the repo lives in a Daytona sandbox, so an
++ * always-on `os.homedir()` search meant every Cloud turn parsed the web
++ * server's `~/.claude/skills` and offered it to the model. Nothing downstream
++ * can tell that apart from working correctly, so it has to be caught here.
++ *
++ * These assert on the RESOLVED SEARCH PATHS rather than on load results, so
++ * they fail even if the home directory happens to be empty on the machine
++ * running the suite.
++ */
++describe('home-directory boundary', () => {
++  const SANDBOX_CWD = '/home/daytona/codebase'
++
++  test('the default search never leaves the project', () => {
++    const dirs = resolveSkillsDirs({ cwd: SANDBOX_CWD })
++
++    expect(dirs).toEqual([
++      path.join(SANDBOX_CWD, '.claude', 'skills'),
++      path.join(SANDBOX_CWD, '.agents', 'skills'),
++    ])
++    expect(dirs.every((dir) => dir.startsWith(SANDBOX_CWD))).toBe(true)
++  })
++
++  test('a home directory is searched only when one is supplied', () => {
++    const withHome = resolveSkillsDirs({
++      cwd: SANDBOX_CWD,
++      homeDir: '/home/webserver',
++    })
++
++    // Home roots come first: lower precedence than the project's.
++    expect(withHome).toEqual([
++      path.join('/home/webserver', '.claude', 'skills'),
++      path.join('/home/webserver', '.agents', 'skills'),
++      path.join(SANDBOX_CWD, '.claude', 'skills'),
++      path.join(SANDBOX_CWD, '.agents', 'skills'),
++    ])
++  })
++
++  test('an explicit skillsPath is the whole search, home or not', () => {
++    expect(
++      resolveSkillsDirs({
++        cwd: SANDBOX_CWD,
++        skillsPath: '/explicit/skills',
++        homeDir: '/home/webserver',
++      }),
++    ).toEqual(['/explicit/skills'])
++  })
++
++  test('a server-embedded run cannot reach the home directory', async () => {
++    // A real home containing a real, valid skill, reached the way the runtime
++    // reaches it — so this fails loudly if the fallback ever returns.
++    const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'skills-home-guard-'))
++    const fakeHome = path.join(tempRoot, 'home')
++    const sandboxCwd = path.join(tempRoot, 'not-the-repo')
++    mkdirSync(fakeHome, { recursive: true })
++    mkdirSync(sandboxCwd, { recursive: true })
++    writeSkill({
++      skillsRoot: path.join(fakeHome, '.claude', 'skills'),
++      skillDirName: 'server-side-skill',
++    })
++
++    const homedirSpy = spyOn(os, 'homedir').mockReturnValue(fakeHome)
++    try {
++      // What a server-embedded runner does: a cwd that is not its own repo,
++      // and no statement that this process belongs to any user.
++      expect(await loadSkills({ cwd: sandboxCwd })).toEqual({})
++
++      // The same call from a process that IS the user's finds it — without
++      // this the assertion above could pass for the wrong reason (a bad seed).
++      expect(
++        Object.keys(
++          await loadSkills({ cwd: sandboxCwd, includeHomeSkills: true }),
++        ),
++      ).toEqual(['server-side-skill'])
++    } finally {
++      homedirSpy.mockRestore()
++      rmSync(tempRoot, { recursive: true, force: true })
++    }
++  })
++})
+diff --git a/sdk/src/run-state.ts b/sdk/src/run-state.ts
+index 4113cda27..6eb1121c0 100644
+--- a/sdk/src/run-state.ts
++++ b/sdk/src/run-state.ts
+@@ -33,6 +33,7 @@ import type {
+   AgentOutput,
+   SessionState,
+ } from '@codebuff/common/types/session-state'
++import type { SkillsMap } from '@codebuff/common/types/skill'
+ import type { CodebuffSpawn } from '@codebuff/common/types/spawn'
+ import type {
+   CustomToolDefinitions,
+@@ -80,6 +81,32 @@ export type InitialSessionStateOptions = {
+   cwd?: string
+   /** Optional directory path to load skills from. When provided, skills are loaded from this directory instead of the default locations. */
+   skillsDir?: string
++  /**
++   * Supplies the run's skills instead of the default local-filesystem walk.
++   *
++   * Required by any host that embeds this runner in a DIFFERENT process from
++   * the repo it is acting on, because the default loader is `fs`-based and
++   * would read THIS machine's disk. Freebuff Cloud is exactly that shape: the
++   * runner lives in the freebuff/web server process while the repo lives in a
++   * Daytona sandbox (freebuff/web/src/server/agent-runner/runTurn.ts:1346
++   * passes a sandbox `cwd` that does not exist on the web server), so it
++   * injects a loader that reads the sandbox. CLI and Desktop run alongside
++   * their repo and correctly leave this unset.
++   *
++   * This is the per-run escape hatch; `includeHomeSkills` below is the blunt
++   * structural guard that keeps the home directory out of the default path
++   * even when a host forgets to set this.
++   *
++   * Called at most once, and only when a fresh session state is built. A
++   * rejection is contained: it yields no skills rather than failing the run.
++   */
++  skillsLoader?: () => Promise<SkillsMap>
++  /**
++   * Also load the user's `~/.claude/skills` and `~/.agents/skills`. Defaults to
++   * false, so an embedder gets project-only skills unless it states that this
++   * process belongs to that user. See `LoadSkillsOptions.includeHomeSkills`.
++   */
++  includeHomeSkills?: boolean
+   projectFiles?: Record<string, string>
+   /** Precomputed index for exactly these `projectFiles` (see
+    *  ComputedProjectIndex). Ignored when `projectFiles` is absent. */
+@@ -555,7 +582,13 @@ async function loadKnowledgeFilesFromPaths(params: {
+ export async function initialSessionState(
+   params: InitialSessionStateOptions,
+ ): Promise<SessionState> {
+-  const { cwd, maxAgentSteps, skillsDir } = params
++  const {
++    cwd,
++    maxAgentSteps,
++    skillsDir,
++    skillsLoader,
++    includeHomeSkills = false,
++  } = params
+   let {
+     agentDefinitions,
+     customToolDefinitions,
+@@ -666,12 +699,29 @@ export async function initialSessionState(
+     ...providedUserKnowledgeFiles,
+   }
+ 
+-  // Load skills from project and home directories
+-  const skills = await loadSkills({
+-    cwd: cwd ?? process.cwd(),
+-    skillsPath: skillsDir,
+-    verbose: false,
+-  })
++  // Load skills. An injected loader wins outright: it is the only correct
++  // source for a host whose repo is not on this machine (see `skillsLoader`).
++  // Skills are prompt content, never control flow, so a loader that throws
++  // must degrade to "no skills" rather than take the whole turn down with it.
++  let skills: SkillsMap
++  if (skillsLoader) {
++    try {
++      skills = await skillsLoader()
++    } catch (error) {
++      logger.error(
++        { error: getErrorObject(error) },
++        'Injected skills loader failed; continuing with no skills',
++      )
++      skills = {}
++    }
++  } else {
++    skills = await loadSkills({
++      cwd: cwd ?? process.cwd(),
++      skillsPath: skillsDir,
++      verbose: false,
++      includeHomeSkills,
++    })
++  }
+ 
+   const initialState = getInitialSessionState({
+     projectRoot: cwd ?? process.cwd(),
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 2e114e68f..ece542f70 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -1,6 +1,7 @@
+ import path from 'path'
+ 
+ import { callMainPrompt } from '@codebuff/agent-runtime/main-prompt'
++import { adjustContextTokenCountForHistoryEdit } from '@codebuff/agent-runtime/util/context-token-count'
+ import {
+   buildUserMessageContent,
+   withSystemTags,
+@@ -65,10 +66,14 @@ import type {
+ } from '@codebuff/common/types/contracts/llm'
+ import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+ import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
+-import type { ToolMessage } from '@codebuff/common/types/messages/codebuff-message'
++import type {
++  Message,
++  ToolMessage,
++} from '@codebuff/common/types/messages/codebuff-message'
+ import type { ToolResultOutput } from '@codebuff/common/types/messages/content-part'
+ import type { PrintModeEvent } from '@codebuff/commo
+
+… [diff truncated — view full diff on GitHub] …

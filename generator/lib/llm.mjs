@@ -16,15 +16,15 @@
 import { createHash } from 'node:crypto'
 import { readJson, writeJson, log } from './util.mjs'
 
-export function llmConfigured () {
-  return process.env.CHANGELOG_LLM === '1' && !!process.env.LLM_API_KEY
+export function llmConfigured (env = process.env) {
+  return env.CHANGELOG_LLM === '1' && !!env.LLM_API_KEY
 }
 
 function patchHash (patch) {
   return createHash('sha1').update(patch).digest('hex').slice(0, 12)
 }
 
-function buildPrompt (entry, patch) {
+export function buildPrompt (entry, patch) {
   return [
     'You write changelog entries for Freebuff, a free AI coding agent, based on the exact diff a sync bot pushed to the public repo.',
     'Rules: use ONLY facts from the diff and the analysis notes below. Never invent file names, features, or versions.',
@@ -41,6 +41,15 @@ function buildPrompt (entry, patch) {
     patch.slice(0, 12000),
     '```'
   ].filter(Boolean).join('\n')
+}
+
+export function parseLlmJson (text) {
+  const jsonStart = text.indexOf('{')
+  const jsonEnd = text.lastIndexOf('}')
+  if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
+    throw new Error('LLM returned no JSON')
+  }
+  return JSON.parse(text.slice(jsonStart, jsonEnd + 1))
 }
 
 async function callLlm (prompt, env) {
@@ -61,50 +70,84 @@ async function callLlm (prompt, env) {
     signal: AbortSignal.timeout(60000)
   })
   if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
-  const data = await res.json()
+  const rawText = await res.text()
+  const data = parseLlmJson(rawText)
   const text = data.choices?.[0]?.message?.content ?? ''
-  const jsonStart = text.indexOf('{')
-  if (jsonStart === -1) throw new Error('LLM returned no JSON')
-  return JSON.parse(text.slice(jsonStart))
+  return parseLlmJson(text)
 }
 
-export async function enrichWithLlm (entries, getPatch, dataDir, env = process.env) {
-  if (!llmConfigured()) return 0
+function isTransientError (err) {
+  const msg = String(err?.message || err || '')
+  return /fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|502|503|504|timeout/i.test(msg)
+}
+
+export async function enrichWithLlm (entries, getPatch, dataDir, env = process.env, options = {}) {
+  if (!llmConfigured(env)) return 0
   const cachePath = `${dataDir}/ai-summaries.json`
   const cache = await readJson(cachePath, {})
   const limit = Number(env.CHANGELOG_LLM_LIMIT || 60)
-  let done = 0
-  for (const e of entries) {
-    if (done >= limit) break
-    if (e.kind !== 'sync') continue
+  const concurrency = Number(env.CHANGELOG_LLM_CONCURRENCY || 5)
+  let apiCalls = 0
+  let cacheModified = false
+
+  // Prioritize newest entries first so latest releases & days receive summaries
+  const syncEntries = entries.filter(e => e.kind === 'sync').reverse()
+
+  const queue = []
+  for (const e of syncEntries) {
     if (e.ai?.model) continue
     const patch = await getPatch(e)
     if (!patch) continue
     const key = `${e.sha}:${patchHash(patch)}`
-    if (cache[key]?.error) continue
-    if (cache[key]) {
+    if (cache[key]?.error && !options.retryErrors) continue
+    if (cache[key] && !cache[key].error) {
       e.ai = { model: cache[key].model, title: cache[key].title, summary: cache[key].summary, significance: cache[key].significance, at: cache[key].at }
-      done++
-      continue
+      continue // Cache hit does not consume the API budget
     }
-    try {
-      const out = await callLlm(buildPrompt(e, patch), env)
-      cache[key] = {
-        model: env.LLM_MODEL || 'gpt-4o-mini',
-        title: String(out.title || '').slice(0, 90),
-        summary: String(out.summary || '').slice(0, 800),
-        significance: ['minor', 'notable', 'major'].includes(out.significance) ? out.significance : 'minor',
-        at: new Date().toISOString()
+    queue.push({ entry: e, patch, key })
+    if (queue.length >= limit) break
+  }
+
+  if (!queue.length) return 0
+
+  let activeIndex = 0
+  let isOffline = false
+
+  async function worker () {
+    while (activeIndex < queue.length && !isOffline) {
+      const idx = activeIndex++
+      const { entry: e, patch, key } = queue[idx]
+      try {
+        const out = await callLlm(buildPrompt(e, patch), env)
+        cache[key] = {
+          model: env.LLM_MODEL || 'gpt-4o-mini',
+          title: String(out.title || '').slice(0, 90),
+          summary: String(out.summary || '').slice(0, 800),
+          significance: ['minor', 'notable', 'major'].includes(out.significance) ? out.significance : 'minor',
+          at: new Date().toISOString()
+        }
+        e.ai = { ...cache[key] }
+        apiCalls++
+        cacheModified = true
+        log(`LLM summarized ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})`)
+      } catch (err) {
+        log(`LLM failed for ${e.sha.slice(0, 8)}: ${err.message}`)
+        if (isTransientError(err)) {
+          isOffline = true
+          log(`LLM endpoint appears offline (${err.message}) — skipping further attempts this run`)
+          break
+        }
+        cache[key] = { error: String(err.message).slice(0, 200) }
+        cacheModified = true
       }
-      e.ai = { ...cache[key] }
-      done++
-      log(`LLM summarized ${e.sha.slice(0, 8)}`)
-    } catch (err) {
-      cache[key] = { error: String(err.message).slice(0, 200) }
-      log(`LLM failed for ${e.sha.slice(0, 8)}: ${err.message}`)
     }
+  }
+
+  const poolSize = Math.min(concurrency, queue.length)
+  await Promise.all(Array.from({ length: poolSize }, () => worker()))
+
+  if (cacheModified) {
     await writeJson(cachePath, cache)
   }
-  await writeJson(cachePath, cache)
-  return done
+  return apiCalls
 }

@@ -1,0 +1,347 @@
+diff --git a/agents/__tests__/basher.test.ts b/agents/__tests__/basher.test.ts
+index d6be640bb..4f486095a 100644
+--- a/agents/__tests__/basher.test.ts
++++ b/agents/__tests__/basher.test.ts
+@@ -188,33 +188,95 @@ describe('commander agent', () => {
+       expect(final.done).toBe(true)
+     })
+ 
+-    test('yields STEP for model analysis when what_to_summarize is provided', () => {
+-      const mockAgentState = createMockAgentState()
+-      const mockLogger = {
+-        debug: () => {},
+-        info: () => {},
+-        warn: () => {},
+-        error: () => {},
+-      }
+-
++    const mockLogger = {
++      debug: () => {},
++      info: () => {},
++      warn: () => {},
++      error: () => {},
++    }
++
++    /** Runs the generator through the command step and returns the second yield. */
++    const stepAfterCommand = (
++      params: Record<string, unknown>,
++      value: unknown,
++    ) => {
+       const generator = commander.handleSteps!({
+-        agentState: mockAgentState,
++        agentState: createMockAgentState(),
+         logger: mockLogger as any,
+-        params: { command: 'ls -la', what_to_summarize: 'list of files' },
++        params,
+       })
+-
+-      // First yield is the command
+       generator.next()
++      return generator.next({
++        agentState: createMockAgentState(),
++        toolResult: [{ type: 'json' as const, value }] as ToolResultOutput[],
++        stepsComplete: true,
++      })
++    }
+ 
+-      // Second yield should be STEP for model analysis
+-      const mockToolResult = {
++    test('yields STEP for model analysis when output is long enough to be worth summarizing', () => {
++      const result = stepAfterCommand(
++        { command: 'bun test', what_to_summarize: 'did the tests pass' },
++        { stdout: 'x'.repeat(5000) },
++      )
++
++      expect(result.value).toBe('STEP')
++    })
++
++    test('returns raw output without an LLM step when the output is small', () => {
++      // The whole point of the short-circuit: a summary of two file names costs
++      // a model round-trip to compress nothing.
++      const result = stepAfterCommand(
++        { command: 'ls -la', what_to_summarize: 'list of files' },
++        { stdout: 'file1.txt\nfile2.txt' },
++      )
++
++      const toolCall = result.value as {
++        toolName: string
++        input: { output: { stdout: string } }
++        includeToolCall?: boolean
++      }
++      expect(toolCall.toolName).toBe('set_output')
++      expect(toolCall.input.output).toEqual({ stdout: 'file1.txt\nfile2.txt' })
++      expect(toolCall.includeToolCall).toBe(false)
++    })
++
++    test('counts stderr and message toward the passthrough threshold', () => {
++      const result = stepAfterCommand(
++        { command: 'bun run build', what_to_summarize: 'what failed' },
++        { stdout: 'x'.repeat(1000), stderr: 'y'.repeat(1500) },
++      )
++
++      expect(result.value).toBe('STEP')
++    })
++
++    test('short-circuit survives handleSteps serialization', () => {
++      // The runtime stringifies handleSteps and re-evaluates it standalone, so
++      // a threshold read from module scope would throw ReferenceError in prod
++      // while passing every in-process test above. Assert on behavior from the
++      // serialized form, not on its source (the build minifies it).
++      const fn = eval(`(${commander.handleSteps!.toString()})`) as typeof commander.handleSteps
++      const generator = fn!({
++        agentState: createMockAgentState(),
++        logger: mockLogger as any,
++        params: { command: 'ls', what_to_summarize: 'files' },
++      })
++      generator.next()
++      const result = generator.next({
+         agentState: createMockAgentState(),
+         toolResult: [
+-          { type: 'json' as const, value: { stdout: 'file1.txt\nfile2.txt' } },
+-        ],
++          { type: 'json' as const, value: { stdout: 'a.txt' } },
++        ] as ToolResultOutput[],
+         stepsComplete: true,
+-      }
+-      const result = generator.next(mockToolResult)
++      })
++
++      expect((result.value as { toolName: string }).toolName).toBe('set_output')
++    })
++
++    test('summarizes when stdout was omitted for length, however short the rest is', () => {
++      const result = stepAfterCommand(
++        { command: 'bun test', what_to_summarize: 'did the tests pass' },
++        { stdout: 'tail', stdoutOmittedForLength: true as const },
++      )
+ 
+       expect(result.value).toBe('STEP')
+     })
+diff --git a/agents/basher.ts b/agents/basher.ts
+index e173a65f9..989599ff9 100644
+--- a/agents/basher.ts
++++ b/agents/basher.ts
+@@ -13,7 +13,7 @@ const basher: AgentDefinition = {
+   model: GEMINI_3_5_FLASH_LITE_MODEL_ID,
+   displayName: 'Basher',
+   spawnerPrompt:
+-    'Runs a single terminal command and (recommended) describes its output using an LLM using the what_to_summarize field. A lightweight shell command executor. Every basher spawn MUST include params: { command: "<shell>" }.',
++    'Runs a single terminal command and returns its output. A lightweight shell command executor. Every basher spawn MUST include params: { command: "<shell>" }. Add what_to_summarize only when you expect long or noisy output (full test suites, builds, large logs) and want an LLM to pull out the relevant part; for ordinary commands leave it off and read the output yourself. Short output is returned raw either way.',
+ 
+   inputSchema: {
+     params: {
+@@ -26,7 +26,7 @@ const basher: AgentDefinition = {
+         what_to_summarize: {
+           type: 'string',
+           description:
+-            'What information from the command output is desired. Be specific about what to look for or extract. This is optional, and if not provided, the basher will return the full command output without summarization.',
++            'Optional. What information from the command output is desired -- be specific about what to look for or extract. Only worth setting when you expect long or noisy output (a full test suite, a build, a large log); omit it for ordinary commands and read the output yourself. Output that is already short is returned raw either way, so setting this never hides anything from you.',
+         },
+         timeout_seconds: {
+           type: 'number',
+@@ -81,11 +81,15 @@ Do not use any tools! Only analyze the output of the command.`,
+       },
+     }
+ 
++    // Only object values are real command-output objects, not plain strings.
++    const result = toolResult?.[0]
++    const output =
++      result?.type === 'json' && typeof result.value === 'object'
++        ? result.value
++        : ''
++
+     if (!what_to_summarize) {
+       // Return the raw command output without summarization
+-      const result = toolResult?.[0]
+-      // Only return object values (command output objects), not plain strings
+-      const output = result?.type === 'json' && typeof result.value === 'object' ? result.value : ''
+       yield {
+         toolName: 'set_output',
+         input: { output },
+@@ -94,6 +98,42 @@ Do not use any tools! Only analyze the output of the command.`,
+       return
+     }
+ 
++    // Short-circuit: summarizing output the parent could just read is pure
++    // waste — it spends an LLM round-trip (and its latency, on the critical
++    // path of every typecheck/test spawn) to compress almost nothing, and the
++    // typical summary is ~150 tokens anyway. Below the cutoff we hand back the
++    // raw output, which is strictly more information than a summary of it.
++    // Inlined rather than imported: this generator is serialized with
++    // toString() and re-evaluated standalone, so it cannot close over module
++    // scope. ~2000 chars is roughly 500 tokens.
++    const RAW_OUTPUT_PASSTHROUGH_CHARS = 2000
++    if (output && typeof output === 'object') {
++      const o = output as {
++        stdout?: string
++        stderr?: string
++        message?: string
++        stdoutOmittedForLength?: true
++      }
++      const rawChars =
++        (o.stdout ?? '').length +
++        (o.stderr ?? '').length +
++        (o.message ?? '').length
++      // Defensive: stdoutOmittedForLength marks a result whose stdout was
++      // dropped wholesale (simplify-tool-results.ts, applied by
++      // trimMessagesToFitTokenLimit during context compaction). A fresh result
++      // straight from the tool shouldn't carry it, but if one ever does, its
++      // stdout is gone rather than small — passing it through would hand the
++      // parent nothing, so summarize instead.
++      if (!o.stdoutOmittedForLength && rawChars <= RAW_OUTPUT_PASSTHROUGH_CHARS) {
++        yield {
++          toolName: 'set_output',
++          input: { output },
++          includeToolCall: false,
++        }
++        return
++      }
++    }
++
+     // Let the model analyze and describe the output
+     yield 'STEP'
+   },
+diff --git a/packages/agent-runtime/src/__tests__/basher-short-circuit.test.ts b/packages/agent-runtime/src/__tests__/basher-short-circuit.test.ts
+new file mode 100644
+index 000000000..65ccebe89
+--- /dev/null
++++ b/packages/agent-runtime/src/__tests__/basher-short-circuit.test.ts
+@@ -0,0 +1,138 @@
++/**
++ * End-to-end check on basher's summarization short-circuit.
++ *
++ * The generator-level tests in agents/__tests__/basher.test.ts assert which
++ * step is yielded. This drives the REAL basher definition through
++ * loopAgentSteps with a mocked LLM and a stubbed terminal, and asserts the
++ * thing the change actually exists for: that no LLM call happens at all when
++ * the command output is small, and that the parent still receives the output.
++ */
++import { TEST_USER_ID } from '@codebuff/common/old-constants'
++import { createTestAgentRuntimeParams } from '@codebuff/common/testing/fixtures/agent-runtime'
++import { clearMockedModules } from '@codebuff/common/testing/mock-modules'
++import {
++  createMockDbOperations,
++  setupDbSpies,
++} from '@codebuff/common/testing/mocks/database'
++import { getInitialSessionState } from '@codebuff/common/types/session-state'
++import { promptSuccess } from '@codebuff/common/util/error'
++import { userMessage } from '@codebuff/common/util/messages'
++import * as analytics from '@codebuff/common/analytics'
++import {
++  afterAll,
++  afterEach,
++  beforeEach,
++  describe,
++  expect,
++  it,
++  mock,
++  spyOn,
++} from 'bun:test'
++
++import basher from '../../../../agents/basher'
++import { loopAgentSteps } from '../run-agent-step'
++import { clearAgentGeneratorCache } from '../run-programmatic-step'
++import { createToolCallChunk, mockFileContext } from './test-utils'
++
++import type { AgentTemplate } from '../templates/types'
++import type { DbSpies } from '@codebuff/common/testing/mocks/database'
++
++describe('basher summarization short-circuit (end-to-end)', () => {
++  let llmCallCount: number
++  let dbSpies: DbSpies
++  let runtime: any
++
++  const basherTemplate = {
++    ...basher,
++    inputSchema: {},
++    includeMessageHistory: false,
++    inheritParentSystemPrompt: false,
++    mcpServers: {},
++    spawnableAgents: [],
++    stepPrompt: '',
++    handleSteps: basher.handleSteps,
++  } as unknown as AgentTemplate
++
++  beforeEach(() => {
++    const {
++      agentTemplate: _,
++      localAgentTemplates: __,
++      ...base
++    } = createTestAgentRuntimeParams()
++    runtime = { ...base }
++    llmCallCount = 0
++    dbSpies = setupDbSpies(createMockDbOperations())
++
++    runtime.promptAiSdkStream = mock(async function* ({}) {
++      llmCallCount++
++      yield { type: 'text' as const, text: 'The command succeeded.\n\n' }
++      yield createToolCallChunk('end_turn', {})
++      return promptSuccess('mock-message-id')
++    })
++
++    spyOn(analytics, 'trackEvent').mockImplementation(() => {})
++  })
++
++  afterEach(() => {
++    clearAgentGeneratorCache(runtime)
++    dbSpies.restore()
++    mock.restore()
++  })
++
++  afterAll(() => {
++    clearMockedModules()
++  })
++
++  const runBasher = async (stdout: string) => {
++    runtime.requestToolCall = mock(async () => ({
++      output: [
++        {
++          type: 'json' as const,
++          value: { command: 'bun test', stdout, exitCode: 0 },
++        },
++      ],
++    }))
++
++    const sessionState = getInitialSessionState(mockFileContext)
++    return loopAgentSteps({
++      ...runtime,
++      agentType: 'basher',
++      localAgentTemplates: { basher: basherTemplate },
++      repoId: undefined,
++      repoUrl: undefined,
++      userInputId: 'test-user-input',
++      agentState: {
++        ...sessionState.mainAgentState,
++        agentId: 'basher-test',
++        messageHistory: [userMessage('run it')],
++        output: undefined,
++        stepsRemaining: 10,
++      },
++      prompt: undefined,
++      spawnParams: { command: 'bun test', what_to_summarize: 'did it pass' },
++      fingerprintId: 'test-fingerprint',
++      fileContext: mockFileContext,
++      userId: TEST_USER_ID,
++      clientSessionId: 'test-session',
++      ancestorRunIds: [],
++      onResponseChunk: () => {},
++      signal: new AbortController().signal,
++    })
++  }
++
++  it('makes no LLM call when output is small, and still returns it', async () => {
++    const result = await runBasher('2 pass 0 fail')
++
++    expect(llmCallCount).toBe(0)
++    // The parent must still receive the command output, not an empty result.
++    const serialized = JSON.stringify(result.output)
++    expect(serialized).toContain('2 pass 0 fail')
++    expect(result.output?.type).not.toBe('error')
++  })
++
++  it('still calls the LLM once when output is large', async () => {
++    await runBasher('x'.repeat(5000))
++
++    expect(llmCallCount).toBe(1)
++  })
++})

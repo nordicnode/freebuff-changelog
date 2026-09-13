@@ -1,0 +1,216 @@
+diff --git a/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.test.ts b/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.test.ts
+index e7b99193d..723acec6b 100644
+--- a/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.test.ts
++++ b/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.test.ts
+@@ -159,6 +159,57 @@ describe('OpenAICompatibleChatLanguageModel doStream', () => {
+     expect(finishPartOf(parts).finishReason).toBe('error')
+   })
+ 
++  it('carries provider detail and status out of a mid-stream error chunk', async () => {
++    // OpenRouter's mid-stream provider refusals say only "Provider returned
++    // error" in `message`; the upstream's actual words live in `metadata.raw`.
++    // Surfacing just the message left users (most visibly on Freebuff Web)
++    // with "Agent run error: Provider returned error" and nothing else, while
++    // the same failure on the non-stream path shows the full
++    // `message [provider: raw]` form built by the server. The stream path
++    // must produce the same shape: an APICallError with the enhanced message,
++    // the numeric code as statusCode, and a responseBody that
++    // extractApiErrorDetails can parse like any failed HTTP response.
++    const parts = await streamParts(
++      sseResponse([
++        JSON.stringify({
++          id: 'gen-2',
++          object: 'chat.completion.chunk',
++          created: 1,
++          model: 'deepseek/deepseek-v4-flash',
++          provider: 'DeepSeek',
++          choices: [],
++          error: {
++            code: 429,
++            message: 'Provider returned error',
++            metadata: {
++              raw: 'deepseek-v4-flash is temporarily rate-limited upstream.',
++              provider_name: 'DeepSeek',
++            },
++          },
++        }),
++      ]),
++    )
++
++    const errorPart = parts.find((part) => part.type === 'error')
++    if (!errorPart || errorPart.type !== 'error') {
++      throw new Error('stream swallowed the provider error')
++    }
++    const apiError = errorPart.error as {
++      message: string
++      statusCode?: number
++      responseBody?: string
++    }
++    expect(apiError.message).toBe(
++      'Provider returned error [DeepSeek: deepseek-v4-flash is temporarily rate-limited upstream.]',
++    )
++    expect(apiError.statusCode).toBe(429)
++    const parsedBody = JSON.parse(apiError.responseBody ?? '{}')
++    expect(parsedBody.error.message).toBe(apiError.message)
++    expect(parsedBody.error.code).toBe(429)
++
++    expect(finishPartOf(parts).finishReason).toBe('error')
++  })
++
+   it('assembles streamed reasoning_details onto the reasoning-end part', async () => {
+     const parts = await streamParts(
+       sseResponse([
+diff --git a/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.ts b/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.ts
+index 36cdc019d..1d3e1a008 100644
+--- a/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.ts
++++ b/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.ts
+@@ -15,7 +15,10 @@ import { convertToOpenAICompatibleChatMessages } from './convert-to-openai-compa
+ import { getResponseMetadata } from './get-response-metadata'
+ import { mapOpenAICompatibleFinishReason } from './map-openai-compatible-finish-reason'
+ import { openaiCompatibleProviderOptions } from './openai-compatible-chat-options'
+-import { defaultOpenAICompatibleErrorStructure } from '../openai-compatible-error'
++import {
++  defaultOpenAICompatibleErrorStructure,
++  streamErrorChunkToApiCallError,
++} from '../openai-compatible-error'
+ import { prepareTools } from './openai-compatible-prepare-tools'
+ 
+ import type { OpenAICompatibleChatModelId } from './openai-compatible-chat-options'
+@@ -344,11 +347,12 @@ export class OpenAICompatibleChatLanguageModel implements LanguageModelV2 {
+     const metadataExtractor =
+       this.config.metadataExtractor?.createStreamExtractor()
+ 
++    const url = this.config.url({
++      path: '/chat/completions',
++      modelId: this.modelId,
++    })
+     const { responseHeaders, value: response } = await postJsonToApi({
+-      url: this.config.url({
+-        path: '/chat/completions',
+-        modelId: this.modelId,
+-      }),
++      url,
+       headers: combineHeaders(this.config.headers(), options.headers),
+       body,
+       failedResponseHandler: this.failedResponseHandler,
+@@ -463,7 +467,14 @@ export class OpenAICompatibleChatLanguageModel implements LanguageModelV2 {
+             // handle error chunks:
+             if ('error' in value) {
+               finishReason = 'error'
+-              controller.enqueue({ type: 'error', error: value.error.message })
++              controller.enqueue({
++                type: 'error',
++                error: streamErrorChunkToApiCallError({
++                  errorValue: value.error,
++                  url,
++                  requestBodyValues: body,
++                }),
++              })
+               return
+             }
+ 
+diff --git a/packages/llm-providers/src/openai-compatible/openai-compatible-error.ts b/packages/llm-providers/src/openai-compatible/openai-compatible-error.ts
+index b14cdb3f4..c2d449be7 100644
+--- a/packages/llm-providers/src/openai-compatible/openai-compatible-error.ts
++++ b/packages/llm-providers/src/openai-compatible/openai-compatible-error.ts
+@@ -1,3 +1,4 @@
++import { APICallError } from '@ai-sdk/provider'
+ import { z } from 'zod/v4'
+ 
+ import type { ZodType } from 'zod/v4'
+@@ -12,6 +13,17 @@ export const openaiCompatibleErrorDataSchema = z.object({
+     type: z.string().nullish(),
+     param: z.any().nullish(),
+     code: z.union([z.string(), z.number()]).nullish(),
++
++    // OpenRouter provider failures put the upstream's own words here — for a
++    // mid-stream refusal, `message` is often just "Provider returned error"
++    // and `metadata.raw` is the only place the actual reason exists. Loose so
++    // provider-specific extras (e.g. `error_type`) survive into responseBody.
++    metadata: z
++      .looseObject({
++        raw: z.string().nullish(),
++        provider_name: z.string().nullish(),
++      })
++      .nullish(),
+   }),
+ })
+ 
+@@ -30,3 +42,77 @@ export const defaultOpenAICompatibleErrorStructure: ProviderErrorStructure<OpenA
+     errorSchema: openaiCompatibleErrorDataSchema,
+     errorToMessage: (data) => data.error.message,
+   }
++
++// Matches buildEnhancedErrorMessage on the server (web/src/llm-api/
++// openrouter.ts), which applies the same bound to upstream prose.
++const MAX_PROVIDER_DETAIL_LENGTH = 1000
++
++/**
++ * Convert a mid-stream error chunk into an APICallError that carries
++ * everything the failed-response path already gives clients.
++ *
++ * Error chunks arrive inside an HTTP 200 stream, so they bypass the JSON
++ * error response handler entirely. Surfacing only `error.message` here left
++ * the user-facing failure as the provider's generic wording ("Provider
++ * returned error") with the actual reason discarded in `metadata.raw`, and —
++ * with no statusCode or responseBody for extractApiErrorDetails to find —
++ * every client rendered it behind an "Agent run error:" prefix with no
++ * detail. This builds the same `message [provider: raw]` form the server's
++ * parseOpenRouterError produces for non-stream failures, and encodes the
++ * result as a responseBody so downstream error extraction treats both
++ * failure shapes identically.
++ */
++export function streamErrorChunkToApiCallError(params: {
++  errorValue: unknown
++  url: string
++  requestBodyValues: unknown
++}): APICallError {
++  const { errorValue, url, requestBodyValues } = params
++  const error =
++    errorValue && typeof errorValue === 'object'
++      ? (errorValue as {
++          message?: unknown
++          code?: unknown
++          metadata?: { raw?: unknown; provider_name?: unknown } | null
++        })
++      : {}
++
++  const baseMessage =
++    typeof error.message === 'string' && error.message.length > 0
++      ? error.message
++      : JSON.stringify(errorValue)
++
++  const raw =
++    typeof error.metadata?.raw === 'string' && error.metadata.raw.length > 0
++      ? error.metadata.raw
++      : undefined
++  const providerLabel =
++    typeof error.metadata?.provider_name === 'string'
++      ? error.metadata.provider_name
++      : 'Provider details'
++  const truncatedRaw =
++    raw !== undefined && raw.length > MAX_PROVIDER_DETAIL_LENGTH
++      ? raw.slice(0, MAX_PROVIDER_DETAIL_LENGTH) + '...'
++      : raw
++  const message =
++    truncatedRaw !== undefined
++      ? `${baseMessage} [${providerLabel}: ${truncatedRaw}]`
++      : baseMessage
++
++  // OpenRouter puts the upstream HTTP status in `code` as a number; some
++  // providers send it as a digit string.
++  const statusCode =
++    typeof error.code === 'number' && Number.isInteger(error.code)
++      ? error.code
++      : typeof error.code === 'string' && /^\d{3}$/.test(error.code)
++        ? Number(error.code)
++        : undefined
++
++  return new APICallError({
++    message,
++    url,
++    requestBodyValues,
++    statusCode,
++    responseBody: JSON.stringify({ error: { ...error, message } }),
++  })
++}

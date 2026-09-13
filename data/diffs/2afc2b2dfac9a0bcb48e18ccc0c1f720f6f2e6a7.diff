@@ -1,0 +1,162 @@
+diff --git a/common/src/constants/freebuff-models.ts b/common/src/constants/freebuff-models.ts
+index cc931dcc7..75ae70b28 100644
+--- a/common/src/constants/freebuff-models.ts
++++ b/common/src/constants/freebuff-models.ts
+@@ -164,10 +164,12 @@ export const FREEBUFF_GLM_V52_MODEL_ID = 'z-ai/glm-5.2'
+  *  and BYOK callers alike (see applyOpenRouterProviderRouting and
+  *  applyFreebuffReasoningDefaults in web/src/llm-api/openrouter.ts):
+  *
+- *   - Routing is PINNED to OpenAI's own endpoint. OpenRouter also lists Azure
+- *     and Amazon Bedrock for this model at $1.00/$6.00 per M — 10x OpenAI's
+- *     $0.10/$0.60 — so unpinned routing is a silent 10x bill (cf. the
+- *     Kimi/Infron unit-price doubling, 2026-07-29).
++ *   - Routing PREFERS OpenAI's own endpoint ($0.10/$0.60 per M) via `order`,
++ *     with fallbacks allowed and cost bounded by FREEBUFF_GPT_5_6_LUNA_MAX_PRICE
++ *     rather than by the pin. A hard pin (allow_fallbacks:false) held until
++ *     2026-08-16, when OpenAI began refusing every request from this account
++ *     ("Policy Violation: this user has been blocked") and took Luna to a 100%
++ *     failure rate with four usable endpoints sitting under the ceiling.
+  *   - Reasoning effort is `high`. Luna is cheap enough per token that the
+  *     quality is worth more than the reasoning tokens.
+  *
+@@ -175,12 +177,13 @@ export const FREEBUFF_GLM_V52_MODEL_ID = 'z-ai/glm-5.2'
+  *  (agents/constants.ts) is this same model id, so keying either off the model
+  *  alone would change Codebuff's paid lite mode as a side effect. */
+ export const FREEBUFF_GPT_5_6_LUNA_MODEL_ID = 'openai/gpt-5.6-luna'
+-/** OpenRouter provider slug Luna is pinned to. */
++/** OpenRouter provider slug Luna prefers (first in `provider.order`). */
+ export const FREEBUFF_GPT_5_6_LUNA_PROVIDER_ROUTE = 'openai'
+ /** Price ceiling for Luna, USD per million tokens. Sent as OpenRouter's
+- *  `provider.max_price`, which REFUSES the request rather than serving above
+- *  it, so a provider re-pricing surfaces as a loud error instead of a 10x
+- *  invoice.
++ *  `provider.max_price`, which REFUSES to route above it rather than serving
++ *  and billing, so a provider re-pricing surfaces as a loud error instead of a
++ *  surprise invoice. Since 2026-08-16 this — not a hard provider pin — is the
++ *  sole cost guarantee, so it must not be widened casually.
+  *
+  *  This is a COST FENCE, not an assertion of the list price, and the gap is
+  *  deliberate on both sides:
+@@ -190,13 +193,14 @@ export const FREEBUFF_GPT_5_6_LUNA_PROVIDER_ROUTE = 'openai'
+  *     found that satisfy the max price for this request" — verified against the
+  *     live API on 2026-07-30, where 0.11/0.61 passed and 0.1/0.6 did not. A
+  *     ceiling equal to list is an outage waiting on a rounding change.
+- *   - It must sit WELL BELOW $1.00/$6.00, which is what Azure, Azure EU
+- *     ($1.10/$6.60) and Amazon Bedrock charge for this model. Blocking those is
+- *     the whole point.
+- *
+- *  Half of Azure's price leaves room for OpenAI's own tiers (list $0.10/$0.60,
+- *  priority $0.20/$1.20) and for ordinary price drift, while still failing
+- *  closed long before a 10x endpoint could serve a request. */
++ *   - It must stay under the next tier up. Azure, Azure EU and Amazon Bedrock
++ *     listed $1.00/$6.00 when this was written and re-priced to $0.20/$1.20 by
++ *     2026-08-16; the ceiling admits them at today's price and would exclude
++ *     them again if they returned to the old one.
++ *
++ *  The headroom covers OpenAI's own tiers (list $0.10/$0.60, priority
++ *  $0.20/$1.20, flex $0.05/$0.30) and ordinary price drift, while still failing
++ *  closed well before a 10x endpoint could serve a request. */
+ export const FREEBUFF_GPT_5_6_LUNA_MAX_PRICE = {
+   prompt: 0.5,
+   completion: 3.0,
+diff --git a/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.test.ts b/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.test.ts
+index 8ec828684..e7b99193d 100644
+--- a/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.test.ts
++++ b/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.test.ts
+@@ -121,6 +121,44 @@ describe('OpenAICompatibleChatLanguageModel doStream', () => {
+     expect(finish.usage.totalTokens ?? undefined).toBeUndefined()
+   })
+ 
++  it('surfaces a provider error chunk that also carries empty choices', async () => {
++    // Verbatim shape OpenRouter streams when the upstream provider refuses:
++    // an `error` object alongside an EMPTY `choices` array, HTTP 200. That
++    // empty array satisfies the normal-chunk branch of the chunk schema, so
++    // while the error branch came second the whole `error` key was stripped
++    // and the failure vanished — the stream looked like a connection cut, and
++    // the agent loop told users to check their network while retrying a
++    // refusal that could never succeed (prod, 2026-08-16).
++    const parts = await streamParts(
++      sseResponse([
++        JSON.stringify({
++          id: 'gen-1',
++          object: 'chat.completion.chunk',
++          created: 1,
++          model: 'openai/gpt-5.6-luna',
++          provider: 'OpenAI',
++          choices: [],
++          error: {
++            code: 502,
++            message:
++              'Policy Violation: this user has been blocked for a previous policy violation.',
++            metadata: { error_type: 'provider_unavailable' },
++          },
++        }),
++      ]),
++    )
++
++    const error = parts.find((part) => part.type === 'error')
++    if (!error || error.type !== 'error') {
++      throw new Error('stream swallowed the provider error')
++    }
++    expect(String(error.error)).toContain('Policy Violation')
++
++    // And it must NOT masquerade as a severed connection, or the silent-stop
++    // detector would retry it as a network blip instead of failing loudly.
++    expect(finishPartOf(parts).finishReason).toBe('error')
++  })
++
+   it('assembles streamed reasoning_details onto the reasoning-end part', async () => {
+     const parts = await streamParts(
+       sseResponse([
+diff --git a/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.ts b/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.ts
+index c1ebb5cc7..36cdc019d 100644
+--- a/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.ts
++++ b/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.ts
+@@ -814,6 +814,19 @@ const createOpenAICompatibleChatChunkSchema = <
+   errorSchema: ERROR_SCHEMA,
+ ) =>
+   z.union([
++    // The error branch MUST come first. A union returns its first matching
++    // branch, and providers send error chunks that ALSO carry an (empty)
++    // `choices` array — OpenRouter's mid-stream failures look like
++    // `{id, model, provider, choices: [], error: {...}}`. Those satisfy the
++    // normal-chunk branch below, and because z.object strips unknown keys the
++    // `error` field was then dropped before the `'error' in value` check could
++    // ever see it: the stream ended with no content, no usage and no error,
++    // which the silent-stop detector read as a severed connection. Users got
++    // "check your network connection" after four pointless retries while the
++    // provider had plainly said why it refused (prod, 2026-08-16: OpenAI
++    // returned "Policy Violation: this user has been blocked" for every
++    // Luna request).
++    errorSchema,
+     z.object({
+       id: z.string().nullish(),
+       created: z.number().nullish(),
+@@ -851,5 +864,4 @@ const createOpenAICompatibleChatChunkSchema = <
+       ),
+       usage: openaiCompatibleTokenUsageSchema,
+     }),
+-    errorSchema,
+   ])
+diff --git a/packages/llm-providers/src/openai-compatible/completion/openai-compatible-completion-language-model.ts b/packages/llm-providers/src/openai-compatible/completion/openai-compatible-completion-language-model.ts
+index 80b2bb26e..a6fe82b3b 100644
+--- a/packages/llm-providers/src/openai-compatible/completion/openai-compatible-completion-language-model.ts
++++ b/packages/llm-providers/src/openai-compatible/completion/openai-compatible-completion-language-model.ts
+@@ -365,6 +365,11 @@ const createOpenAICompatibleCompletionChunkSchema = <
+   errorSchema: ERROR_SCHEMA,
+ ) =>
+   z.union([
++    // Error branch first — see the chat model's schema for why: an error chunk
++    // that also carries `choices` otherwise matches the normal branch and has
++    // its `error` key stripped, silently turning a stated provider failure into
++    // an empty stream.
++    errorSchema,
+     z.object({
+       id: z.string().nullish(),
+       created: z.number().nullish(),
+@@ -378,5 +383,4 @@ const createOpenAICompatibleCompletionChunkSchema = <
+       ),
+       usage: usageSchema.nullish(),
+     }),
+-    errorSchema,
+   ])

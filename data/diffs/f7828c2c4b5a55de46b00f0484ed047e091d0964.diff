@@ -1,0 +1,1276 @@
+diff --git a/freebuff/runner/README.md b/freebuff/runner/README.md
+new file mode 100644
+index 000000000..24fcca4cf
+--- /dev/null
++++ b/freebuff/runner/README.md
+@@ -0,0 +1,85 @@
++# Freebuff Runner
++
++Long-lived Bun worker that executes Freebuff agent turns off Convex action
++compute (design: `docs/freebuff-render-harness.md`). It subscribes to
++runner-dispatched `queued` rows in `freebuff_agent_runs`, claims them with a
++CAS mutation, runs the codebuff SDK harness in-process, and streams batched
++events back through `recordRunEventBatch`.
++
++## Rollout
++
++Dispatch is gated by the `freebuff_runner_enabled` feature flag
++(`convex/featureFlags.ts`), which now DEFAULTS ON for Freebuff, Codex, and
++Claude Code sends. Kill switch: create a feature_flags row with that key and
++rollout_strategy 'disabled' — sends instantly fall back to the legacy Convex
++action (Freebuff) / workflow (Codex/Claude) paths. Runs queued while no runner
++is alive are reaped by the sweep cron after 10 minutes.
++
++⚠️ DEPLOY ORDER: bring this Render worker up (with prod env) BEFORE pushing
++the Convex deploy that defaults the flag on, or sends will queue with nothing
++to claim them.
++
++## Environment
++
++- `CONVEX_URL` — deployment URL (e.g. https://<name>.convex.cloud)
++- `CONVEX_DEPLOY_KEY` — deploy/admin key for that deployment (internal
++  functions + subscriptions). Keep scoped to this service's env.
++- `CODEBUFF_API_KEY` — Freebuff Web service account PAT
++  (docs/freebuff-web-service-account.md)
++- `NEXT_PUBLIC_CODEBUFF_APP_URL` — Codebuff backend base URL for the SDK
++  (`https://www.codebuff.com` in prod; without it the SDK may use a bundled
++  dev URL and fail with "Network request failed")
++- `DAYTONA_API_KEY` (+ `DAYTONA_API_KEY_LEGACY` / `DAYTONA_API_KEY_NEW`,
++  `DAYTONA_SNAPSHOT_ID`) — sandbox access, same values as the Convex env
++- `VLY_INTEGRATION_KEY`, `VLY_SANDBOX_USAGE_*`, `VLY_STATS_SCRIPTS_URL` —
++  optional, same semantics as the Convex env
++- Codex / Claude Code runs additionally need (copy from Convex env):
++  - `BYOK_ENCRYPTION_KEY` / `CODEX_AUTH_ENCRYPTION_KEY` /
++    `CONVEX_TOKEN_ENCRYPTION_KEY` — decrypt user BYOK keys and stored ChatGPT
++    OAuth payloads (byokAuth/codexAuth read whichever is set)
++  - `CODEX_AUTH_HASH_SALT` — optional, falls back to the encryption secret
++  - `GITHUB_APP_PRIVATE_KEY` — refresh `origin` auth on connected-repo
++    (Freebuff Cloud) projects before CLI runs
++- `RUNNER_MAX_CONCURRENT_RUNS` — claim cap per instance (default 25; work is
++  I/O-bound so instances multiplex many runs)
++- `FREEBUFF_TURN_LIMIT_MS` — wall-clock limit per turn (default 60 min; must
++  stay under `RUNNER_TURN_DEADLINE_MS` in `timeLimits.ts`, which the message
++  watchdog uses)
++
++## Render service
++
++Background worker (no public port), same repo:
++
++- Build command: `bun install`
++- Start command: `bun --cwd freebuff/runner start`
++- Instances: start with 1–2. Scale on claim latency, not CPU.
++- Graceful shutdown: on SIGTERM the worker stops claiming, aborts active
++  turns, persists full-context resume state to Convex storage, and requeues
++  the runs; the replacement instance resumes them mid-turn. Render's ~30s
++  grace is enough (persist takes <5s per run).
++
++## Local dev
++
++```bash
++# assemble env (see README section above), then:
++bun --cwd freebuff/runner dev
++```
++
++Point `CONVEX_URL`/`CONVEX_DEPLOY_KEY` at your dev deployment, enable the
++`freebuff_runner_enabled` flag there, and send a Freebuff message from the web
++app — the local runner claims and executes it.
++
++## Code layout
++
++- `src/main.ts` — queue subscription, CAS claim loop, concurrency cap,
++  per-run cancel subscription, SIGTERM requeue
++- `src/runTurn.ts` — the turn loop (port of the Convex action
++  `executeFreebuff.runFreebuffAgent`, minus the 10-minute continuation
++  machinery)
++- `src/eventBatcher.ts` — batches all stream events into one
++  `recordRunEventBatch` mutation per ~2s + 30s heartbeats
++- `src/convexBridge.ts` — RunnerCtx (runQuery/runMutation/runAction/storage)
++  over ConvexHttpClient + websocket subscription client
++- `src/harness.ts` / `src/webcontainerTools.ts` — ctx-free harness logic
++  copied from the action file; the action path stays untouched during rollout
++  and is deleted (with these copies unified) once the runner is at 100%
+diff --git a/freebuff/runner/package.json b/freebuff/runner/package.json
+new file mode 100644
+index 000000000..36b605e9a
+--- /dev/null
++++ b/freebuff/runner/package.json
+@@ -0,0 +1,23 @@
++{
++  "name": "@codebuff/freebuff-runner",
++  "version": "0.0.1",
++  "private": true,
++  "type": "module",
++  "description": "Render-hosted Freebuff agent runner: claims queued freebuff_agent_runs from Convex and executes the codebuff SDK harness off Convex action compute (docs/freebuff-render-harness.md)",
++  "scripts": {
++    "start": "bun src/main.ts",
++    "dev": "bun --watch src/main.ts",
++    "typecheck": "tsc --noEmit"
++  },
++  "dependencies": {
++    "@codebuff/common": "workspace:*",
++    "@codebuff/sdk": "workspace:*",
++    "@daytonaio/sdk": "^0.145.0",
++    "convex": "^1.30.0",
++    "diff": "^9.0.0"
++  },
++  "devDependencies": {
++    "@types/bun": "^1.2.23",
++    "typescript": "^5.5.0"
++  }
++}
+diff --git a/freebuff/runner/src/convexBridge.ts b/freebuff/runner/src/convexBridge.ts
+new file mode 100644
+index 000000000..9c836aa27
+--- /dev/null
++++ b/freebuff/runner/src/convexBridge.ts
+@@ -0,0 +1,110 @@
++import { ConvexClient, ConvexHttpClient } from 'convex/browser'
++
++import type { FunctionReference } from 'convex/server'
++
++/**
++ * The subset of a Convex ActionCtx the ported run loop uses, implemented over
++ * HTTP against the deployment. `storage` round-trips through the
++ * runner_bridge storage helpers because only Convex functions can mint
++ * upload/download URLs.
++ *
++ * Auth: a deploy key (admin) so internal functions are callable. The key
++ * lives only in the runner's Render env.
++ */
++export type RunnerCtx = {
++  runQuery: <T = any>(ref: FunctionReference<any, any>, args: any) => Promise<T>
++  runMutation: <T = any>(ref: FunctionReference<any, any>, args: any) => Promise<T>
++  runAction: <T = any>(ref: FunctionReference<any, any>, args: any) => Promise<T>
++  storage: {
++    get: (storageId: string) => Promise<Blob | null>
++    store: (blob: Blob) => Promise<string>
++    delete: (storageId: string) => Promise<void>
++    getUrl: (storageId: string) => Promise<string | null>
++  }
++}
++
++// Transient-failure retry for the HTTP hop. Only retries when the request
++// never reached Convex (network/fetch errors) — a thrown application error is
++// surfaced immediately, and we never blind-retry mutations that may have
++// committed (double-applied stream deltas are worse than a dropped flush).
++async function withNetworkRetry<T>(fn: () => Promise<T>): Promise<T> {
++  let lastError: unknown
++  for (let attempt = 0; attempt < 3; attempt++) {
++    try {
++      return await fn()
++    } catch (error) {
++      lastError = error
++      const message = error instanceof Error ? error.message : String(error)
++      const isNetwork =
++        error instanceof TypeError || /fetch failed|network|ECONN|ETIMEDOUT|EAI_AGAIN/i.test(message)
++      if (!isNetwork) throw error
++      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)))
++    }
++  }
++  throw lastError
++}
++
++export function createRunnerCtx(params: {
++  convexUrl: string
++  deployKey: string
++  bridge: {
++    generateRunnerUploadUrl: FunctionReference<any, any>
++    getStorageUrl: FunctionReference<any, any>
++    deleteStorageBlob: FunctionReference<any, any>
++  }
++}): RunnerCtx {
++  const http = new ConvexHttpClient(params.convexUrl)
++  ;(http as any).setAdminAuth(params.deployKey)
++
++  const ctx: RunnerCtx = {
++    runQuery: (ref, args) => withNetworkRetry(() => http.query(ref as any, args)),
++    runMutation: (ref, args) => http.mutation(ref as any, args),
++    runAction: (ref, args) => http.action(ref as any, args),
++    storage: {
++      getUrl: (storageId) =>
++        ctx.runQuery(params.bridge.getStorageUrl, { storageId }),
++      get: async (storageId) => {
++        const url = await ctx.runQuery<string | null>(
++          params.bridge.getStorageUrl,
++          { storageId },
++        )
++        if (!url) return null
++        const response = await withNetworkRetry(() => fetch(url))
++        if (!response.ok) return null
++        return await response.blob()
++      },
++      store: async (blob) => {
++        const uploadUrl = await ctx.runMutation<string>(
++          params.bridge.generateRunnerUploadUrl,
++          {},
++        )
++        const response = await withNetworkRetry(() =>
++          fetch(uploadUrl, {
++            method: 'POST',
++            headers: { 'Content-Type': blob.type || 'application/octet-stream' },
++            body: blob,
++          }),
++        )
++        if (!response.ok) {
++          throw new Error(`Storage upload failed: ${response.status}`)
++        }
++        const { storageId } = (await response.json()) as { storageId: string }
++        return storageId
++      },
++      delete: async (storageId) => {
++        await ctx.runMutation(params.bridge.deleteStorageBlob, { storageId })
++      },
++    },
++  }
++  return ctx
++}
++
++/** Long-lived websocket client for subscriptions (queue + per-run status). */
++export function createSubscriptionClient(params: {
++  convexUrl: string
++  deployKey: string
++}): ConvexClient {
++  const client = new ConvexClient(params.convexUrl)
++  ;(client as any).setAdminAuth(params.deployKey)
++  return client
++}
+diff --git a/freebuff/runner/src/eventBatcher.ts b/freebuff/runner/src/eventBatcher.ts
+new file mode 100644
+index 000000000..36e5fd981
+--- /dev/null
++++ b/freebuff/runner/src/eventBatcher.ts
+@@ -0,0 +1,157 @@
++import { internal } from '../../web/convex/_generated/api'
++
++import type { RunnerCtx } from './convexBridge'
++import type { FreebuffRunEvent } from './harness'
++
++// Batched replacement for the action path's createRunEventBuffer: instead of
++// one Convex mutation per delta/status, EVERY event buffered over the flush
++// window ships as one recordRunEventBatch call. Each mutation invalidates the
++// client's streaming subscription (a re-read the browser pays for), so fewer,
++// fatter mutations cut both function calls and DB I/O.
++const FLUSH_INTERVAL_MS = 2000
++// Quiet-run heartbeat: an empty batch bumps last_event_at so the sweep knows
++// the runner is alive during long tool calls with no streamed output.
++const HEARTBEAT_INTERVAL_MS = 30_000
++
++type DeltaEvent = {
++  type: 'text_delta' | 'reasoning_delta' | 'subagent_delta'
++  chunk: string
++  agentType?: string
++}
++
++export function createEventBatcher(params: {
++  ctx: RunnerCtx
++  runId: string
++  projectId: string
++  threadId: string
++  messageId: string
++}) {
++  const { ctx, runId, projectId, threadId, messageId } = params
++
++  let pending: FreebuffRunEvent[] = []
++  let flushTimer: ReturnType<typeof setTimeout> | undefined
++  let chain = Promise.resolve()
++  let lastFlushAt = Date.now()
++  let stopped = false
++
++  const send = async (
++    events: FreebuffRunEvent[],
++    runStateStorageId?: string,
++  ) => {
++    if (events.length === 0 && runStateStorageId === undefined) {
++      // Pure heartbeat.
++      await ctx.runMutation(
++        internal.coding_agent.freebuff_bridge_mutations.recordRunEventBatch,
++        { runId, events: [] },
++      )
++      return
++    }
++    await ctx.runMutation(
++      internal.coding_agent.freebuff_bridge_mutations.recordRunEventBatch,
++      {
++        runId,
++        events: events.map((event) => ({
++          runId,
++          projectId,
++          threadId,
++          messageId,
++          ...event,
++        })),
++        ...(runStateStorageId ? { runStateStorageId } : {}),
++      },
++    )
++  }
++
++  const takePending = () => {
++    if (flushTimer) {
++      clearTimeout(flushTimer)
++      flushTimer = undefined
++    }
++    const events = pending
++    pending = []
++    return events
++  }
++
++  const enqueueFlush = () => {
++    if (flushTimer || stopped) return
++    flushTimer = setTimeout(() => {
++      flushTimer = undefined
++      const events = takePending()
++      lastFlushAt = Date.now()
++      chain = chain
++        .then(() => send(events))
++        .catch((error) => {
++          console.error('[freebuff-runner] stream flush failed', error)
++        })
++    }, FLUSH_INTERVAL_MS)
++  }
++
++  const heartbeatTimer = setInterval(() => {
++    if (stopped) return
++    if (Date.now() - lastFlushAt < HEARTBEAT_INTERVAL_MS) return
++    lastFlushAt = Date.now()
++    chain = chain
++      .then(() => send([]))
++      .catch((error) => {
++        console.warn('[freebuff-runner] heartbeat failed', error)
++      })
++  }, HEARTBEAT_INTERVAL_MS)
++
++  return {
++    /** Append a streaming delta, merging into the previous chunk when the
++     *  stream kind hasn't changed (one array entry per contiguous stretch). */
++    appendDelta(event: DeltaEvent) {
++      const last = pending.at(-1)
++      if (
++        last &&
++        last.type === event.type &&
++        last.agentType === event.agentType
++      ) {
++        last.chunk = (last.chunk ?? '') + event.chunk
++      } else {
++        pending.push({ ...event })
++      }
++      enqueueFlush()
++    },
++
++    /** Append a non-delta event (status, start, ...) in stream order. */
++    append(event: FreebuffRunEvent) {
++      pending.push(event)
++      enqueueFlush()
++    },
++
++    /** Flush everything buffered so far and wait for it to land. */
++    async flush() {
++      const events = takePending()
++      lastFlushAt = Date.now()
++      if (events.length > 0) {
++        chain = chain.then(() => send(events))
++      }
++      await chain
++    },
++
++    /** Terminal flush: everything pending plus the terminal event, in one
++     *  mutation, carrying the persisted run-state pointer. Stops timers. */
++    async finish(event: FreebuffRunEvent, runStateStorageId?: string) {
++      stopped = true
++      clearInterval(heartbeatTimer)
++      const events = [...takePending(), event]
++      lastFlushAt = Date.now()
++      chain = chain.then(() => send(events, runStateStorageId))
++      await chain
++    },
++
++    /** Stop timers without emitting a terminal event (requeue/cancel paths). */
++    async stop() {
++      stopped = true
++      clearInterval(heartbeatTimer)
++      const events = takePending()
++      if (events.length > 0) {
++        chain = chain.then(() => send(events))
++      }
++      await chain.catch(() => {})
++    },
++  }
++}
++
++export type EventBatcher = ReturnType<typeof createEventBatcher>
+diff --git a/freebuff/runner/src/executeClaudeCode.ts b/freebuff/runner/src/executeClaudeCode.ts
+new file mode 100644
+index 000000000..f134b3b0f
+--- /dev/null
++++ b/freebuff/runner/src/executeClaudeCode.ts
+@@ -0,0 +1,582 @@
++// Runner port of convex/coding_agent/cli_agent/executeClaudeCode.ts
++// (docs/freebuff-render-harness.md). Differences from the Convex action copy:
++//   - ctx is the RunnerCtx bridge (runQuery/runMutation/storage over HTTP).
++//   - Stream items go through `emitStreamItem` → the runner's batched
++//     recordRunEventBatch mutation → agent_message_delta rows, instead of
++//     full-array updateAgentMessageStream rewrites.
++//   - One wall-clock turn limit (`turnLimitMs`) replaces the per-action abort
++//     + cloud chaining; `isInterrupted` covers user cancel / runner shutdown.
++
++import { internal } from "../../web/convex/_generated/api";
++import { Id } from "../../web/convex/_generated/dataModel";
++import { DaytonaCodebase } from "../../web/codebase-utils/codebase/DaytonaCodebase";
++import {
++  cliAgentSystemPrompt,
++  knowledgePrompts,
++} from "../../web/convex/coding_agent/cli_agent/system_prompt";
++import { escapeShellArg } from "../../web/convex/coding_agent/cli_agent/shellEscape";
++import { refreshConnectedRepoOrigin } from "../../web/convex/coding_agent/cli_agent/gitRemoteAuth";
++import { processStreamItem as parseStreamItem } from "../../web/convex/coding_agent/cli_agent/streamParser";
++import { CLI_AGENT_TIMEOUT_MESSAGE } from "../../web/convex/coding_agent/cli_agent/timeLimits";
++
++import type { RunnerCtx } from "./convexBridge";
++
++export type CliStreamItem = {
++  type: string;
++  title?: string;
++  status?: string;
++  content: string;
++  description?: string;
++};
++
++export interface ExecuteClaudeCodeArgs {
++  projectId: Id<"project">;
++  threadId: Id<"agent_thread">;
++  messageId: Id<"agent_message">;
++  sandboxId: string;
++  activeSessionId: string | undefined;
++  executingUserId: Id<"users">;
++  userMessage: string;
++  images: Id<"_storage">[] | undefined;
++  claudeProviderPreference: "anthropic" | "bedrock";
++  claudeModelPreference?: string;
++  anthropicApiKey?: string;
++  bedrockBearerToken?: string;
++  // Wall-clock limit for this turn (no chaining on the runner).
++  turnLimitMs: number;
++  // Ship a UI-shaped stream item to the client (batched delta rows).
++  emitStreamItem: (item: CliStreamItem) => void;
++  // User cancel or runner shutdown — abort the CLI at the next stream chunk.
++  isInterrupted: () => boolean;
++}
++
++export interface ExecuteClaudeCodeResult {
++  success: boolean;
++  error?: string;
++  sessionId?: string;
++  timedOut?: boolean;
++}
++
++const ANTHROPIC_CLAUDE_MODELS = [
++  "claude-opus-4-8",
++  "claude-sonnet-4-6",
++  "claude-haiku-4-5",
++] as const;
++
++const BEDROCK_CLAUDE_MODELS = [
++  "us.anthropic.claude-opus-4-8",
++  "us.anthropic.claude-sonnet-4-6",
++  "us.anthropic.claude-haiku-4-5-20251001-v1:0",
++] as const;
++
++const ANTHROPIC_CLAUDE_MODEL_SET = new Set<string>(ANTHROPIC_CLAUDE_MODELS);
++const BEDROCK_CLAUDE_MODEL_SET = new Set<string>(BEDROCK_CLAUDE_MODELS);
++
++const resolveClaudeModelPreference = (
++  provider: "anthropic" | "bedrock",
++  preference: string | undefined,
++) => {
++  const selected = preference?.trim();
++  if (provider === "bedrock") {
++    if (selected && BEDROCK_CLAUDE_MODEL_SET.has(selected)) {
++      return selected;
++    }
++    return "us.anthropic.claude-sonnet-4-6";
++  }
++
++  if (selected && ANTHROPIC_CLAUDE_MODEL_SET.has(selected)) {
++    return selected;
++  }
++  return "claude-sonnet-4-6";
++};
++
++export async function executeClaudeCode(
++  ctx: RunnerCtx,
++  codebase: DaytonaCodebase,
++  args: ExecuteClaudeCodeArgs,
++): Promise<ExecuteClaudeCodeResult> {
++  const projectRecord = await ctx.runQuery(internal.project.getProject, {
++    projectId: args.projectId,
++  });
++  const shouldInjectConvexDeployKey = projectRecord?.project_type === "template";
++  // Freebuff Cloud (connected_repo) operates on the user's real repo, so git is
++  // allowed here; web/template stays platform-managed.
++  const isConnectedRepoProject =
++    projectRecord?.project_type === "connected_repo";
++
++  // Authenticate `origin` up front so agent-run fetch/pull/push work on
++  // long-lived cloud sandboxes. Best-effort; local git works regardless.
++  if (isConnectedRepoProject) {
++    await refreshConnectedRepoOrigin(codebase, projectRecord);
++  }
++
++  const selectedProvider = args.claudeProviderPreference;
++  const anthropicApiKey = args.anthropicApiKey?.trim() || undefined;
++  const awsBearerToken = args.bedrockBearerToken?.trim() || undefined;
++  const selectedModel = resolveClaudeModelPreference(
++    selectedProvider,
++    args.claudeModelPreference,
++  );
++
++  if (selectedProvider === "anthropic" && !anthropicApiKey) {
++    return {
++      success: false,
++      sessionId: undefined,
++      error:
++        "Claude provider is set to Anthropic, but no API key is saved. Add one in Settings > AI Credentials.",
++    };
++  }
++
++  if (selectedProvider === "bedrock" && !awsBearerToken) {
++    return {
++      success: false,
++      sessionId: undefined,
++      error:
++        "Claude provider is set to Bedrock, but no bearer token is saved. Add one in Settings > AI Credentials.",
++    };
++  }
++
++  // Escape session ID if provided (user-controlled input)
++  const escapedSessionId = args.activeSessionId?.trim() || "";
++  const resumeFlag = escapedSessionId
++    ? ` --resume ${escapeShellArg(escapedSessionId)} --fork-session`
++    : "";
++
++  // Download images to temp files so the CLI agent can read them visually
++  let userMessageWithImages = args.userMessage;
++  if (args.images && args.images.length > 0) {
++    const downloadedPaths: string[] = [];
++    for (let i = 0; i < args.images.length; i++) {
++      const imageUrl = await ctx.storage.getUrl(args.images[i]);
++      if (imageUrl) {
++        const tempPath = `/tmp/vly-user-image-${i + 1}.png`;
++        try {
++          await codebase.runCommand(
++            `curl -sL ${escapeShellArg(imageUrl)} -o ${escapeShellArg(tempPath)}`,
++            15000,
++          );
++          downloadedPaths.push(tempPath);
++        } catch {
++          // If download fails, skip this image
++        }
++      }
++    }
++
++    if (downloadedPaths.length > 0) {
++      const imageReferences = downloadedPaths
++        .map(
++          (path, idx) =>
++            `Image ${idx + 1}: ${path} (use your Read tool to view this image)`,
++        )
++        .join("\n");
++      userMessageWithImages = `${args.userMessage}\n\nThe user has attached ${downloadedPaths.length} image(s). Read these image files to see what the user is referring to:\n${imageReferences}`;
++    }
++  }
++
++  // Escape user message/prompt (user-controlled input, now includes image URLs)
++  const escapedPrompt = escapeShellArg(userMessageWithImages);
++
++  // Get package manager and runner for system prompt interpolation
++  const pm = codebase.getPackageManager();
++  const runner = pm.runner(); // "npx" or "bunx"
++  const packageManagerName = codebase.getPackageManagerName();
++
++  // Template projects get the platform prompt. Cloud connected repos should
++  // receive only the user's prompt and repo-local instructions.
++  const escapedSystemPrompt = isConnectedRepoProject
++    ? undefined
++    : escapeShellArg(
++        cliAgentSystemPrompt(runner, { allowGit: false }) +
++          knowledgePrompts(runner, packageManagerName),
++      );
++
++  // Build the base Claude Code command with escaped inputs
++  const commandParts = [
++    "claude",
++    "--model",
++    escapeShellArg(selectedModel),
++    "--dangerously-skip-permissions",
++    resumeFlag.trim(),
++    "-p",
++    escapedPrompt,
++    escapedSystemPrompt ? "--append-system-prompt" : "",
++    escapedSystemPrompt ?? "",
++    "--tools",
++    '"default"',
++    "--output-format",
++    "stream-json",
++    "--verbose",
++  ].filter((part) => part.length > 0); // Remove empty parts (e.g., if resumeFlag is empty)
++
++  const command = commandParts.join(" ");
++
++  const escapedAwsToken = awsBearerToken
++    ? escapeShellArg(awsBearerToken)
++    : undefined;
++  const escapedAnthropicApiKey = anthropicApiKey
++    ? escapeShellArg(anthropicApiKey)
++    : undefined;
++
++  // Build PATH matching old agent: /home/daytona/.local/bin + system PATH, plus npm-global bin
++  const systemPath = process.env.PATH || "/usr/local/bin:/usr/bin:/bin";
++  // PATH doesn't need escaping since we control the value
++  const pathValue = `"$HOME/.local/share/npm-global/bin:/home/daytona/.local/bin:${systemPath}"`;
++
++  // Build env vars array (matching old agent's executeCommand env vars + AWS Bedrock config)
++  // For connected-repo cloud projects, do not inject Convex deploy credentials.
++  const envVars = [
++    `ANTHROPIC_API_KEY=`,
++    `AWS_BEARER_TOKEN_BEDROCK=`,
++    `AWS_ACCESS_KEY_ID=`,
++    `AWS_SECRET_ACCESS_KEY=`,
++    `AWS_SESSION_TOKEN=`,
++    `AWS_PROFILE=`,
++    `CLAUDE_CODE_USE_BEDROCK=`,
++    ...(selectedProvider === "bedrock" && escapedAwsToken
++      ? [
++          `AWS_BEARER_TOKEN_BEDROCK=${escapedAwsToken}`,
++          `CLAUDE_CODE_USE_BEDROCK=1`,
++          `AWS_REGION=us-east-1`,
++        ]
++      : []),
++    ...(selectedProvider === "anthropic" && escapedAnthropicApiKey
++      ? [`ANTHROPIC_API_KEY=${escapedAnthropicApiKey}`]
++      : []),
++    ...(shouldInjectConvexDeployKey
++      ? [`CONVEX_DEPLOY_KEY=$(cat $HOME/.vly-convex/dev.key 2>/dev/null || echo "")`]
++      : []),
++    `GIT_TERMINAL_PROMPT=0`,
++    `PATH=${pathValue}`,
++  ].join(" ");
++
++  // Prepend environment variables and change to codebase directory before running
++  // Matches old agent's environment setup for consistency (working dir: /home/daytona/codebase)
++  // Using command substitution for deploy key eliminates the need for a separate command
++  const fullCommand = `cd /home/daytona/codebase && ${envVars} ${command}`;
++
++  // Set up streaming assistant_stream array
++  const assistantStream: Array<{
++    type: string;
++    title?: string;
++    status?: string;
++    content: string;
++    description?: string;
++  }> = [];
++
++  // Track session ID from result type chunks
++  let newSessionId: string | undefined = undefined;
++
++  // Track if we should terminate (when result type received with session ID and usage)
++  let shouldTerminate = false;
++  // Runner turn limit: one wall-clock ceiling for the whole turn — there is no
++  // Convex action ceiling here, so no chaining and no cloud budget math.
++  let timedOut = false;
++  const runTimeoutHandle = setTimeout(() => {
++    timedOut = true;
++    shouldTerminate = true;
++  }, args.turnLimitMs);
++
++  // Items are shipped as batched delta rows via emitStreamItem; this counter
++  // tracks what has already been emitted.
++  let lastUpdateCount = 0;
++  const flushAssistantStream = () => {
++    const pending = assistantStream.slice(lastUpdateCount);
++    lastUpdateCount = assistantStream.length;
++    for (const item of pending) args.emitStreamItem(item);
++  };
++
++  // Track all mutation promises to ensure they complete (prevents dangling promise warnings)
++  const pendingMutations: Promise<any>[] = [];
++
++  // Helper to track mutation promises
++  const trackMutation = <T>(promise: Promise<T>): Promise<T> => {
++    pendingMutations.push(promise);
++    promise.finally(() => {
++      const index = pendingMutations.indexOf(promise);
++      if (index > -1) {
++        pendingMutations.splice(index, 1);
++      }
++    });
++    return promise;
++  };
++
++  // Buffer for incomplete JSON lines that span multiple PTY chunks
++  let lineBuffer = "";
++
++  // Callback for processing stdout chunks from PTY
++  const processOutputLines = async (data: string) => {
++    // User cancel / runner shutdown: stop the CLI at the next chunk.
++    if (!shouldTerminate && args.isInterrupted()) {
++      shouldTerminate = true;
++    }
++    // Append new data to buffer (handles incomplete lines from previous chunks)
++    lineBuffer += data;
++
++    // Split by newlines to get complete lines
++    const lines = lineBuffer.split("\n");
++
++    // Keep the last line in buffer (it might be incomplete)
++    // All other lines are complete
++    lineBuffer = lines.pop() || "";
++
++    // Process complete lines
++    for (const line of lines) {
++      const trimmedLine = line.trim();
++      if (!trimmedLine) {
++        continue; // Skip empty lines
++      }
++
++      // Skip processing if we should terminate
++      if (shouldTerminate) {
++        return;
++      }
++
++      try {
++        const parsed = JSON.parse(trimmedLine);
++
++        // Handle arrays - process each item in the array separately
++        if (Array.isArray(parsed)) {
++          for (const item of parsed) {
++            await processStreamItem(item);
++            if (shouldTerminate) {
++              return;
++            }
++          }
++          continue;
++        }
++
++        // Process single item
++        await processStreamItem(parsed);
++      } catch {
++        // Check if this is a "No conversation found" error from Claude Code
++        if (
++          trimmedLine.includes("No conversation found") ||
++          (trimmedLine.includes("session") && trimmedLine.includes("not found"))
++        ) {
++          // Clear the session ID and continue as a new session
++          if (newSessionId === args.activeSessionId) {
++            newSessionId = undefined;
++            // Update thread to clear invalid session ID
++            try {
++              await trackMutation(
++                ctx.runMutation(
++                  internal.coding_agent.cli_agent.agent_thread
++                    .updateAgentThreadActiveSessionId,
++                  {
++                    threadId: args.threadId,
++                    activeSessionId: "", // Clear invalid session
++                  },
++                ),
++              );
++            } catch (error) {
++              console.error(
++                "[CLIAgent] Error clearing invalid session ID:",
++                error,
++              );
++            }
++          }
++          // Don't add text types to stream - they may contain sensitive data
++        } else {
++          // If JSON parsing failed and it's not an error message, it might be an incomplete line
++          // This will be handled by the buffer on the next chunk
++          // SECURITY: Do not save text types - they may contain API keys or sensitive data
++          // Skip adding to assistantStream
++        }
++      }
++    }
++  };
++
++  // Helper function to process a single stream item
++  // Uses the stream parser module for parsing logic
++  const processStreamItem = async (parsed: any) => {
++    const result = parseStreamItem(parsed);
++
++    // Handle result type - update session ID and usage
++    if (result.sessionId && result.sessionId !== newSessionId) {
++      newSessionId = result.sessionId;
++      // Update thread with new session ID
++      await trackMutation(
++        ctx.runMutation(
++          internal.coding_agent.cli_agent.agent_thread
++            .updateAgentThreadActiveSessionId,
++          {
++            threadId: args.threadId,
++            activeSessionId: newSessionId,
++          },
++        ),
++      );
++      // Save session ID to message
++      await trackMutation(
++        ctx.runMutation(
++          internal.coding_agent.cli_agent.agent_message
++            .updateAgentMessageSessionId,
++          {
++            messageId: args.messageId,
++            sessionId: newSessionId,
++          },
++        ),
++      );
++    }
++
++    // Handle usage information
++    if (result.usage) {
++      await trackMutation(
++        ctx.runMutation(
++          internal.coding_agent.cli_agent.agent_message.updateAgentMessageUsage,
++          {
++            messageId: args.messageId,
++            totalCostUsd: result.usage.totalCostUsd,
++            usageBreakdown: result.usage.usageBreakdown,
++            modelUsed: `Claude Code (${selectedProvider})`,
++          },
++        ),
++      );
++
++      // Do not deduct platform credits for user BYOK credentials.
++    }
++
++    // Handle termination
++    if (result.shouldTerminate) {
++      shouldTerminate = true;
++    }
++
++    // Save stream item if shouldSave is true
++    if (result.shouldSave && result.streamItem) {
++      assistantStream.push(result.streamItem);
++      flushAssistantStream();
++    }
++  };
++
++  try {
++    // Install Claude Code if not already installed (following Daytona docs pattern)
++    // This ensures Claude Code is available before running the PTY command
++    // Use --prefix to install to user-writable directory to avoid permission issues
++    try {
++      // Check if claude command exists before installing
++      const checkResult = await codebase.runCommand(
++        'export PATH="$HOME/.local/share/npm-global/bin:$HOME/.local/bin:$PATH" && command -v claude >/dev/null 2>&1 && echo "EXISTS" || echo "MISSING"',
++        5000,
++      );
++      const claudeExists = checkResult.output?.trim() === "EXISTS";
++
++      if (!claudeExists) {
++        // Install to ~/.local/share/npm-global/bin (user-writable directory)
++        await codebase.runCommand(
++          "mkdir -p ~/.local/share/npm-global && npm install -g --prefix ~/.local/share/npm-global @anthropic-ai/claude-code",
++          60000,
++        ); // 60 second timeout
++      }
++      // SECURITY: Don't log installation output - may contain sensitive data
++    } catch {
++      // If installation fails, continue - Claude Code might already be installed
++      // The command execution will fail later if it's actually missing
++      // SECURITY: Don't log error details - may contain sensitive data
++    }
++
++    const runClaudeCommandAndProcessOutput = async (command: string) => {
++      // Run via a script file rather than typing the whole command into the
++      // PTY. Daytona's PTY input intermittently drops/doubles characters on
++      // long commands, which can silently corrupt credential env vars/flags.
++      // Uploading the command via the fs API and running `bash <path>` removes
++      // that class of transit corruption while preserving streaming + exit code.
++      const ptyPromise = codebase.runPtyCommandViaScript(
++        command,
++        processOutputLines,
++        { scriptPath: `/home/daytona/.vly-claude-run-${args.messageId}.sh` },
++      );
++
++      // Terminate early once we've received final usage/result info.
++      // This prevents Claude CLI sessions from hanging after work is complete.
++      const terminationPromise = new Promise<{
++        exitCode: number | null;
++        error?: string;
++      }>((resolve) => {
++        const checkTermination = setInterval(() => {
++          if (shouldTerminate) {
++            clearInterval(checkTermination);
++            codebase
++              .runCommand(
++                'pkill -f "claude.*--output-format stream-json" || true',
++                5000,
++              )
++              .catch(() => {
++                // Ignore kill errors; process may have already exited.
++              });
++            resolve({ exitCode: 0, error: undefined });
++          }
++        }, 100);
++
++        ptyPromise
++          .then(() => clearInterval(checkTermination))
++          .catch(() => clearInterval(checkTermination));
++      });
++
++      const result = await Promise.race([ptyPromise, terminationPromise]);
++
++      // Process any remaining buffered line (in case command ended mid-line)
++      if (lineBuffer.trim()) {
++        try {
++          const parsed = JSON.parse(lineBuffer.trim());
++          if (Array.isArray(parsed)) {
++            for (const item of parsed) {
++              await processStreamItem(item);
++            }
++          } else {
++            await processStreamItem(parsed);
++          }
++        } catch {
++          // If final buffer doesn't parse, it's likely incomplete - skip it
++        }
++      }
++
++      lineBuffer = "";
++      return result;
++    };
++
++    const result = await runClaudeCommandAndProcessOutput(fullCommand);
++
++    // Ship any items not yet emitted.
++    flushAssistantStream();
++
++    // If the in-process 9-min timer fired, surface that to the workflow
++    // handler so it marks the message as Paused with the canonical copy.
++    if (timedOut) {
++      return {
++        success: false,
++        error: CLI_AGENT_TIMEOUT_MESSAGE,
++        timedOut: true,
++        sessionId: newSessionId,
++      };
++    }
++
++    // If we received final usage/result info, terminate immediately
++    if (shouldTerminate) {
++      return { success: true, sessionId: newSessionId };
++    }
++
++    // Check exit code
++    if (result.exitCode !== null && result.exitCode !== 0) {
++      throw new Error(
++        `Command failed with exit code ${result.exitCode}: ${result.error || "Unknown error"}`,
++      );
++    }
++
++    return { success: true, sessionId: newSessionId };
++  } catch (error) {
++    if (timedOut) {
++      return {
++        success: false,
++        error: CLI_AGENT_TIMEOUT_MESSAGE,
++        timedOut: true,
++        sessionId: newSessionId,
++      };
++    }
++    const errorMessage =
++      error instanceof Error ? error.message : "Unknown error";
++
++    // Don't update message state here - let onComplete handle it
++    return { success: false, error: errorMessage };
++  } finally {
++    clearTimeout(runTimeoutHandle);
++  }
++}
+diff --git a/freebuff/runner/src/executeCodex.ts b/freebuff/runner/src/executeCodex.ts
+new file mode 100644
+index 000000000..a7e6ff904
+--- /dev/null
++++ b/freebuff/runner/src/executeCodex.ts
+@@ -0,0 +1,1366 @@
++// Runner port of convex/coding_agent/cli_agent/executeCodex.ts
++// (docs/freebuff-render-harness.md). Differences from the Convex action copy:
++//   - ctx is the RunnerCtx bridge (runQuery/runMutation/storage over HTTP).
++//   - Stream items go through `emitStreamItem` → the runner's batched
++//     recordRunEventBatch mutation → agent_message_delta rows, instead of
++//     full-array updateAgentMessageStream rewrites.
++//   - One wall-clock turn limit (`turnLimitMs`) replaces the per-action abort
++//     + cloud chaining; `isInterrupted` covers user cancel / runner shutdown.
++
++import { internal } from "../../web/convex/_generated/api";
++import { Id } from "../../web/convex/_generated/dataModel";
++import { DaytonaCodebase } from "../../web/codebase-utils/codebase/DaytonaCodebase";
++import {
++  cliAgentSystemPrompt,
++  knowledgePrompts,
++} from "../../web/convex/coding_agent/cli_agent/system_prompt";
++import { escapeShellArg } from "../../web/convex/coding_agent/cli_agent/shellEscape";
++import { refreshConnectedRepoOrigin } from "../../web/convex/coding_agent/cli_agent/gitRemoteAuth";
++import { CLI_AGENT_TIMEOUT_MESSAGE } from "../../web/convex/coding_agent/cli_agent/timeLimits";
++import {
++  CODEX_DEVICE_AUTH_URL,
++  CodexAuthFileStatus,
++  DeviceAuthInfo,
++  decryptCodexAuthPayload,
++  encryptCodexAuthPayload,
++  getCodexAuthEncryptionSecret,
++  getCodexAuthHashSalt,
++  parseCodexAuthFileStatus,
++  parseDeviceAuthInfo,
++} from "../../web/convex/coding_agent/cli_agent/codexAuth";
++
++import type { RunnerCtx } from "./convexBridge";
++import type { CliStreamItem } from "./executeClaudeCode";
++
++export interface ExecuteCodexArgs {
++  projectId: Id<"project">;
++  threadId: Id<"agent_thread">;
++  messageId: Id<"agent_message">;
++  sandboxId: string;
++  activeSessionId: string | undefined;
++  executingUserId: Id<"users">;
++  userMessage: string;
++  images: Id<"_storage">[] | undefined;
++  gptAuthMethod: "oauth" | "byok";
++  gptModelPreference?: string;
++  openAiApiKey?: string;
++  // Wall-clock limit for this turn (no chaining on the runner).
++  turnLimitMs: number;
++  // Ship a UI-shaped stream item to the client (batched delta rows).
++  emitStreamItem: (item: CliStreamItem) => void;
++  // User cancel or runner shutdown — abort the CLI at the next stream chunk.
++  isInterrupted: () => boolean;
++}
++
++export interface ExecuteCodexResult {
++  success: boolean;
++  error?: string;
++  sessionId?: string;
++  timedOut?: boolean;
++}
++
++const CODEX_MODEL_PREFERENCE_SET = new Set<string>([
++  "gpt-5.5",
++  "gpt-5.4",
++  "gpt-5.4-mini",
++]);
++
++// ChatGPT-account (OAuth) runs must always pass an explicit --model: with no
++// flag, codex-cli falls back to its own default (gpt-5.3-codex as of 0.128.0),
++// which OpenAI rejects with 400 "not supported when using Codex with a ChatGPT
++// account". BYOK/API-key runs keep the CLI default.
++const DEFAULT_CHATGPT_CODEX_MODEL = "gpt-5.5";
++
++const resolveCodexModelPreference = (
++  preference: string | undefined,
++): string | undefined => {
++  const selected = preference?.trim();
++  if (selected && CODEX_MODEL_PREFERENCE_SET.has(selected)) {
++    return selected;
++  }
++  return undefined;
++};
++
++export async function executeCodex(
++  ctx: RunnerCtx,
++  codebase: DaytonaCodebase,
++  args: ExecuteCodexArgs,
++): Promise<ExecuteCodexResult> {
++  const normalizeCommandForDisplay = (raw: string): string => {
++    const command = raw.trim();
++    const shellWrapped = command.match(/^\/bin\/(?:ba)?sh\s+-lc\s+'([\s\S]*)'$/i);
++    if (!shellWrapped) {
++      return command;
++    }
++
++    return shellWrapped[1]
++      .replace(/'"'"'/g, "'")
++      .replace(/\s+/g, " ")
++      .trim();
++  };
++
++  const humanizeCodexItemType = (value: string): string => {
++    const label = value
++      .replace(/[_-]+/g, " ")
++      .replace(/\s+/g, " ")
++      .trim();
++    return label ? `Processing ${label}` : "Processing the next step.";
++  };
++
++  const normalizeByokOpenAiKey = (
++    value: string | undefined,
++  ): string | undefined => {
++    const trimmed = value?.trim();
++    if (!trimmed) {
++      return undefined;
++    }
++    const withoutAssignment = trimmed.replace(/^OPENAI_API_KEY\s*=\s*/i, "");
++    const withoutBearer = withoutAssignment.replace(/^Bearer\s+/i, "");
++    const unquoted = withoutBearer.replace(/^['"]|['"]$/g, "").trim();
++    // Common paste typo: keys accidentally start with "ssk-".
++    if (unquoted.startsWith("ssk-")) {
++      return unquoted.slice(1);
++    }
++    return unquoted;
++  };
++
++  const sanitizeCodexShellCommand = (command: string): string =>
++    command
++      .replaceAll("$HOME/.local//share", "$HOME/.local/share")
++      .replace(/\bVVLY_/g, "VLY_")
++      .replaceAll(
++        "VLY_CODEX_USE_STORED_CREDENTIALS=1VLY_CODEX_AUTH_SOURCE",
++        "VLY_CODEX_USE_STORED_CREDENTIALS=1 VLY_CODEX_AUTH_SOURCE",
++      )
++      .replaceAll(
++        'OPENAI_API_KEY=""VLY_CODEX_USE_STORED_CREDENTIALS',
++        'OPENAI_API_KEY="" VLY_CODEX_USE_STORED_CREDENTIALS',
++      )
++      .replace(/\bunset\s+OPENAI_API__KEY\b/g, "unset OPENAI_API_KEY")
++      .replaceAll(".vly-convex/devv.key", ".vly-convex/dev.key")
++      .replace(/\bcodex exec --yoloo+\b/g, "codex exec --yolo")
++      .replaceAll(" codex exec --yolo ---color ", " codex exec --yolo --color ")
++      .replace(/OPENAI_API_KEY=(['"]?)ssk-/g, "OPENAI_API_KEY=$1sk-");
++
++  // Check if this is the first message (no active session ID means new thread)
++  const isFirstMessage = !args.activeSessionId;
++  const projectRecord = await ctx.runQuery(internal.project.getProject, {
++    projectId: args.projectId,
++  });
++  const shouldInjectConvexDeployKey = projectRecord?.project_type === "template";
++  // Freebuff Cloud runs against the user's real connected repo, so the agent is
++  // allowed to use git here (web/template stays platform-managed). See
++  // gitGuidanceLines / gitRemoteAuth for the rationale.
++  const isConnectedRepoProject =
++    projectRecord?.project_type === "connected_repo";
++
++  // Give the cloud agent a fresh, authenticated `origin` up front so its
++  // fetch/pull/push work even on a long-lived sandbox whose clone-time token
++  // has expired. Best-effort; local git works regardless.
++  if (isConnectedRepoProject) {
++    await refreshConnectedRepoOrigin(codebase, projectRecord);
++  }
++
++  // Template projects get the CLI agent instruction file. Cloud connected repos
++  // should receive only the user's prompt and whatever instructions already
++  // exist in the repo.
++  if (isFirstMessage && !isConnectedRepoProject) {
++    try {
++      const agentsMdExists =
++        await codebase.checkIfFileExistsInCodebase("AGENTS.md");
++      if (!agentsMdExists) {
++        // Create AGENTS.md with the system prompt content
++        // Get package manager and runner for system prompt interpolation
++        const pm = codebase.getPackageManager();
++        const runner = pm.runner(); // "npx" or "bunx"
++        const packageManagerName = codebase.getPackageManagerName();
++        const systemPromptContent =
++          cliAgentSystemPrompt(runner, { allowGit: isConnectedRepoProject }) +
++          knowledgePrompts(runner, packageManagerName);
++        await codebase.writeFile("AGENTS.md", systemPromptContent);
++      }
++    } catch (error) {
++      // If file check/write fails, log but continue - codex will handle it
++      console.error("[Codex] Error checking/creating AGENTS.md:", error);
++    }
++  }
++
++  // Download images to temp files so the CLI agent can read them visually
++  let userMessageWithImages = args.userMessage;
++  if (args.images && args.images.length > 0) {
++    const downloadedPaths: string[] = [];
++    for (let i = 0; i < args.images.length; i++) {
++      const imageUrl = await ctx.storage.getUrl(args.images[i]);
++      if (imageUrl) {
++        const tempPath = `/tmp/vly-user-image-${i + 1}.png`;
++        try {
++          await codebase.runCommand(
++            `curl -sL ${escapeShellArg(imageUrl)} -o ${escapeShellArg(tempPath)}`,
++            15000,
++          );
++          downloadedPaths.push(tempPath);
++        } catch {
++          // If download fails, skip this image
++        }
++      }
++    }
++
++    if (downloadedPaths.length > 0) {
++      const imageReferences = downloadedPaths
++        .map(
++          (path, idx) =>
++            `Image ${idx + 1}: ${path} (read this image file to view it)`,
++        )
++        .join("\n");
++      userMessageWithImages = `${args.userMessage}\n\nThe user has attached ${downloadedPaths.length} image(s). Read these image files to see what the user is referring to:\n${imageReferences}`;
++    }
++  }
++
++  const codexRuntimeConstraints = [
++    "Important constraints:",
++    "- Git runs automatically between messages (the platform commits and syncs your changes after each turn), so you normally don't need to run git yourself. You may use it if genuinely needed, but avoid manual commits/pushes/history rewrites that can conflict with the automatic sync.",
++    isFirstMessage
++      ? "- This is the first message in this thread. Make at least one clearly visible landing-page edit so the user can immediately see changes in preview."
++      : "",
++  ]
++    .filter(Boolean)
++    .join("\n");
++
++  const commandPrompt = isConnectedRepoProject
++    ? userMessageWithImages
++    : `${codexRuntimeConstraints}\n\nUser request:\n${userMessageWithImages}`;
++
++  // Escape the final prompt for shell
++  const escapedPrompt = escapeShellArg(commandPrompt);
++
++  // Build PATH matching old agent: /home/daytona/.local/bin + system PATH, plus npm-global bin
++  const systemPath = process.env.PATH || "/usr/local/bin:/usr/bin:/bin";
++  // PATH doesn't need escaping since we control the value
++  const pathValue = `"$HOME/.local/share/npm-global/bin:/home/daytona/.local/bin:${systemPath}"`;
++
++  // Active session ID if provided (user-controlled input)
++  const activeSessionId = args.activeSessionId?.trim() || "";
++
++  // Build the codex command
++  // For new sessions: codex exec --yolo --color never --json "prompt"
++  // For resuming (current CLI): codex exec resume <SESSION_ID> --yolo --json "prompt"
++  // For resuming (legacy fallback): codex exec --resume <SESSION_ID> --yolo --color never --json "prompt"
++  // Note: PATH must be exported at the start so codex can be found in both login and exec commands
++  // Note: --json flag makes codex output JSON format for easier parsing
++  type ResumeCommandMode = "subcommand" | "legacy_flag";
++  const buildCodexCommand = (
++    sessionId: string | undefined,
++    authSource: "stored_chatgpt" | "byok_openai",
++    openAiApiKey: string | undefined,
++    resumeMode: ResumeCommandMode = "subcommand",
++  ) => {
++    const escapedSessionId = sessionId ? escapeShellArg(sessionId) : undefined;
++    const selectedModel =
++      resolveCodexModelPreference(args.gptModelPreference) ??
++      (authSource === "stored_chatgpt" ? DEFAULT_CHATGPT_CODEX_MODEL : undefined);
++    const modelFlag = selectedModel
++      ? ` --model ${escapeShellArg(selectedModel)}`
++      : "";
++    const codexExecCommand = (() => {
++      if (!escapedSessionId) {
++        return `codex exec --yolo --color never --json${modelFlag} ${escapedPrompt}`;
++      }
++      if (resumeMode === "legacy_flag") {
++        return `codex exec --resume ${escapedSessionId} --yolo --color never --json${modelFlag} ${escapedPrompt}`;
++      }
++      // codex exec resume does not accept --color; keep args to the supported subset.
++      return `codex exec resume ${escapedSessionId} --yolo --json${modelFlag} ${escapedPrompt}`;
++    })();
++    const authPrefix =
++      authSource === "stored_chatgpt" ? "unset OPENAI_API_KEY && " : "";
++    const authEnv =
++      authSource === "stored_chatgpt"
++        ? `VLY_CODEX_USE_STORED_CREDENTIALS=1 VLY_CODEX_AUTH_SOURCE="${authSource}"`
++        : `OPENAI_API_KEY=${escapeShellArg(openAiApiKey || "")} VLY_CODEX_AUTH_SOURCE="${authSource}"`;
++    const convexDeployKeyExpr =
++      '$(cat "$HOME/.vly-c
+
+… [diff truncated — view full diff on GitHub] …

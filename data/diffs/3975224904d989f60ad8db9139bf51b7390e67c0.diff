@@ -1,0 +1,1544 @@
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index 8a2770b57..50bad5c95 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -2,6 +2,9 @@ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ import type { FeedbackCategory } from '@codebuff/common/constants/feedback'
+ import { setFreeModeCapacityDeferralListener } from '@codebuff/sdk'
+ import { safeOpen } from './utils/open-url'
++import { getAuthToken } from './utils/auth'
++import { isSponsoredProposalBlock } from './types/chat'
++import { runSponsoredProposalControl } from './utils/sponsored-proposal-control'
+ import {
+   useCallback,
+   useEffect,
+@@ -104,6 +107,7 @@ import type { AgentMode } from './utils/constants'
+ import type { FileTreeNode } from '@codebuff/common/util/file'
+ import type { BoxRenderable, ScrollBoxRenderable } from '@opentui/core'
+ import type { UseMutationResult } from '@tanstack/react-query'
++import type { SponsoredProposalContentBlock } from './types/chat'
+ import type { Dispatch, SetStateAction } from 'react'
+ 
+ export const Chat = ({
+@@ -209,6 +213,133 @@ export const Chat = ({
+   const handleAdImpression = useEvent(recordImpression)
+   const handleResponseAdsNeeded = useEvent(requestResponseAds)
+ 
++  // ------------------------------------------------- sponsored proposals
++
++  /**
++   * Patch the one sponsored-proposal block for a target, wherever it sits.
++   *
++   * BY TARGET rather than by message id: a repository has one live offer, and
++   * if it were ever rendered twice, declining it in one place must not leave it
++   * standing in the other.
++   */
++  // The transcript as of this render. A control has to find its own block
++  // synchronously -- `busy` is what makes a double press inert, and reading it
++  // out of a `setMessages` updater would be a check inside a state write.
++  const messagesRef = useRef(messages)
++  messagesRef.current = messages
++
++  const patchProposalBlock = useEvent(
++    (target: string, patch: Partial<SponsoredProposalContentBlock>) => {
++      setMessages((prev) =>
++        prev.map((message) =>
++          message.blocks?.some(
++            (block) =>
++              isSponsoredProposalBlock(block) && block.target === target,
++          )
++            ? {
++                ...message,
++                blocks: message.blocks.map((block) =>
++                  isSponsoredProposalBlock(block) && block.target === target
++                    ? { ...block, ...patch }
++                    : block,
++                ),
++              }
++            : message,
++        ),
++      )
++    },
++  )
++
++  const findProposalBlock = useEvent((target: string) => {
++    for (const message of messagesRef.current) {
++      for (const block of message.blocks ?? []) {
++        if (isSponsoredProposalBlock(block) && block.target === target) {
++          return block
++        }
++      }
++    }
++    return null
++  })
++
++  // Whether a card is currently holding the keyboard. Derived from the
++  // transcript rather than kept as its own flag: the menu is a property of a
++  // block, and a second source of truth would go stale the moment a block is
++  // answered or replaced while its menu is open.
++  const sponsoredProposalMenuOpen = useMemo(
++    () =>
++      messages.some((message) =>
++        message.blocks?.some(
++          (block) =>
++            isSponsoredProposalBlock(block) &&
++            block.menuOpen === true &&
++            block.answered !== true,
++        ),
++      ),
++    [messages],
++  )
++
++  const handleSponsoredProposalMenu = useEvent((target: string, open: boolean) =>
++    patchProposalBlock(target, { menuOpen: open }),
++  )
++  const handleSponsoredProposalDisclose = useEvent(
++    (target: string, open: boolean) => patchProposalBlock(target, { whyOpen: open }),
++  )
++
++  const handleSponsoredProposalControl = useEvent(
++    (
++      target: string,
++      control: 'dismiss' | 'report' | 'never-advertiser' | 'opt-out',
++    ) => {
++      const block = findProposalBlock(target)
++      const authToken = getAuthToken()
++      // `busy` is checked before the await, not after: the impatient double
++      // press is synchronous, and a guard on the far side of a promise arrives
++      // too late to stop the second call.
++      if (!block || block.busy || block.answered || !authToken) return
++      patchProposalBlock(target, { busy: true, menuOpen: false })
++      const proposalId = block.proposal._id
++      const advertiserId = block.proposal.advertiser_id
++      void (async () => {
++        let succeeded = false
++        try {
++          // The ordering rules -- preference before dismiss, and the
++          // preference's RESULT deciding whether the dismiss happens at all --
++          // live in `runSponsoredProposalControl` so they can be tested
++          // without a network and without mounting chat.
++          succeeded = await runSponsoredProposalControl(
++            control,
++            { proposalId, advertiserId },
++            authToken,
++          )
++        } finally {
++          // ANSWERED ONLY WHEN IT WAS. `answered` stands the card's controls
++          // down permanently, so setting it in a `finally` marked a failed
++          // control as an answer the user gave: the card stayed on screen
++          // looking spent, with no way to retry and nothing saved.
++          //
++          // ANSWERED, not removed, when it did succeed. The card stays in the
++          // transcript with its controls stood down, because a block that
++          // vanishes reflows text the user is reading and leaves history
++          // claiming the offer never happened.
++          patchProposalBlock(
++            target,
++            succeeded ? { busy: false, answered: true } : { busy: false },
++          )
++          if (!succeeded) {
++            // Said out loud, unlike the transport's own debug log. Everything
++            // else in this channel is optional and stays quiet, but this is the
++            // one moment the user made a request of us and the card must not
++            // silently keep the answer.
++            setMessages((prev) => [
++              ...prev,
++              getSystemMessage("Couldn't save that — try again"),
++            ])
++          }
++        }
++      })()
++    },
++  )
++
+   // Set initial mode from CLI flag on mount
+   useEffect(() => {
+     if (initialMode) {
+@@ -1324,7 +1455,18 @@ export const Chat = ({
+   useChatKeyboard({
+     state: chatKeyboardState,
+     handlers: chatKeyboardHandlers,
+-    disabled: askUserState !== null || reviewMode || queuePanelOpen,
++    // `sponsoredProposalMenuOpen` joins askUser for exactly the same reason
++    // askUser is here (COD-376): both take over the keyboard, and `useKeyboard`
++    // is a GLOBAL listener rather than a focus-scoped one -- so without this,
++    // the menu's arrows, Enter and Esc would reach the card AND the composer,
++    // and the user would move a selection while also navigating history. The
++    // card claims no keys at all outside this span; that is what makes turning
++    // chat's off for the span safe rather than a second overlap.
++    disabled:
++      askUserState !== null ||
++      reviewMode ||
++      queuePanelOpen ||
++      sponsoredProposalMenuOpen,
+   })
+ 
+   // Sync message block context to zustand store for child components
+@@ -1371,6 +1513,9 @@ export const Chat = ({
+       onAdClick: handleAdClick,
+       onAdImpression: handleAdImpression,
+       onResponseAdsNeeded: handleResponseAdsNeeded,
++      onSponsoredProposalMenu: handleSponsoredProposalMenu,
++      onSponsoredProposalDisclose: handleSponsoredProposalDisclose,
++      onSponsoredProposalControl: handleSponsoredProposalControl,
+     })
+   }, [
+     handleCollapseToggle,
+diff --git a/cli/src/commands/__tests__/ads-proposal-commands.test.ts b/cli/src/commands/__tests__/ads-proposal-commands.test.ts
+new file mode 100644
+index 000000000..b1403ca5d
+--- /dev/null
++++ b/cli/src/commands/__tests__/ads-proposal-commands.test.ts
+@@ -0,0 +1,119 @@
++import { SPONSORED_ROW_FIXTURES } from '@codebuff/common/ads/__fixtures__/sponsored-proposal-rows'
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import {
++  handleProposalDismiss,
++  handleProposalMenu,
++  liveSponsoredProposal,
++} from '../ads'
++import { useMessageBlockStore } from '../../state/message-block-store'
++
++import type { ChatMessage, SponsoredProposalContentBlock } from '../../types/chat'
++
++/**
++ * The slash commands that replaced the card's bare keys (COD-376).
++ *
++ * `useKeyboard` registers a GLOBAL listener and chat's composer has one too,
++ * so the card's `m` and `esc` fired alongside whatever the user was actually
++ * typing. `/ads:proposal` and `/ads:dismiss-proposal` are therefore not a
++ * convenience for when no card is on screen — they are the ONLY way to reach
++ * the menu and the decline, which is why they need a test of their own.
++ */
++
++const proposalBlock = (
++  over: Partial<SponsoredProposalContentBlock> = {},
++): SponsoredProposalContentBlock => ({
++  type: 'sponsored-proposal',
++  target: 'acme/deploys',
++  proposal: {
++    ...SPONSORED_ROW_FIXTURES.offered,
++    _id: 'proposal-1',
++    advertiser_id: 'adv_acme',
++  },
++  ...over,
++})
++
++const withBlocks = (
++  ...blocks: SponsoredProposalContentBlock[]
++): ChatMessage[] =>
++  blocks.map(
++    (block, index) =>
++      ({
++        id: `m${index}`,
++        role: 'assistant',
++        content: '',
++        blocks: [block],
++      }) as unknown as ChatMessage,
++  )
++
++function recordCalls() {
++  const calls: [string, ...unknown[]][] = []
++  useMessageBlockStore.getState().setCallbacks({
++    ...useMessageBlockStore.getState().callbacks,
++    onSponsoredProposalMenu: (target, open) => calls.push(['menu', target, open]),
++    onSponsoredProposalControl: (target, control) =>
++      calls.push(['control', target, control]),
++  })
++  return calls
++}
++
++afterEach(() => useMessageBlockStore.getState().reset())
++
++describe('/ads:proposal', () => {
++  test('opens the menu on the live card and says nothing', () => {
++    const calls = recordCalls()
++    expect(handleProposalMenu(withBlocks(proposalBlock()))).toBeNull()
++    expect(calls).toEqual([['menu', 'acme/deploys', true]])
++  })
++
++  test('with no card on screen it explains rather than doing nothing', () => {
++    const calls = recordCalls()
++    expect(handleProposalMenu([])).toBe('No sponsored proposal on screen.')
++    expect(calls).toEqual([])
++  })
++
++  test('an ANSWERED card is not a live card', () => {
++    // A spent card is still in the transcript by design — it is never removed —
++    // so "the last proposal block" is the wrong question to ask.
++    const calls = recordCalls()
++    expect(handleProposalMenu(withBlocks(proposalBlock({ answered: true })))).toBe(
++      'No sponsored proposal on screen.',
++    )
++    expect(calls).toEqual([])
++  })
++
++  test('the newest live card wins when the transcript holds several', () => {
++    const calls = recordCalls()
++    handleProposalMenu(
++      withBlocks(
++        proposalBlock({ target: 'old/repo', answered: true }),
++        proposalBlock({ target: 'new/repo' }),
++      ),
++    )
++    expect(calls).toEqual([['menu', 'new/repo', true]])
++  })
++})
++
++describe('/ads:dismiss-proposal', () => {
++  test('declines through the same control path the menu uses', () => {
++    // Not a second call to the dismiss endpoint: the busy guard, the
++    // `answered` bookkeeping and the failure message all live on that path,
++    // and a second implementation would be a second set of rules for one
++    // gesture.
++    const calls = recordCalls()
++    expect(handleProposalDismiss(withBlocks(proposalBlock()))).toBeNull()
++    expect(calls).toEqual([['control', 'acme/deploys', 'dismiss']])
++  })
++
++  test('with no card on screen it explains rather than doing nothing', () => {
++    const calls = recordCalls()
++    expect(handleProposalDismiss([])).toBe('No sponsored proposal on screen.')
++    expect(calls).toEqual([])
++  })
++})
++
++describe('liveSponsoredProposal', () => {
++  test('is null for a transcript with no proposal at all', () => {
++    expect(liveSponsoredProposal([])).toBeNull()
++  })
++})
+diff --git a/cli/src/commands/ads.ts b/cli/src/commands/ads.ts
+index 0e42afa81..58c440e3a 100644
+--- a/cli/src/commands/ads.ts
++++ b/cli/src/commands/ads.ts
+@@ -1,10 +1,19 @@
+ import { useChatStore } from '../state/chat-store'
++import { useMessageBlockStore } from '../state/message-block-store'
+ import { IS_FREEBUFF } from '../utils/constants'
+ import { logger } from '../utils/logger'
+ import { getSystemMessage } from '../utils/message-history'
+ import { saveSettings, loadSettings } from '../utils/settings'
+ 
+-import type { ChatMessage } from '../types/chat'
++import { getAuthToken } from '../utils/auth'
++import { setSponsoredProposalPrefs } from '../utils/sponsored-proposal-api'
++import { runSponsoredProposalControl } from '../utils/sponsored-proposal-control'
++import { isSponsoredProposalBlock } from '../types/chat'
++
++import type {
++  ChatMessage,
++  SponsoredProposalContentBlock,
++} from '../types/chat'
+ 
+ export const handleAdsEnable = (): {
+   postUserMessage: (messages: ChatMessage[]) => ChatMessage[]
+@@ -42,3 +51,136 @@ export const getAdsEnabled = (): boolean => {
+   const settings = loadSettings()
+   return settings.adsEnabled ?? false
+ }
++
++/**
++ * The sponsored-proposal channel controls, reachable from `/ads` as well as
++ * from the card (COD-376).
++ *
++ * They are on the card because that is where the user is when they want them,
++ * and here because a card can be scrolled off, dismissed, or never shown --
++ * and "turn this off" must not require an ad to be on screen to reach. The
++ * two paths call the same endpoints.
++ *
++ * Report and never-this-advertiser need a proposal to be ABOUT, so they act on
++ * the live card and say so plainly when there is none. The channel opt-out
++ * needs nothing and always works.
++ */
++
++/** The live (unanswered) sponsored proposal in the transcript, or null. */
++export function liveSponsoredProposal(
++  messages: ChatMessage[],
++): SponsoredProposalContentBlock | null {
++  for (let i = messages.length - 1; i >= 0; i--) {
++    for (const block of messages[i]!.blocks ?? []) {
++      if (isSponsoredProposalBlock(block) && !block.answered) return block
++    }
++  }
++  return null
++}
++
++async function withProposal(
++  messages: ChatMessage[],
++  act: (
++    block: SponsoredProposalContentBlock,
++    authToken: string,
++  ) => Promise<boolean>,
++  done: string,
++): Promise<string> {
++  const block = liveSponsoredProposal(messages)
++  if (!block) return 'No sponsored proposal on screen.'
++  const authToken = getAuthToken()
++  if (!authToken) return 'Sign in to change sponsored proposal settings.'
++  return (await act(block, authToken))
++    ? done
++    : 'Could not reach the sponsored proposal service. Try again.'
++}
++
++/**
++ * `/ads:proposal` — open the channel menu on the card that is on screen.
++ *
++ * THE ONLY WAY IN, since COD-376's review: the card used to bind a bare `m`,
++ * and `useKeyboard` is a GLOBAL listener rather than a focus-scoped one, so
++ * that letter reached the ad menu at the same time as the composer it was
++ * typed into. A slash command is the gesture a terminal already has for
++ * "address the client, not the prompt".
++ *
++ * Returns null when it did something: opening a menu is visible on its own and
++ * a system line saying so would push the card it refers to further up the
++ * transcript.
++ */
++export function handleProposalMenu(messages: ChatMessage[]): string | null {
++  const block = liveSponsoredProposal(messages)
++  if (!block) return 'No sponsored proposal on screen.'
++  useMessageBlockStore
++    .getState()
++    .callbacks.onSponsoredProposalMenu(block.target, true)
++  return null
++}
++
++/**
++ * `/ads:dismiss-proposal` — decline the card on screen.
++ *
++ * Goes through the SAME control path the menu uses rather than calling the
++ * dismiss endpoint here, so the busy guard, the `answered` bookkeeping and the
++ * failure message are the ones the card already has. A second implementation
++ * would be a second set of rules for the same gesture.
++ */
++export function handleProposalDismiss(messages: ChatMessage[]): string | null {
++  const block = liveSponsoredProposal(messages)
++  if (!block) return 'No sponsored proposal on screen.'
++  useMessageBlockStore
++    .getState()
++    .callbacks.onSponsoredProposalControl(block.target, 'dismiss')
++  return null
++}
++
++export const handleProposalReport = (
++  messages: ChatMessage[],
++): Promise<string> =>
++  withProposal(
++    messages,
++    (block, authToken) =>
++      runSponsoredProposalControl(
++        'report',
++        {
++          proposalId: block.proposal._id,
++          advertiserId: block.proposal.advertiser_id,
++        },
++        authToken,
++      ),
++    'Reported. Thanks — we review every report.',
++  )
++
++export const handleProposalNeverAdvertiser = (
++  messages: ChatMessage[],
++): Promise<string> =>
++  withProposal(
++    messages,
++    // THE SAME helper the card's menu runs, so the preference-before-dismiss
++    // ordering and its result-gating have one implementation. Two would drift,
++    // and the drift would be silent: both paths succeed on the happy path.
++    (block, authToken) =>
++      runSponsoredProposalControl(
++        'never-advertiser',
++        {
++          proposalId: block.proposal._id,
++          advertiserId: block.proposal.advertiser_id,
++        },
++        authToken,
++      ),
++    'You will not see proposals from this advertiser again.',
++  )
++
++/**
++ * Turns sponsored PROPOSALS off. Deliberately separate from `/ads:disable`,
++ * which is the display rail: the two are different channels with different
++ * controls, and one switch for both would turn off something the user did not
++ * ask about.
++ */
++export const handleProposalsOff = async (): Promise<string> => {
++  const authToken = getAuthToken()
++  if (!authToken) return 'Sign in to change sponsored proposal settings.'
++  return (await setSponsoredProposalPrefs({ optedOut: true }, authToken))
++    ? 'Sponsored proposals are off. This does not change other ads.'
++    : 'Could not reach the sponsored proposal service. Try again.'
++}
+diff --git a/cli/src/commands/command-registry.ts b/cli/src/commands/command-registry.ts
+index 820df1dec..9c381796f 100644
+--- a/cli/src/commands/command-registry.ts
++++ b/cli/src/commands/command-registry.ts
+@@ -1,6 +1,14 @@
+ import { safeOpen } from '../utils/open-url'
+ 
+-import { handleAdsEnable, handleAdsDisable } from './ads'
++import {
++  handleAdsEnable,
++  handleAdsDisable,
++  handleProposalDismiss,
++  handleProposalMenu,
++  handleProposalNeverAdvertiser,
++  handleProposalReport,
++  handleProposalsOff,
++} from './ads'
+ import { handleCopyConversationCommand } from './copy-conversation'
+ import { handleExportConversationCommand } from './export-conversation'
+ import { handleHelpCommand } from './help'
+@@ -214,6 +222,63 @@ const ALL_COMMANDS: CommandDefinition[] = [
+       clearInput(params)
+     },
+   }),
++  // The sponsored-proposal channel's controls (COD-376). Separate from
++  // ads:disable, which is the display rail: one switch for both would turn off
++  // something the user did not ask about.
++  //
++  // THE CARD ITSELF BINDS NO BARE KEYS while its menu is closed, so these are
++  // not merely a convenience for when no card is on screen -- `/ads:proposal`
++  // and `/ads:dismiss-proposal` are the ONLY way to reach the menu and the
++  // decline. `useKeyboard` is global and the composer's handler is too, so the
++  // `m` and `esc` these replaced fired alongside whatever the user was
++  // actually typing.
++  defineCommand({
++    name: 'ads:proposal',
++    handler: (params) => {
++      const message = handleProposalMenu(useChatStore.getState().messages)
++      // Null means it opened the menu, which is visible on its own; a system
++      // line would only push the card it refers to further up the transcript.
++      if (message) params.setMessages((prev) => [...prev, getSystemMessage(message)])
++      params.saveToHistory(params.inputValue.trim())
++      clearInput(params)
++    },
++  }),
++  defineCommand({
++    name: 'ads:dismiss-proposal',
++    handler: (params) => {
++      const message = handleProposalDismiss(useChatStore.getState().messages)
++      if (message) params.setMessages((prev) => [...prev, getSystemMessage(message)])
++      params.saveToHistory(params.inputValue.trim())
++      clearInput(params)
++    },
++  }),
++  defineCommand({
++    name: 'ads:report-proposal',
++    handler: async (params) => {
++      const message = await handleProposalReport(useChatStore.getState().messages)
++      params.setMessages((prev) => [...prev, getSystemMessage(message)])
++      params.saveToHistory(params.inputValue.trim())
++      clearInput(params)
++    },
++  }),
++  defineCommand({
++    name: 'ads:never-advertiser',
++    handler: async (params) => {
++      const message = await handleProposalNeverAdvertiser(useChatStore.getState().messages)
++      params.setMessages((prev) => [...prev, getSystemMessage(message)])
++      params.saveToHistory(params.inputValue.trim())
++      clearInput(params)
++    },
++  }),
++  defineCommand({
++    name: 'ads:proposals-off',
++    handler: async (params) => {
++      const message = await handleProposalsOff()
++      params.setMessages((prev) => [...prev, getSystemMessage(message)])
++      params.saveToHistory(params.inputValue.trim())
++      clearInput(params)
++    },
++  }),
+   defineCommand({
+     name: 'help',
+     aliases: ['h', '?'],
+diff --git a/cli/src/components/__tests__/__snapshots__/sponsored-proposal-frames.txt b/cli/src/components/__tests__/__snapshots__/sponsored-proposal-frames.txt
+new file mode 100644
+index 000000000..b8bc126a9
+--- /dev/null
++++ b/cli/src/components/__tests__/__snapshots__/sponsored-proposal-frames.txt
+@@ -0,0 +1,546 @@
++=== offered @ 20 ===
++┌──────────────────┐
++│ SPONSORED        │
++│ Acme Deploys     │
++│ Sponsored propos │
++│ Add one-click    │
++│ dep…             │
++│ /ads:proposal    │
++└──────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== offered @ 48 ===
++┌──────────────────────────────────────────────┐
++│ Acme Deploys                       SPONSORED │
++│ Sponsored proposal                           │
++│ Add one-click deploys to this project        │
++│ A sponsored agent can wire Acme Deploys      │
++│ into your repo on its own branch.            │
++│ /ads:proposal · /ads:dismiss-proposal        │
++└──────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== offered @ 60 ===
++┌──────────────────────────────────────────────────────────┐
++│ Acme Deploys                                   SPONSORED │
++│ Sponsored proposal                                       │
++│ Add one-click deploys to this project                    │
++│ A sponsored agent can wire Acme Deploys into your repo   │
++│ on its own branch.                                       │
++│ /ads:proposal · /ads:dismiss-proposal                    │
++└──────────────────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== accepted @ 20 ===
++┌──────────────────┐
++│ SPONSORED        │
++│ Acme Deploys     │
++│ Starting sponsor │
++│ Add one-click    │
++│ dep…             │
++│ /ads:proposal    │
++└──────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== accepted @ 48 ===
++┌──────────────────────────────────────────────┐
++│ Acme Deploys                       SPONSORED │
++│ Starting sponsored thread…                   │
++│ Add one-click deploys to this project        │
++│ /ads:proposal · /ads:dismiss-proposal        │
++└──────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== accepted @ 60 ===
++┌──────────────────────────────────────────────────────────┐
++│ Acme Deploys                                   SPONSORED │
++│ Starting sponsored thread…                               │
++│ Add one-click deploys to this project                    │
++│ /ads:proposal · /ads:dismiss-proposal                    │
++└──────────────────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== running @ 20 ===
++┌──────────────────┐
++│ SPONSORED        │
++│ Acme Deploys     │
++│ Sponsored thread │
++│ Add one-click    │
++│ dep…             │
++│ 1/3              │
++│ Done  Install th │
++│ In progress  Wir │
++│ Pending  Open a  │
++│ /ads:proposal    │
++└──────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== running @ 48 ===
++┌──────────────────────────────────────────────┐
++│ Acme Deploys                       SPONSORED │
++│ Sponsored thread running                     │
++│ Add one-click deploys to this project        │
++│ 1/3                                          │
++│ Done  Install the SDK                        │
++│ In progress  Wire the deploy hook            │
++│ Pending  Open a pull request                 │
++│ /ads:proposal · /ads:dismiss-proposal        │
++└──────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== running @ 60 ===
++┌──────────────────────────────────────────────────────────┐
++│ Acme Deploys                                   SPONSORED │
++│ Sponsored thread running                                 │
++│ Add one-click deploys to this project                    │
++│ 1/3                                                      │
++│ Done  Install the SDK                                    │
++│ In progress  Wire the deploy hook                        │
++│ Pending  Open a pull request                             │
++│ /ads:proposal · /ads:dismiss-proposal                    │
++└──────────────────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== committed @ 20 ===
++┌──────────────────┐
++│ SPONSORED        │
++│ Acme Deploys     │
++│ Sponsored thread │
++│ Add one-click    │
++│ dep…             │
++│ Committed to     │
++│ sponsored/acme-  │
++│ deploys.         │
++│ Nothing was      │
++│ pushed to your   │
++│ repository.      │
++│ /ads:proposal    │
++└──────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++=== committed @ 48 ===
++┌──────────────────────────────────────────────┐
++│ Acme Deploys                       SPONSORED │
++│ Sponsored thread committed its work          │
++│ Add one-click deploys to this project        │
++│ Committed to sponsored/acme-deploys.         │
++│ Nothing was pushed to your repository.       │
++│ /ads:proposal · /ads:dismiss-proposal        │
++└──────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== committed @ 60 ===
++┌──────────────────────────────────────────────────────────┐
++│ Acme Deploys                                   SPONSORED │
++│ Sponsored thread committed its work                      │
++│ Add one-click deploys to this project                    │
++│ Committed to sponsored/acme-deploys. Nothing was pushed  │
++│ to your repository.                                      │
++│ /ads:proposal · /ads:dismiss-proposal                    │
++└──────────────────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== landed @ 20 ===
++┌──────────────────┐
++│ SPONSORED        │
++│ Acme Deploys     │
++│ Sponsored thread │
++│ Add one-click    │
++│ dep…             │
++│ Review the pull  │
++│ /ads:proposal    │
++└──────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== landed @ 48 ===
++┌──────────────────────────────────────────────┐
++│ Acme Deploys                       SPONSORED │
++│ Sponsored thread landed a PR                 │
++│ Add one-click deploys to this project        │
++│ Review the pull request: https://github.com/ │
++│ /ads:proposal · /ads:dismiss-proposal        │
++└──────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== landed @ 60 ===
++┌──────────────────────────────────────────────────────────┐
++│ Acme Deploys                                   SPONSORED │
++│ Sponsored thread landed a PR                             │
++│ Add one-click deploys to this project                    │
++│ Review the pull request: https://github.com/x/y/pull/7   │
++│ /ads:proposal · /ads:dismiss-proposal                    │
++└──────────────────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== failed @ 20 ===
++┌──────────────────┐
++│ SPONSORED        │
++│ Acme Deploys     │
++│ Sponsored thread │
++│ Add one-click    │
++│ dep…             │
++│ Budget exceeded  │
++│ /ads:proposal    │
++└──────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== failed @ 48 ===
++┌──────────────────────────────────────────────┐
++│ Acme Deploys                       SPONSORED │
++│ Sponsored thread failed                      │
++│ Add one-click deploys to this project        │
++│ Budget exceeded                              │
++│ /ads:proposal · /ads:dismiss-proposal        │
++└──────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== failed @ 60 ===
++┌──────────────────────────────────────────────────────────┐
++│ Acme Deploys                                   SPONSORED │
++│ Sponsored thread failed                                  │
++│ Add one-click deploys to this project                    │
++│ Budget exceeded                                          │
++│ /ads:proposal · /ads:dismiss-proposal                    │
++└──────────────────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== merged @ 20 ===
++┌──────────────────┐
++│ SPONSORED        │
++│ Acme Deploys     │
++│ Sponsored PR mer │
++│ Add one-click    │
++│ dep…             │
++│ view on GitHub:  │
++│ /ads:proposal    │
++└──────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== merged @ 48 ===
++┌──────────────────────────────────────────────┐
++│ Acme Deploys                       SPONSORED │
++│ Sponsored PR merged                          │
++│ Add one-click deploys to this project        │
++│ view on GitHub: https://github.com/x/y/pull/ │
++│ /ads:proposal · /ads:dismiss-proposal        │
++└──────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++=== merged @ 60 ===
++┌──────────────────────────────────────────────────────────┐
++│ Acme Deploys                                   SPONSORED │
++│ Sponsored PR merged                                      │
++│ Add one-click deploys to this project                    │
++│ view on GitHub: https://github.com/x/y/pull/7            │
++│ /ads:proposal · /ads:dismiss-proposal                    │
++└──────────────────────────────────────────────────────────┘
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+diff --git a/cli/src/components/__tests__/message-with-agents.test.tsx b/cli/src/components/__tests__/message-with-agents.test.tsx
+index d2b1e43f5..41ef5a129 100644
+--- a/cli/src/components/__tests__/message-with-agents.test.tsx
++++ b/cli/src/components/__tests__/message-with-agents.test.tsx
+@@ -91,6 +91,9 @@ const defaultCallbacks = {
+   onAdClick: () => {},
+   onAdImpression: () => {},
+   onResponseAdsNeeded: () => {},
++  onSponsoredProposalMenu: () => {},
++  onSponsoredProposalDisclose: () => {},
++  onSponsoredProposalControl: () => {},
+ }
+ 
+ const initializeStore = (overrides: {
+@@ -208,6 +211,9 @@ describe('MessageBlockStore', () => {
+         onAdClick: () => {},
+         onAdImpression: () => {},
+         onResponseAdsNeeded: () => {},
++  onSponsoredProposalMenu: () => {},
++  onSponsoredProposalDisclose: () => {},
++  onSponsoredProposalControl: () => {},
+       })
+ 
+       const state = useMessageBlockStore.getState()
+@@ -263,6 +269,9 @@ describe('MessageBlockStore', () => {
+         onAdClick: mockFn,
+         onAdImpression: mockFn,
+         onResponseAdsNeeded: mockFn,
++        onSponsoredProposalMenu: mockFn,
++        onSponsoredProposalDisclose: mockFn,
++        onSponsoredProposalControl: mockFn,
+       })
+ 
+       useMessageBlockStore.getState().reset()
+diff --git a/cli/src/components/__tests__/sponsored-proposal-block.test.tsx b/cli/src/components/__tests__/sponsored-proposal-block.test.tsx
+new file mode 100644
+index 000000000..709b2c2c4
+--- /dev/null
++++ b/cli/src/components/__tests__/sponsored-proposal-block.test.tsx
+@@ -0,0 +1,401 @@
++/**
++ * The CLI's R layer of the sponsored-proposal conformance matrix (COD-376).
++ *
++ * Rows come from the SHARED fixtures in `@codebuff/common`, not from literals
++ * here: the whole claim being tested is that three surfaces render the same
++ * bytes, and a fixture written in this file would be the CLI grading its own
++ * homework.
++ *
++ * Three widths, because a terminal is the only surface whose layout can be
++ * taken away from it: 60 is a comfortable pane, 48 a split, and 20 is the floor
++ * where the "SPONSORED" marker and the advertiser name must both still survive
++ * -- body copy goes first, the headline last.
++ *
++ * TWO CHECKS ARE WAIVED HERE AND THE WAIVERS ARE ASSERTED, not just declared:
++ * R-15 (a link) becomes sanitized text, and R-16/R-17 (a logo) becomes the
++ * advertiser's name with no request minted. A waiver nobody tests is a gap
++ * nobody notices.
++ */
++import {
++  HOSTILE_PR_URLS,
++  MALFORMED_LOGO_TOKENS,
++  SPONSORED_FIXTURE_STATES,
++  SPONSORED_ROW_FIXTURES,
++  VALID_LOGO_TOKEN,
++} from '@codebuff/common/ads/__fixtures__/sponsored-proposal-rows'
++import { createTestRenderer } from '@opentui/core/testing'
++import { createRoot, flushSync } from '@opentui/react'
++import { afterEach, beforeAll, describe, expect, test } from 'bun:test'
++import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
++import { dirname, join } from 'node:path'
++
++import React from 'react'
++
++import { SponsoredProposalBlock, hintFor } from '../blocks/sponsored-proposal-block'
++import { initializeThemeStore } from '../../hooks/use-theme'
++import { useMessageBlockStore } from '../../state/message-block-store'
++
++import type {
++  SponsoredProposalContentBlock,
++  ContentBlock,
++} from '../../types/chat'
++import type { SponsoredProposalRow } from '@codebuff/common/ads/sponsored-proposal-view'
++
++beforeAll(() => {
++  initializeThemeStore()
++})
++
++const WIDTHS = [20, 48, 60] as const
++
++const blockFor = (
++  row: SponsoredProposalRow,
++  over: Partial<SponsoredProposalContentBlock> = {},
++): SponsoredProposalContentBlock => ({
++  type: 'sponsored-proposal',
++  target: 'acme/deploys',
++  proposal: { ...row, _id: 'proposal-1', advertiser_id: 'adv_acme' },
++  ...over,
++})
++
++const render = async (
++  block: SponsoredProposalContentBlock,
++  width: number,
++): Promise<string> => {
++  const setup = await createTestRenderer({ width, height: 24 })
++  const root = createRoot(setup.renderer)
++  flushSync(() => {
++    root.render(<SponsoredProposalBlock block={block} availableWidth={width} />)
++  })
++  try {
++    await setup.renderOnce()
++    return setup.captureCharFrame()
++  } finally {
++    flushSync(() => root.unmount())
++    setup.renderer.destroy()
++  }
++}
++
++describe('every state, at every width', () => {
++  for (const width of WIDTHS) {
++    test(`R-1 / R-19 the disclosure and the advertiser survive at ${width} columns`, async () => {
++      for (const state of SPONSORED_FIXTURE_STATES) {
++        const frame = await render(blockFor(SPONSORED_ROW_FIXTURES[state]), width)
++        // The two things that may never be dropped: that this is an ad, and
++        // whose. At 20 columns everything else is negotiable.
++        expect(frame, `${state} at ${width}`).toContain('SPONSORED')
++        expect(frame, `${state} at ${width}`).toContain('Acme')
++      }
++    })
++  }
++
++  test('R-3 is waived: there is no Accept control in any state, at any width', async () => {
++    // Phase 1's acceptance criterion, asserted rather than promised. An Accept
++    // here would spawn a Cloud thread against a folder that is not a Cloud
++    // project, so it is absent — not disabled, not stubbed.
++    for (const state of SPONSORED_FIXTURE_STATES) {
++      for (const width of WIDTHS) {
++        const frame = await render(blockFor(SPONSORED_ROW_FIXTURES[state]), width)
++        expect(frame, `${state} at ${width}`).not.toContain('Start sponsored thread')
++        expect(frame, `${state} at ${width}`).not.toContain('Accept')
++      }
++    }
++  })
++
++  test('R-2 every state offers the same one decline, and names it', async () => {
++    // The decline is a COMMAND, not a key. The card used to say "esc dismiss",
++    // and `useKeyboard` is a global listener -- so that Esc reached the card at
++    // the same time as whatever the user was actually cancelling.
++    for (const state of SPONSORED_FIXTURE_STATES) {
++      expect(await render(blockFor(SPONSORED_ROW_FIXTURES[state]), 60)).toContain(
++        '/ads:dismiss-proposal',
++      )
++    }
++  })
++})
++
++describe('states that carry more than a headline', () => {
++  test('R-5 running renders the todo-dock vocabulary and the count', async () => {
++    const frame = await render(blockFor(SPONSORED_ROW_FIXTURES.running), 60)
++    expect(frame).toContain('1/3')
++    expect(frame).toContain('In progress')
++    expect(frame).toContain('Wire the deploy hook')
++  })
++
++  test('R-7 / R-8 / R-10 committed names the branch and claims no PR', async () => {
++    const frame = await render(blockFor(SPONSORED_ROW_FIXTURES.committed), 60)
++    expect(frame).toContain('sponsored/acme-deploys')
++    expect(frame).toContain('Nothing was pushed')
++    expect(frame).not.toContain('http')
++  })
++
++  test('R-8 an absent branch drops the clause rather than guessing one', async () => {
++    const frame = await render(
++      blockFor({ ...SPONSORED_ROW_FIXTURES.committed, branch: undefined }),
++      60,
++    )
++    expect(frame).toContain('its own branch')
++    expect(frame).not.toContain('sponsored/acme-deploys')
++  })
++
++  test('R-12 failed shows the reason', async () => {
++    expect(await render(blockFor(SPONSORED_ROW_FIXTURES.failed), 60)).toContain(
++      'Budget exceeded',
++    )
++  })
++})
++
++describe('the two waivers, asserted', () => {
++  test('R-15 is waived: an https PR is sanitized TEXT, never a link', async () => {
++    const frame = await render(blockFor(SPONSORED_ROW_FIXTURES.landed), 60)
++    // A terminal cannot make a link; it can print a destination the user may
++    // copy. What must still hold is that only a gated URL is ever printed.
++    expect(frame).toContain('https://github.com/x/y/pull/7')
++  })
++
++  test('R-14 no hostile URL is ever printed, and the card survives', async () => {
++    for (const state of ['landed', 'merged'] as const) {
++      for (const pr_url of HOSTILE_PR_URLS) {
++        const frame = await render(
++          blockFor({ ...SPONSORED_ROW_FIXTURES[state], pr_url }),
++          60,
++        )
++        if (pr_url.length > 0) {
++          expect(frame, `${state}: ${pr_url}`).not.toContain(pr_url.slice(0, 12))
++        }
++        // Losing the link costs a click; losing the card would withhold the
++        // news that a sponsored thread reached the user's repository.
++        expect(frame, `${state}: ${pr_url}`).toContain('SPONSORED')
++      }
++    }
++  })
++
++  test('R-16 / R-17 are waived: no logo is fetched, and the token never appears', async () => {
++    // The strongest form this surface can state it in: a valid token, three
++    // malformed ones and no token at all all render the same frame.
++    const noToken = await render(blockFor(SPONSORED_ROW_FIXTURES.offered), 60)
++    for (const token of [VALID_LOGO_TOKEN, ...MALFORMED_LOGO_TOKENS]) {
++      const frame = await render(
++        blockFor({
++          ...SPONSORED_ROW_FIXTURES.offered,
++          advertiser_logo_token: token,
++        }),
++        60,
++      )
++      expect(frame, JSON.stringify(token)).toBe(noToken)
++      expect(frame).not.toContain('creative-image')
++    }
++  })
++})
++
++/**
++ * The frames themselves, checked in.
++ *
++ * The assertions above say what must be present; this says what it LOOKS like,
++ * which is the half a terminal card actually gets wrong -- a clipped headline,
++ * a wrapped disclosure, a step column that eats the step text. Reviewing a diff
++ * of these is the only way that shows up before a user sees it.
++ *
++ * Regenerate deliberately: `UPDATE_PROPOSAL_FRAMES=1 bun test
++ * sponsored-proposal-block`. A frame that changed without anyone intending it
++ * fails here, which is the point.
++ */
++describe('checked-in frames', () => {
++  const SNAPSHOT = join(import.meta.dir, '__snapshots__', 'sponsored-proposal-frames.txt')
++
++  test('every state at 20, 48 and 60 columns', async () => {
++    const sections: string[] = []
++    for (const state of SPONSORED_FIXTURE_STATES) {
++      for (const width of WIDTHS) {
++        const frame = await render(blockFor(SPONSORED_ROW_FIXTURES[state]), width)
++        sections.push(
++          `=== ${state} @ ${width} ===\n${frame.replace(/[ \t]+$/gm, '')}`,
++        )
++      }
++    }
++    const rendered = `${sections.join('\n')}\n`
++    if (process.env.UPDATE_PROPOSAL_FRAMES === '1') {
++      mkdirSync(dirname(SNAPSHOT), { recursive: true })
++      writeFileSync(SNAPSHOT, rendered)
++    }
++    expect(
++      readFileSync(SNAPSHOT, 'utf8'),
++      'frames changed -- review the diff, then UPDATE_PROPOSAL_FRAMES=1 to accept',
++    ).toBe(rendered)
++  })
++})
++
++describe('the block itself', () => {
++  test('is a plain serializable block, not html', () => {
++    // `HtmlContentBlock` cannot survive being written to history and read back,
++    // and this card has to: a proposal outlives the turn it arrived on.
++    const block: ContentBlock = blockFor(SPONSORED_ROW_FIXTURES.offered)
++    expect(JSON.parse(JSON.stringify(block))).toEqual(block)
++  })
++
++  test('the hint names commands while the menu is closed, and keys while it is open', () => {
++    // The closed hint may not name a bare key, because the card binds none --
++    // and a hint naming a key that does nothing is worse than no hint.
++    const closed = hintFor(false)
++    expect(closed).toContain('/ads:proposal')
++    expect(closed).toContain('/ads:dismiss-proposal')
++    // Two columns of padding the card's own `inner` does not account for, so
++    // the widest line it may emit is narrower than `inner` suggests.
++    expect(closed.length).toBeLessThanOrEqual(44)
++    for (const key of ['esc dismiss', 'm options', 'enter open PR']) {
++      expect(closed).not.toContain(key)
++    }
++    // Naming an Accept the surface does not have is how a Phase 1 card starts
++    // looking like it can run a sponsored thread.
++    expect(closed.toLowerCase()).not.toContain('accept')
++
++    // The open menu is the one span the card owns the keyboard, and chat's is
++    // disabled for exactly it.
++    expect(hintFor(true)).toContain('esc close')
++    expect(hintFor(true).toLowerCase()).not.toContain('accept')
++  })
++
++  test('a narrow hint never clips a command mid-token', () => {
++    // A truncated `/ads:dismiss-propos` teaches a command that does not exist.
++    for (const width of [0, 1, 5, 13, 20, 30, 36, 37, 44]) {
++      const hint = hintFor(false, width)
++      expect(hint.length, `width ${width}`).toBeLessThanOrEqual(width)
++      if (hint.length > 0) {
++        for (const token of hint.split(' · ')) {
++          expect(
++            ['/ads:proposal', '/ads:dismiss-proposal'],
++            `width ${width}`,
++          ).toContain(token)
++        }
++      }
++    }
++  })
++})
++
++/**
++ * WHAT THE CARD DOES WITH A KEYPRESS, which is the finding this section exists
++ * for.
++ *
++ * `useKeyboard` registers a GLOBAL listener; it is not scoped to a focused
++ * element. Chat's composer has a global handler of its own and does not stop
++ * firing because a transcript block exists, so every bare key this card used to
++ * claim reached BOTH: typing `m` into a prompt opened an ad's menu, and an Esc
++ * aimed at something else was recorded as a decline the user never made.
++ *
++ * So while the menu is closed the card must claim NOTHING. While it is open,
++ * `chat.tsx` disables the chat keyboard for exactly that span -- the same
++ * `disabled` prop askUser uses -- which is what makes the arrows, Enter and Esc
++ * below safe to own.
++ */
++describe('the card claims no bare keys while its menu is closed', () => {
++  type Call = [string, ...unknown[]]
++
++  let cleanupKeys: (() => void) | undefined
++  afterEach(() => {
++    cleanupKeys?.()
++    cleanupKeys = undefined
++  })
++
++  const mount = async (block: SponsoredProposalContentBlock) => {
++    const calls: Call[] = []
++    useMessageBlockStore.getState().setCallbacks({
++      ...useMessageBlockStore.getState().callbacks,
++      onSponsoredProposalMenu: (target, open) =>
++        calls.push(['menu', target, open]),
++      onSponsoredProposalDisclose: (target, open) =>
++        calls.push(['disclose', target, open]),
++      onSponsoredProposalControl: (target, control) =>
++        calls.push(['control', target, control]),
++    })
++    const setup = await createTestRenderer({
++      width: 60,
++      height: 24,
++      // Unambiguous encoding: a bare Escape is otherwise indistinguishable
++      // from the start of the next key's sequence, which is exactly the key
++      // whose behaviour this section is about.
++      kittyKeyboard: true,
++    })
++    const root = createRoot(setup.renderer)
++    cleanupKeys = () => {
++      flushSync(() => root.unmount())
++      setup.renderer.destroy()
++      useMessageBlockStore.getState().reset()
++    }
++    flushSync(() => {
++      root.render(<SponsoredProposalBlock block={block} availableWidth={60} />)
++    })
++    await setup.renderOnce()
++
++    /** Input lands on the render loop and the state it sets is committed by
++     *  React's scheduler, so both drain before the next keypress. */
++    const settle = async () => {
++      await setup.renderOnce()
++      await new Promise((resolve) => setTimeout(resolve, 20))
++      await setup.renderOnce()
++    }
++    await settle()
++    return {
++      calls,
++      input: setup.mockInput,
++      async press(act: () => void) {
++        act()
++        await settle()
++      },
++    }
++  }
++
++  test('m, esc, enter and the arrows all do nothing on a closed card', async () => {
++    const card = await mount(blockFor(SPONSORED_ROW_FIXTURES.offered))
++    await card.press(() => card.input.pressKey('m'))
++    await card.press(() => card.input.pressEscape())
++    await card.press(() => card.input.pressEnter())
++    await card.press(() => card.input.pressArrow('down'))
++    expect(card.calls).toEqual([])
++  })
++
++  test('enter does not open a pull request either, even when the row has one', async () => {
++    // The one bare binding that looked harmless. It is not: Enter is the
++    // composer's submit, so a landed proposal sitting in the transcript meant
++    // every message the user sent also tried to launch a browser.
++    const card = await mount(blockFor(SPONSORED_ROW_FIXTURES.landed))
++    await card.press(() => card.input.pressEnter())
++    expect(card.calls).toEqual([])
++  })
++
++  test('an OPEN menu takes the arrows and Enter', async () => {
++    const card = await mount(
++      blockFor(SPONSORED_ROW_FIXTURES.offered, { menuOpen: true }),
++    )
++    await card.press(() => card.input.pressArrow('down'))
++    await card.press(() => card.input.pressEnter())
++    // Down moved off `why` onto the second item, which the shared menu order
++    // fixes as never-this-advertiser.
++    expect(card.calls).toEqual([
++      ['menu', 'acme/deploys', false],
++      ['control', 'acme/deploys', 'never-advertiser'],
++    ])
++  })
++
++  test('Esc closes the MENU and never answers the proposal', async () => {
++    // The old binding dismissed. "I opened this by accident" is the single
++    // most likely reason a user presses Esc here, and recording it as a
++    // decline is an answer they did not give.
++    const card = await mount(
++      blockFor(SPONSORED_ROW_FIXTURES.offered, { menuOpen: true }),
++    )
++    await card.press(() => card.input.pressEscape())
++    expect(card.calls).toEqual([['menu', 'acme/deploys', false]])
++  })
++
++  test('an answered card activates nothing, but can still close its menu', async () => {
++    const card = await mount(
++      blockFor(SPONSORED_ROW_FIXTURES.offered, {
++        menuOpen: true,
++        answ
+
+… [diff truncated — view full diff on GitHub] …

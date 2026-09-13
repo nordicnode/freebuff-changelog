@@ -1,0 +1,191 @@
+diff --git a/sdk/src/__tests__/clone-session-state.test.ts b/sdk/src/__tests__/clone-session-state.test.ts
+new file mode 100644
+index 000000000..ad80a72d5
+--- /dev/null
++++ b/sdk/src/__tests__/clone-session-state.test.ts
+@@ -0,0 +1,121 @@
++import { getInitialSessionState } from '@codebuff/common/types/session-state'
++import { getStubProjectFileContext } from '@codebuff/common/util/file'
++import { describe, expect, it } from 'bun:test'
++
++import { cloneSessionState } from '../run'
++
++import type { SessionState } from '@codebuff/common/types/session-state'
++
++function makeSession(): SessionState {
++  const state = getInitialSessionState(getStubProjectFileContext())
++  state.mainAgentState.messageHistory = [
++    { role: 'user', content: [{ type: 'text', text: 'hello' }] } as any,
++    {
++      role: 'assistant',
++      content: [{ type: 'text', text: 'world' }],
++    } as any,
++  ]
++  return state
++}
++
++describe('cloneSessionState', () => {
++  it('returns a structurally-equal copy', () => {
++    const source = makeSession()
++    const clone = cloneSessionState(source)
++    expect(clone).toEqual(source)
++  })
++
++  it('is a deep copy: mutating the clone does not affect the source', () => {
++    const source = makeSession()
++    const clone = cloneSessionState(source)
++
++    // Append to the clone's history (the actual use: pushing an interruption
++    // message onto a snapshot).
++    clone.mainAgentState.messageHistory.push({
++      role: 'user',
++      content: [{ type: 'text', text: 'interrupted' }],
++    } as any)
++    // Mutate a nested content block in the clone.
++    ;(clone.mainAgentState.messageHistory[0] as any).content[0].text = 'changed'
++
++    expect(source.mainAgentState.messageHistory).toHaveLength(2)
++    expect(
++      (source.mainAgentState.messageHistory[0] as any).content[0].text,
++    ).toBe('hello')
++  })
++
++  it('deep-copies mainAgentState but shares fileContext by reference', () => {
++    const source = makeSession()
++    const clone = cloneSessionState(source)
++
++    // mainAgentState (where in-place mutations happen) is an independent copy.
++    expect(clone.mainAgentState).not.toBe(source.mainAgentState)
++    expect(clone.mainAgentState.messageHistory).not.toBe(
++      source.mainAgentState.messageHistory,
++    )
++    // fileContext is intentionally shared: it's large, effectively read-only
++    // during a run, so copying it is wasted work.
++    expect(clone.fileContext).toBe(source.fileContext)
++  })
++
++  it('shares fileContext even when it holds a non-JSON-cloneable value', () => {
++    const source = makeSession()
++    // MCP tools can place Zod schemas (with methods) in customToolDefinitions.
++    // Sharing fileContext means this never affects the clone path.
++    ;(source.fileContext as any).customToolDefinitions = {
++      mcpTool: { inputSchema: { parse: () => ({}), _def: {} } },
++    }
++
++    const clone = cloneSessionState(source)
++
++    expect(clone.mainAgentState).not.toBe(source.mainAgentState)
++    expect(clone.fileContext).toBe(source.fileContext)
++    expect((clone.fileContext as any).customToolDefinitions.mcpTool).toBe(
++      (source.fileContext as any).customToolDefinitions.mcpTool,
++    )
++  })
++
++  it('clones message content with URL / Buffer instances without throwing', () => {
++    // The message schema permits URL and Buffer in image/file content.
++    // structuredClone throws on URL; the JSON round-trip must not, and must
++    // produce the same bytes the snapshot is ultimately persisted as.
++    const source = makeSession()
++    source.mainAgentState.messageHistory.push({
++      role: 'user',
++      content: [
++        { type: 'image', image: new URL('https://example.com/a.png') },
++        { type: 'file', data: Buffer.from('hello'), mediaType: 'text/plain' },
++      ],
++    } as any)
++
++    const clone = cloneSessionState(source)
++
++    // Independent copy, and byte-parity with JSON persistence of the source.
++    expect(clone.mainAgentState).not.toBe(source.mainAgentState)
++    expect(JSON.stringify(clone.mainAgentState)).toBe(
++      JSON.stringify(source.mainAgentState),
++    )
++  })
++
++  it('falls back to a deep copy when JSON.stringify throws (circular ref)', () => {
++    const source = makeSession()
++    // A circular reference makes JSON.stringify throw, forcing the cloneDeep
++    // fallback (cloneDeep handles cycles) so a snapshot can never fail to build.
++    const circular: any = { self: null }
++    circular.self = circular
++    ;(source.mainAgentState as any).output = circular
++
++    const clone = cloneSessionState(source)
++
++    expect(clone.mainAgentState).not.toBe(source.mainAgentState)
++    expect(clone.mainAgentState.messageHistory).not.toBe(
++      source.mainAgentState.messageHistory,
++    )
++    // Mutating the fallback clone must not affect the source either.
++    clone.mainAgentState.messageHistory.push({
++      role: 'user',
++      content: [{ type: 'text', text: 'x' }],
++    } as any)
++    expect(source.mainAgentState.messageHistory).toHaveLength(2)
++  })
++})
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 1c7c08719..0b3a4a442 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -192,6 +192,50 @@ const STATE_SNAPSHOT_INTERVAL_MS = 5_000
+ export const STATE_SNAPSHOT_INTERRUPTION_MESSAGE =
+   'The session ended before this response completed. Partial progress has been preserved.'
+ 
++/**
++ * Copy a SessionState for a checkpoint / cancellation snapshot: the caller
++ * appends an interruption message and must not disturb the live session.
++ *
++ * lodash cloneDeep of the whole session is expensive — ~230ms on an ~8 MB
++ * session — and this runs on the CLI's render/input thread every ~5s at each
++ * in-flight snapshot, a major source of long-session freezes.
++ *
++ * Only mainAgentState needs an independent copy: the mutations that would
++ * otherwise bleed into an already-captured snapshot all live there —
++ * messageHistory (.push), agentContext subgoals (update_subgoal). We copy it
++ * with a JSON round-trip, which is ~50x faster than cloneDeep (~4ms). The
++ * snapshot is only ever consumed as JSON — persisted to disk, and re-serialized
++ * when fed back as previousRunState — so a JSON round-trip is byte-for-byte
++ * parity with the prior cloneDeep→JSON.stringify path. It also can't choke on
++ * the URL / Buffer / Uint8Array instances the message schema permits in
++ * image/file content (structuredClone throws on URL and rewrites
++ * Buffer→Uint8Array; both change the persisted bytes or fall back).
++ *
++ * fileContext is large, effectively read-only during a run, and already
++ * persisted as-is, so we share it by reference rather than copy it.
++ *
++ * Falls back to cloneDeep only if JSON.stringify throws (circular refs /
++ * BigInt — which AgentState isn't expected to contain, as it uses IDs rather
++ * than object back-refs) so a snapshot — or the final error state, which shares
++ * this path — can never fail to build.
++ */
++export function cloneSessionState(
++  state: SessionState,
++  logger?: Logger,
++): SessionState {
++  let mainAgentState: SessionState['mainAgentState']
++  try {
++    mainAgentState = JSON.parse(JSON.stringify(state.mainAgentState))
++  } catch (error) {
++    logger?.debug?.(
++      { error: error instanceof Error ? error.message : String(error) },
++      'JSON clone of mainAgentState failed; falling back to cloneDeep',
++    )
++    mainAgentState = cloneDeep(state.mainAgentState)
++  }
++  return { fileContext: state.fileContext, mainAgentState }
++}
++
+ const createAbortError = (signal?: AbortSignal) => {
+   if (signal?.reason instanceof Error) {
+     return signal.reason
+@@ -362,7 +406,7 @@ async function runOnce({
+     const runtimeMadeProgress =
+       sessionState.mainAgentState.messageHistory !== initialMessageHistory
+ 
+-    const state = cloneDeep(sessionState)
++    const state = cloneSessionState(sessionState, logger)
+ 
+     // Only add the user's message if the runtime didn't get a chance to add it.
+     if (!runtimeMadeProgress && (prompt || preparedContent)) {

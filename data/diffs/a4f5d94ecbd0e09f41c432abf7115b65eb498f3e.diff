@@ -1,0 +1,244 @@
+diff --git a/cli/src/utils/analytics.ts b/cli/src/utils/analytics.ts
+index 7fdfa639c..7cfd1686f 100644
+--- a/cli/src/utils/analytics.ts
++++ b/cli/src/utils/analytics.ts
+@@ -10,8 +10,11 @@ import {
+   DEBUG_ANALYTICS,
+ } from '@codebuff/common/env'
+ import { shouldTrackAnalyticsEvent } from '@codebuff/common/util/analytics-sampling'
++import { shouldMirrorAnalyticsEvent } from '@codebuff/common/util/log-mirror'
+ 
+-import type { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
++import { enqueueClientLog } from './log-shipper'
++
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ 
+ 
+ // Re-export types from core for backwards compatibility
+@@ -229,6 +232,26 @@ export function trackEvent(
+       properties,
+     })
+   }
++
++  // Mirror analytics events into the Axiom logs sink too (PostHog stays the
++  // product-analytics source of truth). The shipper batches and ships even
++  // before login (anonymously), so pre-auth events like app_launched reach
++  // Axiom — making install→login funnels queryable in APL. We correlate on the
++  // anonymous/run id so pre- and post-login events join. CLI_LOG is excluded
++  // because the logger already mirrors log rows to Axiom (avoids double-ship).
++  if (event !== AnalyticsEvent.CLI_LOG && shouldMirrorAnalyticsEvent(event)) {
++    try {
++      enqueueClientLog({
++        level: 'info',
++        event,
++        message: event,
++        client_session_id: anonymousId ?? currentUserId,
++        data: properties,
++      })
++    } catch {
++      // Best-effort mirror; never let it affect analytics or the app.
++    }
++  }
+ }
+ 
+ export function identifyUser(userId: string, properties?: Record<string, any>) {
+diff --git a/cli/src/utils/log-shipper.ts b/cli/src/utils/log-shipper.ts
+index 39759ad1d..73c4989c8 100644
+--- a/cli/src/utils/log-shipper.ts
++++ b/cli/src/utils/log-shipper.ts
+@@ -71,16 +71,19 @@ export async function flushClientLogs(): Promise<void> {
+   const batch = buffer.splice(0, MAX_BATCH)
+   try {
+     const client = getApiClient()
+-    if (!client.authToken) {
+-      // Not logged in yet — put the batch back (bounded by MAX_BUFFER) so we
+-      // can ship it once auth is available.
+-      buffer.unshift(...batch)
+-      return
+-    }
++    // Ship whether or not we're logged in. With a token the server stamps the
++    // authenticated user_id; without one it accepts the batch anonymously
++    // (rate-limited, user_id=null) so pre-auth events like app_launched still
++    // reach Axiom. Records carry client_session_id for correlation. See
++    // /api/logs and docs/logging.md.
+     await client.post(
+       '/api/logs',
+       { records: batch },
+-      { includeAuth: true, retry: false, timeoutMs: 5_000 },
++      {
++        includeAuth: Boolean(client.authToken),
++        retry: false,
++        timeoutMs: 5_000,
++      },
+     )
+   } catch {
+     // Best-effort: drop on error rather than risk unbounded growth.
+diff --git a/common/src/util/__tests__/log-mirror.test.ts b/common/src/util/__tests__/log-mirror.test.ts
+new file mode 100644
+index 000000000..3d4bf9d18
+--- /dev/null
++++ b/common/src/util/__tests__/log-mirror.test.ts
+@@ -0,0 +1,31 @@
++import { describe, expect, it } from 'bun:test'
++
++import {
++  AXIOM_MIRROR_DENYLIST,
++  shouldMirrorAnalyticsEvent,
++} from '../log-mirror'
++
++describe('shouldMirrorAnalyticsEvent', () => {
++  it('drops high-volume PostHog auto-events from the Axiom mirror', () => {
++    for (const denied of AXIOM_MIRROR_DENYLIST) {
++      expect(shouldMirrorAnalyticsEvent(denied)).toBe(false)
++    }
++    expect(shouldMirrorAnalyticsEvent('$snapshot')).toBe(false)
++    expect(shouldMirrorAnalyticsEvent('$autocapture')).toBe(false)
++  })
++
++  it('keeps named product events and useful $ events', () => {
++    expect(shouldMirrorAnalyticsEvent('cli.login')).toBe(true)
++    expect(shouldMirrorAnalyticsEvent('cli.app_launched')).toBe(true)
++    expect(shouldMirrorAnalyticsEvent('web.signup')).toBe(true)
++    expect(shouldMirrorAnalyticsEvent('$pageview')).toBe(true)
++    expect(shouldMirrorAnalyticsEvent('$identify')).toBe(true)
++    expect(shouldMirrorAnalyticsEvent('$exception')).toBe(true)
++  })
++
++  it('treats empty/null event names as mirror-eligible (logs without an event)', () => {
++    expect(shouldMirrorAnalyticsEvent(null)).toBe(true)
++    expect(shouldMirrorAnalyticsEvent(undefined)).toBe(true)
++    expect(shouldMirrorAnalyticsEvent('')).toBe(true)
++  })
++})
+diff --git a/common/src/util/__tests__/rate-limit.test.ts b/common/src/util/__tests__/rate-limit.test.ts
+new file mode 100644
+index 000000000..3cae45d99
+--- /dev/null
++++ b/common/src/util/__tests__/rate-limit.test.ts
+@@ -0,0 +1,28 @@
++import { describe, expect, it } from 'bun:test'
++
++import { createFixedWindowRateLimiter } from '../rate-limit'
++
++describe('createFixedWindowRateLimiter', () => {
++  it('allows up to `max` requests per window, then limits', () => {
++    const rl = createFixedWindowRateLimiter({ windowMs: 1000, max: 3 })
++    const t = 0
++    expect(rl.limited('a', t)).toBe(false) // 1
++    expect(rl.limited('a', t)).toBe(false) // 2
++    expect(rl.limited('a', t)).toBe(false) // 3
++    expect(rl.limited('a', t)).toBe(true) // 4 -> over
++  })
++
++  it('resets after the window elapses', () => {
++    const rl = createFixedWindowRateLimiter({ windowMs: 1000, max: 1 })
++    expect(rl.limited('a', 0)).toBe(false)
++    expect(rl.limited('a', 500)).toBe(true) // still in window
++    expect(rl.limited('a', 1000)).toBe(false) // window rolled over
++  })
++
++  it('tracks keys independently', () => {
++    const rl = createFixedWindowRateLimiter({ windowMs: 1000, max: 1 })
++    expect(rl.limited('a', 0)).toBe(false)
++    expect(rl.limited('b', 0)).toBe(false) // different key, own budget
++    expect(rl.limited('a', 0)).toBe(true)
++  })
++})
+diff --git a/common/src/util/log-mirror.ts b/common/src/util/log-mirror.ts
+new file mode 100644
+index 000000000..dfbc780b1
+--- /dev/null
++++ b/common/src/util/log-mirror.ts
+@@ -0,0 +1,30 @@
++/**
++ * Which analytics events get mirrored into the Axiom logs dataset.
++ *
++ * PostHog stays the product-analytics system of record (it keeps EVERY event).
++ * Axiom is the SQL-queryable copy for debugging/ops, where a handful of
++ * extremely high-volume, low-query-value PostHog auto-events would otherwise
++ * dominate ingest cost and bury the events we actually query (named product
++ * events, signups, logins, errors). We drop those from the Axiom mirror only.
++ *
++ * `$snapshot` (session replay) alone is the bulk of ingest. Autocapture,
++ * heatmaps and web-vitals are similar: useful in PostHog's product UI, noise in
++ * APL. Everything else — `$pageview`, `$identify`, `$exception`, `$rageclick`,
++ * and all non-`$` named events — is kept.
++ */
++export const AXIOM_MIRROR_DENYLIST: ReadonlySet<string> = new Set([
++  '$snapshot',
++  '$autocapture',
++  '$heatmap',
++  '$$heatmap',
++  '$web_vitals',
++  '$pageleave',
++])
++
++/** True if this analytics event should be copied into the Axiom logs dataset. */
++export function shouldMirrorAnalyticsEvent(
++  eventName: string | null | undefined,
++): boolean {
++  if (!eventName) return true
++  return !AXIOM_MIRROR_DENYLIST.has(eventName)
++}
+diff --git a/common/src/util/rate-limit.ts b/common/src/util/rate-limit.ts
+new file mode 100644
+index 000000000..d0f7d662a
+--- /dev/null
++++ b/common/src/util/rate-limit.ts
+@@ -0,0 +1,56 @@
++/**
++ * Minimal in-memory fixed-window rate limiter, shared by the unauthenticated
++ * `/api/logs` ingest endpoints (browser + anonymous CLI). Per-instance and
++ * best-effort — good enough to blunt abuse/cost on a single Render instance,
++ * not a distributed guarantee. Kept dependency-free and `now`-injectable so the
++ * window logic is unit-testable.
++ */
++export interface FixedWindowRateLimiter {
++  /** Returns true if `key` has exceeded the window's request budget. */
++  limited(key: string, now: number): boolean
++}
++
++export function createFixedWindowRateLimiter(opts: {
++  windowMs: number
++  max: number
++  /** Prune expired entries once the map grows past this. Defaults to 10k. */
++  maxKeys?: number
++}): FixedWindowRateLimiter {
++  const { windowMs, max, maxKeys = 10_000 } = opts
++  const hits = new Map<string, { count: number; resetAt: number }>()
++  let lastPruneAt = 0
++
++  return {
++    limited(key: string, now: number): boolean {
++      const entry = hits.get(key)
++      if (!entry || now >= entry.resetAt) {
++        hits.set(key, { count: 1, resetAt: now + windowMs })
++        // Bound map growth: prune expired entries, but at most once per window
++        // so a steady stream of live keys can't trigger an O(n) scan per call.
++        if (hits.size > maxKeys && now - lastPruneAt >= windowMs) {
++          lastPruneAt = now
++          for (const [k, v] of hits) if (now >= v.resetAt) hits.delete(k)
++        }
++        return false
++      }
++      entry.count++
++      return entry.count > max
++    },
++  }
++}
++
++/**
++ * Best-effort client IP for per-IP rate limiting on the unauthenticated ingest
++ * endpoints. Prefers the proxy-set `x-real-ip` (harder to spoof than the
++ * left-most `x-forwarded-for` token). Accepts any Headers-like object so it
++ * works with `NextRequest.headers` without a Next dependency here.
++ */
++export function extractClientIp(headers: {
++  get(name: string): string | null
++}): string {
++  return (
++    headers.get('x-real-ip')?.trim() ||
++    headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
++    'unknown'
++  )
++}

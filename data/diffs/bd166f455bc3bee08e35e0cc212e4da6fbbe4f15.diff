@@ -1,0 +1,344 @@
+diff --git a/common/src/util/__tests__/error-api-details.test.ts b/common/src/util/__tests__/error-api-details.test.ts
+index 29a1742a8..f54f57d7f 100644
+--- a/common/src/util/__tests__/error-api-details.test.ts
++++ b/common/src/util/__tests__/error-api-details.test.ts
+@@ -1,6 +1,10 @@
+ import { describe, expect, it } from 'bun:test'
+ 
+-import { extractApiErrorDetails, isFetchIdleTimeoutError } from '../error'
++import {
++  extractApiErrorDetails,
++  isFetchIdleTimeoutError,
++  isTransientNetworkError,
++} from '../error'
+ 
+ describe('extractApiErrorDetails', () => {
+   it('extracts structured details from nested retry errors', () => {
+@@ -125,3 +129,62 @@ describe('isFetchIdleTimeoutError', () => {
+     expect(isFetchIdleTimeoutError('The operation timed out.')).toBe(false)
+   })
+ })
++
++describe('isTransientNetworkError', () => {
++  it('detects the Bun socket-close message', () => {
++    expect(
++      isTransientNetworkError(
++        new Error(
++          'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
++        ),
++      ),
++    ).toBe(true)
++  })
++
++  it('detects transient network error codes', () => {
++    const error = new Error('request failed') as Error & { code: string }
++    error.code = 'ECONNRESET'
++    expect(isTransientNetworkError(error)).toBe(true)
++
++    const bunError = new Error('request failed') as Error & { code: string }
++    bunError.code = 'ConnectionClosed'
++    expect(isTransientNetworkError(bunError)).toBe(true)
++  })
++
++  it('detects the undici "fetch failed" TypeError', () => {
++    expect(isTransientNetworkError(new TypeError('fetch failed'))).toBe(true)
++  })
++
++  it('detects a socket error nested inside an AI SDK RetryError wrapper', () => {
++    const socketError = new Error(
++      'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
++    ) as Error & { code: string }
++    socketError.code = 'ECONNRESET'
++    const retryError = new Error('Failed after 3 attempts.') as Error & {
++      errors: unknown[]
++    }
++    retryError.errors = [socketError]
++    expect(isTransientNetworkError(retryError)).toBe(true)
++  })
++
++  it('detects a socket error in a cause chain', () => {
++    const inner = new Error('read ECONNRESET') as Error & { code: string }
++    inner.code = 'ECONNRESET'
++    const outer = new Error('Cannot connect to API')
++    ;(outer as Error & { cause: unknown }).cause = inner
++    expect(isTransientNetworkError(outer)).toBe(true)
++  })
++
++  it('returns false for unrelated errors', () => {
++    expect(isTransientNetworkError(new Error('Internal Server Error'))).toBe(
++      false,
++    )
++    expect(isTransientNetworkError(undefined)).toBe(false)
++    expect(isTransientNetworkError('fetch failed')).toBe(false)
++    const serverError = new Error('Bad Request') as Error & {
++      statusCode: number
++    }
++    serverError.statusCode = 400
++    expect(isTransientNetworkError(serverError)).toBe(false)
++  })
++})
+diff --git a/common/src/util/error.ts b/common/src/util/error.ts
+index 32700911c..5aa3b78f3 100644
+--- a/common/src/util/error.ts
++++ b/common/src/util/error.ts
+@@ -394,6 +394,73 @@ export const FETCH_IDLE_TIMEOUT_USER_MESSAGE =
+   'The server sends a heartbeat every 30 seconds while responses stream, so this usually means the connection was silently dropped in transit (VPN, proxy, firewall, or flaky network) rather than a server outage.\n\n' +
+   'Things to try: retry your message, check your network/VPN/proxy, or switch networks if it keeps happening.'
+ 
++/**
++ * Substrings of error messages that indicate the TCP connection died in
++ * transit (as opposed to the server returning an error response). Bun's fetch
++ * throws a plain Error with "The socket connection was closed unexpectedly..."
++ * and code ECONNRESET/ConnectionClosed; undici throws TypeError "fetch failed".
++ */
++const TRANSIENT_NETWORK_ERROR_MESSAGE_PATTERNS = [
++  'socket connection was closed unexpectedly',
++  'fetch failed',
++  'failed to fetch',
++  'network connection was lost',
++]
++
++const TRANSIENT_NETWORK_ERROR_CODES = new Set([
++  'ECONNRESET',
++  'ECONNREFUSED',
++  'EPIPE',
++  'ETIMEDOUT',
++  // Bun-specific fetch error codes
++  'ConnectionClosed',
++  'ConnectionRefused',
++  'FailedToOpenSocket',
++])
++
++/**
++ * Detects transient connection-level failures (socket closed/reset, connection
++ * refused, etc.) where no HTTP response was received. These are safe to retry
++ * and should be shown to the user as a connectivity problem instead of a raw
++ * runtime error with a stack trace. Walks AI SDK RetryError wrappers and
++ * cause chains.
++ */
++export function isTransientNetworkError(error: unknown): boolean {
++  for (const candidate of getApiErrorCandidates(error)) {
++    if (!candidate || typeof candidate !== 'object') continue
++    const { message, code } = candidate as {
++      message?: unknown
++      code?: unknown
++    }
++    if (typeof code === 'string' && TRANSIENT_NETWORK_ERROR_CODES.has(code)) {
++      return true
++    }
++    if (typeof message === 'string') {
++      const lower = message.toLowerCase()
++      if (
++        TRANSIENT_NETWORK_ERROR_MESSAGE_PATTERNS.some((pattern) =>
++          lower.includes(pattern),
++        )
++      ) {
++        return true
++      }
++    }
++  }
++  return false
++}
++
++/**
++ * User-facing explanation for a dropped connection. The raw runtime message
++ * ("The socket connection was closed unexpectedly. For more information, pass
++ * `verbose: true`...") plus a stack trace reads like a crash; in practice the
++ * connection to the server was cut mid-request, which is transient and safe
++ * to retry.
++ */
++export const TRANSIENT_NETWORK_ERROR_USER_MESSAGE =
++  'Connection interrupted: the connection to the server was closed unexpectedly, even after retrying.\n\n' +
++  'This is usually a transient issue — a flaky network, VPN/proxy, or the server briefly under heavy load.\n\n' +
++  'Your progress is saved. Please try sending your message again.'
++
+ // Extended error properties that various libraries add to Error objects
+ interface ExtendedErrorProperties {
+   status?: number
+diff --git a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+index 4a034c63c..3ff33da6c 100644
+--- a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
++++ b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+@@ -1136,6 +1136,42 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+         expect(result.output.message).not.toBe('The operation timed out.')
+       }
+     })
++
++    it('should explain dropped socket connections instead of showing the raw runtime message', async () => {
++      const llmOnlyTemplate = {
++        ...mockTemplate,
++        handleSteps: undefined,
++      }
++
++      const localAgentTemplates = {
++        'test-agent': llmOnlyTemplate,
++      }
++
++      // Bun's fetch throws a plain Error with this message (and code
++      // ECONNRESET/ConnectionClosed) when the TCP connection is dropped.
++      loopAgentStepsBaseParams.promptAiSdkStream = async function* () {
++        const socketError = new Error(
++          'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
++        ) as Error & { code: string }
++        socketError.code = 'ECONNRESET'
++        throw socketError
++      }
++
++      const result = await loopAgentSteps({
++        ...loopAgentStepsBaseParams,
++        agentType: 'test-agent',
++        localAgentTemplates,
++      })
++
++      expect(result.output.type).toBe('error')
++      if (result.output.type === 'error') {
++        expect(result.output.message).toContain('Connection interrupted')
++        expect(result.output.message).not.toContain('Agent run error:')
++        expect(result.output.message).not.toContain(
++          'pass `verbose: true` in the second argument to fetch()',
++        )
++      }
++    })
+   })
+ 
+   describe('steering (drainSteeringMessages)', () => {
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index dd006b3d9..f0361bf81 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -12,10 +12,12 @@ import { buildArray } from '@codebuff/common/util/array'
+ import {
+   AbortError,
+   FETCH_IDLE_TIMEOUT_USER_MESSAGE,
++  TRANSIENT_NETWORK_ERROR_USER_MESSAGE,
+   extractApiErrorDetails,
+   getErrorObject,
+   isAbortError,
+   isFetchIdleTimeoutError,
++  isTransientNetworkError,
+ } from '@codebuff/common/util/error'
+ import { serializeCacheDebugCorrelation } from '@codebuff/common/util/cache-debug'
+ import { systemMessage, userMessage } from '@codebuff/common/util/messages'
+@@ -1200,10 +1202,13 @@ export async function loopAgentSteps(
+ 
+     const apiErrorDetails = extractApiErrorDetails(error)
+     const isIdleTimeout = isFetchIdleTimeoutError(error)
++    const isNetworkError = !isIdleTimeout && isTransientNetworkError(error)
+     const hasServerMessage = apiErrorDetails.message !== undefined
+     let fallbackMessage: string
+     if (isIdleTimeout) {
+       fallbackMessage = FETCH_IDLE_TIMEOUT_USER_MESSAGE
++    } else if (isNetworkError) {
++      fallbackMessage = TRANSIENT_NETWORK_ERROR_USER_MESSAGE
+     } else if (error instanceof Error) {
+       const includeStack =
+         apiErrorDetails.statusCode === undefined && error.stack
+@@ -1236,7 +1241,7 @@ export async function loopAgentSteps(
+       output: {
+         type: 'error',
+         message:
+-          hasServerMessage || isIdleTimeout
++          hasServerMessage || isIdleTimeout || isNetworkError
+             ? errorMessage
+             : 'Agent run error: ' + errorMessage,
+         ...(statusCode !== undefined && { statusCode }),
+diff --git a/sdk/src/impl/model-provider.ts b/sdk/src/impl/model-provider.ts
+index ff9240b57..ab2d7f29c 100644
+--- a/sdk/src/impl/model-provider.ts
++++ b/sdk/src/impl/model-provider.ts
+@@ -17,10 +17,12 @@ import {
+   isOpenAIProviderModel,
+   toOpenAIModelId,
+ } from '@codebuff/common/constants/chatgpt-oauth'
++import { isTransientNetworkError } from '@codebuff/common/util/error'
+ import {
+   OpenAICompatibleChatLanguageModel,
+   VERSION,
+ } from '@codebuff/llm-providers/openai-compatible'
++import { APICallError } from 'ai'
+ 
+ import { getWebsiteUrl } from '../constants'
+ import { getValidChatGptOAuthCredentials } from '../credentials'
+@@ -191,6 +193,41 @@ function createOpenAIOAuthModel(
+   })
+ }
+ 
++/**
++ * Wrap global fetch so transient connection failures (socket closed/reset,
++ * connection refused) are rethrown as retryable APICallErrors.
++ *
++ * Bun's fetch throws these as plain Errors ("The socket connection was closed
++ * unexpectedly...", code ECONNRESET/ConnectionClosed), which the AI SDK does
++ * not recognize as retryable — it only auto-retries APICallError with
++ * isRetryable=true. Marking them retryable lets streamText's built-in
++ * exponential backoff (default 2 retries) absorb brief server/network blips
++ * instead of failing the whole agent run.
++ */
++function fetchWithRetryableNetworkErrors(
++  ...args: Parameters<typeof globalThis.fetch>
++): ReturnType<typeof globalThis.fetch> {
++  return globalThis.fetch(...args).catch((error: unknown) => {
++    if (isTransientNetworkError(error)) {
++      const input = args[0]
++      const url =
++        typeof input === 'string'
++          ? input
++          : input instanceof URL
++            ? input.toString()
++            : input.url
++      throw new APICallError({
++        message: error instanceof Error ? error.message : String(error),
++        cause: error,
++        url,
++        requestBodyValues: {},
++        isRetryable: true,
++      })
++    }
++    throw error
++  })
++}
++
+ /**
+  * Create a model that routes through the Codebuff backend.
+  * This is the existing behavior - requests go to Codebuff backend which forwards to OpenRouter.
+@@ -257,7 +294,9 @@ function createCodebuffBackendModel(
+         },
+       }),
+     },
+-    fetch: undefined,
++    // Cast: Bun's fetch type also declares a `preconnect` helper, but the AI
++    // SDK only ever invokes fetch as a plain function.
++    fetch: fetchWithRetryableNetworkErrors as typeof globalThis.fetch,
+     includeUsage: undefined,
+     supportsStructuredOutputs: true,
+   })
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 87e319a6c..1c7c08719 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -21,8 +21,10 @@ import { clientToolCallSchema } from '@codebuff/common/tools/list'
+ import { AgentOutputSchema } from '@codebuff/common/types/session-state'
+ import {
+   FETCH_IDLE_TIMEOUT_USER_MESSAGE,
++  TRANSIENT_NETWORK_ERROR_USER_MESSAGE,
+   extractApiErrorDetails,
+   isFetchIdleTimeoutError,
++  isTransientNetworkError,
+ } from '@codebuff/common/util/error'
+ import { cloneDeep } from 'lodash'
+ 
+@@ -644,9 +646,11 @@ async function runOnce({
+   }).catch((error) => {
+     let errorMessage = isFetchIdleTimeoutError(error)
+       ? FETCH_IDLE_TIMEOUT_USER_MESSAGE
+-      : error instanceof Error
+-        ? error.message
+-        : String(error ?? '')
++      : isTransientNetworkError(error)
++        ? TRANSIENT_NETWORK_ERROR_USER_MESSAGE
++        : error instanceof Error
++          ? error.message
++          : String(error ?? '')
+     const apiErrorDetails = extractApiErrorDetails(error)
+     const statusCode = apiErrorDetails.statusCode ?? getErrorStatusCode(error)
+     const {

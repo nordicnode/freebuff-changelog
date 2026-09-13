@@ -1,0 +1,840 @@
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index 4dd3ece22..5ab829609 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -1,3 +1,5 @@
++import { randomUUID } from 'node:crypto'
++
+ import { useCallback, useEffect, useRef } from 'react'
+ 
+ import { setCurrentChatId } from '../project-files'
+@@ -12,14 +14,17 @@ import { getAgentIdForMode } from '../utils/freebuff-agent-selection'
+ import { loadAgentDefinitions } from '../utils/local-agent-registry'
+ import { logger } from '../utils/logger'
+ import {
++  clearLiveChatStateProvider,
+   loadMostRecentChatState,
+   saveChatState,
++  setLiveChatStateProvider,
+ } from '../utils/run-state-storage'
+ import {
+   autoCollapsePreviousMessages,
+   createAiMessageShell,
+   createErrorMessage as createErrorChatMessage,
+   generateAiMessageId,
++  sanitizeRestoredMessages,
+ } from '../utils/send-message-helpers'
+ import { createSendMessageTimerController } from '../utils/send-message-timer'
+ import {
+@@ -39,6 +44,8 @@ import type { ChatMessage } from '../types/chat'
+ import type { SendMessageFn } from '../types/contracts/send-message'
+ import type { AgentMode } from '../utils/constants'
+ import type { SendMessageTimerEvent } from '../utils/send-message-timer'
++import { STATE_SNAPSHOT_INTERRUPTION_MESSAGE } from '@codebuff/sdk'
++
+ import type { AgentDefinition, MessageContent, RunState } from '@codebuff/sdk'
+ import { isCoveredBySubscription } from '../utils/subscription'
+ 
+@@ -153,7 +160,7 @@ export const useSendMessage = ({
+       if (loadedState) {
+         previousRunStateRef.current = loadedState.runState
+         setRunState(loadedState.runState)
+-        setMessages(loadedState.messages)
++        setMessages(sanitizeRestoredMessages(loadedState.messages))
+         if (loadedState.chatId) {
+           setCurrentChatId(loadedState.chatId)
+         }
+@@ -414,6 +421,23 @@ export const useSendMessage = ({
+       // before any async work, so the router can correctly detect busy state.
+       let actualCredits: number | undefined
+ 
++      // Checkpoint the turn to disk immediately so that killing the process
++      // (closed terminal, crash) can't lose the user's prompt, then keep the
++      // checkpoint fresh from SDK run-state snapshots while the run streams.
++      // The completion save below overwrites this with the final state.
++      let latestRunStateSnapshot: RunState = previousRunStateRef.current ?? {
++        traceSessionId: randomUUID(),
++        output: {
++          type: 'error',
++          message: STATE_SNAPSHOT_INTERRUPTION_MESSAGE,
++        },
++      }
++      setLiveChatStateProvider(aiMessageId, () => ({
++        runState: latestRunStateSnapshot,
++        messages: useChatStore.getState().messages,
++      }))
++      saveChatState(latestRunStateSnapshot, useChatStore.getState().messages)
++
+       // Execute SDK run with streaming handlers
+       try {
+         const agentDefinitions = loadAgentDefinitions()
+@@ -465,6 +489,10 @@ export const useSendMessage = ({
+             IS_FREEBUFF && freebuffInstanceId
+               ? { freebuff_instance_id: freebuffInstanceId }
+               : undefined,
++          onStateSnapshot: (snapshot) => {
++            latestRunStateSnapshot = snapshot
++            saveChatState(snapshot, useChatStore.getState().messages)
++          },
+         })
+ 
+         // Log a summary only: the full run config contains the entire
+@@ -532,10 +560,20 @@ export const useSendMessage = ({
+             isProcessingQueueRef,
+             isQueuePausedRef,
+           })
++          // Persist the last checkpoint plus the error banner so a restart
++          // after a failed run still shows this turn.
++          saveChatState(
++            latestRunStateSnapshot,
++            useChatStore.getState().messages,
++          )
+         } else {
+           logger.debug({ error }, '[send-message] Ignoring error after abort')
+         }
+       } finally {
++        // Stop exit-flushing this run's checkpoint; the final state (or last
++        // checkpoint, on error) has been saved above. Owner-guarded so an
++        // aborted run resolving late can't clear a newer run's provider.
++        clearLiveChatStateProvider(aiMessageId)
+         // If this run was aborted, the abort handler already released the chain lock
+         // and queue processing state. Don't touch shared state here to avoid
+         // interfering with any new run that may have started after the abort.
+diff --git a/cli/src/utils/__tests__/run-state-storage.test.ts b/cli/src/utils/__tests__/run-state-storage.test.ts
+index c3237d73f..097cbe7dd 100644
+--- a/cli/src/utils/__tests__/run-state-storage.test.ts
++++ b/cli/src/utils/__tests__/run-state-storage.test.ts
+@@ -1,4 +1,11 @@
+-import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test'
++import {
++  describe,
++  test,
++  expect,
++  beforeEach,
++  afterEach,
++  mock,
++} from 'bun:test'
+ import * as fs from 'fs'
+ import * as path from 'path'
+ import * as os from 'os'
+@@ -10,6 +17,10 @@ import {
+   saveChatState,
+   loadMostRecentChatState,
+   clearChatState,
++  setChatDirOverrideForTesting,
++  setLiveChatStateProvider,
++  clearLiveChatStateProvider,
++  flushLiveChatState,
+ } from '../run-state-storage'
+ import type { ChatMessage, ContentBlock } from '../../types/chat'
+ import type { RunState } from '@codebuff/sdk'
+@@ -364,3 +375,166 @@ describe('run-state-storage', () => {
+     })
+   })
+ })
++
++describe('live chat state provider', () => {
++  // Point persistence at a temp dir via the explicit test override — module
++  // seams (mock.module, HOME, spyOn on auth) are unreliable across bun test
++  // files and platforms.
++  const chatDir = path.join(os.tmpdir(), 'codebuff-test-live-chatdir')
++
++  const testRunState = (marker: string): RunState =>
++    ({
++      output: { type: 'error', message: marker },
++    }) as unknown as RunState
++
++  const testMessages = (marker: string): ChatMessage[] => [
++    {
++      id: 'msg-1',
++      variant: 'user',
++      content: marker,
++      timestamp: new Date().toISOString(),
++    },
++  ]
++
++  const readSavedMessages = () =>
++    JSON.parse(
++      fs.readFileSync(path.join(chatDir, 'chat-messages.json'), 'utf8'),
++    ) as ChatMessage[]
++
++  beforeEach(() => {
++    fs.rmSync(chatDir, { recursive: true, force: true })
++    setChatDirOverrideForTesting(chatDir)
++  })
++
++  afterEach(() => {
++    clearLiveChatStateProvider('run-a')
++    clearLiveChatStateProvider('run-b')
++    setChatDirOverrideForTesting(undefined)
++    fs.rmSync(chatDir, { recursive: true, force: true })
++  })
++
++  test('flushLiveChatState persists the provided state', () => {
++    setLiveChatStateProvider('run-a', () => ({
++      runState: testRunState('checkpoint'),
++      messages: testMessages('in-flight prompt'),
++    }))
++
++    flushLiveChatState()
++
++    expect(readSavedMessages()[0].content).toBe('in-flight prompt')
++  })
++
++  test('flushLiveChatState is a no-op with no provider registered', () => {
++    flushLiveChatState()
++
++    expect(fs.existsSync(path.join(chatDir, 'chat-messages.json'))).toBe(false)
++  })
++
++  test('clearLiveChatStateProvider stops flushing', () => {
++    setLiveChatStateProvider('run-a', () => ({
++      runState: testRunState('checkpoint'),
++      messages: testMessages('in-flight prompt'),
++    }))
++    clearLiveChatStateProvider('run-a')
++
++    flushLiveChatState()
++
++    expect(fs.existsSync(path.join(chatDir, 'chat-messages.json'))).toBe(false)
++  })
++
++  test('a stale run cannot clear a newer run provider', () => {
++    setLiveChatStateProvider('run-a', () => ({
++      runState: testRunState('old'),
++      messages: testMessages('old prompt'),
++    }))
++    setLiveChatStateProvider('run-b', () => ({
++      runState: testRunState('new'),
++      messages: testMessages('new prompt'),
++    }))
++
++    // The old run settling late must not remove the new run's provider.
++    clearLiveChatStateProvider('run-a')
++    flushLiveChatState()
++
++    expect(readSavedMessages()[0].content).toBe('new prompt')
++  })
++
++  test('flushLiveChatState swallows provider errors', () => {
++    setLiveChatStateProvider('run-a', () => {
++      throw new Error('boom')
++    })
++
++    expect(() => flushLiveChatState()).not.toThrow()
++  })
++})
++
++describe('atomic save and resilient load', () => {
++  const chatDir = path.join(os.tmpdir(), 'codebuff-test-resilient-chatdir')
++
++  const runState = { output: { type: 'error', message: 'x' } } as RunState
++  const messages: ChatMessage[] = [
++    {
++      id: 'msg-1',
++      variant: 'user',
++      content: 'the prompt',
++      timestamp: new Date().toISOString(),
++    },
++  ]
++
++  beforeEach(() => {
++    fs.rmSync(chatDir, { recursive: true, force: true })
++    setChatDirOverrideForTesting(chatDir)
++  })
++
++  afterEach(() => {
++    setChatDirOverrideForTesting(undefined)
++    fs.rmSync(chatDir, { recursive: true, force: true })
++  })
++
++  test('saveChatState leaves no .tmp files behind', () => {
++    saveChatState(runState, messages)
++
++    const leftovers = fs
++      .readdirSync(chatDir)
++      .filter((name) => name.endsWith('.tmp'))
++    expect(leftovers).toHaveLength(0)
++    expect(
++      JSON.parse(
++        fs.readFileSync(path.join(chatDir, 'chat-messages.json'), 'utf8'),
++      ),
++    ).toHaveLength(1)
++  })
++
++  test('torn run-state.json still restores the transcript', () => {
++    saveChatState(runState, messages)
++    fs.writeFileSync(
++      path.join(chatDir, 'run-state.json'),
++      '{"sessionState": {"trunc',
++    )
++
++    const loaded = loadMostRecentChatState()
++
++    expect(loaded).not.toBeNull()
++    expect(loaded!.messages[0].content).toBe('the prompt')
++    expect(loaded!.runState.output.type).toBe('error')
++  })
++
++  test('torn chat-messages.json still restores the run state', () => {
++    saveChatState(runState, messages)
++    fs.writeFileSync(path.join(chatDir, 'chat-messages.json'), '[{"id":')
++
++    const loaded = loadMostRecentChatState()
++
++    expect(loaded).not.toBeNull()
++    expect(loaded!.messages).toHaveLength(0)
++    expect((loaded!.runState.output as any).message).toBe('x')
++  })
++
++  test('returns null when both files are unreadable', () => {
++    saveChatState(runState, messages)
++    fs.writeFileSync(path.join(chatDir, 'run-state.json'), '{')
++    fs.writeFileSync(path.join(chatDir, 'chat-messages.json'), '[')
++
++    expect(loadMostRecentChatState()).toBeNull()
++  })
++})
+diff --git a/cli/src/utils/__tests__/send-message-helpers.test.ts b/cli/src/utils/__tests__/send-message-helpers.test.ts
+index 00f95b899..89824e953 100644
+--- a/cli/src/utils/__tests__/send-message-helpers.test.ts
++++ b/cli/src/utils/__tests__/send-message-helpers.test.ts
+@@ -32,6 +32,7 @@ import {
+   createSpawnAgentBlocks,
+   isSpawnAgentsResult,
+   markMessageComplete,
++  sanitizeRestoredMessages,
+   setMessageError,
+ } from '../send-message-helpers'
+ 
+@@ -1699,3 +1700,105 @@ describe('setMessageError', () => {
+     expect(result.isComplete).toBe(true)
+   })
+ })
++
++// ============================================================================
++// sanitizeRestoredMessages Tests
++// ============================================================================
++
++describe('sanitizeRestoredMessages', () => {
++  const streamedShell = (overrides: Partial<ChatMessage> = {}): ChatMessage => ({
++    id: 'ai-1750000000000-abc123',
++    variant: 'ai',
++    content: '',
++    timestamp: new Date().toISOString(),
++    blocks: [{ type: 'text', content: 'partial answer' }],
++    ...overrides,
++  })
++
++  test('marks an interrupted AI response complete with an interruption notice', () => {
++    const [result] = sanitizeRestoredMessages([streamedShell()])
++
++    expect(result.isComplete).toBe(true)
++    const lastBlock = result.blocks![result.blocks!.length - 1]
++    expect(lastBlock.type).toBe('text')
++    expect((lastBlock as TextContentBlock).content).toContain(
++      '[response interrupted]',
++    )
++  })
++
++  test('cancels running agent blocks in an interrupted AI response', () => {
++    const [result] = sanitizeRestoredMessages([
++      streamedShell({
++        blocks: [
++          {
++            type: 'agent',
++            agentId: 'agent-1',
++            agentName: 'TestAgent',
++            agentType: 'inline',
++            content: '',
++            status: 'running',
++            blocks: [],
++          },
++        ],
++      }),
++    ])
++
++    const agentBlock = result.blocks![0] as AgentContentBlock
++    expect(agentBlock.status).toBe('cancelled')
++  })
++
++  test('adds a notice to an interrupted AI response with no blocks yet', () => {
++    const [result] = sanitizeRestoredMessages([streamedShell({ blocks: [] })])
++
++    expect(result.isComplete).toBe(true)
++    expect(result.blocks).toHaveLength(1)
++    expect((result.blocks![0] as TextContentBlock).content).toBe(
++      '[response interrupted]',
++    )
++  })
++
++  test('leaves completed AI responses untouched', () => {
++    const message = streamedShell({ isComplete: true })
++    const [result] = sanitizeRestoredMessages([message])
++
++    expect(result).toBe(message)
++  })
++
++  test('leaves mode dividers, system messages, and user messages untouched', () => {
++    const divider = createModeDividerMessage('DEFAULT' as any)
++    const system: ChatMessage = {
++      id: 'sys-123',
++      variant: 'ai',
++      content: 'system notice',
++      timestamp: new Date().toISOString(),
++    }
++    const user: ChatMessage = {
++      id: 'user-123',
++      variant: 'user',
++      content: 'hello',
++      timestamp: new Date().toISOString(),
++    }
++
++    const results = sanitizeRestoredMessages([divider, system, user])
++
++    expect(results[0]).toBe(divider)
++    expect(results[1]).toBe(system)
++    expect(results[2]).toBe(user)
++  })
++})
++
++describe('sanitizeRestoredMessages corruption tolerance', () => {
++  test('does not throw on null entries in a restored blocks array', () => {
++    const corrupted: ChatMessage = {
++      id: 'ai-1750000000000-abc123',
++      variant: 'ai',
++      content: '',
++      timestamp: new Date().toISOString(),
++      blocks: [null as unknown as ContentBlock, { type: 'text', content: 'x' }],
++    }
++
++    const [result] = sanitizeRestoredMessages([corrupted])
++
++    expect(result.isComplete).toBe(true)
++  })
++})
+diff --git a/cli/src/utils/create-run-config.ts b/cli/src/utils/create-run-config.ts
+index e37d86d7d..a17f9deb1 100644
+--- a/cli/src/utils/create-run-config.ts
++++ b/cli/src/utils/create-run-config.ts
+@@ -27,6 +27,8 @@ export type CreateRunConfigParams = {
+   signal: AbortSignal
+   costMode?: 'free' | 'lite' | 'normal' | 'max' | 'experimental' | 'ask'
+   extraCodebuffMetadata?: Record<string, string>
++  /** Periodic in-flight RunState checkpoints (see RunOptions.onStateSnapshot). */
++  onStateSnapshot?: (runState: RunState) => void
+ }
+ 
+ const SENSITIVE_EXTENSIONS = new Set([
+@@ -104,6 +106,7 @@ export const createRunConfig = (params: CreateRunConfigParams) => {
+     eventHandlerState,
+     costMode,
+     extraCodebuffMetadata,
++    onStateSnapshot,
+   } = params
+ 
+   return {
+@@ -119,6 +122,7 @@ export const createRunConfig = (params: CreateRunConfigParams) => {
+     signal: params.signal,
+     costMode,
+     extraCodebuffMetadata,
++    onStateSnapshot,
+     fileFilter: ((filePath: string) => {
+       if (isSensitiveFile(filePath)) return { status: 'blocked' }
+       if (isEnvTemplateFile(filePath)) return { status: 'allow-example' }
+diff --git a/cli/src/utils/renderer-cleanup.ts b/cli/src/utils/renderer-cleanup.ts
+index 58d21367d..f39671f2f 100644
+--- a/cli/src/utils/renderer-cleanup.ts
++++ b/cli/src/utils/renderer-cleanup.ts
+@@ -1,4 +1,5 @@
+ import { resetTerminalTitle } from './terminal-title'
++import { flushLiveChatState } from './run-state-storage'
+ 
+ import type { CliRenderer } from '@opentui/core'
+ 
+@@ -68,7 +69,11 @@ function resetTerminalState(): void {
+  * This resets terminal state to prevent garbled output after exit.
+  */
+ function cleanup(): void {
+-  // FIRST: Reset terminal state by writing escape sequences directly to stdout.
++  // Persist any in-flight chat state first (synchronous, best-effort) so
++  // closing the terminal or killing the process mid-run doesn't lose the turn.
++  flushLiveChatState()
++
++  // Reset terminal state by writing escape sequences directly to stdout.
+   // This ensures mouse mode, focus reporting, etc. are disabled even if
+   // renderer.destroy() fails or doesn't fully clean up.
+   resetTerminalState()
+diff --git a/cli/src/utils/run-state-storage.ts b/cli/src/utils/run-state-storage.ts
+index 63a59a5a8..e4acebea9 100644
+--- a/cli/src/utils/run-state-storage.ts
++++ b/cli/src/utils/run-state-storage.ts
+@@ -22,6 +22,50 @@ type SavedChatState = {
+   chatId?: string
+ }
+ 
++type LiveChatState = {
++  runState: RunState
++  messages: ChatMessage[]
++}
++
++let liveChatStateProvider: {
++  ownerId: string
++  provide: () => LiveChatState | null
++} | null = null
++
++/**
++ * Register a provider for the in-flight chat state. While a run is active,
++ * exit paths call flushLiveChatState() to persist the latest checkpoint so a
++ * quit/crash doesn't lose the turn. ownerId ties the provider to a specific
++ * run so a stale run can't clear a newer run's provider.
++ */
++export function setLiveChatStateProvider(
++  ownerId: string,
++  provide: () => LiveChatState | null,
++): void {
++  liveChatStateProvider = { ownerId, provide }
++}
++
++export function clearLiveChatStateProvider(ownerId: string): void {
++  if (liveChatStateProvider?.ownerId === ownerId) {
++    liveChatStateProvider = null
++  }
++}
++
++/**
++ * Synchronously persist the in-flight chat state, if any. Safe to call from
++ * process exit/signal handlers (saveChatState uses writeFileSync).
++ */
++export function flushLiveChatState(): void {
++  try {
++    const state = liveChatStateProvider?.provide()
++    if (state) {
++      saveChatState(state.runState, state.messages)
++    }
++  } catch {
++    // Best-effort - never block process exit.
++  }
++}
++
+ /**
+  * Recursively extract all agent IDs and tool call IDs from content blocks
+  */
+@@ -56,11 +100,30 @@ export function getAllToggleIdsFromMessages(messages: ChatMessage[]): string[] {
+   return ids
+ }
+ 
++// Test-only escape hatch: persistence normally resolves the chat directory
++// through project-files (under the user's real config dir). Tests point it at
++// a temp directory instead of mocking module internals — mock.module leaks
++// across bun test files and os.homedir() ignores $HOME on macOS, so both of
++// those seams are unreliable (see docs/testing.md: DI over module mocking).
++let chatDirOverride: string | undefined
++
++export function setChatDirOverrideForTesting(dir: string | undefined): void {
++  chatDirOverride = dir
++}
++
++function resolveCurrentChatDir(): string {
++  if (chatDirOverride) {
++    fs.mkdirSync(chatDirOverride, { recursive: true })
++    return chatDirOverride
++  }
++  return getCurrentChatDir()
++}
++
+ /**
+  * Get the path to the run state file for the current chat
+  */
+ export function getRunStatePath(): string {
+-  const chatDir = getCurrentChatDir()
++  const chatDir = resolveCurrentChatDir()
+   return path.join(chatDir, RUN_STATE_FILENAME)
+ }
+ 
+@@ -68,7 +131,7 @@ export function getRunStatePath(): string {
+  * Get the path to the chat messages file for the current chat
+  */
+ export function getChatMessagesPath(): string {
+-  const chatDir = getCurrentChatDir()
++  const chatDir = resolveCurrentChatDir()
+   return path.join(chatDir, CHAT_MESSAGES_FILENAME)
+ }
+ 
+@@ -83,8 +146,10 @@ export function saveChatState(
+     const runStatePath = getRunStatePath()
+     const messagesPath = getChatMessagesPath()
+ 
+-    writeFileAtomic(runStatePath, JSON.stringify(runState, null, 2))
+-    writeFileAtomic(messagesPath, JSON.stringify(messages, null, 2))
++    // Compact JSON: these files are rewritten on every checkpoint and grow to
++    // multiple MB; pretty-printing roughly doubles the write.
++    writeFileAtomic(runStatePath, JSON.stringify(runState))
++    writeFileAtomic(messagesPath, JSON.stringify(messages))
+   } catch (error) {
+     logger.error(
+       {
+@@ -105,9 +170,9 @@ export function loadMostRecentChatState(
+   chatId?: string,
+ ): SavedChatState | null {
+   try {
+-    let chatDir: string | null = null
++    let chatDir: string | null = chatDirOverride ?? null
+ 
+-    if (chatId && chatId.trim().length > 0) {
++    if (!chatDir && chatId && chatId.trim().length > 0) {
+       const baseDir = path.join(getProjectDataDir(), 'chats')
+       const candidateDir = path.join(baseDir, chatId.trim())
+       if (
+@@ -135,20 +200,55 @@ export function loadMostRecentChatState(
+     const runStatePath = path.join(chatDir, RUN_STATE_FILENAME)
+     const messagesPath = path.join(chatDir, CHAT_MESSAGES_FILENAME)
+ 
+-    if (!fs.existsSync(runStatePath) || !fs.existsSync(messagesPath)) {
++    // Parse the two files independently: a missing or torn run-state.json
++    // must not lose the transcript, and vice versa. Restore whatever is
++    // readable and fall back for the rest.
++    let runState: RunState | null = null
++    try {
++      runState = JSON.parse(
++        fs.readFileSync(runStatePath, 'utf8'),
++      ) as RunState
++    } catch (error) {
++      logger.warn(
++        {
++          runStatePath,
++          error: error instanceof Error ? error.message : String(error),
++        },
++        'Could not read run state; restoring transcript without agent context',
++      )
++    }
++
++    let messages: ChatMessage[] | null = null
++    try {
++      messages = JSON.parse(
++        fs.readFileSync(messagesPath, 'utf8'),
++      ) as ChatMessage[]
++    } catch (error) {
++      logger.warn(
++        {
++          messagesPath,
++          error: error instanceof Error ? error.message : String(error),
++        },
++        'Could not read chat messages; restoring agent context without transcript',
++      )
++    }
++
++    if (!runState && !messages) {
+       logger.debug(
+         { runStatePath, messagesPath },
+-        'Missing state files in chat directory',
++        'No readable state files in chat directory',
+       )
+       return null
+     }
+ 
+-    const runStateContent = fs.readFileSync(runStatePath, 'utf8')
+-    const messagesContent = fs.readFileSync(messagesPath, 'utf8')
+-
+-    const runState = JSON.parse(runStateContent) as RunState
++    runState ??= {
++      output: {
++        type: 'error',
++        message: 'Previous run state could not be restored.',
++      },
++    } as RunState
+     runState.traceSessionId ??= randomUUID()
+-    const messages = JSON.parse(messagesContent) as ChatMessage[]
++    messages ??= []
+ 
+     const resolvedChatId = path.basename(chatDir)
+ 
+diff --git a/cli/src/utils/send-message-helpers.ts b/cli/src/utils/send-message-helpers.ts
+index c5d716f0b..fa3a4d279 100644
+--- a/cli/src/utils/send-message-helpers.ts
++++ b/cli/src/utils/send-message-helpers.ts
+@@ -6,9 +6,14 @@
+ 
+ import { has } from 'lodash'
+ 
++import { markRunningAgentsAsCancelled } from './block-operations'
+ import { shouldHideAgent } from './constants'
+ import { formatTimestamp } from './helpers'
+-import { autoCollapseBlocks , createAgentBlock } from './message-block-helpers'
++import {
++  appendInterruptionNotice,
++  autoCollapseBlocks,
++  createAgentBlock,
++} from './message-block-helpers'
+ 
+ import type { AgentMode } from './constants'
+ import type {
+@@ -48,8 +53,46 @@ export const createErrorMessage = (content: string): ChatMessage => ({
+   timestamp: formatTimestamp(),
+ })
+ 
++/** Id prefix identifying streamed AI response shells; shared with
++ * sanitizeRestoredMessages so the two can't silently drift apart. */
++export const AI_MESSAGE_ID_PREFIX = 'ai-'
++
+ export const generateAiMessageId = (): string =>
+-  `ai-${Date.now()}-${Math.random().toString(16).slice(2)}`
++  `${AI_MESSAGE_ID_PREFIX}${Date.now()}-${Math.random().toString(16).slice(2)}`
++
++/**
++ * A restored chat may contain an AI response that was still streaming when the
++ * process died (checkpoint saves persist in-flight turns). Mark it complete
++ * with an interruption notice so it doesn't render as still in progress.
++ * Only touches streamed response shells (ids from generateAiMessageId) —
++ * other 'ai'-variant messages (mode dividers, system notices, bash results)
++ * are never marked complete by design.
++ */
++export const sanitizeRestoredMessages = (
++  messages: ChatMessage[],
++): ChatMessage[] =>
++  messages.map((message) => {
++    if (
++      message.variant !== 'ai' ||
++      !message.id.startsWith(AI_MESSAGE_ID_PREFIX) ||
++      message.isComplete
++    ) {
++      return message
++    }
++    try {
++      return {
++        ...message,
++        isComplete: true,
++        blocks: appendInterruptionNotice(
++          markRunningAgentsAsCancelled(message.blocks ?? []),
++        ),
++      }
++    } catch {
++      // Corrupted persisted blocks (e.g. null entries) must not prevent the
++      // chat from restoring; keep the message as-is.
++      return { ...message, isComplete: true }
++    }
++  })
+ 
+ // -----------------------------------------------------------------------------
+ // Auto-Collapse Logic
+diff --git a/sdk/src/index.ts b/sdk/src/index.ts
+index c18b0982b..08ffe2a6a 100644
+--- a/sdk/src/index.ts
++++ b/sdk/src/index.ts
+@@ -6,7 +6,7 @@ export type {
+   TextPart,
+   ImagePart,
+ } from '@codebuff/common/types/messages/content-part'
+-export { run } from './run'
++export { run, STATE_SNAPSHOT_INTERRUPTION_MESSAGE } from './run'
+ export { getFiles } from './tools/read-files'
+ export type { FileFilter, FileFilterResult } from './tools/read-files'
+ export type {
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index ccef343c5..cba649f5e 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -174,8 +174,22 @@ export type RunOptions = {
+    *  Used by hosts (e.g. the CLI) to forward client-scoped identifiers like
+    *  `freebuff_instance_id` that server-side gates read from the request body. */
+   extraCodebuffMetadata?: Record<string, string>
++  /** Optional checkpoint hook. Called once when the run starts and then
++   * periodically while it is in flight, with a RunState snapshot that
++   * preserves all progress so far (the user's prompt plus any completed
++   * agent steps, ending with an interruption note). Hosts can persist these
++   * snapshots so that a killed process (closed terminal, crash) does not
++   * lose the in-flight turn. The final resolved RunState supersedes any
++   * snapshot; no snapshots are emitted after the run settles. */
++  onStateSnapshot?: (runState: RunState) => void
+ }
+ 
++/** How often onStateSnapshot fires while a run is in flight. */
++const STATE_SNAPSHOT_INTERVAL_MS = 5_000
++
++export const STATE_SNAPSHOT_INTERRUPTION_MESSAGE =
++  'The session ended before this response completed. Partial progress has been preserved.'
++
+ const createAbortError = (signal?: AbortSignal) => {
+   if (signal?.reason instanceof Error) {
+     return signal.reason
+@@ -245,6 +259,7 @@ async function runOnce({
+   drainSteeringMessages,
+   costMode,
+   extraCodebuffMetadata,
++  onStateSnapshot,
+ }: RunExecutionOptions): Promise<RunState> {
+   const fsSourceValue = typeof fsSource === 'function' ? fsSource() : fsSource
+   const fs = await fsSourceValue
+@@ -302,13 +317,26 @@ async function runOnce({
+     delete sessionState.fileContext.customToolDefinitions[toolName]
+   }
+ 
+-  let resolve: (value: RunReturnType) => any = () => {}
++  let resolvePromise: (value: RunReturnType) => any = () => {}
+   let _reject: (error: any) => any = () => {}
+   const promise = new Promise<RunReturnType>((res, rej) => {
+-    resolve = res
++    resolvePromise = res
+     _reject = rej
+   })
+ 
++  // Snapshot support: stop emitting the moment the run settles so a late
++  // snapshot can never overwrite the final state persisted by the host.
++  let settled = false
++  let snapshotTimer: ReturnType<typeof setInterval> | null = null
++  const resolve = (value: RunReturnType) => {
++    settled = true
++    if (snapshotTimer !== null) {
++      clearInterval(snapshotTimer)
++      snapshotTimer = null
++    }
++    resolvePromise(value)
++  }
++
+   async function onError(error: { message: string }) {
+     if (handleEvent) {
+       await handleEvent({ type: 'error', message: error.message })
+@@ -550,6 +578,43 @@ async function runOnce({
+     return getCancelledRunState('Run cancelled by user.')
+   }
+ 
++  if (onStateSnapshot) {
++    // The runtime replaces mainAgentState.messageHistory with a new array at
++    // each step boundary, so reference identity is a cheap "has anything
++    // durable changed" check. Skipping unchanged ticks avoids deep-cloning a
++    // potentially multi-MB sessionState every interval while the run is just
++    // waiting on a slow LLM call.
++    let lastSnapshotHistory: unknown = null
++    const emitStateSnapshot = () => {
++      if (settled || signal?.aborted) {
++        return
++      }
++      const history = sessionState.mainAgentState.messageHistory
++      if (history === lastSnapshotHistory) {
++        return
++      }
++      lastSnapshotHistory = history
++      try {
++        onStateSnapshot(
++          getCancelledRunState(STATE_SNAPSHOT_INTERRUPTION_MESSAGE),
++        )
++      } catch (error) {
++        logger?.debug?.(
++          { error: error instanceof Error ? error.message : String(error) },
++          'onStateSnapshot handler threw',
++        )
++      }
++    }
++    // Emit immediately so the user's prompt is checkpointed as soon as the
++    // run starts, then keep checkpointing progress while it is in flight.
++    emitStateSnapshot()
++    snapshotTimer = setInterval(emitStateSnapshot, STATE_SNAPSHOT_INTERVAL_MS)
++    // Don't let the checkpoint timer keep the host process alive.
++    if (typeof (snapshotTimer as any).unref === 'function') {
++      ;(snapshotTimer as any).unref()
++    }
++  }
++
+   callMainPrompt({
+     ...agentRuntimeImpl,
+     promptId,

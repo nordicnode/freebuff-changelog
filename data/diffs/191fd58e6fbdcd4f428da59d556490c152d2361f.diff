@@ -1,0 +1,584 @@
+diff --git a/agents/__tests__/context-pruner.test.ts b/agents/__tests__/context-pruner.test.ts
+index 0fc9af2af..faa938036 100644
+--- a/agents/__tests__/context-pruner.test.ts
++++ b/agents/__tests__/context-pruner.test.ts
+@@ -220,6 +220,8 @@ describe('context-pruner handleSteps', () => {
+     contextTokenCount?: number,
+     maxContextLength?: number,
+     budgets?: { assistantToolBudget?: number; userBudget?: number },
++    infoLogs?: Array<{ data: unknown; message?: string }>,
++    throwOnInfo = false,
+   ) => {
+     mockAgentState.messageHistory = messages
+     // If contextTokenCount not provided, estimate from messages
+@@ -227,7 +229,10 @@ describe('context-pruner handleSteps', () => {
+       contextTokenCount ?? Math.ceil(JSON.stringify(messages).length / 3)
+     const mockLogger = {
+       debug: () => {},
+-      info: () => {},
++      info: (data: unknown, message?: string) => {
++        if (throwOnInfo) throw new Error('logger unavailable')
++        infoLogs?.push({ data, message })
++      },
+       warn: () => {},
+       error: () => {},
+     }
+@@ -270,6 +275,37 @@ describe('context-pruner handleSteps', () => {
+     )
+   })
+ 
++  test('does not emit pruning telemetry when pruning is unnecessary', () => {
++    const infoLogs: Array<{ data: unknown; message?: string }> = []
++
++    runHandleSteps(
++      [createMessage('user', 'Hello')],
++      1_000,
++      200_000,
++      undefined,
++      infoLogs,
++    )
++
++    expect(infoLogs).toEqual([])
++  })
++
++  test('still prunes when telemetry logging throws', () => {
++    const results = runHandleSteps(
++      [createMessage('user', 'Keep this request')],
++      250_000,
++      200_000,
++      undefined,
++      undefined,
++      true,
++    )
++
++    expect(results).toHaveLength(1)
++    expect(results[0].toolName).toBe('set_messages')
++    expect(results[0].input.messages[0].content[0].text).toContain(
++      'Keep this request',
++    )
++  })
++
+   test('summarizes conversation when context exceeds max limit', () => {
+     const messages = [
+       createMessage('user', 'Please help me with this task'),
+@@ -518,7 +554,14 @@ describe('context-pruner handleSteps', () => {
+       prunerParamsPrompt,
+     ]
+ 
+-    const results = runHandleSteps(messages, 250000, 200000)
++    const infoLogs: Array<{ data: any; message?: string }> = []
++    const results = runHandleSteps(
++      messages,
++      250000,
++      200000,
++      undefined,
++      infoLogs,
++    )
+     const resultMessages = results[0].input.messages
+ 
+     expect(resultMessages).toHaveLength(2)
+@@ -535,6 +578,23 @@ describe('context-pruner handleSteps', () => {
+     expect((resultMessages[1].content[0] as { text: string }).text).toBe(
+       'LATEST LIVE REQUEST',
+     )
++    expect(infoLogs).toHaveLength(1)
++    expect(infoLogs[0]).toEqual({
++      message: 'Context pruning completed',
++      data: expect.objectContaining({
++        axiomEvent: 'context_pruning.completed',
++        trigger_reason: 'context_limit',
++        context_token_count: 250000,
++        max_context_length: 200000,
++        live_user_prompt_found: true,
++        live_user_prompt_text_preserved: true,
++        mid_turn: false,
++        dropped_user_entry_count: 0,
++      }),
++    })
++    expect(JSON.stringify(infoLogs[0].data)).not.toContain(
++      'LATEST LIVE REQUEST',
++    )
+   })
+ 
+   test('keeps live user prompt in memory and adds continuation prompt when pruning mid-turn', () => {
+@@ -578,6 +638,40 @@ describe('context-pruner handleSteps', () => {
+     expect(continuationText).toContain('Do not restart completed work')
+   })
+ 
++  test('telemetry reports a mid-turn live prompt that exceeds the user budget', () => {
++    const liveUserPrompt: Message = {
++      role: 'user',
++      content: [{ type: 'text', text: 'OVERSIZED LIVE REQUEST' }],
++      tags: ['USER_PROMPT'],
++    }
++    const prunerParamsPrompt: Message = {
++      role: 'user',
++      content: [{ type: 'text', text: '{"maxContextLength":200000}' }],
++      tags: ['USER_PROMPT'],
++    }
++    const infoLogs: Array<{ data: any; message?: string }> = []
++
++    runHandleSteps(
++      [
++        liveUserPrompt,
++        createMessage('assistant', 'Work in progress'),
++        prunerParamsPrompt,
++      ],
++      250000,
++      200000,
++      { userBudget: 1, assistantToolBudget: 1000 },
++      infoLogs,
++    )
++
++    expect(infoLogs[0].data).toEqual(
++      expect.objectContaining({
++        live_user_prompt_found: true,
++        live_user_prompt_text_preserved: false,
++        dropped_user_entry_count: 1,
++      }),
++    )
++  })
++
+   test('handles empty message history', () => {
+     const messages: Message[] = []
+ 
+diff --git a/agents/context-pruner.ts b/agents/context-pruner.ts
+index 2a148c6a8..145899cb0 100644
+--- a/agents/context-pruner.ts
++++ b/agents/context-pruner.ts
+@@ -42,7 +42,7 @@ const definition: AgentDefinition = {
+   inheritParentSystemPrompt: true,
+   includeMessageHistory: true,
+ 
+-  handleSteps: function* ({ agentState, params }) {
++  handleSteps: function* ({ agentState, params, logger }) {
+     // =============================================================================
+     // Constants (must be inside handleSteps since it's serialized to a string)
+     // =============================================================================
+@@ -78,6 +78,9 @@ const definition: AgentDefinition = {
+     /** Fudge factor for token count threshold to trigger pruning earlier */
+     const TOKEN_COUNT_FUDGE_FACTOR = 1_000
+ 
++    /** Axiom-only operational event understood by the logging adapters. */
++    const CONTEXT_PRUNING_COMPLETED_EVENT = 'context_pruning.completed'
++
+     /** Prompt cache expiry time (Anthropic caches for 5 minutes by default) */
+     const CACHE_EXPIRY_MS: number = params?.cacheExpiryMs ?? 5 * 60 * 1000
+ 
+@@ -379,6 +382,7 @@ const definition: AgentDefinition = {
+     // The USER_PROMPT is the actual user message; INSTRUCTIONS_PROMPT comes after it
+     // We need to find the USER_PROMPT and check the gap between it and the last assistant message
+     let cacheWillMiss = false
++    let cacheGapMs: number | null = null
+     const userPromptIndex = currentMessages.findLastIndex((message) =>
+       message.tags?.includes('USER_PROMPT'),
+     )
+@@ -394,19 +398,19 @@ const definition: AgentDefinition = {
+       }
+       if (userPromptMsg.sentAt && lastAssistantMsg?.sentAt) {
+         const gap = userPromptMsg.sentAt - lastAssistantMsg.sentAt
++        cacheGapMs = gap
+         cacheWillMiss = gap > CACHE_EXPIRY_MS
+       }
+     }
+ 
++    const contextLimitExceeded =
++      agentState.contextTokenCount + TOKEN_COUNT_FUDGE_FACTOR > maxContextLength
++
+     // Check if we need to prune at all:
+     // - Prune when context exceeds max, OR
+     // - Prune when prompt cache will miss (>5 min gap) to take advantage of fresh context
+     // If not, return messages with just the subagent-specific tags removed
+-    if (
+-      agentState.contextTokenCount + TOKEN_COUNT_FUDGE_FACTOR <=
+-        maxContextLength &&
+-      !cacheWillMiss
+-    ) {
++    if (!contextLimitExceeded && !cacheWillMiss) {
+       yield {
+         toolName: 'set_messages',
+         input: { messages: currentMessages },
+@@ -552,10 +556,12 @@ const definition: AgentDefinition = {
+     }
+ 
+     // Phase 1: Summarize ALL messages into tagged entries
+-    const summarizedEntries: Array<{
++    type SummaryEntry = {
+       role: 'user' | 'assistant_tool'
+       parts: string[]
+-    }> = []
++    }
++    const summarizedEntries: SummaryEntry[] = []
++    let liveUserPromptEntry: SummaryEntry | undefined
+ 
+     for (const message of messagesToSummarize) {
+       if (message.role === 'user') {
+@@ -570,10 +576,14 @@ const definition: AgentDefinition = {
+             )
+           }
+           const imageNote = hasImages ? ' [image(s) were attached]' : ''
+-          summarizedEntries.push({
++          const entry: SummaryEntry = {
+             role: 'user',
+             parts: [`[USER]${imageNote}\n${text}`],
+-          })
++          }
++          if (message === latestLiveUserPromptMessage) {
++            liveUserPromptEntry = entry
++          }
++          summarizedEntries.push(entry)
+         }
+       } else if (message.role === 'assistant') {
+         const textParts: string[] = []
+@@ -757,8 +767,11 @@ const definition: AgentDefinition = {
+     }
+ 
+     // Parse previous summary into role-tagged entries and combine with new entries
+-    const allEntries = [
+-      ...parseSummaryIntoEntries(previousSummaryContent),
++    const previousSummaryEntries = parseSummaryIntoEntries(
++      previousSummaryContent,
++    )
++    const allEntries: SummaryEntry[] = [
++      ...previousSummaryEntries,
+       ...summarizedEntries,
+     ]
+ 
+@@ -801,9 +814,11 @@ const definition: AgentDefinition = {
+     // role selection, entries from the other role may still fit, so the old
+     // "summary is empty" fallback is no longer sufficient.
+     const newestEntry = allEntries[allEntries.length - 1]
++    let newestEntryForced = false
+     if (newestEntry && !includedEntries.includes(newestEntry)) {
+       // includedEntries is reverse-chronological until Phase 3.
+       includedEntries.unshift(newestEntry)
++      newestEntryForced = true
+     }
+ 
+     // Phase 3: Build final summary from included entries
+@@ -868,6 +883,64 @@ ${SUMMARY_DISCLAIMER}`,
+       finalMessages.push({ ...latestLiveUserPromptMessage, sentAt: now })
+     }
+ 
++    const userEntryCount = allEntries.filter(
++      (entry) => entry.role === 'user',
++    ).length
++    const assistantToolEntryCount = allEntries.length - userEntryCount
++    const liveUserPromptHasText = latestLiveUserPromptMessage
++      ? getTextContent(latestLiveUserPromptMessage).trim().length > 0
++      : false
++    const liveUserPromptTextPreserved = latestLiveUserPromptMessage
++      ? !isMidTurnPrune ||
++        !liveUserPromptHasText ||
++        (liveUserPromptEntry !== undefined &&
++          includedEntries.includes(liveUserPromptEntry))
++      : false
++    const includedUserEntryCount = includedEntries.filter(
++      (entry) => entry.role === 'user',
++    ).length
++    const includedAssistantToolEntryCount =
++      includedEntries.length - includedUserEntryCount
++    const triggerReason = contextLimitExceeded
++      ? cacheWillMiss
++        ? 'context_limit_and_cache_expiry'
++        : 'context_limit'
++      : 'cache_expiry'
++
++    // Telemetry is best-effort and must never block the actual pruning update.
++    try {
++      logger.info(
++        {
++          axiomEvent: CONTEXT_PRUNING_COMPLETED_EVENT,
++          agent_run_id: agentState.runId,
++          parent_agent_run_id: agentState.parentId,
++          trigger_reason: triggerReason,
++          context_token_count: agentState.contextTokenCount,
++          max_context_length: maxContextLength,
++          ...(cacheGapMs === null ? {} : { cache_gap_ms: cacheGapMs }),
++          cache_expiry_ms: CACHE_EXPIRY_MS,
++          previous_summary_entry_count: previousSummaryEntries.length,
++          user_budget: userBudget,
++          user_entry_count: userEntryCount,
++          dropped_user_entry_count: userEntryCount - includedUserEntryCount,
++          assistant_tool_budget: assistantToolBudget,
++          assistant_tool_entry_count: assistantToolEntryCount,
++          dropped_assistant_tool_entry_count:
++            assistantToolEntryCount - includedAssistantToolEntryCount,
++          mid_turn: isMidTurnPrune,
++          live_user_prompt_found: latestLiveUserPromptMessage !== null,
++          live_user_prompt_text_preserved: liveUserPromptTextPreserved,
++          newest_entry_forced: newestEntryForced,
++          summary_estimated_tokens: Math.ceil(
++            summaryText.length / CHARS_PER_TOKEN,
++          ),
++        },
++        'Context pruning completed',
++      )
++    } catch {
++      // Ignore logging failures; set_messages below is the critical operation.
++    }
++
+     yield {
+       toolName: 'set_messages',
+       input: {
+diff --git a/cli/src/utils/logger.ts b/cli/src/utils/logger.ts
+index 045d4f0d8..c281f6870 100644
+--- a/cli/src/utils/logger.ts
++++ b/cli/src/utils/logger.ts
+@@ -7,6 +7,7 @@ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ import { env, IS_DEV, IS_TEST, IS_CI } from '@codebuff/common/env'
+ import { createAnalyticsDispatcher } from '@codebuff/common/util/analytics-dispatcher'
+ import { getAnalyticsEventId } from '@codebuff/common/util/analytics-log'
++import { getAxiomOnlyLogEvent } from '@codebuff/common/util/axiom-only-log'
+ import {
+   isFullTelemetryEnabled,
+   summarizeAnalyticsValue,
+@@ -153,6 +154,7 @@ function sendAnalyticsAndLog(
+   const normalizedData = isStringOnly ? undefined : data
+   const normalizedMsg = isStringOnly ? (data as string) : msg
+   const includeData = normalizedData != null && !isEmptyObject(normalizedData)
++  const axiomOnlyLogEvent = getAxiomOnlyLogEvent(normalizedData)
+ 
+   const toTrack = {
+     ...(includeData ? { data: normalizedData } : {}),
+@@ -179,7 +181,7 @@ function sendAnalyticsAndLog(
+   // Send all log events to PostHog in production for better observability
+   // Skip if the log already has an eventId (to avoid duplicate tracking)
+   const hasEventId = includeData && getAnalyticsEventId(normalizedData) !== null
+-  if (!IS_DEV && !IS_TEST && !IS_CI && !hasEventId) {
++  if (!IS_DEV && !IS_TEST && !IS_CI && !hasEventId && !axiomOnlyLogEvent) {
+     const fullTelemetry = isFullTelemetryEnabled({
+       distinctId: loggerContext.userId,
+       properties: loggerContext,
+@@ -204,8 +206,14 @@ function sendAnalyticsAndLog(
+   // Mirror the log/event into the server-side Axiom logs sink via /api/logs
+   // (in addition to PostHog). Best-effort and batched; skip noisy debug logs
+   // and anything before we know who the user is.
+-  if (!IS_DEV && !IS_TEST && !IS_CI && loggerContext.userId && level !== 'debug') {
+-    const eventId =
++  if (
++    !IS_DEV &&
++    !IS_TEST &&
++    !IS_CI &&
++    loggerContext.userId &&
++    level !== 'debug'
++  ) {
++    const analyticsEventId =
+       includeData && typeof normalizedData === 'object'
+         ? getAnalyticsEventId(normalizedData)
+         : null
+@@ -219,18 +227,26 @@ function sendAnalyticsAndLog(
+       }) ||
+       level === 'error' ||
+       level === 'fatal'
+-    const shipData = includeData
+-      ? includeRawData
+-        ? normalizedData
+-        : summarizeAnalyticsValue(normalizedData)
+-      : undefined
++    const shipData = axiomOnlyLogEvent
++      ? axiomOnlyLogEvent.data
++      : includeData
++        ? includeRawData
++          ? normalizedData
++          : summarizeAnalyticsValue(normalizedData)
++        : undefined
+     const record: LogRecordInput = {
+       timestamp: new Date().toISOString(),
+       level,
+-      event: eventId ? String(eventId) : undefined,
++      event:
++        axiomOnlyLogEvent?.event ??
++        (analyticsEventId ? String(analyticsEventId) : undefined),
+       message: stringFormat(normalizedMsg ?? '', ...args),
+-      client_session_id: loggerContext.clientSessionId,
+-      client_request_id: loggerContext.clientRequestId,
++      client_session_id:
++        (axiomOnlyLogEvent?.data.client_session_id as string | undefined) ??
++        loggerContext.clientSessionId,
++      client_request_id:
++        (axiomOnlyLogEvent?.data.client_request_id as string | undefined) ??
++        loggerContext.clientRequestId,
+       fingerprint_id: loggerContext.fingerprintId,
+       data: shipData,
+     }
+diff --git a/common/src/schemas/logs.ts b/common/src/schemas/logs.ts
+index b5555a52b..e3d5db3dd 100644
+--- a/common/src/schemas/logs.ts
++++ b/common/src/schemas/logs.ts
+@@ -44,7 +44,7 @@ export const logRecordSchema = z.object({
+   /** Client-supplied event time (ISO 8601). Server falls back to now. */
+   timestamp: z.string().datetime().optional(),
+   level: logLevelSchema.default('info'),
+-  /** AnalyticsEvent name when this is an analytics event. */
++  /** Analytics or operational event name when applicable. */
+   event: z.string().max(200).nullish(),
+   message: z.string().max(MAX_LOG_MESSAGE_LENGTH).nullish(),
+   client_session_id: z.string().max(200).nullish(),
+diff --git a/common/src/types/contracts/logs.ts b/common/src/types/contracts/logs.ts
+index 436cabaac..ff3dec967 100644
+--- a/common/src/types/contracts/logs.ts
++++ b/common/src/types/contracts/logs.ts
+@@ -21,7 +21,7 @@ export type LogRow = {
+   service?: string | null
+   /** Deploy environment: 'dev' | 'test' | 'prod'. */
+   env: string
+-  /** AnalyticsEvent name when this row is an analytics event, else null. */
++  /** Analytics or operational event name when applicable, else null. */
+   event?: string | null
+   /** Human-readable message (the formatted pino msg). */
+   message?: string | null
+diff --git a/common/src/util/__tests__/axiom-only-log.test.ts b/common/src/util/__tests__/axiom-only-log.test.ts
+new file mode 100644
+index 000000000..a4cffe418
+--- /dev/null
++++ b/common/src/util/__tests__/axiom-only-log.test.ts
+@@ -0,0 +1,64 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  CONTEXT_PRUNING_COMPLETED_EVENT,
++  getAxiomOnlyLogEvent,
++} from '../axiom-only-log'
++
++describe('getAxiomOnlyLogEvent', () => {
++  test('sanitizes context-pruning metadata', () => {
++    expect(
++      getAxiomOnlyLogEvent({
++        axiomEvent: CONTEXT_PRUNING_COMPLETED_EVENT,
++        trigger_reason: 'context_limit',
++        client_session_id: 'turn-123',
++        dropped_user_entry_count: 2,
++        live_user_prompt_text_preserved: true,
++        prompt: 'must not leave the client',
++        nested: { secret: true },
++        context_token_count: Number.POSITIVE_INFINITY,
++      }),
++    ).toEqual({
++      event: CONTEXT_PRUNING_COMPLETED_EVENT,
++      data: {
++        trigger_reason: 'context_limit',
++        client_session_id: 'turn-123',
++        dropped_user_entry_count: 2,
++        live_user_prompt_text_preserved: true,
++      },
++    })
++  })
++
++  test('does not treat arbitrary events as Axiom-only', () => {
++    expect(
++      getAxiomOnlyLogEvent({
++        axiomEvent: 'untrusted.event',
++        prompt: 'secret',
++      }),
++    ).toBeNull()
++  })
++
++  test('sanitizes the client wire format identified by its top-level event', () => {
++    expect(
++      getAxiomOnlyLogEvent(
++        {
++          dropped_user_entry_count: 2,
++          prompt: 'must not reach Axiom',
++        },
++        CONTEXT_PRUNING_COMPLETED_EVENT,
++      ),
++    ).toEqual({
++      event: CONTEXT_PRUNING_COMPLETED_EVENT,
++      data: { dropped_user_entry_count: 2 },
++    })
++  })
++
++  test('accepts an allowlisted top-level event with empty data', () => {
++    expect(getAxiomOnlyLogEvent(null, CONTEXT_PRUNING_COMPLETED_EVENT)).toEqual(
++      {
++        event: CONTEXT_PRUNING_COMPLETED_EVENT,
++        data: {},
++      },
++    )
++  })
++})
+diff --git a/common/src/util/axiom-only-log.ts b/common/src/util/axiom-only-log.ts
+new file mode 100644
+index 000000000..1a42a4ec0
+--- /dev/null
++++ b/common/src/util/axiom-only-log.ts
+@@ -0,0 +1,78 @@
++/**
++ * Operational events that belong in Axiom but not in product analytics.
++ *
++ * CLI logs normally redact structured info payloads before shipping and also
++ * mirror a sampled `cli_log` event to PostHog. This allowlist lets a small set
++ * of content-free operational events retain useful numeric metadata in Axiom
++ * without becoming product events or providing a general redaction bypass.
++ */
++
++export const CONTEXT_PRUNING_COMPLETED_EVENT =
++  'context_pruning.completed' as const
++
++const CONTEXT_PRUNING_FIELDS = {
++  agent_run_id: 'string',
++  parent_agent_run_id: 'string',
++  client_session_id: 'string',
++  client_request_id: 'string',
++  trigger_reason: 'string',
++  context_token_count: 'number',
++  max_context_length: 'number',
++  cache_gap_ms: 'number',
++  cache_expiry_ms: 'number',
++  previous_summary_entry_count: 'number',
++  user_budget: 'number',
++  user_entry_count: 'number',
++  dropped_user_entry_count: 'number',
++  assistant_tool_budget: 'number',
++  assistant_tool_entry_count: 'number',
++  dropped_assistant_tool_entry_count: 'number',
++  summary_estimated_tokens: 'number',
++  mid_turn: 'boolean',
++  live_user_prompt_found: 'boolean',
++  live_user_prompt_text_preserved: 'boolean',
++  newest_entry_forced: 'boolean',
++} as const satisfies Record<string, 'string' | 'number' | 'boolean'>
++
++export type AxiomOnlyLogEvent = {
++  event: typeof CONTEXT_PRUNING_COMPLETED_EVENT
++  data: Record<string, string | number | boolean>
++}
++
++/**
++ * Return a sanitized Axiom-only event, or null for ordinary logger payloads.
++ * Unknown keys and unexpected value types are deliberately discarded.
++ */
++export function getAxiomOnlyLogEvent(
++  data: unknown,
++  event?: string | null,
++): AxiomOnlyLogEvent | null {
++  const record =
++    data != null && typeof data === 'object' && !Array.isArray(data)
++      ? (data as Record<string, unknown>)
++      : {}
++  if (
++    record.axiomEvent !== CONTEXT_PRUNING_COMPLETED_EVENT &&
++    event !== CONTEXT_PRUNING_COMPLETED_EVENT
++  ) {
++    return null
++  }
++
++  const sanitized: Record<string, string | number | boolean> = {}
++  for (const [key, expectedType] of Object.entries(CONTEXT_PRUNING_FIELDS)) {
++    const value = record[key]
++    if (typeof value !== expectedType) continue
++    if (typeof value === 'string') {
++      sanitized[key] = value.slice(0, 200)
++    } else if (typeof value === 'number' && Number.isFinite(value)) {
++      sanitized[key] = value
++    } else if (typeof value === 'boolean') {
++      sanitized[key] = value
++    }
++  }
++
++  return {
++    event: CONTEXT_PRUNING_COMPLETED_EVENT,
++    data: sanitized,
++  }
++}

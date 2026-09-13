@@ -90,6 +90,21 @@ export async function diffPatch (repoDir, base, head, paths, maxBytes = 24000) {
   return out.length > maxBytes ? out.slice(0, maxBytes) + '\n…[truncated]…\n' : out
 }
 
+// Clean unified diff of a commit for in-browser inspection, excluding lockfiles.
+export async function extractCleanDiff (repoDir, base, head, maxBytes = 48000) {
+  const args = [
+    'diff', '--no-color', '-U3', `${base}...${head}`,
+    '--', '.',
+    ':(exclude)*bun.lock*',
+    ':(exclude)*package-lock.json',
+    ':(exclude)*pnpm-lock.yaml',
+    ':(exclude)*yarn.lock'
+  ]
+  const out = await git(args, repoDir)
+  if (!out) return ''
+  return out.length > maxBytes ? out.slice(0, maxBytes) + '\n\n… [diff truncated — view full diff on GitHub] …\n' : out
+}
+
 // ---------------------------------------------------------------------------
 // 3. Semantic extractors
 // ---------------------------------------------------------------------------
@@ -98,33 +113,69 @@ export async function diffPatch (repoDir, base, head, paths, maxBytes = 24000) {
 //   | **GPT-5.6 Luna** | Full access | Strong all-around with native images |
 const MODEL_ROW_RE = /^\|\s*\*\*(.+?)\*\*\s*\|/
 
+const PRODUCT_NAMES = new Set([
+  'Freebuff Desktop',
+  'Freebuff CLI',
+  'Freebuff Web',
+  'Freebuff Cloud',
+  'Freebuff Chat'
+])
+
 export function extractModelTableChanges (patch) {
-  const added = [], removed = []
+  const rawAdded = [], rawRemoved = []
+  let inProductTable = false
   for (const line of patch.split('\n')) {
+    if (/^@@/.test(line)) inProductTable = false
+    if (/\|\s*Product\s*\|/i.test(line) || /Choose your Freebuff/i.test(line)) {
+      inProductTable = true
+      continue
+    }
+    if (/\|\s*Model\s*\|/i.test(line) || /model catalog/i.test(line)) {
+      inProductTable = false
+      continue
+    }
+    if (inProductTable) continue
+
     if (line.startsWith('+') && !line.startsWith('+++')) {
       const m = MODEL_ROW_RE.exec(line.slice(1))
-      if (m) added.push(m[1].trim())
+      if (m) {
+        const name = m[1].trim()
+        if (!PRODUCT_NAMES.has(name) && !/^Freebuff (Desktop|CLI|Web|Cloud|Chat)/i.test(name)) {
+          rawAdded.push(name)
+        }
+      }
     } else if (line.startsWith('-') && !line.startsWith('---')) {
       const m = MODEL_ROW_RE.exec(line.slice(1))
-      if (m) removed.push(m[1].trim())
+      if (m) {
+        const name = m[1].trim()
+        if (!PRODUCT_NAMES.has(name) && !/^Freebuff (Desktop|CLI|Web|Cloud|Chat)/i.test(name)) {
+          rawRemoved.push(name)
+        }
+      }
     }
   }
+
+  // Net set differences: a model present in both added and removed only had description/metadata modified
+  const added = rawAdded.filter(m => !rawRemoved.includes(m))
+  const removed = rawRemoved.filter(m => !rawAdded.includes(m))
   return { added, removed }
 }
 
-// Pricing lines like `input: 0.25, output: 1` etc. in constants files.
+// Version bump in package.json
 export function extractVersionBump (patch) {
-  const adds = [...patch.matchAll(/^\+\s*"version":\s*"([\d.]+)"/gm)].map(x => x[1])
+  const adds = [...patch.matchAll(/^\+\s*['"]version['"]:\s*['"]([\d.]+)['"]/gm)].map(x => x[1])
   return adds.length ? adds[adds.length - 1] : null
 }
 
 // Slash-commands registry: cli/src/constants/commands.ts or similar.
 export function extractSlashCommandChanges (patch) {
-  const added = [...patch.matchAll(/^\+\s*name:\s*'([/a-z0-9-]+)'/gm)].map(x => x[1])
-  const removed = [...patch.matchAll(/^-\s*name:\s*'([/a-z0-9-]+)'/gm)].map(x => x[1])
+  const rawAdded = [...patch.matchAll(/^\+\s*name:\s*['"`]([/a-z0-9-]+)['"`]/gm)].map(x => x[1])
+  const rawRemoved = [...patch.matchAll(/^-\s*name:\s*['"`]([/a-z0-9-]+)['"`]/gm)].map(x => x[1])
+  const filteredAdded = rawAdded.filter(c => c.startsWith('/'))
+  const filteredRemoved = rawRemoved.filter(c => c.startsWith('/'))
   return {
-    added: added.filter(c => c.startsWith('/')),
-    removed: removed.filter(c => c.startsWith('/'))
+    added: filteredAdded.filter(c => !filteredRemoved.includes(c)),
+    removed: filteredRemoved.filter(c => !filteredAdded.includes(c))
   }
 }
 
@@ -132,6 +183,8 @@ const AREA_MAP = [
   [/^cli\//, 'CLI'],
   [/^common\//, 'Shared/Core'],
   [/^packages\/agent-runtime\//, 'Agent Runtime'],
+  [/^packages\/code-map\//, 'Code Map'],
+  [/^packages\/llm-providers\//, 'LLM Providers'],
   [/^packages\//, 'Packages'],
   [/^sdk\//, 'SDK'],
   [/^agents\//, 'Agents'],
@@ -150,14 +203,14 @@ export function areaOf (path) {
 
 export function isNoiseFile (p) {
   return (
-    p === 'bun.lock' || p === 'package-lock.json' || p === 'yarn.lock' ||
+    /(^|\/)(bun\.lockb?|package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/.test(p) ||
+    p === '.bun-version' ||
     /^snapcraft\/icons\//.test(p) ||
-    /\.svg$/.test(p) ||
-    p === '.bun-version'
+    /\.svg$/.test(p)
   )
 }
 
-const TEST_RE = /(^|\/)(__tests__|tests?)\/|\.test\.tsx?$/
+export const TEST_RE = /(^|\/)(__tests__|tests?)\/|\.(test|spec)\.[jt]sx?$/
 
 // ---------------------------------------------------------------------------
 // 4. Entry builder for one sync commit
@@ -167,6 +220,8 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
   const files = await diffNameStatus(repoDir, prevSha, commit.sha)
   const { additions, deletions } = await diffNumstat(repoDir, prevSha, commit.sha)
   const meaningful = files.filter(f => !isNoiseFile(f.path))
+  const sourceMeaningful = meaningful.filter(f => !TEST_RE.test(f.path))
+  const testOnly = meaningful.length > 0 && sourceMeaningful.length === 0
   const areas = [...new Set(meaningful.map(f => areaOf(f.path)))].filter(a => a !== 'Repo')
 
   const facts = []
@@ -177,7 +232,7 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
   let cmdChanges = null
   if (patchTargets.length) {
     const patch = await diffPatch(repoDir, prevSha, commit.sha, patchTargets)
-    const readmePatch = patchForFile(patch, 'README.md')
+    const readmePatch = patchForFile(patch, 'README.md') || patchForFile(patch, 'README.zh-CN.md')
     if (readmePatch) {
       const mc = extractModelTableChanges(readmePatch)
       if (mc.added.length || mc.removed.length) modelChanges = mc
@@ -191,14 +246,16 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
     facts.push(...extractCommentFacts(patch))
   }
 
-  const added = meaningful.filter(f => f.status === 'added' && !TEST_RE.test(f.path)).map(f => f.path)
-  const removed = meaningful.filter(f => f.status === 'removed' && !TEST_RE.test(f.path)).map(f => f.path)
-  const renamed = meaningful.filter(f => f.status === 'renamed')
-  const modified = meaningful.filter(f => f.status === 'modified')
+  // Consistent source file lists (tests excluded so headlines and chips match real code)
+  const added = sourceMeaningful.filter(f => f.status === 'added').map(f => f.path)
+  const removed = sourceMeaningful.filter(f => f.status === 'removed').map(f => f.path)
+  const renamed = sourceMeaningful.filter(f => f.status === 'renamed')
+  const modified = sourceMeaningful.filter(f => f.status === 'modified').map(f => f.path)
 
   const entry = {
     kind: 'sync',
     sha: commit.sha,
+    prevSha,
     url: `${repoMeta.repoUrl}/commit/${commit.sha}`,
     compareUrl: `${repoMeta.compareUrl}/${prevSha.slice(0, 12)}...${commit.sha.slice(0, 12)}`,
     date: commit.date,
@@ -209,11 +266,13 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
     cmdChanges,
     files: {
       total: files.length,
-      meaningful: meaningful.length,
+      meaningful: sourceMeaningful.length,
+      rawMeaningful: meaningful.length,
+      testOnly,
       added: added.slice(0, 12),
       removed: removed.slice(0, 12),
       renamed: renamed.slice(0, 8).map(r => ({ from: r.from, to: r.path })),
-      modified: modified.slice(0, 16).map(m => m.path)
+      modified: modified.slice(0, 16)
     },
     stats: { additions, deletions },
     facts: facts.slice(0, 6)
@@ -226,12 +285,13 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
 
 function pickPatchTargets (files) {
   const score = (p) => {
-    if (p === 'README.md') return 10
+    if (TEST_RE.test(p)) return 0 // Test assertion comments and mocks must never become changelog facts
+    if (p === 'README.md' || p === 'README.zh-CN.md') return 10
     if (/package\.json$/.test(p)) return 9
     if (/commands?\.(ts|tsx|js)$/.test(p) || /slash/i.test(p)) return 8
     if (/constants?\//.test(p)) return 7
     if (/\.md$/.test(p)) return 5
-    if (/\.tsx?$/.test(p) && !TEST_RE.test(p)) return 3
+    if (/\.[jt]sx?$/.test(p)) return 3
     return 0
   }
   return files
@@ -252,9 +312,9 @@ function patchForFile (patch, file) {
 
 // Pull out informative code comments the Freebuff team leaves in diffs
 // (they write unusually thorough rationale comments; e.g. model retirements).
-// Consecutive added/removed comment lines are joined into paragraphs; only
+// Consecutive added comment lines are joined into paragraphs; only
 // mostly-prose, sentence-terminated paragraphs survive (kills identifier junk).
-function extractCommentFacts (patch) {
+export function extractCommentFacts (patch) {
   const facts = []
   let buf = []
   const flush = () => {
@@ -274,6 +334,8 @@ function extractCommentFacts (patch) {
   for (const line of patch.split('\n')) {
     const m = /^([+-])\s*(?:\/\/|\/\*+|\*+)\s?(.*)$/.exec(line)
     if (!m) { flush(); continue }
+    // Only capture added comments; ignore deletions and flush on deletion
+    if (m[1] !== '+') { flush(); continue }
     const t = m[2].replace(/\*\/\s*$/, '').trim()
     if (!t) { flush(); continue }
     buf.push(t)
@@ -348,7 +410,7 @@ export function entryTitle (e) {
 
 function shortBaseName (p) {
   const b = p.split('/').pop()
-  return b.replace(/\.(ts|tsx|js|json|md)$/, '')
+  return b.replace(/\.(test|spec)\.[jt]sx?$/, '').replace(/\.(ts|tsx|js|jsx|json|md)$/, '')
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +424,8 @@ export async function analyzeCommunityCommit (repoDir, commit, prevSha, repoMeta
     stats = await diffNumstat(repoDir, prevSha, commit.sha)
   }
   const meaningful = files.filter(f => !isNoiseFile(f.path))
+  const sourceMeaningful = meaningful.filter(f => !TEST_RE.test(f.path))
+  const testOnly = meaningful.length > 0 && sourceMeaningful.length === 0
   const areas = [...new Set(meaningful.map(f => areaOf(f.path)))].filter(a => a !== 'Repo')
   const prMatch = /\(#(\d+)\)/.exec(commit.subject)
   const verMatch = /[Bb]ump (?:\w+ )*version(?: to)? (\d+\.\d+\.\d+)/.exec(commit.subject)
@@ -379,10 +443,14 @@ export async function analyzeCommunityCommit (repoDir, commit, prevSha, repoMeta
     modelChanges: null,
     cmdChanges: null,
     files: {
-      total: files.length, meaningful: meaningful.length,
-      added: meaningful.filter(f => f.status === 'added').map(f => f.path).slice(0, 12),
-      removed: meaningful.filter(f => f.status === 'removed').map(f => f.path).slice(0, 12),
-      renamed: [], modified: meaningful.filter(f => f.status === 'modified').map(f => f.path).slice(0, 16)
+      total: files.length,
+      meaningful: sourceMeaningful.length,
+      rawMeaningful: meaningful.length,
+      testOnly,
+      added: sourceMeaningful.filter(f => f.status === 'added').map(f => f.path).slice(0, 12),
+      removed: sourceMeaningful.filter(f => f.status === 'removed').map(f => f.path).slice(0, 12),
+      renamed: [],
+      modified: sourceMeaningful.filter(f => f.status === 'modified').map(f => f.path).slice(0, 16)
     },
     stats,
     facts: []
@@ -391,14 +459,4 @@ export async function analyzeCommunityCommit (repoDir, commit, prevSha, repoMeta
   entry.title = entryTitle(entry)
   entry.tags = tagsFor(entry)
   return entry
-}
-
-// Filter: skip commits whose meaningful content is nil.
-export function skipEntry (e) {
-  if (e.kind === 'sync') {
-    if (e.files.meaningful === 0 && !e.modelChanges && !e.version) return true
-    if (e.files.total > 60 && e.files.meaningful <= 4 && !e.modelChanges && !e.version) return false
-    return false
-  }
-  return false
 }

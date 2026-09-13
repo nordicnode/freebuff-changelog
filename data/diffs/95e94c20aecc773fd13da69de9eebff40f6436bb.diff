@@ -1,0 +1,729 @@
+diff --git a/common/src/util/__tests__/ad-experiment.test.ts b/common/src/util/__tests__/ad-experiment.test.ts
+new file mode 100644
+index 000000000..74a512524
+--- /dev/null
++++ b/common/src/util/__tests__/ad-experiment.test.ts
+@@ -0,0 +1,36 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  IMPREZIA_EXPERIMENT_PERCENT,
++  adExperimentArmForUser,
++} from '../ad-experiment'
++
++describe('imprezia experiment arm', () => {
++  test('signed-out sessions stay in control', () => {
++    for (const id of [null, undefined, '']) {
++      expect(adExperimentArmForUser(id)).toBe('control')
++    }
++  })
++
++  test('a user gets the same arm every time', () => {
++    for (const id of ['abc', 'user-42', 'a-very-long-uuid-like-identifier']) {
++      const first = adExperimentArmForUser(id)
++      for (let i = 0; i < 20; i++) {
++        expect(adExperimentArmForUser(id)).toBe(first)
++      }
++    }
++  })
++
++  test(`puts ~${IMPREZIA_EXPERIMENT_PERCENT}% of users in the arm`, () => {
++    const N = 20_000
++    let inArm = 0
++    for (let i = 0; i < N; i++) {
++      if (adExperimentArmForUser(`user-${i}`) === 'imprezia_first') inArm++
++    }
++    const percent = (inArm / N) * 100
++    // FNV-1a over sequential ids is not a perfect uniform source, so allow a
++    // point of slack rather than asserting an exact count.
++    expect(percent).toBeGreaterThan(IMPREZIA_EXPERIMENT_PERCENT - 1.5)
++    expect(percent).toBeLessThan(IMPREZIA_EXPERIMENT_PERCENT + 1.5)
++  })
++})
+diff --git a/common/src/util/__tests__/imprezia-impression-fields.test.ts b/common/src/util/__tests__/imprezia-impression-fields.test.ts
+new file mode 100644
+index 000000000..ad749d249
+--- /dev/null
++++ b/common/src/util/__tests__/imprezia-impression-fields.test.ts
+@@ -0,0 +1,80 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  impreziaImpressionFields,
++  impreziaImpressionUrl,
++  parseImpreziaBeaconRecord,
++} from '../imprezia-ad'
++
++import type { ImpreziaAd } from '../imprezia-ad'
++
++const ad: ImpreziaAd = {
++  creative: {
++    brandName: 'Acme',
++    title: 'Ship faster',
++    description: 'A tool for shipping',
++    cta: 'Try it',
++    logoUrl: 'https://cdn.example/logo.png',
++  },
++  clickUrl: 'https://click.imprezia.ai/abc',
++  impression: {
++    impressionUuid: 'uuid-1',
++    beaconToken: { token: 'tok', issuedAt: 123, kid: 'k1' },
++    servedAt: '2026-08-22T00:00:00.000Z',
++    publisherId: 'pub-1',
++  },
++}
++
++const fields = () =>
++  impreziaImpressionFields({
++    ad,
++    requestId: 'req-1',
++    sessionId: 'sess-1',
++    baseUrl: 'https://api.imprezia.ai',
++  })
++
++describe('imprezia impression fields', () => {
++  test('imp_url carries the impressionUuid', () => {
++    // The join key: Imprezia's response has no payout, so per-arm revenue is
++    // only assemblable by matching their billed impressions back to our
++    // tagged rows through this id.
++    expect(fields().impUrl).toBe(impreziaImpressionUrl('uuid-1'))
++    expect(fields().impUrl).toContain('uuid-1')
++  })
++
++  test('maps the creative onto the ledger columns', () => {
++    expect(fields()).toMatchObject({
++      adText: 'A tool for shipping',
++      title: 'Ship faster',
++      cta: 'Try it',
++      // One tracked click URL, no separate landing page.
++      url: 'https://click.imprezia.ai/abc',
++      clickUrl: 'https://click.imprezia.ai/abc',
++      favicon: 'https://cdn.example/logo.png',
++    })
++  })
++
++  test('carries the beacon forward so the impression can be reported later', () => {
++    // The auction and the render happen in different requests; a token that
++    // does not survive means the serve can never be billed.
++    const record = parseImpreziaBeaconRecord(fields().providerMeta)
++    expect(record).toMatchObject({
++      baseUrl: 'https://api.imprezia.ai',
++      requestId: 'req-1',
++      sessionId: 'sess-1',
++      clickUrl: 'https://click.imprezia.ai/abc',
++    })
++    expect(record?.impression.beaconToken?.token).toBe('tok')
++  })
++
++  test('a missing logo becomes an empty favicon, not undefined', () => {
++    // favicon is NOT NULL on ad_impression.
++    const withoutLogo = impreziaImpressionFields({
++      ad: { ...ad, creative: { ...ad.creative, logoUrl: undefined } },
++      requestId: 'r',
++      sessionId: 's',
++      baseUrl: 'https://api.imprezia.ai',
++    })
++    expect(withoutLogo.favicon).toBe('')
++  })
++})
+diff --git a/common/src/util/ad-experiment.ts b/common/src/util/ad-experiment.ts
+new file mode 100644
+index 000000000..a748fce3e
+--- /dev/null
++++ b/common/src/util/ad-experiment.ts
+@@ -0,0 +1,58 @@
++/**
++ * Which ad network gets first refusal on a sponsored slot.
++ *
++ * Imprezia reaches users two different ways, and the whole point of this
++ * module is that the two stay tellable apart:
++ *
++ * - As the PRIMARY for a random {@link IMPREZIA_EXPERIMENT_PERCENT}% of users.
++ *   This is the experiment arm — a clean random subset whose revenue can be
++ *   compared against control.
++ * - As Gravity's FALLBACK for everyone else, ahead of Carbon. This is not
++ *   random: it only ever sees the turns Gravity declined, which is a biased
++ *   sample by construction and would drag the arm's numbers down if the two
++ *   were pooled.
++ *
++ * Bucketing lives in `common` rather than in either web app because a user
++ * must land in the same arm on every surface. Bucketing per product would let
++ * one person be in the arm on the CLI and in control in chat, which makes
++ * per-arm revenue uncomparable across products — the exact comparison this
++ * experiment exists to support.
++ */
++
++/**
++ * Salt for the assignment hash. Changing this re-randomizes every user, so it
++ * carries a date: a new experiment gets a new key rather than silently
++ * reshuffling this one's cohort mid-flight.
++ */
++export const IMPREZIA_EXPERIMENT = 'ads_imprezia_primary_2026_08'
++
++/** Share of signed-in users who get Imprezia first refusal. */
++export const IMPREZIA_EXPERIMENT_PERCENT = 10
++
++export type AdExperimentArm = 'imprezia_first' | 'control'
++
++/** FNV-1a 32-bit: tiny, dependency-free, stable across runtimes. */
++export function fnv1a(input: string): number {
++  let hash = 0x811c9dc5
++  for (let i = 0; i < input.length; i++) {
++    hash ^= input.charCodeAt(i)
++    hash = Math.imul(hash, 0x01000193)
++  }
++  return hash >>> 0
++}
++
++/**
++ * Deterministic arm for a signed-in user. Stable across devices, sessions and
++ * products, because it is a pure function of the user id.
++ */
++export function adExperimentArmForUser(
++  userId: string | null | undefined,
++): AdExperimentArm {
++  // Every ad surface rejects unauthenticated callers, so a missing id means no
++  // ad is served at all. Park those in control rather than letting them dilute
++  // the arm with impressions that never happened.
++  if (!userId) return 'control'
++
++  const bucket = fnv1a(`${IMPREZIA_EXPERIMENT}:${userId}`) % 100
++  return bucket < IMPREZIA_EXPERIMENT_PERCENT ? 'imprezia_first' : 'control'
++}
+diff --git a/common/src/util/imprezia-ad.ts b/common/src/util/imprezia-ad.ts
+new file mode 100644
+index 000000000..3f6788888
+--- /dev/null
++++ b/common/src/util/imprezia-ad.ts
+@@ -0,0 +1,352 @@
++import { z } from 'zod'
++
++/**
++ * Imprezia Chat Ads API (https://imprezia.ai).
++ *
++ * Docs: https://demo.imprezia.ai/docs?platform=web (Chat Ads API — REST,
++ * server-to-server).
++ *
++ * Key facts:
++ * - POST {base}/v1/ads/chat, authenticated with the publisher key in the
++ *   `X-API-Key` header. Server-to-server only — the key must never reach the
++ *   browser.
++ * - The key prefix selects the environment: `api_pub_sandbox_` keys talk to
++ *   api-sandbox.imprezia.ai, `api_pub_prod_` keys to api.imprezia.ai. We key
++ *   off the prefix rather than NODE_ENV so a sandbox key deployed to prod
++ *   still cannot bill live advertisers.
++ * - One call per completed chat turn; it takes both the user message and the
++ *   finished assistant reply. Returns `{ requestId, ad }` with `ad: null` on
++ *   no-fill. Ads are single-use: never cached or replayed across turns.
++ * - Billing runs on two browser-fired beacons (see buildBeaconPayload). An ad
++ *   that never reports the viewable beacon is never counted or paid.
++ *
++ * This module is isomorphic and lives in `common` because three callers share
++ * it: the freebuff web chat route, its browser renderer, and the ad-provider
++ * used by the CLI/Desktop auction endpoint. It pulls in nothing server-only.
++ */
++
++/** Version label we report as `sdkVersion` on every beacon. */
++const IMPREZIA_INTEGRATION_VERSION = 'freebuff-web/1.0.0'
++
++export const IMPREZIA_SANDBOX_BASE_URL = 'https://api-sandbox.imprezia.ai'
++export const IMPREZIA_PROD_BASE_URL = 'https://api.imprezia.ai'
++
++const SANDBOX_KEY_PREFIX = 'api_pub_sandbox_'
++
++/**
++ * Field limits from the request contract. We clamp to these rather than
++ * rejecting: a 60k-character assistant reply is a normal chat turn, and
++ * dropping the whole ad call over it would just be lost revenue.
++ */
++export const IMPREZIA_LIMITS = {
++  request: 10_000,
++  response: 50_000,
++  sessionId: 100,
++} as const
++
++/**
++ * Pick the API base URL from the key prefix. Sandbox keys must never hit the
++ * production endpoint (and vice versa) — the key is the source of truth for
++ * which environment we are in.
++ */
++export function impreziaBaseUrlForKey(apiKey: string): string {
++  return apiKey.startsWith(SANDBOX_KEY_PREFIX)
++    ? IMPREZIA_SANDBOX_BASE_URL
++    : IMPREZIA_PROD_BASE_URL
++}
++
++/**
++ * Sandbox keys serve real-looking *test* creatives (Imprezia's own house ad),
++ * which must never reach production users. The key prefix keeps us off the
++ * production ledger; this keeps test inventory off the production site. Both
++ * ad routes refuse to serve when this is true in prod.
++ */
++export function isImpreziaSandboxKey(apiKey: string): boolean {
++  return apiKey.startsWith(SANDBOX_KEY_PREFIX)
++}
++
++const impreziaDeviceTypeSchema = z.enum(['desktop', 'mobile', 'tablet'])
++
++export type ImpreziaDeviceType = z.infer<typeof impreziaDeviceTypeSchema>
++
++export const impreziaDeviceContextSchema = z.object({
++  deviceType: impreziaDeviceTypeSchema,
++  viewportWidth: z.number().int().positive(),
++  viewportHeight: z.number().int().positive(),
++})
++
++export type ImpreziaDeviceContext = z.infer<typeof impreziaDeviceContextSchema>
++
++/**
++ * Third-party measurement attached by the demand partners funding the ad.
++ * Delivering it is not optional — undelivered measurement means the
++ * advertiser never counts the impression.
++ *
++ * Each of the two moments (insertion, MRC50) arrives in exactly one of two
++ * channels: a URL array to fire as pixels, or a frame URL to embed as a
++ * hidden iframe. A presence check on the frame field picks correctly and
++ * cannot double-count.
++ */
++const impreziaTrackersSchema = z.object({
++  impression: z.array(z.string()).optional(),
++  mrc50: z.array(z.string()).optional(),
++  impressionFrameUrl: z.string().optional(),
++  viewabilityFrameUrl: z.string().optional(),
++})
++
++export type ImpreziaTrackers = z.infer<typeof impreziaTrackersSchema>
++
++const impreziaBeaconTokenSchema = z.object({
++  token: z.string(),
++  issuedAt: z.number(),
++  kid: z.string(),
++})
++
++const impreziaImpressionSchema = z.object({
++  impressionUuid: z.string(),
++  beaconToken: impreziaBeaconTokenSchema.optional(),
++  servedAt: z.string(),
++  publisherId: z.string(),
++})
++
++const impreziaCreativeSchema = z.object({
++  brandName: z.string(),
++  title: z.string(),
++  description: z.string(),
++  cta: z.string(),
++  // Not always present. When they ARE present, rendering them is required.
++  logoUrl: z.string().optional(),
++  imageUrl: z.string().optional(),
++})
++
++export const impreziaAdSchema = z.object({
++  creative: impreziaCreativeSchema,
++  clickUrl: z.string(),
++  trackers: impreziaTrackersSchema.optional(),
++  impression: impreziaImpressionSchema,
++})
++
++export type ImpreziaAd = z.infer<typeof impreziaAdSchema>
++
++/** Shape of a 200 from POST /v1/ads/chat. `ad` is null on no-fill. */
++export const impreziaChatAdResponseSchema = z.object({
++  requestId: z.string(),
++  ad: impreziaAdSchema.nullable().optional(),
++})
++
++/**
++ * What our own API route hands the browser: the decision plus the base URL
++ * the client should post beacons to. The API key is deliberately absent — the
++ * beacon endpoint is unauthenticated, so the browser never needs it.
++ */
++export type ImpreziaDecision = {
++  requestId: string
++  ad: ImpreziaAd
++  baseUrl: string
++}
++
++/**
++ * The two beacon event types, spelled exactly as the API expects.
++ *
++ * These strings are load-bearing: a beacon whose eventType is missing or
++ * unrecognized is counted as `sdk_impression` (the billable viewable
++ * impression), so a typo in `sdk_impression_inserted` silently reports a
++ * viewable impression that was never viewable. Always reference these
++ * constants rather than writing the literals at call sites.
++ */
++export const IMPREZIA_EVENT_INSERTED = 'sdk_impression_inserted' as const
++export const IMPREZIA_EVENT_VIEWABLE = 'sdk_impression' as const
++
++export type ImpreziaEventType =
++  | typeof IMPREZIA_EVENT_INSERTED
++  | typeof IMPREZIA_EVENT_VIEWABLE
++
++export const IMPREZIA_BEACON_PATH = '/v1/events/sdk-impression'
++
++/**
++ * Build the beacon body. Every value the API gave us is echoed back exactly
++ * as received — `impressionUuid`, the three `beaconToken` fields, `servedAt`
++ * as `serverTimestamp`, and `clickUrl` as `generatedUrl`. When `beaconToken`
++ * is absent the three token fields are omitted entirely rather than sent as
++ * null/undefined.
++ */
++export function buildBeaconPayload(params: {
++  // Structural, not `ImpreziaDecision`: the server-side path reconstitutes
++  // only the handful of fields a beacon echoes (see ImpreziaBeaconRecord)
++  // rather than storing an entire creative it already has in table columns.
++  decision: {
++    requestId: string
++    ad: Pick<ImpreziaAd, 'clickUrl' | 'impression'>
++  }
++  eventType: ImpreziaEventType
++  sessionId: string
++  eventId: string
++  clientTimestamp: string
++}): Record<string, unknown> {
++  const { decision, eventType, sessionId, eventId, clientTimestamp } = params
++  const { requestId, ad } = decision
++  const token = ad.impression.beaconToken
++
++  return {
++    eventId,
++    eventType,
++    requestId,
++    sdkVersion: IMPREZIA_INTEGRATION_VERSION,
++    clientTimestamp,
++    serverTimestamp: ad.impression.servedAt,
++    generatedUrl: ad.clickUrl,
++    impressionUuid: ad.impression.impressionUuid,
++    ...(token
++      ? {
++          impressionToken: token.token,
++          tokenIssuedAt: token.issuedAt,
++          tokenKid: token.kid,
++        }
++      : {}),
++    placementType: 'uicard',
++    publisherId: ad.impression.publisherId,
++    sessionId,
++  }
++}
++
++/**
++ * `sourceUrl` must be the page origin + path only. Strip any query string or
++ * fragment rather than trusting the caller, since the chat URL carries thread
++ * ids we have no reason to hand an ad network.
++ */
++export function normalizeSourceUrl(raw: string): string | null {
++  try {
++    const url = new URL(raw)
++    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null
++    return `${url.origin}${url.pathname}`
++  } catch {
++    return null
++  }
++}
++
++/**
++ * Classify the end user's device for `deviceContext.deviceType`.
++ *
++ * Width alone is not enough — a desktop browser dragged narrow is still a
++ * desktop, and a tablet in portrait is not a phone — so the touch capability
++ * and the UA both get a say. Pure and parameterised so the branches are
++ * testable without a DOM.
++ */
++export function detectDeviceType(params: {
++  userAgent: string
++  width: number
++  maxTouchPoints: number
++}): ImpreziaDeviceType {
++  const { userAgent, width, maxTouchPoints } = params
++  const ua = userAgent.toLowerCase()
++  const isTouch = maxTouchPoints > 0
++
++  // iPadOS reports a desktop UA, so the touch check is what catches it.
++  if (ua.includes('ipad') || ua.includes('tablet')) return 'tablet'
++  if (ua.includes('mobi') || ua.includes('iphone') || ua.includes('android')) {
++    // Android tablets say "Android" but omit "Mobi".
++    return ua.includes('android') && !ua.includes('mobi') ? 'tablet' : 'mobile'
++  }
++  if (isTouch && width >= 600 && width < 1024) return 'tablet'
++  if (isTouch && width < 600) return 'mobile'
++  return 'desktop'
++}
++
++/**
++ * The minimum an Imprezia impression needs to be reported LATER, from a
++ * different process than the one that won the auction.
++ *
++ * The browser path never needs this — it holds the decision in memory and
++ * beacons from the page. The CLI and Desktop do: they auction on our server,
++ * render in a terminal, then call back to say "shown", by which point the
++ * signed token has to still exist somewhere. It is stored on the impression
++ * row (`ad_impression.provider_meta`) rather than handed to the client,
++ * because that endpoint deliberately trusts only server-side state.
++ *
++ * Deliberately excludes the creative: title, description, cta, click url and
++ * favicon are already their own columns on that row, and duplicating them
++ * into a JSON blob on a table this large is pure cost.
++ */
++export type ImpreziaBeaconRecord = {
++  /** Environment-correct API base, resolved from the key prefix at auction. */
++  baseUrl: string
++  requestId: string
++  sessionId: string
++  /** Echoed back as `generatedUrl`. */
++  clickUrl: string
++  impression: ImpreziaAd['impression']
++}
++
++/** Parse a stored {@link ImpreziaBeaconRecord}, or null if it is unusable. */
++export function parseImpreziaBeaconRecord(
++  raw: string | null | undefined,
++): ImpreziaBeaconRecord | null {
++  if (!raw) return null
++  try {
++    const parsed = impreziaBeaconRecordSchema.safeParse(JSON.parse(raw))
++    return parsed.success ? parsed.data : null
++  } catch {
++    return null
++  }
++}
++
++const impreziaBeaconRecordSchema = z.object({
++  baseUrl: z.string(),
++  requestId: z.string(),
++  sessionId: z.string(),
++  clickUrl: z.string(),
++  impression: impreziaImpressionSchema,
++})
++
++/**
++ * Host for the synthesized `ad_impression.imp_url`. Imprezia has no impression
++ * pixel, but that column is NOT NULL UNIQUE and is the key every downstream
++ * lookup uses, so a serve needs one. `.invalid` is reserved by RFC 2606 and
++ * never resolves, so a stray fetch fails loudly instead of hitting something
++ * real.
++ */
++const IMPREZIA_IMP_URL_PREFIX = 'https://impression.imprezia.invalid/'
++
++/** Stable per-impression identity for the `imp_url` column. */
++export function impreziaImpressionUrl(impressionUuid: string): string {
++  return `${IMPREZIA_IMP_URL_PREFIX}${impressionUuid}`
++}
++
++/**
++ * Map an Imprezia decision onto impression-row fields.
++ *
++ * Two callers serve Imprezia — the CLI/Desktop ad provider and the web chat
++ * route — and they reach it by completely different paths. This exists so they
++ * cannot drift on HOW a serve is recorded: the same creative mapping, the same
++ * synthesized imp_url, the same beacon record. A row written by one has to be
++ * indistinguishable from a row written by the other, or the arm comparison is
++ * comparing bookkeeping instead of ads.
++ */
++export function impreziaImpressionFields(params: {
++  ad: ImpreziaAd
++  requestId: string
++  sessionId: string
++  baseUrl: string
++}) {
++  const { ad, requestId, sessionId, baseUrl } = params
++
++  const beacon: ImpreziaBeaconRecord = {
++    baseUrl,
++    requestId,
++    sessionId,
++    clickUrl: ad.clickUrl,
++    impression: ad.impression,
++  }
++
++  return {
++    adText: ad.creative.description,
++    title: ad.creative.title,
++    cta: ad.creative.cta,
++    // Imprezia returns one tracked click URL and no separate landing page.
++    url: ad.clickUrl,
++    clickUrl: ad.clickUrl,
++    favicon: ad.creative.logoUrl ?? '',
++    impUrl: impreziaImpressionUrl(ad.impression.impressionUuid),
++    providerMeta: JSON.stringify(beacon),
++  }
++}
+diff --git a/common/src/util/imprezia-client.ts b/common/src/util/imprezia-client.ts
+new file mode 100644
+index 000000000..5ec911ce3
+--- /dev/null
++++ b/common/src/util/imprezia-client.ts
+@@ -0,0 +1,173 @@
++import {
++  IMPREZIA_LIMITS,
++  impreziaBaseUrlForKey,
++  impreziaChatAdResponseSchema,
++  isImpreziaSandboxKey,
++} from './imprezia-ad'
++
++import type { ImpreziaAd, ImpreziaDeviceContext } from './imprezia-ad'
++import type { Logger } from '../types/contracts/logger'
++
++/**
++ * The one way we call Imprezia's chat-ads API.
++ *
++ * Two callers reach it from opposite directions — the web chat, which knows
++ * the exact turn and the real viewport, and the CLI/Desktop ad provider, which
++ * infers a turn from a rolling message list and has no viewport at all. What
++ * they have in common is the whole transport: same path, same key header, same
++ * forwarded user agent, same timeout, same 403-means-account-not-enabled, same
++ * response schema. Only the inputs and what each does with the ad differ.
++ *
++ * Server-only by convention (it takes the publisher key), which is why it is
++ * separate from the isomorphic contract module the browser renderer imports.
++ *
++ * Every failure is a no-ad path. The reply is already on the user's screen by
++ * the time this runs, so an ad-network problem must never surface or delay
++ * anything.
++ */
++
++const CHAT_ADS_PATH = '/v1/ads/chat'
++
++/** Ad decisioning is off the critical path but holds a socket; cap it well
++ *  under the browser's own patience. */
++const REQUEST_TIMEOUT_MS = 5_000
++
++export type ImpreziaChatAdRequest = {
++  /** Current user message, verbatim. */
++  request: string
++  /** Completed assistant reply for the same turn. */
++  response: string
++  sessionId: string
++  /** ISO-8601 instant the TURN completed — not when we send this. */
++  timestamp: string
++  /** Origin + path, already stripped of query/fragment. */
++  sourceUrl: string
++  /**
++   * Names the calling SURFACE, not the OS: 'browser' | 'desktop' | 'cli'. (The
++   * published docs list browser|android|ios, which is not what their backend
++   * actually expects.)
++   */
++  platformString: string
++  deviceContext: ImpreziaDeviceContext
++}
++
++export type ImpreziaChatAdResult = {
++  /** Support/reconciliation key. Present even on no-fill. */
++  requestId: string
++  ad: ImpreziaAd | null
++}
++
++export async function fetchImpreziaChatAd(params: {
++  apiKey: string
++  request: ImpreziaChatAdRequest
++  /** The END USER's UA, forwarded verbatim. Never our HTTP client's. */
++  userAgent: string
++  /** False in production. A sandbox key must not serve real users. */
++  testMode: boolean
++  logger: Logger
++  fetch: typeof globalThis.fetch
++}): Promise<ImpreziaChatAdResult | null> {
++  const { apiKey, request, userAgent, testMode, logger, fetch } = params
++  const baseUrl = impreziaBaseUrlForKey(apiKey)
++
++  // Both halves are required and must be non-empty. A turn with an empty reply
++  // (aborted mid-stream) is not an ad opportunity.
++  if (!request.request.trim() || !request.response.trim()) {
++    logger.debug('[ads:imprezia] Skipping turn with an empty message')
++    return null
++  }
++
++  // A sandbox key serves Imprezia's own house creatives. They render like real
++  // ads, so in production they are indistinguishable from live inventory.
++  if (isImpreziaSandboxKey(apiKey) && !testMode) {
++    logger.error(
++      '[ads:imprezia] Refusing to serve: sandbox key in production. Swap in ' +
++        'an api_pub_prod_ key before this can fill.',
++    )
++    return null
++  }
++
++  const controller = new AbortController()
++  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
++
++  let response: Response
++  try {
++    response = await fetch(`${baseUrl}${CHAT_ADS_PATH}`, {
++      method: 'POST',
++      headers: {
++        'Content-Type': 'application/json',
++        'X-API-Key': apiKey,
++        // Imprezia targets and measures off this; sending our runtime's UA
++        // would look like datacenter traffic and be discounted as invalid.
++        'X-Forwarded-User-Agent': userAgent,
++      },
++      body: JSON.stringify({
++        ...request,
++        request: request.request.slice(0, IMPREZIA_LIMITS.request),
++        response: request.response.slice(0, IMPREZIA_LIMITS.response),
++        sessionId: request.sessionId.slice(0, IMPREZIA_LIMITS.sessionId),
++      }),
++      signal: controller.signal,
++    })
++  } catch (error) {
++    const aborted = error instanceof Error && error.name === 'AbortError'
++    logger.warn(
++      { baseUrl, timedOut: aborted, error },
++      aborted
++        ? '[ads:imprezia] Ad request timed out'
++        : '[ads:imprezia] Ad request failed',
++    )
++    return null
++  } finally {
++    clearTimeout(timeout)
++  }
++
++  if (!response.ok) {
++    // A publisher account not switched on for chat ads 403s on every single
++    // request. That is an account-state problem with an account-side fix, not
++    // a bug to chase in the logs, so name it rather than burying it.
++    if (response.status === 403) {
++      logger.warn(
++        { baseUrl },
++        '[ads:imprezia] Publisher is not enabled for chat ads; no ad will ' +
++          'fill until Imprezia enables the account for this key',
++      )
++      return null
++    }
++    logger.error(
++      { baseUrl, status: response.status },
++      '[ads:imprezia] API returned error',
++    )
++    return null
++  }
++
++  const parsed = impreziaChatAdResponseSchema.safeParse(
++    await response.json().catch(() => null),
++  )
++  if (!parsed.success) {
++    logger.error(
++      { baseUrl, issues: parsed.error.issues },
++      '[ads:imprezia] API response did not match the expected shape',
++    )
++    return null
++  }
++
++  const { requestId, ad } = parsed.data
++  if (!ad) {
++    // No-fill is the common case, not an error. Log the requestId anyway: it
++    // is the reconciliation key Imprezia support asks for, and the only handle
++    // we have on a serve that produced nothing.
++    logger.debug({ requestId }, '[ads:imprezia] No ad fill')
++    return { requestId, ad: null }
++  }
++
++  logger.info(
++    {
++      requestId,
++      impressionUuid: ad.impression.impressionUuid,
++      brandName: ad.creative.brandName,
++    },
++    '[ads:imprezia] Ad filled',
++  )
++  return { requestId, ad }
++}

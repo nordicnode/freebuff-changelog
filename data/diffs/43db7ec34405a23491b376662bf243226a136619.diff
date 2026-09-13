@@ -1,0 +1,873 @@
+diff --git a/common/src/util/__tests__/database-request-cost.test.ts b/common/src/util/__tests__/database-request-cost.test.ts
+deleted file mode 100644
+index 94cbbccc9..000000000
+--- a/common/src/util/__tests__/database-request-cost.test.ts
++++ /dev/null
+@@ -1,366 +0,0 @@
+-import { describe, expect, test } from 'bun:test'
+-
+-import {
+-  DATABASE_REQUEST_BUDGETS,
+-  DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-  buildDatabaseRequestCostApl,
+-  evaluateDatabaseRequestCosts,
+-  normalizeDatabaseCostRow,
+-} from '../database-request-cost'
+-
+-import type {
+-  DatabaseCostRow,
+-  DatabaseRequestBudget,
+-} from '../database-request-cost'
+-
+-const budget: DatabaseRequestBudget = {
+-  service: 'web',
+-  route: '/api/v1/freebuff/session',
+-  feature: 'session_get',
+-  clientSqlWallMs: { p50: 25, p95: 100, p99: 500 },
+-  roundTrips: { p50: 6, p95: 12, p99: 20 },
+-}
+-
+-/**
+- * Same lane, generous limits. Regression tests need values large enough to clear
+- * the absolute floors (+150ms, +8 round trips) while staying INSIDE budget, so
+- * that "regressed" and "over budget" remain independently assertable — with one
+- * shared tight budget every regression fixture is also over budget and the two
+- * signals cannot be told apart.
+- */
+-const roomyBudget: DatabaseRequestBudget = {
+-  ...budget,
+-  clientSqlWallMs: { p50: 400, p95: 600, p99: 900 },
+-  roundTrips: { p50: 50, p95: 50, p99: 50 },
+-}
+-
+-function row(overrides: Partial<DatabaseCostRow> = {}): DatabaseCostRow {
+-  return {
+-    service: 'web',
+-    route: '/api/v1/freebuff/session',
+-    feature: 'session_get',
+-    requests: 1_000,
+-    intervals: 60,
+-    roundTrips: 5_000,
+-    failedRoundTrips: 0,
+-    clientSqlWallSeconds: 10,
+-    p50ClientSqlWallMs: 10,
+-    p95ClientSqlWallMs: 50,
+-    p99ClientSqlWallMs: 200,
+-    p50RoundTrips: 3,
+-    p95RoundTrips: 8,
+-    p99RoundTrips: 15,
+-    ...overrides,
+-  }
+-}
+-
+-describe('database request cost budgets', () => {
+-  test('covers CLI auth polling in both deployed services', () => {
+-    expect(
+-      DATABASE_REQUEST_BUDGETS.filter(
+-        (item) => item.feature === 'cli_auth_status',
+-      ).map((item) => item.service),
+-    ).toEqual(['web', 'freebuff-web'])
+-  })
+-
+-  test('accepts a healthy distribution', () => {
+-    const [verdict] = evaluateDatabaseRequestCosts(
+-      [row()],
+-      [row({ requests: 10_000 })],
+-      [budget],
+-      DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-    )
+-    expect(verdict.evaluable).toBe(true)
+-    expect(verdict.breach).toBe(false)
+-  })
+-
+-  test('reports p50, p95, and p99 budget overruns for both metric families', () => {
+-    // Each percentile of each family is still checked and named. What changed
+-    // 2026-08-07 is that being over an ABSOLUTE budget is reported rather than
+-    // paged — see the `breach` comment in evaluateDatabaseRequestCosts.
+-    const cases: Partial<DatabaseCostRow>[] = [
+-      { p50ClientSqlWallMs: 26 },
+-      { p95ClientSqlWallMs: 101 },
+-      { p99ClientSqlWallMs: 501 },
+-      { p50RoundTrips: 7 },
+-      { p95RoundTrips: 13 },
+-      { p99RoundTrips: 21 },
+-    ]
+-    for (const current of cases) {
+-      const [verdict] = evaluateDatabaseRequestCosts(
+-        [row(current)],
+-        [],
+-        [budget],
+-        DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-      )
+-      expect(verdict.overBudget).toHaveLength(1)
+-      expect(verdict.breach).toBe(false)
+-    }
+-  })
+-
+-  test('alerts on a material relative regression below the fixed budget', () => {
+-    // Must clear BOTH 2.0x and +150ms. 40 -> 80 is 2x but only +40ms, which is
+-    // inside the measured noise band and deliberately does NOT page.
+-    const [verdict] = evaluateDatabaseRequestCosts(
+-      [row({ p95ClientSqlWallMs: 400 })],
+-      [row({ requests: 5_000, p95ClientSqlWallMs: 200 })],
+-      [roomyBudget],
+-      DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-    )
+-    expect(verdict.breach).toBe(true)
+-    expect(verdict.reasons[0]).toContain('regressed 200 -> 400')
+-  })
+-
+-  // p50 tracks request mix, not cost, and is 1.2-2.3x noisy on wall time and
+-  // 4-6x on round trips. session_post's p50 wall really does move 9ms -> 20ms on
+-  // ordinary traffic, which is 2.2x.
+-  test.each(['p50ClientSqlWallMs', 'p50RoundTrips'] as const)(
+-    '%s never pages, however large the jump',
+-    (metric) => {
+-      const [verdict] = evaluateDatabaseRequestCosts(
+-        [row({ [metric]: 400 })],
+-        [row({ requests: 5_000, [metric]: 9 })],
+-        [budget],
+-        DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-      )
+-      expect(verdict.regressed).toEqual([])
+-      expect(verdict.breach).toBe(false)
+-    },
+-  )
+-
+-  // The other half: a light lane must still HAVE a pageable signal. Its whole
+-  // p95 budget (100ms here) is below the global +150ms floor, so a flat floor
+-  // would leave it unable to page at any magnitude.
+-  test('a light lane can still page on its own scale', () => {
+-    const [verdict] = evaluateDatabaseRequestCosts(
+-      [row({ p95ClientSqlWallMs: 90 })],
+-      [row({ requests: 5_000, p95ClientSqlWallMs: 20 })],
+-      [budget],
+-      DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-    )
+-    expect(verdict.breach).toBe(true)
+-    expect(verdict.reasons[0]).toContain('clientSqlWallMs.p95 regressed 20 -> 90')
+-  })
+-
+-  test('p95 round trips still pages on a structural jump', () => {
+-    const [verdict] = evaluateDatabaseRequestCosts(
+-      [row({ p95RoundTrips: 30 })],
+-      [row({ requests: 5_000, p95RoundTrips: 12 })],
+-      [roomyBudget],
+-      DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-    )
+-    expect(verdict.breach).toBe(true)
+-    expect(verdict.reasons[0]).toContain('roundTrips.p95 regressed 12 -> 30')
+-  })
+-
+-  test('alerts exactly at the relative and absolute regression thresholds', () => {
+-    // Exactly 2.0x and exactly the absolute floors: +150ms and +8 round trips.
+-    const [verdict] = evaluateDatabaseRequestCosts(
+-      [row({ p95ClientSqlWallMs: 300, p95RoundTrips: 16 })],
+-      [
+-        row({
+-          requests: 5_000,
+-          p95ClientSqlWallMs: 150,
+-          p95RoundTrips: 8,
+-        }),
+-      ],
+-      [roomyBudget],
+-      DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-    )
+-
+-    expect(verdict.breach).toBe(true)
+-    expect(verdict.reasons).toEqual([
+-      'clientSqlWallMs.p95 regressed 150 -> 300 (>=2.00x)',
+-      'roundTrips.p95 regressed 8 -> 16 (>=2.00x)',
+-    ])
+-  })
+-
+-  test('ignores tiny ratio changes and under-sampled routes', () => {
+-    const verdicts = evaluateDatabaseRequestCosts(
+-      [
+-        row({ p95ClientSqlWallMs: 15 }),
+-        row({
+-          feature: 'too_quiet',
+-          requests: 20,
+-          p99ClientSqlWallMs: 5_000,
+-        }),
+-      ],
+-      [row({ requests: 5_000, p95ClientSqlWallMs: 5 })],
+-      [budget, { ...budget, feature: 'too_quiet' }],
+-      DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-    )
+-    expect(verdicts[0].breach).toBe(false)
+-    expect(verdicts[1].evaluable).toBe(false)
+-    expect(verdicts[1].breach).toBe(false)
+-  })
+-
+-  test('does not evaluate unbudgeted cardinality', () => {
+-    const [verdict] = evaluateDatabaseRequestCosts(
+-      [row({ feature: 'unexpected' })],
+-      [],
+-      [budget],
+-      DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-    )
+-    expect(verdict.budget).toBeUndefined()
+-    expect(verdict.evaluable).toBe(false)
+-    expect(verdict.breach).toBe(false)
+-    expect(verdict.reasons).toEqual([
+-      'No database cost budget is configured for this lane',
+-    ])
+-  })
+-
+-  test('rejects alert settings that would silently disable evaluation', () => {
+-    expect(() =>
+-      evaluateDatabaseRequestCosts([row()], [], [budget], {
+-        ...DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-        regressionRatio: Number.NaN,
+-      }),
+-    ).toThrow('regressionRatio')
+-    expect(() =>
+-      evaluateDatabaseRequestCosts([row()], [], [budget], {
+-        ...DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-        minRequests: 0,
+-      }),
+-    ).toThrow('minRequests')
+-  })
+-
+-  test('allows values exactly at their budgets', () => {
+-    const [verdict] = evaluateDatabaseRequestCosts(
+-      [
+-        row({
+-          p50ClientSqlWallMs: 25,
+-          p95ClientSqlWallMs: 100,
+-          p99ClientSqlWallMs: 500,
+-          p50RoundTrips: 6,
+-          p95RoundTrips: 12,
+-          p99RoundTrips: 20,
+-        }),
+-      ],
+-      [],
+-      [budget],
+-      DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+-    )
+-    expect(verdict.breach).toBe(false)
+-  })
+-})
+-
+-describe('budgets versus regressions', () => {
+-  const options = DEFAULT_DATABASE_COST_EVALUATION_OPTIONS
+-
+-  test('being over the absolute budget does not page', () => {
+-    // Originally because every lane sat 4-25x over these: they were written
+-    // for server execution while the metric measures client wall time, and
+-    // paging on it made the job red on every run for days. The budgets are now
+-    // a ratchet measured against real traffic, but they stay report-only until
+-    // that has survived a full weekly cycle.
+-    const [verdict] = evaluateDatabaseRequestCosts(
+-      [row({ p50ClientSqlWallMs: 192 })],
+-      [row({ p50ClientSqlWallMs: 190 })],
+-      [budget],
+-      options,
+-    )
+-
+-    expect(verdict!.overBudget.length).toBeGreaterThan(0)
+-    expect(verdict!.regressed).toEqual([])
+-    expect(verdict!.breach).toBe(false)
+-  })
+-
+-  test('a regression ON TOP of an over-budget lane still pages', () => {
+-    // The bug this replaces: the over-budget branch used to `continue`, so once
+-    // a lane was over budget its baseline comparison never ran and a genuine
+-    // regression was invisible.
+-    // p95 rather than p50, because p50 is not a pageable percentile — see the
+-    // noise table in evaluateFamily.
+-    const [verdict] = evaluateDatabaseRequestCosts(
+-      [row({ p95ClientSqlWallMs: 2_000 })],
+-      [row({ p95ClientSqlWallMs: 192 })],
+-      [budget],
+-      options,
+-    )
+-
+-    expect(verdict!.overBudget.length).toBeGreaterThan(0)
+-    expect(verdict!.regressed.join(' ')).toContain('regressed 192 -> 2000')
+-    expect(verdict!.breach).toBe(true)
+-  })
+-
+-  test('a regression within budget pages', () => {
+-    const [verdict] = evaluateDatabaseRequestCosts(
+-      [row({ p95ClientSqlWallMs: 400 })],
+-      [row({ p95ClientSqlWallMs: 200 })],
+-      [roomyBudget],
+-      options,
+-    )
+-
+-    expect(verdict!.overBudget).toEqual([])
+-    expect(verdict!.breach).toBe(true)
+-  })
+-
+-  test('steady state pages nothing', () => {
+-    const [verdict] = evaluateDatabaseRequestCosts(
+-      [row()],
+-      [row()],
+-      [budget],
+-      options,
+-    )
+-
+-    expect(verdict!.breach).toBe(false)
+-    expect(verdict!.regressed).toEqual([])
+-  })
+-})
+-
+-describe('database request cost APL', () => {
+-  test('builds the same current and baseline aggregation shape', () => {
+-    const current = buildDatabaseRequestCostApl({
+-      dataset: 'freebuff-dev',
+-      since: '1h',
+-    })
+-    const baseline = buildDatabaseRequestCostApl({
+-      dataset: 'freebuff-dev',
+-      since: '7d',
+-      before: '1h',
+-    })
+-
+-    expect(current).toContain("['freebuff-dev']")
+-    expect(current).toContain('_time >= ago(1h) and service in')
+-    expect(baseline).toContain('_time >= ago(10140m) and _time < ago(1h)')
+-    expect(current).toContain('p99RoundTrips=round(percentile(p99Trips,95),2)')
+-  })
+-
+-  test('rejects interpolated dataset names and unsupported windows', () => {
+-    expect(() =>
+-      buildDatabaseRequestCostApl({ dataset: "x'] | take 1", since: '1h' }),
+-    ).toThrow('Invalid Axiom dataset')
+-    expect(() =>
+-      buildDatabaseRequestCostApl({ dataset: 'freebuff', since: '1 hour' }),
+-    ).toThrow('Invalid database cost window')
+-    expect(() =>
+-      buildDatabaseRequestCostApl({ dataset: 'freebuff', since: '0m' }),
+-    ).toThrow('Invalid database cost window')
+-    expect(() =>
+-      buildDatabaseRequestCostApl({
+-        dataset: 'freebuff',
+-        since: '9007199254740991m',
+-        before: '1m',
+-      }),
+-    ).toThrow('too large')
+-  })
+-
+-  test('normalizes missing and string-valued Axiom fields', () => {
+-    expect(
+-      normalizeDatabaseCostRow({
+-        service: 'web',
+-        route: '/route',
+-        feature: 'feature',
+-        requests: '12',
+-        p95RoundTrips: '4.5',
+-      }),
+-    ).toMatchObject({
+-      service: 'web',
+-      route: '/route',
+-      feature: 'feature',
+-      requests: 12,
+-      p95RoundTrips: 4.5,
+-      failedRoundTrips: 0,
+-    })
+-  })
+-})
+diff --git a/common/src/util/database-request-cost.ts b/common/src/util/database-request-cost.ts
+deleted file mode 100644
+index 12b07fe73..000000000
+--- a/common/src/util/database-request-cost.ts
++++ /dev/null
+@@ -1,495 +0,0 @@
+-export type PercentileBudget = {
+-  p50: number
+-  p95: number
+-  p99: number
+-}
+-
+-export type DatabaseRequestBudget = {
+-  service: 'web' | 'freebuff-web'
+-  route: string
+-  feature: string
+-  clientSqlWallMs: PercentileBudget
+-  roundTrips: PercentileBudget
+-}
+-
+-export type DatabaseCostRow = {
+-  service: string
+-  route: string
+-  feature: string
+-  requests: number
+-  intervals: number
+-  roundTrips: number
+-  failedRoundTrips: number
+-  clientSqlWallSeconds: number
+-  p50ClientSqlWallMs: number
+-  p95ClientSqlWallMs: number
+-  p99ClientSqlWallMs: number
+-  p50RoundTrips: number
+-  p95RoundTrips: number
+-  p99RoundTrips: number
+-}
+-
+-export type DatabaseCostVerdict = {
+-  row: DatabaseCostRow
+-  budget?: DatabaseRequestBudget
+-  evaluable: boolean
+-  /** True only for a REGRESSION against the baseline — the pageable signal. */
+-  breach: boolean
+-  /** Over the aspirational absolute budget. Reported, never paged: see the
+-   *  comment on `breach` in evaluateDatabaseRequestCosts. */
+-  overBudget: string[]
+-  /** Materially worse than the preceding baseline window. Pages. */
+-  regressed: string[]
+-  /** Everything, regression first. Kept for callers that just want a blob. */
+-  reasons: string[]
+-}
+-
+-export type DatabaseCostEvaluationOptions = {
+-  minRequests: number
+-  minBaselineRequests: number
+-  regressionRatio: number
+-  minClientSqlWallRegressionMs: number
+-  minRoundTripRegression: number
+-}
+-
+-/**
+- * RATIO AND FLOORS ARE SET FROM MEASURED NOISE, not intuition — both were too
+- * tight and the alert paged on ordinary traffic within a day of shipping.
+- *
+- * Noise across buckets with no known change (2026-08-10; wall time sampled from
+- * the 9 hours after the private-endpoint rollout so the 15x improvement does not
+- * pollute it):
+- *
+- *   family                    p50        p95        p99
+- *   ClientSqlWallMs      1.2-2.3x   1.4-1.9x   1.4-1.5x
+- *   RoundTrips           4.0-6.0x   1.5-2.4x   1.1-1.5x
+- *
+- * So `regressionRatio` is 2.0, above every tail-percentile swing observed, and
+- * the absolute floors sit above the largest observed absolute move (wall p95
+- * +122ms on free_mode; round trips +6). A regression has to clear BOTH, which is
+- * what stops a large ratio on a tiny value — 9ms -> 20ms is 2.3x and means
+- * nothing — from paging.
+- *
+- * p50 round trips is excluded entirely; see the note in evaluateFamily.
+- */
+-export const DEFAULT_DATABASE_COST_EVALUATION_OPTIONS: DatabaseCostEvaluationOptions =
+-  {
+-    minRequests: 100,
+-    minBaselineRequests: 500,
+-    regressionRatio: 2.0,
+-    minClientSqlWallRegressionMs: 150,
+-    minRoundTripRegression: 8,
+-  }
+-
+-// RECALIBRATED 2026-08-09 against one hour of post-private-endpoint traffic
+-// (~470k requests). Each number sits just above that hour's measured
+-// percentile, so these are a RATCHET — "no worse than the day we measured" —
+-// rather than the aspirational guardrails they started as. That change is only
+-// possible because moving off the public database endpoint took the
+-// per-round-trip cost from 114ms to 11.8ms; the old budgets were written for
+-// server execution time and every lane ran 4-25x over them continuously.
+-//
+-// Measured p50/p95/p99 at the time of writing, for anyone re-deriving these:
+-//   chat free_mode          22.2 / 253.7 / 582.7 ms   trips  3 / 11 / 12
+-//   chat freebuff_service   17.5 / 341.1 / 354.8 ms   trips  4 / 13 / 13
+-//   chat paid_mode           7.0 /  85.3 /  85.3 ms   trips  2 / 21 / 21
+-//   session_get              7.8 /  94.1 / 327.9 ms   trips  1 / 14 / 16
+-//   session_post             9.7 / 234.5 / 507.3 ms   trips  1 / 19 / 21
+-//   streak_get               6.0 /  41.0 /  41.0 ms   trips  2 /  2 /  2
+-//   cli_auth_status          2.2 /  10.9 /  15.2 ms   trips  1 /  1 /  1
+-//   cli_auth_code           56.3 /  94.1 /  94.1 ms   trips  2 /  2 /  2
+-//   account_providers       75.3 / 116.8 / 116.8 ms   trips  2 /  2 /  2
+-const chatClientSqlWall = { p50: 40, p95: 400, p99: 700 }
+-const chatTrips = { p50: 8, p95: 24, p99: 28 }
+-const sessionClientSqlWall = { p50: 20, p95: 275, p99: 600 }
+-const sessionTrips = { p50: 4, p95: 22, p99: 24 }
+-// Split out of `ancillary`, because one shared budget wide enough for
+-// account_providers (75ms p50 on 2 round trips) was blind to lanes that
+-// actually run at 2-6ms. A budget that every lane passes is not a budget.
+-const lightClientSqlWall = { p50: 12, p95: 60, p99: 90 }
+-const lightTrips = { p50: 2, p95: 3, p99: 4 }
+-const ancillaryClientSqlWall = { p50: 100, p95: 175, p99: 300 }
+-const ancillaryTrips = { p50: 6, p95: 8, p99: 12 }
+-
+-/**
+- * A no-regression ratchet against measured production, not an aspiration.
+- *
+- * Still REPORTED, never paged — see the `breach` comment in
+- * evaluateDatabaseRequestCosts. Promoting these to pageable is a deliberate
+- * follow-up, and the precondition is a full week with every lane inside them.
+- *
+- * The lane most worth driving down is `session_post`: 19 round trips at p95.
+- * With transport at ~11ms that is ~210ms of pure round-tripping, and round
+- * trips — not query time — are what handlers control.
+- */
+-export const DATABASE_REQUEST_BUDGETS: DatabaseRequestBudget[] = [
+-  ...['chat_unknown', 'free_mode', 'freebuff_service', 'paid_mode'].map(
+-    (feature) => ({
+-      service: 'web' as const,
+-      route: '/api/v1/chat/completions',
+-      feature,
+-      clientSqlWallMs: chatClientSqlWall,
+-      roundTrips: chatTrips,
+-    }),
+-  ),
+-  ...['session_get', 'session_post', 'session_delete'].map((feature) => ({
+-    service: 'web' as const,
+-    route: '/api/v1/freebuff/session',
+-    feature,
+-    clientSqlWallMs: sessionClientSqlWall,
+-    roundTrips: sessionTrips,
+-  })),
+-  {
+-    service: 'web',
+-    route: '/api/v1/freebuff/streak',
+-    feature: 'streak_get',
+-    clientSqlWallMs: lightClientSqlWall,
+-    roundTrips: lightTrips,
+-  },
+-  {
+-    service: 'web',
+-    route: '/api/v1/freebuff/title',
+-    feature: 'title_post',
+-    clientSqlWallMs: lightClientSqlWall,
+-    roundTrips: lightTrips,
+-  },
+-  ...[
+-    ['/api/account/providers', 'account_providers'],
+-    ['/api/admin/glm-grants', 'admin_glm_grant'],
+-    ['/api/auth/cli/code', 'cli_auth_code'],
+-    ['/api/nodepod/handoff', 'nodepod_handoff'],
+-    ['/api/web/referrals', 'referrals_get'],
+-  ].map(([route, feature]) => ({
+-    service: 'freebuff-web' as const,
+-    route,
+-    feature,
+-    clientSqlWallMs: ancillaryClientSqlWall,
+-    roundTrips: ancillaryTrips,
+-  })),
+-  // One indexed read, on both services. The tightest lane we have, and the
+-  // clearest read on transport cost: 1 round trip, so its p50 IS the floor.
+-  ...(['web', 'freebuff-web'] as const).map((service) => ({
+-    service,
+-    route: '/api/auth/cli/status',
+-    feature: 'cli_auth_status',
+-    clientSqlWallMs: lightClientSqlWall,
+-    roundTrips: lightTrips,
+-  })),
+-]
+-
+-function validateAplToken(value: string, label: string): string {
+-  if (!/^[A-Za-z0-9._-]+$/.test(value)) {
+-    throw new Error(`Invalid ${label} "${value}"`)
+-  }
+-  return value
+-}
+-
+-function validateWindow(value: string): string {
+-  if (!/^[1-9]\d*[mhd]$/.test(value)) {
+-    throw new Error(`Invalid database cost window "${value}"`)
+-  }
+-  return value
+-}
+-
+-function windowMinutes(value: string): number {
+-  const safe = validateWindow(value)
+-  const amount = Number(safe.slice(0, -1))
+-  const unit = safe.at(-1)
+-  const minutes = amount * (unit === 'd' ? 1_440 : unit === 'h' ? 60 : 1)
+-  if (!Number.isSafeInteger(minutes)) {
+-    throw new Error(`Invalid database cost window "${value}"`)
+-  }
+-  return minutes
+-}
+-
+-function combinedWindowMinutes(first: string, second: string): number {
+-  const minutes = windowMinutes(first) + windowMinutes(second)
+-  if (!Number.isSafeInteger(minutes)) {
+-    throw new Error(`Combined database cost window is too large`)
+-  }
+-  return minutes
+-}
+-
+-/** One canonical APL definition for the scheduled alert and admin dashboard. */
+-export function buildDatabaseRequestCostApl({
+-  dataset,
+-  since,
+-  before,
+-}: {
+-  dataset: string
+-  since: string
+-  before?: string
+-}): string {
+-  const safeDataset = validateAplToken(dataset, 'Axiom dataset')
+-  const safeSince = validateWindow(since)
+-  const start = before
+-    ? `${combinedWindowMinutes(safeSince, before)}m`
+-    : safeSince
+-  const timeFilter = `_time >= ago(${start})${
+-    before ? ` and _time < ago(${validateWindow(before)})` : ''
+-  }`
+-  return `['${safeDataset}']
+-    | where ${timeFilter} and service in ("web", "freebuff-web")
+-    | extend d = parse_json(data)
+-    | where tostring(d.metric) == "database_request_cost"
+-    | extend requests=toint(d.requests), roundTrips=toint(d.roundTrips),
+-             failedRoundTrips=toint(d.failedRoundTrips),
+-             clientSqlWallSeconds=toreal(d.clientSqlWallSeconds),
+-             p50ClientSqlWall=toreal(d.p50ClientSqlWallMs),
+-             p95ClientSqlWall=toreal(d.p95ClientSqlWallMs),
+-             p99ClientSqlWall=toreal(d.p99ClientSqlWallMs),
+-             p50Trips=toreal(d.p50RoundTrips), p95Trips=toreal(d.p95RoundTrips),
+-             p99Trips=toreal(d.p99RoundTrips)
+-    | summarize requests=sum(requests), intervals=count(),
+-                roundTrips=sum(roundTrips), failedRoundTrips=sum(failedRoundTrips),
+-                clientSqlWallSeconds=round(sum(clientSqlWallSeconds),3),
+-                p50ClientSqlWallMs=round(percentile(p50ClientSqlWall,50),2),
+-                p95ClientSqlWallMs=round(percentile(p95ClientSqlWall,95),2),
+-                p99ClientSqlWallMs=round(percentile(p99ClientSqlWall,95),2),
+-                p50RoundTrips=round(percentile(p50Trips,50),2),
+-                p95RoundTrips=round(percentile(p95Trips,95),2),
+-                p99RoundTrips=round(percentile(p99Trips,95),2)
+-      by service=tostring(service), route=tostring(d.route), feature=tostring(d.feature)`
+-}
+-
+-export function normalizeDatabaseCostRow(
+-  row: Record<string, unknown>,
+-): DatabaseCostRow {
+-  const number = (value: unknown) => Number(value) || 0
+-  const string = (value: unknown) => (typeof value === 'string' ? value : '')
+-  return {
+-    service: string(row.service),
+-    route: string(row.route),
+-    feature: string(row.feature),
+-    requests: number(row.requests),
+-    intervals: number(row.intervals),
+-    roundTrips: number(row.roundTrips),
+-    failedRoundTrips: number(row.failedRoundTrips),
+-    clientSqlWallSeconds: number(row.clientSqlWallSeconds),
+-    p50ClientSqlWallMs: number(row.p50ClientSqlWallMs),
+-    p95ClientSqlWallMs: number(row.p95ClientSqlWallMs),
+-    p99ClientSqlWallMs: number(row.p99ClientSqlWallMs),
+-    p50RoundTrips: number(row.p50RoundTrips),
+-    p95RoundTrips: number(row.p95RoundTrips),
+-    p99RoundTrips: number(row.p99RoundTrips),
+-  }
+-}
+-
+-const PERCENTILES = ['p50', 'p95', 'p99'] as const
+-
+-function budgetKey({
+-  service,
+-  route,
+-  feature,
+-}: Pick<DatabaseCostRow, 'service' | 'route' | 'feature'>): string {
+-  return `${service}\u0000${route}\u0000${feature}`
+-}
+-
+-function metricValue(
+-  row: DatabaseCostRow,
+-  family: 'ClientSqlWallMs' | 'RoundTrips',
+-  percentile: (typeof PERCENTILES)[number],
+-): number {
+-  return Number(row[`${percentile}${family}` as keyof DatabaseCostRow]) || 0
+-}
+-
+-/**
+- * How much of a lane's budget a regression must move before it can page, used to
+- * scale the absolute floor down for lanes whose whole budget is smaller than the
+- * global floor. 0.375 reproduces the measured floors on the heavy lanes it was
+- * derived from (chat p95 budget 400ms x 0.375 = 150ms) while giving the light
+- * ones something proportionate (p95 budget 60ms -> 22.5ms).
+- */
+-const REGRESSION_FLOOR_BUDGET_SHARE = 0.375
+-
+-function evaluateFamily({
+-  current,
+-  baseline,
+-  budget,
+-  family,
+-  regressionRatio,
+-  minRegression,
+-}: {
+-  current: DatabaseCostRow
+-  baseline?: DatabaseCostRow
+-  budget: PercentileBudget
+-  family: 'ClientSqlWallMs' | 'RoundTrips'
+-  regressionRatio: number
+-  minRegression: number
+-}): { overBudget: string[]; regressed: string[] } {
+-  const label = family === 'ClientSqlWallMs' ? 'clientSqlWallMs' : 'roundTrips'
+-  const overBudget: string[] = []
+-  const regressed: string[] = []
+-  for (const percentile of PERCENTILES) {
+-    const value = metricValue(current, family, percentile)
+-    const limit = budget[percentile]
+-    if (value > limit) {
+-      overBudget.push(`${label}.${percentile} ${value} > budget ${limit}`)
+-      // Deliberately NOT `continue`. Skipping the regression check for an
+-      // over-budget percentile is what silently disabled regression detection:
+-      // by 2026-08-07 every lane was over every budget, so nothing was ever
+-      // compared against its baseline and a genuine 10x regression on top
+-      // would have gone unreported.
+-    }
+-    if (!baseline) continue
+-    // The absolute floor is scaled DOWN for light lanes. The global floors are
+-    // derived from the heaviest lanes' noise (+150ms came from free_mode's p95),
+-    // and applied flat they leave a lane like cli_auth_status — p95 10-15ms —
+-    // able to regress 10x without ever clearing them, i.e. with no pageable
+-    // signal at all. The lane's own budget is the per-lane scale we already
+-    // calibrate, so the floor is the lesser of the global value and a share of
+-    // it: heavy lanes keep the measured floor, light lanes get a proportionate
+-    // one.
+-    const floor = Math.min(minRegression, limit * REGRESSION_FLOOR_BUDGET_SHARE)
+-    // p50 NEVER pages, for either family, and no threshold fixes it. p50 is the
+-    // typical request, so it tracks request MIX — which share took the cheap
+-    // branch — while the tails track structural cost. Measured noise in periods
+-    // with no known change:
+-    //
+-    //   family              p50        p95        p99
+-    //   ClientSqlWallMs  1.2-2.3x   1.4-1.9x   1.4-1.5x
+-    //   RoundTrips       4.0-6.0x   1.5-2.4x   1.1-1.5x
+-    //
+-    // No ratio separates a 2.3x-noisy p50 from a real 2x regression, and
+-    // 4-6x on p50RoundTrips is hopeless. Both produced false pages on
+-    // 2026-08-10 ("roundTrips.p50 regressed 2 -> 5"; session_post's p50 wall
+-    // moving 9ms -> 20ms). Still reported via the budgets, just not pageable.
+-    if (percentile === 'p50') continue
+-    const previous = metricValue(baseline, family, percentile)
+-    if (
+-      previous > 0 &&
+-      value >= previous * regressionRatio &&
+-      value - previous >= floor
+-    ) {
+-      regressed.push(
+-        `${label}.${percentile} regressed ${previous} -> ${value} ` +
+-          `(>=${regressionRatio.toFixed(2)}x)`,
+-      )
+-    }
+-  }
+-  return { overBudget, regressed }
+-}
+-
+-export function evaluateDatabaseRequestCosts(
+-  currentRows: DatabaseCostRow[],
+-  baselineRows: DatabaseCostRow[],
+-  budgets: DatabaseRequestBudget[],
+-  options: DatabaseCostEvaluationOptions,
+-): DatabaseCostVerdict[] {
+-  validateDatabaseCostEvaluationOptions(options)
+-  const budgetByKey = new Map(
+-    budgets.map((budget) => [budgetKey(budget), budget]),
+-  )
+-  const baselineByKey = new Map(
+-    baselineRows.map((row) => [budgetKey(row), row]),
+-  )
+-
+-  return currentRows.map((row) => {
+-    const key = budgetKey(row)
+-    const budget = budgetByKey.get(key)
+-    const evaluable = row.requests >= options.minRequests && Boolean(budget)
+-    if (!budget) {
+-      return {
+-        row,
+-        budget,
+-        evaluable: false,
+-        breach: false,
+-        overBudget: [],
+-        regressed: [],
+-        reasons: ['No database cost budget is configured for this lane'],
+-      }
+-    }
+-    if (!evaluable) {
+-      return {
+-        row,
+-        budget,
+-        evaluable,
+-        breach: false,
+-        overBudget: [],
+-        regressed: [],
+-        reasons: [],
+-      }
+-    }
+-
+-    const candidateBaseline = baselineByKey.get(key)
+-    const baseline =
+-      candidateBaseline &&
+-      candidateBaseline.requests >= options.minBaselineRequests
+-        ? candidateBaseline
+-        : undefined
+-    const families = [
+-      evaluateFamily({
+-        current: row,
+-        baseline,
+-        budget: budget.clientSqlWallMs,
+-        family: 'ClientSqlWallMs',
+-        regressionRatio: options.regressionRatio,
+-        minRegression: options.minClientSqlWallRegressionMs,
+-      }),
+-      evaluateFamily({
+-        current: row,
+-        baseline,
+-        budget: budget.roundTrips,
+-        family: 'RoundTrips',
+-        regressionRatio: options.regressionRatio,
+-        minRegression: options.minRoundTripRegression,
+-      }),
+-    ]
+-    const overBudget = families.flatMap((f) => f.overBudget)
+-    const regressed = families.flatMap((f) => f.regressed)
+-    return {
+-      row,
+-      budget,
+-      evaluable,
+-      // Only a regression pages.
+-      //
+-      // The absolute budgets used to be unpageable for a hard reason: they were
+-      // written against server execution time while this metric measures CLIENT
+-      // wall time, so every lane sat 4-25x over them and paging made this alert
+-      // red on every run for days — the same as no alert. That reason is gone.
+-      // The private-endpoint move (docs/db-capacity-and-scaling.md §10) cut the
+-      // per-round-trip cost from 114ms to 11.8ms, and the budgets above are now
+-      // a ratchet measured against real traffic.
+-      //
+-      // They still do not page, on purpose. A ratchet set from a single hour has
+-      // not been shown to survive a weekly traffic cycle, and 2026-08-10 showed
+-      // why that caution is warranted: the REGRESSION thresholds — which do page
+-      // — were themselves too tight and fired on ordinary diurnal noise within a
+-      // day. Promote only after a week in which nothing over-budget is reported,
+-      // and re-read the noise table above first.
+-      breach: regressed.length > 0,
+-      overBudget,
+-      regressed,
+-      reasons: [...regressed, ...overBudget],
+-    }
+-  })
+-}
+-
+-export function validateDatabaseCostEvaluationOptions(
+-  options: DatabaseCostEvaluationOptions,
+-): void {
+-  const positiveIntegers: Array<[keyof DatabaseCostEvaluationOptions, number]> =
+-    [
+-      ['minRequests', options.minRequests],
+-      ['minBaselineRequests', options.minBaselineRequests],
+-    ]
+-  for (const [name, value] of positiveIntegers) {
+-    if (!Number.isSafeInteger(value) || value < 1) {
+-      throw new Error(`${name} must be a positive integer`)
+-    }
+-  }
+-  if (
+-    !Number.isFinite(options.regressionRatio) ||
+-    options.regressionRatio <= 1
+-  ) {
+-    throw new Error('regressionRatio must be greater than 1')
+-  }
+-  for (const [name, value] of [
+-    ['minClientSqlWallRegressionMs', options.minClientSqlWallRegressionMs],
+-    ['minRoundTripRegression', options.minRoundTripRegression],
+-  ] as const) {
+-    if (!Number.isFinite(value) || value < 0) {
+-      throw new Error(`${name} must be a non-negative finite number`)
+-    }
+-  }
+-}

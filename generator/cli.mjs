@@ -4,27 +4,27 @@
 //   node generator/cli.mjs generate [--repo URL] [--full]
 //   node generator/cli.mjs build
 //   node generator/cli.mjs preview [port]
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readFile, cp } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { git, readJson, writeJson, writeText, log, ymd } from './lib/util.mjs'
 import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
-  diffNameStatus, diffPatch, SYNC_SUBJECT
+  diffNameStatus, diffPatch, extractCleanDiff, SYNC_SUBJECT, TEST_RE
 } from './lib/analyze.mjs'
 import { enrichWithLlm, llmConfigured } from './lib/llm.mjs'
 import { buildSite } from './lib/site.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+if (existsSync(resolve(ROOT, '.env')) && typeof process.loadEnvFile === 'function') {
+  process.loadEnvFile(resolve(ROOT, '.env'))
+}
 const DATA = resolve(ROOT, 'data')
 const CACHE = resolve(ROOT, '.cache')
 const REPO_DIR = resolve(CACHE, 'freebuff')
 const REPO_URL = process.env.FREEBUFF_REPO || 'https://github.com/CodebuffAI/freebuff.git'
 const META = { repoUrl: 'https://github.com/CodebuffAI/freebuff', compareUrl: 'https://github.com/CodebuffAI/freebuff/compare' }
-
-const TEST_RE = /(^|\/)(__tests__|tests?)\/|\.test\.tsx?$/
-const NOISE_ONLY_RE = /^(bun\.lock|README\.md|README\.zh-CN\.md|\.bun-version)$/
 
 // ---------------------------------------------------------------------------
 
@@ -54,15 +54,18 @@ async function fetchOpenPrs () {
 }
 
 function decorate (e) {
-  const testOnly = (e.files.added.length + e.files.removed.length + e.files.modified.length) > 0 &&
-    [...e.files.added, ...e.files.removed, ...e.files.modified].every(p => TEST_RE.test(p))
-  const lockOnly = e.files.meaningful === 0
+  const testOnly = e.files.testOnly ?? ((e.files.meaningful === 0 && (e.files.rawMeaningful || 0) > 0) ||
+    ([...e.files.added, ...e.files.removed, ...e.files.modified].length > 0 &&
+     [...e.files.added, ...e.files.removed, ...e.files.modified].every(p => TEST_RE.test(p))))
+  const lockOnly = e.files.meaningful === 0 && !testOnly
   e.skip = lockOnly || (testOnly && !e.modelChanges && !e.version && !e.cmdChanges)
   if (e.modelChanges) e.category = 'Model Catalog'
   else if (e.cmdChanges) e.category = 'Commands'
   else if (e.areas.includes('CLI')) e.category = 'CLI'
   else if (e.areas.includes('SDK')) e.category = 'SDK'
   else if (e.areas.includes('Agent Runtime')) e.category = 'Agent Runtime'
+  else if (e.areas.includes('Code Map')) e.category = 'Code Map'
+  else if (e.areas.includes('LLM Providers')) e.category = 'LLM Providers'
   else if (e.areas.includes('Agents')) e.category = 'Agents'
   else if (e.areas.includes('Shared/Core')) e.category = 'Core'
   else if (e.areas.includes('Docs')) e.category = 'Docs'
@@ -115,7 +118,6 @@ async function cmdGenerate (argv) {
     }
     decorate(e)
     if (e.skip) { bySha.set(c.sha, { sha: c.sha, skip: true, date: e.date }); continue }
-    e.title = e.title || deriveTitle(e)
     bySha.set(c.sha, e)
     added++
     if (added % 200 === 0) log(`${added} entries so far (${c.sha.slice(0, 8)})`)
@@ -126,23 +128,28 @@ async function cmdGenerate (argv) {
 
   if (llmConfigured()) {
     const getPatch = async (e) => {
-      if (e.kind !== 'sync' || !e.prevSha) return ''
-      const files = await diffNameStatus(REPO_DIR, e.prevSha, e.sha)
+      if (e.kind !== 'sync') return ''
+      const prev = e.prevSha || (await git(['rev-parse', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
+      if (!prev) return ''
+      const files = await diffNameStatus(REPO_DIR, prev, e.sha)
       const targets = files.map(f => f.path).filter(p => !p.endsWith('bun.lock') && !TEST_RE.test(p)).slice(0, 8)
       if (!targets.length) return ''
-      return diffPatch(REPO_DIR, e.prevSha, e.sha, targets)
+      return diffPatch(REPO_DIR, prev, e.sha, targets)
     }
     const n = await enrichWithLlm(entries, getPatch, DATA)
     log(`LLM enriched ${n} entries`)
   }
 
+  await backfillDiffs(entries, 60)
+
+  const prevScanned = existing.counts?.commitsScanned || 0
   const changelog = {
     version: 1,
     repo: META.repoUrl,
     generatedAt: new Date().toISOString(),
     headSha: head,
     counts: {
-      commitsScanned: commits.length,
+      commitsScanned: full || !isAncestor ? commits.length : (prevScanned || entries.length) + commits.length,
       entries: entries.length,
       syncEra: entries.filter(e => e.kind === 'sync').length,
       community: entries.filter(e => e.kind === 'community').length
@@ -158,15 +165,28 @@ async function cmdGenerate (argv) {
   log(`wrote ${entries.length} entries (${added} new this run)` + (prs ? `, ${prs.length} open PRs` : ''))
 }
 
-function deriveTitle (e) {
-  if (e.modelChanges) {
-    const { added = [], removed = [] } = e.modelChanges
-    if (added.length && removed.length) return `${added[0]} replaces ${removed[0]} in the model lineup`
-    if (added.length) return `New model available: ${added[0]}`
-    if (removed.length) return `${removed[0]} removed from the model lineup`
+async function backfillDiffs (entries, max = 1000) {
+  const diffDir = resolve(DATA, 'diffs')
+  await mkdir(diffDir, { recursive: true })
+  const syncs = entries.filter(e => e.kind === 'sync').reverse()
+  let count = 0
+  for (const e of syncs) {
+    const diffFile = resolve(diffDir, `${e.sha}.diff`)
+    if (existsSync(diffFile)) {
+      e.hasDiff = true
+      continue
+    }
+    if (count >= max) continue
+    const prev = e.prevSha || (await git(['rev-parse', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
+    if (!prev) continue
+    const diff = await extractCleanDiff(REPO_DIR, prev, e.sha)
+    if (diff) {
+      await writeText(diffFile, diff)
+      e.hasDiff = true
+      count++
+    }
   }
-  if (e.version) return `Release ${e.version}`
-  return e.summary.split(/[.:]/)[0].slice(0, 70)
+  if (count > 0) log(`generated ${count} diffs in data/diffs/`)
 }
 
 async function listCommitsRange (repoDir, lastSha) {
@@ -184,13 +204,116 @@ async function listCommitsRange (repoDir, lastSha) {
 
 // ---------------------------------------------------------------------------
 
+async function cmdCatchUp (argv) {
+  log('running LLM enrichment catch-up…')
+  const head = await ensureRepo()
+
+  try {
+    const currentBranch = (await git(['branch', '--show-current'], ROOT, { allowFail: true }))?.trim() || 'master'
+    await git(['pull', '--rebase', 'origin', currentBranch], ROOT, { allowFail: true })
+  } catch {}
+
+  const existing = await readJson(`${DATA}/changelog.json`, { version: 1, entries: [] })
+  let entries = existing.entries || []
+  if (!entries.length) {
+    log('no entries found — running generate first')
+    await cmdGenerate(argv)
+    return
+  }
+
+  // Ensure diffs exist for all sync entries
+  await backfillDiffs(entries, 1000)
+
+  if (llmConfigured()) {
+    const getPatch = async (e) => {
+      if (e.kind !== 'sync') return ''
+      const prev = e.prevSha || (await git(['rev-parse', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
+      if (!prev) return ''
+      const files = await diffNameStatus(REPO_DIR, prev, e.sha)
+      const targets = files.map(f => f.path).filter(p => !p.endsWith('bun.lock') && !TEST_RE.test(p)).slice(0, 8)
+      if (!targets.length) return ''
+      return diffPatch(REPO_DIR, prev, e.sha, targets)
+    }
+    const envWithLimit = { ...process.env, CHANGELOG_LLM_LIMIT: process.env.CHANGELOG_LLM_LIMIT || '100' }
+    const n = await enrichWithLlm(entries, getPatch, DATA, envWithLimit, { retryErrors: true })
+    log(`catch-up complete: ${n} entries enriched with LLM`)
+    if (n > 0) {
+      await writeJson(`${DATA}/changelog.json`, existing)
+    }
+  } else {
+    log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required)')
+  }
+
+  if (argv.includes('--push')) {
+    const status = (await git(['status', '--porcelain', 'data/'], ROOT, { allowFail: true })) || ''
+    if (status.trim()) {
+      log('committing and pushing data to git…')
+      await git(['add', 'data'], ROOT)
+      await git(['commit', '-m', 'data: LLM catch-up and diffs [skip ci]'], ROOT)
+      const currentBranch = (await git(['branch', '--show-current'], ROOT, { allowFail: true }))?.trim() || 'master'
+      await git(['push', 'origin', currentBranch], ROOT)
+      log('pushed to origin — Cloudflare Pages will deploy automatically.')
+    } else {
+      log('data is already up to date — nothing to push.')
+    }
+  }
+}
+
+async function cmdWatch (argv) {
+  const intervalSec = Number(process.env.WATCH_INTERVAL || 180)
+  log(`starting watch daemon (polling every ${intervalSec}s)… Press Ctrl+C to stop.`)
+  while (true) {
+    try {
+      await cmdCatchUp(argv)
+    } catch (err) {
+      log(`watch iteration error: ${err.message}`)
+    }
+    await new Promise(r => setTimeout(r, intervalSec * 1000))
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 async function cmdBuild () {
   const changelog = await readJson(`${DATA}/changelog.json`, null)
   if (!changelog) throw new Error('data/changelog.json missing — run generate first')
+  const aiCache = await readJson(`${DATA}/ai-summaries.json`, {})
+  if (Object.keys(aiCache).length) {
+    const aiBySha = new Map()
+    for (const [key, val] of Object.entries(aiCache)) {
+      if (val && !val.error && val.title) {
+        const sha = key.split(':')[0]
+        aiBySha.set(sha, val)
+      }
+    }
+    for (const e of changelog.entries) {
+      if (!e.ai && aiBySha.has(e.sha)) {
+        e.ai = aiBySha.get(e.sha)
+      }
+    }
+  }
   const prs = await readJson(`${DATA}/open-prs.json`, [])
+  const diffs = new Map()
+  const dataDiffs = resolve(DATA, 'diffs')
+  if (existsSync(dataDiffs)) {
+    const { readdir } = await import('node:fs/promises')
+    const files = await readdir(dataDiffs)
+    for (const f of files) {
+      if (f.endsWith('.diff')) {
+        diffs.set(f.slice(0, -5), await readFile(resolve(dataDiffs, f), 'utf8'))
+      }
+    }
+  }
   const dist = resolve(ROOT, 'dist')
   const t0 = Date.now()
-  await buildSite({ changelog, openPrs: prs, dist })
+  await buildSite({ changelog, openPrs: prs, dist, diffs })
+
+  const distDiffs = resolve(dist, 'diffs')
+  if (existsSync(dataDiffs)) {
+    await mkdir(distDiffs, { recursive: true })
+    await cp(dataDiffs, distDiffs, { recursive: true })
+  }
+
   log(`site built in ${((Date.now() - t0) / 1000).toFixed(1)}s → ${dist}`)
 }
 
@@ -209,7 +332,16 @@ async function cmdPreview (port = 8788) {
       res.end(body)
     } catch {
       try { const body = await readFile(join(f.replace(/\/$/, '') + '/index.html')); res.writeHead(200, { 'content-type': 'text/html' }); res.end(body) }
-      catch { res.writeHead(404); res.end('404') }
+      catch {
+        try {
+          const body = await readFile(resolve(dist, '404.html'))
+          res.writeHead(404, { 'content-type': 'text/html; charset=utf-8' })
+          res.end(body)
+        } catch {
+          res.writeHead(404)
+          res.end('404')
+        }
+      }
     }
   }).listen(port, () => log(`preview: http://localhost:${port}`))
 }
@@ -217,6 +349,7 @@ async function cmdPreview (port = 8788) {
 function MIME (f) {
   if (f.endsWith('.html')) return 'text/html; charset=utf-8'
   if (f.endsWith('.json')) return 'application/json; charset=utf-8'
+  if (f.endsWith('.diff')) return 'text/plain; charset=utf-8'
   if (f.endsWith('.xml')) return 'application/rss+xml; charset=utf-8'
   if (f.endsWith('.css')) return 'text/css'
   if (f.endsWith('.svg')) return 'image/svg+xml'
@@ -227,9 +360,16 @@ function MIME (f) {
 
 const [, , cmd, ...rest] = process.argv
 if (cmd === 'generate') await cmdGenerate(rest)
+else if (cmd === 'catch-up') await cmdCatchUp(rest)
+else if (cmd === 'watch') await cmdWatch(rest)
 else if (cmd === 'build') await cmdBuild()
 else if (cmd === 'preview') await cmdPreview(Number(rest[0]) || 8788)
 else {
-  console.log(`usage:\n  node generator/cli.mjs generate [--full]   # fetch freebuff, analyze new commits\n  node generator/cli.mjs build                     # render static site → dist/\n  node generator/cli.mjs preview [port]              # local preview of dist/`)
+  console.log(`usage:
+  node generator/cli.mjs generate [--full]       # fetch freebuff, analyze new commits
+  node generator/cli.mjs catch-up [--push]      # catch up LLM enrichment & diffs
+  node generator/cli.mjs watch [--push]         # continuous polling daemon
+  node generator/cli.mjs build                  # render static site → dist/
+  node generator/cli.mjs preview [port]         # local preview of dist/`)
   process.exit(cmd ? 1 : 0)
 }

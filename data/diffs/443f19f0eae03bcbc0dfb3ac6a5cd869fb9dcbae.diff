@@ -1,0 +1,1283 @@
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index 88f6662fe..8a2770b57 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -535,6 +535,7 @@ export const Chat = ({
+           logoutMutation,
+           streamMessageIdRef,
+           addToQueue,
++          hasQueuedMessages: () => queuedCount > 0,
+           clearMessages,
+           saveToHistory,
+           scrollToLatest,
+diff --git a/cli/src/commands/__tests__/router-steering.test.ts b/cli/src/commands/__tests__/router-steering.test.ts
+new file mode 100644
+index 000000000..cb15dcf92
+--- /dev/null
++++ b/cli/src/commands/__tests__/router-steering.test.ts
+@@ -0,0 +1,128 @@
++import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
++
++import { useChatStore } from '../../state/chat-store'
++import {
++  __resetSteeringForTests,
++  activateSteering,
++  drainSteeringMessages,
++} from '../../utils/steering-buffer'
++import { routeUserPrompt } from '../router'
++
++import type { RouterParams } from '../command-registry'
++
++const createMockParams = (overrides: Partial<RouterParams> = {}): RouterParams =>
++  ({
++    agentMode: 'DEFAULT',
++    inputRef: { current: null },
++    inputValue: '',
++    isChainInProgressRef: { current: false },
++    isStreaming: false,
++    logoutMutation: {} as RouterParams['logoutMutation'],
++    streamMessageIdRef: { current: null },
++    addToQueue: mock(() => {}),
++    hasQueuedMessages: () => false,
++    clearMessages: mock(() => {}),
++    saveToHistory: mock(() => {}),
++    scrollToLatest: mock(() => {}),
++    sendMessage: mock(async () => {}),
++    setCanProcessQueue: mock(() => {}),
++    setInputFocused: mock(() => {}),
++    setInputValue: mock(() => {}),
++    setIsAuthenticated: mock(() => {}),
++    setMessages: mock(() => {}),
++    setUser: mock(() => {}),
++    ...overrides,
++  }) as RouterParams
++
++beforeEach(() => {
++  useChatStore.getState().clearPendingBashMessages()
++})
++
++afterEach(() => {
++  __resetSteeringForTests()
++  useChatStore.getState().clearPendingBashMessages()
++})
++
++describe('mid-turn routing', () => {
++  test('plain text steers the active run and echoes a bubble immediately', async () => {
++    activateSteering('run-1')
++    const params = createMockParams({
++      inputValue: 'actually use zod for validation',
++      isStreaming: true,
++    })
++    await routeUserPrompt(params)
++
++    expect(params.addToQueue).not.toHaveBeenCalled()
++    expect(params.sendMessage).not.toHaveBeenCalled()
++    // Bubble echoed at push time so the submit is visible right away.
++    expect(params.setMessages).toHaveBeenCalledTimes(1)
++    const drained = drainSteeringMessages('run-1')
++    expect(drained.map((entry) => entry.text)).toEqual([
++      'actually use zod for validation',
++    ])
++    expect(drained[0]!.messageId).toStartWith('user-')
++  })
++
++  test('falls back to the queue when no run is accepting steering', async () => {
++    const params = createMockParams({
++      inputValue: 'between chained runs',
++      isStreaming: true,
++    })
++    await routeUserPrompt(params)
++
++    expect(params.addToQueue).toHaveBeenCalledTimes(1)
++    const [queued] = (params.addToQueue as ReturnType<typeof mock>).mock
++      .calls[0] as [string]
++    expect(queued).toBe('between chained runs')
++  })
++
++  test('queues instead of steering when earlier messages are already queued', async () => {
++    activateSteering('run-1')
++    const params = createMockParams({
++      inputValue: 'this must not overtake the queue',
++      isStreaming: true,
++      hasQueuedMessages: () => true,
++    })
++    await routeUserPrompt(params)
++
++    expect(drainSteeringMessages('run-1')).toEqual([])
++    expect(params.addToQueue).toHaveBeenCalledTimes(1)
++  })
++
++  test('queues instead of steering while bash output is pending', async () => {
++    activateSteering('run-1')
++    useChatStore.getState().addPendingBashMessage({
++      command: 'bun test',
++      output: '3 fail',
++    } as never)
++    const params = createMockParams({
++      inputValue: 'fix those failures',
++      isStreaming: true,
++    })
++    await routeUserPrompt(params)
++
++    expect(drainSteeringMessages('run-1')).toEqual([])
++    expect(params.addToQueue).toHaveBeenCalledTimes(1)
++  })
++
++  test('slash commands never steer', async () => {
++    activateSteering('run-1')
++    const params = createMockParams({
++      inputValue: '/definitely-not-a-command',
++      isStreaming: true,
++    })
++    await routeUserPrompt(params)
++
++    expect(drainSteeringMessages('run-1')).toEqual([])
++    expect(params.addToQueue).toHaveBeenCalledTimes(1)
++  })
++
++  test('idle submits are unaffected and send normally', async () => {
++    activateSteering('run-1')
++    const params = createMockParams({ inputValue: 'a fresh task' })
++    await routeUserPrompt(params)
++
++    expect(params.sendMessage).toHaveBeenCalledTimes(1)
++    expect(drainSteeringMessages('run-1')).toEqual([])
++  })
++})
+diff --git a/cli/src/commands/__tests__/skill-command.test.ts b/cli/src/commands/__tests__/skill-command.test.ts
+new file mode 100644
+index 000000000..9ff609622
+--- /dev/null
++++ b/cli/src/commands/__tests__/skill-command.test.ts
+@@ -0,0 +1,156 @@
++import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
++
++import { useChatStore } from '../../state/chat-store'
++import {
++  __resetSkillRegistryForTests,
++  __setSkillsForTests,
++} from '../../utils/skill-registry'
++import { findCommand } from '../command-registry'
++import { buildSkillPrompt } from '../prompt-builders'
++import { routeUserPrompt } from '../router'
++
++import type { RouterParams } from '../command-registry'
++import type { SkillDefinition } from '@codebuff/common/types/skill'
++
++const TEST_SKILL: SkillDefinition = {
++  name: 'release-notes',
++  description: 'Draft release notes from recent commits',
++  content:
++    '---\nname: release-notes\ndescription: Draft release notes\n---\n\nDo the thing.',
++  filePath: '/tmp/skills/release-notes/SKILL.md',
++}
++
++const createMockParams = (overrides: Partial<RouterParams> = {}): RouterParams =>
++  ({
++    agentMode: 'DEFAULT',
++    inputRef: { current: null },
++    inputValue: '',
++    isChainInProgressRef: { current: false },
++    isStreaming: false,
++    logoutMutation: {} as RouterParams['logoutMutation'],
++    streamMessageIdRef: { current: null },
++    addToQueue: mock(() => {}),
++    clearMessages: mock(() => {}),
++    saveToHistory: mock(() => {}),
++    scrollToLatest: mock(() => {}),
++    sendMessage: mock(async () => {}),
++    setCanProcessQueue: mock(() => {}),
++    setInputFocused: mock(() => {}),
++    setInputValue: mock(() => {}),
++    setIsAuthenticated: mock(() => {}),
++    setMessages: mock(() => {}),
++    setUser: mock(() => {}),
++    ...overrides,
++  }) as RouterParams
++
++const resetChatStore = () => {
++  useChatStore.getState().setInputMode('default')
++  useChatStore.getState().setPendingSkillName(null)
++}
++
++beforeEach(() => {
++  __setSkillsForTests({ [TEST_SKILL.name]: TEST_SKILL })
++  resetChatStore()
++})
++
++afterEach(() => {
++  __resetSkillRegistryForTests()
++  resetChatStore()
++})
++
++describe('/skill:<name> command', () => {
++  test('bare invocation enters skill input mode instead of sending', async () => {
++    const command = findCommand('skill:release-notes')
++    expect(command).toBeDefined()
++
++    const params = createMockParams({ inputValue: '/skill:release-notes' })
++    await command!.handler(params, '')
++
++    expect(useChatStore.getState().inputMode).toBe('skill')
++    expect(useChatStore.getState().pendingSkillName).toBe('release-notes')
++    expect(params.sendMessage).not.toHaveBeenCalled()
++    expect(params.addToQueue).not.toHaveBeenCalled()
++  })
++
++  test('invocation with trailing text sends immediately', async () => {
++    const command = findCommand('skill:release-notes')
++    const params = createMockParams({
++      inputValue: '/skill:release-notes for v2.1 only',
++    })
++    await command!.handler(params, 'for v2.1 only')
++
++    expect(useChatStore.getState().inputMode).toBe('default')
++    expect(params.sendMessage).toHaveBeenCalledTimes(1)
++    const [{ content }] = (params.sendMessage as ReturnType<typeof mock>).mock
++      .calls[0] as [{ content: string }]
++    expect(content).toBe(buildSkillPrompt(TEST_SKILL, 'for v2.1 only'))
++    expect(content).toContain('<skill name="release-notes">')
++    expect(content).toContain('User request: for v2.1 only')
++  })
++})
++
++describe('skill input mode submit', () => {
++  const enterSkillMode = () => {
++    useChatStore.getState().setInputMode('skill')
++    useChatStore.getState().setPendingSkillName(TEST_SKILL.name)
++  }
++
++  test('submit with text sends the skill plus the user request', async () => {
++    enterSkillMode()
++    const params = createMockParams({ inputValue: 'focus on the API changes' })
++    await routeUserPrompt(params)
++
++    expect(useChatStore.getState().inputMode).toBe('default')
++    expect(useChatStore.getState().pendingSkillName).toBeNull()
++    expect(params.sendMessage).toHaveBeenCalledTimes(1)
++    const [{ content }] = (params.sendMessage as ReturnType<typeof mock>).mock
++      .calls[0] as [{ content: string }]
++    expect(content).toBe(
++      buildSkillPrompt(TEST_SKILL, 'focus on the API changes'),
++    )
++  })
++
++  test('empty submit runs the skill without a user request', async () => {
++    enterSkillMode()
++    const params = createMockParams({ inputValue: '' })
++    await routeUserPrompt(params)
++
++    expect(params.sendMessage).toHaveBeenCalledTimes(1)
++    const [{ content }] = (params.sendMessage as ReturnType<typeof mock>).mock
++      .calls[0] as [{ content: string }]
++    expect(content).toBe(buildSkillPrompt(TEST_SKILL, ''))
++    expect(content).not.toContain('User request:')
++  })
++
++  test('submit while a turn is running queues instead of sending', async () => {
++    enterSkillMode()
++    const params = createMockParams({
++      inputValue: 'and be brief',
++      isStreaming: true,
++    })
++    await routeUserPrompt(params)
++
++    expect(params.sendMessage).not.toHaveBeenCalled()
++    expect(params.addToQueue).toHaveBeenCalledTimes(1)
++    const [queued] = (params.addToQueue as ReturnType<typeof mock>).mock
++      .calls[0] as [string]
++    expect(queued).toBe(buildSkillPrompt(TEST_SKILL, 'and be brief'))
++  })
++
++  test('a skill deleted mid-session reports instead of sending nothing', async () => {
++    enterSkillMode()
++    __resetSkillRegistryForTests()
++    const params = createMockParams({ inputValue: 'anything' })
++    await routeUserPrompt(params)
++
++    expect(params.sendMessage).not.toHaveBeenCalled()
++    expect(params.setMessages).toHaveBeenCalled()
++    expect(useChatStore.getState().inputMode).toBe('default')
++  })
++
++  test('leaving skill mode clears the pending skill', () => {
++    enterSkillMode()
++    useChatStore.getState().setInputMode('default')
++    expect(useChatStore.getState().pendingSkillName).toBeNull()
++  })
++})
+diff --git a/cli/src/commands/command-registry.ts b/cli/src/commands/command-registry.ts
+index 18d0eea0d..b308c7bb9 100644
+--- a/cli/src/commands/command-registry.ts
++++ b/cli/src/commands/command-registry.ts
+@@ -9,7 +9,7 @@ import {
+   collectProcessDiagnostics,
+   formatProcessDiagnostics,
+ } from './process-diagnostics'
+-import { buildInterviewPrompt, buildPlanPrompt, buildReviewPromptFromArgs } from './prompt-builders'
++import { buildInterviewPrompt, buildPlanPrompt, buildReviewPromptFromArgs, buildSkillPrompt } from './prompt-builders'
+ import { handleReasoningCommand } from './reasoning'
+ import { runBashCommand } from './router'
+ import { handleUsageCommand } from './usage'
+@@ -44,6 +44,9 @@ export type RouterParams = {
+   logoutMutation: UseMutationResult<boolean, Error, void, unknown>
+   streamMessageIdRef: React.MutableRefObject<string | null>
+   addToQueue: (message: string, attachments?: PendingAttachment[]) => void
++  /** Whether the message queue currently holds anything. Steering checks it
++   *  so a mid-turn submit can't overtake earlier queued submissions. */
++  hasQueuedMessages?: () => boolean
+   clearMessages: () => void
+   saveToHistory: (message: string) => void
+   scrollToLatest: () => void
+@@ -715,36 +718,50 @@ function createSkillCommand(skillName: string): CommandDefinition {
+       params.saveToHistory(trimmed)
+       params.setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
+ 
+-      // Build the message content with skill context and optional user args
+-      const skillContext = `<skill name="${skill.name}">
+-${skill.content}
+-</skill>`
+-
+-      const userPrompt = `I invoke the following skill:\n\n${skillContext}\n\n`
+-        + (args.trim()
+-          ? `User request: ${args.trim()}`
+-          : '')
+-
+-      // Check streaming/queue state
+-      if (
+-        params.isStreaming ||
+-        params.streamMessageIdRef.current ||
+-        params.isChainInProgressRef.current
+-      ) {
+-        const pendingAttachments = capturePendingAttachments()
+-        params.addToQueue(userPrompt, pendingAttachments)
++      // Bare invocation: like /interview, drop into an input mode so the
++      // user can add instructions before the skill is sent. Enter with an
++      // empty composer still runs the skill as-is (the router's skill-mode
++      // branch), so a no-args run costs one extra keystroke, not a feature.
++      if (!args.trim()) {
++        useChatStore.getState().enterSkillMode(skill.name)
+         params.setInputFocused(true)
+         params.inputRef.current?.focus()
+         return
+       }
+ 
+-      params.sendMessage({
+-        content: userPrompt,
+-        agentMode: params.agentMode,
+-      })
+-      setTimeout(() => {
+-        params.scrollToLatest()
+-      }, 0)
++      dispatchSkillPrompt(params, skill, args)
+     },
+   })
+ }
++
++/**
++ * Send (or queue, mid-turn) a user-invoked skill prompt. Shared by the
++ * /skill:<name> args form and the skill input mode's submit (router), so the
++ * two entry paths for the same feature cannot drift.
++ */
++export function dispatchSkillPrompt(
++  params: RouterParams,
++  skill: { name: string; content: string },
++  input: string,
++): void {
++  const userPrompt = buildSkillPrompt(skill, input)
++
++  if (
++    params.isStreaming ||
++    params.streamMessageIdRef.current ||
++    params.isChainInProgressRef.current
++  ) {
++    params.addToQueue(userPrompt, capturePendingAttachments())
++    params.setInputFocused(true)
++    params.inputRef.current?.focus()
++    return
++  }
++
++  params.sendMessage({
++    content: userPrompt,
++    agentMode: params.agentMode,
++  })
++  setTimeout(() => {
++    params.scrollToLatest()
++  }, 0)
++}
+diff --git a/cli/src/commands/prompt-builders.ts b/cli/src/commands/prompt-builders.ts
+index 4dc997977..243523821 100644
+--- a/cli/src/commands/prompt-builders.ts
++++ b/cli/src/commands/prompt-builders.ts
+@@ -39,6 +39,26 @@ export function buildInterviewPrompt(input: string): string {
+   return `${INTERVIEW_BASE_PROMPT}\n\n${trimmedInput}`
+ }
+ 
++/**
++ * Build the prompt for a user-invoked skill. Shared by the /skill:<name>
++ * command (when it carries trailing text) and the skill input mode's second
++ * submit, so both entry paths produce byte-identical prompts.
++ *
++ * `content` is the whole SKILL.md (frontmatter included) — same as the
++ * agent-runtime's own skill tool output.
++ */
++export function buildSkillPrompt(
++  skill: { name: string; content: string },
++  input: string,
++): string {
++  const skillContext = `<skill name="${skill.name}">\n${skill.content}\n</skill>`
++  const trimmedInput = input.trim()
++  return (
++    `I invoke the following skill:\n\n${skillContext}\n\n` +
++    (trimmedInput ? `User request: ${trimmedInput}` : '')
++  )
++}
++
+ /**
+  * Review scope presets for the review screen.
+  */
+diff --git a/cli/src/commands/router.ts b/cli/src/commands/router.ts
+index d9b08aa76..7453034eb 100644
+--- a/cli/src/commands/router.ts
++++ b/cli/src/commands/router.ts
+@@ -3,6 +3,7 @@ import { runTerminalCommand } from '@codebuff/sdk'
+ 
+ 
+ import {
++  dispatchSkillPrompt,
+   findCommand,
+   type RouterParams,
+   type CommandResult,
+@@ -25,6 +26,8 @@ import { IS_FREEBUFF } from '../utils/constants'
+ import { getSystemProcessEnv } from '../utils/env'
+ import { terminalCommandBroker } from '../utils/terminal-command-broker'
+ import { getSystemMessage, getUserMessage } from '../utils/message-history'
++import { getSkillByName } from '../utils/skill-registry'
++import { pushSteeringMessage } from '../utils/steering-buffer'
+ import {
+   capturePendingAttachments,
+   hasProcessingFiles,
+@@ -258,6 +261,7 @@ export async function routeUserPrompt(
+     isStreaming,
+     streamMessageIdRef,
+     addToQueue,
++    hasQueuedMessages,
+     saveToHistory,
+     scrollToLatest,
+     sendMessage,
+@@ -272,9 +276,10 @@ export async function routeUserPrompt(
+   const pendingImages = pendingAttachments.filter((a) => a.kind === 'image')
+ 
+   const trimmed = inputValue.trim()
+-  // Allow empty messages if there are pending attachments (images or text)
++  // Allow empty messages if there are pending attachments (images or text).
++  // Skill mode also accepts an empty submit: it means "run the skill as-is".
+   const hasAttachments = pendingAttachments.length > 0
+-  if (!trimmed && !hasAttachments) return
++  if (!trimmed && !hasAttachments && inputMode !== 'skill') return
+ 
+   // DAU signal: one un-sampled event per user-submitted prompt. The CLI's
+   // distinct id resolves to the canonical codebuff user id (anonymous id is
+@@ -343,6 +348,38 @@ export async function routeUserPrompt(
+     return
+   }
+ 
++  // Handle skill mode input: the user picked a skill (bare /skill:<name>)
++  // and is now adding instructions. Empty input runs the skill without any.
++  if (inputMode === 'skill') {
++    const skillName = useChatStore.getState().pendingSkillName
++    const skill = skillName ? getSkillByName(skillName) : undefined
++
++    if (!skill) {
++      // Mode without a resolvable skill (state got out of sync): explain,
++      // and leave the user's typed text in the composer rather than
++      // destroying it — only the mode is reset.
++      setInputMode('default')
++      setInputFocused(true)
++      inputRef.current?.focus()
++      setMessages((prev) => [
++        ...prev,
++        getSystemMessage(`Skill not found: ${skillName ?? '(unknown)'}`),
++      ])
++      return
++    }
++
++    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
++    setInputMode('default')
++    setInputFocused(true)
++    inputRef.current?.focus()
++
++    if (trimmed) {
++      saveToHistory(trimmed)
++    }
++    dispatchSkillPrompt(params, skill, trimmed)
++    return
++  }
++
+   // Handle review mode input
+   if (inputMode === 'review') {
+     if (!trimmed) return
+@@ -430,6 +467,35 @@ export async function routeUserPrompt(
+     streamMessageIdRef.current ||
+     isChainInProgressRef.current
+   ) {
++    // Steer the running turn when possible: plain text is handed to the
++    // active run and injected at its next step boundary, so the user can
++    // redirect the agent without waiting the turn out. Falls back to the
++    // queue for anything the steering hook can't carry faithfully:
++    // attachments (strings only), a slash command (queued today so it can
++    // error/execute after the turn), pending `!` bash output (only
++    // prepareUserMessage folds it into the message that referenced it), a
++    // non-empty queue (steering would deliver this text ahead of earlier
++    // submissions), and the window where no run is accepting steering.
++    const canSteer =
++      !hasAttachments &&
++      !isSlashCommand(trimmed) &&
++      useChatStore.getState().pendingBashMessages.length === 0 &&
++      !hasQueuedMessages?.()
++    if (canSteer) {
++      // Echo the bubble now, so the submit is visible immediately, and hand
++      // its id to the buffer: if the run ends before draining this entry,
++      // use-send-message retracts the bubble and requeues the text (which
++      // mints its own bubble at dequeue) — no invisible message, no dupe.
++      const steeredMessage = getUserMessage(trimmed)
++      if (
++        pushSteeringMessage({ messageId: steeredMessage.id, text: trimmed })
++      ) {
++        setMessages((prev) => [...prev, steeredMessage])
++        setInputFocused(true)
++        inputRef.current?.focus()
++        return
++      }
++    }
+     const pendingAttachmentsForQueue = capturePendingAttachments()
+     // Pass a copy of pending attachments to the queue
+     addToQueue(trimmed, pendingAttachmentsForQueue)
+diff --git a/cli/src/components/__tests__/status-bar.test.tsx b/cli/src/components/__tests__/status-bar.test.tsx
+index b0af467ef..2db6c9afd 100644
+--- a/cli/src/components/__tests__/status-bar.test.tsx
++++ b/cli/src/components/__tests__/status-bar.test.tsx
+@@ -1,12 +1,18 @@
+ import { beforeAll, describe, expect, test } from 'bun:test'
++import { FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID } from '@codebuff/common/constants/freebuff-model-ids'
+ import { createTestRenderer } from '@opentui/core/testing'
+ import { createRoot, flushSync } from '@opentui/react'
+ import React from 'react'
+ 
+ import { StatusBar } from '../status-bar'
+ import { initializeThemeStore } from '../../hooks/use-theme'
++import { useChatStore } from '../../state/chat-store'
++import { IS_FREEBUFF } from '../../utils/constants'
+ import { getStatusIndicatorState } from '../../utils/status-indicator-state'
+ 
++import type { FreebuffSessionResponse } from '../../types/freebuff-session'
++import type { RunState } from '@codebuff/sdk'
++
+ beforeAll(() => {
+   initializeThemeStore()
+ })
+@@ -41,4 +47,60 @@ describe('StatusBar', () => {
+       setup.renderer.destroy()
+     }
+   })
++
++  // The idle session line (and therefore the context readout) only renders in
++  // freebuff builds — useFreebuffSessionProgress returns null otherwise.
++  test.skipIf(!IS_FREEBUFF)(
++    'renders context usage next to the unlimited label',
++    async () => {
++      const now = Date.now()
++      const session = {
++        status: 'active',
++        accessTier: 'full',
++        instanceId: 'test-instance',
++        model: FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
++        admittedAt: new Date(now - 60_000).toISOString(),
++        expiresAt: new Date(now + 3_600_000).toISOString(),
++        remainingMs: 3_600_000,
++      } as FreebuffSessionResponse
++      useChatStore.getState().setRunState({
++        sessionState: {
++          mainAgentState: { contextTokenCount: 142_310 },
++        },
++      } as RunState)
++
++      const statusIndicatorState = getStatusIndicatorState({
++        statusMessage: null,
++        streamStatus: 'idle',
++        nextCtrlCWillExit: false,
++        isConnected: true,
++      })
++      // Wide frame: the right-hand flex column takes half the row, and the
++      // left label truncates rather than wraps.
++      const setup = await createTestRenderer({ width: 140, height: 3 })
++      const root = createRoot(setup.renderer)
++      flushSync(() => {
++        root.render(
++          <StatusBar
++            timerStartTime={null}
++            isAtBottom
++            scrollToLatest={() => {}}
++            statusIndicatorState={statusIndicatorState}
++            freebuffSession={session}
++          />,
++        )
++      })
++
++      try {
++        await setup.renderOnce()
++        const frame = setup.captureCharFrame()
++        // 142,310 of DeepSeek V4 Flash's 1,048,576-token window → 14%.
++        expect(frame).toContain('unlimited · 142.3K (14%)')
++      } finally {
++        flushSync(() => root.unmount())
++        setup.renderer.destroy()
++        useChatStore.getState().setRunState(null)
++      }
++    },
++  )
+ })
+diff --git a/cli/src/components/chat-input-bar.tsx b/cli/src/components/chat-input-bar.tsx
+index 8f2aadf57..bd6922702 100644
+--- a/cli/src/components/chat-input-bar.tsx
++++ b/cli/src/components/chat-input-bar.tsx
+@@ -123,8 +123,25 @@ export const ChatInputBar = ({
+ }: ChatInputBarProps) => {
+   const inputMode = useChatStore((state) => state.inputMode)
+   const setInputMode = useChatStore((state) => state.setInputMode)
+-
+-  const modeConfig = getInputModeConfig(inputMode)
++  const pendingSkillName = useChatStore((state) => state.pendingSkillName)
++
++  const baseModeConfig = getInputModeConfig(inputMode)
++  // Skill mode names the pending skill in the banner so the user can see
++  // what their text will be attached to. Skill names run up to 64 chars;
++  // keep the banner narrow enough to leave room for typing.
++  const skillLabel =
++    inputMode === 'skill' && pendingSkillName
++      ? pendingSkillName.length > 24
++        ? `${pendingSkillName.slice(0, 23)}…`
++        : pendingSkillName
++      : null
++  const modeConfig = skillLabel
++    ? {
++        ...baseModeConfig,
++        label: skillLabel,
++        widthAdjustment: skillLabel.length + 3,
++      }
++    : baseModeConfig
+   const askUserState = useChatStore((state) => state.askUserState)
+   const hasAnyPreview = hasSuggestionMenu
+ 
+diff --git a/cli/src/components/status-bar.tsx b/cli/src/components/status-bar.tsx
+index 4ad621345..3cfeafb1d 100644
+--- a/cli/src/components/status-bar.tsx
++++ b/cli/src/components/status-bar.tsx
+@@ -1,4 +1,8 @@
+-import { getFreebuffModel } from '@codebuff/common/constants/freebuff-models'
++import {
++  FREEBUFF_DEFAULT_CONTEXT_WINDOW,
++  FREEBUFF_MODEL_CONTEXT_WINDOWS,
++  getFreebuffModel,
++} from '@codebuff/common/constants/freebuff-models'
+ import { TextAttributes } from '@opentui/core'
+ import React, { useEffect, useState } from 'react'
+ 
+@@ -8,7 +12,9 @@ import { ShimmerText } from './shimmer-text'
+ 
+ import { useFreebuffSessionProgress } from '../hooks/use-freebuff-session-progress'
+ import { useTheme } from '../hooks/use-theme'
++import { useChatStore } from '../state/chat-store'
+ import { formatElapsedTime } from '../utils/format-elapsed-time'
++import { formatContextUsage } from '../utils/format-token-count'
+ import {
+   FREEBUFF_COUNTDOWN_VISIBLE_MS,
+   formatFreebuffSessionCountdown,
+@@ -110,6 +116,27 @@ export const StatusBar = ({
+   const isUnlimited =
+     freebuffSession?.status === 'active' && !freebuffSession.rateLimit
+ 
++  // Context occupancy of the main agent only: subagent states never land in
++  // mainAgentState, so their tokens are excluded by construction. The store's
++  // runState is written at end of turn, which is exactly when the idle branch
++  // below renders — no mid-turn staleness is visible.
++  const contextTokenCount = useChatStore(
++    // Fully optional-chained: runState can be restored from a JSON.parse of
++    // run-state.json with no shape validation, and a throwing selector would
++    // crash the whole TUI.
++    (state) =>
++      state.runState?.sessionState?.mainAgentState?.contextTokenCount,
++  )
++  const contextWindow =
++    freebuffSession?.status === 'active'
++      ? (FREEBUFF_MODEL_CONTEXT_WINDOWS[freebuffSession.model] ??
++        FREEBUFF_DEFAULT_CONTEXT_WINDOW)
++      : FREEBUFF_DEFAULT_CONTEXT_WINDOW
++  const contextUsage =
++    contextTokenCount !== undefined
++      ? formatContextUsage(contextTokenCount, contextWindow)
++      : null
++
+   const renderStatusIndicator = () => {
+     switch (statusIndicatorState.kind) {
+       case 'ctrlC':
+@@ -171,6 +198,13 @@ export const StatusBar = ({
+             freebuffSession?.status === 'active'
+               ? getFreebuffModel(freebuffSession.model).displayName
+               : null
++          // One template string on purpose: conditional text-node children
++          // inside a <span> trip OpenTUI's reconciler (see knowledge.md).
++          const idleLabel = `${modelName ? `${modelName} · ` : ''}${
++            isUnlimited
++              ? 'unlimited'
++              : formatFreebuffSessionRemaining(sessionProgress.remainingMs)
++          }${contextUsage ? ` · ${contextUsage}` : ''}`
+           return (
+             <span
+               fg={
+@@ -181,10 +215,7 @@ export const StatusBar = ({
+                     : theme.secondary
+               }
+             >
+-              {modelName ? `${modelName} · ` : ''}
+-              {isUnlimited
+-                ? 'unlimited'
+-                : formatFreebuffSessionRemaining(sessionProgress.remainingMs)}
++              {idleLabel}
+             </span>
+           )
+         }
+diff --git a/cli/src/contexts/chat-runtime-context.tsx b/cli/src/contexts/chat-runtime-context.tsx
+index 978596f21..ebe0d6182 100644
+--- a/cli/src/contexts/chat-runtime-context.tsx
++++ b/cli/src/contexts/chat-runtime-context.tsx
+@@ -188,6 +188,7 @@ export const ChatRuntimeProvider = ({
+     isProcessingQueueRef: queue.isProcessingQueueRef,
+     resumeQueue: queue.resumeQueue,
+     requeueMessageAtFront: queue.addToQueueFront,
++    pauseQueue: queue.pauseQueue,
+     continueChat,
+     continueChatId,
+     subscriptionData,
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index ea2526a86..698859a44 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -35,6 +35,11 @@ import {
+   sanitizeRestoredMessages,
+ } from '../utils/send-message-helpers'
+ import { createSendMessageTimerController } from '../utils/send-message-timer'
++import {
++  activateSteering,
++  deactivateSteering,
++  drainSteeringMessages as drainSteeringBuffer,
++} from '../utils/steering-buffer'
+ import {
+   handleRunCompletion,
+   handleRunError,
+@@ -83,6 +88,10 @@ interface UseSendMessageOptions {
+     content: string
+     attachments: PendingAttachment[]
+   }) => void
++  /** Pause the queue. Used when requeueing an undelivered steering message
++   *  after a user interrupt, so the held text doesn't auto-start a new turn
++   *  the user just stopped. */
++  pauseQueue?: () => void
+   continueChat: boolean
+   continueChatId?: string
+   subscriptionData?: SubscriptionResponse | null
+@@ -136,6 +145,7 @@ export const useSendMessage = ({
+   isProcessingQueueRef,
+   resumeQueue,
+   requeueMessageAtFront,
++  pauseQueue,
+   continueChat,
+   continueChatId,
+   subscriptionData,
+@@ -630,6 +640,16 @@ export const useSendMessage = ({
+               runChatDir,
+             )
+           },
++          // Mid-turn steering: the agent loop calls this at each step
++          // boundary; texts pushed by the router since the last boundary are
++          // injected into the running turn as user prompts. The transcript
++          // bubble was already echoed at push time (router), so this only
++          // hands over the texts. Returning [] on abort leaves the entries
++          // in the buffer for the leftover handling below.
++          drainSteeringMessages: () => {
++            if (abortController.signal.aborted) return []
++            return drainSteeringBuffer(runOwnerId).map((entry) => entry.text)
++          },
+         })
+ 
+         // Log a summary only: the full run config contains the entire
+@@ -653,6 +673,9 @@ export const useSendMessage = ({
+           },
+           '[send-message] Sending message with sdk run config',
+         )
++        // Open the steering mailbox for this run only once we're committed to
++        // calling run(); the router falls back to the queue before this point.
++        activateSteering(runOwnerId)
+         const runState = await client.run(runConfig)
+ 
+         // Only adopt and persist the result while this run's chat is still
+@@ -728,6 +751,38 @@ export const useSendMessage = ({
+           logger.debug({ error }, '[send-message] Ignoring error after abort')
+         }
+       } finally {
++        // Close the steering mailbox. Anything the run never drained was
++        // submitted after its last step boundary; retract its push-time
++        // bubble (the requeued send mints its own at dequeue) and requeue it
++        // at the front so it isn't lost. On Esc the queue is paused first,
++        // matching the 'pause-if-pending' interrupt policy that ran while
++        // this text was still in the buffer — without the pause, the
++        // unblocked queue would immediately auto-start a new turn the user
++        // just tried to stop. Skipped after a mid-run chat switch (the
++        // message belongs to the old chat, whose queue was already cleared
++        // by the stop policy) and after non-user aborts like logout, where
++        // resurrecting input is wrong.
++        const steeringLeftovers = deactivateSteering(runOwnerId)
++        if (
++          steeringLeftovers.length > 0 &&
++          runChatIsCurrent() &&
++          (!abortController.signal.aborted ||
++            abortController.signal.reason === 'user-interrupt')
++        ) {
++          const leftoverIds = new Set(
++            steeringLeftovers.map((entry) => entry.messageId),
++          )
++          setMessages((prev) => prev.filter((msg) => !leftoverIds.has(msg.id)))
++          if (abortController.signal.aborted) {
++            pauseQueue?.()
++          }
++          for (const entry of steeringLeftovers.reverse()) {
++            requeueMessageAtFront?.({
++              content: entry.text,
++              attachments: [],
++            })
++          }
++        }
+         // Stop exit-flushing this run's checkpoint; the final state (or last
+         // checkpoint, on error) has been saved above. Owner-guarded so an
+         // aborted run resolving late can't clear a newer run's provider.
+@@ -771,6 +826,7 @@ export const useSendMessage = ({
+       removeActiveSubagent,
+       requeueMessageAtFront,
+       resumeQueue,
++      pauseQueue,
+       scrollToLatest,
+       setCanProcessQueue,
+       setFocusedAgentId,
+diff --git a/cli/src/state/chat-store.ts b/cli/src/state/chat-store.ts
+index 84fc0dc05..37b7da887 100644
+--- a/cli/src/state/chat-store.ts
++++ b/cli/src/state/chat-store.ts
+@@ -76,6 +76,10 @@ export type ChatStoreState = {
+   /** The currently active top banner, or null if none */
+   activeTopBanner: TopBannerType
+   inputMode: InputMode
++  /** Skill awaiting user text while inputMode === 'skill'. Cleared by
++   *  setInputMode whenever the mode moves off 'skill', so Escape and every
++   *  other mode exit reset it without extra bookkeeping. */
++  pendingSkillName: string | null
+   isRetrying: boolean
+   /** True while the current retry wait is a server capacity deferral (free
+    *  mode shed under high demand) rather than a stream recovery — the status
+@@ -149,6 +153,10 @@ type ChatStoreActions = {
+   setActiveTopBanner: (banner: TopBannerType) => void
+   closeTopBanner: () => void
+   setInputMode: (mode: InputMode) => void
++  setPendingSkillName: (name: string | null) => void
++  /** Atomic skill-mode entry: mode and pending skill set together, so
++   *  'skill' mode with a null skill is never representable via this path. */
++  enterSkillMode: (skillName: string) => void
+   setIsRetrying: (retrying: boolean) => void
+   /** Mark the current wait as a free-mode capacity deferral (implies
+    *  isRetrying). Cleared by setIsRetrying(false). */
+@@ -204,6 +212,7 @@ const initialState: ChatStoreState = {
+   runState: null,
+   activeTopBanner: null,
+   inputMode: 'default' as InputMode,
++  pendingSkillName: null as string | null,
+   isRetrying: false,
+   isCapacityWait: false,
+   askUserState: null,
+@@ -332,6 +341,20 @@ export const useChatStore = create<ChatStore>()(
+     setInputMode: (mode) =>
+       set((state) => {
+         state.inputMode = mode
++        if (mode !== 'skill') {
++          state.pendingSkillName = null
++        }
++      }),
++
++    setPendingSkillName: (name) =>
++      set((state) => {
++        state.pendingSkillName = name
++      }),
++
++    enterSkillMode: (skillName) =>
++      set((state) => {
++        state.inputMode = 'skill'
++        state.pendingSkillName = skillName
+       }),
+ 
+     setIsRetrying: (retrying) =>
+@@ -532,6 +555,7 @@ export const useChatStore = create<ChatStore>()(
+           : null
+         state.activeTopBanner = initialState.activeTopBanner
+         state.inputMode = initialState.inputMode
++        state.pendingSkillName = initialState.pendingSkillName
+         state.isRetrying = initialState.isRetrying
+         state.isCapacityWait = initialState.isCapacityWait
+         state.askUserState = initialState.askUserState
+diff --git a/cli/src/utils/__tests__/format-token-count.test.ts b/cli/src/utils/__tests__/format-token-count.test.ts
+new file mode 100644
+index 000000000..cdbba18be
+--- /dev/null
++++ b/cli/src/utils/__tests__/format-token-count.test.ts
+@@ -0,0 +1,58 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  formatContextUsage,
++  formatTokenCount,
++} from '../format-token-count'
++
++describe('formatTokenCount', () => {
++  test('small counts render as-is', () => {
++    expect(formatTokenCount(0)).toBe('0')
++    expect(formatTokenCount(982)).toBe('982')
++  })
++
++  test('thousands get a K suffix with one decimal', () => {
++    expect(formatTokenCount(1000)).toBe('1K')
++    expect(formatTokenCount(14_231)).toBe('14.2K')
++    expect(formatTokenCount(132_500)).toBe('132.5K')
++    expect(formatTokenCount(999_949)).toBe('999.9K')
++  })
++
++  test('millions get an M suffix', () => {
++    expect(formatTokenCount(1_000_000)).toBe('1M')
++    expect(formatTokenCount(1_250_000)).toBe('1.3M')
++  })
++
++  test('values that round to 1000K promote to 1M', () => {
++    expect(formatTokenCount(999_960)).toBe('1M')
++  })
++
++  test('garbage is rendered as zero rather than NaN', () => {
++    expect(formatTokenCount(Number.NaN)).toBe('0')
++    expect(formatTokenCount(-5)).toBe('0')
++  })
++})
++
++describe('formatContextUsage', () => {
++  test('formats tokens with a rounded window percentage', () => {
++    expect(formatContextUsage(14_231, 203_300)).toBe('14.2K (7%)')
++    expect(formatContextUsage(131_072, 1_048_576)).toBe('131.1K (13%)')
++  })
++
++  test('never shows 0% for a non-empty context', () => {
++    expect(formatContextUsage(1200, 1_048_576)).toBe('1.2K (1%)')
++  })
++
++  test('clamps at 100% when the estimate overshoots the window', () => {
++    expect(formatContextUsage(150_000, 131_072)).toBe('150K (100%)')
++  })
++
++  test('returns null when there is nothing to show', () => {
++    expect(formatContextUsage(0, 131_072)).toBeNull()
++    expect(formatContextUsage(Number.NaN, 131_072)).toBeNull()
++  })
++
++  test('omits the percentage when the window is unknown', () => {
++    expect(formatContextUsage(14_231, 0)).toBe('14.2K')
++  })
++})
+diff --git a/cli/src/utils/__tests__/steering-buffer.test.ts b/cli/src/utils/__tests__/steering-buffer.test.ts
+new file mode 100644
+index 000000000..e40060719
+--- /dev/null
++++ b/cli/src/utils/__tests__/steering-buffer.test.ts
+@@ -0,0 +1,69 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import {
++  __resetSteeringForTests,
++  activateSteering,
++  deactivateSteering,
++  drainSteeringMessages,
++  isSteeringActive,
++  pushSteeringMessage,
++} from '../steering-buffer'
++
++const entry = (text: string, messageId = `msg-${text}`) => ({
++  messageId,
++  text,
++})
++
++afterEach(() => {
++  __resetSteeringForTests()
++})
++
++describe('steering buffer', () => {
++  test('push fails while no run is active', () => {
++    expect(isSteeringActive()).toBe(false)
++    expect(pushSteeringMessage(entry('hello'))).toBe(false)
++  })
++
++  test('push/drain round-trips in order while a run is active', () => {
++    activateSteering('run-1')
++    expect(isSteeringActive()).toBe(true)
++    expect(pushSteeringMessage(entry('first'))).toBe(true)
++    expect(pushSteeringMessage(entry('second'))).toBe(true)
++    expect(drainSteeringMessages('run-1')).toEqual([
++      entry('first'),
++      entry('second'),
++    ])
++    // Drained means gone.
++    expect(drainSteeringMessages('run-1')).toEqual([])
++  })
++
++  test('drain is owner-guarded', () => {
++    activateSteering('run-1')
++    pushSteeringMessage(entry('for run 1'))
++    expect(drainSteeringMessages('run-2')).toEqual([])
++    expect(drainSteeringMessages('run-1')).toEqual([entry('for run 1')])
++  })
++
++  test('deactivate returns undelivered leftovers exactly once', () => {
++    activateSteering('run-1')
++    pushSteeringMessage(entry('too late'))
++    expect(deactivateSteering('run-1')).toEqual([entry('too late')])
++    expect(deactivateSteering('run-1')).toEqual([])
++    expect(pushSteeringMessage(entry('after end'))).toBe(false)
++  })
++
++  test('a stale run cannot deactivate a newer run', () => {
++    activateSteering('run-1')
++    activateSteering('run-2')
++    pushSteeringMessage(entry('for run 2'))
++    expect(deactivateSteering('run-1')).toEqual([])
++    expect(drainSteeringMessages('run-2')).toEqual([entry('for run 2')])
++  })
++
++  test('activation clears residue from a run that never deactivated', () => {
++    activateSteering('run-1')
++    pushSteeringMessage(entry('stale'))
++    activateSteering('run-2')
++    expect(drainSteeringMessages('run-2')).toEqual([])
++  })
++})
+diff --git a/cli/src/utils/create-run-config.ts b/cli/src/utils/create-run-config.ts
+index 29a3d97e6..b55408cbb 100644
+--- a/cli/src/utils/create-run-config.ts
++++ b/cli/src/utils/create-run-config.ts
+@@ -30,6 +30,10 @@ export type CreateRunConfigParams = {
+   extraCodebuffMetadata?: Record<string, string>
+   /** Periodic in-flight RunState checkpoints (see RunOptions.onStateSnapshot). */
+   onStateSnapshot?: (runState: RunState) => void
++  /** Mid-turn steering: drained by the agent loop at each step boundary;
++   *  returned texts are appended as user prompts and keep the turn going
++   *  (see RunOptions.drainSteeringMessages). */
++  drainSteeringMessages?: () => string[]
+ }
+ 
+ const SENSITIVE_EXTENSIONS = new Set([
+@@ -97,6 +101,7 @@ export const createRunConfig = (params: CreateRunConfigParams) => {
+     costMode,
+     extraCodebuffMetadata,
+     onStateSnapshot,
++    drainSteeringMessages,
+   } = params
+ 
+   return {
+@@ -113,6 +118,7 @@ export const createRunConfig = (params: CreateRunConfigParams) => {
+     costMode,
+     extraCodebuffMetadata,
+     onStateSnapshot,
++    drainSteeringMessages,
+     fileFilter: ((filePath: string) => {
+       if (isSensitiveFile(filePath)) return { status: 'blocked' }
+       return { status: 'allow' }
+diff --git a/cli/src/utils/format-token-count.ts b/cli/src/utils/format-token-count.ts
+new file mode 100644
+index 000000000..b4f394960
+--- /dev/null
++++ b/cli/src/utils/format-token-count.ts
+@@ -0,0 +1,48 @@
++import { clamp } from './math'
++
++/**
++ * Compact token count for the status bar: 982 → "982", 14_231 → "14.2K",
++ * 1_250_000 → "1.3M". One decimal, trailing ".0" dropped, so the readout
++ * stays narrow in an 80-column terminal.
++ */
++export function formatTokenCount(tokens: number): string {
++  if (!Number.isFinite(tokens) || tokens < 0) {
++    return '0'
++  }
++  if (tokens < 1000) {
++    return String(Math.round(tokens))
++  }
++  const format = (value: number, suffix: string): string => {
++    const rounded = Math.round(value * 10) / 10
++    const text = Number.isInteger(rounded)
++      ? String(rounded)
++      : rounded.toFixed(1)
++    return `${text}${suffix}`
++  }
++  // Branch on the ROUNDED value: 999,960 rounds to 1000.0K and must render
++  // as 1M, not "1000K".
++  if (Math.round(tokens / 100) / 10 < 1000) {
++    return format(tokens / 1000, 'K')
++  }
++  return format(tokens / 1_000_000, 'M')
++}
++
++/**
++ * "14.2K (7%)" — context occupancy against the model's context window. The
++ * percentage is rounded but never shown as 0% while tokens are non-zero, so a
++ * fresh session reads "1%" rather than implying an empty context is tracked
++ * at all. Returns null when there is nothing meaningful to show.
++ */
++export function formatContextUsage(
++  tokens: number,
++  contextWindow: number,
++): string | null {
++  if (!Number.isFinite(tokens) || tokens <= 0) {
++    return null
++  }
++  if (!Number.isFinite(contextWindow) || contextWindow <= 0) {
++    return formatTokenCount(tokens)
++  }
++  const percent = clamp(Math.round((tokens / contextWindow) * 100), 1, 100)
++  return `${formatTokenCount(tokens)} (${percent}%)`
++}
+diff --git a/cli/src/utils/input-modes.ts b/cli/src/utils/input-modes.ts
+index e3e5b8fae..68563e3de 100644
+--- a/cli/src/utils/input-modes.ts
++++ b/cli/src/utils/input-modes.ts
+@@ -12,6 +12,7 @@ export type InputMode =
+   | 'plan'
+   | 'review'
+   | 'interview'
++  | 'skill'
+   | 'usage'
+   | 'image'
+   | 'help'
+@@ -90,6 +91,18 @@ export const INPUT_MODE_CONFIGS: Record<InputMode, InputModeConfig> = {
+     disableSlashSuggestions: true,
+     blockKeyboardExit: false,
+   },
++  skill: {
++    icon: null,
++    // Label is replaced with the pending skill's name at render time
++    // (chat-input-bar), so the mode banner names what is about to run.
++    label: 'Skill',
++    color: 'info',
++    placeholder: 'add instructions for this skill, or press Enter to run it as-is...',
++    widthAdjustment: 8,
++    showAgentModeToggle: false,
++    disableSlashSuggestions: true,
++    blockKeyboardExit: false,
++  },
+   plan: {
+     icon: null,
+     label: 'Plan',
+diff --git a/cli/src/utils/skill-registry.ts b/cli/src/utils/skill-registry.ts
+index 466840456..79942f4e9 100644
+--- a/cli/src/utils/skill-registry.ts
++++ b/cli/src/utils/skill-registry.ts
+@@ -98,3 +98,10 @@ export function getLoadedSkillsMessage(): string | null {
+ export function __resetSkillRegistryForTests(): void {
+   skillsCache = {}
+ }
++
++/**
++ * Seed the cache without touching the filesystem. Intended for test scenarios.
++ */
++export function __setSkillsForTests(skills: SkillsMap): void {
++  skillsCache = skills
++}
+diff --git a/cli/src/utils/steering-buffer.ts b/cli/src/utils/steering-buffer.ts
+new file mode 100644
+index 000000000..8a8be3403
+--- /dev/null
++++ b/cli/src/utils/steering-buffer.ts
+@@ -0,0 +1,74 @@
++/**
++ * Mid-turn steering buffer.
++ *
++ * The agent loop runs in-process (SDK → agent-runtime), and the runtime
++ * drains `RunOptions.drainSteeringMessages` at every step boundary: any
++ * returned texts are appended to the conversation as user prompts and keep
++ * the turn going. This module is the CLI-side mailbox between the composer
++ * (router) and the active run (use-send-message), mirroring the claim/accept
++ * shape freebuff-desktop uses for the same hook.
++ *
++ * The router echoes the transcript bubble at push time and records its id
++ * here, so an entry the run never drains can have its bubble retracted when
++ * the text is requeued as a fresh turn (which mints its own bubble).
++ *
++ * Owner-guarded like active-run.ts: an aborted run resolving late must not
++ * drain or clear a newer run's buffer.
++ */
++
++export type SteeringEntry = {
++  /** Transcript id of the bubble echoed when the entry was pushed. */
++  messageId: string
++  text: string
++}
++
++let activeOwnerId: string | null = null
++let buffer: SteeringEntry[] = []
++
++/** Called by use-send-message right before client.run(). */
++export function activateSteering(ownerId: string): void {
++  activeOwnerId = ownerId
++  buffer = []
++}
++
++/**
++ * Called by use-send-message when the run settles. Returns any entries the
++ * run never drained (submitted after its last step boundary) so the caller
++ * can retract their bubbles and requeue the texts instead of dropping them.
++ */
++export function deactivateSteering(ownerId: string): SteeringEntry[] {
++  if (activeOwnerId !== ownerId) return []
++  activeOwnerId = null
++  const leftovers = buffer
++  buffer = []
++  return leftovers
++}
++
++/**
++ * Called by the router on a mid-turn submit. Returns false when no run is
++ * accepting steering (caller falls back to the queue).
++ */
++export function pushSteeringMessage(entry: SteeringEntry): boolean {
++  if (activeOwnerId === null) return false
++  buffer.push(entry)
++  return true
++}
++
++/** True while a run is accepting steering pushes. */
++export function isSteeringActive(): boolean {
++  return activeOwnerId !== null
++}
++
++/** Called by the run's drainSteeringMessages hook at each step boundary. */
++export function drainSteeringMessages(ownerId: string): SteeringEntry[] {
++  if (activeOwnerId !== ownerId || buffer.length === 0) return []
++  const drained = buffer
++  buffer = []
++  return drained
++}
++
++/** Test seam. */
++export function __resetSteeringForTests(): void {
++  activeOwnerId = null
++  buffer = []
++}

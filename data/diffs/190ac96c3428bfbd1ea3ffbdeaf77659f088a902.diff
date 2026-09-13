@@ -1,0 +1,1114 @@
+diff --git a/cli/src/commands/__tests__/copy-conversation-clipboard.test.ts b/cli/src/commands/__tests__/copy-conversation-clipboard.test.ts
+new file mode 100644
+index 000000000..4ad6d8bba
+--- /dev/null
++++ b/cli/src/commands/__tests__/copy-conversation-clipboard.test.ts
+@@ -0,0 +1,108 @@
++import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
++
++import { handleCopyConversationCommand } from '../copy-conversation'
++import { useChatStore } from '../../state/chat-store'
++import {
++  clearClipboardMessage,
++  registerClipboardRenderer,
++  subscribeClipboardMessages,
++  unregisterClipboardRenderer,
++} from '../../utils/clipboard'
++
++import type { RouterParams } from '../command-registry'
++import type { ChatMessage } from '../../types/chat'
++
++const hugeMessage: ChatMessage = {
++  id: 'huge-user-message',
++  variant: 'user',
++  content: 'word '.repeat(10_000),
++  timestamp: '2026-08-13T00:00:00.000Z',
++}
++
++const commandParams = {
++  inputValue: '/copy',
++  saveToHistory: () => {},
++  setInputValue: () => {},
++} as unknown as RouterParams
++
++describe('/copy OSC 52 fallback', () => {
++  let originalPlatform: PropertyDescriptor | undefined
++  let originalEnv: Record<string, string | undefined>
++
++  beforeEach(() => {
++    originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
++    originalEnv = {
++      TERM: process.env.TERM,
++      SSH_CLIENT: process.env.SSH_CLIENT,
++      SSH_TTY: process.env.SSH_TTY,
++      SSH_CONNECTION: process.env.SSH_CONNECTION,
++    }
++    Object.defineProperty(process, 'platform', {
++      value: 'freebsd',
++      configurable: true,
++    })
++    process.env.TERM = 'dumb'
++    delete process.env.SSH_CLIENT
++    delete process.env.SSH_TTY
++    delete process.env.SSH_CONNECTION
++    useChatStore.setState({ messages: [hugeMessage] })
++  })
++
++  afterEach(() => {
++    unregisterClipboardRenderer()
++    clearClipboardMessage()
++    useChatStore.getState().reset()
++    if (originalPlatform) {
++      Object.defineProperty(process, 'platform', originalPlatform)
++    }
++    for (const [key, value] of Object.entries(originalEnv)) {
++      if (value === undefined) delete process.env[key]
++      else process.env[key] = value
++    }
++  })
++
++  test('uses a bounded fallback when local native copy is unavailable', async () => {
++    const clipboardWrites: string[] = []
++    registerClipboardRenderer({
++      copyToClipboardOSC52: (text: string) => {
++        clipboardWrites.push(text)
++        return true
++      },
++    })
++    const statusMessages: (string | null)[] = []
++    const unsubscribe = subscribeClipboardMessages((message) =>
++      statusMessages.push(message),
++    )
++
++    await handleCopyConversationCommand(commandParams)
++
++    expect(clipboardWrites).toHaveLength(1)
++    expect(Buffer.byteLength(clipboardWrites[0]!, 'utf8')).toBeLessThanOrEqual(
++      22_000,
++    )
++    expect(clipboardWrites[0]).toContain('truncated to fit clipboard')
++    expect(statusMessages).toContain(
++      'Copied conversation · 1 message (older messages truncated to fit clipboard)',
++    )
++    unsubscribe()
++  })
++
++  test('uses the bounded representation directly over remote OSC 52', async () => {
++    process.env.SSH_CONNECTION = '192.0.2.1 12345 192.0.2.2 22'
++    const clipboardWrites: string[] = []
++    registerClipboardRenderer({
++      copyToClipboardOSC52: (text: string) => {
++        clipboardWrites.push(text)
++        return true
++      },
++    })
++
++    await handleCopyConversationCommand(commandParams)
++
++    expect(clipboardWrites).toHaveLength(1)
++    expect(Buffer.byteLength(clipboardWrites[0]!, 'utf8')).toBeLessThanOrEqual(
++      22_000,
++    )
++    expect(clipboardWrites[0]).toContain('truncated to fit clipboard')
++  })
++})
+diff --git a/cli/src/commands/copy-conversation.ts b/cli/src/commands/copy-conversation.ts
+index 2a43627c5..8c130efe3 100644
+--- a/cli/src/commands/copy-conversation.ts
++++ b/cli/src/commands/copy-conversation.ts
+@@ -7,15 +7,12 @@
+  * (see clipboard.ts). A real back-and-forth easily exceeds that, so when we're on
+  * a remote session and the transcript is too large, we progressively drop the
+  * largest tool results (then, if still needed, large tool inputs) — replacing each
+- * with a short omission note — until it fits. Local sessions use pbcopy/xclip,
+- * which have no such limit, so they always copy the full transcript.
++ * with a short omission note — until it fits. Local sessions first try a native
++ * clipboard tool with the full transcript, then use the same bounded rendering
++ * as an OSC 52 fallback when no native clipboard tool is available.
+  */
+ 
+-import {
+-  copyTextToClipboard,
+-  isRemoteSession,
+-  showClipboardMessage,
+-} from '../utils/clipboard'
++import { copyTextToClipboard, showClipboardMessage } from '../utils/clipboard'
+ import { useChatStore } from '../state/chat-store'
+ import { IS_FREEBUFF } from '../utils/constants'
+ 
+@@ -100,7 +97,10 @@ function renderToolOutput(output: string): { body: string; lang: string } {
+   const trimmed = output.trim()
+   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+     try {
+-      return { body: JSON.stringify(JSON.parse(trimmed), null, 2), lang: 'json' }
++      return {
++        body: JSON.stringify(JSON.parse(trimmed), null, 2),
++        lang: 'json',
++      }
+     } catch {
+       // Not valid JSON — fall through to raw.
+     }
+@@ -176,7 +176,9 @@ function renderBlock(block: ContentBlock, out: Segment[]): void {
+ 
+     case 'agent': {
+       const label = block.agentName || block.agentType
+-      out.push(`### ⤷ Subagent: ${label}${block.agentName ? ` (${block.agentType})` : ''}`)
++      out.push(
++        `### ⤷ Subagent: ${label}${block.agentName ? ` (${block.agentType})` : ''}`,
++      )
+       if (block.initialPrompt?.trim()) {
+         out.push(`_Prompt:_ ${block.initialPrompt.trim()}`)
+       }
+@@ -255,7 +257,36 @@ export interface SerializedConversation {
+   truncated: boolean
+ }
+ 
+-const TRUNCATION_MARKER = '_[…earlier conversation truncated to fit clipboard…]_'
++const TRUNCATION_MARKER =
++  '_[…earlier conversation truncated to fit clipboard…]_'
++
++function copySuccessMessage(
++  messageCount: number,
++  { omittedCount, truncated }: SerializedConversation,
++): string {
++  const count = `${messageCount} message${messageCount === 1 ? '' : 's'}`
++  const trimNotes: string[] = []
++  if (omittedCount > 0) {
++    trimNotes.push(
++      `${omittedCount} large tool call${omittedCount === 1 ? '' : 's'} trimmed`,
++    )
++  }
++  if (truncated) trimNotes.push('older messages truncated')
++  return trimNotes.length > 0
++    ? `Copied conversation · ${count} (${trimNotes.join(', ')} to fit clipboard)`
++    : `Copied conversation · ${count}`
++}
++
++function conversationClipboardContent(
++  messages: ChatMessage[],
++  maxBytes?: number,
++): { text: string; successMessage: string } {
++  const serialized = serializeConversation(messages, { maxBytes })
++  return {
++    text: serialized.text,
++    successMessage: copySuccessMessage(messages.length, serialized),
++  }
++}
+ 
+ /**
+  * Serialize the conversation to Markdown. When `maxBytes` is provided and the
+@@ -343,29 +374,18 @@ export async function handleCopyConversationCommand(
+     return
+   }
+ 
+-  // Only remote sessions are subject to the OSC 52 size cap; local clipboard
+-  // tools (pbcopy/xclip/clip) handle arbitrarily large transcripts.
+-  const { text, omittedCount, truncated } = serializeConversation(messages, {
+-    maxBytes: isRemoteSession() ? OSC52_TEXT_BUDGET_BYTES : undefined,
+-  })
+-
+-  const count = `${messages.length} message${messages.length === 1 ? '' : 's'}`
+-  // omittedCount covers dropped tool outputs and/or inputs, so phrase it as
+-  // "tool call(s)" rather than specifically "results".
+-  const trimNotes: string[] = []
+-  if (omittedCount > 0) {
+-    trimNotes.push(
+-      `${omittedCount} large tool call${omittedCount === 1 ? '' : 's'} trimmed`,
+-    )
+-  }
+-  if (truncated) trimNotes.push('older messages truncated')
+-  const successMessage =
+-    trimNotes.length > 0
+-      ? `Copied conversation · ${count} (${trimNotes.join(', ')} to fit clipboard)`
+-      : `Copied conversation · ${count}`
++  const primary = conversationClipboardContent(messages)
+ 
+   try {
+-    await copyTextToClipboard(text, { successMessage, durationMs: 4000 })
++    await copyTextToClipboard(primary.text, {
++      successMessage: primary.successMessage,
++      durationMs: 4000,
++      getOsc52Fallback:
++        byteLen(primary.text) > OSC52_TEXT_BUDGET_BYTES
++          ? () =>
++              conversationClipboardContent(messages, OSC52_TEXT_BUDGET_BYTES)
++          : undefined,
++    })
+   } catch {
+     // copyTextToClipboard already surfaces a failure/guidance message.
+   }
+diff --git a/cli/src/hooks/__tests__/use-clipboard.test.tsx b/cli/src/hooks/__tests__/use-clipboard.test.tsx
+new file mode 100644
+index 000000000..a9bfd1a51
+--- /dev/null
++++ b/cli/src/hooks/__tests__/use-clipboard.test.tsx
+@@ -0,0 +1,73 @@
++import { createTestRenderer } from '@opentui/core/testing'
++import { createRoot, flushSync } from '@opentui/react'
++import { afterEach, describe, expect, spyOn, test } from 'bun:test'
++import React from 'react'
++
++import { useClipboard } from '../use-clipboard'
++import * as clipboard from '../../utils/clipboard'
++
++import type { CopyToClipboardOptions } from '../../utils/clipboard'
++
++const waitForSelectionCopy = () =>
++  new Promise((resolve) => setTimeout(resolve, 300))
++
++describe('useClipboard selection copying', () => {
++  let dispose: (() => void) | undefined
++
++  afterEach(() => {
++    dispose?.()
++    dispose = undefined
++  })
++
++  test('a newer selection aborts the in-flight copy before starting its own', async () => {
++    const calls: Array<{
++      text: string
++      signal: AbortSignal
++      resolve: () => void
++    }> = []
++    const copySpy = spyOn(clipboard, 'copyTextToClipboard').mockImplementation(
++      (text: string, options: CopyToClipboardOptions = {}) =>
++        new Promise<void>((resolve, reject) => {
++          const signal = options.signal!
++          signal.addEventListener('abort', () => reject(signal.reason), {
++            once: true,
++          })
++          calls.push({ text, signal, resolve })
++        }),
++    )
++
++    const Harness = () => {
++      useClipboard()
++      return <text>clipboard</text>
++    }
++    const setup = await createTestRenderer({ width: 20, height: 2 })
++    const root = createRoot(setup.renderer)
++    flushSync(() => root.render(<Harness />))
++    await setup.renderOnce()
++    dispose = () => {
++      copySpy.mockRestore()
++      flushSync(() => root.unmount())
++      setup.renderer.destroy()
++    }
++
++    setup.renderer.emit('selection', {
++      getSelectedText: () => 'first selection',
++    } as never)
++    await waitForSelectionCopy()
++    expect(calls).toHaveLength(1)
++    expect(calls[0]?.signal.aborted).toBe(false)
++
++    setup.renderer.emit('selection', {
++      getSelectedText: () => 'second selection',
++    } as never)
++    expect(calls[0]?.signal.aborted).toBe(true)
++    await waitForSelectionCopy()
++
++    expect(calls.map(({ text }) => text)).toEqual([
++      'first selection',
++      'second selection',
++    ])
++    expect(calls[1]?.signal.aborted).toBe(false)
++    calls[1]?.resolve()
++  })
++})
+diff --git a/cli/src/hooks/use-clipboard.ts b/cli/src/hooks/use-clipboard.ts
+index daf05ca90..37680bc76 100644
+--- a/cli/src/hooks/use-clipboard.ts
++++ b/cli/src/hooks/use-clipboard.ts
+@@ -27,6 +27,7 @@ export const useClipboard = () => {
+   )
+   const pendingSelectionRef = useRef<string | null>(null)
+   const lastCopiedRef = useRef<string | null>(null)
++  const activeCopyControllerRef = useRef<AbortController | null>(null)
+ 
+   useEffect(() => {
+     return subscribeClipboardMessages(setStatusMessage)
+@@ -54,10 +55,13 @@ export const useClipboard = () => {
+           : null
+ 
+       // Filter out cursor character from selected text
+-      const cleanedText = rawText?.replace(new RegExp(CURSOR_CHAR, 'g'), '') ?? null
++      const cleanedText =
++        rawText?.replace(new RegExp(CURSOR_CHAR, 'g'), '') ?? null
+ 
+       if (!cleanedText || cleanedText.trim().length === 0) {
+         pendingSelectionRef.current = null
++        activeCopyControllerRef.current?.abort()
++        activeCopyControllerRef.current = null
+         setHasSelection(false)
+         if (pendingCopyTimeoutRef.current) {
+           clearTimeout(pendingCopyTimeoutRef.current)
+@@ -70,6 +74,13 @@ export const useClipboard = () => {
+         return
+       }
+ 
++      // A prior selection may still be waiting on a clipboard backend. Stop it
++      // immediately so it cannot finish after this newer selection and restore
++      // stale clipboard contents.
++      activeCopyControllerRef.current?.abort()
++      const controller = new AbortController()
++      activeCopyControllerRef.current = controller
++
+       // Track that there's an active selection for visual feedback
+       setHasSelection(true)
+ 
+@@ -83,22 +94,33 @@ export const useClipboard = () => {
+         pendingCopyTimeoutRef.current = null
+         const pending = pendingSelectionRef.current
+         if (!pending || pending === lastCopiedRef.current) {
++          if (activeCopyControllerRef.current === controller) {
++            activeCopyControllerRef.current = null
++          }
+           return
+         }
+ 
+-        lastCopiedRef.current = pending
+         const successMessage = formatDefaultClipboardMessage(pending)
+         void copyTextToClipboard(pending, {
+           successMessage,
+           durationMs: 3000,
++          signal: controller.signal,
+         })
+           .then(() => {
+-            // Clear selection visual state after successful copy
+-            setHasSelection(false)
++            if (activeCopyControllerRef.current === controller) {
++              lastCopiedRef.current = pending
++              // Clear selection visual state after successful copy
++              setHasSelection(false)
++            }
+           })
+           .catch(() => {
+             // Errors are logged within copyTextToClipboard
+           })
++          .finally(() => {
++            if (activeCopyControllerRef.current === controller) {
++              activeCopyControllerRef.current = null
++            }
++          })
+       }, 250)
+     }
+ 
+@@ -117,6 +139,8 @@ export const useClipboard = () => {
+         clearTimeout(pendingCopyTimeoutRef.current)
+         pendingCopyTimeoutRef.current = null
+       }
++      activeCopyControllerRef.current?.abort()
++      activeCopyControllerRef.current = null
+     }
+   }, [])
+ 
+diff --git a/cli/src/utils/__tests__/clipboard-linux.test.ts b/cli/src/utils/__tests__/clipboard-linux.test.ts
+new file mode 100644
+index 000000000..9e82baa93
+--- /dev/null
++++ b/cli/src/utils/__tests__/clipboard-linux.test.ts
+@@ -0,0 +1,359 @@
++import { EventEmitter } from 'node:events'
++import { Writable } from 'node:stream'
++
++import { createMockTimers } from '@codebuff/common/testing/mocks/timers'
++import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
++
++import {
++  clearClipboardMessage,
++  copyTextToClipboard,
++  LINUX_CLIPBOARD_ERROR_MESSAGE,
++  registerClipboardRenderer,
++  subscribeClipboardMessages,
++  unregisterClipboardRenderer,
++} from '../clipboard'
++import { logger } from '../logger'
++
++import type { ChildProcess } from 'node:child_process'
++import type { MockTimers } from '@codebuff/common/testing/mocks/timers'
++
++interface FakeClipboardProcess {
++  child: ChildProcess
++  close: (code: number) => void
++  input: () => string
++  killSignals: string[]
++}
++
++function fakeClipboardProcess(): FakeClipboardProcess {
++  let input = ''
++  const killSignals: string[] = []
++  const child = new EventEmitter() as ChildProcess
++  child.stdin = new Writable({
++    write(chunk, _encoding, callback) {
++      input += chunk.toString()
++      callback()
++    },
++  })
++  child.kill = ((signal = 'SIGTERM') => {
++    killSignals.push(String(signal))
++    return true
++  }) as ChildProcess['kill']
++
++  return {
++    child,
++    close: (code) => child.emit('close', code, null),
++    input: () => input,
++    killSignals,
++  }
++}
++
++const flushMicrotasks = async () => {
++  await Promise.resolve()
++  await Promise.resolve()
++}
++
++describe('copyTextToClipboard - Linux platform tools', () => {
++  let childProcess: typeof import('node:child_process')
++  let spawnSpy: ReturnType<typeof spyOn>
++  let loggerErrorSpy: ReturnType<typeof spyOn>
++  let mockTimers: MockTimers
++  let originalPlatform: PropertyDescriptor | undefined
++  let originalEnv: Record<string, string | undefined>
++  let attempts: {
++    command: string
++    args: string[]
++    process: FakeClipboardProcess
++  }[]
++
++  beforeEach(async () => {
++    childProcess = await import('node:child_process')
++    spawnSpy = spyOn(childProcess, 'spawn')
++    loggerErrorSpy = spyOn(logger, 'error').mockImplementation(() => {})
++    mockTimers = createMockTimers()
++    mockTimers.install()
++    attempts = []
++    originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
++    originalEnv = {
++      WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY,
++      SSH_CLIENT: process.env.SSH_CLIENT,
++      SSH_TTY: process.env.SSH_TTY,
++      SSH_CONNECTION: process.env.SSH_CONNECTION,
++      TERM: process.env.TERM,
++    }
++
++    Object.defineProperty(process, 'platform', {
++      value: 'linux',
++      configurable: true,
++    })
++    delete process.env.SSH_CLIENT
++    delete process.env.SSH_TTY
++    delete process.env.SSH_CONNECTION
++    process.env.TERM = 'dumb'
++    clearClipboardMessage()
++    unregisterClipboardRenderer()
++  })
++
++  afterEach(() => {
++    mockTimers.restore()
++    spawnSpy.mockRestore()
++    loggerErrorSpy.mockRestore()
++    unregisterClipboardRenderer()
++    clearClipboardMessage()
++    if (originalPlatform) {
++      Object.defineProperty(process, 'platform', originalPlatform)
++    }
++    for (const [key, value] of Object.entries(originalEnv)) {
++      if (value === undefined) delete process.env[key]
++      else process.env[key] = value
++    }
++  })
++
++  function mockBackends(statusFor: (command: string) => number | null) {
++    spawnSpy.mockImplementation((command: string, args: readonly string[]) => {
++      const process = fakeClipboardProcess()
++      attempts.push({ command, args: [...args], process })
++      const status = statusFor(command)
++      if (status !== null) {
++        queueMicrotask(() => process.close(status))
++      }
++      return process.child
++    })
++  }
++
++  test('prefers wl-copy in a Wayland session', async () => {
++    process.env.WAYLAND_DISPLAY = 'wayland-0'
++    mockBackends(() => 0)
++    let fallbackCalls = 0
++
++    await copyTextToClipboard('hello', {
++      suppressGlobalMessage: true,
++      getOsc52Fallback: () => {
++        fallbackCalls++
++        return { text: 'fallback' }
++      },
++    })
++
++    expect(attempts).toHaveLength(1)
++    expect(attempts[0]?.command).toBe('wl-copy')
++    expect(attempts[0]?.args).toEqual(['--type', 'text/plain'])
++    expect(attempts[0]?.process.input()).toBe('hello')
++    expect(fallbackCalls).toBe(0)
++  })
++
++  test('falls back from wl-copy through the X11 tools in order', async () => {
++    process.env.WAYLAND_DISPLAY = 'wayland-0'
++    mockBackends((command) => (command === 'xsel' ? 0 : 1))
++
++    await copyTextToClipboard('hello', { suppressGlobalMessage: true })
++
++    expect(attempts.map(({ command }) => command)).toEqual([
++      'wl-copy',
++      'xclip',
++      'xsel',
++    ])
++    expect(attempts.every(({ process }) => process.input() === 'hello')).toBe(
++      true,
++    )
++  })
++
++  test('a hanging backend does not block timers and is killed before fallback', async () => {
++    process.env.WAYLAND_DISPLAY = 'wayland-0'
++    mockBackends((command) => (command === 'wl-copy' ? null : 0))
++
++    const copyPromise = copyTextToClipboard('hello', {
++      suppressGlobalMessage: true,
++    })
++    await flushMicrotasks()
++    expect(attempts.map(({ command }) => command)).toEqual(['wl-copy'])
++
++    let uiTimerRan = false
++    setTimeout(() => {
++      uiTimerRan = true
++    }, 1)
++    mockTimers.advanceBy(1)
++    expect(uiTimerRan).toBe(true)
++    expect(attempts.map(({ command }) => command)).toEqual(['wl-copy'])
++
++    mockTimers.advanceBy(4999)
++    await copyPromise
++
++    expect(attempts.map(({ command }) => command)).toEqual(['wl-copy', 'xclip'])
++    expect(attempts[0]?.process.killSignals).toEqual(['SIGKILL'])
++  })
++
++  test('uses OSC 52 after a native timeout and failed native fallbacks', async () => {
++    process.env.WAYLAND_DISPLAY = 'wayland-0'
++    process.env.TERM = 'xterm-256color'
++    mockBackends((command) => (command === 'wl-copy' ? null : 1))
++    const rendererCalls: string[] = []
++    registerClipboardRenderer({
++      copyToClipboardOSC52: (text: string) => {
++        rendererCalls.push(text)
++        return true
++      },
++    })
++
++    const copyPromise = copyTextToClipboard('hello', {
++      suppressGlobalMessage: true,
++    })
++    mockTimers.advanceBy(5000)
++    await copyPromise
++
++    expect(attempts.map(({ command }) => command)).toEqual([
++      'wl-copy',
++      'xclip',
++      'xsel',
++    ])
++    expect(rendererCalls).toEqual(['hello'])
++  })
++
++  test('aborting a hanging backend kills it without running stale fallbacks', async () => {
++    process.env.WAYLAND_DISPLAY = 'wayland-0'
++    process.env.TERM = 'xterm-256color'
++    mockBackends(() => null)
++    const rendererCalls: string[] = []
++    registerClipboardRenderer({
++      copyToClipboardOSC52: (text: string) => {
++        rendererCalls.push(text)
++        return true
++      },
++    })
++    const controller = new AbortController()
++
++    const copyPromise = copyTextToClipboard('stale selection', {
++      signal: controller.signal,
++    })
++    await flushMicrotasks()
++    controller.abort()
++
++    await expect(copyPromise).rejects.toMatchObject({ name: 'AbortError' })
++    expect(attempts.map(({ command }) => command)).toEqual(['wl-copy'])
++    expect(attempts[0]?.process.killSignals).toEqual(['SIGKILL'])
++    expect(rendererCalls).toEqual([])
++    expect(mockTimers.getPendingCount()).toBe(0)
++    expect(loggerErrorSpy).not.toHaveBeenCalled()
++  })
++
++  test('a newer copy cancels an older hanging copy across callers', async () => {
++    process.env.WAYLAND_DISPLAY = 'wayland-0'
++    let wlCopyAttempts = 0
++    mockBackends((command) => {
++      if (command !== 'wl-copy') return 0
++      wlCopyAttempts++
++      return wlCopyAttempts === 1 ? null : 0
++    })
++
++    const staleCopy = copyTextToClipboard('stale selection', {
++      suppressGlobalMessage: true,
++    })
++    await flushMicrotasks()
++    const freshCopy = copyTextToClipboard('fresh selection', {
++      suppressGlobalMessage: true,
++    })
++
++    await expect(staleCopy).rejects.toMatchObject({ name: 'AbortError' })
++    await freshCopy
++    expect(attempts.map(({ command }) => command)).toEqual([
++      'wl-copy',
++      'wl-copy',
++    ])
++    expect(attempts[0]?.process.killSignals).toEqual(['SIGKILL'])
++    expect(attempts[1]?.process.input()).toBe('fresh selection')
++    expect(loggerErrorSpy).not.toHaveBeenCalled()
++  })
++
++  test('cancellation wins if an older backend closes before its continuation runs', async () => {
++    process.env.WAYLAND_DISPLAY = 'wayland-0'
++    let wlCopyAttempts = 0
++    mockBackends((command) => {
++      if (command !== 'wl-copy') return 0
++      wlCopyAttempts++
++      return wlCopyAttempts === 1 ? null : 0
++    })
++
++    const staleCopy = copyTextToClipboard('stale selection', {
++      suppressGlobalMessage: true,
++    })
++    attempts[0]?.process.close(0)
++    const freshCopy = copyTextToClipboard('fresh selection', {
++      suppressGlobalMessage: true,
++    })
++
++    await expect(staleCopy).rejects.toMatchObject({ name: 'AbortError' })
++    await freshCopy
++    expect(attempts.map(({ process }) => process.input())).toEqual([
++      'stale selection',
++      'fresh selection',
++    ])
++  })
++
++  test('prefers xclip when Wayland is not active', async () => {
++    delete process.env.WAYLAND_DISPLAY
++    mockBackends(() => 0)
++
++    await copyTextToClipboard('hello', { suppressGlobalMessage: true })
++
++    expect(attempts.map(({ command }) => command)).toEqual(['xclip'])
++  })
++
++  test('shows an actionable error when no Linux backend is available', async () => {
++    process.env.WAYLAND_DISPLAY = 'wayland-0'
++    mockBackends(() => 1)
++    const messages: (string | null)[] = []
++    const unsubscribe = subscribeClipboardMessages((message) =>
++      messages.push(message),
++    )
++
++    await expect(copyTextToClipboard('hello')).rejects.toThrow(
++      'No clipboard method available',
++    )
++
++    expect(messages).toContain(LINUX_CLIPBOARD_ERROR_MESSAGE)
++    unsubscribe()
++  })
++
++  test('uses a bounded OSC 52 fallback after native tools reject the full text', async () => {
++    process.env.WAYLAND_DISPLAY = 'wayland-0'
++    mockBackends(() => 1)
++    const rendererCalls: string[] = []
++    registerClipboardRenderer({
++      copyToClipboardOSC52: (text: string) => {
++        rendererCalls.push(text)
++        return true
++      },
++    })
++    const messages: (string | null)[] = []
++    const unsubscribe = subscribeClipboardMessages((message) =>
++      messages.push(message),
++    )
++
++    await copyTextToClipboard('x'.repeat(24_001), {
++      successMessage: 'Copied full text',
++      getOsc52Fallback: () => ({
++        text: 'bounded text',
++        successMessage: 'Copied bounded text',
++      }),
++    })
++
++    expect(rendererCalls).toEqual(['bounded text'])
++    expect(messages).toContain('Copied bounded text')
++    expect(messages).not.toContain('Copied full text')
++    unsubscribe()
++  })
++
++  test('accepts an OSC 52 payload exactly at the 32 KB base64 limit', async () => {
++    mockBackends(() => 1)
++    const rendererCalls: string[] = []
++    registerClipboardRenderer({
++      copyToClipboardOSC52: (text: string) => {
++        rendererCalls.push(text)
++        return true
++      },
++    })
++    const text = 'x'.repeat(24_000)
++
++    await copyTextToClipboard(text, { suppressGlobalMessage: true })
++
++    expect(rendererCalls).toEqual([text])
++  })
++})
+diff --git a/cli/src/utils/clipboard.ts b/cli/src/utils/clipboard.ts
+index f333e4921..8682e7fa3 100644
+--- a/cli/src/utils/clipboard.ts
++++ b/cli/src/utils/clipboard.ts
+@@ -1,5 +1,7 @@
++import { spawn } from 'child_process'
+ import { closeSync, openSync, writeSync } from 'fs'
+-import { createRequire } from 'module'
++
++import type { ChildProcess } from 'child_process'
+ 
+ import { getCliEnv } from './env'
+ import { logger } from './logger'
+@@ -10,7 +12,9 @@ import { logger } from './logger'
+ // OSC 52 without threading the renderer through every call site.
+ let registeredRenderer: Record<string, unknown> | null = null
+ 
+-export function registerClipboardRenderer(renderer: Record<string, unknown>): void {
++export function registerClipboardRenderer(
++  renderer: Record<string, unknown>,
++): void {
+   registeredRenderer = renderer
+ }
+ 
+@@ -18,8 +22,6 @@ export function unregisterClipboardRenderer(): void {
+   registeredRenderer = null
+ }
+ 
+-const require = createRequire(import.meta.url)
+-
+ type ClipboardListener = (message: string | null) => void
+ 
+ let currentMessage: string | null = null
+@@ -76,11 +78,20 @@ function getDefaultSuccessMessage(text: string): string | null {
+   return `Copied: "${truncated}"`
+ }
+ 
++type ClipboardCandidate = {
++  text: string
++  successMessage?: string | null
++}
++
++let activeClipboardOperation: AbortController | null = null
++
+ export interface CopyToClipboardOptions {
+   successMessage?: string | null
+   errorMessage?: string | null
+   durationMs?: number
+   suppressGlobalMessage?: boolean
++  getOsc52Fallback?: () => ClipboardCandidate
++  signal?: AbortSignal
+ }
+ 
+ export async function copyTextToClipboard(
+@@ -90,56 +101,98 @@ export async function copyTextToClipboard(
+     errorMessage,
+     durationMs,
+     suppressGlobalMessage = false,
++    getOsc52Fallback,
++    signal,
+   }: CopyToClipboardOptions = {},
+ ) {
+   if (!text || text.trim().length === 0) {
+     return
+   }
+ 
++  throwIfClipboardAborted(signal)
++  const operationController = new AbortController()
++  activeClipboardOperation?.abort()
++  activeClipboardOperation = operationController
++  const operationSignal = signal
++    ? AbortSignal.any([signal, operationController.signal])
++    : operationController.signal
++
+   const osc52Blocked = isOsc52Blocked()
+   try {
+-    const tryCopyViaAnyOsc52 = () =>
+-      !osc52Blocked && (tryCopyViaRenderer(text) || tryCopyViaOsc52(text))
+-
+-    let copied: boolean
+-    if (isRemoteSession()) {
+-      // Remote/SSH: prefer renderer OSC 52 (through render pipeline),
+-      // then our manual OSC 52, then platform tools
+-      copied = tryCopyViaAnyOsc52() || tryCopyViaPlatformTool(text)
+-    } else {
+-      // Local: prefer platform tools (reliable with tmux),
+-      // then renderer OSC 52, then our manual OSC 52 as fallback
+-      copied = tryCopyViaPlatformTool(text) || tryCopyViaAnyOsc52()
++    throwIfClipboardAborted(operationSignal)
++    const tryOsc52 = (candidate: string) =>
++      !osc52Blocked &&
++      isWithinOsc52PayloadLimit(candidate) &&
++      (tryCopyViaRenderer(candidate) || tryCopyViaTtyOsc52(candidate))
++
++    const primary: ClipboardCandidate = { text, successMessage }
++    const remoteSession = isRemoteSession()
++    const tryCandidateViaOsc52 = (candidate: ClipboardCandidate) =>
++      tryOsc52(candidate.text) ? candidate : null
++    const tryFallbackViaOsc52 = () => {
++      if (!getOsc52Fallback) return null
++      const fallback = getOsc52Fallback()
++      return fallback.text.trim() && fallback.text !== text
++        ? tryCandidateViaOsc52(fallback)
++        : null
++    }
++
++    // Remote sessions need OSC 52 to reach the client clipboard. Local
++    // sessions prefer native tools because they survive tmux and have no cap.
++    let copiedCandidate = remoteSession
++      ? (tryCandidateViaOsc52(primary) ?? tryFallbackViaOsc52())
++      : null
++
++    if (
++      !copiedCandidate &&
++      (await tryCopyViaPlatformTool(text, operationSignal))
++    ) {
++      copiedCandidate = primary
++    }
++    if (!copiedCandidate && !remoteSession) {
++      copiedCandidate = tryCandidateViaOsc52(primary) ?? tryFallbackViaOsc52()
+     }
+ 
+-    if (!copied) {
++    if (!copiedCandidate) {
+       throw new Error('No clipboard method available')
+     }
+ 
+     if (!suppressGlobalMessage) {
+       const message =
+-        successMessage !== undefined
+-          ? successMessage
+-          : getDefaultSuccessMessage(text)
++        copiedCandidate.successMessage !== undefined
++          ? copiedCandidate.successMessage
++          : getDefaultSuccessMessage(copiedCandidate.text)
+       if (message) {
+         showClipboardMessage(message, { durationMs })
+       }
+     }
+   } catch (error) {
++    if (operationSignal.aborted) throw error
+     logger.error(error, 'Failed to copy to clipboard')
+     // When the terminal drops OSC 52 and no platform tool exists (e.g.
+     // Codespaces), the Shift+drag guidance is the only way the user can copy,
+     // so show it even for callers that suppress routine messages.
+     if (!suppressGlobalMessage || osc52Blocked) {
++      const isLinux = process.platform === 'linux'
++      const defaultErrorMessage = isLinux
++        ? LINUX_CLIPBOARD_ERROR_MESSAGE
++        : 'Failed to copy to clipboard'
+       showClipboardMessage(
+         osc52Blocked
+           ? OSC52_BLOCKED_MESSAGE
+-          : (errorMessage ?? 'Failed to copy to clipboard'),
++          : (errorMessage ?? defaultErrorMessage),
+         // Give the longer guidance message extra time to be read
+-        { durationMs: durationMs ?? (osc52Blocked ? 6000 : undefined) },
++        {
++          durationMs:
++            durationMs ?? (osc52Blocked || isLinux ? 6000 : undefined),
++        },
+       )
+     }
+     throw error
++  } finally {
++    if (activeClipboardOperation === operationController) {
++      activeClipboardOperation = null
++    }
+   }
+ }
+ 
+@@ -151,7 +204,6 @@ export function clearClipboardMessage() {
+   emitClipboardMessage(null)
+ }
+ 
+-
+ // =============================================================================
+ // OSC52 Clipboard Support
+ // =============================================================================
+@@ -167,6 +219,9 @@ export function isRemoteSession(): boolean {
+ export const OSC52_BLOCKED_MESSAGE =
+   'Copy is blocked by this terminal — hold Shift and drag to select, then copy normally'
+ 
++export const LINUX_CLIPBOARD_ERROR_MESSAGE =
++  'Clipboard unavailable — install wl-clipboard (Wayland) or xclip (X11)'
++
+ // GitHub Codespaces and VS Code remote (SSH/tunnel) terminals silently drop
+ // OSC 52 sequences, so a "successful" write never reaches the user's
+ // clipboard. Local VS Code terminals (including devcontainers) honor OSC 52.
+@@ -179,28 +234,107 @@ export function isOsc52Blocked(): boolean {
+   )
+ }
+ 
+-function tryCopyViaPlatformTool(text: string): boolean {
+-  const { execSync } = require('child_process') as typeof import('child_process')
+-  const opts = { input: text, stdio: ['pipe', 'ignore', 'ignore'] as ('pipe' | 'ignore')[] }
++const CLIPBOARD_TOOL_TIMEOUT_MS = 5000
+ 
++function throwIfClipboardAborted(signal?: AbortSignal): void {
++  if (!signal?.aborted) return
++  if (signal.reason instanceof Error) throw signal.reason
++  throw new DOMException('The clipboard operation was aborted', 'AbortError')
++}
++
++function killClipboardTool(child: ChildProcess): void {
+   try {
+-    if (process.platform === 'darwin') {
+-      execSync('pbcopy', opts)
+-    } else if (process.platform === 'linux') {
+-      try {
+-        execSync('xclip -selection clipboard', opts)
+-      } catch {
+-        execSync('xsel --clipboard --input', opts)
+-      }
+-    } else if (process.platform === 'win32') {
+-      execSync('clip', opts)
+-    } else {
+-      return false
+-    }
+-    return true
++    child.kill('SIGKILL')
+   } catch {
+-    return false
++    // The process may already have exited between an error and cleanup.
++  }
++}
++
++function writeToClipboardTool(
++  command: string,
++  args: string[],
++  text: string,
++  signal?: AbortSignal,
++): Promise<boolean> {
++  return new Promise((resolve) => {
++    let child: ChildProcess
++    try {
++      child = spawn(command, args, {
++        stdio: ['pipe', 'ignore', 'ignore'],
++      })
++    } catch {
++      resolve(false)
++      return
++    }
++
++    let settled = false
++    let timeout: ReturnType<typeof setTimeout> | null = null
++    const finish = (copied: boolean) => {
++      if (settled) return
++      settled = true
++      if (timeout) clearTimeout(timeout)
++      signal?.removeEventListener('abort', handleAbort)
++      resolve(copied)
++    }
++    const handleAbort = () => {
++      killClipboardTool(child)
++      finish(false)
++    }
++
++    child.once('error', () => finish(false))
++    child.once('close', (code) => finish(code === 0))
++    child.stdin?.once('error', () => {
++      killClipboardTool(child)
++      finish(false)
++    })
++
++    timeout = setTimeout(() => {
++      // A backend waiting on a broken display server must not freeze the TUI.
++      // SIGKILL also prevents a timed-out process from retaining the clipboard
++      // pipe after the next backend starts.
++      killClipboardTool(child)
++      finish(false)
++    }, CLIPBOARD_TOOL_TIMEOUT_MS)
++    signal?.addEventListener('abort', handleAbort, { once: true })
++
++    try {
++      child.stdin?.end(text)
++    } catch {
++      killClipboardTool(child)
++      finish(false)
++    }
++
++    // Abort may have happened between the caller's check and listener setup.
++    if (signal?.aborted) handleAbort()
++  })
++}
++
++async function tryCopyViaPlatformTool(
++  text: string,
++  signal?: AbortSignal,
++): Promise<boolean> {
++  const commands: [string, string[]][] = (() => {
++    if (process.platform === 'darwin') return [['pbcopy', []]]
++    if (process.platform === 'win32') return [['clip', []]]
++    if (process.platform !== 'linux') return []
++
++    const x11Commands: [string, string[]][] = [
++      ['xclip', ['-selection', 'clipboard']],
++      ['xsel', ['--clipboard', '--input']],
++    ]
++    return getCliEnv().WAYLAND_DISPLAY
++      ? [['wl-copy', ['--type', 'text/plain']], ...x11Commands]
++      : x11Commands
++  })()
++
++  for (const [command, args] of commands) {
++    throwIfClipboardAborted(signal)
++    const copied = await writeToClipboardTool(command, args, text, signal)
++    throwIfClipboardAborted(signal)
++    if (copied) return true
+   }
++
++  return false
+ }
+ 
+ function tryCopyViaRenderer(text: string): boolean {
+@@ -217,12 +351,18 @@ function tryCopyViaRenderer(text: string): boolean {
+ // 32KB is safe for all environments (tmux is the strictest)
+ const OSC52_MAX_PAYLOAD = 32_000
+ 
++function isWithinOsc52PayloadLimit(text: string): boolean {
++  const byteLength = Buffer.byteLength(text, 'utf8')
++  const base64Length = 4 * Math.ceil(byteLength / 3)
++  return base64Length <= OSC52_MAX_PAYLOAD
++}
++
+ function buildOsc52Sequence(text: string): string | null {
+   const env = getCliEnv()
+   if (env.TERM === 'dumb') return null
++  if (!isWithinOsc52PayloadLimit(text)) return null
+ 
+   const base64 = Buffer.from(text, 'utf8').toString('base64')
+-  if (base64.length > OSC52_MAX_PAYLOAD) return null
+ 
+   const osc = `\x1b]52;c;${base64}\x07`
+ 
+@@ -239,7 +379,7 @@ function buildOsc52Sequence(text: string): string | null {
+   return osc
+ }
+ 
+-function tryCopyViaOsc52(text: string): boolean {
++function tryCopyViaTtyOsc52(text: string): boolean {
+   const sequence = buildOsc52Sequence(text)
+   if (!sequence) return false
+ 

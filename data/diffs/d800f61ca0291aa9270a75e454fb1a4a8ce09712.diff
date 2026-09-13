@@ -1,0 +1,221 @@
+diff --git a/common/src/util/__tests__/database-request-cost.test.ts b/common/src/util/__tests__/database-request-cost.test.ts
+index 7f9b522b8..079a03372 100644
+--- a/common/src/util/__tests__/database-request-cost.test.ts
++++ b/common/src/util/__tests__/database-request-cost.test.ts
+@@ -61,7 +61,10 @@ describe('database request cost budgets', () => {
+     expect(verdict.breach).toBe(false)
+   })
+ 
+-  test('checks p50, p95, and p99 fixed budgets for both metric families', () => {
++  test('reports p50, p95, and p99 budget overruns for both metric families', () => {
++    // Each percentile of each family is still checked and named. What changed
++    // 2026-08-07 is that being over an ABSOLUTE budget is reported rather than
++    // paged — see the `breach` comment in evaluateDatabaseRequestCosts.
+     const cases: Partial<DatabaseCostRow>[] = [
+       { p50ClientSqlWallMs: 26 },
+       { p95ClientSqlWallMs: 101 },
+@@ -77,8 +80,8 @@ describe('database request cost budgets', () => {
+         [budget],
+         DEFAULT_DATABASE_COST_EVALUATION_OPTIONS,
+       )
+-      expect(verdict.breach).toBe(true)
+-      expect(verdict.reasons).toHaveLength(1)
++      expect(verdict.overBudget).toHaveLength(1)
++      expect(verdict.breach).toBe(false)
+     }
+   })
+ 
+@@ -183,6 +186,66 @@ describe('database request cost budgets', () => {
+   })
+ })
+ 
++describe('budgets versus regressions', () => {
++  const options = DEFAULT_DATABASE_COST_EVALUATION_OPTIONS
++
++  test('being over the absolute budget does not page', () => {
++    // Every lane has been over these since the metric started measuring client
++    // wall time (which includes the ~110ms pool acquire) instead of server
++    // execution. Paging on it made the job red on every run for days.
++    const [verdict] = evaluateDatabaseRequestCosts(
++      [row({ p50ClientSqlWallMs: 192 })],
++      [row({ p50ClientSqlWallMs: 190 })],
++      [budget],
++      options,
++    )
++
++    expect(verdict!.overBudget.length).toBeGreaterThan(0)
++    expect(verdict!.regressed).toEqual([])
++    expect(verdict!.breach).toBe(false)
++  })
++
++  test('a regression ON TOP of an over-budget lane still pages', () => {
++    // The bug this replaces: the over-budget branch used to `continue`, so once
++    // a lane was over budget its baseline comparison never ran and a genuine
++    // regression was invisible.
++    const [verdict] = evaluateDatabaseRequestCosts(
++      [row({ p50ClientSqlWallMs: 2_000 })],
++      [row({ p50ClientSqlWallMs: 192 })],
++      [budget],
++      options,
++    )
++
++    expect(verdict!.overBudget.length).toBeGreaterThan(0)
++    expect(verdict!.regressed.join(' ')).toContain('regressed 192 -> 2000')
++    expect(verdict!.breach).toBe(true)
++  })
++
++  test('a regression within budget pages', () => {
++    const [verdict] = evaluateDatabaseRequestCosts(
++      [row({ p50ClientSqlWallMs: 24 })],
++      [row({ p50ClientSqlWallMs: 2 })],
++      [budget],
++      options,
++    )
++
++    expect(verdict!.overBudget).toEqual([])
++    expect(verdict!.breach).toBe(true)
++  })
++
++  test('steady state pages nothing', () => {
++    const [verdict] = evaluateDatabaseRequestCosts(
++      [row()],
++      [row()],
++      [budget],
++      options,
++    )
++
++    expect(verdict!.breach).toBe(false)
++    expect(verdict!.regressed).toEqual([])
++  })
++})
++
+ describe('database request cost APL', () => {
+   test('builds the same current and baseline aggregation shape', () => {
+     const current = buildDatabaseRequestCostApl({
+diff --git a/common/src/util/database-request-cost.ts b/common/src/util/database-request-cost.ts
+index 8a84db0d4..6b3e4718b 100644
+--- a/common/src/util/database-request-cost.ts
++++ b/common/src/util/database-request-cost.ts
+@@ -33,7 +33,14 @@ export type DatabaseCostVerdict = {
+   row: DatabaseCostRow
+   budget?: DatabaseRequestBudget
+   evaluable: boolean
++  /** True only for a REGRESSION against the baseline — the pageable signal. */
+   breach: boolean
++  /** Over the aspirational absolute budget. Reported, never paged: see the
++   *  comment on `breach` in evaluateDatabaseRequestCosts. */
++  overBudget: string[]
++  /** Materially worse than the preceding baseline window. Pages. */
++  regressed: string[]
++  /** Everything, regression first. Kept for callers that just want a blob. */
+   reasons: string[]
+ }
+ 
+@@ -249,15 +256,20 @@ function evaluateFamily({
+   family: 'ClientSqlWallMs' | 'RoundTrips'
+   regressionRatio: number
+   minRegression: number
+-}): string[] {
++}): { overBudget: string[]; regressed: string[] } {
+   const label = family === 'ClientSqlWallMs' ? 'clientSqlWallMs' : 'roundTrips'
+-  const reasons: string[] = []
++  const overBudget: string[] = []
++  const regressed: string[] = []
+   for (const percentile of PERCENTILES) {
+     const value = metricValue(current, family, percentile)
+     const limit = budget[percentile]
+     if (value > limit) {
+-      reasons.push(`${label}.${percentile} ${value} > budget ${limit}`)
+-      continue
++      overBudget.push(`${label}.${percentile} ${value} > budget ${limit}`)
++      // Deliberately NOT `continue`. Skipping the regression check for an
++      // over-budget percentile is what silently disabled regression detection:
++      // by 2026-08-07 every lane was over every budget, so nothing was ever
++      // compared against its baseline and a genuine 10x regression on top
++      // would have gone unreported.
+     }
+     if (!baseline) continue
+     const previous = metricValue(baseline, family, percentile)
+@@ -266,13 +278,13 @@ function evaluateFamily({
+       value >= previous * regressionRatio &&
+       value - previous >= minRegression
+     ) {
+-      reasons.push(
++      regressed.push(
+         `${label}.${percentile} regressed ${previous} -> ${value} ` +
+           `(>=${regressionRatio.toFixed(2)}x)`,
+       )
+     }
+   }
+-  return reasons
++  return { overBudget, regressed }
+ }
+ 
+ export function evaluateDatabaseRequestCosts(
+@@ -299,11 +311,21 @@ export function evaluateDatabaseRequestCosts(
+         budget,
+         evaluable: false,
+         breach: false,
++        overBudget: [],
++        regressed: [],
+         reasons: ['No database cost budget is configured for this lane'],
+       }
+     }
+     if (!evaluable) {
+-      return { row, budget, evaluable, breach: false, reasons: [] }
++      return {
++        row,
++        budget,
++        evaluable,
++        breach: false,
++        overBudget: [],
++        regressed: [],
++        reasons: [],
++      }
+     }
+ 
+     const candidateBaseline = baselineByKey.get(key)
+@@ -312,8 +334,8 @@ export function evaluateDatabaseRequestCosts(
+       candidateBaseline.requests >= options.minBaselineRequests
+         ? candidateBaseline
+         : undefined
+-    const reasons = [
+-      ...evaluateFamily({
++    const families = [
++      evaluateFamily({
+         current: row,
+         baseline,
+         budget: budget.clientSqlWallMs,
+@@ -321,7 +343,7 @@ export function evaluateDatabaseRequestCosts(
+         regressionRatio: options.regressionRatio,
+         minRegression: options.minClientSqlWallRegressionMs,
+       }),
+-      ...evaluateFamily({
++      evaluateFamily({
+         current: row,
+         baseline,
+         budget: budget.roundTrips,
+@@ -330,7 +352,22 @@ export function evaluateDatabaseRequestCosts(
+         minRegression: options.minRoundTripRegression,
+       }),
+     ]
+-    return { row, budget, evaluable, breach: reasons.length > 0, reasons }
++    const overBudget = families.flatMap((f) => f.overBudget)
++    const regressed = families.flatMap((f) => f.regressed)
++    return {
++      row,
++      budget,
++      evaluable,
++      // Only a regression pages. The absolute budgets are aspirational targets
++      // for §4.7's capacity work, and every lane has been over them since the
++      // metric started measuring CLIENT wall time (which includes the ~110ms
++      // pool acquire) rather than server execution. Paging on them made this
++      // alert red on every run for days, which is the same as no alert.
++      breach: regressed.length > 0,
++      overBudget,
++      regressed,
++      reasons: [...regressed, ...overBudget],
++    }
+   })
+ }
+ 

@@ -1,0 +1,226 @@
+diff --git a/common/src/types/contracts/llm.ts b/common/src/types/contracts/llm.ts
+index 811dd77ae..87769ed40 100644
+--- a/common/src/types/contracts/llm.ts
++++ b/common/src/types/contracts/llm.ts
+@@ -53,6 +53,20 @@ export type CacheDebugUsageData = {
+   totalTokens: number
+ }
+ 
++/** Provider-reported usage for one model request. */
++export type ModelUsageData = CacheDebugUsageData
++
++/** Provider usage attributed by the runtime to the agent that made the request. */
++export type AgentUsageData = ModelUsageData & {
++  isRoot: boolean
++  agentId?: string
++}
++
++export type ContextCompactionData = {
++  trigger: 'context_limit' | 'cache_expiry' | 'context_limit_and_cache_expiry'
++  thresholdTokens: number
++}
++
+ export type PromptAiSdkStreamFn = (
+   params: {
+     apiKey: string
+@@ -74,6 +88,7 @@ export type PromptAiSdkStreamFn = (
+       normalizedBody?: unknown
+     }) => void
+     onCacheDebugUsageReceived?: (usage: CacheDebugUsageData) => void
++    onUsageReceived?: (usage: ModelUsageData) => void
+     includeCacheControl?: boolean
+     cacheDebugCorrelation?: string
+     agentProviderOptions?: OpenRouterProviderRoutingOptions
+diff --git a/packages/agent-runtime/src/compact-history.ts b/packages/agent-runtime/src/compact-history.ts
+index 38130f47f..9f8a4fce9 100644
+--- a/packages/agent-runtime/src/compact-history.ts
++++ b/packages/agent-runtime/src/compact-history.ts
+@@ -972,6 +972,7 @@ export function maybeCompactHistory(params: {
+   cacheExpiryMinTokens?: number | null
+   logger?: Logger
+   runId?: string
++  onCompaction?: (trigger: CompactionTrigger) => void
+ }): Message[] | null {
+   const { messages, contextTokenCount, maxContextLength, logger, runId } =
+     params
+@@ -987,6 +988,11 @@ export function maybeCompactHistory(params: {
+   if (!trigger) return null
+ 
+   const result = compactMessages({ messages })
++  try {
++    params.onCompaction?.(trigger)
++  } catch {
++    // Reporting must never block the compaction itself.
++  }
+ 
+   // Telemetry is best-effort and must never block the compaction itself.
+   try {
+diff --git a/packages/agent-runtime/src/prompt-agent-stream.ts b/packages/agent-runtime/src/prompt-agent-stream.ts
+index 7e41e0385..803877431 100644
+--- a/packages/agent-runtime/src/prompt-agent-stream.ts
++++ b/packages/agent-runtime/src/prompt-agent-stream.ts
+@@ -5,6 +5,7 @@ import type { TrackEventFn } from '@codebuff/common/types/contracts/analytics'
+ import type { SendActionFn } from '@codebuff/common/types/contracts/client'
+ import type {
+   CacheDebugUsageData,
++  ModelUsageData,
+   PromptAiSdkStreamFn,
+ } from '@codebuff/common/types/contracts/llm'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+@@ -37,6 +38,7 @@ export const getAgentStreamFromTemplate = (params: {
+     normalizedBody?: unknown
+   }) => void
+   onCacheDebugUsageReceived?: (usage: CacheDebugUsageData) => void
++  onUsageReceived?: (usage: ModelUsageData) => void
+ 
+   onCostCalculated?: (credits: number) => Promise<void>
+   promptAiSdkStream: PromptAiSdkStreamFn
+@@ -62,6 +64,7 @@ export const getAgentStreamFromTemplate = (params: {
+     cacheDebugCorrelation,
+     onCacheDebugProviderRequestBuilt,
+     onCacheDebugUsageReceived,
++    onUsageReceived,
+ 
+     sendAction,
+     onCostCalculated,
+@@ -99,6 +102,7 @@ export const getAgentStreamFromTemplate = (params: {
+     cacheDebugCorrelation,
+     onCacheDebugProviderRequestBuilt,
+     onCacheDebugUsageReceived,
++    onUsageReceived,
+ 
+     onCostCalculated,
+     sendAction,
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index e8d0af45e..abd4090f3 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -64,7 +64,10 @@ import type {
+   StartAgentRunFn,
+ } from '@codebuff/common/types/contracts/database'
+ import type {
++  AgentUsageData,
+   CacheDebugUsageData,
++  ContextCompactionData,
++  ModelUsageData,
+   PromptAiSdkFn,
+ } from '@codebuff/common/types/contracts/llm'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+@@ -185,6 +188,8 @@ export const runAgentStep = async (
+     trackEvent: TrackEventFn
+     promptAiSdk: PromptAiSdkFn
+     traceWriter?: TraceWriter
++    onAgentUsageReceived?: (usage: AgentUsageData) => void
++    onCompaction?: (data: ContextCompactionData) => void
+   } & ParamsExcluding<
+     typeof processStream,
+     | 'agentContext'
+@@ -526,6 +531,14 @@ export const runAgentStep = async (
+     messages: [systemMessage(system), ...agentState.messageHistory],
+     onCacheDebugProviderRequestBuilt,
+     onCacheDebugUsageReceived,
++    onUsageReceived: params.onAgentUsageReceived
++      ? (usage: ModelUsageData) =>
++          params.onAgentUsageReceived?.({
++            ...usage,
++            isRoot: !agentState.parentId,
++            agentId: agentState.agentId,
++          })
++      : undefined,
+     template: agentTemplate,
+     onCostCalculated,
+   })
+@@ -1045,6 +1058,13 @@ export async function loopAgentSteps(
+           maxContextLength: contextPrunerBudgetForModel(agentTemplate.model),
+           logger,
+           runId,
++          onCompaction: (trigger) => {
++            if (initialAgentState.parentId) return
++            params.onCompaction?.({
++              trigger,
++              thresholdTokens: contextPrunerBudgetForModel(agentTemplate.model),
++            })
++          },
+         })
+         if (compacted) {
+           currentAgentState.messageHistory = compacted
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index b2aad4540..25a156a60 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -593,6 +593,10 @@ export async function* promptAiSdkStream(
+     callback: params.onCacheDebugUsageReceived,
+     usage: usageResult,
+   })
++  emitCacheDebugUsage({
++    callback: params.onUsageReceived,
++    usage: usageResult,
++  })
+ 
+   const providerMetadata = (await response.providerMetadata) ?? {}
+   const openrouterUsage = providerMetadata.codebuff?.usage as
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index de0ee1ff5..ad5f2d819 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -58,6 +58,10 @@ import type { AgentDefinition } from '@codebuff/common/templates/initial-agents-
+ import type { ToolName } from '@codebuff/common/tools/constants'
+ import type { PublishedClientToolName } from '@codebuff/common/tools/list'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
++import type {
++  AgentUsageData,
++  ContextCompactionData,
++} from '@codebuff/common/types/contracts/llm'
+ import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+ import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
+ import type { ToolMessage } from '@codebuff/common/types/messages/codebuff-message'
+@@ -207,6 +211,10 @@ export type RunOptions = {
+    * lose the in-flight turn. The final resolved RunState supersedes any
+    * snapshot; no snapshots are emitted after the run settles. */
+   onStateSnapshot?: (runState: RunState) => void
++  /** Provider-reported usage for each root-agent model request. */
++  onUsage?: (usage: AgentUsageData) => void
++  /** Mechanical context compaction performed by the root agent runtime. */
++  onCompaction?: (data: ContextCompactionData) => void
+ }
+ 
+ /** How often onStateSnapshot fires while a run is in flight. */
+@@ -332,6 +340,8 @@ async function runOnce({
+   costMode,
+   extraCodebuffMetadata,
+   onStateSnapshot,
++  onUsage,
++  onCompaction,
+ }: RunExecutionOptions): Promise<RunState> {
+   const fsSourceValue = typeof fsSource === 'function' ? fsSource() : fsSource
+   const fs = await fsSourceValue
+@@ -697,6 +707,20 @@ async function runOnce({
+     }
+   }
+ 
++  const report = <T>(callback: ((value: T) => void) | undefined) =>
++    callback
++      ? (value: T) => {
++          try {
++            callback(value)
++          } catch (error) {
++            agentRuntimeImpl.logger.debug?.(
++              { error: error instanceof Error ? error.message : String(error) },
++              'Run metrics handler threw',
++            )
++          }
++        }
++      : undefined
++
+   callMainPrompt({
+     ...agentRuntimeImpl,
+     promptId,
+@@ -722,6 +746,8 @@ async function runOnce({
+       trace_session_id: traceSessionId,
+     },
+     signal: signal ?? new AbortController().signal,
++    onAgentUsageReceived: report(onUsage),
++    onCompaction: report(onCompaction),
+   }).catch((error) => {
+     let errorMessage = isFetchIdleTimeoutError(error)
+       ? FETCH_IDLE_TIMEOUT_USER_MESSAGE

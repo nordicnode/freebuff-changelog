@@ -1,0 +1,1551 @@
+diff --git a/cli/release-staging/http.js b/cli/release-staging/http.js
+index 38be896d6..ac613952c 100644
+--- a/cli/release-staging/http.js
++++ b/cli/release-staging/http.js
+@@ -1,5 +1,7 @@
+ const http = require('http')
+ const https = require('https')
++const fs = require('fs')
++const { pipeline } = require('stream/promises')
+ const tls = require('tls')
+ 
+ function createReleaseHttpClient({
+@@ -8,9 +10,20 @@ function createReleaseHttpClient({
+   requestTimeout,
+   httpModule = http,
+   httpsModule = https,
++  fsModule = fs,
++  pipelineFn = pipeline,
+   tlsModule = tls,
+ }) {
+-  function getProxyUrl() {
++  function getProxyUrl(protocol = 'https:') {
++    if (protocol === 'http:') {
++      return (
++        env.HTTP_PROXY ||
++        env.http_proxy ||
++        env.HTTPS_PROXY ||
++        env.https_proxy ||
++        null
++      )
++    }
+     return (
+       env.HTTPS_PROXY ||
+       env.https_proxy ||
+@@ -87,11 +100,15 @@ function createReleaseHttpClient({
+     })
+   }
+ 
+-  async function buildRequestOptions(url, options = {}) {
++  async function buildRequest(url, options = {}) {
+     const parsedUrl = new URL(url)
++    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
++      throw new Error(`Unsupported URL protocol: ${parsedUrl.protocol}`)
++    }
++    const isHttps = parsedUrl.protocol === 'https:'
+     const reqOptions = {
+       hostname: parsedUrl.hostname,
+-      port: parsedUrl.port || 443,
++      port: parsedUrl.port || (isHttps ? 443 : 80),
+       path: parsedUrl.pathname + parsedUrl.search,
+       headers: {
+         'User-Agent': userAgent,
+@@ -99,9 +116,31 @@ function createReleaseHttpClient({
+       },
+     }
+ 
+-    const proxyUrl = getProxyUrl()
++    const proxyUrl = getProxyUrl(parsedUrl.protocol)
+     if (!proxyUrl || shouldBypassProxy(parsedUrl.hostname)) {
+-      return reqOptions
++      return { transport: isHttps ? httpsModule : httpModule, reqOptions }
++    }
++
++    const proxy = new URL(proxyUrl)
++    if (!['http:', 'https:'].includes(proxy.protocol)) {
++      throw new Error(`Unsupported proxy protocol: ${proxy.protocol}`)
++    }
++
++    if (!isHttps) {
++      reqOptions.hostname = proxy.hostname
++      reqOptions.port = proxy.port || (proxy.protocol === 'https:' ? 443 : 80)
++      reqOptions.path = parsedUrl.href
++      reqOptions.headers.Host = parsedUrl.host
++      if (proxy.username || proxy.password) {
++        const auth = Buffer.from(
++          `${decodeURIComponent(proxy.username || '')}:${decodeURIComponent(proxy.password || '')}`,
++        ).toString('base64')
++        reqOptions.headers['Proxy-Authorization'] = `Basic ${auth}`
++      }
++      return {
++        transport: proxy.protocol === 'https:' ? httpsModule : httpModule,
++        reqOptions,
++      }
+     }
+ 
+     const tunnelSocket = await connectThroughProxy(
+@@ -138,15 +177,15 @@ function createReleaseHttpClient({
+     }
+ 
+     reqOptions.agent = new TunnelAgent({ keepAlive: false })
+-    return reqOptions
++    return { transport: httpsModule, reqOptions }
+   }
+ 
+   async function httpGet(url, options = {}) {
+     const redirectCount = options.redirectCount || 0
+-    const reqOptions = await buildRequestOptions(url, options)
++    const { transport, reqOptions } = await buildRequest(url, options)
+ 
+     return new Promise((resolve, reject) => {
+-      const req = httpsModule.get(reqOptions, (res) => {
++      const req = transport.get(reqOptions, (res) => {
+         if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+           res.resume()
+ 
+@@ -170,17 +209,198 @@ function createReleaseHttpClient({
+           return
+         }
+ 
++        res.requestUrl = url
+         resolve(res)
+       })
+ 
+-      req.on('error', reject)
++      req.on('error', (error) => {
++        error.requestUrl = url
++        reject(error)
++      })
+       req.setTimeout(options.timeout || requestTimeout, () => {
+         req.destroy()
+-        reject(new Error('Request timeout.'))
++        const error = new Error('Request timeout.')
++        error.code = 'ETIMEDOUT'
++        error.requestUrl = url
++        reject(error)
+       })
+     })
+   }
+ 
++  function getFileSize(filePath) {
++    try {
++      return fsModule.statSync(filePath).size
++    } catch (error) {
++      if (error.code === 'ENOENT') return 0
++      throw error
++    }
++  }
++
++  function removeFileIfPresent(filePath) {
++    try {
++      fsModule.unlinkSync(filePath)
++    } catch (error) {
++      if (error.code !== 'ENOENT') throw error
++    }
++  }
++
++  function throwResponseError(res, message, requestUrl, retryable) {
++    res.resume()
++    const error = new Error(message)
++    error.statusCode = res.statusCode
++    error.retryable = retryable
++    error.requestUrl = requestUrl
++    throw error
++  }
++
++  function parseContentRange(value) {
++    if (!value) return null
++
++    const completeMatch = value.match(/^bytes (\d+)-(\d+)\/(\d+)$/i)
++    if (completeMatch) {
++      const start = Number(completeMatch[1])
++      const end = Number(completeMatch[2])
++      const total = Number(completeMatch[3])
++      if (start > end || end >= total) return null
++      return {
++        start,
++        end,
++        total,
++      }
++    }
++
++    const unsatisfiedMatch = value.match(/^bytes \*\/(\d+)$/i)
++    if (unsatisfiedMatch) {
++      return { start: null, end: null, total: Number(unsatisfiedMatch[1]) }
++    }
++
++    return null
++  }
++
++  function isRetryableStatus(statusCode) {
++    return (
++      statusCode === 408 ||
++      statusCode === 425 ||
++      statusCode === 429 ||
++      statusCode >= 500
++    )
++  }
++
++  async function downloadFile(url, destinationPath, options = {}) {
++    let resumedFrom = getFileSize(destinationPath)
++    let totalBytes = null
++
++    const headers = { ...options.headers }
++    if (resumedFrom > 0) {
++      headers.Range = `bytes=${resumedFrom}-`
++    }
++
++    const res = await httpGet(url, { ...options, headers })
++    const responseUrl = res.requestUrl || url
++    const contentRange = parseContentRange(res.headers['content-range'])
++
++    if (res.statusCode === 416 && contentRange?.total === resumedFrom) {
++      res.resume()
++      return {
++        downloadedBytes: resumedFrom,
++        totalBytes: resumedFrom,
++        resumedFrom,
++        responseUrl,
++      }
++    }
++
++    if (res.statusCode === 416) {
++      removeFileIfPresent(destinationPath)
++      throwResponseError(
++        res,
++        'Saved partial download is no longer valid',
++        responseUrl,
++        true,
++      )
++    }
++
++    let writeFlags
++    let expectedResponseBytes = null
++    if (res.statusCode === 206) {
++      if (!contentRange || contentRange.start !== resumedFrom) {
++        removeFileIfPresent(destinationPath)
++        throwResponseError(
++          res,
++          `Download resume mismatch: expected byte ${resumedFrom}`,
++          responseUrl,
++          true,
++        )
++      }
++      totalBytes = contentRange.total
++      expectedResponseBytes = contentRange.end - contentRange.start + 1
++      writeFlags = 'a'
++    } else if (res.statusCode === 200) {
++      // The server may ignore Range. Restart safely instead of appending a
++      // complete response to the existing partial archive.
++      resumedFrom = 0
++      totalBytes = Number(res.headers['content-length']) || null
++      writeFlags = 'w'
++    } else {
++      throwResponseError(
++        res,
++        `Download failed: HTTP ${res.statusCode}`,
++        responseUrl,
++        isRetryableStatus(res.statusCode),
++      )
++    }
++
++    let downloadedBytes = resumedFrom
++    res.on('data', (chunk) => {
++      downloadedBytes += chunk.length
++      options.onProgress?.({ downloadedBytes, totalBytes, resumedFrom })
++    })
++
++    try {
++      await pipelineFn(
++        res,
++        fsModule.createWriteStream(destinationPath, { flags: writeFlags }),
++      )
++    } catch (error) {
++      error.requestUrl ||= responseUrl
++      error.downloadedBytes = getFileSize(destinationPath)
++      error.totalBytes = totalBytes
++      throw error
++    }
++
++    downloadedBytes = getFileSize(destinationPath)
++    const responseBytes = downloadedBytes - resumedFrom
++    if (
++      expectedResponseBytes !== null &&
++      responseBytes !== expectedResponseBytes
++    ) {
++      if (responseBytes > expectedResponseBytes) {
++        removeFileIfPresent(destinationPath)
++      }
++      const error = new Error(
++        `Download incomplete: response contained ${responseBytes} of ${expectedResponseBytes} bytes`,
++      )
++      error.code = 'EINCOMPLETE'
++      error.retryable = true
++      error.requestUrl = responseUrl
++      error.downloadedBytes = getFileSize(destinationPath)
++      error.totalBytes = totalBytes
++      throw error
++    }
++    if (totalBytes !== null && downloadedBytes !== totalBytes) {
++      const error = new Error(
++        `Download incomplete: received ${downloadedBytes} of ${totalBytes} bytes`,
++      )
++      error.code = 'EINCOMPLETE'
++      error.retryable = true
++      error.requestUrl = responseUrl
++      error.downloadedBytes = downloadedBytes
++      error.totalBytes = totalBytes
++      throw error
++    }
++
++    return { downloadedBytes, totalBytes, resumedFrom, responseUrl }
++  }
++
+   async function withRetries(
+     operation,
+     {
+@@ -208,6 +428,7 @@ function createReleaseHttpClient({
+ 
+   return {
+     getProxyUrl,
++    downloadFile,
+     httpGet,
+     withRetries,
+   }
+diff --git a/cli/release-staging/index.js b/cli/release-staging/index.js
+index 0c0cca00b..5a125c271 100644
+--- a/cli/release-staging/index.js
++++ b/cli/release-staging/index.js
+@@ -106,7 +106,7 @@ function createConfig(packageName) {
+ }
+ 
+ const CONFIG = createConfig(packageName)
+-const { httpGet, withRetries } = createReleaseHttpClient({
++const { downloadFile, httpGet, withRetries } = createReleaseHttpClient({
+   env: process.env,
+   userAgent: CONFIG.userAgent,
+   requestTimeout: CONFIG.requestTimeout,
+@@ -516,20 +516,67 @@ function createProgressBar(percentage, width = 30) {
+   return '[' + '█'.repeat(filled) + '░'.repeat(empty) + ']'
+ }
+ 
+-function isRetryableDownloadStatus(statusCode) {
+-  return (
+-    statusCode === 408 ||
+-    statusCode === 425 ||
+-    statusCode === 429 ||
+-    statusCode >= 500
+-  )
+-}
+-
+ function isRetryableDownloadError(error) {
+   if (error && typeof error.retryable === 'boolean') return error.retryable
+   return !['EACCES', 'ENOSPC', 'EPERM', 'EROFS'].includes(error?.code)
+ }
+ 
++function getPartialArchivePath(version, targetKey) {
++  return path.join(
++    CONFIG.configDir,
++    `.${packageName}-${version}-${targetKey}.tar.gz.part`,
++  )
++}
++
++function getFileSize(filePath) {
++  try {
++    return fs.statSync(filePath).size
++  } catch (error) {
++    if (error.code === 'ENOENT') return 0
++    throw error
++  }
++}
++
++function removeFileIfPresent(filePath) {
++  try {
++    fs.unlinkSync(filePath)
++  } catch (error) {
++    if (error.code !== 'ENOENT') throw error
++  }
++}
++
++function formatDownloadSource(downloadUrl) {
++  try {
++    const parsedUrl = new URL(downloadUrl)
++    return `${parsedUrl.origin}${parsedUrl.pathname}`
++  } catch {
++    return downloadUrl
++  }
++}
++
++function printDownloadFailure(error) {
++  const code = error.code ? ` (${error.code})` : ''
++  console.error(`❌ Failed to download ${packageName}: ${error.message}${code}`)
++
++  if (error.requestUrl) {
++    console.error(`Download source: ${formatDownloadSource(error.requestUrl)}`)
++  }
++  if (error.downloadedBytes > 0) {
++    const total = error.totalBytes ? ` of ${formatBytes(error.totalBytes)}` : ''
++    console.error(
++      `Saved ${formatBytes(error.downloadedBytes)}${total}; the next run will resume this download.`,
++    )
++  } else if (error.requestUrl) {
++    console.error(
++      'Please retry. The release host may be temporarily unavailable.',
++    )
++  } else {
++    console.error(
++      'The downloaded update could not be installed; the existing binary was preserved when possible.',
++    )
++  }
++}
++
+ function prepareTempDownloadDir() {
+   if (fs.existsSync(CONFIG.tempDownloadDir)) {
+     fs.rmSync(CONFIG.tempDownloadDir, { recursive: true })
+@@ -537,55 +584,61 @@ function prepareTempDownloadDir() {
+   fs.mkdirSync(CONFIG.tempDownloadDir, { recursive: true })
+ }
+ 
+-async function downloadAndExtract(downloadUrl, version, targetKey) {
++async function downloadAndExtract(
++  downloadUrl,
++  version,
++  targetKey,
++  { quiet = false } = {},
++) {
+   let attempts = 0
++  const partialArchivePath = getPartialArchivePath(version, targetKey)
++  let totalBytes = null
+ 
+   try {
+     return await withRetries(
+       async (attempt) => {
+         attempts = attempt
+         prepareTempDownloadDir()
+-        term.write('Downloading...')
+-
+-        const res = await httpGet(downloadUrl, {
+-          timeout: CONFIG.downloadRequestTimeout,
+-        })
++        if (!quiet) term.write('Downloading...')
+ 
+-        if (res.statusCode !== 200) {
+-          res.resume()
+-          const error = new Error(`Download failed: HTTP ${res.statusCode}`)
+-          error.statusCode = res.statusCode
+-          error.retryable = isRetryableDownloadStatus(res.statusCode)
+-          throw error
+-        }
+-
+-        const totalSize = parseInt(res.headers['content-length'] || '0', 10)
+-        let downloadedSize = 0
+         let lastProgressTime = Date.now()
+-
+-        res.on('data', (chunk) => {
+-          downloadedSize += chunk.length
+-          const now = Date.now()
+-          if (now - lastProgressTime >= 100 || downloadedSize === totalSize) {
++        const result = await downloadFile(downloadUrl, partialArchivePath, {
++          timeout: CONFIG.downloadRequestTimeout,
++          onProgress: ({ downloadedBytes, totalBytes: progressTotal }) => {
++            totalBytes = progressTotal
++            if (quiet) return
++            const now = Date.now()
++            if (
++              now - lastProgressTime < 100 &&
++              downloadedBytes !== progressTotal
++            ) {
++              return
++            }
+             lastProgressTime = now
+-            if (totalSize > 0) {
+-              const pct = Math.round((downloadedSize / totalSize) * 100)
++            if (progressTotal) {
++              const pct = Math.round((downloadedBytes / progressTotal) * 100)
+               term.write(
+-                `Downloading... ${createProgressBar(pct)} ${pct}% of ${formatBytes(
+-                  totalSize,
+-                )}`,
++                `Downloading... ${createProgressBar(pct)} ${pct}% of ${formatBytes(progressTotal)}`,
+               )
+             } else {
+-              term.write(`Downloading... ${formatBytes(downloadedSize)}`)
++              term.write(`Downloading... ${formatBytes(downloadedBytes)}`)
+             }
+-          }
++          },
+         })
++        totalBytes = result.totalBytes
+ 
+-        await pipeline(
+-          res,
+-          zlib.createGunzip(),
+-          tar.x({ cwd: CONFIG.tempDownloadDir }),
+-        )
++        try {
++          await pipeline(
++            fs.createReadStream(partialArchivePath),
++            zlib.createGunzip(),
++            tar.x({ cwd: CONFIG.tempDownloadDir }),
++          )
++        } catch (error) {
++          // A complete archive that cannot be extracted is corrupt. Do not
++          // resume it on the next attempt.
++          removeFileIfPresent(partialArchivePath)
++          throw error
++        }
+ 
+         const tempBinaryPath = path.join(
+           CONFIG.tempDownloadDir,
+@@ -593,6 +646,7 @@ async function downloadAndExtract(downloadUrl, version, targetKey) {
+         )
+         if (!fs.existsSync(tempBinaryPath)) {
+           const files = fs.readdirSync(CONFIG.tempDownloadDir)
++          removeFileIfPresent(partialArchivePath)
+           const error = new Error(
+             `Binary not found after extraction. Expected: ${CONFIG.binaryName}, Available files: ${files.join(', ')}`,
+           )
+@@ -600,12 +654,14 @@ async function downloadAndExtract(downloadUrl, version, targetKey) {
+           throw error
+         }
+ 
++        removeFileIfPresent(partialArchivePath)
+         return tempBinaryPath
+       },
+       {
+         maxAttempts: CONFIG.downloadMaxAttempts,
+         shouldRetry: isRetryableDownloadError,
+         onRetry: ({ nextAttempt, delayMs }) => {
++          if (quiet) return
+           term.writeLine(
+             `Download interrupted. Retrying in ${delayMs / 1000}s (${nextAttempt}/${CONFIG.downloadMaxAttempts})...`,
+           )
+@@ -613,21 +669,33 @@ async function downloadAndExtract(downloadUrl, version, targetKey) {
+       },
+     )
+   } catch (error) {
+-    if (fs.existsSync(CONFIG.tempDownloadDir)) {
+-      fs.rmSync(CONFIG.tempDownloadDir, { recursive: true })
++    try {
++      fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
++    } catch {
++      // Best effort after a failed download.
+     }
+ 
+     trackUpdateFailed(error.message, version, {
+       stage: 'download',
++      errorCode: error.code,
+       statusCode: error.statusCode,
+       target: targetKey,
+       attempts,
++      bytesDownloaded: getFileSize(partialArchivePath),
++      totalBytes: error.totalBytes || totalBytes,
+     })
++    error.downloadedBytes = getFileSize(partialArchivePath)
++    error.totalBytes ||= totalBytes
++    error.requestUrl ||= downloadUrl
+     throw error
+   }
+ }
+ 
+-async function downloadBinary(version, targetKey = getDownloadTargetKey()) {
++async function stageBinary(
++  version,
++  targetKey = getDownloadTargetKey(),
++  options = {},
++) {
+   const fileName = PLATFORM_TARGETS[targetKey]
+ 
+   if (!fileName) {
+@@ -645,41 +713,85 @@ async function downloadBinary(version, targetKey = getDownloadTargetKey()) {
+     downloadUrl,
+     version,
+     targetKey,
++    options,
+   )
+ 
+-  // Set executable permissions
+-  if (process.platform !== 'win32') {
+-    fs.chmodSync(tempBinaryPath, 0o755)
++  try {
++    if (process.platform !== 'win32') {
++      fs.chmodSync(tempBinaryPath, 0o755)
++    }
++  } catch (error) {
++    try {
++      fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
++    } catch {
++      // Preserve the original chmod error.
++    }
++    throw error
++  }
++
++  return { tempBinaryPath, version, targetKey }
++}
++
++function replaceFileWithRollback(sourcePath, targetPath, replacements) {
++  const backupPath = fs.existsSync(targetPath)
++    ? `${targetPath}.old.${Date.now()}.${replacements.length}`
++    : null
++
++  if (backupPath) {
++    fs.renameSync(targetPath, backupPath)
+   }
+ 
+-  // Move binary to final location
+   try {
+-    if (fs.existsSync(CONFIG.binaryPath)) {
+-      try {
+-        fs.unlinkSync(CONFIG.binaryPath)
+-      } catch (err) {
+-        // Fallback: try renaming the locked/undeletable binary (Windows)
+-        const backupPath = CONFIG.binaryPath + `.old.${Date.now()}`
+-        try {
+-          fs.renameSync(CONFIG.binaryPath, backupPath)
+-        } catch (renameErr) {
+-          throw new Error(
+-            `Failed to replace existing binary. ` +
+-              `unlink error: ${err.code || err.message}, ` +
+-              `rename error: ${renameErr.code || renameErr.message}`,
+-          )
+-        }
+-      }
++    fs.renameSync(sourcePath, targetPath)
++  } catch (error) {
++    if (backupPath && fs.existsSync(backupPath)) {
++      fs.renameSync(backupPath, targetPath)
+     }
+-    fs.renameSync(tempBinaryPath, CONFIG.binaryPath)
++    throw error
++  }
++
++  replacements.push({ backupPath, targetPath })
++}
+ 
+-    // Save version metadata for fast version checking
++function rollbackReplacements(replacements) {
++  for (const { backupPath, targetPath } of replacements.reverse()) {
++    removeFileIfPresent(targetPath)
++    if (backupPath && fs.existsSync(backupPath)) {
++      fs.renameSync(backupPath, targetPath)
++    }
++  }
++}
++
++function commitReplacements(replacements) {
++  for (const { backupPath } of replacements) {
++    if (!backupPath) continue
++    try {
++      removeFileIfPresent(backupPath)
++    } catch {
++      // The replacement is already committed. A stale backup is safer than
++      // rolling back a working install because cleanup failed.
++    }
++  }
++}
++
++function installStagedBinary({ tempBinaryPath, version, targetKey }) {
++  const replacements = []
++  const metadataTempPath = `${CONFIG.metadataPath}.new.${process.pid}`
++
++  try {
+     fs.writeFileSync(
+-      CONFIG.metadataPath,
++      metadataTempPath,
+       JSON.stringify({ version, target: targetKey }, null, 2),
+     )
++    replaceFileWithRollback(tempBinaryPath, CONFIG.binaryPath, replacements)
++
++    replaceFileWithRollback(metadataTempPath, CONFIG.metadataPath, replacements)
++    commitReplacements(replacements)
++  } catch (error) {
++    rollbackReplacements(replacements)
++    throw error
+   } finally {
+-    // Clean up temp directory even if rename fails
++    removeFileIfPresent(metadataTempPath)
+     if (fs.existsSync(CONFIG.tempDownloadDir)) {
+       fs.rmSync(CONFIG.tempDownloadDir, { recursive: true })
+     }
+@@ -689,6 +801,11 @@ async function downloadBinary(version, targetKey = getDownloadTargetKey()) {
+   console.log('Download complete! Starting Codecane...')
+ }
+ 
++async function downloadBinary(version, targetKey = getDownloadTargetKey()) {
++  const stagedBinary = await stageBinary(version, targetKey)
++  installStagedBinary(stagedBinary)
++}
++
+ async function ensureBinaryExists() {
+   const currentVersion = getCurrentVersion()
+   if (currentVersion !== null) {
+@@ -706,13 +823,52 @@ async function ensureBinaryExists() {
+     await downloadBinary(version)
+   } catch (error) {
+     term.clearLine()
+-    console.error('❌ Failed to download codecane:', error.message)
+-    console.error('Please check your internet connection and try again')
++    printDownloadFailure(error)
+     process.exit(1)
+   }
+ }
+ 
++function stopRunningProcess(runningProcess) {
++  return new Promise((resolve, reject) => {
++    let forceKillTimer
++    let forceKillTimeout
++
++    const cleanup = () => {
++      clearTimeout(forceKillTimer)
++      clearTimeout(forceKillTimeout)
++      runningProcess.removeListener('exit', handleExit)
++    }
++    const handleExit = () => {
++      cleanup()
++      resolve()
++    }
++    const fail = (error) => {
++      cleanup()
++      reject(error)
++    }
++
++    runningProcess.once('exit', handleExit)
++    forceKillTimer = setTimeout(() => {
++      forceKillTimeout = setTimeout(() => {
++        fail(new Error(`${packageName} did not exit after SIGKILL`))
++      }, 1000)
++      try {
++        runningProcess.kill('SIGKILL')
++      } catch (error) {
++        fail(error)
++      }
++    }, 5000)
++    try {
++      runningProcess.kill('SIGTERM')
++    } catch (error) {
++      fail(error)
++    }
++  })
++}
++
+ async function checkForUpdates(runningProcess, exitListener) {
++  let stoppedForUpdate = false
++
+   try {
+     const currentVersion = getCurrentVersion()
+ 
+@@ -724,37 +880,47 @@ async function checkForUpdates(runningProcess, exitListener) {
+       currentVersion === null ||
+       compareVersions(currentVersion, latestVersion) < 0
+     ) {
++      const stagedBinary = await stageBinary(
++        latestVersion,
++        getDownloadTargetKey(),
++        { quiet: true },
++      )
++
+       term.clearLine()
+ 
+       runningProcess.removeListener('exit', exitListener)
+-
+-      await new Promise((resolve) => {
+-        let exited = false
+-        runningProcess.once('exit', () => {
+-          exited = true
+-          resolve()
+-        })
+-        runningProcess.kill('SIGTERM')
+-        setTimeout(() => {
+-          if (!exited) {
+-            runningProcess.kill('SIGKILL')
+-            // Safety: resolve after giving SIGKILL time to take effect
+-            setTimeout(() => resolve(), 1000)
+-          }
+-        }, 5000)
+-      })
++      try {
++        await stopRunningProcess(runningProcess)
++      } catch (error) {
++        runningProcess.on('exit', exitListener)
++        throw error
++      }
++      stoppedForUpdate = true
+ 
+       resetTerminal({ exitAlternateScreen: true })
+       console.log(`Update available: ${currentVersion} → ${latestVersion}`)
+ 
+-      await downloadBinary(latestVersion)
++      installStagedBinary(stagedBinary)
+       const newChild = spawnInstalledBinary({ detached: false })
+       attachExitHandler(newChild)
+ 
+       return new Promise(() => {})
+     }
+   } catch (error) {
+-    // Ignore update failures
++    if (stoppedForUpdate && fs.existsSync(CONFIG.binaryPath)) {
++      console.error(
++        `Update failed; restarting ${packageName} ${getCurrentVersion()}.`,
++      )
++      const child = spawnInstalledBinary({ detached: false })
++      attachExitHandler(child)
++      return new Promise(() => {})
++    }
++    try {
++      fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
++    } catch {
++      // Best effort after a failed background update.
++    }
++    // A staging failure leaves the current process and binary untouched.
+   }
+ }
+ 
+@@ -909,7 +1075,11 @@ async function main() {
+   }, 100)
+ }
+ 
+-main().catch((error) => {
+-  console.error('❌ Unexpected error:', error.message)
+-  process.exit(1)
+-})
++module.exports = { stopRunningProcess }
++
++if (require.main === module) {
++  main().catch((error) => {
++    console.error('❌ Unexpected error:', error.message)
++    process.exit(1)
++  })
++}
+diff --git a/cli/release-staging/package.json b/cli/release-staging/package.json
+index f84bff872..7ec1d0cc0 100644
+--- a/cli/release-staging/package.json
++++ b/cli/release-staging/package.json
+@@ -6,14 +6,9 @@
+   "bin": {
+     "codecane": "index.js"
+   },
+-  "scripts": {
+-    "postinstall": "node postinstall.js",
+-    "preuninstall": "node -e \"const fs = require('fs'); const path = require('path'); const os = require('os'); const binaryPath = path.join(os.homedir(), '.config', 'manicode', process.platform === 'win32' ? 'codecane.exe' : 'codecane'); try { fs.unlinkSync(binaryPath) } catch (e) { /* ignore if file doesn't exist */ }\""
+-  },
+   "files": [
+     "index.js",
+     "http.js",
+-    "postinstall.js",
+     "README.md"
+   ],
+   "os": [
+diff --git a/cli/release-staging/postinstall.js b/cli/release-staging/postinstall.js
+deleted file mode 100644
+index 85f5e2527..000000000
+--- a/cli/release-staging/postinstall.js
++++ /dev/null
+@@ -1,36 +0,0 @@
+-#!/usr/bin/env node
+-
+-const fs = require('fs');
+-const os = require('os');
+-const path = require('path');
+-
+-// Clean up old binary
+-const binaryPath = path.join(
+-  os.homedir(),
+-  '.config',
+-  'manicode',
+-  process.platform === 'win32' ? 'codecane.exe' : 'codecane'
+-);
+-
+-try {
+-  fs.unlinkSync(binaryPath);
+-} catch (e) {
+-  /* ignore if file doesn't exist */
+-}
+-
+-// Print welcome message
+-console.log('\n');
+-console.log('🧪 Welcome to Codecane (Staging)!');
+-console.log('\n');
+-console.log('⚠️  This is a staging/beta release for testing purposes.');
+-console.log('\n');
+-console.log('To get started:');
+-console.log('  1. cd to your project directory');
+-console.log('  2. Run: codecane');
+-console.log('\n');
+-console.log('Example:');
+-console.log('  $ cd ~/my-project');
+-console.log('  $ codecane');
+-console.log('\n');
+-console.log('For more information, visit: https://codebuff.com/docs');
+-console.log('\n');
+diff --git a/cli/release/http.js b/cli/release/http.js
+index 38be896d6..ac613952c 100644
+--- a/cli/release/http.js
++++ b/cli/release/http.js
+@@ -1,5 +1,7 @@
+ const http = require('http')
+ const https = require('https')
++const fs = require('fs')
++const { pipeline } = require('stream/promises')
+ const tls = require('tls')
+ 
+ function createReleaseHttpClient({
+@@ -8,9 +10,20 @@ function createReleaseHttpClient({
+   requestTimeout,
+   httpModule = http,
+   httpsModule = https,
++  fsModule = fs,
++  pipelineFn = pipeline,
+   tlsModule = tls,
+ }) {
+-  function getProxyUrl() {
++  function getProxyUrl(protocol = 'https:') {
++    if (protocol === 'http:') {
++      return (
++        env.HTTP_PROXY ||
++        env.http_proxy ||
++        env.HTTPS_PROXY ||
++        env.https_proxy ||
++        null
++      )
++    }
+     return (
+       env.HTTPS_PROXY ||
+       env.https_proxy ||
+@@ -87,11 +100,15 @@ function createReleaseHttpClient({
+     })
+   }
+ 
+-  async function buildRequestOptions(url, options = {}) {
++  async function buildRequest(url, options = {}) {
+     const parsedUrl = new URL(url)
++    if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
++      throw new Error(`Unsupported URL protocol: ${parsedUrl.protocol}`)
++    }
++    const isHttps = parsedUrl.protocol === 'https:'
+     const reqOptions = {
+       hostname: parsedUrl.hostname,
+-      port: parsedUrl.port || 443,
++      port: parsedUrl.port || (isHttps ? 443 : 80),
+       path: parsedUrl.pathname + parsedUrl.search,
+       headers: {
+         'User-Agent': userAgent,
+@@ -99,9 +116,31 @@ function createReleaseHttpClient({
+       },
+     }
+ 
+-    const proxyUrl = getProxyUrl()
++    const proxyUrl = getProxyUrl(parsedUrl.protocol)
+     if (!proxyUrl || shouldBypassProxy(parsedUrl.hostname)) {
+-      return reqOptions
++      return { transport: isHttps ? httpsModule : httpModule, reqOptions }
++    }
++
++    const proxy = new URL(proxyUrl)
++    if (!['http:', 'https:'].includes(proxy.protocol)) {
++      throw new Error(`Unsupported proxy protocol: ${proxy.protocol}`)
++    }
++
++    if (!isHttps) {
++      reqOptions.hostname = proxy.hostname
++      reqOptions.port = proxy.port || (proxy.protocol === 'https:' ? 443 : 80)
++      reqOptions.path = parsedUrl.href
++      reqOptions.headers.Host = parsedUrl.host
++      if (proxy.username || proxy.password) {
++        const auth = Buffer.from(
++          `${decodeURIComponent(proxy.username || '')}:${decodeURIComponent(proxy.password || '')}`,
++        ).toString('base64')
++        reqOptions.headers['Proxy-Authorization'] = `Basic ${auth}`
++      }
++      return {
++        transport: proxy.protocol === 'https:' ? httpsModule : httpModule,
++        reqOptions,
++      }
+     }
+ 
+     const tunnelSocket = await connectThroughProxy(
+@@ -138,15 +177,15 @@ function createReleaseHttpClient({
+     }
+ 
+     reqOptions.agent = new TunnelAgent({ keepAlive: false })
+-    return reqOptions
++    return { transport: httpsModule, reqOptions }
+   }
+ 
+   async function httpGet(url, options = {}) {
+     const redirectCount = options.redirectCount || 0
+-    const reqOptions = await buildRequestOptions(url, options)
++    const { transport, reqOptions } = await buildRequest(url, options)
+ 
+     return new Promise((resolve, reject) => {
+-      const req = httpsModule.get(reqOptions, (res) => {
++      const req = transport.get(reqOptions, (res) => {
+         if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+           res.resume()
+ 
+@@ -170,17 +209,198 @@ function createReleaseHttpClient({
+           return
+         }
+ 
++        res.requestUrl = url
+         resolve(res)
+       })
+ 
+-      req.on('error', reject)
++      req.on('error', (error) => {
++        error.requestUrl = url
++        reject(error)
++      })
+       req.setTimeout(options.timeout || requestTimeout, () => {
+         req.destroy()
+-        reject(new Error('Request timeout.'))
++        const error = new Error('Request timeout.')
++        error.code = 'ETIMEDOUT'
++        error.requestUrl = url
++        reject(error)
+       })
+     })
+   }
+ 
++  function getFileSize(filePath) {
++    try {
++      return fsModule.statSync(filePath).size
++    } catch (error) {
++      if (error.code === 'ENOENT') return 0
++      throw error
++    }
++  }
++
++  function removeFileIfPresent(filePath) {
++    try {
++      fsModule.unlinkSync(filePath)
++    } catch (error) {
++      if (error.code !== 'ENOENT') throw error
++    }
++  }
++
++  function throwResponseError(res, message, requestUrl, retryable) {
++    res.resume()
++    const error = new Error(message)
++    error.statusCode = res.statusCode
++    error.retryable = retryable
++    error.requestUrl = requestUrl
++    throw error
++  }
++
++  function parseContentRange(value) {
++    if (!value) return null
++
++    const completeMatch = value.match(/^bytes (\d+)-(\d+)\/(\d+)$/i)
++    if (completeMatch) {
++      const start = Number(completeMatch[1])
++      const end = Number(completeMatch[2])
++      const total = Number(completeMatch[3])
++      if (start > end || end >= total) return null
++      return {
++        start,
++        end,
++        total,
++      }
++    }
++
++    const unsatisfiedMatch = value.match(/^bytes \*\/(\d+)$/i)
++    if (unsatisfiedMatch) {
++      return { start: null, end: null, total: Number(unsatisfiedMatch[1]) }
++    }
++
++    return null
++  }
++
++  function isRetryableStatus(statusCode) {
++    return (
++      statusCode === 408 ||
++      statusCode === 425 ||
++      statusCode === 429 ||
++      statusCode >= 500
++    )
++  }
++
++  async function downloadFile(url, destinationPath, options = {}) {
++    let resumedFrom = getFileSize(destinationPath)
++    let totalBytes = null
++
++    const headers = { ...options.headers }
++    if (resumedFrom > 0) {
++      headers.Range = `bytes=${resumedFrom}-`
++    }
++
++    const res = await httpGet(url, { ...options, headers })
++    const responseUrl = res.requestUrl || url
++    const contentRange = parseContentRange(res.headers['content-range'])
++
++    if (res.statusCode === 416 && contentRange?.total === resumedFrom) {
++      res.resume()
++      return {
++        downloadedBytes: resumedFrom,
++        totalBytes: resumedFrom,
++        resumedFrom,
++        responseUrl,
++      }
++    }
++
++    if (res.statusCode === 416) {
++      removeFileIfPresent(destinationPath)
++      throwResponseError(
++        res,
++        'Saved partial download is no longer valid',
++        responseUrl,
++        true,
++      )
++    }
++
++    let writeFlags
++    let expectedResponseBytes = null
++    if (res.statusCode === 206) {
++      if (!contentRange || contentRange.start !== resumedFrom) {
++        removeFileIfPresent(destinationPath)
++        throwResponseError(
++          res,
++          `Download resume mismatch: expected byte ${resumedFrom}`,
++          responseUrl,
++          true,
++        )
++      }
++      totalBytes = contentRange.total
++      expectedResponseBytes = contentRange.end - contentRange.start + 1
++      writeFlags = 'a'
++    } else if (res.statusCode === 200) {
++      // The server may ignore Range. Restart safely instead of appending a
++      // complete response to the existing partial archive.
++      resumedFrom = 0
++      totalBytes = Number(res.headers['content-length']) || null
++      writeFlags = 'w'
++    } else {
++      throwResponseError(
++        res,
++        `Download failed: HTTP ${res.statusCode}`,
++        responseUrl,
++        isRetryableStatus(res.statusCode),
++      )
++    }
++
++    let downloadedBytes = resumedFrom
++    res.on('data', (chunk) => {
++      downloadedBytes += chunk.length
++      options.onProgress?.({ downloadedBytes, totalBytes, resumedFrom })
++    })
++
++    try {
++      await pipelineFn(
++        res,
++        fsModule.createWriteStream(destinationPath, { flags: writeFlags }),
++      )
++    } catch (error) {
++      error.requestUrl ||= responseUrl
++      error.downloadedBytes = getFileSize(destinationPath)
++      error.totalBytes = totalBytes
++      throw error
++    }
++
++    downloadedBytes = getFileSize(destinationPath)
++    const responseBytes = downloadedBytes - resumedFrom
++    if (
++      expectedResponseBytes !== null &&
++      responseBytes !== expectedResponseBytes
++    ) {
++      if (responseBytes > expectedResponseBytes) {
++        removeFileIfPresent(destinationPath)
++      }
++      const error = new Error(
++        `Download incomplete: response contained ${responseBytes} of ${expectedResponseBytes} bytes`,
++      )
++      error.code = 'EINCOMPLETE'
++      error.retryable = true
++      error.requestUrl = responseUrl
++      error.downloadedBytes = getFileSize(destinationPath)
++      error.totalBytes = totalBytes
++      throw error
++    }
++    if (totalBytes !== null && downloadedBytes !== totalBytes) {
++      const error = new Error(
++        `Download incomplete: received ${downloadedBytes} of ${totalBytes} bytes`,
++      )
++      error.code = 'EINCOMPLETE'
++      error.retryable = true
++      error.requestUrl = responseUrl
++      error.downloadedBytes = downloadedBytes
++      error.totalBytes = totalBytes
++      throw error
++    }
++
++    return { downloadedBytes, totalBytes, resumedFrom, responseUrl }
++  }
++
+   async function withRetries(
+     operation,
+     {
+@@ -208,6 +428,7 @@ function createReleaseHttpClient({
+ 
+   return {
+     getProxyUrl,
++    downloadFile,
+     httpGet,
+     withRetries,
+   }
+diff --git a/cli/release/index.js b/cli/release/index.js
+index f4ff7a649..f5f9ee548 100644
+--- a/cli/release/index.js
++++ b/cli/release/index.js
+@@ -106,7 +106,7 @@ function createConfig(packageName) {
+ }
+ 
+ const CONFIG = createConfig(packageName)
+-const { httpGet, withRetries } = createReleaseHttpClient({
++const { downloadFile, httpGet, withRetries } = createReleaseHttpClient({
+   env: process.env,
+   userAgent: CONFIG.userAgent,
+   requestTimeout: CONFIG.requestTimeout,
+@@ -515,20 +515,67 @@ function createProgressBar(percentage, width = 30) {
+   return '[' + '█'.repeat(filled) + '░'.repeat(empty) + ']'
+ }
+ 
+-function isRetryableDownloadStatus(statusCode) {
+-  return (
+-    statusCode === 408 ||
+-    statusCode === 425 ||
+-    statusCode === 429 ||
+-    statusCode >= 500
+-  )
+-}
+-
+ function isRetryableDownloadError(error) {
+   if (error && typeof error.retryable === 'boolean') return error.retryable
+   return !['EACCES', 'ENOSPC', 'EPERM', 'EROFS'].includes(error?.code)
+ }
+ 
++function getPartialArchivePath(version, targetKey) {
++  return path.join(
++    CONFIG.configDir,
++    `.${packageName}-${version}-${targetKey}.tar.gz.part`,
++  )
++}
++
++function getFileSize(filePath) {
++  try {
++    return fs.statSync(filePath).size
++  } catch (error) {
++    if (error.code === 'ENOENT') return 0
++    throw error
++  }
++}
++
++function removeFileIfPresent(filePath) {
++  try {
++    fs.unlinkSync(filePath)
++  } catch (error) {
++    if (error.code !== 'ENOENT') throw error
++  }
++}
++
++function formatDownloadSource(downloadUrl) {
++  try {
++    const parsedUrl = new URL(downloadUrl)
++    return `${parsedUrl.origin}${parsedUrl.pathname}`
++  } catch {
++    return downloadUrl
++  }
++}
++
++function printDownloadFailure(error) {
++  const code = error.code ? ` (${error.code})` : ''
++  console.error(`❌ Failed to download ${packageName}: ${error.message}${code}`)
++
++  if (error.requestUrl) {
++    console.error(`Download source: ${formatDownloadSource(error.requestUrl)}`)
++  }
++  if (error.downloadedBytes > 0) {
++    const total = error.totalBytes ? ` of ${formatBytes(error.totalBytes)}` : ''
++    console.error(
++      `Saved ${formatBytes(error.downloadedBytes)}${total}; the next run will resume this download.`,
++    )
++  } else if (error.requestUrl) {
++    console.error(
++      'Please retry. The release host may be temporarily unavailable.',
++    )
++  } else {
++    console.error(
++      'The downloaded update could not be installed; the existing binary was preserved when possible.',
++    )
++  }
++}
++
+ function prepareTempDownloadDir() {
+   if (fs.existsSync(CONFIG.tempDownloadDir)) {
+     fs.rmSync(CONFIG.tempDownloadDir, { recursive: true })
+@@ -536,55 +583,61 @@ function prepareTempDownloadDir() {
+   fs.mkdirSync(CONFIG.tempDownloadDir, { recursive: true })
+ }
+ 
+-async function downloadAndExtract(downloadUrl, version, targetKey) {
++async function downloadAndExtract(
++  downloadUrl,
++  version,
++  targetKey,
++  { quiet = false } = {},
++) {
+   let attempts = 0
++  const partialArchivePath = getPartialArchivePath(version, targetKey)
++  let totalBytes = null
+ 
+   try {
+     return await withRetries(
+       async (attempt) => {
+         attempts = attempt
+         prepareTempDownloadDir()
+-        term.write('Downloading...')
++        if (!quiet) term.write('Downloading...')
+ 
+-        const res = await httpGet(downloadUrl, {
+-          timeout: CONFIG.downloadRequestTimeout,
+-        })
+-
+-        if (res.statusCode !== 200) {
+-          res.resume()
+-          const error = new Error(`Download failed: HTTP ${res.statusCode}`)
+-          error.statusCode = res.statusCode
+-          error.retryable = isRetryableDownloadStatus(res.statusCode)
+-          throw error
+-        }
+-
+-        const totalSize = parseInt(res.headers['content-length'] || '0', 10)
+-        let downloadedSize = 0
+         let lastProgressTime = Date.now()
+-
+-        res.on('data', (chunk) => {
+-          downloadedSize += chunk.length
+-          const now = Date.now()
+-          if (now - lastProgressTime >= 100 || downloadedSize === totalSize) {
++        const result = await downloadFile(downloadUrl, partialArchivePath, {
++          timeout: CONFIG.downloadRequestTimeout,
++          onProgress: ({ downloadedBytes, totalBytes: progressTotal }) => {
++            totalBytes = progressTotal
++            if (quiet) return
++            const now = Date.now()
++            if (
++              now - lastProgressTime < 100 &&
++              downloadedBytes !== progressTotal
++            ) {
++              return
++            }
+             lastProgressTime = now
+-            if (totalSize > 0) {
+-              const pct = Math.round((downloadedSize / totalSize) * 100)
++            if (progressTotal) {
++              const pct = Math.round((downloadedBytes / progressTotal) * 100)
+               term.write(
+-                `Downloading... ${createProgressBar(pct)} ${pct}% of ${formatBytes(
+-                  totalSize,
+-                )}`,
++                `Downloading... ${createProgressBar(pct)} ${pct}% of ${formatBytes(progressTotal)}`,
+               )
+             } else {
+-              term.write(`Downloading... ${formatBytes(downloadedSize)}`)
++              term.write(`Downloading... ${formatBytes(downloadedBytes)}`)
+             }
+-          }
++          },
+         })
++        totalBytes = result.totalBytes
+ 
+-        await pipeline(
+-          res,
+-          zlib.createGunzip(),
+-          tar.x({ cwd: CONFIG.tempDownloadDir }),
+-        )
++        try {
++          await pipeline(
++            fs.createReadStream(partialArchivePath),
++            zlib.createGunzip(),
++            tar.x({ cwd: CONFIG.tempDownloadDir }),
++          )
++        } catch (error) {
++          // A complete archive that cannot be extracted is corrupt. Do not
++          // resume it on the next attempt.
++          removeFileIfPresent(partialArchivePath)
++          throw error
++        }
+ 
+         const tempBinaryPath = path.join(
+           CONFIG.tempDownloadDir,
+@@ -592,6 +645,7 @@ async function downloadAndExtract(downloadUrl, version, targetKey) {
+         )
+         if (!fs.existsSync(tempBinaryPath)) {
+           const files = fs.readdirSync(CONFIG.tempDownloadDir)
++          removeFileIfPresent(partialArchivePath)
+           const error = new Error(
+             `Binary not found after extraction. Expected: ${CONFIG.binaryName}, Available files: ${files.join(', ')}`,
+           )
+@@ -599,12 +653,14 @@ async function downloadAndExtract(downloadUrl, version, targetKey) {
+           throw error
+         }
+ 
++        removeFileIfPresent(partialArchivePath)
+         return tempBinaryPath
+       },
+       {
+         maxAttempts: CONFIG.downloadMaxAttempts,
+         shouldRetry: isRetryableDownloadError,
+         onRetry: ({ nextAttempt, delayMs }) => {
++          if (quiet) return
+           term.writeLine(
+             `Download interrupted. Retrying in ${delayMs / 1000}s (${nextAttempt}/${CONFIG.downloadMaxAttempts})...`,
+           )
+@@ -612,21 +668,33 @@ async function downloadAndExtract(downloadUrl, version, targetKey) {
+       },
+     )
+   } catch (error) {
+-    if (fs.existsSync(CONFIG.tempDownloadDir)) {
+-      fs.rmSync(CONFIG.tempDownloadDir, { recursive: true })
++    try {
++      fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
++    } catch {
++      // Best effort after a failed download.
+     }
+ 
+     trackUpdateFailed(error.message, version, {
+       stage: 'download',
++      errorCode: error.code,
+       statusCode: error.statusCode,
+       target: targetKey,
+       attempts,
++      bytesDownloaded: getFileSize(partialArchivePath),
++      totalBytes: error.totalBytes || totalBytes,
+     })
++    error.downloadedBytes = getFileSize(partialArchivePath)
++    error.totalBytes ||= totalBytes
++    error.requestUrl ||= downloadUrl
+     throw error
+   }
+ }
+ 
+-async function downloadBinary(version, targetKey = getDownloadTargetKey()) {
++async function stageBinary(
++  version,
++  targetKey = getDownloadTargetKey(),
++  options = {},
++) {
+   const fileName = PLATFORM_TARGETS[targetKey]
+ 
+   if (!fileName) {
+@@ -644,33 +712,77 @@ async function downloadBinary(version, targetKey = getDownloadTargetKey()) {
+     downloadUrl,
+     version,
+     targetKey,
++    options,
+   )
+ 
+-  // Set executable permissions
+-  if (process.platform !== 'win32') {
+-    fs.chmodSync(tempBinaryPath, 0o755)
++  try {
++    if (process.platform !== 'win32') {
++      fs.chmodSync(tempBinaryPath, 0o755)
++    }
++  } catch (error) {
++    try {
++      fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
++    } catch {
++      // Preserve the original chmod error.
++    }
++    throw error
++  }
++
++  return { tempBinaryPath, version, targetKey }
++}
++
++function replaceFileWithRollback(sourcePath, targetPath, replacements) {
++  const backupPath = fs.existsSync(targetPath)
++    ? `${targetPath}.old.${Date.now()}.${replacements.length}`
++    : null
++
++  if (backupPath) {
++    fs.renameSync(targetPath, backupPath)
+   }
+ 
+-  // Move binary to final location
+   try {
+-    if (fs.existsSync(CONFIG.binaryPath)) {
+-      try {
+-        fs.unlinkSync(CONFIG.binaryPath)
+-      } catch (err) {
+-        // Fallback: try renaming the locked/undeletable binary (Windows)
+-        const backupPath = CONFIG.binaryPath + `.old.${Date.now()}`
+-        try {
+-          fs.renameSync(CONFIG.binaryPath, backupPath)
+-        } catch (renameErr) {
+-          throw new Error(
+-            `Failed to replace existing binary. ` +
+-              `unlink error: ${err.code || err.message}, ` +
+-              `rename error: ${renameErr.code || renameErr.message}`,
+-          )
+-        }
+-      }
++    fs.renameSync(sourcePath, targetPath)
++  } catch (error) {
++    if (backupPath && fs.existsSync(backupPath)) {
++      fs.renameSync(backupPath, targetPath)
++    }
++    throw error
++  }
++
++  replacements.push({ backupPath, targetPath })
++}
++
++function rollbackReplacements(replacements) {
++  for (const { backupPath, targetPath } of replacements.reverse()) {
++    removeFileIfPresent(targetPath)
++    if (backupPath && fs.existsSync(backupPath)) {
++      fs.renameSync(backupPath, targetPath)
++    }
++  }
++}
++
++function commitReplacements(replacements) {
++  for (const { backupPath } of replacements) {
++    if (!backupPath) continue
++    try {
++      removeFileIfPresent(backupPath)
++    } catch {
++      // The replacement is already committed. A stale backup is safer than
++      // rolling back a working install because cleanup failed.
+     }
+-    fs.renameSync(tempBinaryPath, CONFIG.binaryPath)
++  }
++}
++
++function installStagedBinary({ tempBinaryPath, version, targetKey }) {
++  const replacements = []
++  const metadataTempPath = `${CONFIG.metadataPath}.new.${process.pid}`
++
++  try {
++    fs.writeFileSync(
++      metadataTempPath,
++      JSON.stringify({ version, target: targetKey }, null, 2),
++    )
++    replaceFileWithRollback(tempBinaryPath, CONFIG.binaryPath, replacements)
+ 
+     // Move tree-sitter.wasm next to the binary if the tarball included
+     // it. The CLI binary loads this at startup; embedding it inside the
+@@ -685,21 +797,16 @@ async function downloadBinary(version, targetKey = getDownloadTargetKey()) {
+         path.dirname(CONFIG.binaryPath),
+         'tree-sitter.wasm',
+       )
+-      try {
+-        if (fs.existsSync(targetWasmPath)) fs.unlinkSync(targetWasmPath)
+-      } catch {
+-        // best effort; rename below will surface the real error if it matters
+-      }
+-      fs.renameSync(tempWasmPath, targetWasmPath)
++      replaceFileWithRollback(tempWasmPath, targetWasmPath, replacements)
+    
+
+… [diff truncated — view full diff on GitHub] …

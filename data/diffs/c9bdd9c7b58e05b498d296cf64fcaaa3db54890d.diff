@@ -1,0 +1,251 @@
+diff --git a/packages/agent-runtime/src/main-prompt.ts b/packages/agent-runtime/src/main-prompt.ts
+index 60fddd7fb..618a8733a 100644
+--- a/packages/agent-runtime/src/main-prompt.ts
++++ b/packages/agent-runtime/src/main-prompt.ts
+@@ -7,6 +7,7 @@ import {
+   assembleLocalAgentTemplates,
+   getAgentTemplate,
+ } from './templates/agent-registry'
++import { dedupeClientToolResults } from './util/messages'
+ 
+ import type { AgentTemplate } from './templates/types'
+ import type { ClientAction } from '@codebuff/common/actions'
+@@ -185,11 +186,42 @@ export async function callMainPrompt(
+   action.sessionState.mainAgentState.directCreditsUsed = 0
+ 
+   // Add any extra tool results (e.g. from user-executed terminal commands) to message history
+-  // This allows the AI to see context from commands run between prompts
++  // This allows the AI to see context from commands run between prompts.
++  //
++  // Skip ids that already carry a result. These arrive from public SDK input
++  // (`run({ extraToolResults })`), and a caller retrying after a failed run has
++  // no way to know whether its results were recorded before the failure — the
++  // returned RunState is replayable, so the safe thing for it to do is resend.
++  // A repeated tool_call_id then makes providers reject the whole history
++  // ("Duplicate value for 'tool_call_id' of X in message[N]"), which wedges
++  // every later turn in that conversation, not just this one.
++  //
++  // Matching on existing *results* rather than on every id keeps the legitimate
++  // case working: answering a tool call that is still pending in history.
+   if (action.toolResults && action.toolResults.length > 0) {
+-    action.sessionState.mainAgentState.messageHistory.push(
+-      ...action.toolResults,
+-    )
++    const { messageHistory } = action.sessionState.mainAgentState
++    const { fresh, duplicates } = dedupeClientToolResults({
++      messageHistory,
++      toolResults: action.toolResults,
++    })
++
++    if (duplicates.length > 0) {
++      logger.warn(
++        {
++          userId: (params as { userId?: string }).userId,
++          promptId,
++          duplicateCount: duplicates.length,
++          acceptedCount: fresh.length,
++          toolNames: [...new Set(duplicates.map((r) => r.toolName))],
++          messageCount: messageHistory.length,
++        },
++        'Skipped client tool results for already-answered tool calls',
++      )
++    }
++
++    if (fresh.length > 0) {
++      messageHistory.push(...fresh)
++    }
+   }
+ 
+   // Assemble local agent templates from fileContext
+diff --git a/packages/agent-runtime/src/util/__tests__/messages.test.ts b/packages/agent-runtime/src/util/__tests__/messages.test.ts
+index c23fb4ce2..c378beea4 100644
+--- a/packages/agent-runtime/src/util/__tests__/messages.test.ts
++++ b/packages/agent-runtime/src/util/__tests__/messages.test.ts
+@@ -19,12 +19,16 @@ import {
+   messagesWithSystem,
+   getPreviouslyReadFiles,
+   filterUnfinishedToolCalls,
++  dedupeClientToolResults,
+   buildUserMessageContent,
+ } from '../../util/messages'
+ import * as tokenCounter from '../token-counter'
+ 
+ import type { CodebuffToolMessage } from '@codebuff/common/tools/list'
+-import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++import type {
++  Message,
++  ToolMessage,
++} from '@codebuff/common/types/messages/codebuff-message'
+ import type {
+   TextPart,
+   ToolCallPart,
+@@ -984,3 +988,99 @@ describe('getPreviouslyReadFiles', () => {
+     expect(result).toEqual([])
+   })
+ })
++
++describe('dedupeClientToolResults', () => {
++  const toolResult = (
++    toolCallId: string,
++    toolName = 'run_terminal_command',
++  ): ToolMessage => ({
++    role: 'tool',
++    toolName,
++    toolCallId,
++    content: jsonToolResult({ stdout: 'ok' }),
++  })
++
++  const pendingCall = (toolCallId: string) =>
++    assistantMessage({
++      type: 'tool-call',
++      toolCallId,
++      toolName: 'run_terminal_command',
++      input: { command: 'ls' },
++    })
++
++  it('accepts results for calls that have no answer yet', () => {
++    const { fresh, duplicates } = dedupeClientToolResults({
++      messageHistory: [userMessage('go'), pendingCall('a')],
++      toolResults: [toolResult('a')],
++    })
++
++    expect(fresh).toHaveLength(1)
++    expect(duplicates).toEqual([])
++  })
++
++  it('accepts a result whose id is nowhere in the history', () => {
++    // The documented use: context from a command the user ran between prompts,
++    // which never had a matching tool call.
++    const { fresh, duplicates } = dedupeClientToolResults({
++      messageHistory: [userMessage('go')],
++      toolResults: [toolResult('freestanding')],
++    })
++
++    expect(fresh).toHaveLength(1)
++    expect(duplicates).toEqual([])
++  })
++
++  it('skips a result whose call was already answered', () => {
++    // The retry case: the run failed after the result was recorded, so the
++    // caller resends it against the replayable state it got back.
++    const { fresh, duplicates } = dedupeClientToolResults({
++      messageHistory: [userMessage('go'), pendingCall('a'), toolResult('a')],
++      toolResults: [toolResult('a')],
++    })
++
++    expect(fresh).toEqual([])
++    expect(duplicates).toHaveLength(1)
++    expect(duplicates[0].toolCallId).toBe('a')
++  })
++
++  it('keeps the fresh results when only some are duplicates', () => {
++    const { fresh, duplicates } = dedupeClientToolResults({
++      messageHistory: [toolResult('a')],
++      toolResults: [toolResult('a'), toolResult('b')],
++    })
++
++    expect(fresh.map((r) => r.toolCallId)).toEqual(['b'])
++    expect(duplicates.map((r) => r.toolCallId)).toEqual(['a'])
++  })
++
++  it('catches duplicates inside the incoming batch', () => {
++    const { fresh, duplicates } = dedupeClientToolResults({
++      messageHistory: [],
++      toolResults: [toolResult('a'), toolResult('a')],
++    })
++
++    expect(fresh).toHaveLength(1)
++    expect(duplicates).toHaveLength(1)
++  })
++
++  it('does not mutate its inputs', () => {
++    const messageHistory: Message[] = [toolResult('a')]
++    const toolResults = [toolResult('a'), toolResult('b')]
++    const historyBefore = JSON.stringify(messageHistory)
++    const resultsBefore = JSON.stringify(toolResults)
++
++    dedupeClientToolResults({ messageHistory, toolResults })
++
++    expect(JSON.stringify(messageHistory)).toBe(historyBefore)
++    expect(JSON.stringify(toolResults)).toBe(resultsBefore)
++  })
++
++  it('handles an empty batch', () => {
++    expect(
++      dedupeClientToolResults({
++        messageHistory: [toolResult('a')],
++        toolResults: [],
++      }),
++    ).toEqual({ fresh: [], duplicates: [] })
++  })
++})
+diff --git a/packages/agent-runtime/src/util/messages.ts b/packages/agent-runtime/src/util/messages.ts
+index 222eb2905..15a901f1b 100644
+--- a/packages/agent-runtime/src/util/messages.ts
++++ b/packages/agent-runtime/src/util/messages.ts
+@@ -15,7 +15,10 @@ import type {
+   CodebuffToolOutput,
+ } from '@codebuff/common/tools/list'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+-import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++import type {
++  Message,
++  ToolMessage,
++} from '@codebuff/common/types/messages/codebuff-message'
+ import type {
+   TextPart,
+   ImagePart,
+@@ -360,6 +363,53 @@ export function filterUnfinishedToolCalls(messages: Message[]): Message[] {
+   return filteredMessages
+ }
+ 
++/**
++ * Splits client-supplied tool results into those the history has room for and
++ * those that would repeat a `tool_call_id` already answered.
++ *
++ * These arrive from public SDK input (`run({ extraToolResults })`). A caller
++ * retrying after a failed run cannot tell whether its results were recorded
++ * before the failure — the returned RunState is replayable — so resending them
++ * is the reasonable thing for it to do. Appending blindly would put the same
++ * `tool_call_id` in the history twice, which providers reject outright
++ * ("Duplicate value for 'tool_call_id' of X in message[N]") and which then
++ * fails every later turn in that conversation, not just this one.
++ *
++ * Matching on ids that already have a *result* rather than on every id in the
++ * history is what keeps the legitimate case working: a result may answer a tool
++ * call that is still pending. Duplicates within `toolResults` itself are caught
++ * too, since each accepted id is claimed as it goes.
++ *
++ * Pure by design (no logger dependency): callers log `duplicates` with their own
++ * request context.
++ */
++export function dedupeClientToolResults(params: {
++  messageHistory: Message[]
++  toolResults: ToolMessage[]
++}): { fresh: ToolMessage[]; duplicates: ToolMessage[] } {
++  const { messageHistory, toolResults } = params
++
++  const answeredToolCallIds = new Set<string>()
++  for (const message of messageHistory) {
++    if (message.role === 'tool') {
++      answeredToolCallIds.add(message.toolCallId)
++    }
++  }
++
++  const fresh: ToolMessage[] = []
++  const duplicates: ToolMessage[] = []
++  for (const toolResult of toolResults) {
++    if (answeredToolCallIds.has(toolResult.toolCallId)) {
++      duplicates.push(toolResult)
++      continue
++    }
++    answeredToolCallIds.add(toolResult.toolCallId)
++    fresh.push(toolResult)
++  }
++
++  return { fresh, duplicates }
++}
++
+ export function getEditedFiles(params: {
+   messages: Message[]
+   logger: Logger

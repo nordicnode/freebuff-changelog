@@ -1,0 +1,301 @@
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index eb6d4dc8e..a2b0b0ea8 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -60,6 +60,7 @@ import { useFeedbackStore } from './state/feedback-store'
+ import { useMessageBlockStore } from './state/message-block-store'
+ import { usePublishStore } from './state/publish-store'
+ import { reportActivity } from './utils/activity-tracker'
++import { abortActiveRun } from './utils/active-run'
+ import { trackEvent } from './utils/analytics'
+ import { showClipboardMessage } from './utils/clipboard'
+ import { readClipboardImage } from './utils/clipboard-image'
+@@ -1070,7 +1071,9 @@ export const Chat = ({
+         setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false }),
+       onBackspaceExitMode: () => setInputMode('default'),
+       onInterruptStream: () => {
+-        abortControllerRef.current?.abort()
++        // The active-run registry survives temporary Chat unmounts; this
++        // component's local abort ref does not.
++        abortActiveRun()
+         if (queuedMessages.length > 0) {
+           pauseQueue()
+         }
+@@ -1278,7 +1281,6 @@ export const Chat = ({
+       handleCloseFeedback,
+       setFeedbackText,
+       setInputValue,
+-      abortControllerRef,
+       queuedMessages.length,
+       pauseQueue,
+       setSlashSelectedIndex,
+diff --git a/cli/src/components/__tests__/status-bar.test.tsx b/cli/src/components/__tests__/status-bar.test.tsx
+new file mode 100644
+index 000000000..47a3cbf8d
+--- /dev/null
++++ b/cli/src/components/__tests__/status-bar.test.tsx
+@@ -0,0 +1,54 @@
++import { beforeAll, describe, expect, test } from 'bun:test'
++import { testRender } from '@opentui/react/test-utils'
++import React, { act } from 'react'
++
++import { StatusBar } from '../status-bar'
++import { initializeThemeStore } from '../../hooks/use-theme'
++import {
++  clearActiveRunAborter,
++  hasActiveRun,
++  setActiveRunAborter,
++} from '../../utils/active-run'
++import {
++  getStatusIndicatorState,
++  resolveStreamStatus,
++} from '../../utils/status-indicator-state'
++
++beforeAll(() => {
++  initializeThemeStore()
++})
++
++describe('StatusBar', () => {
++  test('renders working after Chat remounts during an active run', async () => {
++    setActiveRunAborter('remounted-run', () => {})
++    try {
++      const statusIndicatorState = getStatusIndicatorState({
++        statusMessage: null,
++        streamStatus: resolveStreamStatus('idle', true, hasActiveRun()),
++        nextCtrlCWillExit: false,
++        isConnected: true,
++      })
++      const setup = await testRender(
++        <StatusBar
++          timerStartTime={null}
++          isAtBottom
++          scrollToLatest={() => {}}
++          statusIndicatorState={statusIndicatorState}
++          freebuffSession={null}
++        />,
++        { width: 80, height: 3 },
++      )
++
++      try {
++        await act(async () => {
++          await setup.renderOnce()
++        })
++        expect(setup.captureCharFrame()).toContain('working...')
++      } finally {
++        act(() => setup.renderer.destroy())
++      }
++    } finally {
++      clearActiveRunAborter('remounted-run')
++    }
++  })
++})
+diff --git a/cli/src/components/__tests__/status-indicator.test.tsx b/cli/src/components/__tests__/status-indicator.test.tsx
+index b2f848023..d20eb2839 100644
+--- a/cli/src/components/__tests__/status-indicator.test.tsx
++++ b/cli/src/components/__tests__/status-indicator.test.tsx
+@@ -1,10 +1,29 @@
+ import { describe, test, expect } from 'bun:test'
+ 
+-import { getStatusIndicatorState } from '../../utils/status-indicator-state'
++import {
++  getStatusIndicatorState,
++  resolveStreamStatus,
++} from '../../utils/status-indicator-state'
+ 
+ import type { StatusIndicatorStateArgs } from '../../utils/status-indicator-state'
+ 
+ describe('StatusIndicator state logic', () => {
++  describe('resolveStreamStatus', () => {
++    test('restores working status when Chat remounts during an active run', () => {
++      expect(resolveStreamStatus('idle', true, true)).toBe('streaming')
++    })
++
++    test('does not report a cancellable stream during preflight or after completion', () => {
++      expect(resolveStreamStatus('idle', true, false)).toBe('idle')
++      expect(resolveStreamStatus('idle', false, true)).toBe('idle')
++    })
++
++    test('preserves normal stream phases', () => {
++      expect(resolveStreamStatus('waiting', true, false)).toBe('waiting')
++      expect(resolveStreamStatus('streaming', false, false)).toBe('streaming')
++    })
++  })
++
+   describe('getStatusIndicatorState', () => {
+     const baseArgs: StatusIndicatorStateArgs = {
+       statusMessage: null,
+diff --git a/cli/src/hooks/use-chat-streaming.ts b/cli/src/hooks/use-chat-streaming.ts
+index f938a01e7..c4dc6afdb 100644
+--- a/cli/src/hooks/use-chat-streaming.ts
++++ b/cli/src/hooks/use-chat-streaming.ts
+@@ -18,8 +18,10 @@ import { useQueueUi } from './use-queue-ui'
+ import { useTimeout } from './use-timeout'
+ import { useChatStore } from '../state/chat-store'
+ import { useFreebuffSessionStore } from '../state/freebuff-session-store'
++import { hasActiveRun } from '../utils/active-run'
+ import { IS_FREEBUFF } from '../utils/constants'
+ import { logger } from '../utils/logger'
++import { resolveStreamStatus } from '../utils/status-indicator-state'
+ 
+ import type { ElapsedTimeTracker } from './use-elapsed-time'
+ import type { PendingAttachment } from '../types/store'
+@@ -129,6 +131,7 @@ export function useChatStreaming({
+ 
+   // Pause/resume timer when ask_user tool becomes active/inactive
+   const askUserState = useChatStore((state) => state.askUserState)
++  const isChainInProgress = useChatStore((state) => state.isChainInProgress)
+   useEffect(() => {
+     if (askUserState !== null) {
+       mainAgentTimer.pause()
+@@ -214,9 +217,15 @@ export function useChatStreaming({
+     baseHandleCtrlC,
+   })
+ 
+-  // Derived flags
+-  const isWaitingForResponse = streamStatus === 'waiting'
+-  const isStreaming = streamStatus !== 'idle'
++  // Derived flags. The store-backed chain flag preserves active-run state
++  // across temporary Chat unmounts; the hook-local stream status does not.
++  const effectiveStreamStatus = resolveStreamStatus(
++    streamStatus,
++    isChainInProgress,
++    hasActiveRun(),
++  )
++  const isWaitingForResponse = effectiveStreamStatus === 'waiting'
++  const isStreaming = effectiveStreamStatus !== 'idle'
+ 
+   return {
+     // Connection state
+@@ -228,7 +237,7 @@ export function useChatStreaming({
+     timerStartTime,
+ 
+     // Stream status
+-    streamStatus,
++    streamStatus: effectiveStreamStatus,
+     isWaitingForResponse,
+     isStreaming,
+     setStreamStatus,
+diff --git a/cli/src/utils/__tests__/active-run.test.ts b/cli/src/utils/__tests__/active-run.test.ts
+new file mode 100644
+index 000000000..91b955f94
+--- /dev/null
++++ b/cli/src/utils/__tests__/active-run.test.ts
+@@ -0,0 +1,38 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  abortActiveRun,
++  clearActiveRunAborter,
++  hasActiveRun,
++  setActiveRunAborter,
++} from '../active-run'
++
++describe('active-run registry', () => {
++  test('tracks and aborts the registered run across component lifetimes', () => {
++    let aborted = false
++    setActiveRunAborter('run-1', () => {
++      aborted = true
++    })
++
++    try {
++      expect(hasActiveRun()).toBe(true)
++      abortActiveRun()
++      expect(aborted).toBe(true)
++    } finally {
++      clearActiveRunAborter('run-1')
++    }
++
++    expect(hasActiveRun()).toBe(false)
++  })
++
++  test('does not let a stale owner clear a newer run', () => {
++    setActiveRunAborter('run-new', () => {})
++
++    try {
++      clearActiveRunAborter('run-old')
++      expect(hasActiveRun()).toBe(true)
++    } finally {
++      clearActiveRunAborter('run-new')
++    }
++  })
++})
+diff --git a/cli/src/utils/active-run.ts b/cli/src/utils/active-run.ts
+index aa3b03116..170666d06 100644
+--- a/cli/src/utils/active-run.ts
++++ b/cli/src/utils/active-run.ts
+@@ -16,6 +16,11 @@ export function clearActiveRunAborter(ownerId: string): void {
+   }
+ }
+ 
++/** Whether a run has reached the abortable SDK phase. */
++export function hasActiveRun(): boolean {
++  return activeRun !== null
++}
++
+ /** Abort the in-flight agent run, if any. Safe to call when idle. */
+ export function abortActiveRun(): void {
+   activeRun?.abort()
+diff --git a/cli/src/utils/status-indicator-state.ts b/cli/src/utils/status-indicator-state.ts
+index 8745edba5..212cc97b2 100644
+--- a/cli/src/utils/status-indicator-state.ts
++++ b/cli/src/utils/status-indicator-state.ts
+@@ -13,6 +13,23 @@ export type StatusIndicatorState =
+ 
+ export type AuthStatus = 'ok' | 'retrying' | 'unreachable'
+ 
++/**
++ * The queue's stream status is local to <Chat>, while the chain flag lives in
++ * the chat store. If a session gate temporarily unmounts <Chat> during a run,
++ * the local status comes back as idle even though the original run continues
++ * updating the shared transcript. Keep the remounted UI in an active state
++ * only when that run has also reached the abortable SDK phase. The latter
++ * avoids advertising a working/cancellable stream during message preflight.
++ */
++export const resolveStreamStatus = (
++  streamStatus: StreamStatus,
++  isChainInProgress: boolean,
++  hasActiveRun: boolean,
++): StreamStatus =>
++  streamStatus === 'idle' && isChainInProgress && hasActiveRun
++    ? 'streaming'
++    : streamStatus
++
+ export type StatusIndicatorStateArgs = {
+   statusMessage?: string | null
+   streamStatus: StreamStatus
+diff --git a/common/src/__tests__/model-config.test.ts b/common/src/__tests__/model-config.test.ts
+index 92c90709e..2f2771311 100644
+--- a/common/src/__tests__/model-config.test.ts
++++ b/common/src/__tests__/model-config.test.ts
+@@ -1,6 +1,17 @@
+ import { describe, expect, test } from 'bun:test'
+ 
+-import { supportsAssistantPrefill } from '../constants/model-config'
++import {
++  isExplicitlyDefinedModel,
++  models,
++  supportsAssistantPrefill,
++} from '../constants/model-config'
++
++describe('isExplicitlyDefinedModel', () => {
++  test('distinguishes configured models from unknown model IDs', () => {
++    expect(isExplicitlyDefinedModel(models.openrouter_gpt5)).toBe(true)
++    expect(isExplicitlyDefinedModel('custom/unknown-model')).toBe(false)
++  })
++})
+ 
+ describe('supportsAssistantPrefill', () => {
+   test('rejects prefill for Claude 4.6+', () => {
+@@ -14,9 +25,9 @@ describe('supportsAssistantPrefill', () => {
+     expect(supportsAssistantPrefill('anthropic/claude-sonnet-4.5')).toBe(true)
+     expect(supportsAssistantPrefill('anthropic/claude-opus-4')).toBe(true)
+     expect(supportsAssistantPrefill('anthropic/claude-3-5-sonnet')).toBe(true)
+-    expect(supportsAssistantPrefill('anthropic/claude-haiku-4-5-20251001')).toBe(
+-      true,
+-    )
++    expect(
++      supportsAssistantPrefill('anthropic/claude-haiku-4-5-20251001'),
++    ).toBe(true)
+   })
+ 
+   test('allows prefill for non-Claude models', () => {

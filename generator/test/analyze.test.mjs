@@ -4,7 +4,8 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   extractModelTableChanges, extractVersionBump, extractSlashCommandChanges,
-  areaOf, isNoiseFile, deterministicSummary, entryTitle, sourceRef, isSyncCommit
+  areaOf, isNoiseFile, deterministicSummary, entryTitle, sourceRef, isSyncCommit,
+  extractCommentFacts, extractCleanDiff
 } from '../lib/analyze.mjs'
 
 const README_PATCH = [
@@ -92,3 +93,68 @@ test('sync detection + source sha parse', () => {
   assert.equal(sourceRef(c), 'a'.repeat(40))
   assert.ok(!isSyncCommit({ subject: 'Add thing (#12)' }))
 })
+
+test('model table: ignores product tables like Choose your Freebuff', () => {
+  const patch = [
+    'diff --git a/README.md b/README.md',
+    '@@ -8,6 +8,6 @@',
+    ' | Product | What it does | Get started |',
+    '-| **Freebuff Desktop** | Run agents | link |',
+    '+| **Freebuff Desktop** | Run parallel agents locally | link |',
+    '-| **Freebuff CLI** | Terminal | link |',
+    '+| **Freebuff CLI** | Code in terminal | link |'
+  ].join('\n')
+  const r = extractModelTableChanges(patch)
+  assert.deepEqual(r.added, [])
+  assert.deepEqual(r.removed, [])
+})
+
+test('model table: description edit yields no self-replacement', () => {
+  const patch = [
+    'diff --git a/README.md b/README.md',
+    '@@ -35,2 +35,2 @@',
+    '-| **DeepSeek V4 Pro 08/13** | Full access | Old description |',
+    '+| **DeepSeek V4 Pro 08/13** | Full access | New description with extra details |'
+  ].join('\n')
+  const r = extractModelTableChanges(patch)
+  assert.deepEqual(r.added, [])
+  assert.deepEqual(r.removed, [])
+})
+
+test('slash command: quotes, backticks, and net set diff', () => {
+  const patch = [
+    "+\tname: '/undo',",
+    '+\tname: "/redo",',
+    '+\tname: `/compact`,',
+    '-\tname: \'/compact\','
+  ].join('\n')
+  const r = extractSlashCommandChanges(patch)
+  assert.deepEqual(r.added.sort(), ['/redo', '/undo'])
+  assert.deepEqual(r.removed, [])
+})
+
+test('noise files: catches nested and binary lockfiles', () => {
+  assert.ok(isNoiseFile('bun.lockb'))
+  assert.ok(isNoiseFile('test/bun.lockb'))
+  assert.ok(isNoiseFile('web/bun.lock'))
+  assert.ok(isNoiseFile('pnpm-lock.yaml'))
+  assert.ok(isNoiseFile('.bun-version'))
+})
+
+test('extractCommentFacts: only captures added comments and flushes properly', () => {
+  const patch = [
+    '- // Deprecated model access due to high upstream provider latency.',
+    '+ // Re-enabled with new high-throughput fallback endpoints across regions.',
+    '+ // Verified under multi-turn stress test with zero token leakage.'
+  ].join('\n')
+  const facts = extractCommentFacts(patch)
+  assert.equal(facts.length, 1)
+  assert.ok(facts[0].startsWith('Re-enabled with new high-throughput'))
+  assert.ok(!facts[0].includes('Deprecated model access'))
+})
+
+test('extractCleanDiff: function is exported and callable', () => {
+  assert.equal(typeof extractCleanDiff, 'function')
+})
+
+

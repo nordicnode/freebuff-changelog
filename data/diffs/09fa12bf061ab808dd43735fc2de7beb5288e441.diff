@@ -1,0 +1,290 @@
+diff --git a/cli/src/utils/__tests__/error-handling.test.ts b/cli/src/utils/__tests__/error-handling.test.ts
+index 56f202324..ba1bd8c73 100644
+--- a/cli/src/utils/__tests__/error-handling.test.ts
++++ b/cli/src/utils/__tests__/error-handling.test.ts
+@@ -1,5 +1,9 @@
+ import { describe, test, expect } from 'bun:test'
+-import { FREEBUFF_PROVIDER_USAGE_MESSAGE } from '@codebuff/common/constants/freebuff-errors'
++import {
++  FREEBUFF_PROVIDER_USAGE_MESSAGE,
++  FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
++  FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
++} from '@codebuff/common/constants/freebuff-errors'
+ 
+ import {
+   getFreebuffRateLimitErrorMessage,
+@@ -133,6 +137,17 @@ describe('error-handling', () => {
+   })
+ 
+   describe('getFreebuffRateLimitErrorMessage', () => {
++    test('shows the per-turn spend breaker copy verbatim, not a rate-limit framing', () => {
++      expect(
++        getFreebuffRateLimitErrorMessage({
++          type: 'error',
++          statusCode: 429,
++          error: FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
++          message: FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
++        }),
++      ).toBe(FREEBUFF_TURN_SPEND_LIMIT_MESSAGE)
++    })
++
+     test('returns the generic message for untyped 429 errors', () => {
+       expect(
+         getFreebuffRateLimitErrorMessage({
+diff --git a/cli/src/utils/error-handling.ts b/cli/src/utils/error-handling.ts
+index 05c603c5e..ff1ffaf7c 100644
+--- a/cli/src/utils/error-handling.ts
++++ b/cli/src/utils/error-handling.ts
+@@ -1,4 +1,8 @@
+-import { FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN } from '@codebuff/common/constants/freebuff-errors'
++import {
++  FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN,
++  FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
++  FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
++} from '@codebuff/common/constants/freebuff-errors'
+ import { env } from '@codebuff/common/env'
+ import { extractApiErrorDetails } from '@codebuff/common/util/error'
+ import { formatFreebuffHardBlockedPrivacySignals } from '@codebuff/common/util/freebuff-privacy'
+@@ -128,6 +132,11 @@ export const getFreebuffRateLimitErrorMessage = (
+     // retry countdown — show it verbatim.
+     return details.message ?? FREEBUFF_RATE_LIMIT_MESSAGE
+   }
++  if (details.errorCode === FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE) {
++    // The per-turn spend breaker. Its copy already says what happened and
++    // what to do (send a new message); a rate-limit framing would be wrong.
++    return details.message ?? FREEBUFF_TURN_SPEND_LIMIT_MESSAGE
++  }
+   // Other 429s (e.g. relayed upstream capacity errors) keep the branded
+   // message but include the server detail so users aren't left guessing.
+   // Only trust messages parsed from a server response body, or the curated
+diff --git a/common/src/constants/freebuff-errors.ts b/common/src/constants/freebuff-errors.ts
+index 04f3b3fa3..e7be0cbe5 100644
+--- a/common/src/constants/freebuff-errors.ts
++++ b/common/src/constants/freebuff-errors.ts
+@@ -5,3 +5,17 @@ export const FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN =
+ /** Shared copy keeps every Freebuff surface clear that the user is not billed. */
+ export const FREEBUFF_PROVIDER_USAGE_MESSAGE =
+   'Freebuff ran out of provider usage and needs a refill. This is on us, not your account.'
++
++/**
++ * The completions API's per-turn spend breaker (web/src/app/api/v1/chat/
++ * completions/_post.ts, packages/billing/src/freebuff-turn-spend.ts): a 429
++ * whose body is `{ error: 'turn_spend_limit', message }`. It is not a quota
++ * and not transient — the same turn is refused again on every retry, because
++ * its spend only ever grows — so every client stops retrying on sight and
++ * shows the message as-is. A NEW message starts a new turn with a fresh
++ * budget, which is what the copy says.
++ */
++export const FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE = 'turn_spend_limit'
++
++export const FREEBUFF_TURN_SPEND_LIMIT_MESSAGE =
++  'Something went wrong with this turn — it kept accumulating model usage well past what a single turn should use (this usually means an agent got stuck in a loop). Your session is fine: send a new message to continue from here.'
+diff --git a/sdk/src/impl/__tests__/turn-spend-breaker.test.ts b/sdk/src/impl/__tests__/turn-spend-breaker.test.ts
+new file mode 100644
+index 000000000..111a263cb
+--- /dev/null
++++ b/sdk/src/impl/__tests__/turn-spend-breaker.test.ts
+@@ -0,0 +1,89 @@
++/**
++ * The client half of the per-turn spend breaker (packages/billing/src/
++ * freebuff-turn-spend.ts): a 429 with `error: 'turn_spend_limit'` is final
++ * for the turn, so the SDK must not spend the AI SDK's retry budget on it —
++ * and must hand the server's own copy to the runtime unchanged.
++ */
++import {
++  FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
++  FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
++} from '@codebuff/common/constants/freebuff-errors'
++import { extractApiErrorDetails } from '@codebuff/common/util/error'
++import { APICallError, streamText } from 'ai'
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { getModelForRequest } from '../model-provider'
++
++const originalFetch = globalThis.fetch
++
++afterEach(() => {
++  globalThis.fetch = originalFetch
++})
++
++function serve429(body: Record<string, unknown>): { calls: () => number } {
++  let calls = 0
++  globalThis.fetch = (async () => {
++    calls += 1
++    return new Response(JSON.stringify(body), {
++      status: 429,
++      headers: { 'content-type': 'application/json' },
++    })
++  }) as unknown as typeof fetch
++  return { calls: () => calls }
++}
++
++/** Runs one completion and returns whatever it failed with. */
++async function failureOf(maxRetries: number): Promise<unknown> {
++  const result = streamText({
++    model: getModelForRequest({ apiKey: 'k', model: 'openai/gpt-5.6-luna' }),
++    messages: [{ role: 'user', content: 'hi' }],
++    maxRetries,
++  })
++  let error: unknown
++  try {
++    for await (const part of result.stream) {
++      if (part.type === 'error') error = (part as { error: unknown }).error
++    }
++  } catch (thrown) {
++    error ??= thrown
++  }
++  await Promise.resolve(result.text).catch((thrown: unknown) => {
++    error ??= thrown
++  })
++  return error
++}
++
++describe('per-turn spend breaker on the SDK side', () => {
++  test('a capped turn is refused once, not retried, and keeps the server copy', async () => {
++    const server = serve429({
++      error: FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
++      message: FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
++    })
++
++    const error = await failureOf(3)
++
++    // One request even with three retries on offer: the AI SDK only retries
++    // an APICallError that says it is retryable, and this one says no.
++    expect(server.calls()).toBe(1)
++    expect(APICallError.isInstance(error)).toBe(true)
++    const apiError = error as APICallError
++    expect(apiError.isRetryable).toBe(false)
++    expect(apiError.statusCode).toBe(429)
++    expect(apiError.message).toBe(FREEBUFF_TURN_SPEND_LIMIT_MESSAGE)
++    // What the runtime's error parser (run-agent-step.ts) reads off it: the
++    // code reaches `AgentOutput.error`, the copy replaces "Agent run error: …".
++    expect(extractApiErrorDetails(error)).toMatchObject({
++      statusCode: 429,
++      errorCode: FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
++      message: FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
++    })
++  })
++
++  test('any other 429 is still retried', async () => {
++    const server = serve429({ error: 'free_mode_rate_limited', message: 'slow down' })
++
++    await failureOf(1)
++
++    expect(server.calls()).toBe(2)
++  }, 15_000)
++})
+diff --git a/sdk/src/impl/model-provider.ts b/sdk/src/impl/model-provider.ts
+index 37b35583d..79fcbb4e5 100644
+--- a/sdk/src/impl/model-provider.ts
++++ b/sdk/src/impl/model-provider.ts
+@@ -6,6 +6,10 @@
+ import path from 'path'
+ 
+ import { BYOK_OPENROUTER_HEADER } from '@codebuff/common/constants/byok'
++import {
++  FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
++  FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
++} from '@codebuff/common/constants/freebuff-errors'
+ import { FREEBUFF_ACTING_USER_HEADER } from '@codebuff/common/constants/freebuff-models'
+ import { isTransientNetworkError } from '@codebuff/common/util/error'
+ import {
+@@ -82,9 +86,59 @@ function notifyCapacityDeferralFromResponse(response: Response): void {
+     .catch(() => {})
+ }
+ 
++function requestUrlOf(input: Parameters<typeof globalThis.fetch>[0]): string {
++  return typeof input === 'string'
++    ? input
++    : input instanceof URL
++      ? input.toString()
++      : input.url
++}
++
++/**
++ * The per-turn spend breaker (HTTP 429, body `{ error: 'turn_spend_limit',
++ * message }`) is final for THIS turn: its spend only grows, so the same run
++ * id is refused again on every retry. Left to the AI SDK, which treats every
++ * 429 as retryable, a capped turn asked four times over ~14s and then failed
++ * as "Failed after 4 attempts. Last error: Too Many Requests" — which every
++ * client read as an ordinary rate limit and answered with "wait a moment or
++ * switch models", neither of which helps. Throwing a NON-retryable
++ * APICallError stops the retry loop on the first refusal, and carrying the
++ * body lets the runtime's error parser hand the server's own copy (and the
++ * `turn_spend_limit` code) to the client unchanged.
++ */
++async function throwIfTurnSpendCapped(
++  response: Response,
++  url: string,
++): Promise<void> {
++  if (response.status !== 429) return
++  const text = await response
++    .clone()
++    .text()
++    .catch(() => '')
++  let body: { error?: unknown; message?: unknown } | null = null
++  try {
++    body = JSON.parse(text)
++  } catch {
++    return
++  }
++  if (body?.error !== FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE) return
++  throw new APICallError({
++    message:
++      typeof body.message === 'string' && body.message
++        ? body.message
++        : FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
++    url,
++    requestBodyValues: {},
++    statusCode: response.status,
++    responseBody: text,
++    isRetryable: false,
++  })
++}
++
+ /**
+  * Wrap global fetch so transient connection failures (socket closed/reset,
+- * connection refused) are rethrown as retryable APICallErrors.
++ * connection refused) are rethrown as retryable APICallErrors, and a capped
++ * turn's 429 as a non-retryable one (see throwIfTurnSpendCapped).
+  *
+  * Bun's fetch throws these as plain Errors ("The socket connection was closed
+  * unexpectedly...", code ECONNRESET/ConnectionClosed), which the AI SDK does
+@@ -96,21 +150,15 @@ function notifyCapacityDeferralFromResponse(response: Response): void {
+ function fetchWithRetryableNetworkErrors(
+   ...args: Parameters<typeof globalThis.fetch>
+ ): ReturnType<typeof globalThis.fetch> {
+-  return globalThis
+-    .fetch(...args)
+-    .then((response) => {
++  const url = requestUrlOf(args[0])
++  return globalThis.fetch(...args).then(
++    async (response) => {
+       notifyCapacityDeferralFromResponse(response)
++      await throwIfTurnSpendCapped(response, url)
+       return response
+-    })
+-    .catch((error: unknown) => {
++    },
++    (error: unknown) => {
+       if (isTransientNetworkError(error)) {
+-        const input = args[0]
+-        const url =
+-          typeof input === 'string'
+-            ? input
+-            : input instanceof URL
+-              ? input.toString()
+-              : input.url
+         throw new APICallError({
+           message: error instanceof Error ? error.message : String(error),
+           cause: error,
+@@ -120,7 +168,8 @@ function fetchWithRetryableNetworkErrors(
+         })
+       }
+       throw error
+-    })
++    },
++  )
+ }
+ 
+ /**

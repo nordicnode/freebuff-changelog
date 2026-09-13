@@ -1,0 +1,235 @@
+diff --git a/common/src/__tests__/project-file-tree.test.ts b/common/src/__tests__/project-file-tree.test.ts
+index 2f8b8a72d..b9955ece9 100644
+--- a/common/src/__tests__/project-file-tree.test.ts
++++ b/common/src/__tests__/project-file-tree.test.ts
+@@ -4,6 +4,7 @@ import path from 'path'
+ import { describe, expect, it } from 'bun:test'
+ 
+ import {
++  flattenTree,
+   getAllPathsWithDirectories,
+   getProjectFileTree,
+   isFileIgnored,
+@@ -72,6 +73,38 @@ describe('getProjectFileTree', () => {
+ 
+     expect(paths).toContain(path.join('a', 'b', 'c', 'd', 'e.txt'))
+   })
++
++  it('records file paths with forward slashes', async () => {
++    // `ignore` and the glob patterns the model writes are both POSIX-only, and
++    // `ignore` answers false for a backslash path rather than throwing. Storing
++    // anything but forward slashes here makes nested rules stop pruning on
++    // Windows, which is how build output ends up eating the maxFiles budget.
++    const root = '/repo'
++    const fs = createFsWithFiles(root, ['app/src/main/Inventory.kt'])
++
++    const tree = await getProjectFileTree({ projectRoot: root, fs })
++
++    const filePaths = flattenTree(tree).map((node) => node.filePath)
++    expect(filePaths).toEqual(['app/src/main/Inventory.kt'])
++  })
++
++  it('prunes directories ignored by a rule in a nested .gitignore', async () => {
++    const root = '/repo'
++    const fs = createFsWithFiles(root, [
++      'app/.gitignore',
++      'app/build/output.class',
++      'app/src/Inventory.kt',
++    ])
++    ;(fs.readFile as any).mockImplementation(async (filePath: string) =>
++      String(filePath).endsWith('.gitignore') ? 'build/\n' : '',
++    )
++
++    const tree = await getProjectFileTree({ projectRoot: root, fs })
++
++    const filePaths = flattenTree(tree).map((node) => node.filePath)
++    expect(filePaths).toContain('app/src/Inventory.kt')
++    expect(filePaths).not.toContain('app/build/output.class')
++  })
+ })
+ 
+ describe('isFileIgnored', () => {
+diff --git a/common/src/project-file-tree.ts b/common/src/project-file-tree.ts
+index 3605d474e..e3d814a1e 100644
+--- a/common/src/project-file-tree.ts
++++ b/common/src/project-file-tree.ts
+@@ -41,6 +41,18 @@ function logFileTreeError(
+ 
+ export const DEFAULT_MAX_FILES = 10_000
+ 
++/**
++ * Everything downstream of the file tree is POSIX-only: `ignore` matches
++ * nothing but forward slashes, and glob patterns come from the model in that
++ * form too. `path.relative` returns backslashes on Windows, and `ignore`
++ * answers `false` for them instead of throwing — so nested rules like `build/`
++ * or `node_modules` silently stop pruning and the crawl burns its file budget
++ * on build output before it ever reaches the source tree.
++ */
++function toPosixPath(p: string): string {
++  return p.replace(/\\/g, '/')
++}
++
+ // When the project root is the home directory (or an ancestor), a full scan
+ // could crawl the user's entire disk. Instead of disabling the file tree
+ // entirely, do a shallow capped scan so @ mentions still surface
+@@ -121,7 +133,7 @@ export async function getProjectFileTree(params: {
+         if (totalFiles >= maxFiles) break
+ 
+         const filePath = path.join(fullPath, file)
+-        const relativeFilePath = path.relative(projectRoot, filePath)
++        const relativeFilePath = toPosixPath(path.relative(projectRoot, filePath))
+ 
+         if (mergedIgnore.ignores(relativeFilePath)) continue
+ 
+@@ -189,7 +201,7 @@ function rebaseGitignorePattern(
+   const hasSlash = coreNoLead.includes('/')
+ 
+   // Build the base (where this .gitignore lives relative to projectRoot)
+-  const base = relativeDirPath.replace(/\\/g, '/') // normalize
++  const base = toPosixPath(relativeDirPath)
+ 
+   let rebased: string
+   if (anchored) {
+@@ -212,8 +224,7 @@ function rebaseGitignorePattern(
+     rebased += '/'
+   }
+ 
+-  // Normalize to forward slashes
+-  rebased = rebased.replace(/\\/g, '/')
++  rebased = toPosixPath(rebased)
+ 
+   return isNegated ? `!${rebased}` : rebased
+ }
+@@ -331,7 +342,9 @@ export async function isFileIgnored(params: {
+     defaultIgnore.add(pattern)
+   }
+ 
+-  const relativeFilePath = path.relative(resolvedProjectRoot, fullFilePath)
++  const relativeFilePath = toPosixPath(
++    path.relative(resolvedProjectRoot, fullFilePath),
++  )
+ 
+   // Get ignore patterns from the directory containing the file and all parent directories
+   const mergedIgnore = ignore.default().add(defaultIgnore)
+diff --git a/sdk/src/__tests__/glob.test.ts b/sdk/src/__tests__/glob.test.ts
+new file mode 100644
+index 000000000..0f64ff37e
+--- /dev/null
++++ b/sdk/src/__tests__/glob.test.ts
+@@ -0,0 +1,81 @@
++import { DEFAULT_MAX_FILES } from '@codebuff/common/project-file-tree'
++import { createMockFs } from '@codebuff/common/testing/mocks/filesystem'
++import { describe, expect, it } from 'bun:test'
++
++import { glob } from '../tools/glob'
++
++const ROOT = '/proj'
++
++/** Mock fs from relative paths under ROOT, inferring intermediate directories. */
++function fsWithFiles(files: string[]) {
++  const fileRecords: Record<string, string> = {}
++  const dirChildren: Record<string, Set<string>> = { [ROOT]: new Set() }
++  for (const file of files) {
++    fileRecords[`${ROOT}/${file}`] = ''
++    const segments = file.split('/')
++    let dir = ROOT
++    for (const [i, segment] of segments.entries()) {
++      ;(dirChildren[dir] ??= new Set()).add(segment)
++      if (i === segments.length - 1) break
++      dir = `${dir}/${segment}`
++    }
++  }
++  return createMockFs({
++    files: fileRecords,
++    directories: Object.fromEntries(
++      Object.entries(dirChildren).map(([dir, names]) => [dir, [...names]]),
++    ),
++  })
++}
++
++async function globCount(fs: ReturnType<typeof fsWithFiles>, pattern: string) {
++  const [output] = await glob({ pattern, projectPath: ROOT, fs })
++  return output.value as { count: number; files: string[]; message: string }
++}
++
++describe('glob', () => {
++  it('says the result is partial when the project scan hits its file cap', async () => {
++    // The scan is breadth-first and stops dead at DEFAULT_MAX_FILES, so a deep
++    // file past the cut-off is simply absent from the tree. Reporting that as a
++    // flat "Found 0 file(s)" reads as proof the file does not exist — which is
++    // exactly how a user ended up believing glob could not see .kt files.
++    const junk = Array.from(
++      { length: DEFAULT_MAX_FILES + 500 },
++      (_, i) => `app/build/chunk${Math.floor(i / 500)}/f${i}.class`,
++    )
++    const fs = fsWithFiles([
++      ...junk,
++      'app/src/main/java/com/example/ui/Inventory.kt',
++    ])
++
++    const result = await globCount(fs, '**/*.kt')
++
++    expect(result.count).toBe(0)
++    expect(result.message).toContain(`${DEFAULT_MAX_FILES}-file limit`)
++  })
++
++  it('does not warn when the whole project was scanned', async () => {
++    const fs = fsWithFiles([
++      'app/src/main/java/com/example/ui/Inventory.kt',
++      'docs/guide.md',
++    ])
++
++    const result = await globCount(fs, '**/*.kt')
++
++    expect(result.count).toBe(1)
++    expect(result.message).not.toContain('limit')
++  })
++
++  it('matches deeply nested files against a recursive pattern', async () => {
++    const fs = fsWithFiles([
++      'app/src/main/java/com/example/ui/Inventory.kt',
++      'app/src/main/java/com/example/BackendCapabilities.kt',
++      'app/src/main/res/values/strings.xml',
++      'docs/guide.md',
++    ])
++
++    expect((await globCount(fs, '**/*.kt')).count).toBe(2)
++    expect((await globCount(fs, '**/BackendCapabilities*')).count).toBe(1)
++    expect((await globCount(fs, '**/*.xml')).count).toBe(1)
++  })
++})
+diff --git a/sdk/src/tools/glob.ts b/sdk/src/tools/glob.ts
+index 8cd109342..445fbc33c 100644
+--- a/sdk/src/tools/glob.ts
++++ b/sdk/src/tools/glob.ts
+@@ -1,4 +1,5 @@
+ import {
++  DEFAULT_MAX_FILES,
+   flattenTree,
+   getProjectFileTree,
+ } from '@codebuff/common/project-file-tree'
+@@ -34,13 +35,23 @@ export async function glob(params: {
+ 
+     const matchingFiles = micromatch(allFilePaths, pattern)
+ 
++    // The scan behind this stops silently at DEFAULT_MAX_FILES, breadth-first,
++    // so on a large project the deepest directories are never visited and every
++    // pattern below the cut-off answers "0 files". Say the scan was partial
++    // instead of letting the agent read that as proof the files don't exist.
++    const truncated = flattenedNodes.length >= DEFAULT_MAX_FILES
++
+     return [
+       {
+         type: 'json',
+         value: {
+           files: matchingFiles,
+           count: matchingFiles.length,
+-          message: `Found ${matchingFiles.length} file(s) matching pattern "${pattern}"${cwd ? ` in directory "${cwd}"` : ''}`,
++          message:
++            `Found ${matchingFiles.length} file(s) matching pattern "${pattern}"${cwd ? ` in directory "${cwd}"` : ''}` +
++            (truncated
++              ? `. Warning: the project scan hit its ${DEFAULT_MAX_FILES}-file limit, so the deepest directories were not searched and this result may be incomplete. Narrow the search with cwd, or use run_terminal_command (find/dir) to check.`
++              : ''),
+         },
+       },
+     ]

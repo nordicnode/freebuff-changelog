@@ -1,0 +1,989 @@
+diff --git a/cli/src/__tests__/helpers/terminal-watchdog-fixture.ts b/cli/src/__tests__/helpers/terminal-watchdog-fixture.ts
+index 049086896..f73b8ef6a 100644
+--- a/cli/src/__tests__/helpers/terminal-watchdog-fixture.ts
++++ b/cli/src/__tests__/helpers/terminal-watchdog-fixture.ts
+@@ -6,7 +6,13 @@
+  * - mode "clean": start the watchdog, then stop it and exit (clean shutdown).
+  *
+  * Prints "ready" once the watchdog is armed so the test knows when to kill.
++ * On Windows, arming is asynchronous (a PowerShell bootstrap has to launch
++ * the real watchdog outside Bun's kill-on-close job object), so we wait for
++ * the `<ttyPath>.armed` marker before printing "ready" — killing earlier
++ * would take the bootstrap down before the watchdog exists.
+  */
++import { existsSync } from 'fs'
++
+ import {
+   startTerminalWatchdog,
+   stopTerminalWatchdog,
+@@ -19,13 +25,26 @@ if (!mode || !ttyPath) {
+   process.exit(2)
+ }
+ 
++async function waitForArmed(): Promise<void> {
++  if (process.platform !== 'win32') return
++  const deadline = Date.now() + 30_000
++  while (Date.now() < deadline) {
++    if (existsSync(`${ttyPath}.armed`)) return
++    await new Promise((r) => setTimeout(r, 50))
++  }
++  console.error('watchdog never armed')
++  process.exit(3)
++}
++
+ startTerminalWatchdog({ ttyPath })
+ 
+ if (mode === 'clean') {
++  await waitForArmed()
+   stopTerminalWatchdog()
+   console.log('ready')
+   process.exit(0)
+ }
+ 
++await waitForArmed()
+ console.log('ready')
+ setInterval(() => {}, 1_000)
+diff --git a/cli/src/__tests__/terminal-watchdog.test.ts b/cli/src/__tests__/terminal-watchdog.test.ts
+index 5f8335f70..e1cec63f3 100644
+--- a/cli/src/__tests__/terminal-watchdog.test.ts
++++ b/cli/src/__tests__/terminal-watchdog.test.ts
+@@ -31,7 +31,7 @@ function waitForReady(child: ChildProcess): Promise<void> {
+       out += chunk.toString()
+       if (out.includes('ready')) resolve()
+     })
+-    child.on('exit', () => resolve()) // "clean" mode exits immediately
++    child.on('exit', () => resolve()) // "clean" mode exits after arming
+     child.on('error', reject)
+   })
+ }
+@@ -61,9 +61,10 @@ async function pollForContent(ttyPath: string, timeoutMs: number): Promise<strin
+   return readTty(ttyPath)
+ }
+ 
+-// The watchdog is POSIX-only (sh + /dev/tty); on Windows the npm wrapper is
+-// the safety net instead.
+-describe.skipIf(process.platform === 'win32')('terminal watchdog', () => {
++// POSIX uses a detached sh blocking on pipe EOF; Windows uses a PowerShell
++// grandchild (outside Bun's kill-on-close job object) blocking on
++// Wait-Process. Both then write the reset sequences to the injected ttyPath.
++describe('terminal watchdog', () => {
+   test('writes reset sequences to the tty when the process dies uncleanly', async () => {
+     const ttyPath = join(tempDir, 'unclean.out')
+     const child = spawnFixture('hang', ttyPath)
+@@ -72,17 +73,21 @@ describe.skipIf(process.platform === 'win32')('terminal watchdog', () => {
+     child.kill('SIGKILL')
+     await waitForExit(child)
+ 
+-    const written = await pollForContent(ttyPath, 5_000)
++    // Wait-Process wakeup + write can take a few seconds under CI load.
++    const written = await pollForContent(ttyPath, 15_000)
+     expect(written).toBe(TERMINAL_RESET_SEQUENCES)
+-  }, 15_000)
++  }, 60_000)
+ 
+   test('stays silent when the process shuts down cleanly', async () => {
+     const ttyPath = join(tempDir, 'clean.out')
+     const child = spawnFixture('clean', ttyPath)
+     await waitForExit(child)
+ 
+-    // Give a killed-too-late watchdog time to (incorrectly) fire.
+-    await new Promise((r) => setTimeout(r, 500))
++    // Give a disarmed-too-late watchdog time to (incorrectly) fire. Windows
++    // gets longer since the watchdog wakes asynchronously via Wait-Process.
++    await new Promise((r) =>
++      setTimeout(r, process.platform === 'win32' ? 3_000 : 500),
++    )
+     expect(readTty(ttyPath)).toBe('')
+-  }, 15_000)
++  }, 60_000)
+ })
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index 888ea4603..eea2f09bd 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -2,6 +2,7 @@ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ import type { FeedbackCategory } from '@codebuff/common/constants/feedback'
+ import { safeOpen } from './utils/open-url'
+ import {
++  Fragment,
+   useCallback,
+   useEffect,
+   useLayoutEffect,
+@@ -13,7 +14,7 @@ import { useShallow } from 'zustand/react/shallow'
+ 
+ import { getAdsEnabled } from './commands/ads'
+ import { routeUserPrompt, addBashMessageToHistory } from './commands/router'
+-import { SingleAdBanner } from './components/ad-banner'
++import { InlineAdBanner } from './components/ad-banner'
+ import { ChatInputBar } from './components/chat-input-bar'
+ import { FreebuffActiveSessionSummary } from './components/freebuff-active-session-summary'
+ import { LoadPreviousButton } from './components/load-previous-button'
+@@ -190,11 +191,22 @@ export const Chat = ({
+   })
+   const hasSubscription = subscriptionData?.hasSubscription ?? false
+ 
+-  const { ads, recordClick, recordImpression } = useGravityAd({
++  const { placedAds, recordClick, recordImpression } = useGravityAd({
+     enabled: IS_FREEBUFF || !hasSubscription,
+     provider: 'gravity',
++    inline: true,
++    surface: 'cli_chat',
+   })
+ 
++  // Index placed ads by the message they're anchored below, so the transcript
++  // render can drop each ad in right after its anchor message.
++  const adByAnchor = useMemo(() => {
++    const map = new Map<string, (typeof placedAds)[number]>()
++    for (const placed of placedAds) map.set(placed.afterMessageId, placed)
++    return map
++  }, [placedAds])
++  const showInlineAds = IS_FREEBUFF || getAdsEnabled()
++
+   // Set initial mode from CLI flag on mount
+   useEffect(() => {
+     if (initialMode) {
+@@ -1514,14 +1526,23 @@ export const Chat = ({
+         )}
+         {visibleTopLevelMessages.map((message, idx) => {
+           const isLast = idx === visibleTopLevelMessages.length - 1
++          const anchoredAd = adByAnchor.get(message.id)
+           return (
+-            <MessageWithAgents
+-              key={message.id}
+-              message={message}
+-              depth={0}
+-              isLastMessage={isLast}
+-              availableWidth={messageAvailableWidth}
+-            />
++            <Fragment key={message.id}>
++              <MessageWithAgents
++                message={message}
++                depth={0}
++                isLastMessage={isLast}
++                availableWidth={messageAvailableWidth}
++              />
++              {showInlineAds && anchoredAd && (
++                <InlineAdBanner
++                  ad={anchoredAd.ad}
++                  onClick={recordClick}
++                  onImpression={recordImpression}
++                />
++              )}
++            </Fragment>
+           )
+         })}
+         {/* Pending bash messages as ghost messages (only show those not already in history) */}
+@@ -1563,14 +1584,6 @@ export const Chat = ({
+           />
+         )}
+ 
+-        {ads?.[0] && (IS_FREEBUFF || getAdsEnabled()) && (
+-          <SingleAdBanner
+-            ad={ads[0]}
+-            onClick={recordClick}
+-            onImpression={recordImpression}
+-          />
+-        )}
+-
+         {reviewMode ? (
+           // Review and ask_user take precedence over the session-ended banner:
+           // during the grace window the agent may still be asking to run tools
+diff --git a/cli/src/components/ad-banner.tsx b/cli/src/components/ad-banner.tsx
+index 84d401b1c..65f84d78b 100644
+--- a/cli/src/components/ad-banner.tsx
++++ b/cli/src/components/ad-banner.tsx
+@@ -161,6 +161,33 @@ export const SingleAdBanner: React.FC<{
+   )
+ }
+ 
++/**
++ * A single ad embedded inside the chat transcript, anchored below a message so
++ * it stays in scrollback. Same card as {@link SingleAdBanner} but with a bottom
++ * spacer so it reads as its own block between messages; fires its impression on
++ * mount (deduped per impUrl in the hook, so scroll churn won't double-count).
++ */
++export const InlineAdBanner: React.FC<{
++  ad: AdResponse
++  onClick?: (ad: AdResponse) => void
++  onImpression?: (ad: AdResponse) => void
++}> = ({ ad, onClick, onImpression }) => {
++  const { terminalWidth } = useTerminalDimensions()
++
++  // Full width minus left/right margin of 1 each.
++  const width = terminalWidth - 2
++
++  useEffect(() => {
++    onImpression?.(ad)
++  }, [ad, onImpression])
++
++  return (
++    <box style={{ marginLeft: 1, marginRight: 1, paddingBottom: 1 }}>
++      <AdCard ad={ad} width={width} onClick={onClick} />
++    </box>
++  )
++}
++
+ /**
+  * Up to four ads shown in a row. Still used by the freebuff landing screen,
+  * which intentionally fills the space with multiple ads.
+diff --git a/cli/src/hooks/__tests__/use-gravity-ad.test.ts b/cli/src/hooks/__tests__/use-gravity-ad.test.ts
+new file mode 100644
+index 000000000..35ea6a866
+--- /dev/null
++++ b/cli/src/hooks/__tests__/use-gravity-ad.test.ts
+@@ -0,0 +1,209 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  computeInlineAdAdditions,
++  inlineAdAnchorIds,
++  isCompletedAnswer,
++} from '../use-gravity-ad'
++
++import type { AdResponse, PlacedAd } from '../use-gravity-ad'
++import type { ChatMessage } from '../../types/chat'
++
++// Inline ads anchor to completed assistant answers: by default the first one
++// (offset 0), then every other one after it (step 2). The argument is the
++// ordered list of those answers' message ids.
++describe('inlineAdAnchorIds', () => {
++  test('places nothing before the first completed answer', () => {
++    expect(inlineAdAnchorIds([])).toEqual([])
++  })
++
++  test('places the first ad right after the first completed answer', () => {
++    expect(inlineAdAnchorIds(['a'])).toEqual(['a'])
++    expect(inlineAdAnchorIds(['a', 'b'])).toEqual(['a'])
++  })
++
++  test('then spaces one ad every other completed answer', () => {
++    expect(inlineAdAnchorIds(['a', 'b', 'c'])).toEqual(['a', 'c'])
++    expect(inlineAdAnchorIds(['a', 'b', 'c', 'd'])).toEqual(['a', 'c'])
++    expect(inlineAdAnchorIds(['a', 'b', 'c', 'd', 'e'])).toEqual(['a', 'c', 'e'])
++  })
++
++  test('honors custom pacing knobs', () => {
++    const ids = ['a', 'b', 'c', 'd', 'e']
++    // Delay the first ad and widen the spacing.
++    expect(inlineAdAnchorIds(ids, { firstOffset: 1, step: 3 })).toEqual([
++      'b',
++      'e',
++    ])
++    // An ad after every completed answer.
++    expect(inlineAdAnchorIds(ids, { step: 1 })).toEqual(ids)
++    // A non-positive step is clamped to 1 (never loops forever).
++    expect(inlineAdAnchorIds(['a', 'b'], { step: 0 })).toEqual(['a', 'b'])
++  })
++})
++
++// Only genuine streamed LLM answers (id 'ai-…', completed, top-level) anchor
++// ads — not bash echoes, system notices, mode dividers, or in-flight turns.
++describe('isCompletedAnswer', () => {
++  const msg = (over: Partial<ChatMessage>): ChatMessage => ({
++    id: 'ai-1',
++    variant: 'ai',
++    content: '',
++    timestamp: '',
++    isComplete: true,
++    ...over,
++  })
++
++  test('accepts a completed top-level streamed answer', () => {
++    expect(isCompletedAnswer(msg({}))).toBe(true)
++  })
++
++  test('rejects a still-streaming answer', () => {
++    expect(isCompletedAnswer(msg({ isComplete: false }))).toBe(false)
++  })
++
++  test('rejects bash `!command` echoes and system notices', () => {
++    expect(isCompletedAnswer(msg({ id: 'bash-result-x' }))).toBe(false)
++    expect(isCompletedAnswer(msg({ id: 'sys-1', isComplete: undefined }))).toBe(
++      false,
++    )
++  })
++
++  test('rejects non-ai variants and nested (sub-agent) messages', () => {
++    expect(isCompletedAnswer(msg({ variant: 'user' }))).toBe(false)
++    expect(isCompletedAnswer(msg({ parentId: 'ai-0' }))).toBe(false)
++  })
++})
++
++// A fake ad; only impUrl matters for identity in these assertions.
++const ad = (n: number): AdResponse => ({
++  adText: `ad ${n}`,
++  title: `title ${n}`,
++  cta: 'cta',
++  url: `https://example.com/${n}`,
++  favicon: '',
++  clickUrl: `https://example.com/click/${n}`,
++  impUrl: `imp-${n}`,
++  provider: 'gravity',
++})
++
++/** A drawAd that cycles a fixed pool, like nextFromChoiceCache does. */
++function cyclingDraw(pool: AdResponse[]): () => AdResponse | null {
++  let cursor = 0
++  return () => {
++    if (pool.length === 0) return null
++    return pool[cursor++ % pool.length]!
++  }
++}
++
++const anchors = (placed: PlacedAd[]): string[] =>
++  placed.map((p) => p.afterMessageId)
++
++describe('computeInlineAdAdditions', () => {
++  test('first ad lands right after the first completed answer', () => {
++    const additions = computeInlineAdAdditions({
++      completedAnswerIds: ['a'],
++      placedAds: [],
++      drawAd: cyclingDraw([ad(1)]),
++    })
++    expect(anchors(additions)).toEqual(['a'])
++    expect(additions[0]!.ad.impUrl).toBe('imp-1')
++  })
++
++  test('spaces ads every 2 answers across a longer transcript', () => {
++    const additions = computeInlineAdAdditions({
++      completedAnswerIds: ['a', 'b', 'c', 'd', 'e'],
++      placedAds: [],
++      drawAd: cyclingDraw([ad(1), ad(2), ad(3), ad(4)]),
++    })
++    expect(anchors(additions)).toEqual(['a', 'c', 'e'])
++  })
++
++  test('forwards custom pacing to the anchor calc', () => {
++    const additions = computeInlineAdAdditions({
++      completedAnswerIds: ['a', 'b', 'c', 'd', 'e'],
++      placedAds: [],
++      drawAd: cyclingDraw([ad(1), ad(2)]),
++      pacing: { firstOffset: 1, step: 3 },
++    })
++    expect(anchors(additions)).toEqual(['b', 'e'])
++  })
++
++  test('is idempotent across re-renders — only new anchors are added', () => {
++    const draw = cyclingDraw([ad(1), ad(2), ad(3)])
++
++    // First pass: one completed answer -> one ad at 'a'.
++    let placed = computeInlineAdAdditions({
++      completedAnswerIds: ['a'],
++      placedAds: [],
++      drawAd: draw,
++    })
++    expect(anchors(placed)).toEqual(['a'])
++
++    // Re-render with the SAME transcript adds nothing (no anchor churn).
++    expect(
++      computeInlineAdAdditions({
++        completedAnswerIds: ['a'],
++        placedAds: placed,
++        drawAd: draw,
++      }),
++    ).toEqual([])
++
++    // Transcript grows to a new spaced anchor -> only 'c' is added, 'a' stays put.
++    const next = computeInlineAdAdditions({
++      completedAnswerIds: ['a', 'b', 'c'],
++      placedAds: placed,
++      drawAd: draw,
++    })
++    expect(anchors(next)).toEqual(['c'])
++  })
++
++  test('never shows the same ad twice — stops when distinct ads run out', () => {
++    // Pool of 2 ads, 3 due anchors -> only 2 get placed, no repeat.
++    const additions = computeInlineAdAdditions({
++      completedAnswerIds: ['a', 'b', 'c', 'd', 'e'],
++      placedAds: [],
++      drawAd: cyclingDraw([ad(1), ad(2)]),
++    })
++    expect(additions.map((p) => p.ad.impUrl)).toEqual(['imp-1', 'imp-2'])
++    expect(anchors(additions)).toEqual(['a', 'c'])
++  })
++
++  test('does not reuse an ad already placed in a prior pass', () => {
++    // 'a' already holds imp-1; the only cached ad is imp-1 -> 'c' stays empty.
++    const placed: PlacedAd[] = [{ ad: ad(1), afterMessageId: 'a' }]
++    const blocked = computeInlineAdAdditions({
++      completedAnswerIds: ['a', 'b', 'c'],
++      placedAds: placed,
++      drawAd: cyclingDraw([ad(1)]),
++    })
++    expect(blocked).toEqual([])
++
++    // Once a fresh ad is cached, 'c' fills with the distinct one.
++    const filled = computeInlineAdAdditions({
++      completedAnswerIds: ['a', 'b', 'c'],
++      placedAds: placed,
++      drawAd: cyclingDraw([ad(1), ad(2)]),
++    })
++    expect(anchors(filled)).toEqual(['c'])
++    expect(filled[0]!.ad.impUrl).toBe('imp-2')
++  })
++
++  test('stops at an empty cache and fills the rest once it refills', () => {
++    // Cache empty on the first pass: nothing is placed yet.
++    const emptyPass = computeInlineAdAdditions({
++      completedAnswerIds: ['a', 'b', 'c'],
++      placedAds: [],
++      drawAd: () => null,
++    })
++    expect(emptyPass).toEqual([])
++
++    // Later pass (cache filled): both due anchors get filled.
++    const filledPass = computeInlineAdAdditions({
++      completedAnswerIds: ['a', 'b', 'c'],
++      placedAds: emptyPass,
++      drawAd: cyclingDraw([ad(1), ad(2)]),
++    })
++    expect(anchors(filledPass)).toEqual(['a', 'c'])
++  })
++})
+diff --git a/cli/src/hooks/use-gravity-ad.ts b/cli/src/hooks/use-gravity-ad.ts
+index 2fabd4a27..72f0435a7 100644
+--- a/cli/src/hooks/use-gravity-ad.ts
++++ b/cli/src/hooks/use-gravity-ad.ts
+@@ -9,8 +9,10 @@ import { getAuthToken } from '../utils/auth'
+ import { IS_FREEBUFF } from '../utils/constants'
+ import { getCliEnv } from '../utils/env'
+ import { logger } from '../utils/logger'
++import { AI_MESSAGE_ID_PREFIX } from '../utils/ai-message-id'
+ 
+ import type { Message } from '@codebuff/sdk'
++import type { ChatMessage } from '../types/chat'
+ 
+ const AD_ROTATION_INTERVAL_MS = 60 * 1000 // 60 seconds per ad
+ const MAX_ADS_AFTER_ACTIVITY = 3 // Show up to 3 ads after last activity, then pause fetching new ads
+@@ -18,6 +20,16 @@ const ACTIVITY_THRESHOLD_MS = 30_000 // 30 seconds idle threshold for fetching n
+ const MAX_AD_CACHE_SIZE = 50 // Maximum number of ads to keep in cache
+ const ZEROCLICK_IMPRESSIONS_URL = 'https://zeroclick.dev/api/v2/impressions'
+ 
++// Inline ad pacing — anchors go below *completed* assistant answers (an answer
++// is "completed" once its turn finishes, so an anchor never sits under the
++// actively-streaming last turn). Tweak these two knobs to experiment with
++// frequency:
++//   AD_FIRST_ANSWER_OFFSET — index of the first completed answer that gets an
++//     ad; 0 = right after the very first answer (most prominent).
++//   AD_STEP_EXCHANGES — completed answers between ads after that first one.
++const AD_FIRST_ANSWER_OFFSET = 0
++const AD_STEP_EXCHANGES = 2
++
+ // Ad response type (normalized shape across providers; credits added after impression)
+ export type AdResponse = {
+   adText: string
+@@ -37,12 +49,26 @@ export type AdResponse = {
+  * same normalized response shape, so the rest of the hook is provider-agnostic.
+  */
+ export type AdProvider = 'gravity' | 'carbon' | 'zeroclick'
+-// 'waiting_room' is the legacy wire name for the freebuff landing screen —
+-// the ads API maps it to placements, so the value must not change.
+-export type AdSurface = 'waiting_room'
++// Product surfaces the ads API maps to Gravity placements. 'waiting_room' is the
++// legacy wire name for the freebuff landing screen; 'cli_chat' is the inline
++// transcript ad in the coding-agent chat. Values must match the server's
++// AD_SURFACES enum, so don't rename them.
++export type AdSurface = 'waiting_room' | 'cli_chat'
++
++/**
++ * An ad pinned into the chat transcript. `afterMessageId` anchors it directly
++ * below a specific (settled) top-level message; once placed it never moves, so
++ * it stays put in scrollback and multiple can be on screen at once.
++ */
++export type PlacedAd = {
++  ad: AdResponse
++  afterMessageId: string
++}
+ 
+ export type GravityAdState = {
+   ads: AdResponse[] | null
++  /** Ads interleaved into the transcript, in placement order. */
++  placedAds: PlacedAd[]
+   isLoading: boolean
+   recordClick: (ad: AdResponse) => void
+   recordImpression: (ad: AdResponse) => void
+@@ -78,6 +104,90 @@ function nextFromChoiceCache(ctrl: GravityController): AdResponse[] | null {
+   return set
+ }
+ 
++/**
++ * A completed, streamed LLM answer — the only messages inline ads anchor to.
++ * Other top-level 'ai'-variant messages (bash `!command` echoes, system notices,
++ * mode dividers) are excluded via the `ai-` id prefix so they don't inflate the
++ * spacing cadence or get an ad below them.
++ */
++export function isCompletedAnswer(m: ChatMessage): boolean {
++  return (
++    !m.parentId &&
++    m.variant === 'ai' &&
++    !!m.isComplete &&
++    m.id.startsWith(AI_MESSAGE_ID_PREFIX)
++  )
++}
++
++/** Frequency knobs for inline ad placement; defaults from the module constants. */
++export type AdPacing = { firstOffset?: number; step?: number }
++
++/**
++ * Pure helper: given the ids of completed assistant answers in transcript order,
++ * return the ones that should get an inline ad — the answer at `firstOffset`,
++ * then every `step` answers after it.
++ */
++export function inlineAdAnchorIds(
++  completedAnswerIds: string[],
++  pacing: AdPacing = {},
++): string[] {
++  const firstOffset = pacing.firstOffset ?? AD_FIRST_ANSWER_OFFSET
++  const step = Math.max(1, pacing.step ?? AD_STEP_EXCHANGES)
++  const anchors: string[] = []
++  for (let i = firstOffset; i <= completedAnswerIds.length - 1; i += step) {
++    anchors.push(completedAnswerIds[i]!)
++  }
++  return anchors
++}
++
++/**
++ * Draw the next ad whose `impUrl` hasn't been used yet, or null if the pool is
++ * empty or every ad in it is already placed. `drawAd` cycles the pool, so seeing
++ * an `impUrl` twice means we've been through the whole pool without a fresh one.
++ */
++function drawUnusedAd(
++  drawAd: () => AdResponse | null,
++  usedImpUrls: Set<string>,
++): AdResponse | null {
++  const tried = new Set<string>()
++  for (;;) {
++    const ad = drawAd()
++    if (!ad) return null
++    if (!usedImpUrls.has(ad.impUrl)) return ad
++    if (tried.has(ad.impUrl)) return null
++    tried.add(ad.impUrl)
++  }
++}
++
++/**
++ * Pure helper: compute the inline ads to append this pass. Fills every anchor
++ * ({@link inlineAdAnchorIds}) not already in `placedAds`, drawing a *distinct*
++ * ad per new anchor via `drawAd` — the same ad is never shown twice in the
++ * transcript. Idempotent: anchors already placed are skipped, so re-running with
++ * an unchanged transcript adds nothing. Stops when no unused ad is available
++ * (empty cache, or every cached ad is already placed), leaving later anchors for
++ * a future pass once fresh ads are fetched.
++ */
++export function computeInlineAdAdditions(params: {
++  completedAnswerIds: string[]
++  placedAds: PlacedAd[]
++  drawAd: () => AdResponse | null
++  pacing?: AdPacing
++}): PlacedAd[] {
++  const { completedAnswerIds, placedAds, drawAd, pacing } = params
++  const placedAnchors = new Set(placedAds.map((p) => p.afterMessageId))
++  const usedImpUrls = new Set(placedAds.map((p) => p.ad.impUrl))
++  const additions: PlacedAd[] = []
++  for (const anchorId of inlineAdAnchorIds(completedAnswerIds, pacing)) {
++    if (placedAnchors.has(anchorId)) continue
++    const ad = drawUnusedAd(drawAd, usedImpUrls)
++    if (!ad) break
++    additions.push({ ad, afterMessageId: anchorId })
++    usedImpUrls.add(ad.impUrl)
++  }
++  return additions
++}
++
+ /**
+  * Hook for fetching and rotating Gravity ads.
+  *
+@@ -98,12 +208,21 @@ export const useGravityAd = (options?: {
+   provider?: AdProvider
+   /** Product surface requesting the ad. The server maps this to placements. */
+   surface?: AdSurface
++  /**
++   * Interleave ads into the chat transcript (spaced every few exchanges,
++   * pinned in scrollback) instead of exposing a single rotating `ads[0]` slot.
++   * When set, {@link GravityAdState.placedAds} is populated for the caller to
++   * render inline. The rotating `ads` field still drives ad fetching.
++   */
++  inline?: boolean
+ }): GravityAdState => {
+   const enabled = options?.enabled ?? true
+   const forceStart = options?.forceStart ?? false
+   const provider: AdProvider = options?.provider ?? 'gravity'
+   const surface = options?.surface
++  const inline = options?.inline ?? false
+   const [ads, setAds] = useState<AdResponse[] | null>(null)
++  const [placedAds, setPlacedAds] = useState<PlacedAd[]>([])
+   const [isLoading, setIsLoading] = useState(false)
+ 
+   // Check if terminal height is too small to show ads
+@@ -430,10 +549,46 @@ export const useGravityAd = (options?: {
+     }
+   }, [shouldStart, shouldHideAds, provider, surface])
+ 
++  // Count of completed assistant answers (a top-level 'ai' message whose turn
++  // has finished). This is the only transcript signal placement cares about — it
++  // ticks up when a turn completes, NOT on every streamed token, so subscribing
++  // to it here doesn't re-render the caller mid-stream.
++  const completedAnswerCount = useChatStore((s) => {
++    if (!inline) return 0
++    let count = 0
++    for (const m of s.messages) {
++      if (isCompletedAnswer(m)) count++
++    }
++    return count
++  })
++
++  // Anchor a new ad below completed assistant answers per the pacing knobs,
++  // drawing from the same rotation cache the slot ad cycles through. Placement is
++  // append-only and idempotent (an anchor is filled once, never moved or
++  // re-drawn), so ads stay put in scrollback. Re-runs on `ads` retry any anchor
++  // that couldn't be filled while the cache was still empty.
++  useEffect(() => {
++    if (!inline || shouldHideAds || !getAdsEnabled()) return
++
++    const completedAnswerIds = useChatStore
++      .getState()
++      .messages.filter(isCompletedAnswer)
++      .map((m) => m.id)
++
++    const additions = computeInlineAdAdditions({
++      completedAnswerIds,
++      placedAds,
++      drawAd: () => nextFromChoiceCache(ctrlRef.current)?.[0] ?? null,
++    })
++
++    if (additions.length > 0) setPlacedAds((prev) => [...prev, ...additions])
++  }, [inline, shouldHideAds, completedAnswerCount, ads, placedAds])
++
+   // Don't return ads when ads should be hidden
+   const visible = shouldStart && !shouldHideAds
+   return {
+     ads: visible ? ads : null,
++    placedAds: visible ? placedAds : [],
+     isLoading,
+     recordClick,
+     recordImpression: recordImpressionOnce,
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index be2c376ce..494acdf10 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -373,10 +373,10 @@ async function main(): Promise<void> {
+   process.on('unhandledRejection', earlyFatalHandler)
+ 
+   // Last line of defense for uncatchable deaths (SIGKILL, native crashes,
+-  // kill sweeps that also take out the npm wrapper): a detached sh process
+-  // that resets the terminal when this process disappears. Started before the
+-  // renderer begins enabling terminal modes; the clean-shutdown path
+-  // (renderer-cleanup) disarms it.
++  // kill sweeps that also take out the npm wrapper): a detached process
++  // (sh on POSIX, PowerShell on Windows) that resets the terminal when this
++  // process disappears. Started before the renderer begins enabling terminal
++  // modes; the clean-shutdown path (renderer-cleanup) disarms it.
+   startTerminalWatchdog()
+ 
+   const renderer = await createCliRenderer({
+diff --git a/cli/src/types/env.ts b/cli/src/types/env.ts
+index 78ec27c3b..baaf2ca56 100644
+--- a/cli/src/types/env.ts
++++ b/cli/src/types/env.ts
+@@ -16,6 +16,9 @@ import type {
+  * CLI-specific env vars for terminal/IDE detection and editor preferences.
+  */
+ export type CliEnv = BaseEnv & {
++  // Windows system paths
++  SystemRoot?: string
++
+   // Terminal detection (for tmux/screen passthrough)
+   TERM?: string
+   TMUX?: string
+diff --git a/cli/src/utils/ai-message-id.ts b/cli/src/utils/ai-message-id.ts
+new file mode 100644
+index 000000000..7621d9d20
+--- /dev/null
++++ b/cli/src/utils/ai-message-id.ts
+@@ -0,0 +1,12 @@
++/**
++ * Identity of streamed AI-response messages, kept in a dependency-free leaf
++ * module so lightweight consumers (e.g. the ads hook) can discriminate real LLM
++ * answers from other 'ai'-variant messages without pulling in the full
++ * send-message helper graph.
++ */
++
++/** Id prefix identifying streamed AI response shells. */
++export const AI_MESSAGE_ID_PREFIX = 'ai-'
++
++export const generateAiMessageId = (): string =>
++  `${AI_MESSAGE_ID_PREFIX}${Date.now()}-${Math.random().toString(16).slice(2)}`
+diff --git a/cli/src/utils/env.ts b/cli/src/utils/env.ts
+index a57a334c9..ecb6f4f01 100644
+--- a/cli/src/utils/env.ts
++++ b/cli/src/utils/env.ts
+@@ -16,6 +16,9 @@ import type { CliEnv } from '../types/env'
+ export const getCliEnv = (): CliEnv => ({
+   ...getBaseEnv(),
+ 
++  // Windows system paths
++  SystemRoot: process.env.SystemRoot,
++
+   // Display server detection (Linux headless check)
+   DISPLAY: process.env.DISPLAY,
+   WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY,
+diff --git a/cli/src/utils/send-message-helpers.ts b/cli/src/utils/send-message-helpers.ts
+index fa3a4d279..a0b6770c4 100644
+--- a/cli/src/utils/send-message-helpers.ts
++++ b/cli/src/utils/send-message-helpers.ts
+@@ -6,6 +6,7 @@
+ 
+ import { has } from 'lodash'
+ 
++import { AI_MESSAGE_ID_PREFIX, generateAiMessageId } from './ai-message-id'
+ import { markRunningAgentsAsCancelled } from './block-operations'
+ import { shouldHideAgent } from './constants'
+ import { formatTimestamp } from './helpers'
+@@ -53,12 +54,10 @@ export const createErrorMessage = (content: string): ChatMessage => ({
+   timestamp: formatTimestamp(),
+ })
+ 
+-/** Id prefix identifying streamed AI response shells; shared with
+- * sanitizeRestoredMessages so the two can't silently drift apart. */
+-export const AI_MESSAGE_ID_PREFIX = 'ai-'
+-
+-export const generateAiMessageId = (): string =>
+-  `${AI_MESSAGE_ID_PREFIX}${Date.now()}-${Math.random().toString(16).slice(2)}`
++// Re-exported (imported above) from a dependency-free leaf module so lightweight
++// consumers can import the id prefix without dragging in this helper graph.
++// Shared with sanitizeRestoredMessages so the two can't silently drift apart.
++export { AI_MESSAGE_ID_PREFIX, generateAiMessageId }
+ 
+ /**
+  * A restored chat may contain an AI response that was still streaming when the
+diff --git a/cli/src/utils/terminal-watchdog.ts b/cli/src/utils/terminal-watchdog.ts
+index effd703c5..63d41fd04 100644
+--- a/cli/src/utils/terminal-watchdog.ts
++++ b/cli/src/utils/terminal-watchdog.ts
+@@ -5,8 +5,9 @@
+  * The in-process handlers (renderer-cleanup.ts) cover catchable exits, and
+  * the npm wrapper resets when it outlives the binary — but neither survives
+  * `pkill -9 node`-style sweeps that take out the wrapper and binary together,
+- * and dev/direct-binary runs have no wrapper at all. This covers those:
++ * and dev/direct-binary runs have no wrapper at all. This covers those.
+  *
++ * POSIX:
+  * - We spawn a detached `/bin/sh` whose stdin is a pipe from this process.
+  *   `sh` isn't named node/bun/codebuff/freebuff, so process-name kill sweeps
+  *   miss it, and `detached` puts it in its own session so process-group kills
+@@ -21,51 +22,156 @@
+  *   synchronous), so it never fires and the normal cleanup path owns the
+  *   terminal writes.
+  *
+- * Windows has no /dev/tty or sh; there the npm wrapper remains the only
+- * safety net for uncatchable exits.
++ * Windows (closes the codebuff#843 after-exit gap, where the hosting
++ * terminal keeps sending mouse/focus VT input that the shell echoes as
++ * `^[[<35;12;7M` gibberish):
++ * - Bun/libuv put direct children in a kill-on-job-close job object, so a
++ *   plain child — detached or not — is terminated the moment we die
++ *   (oven-sh/bun#31603) and can never fire. Grandchildren of job members are
++ *   NOT added to the job (silent-breakaway semantics), so we launch a
++ *   short-lived PowerShell bootstrap (in the job; its death doesn't matter)
++ *   that uses Start-Process -NoNewWindow to spawn the real watchdog outside
++ *   the job, attached to our console.
++ * - The pipe/EOF trick can't cross the bootstrap hop, so the watchdog
++ *   detects our death with `Wait-Process -Id <our pid>` instead, then writes
++ *   the reset sequences to its console stdout (ConPTY forwards the disable
++ *   sequences to the hosting terminal).
++ * - We hold no handle to the grandchild, so clean shutdown can't kill it.
++ *   Instead stopTerminalWatchdog() synchronously drops a disarm file; the
++ *   watchdog checks it after Wait-Process and exits silently when present.
++ * - Windows PowerShell 5.1 always exists; scripts go through -EncodedCommand
++ *   (base64 UTF-16LE) so no command-line quoting can break them.
++ * - Arming takes a few hundred ms (PowerShell boot); deaths inside that
++ *   window fall back to the pre-existing behavior (npm wrapper or nothing).
+  */
+ import { spawn } from 'child_process'
+-import { closeSync, openSync } from 'fs'
++import { closeSync, openSync, writeFileSync } from 'fs'
++import os from 'os'
++import path from 'path'
+ 
+ import { TERMINAL_RESET_SEQUENCES } from './terminal-reset-sequences'
++import { getCliEnv } from './env'
+ 
+ import type { ChildProcess } from 'child_process'
+ 
+ let watchdog: ChildProcess | null = null
++let disarmFilePath: string | null = null
+ 
+ /** Reset payload with ESC as printf-compatible octal escapes. */
+ function printfPayload(): string {
+   return TERMINAL_RESET_SEQUENCES.replace(/\x1b/g, '\\033')
+ }
+ 
++function spawnPosixWatchdog(overrideFd: number | null): ChildProcess {
++  // `cat` holds until our death closes the pipe; the reset then goes to the
++  // watchdog's stdout (see stdio below). The payload contains no quotes, so
++  // embedding it in single quotes is safe.
++  const script = `cat >/dev/null 2>&1; printf '${printfPayload()}'`
++  return spawn('/bin/sh', ['-c', script, 'terminal-reset-watchdog'], {
++    detached: true,
++    stdio: ['pipe', overrideFd ?? 'inherit', 'ignore'],
++  })
++}
++
++/** Single-quote a string for PowerShell (only ' needs escaping, by doubling). */
++function psQuote(value: string): string {
++  return `'${value.replace(/'/g, "''")}'`
++}
++
++function encodePsCommand(script: string): string {
++  return Buffer.from(script, 'utf16le').toString('base64')
++}
++
++function spawnWindowsWatchdog(options: {
++  ttyPath?: string
++  disarmPath: string
++}): ChildProcess {
++  // `${e}` (explicit-brace variable expansion) keeps the sequences literal in
++  // the PowerShell double-quoted string; none of them contain `"`, backticks,
++  // or `$`. Raw ASCII bytes avoid any Console.Out encoding translation, so
++  // the reset payload arrives byte-exact.
++  const payload = TERMINAL_RESET_SEQUENCES.replace(/\x1b/g, '${e}')
++  // Tests observe a file instead of the console; production writes to the
++  // watchdog's stdout, which is the console (Start-Process -NoNewWindow
++  // without redirection leaves the grandchild on our console's handles).
++  const writeResets = options.ttyPath
++    ? `[System.IO.File]::WriteAllBytes(${psQuote(options.ttyPath)}, $b)`
++    : '$s=[Console]::OpenStandardOutput(); $s.Write($b, 0, $b.Length); $s.Flush()'
++  // The armed marker lets tests wait out the bootstrap hop before killing
++  // the fixture; production never passes ttyPath so no marker is written.
++  const armedMarker = options.ttyPath
++    ? `[System.IO.File]::WriteAllText(${psQuote(options.ttyPath + '.armed')}, 'armed'); `
++    : ''
++  const watchdogScript =
++    armedMarker +
++    `try { Wait-Process -Id ${process.pid} -ErrorAction Stop } catch {}; ` +
++    `if (Test-Path -LiteralPath ${psQuote(options.disarmPath)}) { ` +
++    `Remove-Item -LiteralPath ${psQuote(options.disarmPath)} -Force -ErrorAction SilentlyContinue ` +
++    `} else { ` +
++    `$e=[char]27; ` +
++    `$b=[System.Text.Encoding]::ASCII.GetBytes("${payload}"); ` +
++    `${writeResets} }`
++
++  // Windows PowerShell 5.1 ships with every supported Windows; use the
++  // absolute path so a broken PATH can't take out the safety net.
++  const systemRoot = getCliEnv().SystemRoot ?? 'C:\\Windows'
++  const powershell = path.join(
++    systemRoot,
++    'System32',
++    'WindowsPowerShell',
++    'v1.0',
++    'powershell.exe',
++  )
++
++  const bootstrapScript =
++    `Start-Process -FilePath ${psQuote(powershell)} ` +
++    `-ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand',` +
++    `${psQuote(encodePsCommand(watchdogScript))} -NoNewWindow`
++
++  return spawn(
++    powershell,
++    [
++      '-NoProfile',
++      '-NonInteractive',
++      '-EncodedCommand',
++      encodePsCommand(bootstrapScript),
++    ],
++    {
++      stdio: ['ignore', 'ignore', 'ignore'],
++    },
++  )
++}
++
+ /**
+  * Start the watchdog. Call once, before the TUI renderer starts enabling
+- * terminal modes. No-op on Windows, when stdout isn't a TTY (unless an
+- * explicit ttyPath is injected, e.g. in tests), or if already started.
++ * terminal modes. No-op when stdout isn't a TTY (unless an explicit ttyPath
++ * is injected, e.g. in tests), or if already started.
+  *
+- * @param options.ttyPath - Override the reset target (the watchdog's stdout
+- *   is pointed at this file instead of inheriting ours). Tests inject a
+- *   regular file here to observe what gets written.
++ * @param options.ttyPath - Override the reset target (POSIX: the watchdog's
++ *   stdout is pointed at this file; Windows: the watchdog writes the payload
++ *   to this file and drops a `<ttyPath>.armed` marker once running). Tests
++ *   inject a regular file here to observe what gets written.
+  */
+ export function startTerminalWatchdog(options?: { ttyPath?: string }): void {
+   if (watchdog) return
+-  if (process.platform === 'win32') return
+   if (!options?.ttyPath && !process.stdout.isTTY) return
+ 
+-  // `cat` holds until our death closes the pipe; the reset then goes to the
+-  // watchdog's stdout (see stdio below). The payload contains no quotes, so
+-  // embedding it in single quotes is safe.
+-  const script = `cat >/dev/null 2>&1; printf '${printfPayload()}'`
+-
+   let overrideFd: number | null = null
+   try {
+-    if (options?.ttyPath) {
+-      overrideFd = openSync(options.ttyPath, 'w')
++    let child: ChildProcess
++    if (process.platform === 'win32') {
++      const disarmPath = path.join(
++        os.tmpdir(),
++        `codebuff-watchdog-disarm-${process.pid}-${Math.random().toString(36).slice(2)}`,
++      )
++      child = spawnWindowsWatchdog({ ttyPath: options?.ttyPath, disarmPath })
++      disarmFilePath = disarmPath
++    } else {
++      if (options?.ttyPath) {
++        overrideFd = openSync(options.ttyPath, 'w')
++      }
++      child = spawnPosixWatchdog(overrideFd)
+     }
+-    const child = spawn('/bin/sh', ['-c', script, 'terminal-reset-watchdog'], {
+-      detached: true,
+-      stdio: ['pipe', overrideFd ?? 'inherit', 'ignore'],
+-    })
+     child.on('error', () => {
+       watchdog = null
+     })
+@@ -90,17 +196,31 @@ export function startTerminalWatchdog(options?: { ttyPath?: string }): void {
+ }
+ 
+ /**
+- * Kill the watchdog before it can fire. Called from the clean-shutdown path
++ * Disarm the watchdog before it can fire. Called from the clean-shutdown path
+  * (and safe to call multiple times). Synchronous, so it completes even inside
+  * a process 'exit' handler.
+  */
+ export function stopTerminalWatchdog(): void {
+   const child = watchdog
+-  if (!child) return
++  const disarm = disarmFilePath
++  if (!child && !disarm) return
+   watchdog = null
+-  try {
+-    child.kill('SIGKILL')
+-  } catch {
+-    // Already dead — nothing to stop.
++  disarmFilePath = null
++  if (disarm) {
++    // Windows: the real watchdog is a grandchild we hold no handle to; it
++    // checks for this file after our death and stays silent when present.
++    try {
++      writeFileSync(disarm, '')
++    } catch {
++      // Best-effort; worst case the watchdog writes resets on a clean exit,
++      // which the terminal treats as no-ops.
++    }
++  }
++  if (child) {
++    try {
++      child.kill('SIGKILL')
++    } catch {
++      // Already dead — nothing to stop.
++    }
+   }
+ }

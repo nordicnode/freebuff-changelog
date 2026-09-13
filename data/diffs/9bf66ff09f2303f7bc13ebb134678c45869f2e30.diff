@@ -1,0 +1,351 @@
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index e1f4bd051..cd381c472 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -1,5 +1,6 @@
+ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ import type { FeedbackCategory } from '@codebuff/common/constants/feedback'
++import { setFreeModeCapacityDeferralListener } from '@codebuff/sdk'
+ import { safeOpen } from './utils/open-url'
+ import {
+   useCallback,
+@@ -164,6 +165,7 @@ export const Chat = ({
+     setAgentMode,
+     toggleAgentMode,
+     isRetrying,
++    isCapacityWait,
+     pendingBashMessages,
+   } = useChatState()
+ 
+@@ -273,6 +275,18 @@ export const Chat = ({
+     return () => clearTimeout(timeoutId)
+   }, [messages, terminalHeight, terminalWidth, updateHeaderVisibility])
+ 
++  // Surface server capacity deferrals (free-mode tier shedding under peak
++  // demand): the SDK's retry loop absorbs the 429s silently, so without this
++  // the user just sees a longer unexplained "thinking". The stream-chunk
++  // handlers clear the flag (via setIsRetrying(false)) as soon as real
++  // output resumes.
++  useEffect(() => {
++    setFreeModeCapacityDeferralListener(() => {
++      useChatStore.getState().noteCapacityDeferral()
++    })
++    return () => setFreeModeCapacityDeferralListener(null)
++  }, [])
++
+   const localAgents = useMemo(() => loadLocalAgents(agentMode), [agentMode])
+   const inputMode = useChatStore((state) => state.inputMode)
+   const setInputMode = useChatStore((state) => state.setInputMode)
+@@ -1394,6 +1408,7 @@ export const Chat = ({
+     authStatus,
+     showReconnectionMessage,
+     isRetrying,
++    isCapacityWait,
+     isAskUserActive: askUserState !== null,
+   })
+   const hasStatusIndicatorContent = statusIndicatorState.kind !== 'idle'
+diff --git a/cli/src/components/__tests__/status-indicator.test.tsx b/cli/src/components/__tests__/status-indicator.test.tsx
+index b2f848023..1b58f6ea7 100644
+--- a/cli/src/components/__tests__/status-indicator.test.tsx
++++ b/cli/src/components/__tests__/status-indicator.test.tsx
+@@ -52,6 +52,26 @@ describe('StatusIndicator state logic', () => {
+       expect(state.kind).toBe('retrying')
+     })
+ 
++    test('returns capacityWait when the retry is a capacity deferral', () => {
++      const state = getStatusIndicatorState({
++        ...baseArgs,
++        isRetrying: true,
++        isCapacityWait: true,
++        streamStatus: 'waiting',
++      })
++      expect(state.kind).toBe('capacityWait')
++    })
++
++    test('ignores isCapacityWait unless a retry is actually in progress', () => {
++      const state = getStatusIndicatorState({
++        ...baseArgs,
++        isRetrying: false,
++        isCapacityWait: true,
++        streamStatus: 'waiting',
++      })
++      expect(state.kind).toBe('waiting')
++    })
++
+     test('returns retrying state when message send is retrying', () => {
+       const state = getStatusIndicatorState({
+         ...baseArgs,
+diff --git a/cli/src/components/status-bar.tsx b/cli/src/components/status-bar.tsx
+index 72a51c025..4ad621345 100644
+--- a/cli/src/components/status-bar.tsx
++++ b/cli/src/components/status-bar.tsx
+@@ -131,6 +131,14 @@ export const StatusBar = ({
+       case 'retrying':
+         return <ShimmerText text="retrying..." primaryColor={theme.warning} />
+ 
++      case 'capacityWait':
++        return (
++          <ShimmerText
++            text="high demand — in line, starting soon..."
++            primaryColor={theme.warning}
++          />
++        )
++
+       case 'connecting':
+         return <ShimmerText text="connecting..." />
+ 
+diff --git a/cli/src/hooks/use-chat-state.ts b/cli/src/hooks/use-chat-state.ts
+index 0e49c78c1..71d9edb38 100644
+--- a/cli/src/hooks/use-chat-state.ts
++++ b/cli/src/hooks/use-chat-state.ts
+@@ -52,6 +52,7 @@ export interface UseChatStateReturn {
+ 
+   // Retry state
+   isRetrying: boolean
++  isCapacityWait: boolean
+ 
+   // Pending bash messages
+   pendingBashMessages: PendingBashMessage[]
+@@ -85,6 +86,7 @@ export function useChatState(): UseChatStateReturn {
+     setAgentMode,
+     toggleAgentMode,
+     isRetrying,
++    isCapacityWait,
+   } = useChatStore(
+     useShallow((store) => ({
+       inputValue: store.inputValue,
+@@ -106,6 +108,7 @@ export function useChatState(): UseChatStateReturn {
+       setAgentMode: store.setAgentMode,
+       toggleAgentMode: store.toggleAgentMode,
+       isRetrying: store.isRetrying,
++      isCapacityWait: store.isCapacityWait,
+     })),
+   )
+ 
+@@ -154,6 +157,7 @@ export function useChatState(): UseChatStateReturn {
+ 
+     // Retry state
+     isRetrying,
++    isCapacityWait,
+ 
+     // Pending bash messages
+     pendingBashMessages,
+diff --git a/cli/src/state/chat-store.ts b/cli/src/state/chat-store.ts
+index 45489a335..cf5452160 100644
+--- a/cli/src/state/chat-store.ts
++++ b/cli/src/state/chat-store.ts
+@@ -73,6 +73,11 @@ export type ChatStoreState = {
+   activeTopBanner: TopBannerType
+   inputMode: InputMode
+   isRetrying: boolean
++  /** True while the current retry wait is a server capacity deferral (free
++   *  mode shed under high demand) rather than a stream recovery — the status
++   *  bar says "high demand" instead of a generic "retrying". Cleared with
++   *  isRetrying. */
++  isCapacityWait: boolean
+   askUserState: AskUserState
+   pendingAttachments: PendingAttachment[]
+   pendingBashMessages: PendingBashMessage[]
+@@ -141,6 +146,9 @@ type ChatStoreActions = {
+   closeTopBanner: () => void
+   setInputMode: (mode: InputMode) => void
+   setIsRetrying: (retrying: boolean) => void
++  /** Mark the current wait as a free-mode capacity deferral (implies
++   *  isRetrying). Cleared by setIsRetrying(false). */
++  noteCapacityDeferral: () => void
+   setAskUserState: (state: AskUserState) => void
+   updateAskUserAnswer: (questionIndex: number, optionIndex: number) => void
+   updateAskUserOtherText: (questionIndex: number, text: string) => void
+@@ -193,6 +201,7 @@ const initialState: ChatStoreState = {
+   activeTopBanner: null,
+   inputMode: 'default' as InputMode,
+   isRetrying: false,
++  isCapacityWait: false,
+   askUserState: null,
+   pendingAttachments: [],
+   pendingBashMessages: [],
+@@ -324,6 +333,15 @@ export const useChatStore = create<ChatStore>()(
+     setIsRetrying: (retrying) =>
+       set((state) => {
+         state.isRetrying = retrying
++        // Any transition (fresh generic retry, or the wait ending) supersedes
++        // a capacity flavor; only noteCapacityDeferral re-establishes it.
++        state.isCapacityWait = false
++      }),
++
++    noteCapacityDeferral: () =>
++      set((state) => {
++        state.isRetrying = true
++        state.isCapacityWait = true
+       }),
+ 
+     setAskUserState: (askUserState) =>
+@@ -511,6 +529,7 @@ export const useChatStore = create<ChatStore>()(
+         state.activeTopBanner = initialState.activeTopBanner
+         state.inputMode = initialState.inputMode
+         state.isRetrying = initialState.isRetrying
++        state.isCapacityWait = initialState.isCapacityWait
+         state.askUserState = initialState.askUserState
+         state.pendingAttachments = []
+         state.pendingBashMessages = []
+diff --git a/cli/src/utils/status-indicator-state.ts b/cli/src/utils/status-indicator-state.ts
+index 8745edba5..c4a9d8ffa 100644
+--- a/cli/src/utils/status-indicator-state.ts
++++ b/cli/src/utils/status-indicator-state.ts
+@@ -6,6 +6,7 @@ export type StatusIndicatorState =
+   | { kind: 'ctrlC' }
+   | { kind: 'connecting' }
+   | { kind: 'retrying' }
++  | { kind: 'capacityWait' }
+   | { kind: 'waiting' }
+   | { kind: 'streaming' }
+   | { kind: 'reconnected' }
+@@ -20,6 +21,11 @@ export type StatusIndicatorStateArgs = {
+   isConnected: boolean
+   authStatus?: AuthStatus
+   isRetrying?: boolean
++  /**
++   * Whether the current retry wait is a server capacity deferral (free-mode
++   * shed during peak demand). Only meaningful while isRetrying is true.
++   */
++  isCapacityWait?: boolean
+   /**
+    * Whether to show a transient "Reconnected" status message.
+    * This should only be true for a short period after a reconnection event.
+@@ -53,6 +59,7 @@ export const getStatusIndicatorState = ({
+   isConnected,
+   authStatus = 'ok',
+   isRetrying = false,
++  isCapacityWait = false,
+   showReconnectionMessage = false,
+   isAskUserActive = false,
+ }: StatusIndicatorStateArgs): StatusIndicatorState => {
+@@ -75,7 +82,7 @@ export const getStatusIndicatorState = ({
+     return { kind: 'retrying' }
+   }
+   if (isRetrying) {
+-    return { kind: 'retrying' }
++    return isCapacityWait ? { kind: 'capacityWait' } : { kind: 'retrying' }
+   }
+ 
+   // Show connecting if service is disconnected OR auth service is unreachable
+diff --git a/sdk/src/impl/model-provider.ts b/sdk/src/impl/model-provider.ts
+index 6af1d4808..37b35583d 100644
+--- a/sdk/src/impl/model-provider.ts
++++ b/sdk/src/impl/model-provider.ts
+@@ -39,6 +39,49 @@ type OpenRouterUsageAccounting = {
+   }
+ }
+ 
++/**
++ * Notification hook for free-mode capacity deferrals. When the backend sheds
++ * a free-mode completion under saturation (HTTP 429 with
++ * `error: 'free_mode_capacity_deferred'` — see the server's
++ * free-mode-priority.ts), the AI SDK's retry loop absorbs the wait silently.
++ * Hosts (the CLI) can register here to surface a "high demand" indicator
++ * instead of an unexplained pause.
++ */
++export type FreeModeCapacityDeferral = { retryAfterSeconds: number }
++
++let freeModeCapacityDeferralListener:
++  | ((deferral: FreeModeCapacityDeferral) => void)
++  | null = null
++
++export function setFreeModeCapacityDeferralListener(
++  listener: ((deferral: FreeModeCapacityDeferral) => void) | null,
++): void {
++  freeModeCapacityDeferralListener = listener
++}
++
++function notifyCapacityDeferralFromResponse(response: Response): void {
++  if (response.status !== 429 || !freeModeCapacityDeferralListener) return
++  // Clone so the AI SDK still reads the original body for its own error
++  // handling/retry. Both the parse and the listener are best-effort: a
++  // malformed body or throwing listener must never break the request path.
++  void response
++    .clone()
++    .json()
++    .then((body: unknown) => {
++      const error =
++        body && typeof body === 'object' ? (body as any).error : undefined
++      if (error !== 'free_mode_capacity_deferred') return
++      const retryAfterHeader = Number(response.headers.get('retry-after'))
++      freeModeCapacityDeferralListener?.({
++        retryAfterSeconds:
++          Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
++            ? retryAfterHeader
++            : 10,
++      })
++    })
++    .catch(() => {})
++}
++
+ /**
+  * Wrap global fetch so transient connection failures (socket closed/reset,
+  * connection refused) are rethrown as retryable APICallErrors.
+@@ -53,25 +96,31 @@ type OpenRouterUsageAccounting = {
+ function fetchWithRetryableNetworkErrors(
+   ...args: Parameters<typeof globalThis.fetch>
+ ): ReturnType<typeof globalThis.fetch> {
+-  return globalThis.fetch(...args).catch((error: unknown) => {
+-    if (isTransientNetworkError(error)) {
+-      const input = args[0]
+-      const url =
+-        typeof input === 'string'
+-          ? input
+-          : input instanceof URL
+-            ? input.toString()
+-            : input.url
+-      throw new APICallError({
+-        message: error instanceof Error ? error.message : String(error),
+-        cause: error,
+-        url,
+-        requestBodyValues: {},
+-        isRetryable: true,
+-      })
+-    }
+-    throw error
+-  })
++  return globalThis
++    .fetch(...args)
++    .then((response) => {
++      notifyCapacityDeferralFromResponse(response)
++      return response
++    })
++    .catch((error: unknown) => {
++      if (isTransientNetworkError(error)) {
++        const input = args[0]
++        const url =
++          typeof input === 'string'
++            ? input
++            : input instanceof URL
++              ? input.toString()
++              : input.url
++        throw new APICallError({
++          message: error instanceof Error ? error.message : String(error),
++          cause: error,
++          url,
++          requestBodyValues: {},
++          isRetryable: true,
++        })
++      }
++      throw error
++    })
+ }
+ 
+ /**
+diff --git a/sdk/src/index.ts b/sdk/src/index.ts
+index f2fc40650..0faa038a4 100644
+--- a/sdk/src/index.ts
++++ b/sdk/src/index.ts
+@@ -56,6 +56,10 @@ export type {
+ export { validateAgents } from './validate-agents'
+ export type { ValidationResult, ValidateAgentsOptions } from './validate-agents'
+ 
++// Free-mode capacity deferral notifications (server-side tier shedding)
++export { setFreeModeCapacityDeferralListener } from './impl/model-provider'
++export type { FreeModeCapacityDeferral } from './impl/model-provider'
++
+ // Error utilities
+ export {
+   isRetryableStatusCode,

@@ -1,0 +1,477 @@
+diff --git a/common/src/util/__tests__/db-health-alerts.test.ts b/common/src/util/__tests__/db-health-alerts.test.ts
+new file mode 100644
+index 000000000..42e126146
+--- /dev/null
++++ b/common/src/util/__tests__/db-health-alerts.test.ts
+@@ -0,0 +1,231 @@
++import { describe, expect, it } from 'bun:test'
++
++import {
++  buildPgReadAllStatsMissingText,
++  computeBusyBackendRank,
++  DEFAULT_BACKEND_XMIN_XID,
++  DEFAULT_BUSY_BACKENDS,
++  DEFAULT_STUCK_BUILD_MINUTES,
++  DEFAULT_WRAPAROUND_PCT,
++  evaluateBackendXmin,
++  evaluateBusyBackendRank,
++  evaluateInvalidIndexes,
++  evaluateWraparound,
++  toNumber,
++  WRAPAROUND_BUDGET,
++  type BusyBackendRank,
++  type InvalidIndexRow,
++  type StatementSnapshotRow,
++} from '../db-health-alerts'
++
++describe('buildPgReadAllStatsMissingText', () => {
++  it('names what is unmonitored and states the one-time grant', () => {
++    const text = buildPgReadAllStatsMissingText(
++      "pg_stat_activity hides other sessions' backend_xmin, so the " +
++        'long-lived-snapshot signal is blind',
++    )
++    expect(text).toContain('lacks pg_read_all_stats')
++    expect(text).toContain('long-lived-snapshot signal is blind')
++    expect(text).toContain('GRANT pg_read_all_stats TO manicode_scripts;')
++  })
++})
++
++describe('toNumber', () => {
++  it('coerces numeric strings and numbers', () => {
++    expect(toNumber('123')).toBe(123)
++    expect(toNumber(123)).toBe(123)
++    expect(toNumber('0')).toBe(0)
++    expect(toNumber(0)).toBe(0)
++  })
++
++  it('returns null for null, undefined, empty and non-numeric input', () => {
++    expect(toNumber(null)).toBeNull()
++    expect(toNumber(undefined)).toBeNull()
++    expect(toNumber('')).toBeNull()
++    expect(toNumber('abc')).toBeNull()
++    expect(toNumber(Number.NaN)).toBeNull()
++    expect(toNumber(Number.POSITIVE_INFINITY)).toBeNull()
++  })
++})
++
++describe('evaluateWraparound', () => {
++  it('breaches at the configured fraction of the 2^31 budget', () => {
++    // 50% of 2^31 is exactly 2^30.
++    const threshold = Math.floor(WRAPAROUND_BUDGET * DEFAULT_WRAPAROUND_PCT)
++    expect(evaluateWraparound(threshold)).toBe(true)
++    expect(evaluateWraparound(threshold - 1)).toBe(false)
++  })
++
++  it('honors a custom fraction', () => {
++    expect(evaluateWraparound(200_000_000, 0.1)).toBe(false) // 10% of 2^31 ≈ 214.7M
++    expect(evaluateWraparound(215_000_000, 0.1)).toBe(true)
++  })
++
++  it('never breaches without a measured age', () => {
++    expect(evaluateWraparound(null)).toBe(false)
++  })
++})
++
++describe('evaluateBackendXmin', () => {
++  it('breaches at the threshold, inclusive', () => {
++    expect(evaluateBackendXmin(DEFAULT_BACKEND_XMIN_XID)).toBe(true)
++    expect(evaluateBackendXmin(DEFAULT_BACKEND_XMIN_XID - 1)).toBe(false)
++  })
++
++  it('never breaches with no snapshot held', () => {
++    expect(evaluateBackendXmin(null)).toBe(false)
++  })
++})
++
++describe('evaluateInvalidIndexes', () => {
++  const row = (over: Partial<InvalidIndexRow>): InvalidIndexRow => ({
++    schema: 'public',
++    table_name: 'messages',
++    index_name: 'messages_created_at_idx',
++    indisready: true,
++    build_phase: null,
++    build_seconds: null,
++    ...over,
++  })
++
++  it('breaches on a permanently-invalid index', () => {
++    const { breach, offenders } = evaluateInvalidIndexes([row({})])
++    expect(breach).toBe(true)
++    expect(offenders[0]).toContain('public.messages.messages_created_at_idx')
++    expect(offenders[0]).toContain('not building')
++  })
++
++  it('does not breach on a fresh in-flight build', () => {
++    const { breach } = evaluateInvalidIndexes([
++      row({ build_phase: 'building index', build_seconds: 60 }),
++    ])
++    expect(breach).toBe(false)
++  })
++
++  it('breaches on a build stuck past the threshold', () => {
++    const { breach, offenders } = evaluateInvalidIndexes([
++      row({
++        build_phase: 'building index',
++        build_seconds: DEFAULT_STUCK_BUILD_MINUTES * 60 + 1,
++      }),
++    ])
++    expect(breach).toBe(true)
++    expect(offenders[0]).toContain('building 30m')
++  })
++
++  it('reports but does not page a build whose age is hidden (no pg_read_all_stats)', () => {
++    const { breach } = evaluateInvalidIndexes([
++      row({ build_phase: 'building index', build_seconds: null }),
++    ])
++    expect(breach).toBe(false)
++  })
++
++  it('is empty-safe', () => {
++    expect(evaluateInvalidIndexes([])).toEqual({ breach: false, offenders: [] })
++  })
++})
++
++describe('computeBusyBackendRank', () => {
++  const snap = (
++    rows: Array<Partial<StatementSnapshotRow>>,
++  ): StatementSnapshotRow[] =>
++    rows.map((r) => ({
++      queryid: r.queryid!,
++      calls: r.calls ?? 0,
++      total_exec_time: r.total_exec_time ?? 0,
++      query: r.query ?? '',
++    }))
++
++  it('computes busy-backend equivalents from the delta over the window', () => {
++    const before = snap([
++      { queryid: '1', calls: 100, total_exec_time: 10_000, query: 'SELECT 1' },
++    ])
++    const after = snap([
++      { queryid: '1', calls: 200, total_exec_time: 60_000, query: 'SELECT 1' },
++    ])
++    const rank = computeBusyBackendRank(before, after, 60)
++    expect(rank).toHaveLength(1)
++    // 50,000ms delta / 1000 / 60s = 0.833 busy-backend equivalents.
++    expect(rank[0].busy).toBeCloseTo(0.833, 3)
++    expect(rank[0].calls).toBe(100)
++    expect(rank[0].meanMs).toBeCloseTo(500, 3)
++  })
++
++  it('counts a query first seen in the after snapshot from zero', () => {
++    const before = snap([])
++    const after = snap([
++      { queryid: '2', calls: 10, total_exec_time: 5_000, query: 'SELECT 2' },
++    ])
++    const rank = computeBusyBackendRank(before, after, 50)
++    expect(rank).toHaveLength(1)
++    expect(rank[0].busy).toBeCloseTo(5_000 / 1000 / 50, 3)
++  })
++
++  it('drops queries that vanished between snapshots', () => {
++    const before = snap([
++      { queryid: '3', calls: 5, total_exec_time: 5_000, query: 'x' },
++    ])
++    const after = snap([])
++    expect(computeBusyBackendRank(before, after, 60)).toEqual([])
++  })
++
++  it('skips rows with no activity in the window', () => {
++    const before = snap([
++      { queryid: '4', calls: 50, total_exec_time: 5_000, query: 'x' },
++    ])
++    const after = snap([
++      { queryid: '4', calls: 50, total_exec_time: 5_000, query: 'x' },
++    ])
++    expect(computeBusyBackendRank(before, after, 60)).toEqual([])
++  })
++
++  it('sorts by busy descending', () => {
++    const before = snap([])
++    const after = snap([
++      { queryid: 'a', calls: 1, total_exec_time: 2_000, query: 'a' },
++      { queryid: 'b', calls: 1, total_exec_time: 9_000, query: 'b' },
++    ])
++    const rank = computeBusyBackendRank(before, after, 10)
++    expect(rank.map((r) => r.query)).toEqual(['b', 'a'])
++  })
++
++  it('returns an empty rank for a non-positive wall window (never Infinity)', () => {
++    const before = snap([])
++    const after = snap([
++      { queryid: 'x', calls: 1, total_exec_time: 100, query: 'x' },
++    ])
++    expect(computeBusyBackendRank(before, after, 0)).toEqual([])
++    expect(computeBusyBackendRank(before, after, -5)).toEqual([])
++  })
++
++  it('is empty-safe', () => {
++    expect(computeBusyBackendRank([], [], 60)).toEqual([])
++  })
++})
++
++describe('evaluateBusyBackendRank', () => {
++  const top = (busy: number): BusyBackendRank => ({
++    busy,
++    calls: 1,
++    meanMs: 10,
++    query: 'SELECT 1',
++  })
++
++  it('breaches when the top query holds at least the threshold', () => {
++    expect(evaluateBusyBackendRank([top(DEFAULT_BUSY_BACKENDS)]).breach).toBe(
++      true,
++    )
++    expect(
++      evaluateBusyBackendRank([top(DEFAULT_BUSY_BACKENDS - 0.01)]).breach,
++    ).toBe(false)
++  })
++
++  it('returns the top offender', () => {
++    const { top: offender } = evaluateBusyBackendRank([top(9.65)])
++    expect(offender?.busy).toBe(9.65)
++  })
++
++  it('never breaches an empty rank', () => {
++    expect(evaluateBusyBackendRank([])).toEqual({ breach: false, top: null })
++  })
++})
+diff --git a/common/src/util/db-health-alerts.ts b/common/src/util/db-health-alerts.ts
+new file mode 100644
+index 000000000..f33755fd7
+--- /dev/null
++++ b/common/src/util/db-health-alerts.ts
+@@ -0,0 +1,234 @@
++/**
++ * Shared SQL + threshold logic for the production database health alerts
++ * (docs/db-capacity-and-scaling.md §7 rec #3 and #4).
++ *
++ * The queries are plain SQL strings (not drizzle fragments) so this module
++ * stays dependency-free; the alert scripts wrap them with `sql.raw(...)`.
++ * Threshold defaults are grounded in the capacity doc's measured numbers:
++ *
++ *   - Wraparound: the doc measured `xid_age` 199.6M = 9.98% of the 2^31 budget
++ *     and called it "not urgent". DEFAULT_WRAPAROUND_PCT (50%) pages with
++ *     roughly a year of runway at today's growth, and is the standard
++ *     conservative wraparound bar.
++ *   - backend_xmin: the 2026-08-03 incident's long-lived snapshots were
++ *     1,137,687 transactions behind (normal is ~1); DEFAULT_BACKEND_XMIN_XID
++ *     (1M) sits just under that severity while far above any ordinary backend.
++ *   - Invalid index: the incident's `CREATE INDEX CONCURRENTLY` was stuck for
++ *     72 minutes; DEFAULT_STUCK_BUILD_MINUTES (30) is far above any normal
++ *     build while catching a stuck one.
++ *   - Busy-backend equivalents: the incident query held 9.65 backends (59% of
++ *     all DB execution); current total fleet load is ~4.0 (§5.5).
++ *     DEFAULT_BUSY_BACKENDS (4) pages when ONE query owns as much as the
++ *     entire fleet currently uses.
++ */
++
++export const WRAPAROUND_BUDGET = 2 ** 31
++export const DEFAULT_WRAPAROUND_PCT = 0.5
++export const DEFAULT_BACKEND_XMIN_XID = 1_000_000
++export const DEFAULT_STUCK_BUILD_MINUTES = 30
++export const DEFAULT_BUSY_BACKENDS = 4
++export const DEFAULT_SAMPLE_SECONDS = 60
++
++export interface WraparoundRow {
++  xid_age: string | number
++}
++export interface BackendXminRow {
++  oldest_xmin_age: string | number | null
++}
++export interface InvalidIndexRow {
++  schema: string
++  table_name: string
++  index_name: string
++  indisready: boolean
++  /** Non-null while a CREATE INDEX / REINDEX is actively running. */
++  build_phase: string | null
++  /** Seconds the build has run; null when not visible (no pg_read_all_stats). */
++  build_seconds: string | number | null
++}
++export interface StatementSnapshotRow {
++  queryid: string | null
++  calls: string | number
++  total_exec_time: string | number
++  query: string
++}
++export interface BusyBackendRank {
++  /** delta total_exec_time (ms) / 1000 / wall seconds. */
++  busy: number
++  calls: number
++  meanMs: number
++  query: string
++}
++
++/** The database's transaction-id age, as a fraction of the wraparound budget. */
++export function buildWraparoundSql(): string {
++  return `
++    SELECT age(datfrozenxid)::bigint AS xid_age
++    FROM pg_database
++    WHERE datname = current_database()
++  `
++}
++
++/** The oldest client backend's held snapshot, in transactions. */
++export function buildBackendXminSql(): string {
++  return `
++    SELECT max(age(backend_xmin))::bigint AS oldest_xmin_age
++    FROM pg_stat_activity
++    WHERE backend_type = 'client backend'
++      AND backend_xmin IS NOT NULL
++  `
++}
++
++/**
++ * User indexes with `indisvalid = false`, joined to build progress so a
++ * legitimate in-flight CREATE INDEX CONCURRENTLY is distinguishable from a
++ * permanently broken index.
++ */
++export function buildInvalidIndexesSql(): string {
++  return `
++    SELECT
++      n.nspname                                          AS schema,
++      c.relname                                          AS table_name,
++      i.relname                                          AS index_name,
++      ix.indisready,
++      p.phase                                            AS build_phase,
++      extract(epoch FROM (now() - a.query_start))        AS build_seconds
++    FROM pg_index ix
++    JOIN pg_class i ON i.oid = ix.indexrelid
++    JOIN pg_class c ON c.oid = ix.indrelid
++    JOIN pg_namespace n ON n.oid = c.relnamespace
++    LEFT JOIN pg_stat_progress_create_index p ON p.index_relid = ix.indexrelid
++    LEFT JOIN pg_stat_activity a ON a.pid = p.pid
++    WHERE ix.indisvalid = false
++      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
++    ORDER BY n.nspname, c.relname, i.relname
++  `
++}
++
++/** One pg_stat_statements snapshot for the current database, by queryid. */
++export function buildStatementSnapshotSql(): string {
++  return `
++    SELECT
++      s.queryid::text                           AS queryid,
++      s.calls::bigint                           AS calls,
++      s.total_exec_time::double precision       AS total_exec_time,
++      left(regexp_replace(s.query, '\\s+', ' ', 'g'), 200) AS query
++    FROM pg_stat_statements s
++    JOIN pg_database d ON d.oid = s.dbid AND d.datname = current_database()
++    WHERE s.queryid IS NOT NULL
++  `
++}
++
++/**
++ * Whether the connecting role can see fleet-wide stats. Without
++ * `pg_read_all_stats`, pg_stat_statements shows only the role's OWN statements
++ * and pg_stat_activity hides other sessions' `backend_xmin`/`query_start`, so
++ * both the busy-backend rank (rec #4) and the long-lived-snapshot signal (rec
++ * #3) are uncomputable — and would silently read "all clear".
++ */
++export function buildPgReadAllStatsProbeSql(): string {
++  return `
++    SELECT pg_has_role(current_user, 'pg_read_all_stats', 'USAGE') AS has_read_all_stats
++  `
++}
++
++/**
++ * The broken-run text for when the scripts role lacks `pg_read_all_stats`,
++ * shared by both DB alerts so the one-time grant is stated identically.
++ * `unmonitored` names what the missing grant makes invisible (the signal that
++ * would otherwise silently read "all clear").
++ */
++export function buildPgReadAllStatsMissingText(unmonitored: string): string {
++  return (
++    `the scripts role lacks pg_read_all_stats, so ${unmonitored}. ` +
++    `Grant it once on prod: GRANT pg_read_all_stats TO manicode_scripts;`
++  )
++}
++
++/** Coerce a Postgres-returned number-or-string (or null/undefined) to number. */
++export function toNumber(v: string | number | null | undefined): number | null {
++  if (v === null || v === undefined || v === '') return null
++  const n = Number(v)
++  return Number.isFinite(n) ? n : null
++}
++
++/** Breach when the database's xid age is at least `pct` of the 2^31 budget. */
++export function evaluateWraparound(
++  xidAge: number | null,
++  pct = DEFAULT_WRAPAROUND_PCT,
++): boolean {
++  return xidAge !== null && xidAge >= WRAPAROUND_BUDGET * pct
++}
++
++/** Breach when the oldest held backend_xmin snapshot is >= `threshold` xids. */
++export function evaluateBackendXmin(
++  oldestXminAge: number | null,
++  threshold = DEFAULT_BACKEND_XMIN_XID,
++): boolean {
++  return oldestXminAge !== null && oldestXminAge >= threshold
++}
++
++/**
++ * Which invalid indexes are a breach. A permanently-invalid index (not
++ * building) is never OK. A building index pages only once it has been stuck
++ * for `stuckMinutes`; a building index whose age we cannot see (query_start
++ * hidden without pg_read_all_stats) is treated as in-progress and reported,
++ * not paged.
++ */
++export function evaluateInvalidIndexes(
++  rows: InvalidIndexRow[],
++  stuckMinutes = DEFAULT_STUCK_BUILD_MINUTES,
++): { breach: boolean; offenders: string[] } {
++  const offenders: string[] = []
++  for (const row of rows) {
++    const building = row.build_phase !== null
++    const buildSeconds = toNumber(row.build_seconds)
++    const stuck =
++      building && buildSeconds !== null && buildSeconds >= stuckMinutes * 60
++    if (!building || stuck) {
++      const where = building
++        ? `building ${Math.round((buildSeconds ?? 0) / 60)}m`
++        : 'not building'
++      offenders.push(
++        `${row.schema}.${row.table_name}.${row.index_name} (${where}, indisready=${row.indisready})`,
++      )
++    }
++  }
++  return { breach: offenders.length > 0, offenders }
++}
++
++/**
++ * Busy-backend equivalents per query: delta `total_exec_time` over the
++ * wall-clock window, the metric that found the 2026-08-03 incident (§3).
++ * Mirrors the ad-hoc recipe in scripts/logs/_adhoc-pgdelta.ts.
++ */
++export function computeBusyBackendRank(
++  before: StatementSnapshotRow[],
++  after: StatementSnapshotRow[],
++  wallSeconds: number,
++): BusyBackendRank[] {
++  if (wallSeconds <= 0) return []
++  const beforeById = new Map(before.map((r) => [r.queryid, r]))
++  const out: BusyBackendRank[] = []
++  for (const nb of after) {
++    const na = beforeById.get(nb.queryid)
++    const dc = Number(nb.calls) - Number(na?.calls ?? 0)
++    const dt = Number(nb.total_exec_time) - Number(na?.total_exec_time ?? 0)
++    if (dc <= 0 && dt <= 0) continue
++    out.push({
++      busy: dt / 1000 / wallSeconds,
++      calls: dc,
++      meanMs: dc > 0 ? dt / dc : 0,
++      query: nb.query,
++    })
++  }
++  return out.sort((a, b) => b.busy - a.busy)
++}
++
++/** Breach when the top query holds at least `threshold` busy-backend equivalents. */
++export function evaluateBusyBackendRank(
++  rank: BusyBackendRank[],
++  threshold = DEFAULT_BUSY_BACKENDS,
++): { breach: boolean; top: BusyBackendRank | null } {
++  const top = rank[0] ?? null
++  return { breach: top !== null && top.busy >= threshold, top }
++}

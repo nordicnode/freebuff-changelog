@@ -1,0 +1,152 @@
+diff --git a/cli/src/hooks/use-gravity-ad.ts b/cli/src/hooks/use-gravity-ad.ts
+index c6e02b70b..fe9819514 100644
+--- a/cli/src/hooks/use-gravity-ad.ts
++++ b/cli/src/hooks/use-gravity-ad.ts
+@@ -1,4 +1,5 @@
+ import { WEBSITE_URL } from '@codebuff/sdk'
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ import { useEffect, useRef, useState } from 'react'
+ 
+ import { useTerminalLayout } from './use-terminal-layout'
+@@ -10,8 +11,10 @@ import { IS_FREEBUFF } from '../utils/constants'
+ import { getCliEnv } from '../utils/env'
+ import { logger } from '../utils/logger'
+ import { AI_MESSAGE_ID_PREFIX } from '../utils/ai-message-id'
++import { trackEvent } from '../utils/analytics'
+ import {
+   createLazyResponseAdQueue,
++  MAX_RESPONSE_AD_POOL_SIZE,
+   requestLazyResponseAds,
+ } from '../utils/lazy-response-ads'
+ 
+@@ -71,6 +74,7 @@ type GravityController = {
+   adsShownSinceActivity: number
+   tickInFlight: boolean
+   inlineQueue: ReturnType<typeof createLazyResponseAdQueue<AdResponse>>
++  eligibleSlotCounts: Map<string, number>
+ }
+ 
+ // Pure helper: add an ad set to the cache
+@@ -118,6 +122,18 @@ export function claimAdImpression(
+   return true
+ }
+ 
++function trackInlineAdEvent(
++  event: AnalyticsEvent,
++  properties: Record<string, unknown>,
++): void {
++  try {
++    trackEvent(event, properties)
++  } catch (error) {
++    // Telemetry must never interfere with fetching or rendering an ad.
++    logger.debug({ error, event }, '[ads] Failed to track inline ad event')
++  }
++}
++
+ type GravityAdOptionsBase = {
+   enabled?: boolean
+   /** Skip the "wait for first user message" gate. Used by the freebuff
+@@ -191,6 +207,7 @@ export const useGravityAd = (options?: GravityAdOptions): GravityAdState => {
+     adsShownSinceActivity: 0,
+     tickInFlight: false,
+     inlineQueue: createLazyResponseAdQueue<AdResponse>(),
++    eligibleSlotCounts: new Map(),
+   })
+ 
+   // Ref for the tick function (avoids useCallback dependency issues)
+@@ -519,6 +536,34 @@ export const useGravityAd = (options?: GravityAdOptions): GravityAdState => {
+     }
+ 
+     const ctrl = ctrlRef.current
++    const previousEligibleCount = ctrl.eligibleSlotCounts.get(messageId) ?? 0
++    if (count > previousEligibleCount) {
++      ctrl.eligibleSlotCounts.set(messageId, count)
++      const telemetryProperties = {
++        response_id: messageId,
++        chat_session_id: useChatStore.getState().chatSessionId,
++        eligible_slot_count: count,
++        pool_size: MAX_RESPONSE_AD_POOL_SIZE,
++        provider,
++        surface,
++        placement_id: inlinePlacementId,
++        is_freebuff: IS_FREEBUFF,
++      }
++      trackInlineAdEvent(
++        AnalyticsEvent.CLI_INLINE_AD_SLOT_ELIGIBLE,
++        telemetryProperties,
++      )
++
++      if (
++        count > MAX_RESPONSE_AD_POOL_SIZE &&
++        previousEligibleCount <= MAX_RESPONSE_AD_POOL_SIZE
++      ) {
++        trackInlineAdEvent(
++          AnalyticsEvent.CLI_INLINE_AD_POOL_REUSED,
++          telemetryProperties,
++        )
++      }
++    }
+ 
+     void requestLazyResponseAds({
+       queue: ctrl.inlineQueue,
+diff --git a/common/src/constants/analytics-events.ts b/common/src/constants/analytics-events.ts
+index 1cf985c20..2da7a12a3 100644
+--- a/common/src/constants/analytics-events.ts
++++ b/common/src/constants/analytics-events.ts
+@@ -48,6 +48,12 @@ export enum AnalyticsEvent {
+   FOLLOWUP_CLICKED = 'cli.followup_clicked',
+   SUGGESTED_PROMPT_SHOWN = 'cli.suggested_prompt_shown',
+   SUGGESTED_PROMPT_CLICKED = 'cli.suggested_prompt_clicked',
++  // Sampled per eligible transcript slot; use response_id to recover the
++  // response-length distribution without ingesting every user's full stream.
++  CLI_INLINE_AD_SLOT_ELIGIBLE = 'cli.inline_ad_slot_eligible',
++  // Emitted once when a response needs a fifth slot and starts reusing its
++  // four-ad pool.
++  CLI_INLINE_AD_POOL_REUSED = 'cli.inline_ad_pool_reused',
+ 
+   // Backend
+   AGENT_STEP = 'backend.agent_step',
+@@ -172,6 +178,8 @@ export enum AnalyticsEvent {
+ 
+   // Web - Ads API
+   ADS_API_AUTH_ERROR = 'api.ads_auth_error',
++  ADS_FETCH_COMPLETED = 'ads.fetch_completed',
++  ADS_IMPRESSION_RECORDED = 'ads.impression_recorded',
+   ADS_CLICKED = 'ads.clicked',
+ 
+   // Web - Token Count API
+diff --git a/common/src/util/__tests__/analytics-sampling.test.ts b/common/src/util/__tests__/analytics-sampling.test.ts
+index 9fcb8fc6c..190471ccd 100644
+--- a/common/src/util/__tests__/analytics-sampling.test.ts
++++ b/common/src/util/__tests__/analytics-sampling.test.ts
+@@ -73,6 +73,18 @@ describe('analytics sampling', () => {
+     expect(typeof otherEvent).toBe('boolean')
+   })
+ 
++  it('samples inline ad slot demand instead of ingesting every slot', () => {
++    const decisions = Array.from({ length: 1_000 }, (_, i) =>
++      shouldTrackAnalyticsEvent({
++        event: AnalyticsEvent.CLI_INLINE_AD_SLOT_ELIGIBLE,
++        distinctId: `inline-ad-user-${i}`,
++      }),
++    )
++
++    expect(decisions).toContain(true)
++    expect(decisions).toContain(false)
++  })
++
+   it('honors full telemetry env flags and allowlists', () => {
+     process.env.CODEBUFF_FULL_TELEMETRY = 'true'
+     expect(
+diff --git a/common/src/util/analytics-sampling.ts b/common/src/util/analytics-sampling.ts
+index d2b6d4368..1a985c299 100644
+--- a/common/src/util/analytics-sampling.ts
++++ b/common/src/util/analytics-sampling.ts
+@@ -8,6 +8,7 @@ const SAMPLED_EVENT_RATES: Partial<Record<AnalyticsEvent, number>> = {
+   [AnalyticsEvent.CLI_LOG]: DEFAULT_SAMPLED_RATE,
+   [AnalyticsEvent.FEEDBACK_BUTTON_HOVERED]: DEFAULT_SAMPLED_RATE,
+   [AnalyticsEvent.FOLLOWUP_CLICKED]: DEFAULT_SAMPLED_RATE,
++  [AnalyticsEvent.CLI_INLINE_AD_SLOT_ELIGIBLE]: DEFAULT_SAMPLED_RATE,
+   [AnalyticsEvent.SLASH_COMMAND_USED]: DEFAULT_SAMPLED_RATE,
+   [AnalyticsEvent.SLASH_MENU_ACTIVATED]: DEFAULT_SAMPLED_RATE,
+   [AnalyticsEvent.TOOL_USE]: DEFAULT_SAMPLED_RATE,

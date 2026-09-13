@@ -1,0 +1,1143 @@
+diff --git a/cli/src/utils/sdk-event-handlers.ts b/cli/src/utils/sdk-event-handlers.ts
+index eb00c98c8..e0ee5d582 100644
+--- a/cli/src/utils/sdk-event-handlers.ts
++++ b/cli/src/utils/sdk-event-handlers.ts
+@@ -34,6 +34,7 @@ import type { StreamStatus } from '../hooks/use-message-queue'
+ import type { ContentBlock, ToolContentBlock } from '../types/chat'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type {
++  PrintModeError,
+   PrintModeEvent as SDKEvent,
+   PrintModeFinish,
+   PrintModeSubagentFinish,
+@@ -116,7 +117,6 @@ const ensureStreaming = (state: EventHandlerState) => {
+   if (!state.message.hasReceivedContentRef.current) {
+     state.message.hasReceivedContentRef.current = true
+     state.streaming.setStreamStatus('streaming')
+-    state.setIsRetrying(false)
+   }
+ }
+ 
+@@ -491,6 +491,20 @@ const handleFinish = (state: EventHandlerState, event: PrintModeFinish) => {
+   }
+ }
+ 
++const handleStreamError = (state: EventHandlerState, event: PrintModeError) => {
++  if (!event.source) {
++    // Sourceless error chunks already surface to the model as inline
++    // tool-error messages; the UI intentionally stays quiet about them.
++    return
++  }
++  // A `source` means an auto-recovered stream ending (connection cut, or
++  // output budget burned on reasoning): the agent loop is taking another
++  // step to continue. Show the transient retrying status; the next content
++  // chunk (or run completion) clears it.
++  state.logger.warn({ event }, 'Stream recovery; agent loop is retrying')
++  state.setIsRetrying(true)
++}
++
+ export const createStreamChunkHandler =
+   (state: EventHandlerState) => (event: StreamChunkEvent) => {
+     if (state.isActive?.() === false) return
+@@ -512,6 +526,11 @@ export const createStreamChunkHandler =
+     }
+ 
+     ensureStreaming(state)
++    // Content is flowing (again) — clear any stream-interrupted retry status.
++    // Terminal paths (run completion, error, abort) already reset it in
++    // use-send-message/send-message, so the indicator can't outlive its run.
++    // (No-op when already false: the immer store returns the same state.)
++    state.setIsRetrying(false)
+ 
+     if (destination.type === 'root') {
+       if (destination.textType === 'text') {
+@@ -542,5 +561,6 @@ export const createEventHandler =
+       .with({ type: 'tool_call' }, (e) => handleToolCall(state, e))
+       .with({ type: 'tool_result' }, (e) => handleToolResult(state, e))
+       .with({ type: 'finish' }, (e) => handleFinish(state, e))
++      .with({ type: 'error' }, (e) => handleStreamError(state, e))
+       .otherwise(() => undefined)
+   }
+diff --git a/common/src/types/contracts/llm.ts b/common/src/types/contracts/llm.ts
+index 11c5a5ba0..48ae56b09 100644
+--- a/common/src/types/contracts/llm.ts
++++ b/common/src/types/contracts/llm.ts
+@@ -9,6 +9,14 @@ import type { PromptResult } from '../../util/error'
+ import type { generateText, streamText, ToolCallPart } from 'ai'
+ import type z from 'zod/v4'
+ 
++/** Auto-recovered stream endings (see sdk/src/impl/stream-interruption.ts):
++ *  - 'stream-interrupted': the stream ended without a finish marker
++ *    (connection cut mid-response — a server deploy or network drop).
++ *  - 'output-limit': the stream finished with reason 'length' having produced
++ *    only reasoning — the model burned its output budget thinking and never
++ *    answered. */
++export type StreamRecoverySource = 'stream-interrupted' | 'output-limit'
++
+ export type StreamChunk =
+   | {
+       type: 'text'
+@@ -23,7 +31,15 @@ export type StreamChunk =
+       ToolCallPart,
+       'type' | 'toolCallId' | 'toolName' | 'input' | 'providerOptions'
+     >
+-  | { type: 'error'; message: string }
++  | {
++      type: 'error'
++      message: string
++      /** When set, this is an auto-recovered stream ending rather than a
++       *  failure: consumers force another agent step so the model can
++       *  continue, instead of wrapping the message as a tool-call failure and
++       *  instead of the turn silently ending. */
++      source?: StreamRecoverySource
++    }
+ 
+ export type CacheDebugUsageData = {
+   inputTokens: number
+diff --git a/common/src/types/print-mode.ts b/common/src/types/print-mode.ts
+index 5fa335d0e..38d2665e0 100644
+--- a/common/src/types/print-mode.ts
++++ b/common/src/types/print-mode.ts
+@@ -12,6 +12,11 @@ export type PrintModeStart = z.infer<typeof printModeStartSchema>
+ export const printModeErrorSchema = z.object({
+   type: z.literal('error'),
+   message: z.string(),
++  /** Auto-recovered stream endings ('stream-interrupted': connection cut
++   *  mid-response; 'output-limit': output budget burned on reasoning with no
++   *  answer). The agent loop is automatically taking another step; UIs show a
++   *  transient retrying indicator rather than a failure. */
++  source: z.enum(['stream-interrupted', 'output-limit']).optional(),
+ })
+ export type PrintModeError = z.infer<typeof printModeErrorSchema>
+ 
+diff --git a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+index 3ff33da6c..7095bdbf9 100644
+--- a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
++++ b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+@@ -25,6 +25,13 @@ import { z } from 'zod/v4'
+ 
+ import { loopAgentSteps } from '../run-agent-step'
+ import { clearAgentGeneratorCache } from '../run-programmatic-step'
++import {
++  MAX_CONSECUTIVE_STREAM_RECOVERIES,
++  OUTPUT_LIMIT_TAG,
++  REPEATED_OUTPUT_LIMIT_MESSAGE,
++  REPEATED_STREAM_INTERRUPTIONS_MESSAGE,
++  STREAM_INTERRUPTED_TAG,
++} from '../tools/stream-parser'
+ import { createToolCallChunk, mockFileContext } from './test-utils'
+ 
+ import type { AgentTemplate } from '../templates/types'
+@@ -1216,4 +1223,114 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+       expect(result.agentState).toBeDefined()
+     })
+   })
++
++  describe('stream interruptions', () => {
++    it('retries after a stream interruption and completes the turn', async () => {
++      let callCount = 0
++      loopAgentStepsBaseParams.promptAiSdkStream = async function* () {
++        callCount++
++        if (callCount === 1) {
++          // A stream cut mid-response: partial text, then the interruption
++          // chunk promptAiSdkStream yields when no finish marker arrived.
++          yield { type: 'text' as const, text: 'partial answer that got cut ' }
++          yield {
++            type: 'error' as const,
++            source: 'stream-interrupted' as const,
++            message: 'The connection dropped while the response was streaming.',
++          }
++          return promptSuccess('interrupted-message-id')
++        }
++        yield { type: 'text' as const, text: 'complete answer' }
++        yield createToolCallChunk('end_turn', {})
++        return promptSuccess('complete-message-id')
++      }
++
++      const result = await loopAgentSteps(loopAgentStepsBaseParams)
++
++      // The interruption forced a second step (the retry), which completed.
++      expect(callCount).toBe(2)
++      expect(result.output?.type).not.toBe('error')
++
++      const notes = result.agentState.messageHistory.filter(
++        (m) => m.role === 'user' && m.tags?.includes(STREAM_INTERRUPTED_TAG),
++      )
++      expect(notes).toHaveLength(1)
++    })
++
++    it('gives up with a clear error when every attempt is interrupted', async () => {
++      let callCount = 0
++      loopAgentStepsBaseParams.promptAiSdkStream = async function* () {
++        callCount++
++        yield {
++          type: 'error' as const,
++          source: 'stream-interrupted' as const,
++          message: 'The connection dropped while the response was streaming.',
++        }
++        return promptSuccess(`interrupted-${callCount}`)
++      }
++
++      const result = await loopAgentSteps(loopAgentStepsBaseParams)
++
++      expect(result.output?.type).toBe('error')
++      expect((result.output as { message?: string }).message).toContain(
++        REPEATED_STREAM_INTERRUPTIONS_MESSAGE,
++      )
++      // The retried interruptions, plus the final attempt that trips the cap
++      // instead of retrying forever (well under maxAgentSteps).
++      expect(callCount).toBe(MAX_CONSECUTIVE_STREAM_RECOVERIES + 1)
++    })
++
++    it('retries after an output-limit thinking overrun and completes the turn', async () => {
++      let callCount = 0
++      loopAgentStepsBaseParams.promptAiSdkStream = async function* () {
++        callCount++
++        if (callCount === 1) {
++          // The model burned its output budget on reasoning: only reasoning
++          // chunks, then the output-limit chunk promptAiSdkStream yields for
++          // a 'length' finish with no content or tool calls.
++          yield { type: 'reasoning' as const, text: 'thinking forever ' }
++          yield {
++            type: 'error' as const,
++            source: 'output-limit' as const,
++            message: 'The response hit its output token limit while reasoning.',
++          }
++          return promptSuccess('limited-message-id')
++        }
++        yield { type: 'text' as const, text: 'concise answer' }
++        yield createToolCallChunk('end_turn', {})
++        return promptSuccess('complete-message-id')
++      }
++
++      const result = await loopAgentSteps(loopAgentStepsBaseParams)
++
++      expect(callCount).toBe(2)
++      expect(result.output?.type).not.toBe('error')
++
++      const notes = result.agentState.messageHistory.filter(
++        (m) => m.role === 'user' && m.tags?.includes(OUTPUT_LIMIT_TAG),
++      )
++      expect(notes).toHaveLength(1)
++    })
++
++    it('gives up with the output-limit message when every attempt overruns', async () => {
++      let callCount = 0
++      loopAgentStepsBaseParams.promptAiSdkStream = async function* () {
++        callCount++
++        yield {
++          type: 'error' as const,
++          source: 'output-limit' as const,
++          message: 'The response hit its output token limit while reasoning.',
++        }
++        return promptSuccess(`limited-${callCount}`)
++      }
++
++      const result = await loopAgentSteps(loopAgentStepsBaseParams)
++
++      expect(result.output?.type).toBe('error')
++      expect((result.output as { message?: string }).message).toContain(
++        REPEATED_OUTPUT_LIMIT_MESSAGE,
++      )
++      expect(callCount).toBe(MAX_CONSECUTIVE_STREAM_RECOVERIES + 1)
++    })
++  })
+ })
+diff --git a/packages/agent-runtime/src/__tests__/stream-parser-interrupted.test.ts b/packages/agent-runtime/src/__tests__/stream-parser-interrupted.test.ts
+new file mode 100644
+index 000000000..b3cec9b98
+--- /dev/null
++++ b/packages/agent-runtime/src/__tests__/stream-parser-interrupted.test.ts
+@@ -0,0 +1,255 @@
++import { TEST_AGENT_RUNTIME_IMPL } from '@codebuff/common/testing/impl/agent-runtime'
++import { getInitialSessionState } from '@codebuff/common/types/session-state'
++import { beforeEach, describe, expect, it } from 'bun:test'
++
++import { assistantMessage, userMessage } from '@codebuff/common/util/messages'
++
++import { mockFileContext } from './test-utils'
++import {
++  countTrailingStreamRecoveryNotes,
++  MAX_CONSECUTIVE_STREAM_RECOVERIES,
++  OUTPUT_LIMIT_TAG,
++  processStream,
++  REPEATED_OUTPUT_LIMIT_MESSAGE,
++  REPEATED_STREAM_INTERRUPTIONS_MESSAGE,
++  STREAM_INTERRUPTED_TAG,
++} from '../tools/stream-parser'
++
++import type { AgentTemplate } from '../templates/types'
++import type {
++  AgentRuntimeDeps,
++  AgentRuntimeScopedDeps,
++} from '@codebuff/common/types/contracts/agent-runtime'
++import type { StreamChunk } from '@codebuff/common/types/contracts/llm'
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++import type { PromptResult } from '@codebuff/common/util/error'
++
++describe('stream parser interrupted streams', () => {
++  let agentRuntimeImpl: AgentRuntimeDeps & AgentRuntimeScopedDeps
++
++  beforeEach(() => {
++    agentRuntimeImpl = { ...TEST_AGENT_RUNTIME_IMPL, sendAction: () => {} }
++  })
++
++  const testAgentTemplate: AgentTemplate = {
++    id: 'test-agent',
++    displayName: 'Test Agent',
++    spawnerPrompt: 'Test agent',
++    model: 'claude-3-5-sonnet-20241022',
++    inputSchema: {},
++    outputMode: 'structured_output',
++    includeMessageHistory: true,
++    inheritParentSystemPrompt: false,
++    mcpServers: {},
++    toolNames: ['read_files', 'end_turn'],
++    spawnableAgents: [],
++    systemPrompt: 'Test system prompt',
++    instructionsPrompt: 'Test instructions',
++    stepPrompt: 'Test step prompt',
++  }
++
++  async function runStream(
++    stream: AsyncGenerator<StreamChunk, PromptResult<string | null>>,
++    initialHistory: Message[] = [],
++  ) {
++    const abortController = new AbortController()
++    const sessionState = getInitialSessionState(mockFileContext)
++    const agentState = sessionState.mainAgentState
++    agentState.messageHistory = [...initialHistory]
++
++    const result = await processStream({
++      ...agentRuntimeImpl,
++      agentContext: {},
++      agentState,
++      agentStepId: 'test-step-id',
++      agentTemplate: testAgentTemplate,
++      ancestorRunIds: [],
++      clientSessionId: 'test-session',
++      fileContext: mockFileContext,
++      fingerprintId: 'test-fingerprint',
++      fullResponse: '',
++      localAgentTemplates: { 'test-agent': testAgentTemplate },
++      messages: [],
++      prompt: 'test prompt',
++      repoId: undefined,
++      repoUrl: undefined,
++      runId: 'test-run-id',
++      signal: abortController.signal,
++      stream,
++      system: 'test system',
++      tools: {},
++      userId: 'test-user',
++      userInputId: 'test-input-id',
++      onCostCalculated: async () => {},
++      onResponseChunk: () => {},
++    })
++
++    return { result, messageHistory: agentState.messageHistory as Message[] }
++  }
++
++  it('records the interruption note and forces another step', async () => {
++    // A stream cut mid-response: partial text, then the interruption chunk
++    // promptAiSdkStream yields when the finish marker never arrived.
++    async function* interruptedStream(): AsyncGenerator<
++      StreamChunk,
++      PromptResult<string | null>
++    > {
++      yield { type: 'text' as const, text: 'The reviewer flagged two unused ' }
++      yield {
++        type: 'error' as const,
++        source: 'stream-interrupted' as const,
++        message: 'The connection dropped while the response was streaming.',
++      }
++      return { aborted: false, value: 'msg-id' }
++    }
++
++    const { result, messageHistory } = await runStream(interruptedStream())
++
++    // hadToolCallError forces run-agent-step to take another step — the retry.
++    expect(result.hadToolCallError).toBe(true)
++
++    const interruptionNotes = messageHistory.filter(
++      (m) => m.role === 'user' && m.tags?.includes('STREAM_INTERRUPTED'),
++    )
++    expect(interruptionNotes).toHaveLength(1)
++    const noteContent = interruptionNotes[0]!.content
++    expect(JSON.stringify(noteContent)).toContain('connection dropped')
++    // Not wrapped in the misleading tool-call-failure phrasing.
++    expect(JSON.stringify(noteContent)).not.toContain('Error during tool call')
++
++    // The partial text stays in history so the model can continue from it.
++    expect(result.fullResponse).toBe('The reviewer flagged two unused ')
++  })
++
++  it('records an output-limit note with its own tag and forces another step', async () => {
++    async function* outputLimitStream(): AsyncGenerator<
++      StreamChunk,
++      PromptResult<string | null>
++    > {
++      // Reasoning only, then the output-limit chunk promptAiSdkStream yields
++      // when finishReason was 'length' with no content or tool calls.
++      yield { type: 'reasoning' as const, text: 'thinking at great length ' }
++      yield {
++        type: 'error' as const,
++        source: 'output-limit' as const,
++        message: 'The response hit its output token limit while reasoning.',
++      }
++      return { aborted: false, value: 'msg-id' }
++    }
++
++    const { result, messageHistory } = await runStream(outputLimitStream())
++
++    expect(result.hadToolCallError).toBe(true)
++    const notes = messageHistory.filter(
++      (m) => m.role === 'user' && m.tags?.includes(OUTPUT_LIMIT_TAG),
++    )
++    expect(notes).toHaveLength(1)
++    expect(JSON.stringify(notes[0]!.content)).toContain('output token limit')
++    expect(JSON.stringify(notes[0]!.content)).not.toContain(
++      'Error during tool call',
++    )
++  })
++
++  it('fails the turn after too many consecutive interruptions', async () => {
++    async function* interruptedStream(): AsyncGenerator<
++      StreamChunk,
++      PromptResult<string | null>
++    > {
++      yield {
++        type: 'error' as const,
++        source: 'stream-interrupted' as const,
++        message: 'The connection dropped while the response was streaming.',
++      }
++      return { aborted: false, value: 'msg-id' }
++    }
++
++    const interruptionNote = () =>
++      userMessage({
++        content: 'interrupted',
++        tags: [STREAM_INTERRUPTED_TAG],
++      })
++    const priorNotes = Array.from(
++      { length: MAX_CONSECUTIVE_STREAM_RECOVERIES },
++      interruptionNote,
++    )
++
++    await expect(runStream(interruptedStream(), priorNotes)).rejects.toThrow(
++      REPEATED_STREAM_INTERRUPTIONS_MESSAGE,
++    )
++  })
++
++  it('fails with the output-limit message when that source trips the shared cap', async () => {
++    async function* outputLimitStream(): AsyncGenerator<
++      StreamChunk,
++      PromptResult<string | null>
++    > {
++      yield {
++        type: 'error' as const,
++        source: 'output-limit' as const,
++        message: 'The response hit its output token limit while reasoning.',
++      }
++      return { aborted: false, value: 'msg-id' }
++    }
++
++    // The streak is shared across recovery kinds: a mix of interruption and
++    // output-limit notes still counts toward one cap.
++    const priorNotes = [
++      userMessage({ content: 'n1', tags: [STREAM_INTERRUPTED_TAG] }),
++      userMessage({ content: 'n2', tags: [OUTPUT_LIMIT_TAG] }),
++      userMessage({ content: 'n3', tags: [STREAM_INTERRUPTED_TAG] }),
++    ]
++
++    await expect(runStream(outputLimitStream(), priorNotes)).rejects.toThrow(
++      REPEATED_OUTPUT_LIMIT_MESSAGE,
++    )
++  })
++
++  it('counts only back-to-back recovery notes of either kind', () => {
++    const note = () =>
++      userMessage({ content: 'interrupted', tags: [STREAM_INTERRUPTED_TAG] })
++    const limitNote = () =>
++      userMessage({ content: 'limited', tags: [OUTPUT_LIMIT_TAG] })
++    const assistant = assistantMessage('partial output')
++    const toolResult = {
++      role: 'tool',
++      content: { type: 'tool-result', toolName: 'read_files', toolCallId: 'x', output: [] },
++    } as unknown as Message
++    const plainUser = userMessage({ content: 'a real prompt' })
++
++    expect(countTrailingStreamRecoveryNotes([])).toBe(0)
++    expect(countTrailingStreamRecoveryNotes([plainUser, note()])).toBe(1)
++    // Both note kinds count toward the same streak.
++    expect(countTrailingStreamRecoveryNotes([note(), limitNote()])).toBe(2)
++    // Partial assistant output between notes does not break the streak.
++    expect(
++      countTrailingStreamRecoveryNotes([note(), assistant, note()]),
++    ).toBe(2)
++    // A completed tool exchange means a step succeeded — streak resets.
++    expect(
++      countTrailingStreamRecoveryNotes([note(), toolResult, limitNote()]),
++    ).toBe(1)
++    // A newer real user message resets the streak entirely.
++    expect(countTrailingStreamRecoveryNotes([note(), plainUser])).toBe(0)
++  })
++
++  it('keeps wrapping ordinary error chunks as tool-call failures', async () => {
++    async function* toolErrorStream(): AsyncGenerator<
++      StreamChunk,
++      PromptResult<string | null>
++    > {
++      yield { type: 'error' as const, message: 'bad tool input' }
++      return { aborted: false, value: 'msg-id' }
++    }
++
++    const { result, messageHistory } = await runStream(toolErrorStream())
++
++    expect(result.hadToolCallError).toBe(true)
++    const errorNotes = messageHistory.filter(
++      (m) => m.role === 'user' && m.tags?.includes('TOOL_CALL_ERROR'),
++    )
++    expect(errorNotes).toHaveLength(1)
++    expect(JSON.stringify(errorNotes[0]!.content)).toContain(
++      'Error during tool call',
++    )
++  })
++})
+diff --git a/packages/agent-runtime/src/tools/stream-parser.ts b/packages/agent-runtime/src/tools/stream-parser.ts
+index 90b45d08b..46f08806d 100644
+--- a/packages/agent-runtime/src/tools/stream-parser.ts
++++ b/packages/agent-runtime/src/tools/stream-parser.ts
+@@ -22,6 +22,7 @@ import type { FileProcessingState } from './handlers/tool/write-file'
+ import type { ToolName } from '@codebuff/common/tools/constants'
+ import type { CodebuffToolCall } from '@codebuff/common/tools/list'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
++import type { StreamRecoverySource } from '@codebuff/common/types/contracts/llm'
+ import type { ParamsExcluding } from '@codebuff/common/types/function-params'
+ import type {
+   Message,
+@@ -31,6 +32,66 @@ import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+ import type { Subgoal } from '@codebuff/common/types/session-state'
+ import type { ProjectFileContext } from '@codebuff/common/util/file'
+ 
++/** History tags for the notes appended when a step's stream ends without a
++ *  usable response and the loop auto-retries (see
++ *  sdk/src/impl/stream-interruption.ts for detection): the connection was cut
++ *  mid-response, or the model burned its output budget on reasoning. */
++export const STREAM_INTERRUPTED_TAG = 'STREAM_INTERRUPTED'
++export const OUTPUT_LIMIT_TAG = 'OUTPUT_LIMIT'
++
++/** How many back-to-back recovery retries (nothing but the model's partial
++ *  output between them, interruption and output-limit combined) run before
++ *  the turn fails loudly. One covers the deploy/network blip or one-off
++ *  thinking overrun this retry exists for; a run of them means every attempt
++ *  is failing the same way. */
++export const MAX_CONSECUTIVE_STREAM_RECOVERIES = 3
++
++export const REPEATED_STREAM_INTERRUPTIONS_MESSAGE =
++  'The connection kept dropping mid-response after several retries. Please check your network connection and try again.'
++
++export const REPEATED_OUTPUT_LIMIT_MESSAGE =
++  'The model kept hitting its output token limit while reasoning, without producing a response. Try a simpler request or a different model.'
++
++const RECOVERY_BY_SOURCE: Record<
++  StreamRecoverySource,
++  { tag: string; giveUpMessage: string }
++> = {
++  'stream-interrupted': {
++    tag: STREAM_INTERRUPTED_TAG,
++    giveUpMessage: REPEATED_STREAM_INTERRUPTIONS_MESSAGE,
++  },
++  'output-limit': {
++    tag: OUTPUT_LIMIT_TAG,
++    giveUpMessage: REPEATED_OUTPUT_LIMIT_MESSAGE,
++  },
++}
++
++const RECOVERY_TAGS: readonly string[] = Object.values(RECOVERY_BY_SOURCE).map(
++  (recovery) => recovery.tag,
++)
++
++/**
++ * Count the streak of recovery notes (either kind) at the tail of the
++ * conversation. Assistant/system content between notes is the retries'
++ * partial output, and STEP_PROMPT messages are per-step scaffolding
++ * (run-agent-step appends one to the history before every step) — neither
++ * breaks the streak. A completed tool exchange or any other user message (a
++ * real prompt, a tool-error note) means a step fully succeeded or failed
++ * differently in between, so the streak resets.
++ */
++export function countTrailingStreamRecoveryNotes(messages: Message[]): number {
++  let count = 0
++  for (let i = messages.length - 1; i >= 0; i--) {
++    const message = messages[i]!
++    if (message.role === 'tool') break
++    if (message.role !== 'user') continue
++    if (message.tags?.includes('STEP_PROMPT')) continue
++    if (!message.tags?.some((tag) => RECOVERY_TAGS.includes(tag))) break
++    count++
++  }
++  return count
++}
++
+ export async function processStream(
+   params: {
+     agentContext: Record<string, Subgoal>
+@@ -77,6 +138,7 @@ export async function processStream(
+     ancestorRunIds,
+     fileContext,
+     fullResponse,
++    logger,
+     onCostCalculated,
+     onResponseChunk,
+     runId,
+@@ -92,6 +154,7 @@ export async function processStream(
+   const toolCallsToAddToMessageHistory: (CodebuffToolCall | CustomToolCall)[] = []
+   const assistantMessages: Message[] = []
+   let hadToolCallError = false
++  let sawStreamRecovery = false
+   const errorMessages: Message[] = []
+   const { promise: streamDonePromise, resolve: resolveStreamDonePromise } =
+     Promise.withResolvers<void>()
+@@ -304,15 +367,54 @@ export async function processStream(
+         fullResponseChunks.push(chunk.text)
+       } else if (chunk.type === 'error') {
+         onResponseChunk(chunk)
+-        hadToolCallError = true
+-        errorMessages.push(
+-          userMessage({
+-            content: withSystemTags(
+-              `Error during tool call: ${chunk.message}. Please check the tool name and arguments and try again.`,
+-            ),
+-            tags: ['TOOL_CALL_ERROR'],
+-          }),
+-        )
++        if (chunk.source) {
++          const recovery = RECOVERY_BY_SOURCE[chunk.source]
++          sawStreamRecovery = true
++          const priorRecoveries = countTrailingStreamRecoveryNotes(
++            agentState.messageHistory,
++          )
++          // Every attempt is failing the same way (not the one-off
++          // deploy/network blip or thinking overrun this retry exists for).
++          // Fail the turn with a clear message instead of burning up to
++          // maxAgentSteps (200) requests.
++          if (priorRecoveries >= MAX_CONSECUTIVE_STREAM_RECOVERIES) {
++            logger.error(
++              {
++                metric: 'stream_recovery_gave_up',
++                source: chunk.source,
++                model: agentTemplate.model,
++                agentId: agentTemplate.id,
++                userId,
++                runId,
++                consecutive: priorRecoveries + 1,
++              },
++              'Giving up after repeated stream recoveries',
++            )
++            throw new Error(recovery.giveUpMessage)
++          }
++          // Setting hadToolCallError makes run-agent-step force another step
++          // instead of ending the turn — that next step IS the retry: the
++          // model sees its partial output plus this note and continues. (No
++          // per-retry telemetry: detection in promptAiSdkStream already logs
++          // one stream_recovery_detected per occurrence.)
++          hadToolCallError = true
++          errorMessages.push(
++            userMessage({
++              content: withSystemTags(chunk.message),
++              tags: [recovery.tag],
++            }),
++          )
++        } else {
++          hadToolCallError = true
++          errorMessages.push(
++            userMessage({
++              content: withSystemTags(
++                `Error during tool call: ${chunk.message}. Please check the tool name and arguments and try again.`,
++              ),
++              tags: ['TOOL_CALL_ERROR'],
++            }),
++          )
++        }
+       } else if (chunk.type === 'tool-call') {
+       } else {
+         chunk satisfies never
+@@ -322,6 +424,30 @@ export async function processStream(
+       }
+     }
+ 
++    // Retry-outcome signal: this step streamed to completion (no new
++    // recovery, no user abort) while the history tail still carries a
++    // recovery streak — meaning the forced-step retry rescued the turn.
++    // Checked before finalization appends this step's messages, so the count
++    // is the streak being recovered from.
++    if (!sawStreamRecovery && !signal.aborted) {
++      const recoveredFrom = countTrailingStreamRecoveryNotes(
++        agentState.messageHistory,
++      )
++      if (recoveredFrom > 0) {
++        logger.info(
++          {
++            metric: 'stream_recovery_rescued',
++            model: agentTemplate.model,
++            agentId: agentTemplate.id,
++            userId,
++            runId,
++            consecutive: recoveredFrom,
++          },
++          'Stream-interruption retry succeeded; turn continued normally',
++        )
++      }
++    }
++
+     if (!signal.aborted) {
+       resolveStreamDonePromise()
+       await previousToolCallFinished
+diff --git a/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.test.ts b/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.test.ts
+new file mode 100644
+index 000000000..23326b66f
+--- /dev/null
++++ b/packages/llm-providers/src/openai-compatible/chat/openai-compatible-chat-language-model.test.ts
+@@ -0,0 +1,122 @@
++import { describe, expect, it } from 'bun:test'
++
++import { OpenAICompatibleChatLanguageModel } from './openai-compatible-chat-language-model'
++
++import type { LanguageModelV2StreamPart } from '@ai-sdk/provider'
++
++/**
++ * Simulates the server side of an SSE completion stream. `close` decides
++ * whether the body ends like a healthy stream (finish_reason + usage +
++ * [DONE]) or is cut mid-response the way a killed server instance or dropped
++ * connection looks to the client: the HTTP body just ends after some deltas.
++ */
++function sseResponse(lines: string[]): Response {
++  const encoder = new TextEncoder()
++  const body = new ReadableStream<Uint8Array>({
++    start(controller) {
++      for (const line of lines) {
++        controller.enqueue(encoder.encode(`data: ${line}\n\n`))
++      }
++      controller.close()
++    },
++  })
++  return new Response(body, {
++    status: 200,
++    headers: { 'Content-Type': 'text/event-stream' },
++  })
++}
++
++function chunk(delta: object, extra: object = {}): string {
++  return JSON.stringify({
++    id: 'cmpl-1',
++    object: 'chat.completion.chunk',
++    created: 1,
++    model: 'test-model',
++    choices: [{ index: 0, delta, ...extra }],
++  })
++}
++
++async function streamParts(response: Response) {
++  // Bun's fetch type carries a `preconnect` member the mock doesn't need.
++  const testFetch = (async () => response) as unknown as typeof fetch
++  const model = new OpenAICompatibleChatLanguageModel('test-model', {
++    provider: 'test-provider',
++    headers: () => ({}),
++    url: () => 'https://example.test/v1/chat/completions',
++    fetch: testFetch,
++  })
++
++  const { stream } = await model.doStream({
++    prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
++    includeRawChunks: false,
++  })
++
++  const parts: LanguageModelV2StreamPart[] = []
++  const reader = stream.getReader()
++  while (true) {
++    const { done, value } = await reader.read()
++    if (done) break
++    parts.push(value)
++  }
++  return parts
++}
++
++const finishPartOf = (parts: LanguageModelV2StreamPart[]) => {
++  const finish = parts.find((part) => part.type === 'finish')
++  if (!finish || finish.type !== 'finish') {
++    throw new Error('stream emitted no finish part')
++  }
++  return finish
++}
++
++describe('OpenAICompatibleChatLanguageModel doStream', () => {
++  it('a healthy stream finishes with a real reason and usage', async () => {
++    const parts = await streamParts(
++      sseResponse([
++        chunk({ role: 'assistant', content: 'Hello' }),
++        chunk({ content: ' world' }),
++        JSON.stringify({
++          id: 'cmpl-1',
++          object: 'chat.completion.chunk',
++          created: 1,
++          model: 'test-model',
++          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
++          usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
++        }),
++        '[DONE]',
++      ]),
++    )
++
++    const finish = finishPartOf(parts)
++    expect(finish.finishReason).toBe('stop')
++    expect(finish.usage.totalTokens).toBe(5)
++  })
++
++  it('a connection cut mid-stream flushes finishReason unknown with no usage', async () => {
++    // No finish_reason chunk, no usage, no [DONE] — the body just ends, which
++    // is exactly what a client sees when the serving instance dies mid-stream.
++    // This is the invariant the SDK's stream-interruption detection relies on
++    // (sdk/src/impl/stream-interruption.ts): finishReason 'unknown' AND
++    // missing usage after stream end means the tail was never received.
++    const parts = await streamParts(
++      sseResponse([
++        chunk({ role: 'assistant', content: 'The reviewer flagged two ' }),
++        chunk({ content: 'unused React default imports (' }),
++      ]),
++    )
++
++    // Text that did arrive is preserved...
++    const text = parts
++      .filter((part) => part.type === 'text-delta')
++      .map((part) => (part.type === 'text-delta' ? part.delta : ''))
++      .join('')
++    expect(text).toBe('The reviewer flagged two unused React default imports (')
++
++    // ...but the synthesized finish carries the truncation signature.
++    const finish = finishPartOf(parts)
++    expect(finish.finishReason).toBe('unknown')
++    expect(finish.usage.inputTokens ?? undefined).toBeUndefined()
++    expect(finish.usage.outputTokens ?? undefined).toBeUndefined()
++    expect(finish.usage.totalTokens ?? undefined).toBeUndefined()
++  })
++})
+diff --git a/sdk/src/__tests__/stream-interruption.test.ts b/sdk/src/__tests__/stream-interruption.test.ts
+new file mode 100644
+index 000000000..b9fb5fec7
+--- /dev/null
++++ b/sdk/src/__tests__/stream-interruption.test.ts
+@@ -0,0 +1,118 @@
++import { describe, expect, it } from 'bun:test'
++
++import {
++  classifyStreamEndRecovery,
++  streamFinishInfoOf,
++} from '../impl/stream-interruption'
++
++const noYields = { yieldedText: false, yieldedToolCall: false }
++
++describe('classifyStreamEndRecovery', () => {
++  it('classifies a stream that ended without any finish part as interrupted', () => {
++    expect(
++      classifyStreamEndRecovery({ aborted: false, finish: undefined, ...noYields })
++        ?.source,
++    ).toBe('stream-interrupted')
++  })
++
++  it('classifies the flush signature (unknown reason, no usage) as interrupted', () => {
++    // The provider's TransformStream flush emits this shape when the HTTP
++    // body ends without a finish_reason chunk — the connection-cut signature.
++    expect(
++      classifyStreamEndRecovery({
++        aborted: false,
++        finish: { finishReason: 'unknown', hasUsage: false },
++        yieldedText: true,
++        yieldedToolCall: false,
++      })?.source,
++    ).toBe('stream-interrupted')
++  })
++
++  it('classifies a reasoning-only length stop as output-limit', () => {
++    const recovery = classifyStreamEndRecovery({
++      aborted: false,
++      finish: { finishReason: 'length', hasUsage: true },
++      ...noYields,
++    })
++    expect(recovery?.source).toBe('output-limit')
++    expect(recovery?.message).toContain('output token limit')
++  })
++
++  it('leaves a length stop after real output alone', () => {
++    // The answer ran long — retrying would duplicate output.
++    for (const yields of [
++      { yieldedText: true, yieldedToolCall: false },
++      { yieldedText: false, yieldedToolCall: true },
++    ]) {
++      expect(
++        classifyStreamEndRecovery({
++          aborted: false,
++          finish: { finishReason: 'length', hasUsage: true },
++          ...yields,
++        }),
++      ).toBeNull()
++    }
++  })
++
++  it('never classifies a user-cancelled stream', () => {
++    for (const finish of [
++      undefined,
++      { finishReason: 'unknown', hasUsage: false },
++      { finishReason: 'length', hasUsage: true },
++    ]) {
++      expect(
++        classifyStreamEndRecovery({ aborted: true, finish, ...noYields }),
++      ).toBeNull()
++    }
++  })
++
++  it('leaves normal completions alone', () => {
++    for (const finishReason of ['stop', 'tool-calls', 'content-filter']) {
++      for (const hasUsage of [true, false]) {
++        expect(
++          classifyStreamEndRecovery({
++            aborted: false,
++            finish: { finishReason, hasUsage },
++            ...noYields,
++          }),
++        ).toBeNull()
++      }
++    }
++  })
++
++  it('leaves an unrecognized finish reason on a complete stream alone', () => {
++    // Providers map nonstandard finish_reason strings to 'unknown', but a
++    // complete stream still delivers usage in its final chunk — only the
++    // combination of 'unknown' AND missing usage means truncation.
++    expect(
++      classifyStreamEndRecovery({
++        aborted: false,
++        finish: { finishReason: 'unknown', hasUsage: true },
++        ...noYields,
++      }),
++    ).toBeNull()
++  })
++})
++
++describe('streamFinishInfoOf', () => {
++  it('counts any finite usage number as usage', () => {
++    expect(
++      streamFinishInfoOf({
++        finishReason: 'stop',
++        totalUsage: { outputTokens: 0 },
++      }),
++    ).toEqual({ finishReason: 'stop', hasUsage: true })
++  })
++
++  it('treats missing or NaN usage as absent', () => {
++    expect(
++      streamFinishInfoOf({ finishReason: 'unknown', totalUsage: {} }),
++    ).toEqual({ finishReason: 'unknown', hasUsage: false })
++    expect(
++      streamFinishInfoOf({
++        finishReason: 'unknown',
++        totalUsage: { totalTokens: NaN },
++      }),
++    ).toEqual({ finishReason: 'unknown', hasUsage: false })
++  })
++})
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index 660ab562f..ea4b89abd 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -26,9 +26,14 @@ import {
+   getModelForRequest,
+   markChatGptOAuthRateLimited,
+ } from './model-provider'
++import {
++  classifyStreamEndRecovery,
++  streamFinishInfoOf,
++} from './stream-interruption'
+ import { refreshChatGptOAuthToken } from '../credentials'
+ import { getErrorStatusCode } from '../error-utils'
+ 
++import type { StreamFinishInfo } from './stream-interruption'
+ import type { ModelRequestParams } from './model-provider'
+ import type {
+   OpenRouterProviderOptions,
+@@ -467,8 +472,19 @@ export async function* promptAiSdkStream(
+ 
+   // Track if we've yielded any content - if so, we can't safely fall back
+   let hasYieldedContent = false
++  // Tool calls tracked separately: a step that produced tool calls is
++  // actionable even with no text, so it is never a silent stop.
++  let hasYieldedToolCall = false
++
++  // A healthy stream always delivers a finish part with a real finishReason
++  // (and usage) before ending; its absence after the loop means the
++  // connection was cut mid-response. See stream-interruption.ts.
++  let finishInfo: StreamFinishInfo | undefined
+ 
+   for await (const chunkValue of response.fullStream) {
++    if (chunkValue.type === 'finish') {
++      finishInfo = streamFinishInfoOf(chunkValue)
++    }
+     if (chunkValue.type !== 'text-delta') {
+       const flushed = stopSequenceHandler.flush()
+       if (flushed) {
+@@ -662,6 +678,7 @@ export async function* promptAiSdkStream(
+       }
+     }
+     if (chunkValue.type === 'tool-call') {
++      hasYieldedToolCall = true
+       yield chunkValue
+     }
+   }
+@@ -674,6 +691,40 @@ export async function* promptAiSdkStream(
+     }
+   }
+ 
++  const recovery = classifyStreamEndRecovery({
++    aborted: params.signal.aborted,
++    finish: finishInfo,
++    yieldedText: hasYieldedContent,
++    yieldedToolCall: hasYieldedToolCall,
++  })
++  if (recovery) {
++    // The stream ended in a recoverable silent stop (connection cut, or
++    // output budget burned on reasoning). Yield an error chunk instead of
++    // ending like a normal completion: the agent loop appends the note to
++    // the conversation and forces another step (with a consecutive cap), so
++    // the model continues rather than the turn silently stopping.
++    logger.warn(
++      {
++        // Queryable via scripts/logs/stream-interruptions.ts — one event per
++        // detection. Outcomes (rescued/gave_up) are emitted by the agent
++        // loop, which knows the consecutive streak.
++        metric: 'stream_recovery_detected',
++        source: recovery.source,
++        model: params.model,
++        userId: params.userId,
++        userInputId: params.userInputId,
++        finishReason: finishInfo?.finishReason,
++        hasYieldedContent,
++      },
++      'Completion stream ended without a usable response; forcing a retry step',
++    )
++    yield {
++      type: 'error',
++      source: recovery.source,
++      message: recovery.message,
++    }
++  }
++
+   const responseValue = await response.response
+   const messageId = responseValue.id
+ 
+diff --git a/sdk/src/impl/stream-interruption.ts b/sdk/src/impl/stream-interruption.ts
+new file mode 100644
+index 000000000..b80dd0c65
+--- /dev/null
++++ b/sdk/src/impl/stream-interruption.ts
+@@ -0,0 +1,101 @@
++/**
++ * Classification of completion-stream endings that would otherwise silently
++ * end the turn with nothing visible to the user. Two classes:
++ *
++ * **'stream-interrupted'** — the connection was cut mid-response. A healthy
++ * OpenAI-compatible SSE stream always ends with a chunk carrying a real
++ * `finish_reason` (and, on our backend, usage totals) before `[DONE]`. When
++ * the connection dies mid-stream — a server deploy killing the instance, a
++ * proxy timeout, a network drop — the HTTP body just ends: the AI SDK
++ * provider's flush then emits a `finish` part with finishReason `'unknown'`
++ * and no usage, and the stream otherwise looks like a normal completion.
++ * `'unknown'` alone is not proof: providers map any unrecognized
++ * `finish_reason` string to `'unknown'` too. Usage disambiguates — it arrives
++ * in the stream's final chunk, so `'unknown'` *with* usage means an odd but
++ * complete stream, while `'unknown'` *without* usage means the tail was never
++ * received. A missing finish part altogether is always an interruption.
++ *
++ * **'output-limit'** — the model spent its entire output budget on reasoning:
++ * the stream finished with reason 'length' having produced no text and no
++ * tool calls. A complete, well-formed stream, but the turn would end with
++ * nothing visible, exactly like a cut. Only reasoning-only completions
++ * qualify: a 'length' stop after real output is the answer running long,
++ * which is not silently recoverable (retrying would duplicate output).
++ *
++ * Before this existed, both classes read as the agent "randomly stopping"
++ * mid-thinking with no error anywhere (2026-07-17 incident).
++ */
++
++import type { StreamRecoverySource } from '@codebuff/common/types/contracts/llm'
++
++export interface StreamFinishInfo {
++  finishReason: string
++  hasUsage: boolean
++}
++
++/** Distill an AI SDK fullStream `finish` part into what detection needs. */
++export function streamFinishInfoOf(part: {
++  finishReason: string
++  totalUsage: {
++    inputTokens?: number
++    outputTokens?: number
++    totalTokens?: number
++  }
++}): StreamFinishInfo {
++  const { inputTokens, outputTokens, totalTokens } = part.totalUsage
++  return {
++    finishReason: part.finishReason,
++    hasUsage: [inputTokens, outputTokens, totalTokens].some(
++      (tokens) => typeof tokens === 'number' && Number.isFinite(tokens),
++    ),
++  }
++}
++
++export interface StreamEndRecovery {
++  source: StreamRecoverySource
++  /** Injected into the conversation (and shown to the user). Written for the
++   *  model: the retry step sees its own partial output plus this note. */
++  message: string
++}
++
++const STREAM_INTERRUPTED_RECOVERY: StreamEndRecovery = {
++  source: 'stream-interrupted',
++  message:
++    'The connection dropped while the response was streaming, so the output above may be cut off mid-thought. Continue from where it left off (or start the step over if nothing useful arrived).',
++}
++
++const OUTPUT_LIMIT_RECOVERY: StreamEndRecovery = {
++  source: 'output-limit',
++  // The actionable instruction is a tighter budget on the redo: finishing the
++  // same depth of reasoning would hit the same limit again.
++  message:
++    'The response hit its output token limit while still reasoning, so no answer was produced. Redo this step thinking much more briefly, and get to the response or tool calls quickly.',
++}
++
++/**
++ * Decide whether a completed fullStream ended in a recoverable silent stop.
++ * Returns the recovery to yield as an error chunk, or null for normal
++ * endings. A user cancel (`aborted`) also ends streams early and is never a
++ * recovery.
++ */
++export function classifyStreamEndRecovery(params: {
++  aborted: boolean
++  /** Info from the stream's `finish` part, or undefined if none arrived. */
++  finish: StreamFinishInfo | undefined
++  yieldedText: boolean
++  yieldedToolCall: boolean
++}): StreamEndRecovery | null {
++  const { aborted, finish, yieldedText, yieldedToolCall } = params
++  if (aborted) return null
++
++  const interrupted =
++    finish === undefined ||
++    (finish.finishReason === 'unknown' && !finish.hasUsage)
++  if (interrupted) return STREAM_INTERRUPTED_RECOVERY
++
++  const reasoningOnlyLength =
++    finish.finishReason === 'length' && !yieldedText && !yieldedToolCall
++  if (reasoningOnlyLength) return OUTPUT_LIMIT_RECOVERY
++
++  return null
++}

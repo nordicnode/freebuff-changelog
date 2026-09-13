@@ -1,0 +1,371 @@
+diff --git a/cli/src/types/env.ts b/cli/src/types/env.ts
+index 1d45aeb0f..78ec27c3b 100644
+--- a/cli/src/types/env.ts
++++ b/cli/src/types/env.ts
+@@ -75,6 +75,8 @@ export type CliEnv = BaseEnv & {
+   CODEBUFF_SCROLL_MULTIPLIER?: string
+   CODEBUFF_PERF_TEST?: string
+   CODEBUFF_TRACE?: string
++  // Toggle for mirroring CLI logs to the server's /api/logs sink (Axiom).
++  CODEBUFF_SHIP_LOGS?: string
+   FREEBUFF_MODE?: string
+ }
+ 
+diff --git a/cli/src/utils/env.ts b/cli/src/utils/env.ts
+index 70e61d749..a57a334c9 100644
+--- a/cli/src/utils/env.ts
++++ b/cli/src/utils/env.ts
+@@ -75,6 +75,7 @@ export const getCliEnv = (): CliEnv => ({
+   CODEBUFF_SCROLL_MULTIPLIER: process.env.CODEBUFF_SCROLL_MULTIPLIER,
+   CODEBUFF_PERF_TEST: process.env.CODEBUFF_PERF_TEST,
+   CODEBUFF_TRACE: process.env.CODEBUFF_TRACE,
++  CODEBUFF_SHIP_LOGS: process.env.CODEBUFF_SHIP_LOGS,
+   FREEBUFF_MODE: process.env.FREEBUFF_MODE,
+ })
+ 
+diff --git a/cli/src/utils/log-shipper.ts b/cli/src/utils/log-shipper.ts
+new file mode 100644
+index 000000000..39759ad1d
+--- /dev/null
++++ b/cli/src/utils/log-shipper.ts
+@@ -0,0 +1,90 @@
++import { IS_DEV, IS_TEST, IS_CI } from '@codebuff/common/env'
++
++import { getApiClient } from './codebuff-api'
++import { getCliEnv } from './env'
++
++import type { LogRecordInput } from '@codebuff/common/schemas/logs'
++
++/**
++ * Client-side shipper that mirrors CLI logs/events into the server's Axiom
++ * logs sink via POST /api/logs. Runs alongside PostHog (it does not replace
++ * it). Fully best-effort: batched, fire-and-forget, never throws, never logs
++ * through the app logger (which would recurse).
++ *
++ * Tuning via env:
++ *  - CODEBUFF_SHIP_LOGS 'true' | 'false'  (default: on outside dev/test)
++ */
++
++const MAX_BATCH = 50
++const FLUSH_INTERVAL_MS = 10_000
++const MAX_BUFFER = 1_000
++
++let buffer: LogRecordInput[] = []
++let timer: ReturnType<typeof setInterval> | null = null
++let flushing = false
++let shutdownRegistered = false
++
++function enabled(): boolean {
++  const flag = getCliEnv().CODEBUFF_SHIP_LOGS
++  if (flag === 'true') return true
++  if (flag === 'false') return false
++  return !IS_DEV && !IS_TEST && !IS_CI
++}
++
++function ensureTimer(): void {
++  if (timer) return
++  timer = setInterval(() => {
++    void flushClientLogs()
++  }, FLUSH_INTERVAL_MS)
++  ;(timer as { unref?: () => void }).unref?.()
++}
++
++function registerShutdown(): void {
++  if (shutdownRegistered) return
++  shutdownRegistered = true
++  const onExit = () => {
++    void flushClientLogs()
++  }
++  process.once('beforeExit', onExit)
++  process.once('SIGTERM', onExit)
++  process.once('SIGINT', onExit)
++}
++
++/** Buffer one record for shipping. Cheap, synchronous, never throws. */
++export function enqueueClientLog(record: LogRecordInput): void {
++  if (!enabled()) return
++  if (buffer.length >= MAX_BUFFER) {
++    buffer.shift()
++  }
++  buffer.push(record)
++  ensureTimer()
++  registerShutdown()
++  if (buffer.length >= MAX_BATCH) {
++    void flushClientLogs()
++  }
++}
++
++/** Flush a batch to /api/logs. Requeues if not yet authenticated. */
++export async function flushClientLogs(): Promise<void> {
++  if (flushing || buffer.length === 0) return
++  flushing = true
++  const batch = buffer.splice(0, MAX_BATCH)
++  try {
++    const client = getApiClient()
++    if (!client.authToken) {
++      // Not logged in yet — put the batch back (bounded by MAX_BUFFER) so we
++      // can ship it once auth is available.
++      buffer.unshift(...batch)
++      return
++    }
++    await client.post(
++      '/api/logs',
++      { records: batch },
++      { includeAuth: true, retry: false, timeoutMs: 5_000 },
++    )
++  } catch {
++    // Best-effort: drop on error rather than risk unbounded growth.
++  } finally {
++    flushing = false
++  }
++}
+diff --git a/cli/src/utils/logger.ts b/cli/src/utils/logger.ts
+index 552915df5..045d4f0d8 100644
+--- a/cli/src/utils/logger.ts
++++ b/cli/src/utils/logger.ts
+@@ -19,8 +19,11 @@ import {
+   setAnalyticsErrorLogger,
+   trackEvent,
+ } from './analytics'
++import { enqueueClientLog } from './log-shipper'
+ import { getCurrentChatDir, getProjectRoot } from '../project-files'
+ 
++import type { LogRecordInput } from '@codebuff/common/schemas/logs'
++
+ /** Name of the per-chat debug log file written in production builds */
+ export const CHAT_LOG_FILENAME = 'log.jsonl'
+ 
+@@ -198,6 +201,42 @@ function sendAnalyticsAndLog(
+     })
+   }
+ 
++  // Mirror the log/event into the server-side Axiom logs sink via /api/logs
++  // (in addition to PostHog). Best-effort and batched; skip noisy debug logs
++  // and anything before we know who the user is.
++  if (!IS_DEV && !IS_TEST && !IS_CI && loggerContext.userId && level !== 'debug') {
++    const eventId =
++      includeData && typeof normalizedData === 'object'
++        ? getAnalyticsEventId(normalizedData)
++        : null
++    // Mirror the PostHog path's redaction: only ship raw payloads for errors or
++    // when full telemetry is enabled; otherwise ship a summary. Keeps PII/data
++    // volume symmetric across the two sinks.
++    const includeRawData =
++      isFullTelemetryEnabled({
++        distinctId: loggerContext.userId,
++        properties: loggerContext,
++      }) ||
++      level === 'error' ||
++      level === 'fatal'
++    const shipData = includeData
++      ? includeRawData
++        ? normalizedData
++        : summarizeAnalyticsValue(normalizedData)
++      : undefined
++    const record: LogRecordInput = {
++      timestamp: new Date().toISOString(),
++      level,
++      event: eventId ? String(eventId) : undefined,
++      message: stringFormat(normalizedMsg ?? '', ...args),
++      client_session_id: loggerContext.clientSessionId,
++      client_request_id: loggerContext.clientRequestId,
++      fingerprint_id: loggerContext.fingerprintId,
++      data: shipData,
++    }
++    enqueueClientLog(record)
++  }
++
+   // In dev mode, use appendFileSync for real-time logging (Bun has issues with pino sync)
+   // In prod mode, use pino for better performance
+   if (IS_DEV && logPath) {
+diff --git a/common/src/constants/analytics-events.ts b/common/src/constants/analytics-events.ts
+index b380cc121..ca9e9c6d0 100644
+--- a/common/src/constants/analytics-events.ts
++++ b/common/src/constants/analytics-events.ts
+@@ -134,6 +134,10 @@ export enum AnalyticsEvent {
+   FEEDBACK_AUTH_ERROR = 'api.feedback_auth_error',
+   FEEDBACK_VALIDATION_ERROR = 'api.feedback_validation_error',
+ 
++  // Web - Logs ingest API (client logs/events → BigQuery)
++  LOGS_INGEST_AUTH_ERROR = 'api.logs_ingest_auth_error',
++  LOGS_INGEST_VALIDATION_ERROR = 'api.logs_ingest_validation_error',
++
+   // Web - Ads API
+   ADS_API_AUTH_ERROR = 'api.ads_auth_error',
+   ADS_CLICKED = 'ads.clicked',
+diff --git a/common/src/schemas/logs.ts b/common/src/schemas/logs.ts
+new file mode 100644
+index 000000000..b5555a52b
+--- /dev/null
++++ b/common/src/schemas/logs.ts
+@@ -0,0 +1,66 @@
++import { z } from 'zod/v4'
++
++/**
++ * Wire schema for the client → server log/event ingest endpoint (`/api/logs`).
++ *
++ * Clients (CLI, browser) POST a batch of records. The server stamps `source`,
++ * `env`, `user_id` (from auth) and a received-at `timestamp` if missing, then
++ * enqueues into the Axiom logs sink. See docs/logging.md.
++ *
++ * Caps exist to bound per-row storage and protect the ingest path from abuse.
++ */
++
++export const MAX_LOG_RECORDS_PER_BATCH = 500
++export const MAX_LOG_MESSAGE_LENGTH = 4_000
++/** Max serialized size of a single record's `data` payload (≈64 KB). */
++export const MAX_LOG_DATA_BYTES = 64_000
++/**
++ * Hard ceiling on the raw ingest request body (~1 MB). Enforced via
++ * Content-Length BEFORE parsing so an unauthenticated client cannot force the
++ * server to buffer/parse a huge body (Next.js app-router handlers have no
++ * default body limit). See `isLogBodyTooLarge`.
++ */
++export const MAX_LOG_BODY_BYTES = 1_000_000
++
++/**
++ * Returns true if a request declares (or omits, when `required`) a body larger
++ * than MAX_LOG_BODY_BYTES. Pass the `Content-Length` header value.
++ */
++export function isLogBodyTooLarge(contentLength: string | null): boolean {
++  if (contentLength == null) return false // chunked / unknown; schema caps still apply
++  const len = Number(contentLength)
++  return Number.isFinite(len) && len > MAX_LOG_BODY_BYTES
++}
++
++export const logLevelSchema = z.enum([
++  'debug',
++  'info',
++  'warn',
++  'error',
++  'fatal',
++])
++
++export const logRecordSchema = z.object({
++  /** Client-supplied event time (ISO 8601). Server falls back to now. */
++  timestamp: z.string().datetime().optional(),
++  level: logLevelSchema.default('info'),
++  /** AnalyticsEvent name when this is an analytics event. */
++  event: z.string().max(200).nullish(),
++  message: z.string().max(MAX_LOG_MESSAGE_LENGTH).nullish(),
++  client_session_id: z.string().max(200).nullish(),
++  client_request_id: z.string().max(200).nullish(),
++  fingerprint_id: z.string().max(200).nullish(),
++  /**
++   * Structured payload. Kept as unknown JSON; the server truncates if the
++   * serialized form exceeds MAX_LOG_DATA_BYTES.
++   */
++  data: z.unknown().optional(),
++})
++
++export type LogRecordInput = z.infer<typeof logRecordSchema>
++
++export const logIngestSchema = z.object({
++  records: z.array(logRecordSchema).min(1).max(MAX_LOG_RECORDS_PER_BATCH),
++})
++
++export type LogIngestBody = z.infer<typeof logIngestSchema>
+diff --git a/common/src/types/contracts/logs.ts b/common/src/types/contracts/logs.ts
+new file mode 100644
+index 000000000..436cabaac
+--- /dev/null
++++ b/common/src/types/contracts/logs.ts
+@@ -0,0 +1,34 @@
++/** Severity levels for the unified logs stream. */
++export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'fatal'
++
++/** Origin of a log row. */
++export type LogSource = 'server' | 'cli' | 'browser'
++
++/**
++ * One normalized log/event record. This is the provider-agnostic shape the
++ * sink ingests (currently into Axiom — see `@codebuff/logging`). An "event" is
++ * just a log row with `event` populated, so all logs and analytics events live
++ * in one stream. See docs/logging.md.
++ */
++export type LogRow = {
++  /** UUID for this row. */
++  id: string
++  /** Event time (becomes Axiom's `_time`). */
++  timestamp: Date
++  level: LogLevel
++  source: LogSource
++  /** Emitting service, e.g. 'web', 'agent-runtime', 'freebuff-web', 'cli'. */
++  service?: string | null
++  /** Deploy environment: 'dev' | 'test' | 'prod'. */
++  env: string
++  /** AnalyticsEvent name when this row is an analytics event, else null. */
++  event?: string | null
++  /** Human-readable message (the formatted pino msg). */
++  message?: string | null
++  user_id?: string | null
++  client_session_id?: string | null
++  client_request_id?: string | null
++  fingerprint_id?: string | null
++  /** Structured payload. Serialized to a single string field on ingest. */
++  data?: unknown
++}
+diff --git a/common/src/util/log-ingest.ts b/common/src/util/log-ingest.ts
+new file mode 100644
+index 000000000..ab4198ed6
+--- /dev/null
++++ b/common/src/util/log-ingest.ts
+@@ -0,0 +1,58 @@
++import { MAX_LOG_DATA_BYTES } from '../schemas/logs'
++
++import type { LogRecordInput } from '../schemas/logs'
++import type { LogRow, LogSource } from '../types/contracts/logs'
++
++/**
++ * Truncate an oversized payload so a single client cannot bloat ingest volume.
++ * Returns the original value when small.
++ */
++function truncateData(data: unknown): unknown {
++  if (data === undefined) return null
++  let serialized: string
++  try {
++    serialized = JSON.stringify(data)
++  } catch {
++    return { _unserializable: true }
++  }
++  if (serialized.length <= MAX_LOG_DATA_BYTES) return data
++  return {
++    _truncated: true,
++    original_bytes: serialized.length,
++    preview: serialized.slice(0, MAX_LOG_DATA_BYTES),
++  }
++}
++
++/**
++ * Map validated client ingest records onto `LogRow`s. The server is the source
++ * of truth for identity/environment: it stamps `source`, `service`, `env`, the
++ * authenticated `user_id`, and a received-at fallback timestamp.
++ */
++export function buildLogRows(params: {
++  records: LogRecordInput[]
++  source: LogSource
++  service: string
++  env: string
++  userId?: string | null
++  now: Date
++}): LogRow[] {
++  const { records, source, service, env, userId = null, now } = params
++  return records.map((record) => {
++    const ts = record.timestamp ? new Date(record.timestamp) : now
++    return {
++      id: crypto.randomUUID(),
++      timestamp: isNaN(ts.getTime()) ? now : ts,
++      level: record.level,
++      source,
++      service,
++      env,
++      event: record.event ?? null,
++      message: record.message ?? null,
++      user_id: userId,
++      client_session_id: record.client_session_id ?? null,
++      client_request_id: record.client_request_id ?? null,
++      fingerprint_id: record.fingerprint_id ?? null,
++      data: truncateData(record.data),
++    }
++  })
++}

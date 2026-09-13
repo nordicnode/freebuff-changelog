@@ -1,0 +1,236 @@
+diff --git a/common/src/types/contracts/llm.ts b/common/src/types/contracts/llm.ts
+index 48ae56b09..b90cba5c2 100644
+--- a/common/src/types/contracts/llm.ts
++++ b/common/src/types/contracts/llm.ts
+@@ -12,9 +12,8 @@ import type z from 'zod/v4'
+ /** Auto-recovered stream endings (see sdk/src/impl/stream-interruption.ts):
+  *  - 'stream-interrupted': the stream ended without a finish marker
+  *    (connection cut mid-response — a server deploy or network drop).
+- *  - 'output-limit': the stream finished with reason 'length' having produced
+- *    only reasoning — the model burned its output budget thinking and never
+- *    answered. */
++ *  - 'output-limit': the stream produced only reasoning and no usable answer,
++ *    either by reaching its output limit or by reporting a normal stop. */
+ export type StreamRecoverySource = 'stream-interrupted' | 'output-limit'
+ 
+ export type StreamChunk =
+diff --git a/common/src/types/print-mode.ts b/common/src/types/print-mode.ts
+index 38d2665e0..d9e271c12 100644
+--- a/common/src/types/print-mode.ts
++++ b/common/src/types/print-mode.ts
+@@ -13,8 +13,8 @@ export const printModeErrorSchema = z.object({
+   type: z.literal('error'),
+   message: z.string(),
+   /** Auto-recovered stream endings ('stream-interrupted': connection cut
+-   *  mid-response; 'output-limit': output budget burned on reasoning with no
+-   *  answer). The agent loop is automatically taking another step; UIs show a
++   *  mid-response; 'output-limit': reasoning ended with no usable answer).
++   *  The agent loop is automatically taking another step; UIs show a
+    *  transient retrying indicator rather than a failure. */
+   source: z.enum(['stream-interrupted', 'output-limit']).optional(),
+ })
+diff --git a/packages/agent-runtime/src/tools/stream-parser.ts b/packages/agent-runtime/src/tools/stream-parser.ts
+index 20fafd461..427d28819 100644
+--- a/packages/agent-runtime/src/tools/stream-parser.ts
++++ b/packages/agent-runtime/src/tools/stream-parser.ts
+@@ -37,12 +37,12 @@ import type { ProjectFileContext } from '@codebuff/common/util/file'
+ /** History tags for the notes appended when a step's stream ends without a
+  *  usable response and the loop auto-retries (see
+  *  sdk/src/impl/stream-interruption.ts for detection): the connection was cut
+- *  mid-response, or the model burned its output budget on reasoning. */
++ *  mid-response, or the model ended after reasoning without an answer. */
+ export const STREAM_INTERRUPTED_TAG = 'STREAM_INTERRUPTED'
+ export const OUTPUT_LIMIT_TAG = 'OUTPUT_LIMIT'
+ 
+ /** How many back-to-back recovery retries (nothing but the model's partial
+- *  output between them, interruption and output-limit combined) run before
++ *  output between them, interruption and reasoning-only combined) run before
+  *  the turn fails loudly. One covers the deploy/network blip or one-off
+  *  thinking overrun this retry exists for; a run of them means every attempt
+  *  is failing the same way. */
+@@ -52,7 +52,7 @@ export const REPEATED_STREAM_INTERRUPTIONS_MESSAGE =
+   'The connection kept dropping mid-response after several retries. Please check your network connection and try again.'
+ 
+ export const REPEATED_OUTPUT_LIMIT_MESSAGE =
+-  'The model kept hitting its output token limit while reasoning, without producing a response. Try a simpler request or a different model.'
++  'The model kept ending after reasoning without producing a response. Try a simpler request or a different model.'
+ 
+ const RECOVERY_BY_SOURCE: Record<
+   StreamRecoverySource,
+diff --git a/sdk/src/__tests__/stream-interruption.test.ts b/sdk/src/__tests__/stream-interruption.test.ts
+index 5b231d0cb..eb50a901a 100644
+--- a/sdk/src/__tests__/stream-interruption.test.ts
++++ b/sdk/src/__tests__/stream-interruption.test.ts
+@@ -6,7 +6,11 @@ import {
+   streamFinishInfoOf,
+ } from '../impl/stream-interruption'
+ 
+-const noYields = { yieldedText: false, yieldedToolCall: false }
++const noYields = {
++  receivedReasoning: false,
++  yieldedText: false,
++  yieldedToolCall: false,
++}
+ 
+ describe('classifyStreamEndRecovery', () => {
+   it('classifies a stream that ended without any finish part as interrupted', () => {
+@@ -23,6 +27,7 @@ describe('classifyStreamEndRecovery', () => {
+       classifyStreamEndRecovery({
+         aborted: false,
+         finish: { finishReason: 'unknown', hasUsage: false },
++        receivedReasoning: false,
+         yieldedText: true,
+         yieldedToolCall: false,
+       })?.source,
+@@ -39,11 +44,33 @@ describe('classifyStreamEndRecovery', () => {
+     expect(recovery?.message).toContain('output token limit')
+   })
+ 
++  it('classifies a normal finish with reasoning but no text or tool calls', () => {
++    const recovery = classifyStreamEndRecovery({
++      aborted: false,
++      finish: { finishReason: 'stop', hasUsage: true },
++      receivedReasoning: true,
++      yieldedText: false,
++      yieldedToolCall: false,
++    })
++    expect(recovery?.source).toBe('output-limit')
++    expect(recovery?.message).toContain(
++      'ended after reasoning without producing an answer or tool call',
++    )
++  })
++
+   it('leaves a length stop after real output alone', () => {
+     // The answer ran long — retrying would duplicate output.
+     for (const yields of [
+-      { yieldedText: true, yieldedToolCall: false },
+-      { yieldedText: false, yieldedToolCall: true },
++      {
++        receivedReasoning: true,
++        yieldedText: true,
++        yieldedToolCall: false,
++      },
++      {
++        receivedReasoning: true,
++        yieldedText: false,
++        yieldedToolCall: true,
++      },
+     ]) {
+       expect(
+         classifyStreamEndRecovery({
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index 3f1cab208..ff56e3b2f 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -342,6 +342,9 @@ export async function* promptAiSdkStream(
+ 
+   // Track if we've yielded any content - if so, we can't safely fall back
+   let hasYieldedContent = false
++  // Native reasoning is not visible answer content, but it distinguishes a
++  // silent model stop from a legitimate empty completion.
++  let hasReceivedReasoning = false
+   // Tool calls tracked separately: a step that produced tool calls is
+   // actionable even with no text, so it is never a silent stop.
+   let hasYieldedToolCall = false
+@@ -459,6 +462,9 @@ export async function* promptAiSdkStream(
+       throw chunkValue.error
+     }
+     if (chunkValue.type === 'reasoning-delta') {
++      if (chunkValue.text) {
++        hasReceivedReasoning = true
++      }
+       const reasoningExcluded = (['openrouter', 'codebuff'] as const).some(
+         (p) =>
+           (params.providerOptions?.[p] as OpenRouterProviderOptions | undefined)
+@@ -517,12 +523,13 @@ export async function* promptAiSdkStream(
+     classifyStreamEndRecovery({
+       aborted: params.signal.aborted,
+       finish: finishInfo,
++      receivedReasoning: hasReceivedReasoning,
+       yieldedText: hasYieldedContent,
+       yieldedToolCall: hasYieldedToolCall,
+     })
+   if (recovery) {
+     // The stream ended in a recoverable silent stop (connection cut, or
+-    // output budget burned on reasoning). Yield an error chunk instead of
++    // reasoning ended without an answer). Yield an error chunk instead of
+     // ending like a normal completion: the agent loop appends the note to
+     // the conversation and forces another step (with a consecutive cap), so
+     // the model continues rather than the turn silently stopping.
+@@ -544,6 +551,7 @@ export async function* promptAiSdkStream(
+         userInputId: params.userInputId,
+         finishReason: finishInfo?.finishReason,
+         hasYieldedContent,
++        hasReceivedReasoning,
+       },
+       'Completion stream ended without a usable response; forcing a retry step',
+     )
+diff --git a/sdk/src/impl/stream-interruption.ts b/sdk/src/impl/stream-interruption.ts
+index da4fab763..edf08edb7 100644
+--- a/sdk/src/impl/stream-interruption.ts
++++ b/sdk/src/impl/stream-interruption.ts
+@@ -15,12 +15,12 @@
+  * complete stream, while `'unknown'` *without* usage means the tail was never
+  * received. A missing finish part altogether is always an interruption.
+  *
+- * **'output-limit'** — the model spent its entire output budget on reasoning:
+- * the stream finished with reason 'length' having produced no text and no
+- * tool calls. A complete, well-formed stream, but the turn would end with
+- * nothing visible, exactly like a cut. Only reasoning-only completions
+- * qualify: a 'length' stop after real output is the answer running long,
+- * which is not silently recoverable (retrying would duplicate output).
++ * **'output-limit'** — the model produced no text or tool calls because it
++ * either spent its output budget on reasoning (`length`) or reported a normal
++ * stop after emitting only native reasoning. Both are complete, well-formed
++ * streams whose turns would otherwise end with nothing visible. A `length`
++ * stop after real output is the answer running long, which is not silently
++ * recoverable (retrying would duplicate output).
+  *
+  * Before this existed, both classes read as the agent "randomly stopping"
+  * mid-thinking with no error anywhere (2026-07-17 incident).
+@@ -73,6 +73,14 @@ const OUTPUT_LIMIT_RECOVERY: StreamEndRecovery = {
+     'The response hit its output token limit while still reasoning, so no answer was produced. Redo this step thinking much more briefly, and get to the response or tool calls quickly.',
+ }
+ 
++const REASONING_ONLY_RECOVERY: StreamEndRecovery = {
++  // Keep the existing source so this follows the same bounded retry path,
++  // while the message stays truthful for a normal stop.
++  source: 'output-limit',
++  message:
++    'The response ended after reasoning without producing an answer or tool call. Continue this step, think more briefly, and get to the response or tool calls quickly.',
++}
++
+ /**
+  * Decide whether a completed fullStream ended in a recoverable silent stop.
+  * Returns the recovery to yield as an error chunk, or null for normal
+@@ -83,10 +91,12 @@ export function classifyStreamEndRecovery(params: {
+   aborted: boolean
+   /** Info from the stream's `finish` part, or undefined if none arrived. */
+   finish: StreamFinishInfo | undefined
++  receivedReasoning: boolean
+   yieldedText: boolean
+   yieldedToolCall: boolean
+ }): StreamEndRecovery | null {
+-  const { aborted, finish, yieldedText, yieldedToolCall } = params
++  const { aborted, finish, receivedReasoning, yieldedText, yieldedToolCall } =
++    params
+   if (aborted) return null
+ 
+   const interrupted =
+@@ -94,9 +104,13 @@ export function classifyStreamEndRecovery(params: {
+     (finish.finishReason === 'unknown' && !finish.hasUsage)
+   if (interrupted) return STREAM_INTERRUPTED_RECOVERY
+ 
+-  const reasoningOnlyLength =
+-    finish.finishReason === 'length' && !yieldedText && !yieldedToolCall
+-  if (reasoningOnlyLength) return OUTPUT_LIMIT_RECOVERY
++  if (yieldedText || yieldedToolCall) return null
++
++  if (finish.finishReason === 'length') return OUTPUT_LIMIT_RECOVERY
++
++  const reasoningOnlyStop =
++    finish.finishReason === 'stop' && receivedReasoning
++  if (reasoningOnlyStop) return REASONING_ONLY_RECOVERY
+ 
+   return null
+ }

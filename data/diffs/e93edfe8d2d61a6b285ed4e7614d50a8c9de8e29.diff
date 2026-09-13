@@ -1,0 +1,760 @@
+diff --git a/cli/src/hooks/use-freebuff-session.ts b/cli/src/hooks/use-freebuff-session.ts
+index 86d87f5cb..1a91bbde4 100644
+--- a/cli/src/hooks/use-freebuff-session.ts
++++ b/cli/src/hooks/use-freebuff-session.ts
+@@ -36,6 +36,7 @@ import {
+   callFreebuffSession,
+   FreebuffSessionRequestError,
+   holdsLiveFreebuffSlot,
++  mergeCompactActiveSession,
+   releaseFreebuffSlot,
+ } from '../utils/freebuff-session-api'
+ import {
+@@ -367,6 +368,9 @@ export function useFreebuffSession(): UseFreebuffSessionResult {
+     let abortController = new AbortController()
+     let timer: ReturnType<typeof setTimeout> | null = null
+     let previousStatus: FreebuffSessionResponse['status'] | null = null
++    // A compact response for an unexpected session identity has no safe quota
++    // snapshot to retain, so force exactly one rich poll to restore it.
++    let needsFullActivePoll = false
+     let restartGeneration = 0
+     let consecutiveFailures = 0
+     // Method for the NEXT tick. GET is read-only; POST claims/rotates a seat.
+@@ -408,6 +412,8 @@ export function useFreebuffSession(): UseFreebuffSessionResult {
+       const method = nextMethod
+       const instanceId = getFreebuffInstanceId()
+       const model = getSelectedFreebuffModel()
++      const compact =
++        method === 'GET' && previousStatus === 'active' && !needsFullActivePoll
+       const fetchController = abortController
+       const generation = restartGeneration
+       try {
+@@ -415,6 +421,7 @@ export function useFreebuffSession(): UseFreebuffSessionResult {
+           signal: fetchController.signal,
+           instanceId,
+           model,
++          compact,
+         })
+         if (
+           cancelled ||
+@@ -590,7 +597,21 @@ export function useFreebuffSession(): UseFreebuffSessionResult {
+           return
+         }
+ 
+-        apply(next)
++        if (compact && next.status === 'active') {
++          const merged = mergeCompactActiveSession(
++            useFreebuffSessionStore.getState().session,
++            next,
++          )
++          needsFullActivePoll = merged === null
++          apply(merged ?? next)
++        } else {
++          needsFullActivePoll = false
++          apply(next)
++        }
++        if (needsFullActivePoll) {
++          schedule(0)
++          return
++        }
+         const delay = nextDelayMs(next)
+         if (delay !== null) schedule(delay)
+       } catch (err) {
+@@ -631,6 +652,7 @@ export function useFreebuffSession(): UseFreebuffSessionResult {
+         // a forced restart, and so the active|ended → none synthesis below
+         // doesn't bounce a 'landing' restart straight back to 'ended'.
+         previousStatus = null
++        needsFullActivePoll = false
+         consecutiveFailures = 0
+         if (mode === 'landing') {
+           nextMethod = 'GET'
+diff --git a/cli/src/utils/__tests__/freebuff-session-api.test.ts b/cli/src/utils/__tests__/freebuff-session-api.test.ts
+index e99595979..487a8461b 100644
+--- a/cli/src/utils/__tests__/freebuff-session-api.test.ts
++++ b/cli/src/utils/__tests__/freebuff-session-api.test.ts
+@@ -4,7 +4,10 @@ import {
+   resolveFreebuffModelForAccessTier,
+ } from '@codebuff/common/constants/freebuff-models'
+ 
+-import { callFreebuffSession } from '../freebuff-session-api'
++import {
++  callFreebuffSession,
++  mergeCompactActiveSession,
++} from '../freebuff-session-api'
+ 
+ let fetchSpy: ReturnType<typeof spyOn> | undefined
+ 
+@@ -32,3 +35,88 @@ test('full-tier referral GLM reaches the session POST header unchanged', async (
+     FREEBUFF_GLM_V52_MODEL_ID,
+   )
+ })
++
++test('compact GET sends the compact-session header', async () => {
++  fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
++    Response.json({ status: 'active', model: 'model', instanceId: 'i1' }),
++  )
++
++  await callFreebuffSession('GET', 'test-token', {
++    instanceId: 'i1',
++    compact: true,
++  })
++
++  const [, init] = fetchSpy.mock.calls[0]!
++  expect(new Headers(init?.headers).get('x-freebuff-compact-session')).toBe('1')
++})
++
++test('compact active state retains the admission quota snapshot', () => {
++  const rateLimit = {
++    model: 'model',
++    limit: 5,
++    period: 'pacific_day' as const,
++    resetTimeZone: 'America/Los_Angeles' as const,
++    resetAt: '2026-08-06T07:00:00.000Z',
++    windowHours: 1,
++    recentCount: 2,
++    entitlementBreakdown: { base: 5, referral: 0, streak: 0 },
++  }
++  const merged = mergeCompactActiveSession(
++    {
++      status: 'active',
++      accessTier: 'full',
++      model: 'model',
++      instanceId: 'i1',
++      admittedAt: '2026-08-05T12:00:00.000Z',
++      expiresAt: '2026-08-05T13:00:00.000Z',
++      remainingMs: 1_000,
++      rateLimit,
++    },
++    {
++      status: 'active',
++      accessTier: 'full',
++      model: 'model',
++      instanceId: 'i1',
++      admittedAt: '2026-08-05T12:00:00.000Z',
++      expiresAt: '2026-08-05T13:00:00.000Z',
++      remainingMs: 500,
++    },
++  )
++
++  expect(merged).toMatchObject({ remainingMs: 500, rateLimit })
++})
++
++test('compact state requests a full refresh instead of carrying quota across models', () => {
++  const merged = mergeCompactActiveSession(
++    {
++      status: 'active',
++      accessTier: 'full',
++      model: 'old-model',
++      instanceId: 'i1',
++      admittedAt: '2026-08-05T12:00:00.000Z',
++      expiresAt: '2026-08-05T13:00:00.000Z',
++      remainingMs: 1_000,
++      rateLimit: {
++        model: 'old-model',
++        limit: 5,
++        period: 'pacific_day',
++        resetTimeZone: 'America/Los_Angeles',
++        resetAt: '2026-08-06T07:00:00.000Z',
++        windowHours: 1,
++        recentCount: 2,
++        entitlementBreakdown: { base: 5, referral: 0, streak: 0 },
++      },
++    },
++    {
++      status: 'active',
++      accessTier: 'full',
++      model: 'new-model',
++      instanceId: 'i1',
++      admittedAt: '2026-08-05T12:00:00.000Z',
++      expiresAt: '2026-08-05T13:00:00.000Z',
++      remainingMs: 500,
++    },
++  )
++
++  expect(merged).toBeNull()
++})
+diff --git a/cli/src/utils/freebuff-session-api.ts b/cli/src/utils/freebuff-session-api.ts
+index 3116a47ca..f23307173 100644
+--- a/cli/src/utils/freebuff-session-api.ts
++++ b/cli/src/utils/freebuff-session-api.ts
+@@ -1,4 +1,9 @@
+ import { env } from '@codebuff/common/env'
++import {
++  FREEBUFF_COMPACT_SESSION_HEADER,
++  FREEBUFF_INSTANCE_HEADER,
++  FREEBUFF_MODEL_HEADER,
++} from '@codebuff/common/constants/freebuff-models'
+ 
+ import { useFreebuffSessionStore } from '../state/freebuff-session-store'
+ import { getAuthTokenDetails } from './auth'
+@@ -8,9 +13,6 @@ import type { FreebuffSessionResponse } from '../types/freebuff-session'
+ import type { FreebuffSessionServerResponse } from '@codebuff/common/types/freebuff-session'
+ 
+ const SESSION_FETCH_TIMEOUT_MS = 20_000
+-const FREEBUFF_INSTANCE_HEADER = 'x-freebuff-instance-id'
+-const FREEBUFF_MODEL_HEADER = 'x-freebuff-model'
+-
+ export class FreebuffSessionRequestError extends Error {
+   constructor(
+     message: string,
+@@ -55,12 +57,20 @@ function sessionEndpoint(): string {
+ export async function callFreebuffSession(
+   method: 'POST' | 'GET' | 'DELETE',
+   token: string,
+-  opts: { instanceId?: string; model?: string; signal?: AbortSignal } = {},
++  opts: {
++    instanceId?: string
++    model?: string
++    signal?: AbortSignal
++    compact?: boolean
++  } = {},
+ ): Promise<FreebuffSessionServerResponse> {
+   const headers: Record<string, string> = { Authorization: `Bearer ${token}` }
+   if (method === 'GET' && opts.instanceId) {
+     headers[FREEBUFF_INSTANCE_HEADER] = opts.instanceId
+   }
++  if (method === 'GET' && opts.compact) {
++    headers[FREEBUFF_COMPACT_SESSION_HEADER] = '1'
++  }
+   if (method === 'POST' && opts.model) {
+     headers[FREEBUFF_MODEL_HEADER] = opts.model
+   }
+@@ -125,6 +135,28 @@ export async function callFreebuffSession(
+   return (await response.json()) as FreebuffSessionServerResponse
+ }
+ 
++/** A compact poll omits quota fields that were already returned by admission.
++ * Keep that snapshot only for the same active session; null tells the poller
++ * to fetch one full response before compacting again. */
++export function mergeCompactActiveSession(
++  current: FreebuffSessionResponse | null,
++  next: FreebuffSessionServerResponse,
++): FreebuffSessionServerResponse | null {
++  if (
++    current?.status !== 'active' ||
++    next.status !== 'active' ||
++    current.instanceId !== next.instanceId ||
++    current.model !== next.model
++  ) {
++    return null
++  }
++  return {
++    ...next,
++    rateLimit: next.rateLimit ?? current.rateLimit,
++    rateLimitsByModel: next.rateLimitsByModel ?? current.rateLimitsByModel,
++  }
++}
++
+ export function holdsLiveFreebuffSlot(
+   current: FreebuffSessionResponse | null,
+ ): boolean {
+diff --git a/common/src/constants/agents.ts b/common/src/constants/agents.ts
+index 5737b7761..0770fa169 100644
+--- a/common/src/constants/agents.ts
++++ b/common/src/constants/agents.ts
+@@ -93,3 +93,7 @@ export const AGENT_NAME_TO_TYPES = Object.entries(AGENT_NAMES).reduce(
+ )
+ 
+ export const MAX_AGENT_STEPS_DEFAULT = 200
++
++// Programmatic tool calls can persist additional rows without consuming the
++// LLM-call budget, so keep the transport limit separate and safely bounded.
++export const MAX_AGENT_STEP_ROWS = 1_000
+diff --git a/common/src/constants/freebuff-models.ts b/common/src/constants/freebuff-models.ts
+index fc0cf78ba..1adb77e46 100644
+--- a/common/src/constants/freebuff-models.ts
++++ b/common/src/constants/freebuff-models.ts
+@@ -831,6 +831,10 @@ export const FREEBUFF_ACTING_USER_HEADER = 'x-freebuff-acting-user-id'
+  * quota snapshots so it can render accurate "N of M sessions" labels. */
+ export const FREEBUFF_INCLUDE_UNUSED_RATE_LIMITS_HEADER =
+   'x-freebuff-include-unused-rate-limits'
++/** Set by the CLI on its recurring active-session poll. The response keeps the
++ *  authoritative session state but omits quota snapshots the CLI already has
++ *  and does not need for its countdown. */
++export const FREEBUFF_COMPACT_SESSION_HEADER = 'x-freebuff-compact-session'
+ /** Set to '1' by Freebuff Desktop to opt into multi-session mode (concurrent
+  *  per-tab sessions); absent for CLI/web, which keep one session per user. */
+ export const FREEBUFF_MULTI_SESSION_HEADER = 'x-freebuff-multi-session'
+diff --git a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+index 7095bdbf9..a49dc7927 100644
+--- a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
++++ b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+@@ -563,10 +563,14 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+     }
+ 
+     let llmCallNumber = 0
++    const llmStepNumbers: string[] = []
+     let capturedAgentState: AgentState | null = null
+ 
+-    loopAgentStepsBaseParams.promptAiSdkStream = async function* ({}) {
++    loopAgentStepsBaseParams.promptAiSdkStream = async function* ({
++      extraCodebuffMetadata,
++    }) {
+       llmCallNumber++
++      llmStepNumbers.push(extraCodebuffMetadata?.llm_step_number ?? '')
+       if (llmCallNumber === 1) {
+         // First call: agent tries to end turn without setting output
+         yield {
+@@ -609,6 +613,7 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+ 
+     // Should call LLM twice: once to try ending without output, once after reminder
+     expect(llmCallNumber).toBe(2)
++    expect(llmStepNumbers).toEqual(['1', '2'])
+ 
+     // Should have output set after the second attempt
+     expect(result.agentState.output).toEqual({
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index b268e56be..8ce0bb2b6 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -977,6 +977,7 @@ export async function loopAgentSteps(
+   let currentPrompt = prompt
+   let currentParams = spawnParams
+   let totalSteps = 0
++  let llmStepNumber = 0
+   let nResponses: string[] | undefined = undefined
+ 
+   try {
+@@ -1100,6 +1101,7 @@ export async function loopAgentSteps(
+ 
+       const creditsBefore = currentAgentState.directCreditsUsed
+       const childrenBefore = currentAgentState.childRunIds.length
++      llmStepNumber++
+       const {
+         agentState: newAgentState,
+         shouldEndTurn: llmShouldEndTurn,
+@@ -1110,6 +1112,10 @@ export async function loopAgentSteps(
+ 
+         agentState: currentAgentState,
+         agentTemplate,
++        extraCodebuffMetadata: {
++          ...(params.extraCodebuffMetadata ?? {}),
++          llm_step_number: String(llmStepNumber),
++        },
+         n,
+         prompt: currentPrompt,
+         runId,
+diff --git a/sdk/src/impl/__tests__/agent-step-batching.test.ts b/sdk/src/impl/__tests__/agent-step-batching.test.ts
+new file mode 100644
+index 000000000..d363814e0
+--- /dev/null
++++ b/sdk/src/impl/__tests__/agent-step-batching.test.ts
+@@ -0,0 +1,206 @@
++import { afterEach, describe, expect, mock, test } from 'bun:test'
++import { MAX_AGENT_STEP_ROWS } from '@codebuff/common/constants/agents'
++
++import { addAgentStep, finishAgentRun } from '../database'
++
++import type {
++  AddAgentStepFn,
++  FinishAgentRunFn,
++} from '@codebuff/common/types/contracts/database'
++import type { Logger } from '@codebuff/common/types/contracts/logger'
++
++const originalFetch = globalThis.fetch
++const logger = {
++  debug: () => {},
++  info: () => {},
++  warn: () => {},
++  error: () => {},
++} as Logger
++
++afterEach(() => {
++  globalThis.fetch = originalFetch
++  mock.restore()
++})
++
++function step(
++  runId: string,
++  stepNumber: number,
++): Parameters<AddAgentStepFn>[0] {
++  return {
++    apiKey: 'key',
++    userId: 'user',
++    agentRunId: runId,
++    stepNumber,
++    messageId: null,
++    startTime: new Date('2026-08-05T12:00:00.000Z'),
++    logger,
++  }
++}
++
++function finishedRun(runId: string): Parameters<FinishAgentRunFn>[0] {
++  return {
++    apiKey: 'key',
++    userId: 'user',
++    runId,
++    status: 'completed',
++    totalSteps: 3,
++    directCredits: 1,
++    totalCredits: 1,
++    logger,
++  }
++}
++
++function captureRequestBodies(): unknown[] {
++  const bodies: unknown[] = []
++  globalThis.fetch = mock(async (_input, init) => {
++    bodies.push(JSON.parse(String(init?.body)))
++    return Response.json({ success: true })
++  }) as unknown as typeof fetch
++  return bodies
++}
++
++describe('agent step batching', () => {
++  test('includes all pending steps in the finish request', async () => {
++    const bodies = captureRequestBodies()
++    const runId = 'tail-run'
++
++    await addAgentStep(step(runId, 1))
++    await addAgentStep(step(runId, 2))
++    await addAgentStep(step(runId, 3))
++    expect(bodies).toHaveLength(0)
++
++    await finishAgentRun(finishedRun(runId))
++
++    expect(bodies).toHaveLength(1)
++    expect(bodies[0]).toMatchObject({
++      action: 'FINISH',
++      runId,
++      steps: [{ stepNumber: 1 }, { stepNumber: 2 }, { stepNumber: 3 }],
++    })
++    expect(
++      (bodies[0] as { steps: Array<{ id: string; startTime: string }> }).steps,
++    ).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({
++          id: expect.any(String),
++          startTime: '2026-08-05T12:00:00.000Z',
++        }),
++      ]),
++    )
++  })
++
++  test('snapshots mutable step inputs when the step completes', async () => {
++    const bodies = captureRequestBodies()
++    const childRunIds = ['child-1']
++    const startTime = new Date('2026-08-05T12:00:00.000Z')
++
++    await addAgentStep({
++      ...step('snapshot-run', 1),
++      childRunIds,
++      startTime,
++    })
++    childRunIds.push('child-2')
++    startTime.setUTCFullYear(2030)
++
++    await finishAgentRun(finishedRun('snapshot-run'))
++
++    expect(bodies[0]).toMatchObject({
++      steps: [
++        {
++          childRunIds: ['child-1'],
++          startTime: '2026-08-05T12:00:00.000Z',
++        },
++      ],
++    })
++  })
++
++  test('does not let an invalid step timestamp poison run completion', async () => {
++    const bodies = captureRequestBodies()
++    const result = await addAgentStep({
++      ...step('invalid-date-run', 1),
++      startTime: new Date(Number.NaN),
++    })
++
++    await finishAgentRun(finishedRun('invalid-date-run'))
++
++    expect(result).toBeNull()
++    expect(bodies[0]).toMatchObject({
++      action: 'FINISH',
++      runId: 'invalid-date-run',
++      steps: [],
++    })
++  })
++
++  test('keeps concurrent runs isolated and clears each finished buffer', async () => {
++    const bodies = captureRequestBodies()
++
++    await addAgentStep(step('run-a', 1))
++    await addAgentStep(step('run-b', 2))
++    await finishAgentRun(finishedRun('run-a'))
++    await finishAgentRun(finishedRun('run-b'))
++    await finishAgentRun(finishedRun('run-a'))
++
++    expect(
++      bodies.map((body) => (body as { steps: unknown[] }).steps.length),
++    ).toEqual([1, 1, 0])
++    expect(bodies[0]).toMatchObject({
++      runId: 'run-a',
++      steps: [{ stepNumber: 1 }],
++    })
++    expect(bodies[1]).toMatchObject({
++      runId: 'run-b',
++      steps: [{ stepNumber: 2 }],
++    })
++  })
++
++  test('bounds the number of buffered steps per run', async () => {
++    const bodies = captureRequestBodies()
++    const runId = 'bounded-steps-run'
++
++    for (let index = 0; index < MAX_AGENT_STEP_ROWS; index++) {
++      expect(await addAgentStep(step(runId, index + 1))).not.toBeNull()
++    }
++    expect(
++      await addAgentStep(step(runId, MAX_AGENT_STEP_ROWS + 1)),
++    ).toBeNull()
++
++    await finishAgentRun(finishedRun(runId))
++
++    expect((bodies[0] as { steps: unknown[] }).steps).toHaveLength(
++      MAX_AGENT_STEP_ROWS,
++    )
++  })
++
++  test('evicts the oldest abandoned run when the buffer map is full', async () => {
++    const selectedBodies: Array<{ runId: string; steps: unknown[] }> = []
++    globalThis.fetch = mock(async (_input, init) => {
++      const body = JSON.parse(String(init?.body)) as {
++        runId: string
++        steps: unknown[]
++      }
++      if (body.runId === 'abandoned-0' || body.runId === 'abandoned-1000') {
++        selectedBodies.push(body)
++      }
++      return Response.json({ success: true })
++    }) as unknown as typeof fetch
++
++    for (let index = 0; index <= 1_000; index++) {
++      await addAgentStep(step(`abandoned-${index}`, 1))
++    }
++    await finishAgentRun(finishedRun('abandoned-0'))
++    await finishAgentRun(finishedRun('abandoned-1000'))
++    for (let index = 1; index < 1_000; index++) {
++      await finishAgentRun(finishedRun(`abandoned-${index}`))
++    }
++
++    expect(selectedBodies).toHaveLength(2)
++    expect(selectedBodies[0]).toMatchObject({
++      runId: 'abandoned-0',
++      steps: [],
++    })
++    expect(selectedBodies[1]).toMatchObject({
++      runId: 'abandoned-1000',
++      steps: [expect.any(Object)],
++    })
++  })
++})
+diff --git a/sdk/src/impl/__tests__/delegated-user-header.test.ts b/sdk/src/impl/__tests__/delegated-user-header.test.ts
+index 61a19f139..a3af559e6 100644
+--- a/sdk/src/impl/__tests__/delegated-user-header.test.ts
++++ b/sdk/src/impl/__tests__/delegated-user-header.test.ts
+@@ -33,7 +33,7 @@ describe('SDK delegated user headers', () => {
+     })
+   })
+ 
+-  test('sends userId on agent run and step requests', async () => {
++  test('sends userId on agent run requests', async () => {
+     const requests: RequestInit[] = []
+     globalThis.fetch = mock(async (_input, init) => {
+       requests.push(init ?? {})
+@@ -54,6 +54,15 @@ describe('SDK delegated user headers', () => {
+       ancestorRunIds: [],
+       logger,
+     })
++    await addAgentStep({
++      apiKey: 'service-key',
++      userId: 'end-user',
++      agentRunId: 'run-1',
++      stepNumber: 1,
++      messageId: null,
++      startTime: new Date(),
++      logger,
++    })
+     await finishAgentRun({
+       apiKey: 'service-key',
+       userId: 'end-user',
+@@ -64,17 +73,8 @@ describe('SDK delegated user headers', () => {
+       totalCredits: 1,
+       logger,
+     })
+-    await addAgentStep({
+-      apiKey: 'service-key',
+-      userId: 'end-user',
+-      agentRunId: 'run-1',
+-      stepNumber: 1,
+-      messageId: null,
+-      startTime: new Date(),
+-      logger,
+-    })
+ 
+-    expect(requests).toHaveLength(3)
++    expect(requests).toHaveLength(2)
+     for (const request of requests) {
+       expect(request.headers).toMatchObject({
+         [FREEBUFF_ACTING_USER_HEADER]: 'end-user',
+diff --git a/sdk/src/impl/database.ts b/sdk/src/impl/database.ts
+index 0716457a4..337f2c7e5 100644
+--- a/sdk/src/impl/database.ts
++++ b/sdk/src/impl/database.ts
+@@ -1,3 +1,4 @@
++import { MAX_AGENT_STEP_ROWS } from '@codebuff/common/constants/agents'
+ import { FREEBUFF_ACTING_USER_HEADER } from '@codebuff/common/constants/freebuff-models'
+ import { validateSingleAgent } from '@codebuff/common/templates/agent-validation'
+ import { DynamicAgentTemplateSchema } from '@codebuff/common/types/dynamic-agent-template'
+@@ -381,6 +382,8 @@ export async function finishAgentRun(
+     errorMessage,
+     logger,
+   } = params
++  const steps = pendingAgentSteps.get(runId) ?? []
++  pendingAgentSteps.delete(runId)
+ 
+   const url = new URL(`/api/v1/agent-runs`, getWebsiteUrl())
+ 
+@@ -405,6 +408,7 @@ export async function finishAgentRun(
+             errorMessage === undefined
+               ? undefined
+               : truncateString(errorMessage, 5000),
++          steps,
+         }),
+       },
+       logger,
+@@ -422,75 +426,79 @@ export async function finishAgentRun(
+   }
+ }
+ 
++const pendingAgentStepSchema = z.object({
++  id: z.string().uuid(),
++  stepNumber: z.number().int().nonnegative(),
++  credits: z.number().nonnegative().optional(),
++  childRunIds: z.array(z.string()).optional(),
++  messageId: z.string().nullable(),
++  status: z.enum(['running', 'completed', 'skipped']).optional(),
++  errorMessage: z.string().optional(),
++  startTime: z.string().datetime(),
++})
++type PendingAgentStep = z.infer<typeof pendingAgentStepSchema>
++
++const pendingAgentSteps = new Map<string, PendingAgentStep[]>()
++const MAX_PENDING_AGENT_RUNS = 1_000
++
+ export async function addAgentStep(
+   params: ParamsOf<AddAgentStepFn>,
+ ): ReturnType<AddAgentStepFn> {
+-  const {
+-    apiKey,
+-    userId,
+-    agentRunId,
+-    stepNumber,
+-    credits,
+-    childRunIds,
+-    messageId,
+-    status = 'completed',
+-    errorMessage,
++  const id = crypto.randomUUID()
++  const startTime =
++    params.startTime instanceof Date ? params.startTime.toJSON() : null
++  const parsedStep = pendingAgentStepSchema.safeParse({
++    id,
++    stepNumber: params.stepNumber,
++    credits: params.credits,
++    childRunIds: params.childRunIds,
++    messageId: params.messageId,
++    status: params.status,
++    errorMessage: params.errorMessage,
+     startTime,
+-    logger,
+-  } = params
+-
+-  const url = new URL(`/api/v1/agent-runs/${agentRunId}/steps`, getWebsiteUrl())
+-
+-  try {
+-    const response = await fetchWithRetry(
+-      url,
++  })
++  if (!parsedStep.success) {
++    params.logger.error(
+       {
+-        method: 'POST',
+-        headers: {
+-          Authorization: `Bearer ${apiKey}`,
+-          ...(userId ? { [FREEBUFF_ACTING_USER_HEADER]: userId } : {}),
+-        },
+-        body: JSON.stringify({
+-          stepNumber,
+-          credits,
+-          childRunIds,
+-          messageId,
+-          status,
+-          errorMessage,
+-          startTime,
+-        }),
++        agentRunId: params.agentRunId,
++        stepNumber: params.stepNumber,
++        validationError: parsedStep.error,
+       },
+-      logger,
++      'addAgentStep received invalid step data',
+     )
+-
+-    const responseBody = await response.json()
+-    if (!response.ok) {
+-      logger.error({ responseBody }, 'addAgentStep request failed')
+-      return null
+-    }
+-
+-    if (!responseBody?.stepId) {
+-      logger.error(
+-        { responseBody },
+-        'no stepId found from addAgentStep request',
+-      )
++    return null
++  }
++  let entries = pendingAgentSteps.get(params.agentRunId)
++  if (!entries) {
++    if (pendingAgentSteps.size >= MAX_PENDING_AGENT_RUNS) {
++      const oldestRunId = pendingAgentSteps.keys().next().value
++      if (oldestRunId !== undefined) {
++        pendingAgentSteps.delete(oldestRunId)
++        params.logger.warn(
++          { evictedRunId: oldestRunId, maxPendingRuns: MAX_PENDING_AGENT_RUNS },
++          'Evicted abandoned agent-step buffer',
++        )
++      }
+     }
+-    return responseBody.stepId ?? null
+-  } catch (error) {
+-    logger.error(
++    entries = []
++    pendingAgentSteps.set(params.agentRunId, entries)
++  } else {
++    // Refresh insertion order so the map cap evicts abandoned buffers before
++    // long-running agents that are still producing steps.
++    pendingAgentSteps.delete(params.agentRunId)
++    pendingAgentSteps.set(params.agentRunId, entries)
++  }
++  if (entries.length >= MAX_AGENT_STEP_ROWS) {
++    params.logger.warn(
+       {
+-        error: getErrorObject(error),
+-        agentRunId,
+-        stepNumber,
+-        credits,
+-        childRunIds,
+-        messageId,
+-        status,
+-        errorMessage,
+-        startTime,
++        agentRunId: params.agentRunId,
++        stepNumber: params.stepNumber,
++        maxSteps: MAX_AGENT_STEP_ROWS,
+       },
+-      'addAgentStep error',
++      'Ignored agent step beyond the per-run buffer limit',
+     )
+     return null
+   }
++  entries.push(parsedStep.data)
++  return id
+ }

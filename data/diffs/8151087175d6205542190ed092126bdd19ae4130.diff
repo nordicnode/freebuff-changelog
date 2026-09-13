@@ -1,0 +1,328 @@
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index 674eb8b50..888ea4603 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -380,6 +380,7 @@ export const Chat = ({
+     queuePaused,
+     streamMessageIdRef,
+     addToQueue,
++    addToQueueFront,
+     stopStreaming,
+     setCanProcessQueue,
+     pauseQueue,
+@@ -460,6 +461,7 @@ export const Chat = ({
+     isQueuePausedRef,
+     isProcessingQueueRef,
+     resumeQueue,
++    requeueMessageAtFront: addToQueueFront,
+     continueChat,
+     continueChatId,
+     subscriptionData,
+diff --git a/cli/src/hooks/helpers/send-message.ts b/cli/src/hooks/helpers/send-message.ts
+index 5ff3877a4..7a59d24f8 100644
+--- a/cli/src/hooks/helpers/send-message.ts
++++ b/cli/src/hooks/helpers/send-message.ts
+@@ -337,6 +337,10 @@ export const handleRunCompletion = (params: {
+   updater: BatchedMessageUpdater
+   aiMessageId: string
+   wasAbortedByUser: boolean
++  /** Whether the run streamed any content before finishing. A freebuff gate
++   *  rejection with no content means the prompt was consumed unprocessed —
++   *  surfaced as an inline error instead of silently looking sent. */
++  hasReceivedContent?: boolean
+   setStreamStatus: (status: StreamStatus) => void
+   setCanProcessQueue: (can: boolean) => void
+   updateChainInProgress: (value: boolean) => void
+@@ -413,7 +417,9 @@ export const handleRunCompletion = (params: {
+ 
+     const gateKind = getFreebuffGateErrorKind(output)
+     if (gateKind) {
+-      handleFreebuffGateError(gateKind, updater)
++      handleFreebuffGateError(gateKind, updater, {
++        messageWasDropped: params.hasReceivedContent === false,
++      })
+       finalizeAfterError()
+       return
+     }
+@@ -476,6 +482,8 @@ export const handleRunError = (params: {
+   updateChainInProgress: (value: boolean) => void
+   isProcessingQueueRef?: MutableRefObject<boolean>
+   isQueuePausedRef?: MutableRefObject<boolean>
++  /** See handleRunCompletion — flags an unprocessed prompt on gate errors. */
++  hasReceivedContent?: boolean
+ }) => {
+   const {
+     error,
+@@ -487,6 +495,7 @@ export const handleRunError = (params: {
+     updateChainInProgress,
+     isProcessingQueueRef,
+     isQueuePausedRef,
++    hasReceivedContent,
+   } = params
+ 
+   const errorInfo = getErrorObject(error, { includeRawError: true })
+@@ -523,7 +532,9 @@ export const handleRunError = (params: {
+ 
+   const gateKind = getFreebuffGateErrorKind(error)
+   if (gateKind) {
+-    handleFreebuffGateError(gateKind, updater)
++    handleFreebuffGateError(gateKind, updater, {
++      messageWasDropped: hasReceivedContent === false,
++    })
+     return
+   }
+ 
+@@ -548,6 +559,7 @@ export const handleRunError = (params: {
+ function handleFreebuffGateError(
+   kind: ReturnType<typeof getFreebuffGateErrorKind>,
+   updater: BatchedMessageUpdater,
++  opts: { messageWasDropped?: boolean } = {},
+ ) {
+   switch (kind) {
+     case 'session_expired':
+@@ -559,6 +571,15 @@ function handleFreebuffGateError(
+       // agent is still working even though the SessionEndedBanner is visible
+       // and actionable. Also disposes the batched-updater flush interval.
+       updater.markComplete()
++      // Rejected before producing anything (the run-start guard missed
++      // because only the server knew the slot was gone): the prompt won't be
++      // processed and isn't re-queued, so say so instead of leaving it
++      // looking sent. Runs that got partway keep the quieter banner-only UX.
++      if (opts.messageWasDropped) {
++        updater.setError(
++          'Your free session ended before this message was processed. Send it again after starting a new session.',
++        )
++      }
+       // Flip to `ended` instead of auto re-queuing: the Chat surface stays
+       // mounted so any in-flight agent work can finish under the server-side
+       // grace period, and the session-ended banner prompts the user to press
+diff --git a/cli/src/hooks/use-chat-streaming.ts b/cli/src/hooks/use-chat-streaming.ts
+index 2b6dbd888..f938a01e7 100644
+--- a/cli/src/hooks/use-chat-streaming.ts
++++ b/cli/src/hooks/use-chat-streaming.ts
+@@ -19,6 +19,7 @@ import { useTimeout } from './use-timeout'
+ import { useChatStore } from '../state/chat-store'
+ import { useFreebuffSessionStore } from '../state/freebuff-session-store'
+ import { IS_FREEBUFF } from '../utils/constants'
++import { logger } from '../utils/logger'
+ 
+ import type { ElapsedTimeTracker } from './use-elapsed-time'
+ import type { PendingAttachment } from '../types/store'
+@@ -57,6 +58,7 @@ export interface UseChatStreamingReturn {
+   queuePaused: boolean
+   streamMessageIdRef: MutableRefObject<string | null>
+   addToQueue: (message: string, attachments?: PendingAttachment[]) => void
++  addToQueueFront: (message: QueuedMessage) => void
+   stopStreaming: () => void
+   setCanProcessQueue: (value: boolean | ((prev: boolean) => boolean)) => void
+   pauseQueue: () => void
+@@ -144,6 +146,15 @@ export function useChatStreaming({
+   // so queued work resumes in the new session.
+   const freebuffSession = useFreebuffSessionStore((s) => s.session)
+   const sendBlocked = IS_FREEBUFF && !holdsLiveFreebuffSlot(freebuffSession)
++  // Log the transition once, not per render — the hold can last indefinitely.
++  useEffect(() => {
++    if (sendBlocked) {
++      logger.info(
++        {},
++        '[chat-streaming] Freebuff session over; holding queued messages until rejoin',
++      )
++    }
++  }, [sendBlocked])
+ 
+   // Message queue
+   const {
+@@ -152,6 +163,7 @@ export function useChatStreaming({
+     queuePaused,
+     streamMessageIdRef,
+     addToQueue,
++    addToQueueFront,
+     stopStreaming,
+     setStreamStatus,
+     setCanProcessQueue,
+@@ -226,6 +238,7 @@ export function useChatStreaming({
+     queuePaused,
+     streamMessageIdRef,
+     addToQueue,
++    addToQueueFront,
+     stopStreaming,
+     setCanProcessQueue,
+     pauseQueue,
+diff --git a/cli/src/hooks/use-freebuff-session.ts b/cli/src/hooks/use-freebuff-session.ts
+index d40a78454..ce24a1e9a 100644
+--- a/cli/src/hooks/use-freebuff-session.ts
++++ b/cli/src/hooks/use-freebuff-session.ts
+@@ -191,19 +191,14 @@ interface PollController {
+ 
+ let controller: PollController | null = null
+ 
+-/** Read the current instance id for outgoing chat requests. Includes `ended`
+- *  so in-flight agent work can keep streaming during the server-side grace
+- *  window (server keeps the row alive until `expires_at + grace`). */
++/** Read the current instance id for outgoing chat requests. Defined via
++ *  `holdsLiveFreebuffSlot` so the two can't drift: an id exists exactly while
++ *  we hold a live slot (active, or `ended` inside the server-side grace
++ *  window where the row stays alive until `expires_at + grace`). */
+ export function getFreebuffInstanceId(): string | undefined {
+   const current = useFreebuffSessionStore.getState().session
+-  if (!current) return undefined
+-  switch (current.status) {
+-    case 'active':
+-    case 'ended':
+-      return current.instanceId
+-    default:
+-      return undefined
+-  }
++  if (!current || !holdsLiveFreebuffSlot(current)) return undefined
++  return 'instanceId' in current ? current.instanceId : undefined
+ }
+ 
+ /** True when the session represents a server-side slot the caller is
+diff --git a/cli/src/hooks/use-message-queue.ts b/cli/src/hooks/use-message-queue.ts
+index 64c965116..d11331893 100644
+--- a/cli/src/hooks/use-message-queue.ts
++++ b/cli/src/hooks/use-message-queue.ts
+@@ -93,11 +93,10 @@ export const useMessageQueue = (
+     // External hold: sending is currently pointless (e.g. freebuff session
+     // fully ended — requests without a live session are rejected). Leave the
+     // messages queued; the effect below re-runs when sendBlocked flips false.
++    // No log here: unlike the transient busy branches above, this state can
++    // persist for the whole hold, and this path re-runs on every render —
++    // the transition is logged once by the caller instead.
+     if (sendBlocked) {
+-      logger.debug(
+-        { queueLength },
+-        '[message-queue] Queue blocked: sending unavailable',
+-      )
+       return
+     }
+ 
+@@ -233,6 +232,18 @@ export const useMessageQueue = (
+     [],
+   )
+ 
++  /** Put a message back at the HEAD of the queue. Used when a send was
++   *  aborted before it did anything (e.g. the freebuff session ended between
++   *  dequeue and run start) so the message keeps its place instead of being
++   *  consumed. */
++  const addToQueueFront = useCallback((message: QueuedMessage) => {
++    setQueuedMessages((prev) => {
++      const newQueue = [message, ...prev]
++      queuedMessagesRef.current = newQueue
++      return newQueue
++    })
++  }, [])
++
+   const pauseQueue = useCallback(() => {
+     isQueuePausedRef.current = true
+     setQueuePausedState(true)
+@@ -269,6 +280,7 @@ export const useMessageQueue = (
+     queuePaused,
+     streamMessageIdRef,
+     addToQueue,
++    addToQueueFront,
+     startStreaming,
+     stopStreaming,
+     setStreamStatus,
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index 3af0234e2..ece3693cb 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -5,7 +5,10 @@ import { useCallback, useEffect, useRef } from 'react'
+ import { setCurrentChatId } from '../project-files'
+ import { createStreamController } from './stream-state'
+ import { useChatStore } from '../state/chat-store'
+-import { getFreebuffInstanceId } from './use-freebuff-session'
++import {
++  getFreebuffInstanceId,
++  markFreebuffSessionEnded,
++} from './use-freebuff-session'
+ import { getCodebuffClient } from '../utils/codebuff-client'
+ import { AGENT_MODE_TO_COST_MODE, IS_FREEBUFF } from '../utils/constants'
+ import { createEventHandlerState } from '../utils/create-event-handler-state'
+@@ -69,6 +72,13 @@ interface UseSendMessageOptions {
+   isQueuePausedRef?: React.MutableRefObject<boolean>
+   isProcessingQueueRef?: React.MutableRefObject<boolean>
+   resumeQueue?: () => void
++  /** Put a message back at the head of the queue. Used by the freebuff
++   *  run-start guard so a message that can't be sent (session fully over)
++   *  is held for the next session instead of consumed. */
++  requeueMessageAtFront?: (message: {
++    content: string
++    attachments: PendingAttachment[]
++  }) => void
+   continueChat: boolean
+   continueChatId?: string
+   subscriptionData?: SubscriptionResponse | null
+@@ -120,6 +130,7 @@ export const useSendMessage = ({
+   isQueuePausedRef,
+   isProcessingQueueRef,
+   resumeQueue,
++  requeueMessageAtFront,
+   continueChat,
+   continueChatId,
+   subscriptionData,
+@@ -245,6 +256,24 @@ export const useSendMessage = ({
+       updateChainInProgress(true)
+       setCanProcessQueue(false)
+ 
++      // Freebuff run-start guard: without a live session slot the server
++      // rejects the request outright, consuming the message. Hold it at the
++      // head of the queue instead; it resumes when the user rejoins from the
++      // session-ended banner. Catches sends that bypass the queue's
++      // sendBlocked hold (direct review-screen answers) and the dequeue race
++      // where the slot expires between the queue's check and this call.
++      if (IS_FREEBUFF && !getFreebuffInstanceId()) {
++        markFreebuffSessionEnded()
++        requeueMessageAtFront?.({ content, attachments: attachments ?? [] })
++        resetEarlyReturnState({
++          setCanProcessQueue,
++          updateChainInProgress,
++          isProcessingQueueRef,
++          isQueuePausedRef,
++        })
++        return
++      }
++
+       if (agentMode !== 'PLAN') {
+         setHasReceivedPlanResponse(false)
+       }
+@@ -536,6 +565,7 @@ export const useSendMessage = ({
+           updater,
+           aiMessageId,
+           wasAbortedByUser: abortController.signal.aborted,
++          hasReceivedContent: hasReceivedContentRef.current,
+           setStreamStatus,
+           setCanProcessQueue,
+           updateChainInProgress,
+@@ -560,6 +590,7 @@ export const useSendMessage = ({
+             updateChainInProgress,
+             isProcessingQueueRef,
+             isQueuePausedRef,
++            hasReceivedContent: hasReceivedContentRef.current,
+           })
+           // Persist the last checkpoint plus the error banner so a restart
+           // after a failed run still shows this turn.
+@@ -612,6 +643,7 @@ export const useSendMessage = ({
+       onTimerEvent,
+       prepareUserMessage,
+       removeActiveSubagent,
++      requeueMessageAtFront,
+       resumeQueue,
+       scrollToLatest,
+       setCanProcessQueue,
+diff --git a/cli/src/utils/error-handling.ts b/cli/src/utils/error-handling.ts
+index 294494113..f3a05bae0 100644
+--- a/cli/src/utils/error-handling.ts
++++ b/cli/src/utils/error-handling.ts
+@@ -187,7 +187,9 @@ export const getFreeModeUnavailableErrorMessage = (
+  * Freebuff waiting-room gate errors returned by /api/v1/chat/completions.
+  *
+  * Contract (see docs/freebuff-waiting-room.md):
+- *   - 428 `waiting_room_required`   — no session row exists; POST /session to join.
++ *   - 428 `waiting_room_required`   — no session row exists, or the request
++ *                                     carried no instance id (client isn't
++ *                                     holding a session); POST /session to join.
+  *   - 429 `waiting_room_queued`     — row exists but still queued.
+  *   - 409 `session_superseded`      — another CLI rotated our instance id.
+  *   - 409 `session_model_mismatch`  — session tier/model no longer matches.

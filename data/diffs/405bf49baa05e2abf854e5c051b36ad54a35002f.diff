@@ -1,0 +1,1089 @@
+diff --git a/cli/scripts/smoke-terminal-broker-windows.ts b/cli/scripts/smoke-terminal-broker-windows.ts
+index b7ad4f5f0..0c73769d8 100644
+--- a/cli/scripts/smoke-terminal-broker-windows.ts
++++ b/cli/scripts/smoke-terminal-broker-windows.ts
+@@ -121,7 +121,6 @@ async function main(): Promise<void> {
+   console.log(`terminal-broker-smoke: artifacts=${runDir}`)
+ 
+   const smokeEnv = { ...process.env }
+-  delete smokeEnv.CODEBUFF_ENABLE_TERMINAL_WATCHDOG
+   delete smokeEnv.CODEBUFF_NO_TERMINAL_WATCHDOG
+   const child = spawn(
+     winpty,
+diff --git a/cli/src/__tests__/helpers/terminal-watchdog-fixture.ts b/cli/src/__tests__/helpers/terminal-watchdog-fixture.ts
+index 5c3274d96..baf3f0d47 100644
+--- a/cli/src/__tests__/helpers/terminal-watchdog-fixture.ts
++++ b/cli/src/__tests__/helpers/terminal-watchdog-fixture.ts
+@@ -4,14 +4,15 @@
+  * Usage: bun terminal-watchdog-fixture.ts <mode> <ttyPath>
+  * - mode "hang":  start the watchdog and stay alive until killed by the test.
+  * - mode "clean": start the watchdog, then stop it and exit (clean shutdown).
++ * - mode "spawn-failure": report a watchdog startup failure and exit.
+  *
+- * Prints "ready" once the watchdog policy has been applied. When explicitly
+- * enabled on Windows, arming is asynchronous (a PowerShell bootstrap has to
+- * launch the real watchdog outside Bun's kill-on-close job object), so we wait
+- * for the `<ttyPath>.armed` marker before printing "ready" — killing earlier
+- * would take the bootstrap down before the watchdog exists.
++ * Prints "ready" once the watchdog is armed. On Windows, arming is asynchronous
++ * (a PowerShell bootstrap has to launch the real watchdog outside Bun's
++ * kill-on-close job object), so we wait for the `<ttyPath>.armed` marker before
++ * printing "ready" — killing earlier would take the bootstrap down before the
++ * watchdog exists.
+  */
+-import { existsSync } from 'fs'
++import { existsSync, writeFileSync } from 'fs'
+ 
+ import {
+   getTerminalWatchdogDiagnostics,
+@@ -22,12 +23,15 @@ import {
+ const [mode, ttyPath] = process.argv.slice(2)
+ 
+ if (!mode || !ttyPath) {
+-  console.error('usage: terminal-watchdog-fixture.ts <hang|clean> <ttyPath>')
++  console.error(
++    'usage: terminal-watchdog-fixture.ts <hang|clean|spawn-failure> <ttyPath>',
++  )
+   process.exit(2)
+ }
+ 
+ async function waitForArmed(): Promise<void> {
+   if (process.platform !== 'win32') return
++  // An explicit opt-out is the one path where no armed marker is expected.
+   if (!getTerminalWatchdogDiagnostics().armed) return
+   const deadline = Date.now() + 30_000
+   while (Date.now() < deadline) {
+@@ -38,6 +42,22 @@ async function waitForArmed(): Promise<void> {
+   process.exit(3)
+ }
+ 
++if (mode === 'spawn-failure') {
++  const failure = await new Promise<unknown>((resolve) => {
++    startTerminalWatchdog({
++      ttyPath,
++      reportFailure: resolve,
++      windowsPowerShellPath: `${ttyPath}.missing.exe`,
++    })
++    setTimeout(() => {
++      console.error('watchdog failure was not reported')
++      process.exit(4)
++    }, 10_000)
++  })
++  writeFileSync(ttyPath, JSON.stringify(failure))
++  process.exit(0)
++}
++
+ startTerminalWatchdog({ ttyPath })
+ 
+ if (mode === 'clean') {
+diff --git a/cli/src/__tests__/terminal-watchdog.test.ts b/cli/src/__tests__/terminal-watchdog.test.ts
+index 32cefb5a7..393f38976 100644
+--- a/cli/src/__tests__/terminal-watchdog.test.ts
++++ b/cli/src/__tests__/terminal-watchdog.test.ts
+@@ -1,18 +1,17 @@
+ import { spawn } from 'child_process'
+-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'fs'
++import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'fs'
+ import { tmpdir } from 'os'
+ import { join } from 'path'
+ 
+ import { afterAll, describe, expect, test } from 'bun:test'
+ 
+ import { TERMINAL_RESET_SEQUENCES } from '../utils/terminal-reset-sequences'
++import { classifyTerminalWatchdogSpawnFailure } from '../utils/terminal-watchdog'
++import { sanitizeWindowsCliVersion } from '../utils/windows-terminal-health'
+ 
+ import type { ChildProcess } from 'child_process'
+ 
+ const FIXTURE = join(import.meta.dir, 'helpers', 'terminal-watchdog-fixture.ts')
+-const WINDOWS_WATCHDOG_ENV: Record<string, string> =
+-  process.platform === 'win32' ? { CODEBUFF_ENABLE_TERMINAL_WATCHDOG: '1' } : {}
+-
+ const tempDir = mkdtempSync(join(tmpdir(), 'terminal-watchdog-'))
+ 
+ afterAll(() => {
+@@ -20,12 +19,11 @@ afterAll(() => {
+ })
+ 
+ function spawnFixture(
+-  mode: 'hang' | 'clean',
++  mode: 'hang' | 'clean' | 'spawn-failure',
+   ttyPath: string,
+   env?: Record<string, string>,
+ ): ChildProcess {
+   const childEnv = { ...process.env }
+-  delete childEnv.CODEBUFF_ENABLE_TERMINAL_WATCHDOG
+   delete childEnv.CODEBUFF_NO_TERMINAL_WATCHDOG
+   return spawn(process.execPath, [FIXTURE, mode, ttyPath], {
+     stdio: ['ignore', 'pipe', 'inherit'],
+@@ -87,30 +85,43 @@ async function pollForContent(
+   return readTty(ttyPath)
+ }
+ 
+-// POSIX uses a detached sh blocking on pipe EOF. When explicitly enabled,
+-// Windows uses a PowerShell grandchild (outside Bun's kill-on-close job object)
+-// blocking on Wait-Process. Both then write the reset sequences to ttyPath.
++// POSIX uses a detached sh blocking on pipe EOF. Windows uses a PowerShell
++// grandchild (outside Bun's kill-on-close job object) blocking on Wait-Process.
++// Both then write the reset sequences to ttyPath.
+ describe('terminal watchdog', () => {
++  test('bounds watchdog failure telemetry labels', () => {
++    expect(
++      classifyTerminalWatchdogSpawnFailure(
++        Object.assign(new Error('private path'), { code: 'ENOENT' }),
++      ),
++    ).toBe('enoent')
++    expect(
++      classifyTerminalWatchdogSpawnFailure(new Error('private text')),
++    ).toBe('unknown')
++    expect(sanitizeWindowsCliVersion('0.0.142')).toBe('0.0.142')
++    expect(sanitizeWindowsCliVersion('private/path')).toBe('unknown')
++  })
++
+   test.skipIf(process.platform !== 'win32')(
+-    'does not arm by default on Windows',
++    'reports a bounded failure when PowerShell cannot spawn',
+     async () => {
+-      const ttyPath = join(tempDir, 'windows-default.out')
+-      const child = spawnFixture('hang', ttyPath)
+-      await waitForReady(child)
+-
+-      const armed = existsSync(`${ttyPath}.armed`)
+-      child.kill('SIGKILL')
++      const reportPath = join(tempDir, 'spawn-failure.json')
++      const child = spawnFixture('spawn-failure', reportPath)
+       await waitForExit(child)
+ 
+-      expect(armed).toBe(false)
+-      expect(readTty(ttyPath)).toBe('')
++      expect(child.exitCode).toBe(0)
++      expect(JSON.parse(readTty(reportPath))).toEqual({
++        stage: 'spawn',
++        failureCode: 'enoent',
++      })
++      expect(findDisarmFiles(child.pid)).toEqual([])
+     },
+-    60_000,
++    30_000,
+   )
+ 
+   test('writes reset sequences to the tty when the process dies uncleanly', async () => {
+     const ttyPath = join(tempDir, 'unclean.out')
+-    const child = spawnFixture('hang', ttyPath, WINDOWS_WATCHDOG_ENV)
++    const child = spawnFixture('hang', ttyPath)
+     await waitForReady(child)
+ 
+     child.kill('SIGKILL')
+@@ -133,7 +144,6 @@ describe('terminal watchdog', () => {
+     async (value) => {
+       const ttyPath = join(tempDir, `optout-${value}.out`)
+       const child = spawnFixture('hang', ttyPath, {
+-        ...WINDOWS_WATCHDOG_ENV,
+         CODEBUFF_NO_TERMINAL_WATCHDOG: value,
+       })
+       await waitForReady(child)
+@@ -153,7 +163,6 @@ describe('terminal watchdog', () => {
+   test('still arms when the opt-out is set to an unrelated value', async () => {
+     const ttyPath = join(tempDir, 'optout-noise.out')
+     const child = spawnFixture('hang', ttyPath, {
+-      ...WINDOWS_WATCHDOG_ENV,
+       CODEBUFF_NO_TERMINAL_WATCHDOG: '0',
+     })
+     await waitForReady(child)
+@@ -171,7 +180,7 @@ describe('terminal watchdog', () => {
+ 
+   test('stays silent when the process shuts down cleanly', async () => {
+     const ttyPath = join(tempDir, 'clean.out')
+-    const child = spawnFixture('clean', ttyPath, WINDOWS_WATCHDOG_ENV)
++    const child = spawnFixture('clean', ttyPath)
+     await waitForExit(child)
+ 
+     // Give a disarmed-too-late watchdog time to (incorrectly) fire. Windows
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index 9420aee72..cae4e380e 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -37,6 +37,7 @@ import { IS_FREEBUFF } from './utils/constants'
+ import { initializeAgentRegistry } from './utils/local-agent-registry'
+ import { trimOversizedChatLogs } from './utils/chat-history'
+ import { clearLogFile, logger } from './utils/logger'
++import { drainClientLogs } from './utils/log-shipper'
+ import { shouldShowProjectPicker } from './utils/project-picker'
+ import { saveRecentProject } from './utils/recent-projects'
+ import { startEngagementTracking } from './utils/engagement'
+@@ -245,6 +246,13 @@ async function main(): Promise<void> {
+     initialMode: initialMode ?? 'DEFAULT',
+     isFreeBuff: IS_FREEBUFF,
+   })
++  // Start shipping the launch row now, well before the Windows watchdog is
++  // armed. If endpoint security terminates this process during that spawn, the
++  // next --continue launch still has a prior row for the health dashboard's
++  // rapid-resume and interruption joins.
++  if (IS_FREEBUFF && process.platform === 'win32') {
++    void drainClientLogs()
++  }
+ 
+   // Initialize agent registry (loads user agents via SDK).
+   // When --agent is provided, skip local .agents to avoid overrides.
+diff --git a/cli/src/types/env.ts b/cli/src/types/env.ts
+index e66041cee..606548fd8 100644
+--- a/cli/src/types/env.ts
++++ b/cli/src/types/env.ts
+@@ -78,13 +78,9 @@ export type CliEnv = BaseEnv & {
+   CODEBUFF_LAUNCHER_PID?: string
+   // Toggle for mirroring CLI logs to the server's /api/logs sink (Axiom).
+   CODEBUFF_SHIP_LOGS?: string
+-  // Set to 1/true to suppress the terminal-reset watchdog. Retained for
+-  // backwards compatibility and explicit opt-outs on supported platforms.
++  // Set to 1/true to suppress the terminal-reset watchdog on machines where
++  // the PowerShell process shape conflicts with endpoint-security policy.
+   CODEBUFF_NO_TERMINAL_WATCHDOG?: string
+-  // Set to 1/true to opt into the PowerShell terminal-reset watchdog for
+-  // targeted Windows CI and debugging. It is disabled there by default because
+-  // the process shape can trip EDR/AV.
+-  CODEBUFF_ENABLE_TERMINAL_WATCHDOG?: string
+   FREEBUFF_MODE?: string
+ }
+ 
+diff --git a/cli/src/utils/__tests__/terminal-command-broker.test.ts b/cli/src/utils/__tests__/terminal-command-broker.test.ts
+index 3a6aa76c7..fbd9ac7b0 100644
+--- a/cli/src/utils/__tests__/terminal-command-broker.test.ts
++++ b/cli/src/utils/__tests__/terminal-command-broker.test.ts
+@@ -14,8 +14,8 @@ import {
+   createTerminalCommandBroker,
+   isTerminalCommandBrokerInvocation,
+   protocolPathFromEnv,
+-  sanitizeTerminalBrokerVersion,
+ } from '../terminal-command-broker'
++import { sanitizeWindowsCliVersion } from '../windows-terminal-health'
+ 
+ const brokerFixture = path.join(
+   import.meta.dir,
+@@ -105,8 +105,8 @@ describe('terminal command broker', () => {
+         new Error('terminal command broker protocol response was missing'),
+       ),
+     ).toBe('protocol_missing')
+-    expect(sanitizeTerminalBrokerVersion('0.0.142')).toBe('0.0.142')
+-    expect(sanitizeTerminalBrokerVersion('private path/and details')).toBe(
++    expect(sanitizeWindowsCliVersion('0.0.142')).toBe('0.0.142')
++    expect(sanitizeWindowsCliVersion('private path/and details')).toBe(
+       'unknown',
+     )
+   })
+diff --git a/cli/src/utils/__tests__/windows-terminal-health.test.ts b/cli/src/utils/__tests__/windows-terminal-health.test.ts
+new file mode 100644
+index 000000000..b3e7b6d59
+--- /dev/null
++++ b/cli/src/utils/__tests__/windows-terminal-health.test.ts
+@@ -0,0 +1,101 @@
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
++import { afterEach, describe, expect, mock, test } from 'bun:test'
++
++import {
++  initAnalytics,
++  resetAnalyticsState,
++  trackEvent,
++  type AnalyticsDeps,
++} from '../analytics'
++import { deliverWindowsTerminalFailure } from '../windows-terminal-health'
++
++import type { LogRecordInput } from '@codebuff/common/schemas/logs'
++
++const FAILED_ANALYTICS_DEPS: AnalyticsDeps = {
++  env: {},
++  isProd: true,
++  createClient: mock(() => {
++    throw new Error(
++      'PostHog client should not be created without configuration',
++    )
++  }),
++  generateAnonymousId: () => 'analytics-anonymous-id',
++}
++
++afterEach(() => {
++  resetAnalyticsState()
++})
++
++describe('Windows terminal-health delivery', () => {
++  test('queues and drains the bounded Axiom event when analytics initialization fails', async () => {
++    const analyticsRecords: LogRecordInput[] = []
++    resetAnalyticsState({
++      ...FAILED_ANALYTICS_DEPS,
++      enqueueClientLog: (record) => analyticsRecords.push(record),
++    })
++    expect(() => initAnalytics()).toThrow(
++      'NEXT_PUBLIC_POSTHOG_API_KEY or NEXT_PUBLIC_POSTHOG_HOST_URL is not set',
++    )
++    const fallbackRecords: LogRecordInput[] = []
++    const drainClientLogs = mock(async () => {})
++    const properties = {
++      version: '0.0.142',
++      platform: 'win32' as const,
++      stage: 'arming' as const,
++      failureCode: 'timeout' as const,
++    }
++
++    await deliverWindowsTerminalFailure(
++      AnalyticsEvent.TERMINAL_WATCHDOG_FAILED,
++      properties,
++      {
++        trackEvent,
++        getAnonymousId: () => 'anonymous-install-id',
++        enqueueClientLog: (record) => fallbackRecords.push(record),
++        drainClientLogs,
++      },
++    )
++
++    expect(analyticsRecords).toEqual([
++      {
++        level: 'info',
++        event: AnalyticsEvent.TERMINAL_WATCHDOG_FAILED,
++        message: AnalyticsEvent.TERMINAL_WATCHDOG_FAILED,
++        client_session_id: 'analytics-anonymous-id',
++        data: properties,
++      },
++    ])
++    expect(fallbackRecords).toEqual([])
++    expect(drainClientLogs).toHaveBeenCalledTimes(1)
++  })
++
++  test('preserves the analytics mirror without queuing a duplicate', async () => {
++    const tracked = mock(() => {})
++    const enqueueClientLog = mock((_record: LogRecordInput) => {})
++    const drainClientLogs = mock(async () => {})
++    const properties = {
++      version: '0.0.142',
++      platform: 'win32' as const,
++      stage: 'spawn' as const,
++      failureCode: 'enoent' as const,
++    }
++
++    await deliverWindowsTerminalFailure(
++      AnalyticsEvent.TERMINAL_BROKER_SPAWN_FAILED,
++      properties,
++      {
++        trackEvent: tracked,
++        getAnonymousId: () => 'unused',
++        enqueueClientLog,
++        drainClientLogs,
++      },
++    )
++
++    expect(tracked).toHaveBeenCalledWith(
++      AnalyticsEvent.TERMINAL_BROKER_SPAWN_FAILED,
++      properties,
++    )
++    expect(enqueueClientLog).not.toHaveBeenCalled()
++    expect(drainClientLogs).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/cli/src/utils/analytics.ts b/cli/src/utils/analytics.ts
+index 17fd086fb..b8c2257e2 100644
+--- a/cli/src/utils/analytics.ts
++++ b/cli/src/utils/analytics.ts
+@@ -12,10 +12,11 @@ import { shouldTrackAnalyticsEvent } from '@codebuff/common/util/analytics-sampl
+ import { shouldMirrorAnalyticsEvent } from '@codebuff/common/util/log-mirror'
+ 
+ import { getOrCreatePersistentAnonymousId } from './anonymous-id'
+-import { enqueueClientLog } from './log-shipper'
++import { enqueueClientLog as defaultEnqueueClientLog } from './log-shipper'
+ 
+ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ 
++import type { LogRecordInput } from '@codebuff/common/schemas/logs'
+ 
+ // Re-export types from core for backwards compatibility
+ export type { AnalyticsClientWithIdentify as AnalyticsClient } from '@codebuff/common/analytics-core'
+@@ -42,6 +43,7 @@ type ResolvedAnalyticsDeps = {
+   isProd: boolean
+   createClient: AnalyticsDeps['createClient']
+   generateAnonymousId: NonNullable<AnalyticsDeps['generateAnonymousId']>
++  enqueueClientLog: NonNullable<AnalyticsDeps['enqueueClientLog']>
+ }
+ 
+ /** Dependencies that can be injected for testing */
+@@ -56,6 +58,7 @@ export interface AnalyticsDeps {
+     options: PostHogClientOptions,
+   ) => AnalyticsClientWithIdentify
+   generateAnonymousId?: () => string
++  enqueueClientLog?: (record: LogRecordInput) => void
+ }
+ 
+ // Anonymous ID used before user identification (for PostHog alias)
+@@ -63,6 +66,7 @@ let anonymousId: string | undefined
+ // Real user ID after identification
+ let currentUserId: string | undefined
+ let client: AnalyticsClientWithIdentify | undefined
++let initializationState: 'not_started' | 'ready' | 'failed' = 'not_started'
+ 
+ // Store injected dependencies (for testing)
+ let injectedDeps: AnalyticsDeps | undefined
+@@ -74,12 +78,13 @@ function resolveDeps(): ResolvedAnalyticsDeps {
+     createClient: injectedDeps?.createClient ?? createPostHogClient,
+     generateAnonymousId:
+       injectedDeps?.generateAnonymousId ?? getOrCreatePersistentAnonymousId,
++    enqueueClientLog: injectedDeps?.enqueueClientLog ?? defaultEnqueueClientLog,
+   }
+ }
+ 
+-let loggerModulePromise:
+-  | Promise<{ logger: { debug: (data: any, msg?: string, ...args: any[]) => void } }>
+-  | null = null
++let loggerModulePromise: Promise<{
++  logger: { debug: (data: any, msg?: string, ...args: any[]) => void }
++}> | null = null
+ 
+ const loadLogger = () => {
+   if (!loggerModulePromise) {
+@@ -117,6 +122,7 @@ export function resetAnalyticsState(deps?: AnalyticsDeps) {
+   anonymousId = undefined
+   currentUserId = undefined
+   client = undefined
++  initializationState = 'not_started'
+   injectedDeps = deps
+   identified = false
+ }
+@@ -138,8 +144,10 @@ function logAnalyticsError(error: unknown, context: AnalyticsErrorContext) {
+ 
+ export function initAnalytics() {
+   const { env, isProd, createClient, generateAnonymousId } = resolveDeps()
++  client = undefined
+ 
+   if (!env.NEXT_PUBLIC_POSTHOG_API_KEY || !env.NEXT_PUBLIC_POSTHOG_HOST_URL) {
++    initializationState = 'failed'
+     const error = new Error(
+       'NEXT_PUBLIC_POSTHOG_API_KEY or NEXT_PUBLIC_POSTHOG_HOST_URL is not set',
+     )
+@@ -160,7 +168,9 @@ export function initAnalytics() {
+       host: env.NEXT_PUBLIC_POSTHOG_HOST_URL,
+       enableExceptionAutocapture: isProd,
+     })
++    initializationState = 'ready'
+   } catch (error) {
++    initializationState = 'failed'
+     logAnalyticsError(error, { stage: AnalyticsErrorStage.Init })
+     throw error
+   }
+@@ -182,12 +192,21 @@ export async function flushAnalytics() {
+ export function trackEvent(
+   event: AnalyticsEvent,
+   properties?: Record<string, any>,
+-) {
+-  const { isProd } = resolveDeps()
+-  const distinctId = getDistinctId()
++): boolean {
++  const { isProd, generateAnonymousId, enqueueClientLog } = resolveDeps()
++  let distinctId = getDistinctId()
+ 
+   if (!client) {
+-    if (isProd) {
++    if (initializationState === 'failed') {
++      if (!distinctId) {
++        try {
++          anonymousId = generateAnonymousId()
++          distinctId = anonymousId
++        } catch {
++          return false
++        }
++      }
++    } else if (isProd) {
+       const error = new Error('Analytics client not initialized')
+       logAnalyticsError(error, {
+         stage: AnalyticsErrorStage.Track,
+@@ -195,13 +214,14 @@ export function trackEvent(
+         properties,
+       })
+       throw error
++    } else {
++      return false
+     }
+-    return
+   }
+ 
+   if (!distinctId) {
+     // This shouldn't happen if initAnalytics was called, but handle gracefully
+-    return
++    return false
+   }
+ 
+   if (!isProd) {
+@@ -212,25 +232,27 @@ export function trackEvent(
+         distinctId,
+       })
+     }
+-    return
++    return false
+   }
+ 
+   if (!shouldTrackAnalyticsEvent({ event, distinctId, properties })) {
+-    return
++    return false
+   }
+ 
+-  try {
+-    client.capture({
+-      distinctId,
+-      event,
+-      properties,
+-    })
+-  } catch (error) {
+-    logAnalyticsError(error, {
+-      stage: AnalyticsErrorStage.Track,
+-      event,
+-      properties,
+-    })
++  if (client) {
++    try {
++      client.capture({
++        distinctId,
++        event,
++        properties,
++      })
++    } catch (error) {
++      logAnalyticsError(error, {
++        stage: AnalyticsErrorStage.Track,
++        event,
++        properties,
++      })
++    }
+   }
+ 
+   // Mirror analytics events into the Axiom logs sink too (PostHog stays the
+@@ -248,14 +270,21 @@ export function trackEvent(
+         client_session_id: anonymousId ?? currentUserId,
+         data: properties,
+       })
++      return true
+     } catch {
+       // Best-effort mirror; never let it affect analytics or the app.
+     }
+   }
++  return false
+ }
+ 
+ export function identifyUser(userId: string, properties?: Record<string, any>) {
+   if (!client) {
++    if (initializationState === 'failed') {
++      currentUserId = userId
++      identified = true
++      return
++    }
+     const error = new Error('Analytics client not initialized')
+     logAnalyticsError(error, {
+       stage: AnalyticsErrorStage.Identify,
+diff --git a/cli/src/utils/env.ts b/cli/src/utils/env.ts
+index 12bd1b3f2..7d74b2eaa 100644
+--- a/cli/src/utils/env.ts
++++ b/cli/src/utils/env.ts
+@@ -81,8 +81,6 @@ export const getCliEnv = (): CliEnv => ({
+   CODEBUFF_LAUNCHER_PID: process.env.CODEBUFF_LAUNCHER_PID,
+   CODEBUFF_SHIP_LOGS: process.env.CODEBUFF_SHIP_LOGS,
+   CODEBUFF_NO_TERMINAL_WATCHDOG: process.env.CODEBUFF_NO_TERMINAL_WATCHDOG,
+-  CODEBUFF_ENABLE_TERMINAL_WATCHDOG:
+-    process.env.CODEBUFF_ENABLE_TERMINAL_WATCHDOG,
+   FREEBUFF_MODE: process.env.FREEBUFF_MODE,
+ })
+ 
+diff --git a/cli/src/utils/terminal-command-broker.ts b/cli/src/utils/terminal-command-broker.ts
+index b9611d8ce..628620f6a 100644
+--- a/cli/src/utils/terminal-command-broker.ts
++++ b/cli/src/utils/terminal-command-broker.ts
+@@ -12,6 +12,7 @@ import type {
+ import type { ChildProcess } from 'child_process'
+ 
+ import { getCliEnv, getSystemProcessEnv } from './env'
++import { reportWindowsTerminalFailure } from './windows-terminal-health'
+ 
+ export const TERMINAL_COMMAND_BROKER_FLAG = '--terminal-command-broker'
+ const TERMINAL_COMMAND_BROKER_ENV = 'CODEBUFF_TERMINAL_COMMAND_BROKER'
+@@ -70,37 +71,14 @@ export function classifyTerminalBrokerFailure(
+   return 'unknown'
+ }
+ 
+-export function sanitizeTerminalBrokerVersion(version: string): string {
+-  return /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,31}$/.test(version)
+-    ? version
+-    : 'unknown'
+-}
+-
+ function reportTerminalBrokerFailure({
+   stage,
+   failureCode,
+ }: TerminalBrokerFailureTelemetry): void {
+-  if (process.platform !== 'win32' || getCliEnv().FREEBUFF_MODE !== 'true') {
+-    return
+-  }
+-  const configuredVersion = getCliEnv().CODEBUFF_CLI_VERSION ?? ''
+-  const version = sanitizeTerminalBrokerVersion(configuredVersion)
+-
+-  // Load analytics only in the interactive parent and only on failure. The
+-  // detached broker helper imports this module too, but must stay minimal and
+-  // must never initialize product analytics of its own.
+-  void import('./analytics')
+-    .then(({ trackEvent }) => {
+-      trackEvent(AnalyticsEvent.TERMINAL_BROKER_SPAWN_FAILED, {
+-        version,
+-        platform: 'win32',
+-        stage,
+-        failureCode,
+-      })
+-    })
+-    .catch(() => {
+-      // Telemetry is best-effort and must never change command behavior.
+-    })
++  reportWindowsTerminalFailure(AnalyticsEvent.TERMINAL_BROKER_SPAWN_FAILED, {
++    stage,
++    failureCode,
++  })
+ }
+ 
+ function brokerFailure(error: unknown): Error {
+diff --git a/cli/src/utils/terminal-watchdog.ts b/cli/src/utils/terminal-watchdog.ts
+index 29689715a..bc2a43556 100644
+--- a/cli/src/utils/terminal-watchdog.ts
++++ b/cli/src/utils/terminal-watchdog.ts
+@@ -45,32 +45,76 @@
+  *   is a classic EDR/AV malware heuristic). They are deliberately built
+  *   without double quotes, which makes that quoting-safe — see
+  *   spawnWindowsWatchdog.
+- * - The PowerShell watchdog is disabled by default on Windows because this
+- *   process shape can trip EDR/AV. CODEBUFF_ENABLE_TERMINAL_WATCHDOG=1 opts
+- *   into it for targeted CI and debugging.
+  * - Arming takes a few hundred ms (PowerShell boot); deaths inside that
+  *   window fall back to the pre-existing behavior (npm wrapper or nothing).
+  */
+ import { spawn } from 'child_process'
+-import { closeSync, openSync, writeFileSync } from 'fs'
++import { closeSync, existsSync, openSync, rmSync, writeFileSync } from 'fs'
+ import os from 'os'
+ import path from 'path'
+ 
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
++
+ import { TERMINAL_RESET_SEQUENCES } from './terminal-reset-sequences'
+ import { getCliEnv } from './env'
++import { reportWindowsTerminalFailure } from './windows-terminal-health'
+ 
+ import type { ChildProcess } from 'child_process'
+ 
+ let watchdog: ChildProcess | null = null
+ let disarmFilePath: string | null = null
++let armedFilePath: string | null = null
++let armMonitor: ReturnType<typeof setTimeout> | null = null
++
++const WINDOWS_ARM_TIMEOUT_MS = 10_000
++
++export type TerminalWatchdogFailure = {
++  stage: 'spawn' | 'bootstrap' | 'arming'
++  failureCode:
++    | 'enoent'
++    | 'eacces'
++    | 'eperm'
++    | 'exit_nonzero'
++    | 'terminated'
++    | 'timeout'
++    | 'unknown'
++}
++
++export function classifyTerminalWatchdogSpawnFailure(
++  error: unknown,
++): TerminalWatchdogFailure['failureCode'] {
++  const code =
++    error && typeof error === 'object' && 'code' in error
++      ? String((error as NodeJS.ErrnoException).code ?? '').toUpperCase()
++      : ''
++  if (code === 'ENOENT') return 'enoent'
++  if (code === 'EACCES') return 'eacces'
++  if (code === 'EPERM') return 'eperm'
++  return 'unknown'
++}
++
++function reportTerminalWatchdogFailure(failure: TerminalWatchdogFailure): void {
++  reportWindowsTerminalFailure(AnalyticsEvent.TERMINAL_WATCHDOG_FAILED, failure)
++}
++
++function clearArmMonitor(): void {
++  if (armMonitor) clearTimeout(armMonitor)
++  armMonitor = null
++  if (armedFilePath) {
++    try {
++      rmSync(armedFilePath, { force: true })
++    } catch {
++      // The external watchdog also removes this marker when it exits.
++    }
++  }
++  armedFilePath = null
++}
+ 
+ /** Read-only watchdog state for local process diagnostics. */
+ export function getTerminalWatchdogDiagnostics() {
+   const external = disarmFilePath !== null
+   const childIsRunning = Boolean(
+-    watchdog?.pid &&
+-      watchdog.exitCode === null &&
+-      watchdog.signalCode === null,
++    watchdog?.pid && watchdog.exitCode === null && watchdog.signalCode === null,
+   )
+   return {
+     armed: childIsRunning || external,
+@@ -103,6 +147,8 @@ function psQuote(value: string): string {
+ function spawnWindowsWatchdog(options: {
+   ttyPath?: string
+   disarmPath: string
++  armedPath: string
++  powershellPath?: string
+ }): ChildProcess {
+   // The payload rides as a numeric byte array, which keeps the script free of
+   // double quotes and string interpolation (the no-`"` invariant the quoting
+@@ -117,11 +163,9 @@ function spawnWindowsWatchdog(options: {
+   const writeResets = options.ttyPath
+     ? `[System.IO.File]::WriteAllBytes(${psQuote(options.ttyPath)}, $b)`
+     : '$s=[Console]::OpenStandardOutput(); $s.Write($b, 0, $b.Length); $s.Flush()'
+-  // The armed marker lets tests wait out the bootstrap hop before killing
+-  // the fixture; production never passes ttyPath so no marker is written.
+-  const armedMarker = options.ttyPath
+-    ? `[System.IO.File]::WriteAllText(${psQuote(options.ttyPath + '.armed')}, 'armed'); `
+-    : ''
++  // The marker lets tests wait out the bootstrap hop and lets production
++  // report a bounded arming timeout without inspecting PowerShell output.
++  const armedMarker = `[System.IO.File]::WriteAllText(${psQuote(options.armedPath)}, 'armed'); `
+   const watchdogScript =
+     armedMarker +
+     `try { Wait-Process -Id ${process.pid} -ErrorAction Stop } catch {}; ` +
+@@ -129,18 +173,20 @@ function spawnWindowsWatchdog(options: {
+     `Remove-Item -LiteralPath ${psQuote(options.disarmPath)} -Force -ErrorAction SilentlyContinue ` +
+     `} else { ` +
+     `$b=[byte[]](${payloadBytes}); ` +
+-    `${writeResets} }`
++    `${writeResets} }; ` +
++    `Remove-Item -LiteralPath ${psQuote(options.armedPath)} -Force -ErrorAction SilentlyContinue`
+ 
+   // Windows PowerShell 5.1 ships with every supported Windows; use the
+   // absolute path so a broken PATH can't take out the safety net.
+-  const systemRoot = getCliEnv().SystemRoot ?? 'C:\\Windows'
+-  const powershell = path.join(
+-    systemRoot,
+-    'System32',
+-    'WindowsPowerShell',
+-    'v1.0',
+-    'powershell.exe',
+-  )
++  const powershell =
++    options.powershellPath ??
++    path.join(
++      getCliEnv().SystemRoot ?? 'C:\\Windows',
++      'System32',
++      'WindowsPowerShell',
++      'v1.0',
++      'powershell.exe',
++    )
+ 
+   // Plain -Command (not -EncodedCommand) so the command lines are auditable
+   // in process listings — encoded PowerShell trips EDR/AV heuristics. This is
+@@ -172,30 +218,27 @@ const isTruthy = (value: string | undefined): boolean =>
+  * terminal modes. No-op when stdout isn't a TTY (unless an explicit ttyPath
+  * is injected, e.g. in tests), or if already started.
+  *
+- * Also a no-op when CODEBUFF_NO_TERMINAL_WATCHDOG is set. On Windows the
+- * PowerShell watchdog is disabled by default because its out-of-job grandchild
+- * process can trip EDR/AV. CODEBUFF_ENABLE_TERMINAL_WATCHDOG=1 opts into it for
+- * targeted CI and debugging. Disabling it costs only the after-exit terminal
+- * repair for hard kills, which is strictly better than the CLI being terminated
+- * or quarantined by endpoint security.
++ * Also a no-op when CODEBUFF_NO_TERMINAL_WATCHDOG is set. This remains an
++ * explicit escape hatch for Windows endpoint-security policies that reject the
++ * out-of-job PowerShell grandchild used by the recovery path.
+  *
+  * @param options.ttyPath - Override the reset target (POSIX: the watchdog's
+  *   stdout is pointed at this file; Windows: the watchdog writes the payload
+  *   to this file and drops a `<ttyPath>.armed` marker once running). Tests
+  *   inject a regular file here to observe what gets written.
+  */
+-export function startTerminalWatchdog(options?: { ttyPath?: string }): void {
++export function startTerminalWatchdog(options?: {
++  ttyPath?: string
++  reportFailure?: (failure: TerminalWatchdogFailure) => void
++  /** Test-only override for exercising Windows spawn failures. */
++  windowsPowerShellPath?: string
++}): void {
+   if (watchdog) return
+   const env = getCliEnv()
+   if (isTruthy(env.CODEBUFF_NO_TERMINAL_WATCHDOG)) return
+-  if (
+-    process.platform === 'win32' &&
+-    !isTruthy(env.CODEBUFF_ENABLE_TERMINAL_WATCHDOG)
+-  ) {
+-    return
+-  }
+   if (!options?.ttyPath && !process.stdout.isTTY) return
+ 
++  const reportFailure = options?.reportFailure ?? reportTerminalWatchdogFailure
+   let overrideFd: number | null = null
+   try {
+     let child: ChildProcess
+@@ -204,20 +247,53 @@ export function startTerminalWatchdog(options?: { ttyPath?: string }): void {
+         os.tmpdir(),
+         `codebuff-watchdog-disarm-${process.pid}-${Math.random().toString(36).slice(2)}`,
+       )
+-      child = spawnWindowsWatchdog({ ttyPath: options?.ttyPath, disarmPath })
++      const armedPath = options?.ttyPath
++        ? `${options.ttyPath}.armed`
++        : `${disarmPath}.armed`
++      child = spawnWindowsWatchdog({
++        ttyPath: options?.ttyPath,
++        disarmPath,
++        armedPath,
++        powershellPath: options?.windowsPowerShellPath,
++      })
+       disarmFilePath = disarmPath
++      if (!options?.ttyPath) {
++        armedFilePath = armedPath
++      }
+     } else {
+       if (options?.ttyPath) {
+         overrideFd = openSync(options.ttyPath, 'w')
+       }
+       child = spawnPosixWatchdog(overrideFd)
+     }
+-    child.on('error', () => {
++    let failureReported = false
++    const reportOnce = (failure: TerminalWatchdogFailure) => {
++      if (failureReported) return
++      failureReported = true
++      reportFailure(failure)
++    }
++    const fail = (failure: TerminalWatchdogFailure) => {
++      if (failureReported || watchdog !== child) return
+       watchdog = null
+-      // A watchdog that never spawned will never consume the disarm file;
+-      // don't leave stopTerminalWatchdog() writing one nothing will delete.
+       disarmFilePath = null
++      clearArmMonitor()
++      reportOnce(failure)
++    }
++    child.on('error', (error) => {
++      fail({
++        stage: 'spawn',
++        failureCode: classifyTerminalWatchdogSpawnFailure(error),
++      })
+     })
++    if (process.platform === 'win32') {
++      child.on('exit', (code, signal) => {
++        if (code === 0 || watchdog !== child) return
++        fail({
++          stage: 'bootstrap',
++          failureCode: signal ? 'terminated' : 'exit_nonzero',
++        })
++      })
++    }
+     // Don't let the watchdog (or our write end of its pipe) hold the event
+     // loop open — the CLI must still be able to exit naturally. stdin is a
+     // Socket at runtime; its unref isn't in the Writable type.
+@@ -225,7 +301,27 @@ export function startTerminalWatchdog(options?: { ttyPath?: string }): void {
+     child.stdin?.on('error', () => {})
+     ;(child.stdin as { unref?: () => void } | null)?.unref?.()
+     watchdog = child
+-  } catch {
++    if (armedFilePath) {
++      const expectedMarker = armedFilePath
++      armMonitor = setTimeout(() => {
++        if (watchdog !== child) return
++        const armed = existsSync(expectedMarker)
++        clearArmMonitor()
++        if (!armed) {
++          reportOnce({ stage: 'arming', failureCode: 'timeout' })
++        }
++      }, WINDOWS_ARM_TIMEOUT_MS)
++      ;(armMonitor as { unref?: () => void }).unref?.()
++    }
++  } catch (error) {
++    disarmFilePath = null
++    clearArmMonitor()
++    if (process.platform === 'win32') {
++      reportFailure({
++        stage: 'spawn',
++        failureCode: classifyTerminalWatchdogSpawnFailure(error),
++      })
++    }
+     // Best-effort: no watchdog is the pre-existing behavior.
+   } finally {
+     if (overrideFd !== null) {
+@@ -249,6 +345,7 @@ export function stopTerminalWatchdog(): void {
+   if (!child && !disarm) return
+   watchdog = null
+   disarmFilePath = null
++  clearArmMonitor()
+   if (disarm) {
+     // Windows: the real watchdog is a grandchild we hold no handle to; it
+     // checks for this file after our death and stays silent when present.
+diff --git a/cli/src/utils/windows-terminal-health.ts b/cli/src/utils/windows-terminal-health.ts
+new file mode 100644
+index 000000000..6c76d6120
+--- /dev/null
++++ b/cli/src/utils/windows-terminal-health.ts
+@@ -0,0 +1,124 @@
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
++
++import { getCliEnv } from './env'
++
++import type { LogRecordInput } from '@codebuff/common/schemas/logs'
++
++type WindowsTerminalFailureEvent =
++  | AnalyticsEvent.TERMINAL_BROKER_SPAWN_FAILED
++  | AnalyticsEvent.TERMINAL_WATCHDOG_FAILED
++
++export type WindowsTerminalFailure = {
++  stage: 'spawn' | 'stdio' | 'completion' | 'bootstrap' | 'arming'
++  failureCode:
++    | 'failed_to_connect'
++    | 'enoent'
++    | 'eacces'
++    | 'eperm'
++    | 'epipe'
++    | 'invalid_response'
++    | 'protocol_missing'
++    | 'response_too_large'
++    | 'exit_nonzero'
++    | 'terminated'
++    | 'timeout'
++    | 'unknown'
++}
++
++type WindowsTerminalFailureProperties = WindowsTerminalFailure & {
++  version: string
++  platform: 'win32'
++}
++
++export type WindowsTerminalHealthDeliveryDeps = {
++  trackEvent?: (
++    event: WindowsTerminalFailureEvent,
++    properties: WindowsTerminalFailureProperties,
++  ) => boolean | void
++  getAnonymousId: () => string
++  enqueueClientLog: (record: LogRecordInput) => void
++  drainClientLogs: () => Promise<void>
++}
++
++export function sanitizeWindowsCliVersion(version: string): string {
++  return /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,31}$/.test(version)
++    ? version
++    : 'unknown'
++}
++
++/**
++ * Preserve the normal PostHog + Axiom mirror path when analytics is available.
++ * If analytics was not initialized, queue the same bounded event directly in
++ * the Axiom shipper before draining it.
++ */
++export async function deliverWindowsTerminalFailure(
++  event: WindowsTerminalFailureEvent,
++  properties: WindowsTerminalFailureProperties,
++  deps: WindowsTerminalHealthDeliveryDeps,
++): Promise<void> {
++  let queuedByAnalytics = false
++  if (deps.trackEvent) {
++    try {
++      queuedByAnalytics = deps.trackEvent(event, properties) !== false
++    } catch {
++      // Analytics initialization is best-effort; Axiom delivery is independent.
++    }
++  }
++
++  if (!queuedByAnalytics) {
++    try {
++      deps.enqueueClientLog({
++        level: 'info',
++        event,
++        message: event,
++        client_session_id: deps.getAnonymousId(),
++        data: properties,
++      })
++    } catch {
++      // Terminal-health reporting must never affect terminal behavior.
++    }
++  }
++
++  try {
++    await deps.drainClientLogs()
++  } catch {
++    // The shipper is best-effort and owns retry/drop behavior.
++  }
++}
++
++/**
++ * Emit a bounded Windows terminal-health failure and start its Axiom mirror
++ * immediately. Both terminal components use this path so their platform gate,
++ * version handling, privacy envelope, and delivery behavior cannot drift.
++ */
++export function reportWindowsTerminalFailure(
++  event: WindowsTerminalFailureEvent,
++  failure: WindowsTerminalFailure,
++): void {
++  const env = getCliEnv()
++  if (process.platform !== 'win32' || env.FREEBUFF_MODE !== 'true') return
++
++  const properties: WindowsTerminalFailureProperties = {
++    version: sanitizeWindowsCliVersion(env.CODEBUFF_CLI_VERSION ?? ''),
++    platform: 'win32',
++    stage: failure.stage,
++    failureCode: failure.failureCode,
++  }
++
++  void Promise.all([
++    import('./analytics').catch(() => null),
++    import('./anonymous-id'),
++    import('./log-shipper'),
++  ])
++    .then(([analytics, { getOrCreatePersistentAnonymousId }, logShipper]) => {
++      return deliverWindowsTerminalFailure(event, properties, {
++        trackEvent: analytics?.trackEvent,
++        getAnonymousId: getOrCreatePersistentAnonymousId,
++        enqueueClientLog: logShipper.enqueueClientLog,
++        drainClientLogs: logShipper.drainClientLogs,
++      })
++    })
++    .catch(() => {
++      // Telemetry is best-effort and must never affect terminal behavior.
++    })
++}
+diff --git a/common/src/constants/analytics-events.ts b/common/src/constants/analytics-events.ts
+index d2f6f7141..35a94b732 100644
+--- a/common/src/constants/analytics-events.ts
++++ b/common/src/constants/analytics-events.ts
+@@ -42,6 +42,7 @@ export enum AnalyticsEvent {
+   SLASH_MENU_ACTIVATED = 'cli.slash_menu_activated',
+   SLASH_COMMAND_USED = 'cli.slash_command_used',
+   TERMINAL_BROKER_SPAWN_FAILED = 'cli.terminal_broker_spawn_failed',
++  TERMINAL_WATCHDOG_FAILED = 'cli.terminal_watchdog_failed',
+   TERMINAL_COMMAND_COMPLETED = 'cli.terminal_command_completed',
+   USER_INPUT_COMPLETE = 'cli.user_input_complete',
+   UPDATE_CODEBUFF_FAILED = 'cli.update_codebuff_failed',
+diff --git a/common/src/util/__tests__/analytics-sampling.test.ts b/common/src/util/__tests__/analytics-sampling.test.ts
+index d6364d2c4..015187626 100644
+--- a/common/src/util/__tests__/analytics-sampling.test.ts
++++ b/common/src/util/__tests__/analytics-sampling.test.ts
+@@ -49,6 +49,12 @@ describe('analytics sampling', () => {
+         distinctId: 'user-1',
+       }),
+     ).toBe(true)
++    expect(
++      shouldTrackAnalyticsEvent({
++        event: AnalyticsEvent.TERMINAL_WATCHDOG_FAILED,
++        distinctId: 'user-1',
++      }),
++    ).toBe(true)
+   })
+ 
+   it('always tracks CLI error logs', () => {
+diff --git a/common/src/util/analytics-sampling.ts b/common/src/util/analytics-sampling.ts
+index f8cc47670..1a94aae56 100644
+--- a/common/src/util/analytics-sampling.ts
++++ b/common/src/util/analytics-sampling.ts
+@@ -57,6 +57,7 @@ const ALWAYS_TRACK_EVENTS = new Set<AnalyticsEvent>([
+   // Rare operational signal. Sampling would make per-version failure rates
+   // misleading precisely when a Windows-only regression affects few installs.
+   AnalyticsEvent.TERMINAL_BROKER_SPAWN_FAILED,
++  AnalyticsEvent.TERMINAL_WATCHDOG_FAILED,
+   AnalyticsEvent.TERMINAL_COMMAND_COMPLETED,
+   AnalyticsEvent.UPDATE_CODEBUFF_FAILED,
+   AnalyticsEvent.USER_INPUT,

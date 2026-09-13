@@ -1,0 +1,160 @@
+diff --git a/agents/base2/base2.ts b/agents/base2/base2.ts
+index 1f622a99d..83b26ef86 100644
+--- a/agents/base2/base2.ts
++++ b/agents/base2/base2.ts
+@@ -11,7 +11,7 @@ import {
+   canFreebuffModelSpawnGeminiThinker,
+   FREEBUFF_MINIMAX_M3_MODEL_ID,
+ } from '@codebuff/common/constants/freebuff-models'
+-import { moonshotModels } from '@codebuff/common/constants/model-config'
++import { contextPrunerBudgetForModel } from '@codebuff/common/constants/model-config'
+ 
+ import { LITE_MODEL, OPUS_MODEL, publisher } from '../constants'
+ import {
+@@ -99,8 +99,7 @@ export function createBase2(
+     (isFreebuff
+       ? FREEBUFF_REVIEWER_AGENT_ID_BY_MODEL
+       : CODEBUFF_REVIEWER_BY_MODEL)[model] ?? FALLBACK_REVIEWER_AGENT_ID
+-  const contextPrunerMaxContextLength =
+-    getBase2ContextPrunerMaxContextLength(model)
++  const contextPrunerMaxContextLength = contextPrunerBudgetForModel(model)
+   const defaultProviderOptions = getBase2ProviderOptions(model)
+ 
+   return {
+@@ -393,13 +392,6 @@ function getBase2ProviderOptions(
+     : { data_collection: 'deny' }
+ }
+ 
+-function getBase2ContextPrunerMaxContextLength(
+-  model: SecretAgentDefinition['model'],
+-): 250_000 | 400_000 {
+-  if (model === moonshotModels.kimiK27Code) return 250_000
+-  return 400_000
+-}
+-
+ function getBase2HandleSteps({
+   isFreebuff,
+   maxContextLength,
+diff --git a/agents/context-pruner.ts b/agents/context-pruner.ts
+index a33359053..eed42ec38 100644
+--- a/agents/context-pruner.ts
++++ b/agents/context-pruner.ts
+@@ -335,7 +335,10 @@ const definition: AgentDefinition = {
+     // =============================================================================
+ 
+     const messages = agentState.messageHistory
+-    const maxContextLength: number = params?.maxContextLength ?? 200_000
++    // 400k: every model we serve has a ~1M window. Callers that know their
++    // model pass an explicit budget (see contextPrunerBudgetForModel), which is
++    // how the 262,144-token models get a smaller one.
++    const maxContextLength: number = params?.maxContextLength ?? 400_000
+ 
+     // STEP 0: Always remove the last INSTRUCTIONS_PROMPT and SUBAGENT_SPAWN
+     // (these are inserted for the context-pruner subagent itself)
+diff --git a/common/src/__tests__/model-config.test.ts b/common/src/__tests__/model-config.test.ts
+index 332a9af34..eee625bde 100644
+--- a/common/src/__tests__/model-config.test.ts
++++ b/common/src/__tests__/model-config.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, expect, test } from 'bun:test'
+ 
+ import {
++  contextPrunerBudgetForModel,
+   ephemeralTrailingMessageBreaksCache,
+   isExplicitlyDefinedModel,
+   models,
+@@ -67,3 +68,45 @@ describe('ephemeralTrailingMessageBreaksCache', () => {
+     }
+   })
+ })
++
++describe('contextPrunerBudgetForModel', () => {
++  test('defaults to 400k, which every ~1M-window model we serve can hold', () => {
++    for (const model of [
++      'anthropic/claude-opus-5',
++      'anthropic/claude-sonnet-5',
++      'openai/gpt-5.4',
++      'openai/gpt-5.6-luna',
++      'deepseek/deepseek-v4-flash',
++      'deepseek/deepseek-v4-pro',
++      'mimo/mimo-v2.5',
++      'z-ai/glm-5.2',
++      // MiniMax M3's real enforced limit is 524_288 (Fireworks rejects with
++      // "model maximum context length: 524287"), not the 1M OpenRouter lists.
++      // 400k is still comfortably under it.
++      'minimax/minimax-m3',
++      'some/model-we-have-never-shipped',
++    ]) {
++      expect(contextPrunerBudgetForModel(model)).toBe(400_000)
++    }
++  })
++
++  test('drops to 250k for the 262,144-token models', () => {
++    // Kimi was already special-cased; hy3 and Ling share its window and were
++    // silently getting 400k, i.e. a budget above what the provider accepts.
++    for (const model of [
++      'moonshotai/kimi-k2.7-code',
++      'tencent/hy3',
++      'tencent/hy3:free',
++      'tencent/hy3-preview',
++      'inclusionai/ling-3.0-flash:free',
++    ]) {
++      expect(contextPrunerBudgetForModel(model)).toBe(250_000)
++    }
++  })
++
++  test('every exception stays under its real window', () => {
++    // The budget is compared against a GPT-4o-based estimate applied to other
++    // tokenizers, so it must sit under the provider's limit with room to spare.
++    expect(contextPrunerBudgetForModel('tencent/hy3')).toBeLessThan(262_144)
++  })
++})
+diff --git a/common/src/constants/model-config.ts b/common/src/constants/model-config.ts
+index e87a65316..ffa222120 100644
+--- a/common/src/constants/model-config.ts
++++ b/common/src/constants/model-config.ts
+@@ -214,6 +214,44 @@ export function supportsAssistantPrefill(model: Model): boolean {
+   return version < 4.6
+ }
+ 
++/**
++ * Token budget a model's conversation may reach before context-pruner
++ * summarizes it, compared against `agentState.contextTokenCount`.
++ *
++ * 400k by default: every model we serve has roughly a 1M window, which leaves
++ * ample headroom — including for the estimator being a GPT-4o count applied to
++ * models with their own tokenizers, so it can run under the provider's real
++ * number.
++ *
++ * The exceptions are the 262,144-token models below, verified against
++ * OpenRouter's models API on 2026-08-02 (Kimi's is additionally confirmed by a
++ * provider rejection quoted in freebuff-models.ts). They get 250k, the value
++ * Kimi has been running on in prod. That margin is thin for exactly the
++ * estimator reason above, so it is the number to revisit if these models start
++ * hitting context rejections.
++ *
++ * MiniMax M3 is deliberately NOT an exception: its real enforced limit is
++ * 524,288, not the 1,048,576 OpenRouter advertises (Fireworks rejects with
++ * "model maximum context length: 524287"), but 400k is still under it.
++ *
++ * The return type is the two budgets rather than `number` on purpose — base2
++ * pre-serializes one handleSteps variant per budget, so a third value has to be
++ * a compile error there rather than silently falling through to 400k.
++ */
++const SMALL_CONTEXT_MODELS: ReadonlySet<string> = new Set([
++  moonshotModels.kimiK27Code,
++  openrouterModels.openrouter_tencent_hy3,
++  openrouterModels.openrouter_tencent_hy3_free,
++  'tencent/hy3-preview',
++  // FREEBUFF_LING_3_FLASH_MODEL_ID lives in freebuff-models.ts, which imports
++  // from this file, so referencing it here would be circular.
++  'inclusionai/ling-3.0-flash:free',
++])
++
++export function contextPrunerBudgetForModel(model: Model): 250_000 | 400_000 {
++  return SMALL_CONTEXT_MODELS.has(model) ? 250_000 : 400_000
++}
++
+ /**
+  * Whether a trailing message that we delete on the next step destroys this
+  * model's prompt cache.

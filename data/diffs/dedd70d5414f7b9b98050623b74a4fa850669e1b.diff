@@ -1,0 +1,508 @@
+diff --git a/common/src/tools/params/tool/read-files.ts b/common/src/tools/params/tool/read-files.ts
+index f11049d01..8964fbc6d 100644
+--- a/common/src/tools/params/tool/read-files.ts
++++ b/common/src/tools/params/tool/read-files.ts
+@@ -105,5 +105,13 @@ export const readFilesParams = {
+   endsAgentStep,
+   description,
+   inputSchema: windowedInputSchema,
+-  outputSchema: jsonToolResultSchema(fileContentsSchema.array()),
++  // The file listing, then one media part per image that was read, so the
++  // model sees the picture rather than its bytes decoded as text.
++  outputSchema: jsonToolResultSchema(fileContentsSchema.array()).rest(
++    z.object({
++      type: z.literal('media'),
++      data: z.string(),
++      mediaType: z.string(),
++    }),
++  ),
+ } satisfies $ToolParams
+diff --git a/common/src/types/contracts/agent-runtime.ts b/common/src/types/contracts/agent-runtime.ts
+index ee43c338a..60533073c 100644
+--- a/common/src/types/contracts/agent-runtime.ts
++++ b/common/src/types/contracts/agent-runtime.ts
+@@ -3,6 +3,7 @@ import type { ConsumeCreditsWithFallbackFn } from './billing'
+ import type {
+   HandleStepsLogChunkFn,
+   RequestFilesFn,
++  RequestImageFileFn,
+   RequestMcpToolDataFn,
+   RequestOptionalFileFn,
+   RequestToolCallFn,
+@@ -68,6 +69,9 @@ export type AgentRuntimeScopedDeps = {
+   requestMcpToolData: RequestMcpToolDataFn
+   requestFiles: RequestFilesFn
+   requestOptionalFile: RequestOptionalFileFn
++  /** Only hosts that read the workspace locally provide this. Without it,
++   *  read_files sends image paths through `requestFiles` like any file. */
++  requestImageFile?: RequestImageFileFn
+   sendAction: SendActionFn
+   sendSubagentChunk: SendSubagentChunkFn
+ 
+diff --git a/common/src/types/contracts/client.ts b/common/src/types/contracts/client.ts
+index 239c95d0f..f9dd17a0b 100644
+--- a/common/src/types/contracts/client.ts
++++ b/common/src/types/contracts/client.ts
+@@ -33,6 +33,18 @@ export type RequestOptionalFileFn = (params: {
+   filePath: string
+ }) => Promise<string | null>
+ 
++/**
++ * Read an image file as base64, so read_files can hand the model the picture
++ * instead of its bytes decoded as text. `error` is a read_files status line
++ * (missing, blocked, too large) in the slot the image would have occupied.
++ */
++export type RequestImageFileFn = (params: {
++  filePath: string
++}) => Promise<
++  | { path: string; data: string; mediaType: string; bytes: number }
++  | { path: string; error: string }
++>
++
+ export type SendSubagentChunkFn = (params: {
+   userInputId: string
+   agentId: string
+diff --git a/packages/agent-runtime/src/tools/handlers/__tests__/read-files.test.ts b/packages/agent-runtime/src/tools/handlers/__tests__/read-files.test.ts
+index 41d3b7931..961acb408 100644
+--- a/packages/agent-runtime/src/tools/handlers/__tests__/read-files.test.ts
++++ b/packages/agent-runtime/src/tools/handlers/__tests__/read-files.test.ts
+@@ -150,4 +150,62 @@ describe('handleReadFiles with prototype-member paths', () => {
+     expect(({} as Record<string, unknown>).offset).toBeUndefined()
+     expect(Object.prototype).not.toHaveProperty('offset')
+   })
++
++  it('attaches images as media instead of reading their bytes as text', async () => {
++    const seenFilePaths: string[][] = []
++    const { output } = await handleReadFiles({
++      previousToolCallFinished: Promise.resolve(),
++      toolCall: {
++        toolName: 'read_files',
++        toolCallId: 'tc-1',
++        input: { paths: ['a.ts', 'shot.PNG', 'missing.jpg', 'shot.PNG'] },
++      },
++      agentTemplate: agentTemplate(false),
++      fileContext: { tokenCallers: {} } as any,
++      requestFiles: async ({ filePaths }) => {
++        seenFilePaths.push(filePaths)
++        return Object.fromEntries(filePaths.map((path) => [path, 'content']))
++      },
++      requestImageFile: async ({ filePath }) =>
++        filePath === 'shot.PNG'
++          ? {
++              path: filePath,
++              data: 'iVBORw0KGgo=',
++              mediaType: 'image/png',
++              bytes: 2048,
++            }
++          : { path: filePath, error: '[FILE_DOES_NOT_EXIST]' },
++    })
++
++    expect(seenFilePaths).toEqual([['a.ts']])
++    expect(output).toEqual([
++      {
++        type: 'json',
++        value: [
++          { path: 'a.ts', content: 'content', referencedBy: {} },
++          {
++            path: 'shot.PNG',
++            content:
++              '[IMAGE] image/png, 2 KB. The image is attached after this result.',
++            referencedBy: {},
++          },
++          {
++            path: 'missing.jpg',
++            content: '[FILE_DOES_NOT_EXIST]',
++            referencedBy: {},
++          },
++        ],
++      },
++      { type: 'media', data: 'iVBORw0KGgo=', mediaType: 'image/png' },
++    ])
++  })
++
++  it('reads images as ordinary files when the host cannot read binary', async () => {
++    const { seenFilePaths } = await runHandler({
++      paths: ['shot.png'],
++      windowed: false,
++    })
++
++    expect(seenFilePaths).toEqual(['shot.png'])
++  })
+ })
+diff --git a/packages/agent-runtime/src/tools/handlers/tool/read-files.ts b/packages/agent-runtime/src/tools/handlers/tool/read-files.ts
+index 87b8e40d0..c02cb5477 100644
+--- a/packages/agent-runtime/src/tools/handlers/tool/read-files.ts
++++ b/packages/agent-runtime/src/tools/handlers/tool/read-files.ts
+@@ -1,4 +1,5 @@
+-import { jsonToolResult } from '@codebuff/common/util/messages'
++import { isSupportedImageExtension } from '@codebuff/common/constants/images'
++import { jsonToolResult, mediaToolResult } from '@codebuff/common/util/messages'
+ 
+ import { getFileReadingUpdates } from '../../../get-file-reading-updates'
+ import { renderReadFilesResult } from '../../../util/render-read-files-result'
+@@ -9,11 +10,21 @@ import type {
+   CodebuffToolOutput,
+ } from '@codebuff/common/tools/list'
+ import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+-import type { FileReadWindow } from '@codebuff/common/types/contracts/client'
++import type {
++  FileReadWindow,
++  RequestImageFileFn,
++} from '@codebuff/common/types/contracts/client'
+ import type { ParamsExcluding } from '@codebuff/common/types/function-params'
+ import type { ProjectFileContext } from '@codebuff/common/util/file'
+ 
+ type ToolName = 'read_files'
++
++function isImagePath(path: string): boolean {
++  const dot = path.lastIndexOf('.')
++  const separator = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
++  return dot > separator && isSupportedImageExtension(path.slice(dot))
++}
++
+ export const handleReadFiles = (async (
+   params: {
+     previousToolCallFinished: Promise<void>
+@@ -21,6 +32,7 @@ export const handleReadFiles = (async (
+     agentTemplate: AgentTemplate
+ 
+     fileContext: ProjectFileContext
++    requestImageFile?: RequestImageFileFn
+   } & ParamsExcluding<
+     typeof getFileReadingUpdates,
+     'requestedFiles' | 'fileWindows'
+@@ -32,6 +44,7 @@ export const handleReadFiles = (async (
+     agentTemplate,
+ 
+     fileContext,
++    requestImageFile,
+   } = params
+   const { paths } = toolCall.input
+ 
+@@ -39,6 +52,11 @@ export const handleReadFiles = (async (
+ 
+   const windowed = agentTemplate.windowedFileReads === true
+   const requestedFiles: string[] = []
++  // Images skip the text read entirely: decoded as UTF-8 a PNG is a wall of
++  // replacement characters, and the model reports "raw bytes" instead of
++  // describing the picture. A host that cannot read binary leaves them in
++  // `requestedFiles`, which keeps its old behavior.
++  const imagePaths: string[] = []
+   // Null-prototype: these are keyed by a model-supplied path, so a plain object
+   // would resolve `__proto__`, `constructor`, `toString` and friends to
+   // inherited members. `??=` then sees a truthy non-Set / non-Array and leaves
+@@ -48,6 +66,10 @@ export const handleReadFiles = (async (
+   const seenWindows: Record<string, Set<string>> = Object.create(null)
+   for (const entry of paths) {
+     const path = typeof entry === 'string' ? entry : entry.path
++    if (requestImageFile && isImagePath(path)) {
++      if (!imagePaths.includes(path)) imagePaths.push(path)
++      continue
++    }
+     requestedFiles.push(path)
+     if (!windowed) continue
+     const window =
+@@ -65,15 +87,41 @@ export const handleReadFiles = (async (
+     ;(fileWindows[path] ??= []).push(window)
+   }
+ 
+-  const addedFiles = await getFileReadingUpdates({
+-    ...params,
+-    requestedFiles,
+-    fileWindows: windowed ? fileWindows : undefined,
+-  })
++  const addedFiles =
++    requestedFiles.length > 0 || imagePaths.length === 0
++      ? await getFileReadingUpdates({
++          ...params,
++          requestedFiles,
++          fileWindows: windowed ? fileWindows : undefined,
++        })
++      : []
++
++  const images = requestImageFile
++    ? await Promise.all(
++        imagePaths.map((filePath) => requestImageFile({ filePath })),
++      )
++    : []
++  const imageEntries = images.map((image) => ({
++    path: image.path,
++    content:
++      'data' in image
++        ? `[IMAGE] ${image.mediaType}, ${Math.max(1, Math.round(image.bytes / 1024))} KB. The image is attached after this result.`
++        : image.error,
++  }))
+ 
+   return {
+-    output: jsonToolResult(
+-      renderReadFilesResult(addedFiles, fileContext.tokenCallers ?? {}),
+-    ),
++    output: [
++      ...jsonToolResult(
++        renderReadFilesResult(
++          [...addedFiles, ...imageEntries],
++          fileContext.tokenCallers ?? {},
++        ),
++      ),
++      ...images.flatMap((image) =>
++        'data' in image
++          ? mediaToolResult({ data: image.data, mediaType: image.mediaType })
++          : [],
++      ),
++    ],
+   }
+ }) satisfies CodebuffToolHandlerFunction<ToolName>
+diff --git a/packages/agent-runtime/src/tools/handlers/tool/spawn-agent-utils.ts b/packages/agent-runtime/src/tools/handlers/tool/spawn-agent-utils.ts
+index 42063b831..cb1acf558 100644
+--- a/packages/agent-runtime/src/tools/handlers/tool/spawn-agent-utils.ts
++++ b/packages/agent-runtime/src/tools/handlers/tool/spawn-agent-utils.ts
+@@ -89,6 +89,7 @@ export function extractSubagentContextParams(
+     requestToolCall: params.requestToolCall,
+     requestMcpToolData: params.requestMcpToolData,
+     requestFiles: params.requestFiles,
++    requestImageFile: params.requestImageFile,
+     requestOptionalFile: params.requestOptionalFile,
+     sendAction: params.sendAction,
+     sendSubagentChunk: params.sendSubagentChunk,
+diff --git a/sdk/src/__tests__/read-files.test.ts b/sdk/src/__tests__/read-files.test.ts
+index 9448c0f00..d6a7e16d4 100644
+--- a/sdk/src/__tests__/read-files.test.ts
++++ b/sdk/src/__tests__/read-files.test.ts
+@@ -11,7 +11,7 @@ import {
+   spyOn,
+ } from 'bun:test'
+ 
+-import { getFiles } from '../tools/read-files'
++import { getFiles, getImageFile } from '../tools/read-files'
+ 
+ import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
+ import type { PathLike } from 'node:fs'
+@@ -850,3 +850,80 @@ describe('getFiles', () => {
+     })
+   })
+ })
++
++describe('getImageFile', () => {
++  let isFileIgnoredSpy: ReturnType<typeof spyOn>
++
++  beforeEach(() => {
++    isFileIgnoredSpy = spyOn(
++      projectFileTree,
++      'isFileIgnored',
++    ).mockResolvedValue(false)
++  })
++
++  afterEach(() => {
++    mock.restore()
++  })
++
++  test('returns the bytes as base64 with the media type', async () => {
++    const mockFs = createMockFs({
++      files: { '/project/shot.png': { content: 'PNGDATA' } },
++    })
++
++    expect(
++      await getImageFile({ filePath: 'shot.png', cwd: '/project', fs: mockFs }),
++    ).toEqual({
++      path: 'shot.png',
++      data: Buffer.from('PNGDATA').toString('base64'),
++      mediaType: 'image/png',
++      bytes: 7,
++    })
++  })
++
++  test('refuses an image too large to attach and says how to shrink it', async () => {
++    const mockFs = createMockFs({
++      files: { '/project/big.jpg': { content: 'x', size: 5 * 1024 * 1024 } },
++    })
++
++    const result = await getImageFile({
++      filePath: 'big.jpg',
++      cwd: '/project',
++      fs: mockFs,
++    })
++
++    expect('error' in result ? result.error : '').toContain(
++      FILE_READ_STATUS.TOO_LARGE,
++    )
++    expect('error' in result ? result.error : '').toContain('downscaled copy')
++  })
++
++  test('applies the gitignore and filter policy of read_files', async () => {
++    const mockFs = createMockFs({
++      files: { '/project/shot.png': { content: 'PNGDATA' } },
++    })
++
++    expect(
++      await getImageFile({
++        filePath: 'shot.png',
++        cwd: '/project',
++        fs: mockFs,
++        fileFilter: () => ({ status: 'blocked' }),
++      }),
++    ).toEqual({ path: 'shot.png', error: FILE_READ_STATUS.IGNORED })
++
++    isFileIgnoredSpy.mockResolvedValue(true)
++    expect(
++      await getImageFile({ filePath: 'shot.png', cwd: '/project', fs: mockFs }),
++    ).toEqual({ path: 'shot.png', error: FILE_READ_STATUS.IGNORED })
++  })
++
++  test('reports a missing image the way read_files reports a missing file', async () => {
++    expect(
++      await getImageFile({
++        filePath: 'gone.webp',
++        cwd: '/project',
++        fs: createMockFs({}),
++      }),
++    ).toEqual({ path: 'gone.webp', error: FILE_READ_STATUS.DOES_NOT_EXIST })
++  })
++})
+diff --git a/sdk/src/impl/agent-runtime.ts b/sdk/src/impl/agent-runtime.ts
+index af5e09b50..f3ade0e4c 100644
+--- a/sdk/src/impl/agent-runtime.ts
++++ b/sdk/src/impl/agent-runtime.ts
+@@ -61,6 +61,7 @@ export function getAgentRuntimeImpl(
+     | 'requestToolCall'
+     | 'requestMcpToolData'
+     | 'requestFiles'
++    | 'requestImageFile'
+     | 'requestOptionalFile'
+     | 'sendAction'
+     | 'sendSubagentChunk'
+@@ -76,6 +77,7 @@ export function getAgentRuntimeImpl(
+     requestToolCall,
+     requestMcpToolData,
+     requestFiles,
++    requestImageFile,
+     requestOptionalFile,
+     sendAction,
+     sendSubagentChunk,
+@@ -157,6 +159,7 @@ export function getAgentRuntimeImpl(
+     requestToolCall,
+     requestMcpToolData,
+     requestFiles,
++    requestImageFile,
+     requestOptionalFile,
+     sendAction,
+     sendSubagentChunk,
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 6c9a247e6..4fc5560af 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -49,7 +49,7 @@ import { codeSearch } from './tools/code-search'
+ import { glob } from './tools/glob'
+ import { listDirectory } from './tools/list-directory'
+ import { getProjectPathLookupKeys } from './tools/path-utils'
+-import { getFiles } from './tools/read-files'
++import { getFiles, getImageFile } from './tools/read-files'
+ import { readUrl } from './tools/read-url'
+ import { runTerminalCommand } from './tools/run-terminal-command'
+ import type { TerminalCommandBroker } from './tools/run-terminal-command'
+@@ -747,6 +747,17 @@ async function runOnce({
+         cwd,
+         fs,
+       }),
++    // Only a local read can return an image's bytes. An override reads a
++    // remote workspace through the text-only contract, so it keeps images.
++    requestImageFile: overrideTools?.read_files
++      ? undefined
++      : ({ filePath }) =>
++          getImageFile({
++            filePath,
++            cwd: requireCwd(cwd, 'read_files'),
++            fs,
++            fileFilter,
++          }),
+     requestOptionalFile: async ({ filePath }) => {
+       const files = await readFiles({
+         filePaths: [filePath],
+diff --git a/sdk/src/tools/read-files.ts b/sdk/src/tools/read-files.ts
+index 1a9c21791..93974a145 100644
+--- a/sdk/src/tools/read-files.ts
++++ b/sdk/src/tools/read-files.ts
+@@ -1,4 +1,10 @@
++import path from 'path'
++
+ import { countTokens } from '@codebuff/agent-runtime/util/token-counter'
++import {
++  getImageMimeType,
++  MAX_IMAGE_BASE64_SIZE,
++} from '@codebuff/common/constants/images'
+ import { FILE_READ_STATUS } from '@codebuff/common/old-constants'
+ import { isFileIgnored } from '@codebuff/common/project-file-tree'
+ import {
+@@ -12,7 +18,10 @@ import {
+ 
+ import { resolveFilePath } from './path-utils'
+ 
+-import type { FileReadWindow } from '@codebuff/common/types/contracts/client'
++import type {
++  FileReadWindow,
++  RequestImageFileFn,
++} from '@codebuff/common/types/contracts/client'
+ import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
+ 
+ export type FileFilterResult = {
+@@ -144,3 +153,61 @@ export async function getFiles(params: {
+   }
+   return { ...result }
+ }
++
++/**
++ * The largest image read_files attaches: the base64 ceiling the CLI enforces on
++ * a pasted image after compressing it. The SDK has no image codec to shrink a
++ * larger file, so the refusal tells the model how to make a smaller copy.
++ */
++const MAX_IMAGE_READ_BYTES = Math.floor((MAX_IMAGE_BASE64_SIZE * 3) / 4)
++
++/** read_files for an image: the same policy as `getFiles`, but the bytes. */
++export async function getImageFile(params: {
++  filePath: string
++  cwd: string
++  fs: CodebuffFileSystem
++  fileFilter?: FileFilter
++}): ReturnType<RequestImageFileFn> {
++  const { filePath, cwd, fs, fileFilter } = params
++  const { relativePath, fullPath, isWithinProject } = resolveFilePath(
++    cwd,
++    filePath,
++  )
++  const mediaType = getImageMimeType(path.extname(relativePath))
++  if (!mediaType) return { path: relativePath, error: FILE_READ_STATUS.ERROR }
++  if (fileFilter?.(relativePath).status === 'blocked') {
++    return { path: relativePath, error: FILE_READ_STATUS.IGNORED }
++  }
++  if (
++    !fileFilter &&
++    isWithinProject &&
++    (await isFileIgnored({ filePath: relativePath, projectRoot: cwd, fs }))
++  ) {
++    return { path: relativePath, error: FILE_READ_STATUS.IGNORED }
++  }
++
++  try {
++    const stats = await fs.stat(fullPath)
++    if (stats.size > MAX_IMAGE_READ_BYTES) {
++      const kb = (bytes: number) => Math.round(bytes / 1024)
++      return {
++        path: relativePath,
++        error:
++          FILE_READ_STATUS.TOO_LARGE +
++          ` [Image is ${kb(stats.size)} KB; images over ${kb(MAX_IMAGE_READ_BYTES)} KB cannot be attached. Save a downscaled copy with a terminal command (for example \`magick ${relativePath} -resize 1024x1024 /tmp/preview.png\`) and read that instead.]`,
++      }
++    }
++    const data = Buffer.from(await fs.readFile(fullPath)).toString('base64')
++    return { path: relativePath, data, mediaType, bytes: stats.size }
++  } catch (error) {
++    const missing =
++      !!error &&
++      typeof error === 'object' &&
++      'code' in error &&
++      error.code === 'ENOENT'
++    return {
++      path: relativePath,
++      error: missing ? FILE_READ_STATUS.DOES_NOT_EXIST : FILE_READ_STATUS.ERROR,
++    }
++  }
++}

@@ -1,0 +1,220 @@
+diff --git a/sdk/src/__tests__/stream-interruption.test.ts b/sdk/src/__tests__/stream-interruption.test.ts
+index b9fb5fec7..5b231d0cb 100644
+--- a/sdk/src/__tests__/stream-interruption.test.ts
++++ b/sdk/src/__tests__/stream-interruption.test.ts
+@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test'
+ 
+ import {
+   classifyStreamEndRecovery,
++  classifyThrownStreamRecovery,
+   streamFinishInfoOf,
+ } from '../impl/stream-interruption'
+ 
+@@ -116,3 +117,42 @@ describe('streamFinishInfoOf', () => {
+     ).toEqual({ finishReason: 'unknown', hasUsage: false })
+   })
+ })
++
++describe('classifyThrownStreamRecovery', () => {
++  it('classifies Bun socket-close exceptions as interrupted streams', () => {
++    const error = new Error(
++      'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
++    ) as Error & { code: string }
++    error.code = 'ECONNRESET'
++
++    expect(
++      classifyThrownStreamRecovery({ aborted: false, error })?.source,
++    ).toBe('stream-interrupted')
++  })
++
++  it('walks wrapped transport errors', () => {
++    const cause = Object.assign(new Error('read failed'), {
++      code: 'ConnectionClosed',
++    })
++    const error = new Error('Failed after 4 attempts', { cause })
++
++    expect(
++      classifyThrownStreamRecovery({ aborted: false, error })?.source,
++    ).toBe('stream-interrupted')
++  })
++
++  it('does not recover cancellation or unrelated exceptions', () => {
++    const networkError = Object.assign(new Error('read ECONNRESET'), {
++      code: 'ECONNRESET',
++    })
++    expect(
++      classifyThrownStreamRecovery({ aborted: true, error: networkError }),
++    ).toBeNull()
++    expect(
++      classifyThrownStreamRecovery({
++        aborted: false,
++        error: new TypeError('Headers must be an object'),
++      }),
++    ).toBeNull()
++  })
++})
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index 0d65aa2aa..79c4b0ccf 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -29,12 +29,14 @@ import {
+ } from './model-provider'
+ import {
+   classifyStreamEndRecovery,
++  classifyThrownStreamRecovery,
+   streamFinishInfoOf,
++  type StreamEndRecovery,
++  type StreamFinishInfo,
+ } from './stream-interruption'
+ import { refreshChatGptOAuthToken } from '../credentials'
+ import { getErrorStatusCode } from '../error-utils'
+ 
+-import type { StreamFinishInfo } from './stream-interruption'
+ import type { ModelRequestParams } from './model-provider'
+ import type {
+   OpenRouterProviderOptions,
+@@ -481,8 +483,41 @@ export async function* promptAiSdkStream(
+   // (and usage) before ending; its absence after the loop means the
+   // connection was cut mid-response. See stream-interruption.ts.
+   let finishInfo: StreamFinishInfo | undefined
++  // Bun/undici can throw when a response body is severed instead of ending the
++  // iterator cleanly. Feed that through the same capped continuation path as a
++  // clean end without a finish marker.
++  let thrownStreamRecovery: StreamEndRecovery | undefined
++  const streamIterator = response.fullStream[Symbol.asyncIterator]()
++  const recoverThrownStream = (error: unknown): StreamEndRecovery | null => {
++    const recovery = classifyThrownStreamRecovery({
++      aborted: params.signal.aborted,
++      error,
++    })
++    if (!recovery) return null
++    // These final-result promises can reject with the same transport error.
++    // Observe them now so the recovery yield below cannot leave an unhandled
++    // rejection while the consumer starts the continuation step.
++    void Promise.allSettled([
++      response.response,
++      response.request,
++      response.usage,
++      response.providerMetadata,
++    ])
++    return recovery
++  }
+ 
+-  for await (const chunkValue of response.fullStream) {
++  while (true) {
++    let iteration: Awaited<ReturnType<typeof streamIterator.next>>
++    try {
++      iteration = await streamIterator.next()
++    } catch (error) {
++      const recovery = recoverThrownStream(error)
++      if (!recovery) throw error
++      thrownStreamRecovery = recovery
++      break
++    }
++    if (iteration.done) break
++    const chunkValue = iteration.value
+     if (chunkValue.type === 'finish') {
+       finishInfo = streamFinishInfoOf(chunkValue)
+     }
+@@ -498,8 +533,9 @@ export async function* promptAiSdkStream(
+       }
+     }
+     if (chunkValue.type === 'error') {
+-      // Error chunks from fullStream are non-network errors (tool failures, model issues, rate limits, etc.)
+-      // Network errors which cannot be recovered from are thrown, not yielded as chunks.
++      // Error chunks are usually model/tool/API failures. Some runtimes surface
++      // a response-body transport drop here instead of rejecting iterator.next;
++      // the final branch below recognizes that one recoverable exception.
+ 
+       const errorBody = APICallError.isInstance(chunkValue.error)
+         ? chunkValue.error.responseBody
+@@ -630,6 +666,14 @@ export async function* promptAiSdkStream(
+         return fallbackResult
+       }
+ 
++      // A transport error can also arrive as an AI SDK error chunk instead of
++      // making iterator.next() reject. Recover both runtime shapes identically.
++      const recovery = recoverThrownStream(chunkValue.error)
++      if (recovery) {
++        thrownStreamRecovery = recovery
++        break
++      }
++
+       logger.error(
+         {
+           chunk: { ...chunkValue, error: undefined },
+@@ -685,6 +729,7 @@ export async function* promptAiSdkStream(
+   }
+   const flushed = stopSequenceHandler.flush()
+   if (flushed) {
++    hasYieldedContent = true
+     yield {
+       type: 'text',
+       text: flushed,
+@@ -692,12 +737,17 @@ export async function* promptAiSdkStream(
+     }
+   }
+ 
+-  const recovery = classifyStreamEndRecovery({
+-    aborted: params.signal.aborted,
+-    finish: finishInfo,
+-    yieldedText: hasYieldedContent,
+-    yieldedToolCall: hasYieldedToolCall,
+-  })
++  if (thrownStreamRecovery && params.signal.aborted) {
++    return promptAborted('User cancelled input')
++  }
++  const recovery =
++    thrownStreamRecovery ??
++    classifyStreamEndRecovery({
++      aborted: params.signal.aborted,
++      finish: finishInfo,
++      yieldedText: hasYieldedContent,
++      yieldedToolCall: hasYieldedToolCall,
++    })
+   if (recovery) {
+     // The stream ended in a recoverable silent stop (connection cut, or
+     // output budget burned on reasoning). Yield an error chunk instead of
+@@ -732,6 +782,11 @@ export async function* promptAiSdkStream(
+     }
+   }
+ 
++  // A thrown response body has no reliable final metadata to collect. The
++  // recovery chunk above preserves partial output and forces a fresh agent
++  // step, which continues from that saved context.
++  if (thrownStreamRecovery) return promptSuccess(null)
++
+   const responseValue = await response.response
+   const messageId = responseValue.id
+ 
+diff --git a/sdk/src/impl/stream-interruption.ts b/sdk/src/impl/stream-interruption.ts
+index b80dd0c65..da4fab763 100644
+--- a/sdk/src/impl/stream-interruption.ts
++++ b/sdk/src/impl/stream-interruption.ts
+@@ -27,6 +27,7 @@
+  */
+ 
+ import type { StreamRecoverySource } from '@codebuff/common/types/contracts/llm'
++import { isTransientNetworkError } from '@codebuff/common/util/error'
+ 
+ export interface StreamFinishInfo {
+   finishReason: string
+@@ -99,3 +100,18 @@ export function classifyStreamEndRecovery(params: {
+ 
+   return null
+ }
++
++/**
++ * Classify an exception thrown while consuming a completion stream. Some
++ * runtimes surface a severed response body as an exception (for example Bun's
++ * `ConnectionClosed` / `ECONNRESET`) instead of the graceful-but-incomplete
++ * stream ending handled by {@link classifyStreamEndRecovery}. Both represent
++ * the same recoverable condition to the agent loop.
++ */
++export function classifyThrownStreamRecovery(params: {
++  aborted: boolean
++  error: unknown
++}): StreamEndRecovery | null {
++  if (params.aborted || !isTransientNetworkError(params.error)) return null
++  return STREAM_INTERRUPTED_RECOVERY
++}

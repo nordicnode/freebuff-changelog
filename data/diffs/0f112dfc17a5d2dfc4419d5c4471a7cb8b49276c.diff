@@ -1,0 +1,386 @@
+diff --git a/cli/src/utils/__tests__/terminal-command-broker.test.ts b/cli/src/utils/__tests__/terminal-command-broker.test.ts
+index 19fd36114..3a6aa76c7 100644
+--- a/cli/src/utils/__tests__/terminal-command-broker.test.ts
++++ b/cli/src/utils/__tests__/terminal-command-broker.test.ts
+@@ -10,9 +10,11 @@ import {
+ } from '@codebuff/sdk'
+ 
+ import {
++  classifyTerminalBrokerFailure,
+   createTerminalCommandBroker,
+   isTerminalCommandBrokerInvocation,
+   protocolPathFromEnv,
++  sanitizeTerminalBrokerVersion,
+ } from '../terminal-command-broker'
+ 
+ const brokerFixture = path.join(
+@@ -84,6 +86,31 @@ function stdoutOf(
+ }
+ 
+ describe('terminal command broker', () => {
++  test('normalizes failures without retaining exception text', () => {
++    expect(classifyTerminalBrokerFailure(new Error('Failed to connect'))).toBe(
++      'failed_to_connect',
++    )
++    expect(
++      classifyTerminalBrokerFailure(
++        Object.assign(new Error('private path must not be retained'), {
++          code: 'ENOENT',
++        }),
++      ),
++    ).toBe('enoent')
++    expect(classifyTerminalBrokerFailure(new Error('private details'))).toBe(
++      'unknown',
++    )
++    expect(
++      classifyTerminalBrokerFailure(
++        new Error('terminal command broker protocol response was missing'),
++      ),
++    ).toBe('protocol_missing')
++    expect(sanitizeTerminalBrokerVersion('0.0.142')).toBe('0.0.142')
++    expect(sanitizeTerminalBrokerVersion('private path/and details')).toBe(
++      'unknown',
++    )
++  })
++
+   test('requires its private environment marker and flag before --', () => {
+     expect(
+       isTerminalCommandBrokerInvocation(
+@@ -181,11 +208,18 @@ describe('terminal command broker', () => {
+   })
+ 
+   test('isolates overlapping commands so one cancellation does not affect the other', async () => {
++    const failures: Array<{ stage: string; failureCode: string }> = []
+     const existing = new Set(
+       getActiveTerminalCommandProcesses().map(({ pid }) => pid),
+     )
+     const firstAbort = new AbortController()
+-    const broker = createTestBroker()
++    const broker = createTerminalCommandBroker({
++      invocation: () => ({
++        executable: process.execPath,
++        args: [brokerFixture],
++      }),
++      reportFailure: (failure) => failures.push(failure),
++    })
+     const first = runTerminalCommand({
+       command: `printf 'FIRST_STARTED'; while :; do sleep 1; done`,
+       process_type: 'SYNC',
+@@ -214,13 +248,16 @@ describe('terminal command broker', () => {
+       message: expect.stringContaining('aborted by the user'),
+     })
+     expect(stdoutOf(secondResult)).toBe('SECOND_DONE')
++    expect(failures).toEqual([])
+   })
+ 
+   test('surfaces helper startup failures instead of falling back to the console', async () => {
++    const failures: Array<{ stage: string; failureCode: string }> = []
+     const broker = createTerminalCommandBroker({
+       invocation: () => {
+         throw new Error('helper executable is unavailable')
+       },
++      reportFailure: (failure) => failures.push(failure),
+     })
+ 
+     await expect(
+@@ -234,9 +271,11 @@ describe('terminal command broker', () => {
+     ).rejects.toThrow(
+       'Failed to start terminal command broker: helper executable is unavailable\n\nRestart Freebuff and try again.',
+     )
++    expect(failures).toEqual([{ stage: 'spawn', failureCode: 'unknown' }])
+   })
+ 
+   test('contains an asynchronous spawn error when the helper is missing', async () => {
++    const failures: Array<{ stage: string; failureCode: string }> = []
+     const broker = createTerminalCommandBroker({
+       invocation: () => ({
+         executable: path.join(
+@@ -245,6 +284,7 @@ describe('terminal command broker', () => {
+         ),
+         args: [],
+       }),
++      reportFailure: (failure) => failures.push(failure),
+     })
+ 
+     await expect(
+@@ -259,6 +299,7 @@ describe('terminal command broker', () => {
+ 
+     // Bun reports this asynchronously after spawn() returns a child handle.
+     await Bun.sleep(0)
++    expect(failures).toEqual([{ stage: 'completion', failureCode: 'enoent' }])
+   })
+ 
+   test('adds recovery guidance when spawning the helper throws', async () => {
+@@ -278,6 +319,7 @@ describe('terminal command broker', () => {
+   })
+ 
+   test('adds recovery guidance when the helper exits before responding', async () => {
++    const failures: Array<{ stage: string; failureCode: string }> = []
+     const broker = createTerminalCommandBroker({
+       invocation: () => ({
+         executable: process.execPath,
+@@ -288,6 +330,7 @@ describe('terminal command broker', () => {
+           ),
+         ],
+       }),
++      reportFailure: (failure) => failures.push(failure),
+     })
+ 
+     let failureMessage = ''
+@@ -305,6 +348,9 @@ describe('terminal command broker', () => {
+ 
+     expect(failureMessage).toContain('Terminal command broker failed:')
+     expect(failureMessage).toContain('Restart Freebuff and try again.')
++    expect(failures).toEqual([
++      { stage: 'completion', failureCode: 'protocol_missing' },
++    ])
+   })
+ 
+   test('does not add broker recovery guidance to a command spawn failure', async () => {
+diff --git a/cli/src/utils/terminal-command-broker.ts b/cli/src/utils/terminal-command-broker.ts
+index 9b5310d43..b9611d8ce 100644
+--- a/cli/src/utils/terminal-command-broker.ts
++++ b/cli/src/utils/terminal-command-broker.ts
+@@ -3,6 +3,7 @@ import { readFileSync, rmSync, writeFileSync } from 'fs'
+ import os from 'os'
+ import path from 'path'
+ 
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ import type {
+   TerminalCommandBroker,
+   TerminalCommandProcess,
+@@ -22,6 +23,23 @@ const MAX_PROTOCOL_BYTES = 64 * 1024
+ const PROTOCOL_FILE_PREFIX = 'freebuff-terminal-command-broker-'
+ const TERMINAL_COMMAND_BROKER_RECOVERY = 'Restart Freebuff and try again.'
+ 
++export type TerminalBrokerFailureStage = 'spawn' | 'stdio' | 'completion'
++export type TerminalBrokerFailureCode =
++  | 'failed_to_connect'
++  | 'enoent'
++  | 'eacces'
++  | 'eperm'
++  | 'epipe'
++  | 'invalid_response'
++  | 'protocol_missing'
++  | 'response_too_large'
++  | 'unknown'
++
++export type TerminalBrokerFailureTelemetry = {
++  stage: TerminalBrokerFailureStage
++  failureCode: TerminalBrokerFailureCode
++}
++
+ type BrokerProtocol =
+   | { ok: true; exitCode: number | null }
+   | { ok: false; error: string }
+@@ -30,6 +48,61 @@ function errorMessage(error: unknown): string {
+   return error instanceof Error ? error.message : String(error)
+ }
+ 
++export function classifyTerminalBrokerFailure(
++  error: unknown,
++): TerminalBrokerFailureCode {
++  const rawCode =
++    error && typeof error === 'object' && 'code' in error
++      ? String((error as NodeJS.ErrnoException).code ?? '').toUpperCase()
++      : ''
++  if (rawCode === 'ENOENT') return 'enoent'
++  if (rawCode === 'EACCES') return 'eacces'
++  if (rawCode === 'EPERM') return 'eperm'
++  if (rawCode === 'EPIPE') return 'epipe'
++
++  const message = errorMessage(error).toLowerCase()
++  if (message.includes('failed to connect')) return 'failed_to_connect'
++  if (message.includes('invalid response')) return 'invalid_response'
++  if (message.includes('protocol response was missing')) {
++    return 'protocol_missing'
++  }
++  if (message.includes('response was too large')) return 'response_too_large'
++  return 'unknown'
++}
++
++export function sanitizeTerminalBrokerVersion(version: string): string {
++  return /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,31}$/.test(version)
++    ? version
++    : 'unknown'
++}
++
++function reportTerminalBrokerFailure({
++  stage,
++  failureCode,
++}: TerminalBrokerFailureTelemetry): void {
++  if (process.platform !== 'win32' || getCliEnv().FREEBUFF_MODE !== 'true') {
++    return
++  }
++  const configuredVersion = getCliEnv().CODEBUFF_CLI_VERSION ?? ''
++  const version = sanitizeTerminalBrokerVersion(configuredVersion)
++
++  // Load analytics only in the interactive parent and only on failure. The
++  // detached broker helper imports this module too, but must stay minimal and
++  // must never initialize product analytics of its own.
++  void import('./analytics')
++    .then(({ trackEvent }) => {
++      trackEvent(AnalyticsEvent.TERMINAL_BROKER_SPAWN_FAILED, {
++        version,
++        platform: 'win32',
++        stage,
++        failureCode,
++      })
++    })
++    .catch(() => {
++      // Telemetry is best-effort and must never change command behavior.
++    })
++}
++
+ function brokerFailure(error: unknown): Error {
+   const message = errorMessage(error)
+   return new Error(
+@@ -304,13 +377,27 @@ function defaultBrokerInvocation(): {
+ export function createTerminalCommandBroker({
+   invocation = defaultBrokerInvocation,
+   terminate = terminateProcessGroup,
++  reportFailure = reportTerminalBrokerFailure,
+ }: {
+   invocation?: () => { executable: string; args: string[] }
+   terminate?: typeof terminateProcessGroup
++  reportFailure?: (failure: TerminalBrokerFailureTelemetry) => void
+ } = {}): TerminalCommandBroker {
++  const report = (stage: TerminalBrokerFailureStage, error: unknown): void => {
++    try {
++      reportFailure({
++        stage,
++        failureCode: classifyTerminalBrokerFailure(error),
++      })
++    } catch {
++      // An injected or future reporter must never replace the broker failure.
++    }
++  }
++
+   return {
+     start(request): TerminalCommandProcess {
+       let child: ChildProcess
++      let terminationRequested = false
+       const protocolPath = createProtocolPath()
+       try {
+         const { executable, args } = invocation()
+@@ -330,6 +417,7 @@ export function createTerminalCommandBroker({
+           windowsHide: true,
+         })
+       } catch (error) {
++        report('spawn', error)
+         removeProtocolFile(protocolPath)
+         throw brokerFailure(error)
+       }
+@@ -340,7 +428,9 @@ export function createTerminalCommandBroker({
+       if (!child.stdin || !child.stdout || !child.stderr) {
+         terminate(child, 'SIGKILL')
+         removeProtocolFile(protocolPath)
+-        throw brokerFailure('could not open terminal command broker pipes')
++        const error = new Error('could not open terminal command broker pipes')
++        report('stdio', error)
++        throw brokerFailure(error)
+       }
+ 
+       // Cancellation can close the broker while this small request is still
+@@ -355,13 +445,24 @@ export function createTerminalCommandBroker({
+       })
+       const completion = closed
+         .then(() => {
+-          const payload = readFileSync(protocolPath)
++          let payload: Buffer
++          try {
++            payload = readFileSync(protocolPath)
++          } catch (error) {
++            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
++              throw new Error(
++                'terminal command broker protocol response was missing',
++              )
++            }
++            throw error
++          }
+           if (payload.byteLength > MAX_PROTOCOL_BYTES) {
+             throw new Error('terminal command broker response was too large')
+           }
+           return parseProtocol(payload.toString('utf8').trim())
+         })
+         .catch((error) => {
++          if (!terminationRequested) report('completion', error)
+           throw brokerFailure(error)
+         })
+         .then((message) => {
+@@ -375,7 +476,10 @@ export function createTerminalCommandBroker({
+         stdout: child.stdout,
+         stderr: child.stderr,
+         completion,
+-        kill: (signal) => terminate(child, signal),
++        kill: (signal) => {
++          terminationRequested = true
++          terminate(child, signal)
++        },
+         isAlive: () => isProcessGroupAlive(child),
+       }
+     },
+diff --git a/common/src/constants/analytics-events.ts b/common/src/constants/analytics-events.ts
+index 99bcd3309..d2f6f7141 100644
+--- a/common/src/constants/analytics-events.ts
++++ b/common/src/constants/analytics-events.ts
+@@ -41,6 +41,7 @@ export enum AnalyticsEvent {
+   LOGIN_ABORTED = 'cli.login_aborted',
+   SLASH_MENU_ACTIVATED = 'cli.slash_menu_activated',
+   SLASH_COMMAND_USED = 'cli.slash_command_used',
++  TERMINAL_BROKER_SPAWN_FAILED = 'cli.terminal_broker_spawn_failed',
+   TERMINAL_COMMAND_COMPLETED = 'cli.terminal_command_completed',
+   USER_INPUT_COMPLETE = 'cli.user_input_complete',
+   UPDATE_CODEBUFF_FAILED = 'cli.update_codebuff_failed',
+diff --git a/common/src/util/__tests__/analytics-sampling.test.ts b/common/src/util/__tests__/analytics-sampling.test.ts
+index 190471ccd..d6364d2c4 100644
+--- a/common/src/util/__tests__/analytics-sampling.test.ts
++++ b/common/src/util/__tests__/analytics-sampling.test.ts
+@@ -43,6 +43,12 @@ describe('analytics sampling', () => {
+         distinctId: 'user-1',
+       }),
+     ).toBe(true)
++    expect(
++      shouldTrackAnalyticsEvent({
++        event: AnalyticsEvent.TERMINAL_BROKER_SPAWN_FAILED,
++        distinctId: 'user-1',
++      }),
++    ).toBe(true)
+   })
+ 
+   it('always tracks CLI error logs', () => {
+diff --git a/common/src/util/analytics-sampling.ts b/common/src/util/analytics-sampling.ts
+index 5e5ce798c..f8cc47670 100644
+--- a/common/src/util/analytics-sampling.ts
++++ b/common/src/util/analytics-sampling.ts
+@@ -54,6 +54,9 @@ const ALWAYS_TRACK_EVENTS = new Set<AnalyticsEvent>([
+   AnalyticsEvent.DESKTOP_MODEL_CHANGED,
+   AnalyticsEvent.DESKTOP_SKILL_RUN,
+   AnalyticsEvent.DESKTOP_CODEX_RESOLUTION,
++  // Rare operational signal. Sampling would make per-version failure rates
++  // misleading precisely when a Windows-only regression affects few installs.
++  AnalyticsEvent.TERMINAL_BROKER_SPAWN_FAILED,
+   AnalyticsEvent.TERMINAL_COMMAND_COMPLETED,
+   AnalyticsEvent.UPDATE_CODEBUFF_FAILED,
+   AnalyticsEvent.USER_INPUT,
+@@ -70,7 +73,9 @@ function getStringProperty(
+   return typeof value === 'string' && value.trim() ? value : undefined
+ }
+ 
+-function getPropertyUserId(properties: AnalyticsProperties): string | undefined {
++function getPropertyUserId(
++  properties: AnalyticsProperties,
++): string | undefined {
+   const direct =
+     getStringProperty(properties, 'userId') ??
+     getStringProperty(properties, 'user_id') ??
+@@ -123,8 +128,7 @@ export function isFullTelemetryEnabled(params: {
+     getStringProperty(params.properties, 'userEmail'),
+     getStringProperty(params.properties, 'email'),
+   ].filter(
+-    (value): value is string =>
+-      typeof value === 'string' && value.length > 0,
++    (value): value is string => typeof value === 'string' && value.length > 0,
+   )
+ 
+   return candidates.some((candidate) => ids.has(candidate))

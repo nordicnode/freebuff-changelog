@@ -1,0 +1,736 @@
+diff --git a/cli/src/hooks/helpers/send-message.ts b/cli/src/hooks/helpers/send-message.ts
+index f5432dbc9..2ce15427a 100644
+--- a/cli/src/hooks/helpers/send-message.ts
++++ b/cli/src/hooks/helpers/send-message.ts
+@@ -14,6 +14,8 @@ import { processBashContext } from '../../utils/bash-context-processor'
+ import { markRunningAgentsAsCancelled } from '../../utils/block-operations'
+ import {
+   getCountryBlockFromFreeModeError,
++  getFreebuffOnboardingRequiredMessage,
++  isFreebuffOnboardingRequiredError,
+   getFreeModeUnavailableErrorMessage,
+   getFreebuffGateErrorKind,
+   getFreebuffRateLimitErrorMessage,
+@@ -429,6 +431,14 @@ export const handleRunCompletion = (params: {
+       return
+     }
+ 
++    // Checked before the gate/rate-limit branches: this is terminal for the
++    // run and no amount of waiting clears it.
++    if (IS_FREEBUFF && isFreebuffOnboardingRequiredError(output)) {
++      updater.setError(getFreebuffOnboardingRequiredMessage(output))
++      finalizeAfterError()
++      return
++    }
++
+     const gateKind = getFreebuffGateErrorKind(output)
+     if (gateKind) {
+       handleFreebuffGateError(gateKind, updater, {
+diff --git a/cli/src/utils/__tests__/error-handling.test.ts b/cli/src/utils/__tests__/error-handling.test.ts
+index 56f202324..b73f55c61 100644
+--- a/cli/src/utils/__tests__/error-handling.test.ts
++++ b/cli/src/utils/__tests__/error-handling.test.ts
+@@ -7,6 +7,8 @@ import {
+   isOutOfCreditsError,
+   isFreeModeUnavailableError,
+   getCountryBlockFromFreeModeError,
++  getFreebuffOnboardingRequiredMessage,
++  isFreebuffOnboardingRequiredError,
+   OUT_OF_CREDITS_MESSAGE,
+   FREE_MODE_UNAVAILABLE_MESSAGE,
+   FREEBUFF_RATE_LIMIT_MESSAGE,
+@@ -307,6 +309,40 @@ describe('error-handling', () => {
+     })
+   })
+ 
++  describe('isFreebuffOnboardingRequiredError', () => {
++    test('recognizes the code from a response body', () => {
++      const error = {
++        statusCode: 403,
++        responseBody: JSON.stringify({
++          error: 'onboarding_required',
++          message: 'Finish setting up your account.',
++        }),
++      }
++      expect(isFreebuffOnboardingRequiredError(error)).toBe(true)
++      expect(getFreebuffOnboardingRequiredMessage(error)).toBe(
++        'Finish setting up your account.',
++      )
++    })
++
++    test('falls back to a local message when the server sends none', () => {
++      expect(
++        getFreebuffOnboardingRequiredMessage({
++          statusCode: 403,
++          error: 'onboarding_required',
++        }),
++      ).toContain('freebuff.com')
++    })
++
++    test('does not claim other 403s', () => {
++      expect(
++        isFreebuffOnboardingRequiredError({
++          statusCode: 403,
++          error: 'free_mode_unavailable',
++        }),
++      ).toBe(false)
++    })
++  })
++
+   describe('getCountryBlockFromFreeModeError', () => {
+     test('extracts country block details from free-mode unavailable errors', () => {
+       const error = {
+diff --git a/cli/src/utils/error-handling.ts b/cli/src/utils/error-handling.ts
+index 05c603c5e..a84e0d497 100644
+--- a/cli/src/utils/error-handling.ts
++++ b/cli/src/utils/error-handling.ts
+@@ -1,4 +1,8 @@
+ import { FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN } from '@codebuff/common/constants/freebuff-errors'
++import {
++  ONBOARDING_REQUIRED_ERROR,
++  ONBOARDING_REQUIRED_MESSAGE,
++} from '@codebuff/common/constants/freebuff-onboarding-gate'
+ import { env } from '@codebuff/common/env'
+ import { extractApiErrorDetails } from '@codebuff/common/util/error'
+ import { formatFreebuffHardBlockedPrivacySignals } from '@codebuff/common/util/freebuff-privacy'
+@@ -60,6 +64,26 @@ export const isFreeModeUnavailableError = (error: unknown): boolean => {
+   )
+ }
+ 
++/**
++ * The account owes onboarding answers. Distinct from every rate-limit and
++ * country code because the recovery is different in kind: nothing here is
++ * retryable and no countdown will clear it — the user has to open the web app
++ * once. Falls back to a local message so an older server that omits one still
++ * tells the user what to do.
++ */
++export const isFreebuffOnboardingRequiredError = (error: unknown): boolean => {
++  const details = getCliApiErrorDetails(error)
++  return (
++    details.statusCode === 403 &&
++    details.errorCode === ONBOARDING_REQUIRED_ERROR
++  )
++}
++
++export const getFreebuffOnboardingRequiredMessage = (
++  error: unknown,
++): string =>
++  getCliApiErrorDetails(error).message ?? ONBOARDING_REQUIRED_MESSAGE
++
+ const getTopLevelApiErrorDetails = (
+   error: unknown,
+ ): {
+diff --git a/common/src/constants/__tests__/freebuff-onboarding-gate.test.ts b/common/src/constants/__tests__/freebuff-onboarding-gate.test.ts
+new file mode 100644
+index 000000000..ff5f6c4a4
+--- /dev/null
++++ b/common/src/constants/__tests__/freebuff-onboarding-gate.test.ts
+@@ -0,0 +1,97 @@
++import { describe, expect, it } from 'bun:test'
++
++import {
++  evaluateOnboardingRequirement,
++  parseOnboardingCutover,
++} from '../freebuff-onboarding-gate'
++
++const CUTOVER = new Date('2026-08-12T00:00:00.000Z')
++const BEFORE = new Date('2026-08-01T00:00:00.000Z')
++const AFTER = new Date('2026-08-13T00:00:00.000Z')
++
++describe('existing users are never affected', () => {
++  it('never requires an account created before the cutover', () => {
++    // The load-bearing case. ~203,000 accounts predate this feature; they never
++    // saw the questions and must never be stopped by them.
++    const result = evaluateOnboardingRequirement({
++      accountCreatedAt: BEFORE,
++      requiredAfter: CUTOVER,
++      complete: false,
++    })
++    expect(result).toEqual({ required: false, reason: 'pre_existing_account' })
++  })
++
++  it('exempts an account created at the exact cutover instant minus a millisecond', () => {
++    const result = evaluateOnboardingRequirement({
++      accountCreatedAt: new Date(CUTOVER.getTime() - 1),
++      requiredAfter: CUTOVER,
++      complete: false,
++    })
++    expect(result.required).toBe(false)
++  })
++
++  it('requires an account created at the cutover instant itself', () => {
++    const result = evaluateOnboardingRequirement({
++      accountCreatedAt: CUTOVER,
++      requiredAfter: CUTOVER,
++      complete: false,
++    })
++    expect(result.required).toBe(true)
++  })
++})
++
++describe('missing configuration disables the gate rather than applying it', () => {
++  it('requires nobody when no cutover is set', () => {
++    // Absence must not mean "everyone". The opposite convention already cost
++    // this repo seven hours once; here it would lock out every user at once.
++    const result = evaluateOnboardingRequirement({
++      accountCreatedAt: AFTER,
++      requiredAfter: null,
++      complete: false,
++    })
++    expect(result).toEqual({ required: false, reason: 'gate_disabled' })
++  })
++
++  it('parses only a usable instant, and nulls everything else', () => {
++    expect(parseOnboardingCutover('2026-08-12T00:00:00Z')?.toISOString()).toBe(
++      '2026-08-12T00:00:00.000Z',
++    )
++    for (const bad of [undefined, null, '', '   ', 'next tuesday', 'yes']) {
++      expect(parseOnboardingCutover(bad as string)).toBeNull()
++    }
++  })
++
++  it('lets a user through when their account age is unreadable', () => {
++    // Deliberately the opposite of the trust-tier convention, where unknown age
++    // means `new`. There, unknown costs some headroom; here it would cost
++    // access entirely, so the safe default flips.
++    const result = evaluateOnboardingRequirement({
++      accountCreatedAt: null,
++      requiredAfter: CUTOVER,
++      complete: false,
++    })
++    expect(result).toEqual({ required: false, reason: 'unknown_account_age' })
++  })
++})
++
++describe('new users', () => {
++  it('requires a post-cutover account that has not answered', () => {
++    expect(
++      evaluateOnboardingRequirement({
++        accountCreatedAt: AFTER,
++        requiredAfter: CUTOVER,
++        complete: false,
++      }),
++    ).toEqual({ required: true })
++  })
++
++  it('stops requiring once they have answered', () => {
++    expect(
++      evaluateOnboardingRequirement({
++        accountCreatedAt: AFTER,
++        requiredAfter: CUTOVER,
++        complete: true,
++      }),
++    ).toEqual({ required: false, reason: 'already_complete' })
++  })
++})
+diff --git a/common/src/constants/__tests__/freebuff-onboarding.test.ts b/common/src/constants/__tests__/freebuff-onboarding.test.ts
+new file mode 100644
+index 000000000..05a0b4102
+--- /dev/null
++++ b/common/src/constants/__tests__/freebuff-onboarding.test.ts
+@@ -0,0 +1,166 @@
++import { describe, expect, it } from 'bun:test'
++
++import {
++  FREEBUFF_ONBOARDING_QUESTIONS,
++  isOnboardingComplete,
++  ONBOARDING_OTHER_TEXT_MAX,
++  OTHER_OPTION_ID,
++  validateOnboardingSubmission,
++  type OnboardingAnswer,
++} from '../freebuff-onboarding'
++
++/** A complete, valid submission. */
++function fullAnswers(overrides: OnboardingAnswer[] = []): OnboardingAnswer[] {
++  const base: OnboardingAnswer[] = [
++    { questionId: 'referral_source', optionIds: ['youtube'] },
++    { questionId: 'role', optionIds: ['professional_dev'] },
++    { questionId: 'proficiency', optionIds: ['advanced'] },
++    { questionId: 'intended_use', optionIds: ['work', 'side_projects'] },
++  ]
++  return base.map((a) => overrides.find((o) => o.questionId === a.questionId) ?? a)
++}
++
++describe('the question set itself', () => {
++  it('gives every option a unique id within its question', () => {
++    // A duplicate id would silently merge two distinct answers in the analytics.
++    for (const q of FREEBUFF_ONBOARDING_QUESTIONS) {
++      const ids = q.options.map((o) => o.id)
++      expect(new Set(ids).size).toBe(ids.length)
++    }
++  })
++
++  it('offers Other everywhere except the ordinal scale', () => {
++    // Free text on an ordered scale is unusable for the segmentation the
++    // question exists to support.
++    for (const q of FREEBUFF_ONBOARDING_QUESTIONS) {
++      const hasOther = q.options.some((o) => o.id === OTHER_OPTION_ID)
++      expect(hasOther).toBe(q.id !== 'proficiency')
++    }
++  })
++})
++
++describe('validateOnboardingSubmission', () => {
++  it('accepts a complete submission', () => {
++    const result = validateOnboardingSubmission({ answers: fullAnswers() })
++    expect(result.ok).toBe(true)
++  })
++
++  it('requires every question', () => {
++    const result = validateOnboardingSubmission({
++      answers: fullAnswers().slice(0, 2),
++    })
++    expect(result.ok).toBe(false)
++    if (result.ok) throw new Error('unreachable')
++    expect(result.errors.map((e) => e.questionId)).toEqual([
++      'proficiency',
++      'intended_use',
++    ])
++  })
++
++  it('rejects an unknown option id', () => {
++    // Out-of-date client or a forged post. Accepting it would put a value in
++    // the analytics that no question can explain.
++    const result = validateOnboardingSubmission({
++      answers: fullAnswers([{ questionId: 'role', optionIds: ['ceo_of_mars'] }]),
++    })
++    expect(result.ok).toBe(false)
++  })
++
++  it('rejects multiple answers to a single-choice question', () => {
++    const result = validateOnboardingSubmission({
++      answers: fullAnswers([
++        { questionId: 'role', optionIds: ['student', 'founder'] },
++      ]),
++    })
++    expect(result.ok).toBe(false)
++  })
++
++  it('accepts multiple answers where the question allows it', () => {
++    const result = validateOnboardingSubmission({
++      answers: fullAnswers([
++        {
++          questionId: 'intended_use',
++          optionIds: ['work', 'learning', 'automation'],
++        },
++      ]),
++    })
++    expect(result.ok).toBe(true)
++  })
++})
++
++describe('the Other option', () => {
++  it('requires accompanying text', () => {
++    const result = validateOnboardingSubmission({
++      answers: fullAnswers([
++        { questionId: 'role', optionIds: [OTHER_OPTION_ID] },
++      ]),
++    })
++    expect(result.ok).toBe(false)
++  })
++
++  it('keeps the text when Other is chosen', () => {
++    const result = validateOnboardingSubmission({
++      answers: fullAnswers([
++        {
++          questionId: 'role',
++          optionIds: [OTHER_OPTION_ID],
++          otherText: '  technical writer  ',
++        },
++      ]),
++    })
++    expect(result.ok).toBe(true)
++    if (!result.ok) throw new Error('unreachable')
++    const role = result.answers.find((a) => a.questionId === 'role')
++    expect(role?.otherText).toBe('technical writer')
++  })
++
++  it('drops stray text when Other was NOT chosen', () => {
++    // Otherwise text rides along on an answer that has nowhere to display it,
++    // and the admin view shows a note against the wrong option.
++    const result = validateOnboardingSubmission({
++      answers: fullAnswers([
++        { questionId: 'role', optionIds: ['student'], otherText: 'ignore me' },
++      ]),
++    })
++    expect(result.ok).toBe(true)
++    if (!result.ok) throw new Error('unreachable')
++    expect(result.answers.find((a) => a.questionId === 'role')?.otherText).toBeUndefined()
++  })
++
++  it('truncates rather than rejecting a long note', () => {
++    const result = validateOnboardingSubmission({
++      answers: fullAnswers([
++        {
++          questionId: 'role',
++          optionIds: [OTHER_OPTION_ID],
++          otherText: 'x'.repeat(ONBOARDING_OTHER_TEXT_MAX + 500),
++        },
++      ]),
++    })
++    expect(result.ok).toBe(true)
++    if (!result.ok) throw new Error('unreachable')
++    expect(result.answers.find((a) => a.questionId === 'role')?.otherText).toHaveLength(
++      ONBOARDING_OTHER_TEXT_MAX,
++    )
++  })
++})
++
++describe('isOnboardingComplete — the blocking gate reads this', () => {
++  it('is true only when every question has an answer', () => {
++    expect(isOnboardingComplete(fullAnswers())).toBe(true)
++    expect(isOnboardingComplete(fullAnswers().slice(0, 3))).toBe(false)
++  })
++
++  it('treats null, undefined and empty as incomplete', () => {
++    // A user with no record must be gated, not waved through — this is the
++    // difference between the gate working and being decorative.
++    expect(isOnboardingComplete(null)).toBe(false)
++    expect(isOnboardingComplete(undefined)).toBe(false)
++    expect(isOnboardingComplete([])).toBe(false)
++  })
++
++  it('does not count an answer with no options chosen', () => {
++    const hollow = fullAnswers([{ questionId: 'role', optionIds: [] }])
++    expect(isOnboardingComplete(hollow)).toBe(false)
++  })
++})
+diff --git a/common/src/constants/freebuff-onboarding-gate.ts b/common/src/constants/freebuff-onboarding-gate.ts
+new file mode 100644
+index 000000000..51f1290b7
+--- /dev/null
++++ b/common/src/constants/freebuff-onboarding-gate.ts
+@@ -0,0 +1,80 @@
++/**
++ * Who the onboarding requirement applies to.
++ *
++ * The requirement is blocking: an account that owes answers cannot use free
++ * mode on any surface. That makes "who does it apply to" the single most
++ * dangerous decision in the feature, because getting it wrong locks out real
++ * people who did nothing.
++ *
++ * So it is scoped by a CUTOVER INSTANT. Only accounts created at or after it
++ * are ever required, and the ~203,000 accounts that predate the feature are
++ * permanently exempt — they never saw the questions and must never be stopped
++ * by them.
++ *
++ * The polarity is deliberate and load-bearing: **an unset or unparseable
++ * cutover requires NOBODY.** Absence of config disables the gate rather than
++ * enabling it universally. This repo has already paid for the opposite
++ * convention once — a deleted env var silently activating a default is
++ * documented in db-capacity-and-scaling.md §10.6 — and here that mistake would
++ * present as every existing user being locked out at once.
++ */
++
++export type OnboardingRequirementInput = {
++  /** When the account was created. Null/unknown is treated as pre-existing. */
++  accountCreatedAt: Date | null | undefined
++  /** Parsed `FREEBUFF_ONBOARDING_REQUIRED_AFTER`. Null disables the gate. */
++  requiredAfter: Date | null
++  /** Whether the user has answered every question. */
++  complete: boolean
++}
++
++export type OnboardingRequirement =
++  | { required: false; reason: 'gate_disabled' | 'pre_existing_account' | 'already_complete' | 'unknown_account_age' }
++  | { required: true }
++
++export function evaluateOnboardingRequirement(
++  input: OnboardingRequirementInput,
++): OnboardingRequirement {
++  // No cutover configured — nobody is required. See the polarity note above.
++  if (!input.requiredAfter) return { required: false, reason: 'gate_disabled' }
++
++  // An account whose age we cannot read is treated as pre-existing. This is the
++  // opposite of the trust-tier convention, where unknown age means `new`, and
++  // the asymmetry is intentional: there, unknown costs a user some headroom;
++  // here, unknown would cost them access entirely. When the failure is a
++  // lockout, the safe default is to let them through.
++  if (!input.accountCreatedAt) {
++    return { required: false, reason: 'unknown_account_age' }
++  }
++
++  if (input.accountCreatedAt.getTime() < input.requiredAfter.getTime()) {
++    return { required: false, reason: 'pre_existing_account' }
++  }
++
++  if (input.complete) return { required: false, reason: 'already_complete' }
++
++  return { required: true }
++}
++
++/**
++ * Parse the cutover instant.
++ *
++ * Returns null for anything unusable — unset, empty, or unparseable — so a
++ * typo disables the gate instead of applying it to everyone.
++ */
++export function parseOnboardingCutover(
++  raw: string | null | undefined,
++): Date | null {
++  const trimmed = raw?.trim()
++  if (!trimmed) return null
++  const parsed = new Date(trimmed)
++  return Number.isNaN(parsed.getTime()) ? null : parsed
++}
++
++/** Error code surfaced to non-web clients (CLI, desktop, cloud) when a user
++ *  owes answers. Distinct from every rate-limit code so clients can render a
++ *  "finish setup" prompt rather than a retry countdown. */
++export const ONBOARDING_REQUIRED_ERROR = 'onboarding_required'
++
++export const ONBOARDING_REQUIRED_MESSAGE =
++  'Finish setting up your account at freebuff.com to continue — it takes about 20 seconds.'
+diff --git a/common/src/constants/freebuff-onboarding.ts b/common/src/constants/freebuff-onboarding.ts
+new file mode 100644
+index 000000000..22a4a2af2
+--- /dev/null
++++ b/common/src/constants/freebuff-onboarding.ts
+@@ -0,0 +1,199 @@
++/**
++ * The post-signup onboarding questionnaire.
++ *
++ * Four questions, each a fixed option list plus a free-text "Other". Shared
++ * between the form, the persistence layer and the admin view so a renamed
++ * option cannot silently split one answer into two in the analytics.
++ *
++ * Why the option ids are opaque and permanent
++ * -------------------------------------------
++ * The stored value is the id, never the label. Labels are copy and will be
++ * reworded; ids are data. Changing a label is free, changing an id
++ * retroactively rewrites history — so ids here are append-only. Retire an
++ * option by removing it from the list, never by renaming it.
++ */
++
++export type OnboardingQuestionId =
++  | 'referral_source'
++  | 'role'
++  | 'proficiency'
++  | 'intended_use'
++
++export type OnboardingOption = {
++  /** Stored verbatim. Append-only — see the note above. */
++  id: string
++  label: string
++}
++
++export type OnboardingQuestion = {
++  id: OnboardingQuestionId
++  prompt: string
++  /** Shown under the prompt when the question needs framing. */
++  hint?: string
++  options: OnboardingOption[]
++  /** Whether more than one option may be chosen. */
++  multi: boolean
++}
++
++/** Every question offers this. The accompanying free text is stored separately
++ *  so "other" stays countable while the text stays readable. */
++export const OTHER_OPTION_ID = 'other'
++
++export const FREEBUFF_ONBOARDING_QUESTIONS: readonly OnboardingQuestion[] = [
++  {
++    id: 'referral_source',
++    prompt: 'Where did you hear about Freebuff?',
++    // Attribution is the one answer we cannot reconstruct later: referrer
++    // headers are stripped, and self-report is the only signal for word of
++    // mouth, which is where most of it actually comes from.
++    options: [
++      { id: 'youtube', label: 'YouTube' },
++      { id: 'x_twitter', label: 'X / Twitter' },
++      { id: 'reddit', label: 'Reddit' },
++      { id: 'tiktok', label: 'TikTok' },
++      { id: 'discord', label: 'Discord' },
++      { id: 'github', label: 'GitHub' },
++      { id: 'search', label: 'Google / search' },
++      { id: 'friend', label: 'A friend or colleague' },
++      { id: 'blog_news', label: 'Blog or newsletter' },
++      { id: OTHER_OPTION_ID, label: 'Somewhere else' },
++    ],
++    multi: false,
++  },
++  {
++    id: 'role',
++    prompt: 'What best describes you?',
++    options: [
++      { id: 'professional_dev', label: 'Professional developer' },
++      { id: 'student', label: 'Student' },
++      { id: 'hobbyist', label: 'Hobbyist / side projects' },
++      { id: 'founder', label: 'Founder or indie hacker' },
++      { id: 'designer', label: 'Designer' },
++      { id: 'pm', label: 'Product or project manager' },
++      { id: 'data_ml', label: 'Data / ML' },
++      { id: 'non_technical', label: 'Non-technical' },
++      { id: OTHER_OPTION_ID, label: 'Something else' },
++    ],
++    multi: false,
++  },
++  {
++    id: 'proficiency',
++    prompt: 'How would you describe your coding experience?',
++    options: [
++      { id: 'none', label: "I don't code" },
++      { id: 'beginner', label: 'Beginner — learning the basics' },
++      { id: 'intermediate', label: 'Intermediate — I build things' },
++      { id: 'advanced', label: 'Advanced — years of experience' },
++      { id: 'expert', label: 'Expert — I do this professionally at depth' },
++    ],
++    // No Other: this is an ordered scale, and a free-text answer on an ordinal
++    // question is unusable for the segmentation it exists to support.
++    multi: false,
++  },
++  {
++    id: 'intended_use',
++    prompt: 'What do you want to use Freebuff for?',
++    hint: 'Pick as many as apply.',
++    options: [
++      { id: 'side_projects', label: 'Personal or side projects' },
++      { id: 'work', label: 'Work / production code' },
++      { id: 'learning', label: 'Learning to code' },
++      { id: 'prototyping', label: 'Prototyping and demos' },
++      { id: 'automation', label: 'Scripts and automation' },
++      { id: 'debugging', label: 'Debugging and code review' },
++      { id: 'website', label: 'Building a website or app' },
++      { id: OTHER_OPTION_ID, label: 'Something else' },
++    ],
++    multi: true,
++  },
++] as const
++
++export type OnboardingAnswer = {
++  questionId: OnboardingQuestionId
++  /** Chosen option ids. Single-choice questions carry exactly one. */
++  optionIds: string[]
++  /** Free text, only when `other` is among the chosen ids. */
++  otherText?: string
++}
++
++export type OnboardingSubmission = {
++  answers: OnboardingAnswer[]
++}
++
++export const ONBOARDING_OTHER_TEXT_MAX = 200
++
++export type OnboardingValidationError = {
++  questionId: OnboardingQuestionId
++  message: string
++}
++
++/**
++ * Validate a submission against the question set.
++ *
++ * Deliberately strict about ids and lenient about text: an unknown option id
++ * means the client is out of date or forged, and accepting it would put a value
++ * in the analytics that no question can explain. Free text is merely trimmed
++ * and truncated — it is never interpreted, only displayed.
++ */
++export function validateOnboardingSubmission(
++  submission: OnboardingSubmission,
++  questions: readonly OnboardingQuestion[] = FREEBUFF_ONBOARDING_QUESTIONS,
++): { ok: true; answers: OnboardingAnswer[] } | { ok: false; errors: OnboardingValidationError[] } {
++  const errors: OnboardingValidationError[] = []
++  const cleaned: OnboardingAnswer[] = []
++
++  for (const question of questions) {
++    const answer = submission.answers.find((a) => a.questionId === question.id)
++    const optionIds = answer?.optionIds ?? []
++
++    if (optionIds.length === 0) {
++      errors.push({ questionId: question.id, message: 'Please choose an option.' })
++      continue
++    }
++    if (!question.multi && optionIds.length > 1) {
++      errors.push({ questionId: question.id, message: 'Choose one option.' })
++      continue
++    }
++
++    const valid = new Set(question.options.map((o) => o.id))
++    const unknown = optionIds.filter((id) => !valid.has(id))
++    if (unknown.length > 0) {
++      errors.push({ questionId: question.id, message: 'Unrecognised option.' })
++      continue
++    }
++
++    const wantsOther = optionIds.includes(OTHER_OPTION_ID)
++    const otherText = answer?.otherText?.trim()
++    if (wantsOther && !otherText) {
++      errors.push({
++        questionId: question.id,
++        message: 'Tell us a little more.',
++      })
++      continue
++    }
++
++    cleaned.push({
++      questionId: question.id,
++      optionIds,
++      // Dropped unless `other` was chosen, so stray text cannot ride along on
++      // an answer that has nowhere to show it.
++      ...(wantsOther && otherText
++        ? { otherText: otherText.slice(0, ONBOARDING_OTHER_TEXT_MAX) }
++        : {}),
++    })
++  }
++
++  return errors.length > 0 ? { ok: false, errors } : { ok: true, answers: cleaned }
++}
++
++/** Every question answered — the completion test the blocking gate uses. */
++export function isOnboardingComplete(
++  answers: readonly OnboardingAnswer[] | null | undefined,
++  questions: readonly OnboardingQuestion[] = FREEBUFF_ONBOARDING_QUESTIONS,
++): boolean {
++  if (!answers || answers.length === 0) return false
++  const answered = new Set(
++    answers.filter((a) => a.optionIds.length > 0).map((a) => a.questionId),
++  )
++  return questions.every((q) => answered.has(q.id))
++}
+diff --git a/common/src/constants/freebuff-signup-block.ts b/common/src/constants/freebuff-signup-block.ts
+index 68834b541..8e69f8669 100644
+--- a/common/src/constants/freebuff-signup-block.ts
++++ b/common/src/constants/freebuff-signup-block.ts
+@@ -9,6 +9,8 @@
+ 
+ /** Why a signup was refused. Also the `?error=` code on the login redirect. */
+ export type SignupBlockReason =
++  | 'captcha_missing'
++  | 'captcha_invalid'
+   | 'mailbox_already_registered'
+   | 'privacy_egress'
+   | 'untrusted_client_ip'
+@@ -25,6 +27,10 @@ export type SignupBlockReason =
+  * being broken, and generates a support ticket instead of a retry.
+  */
+ export const SIGNUP_BLOCK_MESSAGES: Record<SignupBlockReason, string> = {
++  captcha_missing:
++    'Please complete the verification check on the sign-in page and try again.',
++  captcha_invalid:
++    'That verification check could not be confirmed. Please try again.',
+   mailbox_already_registered:
+     'An account already exists for this email address. Try signing in instead.',
+   privacy_egress:
+diff --git a/common/src/env-schema.ts b/common/src/env-schema.ts
+index 77f910191..d057f0cec 100644
+--- a/common/src/env-schema.ts
++++ b/common/src/env-schema.ts
+@@ -14,6 +14,11 @@ export const clientEnvSchema = z.object({
+   NEXT_PUBLIC_STRIPE_CUSTOMER_PORTAL: z.url().min(1),
+   NEXT_PUBLIC_GOOGLE_SITE_VERIFICATION_ID: z.string().optional(),
+   NEXT_PUBLIC_WEB_PORT: z.coerce.number().min(1000),
++  /** Cloudflare Turnstile site key for the signup challenge. Public by design —
++   *  the secret half is server-only (`TURNSTILE_SECRET_KEY`). Optional so a dev
++   *  checkout without Turnstile configured still boots; the server gate decides
++   *  whether a missing key means "skip" or "refuse". */
++  NEXT_PUBLIC_TURNSTILE_SITE_KEY: z.string().min(1).optional(),
+   /** Human Behavior session-replay write key for Freebuff Web. Public by
+    *  design — it only authorizes ingestion. Optional so a dev checkout without
+    *  it boots with replay simply switched off. */
+@@ -45,6 +50,7 @@ export const clientProcessEnv: ClientInput = {
+   NEXT_PUBLIC_GOOGLE_SITE_VERIFICATION_ID:
+     process.env.NEXT_PUBLIC_GOOGLE_SITE_VERIFICATION_ID,
+   NEXT_PUBLIC_WEB_PORT: process.env.NEXT_PUBLIC_WEB_PORT,
++  NEXT_PUBLIC_TURNSTILE_SITE_KEY: process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY,
+   NEXT_PUBLIC_HUMANBEHAVIOR_API_KEY:
+     process.env.NEXT_PUBLIC_HUMANBEHAVIOR_API_KEY,
+   NEXT_PUBLIC_HUMANBEHAVIOR_INGESTION_URL:

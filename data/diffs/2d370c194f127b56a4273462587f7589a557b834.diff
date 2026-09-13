@@ -1,0 +1,330 @@
+diff --git a/common/src/util/__tests__/messages.test.ts b/common/src/util/__tests__/messages.test.ts
+index 934ccb85b..30b4f1a68 100644
+--- a/common/src/util/__tests__/messages.test.ts
++++ b/common/src/util/__tests__/messages.test.ts
+@@ -254,6 +254,159 @@ describe('convertCbToModelMessages', () => {
+       expect(result.map((message) => message.role)).toEqual(['user', 'tool'])
+       expect(result[0].content).toHaveLength(2)
+     })
++
++    // A media result rides a user message, and the AI SDK treats a user message
++    // as a boundary where every tool call issued so far must already be
++    // answered. Emitted inline it splits a batch of parallel calls and the
++    // sibling still pending throws MissingToolResultsError client-side, which
++    // wedges every later turn in the thread that replays the history.
++    it('keeps a media result from splitting a batch of parallel tool calls', () => {
++      const screenshot = (toolCallId: string): Message => ({
++        role: 'tool',
++        toolCallId,
++        toolName: 'preview_screenshot',
++        content: [
++          ...mediaToolResult({ data: 'base64data', mediaType: 'image/png' }),
++          ...jsonToolResult({ ok: true }),
++        ],
++      })
++      const readFiles = (toolCallId: string): Message => ({
++        role: 'tool',
++        toolCallId,
++        toolName: 'read_files',
++        content: jsonToolResult({ files: [] }),
++      })
++
++      const result = convertCbToModelMessages({
++        messages: [
++          userMessage('screenshot the preview and read the file'),
++          {
++            ...assistantMessage('working'),
++            content: [
++              {
++                type: 'tool-call',
++                toolCallId: 'call_shot',
++                toolName: 'preview_screenshot',
++                input: {},
++              },
++              {
++                type: 'tool-call',
++                toolCallId: 'call_read',
++                toolName: 'read_files',
++                input: {},
++              },
++            ],
++          },
++          screenshot('call_shot'),
++          readFiles('call_read'),
++        ],
++        includeCacheControl: false,
++      })
++
++      // Both results land before the image's user message, so no call is still
++      // pending at the boundary.
++      expect(result.map((message) => message.role)).toEqual([
++        'user',
++        'assistant',
++        'tool',
++        'tool',
++        'user',
++      ])
++      expect(result.at(-1)!.content).toEqual([
++        expect.objectContaining({ type: 'file' }),
++      ])
++    })
++
++    // Waiting on the answers, not merely on the next non-tool message: anything
++    // interleaved between a batch's results must not let the image out early.
++    it('holds media until a sibling result arrives after an interleaved message', () => {
++      const result = convertCbToModelMessages({
++        messages: [
++          userMessage('go'),
++          {
++            ...assistantMessage('working'),
++            content: [
++              {
++                type: 'tool-call',
++                toolCallId: 'call_shot',
++                toolName: 'preview_screenshot',
++                input: {},
++              },
++              {
++                type: 'tool-call',
++                toolCallId: 'call_read',
++                toolName: 'read_files',
++                input: {},
++              },
++            ],
++          },
++          {
++            role: 'tool',
++            toolCallId: 'call_shot',
++            toolName: 'preview_screenshot',
++            content: [
++              ...mediaToolResult({ data: 'base64data', mediaType: 'image/png' }),
++              ...jsonToolResult({ ok: true }),
++            ],
++          },
++          assistantMessage('still thinking'),
++          {
++            role: 'tool',
++            toolCallId: 'call_read',
++            toolName: 'read_files',
++            content: jsonToolResult({ files: [] }),
++          },
++        ],
++        includeCacheControl: false,
++      })
++
++      expect(result.map((message) => message.role)).toEqual([
++        'user',
++        'assistant',
++        'tool',
++        'assistant',
++        'tool',
++        'user',
++      ])
++    })
++
++    it('flushes buffered media before the next assistant message', () => {
++      const result = convertCbToModelMessages({
++        messages: [
++          userMessage('go'),
++          {
++            ...assistantMessage('working'),
++            content: [
++              {
++                type: 'tool-call',
++                toolCallId: 'call_shot',
++                toolName: 'preview_screenshot',
++                input: {},
++              },
++            ],
++          },
++          {
++            role: 'tool',
++            toolCallId: 'call_shot',
++            toolName: 'preview_screenshot',
++            content: [
++              ...mediaToolResult({ data: 'base64data', mediaType: 'image/png' }),
++              ...jsonToolResult({ ok: true }),
++            ],
++          },
++          assistantMessage('here is what I saw'),
++        ],
++        includeCacheControl: false,
++      })
++
++      expect(result.map((message) => message.role)).toEqual([
++        'user',
++        'assistant',
++        'tool',
++        'user',
++        'assistant',
++      ])
++    })
+   })
+ 
+   describe('basic message conversion', () => {
+diff --git a/common/src/util/messages.ts b/common/src/util/messages.ts
+index 7c3c329b5..cd673b612 100644
+--- a/common/src/util/messages.ts
++++ b/common/src/util/messages.ts
+@@ -233,9 +233,60 @@ function convertToolMessages(
+   messages: Message[],
+ ): ModelMessageWithAuxiliaryData[] {
+   const withoutToolMessages: ModelMessageWithAuxiliaryData[] = []
++  // Media parts ride *user* messages (see convertToolResultMessage), and the AI
++  // SDK throws at a user/system boundary when any tool call issued so far is
++  // still unanswered. Emitting media inline therefore splits a batch of
++  // parallel calls -- the sibling whose result is not reached yet is still
++  // pending, so validation fails client-side before the request is ever sent,
++  // permanently wedging the thread that replays that history. Buffer media
++  // until every call is answered, then flush: waiting on the answers not on
++  // the next non-tool message keeps the image as close to its own result as is
++  // safe, even when something is interleaved between the results.
++  // (convertToolResultMessage already does this within one tool message.)
++  const unanswered = new Set<string>()
++  let pendingMedia: ModelMessageWithAuxiliaryData[] = []
++  const flushMedia = () => {
++    if (unanswered.size > 0 || pendingMedia.length === 0) return
++    withoutToolMessages.push(...pendingMedia)
++    pendingMedia = []
++  }
++
+   for (const message of messages) {
+-    withoutToolMessages.push(...convertToolMessage(message))
++    const converted = convertToolMessage(message)
++    if (message.role !== 'tool') {
++      flushMedia()
++      withoutToolMessages.push(...converted)
++      for (const part of converted) {
++        if (part.role !== 'assistant') continue
++        for (const content of part.content) {
++          // Mirrors the SDK: a provider-executed call needs no local result, so
++          // tracking one would defer every later image forever.
++          if (content.type !== 'tool-call') continue
++          if (content.providerExecuted !== true) {
++            unanswered.add(content.toolCallId)
++          }
++        }
++      }
++      continue
++    }
++    for (const part of converted) {
++      if (part.role !== 'tool') {
++        pendingMedia.push(part)
++        continue
++      }
++      withoutToolMessages.push(part)
++      for (const content of part.content) {
++        if (content.type === 'tool-result') {
++          unanswered.delete(content.toolCallId)
++        }
++      }
++    }
++    flushMedia()
+   }
++
++  // Anything still buffered had no clean boundary; dropUnansweredToolCalls has
++  // already removed calls that never get answered, so this is just a backstop.
++  withoutToolMessages.push(...pendingMedia)
+   return withoutToolMessages
+ }
+ 
+diff --git a/sdk/src/impl/__tests__/prompt-repair.test.ts b/sdk/src/impl/__tests__/prompt-repair.test.ts
+index 6010a1930..9e35b4ab9 100644
+--- a/sdk/src/impl/__tests__/prompt-repair.test.ts
++++ b/sdk/src/impl/__tests__/prompt-repair.test.ts
+@@ -102,4 +102,95 @@ describe('stream prompt repair', () => {
+       ),
+     ).toBe(false)
+   })
++
++  // A screenshot's image rides a user message, and the AI SDK rejects a user
++  // message while a sibling call from the same batch is still unanswered. That
++  // throws in convertToLanguageModelPrompt before any request goes out, so it
++  // cannot be repaired server-side -- assert the call actually reaches the wire.
++  test('sends a batch whose first parallel call returned an image', async () => {
++    let requestBody: Record<string, unknown> | undefined
++    globalThis.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
++      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>
++      return Promise.resolve(
++        new Response(
++          `data: ${JSON.stringify({
++            id: 'chatcmpl-media',
++            object: 'chat.completion.chunk',
++            created: 1,
++            model: 'test-model',
++            choices: [
++              { index: 0, delta: { content: 'saw it' }, finish_reason: 'stop' },
++            ],
++            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
++          })}\n\ndata: [DONE]\n\n`,
++          { headers: { 'Content-Type': 'text/event-stream' } },
++        ),
++      )
++    }) as unknown as typeof fetch
++
++    const stream = promptAiSdkStream({
++      apiKey: 'test-key',
++      runId: 'run-media',
++      messages: [
++        { role: 'user', content: [{ type: 'text', text: 'shoot and read' }] },
++        {
++          role: 'assistant',
++          content: [
++            {
++              type: 'tool-call',
++              toolCallId: 'shot-1',
++              toolName: 'preview_screenshot',
++              input: {},
++            },
++            {
++              type: 'tool-call',
++              toolCallId: 'read-1',
++              toolName: 'read_files',
++              input: { paths: ['README.md'] },
++            },
++          ],
++        },
++        {
++          role: 'tool',
++          toolCallId: 'shot-1',
++          toolName: 'preview_screenshot',
++          content: [
++            { type: 'media', data: 'QUJD', mediaType: 'image/png' },
++            { type: 'json', value: { ok: true } },
++          ],
++        },
++        {
++          role: 'tool',
++          toolCallId: 'read-1',
++          toolName: 'read_files',
++          content: [{ type: 'json', value: { files: [] } }],
++        },
++      ],
++      clientSessionId: 'session-media',
++      fingerprintId: 'fingerprint-media',
++      model: 'openai/gpt-5.6-luna',
++      userId: 'user-1',
++      userInputId: 'input-media',
++      sendAction: async () => undefined,
++      logger,
++      trackEvent: async () => undefined,
++      signal: new AbortController().signal,
++    } as unknown as Parameters<typeof promptAiSdkStream>[0])
++
++    const text: string[] = []
++    for await (const chunk of stream) {
++      if (chunk.type === 'text') text.push(chunk.text)
++    }
++
++    // Reached the provider at all: without the reordering this rejects locally.
++    expect(text.join('')).toBe('saw it')
++    const wireMessages = requestBody?.messages as
++      | Array<Record<string, unknown>>
++      | undefined
++    // Both calls are still answered, and the image survives the move.
++    const serialized = JSON.stringify(wireMessages)
++    expect(serialized).toContain('shot-1')
++    expect(serialized).toContain('read-1')
++    expect(serialized).toContain('QUJD')
++  })
+ })

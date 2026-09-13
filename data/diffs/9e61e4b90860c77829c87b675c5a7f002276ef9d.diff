@@ -1,0 +1,149 @@
+diff --git a/common/src/mcp/client.ts b/common/src/mcp/client.ts
+index b49ef792b..5a5608d57 100644
+--- a/common/src/mcp/client.ts
++++ b/common/src/mcp/client.ts
+@@ -3,6 +3,8 @@ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
+ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+ 
++import { getErrorObject } from '../util/error'
++
+ import type { MCPConfig } from '../types/mcp'
+ import type { ToolResultOutput } from '../types/messages/content-part'
+ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+@@ -12,6 +14,10 @@ import type {
+   TextResourceContents,
+ } from '@modelcontextprotocol/sdk/types.js'
+ 
++// Cap on how much of a failed stdio server's stderr we retain for the error
++// message — enough to show the real failure without unbounded growth.
++const STDERR_BUFFER_CAP = 8192
++
+ const runningClients: Record<string, Client> = {}
+ const listToolsCache: Record<
+   string,
+@@ -81,13 +87,26 @@ export async function getMCPClient(config: MCPConfig): Promise<string> {
+   }
+ 
+   let transport: Transport
++  // Buffer the child process's stderr so that a server which crashes during
++  // startup produces an actionable error instead of the opaque MCP SDK message
++  // "MCP error -32000: Connection closed".
++  let stderrBuffer = ''
+   if (config.type === 'stdio') {
+-    transport = new StdioClientTransport({
++    const stdioTransport = new StdioClientTransport({
+       command: config.command,
+       args: config.args,
+       env: substituteEnvInRecord(config.env),
+-      stderr: 'ignore',
++      stderr: 'pipe',
++    })
++    // When stderr is 'pipe' the SDK exposes a PassThrough immediately (before
++    // the process is spawned), so attaching here captures even early output
++    // from a child that dies during the connection handshake.
++    stdioTransport.stderr?.on('data', (chunk: Buffer) => {
++      if (stderrBuffer.length < STDERR_BUFFER_CAP) {
++        stderrBuffer += chunk.toString('utf8')
++      }
+     })
++    transport = stdioTransport
+   } else {
+     const url = new URL(config.url)
+     for (const [key, value] of Object.entries(config.params)) {
+@@ -117,7 +136,24 @@ export async function getMCPClient(config: MCPConfig): Promise<string> {
+     version: '1.0.0',
+   })
+ 
+-  await client.connect(transport)
++  try {
++    await client.connect(transport)
++  } catch (error) {
++    const baseMessage = getErrorObject(error).message
++    if (config.type === 'stdio') {
++      const commandStr = [config.command, ...(config.args ?? [])].join(' ')
++      const detail = stderrBuffer.trim()
++      throw new Error(
++        `${baseMessage}. Failed to start MCP server via \`${commandStr}\`. ` +
++          `Ensure the command is installed and runnable (e.g. an up-to-date ` +
++          `node/npm/npx, or python/uvx) and that any required env vars are set.` +
++          (detail ? `\nServer stderr:\n${detail}` : ''),
++      )
++    }
++    throw new Error(
++      `${baseMessage}. Failed to connect to MCP server at ${config.url}.`,
++    )
++  }
+   runningClients[key] = client
+ 
+   return key
+diff --git a/packages/agent-runtime/src/mcp.ts b/packages/agent-runtime/src/mcp.ts
+index 56a2ba56a..a7390f219 100644
+--- a/packages/agent-runtime/src/mcp.ts
++++ b/packages/agent-runtime/src/mcp.ts
+@@ -1,9 +1,11 @@
++import { getErrorObject } from '@codebuff/common/util/error'
+ import { convertJsonSchemaToZod } from 'zod-from-json-schema'
+ 
+ import { MCP_TOOL_SEPARATOR } from './mcp-constants'
+ 
+ import type { AgentTemplate } from './templates/types'
+ import type { RequestMcpToolDataFn } from '@codebuff/common/types/contracts/client'
++import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { OptionalFields } from '@codebuff/common/types/function-params'
+ import type {
+   CustomToolDefinitions,
+@@ -17,12 +19,14 @@ export async function getMCPToolData(
+       mcpServers: AgentTemplate['mcpServers']
+       writeTo: ProjectFileContext['customToolDefinitions']
+       requestMcpToolData: RequestMcpToolDataFn
++      logger?: Logger
+     },
+     'writeTo'
+   >,
+ ): Promise<CustomToolDefinitions> {
+   const withDefaults = { writeTo: {}, ...params }
+-  const { toolNames, mcpServers, writeTo, requestMcpToolData } = withDefaults
++  const { toolNames, mcpServers, writeTo, requestMcpToolData, logger } =
++    withDefaults
+ 
+   // User-facing toolNames use '/' as separator (e.g., 'supabase/list_tables')
+   // but internally we use MCP_TOOL_SEPARATOR ('__') for LLM API compatibility
+@@ -44,17 +48,28 @@ export async function getMCPToolData(
+   for (const [mcpName, mcpConfig] of Object.entries(mcpServers)) {
+     promises.push(
+       (async () => {
+-        const mcpData = await requestMcpToolData({
+-          mcpConfig,
+-          toolNames: requestedToolsByMcp[mcpName] ?? null,
+-        })
++        try {
++          const mcpData = await requestMcpToolData({
++            mcpConfig,
++            toolNames: requestedToolsByMcp[mcpName] ?? null,
++          })
+ 
+-        for (const { name, description, inputSchema } of mcpData) {
+-          writeTo[mcpName + MCP_TOOL_SEPARATOR + name] = {
+-            inputSchema: convertJsonSchemaToZod(inputSchema as any) as any,
+-            endsAgentStep: true,
+-            description,
++          for (const { name, description, inputSchema } of mcpData) {
++            writeTo[mcpName + MCP_TOOL_SEPARATOR + name] = {
++              inputSchema: convertJsonSchemaToZod(inputSchema as any) as any,
++              endsAgentStep: true,
++              description,
++            }
+           }
++        } catch (error) {
++          // A failed MCP server (e.g. a stdio server that can't be spawned)
++          // should disable just its own tools, not abort the whole turn. The
++          // error from the client carries the actionable detail (command +
++          // captured stderr).
++          logger?.warn(
++            { error: getErrorObject(error), mcpServer: mcpName },
++            `Failed to load tools from MCP server "${mcpName}"; its tools will be unavailable for this step.`,
++          )
+         }
+       })(),
+     )

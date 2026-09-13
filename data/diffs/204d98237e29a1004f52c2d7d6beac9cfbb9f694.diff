@@ -1,0 +1,248 @@
+diff --git a/packages/llm-providers/src/openai-compatible/chat/convert-to-openai-compatible-chat-messages.test.ts b/packages/llm-providers/src/openai-compatible/chat/convert-to-openai-compatible-chat-messages.test.ts
+index 5b8c7b5b3..195d63b81 100644
+--- a/packages/llm-providers/src/openai-compatible/chat/convert-to-openai-compatible-chat-messages.test.ts
++++ b/packages/llm-providers/src/openai-compatible/chat/convert-to-openai-compatible-chat-messages.test.ts
+@@ -100,6 +100,100 @@ describe('user messages', () => {
+       },
+     ])
+   })
++
++  // Callers on `ai` v7 reach this v2 model through the SDK's compatibility
++  // proxy, which forwards a LanguageModelV4 prompt untouched — so `data`
++  // arrives TAGGED, not raw. Reading it as raw stringified the wrapper into
++  // `data:image/png;base64,[object Object]` and 400'd every image turn.
++  describe('LanguageModelV4 tagged file data', () => {
++    it('reads base64 out of a tagged data part', async () => {
++      const result = convertToOpenAICompatibleChatMessages([
++        {
++          role: 'user',
++          content: [
++            {
++              type: 'file',
++              data: { type: 'data', data: 'AAECAw==' },
++              mediaType: 'image/png',
++            } as any,
++          ],
++        },
++      ])
++
++      expect(result[0].content).toEqual([
++        {
++          type: 'image_url',
++          image_url: { url: 'data:image/png;base64,AAECAw==' },
++        },
++      ])
++    })
++
++    it('reads bytes out of a tagged data part', async () => {
++      const result = convertToOpenAICompatibleChatMessages([
++        {
++          role: 'user',
++          content: [
++            {
++              type: 'file',
++              data: { type: 'data', data: new Uint8Array([0, 1, 2, 3]) },
++              mediaType: 'image/png',
++            } as any,
++          ],
++        },
++      ])
++
++      expect(result[0].content).toEqual([
++        {
++          type: 'image_url',
++          image_url: { url: 'data:image/png;base64,AAECAw==' },
++        },
++      ])
++    })
++
++    it('passes a tagged url part through', async () => {
++      const result = convertToOpenAICompatibleChatMessages([
++        {
++          role: 'user',
++          content: [
++            {
++              type: 'file',
++              data: { type: 'url', url: new URL('https://example.com/a.png') },
++              mediaType: 'image/png',
++            } as any,
++          ],
++        },
++      ])
++
++      expect(result[0].content).toEqual([
++        {
++          type: 'image_url',
++          image_url: { url: 'https://example.com/a.png' },
++        },
++      ])
++    })
++  })
++
++  it('does not re-prefix data that is already a data URL', async () => {
++    const result = convertToOpenAICompatibleChatMessages([
++      {
++        role: 'user',
++        content: [
++          {
++            type: 'file',
++            data: 'data:image/png;base64,AAECAw==',
++            mediaType: 'image/png',
++          },
++        ],
++      },
++    ])
++
++    expect(result[0].content).toEqual([
++      {
++        type: 'image_url',
++        image_url: { url: 'data:image/png;base64,AAECAw==' },
++      },
++    ])
++  })
+ })
+ 
+ describe('tool calls', () => {
+diff --git a/packages/llm-providers/src/openai-compatible/chat/convert-to-openai-compatible-chat-messages.ts b/packages/llm-providers/src/openai-compatible/chat/convert-to-openai-compatible-chat-messages.ts
+index b0e615c5c..ead5daab1 100644
+--- a/packages/llm-providers/src/openai-compatible/chat/convert-to-openai-compatible-chat-messages.ts
++++ b/packages/llm-providers/src/openai-compatible/chat/convert-to-openai-compatible-chat-messages.ts
+@@ -20,11 +20,8 @@ function imageUrlFromData(data: unknown, mediaType: string): string {
+   if (data && typeof data === 'object' && 'type' in data) {
+     if (data.type === 'data' && 'data' in data) {
+       data = data.data
+-    } else if (
+-      data.type === 'url' &&
+-      'url' in data &&
+-      data.url instanceof URL
+-    ) {
++    } else if (data.type === 'url' && 'url' in data) {
++      // The tagged `url` may be a plain string, not only a URL instance.
+       data = data.url
+     }
+   }
+@@ -36,6 +33,19 @@ function imageUrlFromData(data: unknown, mediaType: string): string {
+     })
+   }
+ 
++  // Never re-prefix something that is already addressable. `convertToBase64`
++  // passes a string through unchanged (it assumes the string IS base64), so
++  // prefixing a value that already carries its own `data:` scheme yields
++  // `data:image/png;base64,data:image/png;base64,…` — which the provider
++  // rejects with the same "invalid base64-encoded value" 400 that the tagged
++  // -shape handling above exists to prevent, just reached by another route.
++  if (typeof data === 'string') {
++    const trimmed = data.trim()
++    if (trimmed.startsWith('data:') || /^https?:\/\//i.test(trimmed)) {
++      return trimmed
++    }
++  }
++
+   return `data:${mediaType};base64,${convertToBase64(data)}`
+ }
+ 
+diff --git a/sdk/src/__tests__/image-request-body.test.ts b/sdk/src/__tests__/image-request-body.test.ts
+new file mode 100644
+index 000000000..8d40eba7d
+--- /dev/null
++++ b/sdk/src/__tests__/image-request-body.test.ts
+@@ -0,0 +1,99 @@
++/**
++ * End-to-end guard on the shape of an image as it leaves for the provider.
++ *
++ * The converter in @codebuff/llm-providers implements LanguageModelV2, where a
++ * file part's `data` is the raw value. This package runs `ai` v7, which hands
++ * the model a LanguageModelV4 prompt through a compatibility proxy that
++ * forwards the prompt untouched — and there `data` is a TAGGED wrapper. The
++ * package's own unit tests fed the converter the raw v2 shape and passed while
++ * production sent `data:image/png;base64,[object Object]`, which OpenAI
++ * rejected ("invalid base64-encoded value") on every GPT-5.6 Luna turn
++ * carrying an image.
++ *
++ * So this test asserts on the real wire body produced by the real streamText →
++ * model path, not on the converter in isolation: it is the seam that broke.
++ */
++import { describe, it, expect } from 'bun:test'
++import { OpenAICompatibleChatLanguageModel } from '@codebuff/llm-providers/openai-compatible'
++import { streamText } from 'ai'
++
++const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
++const VALID_IMAGE_DATA_URL = /^data:image\/[\w.+-]+;base64,[A-Za-z0-9+/]+={0,2}$/
++
++async function imageUrlSentToProvider(
++  imagePart: unknown,
++): Promise<string | undefined> {
++  let sentBody: any
++  const model = new OpenAICompatibleChatLanguageModel('openai/gpt-5.6-luna', {
++    provider: 'test',
++    url: () => 'https://example.com/v1/chat/completions',
++    headers: () => ({}),
++    fetch: (async (_input: unknown, init: any) => {
++      sentBody = JSON.parse(init.body)
++      return new Response(
++        'data: {"id":"1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n' +
++          'data: [DONE]\n\n',
++        { status: 200, headers: { 'content-type': 'text/event-stream' } },
++      )
++    }) as any,
++  })
++
++  const result = streamText({
++    model: model as any,
++    messages: [
++      {
++        role: 'user',
++        content: [{ type: 'text', text: 'what is this' }, imagePart as any],
++      },
++    ],
++  })
++  // Drain so the request is actually issued.
++  for await (const _chunk of result.textStream) {
++  }
++
++  return sentBody?.messages?.[0]?.content?.[1]?.image_url?.url
++}
++
++describe('images on the wire', () => {
++  it('sends a valid base64 data URL for a base64 image part (CLI/Desktop shape)', async () => {
++    const url = await imageUrlSentToProvider({
++      type: 'image',
++      image: PNG_BYTES.toString('base64'),
++      mediaType: 'image/png',
++    })
++
++    expect(url).toMatch(VALID_IMAGE_DATA_URL)
++    expect(url).toBe(`data:image/png;base64,${PNG_BYTES.toString('base64')}`)
++  })
++
++  it('sends a valid base64 data URL for a data-URL image part', async () => {
++    const url = await imageUrlSentToProvider({
++      type: 'image',
++      image: `data:image/png;base64,${PNG_BYTES.toString('base64')}`,
++      mediaType: 'image/png',
++    })
++
++    expect(url).toMatch(VALID_IMAGE_DATA_URL)
++    expect(url).toBe(`data:image/png;base64,${PNG_BYTES.toString('base64')}`)
++  })
++
++  it('sends a valid base64 data URL for a byte-array image part', async () => {
++    const url = await imageUrlSentToProvider({
++      type: 'image',
++      image: new Uint8Array(PNG_BYTES),
++      mediaType: 'image/png',
++    })
++
++    expect(url).toMatch(VALID_IMAGE_DATA_URL)
++  })
++
++  it('sends a valid base64 data URL for a file part', async () => {
++    const url = await imageUrlSentToProvider({
++      type: 'file',
++      data: PNG_BYTES.toString('base64'),
++      mediaType: 'image/png',
++    })
++
++    expect(url).toMatch(VALID_IMAGE_DATA_URL)
++  })
++})

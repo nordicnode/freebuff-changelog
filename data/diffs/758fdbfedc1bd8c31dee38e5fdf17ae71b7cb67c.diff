@@ -1,0 +1,389 @@
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index ece3693cb..1c0dddaca 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -20,7 +20,9 @@ import {
+   clearLiveChatStateProvider,
+   loadMostRecentChatState,
+   saveChatState,
++  scheduleCheckpointSave,
+   setLiveChatStateProvider,
++  settleCheckpointSave,
+ } from '../utils/run-state-storage'
+ import {
+   autoCollapsePreviousMessages,
+@@ -520,7 +522,12 @@ export const useSendMessage = ({
+               : undefined,
+           onStateSnapshot: (snapshot) => {
+             latestRunStateSnapshot = snapshot
+-            saveChatState(snapshot, useChatStore.getState().messages)
++            // Persist asynchronously and coalescing: the periodic snapshot
++            // fires ~every 5s at step boundaries, and a synchronous save of the
++            // (growing) transcript on the render/input thread is what stalls
++            // long sessions. The authoritative synchronous saves below still
++            // capture the final state.
++            scheduleCheckpointSave(snapshot, useChatStore.getState().messages)
+           },
+         })
+ 
+@@ -552,6 +559,9 @@ export const useSendMessage = ({
+         setRunState(runState)
+         setIsRetrying(false)
+ 
++        // Drop any queued/in-flight async checkpoint first so a stale write
++        // can't land after this authoritative final save.
++        await settleCheckpointSave()
+         // Read committed state rather than saving inside a setMessages
+         // updater: the store uses immer, so the updater sees a draft proxy
+         // and JSON.stringify of the (unbounded) transcript through proxy
+@@ -593,7 +603,9 @@ export const useSendMessage = ({
+             hasReceivedContent: hasReceivedContentRef.current,
+           })
+           // Persist the last checkpoint plus the error banner so a restart
+-          // after a failed run still shows this turn.
++          // after a failed run still shows this turn. Settle async checkpoints
++          // first so a stale write can't clobber this one.
++          await settleCheckpointSave()
+           saveChatState(
+             latestRunStateSnapshot,
+             useChatStore.getState().messages,
+diff --git a/cli/src/utils/__tests__/run-state-storage.test.ts b/cli/src/utils/__tests__/run-state-storage.test.ts
+index 097cbe7dd..8b8098bb4 100644
+--- a/cli/src/utils/__tests__/run-state-storage.test.ts
++++ b/cli/src/utils/__tests__/run-state-storage.test.ts
+@@ -21,6 +21,8 @@ import {
+   setLiveChatStateProvider,
+   clearLiveChatStateProvider,
+   flushLiveChatState,
++  scheduleCheckpointSave,
++  settleCheckpointSave,
+ } from '../run-state-storage'
+ import type { ChatMessage, ContentBlock } from '../../types/chat'
+ import type { RunState } from '@codebuff/sdk'
+@@ -538,3 +540,79 @@ describe('atomic save and resilient load', () => {
+     expect(loadMostRecentChatState()).toBeNull()
+   })
+ })
++
++describe('scheduleCheckpointSave (async, coalescing)', () => {
++  const chatDir = path.join(os.tmpdir(), 'codebuff-test-checkpoint-chatdir')
++
++  const runState = (marker: string) =>
++    ({ output: { type: 'error', message: marker } }) as unknown as RunState
++
++  const messages = (marker: string): ChatMessage[] => [
++    {
++      id: 'msg-1',
++      variant: 'user',
++      content: marker,
++      timestamp: new Date().toISOString(),
++    },
++  ]
++
++  const readSavedMessages = () =>
++    JSON.parse(
++      fs.readFileSync(path.join(chatDir, 'chat-messages.json'), 'utf8'),
++    ) as ChatMessage[]
++
++  beforeEach(() => {
++    fs.rmSync(chatDir, { recursive: true, force: true })
++    setChatDirOverrideForTesting(chatDir)
++  })
++
++  afterEach(async () => {
++    await settleCheckpointSave()
++    setChatDirOverrideForTesting(undefined)
++    fs.rmSync(chatDir, { recursive: true, force: true })
++  })
++
++  test('persists the scheduled state after settling', async () => {
++    scheduleCheckpointSave(runState('a'), messages('first'))
++
++    await settleCheckpointSave()
++
++    expect(readSavedMessages()[0].content).toBe('first')
++  })
++
++  test('does not write synchronously (deferred off the calling tick)', () => {
++    scheduleCheckpointSave(runState('a'), messages('deferred'))
++
++    // Nothing on disk yet: the write is scheduled for a later tick.
++    expect(fs.existsSync(path.join(chatDir, 'chat-messages.json'))).toBe(false)
++  })
++
++  test('coalesces a burst to the latest state', async () => {
++    scheduleCheckpointSave(runState('a'), messages('one'))
++    scheduleCheckpointSave(runState('b'), messages('two'))
++    scheduleCheckpointSave(runState('c'), messages('three'))
++
++    await settleCheckpointSave()
++
++    // Whatever intermediate states were dropped, the newest wins.
++    expect(readSavedMessages()[0].content).toBe('three')
++  })
++
++  test('an authoritative save after settling is the last write (no clobber)', async () => {
++    scheduleCheckpointSave(runState('a'), messages('checkpoint'))
++    // settle waits for the queued async write to flush, so the synchronous
++    // final save below is guaranteed to land last.
++    await settleCheckpointSave()
++
++    saveChatState(runState('final'), messages('authoritative'))
++    // Give any lingering async write a chance to (incorrectly) land on top.
++    await new Promise((r) => setImmediate(r))
++    await settleCheckpointSave()
++
++    expect(readSavedMessages()[0].content).toBe('authoritative')
++  })
++
++  test('settleCheckpointSave is safe with nothing scheduled', async () => {
++    await expect(settleCheckpointSave()).resolves.toBeUndefined()
++  })
++})
+diff --git a/cli/src/utils/__tests__/write-file-atomic.test.ts b/cli/src/utils/__tests__/write-file-atomic.test.ts
+index 8fb7b3d29..0da7b44e9 100644
+--- a/cli/src/utils/__tests__/write-file-atomic.test.ts
++++ b/cli/src/utils/__tests__/write-file-atomic.test.ts
+@@ -3,7 +3,7 @@ import * as fs from 'fs'
+ import * as os from 'os'
+ import * as path from 'path'
+ 
+-import { writeFileAtomic } from '../write-file-atomic'
++import { writeFileAtomic, writeFileAtomicAsync } from '../write-file-atomic'
+ 
+ let tempDir = ''
+ 
+@@ -50,4 +50,78 @@ describe('writeFileAtomic', () => {
+ 
+     expect(fs.readdirSync(tempDir)).toEqual(['target-dir'])
+   })
++
++  test('uses a unique temp name per write (no collision between calls)', () => {
++    // Two writes to different targets must not share a temp path, otherwise
++    // concurrent sync + async writes would tear each other. The temp name
++    // includes a random component, so back-to-back writes never collide.
++    const a = path.join(tempDir, 'a.json')
++    const b = path.join(tempDir, 'b.json')
++
++    writeFileAtomic(a, 'a')
++    writeFileAtomic(b, 'b')
++
++    expect(fs.readdirSync(tempDir).sort()).toEqual(['a.json', 'b.json'])
++  })
++})
++
++describe('writeFileAtomicAsync', () => {
++  beforeEach(() => {
++    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codebuff-atomic-async-'))
++  })
++
++  afterEach(() => {
++    fs.rmSync(tempDir, { recursive: true, force: true })
++  })
++
++  test('writes a new file', async () => {
++    const target = path.join(tempDir, 'out.json')
++
++    await writeFileAtomicAsync(target, '{"a":1}')
++
++    expect(fs.readFileSync(target, 'utf8')).toBe('{"a":1}')
++  })
++
++  test('replaces an existing file', async () => {
++    const target = path.join(tempDir, 'out.json')
++    fs.writeFileSync(target, 'old content')
++
++    await writeFileAtomicAsync(target, 'new content')
++
++    expect(fs.readFileSync(target, 'utf8')).toBe('new content')
++  })
++
++  test('leaves no temp file behind on success', async () => {
++    const target = path.join(tempDir, 'out.json')
++
++    await writeFileAtomicAsync(target, 'data')
++
++    expect(fs.readdirSync(tempDir)).toEqual(['out.json'])
++  })
++
++  test('cleans up the temp file and rejects on failure', async () => {
++    const target = path.join(tempDir, 'target-dir')
++    fs.mkdirSync(target)
++
++    await expect(writeFileAtomicAsync(target, 'data')).rejects.toThrow()
++
++    expect(fs.readdirSync(tempDir)).toEqual(['target-dir'])
++  })
++
++  test('concurrent writes to the same file do not tear (last write wins)', async () => {
++    const target = path.join(tempDir, 'out.json')
++
++    await Promise.all([
++      writeFileAtomicAsync(target, 'first'),
++      writeFileAtomicAsync(target, 'second'),
++      writeFileAtomicAsync(target, 'third'),
++    ])
++
++    // Whichever rename lands last wins, but the file is always one intact
++    // value — never a torn mix — and no temp files remain.
++    expect(['first', 'second', 'third']).toContain(
++      fs.readFileSync(target, 'utf8'),
++    )
++    expect(fs.readdirSync(tempDir)).toEqual(['out.json'])
++  })
+ })
+diff --git a/cli/src/utils/run-state-storage.ts b/cli/src/utils/run-state-storage.ts
+index bd1a5afb0..1cfaa04e0 100644
+--- a/cli/src/utils/run-state-storage.ts
++++ b/cli/src/utils/run-state-storage.ts
+@@ -13,7 +13,7 @@ import {
+   writeChatMeta,
+ } from './chat-meta'
+ import { logger } from './logger'
+-import { writeFileAtomic } from './write-file-atomic'
++import { writeFileAtomic, writeFileAtomicAsync } from './write-file-atomic'
+ 
+ import type { ChatMessage, ContentBlock } from '../types/chat'
+ import type { RunState } from '@codebuff/sdk'
+@@ -168,6 +168,87 @@ export function saveChatState(
+   }
+ }
+ 
++/**
++ * Async counterpart to saveChatState. Serializes and writes off the caller's
++ * tick so a multi-MB transcript doesn't block the CLI's render/input thread.
++ */
++async function saveChatStateAsync(
++  runState: RunState,
++  messages: ChatMessage[],
++): Promise<void> {
++  try {
++    const runStatePath = getRunStatePath()
++    const messagesPath = getChatMessagesPath()
++    const chatDir = resolveCurrentChatDir()
++
++    await writeFileAtomicAsync(runStatePath, JSON.stringify(runState))
++    await writeFileAtomicAsync(messagesPath, JSON.stringify(messages))
++    // Sidecar summary so /history can list this chat without parsing the
++    // (unbounded) chat-messages.json. Written after the messages file: it
++    // records that file's size/mtime to detect staleness. The meta write is
++    // tiny, so keeping it synchronous here is fine.
++    writeChatMeta(chatDir, messages)
++  } catch (error) {
++    logger.error(
++      {
++        error: error instanceof Error ? error.message : String(error),
++      },
++      'Failed to save chat state (async)',
++    )
++  }
++}
++
++// In-flight checkpoint writer. The SDK emits an onStateSnapshot roughly every
++// 5s at step boundaries while a run streams; the CLI used to persist each one
++// synchronously (cloneDeep in the SDK + two multi-MB JSON.stringify + two
++// blocking disk writes on the CLI), all on the render/input thread. In long
++// sessions that periodic stall is what users experience as "freezes". Instead,
++// schedule the write asynchronously and collapse bursts to a single in-flight
++// write, always persisting the latest state.
++let pendingCheckpoint: LiveChatState | null = null
++let checkpointDrain: Promise<void> | null = null
++
++async function drainCheckpoints(): Promise<void> {
++  while (pendingCheckpoint) {
++    const next = pendingCheckpoint
++    pendingCheckpoint = null
++    // Yield first so serialization never runs on the same tick that scheduled
++    // us (that tick is often mid-render or handling a keystroke).
++    await new Promise<void>((resolve) => setImmediate(resolve))
++    await saveChatStateAsync(next.runState, next.messages)
++  }
++}
++
++/**
++ * Schedule an asynchronous, coalescing checkpoint save. Safe to call at a high
++ * rate: only one write runs at a time and intermediate states are dropped in
++ * favor of the latest. Use this for periodic in-flight checkpoints; use the
++ * synchronous saveChatState for one-shot authoritative saves (turn completion,
++ * exit flush).
++ */
++export function scheduleCheckpointSave(
++  runState: RunState,
++  messages: ChatMessage[],
++): void {
++  pendingCheckpoint = { runState, messages }
++  if (!checkpointDrain) {
++    checkpointDrain = drainCheckpoints().finally(() => {
++      checkpointDrain = null
++    })
++  }
++}
++
++/**
++ * Wait until all queued/in-flight checkpoint writes have flushed. Call this
++ * before an authoritative synchronous save (turn completion / error) so that a
++ * still-running async write can't land after — and clobber — the final state.
++ * Relies on the run having stopped scheduling checkpoints (the SDK's snapshot
++ * timer stops once the run settles), so the queue reaches idle.
++ */
++export async function settleCheckpointSave(): Promise<void> {
++  await checkpointDrain
++}
++
+ /**
+  * Load both RunState and ChatMessage[] from a specific chat directory or the most recent one.
+  * When chatId is provided, it is used to locate the chat directory; otherwise the most
+diff --git a/cli/src/utils/write-file-atomic.ts b/cli/src/utils/write-file-atomic.ts
+index 41ad7baa5..85b922e24 100644
+--- a/cli/src/utils/write-file-atomic.ts
++++ b/cli/src/utils/write-file-atomic.ts
+@@ -1,4 +1,13 @@
+ import * as fs from 'fs'
++import { randomUUID } from 'node:crypto'
++
++// Unique per-write temp suffix. A plain `${pid}.tmp` collides when a sync
++// exit-flush and an async checkpoint write target the same file concurrently
++// (both share the pid): they'd write and rename the SAME temp path, tearing
++// each other's output. A random component makes every write self-contained.
++function tempPathFor(filePath: string): string {
++  return `${filePath}.${process.pid}.${randomUUID()}.tmp`
++}
+ 
+ /**
+  * Write a file atomically: write to a temp file in the same directory, then
+@@ -7,7 +16,7 @@ import * as fs from 'fs'
+  * leaves truncated JSON that hides the chat from /history.
+  */
+ export function writeFileAtomic(filePath: string, data: string): void {
+-  const tmpPath = `${filePath}.${process.pid}.tmp`
++  const tmpPath = tempPathFor(filePath)
+   try {
+     fs.writeFileSync(tmpPath, data)
+     fs.renameSync(tmpPath, filePath)
+@@ -20,3 +29,26 @@ export function writeFileAtomic(filePath: string, data: string): void {
+     throw error
+   }
+ }
++
++/**
++ * Async counterpart to writeFileAtomic. Used by the in-flight checkpoint writer
++ * so serializing + flushing a multi-MB transcript doesn't block the CLI's
++ * render/input thread. Same tmp-then-rename atomicity guarantee.
++ */
++export async function writeFileAtomicAsync(
++  filePath: string,
++  data: string,
++): Promise<void> {
++  const tmpPath = tempPathFor(filePath)
++  try {
++    await fs.promises.writeFile(tmpPath, data)
++    await fs.promises.rename(tmpPath, filePath)
++  } catch (error) {
++    try {
++      await fs.promises.unlink(tmpPath)
++    } catch {
++      // Ignore cleanup errors; the original error is what matters
++    }
++    throw error
++  }
++}

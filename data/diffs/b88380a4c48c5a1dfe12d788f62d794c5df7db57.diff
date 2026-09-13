@@ -1,0 +1,432 @@
+diff --git a/cli/src/__tests__/project-files-chat-id.test.ts b/cli/src/__tests__/project-files-chat-id.test.ts
+new file mode 100644
+index 000000000..73f504f5f
+--- /dev/null
++++ b/cli/src/__tests__/project-files-chat-id.test.ts
+@@ -0,0 +1,34 @@
++import { describe, test, expect } from 'bun:test'
++
++// NOTE: deliberately no mock.module here — bun module mocks are process-wide
++// and leak into other test files (e.g. stubbing utils/auth broke the
++// credentials-storage integration tests in CI). The chat id helpers below
++// never touch the config dir, so the real imports are safe.
++import {
++  getCurrentChatId,
++  setCurrentChatId,
++  startNewChat,
++} from '../project-files'
++
++describe('chat id lifecycle', () => {
++  test('getCurrentChatId is stable across calls', () => {
++    const first = getCurrentChatId()
++    expect(getCurrentChatId()).toBe(first)
++  })
++
++  test('setCurrentChatId overrides the current chat id', () => {
++    setCurrentChatId('resumed-chat-id')
++    expect(getCurrentChatId()).toBe('resumed-chat-id')
++  })
++
++  test('startNewChat rotates to a fresh chat id', () => {
++    setCurrentChatId('old-chat-id')
++
++    const rotated = startNewChat()
++
++    expect(rotated).not.toBe('old-chat-id')
++    expect(getCurrentChatId()).toBe(rotated)
++    // New ids are filesystem-safe ISO timestamps
++    expect(rotated).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z$/)
++  })
++})
+diff --git a/cli/src/app.tsx b/cli/src/app.tsx
+index c163c6f8f..e0fadd97e 100644
+--- a/cli/src/app.tsx
++++ b/cli/src/app.tsx
+@@ -17,7 +17,7 @@ import { useSheenAnimation } from './hooks/use-sheen-animation'
+ import { useTerminalDimensions } from './hooks/use-terminal-dimensions'
+ import { useTerminalFocus } from './hooks/use-terminal-focus'
+ import { useTheme } from './hooks/use-theme'
+-import { getProjectRoot } from './project-files'
++import { getProjectRoot, startNewChat } from './project-files'
+ import { useChatHistoryStore } from './state/chat-history-store'
+ import { useChatStore } from './state/chat-store'
+ import type { TopBannerType } from './types/store'
+@@ -195,6 +195,9 @@ export const App = ({
+   const handleNewChat = useCallback(() => {
+     closeChatHistory()
+     resetChatStore()
++    // Rotate the chat id so the new conversation saves to its own directory
++    // instead of overwriting the current (possibly resumed) chat's history
++    startNewChat()
+     setResumeChatId(null)
+   }, [closeChatHistory, resetChatStore])
+ 
+diff --git a/cli/src/commands/__tests__/new-command-rotates-chat.test.ts b/cli/src/commands/__tests__/new-command-rotates-chat.test.ts
+new file mode 100644
+index 000000000..1cb8aa152
+--- /dev/null
++++ b/cli/src/commands/__tests__/new-command-rotates-chat.test.ts
+@@ -0,0 +1,68 @@
++import { describe, expect, test } from 'bun:test'
++
++describe('/new command', () => {
++  test('rotates the chat id so the previous chat is not overwritten', () => {
++    const commandRegistryUrl = new URL(
++      '../command-registry.ts',
++      import.meta.url,
++    ).href
++    const projectFilesUrl = new URL(
++      '../../project-files.ts',
++      import.meta.url,
++    ).href
++
++    const result = Bun.spawnSync({
++      cmd: [
++        'bun',
++        '--eval',
++        `
++          import { findCommand } from ${JSON.stringify(commandRegistryUrl)}
++          import { getCurrentChatId, setCurrentChatId } from ${JSON.stringify(projectFilesUrl)}
++
++          setCurrentChatId('previous-chat-id')
++
++          const newCommand = findCommand('new')
++          if (!newCommand) throw new Error('new command missing')
++
++          const noop = () => {}
++          newCommand.handler(
++            {
++              setMessages: noop,
++              clearMessages: noop,
++              saveToHistory: noop,
++              inputValue: '/new',
++              setInputValue: noop,
++              stopStreaming: noop,
++              setCanProcessQueue: noop,
++            },
++            '',
++          )
++
++          if (getCurrentChatId() === 'previous-chat-id') {
++            throw new Error(
++              '/new did not rotate the chat id — the next save would overwrite the previous chat',
++            )
++          }
++        `,
++      ],
++      cwd: process.cwd(),
++      env: {
++        ...process.env,
++        NODE_ENV: 'test',
++        NEXT_PUBLIC_CB_ENVIRONMENT: 'test',
++        NEXT_PUBLIC_CODEBUFF_APP_URL: 'https://app.codebuff.test',
++        NEXT_PUBLIC_SUPPORT_EMAIL: 'support@codebuff.test',
++        NEXT_PUBLIC_POSTHOG_API_KEY: 'phc_test_key',
++        NEXT_PUBLIC_POSTHOG_HOST_URL: 'https://posthog.codebuff.test',
++        NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: 'pk_test_123',
++        NEXT_PUBLIC_STRIPE_CUSTOMER_PORTAL: 'https://stripe.codebuff.test',
++        NEXT_PUBLIC_WEB_PORT: '3000',
++      },
++      stderr: 'pipe',
++      stdout: 'pipe',
++    })
++
++    const stderr = new TextDecoder().decode(result.stderr)
++    expect(result.exitCode, stderr).toBe(0)
++  })
++})
+diff --git a/cli/src/commands/command-registry.ts b/cli/src/commands/command-registry.ts
+index 0a0afffb0..2cdfd68a8 100644
+--- a/cli/src/commands/command-registry.ts
++++ b/cli/src/commands/command-registry.ts
+@@ -12,6 +12,7 @@ import { handleUsageCommand } from './usage'
+ import { returnToFreebuffLanding } from '../hooks/use-freebuff-session'
+ import { useThemeStore } from '../hooks/use-theme'
+ import { WEBSITE_URL } from '../login/constants'
++import { startNewChat } from '../project-files'
+ import { useChatStore } from '../state/chat-store'
+ import { useFeedbackStore } from '../state/feedback-store'
+ import { useLoginStore } from '../state/login-store'
+@@ -305,9 +306,11 @@ const ALL_COMMANDS: CommandDefinition[] = [
+     handler: (params, args) => {
+       const trimmedArgs = args.trim()
+ 
+-      // Clear the conversation
++      // Clear the conversation and rotate to a fresh chat directory, so the
++      // next message doesn't overwrite the previous conversation's history
+       params.setMessages(() => [])
+       params.clearMessages()
++      startNewChat()
+       params.saveToHistory(params.inputValue.trim())
+       clearInput(params)
+       params.stopStreaming()
+diff --git a/cli/src/components/chat-history-screen.tsx b/cli/src/components/chat-history-screen.tsx
+index bf9c72ee5..7e2c79937 100644
+--- a/cli/src/components/chat-history-screen.tsx
++++ b/cli/src/components/chat-history-screen.tsx
+@@ -108,7 +108,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = ({
+           LAYOUT.TIME_COL_WIDTH,
+         )
+         const msgs = padRight(
+-          `${chat.messageCount} msgs`,
++          chat.unreadable ? '—' : `${chat.messageCount} msgs`,
+           LAYOUT.MSGS_COL_WIDTH,
+         )
+         const prompt = padRight(
+@@ -154,12 +154,29 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = ({
+ 
+   // No need to calculate listHeight - let flexbox handle it naturally
+ 
++  // Unreadable chats (corrupt chat-messages.json) can be deleted but not resumed
++  const unreadableChatIds = useMemo(
++    () => new Set(chats.filter((chat) => chat.unreadable).map((c) => c.chatId)),
++    [chats],
++  )
++
+   // Handle chat selection
++  const selectChat = useCallback(
++    (chatId: string) => {
++      if (unreadableChatIds.has(chatId)) {
++        setStatusMessage("Chat file is corrupted and can't be opened")
++        return
++      }
++      onSelectChat(chatId)
++    },
++    [onSelectChat, unreadableChatIds],
++  )
++
+   const handleChatSelect = useCallback(
+     (item: SelectableListItem) => {
+-      onSelectChat(item.id)
++      selectChat(item.id)
+     },
+-    [onSelectChat],
++    [selectChat],
+   )
+ 
+   const handleChatDelete = useCallback(
+@@ -200,7 +217,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = ({
+       if (isPlainEnterKey(key)) {
+         const focused = filteredItems[focusedIndex]
+         if (focused) {
+-          onSelectChat(focused.id)
++          selectChat(focused.id)
+         }
+         return true
+       }
+@@ -216,7 +233,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = ({
+       setFocusedIndex,
+       filteredItems,
+       focusedIndex,
+-      onSelectChat,
++      selectChat,
+       onCancel,
+     ],
+   )
+diff --git a/cli/src/utils/__tests__/chat-history.test.ts b/cli/src/utils/__tests__/chat-history.test.ts
+index 31acf47f3..4c1b618ef 100644
+--- a/cli/src/utils/__tests__/chat-history.test.ts
++++ b/cli/src/utils/__tests__/chat-history.test.ts
+@@ -71,4 +71,51 @@ describe('chat-history', () => {
+   test('deleteChatSession returns false when the chat does not exist', () => {
+     expect(deleteChatSession('missing-chat')).toBe(false)
+   })
++
++  test('getAllChats lists corrupt chats as unreadable instead of hiding them', () => {
++    writeChat('chat-good', 'hello from a healthy chat')
++
++    // Simulate a chat-messages.json truncated by a crash mid-write
++    const corruptDir = path.join(tempDataDir, 'chats', 'chat-corrupt')
++    fs.mkdirSync(corruptDir, { recursive: true })
++    fs.writeFileSync(
++      path.join(corruptDir, 'chat-messages.json'),
++      '[{"id":"msg-1","variant":"user","content":"truncat',
++    )
++
++    const chats = getAllChats()
++
++    const good = chats.find((chat) => chat.chatId === 'chat-good')
++    expect(good).toBeDefined()
++    expect(good?.unreadable).toBeUndefined()
++    expect(good?.lastPrompt).toBe('hello from a healthy chat')
++
++    const corrupt = chats.find((chat) => chat.chatId === 'chat-corrupt')
++    expect(corrupt).toBeDefined()
++    expect(corrupt?.unreadable).toBe(true)
++    expect(corrupt?.lastPrompt).toBe('(unreadable chat)')
++  })
++
++  test('getAllChats lists non-array chat-messages.json as unreadable', () => {
++    const badDir = path.join(tempDataDir, 'chats', 'chat-not-array')
++    fs.mkdirSync(badDir, { recursive: true })
++    fs.writeFileSync(
++      path.join(badDir, 'chat-messages.json'),
++      '{"not":"an array"}',
++    )
++
++    const chats = getAllChats()
++
++    expect(chats).toHaveLength(1)
++    expect(chats[0].chatId).toBe('chat-not-array')
++    expect(chats[0].unreadable).toBe(true)
++  })
++
++  test('getAllChats still hides empty chats', () => {
++    const emptyDir = path.join(tempDataDir, 'chats', 'chat-empty')
++    fs.mkdirSync(emptyDir, { recursive: true })
++    fs.writeFileSync(path.join(emptyDir, 'chat-messages.json'), '[]')
++
++    expect(getAllChats()).toHaveLength(0)
++  })
+ })
+diff --git a/cli/src/utils/__tests__/write-file-atomic.test.ts b/cli/src/utils/__tests__/write-file-atomic.test.ts
+new file mode 100644
+index 000000000..8fb7b3d29
+--- /dev/null
++++ b/cli/src/utils/__tests__/write-file-atomic.test.ts
+@@ -0,0 +1,53 @@
++import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
++import * as fs from 'fs'
++import * as os from 'os'
++import * as path from 'path'
++
++import { writeFileAtomic } from '../write-file-atomic'
++
++let tempDir = ''
++
++describe('writeFileAtomic', () => {
++  beforeEach(() => {
++    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codebuff-atomic-'))
++  })
++
++  afterEach(() => {
++    fs.rmSync(tempDir, { recursive: true, force: true })
++  })
++
++  test('writes a new file', () => {
++    const target = path.join(tempDir, 'out.json')
++
++    writeFileAtomic(target, '{"a":1}')
++
++    expect(fs.readFileSync(target, 'utf8')).toBe('{"a":1}')
++  })
++
++  test('replaces an existing file', () => {
++    const target = path.join(tempDir, 'out.json')
++    fs.writeFileSync(target, 'old content')
++
++    writeFileAtomic(target, 'new content')
++
++    expect(fs.readFileSync(target, 'utf8')).toBe('new content')
++  })
++
++  test('leaves no temp file behind on success', () => {
++    const target = path.join(tempDir, 'out.json')
++
++    writeFileAtomic(target, 'data')
++
++    expect(fs.readdirSync(tempDir)).toEqual(['out.json'])
++  })
++
++  test('cleans up the temp file and rethrows on failure', () => {
++    // Renaming a file over an existing directory fails on all platforms
++    const target = path.join(tempDir, 'target-dir')
++    fs.mkdirSync(target)
++
++    expect(() => writeFileAtomic(target, 'data')).toThrow()
++
++    expect(fs.readdirSync(tempDir)).toEqual(['target-dir'])
++  })
++})
+diff --git a/cli/src/utils/chat-history.ts b/cli/src/utils/chat-history.ts
+index 8108d26ef..e6b07f0a9 100644
+--- a/cli/src/utils/chat-history.ts
++++ b/cli/src/utils/chat-history.ts
+@@ -11,6 +11,10 @@ export interface ChatHistoryEntry {
+   lastPrompt: string
+   timestamp: Date
+   messageCount: number
++  /** True when chat-messages.json exists but can't be parsed (e.g. truncated
++   * by a crash mid-write). Shown in /history so the chat doesn't silently
++   * vanish; can be deleted but not resumed. */
++  unreadable?: boolean
+ }
+ 
+ function getChatsDir(): string {
+@@ -89,6 +93,9 @@ export function getAllChats(maxChats: number = 500): ChatHistoryEntry[] {
+         if (fs.existsSync(info.messagesPath)) {
+           const content = fs.readFileSync(info.messagesPath, 'utf8')
+           const messages = JSON.parse(content) as ChatMessage[]
++          if (!Array.isArray(messages)) {
++            throw new Error('chat-messages.json is not an array')
++          }
+           messageCount = messages.length
+           lastPrompt = getFirstUserPrompt(messages)
+         }
+@@ -110,6 +117,15 @@ export function getAllChats(maxChats: number = 500): ChatHistoryEntry[] {
+           },
+           'Failed to read chat messages',
+         )
++        // Don't silently hide the chat: list it as unreadable so the user
++        // knows it exists (and can delete it) instead of thinking it was lost
++        chats.push({
++          chatId: info.chatId,
++          lastPrompt: '(unreadable chat)',
++          timestamp: info.mtime,
++          messageCount: 0,
++          unreadable: true,
++        })
+       }
+     }
+ 
+diff --git a/cli/src/utils/run-state-storage.ts b/cli/src/utils/run-state-storage.ts
+index 8ca916812..63a59a5a8 100644
+--- a/cli/src/utils/run-state-storage.ts
++++ b/cli/src/utils/run-state-storage.ts
+@@ -8,6 +8,7 @@ import {
+   getProjectDataDir,
+ } from '../project-files'
+ import { logger } from './logger'
++import { writeFileAtomic } from './write-file-atomic'
+ 
+ import type { ChatMessage, ContentBlock } from '../types/chat'
+ import type { RunState } from '@codebuff/sdk'
+@@ -82,8 +83,8 @@ export function saveChatState(
+     const runStatePath = getRunStatePath()
+     const messagesPath = getChatMessagesPath()
+ 
+-    fs.writeFileSync(runStatePath, JSON.stringify(runState, null, 2))
+-    fs.writeFileSync(messagesPath, JSON.stringify(messages, null, 2))
++    writeFileAtomic(runStatePath, JSON.stringify(runState, null, 2))
++    writeFileAtomic(messagesPath, JSON.stringify(messages, null, 2))
+   } catch (error) {
+     logger.error(
+       {
+diff --git a/cli/src/utils/write-file-atomic.ts b/cli/src/utils/write-file-atomic.ts
+new file mode 100644
+index 000000000..41ad7baa5
+--- /dev/null
++++ b/cli/src/utils/write-file-atomic.ts
+@@ -0,0 +1,22 @@
++import * as fs from 'fs'
++
++/**
++ * Write a file atomically: write to a temp file in the same directory, then
++ * rename over the target. Chat files grow to multiple MB and are rewritten on
++ * every agent step, so a plain writeFileSync interrupted by a crash/kill
++ * leaves truncated JSON that hides the chat from /history.
++ */
++export function writeFileAtomic(filePath: string, data: string): void {
++  const tmpPath = `${filePath}.${process.pid}.tmp`
++  try {
++    fs.writeFileSync(tmpPath, data)
++    fs.renameSync(tmpPath, filePath)
++  } catch (error) {
++    try {
++      fs.unlinkSync(tmpPath)
++    } catch {
++      // Ignore cleanup errors; the original error is what matters
++    }
++    throw error
++  }
++}

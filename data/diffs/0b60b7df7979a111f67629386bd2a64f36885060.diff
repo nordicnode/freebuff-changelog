@@ -1,0 +1,1098 @@
+diff --git a/agents/__tests__/base3.test.ts b/agents/__tests__/base3.test.ts
+index ab0d86bdc..742828d33 100644
+--- a/agents/__tests__/base3.test.ts
++++ b/agents/__tests__/base3.test.ts
+@@ -87,6 +87,9 @@ describe('base3 CLI roots', () => {
+     // requires a canonical opening at byte 0, so prepending 403s every turn.
+     for (const agent of CLI_ROOTS) {
+       expect(hasFreebuffRootSystemPromptOpening(agent.systemPrompt!)).toBe(true)
++      expect(
++        agent.systemPrompt!.match(/\{CODEBUFF_GIT_CHANGES_PROMPT\}/g),
++      ).toHaveLength(1)
+     }
+   })
+ 
+diff --git a/agents/base3.ts b/agents/base3.ts
+index f0075de3f..d2f193f69 100644
+--- a/agents/base3.ts
++++ b/agents/base3.ts
+@@ -55,6 +55,8 @@ Current date: ${PLACEHOLDER.CURRENT_DATE}.
+ - Don't run destructive or hard-to-undo commands (git push, resets, deploys) unless the user asks for them.
+ 
+ ${PLACEHOLDER.KNOWLEDGE_FILES_CONTENTS}
++
++${PLACEHOLDER.GIT_CHANGES_PROMPT}
+ `,
+   }
+ }
+@@ -174,12 +176,6 @@ ${
+ }
+ 
+ ${PLACEHOLDER.SYSTEM_INFO_PROMPT}
+-
+-# Initial Git Changes
+-
+-The following is the state of the git repository at the start of the conversation. Note that it is not updated to reflect any subsequent changes made by you or the user.
+-
+-${PLACEHOLDER.GIT_CHANGES_PROMPT}
+ `
+ }
+ 
+diff --git a/common/src/util/file.ts b/common/src/util/file.ts
+index 84568384f..75c4a050f 100644
+--- a/common/src/util/file.ts
++++ b/common/src/util/file.ts
+@@ -71,10 +71,39 @@ export const ProjectFileContextSchema = z.object({
+   skills: z.record(z.string(), z.any()).optional(),
+   includeHomeSkills: z.boolean().optional(),
+   gitChanges: z.object({
+-    status: z.string(),
+-    diff: z.string(),
+-    diffCached: z.string(),
+-    lastCommitMessages: z.string(),
++    gitAvailable: z.boolean().optional(),
++    branch: z.string().optional(),
++    changedFiles: z.array(z.string()).optional(),
++    changedFileCount: z.number().optional(),
++    changedFileScanTruncated: z.boolean().optional(),
++    repositoryVisibility: z
++      .enum(['public', 'private', 'internal', 'unknown'])
++      .optional(),
++    commitCount: z.number().optional(),
++    historyIsShallow: z.boolean().optional(),
++    commitDatePercentiles: z
++      .object({
++        p0: z.string(),
++        p25: z.string(),
++        p50: z.string(),
++        p75: z.string(),
++        p100: z.string(),
++      })
++      .optional(),
++    mergedPullRequestCount: z.number().optional(),
++    humanContributorCount: z.number().optional(),
++    botContributorCount: z.number().optional(),
++    historyScanTruncated: z.boolean().optional(),
++    // Legacy field retained so stored run states from older clients parse.
++    contributorCount: z.number().optional(),
++    fileCount: z.number().optional(),
++    fileCountIsLowerBound: z.boolean().optional(),
++    testFileCount: z.number().optional(),
++    // Legacy fields retained so stored run states from older clients parse.
++    status: z.string().optional(),
++    diff: z.string().optional(),
++    diffCached: z.string().optional(),
++    lastCommitMessages: z.string().optional(),
+   }),
+   changesSinceLastChat: z.record(z.string(), z.string()),
+   shellConfigFiles: z.record(z.string(), z.string()),
+@@ -110,10 +139,35 @@ export type ProjectFileContext = {
+    */
+   includeHomeSkills?: boolean
+   gitChanges: {
+-    status: string
+-    diff: string
+-    diffCached: string
+-    lastCommitMessages: string
++    gitAvailable?: boolean
++    branch?: string
++    changedFiles?: string[]
++    changedFileCount?: number
++    changedFileScanTruncated?: boolean
++    repositoryVisibility?: 'public' | 'private' | 'internal' | 'unknown'
++    commitCount?: number
++    historyIsShallow?: boolean
++    commitDatePercentiles?: {
++      p0: string
++      p25: string
++      p50: string
++      p75: string
++      p100: string
++    }
++    mergedPullRequestCount?: number
++    humanContributorCount?: number
++    botContributorCount?: number
++    historyScanTruncated?: boolean
++    /** Legacy field present in run states created before bot separation. */
++    contributorCount?: number
++    fileCount?: number
++    fileCountIsLowerBound?: boolean
++    testFileCount?: number
++    /** Legacy fields present in run states created before repository summaries. */
++    status?: string
++    diff?: string
++    diffCached?: string
++    lastCommitMessages?: string
+   }
+   changesSinceLastChat: Record<string, string>
+   shellConfigFiles: Record<string, string>
+@@ -155,10 +209,12 @@ export const getStubProjectFileContext = (): ProjectFileContext => ({
+   customToolDefinitions: {},
+   skills: {},
+   gitChanges: {
+-    status: '',
+-    diff: '',
+-    diffCached: '',
+-    lastCommitMessages: '',
++    gitAvailable: false,
++    changedFiles: [],
++    changedFileCount: 0,
++    repositoryVisibility: 'unknown',
++    fileCount: 0,
++    testFileCount: 0,
+   },
+   changesSinceLastChat: {},
+   shellConfigFiles: {},
+diff --git a/packages/agent-runtime/src/system-prompt/prompts.ts b/packages/agent-runtime/src/system-prompt/prompts.ts
+index 6f2bca940..9dc1beec3 100644
+--- a/packages/agent-runtime/src/system-prompt/prompts.ts
++++ b/packages/agent-runtime/src/system-prompt/prompts.ts
+@@ -3,7 +3,6 @@ import {
+   getLastReadFilePaths,
+ } from '@codebuff/common/project-file-tree'
+ import { createMarkdownFileBlock } from '@codebuff/common/util/file'
+-import { truncateString } from '@codebuff/common/util/string'
+ import { closeXml } from '@codebuff/common/util/xml'
+ 
+ import { truncateFileTreeBasedOnTokenBudget } from './truncate-file-tree'
+@@ -194,23 +193,62 @@ export const getGitChangesPrompt = (fileContext: ProjectFileContext) => {
+   if (!gitChanges) {
+     return ''
+   }
+-  const maxLength = 30_000
++
++  const historyCountPrefix =
++    gitChanges.historyScanTruncated || gitChanges.historyIsShallow
++      ? 'at least '
++      : ''
++  const contributorStats =
++    gitChanges.humanContributorCount !== undefined
++      ? [
++          `human_contributors: ${historyCountPrefix}${gitChanges.humanContributorCount}`,
++          `bot_contributors: ${historyCountPrefix}${gitChanges.botContributorCount ?? 0}`,
++        ]
++      : gitChanges.contributorCount !== undefined
++        ? [`contributor_identities: ${gitChanges.contributorCount}`]
++        : []
++  const stats = [
++    gitChanges.branch ? `branch: ${gitChanges.branch}` : undefined,
++    `repository_visibility: ${gitChanges.repositoryVisibility ?? 'unknown'}`,
++    gitChanges.fileCount !== undefined
++      ? `indexed_project_files: ${gitChanges.fileCountIsLowerBound ? 'at least ' : ''}${gitChanges.fileCount}`
++      : undefined,
++    gitChanges.testFileCount !== undefined
++      ? `detected_test_files: ${gitChanges.fileCountIsLowerBound ? 'at least ' : ''}${gitChanges.testFileCount}`
++      : undefined,
++    gitChanges.commitCount !== undefined
++      ? `${gitChanges.historyIsShallow ? 'commits_in_shallow_clone' : 'total_commits'}: ${gitChanges.commitCount}`
++      : undefined,
++    gitChanges.commitDatePercentiles
++      ? `${gitChanges.historyIsShallow ? 'commit_dates_available_history' : 'commit_dates'}: first=${gitChanges.commitDatePercentiles.p0}, p25=${gitChanges.commitDatePercentiles.p25}, p50=${gitChanges.commitDatePercentiles.p50}, p75=${gitChanges.commitDatePercentiles.p75}, p100=${gitChanges.commitDatePercentiles.p100}`
++      : undefined,
++    gitChanges.mergedPullRequestCount !== undefined
++      ? `merged_pull_requests_detected: ${historyCountPrefix}${gitChanges.mergedPullRequestCount}`
++      : undefined,
++    ...contributorStats,
++  ].filter((line): line is string => line !== undefined)
++  const changedFiles = gitChanges.changedFiles ?? []
++  const gitAvailable =
++    gitChanges.gitAvailable ?? gitChanges.changedFiles !== undefined
++  const changedFileCount = gitChanges.changedFileCount ?? changedFiles.length
++  const countLabel = gitChanges.changedFileScanTruncated
++    ? `at least ${changedFileCount}`
++    : `${changedFileCount}`
++  const changedFilesLabel =
++    changedFiles.length < changedFileCount ||
++    gitChanges.changedFileScanTruncated
++      ? `showing ${changedFiles.length} of ${countLabel}`
++      : `${changedFileCount}`
++
+   return `
+-Git Changes:
+-<git_status>
+-${truncateString(gitChanges.status, maxLength / 10)}
+-${closeXml('git_status')}
+-
+-<git_diff>
+-${truncateString(gitChanges.diff, maxLength)}
+-${closeXml('git_diff')}
+-
+-<git_diff_cached>
+-${truncateString(gitChanges.diffCached, maxLength)}
+-${closeXml('git_diff_cached')}
+-
+-<git_commit_messages_most_recent_first>
+-${truncateString(gitChanges.lastCommitMessages, maxLength / 10)}
+-${closeXml('git_commit_messages_most_recent_first')}
++Git repository summary captured at the start of the conversation. Repository visibility is a best-effort authenticated GitHub lookup; unknown does not imply private. Commit dates are chronological percentiles by committer date. A shallow clone labels them as available history rather than the full project timeline; truncated history omits them. Local file discovery respects repository ignore rules. Test files are detected from common language-agnostic path and filename conventions without reading file contents. Human and bot contributors are separated conservatively after Git mailmap alias canonicalization; aliases absent from .mailmap can still remain separate. Merged pull requests are detected from common merge and squash commit-subject formats, so histories that omit PR numbers can undercount them.
++<repository_stats>
++${stats.join('\n')}
++${closeXml('repository_stats')}
++
++Changed file paths (${gitAvailable ? changedFilesLabel : 'unavailable'}):
++<changed_file_paths>
++${gitAvailable ? (changedFiles.length > 0 ? changedFiles.join('\n') : '(none)') : '(Git metadata unavailable to this host)'}
++${closeXml('changed_file_paths')}
+ `.trim()
+ }
+diff --git a/packages/agent-runtime/src/templates/__tests__/strings.test.ts b/packages/agent-runtime/src/templates/__tests__/strings.test.ts
+index 4057c963d..585201560 100644
+--- a/packages/agent-runtime/src/templates/__tests__/strings.test.ts
++++ b/packages/agent-runtime/src/templates/__tests__/strings.test.ts
+@@ -3,6 +3,7 @@ import { describe, test, expect, mock } from 'bun:test'
+ 
+ import { PLACEHOLDER } from '../types'
+ import { formatCurrentDate, getAgentPrompt } from '../strings'
++import { getGitChangesPrompt } from '../../system-prompt/prompts'
+ 
+ import type { AgentTemplate } from '../types'
+ import type { AgentState } from '@codebuff/common/types/session-state'
+@@ -108,12 +109,127 @@ describe('getAgentPrompt', () => {
+     expect(result).not.toContain(PLACEHOLDER.CURRENT_DATE)
+   })
+ 
+-  test('formats current date for prompts', () => {
+-    expect(formatCurrentDate(new Date(2026, 4, 22, 12))).toBe(
+-      'May 22, 2026',
++  test('renders compact repository stats and changed paths without patch content', async () => {
++    const agentTemplate = createMockAgentTemplate({
++      id: 'git-agent',
++      systemPrompt: PLACEHOLDER.GIT_CHANGES_PROMPT,
++    })
++    const fileContext: ProjectFileContext = {
++      ...createMockFileContext(),
++      gitChanges: {
++        gitAvailable: true,
++        branch: 'main',
++        changedFiles: ['src/a.ts', 'src/b.ts'],
++        changedFileCount: 52,
++        changedFileScanTruncated: false,
++        repositoryVisibility: 'private',
++        commitCount: 1200,
++        historyIsShallow: false,
++        commitDatePercentiles: {
++          p0: '2019-01-01',
++          p25: '2020-06-15',
++          p50: '2022-03-10',
++          p75: '2024-07-20',
++          p100: '2026-08-24',
++        },
++        mergedPullRequestCount: 900,
++        humanContributorCount: 6,
++        botContributorCount: 2,
++        historyScanTruncated: false,
++        fileCount: 340,
++        fileCountIsLowerBound: true,
++        testFileCount: 75,
++        // A legacy run state can still contain these, but they must not be
++        // injected into the compact base3 repository context.
++        diff: 'SECRET PATCH CONTENT',
++      },
++    }
++
++    const result = await getAgentPrompt({
++      agentTemplate,
++      promptType: { type: 'systemPrompt' },
++      fileContext,
++      agentState: createMockAgentState('git-agent'),
++      agentTemplates: { 'git-agent': agentTemplate },
++      additionalToolDefinitions: async () => ({}),
++      logger: createMockLogger(),
++      apiKey: TEST_AGENT_RUNTIME_IMPL.apiKey,
++      databaseAgentCache: TEST_AGENT_RUNTIME_IMPL.databaseAgentCache,
++      fetchAgentFromDatabase: TEST_AGENT_RUNTIME_IMPL.fetchAgentFromDatabase,
++    })
++
++    expect(result).toContain('indexed_project_files: at least 340')
++    expect(result).toContain('detected_test_files: at least 75')
++    expect(result).toContain('repository_visibility: private')
++    expect(result).toContain('total_commits: 1200')
++    expect(result).toContain(
++      'commit_dates: first=2019-01-01, p25=2020-06-15, p50=2022-03-10, p75=2024-07-20, p100=2026-08-24',
++    )
++    expect(result).toContain('merged_pull_requests_detected: 900')
++    expect(result).toContain('human_contributors: 6')
++    expect(result).toContain('bot_contributors: 2')
++    expect(result).toContain('Changed file paths (showing 2 of 52)')
++    expect(result).toContain('src/a.ts\nsrc/b.ts')
++    expect(result).not.toContain('SECRET PATCH CONTENT')
++
++    const unavailableResult = getGitChangesPrompt({
++      ...fileContext,
++      gitChanges: { gitAvailable: false, fileCount: 340 },
++    })
++    expect(unavailableResult).toContain('Changed file paths (unavailable)')
++    expect(unavailableResult).toContain('repository_visibility: unknown')
++    expect(unavailableResult).toContain(
++      '(Git metadata unavailable to this host)',
++    )
++    expect(unavailableResult).not.toContain('(none)')
++
++    const truncatedResult = getGitChangesPrompt({
++      ...fileContext,
++      gitChanges: {
++        humanContributorCount: 6,
++        botContributorCount: 2,
++        mergedPullRequestCount: 900,
++        historyScanTruncated: true,
++      },
++    })
++    expect(truncatedResult).toContain('human_contributors: at least 6')
++    expect(truncatedResult).toContain('bot_contributors: at least 2')
++    expect(truncatedResult).toContain(
++      'merged_pull_requests_detected: at least 900',
++    )
++
++    const shallowResult = getGitChangesPrompt({
++      ...fileContext,
++      gitChanges: {
++        commitCount: 25,
++        historyIsShallow: true,
++        humanContributorCount: 3,
++        botContributorCount: 1,
++        mergedPullRequestCount: 10,
++        commitDatePercentiles: {
++          p0: '2024-01-01',
++          p25: '2024-02-01',
++          p50: '2024-03-01',
++          p75: '2024-04-01',
++          p100: '2024-05-01',
++        },
++      },
++    })
++    expect(shallowResult).toContain('commits_in_shallow_clone: 25')
++    expect(shallowResult).toContain(
++      'commit_dates_available_history: first=2024-01-01',
++    )
++    expect(shallowResult).toContain('human_contributors: at least 3')
++    expect(shallowResult).toContain('bot_contributors: at least 1')
++    expect(shallowResult).toContain(
++      'merged_pull_requests_detected: at least 10',
+     )
+   })
+ 
++  test('formats current date for prompts', () => {
++    expect(formatCurrentDate(new Date(2026, 4, 22, 12))).toBe('May 22, 2026')
++  })
++
+   describe('spawnerPrompt inclusion in instructionsPrompt', () => {
+     test('includes spawnerPrompt for each spawnable agent with spawnerPrompt defined', async () => {
+       const filePickerTemplate = createMockAgentTemplate({
+@@ -156,8 +272,12 @@ describe('getAgentPrompt', () => {
+ 
+       expect(result).toBeDefined()
+       expect(result).toContain('You can spawn the following agents:')
+-      expect(result).toContain('- file-picker: Spawn to find relevant files in a codebase')
+-      expect(result).toContain('- code-searcher: Mechanically runs multiple code search queries')
++      expect(result).toContain(
++        '- file-picker: Spawn to find relevant files in a codebase',
++      )
++      expect(result).toContain(
++        '- code-searcher: Mechanically runs multiple code search queries',
++      )
+     })
+ 
+     test('includes only agent name when spawnerPrompt is not defined', async () => {
+diff --git a/sdk/src/__tests__/run-state-git-changes.test.ts b/sdk/src/__tests__/run-state-git-changes.test.ts
+index f3e80743d..f26a098c7 100644
+--- a/sdk/src/__tests__/run-state-git-changes.test.ts
++++ b/sdk/src/__tests__/run-state-git-changes.test.ts
+@@ -2,10 +2,16 @@ import { EventEmitter } from 'events'
+ 
+ import { describe, expect, it } from 'bun:test'
+ 
+-import { getGitChanges } from '../run-state'
++import {
++  applyOverridesToSessionState,
++  getGitChanges,
++  isTestFilePath,
++} from '../run-state'
+ 
++import { getInitialSessionState } from '@codebuff/common/types/session-state'
+ import type { CodebuffSpawn } from '@codebuff/common/types/spawn'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
++import { getStubProjectFileContext } from '@codebuff/common/util/file'
+ 
+ /** Fake ChildProcess: streams the given stdout in fixed-size chunks after
+  *  spawn returns, then closes with code 0 — unless killed first, in which
+@@ -43,50 +49,186 @@ function makeSpawn(outputs: Record<string, string>): CodebuffSpawn {
+ }
+ 
+ describe('getGitChanges', () => {
+-  it('returns full output when under the cap', async () => {
++  it('summarizes repository scale and all kinds of changed paths', async () => {
+     const events: Array<{ data: unknown; msg?: string }> = []
+     const result = await getGitChanges({
+       cwd: '/repo',
+       spawn: makeSpawn({
+-        'git status': 'On branch main\n',
+-        'git diff': 'diff --git a/x b/x\n+hello\n',
+-        'git diff --cached': '',
++        'git rev-parse --abbrev-ref HEAD': 'main\n',
++        'git diff --name-only --': 'src/b.ts\nsrc/a.ts\n',
++        'git diff --cached --name-only --': 'src/a.ts\nsrc/c.ts\n',
++        'git ls-files --others --exclude-standard': 'src/new.ts\n',
++        'git rev-list --count HEAD': '1234\n',
++        'git log --use-mailmap --format=%aN%x09%aE%x09%cs%x09%s HEAD': [
++          'Ada Lovelace\tada@example.com\t2020-01-01\tFix engine (#101)',
++          'A. Lovelace\tada@example.com\t2020-02-01\tFollow up (#101)',
++          'Grace Hopper\tgrace@example.com\t2020-03-01\tMerge pull request #102 from grace/feature',
++          'github-actions[bot]\t41898282+github-actions[bot]@users.noreply.github.com\t2020-04-01\tRelease',
++          'GitHub Actions\tgithub-actions[bot]@users.noreply.github.com\t2020-05-01\tRelease follow-up',
++          'Renovate Bot\trenovate@whitesourcesoftware.com\t2020-06-01\tBump deps (pull request #103)',
++        ].join('\n'),
++        'git rev-parse --is-shallow-repository': 'false\n',
++        'gh repo view --json visibility --jq .visibility': 'PRIVATE\n',
+       }),
+       logger: makeLogger(events),
++      fileCount: 87,
++      testFileCount: 12,
+     })
+ 
+-    expect(result.status).toBe('On branch main\n')
+-    expect(result.diff).toBe('diff --git a/x b/x\n+hello\n')
+-    expect(result.diffCached).toBe('')
++    expect(result).toEqual({
++      gitAvailable: true,
++      branch: 'main',
++      changedFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/new.ts'],
++      changedFileCount: 4,
++      changedFileScanTruncated: false,
++      repositoryVisibility: 'private',
++      commitCount: 1234,
++      historyIsShallow: false,
++      commitDatePercentiles: {
++        p0: '2020-01-01',
++        p25: '2020-02-01',
++        p50: '2020-03-01',
++        p75: '2020-05-01',
++        p100: '2020-06-01',
++      },
++      mergedPullRequestCount: 3,
++      humanContributorCount: 2,
++      botContributorCount: 2,
++      historyScanTruncated: false,
++      fileCount: 87,
++      fileCountIsLowerBound: undefined,
++      testFileCount: 12,
++    })
+     expect(events).toEqual([])
+   })
+ 
+-  it('caps a huge diff instead of buffering it unbounded', async () => {
+-    // ~30MB diff vs the 10M-char cap. The pre-fix behavior accumulated all of
+-    // it (real-world multi-GB diffs hit the runtime string ceiling and threw
+-    // RangeError: Out of memory).
+-    const hugeDiff = 'x'.repeat(30_000_000)
++  it('renders no more than 25 changed file names', async () => {
++    const changedFiles = Array.from(
++      { length: 60 },
++      (_, index) => `src/file-${String(index).padStart(2, '0')}.ts`,
++    )
++    const result = await getGitChanges({
++      cwd: '/repo',
++      spawn: makeSpawn({
++        'git diff --name-only --': changedFiles.join('\n'),
++      }),
++      logger: makeLogger([]),
++    })
++
++    expect(result.changedFiles).toHaveLength(25)
++    expect(result.changedFileCount).toBe(60)
++    expect(result.changedFileScanTruncated).toBe(false)
++  })
++
++  it('labels a partial clone without discarding its available timeline', async () => {
++    const result = await getGitChanges({
++      cwd: '/repo',
++      spawn: makeSpawn({
++        'git rev-parse --is-shallow-repository': 'true\n',
++        'git rev-list --count HEAD': '25\n',
++        'git log --use-mailmap --format=%aN%x09%aE%x09%cs%x09%s HEAD':
++          'Ada Lovelace\tada@example.com\t2024-01-01\tRecent commit',
++      }),
++      logger: makeLogger([]),
++    })
++
++    expect(result.historyIsShallow).toBe(true)
++    expect(result.commitCount).toBe(25)
++    expect(result.commitDatePercentiles).toEqual({
++      p0: '2024-01-01',
++      p25: '2024-01-01',
++      p50: '2024-01-01',
++      p75: '2024-01-01',
++      p100: '2024-01-01',
++    })
++    expect(result.repositoryVisibility).toBe('unknown')
++  })
++
++  it('stops pathological changed-path output at the subprocess cap', async () => {
+     const events: Array<{ data: unknown; msg?: string }> = []
+ 
+     const result = await getGitChanges({
+       cwd: '/repo',
+-      spawn: makeSpawn({ 'git diff': hugeDiff }),
++      spawn: makeSpawn({
++        'git diff --name-only --': 'repeated-path\n'.repeat(100_000),
++      }),
+       logger: makeLogger(events),
+     })
+ 
+-    // Truncated prefix + marker resolved — not rejected-and-folded to ''.
+-    expect(result.diff.length).toBe(10_000_000 + '\n[output truncated]'.length)
+-    expect(result.diff.endsWith('\n[output truncated]')).toBe(true)
+-    expect(result.diff.startsWith('xxx')).toBe(true)
+-
+-    // Other commands are unaffected.
+-    expect(result.status).toBe('')
++    expect(result.changedFileScanTruncated).toBe(true)
+ 
+-    // Truncation is logged with the offending command.
+     const truncationLogs = events.filter(
+       (e) => e.msg === 'Git command output truncated at cap',
+     )
+     expect(truncationLogs.length).toBe(1)
+-    expect((truncationLogs[0]!.data as any).command).toBe('git diff')
++    expect((truncationLogs[0]!.data as any).command).toBe(
++      'git unstaged file names',
++    )
++  })
++})
++
++describe('repository snapshot persistence', () => {
++  it('preserves the initial Git snapshot when a thread applies turn overrides', async () => {
++    const gitChanges = {
++      gitAvailable: true,
++      branch: 'main',
++      changedFiles: ['src/original.ts'],
++      changedFileCount: 1,
++      changedFileScanTruncated: false,
++      repositoryVisibility: 'private' as const,
++      commitCount: 123,
++    }
++    const baseSessionState = getInitialSessionState({
++      ...getStubProjectFileContext(),
++      gitChanges,
++    })
++
++    const continuedSessionState = await applyOverridesToSessionState(
++      '/repo',
++      baseSessionState,
++      { knowledgeFiles: { 'AGENTS.md': 'Updated instructions' } },
++    )
++
++    expect(continuedSessionState.fileContext.gitChanges).toEqual(gitChanges)
++    expect(continuedSessionState.fileContext.knowledgeFiles).toEqual({
++      'AGENTS.md': 'Updated instructions',
++    })
+   })
+ })
++
++describe('isTestFilePath', () => {
++  const testFiles = [
++    'src/foo.test.ts',
++    'src/foo.spec.jsx',
++    'src/widget.cy.ts',
++    'python/test_parser.py',
++    'python/parser_test.py',
++    'pkg/parser_test.go',
++    'spec/models/user_spec.rb',
++    'tests/integration.rs',
++    '__tests__/helper.ts',
++    'src/FooTest.java',
++    'src/FooTests.kt',
++    'src/FooTestCase.cs',
++  ]
++  const sourceFiles = [
++    'src/latest.ts',
++    'src/contest.py',
++    'src/testing-utils.ts',
++    'src/testimony.rs',
++    'src/FooTestData.java',
++    'fixtures/foo.ts',
++  ]
++
++  for (const filePath of testFiles) {
++    it(`detects ${filePath}`, () => {
++      expect(isTestFilePath(filePath)).toBe(true)
++    })
++  }
++
++  for (const filePath of sourceFiles) {
++    it(`does not mistake ${filePath} for a test`, () => {
++      expect(isTestFilePath(filePath)).toBe(false)
++    })
++  }
++})
+diff --git a/sdk/src/run-state.ts b/sdk/src/run-state.ts
+index ea0f78bfe..c13a6ab1a 100644
+--- a/sdk/src/run-state.ts
++++ b/sdk/src/run-state.ts
+@@ -7,6 +7,7 @@ import {
+   isKnowledgeFile,
+ } from '@codebuff/common/constants/knowledge'
+ import {
++  DEFAULT_MAX_FILES,
+   getProjectFileTree,
+   getAllFilePaths,
+ } from '@codebuff/common/project-file-tree'
+@@ -190,14 +191,135 @@ type ProjectIndexInput = {
+ 
+ const MAX_DISCOVERED_PROJECT_READ_BYTES = 1_000_000
+ 
+-/** Per-stream cap on collected subprocess output. A working-tree diff can be
+- *  multiple GB (huge tracked files), which used to accumulate unbounded until
+- *  the string hit the runtime's ~2GB ceiling and threw RangeError: Out of
+- *  memory. Downstream prompt building keeps only the first ~30KB, so anything
+- *  past this cap is discarded work; the child is killed once it's reached. */
++/** Per-stream cap on collected subprocess output. */
+ const MAX_SUBPROCESS_OUTPUT_CHARS = 10_000_000
++/** A repository summary renders at most 25 changed paths. Stop pathological
++ *  path listings early instead of buffering a huge working tree at startup. */
++const MAX_GIT_PATH_OUTPUT_CHARS = 500_000
++const MAX_CHANGED_FILES = 25
++const REPOSITORY_VISIBILITY_TIMEOUT_MS = 1_000
+ const SUBPROCESS_TRUNCATION_MARKER = '\n[output truncated]'
+ 
++const KNOWN_BOT_PATTERN =
++  /(?:\[bot\]|(?:^|[\s._+/@-])(?:bot|dependabot|renovate|github-actions|codecov|coveralls|greenkeeper|mergify|semantic-release|release-please)(?:$|[\s._+/@-]))/i
++const MERGED_PULL_REQUEST_PATTERNS = [
++  /^Merge pull request #(\d+)\b/i,
++  /\(#(\d+)\)\s*$/,
++  /\(pull request #(\d+)\)\s*$/i,
++]
++const TEST_DIRECTORY_NAMES = new Set([
++  '__tests__',
++  '__specs__',
++  'test',
++  'tests',
++  'spec',
++  'specs',
++])
++
++/** Detects common test-file naming conventions without assuming a language. */
++export function isTestFilePath(filePath: string): boolean {
++  const segments = filePath.replaceAll('\\', '/').split('/')
++  const fileName = segments.pop() ?? ''
++  if (
++    segments.some((segment) => TEST_DIRECTORY_NAMES.has(segment.toLowerCase()))
++  ) {
++    return true
++  }
++
++  const lowerFileName = fileName.toLowerCase()
++  return (
++    /\.(?:test|tests|spec|specs|cy)\./.test(lowerFileName) ||
++    /^(?:test|spec)_.+\.[^.]+$/.test(lowerFileName) ||
++    /_(?:test|tests|spec|specs)\.[^.]+$/.test(lowerFileName) ||
++    /^(?:test|tests|spec|specs)\.[^.]+$/.test(lowerFileName) ||
++    /(?:Test|Tests|TestCase|Spec)\.[^.]+$/.test(fileName)
++  )
++}
++
++function getCompleteOutput(result: {
++  stdout: string
++  truncated: boolean
++}): string {
++  if (!result.truncated) return result.stdout
++  const prefix = result.stdout.slice(0, -SUBPROCESS_TRUNCATION_MARKER.length)
++  const lastNewline = prefix.lastIndexOf('\n')
++  return lastNewline === -1 ? '' : prefix.slice(0, lastNewline)
++}
++
++function getHistoryStats(output: string): {
++  humanContributorCount: number
++  botContributorCount: number
++  mergedPullRequestCount: number
++  commitDatePercentiles?: {
++    p0: string
++    p25: string
++    p50: string
++    p75: string
++    p100: string
++  }
++} {
++  const contributors = new Map<string, boolean>()
++  const mergedPullRequests = new Set<string>()
++  const commitDates: string[] = []
++
++  for (const line of output.split('\n')) {
++    const [rawName = '', rawEmail = '', rawDate = '', ...subjectParts] =
++      line.split('\t')
++    const name = rawName.trim()
++    const email = rawEmail.trim().toLowerCase()
++    const date = rawDate.trim()
++    const subject = subjectParts.join('\t').trim()
++    if (!name && !email) continue
++
++    if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
++      commitDates.push(date)
++    }
++
++    // `--use-mailmap` canonicalizes known aliases. Email is the safest
++    // remaining dedupe key; name is only a fallback for email-less commits.
++    const githubEmail = email.replace(
++      /^(?:\d+\+)?([^@]+)@users\.noreply\.github\.com$/,
++      '$1@users.noreply.github.com',
++    )
++    const key = githubEmail || name.toLowerCase()
++    const isBot = KNOWN_BOT_PATTERN.test(`${name} ${email}`)
++    contributors.set(key, (contributors.get(key) ?? false) || isBot)
++
++    for (const pattern of MERGED_PULL_REQUEST_PATTERNS) {
++      const match = subject.match(pattern)
++      if (match?.[1]) {
++        mergedPullRequests.add(match[1])
++        break
++      }
++    }
++  }
++
++  let botContributorCount = 0
++  for (const isBot of contributors.values()) {
++    if (isBot) botContributorCount++
++  }
++  commitDates.sort()
++  const percentileDate = (percentile: number): string | undefined => {
++    if (commitDates.length === 0) return undefined
++    const index =
++      percentile === 0 ? 0 : Math.ceil(percentile * commitDates.length) - 1
++    return commitDates[Math.min(index, commitDates.length - 1)]
++  }
++  const p0 = percentileDate(0)
++  const p25 = percentileDate(0.25)
++  const p50 = percentileDate(0.5)
++  const p75 = percentileDate(0.75)
++  const p100 = percentileDate(1)
++
++  return {
++    humanContributorCount: contributors.size - botContributorCount,
++    botContributorCount,
++    mergedPullRequestCount: mergedPullRequests.size,
++    commitDatePercentiles:
++      p0 && p25 && p50 && p75 && p100 ? { p0, p25, p50, p75, p100 } : undefined,
++  }
++}
++
+ async function computeProjectIndex(params: ProjectIndexInput): Promise<{
+   fileTree: FileTreeNode[]
+   fileTokenScores: Record<string, any>
+@@ -309,11 +431,29 @@ function getFileSize(stats: Awaited<ReturnType<CodebuffFileSystem['stat']>>) {
+ function childProcessToPromise(
+   proc: ReturnType<CodebuffSpawn>,
+   maxOutputChars: number = MAX_SUBPROCESS_OUTPUT_CHARS,
++  timeoutMs?: number,
+ ): Promise<{ stdout: string; stderr: string; truncated: boolean }> {
+   return new Promise((resolve, reject) => {
+     let stdout = ''
+     let stderr = ''
+     let truncated = false
++    let settled = false
++    const timeout =
++      timeoutMs === undefined
++        ? undefined
++        : setTimeout(() => {
++            if (settled) return
++            settled = true
++            proc.kill()
++            reject(new Error(`Command timed out after ${timeoutMs}ms`))
++          }, timeoutMs)
++
++    const finish = (callback: () => void) => {
++      if (settled) return
++      settled = true
++      if (timeout) clearTimeout(timeout)
++      callback()
++    }
+ 
+     const collect = (existing: string, data: Buffer): string => {
+       if (truncated) return existing
+@@ -336,32 +476,61 @@ function childProcessToPromise(
+       // A kill we issued at the cap exits nonzero; that must not reject, or
+       // the callers' catch-to-empty would discard the collected prefix.
+       if (code === 0 || truncated) {
+-        resolve({ stdout, stderr, truncated })
++        finish(() => resolve({ stdout, stderr, truncated }))
+       } else {
+-        reject(new Error(`Command exited with code ${code}`))
++        finish(() => reject(new Error(`Command exited with code ${code}`)))
+       }
+     })
+ 
+-    proc.on('error', reject)
++    proc.on('error', (error) => finish(() => reject(error)))
+   })
+ }
+ 
+ /**
+- * Retrieves git changes for the project using the provided spawn function.
+- * Output is capped per command (see MAX_SUBPROCESS_OUTPUT_CHARS).
++ * Retrieves a compact repository summary using the provided spawn function.
++ * Changed paths include staged, unstaged, and untracked files, and the prompt
++ * receives at most MAX_CHANGED_FILES of them.
+  * @internal Exported for testing
+  */
+ export async function getGitChanges(params: {
+   cwd: string
+   spawn: CodebuffSpawn
+   logger: Logger
++  fileCount?: number
++  fileCountIsLowerBound?: boolean
++  testFileCount?: number
+ }): Promise<{
+-  status: string
+-  diff: string
+-  diffCached: string
+-  lastCommitMessages: string
++  gitAvailable: boolean
++  branch?: string
++  changedFiles: string[]
++  changedFileCount: number
++  changedFileScanTruncated: boolean
++  repositoryVisibility: 'public' | 'private' | 'internal' | 'unknown'
++  commitCount?: number
++  historyIsShallow?: boolean
++  commitDatePercentiles?: {
++    p0: string
++    p25: string
++    p50: string
++    p75: string
++    p100: string
++  }
++  mergedPullRequestCount?: number
++  humanContributorCount?: number
++  botContributorCount?: number
++  historyScanTruncated?: boolean
++  fileCount?: number
++  fileCountIsLowerBound?: boolean
++  testFileCount?: number
+ }> {
+-  const { cwd, spawn, logger } = params
++  const {
++    cwd,
++    spawn,
++    logger,
++    fileCount,
++    fileCountIsLowerBound,
++    testFileCount,
++  } = params
+ 
+   const stdoutOf =
+     (command: string) =>
+@@ -375,51 +544,124 @@ export async function getGitChanges(params: {
+       return stdout
+     }
+ 
+-  const status = childProcessToPromise(spawn('git', ['status'], { cwd }))
+-    .then(stdoutOf('git status'))
+-    .catch((error) => {
+-      logger.debug?.({ error }, 'Failed to get git status')
+-      return ''
+-    })
+-
+-  const diff = childProcessToPromise(spawn('git', ['diff'], { cwd }))
+-    .then(stdoutOf('git diff'))
+-    .catch((error) => {
+-      logger.debug?.({ error }, 'Failed to get git diff')
+-      return ''
+-    })
++  const gitOutput = (
++    args: string[],
++    label: string,
++    maxOutputChars = MAX_SUBPROCESS_OUTPUT_CHARS,
++  ) =>
++    childProcessToPromise(spawn('git', args, { cwd }), maxOutputChars)
++      .then((result) => ({
++        stdout: stdoutOf(label)(result),
++        truncated: result.truncated,
++      }))
++      .catch((error) => {
++        logger.debug?.({ error }, `Failed to get ${label}`)
++        return undefined
++      })
+ 
+-  const diffCached = childProcessToPromise(
+-    spawn('git', ['diff', '--cached'], { cwd }),
++  const branch = gitOutput(['rev-parse', '--abbrev-ref', 'HEAD'], 'git branch')
++  const unstagedFiles = gitOutput(
++    ['diff', '--name-only', '--'],
++    'git unstaged file names',
++    MAX_GIT_PATH_OUTPUT_CHARS,
+   )
+-    .then(stdoutOf('git diff --cached'))
+-    .catch((error) => {
+-      logger.debug?.({ error }, 'Failed to get git diff --cached')
+-      return ''
+-    })
+-
+-  const lastCommitMessages = childProcessToPromise(
+-    spawn('git', ['shortlog', 'HEAD~10..HEAD'], { cwd }),
++  const stagedFiles = gitOutput(
++    ['diff', '--cached', '--name-only', '--'],
++    'git staged file names',
++    MAX_GIT_PATH_OUTPUT_CHARS,
+   )
+-    .then(({ stdout }) =>
+-      stdout
+-        .trim()
+-        .split('\n')
+-        .slice(1)
+-        .reverse()
+-        .map((line) => line.trim())
+-        .join('\n'),
+-    )
+-    .catch((error) => {
+-      logger.debug?.({ error }, 'Failed to get lastCommitMessages')
+-      return ''
+-    })
++  const untrackedFiles = gitOutput(
++    ['ls-files', '--others', '--exclude-standard'],
++    'git untracked file names',
++    MAX_GIT_PATH_OUTPUT_CHARS,
++  )
++  const commitCount = gitOutput(
++    ['rev-list', '--count', 'HEAD'],
++    'git commit count',
++  )
++  const history = gitOutput(
++    ['log', '--use-mailmap', '--format=%aN%x09%aE%x09%cs%x09%s', 'HEAD'],
++    'git history summary',
++  )
++  const historyIsShallow = gitOutput(
++    ['rev-parse', '--is-shallow-repository'],
++    'git shallow status',
++  )
++  const visibility = childProcessToPromise(
++    spawn(
++      'gh',
++      ['repo', 'view', '--json', 'visibility', '--jq', '.visibility'],
++      { cwd },
++    ),
++    1_000,
++    REPOSITORY_VISIBILITY_TIMEOUT_MS,
++  ).catch((error) => {
++    logger.debug?.({ error }, 'Failed to get repository visibility')
++    return undefined
++  })
++
++  const pathResults = await Promise.all([
++    unstagedFiles,
++    stagedFiles,
++    untrackedFiles,
++  ])
++  const changedPaths = Array.from(
++    new Set(
++      pathResults.flatMap((result) => {
++        if (!result) return []
++        return getCompleteOutput(result)
++          .split('\n')
++          .map((line) => line.trim())
++          .filter((line) => line.length > 0)
++      }),
++    ),
++  ).sort()
++  const gitAvailable = pathResults.some((result) => result !== undefined)
++  const pathOutputTruncated = pathResults.some((result) => result?.truncated)
++
++  const parseCount = (value: string | undefined): number | undefined => {
++    if (value === undefined) return undefined
++    const parsed = Number.parseInt(value.trim(), 10)
++    return Number.isFinite(parsed) ? parsed : undefined
++  }
++  const historyResult = await history
++  const parsedHistoryStats = historyResult
++    ? getHistoryStats(getCompleteOutput(historyResult))
++    : undefined
++  const shallowResult = await historyIsShallow
++  const shallow = shallowResult
++    ? shallowResult.stdout.trim() === 'true'
++    : undefined
++  const historyStats = parsedHistoryStats
++    ? {
++        ...parsedHistoryStats,
++        commitDatePercentiles: historyResult?.truncated
++          ? undefined
++          : parsedHistoryStats.commitDatePercentiles,
++      }
++    : undefined
++  const visibilityValue = (await visibility)?.stdout.trim().toLowerCase()
++  const repositoryVisibility =
++    visibilityValue === 'public' ||
++    visibilityValue === 'private' ||
++    visibilityValue === 'internal'
++      ? visibilityValue
++      : 'unknown'
+ 
+   return {
+-    status: await status,
+-    diff: await diff,
+-    diffCached: await diffCached,
+-    lastCommitMessages: await lastCommitMessages,
++    gitAvailable,
++    branch: (await branch)?.stdout.trim() || undefined,
++    changedFiles: changedPaths.slice(0, MAX_CHANGED_FILES),
++    changedFileCount: changedPaths.length,
++    changedFileScanTruncated: pathOutputTruncated,
++    repositoryVisibility,
++    commitCount: parseCount((await commitCount)?.stdout),
++    historyIsShallow: shallow,
++    ...historyStats,
++    historyScanTruncated: historyResult?.truncated,
++    fileCount,
++    fileCountIsLowerBound,
++    testFileCount,
+   }
+ }
+ 
+@@ -621,6 +863,12 @@ export async function initialSessionState(
+     }
+   }
+ 
++  // Start repository collection before project indexing so an authenticated,
++  // bounded visibility lookup is normally hidden behind work we already do.
++  const gitChangesPromise = cwd
++    ? getGitChanges({ cwd, spawn, logger })
++    : undefined
++
+   let discoveredProject:
+     | { fileTree: FileTreeNode[]; filePaths: string[] }
+     | undefined
+@@ -682,14 +930,33 @@ export async function initialSessionState(
+     }
+   }
+ 
++  const projectFilePaths = getAllFilePaths(fileTree)
++  const fileCount = projectFilePaths.length
++  const testFileCount = projectFilePaths.filter(isTestFilePath).length
++  const fileCountIsLowerBound =
++    projectFiles === undefined &&
++    discoveredProject !== undefined &&
++    discoveredProject.filePaths.length >= DEFAULT_MAX_FILES
++
+   // Gather git changes if cwd is available
+   const gitChanges = cwd
+-    ? await getGitChanges({ cwd, spawn, logger })
++    ? {
++        ...(await gitChangesPromise!),
++        // The project tree has already been built for agent context and
++        // respects ignore rules, so counting it adds no filesystem traversal.
++        fileCount,
++        fileCountIsLowerBound,
++        testFileCount,
++      }
+     : {
+-        status: '',
+-        diff: '',
+-        diffCached: '',
+-        lastCommitMessages: '',
++        gitAvailable: false,
++        changedFiles: [],
++        changedFileCount: 0,
++        changedFileScanTruncated: false,
++        repositoryVisibility: 'unknown' as const,
++        fileCount,
++        fileCountIsLowerBound,
++        testFileCount,
+       }
+ 
+   // Load user knowledge files from home directory and merge with any provided ones
