@@ -92,7 +92,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /href="\/in-flight\/"/)
     assert.match(indexHtml, /class="diff-viewer" data-sha=/)
     assert.match(indexHtml, /View inline diff/)
-    assert.match(indexHtml, /class="sync-badge"/)
+    assert.doesNotMatch(indexHtml, /class="sync-badge"/)
     assert.match(indexHtml, /class="sync-val"/)
     assert.match(indexHtml, /NEXT SYNC:/)
 
