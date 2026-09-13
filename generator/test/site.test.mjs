@@ -127,11 +127,20 @@ test('buildSite generates valid static site output', async () => {
     assert.equal(searchIdx[0].m, undefined)
     assert.equal(searchIdx[0].ai, undefined)
 
-    // Verify feed.xml contains atom:link, stylesheet, and lastBuildDate
+    // Verify feed.xml contains atom:link, stylesheet, and lastBuildDate with correct domain
     const feedXml = await readFile(join(tmpDist, 'feed.xml'), 'utf8')
     assert.match(feedXml, /<atom:link /)
     assert.match(feedXml, /<lastBuildDate>/)
     assert.match(feedXml, /xml-stylesheet type="text\/xsl" href="\/feed\.xsl"/)
+    assert.match(feedXml, /https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/day\//)
+    assert.doesNotMatch(feedXml, /pages\.dev/)
+
+    // Verify sitemap.xml and robots.txt use active domain
+    const sitemapXml = await readFile(join(tmpDist, 'sitemap.xml'), 'utf8')
+    assert.match(sitemapXml, /https:\/\/freebuff-changelog\.nordicnode\.workers\.dev/)
+    assert.doesNotMatch(sitemapXml, /pages\.dev/)
+    const robotsTxt = await readFile(join(tmpDist, 'robots.txt'), 'utf8')
+    assert.match(robotsTxt, /https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/sitemap\.xml/)
 
     // Verify feed.xsl exists and sets data-theme="dark"
     const feedXsl = await readFile(join(tmpDist, 'feed.xsl'), 'utf8')
