@@ -1494,7 +1494,7 @@ export async function buildSite ({ changelog, openPrs, dist, diffs = new Map() }
   const daysHtml = idx.map(d =>
     `<section class="day" id="${d.day}">
 <div class="day-line">
-  <h2><time datetime="${d.day}">== [ ${esc(fmtDateHuman(d.day))} ] ==</time></h2>
+  <h2><time datetime="${d.day}">[ ${esc(fmtDateHuman(d.day))} ]</time></h2>
   <span class="day-count">${d.entries.length} change${d.entries.length === 1 ? '' : 's'}</span>
 </div>
 ${d.entries.map(e => {

@@ -95,6 +95,8 @@ test('buildSite generates valid static site output', async () => {
     assert.doesNotMatch(indexHtml, /class="sync-badge"/)
     assert.match(indexHtml, /class="sync-val"/)
     assert.match(indexHtml, /NEXT SYNC:/)
+    assert.match(indexHtml, /<h2><time datetime="2026-09-13">\[ Sep 13, 2026 \]<\/time><\/h2>/)
+    assert.doesNotMatch(indexHtml, /== \[ Sep 13, 2026 \] ==/)
 
     // Verify collapsible entries: latest commit is open by default, previous commit is collapsed
     assert.match(indexHtml, /<details class="entry major" id="bbbb11112222" open>/)
