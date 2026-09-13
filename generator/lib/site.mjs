@@ -248,19 +248,41 @@ nav.term-nav a.active{
   border:1px solid var(--term-border);
   border-left:3px solid var(--term-border);
   border-radius:2px;
-  padding:14px 16px;
   margin:10px 0;
   transition:border-color .12s ease;
+  overflow:hidden;
 }
 .entry:hover{
   border-color:var(--term-border-strong);
 }
+.entry.has-ai{
+  border-left-color:rgba(88,166,255,0.7);
+}
 .entry.major{
-  border-left-color:var(--txt-dim);
+  border-left-color:var(--term-amber);
 }
 .entry.notable{
   border-left-color:var(--term-border-strong);
 }
+
+.entry-summary{
+  list-style:none;
+  cursor:pointer;
+  padding:12px 14px;
+  user-select:none;
+  display:block;
+  outline:none;
+}
+.entry-summary::-webkit-details-marker{
+  display:none;
+}
+.entry-summary::marker{
+  display:none;
+}
+.entry-summary:hover{
+  background:rgba(255,255,255,0.02);
+}
+
 .entry-meta-top{
   display:flex;
   align-items:center;
@@ -269,6 +291,22 @@ nav.term-nav a.active{
   color:var(--txt-subtle);
   margin-bottom:6px;
   flex-wrap:wrap;
+}
+.entry-arrow{
+  display:inline-block;
+  font-size:.8rem;
+  color:var(--txt-subtle);
+  font-weight:700;
+  transition:transform .12s ease, color .12s ease;
+  user-select:none;
+  margin-right:2px;
+}
+.entry[open] > .entry-summary .entry-arrow{
+  transform:rotate(90deg);
+  color:var(--term-cyan);
+}
+.entry-summary:hover .entry-arrow{
+  color:var(--txt);
 }
 .commit-ref{
   color:var(--txt-subtle);
@@ -300,6 +338,20 @@ nav.term-nav a.active{
   border:1px solid var(--term-border);
   color:var(--txt-subtle);
   text-decoration:none;
+}
+.badge.ai{
+  color:var(--term-cyan);
+  border-color:rgba(88,166,255,0.45);
+  background:rgba(88,166,255,0.08);
+  font-weight:700;
+  letter-spacing:.03em;
+  display:inline-flex;
+  align-items:center;
+  gap:3px;
+}
+.badge.ai .ai-sym{
+  font-size:.78em;
+  color:var(--term-cyan);
 }
 .badge.maj{
   color:var(--term-amber);
@@ -340,12 +392,17 @@ nav.term-nav a.active{
 .permalink:hover{
   color:var(--term-cyan);
 }
-.entry h3{
-  margin:0 0 8px;
+
+.entry h3.entry-title,.entry h3{
+  margin:0;
   font-size:1.02rem;
   font-weight:700;
   line-height:1.45;
   color:var(--txt);
+  transition:color .12s ease;
+}
+.entry-summary:hover .entry-title{
+  color:var(--term-cyan);
 }
 .entry h3 a{
   color:var(--txt);
@@ -354,6 +411,19 @@ nav.term-nav a.active{
 .entry h3 a:hover{
   color:var(--term-cyan);
   text-decoration:underline;
+}
+
+.entry-body{
+  padding:12px 16px 14px;
+  border-top:1px solid rgba(48,54,61,0.5);
+}
+.meta-ai{
+  color:var(--term-cyan);
+  font-size:.72rem;
+  display:inline-flex;
+  align-items:center;
+  gap:3px;
+  letter-spacing:.02em;
 }
 
 .model-swap{
@@ -941,6 +1011,18 @@ ${body}
   </div>
 </footer>
 <script>
+function openHashTarget() {
+  const hash = window.location.hash;
+  if (!hash) return;
+  const target = document.querySelector(hash);
+  if (target && target.tagName === 'DETAILS' && target.classList.contains('entry')) {
+    target.open = true;
+    try { target.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (_) {}
+  }
+}
+window.addEventListener('DOMContentLoaded', openHashTarget);
+window.addEventListener('hashchange', openHashTarget);
+
 document.addEventListener('keydown', (e) => {
   if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
     e.preventDefault();
@@ -1063,10 +1145,13 @@ function renderDiff(container, text, sha) {
 
 function badges (e) {
   const b = []
+  if (e.ai?.title || e.ai?.summary) {
+    b.push(`<span class="badge ai" title="AI summary generated from git diff (${esc(e.ai.model || '')})"><span class="ai-sym">&#x25c8;</span> AI</span>`)
+  }
   if (e.significance === 'major') b.push('<span class="badge maj">[MAJOR]</span>')
   else if (e.significance === 'notable') b.push('<span class="badge not">[NOTABLE]</span>')
   if (e.modelChanges) b.push('<span class="badge model">[MODEL]</span>')
-  if (e.version) b.push(`<a class="badge ver" href="/release/${e.version}/">[v${e.version}]</a>`)
+  if (e.version) b.push(`<a class="badge ver" href="/release/${e.version}/" onclick="event.stopPropagation()">[v${e.version}]</a>`)
   if (e.kind === 'community' && e.pr) b.push(`<span class="badge">[PR #${e.pr}]</span>`)
   b.push(`<span class="badge cat">[${esc(e.category)}]</span>`)
   return b.join('')
@@ -1122,7 +1207,7 @@ function formatDiffHtml (diffText) {
   return out.join('')
 }
 
-function entryCard (e, diffs) {
+function entryCard (e, diffs, isExpanded = false) {
   const t = fmtDateHuman(e.date)
   const time = e.date.slice(11, 16)
   const anchor = e.sha.slice(0, 12)
@@ -1161,14 +1246,20 @@ function entryCard (e, diffs) {
 <div class="diff-body"><span class="diff-loading">Loading diff…</span></div>
 </details>`
   }
-  return `<article class="entry ${e.significance}" id="${anchor}">
-<div class="entry-meta-top">
-  <span class="commit-ref">commit <a href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" target="_blank" rel="noopener">${anchor}</a></span>
-  <span class="entry-utc">${esc(time)} UTC</span>
-  <div class="badges">${badges(e)}</div>
-  <a class="permalink" href="/day/${e.day}/#${anchor}" title="Permalink" aria-label="Permalink">#</a>
-</div>
-<h3><a href="/day/${e.day}/#${anchor}">${title}</a></h3>
+  const hasAi = Boolean(e.ai?.title || e.ai?.summary)
+  const aiClass = hasAi ? ' has-ai' : ''
+  return `<details class="entry ${e.significance}${aiClass}" id="${anchor}"${isExpanded ? ' open' : ''}>
+<summary class="entry-summary">
+  <div class="entry-meta-top">
+    <span class="entry-arrow">&gt;</span>
+    <span class="commit-ref">commit <a href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${anchor}</a></span>
+    <span class="entry-utc">${esc(time)} UTC</span>
+    <div class="badges">${badges(e)}</div>
+    <a class="permalink" href="/day/${e.day}/#${anchor}" title="Permalink" aria-label="Permalink" onclick="event.stopPropagation()">#</a>
+  </div>
+  <h3 class="entry-title">${title}</h3>
+</summary>
+<div class="entry-body">
 ${modelDiffLine(e)}
 <div class="summary">${miniMd(e.ai?.summary || e.summary)}</div>
 ${e.facts?.length ? `<ul class="facts">${e.facts.slice(0, 3).map(f => `<li>${miniMd(f)}</li>`).join('')}</ul>` : ''}
@@ -1177,11 +1268,14 @@ ${diffViewer}
 <div class="metarow">
   <span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i> &middot; ${e.files.total} file${e.files.total === 1 ? '' : 's'}</span>
   <div class="meta-links">
+    ${hasAi ? `<span class="meta-ai" title="AI-grounded diff analysis (${esc(e.ai.model || '')})"><span class="ai-sym">&#x25c8;</span> ai</span>` : ''}
     ${e.sourceSha ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" rel="noopener" target="_blank">snapshot</a>` : ''}
     ${e.pr ? `<a class="meta-link" href="${esc(e.prUrl || '')}" rel="noopener" target="_blank">PR #${e.pr}</a>` : ''}
     ${e.compareUrl ? `<a class="meta-link" href="${esc(e.compareUrl)}" rel="noopener" target="_blank">compare</a>` : e.url ? `<a class="meta-link" href="${esc(e.url)}" rel="noopener" target="_blank">commit</a>` : ''}
   </div>
-</div></article>`
+</div>
+</div>
+</details>`
 }
 
 function deriveTitleSafe (e) {
@@ -1244,13 +1338,18 @@ export async function buildSite ({ changelog, openPrs, dist, diffs = new Map() }
   </div>
 </section>`
 
+  let isFirstIndex = true
   const daysHtml = idx.map(d =>
     `<section class="day" id="${d.day}">
 <div class="day-line">
   <h2><time datetime="${d.day}">== [ ${esc(fmtDateHuman(d.day))} ] ==</time></h2>
   <span class="day-count">${d.entries.length} change${d.entries.length === 1 ? '' : 's'}</span>
 </div>
-${d.entries.map(e => entryCard(e, diffs)).join('\n')}</section>`).join('')
+${d.entries.map(e => {
+  const open = isFirstIndex
+  isFirstIndex = false
+  return entryCard(e, diffs, open)
+}).join('\n')}</section>`).join('')
 
   await write(dist, 'index.html', layout({ title: 'Home', path: '/', body: hero + daysHtml +
     `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss feed ]</a></div>` }))
@@ -1269,7 +1368,7 @@ ${d.entries.map(e => entryCard(e, diffs)).join('\n')}</section>`).join('')
       desc: `${d.entries.length} Freebuff changes on ${d.day}`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">DAILY_LOG :: ${esc(d.day)}</span><span>${d.entries.length} entries</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Reconstructed public snapshot commits pushed to CodebuffAI/freebuff on this date.</p></div></section>` +
         dayPager +
-        `<section class="day">${d.entries.map(e => entryCard(e, diffs)).join('\n')}</section>` +
+        `<section class="day">${d.entries.map((e, entryIdx) => entryCard(e, diffs, entryIdx === 0)).join('\n')}</section>` +
         dayPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/">&larr; [latest]</a> &middot; <a href="/archive/">[archive]</a></p>`
     }))
@@ -1295,7 +1394,7 @@ ${d.entries.map(e => entryCard(e, diffs)).join('\n')}</section>`).join('')
       desc: `Freebuff v${rel.version} — ${mine.length} changes since the previous release.`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(rel.version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Freebuff v${esc(rel.version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p></div></section>` +
         relPager +
-        `<section class="day">${[rel, ...mine].map(e => entryCard(e, diffs)).join('\n')}</section>` +
+        `<section class="day">${[rel, ...mine].map((e, entryIdx) => entryCard(e, diffs, entryIdx === 0)).join('\n')}</section>` +
         relPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/archive/#releases">&larr; [all releases]</a> &middot; <a href="/">[latest]</a></p>`
     }))
@@ -1359,7 +1458,8 @@ ${yearSections}`
     t: (e.ai?.title || e.title || deriveTitleSafe(e)).slice(0, 90),
     c: e.category,
     s: e.sha.slice(0, 12),
-    a: e.significance
+    a: e.significance,
+    ai: (e.ai?.title || e.ai?.summary) ? 1 : 0
   }))
   await write(dist, 'search-index.json', JSON.stringify(idxJson))
   await write(dist, 'search/index.html', layout({
@@ -1378,6 +1478,7 @@ ${yearSections}`
     <div class="filter-chips">
       <span class="filter-lbl">FLAGS:</span>
       <button class="filter-chip active" data-filter="">--all</button>
+      <button class="filter-chip" data-filter="ai">--ai</button>
       <button class="filter-chip" data-filter="model">--models</button>
       <button class="filter-chip" data-filter="major">--major</button>
       <button class="filter-chip" data-filter="release">--releases</button>
@@ -1403,7 +1504,7 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
     if (!v) { h.innerHTML = ''; cnt.textContent = ''; return; }
     const w = v.split(/\\s+/);
     const hits = ix.filter(e => {
-      const s = (e.t + ' ' + e.c + ' ' + (e.a || '')).toLowerCase();
+      const s = (e.t + ' ' + e.c + ' ' + (e.a || '') + (e.ai ? ' ai' : '')).toLowerCase();
       return w.every(x => s.includes(x));
     }).slice(0, 200);
     
@@ -1411,10 +1512,11 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
     h.innerHTML = hits.map(e => {
       const u = '/day/' + e.d + '/#' + e.s;
       const sigTag = e.a === 'major' ? '<span class="badge maj">[MAJOR]</span>' : (e.a === 'notable' ? '<span class="badge not">[NOTABLE]</span>' : '');
-      return '<article class="entry ' + (e.a || '') + '"><div class="entry-meta-top">' +
+      const aiTag = e.ai ? '<span class="badge ai" title="AI summary"><span class="ai-sym">&#x25c8;</span> AI</span>' : '';
+      return '<article class="entry ' + (e.a || '') + (e.ai ? ' has-ai' : '') + '"><div class="entry-meta-top">' +
         '<span class="commit-ref">commit ' + esc(e.s) + '</span>' +
         '<span class="entry-utc">' + esc(e.d) + '</span>' +
-        '<div class="badges"><span class="badge cat">[' + esc(e.c) + ']</span>' + sigTag + '</div>' +
+        '<div class="badges">' + aiTag + '<span class="badge cat">[' + esc(e.c) + ']</span>' + sigTag + '</div>' +
         '</div>' +
         '<h3><a href="' + u + '">' + esc(e.t) + '</a></h3>' +
         '</article>';

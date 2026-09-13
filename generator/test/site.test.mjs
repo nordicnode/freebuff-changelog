@@ -58,8 +58,9 @@ test('buildSite generates valid static site output', async () => {
           files: { total: 2, meaningful: 1, rawMeaningful: 2, testOnly: false, added: [], removed: [], renamed: [], modified: ['README.md'] },
           stats: { additions: 5, deletions: 5 },
           facts: ['New high-speed endpoint enabled.'],
-          summary: 'Model catalog: Muse Spark 1.3 replaced Muse Spark 1.2 in the free model picker.',
+          summary: 'Model catalog: Muse Spark 1.3 replaced Muse Spark 1.2 in the free model lineup.',
           title: 'Muse Spark 1.3 replaces Muse Spark 1.2 in the free model lineup',
+          ai: { title: 'Muse Spark 1.3 replaces Muse Spark 1.2', summary: 'AI summarized diff', model: 'mock-model' },
           category: 'Model Catalog',
           significance: 'major',
           day: '2026-09-13',
@@ -92,6 +93,13 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /class="diff-viewer" data-sha=/)
     assert.match(indexHtml, /View inline diff/)
 
+    // Verify collapsible entries: latest commit is open by default, previous commit is collapsed
+    assert.match(indexHtml, /<details class="entry major has-ai" id="bbbb11112222" open>/)
+    assert.match(indexHtml, /<details class="entry major" id="aaaa11112222">/)
+    assert.doesNotMatch(indexHtml, /<details class="entry major" id="aaaa11112222" open>/)
+    assert.match(indexHtml, /class="entry-summary"/)
+    assert.match(indexHtml, /class="badge ai"/)
+
     // Verify day pages contain prev/next pager
     const dayHtml = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
     assert.match(dayHtml, /class="pager"/)
@@ -106,12 +114,14 @@ test('buildSite generates valid static site output', async () => {
     assert.doesNotMatch(inFlightHtml, /undefined/)
     assert.match(inFlightHtml, /#999 by contributor/)
 
-    // Verify search index is compact (no redundant u field)
+    // Verify search index includes compact fields and ai indicator
     const searchIdx = JSON.parse(await readFile(join(tmpDist, 'search-index.json'), 'utf8'))
     assert.equal(searchIdx.length, 2)
     assert.equal(searchIdx[0].u, undefined)
     assert.ok(searchIdx[0].s)
     assert.ok(searchIdx[0].d)
+    assert.equal(searchIdx[0].ai, 1)
+    assert.equal(searchIdx[1].ai, 0)
 
     // Verify feed.xml contains atom:link and lastBuildDate
     const feedXml = await readFile(join(tmpDist, 'feed.xml'), 'utf8')
