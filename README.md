@@ -1,4 +1,4 @@
-# Freebuff Changes — unofficial changelog generator + static site
+# Freebuff Changelog — unofficial changelog generator + static site
 
 Tracks what actually ships in [CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff),
 a project whose public repo is a **mirror**: a bot pushes opaque
