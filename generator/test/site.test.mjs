@@ -142,6 +142,12 @@ test('buildSite generates valid static site output', async () => {
     // Verify 404 contains noindex
     const notFoundHtml = await readFile(join(tmpDist, '404.html'), 'utf8')
     assert.match(notFoundHtml, /<meta name="robots" content="noindex">/)
+
+    // Verify about page contains extended tracking and Qwen 3.8 Flash
+    const aboutHtml = await readFile(join(tmpDist, 'about/index.html'), 'utf8')
+    assert.match(aboutHtml, /WHAT WE TRACK/)
+    assert.match(aboutHtml, /Qwen 3\.8 Flash/)
+    assert.match(aboutHtml, /Subsystems &amp; Areas:/)
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }

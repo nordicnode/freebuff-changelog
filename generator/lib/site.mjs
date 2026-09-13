@@ -1552,10 +1552,18 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
       <p>This project inspects the code diff behind every snapshot (${entries.length.toLocaleString()} tracked changes from ${scannedCount.toLocaleString()} scanned commits) to extract meaningful updates so developers and users always know what is new.</p>
       
       <h4>WHAT WE TRACK</h4>
-      <p><strong>Model Lineup:</strong> Additions, retirements, and swaps in the free model catalog.<br>
-      <strong>Releases:</strong> CLI version bumps (<code>v1.0.x</code>) and feature highlights.<br>
-      <strong>Commands:</strong> New slash commands, CLI flags, and workflow capabilities.<br>
-      <strong>Code Diffs:</strong> Clean unified diffs with syntax highlighting so you can inspect the exact code changes.</p>
+      <p><strong>Model Lineup:</strong> Additions, retirements, swaps, and provider changes in the free model catalog.<br>
+      <strong>Releases &amp; Versions:</strong> CLI and runtime version bumps (<code>v1.0.x</code>) and milestone release highlights.<br>
+      <strong>Commands &amp; Flags:</strong> New slash commands (<code>/commit</code>, <code>/plan</code>, etc.), CLI flags, arguments, and workflow capabilities.<br>
+      <strong>Subsystems &amp; Areas:</strong> Automatic categorization across 9 areas: <em>AI &amp; Agents</em>, <em>Models</em>, <em>UI &amp; CLI</em>, <em>Performance</em>, <em>Testing</em>, <em>Core</em>, <em>Packaging</em>, <em>Docs</em>, and <em>Internal</em>.<br>
+      <strong>Significance &amp; Impact:</strong> Tiering every commit as <code>major</code> (new models/features/releases), <code>notable</code> (UI changes, new files, large churn), or <code>minor</code> (internal refactors, types, dependencies).<br>
+      <strong>Code Churn &amp; Files:</strong> Additions (<code>+</code>) and deletions (<code>−</code>) across modified, added, renamed, or deleted files—distinguishing real code changes from massive generated lockfiles.<br>
+      <strong>Clean Code Diffs:</strong> Pre-rendered unified diffs with syntax highlighting, stripping out lockfile noise and pure test hunks.<br>
+      <strong>In-Flight PRs:</strong> Active community pull requests and drafts on upstream Freebuff ahead of merges with live diffstats.<br>
+      <strong>Upstream Attribution:</strong> Unmasking opaque <em>"Sync public snapshot"</em> commits to link back to the exact source commit SHA and author.</p>
+      
+      <h4>AI ENRICHMENT (QWEN 3.8 FLASH)</h4>
+      <p>To turn raw unified diffs into clear, human-readable entries, we use <strong>Qwen 3.8 Flash</strong> to synthesize commit diffs and deterministic metadata into concise, accurate summaries. The model is constrained strictly to verified code changes from the diff—never inventing features, versions, or filenames—ensuring complete technical accuracy.</p>
       
       <h4>VERIFIABLE & OPEN</h4>
       <p>Every entry links directly to the underlying GitHub commit and snapshot compare view for complete ground truth. Stay up to date via the <a href="/feed.xml">RSS feed</a>, explore historical changes in the <a href="/archive/">Archive</a>, or inspect upcoming community contributions on the <a href="/in-flight/">In-Flight PRs</a> page.</p>
