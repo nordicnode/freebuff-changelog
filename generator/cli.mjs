@@ -268,7 +268,7 @@ async function cmdCatchUp (argv) {
       await git(['pull', '--rebase', 'origin', currentBranch], ROOT, { allowFail: true })
       await git(['add', 'data'], ROOT)
       const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 16)
-      await git(['commit', '-m', `data: LLM backfill (${nowUtc} UTC) [skip ci]`], ROOT)
+      await git(['commit', '-m', `data: LLM backfill (${nowUtc} UTC)`], ROOT)
       await git(['push', 'origin', currentBranch], ROOT)
       log('pushed to origin — Cloudflare Pages will deploy automatically.')
     } else {
