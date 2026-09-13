@@ -339,19 +339,12 @@ nav.term-nav a.active{
   color:var(--txt-subtle);
   text-decoration:none;
 }
-.badge.ai{
-  color:var(--term-cyan);
-  border-color:rgba(88,166,255,0.45);
-  background:rgba(88,166,255,0.08);
-  font-weight:700;
-  letter-spacing:.03em;
-  display:inline-flex;
-  align-items:center;
-  gap:3px;
-}
-.badge.ai .ai-sym{
-  font-size:.78em;
-  color:var(--term-cyan);
+.ai-indicator{
+  font-size:.73rem;
+  color:var(--txt-subtle);
+  font-weight:400;
+  letter-spacing:.01em;
+  white-space:nowrap;
 }
 .badge.maj{
   color:var(--term-amber);
@@ -416,14 +409,6 @@ nav.term-nav a.active{
 .entry-body{
   padding:12px 16px 14px;
   border-top:1px solid rgba(48,54,61,0.5);
-}
-.meta-ai{
-  color:var(--term-cyan);
-  font-size:.72rem;
-  display:inline-flex;
-  align-items:center;
-  gap:3px;
-  letter-spacing:.02em;
 }
 
 .model-swap{
@@ -1143,11 +1128,22 @@ function renderDiff(container, text, sha) {
 </body></html>`
 }
 
+function formatAiModel (model) {
+  if (!model) return 'Qwen 3.8 Flash'
+  const raw = String(model).replace(/^[^/]+\//, '')
+  if (/^qwen3\.8-flash$/i.test(raw)) return 'Qwen 3.8 Flash'
+  if (/^qwen2\.5-coder/i.test(raw)) return 'Qwen 2.5 Coder'
+  if (/^claude-3-5-sonnet/i.test(raw)) return 'Claude 3.5 Sonnet'
+  if (/^gpt-4o-mini/i.test(raw)) return 'GPT-4o Mini'
+  if (/^gpt-4o/i.test(raw)) return 'GPT-4o'
+  return raw
+    .split(/[-_]/)
+    .map(w => w ? w[0].toUpperCase() + w.slice(1) : '')
+    .join(' ')
+}
+
 function badges (e) {
   const b = []
-  if (e.ai?.title || e.ai?.summary) {
-    b.push(`<span class="badge ai" title="AI summary generated from git diff (${esc(e.ai.model || '')})"><span class="ai-sym">&#x25c8;</span> AI</span>`)
-  }
   if (e.significance === 'major') b.push('<span class="badge maj">[MAJOR]</span>')
   else if (e.significance === 'notable') b.push('<span class="badge not">[NOTABLE]</span>')
   if (e.modelChanges) b.push('<span class="badge model">[MODEL]</span>')
@@ -1248,6 +1244,7 @@ function entryCard (e, diffs, isExpanded = false) {
   }
   const hasAi = Boolean(e.ai?.title || e.ai?.summary)
   const aiClass = hasAi ? ' has-ai' : ''
+  const aiIndicator = hasAi ? `<span class="ai-indicator">Summarized by ${esc(formatAiModel(e.ai.model))}</span>` : ''
   return `<details class="entry ${e.significance}${aiClass}" id="${anchor}"${isExpanded ? ' open' : ''}>
 <summary class="entry-summary">
   <div class="entry-meta-top">
@@ -1255,6 +1252,7 @@ function entryCard (e, diffs, isExpanded = false) {
     <span class="commit-ref">commit <a href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${anchor}</a></span>
     <span class="entry-utc">${esc(time)} UTC</span>
     <div class="badges">${badges(e)}</div>
+    ${aiIndicator}
     <a class="permalink" href="/day/${e.day}/#${anchor}" title="Permalink" aria-label="Permalink" onclick="event.stopPropagation()">#</a>
   </div>
   <h3 class="entry-title">${title}</h3>
@@ -1268,7 +1266,6 @@ ${diffViewer}
 <div class="metarow">
   <span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i> &middot; ${e.files.total} file${e.files.total === 1 ? '' : 's'}</span>
   <div class="meta-links">
-    ${hasAi ? `<span class="meta-ai" title="AI-grounded diff analysis (${esc(e.ai.model || '')})"><span class="ai-sym">&#x25c8;</span> ai</span>` : ''}
     ${e.sourceSha ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" rel="noopener" target="_blank">snapshot</a>` : ''}
     ${e.pr ? `<a class="meta-link" href="${esc(e.prUrl || '')}" rel="noopener" target="_blank">PR #${e.pr}</a>` : ''}
     ${e.compareUrl ? `<a class="meta-link" href="${esc(e.compareUrl)}" rel="noopener" target="_blank">compare</a>` : e.url ? `<a class="meta-link" href="${esc(e.url)}" rel="noopener" target="_blank">commit</a>` : ''}
@@ -1459,7 +1456,7 @@ ${yearSections}`
     c: e.category,
     s: e.sha.slice(0, 12),
     a: e.significance,
-    ai: (e.ai?.title || e.ai?.summary) ? 1 : 0
+    m: (e.ai?.title || e.ai?.summary) ? formatAiModel(e.ai?.model) : undefined
   }))
   await write(dist, 'search-index.json', JSON.stringify(idxJson))
   await write(dist, 'search/index.html', layout({
@@ -1504,7 +1501,7 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
     if (!v) { h.innerHTML = ''; cnt.textContent = ''; return; }
     const w = v.split(/\\s+/);
     const hits = ix.filter(e => {
-      const s = (e.t + ' ' + e.c + ' ' + (e.a || '') + (e.ai ? ' ai' : '')).toLowerCase();
+      const s = (e.t + ' ' + e.c + ' ' + (e.a || '') + (e.m ? ' ai summarized by ' + e.m : '')).toLowerCase();
       return w.every(x => s.includes(x));
     }).slice(0, 200);
     
@@ -1512,11 +1509,12 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
     h.innerHTML = hits.map(e => {
       const u = '/day/' + e.d + '/#' + e.s;
       const sigTag = e.a === 'major' ? '<span class="badge maj">[MAJOR]</span>' : (e.a === 'notable' ? '<span class="badge not">[NOTABLE]</span>' : '');
-      const aiTag = e.ai ? '<span class="badge ai" title="AI summary"><span class="ai-sym">&#x25c8;</span> AI</span>' : '';
-      return '<article class="entry ' + (e.a || '') + (e.ai ? ' has-ai' : '') + '"><div class="entry-meta-top">' +
+      const aiIndicator = e.m ? ('<span class="ai-indicator">Summarized by ' + esc(e.m) + '</span>') : '';
+      return '<article class="entry ' + (e.a || '') + (e.m ? ' has-ai' : '') + '"><div class="entry-meta-top">' +
         '<span class="commit-ref">commit ' + esc(e.s) + '</span>' +
         '<span class="entry-utc">' + esc(e.d) + '</span>' +
-        '<div class="badges">' + aiTag + '<span class="badge cat">[' + esc(e.c) + ']</span>' + sigTag + '</div>' +
+        '<div class="badges"><span class="badge cat">[' + esc(e.c) + ']</span>' + sigTag + '</div>' +
+        aiIndicator +
         '</div>' +
         '<h3><a href="' + u + '">' + esc(e.t) + '</a></h3>' +
         '</article>';
