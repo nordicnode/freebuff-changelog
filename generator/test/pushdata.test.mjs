@@ -134,3 +134,50 @@ test('refreshDiffFlags reconciles hasDiff with the files actually on disk', asyn
   assert.equal(community.hasDiff, undefined, 'community rows never had inline diffs')
   assert.equal(fixed, 2)
 })
+
+// The push-recovery path used to run a worktree-wide `git reset --hard`: on a
+// rejected push whose rebase conflicts, it moved HEAD onto origin and threw away
+// every *other* uncommitted file in the repository. That is not a sync failure to
+// absorb, it is destroying a human's work — it silently cost an afternoon of
+// edits in this repo. Recovery may only touch the derived data this cycle owns.
+test('conflicting push recovery never discards unrelated uncommitted work', async () => {
+  const { remote, clone } = await fixture()
+  const daemon = await clone('conflicted')
+  const analyze = await clone('analysis')
+
+  // A tracked file the sync does not own, edited locally and left uncommitted:
+  // exactly what the old recovery path deleted.
+  await writeFile(`${daemon}/generator-note.txt`, 'work in progress\n')
+  git(daemon, 'add', 'generator-note.txt')
+  git(daemon, 'commit', '-qm', 'track a file the sync does not own')
+  git(daemon, 'push', '-q', 'origin', 'HEAD:main')
+  await writeFile(`${daemon}/generator-note.txt`, 'uncommitted edit that must survive\n')
+  git(analyze, 'pull', '-q', '--rebase', 'origin', 'main')
+
+  // Both writers then move the same line of the same derived file, so the rebase
+  // cannot merge it — which is what drives the recovery branch.
+  await writeDoc(analyze, doc('2026-09-14T15:00:00.000Z', 'hA', [entry('a'), entry('b'), entry('c')]))
+  git(analyze, 'add', '-A')
+  git(analyze, 'commit', '-qm', 'data: update changelog')
+  git(analyze, 'push', '-q', 'origin', 'HEAD:main')
+
+  const snapshot = doc('2026-09-14T11:21:46.000Z', 'hD', [
+    entry('a', { v: 5, title: 'Adds gemini-3', summary: 'Swaps the default model.' }),
+    entry('b')
+  ])
+  await writeDoc(daemon, snapshot)
+  const pushed = await commitAndPushData({
+    root: daemon,
+    dataDir: `${daemon}/data`,
+    message: 'data: LLM backfill',
+    overrides: { [`${daemon}/data/changelog.json`]: snapshot }
+  })
+  assert.equal(pushed, true, 'the cycle still converges onto origin and pushes')
+  assert.equal(await readFile(`${daemon}/generator-note.txt`, 'utf8'), 'uncommitted edit that must survive\n',
+    'recovery must not reset files the sync does not own')
+
+  const landed = readOriginDoc(remote)
+  assert.ok(landed.entries.some(e => e.sha === 'c'), 'the other writer keeps its entries')
+  assert.equal(landed.headSha, 'hA', 'and origin stays authoritative for headSha through the recovery')
+  assert.equal(landed.entries.find(e => e.sha === 'a').ai?.title, 'Adds gemini-3', 'this cycle still lands its work')
+})

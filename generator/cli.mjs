@@ -6,7 +6,7 @@
 //   node generator/cli.mjs preview [port]
 import { mkdir, readFile, cp } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import { resolve, dirname } from 'node:path'
+import { resolve, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { git, readJson, writeJson, writeText, log, ymd, pruneDiffs, pool, withLock } from './lib/util.mjs'
 import { capturePendingWrites, persistMerged } from './lib/mergedata.mjs'
@@ -389,6 +389,9 @@ async function realignOrigin (branch) {
  */
 export async function commitAndPushData ({ message, overrides = {}, attempts = 3, root = ROOT, dataDir = DATA } = {}) {
   const branch = await currentBranch(root)
+  // Where this cycle's derived files live, relative to the worktree: the only
+  // path the conflict recovery is allowed to overwrite.
+  const dataRel = relative(root, resolve(dataDir)) || 'data'
   const pending = await capturePendingWrites(dataDir, overrides)
   await persistMerged(pending)
 
@@ -415,7 +418,16 @@ export async function commitAndPushData ({ message, overrides = {}, attempts = 3
       // snapshot on top. Nothing from either writer is lost and HEAD ends up
       // matching origin exactly, so the next attempt starts clean.
       await git(['rebase', '--abort'], root, { allowFail: true })
-      await git(['reset', '--hard', `origin/${branch}`], root, { allowFail: true })
+      // Two separate jobs, and one `reset --hard` was doing both badly. HEAD must
+      // land on origin, and data/ on disk must become origin's copy — that is the
+      // version persistMerged merges against, so skipping it would quietly drop
+      // the other writer's entries and move headSha backward. Neither job justifies
+      // touching the rest of the worktree: this loop runs beside a human editing
+      // this repository, and a worktree-wide hard reset also throws away their
+      // uncommitted files. Losing that is not a sync bug to absorb, it is data
+      // loss. So: move HEAD with --mixed, then restore only the paths owned here.
+      await git(['reset', '--mixed', `origin/${branch}`], root, { allowFail: true })
+      await git(['checkout', `origin/${branch}`, '--', dataRel], root, { allowFail: true })
       await persistMerged(pending)
       log('rebase conflicted: re-applied this cycle onto origin')
       if (await dirtyData(root)) {
