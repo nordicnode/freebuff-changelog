@@ -70,6 +70,79 @@ export function generateFaviconIco () {
   return buf
 }
 
+// OG card (SVG): day label + top-3 entry titles on the dark tile.
+export function ogCardSvg (dayLabel, titles, stats) {
+  const rows = titles.slice(0, 3).map((t, i) =>
+    `<text x="48" y="${300 + i * 56}" font-family="monospace" font-size="30" fill="#e6edf3">${esc(t.slice(0, 52))}</text>`).join('')
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630"><rect width="1200" height="630" fill="#0d1117"/>`
+    + `<rect x="0" y="0" width="1200" height="160" fill="#161b22"/>`
+    + `<text x="48" y="80" font-family="monospace" font-size="40" font-weight="bold" fill="#58a6ff">&gt;_ Freebuff Changelog</text>`
+    + `<text x="48" y="128" font-family="monospace" font-size="28" fill="#9aa4ae">${esc(dayLabel)} · ${esc(stats)}</text>`
+    + rows + `</svg>`
+}
+// Same >_ mark as the favicon at 192 and 512 for the PWA manifest.
+export function generateIconPng (size = 192) {
+  const px = (x, y) => {
+    // Glyph: >_ centered. Bar thickness scales with size.
+    const t = Math.max(2, Math.round(size / 16))
+    const cx = size / 2, cy = size / 2
+    const chev = (x >= cx - size * 0.22 && x < cx - size * 0.22 + t * 3 && Math.abs(y - cy) < size * 0.16)
+      ? Math.abs((x - (cx - size * 0.22)) - Math.abs(y - cy) * 0.9) < t : false
+    const bar = x >= cx + size * 0.02 && x < cx + size * 0.24 && y >= cy + size * 0.10 && y < cy + size * 0.10 + t
+    return chev || bar
+  }
+  const raw = Buffer.alloc(size * size * 4)
+  let o = 0
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      if (px(x, y)) { raw[o++] = 0x58; raw[o++] = 0xa6; raw[o++] = 0xff; raw[o++] = 0xff }
+      else { raw[o++] = 0x0d; raw[o++] = 0x11; raw[o++] = 0x17; raw[o++] = 0xff }
+    }
+  }
+  const crcTable = (() => {
+    const t = new Int32Array(256)
+    for (let n = 0; n < 256; n++) {
+      let c = n
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+      t[n] = c
+    }
+    return t
+  })()
+  const crc = (buf) => {
+    let c = 0xffffffff
+    for (const b of buf) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8)
+    return (c ^ 0xffffffff) >>> 0
+  }
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length)
+    const body = Buffer.concat([Buffer.from(type, 'ascii'), data])
+    const cs = Buffer.alloc(4); cs.writeUInt32BE(crc(body))
+    return Buffer.concat([len, body, cs])
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4)
+  ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0
+  // Raw rows with filter byte 0; zlib stored blocks (no compression).
+  const rows = []
+  for (let y = 0; y < size; y++) rows.push(Buffer.concat([Buffer.from([0]), raw.subarray(y * size * 4, (y + 1) * size * 4)]))
+  const rawData = Buffer.concat(rows)
+  const blocks = []
+  for (let i = 0; i < rawData.length; i += 65535) {
+    const slice = rawData.subarray(i, Math.min(i + 65535, rawData.length))
+    const last = i + 65535 >= rawData.length ? 1 : 0
+    const hdr = Buffer.from([last, slice.length & 0xff, (slice.length >>> 8) & 0xff, (~slice.length) & 0xff, ((~slice.length) >>> 8) & 0xff])
+    blocks.push(Buffer.concat([hdr, slice]))
+  }
+  const zlib = Buffer.concat([Buffer.from([0x78, 0x01]), ...blocks])
+  const adler = (() => {
+    let a = 1, b = 0
+    for (const byte of rawData) { a = (a + byte) % 65521; b = (b + a) % 65521 }
+    const out = Buffer.alloc(4); out.writeUInt32BE(((b << 16) | a) >>> 0); return out
+  })()
+  const idat = Buffer.concat([zlib, adler])
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', idat), chunk('IEND', Buffer.alloc(0))])
+}
+
 export const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="4" fill="#0d1117"/><text x="5" y="22" font-family="monospace" font-weight="bold" font-size="20" fill="#58a6ff">&gt;_</text></svg>`
 
 export const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
@@ -190,4 +263,37 @@ export function feedXml (siteUrl, siteName, siteDesc, generated, name, title, de
     + `<?xml-stylesheet type="text/xsl" href="/feed.xsl"?>`
     + `<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>${esc(title)}</title>`
     + `<link>${siteUrl}</link><atom:link href="${siteUrl}/${name}" rel="self" type="application/rss+xml" /><description>${esc(desc)}</description><language>en</language><lastBuildDate>${new Date(generated).toUTCString()}</lastBuildDate>${items}</channel></rss>`
+}
+
+// JSON Feed 1.1 (jsonfeed.org): same envelope as RSS, reader-friendly JSON.
+export function feedJson (siteUrl, generated, title, desc, feedPath, items) {
+  return JSON.stringify({
+    version: 'https://jsonfeed.org/version/1.1',
+    title,
+    home_page_url: siteUrl,
+    feed_url: `${siteUrl}/${feedPath}`,
+    description: desc,
+    items: items.map(it => ({
+      id: it.id,
+      url: it.url,
+      title: it.title,
+      content_html: it.html,
+      date_published: it.date,
+      tags: it.tags
+    }))
+  })
+}
+
+export function jsonItem (siteUrl, e, titleOf) {
+  const title = titleOf(e)
+  const summary = String(e.ai?.summary || e.summary || '').replace(/[*`#]/g, '')
+  const facts = (e.facts || []).slice(0, 5).map(f => `<li>${esc(String(f)).slice(0, 400)}</li>`).join('')
+  return {
+    id: e.sha,
+    url: `${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}`,
+    title: `[${e.day}] ${title}`,
+    html: facts ? `<p>${esc(summary)}</p><ul>${facts}</ul>` : `<p>${esc(summary)}</p>`,
+    date: new Date(e.date).toISOString(),
+    tags: [e.category, e.significance].filter(Boolean)
+  }
 }

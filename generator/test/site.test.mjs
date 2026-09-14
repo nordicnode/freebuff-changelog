@@ -46,6 +46,25 @@ test('buildSite generates valid static site output', async () => {
         },
         {
           kind: 'sync',
+          sha: 'dddd111122223333444455556666777788889999',
+          url: 'https://github.com/CodebuffAI/freebuff/commit/dddd',
+          compareUrl: 'https://github.com/CodebuffAI/freebuff/compare/cccc...dddd',
+          date: '2026-09-13T11:00:00Z',
+          areas: ['CLI'],
+          modelChanges: null,
+          cmdChanges: null,
+          files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/y.ts'] },
+          stats: { additions: 10, deletions: 2 },
+          facts: [],
+          summary: 'CLI flag tweak.',
+          title: 'CLI flag tweak',
+          category: 'CLI',
+          significance: 'minor',
+          day: '2026-09-13',
+          month: '2026-09'
+        },
+        {
+          kind: 'sync',
           sha: 'bbbb111122223333444455556666777788889999',
           url: 'https://github.com/CodebuffAI/freebuff/commit/bbbb',
           compareUrl: 'https://github.com/CodebuffAI/freebuff/compare/aaaa...bbbb',
@@ -82,7 +101,7 @@ test('buildSite generates valid static site output', async () => {
     ]
 
     const res = await buildSite({ changelog: mockChangelog, openPrs: mockOpenPrs, dist: tmpDist })
-    assert.equal(res.entries, 2)
+    assert.equal(res.entries, 3)
     assert.equal(res.days, 2)
     assert.equal(res.releases, 1)
 
@@ -130,7 +149,7 @@ test('buildSite generates valid static site output', async () => {
     assert.ok(Array.isArray(searchIdx.cats))
     assert.ok(searchIdx.cats.includes('CLI'))
     assert.deepEqual(searchIdx.sigs, ['minor', 'notable', 'major'])
-    assert.equal(searchIdx.ix.length, 2)
+    assert.equal(searchIdx.ix.length, 3)
     assert.ok(Array.isArray(searchIdx.ix[0]))
     assert.equal(searchIdx.ix[0].length, 5)
     const searchHtml = await readFile(join(tmpDist, 'search/index.html'), 'utf8')
@@ -151,7 +170,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /class="sync-age"/)
     assert.match(indexHtml, /data-generated="2026-09-13T12:00:00Z"/)
     const statusApi = JSON.parse(await readFile(join(tmpDist, 'api/status.json'), 'utf8'))
-    assert.equal(statusApi.total, 2)
+    assert.equal(statusApi.total, 3)
     assert.equal(statusApi.openPrs, 1)
     assert.equal(statusApi.models.changes, 1)
     assert.match(await readFile(join(tmpDist, '_headers'), 'utf8'), /\/pr-diffs\/\*/)
@@ -263,6 +282,8 @@ test('buildSite generates valid static site output', async () => {
     const statsHtml = await readFile(join(tmpDist, 'stats/index.html'), 'utf8')
     assert.match(statsHtml, /TELEMETRY/)
     assert.match(statsHtml, /MOST-CHANGED MODELS/)
+    assert.match(statsHtml, /class="spark"/)
+    assert.match(statsHtml, /12-MO TREND/)
     const watchHtml = await readFile(join(tmpDist, 'watch/index.html'), 'utf8')
     assert.match(watchHtml, /WATCHLIST/)
     assert.match(watchHtml, /PER-MODEL RSS/)
@@ -276,6 +297,20 @@ test('buildSite generates valid static site output', async () => {
     assert.match(dayHtml2, /data-mode="split"/)
     // Homepage teasers: older days collapse, first day stays full
     assert.match(indexHtml, /class="entry teaser/)
+    // Day pages carry related links + per-day OG image
+    assert.match(dayHtml2, /RELATED:/)
+    assert.match(dayHtml2, /og\/2026-09-13\.svg/)
+    // JSON feed + manifest + icons + OG cards exist
+    const feedJson = JSON.parse(await readFile(join(tmpDist, 'feed.json'), 'utf8'))
+    assert.equal(feedJson.version, 'https://jsonfeed.org/version/1.1')
+    assert.ok(feedJson.items.length > 0)
+    assert.match(feedJson.items[0].title, /^\[2026-/)
+    const manifest = JSON.parse(await readFile(join(tmpDist, 'manifest.webmanifest'), 'utf8'))
+    assert.equal(manifest.short_name, 'FreebuffLog')
+    assert.match(indexHtml, /rel="manifest"/)
+    assert.match(indexHtml, /rel="apple-touch-icon"/)
+    assert.match(indexHtml, /property="og:image"/)
+    assert.match(indexHtml, /type="application\/feed\+json"/)
     const archiveHtml = await readFile(join(tmpDist, 'archive/index.html'), 'utf8')
     assert.match(archiveHtml, /cat-collapse/)
     const sitemapModels = await readFile(join(tmpDist, 'sitemap-models.xml'), 'utf8')

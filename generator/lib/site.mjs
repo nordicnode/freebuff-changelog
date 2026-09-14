@@ -4,7 +4,7 @@
 import { writeText, writeBinary } from './util.mjs'
 import { escapeHtml as esc, fmtDateHuman, pool } from './util.mjs'
 import { CSS } from './style.mjs'
-import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml } from './feed.mjs'
+import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, ogCardSvg } from './feed.mjs'
 
 const SITE = {
   name: 'Freebuff Changelog',
@@ -24,21 +24,27 @@ function miniMd (text) {
   return s
 }
 
-function layout ({ title, path, body, desc, noindex }) {
+function layout ({ title, path, body, desc, noindex, ogImage }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#0d1117">
 <title>${esc(title)} · ${SITE.name}</title>
 <meta name="description" content="${esc(desc || SITE.desc)}">
 ${noindex ? '<meta name="robots" content="noindex">' : ''}
 <link rel="canonical" href="${abs(path)}">
 <meta property="og:title" content="${esc(title)} · ${SITE.name}">
 <meta property="og:description" content="${esc(desc || SITE.desc)}">
+<meta property="og:image" content="${abs(ogImage || '/favicon.svg')}">
+<meta name="twitter:card" content="summary_large_image">
 <meta property="og:type" content="website"><meta property="og:url" content="${abs(path)}">
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (major + notable)" href="${SITE.url}/feed.xml">
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (models only)" href="${SITE.url}/feed-models.xml">
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (releases only)" href="${SITE.url}/feed-releases.xml">
+<link rel="alternate" type="application/feed+json" title="${SITE.name} (JSON)" href="${SITE.url}/feed.json">
+<link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="apple-touch-icon" href="/icon-192.png">
 <style>${CSS}</style></head><body><main>
 <header class="top">
   <div class="brand">
@@ -383,7 +389,28 @@ function fileChips (e) {
   return chips.length ? `<div class="files">${chips.join('')}</div>` : ''
 }
 
-function entryCard (e, isExpanded = false, mode = 'full') {
+// Related entries: same category, newest first, excluding self. Precomputed
+// per build into a lookup so cards render without scanning 7k entries.
+export function buildRelatedIndex (entries, n = 3) {
+  const byCat = new Map()
+  for (const e of entries) {
+    if (!byCat.has(e.category)) byCat.set(e.category, [])
+    byCat.get(e.category).push(e)
+  }
+  const idx = new Map()
+  for (const e of entries) {
+    idx.set(e.sha, (byCat.get(e.category) || []).filter(x => x.sha !== e.sha).slice(0, n))
+  }
+  return idx
+}
+
+function relatedLine (e, relatedIdx) {
+  const rel = relatedIdx?.get(e.sha) || []
+  if (!rel.length) return ''
+  return `<div class="related">RELATED: ${rel.map(r => `<a href="/day/${r.day}/#${r.sha.slice(0, 12)}">${esc((r.ai?.title || r.title || '').slice(0, 60))}</a>`).join(' · ')}</div>`
+}
+
+function entryCard (e, isExpanded = false, mode = 'full', relatedIdx = null) {
   const time = e.date.slice(11, 16)
   const anchor = e.sha.slice(0, 12)
   const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
@@ -439,6 +466,7 @@ ${modelDiffLine(e)}
 ${e.facts?.length ? `<ul class="facts">${e.facts.slice(0, 3).map(f => `<li>${miniMd(f)}</li>`).join('')}</ul>` : ''}
 ${fileChips(e)}
 ${diffViewer}
+${relatedLine(e, relatedIdx)}
 <div class="metarow">
   <span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i> &middot; ${e.files.total} file${e.files.total === 1 ? '' : 's'}</span>
   <div class="meta-links">
@@ -502,6 +530,7 @@ async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, ''
 export async function buildSite ({ changelog, openPrs, dist }) {
   const entries = [...changelog.entries].reverse() // newest first
   const byDay = groupByDay(entries)
+  const relatedIdx = buildRelatedIndex(entries)
   const modelEntries = entries.filter(e => e.modelChanges)
   const releases = entries.filter(e => e.version)
   const first = entries.at(-1), last = entries[0]
@@ -539,7 +568,7 @@ ${d.entries.map(e => {
   isFirstIndex = false
   // Homepage weight: full bodies only for the first day; older entries
   // collapse to title + facts (full body lives on the day page).
-  return entryCard(e, open, di === 0 ? 'full' : 'teaser')
+  return entryCard(e, open, di === 0 ? 'full' : 'teaser', relatedIdx)
 }).join('\n')}</section>`).join('')
 
   await write(dist, 'index.html', layout({ title: 'Home', path: '/', body: hero + daysHtml +
@@ -559,12 +588,15 @@ ${d.entries.map(e => {
     await write(dist, `day/${d.day}/index.html`, layout({
       title: fmtDateHuman(d.day), path: `/day/${d.day}/`,
       desc: `${d.entries.length} Freebuff changes on ${d.day}`,
+      ogImage: `/og/${d.day}.svg`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">DAILY_LOG :: ${esc(d.day)}</span><span>${d.entries.length} entries</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Reconstructed public snapshot commits pushed to CodebuffAI/freebuff on this date.</p></div></section>` +
         dayPager +
-        `<section class="day">${d.entries.map((e, entryIdx) => entryCard(e, entryIdx === 0)).join('\n')}</section>` +
+        `<section class="day">${d.entries.map((e, entryIdx) => entryCard(e, entryIdx === 0, 'full', relatedIdx)).join('\n')}</section>` +
         dayPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/">&larr; [latest]</a> &middot; <a href="/archive/">[archive]</a></p>`
     }))
+    const ogTitles = d.entries.slice(0, 3).map(e => e.ai?.title || e.title || '')
+    await write(dist, `og/${d.day}.svg`, ogCardSvg(fmtDateHuman(d.day), ogTitles, `${d.entries.length} changes`))
   })
   await pool(dayTasks, 16)
 
@@ -590,7 +622,7 @@ ${d.entries.map(e => {
       desc: `Freebuff v${rel.version}: ${mine.length} changes since the previous release.`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(rel.version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Freebuff v${esc(rel.version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p></div></section>` +
         relPager +
-        `<section class="day">${[rel, ...mine].map((e, entryIdx) => entryCard(e, entryIdx === 0)).join('\n')}</section>` +
+        `<section class="day">${[rel, ...mine].map((e, entryIdx) => entryCard(e, entryIdx === 0, 'full', relatedIdx)).join('\n')}</section>` +
         relPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/archive/#releases">&larr; [all releases]</a> &middot; <a href="/">[latest]</a></p>`
     }))
@@ -724,9 +756,28 @@ ${d.entries.map(e => {
 ${yearSections}`
   }))
 
-  // ----- stats (counts, churn, cadence: zero-dependency CSS bars)
+  // ----- stats (counts, churn, cadence: zero-dependency CSS bars + SVG sparklines)
+  // Sparkline: inline SVG trend (history, not snapshot).
+  const spark = (vals, w = 220, h = 36) => {
+    const max = Math.max(1, ...vals)
+    const pts = vals.map((v, i) => `${(i / Math.max(1, vals.length - 1) * w).toFixed(1)},${(h - 3 - (v / max) * (h - 6)).toFixed(1)}`).join(' ')
+    return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="trend: ${vals.join(', ')}"><polyline points="${pts}" fill="none" stroke="var(--term-cyan)" stroke-width="1.5"/></svg>`
+  }
   const statCats = [...cats.entries()].sort((a, b) => b[1] - a[1])
   const catMax = statCats[0]?.[1] || 1
+  // Per-category monthly history for trend sparklines.
+  const catMonths = new Map()
+  for (const e of entries) {
+    const m = (e.day || '').slice(0, 7)
+    if (!catMonths.has(e.category)) catMonths.set(e.category, new Map())
+    const cm = catMonths.get(e.category)
+    cm.set(m, (cm.get(m) || 0) + 1)
+  }
+  const allMonths = [...new Set(entries.map(e => (e.day || '').slice(0, 7)))].sort().slice(-12)
+  const catSpark = (c) => {
+    const cm = catMonths.get(c) || new Map()
+    return spark(allMonths.map(m => cm.get(m) || 0), 120, 22)
+  }
   const churnByArea = new Map()
   for (const e of entries) {
     const a = (e.areas || [])[0] || 'Repo'
@@ -744,6 +795,7 @@ ${yearSections}`
   }
   const monthRows = [...byMonth.entries()].sort().slice(-12)
   const monthMax = Math.max(1, ...monthRows.map(([, n]) => n))
+  const cadenceSpark = spark(monthRows.map(([, n]) => n))
   const modelCounts = new Map()
   for (const e of modelEntries) {
     for (const m of [...(e.modelChanges?.added || []), ...(e.modelChanges?.removed || [])]) {
@@ -752,16 +804,16 @@ ${yearSections}`
   }
   const modelRows2 = [...modelCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)
   const modelMax = Math.max(1, ...modelRows2.map(([, n]) => n))
-  const bar = (lbl, n, max, href) => `<div class="stat-bar-row"><span class="stat-bar-lbl">${href ? `<a href="${href}">${esc(lbl)}</a>` : esc(lbl)}</span><span class="stat-bar"><span class="stat-bar-fill" style="width:${Math.max(2, Math.round(n / max * 100))}%"></span></span><span class="stat-bar-n">${n.toLocaleString()}</span></div>`
+  const bar = (lbl, n, max, href, trend) => `<div class="stat-bar-row"><span class="stat-bar-lbl">${href ? `<a href="${href}">${esc(lbl)}</a>` : esc(lbl)}</span><span class="stat-bar"><span class="stat-bar-fill" style="width:${Math.max(2, Math.round(n / max * 100))}%"></span></span><span class="stat-bar-n">${n.toLocaleString()}</span>${trend || ''}</div>`
   await write(dist, 'stats/index.html', layout({
     title: 'Stats', path: '/stats/',
     desc: `Freebuff changelog stats: ${entries.length} changes across ${byDay.length} days, ${vers.length} releases, ${modelEntries.length} model changes.`,
     body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">TELEMETRY :: changelog stats</span><span>${entries.length.toLocaleString()} changes &middot; ${byDay.length} days</span></div>`
       + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Where the work lands, how fast it ships, and which models churn. Recomputed on every sync.</p></div></section>`
       + `<div class="stat-grid">`
-      + `<div class="stat-card"><h3>CHANGES BY CATEGORY</h3>${statCats.map(([c, n]) => bar(c, n, catMax, `/search/?cat=${encodeURIComponent(c)}`)).join('')}</div>`
+      + `<div class="stat-card"><h3>CHANGES BY CATEGORY (12-MO TREND)</h3>${statCats.map(([c, n]) => bar(c, n, catMax, `/search/?cat=${encodeURIComponent(c)}`, catSpark(c))).join('')}</div>`
       + `<div class="stat-card"><h3>CODE CHURN BY AREA (+/-)</h3>${churnRows.map(([a, c]) => bar(`${a} +${(c.add / 1000).toFixed(0)}k/-${(c.del / 1000).toFixed(0)}k`, c.add + c.del, churnMax)).join('')}</div>`
-      + `<div class="stat-card"><h3>SHIPPING CADENCE (LAST 12 MO)</h3>${monthRows.map(([m, n]) => bar(m, n, monthMax, `/archive/`)).join('')}</div>`
+      + `<div class="stat-card"><h3>SHIPPING CADENCE (LAST 12 MO)</h3>${cadenceSpark}${monthRows.map(([m, n]) => bar(m, n, monthMax, `/archive/`)).join('')}</div>`
       + `<div class="stat-card"><h3>MOST-CHANGED MODELS</h3>${modelRows2.map(([m, n]) => bar(m, n, modelMax, `/models/${modelSlug(m)}/`)).join('')}</div>`
       + `</div>`
   }))
@@ -1029,9 +1081,26 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
   await write(dist, 'feed.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed.xml', `${SITE.name} (unofficial)`, SITE.desc, mainItems))
   await write(dist, 'feed-models.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-models.xml', `${SITE.name}: models (unofficial)`, 'Model catalog additions, retirements, and swaps in the Freebuff free picker.', modelItems))
   await write(dist, 'feed-releases.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-releases.xml', `${SITE.name}: releases (unofficial)`, 'Freebuff CLI and core package version bumps.', releaseItems))
+  const mainJsonItems = entries.filter(e => e.significance !== 'minor').slice(0, 60).map(e => jsonItem(SITE.url, e, titleOf))
+  await write(dist, 'feed.json', feedJson(SITE.url, generated, `${SITE.name} (unofficial)`, SITE.desc, 'feed.json', mainJsonItems))
   await write(dist, 'feed.xsl', FEED_XSL)
   await writeBinary(`${dist.replace(/\/$/, '')}/favicon.ico`, generateFaviconIco())
   await write(dist, 'favicon.svg', FAVICON_SVG)
+  await writeBinary(`${dist.replace(/\/$/, '')}/icon-192.png`, generateIconPng(192))
+  await writeBinary(`${dist.replace(/\/$/, '')}/icon-512.png`, generateIconPng(512))
+  await write(dist, 'manifest.webmanifest', JSON.stringify({
+    name: SITE.name,
+    short_name: 'FreebuffLog',
+    description: SITE.desc,
+    start_url: '/',
+    display: 'standalone',
+    background_color: '#0d1117',
+    theme_color: '#0d1117',
+    icons: [
+      { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+      { src: '/icon-512.png', sizes: '512x512', type: 'image/png' }
+    ]
+  }))
 
   await write(dist, 'api/entries.json', JSON.stringify({ generatedAt: generated, head: changelog.headSha, total: entries.length, latest: entries.slice(0, 60) }))
   await write(dist, 'api/status.json', JSON.stringify({
@@ -1065,6 +1134,21 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
 /favicon.svg
   Content-Type: image/svg+xml
   Cache-Control: public, max-age=604800
+/icon-192.png
+  Content-Type: image/png
+  Cache-Control: public, max-age=604800
+/icon-512.png
+  Content-Type: image/png
+  Cache-Control: public, max-age=604800
+/manifest.webmanifest
+  Content-Type: application/manifest+json
+  Cache-Control: public, max-age=86400
+/feed.json
+  Content-Type: application/feed+json; charset=utf-8
+  Cache-Control: public, max-age=600
+/og/*
+  Content-Type: image/svg+xml
+  Cache-Control: public, max-age=86400
 /feed.xsl
   Content-Type: text/xsl; charset=utf-8
   Cache-Control: public, max-age=86400
@@ -1080,6 +1164,8 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
 /search-index.json
   Cache-Control: public, max-age=3600
 /feed.xml
+  Cache-Control: public, max-age=600
+/feed.json
   Cache-Control: public, max-age=600
 /feed-models.xml
   Cache-Control: public, max-age=600

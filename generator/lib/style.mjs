@@ -366,6 +366,16 @@ nav.term-nav a.active{
   font-size:.76rem;
   color:var(--txt-dim);
 }
+.related{
+  margin-top:8px;
+  padding-top:6px;
+  border-top:1px dotted var(--term-border);
+  font-size:.76rem;
+  color:var(--txt-dim);
+}
+.related a{color:var(--term-cyan);text-decoration:none}
+.related a:hover{text-decoration:underline}
+.spark{display:block;margin:4px 0 8px;max-width:100%;height:auto}
 
 .entry-body{
   padding:12px 16px 14px;
