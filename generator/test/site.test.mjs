@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildSite, modelTimeline } from '../lib/site.mjs'
+import { buildSite, modelTimeline, modelSlug, scoreHit } from '../lib/site.mjs'
 
 test('buildSite generates valid static site output', async () => {
   const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-test-dist-'))
@@ -202,7 +202,7 @@ test('buildSite generates valid static site output', async () => {
 
     // Verify split feeds: main, models-only, releases-only with correct self links
     assert.match(feedXml, /<atom:link href="https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/feed\.xml" rel="self"/)
-    assert.match(feedXml, /Muse Spark 1\.3 replaces Muse Spark 1\.2/)
+    assert.match(feedXml, /\[2026-09-13\] Muse Spark 1\.3 replaces Muse Spark 1\.2/)
     const feedModels = await readFile(join(tmpDist, 'feed-models.xml'), 'utf8')
     assert.match(feedModels, /<atom:link href="https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/feed-models\.xml" rel="self"/)
     assert.match(feedModels, /Muse Spark 1\.3 replaces Muse Spark 1\.2/)
@@ -237,15 +237,54 @@ test('buildSite generates valid static site output', async () => {
     // Verify models page: lineup, retired, history rows, nav
     const modelsHtml = await readFile(join(tmpDist, 'models/index.html'), 'utf8')
     assert.match(modelsHtml, /MODEL_LINEUP/)
+    assert.match(modelsHtml, /href="\/models\/muse-spark-1-3\/"/)
     assert.match(modelsHtml, /Muse Spark 1\.3/)
     assert.match(modelsHtml, /Muse Spark 1\.2/)
     assert.match(modelsHtml, /CATALOG HISTORY \(1 CHANGES\)/)
     assert.match(modelsHtml, /\/day\/2026-09-13\/#bbbb11112222/)
     assert.match(modelsHtml, /\/models\//)
     assert.match(modelsHtml, /href="\/feed-models\.xml"/)
+
+    // Verify per-model detail page: status, history, watch feed
+    const modelDetail = await readFile(join(tmpDist, 'models/muse-spark-1-3/index.html'), 'utf8')
+    assert.match(modelDetail, /MODEL :: Muse Spark 1\.3/)
+    assert.match(modelDetail, /\[LIVE\]|\[RETIRED\]/)
+    assert.match(modelDetail, /HISTORY \(1\)/)
+    assert.match(modelDetail, /watch rss/)
+    const modelFeed = await readFile(join(tmpDist, 'models/muse-spark-1-3/feed.xml'), 'utf8')
+    assert.match(modelFeed, /Muse Spark 1\.3/)
+
+    // Verify stats + watch pages and nav entries
+    const statsHtml = await readFile(join(tmpDist, 'stats/index.html'), 'utf8')
+    assert.match(statsHtml, /TELEMETRY/)
+    assert.match(statsHtml, /MOST-CHANGED MODELS/)
+    const watchHtml = await readFile(join(tmpDist, 'watch/index.html'), 'utf8')
+    assert.match(watchHtml, /WATCHLIST/)
+    assert.match(watchHtml, /PER-MODEL RSS/)
+    assert.match(watchHtml, /SAVED SEARCH/)
+    assert.match(indexHtml, /href="\/stats\/"/)
+    assert.match(indexHtml, /href="\/watch\/"/)
+
+    // Verify day jump, split-view toggle, collapse, sitemap models
+    const dayHtml2 = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
+    assert.match(dayHtml2, /class="day-jump"/)
+    assert.match(dayHtml2, /data-mode="split"/)
+    const archiveHtml = await readFile(join(tmpDist, 'archive/index.html'), 'utf8')
+    assert.match(archiveHtml, /cat-collapse/)
+    const sitemapModels = await readFile(join(tmpDist, 'sitemap-models.xml'), 'utf8')
+    assert.match(sitemapModels, /\/models\/muse-spark-1-3\//)
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }
+})
+
+test('modelSlug + scoreHit: slugs safe, titles outrank categories', () => {
+  assert.equal(modelSlug('Muse Spark 1.2'), 'muse-spark-1-2')
+  assert.equal(modelSlug('DeepSeek V4 Pro 08/13'), 'deepseek-v4-pro-08-13')
+  assert.equal(modelSlug(''), 'model')
+  assert.ok(scoreHit('Muse Spark added', 'Model Catalog', 'major', '2026-09-13', ['muse']) > scoreHit('Other title', 'Model Catalog', 'major', '2026-09-13', ['muse']))
+  assert.ok(scoreHit('Muse Spark added', 'Model Catalog', 'major', '2026-09-13', ['muse']) > scoreHit('Muse Spark added', 'Model Catalog', 'minor', '2026-09-13', ['muse']))
+  assert.equal(scoreHit('Unrelated', 'CLI', 'minor', '2026-09-13', ['muse']), -1)
 })
 
 test('modelTimeline: replays adds/removes oldest-first', () => {

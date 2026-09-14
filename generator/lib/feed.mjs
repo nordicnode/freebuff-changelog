@@ -171,7 +171,9 @@ export const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
 
 // One feed <item>: title link, stable guid, summary + facts in content.
 export function feedItem (siteUrl, e, titleOf) {
-  const title = titleOf(e)
+  // Date-prefix disambiguates repeat titles across days ("New slash
+  // command /queue" shipped once; model swaps repeat names often).
+  const title = `[${e.day}] ${titleOf(e)}`
   const summary = String(e.ai?.summary || e.summary || '').replace(/[*`#]/g, '')
   const facts = (e.facts || []).slice(0, 5).map(f => `<li>${esc(String(f)).slice(0, 400)}</li>`).join('')
   const content = facts

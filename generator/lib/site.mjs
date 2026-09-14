@@ -51,6 +51,8 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
   <nav class="term-nav">
     <a href="/about/" class="${path === '/about/' ? 'active' : ''}">/about</a>
     <a href="/models/" class="${path.startsWith('/models/') ? 'active' : ''}">/models</a>
+    <a href="/stats/" class="${path.startsWith('/stats/') ? 'active' : ''}">/stats</a>
+    <a href="/watch/" class="${path.startsWith('/watch/') ? 'active' : ''}">/watch</a>
     <a href="/archive/" class="${path.startsWith('/archive/') ? 'active' : ''}">/archive</a>
     <a href="/search/" class="${path.startsWith('/search/') ? 'active' : ''}">/search</a>
     <a href="/in-flight/" class="${path.startsWith('/in-flight/') ? 'active' : ''}">/in-flight</a>
@@ -69,9 +71,13 @@ ${body}
 function updateSyncTimer() {
   const el = document.querySelector('.sync-val');
   if (!el) return;
+  // Freeze when stale: a countdown to a sync that already missed is a lie.
+  const ageEl = document.querySelector('.sync-age');
+  const ageMin = ageEl && ageEl.dataset.generated
+    ? Math.max(0, Math.floor((Date.now() - Date.parse(ageEl.dataset.generated)) / 60000))
+    : 0;
   const now = new Date();
-  const utcMin = now.getUTCMinutes();
-  if (utcMin === 0) {
+  if (now.getUTCMinutes() === 0 || ageMin >= 90) {
     el.textContent = 'syncing…';
     el.style.color = 'var(--term-green)';
     return;
@@ -101,8 +107,16 @@ updateSyncAge();
 
 function openHashTarget() {
   const hash = window.location.hash;
-  if (!hash) return;
-  const target = document.querySelector(hash);
+  if (!hash || hash.length < 2) return;
+  let target = null;
+  try { target = document.querySelector(hash); } catch (_) { return; }
+  if (!target) {
+    // Short-sha links (#abcdef) may not match the full 12-char id prefix.
+    const short = hash.slice(1);
+    if (/^[0-9a-f]{4,11}$/i.test(short)) {
+      target = document.querySelector('[id^="' + short + '"]');
+    }
+  }
   if (target && target.tagName === 'DETAILS' && target.classList.contains('entry')) {
     target.open = true;
     try { target.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (_) {}
@@ -131,6 +145,19 @@ function copyDiff(btn) {
     setTimeout(() => { btn.innerText = orig; }, 1800);
   });
 }
+
+document.addEventListener('click', (ev) => {
+  const btn = ev.target.closest ? ev.target.closest('.diff-mode') : null;
+  if (!btn) return;
+  const viewer = btn.closest('.diff-viewer');
+  if (!viewer) return;
+  viewer.querySelectorAll('.diff-mode').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const body = viewer.querySelector('.diff-body');
+  if (!body || !body.dataset.raw) return;
+  const label = viewer.dataset.sha || ('PR-' + viewer.dataset.pr);
+  renderDiff(body, body.dataset.raw, label, viewer.dataset.gh || '', btn.dataset.mode);
+});
 
 document.addEventListener('toggle', async (ev) => {
   const el = ev.target;
@@ -161,8 +188,10 @@ document.addEventListener('toggle', async (ev) => {
   }
 }, true);
 
-function renderDiff(container, text, label, ghUrl) {
-  const lines = text.split(/\\r?\\n/);
+function renderDiff(container, text, label, ghUrl, mode) {
+  mode = mode || 'unified';
+  container.dataset.raw = text;
+  const lines = text.split(/\r?\n/);
   const frag = document.createDocumentFragment();
 
   const toolbar = document.createElement('div');
@@ -190,6 +219,65 @@ function renderDiff(container, text, label, ghUrl) {
 
   toolbar.appendChild(actions);
   frag.appendChild(toolbar);
+
+  if (mode === 'split') {
+    // Before/after columns: pair runs of - lines with following + runs.
+    const table = document.createElement('table');
+    table.className = 'diff-split';
+    const addCell = (tr, cls, txt) => {
+      const td = document.createElement('td');
+      td.className = 'diff-cell ' + cls;
+      td.textContent = txt;
+      tr.appendChild(td);
+    };
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (line.startsWith('diff --git') || line.startsWith('index ') || line.startsWith('@@') || line.startsWith('+++') || line.startsWith('---')) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 2;
+        td.className = 'diff-cell diff-hdr';
+        td.textContent = line;
+        tr.appendChild(td);
+        table.appendChild(tr);
+        i++;
+        continue;
+      }
+      if (line.startsWith('-') && !line.startsWith('---')) {
+        const dels = [];
+        while (i < lines.length && lines[i].startsWith('-') && !lines[i].startsWith('---')) { dels.push(lines[i].slice(1)); i++; }
+        const adds = [];
+        while (i < lines.length && lines[i].startsWith('+') && !lines[i].startsWith('+++')) { adds.push(lines[i].slice(1)); i++; }
+        const n = Math.max(dels.length, adds.length);
+        for (let k = 0; k < n; k++) {
+          const tr = document.createElement('tr');
+          addCell(tr, 'diff-del', dels[k] ?? '');
+          addCell(tr, 'diff-add', adds[k] ?? '');
+          table.appendChild(tr);
+        }
+        continue;
+      }
+      if (line.startsWith('+') && !line.startsWith('+++')) {
+        const tr = document.createElement('tr');
+        addCell(tr, 'diff-del', '');
+        addCell(tr, 'diff-add', line.slice(1));
+        table.appendChild(tr);
+        i++;
+        continue;
+      }
+      const tr = document.createElement('tr');
+      const ctx = line.startsWith(' ') ? line.slice(1) : line;
+      addCell(tr, 'diff-ctx', ctx);
+      addCell(tr, 'diff-ctx', ctx);
+      table.appendChild(tr);
+      i++;
+    }
+    frag.appendChild(table);
+    container.innerHTML = '';
+    container.appendChild(frag);
+    return;
+  }
 
   const pre = document.createElement('pre');
   pre.className = 'diff-pre';
@@ -248,15 +336,30 @@ function badges (e) {
 function modelDiffLine (e) {
   if (!e.modelChanges) return ''
   const { added = [], removed = [] } = e.modelChanges
-  const addHtml = added.map(m => `<span class="modelplus">+${esc(m)}</span>`).join('<span class="model-sep">,</span> ')
-  const remHtml = removed.map(m => `<span class="modelminus">−${esc(m)}</span>`).join('<span class="model-sep">,</span> ')
+  const tables = e.modelChanges.tables || {}
+  const pillsFor = (names, cls, sign) => names.map(m => {
+    const row = tables[m]?.after || tables[m]?.before
+    const tip = row ? ` title="${esc(row.join(' · '))}"` : ''
+    return `<span class="${cls}"${tip}>${sign}${esc(m)}</span>`
+  }).join('<span class="model-sep">,</span> ')
+  const addHtml = pillsFor(added, 'modelplus', '+')
+  const remHtml = pillsFor(removed, 'modelminus', '−')
   let swapContent = ''
   if (added.length && removed.length) {
     swapContent = `${addHtml} <span class="swap-arrow">-></span> ${remHtml}`
   } else {
     swapContent = [addHtml, remHtml].filter(Boolean).join(' ')
   }
-  return `<div class="model-swap"><span class="model-swap-tag">MODEL SWAP:</span> <span class="model-swap-pills">${swapContent}</span></div>`
+  // Snapshot embed: full before/after README rows for the changed models,
+  // so readers see access + best-for without opening the diff.
+  const snapRows = [...added.map(m => [m, 'add']), ...removed.map(m => [m, 'del'])]
+    .map(([m, kind]) => {
+      const row = tables[m]?.after || tables[m]?.before
+      if (!row) return ''
+      return `<div class="snap-row ${kind}"><span class="snap-name">${esc(m)}</span><span class="snap-cells">${esc(row.slice(1).join(' · ') || row[0])}</span></div>`
+    }).join('')
+  const snap = snapRows ? `<div class="model-snap">${snapRows}</div>` : ''
+  return `<div class="model-swap"><span class="model-swap-tag">MODEL SWAP:</span> <span class="model-swap-pills">${swapContent}</span></div>${snap}`
 }
 
 function shortPath (p) {
@@ -268,10 +371,15 @@ function shortPath (p) {
 
 function fileChips (e) {
   const chips = []
-  for (const p of e.files.added.slice(0, 3)) chips.push(`<span class="fchip add" title="${esc(p)}">${esc(shortPath(p))}</span>`)
-  for (const p of e.files.removed.slice(0, 3)) chips.push(`<span class="fchip del" title="${esc(p)}">${esc(shortPath(p))}</span>`)
-  for (const p of e.files.modified.slice(0, e.files.added.length + e.files.removed.length ? 3 : 5)) chips.push(`<span class="fchip mod" title="${esc(p)}">${esc(shortPath(p))}</span>`)
-  const extra = Math.max(0, e.files.meaningful - chips.length)
+  const totalListed = (e.files.added?.length || 0) + (e.files.removed?.length || 0) + (e.files.modified?.length || 0)
+  const shownAdded = (e.files.added || []).slice(0, 3), shownRemoved = (e.files.removed || []).slice(0, 3)
+  const modCap = shownAdded.length + shownRemoved.length ? 3 : 5
+  const shownModified = (e.files.modified || []).slice(0, modCap)
+  for (const p of shownAdded) chips.push(`<span class="fchip add" title="${esc(p)}">${esc(shortPath(p))}</span>`)
+  for (const p of shownRemoved) chips.push(`<span class="fchip del" title="${esc(p)}">${esc(shortPath(p))}</span>`)
+  for (const p of shownModified) chips.push(`<span class="fchip mod" title="${esc(p)}">${esc(shortPath(p))}</span>`)
+  const shown = shownAdded.length + shownRemoved.length + shownModified.length
+  const extra = Math.max(totalListed - shown, (e.files.meaningful || 0) - shown)
   if (extra > 0) chips.push(`<span class="fchip more">+${extra} more</span>`)
   return chips.length ? `<div class="files">${chips.join('')}</div>` : ''
 }
@@ -282,6 +390,7 @@ function entryCard (e, isExpanded = false) {
   const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
   // Diffs lazy-load in the browser on toggle (fetch /diffs/<sha>.diff),
   // so the server never holds diff text in memory or bloats pages with it.
+  // Compare view renders the fetched diff side-by-side inline on demand.
   let diffViewer = ''
   if (e.kind === 'sync') {
     diffViewer = `<details class="diff-viewer" data-sha="${e.sha}" data-gh="${esc(e.compareUrl || e.url || '')}">
@@ -292,6 +401,7 @@ function entryCard (e, isExpanded = false) {
   </span>
   <span class="diff-badge">+${e.stats.additions} / −${e.stats.deletions}</span>
 </summary>
+<div class="diff-view-modes"><button class="diff-mode active" data-mode="unified">unified</button><button class="diff-mode" data-mode="split">split</button></div>
 <div class="diff-body"><span class="diff-loading">Loading diff…</span></div>
 </details>`
   }
@@ -326,6 +436,26 @@ ${diffViewer}
 
 function deriveTitleSafe (e) {
   return (e.summary || '').split(/[.:]/)[0].slice(0, 70) || `${e.category} update`
+}
+
+// Search ranking (mirrored client-side): title hits beat category hits,
+// significance boosts, recency breaks ties. Exported for unit tests.
+export function scoreHit (title, cat, sig, day, words) {
+  const t = title.toLowerCase(), c = cat.toLowerCase()
+  let s = 0
+  for (const w of words) {
+    if (t.includes(w)) s += w.length > 4 ? 3 : 2
+    else if (c.includes(w)) s += 1
+    else return -1
+  }
+  if (sig === 'major') s += 2
+  else if (sig === 'notable') s += 1
+  return s
+}
+
+export function modelSlug (name) {
+  const base = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'model'
+  return base
 }
 
 function groupByDay (entries) {
@@ -410,11 +540,14 @@ ${d.entries.map(e => {
     `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>` }))
 
   // ----- per-day pages (independent writes: bounded parallel pool)
+  const dayOptions = byDay.map(d => `<option value="/day/${d.day}/">${esc(fmtDateHuman(d.day))} (${d.entries.length})</option>`).join('')
+  const dayJump = (current) => `<form class="day-jump" action="/day/${current}/" method="get" onsubmit="location.href=this.d.value;return false"><label>JUMP:<select name="d" onchange="if(this.value)location.href=this.value"><option value="">--pick a date--</option>${dayOptions}</select></label></form>`
   const dayTasks = byDay.map((d, i) => async () => {
     const prevDay = i < byDay.length - 1 ? byDay[i + 1] : null
     const nextDay = i > 0 ? byDay[i - 1] : null
     const dayPager = `<div class="pager">` +
       (prevDay ? `<a href="/day/${prevDay.day}/">&larr; ${esc(fmtDateHuman(prevDay.day))}</a>` : '<span></span>') +
+      dayJump(d.day) +
       (nextDay ? `<a href="/day/${nextDay.day}/">${esc(fmtDateHuman(nextDay.day))} &rarr;</a>` : '<span></span>') +
       `</div>`
     await write(dist, `day/${d.day}/index.html`, layout({
@@ -459,10 +592,12 @@ ${d.entries.map(e => {
 
   // ----- models timeline (catalog history: current lineup, retired, per-change rows)
   const { chrono: modelChrono, live: modelLive, retired: modelRetired } = modelTimeline(modelEntries)
+  const modelLink = (m, cls, sign) => `<a class="${cls}" href="/models/${modelSlug(m)}/">${sign}${esc(m)}</a>`
+  const titleOfModel = (e) => e.ai?.title || e.title || deriveTitleSafe(e)
   const modelRows = modelChrono.map(e => {
     const { added = [], removed = [] } = e.modelChanges || {}
-    const addHtml = added.map(m => `<span class="modelplus">+${esc(m)}</span>`).join('<span class="model-sep">,</span> ')
-    const remHtml = removed.map(m => `<span class="modelminus">−${esc(m)}</span>`).join('<span class="model-sep">,</span> ')
+    const addHtml = added.map(m => modelLink(m, 'modelplus', '+')).join('<span class="model-sep">,</span> ')
+    const remHtml = removed.map(m => modelLink(m, 'modelminus', '−')).join('<span class="model-sep">,</span> ')
     const swap = added.length && removed.length
       ? `${addHtml} <span class="swap-arrow">-&gt;</span> ${remHtml}`
       : [addHtml, remHtml].filter(Boolean).join(' ')
@@ -482,10 +617,10 @@ ${d.entries.map(e => {
       <span>${modelLive.length} live &middot; ${modelRetired.length} retired</span>
     </div>
     <div style="font-size:.76rem;color:var(--txt-subtle);margin-bottom:6px">LIVE:</div>
-    <div class="model-lineup">${modelLive.map(m => `<span class="modelplus">${esc(m)}</span>`).join('<span class="model-sep">,</span> ')}</div>
+    <div class="model-lineup">${modelLive.map(m => modelLink(m, 'modelplus', '')).join('<span class="model-sep">,</span> ')}</div>
     ${modelRetired.length ? `<div style="font-size:.76rem;color:var(--txt-subtle);margin:10px 0 6px">RETIRED:</div>
-    <div class="model-lineup">${modelRetired.map(m => `<span class="modelminus">${esc(m)}</span>`).join('<span class="model-sep">,</span> ')}</div>` : ''}
-    <p style="margin:10px 0 0;font-size:.78rem;color:var(--txt-subtle)">SUBSCRIBE: <a href="/feed-models.xml">[models rss]</a> &middot; <a href="/feed.xml">[all changes]</a></p>
+    <div class="model-lineup">${modelRetired.map(m => modelLink(m, 'modelminus', '')).join('<span class="model-sep">,</span> ')}</div>` : ''}
+    <p style="margin:10px 0 0;font-size:.78rem;color:var(--txt-subtle)">SUBSCRIBE: <a href="/feed-models.xml">[models rss]</a> &middot; <a href="/feed.xml">[all changes]</a> &middot; per-model feeds on each model page</p>
   </div>
 </section>
 <div class="section-hdr">
@@ -493,6 +628,43 @@ ${d.entries.map(e => {
 </div>
 <div class="model-history">${modelRows}</div>`
   }))
+
+  // ----- per-model pages (one page per catalog name: status, events, watch feed)
+  const byModel = new Map()
+  for (const e of modelChrono) {
+    for (const m of (e.modelChanges?.added || [])) {
+      if (!byModel.has(m)) byModel.set(m, [])
+      byModel.get(m).push({ e, kind: 'added' })
+    }
+    for (const m of (e.modelChanges?.removed || [])) {
+      if (!byModel.has(m)) byModel.set(m, [])
+      byModel.get(m).push({ e, kind: 'removed' })
+    }
+  }
+  const liveSet = new Set(modelLive)
+  await pool([...byModel.entries()].map(([name, events]) => async () => {
+    const slug = modelSlug(name)
+    const status = liveSet.has(name) ? 'LIVE' : 'RETIRED'
+    const firstSeen = events[events.length - 1].e.day
+    const lastSeen = events[0].e.day
+    const rows = events.map(({ e, kind }) => {
+      const row = e.modelChanges?.tables?.[name]
+      const cells = row ? (row.after || row.before) : null
+      const detail = cells ? `<span class="snap-cells">${esc(cells.slice(1).join(' · ') || cells[0])}</span>` : ''
+      return `<div class="model-row"><span class="model-row-date"><a href="/day/${e.day}/#${e.sha.slice(0, 12)}">${esc(e.day)}</a></span>`
+        + `<span class="model-row-change">${kind === 'added' ? '<span class="modelplus">+added</span>' : '<span class="modelminus">−removed</span>'}</span>`
+        + `<span class="model-row-title">${esc(e.ai?.title || e.title || '')} ${detail}</span></div>`
+    }).join('')
+    const evts = events.map(({ e }) => e)
+    await write(dist, `models/${slug}/feed.xml`, feedXml(SITE.url, SITE.name, SITE.desc, generated, `models/${slug}/feed.xml`, `${SITE.name}: ${name} (unofficial)`, `Catalog events for ${name}: additions, retirements, swaps.`, evts.map(e => feedItem(SITE.url, e, titleOfModel)).join('')))
+    await write(dist, `models/${slug}/index.html`, layout({
+      title: name, path: `/models/${slug}/`,
+      desc: `${name} is ${status.toLowerCase()} in the Freebuff free picker: ${events.length} catalog events, ${firstSeen} to ${lastSeen}.`,
+      body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">MODEL :: ${esc(name)}</span><span class="${status === 'LIVE' ? 'modelplus' : 'modelminus'}">[${status}]</span></div>`
+        + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">${events.length} catalog event${events.length === 1 ? '' : 's'} &middot; ${esc(firstSeen)} &rarr; ${esc(lastSeen)} &middot; <a href="/models/">[all models]</a> &middot; <a href="/models/${slug}/feed.xml">[watch rss]</a></p></div></section>`
+        + `<div class="section-hdr"><h2>== HISTORY (${events.length}) ==</h2></div><div class="model-history">${rows}</div>`
+    }))
+  }), 8)
 
   // ----- archive (all days + releases + categories)
   const cats = new Map()
@@ -533,7 +705,7 @@ ${d.entries.map(e => {
       <span>${entries.length.toLocaleString()} total commits</span>
     </div>
     <div style="font-size:.76rem;color:var(--txt-subtle);margin-bottom:6px">CATEGORIES:</div>
-    <div class="grid">${catTiles}</div>
+    <details class="cat-collapse" open><summary class="cat-toggle">[${cats.size} categories — toggle]</summary><div class="grid">${catTiles}</div></details>
   </div>
 </section>
 <div class="section-hdr">
@@ -544,6 +716,48 @@ ${d.entries.map(e => {
   <h2>== DAYS BY MONTH (${byDay.length} DATES) ==</h2>
 </div>
 ${yearSections}`
+  }))
+
+  // ----- stats (counts, churn, cadence: zero-dependency CSS bars)
+  const statCats = [...cats.entries()].sort((a, b) => b[1] - a[1])
+  const catMax = statCats[0]?.[1] || 1
+  const churnByArea = new Map()
+  for (const e of entries) {
+    const a = (e.areas || [])[0] || 'Repo'
+    const c = churnByArea.get(a) || { add: 0, del: 0 }
+    c.add += e.stats?.additions || 0
+    c.del += e.stats?.deletions || 0
+    churnByArea.set(a, c)
+  }
+  const churnRows = [...churnByArea.entries()].sort((a, b) => (b[1].add + b[1].del) - (a[1].add + a[1].del)).slice(0, 10)
+  const churnMax = Math.max(1, ...churnRows.map(([, c]) => c.add + c.del))
+  const byMonth = new Map()
+  for (const d of byDay) {
+    const m = d.day.slice(0, 7)
+    byMonth.set(m, (byMonth.get(m) || 0) + d.entries.length)
+  }
+  const monthRows = [...byMonth.entries()].sort().slice(-12)
+  const monthMax = Math.max(1, ...monthRows.map(([, n]) => n))
+  const modelCounts = new Map()
+  for (const e of modelEntries) {
+    for (const m of [...(e.modelChanges?.added || []), ...(e.modelChanges?.removed || [])]) {
+      modelCounts.set(m, (modelCounts.get(m) || 0) + 1)
+    }
+  }
+  const modelRows2 = [...modelCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)
+  const modelMax = Math.max(1, ...modelRows2.map(([, n]) => n))
+  const bar = (lbl, n, max, href) => `<div class="stat-bar-row"><span class="stat-bar-lbl">${href ? `<a href="${href}">${esc(lbl)}</a>` : esc(lbl)}</span><span class="stat-bar"><span class="stat-bar-fill" style="width:${Math.max(2, Math.round(n / max * 100))}%"></span></span><span class="stat-bar-n">${n.toLocaleString()}</span></div>`
+  await write(dist, 'stats/index.html', layout({
+    title: 'Stats', path: '/stats/',
+    desc: `Freebuff changelog stats: ${entries.length} changes across ${byDay.length} days, ${vers.length} releases, ${modelEntries.length} model changes.`,
+    body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">TELEMETRY :: changelog stats</span><span>${entries.length.toLocaleString()} changes &middot; ${byDay.length} days</span></div>`
+      + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Where the work lands, how fast it ships, and which models churn. Recomputed on every sync.</p></div></section>`
+      + `<div class="stat-grid">`
+      + `<div class="stat-card"><h3>CHANGES BY CATEGORY</h3>${statCats.map(([c, n]) => bar(c, n, catMax, `/search/?cat=${encodeURIComponent(c)}`)).join('')}</div>`
+      + `<div class="stat-card"><h3>CODE CHURN BY AREA (+/-)</h3>${churnRows.map(([a, c]) => bar(`${a} +${(c.add / 1000).toFixed(0)}k/-${(c.del / 1000).toFixed(0)}k`, c.add + c.del, churnMax)).join('')}</div>`
+      + `<div class="stat-card"><h3>SHIPPING CADENCE (LAST 12 MO)</h3>${monthRows.map(([m, n]) => bar(m, n, monthMax, `/archive/`)).join('')}</div>`
+      + `<div class="stat-card"><h3>MOST-CHANGED MODELS</h3>${modelRows2.map(([m, n]) => bar(m, n, modelMax, `/models/${modelSlug(m)}/`)).join('')}</div>`
+      + `</div>`
   }))
 
   // ----- search (compact index: field codes + category/sig codebooks)
@@ -614,14 +828,26 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     const cat = fcat ? fcat.value : '', sig = fsig ? fsig.value : '';
     const w = v.split(/\s+/).filter(Boolean);
     if (!w.length && !cat && !sig) { h.innerHTML = ''; cnt.textContent = ''; return; }
-    const hits = ix.filter(e => {
+    const scored = [];
+    for (const e of ix) {
       const c = cats[e[2]] || '', a = sigs[e[4]] || '';
-      if (cat && c !== cat) return false;
-      if (sig && a !== sig) return false;
-      if (!w.length) return true;
-      const s = (e[1] + ' ' + c + ' ' + a).toLowerCase();
-      return w.every(x => s.includes(x));
-    }).slice(0, 200);
+      if (cat && c !== cat) continue;
+      if (sig && a !== sig) continue;
+      if (!w.length) { scored.push([0, e[0], e]); continue; }
+      // Title hits outrank category hits; significance boosts.
+      const t = e[1].toLowerCase(), cl = c.toLowerCase();
+      let s = 0, ok = true;
+      for (const x of w) {
+        if (t.includes(x)) s += x.length > 4 ? 3 : 2;
+        else if (cl.includes(x)) s += 1;
+        else { ok = false; break; }
+      }
+      if (!ok) continue;
+      if (a === 'major') s += 2; else if (a === 'notable') s += 1;
+      scored.push([s, e[0], e]);
+    }
+    scored.sort((x, y) => y[0] - x[0] || (y[1] < x[1] ? -1 : 1));
+    const hits = scored.slice(0, 200).map(r => r[2]);
 
     cnt.textContent = hits.length ? ('MATCHES: ' + hits.length + (hits.length === 200 ? '+ (capped at 200)' : '')) : 'MATCHES: 0';
     h.innerHTML = hits.map(e => {
@@ -675,6 +901,31 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
 });
 </script>`
   }))
+
+  // ----- watchlist (saved searches + per-model RSS, client-side builder)
+  const watchModels = [...new Set([...modelLive, ...modelRetired])].sort().map(m => `<option value="/models/${modelSlug(m)}/feed.xml">${esc(m)}</option>`).join('')
+  await write(dist, 'watch/index.html', layout({
+    title: 'Watch', path: '/watch/',
+    desc: 'Build a personal Freebuff watchlist: per-model RSS feeds and saved search links.',
+    body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">WATCHLIST :: follow what matters</span><span>${modelLive.length} live models</span></div>`
+      + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Pick a model for its dedicated RSS feed, or build a saved search link. No account, no tracking — just URLs for your reader.</p></div></section>`
+      + `<div class="section-hdr"><h2>== PER-MODEL RSS ==</h2></div>`
+      + `<div class="watch-row"><select id="wmodel">${watchModels}</select><a id="wmodellink" href="#">[open feed]</a><button id="wmodelcopy">[copy url]</button></div>`
+      + `<div class="section-hdr"><h2>== SAVED SEARCH ==</h2></div>`
+      + `<div class="watch-row"><input id="wq" type="search" placeholder="pattern (e.g. byok, model swap)..." size="28"><select id="wcat"><option value="">--any category</option>${SEARCH_CATS.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('')}</select><select id="wsig"><option value="">--any impact</option>${SEARCH_SIGS.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('')}</select></div>`
+      + `<div class="watch-row"><a id="wlink" href="/search/">[open search]</a><button id="wcopy">[copy url]</button></div>`
+      + `<p class="watch-hint">Tip: paste the feed URL or search link into any RSS reader — new matches surface on every hourly sync.</p>`
+      + `<script>
+const wm=document.getElementById('wmodel'),wml=document.getElementById('wmodellink'),wmc=document.getElementById('wmodelcopy');
+const syncModel=()=>{const u=new URL(wm.value,location.origin).href;wml.href=wm.value;wmc.onclick=()=>navigator.clipboard.writeText(u).then(()=>{wmc.textContent='[copied!]';setTimeout(()=>wmc.textContent='[copy url]',1500)})};
+wm.addEventListener('change',syncModel);syncModel();
+const wq=document.getElementById('wq'),wc=document.getElementById('wcat'),ws=document.getElementById('wsig'),wl=document.getElementById('wlink'),wcp=document.getElementById('wcopy');
+const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q',wq.value.trim());if(wc.value)p.set('cat',wc.value);if(ws.value)p.set('sig',ws.value);const s=p.toString();const href='/search/'+(s?'?'+s:'');wl.href=href;const abs=new URL(href,location.origin).href;wcp.onclick=()=>navigator.clipboard.writeText(abs).then(()=>{wcp.textContent='[copied!]';setTimeout(()=>wcp.textContent='[copy url]',1500)})};
+[wq,wc,ws].forEach(el=>el.addEventListener('input',syncSearch));syncSearch();
+</script>`
+  }))
+
+
 
   // ----- about (user-facing overview)
   await write(dist, 'about/index.html', layout({
@@ -793,11 +1044,13 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   const urlset = (urls) => `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.map(u => `<url><loc>${SITE.url}${u}</loc></url>`).join('')}</urlset>`
   const dayUrls = byDay.map(d => `/day/${d.day}/`)
   const relUrls = vers.map(v => `/release/${v.version}/`)
-  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', ...(openPrs?.length ? ['/in-flight/'] : [])]
+  const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`)]
+  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/watch/', ...(openPrs?.length ? ['/in-flight/'] : [])]
   await write(dist, 'sitemap-days.xml', urlset(dayUrls))
   await write(dist, 'sitemap-releases.xml', urlset(relUrls))
+  await write(dist, 'sitemap-models.xml', urlset(modelUrls))
   await write(dist, 'sitemap-pages.xml', urlset(pageUrls))
-  await write(dist, 'sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-pages.xml'].map(f => `<sitemap><loc>${SITE.url}/${f}</loc></sitemap>`).join('')}</sitemapindex>`)
+  await write(dist, 'sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-pages.xml'].map(f => `<sitemap><loc>${SITE.url}/${f}</loc></sitemap>`).join('')}</sitemapindex>`)
   await write(dist, 'robots.txt', `User-agent: *\nAllow: /\nSitemap: ${SITE.url}/sitemap.xml\n`)
   await write(dist, '_headers', `/*
   X-Content-Type-Options: nosniff
@@ -831,6 +1084,8 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
 /sitemap-days.xml
   Cache-Control: public, max-age=86400
 /sitemap-releases.xml
+  Cache-Control: public, max-age=86400
+/sitemap-models.xml
   Cache-Control: public, max-age=86400
 /sitemap-pages.xml
   Cache-Control: public, max-age=86400

@@ -159,6 +159,21 @@ export function catalogFromReadme (text) {
   return names
 }
 
+// Full row cells per model name, for before/after snapshot embeds.
+export function catalogRowsFromReadme (text) {
+  const rows = new Map()
+  for (const lines of parseMarkdownTables(text || '')) {
+    if (!isModelTable(lines)) continue
+    for (const line of lines.slice(1)) {
+      const m = MODEL_ROW_RE.exec(line)
+      if (!m) continue
+      const cells = line.split('|').slice(1, -1).map(c => c.replace(/\*\*/g, '').trim())
+      if (cells.length >= 2) rows.set(m[1].trim(), cells.slice(0, 3))
+    }
+  }
+  return rows
+}
+
 export function diffCatalogs (before, after) {
   const added = [...after].filter(m => !before.has(m))
   const removed = [...before].filter(m => !after.has(m))
@@ -173,25 +188,37 @@ async function showFileAt (repoDir, rev, path) {
 // Snapshot compare: parse the full model tables before/after instead of
 // scanning hunks. Immune to hunk fragmentation, diff truncation, and
 // product-table rows (header-gated). EN is primary, ZH cross-checks it.
+// Returns { added, removed, tables } where tables holds full row cells for
+// snapshot embeds (before/after per changed model).
 export async function snapshotModelChanges (repoDir, base, head) {
-  const beforeEn = catalogFromReadme(await showFileAt(repoDir, base, 'README.md'))
-  const afterEn = catalogFromReadme(await showFileAt(repoDir, head, 'README.md'))
+  const beforeText = await showFileAt(repoDir, base, 'README.md')
+  const afterText = await showFileAt(repoDir, head, 'README.md')
+  const beforeEn = catalogFromReadme(beforeText)
+  const afterEn = catalogFromReadme(afterText)
   if (!beforeEn.size && !afterEn.size) return null
   const en = diffCatalogs(beforeEn, afterEn)
   const beforeZh = catalogFromReadme(await showFileAt(repoDir, base, 'README.zh-CN.md'))
   const afterZh = catalogFromReadme(await showFileAt(repoDir, head, 'README.zh-CN.md'))
   const zh = diffCatalogs(beforeZh, afterZh)
+  const tables = {}
+  const beforeRows = catalogRowsFromReadme(beforeText)
+  const afterRows = catalogRowsFromReadme(afterText)
+  const changed = new Set([...en.added, ...en.removed])
+  for (const name of changed) {
+    tables[name] = { before: beforeRows.get(name) || null, after: afterRows.get(name) || null }
+  }
+  const withTables = (r) => ({ ...r, tables })
   // Both languages track the same catalog: intersect to kill translation lag.
   // Fall back to EN when ZH is absent (older history) or disagrees entirely.
   const zhEmpty = !zh.added.length && !zh.removed.length
   const agree = (a, b) => a.every(x => b.includes(x))
-  if (!beforeZh.size && !afterZh.size) return en
-  if (zhEmpty && (en.added.length || en.removed.length)) return en
-  if (agree(en.added, zh.added) && agree(en.removed, zh.removed)) return en
-  if (agree(zh.added, en.added) && agree(zh.removed, en.removed)) return zh
+  if (!beforeZh.size && !afterZh.size) return withTables(en)
+  if (zhEmpty && (en.added.length || en.removed.length)) return withTables(en)
+  if (agree(en.added, zh.added) && agree(en.removed, zh.removed)) return withTables(en)
+  if (agree(zh.added, en.added) && agree(zh.removed, en.removed)) return withTables({ ...zh })
   const added = en.added.filter(x => zh.added.includes(x))
   const removed = en.removed.filter(x => zh.removed.includes(x))
-  return { added, removed }
+  return withTables({ added, removed })
 }
 
 export function extractModelTableChanges (patch) {
