@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, buildPrompt, enrichWithLlm, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, PROMPT_V } from '../lib/llm.mjs'
+import { parseLlmJson, buildPrompt, enrichWithLlm, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, PROMPT_V } from '../lib/llm.mjs'
 
 test('parseLlmJson: parses standard JSON object', () => {
   const json = '{"title": "New feature", "summary": "Added cool stuff", "significance": "major"}'
@@ -53,9 +53,30 @@ test('buildPrompt: includes diff, date, model changes, files, stats', () => {
   assert.match(prompt, /Muse Spark 1\.3/)
   assert.match(prompt, /CLI, Model Catalog/)
   assert.match(prompt, /diff --git a\/x b\/x/)
-  assert.match(prompt, /plain text, max 70 chars, no backticks/)
+  assert.match(prompt, /NON-TECHNICAL user/)
+  assert.match(prompt, /Summary shape \(2-4 sentences/)
+  assert.match(prompt, /BAD \(jargon/)
+  assert.match(prompt, /GOOD \(plain, why, action, detail\)/)
   assert.match(prompt, /Files: README\.md/)
   assert.match(prompt, /Stats: \+5 \/ -5/)
+})
+
+test('buildPrompt: passes facts, surfaces, commands into context', () => {
+  const entry = {
+    date: '2026-09-13T10:00:00Z',
+    areas: ['CLI'],
+    category: 'Commands',
+    significance: 'notable',
+    stats: { additions: 3, deletions: 1 },
+    files: { added: [], modified: ['cli/src/data/slash-commands.ts'] },
+    summary: 'New slash command /byok.',
+    cmdChanges: { added: ['/byok'], removed: [] },
+    facts: ['The byok command lets users bring their own key.']
+  }
+  const prompt = buildPrompt(entry, 'diff')
+  assert.match(prompt, /Key facts.*bring their own key/)
+  assert.match(prompt, /User surfaces: CLI/)
+  assert.match(prompt, /command line/)
 })
 
 test('error cooldown: recent failures are not retried', async (t) => {
@@ -148,6 +169,26 @@ test('budgetPatch: single-file patch passes through under budget', () => {
 // Golden eval: prompt must ground the model in verifiable signals.
 // A model rename buried in the diff is the classic hallucination risk:
 // the prompt must carry the catalog facts so the summary cannot invent them.
+test('firstSentence: extracts leading sentence', () => {
+  assert.equal(firstSentence('Muse Spark is back. Nothing to do.'), 'Muse Spark is back.')
+  assert.equal(firstSentence('What changed? Details follow!'), 'What changed?')
+  assert.equal(firstSentence('No punctuation here'), 'No punctuation here')
+})
+
+test('validateLlmOut: rejects jargon-first summaries', () => {
+  const bad = 'The free model catalog now offers Muse Spark 1.2 instead of Muse Spark 1.3. This change updates the model selection constants.'
+  assert.throws(() => validateLlmOut({ title: 'Model swap', summary: bad }, 'major'), /not plain/)
+  const codeFirst = 'Updated `cli/src/constants/models.ts` to swap pickers.'
+  assert.throws(() => validateLlmOut({ title: 'Model swap', summary: codeFirst }, 'major'), /not plain/)
+})
+
+test('validateLlmOut: accepts plain-first summary up to 1200 chars', () => {
+  const good = 'Muse Spark 1.2 is back in the free list, replacing 1.3, after 1.3 started returning not-found errors. Nothing to do: saved choices carry over automatically. The swap covers Web, the desktop app, and the command line.'
+  const out = validateLlmOut({ title: 'Muse Spark 1.2 replaces 1.3', summary: good }, 'major')
+  assert.equal(out.significance, 'major')
+  assert.ok(out.summary.length > 200)
+})
+
 test('golden: model-swap prompt carries catalog facts, no invented names', () => {
   const entry = {
     date: '2026-09-13T10:00:00Z',

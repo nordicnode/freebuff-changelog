@@ -23,7 +23,16 @@ export function llmConfigured (env = process.env) {
 }
 
 // Bump when buildPrompt changes so stale entries re-summarize exactly once.
-export const PROMPT_V = 2
+export const PROMPT_V = 3
+
+// First-sentence gate: sentence 1 is what non-technical users read.
+// Code tokens there mean the summary failed its audience.
+const S1_JARGON_RE = /`|[\w-]+\.(ts|tsx|js|json|md)|src\/|constants?|packages?|registry|catalog|snapshot|hunk|diff|CLI packages?/i
+
+export function firstSentence (s) {
+  const m = String(s || '').trim().match(/^[^.?!]+[.?!]/)
+  return (m ? m[0] : String(s || '').trim()).trim()
+}
 
 function patchHash (patch) {
   return createHash('sha1').update(patch).digest('hex').slice(0, 12)
@@ -64,13 +73,20 @@ export function budgetPatch (patch, maxBytes = 12000, perFile = 3000) {
 
 export function buildPrompt (entry, patch) {
   const lines = [
-    'You write changelog entries for Freebuff, a free AI coding agent, based on the exact diff a sync bot pushed to the public repo.',
+    'You write changelog entries for Freebuff, a free AI coding agent. Your reader is a NON-TECHNICAL user: they pick a model, type, and expect answers.',
     'Rules: use ONLY facts from the diff and the analysis notes below. Never invent file names, features, or versions.',
     'Title: plain text, max 70 chars, no backticks, no markdown, no trailing period. Lead with the user-visible change.',
-    'Summary: 1-3 sentences of plain prose. Name the files or subsystems touched. Never paste raw diff lines.',
-    `Output a JSON object: {"title": "<plain title>", "summary": "<summary>", "significance": "${entry.significance || 'minor'}"}.`,
+    'Summary shape (2-4 sentences, plain prose, no backticks in sentence 1):',
+    '1. WHAT a non-technical user notices, in everyday words (e.g. "Muse Spark 1.2 is back in the free list, replacing 1.3"). No file paths, no package names, no code terms.',
+    '2. WHY it happened, grounded in the notes/diff (e.g. "1.3 was removed after it started returning errors"). If the reason is not visible, say what the change does instead — never invent motives.',
+    '3. WHAT TO DO, if anything (e.g. "Nothing to do: your saved choice carries over"). If no action is needed, say so or omit this.',
+    '4. DETAIL for curious readers: name the areas touched in plain words (e.g. "the free model list on Web, desktop app, and command line"), plus one concrete fact (model trait, command name with leading slash, version number). Never paste raw diff lines.',
+    `Output a JSON object: {"title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "${entry.significance || 'minor'}"}.`,
     `Significance (deterministic default "${entry.significance || 'minor'}"): keep it unless the diff clearly contradicts it.`,
     'major = new feature, model added/removed, security, breaking. notable = user-visible behavior/UI change, new file, API change. minor = internal, refactor, types, comments, deps.',
+    '',
+    'BAD (jargon, no why, no action): "The free model catalog now offers Muse Spark 1.2 instead of Muse Spark 1.3. This change updates the model selection constants and documentation across the core and CLI packages."',
+    'GOOD (plain, why, action, detail): "Muse Spark 1.2 is back in the free list, replacing 1.3, after 1.3 started returning not-found errors. Nothing to do: saved choices carry over automatically. The swap covers Web, the desktop app, and the command line; 1.2 is the fast all-round pick."',
     '',
     `Date: ${entry.date}`,
     `Category: ${entry.category || (entry.areas || []).join(', ')}`,
@@ -83,6 +99,10 @@ export function buildPrompt (entry, patch) {
   if (entry.version) lines.push(`Version bump: ${entry.version}`)
   const files = [...(entry.files?.added || []), ...(entry.files?.modified || []).slice(0, 8)]
   if (files.length) lines.push(`Files: ${files.join(', ')}`)
+  const facts = (entry.facts || []).slice(0, 5)
+  if (facts.length) lines.push(`Key facts (ground the WHY and DETAIL sentences in these): ${facts.map(f => `- ${f}`).join(' ')}`)
+  const surfaces = (entry.areas || []).filter(a => ['CLI', 'Agents', 'Docs', 'Packaging'].includes(a))
+  if (surfaces.length) lines.push(`User surfaces: ${surfaces.join(', ')} (translate to plain words: CLI = "command line", Packaging = "desktop app / install", Agents = "built-in helpers", Docs = "help pages")`)
   lines.push('', 'Diff (bun.lock and pure test hunks omitted):', '```diff', budgetPatch(patch), '```')
   return lines.filter(Boolean).join('\n')
 }
@@ -136,14 +156,20 @@ async function callLlm (prompt, env, attempt = 1) {
 }
 
 // Schema gate: titles render via esc() so markdown would show literally;
-// strip it here. Significance falls back to the deterministic default.
+// strip it here. Sentence 1 must read plain for non-technical users:
+// code tokens there reject the output for one repair pass. Significance
+// falls back to the deterministic default.
 export function validateLlmOut (out, fallbackSig = 'minor') {
   if (!out || typeof out !== 'object') throw new Error('LLM output not an object')
   const rawTitle = String(out.title || '').trim()
   if (!rawTitle) throw new Error('LLM output missing title')
   const title = truncateWords(rawTitle.replace(/[`*#_[\]]/g, '').replace(/\s+/g, ' '), 70)
-  const summary = truncateWords(String(out.summary || '').trim(), 800)
-  if (!summary) throw new Error('LLM output missing summary')
+  const rawSummary = String(out.summary || '').trim()
+  if (!rawSummary) throw new Error('LLM output missing summary')
+  if (S1_JARGON_RE.test(firstSentence(rawSummary))) {
+    throw new Error(`LLM summary sentence 1 not plain: "${firstSentence(rawSummary).slice(0, 80)}"`)
+  }
+  const summary = truncateWords(rawSummary, 1200)
   const significance = ['minor', 'notable', 'major'].includes(out.significance) ? out.significance : fallbackSig
   return { title, summary, significance }
 }
