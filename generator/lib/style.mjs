@@ -10,8 +10,8 @@ export const CSS = `
   --term-border-strong:#484f58;
   
   --txt:#f0f6fc;
-  --txt-dim:#9da7b3;
-  --txt-subtle:#768390;
+  --txt-dim:#c2cbd4;
+  --txt-subtle:#9aa4ae;
   
   --term-green:#3fb950;
   --term-red:#f85149;
