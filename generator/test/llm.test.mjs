@@ -50,3 +50,52 @@ test('buildPrompt: includes diff, date, and model changes', () => {
   assert.match(prompt, /CLI, Model Catalog/)
   assert.match(prompt, /diff --git a\/x b\/x/)
 })
+
+test('error cooldown: recent failures are not retried', async (t) => {
+  const { mkdtemp, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { createHash } = await import('node:crypto')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-test-'))
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
+  const sha = 'a'.repeat(40)
+  const patch = 'diff --git a/x b/x\n+new line\n'
+  const key = `${sha}:${createHash('sha1').update(patch).digest('hex').slice(0, 12)}`
+  await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: { error: 'LLM HTTP 429', at: new Date().toISOString() } }))
+  const entries = [{ kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'CLI change.' }]
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'test-key', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
+  let fetchCalls = 0
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (...args) => { fetchCalls++; return origFetch(...args) }
+  try {
+    const n = await enrichWithLlm(entries, async () => patch, dir, env, { retryErrors: true })
+    assert.equal(n, 0)
+    assert.equal(fetchCalls, 0)
+  } finally {
+    globalThis.fetch = origFetch
+  }
+})
+
+test('error cooldown: old failures retry after cooldown', async (t) => {
+  const { mkdtemp, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { createHash } = await import('node:crypto')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-test-'))
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
+  const sha = 'b'.repeat(40)
+  const patch = 'diff --git a/y b/y\n+other line\n'
+  const key = `${sha}:${createHash('sha1').update(patch).digest('hex').slice(0, 12)}`
+  await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: { error: 'LLM HTTP 429', at: '2020-01-01T00:00:00.000Z' } }))
+  const entries = [{ kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'CLI change.' }]
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'test-key', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
+  let fetchCalls = 0
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (...args) => { fetchCalls++; return origFetch(...args) }
+  try {
+    await enrichWithLlm(entries, async () => patch, dir, env, { retryErrors: true })
+    assert.ok(fetchCalls >= 1)
+  } finally {
+    globalThis.fetch = origFetch
+  }
+})

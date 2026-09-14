@@ -211,11 +211,7 @@ async function listCommitsRange (repoDir, lastSha) {
 // ---------------------------------------------------------------------------
 
 async function cmdCatchUp (argv) {
-  const currentBranch = (await git(['branch', '--show-current'], ROOT, { allowFail: true }))?.trim() || 'main'
-  try {
-    await git(['pull', '--rebase', 'origin', currentBranch], ROOT, { allowFail: true })
-  } catch {}
-
+  // Cheap local check first: idle cycles exit before any network.
   const existing = await readJson(`${DATA}/changelog.json`, { version: 1, entries: [] })
   let entries = existing.entries || []
   if (!entries.length) {
@@ -232,6 +228,12 @@ async function cmdCatchUp (argv) {
     log('[backfill] all existing sync entries already have AI summaries!')
     return
   }
+
+  // Work exists: sync with origin before expensive calls.
+  const currentBranch = (await git(['branch', '--show-current'], ROOT, { allowFail: true }))?.trim() || 'main'
+  try {
+    await git(['pull', '--rebase', 'origin', currentBranch], ROOT, { allowFail: true })
+  } catch {}
 
   const head = await ensureRepo()
   await backfillDiffs(entries, 1000)
@@ -253,8 +255,9 @@ async function cmdCatchUp (argv) {
     }
     const envWithLimit = { ...process.env, CHANGELOG_LLM_LIMIT: String(limit) }
     const n = await enrichWithLlm(entries, getPatch, DATA, envWithLimit, { retryErrors: true })
-    log(`[backfill] enriched ${n} entries with LLM (${Math.max(0, unsummarizedSync.length - n)} remaining)`)
-    if (n > 0) {
+    const remaining = entries.filter(e => e.kind === 'sync' && !e.ai?.title).length
+    log(`[backfill] enriched ${n} entries with LLM (${remaining} remaining)`)
+    if (remaining < unsummarizedSync.length) {
       await writeJson(`${DATA}/changelog.json`, existing)
     }
   } else {
@@ -286,16 +289,23 @@ async function cmdWatch (argv) {
     intervalSec = Number(process.env.WATCH_INTERVAL) || 60
   }
 
+  let stopped = false
+  const stop = () => { stopped = true }
+  process.once('SIGINT', stop)
+  process.once('SIGTERM', stop)
+
   log(`starting backfill loop (running every ${intervalSec}s)… Press Ctrl+C to stop.`)
-  while (true) {
+  while (!stopped) {
     try {
       await cmdCatchUp(argv)
     } catch (err) {
       log(`backfill loop iteration error: ${err.message}`)
     }
+    if (stopped) break
     log(`sleeping ${intervalSec}s before next cycle…`)
     await new Promise(r => setTimeout(r, intervalSec * 1000))
   }
+  log('backfill loop stopped.')
 }
 
 // ---------------------------------------------------------------------------

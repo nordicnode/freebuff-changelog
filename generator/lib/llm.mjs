@@ -87,6 +87,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   const cache = await readJson(cachePath, {})
   const limit = Number(env.CHANGELOG_LLM_LIMIT || 60)
   const concurrency = Number(env.CHANGELOG_LLM_CONCURRENCY || 5)
+  const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
   let apiCalls = 0
   let cacheModified = false
 
@@ -99,8 +100,15 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     const patch = await getPatch(e)
     if (!patch) continue
     const key = `${e.sha}:${patchHash(patch)}`
-    if (cache[key]?.error && !options.retryErrors) continue
-    if (cache[key] && !cache[key].error) {
+    const cached = cache[key]
+    if (cached?.error) {
+      // Failed entries cool down before retrying: a 60s watch loop must not
+      // re-hit a failing endpoint on every cycle.
+      if (!options.retryErrors) continue
+      const failedAt = Date.parse(cached.at || '') || 0
+      if (Date.now() - failedAt < errorCooldownMs) continue
+    }
+    if (cached && !cached.error) {
       e.ai = { model: cache[key].model, title: cache[key].title, summary: cache[key].summary, significance: cache[key].significance, at: cache[key].at }
       continue // Cache hit does not consume the API budget
     }
@@ -137,7 +145,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           log(`LLM endpoint appears offline (${err.message}): skipping further attempts this run`)
           break
         }
-        cache[key] = { error: String(err.message).slice(0, 200) }
+        cache[key] = { error: String(err.message).slice(0, 200), at: new Date().toISOString() }
         cacheModified = true
       }
     }
