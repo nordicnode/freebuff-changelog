@@ -166,12 +166,25 @@ test('buildSite generates valid static site output', async () => {
     assert.match(feedXml, /https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/day\//)
     assert.doesNotMatch(feedXml, /pages\.dev/)
 
-    // Verify sitemap.xml and robots.txt use active domain
+    // Verify sitemap.xml is an index with day/release/page children
     const sitemapXml = await readFile(join(tmpDist, 'sitemap.xml'), 'utf8')
-    assert.match(sitemapXml, /https:\/\/freebuff-changelog\.nordicnode\.workers\.dev/)
+    assert.match(sitemapXml, /<sitemapindex/)
+    assert.match(sitemapXml, /sitemap-days\.xml/)
+    assert.match(sitemapXml, /sitemap-releases\.xml/)
+    assert.match(sitemapXml, /sitemap-pages\.xml/)
     assert.doesNotMatch(sitemapXml, /pages\.dev/)
+    const sitemapDays = await readFile(join(tmpDist, 'sitemap-days.xml'), 'utf8')
+    assert.match(sitemapDays, /\/day\/2026-09-13\//)
+    const sitemapRels = await readFile(join(tmpDist, 'sitemap-releases.xml'), 'utf8')
+    assert.match(sitemapRels, /\/release\/1\.0\.100\//)
+    const sitemapPages = await readFile(join(tmpDist, 'sitemap-pages.xml'), 'utf8')
+    assert.match(sitemapPages, /\/models\//)
     const robotsTxt = await readFile(join(tmpDist, 'robots.txt'), 'utf8')
     assert.match(robotsTxt, /https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/sitemap\.xml/)
+
+    // Verify feeds carry enriched content (summary + facts), not titles only
+    assert.match(feedXml, /<content:encoded/)
+    assert.match(feedXml, /New high-speed endpoint enabled\./)
 
     // Verify feed.xsl exists and sets data-theme="dark"
     const feedXsl = await readFile(join(tmpDist, 'feed.xsl'), 'utf8')
@@ -229,6 +242,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(modelsHtml, /CATALOG HISTORY \(1 CHANGES\)/)
     assert.match(modelsHtml, /\/day\/2026-09-13\/#bbbb11112222/)
     assert.match(modelsHtml, /\/models\//)
+    assert.match(modelsHtml, /href="\/feed-models\.xml"/)
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }

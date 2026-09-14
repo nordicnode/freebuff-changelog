@@ -251,6 +251,27 @@ export function extractVersionBump (patch) {
   return adds.length ? adds[adds.length - 1] : null
 }
 
+// Slash-commands registry: cli/src/data/slash-commands.ts holds ALL_SLASH_COMMANDS
+// with string `id:` fields. Snapshot both revs and set-diff the ids: renames
+// (same block, new id) surface as add+remove, description edits as nothing.
+const CMD_REGISTRY = 'cli/src/data/slash-commands.ts'
+const CMD_ID_RE = /^\s*id:\s*['"`]([^'"`]+)['"`]/gm
+
+export function commandIdsFromRegistry (text) {
+  const ids = new Set()
+  for (const m of (text || '').matchAll(CMD_ID_RE)) ids.add(m[1])
+  return ids
+}
+
+export async function snapshotCommandChanges (repoDir, base, head) {
+  const before = commandIdsFromRegistry(await showFileAt(repoDir, base, CMD_REGISTRY))
+  const after = commandIdsFromRegistry(await showFileAt(repoDir, head, CMD_REGISTRY))
+  if (!before.size && !after.size) return null
+  const added = [...after].filter(c => !before.has(c)).map(c => '/' + c)
+  const removed = [...before].filter(c => !after.has(c)).map(c => '/' + c)
+  return { added, removed }
+}
+
 // Slash-commands registry: cli/src/constants/commands.ts or similar.
 export function extractSlashCommandChanges (patch) {
   const rawAdded = [...patch.matchAll(/^\+\s*name:\s*['"`]([/a-z0-9-]+)['"`]/gm)].map(x => x[1])
@@ -330,7 +351,12 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
     }
     const pkgPatch = patchForFile(patch, 'cli/release/package.json')
     if (pkgPatch) version = extractVersionBump(pkgPatch) || version
-    if (/(commands|slash)/i.test(patchTargets.join(' '))) {
+    const registryTouched = meaningful.some(f => f.path === CMD_REGISTRY)
+    if (registryTouched) {
+      const cc = await snapshotCommandChanges(repoDir, prevSha, commit.sha)
+      if (cc && (cc.added.length || cc.removed.length)) cmdChanges = cc
+    }
+    if (!cmdChanges && /(commands|slash)/i.test(patchTargets.join(' '))) {
       const cc = extractSlashCommandChanges(patch)
       if (cc.added.length || cc.removed.length) cmdChanges = cc
     }

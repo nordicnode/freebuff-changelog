@@ -4,6 +4,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   extractModelTableChanges, extractVersionBump, extractSlashCommandChanges,
+  commandIdsFromRegistry,
   areaOf, isNoiseFile, deterministicSummary, entryTitle, sourceRef, isSyncCommit,
   extractCommentFacts, extractCleanDiff, parseMarkdownTables, catalogFromReadme,
   diffCatalogs
@@ -207,6 +208,37 @@ test('parseMarkdownTables: groups consecutive pipe lines', () => {
   const tables = parseMarkdownTables(text)
   assert.equal(tables.length, 2)
   assert.equal(tables[0].length, 3)
+})
+
+test('commandIdsFromRegistry: extracts string ids, ignores comments', () => {
+  const text = [
+    "const ALL_SLASH_COMMANDS: SlashCommand[] = [",
+    "  {",
+    "    id: 'help',",
+    "    label: 'help',",
+    "  },",
+    "  //   id: 'undo',",
+    "  //   label: 'undo',",
+    "  {",
+    '    id: "plan",',
+    "  },",
+    "  {",
+    "    id: 'agent:gpt-5',",
+    "  },",
+    "]"
+  ].join('\n')
+  const ids = commandIdsFromRegistry(text)
+  assert.ok(ids.has('help'))
+  assert.ok(ids.has('plan'))
+  assert.ok(ids.has('agent:gpt-5'))
+  assert.ok(!ids.has('undo'))
+  assert.equal(ids.size, 3)
+})
+
+test('commandIdsFromRegistry: description-only edit yields identical sets', () => {
+  const a = "  id: 'help',\n  description: 'old text',"
+  const b = "  id: 'help',\n  description: 'new text',"
+  assert.deepEqual([...commandIdsFromRegistry(a)], [...commandIdsFromRegistry(b)])
 })
 
 

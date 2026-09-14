@@ -205,8 +205,27 @@ async function cmdGenerate (argv) {
   await pruneDiffs(resolve(DATA, 'diffs'), entries)
 
   const prs = await fetchOpenPrs()
+  await prunePrDiffs(prs || [])
 
   log(`wrote ${entries.length} entries (${added} new this run)` + (prs ? `, ${prs.length} open PRs` : ''))
+}
+
+// Retention: delete pr-diffs/*.diff for PRs no longer open. Stale previews
+// accumulate as PRs merge; the client degrades to a GitHub link when missing.
+export async function prunePrDiffs (openPrs) {
+  const { readdir, unlink } = await import('node:fs/promises')
+  const dir = resolve(DATA, 'pr-diffs')
+  if (!existsSync(dir)) return 0
+  const open = new Set((openPrs || []).map(p => `${p.number}.diff`))
+  let pruned = 0
+  for (const f of await readdir(dir)) {
+    if (f.endsWith('.diff') && !open.has(f)) {
+      await unlink(resolve(dir, f))
+      pruned++
+    }
+  }
+  if (pruned > 0) log(`pruned ${pruned} closed-PR diffs`)
+  return pruned
 }
 
 async function backfillDiffs (entries, max = 1000) {
