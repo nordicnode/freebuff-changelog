@@ -993,6 +993,8 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
 <meta property="og:description" content="${esc(desc || SITE.desc)}">
 <meta property="og:type" content="website"><meta property="og:url" content="${abs(path)}">
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (major + notable)" href="${SITE.url}/feed.xml">
+<link rel="alternate" type="application/rss+xml" title="${SITE.name} (models only)" href="${SITE.url}/feed-models.xml">
+<link rel="alternate" type="application/rss+xml" title="${SITE.name} (releases only)" href="${SITE.url}/feed-releases.xml">
 <link rel="icon" type="image/x-icon" href="/favicon.ico">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>${CSS}</style></head><body><main>
@@ -1364,7 +1366,7 @@ export function generateFaviconIco () {
 const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="4" fill="#0d1117"/><text x="5" y="22" font-family="monospace" font-weight="bold" font-size="20" fill="#58a6ff">&gt;_</text></svg>`
 
 const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
-<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:atom="http://www.w3.org/2005/Atom">
   <xsl:output method="html" version="1.0" encoding="UTF-8" indent="yes"/>
   <xsl:template match="/">
     <html lang="en" data-theme="dark">
@@ -1422,7 +1424,7 @@ const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
             <div class="sub-callout">
               <span class="feed-badge">RSS 2.0</span>
               <p style="margin-top:6px">This is an RSS feed. To subscribe and receive updates automatically in your newsreader (Feedly, NetNewsWire, Miniflux, etc.), copy this URL:</p>
-              <code style="color:var(--term-green);font-size:12px"><xsl:value-of select="/rss/channel/link"/>/feed.xml</code>
+              <code style="color:var(--term-green);font-size:12px"><xsl:value-of select="/rss/channel/atom:link/@href"/></code>
             </div>
             <p style="font-size:12px;margin-top:8px">
               <a href="/">&lt; [back to changelog]</a>
@@ -1518,7 +1520,7 @@ ${d.entries.map(e => {
 }).join('\n')}</section>`).join('')
 
   await write(dist, 'index.html', layout({ title: 'Home', path: '/', body: hero + daysHtml +
-    `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss feed ]</a></div>` }))
+    `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>` }))
 
   // ----- per-day pages
   for (let i = 0; i < byDay.length; i++) {
@@ -1784,7 +1786,7 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
       <p>To turn raw unified diffs into clear, human-readable entries, we use <strong>Qwen 3.8 Flash</strong> to synthesize commit diffs and deterministic metadata into concise, accurate summaries. The model is constrained strictly to verified code changes from the diff (never inventing features, versions, or filenames) to ensure complete technical accuracy.</p>
       
       <h4>VERIFIABLE & OPEN</h4>
-      <p>Every entry links directly to the underlying GitHub commit and snapshot compare view for complete ground truth. Stay up to date via the <a href="/feed.xml">RSS feed</a>, explore historical changes in the <a href="/archive/">Archive</a>, or inspect upcoming community contributions on the <a href="/in-flight/">In-Flight PRs</a> page.</p>
+      <p>Every entry links directly to the underlying GitHub commit and snapshot compare view for complete ground truth. Stay up to date via the <a href="/feed.xml">RSS feed</a> (<a href="/feed-models.xml">models only</a>, <a href="/feed-releases.xml">releases only</a>), explore historical changes in the <a href="/archive/">Archive</a>, or inspect upcoming community contributions on the <a href="/in-flight/">In-Flight PRs</a> page.</p>
     </div>
   </div>
 </section>`
@@ -1829,19 +1831,24 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
     }))
   }
 
-  // ----- feeds / api
-  const feedEntries = entries.filter(e => e.significance !== 'minor').slice(0, 60)
-  const items = feedEntries.map(e => {
+  // ----- feeds: main (major+notable), models-only, releases-only
+  const feedItem = (e) => {
     const title = e.ai?.title || e.title || deriveTitleSafe(e)
     return `<item><title>${esc(title)}</title><link>${SITE.url}/day/${e.day}/#${e.sha.slice(0, 12)}</link>
 <guid isPermaLink="false">${esc(e.sha)}</guid><pubDate>${new Date(e.date).toUTCString()}</pubDate>
 <description>${esc(title)}: ${esc((e.ai?.summary || e.summary || '').replace(/[*`#]/g, ''))}</description></item>`
-  }).join('')
-  await write(dist, 'feed.xml',
+  }
+  const feedXml = (name, title, desc, items) =>
     `<?xml version="1.0" encoding="UTF-8"?>
 <?xml-stylesheet type="text/xsl" href="/feed.xsl"?>
-<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel><title>${SITE.name} (unofficial)</title>
-<link>${SITE.url}</link><atom:link href="${SITE.url}/feed.xml" rel="self" type="application/rss+xml" /><description>${esc(SITE.desc)}</description><language>en</language><lastBuildDate>${new Date(generated).toUTCString()}</lastBuildDate>${items}</channel></rss>`)
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel><title>${esc(title)}</title>
+<link>${SITE.url}</link><atom:link href="${SITE.url}/${name}" rel="self" type="application/rss+xml" /><description>${esc(desc)}</description><language>en</language><lastBuildDate>${new Date(generated).toUTCString()}</lastBuildDate>${items}</channel></rss>`
+  const mainItems = entries.filter(e => e.significance !== 'minor').slice(0, 60).map(feedItem).join('')
+  const modelItems = modelEntries.slice(0, 60).map(feedItem).join('')
+  const releaseItems = [...vers].reverse().slice(0, 60).map(feedItem).join('')
+  await write(dist, 'feed.xml', feedXml('feed.xml', `${SITE.name} (unofficial)`, SITE.desc, mainItems))
+  await write(dist, 'feed-models.xml', feedXml('feed-models.xml', `${SITE.name}: models (unofficial)`, 'Model catalog additions, retirements, and swaps in the Freebuff free picker.', modelItems))
+  await write(dist, 'feed-releases.xml', feedXml('feed-releases.xml', `${SITE.name}: releases (unofficial)`, 'Freebuff CLI and core package version bumps.', releaseItems))
   await write(dist, 'feed.xsl', FEED_XSL)
   await writeBinary(`${dist.replace(/\/$/, '')}/favicon.ico`, generateFaviconIco())
   await write(dist, 'favicon.svg', FAVICON_SVG)
@@ -1882,6 +1889,10 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
 /search-index.json
   Cache-Control: public, max-age=3600
 /feed.xml
+  Cache-Control: public, max-age=600
+/feed-models.xml
+  Cache-Control: public, max-age=600
+/feed-releases.xml
   Cache-Control: public, max-age=600
 /sitemap.xml
   Cache-Control: public, max-age=86400

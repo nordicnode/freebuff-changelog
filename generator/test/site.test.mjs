@@ -162,8 +162,23 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /<html lang="en" data-theme="dark">/)
     assert.match(indexHtml, /href="\/favicon\.ico"/)
 
-    // Verify _headers contains wildcard rules, diffs, favicons, and CORS
+    // Verify split feeds: main, models-only, releases-only with correct self links
+    assert.match(feedXml, /<atom:link href="https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/feed\.xml" rel="self"/)
+    assert.match(feedXml, /Muse Spark 1\.3 replaces Muse Spark 1\.2/)
+    const feedModels = await readFile(join(tmpDist, 'feed-models.xml'), 'utf8')
+    assert.match(feedModels, /<atom:link href="https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/feed-models\.xml" rel="self"/)
+    assert.match(feedModels, /Muse Spark 1\.3 replaces Muse Spark 1\.2/)
+    assert.match(feedModels, /models \(unofficial\)/)
+    const feedReleases = await readFile(join(tmpDist, 'feed-releases.xml'), 'utf8')
+    assert.match(feedReleases, /<atom:link href="https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/feed-releases\.xml" rel="self"/)
+    assert.match(feedReleases, /Add awesome feature/)
+    assert.match(feedReleases, /releases \(unofficial\)/)
+    assert.match(indexHtml, /href="\/feed-models\.xml"/)
+    assert.match(indexHtml, /href="\/feed-releases\.xml"/)
+    // Verify _headers contains wildcard rules, diffs, favicons, feeds, and CORS
     const headers = await readFile(join(tmpDist, '_headers'), 'utf8')
+    assert.match(headers, /\/feed-models\.xml/)
+    assert.match(headers, /\/feed-releases\.xml/)
     assert.match(headers, /\/day\/\*/)
     assert.match(headers, /\/release\/\*/)
     assert.match(headers, /\/diffs\/\*/)
