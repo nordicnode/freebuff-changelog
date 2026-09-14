@@ -319,20 +319,10 @@ async function cmdBuild () {
     }
   }
   const prs = await readJson(`${DATA}/open-prs.json`, [])
-  const diffs = new Map()
   const dataDiffs = resolve(DATA, 'diffs')
-  if (existsSync(dataDiffs)) {
-    const { readdir } = await import('node:fs/promises')
-    const files = await readdir(dataDiffs)
-    for (const f of files) {
-      if (f.endsWith('.diff')) {
-        diffs.set(f.slice(0, -5), await readFile(resolve(dataDiffs, f), 'utf8'))
-      }
-    }
-  }
   const dist = resolve(ROOT, 'dist')
   const t0 = Date.now()
-  await buildSite({ changelog, openPrs: prs, dist, diffs })
+  await buildSite({ changelog, openPrs: prs, dist })
 
   const distDiffs = resolve(dist, 'diffs')
   if (existsSync(dataDiffs)) {

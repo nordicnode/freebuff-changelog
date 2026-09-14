@@ -1176,53 +1176,14 @@ function fileChips (e) {
   return chips.length ? `<div class="files">${chips.join('')}</div>` : ''
 }
 
-function formatDiffHtml (diffText) {
-  const lines = diffText.split(/\r?\n/)
-  const out = []
-  for (const line of lines) {
-    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff --git') || line.startsWith('index ')) {
-      out.push(`<div class="diff-line diff-hdr"><span class="diff-marker"> </span><span class="diff-text">${esc(line)}</span></div>`)
-    } else if (line.startsWith('+')) {
-      out.push(`<div class="diff-line diff-add"><span class="diff-marker">+</span><span class="diff-text">${esc(line.slice(1))}</span></div>`)
-    } else if (line.startsWith('-')) {
-      out.push(`<div class="diff-line diff-del"><span class="diff-marker">−</span><span class="diff-text">${esc(line.slice(1))}</span></div>`)
-    } else if (line.startsWith('@@')) {
-      out.push(`<div class="diff-line diff-hunk"><span class="diff-marker"> </span><span class="diff-text">${esc(line)}</span></div>`)
-    } else {
-      out.push(`<div class="diff-line"><span class="diff-marker"> </span><span class="diff-text">${esc(line.startsWith(' ') ? line.slice(1) : line)}</span></div>`)
-    }
-  }
-  return out.join('')
-}
-
-function entryCard (e, diffs, isExpanded = false) {
-  const t = fmtDateHuman(e.date)
+function entryCard (e, isExpanded = false) {
   const time = e.date.slice(11, 16)
   const anchor = e.sha.slice(0, 12)
   const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
-  const preDiff = diffs?.get ? diffs.get(e.sha) : (diffs ? diffs[e.sha] : null)
+  // Diffs lazy-load in the browser on toggle (fetch /diffs/<sha>.diff),
+  // so the server never holds diff text in memory or bloats pages with it.
   let diffViewer = ''
-  if (preDiff) {
-    diffViewer = `<details class="diff-viewer" data-sha="${e.sha}">
-<summary class="diff-toggle">
-  <span class="diff-toggle-left">
-    <span class="diff-arrow">&gt;</span>
-    <span>View inline diff</span>
-  </span>
-  <span class="diff-badge">+${e.stats.additions} / −${e.stats.deletions}</span>
-</summary>
-<div class="diff-body">
-  <div class="diff-toolbar">
-    <span class="diff-toolbar-title">$ git diff ${anchor}^!</span>
-    <div class="diff-toolbar-actions">
-      <button class="diff-copy-btn" onclick="copyDiff(this)">[copy diff]</button>
-      ${e.compareUrl ? `<a class="diff-gh-btn" href="${esc(e.compareUrl)}" target="_blank" rel="noopener">[github]</a>` : ''}
-    </div>
-  </div>
-  <pre class="diff-pre">${formatDiffHtml(preDiff)}</pre>
-</div>
-</details>`
-  } else if (e.kind === 'sync') {
+  if (e.kind === 'sync') {
     diffViewer = `<details class="diff-viewer" data-sha="${e.sha}" data-gh="${esc(e.compareUrl || e.url || '')}">
 <summary class="diff-toggle">
   <span class="diff-toggle-left">
@@ -1448,7 +1409,7 @@ const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
 
 async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, '')}/${p}`, html) }
 
-export async function buildSite ({ changelog, openPrs, dist, diffs = new Map() }) {
+export async function buildSite ({ changelog, openPrs, dist }) {
   const entries = [...changelog.entries].reverse() // newest first
   const byDay = groupByDay(entries)
   const major = entries.filter(e => e.significance === 'major')
@@ -1500,7 +1461,7 @@ export async function buildSite ({ changelog, openPrs, dist, diffs = new Map() }
 ${d.entries.map(e => {
   const open = isFirstIndex
   isFirstIndex = false
-  return entryCard(e, diffs, open)
+  return entryCard(e, open)
 }).join('\n')}</section>`).join('')
 
   await write(dist, 'index.html', layout({ title: 'Home', path: '/', body: hero + daysHtml +
@@ -1520,7 +1481,7 @@ ${d.entries.map(e => {
       desc: `${d.entries.length} Freebuff changes on ${d.day}`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">DAILY_LOG :: ${esc(d.day)}</span><span>${d.entries.length} entries</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Reconstructed public snapshot commits pushed to CodebuffAI/freebuff on this date.</p></div></section>` +
         dayPager +
-        `<section class="day">${d.entries.map((e, entryIdx) => entryCard(e, diffs, entryIdx === 0)).join('\n')}</section>` +
+        `<section class="day">${d.entries.map((e, entryIdx) => entryCard(e, entryIdx === 0)).join('\n')}</section>` +
         dayPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/">&larr; [latest]</a> &middot; <a href="/archive/">[archive]</a></p>`
     }))
@@ -1546,7 +1507,7 @@ ${d.entries.map(e => {
       desc: `Freebuff v${rel.version}: ${mine.length} changes since the previous release.`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(rel.version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Freebuff v${esc(rel.version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p></div></section>` +
         relPager +
-        `<section class="day">${[rel, ...mine].map((e, entryIdx) => entryCard(e, diffs, entryIdx === 0)).join('\n')}</section>` +
+        `<section class="day">${[rel, ...mine].map((e, entryIdx) => entryCard(e, entryIdx === 0)).join('\n')}</section>` +
         relPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/archive/#releases">&larr; [all releases]</a> &middot; <a href="/">[latest]</a></p>`
     }))
@@ -1726,7 +1687,7 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
       <strong>Subsystems &amp; Areas:</strong> Automatic categorization across 9 areas: <em>AI &amp; Agents</em>, <em>Models</em>, <em>UI &amp; CLI</em>, <em>Performance</em>, <em>Testing</em>, <em>Core</em>, <em>Packaging</em>, <em>Docs</em>, and <em>Internal</em>.<br>
       <strong>Significance &amp; Impact:</strong> Tiering every commit as <code>major</code> (new models/features/releases), <code>notable</code> (UI changes, new files, large churn), or <code>minor</code> (internal refactors, types, dependencies).<br>
       <strong>Code Churn &amp; Files:</strong> Additions (<code>+</code>) and deletions (<code>−</code>) across modified, added, renamed, or deleted files, distinguishing real code changes from massive generated lockfiles.<br>
-      <strong>Clean Code Diffs:</strong> Pre-rendered unified diffs with syntax highlighting, stripping out lockfile noise and pure test hunks.<br>
+      <strong>Clean Code Diffs:</strong> Full unified diffs on every sync entry, loaded on demand, stripping out lockfile noise and pure test hunks.<br>
       <strong>In-Flight PRs:</strong> Active community pull requests and drafts on upstream Freebuff ahead of merges with live diffstats.<br>
       <strong>Upstream Attribution:</strong> Unmasking opaque <em>"Sync public snapshot"</em> commits to link back to the exact source commit SHA and author.</p>
       

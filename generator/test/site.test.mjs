@@ -92,6 +92,10 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /href="\/in-flight\/"/)
     assert.match(indexHtml, /class="diff-viewer" data-sha=/)
     assert.match(indexHtml, /View inline diff/)
+    // Diffs lazy-load on toggle: no pre-rendered diff markup in pages
+    assert.doesNotMatch(indexHtml, /<pre class="diff-pre">/)
+    assert.doesNotMatch(indexHtml, /<div class="diff-line/)
+    assert.match(indexHtml, /Loading diff…/)
     assert.doesNotMatch(indexHtml, /class="sync-badge"/)
     assert.match(indexHtml, /class="sync-val"/)
     assert.match(indexHtml, /NEXT SYNC:/)
