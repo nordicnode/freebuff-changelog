@@ -476,7 +476,7 @@ test('buildSite generates valid static site output', async () => {
     // and where to find it: a bare "27" for CLI reads as "that is all there is".
     assert.match(indexHtml, /data-filter="cli" data-label="CLI" data-total="2" data-href="\/changes\/cli\/"/)
     assert.match(indexHtml, /data-filter="churn" data-label="churn" data-total="1" data-href="\/changes\/churn\/"/)
-    assert.match(indexHtml, /id="filter-all">3 changes all-time across 2 categories <a href="\/changes\/"/,
+    assert.match(indexHtml, /id="filter-all">3 changes all-time across 2 categories <a href="\/archive\/"/,
       'the note line states the all-time total next to the page count')
     assert.equal(rowTags(indexHtml).filter(t => t.includes('data-churn="1"')).length, 1)
     assert.ok(rowTags(indexHtml).every(t => t.includes('data-cat="')), 'every row is filterable by category')
@@ -506,10 +506,6 @@ test('buildSite generates valid static site output', async () => {
     // /changes/<category>/ is the all-time half of the filter question: complete
     // lists, compact rows, one click from the full body. A chip that says "27
     // here" needs somewhere that can answer "1,413 exist".
-    const hubHtml = await readFile(join(tmpDist, 'changes/index.html'), 'utf8')
-    assert.equal((hubHtml.match(/class="tile"/g) || []).length, 3, 'hub lists every category plus churn')
-    assert.match(hubHtml, /href="\/changes\/cli\/"><b>CLI<\/b><span>2 changes<\/span>/)
-    assert.match(hubHtml, /href="\/changes\/churn\/"><b>Churn<\/b><span>1 churn commits<\/span>/)
     const cliPage = await readFile(join(tmpDist, 'changes/cli/index.html'), 'utf8')
     assert.match(cliPage, /<div class="crow" id="dddd11112222"/)
     assert.match(cliPage, /href="\/day\/2026-09-13\/#dddd11112222"/, 'compact row links to the full body')
@@ -528,9 +524,16 @@ test('buildSite generates valid static site output', async () => {
     // Archive tiles used to send a category click to a text search; they now
     // point at the complete list.
     const archivePage = await readFile(join(tmpDist, 'archive/index.html'), 'utf8')
+    assert.equal((archivePage.match(/class="tile"/g) || []).length, 3, 'archive carries the category tiles plus churn')
+    assert.match(archivePage, /href="\/changes\/cli\/"><b>CLI<\/b><span>2 changes<\/span>/)
+    assert.match(archivePage, /href="\/changes\/churn\/"><b>Churn<\/b><span>1 churn commits<\/span>/)
     assert.match(archivePage, /href="\/changes\/cli\/"/)
     assert.doesNotMatch(archivePage, /href="\/search\/\?q=CLI"/, 'no category tile masquerading as a search')
-    assert.match(indexHtml, /href="\/changes\/"[^>]*>\/changes</, 'nav offers the all-time browse')
+    assert.doesNotMatch(indexHtml, /href="\/changes\/"[^>]*>\/changes</, 'nav no longer offers the removed hub')
+    assert.match(indexHtml, /href="\/archive\/"[^>]*>\/archive</, 'nav offers the archive')
+    await assert.rejects(readFile(join(tmpDist, 'changes/index.html'), 'utf8'), 'the hub page is gone')
+    const redirectsTxt = await readFile(join(tmpDist, '_redirects'), 'utf8')
+    assert.match(redirectsTxt, /^\/changes\/ \/archive\/ 301$/m, 'old hub URL redirects to archive')
     assert.equal(ruleFor(rules, '/changes/*').headers['cache-control'], 'public, max-age=60, stale-while-revalidate=300')
     for (const url of ['/changes/', '/changes/cli/', '/changes/churn/']) {
       assert.deepEqual(duplicatedHeaders(rules, url), [], `overlapping _headers rules for ${url}`)

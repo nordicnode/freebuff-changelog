@@ -58,7 +58,6 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
     <a href="/about/" class="${path === '/about/' ? 'active' : ''}">/about</a>
     <a href="/models/" class="${path.startsWith('/models/') ? 'active' : ''}">/models</a>
     <a href="/stats/" class="${path.startsWith('/stats/') ? 'active' : ''}">/stats</a>
-    <a href="/changes/" class="${path.startsWith('/changes/') ? 'active' : ''}">/changes</a>
     <a href="/archive/" class="${path.startsWith('/archive/') ? 'active' : ''}">/archive</a>
     <a href="/search/" class="${path.startsWith('/search/') ? 'active' : ''}">/search</a>
     <a href="/in-flight/" class="${path.startsWith('/in-flight/') ? 'active' : ''}">/in-flight</a>
@@ -637,7 +636,7 @@ export async function buildSite ({ changelog, openPrs, dist }) {
   const chipHtml = (slug, label, n, active, extraClass) => {
     const b = browseBySlug.get(slug)
     const total = b ? b.list.length : meaningful.length
-    const href = b ? `/changes/${b.slug}/` : '/changes/'
+    const href = b ? `/changes/${b.slug}/` : '/archive/'
     return `  <button type="button" class="chip${active ? ' active' : ''}${extraClass}" data-filter="${esc(slug)}" data-label="${esc(label)}" data-total="${total}" data-href="${esc(href)}" aria-pressed="${active ? 'true' : 'false'}">${esc(label)}<span class="chip-n">${n.toLocaleString()}</span></button>`
   }
 
@@ -703,7 +702,7 @@ ${[
       chipHtml('churn', 'churn', churn, false, ' chip-churn')
     ].join('\n')}
 </nav>
-<p class="filter-note" data-hub="/changes/" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? 'churn hidden' : 'no churn that day'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/changes/">browse every change by category</a></span></p>`
+<p class="filter-note" data-hub="/archive/" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? 'churn hidden' : 'no churn that day'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/archive/">browse every change by category</a></span></p>`
 
     // One row starts open: the day's newest *visible* entry. Churn is hidden by
     // default, so the flag passes to the first row a reader can actually see
@@ -723,7 +722,7 @@ ${rows.map(e => {
     return hero + pagePager(i, true) + filterBar + dayHtml + pagePager(i) +
       (latest
         ? `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>`
-        : `<p style="margin-top:20px;font-size:.82rem"><a href="/">&larr; [latest]</a> &middot; <a href="/archive/">[archive]</a> &middot; <a href="/changes/">[by category]</a></p>`)
+        : `<p style="margin-top:20px;font-size:.82rem"><a href="/">&larr; [latest]</a> &middot; <a href="/archive/">[archive]</a></p>`)
   }
 
   // Front-page filters. Every row the timeline can show is already in the DOM,
@@ -748,7 +747,7 @@ ${rows.map(e => {
   var noteEl = document.querySelector('.filter-note em');
   var noteWrap = document.querySelector('.filter-note');
   var allEl = document.getElementById('filter-all');
-  var HUB = (noteWrap && noteWrap.getAttribute('data-hub')) || '/changes/';
+  var HUB = (noteWrap && noteWrap.getAttribute('data-hub')) || '/archive/';
   var ALL_TOTAL = Number(noteWrap && noteWrap.getAttribute('data-all')) || 0;
   var CAT_COUNT = Number(noteWrap && noteWrap.getAttribute('data-cats')) || 0;
   function chipFor(slug) { return bar.querySelector('.chip[data-filter="' + slug + '"]') }
@@ -971,30 +970,11 @@ ${rows.map(e => {
     }))
   }), 8)
 
-  // ----- all-time category pages: /changes/ and /changes/<slug>/
+  // ----- all-time category lists: /changes/<slug>/; the category tiles live on /archive/
   // The front page renders ~90 real changes, so its chips can only ever narrow
   // that window. These pages are the other half of the question -- "every CLI
   // change, all time" -- and being static they are crawlable, linkable and
   // shareable, which a client-side toggle on the front page can never be.
-  const hubTiles = browseList.map(b =>
-    `<a class="tile" href="/changes/${b.slug}/"><b>${esc(b.label)}</b><span>${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : 'changes'}</span></a>`).join('')
-  await write(dist, 'changes/index.html', layout({
-    title: 'Browse every change by category', path: '/changes/',
-    desc: `Complete, all-time lists of each category of change in Freebuff: ${browseList.map(b => `${b.label} (${b.list.length.toLocaleString()})`).join(', ')}.`,
-    ogImage: '',
-    body: `<section class="hero">
-  <div class="term-box">
-    <div class="term-box-hdr">
-      <span class="term-box-title">CHANGE_INDEX :: ${browseList.length} lists</span>
-      <span>${meaningful.length.toLocaleString()} changes${churnNote}</span>
-    </div>
-    <div style="font-size:.76rem;color:var(--txt-subtle);margin-bottom:6px">CATEGORIES:</div>
-    <div class="grid">${hubTiles}</div>
-  </div>
-</section>
-<p class="list-note">Every entry is listed, newest first, ${esc(first.day)} through ${esc(last.day)}. Churn -- dependency lockfiles, icon sets, empty merges -- gets its own list rather than being hidden: it is real repository activity, just not the kind a reader wants mixed into change lists.</p>
-<div class="pager"><a href="/archive/">[ archive by day ]</a><a href="/search/">[ search and filter ]</a></div>`
-  }))
   const browseTasks = browseList.map(b => async () => {
     const list = b.list // already newest-first, same order as the timeline
     const days = groupByDay(list)
@@ -1007,7 +987,7 @@ ${rows.map(e => {
     </div>
     <div class="term-footer-bar">
       <span>${days.length} days &middot; ${esc(list.at(-1).day)} &rarr; ${esc(list[0].day)}</span>
-      <span><a href="/changes/">[ all categories ]</a></span>
+      <span><a href="/archive/">[ all categories ]</a></span>
     </div>
   </div>
 </section>
@@ -1015,7 +995,7 @@ ${rows.map(e => {
   <div class="day-line"><h2><time datetime="${d.day}">[ ${esc(fmtDateHuman(d.day))} ]</time></h2><span class="day-count">${d.entries.length} ${unit}${d.entries.length === 1 ? '' : 's'}</span></div>
 ${d.entries.map(changeRow).join('\n')}
 </section>`).join('\n') + `
-<div class="pager"><a href="/changes/">[ all categories ]</a><a href="/">[ back to the timeline ]</a></div>`
+<div class="pager"><a href="/archive/">[ all categories ]</a><a href="/">[ back to the timeline ]</a></div>`
     await write(dist, `changes/${b.slug}/index.html`, layout({
       title: `${b.label} — all time`, path: `/changes/${b.slug}/`,
       desc: `All ${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : b.label + ' changes'} recorded from Freebuff's public snapshots, newest first.`,
@@ -1033,8 +1013,8 @@ ${d.entries.map(changeRow).join('\n')}
   // taxonomy copy, these tiles) now derive from the same lists the /changes/
   // pages render, so a number can never disagree with the list behind it.
   const cats = new Map([...catLists.entries()].map(([c, list]) => [c, list.length]))
-  const catTiles = browseList.filter(b => !b.churn).map(b =>
-    `<a class="tile" href="/changes/${b.slug}/"><b>${esc(b.label)}</b><span>${b.list.length.toLocaleString()} changes</span></a>`).join('')
+  const catTiles = browseList.map(b =>
+    `<a class="tile" href="/changes/${b.slug}/"><b>${esc(b.label)}</b><span>${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : 'changes'}</span></a>`).join('')
   
   const relCards = [...vers].reverse().map(v =>
     `<div class="release-card"><a href="/release/${v.version}/">v${esc(v.version)}</a><span style="font-size:.74rem;color:var(--txt-subtle)">${esc(v.date.slice(0, 10))}</span></div>`
@@ -1072,6 +1052,7 @@ ${d.entries.map(changeRow).join('\n')}
     <details class="cat-collapse" open><summary class="cat-toggle">[${cats.size} categories — toggle]</summary><div class="grid">${catTiles}</div></details>
   </div>
 </section>
+<p class="list-note">Every entry is listed, newest first, ${esc(first.day)} through ${esc(last.day)}. Churn -- dependency lockfiles, icon sets, empty merges -- gets its own list rather than being hidden: it is real repository activity, just not the kind a reader wants mixed into change lists.</p>
 <div class="section-hdr">
   <h2 id="releases">RELEASES (${vers.length})</h2>
 </div>
@@ -1317,14 +1298,14 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
 
       <h4>HOW TO USE</h4>
       <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a>. Click a row to expand the full entry in place: summary, inline diff (where kept), per-file stats, and links to the exact commit and compare view on GitHub. Share <code>/day/&lt;date&gt;/#sha</code> to point at one specific change.</p>
-      <p><strong>Find.</strong> The chip bar above the timeline filters the rows on that page by category (the churn chip toggles lockfile-only noise). <a href="/search/">/search/</a> queries every entry ever recorded — press <code>/</code> on any page to jump there — and <a href="/changes/">/changes/</a> lists each category across all time.</p>
+      <p><strong>Find.</strong> The chip bar above the timeline filters the rows on that page by category (the churn chip toggles lockfile-only noise). <a href="/search/">/search/</a> queries every entry ever recorded — press <code>/</code> on any page to jump there — and the <a href="/archive/">/archive/</a> category tiles list each category across all time.</p>
       <p><strong>Models, releases, PRs.</strong> <a href="/models/">/models/</a> replays the free-picker catalog with a page per model; <a href="/archive/#releases">release pages</a> list every commit between two versions; <a href="/stats/">/stats/</a> charts churn and cadence; <a href="/in-flight/">/in-flight/</a> previews open upstream pull requests before they merge.</p>
 
       <h4>LIMITS</h4>
       <p>Snapshots squash upstream history, so intra-snapshot sequencing is approximate and authorship resolves to the snapshot bot. Diffs older than 90 days are pruned (day pages fall back to GitHub compare links). AI summaries describe only what the diff shows — no research, no speculation on model capabilities beyond the README row.</p>
 
       <h4>FOLLOW ALONG</h4>
-      <p><a href="/feed.xml">RSS</a> (major + notable), <a href="/feed-models.xml">models only</a>, <a href="/feed-releases.xml">releases only</a>. <a href="/search/">Search</a> supports category and impact filters; <a href="/changes/">Categories</a> list every change of each type, all time; <a href="/stats/">stats</a> charts churn and cadence; <a href="/archive/">Archive</a> holds every day and release. Source: a local sync daemon pushing <code>data/</code> on every upstream commit (45-minute freshness budget), with an hourly GitHub Action as fallback; Cloudflare deploys on push.</p>
+      <p><a href="/feed.xml">RSS</a> (major + notable), <a href="/feed-models.xml">models only</a>, <a href="/feed-releases.xml">releases only</a>. <a href="/search/">Search</a> supports category and impact filters; <a href="/archive/">Categories</a> list every change of each type, all time; <a href="/stats/">stats</a> charts churn and cadence; <a href="/archive/">Archive</a> holds every day and release. Source: a local sync daemon pushing <code>data/</code> on every upstream commit (45-minute freshness budget), with an hourly GitHub Action as fallback; Cloudflare deploys on push.</p>
     </div>
   </div>
 </section>`
@@ -1429,13 +1410,14 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   const dayUrls = byDay.map(d => `/day/${d.day}/`)
   const relUrls = vers.map(v => `/release/${v.version}/`)
   const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`)]
-  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/changes/', ...browseList.map(b => `/changes/${b.slug}/`), ...(openPrs?.length ? ['/in-flight/'] : [])]
+  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', ...browseList.map(b => `/changes/${b.slug}/`), ...(openPrs?.length ? ['/in-flight/'] : [])]
   await write(dist, 'sitemap-days.xml', urlset(dayUrls))
   await write(dist, 'sitemap-releases.xml', urlset(relUrls))
   await write(dist, 'sitemap-models.xml', urlset(modelUrls))
   await write(dist, 'sitemap-pages.xml', urlset(pageUrls))
   await write(dist, 'sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-pages.xml'].map(f => `<sitemap><loc>${SITE.url}/${f}</loc></sitemap>`).join('')}</sitemapindex>`)
   await write(dist, 'robots.txt', `User-agent: *\nAllow: /\nSitemap: ${SITE.url}/sitemap.xml\n`)
+  await write(dist, '_redirects', '/changes/ /archive/ 301\n')
   // Cache policy. Entry data changes on every sync (~2min), so nothing that
   // carries it may hold a long TTL; only SHA-keyed immutable assets keep
   // year-scale caching. Rules must also never overlap on one header: _headers
