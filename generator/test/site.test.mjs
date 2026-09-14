@@ -123,9 +123,8 @@ test('buildSite generates valid static site output', async () => {
 
     // Verify collapsible entries: latest commit is open by default, previous commit is collapsed
     assert.match(indexHtml, /<details class="entry major" id="bbbb11112222" open>/)
-    // Second (older) day collapses to teasers on the homepage
-    assert.match(indexHtml, /<details class="entry teaser major" id="aaaa11112222">/)
-    assert.doesNotMatch(indexHtml, /<details class="entry teaser major" id="aaaa11112222" open>/)
+    // Second (older) day renders plain teaser rows linking to day pages
+    assert.match(indexHtml, /<article class="entry teaser major" id="aaaa11112222">/)
     assert.match(indexHtml, /class="entry-summary"/)
     assert.doesNotMatch(indexHtml, /class="badge ai"/)
     assert.doesNotMatch(indexHtml, /Summarized by/)
@@ -295,8 +294,9 @@ test('buildSite generates valid static site output', async () => {
     const dayHtml2 = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
     assert.match(dayHtml2, /class="day-jump"/)
     assert.match(dayHtml2, /data-mode="split"/)
-    // Homepage teasers: older days collapse, first day stays full
-    assert.match(indexHtml, /class="entry teaser/)
+    // Homepage teasers: older days are plain link rows, first day stays full
+    assert.match(indexHtml, /<article class="entry teaser/)
+    assert.doesNotMatch(indexHtml, /<details class="entry teaser/)
     // Day pages carry related links + per-day OG image
     assert.match(dayHtml2, /RELATED:/)
     assert.match(dayHtml2, /og\/2026-09-13\.svg/)

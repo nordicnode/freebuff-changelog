@@ -415,22 +415,20 @@ function entryCard (e, isExpanded = false, mode = 'full', relatedIdx = null) {
   const anchor = e.sha.slice(0, 12)
   const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
   if (mode === 'teaser') {
-    // Lightweight homepage row: title + facts only. No diff viewer, file
-    // chips, or swap embeds (full card lives on the day page).
+    // Lightweight homepage row: title + facts only, linking to the full
+    // card on the day page. A plain article (not <details>) so it never
+    // pretends to expand with nothing to show.
     const factLine = e.facts?.length ? `<div class="teaser-facts">${e.facts.length} key fact${e.facts.length === 1 ? '' : 's'} &middot; +${e.stats.additions} / −${e.stats.deletions}</div>` : ''
-    return `<details class="entry teaser ${e.significance}" id="${anchor}">
-<summary class="entry-summary">
+    return `<article class="entry teaser ${e.significance}" id="${anchor}">
   <div class="entry-meta-top">
-    <span class="entry-arrow">&gt;</span>
     <span class="commit-ref">commit <a href="/day/${e.day}/#${anchor}">${anchor}</a></span>
     <span class="entry-utc">${esc(time)} UTC</span>
     <div class="badges">${badges(e)}</div>
-    <a class="permalink" href="/day/${e.day}/#${anchor}" title="Permalink" aria-label="Permalink" onclick="event.stopPropagation()">#</a>
+    <a class="permalink" href="/day/${e.day}/#${anchor}" title="Permalink" aria-label="Permalink">#</a>
   </div>
   <h3 class="entry-title"><a href="/day/${e.day}/#${anchor}">${title}</a></h3>
   ${factLine}
-</summary>
-</details>`
+</article>`
   }
   // Diffs lazy-load in the browser on toggle (fetch /diffs/<sha>.diff),
   // so the server never holds diff text in memory or bloats pages with it.
