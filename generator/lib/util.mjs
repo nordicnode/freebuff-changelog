@@ -119,39 +119,60 @@ export async function pool (tasks, n = 8) {
   return out
 }
 
-// Exclusive worktree lock. The backfill daemon and a manual `npm run generate`
-// share one checkout and the same derived files, so overlapping runs would race
-// on git state (a pull --rebase cannot run over the other's half-written data/).
-// mkdir is atomic, and a stale lock is taken over so a killed service cannot
-// wedge the pipeline until someone notices.
-export async function withLock (lockDir, fn, { staleMs = 30 * 60000, retries = 2 } = {}) {
-  const { mkdir, rm, stat, writeFile } = await import('node:fs/promises')
+/**
+ * Exclusive worktree lock. The backfill daemon and a manual `npm run generate`
+ * share one checkout and the same derived files, so overlapping runs would race
+ * on git state (a pull --rebase cannot run over the other's half-written data/).
+ *
+ * mkdir is atomic. Staleness is decided by the owner's *liveness*, not the
+ * clock: a run killed by Ctrl+C or `pkill` leaves the directory behind with a
+ * fresh mtime, and an mtime window meant the daemon logged "another run holds
+ * the lock" for half an hour after every restart while publishing nothing. A
+ * live owner still waits, because a long LLM batch legitimately holds it.
+ */
+export async function withLock (lockDir, fn, { retries = 2 } = {}) {
+  const { mkdir, rm, readFile, writeFile } = await import('node:fs/promises')
   let acquired = false
   for (let attempt = 0; attempt <= retries && !acquired; attempt++) {
     try {
       await mkdir(lockDir, { recursive: false })
       await writeFile(`${lockDir}/owner`, `${process.pid} ${new Date().toISOString()}\n`).catch(() => {})
+      heldHere.add(lockDir)
       acquired = true
     } catch (err) {
       if (err.code !== 'EEXIST') throw err
-      const held = await stat(lockDir).catch(() => null)
-      if (!held || Date.now() - held.mtimeMs <= staleMs) break
-      log(`taking over stale lock ${lockDir} (held ${Math.round((Date.now() - held.mtimeMs) / 60000)}m)`)
+      const owner = await readFile(`${lockDir}/owner`, 'utf8').catch(() => '')
+      const pid = Number(/^\s*(\d+)/.exec(owner)?.[1]) || 0
+      // Same pid is only "ours" if this process is not currently inside the
+      // critical section -- two overlapping runs in one process must still
+      // serialize, and a pid cannot be reused while its process is alive.
+      if (heldHere.has(lockDir) || (pid && isPidAlive(pid) && pid !== process.pid)) {
+        log(`lock ${lockDir} held by ${heldHere.has(lockDir) ? 'this run' : `live pid ${pid}`}: skipping`)
+        break
+      }
+      log(pid
+        ? `taking over lock ${lockDir}: owner pid ${pid} is gone`
+        : `taking over lock ${lockDir} with no live owner recorded`)
       await rm(lockDir, { recursive: true, force: true })
+      continue
     }
   }
   if (!acquired) return { acquired: false }
   try {
     return { acquired: true, result: await fn() }
   } finally {
+    heldHere.delete(lockDir)
     await rm(lockDir, { recursive: true, force: true })
   }
 }
 
-// Retention: delete *.diff files whose entry day is older than the cutoff.
-// Day pages degrade to a GitHub compare link when /diffs/<sha>.diff is
-// missing (client renders a notice), so pruning only loses inline diffs
-// for old entries — the site stays fully navigable.
+/** Locks this process currently holds, so overlapping runs in one process serialize. */
+const heldHere = new Set()
+
+function isPidAlive (pid) {
+  try { process.kill(pid, 0); return true } catch (err) { return err?.code === 'EPERM' }
+}
+
 /**
  * Retention: a stored diff lives exactly as long as its entry. Age-based
  * retention is what left rows advertising a diff that had been deleted (58 of

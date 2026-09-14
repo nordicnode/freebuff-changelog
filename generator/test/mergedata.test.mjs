@@ -7,7 +7,7 @@
 // Merges must be commutative: neither writer's push may undo the other's.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, readdir, utimes } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mergeChangelog, mergeAiCache, mergeSyncState, capturePendingWrites, persistMerged } from '../lib/mergedata.mjs'
@@ -195,22 +195,28 @@ test('withLock serializes overlapping runs in one worktree', async () => {
   assert.equal(third.result, 'ran')
 })
 
-test('withLock releases on throw and takes over a stale lock', async () => {
+test('withLock releases on throw and takes over a lock whose owner is gone', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'fb-lock2-'))
   const lockDir = join(dir, 'generator.lock')
   await assert.rejects(() => withLock(lockDir, () => { throw new Error('boom') }).then(() => { throw new Error('should throw') }))
   const after = await withLock(lockDir, async () => 'ok')
   assert.equal(after.acquired, true, 'lock freed after a throwing run')
 
-  // Backdate beyond the stale window: a killed daemon must not wedge the loop.
-  const held = await withLock(lockDir, async () => {
-    const old = (Date.now() - 60 * 60000) / 1000
-    await utimes(lockDir, old, old)
-    return 'held'
-  })
-  assert.equal(held.result, 'held')
-  const taken = await withLock(lockDir, async () => 'took over', { staleMs: 30 * 60000 })
-  assert.equal(taken.acquired, true)
+  // A run killed by Ctrl+C or pkill leaves the directory with a *fresh* mtime,
+  // so age cannot tell a dead owner from a live one. Backdating the clock used
+  // to be the only way out, and it meant the daemon logged "another run holds
+  // the lock" for half an hour after every restart while publishing nothing.
+  await mkdir(lockDir, { recursive: true })
+  await writeFile(join(lockDir, 'owner'), `999999 ${new Date().toISOString()}\n`)
+  const taken = await withLock(lockDir, async () => 'took over')
+  assert.equal(taken.acquired, true, 'a lock whose owner pid is dead is taken over at once')
+
+  // A live owner is never evicted, however long its batch runs.
+  await mkdir(lockDir, { recursive: true })
+  await writeFile(join(lockDir, 'owner'), `1 ${new Date().toISOString()}\n`)
+  const busy = await withLock(lockDir, async () => 'ran while someone else held it')
+  assert.equal(busy.acquired, false, 'a live owner keeps the lock')
+  assert.equal(busy.result, undefined)
 })
 
 // The plain-English line is produced by the writer that holds the summary, which
