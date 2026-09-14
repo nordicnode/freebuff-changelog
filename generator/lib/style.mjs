@@ -672,7 +672,7 @@ nav.term-nav a.active{
   font-size:.84rem;
 }
 .model-sep{
-  color:var(--txt-subtle);
+  color:var(--txt-dim);
 }
 .model-history{
   display:flex;
@@ -705,7 +705,7 @@ nav.term-nav a.active{
   flex-wrap:wrap;
 }
 .model-row-title{
-  color:var(--txt-subtle);
+  color:var(--txt-dim);
   font-size:.78rem;
 }
 

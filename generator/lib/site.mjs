@@ -603,11 +603,11 @@ ${d.entries.map(e => {
       <span class="term-box-title">MODEL_LINEUP :: free picker catalog</span>
       <span>${modelLive.length} live &middot; ${modelRetired.length} retired</span>
     </div>
-    <div style="font-size:.76rem;color:var(--txt-subtle);margin-bottom:6px">LIVE:</div>
+    <div style="font-size:.76rem;color:var(--txt-dim);margin-bottom:6px">LIVE:</div>
     <div class="model-lineup">${modelLive.map(m => modelLink(m, 'modelplus', '')).join('<span class="model-sep">,</span> ')}</div>
-    ${modelRetired.length ? `<div style="font-size:.76rem;color:var(--txt-subtle);margin:10px 0 6px">RETIRED:</div>
+    ${modelRetired.length ? `<div style="font-size:.76rem;color:var(--txt-dim);margin:10px 0 6px">RETIRED:</div>
     <div class="model-lineup">${modelRetired.map(m => modelLink(m, 'modelminus', '')).join('<span class="model-sep">,</span> ')}</div>` : ''}
-    <p style="margin:10px 0 0;font-size:.78rem;color:var(--txt-subtle)">SUBSCRIBE: <a href="/feed-models.xml">[models rss]</a> &middot; <a href="/feed.xml">[all changes]</a> &middot; per-model feeds on each model page</p>
+    <p style="margin:10px 0 0;font-size:.78rem;color:var(--txt-dim)">SUBSCRIBE: <a href="/feed-models.xml">[models rss]</a> &middot; <a href="/feed.xml">[all changes]</a> &middot; per-model feeds on each model page</p>
   </div>
 </section>
 <div class="section-hdr">
