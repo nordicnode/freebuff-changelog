@@ -795,12 +795,29 @@ nav.term-nav a.active{
   color:var(--term-cyan);
 }
 
-.model-lineup{
-  display:flex;
-  flex-wrap:wrap;
-  gap:8px;
-  font-size:.84rem;
+.models-intro{margin:0 0 12px;font-size:.82rem;color:var(--txt-dim)}
+.model-grid{display:flex;flex-wrap:wrap;gap:6px}
+.model-card{
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
+  background:var(--code);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  padding:3px 9px;
+  font-size:.8rem;
+  color:var(--txt);
+  text-decoration:none;
 }
+.model-card:hover{border-color:var(--term-border-strong);color:#ffffff;text-decoration:none}
+.model-card.live{border-left:3px solid var(--term-green)}
+.model-card.out{border-left:3px solid var(--term-red);color:var(--txt-dim);text-decoration:line-through;text-decoration-color:var(--txt-subtle)}
+.mc-tag{font-size:.62rem;font-weight:700;letter-spacing:.06em}
+.model-card.live .mc-tag{color:var(--term-green)}
+.model-card.out .mc-tag{color:var(--term-red)}
+.model-retired{margin-top:10px}
+.model-retired-toggle{cursor:pointer;font-size:.76rem;letter-spacing:.06em;color:var(--txt-subtle);user-select:none}
+.model-retired-toggle:hover{color:var(--txt)}
 .model-sep{
   color:var(--txt-dim);
 }

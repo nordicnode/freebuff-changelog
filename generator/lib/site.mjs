@@ -899,13 +899,16 @@ ${rows.map(e => {
   // ----- models timeline (catalog history: current lineup, retired, per-change rows)
   const { chrono: modelChrono, live: modelLive, retired: modelRetired } = modelTimeline(modelEntries)
   const modelLink = (m, cls, sign) => `<a class="${cls}" href="/models/${modelSlug(m)}/">${sign}${esc(m)}</a>`
+  const modelCard = (m, cls, tag) => `<a class="model-card ${cls}" href="/models/${modelSlug(m)}/"><span class="mc-tag">${tag}</span>${esc(m)}</a>`
   const modelRows = modelChrono.map(e => {
     const { added = [], removed = [] } = e.modelChanges || {}
     const addHtml = added.map(m => modelLink(m, 'modelplus', '+')).join('<span class="model-sep">,</span> ')
     const remHtml = removed.map(m => modelLink(m, 'modelminus', '−')).join('<span class="model-sep">,</span> ')
+    // Reads as a transition: the model leaving the picker, then the one
+    // replacing it. "old -> new" matches every title ("X replaces Y").
     const swap = added.length && removed.length
-      ? `${addHtml} <span class="swap-arrow">-&gt;</span> ${remHtml}`
-      : [addHtml, remHtml].filter(Boolean).join(' ')
+      ? `${remHtml} <span class="swap-arrow">&rarr;</span> ${addHtml}`
+      : [remHtml, addHtml].filter(Boolean).join(' ')
     return `<div class="model-row">
   <span class="model-row-date"><a href="/day/${e.day}/#${e.sha.slice(0, 12)}">${esc(e.day)}</a></span>
   <span class="model-row-change">${swap}</span>
@@ -921,11 +924,10 @@ ${rows.map(e => {
       <span class="term-box-title">Free model catalog</span>
       <span>${modelLive.length} live &middot; ${modelRetired.length} retired</span>
     </div>
-    <div style="font-size:.76rem;color:var(--txt-dim);margin-bottom:6px">LIVE:</div>
-    <div class="model-lineup">${modelLive.map(m => modelLink(m, 'modelplus', '')).join('<span class="model-sep">,</span> ')}</div>
-    ${modelRetired.length ? `<div style="font-size:.76rem;color:var(--txt-dim);margin:10px 0 6px">RETIRED:</div>
-    <div class="model-lineup">${modelRetired.map(m => modelLink(m, 'modelminus', '')).join('<span class="model-sep">,</span> ')}</div>` : ''}
-    <p style="margin:10px 0 0;font-size:.78rem;color:var(--txt-dim)">SUBSCRIBE: <a href="/feed-models.xml">[models rss]</a> &middot; <a href="/feed.xml">[all changes]</a> &middot; per-model pages</p>
+    <p class="models-intro">Every model that has been free in the Freebuff picker, oldest first. Click a name for its full history &mdash; rows below read <span class="modelminus">&minus;out</span> <span class="swap-arrow">&rarr;</span> <span class="modelplus">+in</span>.</p>
+    <div class="model-grid">${modelLive.map(m => modelCard(m, 'live', 'LIVE')).join('')}</div>
+    ${modelRetired.length ? `<details class="model-retired"><summary class="model-retired-toggle">RETIRED (${modelRetired.length})</summary><div class="model-grid" style="margin-top:8px">${modelRetired.map(m => modelCard(m, 'out', 'OUT')).join('')}</div></details>` : ''}
+    <p style="margin:12px 0 0;font-size:.78rem;color:var(--txt-dim)">SUBSCRIBE: <a href="/feed-models.xml">[models rss]</a> &middot; <a href="/feed.xml">[all changes]</a></p>
   </div>
 </section>
 <div class="section-hdr">
