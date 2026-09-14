@@ -312,7 +312,7 @@ test('buildSite generates valid static site output', async () => {
     assert.equal(ruleFor(rules, '/api/*').headers['cache-control'], 'public, max-age=30, stale-while-revalidate=60')
     assert.equal(ruleFor(rules, '/diffs/*').headers['cache-control'], 'public, max-age=31536000, immutable')
     // Nothing that carries entry data may outlive the sync budget.
-    for (const p of ['/', '/index.html', '/day/*', '/api/*', '/feed.xml', '/feed.json', '/search-index.json']) {
+    for (const p of ['/', '/index.html', '/day/*', '/changes/*', '/api/*', '/feed.xml', '/feed.json', '/search-index.json']) {
       const maxAge = Number((ruleFor(rules, p).headers['cache-control'].match(/max-age=(\d+)/) || [])[1])
       assert.ok(maxAge > 0 && maxAge <= 300, `${p} max-age=${maxAge} is too long for a ~2min sync`)
     }
@@ -468,11 +468,17 @@ test('buildSite generates valid static site output', async () => {
     // chip that reveals it. Nothing is removed from the document either way --
     // filtering costs no request, and the day pages stay the exhaustive view.
     assert.match(indexHtml, /<nav class="filterbar" id="filters"/)
-    assert.match(indexHtml, /data-filter="\*" aria-pressed="true">all<span class="chip-n">3<\/span>/,
-      'the all chip counts the visible rows, not churn')
+    assert.match(indexHtml, /data-filter="\*" data-label="recent"[^>]*aria-pressed="true">recent<span class="chip-n">3<\/span>/,
+      'the reset chip is named for what it counts: this window, not the database')
     assert.match(indexHtml, /data-filter="cli"/)
     assert.match(indexHtml, /data-filter="model-catalog"/)
-    assert.match(indexHtml, /data-filter="churn" aria-pressed="false">churn<span class="chip-n">1<\/span>/)
+    assert.match(indexHtml, /data-filter="churn"[^>]*aria-pressed="false">churn<span class="chip-n">1<\/span>/)
+    // Chip counts are page-scoped, so every chip also carries the all-time figure
+    // and where to find it: a bare "27" for CLI reads as "that is all there is".
+    assert.match(indexHtml, /data-filter="cli" data-label="CLI" data-total="2" data-href="\/changes\/cli\/"/)
+    assert.match(indexHtml, /data-filter="churn" data-label="churn" data-total="1" data-href="\/changes\/churn\/"/)
+    assert.match(indexHtml, /id="filter-all">3 changes all-time across 2 categories <a href="\/changes\/"/,
+      'the note line states the all-time total next to the page count')
     assert.equal(rowTags(indexHtml).filter(t => t.includes('data-churn="1"')).length, 1)
     assert.ok(rowTags(indexHtml).every(t => t.includes('data-cat="')), 'every row is filterable by category')
     assert.equal(rowTags(indexHtml).filter(t => !isHidden(t)).length, 3, 'three rows shown, one hidden')
@@ -491,6 +497,39 @@ test('buildSite generates valid static site output', async () => {
     // Day pages stay exhaustive: no bar, nothing pre-hidden.
     assert.doesNotMatch(dayHtml2, /id="filters"/)
     assert.equal(rowTags(dayHtml2).filter(isHidden).length, 0, 'day pages still list churn')
+
+    // /changes/<category>/ is the all-time half of the filter question: complete
+    // lists, compact rows, one click from the full body. A chip that says "27
+    // here" needs somewhere that can answer "1,413 exist".
+    const hubHtml = await readFile(join(tmpDist, 'changes/index.html'), 'utf8')
+    assert.equal((hubHtml.match(/class="tile"/g) || []).length, 3, 'hub lists every category plus churn')
+    assert.match(hubHtml, /href="\/changes\/cli\/"><b>CLI<\/b><span>2 changes<\/span>/)
+    assert.match(hubHtml, /href="\/changes\/churn\/"><b>Churn<\/b><span>1 churn commits<\/span>/)
+    const cliPage = await readFile(join(tmpDist, 'changes/cli/index.html'), 'utf8')
+    assert.match(cliPage, /<div class="crow" id="dddd11112222"/)
+    assert.match(cliPage, /href="\/day\/2026-09-13\/#dddd11112222"/, 'compact row links to the full body')
+    assert.match(cliPage, /href="https:\/\/github\.com\/CodebuffAI\/freebuff\/commit\/dddd/)
+    assert.doesNotMatch(cliPage, /<details class="entry/, 'complete lists stay cheap enough to be complete')
+    assert.doesNotMatch(cliPage, /id="filters"/, 'the all-time list is not the filtered window')
+    assert.match(cliPage, /CATEGORY_LOG :: CLI/)
+    assert.match(cliPage, /rel="canonical" href="[^"]*\/changes\/cli\/"/)
+    assert.equal((cliPage.match(/<div class="crow/g) || []).length, 2, 'every CLI change, not the recent ones')
+    const churnPage = await readFile(join(tmpDist, 'changes/churn/index.html'), 'utf8')
+    assert.match(churnPage, /CHURN_LOG :: Churn/)
+    assert.match(churnPage, /<div class="crow crow-noise" id="eeee11112222"/, 'churn is listed, not hidden, once asked for')
+    await readFile(join(tmpDist, 'og/category-cli.svg'), 'utf8')
+    assert.match(sitemapPages, /\/changes\/cli\//)
+    assert.match(sitemapPages, /\/changes\/churn\//)
+    // Archive tiles used to send a category click to a text search; they now
+    // point at the complete list.
+    const archivePage = await readFile(join(tmpDist, 'archive/index.html'), 'utf8')
+    assert.match(archivePage, /href="\/changes\/cli\/"/)
+    assert.doesNotMatch(archivePage, /href="\/search\/\?q=CLI"/, 'no category tile masquerading as a search')
+    assert.match(indexHtml, /href="\/changes\/"[^>]*>\/changes</, 'nav offers the all-time browse')
+    assert.equal(ruleFor(rules, '/changes/*').headers['cache-control'], 'public, max-age=60, stale-while-revalidate=300')
+    for (const url of ['/changes/', '/changes/cli/', '/changes/churn/']) {
+      assert.deepEqual(duplicatedHeaders(rules, url), [], `overlapping _headers rules for ${url}`)
+    }
     // Day pages carry related links + per-day OG image
     assert.match(dayHtml2, /RELATED:/)
     assert.match(dayHtml2, /og\/2026-09-13\.svg/)

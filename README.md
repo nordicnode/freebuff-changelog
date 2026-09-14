@@ -175,6 +175,7 @@ rule-based summary is used: the site never depends on the LLM.
 | `/day/YYYY-MM-DD/` | every change pushed that UTC day |
 | `/release/1.0.NNN/` | entries since the previous version bump |
 | `/archive/` | every day, release, category |
+| `/changes/`, `/changes/<category>/` | every change of one category, all time: compact rows, each linking to the full body on its day page |
 | `/search/` | client filter over pre-built JSON index |
 | `/in-flight/` | open community PRs (via GitHub API, best effort) |
 | `/feed.xml` | RSS of major + notable entries |

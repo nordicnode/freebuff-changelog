@@ -199,6 +199,27 @@ nav.term-nav a.active{
   font-size:.76rem;
   color:var(--txt-subtle);
 }
+/* Rows on /changes/<category>/: those pages are complete lists, and Internal
+   alone runs to thousands of entries, so a row costs a line of metadata and one
+   truncated summary -- the full body stays on the day page it links to. */
+.crow{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:baseline;
+  gap:8px;
+  padding:5px 0;
+  border-bottom:1px solid var(--term-border);
+  font-size:.8rem;
+}
+.crow:last-child{border-bottom:0}
+.crow-time{min-width:34px;font-size:.72rem;color:var(--txt-dim)}
+.crow-ref{font-size:.72rem;color:var(--txt-subtle);text-decoration:none}
+.crow-ref:hover{color:var(--term-cyan)}
+.crow-title{color:var(--txt);text-decoration:none}
+.crow-title:hover{color:var(--term-cyan);text-decoration:underline}
+.crow-sum{flex:1 0 100%;padding-left:42px;font-size:.74rem;color:var(--txt-subtle)}
+.crow-noise .crow-title{color:var(--txt-dim)}
+.list-note{margin:14px 0;font-size:.76rem;color:var(--txt-subtle)}
 
 .entry{
   background:var(--panel);

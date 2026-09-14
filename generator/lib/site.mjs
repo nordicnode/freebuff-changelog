@@ -58,6 +58,7 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
     <a href="/about/" class="${path === '/about/' ? 'active' : ''}">/about</a>
     <a href="/models/" class="${path.startsWith('/models/') ? 'active' : ''}">/models</a>
     <a href="/stats/" class="${path.startsWith('/stats/') ? 'active' : ''}">/stats</a>
+    <a href="/changes/" class="${path.startsWith('/changes/') ? 'active' : ''}">/changes</a>
     <a href="/watch/" class="${path.startsWith('/watch/') ? 'active' : ''}">/watch</a>
     <a href="/archive/" class="${path.startsWith('/archive/') ? 'active' : ''}">/archive</a>
     <a href="/search/" class="${path.startsWith('/search/') ? 'active' : ''}">/search</a>
@@ -449,6 +450,31 @@ function categorySlug (c) {
   return String(c || 'other').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'other'
 }
 
+// Word-boundary clip: an all-time list must stay small enough to be complete, and
+// a hard slice through the middle of a word looks like a broken page.
+function clipText (s, n) {
+  s = String(s || '').replace(/\s+/g, ' ').trim()
+  if (s.length <= n) return s
+  const cut = s.lastIndexOf(' ', n)
+  return (cut > n * 0.6 ? s.slice(0, cut) : s.slice(0, n)).trim() + '…'
+}
+
+// A row on /changes/<category>/. These pages exist to be *complete*, so the row
+// stays compact: Internal alone is 3,921 entries, and full bodies would make it
+// an 8 MB page. The body is one click away on the day page, which stays the
+// exhaustive, fully-rendered view.
+function changeRow (e) {
+  const anchor = e.sha.slice(0, 12)
+  const title = e.ai?.title || e.title || deriveTitleSafe(e)
+  const sum = e.ai?.summary || e.summary || ''
+  return `<div class="crow${e.noise ? ' crow-noise' : ''}" id="${anchor}">
+  <span class="crow-time">${esc(e.date.slice(11, 16))}</span>
+  <a class="crow-ref" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" target="_blank" rel="noopener">${anchor}</a>
+  <a class="crow-title" href="/day/${e.day}/#${anchor}">${esc(clipText(title, 110))}</a>
+  ${sum ? `<span class="crow-sum">${esc(clipText(sum, 150))}</span>` : ''}
+</div>`
+}
+
 function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) {
   const time = e.date.slice(11, 16)
   const anchor = e.sha.slice(0, 12)
@@ -573,6 +599,22 @@ export async function buildSite ({ changelog, openPrs, dist }) {
   const meaningful = entries.filter(e => !e.noise)
   const churnCount = entries.length - meaningful.length
   const churnNote = churnCount ? ` &middot; ${churnCount.toLocaleString()} churn` : ''
+  // All-time browse index, computed up front because the front-page chips need
+  // each category's *total* next to its count in this window. "CLI 27" on a page
+  // holding 91 changes is a fact about this page, not about CLI: 1,413 CLI
+  // changes exist. Both numbers belong on screen, not one pretending to be the
+  // other.
+  const catLists = new Map()
+  for (const e of entries) {
+    if (e.noise) continue
+    if (!catLists.has(e.category)) catLists.set(e.category, [])
+    catLists.get(e.category).push(e)
+  }
+  const churnList = entries.filter(e => e.noise)
+  const browseList = [...catLists.entries()].map(([label, list]) => ({ label, slug: categorySlug(label), list, churn: false }))
+  if (churnList.length) browseList.push({ label: 'Churn', slug: 'churn', list: churnList, churn: true })
+  browseList.sort((a, b) => b.list.length - a.list.length || a.label.localeCompare(b.label))
+  const browseBySlug = new Map(browseList.map(b => [b.slug, b]))
   // How long the data is allowed to sit before the sync loop re-analyzes. The
   // countdown below has to be stated in these terms: it used to tick to the top
   // of the next hour, describing a schedule that no longer owns freshness.
@@ -638,13 +680,25 @@ ${d.entries.map(e => {
     if (!catCounts.has(slug)) catCounts.set(slug, cur)
   }
   const chipList = [...catCounts.values()].sort((a, b) => b.n - a.n || a.label.localeCompare(b.label))
-  const filterBar = `<nav class="filterbar" id="filters" aria-label="Filter the timeline by category">
-  <span class="filter-label">FILTER:</span>
-  <button type="button" class="chip active" data-filter="*" aria-pressed="true">all<span class="chip-n">${realRows.length}</span></button>
-${chipList.map(c => `  <button type="button" class="chip" data-filter="${esc(c.slug)}" aria-pressed="false">${esc(c.label)}<span class="chip-n">${c.n}</span></button>`).join('\n')}
-  <button type="button" class="chip chip-churn" data-filter="churn" aria-pressed="false">churn<span class="chip-n">${churnInWindow}</span></button>
+  // Each chip states two different numbers: the rows it narrows *on this page*,
+  // and -- as data-total/data-href, picked up by the note line -- how many
+  // changes of that category exist in the whole database. A chip labelled "all"
+  // over 91 rows would be the site's biggest lie.
+  const chipHtml = (slug, label, n, active, extraClass) => {
+    const b = browseBySlug.get(slug)
+    const total = b ? b.list.length : meaningful.length
+    const href = b ? `/changes/${b.slug}/` : '/changes/'
+    return `  <button type="button" class="chip${active ? ' active' : ''}${extraClass}" data-filter="${esc(slug)}" data-label="${esc(label)}" data-total="${total}" data-href="${esc(href)}" aria-pressed="${active ? 'true' : 'false'}">${esc(label)}<span class="chip-n">${n.toLocaleString()}</span></button>`
+  }
+  const filterBar = `<nav class="filterbar" id="filters" aria-label="Filter the rows on this page by category">
+  <span class="filter-label">FILTER THIS PAGE:</span>
+${[
+    chipHtml('*', 'recent', realRows.length, true, ''),
+    ...chipList.map(c => chipHtml(c.slug, c.label, c.n, false, '')),
+    chipHtml('churn', 'churn', churnInWindow, false, ' chip-churn')
+  ].join('\n')}
 </nav>
-<p class="filter-note">showing <b id="filter-count">${realRows.length}</b> of ${windowRows.length} rows on this page <em>${churnInWindow ? 'churn hidden' : 'no churn in this window'}</em> &middot; <a href="/search/">filter by text, impact, category</a></p>`
+<p class="filter-note" data-hub="/changes/" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${realRows.length}</b> of ${windowRows.length} rows on this page <em>${churnInWindow ? 'churn hidden' : 'no churn in this window'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/changes/">browse every change by category</a></span></p>`
 
   // Progressive enhancement only: no-JS readers see the server default (real
   // changes, no churn). Category labels live in data-* so the toggle never has
@@ -659,6 +713,12 @@ ${chipList.map(c => `  <button type="button" class="chip" data-filter="${esc(c.s
   var days = [].slice.call(document.querySelectorAll('section.day'));
   var countEl = document.getElementById('filter-count');
   var noteEl = document.querySelector('.filter-note em');
+  var noteWrap = document.querySelector('.filter-note');
+  var allEl = document.getElementById('filter-all');
+  var HUB = (noteWrap && noteWrap.getAttribute('data-hub')) || '/changes/';
+  var ALL_TOTAL = Number(noteWrap && noteWrap.getAttribute('data-all')) || 0;
+  var CAT_COUNT = Number(noteWrap && noteWrap.getAttribute('data-cats')) || 0;
+  function chipFor(slug) { return bar.querySelector('.chip[data-filter="' + slug + '"]') }
   var state = { cats: [], churn: false };
   try {
     var stored = JSON.parse(localStorage.getItem(KEY) || 'null');
@@ -688,6 +748,35 @@ ${chipList.map(c => `  <button type="button" class="chip" data-filter="${esc(c.s
       }
     }
     var shown = rows.filter(function (r) { return !r.hidden }).length;
+    // The note line answers the question a chip count raises: 27 rows here, but
+    // how many CLI changes exist at all? That number is not on this page, so it
+    // is stated as an all-time figure and linked to the page where it is.
+    if (allEl) {
+      while (allEl.firstChild) allEl.removeChild(allEl.firstChild);
+      var text = function (t) { allEl.appendChild(document.createTextNode(t)) };
+      var link = function (t, href) { var a = document.createElement('a'); a.href = href; a.textContent = t; allEl.appendChild(a) };
+      var num = function (v) { return Number(v || 0).toLocaleString() };
+      var totalOf = function (slug) { var c = chipFor(slug); return c ? Number(c.getAttribute('data-total') || 0) : 0 };
+      if (active.length === 1) {
+        var c = chipFor(active[0]);
+        if (c) {
+          text(num(c.getAttribute('data-total')) + ' ' + c.getAttribute('data-label') + ' changes all-time ');
+          link('see every one', c.getAttribute('data-href'));
+        }
+      } else if (active.length > 1) {
+        var sum = 0;
+        active.forEach(function (s) { sum += totalOf(s) });
+        text(num(sum) + ' changes across those ' + active.length + ' categories all-time ');
+        link('browse by category', HUB);
+      } else {
+        text(num(ALL_TOTAL) + ' changes all-time across ' + CAT_COUNT + ' categories ');
+        link('browse by category', HUB);
+      }
+      if (state.churn && totalOf('churn')) {
+        text(' \u00b7 ');
+        link(num(totalOf('churn')) + ' churn', chipFor('churn').getAttribute('data-href'));
+      }
+    }
     [].forEach.call(bar.querySelectorAll('.chip'), function (c) {
       var f = c.getAttribute('data-filter');
       var on = f === '*' ? !active.length && !state.churn : f === 'churn' ? state.churn : active.indexOf(f) !== -1;
@@ -853,11 +942,70 @@ ${chipList.map(c => `  <button type="button" class="chip" data-filter="${esc(c.s
     }))
   }), 8)
 
+  // ----- all-time category pages: /changes/ and /changes/<slug>/
+  // The front page renders ~90 real changes, so its chips can only ever narrow
+  // that window. These pages are the other half of the question -- "every CLI
+  // change, all time" -- and being static they are crawlable, linkable and
+  // shareable, which a client-side toggle on the front page can never be.
+  const hubTiles = browseList.map(b =>
+    `<a class="tile" href="/changes/${b.slug}/"><b>${esc(b.label)}</b><span>${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : 'changes'}</span></a>`).join('')
+  await write(dist, 'changes/index.html', layout({
+    title: 'Browse every change by category', path: '/changes/',
+    desc: `Complete, all-time lists of each category of change in Freebuff: ${browseList.map(b => `${b.label} (${b.list.length.toLocaleString()})`).join(', ')}.`,
+    ogImage: '',
+    body: `<section class="hero">
+  <div class="term-box">
+    <div class="term-box-hdr">
+      <span class="term-box-title">CHANGE_INDEX :: ${browseList.length} lists</span>
+      <span>${meaningful.length.toLocaleString()} changes${churnNote}</span>
+    </div>
+    <div style="font-size:.76rem;color:var(--txt-subtle);margin-bottom:6px">CATEGORIES:</div>
+    <div class="grid">${hubTiles}</div>
+  </div>
+</section>
+<p class="list-note">Every entry is listed, newest first, ${esc(first.day)} through ${esc(last.day)}. Churn -- dependency lockfiles, icon sets, empty merges -- gets its own list rather than being hidden: it is real repository activity, just not the kind a reader wants mixed into change lists.</p>
+<div class="pager"><a href="/archive/">[ archive by day ]</a><a href="/search/">[ search and filter ]</a></div>`
+  }))
+  const browseTasks = browseList.map(b => async () => {
+    const list = b.list // already newest-first, same order as the timeline
+    const days = groupByDay(list)
+    const unit = b.churn ? 'churn' : 'change'
+    const body = `<section class="hero">
+  <div class="term-box term-box-slim">
+    <div class="term-box-hdr">
+      <span class="term-box-title">${b.churn ? 'CHURN_LOG' : 'CATEGORY_LOG'} :: ${esc(b.label)}</span>
+      <span>${b.list.length.toLocaleString()} ${b.churn ? 'commits' : 'changes'}</span>
+    </div>
+    <div class="term-footer-bar">
+      <span>${days.length} days &middot; ${esc(list.at(-1).day)} &rarr; ${esc(list[0].day)}</span>
+      <span><a href="/changes/">[ all categories ]</a></span>
+    </div>
+  </div>
+</section>
+` + days.map(d => `<section class="day">
+  <div class="day-line"><h2><time datetime="${d.day}">[ ${esc(fmtDateHuman(d.day))} ]</time></h2><span class="day-count">${d.entries.length} ${unit}${d.entries.length === 1 ? '' : 's'}</span></div>
+${d.entries.map(changeRow).join('\n')}
+</section>`).join('\n') + `
+<div class="pager"><a href="/changes/">[ all categories ]</a><a href="/">[ back to the timeline ]</a></div>`
+    await write(dist, `changes/${b.slug}/index.html`, layout({
+      title: `${b.label} — all time`, path: `/changes/${b.slug}/`,
+      desc: `All ${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : b.label + ' changes'} recorded from Freebuff's public snapshots, newest first.`,
+      ogImage: `/og/category-${b.slug}.svg`,
+      body
+    }))
+    await write(dist, `og/category-${b.slug}.svg`, ogCardSvg(b.label,
+      list.slice(0, 3).map(e => e.ai?.title || e.title || ''),
+      `${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : 'changes'} all time`))
+  })
+  await pool(browseTasks, 8)
+
   // ----- archive (all days + releases + categories)
-  const cats = new Map()
-  for (const e of entries) if (!e.noise) cats.set(e.category, (cats.get(e.category) || 0) + 1)
-  const catTiles = [...cats.entries()].sort((a, b) => b[1] - a[1]).map(([c, k]) =>
-    `<a class="tile" href="/search/?q=${encodeURIComponent(c)}"><b>${esc(c)}</b><span>${k.toLocaleString()} changes</span></a>`).join('')
+  // Category counts everywhere else on the site (stats bars, the about page's
+  // taxonomy copy, these tiles) now derive from the same lists the /changes/
+  // pages render, so a number can never disagree with the list behind it.
+  const cats = new Map([...catLists.entries()].map(([c, list]) => [c, list.length]))
+  const catTiles = browseList.filter(b => !b.churn).map(b =>
+    `<a class="tile" href="/changes/${b.slug}/"><b>${esc(b.label)}</b><span>${b.list.length.toLocaleString()} changes</span></a>`).join('')
   
   const relCards = [...vers].reverse().map(v =>
     `<div class="release-card"><a href="/release/${v.version}/">v${esc(v.version)}</a><span style="font-size:.74rem;color:var(--txt-subtle)">${esc(v.date.slice(0, 10))}</span></div>`
@@ -1166,7 +1314,7 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
       <p>Snapshots squash upstream history, so intra-snapshot sequencing is approximate and authorship resolves to the snapshot bot. Diffs older than 90 days are pruned (day pages fall back to GitHub compare links). AI summaries describe only what the diff shows — no research, no speculation on model capabilities beyond the README row.</p>
 
       <h4>FOLLOW ALONG</h4>
-      <p><a href="/feed.xml">RSS</a> (major + notable), <a href="/feed-models.xml">models only</a>, <a href="/feed-releases.xml">releases only</a>, per-model feeds on each <a href="/models/">model page</a>. <a href="/search/">Search</a> supports category and impact filters; <a href="/stats/">stats</a> charts churn and cadence; <a href="/watch/">watchlist</a> builds saved-search links. <a href="/archive/">Archive</a> holds every day and release. Source: hourly GitHub Action plus a local backfill daemon, both pushing <code>data/</code>; Cloudflare deploys on push.</p>
+      <p><a href="/feed.xml">RSS</a> (major + notable), <a href="/feed-models.xml">models only</a>, <a href="/feed-releases.xml">releases only</a>, per-model feeds on each <a href="/models/">model page</a>. <a href="/search/">Search</a> supports category and impact filters; <a href="/changes/">Categories</a> list every change of each type, all time; <a href="/stats/">stats</a> charts churn and cadence; <a href="/watch/">watchlist</a> builds saved-search links. <a href="/archive/">Archive</a> holds every day and release. Source: hourly GitHub Action plus a local backfill daemon, both pushing <code>data/</code>; Cloudflare deploys on push.</p>
     </div>
   </div>
 </section>`
@@ -1271,7 +1419,7 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
   const dayUrls = byDay.map(d => `/day/${d.day}/`)
   const relUrls = vers.map(v => `/release/${v.version}/`)
   const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`)]
-  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/watch/', ...(openPrs?.length ? ['/in-flight/'] : [])]
+  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/watch/', '/changes/', ...browseList.map(b => `/changes/${b.slug}/`), ...(openPrs?.length ? ['/in-flight/'] : [])]
   await write(dist, 'sitemap-days.xml', urlset(dayUrls))
   await write(dist, 'sitemap-releases.xml', urlset(relUrls))
   await write(dist, 'sitemap-models.xml', urlset(modelUrls))
@@ -1336,6 +1484,8 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
 /feed-releases.xml
   Cache-Control: public, max-age=60, stale-while-revalidate=300
 /day/*
+  Cache-Control: public, max-age=60, stale-while-revalidate=300
+/changes/*
   Cache-Control: public, max-age=60, stale-while-revalidate=300
 /pr-diffs/*
   Content-Type: text/plain; charset=utf-8
