@@ -106,11 +106,42 @@ function updateSyncAge() {
   const el = document.querySelector('.sync-age');
   if (!el || !el.dataset.generated) return;
   const ageMin = Math.max(0, Math.floor((Date.now() - Date.parse(el.dataset.generated)) / 60000));
-  const fresh = ageMin < 90;
+  // Two budgets, not a magic number: one overdue pass just means a sync is in
+  // flight, which is normal. Two missed passes means the loop is not running.
+  const budgetMin = Number(el.dataset.budgetMin) || 45;
+  const fresh = ageMin < budgetMin * 2;
   el.textContent = el.textContent.replace(/\\s*\\[.*\\]$/, '') + (fresh ? ' [fresh]' : ' [stale ' + ageMin + 'm]');
   el.style.color = fresh ? 'var(--term-green)' : 'var(--term-amber)';
 }
 updateSyncAge();
+
+// A tab left open keeps the stamp it loaded with, so a reader can watch a fixed
+// sync count up "[stale 184m]" on an otherwise healthy site. Reload once per
+// data version, and only when the visitor returns to a backgrounded tab on the
+// page that carries the sync line — never mid-interaction, never in a loop.
+(function refreshWhenBehind() {
+  const path = location.pathname;
+  if (path !== '/' && path !== '/index.html') return;
+  const el = document.querySelector('.sync-age');
+  if (!el || !el.dataset.generated) return;
+  const generated = Date.parse(el.dataset.generated);
+  if (!Number.isFinite(generated)) return;
+  const flag = 'fbReload:' + el.dataset.generated;
+  let hiddenAt = 0;
+  let stored = false;
+  try { stored = !!sessionStorage.getItem(flag); } catch (_) { return; }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { hiddenAt = Date.now(); return; }
+    const awayMs = hiddenAt ? Date.now() - hiddenAt : 0;
+    hiddenAt = 0;
+    if (stored || awayMs < 5 * 60000) return;
+    const budgetMs = (Number(el.dataset.budgetMin) || 45) * 60000;
+    if (Date.now() - generated <= budgetMs) return;
+    stored = true;
+    try { sessionStorage.setItem(flag, '1'); } catch (_) {}
+    location.reload();
+  });
+})();
 
 function openHashTarget() {
   const hash = window.location.hash;
@@ -1138,6 +1169,14 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
   await write(dist, 'sitemap-pages.xml', urlset(pageUrls))
   await write(dist, 'sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-pages.xml'].map(f => `<sitemap><loc>${SITE.url}/${f}</loc></sitemap>`).join('')}</sitemapindex>`)
   await write(dist, 'robots.txt', `User-agent: *\nAllow: /\nSitemap: ${SITE.url}/sitemap.xml\n`)
+  // Cache policy. Entry data changes on every sync (~2min), so nothing that
+  // carries it may hold a long TTL; only SHA-keyed immutable assets keep
+  // year-scale caching. Rules must also never overlap on one header: _headers
+  // does not override, it *merges*, so two rules matching the same URL join
+  // their values with a comma — which is how /feed.json came to serve
+  // "public, max-age=600, public, max-age=600", and /api/entries.json
+  // "access-control-allow-origin: *, *" (browsers reject a multi-valued ACAO, so
+  // CORS for JSON lives in exactly one rule).
   await write(dist, '_headers', `/*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
@@ -1156,57 +1195,54 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
 /manifest.webmanifest
   Content-Type: application/manifest+json
   Cache-Control: public, max-age=86400
-/feed.json
-  Content-Type: application/feed+json; charset=utf-8
-  Cache-Control: public, max-age=600
 /og/*
   Content-Type: image/svg+xml
   Cache-Control: public, max-age=86400
 /feed.xsl
   Content-Type: text/xsl; charset=utf-8
   Cache-Control: public, max-age=86400
-/api/*
-  Access-Control-Allow-Origin: *
-  Cache-Control: public, max-age=300
-/*.json
-  Access-Control-Allow-Origin: *
-/
-  Cache-Control: public, max-age=300
-/index.html
-  Cache-Control: public, max-age=300
-/search-index.json
-  Cache-Control: public, max-age=3600
-/feed.xml
-  Cache-Control: public, max-age=600
-/feed.json
-  Cache-Control: public, max-age=600
-/feed-models.xml
-  Cache-Control: public, max-age=600
-/feed-releases.xml
-  Cache-Control: public, max-age=600
-/sitemap.xml
-  Cache-Control: public, max-age=86400
-/sitemap-days.xml
-  Cache-Control: public, max-age=86400
-/sitemap-releases.xml
-  Cache-Control: public, max-age=86400
-/sitemap-models.xml
-  Cache-Control: public, max-age=86400
-/sitemap-pages.xml
-  Cache-Control: public, max-age=86400
-/day/*
-  Cache-Control: public, max-age=86400
-/release/*
-  Cache-Control: public, max-age=86400
 /diffs/*
   Content-Type: text/plain; charset=utf-8
   Cache-Control: public, max-age=31536000, immutable
   Access-Control-Allow-Origin: *
+/*.json
+  Access-Control-Allow-Origin: *
+/api/*
+  Cache-Control: public, max-age=30, stale-while-revalidate=60
+/
+  Cache-Control: public, max-age=30, stale-while-revalidate=60
+/index.html
+  Cache-Control: public, max-age=30, stale-while-revalidate=60
+/search-index.json
+  Cache-Control: public, max-age=120, stale-while-revalidate=600
+/models/
+  Cache-Control: public, max-age=120, stale-while-revalidate=600
+/feed.xml
+  Cache-Control: public, max-age=60, stale-while-revalidate=300
+/feed.json
+  Content-Type: application/feed+json; charset=utf-8
+  Cache-Control: public, max-age=60, stale-while-revalidate=300
+/feed-models.xml
+  Cache-Control: public, max-age=60, stale-while-revalidate=300
+/feed-releases.xml
+  Cache-Control: public, max-age=60, stale-while-revalidate=300
+/day/*
+  Cache-Control: public, max-age=60, stale-while-revalidate=300
 /pr-diffs/*
   Content-Type: text/plain; charset=utf-8
-  Cache-Control: public, max-age=3600
+  Cache-Control: public, max-age=300, stale-while-revalidate=1800
   Access-Control-Allow-Origin: *
-/models/
+/release/*
+  Cache-Control: public, max-age=600, stale-while-revalidate=3600
+/sitemap.xml
+  Cache-Control: public, max-age=3600
+/sitemap-days.xml
+  Cache-Control: public, max-age=3600
+/sitemap-releases.xml
+  Cache-Control: public, max-age=3600
+/sitemap-models.xml
+  Cache-Control: public, max-age=3600
+/sitemap-pages.xml
   Cache-Control: public, max-age=3600
 `)
   await write(dist, '404.html', layout({ title: 'Not found', path: '/404', noindex: true, body: '<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">ERROR :: 404 NOT FOUND</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">No commit or snapshot shipped at this path. <a href="/">&larr; [back to index]</a></p></div></section>' }))

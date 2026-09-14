@@ -7,6 +7,58 @@ import { join } from 'node:path'
 import { buildSite, modelTimeline, modelSlug, scoreHit } from '../lib/site.mjs'
 import { syncStaleMs } from '../lib/sync.mjs'
 
+// _headers rules cannot override each other on Cloudflare: every rule whose
+// pattern matches a URL is applied, and a header name set twice is *joined* with
+// a comma. A multi-valued Access-Control-Allow-Origin is invalid, so browsers
+// reject it, and a joined Cache-Control is ambiguous. `*` also crosses `/`, so
+// /api/entries.json is matched by /*.json as well as /api/*.
+function parseHeaderRules (text) {
+  const rules = []
+  let cur = null
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue
+    if (!/^\s/.test(line)) { cur = { path: line.trim(), headers: {} }; rules.push(cur); continue }
+    const i = line.indexOf(':')
+    if (cur && i > 0) cur.headers[line.slice(0, i).trim().toLowerCase()] = line.slice(i + 1).trim()
+  }
+  return rules
+}
+
+function patternMatches (pattern, url) {
+  const parts = pattern.split('*')
+  let at = 0
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i]
+    if (i === 0) {
+      if (!url.startsWith(p)) return false
+      at = p.length
+      continue
+    }
+    const found = url.indexOf(p, at)
+    if (found === -1) return false
+    at = found + p.length
+  }
+  return pattern.endsWith('*') || at === url.length
+}
+
+function duplicatedHeaders (rules, url) {
+  const seen = new Map()
+  for (const r of rules) {
+    if (!patternMatches(r.path, url)) continue
+    for (const [name, value] of Object.entries(r.headers)) {
+      if (!seen.has(name)) seen.set(name, [])
+      seen.get(name).push(`${r.path}=${value}`)
+    }
+  }
+  return [...seen].filter(([, hits]) => hits.length > 1)
+}
+
+function ruleFor (rules, path) {
+  const r = rules.find(x => x.path === path)
+  assert.ok(r, `no _headers rule for ${path}`)
+  return r
+}
+
 test('buildSite generates valid static site output', async () => {
   const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-test-dist-'))
   try {
@@ -180,6 +232,32 @@ test('buildSite generates valid static site output', async () => {
     assert.equal(statusApi.models.changes, 1)
     assert.match(await readFile(join(tmpDist, '_headers'), 'utf8'), /\/pr-diffs\/\*/)
     assert.match(await readFile(join(tmpDist, '_headers'), 'utf8'), /\/models\//)
+
+    // CDN policy: fresh data must reach readers quickly, no rule may collide with
+    // another, and immutable assets keep their long TTL.
+    const headerText = await readFile(join(tmpDist, '_headers'), 'utf8')
+    const rules = parseHeaderRules(headerText)
+    for (const url of ['/', '/index.html', '/about/', '/day/2026-09-13/', '/release/1.0.100/',
+      '/api/entries.json', '/api/status.json', '/search-index.json', '/feed.json', '/feed.xml',
+      '/diffs/aaa.diff', '/pr-diffs/999.diff', '/models/', '/og/day-2026-09-13.svg', '/sitemap.xml']) {
+      assert.deepEqual(duplicatedHeaders(rules, url), [], `overlapping _headers rules for ${url}`)
+    }
+    assert.equal(ruleFor(rules, '/').headers['cache-control'], 'public, max-age=30, stale-while-revalidate=60')
+    assert.equal(ruleFor(rules, '/day/*').headers['cache-control'], 'public, max-age=60, stale-while-revalidate=300')
+    assert.equal(ruleFor(rules, '/api/*').headers['cache-control'], 'public, max-age=30, stale-while-revalidate=60')
+    assert.equal(ruleFor(rules, '/diffs/*').headers['cache-control'], 'public, max-age=31536000, immutable')
+    // Nothing that carries entry data may outlive the sync budget.
+    for (const p of ['/', '/index.html', '/day/*', '/api/*', '/feed.xml', '/feed.json', '/search-index.json']) {
+      const maxAge = Number((ruleFor(rules, p).headers['cache-control'].match(/max-age=(\d+)/) || [])[1])
+      assert.ok(maxAge > 0 && maxAge <= 300, `${p} max-age=${maxAge} is too long for a ~2min sync`)
+    }
+    assert.equal(rules.filter(r => r.path === '/feed.json').length, 1, 'duplicate /feed.json rule joins Cache-Control')
+
+    // The header widget must key off the budget, and a backgrounded tab must not
+    // sit on an old stamp forever once the loop has moved on.
+    assert.match(indexHtml, /budgetMin \* 2/)
+    assert.match(indexHtml, /fbReload:/)
+    assert.match(indexHtml, /visibilitychange/)
     // Full changelog.json no longer ships to dist (6.9MB dead payload)
     await assert.rejects(readFile(join(tmpDist, 'changelog.json'), 'utf8'))
 
@@ -249,8 +327,9 @@ test('buildSite generates valid static site output', async () => {
     assert.match(headers, /\/favicon\.ico/)
     assert.match(headers, /\/feed\.xsl/)
     assert.match(headers, /Access-Control-Allow-Origin: \*/)
-    // Root path caches like index.html (HAR showed must-revalidate on /)
-    assert.match(headers, /^\/\n  Cache-Control: public, max-age=300/m)
+    // Root path caches like index.html, and short: a new sync must surface in
+    // seconds, not after a 5-minute edge TTL.
+    assert.match(headers, /^\/\n  Cache-Control: public, max-age=30, stale-while-revalidate=60/m)
 
     // Verify 404 contains noindex
     const notFoundHtml = await readFile(join(tmpDist, '404.html'), 'utf8')

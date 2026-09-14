@@ -224,6 +224,9 @@ async function generateOnce (argv) {
   await prunePrDiffs(prs || [])
 
   log(`wrote ${entries.length} entries (${added} new this run)` + (prs ? `, ${prs.length} open PRs` : ''))
+  // Newest last, matching analyze order: callers front-load these for
+  // summarization so a fresh upstream commit is not stuck behind the backlog.
+  return { newShas: newlyAddedEntries.map(e => e.sha) }
 }
 
 // Retention: delete pr-diffs/*.diff for PRs no longer open. Stale previews
@@ -396,13 +399,14 @@ async function catchUpOnce (argv) {
     staleMs: syncStaleMs()
   })
   let didSync = false
+  let freshShas = []
   if (reason) {
     const incremental = !state.lastSha ||
       (await git(['merge-base', '--is-ancestor', state.lastSha, 'origin/main'], REPO_DIR, { allowFail: true })) !== null
     if (incremental) {
       log(`[sync] ${reason}`)
       await realignOrigin(branch)
-      await generateOnce(argv)
+      freshShas = (await generateOnce(argv))?.newShas || []
       didSync = true
     } else {
       // A rewritten history needs a full rescan (minutes of git work). That
@@ -418,6 +422,16 @@ async function catchUpOnce (argv) {
   if (!entries.length) {
     log('no entries after sync: nothing to backfill')
     return
+  }
+
+  // 3. Publish new entries before the slow part. A commit that arrives at
+  //    16:20 must be readable by ~16:22, not after this cycle's LLM batch
+  //    finishes (~2min later) — the summary is enrichment, the row is the news.
+  if (argv.includes('--push') && freshShas.length) {
+    await commitAndPushData({
+      message: `data: update changelog (${utcStamp()} UTC)`,
+      overrides: { [`${DATA}/changelog.json`]: existing }
+    })
   }
 
   const syncEntries = entries.filter(e => e.kind === 'sync')
@@ -437,7 +451,11 @@ async function catchUpOnce (argv) {
     }
     await backfillDiffs(entries, 1000)
     const envWithLimit = { ...process.env, CHANGELOG_LLM_LIMIT: String(limit) }
-    const n = await enrichWithLlm(entries, llmPatchFor, DATA, envWithLimit, { retryErrors: true })
+    const n = await enrichWithLlm(entries, llmPatchFor, DATA, envWithLimit, {
+      retryErrors: true,
+      // This cycle's commits go first; the backlog can wait, the news cannot.
+      priorityShas: new Set(freshShas.slice(-limit))
+    })
     const remaining = entries.filter(e => e.kind === 'sync' && !isCurrent(e)).length
     log(`[backfill] enriched ${n} entries with LLM (${remaining} remaining)`)
     didSummarize = remaining < unsummarizedSync.length
@@ -445,9 +463,10 @@ async function catchUpOnce (argv) {
     log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env)')
   }
 
-  // 3. Publish whenever --push is set, not only when summaries were added: an
-  //    upstream-only move is exactly the case that was stalling, and leftover
-  //    uncommitted diffs would block the next cycle's rebase.
+  // 4. Publish again, this time with the summaries in. Still unconditional on
+  //    --push rather than gated on didSummarize: an upstream-only move is
+  //    exactly the case that was stalling, and leftover uncommitted diffs would
+  //    block the next cycle's rebase.
   if (argv.includes('--push')) {
     await commitAndPushData({
       message: didSummarize

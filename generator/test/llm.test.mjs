@@ -244,3 +244,87 @@ test('golden: command prompt carries slash-command facts', () => {
   assert.match(prompt, /Slash commands: \+\/byok/)
   assert.match(prompt, /cli\/src\/data\/slash-commands\.ts/)
 })
+
+test('transient failure: parked for a short retry window instead of re-hitting every cycle', async (t) => {
+  const { mkdtemp, readFile, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-transient-'))
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
+
+  const sha = 'c'.repeat(40)
+  const patch = 'diff --git a/z b/z\n+line\n'
+  const key = cacheKey(sha, patch)
+  const entries = [{ kind: 'sync', sha, date: '2026-09-14T10:00:00Z', areas: ['CLI'], summary: 'CLI change.' }]
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
+  let calls = 0
+  const orig = globalThis.fetch
+  globalThis.fetch = async (...a) => { calls++; return orig(...a) }
+  try {
+    await enrichWithLlm(entries, async () => patch, dir, env, { retryErrors: true })
+    assert.ok(calls >= 1, 'a fresh entry is attempted once')
+    const cached = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    assert.ok(cached[key].error, 'the failure is recorded')
+    assert.equal(cached[key].transient, true, 'a gateway blip is marked transient, not fatal')
+
+    // Next cycle, inside the retry window: must not spend a call on it again.
+    const before = calls
+    await enrichWithLlm(entries, async () => patch, dir, env, { retryErrors: true })
+    assert.equal(calls, before, 'no repeat attempt while parked')
+
+    // Backdate past the transient window: it is retried, not parked for an hour.
+    cached[key].at = new Date(Date.now() - 6 * 60000).toISOString()
+    await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify(cached))
+    const again = calls
+    await enrichWithLlm(entries, async () => patch, dir, env, { retryErrors: true })
+    assert.ok(calls > again, 'retried once the short window passes')
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
+test('transient failure: a one-shot run (no retryErrors) does not park the entry', async (t) => {
+  const { mkdtemp, readFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-oneshot-'))
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
+  const sha = 'd'.repeat(40)
+  const patch = 'diff --git a/w b/w\n+line\n'
+  const entries = [{ kind: 'sync', sha, date: '2026-09-14T10:00:00Z', areas: ['CLI'], summary: 'CLI change.' }]
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
+  await enrichWithLlm(entries, async () => patch, dir, env, {})
+  const cached = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8').catch(() => '{}'))
+  assert.equal(Object.keys(cached).length, 0, 'the daemon must stay free to retry what the workflow could not')
+})
+
+test('priorityShas: new commits jump the backlog and patch work stays bounded', async (t) => {
+  const { mkdtemp } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-prio-'))
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
+
+  const freshSha = 'f'.repeat(40)
+  const backlog = Array.from({ length: 40 }, (_, i) => ({
+    kind: 'sync', sha: `${i.toString(16).padStart(2, '0')}`.padEnd(40, '0'),
+    date: `2026-09-${String(1 + (i % 27)).padStart(2, '0')}T10:00:00Z`,
+    areas: ['CLI'], summary: 'Old change.'
+  }))
+  const fresh = { kind: 'sync', sha: freshSha, date: '2026-09-14T15:00:00Z', areas: ['CLI'], summary: 'Just landed.' }
+  const entries = [...backlog, fresh]
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '2' }
+  const patched = []
+  const orig = globalThis.fetch
+  globalThis.fetch = async (...a) => { await Promise.resolve(); return orig(...a) }
+  try {
+    await enrichWithLlm(entries, async (e) => { patched.push(e.sha); return 'diff --git a/x b/x\n+new\n' }, dir, env, {
+      retryErrors: true, priorityShas: new Set([freshSha])
+    })
+  } finally {
+    globalThis.fetch = orig
+  }
+  assert.equal(patched[0], freshSha, 'the new commit is diffed and queued first')
+  assert.ok(patched.length <= Math.max(2 * 4, 2 + 5), `patch work bounded to the run window, got ${patched.length} of ${entries.length}`)
+  assert.ok(patched.length < entries.length, 'the whole backlog is not diffed to fill 2 slots')
+})

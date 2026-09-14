@@ -15,6 +15,8 @@
 //   CHANGELOG_LLM_LIMIT        max commits summarized per run (default 60)
 //   CHANGELOG_LLM_CONCURRENCY  parallel API calls (default 5)
 //   CHANGELOG_LLM_ERROR_COOLDOWN_MS  retry failed entries after this (default 3600000)
+//   CHANGELOG_LLM_TRANSIENT_RETRY_MS  ...but gateway blips retry sooner (default 300000)
+//   options.priorityShas       SHAs to summarize ahead of the backlog
 import { createHash } from 'node:crypto'
 import { readJson, writeJson, log, pool } from './util.mjs'
 import { mergeAiCache } from './mergedata.mjs'
@@ -205,27 +207,44 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   const limit = Number(env.CHANGELOG_LLM_LIMIT || 60)
   const concurrency = Number(env.CHANGELOG_LLM_CONCURRENCY || 5)
   const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
+  // A gateway blip (502/timeout) must not park a commit for an hour, but it
+  // must park it *somehow*: an uncached transient failure re-entered the queue
+  // every cycle and burned a call on it — c59bde7f retried at 3-minute
+  // intervals for three cycles before succeeding.
+  const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
+  // SHAs this cycle's sync just added. Newest commits are the whole point of a
+  // live changelog, so they queue ahead of the historical backlog.
+  const priority = options.priorityShas instanceof Set ? options.priorityShas : new Set(options.priorityShas || [])
   let apiCalls = 0
   let cacheModified = false
 
-  // User-visible work first: models, releases, commands — then newest.
-  // Recency-only ordering buried a model swap behind dozens of minors.
-  const prio = (e) => (e.modelChanges ? 0 : e.version ? 1 : e.cmdChanges ? 2 : 3)
+  // User-visible work first: this cycle's fresh commits, then models, releases,
+  // commands — then newest. Recency-only ordering buried a model swap behind
+  // dozens of minors.
+  const prio = (e) => (priority.has(e.sha) ? -1 : e.modelChanges ? 0 : e.version ? 1 : e.cmdChanges ? 2 : 3)
   const syncEntries = entries.filter(e => e.kind === 'sync')
   syncEntries.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
 
   // Fetch patches in parallel (git-bound, independent) before queueing.
   // Entries without a prompt version predate versioning: re-summarize once.
   const isCurrent = (e) => e.ai?.model && (e.ai?.v ?? 1) >= PROMPT_V
-  const patches = await pool(syncEntries.map(e => async () => {
-    if (isCurrent(e)) return ''
+  // Bound the git work to what this run can spend. Diffing every unsummarized
+  // entry to pick `limit` of them made cycle time grow with the backlog, which
+  // delayed exactly the fresh entries the loop exists to publish.
+  const window = Math.max(limit * 4, limit + 5)
+  const candidates = []
+  for (const e of syncEntries) {
+    if (isCurrent(e)) continue
+    candidates.push(e)
+    if (candidates.length >= window) break
+  }
+  const patches = await pool(candidates.map(e => async () => {
     try { return await getPatch(e) } catch { return '' }
   }), 8)
 
   const queue = []
-  for (let qi = 0; qi < syncEntries.length; qi++) {
-    const e = syncEntries[qi]
-    if (isCurrent(e)) continue
+  for (let qi = 0; qi < candidates.length; qi++) {
+    const e = candidates[qi]
     const patch = patches[qi]
     if (!patch) continue
     const key = cacheKey(e.sha, patch)
@@ -235,7 +254,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       // re-hit a failing endpoint on every cycle.
       if (!options.retryErrors) continue
       const failedAt = Date.parse(cached.at || '') || 0
-      if (Date.now() - failedAt < errorCooldownMs) continue
+      if (Date.now() - failedAt < (cached.transient ? transientRetryMs : errorCooldownMs)) continue
     }
     if (cached && !cached.error) {
       e.ai = { model: cache[key].model, v: cache[key].v, title: cache[key].title, summary: cache[key].summary, significance: cache[key].significance, at: cache[key].at }
@@ -276,7 +295,16 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         log(`LLM summarized ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})`)
       } catch (err) {
         log(`LLM failed for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
-        if (isTransientError(err)) {
+        const transient = isTransientError(err)
+        if (transient) {
+          // Record it, or this commit re-enters next cycle's queue and burns
+          // another call on the same failure. One-shot callers (retryErrors
+          // unset: the workflow's analyze pass) must not park it, since nobody
+          // will come back for them — the daemon retries those.
+          if (options.retryErrors) {
+            cache[key] = { error: shortError(err).slice(0, 200), transient: true, at: new Date().toISOString() }
+            cacheModified = true
+          }
           gatewayFails++
           if (gatewayFails >= 3) {
             log('LLM endpoint appears offline (3 consecutive gateway errors): skipping rest of queue this run')

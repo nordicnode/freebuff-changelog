@@ -54,6 +54,26 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
   upstream history triggers a safe full rescan; AI summaries are keyed by
   SHA+patch-hash so each commit is summarized at most once, ever.
 
+## Freshness path (an upstream commit → a reader seeing it)
+
+| step | latency | knob |
+|---|---|---|
+| loop notices the new SHA | ≤ `WATCH_INTERVAL` (30s) | systemd unit env |
+| analyze + merge-safe write | ~10–40s | — |
+| new rows published **before** the LLM batch | ~1s | `commitAndPushData` |
+| Workers build on push | ~20–60s | Cloudflare |
+| edge/browser TTL on `/`, `/day/*` | ≤ 60s (+`stale-while-revalidate`) | `_headers` |
+| its summary replaces the deterministic one | next batch, ahead of the backlog | `CHANGELOG_LLM_LIMIT` |
+
+So a new commit is readable in roughly 2–3 minutes, and a long-open tab reloads
+itself once per data version when it comes back from the background past its
+budget. Summarization order: this cycle's commits, then model swaps, releases
+and commands, then newest-first — and only `4 × limit` candidates are diffed per
+run, so a deep backlog can neither slow a cycle nor starve the new commit.
+Gateway blips park a commit for `CHANGELOG_LLM_TRANSIENT_RETRY_MS` (default 5
+min) instead of re-consuming a call every cycle; hard failures keep the hour
+cooldown.
+
 ## Commands
 
 ```bash
