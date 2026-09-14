@@ -53,15 +53,15 @@ test('buildPrompt: includes diff, date, model changes, files, stats', () => {
   assert.match(prompt, /Muse Spark 1\.3/)
   assert.match(prompt, /CLI, Model Catalog/)
   assert.match(prompt, /diff --git a\/x b\/x/)
-  assert.match(prompt, /NON-TECHNICAL user/)
-  assert.match(prompt, /Summary shape \(2-4 sentences/)
-  assert.match(prompt, /BAD \(jargon/)
-  assert.match(prompt, /GOOD \(plain, why, action, detail\)/)
+  assert.match(prompt, /TECHNICAL user/)
+  assert.match(prompt, /technical prose, backticks allowed/)
+  assert.match(prompt, /Never write "Nothing to do"/)
+  assert.match(prompt, /GOOD \(technical, precise/)
   assert.match(prompt, /Files: README\.md/)
   assert.match(prompt, /Stats: \+5 \/ -5/)
 })
 
-test('buildPrompt: passes facts, surfaces, commands into context', () => {
+test('buildPrompt: passes facts and commands into context', () => {
   const entry = {
     date: '2026-09-13T10:00:00Z',
     areas: ['CLI'],
@@ -75,8 +75,7 @@ test('buildPrompt: passes facts, surfaces, commands into context', () => {
   }
   const prompt = buildPrompt(entry, 'diff')
   assert.match(prompt, /Key facts.*bring their own key/)
-  assert.match(prompt, /User surfaces: CLI/)
-  assert.match(prompt, /command line/)
+  assert.match(prompt, /Slash commands: \+\/byok/)
 })
 
 test('error cooldown: recent failures are not retried', async (t) => {
@@ -175,15 +174,15 @@ test('firstSentence: extracts leading sentence', () => {
   assert.equal(firstSentence('No punctuation here'), 'No punctuation here')
 })
 
-test('validateLlmOut: rejects jargon-first summaries', () => {
-  const bad = 'The free model catalog now offers Muse Spark 1.2 instead of Muse Spark 1.3. This change updates the model selection constants.'
-  assert.throws(() => validateLlmOut({ title: 'Model swap', summary: bad }, 'major'), /not plain/)
-  const codeFirst = 'Updated `cli/src/constants/models.ts` to swap pickers.'
-  assert.throws(() => validateLlmOut({ title: 'Model swap', summary: codeFirst }, 'major'), /not plain/)
+test('validateLlmOut: rejects no-action boilerplate', () => {
+  const boiler = 'Muse Spark 1.2 replaces 1.3 in the picker. Nothing to do: saved choices carry over.'
+  assert.throws(() => validateLlmOut({ title: 'Model swap', summary: boiler }, 'major'), /boilerplate/)
+  const boiler2 = 'CLI flag added. No action needed.'
+  assert.throws(() => validateLlmOut({ title: 'Flag', summary: boiler2 }, 'notable'), /boilerplate/)
 })
 
-test('validateLlmOut: accepts plain-first summary up to 1200 chars', () => {
-  const good = 'Muse Spark 1.2 is back in the free list, replacing 1.3, after 1.3 started returning not-found errors. Nothing to do: saved choices carry over automatically. The swap covers Web, the desktop app, and the command line.'
+test('validateLlmOut: accepts technical summary with identifiers', () => {
+  const good = 'Muse Spark 1.2 replaces 1.3 in the free model picker after 1.3 began returning upstream 404 model_not_found errors. Saved 1.2 preferences migrate on load; existing live sessions keep running. Covers Web, CLI, and Desktop via FREEBUFF_MODELS plus README tables.'
   const out = validateLlmOut({ title: 'Muse Spark 1.2 replaces 1.3', summary: good }, 'major')
   assert.equal(out.significance, 'major')
   assert.ok(out.summary.length > 200)
