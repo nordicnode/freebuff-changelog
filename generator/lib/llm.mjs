@@ -197,7 +197,13 @@ export function validateLlmOut (out, fallbackSig = 'minor') {
 
 export function isTransientError (err) {
   const msg = String(err?.message || err || '')
-  return /fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|50[234]|52[0-4]|timeout/i.test(msg)
+  // Any 5xx from the gateway family, not just the canonical 502/503/504: the
+  // endpoint sits behind a cloudflared tunnel, and 530 (tunnel error) plus
+  // 521/522/523/524/525/526/527 were all being recorded as *permanent* hour-long
+  // failures for what is a second-long blip. Anchored on "HTTP 5xx" so an error
+  // text that merely contains those digits cannot misclassify; 4xx (400, 429)
+  // stays a real failure and keeps the long cooldown.
+  return /fetch failed|ECONNREFUSED|ECONNRESET|ECONNABORTED|EPIPE|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|socket hang up|terminated|HTTP 5\d\d|timeout/i.test(msg)
 }
 
 export async function enrichWithLlm (entries, getPatch, dataDir, env = process.env, options = {}) {

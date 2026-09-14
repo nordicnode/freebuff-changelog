@@ -9,12 +9,19 @@ test('shortError: collapses HTML error pages to status line', () => {
 })
 
 test('isTransientError: 5xx gateway family, network faults transient', () => {
-  for (const code of [502, 503, 504, 520, 521, 522, 523, 524]) {
+  // 525/526/527/530 matter: the endpoint is behind a cloudflared tunnel, and
+  // 530 is what a tunnel blip actually returns.
+  for (const code of [500, 502, 503, 504, 507, 508, 520, 521, 522, 523, 524, 525, 526, 527, 530]) {
     assert.ok(isTransientError(new Error(`LLM HTTP ${code}: <html>`)), `HTTP ${code} transient`)
   }
   assert.ok(isTransientError(new Error('fetch failed')))
+  assert.ok(isTransientError(new Error('socket hang up')))
+  assert.ok(isTransientError(new Error('ECONNRESET')))
+  assert.ok(isTransientError(new Error('The operation was aborted due to timeout')))
   assert.ok(!isTransientError(new Error('LLM HTTP 400: bad request')))
   assert.ok(!isTransientError(new Error('LLM HTTP 429: too many')))
+  // Anchored: a payload that merely contains gateway-looking digits is not one.
+  assert.ok(!isTransientError(new Error('LLM HTTP 400: {"upstream":"502 seen at proxy"}')))
 })
 
 test('parseLlmJson: parses standard JSON object', () => {
