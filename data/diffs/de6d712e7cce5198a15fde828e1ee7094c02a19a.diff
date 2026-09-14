@@ -1,0 +1,457 @@
+diff --git a/common/src/util/file.ts b/common/src/util/file.ts
+index b242e61e2..15a505f4a 100644
+--- a/common/src/util/file.ts
++++ b/common/src/util/file.ts
+@@ -5,6 +5,7 @@ import { z } from 'zod/v4'
+ 
+ import { CodebuffConfigSchema } from '../json-config/constants'
+ 
++import type { CodebuffConfig } from '../json-config/constants'
+ import type { CodebuffFileSystem } from '../types/filesystem'
+ 
+ export const FileTreeNodeSchema: z.ZodType<FileTreeNode> = z.object({
+@@ -43,14 +44,16 @@ export const customToolDefinitionsSchema = z
+   .record(
+     z.string(),
+     z.object({
+-      inputJsonSchema: z.any(),
++      inputSchema: z.custom<z.ZodType>(),
+       endsAgentStep: z.boolean().optional().default(false),
+       description: z.string().optional(),
+       exampleInputs: z.record(z.string(), z.any()).array().optional(),
+     }),
+   )
+   .default(() => ({}))
+-export type CustomToolDefinitions = z.input<typeof customToolDefinitionsSchema>
++export type CustomToolDefinitions = NonNullable<
++  z.input<typeof customToolDefinitionsSchema>
++>
+ 
+ export const ProjectFileContextSchema = z.object({
+   projectRoot: z.string(),
+@@ -83,7 +86,34 @@ export const ProjectFileContextSchema = z.object({
+   }),
+ })
+ 
+-export type ProjectFileContext = z.infer<typeof ProjectFileContextSchema>
++export type ProjectFileContext = {
++  projectRoot: string
++  cwd: string
++  fileTree: FileTreeNode[]
++  fileTokenScores: Record<string, Record<string, number>>
++  tokenCallers?: Record<string, Record<string, string[]>>
++  knowledgeFiles: Record<string, string>
++  userKnowledgeFiles?: Record<string, string>
++  agentTemplates: Record<string, any>
++  customToolDefinitions: CustomToolDefinitions
++  codebuffConfig?: CodebuffConfig
++  gitChanges: {
++    status: string
++    diff: string
++    diffCached: string
++    lastCommitMessages: string
++  }
++  changesSinceLastChat: Record<string, string>
++  shellConfigFiles: Record<string, string>
++  systemInfo: {
++    platform: string
++    shell: string
++    nodeVersion: string
++    arch: string
++    homedir: string
++    cpus: number
++  }
++}
+ 
+ export const fileRegex =
+   /<write_file>\s*<path>([^<]+)<\/path>\s*<content>([\s\S]*?)<\/content>\s*<\/write_file>/g
+diff --git a/packages/agent-runtime/src/mcp.ts b/packages/agent-runtime/src/mcp.ts
+index fa046bfd3..00ec16e7d 100644
+--- a/packages/agent-runtime/src/mcp.ts
++++ b/packages/agent-runtime/src/mcp.ts
+@@ -1,7 +1,12 @@
++import { convertJsonSchemaToZod } from 'zod-from-json-schema'
++
+ import type { AgentTemplate } from './templates/types'
+ import type { RequestMcpToolDataFn } from '@codebuff/common/types/contracts/client'
+ import type { OptionalFields } from '@codebuff/common/types/function-params'
+-import type { ProjectFileContext } from '@codebuff/common/util/file'
++import type {
++  CustomToolDefinitions,
++  ProjectFileContext,
++} from '@codebuff/common/util/file'
+ 
+ export async function getMCPToolData(
+   params: OptionalFields<
+@@ -13,7 +18,7 @@ export async function getMCPToolData(
+     },
+     'writeTo'
+   >,
+-): Promise<ProjectFileContext['customToolDefinitions']> {
++): Promise<CustomToolDefinitions> {
+   const withDefaults = { writeTo: {}, ...params }
+   const { toolNames, mcpServers, writeTo, requestMcpToolData } = withDefaults
+ 
+@@ -41,7 +46,7 @@ export async function getMCPToolData(
+ 
+         for (const { name, description, inputSchema } of mcpData) {
+           writeTo[mcpName + '/' + name] = {
+-            inputJsonSchema: inputSchema,
++            inputSchema: convertJsonSchemaToZod(inputSchema as any) as any,
+             endsAgentStep: true,
+             description,
+           }
+diff --git a/packages/agent-runtime/src/templates/strings.ts b/packages/agent-runtime/src/templates/strings.ts
+index 41ee70830..2d5f2faf0 100644
+--- a/packages/agent-runtime/src/templates/strings.ts
++++ b/packages/agent-runtime/src/templates/strings.ts
+@@ -111,7 +111,7 @@ export async function formatPrompt(
+     [PLACEHOLDER.PROJECT_ROOT]: () => fileContext.projectRoot,
+     [PLACEHOLDER.SYSTEM_INFO_PROMPT]: () => getSystemInfoPrompt(fileContext),
+     [PLACEHOLDER.TOOLS_PROMPT]: async () =>
+-      getToolsInstructions(tools, await additionalToolDefinitions()),
++      getToolsInstructions(tools, (await additionalToolDefinitions()) ?? {}),
+     [PLACEHOLDER.AGENTS_PROMPT]: () => buildSpawnableAgentsDescription(params),
+     [PLACEHOLDER.USER_CWD]: () => fileContext.cwd,
+     [PLACEHOLDER.USER_INPUT_PROMPT]: () => escapeString(lastUserInput ?? ''),
+diff --git a/packages/agent-runtime/src/tools/prompts.ts b/packages/agent-runtime/src/tools/prompts.ts
+index 2baa5b5f3..80f112f79 100644
+--- a/packages/agent-runtime/src/tools/prompts.ts
++++ b/packages/agent-runtime/src/tools/prompts.ts
+@@ -3,46 +3,30 @@ import { toolParams } from '@codebuff/common/tools/list'
+ import { getToolCallString } from '@codebuff/common/tools/utils'
+ import { buildArray } from '@codebuff/common/util/array'
+ import { pluralize } from '@codebuff/common/util/string'
++import { cloneDeep } from 'lodash'
+ import z from 'zod/v4'
+ 
+ import type { ToolName } from '@codebuff/common/tools/constants'
+-import type { customToolDefinitionsSchema } from '@codebuff/common/util/file'
+-import type { JSONSchema } from 'zod/v4/core'
++import type {
++  CustomToolDefinitions,
++  customToolDefinitionsSchema,
++} from '@codebuff/common/util/file'
++import type { ToolSet } from 'ai'
+ 
+-function paramsSection(params: {
+-  schema:
+-    | { type: 'zod'; value: z.ZodObject }
+-    | { type: 'json'; value: JSONSchema.BaseSchema }
+-  endsAgentStep: boolean
+-}) {
++function paramsSection(params: { schema: z.ZodType; endsAgentStep: boolean }) {
+   const { schema, endsAgentStep } = params
+-  const schemaWithEndsAgentStepParam =
+-    schema.type === 'zod'
+-      ? z.toJSONSchema(
+-          endsAgentStep
+-            ? schema.value.extend({
+-                [endsAgentStepParam]: z
+-                  .literal(endsAgentStep)
+-                  .describe('Easp flag must be set to true'),
+-              })
+-            : schema.value,
+-          { io: 'input' },
++  const schemaWithEndsAgentStepParam = z.toJSONSchema(
++    endsAgentStep
++      ? schema.and(
++          z.object({
++            [endsAgentStepParam]: z
++              .literal(endsAgentStep)
++              .describe('Easp flag must be set to true'),
++          }),
+         )
+-      : JSON.parse(JSON.stringify(schema.value))
+-  if (schema.type === 'json') {
+-    if (!schemaWithEndsAgentStepParam.properties) {
+-      schemaWithEndsAgentStepParam.properties = {}
+-    }
+-    schemaWithEndsAgentStepParam.properties[endsAgentStepParam] = {
+-      const: true,
+-      type: 'boolean',
+-      description: 'Easp flag must be set to true',
+-    }
+-    if (!schemaWithEndsAgentStepParam.required) {
+-      schemaWithEndsAgentStepParam.required = []
+-    }
+-    schemaWithEndsAgentStepParam.required.push(endsAgentStepParam)
+-  }
++      : schema,
++    { io: 'input' },
++  )
+ 
+   const jsonSchema = schemaWithEndsAgentStepParam
+   delete jsonSchema.description
+@@ -63,9 +47,7 @@ function paramsSection(params: {
+ // Helper function to build the full tool description markdown
+ export function buildToolDescription(params: {
+   toolName: string
+-  schema:
+-    | { type: 'zod'; value: z.ZodObject }
+-    | { type: 'json'; value: JSONSchema.BaseSchema }
++  schema: z.ZodType
+   description?: string
+   endsAgentStep: boolean
+   exampleInputs?: any[]
+@@ -88,7 +70,7 @@ export function buildToolDescription(params: {
+   ).join('\n\n')
+   return buildArray([
+     `### ${toolName}`,
+-    schema.value.description || '',
++    schema.description || '',
+     paramsSection({ schema, endsAgentStep }),
+     descriptionWithExamples,
+   ]).join('\n\n')
+@@ -99,7 +81,7 @@ export const toolDescriptions = Object.fromEntries(
+     name,
+     buildToolDescription({
+       toolName: name,
+-      schema: { type: 'zod', value: config.inputSchema },
++      schema: config.inputSchema,
+       description: config.description,
+       endsAgentStep: config.endsAgentStep,
+     }),
+@@ -108,9 +90,7 @@ export const toolDescriptions = Object.fromEntries(
+ 
+ function buildShortToolDescription(params: {
+   toolName: string
+-  schema:
+-    | { type: 'zod'; value: z.ZodObject }
+-    | { type: 'json'; value: JSONSchema.BaseSchema }
++  schema: z.ZodType
+   endsAgentStep: boolean
+ }): string {
+   const { toolName, schema, endsAgentStep } = params
+@@ -119,7 +99,9 @@ function buildShortToolDescription(params: {
+ 
+ export const getToolsInstructions = (
+   tools: readonly string[],
+-  additionalToolDefinitions: z.infer<typeof customToolDefinitionsSchema>,
++  additionalToolDefinitions: NonNullable<
++    z.input<typeof customToolDefinitionsSchema>
++  >,
+ ) => {
+   if (
+     tools.length === 0 &&
+@@ -201,7 +183,7 @@ ${fullToolList(tools, additionalToolDefinitions)}
+ 
+ export const fullToolList = (
+   toolNames: readonly string[],
+-  additionalToolDefinitions: z.infer<typeof customToolDefinitionsSchema>,
++  additionalToolDefinitions: CustomToolDefinitions,
+ ) => {
+   if (
+     toolNames.length === 0 &&
+@@ -224,9 +206,9 @@ ${[
+     const toolDef = additionalToolDefinitions[toolName]
+     return buildToolDescription({
+       toolName,
+-      schema: { type: 'json', value: toolDef.inputJsonSchema },
++      schema: toolDef.inputSchema,
+       description: toolDef.description,
+-      endsAgentStep: toolDef.endsAgentStep,
++      endsAgentStep: toolDef.endsAgentStep ?? true,
+       exampleInputs: toolDef.exampleInputs,
+     })
+   }),
+@@ -235,7 +217,7 @@ ${[
+ 
+ export const getShortToolInstructions = (
+   toolNames: readonly string[],
+-  additionalToolDefinitions: z.infer<typeof customToolDefinitionsSchema>,
++  additionalToolDefinitions: CustomToolDefinitions,
+ ) => {
+   if (
+     toolNames.length === 0 &&
+@@ -253,16 +235,16 @@ export const getShortToolInstructions = (
+       const tool = toolParams[name]
+       return buildShortToolDescription({
+         toolName: name,
+-        schema: { type: 'zod', value: tool.inputSchema },
++        schema: tool.inputSchema,
+         endsAgentStep: tool.endsAgentStep,
+       })
+     }),
+     ...Object.keys(additionalToolDefinitions).map((name) => {
+-      const { inputJsonSchema, endsAgentStep } = additionalToolDefinitions[name]
++      const { inputSchema, endsAgentStep } = additionalToolDefinitions[name]
+       return buildShortToolDescription({
+         toolName: name,
+-        schema: { type: 'json', value: inputJsonSchema },
+-        endsAgentStep,
++        schema: inputSchema,
++        endsAgentStep: endsAgentStep ?? true,
+       })
+     }),
+   ]
+diff --git a/packages/agent-runtime/src/tools/stream-parser.ts b/packages/agent-runtime/src/tools/stream-parser.ts
+index 5bfe0466b..ab2b2d333 100644
+--- a/packages/agent-runtime/src/tools/stream-parser.ts
++++ b/packages/agent-runtime/src/tools/stream-parser.ts
+@@ -175,7 +175,7 @@ export async function processStreamWithTools(
+     ...params,
+     processors: Object.fromEntries([
+       ...toolNames.map((toolName) => [toolName, toolCallback(toolName)]),
+-      ...Object.keys(fileContext.customToolDefinitions).map((toolName) => [
++      ...Object.keys(fileContext.customToolDefinitions ?? {}).map((toolName) => [
+         toolName,
+         customToolCallback(toolName),
+       ]),
+diff --git a/packages/agent-runtime/src/tools/tool-executor.ts b/packages/agent-runtime/src/tools/tool-executor.ts
+index 94eabbea5..1baa2b774 100644
+--- a/packages/agent-runtime/src/tools/tool-executor.ts
++++ b/packages/agent-runtime/src/tools/tool-executor.ts
+@@ -4,7 +4,6 @@ import { jsonToolResult } from '@codebuff/common/util/messages'
+ import { generateCompactId } from '@codebuff/common/util/string'
+ import { cloneDeep } from 'lodash'
+ import z from 'zod/v4'
+-import { convertJsonSchemaToZod } from 'zod-from-json-schema'
+ 
+ import { checkLiveUserInput } from '../live-user-inputs'
+ import { getMCPToolData } from '../mcp'
+@@ -30,7 +29,7 @@ import type { ToolResultOutput } from '@codebuff/common/types/messages/content-p
+ import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+ import type { AgentState, Subgoal } from '@codebuff/common/types/session-state'
+ import type {
+-  customToolDefinitionsSchema,
++  CustomToolDefinitions,
+   ProjectFileContext,
+ } from '@codebuff/common/util/file'
+ import type { ToolCallPart } from 'ai'
+@@ -293,7 +292,7 @@ export function executeToolCall<T extends ToolName>(
+ }
+ 
+ export function parseRawCustomToolCall(params: {
+-  customToolDefs: z.infer<typeof customToolDefinitionsSchema>
++  customToolDefs: CustomToolDefinitions
+   rawToolCall: {
+     toolName: string
+     toolCallId: string
+@@ -304,7 +303,10 @@ export function parseRawCustomToolCall(params: {
+   const { customToolDefs, rawToolCall, autoInsertEndStepParam = false } = params
+   const toolName = rawToolCall.toolName
+ 
+-  if (!(toolName in customToolDefs) && !toolName.includes('/')) {
++  if (
++    !(customToolDefs && toolName in customToolDefs) &&
++    !toolName.includes('/')
++  ) {
+     return {
+       toolName,
+       toolCallId: rawToolCall.toolCallId,
+@@ -321,30 +323,13 @@ export function parseRawCustomToolCall(params: {
+   // Add the required codebuff_end_step parameter with the correct value for this tool if requested
+   if (autoInsertEndStepParam) {
+     processedParameters[endsAgentStepParam] =
+-      customToolDefs[toolName].endsAgentStep
++      customToolDefs?.[toolName]?.endsAgentStep
+   }
+ 
+-  const jsonSchema = cloneDeep(customToolDefs[toolName].inputJsonSchema)
+-  if (customToolDefs[toolName].endsAgentStep) {
+-    if (!jsonSchema.properties) {
+-      jsonSchema.properties = {}
+-    }
+-    jsonSchema.properties[endsAgentStepParam] = {
+-      const: true,
+-      type: 'boolean',
+-      description: 'Easp flag must be set to true',
+-    }
+-    if (!jsonSchema.required) {
+-      jsonSchema.required = []
+-    }
+-    jsonSchema.required.push(endsAgentStepParam)
+-  }
+-  const paramsSchema = convertJsonSchemaToZod(jsonSchema)
+-  const result = paramsSchema.safeParse(
+-    processedParameters,
+-  ) as z.ZodSafeParseResult<any>
++  const paramsSchema = customToolDefs?.[toolName]?.inputSchema
++  const result = paramsSchema?.safeParse(processedParameters)
+ 
+-  if (!result.success) {
++  if (result && !result.success) {
+     return {
+       toolName: toolName,
+       toolCallId: rawToolCall.toolCallId,
+diff --git a/sdk/src/__tests__/initial-session-state.test.ts b/sdk/src/__tests__/initial-session-state.test.ts
+index b68317e52..034e43af1 100644
+--- a/sdk/src/__tests__/initial-session-state.test.ts
++++ b/sdk/src/__tests__/initial-session-state.test.ts
+@@ -252,13 +252,7 @@ describe('Initial Session State', () => {
+     const customToolDefinitions = [
+       {
+         toolName: 'custom_tool',
+-        zodSchema: inputSchema,
+-        inputJsonSchema: {
+-          type: 'object' as const,
+-          properties: {
+-            input: { type: 'string' as const },
+-          },
+-        },
++        inputSchema,
+         description: 'A custom tool',
+         endsAgentStep: false,
+         exampleInputs: [],
+@@ -276,10 +270,11 @@ describe('Initial Session State', () => {
+ 
+     expect(sessionState.fileContext.customToolDefinitions).toBeDefined()
+     expect(
+-      sessionState.fileContext.customToolDefinitions['custom_tool'],
++      sessionState.fileContext.customToolDefinitions?.['custom_tool'],
+     ).toBeDefined()
+     expect(
+-      sessionState.fileContext.customToolDefinitions['custom_tool'].description,
++      sessionState.fileContext.customToolDefinitions?.['custom_tool']
++        ?.description,
+     ).toBe('A custom tool')
+   })
+ 
+diff --git a/sdk/src/custom-tool.ts b/sdk/src/custom-tool.ts
+index 29ceef225..5a0604f17 100644
+--- a/sdk/src/custom-tool.ts
++++ b/sdk/src/custom-tool.ts
+@@ -1,8 +1,6 @@
+-import { z } from 'zod/v4'
+-
+ import type { ToolName } from '../../common/src/tools/constants'
+ import type { ToolResultOutput } from '../../common/src/types/messages/content-part'
+-import type { JSONSchema } from 'zod/v4/core'
++import type { z } from 'zod/v4'
+ 
+ export type CustomToolDefinition<
+   N extends string = string,
+@@ -10,8 +8,7 @@ export type CustomToolDefinition<
+   Input extends any = any,
+ > = {
+   toolName: N
+-  zodSchema: z.ZodType<Args, Input>
+-  inputJsonSchema: JSONSchema.BaseSchema
++  inputSchema: z.ZodType<Args, Input>
+   description: string
+   endsAgentStep: boolean
+   exampleInputs: Input[]
+@@ -54,8 +51,7 @@ export function getCustomToolDefinition<
+ }): CustomToolDefinition<TN, Args, Input> {
+   return {
+     toolName,
+-    zodSchema: inputSchema,
+-    inputJsonSchema: z.toJSONSchema(inputSchema, { io: 'input' }),
++    inputSchema,
+     description,
+     endsAgentStep,
+     exampleInputs,
+diff --git a/sdk/src/run-state.ts b/sdk/src/run-state.ts
+index 8be2dfced..fd89bdd51 100644
+--- a/sdk/src/run-state.ts
++++ b/sdk/src/run-state.ts
+@@ -78,7 +78,7 @@ function processCustomToolDefinitions(
+     customToolDefinitions.map((toolDefinition) => [
+       toolDefinition.toolName,
+       {
+-        inputJsonSchema: toolDefinition.inputJsonSchema,
++        inputSchema: toolDefinition.inputSchema,
+         description: toolDefinition.description,
+         endsAgentStep: toolDefinition.endsAgentStep,
+         exampleInputs: toolDefinition.exampleInputs,

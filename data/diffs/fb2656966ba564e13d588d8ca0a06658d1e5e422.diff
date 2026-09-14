@@ -1,0 +1,365 @@
+diff --git a/cli/src/app.tsx b/cli/src/app.tsx
+index add3ce9f0..88180294e 100644
+--- a/cli/src/app.tsx
++++ b/cli/src/app.tsx
+@@ -375,6 +375,7 @@ const AuthedSurface = ({
+   //   'none'   → no seat yet; show model-picker landing
+   //   'queued' → waiting our turn
+   //   'country_blocked' → terminal region-gate message
++  //   'banned' → terminal account-banned message
+   //
+   // 'ended' deliberately falls through to <Chat>: the agent may still be
+   // finishing work under the server-side grace period, and the chat surface
+@@ -384,7 +385,8 @@ const AuthedSurface = ({
+     (session === null ||
+       session.status === 'queued' ||
+       session.status === 'none' ||
+-      session.status === 'country_blocked')
++      session.status === 'country_blocked' ||
++      session.status === 'banned')
+   ) {
+     return <WaitingRoomScreen session={session} error={sessionError} />
+   }
+diff --git a/cli/src/components/waiting-room-screen.tsx b/cli/src/components/waiting-room-screen.tsx
+index 2c2a65f5c..8913093a2 100644
+--- a/cli/src/components/waiting-room-screen.tsx
++++ b/cli/src/components/waiting-room-screen.tsx
+@@ -242,6 +242,21 @@ export const WaitingRoomScreen: React.FC<WaitingRoomScreenProps> = ({
+               </text>
+             </>
+           )}
++
++          {/* Account banned. Terminal — polling has stopped. Blocking here
++              stops banned bots from re-entering the queue every few seconds
++              and inflating queueDepth between admission-tick sweeps. */}
++          {session?.status === 'banned' && (
++            <>
++              <text style={{ fg: theme.secondary, marginBottom: 1 }}>
++                ⚠ Account unavailable
++              </text>
++              <text style={{ fg: theme.muted, wrapMode: 'word' }}>
++                This account can't use freebuff. If you think this is a
++                mistake, contact support@codebuff.com. Press Ctrl+C to exit.
++              </text>
++            </>
++          )}
+         </box>
+       </box>
+ 
+diff --git a/cli/src/hooks/use-freebuff-session.ts b/cli/src/hooks/use-freebuff-session.ts
+index b5497e43d..407d4afd4 100644
+--- a/cli/src/hooks/use-freebuff-session.ts
++++ b/cli/src/hooks/use-freebuff-session.ts
+@@ -60,17 +60,18 @@ async function callSession(
+   if (resp.status === 404) {
+     return { status: 'disabled' }
+   }
+-  // 403 with a country_blocked body is a terminal signal, not an error — the
+-  // server rejects non-allowlist countries up front (see session _handlers.ts)
+-  // so users don't wait through the queue only to be rejected at chat time.
+-  // The 403 status (rather than 200) is deliberate: older CLIs that don't
+-  // know this status treat it as a generic error and back off on the 10s
+-  // error-retry cadence instead of tight-polling an unrecognized 200 body.
++  // 403 with a country_blocked or banned body is a terminal signal, not an
++  // error — the server rejects non-allowlist countries and banned accounts up
++  // front (see session _handlers.ts) so they don't wait through the queue only
++  // to be rejected at chat time. The 403 status (rather than 200) is
++  // deliberate: older CLIs that don't know these statuses treat them as a
++  // generic error and back off on the 10s error-retry cadence instead of
++  // tight-polling an unrecognized 200 body.
+   if (resp.status === 403) {
+     const body = (await resp.json().catch(() => null)) as
+       | FreebuffSessionResponse
+       | null
+-    if (body && body.status === 'country_blocked') {
++    if (body && (body.status === 'country_blocked' || body.status === 'banned')) {
+       return body
+     }
+   }
+@@ -116,6 +117,7 @@ function nextDelayMs(next: FreebuffSessionResponse): number | null {
+     case 'disabled':
+     case 'superseded':
+     case 'country_blocked':
++    case 'banned':
+     case 'model_locked':
+       return null
+   }
+diff --git a/common/src/types/freebuff-session.ts b/common/src/types/freebuff-session.ts
+index 363224d39..e42d9f0be 100644
+--- a/common/src/types/freebuff-session.ts
++++ b/common/src/types/freebuff-session.ts
+@@ -92,3 +92,10 @@ export type FreebuffSessionServerResponse =
+       currentModel: string
+       requestedModel: string
+     }
++  | {
++      /** Account is banned. Returned from every endpoint so banned bots can't
++       *  join the queue at all (otherwise they inflate `queueDepth` until the
++       *  15s admission tick's `evictBanned` sweeps them). Terminal — CLI
++       *  stops polling and shows a banned message. */
++      status: 'banned'
++    }
+diff --git a/web/src/app/api/v1/freebuff/session/__tests__/session.test.ts b/web/src/app/api/v1/freebuff/session/__tests__/session.test.ts
+index cb34a0ad0..657c17f6d 100644
+--- a/web/src/app/api/v1/freebuff/session/__tests__/session.test.ts
++++ b/web/src/app/api/v1/freebuff/session/__tests__/session.test.ts
+@@ -84,10 +84,17 @@ const LOGGER = {
+   debug: () => {},
+ }
+ 
+-function makeDeps(sessionDeps: SessionDeps, userId: string | null): FreebuffSessionDeps {
++function makeDeps(
++  sessionDeps: SessionDeps,
++  userId: string | null,
++  opts: { banned?: boolean } = {},
++): FreebuffSessionDeps {
+   return {
+     logger: LOGGER as unknown as FreebuffSessionDeps['logger'],
+-    getUserInfoFromApiKey: (async () => (userId ? { id: userId } : undefined)) as unknown as FreebuffSessionDeps['getUserInfoFromApiKey'],
++    getUserInfoFromApiKey: (async () =>
++      userId
++        ? { id: userId, banned: opts.banned ?? false }
++        : undefined) as unknown as FreebuffSessionDeps['getUserInfoFromApiKey'],
+     sessionDeps,
+   }
+ }
+@@ -145,6 +152,22 @@ describe('POST /api/v1/freebuff/session', () => {
+     const body = await resp.json()
+     expect(body.status).toBe('queued')
+   })
++
++  // Banned bots with valid API keys were POSTing every few seconds and
++  // inflating queueDepth between the 15s admission-tick sweeps. Rejecting at
++  // the HTTP layer with 403 (terminal, like country_blocked) keeps them out
++  // entirely. Also verifies no queue row is created as a side effect.
++  test('returns banned 403 without joining the queue for banned user', async () => {
++    const sessionDeps = makeSessionDeps()
++    const resp = await postFreebuffSession(
++      makeReq('ok'),
++      makeDeps(sessionDeps, 'u1', { banned: true }),
++    )
++    expect(resp.status).toBe(403)
++    const body = await resp.json()
++    expect(body.status).toBe('banned')
++    expect(sessionDeps.rows.size).toBe(0)
++  })
+ })
+ 
+ describe('GET /api/v1/freebuff/session', () => {
+@@ -168,6 +191,17 @@ describe('GET /api/v1/freebuff/session', () => {
+     expect(body.countryCode).toBe('FR')
+   })
+ 
++  test('returns banned 403 on GET for banned user', async () => {
++    const sessionDeps = makeSessionDeps()
++    const resp = await getFreebuffSession(
++      makeReq('ok'),
++      makeDeps(sessionDeps, 'u1', { banned: true }),
++    )
++    expect(resp.status).toBe(403)
++    const body = await resp.json()
++    expect(body.status).toBe('banned')
++  })
++
+   test('returns superseded when active row exists with mismatched instance id', async () => {
+     const sessionDeps = makeSessionDeps()
+     sessionDeps.rows.set('u1', {
+diff --git a/web/src/app/api/v1/freebuff/session/_handlers.ts b/web/src/app/api/v1/freebuff/session/_handlers.ts
+index b1f1f4c93..ec17568a3 100644
+--- a/web/src/app/api/v1/freebuff/session/_handlers.ts
++++ b/web/src/app/api/v1/freebuff/session/_handlers.ts
+@@ -50,7 +50,7 @@ export interface FreebuffSessionDeps {
+ 
+ type AuthResult =
+   | { error: NextResponse }
+-  | { userId: string; userEmail: string | null }
++  | { userId: string; userEmail: string | null; userBanned: boolean }
+ 
+ async function resolveUser(req: NextRequest, deps: FreebuffSessionDeps): Promise<AuthResult> {
+   const apiKey = extractApiKeyFromHeader(req)
+@@ -67,7 +67,7 @@ async function resolveUser(req: NextRequest, deps: FreebuffSessionDeps): Promise
+   }
+   const userInfo = await deps.getUserInfoFromApiKey({
+     apiKey,
+-    fields: ['id', 'email'],
++    fields: ['id', 'email', 'banned'],
+     logger: deps.logger,
+   })
+   if (!userInfo?.id) {
+@@ -78,7 +78,11 @@ async function resolveUser(req: NextRequest, deps: FreebuffSessionDeps): Promise
+       ),
+     }
+   }
+-  return { userId: String(userInfo.id), userEmail: userInfo.email ?? null }
++  return {
++    userId: String(userInfo.id),
++    userEmail: userInfo.email ?? null,
++    userBanned: Boolean(userInfo.banned),
++  }
+ }
+ 
+ function serverError(
+@@ -130,13 +134,16 @@ export async function postFreebuffSession(
+     const state = await requestSession({
+       userId: auth.userId,
+       userEmail: auth.userEmail,
++      userBanned: auth.userBanned,
+       model: requestedModel,
+       deps: deps.sessionDeps,
+     })
+     // model_locked is a 409 so it's distinguishable from a normal queued/active
+-    // response on the client. The CLI translates it into a "switch model?"
+-    // confirmation prompt.
+-    const status = state.status === 'model_locked' ? 409 : 200
++    // response on the client. banned is a 403 (terminal, mirrors country_blocked)
++    // so older CLIs that don't know the status fall into their `!resp.ok` error
++    // path and back off instead of tight-polling on the unrecognized 200 body.
++    const status =
++      state.status === 'model_locked' ? 409 : state.status === 'banned' ? 403 : 200
+     return NextResponse.json(state, { status })
+   } catch (error) {
+     return serverError(deps, 'POST', auth.userId, error)
+@@ -161,6 +168,7 @@ export async function getFreebuffSession(
+     const state = await getSessionState({
+       userId: auth.userId,
+       userEmail: auth.userEmail,
++      userBanned: auth.userBanned,
+       claimedInstanceId,
+       deps: deps.sessionDeps,
+     })
+@@ -174,7 +182,10 @@ export async function getFreebuffSession(
+         { status: 200 },
+       )
+     }
+-    return NextResponse.json(state, { status: 200 })
++    // banned is terminal; 403 for the same reason as country_blocked — older
++    // CLIs that don't know this status treat it as a generic error.
++    const status = state.status === 'banned' ? 403 : 200
++    return NextResponse.json(state, { status })
+   } catch (error) {
+     return serverError(deps, 'GET', auth.userId, error)
+   }
+diff --git a/web/src/server/free-session/__tests__/public-api.test.ts b/web/src/server/free-session/__tests__/public-api.test.ts
+index 5c5c51282..a824f6d22 100644
+--- a/web/src/server/free-session/__tests__/public-api.test.ts
++++ b/web/src/server/free-session/__tests__/public-api.test.ts
+@@ -155,6 +155,19 @@ describe('requestSession', () => {
+     expect(offDeps.rows.size).toBe(0)
+   })
+ 
++  test('banned user is rejected before joinOrTakeOver runs', async () => {
++    const state = await requestSession({
++      userId: 'u1',
++      model: DEFAULT_MODEL,
++      userBanned: true,
++      deps,
++    })
++    expect(state).toEqual({ status: 'banned' })
++    // No row should be created — the point is to keep banned bots out of
++    // queueDepthsByModel entirely, not just until the next evictBanned tick.
++    expect(deps.rows.size).toBe(0)
++  })
++
+   test('first call puts user in queue at position 1', async () => {
+     const state = await requestSession({ userId: 'u1', model: DEFAULT_MODEL, deps })
+     expect(state.status).toBe('queued')
+@@ -284,6 +297,15 @@ describe('getSessionState', () => {
+     expect(state).toEqual({ status: 'disabled' })
+   })
+ 
++  test('banned user returns banned without hitting the DB', async () => {
++    const state = await getSessionState({
++      userId: 'u1',
++      userBanned: true,
++      deps,
++    })
++    expect(state).toEqual({ status: 'banned' })
++  })
++
+   test('no row returns none with empty queue-depth snapshot', async () => {
+     const state = await getSessionState({ userId: 'u1', deps })
+     expect(state).toEqual({ status: 'none', queueDepthByModel: {} })
+diff --git a/web/src/server/free-session/public-api.ts b/web/src/server/free-session/public-api.ts
+index 3357b7e05..450540443 100644
+--- a/web/src/server/free-session/public-api.ts
++++ b/web/src/server/free-session/public-api.ts
+@@ -144,10 +144,17 @@ export async function requestSession(params: {
+   userId: string
+   model: string
+   userEmail?: string | null | undefined
++  /** True if the account is banned. Short-circuited here so banned bots never
++   *  create a queued row — otherwise they inflate `queueDepth` between the
++   *  15s admission ticks that run `evictBanned`. */
++  userBanned?: boolean
+   deps?: SessionDeps
+ }): Promise<RequestSessionResult> {
+   const deps = params.deps ?? defaultDeps
+   const model = resolveFreebuffModel(params.model)
++  if (params.userBanned) {
++    return { status: 'banned' }
++  }
+   if (
+     !deps.isWaitingRoomEnabled() ||
+     isWaitingRoomBypassedForEmail(params.userEmail)
+@@ -224,10 +231,14 @@ export async function requestSession(params: {
+ export async function getSessionState(params: {
+   userId: string
+   userEmail?: string | null | undefined
++  userBanned?: boolean
+   claimedInstanceId?: string | null | undefined
+   deps?: SessionDeps
+ }): Promise<FreebuffSessionServerResponse> {
+   const deps = params.deps ?? defaultDeps
++  if (params.userBanned) {
++    return { status: 'banned' }
++  }
+   if (
+     !deps.isWaitingRoomEnabled() ||
+     isWaitingRoomBypassedForEmail(params.userEmail)
+diff --git a/web/src/server/free-session/store.ts b/web/src/server/free-session/store.ts
+index 13beb0739..b3bd2bc48 100644
+--- a/web/src/server/free-session/store.ts
++++ b/web/src/server/free-session/store.ts
+@@ -164,12 +164,26 @@ export async function queueDepth(params: { model: string }): Promise<number> {
+  * covers every model's queue depth, so the UI stays cheap to refresh.
+  * Models with no queued rows are absent from the map; callers should default
+  * missing keys to 0.
++ *
++ * Excludes rows whose user is banned: `evictBanned` only runs on the 15s
++ * admission tick, so between ticks a flood of banned bots would inflate
++ * queueDepth by their count and then snap back down. Filtering here keeps
++ * the user-facing counter stable.
+  */
+ export async function queueDepthsByModel(): Promise<Record<string, number>> {
+   const rows = await db
+     .select({ model: schema.freeSession.model, n: count() })
+     .from(schema.freeSession)
+-    .where(eq(schema.freeSession.status, 'queued'))
++    .where(
++      and(
++        eq(schema.freeSession.status, 'queued'),
++        sql`NOT EXISTS (
++          SELECT 1 FROM ${schema.user}
++          WHERE ${schema.user.id} = ${schema.freeSession.user_id}
++            AND ${schema.user.banned} = true
++        )`,
++      ),
++    )
+     .groupBy(schema.freeSession.model)
+   const out: Record<string, number> = {}
+   for (const row of rows) out[row.model] = Number(row.n)
+@@ -224,6 +238,14 @@ export async function queuePositionFor(params: {
+         eq(schema.freeSession.status, 'queued'),
+         eq(schema.freeSession.model, params.model),
+         sql`(${schema.freeSession.queued_at}, ${schema.freeSession.user_id}) <= (${params.queuedAt.toISOString()}::timestamptz, ${params.userId})`,
++        // Exclude banned users ahead of us — matches queueDepthsByModel so the
++        // "Position N / M" counter doesn't briefly jump when banned rows are
++        // swept by the admission tick.
++        sql`NOT EXISTS (
++          SELECT 1 FROM ${schema.user}
++          WHERE ${schema.user.id} = ${schema.freeSession.user_id}
++            AND ${schema.user.banned} = true
++        )`,
+       ),
+     )
+   return Number(rows[0]?.n ?? 0)

@@ -1,0 +1,213 @@
+diff --git a/.github/workflows/cli-release-build.yml b/.github/workflows/cli-release-build.yml
+index 4df1a1a8d..d3513d6bf 100644
+--- a/.github/workflows/cli-release-build.yml
++++ b/.github/workflows/cli-release-build.yml
+@@ -176,11 +176,20 @@ jobs:
+         run: |
+           cd cli/bin
+           if [[ "${{ runner.os }}" == "Windows" ]]; then
+-            ./${{ inputs.binary-name }}.exe --version
++            BIN="./${{ inputs.binary-name }}.exe"
+           else
+-            ./${{ inputs.binary-name }} --version
++            BIN="./${{ inputs.binary-name }}"
+           fi
+ 
++          # Fast path: --version exits synchronously through commander, so it
++          # only catches early sync failures. Run it for parity with old CI.
++          "$BIN" --version
++
++          # Slow path: keep the binary alive long enough for *async* startup
++          # failures (e.g. the Parser.init rejection that crashed the
++          # post-OpenTUI-upgrade Windows build) to surface in stdout/stderr.
++          bun ../scripts/smoke-binary.ts "$BIN"
++
+       - name: Create tarball
+         shell: bash
+         run: |
+@@ -317,7 +326,15 @@ jobs:
+         shell: bash
+         run: |
+           cd cli/bin
+-          ./${{ inputs.binary-name }}.exe --version
++          BIN="./${{ inputs.binary-name }}.exe"
++
++          # Sync check — exits via commander before async tasks fire.
++          "$BIN" --version
++
++          # Long-running check — gives async startup failures time to surface.
++          # This is the step that would have caught the post-OpenTUI-upgrade
++          # tree-sitter wasm crash on Windows.
++          bun ../scripts/smoke-binary.ts "$BIN"
+ 
+       - name: Create tarball
+         shell: bash
+diff --git a/.github/workflows/freebuff-e2e.yml b/.github/workflows/freebuff-e2e.yml
+index dfb86390d..e88c535fb 100644
+--- a/.github/workflows/freebuff-e2e.yml
++++ b/.github/workflows/freebuff-e2e.yml
+@@ -40,7 +40,13 @@ jobs:
+       - name: Smoke test binary
+         run: |
+           chmod +x cli/bin/freebuff
++          # --version exits via commander synchronously and won't see async
++          # startup failures (e.g. the Parser.init rejection from a broken
++          # tree-sitter wasm load).
+           cli/bin/freebuff --version
++          # Run for a few seconds so unhandled rejections during module init
++          # have a chance to fire and trip earlyFatalHandler.
++          bun cli/scripts/smoke-binary.ts cli/bin/freebuff
+ 
+       - name: Upload binary
+         uses: actions/upload-artifact@v7
+diff --git a/cli/scripts/smoke-binary.ts b/cli/scripts/smoke-binary.ts
+new file mode 100644
+index 000000000..725beed55
+--- /dev/null
++++ b/cli/scripts/smoke-binary.ts
+@@ -0,0 +1,102 @@
++#!/usr/bin/env bun
++/**
++ * Long-running smoke test for a compiled CLI binary.
++ *
++ * `--version` and `--help` exit via commander synchronously, before async
++ * startup failures (e.g. the unhandled rejection from Parser.init when the
++ * tree-sitter wasm load fails) get a chance to fire. This script spawns the
++ * binary, lets it run for a few seconds, then kills it and asserts no fatal
++ * startup markers showed up in stdout/stderr.
++ *
++ * Designed to run on every supported platform (Linux, macOS, Windows) without
++ * extra deps. The binary doesn't need a TTY: `earlyFatalHandler` in
++ * `cli/src/index.tsx` writes its diagnostic to stdout/stderr regardless.
++ *
++ * Usage:
++ *   bun cli/scripts/smoke-binary.ts <path-to-binary> [seconds]
++ *
++ * Exits 0 if no fatal markers detected, 1 otherwise.
++ */
++
++import { spawn } from 'child_process'
++import { existsSync } from 'fs'
++
++// Markers that indicate the CLI crashed during startup. Match what
++// `earlyFatalHandler` writes plus the specific tree-sitter regression.
++const FATAL_PATTERNS = [
++  /Fatal error during startup/i,
++  /Internal error: tree-sitter\.wasm not found/i,
++  /UnhandledPromiseRejection/i,
++  /Cannot find module/i,
++] as const
++
++const DEFAULT_RUN_SECONDS = 5
++
++async function main(): Promise<void> {
++  const binary = process.argv[2]
++  const runSeconds = Number(process.argv[3] ?? DEFAULT_RUN_SECONDS)
++
++  if (!binary) {
++    console.error('Usage: bun smoke-binary.ts <path-to-binary> [seconds]')
++    process.exit(2)
++  }
++  if (!existsSync(binary)) {
++    console.error(`smoke-binary: binary not found: ${binary}`)
++    process.exit(2)
++  }
++  if (!Number.isFinite(runSeconds) || runSeconds <= 0) {
++    console.error(`smoke-binary: bad seconds arg: ${process.argv[3]}`)
++    process.exit(2)
++  }
++
++  console.log(`smoke-binary: spawning ${binary} for ${runSeconds}s…`)
++
++  const proc = spawn(binary, [], {
++    stdio: ['ignore', 'pipe', 'pipe'],
++    env: { ...process.env, NO_COLOR: '1', TERM: 'dumb' },
++  })
++
++  let captured = ''
++  const append = (chunk: Buffer): void => {
++    captured += chunk.toString('utf8')
++  }
++  proc.stdout?.on('data', append)
++  proc.stderr?.on('data', append)
++
++  let earlyExitCode: number | null = null
++  const exited = new Promise<void>((resolve) => {
++    proc.once('exit', (code) => {
++      earlyExitCode = code
++      resolve()
++    })
++  })
++
++  const killTimer = setTimeout(() => {
++    // SIGKILL is the only signal that's portable across Linux/macOS/Windows
++    // here; SIGTERM may be ignored by the renderer on some platforms.
++    proc.kill('SIGKILL')
++  }, runSeconds * 1_000)
++
++  await exited
++  clearTimeout(killTimer)
++
++  for (const pattern of FATAL_PATTERNS) {
++    if (pattern.test(captured)) {
++      console.error(
++        `smoke-binary: FAIL — output matched ${pattern} (exit code ${earlyExitCode}).`,
++      )
++      console.error('--- captured output (truncated to 8KB) ---')
++      console.error(captured.slice(0, 8 * 1024))
++      process.exit(1)
++    }
++  }
++
++  console.log(
++    `smoke-binary: OK (exit code ${earlyExitCode}, ${captured.length} bytes captured).`,
++  )
++}
++
++main().catch((err: unknown) => {
++  console.error('smoke-binary: unexpected error:', err)
++  process.exit(2)
++})
+diff --git a/freebuff/e2e/tests/startup.e2e.test.ts b/freebuff/e2e/tests/startup.e2e.test.ts
+index 57a02feb8..f0c7e1d2e 100644
+--- a/freebuff/e2e/tests/startup.e2e.test.ts
++++ b/freebuff/e2e/tests/startup.e2e.test.ts
+@@ -15,24 +15,27 @@ describe('Freebuff: Startup', () => {
+   })
+ 
+   test(
+-    'binary starts without crashing',
++    'binary reaches the model selection screen',
+     async () => {
+       const binary = requireFreebuffBinary()
+       session = await FreebuffSession.start(binary)
+-      await session.waitForReady()
+-
+-      const output = await session.capture()
+ 
+-      // Should not contain fatal errors
++      // Wait for the model selector to render. This proves the binary survived
++      // module init (including the eager tree-sitter Parser.init that crashed
++      // Windows binaries after the OpenTUI 0.2.2 upgrade), passed the auth /
++      // session API call, and successfully mounted the React tree. A pure
++      // "non-empty output" check would pass on a half-rendered crash screen.
++      const output = await session.waitForText('Pick a model to start')
++
++      // earlyFatalHandler in cli/src/index.tsx writes this to stderr on
++      // unhandled rejections during startup. Belt-and-braces: the wait above
++      // would already have timed out, but if some race ever surfaces a fatal
++      // *after* the model selector renders, we still want it to fail.
++      expect(output).not.toContain('Fatal error during startup')
++      expect(output).not.toContain('Internal error: tree-sitter.wasm not found')
+       expect(output).not.toContain('FATAL')
+       expect(output).not.toContain('panic')
+       expect(output).not.toContain('Segmentation fault')
+-
+-      // Should have some visible output (not a blank screen)
+-      const nonEmptyLines = output
+-        .split('\n')
+-        .filter((line) => line.trim().length > 0)
+-      expect(nonEmptyLines.length).toBeGreaterThan(0)
+     },
+     STARTUP_TIMEOUT,
+   )

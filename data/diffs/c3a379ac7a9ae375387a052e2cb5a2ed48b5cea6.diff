@@ -1,0 +1,322 @@
+diff --git a/cli/src/app.tsx b/cli/src/app.tsx
+index 616e7b890..a83214114 100644
+--- a/cli/src/app.tsx
++++ b/cli/src/app.tsx
+@@ -384,7 +384,8 @@ const AuthedSurface = ({
+     IS_FREEBUFF &&
+     (session === null ||
+       session.status === 'queued' ||
+-      session.status === 'none')
++      session.status === 'none' ||
++      session.status === 'country_blocked')
+   ) {
+     return <WaitingRoomScreen session={session} error={sessionError} />
+   }
+diff --git a/cli/src/components/waiting-room-screen.tsx b/cli/src/components/waiting-room-screen.tsx
+index 8d893734f..812acf6ac 100644
+--- a/cli/src/components/waiting-room-screen.tsx
++++ b/cli/src/components/waiting-room-screen.tsx
+@@ -213,6 +213,23 @@ export const WaitingRoomScreen: React.FC<WaitingRoomScreenProps> = ({
+           {session?.status === 'disabled' && (
+             <text style={{ fg: theme.muted }}>Waiting room disabled.</text>
+           )}
++
++          {/* Country outside the free-mode allowlist. Terminal — polling has
++              stopped. Tell the user up front rather than letting them wait in
++              the queue only to be rejected at the chat/completions gate. */}
++          {session?.status === 'country_blocked' && (
++            <>
++              <text style={{ fg: theme.secondary, marginBottom: 1 }}>
++                ⚠ Free mode isn't available in your region
++              </text>
++              <text style={{ fg: theme.muted, wrapMode: 'word' }}>
++                We detected your location as{' '}
++                <span fg={theme.foreground}>{session.countryCode}</span>,
++                which is outside the countries where freebuff is currently
++                offered. Press Ctrl+C to exit.
++              </text>
++            </>
++          )}
+         </box>
+       </box>
+ 
+diff --git a/cli/src/hooks/use-freebuff-session.ts b/cli/src/hooks/use-freebuff-session.ts
+index d031f69e7..06db946be 100644
+--- a/cli/src/hooks/use-freebuff-session.ts
++++ b/cli/src/hooks/use-freebuff-session.ts
+@@ -50,6 +50,20 @@ async function callSession(
+   if (resp.status === 404) {
+     return { status: 'disabled' }
+   }
++  // 403 with a country_blocked body is a terminal signal, not an error — the
++  // server rejects non-allowlist countries up front (see session _handlers.ts)
++  // so users don't wait through the queue only to be rejected at chat time.
++  // The 403 status (rather than 200) is deliberate: older CLIs that don't
++  // know this status treat it as a generic error and back off on the 10s
++  // error-retry cadence instead of tight-polling an unrecognized 200 body.
++  if (resp.status === 403) {
++    const body = (await resp.json().catch(() => null)) as
++      | FreebuffSessionResponse
++      | null
++    if (body && body.status === 'country_blocked') {
++      return body
++    }
++  }
+   if (!resp.ok) {
+     const text = await resp.text().catch(() => '')
+     throw new Error(
+@@ -80,6 +94,7 @@ function nextDelayMs(next: FreebuffSessionResponse): number | null {
+     case 'none':
+     case 'disabled':
+     case 'superseded':
++    case 'country_blocked':
+       return null
+   }
+ }
+diff --git a/common/src/types/freebuff-session.ts b/common/src/types/freebuff-session.ts
+index e92a7bf04..b2a6dabff 100644
+--- a/common/src/types/freebuff-session.ts
++++ b/common/src/types/freebuff-session.ts
+@@ -59,3 +59,12 @@ export type FreebuffSessionServerResponse =
+        *  surfaces it as a 409 for fast in-flight feedback. */
+       status: 'superseded'
+     }
++  | {
++      /** Request originated from a country outside the free-mode allowlist.
++       *  Returned before queue admission so users don't wait through the
++       *  room only to be rejected on their first chat request. Terminal —
++       *  CLI stops polling and shows a "not available in your country"
++       *  screen. `countryCode` is the resolved country for display. */
++      status: 'country_blocked'
++      countryCode: string
++    }
+diff --git a/web/src/app/api/v1/chat/completions/_post.ts b/web/src/app/api/v1/chat/completions/_post.ts
+index c9b616846..f3640f4a3 100644
+--- a/web/src/app/api/v1/chat/completions/_post.ts
++++ b/web/src/app/api/v1/chat/completions/_post.ts
+@@ -68,40 +68,17 @@ import {
+   OpenRouterError,
+ } from '@/llm-api/openrouter'
+ import { checkSessionAdmissible } from '@/server/free-session/public-api'
++import {
++  FREE_MODE_ALLOWED_COUNTRIES,
++  extractClientIp,
++  getCountryCode,
++} from '@/server/free-mode-country'
+ 
+ import type { SessionGateResult } from '@/server/free-session/public-api'
+ import { extractApiKeyFromHeader } from '@/util/auth'
+ import { withDefaultProperties } from '@codebuff/common/analytics'
+ import { checkFreeModeRateLimit } from './free-mode-rate-limiter'
+ 
+-const FREE_MODE_ALLOWED_COUNTRIES = new Set([
+-  'US', 'CA',
+-  'GB', 'AU', 'NZ',
+-  'NO', 'SE', 'NL', 'DK', 'DE', 'FI', 'BE', 'LU', 'CH', 'IE', 'IS',
+-])
+-
+-function extractClientIp(req: NextRequest): string | undefined {
+-  const forwardedFor = req.headers.get('x-forwarded-for')
+-  if (forwardedFor) {
+-    return forwardedFor.split(',')[0].trim()
+-  }
+-  return req.headers.get('x-real-ip') ?? undefined
+-}
+-
+-function getCountryCode(req: NextRequest): string | null {
+-  const cfCountry = req.headers.get('cf-ipcountry')
+-  if (cfCountry && cfCountry !== 'XX' && cfCountry !== 'T1') {
+-    return cfCountry.toUpperCase()
+-  }
+-
+-  const clientIp = extractClientIp(req)
+-  if (!clientIp) {
+-    return null
+-  }
+-  const geo = geoip.lookup(clientIp)
+-  return geo?.country ?? null
+-}
+-
+ export const formatQuotaResetCountdown = (
+   nextQuotaReset: string | null | undefined,
+ ): string => {
+diff --git a/web/src/app/api/v1/freebuff/session/__tests__/session.test.ts b/web/src/app/api/v1/freebuff/session/__tests__/session.test.ts
+index 83e0dc299..eef464fee 100644
+--- a/web/src/app/api/v1/freebuff/session/__tests__/session.test.ts
++++ b/web/src/app/api/v1/freebuff/session/__tests__/session.test.ts
+@@ -14,11 +14,12 @@ import type { NextRequest } from 'next/server'
+ 
+ function makeReq(
+   apiKey: string | null,
+-  opts: { instanceId?: string } = {},
++  opts: { instanceId?: string; cfCountry?: string } = {},
+ ): NextRequest {
+   const headers = new Headers()
+   if (apiKey) headers.set('Authorization', `Bearer ${apiKey}`)
+   if (opts.instanceId) headers.set(FREEBUFF_INSTANCE_HEADER, opts.instanceId)
++  if (opts.cfCountry) headers.set('cf-ipcountry', opts.cfCountry)
+   return {
+     headers,
+   } as unknown as NextRequest
+@@ -102,6 +103,31 @@ describe('POST /api/v1/freebuff/session', () => {
+     const body = await resp.json()
+     expect(body.status).toBe('disabled')
+   })
++
++  test('returns country_blocked without joining the queue for disallowed country', async () => {
++    const sessionDeps = makeSessionDeps()
++    const resp = await postFreebuffSession(
++      makeReq('ok', { cfCountry: 'FR' }),
++      makeDeps(sessionDeps, 'u1'),
++    )
++    // 403 (not 200) so older CLIs that don't know `country_blocked` fall into
++    // their error-retry backoff instead of tight-polling.
++    expect(resp.status).toBe(403)
++    const body = await resp.json()
++    expect(body.status).toBe('country_blocked')
++    expect(body.countryCode).toBe('FR')
++    expect(sessionDeps.rows.size).toBe(0)
++  })
++
++  test('allows queue entry for allowed country', async () => {
++    const sessionDeps = makeSessionDeps()
++    const resp = await postFreebuffSession(
++      makeReq('ok', { cfCountry: 'US' }),
++      makeDeps(sessionDeps, 'u1'),
++    )
++    const body = await resp.json()
++    expect(body.status).toBe('queued')
++  })
+ })
+ 
+ describe('GET /api/v1/freebuff/session', () => {
+@@ -113,6 +139,18 @@ describe('GET /api/v1/freebuff/session', () => {
+     expect(body.status).toBe('none')
+   })
+ 
++  test('returns country_blocked for disallowed country on GET', async () => {
++    const sessionDeps = makeSessionDeps()
++    const resp = await getFreebuffSession(
++      makeReq('ok', { cfCountry: 'FR' }),
++      makeDeps(sessionDeps, 'u1'),
++    )
++    expect(resp.status).toBe(403)
++    const body = await resp.json()
++    expect(body.status).toBe('country_blocked')
++    expect(body.countryCode).toBe('FR')
++  })
++
+   test('returns superseded when active row exists with mismatched instance id', async () => {
+     const sessionDeps = makeSessionDeps()
+     sessionDeps.rows.set('u1', {
+diff --git a/web/src/app/api/v1/freebuff/session/_handlers.ts b/web/src/app/api/v1/freebuff/session/_handlers.ts
+index 5bed8e9c9..6f1ae0664 100644
+--- a/web/src/app/api/v1/freebuff/session/_handlers.ts
++++ b/web/src/app/api/v1/freebuff/session/_handlers.ts
+@@ -5,6 +5,10 @@ import {
+   getSessionState,
+   requestSession,
+ } from '@/server/free-session/public-api'
++import {
++  FREE_MODE_ALLOWED_COUNTRIES,
++  getCountryCode,
++} from '@/server/free-mode-country'
+ import { extractApiKeyFromHeader } from '@/util/auth'
+ 
+ import type { SessionDeps } from '@/server/free-session/public-api'
+@@ -12,6 +16,26 @@ import type { GetUserInfoFromApiKeyFn } from '@codebuff/common/types/contracts/d
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { NextRequest } from 'next/server'
+ 
++/** Early country gate. Mirrors the chat/completions check: if we can resolve
++ *  the caller's country and it's not on the allowlist, short-circuit with a
++ *  terminal `country_blocked` response so the CLI can show the warning
++ *  screen without ever joining the queue. Null country (VPN / localhost)
++ *  fails open — chat/completions will catch it later if it matters.
++ *
++ *  Returns HTTP 403 (not 200) so older CLIs — which don't know the
++ *  `country_blocked` status and would tight-poll on an unrecognized 200
++ *  body — fall into their existing `!resp.ok` error path and back off on
++ *  the 10s error retry cadence. The new CLI parses the 403 body directly. */
++function countryBlockedResponse(req: NextRequest): NextResponse | null {
++  const countryCode = getCountryCode(req)
++  if (!countryCode) return null
++  if (FREE_MODE_ALLOWED_COUNTRIES.has(countryCode)) return null
++  return NextResponse.json(
++    { status: 'country_blocked', countryCode },
++    { status: 403 },
++  )
++}
++
+ /** Header the CLI uses to identify which instance is polling. Used by GET to
+  *  detect when another CLI on the same account has rotated the id. */
+ export const FREEBUFF_INSTANCE_HEADER = 'x-freebuff-instance-id'
+@@ -95,6 +119,9 @@ export async function postFreebuffSession(
+   const auth = await resolveUser(req, deps)
+   if ('error' in auth) return auth.error
+ 
++  const blocked = countryBlockedResponse(req)
++  if (blocked) return blocked
++
+   try {
+     const state = await requestSession({
+       userId: auth.userId,
+@@ -117,6 +144,9 @@ export async function getFreebuffSession(
+   const auth = await resolveUser(req, deps)
+   if ('error' in auth) return auth.error
+ 
++  const blocked = countryBlockedResponse(req)
++  if (blocked) return blocked
++
+   try {
+     const claimedInstanceId = req.headers.get(FREEBUFF_INSTANCE_HEADER) ?? undefined
+     const state = await getSessionState({
+diff --git a/web/src/server/free-mode-country.ts b/web/src/server/free-mode-country.ts
+new file mode 100644
+index 000000000..7936e3dcf
+--- /dev/null
++++ b/web/src/server/free-mode-country.ts
+@@ -0,0 +1,43 @@
++import geoip from 'geoip-lite'
++
++import type { NextRequest } from 'next/server'
++
++export const FREE_MODE_ALLOWED_COUNTRIES = new Set([
++  'US', 'CA',
++  'GB', 'AU', 'NZ',
++  'NO', 'SE', 'NL', 'DK', 'DE', 'FI', 'BE', 'LU', 'CH', 'IE', 'IS',
++])
++
++export function extractClientIp(req: NextRequest): string | undefined {
++  const forwardedFor = req.headers.get('x-forwarded-for')
++  if (forwardedFor) {
++    return forwardedFor.split(',')[0].trim()
++  }
++  return req.headers.get('x-real-ip') ?? undefined
++}
++
++export function getCountryCode(req: NextRequest): string | null {
++  const cfCountry = req.headers.get('cf-ipcountry')
++  if (cfCountry && cfCountry !== 'XX' && cfCountry !== 'T1') {
++    return cfCountry.toUpperCase()
++  }
++
++  const clientIp = extractClientIp(req)
++  if (!clientIp) {
++    return null
++  }
++  const geo = geoip.lookup(clientIp)
++  return geo?.country ?? null
++}
++
++/**
++ * Returns true if the request's resolved country is allowed to use free
++ * mode, false if it's explicitly disallowed. Returns null when country can't
++ * be determined (VPN / localhost / corporate proxy) — callers should fail
++ * open in that case to match the chat-completions gate.
++ */
++export function isCountryAllowedForFreeMode(req: NextRequest): boolean | null {
++  const countryCode = getCountryCode(req)
++  if (!countryCode) return null
++  return FREE_MODE_ALLOWED_COUNTRIES.has(countryCode)
++}

@@ -1,0 +1,563 @@
+diff --git a/common/src/types/contracts/database.ts b/common/src/types/contracts/database.ts
+index 3d2ea05fa..c7250c347 100644
+--- a/common/src/types/contracts/database.ts
++++ b/common/src/types/contracts/database.ts
+@@ -6,9 +6,17 @@ type User = {
+   email: string
+   discord_id: string | null
+   referral_code: string | null
++  stripe_customer_id: string | null
+   banned: boolean
+ }
+-export const userColumns = ['id', 'email', 'discord_id', 'referral_code', 'banned'] as const
++export const userColumns = [
++  'id',
++  'email',
++  'discord_id',
++  'referral_code',
++  'stripe_customer_id',
++  'banned',
++] as const
+ export type UserColumn = keyof User
+ export type GetUserInfoFromApiKeyInput<T extends UserColumn> = {
+   apiKey: string
+diff --git a/evals/impl/agent-runtime.ts b/evals/impl/agent-runtime.ts
+index 6af02ef5d..5dbf3f88e 100644
+--- a/evals/impl/agent-runtime.ts
++++ b/evals/impl/agent-runtime.ts
+@@ -37,6 +37,7 @@ export const EVALS_AGENT_RUNTIME_IMPL = Object.freeze<AgentRuntimeDeps>({
+     email: 'test-email',
+     discord_id: 'test-discord-id',
+     referral_code: 'ref-test-code',
++    stripe_customer_id: null,
+     banned: false,
+   }),
+   fetchAgentFromDatabase: async () => null,
+diff --git a/packages/billing/src/balance-calculator.ts b/packages/billing/src/balance-calculator.ts
+index c60e58ece..23007f42f 100644
+--- a/packages/billing/src/balance-calculator.ts
++++ b/packages/billing/src/balance-calculator.ts
+@@ -6,6 +6,8 @@ import * as schema from '@codebuff/internal/db/schema'
+ import { withSerializableTransaction } from '@codebuff/internal/db/transaction'
+ import { and, asc, gt, isNull, or, eq, sql } from 'drizzle-orm'
+ 
++import { reportPurchasedCreditsToStripe } from './stripe-metering'
++
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type {
+   ParamsExcluding,
+@@ -330,12 +332,13 @@ export async function calculateUsageAndBalance(
+  */
+ export async function consumeCredits(params: {
+   userId: string
++  stripeCustomerId?: string | null
+   creditsToConsume: number
+   logger: Logger
+ }): Promise<CreditConsumptionResult> {
+   const { userId, creditsToConsume, logger } = params
+ 
+-  return await withSerializableTransaction({
++  const result = await withSerializableTransaction({
+     callback: async (tx) => {
+       const now = new Date()
+       const activeGrants = await getOrderedActiveGrants({
+@@ -364,11 +367,24 @@ export async function consumeCredits(params: {
+     context: { userId, creditsToConsume },
+     logger,
+   })
++
++  await reportPurchasedCreditsToStripe({
++    userId,
++    stripeCustomerId: params.stripeCustomerId,
++    purchasedCredits: result.fromPurchased,
++    logger,
++    extraPayload: {
++      source: 'consumeCredits',
++    },
++  })
++
++  return result
+ }
+ 
+ export async function consumeCreditsAndAddAgentStep(params: {
+   messageId: string
+   userId: string
++  stripeCustomerId?: string | null
+   agentId: string
+   clientId: string | null
+   clientRequestId: string | null
+@@ -421,8 +437,7 @@ export async function consumeCreditsAndAddAgentStep(params: {
+   const latencyMs = finishedAt.getTime() - startTime.getTime()
+ 
+   try {
+-    return success(
+-      await withSerializableTransaction({
++    const result = await withSerializableTransaction({
+         callback: async (tx) => {
+           const now = new Date()
+ 
+@@ -493,8 +508,22 @@ export async function consumeCreditsAndAddAgentStep(params: {
+         },
+         context: { userId, credits },
+         logger,
+-      }),
+-    )
++      })
++
++    await reportPurchasedCreditsToStripe({
++      userId,
++      stripeCustomerId: params.stripeCustomerId,
++      purchasedCredits: result.fromPurchased,
++      logger,
++      eventId: messageId,
++      timestamp: finishedAt,
++      extraPayload: {
++        source: 'consumeCreditsAndAddAgentStep',
++        message_id: messageId,
++      },
++    })
++
++    return success(result)
+   } catch (error) {
+     logger.error(
+       { error: getErrorObject(error) },
+diff --git a/packages/billing/src/stripe-metering.ts b/packages/billing/src/stripe-metering.ts
+new file mode 100644
+index 000000000..efe6e4155
+--- /dev/null
++++ b/packages/billing/src/stripe-metering.ts
+@@ -0,0 +1,120 @@
++import { TEST_USER_ID } from '@codebuff/common/old-constants'
++import { withRetry, withTimeout } from '@codebuff/common/util/promise'
++import db from '@codebuff/internal/db'
++import * as schema from '@codebuff/internal/db/schema'
++import { stripeServer } from '@codebuff/internal/util/stripe'
++import { eq } from 'drizzle-orm'
++
++import type { Logger } from '@codebuff/common/types/contracts/logger'
++
++const STRIPE_METER_EVENT_NAME = 'credits'
++const STRIPE_METER_REQUEST_TIMEOUT_MS = 10_000
++
++function shouldAttemptStripeMetering(): boolean {
++  // Avoid sending Stripe metering events in CI/tests, and when Stripe isn't configured.
++  if (process.env.CI === 'true' || process.env.CI === '1') return false
++  if (process.env.NODE_ENV === 'test') return false
++  return Boolean(process.env.STRIPE_SECRET_KEY)
++}
++
++export async function reportPurchasedCreditsToStripe(params: {
++  userId: string
++  stripeCustomerId?: string | null
++  purchasedCredits: number
++  logger: Logger
++  /**
++   * Optional unique identifier used for Stripe idempotency + debugging.
++   * For message-based usage, pass the message ID.
++   */
++  eventId?: string
++  /**
++   * Optional timestamp for the usage event.
++   * Defaults to "now".
++   */
++  timestamp?: Date
++  /**
++   * Optional additional payload fields (must be strings).
++   */
++  extraPayload?: Record<string, string>
++}): Promise<void> {
++  const {
++    userId,
++    stripeCustomerId: providedStripeCustomerId,
++    purchasedCredits,
++    logger,
++    eventId,
++    timestamp = new Date(),
++    extraPayload,
++  } = params
++
++  if (purchasedCredits <= 0) return
++  if (userId === TEST_USER_ID) return
++  if (!shouldAttemptStripeMetering()) return
++
++  const logContext = { userId, purchasedCredits, eventId }
++
++  let stripeCustomerId = providedStripeCustomerId
++  if (stripeCustomerId === undefined) {
++    let user: { stripe_customer_id: string | null } | undefined
++    try {
++      user = await db.query.user.findFirst({
++        where: eq(schema.user.id, userId),
++        columns: { stripe_customer_id: true },
++      })
++    } catch (error) {
++      logger.error(
++        { ...logContext, error },
++        'Failed to fetch user for Stripe metering',
++      )
++      return
++    }
++
++    stripeCustomerId = user?.stripe_customer_id ?? null
++  }
++  if (!stripeCustomerId) {
++    logger.warn(logContext, 'Skipping Stripe metering (missing stripe_customer_id)')
++    return
++  }
++
++  const stripeTimestamp = Math.floor(timestamp.getTime() / 1000)
++  const idempotencyKey = eventId ? `meter-${eventId}` : undefined
++
++  try {
++    await withTimeout(
++      withRetry(
++        () =>
++          stripeServer.billing.meterEvents.create(
++            {
++              event_name: STRIPE_METER_EVENT_NAME,
++              timestamp: stripeTimestamp,
++              payload: {
++                stripe_customer_id: stripeCustomerId,
++                value: purchasedCredits.toString(),
++                ...(eventId ? { event_id: eventId } : {}),
++                ...(extraPayload ?? {}),
++              },
++            },
++            idempotencyKey ? { idempotencyKey } : undefined,
++          ),
++        {
++          maxRetries: 3,
++          retryIf: (error: any) =>
++            error?.type === 'StripeConnectionError' ||
++            error?.type === 'StripeAPIError' ||
++            error?.type === 'StripeRateLimitError',
++          onRetry: (error: any, attempt: number) => {
++            logger.warn(
++              { ...logContext, attempt, error },
++              'Retrying Stripe metering call',
++            )
++          },
++          retryDelayMs: 500,
++        },
++      ),
++      STRIPE_METER_REQUEST_TIMEOUT_MS,
++      `Stripe metering timed out after ${STRIPE_METER_REQUEST_TIMEOUT_MS}ms`,
++    )
++  } catch (error) {
++    logger.error({ ...logContext, error }, 'Failed to report purchased credits to Stripe')
++  }
++}
+diff --git a/sdk/src/__tests__/run-handle-event.test.ts b/sdk/src/__tests__/run-handle-event.test.ts
+index 9343f9bde..05b0bb4ce 100644
+--- a/sdk/src/__tests__/run-handle-event.test.ts
++++ b/sdk/src/__tests__/run-handle-event.test.ts
+@@ -1,7 +1,10 @@
+ import { afterEach, describe, expect, it, mock, spyOn } from 'bun:test'
+ 
++import * as mainPromptModule from '@codebuff/agent-runtime/main-prompt'
+ import { getInitialSessionState } from '@codebuff/common/types/session-state'
+ import { getStubProjectFileContext } from '@codebuff/common/util/file'
++import { CodebuffClient } from '../client'
++import * as databaseModule from '../impl/database'
+ import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+ import type { CodebuffClientOptions } from '../run'
+ 
+@@ -11,14 +14,12 @@ describe('CodebuffClient handleEvent / handleStreamChunk', () => {
+   })
+ 
+   it('streams subagent start/finish once and forwards subagent chunks to handleStreamChunk', async () => {
+-    const databaseModule = await import('../impl/database')
+-    const mainPromptModule = await import('@codebuff/agent-runtime/main-prompt')
+-
+     spyOn(databaseModule, 'getUserInfoFromApiKey').mockResolvedValue({
+       id: 'user-123',
+       email: 'test@example.com',
+       discord_id: null,
+       referral_code: null,
++      stripe_customer_id: null,
+       banned: false,
+     })
+     spyOn(databaseModule, 'fetchAgentFromDatabase').mockResolvedValue(null)
+@@ -108,8 +109,6 @@ describe('CodebuffClient handleEvent / handleStreamChunk', () => {
+     const events: PrintModeEvent[] = []
+     const streamChunks: StreamChunk[] = []
+ 
+-    const { CodebuffClient } = await import('../client')
+-
+     const client = new CodebuffClient({
+       apiKey: 'test-key',
+     })
+diff --git a/web/src/app/api/v1/chat/completions/_post.ts b/web/src/app/api/v1/chat/completions/_post.ts
+index 4c365e872..385f90507 100644
+--- a/web/src/app/api/v1/chat/completions/_post.ts
++++ b/web/src/app/api/v1/chat/completions/_post.ts
+@@ -128,7 +128,7 @@ export async function postChatCompletions(params: {
+     // Get user info
+     const userInfo = await getUserInfoFromApiKey({
+       apiKey,
+-      fields: ['id', 'email', 'discord_id', 'banned'],
++      fields: ['id', 'email', 'discord_id', 'stripe_customer_id', 'banned'],
+       logger,
+     })
+     if (!userInfo) {
+@@ -148,6 +148,7 @@ export async function postChatCompletions(params: {
+     logger = loggerWithContext({ userInfo })
+ 
+     const userId = userInfo.id
++    const stripeCustomerId = userInfo.stripe_customer_id ?? null
+ 
+     // Check if user is banned.
+     // We use a clear, helpful message rather than a cryptic error because:
+@@ -269,6 +270,7 @@ export async function postChatCompletions(params: {
+         const stream = await handleOpenRouterStream({
+           body,
+           userId,
++          stripeCustomerId,
+           agentId,
+           openrouterApiKey,
+           fetch,
+@@ -312,6 +314,7 @@ export async function postChatCompletions(params: {
+           ? handleOpenAINonStream({
+               body,
+               userId,
++              stripeCustomerId,
+               agentId,
+               fetch,
+               logger,
+@@ -320,6 +323,7 @@ export async function postChatCompletions(params: {
+           : handleOpenRouterNonStream({
+               body,
+               userId,
++              stripeCustomerId,
+               agentId,
+               openrouterApiKey,
+               fetch,
+diff --git a/web/src/app/api/v1/me/__tests__/me.test.ts b/web/src/app/api/v1/me/__tests__/me.test.ts
+index ead1e4767..3e32f5fc9 100644
+--- a/web/src/app/api/v1/me/__tests__/me.test.ts
++++ b/web/src/app/api/v1/me/__tests__/me.test.ts
+@@ -23,6 +23,7 @@ describe('/api/v1/me route', () => {
+       email: 'test@example.com',
+       discord_id: 'discord-123',
+       referral_code: 'ref-user-123',
++      stripe_customer_id: 'cus_test_123',
+       banned: false,
+     },
+     'test-api-key-456': {
+@@ -30,6 +31,7 @@ describe('/api/v1/me route', () => {
+       email: 'test2@example.com',
+       discord_id: null,
+       referral_code: 'ref-user-456',
++      stripe_customer_id: null,
+       banned: false,
+     },
+   }
+@@ -44,7 +46,7 @@ describe('/api/v1/me route', () => {
+           return null
+         }
+         return Object.fromEntries(
+-          fields.map((field) => [field, userData[field]]),
++          fields.map((field) => [field, (userData as any)[field]]),
+         ) as any
+       },
+     }
+@@ -212,7 +214,7 @@ describe('/api/v1/me route', () => {
+       const body = await response.json()
+       expect(body.error).toContain('Invalid fields: invalid_field')
+       expect(body.error).toContain(
+-        'Valid fields are: id, email, discord_id, referral_code, referral_link',
++        'Valid fields are: id, email, discord_id, referral_code, stripe_customer_id, banned, referral_link',
+       )
+     })
+ 
+diff --git a/web/src/db/user.ts b/web/src/db/user.ts
+index f1dfd6f21..8fe37b83a 100644
+--- a/web/src/db/user.ts
++++ b/web/src/db/user.ts
+@@ -5,6 +5,7 @@ import { eq } from 'drizzle-orm'
+ import type {
+   GetUserInfoFromApiKeyInput,
+   GetUserInfoFromApiKeyOutput,
++  UserColumn,
+ } from '@codebuff/common/types/contracts/database'
+ 
+ export const VALID_USER_INFO_FIELDS = [
+@@ -12,12 +13,11 @@ export const VALID_USER_INFO_FIELDS = [
+   'email',
+   'discord_id',
+   'referral_code',
++  'stripe_customer_id',
+   'banned',
+ ] as const
+ 
+-export async function getUserInfoFromApiKey<
+-  T extends (typeof VALID_USER_INFO_FIELDS)[number],
+->({
++export async function getUserInfoFromApiKey<T extends UserColumn>({
+   apiKey,
+   fields,
+ }: GetUserInfoFromApiKeyInput<T>): GetUserInfoFromApiKeyOutput<T> {
+diff --git a/web/src/llm-api/helpers.ts b/web/src/llm-api/helpers.ts
+index 3883c5c1a..5c754ade8 100644
+--- a/web/src/llm-api/helpers.ts
++++ b/web/src/llm-api/helpers.ts
+@@ -90,6 +90,7 @@ export async function insertMessageToBigQuery(params: {
+ export async function consumeCreditsForMessage(params: {
+   messageId: string
+   userId: string
++  stripeCustomerId?: string | null
+   agentId: string
+   clientId: string | null
+   clientRequestId: string | null
+@@ -104,6 +105,7 @@ export async function consumeCreditsForMessage(params: {
+   const {
+     messageId,
+     userId,
++    stripeCustomerId,
+     agentId,
+     clientId,
+     clientRequestId,
+@@ -119,6 +121,7 @@ export async function consumeCreditsForMessage(params: {
+   await consumeCreditsAndAddAgentStep({
+     messageId,
+     userId,
++    stripeCustomerId,
+     agentId,
+     clientId,
+     clientRequestId,
+diff --git a/web/src/llm-api/openai.ts b/web/src/llm-api/openai.ts
+index 8257f1d00..59c3986b6 100644
+--- a/web/src/llm-api/openai.ts
++++ b/web/src/llm-api/openai.ts
+@@ -65,6 +65,7 @@ function extractUsageAndCost(
+ export async function handleOpenAINonStream({
+   body,
+   userId,
++  stripeCustomerId,
+   agentId,
+   fetch,
+   logger,
+@@ -72,6 +73,7 @@ export async function handleOpenAINonStream({
+ }: {
+   body: any
+   userId: string
++  stripeCustomerId?: string | null
+   agentId: string
+   fetch: typeof globalThis.fetch
+   logger: Logger
+@@ -182,6 +184,7 @@ export async function handleOpenAINonStream({
+   await consumeCreditsForMessage({
+     messageId: data.id,
+     userId,
++    stripeCustomerId,
+     agentId,
+     clientId,
+     clientRequestId,
+diff --git a/web/src/llm-api/openrouter.ts b/web/src/llm-api/openrouter.ts
+index b7694ebd2..e7ff3690b 100644
+--- a/web/src/llm-api/openrouter.ts
++++ b/web/src/llm-api/openrouter.ts
+@@ -60,6 +60,7 @@ function extractRequestMetadataWithN(params: {
+ export async function handleOpenRouterNonStream({
+   body,
+   userId,
++  stripeCustomerId,
+   agentId,
+   openrouterApiKey,
+   fetch,
+@@ -68,6 +69,7 @@ export async function handleOpenRouterNonStream({
+ }: {
+   body: any
+   userId: string
++  stripeCustomerId?: string | null
+   agentId: string
+   openrouterApiKey: string | null
+   fetch: typeof globalThis.fetch
+@@ -145,6 +147,7 @@ export async function handleOpenRouterNonStream({
+     await consumeCreditsForMessage({
+       messageId: firstData.id,
+       userId,
++      stripeCustomerId,
+       agentId,
+       clientId,
+       clientRequestId,
+@@ -212,6 +215,7 @@ export async function handleOpenRouterNonStream({
+   await consumeCreditsForMessage({
+     messageId: data.id,
+     userId,
++    stripeCustomerId,
+     agentId,
+     clientId,
+     clientRequestId,
+@@ -230,6 +234,7 @@ export async function handleOpenRouterNonStream({
+ export async function handleOpenRouterStream({
+   body,
+   userId,
++  stripeCustomerId,
+   agentId,
+   openrouterApiKey,
+   fetch,
+@@ -238,6 +243,7 @@ export async function handleOpenRouterStream({
+ }: {
+   body: any
+   userId: string
++  stripeCustomerId?: string | null
+   agentId: string
+   openrouterApiKey: string | null
+   fetch: typeof globalThis.fetch
+@@ -319,6 +325,7 @@ export async function handleOpenRouterStream({
+ 
+             state = await handleLine({
+               userId,
++              stripeCustomerId,
+               agentId,
+               clientId,
+               clientRequestId,
+@@ -377,6 +384,7 @@ export async function handleOpenRouterStream({
+ 
+ async function handleLine({
+   userId,
++  stripeCustomerId,
+   agentId,
+   clientId,
+   clientRequestId,
+@@ -389,6 +397,7 @@ async function handleLine({
+   insertMessage,
+ }: {
+   userId: string
++  stripeCustomerId?: string | null
+   agentId: string
+   clientId: string | null
+   clientRequestId: string | null
+@@ -431,6 +440,7 @@ async function handleLine({
+ 
+   return await handleResponse({
+     userId,
++    stripeCustomerId,
+     agentId,
+     clientId,
+     clientRequestId,
+@@ -446,6 +456,7 @@ async function handleLine({
+ 
+ async function handleResponse({
+   userId,
++  stripeCustomerId,
+   agentId,
+   clientId,
+   clientRequestId,
+@@ -458,6 +469,7 @@ async function handleResponse({
+   insertMessage,
+ }: {
+   userId: string
++  stripeCustomerId?: string | null
+   agentId: string
+   clientId: string | null
+   clientRequestId: string | null
+@@ -504,6 +516,7 @@ async function handleResponse({
+   await consumeCreditsForMessage({
+     messageId: data.id,
+     userId,
++    stripeCustomerId,
+     agentId,
+     clientId,
+     clientRequestId,

@@ -1,0 +1,221 @@
+diff --git a/web/src/app/api/v1/chat/completions/_post.ts b/web/src/app/api/v1/chat/completions/_post.ts
+index 0e565ff28..c9b616846 100644
+--- a/web/src/app/api/v1/chat/completions/_post.ts
++++ b/web/src/app/api/v1/chat/completions/_post.ts
+@@ -413,7 +413,11 @@ export async function postChatCompletions(params: {
+     if (isFreeModeRequest) {
+       const claimedInstanceId =
+         typedBody.codebuff_metadata?.freebuff_instance_id
+-      const gate = await checkSession({ userId, claimedInstanceId })
++      const gate = await checkSession({
++        userId,
++        userEmail: userInfo.email,
++        claimedInstanceId,
++      })
+       if (!gate.ok) {
+         trackEvent({
+           event: AnalyticsEvent.CHAT_COMPLETIONS_VALIDATION_ERROR,
+diff --git a/web/src/app/api/v1/freebuff/session/_handlers.ts b/web/src/app/api/v1/freebuff/session/_handlers.ts
+index 54157c0b8..5bed8e9c9 100644
+--- a/web/src/app/api/v1/freebuff/session/_handlers.ts
++++ b/web/src/app/api/v1/freebuff/session/_handlers.ts
+@@ -22,7 +22,9 @@ export interface FreebuffSessionDeps {
+   sessionDeps?: SessionDeps
+ }
+ 
+-type AuthResult = { error: NextResponse } | { userId: string }
++type AuthResult =
++  | { error: NextResponse }
++  | { userId: string; userEmail: string | null }
+ 
+ async function resolveUser(req: NextRequest, deps: FreebuffSessionDeps): Promise<AuthResult> {
+   const apiKey = extractApiKeyFromHeader(req)
+@@ -39,7 +41,7 @@ async function resolveUser(req: NextRequest, deps: FreebuffSessionDeps): Promise
+   }
+   const userInfo = await deps.getUserInfoFromApiKey({
+     apiKey,
+-    fields: ['id'],
++    fields: ['id', 'email'],
+     logger: deps.logger,
+   })
+   if (!userInfo?.id) {
+@@ -50,7 +52,7 @@ async function resolveUser(req: NextRequest, deps: FreebuffSessionDeps): Promise
+       ),
+     }
+   }
+-  return { userId: String(userInfo.id) }
++  return { userId: String(userInfo.id), userEmail: userInfo.email ?? null }
+ }
+ 
+ function serverError(
+@@ -96,6 +98,7 @@ export async function postFreebuffSession(
+   try {
+     const state = await requestSession({
+       userId: auth.userId,
++      userEmail: auth.userEmail,
+       deps: deps.sessionDeps,
+     })
+     return NextResponse.json(state, { status: 200 })
+@@ -118,6 +121,7 @@ export async function getFreebuffSession(
+     const claimedInstanceId = req.headers.get(FREEBUFF_INSTANCE_HEADER) ?? undefined
+     const state = await getSessionState({
+       userId: auth.userId,
++      userEmail: auth.userEmail,
+       claimedInstanceId,
+       deps: deps.sessionDeps,
+     })
+@@ -142,7 +146,11 @@ export async function deleteFreebuffSession(
+   if ('error' in auth) return auth.error
+ 
+   try {
+-    await endUserSession({ userId: auth.userId, deps: deps.sessionDeps })
++    await endUserSession({
++      userId: auth.userId,
++      userEmail: auth.userEmail,
++      deps: deps.sessionDeps,
++    })
+     return NextResponse.json({ status: 'ended' }, { status: 200 })
+   } catch (error) {
+     return serverError(deps, 'DELETE', auth.userId, error)
+diff --git a/web/src/server/free-session/__tests__/public-api.test.ts b/web/src/server/free-session/__tests__/public-api.test.ts
+index df34b7556..b19f24ea0 100644
+--- a/web/src/server/free-session/__tests__/public-api.test.ts
++++ b/web/src/server/free-session/__tests__/public-api.test.ts
+@@ -281,6 +281,29 @@ describe('checkSessionAdmissible', () => {
+     expect(result.code).toBe('waiting_room_required')
+   })
+ 
++  test('bypassed email (team@codebuff.com) → ok with reason=disabled, no DB read', async () => {
++    const result = await checkSessionAdmissible({
++      userId: 'u1',
++      userEmail: 'team@codebuff.com',
++      claimedInstanceId: undefined,
++      deps,
++    })
++    expect(result.ok).toBe(true)
++    if (!result.ok) throw new Error('unreachable')
++    expect(result.reason).toBe('disabled')
++    expect(deps.rows.size).toBe(0)
++  })
++
++  test('bypassed email is case-insensitive', async () => {
++    const result = await checkSessionAdmissible({
++      userId: 'u1',
++      userEmail: 'Team@Codebuff.COM',
++      claimedInstanceId: undefined,
++      deps,
++    })
++    expect(result.ok).toBe(true)
++  })
++
+   test('queued session → waiting_room_queued', async () => {
+     await requestSession({ userId: 'u1', deps })
+     const result = await checkSessionAdmissible({
+diff --git a/web/src/server/free-session/config.ts b/web/src/server/free-session/config.ts
+index 4e9e729c1..e70e1b5c6 100644
+--- a/web/src/server/free-session/config.ts
++++ b/web/src/server/free-session/config.ts
+@@ -16,6 +16,18 @@ export function isWaitingRoomEnabled(): boolean {
+   return env.FREEBUFF_WAITING_ROOM_ENABLED
+ }
+ 
++/** Per-account override on top of the global kill switch. The internal
++ *  `team@codebuff.com` account drives e2e tests in CI; landing it in the
++ *  queue would make those tests flake whenever the waiting room is warm.
++ *  Bypassed users behave exactly as if the waiting room were disabled. */
++const WAITING_ROOM_BYPASS_EMAILS = new Set<string>(['team@codebuff.com'])
++export function isWaitingRoomBypassedForEmail(
++  email: string | null | undefined,
++): boolean {
++  if (!email) return false
++  return WAITING_ROOM_BYPASS_EMAILS.has(email.toLowerCase())
++}
++
+ export function getSessionLengthMs(): number {
+   return env.FREEBUFF_SESSION_LENGTH_MS
+ }
+diff --git a/web/src/server/free-session/public-api.ts b/web/src/server/free-session/public-api.ts
+index 759a516d7..74af009cc 100644
+--- a/web/src/server/free-session/public-api.ts
++++ b/web/src/server/free-session/public-api.ts
+@@ -1,5 +1,6 @@
+ import {
+   getSessionGraceMs,
++  isWaitingRoomBypassedForEmail,
+   isWaitingRoomEnabled,
+ } from './config'
+ import {
+@@ -79,10 +80,16 @@ async function viewForRow(
+  */
+ export async function requestSession(params: {
+   userId: string
++  userEmail?: string | null | undefined
+   deps?: SessionDeps
+ }): Promise<SessionStateResponse> {
+   const deps = params.deps ?? defaultDeps
+-  if (!deps.isWaitingRoomEnabled()) return { status: 'disabled' }
++  if (
++    !deps.isWaitingRoomEnabled() ||
++    isWaitingRoomBypassedForEmail(params.userEmail)
++  ) {
++    return { status: 'disabled' }
++  }
+ 
+   const row = await deps.joinOrTakeOver({ userId: params.userId, now: nowOf(deps) })
+   const view = await viewForRow(params.userId, deps, row)
+@@ -109,11 +116,17 @@ export async function requestSession(params: {
+  */
+ export async function getSessionState(params: {
+   userId: string
++  userEmail?: string | null | undefined
+   claimedInstanceId?: string | null | undefined
+   deps?: SessionDeps
+ }): Promise<FreebuffSessionServerResponse> {
+   const deps = params.deps ?? defaultDeps
+-  if (!deps.isWaitingRoomEnabled()) return { status: 'disabled' }
++  if (
++    !deps.isWaitingRoomEnabled() ||
++    isWaitingRoomBypassedForEmail(params.userEmail)
++  ) {
++    return { status: 'disabled' }
++  }
+   const row = await deps.getSessionRow(params.userId)
+   if (!row) return { status: 'none' }
+ 
+@@ -132,10 +145,16 @@ export async function getSessionState(params: {
+ 
+ export async function endUserSession(params: {
+   userId: string
++  userEmail?: string | null | undefined
+   deps?: SessionDeps
+ }): Promise<void> {
+   const deps = params.deps ?? defaultDeps
+-  if (!deps.isWaitingRoomEnabled()) return
++  if (
++    !deps.isWaitingRoomEnabled() ||
++    isWaitingRoomBypassedForEmail(params.userEmail)
++  ) {
++    return
++  }
+   await deps.endSession(params.userId)
+ }
+ 
+@@ -169,11 +188,17 @@ export type SessionGateResult =
+  */
+ export async function checkSessionAdmissible(params: {
+   userId: string
++  userEmail?: string | null | undefined
+   claimedInstanceId: string | null | undefined
+   deps?: SessionDeps
+ }): Promise<SessionGateResult> {
+   const deps = params.deps ?? defaultDeps
+-  if (!deps.isWaitingRoomEnabled()) return { ok: true, reason: 'disabled' }
++  if (
++    !deps.isWaitingRoomEnabled() ||
++    isWaitingRoomBypassedForEmail(params.userEmail)
++  ) {
++    return { ok: true, reason: 'disabled' }
++  }
+ 
+   // Pre-waiting-room CLIs never send a freebuff_instance_id. Classify that up
+   // front so the caller gets a distinct code (→ 426 Upgrade Required) and the

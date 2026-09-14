@@ -1,0 +1,150 @@
+diff --git a/web/src/app/api/v1/chat/completions/_post.ts b/web/src/app/api/v1/chat/completions/_post.ts
+index 7b5a8a9eb..81851eab2 100644
+--- a/web/src/app/api/v1/chat/completions/_post.ts
++++ b/web/src/app/api/v1/chat/completions/_post.ts
+@@ -874,6 +874,9 @@ export async function postChatCompletions(params: {
+ 
+       // Log detailed error information for debugging
+       const errorDetails = openrouterError?.toJSON()
++      const shouldRecordMessages = freebuffAccessTier !== 'limited'
++      const { messages: _messages, ...bodyWithoutMessages } = body
++      const telemetryBody = shouldRecordMessages ? body : bodyWithoutMessages
+       const providerLabel = siliconflowError
+         ? 'SiliconFlow'
+         : opencodeZenError
+@@ -901,7 +904,9 @@ export async function postChatCompletions(params: {
+           messageCount: Array.isArray(typedBody.messages)
+             ? typedBody.messages.length
+             : 0,
+-          messages: typedBody.messages,
++          ...(shouldRecordMessages
++            ? { messages: typedBody.messages }
++            : { messagesOmitted: true, accessTier: freebuffAccessTier }),
+           providerStatusCode: (
+             openrouterError ??
+             fireworksError ??
+@@ -935,7 +940,7 @@ export async function postChatCompletions(params: {
+         userId,
+         properties: {
+           error: error instanceof Error ? error.message : 'Unknown error',
+-          body,
++          body: telemetryBody,
+           agentId,
+           streaming: bodyStream,
+         },
+diff --git a/web/src/llm-api/deepseek.ts b/web/src/llm-api/deepseek.ts
+index e2adfdfca..531db8908 100644
+--- a/web/src/llm-api/deepseek.ts
++++ b/web/src/llm-api/deepseek.ts
+@@ -74,6 +74,13 @@ export function isDeepSeekModel(model: string): boolean {
+   return DEEPSEEK_ROUTED_MODELS.has(model)
+ }
+ 
++function isDeepSeekV4FlashModel(model: string): boolean {
++  return (
++    model === deepseekModels.deepseekV4Flash ||
++    model === deepseekModels.deepseekV4FlashDirect
++  )
++}
++
+ function getDeepSeekPricing(model: string): DeepSeekPricing {
+   const entry = DEEPSEEK_MODELS[model]
+   if (!entry) {
+@@ -279,6 +286,7 @@ export async function handleDeepSeekStream({
+     body,
+     logger,
+   })
++  const skipDisconnectedBilling = isDeepSeekV4FlashModel(body.model)
+ 
+   const response = await createDeepSeekRequest({ body, originalModel, fetch })
+ 
+@@ -392,13 +400,26 @@ export async function handleDeepSeekStream({
+     cancel() {
+       clearInterval(heartbeatInterval)
+       clientDisconnected = true
++      if (skipDisconnectedBilling) {
++        reader
++          .cancel('client disconnected from DeepSeek V4 Flash stream')
++          .catch((error) => {
++            logger.warn(
++              { error },
++              'Failed to cancel disconnected DeepSeek V4 Flash stream',
++            )
++          })
++      }
+       logger.warn(
+         {
+           clientDisconnected,
+           responseTextLength: state.responseText.length,
+           reasoningTextLength: state.reasoningText.length,
++          skippedBilling: skipDisconnectedBilling,
+         },
+-        'Client cancelled stream, continuing DeepSeek consumption for billing',
++        skipDisconnectedBilling
++          ? 'Client cancelled DeepSeek V4 Flash stream, ending without billing'
++          : 'Client cancelled stream, continuing DeepSeek consumption for billing',
+       )
+     },
+   })
+diff --git a/web/src/llm-api/openrouter.ts b/web/src/llm-api/openrouter.ts
+index bf7231abd..0047445f0 100644
+--- a/web/src/llm-api/openrouter.ts
++++ b/web/src/llm-api/openrouter.ts
+@@ -40,6 +40,7 @@ type StreamState = {
+ // endpoint. OR finalizes generation records asynchronously; 500ms is enough
+ // in practice and keeps the delay off the client response path.
+ const GENERATION_LOOKUP_DELAY_MS = 500
++const DISCONNECTED_STREAM_DRAIN_TIMEOUT_MS = 2 * 60 * 1000
+ 
+ // Extended timeout for deep-thinking models (e.g., gpt-5) that can take
+ // a long time to start streaming.
+@@ -363,6 +364,7 @@ export async function handleOpenRouterStream({
+     billed: false,
+   }
+   let clientDisconnected = false
++  let disconnectedStreamDrainTimeout: NodeJS.Timeout | null = null
+ 
+   // Runs once on any stream-exit path. If we didn't bill through the normal
+   // path (stream ended without a usage chunk, got a provider error chunk,
+@@ -488,12 +490,41 @@ export async function handleOpenRouterStream({
+         }
+         await ensureBilled()
+       } finally {
++        if (disconnectedStreamDrainTimeout) {
++          clearTimeout(disconnectedStreamDrainTimeout)
++        }
+         clearInterval(heartbeatInterval)
+       }
+     },
+     cancel() {
+       clearInterval(heartbeatInterval)
+       clientDisconnected = true
++      disconnectedStreamDrainTimeout = setTimeout(() => {
++        const stateSummary = {
++          clientDisconnected,
++          responseTextLength: state.responseText.length,
++          reasoningTextLength: state.reasoningText.length,
++          generationId: state.generationId,
++          billed: state.billed,
++        }
++        if (!state.billed && !state.generationId) {
++          logger.warn(
++            stateSummary,
++            'Disconnected OpenRouter stream exceeded drain timeout before fallback billing was possible; continuing to drain',
++          )
++          return
++        }
++        logger.warn(
++          stateSummary,
++          'Cancelling disconnected OpenRouter stream after drain timeout',
++        )
++        reader.cancel('client disconnected drain timeout').catch((error) => {
++          logger.warn(
++            { error },
++            'Failed to cancel disconnected OpenRouter stream',
++          )
++        })
++      }, DISCONNECTED_STREAM_DRAIN_TIMEOUT_MS)
+       // Log truncated state to prevent OOM during logging (state can be up to 2MB)
+       logger.warn(
+         {

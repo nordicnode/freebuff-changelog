@@ -1,0 +1,961 @@
+diff --git a/cli/src/components/chatgpt-connect-banner.tsx b/cli/src/components/chatgpt-connect-banner.tsx
+index 3e9d1c50a..165e824fb 100644
+--- a/cli/src/components/chatgpt-connect-banner.tsx
++++ b/cli/src/components/chatgpt-connect-banner.tsx
+@@ -5,10 +5,11 @@ import { Button } from './button'
+ import { useTheme } from '../hooks/use-theme'
+ import { useChatStore } from '../state/chat-store'
+ import {
++  connectChatGptOAuth,
+   disconnectChatGptOAuth,
+   exchangeChatGptCodeForTokens,
+   getChatGptOAuthStatus,
+-  openChatGptOAuthInBrowser,
++  stopChatGptOAuthServer,
+ } from '../utils/chatgpt-oauth'
+ 
+ type FlowState =
+@@ -32,20 +33,30 @@ export const ChatGptConnectBanner = () => {
+     }
+ 
+     setFlowState('waiting-for-code')
+-    openChatGptOAuthInBrowser().catch((err) => {
+-      setError(err instanceof Error ? err.message : 'Failed to open browser')
+-      setFlowState('error')
+-    })
++    connectChatGptOAuth()
++      .then(() => {
++        setFlowState('connected')
++      })
++      .catch((err) => {
++        setError(err instanceof Error ? err.message : 'Failed to connect')
++        setFlowState('error')
++      })
++
++    return () => {
++      stopChatGptOAuthServer()
++    }
+   }, [])
+ 
+   const handleConnect = async () => {
+-    try {
+-      setFlowState('waiting-for-code')
+-      await openChatGptOAuthInBrowser()
+-    } catch (err) {
+-      setError(err instanceof Error ? err.message : 'Failed to open browser')
+-      setFlowState('error')
+-    }
++    setFlowState('waiting-for-code')
++    connectChatGptOAuth()
++      .then(() => {
++        setFlowState('connected')
++      })
++      .catch((err) => {
++        setError(err instanceof Error ? err.message : 'Failed to connect')
++        setFlowState('error')
++      })
+   }
+ 
+   const handleDisconnect = () => {
+@@ -96,7 +107,8 @@ export const ChatGptConnectBanner = () => {
+         <box style={{ flexDirection: 'column', gap: 0 }}>
+           <text style={{ fg: theme.info }}>Waiting for ChatGPT authorization</text>
+           <text style={{ fg: theme.muted, marginTop: 1 }}>
+-            Complete sign-in in your browser, then paste the auth code or callback URL here.
++            Complete sign-in in your browser — it should connect automatically.
++            If not, paste the callback URL here.
+           </text>
+         </box>
+       </BottomBanner>
+@@ -121,6 +133,7 @@ export async function handleChatGptAuthCode(code: string): Promise<{
+ }> {
+   try {
+     await exchangeChatGptCodeForTokens(code)
++    stopChatGptOAuthServer()
+     return {
+       success: true,
+       message:
+diff --git a/cli/src/utils/chatgpt-oauth.ts b/cli/src/utils/chatgpt-oauth.ts
+index 418ff989b..43fbf5c9e 100644
+--- a/cli/src/utils/chatgpt-oauth.ts
++++ b/cli/src/utils/chatgpt-oauth.ts
+@@ -4,6 +4,7 @@
+  */
+ 
+ import crypto from 'crypto'
++import http from 'http'
+ 
+ import {
+   CHATGPT_OAUTH_AUTHORIZE_URL,
+@@ -95,14 +96,136 @@ export function startChatGptOAuthFlow(): { codeVerifier: string; authUrl: string
+   authUrl.searchParams.set('code_challenge_method', 'S256')
+   authUrl.searchParams.set('state', state)
+   authUrl.searchParams.set('scope', 'openid profile email offline_access')
++  authUrl.searchParams.set('id_token_add_organizations', 'true')
++  authUrl.searchParams.set('codex_cli_simplified_flow', 'true')
++  authUrl.searchParams.set('originator', 'codex_cli_rs')
+ 
+   return { codeVerifier, authUrl: authUrl.toString() }
+ }
+ 
+-export async function openChatGptOAuthInBrowser(): Promise<string> {
+-  const { authUrl, codeVerifier } = startChatGptOAuthFlow()
+-  await open(authUrl)
+-  return codeVerifier
++const CALLBACK_SERVER_TIMEOUT_MS = 5 * 60 * 1000
++
++let callbackServer: http.Server | null = null
++
++export function stopChatGptOAuthServer(): void {
++  if (callbackServer) {
++    try { callbackServer.close() } catch { /* ignore */ }
++    callbackServer = null
++  }
++  pendingCodeVerifier = null
++  pendingState = null
++}
++
++function escapeHtml(s: string): string {
++  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;')
++}
++
++function callbackPageHtml(success: boolean, errorMessage?: string): string {
++  const title = success ? 'Connected — Codebuff' : 'Connection Failed — Codebuff'
++  const heading = success ? '✓ Connected to ChatGPT' : 'Connection Failed'
++  const headingColor = success ? '#4ade80' : '#f87171'
++  const body = success
++    ? 'You can close this tab and return to Codebuff.'
++    : `${escapeHtml(errorMessage ?? 'Unknown error')}. Return to Codebuff and try /connect:chatgpt again.`
++  return `<!DOCTYPE html>
++<html><head><meta charset="utf-8"><title>${title}</title></head>
++<body style="font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#0a0a0a;color:#e5e5e5">
++<div style="text-align:center;padding:2rem">
++<h1 style="color:${headingColor};margin-bottom:0.5rem">${heading}</h1>
++<p style="color:#a3a3a3">${body}</p>
++</div></body></html>`
++}
++
++function startCallbackServer(codeVerifier: string): Promise<ChatGptOAuthCredentials> {
++  const redirectUrl = new URL(CHATGPT_OAUTH_REDIRECT_URI)
++  const port = parseInt(redirectUrl.port, 10)
++  const callbackPath = redirectUrl.pathname
++
++  return new Promise<ChatGptOAuthCredentials>((resolve, reject) => {
++    const timeout = setTimeout(() => {
++      stopChatGptOAuthServer()
++      reject(new Error('Timeout waiting for ChatGPT authorization'))
++    }, CALLBACK_SERVER_TIMEOUT_MS)
++
++    const server = http.createServer(async (req, res) => {
++      const reqUrl = new URL(req.url ?? '/', `http://127.0.0.1:${port}`)
++
++      if (reqUrl.pathname !== callbackPath) {
++        res.writeHead(404, { 'Content-Type': 'text/plain' })
++        res.end('Not found')
++        return
++      }
++
++      const code = reqUrl.searchParams.get('code')
++      if (!code) {
++        res.writeHead(400, { 'Content-Type': 'text/html' })
++        res.end(callbackPageHtml(false, 'No authorization code received.'))
++        clearTimeout(timeout)
++        stopChatGptOAuthServer()
++        reject(new Error('No authorization code in callback'))
++        return
++      }
++
++      const state = reqUrl.searchParams.get('state')
++      if (pendingState && (!state || state !== pendingState)) {
++        res.writeHead(400, { 'Content-Type': 'text/html' })
++        res.end(callbackPageHtml(false, 'OAuth state mismatch. Please try again.'))
++        clearTimeout(timeout)
++        stopChatGptOAuthServer()
++        reject(new Error('OAuth state mismatch in callback'))
++        return
++      }
++
++      try {
++        const fullCallbackUrl = `${CHATGPT_OAUTH_REDIRECT_URI}${reqUrl.search}`
++        const credentials = await exchangeChatGptCodeForTokens(fullCallbackUrl, codeVerifier)
++
++        res.writeHead(200, { 'Content-Type': 'text/html' })
++        res.end(callbackPageHtml(true))
++
++        clearTimeout(timeout)
++        stopChatGptOAuthServer()
++        resolve(credentials)
++      } catch (err) {
++        const message = err instanceof Error ? err.message : 'Token exchange failed'
++        res.writeHead(500, { 'Content-Type': 'text/html' })
++        res.end(callbackPageHtml(false, message))
++
++        clearTimeout(timeout)
++        stopChatGptOAuthServer()
++        reject(err instanceof Error ? err : new Error(message))
++      }
++    })
++
++    server.on('error', (err) => {
++      clearTimeout(timeout)
++      callbackServer = null
++      reject(err)
++    })
++
++    server.listen(port, '127.0.0.1', () => {
++      callbackServer = server
++    })
++  })
++}
++
++export function connectChatGptOAuth(): {
++  authUrl: string
++  credentials: Promise<ChatGptOAuthCredentials>
++} {
++  stopChatGptOAuthServer()
++
++  const { codeVerifier, authUrl } = startChatGptOAuthFlow()
++  const credentials = startCallbackServer(codeVerifier)
++
++  open(authUrl).catch(() => {
++    console.debug(
++      'Failed to open browser for ChatGPT OAuth. Manual URL:',
++      authUrl,
++    )
++  })
++
++  return { authUrl, credentials }
+ }
+ 
+ function parseAuthCodeInput(input: string): { code: string; state?: string } {
+@@ -177,6 +300,7 @@ export async function exchangeChatGptCodeForTokens(
+ }
+ 
+ export function disconnectChatGptOAuth(): void {
++  stopChatGptOAuthServer()
+   clearChatGptOAuthCredentials()
+   resetChatGptOAuthRateLimit()
+ }
+diff --git a/common/src/constants/chatgpt-oauth.ts b/common/src/constants/chatgpt-oauth.ts
+index c82d702de..ded5ba48e 100644
+--- a/common/src/constants/chatgpt-oauth.ts
++++ b/common/src/constants/chatgpt-oauth.ts
+@@ -18,8 +18,8 @@ export const CHATGPT_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token'
+ /** Pinned redirect URI for paste-based localhost callback flow. */
+ export const CHATGPT_OAUTH_REDIRECT_URI = 'http://localhost:1455/auth/callback'
+ 
+-/** Base URL for direct OpenAI API calls. */
+-export const OPENAI_API_BASE_URL = 'https://api.openai.com'
++/** Base URL for ChatGPT backend API (Codex endpoint). */
++export const CHATGPT_BACKEND_BASE_URL = 'https://chatgpt.com/backend-api'
+ 
+ /** Environment variable for OAuth token override. */
+ export const CHATGPT_OAUTH_TOKEN_ENV_VAR = 'CODEBUFF_CHATGPT_OAUTH_TOKEN'
+diff --git a/sdk/src/__tests__/credentials.test.ts b/sdk/src/__tests__/credentials.test.ts
+index c8cdbff0a..c1b5317c1 100644
+--- a/sdk/src/__tests__/credentials.test.ts
++++ b/sdk/src/__tests__/credentials.test.ts
+@@ -527,7 +527,7 @@ describe('credentials', () => {
+       }
+     })
+ 
+-    test('clears credentials and returns null on refresh failure', async () => {
++    test('preserves credentials and returns null on refresh failure', async () => {
+       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'refresh-fail-test-'))
+       const env = { NEXT_PUBLIC_CB_ENVIRONMENT: 'test' } as any
+       const originalHomedir = os.homedir
+@@ -558,9 +558,10 @@ describe('credentials', () => {
+         const result = await refreshClaudeOAuthToken(env)
+ 
+         expect(result).toBeNull()
+-        // Credentials should be cleared
++        // Credentials should be preserved (not cleared) so future retries can attempt refresh again
+         const saved = JSON.parse(fs.readFileSync(path.join(configDir, 'credentials.json'), 'utf8'))
+-        expect(saved.claudeOAuth).toBeUndefined()
++        expect(saved.claudeOAuth).toBeDefined()
++        expect(saved.claudeOAuth.refreshToken).toBe('invalid-refresh')
+       } finally {
+         ;(os as any).homedir = originalHomedir
+         fs.rmSync(tmpDir, { recursive: true })
+diff --git a/sdk/src/credentials.ts b/sdk/src/credentials.ts
+index 05fcf4892..d7af78683 100644
+--- a/sdk/src/credentials.ts
++++ b/sdk/src/credentials.ts
+@@ -255,8 +255,7 @@ export const refreshClaudeOAuthToken = async (
+       )
+ 
+       if (!response.ok) {
+-        // Refresh failed, clear credentials
+-        clearClaudeOAuthCredentials(clientEnv)
++        console.debug(`Claude OAuth token refresh failed (status ${response.status})`)
+         return null
+       }
+ 
+@@ -273,9 +272,8 @@ export const refreshClaudeOAuthToken = async (
+       saveClaudeOAuthCredentials(newCredentials, clientEnv)
+ 
+       return newCredentials
+-    } catch {
+-      // Refresh failed, clear credentials
+-      clearClaudeOAuthCredentials(clientEnv)
++    } catch (error) {
++      console.debug('Claude OAuth token refresh failed:', error instanceof Error ? error.message : String(error))
+       return null
+     } finally {
+       // Clear the mutex after completion
+@@ -434,7 +432,7 @@ export const refreshChatGptOAuthToken = async (
+       })
+ 
+       if (!response.ok) {
+-        clearChatGptOAuthCredentials(clientEnv)
++        console.debug(`ChatGPT OAuth token refresh failed (status ${response.status})`)
+         return null
+       }
+ 
+@@ -444,7 +442,7 @@ export const refreshChatGptOAuthToken = async (
+         typeof data?.access_token !== 'string' ||
+         data.access_token.trim().length === 0
+       ) {
+-        clearChatGptOAuthCredentials(clientEnv)
++        console.debug('ChatGPT OAuth token refresh returned empty access token')
+         return null
+       }
+ 
+@@ -461,8 +459,8 @@ export const refreshChatGptOAuthToken = async (
+       saveChatGptOAuthCredentials(newCredentials, clientEnv)
+ 
+       return newCredentials
+-    } catch {
+-      clearChatGptOAuthCredentials(clientEnv)
++    } catch (error) {
++      console.debug('ChatGPT OAuth token refresh failed:', error instanceof Error ? error.message : String(error))
+       return null
+     } finally {
+       chatGptRefreshPromise = null
+diff --git a/sdk/src/impl/chatgpt-backend-fetch.ts b/sdk/src/impl/chatgpt-backend-fetch.ts
+new file mode 100644
+index 000000000..3a645dbf6
+--- /dev/null
++++ b/sdk/src/impl/chatgpt-backend-fetch.ts
+@@ -0,0 +1,516 @@
++/**
++ * Custom fetch for routing ChatGPT OAuth requests through the ChatGPT backend API.
++ *
++ * The AI SDK's OpenAICompatibleChatLanguageModel speaks Chat Completions format,
++ * but ChatGPT OAuth tokens only work with the ChatGPT backend (chatgpt.com/backend-api)
++ * which uses the Responses API format.
++ *
++ * This module transforms:
++ * - Request: Chat Completions body → Responses API body
++ * - Response: Responses API SSE → Chat Completions SSE
++ */
++
++import type { FetchFunction } from '@ai-sdk/provider-utils'
++
++type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
++
++// ============================================================================
++// JWT / Account ID
++// ============================================================================
++
++function base64UrlDecode(str: string): string {
++  let base64 = str.replace(/-/g, '+').replace(/_/g, '/')
++  const pad = base64.length % 4
++  if (pad === 2) base64 += '=='
++  else if (pad === 3) base64 += '='
++  return Buffer.from(base64, 'base64').toString('utf-8')
++}
++
++export function extractChatGptAccountId(accessToken: string): string | null {
++  try {
++    const parts = accessToken.split('.')
++    if (parts.length !== 3) return null
++    const payload = JSON.parse(base64UrlDecode(parts[1]))
++    const auth = payload?.['https://api.openai.com/auth']
++    return typeof auth?.chatgpt_account_id === 'string'
++      ? auth.chatgpt_account_id
++      : null
++  } catch {
++    return null
++  }
++}
++
++// ============================================================================
++// Request Transform: Chat Completions → Responses API
++// ============================================================================
++
++interface ChatCompletionsToolCall {
++  id: string
++  type: string
++  function: { name: string; arguments: string }
++}
++
++interface ChatCompletionsMessage {
++  role: string
++  content?: unknown
++  tool_calls?: ChatCompletionsToolCall[]
++  tool_call_id?: string
++}
++
++interface ChatCompletionsTool {
++  type: string
++  function?: {
++    name: string
++    description?: string
++    parameters?: unknown
++    strict?: boolean
++  }
++}
++
++function convertUserContentParts(content: unknown): unknown {
++  if (typeof content === 'string') return content
++  if (!Array.isArray(content)) return String(content ?? '')
++  return content.map((part: Record<string, unknown>) => {
++    if (part.type === 'text') {
++      return { type: 'input_text', text: part.text }
++    }
++    if (part.type === 'image_url') {
++      const imageUrl = part.image_url as Record<string, unknown> | undefined
++      return {
++        type: 'input_image',
++        image_url: imageUrl?.url ?? imageUrl,
++      }
++    }
++    return part
++  })
++}
++
++function convertMessages(
++  messages: ChatCompletionsMessage[],
++): unknown[] {
++  const input: unknown[] = []
++
++  for (const msg of messages) {
++    switch (msg.role) {
++      case 'system': {
++        // System messages are extracted to top-level `instructions` field;
++        // if any slip through, convert to developer role
++        if (msg.content) {
++          input.push({ type: 'message', role: 'developer', content: msg.content })
++        }
++        break
++      }
++
++      case 'user': {
++        const content = convertUserContentParts(msg.content)
++        if (content) {
++          input.push({ type: 'message', role: 'user', content })
++        }
++        break
++      }
++
++      case 'assistant': {
++        if (msg.content) {
++          input.push({ type: 'message', role: 'assistant', content: msg.content })
++        }
++        if (msg.tool_calls) {
++          for (const tc of msg.tool_calls) {
++            input.push({
++              type: 'function_call',
++              call_id: tc.id,
++              name: tc.function.name,
++              arguments: tc.function.arguments,
++            })
++          }
++        }
++        break
++      }
++
++      case 'tool': {
++        input.push({
++          type: 'function_call_output',
++          call_id: msg.tool_call_id ?? 'unknown',
++          output:
++            typeof msg.content === 'string'
++              ? msg.content
++              : JSON.stringify(msg.content),
++        })
++        break
++      }
++    }
++  }
++
++  return input
++}
++
++function convertTools(tools: ChatCompletionsTool[]): unknown[] {
++  return tools.map((tool) => {
++    if (tool.type === 'function' && tool.function) {
++      return {
++        type: 'function',
++        name: tool.function.name,
++        description: tool.function.description,
++        parameters: tool.function.parameters,
++        ...(tool.function.strict !== undefined && {
++          strict: tool.function.strict,
++        }),
++      }
++    }
++    return tool
++  })
++}
++
++function transformRequestBody(
++  body: Record<string, unknown>,
++): Record<string, unknown> {
++  const messages = (body.messages ?? []) as ChatCompletionsMessage[]
++  const tools = body.tools as ChatCompletionsTool[] | undefined
++
++  // Extract system messages into the top-level `instructions` field
++  // (required by the ChatGPT backend API)
++  const systemMessages = messages.filter((m) => m.role === 'system')
++  const nonSystemMessages = messages.filter((m) => m.role !== 'system')
++  const instructions = systemMessages
++    .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
++    .join('\n\n')
++
++  const transformed: Record<string, unknown> = {
++    model: body.model,
++    instructions: instructions || 'You are a helpful assistant.',
++    input: convertMessages(nonSystemMessages),
++    stream: true,
++    store: false,
++    include: ['reasoning.encrypted_content'],
++  }
++
++  if (tools?.length) {
++    transformed.tools = convertTools(tools)
++  }
++  if (body.tool_choice != null) {
++    transformed.tool_choice = body.tool_choice
++  }
++
++  // The ChatGPT backend does not support: max_output_tokens, max_tokens,
++  // temperature, top_p, stop, frequency_penalty, presence_penalty, logprobs,
++  // n, stream_options — omit them all.
++
++  const reasoningEffort = body.reasoning_effort as string | undefined
++  transformed.reasoning = {
++    effort: reasoningEffort || 'high',
++    summary: 'auto',
++  }
++
++  transformed.text = { verbosity: 'medium' }
++
++  return transformed
++}
++
++// ============================================================================
++// Response Transform: Responses API SSE → Chat Completions SSE
++// ============================================================================
++
++function createSseTransformStream(): TransformStream<Uint8Array, Uint8Array> {
++  const encoder = new TextEncoder()
++  const decoder = new TextDecoder()
++
++  let buffer = ''
++  let responseId: string | null = null
++  let responseModel: string | null = null
++  let nextToolCallIndex = 0
++  const outputIndexToToolIndex = new Map<number, number>()
++  let emittedRole = false
++
++  function emit(
++    controller: TransformStreamDefaultController<Uint8Array>,
++    chunk: Record<string, unknown>,
++  ) {
++    controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
++  }
++
++  function processEvent(
++    controller: TransformStreamDefaultController<Uint8Array>,
++    data: Record<string, unknown>,
++  ) {
++    const type = data.type as string | undefined
++    if (!type) return
++
++    switch (type) {
++      case 'response.created': {
++        const resp = data.response as Record<string, unknown> | undefined
++        responseId = (resp?.id as string) ?? null
++        responseModel = (resp?.model as string) ?? null
++        if (!emittedRole) {
++          emit(controller, {
++            id: responseId,
++            model: responseModel,
++            choices: [
++              { index: 0, delta: { role: 'assistant' }, finish_reason: null },
++            ],
++          })
++          emittedRole = true
++        }
++        break
++      }
++
++      case 'response.output_text.delta': {
++        emit(controller, {
++          id: responseId,
++          choices: [
++            {
++              index: 0,
++              delta: { content: data.delta as string },
++              finish_reason: null,
++            },
++          ],
++        })
++        break
++      }
++
++      case 'response.reasoning_summary_text.delta': {
++        emit(controller, {
++          id: responseId,
++          choices: [
++            {
++              index: 0,
++              delta: { reasoning_content: data.delta as string },
++              finish_reason: null,
++            },
++          ],
++        })
++        break
++      }
++
++      case 'response.output_item.added': {
++        const item = data.item as Record<string, unknown> | undefined
++        if (item?.type === 'function_call') {
++          const tcIndex = nextToolCallIndex++
++          const outputIdx = (data.output_index as number) ?? 0
++          outputIndexToToolIndex.set(outputIdx, tcIndex)
++          emit(controller, {
++            id: responseId,
++            choices: [
++              {
++                index: 0,
++                delta: {
++                  tool_calls: [
++                    {
++                      index: tcIndex,
++                      id: (item.call_id as string) ?? (item.id as string),
++                      function: {
++                        name: item.name as string,
++                        arguments: '',
++                      },
++                    },
++                  ],
++                },
++                finish_reason: null,
++              },
++            ],
++          })
++        }
++        break
++      }
++
++      case 'response.function_call_arguments.delta': {
++        const outputIdx = (data.output_index as number) ?? 0
++        const tcIdx = outputIndexToToolIndex.get(outputIdx) ?? 0
++        emit(controller, {
++          id: responseId,
++          choices: [
++            {
++              index: 0,
++              delta: {
++                tool_calls: [
++                  {
++                    index: tcIdx,
++                    function: { arguments: data.delta as string },
++                  },
++                ],
++              },
++              finish_reason: null,
++            },
++          ],
++        })
++        break
++      }
++
++      case 'response.completed':
++      case 'response.done': {
++        const resp = data.response as Record<string, unknown> | undefined
++        const usage = resp?.usage as Record<string, unknown> | undefined
++        const status = resp?.status as string | undefined
++
++        let finishReason = 'stop'
++        if (status === 'incomplete') {
++          finishReason = 'length'
++        } else if (nextToolCallIndex > 0) {
++          finishReason = 'tool_calls'
++        }
++
++        const chunk: Record<string, unknown> = {
++          id: responseId,
++          choices: [
++            { index: 0, delta: {}, finish_reason: finishReason },
++          ],
++        }
++
++        if (usage) {
++          const outputDetails = usage.output_tokens_details as
++            | Record<string, unknown>
++            | undefined
++          chunk.usage = {
++            prompt_tokens: usage.input_tokens,
++            completion_tokens: usage.output_tokens,
++            total_tokens: usage.total_tokens,
++            ...(outputDetails?.reasoning_tokens != null && {
++              completion_tokens_details: {
++                reasoning_tokens: outputDetails.reasoning_tokens,
++              },
++            }),
++          }
++        }
++
++        emit(controller, chunk)
++        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
++        break
++      }
++
++      case 'response.failed': {
++        const resp = data.response as Record<string, unknown> | undefined
++        const errorObj = (resp?.error ?? data.error) as
++          | Record<string, unknown>
++          | undefined
++        emit(controller, {
++          error: {
++            message:
++              (errorObj?.message as string) ??
++              'ChatGPT backend request failed',
++            type: (errorObj?.type as string) ?? 'server_error',
++          },
++        })
++        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
++        break
++      }
++
++      case 'error': {
++        const errorObj = (data.error ?? data) as Record<string, unknown>
++        emit(controller, {
++          error: {
++            message:
++              (errorObj.message as string) ??
++              'Unknown error from ChatGPT backend',
++            type: (errorObj.type as string) ?? 'server_error',
++          },
++        })
++        break
++      }
++
++      // Skip all other events silently (content_part.added, output_text.done, etc.)
++    }
++  }
++
++  return new TransformStream<Uint8Array, Uint8Array>({
++    transform(chunk, controller) {
++      buffer += decoder.decode(chunk, { stream: true })
++
++      const lines = buffer.split('\n')
++      buffer = lines.pop() ?? ''
++
++      for (const line of lines) {
++        if (!line.startsWith('data: ')) continue
++
++        const jsonStr = line.slice(6).trim()
++        if (!jsonStr || jsonStr === '[DONE]') {
++          continue
++        }
++
++        try {
++          const parsed = JSON.parse(jsonStr) as Record<string, unknown>
++          processEvent(controller, parsed)
++        } catch {
++          // Skip unparseable lines
++        }
++      }
++    },
++
++    flush(controller) {
++      if (buffer.trim().startsWith('data: ')) {
++        const jsonStr = buffer.trim().slice(6).trim()
++        if (jsonStr && jsonStr !== '[DONE]') {
++          try {
++            const parsed = JSON.parse(jsonStr) as Record<string, unknown>
++            processEvent(controller, parsed)
++          } catch {
++            // skip
++          }
++        }
++      }
++    },
++  })
++}
++
++function transformResponseStream(
++  inputStream: ReadableStream<Uint8Array>,
++): ReadableStream<Uint8Array> {
++  const transform = createSseTransformStream()
++  inputStream.pipeTo(transform.writable).catch(() => {})
++  return transform.readable
++}
++
++// ============================================================================
++// Custom Fetch
++// ============================================================================
++
++export function createChatGptBackendFetch(): FetchFunction {
++  const fetchFn: FetchLike = async (
++    input: RequestInfo | URL,
++    init?: RequestInit,
++  ): Promise<Response> => {
++    let transformedInit = init
++
++    if (init?.body && typeof init.body === 'string') {
++      try {
++        const body = JSON.parse(init.body) as Record<string, unknown>
++        const transformedBody = transformRequestBody(body)
++        transformedInit = { ...init, body: JSON.stringify(transformedBody) }
++      } catch {
++        // If body can't be parsed, pass through unchanged
++      }
++    }
++
++    const response = await globalThis.fetch(input, transformedInit)
++
++    if (!response.ok) {
++      // Map 404 usage-limit errors to 429 (same as opencode plugin)
++      if (response.status === 404) {
++        try {
++          const text = await response.clone().text()
++          if (/usage_limit|rate_limit/i.test(text)) {
++            return new Response(text, {
++              status: 429,
++              statusText: 'Too Many Requests',
++              headers: response.headers,
++            })
++          }
++        } catch {
++          // Fall through to return original response
++        }
++      }
++      return response
++    }
++
++    if (!response.body) return response
++
++    const transformedStream = transformResponseStream(response.body)
++
++    return new Response(transformedStream, {
++      status: response.status,
++      statusText: response.statusText,
++      headers: new Headers({
++        'content-type': 'text/event-stream; charset=utf-8',
++      }),
++    })
++  }
++
++  return fetchFn as FetchFunction
++}
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index 54ea057cb..8d2051553 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -147,10 +147,9 @@ function isOAuthRateLimitError(error: unknown): boolean {
+ 
+   if (message.includes('rate_limit') || message.includes('rate limit'))
+     return true
+-  if (message.includes('overloaded')) return true
+   if (
+     responseBody.includes('rate_limit') ||
+-    responseBody.includes('overloaded')
++    responseBody.includes('rate limit')
+   )
+     return true
+ 
+@@ -575,7 +574,8 @@ export async function* promptAiSdkStream(
+       })
+ 
+       if (chatGptErrorPolicy === 'fallback-rate-limit') {
+-        logger.info(
++        const rateLimitErrorDetails = chunkValue.error instanceof Error ? chunkValue.error.message : String(chunkValue.error)
++        logger.warn(
+           { error: getErrorObject(chunkValue.error) },
+           'ChatGPT OAuth rate limited during stream',
+         )
+@@ -595,7 +595,7 @@ export async function* promptAiSdkStream(
+         // In free mode, don't fall back to Codebuff backend — fail instead
+         if (isFreeMode(params.costMode)) {
+           throw new Error(
+-            'ChatGPT rate limit reached. Please wait a few minutes and try again.',
++            `ChatGPT rate limit reached. Please wait a few minutes and try again. (${rateLimitErrorDetails})`,
+           )
+         }
+ 
+@@ -679,6 +679,7 @@ export async function* promptAiSdkStream(
+             })
+             return retryResult
+           }
++          logger.warn({ model: requestedModel }, 'ChatGPT OAuth token refresh failed, unable to recover')
+         }
+ 
+         // Refresh failed or already retried
+diff --git a/sdk/src/impl/model-provider.ts b/sdk/src/impl/model-provider.ts
+index 9a57195f7..03754af32 100644
+--- a/sdk/src/impl/model-provider.ts
++++ b/sdk/src/impl/model-provider.ts
+@@ -13,11 +13,10 @@ import { createAnthropic } from '@ai-sdk/anthropic'
+ import { BYOK_OPENROUTER_HEADER } from '@codebuff/common/constants/byok'
+ import { isFreeMode } from '@codebuff/common/constants/free-agents'
+ import {
+-  CHATGPT_OAUTH_OPENAI_MODEL_ALLOWLIST,
++  CHATGPT_BACKEND_BASE_URL,
+   CHATGPT_OAUTH_ENABLED,
+   isChatGptOAuthModelAllowed,
+   isOpenAIProviderModel,
+-  OPENAI_API_BASE_URL,
+   toOpenAIModelId,
+ } from '@codebuff/common/constants/chatgpt-oauth'
+ import {
+@@ -38,6 +37,10 @@ import {
+   getValidClaudeOAuthCredentials,
+ } from '../credentials'
+ import { getByokOpenrouterApiKeyFromEnv } from '../env'
++import {
++  createChatGptBackendFetch,
++  extractChatGptAccountId,
++} from './chatgpt-backend-fetch'
+ 
+ import type { LanguageModel } from 'ai'
+ 
+@@ -292,24 +295,27 @@ export async function getModelForRequest(params: ModelRequestParams): Promise<Mo
+ }
+ 
+ /**
+- * Create an OpenAI model that uses OAuth Bearer token authentication.
++ * Create an OpenAI model that routes through the ChatGPT backend API (Codex endpoint).
++ * Uses a custom fetch that transforms between Chat Completions and Responses API formats.
+  */
+ function createOpenAIOAuthModel(model: string, oauthToken: string): LanguageModel {
+   const openAIModelId = toOpenAIModelId(model)
++  const accountId = extractChatGptAccountId(oauthToken)
+ 
+   return new OpenAICompatibleChatLanguageModel(openAIModelId, {
+     provider: 'openai',
+-    url: ({ path: endpoint }) => {
+-      const normalizedPath = endpoint.startsWith('/') ? endpoint : `/${endpoint}`
+-      return `${OPENAI_API_BASE_URL}/v1${normalizedPath}`
+-    },
++    url: () => `${CHATGPT_BACKEND_BASE_URL}/codex/responses`,
+     headers: () => ({
+       Authorization: `Bearer ${oauthToken}`,
+       'Content-Type': 'application/json',
++      'OpenAI-Beta': 'responses=experimental',
++      originator: 'codex_cli_rs',
++      accept: 'text/event-stream',
+       'user-agent': `ai-sdk/openai-compatible/${VERSION}/codebuff-chatgpt-oauth`,
++      ...(accountId ? { 'chatgpt-account-id': accountId } : {}),
+     }),
++    fetch: createChatGptBackendFetch(),
+     supportsStructuredOutputs: true,
+-    fetch: undefined,
+     includeUsage: undefined,
+   })
+ }

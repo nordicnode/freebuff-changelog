@@ -1,0 +1,102 @@
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index cd843751f..ed0706706 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -21,7 +21,10 @@ import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+ import { callTokenCountAPI } from './llm-api/codebuff-web-api'
+ import { getMCPToolData } from './mcp'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+-import { runProgrammaticStep } from './run-programmatic-step'
++import {
++  clearProgrammaticRunState,
++  runProgrammaticStep,
++} from './run-programmatic-step'
+ import { additionalSystemPrompts } from './system-prompt/prompts'
+ import { getAgentTemplate } from './templates/agent-registry'
+ import { buildAgentToolSet } from './templates/prompts'
+@@ -1209,6 +1212,11 @@ export async function loopAgentSteps(
+         }),
+       },
+     }
++  } finally {
++    // The endTurn path inside runProgrammaticStep handles normal completion,
++    // but abort/error exits (e.g. chat SSE disconnects) would otherwise leak
++    // the run's generator, STEP_ALL flag, and proposed file content forever.
++    clearProgrammaticRunState(runId)
+   }
+ }
+ 
+diff --git a/packages/agent-runtime/src/run-programmatic-step.ts b/packages/agent-runtime/src/run-programmatic-step.ts
+index 64addd410..ff9e7ca3c 100644
+--- a/packages/agent-runtime/src/run-programmatic-step.ts
++++ b/packages/agent-runtime/src/run-programmatic-step.ts
+@@ -44,6 +44,20 @@ export function clearAgentGeneratorCache(params: { logger: Logger }) {
+   runIdToStepAll.clear()
+ }
+ 
++/**
++ * Release all module-level state held for a run: the handleSteps generator
++ * (whose closure retains the full agent state and message history), the
++ * STEP_ALL flag, and any proposed file content. Safe to call for runs with
++ * no programmatic state. Must run whenever a run's loop exits — including
++ * abort and error paths, not just endTurn — or the state leaks for the
++ * lifetime of the process.
++ */
++export function clearProgrammaticRunState(runId: string): void {
++  delete runIdToGenerator[runId]
++  runIdToStepAll.delete(runId)
++  clearProposedContentForRun(runId)
++}
++
+ // Function to handle programmatic agents
+ export async function runProgrammaticStep(
+   params: {
+@@ -376,9 +390,7 @@ export async function runProgrammaticStep(
+     }
+   } finally {
+     if (endTurn) {
+-      delete runIdToGenerator[agentState.runId]
+-      runIdToStepAll.delete(agentState.runId)
+-      clearProposedContentForRun(agentState.runId)
++      clearProgrammaticRunState(agentState.runId)
+     }
+   }
+ }
+diff --git a/sdk/src/impl/agent-runtime.ts b/sdk/src/impl/agent-runtime.ts
+index 97d8b5d63..83525a7bb 100644
+--- a/sdk/src/impl/agent-runtime.ts
++++ b/sdk/src/impl/agent-runtime.ts
+@@ -17,13 +17,32 @@ import type {
+   AgentRuntimeDeps,
+   AgentRuntimeScopedDeps,
+ } from '@codebuff/common/types/contracts/agent-runtime'
++import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+ import type { DatabaseAgentCache } from '@codebuff/common/types/contracts/database'
+ import type { ClientEnv } from '@codebuff/common/types/contracts/env'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+ import type { TrackEventFn } from '@codebuff/common/types/contracts/analytics'
+ 
+-const databaseAgentCache: DatabaseAgentCache = new Map()
++const DATABASE_AGENT_CACHE_MAX_ENTRIES = 200
++
++/** Insertion-order (FIFO) eviction so the cache can't grow without bound in
++ *  long-lived processes (e.g. the freebuff chat server, which runs the agent
++ *  runtime in-process). Templates are large — prompts plus handleSteps source. */
++class BoundedAgentCache extends Map<string, AgentTemplate | null> {
++  override set(key: string, value: AgentTemplate | null): this {
++    if (!this.has(key)) {
++      while (this.size >= DATABASE_AGENT_CACHE_MAX_ENTRIES) {
++        const oldestKey = this.keys().next().value
++        if (oldestKey === undefined) break
++        this.delete(oldestKey)
++      }
++    }
++    return super.set(key, value)
++  }
++}
++
++const databaseAgentCache: DatabaseAgentCache = new BoundedAgentCache()
+ 
+ export function getAgentRuntimeImpl(
+   params: {

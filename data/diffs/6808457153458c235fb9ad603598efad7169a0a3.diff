@@ -1,0 +1,865 @@
+diff --git a/.bin/bun b/.bin/bun
+index d31dfb369..6719af676 100755
+--- a/.bin/bun
++++ b/.bin/bun
+@@ -1,5 +1,18 @@
+ #!/usr/bin/env bash
+ 
++# Bun wrapper that syncs secrets from Infisical to .env.local
++# Bun natively loads .env files in this order (highest precedence last):
++#   1. .env
++#   2. .env.development (or .env.production/.env.test based on NODE_ENV)
++#   3. .env.local
++#   4. .env.development.local - Worktree-specific overrides (ports, etc.)
++#
++# .env.development.local has highest precedence, so worktree port overrides
++# correctly override values from Infisical-synced .env.local.
++#
++# This wrapper ensures .env.local is up-to-date from Infisical before running bun.
++# If Infisical is not set up, it falls back to using existing .env.local if present.
++
+ # Common bun installation paths to check
+ BUN_PATHS=(
+     "/opt/homebrew/bin/bun"
+@@ -34,21 +47,23 @@ find_project_root() {
+     fi
+ }
+ 
+-# Infisical cache configuration
++# Configuration
+ PROJECT_ROOT="$(find_project_root)"
+-CACHE_FILE="$PROJECT_ROOT/.infisical-cache"
+-CACHE_TTL_SECONDS=${INFISICAL_CACHE_TTL:-900}  # Default 15 minutes, configurable via env var
++ENV_LOCAL_FILE="$PROJECT_ROOT/.env.local"
++ENV_DEVELOPMENT_LOCAL_FILE="$PROJECT_ROOT/.env.development.local"
++CACHE_TTL_SECONDS=${INFISICAL_CACHE_TTL:-900}  # Default 15 minutes
++CALLING_DIR="$(pwd)"
+ 
+ # Clean up any leftover temporary files
+-rm -f "$CACHE_FILE.tmp" 2>/dev/null
++rm -f "$ENV_LOCAL_FILE.tmp" 2>/dev/null
+ 
+-# Function to check if cache is valid
++# Function to check if .env.local cache is valid
+ is_cache_valid() {
+-    if [ ! -f "$CACHE_FILE" ]; then
++    if [ ! -f "$ENV_LOCAL_FILE" ]; then
+         return 1
+     fi
+ 
+-    local cache_time=$(stat -f "%m" "$CACHE_FILE" 2>/dev/null || stat -c "%Y" "$CACHE_FILE" 2>/dev/null)
++    local cache_time=$(stat -f "%m" "$ENV_LOCAL_FILE" 2>/dev/null || stat -c "%Y" "$ENV_LOCAL_FILE" 2>/dev/null)
+     local current_time=$(date +%s)
+     local age=$((current_time - cache_time))
+ 
+@@ -68,70 +83,34 @@ is_cache_valid() {
+     return 0
+ }
+ 
+-# Function to load environment variables from cache
+-load_from_cache() {
+-    if [ ! -f "$CACHE_FILE" ]; then
++# Function to sync secrets from Infisical to .env.local
++sync_from_infisical() {
++    # Check if infisical CLI is available
++    if ! command -v infisical &> /dev/null; then
+         return 1
+     fi
+ 
+-    # Use source to handle multi-line environment variables correctly
+-    set -a  # automatically export all variables
+-    source "$CACHE_FILE" 2>/dev/null
+-    set +a
+-
+-    # Verify that key variables are set to confirm success
+-    if [ -n "$PORT" ] || [ -n "$DATABASE_URL" ] || [ -n "$ANTHROPIC_API_KEY" ]; then
+-        return 0
+-    else
+-        # Cache validation failed
++    # Check if .infisical.json exists
++    if [ ! -f "$PROJECT_ROOT/.infisical.json" ]; then
+         return 1
+     fi
+-}
+-
+-# Function to load worktree env if it exists
+-load_worktree_env() {
+-    if [ -f "$PROJECT_ROOT/.env.worktree" ]; then
+-        if [ "$1" = "override" ]; then
+-            echo "🔧 Loading worktree environment variables from .env.worktree (overriding Infisical)"
+-        else
+-            echo "🔧 Loading worktree environment variables from .env.worktree"
+-        fi
+-        set -a
+-        source "$PROJECT_ROOT/.env.worktree"
+-        set +a
+-    fi
+-}
+-
+-# Function to finalize and exec bun with secrets loaded
+-finalize_and_exec() {
+-    export NEXT_PUBLIC_INFISICAL_UP=true
+-    # Load worktree overrides AFTER Infisical cache to ensure they take precedence
+-    load_worktree_env "override"
+-    exec "$REAL_BUN" "$@"
+-}
+ 
+-# Function to create cache from infisical
+-create_cache() {
+     # Set performance optimizations for Infisical
+     export INFISICAL_DISABLE_UPDATE_CHECK=true
+ 
+-    # Run infisical export in a subshell from project root to avoid cd in main shell
+-    local output
+     local temp_file=$(mktemp)
+ 
+-    # Run infisical export in background from project root, suppress stderr to avoid cluttered output
++    # Run infisical export in background from project root
+     (cd "$PROJECT_ROOT" && infisical export > "$temp_file" 2>/dev/null; echo $? > "$temp_file.exit") &
+     local pid=$!
+ 
+     # Wait up to 10 seconds
+     local count=0
+-    while [ $count -lt 100 ]; do  # 100 * 0.1s = 10s
++    local exit_code=1
++    while [ $count -lt 100 ]; do
+         if ! kill -0 $pid 2>/dev/null; then
+-            # Process finished
+             wait $pid 2>/dev/null
+-            output=$(cat "$temp_file")
+-            local exit_code=$(cat "$temp_file.exit" 2>/dev/null || echo 1)
+-            rm -f "$temp_file" "$temp_file.exit"
++            exit_code=$(cat "$temp_file.exit" 2>/dev/null || echo 1)
+             break
+         fi
+         sleep 0.1
+@@ -142,183 +121,155 @@ create_cache() {
+     if kill -0 $pid 2>/dev/null; then
+         kill $pid 2>/dev/null
+         wait $pid 2>/dev/null
+-        local exit_code=124  # Timeout exit code
+-        output=""
++        local exit_code=124
+         rm -f "$temp_file" "$temp_file.exit"
++        echo "⚠️  Infisical command timed out. Please check your connection or run 'infisical login'."
++        return 1
+     fi
+ 
+-    if [ $exit_code -eq 0 ]; then
+-        # Command succeeded, write to cache
+-        echo "$output" > "$CACHE_FILE"
+-        if [ -s "$CACHE_FILE" ]; then
+-            return 0  # Cache created successfully
+-        else
+-            rm -f "$CACHE_FILE"
+-            return 1  # No variables found
+-        fi
++    if [ "${exit_code:-1}" -eq 0 ] && [ -s "$temp_file" ]; then
++        # Success - move temp file to .env.local
++        mv "$temp_file" "$ENV_LOCAL_FILE"
++        rm -f "$temp_file" "$temp_file.exit" 2>/dev/null
++        return 0
+     else
+-        # Command failed or timed out
++        # Command failed
++        local output=$(cat "$temp_file" 2>/dev/null)
++        rm -f "$temp_file" "$temp_file.exit"
++        
+         if echo "$output" | grep -q "Select the environment"; then
+             echo "⚠️  Infisical session expired or not logged in."
+-        elif [ $exit_code -eq 124 ]; then
+-            echo "⚠️  Infisical command timed out. Please check your connection or run 'infisical login'."
+         else
+-            echo "⚠️  Infisical session expired or not logged in."
++            echo "⚠️  Infisical sync failed."
+         fi
+         echo "   Please run: infisical login"
+-        echo "   Then try your command again."
+-        rm -f "$CACHE_FILE"
+         return 1
+     fi
+ }
+ 
+-# Function to check if tmux is installed
+-check_tmux_installed() {
+-    if ! command -v tmux &> /dev/null; then
+-        return 1
+-    fi
+-    return 0
+-}
+-
+-# Function to check if command doesn't need secrets
+-# Returns 0 if secrets are NOT needed, 1 if they ARE needed
+-doesnt_need_secrets() {
+-    # If we're already running under infisical, don't need to wrap again
+-    if [ -n "$NEXT_PUBLIC_INFISICAL_UP" ]; then
+-        return 0
+-    fi
++# Create symlinks in package subdirectories pointing to root .env.local
++# This allows Next.js and other tools to find env vars when running from subdirs
++create_env_symlinks() {
++    # Skip on Windows - symlinks require admin/Developer Mode
++    case "$OSTYPE" in
++        msys*|cygwin*|win32*)
++            return
++            ;;
++    esac
+ 
+-    # Find the first non-flag argument, which is the command
+-    local cmd=""
+-    for arg in "$@"; do
+-        if [[ ! "$arg" =~ ^- ]]; then
+-            cmd="$arg"
+-            break
++    # Top-level packages (symlink: ../.env.local)
++    for subdir in web cli common evals scripts sdk; do
++        local link_path="$PROJECT_ROOT/$subdir/.env.local"
++        if [ -d "$PROJECT_ROOT/$subdir" ] && [ ! -L "$link_path" ] && [ ! -f "$link_path" ]; then
++            ln -sf ../.env.local "$link_path" 2>/dev/null || true
+         fi
+     done
+ 
+-    # Handle version/help flags which can appear anywhere
+-    for arg in "$@"; do
+-        case "$arg" in
+-            --version|-v|--help|-h|--revision)
+-                return 0
+-                ;;
+-        esac
++    # Nested packages under packages/ (symlink: ../../.env.local)
++    for subdir in packages/agent-runtime packages/bigquery packages/billing packages/build-tools packages/code-map packages/internal; do
++        local link_path="$PROJECT_ROOT/$subdir/.env.local"
++        if [ -d "$PROJECT_ROOT/$subdir" ] && [ ! -L "$link_path" ] && [ ! -f "$link_path" ]; then
++            ln -sf ../../.env.local "$link_path" 2>/dev/null || true
++        fi
+     done
++}
+ 
+-    # If no command is found (e.g., just 'bun'), it doesn't need secrets
+-    if [ -z "$cmd" ]; then
+-        return 0
++# Check for missing .env.local and print helpful guidance
++# This helps non-Infisical users understand how to set up their environment
++check_env_setup() {
++    # Skip in CI environments - they set env vars directly
++    if [ -n "$CI" ]; then
++        return
+     fi
+ 
+-    # Commands that don't need secrets
+-    case "$cmd" in
+-        # Package management
+-        install|i|add|remove|rm|link|unlink|pm|update|upgrade)
+-            return 0
+-            ;;
+-        # Project initialization
+-        init|create)
+-            return 0
+-            ;;
+-        # Info/utility
+-        info|outdated|audit|typecheck)
+-            return 0
+-            ;;
+-        # Run command needs special handling
+-        run)
+-            # Find the script name after 'run'
+-            local script=""
+-            local found_run=false
+-            for arg in "$@"; do
+-                if $found_run && [[ ! "$arg" =~ ^- ]]; then
+-                    script="$arg"
+-                    break
+-                fi
+-                if [[ "$arg" == "run" ]]; then
+-                    found_run=true
+-                fi
+-            done
+-
+-            # 'bun run' with no script lists scripts, no secrets needed
+-            if [ -z "$script" ]; then
+-                return 0
+-            fi
+-
+-            # Scripts that typically don't need secrets
+-            case "$script" in
+-                format|lint|typecheck|compile)
+-                    return 0
+-                    ;;
+-                *)
+-                    # Default run scripts to needing secrets
+-                    return 1
+-                    ;;
+-            esac
+-            ;;
+-        # Test command needs special handling
+-        test)
+-            # Check for integration/e2e tests that require tmux
+-            # Convention: test files matching *integration*.test.ts or *e2e*.test.ts
+-            local needs_tmux=false
+-
+-            for arg in "$@"; do
+-                # Check if running integration or e2e tests
+-                if [[ "$arg" =~ (integration|e2e).*\.test\.(ts|tsx|js|jsx) ]]; then
+-                    needs_tmux=true
+-                    break
+-                fi
+-                # Also check if running all tests and integration files exist
+-                if [[ "$arg" == "test" ]] || [[ -z "$arg" ]]; then
+-                    if ls */src/__tests__/*integration*.test.ts 2>/dev/null || ls */src/__tests__/*e2e*.test.ts 2>/dev/null; then
+-                        needs_tmux=true
+-                        break
+-                    fi
+-                fi
+-            done
+-
+-            # If running integration/e2e tests, check tmux availability
+-            if [ "$needs_tmux" = true ]; then
+-                if ! check_tmux_installed; then
+-                    echo "⚠️  tmux not found but required for integration/E2E tests"
+-                    echo ""
+-                    echo "📦 Install tmux:"
+-                    echo "   macOS:    brew install tmux"
+-                    echo "   Ubuntu:   sudo apt-get install tmux"
+-                    echo "   Windows:  Use WSL and run 'sudo apt-get install tmux'"
+-                    echo ""
+-                    echo "ℹ️  Skipping tmux-dependent tests..."
+-                    echo ""
+-                fi
+-            fi
+-            return 1  # Tests need secrets
+-            ;;
+-        *)
+-            # Default to needing secrets for all other commands
+-            return 1
+-            ;;
+-    esac
++    # If .env.local exists, we're good
++    if [ -f "$ENV_LOCAL_FILE" ]; then
++        return
++    fi
++
++    # Print helpful guidance
++    echo "" >&2
++    echo "⚠️  No .env.local found at project root" >&2
++    echo "" >&2
++    echo "  To set up your environment:" >&2
++    echo "" >&2
++    echo "  📦 Infisical users:" >&2
++    echo "     Run 'infisical login' then retry this command" >&2
++    echo "" >&2
++    echo "  ✏️  Manual setup:" >&2
++    echo "     Run 'cp .env.example .env.local' and edit with your values" >&2
++    echo "     Then edit .env.local with your actual values" >&2
++    echo "" >&2
+ }
+ 
+-# Main logic - determine execution path based on secrets requirement
+-if doesnt_need_secrets "$@"; then
+-    # Path 1: Command doesn't need secrets - run directly
+-    # But still load worktree overrides for commands that don't need secrets
+-    load_worktree_env
++# Load project env files to ensure correct precedence
++# .env.development.local must be sourced last to override any inherited env vars
++load_project_env() {
++    # Source env files with auto-export
++    # Order matters: .env.local first, then .env.development.local overrides
++    set -a
++    
++    # Only source .env.local when running from subdirectory
++    # (Bun loads it natively when at project root)
++    if [ "$PROJECT_ROOT" != "$CALLING_DIR" ] && [ -f "$ENV_LOCAL_FILE" ]; then
++        # shellcheck disable=SC1090
++        source "$ENV_LOCAL_FILE"
++    fi
++    
++    # Always source .env.development.local to ensure worktree overrides
++    # take precedence over any inherited shell environment variables
++    if [ -f "$ENV_DEVELOPMENT_LOCAL_FILE" ]; then
++        # shellcheck disable=SC1090
++        source "$ENV_DEVELOPMENT_LOCAL_FILE"
++    fi
++    
++    set +a
++}
++
++run_bun() {
++    create_env_symlinks
++    check_env_setup
++    load_project_env
+     exec "$REAL_BUN" "$@"
++}
++
++# Main logic
++
++# Path 1: Already running under Infisical wrapper - just exec bun
++# Bun will load .env files natively
++if [ -n "$NEXT_PUBLIC_INFISICAL_UP" ]; then
++    run_bun "$@"
+ fi
+ 
+-# Path 2: Command needs secrets - try cache first, then create if needed
+-if is_cache_valid && load_from_cache; then
+-    # Path 2a: Valid cache exists - use it, then apply worktree overrides
+-    finalize_and_exec "$@"
++# Path 2: Check if .env.local cache is valid
++if is_cache_valid; then
++    export NEXT_PUBLIC_INFISICAL_UP=true
++    run_bun "$@"
++fi
++
++# Path 3: Try to sync from Infisical
++if sync_from_infisical; then
++    export NEXT_PUBLIC_INFISICAL_UP=true
++    run_bun "$@"
++fi
++
++# Path 4: Sync failed but .env.local exists - use it with warning
++if [ -f "$ENV_LOCAL_FILE" ]; then
++    echo "   Using existing .env.local (may be stale)"
++    export NEXT_PUBLIC_INFISICAL_UP=true
++    run_bun "$@"
+ fi
+ 
+-# Path 2b: No valid cache - create new one
+-if create_cache; then
+-    load_from_cache
+-    finalize_and_exec "$@"
++# Path 5: No .env.local and no Infisical - check if .env.example exists for guidance
++if [ -f "$PROJECT_ROOT/.env.example" ]; then
++    echo "❌ No .env.local found and Infisical sync failed."
++    echo ""
++    echo "   To set up environment variables, either:"
++    echo "   1. Copy .env.example to .env.local and fill in values"
++    echo "   2. Set up Infisical: see INFISICAL_SETUP_GUIDE.md"
++    echo ""
++    exit 1
+ fi
+ 
+-# Path 2c: Cache creation failed - exit with error
+-exit 1
++# No .env files at all - just run bun (might be a non-project command)
++run_bun "$@"
+diff --git a/.gitignore b/.gitignore
+index 67d1c2d0c..1e67aef11 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,11 +2,10 @@
+ .idea/
+ .vercel
+ 
++# Environment files (secrets) - Bun loads .env.* files natively
+ .env
+ .env.*
+ !.env.example
+-.env.worktree
+-.worktree-env.sh
+ 
+ # ctags
+ tags
+@@ -29,7 +28,5 @@ debug/
+ .nx/cache
+ .nx/workspace-data
+ 
+-# Infisical cache (contains secrets, should not be committed)
+-.infisical-cache
+-.infisical-cache.tmp
++# Infisical config (user-specific)
+ .infisical.json
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index bc1600e9f..00cdf9e88 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -9,74 +9,46 @@ Hey there! 👋 Thanks for wanting to contribute to Codebuff. Whether you're squ
+ Before you begin, you'll need to install a few tools:
+ 
+ 1. **Bun** (our primary package manager): Follow the [Bun installation guide](https://bun.sh/docs/installation)
+-2. **direnv**: This manages environment variables automatically
+-   - macOS: `brew install direnv`
+-   - Ubuntu/Debian: `sudo apt install direnv`
+-   - Other systems: See [direnv installation guide](https://direnv.net/docs/installation.html)
+-3. **Docker**: Required for the web server database
+-4. **Infisical CLI**: For secrets management
+-   ```bash
+-   npm install -g @infisical/cli
+-   ```
++2. **Docker**: Required for the web server database
+ 
+ ### Setting Up Your Development Environment
+ 
+-1. **Hook direnv into your shell** (one-time setup):
+-
+-   - For zsh: `echo 'eval "$(direnv hook zsh)"' >> ~/.zshrc && source ~/.zshrc`
+-   - For bash: `echo 'eval "$(direnv hook bash)"' >> ~/.bashrc && source ~/.bashrc`
+-   - For fish: `echo 'direnv hook fish | source' >> ~/.config/fish/config.fish && source ~/.config/fish/config.fish`
+-
+-2. **Restart your shell**: Run `exec $SHELL` or restart your terminal
+-
+-3. **Clone the repository**:
++1. **Clone the repository**:
+ 
+    ```bash
+    git clone https://github.com/CodebuffAI/codebuff.git
+    cd codebuff
+    ```
+ 
+-4. **Set up secrets management**:
++2. **Set up environment variables**:
+ 
+    ```bash
+-   npm install -g @infisical/cli
+-   infisical init
+-   infisical login
+-   # Select "US" region when prompted
++   # Copy the example file
++   cp .env.example .env.local
++   
++   # Edit .env.local and update DATABASE_URL to match Docker:
++   # DATABASE_URL=postgresql://manicode_user_local:secretpassword_local@localhost:5432/manicode_db_local
+    ```
+ 
+-   Follow the [Infisical Setup Guide](./INFISICAL_SETUP_GUIDE.md) for detailed setup instructions.
+-
+-   Load all environment variables at once:
+-
+-   ```bash
+-   infisical secrets set --file .env.example
+-   infisical secrets set DATABASE_URL=postgresql://manicode_user_local:secretpassword_local@localhost:5432/manicode_db_local
+-   ```
+-
+-5. **Configure environment**:
+-
+-   ```bash
+-   direnv allow
+-   ```
++   > **Team members**: For shared secrets management, see the [Infisical Setup Guide](./INFISICAL_SETUP_GUIDE.md).
+ 
+-6. **Install dependencies**:
++3. **Install dependencies**:
+ 
+    ```bash
+    bun install
+    ```
+ 
+-7. **Setup a Github OAuth app**
++4. **Setup a Github OAuth app**
+ 
+    1. Follow these instructions to set up a [Github OAuth app](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
+-   2. Find your app's Github client ID and secret access key and set them in Infisical:
++   2. Add your Github client ID and secret to `.env.local`:
+ 
+    ```bash
+-   infisical secrets set CODEBUFF_GITHUB_ID=<your-github-app-id-here>
+-   infisical secrets set CODEBUFF_GITHUB_SECRET=<your-github-app-secret-here>
++   CODEBUFF_GITHUB_ID=<your-github-app-id-here>
++   CODEBUFF_GITHUB_SECRET=<your-github-app-secret-here>
+    ```
+ 
+-8. **Start development services**:
++5. **Start development services**:
+ 
+    **Option A: All-in-one (recommended)**
+    ```bash
+@@ -99,7 +71,7 @@ Before you begin, you'll need to install a few tools:
+ 
+    **Note**: CLI requires both backend and web server running for authentication.
+ 
+-9. **Giving yourself credits**:
++6. **Giving yourself credits**:
+ 
+    1. Log into Codebuff at [http://localhost:3000/login](http://localhost:3000/login)
+ 
+@@ -115,7 +87,7 @@ Before you begin, you'll need to install a few tools:
+ 
+    Now, you should be able to run the CLI commands locally from within the `codebuff` directory.
+ 
+-10. **Running in other directories**:
++7. **Running in other directories**:
+ 
+ In order to run the CLI from other directories, you need to first publish the agents to the database.
+ 
+@@ -271,14 +243,12 @@ Level up the web interface in `web/` with better agent management, project templ
+ 
+ **Setup issues?**
+ 
+-- **direnv problems?** Make sure it's hooked into your shell, run `direnv allow`, and restart your terminal
+ - **Script errors?** Double-check you're using bun for all commands
+-- **Infisical issues?** See our [Infisical Setup Guide](./INFISICAL_SETUP_GUIDE.md) for step-by-step instructions
+ - **Database connection errors?** If you see `password authentication failed for user "postgres"` errors:
+-  1. Ensure DATABASE_URL uses the correct credentials: `postgresql://manicode_user_local:secretpassword_local@localhost:5432/manicode_db_local`
+-  2. Update both your local `.env` file and Infisical secret: `infisical secrets set DATABASE_URL=postgresql://manicode_user_local:secretpassword_local@localhost:5432/manicode_db_local`
+-  3. Run the database migration: `infisical run -- bun run db:migrate`
+-  4. Restart your development services
++  1. Ensure DATABASE_URL in `.env.local` uses the correct credentials: `postgresql://manicode_user_local:secretpassword_local@localhost:5432/manicode_db_local`
++  2. Run the database migration: `bun run db:migrate`
++  3. Restart your development services
++- **Using Infisical?** See the [Infisical Setup Guide](./INFISICAL_SETUP_GUIDE.md) for team secrets management
+ - **Empty Agent Store in dev mode?** This is expected behavior - agents from `.agents/` directory need to be published to the database to appear in the marketplace
+ 
+ **Questions?** Jump into our [Discord community](https://codebuff.com/discord) - we're friendly and always happy to help!
+diff --git a/INFISICAL_SETUP_GUIDE.md b/INFISICAL_SETUP_GUIDE.md
+index 57c182f93..06c1559ef 100644
+--- a/INFISICAL_SETUP_GUIDE.md
++++ b/INFISICAL_SETUP_GUIDE.md
+@@ -1,51 +1,80 @@
+-# Simple Infisical Setup for Codebuff
++# Infisical Setup Guide
+ 
+-Quick 5-step setup to get Codebuff running with Infisical secrets.
++This guide is for **team/advanced secrets management** using [Infisical](https://infisical.com/).
++
++> **Personal development?** Just copy `.env.example` to `.env.local` and fill in your values. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full setup guide.
++
++## Why Infisical?
++
++- **Team sync**: Share secrets securely across team members
++- **Auto-refresh**: The `.bin/bun` wrapper automatically syncs secrets to `.env.local`
++- **No manual copying**: Secrets stay up-to-date with a 15-minute cache
++
++## Prerequisites
++
++- **direnv**: Required for the bun wrapper to work
++  - macOS: `brew install direnv`
++  - Ubuntu/Debian: `sudo apt install direnv`
++  - [Hook it into your shell](https://direnv.net/docs/hook.html)
+ 
+ ## Setup Steps
+ 
+-### 1. Install & Setup
++### 1. Enable the bun wrapper
++```bash
++direnv allow
++```
++This adds `.bin/` to your PATH so the Infisical sync wrapper runs automatically.
++
++### 2. Install & Login
+ ```bash
+ npm install -g @infisical/cli
+ infisical init
+ infisical login
+ # Select "US" region when prompted
+-infisical secrets  # Verify setup works
+ ```
+ 
+-### 2. Browser Login
++### 3. Browser Login
+ - Browser opens automatically to https://app.infisical.com
+-- Login with **any email** (Gmail, etc.)
+-- Fill in any **name** and **organization name** when asked
++- Login with your email
++- Select or create your organization and project
+ - Copy the token from browser and paste in terminal
+ 
+-### 3. Select Project  
+-- Use arrow keys to choose your organization
+-- Select or create a Codebuff project
+-
+-### 4. Load Environment Variables
++### 4. Load Initial Secrets
+ ```bash
+-# Load all variables at once
++# Load all variables from .env.example as a starting point
+ infisical secrets set --file .env.example
+ 
+-# IMPORTANT: Fix the database password separately
++# Fix the database password to match Docker
+ infisical secrets set DATABASE_URL=postgresql://manicode_user_local:secretpassword_local@localhost:5432/manicode_db_local
+ ```
+ 
+-### 5. Done! Run Codebuff
++### 5. Run Codebuff
+ ```bash
+-bun run dev  # Starts everything automatically
++bun run dev  # Secrets auto-sync to .env.local
+ ```
+ 
+-## Common Issues & Quick Fixes
++## How It Works
+ 
+-**Token won't paste?** → Right-click → paste  
+-**Database error?** → Run the DATABASE_URL command above  
+-**Can't navigate menus?** → Use arrow keys ↓ ↑  
++1. The `.bin/bun` wrapper checks if `.env.local` needs refreshing
++2. If stale (>15 min) or missing, it syncs from Infisical
++3. Bun then loads `.env.local` automatically
+ 
+-## That's It!
++## Common Issues
+ 
+-The `.env.example` file contains all the dummy values needed for development. Only the database password needs to be fixed to match Docker's password.
++| Problem | Solution |
++|---------|----------|
++| Token won't paste | Right-click → paste |
++| Session expired | Run `infisical login` again |
++| Can't navigate menus | Use arrow keys ↓ ↑ |
++| Infisical not working | Fall back to manual `.env.local` |
+ 
+-You will need to populate all the secrets in the Infisical UI at https://app.infisical.com. You can provide dummy values for the secrets if you get an error about missing secrets, but you will need to update them with real values in order to use the associated feature.
++## Updating Secrets
+ 
++```bash
++# Set a single secret
++infisical secrets set MY_API_KEY=abc123
++
++# Delete the local cache to force refresh
++rm .env.local
++bun run dev  # Re-syncs from Infisical
++```
+diff --git a/knowledge.md b/knowledge.md
+index bc8b3eb4e..0a284c0c4 100644
+--- a/knowledge.md
++++ b/knowledge.md
+@@ -366,33 +366,52 @@ Important constants are centralized in `common/src/constants.ts`:
+ 
+ ## Environment Variables
+ 
+-This project uses [Infisical](https://infisical.com/) for secret management. All secrets are injected at runtime.
++This project uses standard `.env.*` files for environment configuration. Bun natively loads these files automatically.
+ 
+-### Release Process
++### File Hierarchy
+ 
+-The release mechanism uses the `CODEBUFF_GITHUB_TOKEN` environment variable directly. The old complex GitHub App token generation system has been removed in favor of using a simple personal access token or the infisical-managed token.
++Bun loads `.env` files in this order (highest precedence last):
+ 
+-Environment variables are defined and validated in `packages/internal/src/env.ts`. This module provides type-safe `env` objects for use throughout the monorepo.
++1. `.env.local` - Main secrets file synced from Infisical (gitignored)
++2. `.env.development.local` - Worktree-specific overrides like ports (gitignored, highest precedence)
++
++**Note**: Bun also supports `.env` and `.env.development`, but this project only uses `.env.local` and `.env.development.local`.
++
++### Infisical Integration
++
++Infisical is used as a background sync mechanism to populate `.env.local`:
+ 
+-### Bun Wrapper Script
++- The `.bin/bun` wrapper syncs secrets from Infisical to `.env.local`
++- Caching: 15-minute TTL (configurable via `INFISICAL_CACHE_TTL`)
++- Cache invalidates when `.infisical.json` is modified or TTL expires
++- If Infisical is not set up, existing `.env.local` is used directly
+ 
+-The `.bin/bun` script automatically wraps bun commands with infisical when secrets are needed. It prevents nested infisical calls by checking for `NEXT_PUBLIC_INFISICAL_UP` environment variable, ensuring infisical runs only once at the top level while nested bun commands inherit the environment variables.
++**Setup Options**:
++1. **With Infisical**: Run `infisical login`, secrets auto-sync to `.env.local`
++2. **Without Infisical**: Copy `.env.example` to `.env.local` and fill in values
+ 
+-**Worktree Support**: The wrapper automatically detects and loads `.env.worktree` files when present, allowing worktrees to override Infisical environment variables (like ports) for local development. This enables multiple worktrees to run simultaneously on different ports without conflicts.
++### Worktree Support
+ 
+-The wrapper also loads environment variables in the correct precedence order:
++For git worktrees running on different ports:
+ 
+-1. Infisical secrets are loaded first (if needed)
+-2. `.env.worktree` is loaded second to override any conflicting variables
+-3. This ensures worktree-specific overrides (like custom ports) always take precedence over cached Infisical defaults
++- Create `.env.development.local` in the worktree with port overrides
++- Bun loads `.env.development.local` with highest precedence, so it overrides ports from `.env.local`
++- The `scripts/init-worktree.ts` script creates this file automatically
+ 
+-The wrapper looks for `.env.worktree` in the project root directory, making it work consistently regardless of the current working directory when bun commands are executed.
++### Bun Wrapper Script (`.bin/bun`)
+ 
+-**Performance Optimizations**: The wrapper uses `--silent` flag with Infisical to reduce CLI output overhead and sets `INFISICAL_DISABLE_UPDATE_CHECK=true` to skip version checks for faster startup times.
++The wrapper's role is simple: ensure `.env.local` is synced from Infisical before running bun.
+ 
+-**Infisical Caching**: The wrapper implements robust caching of environment variables in `.infisical-cache` with a 15-minute TTL (configurable via `INFISICAL_CACHE_TTL`). This reduces startup time from ~1.2s to ~0.16s (87% improvement). The cache uses `infisical export` which outputs secrets directly in `KEY='value'` format, ensuring ONLY Infisical-managed secrets are cached (no system environment variables). Multi-line secrets like RSA private keys are handled correctly using `source` command. Cache automatically invalidates when `.infisical.json` is modified or after TTL expires. Uses subshell execution to avoid changing the main shell's working directory.
++- Checks `NEXT_PUBLIC_INFISICAL_UP` to prevent nested syncs
++- Uses `INFISICAL_DISABLE_UPDATE_CHECK=true` for faster startup
++- 10-second timeout on Infisical commands to prevent hangs
++- Falls back gracefully if Infisical is not available
+ 
+-**Session Validation**: The wrapper detects expired Infisical sessions using `infisical export` with a robust 10-second timeout implementation that works cross-platform (macOS and Linux). Uses background processes with polling to prevent hanging on interactive prompts. Valid sessions output environment variables in `KEY='value'` format, while expired sessions either output interactive prompts or timeout. Provides clear error messages directing users to run `infisical login`.
++### Release Process
++
++The release mechanism uses the `CODEBUFF_GITHUB_TOKEN` environment variable directly.
++
++Environment variables are defined and validated in `packages/internal/src/env.ts`. This module provides type-safe `env` objects for use throughout the monorepo.
+ 
+ ## Python Package
+ 
+diff --git a/packages/internal/src/knowledge.md b/packages/internal/src/knowledge.md
+index a470cf904..c8924e95d 100644
+--- a/packages/internal/src/knowledge.md
++++ b/packages/internal/src/knowledge.md
+@@ -16,7 +16,7 @@ All environment variables are defined and validated in `env.ts`:
+ 
+ - Server variables: API keys, database URLs, service credentials
+ - Client variables: Public configuration values
+-- Uses Infisical for secret management in development
++- Loaded from `.env.local` (manually created or synced from Infisical)
+ 
+ ## Current Integrations
+ 
+diff --git a/scripts/cleanup-worktree.sh b/scripts/cleanup-worktree.sh
+index 7d570c744..58230f087 100755
+--- a/scripts/cleanup-worktree.sh
++++ b/scripts/cleanup-worktree.sh
+@@ -29,6 +29,13 @@ cleanup_worktree() {
+     fi
+     
+     # Clean up any worktree-specific files that might be left behind
++    if [ -f "$WORKTREE_PATH/.env.development.local" ]; then
++        rm -f "$WORKTREE_PATH/.env.development.local" 2>/dev/null || true
++    fi
++    # Also clean up legacy .env.development and .env.worktree if present
++    if [ -f "$WORKTREE_PATH/.env.development" ]; then
++        rm -f "$WORKTREE_PATH/.env.development" 2>/dev/null || true
++    fi
+     if [ -f "$WORKTREE_PATH/.env.worktree" ]; then
+         rm -f "$WORKTREE_PATH/.env.worktree" 2>/dev/null || true
+     fi
+diff --git a/scripts/init-worktree.ts b/scripts/init-worktree.ts
+index 7fcf53218..4df83b24d 100644
+--- a/scripts/init-worktree.ts
++++ b/scripts/init-worktree.ts
+@@ -206,17 +206,22 @@ async function checkGitBranchExists(branchName: string): Promise<boolean> {
+   }
+ }
+ 
+-function createEnvWorktreeFile(worktreePath: string, args: WorktreeArgs): void {
++function createEnvDevelopmentLocalFile(
++  worktreePath: string,
++  args: WorktreeArgs,
++): void {
+   const envContent = `# Worktree-specific port overrides
+ # Generated by init-worktree.ts for worktree: ${args.name}
+-PORT=${args.backendPort}
++# This file has highest precedence in Bun's .env loading order, overriding .env.local
++# PORT is used by Next.js dev server
++PORT=${args.webPort}
+ NEXT_PUBLIC_CODEBUFF_BACKEND_URL=localhost:${args.backendPort}
+ NEXT_PUBLIC_WEB_PORT=${args.webPort}
+ NEXT_PUBLIC_CODEBUFF_APP_URL=http://localhost:${args.webPort}
+ `
+ 
+-  writeFileSync(join(worktreePath, '.env.worktree'), envContent)
+-  console.log('Created .env.worktree with port configurations')
++  writeFileSync(join(worktreePath, '.env.development.local'), envContent)
++  console.log('Created .env.development.local with port configurations')
+ }
+ 
+ function copyInfisicalConfig(worktreePath: string): void {
+@@ -308,9 +313,9 @@ async function main(): Promise<void> {
+     console.log(`Web port: ${args.webPort}`)
+ 
+     // Create configuration files
+-    createEnvWorktreeFile(worktreePath, args)
++    createEnvDevelopmentLocalFile(worktreePath, args)
+     copyInfisicalConfig(worktreePath)
+-    // Note: .bin/bun wrapper now automatically loads .env.worktree
++    // Note: Bun loads .env.development.local with highest precedence, overriding .env.local
+ 
+     // Run direnv allow
+     await runDirenvAllow(worktreePath)
+diff --git a/web/package.json b/web/package.json
+index 1f2b0244f..eb319c300 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -10,7 +10,7 @@
+     }
+   },
+   "scripts": {
+-    "dev": "next dev -p ${NEXT_PUBLIC_WEB_PORT:-3000}",
++    "dev": "next dev",
+     "build": "next build 2>&1 | sed '/Contentlayer esbuild warnings:/,/^]/d' && bun run scripts/prebuild-agents-cache.ts",
+     "start": "next start",
+     "preview": "bun run build && bun run start",

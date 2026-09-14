@@ -1,0 +1,652 @@
+diff --git a/.env.example b/.env.example
+index b62d5d11e..17aba42c7 100644
+--- a/.env.example
++++ b/.env.example
+@@ -30,6 +30,7 @@ STRIPE_SUBSCRIPTION_500_PRICE_ID=price_dummy_subscription_500_id
+ # External Services
+ LINKUP_API_KEY=dummy_linkup_key
+ LOOPS_API_KEY=dummy_loops_key
++ZEROCLICK_API_KEY=dummy_zeroclick_key
+ 
+ # Discord Integration
+ DISCORD_PUBLIC_KEY=dummy_discord_public_key
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index a8bae5b03..ba35cda9e 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -177,7 +177,7 @@ export const Chat = ({
+   const { ads, recordImpression } = useGravityAd({
+     enabled: IS_FREEBUFF || !hasSubscription,
+     provider: 'gravity',
+-    fallbackProvider: 'carbon',
++    fallbackProvider: 'zeroclick',
+   })
+ 
+   // Set initial mode from CLI flag on mount
+diff --git a/cli/src/components/choice-ad-banner.tsx b/cli/src/components/choice-ad-banner.tsx
+index 3eaaebbf7..bacfa0225 100644
+--- a/cli/src/components/choice-ad-banner.tsx
++++ b/cli/src/components/choice-ad-banner.tsx
+@@ -11,7 +11,7 @@ import type { AdResponse } from '../hooks/use-gravity-ad'
+ 
+ interface ChoiceAdBannerProps {
+   ads: AdResponse[]
+-  onImpression?: (impUrl: string) => void
++  onImpression?: (ad: AdResponse) => void
+ }
+ 
+ export const CHOICE_AD_BANNER_HEIGHT = 5 // border-top + 2 lines description + spacer + cta row + border-bottom
+@@ -82,7 +82,7 @@ export const ChoiceAdBanner: React.FC<ChoiceAdBannerProps> = ({ ads, onImpressio
+   useEffect(() => {
+     if (onImpression) {
+       for (const ad of visibleAds) {
+-        onImpression(ad.impUrl)
++        onImpression(ad)
+       }
+     }
+   }, [visibleAds, onImpression])
+diff --git a/cli/src/components/waiting-room-screen.tsx b/cli/src/components/waiting-room-screen.tsx
+index a07971cab..87874a4cc 100644
+--- a/cli/src/components/waiting-room-screen.tsx
++++ b/cli/src/components/waiting-room-screen.tsx
+@@ -234,12 +234,12 @@ export const WaitingRoomScreen: React.FC<WaitingRoomScreenProps> = ({
+   // Always enable ads in the waiting room — this is where monetization lives.
+   // forceStart bypasses the "wait for first user message" gate inside the hook,
+   // which would otherwise block ads here since no conversation exists yet.
+-  // Try Gravity first, then fall back to Carbon when Gravity doesn't fill.
++  // Try Gravity first, then fall back to ZeroClick when Gravity doesn't fill.
+   const { ads, recordImpression } = useGravityAd({
+     enabled: true,
+     forceStart: true,
+     provider: 'gravity',
+-    fallbackProvider: 'carbon',
++    fallbackProvider: 'zeroclick',
+     surface: 'waiting_room',
+   })
+ 
+diff --git a/cli/src/hooks/use-gravity-ad.ts b/cli/src/hooks/use-gravity-ad.ts
+index 0a7f2e9e6..d01281786 100644
+--- a/cli/src/hooks/use-gravity-ad.ts
++++ b/cli/src/hooks/use-gravity-ad.ts
+@@ -15,6 +15,7 @@ const AD_ROTATION_INTERVAL_MS = 60 * 1000 // 60 seconds per ad
+ const MAX_ADS_AFTER_ACTIVITY = 3 // Show up to 3 ads after last activity, then pause fetching new ads
+ const ACTIVITY_THRESHOLD_MS = 30_000 // 30 seconds idle threshold for fetching new ads
+ const MAX_AD_CACHE_SIZE = 50 // Maximum number of ads to keep in cache
++const ZEROCLICK_IMPRESSIONS_URL = 'https://zeroclick.dev/api/v2/impressions'
+ 
+ // Ad response type (normalized shape across providers; credits added after impression)
+ export type AdResponse = {
+@@ -25,6 +26,8 @@ export type AdResponse = {
+   favicon: string
+   clickUrl: string
+   impUrl: string
++  provider?: AdProvider
++  impressionIds?: string[]
+   credits?: number // Set after impression is recorded (in cents)
+ }
+ 
+@@ -32,13 +35,13 @@ export type AdResponse = {
+  * Which upstream ad network to query. The server maps each provider onto the
+  * same normalized response shape, so the rest of the hook is provider-agnostic.
+  */
+-export type AdProvider = 'gravity' | 'carbon'
++export type AdProvider = 'gravity' | 'carbon' | 'zeroclick'
+ export type AdSurface = 'waiting_room'
+ 
+ export type GravityAdState = {
+   ads: AdResponse[] | null
+   isLoading: boolean
+-  recordImpression: (impUrl: string) => void
++  recordImpression: (ad: AdResponse) => void
+ }
+ 
+ // Consolidated controller state for the ad rotation logic
+@@ -52,6 +55,10 @@ type GravityController = {
+ 
+ // Pure helper: add a choice ad set to the choice cache
+ function addToChoiceCache(ctrl: GravityController, ads: AdResponse[]): void {
++  // ZeroClick offer responses must not be stored for later display. Keep them
++  // out of the rotation cache and only render them for the live request.
++  if (ads.some((ad) => ad.provider === 'zeroclick')) return
++
+   // Deduplicate by checking if any set has the same first impUrl
+   const key = ads[0]?.impUrl
+   if (key && ctrl.choiceCache.some((set) => set[0]?.impUrl === key)) return
+@@ -134,50 +141,89 @@ export const useGravityAd = (options?: {
+   shouldHideAdsRef.current = shouldHideAds
+ 
+   // Fire impression and update credits (called when showing an ad)
+-  const recordImpressionOnce = (impUrl: string): void => {
++  const recordImpressionOnce = (ad: AdResponse): void => {
+     // Don't record impressions when ads should be hidden
+     if (shouldHideAdsRef.current) return
+ 
+     const ctrl = ctrlRef.current
++    const { impUrl } = ad
+     if (ctrl.impressionsFired.has(impUrl)) return
+     ctrl.impressionsFired.add(impUrl)
+ 
+-    const authToken = getAuthToken()
+-    if (!authToken) {
+-      logger.warn('[ads] No auth token, skipping impression recording')
+-      return
+-    }
++    const recordLocalImpression = async (): Promise<void> => {
++      const authToken = getAuthToken()
++      if (!authToken) {
++        logger.warn('[ads] No auth token, skipping local impression recording')
++        return
++      }
+ 
+-    // Include mode in request - Freebuff should not grant credits (no balance concept).
+-    const agentMode = useChatStore.getState().agentMode
++      // Include mode in request - Freebuff should not grant credits (no balance concept).
++      const agentMode = useChatStore.getState().agentMode
+ 
+-    fetch(`${WEBSITE_URL}/api/v1/ads/impression`, {
+-      method: 'POST',
+-      headers: {
+-        'Content-Type': 'application/json',
+-        Authorization: `Bearer ${authToken}`,
+-      },
+-      body: JSON.stringify({ impUrl, mode: agentMode }),
+-    })
+-      .then((res) => res.json())
+-      .then((data) => {
+-        if (data.creditsGranted > 0) {
+-          logger.info(
+-            { creditsGranted: data.creditsGranted },
+-            '[ads] Ad impression credits granted',
++      const res = await fetch(`${WEBSITE_URL}/api/v1/ads/impression`, {
++        method: 'POST',
++        headers: {
++          'Content-Type': 'application/json',
++          Authorization: `Bearer ${authToken}`,
++        },
++        body: JSON.stringify({ impUrl, mode: agentMode }),
++      })
++
++      if (!res.ok) {
++        logger.debug(
++          { status: res.status },
++          '[ads] Failed to record local ad impression',
++        )
++        return
++      }
++
++      const data = await res.json()
++      if (data.creditsGranted > 0) {
++        logger.info(
++          { creditsGranted: data.creditsGranted },
++          '[ads] Ad impression credits granted',
++        )
++        // Also update credits in visible ads
++        setAds((cur) => {
++          if (!cur) return cur
++          return cur.map((a) =>
++            a.impUrl === impUrl ? { ...a, credits: data.creditsGranted } : a,
+           )
+-          // Also update credits in visible ads
+-          setAds((cur) => {
+-            if (!cur) return cur
+-            return cur.map((a) =>
+-              a.impUrl === impUrl ? { ...a, credits: data.creditsGranted } : a,
+-            )
++        })
++      }
++    }
++
++    if (ad.provider === 'zeroclick' && ad.impressionIds?.length) {
++      void (async () => {
++        try {
++          const res = await fetch(ZEROCLICK_IMPRESSIONS_URL, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ ids: ad.impressionIds }),
+           })
++
++          if (!res.ok) {
++            logger.debug(
++              { status: res.status },
++              '[ads] Failed to record ZeroClick impression',
++            )
++            return
++          }
++        } catch (err) {
++          logger.debug({ err }, '[ads] Failed to record ZeroClick impression')
++          return
+         }
+-      })
+-      .catch((err) => {
+-        logger.debug({ err }, '[ads] Failed to record ad impression')
+-      })
++
++        recordLocalImpression().catch((err) => {
++          logger.debug({ err }, '[ads] Failed to record local ad impression')
++        })
++      })()
++      return
++    }
++
++    recordLocalImpression().catch((err) => {
++      logger.debug({ err }, '[ads] Failed to record ad impression')
++    })
+   }
+ 
+   type FetchAdResult = { ads: AdResponse[] } | null
+@@ -265,7 +311,12 @@ export const useGravityAd = (options?: {
+         const data = await response.json()
+ 
+         if (Array.isArray(data.ads) && data.ads.length > 0) {
+-          return { ads: data.ads as AdResponse[] }
++          return {
++            ads: (data.ads as AdResponse[]).map((ad) => ({
++              ...ad,
++              provider: data.provider ?? providerToTry,
++            })),
++          }
+         }
+       } catch (err) {
+         logger.error(
+@@ -305,6 +356,8 @@ export const useGravityAd = (options?: {
+           if (cachedSet) {
+             ctrl.adsShownSinceActivity += 1
+             setAds(cachedSet)
++          } else {
++            setAds((cur) => (cur?.[0]?.provider === 'zeroclick' ? null : cur))
+           }
+         }
+       } finally {
+diff --git a/packages/internal/src/env-schema.ts b/packages/internal/src/env-schema.ts
+index f478663c3..8fe2e2678 100644
+--- a/packages/internal/src/env-schema.ts
++++ b/packages/internal/src/env-schema.ts
+@@ -16,6 +16,8 @@ export const serverEnvSchema = clientEnvSchema.extend({
+   CONTEXT7_API_KEY: z.string().optional(),
+   GRAVITY_API_KEY: z.string().min(1),
+   IPINFO_TOKEN: z.string().min(1),
++  // ZeroClick tenant API key used for server-side offer fallback requests.
++  ZEROCLICK_API_KEY: z.string().min(1).optional(),
+   // BuySellAds (Carbon) zone key used for the Freebuff waiting-room ad.
+   // Optional: when unset the Carbon provider returns no ad and callers fall
+   // back to their cached ads / fallback content. `CVADC53U` is the public
+@@ -98,6 +100,7 @@ export const serverProcessEnv: ServerInput = {
+   CONTEXT7_API_KEY: process.env.CONTEXT7_API_KEY,
+   GRAVITY_API_KEY: process.env.GRAVITY_API_KEY,
+   IPINFO_TOKEN: process.env.IPINFO_TOKEN,
++  ZEROCLICK_API_KEY: process.env.ZEROCLICK_API_KEY,
+   CARBON_ZONE_KEY: process.env.CARBON_ZONE_KEY,
+   PORT: process.env.PORT,
+ 
+diff --git a/web/src/app/api/v1/ads/_post.ts b/web/src/app/api/v1/ads/_post.ts
+index 370f11622..51419d8fb 100644
+--- a/web/src/app/api/v1/ads/_post.ts
++++ b/web/src/app/api/v1/ads/_post.ts
+@@ -9,6 +9,7 @@ import { requireUserFromApiKey } from '../_helpers'
+ 
+ import { createCarbonProvider } from '@/lib/ad-providers/carbon'
+ import { createGravityProvider } from '@/lib/ad-providers/gravity'
++import { createZeroClickProvider } from '@/lib/ad-providers/zeroclick'
+ 
+ import type {
+   AdProvider,
+@@ -34,7 +35,9 @@ const deviceSchema = z.object({
+   locale: z.string().optional(),
+ })
+ 
+-const providerSchema = z.enum(['gravity', 'carbon']).default('gravity')
++const providerSchema = z
++  .enum(['gravity', 'carbon', 'zeroclick'])
++  .default('gravity')
+ const surfaceSchema = z.enum(['waiting_room'])
+ 
+ const bodySchema = z.object({
+@@ -50,6 +53,7 @@ const bodySchema = z.object({
+ export type AdsEnv = {
+   GRAVITY_API_KEY: string
+   CARBON_ZONE_KEY?: string
++  ZEROCLICK_API_KEY?: string
+   CB_ENVIRONMENT: string
+ }
+ 
+@@ -126,6 +130,12 @@ export async function postAds(params: {
+       return noAdsResponse(providerId)
+     }
+     provider = createCarbonProvider({ zoneKey: serverEnv.CARBON_ZONE_KEY })
++  } else if (providerId === 'zeroclick') {
++    if (!serverEnv.ZEROCLICK_API_KEY) {
++      logger.warn('[ads] ZEROCLICK_API_KEY not configured')
++      return noAdsResponse(providerId)
++    }
++    provider = createZeroClickProvider({ apiKey: serverEnv.ZEROCLICK_API_KEY })
+   } else {
+     if (!serverEnv.GRAVITY_API_KEY) {
+       logger.warn('[ads] GRAVITY_API_KEY not configured')
+diff --git a/web/src/app/api/v1/ads/impression/_post.ts b/web/src/app/api/v1/ads/impression/_post.ts
+index 3d6e53aee..a1f3e04a3 100644
+--- a/web/src/app/api/v1/ads/impression/_post.ts
++++ b/web/src/app/api/v1/ads/impression/_post.ts
+@@ -84,13 +84,8 @@ export async function postAdImpression(params: {
+   trackEvent: TrackEventFn
+   fetch: typeof globalThis.fetch
+ }) {
+-  const {
+-    req,
+-    getUserInfoFromApiKey,
+-    loggerWithContext,
+-    trackEvent,
+-    fetch,
+-  } = params
++  const { req, getUserInfoFromApiKey, loggerWithContext, trackEvent, fetch } =
++    params
+   const baseLogger = params.logger
+ 
+   // Parse and validate request body
+@@ -179,36 +174,39 @@ export async function postAdImpression(params: {
+   }
+ 
+   // Fire the primary impression pixel plus any provider-specific extra
+-  // tracking pixels (Carbon returns these via the `pixel` field). Each extra
+-  // pixel may contain `[timestamp]` which we substitute with unix seconds.
+-  const now = Math.floor(Date.now() / 1000).toString()
+-  const extraPixels = (adRecord.extra_pixels ?? []).map((p) =>
+-    p.replaceAll('[timestamp]', now),
+-  )
+-  const pixelUrls = [impUrl, ...extraPixels]
+-
+-  await Promise.all(
+-    pixelUrls.map(async (pixelUrl) => {
+-      try {
+-        await fetch(pixelUrl)
+-      } catch (error) {
+-        logger.warn(
+-          {
+-            pixelUrl,
+-            error:
+-              error instanceof Error
+-                ? { name: error.name, message: error.message }
+-                : error,
+-          },
+-          '[ads] Failed to fire impression pixel',
+-        )
+-      }
+-    }),
+-  )
+-  logger.info(
+-    { userId, provider: adRecord.provider, pixelCount: pixelUrls.length },
+-    '[ads] Fired impression pixels',
+-  )
++  // tracking pixels (Carbon returns these via the `pixel` field). ZeroClick
++  // impressions must be reported from the client device, so the CLI handles
++  // that directly and this endpoint only records our local state.
++  if (adRecord.provider !== 'zeroclick') {
++    const now = Math.floor(Date.now() / 1000).toString()
++    const extraPixels = (adRecord.extra_pixels ?? []).map((p) =>
++      p.replaceAll('[timestamp]', now),
++    )
++    const pixelUrls = [impUrl, ...extraPixels]
++
++    await Promise.all(
++      pixelUrls.map(async (pixelUrl) => {
++        try {
++          await fetch(pixelUrl)
++        } catch (error) {
++          logger.warn(
++            {
++              pixelUrl,
++              error:
++                error instanceof Error
++                  ? { name: error.name, message: error.message }
++                  : error,
++            },
++            '[ads] Failed to fire impression pixel',
++          )
++        }
++      }),
++    )
++    logger.info(
++      { userId, provider: adRecord.provider, pixelCount: pixelUrls.length },
++      '[ads] Fired impression pixels',
++    )
++  }
+ 
+   // No credits granted for ad impressions
+   const creditsGranted = 0
+@@ -224,10 +222,7 @@ export async function postAdImpression(params: {
+       })
+       .where(eq(schema.adImpression.id, adRecord.id))
+ 
+-    logger.info(
+-      { userId, impUrl },
+-      '[ads] Updated ad impression record',
+-    )
++    logger.info({ userId, impUrl }, '[ads] Updated ad impression record')
+   } catch (error) {
+     logger.error(
+       {
+diff --git a/web/src/app/api/v1/ads/route.ts b/web/src/app/api/v1/ads/route.ts
+index 0b90fd1ee..32c86d873 100644
+--- a/web/src/app/api/v1/ads/route.ts
++++ b/web/src/app/api/v1/ads/route.ts
+@@ -19,6 +19,7 @@ export async function POST(req: NextRequest) {
+     serverEnv: {
+       GRAVITY_API_KEY: env.GRAVITY_API_KEY,
+       CARBON_ZONE_KEY: env.CARBON_ZONE_KEY,
++      ZEROCLICK_API_KEY: env.ZEROCLICK_API_KEY,
+       CB_ENVIRONMENT: env.NEXT_PUBLIC_CB_ENVIRONMENT,
+     },
+   })
+diff --git a/web/src/lib/ad-providers/types.ts b/web/src/lib/ad-providers/types.ts
+index ced439e8f..8f6558d31 100644
+--- a/web/src/lib/ad-providers/types.ts
++++ b/web/src/lib/ad-providers/types.ts
+@@ -6,7 +6,7 @@ import type { Logger } from '@codebuff/common/types/contracts/logger'
+  * shape to expect when firing impressions. Add a new id here when wiring in
+  * another provider (e.g. 'zeroclick').
+  */
+-export type AdProviderId = 'gravity' | 'carbon'
++export type AdProviderId = 'gravity' | 'carbon' | 'zeroclick'
+ 
+ /**
+  * Normalized ad shape returned by every provider. The CLI renders against
+@@ -22,6 +22,12 @@ export type NormalizedAd = {
+   clickUrl: string
+   /** Primary impression pixel URL. Fired once when the ad becomes visible. */
+   impUrl: string
++  /**
++   * Provider-specific impression ids that must be reported from the client
++   * device. ZeroClick impressions use POST /api/v2/impressions with offer ids,
++   * not a GET pixel URL.
++   */
++  impressionIds?: string[]
+   /**
+    * Additional impression pixels (e.g. Carbon's `pixel` field). Each string
+    * may contain `[timestamp]` which must be substituted at fire time.
+diff --git a/web/src/lib/ad-providers/zeroclick.ts b/web/src/lib/ad-providers/zeroclick.ts
+new file mode 100644
+index 000000000..af332cb93
+--- /dev/null
++++ b/web/src/lib/ad-providers/zeroclick.ts
+@@ -0,0 +1,182 @@
++import { createHash, randomUUID } from 'node:crypto'
++
++import type {
++  AdMessage,
++  AdProvider,
++  FetchAdInput,
++  FetchAdResult,
++  NormalizedAd,
++} from './types'
++
++const ZEROCLICK_OFFERS_URL = 'https://zeroclick.dev/api/v2/offers'
++const ZEROCLICK_CHOICE_LIMIT = 4
++const MAX_QUERY_LENGTH = 280
++
++type ZeroClickOffer = {
++  id: string
++  title: string | null
++  subtitle?: string | null
++  content: string | null
++  cta: string | null
++  clickUrl: string
++  imageUrl?: string | null
++  brand?: {
++    name?: string | null
++    url?: string | null
++    iconUrl?: string | null
++  } | null
++  product?: {
++    title?: string | null
++    category?: string | null
++    image?: string | null
++  } | null
++}
++
++function stableHash(value: string): string {
++  return createHash('sha256').update(value).digest('hex')
++}
++
++function extractLastUserMessageContent(content: string): string {
++  const regex = /<user_message>([\s\S]*?)<\/user_message>/gi
++  const matches = [...content.matchAll(regex)]
++  if (matches.length > 0) {
++    const lastMatch = matches[matches.length - 1]
++    return lastMatch[1].trim()
++  }
++  return content.trim()
++}
++
++function queryFromMessages(messages: AdMessage[]): string | null {
++  const lastUser = [...messages]
++    .reverse()
++    .find((m) => m.role === 'user' && m.content.trim())
++  if (!lastUser) return null
++
++  const query = extractLastUserMessageContent(lastUser.content)
++    .replace(/\s+/g, ' ')
++    .trim()
++  if (!query) return null
++
++  return query.length > MAX_QUERY_LENGTH
++    ? query.slice(0, MAX_QUERY_LENGTH).trim()
++    : query
++}
++
++function normalize(raw: ZeroClickOffer, servedId: string): NormalizedAd | null {
++  if (!raw.id || !raw.clickUrl) return null
++
++  const title =
++    raw.title?.trim() ||
++    raw.product?.title?.trim() ||
++    raw.brand?.name?.trim() ||
++    'Sponsored'
++  const content = [raw.subtitle, raw.content]
++    .map((part) => part?.trim())
++    .filter(Boolean)
++    .join(' ')
++
++  return {
++    adText: content || title,
++    title,
++    cta: raw.cta?.trim() || 'Learn more',
++    url: raw.brand?.url?.trim() || '',
++    favicon:
++      raw.imageUrl?.trim() ||
++      raw.product?.image?.trim() ||
++      raw.brand?.iconUrl?.trim() ||
++      '',
++    clickUrl: raw.clickUrl,
++    // Keep this URL-shaped so existing client/server validation can identify
++    // the served ad. The actual ZeroClick impression is a client-side POST using
++    // impressionIds, so do not put provider tracking IDs in this local key.
++    impUrl: `https://codebuff.com/ads/zeroclick-impression/${servedId}`,
++    impressionIds: [raw.id],
++  }
++}
++
++export function createZeroClickProvider(config: {
++  apiKey: string
++}): AdProvider {
++  return {
++    id: 'zeroclick',
++    fetchAd: async (input: FetchAdInput): Promise<FetchAdResult> => {
++      const {
++        userId,
++        sessionId,
++        clientIp,
++        userAgent,
++        device,
++        messages = [],
++        logger,
++        fetch,
++      } = input
++
++      if (!clientIp) {
++        logger.debug('[ads:zeroclick] Missing required clientIp')
++        return null
++      }
++
++      const query = queryFromMessages(messages)
++      const requestBody = {
++        method: 'server',
++        ipAddress: clientIp,
++        ...(userAgent ? { userAgent } : {}),
++        origin: 'https://codebuff.com',
++        ...(query ? { query } : {}),
++        limit: ZEROCLICK_CHOICE_LIMIT,
++        groupingId: input.surface ?? 'choice',
++        userId: `codebuff:${stableHash(userId)}`,
++        userSessionId: sessionId
++          ? `codebuff:${stableHash(sessionId)}`
++          : undefined,
++        userLocale: device?.locale,
++      }
++
++      const response = await fetch(ZEROCLICK_OFFERS_URL, {
++        method: 'POST',
++        headers: {
++          'Content-Type': 'application/json',
++          'x-zc-api-key': config.apiKey,
++        },
++        body: JSON.stringify(requestBody),
++      })
++
++      if (!response.ok) {
++        let errorBody: unknown
++        try {
++          const contentType = response.headers.get('content-type') ?? ''
++          errorBody = contentType.includes('application/json')
++            ? await response.json()
++            : await response.text()
++        } catch {
++          errorBody = 'Unable to parse error response'
++        }
++        logger.error(
++          {
++            request: { ...requestBody, ipAddress: '[redacted]' },
++            response: errorBody,
++            status: response.status,
++          },
++          '[ads:zeroclick] API returned error',
++        )
++        return null
++      }
++
++      const offers = (await response.json()) as ZeroClickOffer[] | unknown
++      if (!Array.isArray(offers) || offers.length === 0) {
++        logger.debug('[ads:zeroclick] No offers returned')
++        return null
++      }
++
++      const ads = offers
++        .map((offer) => normalize(offer, randomUUID()))
++        .filter((ad) => ad !== null)
++      if (ads.length === 0) {
++        logger.debug('[ads:zeroclick] No renderable offers returned')
++        return null
++      }
++
++      return { ads }
++    },
++  }
++}

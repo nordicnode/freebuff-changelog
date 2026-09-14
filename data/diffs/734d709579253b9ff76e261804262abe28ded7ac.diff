@@ -1,0 +1,1509 @@
+diff --git a/.github/workflows/freebuff-e2e.yml b/.github/workflows/freebuff-e2e.yml
+new file mode 100644
+index 000000000..b8df7fcea
+--- /dev/null
++++ b/.github/workflows/freebuff-e2e.yml
+@@ -0,0 +1,112 @@
++name: Freebuff E2E Tests
++
++on:
++  push:
++    branches: ['main']
++  pull_request:
++    branches: ['main']
++  workflow_dispatch: # Manual trigger
++
++concurrency:
++  group: freebuff-e2e-${{ github.ref }}
++  cancel-in-progress: true
++
++jobs:
++  build-freebuff:
++    runs-on: ubuntu-latest
++    timeout-minutes: 15
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@v6
++
++      - uses: ./.github/actions/setup-project
++
++      - name: Set environment variables
++        env:
++          SECRETS_CONTEXT: ${{ toJSON(secrets) }}
++        run: |
++          VAR_NAMES=$(bun scripts/generate-ci-env.ts --scope client)
++          echo "$SECRETS_CONTEXT" | jq -r --argjson vars "$VAR_NAMES" '
++            to_entries | .[] | select(.key as $k | $vars | index($k)) | .key + "=" + .value
++          ' >> $GITHUB_ENV
++          echo "FREEBUFF_MODE=true" >> $GITHUB_ENV
++          echo "NEXT_PUBLIC_CB_ENVIRONMENT=prod" >> $GITHUB_ENV
++          echo "CODEBUFF_GITHUB_ACTIONS=true" >> $GITHUB_ENV
++
++      - name: Build Freebuff binary
++        run: bun freebuff/cli/build.ts 0.0.0-e2e
++
++      - name: Smoke test binary
++        run: |
++          chmod +x cli/bin/freebuff
++          cli/bin/freebuff --version
++
++      - name: Upload binary
++        uses: actions/upload-artifact@v7
++        with:
++          name: freebuff-binary
++          path: cli/bin/freebuff
++          retention-days: 1
++
++  e2e:
++    needs: build-freebuff
++    runs-on: ubuntu-latest
++    timeout-minutes: 10
++    strategy:
++      fail-fast: false
++      matrix:
++        test:
++          - version
++          - startup
++          - help-command
++          - slash-commands
++          - mode-restriction
++          - ads-behavior
++          - agent-startup
++          - code-edit
++          - terminal-command
++    name: e2e-${{ matrix.test }}
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@v6
++
++      - uses: ./.github/actions/setup-project
++
++      - name: Install tmux
++        run: sudo apt-get update && sudo apt-get install -y tmux
++
++      - name: Download Freebuff binary
++        uses: actions/download-artifact@v4
++        with:
++          name: freebuff-binary
++          path: cli/bin/
++
++      - name: Make binary executable
++        run: chmod +x cli/bin/freebuff
++
++      - name: Set environment variables
++        env:
++          SECRETS_CONTEXT: ${{ toJSON(secrets) }}
++        run: |
++          VAR_NAMES=$(bun scripts/generate-ci-env.ts)
++          echo "$SECRETS_CONTEXT" | jq -r --argjson vars "$VAR_NAMES" '
++            to_entries | .[] | select(.key as $k | $vars | index($k)) | .key + "=" + .value
++          ' >> $GITHUB_ENV
++          echo "CODEBUFF_GITHUB_ACTIONS=true" >> $GITHUB_ENV
++          echo "NEXT_PUBLIC_CB_ENVIRONMENT=test" >> $GITHUB_ENV
++          echo "CODEBUFF_GITHUB_TOKEN=${{ secrets.CODEBUFF_GITHUB_TOKEN }}" >> $GITHUB_ENV
++          echo "CODEBUFF_API_KEY=${{ secrets.CODEBUFF_API_KEY }}" >> $GITHUB_ENV
++
++      - name: Build SDK
++        run: cd sdk && bun run build
++
++      - name: Run e2e test - ${{ matrix.test }}
++        run: bun test freebuff/e2e/tests/${{ matrix.test }}.e2e.test.ts --timeout=120000
++
++      - name: Upload tmux session logs on failure
++        if: failure()
++        uses: actions/upload-artifact@v7
++        with:
++          name: tmux-logs-${{ matrix.test }}
++          path: debug/tmux-sessions/
++          retention-days: 7
+diff --git a/freebuff/e2e/README.md b/freebuff/e2e/README.md
+new file mode 100644
+index 000000000..861d31f5b
+--- /dev/null
++++ b/freebuff/e2e/README.md
+@@ -0,0 +1,169 @@
++# Freebuff E2E Tests
++
++End-to-end tests for the Freebuff CLI binary. Tests verify that the compiled binary works correctly by interacting with it via tmux.
++
++## Architecture
++
++Two testing approaches are supported:
++
++### 1. Direct tmux tests (fast, deterministic)
++
++Use the `FreebuffSession` class to start the binary in tmux, send commands, capture output, and assert directly.
++
++```typescript
++import { describe, test, expect, afterEach } from 'bun:test'
++import { FreebuffSession, requireFreebuffBinary } from '../utils'
++
++describe('My Feature', () => {
++  let session: FreebuffSession | null = null
++
++  afterEach(async () => {
++    if (session) await session.stop()
++    session = null
++  })
++
++  test('works correctly', async () => {
++    const binary = requireFreebuffBinary()
++    session = await FreebuffSession.start(binary)
++
++    await session.send('/help')
++    const output = await session.capture(2)
++
++    expect(output).toContain('Shortcuts')
++  }, 60_000)
++})
++```
++
++### 2. SDK agent-driven tests (AI-powered verification)
++
++Use the Codebuff SDK to run a testing agent that interacts with Freebuff via custom tmux tools. The agent reasons about the CLI output and verifies complex behaviors.
++
++```typescript
++import { describe, test, expect, afterEach } from 'bun:test'
++import { CodebuffClient } from '@codebuff/sdk'
++import { freebuffTesterAgent } from '../agent/freebuff-tester'
++import { createFreebuffTmuxTools, requireFreebuffBinary } from '../utils'
++
++describe('Agent Test', () => {
++  let cleanup: (() => Promise<void>) | null = null
++
++  afterEach(async () => {
++    if (cleanup) await cleanup()
++    cleanup = null
++  })
++
++  test('verifies startup', async () => {
++    const apiKey = process.env.CODEBUFF_API_KEY
++    if (!apiKey) return // Skip if no API key
++
++    const binary = requireFreebuffBinary()
++    const tmuxTools = createFreebuffTmuxTools(binary)
++    cleanup = tmuxTools.cleanup
++
++    const client = new CodebuffClient({ apiKey })
++    const result = await client.run({
++      agent: freebuffTesterAgent.id,
++      prompt: 'Start Freebuff and verify the branding is correct.',
++      agentDefinitions: [freebuffTesterAgent],
++      customToolDefinitions: tmuxTools.tools,
++      handleEvent: () => {},
++    })
++
++    expect(result.output.type).not.toBe('error')
++  }, 180_000)
++})
++```
++
++## Prerequisites
++
++- **tmux** must be installed: `brew install tmux` (macOS) or `sudo apt-get install tmux` (Ubuntu)
++- **Freebuff binary** must be built: `bun freebuff/cli/build.ts 0.0.0-dev`
++- **SDK built** (for agent tests): `cd sdk && bun run build`
++- **CODEBUFF_API_KEY** (for agent tests only): Set this environment variable
++
++## Running Tests
++
++### Build the binary first
++
++```bash
++bun freebuff/cli/build.ts 0.0.0-dev
++```
++
++### Run all tests
++
++```bash
++bun test freebuff/e2e/tests/
++```
++
++### Run a specific test
++
++```bash
++bun test freebuff/e2e/tests/version.e2e.test.ts
++bun test freebuff/e2e/tests/startup.e2e.test.ts
++bun test freebuff/e2e/tests/help-command.e2e.test.ts
++bun test freebuff/e2e/tests/agent-startup.e2e.test.ts
++```
++
++### Use a custom binary path
++
++```bash
++FREEBUFF_BINARY=/path/to/freebuff bun test freebuff/e2e/tests/
++```
++
++## Adding New Tests
++
++1. Create a new file in `freebuff/e2e/tests/` with the naming convention `<feature>.e2e.test.ts`
++2. Add the test name to `.github/workflows/freebuff-e2e.yml` matrix:
++
++```yaml
++matrix:
++  test:
++    - version
++    - startup
++    - help-command
++    - agent-startup
++    - your-new-test    # <-- add here
++```
++
++3. The test will automatically run in parallel with other tests in CI.
++
++## CI Workflow
++
++The `.github/workflows/freebuff-e2e.yml` workflow:
++
++1. **Builds** the Freebuff binary once (linux-x64)
++2. **Runs each test file in parallel** via GitHub Actions matrix strategy
++3. **Uploads tmux session logs** on failure for debugging
++
++Triggers:
++- **Nightly** at 6:00 AM PT
++- **Manual** via workflow_dispatch
++
++## Utilities Reference
++
++### `FreebuffSession`
++
++| Method | Description |
++|--------|-------------|
++| `FreebuffSession.start(binaryPath)` | Start binary in tmux, returns session |
++| `session.send(text)` | Send text input (presses Enter) |
++| `session.sendKey(key)` | Send special key (e.g. `'C-c'`, `'Escape'`) |
++| `session.capture(waitSec?)` | Capture terminal output |
++| `session.captureLabeled(label, waitSec?)` | Capture and save to session logs |
++| `session.waitForText(pattern, timeoutMs?)` | Poll until text appears |
++| `session.stop()` | Stop session and clean up |
++
++### `createFreebuffTmuxTools(binaryPath)`
++
++Creates SDK custom tools for agent-driven testing:
++- `start_freebuff` - Launch the CLI
++- `send_to_freebuff` - Send text input
++- `capture_freebuff_output` - Capture terminal output
++- `stop_freebuff` - Stop and clean up
++
++### Helper functions
++
++| Function | Description |
++|----------|-------------|
++| `requireFreebuffBinary()` | Get binary path, throws if not found |
++| `getFreebuffBinaryPath()` | Get binary path (may not exist) |
+diff --git a/freebuff/e2e/agent/freebuff-tester.ts b/freebuff/e2e/agent/freebuff-tester.ts
+new file mode 100644
+index 000000000..a58d6dfb4
+--- /dev/null
++++ b/freebuff/e2e/agent/freebuff-tester.ts
+@@ -0,0 +1,52 @@
++import type { AgentDefinition } from '@codebuff/sdk'
++
++/**
++ * Agent definition for testing the Freebuff CLI via tmux.
++ *
++ * This agent is designed to be used with the custom tmux tools from
++ * `createFreebuffTmuxTools()`. It receives a testing task in its prompt
++ * and uses tmux tools to start Freebuff, interact with it, and verify behavior.
++ *
++ * Example usage:
++ * ```ts
++ * const { tools, cleanup } = createFreebuffTmuxTools(binaryPath)
++ * const result = await client.run({
++ *   agent: freebuffTesterAgent.id,
++ *   prompt: 'Start freebuff and verify the welcome screen shows Freebuff branding',
++ *   agentDefinitions: [freebuffTesterAgent],
++ *   customToolDefinitions: tools,
++ *   handleEvent: collector.handleEvent,
++ * })
++ * await cleanup()
++ * ```
++ */
++export const freebuffTesterAgent: AgentDefinition = {
++  id: 'freebuff-tester',
++  displayName: 'Freebuff E2E Tester',
++  model: 'anthropic/claude-sonnet-4.5',
++  toolNames: [
++    'start_freebuff',
++    'send_to_freebuff',
++    'capture_freebuff_output',
++    'stop_freebuff',
++  ],
++  instructionsPrompt: `You are a QA tester for the Freebuff CLI application.
++
++Your job is to verify that Freebuff behaves correctly by interacting with it
++through tmux tools. Follow these steps:
++
++1. Call start_freebuff to launch the CLI
++2. Use capture_freebuff_output (with waitSeconds) to see the terminal output
++3. Use send_to_freebuff to type commands or text
++4. Capture output again to verify behavior
++5. ALWAYS call stop_freebuff when done
++
++Key things to verify:
++- The CLI starts without errors or crashes
++- Branding shows "Freebuff" (not "Codebuff")
++- Commands work as expected
++- Error messages are user-friendly
++
++Report your findings clearly. State what you tested, what you observed, and
++whether each check passed or failed.`,
++}
+diff --git a/freebuff/e2e/tests/ads-behavior.e2e.test.ts b/freebuff/e2e/tests/ads-behavior.e2e.test.ts
+new file mode 100644
+index 000000000..1ba9fe4d4
+--- /dev/null
++++ b/freebuff/e2e/tests/ads-behavior.e2e.test.ts
+@@ -0,0 +1,79 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { FreebuffSession, requireFreebuffBinary } from '../utils'
++
++const TEST_TIMEOUT = 60_000
++
++describe('Freebuff: Ads Behavior', () => {
++  let session: FreebuffSession | null = null
++
++  afterEach(async () => {
++    if (session) {
++      await session.stop()
++      session = null
++    }
++  })
++
++  test(
++    'ads:enable command is not available',
++    async () => {
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary, { waitSeconds: 5 })
++
++      // Type "/ads" to check for ads commands in autocomplete
++      await session.send('/ads', { noEnter: true })
++      const output = await session.capture(2)
++
++      // Neither ads:enable nor ads:disable should appear
++      expect(output).not.toContain('ads:enable')
++      expect(output).not.toContain('ads:disable')
++    },
++    TEST_TIMEOUT,
++  )
++
++  test(
++    'ads:disable command is not available',
++    async () => {
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary, { waitSeconds: 5 })
++
++      // Try to send the /ads:disable command
++      await session.send('/ads:disable')
++      const output = await session.capture(3)
++
++      // The command should not be recognized
++      // It should NOT show "Ads disabled" confirmation
++      expect(output).not.toMatch(/ads disabled/i)
++    },
++    TEST_TIMEOUT,
++  )
++
++  test(
++    'does not show credits earned from ads',
++    async () => {
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary, { waitSeconds: 5 })
++      const output = await session.capture()
++
++      // In Freebuff, ads don't show "+X credits" because credits don't apply
++      // Check the startup screen doesn't mention ad credits
++      expect(output).not.toMatch(/\+\d+ credits/)
++    },
++    TEST_TIMEOUT,
++  )
++
++  test(
++    'does not show "Hide ads" option',
++    async () => {
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary, { waitSeconds: 5 })
++      const output = await session.capture()
++
++      // In Freebuff, the "Hide ads" link is not shown because ads are mandatory
++      expect(output).not.toContain('Hide ads')
++      // Also should not mention /ads:enable as a way to re-enable
++      expect(output).not.toContain('/ads:enable')
++    },
++    TEST_TIMEOUT,
++  )
++})
+diff --git a/freebuff/e2e/tests/agent-startup.e2e.test.ts b/freebuff/e2e/tests/agent-startup.e2e.test.ts
+new file mode 100644
+index 000000000..6d436758a
+--- /dev/null
++++ b/freebuff/e2e/tests/agent-startup.e2e.test.ts
+@@ -0,0 +1,122 @@
++/**
++ * Agent-driven E2E test for Freebuff.
++ *
++ * Uses the Codebuff SDK to run a testing agent that interacts with the
++ * Freebuff CLI binary via tmux custom tools. Requires CODEBUFF_API_KEY.
++ *
++ * Set CODEBUFF_API_KEY to run this test, otherwise it will be skipped.
++ */
++
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { freebuffTesterAgent } from '../agent/freebuff-tester'
++import { createFreebuffTmuxTools, requireFreebuffBinary } from '../utils'
++
++import type { CodebuffClient as CodebuffClientType } from '@codebuff/sdk'
++
++const AGENT_TEST_TIMEOUT = 180_000
++
++function getApiKey(): string | null {
++  return process.env.CODEBUFF_API_KEY ?? null
++}
++
++describe('Freebuff: Agent-driven E2E', () => {
++  let cleanup: (() => Promise<void>) | null = null
++
++  afterEach(async () => {
++    if (cleanup) {
++      await cleanup()
++      cleanup = null
++    }
++  })
++
++  test(
++    'agent can start freebuff and verify startup behavior',
++    async () => {
++      const apiKey = getApiKey()
++      if (!apiKey) {
++        console.log(
++          'Skipping agent test: CODEBUFF_API_KEY not set. ' +
++            'Set it to run agent-driven e2e tests.',
++        )
++        return
++      }
++
++      const binary = requireFreebuffBinary()
++      const tmuxTools = createFreebuffTmuxTools(binary)
++      cleanup = tmuxTools.cleanup
++
++      // Dynamically import SDK to avoid build-time dependency issues
++      const { CodebuffClient } = (await import(
++        '@codebuff/sdk'
++      )) as typeof import('@codebuff/sdk')
++
++      const client: CodebuffClientType = new CodebuffClient({ apiKey })
++
++      const events: Array<{ type: string; [key: string]: unknown }> = []
++
++      const result = await client.run({
++        agent: freebuffTesterAgent.id,
++        prompt:
++          'Start Freebuff using the start_freebuff tool. Then capture the output ' +
++          'with capture_freebuff_output (waitSeconds: 3). Verify that:\n' +
++          '1. The CLI started without errors\n' +
++          '2. The output contains "freebuff" (case-insensitive)\n' +
++          '3. The output does NOT contain "codebuff" (case-insensitive)\n' +
++          'Finally, call stop_freebuff to clean up. Report your findings.',
++        agentDefinitions: [freebuffTesterAgent],
++        customToolDefinitions: tmuxTools.tools,
++        handleEvent: (event) => {
++          events.push(event)
++        },
++      })
++
++      expect(result.output.type).not.toBe('error')
++
++      // Verify the agent used the tmux tools
++      const toolCalls = events.filter((e) => e.type === 'tool_call')
++      const toolNames = toolCalls.map((e) => e.toolName)
++      expect(toolNames).toContain('start_freebuff')
++      expect(toolNames).toContain('capture_freebuff_output')
++      expect(toolNames).toContain('stop_freebuff')
++    },
++    AGENT_TEST_TIMEOUT,
++  )
++
++  test(
++    'agent can send commands and verify output',
++    async () => {
++      const apiKey = getApiKey()
++      if (!apiKey) {
++        console.log('Skipping agent test: CODEBUFF_API_KEY not set.')
++        return
++      }
++
++      const binary = requireFreebuffBinary()
++      const tmuxTools = createFreebuffTmuxTools(binary)
++      cleanup = tmuxTools.cleanup
++
++      const { CodebuffClient } = (await import(
++        '@codebuff/sdk'
++      )) as typeof import('@codebuff/sdk')
++
++      const client: CodebuffClientType = new CodebuffClient({ apiKey })
++
++      const result = await client.run({
++        agent: freebuffTesterAgent.id,
++        prompt:
++          'Start Freebuff, wait for it to load (capture with waitSeconds: 5), ' +
++          'then send the "/help" command using send_to_freebuff. ' +
++          'Capture the output after 2 seconds. ' +
++          'Verify the help content is displayed. ' +
++          'Stop Freebuff when done and report your findings.',
++        agentDefinitions: [freebuffTesterAgent],
++        customToolDefinitions: tmuxTools.tools,
++        handleEvent: () => {},
++      })
++
++      expect(result.output.type).not.toBe('error')
++    },
++    AGENT_TEST_TIMEOUT,
++  )
++})
+diff --git a/freebuff/e2e/tests/code-edit.e2e.test.ts b/freebuff/e2e/tests/code-edit.e2e.test.ts
+new file mode 100644
+index 000000000..957ccac7f
+--- /dev/null
++++ b/freebuff/e2e/tests/code-edit.e2e.test.ts
+@@ -0,0 +1,75 @@
++/**
++ * E2E test that verifies Freebuff can perform a simple code edit.
++ *
++ * Starts Freebuff in tmux, sends a prompt asking it to add a console.log
++ * to a file, and verifies the file was modified correctly.
++ *
++ * Requires CODEBUFF_API_KEY — skipped if not set.
++ */
++
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { FreebuffSession, requireFreebuffBinary } from '../utils'
++
++const TEST_TIMEOUT = 180_000
++
++function getApiKey(): string | null {
++  return process.env.CODEBUFF_API_KEY ?? null
++}
++
++describe('Freebuff: Code Edit', () => {
++  let session: FreebuffSession | null = null
++
++  afterEach(async () => {
++    if (session) {
++      await session.stop()
++      session = null
++    }
++  })
++
++  test(
++    'adds a console.log to a file',
++    async () => {
++      if (!getApiKey()) {
++        console.log(
++          'Skipping code-edit test: CODEBUFF_API_KEY not set. ' +
++            'Set it to run code-edit e2e tests.',
++        )
++        return
++      }
++
++      const binary = requireFreebuffBinary()
++      const initialContent = [
++        'function greet(name) {',
++        "  return 'Hello, ' + name",
++        '}',
++        '',
++      ].join('\n')
++
++      // Create the file before starting freebuff so it's in the initial context
++      session = await FreebuffSession.start(binary, {
++        waitSeconds: 5,
++        initialFiles: { 'index.js': initialContent },
++      })
++
++      // Verify the file was created
++      expect(session.readFile('index.js')).toBe(initialContent)
++
++      // Send a prompt asking freebuff to add a console.log
++      await session.send("Add a console.log('hello world') to index.js")
++
++      // Wait for the file to be modified with the console.log
++      const finalContent = await session.waitForFileContent(
++        'index.js',
++        'console.log',
++        120_000,
++      )
++
++      expect(finalContent).toContain('console.log')
++      expect(finalContent).toContain('hello world')
++      // The original function should still be present
++      expect(finalContent).toContain('function greet')
++    },
++    TEST_TIMEOUT,
++  )
++})
+diff --git a/freebuff/e2e/tests/help-command.e2e.test.ts b/freebuff/e2e/tests/help-command.e2e.test.ts
+new file mode 100644
+index 000000000..173a3425b
+--- /dev/null
++++ b/freebuff/e2e/tests/help-command.e2e.test.ts
+@@ -0,0 +1,77 @@
++import { execSync } from 'child_process'
++
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { FreebuffSession, requireFreebuffBinary } from '../utils'
++
++const TEST_TIMEOUT = 60_000
++
++describe('Freebuff: --help flag', () => {
++  test('shows CLI usage information', () => {
++    const binary = requireFreebuffBinary()
++    const output = execSync(`'${binary}' --help`, {
++      encoding: 'utf-8',
++      timeout: 10_000,
++    })
++
++    // Should show the binary name
++    expect(output.toLowerCase()).toContain('freebuff')
++
++    // Should show usage info
++    expect(output).toMatch(/usage|options|commands/i)
++  })
++
++  test('does not reference Codebuff', () => {
++    const binary = requireFreebuffBinary()
++    const output = execSync(`'${binary}' --help`, {
++      encoding: 'utf-8',
++      timeout: 10_000,
++    })
++
++    // The --help output should say Freebuff, not Codebuff
++    expect(output).not.toMatch(/\bcodebuff\b/i)
++  })
++})
++
++describe('Freebuff: /help slash command', () => {
++  let session: FreebuffSession | null = null
++
++  afterEach(async () => {
++    if (session) {
++      await session.stop()
++      session = null
++    }
++  })
++
++  test(
++    'shows help content when /help is entered',
++    async () => {
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary, { waitSeconds: 5 })
++
++      await session.send('/help')
++      const output = await session.capture(2)
++
++      // Should show shortcuts section
++      expect(output).toMatch(/shortcut|ctrl|esc/i)
++    },
++    TEST_TIMEOUT,
++  )
++
++  test(
++    'does not show subscription commands in help',
++    async () => {
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary, { waitSeconds: 5 })
++
++      await session.send('/help')
++      const output = await session.capture(2)
++
++      // Freebuff should NOT show these paid/subscription commands
++      expect(output).not.toContain('/subscribe')
++      expect(output).not.toContain('/usage')
++      expect(output).not.toContain('/credits')
++    },
++    TEST_TIMEOUT,
++  )
++})
+diff --git a/freebuff/e2e/tests/slash-commands.e2e.test.ts b/freebuff/e2e/tests/slash-commands.e2e.test.ts
+new file mode 100644
+index 000000000..8631a3d4e
+--- /dev/null
++++ b/freebuff/e2e/tests/slash-commands.e2e.test.ts
+@@ -0,0 +1,107 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { FreebuffSession, requireFreebuffBinary } from '../utils'
++
++const TEST_TIMEOUT = 60_000
++
++/**
++ * Commands that should be REMOVED in Freebuff.
++ * These are stripped at build time via the FREEBUFF_REMOVED_COMMAND_IDS set
++ * in cli/src/data/slash-commands.ts.
++ */
++const REMOVED_COMMANDS = [
++  '/subscribe',
++  '/usage',
++  '/credits',
++  '/ads:enable',
++  '/ads:disable',
++  '/connect:claude',
++  '/refer-friends',
++  '/agent:gpt-5',
++  '/image',
++  '/publish',
++  '/init',
++]
++
++/**
++ * Commands that should be KEPT in Freebuff.
++ * Only includes commands reliably visible in the initial autocomplete viewport.
++ * Commands like /logout and /exit exist but may be scrolled off-screen.
++ */
++const KEPT_COMMANDS = [
++  '/help',
++  '/new',
++  '/history',
++  '/feedback',
++  '/bash',
++  '/theme:toggle',
++]
++
++describe('Freebuff: Slash Commands', () => {
++  let session: FreebuffSession | null = null
++
++  afterEach(async () => {
++    if (session) {
++      await session.stop()
++      session = null
++    }
++  })
++
++  test(
++    'slash command menu does not show removed commands',
++    async () => {
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary, { waitSeconds: 5 })
++
++      // Type "/" to trigger the slash command autocomplete menu
++      await session.send('/', { noEnter: true })
++      const output = await session.capture(2)
++
++      // Removed commands should NOT appear in the autocomplete menu
++      for (const cmd of REMOVED_COMMANDS) {
++        // Strip the leading slash for matching since the menu shows command ids
++        const cmdId = cmd.slice(1)
++        expect(output).not.toContain(cmdId)
++      }
++    },
++    TEST_TIMEOUT,
++  )
++
++  test(
++    'slash command menu shows kept commands',
++    async () => {
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary, { waitSeconds: 5 })
++
++      // Type "/" to trigger the slash command autocomplete menu
++      await session.send('/', { noEnter: true })
++      const output = await session.capture(2)
++
++      // Kept commands SHOULD appear in the autocomplete menu
++      for (const cmd of KEPT_COMMANDS) {
++        const cmdId = cmd.slice(1)
++        expect(output).toContain(cmdId)
++      }
++    },
++    TEST_TIMEOUT,
++  )
++
++  test(
++    'no mode-related slash commands are visible',
++    async () => {
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary, { waitSeconds: 5 })
++
++      // Type "/mode" to check for mode commands
++      await session.send('/mode', { noEnter: true })
++      const output = await session.capture(2)
++
++      // Mode commands should not exist in Freebuff
++      expect(output).not.toContain('mode:max')
++      expect(output).not.toContain('mode:default')
++      expect(output).not.toContain('mode:lite')
++      expect(output).not.toContain('mode:free')
++    },
++    TEST_TIMEOUT,
++  )
++})
+diff --git a/freebuff/e2e/tests/startup.e2e.test.ts b/freebuff/e2e/tests/startup.e2e.test.ts
+new file mode 100644
+index 000000000..173520bfa
+--- /dev/null
++++ b/freebuff/e2e/tests/startup.e2e.test.ts
+@@ -0,0 +1,71 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { FreebuffSession, requireFreebuffBinary } from '../utils'
++
++const STARTUP_TIMEOUT = 60_000
++
++describe('Freebuff: Startup', () => {
++  let session: FreebuffSession | null = null
++
++  afterEach(async () => {
++    if (session) {
++      await session.stop()
++      session = null
++    }
++  })
++
++  test(
++    'binary starts without crashing',
++    async () => {
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary)
++      const output = await session.capture(3)
++
++      // Should not contain fatal errors
++      expect(output).not.toContain('FATAL')
++      expect(output).not.toContain('panic')
++      expect(output).not.toContain('Segmentation fault')
++
++      // Should have some visible output (not a blank screen)
++      const nonEmptyLines = output
++        .split('\n')
++        .filter((line) => line.trim().length > 0)
++      expect(nonEmptyLines.length).toBeGreaterThan(0)
++    },
++    STARTUP_TIMEOUT,
++  )
++
++  test(
++    'shows Freebuff branding',
++    async () => {
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary)
++      const output = await session.capture(3)
++
++      // The CLI should identify itself as Freebuff, not Codebuff
++      const lowerOutput = output.toLowerCase()
++      expect(lowerOutput).toContain('freebuff')
++    },
++    STARTUP_TIMEOUT,
++  )
++
++  test(
++    'responds to Ctrl+C gracefully',
++    async () => {
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary)
++
++      // Wait for startup, then send Ctrl+C
++      await session.capture(2)
++      await session.sendKey('C-c')
++
++      // Give it a moment to process
++      const output = await session.capture(1)
++
++      // Should not show an unhandled error
++      expect(output).not.toContain('Unhandled')
++      expect(output).not.toContain('FATAL')
++    },
++    STARTUP_TIMEOUT,
++  )
++})
+diff --git a/freebuff/e2e/tests/terminal-command.e2e.test.ts b/freebuff/e2e/tests/terminal-command.e2e.test.ts
+new file mode 100644
+index 000000000..9c3486d1e
+--- /dev/null
++++ b/freebuff/e2e/tests/terminal-command.e2e.test.ts
+@@ -0,0 +1,68 @@
++/**
++ * E2E test that verifies Freebuff can run terminal commands.
++ *
++ * Starts Freebuff in tmux, sends a prompt asking it to run a shell command,
++ * and verifies the command was executed by checking its side effects.
++ *
++ * Requires CODEBUFF_API_KEY — skipped if not set.
++ */
++
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { FreebuffSession, requireFreebuffBinary } from '../utils'
++
++const TEST_TIMEOUT = 180_000
++
++function getApiKey(): string | null {
++  return process.env.CODEBUFF_API_KEY ?? null
++}
++
++describe('Freebuff: Terminal Command', () => {
++  let session: FreebuffSession | null = null
++
++  afterEach(async () => {
++    if (session) {
++      await session.stop()
++      session = null
++    }
++  })
++
++  test(
++    'runs a terminal command that creates a file',
++    async () => {
++      if (!getApiKey()) {
++        console.log(
++          'Skipping terminal-command test: CODEBUFF_API_KEY not set. ' +
++            'Set it to run terminal-command e2e tests.',
++        )
++        return
++      }
++
++      const binary = requireFreebuffBinary()
++      session = await FreebuffSession.start(binary, { waitSeconds: 5 })
++
++      // Ask freebuff to run a shell command whose output can only come from
++      // actual terminal execution (not file-writing tools)
++      await session.send(
++        'Use the terminal to run: date +%s > timestamp.txt && echo done',
++      )
++
++      // Wait for the file to be created by the terminal command
++      const content = await session.waitForFileContent(
++        'timestamp.txt',
++        '',
++        120_000,
++      )
++
++      // The file should contain a Unix timestamp (numeric string)
++      const trimmed = content.trim()
++      expect(trimmed).toMatch(/^\d{10,}$/)
++
++      // Verify the timestamp is recent (within the last 5 minutes)
++      const timestamp = parseInt(trimmed, 10)
++      const now = Math.floor(Date.now() / 1000)
++      expect(Math.abs(now - timestamp)).toBeLessThan(300)
++    },
++    TEST_TIMEOUT,
++  )
++})
+diff --git a/freebuff/e2e/tests/version.e2e.test.ts b/freebuff/e2e/tests/version.e2e.test.ts
+new file mode 100644
+index 000000000..d204bd684
+--- /dev/null
++++ b/freebuff/e2e/tests/version.e2e.test.ts
+@@ -0,0 +1,24 @@
++import { execSync } from 'child_process'
++
++import { describe, expect, test } from 'bun:test'
++
++import { requireFreebuffBinary } from '../utils'
++
++describe('Freebuff: --version', () => {
++  test('outputs a version string', () => {
++    const binary = requireFreebuffBinary()
++    const output = execSync(`'${binary}' --version`, {
++      encoding: 'utf-8',
++      timeout: 10_000,
++    }).trim()
++
++    // Should contain a semver-like version (e.g. "0.0.15" or "1.0.0")
++    expect(output).toMatch(/\d+\.\d+\.\d+/)
++  })
++
++  test('exits with code 0', () => {
++    const binary = requireFreebuffBinary()
++    // execSync throws on non-zero exit codes, so if this doesn't throw, it exited 0
++    execSync(`'${binary}' --version`, { encoding: 'utf-8', timeout: 10_000 })
++  })
++})
+diff --git a/freebuff/e2e/utils/binary-helpers.ts b/freebuff/e2e/utils/binary-helpers.ts
+new file mode 100644
+index 000000000..c233574dd
+--- /dev/null
++++ b/freebuff/e2e/utils/binary-helpers.ts
+@@ -0,0 +1,24 @@
++import { existsSync } from 'fs'
++import { dirname, resolve } from 'path'
++import { fileURLToPath } from 'url'
++
++const __dirname = dirname(fileURLToPath(import.meta.url))
++export const REPO_ROOT = resolve(__dirname, '../../..')
++
++export function getFreebuffBinaryPath(): string {
++  if (process.env.FREEBUFF_BINARY) {
++    return resolve(process.env.FREEBUFF_BINARY)
++  }
++  return resolve(REPO_ROOT, 'cli/bin/freebuff')
++}
++
++export function requireFreebuffBinary(): string {
++  const binaryPath = getFreebuffBinaryPath()
++  if (!existsSync(binaryPath)) {
++    throw new Error(
++      `Freebuff binary not found at ${binaryPath}. ` +
++        'Build with: bun freebuff/cli/build.ts <version>',
++    )
++  }
++  return binaryPath
++}
+diff --git a/freebuff/e2e/utils/freebuff-session.ts b/freebuff/e2e/utils/freebuff-session.ts
+new file mode 100644
+index 000000000..552153443
+--- /dev/null
++++ b/freebuff/e2e/utils/freebuff-session.ts
+@@ -0,0 +1,162 @@
++import fs from 'fs'
++import os from 'os'
++import path from 'path'
++
++import { tmuxCapture, tmuxSend, tmuxSendKey, tmuxStart, tmuxStop } from './tmux-helpers'
++
++export class FreebuffSession {
++  public readonly name: string
++  public readonly workDir: string
++
++  private constructor(sessionName: string, workDir: string) {
++    this.name = sessionName
++    this.workDir = workDir
++  }
++
++  /**
++   * Start a freebuff binary in a tmux session.
++   * Creates a temporary working directory to simulate a real user project.
++   */
++  static async start(
++    binaryPath: string,
++    options?: {
++      waitSeconds?: number
++      width?: number
++      height?: number
++      initialFiles?: Record<string, string>
++    },
++  ): Promise<FreebuffSession> {
++    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freebuff-e2e-'))
++
++    // Create a minimal project so freebuff has something to work with
++    fs.writeFileSync(
++      path.join(tmpDir, 'README.md'),
++      '# E2E Test Project\n',
++      'utf-8',
++    )
++
++    // Write any initial files before starting the binary
++    if (options?.initialFiles) {
++      for (const [relativePath, content] of Object.entries(options.initialFiles)) {
++        const filePath = path.join(tmpDir, relativePath)
++        const dir = path.dirname(filePath)
++        if (!fs.existsSync(dir)) {
++          fs.mkdirSync(dir, { recursive: true })
++        }
++        fs.writeFileSync(filePath, content, 'utf-8')
++      }
++    }
++
++    const command = `cd '${tmpDir}' && '${binaryPath}'`
++    const sessionName = tmuxStart({
++      command,
++      waitSeconds: options?.waitSeconds ?? 4,
++      width: options?.width ?? 120,
++      height: options?.height ?? 30,
++    })
++
++    return new FreebuffSession(sessionName, tmpDir)
++  }
++
++  /** Write a file into the session's working directory. */
++  writeFile(relativePath: string, content: string): void {
++    const filePath = path.join(this.workDir, relativePath)
++    const dir = path.dirname(filePath)
++    if (!fs.existsSync(dir)) {
++      fs.mkdirSync(dir, { recursive: true })
++    }
++    fs.writeFileSync(filePath, content, 'utf-8')
++  }
++
++  /** Read a file from the session's working directory. */
++  readFile(relativePath: string): string {
++    return fs.readFileSync(path.join(this.workDir, relativePath), 'utf-8')
++  }
++
++  /** Check if a file exists in the session's working directory. */
++  fileExists(relativePath: string): boolean {
++    return fs.existsSync(path.join(this.workDir, relativePath))
++  }
++
++  /**
++   * Poll until a file in the working directory contains the given text.
++   * Throws if the timeout is exceeded.
++   */
++  async waitForFileContent(
++    relativePath: string,
++    pattern: string,
++    timeoutMs = 60_000,
++  ): Promise<string> {
++    const start = Date.now()
++    while (Date.now() - start < timeoutMs) {
++      try {
++        const content = this.readFile(relativePath)
++        if (content.includes(pattern)) return content
++      } catch {
++        // File may not exist yet
++      }
++      await new Promise((resolve) => setTimeout(resolve, 1_000))
++    }
++    let finalContent = '(file does not exist)'
++    try {
++      finalContent = this.readFile(relativePath)
++    } catch {
++      // ignore
++    }
++    throw new Error(
++      `Timed out after ${timeoutMs}ms waiting for "${pattern}" in ${relativePath}.\n` +
++        `Last content:\n${finalContent}`,
++    )
++  }
++
++  /** Send text input to the freebuff CLI (presses Enter by default). */
++  async send(
++    text: string,
++    options?: { noEnter?: boolean; waitIdle?: number },
++  ): Promise<void> {
++    tmuxSend(this.name, text, { ...options, force: true })
++  }
++
++  /** Send a special key (e.g. Escape, C-c, Enter). */
++  async sendKey(key: string): Promise<void> {
++    tmuxSendKey(this.name, key)
++  }
++
++  /** Capture current terminal output, optionally waiting first. */
++  async capture(waitSeconds?: number): Promise<string> {
++    return tmuxCapture(this.name, { waitSeconds, noSave: true })
++  }
++
++  /** Capture and auto-save to the session logs directory with a label. */
++  async captureLabeled(label: string, waitSeconds?: number): Promise<string> {
++    return tmuxCapture(this.name, { waitSeconds, label })
++  }
++
++  /**
++   * Poll until the terminal output contains the given text.
++   * Throws if the timeout is exceeded.
++   */
++  async waitForText(pattern: string, timeoutMs = 30_000): Promise<string> {
++    const start = Date.now()
++    while (Date.now() - start < timeoutMs) {
++      const output = await this.capture()
++      if (output.includes(pattern)) return output
++      await new Promise((resolve) => setTimeout(resolve, 500))
++    }
++    const finalOutput = await this.capture()
++    throw new Error(
++      `Timed out after ${timeoutMs}ms waiting for "${pattern}".\n` +
++        `Last output:\n${finalOutput}`,
++    )
++  }
++
++  /** Stop the tmux session and clean up the temp directory. */
++  async stop(): Promise<void> {
++    tmuxStop(this.name)
++    try {
++      fs.rmSync(this.workDir, { recursive: true, force: true })
++    } catch {
++      // Ignore cleanup errors
++    }
++  }
++}
+diff --git a/freebuff/e2e/utils/index.ts b/freebuff/e2e/utils/index.ts
+new file mode 100644
+index 000000000..6927a4abd
+--- /dev/null
++++ b/freebuff/e2e/utils/index.ts
+@@ -0,0 +1,10 @@
++export { getFreebuffBinaryPath, requireFreebuffBinary, REPO_ROOT } from './binary-helpers'
++export { FreebuffSession } from './freebuff-session'
++export { createFreebuffTmuxTools } from './tmux-custom-tools'
++export {
++  tmuxStart,
++  tmuxSend,
++  tmuxSendKey,
++  tmuxCapture,
++  tmuxStop,
++} from './tmux-helpers'
+diff --git a/freebuff/e2e/utils/tmux-custom-tools.ts b/freebuff/e2e/utils/tmux-custom-tools.ts
+new file mode 100644
+index 000000000..92af61893
+--- /dev/null
++++ b/freebuff/e2e/utils/tmux-custom-tools.ts
+@@ -0,0 +1,155 @@
++import { z } from 'zod/v4'
++
++import { FreebuffSession } from './freebuff-session'
++
++import type { ZodType } from 'zod/v4'
++
++interface FreebuffToolDefinition {
++  toolName: string
++  description: string
++  inputSchema: ZodType
++  endsAgentStep: boolean
++  exampleInputs: Record<string, unknown>[]
++  execute: (input: Record<string, unknown>) => Promise<ToolOutput>
++}
++
++type ToolOutput = { type: 'json'; value: Record<string, unknown> }[]
++
++/**
++ * Creates custom tool definitions that allow a Codebuff SDK agent
++ * to interact with a Freebuff CLI binary via tmux.
++ *
++ * Returns the tools array and a cleanup function to call in afterEach.
++ *
++ * Usage:
++ * ```ts
++ * const { tools, cleanup } = createFreebuffTmuxTools(binaryPath)
++ * // ... pass tools to client.run({ customToolDefinitions: tools })
++ * // ... in afterEach: await cleanup()
++ * ```
++ */
++export function createFreebuffTmuxTools(binaryPath: string): {
++  tools: FreebuffToolDefinition[]
++  cleanup: () => Promise<void>
++} {
++  let session: FreebuffSession | null = null
++
++  const startTool: FreebuffToolDefinition = {
++    toolName: 'start_freebuff',
++    description:
++      'Start the Freebuff CLI binary in a tmux terminal session. Call this first before interacting with Freebuff.',
++    inputSchema: z.object({}),
++    endsAgentStep: true,
++    exampleInputs: [{}],
++    execute: async (): Promise<ToolOutput> => {
++      if (session) {
++        return [
++          {
++            type: 'json',
++            value: {
++              error: 'Session already running',
++              sessionName: session.name,
++            },
++          },
++        ]
++      }
++      session = await FreebuffSession.start(binaryPath)
++      const initialOutput = await session.capture(2)
++      return [
++        {
++          type: 'json',
++          value: {
++            started: true,
++            sessionName: session.name,
++            initialOutput,
++          },
++        },
++      ]
++    },
++  }
++
++  const sendInputTool: FreebuffToolDefinition = {
++    toolName: 'send_to_freebuff',
++    description:
++      'Send text input to the running Freebuff CLI. The text is sent as if typed by the user and Enter is pressed.',
++    inputSchema: z.object({
++      text: z.string().describe('Text to send to Freebuff'),
++    }),
++    endsAgentStep: false,
++    exampleInputs: [{ text: '/help' }],
++    execute: async (input): Promise<ToolOutput> => {
++      const text = (input as { text: string }).text
++      if (!session) {
++        return [
++          {
++            type: 'json',
++            value: { error: 'No session running. Call start_freebuff first.' },
++          },
++        ]
++      }
++      await session.send(text)
++      return [{ type: 'json', value: { sent: true, text } }]
++    },
++  }
++
++  const captureOutputTool: FreebuffToolDefinition = {
++    toolName: 'capture_freebuff_output',
++    description:
++      'Capture the current terminal output from the running Freebuff CLI session. ' +
++      'Use waitSeconds to wait before capturing (useful after sending a command).',
++    inputSchema: z.object({
++      waitSeconds: z
++        .number()
++        .optional()
++        .describe('Seconds to wait before capturing (default: 0)'),
++    }),
++    endsAgentStep: true,
++    exampleInputs: [{ waitSeconds: 2 }],
++    execute: async (input): Promise<ToolOutput> => {
++      const waitSeconds = (input as { waitSeconds?: number }).waitSeconds
++      if (!session) {
++        return [
++          {
++            type: 'json',
++            value: { error: 'No session running. Call start_freebuff first.' },
++          },
++        ]
++      }
++      const output = await session.capture(waitSeconds)
++      return [{ type: 'json', value: { output } }]
++    },
++  }
++
++  const stopTool: FreebuffToolDefinition = {
++    toolName: 'stop_freebuff',
++    description:
++      'Stop the running Freebuff CLI session and clean up resources. Always call this when done testing.',
++    inputSchema: z.object({}),
++    endsAgentStep: true,
++    exampleInputs: [{}],
++    execute: async (): Promise<ToolOutput> => {
++      if (!session) {
++        return [
++          { type: 'json', value: { stopped: true, wasRunning: false } },
++        ]
++      }
++      await session.stop()
++      session = null
++      return [
++        { type: 'json', value: { stopped: true, wasRunning: true } },
++      ]
++    },
++  }
++
++  const cleanup = async () => {
++    if (session) {
++      await session.stop()
++      session = null
++    }
++  }
++
++  return {
++    tools: [startTool, sendInputTool, captureOutputTool, stopTool],
++    cleanup,
++  }
++}
+diff --git a/freebuff/e2e/utils/tmux-helpers.ts b/freebuff/e2e/utils/tmux-helpers.ts
+new file mode 100644
+index 000000000..40999a336
+--- /dev/null
++++ b/freebuff/e2e/utils/tmux-helpers.ts
+@@ -0,0 +1,83 @@
++import { execFileSync } from 'child_process'
++
++import { REPO_ROOT } from './binary-helpers'
++
++const SCRIPTS_DIR = `${REPO_ROOT}/scripts/tmux`
++
++const EXEC_OPTIONS = { encoding: 'utf-8' as const, cwd: REPO_ROOT }
++
++export interface TmuxStartOptions {
++  command: string
++  name?: string
++  width?: number
++  height?: number
++  waitSeconds?: number
++}
++
++export function tmuxStart(options: TmuxStartOptions): string {
++  const args: string[] = [
++    `${SCRIPTS_DIR}/tmux-start.sh`,
++    '--command',
++    options.command,
++    '--plain',
++  ]
++  if (options.name) args.push('--name', options.name)
++  if (options.width) args.push('--width', String(options.width))
++  if (options.height) args.push('--height', String(options.height))
++  if (options.waitSeconds !== undefined)
++    args.push('--wait', String(options.waitSeconds))
++
++  return execFileSync('bash', args, EXEC_OPTIONS).trim()
++}
++
++export function tmuxSend(
++  sessionName: string,
++  text: string,
++  options?: { noEnter?: boolean; waitIdle?: number; force?: boolean },
++): void {
++  const args: string[] = [
++    `${SCRIPTS_DIR}/tmux-send.sh`,
++    sessionName,
++    text,
++  ]
++  if (options?.noEnter) args.push('--no-enter')
++  if (options?.waitIdle) args.push('--wait-idle', String(options.waitIdle))
++  if (options?.force) args.push('--force')
++
++  execFileSync('bash', args, EXEC_OPTIONS)
++}
++
++export function tmuxSendKey(sessionName: string, key: string): void {
++  execFileSync(
++    'bash',
++    [`${SCRIPTS_DIR}/tmux-send.sh`, sessionName, '--key', key],
++    EXEC_OPTIONS,
++  )
++}
++
++export function tmuxCapture(
++  sessionName: string,
++  options?: { waitSeconds?: number; label?: string; noSave?: boolean },
++): string {
++  const args: string[] = [`${SCRIPTS_DIR}/tmux-capture.sh`, sessionName]
++  if (options?.waitSeconds) args.push('--wait', String(options.waitSeconds))
++  if (options?.label) args.push('--label', options.label)
++  if (options?.noSave) args.push('--no-save')
++
++  return execFileSync('bash', args, {
++    ...EXEC_OPTIONS,
++    stdio: ['pipe', 'pipe', 'pipe'],
++  })
++}
++
++export function tmuxStop(sessionName: string): void {
++  try {
++    execFileSync(
++      'bash',
++      [`${SCRIPTS_DIR}/tmux-stop.sh`, sessionName],
++      EXEC_OPTIONS,
++    )
++  } catch {
++    // tmux-stop.sh is idempotent; ignore errors if session already gone
++  }
++}
+diff --git a/freebuff/package.json b/freebuff/package.json
+index 286a86379..03fb9d35e 100644
+--- a/freebuff/package.json
++++ b/freebuff/package.json
+@@ -3,6 +3,17 @@
+   "version": "1.0.0",
+   "private": true,
+   "scripts": {
+-    "release": "bun cli/release.ts"
++    "release": "bun cli/release.ts",
++    "build:binary": "bun cli/build.ts 0.0.0-dev",
++    "e2e": "bun test e2e/tests/",
++    "e2e:version": "bun test e2e/tests/version.e2e.test.ts",
++    "e2e:startup": "bun test e2e/tests/startup.e2e.test.ts",
++    "e2e:help": "bun test e2e/tests/help-command.e2e.test.ts",
++    "e2e:slash-commands": "bun test e2e/tests/slash-commands.e2e.test.ts",
++    "e2e:mode": "bun test e2e/tests/mode-restriction.e2e.test.ts",
++    "e2e:ads": "bun test e2e/tests/ads-behavior.e2e.test.ts",
++    "e2e:agent": "bun test e2e/tests/agent-startup.e2e.test.ts",
++    "e2e:code-edit": "bun test e2e/tests/code-edit.e2e.test.ts",
++    "e2e:terminal-command": "bun test e2e/tests/terminal-command.e2e.test.ts"
+   }
+ }

@@ -1,0 +1,1597 @@
+diff --git a/cli/src/app.tsx b/cli/src/app.tsx
+index 0661d7d3c..cac6e20ec 100644
+--- a/cli/src/app.tsx
++++ b/cli/src/app.tsx
+@@ -380,6 +380,7 @@ const AuthedSurface = ({
+   //   'queued' → waiting our turn
+   //   'country_blocked' → terminal region-gate message
+   //   'banned' → terminal account-banned message
++  //   'rate_limited' → hit per-model session quota; terminal for this run
+   //
+   // 'ended' deliberately falls through to <Chat>: the agent may still be
+   // finishing work under the server-side grace period, and the chat surface
+@@ -390,7 +391,8 @@ const AuthedSurface = ({
+       session.status === 'queued' ||
+       session.status === 'none' ||
+       session.status === 'country_blocked' ||
+-      session.status === 'banned')
++      session.status === 'banned' ||
++      session.status === 'rate_limited')
+   ) {
+     return <WaitingRoomScreen session={session} error={sessionError} />
+   }
+diff --git a/cli/src/components/waiting-room-screen.tsx b/cli/src/components/waiting-room-screen.tsx
+index 251ca87c0..9e97318c7 100644
+--- a/cli/src/components/waiting-room-screen.tsx
++++ b/cli/src/components/waiting-room-screen.tsx
+@@ -43,6 +43,18 @@ const formatElapsed = (ms: number): string => {
+   return `${minutes}m ${seconds.toString().padStart(2, '0')}s`
+ }
+ 
++/** "in ~3h 20m" / "in ~45 min" / "in under a minute". Used on the
++ *  rate-limited screen so users know when they can try again. */
++const formatRetryAfter = (ms: number): string => {
++  if (!Number.isFinite(ms) || ms <= 0) return 'any moment now'
++  const minutes = Math.round(ms / 60_000)
++  if (minutes < 1) return 'under a minute'
++  if (minutes < 60) return `${minutes} min`
++  const hours = Math.floor(minutes / 60)
++  const rem = minutes % 60
++  return rem === 0 ? `${hours}h` : `${hours}h ${rem}m`
++}
++
+ export const WaitingRoomScreen: React.FC<WaitingRoomScreenProps> = ({
+   session,
+   error,
+@@ -216,6 +228,18 @@ export const WaitingRoomScreen: React.FC<WaitingRoomScreenProps> = ({
+                   <span>Elapsed  </span>
+                   {formatElapsed(elapsedMs)}
+                 </text>
++                {/* Per-model session quota (e.g. GLM 5.1 caps at 5/20h). Only
++                    rendered for rate-limited models so the Minimax queue stays
++                    clutter-free. */}
++                {session.rateLimit && (
++                  <text style={{ fg: theme.muted, alignSelf: 'flex-start' }}>
++                    <span>Sessions </span>
++                    <span fg={theme.foreground}>
++                      {session.rateLimit.recentCount} / {session.rateLimit.limit}
++                    </span>
++                    <span> used in last {session.rateLimit.windowHours}h</span>
++                  </text>
++                )}
+               </box>
+             </>
+           )}
+@@ -258,6 +282,29 @@ export const WaitingRoomScreen: React.FC<WaitingRoomScreenProps> = ({
+               </text>
+             </>
+           )}
++
++          {/* Per-model session quota exhausted (e.g. 5+ GLM sessions in the
++              last 20h). Terminal for this run — the user can exit and come
++              back once the oldest session in the window rolls off. */}
++          {session?.status === 'rate_limited' && (
++            <>
++              <text style={{ fg: theme.secondary, marginBottom: 1 }}>
++                ⚠ Session limit reached
++              </text>
++              <text style={{ fg: theme.muted, wrapMode: 'word' }}>
++                You've used{' '}
++                <span fg={theme.foreground}>
++                  {session.recentCount} of {session.limit}
++                </span>{' '}
++                hour-long sessions on {session.model} in the last{' '}
++                {session.windowHours}h. Try again in{' '}
++                <span fg={theme.foreground}>
++                  {formatRetryAfter(session.retryAfterMs)}
++                </span>
++                . Press Ctrl+C to exit.
++              </text>
++            </>
++          )}
+         </box>
+       </box>
+ 
+diff --git a/cli/src/hooks/use-freebuff-session.ts b/cli/src/hooks/use-freebuff-session.ts
+index f24fba7b3..7bc0fc5af 100644
+--- a/cli/src/hooks/use-freebuff-session.ts
++++ b/cli/src/hooks/use-freebuff-session.ts
+@@ -91,6 +91,19 @@ async function callSession(
+       return body
+     }
+   }
++  // 429 from POST is the per-model session-quota reject (e.g. too many GLM
++  // sessions in the last 20h). Terminal for the current poll — the CLI shows
++  // a screen explaining the limit and when the user can try again. The 429
++  // status (rather than 200) keeps older CLIs in their error path so they
++  // back off instead of tight-polling an unrecognized 200 body.
++  if (resp.status === 429 && method === 'POST') {
++    const body = (await resp.json().catch(() => null)) as
++      | FreebuffSessionResponse
++      | null
++    if (body && body.status === 'rate_limited') {
++      return body
++    }
++  }
+   if (!resp.ok) {
+     const text = await resp.text().catch(() => '')
+     throw new Error(
+@@ -124,6 +137,7 @@ function nextDelayMs(next: FreebuffSessionResponse): number | null {
+     case 'country_blocked':
+     case 'banned':
+     case 'model_locked':
++    case 'rate_limited':
+     case 'model_unavailable':
+       return null
+   }
+diff --git a/common/src/types/freebuff-session.ts b/common/src/types/freebuff-session.ts
+index d141000a4..7789c91f2 100644
+--- a/common/src/types/freebuff-session.ts
++++ b/common/src/types/freebuff-session.ts
+@@ -5,6 +5,22 @@
+  *
+  * The CLI uses these shapes directly; there are no client-only states.
+  */
++
++/**
++ * Per-model usage counter surfaced to the CLI so the waiting-room UI can
++ * render "N of M sessions used" alongside queue/active state. Present when
++ * the joined model has a rate limit applied (today: GLM 5.1 with 5 admits
++ * per 20-hour window). `recentCount` is the number of admissions inside
++ * `windowHours` at the time the response was produced — see also the
++ * standalone `rate_limited` status for the reject path.
++ */
++export interface FreebuffSessionRateLimit {
++  model: string
++  limit: number
++  windowHours: number
++  recentCount: number
++}
++
+ export type FreebuffSessionServerResponse =
+   | {
+       /** Waiting room is globally off; free-mode requests flow through
+@@ -38,6 +54,10 @@ export type FreebuffSessionServerResponse =
+       queueDepthByModel: Record<string, number>
+       estimatedWaitMs: number
+       queuedAt: string
++      /** Rate-limit quota for rate-limited models (GLM 5.1 today). Absent
++       *  for unlimited models or when the status was produced outside the
++       *  rate-limit check path (e.g. pure read via GET). */
++      rateLimit?: FreebuffSessionRateLimit
+     }
+   | {
+       status: 'active'
+@@ -47,6 +67,10 @@ export type FreebuffSessionServerResponse =
+       admittedAt: string
+       expiresAt: string
+       remainingMs: number
++      /** Rate-limit quota for rate-limited models (GLM 5.1 today). Absent
++       *  for unlimited models or when the status was produced outside the
++       *  rate-limit check path (e.g. pure read via GET). */
++      rateLimit?: FreebuffSessionRateLimit
+     }
+   | {
+       /** Session is over. While `instanceId` is present we're inside the
+@@ -105,3 +129,24 @@ export type FreebuffSessionServerResponse =
+        *  stops polling and shows a banned message. */
+       status: 'banned'
+     }
++  | {
++      /** User has used up their per-model admission quota in the rolling
++       *  window (GLM 5.1: 5 one-hour sessions per 20h). Returned from POST
++       *  /session before the user is placed in the queue. `retryAfterMs` is
++       *  the time until the oldest admission inside the window falls off
++       *  and one quota slot opens up — clients should show the user when
++       *  they can try again. Terminal for the CLI's current poll session;
++       *  the user can exit and come back later. */
++      status: 'rate_limited'
++      /** The freebuff model the user tried to join. */
++      model: string
++      /** Max admissions permitted per window (e.g. 5). */
++      limit: number
++      /** Rolling window size in hours (e.g. 20). */
++      windowHours: number
++      /** Admission count inside the window at check time — will be ≥ limit. */
++      recentCount: number
++      /** Milliseconds from now until the oldest admission in the window
++       *  exits and the user regains one quota slot. */
++      retryAfterMs: number
++    }
+diff --git a/packages/internal/src/db/migrations/0046_cloudy_firedrake.sql b/packages/internal/src/db/migrations/0046_cloudy_firedrake.sql
+new file mode 100644
+index 000000000..53a24ec98
+--- /dev/null
++++ b/packages/internal/src/db/migrations/0046_cloudy_firedrake.sql
+@@ -0,0 +1,9 @@
++CREATE TABLE "free_session_admit" (
++	"id" text PRIMARY KEY NOT NULL,
++	"user_id" text NOT NULL,
++	"model" text NOT NULL,
++	"admitted_at" timestamp with time zone DEFAULT now() NOT NULL
++);
++--> statement-breakpoint
++ALTER TABLE "free_session_admit" ADD CONSTRAINT "free_session_admit_user_id_user_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."user"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
++CREATE INDEX "idx_free_session_admit_user_model_time" ON "free_session_admit" USING btree ("user_id","model","admitted_at");
+\ No newline at end of file
+diff --git a/packages/internal/src/db/migrations/meta/0046_snapshot.json b/packages/internal/src/db/migrations/meta/0046_snapshot.json
+new file mode 100644
+index 000000000..48747dd94
+--- /dev/null
++++ b/packages/internal/src/db/migrations/meta/0046_snapshot.json
+@@ -0,0 +1,3307 @@
++{
++  "id": "3bf6a16c-2fd6-4c9d-a395-f4ca2c080a3c",
++  "prevId": "76196ef1-2384-4edd-b832-c9ff8085d809",
++  "version": "7",
++  "dialect": "postgresql",
++  "tables": {
++    "public.account": {
++      "name": "account",
++      "schema": "",
++      "columns": {
++        "userId": {
++          "name": "userId",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "type": {
++          "name": "type",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "provider": {
++          "name": "provider",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "providerAccountId": {
++          "name": "providerAccountId",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "refresh_token": {
++          "name": "refresh_token",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "access_token": {
++          "name": "access_token",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "token_type": {
++          "name": "token_type",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "scope": {
++          "name": "scope",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "id_token": {
++          "name": "id_token",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "session_state": {
++          "name": "session_state",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {
++        "account_userId_user_id_fk": {
++          "name": "account_userId_user_id_fk",
++          "tableFrom": "account",
++          "tableTo": "user",
++          "columnsFrom": [
++            "userId"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {
++        "account_provider_providerAccountId_pk": {
++          "name": "account_provider_providerAccountId_pk",
++          "columns": [
++            "provider",
++            "providerAccountId"
++          ]
++        }
++      },
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.ad_impression": {
++      "name": "ad_impression",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "provider": {
++          "name": "provider",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'gravity'"
++        },
++        "ad_text": {
++          "name": "ad_text",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "title": {
++          "name": "title",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "cta": {
++          "name": "cta",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "''"
++        },
++        "url": {
++          "name": "url",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "favicon": {
++          "name": "favicon",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "click_url": {
++          "name": "click_url",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "imp_url": {
++          "name": "imp_url",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "extra_pixels": {
++          "name": "extra_pixels",
++          "type": "text[]",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "payout": {
++          "name": "payout",
++          "type": "numeric(10, 6)",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "credits_granted": {
++          "name": "credits_granted",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "grant_operation_id": {
++          "name": "grant_operation_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "served_at": {
++          "name": "served_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "impression_fired_at": {
++          "name": "impression_fired_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "clicked_at": {
++          "name": "clicked_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        }
++      },
++      "indexes": {
++        "idx_ad_impression_user": {
++          "name": "idx_ad_impression_user",
++          "columns": [
++            {
++              "expression": "user_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "served_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_ad_impression_imp_url": {
++          "name": "idx_ad_impression_imp_url",
++          "columns": [
++            {
++              "expression": "imp_url",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "ad_impression_user_id_user_id_fk": {
++          "name": "ad_impression_user_id_user_id_fk",
++          "tableFrom": "ad_impression",
++          "tableTo": "user",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {
++        "ad_impression_imp_url_unique": {
++          "name": "ad_impression_imp_url_unique",
++          "nullsNotDistinct": false,
++          "columns": [
++            "imp_url"
++          ]
++        }
++      },
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.agent_config": {
++      "name": "agent_config",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "version": {
++          "name": "version",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "publisher_id": {
++          "name": "publisher_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "major": {
++          "name": "major",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "generated": {
++            "as": "CAST(SPLIT_PART(\"agent_config\".\"version\", '.', 1) AS INTEGER)",
++            "type": "stored"
++          }
++        },
++        "minor": {
++          "name": "minor",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "generated": {
++            "as": "CAST(SPLIT_PART(\"agent_config\".\"version\", '.', 2) AS INTEGER)",
++            "type": "stored"
++          }
++        },
++        "patch": {
++          "name": "patch",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "generated": {
++            "as": "CAST(SPLIT_PART(\"agent_config\".\"version\", '.', 3) AS INTEGER)",
++            "type": "stored"
++          }
++        },
++        "data": {
++          "name": "data",
++          "type": "jsonb",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "updated_at": {
++          "name": "updated_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        }
++      },
++      "indexes": {
++        "idx_agent_config_publisher": {
++          "name": "idx_agent_config_publisher",
++          "columns": [
++            {
++              "expression": "publisher_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "agent_config_publisher_id_publisher_id_fk": {
++          "name": "agent_config_publisher_id_publisher_id_fk",
++          "tableFrom": "agent_config",
++          "tableTo": "publisher",
++          "columnsFrom": [
++            "publisher_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "no action",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {
++        "agent_config_publisher_id_id_version_pk": {
++          "name": "agent_config_publisher_id_id_version_pk",
++          "columns": [
++            "publisher_id",
++            "id",
++            "version"
++          ]
++        }
++      },
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.agent_run": {
++      "name": "agent_run",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "agent_id": {
++          "name": "agent_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "publisher_id": {
++          "name": "publisher_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "generated": {
++            "as": "CASE\n             WHEN agent_id ~ '^[^/@]+/[^/@]+@[^/@]+$'\n               THEN split_part(agent_id, '/', 1)\n             ELSE NULL\n           END",
++            "type": "stored"
++          }
++        },
++        "agent_name": {
++          "name": "agent_name",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "generated": {
++            "as": "CASE\n             WHEN agent_id ~ '^[^/@]+/[^/@]+@[^/@]+$'\n               THEN split_part(split_part(agent_id, '/', 2), '@', 1)\n             ELSE agent_id\n           END",
++            "type": "stored"
++          }
++        },
++        "agent_version": {
++          "name": "agent_version",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "generated": {
++            "as": "CASE\n             WHEN agent_id ~ '^[^/@]+/[^/@]+@[^/@]+$'\n               THEN split_part(agent_id, '@', 2)\n             ELSE NULL\n           END",
++            "type": "stored"
++          }
++        },
++        "ancestor_run_ids": {
++          "name": "ancestor_run_ids",
++          "type": "text[]",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "root_run_id": {
++          "name": "root_run_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "generated": {
++            "as": "CASE WHEN array_length(ancestor_run_ids, 1) >= 1 THEN ancestor_run_ids[1] ELSE id END",
++            "type": "stored"
++          }
++        },
++        "parent_run_id": {
++          "name": "parent_run_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false,
++          "generated": {
++            "as": "CASE WHEN array_length(ancestor_run_ids, 1) >= 1 THEN ancestor_run_ids[array_length(ancestor_run_ids, 1)] ELSE NULL END",
++            "type": "stored"
++          }
++        },
++        "depth": {
++          "name": "depth",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "generated": {
++            "as": "COALESCE(array_length(ancestor_run_ids, 1), 1)",
++            "type": "stored"
++          }
++        },
++        "duration_ms": {
++          "name": "duration_ms",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "generated": {
++            "as": "CASE WHEN completed_at IS NOT NULL THEN EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000 ELSE NULL END::integer",
++            "type": "stored"
++          }
++        },
++        "total_steps": {
++          "name": "total_steps",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "default": 0
++        },
++        "direct_credits": {
++          "name": "direct_credits",
++          "type": "numeric(10, 6)",
++          "primaryKey": false,
++          "notNull": false,
++          "default": "'0'"
++        },
++        "total_credits": {
++          "name": "total_credits",
++          "type": "numeric(10, 6)",
++          "primaryKey": false,
++          "notNull": false,
++          "default": "'0'"
++        },
++        "status": {
++          "name": "status",
++          "type": "agent_run_status",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'running'"
++        },
++        "error_message": {
++          "name": "error_message",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "completed_at": {
++          "name": "completed_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        }
++      },
++      "indexes": {
++        "idx_agent_run_user_id": {
++          "name": "idx_agent_run_user_id",
++          "columns": [
++            {
++              "expression": "user_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_agent_run_parent": {
++          "name": "idx_agent_run_parent",
++          "columns": [
++            {
++              "expression": "parent_run_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_agent_run_root": {
++          "name": "idx_agent_run_root",
++          "columns": [
++            {
++              "expression": "root_run_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_agent_run_agent_id": {
++          "name": "idx_agent_run_agent_id",
++          "columns": [
++            {
++              "expression": "agent_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_agent_run_publisher": {
++          "name": "idx_agent_run_publisher",
++          "columns": [
++            {
++              "expression": "publisher_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_agent_run_status": {
++          "name": "idx_agent_run_status",
++          "columns": [
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "where": "\"agent_run\".\"status\" = 'running'",
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_agent_run_ancestors_gin": {
++          "name": "idx_agent_run_ancestors_gin",
++          "columns": [
++            {
++              "expression": "ancestor_run_ids",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "gin",
++          "with": {}
++        },
++        "idx_agent_run_completed_publisher_agent": {
++          "name": "idx_agent_run_completed_publisher_agent",
++          "columns": [
++            {
++              "expression": "publisher_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "agent_name",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "where": "\"agent_run\".\"status\" = 'completed'",
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_agent_run_completed_recent": {
++          "name": "idx_agent_run_completed_recent",
++          "columns": [
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "publisher_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "agent_name",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "where": "\"agent_run\".\"status\" = 'completed'",
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_agent_run_completed_version": {
++          "name": "idx_agent_run_completed_version",
++          "columns": [
++            {
++              "expression": "publisher_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "agent_name",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "agent_version",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "where": "\"agent_run\".\"status\" = 'completed'",
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_agent_run_completed_user": {
++          "name": "idx_agent_run_completed_user",
++          "columns": [
++            {
++              "expression": "user_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "where": "\"agent_run\".\"status\" = 'completed'",
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "agent_run_user_id_user_id_fk": {
++          "name": "agent_run_user_id_user_id_fk",
++          "tableFrom": "agent_run",
++          "tableTo": "user",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.agent_step": {
++      "name": "agent_step",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "agent_run_id": {
++          "name": "agent_run_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "step_number": {
++          "name": "step_number",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "duration_ms": {
++          "name": "duration_ms",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "generated": {
++            "as": "CASE WHEN completed_at IS NOT NULL THEN EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000 ELSE NULL END::integer",
++            "type": "stored"
++          }
++        },
++        "credits": {
++          "name": "credits",
++          "type": "numeric(10, 6)",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'0'"
++        },
++        "child_run_ids": {
++          "name": "child_run_ids",
++          "type": "text[]",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "spawned_count": {
++          "name": "spawned_count",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": false,
++          "generated": {
++            "as": "array_length(child_run_ids, 1)",
++            "type": "stored"
++          }
++        },
++        "message_id": {
++          "name": "message_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "status": {
++          "name": "status",
++          "type": "agent_step_status",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "'completed'"
++        },
++        "error_message": {
++          "name": "error_message",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "completed_at": {
++          "name": "completed_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        }
++      },
++      "indexes": {
++        "unique_step_number_per_run": {
++          "name": "unique_step_number_per_run",
++          "columns": [
++            {
++              "expression": "agent_run_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "step_number",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": true,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_agent_step_run_id": {
++          "name": "idx_agent_step_run_id",
++          "columns": [
++            {
++              "expression": "agent_run_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_agent_step_children_gin": {
++          "name": "idx_agent_step_children_gin",
++          "columns": [
++            {
++              "expression": "child_run_ids",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "gin",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "agent_step_agent_run_id_agent_run_id_fk": {
++          "name": "agent_step_agent_run_id_agent_run_id_fk",
++          "tableFrom": "agent_step",
++          "tableTo": "agent_run",
++          "columnsFrom": [
++            "agent_run_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.credit_ledger": {
++      "name": "credit_ledger",
++      "schema": "",
++      "columns": {
++        "operation_id": {
++          "name": "operation_id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "principal": {
++          "name": "principal",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "balance": {
++          "name": "balance",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "type": {
++          "name": "type",
++          "type": "grant_type",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "description": {
++          "name": "description",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "priority": {
++          "name": "priority",
++          "type": "integer",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "org_id": {
++          "name": "org_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "stripe_subscription_id": {
++          "name": "stripe_subscription_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        }
++      },
++      "indexes": {
++        "idx_credit_ledger_active_balance": {
++          "name": "idx_credit_ledger_active_balance",
++          "columns": [
++            {
++              "expression": "user_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "balance",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "expires_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "priority",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "where": "\"credit_ledger\".\"balance\" != 0 AND \"credit_ledger\".\"expires_at\" IS NULL",
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_credit_ledger_org": {
++          "name": "idx_credit_ledger_org",
++          "columns": [
++            {
++              "expression": "org_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_credit_ledger_subscription": {
++          "name": "idx_credit_ledger_subscription",
++          "columns": [
++            {
++              "expression": "user_id",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "type",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "created_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "credit_ledger_user_id_user_id_fk": {
++          "name": "credit_ledger_user_id_user_id_fk",
++          "tableFrom": "credit_ledger",
++          "tableTo": "user",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        },
++        "credit_ledger_org_id_org_id_fk": {
++          "name": "credit_ledger_org_id_org_id_fk",
++          "tableFrom": "credit_ledger",
++          "tableTo": "org",
++          "columnsFrom": [
++            "org_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.encrypted_api_keys": {
++      "name": "encrypted_api_keys",
++      "schema": "",
++      "columns": {
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "type": {
++          "name": "type",
++          "type": "api_key_type",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "api_key": {
++          "name": "api_key",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {
++        "encrypted_api_keys_user_id_user_id_fk": {
++          "name": "encrypted_api_keys_user_id_user_id_fk",
++          "tableFrom": "encrypted_api_keys",
++          "tableTo": "user",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {
++        "encrypted_api_keys_user_id_type_pk": {
++          "name": "encrypted_api_keys_user_id_type_pk",
++          "columns": [
++            "user_id",
++            "type"
++          ]
++        }
++      },
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.fingerprint": {
++      "name": "fingerprint",
++      "schema": "",
++      "columns": {
++        "id": {
++          "name": "id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "sig_hash": {
++          "name": "sig_hash",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        }
++      },
++      "indexes": {},
++      "foreignKeys": {},
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.free_session": {
++      "name": "free_session",
++      "schema": "",
++      "columns": {
++        "user_id": {
++          "name": "user_id",
++          "type": "text",
++          "primaryKey": true,
++          "notNull": true
++        },
++        "status": {
++          "name": "status",
++          "type": "free_session_status",
++          "typeSchema": "public",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "active_instance_id": {
++          "name": "active_instance_id",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "model": {
++          "name": "model",
++          "type": "text",
++          "primaryKey": false,
++          "notNull": true
++        },
++        "queued_at": {
++          "name": "queued_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "admitted_at": {
++          "name": "admitted_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "expires_at": {
++          "name": "expires_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": false
++        },
++        "created_at": {
++          "name": "created_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        },
++        "updated_at": {
++          "name": "updated_at",
++          "type": "timestamp with time zone",
++          "primaryKey": false,
++          "notNull": true,
++          "default": "now()"
++        }
++      },
++      "indexes": {
++        "idx_free_session_queue": {
++          "name": "idx_free_session_queue",
++          "columns": [
++            {
++              "expression": "status",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "model",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            },
++            {
++              "expression": "queued_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        },
++        "idx_free_session_expiry": {
++          "name": "idx_free_session_expiry",
++          "columns": [
++            {
++              "expression": "expires_at",
++              "isExpression": false,
++              "asc": true,
++              "nulls": "last"
++            }
++          ],
++          "isUnique": false,
++          "concurrently": false,
++          "method": "btree",
++          "with": {}
++        }
++      },
++      "foreignKeys": {
++        "free_session_user_id_user_id_fk": {
++          "name": "free_session_user_id_user_id_fk",
++          "tableFrom": "free_session",
++          "tableTo": "user",
++          "columnsFrom": [
++            "user_id"
++          ],
++          "columnsTo": [
++            "id"
++          ],
++          "onDelete": "cascade",
++          "onUpdate": "no action"
++        }
++      },
++      "compositePrimaryKeys": {},
++      "uniqueConstraints": {},
++      "policies": {},
++      "checkConstraints": {},
++      "isRLSEnabled": false
++    },
++    "public.free_session_admit": {
++      "name": "free_session_admit",
++      "schema": "",
++      "columns": {
++        "id": {
++     
+
+… [diff truncated: view full diff on GitHub] …

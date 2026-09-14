@@ -1,0 +1,343 @@
+diff --git a/cli/release/index.js b/cli/release/index.js
+index 471053ca8..31b853669 100644
+--- a/cli/release/index.js
++++ b/cli/release/index.js
+@@ -13,6 +13,40 @@ const tar = require('tar')
+ 
+ const packageName = 'codebuff'
+ 
++/**
++ * Terminal escape sequences to reset terminal state after the child process exits.
++ * When the binary is SIGKILL'd, it can't clean up its own terminal state.
++ * The wrapper (this process) survives and must reset these modes.
++ *
++ * Keep in sync with TERMINAL_RESET_SEQUENCES in cli/src/utils/renderer-cleanup.ts
++ */
++const TERMINAL_RESET_SEQUENCES =
++  '\x1b[?1049l' + // Exit alternate screen buffer
++  '\x1b[?1000l' + // Disable X10 mouse mode
++  '\x1b[?1002l' + // Disable button event mouse mode
++  '\x1b[?1003l' + // Disable any-event mouse mode (all motion)
++  '\x1b[?1006l' + // Disable SGR extended mouse mode
++  '\x1b[?1004l' + // Disable focus reporting
++  '\x1b[?2004l' + // Disable bracketed paste mode
++  '\x1b[?25h' // Show cursor
++
++function resetTerminal() {
++  try {
++    if (process.stdin.isTTY && process.stdin.setRawMode) {
++      process.stdin.setRawMode(false)
++    }
++  } catch {
++    // stdin may be closed
++  }
++  try {
++    if (process.stdout.isTTY) {
++      process.stdout.write(TERMINAL_RESET_SEQUENCES)
++    }
++  } catch {
++    // stdout may be closed
++  }
++}
++
+ function createConfig(packageName) {
+   const homeDir = os.homedir()
+   const configDir = path.join(homeDir, '.config', 'manicode')
+@@ -526,18 +560,24 @@ async function checkForUpdates(runningProcess, exitListener) {
+       term.clearLine()
+ 
+       runningProcess.removeListener('exit', exitListener)
+-      runningProcess.kill('SIGTERM')
+ 
+       await new Promise((resolve) => {
+-        runningProcess.on('exit', resolve)
++        let exited = false
++        runningProcess.once('exit', () => {
++          exited = true
++          resolve()
++        })
++        runningProcess.kill('SIGTERM')
+         setTimeout(() => {
+-          if (!runningProcess.killed) {
++          if (!exited) {
+             runningProcess.kill('SIGKILL')
++            // Safety: resolve after giving SIGKILL time to take effect
++            setTimeout(() => resolve(), 1000)
+           }
+-          resolve()
+         }, 5000)
+       })
+ 
++      resetTerminal()
+       console.log(`Update available: ${currentVersion} → ${latestVersion}`)
+ 
+       await downloadBinary(latestVersion)
+@@ -547,8 +587,14 @@ async function checkForUpdates(runningProcess, exitListener) {
+         detached: false,
+       })
+ 
+-      newChild.on('exit', (code) => {
+-        process.exit(code || 0)
++      newChild.on('exit', (code, signal) => {
++        resetTerminal()
++        process.exit(signal ? 1 : (code || 0))
++      })
++
++      newChild.on('error', (err) => {
++        console.error('Failed to start codebuff:', err.message)
++        process.exit(1)
+       })
+ 
+       return new Promise(() => {})
+@@ -565,12 +611,18 @@ async function main() {
+     stdio: 'inherit',
+   })
+ 
+-  const exitListener = (code) => {
+-    process.exit(code || 0)
++  const exitListener = (code, signal) => {
++    resetTerminal()
++    process.exit(signal ? 1 : (code || 0))
+   }
+ 
+   child.on('exit', exitListener)
+ 
++  child.on('error', (err) => {
++    console.error('Failed to start codebuff:', err.message)
++    process.exit(1)
++  })
++
+   setTimeout(() => {
+     checkForUpdates(child, exitListener)
+   }, 100)
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index 8b0fade3d..f9b1cf60b 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -33,7 +33,7 @@ import { initializeAgentRegistry } from './utils/local-agent-registry'
+ import { clearLogFile, logger } from './utils/logger'
+ import { shouldShowProjectPicker } from './utils/project-picker'
+ import { saveRecentProject } from './utils/recent-projects'
+-import { installProcessCleanupHandlers } from './utils/renderer-cleanup'
++import { installProcessCleanupHandlers, TERMINAL_RESET_SEQUENCES } from './utils/renderer-cleanup'
+ import { initializeSkillRegistry } from './utils/skill-registry'
+ import { detectTerminalTheme } from './utils/terminal-color-detection'
+ import { setOscDetectedTheme } from './utils/theme-system'
+@@ -363,11 +363,43 @@ async function main(): Promise<void> {
+     )
+   }
+ 
++  // Install early error handlers BEFORE renderer creation.
++  // If the renderer crashes during init, these ensure the error is visible
++  // by exiting the alternate screen buffer before printing the error.
++  const earlyFatalHandler = (error: unknown) => {
++    try {
++      if (process.stdin.isTTY && process.stdin.setRawMode) {
++        process.stdin.setRawMode(false)
++      }
++    } catch {
++      // stdin may be closed
++    }
++    try {
++      if (process.stdout.isTTY) {
++        process.stdout.write(TERMINAL_RESET_SEQUENCES)
++      }
++    } catch {
++      // stdout may be closed
++    }
++    try {
++      console.error('Fatal error during startup:', error)
++    } catch {
++      // stderr may be closed
++    }
++    process.exit(1)
++  }
++  process.on('uncaughtException', earlyFatalHandler)
++  process.on('unhandledRejection', earlyFatalHandler)
++
+   const renderer = await createCliRenderer({
+     backgroundColor: 'transparent',
+     exitOnCtrlC: false,
+     useAlternateScreen: true,
+   })
++
++  // Remove early handlers — proper cleanup handlers (with renderer access) take over
++  process.removeListener('uncaughtException', earlyFatalHandler)
++  process.removeListener('unhandledRejection', earlyFatalHandler)
+   installProcessCleanupHandlers(renderer)
+   createRoot(renderer).render(
+     <QueryClientProvider client={queryClient}>
+diff --git a/cli/src/utils/renderer-cleanup.ts b/cli/src/utils/renderer-cleanup.ts
+index 8a7c01daa..58d21367d 100644
+--- a/cli/src/utils/renderer-cleanup.ts
++++ b/cli/src/utils/renderer-cleanup.ts
+@@ -21,7 +21,7 @@ let terminalStateReset = false
+  * - \x1b[?2004l: Disable bracketed paste mode
+  * - \x1b[?25h: Show cursor (safety measure)
+  */
+-const TERMINAL_RESET_SEQUENCES =
++export const TERMINAL_RESET_SEQUENCES =
+   '\x1b[?1049l' + // Exit alternate screen buffer
+   '\x1b[?1000l' + // Disable X10 mouse mode
+   '\x1b[?1002l' + // Disable button event mouse mode
+@@ -43,12 +43,21 @@ function resetTerminalState(): void {
+   if (terminalStateReset) return
+   terminalStateReset = true
+ 
++  try {
++    if (process.stdin.isTTY && process.stdin.setRawMode) {
++      process.stdin.setRawMode(false)
++    }
++  } catch {
++    // Ignore errors - stdin may already be closed
++  }
+   try {
+     // Reset terminal title to default
+     resetTerminalTitle()
+     // Write directly to stdout - this is synchronous and will complete
+     // before the process exits, ensuring the terminal is reset
+-    process.stdout.write(TERMINAL_RESET_SEQUENCES)
++    if (process.stdout.isTTY) {
++      process.stdout.write(TERMINAL_RESET_SEQUENCES)
++    }
+   } catch {
+     // Ignore errors - stdout may already be closed
+   }
+@@ -124,21 +133,23 @@ export function installProcessCleanupHandlers(cliRenderer: CliRenderer): void {
+ 
+   // uncaughtException - Safety net for unhandled errors
+   process.on('uncaughtException', (error) => {
++    cleanup() // Exit alt screen FIRST so error output is visible on the main screen
+     try {
+       console.error('Uncaught exception:', error)
+     } catch {
+       // Ignore logging errors
+     }
+-    cleanupAndExit(1)
++    process.exit(1)
+   })
+ 
+   // unhandledRejection - Safety net for unhandled promise rejections
+   process.on('unhandledRejection', (reason) => {
++    cleanup() // Exit alt screen FIRST so error output is visible on the main screen
+     try {
+       console.error('Unhandled rejection:', reason)
+     } catch {
+       // Ignore logging errors
+     }
+-    cleanupAndExit(1)
++    process.exit(1)
+   })
+ }
+diff --git a/freebuff/cli/release/index.js b/freebuff/cli/release/index.js
+index 10b28c821..ba8a04362 100644
+--- a/freebuff/cli/release/index.js
++++ b/freebuff/cli/release/index.js
+@@ -13,6 +13,40 @@ const tar = require('tar')
+ 
+ const packageName = 'freebuff'
+ 
++/**
++ * Terminal escape sequences to reset terminal state after the child process exits.
++ * When the binary is SIGKILL'd, it can't clean up its own terminal state.
++ * The wrapper (this process) survives and must reset these modes.
++ *
++ * Keep in sync with TERMINAL_RESET_SEQUENCES in cli/src/utils/renderer-cleanup.ts
++ */
++const TERMINAL_RESET_SEQUENCES =
++  '\x1b[?1049l' + // Exit alternate screen buffer
++  '\x1b[?1000l' + // Disable X10 mouse mode
++  '\x1b[?1002l' + // Disable button event mouse mode
++  '\x1b[?1003l' + // Disable any-event mouse mode (all motion)
++  '\x1b[?1006l' + // Disable SGR extended mouse mode
++  '\x1b[?1004l' + // Disable focus reporting
++  '\x1b[?2004l' + // Disable bracketed paste mode
++  '\x1b[?25h' // Show cursor
++
++function resetTerminal() {
++  try {
++    if (process.stdin.isTTY && process.stdin.setRawMode) {
++      process.stdin.setRawMode(false)
++    }
++  } catch {
++    // stdin may be closed
++  }
++  try {
++    if (process.stdout.isTTY) {
++      process.stdout.write(TERMINAL_RESET_SEQUENCES)
++    }
++  } catch {
++    // stdout may be closed
++  }
++}
++
+ function createConfig(packageName) {
+   const homeDir = os.homedir()
+   const configDir = path.join(homeDir, '.config', 'manicode')
+@@ -513,18 +547,24 @@ async function checkForUpdates(runningProcess, exitListener) {
+       term.clearLine()
+ 
+       runningProcess.removeListener('exit', exitListener)
+-      runningProcess.kill('SIGTERM')
+ 
+       await new Promise((resolve) => {
+-        runningProcess.on('exit', resolve)
++        let exited = false
++        runningProcess.once('exit', () => {
++          exited = true
++          resolve()
++        })
++        runningProcess.kill('SIGTERM')
+         setTimeout(() => {
+-          if (!runningProcess.killed) {
++          if (!exited) {
+             runningProcess.kill('SIGKILL')
++            // Safety: resolve after giving SIGKILL time to take effect
++            setTimeout(() => resolve(), 1000)
+           }
+-          resolve()
+         }, 5000)
+       })
+ 
++      resetTerminal()
+       console.log(`Update available: ${currentVersion} → ${latestVersion}`)
+ 
+       await downloadBinary(latestVersion)
+@@ -534,8 +574,14 @@ async function checkForUpdates(runningProcess, exitListener) {
+         detached: false,
+       })
+ 
+-      newChild.on('exit', (code) => {
+-        process.exit(code || 0)
++      newChild.on('exit', (code, signal) => {
++        resetTerminal()
++        process.exit(signal ? 1 : (code || 0))
++      })
++
++      newChild.on('error', (err) => {
++        console.error('Failed to start freebuff:', err.message)
++        process.exit(1)
+       })
+ 
+       return new Promise(() => {})
+@@ -552,12 +598,18 @@ async function main() {
+     stdio: 'inherit',
+   })
+ 
+-  const exitListener = (code) => {
+-    process.exit(code || 0)
++  const exitListener = (code, signal) => {
++    resetTerminal()
++    process.exit(signal ? 1 : (code || 0))
+   }
+ 
+   child.on('exit', exitListener)
+ 
++  child.on('error', (err) => {
++    console.error('Failed to start freebuff:', err.message)
++    process.exit(1)
++  })
++
+   setTimeout(() => {
+     checkForUpdates(child, exitListener)
+   }, 100)

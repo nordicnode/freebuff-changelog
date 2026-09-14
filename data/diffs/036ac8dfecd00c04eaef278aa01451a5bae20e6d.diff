@@ -1,0 +1,397 @@
+diff --git a/.github/workflows/cli-release-build.yml b/.github/workflows/cli-release-build.yml
+index d3513d6bf..758794d88 100644
+--- a/.github/workflows/cli-release-build.yml
++++ b/.github/workflows/cli-release-build.yml
+@@ -197,7 +197,10 @@ jobs:
+           if [[ "${{ runner.os }}" == "Windows" ]]; then
+             BINARY_FILE="${{ inputs.binary-name }}.exe"
+           fi
+-          tar -czf ${{ inputs.binary-name }}-${{ matrix.target }}.tar.gz -C cli/bin "$BINARY_FILE"
++          # Bundle the binary alongside tree-sitter.wasm — the CLI loads
++          # the wasm as a sibling file at runtime since bun --compile
++          # asset embedding wasn't reliable on Windows.
++          tar -czf ${{ inputs.binary-name }}-${{ matrix.target }}.tar.gz -C cli/bin "$BINARY_FILE" tree-sitter.wasm
+ 
+       - name: Upload binary artifact
+         uses: actions/upload-artifact@v7
+@@ -340,7 +343,9 @@ jobs:
+         shell: bash
+         run: |
+           BINARY_FILE="${{ inputs.binary-name }}.exe"
+-          tar -czf ${{ inputs.binary-name }}-win32-x64.tar.gz -C cli/bin "$BINARY_FILE"
++          # Bundle tree-sitter.wasm next to the binary; see the
++          # equivalent matrix-job tar step for context.
++          tar -czf ${{ inputs.binary-name }}-win32-x64.tar.gz -C cli/bin "$BINARY_FILE" tree-sitter.wasm
+ 
+       - name: Upload binary artifact
+         uses: actions/upload-artifact@v7
+diff --git a/cli/release/index.js b/cli/release/index.js
+index 85c60ff39..f84e6940c 100644
+--- a/cli/release/index.js
++++ b/cli/release/index.js
+@@ -383,6 +383,27 @@ async function downloadBinary(version) {
+     }
+     fs.renameSync(tempBinaryPath, CONFIG.binaryPath)
+ 
++    // Move tree-sitter.wasm next to the binary if the tarball included
++    // it. The CLI binary loads this at startup; embedding it inside the
++    // binary itself was unreliable on Windows (bun --compile asset
++    // bundling silently dropped or unbound it across several attempts),
++    // so we ship it as a sibling file instead. Older artifacts that
++    // pre-date this change won't have the wasm and will still install —
++    // they'll just hit the same crash they had before, which is fine.
++    const tempWasmPath = path.join(CONFIG.tempDownloadDir, 'tree-sitter.wasm')
++    if (fs.existsSync(tempWasmPath)) {
++      const targetWasmPath = path.join(
++        path.dirname(CONFIG.binaryPath),
++        'tree-sitter.wasm',
++      )
++      try {
++        if (fs.existsSync(targetWasmPath)) fs.unlinkSync(targetWasmPath)
++      } catch {
++        // best effort; rename below will surface the real error if it matters
++      }
++      fs.renameSync(tempWasmPath, targetWasmPath)
++    }
++
+     // Save version metadata for fast version checking
+     fs.writeFileSync(
+       CONFIG.metadataPath,
+diff --git a/cli/scripts/build-binary.ts b/cli/scripts/build-binary.ts
+index 472bb7a49..5888808b4 100644
+--- a/cli/scripts/build-binary.ts
++++ b/cli/scripts/build-binary.ts
+@@ -145,11 +145,6 @@ async function main() {
+   patchOpenTuiAssetPaths()
+   await ensureOpenTuiNativeBundle(targetInfo)
+ 
+-  const treeSitterEmbed = embedTreeSitterWasmAsChunks()
+-  // Even on a build-script crash, restore the empty stub so a developer's
+-  // working tree doesn't end up with a multi-MB diff.
+-  process.on('exit', treeSitterEmbed.restore)
+-
+   const outputFilename =
+     targetInfo.platform === 'win32' ? `${binaryName}.exe` : binaryName
+   const outputFile = join(binDir, outputFilename)
+@@ -191,16 +186,18 @@ async function main() {
+ 
+   runCommand('bun', buildArgs, { cwd: cliRoot })
+ 
+-  // Restore the empty stub now that the build read the chunks. Eager
+-  // cleanup keeps a successful build clean; the exit handler is a
+-  // backstop for crashes between embed and now.
+-  treeSitterEmbed.restore()
+-
+-  // Fail the build if the chunks didn't actually make it into the
+-  // compiled binary. Catches silent regressions (tree-shaking, minifier
+-  // dropping literals, file-write timing) before we upload an artifact
+-  // that would crash for users.
+-  verifyTreeSitterWasmEmbedded(outputFile, treeSitterEmbed.sampleChunks)
++  // Ship tree-sitter.wasm as a sibling file next to the binary. Bun
++  // --compile asset embedding is unreliable on Windows (every JS-level
++  // retrieval mechanism we tried — `with { type: 'file' }`, base64 string
++  // literals, chunked base64, function-wrapped chunked base64 — got
++  // tree-shaken, minified away, or returned an undefined binding even
++  // when the bytes were in the binary). The pre-init reads it from
++  // `dirname(process.execPath)`, which works the same on every platform
++  // because it's a normal disk read, not a bunfs lookup.
++  const sourceWasm = findWebTreeSitterWasm()
++  const siblingWasm = join(binDir, 'tree-sitter.wasm')
++  writeFileSync(siblingWasm, readFileSync(sourceWasm))
++  logAlways(`Copied tree-sitter.wasm sibling: ${sourceWasm} → ${siblingWasm}`)
+ 
+   if (targetInfo.platform !== 'win32') {
+     chmodSync(outputFile, 0o755)
+@@ -246,125 +243,6 @@ function findWebTreeSitterWasm(): string {
+   }
+ }
+ 
+-/**
+- * Inline `tree-sitter.wasm` into the binary as base64-encoded string
+- * literals — but split into many small chunks. A single 274KB string
+- * literal got dropped/transformed by bun's Windows minifier in an
+- * earlier attempt; small chunks are individually unremarkable to the
+- * minifier and survive intact. The pre-init joins them at runtime and
+- * decodes back to the wasm bytes.
+- *
+- * Returns a `restore` function (resets the stub) and a small set of
+- * `sampleChunks` for the post-build verification step to look for in
+- * the compiled binary. Always invoke `restore` (eagerly + on exit) so
+- * a developer's working tree doesn't end up with a multi-MB diff after
+- * a build.
+- */
+-function embedTreeSitterWasmAsChunks(): {
+-  restore: () => void
+-  sampleChunks: string[]
+-} {
+-  const stubPath = join(cliRoot, 'src', 'pre-init', 'tree-sitter-wasm-bytes.ts')
+-  const originalStub = readFileSync(stubPath, 'utf8')
+-  let restored = false
+-  const restore = (): void => {
+-    if (restored) return
+-    restored = true
+-    try {
+-      writeFileSync(stubPath, originalStub)
+-    } catch (error) {
+-      console.error('Failed to restore tree-sitter-wasm-bytes stub:', error)
+-    }
+-  }
+-
+-  const sourceWasm = findWebTreeSitterWasm()
+-  const wasmBytes = readFileSync(sourceWasm)
+-  const fullBase64 = wasmBytes.toString('base64')
+-
+-  // ~1KB per chunk: well under any plausible minifier-dropped-literal
+-  // threshold, and small enough that even a heavy-handed inliner would
+-  // emit them as runtime references rather than evaluating the whole
+-  // .join() at compile time. Keeps total chunk count manageable too
+-  // (~270 chunks for a 205KB wasm).
+-  const CHUNK_SIZE = 1024
+-  const chunks: string[] = []
+-  for (let i = 0; i < fullBase64.length; i += CHUNK_SIZE) {
+-    chunks.push(fullBase64.slice(i, i + CHUNK_SIZE))
+-  }
+-
+-  const generated =
+-    `// AUTO-GENERATED by cli/scripts/build-binary.ts during \`bun build --compile\`.\n` +
+-    `// Restored to an empty function after the build finishes — do not commit a\n` +
+-    `// non-empty body here.\n` +
+-    `export function getTreeSitterWasmChunks(): string[] {\n` +
+-    `  return [\n` +
+-    chunks.map((c) => `    ${JSON.stringify(c)},`).join('\n') +
+-    `\n  ]\n` +
+-    `}\n`
+-
+-  writeFileSync(stubPath, generated)
+-  // Re-read what we just wrote so we can fail loudly if the OS buffered
+-  // the write. On Windows, NTFS writes can lag, and bun --compile would
+-  // then read the stale stub. Verifying here means the build fails
+-  // *during embed* instead of producing a broken binary that surprises
+-  // us later.
+-  const onDisk = readFileSync(stubPath, 'utf8')
+-  if (!onDisk.includes(chunks[0]!)) {
+-    throw new Error(
+-      `Embed wrote ${chunks.length} chunks but re-read of ${stubPath} ` +
+-        `does not contain chunk[0]. File on disk: ${onDisk.slice(0, 200)}…`,
+-    )
+-  }
+-  logAlways(
+-    `Embedded tree-sitter.wasm from ${sourceWasm} (${wasmBytes.length} bytes → ${chunks.length} chunks of ~${CHUNK_SIZE} chars).`,
+-  )
+-
+-  // Pull a few sample chunks from the start, middle, and end for the
+-  // post-build verification scan. If any one is missing in the compiled
+-  // binary, something dropped or transformed the literals.
+-  const samples = [
+-    chunks[0],
+-    chunks[Math.floor(chunks.length / 2)],
+-    chunks[chunks.length - 1],
+-  ].filter((c): c is string => Boolean(c))
+-
+-  return { restore, sampleChunks: samples }
+-}
+-
+-/**
+- * Sanity-check the compiled binary actually contains all the chunked
+- * base64 we just embedded. We pass in a few sample chunks from the
+- * start / middle / end of the array; each must appear in the binary.
+- * If any one is missing, the bundler dropped or inlined-away part of
+- * the literal table, and the runtime decode would produce garbage.
+- */
+-function verifyTreeSitterWasmEmbedded(
+-  outputFile: string,
+-  sampleChunks: string[],
+-): void {
+-  if (sampleChunks.length === 0) {
+-    throw new Error('verifyTreeSitterWasmEmbedded called with no sample chunks')
+-  }
+-  const binary = readFileSync(outputFile)
+-  for (const chunk of sampleChunks) {
+-    const needle = Buffer.from(chunk, 'utf8')
+-    const idx = binary.indexOf(needle)
+-    if (idx === -1) {
+-      throw new Error(
+-        `Embedded tree-sitter wasm chunk not found in ${outputFile}.\n` +
+-          `Missing chunk (first 80 chars): ${chunk.slice(0, 80)}…\n` +
+-          `Either the \`tree-sitter-wasm-bytes.ts\` literals were tree-shaken,\n` +
+-          `the minifier transformed them away, or the pre-init's import wasn't\n` +
+-          `actually consumed. The runtime tree-sitter init would fail with\n` +
+-          `"Internal error: tree-sitter.wasm not found".`,
+-      )
+-    }
+-  }
+-  logAlways(
+-    `Verified ${sampleChunks.length} embedded base64 chunks in compiled binary.`,
+-  )
+-}
+-
+ function patchOpenTuiAssetPaths() {
+   const coreDir = join(cliRoot, 'node_modules', '@opentui', 'core')
+   if (!existsSync(coreDir)) {
+diff --git a/cli/src/pre-init/tree-sitter-wasm-bytes.ts b/cli/src/pre-init/tree-sitter-wasm-bytes.ts
+deleted file mode 100644
+index af14701f7..000000000
+--- a/cli/src/pre-init/tree-sitter-wasm-bytes.ts
++++ /dev/null
+@@ -1,19 +0,0 @@
+-// Stub committed for dev mode and tests. The real chunks are written
+-// here by `cli/scripts/build-binary.ts` immediately before
+-// `bun build --compile`, then restored to this empty stub after.
+-//
+-// Why a *function* return rather than a top-level const: prior
+-// approaches kept getting eliminated on Windows even with 268
+-// individual chunks. The bundler appears to evaluate the imported
+-// value at static-analysis time (we suspect either filesystem write
+-// timing or an AST cache), inlines it as the empty stub, and DCEs
+-// any conditional that depends on `.length > 0`. A function call's
+-// return value is not statically inlinable in the same way — the
+-// chunks live inside the function body, only materialized on call.
+-//
+-// Why a function instead of `export const X = (() => [...])()`:
+-// same reason — IIFEs can be folded by aggressive minifiers, but
+-// imported functions called at runtime are preserved.
+-export function getTreeSitterWasmChunks(): string[] {
+-  return []
+-}
+diff --git a/cli/src/pre-init/tree-sitter-wasm.ts b/cli/src/pre-init/tree-sitter-wasm.ts
+index af0c502f7..1d0d4c993 100644
+--- a/cli/src/pre-init/tree-sitter-wasm.ts
++++ b/cli/src/pre-init/tree-sitter-wasm.ts
+@@ -1,51 +1,62 @@
+-// Embed tree-sitter.wasm into the bun-compile binary so the SDK's tree-sitter
+-// parser singleton can find it at runtime. Must be the very first import in
+-// `index.tsx`: subsequent imports (the SDK / code-map) eagerly construct the
+-// parser, and its init reads what we publish here on `globalThis`.
++// Find tree-sitter.wasm so the SDK's tree-sitter parser singleton can load
++// it at runtime. Must be the very first import in `index.tsx`: subsequent
++// imports (the SDK / code-map) eagerly construct the parser, and its init
++// reads what we publish here on `globalThis` and via the env var.
+ //
+-// History of failed approaches before this one (all worked on macOS/Linux,
+-// failed on Windows in different ways):
++// Final approach after several attempts to embed the wasm into the bun
++// --compile binary all failed on Windows (the bytes ended up in the
++// binary, but every JS-level retrieval mechanism — `with { type: 'file' }`
++// import binding, base64 string literals, chunked base64 in a generated
++// module, function-export wrappers — was either tree-shaken, transformed
++// by the minifier, or otherwise stripped):
+ //
+-//  1. `with { type: 'file' }` of `web-tree-sitter/tree-sitter.wasm` (node_
+-//     modules subpath) — bytes ended up in the binary but the import
+-//     variable was undefined at runtime. Bun/Windows bug with the import-
+-//     attribute binding.
+-//  2. `with { type: 'file' }` of a copied-in relative .wasm — same as #1,
+-//     so it's not subpath-vs-relative.
+-//  3. Single 274KB base64 string literal in a generated TS module — the
+-//     literal didn't appear in the compiled binary at all. Probably the
+-//     minifier transforming "huge constant" literals.
+-//  4. ~268 chunked base64 string literals — same fate; the bundler
+-//     appeared to evaluate the imported array as the empty stub at
+-//     static-analysis time and DCE'd the conditional that consumed it.
++//   ship tree-sitter.wasm as a sibling file next to the binary.
+ //
+-// What this version does: import a *function* whose body returns the
+-// chunks. Function return values aren't statically inlinable the way
+-// `export const` values are, so the bundler can't substitute the empty
+-// stub for the call site. Reference the result unconditionally so DCE
+-// can't kick in even if some inliner does fold the function.
++// It's 200KB, the npm tarball already contains the binary; adding one
++// more file is trivial. The build script copies the wasm into `cli/bin/`
++// after compile, the release workflow tarballs both, and the freebuff /
++// codebuff downloader extracts both into the same directory. At runtime,
++// `process.execPath` plus a relative file lookup gets us the wasm with
++// zero bundler involvement.
+ 
+-import { getTreeSitterWasmChunks } from './tree-sitter-wasm-bytes'
++import { existsSync, readFileSync } from 'fs'
++import { dirname, join } from 'path'
+ 
+-const chunks = getTreeSitterWasmChunks()
+-if (chunks.length > 0) {
+-  const buf = Buffer.from(chunks.join(''), 'base64')
+-  // globalThis is the only cross-bundle channel: the SDK pre-built bundle
+-  // inlines its own copy of `init-node.ts`, so a module-level variable
+-  // here isn't visible to the singleton initialized via the SDK. Slice
+-  // into a fresh Uint8Array view rather than handing over Buffer's shared
+-  // underlying ArrayBuffer.
+-  ;(
+-    globalThis as { __CODEBUFF_TREE_SITTER_WASM_BINARY__?: Uint8Array }
+-  ).__CODEBUFF_TREE_SITTER_WASM_BINARY__ = new Uint8Array(
+-    buf.buffer,
+-    buf.byteOffset,
+-    buf.byteLength,
+-  )
++// Sibling path: same directory as the running binary. Works for both
++// production binaries (where the downloader places tree-sitter.wasm
++// next to the executable) and dev runs (path won't exist, falls
++// through to init-node.ts's path-based resolution which finds the
++// node_modules copy).
++const siblingPath = join(dirname(process.execPath), 'tree-sitter.wasm')
++
++if (existsSync(siblingPath)) {
++  // Tell init-node.ts (in code-map / the SDK bundle) where the wasm
++  // is. The locateFile callback there will hand this path to
++  // emscripten, which fs.readFile's it.
++  process.env.CODEBUFF_TREE_SITTER_WASM_PATH = siblingPath
++
++  // Also try the synchronous-bytes path: hand the bytes straight to
++  // Parser.init({ wasmBinary }) so the SDK doesn't need to round-trip
++  // through emscripten's path resolution. Both channels feed the same
++  // tree-sitter init; whichever one trips first wins.
++  try {
++    const buf = readFileSync(siblingPath)
++    ;(
++      globalThis as { __CODEBUFF_TREE_SITTER_WASM_BINARY__?: Uint8Array }
++    ).__CODEBUFF_TREE_SITTER_WASM_BINARY__ = new Uint8Array(
++      buf.buffer,
++      buf.byteOffset,
++      buf.byteLength,
++    )
++  } catch (err) {
++    console.error(
++      '[tree-sitter pre-init] readFileSync failed for sibling wasm at',
++      siblingPath,
++      '—',
++      err instanceof Error ? err.message : String(err),
++    )
++  }
+ }
+ 
+ // `--smoke-tree-sitter` is the deterministic CI gate. The handler lives at
+-// the top of main() in cli/src/index.tsx (before parseArgs), not here —
+-// top-level await in this module didn't actually pause subsequent module
+-// evaluation under bun --compile on Windows. See the comment over the
+-// handler in index.tsx for the full reasoning.
++// the top of main() in cli/src/index.tsx (before parseArgs).
+diff --git a/freebuff/cli/release/index.js b/freebuff/cli/release/index.js
+index db7fe566a..044d86ebc 100644
+--- a/freebuff/cli/release/index.js
++++ b/freebuff/cli/release/index.js
+@@ -373,6 +373,27 @@ async function downloadBinary(version) {
+     }
+     fs.renameSync(tempBinaryPath, CONFIG.binaryPath)
+ 
++    // Move tree-sitter.wasm next to the binary if the tarball included
++    // it. The CLI binary loads this at startup; embedding it inside the
++    // binary itself was unreliable on Windows (bun --compile asset
++    // bundling silently dropped or unbound it across several attempts),
++    // so we ship it as a sibling file instead. Older artifacts that
++    // pre-date this change won't have the wasm and will still install —
++    // they'll just hit the same crash they had before, which is fine.
++    const tempWasmPath = path.join(CONFIG.tempDownloadDir, 'tree-sitter.wasm')
++    if (fs.existsSync(tempWasmPath)) {
++      const targetWasmPath = path.join(
++        path.dirname(CONFIG.binaryPath),
++        'tree-sitter.wasm',
++      )
++      try {
++        if (fs.existsSync(targetWasmPath)) fs.unlinkSync(targetWasmPath)
++      } catch {
++        // best effort; rename below will surface the real error if it matters
++      }
++      fs.renameSync(tempWasmPath, targetWasmPath)
++    }
++
+     fs.writeFileSync(
+       CONFIG.metadataPath,
+       JSON.stringify({ version }, null, 2),

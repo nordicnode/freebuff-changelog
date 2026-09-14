@@ -1,0 +1,178 @@
+diff --git a/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts b/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts
+index f70275d9d..7be27ad91 100644
+--- a/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts
++++ b/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts
+@@ -801,6 +801,85 @@ describe('/api/v1/chat/completions POST endpoint', () => {
+       expect(response.status).toBe(200)
+     })
+ 
++    it('allows subscriber with 0 a-la-carte credits but active block grant', async () => {
++      const blockGrant: BlockGrantResult = {
++        grantId: 'block-123',
++        credits: 350,
++        expiresAt: new Date(Date.now() + 5 * 60 * 60 * 1000),
++        isNew: true,
++      }
++      const mockEnsureSubscriberBlockGrant = mock(async () => blockGrant)
++
++      // Use the no-credits user (totalRemaining = 0)
++      const req = new NextRequest(
++        'http://localhost:3000/api/v1/chat/completions',
++        {
++          method: 'POST',
++          headers: { Authorization: 'Bearer test-api-key-no-credits' },
++          body: JSON.stringify({
++            model: 'test/test-model',
++            stream: false,
++            codebuff_metadata: {
++              run_id: 'run-123',
++              client_id: 'test-client-id-123',
++            },
++          }),
++        },
++      )
++
++      const response = await postChatCompletions({
++        req,
++        getUserInfoFromApiKey: mockGetUserInfoFromApiKey,
++        logger: mockLogger,
++        trackEvent: mockTrackEvent,
++        getUserUsageData: mockGetUserUsageData,
++        getAgentRunFromId: mockGetAgentRunFromId,
++        fetch: mockFetch,
++        insertMessageBigquery: mockInsertMessageBigquery,
++        loggerWithContext: mockLoggerWithContext,
++        ensureSubscriberBlockGrant: mockEnsureSubscriberBlockGrant,
++      })
++
++      // Should succeed - subscriber has block grant credits despite 0 a-la-carte credits
++      expect(response.status).toBe(200)
++    })
++
++    it('returns 402 for non-subscriber with 0 credits when ensureSubscriberBlockGrant returns null', async () => {
++      const mockEnsureSubscriberBlockGrant = mock(async () => null)
++
++      const req = new NextRequest(
++        'http://localhost:3000/api/v1/chat/completions',
++        {
++          method: 'POST',
++          headers: { Authorization: 'Bearer test-api-key-no-credits' },
++          body: JSON.stringify({
++            model: 'test/test-model',
++            stream: false,
++            codebuff_metadata: {
++              run_id: 'run-123',
++              client_id: 'test-client-id-123',
++            },
++          }),
++        },
++      )
++
++      const response = await postChatCompletions({
++        req,
++        getUserInfoFromApiKey: mockGetUserInfoFromApiKey,
++        logger: mockLogger,
++        trackEvent: mockTrackEvent,
++        getUserUsageData: mockGetUserUsageData,
++        getAgentRunFromId: mockGetAgentRunFromId,
++        fetch: mockFetch,
++        insertMessageBigquery: mockInsertMessageBigquery,
++        loggerWithContext: mockLoggerWithContext,
++        ensureSubscriberBlockGrant: mockEnsureSubscriberBlockGrant,
++      })
++
++      // Non-subscriber with 0 credits should get 402
++      expect(response.status).toBe(402)
++    })
++
+     it('does not call ensureSubscriberBlockGrant before validation passes', async () => {
+       const mockEnsureSubscriberBlockGrant = mock(async () => null)
+ 
+diff --git a/web/src/app/api/v1/chat/completions/_post.ts b/web/src/app/api/v1/chat/completions/_post.ts
+index 1f88be5bf..3925edbef 100644
+--- a/web/src/app/api/v1/chat/completions/_post.ts
++++ b/web/src/app/api/v1/chat/completions/_post.ts
+@@ -204,29 +204,11 @@ export async function postChatCompletions(params: {
+     const costMode = typedBody.codebuff_metadata?.cost_mode
+     const isFreeModeRequest = isFreeMode(costMode)
+ 
+-    // Check user credits (skip for FREE mode since those requests cost 0 credits)
++    // Fetch user credit data early (actual credit check happens after subscription block grant logic)
+     const {
+       balance: { totalRemaining },
+       nextQuotaReset,
+     } = await getUserUsageData({ userId, logger })
+-    if (totalRemaining <= 0 && !isFreeModeRequest) {
+-      trackEvent({
+-        event: AnalyticsEvent.CHAT_COMPLETIONS_INSUFFICIENT_CREDITS,
+-        userId,
+-        properties: {
+-          totalRemaining,
+-          nextQuotaReset,
+-        },
+-        logger,
+-      })
+-      const resetCountdown = formatQuotaResetCountdown(nextQuotaReset)
+-      return NextResponse.json(
+-        {
+-          message: `Out of credits. Please add credits at ${env.NEXT_PUBLIC_CODEBUFF_APP_URL}/usage. Your free credits reset ${resetCountdown}.`,
+-        },
+-        { status: 402 },
+-      )
+-    }
+ 
+     // Extract and validate agent run ID
+     const runIdFromBody = typedBody.codebuff_metadata?.run_id
+@@ -288,6 +270,7 @@ export async function postChatCompletions(params: {
+ 
+     // For subscribers, ensure a block grant exists before processing the request.
+     // This is done AFTER validation so malformed requests don't start a new 5-hour block.
++    let subscriberHasAvailableCredits = false
+     if (ensureSubscriberBlockGrant) {
+       try {
+         const blockGrantResult = await ensureSubscriberBlockGrant({ userId, logger })
+@@ -328,17 +311,42 @@ export async function postChatCompletions(params: {
+             { userId, limitType: isWeeklyLimitError(blockGrantResult) ? 'weekly' : 'session' },
+             'Subscriber hit limit, falling back to a-la-carte credits',
+           )
++        } else if (blockGrantResult) {
++          subscriberHasAvailableCredits = true
+         }
+       } catch (error) {
+         logger.error(
+           { error: getErrorObject(error), userId },
+           'Error ensuring subscription block grant',
+         )
+-        // Fail open: if we can't check the subscription status, allow the request to proceed
+-        // This is intentional - we prefer to allow requests rather than block legitimate users
++        // Fail open: if we can't check the subscription status, allow the request to proceed.
++        // Assume the user may be a subscriber so the credit check below doesn't reject them.
++        subscriberHasAvailableCredits = true
+       }
+     }
+ 
++    // Credit check: reject if user has no a-la-carte credits AND is not covered by subscription.
++    // Subscribers with available block grant credits bypass this check since their
++    // subscription credits are excluded from totalRemaining (isPersonalContext: true).
++    if (totalRemaining <= 0 && !isFreeModeRequest && !subscriberHasAvailableCredits) {
++      trackEvent({
++        event: AnalyticsEvent.CHAT_COMPLETIONS_INSUFFICIENT_CREDITS,
++        userId,
++        properties: {
++          totalRemaining,
++          nextQuotaReset,
++        },
++        logger,
++      })
++      const resetCountdown = formatQuotaResetCountdown(nextQuotaReset)
++      return NextResponse.json(
++        {
++          message: `Out of credits. Please add credits at ${env.NEXT_PUBLIC_CODEBUFF_APP_URL}/usage. Your free credits reset ${resetCountdown}.`,
++        },
++        { status: 402 },
++      )
++    }
++
+     const openrouterApiKey = req.headers.get(BYOK_OPENROUTER_HEADER)
+ 
+     // Handle streaming vs non-streaming

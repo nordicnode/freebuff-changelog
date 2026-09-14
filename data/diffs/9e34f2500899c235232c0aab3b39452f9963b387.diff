@@ -1,0 +1,593 @@
+diff --git a/docs/authentication.md b/docs/authentication.md
+index c8fad1c88..d4054b87f 100644
+--- a/docs/authentication.md
++++ b/docs/authentication.md
+@@ -13,10 +13,13 @@ sequenceDiagram
+     participant DB as Database
+ 
+     CLI->>Web: POST /api/auth/cli/code {fingerprintId}
+-    Web->>Web: Generate auth code (1h expiry)
+-    Web->>CLI: Return login URL
++    Web->>Web: Generate signed auth payload (1h expiry)
++    Web->>DB: Store payload behind opaque browser token
++    Web->>CLI: Return login URL with opaque token
+     CLI->>CLI: Open browser
+     Note over Web: User completes OAuth
++    Web->>DB: Resolve opaque token to signed payload
++    Web->>DB: Delete opaque token
+     Web->>DB: Check fingerprint ownership
+     Web->>DB: Create/update session
+     loop Every 5s
+@@ -64,11 +67,14 @@ sequenceDiagram
+ ### 4. Failure: Invalid/Expired Code
+ 
+ - Auth code validation fails or expired (1h limit)
++- Opaque browser tokens resolve expired signed payloads before returning the expired-code error
+ - Returns authentication error
+ 
+ ## Security Features
+ 
+-- Auth codes expire after 1 hour
++- Signed auth payloads expire after 1 hour
++- Browser login URLs use opaque 43-character tokens instead of exposing the signed auth payload
++- Opaque browser tokens are stored in `verificationToken` under `cli-login:<token>` and consumed with `DELETE ... RETURNING` when onboarding resolves them
+ - Fingerprint uniqueness: hardware info + 8 random bytes
+ - Ownership conflicts blocked and logged
+ - Sessions linked to fingerprint_id in database
+diff --git a/freebuff/web/src/app/api/auth/cli/code/route.ts b/freebuff/web/src/app/api/auth/cli/code/route.ts
+index 315284d95..6622af094 100644
+--- a/freebuff/web/src/app/api/auth/cli/code/route.ts
++++ b/freebuff/web/src/app/api/auth/cli/code/route.ts
+@@ -8,6 +8,7 @@ import { and, eq, gt } from 'drizzle-orm'
+ import { NextResponse } from 'next/server'
+ import { z } from 'zod/v4'
+ 
++import { buildCliAuthCode } from '@/app/onboard/_helpers'
+ import { logger } from '@/util/logger'
+ 
+ import { getLoginUrlOrigin } from './_origin'
+@@ -57,7 +58,11 @@ export async function POST(req: Request) {
+       )
+     }
+ 
+-    const authCode = `${fingerprintId}.${expiresAt}.${fingerprintHash}`
++    const authCode = buildCliAuthCode(
++      fingerprintId,
++      expiresAt.toString(),
++      fingerprintHash,
++    )
+     const loginToken = randomBytes(32).toString('base64url')
+ 
+     await db.insert(schema.verificationToken).values({
+diff --git a/freebuff/web/src/app/onboard/__tests__/helpers.test.ts b/freebuff/web/src/app/onboard/__tests__/helpers.test.ts
+index 4d9d0eab9..0a19061b8 100644
+--- a/freebuff/web/src/app/onboard/__tests__/helpers.test.ts
++++ b/freebuff/web/src/app/onboard/__tests__/helpers.test.ts
+@@ -1,7 +1,14 @@
+ import { genAuthCode } from '@codebuff/common/util/credentials'
+ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+ 
+-import { parseAuthCode, validateAuthCode, isAuthCodeExpired } from '../_helpers'
++import {
++  buildCliAuthCode,
++  isAuthCodeExpired,
++  isOpaqueCliAuthCodeToken,
++  parseAuthCode,
++  resolveCliAuthCode,
++  validateAuthCode,
++} from '../_helpers'
+ 
+ describe('freebuff onboard/_helpers', () => {
+   describe('parseAuthCode', () => {
+@@ -78,6 +85,117 @@ describe('freebuff onboard/_helpers', () => {
+     })
+   })
+ 
++  describe('opaque CLI auth code tokens', () => {
++    const testSecret = 'test-secret-key'
++    const testFingerprintId = 'fp-abc123'
++
++    test('builds the signed auth code payload', () => {
++      expect(buildCliAuthCode('fingerprint-id', '1704067200000', 'hash')).toBe(
++        'fingerprint-id.1704067200000.hash',
++      )
++    })
++
++    test('identifies 43 character base64url browser tokens only', () => {
++      const opaqueToken = 'A'.repeat(41) + '-_'
++      const signedAuthCode = buildCliAuthCode(
++        testFingerprintId,
++        '1704067200000',
++        'a'.repeat(64),
++      )
++
++      expect(isOpaqueCliAuthCodeToken(opaqueToken)).toBe(true)
++      expect(isOpaqueCliAuthCodeToken(` ${opaqueToken}\n`)).toBe(true)
++      expect(isOpaqueCliAuthCodeToken(signedAuthCode)).toBe(false)
++      expect(isOpaqueCliAuthCodeToken('A'.repeat(42))).toBe(false)
++      expect(isOpaqueCliAuthCodeToken(`${'A'.repeat(42)}.`)).toBe(false)
++    })
++
++    test('resolves an opaque browser token before validation', async () => {
++      const expiresAt = '4102444800000'
++      const fingerprintHash = genAuthCode(
++        testFingerprintId,
++        expiresAt,
++        testSecret,
++      )
++      const signedAuthCode = buildCliAuthCode(
++        testFingerprintId,
++        expiresAt,
++        fingerprintHash,
++      )
++      const opaqueToken = 'a'.repeat(43)
++
++      const result = await resolveCliAuthCode(opaqueToken, async (token) => {
++        expect(token).toBe(opaqueToken)
++        return signedAuthCode
++      })
++
++      expect(result).toEqual({
++        authCode: signedAuthCode,
++        resolvedOpaqueToken: true,
++      })
++
++      const parsed = parseAuthCode(result.authCode)
++      expect(
++        validateAuthCode(
++          parsed.receivedHash,
++          parsed.fingerprintId,
++          parsed.expiresAt,
++          testSecret,
++        ).valid,
++      ).toBe(true)
++    })
++
++    test('does not look up already signed auth codes', async () => {
++      const signedAuthCode = buildCliAuthCode(
++        testFingerprintId,
++        '4102444800000',
++        'a'.repeat(64),
++      )
++      let lookedUp = false
++
++      const result = await resolveCliAuthCode(signedAuthCode, async () => {
++        lookedUp = true
++        return null
++      })
++
++      expect(lookedUp).toBe(false)
++      expect(result).toEqual({
++        authCode: signedAuthCode,
++        resolvedOpaqueToken: false,
++      })
++    })
++
++    test('resolves expired stored payloads so callers can show expired', async () => {
++      const expiresAt = '0'
++      const fingerprintHash = genAuthCode(
++        testFingerprintId,
++        expiresAt,
++        testSecret,
++      )
++      const signedAuthCode = buildCliAuthCode(
++        testFingerprintId,
++        expiresAt,
++        fingerprintHash,
++      )
++
++      const result = await resolveCliAuthCode(
++        'b'.repeat(43),
++        async () => signedAuthCode,
++      )
++      const parsed = parseAuthCode(result.authCode)
++
++      expect(isAuthCodeExpired(parsed.expiresAt)).toBe(true)
++      expect(
++        validateAuthCode(
++          parsed.receivedHash,
++          parsed.fingerprintId,
++          parsed.expiresAt,
++          testSecret,
++        ).valid,
++      ).toBe(true)
++    })
++  })
++
+   describe('isAuthCodeExpired', () => {
+     let originalDateNow: typeof Date.now
+ 
+diff --git a/freebuff/web/src/app/onboard/_db.ts b/freebuff/web/src/app/onboard/_db.ts
+index 0e3858798..cf9724b16 100644
+--- a/freebuff/web/src/app/onboard/_db.ts
++++ b/freebuff/web/src/app/onboard/_db.ts
+@@ -32,21 +32,17 @@ export async function hasCliSessionForAuthHash(
+   return existing.length > 0
+ }
+ 
+-export async function getCliAuthCodeForToken(
++export async function consumeCliAuthCodeToken(
+   authCodeToken: string,
+ ): Promise<string | null> {
+-  const existing = await db
+-    .select({ authCode: schema.verificationToken.token })
+-    .from(schema.verificationToken)
++  const deleted = await db
++    .delete(schema.verificationToken)
+     .where(
+-      and(
+-        eq(schema.verificationToken.identifier, `cli-login:${authCodeToken}`),
+-        gt(schema.verificationToken.expires, new Date()),
+-      ),
++      eq(schema.verificationToken.identifier, `cli-login:${authCodeToken}`),
+     )
+-    .limit(1)
++    .returning({ authCode: schema.verificationToken.token })
+ 
+-  return existing[0]?.authCode ?? null
++  return deleted[0]?.authCode ?? null
+ }
+ 
+ export async function checkFingerprintConflict(
+diff --git a/freebuff/web/src/app/onboard/_helpers.ts b/freebuff/web/src/app/onboard/_helpers.ts
+index 850a3eaec..a3daf585a 100644
+--- a/freebuff/web/src/app/onboard/_helpers.ts
++++ b/freebuff/web/src/app/onboard/_helpers.ts
+@@ -1,5 +1,39 @@
+ import { genAuthCode } from '@codebuff/common/util/credentials'
+ 
++const OPAQUE_CLI_AUTH_CODE_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/
++
++export function buildCliAuthCode(
++  fingerprintId: string,
++  expiresAt: string,
++  fingerprintHash: string,
++): string {
++  return `${fingerprintId}.${expiresAt}.${fingerprintHash}`
++}
++
++export function isOpaqueCliAuthCodeToken(authCode: string): boolean {
++  return OPAQUE_CLI_AUTH_CODE_TOKEN_RE.test(authCode.trim())
++}
++
++export async function resolveCliAuthCode(
++  authCode: string,
++  consumeCliAuthCodeToken: (authCodeToken: string) => Promise<string | null>,
++): Promise<{ authCode: string; resolvedOpaqueToken: boolean }> {
++  const normalizedAuthCode = authCode.trim()
++  if (!isOpaqueCliAuthCodeToken(normalizedAuthCode)) {
++    return { authCode: normalizedAuthCode, resolvedOpaqueToken: false }
++  }
++
++  const signedAuthCode = await consumeCliAuthCodeToken(normalizedAuthCode)
++  if (!signedAuthCode) {
++    return { authCode: normalizedAuthCode, resolvedOpaqueToken: false }
++  }
++
++  return {
++    authCode: signedAuthCode,
++    resolvedOpaqueToken: true,
++  }
++}
++
+ export function parseAuthCode(authCode: string): {
+   fingerprintId: string
+   expiresAt: string
+diff --git a/freebuff/web/src/app/onboard/page.tsx b/freebuff/web/src/app/onboard/page.tsx
+index 21f6e6135..e39a4a0b3 100644
+--- a/freebuff/web/src/app/onboard/page.tsx
++++ b/freebuff/web/src/app/onboard/page.tsx
+@@ -6,12 +6,17 @@ import { getServerSession } from 'next-auth'
+ 
+ import {
+   checkFingerprintConflict,
++  consumeCliAuthCodeToken,
+   createCliSession,
+-  getCliAuthCodeForToken,
+   getSessionTokenFromCookies,
+   hasCliSessionForAuthHash,
+ } from './_db'
+-import { isAuthCodeExpired, parseAuthCode, validateAuthCode } from './_helpers'
++import {
++  isAuthCodeExpired,
++  parseAuthCode,
++  resolveCliAuthCode,
++  validateAuthCode,
++} from './_helpers'
+ import { authOptions } from '../api/auth/[...nextauth]/auth-options'
+ 
+ import {
+@@ -92,7 +97,8 @@ const Onboard = async ({ searchParams }: PageProps) => {
+     )
+   }
+ 
+-  const resolvedAuthCode = (await getCliAuthCodeForToken(authCode)) ?? authCode
++  const { authCode: resolvedAuthCode, resolvedOpaqueToken } =
++    await resolveCliAuthCode(authCode, consumeCliAuthCodeToken)
+   const { fingerprintId, expiresAt, receivedHash } =
+     parseAuthCode(resolvedAuthCode)
+   const { valid, expectedHash: fingerprintHash } = validateAuthCode(
+@@ -106,7 +112,7 @@ const Onboard = async ({ searchParams }: PageProps) => {
+     logger.warn(
+       {
+         authCodeLength: authCode.length,
+-        resolvedAuthCode: resolvedAuthCode !== authCode,
++        resolvedAuthCode: resolvedOpaqueToken,
+         resolvedAuthCodeLength: resolvedAuthCode.length,
+         dotCount: authCode.match(/\./g)?.length ?? 0,
+         hyphenCount: authCode.match(/-/g)?.length ?? 0,
+diff --git a/web/src/app/api/auth/cli/code/route.ts b/web/src/app/api/auth/cli/code/route.ts
+index 455375d60..1149a46de 100644
+--- a/web/src/app/api/auth/cli/code/route.ts
++++ b/web/src/app/api/auth/cli/code/route.ts
+@@ -8,6 +8,7 @@ import { and, eq, gt } from 'drizzle-orm'
+ import { NextResponse } from 'next/server'
+ import { z } from 'zod/v4'
+ 
++import { buildCliAuthCode } from '@/app/onboard/_helpers'
+ import { logger } from '@/util/logger'
+ 
+ import { getLoginUrlOrigin } from './_origin'
+@@ -59,7 +60,11 @@ export async function POST(req: Request) {
+       )
+     }
+ 
+-    const authCode = `${fingerprintId}.${expiresAt}.${fingerprintHash}`
++    const authCode = buildCliAuthCode(
++      fingerprintId,
++      expiresAt.toString(),
++      fingerprintHash,
++    )
+     const loginToken = randomBytes(32).toString('base64url')
+ 
+     await db.insert(schema.verificationToken).values({
+diff --git a/web/src/app/onboard/__tests__/helpers.test.ts b/web/src/app/onboard/__tests__/helpers.test.ts
+index 2d10f2447..c47c2f642 100644
+--- a/web/src/app/onboard/__tests__/helpers.test.ts
++++ b/web/src/app/onboard/__tests__/helpers.test.ts
+@@ -1,7 +1,14 @@
+ import { genAuthCode } from '@codebuff/common/util/credentials'
+ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+ 
+-import { parseAuthCode, validateAuthCode, isAuthCodeExpired } from '../_helpers'
++import {
++  buildCliAuthCode,
++  isAuthCodeExpired,
++  isOpaqueCliAuthCodeToken,
++  parseAuthCode,
++  resolveCliAuthCode,
++  validateAuthCode,
++} from '../_helpers'
+ 
+ describe('onboard/_helpers', () => {
+   describe('parseAuthCode', () => {
+@@ -206,6 +213,117 @@ describe('onboard/_helpers', () => {
+     })
+   })
+ 
++  describe('opaque CLI auth code tokens', () => {
++    const testSecret = 'test-secret-key'
++    const testFingerprintId = 'fp-abc123'
++
++    test('builds the signed auth code payload', () => {
++      expect(buildCliAuthCode('fingerprint-id', '1704067200000', 'hash')).toBe(
++        'fingerprint-id.1704067200000.hash',
++      )
++    })
++
++    test('identifies 43 character base64url browser tokens only', () => {
++      const opaqueToken = 'A'.repeat(41) + '-_'
++      const signedAuthCode = buildCliAuthCode(
++        testFingerprintId,
++        '1704067200000',
++        'a'.repeat(64),
++      )
++
++      expect(isOpaqueCliAuthCodeToken(opaqueToken)).toBe(true)
++      expect(isOpaqueCliAuthCodeToken(` ${opaqueToken}\n`)).toBe(true)
++      expect(isOpaqueCliAuthCodeToken(signedAuthCode)).toBe(false)
++      expect(isOpaqueCliAuthCodeToken('A'.repeat(42))).toBe(false)
++      expect(isOpaqueCliAuthCodeToken(`${'A'.repeat(42)}.`)).toBe(false)
++    })
++
++    test('resolves an opaque browser token before validation', async () => {
++      const expiresAt = '4102444800000'
++      const fingerprintHash = genAuthCode(
++        testFingerprintId,
++        expiresAt,
++        testSecret,
++      )
++      const signedAuthCode = buildCliAuthCode(
++        testFingerprintId,
++        expiresAt,
++        fingerprintHash,
++      )
++      const opaqueToken = 'a'.repeat(43)
++
++      const result = await resolveCliAuthCode(opaqueToken, async (token) => {
++        expect(token).toBe(opaqueToken)
++        return signedAuthCode
++      })
++
++      expect(result).toEqual({
++        authCode: signedAuthCode,
++        resolvedOpaqueToken: true,
++      })
++
++      const parsed = parseAuthCode(result.authCode)
++      expect(
++        validateAuthCode(
++          parsed.receivedHash,
++          parsed.fingerprintId,
++          parsed.expiresAt,
++          testSecret,
++        ).valid,
++      ).toBe(true)
++    })
++
++    test('does not look up already signed auth codes', async () => {
++      const signedAuthCode = buildCliAuthCode(
++        testFingerprintId,
++        '4102444800000',
++        'a'.repeat(64),
++      )
++      let lookedUp = false
++
++      const result = await resolveCliAuthCode(signedAuthCode, async () => {
++        lookedUp = true
++        return null
++      })
++
++      expect(lookedUp).toBe(false)
++      expect(result).toEqual({
++        authCode: signedAuthCode,
++        resolvedOpaqueToken: false,
++      })
++    })
++
++    test('resolves expired stored payloads so callers can show expired', async () => {
++      const expiresAt = '0'
++      const fingerprintHash = genAuthCode(
++        testFingerprintId,
++        expiresAt,
++        testSecret,
++      )
++      const signedAuthCode = buildCliAuthCode(
++        testFingerprintId,
++        expiresAt,
++        fingerprintHash,
++      )
++
++      const result = await resolveCliAuthCode(
++        'b'.repeat(43),
++        async () => signedAuthCode,
++      )
++      const parsed = parseAuthCode(result.authCode)
++
++      expect(isAuthCodeExpired(parsed.expiresAt)).toBe(true)
++      expect(
++        validateAuthCode(
++          parsed.receivedHash,
++          parsed.fingerprintId,
++          parsed.expiresAt,
++          testSecret,
++        ).valid,
++      ).toBe(true)
++    })
++  })
++
+   describe('isAuthCodeExpired', () => {
+     let originalDateNow: typeof Date.now
+ 
+diff --git a/web/src/app/onboard/_db.ts b/web/src/app/onboard/_db.ts
+index 0e3858798..cf9724b16 100644
+--- a/web/src/app/onboard/_db.ts
++++ b/web/src/app/onboard/_db.ts
+@@ -32,21 +32,17 @@ export async function hasCliSessionForAuthHash(
+   return existing.length > 0
+ }
+ 
+-export async function getCliAuthCodeForToken(
++export async function consumeCliAuthCodeToken(
+   authCodeToken: string,
+ ): Promise<string | null> {
+-  const existing = await db
+-    .select({ authCode: schema.verificationToken.token })
+-    .from(schema.verificationToken)
++  const deleted = await db
++    .delete(schema.verificationToken)
+     .where(
+-      and(
+-        eq(schema.verificationToken.identifier, `cli-login:${authCodeToken}`),
+-        gt(schema.verificationToken.expires, new Date()),
+-      ),
++      eq(schema.verificationToken.identifier, `cli-login:${authCodeToken}`),
+     )
+-    .limit(1)
++    .returning({ authCode: schema.verificationToken.token })
+ 
+-  return existing[0]?.authCode ?? null
++  return deleted[0]?.authCode ?? null
+ }
+ 
+ export async function checkFingerprintConflict(
+diff --git a/web/src/app/onboard/_helpers.ts b/web/src/app/onboard/_helpers.ts
+index 850a3eaec..a3daf585a 100644
+--- a/web/src/app/onboard/_helpers.ts
++++ b/web/src/app/onboard/_helpers.ts
+@@ -1,5 +1,39 @@
+ import { genAuthCode } from '@codebuff/common/util/credentials'
+ 
++const OPAQUE_CLI_AUTH_CODE_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/
++
++export function buildCliAuthCode(
++  fingerprintId: string,
++  expiresAt: string,
++  fingerprintHash: string,
++): string {
++  return `${fingerprintId}.${expiresAt}.${fingerprintHash}`
++}
++
++export function isOpaqueCliAuthCodeToken(authCode: string): boolean {
++  return OPAQUE_CLI_AUTH_CODE_TOKEN_RE.test(authCode.trim())
++}
++
++export async function resolveCliAuthCode(
++  authCode: string,
++  consumeCliAuthCodeToken: (authCodeToken: string) => Promise<string | null>,
++): Promise<{ authCode: string; resolvedOpaqueToken: boolean }> {
++  const normalizedAuthCode = authCode.trim()
++  if (!isOpaqueCliAuthCodeToken(normalizedAuthCode)) {
++    return { authCode: normalizedAuthCode, resolvedOpaqueToken: false }
++  }
++
++  const signedAuthCode = await consumeCliAuthCodeToken(normalizedAuthCode)
++  if (!signedAuthCode) {
++    return { authCode: normalizedAuthCode, resolvedOpaqueToken: false }
++  }
++
++  return {
++    authCode: signedAuthCode,
++    resolvedOpaqueToken: true,
++  }
++}
++
+ export function parseAuthCode(authCode: string): {
+   fingerprintId: string
+   expiresAt: string
+diff --git a/web/src/app/onboard/page.tsx b/web/src/app/onboard/page.tsx
+index aba3ded26..d751222e0 100644
+--- a/web/src/app/onboard/page.tsx
++++ b/web/src/app/onboard/page.tsx
+@@ -6,12 +6,17 @@ import { getServerSession } from 'next-auth'
+ 
+ import {
+   checkFingerprintConflict,
++  consumeCliAuthCodeToken,
+   createCliSession,
+-  getCliAuthCodeForToken,
+   getSessionTokenFromCookies,
+   hasCliSessionForAuthHash,
+ } from './_db'
+-import { isAuthCodeExpired, parseAuthCode, validateAuthCode } from './_helpers'
++import {
++  isAuthCodeExpired,
++  parseAuthCode,
++  resolveCliAuthCode,
++  validateAuthCode,
++} from './_helpers'
+ import { authOptions } from '../api/auth/[...nextauth]/auth-options'
+ 
+ import CardWithBeams from '@/components/card-with-beams'
+@@ -49,7 +54,10 @@ const Onboard = async ({ searchParams }: PageProps) => {
+     )
+   }
+ 
+-  const resolvedAuthCode = (await getCliAuthCodeForToken(authCode)) ?? authCode
++  const { authCode: resolvedAuthCode } = await resolveCliAuthCode(
++    authCode,
++    consumeCliAuthCodeToken,
++  )
+   const { fingerprintId, expiresAt, receivedHash } =
+     parseAuthCode(resolvedAuthCode)
+   const { valid, expectedHash: fingerprintHash } = validateAuthCode(

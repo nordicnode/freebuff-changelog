@@ -1,0 +1,298 @@
+diff --git a/common/src/constants/free-agents.ts b/common/src/constants/free-agents.ts
+new file mode 100644
+index 000000000..48610436f
+--- /dev/null
++++ b/common/src/constants/free-agents.ts
+@@ -0,0 +1,30 @@
++import { parseAgentId } from '../util/agent-id-parsing'
++
++/**
++ * Agents that don't charge credits.
++ *
++ * These are typically lightweight utility agents that:
++ * - Use cheap models (e.g., Gemini Flash Lite)
++ * - Have limited, programmatic capabilities
++ * - Are frequently spawned as subagents
++ *
++ * Making them free avoids user confusion when they connect their own
++ * Claude subscription (BYOK) but still see credit charges for non-Claude models.
++ */
++export const FREE_TIER_AGENTS = new Set([
++  'file-picker',
++  'file-picker-max',
++  'file-lister',
++])
++
++/**
++ * Check if an agent should be free (no credit charge).
++ * Handles all agent ID formats:
++ * - 'file-picker'
++ * - 'file-picker@1.0.0'
++ * - 'codebuff/file-picker@0.0.2'
++ */
++export function isFreeAgent(fullAgentId: string): boolean {
++  const { agentId } = parseAgentId(fullAgentId)
++  return agentId ? FREE_TIER_AGENTS.has(agentId) : false
++}
+diff --git a/web/src/llm-api/helpers.ts b/web/src/llm-api/helpers.ts
+index 5c754ade8..b31b4e18c 100644
+--- a/web/src/llm-api/helpers.ts
++++ b/web/src/llm-api/helpers.ts
+@@ -1,5 +1,6 @@
+ import { setupBigQuery } from '@codebuff/bigquery'
+ import { consumeCreditsAndAddAgentStep } from '@codebuff/billing'
++import { isFreeAgent } from '@codebuff/common/constants/free-agents'
+ import { PROFIT_MARGIN } from '@codebuff/common/old-constants'
+ 
+ import type { InsertMessageBigqueryFn } from '@codebuff/common/types/contracts/bigquery'
+@@ -101,7 +102,7 @@ export async function consumeCreditsForMessage(params: {
+   usageData: UsageData
+   byok: boolean
+   logger: Logger
+-}) {
++}): Promise<number> {
+   const {
+     messageId,
+     userId,
+@@ -118,6 +119,11 @@ export async function consumeCreditsForMessage(params: {
+     logger,
+   } = params
+ 
++  // Free tier agents (like file-picker) don't charge credits to avoid confusion
++  // when users connect their Claude subscription but subagents use other models
++  const initialCredits = Math.round(usageData.cost * 100 * (1 + PROFIT_MARGIN))
++  const credits = isFreeAgent(agentId) && initialCredits < 5 ? 0 : initialCredits
++
+   await consumeCreditsAndAddAgentStep({
+     messageId,
+     userId,
+@@ -130,7 +136,7 @@ export async function consumeCreditsForMessage(params: {
+     reasoningText,
+     response: responseText,
+     cost: usageData.cost,
+-    credits: Math.round(usageData.cost * 100 * (1 + PROFIT_MARGIN)),
++    credits,
+     inputTokens: usageData.inputTokens,
+     cacheCreationInputTokens: null,
+     cacheReadInputTokens: usageData.cacheReadInputTokens,
+@@ -140,4 +146,6 @@ export async function consumeCreditsForMessage(params: {
+     byok,
+     logger,
+   })
++
++  return credits
+ }
+diff --git a/web/src/llm-api/openrouter.ts b/web/src/llm-api/openrouter.ts
+index 228164266..536b9891b 100644
+--- a/web/src/llm-api/openrouter.ts
++++ b/web/src/llm-api/openrouter.ts
+@@ -1,3 +1,4 @@
++import { PROFIT_MARGIN } from '@codebuff/common/constants/limits'
+ import { getErrorObject } from '@codebuff/common/util/error'
+ import { env } from '@codebuff/internal/env'
+ 
+@@ -17,6 +18,13 @@ import type { InsertMessageBigqueryFn } from '@codebuff/common/types/contracts/b
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ 
+ type StreamState = { responseText: string; reasoningText: string }
++
++/** Result from processing a line, including optional billed credits for final chunk */
++type LineResult = {
++  state: StreamState
++  billedCredits?: number
++}
++
+ function createOpenRouterRequest(params: {
+   body: any
+   openrouterApiKey: string | null
+@@ -143,8 +151,8 @@ export async function handleOpenRouterNonStream({
+       logger.error({ error }, 'Failed to insert message into BigQuery')
+     })
+ 
+-    // Consume credits
+-    await consumeCreditsForMessage({
++    // Consume credits and get the actual billed amount
++    const billedCredits = await consumeCreditsForMessage({
+       messageId: firstData.id,
+       userId,
+       stripeCustomerId,
+@@ -175,7 +183,9 @@ export async function handleOpenRouterNonStream({
+         completion_tokens: aggregatedUsage.outputTokens,
+         total_tokens:
+           aggregatedUsage.inputTokens + aggregatedUsage.outputTokens,
+-        cost: aggregatedUsage.cost,
++        // Overwrite cost so SDK calculates exact credits we charged
++        cost: creditsToFakeCost(billedCredits),
++        cost_details: { upstream_inference_cost: 0 },
+       },
+     }
+   }
+@@ -211,8 +221,8 @@ export async function handleOpenRouterNonStream({
+     logger.error({ error }, 'Failed to insert message into BigQuery')
+   })
+ 
+-  // Consume credits
+-  await consumeCreditsForMessage({
++  // Consume credits and get the actual billed amount
++  const billedCredits = await consumeCreditsForMessage({
+     messageId: data.id,
+     userId,
+     stripeCustomerId,
+@@ -228,6 +238,12 @@ export async function handleOpenRouterNonStream({
+     logger,
+   })
+ 
++  // Overwrite cost so SDK calculates exact credits we charged
++  if (data.usage) {
++    data.usage.cost = creditsToFakeCost(billedCredits)
++    data.usage.cost_details = { upstream_inference_cost: 0 }
++  }
++
+   return data
+ }
+ 
+@@ -323,7 +339,7 @@ export async function handleOpenRouterStream({
+             const line = buffer.slice(0, lineEnd + 1)
+             buffer = buffer.slice(lineEnd + 1)
+ 
+-            state = await handleLine({
++            const lineResult = await handleLine({
+               userId,
+               stripeCustomerId,
+               agentId,
+@@ -337,10 +353,15 @@ export async function handleOpenRouterStream({
+               logger,
+               insertMessage: insertMessageBigquery,
+             })
++            state = lineResult.state
+ 
+             if (!clientDisconnected) {
+               try {
+-                controller.enqueue(new TextEncoder().encode(line))
++                // Overwrite cost in final chunk so SDK calculates exact credits we charged
++                const lineToSend = lineResult.billedCredits !== undefined
++                  ? overwriteCostWithBilledCredits(line, lineResult.billedCredits)
++                  : line
++                controller.enqueue(new TextEncoder().encode(lineToSend))
+               } catch (error) {
+                 logger.warn(
+                   'Client disconnected during stream, continuing for billing',
+@@ -413,14 +434,14 @@ async function handleLine({
+   state: StreamState
+   logger: Logger
+   insertMessage: InsertMessageBigqueryFn
+-}): Promise<StreamState> {
++}): Promise<LineResult> {
+   if (!line.startsWith('data: ')) {
+-    return state
++    return { state }
+   }
+ 
+   const raw = line.slice('data: '.length)
+   if (raw === '[DONE]\n') {
+-    return state
++    return { state }
+   }
+ 
+   // Parse the string into an object
+@@ -432,7 +453,7 @@ async function handleLine({
+       { error: getErrorObject(error, { includeRawError: true }) },
+       'Received non-JSON OpenRouter response',
+     )
+-    return state
++    return { state }
+   }
+ 
+   // Extract usage
+@@ -442,10 +463,10 @@ async function handleLine({
+       { error: getErrorObject(parsed.error, { includeRawError: true }) },
+       'Unable to parse OpenRouter response',
+     )
+-    return state
++    return { state }
+   }
+ 
+-  return await handleResponse({
++  return handleResponse({
+     userId,
+     stripeCustomerId,
+     agentId,
+@@ -487,7 +508,7 @@ async function handleResponse({
+   state: StreamState
+   logger: Logger
+   insertMessage: InsertMessageBigqueryFn
+-}): Promise<StreamState> {
++}): Promise<LineResult> {
+   const model = 'model' in data ? data.model : undefined
+   state = await handleStreamChunk({
+     data,
+@@ -500,7 +521,7 @@ async function handleResponse({
+ 
+   if ('error' in data || !data.usage) {
+     // Stream not finished
+-    return state
++    return { state }
+   }
+ 
+   const usageData = extractUsageAndCost(data.usage)
+@@ -520,7 +541,8 @@ async function handleResponse({
+     logger.error({ error }, 'Failed to insert message into BigQuery')
+   })
+ 
+-  await consumeCreditsForMessage({
++  // Consume credits and get the actual billed amount
++  const billedCredits = await consumeCreditsForMessage({
+     messageId: data.id,
+     userId,
+     stripeCustomerId,
+@@ -536,7 +558,7 @@ async function handleResponse({
+     logger,
+   })
+ 
+-  return state
++  return { state, billedCredits }
+ }
+ 
+ async function handleStreamChunk({
+@@ -727,3 +749,41 @@ async function parseOpenRouterError(
+   }
+   return new OpenRouterError(response.status, response.statusText, errorBody)
+ }
++
++/**
++ * Convert credits (integer cents) back to a cost value that will result in the same
++ * credits when the SDK applies its formula: credits = Math.round(cost * (1 + PROFIT_MARGIN) * 100)
++ */
++function creditsToFakeCost(credits: number): number {
++  return credits / ((1 + PROFIT_MARGIN) * 100)
++}
++
++/**
++ * Overwrite the cost field in the final SSE chunk to reflect actual billed credits.
++ * This ensures the SDK calculates the exact credits value we stored in the database,
++ * making the server the single source of truth for credit tracking.
++ */
++function overwriteCostWithBilledCredits(line: string, billedCredits: number): string {
++  if (!line.startsWith('data: ')) {
++    return line
++  }
++
++  const raw = line.slice('data: '.length)
++  if (raw === '[DONE]\n' || raw === '[DONE]') {
++    return line
++  }
++
++  try {
++    const obj = JSON.parse(raw)
++    // Only modify if there's usage data (final chunk)
++    if (obj.usage) {
++      obj.usage.cost = creditsToFakeCost(billedCredits)
++      obj.usage.cost_details = { upstream_inference_cost: 0 }
++      return `data: ${JSON.stringify(obj)}\n`
++    }
++  } catch {
++    // If parsing fails, return original line
++  }
++
++  return line
++}

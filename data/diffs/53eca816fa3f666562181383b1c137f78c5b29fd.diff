@@ -1,0 +1,390 @@
+diff --git a/packages/agent-runtime/src/llm-api/codebuff-web-api.ts b/packages/agent-runtime/src/llm-api/codebuff-web-api.ts
+index f518a03f6..1b0b98c97 100644
+--- a/packages/agent-runtime/src/llm-api/codebuff-web-api.ts
++++ b/packages/agent-runtime/src/llm-api/codebuff-web-api.ts
+@@ -3,6 +3,9 @@ import type { ClientEnv, CiEnv } from '@codebuff/common/types/contracts/env'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ 
+ const FETCH_TIMEOUT_MS = 30_000
++const MAX_RETRIES = 3
++const RETRY_BASE_DELAY_MS = 1000
++const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504])
+ 
+ interface CodebuffWebApiEnv {
+   clientEnv: ClientEnv
+@@ -50,55 +53,103 @@ const callCodebuffV1 = async (params: {
+   }
+ 
+   const url = `${baseUrl}${endpoint}`
++  let lastError: string | undefined
+ 
+-  try {
+-    const res = await withTimeout(
+-      fetch(url, {
+-        method: 'POST',
+-        headers: {
+-          'Content-Type': 'application/json',
+-          Authorization: `Bearer ${apiKey}`,
+-          'x-codebuff-api-key': apiKey,
+-        },
+-        body: JSON.stringify(payload),
+-      }),
+-      FETCH_TIMEOUT_MS,
+-    )
++  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
++    try {
++      const res = await withTimeout(
++        fetch(url, {
++          method: 'POST',
++          headers: {
++            'Content-Type': 'application/json',
++            Authorization: `Bearer ${apiKey}`,
++            'x-codebuff-api-key': apiKey,
++          },
++          body: JSON.stringify(payload),
++        }),
++        FETCH_TIMEOUT_MS,
++      )
+ 
+-    const text = await res.text()
+-    const json = tryParseJson(text)
++      const text = await res.text()
++      const json = tryParseJson(text)
+ 
+-    if (!res.ok) {
+-      const err =
+-        getStringField(json, 'error') ??
+-        getStringField(json, 'message') ??
+-        text ??
+-        'Request failed'
+-      logger.warn(
++      if (!res.ok) {
++        const err =
++          getStringField(json, 'error') ??
++          getStringField(json, 'message') ??
++          text ??
++          'Request failed'
++
++        // Retry on transient errors
++        if (RETRYABLE_STATUS_CODES.has(res.status) && attempt < MAX_RETRIES) {
++          const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
++          logger.warn(
++            {
++              url,
++              status: res.status,
++              statusText: res.statusText,
++              attempt,
++              maxRetries: MAX_RETRIES,
++              nextRetryDelayMs: delay,
++            },
++            `Web API ${requestName} request failed with retryable status, retrying...`,
++          )
++          await new Promise((resolve) => setTimeout(resolve, delay))
++          lastError = err
++          continue
++        }
++
++        logger.warn(
++          {
++            url,
++            status: res.status,
++            statusText: res.statusText,
++            body: text?.slice(0, 500),
++            attempt,
++          },
++          `Web API ${requestName} request failed`,
++        )
++        return { error: err }
++      }
++
++      return { json, creditsUsed: getNumberField(json, 'creditsUsed') }
++    } catch (error) {
++      lastError = error instanceof Error ? error.message : 'Network error'
++
++      // Retry on network errors
++      if (attempt < MAX_RETRIES) {
++        const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
++        logger.warn(
++          {
++            error:
++              error instanceof Error
++                ? { name: error.name, message: error.message }
++                : error,
++            attempt,
++            maxRetries: MAX_RETRIES,
++            nextRetryDelayMs: delay,
++          },
++          `Web API ${requestName} network error, retrying...`,
++        )
++        await new Promise((resolve) => setTimeout(resolve, delay))
++        continue
++      }
++
++      logger.error(
+         {
+-          url,
+-          status: res.status,
+-          statusText: res.statusText,
+-          body: text?.slice(0, 500),
++          error:
++            error instanceof Error
++              ? { name: error.name, message: error.message, stack: error.stack }
++              : error,
++          attempt,
+         },
+-        `Web API ${requestName} request failed`,
++        `Web API ${requestName} network error after all retries`,
+       )
+-      return { error: err }
++      return { error: lastError }
+     }
+-
+-    return { json, creditsUsed: getNumberField(json, 'creditsUsed') }
+-  } catch (error) {
+-    logger.error(
+-      {
+-        error:
+-          error instanceof Error
+-            ? { name: error.name, message: error.message, stack: error.stack }
+-            : error,
+-      },
+-      `Web API ${requestName} network error`,
+-    )
+-    return { error: error instanceof Error ? error.message : 'Network error' }
+   }
++
++  return { error: lastError ?? 'Request failed after all retries' }
+ }
+ 
+ export async function callWebSearchAPI(params: {
+diff --git a/sdk/src/impl/database.ts b/sdk/src/impl/database.ts
+index a2f592b3a..9efbb5a6a 100644
+--- a/sdk/src/impl/database.ts
++++ b/sdk/src/impl/database.ts
+@@ -9,7 +9,13 @@ import {
+   createNetworkError,
+   createServerError,
+   createHttpError,
++  isRetryableStatusCode,
+ } from '../error-utils'
++import {
++  MAX_RETRIES_PER_MESSAGE,
++  RETRY_BACKOFF_BASE_DELAY_MS,
++  RETRY_BACKOFF_MAX_DELAY_MS,
++} from '../retry-config'
+ 
+ import type {
+   AddAgentStepFn,
+@@ -37,6 +43,58 @@ const agentsResponseSchema = z.object({
+   data: DynamicAgentTemplateSchema,
+ })
+ 
++/**
++ * Fetch with retry logic for transient errors (502, 503, etc.)
++ * Implements exponential backoff between retries.
++ */
++async function fetchWithRetry(
++  url: URL | string,
++  options: RequestInit,
++  logger?: { warn: (obj: object, msg: string) => void },
++): Promise<Response> {
++  let lastError: Error | null = null
++  let backoffDelay = RETRY_BACKOFF_BASE_DELAY_MS
++
++  for (let attempt = 0; attempt <= MAX_RETRIES_PER_MESSAGE; attempt++) {
++    try {
++      const response = await fetch(url, options)
++
++      // If response is OK or not retryable, return it
++      if (response.ok || !isRetryableStatusCode(response.status)) {
++        return response
++      }
++
++      // Retryable error - log and continue to retry
++      if (attempt < MAX_RETRIES_PER_MESSAGE) {
++        logger?.warn(
++          { status: response.status, attempt: attempt + 1, url: String(url) },
++          `Retryable HTTP error, retrying in ${backoffDelay}ms`,
++        )
++        await new Promise((resolve) => setTimeout(resolve, backoffDelay))
++        backoffDelay = Math.min(backoffDelay * 2, RETRY_BACKOFF_MAX_DELAY_MS)
++      } else {
++        // Last attempt, return the response even if it's an error
++        return response
++      }
++    } catch (error) {
++      // Network-level error (DNS, connection refused, etc.)
++      lastError = error instanceof Error ? error : new Error(String(error))
++
++      if (attempt < MAX_RETRIES_PER_MESSAGE) {
++        logger?.warn(
++          { error: getErrorObject(lastError), attempt: attempt + 1, url: String(url) },
++          `Network error, retrying in ${backoffDelay}ms`,
++        )
++        await new Promise((resolve) => setTimeout(resolve, backoffDelay))
++        backoffDelay = Math.min(backoffDelay * 2, RETRY_BACKOFF_MAX_DELAY_MS)
++      }
++    }
++  }
++
++  // All retries exhausted - throw the last error
++  throw lastError ?? new Error('Request failed after retries')
++}
++
+ export async function getUserInfoFromApiKey<T extends UserColumn>(
+   params: GetUserInfoFromApiKeyInput<T>,
+ ): GetUserInfoFromApiKeyOutput<T> {
+@@ -70,12 +128,16 @@ export async function getUserInfoFromApiKey<T extends UserColumn>(
+ 
+   let response: Response
+   try {
+-    response = await fetch(url, {
+-      method: 'GET',
+-      headers: {
+-        Authorization: `Bearer ${apiKey}`,
++    response = await fetchWithRetry(
++      url,
++      {
++        method: 'GET',
++        headers: {
++          Authorization: `Bearer ${apiKey}`,
++        },
+       },
+-    })
++      logger,
++    )
+   } catch (error) {
+     logger.error(
+       { error: getErrorObject(error), apiKey, fields },
+@@ -161,12 +223,16 @@ export async function fetchAgentFromDatabase(
+   )
+ 
+   try {
+-    const response = await fetch(url, {
+-      method: 'GET',
+-      headers: {
+-        Authorization: `Bearer ${apiKey}`,
++    const response = await fetchWithRetry(
++      url,
++      {
++        method: 'GET',
++        headers: {
++          Authorization: `Bearer ${apiKey}`,
++        },
+       },
+-    })
++      logger,
++    )
+ 
+     if (!response.ok) {
+       logger.error({ response }, 'fetchAgentFromDatabase request failed')
+@@ -240,17 +306,21 @@ export async function startAgentRun(
+   const url = new URL(`/api/v1/agent-runs`, WEBSITE_URL)
+ 
+   try {
+-    const response = await fetch(url, {
+-      method: 'POST',
+-      headers: {
+-        Authorization: `Bearer ${apiKey}`,
++    const response = await fetchWithRetry(
++      url,
++      {
++        method: 'POST',
++        headers: {
++          Authorization: `Bearer ${apiKey}`,
++        },
++        body: JSON.stringify({
++          action: 'START',
++          agentId,
++          ancestorRunIds,
++        }),
+       },
+-      body: JSON.stringify({
+-        action: 'START',
+-        agentId,
+-        ancestorRunIds,
+-      }),
+-    })
++      logger,
++    )
+ 
+     if (!response.ok) {
+       logger.error({ response }, 'startAgentRun request failed')
+@@ -290,20 +360,24 @@ export async function finishAgentRun(
+   const url = new URL(`/api/v1/agent-runs`, WEBSITE_URL)
+ 
+   try {
+-    const response = await fetch(url, {
+-      method: 'POST',
+-      headers: {
+-        Authorization: `Bearer ${apiKey}`,
++    const response = await fetchWithRetry(
++      url,
++      {
++        method: 'POST',
++        headers: {
++          Authorization: `Bearer ${apiKey}`,
++        },
++        body: JSON.stringify({
++          action: 'FINISH',
++          runId,
++          status,
++          totalSteps,
++          directCredits,
++          totalCredits,
++        }),
+       },
+-      body: JSON.stringify({
+-        action: 'FINISH',
+-        runId,
+-        status,
+-        totalSteps,
+-        directCredits,
+-        totalCredits,
+-      }),
+-    })
++      logger,
++    )
+ 
+     if (!response.ok) {
+       logger.error({ response }, 'finishAgentRun request failed')
+@@ -336,21 +410,25 @@ export async function addAgentStep(
+   const url = new URL(`/api/v1/agent-runs/${agentRunId}/steps`, WEBSITE_URL)
+ 
+   try {
+-    const response = await fetch(url, {
+-      method: 'POST',
+-      headers: {
+-        Authorization: `Bearer ${apiKey}`,
++    const response = await fetchWithRetry(
++      url,
++      {
++        method: 'POST',
++        headers: {
++          Authorization: `Bearer ${apiKey}`,
++        },
++        body: JSON.stringify({
++          stepNumber,
++          credits,
++          childRunIds,
++          messageId,
++          status,
++          errorMessage,
++          startTime,
++        }),
+       },
+-      body: JSON.stringify({
+-        stepNumber,
+-        credits,
+-        childRunIds,
+-        messageId,
+-        status,
+-        errorMessage,
+-        startTime,
+-      }),
+-    })
++      logger,
++    )
+ 
+     const responseBody = await response.json()
+     if (!response.ok) {

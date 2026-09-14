@@ -1,0 +1,251 @@
+diff --git a/.github/workflows/freebuff-e2e.yml b/.github/workflows/freebuff-e2e.yml
+index f6fd424c7..dfb86390d 100644
+--- a/.github/workflows/freebuff-e2e.yml
++++ b/.github/workflows/freebuff-e2e.yml
+@@ -73,7 +73,20 @@ jobs:
+       - uses: ./.github/actions/setup-project
+ 
+       - name: Install tmux
+-        run: sudo apt-get update && sudo apt-get install -y tmux
++        run: |
++          if command -v tmux >/dev/null 2>&1; then
++            tmux -V
++            exit 0
++          fi
++
++          timeout 120s sudo apt-get install -y --no-install-recommends tmux || (
++            timeout 120s sudo apt-get update \
++              -o Acquire::Retries=3 \
++              -o Acquire::http::Timeout=20 \
++              -o Acquire::https::Timeout=20 &&
++            timeout 120s sudo apt-get install -y --no-install-recommends tmux
++          )
++          tmux -V
+ 
+       - name: Download Freebuff binary
+         uses: actions/download-artifact@v8
+diff --git a/packages/agent-runtime/src/__tests__/tool-validation-error.test.ts b/packages/agent-runtime/src/__tests__/tool-validation-error.test.ts
+index 50ef219ac..9b834024a 100644
+--- a/packages/agent-runtime/src/__tests__/tool-validation-error.test.ts
++++ b/packages/agent-runtime/src/__tests__/tool-validation-error.test.ts
+@@ -174,6 +174,51 @@ describe('tool validation error handling', () => {
+     }
+   })
+ 
++  it('should summarize missing replacement fields without implying deletion', () => {
++    const result = parseRawToolCall({
++      rawToolCall: {
++        toolName: 'str_replace',
++        toolCallId: 'missing-new-tool-call-id',
++        input: {
++          path: 'test.ts',
++          replacements: [
++            { old: 'before', new: 'after' },
++            { old: 'delete me' },
++            { old: 'delete me too' },
++          ],
++        },
++      },
++    })
++
++    expect('error' in result).toBe(true)
++    if ('error' in result) {
++      expect(result.error).toContain('Missing required replacement fields:')
++      expect(result.error).toContain('- replacements[1].new')
++      expect(result.error).toContain('- replacements[2].new')
++      expect(result.error).toContain(
++        'If the intent is deletion, set "new": "" explicitly.',
++      )
++      expect(result.error).toContain('Raw validation issues:')
++    }
++  })
++
++  it('should include JSON parse details for incomplete stringified input', () => {
++    const result = parseRawToolCall({
++      rawToolCall: {
++        toolName: 'write_file',
++        toolCallId: 'incomplete-stringified-tool-call-id',
++        input:
++          '{"path": ".agents/deep-thinkers/meta-coordinator.ts", "instructions": "Creates a meta-coordinator"',
++      },
++    })
++
++    expect('error' in result).toBe(true)
++    if ('error' in result) {
++      expect(result.error).toContain('The JSON parser reported:')
++      expect(result.error).toContain('If the arguments are incomplete')
++    }
++  })
++
+   it('should emit error event instead of tool result when spawn_agents receives invalid parameters', async () => {
+     // This simulates what happens when the LLM passes a string instead of an array to spawn_agents
+     // The error from Anthropic was: "Invalid parameters for spawn_agents: expected array, received string"
+diff --git a/packages/agent-runtime/src/tools/tool-executor.ts b/packages/agent-runtime/src/tools/tool-executor.ts
+index a3f1a036b..303765ea7 100644
+--- a/packages/agent-runtime/src/tools/tool-executor.ts
++++ b/packages/agent-runtime/src/tools/tool-executor.ts
+@@ -94,8 +94,12 @@ function repairBareStringFieldObject(input: string, toolName: string): unknown {
+   return { [field]: value }
+ }
+ 
+-function parseStringifiedToolInput(input: unknown, toolName: string): unknown {
++function parseStringifiedToolInput(
++  input: unknown,
++  toolName: string,
++): { input: unknown; parseError?: string } {
+   let parsed = input
++  let parseError: string | undefined
+ 
+   // Some providers/models double-encode tool arguments, for example an input
+   // value like "\"{\\\"path\\\":\\\"file.ts\\\"}\"". Repeated JSON.parse
+@@ -104,27 +108,76 @@ function parseStringifiedToolInput(input: unknown, toolName: string): unknown {
+     const stringInput = parsed
+     try {
+       parsed = JSON.parse(stringInput)
+-    } catch {
++      parseError = undefined
++    } catch (error) {
+       const repaired = repairBareStringFieldObject(stringInput, toolName)
+       if (repaired !== undefined) {
+         parsed = repaired
++        parseError = undefined
++      } else {
++        parseError = error instanceof Error ? error.message : String(error)
+       }
+       break
+     }
+   }
+ 
+-  return parsed
++  return { input: parsed, parseError }
+ }
+ 
+-function stringInputError(toolName: string, toolCallId: string): ToolCallError {
++function stringInputError(
++  toolName: string,
++  toolCallId: string,
++  parseError?: string,
++): ToolCallError {
++  const parseDetails = parseError
++    ? ` The JSON parser reported: ${parseError}. If the arguments are incomplete, re-issue the full object.`
++    : ''
+   return {
+     toolName,
+     toolCallId,
+     input: {},
+-    error: `Invalid parameters for ${toolName}: tool arguments were a string, not a JSON object. The runtime tried to parse stringified JSON before validation, but the value was still not a JSON object. Re-issue the tool call as a JSON object with properly escaped string values.`,
++    error: `Invalid parameters for ${toolName}: tool arguments were a string, not a JSON object. The runtime tried to parse stringified JSON before validation, but the value was still not a JSON object.${parseDetails} Re-issue the tool call as a JSON object with properly escaped string values.`,
+   }
+ }
+ 
++function summarizeMissingReplacementFields(
++  toolName: string,
++  issues: Array<{
++    expected?: unknown
++    code?: string
++    path?: PropertyKey[]
++    message?: string
++  }>,
++): string | undefined {
++  if (toolName !== 'str_replace' && toolName !== 'propose_str_replace') {
++    return undefined
++  }
++
++  const missingFields = issues.flatMap((issue) => {
++    const [root, index, field] = issue.path ?? []
++    const isMissingReplacementString =
++      issue.code === 'invalid_type' &&
++      issue.expected === 'string' &&
++      issue.message?.includes('received undefined') &&
++      root === 'replacements' &&
++      typeof index === 'number' &&
++      (field === 'old' || field === 'new')
++
++    return isMissingReplacementString ? [`replacements[${index}].${field}`] : []
++  })
++
++  if (missingFields.length !== issues.length || missingFields.length === 0) {
++    return undefined
++  }
++
++  return [
++    'Missing required replacement fields:',
++    ...missingFields.map((field) => `- ${field}`),
++    '',
++    'If the intent is deletion, set "new": "" explicitly.',
++  ].join('\n')
++}
++
+ function getToolValidationHint(toolName: string): string | undefined {
+   if (toolName === 'str_replace' || toolName === 'propose_str_replace') {
+     return 'Expected shape: { "path": string, "replacements": [{ "old": string, "new": string, "allowMultiple"?: boolean }] }.'
+@@ -151,23 +204,32 @@ export function parseRawToolCall<T extends ToolName = ToolName>(params: {
+   )
+   const paramsSchema = toolParams[toolName].inputSchema
+ 
+-  if (typeof processedParameters === 'string') {
+-    return stringInputError(toolName, rawToolCall.toolCallId)
++  if (typeof processedParameters.input === 'string') {
++    return stringInputError(
++      toolName,
++      rawToolCall.toolCallId,
++      processedParameters.parseError,
++    )
+   }
+ 
+-  const result = paramsSchema.safeParse(processedParameters)
++  const result = paramsSchema.safeParse(processedParameters.input)
+ 
+   if (!result.success) {
+     const hint = getToolValidationHint(toolName)
++    const summary = summarizeMissingReplacementFields(
++      toolName,
++      result.error.issues,
++    )
++    const validationDetails = JSON.stringify(result.error.issues, null, 2)
+     return {
+       toolName,
+       toolCallId: rawToolCall.toolCallId,
+       input: rawToolCall.input,
+-      error: `Invalid parameters for ${toolName}: ${JSON.stringify(
+-        result.error.issues,
+-        null,
+-        2,
+-      )}${hint ? `\n\n${hint}` : ''}`,
++      error: `Invalid parameters for ${toolName}: ${
++        summary
++          ? `${summary}\n\nRaw validation issues:\n${validationDetails}`
++          : validationDetails
++      }${hint ? `\n\n${hint}` : ''}`,
+     }
+   }
+ 
+@@ -496,12 +558,16 @@ export function parseRawCustomToolCall(params: {
+ 
+   const parsedInput = parseStringifiedToolInput(rawToolCall.input, toolName)
+ 
+-  if (typeof parsedInput === 'string') {
+-    return stringInputError(toolName, rawToolCall.toolCallId)
++  if (typeof parsedInput.input === 'string') {
++    return stringInputError(
++      toolName,
++      rawToolCall.toolCallId,
++      parsedInput.parseError,
++    )
+   }
+ 
+   const processedParameters: Record<string, any> = {}
+-  for (const [param, val] of Object.entries(parsedInput ?? {})) {
++  for (const [param, val] of Object.entries(parsedInput.input ?? {})) {
+     processedParameters[param] = val
+   }
+ 
+@@ -530,7 +596,7 @@ export function parseRawCustomToolCall(params: {
+     }
+   }
+ 
+-  const input = JSON.parse(JSON.stringify(parsedInput))
++  const input = JSON.parse(JSON.stringify(parsedInput.input))
+   if (endsAgentStepParam in input) {
+     delete input[endsAgentStepParam]
+   }

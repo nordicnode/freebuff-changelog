@@ -1,0 +1,743 @@
+diff --git a/evals/buffbench/README.md b/evals/buffbench/README.md
+index c52d7212f..2707cdd2b 100644
+--- a/evals/buffbench/README.md
++++ b/evals/buffbench/README.md
+@@ -133,6 +133,37 @@ The AI judge evaluates three dimensions:
+ - **Binary Installation**: Install required tools (e.g., linters, test runners) in isolated environments
+ - **Custom Environment**: Set environment variables for evaluation runs
+ 
++### External CLI Agents
++
++BuffBench supports running external CLI coding agents for comparison:
++
++- **Claude Code**: Use `external:claude` - requires `claude` CLI installed
++- **Codex**: Use `external:codex` - requires `codex` CLI installed
++
++Example comparing Codebuff vs Claude Code:
++
++```typescript
++await runBuffBench({
++  evalDataPath: 'evals/buffbench/eval-codebuff.json',
++  agents: ['base2', 'external:claude'],
++  taskConcurrency: 3,
++})
++```
++
++### Prerequisites for External Agents
++
++**Claude Code CLI:**
++```bash
++npm install -g @anthropic-ai/claude-code
++# Set ANTHROPIC_API_KEY or CLAUDE_CODE_KEY environment variable
++```
++
++**Codex CLI:**
++```bash
++npm install -g @openai/codex
++# Set OPENAI_API_KEY environment variable
++```
++
+ ## Directory Structure
+ 
+ ```
+diff --git a/evals/buffbench/agent-runner.ts b/evals/buffbench/agent-runner.ts
+index da183bcb4..1cf21a4ec 100644
+--- a/evals/buffbench/agent-runner.ts
++++ b/evals/buffbench/agent-runner.ts
+@@ -1,5 +1,3 @@
+-import fs from 'fs'
+-import path from 'path'
+ import { execSync } from 'child_process'
+ import { promisify } from 'util'
+ import { exec } from 'child_process'
+@@ -9,13 +7,16 @@ const execAsync = promisify(exec)
+ import { withTimeout } from '@codebuff/common/util/promise'
+ import { CodebuffClient } from '@codebuff/sdk'
+ import { withTestRepo } from '../subagents/test-repo-utils'
++import { ClaudeRunner } from './runners/claude'
++import { CodexRunner } from './runners/codex'
++import { CodebuffRunner } from './runners/codebuff'
+ 
+-import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+ import type { EvalCommitV2, FinalCheckOutput } from './types'
++import type { Runner, AgentStep } from './runners/runner'
+ 
+-export type AgentStep = PrintModeEvent
++export type { AgentStep }
+ 
+-const DEBUG_ERROR = true
++export type ExternalAgentType = 'claude' | 'codex'
+ 
+ export async function runAgentOnCommit({
+   client,
+@@ -27,6 +28,7 @@ export async function runAgentOnCommit({
+   localAgentDefinitions,
+   printEvents,
+   finalCheckCommands,
++  externalAgentType,
+ }: {
+   client: CodebuffClient
+   agentId: string
+@@ -37,6 +39,7 @@ export async function runAgentOnCommit({
+   localAgentDefinitions: any[]
+   printEvents: boolean
+   finalCheckCommands?: string[]
++  externalAgentType?: ExternalAgentType
+ }): Promise<{
+   diff: string
+   contextFiles: Record<string, string>
+@@ -66,59 +69,33 @@ export async function runAgentOnCommit({
+           env,
+         },
+         async (repoDir) => {
+-          const maxAgentSteps = 40
+-          const result = await client.run({
+-            agent: agentId,
+-            prompt: commit.prompt,
+-            agentDefinitions: localAgentDefinitions,
+-            cwd: repoDir,
+-            env,
+-            maxAgentSteps,
+-            handleEvent: (event) => {
+-              if (
+-                (event.type === 'tool_call' || event.type === 'tool_result') &&
+-                event.toolName === 'set_messages'
+-              ) {
+-                return
+-              }
+-              if (event.type === 'error') {
+-                console.error(
+-                  `[${commit.id}:${agentId}] Error event:`,
+-                  event.message,
+-                )
+-                if (DEBUG_ERROR && !event.message.startsWith('Invalid JSON')) {
+-                  // Save errors in a file, but not tool calls with invalid json.
+-                  fs.writeFileSync(
+-                    path.join(
+-                      __dirname,
+-                      `${commit.id}-${agentId}-error-${Math.random().toString(36).substring(2, 6)}.json`,
+-                    ),
+-                    JSON.stringify(
+-                      {
+-                        error: event.message,
+-                        trace: trace,
+-                      },
+-                      null,
+-                      2,
+-                    ),
+-                  )
+-                }
+-              } else if (printEvents) {
+-                console.log(
+-                  `[${commit.id}:${agentId}]`,
+-                  JSON.stringify(event, null, 2),
+-                )
+-              }
+-              trace.push(event)
+-            },
+-          })
+-          cost = (result.sessionState?.mainAgentState.creditsUsed ?? 0) / 100
+-
+-          execSync('git add .', { cwd: repoDir, stdio: 'ignore' })
+-          diff = execSync(`git diff ${commit.parentSha}`, {
+-            cwd: repoDir,
+-            encoding: 'utf-8',
+-          })
++          // Select the appropriate runner
++          let runner: Runner
++          if (externalAgentType === 'claude') {
++            runner = new ClaudeRunner(repoDir, env)
++          } else if (externalAgentType === 'codex') {
++            runner = new CodexRunner(repoDir, env)
++          } else {
++            runner = new CodebuffRunner({
++              cwd: repoDir,
++              env,
++              client,
++              agentId,
++              localAgentDefinitions,
++              printEvents,
++              commitId: commit.id,
++              parentSha: commit.parentSha,
++            })
++          }
++
++          console.log(
++            `[${commit.id}] Running agent: ${externalAgentType || 'codebuff'}`,
++          )
++
++          const result = await runner.run(commit.prompt)
++          trace.push(...result.steps)
++          cost = result.totalCostUsd
++          diff = result.diff
+ 
+           const contextFilePaths = new Set<string>([
+             ...commit.supplementalFiles,
+diff --git a/evals/buffbench/main-single-eval.ts b/evals/buffbench/main-single-eval.ts
+index 6e6ba8382..64a441f67 100644
+--- a/evals/buffbench/main-single-eval.ts
++++ b/evals/buffbench/main-single-eval.ts
+@@ -5,8 +5,8 @@ import { runBuffBench } from './run-buffbench'
+ async function main() {
+   await runBuffBench({
+     evalDataPath: path.join(__dirname, 'eval-codebuff.json'),
+-    agents: ['base2-opus'],
+-    taskIds: ['add-spawn-perms-tests'],
++    agents: ['base2'],
++    taskIds: ['filter-system-history'],
+   })
+ 
+   process.exit(0)
+diff --git a/evals/buffbench/main.ts b/evals/buffbench/main.ts
+index 08c9cca55..b667def5e 100644
+--- a/evals/buffbench/main.ts
++++ b/evals/buffbench/main.ts
+@@ -3,10 +3,13 @@ import path from 'path'
+ import { runBuffBench } from './run-buffbench'
+ 
+ async function main() {
++  // Compare Codebuff agents against external CLI agents
++  // Use 'external:claude' for Claude Code CLI
++  // Use 'external:codex' for OpenAI Codex CLI
+   await runBuffBench({
+     evalDataPath: path.join(__dirname, 'eval-codebuff.json'),
+-    agents: ['base2', 'base2-max'],
+-    taskConcurrency: 3,
++    agents: ['base2', 'external:claude', 'external:codex'],
++    taskConcurrency: 1,
+   })
+ 
+   process.exit(0)
+diff --git a/evals/buffbench/run-buffbench.ts b/evals/buffbench/run-buffbench.ts
+index 8acf9b70e..d9a112b26 100644
+--- a/evals/buffbench/run-buffbench.ts
++++ b/evals/buffbench/run-buffbench.ts
+@@ -8,7 +8,7 @@ import { getUserCredentials } from '@codebuff/npm-app/credentials'
+ import { loadLocalAgents } from '@codebuff/npm-app/agents/load-agents'
+ import pLimit from 'p-limit'
+ 
+-import { runAgentOnCommit } from './agent-runner'
++import { runAgentOnCommit, type ExternalAgentType } from './agent-runner'
+ import { formatTaskResults } from './format-output'
+ import { judgeCommitResult } from './judge'
+ import { analyzeAgentTraces, type AgentTraceData } from './trace-analyzer'
+@@ -18,6 +18,22 @@ import { logger } from '../logger'
+ import type { AgentEvalResults, EvalDataV2 } from './types'
+ import { analyzeAllTasks } from './meta-analyzer'
+ 
++function parseAgentId(agent: string): {
++  agentId: string
++  externalAgentType?: ExternalAgentType
++} {
++  if (agent.startsWith('external:')) {
++    const externalType = agent.slice('external:'.length) as ExternalAgentType
++    if (externalType !== 'claude' && externalType !== 'codex') {
++      throw new Error(
++        `Unknown external agent type: ${externalType}. Supported: claude, codex`,
++      )
++    }
++    return { agentId: agent, externalAgentType: externalType }
++  }
++  return { agentId: agent }
++}
++
+ async function runTask(options: {
+   client: CodebuffClient
+   commit: EvalDataV2['evalCommits'][0]
+@@ -64,7 +80,9 @@ async function runTask(options: {
+   // Store trace data for this commit to analyze later
+   const commitTraces: AgentTraceData[] = []
+ 
+-  const agentPromises = agents.map(async (agentId) => {
++  const agentPromises = agents.map(async (agent) => {
++    const { agentId, externalAgentType } = parseAgentId(agent)
++
+     const agentResult = await runAgentOnCommit({
+       client,
+       agentId,
+@@ -75,6 +93,7 @@ async function runTask(options: {
+       localAgentDefinitions,
+       printEvents,
+       finalCheckCommands,
++      externalAgentType,
+     })
+ 
+     const judgeResult = await judgeCommitResult({
+diff --git a/evals/buffbench/runners/claude.ts b/evals/buffbench/runners/claude.ts
+new file mode 100644
+index 000000000..63ba052ff
+--- /dev/null
++++ b/evals/buffbench/runners/claude.ts
+@@ -0,0 +1,176 @@
++import { execSync, spawn } from 'child_process'
++
++import type { Runner, RunnerResult, AgentStep } from './runner'
++import type {
++  PrintModeToolCall,
++  PrintModeToolResult,
++} from '@codebuff/common/types/print-mode'
++
++export class ClaudeRunner implements Runner {
++  private cwd: string
++  private env: Record<string, string>
++
++  constructor(cwd: string, env: Record<string, string> = {}) {
++    this.cwd = cwd
++    this.env = env
++  }
++
++  async run(prompt: string): Promise<RunnerResult> {
++    const steps: AgentStep[] = []
++    let totalCostUsd = 0
++
++    return new Promise((resolve, reject) => {
++      const args = [
++        '-p',
++        prompt,
++        '--output-format',
++        'stream-json',
++        '--verbose',
++        '--dangerously-skip-permissions',
++        '--model',
++        'opus',
++      ]
++
++      console.log(`[ClaudeRunner] Running: claude ${args.join(' ')}`)
++
++      const child = spawn('claude', args, {
++        cwd: this.cwd,
++        env: {
++          ...process.env,
++          ...this.env,
++          // Ensure ANTHROPIC_API_KEY is set from CLAUDE_CODE_KEY if available
++          ANTHROPIC_API_KEY:
++            process.env.CLAUDE_CODE_KEY || process.env.ANTHROPIC_API_KEY,
++        },
++        // Use 'ignore' for stdin to prevent the CLI from waiting for input
++        stdio: ['ignore', 'pipe', 'pipe'],
++      })
++
++      let stdout = ''
++      let stderr = ''
++      let responseText = ''
++      let toolCalls: PrintModeToolCall[] = []
++      let toolResults: PrintModeToolResult[] = []
++
++      function flushStep() {
++        if (responseText.length > 0) {
++          steps.push({ type: 'text', text: responseText })
++        }
++        for (const call of toolCalls) {
++          steps.push(call)
++        }
++        for (const result of toolResults) {
++          steps.push(result)
++        }
++        responseText = ''
++        toolCalls = []
++        toolResults = []
++      }
++
++      child.stdout.on('data', (data: Buffer) => {
++        const chunk = data.toString()
++        stdout += chunk
++
++        // Parse streaming JSON output from Claude CLI
++        const lines = chunk.split('\n').filter((line) => line.trim())
++        for (const line of lines) {
++          try {
++            const event = JSON.parse(line)
++
++            if (event.type === 'assistant') {
++              if (event.message?.content) {
++                for (const content of event.message.content) {
++                  if (content.type === 'text') {
++                    if (toolResults.length > 0) {
++                      flushStep()
++                    }
++                    responseText += content.text
++                    process.stdout.write(content.text)
++                  } else if (content.type === 'tool_use') {
++                    toolCalls.push({
++                      type: 'tool_call',
++                      toolName: content.name,
++                      toolCallId: content.id,
++                      input: content.input || {},
++                    })
++                  }
++                }
++              }
++            } else if (event.type === 'user') {
++              if (event.message?.content) {
++                for (const content of event.message.content) {
++                  if (content.type === 'tool_result') {
++                    toolResults.push({
++                      type: 'tool_result',
++                      toolName: 'unknown',
++                      toolCallId: content.tool_use_id,
++                      output: [
++                        {
++                          type: 'json',
++                          value:
++                            typeof content.content === 'string'
++                              ? content.content
++                              : content.content,
++                        },
++                      ],
++                    })
++                  }
++                }
++              }
++            } else if (event.type === 'result') {
++              if (event.total_cost_usd) {
++                totalCostUsd += event.total_cost_usd
++              }
++            }
++          } catch {
++            // Not JSON, might be plain text output
++            responseText += line
++          }
++        }
++      })
++
++      child.stderr.on('data', (data: Buffer) => {
++        stderr += data.toString()
++        process.stderr.write(data)
++      })
++
++      child.on('error', (error) => {
++        reject(
++          new Error(
++            `Claude CLI failed to start: ${error.message}. Make sure 'claude' is installed and in PATH.`,
++          ),
++        )
++      })
++
++      child.on('close', (code) => {
++        flushStep()
++
++        // Get git diff after Claude has made changes
++        let diff = ''
++        try {
++          execSync('git add .', { cwd: this.cwd, stdio: 'ignore' })
++          diff = execSync('git diff HEAD', {
++            cwd: this.cwd,
++            encoding: 'utf-8',
++            maxBuffer: 10 * 1024 * 1024,
++          })
++        } catch {
++          // Ignore git errors
++        }
++
++        if (code !== 0) {
++          reject(
++            new Error(`Claude CLI exited with code ${code}. stderr: ${stderr}`),
++          )
++          return
++        }
++
++        resolve({
++          steps,
++          totalCostUsd,
++          diff,
++        })
++      })
++    })
++  }
++}
+diff --git a/evals/buffbench/runners/codebuff.ts b/evals/buffbench/runners/codebuff.ts
+new file mode 100644
+index 000000000..ba82fe27a
+--- /dev/null
++++ b/evals/buffbench/runners/codebuff.ts
+@@ -0,0 +1,114 @@
++import fs from 'fs'
++import path from 'path'
++import { execSync } from 'child_process'
++
++import { CodebuffClient } from '@codebuff/sdk'
++
++import type { Runner, RunnerResult, AgentStep } from './runner'
++
++const DEBUG_ERROR = true
++
++export class CodebuffRunner implements Runner {
++  private cwd: string
++  private env?: Record<string, string>
++  private client: CodebuffClient
++  private agentId: string
++  private localAgentDefinitions: any[]
++  private printEvents: boolean
++  private commitId: string
++  private parentSha: string
++
++  constructor(options: {
++    cwd: string
++    env?: Record<string, string>
++    client: CodebuffClient
++    agentId: string
++    localAgentDefinitions: any[]
++    printEvents: boolean
++    commitId: string
++    parentSha: string
++  }) {
++    this.cwd = options.cwd
++    this.env = options.env
++    this.client = options.client
++    this.agentId = options.agentId
++    this.localAgentDefinitions = options.localAgentDefinitions
++    this.printEvents = options.printEvents
++    this.commitId = options.commitId
++    this.parentSha = options.parentSha
++  }
++
++  async run(prompt: string): Promise<RunnerResult> {
++    const steps: AgentStep[] = []
++    let totalCostUsd = 0
++
++    const maxAgentSteps = 40
++    const result = await this.client.run({
++      agent: this.agentId,
++      prompt,
++      agentDefinitions: this.localAgentDefinitions,
++      cwd: this.cwd,
++      env: this.env,
++      maxAgentSteps,
++      handleEvent: (event) => {
++        if (
++          (event.type === 'tool_call' || event.type === 'tool_result') &&
++          event.toolName === 'set_messages'
++        ) {
++          return
++        }
++        if (event.type === 'error') {
++          console.error(
++            `[${this.commitId}:${this.agentId}] Error event:`,
++            event.message,
++          )
++          if (DEBUG_ERROR && !event.message.startsWith('Invalid JSON')) {
++            // Save errors in a file, but not tool calls with invalid json.
++            fs.writeFileSync(
++              path.join(
++                __dirname,
++                '..',
++                `${this.commitId}-${this.agentId}-error-${Math.random().toString(36).substring(2, 6)}.json`,
++              ),
++              JSON.stringify(
++                {
++                  error: event.message,
++                  trace: steps,
++                },
++                null,
++                2,
++              ),
++            )
++          }
++        } else if (this.printEvents) {
++          console.log(
++            `[${this.commitId}:${this.agentId}]`,
++            JSON.stringify(event, null, 2),
++          )
++        }
++        steps.push(event)
++      },
++    })
++
++    totalCostUsd = (result.sessionState?.mainAgentState.creditsUsed ?? 0) / 100
++
++    // Get git diff after Codebuff has made changes
++    let diff = ''
++    try {
++      execSync('git add .', { cwd: this.cwd, stdio: 'ignore' })
++      diff = execSync(`git diff ${this.parentSha}`, {
++        cwd: this.cwd,
++        encoding: 'utf-8',
++        maxBuffer: 10 * 1024 * 1024,
++      })
++    } catch {
++      // Ignore git errors
++    }
++
++    return {
++      steps,
++      totalCostUsd,
++      diff,
++    }
++  }
++}
+diff --git a/evals/buffbench/runners/codex.ts b/evals/buffbench/runners/codex.ts
+new file mode 100644
+index 000000000..4902f9db9
+--- /dev/null
++++ b/evals/buffbench/runners/codex.ts
+@@ -0,0 +1,142 @@
++import { execSync, spawn } from 'child_process'
++
++import type { Runner, RunnerResult, AgentStep } from './runner'
++
++export class CodexRunner implements Runner {
++  private cwd: string
++  private env: Record<string, string>
++
++  constructor(cwd: string, env: Record<string, string> = {}) {
++    this.cwd = cwd
++    this.env = env
++  }
++
++  async run(prompt: string): Promise<RunnerResult> {
++    const steps: AgentStep[] = []
++    let totalCostUsd = 0
++
++    return new Promise((resolve, reject) => {
++      // Codex CLI uses the prompt as a positional argument
++      // Use exec subcommand with --full-auto for automatic execution
++      // --full-auto enables -a on-failure and --sandbox workspace-write
++      // Use --json for structured output that we can parse
++      const args = [
++        'exec',
++        '--full-auto',
++        '--json',
++        '-m',
++        'gpt-5.1-codex-max:xhigh',
++        prompt,
++      ]
++
++      console.log(`[CodexRunner] Running: codex ${args.join(' ')}`)
++
++      const child = spawn('codex', args, {
++        cwd: this.cwd,
++        env: {
++          ...process.env,
++          ...this.env,
++        },
++        // Use 'ignore' for stdin to prevent the CLI from waiting for input
++        stdio: ['ignore', 'pipe', 'pipe'],
++      })
++
++      let stdout = ''
++      let stderr = ''
++
++      child.stdout.on('data', (data: Buffer) => {
++        const chunk = data.toString()
++        stdout += chunk
++        process.stdout.write(chunk)
++
++        // Codex outputs events as JSON lines in some modes
++        const lines = chunk.split('\n').filter((line) => line.trim())
++        for (const line of lines) {
++          try {
++            const event = JSON.parse(line)
++            if (event.type === 'message') {
++              steps.push({
++                type: 'text',
++                text: event.content || event.message || '',
++              })
++            } else if (
++              event.type === 'function_call' ||
++              event.type === 'tool'
++            ) {
++              steps.push({
++                type: 'tool_call',
++                toolName: event.name || event.function?.name || 'unknown',
++                toolCallId: event.id || `codex-${Date.now()}`,
++                input: event.arguments || event.function?.arguments || {},
++              })
++            } else if (
++              event.type === 'function_result' ||
++              event.type === 'tool_result'
++            ) {
++              steps.push({
++                type: 'tool_result',
++                toolName: event.name || 'unknown',
++                toolCallId: event.id || `codex-${Date.now()}`,
++                output: [
++                  {
++                    type: 'json',
++                    value: event.result || event.output || '',
++                  },
++                ],
++              })
++            }
++          } catch {
++            // Plain text output, add as text step
++            if (line.trim()) {
++              steps.push({
++                type: 'text',
++                text: line,
++              })
++            }
++          }
++        }
++      })
++
++      child.stderr.on('data', (data: Buffer) => {
++        stderr += data.toString()
++        process.stderr.write(data)
++      })
++
++      child.on('error', (error) => {
++        reject(
++          new Error(
++            `Codex CLI failed to start: ${error.message}. Make sure 'codex' is installed and in PATH.`,
++          ),
++        )
++      })
++
++      child.on('close', (code) => {
++        // Get git diff after Codex has made changes
++        let diff = ''
++        try {
++          execSync('git add .', { cwd: this.cwd, stdio: 'ignore' })
++          diff = execSync('git diff HEAD', {
++            cwd: this.cwd,
++            encoding: 'utf-8',
++            maxBuffer: 10 * 1024 * 1024,
++          })
++        } catch {
++          // Ignore git errors
++        }
++
++        if (code !== 0) {
++          reject(
++            new Error(`Codex CLI exited with code ${code}. stderr: ${stderr}`),
++          )
++          return
++        }
++
++        resolve({
++          steps,
++          totalCostUsd, // Codex doesn't report cost in CLI output
++          diff,
++        })
++      })
++    })
++  }
++}
+diff --git a/evals/buffbench/runners/index.ts b/evals/buffbench/runners/index.ts
+new file mode 100644
+index 000000000..99adc3d28
+--- /dev/null
++++ b/evals/buffbench/runners/index.ts
+@@ -0,0 +1,3 @@
++export { ClaudeRunner } from './claude'
++export { CodexRunner } from './codex'
++export type { Runner, RunnerResult } from './runner'
+diff --git a/evals/buffbench/runners/runner.ts b/evals/buffbench/runners/runner.ts
+new file mode 100644
+index 000000000..ea450caaa
+--- /dev/null
++++ b/evals/buffbench/runners/runner.ts
+@@ -0,0 +1,13 @@
++import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
++
++export type AgentStep = PrintModeEvent
++
++export type RunnerResult = {
++  steps: AgentStep[]
++  totalCostUsd: number
++  diff: string
++}
++
++export interface Runner {
++  run: (prompt: string) => Promise<RunnerResult>
++}

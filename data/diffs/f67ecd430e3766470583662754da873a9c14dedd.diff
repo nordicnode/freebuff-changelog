@@ -1,0 +1,572 @@
+diff --git a/common/src/types/contracts/billing.ts b/common/src/types/contracts/billing.ts
+index dca0e740c..36e088b4c 100644
+--- a/common/src/types/contracts/billing.ts
++++ b/common/src/types/contracts/billing.ts
+@@ -4,6 +4,7 @@ import type { ErrorOr } from '../../util/error'
+ export type GetUserUsageDataFn = (params: {
+   userId: string
+   logger: Logger
++  includeSubscriptionCredits?: boolean
+ }) => Promise<{
+   usageThisCycle: number
+   balance: {
+diff --git a/packages/billing/src/__tests__/balance-calculator.test.ts b/packages/billing/src/__tests__/balance-calculator.test.ts
+index d0bdcbe8a..b56f10dc6 100644
+--- a/packages/billing/src/__tests__/balance-calculator.test.ts
++++ b/packages/billing/src/__tests__/balance-calculator.test.ts
+@@ -209,6 +209,69 @@ describe('Balance Calculator - calculateUsageAndBalance', () => {
+       expect(result.usageThisCycle).toBe(500)
+     })
+ 
++    it('should include subscription credits when isPersonalContext is true and includeSubscriptionCredits is true', async () => {
++      const now = new Date()
++      const quotaResetDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000) // 7 days ago
++
++      const grants = [
++        createMockGrant({
++          operation_id: 'free-grant',
++          balance: 500,
++          principal: 1000,
++          priority: 20,
++          type: 'purchase',
++          expires_at: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000),
++          created_at: new Date(now.getTime() - 10 * 24 * 60 * 60 * 1000),
++        }),
++        createMockGrant({
++          operation_id: 'subscription-grant',
++          balance: 2000,
++          principal: 5000,
++          priority: 10,
++          type: 'subscription',
++          expires_at: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000),
++          created_at: new Date(now.getTime() - 5 * 24 * 60 * 60 * 1000),
++        }),
++      ]
++
++      await mockModule('@codebuff/internal/db', () => ({
++        default: {
++          select: () => ({
++            from: () => ({
++              where: () => ({
++                orderBy: () => grants,
++              }),
++            }),
++          }),
++        },
++      }))
++
++      await mockModule('@codebuff/common/analytics', () => ({
++        trackEvent: () => {},
++      }))
++
++      const { calculateUsageAndBalance } = await import(
++        '@codebuff/billing/balance-calculator'
++      )
++
++      const result = await calculateUsageAndBalance({
++        userId: 'user-123',
++        quotaResetDate,
++        now,
++        isPersonalContext: true,
++        includeSubscriptionCredits: true,
++        logger,
++      })
++
++      // Should include both purchase (500) and subscription (2000) credits
++      expect(result.balance.totalRemaining).toBe(2500)
++      expect(result.balance.breakdown.purchase).toBe(500)
++      expect(result.balance.breakdown.subscription).toBe(2000)
++
++      // Usage should include both: (1000 - 500) + (5000 - 2000) = 3500
++      expect(result.usageThisCycle).toBe(3500)
++    })
++
+     it('should include subscription credits when isPersonalContext is false', async () => {
+       const now = new Date()
+       const quotaResetDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000) // 7 days ago
+diff --git a/packages/billing/src/balance-calculator.ts b/packages/billing/src/balance-calculator.ts
+index 165c2030a..d43626861 100644
+--- a/packages/billing/src/balance-calculator.ts
++++ b/packages/billing/src/balance-calculator.ts
+@@ -276,18 +276,20 @@ export async function calculateUsageAndBalance(
+       now: Date
+       conn: DbConn
+       isPersonalContext: boolean
++      includeSubscriptionCredits: boolean
+       logger: Logger
+     } & ParamsOf<typeof getOrderedActiveGrants>,
+-    'now' | 'conn' | 'isPersonalContext'
++    'now' | 'conn' | 'isPersonalContext' | 'includeSubscriptionCredits'
+   >,
+ ): Promise<CreditUsageAndBalance> {
+   const withDefaults = {
+     now: new Date(),
+     conn: db, // Add optional conn parameter to pass transaction
+     isPersonalContext: false, // Add flag to exclude organization credits for personal usage
++    includeSubscriptionCredits: false,
+     ...params,
+   }
+-  const { userId, quotaResetDate, now, isPersonalContext, logger } =
++  const { userId, quotaResetDate, now, isPersonalContext, includeSubscriptionCredits, logger } =
+     withDefaults
+ 
+   // Get all relevant grants in one query, using the provided connection
+@@ -326,9 +328,14 @@ export async function calculateUsageAndBalance(
+   for (const grant of grants) {
+     const grantType = grant.type as GrantType
+ 
+-    // Skip organization and subscription credits for personal context
+-    // Subscription credits are shown separately in the CLI with progress bars
+-    if (isPersonalContext && (grantType === 'organization' || grantType === 'subscription')) {
++    // Skip organization credits for personal context
++    if (isPersonalContext && grantType === 'organization') {
++      continue
++    }
++    // Skip subscription credits for personal context unless explicitly included
++    // (subscription credits are shown separately in the CLI with progress bars,
++    // but need to be included for credit gating after ensureSubscriberBlockGrant)
++    if (isPersonalContext && grantType === 'subscription' && !includeSubscriptionCredits) {
+       continue
+     }
+ 
+diff --git a/packages/billing/src/usage-service.ts b/packages/billing/src/usage-service.ts
+index df47cf628..a25d7d049 100644
+--- a/packages/billing/src/usage-service.ts
++++ b/packages/billing/src/usage-service.ts
+@@ -53,8 +53,9 @@ export interface OrganizationUsageData {
+ export async function getUserUsageData(params: {
+   userId: string
+   logger: Logger
++  includeSubscriptionCredits?: boolean
+ }): Promise<UserUsageData> {
+-  const { userId, logger } = params
++  const { userId, logger, includeSubscriptionCredits } = params
+   try {
+     const now = new Date()
+ 
+@@ -79,10 +80,12 @@ export async function getUserUsageData(params: {
+     // Use the canonical balance calculation function with the effective reset date
+     // Pass isPersonalContext: true to exclude organization credits from personal usage
+     const { usageThisCycle, balance } = await calculateUsageAndBalance({
+-      ...params,
++      userId,
++      logger,
+       quotaResetDate,
+       now,
+-      isPersonalContext: true, // isPersonalContext: true to exclude organization credits
++      isPersonalContext: true,
++      includeSubscriptionCredits: includeSubscriptionCredits ?? false,
+     })
+ 
+     // Check for active subscription
+diff --git a/web/src/app/api/v1/_helpers.ts b/web/src/app/api/v1/_helpers.ts
+index e5f5d5670..87408e09c 100644
+--- a/web/src/app/api/v1/_helpers.ts
++++ b/web/src/app/api/v1/_helpers.ts
+@@ -152,6 +152,7 @@ export const checkCreditsAndCharge = async (params: {
+   insufficientCreditsEvent: AnalyticsEvent
+   getUserUsageData: GetUserUsageDataFn
+   consumeCreditsWithFallback: ConsumeCreditsWithFallbackFn
++  ensureSubscriberBlockGrant?: (params: { userId: string; logger: Logger }) => Promise<unknown>
+ }): Promise<HandlerResult<{ creditsUsed: number }>> => {
+   const {
+     userId,
+@@ -164,12 +165,30 @@ export const checkCreditsAndCharge = async (params: {
+     insufficientCreditsEvent,
+     getUserUsageData,
+     consumeCreditsWithFallback,
++    ensureSubscriberBlockGrant,
+   } = params
+ 
++  // Ensure subscription block grant exists before checking credits.
++  // This creates the grant (if eligible) so its credits appear in the balance below.
++  // When the function is provided, always include subscription credits in the balance:
++  // error/null results mean subscription grants have 0 balance, so including them is harmless.
++  const includeSubscriptionCredits = !!ensureSubscriberBlockGrant
++  if (ensureSubscriberBlockGrant) {
++    try {
++      await ensureSubscriberBlockGrant({ userId, logger })
++    } catch (error) {
++      logger.error(
++        { error, userId },
++        'Error ensuring subscription block grant in credit check',
++      )
++      // Fail open: proceed with subscription credits included in balance check
++    }
++  }
++
+   const {
+     balance: { totalRemaining },
+     nextQuotaReset,
+-  } = await getUserUsageData({ userId, logger })
++  } = await getUserUsageData({ userId, logger, includeSubscriptionCredits })
+ 
+   if (totalRemaining <= 0 || totalRemaining < creditsToCharge) {
+     trackEvent({
+diff --git a/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts b/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts
+index 7be27ad91..67d8fb9de 100644
+--- a/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts
++++ b/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts
+@@ -810,7 +810,19 @@ describe('/api/v1/chat/completions POST endpoint', () => {
+       }
+       const mockEnsureSubscriberBlockGrant = mock(async () => blockGrant)
+ 
+-      // Use the no-credits user (totalRemaining = 0)
++      // Override mock: when subscription credits are included, simulate the block grant's credits
++      mockGetUserUsageData = mock(async ({ includeSubscriptionCredits }: { includeSubscriptionCredits?: boolean }) => ({
++        usageThisCycle: 0,
++        balance: {
++          totalRemaining: includeSubscriptionCredits ? 350 : 0,
++          totalDebt: 0,
++          netBalance: includeSubscriptionCredits ? 350 : 0,
++          breakdown: {},
++        },
++        nextQuotaReset,
++      }))
++
++      // Use the no-credits user (totalRemaining = 0 without subscription)
+       const req = new NextRequest(
+         'http://localhost:3000/api/v1/chat/completions',
+         {
+diff --git a/web/src/app/api/v1/chat/completions/_post.ts b/web/src/app/api/v1/chat/completions/_post.ts
+index 3925edbef..133cad075 100644
+--- a/web/src/app/api/v1/chat/completions/_post.ts
++++ b/web/src/app/api/v1/chat/completions/_post.ts
+@@ -204,12 +204,6 @@ export async function postChatCompletions(params: {
+     const costMode = typedBody.codebuff_metadata?.cost_mode
+     const isFreeModeRequest = isFreeMode(costMode)
+ 
+-    // Fetch user credit data early (actual credit check happens after subscription block grant logic)
+-    const {
+-      balance: { totalRemaining },
+-      nextQuotaReset,
+-    } = await getUserUsageData({ userId, logger })
+-
+     // Extract and validate agent run ID
+     const runIdFromBody = typedBody.codebuff_metadata?.run_id
+     if (!runIdFromBody || typeof runIdFromBody !== 'string') {
+@@ -270,7 +264,9 @@ export async function postChatCompletions(params: {
+ 
+     // For subscribers, ensure a block grant exists before processing the request.
+     // This is done AFTER validation so malformed requests don't start a new 5-hour block.
+-    let subscriberHasAvailableCredits = false
++    // When the function is provided, always include subscription credits in the balance:
++    // error/null results mean subscription grants have 0 balance, so including them is harmless.
++    const includeSubscriptionCredits = !!ensureSubscriberBlockGrant
+     if (ensureSubscriberBlockGrant) {
+       try {
+         const blockGrantResult = await ensureSubscriberBlockGrant({ userId, logger })
+@@ -311,24 +307,24 @@ export async function postChatCompletions(params: {
+             { userId, limitType: isWeeklyLimitError(blockGrantResult) ? 'weekly' : 'session' },
+             'Subscriber hit limit, falling back to a-la-carte credits',
+           )
+-        } else if (blockGrantResult) {
+-          subscriberHasAvailableCredits = true
+         }
+       } catch (error) {
+         logger.error(
+           { error: getErrorObject(error), userId },
+           'Error ensuring subscription block grant',
+         )
+-        // Fail open: if we can't check the subscription status, allow the request to proceed.
+-        // Assume the user may be a subscriber so the credit check below doesn't reject them.
+-        subscriberHasAvailableCredits = true
++        // Fail open: proceed with subscription credits included in balance check
+       }
+     }
+ 
+-    // Credit check: reject if user has no a-la-carte credits AND is not covered by subscription.
+-    // Subscribers with available block grant credits bypass this check since their
+-    // subscription credits are excluded from totalRemaining (isPersonalContext: true).
+-    if (totalRemaining <= 0 && !isFreeModeRequest && !subscriberHasAvailableCredits) {
++    // Fetch user credit data (includes subscription credits when block grant was ensured)
++    const {
++      balance: { totalRemaining },
++      nextQuotaReset,
++    } = await getUserUsageData({ userId, logger, includeSubscriptionCredits })
++
++    // Credit check
++    if (totalRemaining <= 0 && !isFreeModeRequest) {
+       trackEvent({
+         event: AnalyticsEvent.CHAT_COMPLETIONS_INSUFFICIENT_CREDITS,
+         userId,
+diff --git a/web/src/app/api/v1/docs-search/__tests__/docs-search.test.ts b/web/src/app/api/v1/docs-search/__tests__/docs-search.test.ts
+index e1db454dd..2f053149a 100644
+--- a/web/src/app/api/v1/docs-search/__tests__/docs-search.test.ts
++++ b/web/src/app/api/v1/docs-search/__tests__/docs-search.test.ts
+@@ -13,6 +13,7 @@ import type {
+   Logger,
+   LoggerWithContextFn,
+ } from '@codebuff/common/types/contracts/logger'
++import type { BlockGrantResult } from '@codebuff/billing/subscription'
+ 
+ describe('/api/v1/docs-search POST endpoint', () => {
+   let mockLogger: Logger
+@@ -153,4 +154,73 @@ describe('/api/v1/docs-search POST endpoint', () => {
+     const body = await res.json()
+     expect(body.documentation).toContain('Some documentation text')
+   })
++
++  test('200 for subscriber with 0 a-la-carte credits but active block grant', async () => {
++    mockGetUserUsageData = mock(async ({ includeSubscriptionCredits }: { includeSubscriptionCredits?: boolean }) => ({
++      usageThisCycle: 0,
++      balance: {
++        totalRemaining: includeSubscriptionCredits ? 350 : 0,
++        totalDebt: 0,
++        netBalance: includeSubscriptionCredits ? 350 : 0,
++        breakdown: {},
++      },
++      nextQuotaReset: 'soon',
++    }))
++    const mockEnsureSubscriberBlockGrant = mock(async () => ({
++      grantId: 'grant-1',
++      credits: 350,
++      expiresAt: new Date(Date.now() + 5 * 60 * 60 * 1000),
++      isNew: true,
++    })) as unknown as (params: { userId: string; logger: Logger }) => Promise<BlockGrantResult | null>
++
++    const req = new NextRequest('http://localhost:3000/api/v1/docs-search', {
++      method: 'POST',
++      headers: { Authorization: 'Bearer valid' },
++      body: JSON.stringify({ libraryTitle: 'React' }),
++    })
++    const res = await postDocsSearch({
++      req,
++      getUserInfoFromApiKey: mockGetUserInfoFromApiKey,
++      logger: mockLogger,
++      loggerWithContext: mockLoggerWithContext,
++      trackEvent: mockTrackEvent,
++      getUserUsageData: mockGetUserUsageData,
++      consumeCreditsWithFallback: mockConsumeCreditsWithFallback,
++      fetch: mockFetch,
++      ensureSubscriberBlockGrant: mockEnsureSubscriberBlockGrant,
++    })
++    expect(res.status).toBe(200)
++  })
++
++  test('402 for non-subscriber with 0 credits and no block grant', async () => {
++    mockGetUserUsageData = mock(async () => ({
++      usageThisCycle: 0,
++      balance: {
++        totalRemaining: 0,
++        totalDebt: 0,
++        netBalance: 0,
++        breakdown: {},
++      },
++      nextQuotaReset: 'soon',
++    }))
++    const mockEnsureSubscriberBlockGrant = mock(async () => null) as unknown as (params: { userId: string; logger: Logger }) => Promise<BlockGrantResult | null>
++
++    const req = new NextRequest('http://localhost:3000/api/v1/docs-search', {
++      method: 'POST',
++      headers: { Authorization: 'Bearer valid' },
++      body: JSON.stringify({ libraryTitle: 'React' }),
++    })
++    const res = await postDocsSearch({
++      req,
++      getUserInfoFromApiKey: mockGetUserInfoFromApiKey,
++      logger: mockLogger,
++      loggerWithContext: mockLoggerWithContext,
++      trackEvent: mockTrackEvent,
++      getUserUsageData: mockGetUserUsageData,
++      consumeCreditsWithFallback: mockConsumeCreditsWithFallback,
++      fetch: mockFetch,
++      ensureSubscriberBlockGrant: mockEnsureSubscriberBlockGrant,
++    })
++    expect(res.status).toBe(402)
++  })
+ })
+diff --git a/web/src/app/api/v1/docs-search/_post.ts b/web/src/app/api/v1/docs-search/_post.ts
+index 0932cf2fb..01b4c7c4b 100644
+--- a/web/src/app/api/v1/docs-search/_post.ts
++++ b/web/src/app/api/v1/docs-search/_post.ts
+@@ -19,6 +19,7 @@ import type {
+   Logger,
+   LoggerWithContextFn,
+ } from '@codebuff/common/types/contracts/logger'
++import type { BlockGrantResult } from '@codebuff/billing/subscription'
+ import type { NextRequest } from 'next/server'
+ 
+ 
+@@ -38,6 +39,7 @@ export async function postDocsSearch(params: {
+   getUserUsageData: GetUserUsageDataFn
+   consumeCreditsWithFallback: ConsumeCreditsWithFallbackFn
+   fetch: typeof globalThis.fetch
++  ensureSubscriberBlockGrant?: (params: { userId: string; logger: Logger }) => Promise<BlockGrantResult | null>
+ }) {
+   const {
+     req,
+@@ -47,6 +49,7 @@ export async function postDocsSearch(params: {
+     getUserUsageData,
+     consumeCreditsWithFallback,
+     fetch,
++    ensureSubscriberBlockGrant,
+   } = params
+   const baseLogger = params.logger
+ 
+@@ -95,6 +98,7 @@ export async function postDocsSearch(params: {
+     insufficientCreditsEvent: AnalyticsEvent.DOCS_SEARCH_INSUFFICIENT_CREDITS,
+     getUserUsageData,
+     consumeCreditsWithFallback,
++    ensureSubscriberBlockGrant,
+   })
+   if (!credits.ok) return credits.response
+ 
+diff --git a/web/src/app/api/v1/docs-search/route.ts b/web/src/app/api/v1/docs-search/route.ts
+index 1a14ef219..df76f22a9 100644
+--- a/web/src/app/api/v1/docs-search/route.ts
++++ b/web/src/app/api/v1/docs-search/route.ts
+@@ -1,4 +1,5 @@
+ import { consumeCreditsWithFallback } from '@codebuff/billing/credit-delegation'
++import { ensureSubscriberBlockGrant } from '@codebuff/billing/subscription'
+ import { getUserUsageData } from '@codebuff/billing/usage-service'
+ import { trackEvent } from '@codebuff/common/analytics'
+ 
+@@ -19,5 +20,6 @@ export async function POST(req: NextRequest) {
+     getUserUsageData,
+     consumeCreditsWithFallback,
+     fetch,
++    ensureSubscriberBlockGrant,
+   })
+ }
+diff --git a/web/src/app/api/v1/web-search/__tests__/web-search.test.ts b/web/src/app/api/v1/web-search/__tests__/web-search.test.ts
+index 6cc956bc7..18973f947 100644
+--- a/web/src/app/api/v1/web-search/__tests__/web-search.test.ts
++++ b/web/src/app/api/v1/web-search/__tests__/web-search.test.ts
+@@ -13,6 +13,7 @@ import type {
+   Logger,
+   LoggerWithContextFn,
+ } from '@codebuff/common/types/contracts/logger'
++import type { BlockGrantResult } from '@codebuff/billing/subscription'
+ 
+ const testServerEnv = { LINKUP_API_KEY: 'test-linkup-key' }
+ 
+@@ -138,4 +139,75 @@ describe('/api/v1/web-search POST endpoint', () => {
+     const body = await res.json()
+     expect(body.result).toBeDefined()
+   })
++
++  test('200 for subscriber with 0 a-la-carte credits but active block grant', async () => {
++    mockGetUserUsageData = mock(async ({ includeSubscriptionCredits }: { includeSubscriptionCredits?: boolean }) => ({
++      usageThisCycle: 0,
++      balance: {
++        totalRemaining: includeSubscriptionCredits ? 350 : 0,
++        totalDebt: 0,
++        netBalance: includeSubscriptionCredits ? 350 : 0,
++        breakdown: {},
++      },
++      nextQuotaReset: 'soon',
++    }))
++    const mockEnsureSubscriberBlockGrant = mock(async () => ({
++      grantId: 'grant-1',
++      credits: 350,
++      expiresAt: new Date(Date.now() + 5 * 60 * 60 * 1000),
++      isNew: true,
++    })) as unknown as (params: { userId: string; logger: Logger }) => Promise<BlockGrantResult | null>
++
++    const req = new NextRequest('http://localhost:3000/api/v1/web-search', {
++      method: 'POST',
++      headers: { Authorization: 'Bearer valid' },
++      body: JSON.stringify({ query: 'hello' }),
++    })
++    const res = await postWebSearch({
++      req,
++      getUserInfoFromApiKey: mockGetUserInfoFromApiKey,
++      logger: mockLogger,
++      loggerWithContext: mockLoggerWithContext,
++      trackEvent: mockTrackEvent,
++      getUserUsageData: mockGetUserUsageData,
++      consumeCreditsWithFallback: mockConsumeCreditsWithFallback,
++      fetch: mockFetch,
++      serverEnv: testServerEnv,
++      ensureSubscriberBlockGrant: mockEnsureSubscriberBlockGrant,
++    })
++    expect(res.status).toBe(200)
++  })
++
++  test('402 for non-subscriber with 0 credits and no block grant', async () => {
++    mockGetUserUsageData = mock(async () => ({
++      usageThisCycle: 0,
++      balance: {
++        totalRemaining: 0,
++        totalDebt: 0,
++        netBalance: 0,
++        breakdown: {},
++      },
++      nextQuotaReset: 'soon',
++    }))
++    const mockEnsureSubscriberBlockGrant = mock(async () => null) as unknown as (params: { userId: string; logger: Logger }) => Promise<BlockGrantResult | null>
++
++    const req = new NextRequest('http://localhost:3000/api/v1/web-search', {
++      method: 'POST',
++      headers: { Authorization: 'Bearer valid' },
++      body: JSON.stringify({ query: 'hello' }),
++    })
++    const res = await postWebSearch({
++      req,
++      getUserInfoFromApiKey: mockGetUserInfoFromApiKey,
++      logger: mockLogger,
++      loggerWithContext: mockLoggerWithContext,
++      trackEvent: mockTrackEvent,
++      getUserUsageData: mockGetUserUsageData,
++      consumeCreditsWithFallback: mockConsumeCreditsWithFallback,
++      fetch: mockFetch,
++      serverEnv: testServerEnv,
++      ensureSubscriberBlockGrant: mockEnsureSubscriberBlockGrant,
++    })
++    expect(res.status).toBe(402)
++  })
+ })
+diff --git a/web/src/app/api/v1/web-search/_post.ts b/web/src/app/api/v1/web-search/_post.ts
+index 4d6c41b8a..b91df8ded 100644
+--- a/web/src/app/api/v1/web-search/_post.ts
++++ b/web/src/app/api/v1/web-search/_post.ts
+@@ -21,6 +21,7 @@ import type {
+   Logger,
+   LoggerWithContextFn,
+ } from '@codebuff/common/types/contracts/logger'
++import type { BlockGrantResult } from '@codebuff/billing/subscription'
+ import type { NextRequest } from 'next/server'
+ 
+ 
+@@ -42,6 +43,7 @@ export async function postWebSearch(params: {
+   consumeCreditsWithFallback: ConsumeCreditsWithFallbackFn
+   fetch: typeof globalThis.fetch
+   serverEnv: LinkupEnv
++  ensureSubscriberBlockGrant?: (params: { userId: string; logger: Logger }) => Promise<BlockGrantResult | null>
+ }) {
+   const {
+     req,
+@@ -52,6 +54,7 @@ export async function postWebSearch(params: {
+     consumeCreditsWithFallback,
+     fetch,
+     serverEnv,
++    ensureSubscriberBlockGrant,
+   } = params
+   const baseLogger = params.logger
+ 
+@@ -102,6 +105,7 @@ export async function postWebSearch(params: {
+       insufficientCreditsEvent: AnalyticsEvent.WEB_SEARCH_INSUFFICIENT_CREDITS,
+       getUserUsageData,
+       consumeCreditsWithFallback,
++      ensureSubscriberBlockGrant,
+     })
+     if (credits.ok) break
+     if (attempt < 3) {
+diff --git a/web/src/app/api/v1/web-search/route.ts b/web/src/app/api/v1/web-search/route.ts
+index 90eb788e4..8e274e6e8 100644
+--- a/web/src/app/api/v1/web-search/route.ts
++++ b/web/src/app/api/v1/web-search/route.ts
+@@ -1,4 +1,5 @@
+ import { consumeCreditsWithFallback } from '@codebuff/billing/credit-delegation'
++import { ensureSubscriberBlockGrant } from '@codebuff/billing/subscription'
+ import { getUserUsageData } from '@codebuff/billing/usage-service'
+ import { trackEvent } from '@codebuff/common/analytics'
+ import { env } from '@codebuff/internal/env'
+@@ -21,5 +22,6 @@ export async function POST(req: NextRequest) {
+     consumeCreditsWithFallback,
+     fetch,
+     serverEnv: { LINKUP_API_KEY: env.LINKUP_API_KEY },
++    ensureSubscriberBlockGrant,
+   })
+ }

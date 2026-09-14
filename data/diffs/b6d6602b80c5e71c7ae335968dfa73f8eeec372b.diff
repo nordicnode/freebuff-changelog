@@ -1,0 +1,266 @@
+diff --git a/common/src/util/file.ts b/common/src/util/file.ts
+index 15a505f4a..486a8987d 100644
+--- a/common/src/util/file.ts
++++ b/common/src/util/file.ts
+@@ -44,7 +44,10 @@ export const customToolDefinitionsSchema = z
+   .record(
+     z.string(),
+     z.object({
+-      inputSchema: z.custom<z.ZodType>(),
++      // inputSchema can be a Zod schema (from MCP tools) or a JSON Schema object
++      // (from SDK custom tools that have been serialized). The agent-runtime
++      // converts JSON schemas to Zod using ensureZodSchema() before use.
++      inputSchema: z.custom<z.ZodType | Record<string, unknown>>(),
+       endsAgentStep: z.boolean().optional().default(false),
+       description: z.string().optional(),
+       exampleInputs: z.record(z.string(), z.any()).array().optional(),
+diff --git a/packages/agent-runtime/package.json b/packages/agent-runtime/package.json
+index f890eaf9d..b93f1c17d 100644
+--- a/packages/agent-runtime/package.json
++++ b/packages/agent-runtime/package.json
+@@ -25,6 +25,9 @@
+   "engines": {
+     "bun": "^1.3.0"
+   },
++  "dependencies": {
++    "zod-from-json-schema": "0.4.2"
++  },
+   "devDependencies": {
+     "@types/node": "22",
+     "@types/bun": "^1.3.0"
+diff --git a/packages/agent-runtime/src/tools/prompts.ts b/packages/agent-runtime/src/tools/prompts.ts
+index fc0342481..4deb4ec3a 100644
+--- a/packages/agent-runtime/src/tools/prompts.ts
++++ b/packages/agent-runtime/src/tools/prompts.ts
+@@ -5,6 +5,7 @@ import { buildArray } from '@codebuff/common/util/array'
+ import { pluralize } from '@codebuff/common/util/string'
+ import { cloneDeep } from 'lodash'
+ import z from 'zod/v4'
++import { convertJsonSchemaToZod } from 'zod-from-json-schema'
+ 
+ import type { ToolName } from '@codebuff/common/tools/constants'
+ import type {
+@@ -13,6 +14,24 @@ import type {
+ } from '@codebuff/common/util/file'
+ import type { ToolSet } from 'ai'
+ 
++/**
++ * Ensures the inputSchema is a Zod schema. If it's a JSON Schema object
++ * (from SDK custom tools that were serialized), converts it to Zod.
++ */
++export function ensureZodSchema(
++  schema: z.ZodType | Record<string, unknown>,
++): z.ZodType {
++  // Check if it's already a Zod schema by looking for the safeParse method
++  if (
++    schema &&
++    typeof (schema as { safeParse?: unknown }).safeParse === 'function'
++  ) {
++    return schema as z.ZodType
++  }
++  // JSON Schema object - convert to Zod
++  return convertJsonSchemaToZod(schema as Record<string, unknown>)
++}
++
+ function paramsSection(params: { schema: z.ZodType; endsAgentStep: boolean }) {
+   const { schema, endsAgentStep } = params
+   const schemaWithEndsAgentStepParam = z.toJSONSchema(
+@@ -206,7 +225,7 @@ ${[
+     const toolDef = additionalToolDefinitions[toolName]
+     return buildToolDescription({
+       toolName,
+-      schema: toolDef.inputSchema,
++      schema: ensureZodSchema(toolDef.inputSchema),
+       description: toolDef.description,
+       endsAgentStep: toolDef.endsAgentStep ?? true,
+       exampleInputs: toolDef.exampleInputs,
+@@ -226,7 +245,7 @@ export const getShortToolInstructions = (
+     return ''
+   }
+ 
+-  const toolDescriptions = [
++  const toolDescriptionsList = [
+     ...(
+       toolNames.filter(
+         (name) => (name as keyof typeof toolParams) in toolParams,
+@@ -243,7 +262,7 @@ export const getShortToolInstructions = (
+       const { inputSchema, endsAgentStep } = additionalToolDefinitions[name]
+       return buildShortToolDescription({
+         toolName: name,
+-        schema: inputSchema,
++        schema: ensureZodSchema(inputSchema),
+         endsAgentStep: endsAgentStep ?? true,
+       })
+     }),
+@@ -265,7 +284,7 @@ ${getToolCallString(
+ 
+ Important: You only have access to the tools below. Do not use any other tools -- they are not available to you, instead they may have been previously used by other agents.
+ 
+-${toolDescriptions.join('\n\n')}
++${toolDescriptionsList.join('\n\n')}
+ `.trim()
+ }
+ 
+@@ -285,9 +304,14 @@ export async function getToolSet(params: {
+ 
+   const toolDefinitions = await additionalToolDefinitions()
+   for (const [toolName, toolDefinition] of Object.entries(toolDefinitions)) {
+-    toolSet[toolName] = cloneDeep(toolDefinition) satisfies {
+-      inputSchema: { _zod: { input: any } }
+-    } as Omit<typeof toolDefinition, 'inputSchema'> & { inputSchema: z.ZodType }
++    const clonedDef = cloneDeep(toolDefinition)
++    // Custom tool inputSchema may be JSON Schema (from SDK) or Zod (from MCP)
++    // Ensure it's a Zod schema for the AI SDK
++    const zodSchema = ensureZodSchema(clonedDef.inputSchema)
++    toolSet[toolName] = {
++      ...clonedDef,
++      inputSchema: zodSchema,
++    } as (typeof toolSet)[string]
+   }
+ 
+   // Add agent tools (agents as direct tool calls)
+diff --git a/packages/agent-runtime/src/tools/tool-executor.ts b/packages/agent-runtime/src/tools/tool-executor.ts
+index 6886f9b90..2c5486f7a 100644
+--- a/packages/agent-runtime/src/tools/tool-executor.ts
++++ b/packages/agent-runtime/src/tools/tool-executor.ts
+@@ -8,6 +8,7 @@ import { checkLiveUserInput } from '../live-user-inputs'
+ import { getMCPToolData } from '../mcp'
+ import { getAgentShortName } from '../templates/prompts'
+ import { codebuffToolHandlers } from './handlers/list'
++import { ensureZodSchema } from './prompts'
+ 
+ import type { AgentTemplateType } from '@codebuff/common/types/session-state'
+ 
+@@ -332,19 +333,22 @@ export function parseRawCustomToolCall(params: {
+       customToolDefs?.[toolName]?.endsAgentStep
+   }
+ 
+-  const paramsSchema = customToolDefs?.[toolName]?.inputSchema
+-  const result = paramsSchema?.safeParse(processedParameters)
+-
+-  if (result && !result.success) {
+-    return {
+-      toolName: toolName,
+-      toolCallId: rawToolCall.toolCallId,
+-      input: rawToolCall.input,
+-      error: `Invalid parameters for ${toolName}: ${JSON.stringify(
+-        result.error.issues,
+-        null,
+-        2,
+-      )}`,
++  const rawSchema = customToolDefs?.[toolName]?.inputSchema
++  if (rawSchema) {
++    const paramsSchema = ensureZodSchema(rawSchema)
++    const result = paramsSchema.safeParse(processedParameters)
++
++    if (!result.success) {
++      return {
++        toolName: toolName,
++        toolCallId: rawToolCall.toolCallId,
++        input: rawToolCall.input,
++        error: `Invalid parameters for ${toolName}: ${JSON.stringify(
++          result.error.issues,
++          null,
++          2,
++        )}`,
++      }
+     }
+   }
+ 
+diff --git a/sdk/e2e/utils/test-fixtures.ts b/sdk/e2e/utils/test-fixtures.ts
+index a22e7efed..fe9fc9e07 100644
+--- a/sdk/e2e/utils/test-fixtures.ts
++++ b/sdk/e2e/utils/test-fixtures.ts
+@@ -160,15 +160,21 @@ console.log(calc.getResult());
+   'README.md': '# Sample Project\n\nA sample project for testing.',
+ }
+ 
+-export const MOCK_WEATHER_DATA: Record<string, { temp: number; condition: string }> = {
++export const MOCK_WEATHER_DATA: Record<
++  string,
++  { temp: number; condition: string }
++> = {
+   'New York': { temp: 72, condition: 'Sunny' },
+-  'London': { temp: 58, condition: 'Cloudy' },
+-  'Tokyo': { temp: 68, condition: 'Partly Cloudy' },
+-  'Sydney': { temp: 75, condition: 'Clear' },
+-  'Paris': { temp: 62, condition: 'Rainy' },
++  London: { temp: 58, condition: 'Cloudy' },
++  Tokyo: { temp: 68, condition: 'Partly Cloudy' },
++  Sydney: { temp: 75, condition: 'Clear' },
++  Paris: { temp: 62, condition: 'Rainy' },
+ }
+ 
+-export const MOCK_DATABASE: Record<string, { id: number; name: string; email: string }[]> = {
++export const MOCK_DATABASE: Record<
++  string,
++  { id: number; name: string; email: string }[]
++> = {
+   users: [
+     { id: 1, name: 'Alice', email: 'alice@example.com' },
+     { id: 2, name: 'Bob', email: 'bob@example.com' },
+@@ -186,5 +192,5 @@ export const TEST_PROMPTS = {
+   commitMessage: 'Generate a commit message for these changes',
+ }
+ 
+-export const DEFAULT_AGENT = 'base'
++export const DEFAULT_AGENT = 'base2'
+ export const DEFAULT_TIMEOUT = 120_000 // 2 minutes
+diff --git a/sdk/src/run-state.ts b/sdk/src/run-state.ts
+index fd89bdd51..fb00a7f66 100644
+--- a/sdk/src/run-state.ts
++++ b/sdk/src/run-state.ts
+@@ -9,6 +9,7 @@ import {
+ import { getInitialSessionState } from '@codebuff/common/types/session-state'
+ import { getErrorObject } from '@codebuff/common/util/error'
+ import { cloneDeep } from 'lodash'
++import z from 'zod/v4'
+ 
+ import type { CustomToolDefinition } from './custom-tool'
+ import type { AgentDefinition } from '@codebuff/common/templates/initial-agents-dir/types/agent-definition'
+@@ -66,24 +67,31 @@ function processAgentDefinitions(
+ }
+ 
+ /**
+- * Processes custom tool definitions into the format expected by SessionState
++ * Processes custom tool definitions into the format expected by SessionState.
++ * Converts Zod schemas to JSON Schema format so they can survive JSON serialization.
+  */
+ function processCustomToolDefinitions(
+   customToolDefinitions: CustomToolDefinition[],
+-): Record<
+-  string,
+-  Pick<CustomToolDefinition, keyof NonNullable<CustomToolDefinitions>[string]>
+-> {
++): CustomToolDefinitions {
+   return Object.fromEntries(
+-    customToolDefinitions.map((toolDefinition) => [
+-      toolDefinition.toolName,
+-      {
+-        inputSchema: toolDefinition.inputSchema,
+-        description: toolDefinition.description,
+-        endsAgentStep: toolDefinition.endsAgentStep,
+-        exampleInputs: toolDefinition.exampleInputs,
+-      },
+-    ]),
++    customToolDefinitions.map((toolDefinition) => {
++      // Convert Zod schema to JSON Schema format so it survives JSON serialization
++      // The agent-runtime will wrap this with AI SDK's jsonSchema() helper
++      const jsonSchema = z.toJSONSchema(toolDefinition.inputSchema, {
++        io: 'input',
++      }) as Record<string, unknown>
++      delete jsonSchema['$schema']
++
++      return [
++        toolDefinition.toolName,
++        {
++          inputSchema: jsonSchema,
++          description: toolDefinition.description,
++          endsAgentStep: toolDefinition.endsAgentStep,
++          exampleInputs: toolDefinition.exampleInputs,
++        },
++      ]
++    }),
+   )
+ }
+ 

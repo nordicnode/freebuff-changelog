@@ -1,0 +1,1178 @@
+diff --git a/cli/src/__tests__/integration/api-integration.test.ts b/cli/src/__tests__/integration/api-integration.test.ts
+index 7a5cf58fe..9298fc5a8 100644
+--- a/cli/src/__tests__/integration/api-integration.test.ts
++++ b/cli/src/__tests__/integration/api-integration.test.ts
+@@ -151,6 +151,23 @@ describe('API Integration', () => {
+       // 401s are now logged as auth failures
+       expect(testLogger.error.mock.calls.length).toBeGreaterThan(0)
+     })
++
++    test('should treat 404 from /api/v1/me as invalid credentials (AuthenticationError)', async () => {
++      setFetchMock(async () => {
++        return new Response(null, { status: 404 })
++      })
++      const testLogger = createLoggerMocks()
++
++      await expect(
++        getUserInfoFromApiKey({
++          apiKey: 'not-found-token',
++          fields: ['id'],
++          logger: testLogger,
++        }),
++      ).rejects.toBeInstanceOf(AuthenticationError)
++
++      expect(testLogger.error.mock.calls.length).toBeGreaterThan(0)
++    })
+   })
+ 
+   describe('P1: Error Response Handling', () => {
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index 417d1bf23..1696185fb 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -133,15 +133,16 @@ export const Chat = ({
+     setLastMessageMode,
+     addSessionCredits,
+     resetChatStore,
+-    sessionCreditsUsed,
+-    setRunState,
+-    isAnnouncementVisible,
+-    setIsAnnouncementVisible,
+-  } = useChatStore(
+-    useShallow((store) => ({
+-      inputValue: store.inputValue,
+-      cursorPosition: store.cursorPosition,
+-      lastEditDueToNav: store.lastEditDueToNav,
++  sessionCreditsUsed,
++  setRunState,
++  isAnnouncementVisible,
++  setIsAnnouncementVisible,
++  isRetrying,
++} = useChatStore(
++  useShallow((store) => ({
++    inputValue: store.inputValue,
++    cursorPosition: store.cursorPosition,
++    lastEditDueToNav: store.lastEditDueToNav,
+       setInputValue: store.setInputValue,
+       inputFocused: store.inputFocused,
+       setInputFocused: store.setInputFocused,
+@@ -168,12 +169,13 @@ export const Chat = ({
+       setLastMessageMode: store.setLastMessageMode,
+       addSessionCredits: store.addSessionCredits,
+       resetChatStore: store.reset,
+-      sessionCreditsUsed: store.sessionCreditsUsed,
+-      setRunState: store.setRunState,
+-      isAnnouncementVisible: store.isAnnouncementVisible,
+-      setIsAnnouncementVisible: store.setIsAnnouncementVisible,
+-    })),
+-  )
++    sessionCreditsUsed: store.sessionCreditsUsed,
++    setRunState: store.setRunState,
++    isAnnouncementVisible: store.isAnnouncementVisible,
++    setIsAnnouncementVisible: store.setIsAnnouncementVisible,
++    isRetrying: store.isRetrying,
++  })),
++)
+ 
+   // Memoize toggle IDs extraction - only recompute when messages change
+   const allToggleIds = useMemo(() => {
+@@ -204,8 +206,6 @@ export const Chat = ({
+   const activeSubagentsRef = useRef<Set<string>>(activeSubagents)
+   const abortControllerRef = useRef<AbortController | null>(null)
+   const sendMessageRef = useRef<SendMessageFn>()
+-  const retryPendingMessagesRef = useRef<(() => Promise<void>) | null>(null)
+-  const processFailedMessagesRef = useRef<(() => void) | null>(null)
+ 
+   const { statusMessage } = useClipboard()
+ 
+@@ -537,9 +537,6 @@ export const Chat = ({
+   const {
+     sendMessage,
+     clearMessages,
+-    pendingRetryCount,
+-    retryPendingMessages,
+-    processFailedMessages,
+   } = useSendMessage({
+     messages,
+     allToggleIds,
+@@ -575,8 +572,6 @@ export const Chat = ({
+   })
+ 
+   sendMessageRef.current = sendMessage
+-  retryPendingMessagesRef.current = retryPendingMessages
+-  processFailedMessagesRef.current = processFailedMessages
+ 
+   const onSubmitPrompt = useEvent((content: string, mode: AgentMode) => {
+     return routeUserPrompt({
+@@ -822,6 +817,7 @@ export const Chat = ({
+     isConnected,
+     authStatus,
+     showReconnectionMessage,
++    isRetrying,
+   })
+   const hasStatusIndicatorContent = statusIndicatorState.kind !== 'idle'
+   const inputBoxTitle = useMemo(() => {
+diff --git a/cli/src/components/__tests__/status-indicator.test.tsx b/cli/src/components/__tests__/status-indicator.test.tsx
+index 967d416fd..388c22a31 100644
+--- a/cli/src/components/__tests__/status-indicator.test.tsx
++++ b/cli/src/components/__tests__/status-indicator.test.tsx
+@@ -54,6 +54,15 @@ describe('StatusIndicator state logic', () => {
+       expect(state.kind).toBe('retrying')
+     })
+ 
++    test('returns retrying state when message send is retrying', () => {
++      const state = getStatusIndicatorState({
++        ...baseArgs,
++        isRetrying: true,
++        streamStatus: 'waiting',
++      })
++      expect(state.kind).toBe('retrying')
++    })
++
+     test('returns connecting state when not connected (third priority)', () => {
+       const state = getStatusIndicatorState({
+         ...baseArgs,
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index 652dbf34a..9cb21f9e1 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -1,14 +1,17 @@
+-import { has, isEqual } from 'lodash'
+-import { useCallback, useEffect, useRef, useState } from 'react'
+-
++import {
++  MAX_RETRIES_PER_MESSAGE,
++  RETRY_BACKOFF_BASE_DELAY_MS,
++  RETRY_BACKOFF_MAX_DELAY_MS,
++} from '@codebuff/sdk'
+ import { useQueryClient } from '@tanstack/react-query'
++import { has, isEqual } from 'lodash'
++import { useCallback, useEffect, useRef } from 'react'
+ 
++import { usageQueryKeys } from '../hooks/use-usage-query'
++import { setCurrentChatId } from '../project-files'
++import { useChatStore } from '../state/chat-store'
+ import { getCodebuffClient, formatToolOutput } from '../utils/codebuff-client'
+-import {
+-  MAIN_AGENT_ID,
+-  shouldHideAgent,
+-  shouldCollapseByDefault,
+-} from '../utils/constants'
++import { shouldHideAgent, shouldCollapseByDefault } from '../utils/constants'
+ import { createValidationErrorBlocks } from '../utils/create-validation-error-blocks'
+ import { getErrorObject } from '../utils/error'
+ import { formatTimestamp } from '../utils/helpers'
+@@ -20,10 +23,6 @@ import {
+   loadMostRecentChatState,
+   saveChatState,
+ } from '../utils/run-state-storage'
+-import { useChatStore } from '../state/chat-store'
+-import { usageQueryKeys } from '../hooks/use-usage-query'
+-import { setCurrentChatId } from '../project-files'
+-import { RETRY_BACKOFF_BASE_DELAY_MS } from '@codebuff/sdk'
+ 
+ import type { ElapsedTimeTracker } from './use-elapsed-time'
+ import type { StreamStatus } from './use-message-queue'
+@@ -261,32 +260,11 @@ export const useSendMessage = ({
+ }: UseSendMessageOptions): {
+   sendMessage: SendMessageFn
+   clearMessages: () => void
+-  pendingRetryCount: number
+-  retryPendingMessages: () => Promise<void>
+-  processFailedMessages: () => void
+ } => {
+   const queryClient = useQueryClient()
++  const setIsRetrying = useChatStore.getState().setIsRetrying
+   const previousRunStateRef = useRef<RunState | null>(null)
+ 
+-  // Retry state management (Part 7 foundation)
+-  const MAX_FAILED_MESSAGES_TO_STORE = 50
+-  const FAILED_MESSAGE_TTL_MS = 5 * 60 * 1000
+-
+-  const pendingRetriesRef = useRef<
+-    Record<string, { content: string; agentMode: AgentMode }>
+-  >({})
+-  const [pendingRetryCount, setPendingRetryCount] = useState(0)
+-  const retryAttemptsRef = useRef<Record<string, number>>({})
+-  const retryInFlightRef = useRef(false)
+-  const retryBackoffDelayRef = useRef(RETRY_BACKOFF_BASE_DELAY_MS)
+-  const failedDueToConnectionRef = useRef<
+-    Record<
+-      string,
+-      { content: string; agentMode: AgentMode; timestamp: number }
+-    >
+-  >({})
+-  const cancelledRef = useRef(false)
+-
+   // Load previous chat state on mount if continueChat is true
+   useEffect(() => {
+     if (continueChat && !previousRunStateRef.current) {
+@@ -316,87 +294,16 @@ export const useSendMessage = ({
+       }
+     }
+   }, [continueChat, continueChatId, setMessages, setRunState])
+-  const spawnAgentsMapRef = useRef<
+-    Map<string, { index: number; agentType: string }>
+-  >(new Map())
+-
+-  const schedulePendingRetry = useCallback(
+-    ({
+-      userMessageId,
+-      content,
+-      agentMode,
+-      note,
+-    }: {
+-      userMessageId: string
+-      content: string
+-      agentMode: AgentMode
+-      note?: string
+-    }) => {
+-      if (!userMessageId) return
+-
+-      const pending = pendingRetriesRef.current
+-      const alreadyScheduled = userMessageId in pending
+-      pending[userMessageId] = { content, agentMode }
+-
+-      logger.info(
+-        { userMessageId, note, alreadyScheduled },
+-        'Scheduled retry for message',
+-      )
+-
+-      if (!alreadyScheduled) {
+-        setPendingRetryCount(Object.keys(pending).length)
+-      }
+-
+-      // When we have pending retries, pause processing new queue items
+-      setCanProcessQueue(false)
+-    },
+-    [setCanProcessQueue],
+-  )
+-
+-  // Part 7 foundation: Will be used in Part 8 to clear retries for specific messages
+-  const clearPendingRetryForMessage = useCallback((messageId: string) => {
+-    if (!messageId) return
+-    const pending = pendingRetriesRef.current
+-    if (messageId in pending) {
+-      delete pending[messageId]
+-      setPendingRetryCount(Object.keys(pending).length)
+-    }
+-  }, [])
+-
+-  // Part 7 foundation: Will be wired into interval in Part 9 for memory management
+-  const pruneFailedMessages = useCallback(() => {
+-    const now = Date.now()
+-    const failed = failedDueToConnectionRef.current
+-    const entries = Object.entries(failed)
+-
+-    // Remove entries older than TTL (logic wired in Part 9, but foundation here)
+-    const activeEntries = entries.filter(
+-      ([, info]) => now - info.timestamp < FAILED_MESSAGE_TTL_MS,
+-    )
+-
+-    if (activeEntries.length > MAX_FAILED_MESSAGES_TO_STORE) {
+-      activeEntries.sort((a, b) => b[1].timestamp - a[1].timestamp)
+-      activeEntries.splice(MAX_FAILED_MESSAGES_TO_STORE)
+-    }
+-
+-    const activeIds = new Set(activeEntries.map(([id]) => id))
+-    const removedIds = entries
+-      .filter(([id]) => !activeIds.has(id))
+-      .map(([id]) => id)
+-
+-    failedDueToConnectionRef.current = Object.fromEntries(activeEntries)
+ 
+-    for (const id of removedIds) {
+-      delete retryAttemptsRef.current[id]
++  useEffect(() => {
++    return () => {
++      setIsRetrying(false)
+     }
++  }, [setIsRetrying])
+ 
+-    if (removedIds.length > 0) {
+-      logger.debug(
+-        { pruned: removedIds.length },
+-        'Pruned failed messages (foundation)',
+-      )
+-    }
+-  }, [])
++  const spawnAgentsMapRef = useRef<
++    Map<string, { index: number; agentType: string }>
++  >(new Map())
+   const rootStreamBufferRef = useRef('')
+   const agentStreamAccumulatorsRef = useRef<Map<string, string>>(new Map())
+   const rootStreamSeenRef = useRef(false)
+@@ -521,22 +428,6 @@ export const useSendMessage = ({
+     }
+   }, [flushPendingUpdates])
+ 
+-  const retryPendingMessages = useCallback(async () => {
+-    // Full implementation comes in Part 8; keep as a safe no-op for now
+-    if (cancelledRef.current || retryInFlightRef.current) return
+-  }, [])
+-
+-  const processFailedMessages = useCallback(() => {
+-    // Full wiring comes in Part 8. For Part 7 we only expose the API surface.
+-    const failedMessages = Object.entries(failedDueToConnectionRef.current)
+-    if (failedMessages.length === 0) return
+-
+-    logger.info(
+-      { count: failedMessages.length },
+-      'processFailedMessages called (foundation)',
+-    )
+-  }, [])
+-
+   const sendMessage = useCallback<SendMessageFn>(
+     async (params: ParamsOf<SendMessageFn>) => {
+       const { content, agentMode, postUserMessage } = params
+@@ -550,6 +441,7 @@ export const useSendMessage = ({
+         onTimerEvent,
+         agentId,
+       })
++      setIsRetrying(false)
+ 
+       // Use memoized toggle IDs from the store selector
+       // This is computed efficiently in the Zustand store
+@@ -977,6 +869,7 @@ export const useSendMessage = ({
+         setStreamStatus('idle')
+         setCanProcessQueue(!isQueuePausedRef?.current)
+         updateChainInProgress(false)
++        setIsRetrying(false)
+         timerController.stop('aborted')
+ 
+         applyMessageUpdate((prev) =>
+@@ -1029,721 +922,776 @@ export const useSendMessage = ({
+             : agentMode === 'MAX'
+               ? 'base2-max'
+               : 'base2-plan'
+-        const runState = await client.run({
+-          logger,
+-          agent: selectedAgentDefinition ?? agentId ?? fallbackAgent,
+-          prompt: content,
+-          previousRun: previousRunStateRef.current ?? undefined,
+-          signal: abortController.signal,
+-          agentDefinitions: agentDefinitions,
+-          maxAgentSteps: 40,
+-
+-          handleStreamChunk: (event) => {
+-            if (
+-              typeof event === 'string' ||
+-              (event.type === 'reasoning_chunk' &&
+-                event.ancestorRunIds.length === 0)
+-            ) {
+-              const eventObj:
+-                | { type: 'text'; text: string }
+-                | { type: 'reasoning'; text: string } =
+-                typeof event === 'string'
+-                  ? { type: 'text', text: event }
+-                  : { type: 'reasoning', text: event.chunk }
+-              if (!hasReceivedContent) {
+-                hasReceivedContent = true
+-                setStreamStatus('streaming')
+-              }
+-
+-              if (!eventObj.text) {
+-                return
+-              }
+-
+-              if (eventObj.type === 'text') {
+-                rootStreamBufferRef.current =
+-                  (rootStreamBufferRef.current ?? '') + eventObj.text
+-              }
+-
+-              rootStreamSeenRef.current = true
+-              appendRootChunk(eventObj)
+-            } else if (
+-              event.type === 'subagent_chunk' ||
+-              event.type === 'reasoning_chunk'
+-            ) {
+-              const { agentId, chunk } = event
+-
+-              const previous =
+-                agentStreamAccumulatorsRef.current.get(agentId) ?? ''
+-              if (!chunk) {
+-                return
+-              }
+-              agentStreamAccumulatorsRef.current.set(agentId, previous + chunk)
+ 
+-              // TODO: Add reasoning chunks to a separate component
+-              updateAgentContent(agentId, {
+-                type: 'text',
+-                content: chunk,
+-              })
+-              return
+-            } else {
+-              event satisfies never
+-              throw new Error('Unhandled event type')
+-            }
+-          },
+-
+-          handleEvent: (event) => {
+-            logger.info(
+-              {
+-                type: event.type,
+-                hasAgentId: has(event, 'agentId') && event.agentId,
+-                event,
++        let runState: RunState
++        try {
++          runState = await client.run({
++            logger,
++            agent: selectedAgentDefinition ?? agentId ?? fallbackAgent,
++            prompt: content,
++            previousRun: previousRunStateRef.current ?? undefined,
++            abortController,
++            retry: {
++              maxRetries: MAX_RETRIES_PER_MESSAGE,
++              backoffBaseMs: RETRY_BACKOFF_BASE_DELAY_MS,
++              backoffMaxMs: RETRY_BACKOFF_MAX_DELAY_MS,
++              onRetry: async ({ attempt, delayMs, errorCode }) => {
++                logger.warn(
++                  { sdkAttempt: attempt, delayMs, errorCode },
++                  '🔄 SDK retrying after error',
++                )
++                setIsRetrying(true)
++                setStreamStatus('waiting')
+               },
+-              `SDK ${JSON.stringify(event.type)} Event received (raw)`,
+-            )
++              onRetryExhausted: async ({ totalAttempts, errorCode }) => {
++                logger.warn(
++                  { totalAttempts, errorCode },
++                  '❌ SDK exhausted all retries',
++                )
++              },
++            },
++            agentDefinitions: agentDefinitions,
++            maxAgentSteps: 40,
++
++            handleStreamChunk: (event) => {
++              if (
++                typeof event === 'string' ||
++                (event.type === 'reasoning_chunk' &&
++                  event.ancestorRunIds.length === 0)
++              ) {
++                const eventObj:
++                  | { type: 'text'; text: string }
++                  | { type: 'reasoning'; text: string } =
++                  typeof event === 'string'
++                    ? { type: 'text', text: event }
++                    : { type: 'reasoning', text: event.chunk }
++                if (!hasReceivedContent) {
++                  hasReceivedContent = true
++                  setStreamStatus('streaming')
++                  setIsRetrying(false) // Clear retry state once we start receiving content
++                }
+ 
+-            if (event.type === 'text') {
+-              const text = event.text
++                if (!eventObj.text) {
++                  return
++                }
+ 
+-              if (typeof text !== 'string' || !text) return
++                if (eventObj.type === 'text') {
++                  rootStreamBufferRef.current =
++                    (rootStreamBufferRef.current ?? '') + eventObj.text
++                }
+ 
+-              // Track if main agent (no agentId) started streaming
+-              if (!hasReceivedContent && !event.agentId) {
+-                hasReceivedContent = true
+-                setStreamStatus('streaming')
+-              } else if (!hasReceivedContent) {
+-                hasReceivedContent = true
+-                setStreamStatus('streaming')
+-              }
++                rootStreamSeenRef.current = true
++                appendRootChunk(eventObj)
++              } else if (
++                event.type === 'subagent_chunk' ||
++                event.type === 'reasoning_chunk'
++              ) {
++                const { agentId, chunk } = event
+ 
+-              if (event.agentId) {
+-                logger.info(
+-                  {
+-                    agentId: event.agentId,
+-                    textPreview: text.slice(0, 100),
+-                  },
+-                  'setMessages: text event with agentId',
+-                )
+                 const previous =
+-                  agentStreamAccumulatorsRef.current.get(event.agentId) ?? ''
+-                if (!text) {
++                  agentStreamAccumulatorsRef.current.get(agentId) ?? ''
++                if (!chunk) {
+                   return
+                 }
+                 agentStreamAccumulatorsRef.current.set(
+-                  event.agentId,
+-                  previous + text,
++                  agentId,
++                  previous + chunk,
+                 )
+ 
+-                updateAgentContent(event.agentId, {
++                // TODO: Add reasoning chunks to a separate component
++                updateAgentContent(agentId, {
+                   type: 'text',
+-                  content: text,
++                  content: chunk,
+                 })
++                return
+               } else {
+-                if (rootStreamSeenRef.current) {
+-                  // Skip redundant root text events when stream chunks already handled
+-                  return
+-                }
+-                const previous = rootStreamBufferRef.current ?? ''
+-                if (!text) {
+-                  return
++                event satisfies never
++                throw new Error('Unhandled event type')
++              }
++            },
++
++            handleEvent: (event) => {
++              logger.info(
++                {
++                  type: event.type,
++                  hasAgentId: has(event, 'agentId') && event.agentId,
++                  event,
++                },
++                `SDK ${JSON.stringify(event.type)} Event received (raw)`,
++              )
++
++              if (event.type === 'text') {
++                const text = event.text
++
++                if (typeof text !== 'string' || !text) return
++
++                // Track if main agent (no agentId) started streaming
++                if (!hasReceivedContent && !event.agentId) {
++                  hasReceivedContent = true
++                  setStreamStatus('streaming')
++                } else if (!hasReceivedContent) {
++                  hasReceivedContent = true
++                  setStreamStatus('streaming')
+                 }
+-                logger.info(
+-                  {
+-                    textPreview: text.slice(0, 100),
+-                    previousLength: previous.length,
+-                    appendedLength: text.length,
+-                  },
+-                  'setMessages: text event without agentId',
+-                )
+-                rootStreamBufferRef.current = previous + text
+ 
+-                appendRootChunk({ type: 'text', text })
+-              }
+-              return
+-            }
++                if (event.agentId) {
++                  logger.info(
++                    {
++                      agentId: event.agentId,
++                      textPreview: text.slice(0, 100),
++                    },
++                    'setMessages: text event with agentId',
++                  )
++                  const previous =
++                    agentStreamAccumulatorsRef.current.get(event.agentId) ?? ''
++                  if (!text) {
++                    return
++                  }
++                  agentStreamAccumulatorsRef.current.set(
++                    event.agentId,
++                    previous + text,
++                  )
+ 
+-            if (
+-              event.type === 'finish' &&
+-              typeof event.totalCost === 'number'
+-            ) {
+-              actualCredits = event.totalCost
+-              addSessionCredits(event.totalCost)
+-            }
++                  updateAgentContent(event.agentId, {
++                    type: 'text',
++                    content: text,
++                  })
++                } else {
++                  if (rootStreamSeenRef.current) {
++                    // Skip redundant root text events when stream chunks already handled
++                    return
++                  }
++                  const previous = rootStreamBufferRef.current ?? ''
++                  if (!text) {
++                    return
++                  }
++                  logger.info(
++                    {
++                      textPreview: text.slice(0, 100),
++                      previousLength: previous.length,
++                      appendedLength: text.length,
++                    },
++                    'setMessages: text event without agentId',
++                  )
++                  rootStreamBufferRef.current = previous + text
+ 
+-            if (event.type === 'subagent_start') {
+-              // Skip rendering hidden agents
+-              if (shouldHideAgent(event.agentType)) {
++                  appendRootChunk({ type: 'text', text })
++                }
+                 return
+               }
+ 
+-              if (event.agentId) {
+-                logger.info(
+-                  {
+-                    agentId: event.agentId,
+-                    agentType: event.agentType,
+-                    parentAgentId: event.parentAgentId || 'ROOT',
+-                    hasParentAgentId: !!event.parentAgentId,
+-                    eventKeys: Object.keys(event),
+-                    params: event.params,
+-                    prompt: event.prompt,
+-                  },
+-                  'CLI: subagent_start event received',
+-                )
+-                addActiveSubagent(event.agentId)
+-
+-                let foundExistingBlock = false
+-                for (const [
+-                  tempId,
+-                  info,
+-                ] of spawnAgentsMapRef.current.entries()) {
+-                  const eventType = event.agentType || ''
+-                  const storedType = info.agentType || ''
+-                  // Match if exact match, or if eventType ends with storedType (e.g., 'codebuff/file-picker@0.0.2' matches 'file-picker')
+-                  const isMatch =
+-                    eventType === storedType ||
+-                    (eventType.includes('/') &&
+-                      eventType.split('/')[1]?.split('@')[0] === storedType)
+-                  if (isMatch) {
+-                    logger.info(
+-                      {
+-                        tempId,
+-                        realAgentId: event.agentId,
+-                        agentType: eventType,
+-                        hasParentAgentId: !!event.parentAgentId,
+-                        parentAgentId: event.parentAgentId || 'none',
+-                      },
+-                      'setMessages: matching spawn_agents block found',
+-                    )
+-                    applyMessageUpdate((prev) =>
+-                      prev.map((msg) => {
+-                        if (msg.id === aiMessageId && msg.blocks) {
+-                          // Find and extract the block with tempId
+-                          let blockToMove: ContentBlock | null = null
+-                          const extractBlock = (
+-                            blocks: ContentBlock[],
+-                          ): ContentBlock[] => {
+-                            const result: ContentBlock[] = []
+-                            for (const block of blocks) {
+-                              if (
+-                                block.type === 'agent' &&
+-                                block.agentId === tempId
+-                              ) {
+-                                blockToMove = {
+-                                  ...block,
+-                                  agentId: event.agentId,
+-                                  ...(event.params && { params: event.params }),
+-                                  ...(event.prompt &&
+-                                    block.initialPrompt === '' && {
+-                                      initialPrompt: event.prompt,
++              if (
++                event.type === 'finish' &&
++                typeof event.totalCost === 'number'
++              ) {
++                actualCredits = event.totalCost
++                addSessionCredits(event.totalCost)
++              }
++
++              if (event.type === 'subagent_start') {
++                // Skip rendering hidden agents
++                if (shouldHideAgent(event.agentType)) {
++                  return
++                }
++
++                if (event.agentId) {
++                  logger.info(
++                    {
++                      agentId: event.agentId,
++                      agentType: event.agentType,
++                      parentAgentId: event.parentAgentId || 'ROOT',
++                      hasParentAgentId: !!event.parentAgentId,
++                      eventKeys: Object.keys(event),
++                      params: event.params,
++                      prompt: event.prompt,
++                    },
++                    'CLI: subagent_start event received',
++                  )
++                  addActiveSubagent(event.agentId)
++
++                  let foundExistingBlock = false
++                  for (const [
++                    tempId,
++                    info,
++                  ] of spawnAgentsMapRef.current.entries()) {
++                    const eventType = event.agentType || ''
++                    const storedType = info.agentType || ''
++                    // Match if exact match, or if eventType ends with storedType (e.g., 'codebuff/file-picker@0.0.2' matches 'file-picker')
++                    const isMatch =
++                      eventType === storedType ||
++                      (eventType.includes('/') &&
++                        eventType.split('/')[1]?.split('@')[0] === storedType)
++                    if (isMatch) {
++                      logger.info(
++                        {
++                          tempId,
++                          realAgentId: event.agentId,
++                          agentType: eventType,
++                          hasParentAgentId: !!event.parentAgentId,
++                          parentAgentId: event.parentAgentId || 'none',
++                        },
++                        'setMessages: matching spawn_agents block found',
++                      )
++                      applyMessageUpdate((prev) =>
++                        prev.map((msg) => {
++                          if (msg.id === aiMessageId && msg.blocks) {
++                            // Find and extract the block with tempId
++                            let blockToMove: ContentBlock | null = null
++                            const extractBlock = (
++                              blocks: ContentBlock[],
++                            ): ContentBlock[] => {
++                              const result: ContentBlock[] = []
++                              for (const block of blocks) {
++                                if (
++                                  block.type === 'agent' &&
++                                  block.agentId === tempId
++                                ) {
++                                  blockToMove = {
++                                    ...block,
++                                    agentId: event.agentId,
++                                    ...(event.params && {
++                                      params: event.params,
+                                     }),
++                                    ...(event.prompt &&
++                                      block.initialPrompt === '' && {
++                                        initialPrompt: event.prompt,
++                                      }),
++                                  }
++                                  // Don't add to result - we're extracting it
++                                } else if (
++                                  block.type === 'agent' &&
++                                  block.blocks
++                                ) {
++                                  // Recursively process nested blocks
++                                  result.push({
++                                    ...block,
++                                    blocks: extractBlock(block.blocks),
++                                  })
++                                } else {
++                                  result.push(block)
+                                 }
+-                                // Don't add to result - we're extracting it
+-                              } else if (
+-                                block.type === 'agent' &&
+-                                block.blocks
+-                              ) {
+-                                // Recursively process nested blocks
+-                                result.push({
+-                                  ...block,
+-                                  blocks: extractBlock(block.blocks),
+-                                })
+-                              } else {
+-                                result.push(block)
+                               }
++                              return result
+                             }
+-                            return result
+-                          }
+-
+-                          let blocks = extractBlock(msg.blocks)
+ 
+-                          if (!blockToMove) {
+-                            // Fallback: just rename if we couldn't find it
+-                            blocks = updateBlocksRecursively(
+-                              msg.blocks,
+-                              tempId,
+-                              (block) => ({ ...block, agentId: event.agentId }),
+-                            )
+-                            return { ...msg, blocks }
+-                          }
++                            let blocks = extractBlock(msg.blocks)
+ 
+-                          // If parentAgentId exists, nest under parent
+-                          if (event.parentAgentId) {
+-                            logger.info(
+-                              {
++                            if (!blockToMove) {
++                              // Fallback: just rename if we couldn't find it
++                              blocks = updateBlocksRecursively(
++                                msg.blocks,
+                                 tempId,
+-                                realAgentId: event.agentId,
+-                                parentAgentId: event.parentAgentId,
+-                              },
+-                              'setMessages: moving spawn_agents block to nest under parent',
+-                            )
+-
+-                            // Try to find parent and nest
+-                            let parentFound = false
+-                            const updatedBlocks = updateBlocksRecursively(
+-                              blocks,
+-                              event.parentAgentId,
+-                              (parentBlock) => {
+-                                if (parentBlock.type !== 'agent') {
+-                                  return parentBlock
+-                                }
+-                                parentFound = true
+-                                return {
+-                                  ...parentBlock,
+-                                  blocks: [
+-                                    ...(parentBlock.blocks || []),
+-                                    blockToMove!,
+-                                  ],
+-                                }
+-                              },
+-                            )
++                                (block) => ({
++                                  ...block,
++                                  agentId: event.agentId,
++                                }),
++                              )
++                              return { ...msg, blocks }
++                            }
+ 
+-                            // If parent found, use updated blocks; otherwise add to top level
+-                            if (parentFound) {
+-                              blocks = updatedBlocks
+-                            } else {
++                            // If parentAgentId exists, nest under parent
++                            if (event.parentAgentId) {
+                               logger.info(
+                                 {
+                                   tempId,
+                                   realAgentId: event.agentId,
+                                   parentAgentId: event.parentAgentId,
+                                 },
+-                                'setMessages: spawn_agents parent not found, adding to top level',
++                                'setMessages: moving spawn_agents block to nest under parent',
+                               )
++
++                              // Try to find parent and nest
++                              let parentFound = false
++                              const updatedBlocks = updateBlocksRecursively(
++                                blocks,
++                                event.parentAgentId,
++                                (parentBlock) => {
++                                  if (parentBlock.type !== 'agent') {
++                                    return parentBlock
++                                  }
++                                  parentFound = true
++                                  return {
++                                    ...parentBlock,
++                                    blocks: [
++                                      ...(parentBlock.blocks || []),
++                                      blockToMove!,
++                                    ],
++                                  }
++                                },
++                              )
++
++                              // If parent found, use updated blocks; otherwise add to top level
++                              if (parentFound) {
++                                blocks = updatedBlocks
++                              } else {
++                                logger.info(
++                                  {
++                                    tempId,
++                                    realAgentId: event.agentId,
++                                    parentAgentId: event.parentAgentId,
++                                  },
++                                  'setMessages: spawn_agents parent not found, adding to top level',
++                                )
++                                blocks = [...blocks, blockToMove]
++                              }
++                            } else {
++                              // No parent - add back at top level with new ID
+                               blocks = [...blocks, blockToMove]
+                             }
++
++                            return { ...msg, blocks }
++                          }
++                          return msg
++                        }),
++                      )
++
++                      setStreamingAgents((prev) => {
++                        const next = new Set(prev)
++                        next.delete(tempId)
++                        next.add(event.agentId)
++                        return next
++                      })
++
++                      spawnAgentsMapRef.current.delete(tempId)
++                      foundExistingBlock = true
++                      break
++                    }
++                  }
++
++                  if (!foundExistingBlock) {
++                    logger.info(
++                      {
++                        agentId: event.agentId,
++                        agentType: event.agentType,
++                        parentAgentId: event.parentAgentId || 'ROOT',
++                      },
++                      'setMessages: creating new agent block (no spawn_agents match)',
++                    )
++                    applyMessageUpdate((prev) =>
++                      prev.map((msg) => {
++                        if (msg.id !== aiMessageId) {
++                          return msg
++                        }
++
++                        const blocks: ContentBlock[] = msg.blocks
++                          ? [...msg.blocks]
++                          : []
++                        const newAgentBlock: ContentBlock = {
++                          type: 'agent',
++                          agentId: event.agentId,
++                          agentName: event.agentType || 'Agent',
++                          agentType: event.agentType || 'unknown',
++                          content: '',
++                          status: 'running' as const,
++                          blocks: [] as ContentBlock[],
++                          initialPrompt: event.prompt || '',
++                          ...(event.params && { params: event.params }),
++                          ...(shouldCollapseByDefault(
++                            event.agentType || '',
++                          ) && {
++                            isCollapsed: true,
++                          }),
++                        }
++
++                        // If parentAgentId exists, nest inside parent agent
++                        if (event.parentAgentId) {
++                          logger.info(
++                            {
++                              childId: event.agentId,
++                              parentId: event.parentAgentId,
++                            },
++                            'Nesting agent inside parent',
++                          )
++
++                          // Try to find and update parent
++                          let parentFound = false
++                          const updatedBlocks = updateBlocksRecursively(
++                            blocks,
++                            event.parentAgentId,
++                            (parentBlock) => {
++                              if (parentBlock.type !== 'agent') {
++                                return parentBlock
++                              }
++                              parentFound = true
++                              return {
++                                ...parentBlock,
++                                blocks: [
++                                  ...(parentBlock.blocks || []),
++                                  newAgentBlock,
++                                ],
++                              }
++                            },
++                          )
++
++                          // If parent was found, use updated blocks; otherwise add to top level
++                          if (parentFound) {
++                            return { ...msg, blocks: updatedBlocks }
+                           } else {
+-                            // No parent - add back at top level with new ID
+-                            blocks = [...blocks, blockToMove]
++                            logger.info(
++                              {
++                                childId: event.agentId,
++                                parentId: event.parentAgentId,
++                              },
++                              'Parent agent not found, adding to top level',
++                            )
++                            // Parent doesn't exist - add at top level as fallback
++                            return {
++                              ...msg,
++                              blocks: [...blocks, newAgentBlock],
++                            }
+                           }
++                        }
+ 
+-                          return { ...msg, blocks }
++                        // No parent - add to top level
++                        return {
++                          ...msg,
++                          blocks: [...blocks, newAgentBlock],
+                         }
+-                        return msg
+                       }),
+                     )
+ 
+-                    setStreamingAgents((prev) => {
+-                      const next = new Set(prev)
+-                      next.delete(tempId)
+-                      next.add(event.agentId)
+-                      return next
+-                    })
+-
+-                    spawnAgentsMapRef.current.delete(tempId)
+-                    foundExistingBlock = true
+-                    break
++                    setStreamingAgents((prev) =>
++                      new Set(prev).add(event.agentId),
++                    )
+                   }
+                 }
++              } else if (event.type === 'subagent_finish') {
++                if (event.agentId) {
++                  if (shouldHideAgent(event.agentType)) {
++                    return
++                  }
++                  agentStreamAccumulatorsRef.current.delete(event.agentId)
++                  removeActiveSubagent(event.agentId)
+ 
+-                if (!foundExistingBlock) {
+-                  logger.info(
+-                    {
+-                      agentId: event.agentId,
+-                      agentType: event.agentType,
+-                      parentAgentId: event.parentAgentId || 'ROOT',
+-                    },
+-                    'setMessages: creating new agent block (no spawn_agents match)',
++                  applyMessageUpdate((prev) =>
++                    prev.map((msg) => {
++                      if (msg.id === aiMessageId && msg.blocks) {
++                        // Use recursive update to handle nested agents
++                        const blocks = updateBlocksRecursively(
++                          msg.blocks,
++                          event.agentId,
++                          (block) => ({
++                            ...block,
++                            status: 'complete' as const,
++                          }),
++                        )
++                        return { ...msg, blocks }
++                      }
++                      return msg
++                    }),
+                   )
++
++                  setStreamingAgents((prev) => {
++                    const next = new Set(prev)
++                    next.delete(event.agentId)
++                    return next
++                  })
++                }
++              }
++
++              if (event.type === 'tool_call' && event.toolCallId) {
++                const {
++                  toolCallId,
++                  toolName,
++                  input,
++                  agentId,
++                  includeToolCall,
++                } = event
++
++                if (toolName === 'spawn_agents' && input?.agents) {
++                  const agents = Array.isArray(input.agents) ? input.agents : []
++
++                  agents.forEach((agent: any, index: number) => {
++                    const tempAgentId = `${toolCallId}-${index}`
++                    spawnAgentsMapRef.current.set(tempAgentId, {
++                      index,
++                      agentType: agent.agent_type || 'unknown',
++                    })
++                  })
++
+                   applyMessageUpdate((prev) =>
+                     prev.map((msg) => {
+                       if (msg.id !== aiMessageId) {
+                         return msg
+                       }
+ 
+-                      const blocks: ContentBlock[] = msg.blocks
++                      const existingBlocks: ContentBlock[] = msg.blocks
+                         ? [...msg.blocks]
+                         : []
+-                      const newAgentBlock: ContentBlock = {
+-                        type: 'agent',
+-                        agentId: event.agentId,
+-                        agentName: event.agentType || 'Agent',
+-                        agentType: event.agentType || 'unknown',
+-                        content: '',
+-                        status: 'running' as const,
+-                        blocks: [] as ContentBlock[],
+-                        initialPrompt: event.prompt || '',
+-                        ...(event.params && { params: event.params }),
+-                        ...(shouldCollapseByDefault(event.agentType || '') && {
+-                          isCollapsed: true,
+-                        }),
+-                      }
+-
+-                      // If parentAgentId exists, nest inside parent agent
+-                      if (event.parentAgentId) {
+-                        logger.info(
+-                          {
+-                            childId: event.agentId,
+-                            parentId: event.parentAgentId,
+-                          },
+-                          'Nesting agent inside parent',
+-                        )
+-
+-                        // Try to find and update parent
+-                        let parentFound = false
+-                        const updatedBlocks = updateBlocksRecursively(
+-                          blocks,
+-                          event.parentAgentId,
+-                          (parentBlock) => {
+-                            if (parentBlock.type !== 'agent') {
+-                              return parentBlock
+-                            }
+-                            parentFound = true
+-                            return {
+-                              ...parentBlock,
+-                              blocks: [
+-                                ...(parentBlock.blocks || []),
+-                                newAgentBlock,
+-                              ],
+-                            }
+-                          },
+-                        )
+ 
+-                        // If parent was found, use updated blocks; otherwise add to top level
+-                        if (parentFound) {
+-                          return { ...msg, blocks: updatedBlocks }
+-                        } else {
+-                          logger.info(
+-                            {
+-                              childId: event.agentId,
+-                              parentId: event.parentAgentId,
+-                            },
+-                            'Parent agent not found, adding to top level',
+-                          )
+-                          // Parent doesn't exist - add at top level as fallback
+-                          return {
+-                            ...msg,
+-                            blocks: [...blocks, newAgentBlock],
+-                          }
+-                        }
+-                      }
++                      const newAgentBlocks: ContentBlock[] = agents.map(
++                        (agent: any, index: number) => ({
++                          type: 'agent',
++                          agentId: `${toolCallId}-${index}`,
++                          agentName: agent.agent_type || 'Agent
+
+… [diff truncated: view full diff on GitHub] …

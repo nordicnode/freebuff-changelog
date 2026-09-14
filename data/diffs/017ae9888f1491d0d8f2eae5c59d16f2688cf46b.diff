@@ -1,0 +1,212 @@
+diff --git a/sdk/src/__tests__/database.test.ts b/sdk/src/__tests__/database.test.ts
+new file mode 100644
+index 000000000..f10f5fb77
+--- /dev/null
++++ b/sdk/src/__tests__/database.test.ts
+@@ -0,0 +1,100 @@
++import { afterEach, describe, expect, mock, test } from 'bun:test'
++
++import { getUserInfoFromApiKey } from '../impl/database'
++
++import type { Logger } from '@codebuff/common/types/contracts/logger'
++
++describe('getUserInfoFromApiKey', () => {
++  const originalFetch = globalThis.fetch
++
++  const createLoggerMocks = (): Logger =>
++    ({
++      debug: mock(() => {}),
++      info: mock(() => {}),
++      warn: mock(() => {}),
++      error: mock(() => {}),
++    }) as unknown as Logger
++
++  afterEach(() => {
++    globalThis.fetch = originalFetch
++    mock.restore()
++  })
++
++  test('requests only the requested fields (no implicit userColumns)', async () => {
++    const fetchMock = mock(async (input: RequestInfo | URL) => {
++      const urlString =
++        input instanceof URL
++          ? input.toString()
++          : input instanceof Request
++            ? input.url
++            : String(input)
++      const url = new URL(urlString)
++
++      expect(url.pathname).toContain('/api/v1/me')
++      expect(url.searchParams.get('fields')).toBe('id')
++
++      return new Response(JSON.stringify({ id: 'user-123' }), { status: 200 })
++    })
++    globalThis.fetch = fetchMock as unknown as typeof fetch
++
++    const result = await getUserInfoFromApiKey({
++      apiKey: 'test-api-key',
++      fields: ['id'],
++      logger: createLoggerMocks(),
++    })
++
++    expect(fetchMock).toHaveBeenCalledTimes(1)
++    expect(result).toEqual({ id: 'user-123' })
++  })
++
++  test('merges cached fields and avoids refetching when present', async () => {
++    const fetchMock = mock(async (input: RequestInfo | URL) => {
++      const urlString =
++        input instanceof URL
++          ? input.toString()
++          : input instanceof Request
++            ? input.url
++            : String(input)
++      const url = new URL(urlString)
++      const fields = url.searchParams.get('fields')
++
++      if (fields === 'id') {
++        return new Response(JSON.stringify({ id: 'user-123' }), { status: 200 })
++      }
++      if (fields === 'email') {
++        return new Response(JSON.stringify({ email: 'user@example.com' }), {
++          status: 200,
++        })
++      }
++
++      throw new Error(`Unexpected fields param: ${fields}`)
++    })
++    globalThis.fetch = fetchMock as unknown as typeof fetch
++
++    const logger = createLoggerMocks()
++
++    const first = await getUserInfoFromApiKey({
++      apiKey: 'cache-test-api-key',
++      fields: ['id'],
++      logger,
++    })
++    expect(first).toEqual({ id: 'user-123' })
++
++    const second = await getUserInfoFromApiKey({
++      apiKey: 'cache-test-api-key',
++      fields: ['email'],
++      logger,
++    })
++    expect(second).toEqual({ email: 'user@example.com' })
++
++    const third = await getUserInfoFromApiKey({
++      apiKey: 'cache-test-api-key',
++      fields: ['id', 'email'],
++      logger,
++    })
++    expect(third).toEqual({ id: 'user-123', email: 'user@example.com' })
++
++    expect(fetchMock).toHaveBeenCalledTimes(2)
++  })
++})
++
+diff --git a/sdk/src/impl/database.ts b/sdk/src/impl/database.ts
+index e131becfd..5fb0ed907 100644
+--- a/sdk/src/impl/database.ts
++++ b/sdk/src/impl/database.ts
+@@ -1,5 +1,4 @@
+ import { validateSingleAgent } from '@codebuff/common/templates/agent-validation'
+-import { userColumns } from '@codebuff/common/types/contracts/database'
+ import { DynamicAgentTemplateSchema } from '@codebuff/common/types/dynamic-agent-template'
+ import { getErrorObject } from '@codebuff/common/util/error'
+ import z from 'zod/v4'
+@@ -19,9 +18,13 @@ import type {
+ import type { DynamicAgentTemplate } from '@codebuff/common/types/dynamic-agent-template'
+ import type { ParamsOf } from '@codebuff/common/types/function-params'
+ 
++type CachedUserInfo = Partial<
++  NonNullable<Awaited<GetUserInfoFromApiKeyOutput<UserColumn>>>
++>
++
+ const userInfoCache: Record<
+   string,
+-  Awaited<GetUserInfoFromApiKeyOutput<UserColumn>> | null
++  CachedUserInfo | null
+ > = {}
+ 
+ const agentsResponseSchema = z.object({
+@@ -34,20 +37,29 @@ export async function getUserInfoFromApiKey<T extends UserColumn>(
+ ): GetUserInfoFromApiKeyOutput<T> {
+   const { apiKey, fields, logger } = params
+ 
+-  if (apiKey in userInfoCache) {
+-    const userInfo = userInfoCache[apiKey]
+-    if (userInfo === null) {
+-      throw new AuthenticationError('Authentication failed', 401)
+-    }
+-    return Object.fromEntries(
+-      fields.map((field) => [field, userInfo[field]]),
+-    ) as {
+-      [K in (typeof fields)[number]]: (typeof userInfo)[K]
+-    }
++  const cached = userInfoCache[apiKey]
++  if (cached === null) {
++    throw new AuthenticationError('Authentication failed', 401)
+   }
++  if (
++    cached &&
++    fields.every((field) =>
++      Object.prototype.hasOwnProperty.call(cached, field),
++    )
++  ) {
++    return Object.fromEntries(fields.map((field) => [field, cached[field]])) as {
++      [K in T]: CachedUserInfo[K]
++    } as Awaited<GetUserInfoFromApiKeyOutput<T>>
++  }
++
++  const fieldsToFetch = cached
++    ? fields.filter(
++        (field) => !Object.prototype.hasOwnProperty.call(cached, field),
++      )
++    : fields
+ 
+   const urlParams = new URLSearchParams({
+-    fields: userColumns.join(','),
++    fields: fieldsToFetch.join(','),
+   })
+   const url = new URL(`/api/v1/me?${urlParams}`, WEBSITE_URL)
+ 
+@@ -100,8 +112,13 @@ export async function getUserInfoFromApiKey<T extends UserColumn>(
+     throw new NetworkError('Request failed', ErrorCodes.UNKNOWN_ERROR, response.status)
+   }
+ 
++  const cachedBeforeMerge = userInfoCache[apiKey]
+   try {
+-    userInfoCache[apiKey] = await response.json()
++    const fetchedFields = (await response.json()) as CachedUserInfo
++    userInfoCache[apiKey] = {
++      ...(cachedBeforeMerge ?? {}),
++      ...fetchedFields,
++    }
+   } catch (error) {
+     logger.error(
+       { error: getErrorObject(error), apiKey, fields },
+@@ -114,11 +131,21 @@ export async function getUserInfoFromApiKey<T extends UserColumn>(
+   if (userInfo === null) {
+     throw new AuthenticationError('Authentication failed', 401)
+   }
++  if (
++    !userInfo ||
++    !fields.every((field) =>
++      Object.prototype.hasOwnProperty.call(userInfo, field),
++    )
++  ) {
++    logger.error(
++      { apiKey, fields },
++      'getUserInfoFromApiKey: response missing required fields',
++    )
++    throw new NetworkError('Request failed', ErrorCodes.UNKNOWN_ERROR, response.status)
++  }
+   return Object.fromEntries(
+     fields.map((field) => [field, userInfo[field]]),
+-  ) as {
+-    [K in (typeof fields)[number]]: (typeof userInfo)[K]
+-  }
++  ) as Awaited<GetUserInfoFromApiKeyOutput<T>>
+ }
+ 
+ export async function fetchAgentFromDatabase(

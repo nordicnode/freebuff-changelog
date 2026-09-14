@@ -1,0 +1,662 @@
+diff --git a/cli/src/utils/local-agent-registry.ts b/cli/src/utils/local-agent-registry.ts
+index f6041bdc2..2016cc799 100644
+--- a/cli/src/utils/local-agent-registry.ts
++++ b/cli/src/utils/local-agent-registry.ts
+@@ -3,7 +3,9 @@ import os from 'os'
+ import path from 'path'
+ 
+ import { pluralize } from '@codebuff/common/util/string'
+-import { loadLocalAgents as sdkLoadLocalAgents } from '@codebuff/sdk'
++import { loadLocalAgents as sdkLoadLocalAgents, loadMCPConfigSync } from '@codebuff/sdk'
++
++import type { MCPConfig } from '@codebuff/common/types/mcp'
+ 
+ import { getProjectRoot } from '../project-files'
+ import { AGENT_MODE_TO_ID, type AgentMode } from './constants'
+@@ -32,6 +34,8 @@ export interface LocalAgentInfo {
+ let userAgentsCache: Record<string, AgentDefinition> = {}
+ // Map from agent ID to source file path (for UI "Open file" links)
+ let userAgentFilePaths: Map<string, string> = new Map()
++// Cache for MCP servers loaded from mcp.json in .agents directories
++let mcpServersCache: Record<string, MCPConfig> = {}
+ 
+ /**
+  * Initialize the agent registry by loading user agents via the SDK.
+@@ -56,6 +60,21 @@ export async function initializeAgentRegistry(): Promise<void> {
+     userAgentsCache = {}
+     userAgentFilePaths = new Map()
+   }
++
++  // Load MCP config from mcp.json files in .agents directories
++  try {
++    const mcpConfig = loadMCPConfigSync({ verbose: false })
++    mcpServersCache = mcpConfig.mcpServers
++    if (Object.keys(mcpServersCache).length > 0) {
++      logger.debug(
++        { mcpServers: Object.keys(mcpServersCache), source: mcpConfig._sourceFilePath },
++        '[agents] Loaded MCP servers from mcp.json',
++      )
++    }
++  } catch (error) {
++    logger.warn({ error }, 'Failed to load MCP config from .agents directories')
++    mcpServersCache = {}
++  }
+ }
+ 
+ /**
+@@ -329,6 +348,25 @@ export const loadAgentDefinitions = (): AgentDefinition[] => {
+     }
+   }
+ 
++  // Merge MCP servers from mcp.json into base agents
++  // This allows users to configure MCP tools that are available to the main agent
++  if (Object.keys(mcpServersCache).length > 0) {
++    for (const def of definitions) {
++      // Consider any agent with an ID starting with 'base' as a base agent
++      if (def.id.startsWith('base')) {
++        // Initialize mcpServers if not present
++        if (!def.mcpServers) {
++          def.mcpServers = {}
++        }
++        // Merge MCP servers (user config can override existing servers)
++        def.mcpServers = {
++          ...def.mcpServers,
++          ...mcpServersCache,
++        }
++      }
++    }
++  }
++
+   return definitions
+ }
+ 
+@@ -412,4 +450,13 @@ export const __resetLocalAgentRegistryForTests = (): void => {
+   cachedAgentsDir = null
+   userAgentsCache = {}
+   userAgentFilePaths = new Map()
++  mcpServersCache = {}
++}
++
++/**
++ * Get the currently loaded MCP servers from mcp.json.
++ * Useful for debugging and displaying loaded MCP configuration.
++ */
++export const getLoadedMCPServers = (): Record<string, MCPConfig> => {
++  return { ...mcpServersCache }
+ }
+diff --git a/sdk/src/__tests__/load-mcp-config.test.ts b/sdk/src/__tests__/load-mcp-config.test.ts
+new file mode 100644
+index 000000000..43160f494
+--- /dev/null
++++ b/sdk/src/__tests__/load-mcp-config.test.ts
+@@ -0,0 +1,273 @@
++import fs from 'fs'
++import os from 'os'
++import path from 'path'
++
++import { loadMCPConfig, loadMCPConfigSync, mcpFileSchema } from '../agents/load-mcp-config'
++
++import type { MCPConfig } from '@codebuff/common/types/mcp'
++
++// Helper to safely access stdio config properties
++function isStdioConfig(config: MCPConfig): config is MCPConfig & { command: string; env?: Record<string, string> } {
++  return 'command' in config
++}
++
++describe('mcpFileSchema', () => {
++  it('should parse a valid mcp.json with stdio config', () => {
++    const config = {
++      mcpServers: {
++        myServer: {
++          command: 'npx',
++          args: ['-y', 'my-package'],
++          env: {
++            API_KEY: 'test-key',
++          },
++        },
++      },
++    }
++
++    const result = mcpFileSchema.safeParse(config)
++    expect(result.success).toBe(true)
++    if (result.success) {
++      expect(result.data.mcpServers.myServer).toBeDefined()
++      expect(result.data.mcpServers.myServer.command).toBe('npx')
++    }
++  })
++
++  it('should parse a valid mcp.json with http config', () => {
++    const config = {
++      mcpServers: {
++        remoteServer: {
++          type: 'http',
++          url: 'https://example.com/mcp',
++          headers: {
++            Authorization: 'Bearer token',
++          },
++        },
++      },
++    }
++
++    const result = mcpFileSchema.safeParse(config)
++    expect(result.success).toBe(true)
++    if (result.success) {
++      expect(result.data.mcpServers.remoteServer).toBeDefined()
++      expect(result.data.mcpServers.remoteServer.url).toBe('https://example.com/mcp')
++    }
++  })
++
++  it('should default mcpServers to empty object if not provided', () => {
++    const config = {}
++
++    const result = mcpFileSchema.safeParse(config)
++    expect(result.success).toBe(true)
++    if (result.success) {
++      expect(result.data.mcpServers).toEqual({})
++    }
++  })
++
++  it('should reject invalid config', () => {
++    const config = {
++      mcpServers: {
++        invalidServer: {
++          // Missing required fields
++          type: 'invalid-type',
++        },
++      },
++    }
++
++    const result = mcpFileSchema.safeParse(config)
++    expect(result.success).toBe(false)
++  })
++})
++
++describe('loadMCPConfigSync', () => {
++  let tempDir: string
++  let originalCwd: string
++
++  beforeEach(() => {
++    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-config-test-'))
++    originalCwd = process.cwd()
++    process.chdir(tempDir)
++  })
++
++  afterEach(() => {
++    process.chdir(originalCwd)
++    fs.rmSync(tempDir, { recursive: true, force: true })
++  })
++
++  it('should return empty config when no mcp.json exists in project dir', () => {
++    // No mcp.json in tempDir/.agents - should not find any project-specific servers
++    const result = loadMCPConfigSync({ verbose: false })
++    // Check that no server named 'testProjectServer' exists (which we'd create if one existed)
++    expect(result.mcpServers.testProjectServer).toBeUndefined()
++  })
++
++  it('should load mcp.json from .agents directory', () => {
++    const agentsDir = path.join(tempDir, '.agents')
++    fs.mkdirSync(agentsDir, { recursive: true })
++
++    const mcpConfig = {
++      mcpServers: {
++        testServer: {
++          command: 'node',
++          args: ['server.js'],
++        },
++      },
++    }
++    fs.writeFileSync(
++      path.join(agentsDir, 'mcp.json'),
++      JSON.stringify(mcpConfig, null, 2),
++    )
++
++    const result = loadMCPConfigSync({ verbose: false })
++    expect(result.mcpServers.testServer).toBeDefined()
++    const testServer = result.mcpServers.testServer
++    if (isStdioConfig(testServer)) {
++      expect(testServer.command).toBe('node')
++    }
++    // Verify a source path was recorded (don't check exact path due to temp dir variations)
++    expect(result._sourceFilePath).toContain('mcp.json')
++  })
++
++  it('should resolve environment variable references', () => {
++    const agentsDir = path.join(tempDir, '.agents')
++    fs.mkdirSync(agentsDir, { recursive: true })
++
++    // Set env var for test
++    process.env.TEST_MCP_API_KEY = 'resolved-api-key'
++
++    const mcpConfig = {
++      mcpServers: {
++        envServer: {
++          command: 'npx',
++          args: ['-y', 'my-mcp-server'],
++          env: {
++            API_KEY: '$TEST_MCP_API_KEY',
++          },
++        },
++      },
++    }
++    fs.writeFileSync(
++      path.join(agentsDir, 'mcp.json'),
++      JSON.stringify(mcpConfig, null, 2),
++    )
++
++    const result = loadMCPConfigSync({ verbose: false })
++    expect(result.mcpServers.envServer).toBeDefined()
++    const envServer = result.mcpServers.envServer
++    if (isStdioConfig(envServer)) {
++      expect(envServer.env?.API_KEY).toBe('resolved-api-key')
++    }
++
++    // Cleanup
++    delete process.env.TEST_MCP_API_KEY
++  })
++
++  it('should skip config if env var is missing', () => {
++    const agentsDir = path.join(tempDir, '.agents')
++    fs.mkdirSync(agentsDir, { recursive: true })
++
++    const mcpConfig = {
++      mcpServers: {
++        missingEnvServer: {
++          command: 'npx',
++          args: ['-y', 'my-mcp-server'],
++          env: {
++            API_KEY: '$NONEXISTENT_VAR_12345',
++          },
++        },
++      },
++    }
++    fs.writeFileSync(
++      path.join(agentsDir, 'mcp.json'),
++      JSON.stringify(mcpConfig, null, 2),
++    )
++
++    // Should not throw, just skip the server with missing env var
++    const result = loadMCPConfigSync({ verbose: false })
++    // The server with missing env var should not be loaded
++    expect(result.mcpServers.missingEnvServer).toBeUndefined()
++  })
++
++  it('should load config from project .agents directory', () => {
++    // Create project .agents directory
++    const projectAgentsDir = path.join(tempDir, '.agents')
++    fs.mkdirSync(projectAgentsDir, { recursive: true })
++
++    // Project config
++    const projectConfig = {
++      mcpServers: {
++        projectServer: {
++          command: 'project-command',
++          args: ['--flag'],
++        },
++      },
++    }
++    fs.writeFileSync(
++      path.join(projectAgentsDir, 'mcp.json'),
++      JSON.stringify(projectConfig, null, 2),
++    )
++
++    const result = loadMCPConfigSync({ verbose: false })
++
++    // Project config should be loaded
++    const projectServer = result.mcpServers.projectServer
++    expect(projectServer).toBeDefined()
++    if (projectServer && isStdioConfig(projectServer)) {
++      expect(projectServer.command).toBe('project-command')
++    }
++  })
++
++  it('should handle invalid JSON gracefully', () => {
++    const agentsDir = path.join(tempDir, '.agents')
++    fs.mkdirSync(agentsDir, { recursive: true })
++
++    fs.writeFileSync(path.join(agentsDir, 'mcp.json'), 'not valid json {')
++
++    // Should not throw - just skip the invalid file
++    const result = loadMCPConfigSync({ verbose: false })
++    // The result should not contain any servers from this invalid config
++    // (though it might contain servers from other directories like home)
++    expect(result.mcpServers.invalidServer).toBeUndefined()
++  })
++})
++
++describe('loadMCPConfig', () => {
++  let tempDir: string
++  let originalCwd: string
++
++  beforeEach(() => {
++    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-config-async-test-'))
++    originalCwd = process.cwd()
++    process.chdir(tempDir)
++  })
++
++  afterEach(() => {
++    process.chdir(originalCwd)
++    fs.rmSync(tempDir, { recursive: true, force: true })
++  })
++
++  it('should load mcp.json asynchronously', async () => {
++    const agentsDir = path.join(tempDir, '.agents')
++    fs.mkdirSync(agentsDir, { recursive: true })
++
++    const mcpConfig = {
++      mcpServers: {
++        asyncServer: {
++          command: 'async-command',
++          args: ['--async'],
++        },
++      },
++    }
++    fs.writeFileSync(
++      path.join(agentsDir, 'mcp.json'),
++      JSON.stringify(mcpConfig, null, 2),
++    )
++
++    const result = await loadMCPConfig({ verbose: false })
++    expect(result.mcpServers.asyncServer).toBeDefined()
++    const asyncServer = result.mcpServers.asyncServer
++    if (isStdioConfig(asyncServer)) {
++      expect(asyncServer.command).toBe('async-command')
++    }
++  })
++})
+diff --git a/sdk/src/agents/load-mcp-config.ts b/sdk/src/agents/load-mcp-config.ts
+new file mode 100644
+index 000000000..98943588e
+--- /dev/null
++++ b/sdk/src/agents/load-mcp-config.ts
+@@ -0,0 +1,268 @@
++import fs from 'fs'
++import fsPromises from 'fs/promises'
++import os from 'os'
++import path from 'path'
++
++import { mcpConfigSchema } from '@codebuff/common/types/mcp'
++import { z } from 'zod/v4'
++
++import type { MCPConfig } from '@codebuff/common/types/mcp'
++
++/**
++ * Schema for the mcp.json file format.
++ * Matches the standard MCP config format used by Claude Code, Cursor, etc.
++ */
++export const mcpFileSchema = z.object({
++  mcpServers: z.record(z.string(), mcpConfigSchema).default(() => ({})),
++})
++
++export type MCPFileConfig = z.infer<typeof mcpFileSchema>
++
++/**
++ * Loaded MCP configuration with resolved environment variables.
++ */
++export type LoadedMCPConfig = {
++  mcpServers: Record<string, MCPConfig>
++  /** The file path this config was loaded from */
++  _sourceFilePath: string
++}
++
++/**
++ * Resolves environment variable references in MCP server env configs.
++ * Values starting with `$` are treated as env var references (e.g., `'$NOTION_TOKEN'`).
++ *
++ * @param env - The env object from MCP config with possible $VAR_NAME references
++ * @param mcpServerName - The MCP server name for error messages
++ * @returns Resolved env object with all $VAR_NAME values replaced with actual values
++ * @throws Error if a referenced environment variable is missing
++ */
++function resolveMcpEnv(
++  env: Record<string, string> | undefined,
++  mcpServerName: string,
++): Record<string, string> {
++  if (!env) return {}
++
++  const resolved: Record<string, string> = {}
++
++  for (const [key, value] of Object.entries(env)) {
++    if (value.startsWith('$')) {
++      // $VAR_NAME reference - resolve from process.env
++      const envVarName = value.slice(1) // Remove the leading $
++      const envValue = process.env[envVarName]
++
++      if (envValue === undefined) {
++        throw new Error(
++          `Missing environment variable '${envVarName}' required by MCP server '${mcpServerName}' in mcp.json`,
++        )
++      }
++
++      resolved[key] = envValue
++    } else {
++      // Plain string value - use as-is
++      resolved[key] = value
++    }
++  }
++
++  return resolved
++}
++
++/**
++ * Resolves all MCP server env references in a config.
++ * Mutates the mcpServers object to replace $VAR_NAME references with resolved values.
++ *
++ * @param config - The MCP file config to process
++ * @throws Error if any referenced environment variable is missing
++ */
++function resolveMcpConfigEnv(config: MCPFileConfig): void {
++  for (const [serverName, serverConfig] of Object.entries(config.mcpServers)) {
++    if ('command' in serverConfig && serverConfig.env) {
++      serverConfig.env = resolveMcpEnv(serverConfig.env, serverName)
++    }
++  }
++}
++
++const MCP_CONFIG_FILE_NAME = 'mcp.json'
++
++/**
++ * Get default directories to search for mcp.json.
++ * Matches the agent loading directories for consistency.
++ */
++const getDefaultMcpConfigDirs = (): string[] => {
++  const cwdAgents = path.join(process.cwd(), '.agents')
++  const parentAgents = path.join(process.cwd(), '..', '.agents')
++  const homeAgents = path.join(os.homedir(), '.agents')
++  return [cwdAgents, parentAgents, homeAgents]
++}
++
++/**
++ * Load MCP configuration from `mcp.json` files in `.agents` directories.
++ *
++ * By default, searches for mcp.json in:
++ * - `{cwd}/.agents/mcp.json`
++ * - `{cwd}/../.agents/mcp.json`
++ * - `{homedir}/.agents/mcp.json`
++ *
++ * Later directories take precedence, so project MCP servers override global ones.
++ * Environment variable references (e.g., `$API_KEY`) are resolved from process.env.
++ *
++ * @param options.verbose - Whether to log errors during loading
++ * @returns Record of MCP server configurations keyed by server name
++ *
++ * @example
++ * ```typescript
++ * // Load from default locations
++ * const mcpConfig = await loadMCPConfig({ verbose: true })
++ *
++ * // Access MCP servers
++ * for (const [serverName, config] of Object.entries(mcpConfig.mcpServers)) {
++ *   console.log(`MCP server: ${serverName}`)
++ * }
++ * ```
++ */
++export async function loadMCPConfig(options: {
++  verbose?: boolean
++}): Promise<LoadedMCPConfig> {
++  const { verbose = false } = options
++
++  const mergedConfig: LoadedMCPConfig = {
++    mcpServers: {},
++    _sourceFilePath: '',
++  }
++
++  const mcpConfigDirs = getDefaultMcpConfigDirs()
++
++  for (const dir of mcpConfigDirs) {
++    const configPath = path.join(dir, MCP_CONFIG_FILE_NAME)
++
++    try {
++      // Check if file exists asynchronously
++      try {
++        await fsPromises.access(configPath)
++      } catch {
++        continue
++      }
++
++      const content = await fsPromises.readFile(configPath, 'utf8')
++      const rawConfig = JSON.parse(content)
++      const parseResult = mcpFileSchema.safeParse(rawConfig)
++
++      if (!parseResult.success) {
++        if (verbose) {
++          console.error(
++            `Invalid mcp.json at ${configPath}: ${parseResult.error.message}`,
++          )
++        }
++        continue
++      }
++
++      const parsedConfig = parseResult.data
++
++      // Resolve environment variable references
++      try {
++        resolveMcpConfigEnv(parsedConfig)
++      } catch (error) {
++        if (verbose) {
++          console.error(error instanceof Error ? error.message : String(error))
++        }
++        continue
++      }
++
++      // Merge MCP servers (later directories override earlier ones)
++      for (const [serverName, serverConfig] of Object.entries(
++        parsedConfig.mcpServers,
++      )) {
++        mergedConfig.mcpServers[serverName] = serverConfig
++      }
++
++      // Track the last successfully loaded config path
++      if (Object.keys(parsedConfig.mcpServers).length > 0) {
++        mergedConfig._sourceFilePath = configPath
++      }
++    } catch (error) {
++      if (verbose) {
++        console.error(
++          `Error loading mcp.json from ${configPath}:`,
++          error instanceof Error ? error.message : error,
++        )
++      }
++    }
++  }
++
++  return mergedConfig
++}
++
++/**
++ * Synchronously load MCP configuration from `mcp.json` files in `.agents` directories.
++ * This is a sync version for use in contexts where async is not available.
++ *
++ * @param options.verbose - Whether to log errors during loading
++ * @returns Record of MCP server configurations keyed by server name
++ */
++export function loadMCPConfigSync(options: {
++  verbose?: boolean
++}): LoadedMCPConfig {
++  const { verbose = false } = options
++
++  const mergedConfig: LoadedMCPConfig = {
++    mcpServers: {},
++    _sourceFilePath: '',
++  }
++
++  const mcpConfigDirs = getDefaultMcpConfigDirs()
++
++  for (const dir of mcpConfigDirs) {
++    const configPath = path.join(dir, MCP_CONFIG_FILE_NAME)
++
++    try {
++      if (!fs.existsSync(configPath)) {
++        continue
++      }
++
++      const content = fs.readFileSync(configPath, 'utf8')
++      const rawConfig = JSON.parse(content)
++      const parseResult = mcpFileSchema.safeParse(rawConfig)
++
++      if (!parseResult.success) {
++        if (verbose) {
++          console.error(
++            `Invalid mcp.json at ${configPath}: ${parseResult.error.message}`,
++          )
++        }
++        continue
++      }
++
++      const parsedConfig = parseResult.data
++
++      // Resolve environment variable references
++      try {
++        resolveMcpConfigEnv(parsedConfig)
++      } catch (error) {
++        if (verbose) {
++          console.error(error instanceof Error ? error.message : String(error))
++        }
++        continue
++      }
++
++      // Merge MCP servers (later directories override earlier ones)
++      for (const [serverName, serverConfig] of Object.entries(
++        parsedConfig.mcpServers,
++      )) {
++        mergedConfig.mcpServers[serverName] = serverConfig
++      }
++
++      // Track the last successfully loaded config path
++      if (Object.keys(parsedConfig.mcpServers).length > 0) {
++        mergedConfig._sourceFilePath = configPath
++      }
++    } catch (error) {
++      if (verbose) {
++        console.error(
++          `Error loading mcp.json from ${configPath}:`,
++          error instanceof Error ? error.message : error,
++        )
++      }
++    }
++  }
++
++  return mergedConfig
++}
+diff --git a/sdk/src/index.ts b/sdk/src/index.ts
+index fa8f405c7..eb3d7837f 100644
+--- a/sdk/src/index.ts
++++ b/sdk/src/index.ts
+@@ -35,6 +35,7 @@ export * from './constants'
+ export { getUserInfoFromApiKey } from './impl/database'
+ export * from './credentials'
+ export { loadLocalAgents } from './agents/load-agents'
++export { loadMCPConfig, loadMCPConfigSync } from './agents/load-mcp-config'
+ export { loadSkills } from './skills/load-skills'
+ export { formatAvailableSkillsXml } from '@codebuff/common/util/skills'
+ export type { LoadSkillsOptions } from './skills/load-skills'
+@@ -45,6 +46,10 @@ export type {
+   LoadLocalAgentsResult,
+   AgentValidationError,
+ } from './agents/load-agents'
++export type {
++  MCPFileConfig,
++  LoadedMCPConfig,
++} from './agents/load-mcp-config'
+ 
+ export { validateAgents } from './validate-agents'
+ export type { ValidationResult, ValidateAgentsOptions } from './validate-agents'

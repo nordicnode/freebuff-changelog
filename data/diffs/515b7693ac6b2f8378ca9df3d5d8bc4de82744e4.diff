@@ -1,0 +1,945 @@
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index d837c30fb..245484cb9 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -10,10 +10,11 @@ import {
+ } from 'react'
+ import { useShallow } from 'zustand/react/shallow'
+ 
+-import { routeUserPrompt } from './commands/router'
++import { routeUserPrompt, addBashMessageToHistory } from './commands/router'
+ import { AnnouncementBanner } from './components/announcement-banner'
+ import { ChatInputBar } from './components/chat-input-bar'
+ import { MessageWithAgents } from './components/message-with-agents'
++import { PendingBashMessage } from './components/pending-bash-message'
+ import { StatusBar } from './components/status-bar'
+ import { SLASH_COMMANDS } from './data/slash-commands'
+ import { useAgentValidation } from './hooks/use-agent-validation'
+@@ -193,6 +194,15 @@ export const Chat = ({
+       isRetrying: store.isRetrying,
+     })),
+   )
++  const pendingBashMessages = useChatStore(
++    (state) => state.pendingBashMessages,
++  )
++  const clearPendingBashMessages = useChatStore(
++    (state) => state.clearPendingBashMessages,
++  )
++  const removePendingBashMessage = useChatStore(
++    (state) => state.removePendingBashMessage,
++  )
+ 
+   // Memoize toggle IDs extraction - only recompute when messages change
+   const allToggleIds = useMemo(() => {
+@@ -516,6 +526,7 @@ export const Chat = ({
+   const { saveToHistory, navigateUp, navigateDown } = useInputHistory(
+     inputValue,
+     setInputValue,
++    { inputMode, setInputMode },
+   )
+ 
+   const {
+@@ -533,8 +544,31 @@ export const Chat = ({
+     clearQueue,
+     isQueuePausedRef,
+   } = useMessageQueue(
+-    (content: string) =>
+-      sendMessageRef.current?.({ content, agentMode }) ?? Promise.resolve(),
++    (content: string) => {
++      // Route queued messages through the router to handle bash commands, slash commands, etc.
++      return routeUserPrompt({
++        abortControllerRef,
++        agentMode,
++        inputRef,
++        inputValue: content,
++        isChainInProgressRef,
++        isStreaming,
++        logoutMutation,
++        streamMessageIdRef,
++        addToQueue,
++        clearMessages,
++        saveToHistory: () => {}, // Already saved when queued
++        scrollToLatest,
++        sendMessage,
++        setCanProcessQueue,
++        setInputFocused,
++        setInputValue: () => {}, // Input already cleared when queued
++        setIsAuthenticated,
++        setMessages,
++        setUser,
++        stopStreaming,
++      })
++    },
+     isChainInProgressRef,
+     activeAgentStreamsRef,
+   )
+@@ -570,6 +604,39 @@ export const Chat = ({
+   const isWaitingForResponse = streamStatus === 'waiting'
+   const isStreaming = streamStatus !== 'idle'
+ 
++  // When streaming completes, flush any pending bash commands into history
++  useEffect(() => {
++    if (
++      !isStreaming &&
++      !streamMessageIdRef.current &&
++      !isChainInProgressRef.current &&
++      pendingBashMessages.length > 0
++    ) {
++      // Flush only messages that have finished running
++      for (const msg of pendingBashMessages) {
++        if (!msg.isRunning) {
++          addBashMessageToHistory(
++            {
++              command: msg.command,
++              stdout: msg.stdout ?? msg.output,
++              stderr: msg.stderr ?? null,
++              exitCode: msg.exitCode,
++              cwd: msg.cwd || process.cwd(),
++              displayOutput: msg.output,
++              setMessages,
++            })
++          removePendingBashMessage(msg.id)
++        }
++      }
++    }
++  }, [
++    isStreaming,
++    pendingBashMessages,
++    setMessages,
++    removePendingBashMessage,
++    scrollToLatest,
++  ])
++
+   // Timer events are currently tracked but not used for UI updates
+   // Future: Could be used for analytics or debugging
+ 
+@@ -822,6 +889,7 @@ export const Chat = ({
+     nextCtrlCWillExit,
+     queuePaused,
+     queuedCount,
++
+   }), [
+     inputMode,
+     inputValue,
+@@ -842,6 +910,7 @@ export const Chat = ({
+     nextCtrlCWillExit,
+     queuePaused,
+     queuedCount,
++
+   ])
+ 
+   // Keyboard handlers
+@@ -940,6 +1009,10 @@ export const Chat = ({
+     onClearQueue: clearQueue,
+     onExitAppWarning: () => handleCtrlC(),
+     onExitApp: () => handleCtrlC(),
++    onBashHistoryUp: navigateUp,
++    onBashHistoryDown: navigateDown,
++    onDismissBashOverlay: () => {},
++    onCancelBashCommand: () => {},
+   }), [
+     setInputMode,
+     handleCloseFeedback,
+@@ -969,6 +1042,9 @@ export const Chat = ({
+     inputRef,
+     handleCtrlC,
+     clearQueue,
++    navigateUp,
++    navigateDown,
++
+   ])
+ 
+   // Use the chat keyboard hook
+@@ -1123,6 +1199,14 @@ export const Chat = ({
+             />
+           )
+         })}
++        {/* Pending bash messages as ghost messages */}
++        {pendingBashMessages.map((msg) => (
++          <PendingBashMessage
++            key={`pending-bash-${msg.id}`}
++            message={msg}
++            width={separatorWidth - 4}
++          />
++        ))}
+       </scrollbox>
+ 
+       <box
+diff --git a/cli/src/commands/router.ts b/cli/src/commands/router.ts
+index e212f3d26..f03463b40 100644
+--- a/cli/src/commands/router.ts
++++ b/cli/src/commands/router.ts
+@@ -16,8 +16,251 @@ import {
+ import { useChatStore } from '../state/chat-store'
+ import { getSystemMessage, getUserMessage } from '../utils/message-history'
+ 
++import type { ToolMessage } from '@codebuff/common/types/messages/codebuff-message'
++import type { ToolResultOutput } from '@codebuff/common/types/messages/content-part'
+ import type { ContentBlock } from '../types/chat'
+ 
++/**
++ * Execute a bash command and add it directly to chat history.
++ * Shows immediate placeholder while running, then updates with output.
++ */
++function executeBashCommand(
++  command: string,
++  setMessages: RouterParams['setMessages'],
++) {
++  const toolCallId = crypto.randomUUID()
++  const resultBlock: ContentBlock = {
++    type: 'tool',
++    toolName: 'run_terminal_command',
++    toolCallId,
++    input: { command },
++    output: '...',
++  }
++
++  const commandCwd = process.cwd()
++
++  // Add the command result to chat as a user message so the AI sees it as context
++  setMessages((prev) => [
++    ...prev,
++    {
++      ...getUserMessage([resultBlock]),
++      metadata: { bashCwd: commandCwd },
++    },
++  ])
++
++  // Execute the command and update the output when complete
++  runTerminalCommand({
++    command,
++    process_type: 'SYNC',
++    cwd: commandCwd,
++    timeout_seconds: -1,
++    env: process.env,
++  }).then(([{ value }]) => {
++    const stdout = 'stdout' in value ? (value.stdout || '') : ''
++    const stderr = 'stderr' in value ? (value.stderr || '') : ''
++    const exitCode = 'exitCode' in value ? value.exitCode : 0
++
++    // Create tool result output for display
++    const toolResultOutput = [{
++      type: 'json' as const,
++      value: {
++        command,
++        startingCwd: commandCwd,
++        stdout: stdout || null,
++        stderr: stderr || null,
++        exitCode: exitCode ?? 0,
++      }
++    }]
++
++    // Store output in JSON format for display
++    const outputJson = JSON.stringify(toolResultOutput)
++
++    setMessages((prev) => {
++      return prev.map((msg) => {
++        if (!msg.blocks) {
++          return msg
++        }
++        return {
++          ...msg,
++          blocks: msg.blocks.map((block) =>
++            'toolCallId' in block && block.toolCallId === toolCallId
++              ? {
++                  ...block,
++                  output: outputJson,
++                }
++              : block,
++          ),
++        }
++      })
++    })
++
++    // Add to pending tool results so AI can see this in the next run
++    const toolMessage: ToolMessage = {
++      role: 'tool',
++      toolCallId,
++      toolName: 'run_terminal_command',
++      content: toolResultOutput,
++    }
++    useChatStore.getState().addPendingToolResult(toolMessage)
++  }).catch((error) => {
++    const errorMessage = error instanceof Error ? error.message : String(error)
++    
++    // Create error tool result output
++    const errorToolResultOutput = [{
++      type: 'json' as const,
++      value: {
++        command,
++        startingCwd: commandCwd,
++        errorMessage,
++      }
++    }]
++
++    // Store error output in JSON format for display
++    const errorOutputJson = JSON.stringify(errorToolResultOutput)
++
++    setMessages((prev) => {
++      return prev.map((msg) => {
++        if (!msg.blocks) {
++          return msg
++        }
++        return {
++          ...msg,
++          blocks: msg.blocks.map((block) =>
++            'toolCallId' in block && block.toolCallId === toolCallId
++              ? {
++                  ...block,
++                  output: errorOutputJson,
++                }
++              : block,
++          ),
++        }
++      })
++    })
++
++    // Add error result to pending tool results so AI can see this in the next run
++    const errorToolMessage: ToolMessage = {
++      role: 'tool',
++      toolCallId,
++      toolName: 'run_terminal_command',
++      content: errorToolResultOutput,
++    }
++    useChatStore.getState().addPendingToolResult(errorToolMessage)
++  })
++}
++
++/**
++ * Add a bash command result to the chat message history.
++ * Also adds to pendingToolResults so the AI can see it in the next run.
++ */
++export function addBashMessageToHistory(params: {
++  command: string
++  stdout: string
++  stderr: string | null | undefined
++  exitCode: number
++  cwd: string
++  displayOutput?: string
++  setMessages: RouterParams['setMessages']
++}) {
++  const { command, stdout, stderr, exitCode, cwd, displayOutput, setMessages } =
++    params
++  const outputText =
++    displayOutput ?? (stdout || stderr ? `${stdout}${stderr ?? ''}` : '')
++  const toolCallId = crypto.randomUUID()
++  const resultBlock: ContentBlock = {
++    type: 'tool',
++    toolName: 'run_terminal_command',
++    toolCallId,
++    input: { command },
++    output: outputText || '(no output)',
++  }
++
++  // Add as a user message so the AI sees it as context
++  setMessages((prev) => [
++    ...prev,
++    {
++      ...getUserMessage([resultBlock]),
++      metadata: { bashCwd: cwd },
++    },
++  ])
++
++  // Also add to pending tool results so AI can see this in the next run
++  const toolResultOutput: ToolResultOutput[] = [{
++    type: 'json' as const,
++    value: {
++      command,
++      startingCwd: cwd,
++      stdout: stdout || null,
++      stderr: stderr ?? null,
++      exitCode: exitCode ?? 0,
++    }
++  }]
++  const toolMessage: ToolMessage = {
++    role: 'tool',
++    toolCallId,
++    toolName: 'run_terminal_command',
++    content: toolResultOutput,
++  }
++  useChatStore.getState().addPendingToolResult(toolMessage)
++}
++
++/**
++ * Execute a bash command as a ghost message in chat.
++ * Shows as a pending message while running, then commits to history when streaming ends.
++ */
++function executeBashCommandAsGhost(
++  command: string,
++  addPendingBashMessage: (message: import('../state/chat-store').PendingBashMessage) => void,
++  updatePendingBashMessage: (id: string, updates: Partial<import('../state/chat-store').PendingBashMessage>) => void,
++) {
++  const id = crypto.randomUUID()
++
++  // Add pending message immediately with placeholder
++  addPendingBashMessage({
++    id,
++    command,
++    output: '',
++    exitCode: -1, // Indicates running
++    isRunning: true,
++    startTime: Date.now(),
++    cwd: process.cwd(),
++  })
++
++  runTerminalCommand({
++    command,
++    process_type: 'SYNC',
++    cwd: process.cwd(),
++    timeout_seconds: -1,
++    env: process.env,
++  })
++    .then(([{ value }]) => {
++      const stdout = 'stdout' in value ? value.stdout || '' : ''
++      const stderr = 'stderr' in value ? value.stderr || '' : ''
++      const rawOutput = stdout + stderr
++      const output = rawOutput || '(no output)'
++      const exitCode = 'exitCode' in value ? value.exitCode ?? 0 : 0
++
++      updatePendingBashMessage(id, {
++        output,
++        exitCode,
++        stdout,
++        stderr,
++        isRunning: false,
++      })
++    })
++    .catch((error) => {
++      const errorMessage = error instanceof Error ? error.message : String(error)
++      const output = `Error: ${errorMessage}`
++
++      updatePendingBashMessage(id, {
++        output,
++        stdout: '',
++        stderr: errorMessage,
++        exitCode: 1,
++        isRunning: false,
++      })
++    })
++}
++
+ export async function routeUserPrompt(
+   params: RouterParams,
+ ): Promise<CommandResult> {
+@@ -41,58 +284,40 @@ export async function routeUserPrompt(
+   const setInputMode = useChatStore.getState().setInputMode
+ 
+   const trimmed = inputValue.trim()
++  const isBusy =
++    isStreaming ||
++    streamMessageIdRef.current ||
++    isChainInProgressRef.current
+   if (!trimmed) return
+ 
+   // Handle bash mode commands
+   if (inputMode === 'bash') {
+     const commandWithBang = '!' + trimmed
+-    const toolCallId = crypto.randomUUID()
+-    const resultBlock: ContentBlock = {
+-      type: 'tool',
+-      toolName: 'run_terminal_command',
+-      toolCallId,
+-      input: { command: trimmed },
+-      output: '',
+-    }
+-
+-    setMessages((prev) => [
+-      ...prev,
+-      getUserMessage(commandWithBang),
+-      getSystemMessage([resultBlock]),
+-    ])
+-
+-    runTerminalCommand({
+-      command: trimmed,
+-      process_type: 'SYNC',
+-      cwd: process.cwd(),
+-      timeout_seconds: -1,
+-      env: process.env,
+-    }).then(([{ value }]) => {
+-      setMessages((prev) => {
+-        const output = 'stdout' in value ? value.stdout : ''
+-        return prev.map((msg) => {
+-          if (!msg.blocks) {
+-            return msg
+-          }
+-          return {
+-            ...msg,
+-            blocks: msg.blocks.map((block) =>
+-              'toolCallId' in block && block.toolCallId === toolCallId
+-                ? {
+-                    ...block,
+-                    output,
+-                  }
+-                : block,
+-            ),
+-          }
+-        })
+-      })
+-    })
+-
+     saveToHistory(commandWithBang)
+     setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
+     setInputMode('default')
++    setInputFocused(true)
++    inputRef.current?.focus()
+ 
++    if (isBusy) {
++      const { addPendingBashMessage, updatePendingBashMessage } = useChatStore.getState()
++      executeBashCommandAsGhost(trimmed, addPendingBashMessage, updatePendingBashMessage)
++    } else {
++      executeBashCommand(trimmed, setMessages)
++    }
++    return
++  }
++
++  // Handle bash commands from queue (starts with '!')
++  if (trimmed.startsWith('!') && trimmed.length > 1) {
++    const command = trimmed.slice(1)
++
++    if (isBusy) {
++      const { addPendingBashMessage, updatePendingBashMessage } = useChatStore.getState()
++      executeBashCommandAsGhost(command, addPendingBashMessage, updatePendingBashMessage)
++    } else {
++      executeBashCommand(command, setMessages)
++    }
+     return
+   }
+ 
+diff --git a/cli/src/components/message-block.tsx b/cli/src/components/message-block.tsx
+index 714212a19..1037fd315 100644
+--- a/cli/src/components/message-block.tsx
++++ b/cli/src/components/message-block.tsx
+@@ -61,6 +61,7 @@ interface MessageBlockProps {
+     footerMessage?: string
+     errors?: Array<{ id: string; message: string }>
+   }) => void
++  metadata?: Record<string, any>
+ }
+ 
+ import { BORDER_CHARS } from '../utils/ui-constants'
+@@ -90,9 +91,22 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
+   onCloseFeedback,
+   validationErrors,
+   onOpenFeedback,
++  metadata,
+ }) => {
+   const [showValidationPopover, setShowValidationPopover] = useState(false)
+   
++  // Format cwd for display, replacing home directory with ~
++  const formatCwd = (cwd: string | undefined): string => {
++    if (!cwd) return ''
++    const homeDir = process.env.HOME || process.env.USERPROFILE || ''
++    if (homeDir && cwd.startsWith(homeDir)) {
++      return '~' + cwd.slice(homeDir.length)
++    }
++    return cwd
++  }
++  
++  const bashCwd = metadata?.bashCwd ? formatCwd(metadata.bashCwd) : undefined
++  
+   useWhyDidYouUpdateById(
+     'MessageBlock',
+     messageId,
+@@ -121,6 +135,7 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
+       onCloseFeedback,
+       validationErrors,
+       onOpenFeedback,
++      metadata,
+     },
+     {
+       logLevel: 'debug',
+@@ -138,8 +153,8 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
+         width: '100%',
+       }}
+     >
+-      {/* User message timestamp with error indicator button */}
+-      {isUser && (
++      {/* User message timestamp with error indicator button (non-bash commands) */}
++      {isUser && !bashCwd && (
+         <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
+           <text
+             attributes={TextAttributes.DIM}
+@@ -168,8 +183,41 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
+         </box>
+       )}
+       
++      {/* Bash command metadata header (timestamp + cwd) - now for user messages with bashCwd */}
++      {bashCwd && (
++        <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
++          <text
++            attributes={TextAttributes.DIM}
++            style={{
++              wrapMode: 'none',
++              fg: timestampColor,
++            }}
++          >
++            {`[${timestamp}]`}
++          </text>
++          <text
++            attributes={TextAttributes.DIM}
++            style={{
++              wrapMode: 'none',
++              fg: theme.muted,
++            }}
++          >
++            •
++          </text>
++          <text
++            attributes={TextAttributes.DIM}
++            style={{
++              wrapMode: 'word',
++              fg: theme.muted,
++            }}
++          >
++            {bashCwd}
++          </text>
++        </box>
++      )}
++      
+       {/* Show validation popover below timestamp when expanded */}
+-      {isUser && validationErrors && validationErrors.length > 0 && showValidationPopover && (
++      {isUser && !bashCwd && validationErrors && validationErrors.length > 0 && showValidationPopover && (
+         <box style={{ paddingTop: 1, paddingBottom: 1 }}>
+           <ValidationErrorPopover
+             errors={validationErrors}
+diff --git a/cli/src/components/message-with-agents.tsx b/cli/src/components/message-with-agents.tsx
+index b84ede137..5df6c93b6 100644
+--- a/cli/src/components/message-with-agents.tsx
++++ b/cli/src/components/message-with-agents.tsx
+@@ -147,6 +147,7 @@ export const MessageWithAgents = memo(
+ 
+     const agentChildren = messageTree.get(message.id) ?? []
+     const hasAgentChildren = agentChildren.length > 0
++    // Show vertical line for user messages (including bash commands which are now user messages)
+     const showVerticalLine = isUser
+ 
+     return (
+@@ -213,6 +214,7 @@ export const MessageWithAgents = memo(
+                       ? (options) => onFeedback(message.id, options)
+                       : undefined
+                   }
++                  metadata={message.metadata}
+                 />
+               </box>
+             </box>
+@@ -241,6 +243,7 @@ export const MessageWithAgents = memo(
+                 onBuildMax={onBuildMax}
+                 onFeedback={onFeedback}
+                 onCloseFeedback={onCloseFeedback}
++                metadata={message.metadata}
+               />
+             </box>
+           )}
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index 8112a568d..1f390462a 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -937,11 +937,18 @@ export const useSendMessage = ({
+ 
+         let runState: RunState
+         try {
++          // Get any pending tool results from user-executed bash commands
++          const pendingToolResults = useChatStore.getState().pendingToolResults
++          if (pendingToolResults.length > 0) {
++            useChatStore.getState().clearPendingToolResults()
++          }
++
+           runState = await client.run({
+             logger,
+             agent: selectedAgentDefinition ?? agentId ?? fallbackAgent,
+             prompt: content,
+             previousRun: previousRunStateRef.current ?? undefined,
++            extraToolResults: pendingToolResults.length > 0 ? (pendingToolResults as unknown as import('@codebuff/common/types/messages/codebuff-message').ToolMessage[]) : undefined,
+             abortController,
+             retry: {
+               maxRetries: MAX_RETRIES_PER_MESSAGE,
+diff --git a/cli/src/state/chat-store.ts b/cli/src/state/chat-store.ts
+index 11587a60a..92b2d359c 100644
+--- a/cli/src/state/chat-store.ts
++++ b/cli/src/state/chat-store.ts
+@@ -43,6 +43,27 @@ export type AskUserState = {
+   otherTexts: string[] // Custom text input for each question (empty string if not used)
+ } | null
+ 
++export type PendingBashMessage = {
++  id: string
++  command: string
++  output: string
++  exitCode: number
++  stdout?: string
++  stderr?: string | null
++  isRunning?: boolean
++  startTime?: number
++  cwd?: string
++}
++
++// Pending tool result stores tool results from user-executed commands to send to AI
++// Using a simplified type to avoid complex type instantiation issues
++export type PendingToolResult = {
++  role: 'tool'
++  toolCallId: string
++  toolName: string
++  content: Array<{ type: string; value?: unknown }>
++}
++
+ export type ChatStoreState = {
+   messages: ChatMessage[]
+   streamingAgents: Set<string>
+@@ -65,6 +86,8 @@ export type ChatStoreState = {
+   inputMode: InputMode
+   isRetrying: boolean
+   askUserState: AskUserState
++  pendingBashMessages: PendingBashMessage[]
++  pendingToolResults: PendingToolResult[]
+ }
+ 
+ type ChatStoreActions = {
+@@ -100,6 +123,12 @@ type ChatStoreActions = {
+   setAskUserState: (state: AskUserState) => void
+   updateAskUserAnswer: (questionIndex: number, optionIndex: number) => void
+   updateAskUserOtherText: (questionIndex: number, text: string) => void
++  addPendingBashMessage: (message: PendingBashMessage) => void
++  updatePendingBashMessage: (id: string, updates: Partial<PendingBashMessage>) => void
++  removePendingBashMessage: (id: string) => void
++  clearPendingBashMessages: () => void
++  addPendingToolResult: (result: PendingToolResult) => void
++  clearPendingToolResults: () => void
+   reset: () => void
+ }
+ 
+@@ -127,6 +156,8 @@ const initialState: ChatStoreState = {
+   inputMode: 'default' as InputMode,
+   isRetrying: false,
+   askUserState: null,
++  pendingBashMessages: [],
++  pendingToolResults: [],
+ }
+ 
+ export const useChatStore = create<ChatStore>()(
+@@ -298,6 +329,41 @@ export const useChatStore = create<ChatStore>()(
+         }
+       }),
+ 
++    addPendingBashMessage: (message) =>
++      set((state) => {
++        state.pendingBashMessages.push(message)
++      }),
++
++    updatePendingBashMessage: (id, updates) =>
++      set((state) => {
++        const msg = state.pendingBashMessages.find((m) => m.id === id)
++        if (msg) {
++          Object.assign(msg, updates)
++        }
++      }),
++
++    removePendingBashMessage: (id) =>
++      set((state) => {
++        state.pendingBashMessages = state.pendingBashMessages.filter(
++          (m) => m.id !== id,
++        )
++      }),
++
++    clearPendingBashMessages: () =>
++      set((state) => {
++        state.pendingBashMessages = []
++      }),
++
++    addPendingToolResult: (result) =>
++      set((state) => {
++        ;(state.pendingToolResults as PendingToolResult[]).push(result)
++      }),
++
++    clearPendingToolResults: () =>
++      set((state) => {
++        state.pendingToolResults = []
++      }),
++
+     reset: () =>
+       set((state) => {
+         state.messages = initialState.messages.slice()
+@@ -323,6 +389,8 @@ export const useChatStore = create<ChatStore>()(
+         state.inputMode = initialState.inputMode
+         state.isRetrying = initialState.isRetrying
+         state.askUserState = initialState.askUserState
++        state.pendingBashMessages = []
++        state.pendingToolResults = []
+       }),
+   })),
+ )
+diff --git a/packages/agent-runtime/src/main-prompt.ts b/packages/agent-runtime/src/main-prompt.ts
+index bbc2df56c..8488fc00d 100644
+--- a/packages/agent-runtime/src/main-prompt.ts
++++ b/packages/agent-runtime/src/main-prompt.ts
+@@ -200,6 +200,12 @@ export async function callMainPrompt(
+   action.sessionState.mainAgentState.creditsUsed = 0
+   action.sessionState.mainAgentState.directCreditsUsed = 0
+ 
++  // Add any extra tool results (e.g. from user-executed terminal commands) to message history
++  // This allows the AI to see context from commands run between prompts
++  if (action.toolResults && action.toolResults.length > 0) {
++    action.sessionState.mainAgentState.messageHistory.push(...action.toolResults)
++  }
++
+   // Assemble local agent templates from fileContext
+   const { agentTemplates: localAgentTemplates, validationErrors } =
+     assembleLocalAgentTemplates({ fileContext, logger })
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 19720c705..9ad9b8c95 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -632,7 +632,9 @@ export async function loopAgentSteps(
+         })) ?? ''
+ 
+   const hasUserMessage = Boolean(
+-    prompt || (spawnParams && Object.keys(spawnParams).length > 0),
++    prompt ||
++      (spawnParams && Object.keys(spawnParams).length > 0) ||
++      (content && content.length > 0),
+   )
+ 
+   const initialMessages = buildArray<Message>(
+diff --git a/packages/agent-runtime/src/util/messages.ts b/packages/agent-runtime/src/util/messages.ts
+index ecaeeaf6d..9b44eccc0 100644
+--- a/packages/agent-runtime/src/util/messages.ts
++++ b/packages/agent-runtime/src/util/messages.ts
+@@ -34,20 +34,26 @@ export function asUserMessage(str: string): string {
+ }
+ 
+ /**
+- * Combines prompt, params, and content into a unified message content structure
++ * Combines prompt, params, and content into a unified message content structure.
++ * For single text parts, wraps the text in <user_message> tags; multipart content
++ * is returned as-is (assumes caller already wrapped the appropriate part).
+  */
+ export function buildUserMessageContent(
+   prompt: string | undefined,
+   params: Record<string, any> | undefined,
+   content?: Array<TextPart | ImagePart>,
+ ): Array<TextPart | ImagePart> {
+-  // If we have content, return it as-is (client should have already combined prompt + content)
+   if (content && content.length > 0) {
+     if (content.length === 1 && content[0].type === 'text') {
++      const [textPart] = content
++      const alreadyWrapped = parseUserMessage(textPart.text) !== undefined
++      if (alreadyWrapped) {
++        return content
++      }
+       return [
+         {
+-          type: 'text',
+-          text: asUserMessage(content[0].text),
++          ...textPart,
++          text: asUserMessage(textPart.text),
+         },
+       ]
+     }
+diff --git a/sdk/src/index.ts b/sdk/src/index.ts
+index f83b1fd3d..ee1b54b71 100644
+--- a/sdk/src/index.ts
++++ b/sdk/src/index.ts
+@@ -2,8 +2,10 @@ export type * from '../../common/src/types/json'
+ export type * from '../../common/src/types/messages/codebuff-message'
+ export type * from '../../common/src/types/messages/data-content'
+ export type * from '../../common/src/types/print-mode'
++export type { TextPart, ImagePart } from '../../common/src/types/messages/content-part'
+ export { run, getRetryableErrorCode } from './run'
+ export type { RunOptions, RetryOptions } from './run'
++export { buildUserMessageContent } from '@codebuff/agent-runtime/util/messages'
+ // Agent type exports
+ export type { AgentDefinition } from '../../common/src/templates/initial-agents-dir/types/agent-definition'
+ export type { ToolName } from '../../common/src/tools/constants'
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 45d3daf8b..49211883b 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -1,7 +1,10 @@
+ import path from 'path'
+ 
+ import { callMainPrompt } from '@codebuff/agent-runtime/main-prompt'
+-import { getCancelledAdditionalMessages } from '@codebuff/agent-runtime/util/messages'
++import {
++  asUserMessage,
++  getCancelledAdditionalMessages,
++} from '@codebuff/agent-runtime/util/messages'
+ import { MAX_AGENT_STEPS_DEFAULT } from '@codebuff/common/constants/agents'
+ import { getMCPClient, listMCPTools } from '@codebuff/common/mcp/client'
+ import { toOptionalFile } from '@codebuff/common/old-constants'
+@@ -47,6 +50,8 @@ import type {
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
+ import type {
++  ImagePart,
++  TextPart,
+   ToolResultOutput,
+ } from '@codebuff/common/types/messages/content-part'
+ import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+@@ -55,6 +60,28 @@ import type { Source } from '@codebuff/common/types/source'
+ import type { CodebuffSpawn } from '@codebuff/common/types/spawn'
+ import { ToolMessage } from '@codebuff/common/types/messages/codebuff-message'
+ 
++const wrapContentForUserMessage = (
++  content?: (TextPart | ImagePart)[],
++): (TextPart | ImagePart)[] | undefined => {
++  if (!content || content.length === 0) {
++    return content
++  }
++  let hasWrappedText = false
++  return content.map((part) => {
++    if (part.type === 'text' && !hasWrappedText) {
++      hasWrappedText = true
++      const alreadyWrapped = part.text.includes('<user_message>')
++      return alreadyWrapped
++        ? part
++        : {
++            ...part,
++            text: asUserMessage(part.text),
++          }
++    }
++    return part
++  })
++}
++
+ export type CodebuffClientOptions = {
+   apiKey?: string
+ 
+@@ -145,6 +172,7 @@ export type RunOptions = {
+   agent: string | AgentDefinition
+   prompt: string
+   params?: Record<string, any>
++  content?: (TextPart | ImagePart)[]
+   previousRun?: RunState
+   extraToolResults?: ToolMessage[]
+   signal?: AbortSignal
+@@ -479,6 +507,7 @@ export async function runOnce({
+   agent,
+   prompt,
+   params,
++  content,
+   previousRun,
+   extraToolResults,
+   signal,
+@@ -487,6 +516,7 @@ export async function runOnce({
+   const spawn: CodebuffSpawn = (
+     spawnSource ? await spawnSource : require('child_process').spawn
+   ) as CodebuffSpawn
++  const preparedContent = wrapContentForUserMessage(content)
+ 
+   // Init session state
+   let agentId
+@@ -549,6 +579,7 @@ export async function runOnce({
+       ...getCancelledAdditionalMessages({
+         prompt,
+         params,
++        content: preparedContent,
+         pendingAgentResponse,
+         systemMessage: message,
+       }),
+@@ -787,6 +818,7 @@ export async function runOnce({
+       promptId,
+       prompt,
+       promptParams: params,
++      content: preparedContent,
+       fingerprintId: fingerprintId,
+       costMode: 'normal',
+       sessionState,

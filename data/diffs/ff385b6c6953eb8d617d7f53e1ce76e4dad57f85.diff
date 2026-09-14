@@ -1,0 +1,267 @@
+diff --git a/.gitignore b/.gitignore
+index 1e67aef11..139bdfc07 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -23,6 +23,7 @@ npm-app/src/__tests__/data/
+ **.log
+ 
+ debug/
++docs/bot-detection.md
+ 
+ # Nx cache directories
+ .nx/cache
+diff --git a/scripts/ban-freebuff-bots.ts b/scripts/ban-freebuff-bots.ts
+new file mode 100644
+index 000000000..28c088e71
+--- /dev/null
++++ b/scripts/ban-freebuff-bots.ts
+@@ -0,0 +1,103 @@
++import { readFileSync } from 'fs'
++
++import db from '@codebuff/internal/db'
++import * as schema from '@codebuff/internal/db/schema'
++import { eq, inArray, sql } from 'drizzle-orm'
++
++const args = process.argv.slice(2).filter((a) => !a.startsWith('--'))
++const BAN_FILE =
++  args[0] ?? '/Users/jahooma/codebuff/debug/freebuff-ban-candidates.txt'
++const DRY_RUN = !process.argv.includes('--commit')
++
++function parseEmails(path: string): string[] {
++  const emails: string[] = []
++  for (const raw of readFileSync(path, 'utf8').split('\n')) {
++    const line = raw.replace(/\r$/, '')
++    if (!line || line.startsWith('#')) continue
++    // Strip inline comments
++    const code = line.split('#')[0].trim()
++    if (!code) continue
++    // The whole non-comment chunk IS the email (possibly with trailing whitespace)
++    const email = code.trim()
++    if (email.includes('@')) emails.push(email.toLowerCase())
++  }
++  return [...new Set(emails)]
++}
++
++async function main() {
++  const emails = parseEmails(BAN_FILE)
++  console.log(`parsed ${emails.length} distinct emails from ${BAN_FILE}`)
++
++  // Look up users (case-insensitive match)
++  const users = await db
++    .select({
++      id: schema.user.id,
++      email: schema.user.email,
++      name: schema.user.name,
++      banned: schema.user.banned,
++      created_at: schema.user.created_at,
++    })
++    .from(schema.user)
++    .where(
++      sql`lower(${schema.user.email}) IN (${sql.join(
++        emails.map((e) => sql`${e}`),
++        sql`, `,
++      )})`,
++    )
++
++  const foundEmails = new Set(users.map((u) => u.email.toLowerCase()))
++  const missing = emails.filter((e) => !foundEmails.has(e))
++
++  console.log(`matched ${users.length} users in DB`)
++  if (missing.length) {
++    console.log(`\nNOT FOUND in user table (${missing.length}):`)
++    for (const e of missing) console.log(`  ${e}`)
++  }
++
++  const alreadyBanned = users.filter((u) => u.banned)
++  const toBan = users.filter((u) => !u.banned)
++  console.log(`\nalready banned: ${alreadyBanned.length}`)
++  console.log(`will ban:       ${toBan.length}`)
++  for (const u of toBan) {
++    console.log(
++      `  ${u.email.padEnd(40)} "${u.name ?? ''}" (created ${u.created_at.toISOString()})`,
++    )
++  }
++
++  if (DRY_RUN) {
++    console.log(
++      `\nDRY RUN — pass --commit to actually set banned=true and delete free_session rows.`,
++    )
++    return
++  }
++
++  if (toBan.length === 0) {
++    console.log('\nnothing to do.')
++    return
++  }
++
++  const ids = toBan.map((u) => u.id)
++
++  const updated = await db
++    .update(schema.user)
++    .set({ banned: true })
++    .where(inArray(schema.user.id, ids))
++    .returning({ id: schema.user.id, email: schema.user.email })
++
++  console.log(`\n✅ banned ${updated.length} users`)
++
++  // Also clear their free_session rows so admitted slots free up immediately
++  const deleted = await db
++    .delete(schema.freeSession)
++    .where(inArray(schema.freeSession.user_id, ids))
++    .returning({ user_id: schema.freeSession.user_id })
++
++  console.log(`✅ deleted ${deleted.length} free_session rows`)
++}
++
++main()
++  .then(() => process.exit(0))
++  .catch((err) => {
++    console.error(err)
++    process.exit(1)
++  })
+diff --git a/scripts/investigate-user.ts b/scripts/investigate-user.ts
+new file mode 100644
+index 000000000..ce6afec71
+--- /dev/null
++++ b/scripts/investigate-user.ts
+@@ -0,0 +1,113 @@
++import db from '@codebuff/internal/db'
++import * as schema from '@codebuff/internal/db/schema'
++import { sql, eq, desc } from 'drizzle-orm'
++
++async function main() {
++  const email = process.argv[2]
++  if (!email) {
++    console.error('usage: bun scripts/investigate-user.ts <email>')
++    process.exit(1)
++  }
++
++  const users = await db
++    .select()
++    .from(schema.user)
++    .where(sql`lower(${schema.user.email}) = ${email.toLowerCase()}`)
++
++  if (users.length === 0) {
++    console.log('user not found')
++    return
++  }
++  const u = users[0]
++  console.log('=== user ===')
++  console.log(JSON.stringify({
++    id: u.id,
++    email: u.email,
++    name: u.name,
++    handle: u.handle,
++    banned: u.banned,
++    created_at: u.created_at,
++    emailVerified: u.emailVerified,
++    image: u.image,
++  }, null, 2))
++
++  const accounts = await db
++    .select()
++    .from(schema.account)
++    .where(eq(schema.account.userId, u.id))
++  console.log('\n=== accounts ===')
++  for (const a of accounts) {
++    console.log(`  provider=${a.provider}  providerAccountId=${a.providerAccountId}  scope=${a.scope ?? ''}`)
++  }
++
++  const stats = await db
++    .select({
++      agent_id: schema.message.agent_id,
++      count: sql<number>`COUNT(*)`,
++      totalCost: sql<number>`SUM(${schema.message.cost})`,
++      first: sql<string>`MIN(${schema.message.finished_at})`,
++      last: sql<string>`MAX(${schema.message.finished_at})`,
++    })
++    .from(schema.message)
++    .where(eq(schema.message.user_id, u.id))
++    .groupBy(schema.message.agent_id)
++  console.log('\n=== messages by agent ===')
++  for (const s of stats) {
++    console.log(`  ${s.agent_id}: ${s.count} msgs, $${Number(s.totalCost).toFixed(2)}, ${s.first} → ${s.last}`)
++  }
++
++  const repos = await db
++    .select({
++      repo_url: schema.message.repo_url,
++      count: sql<number>`COUNT(*)`,
++    })
++    .from(schema.message)
++    .where(eq(schema.message.user_id, u.id))
++    .groupBy(schema.message.repo_url)
++    .orderBy(desc(sql`COUNT(*)`))
++    .limit(20)
++  console.log('\n=== repos touched ===')
++  for (const r of repos) {
++    console.log(`  ${r.count.toString().padStart(5)}  ${r.repo_url ?? '(null)'}`)
++  }
++
++  const sample = await db
++    .select({
++      finished_at: schema.message.finished_at,
++      agent_id: schema.message.agent_id,
++      repo_url: schema.message.repo_url,
++      input_tokens: schema.message.input_tokens,
++      output_tokens: schema.message.output_tokens,
++      cost: schema.message.cost,
++      lastMessage: schema.message.lastMessage,
++    })
++    .from(schema.message)
++    .where(eq(schema.message.user_id, u.id))
++    .orderBy(desc(schema.message.finished_at))
++    .limit(5)
++  console.log('\n=== 5 most recent messages (last user turn) ===')
++  for (const m of sample) {
++    console.log(`\n  ${m.finished_at.toISOString()}  agent=${m.agent_id}  repo=${m.repo_url ?? ''}  in=${m.input_tokens} out=${m.output_tokens} cost=$${Number(m.cost).toFixed(4)}`)
++    const msg = m.lastMessage as any
++    const content = typeof msg?.content === 'string' ? msg.content : JSON.stringify(msg?.content)?.slice(0, 500)
++    console.log(`    role=${msg?.role}  content=${(content ?? '').slice(0, 500)}`)
++  }
++
++  // Session/CLI usage
++  const sessions = await db
++    .select({
++      type: schema.session.type,
++      created_at: schema.session.created_at,
++      fingerprint_id: schema.session.fingerprint_id,
++    })
++    .from(schema.session)
++    .where(eq(schema.session.userId, u.id))
++    .orderBy(desc(schema.session.created_at))
++    .limit(10)
++  console.log('\n=== recent sessions ===')
++  for (const s of sessions) {
++    console.log(`  ${s.created_at.toISOString()}  type=${s.type}  fp=${s.fingerprint_id ?? ''}`)
++  }
++}
++
++main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1) })
+diff --git a/scripts/unban-user.ts b/scripts/unban-user.ts
+new file mode 100644
+index 000000000..420b25ae3
+--- /dev/null
++++ b/scripts/unban-user.ts
+@@ -0,0 +1,21 @@
++import db from '@codebuff/internal/db'
++import * as schema from '@codebuff/internal/db/schema'
++import { sql } from 'drizzle-orm'
++
++async function main() {
++  const emails = process.argv.slice(2).map((e) => e.toLowerCase())
++  if (!emails.length) { console.error('usage: bun scripts/unban-user.ts <email> [<email> ...]'); process.exit(1) }
++
++  const res = await db
++    .update(schema.user)
++    .set({ banned: false })
++    .where(sql`lower(${schema.user.email}) IN (${sql.join(emails.map((e) => sql`${e}`), sql`, `)})`)
++    .returning({ id: schema.user.id, email: schema.user.email, banned: schema.user.banned })
++
++  console.log(`unbanned ${res.length} users:`)
++  for (const r of res) console.log(`  ${r.email}`)
++  const missing = emails.filter((e) => !res.some((r) => r.email.toLowerCase() === e))
++  if (missing.length) { console.log(`\nno match for:`); for (const m of missing) console.log(`  ${m}`) }
++}
++
++main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1) })

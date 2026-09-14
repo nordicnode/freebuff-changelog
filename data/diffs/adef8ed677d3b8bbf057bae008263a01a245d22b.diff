@@ -1,0 +1,124 @@
+diff --git a/cli/src/pre-init/tree-sitter-wasm.ts b/cli/src/pre-init/tree-sitter-wasm.ts
+index 72fba276d..40110e141 100644
+--- a/cli/src/pre-init/tree-sitter-wasm.ts
++++ b/cli/src/pre-init/tree-sitter-wasm.ts
+@@ -1,11 +1,15 @@
+-// Embed tree-sitter.wasm into the bun-compile binary at a bunfs path the runtime
+-// can find. Must be the very first import in `index.tsx`: subsequent imports
+-// (the SDK / code-map) eagerly construct a tree-sitter parser singleton, and its
+-// `locateFile` callback reads `CODEBUFF_TREE_SITTER_WASM_PATH` from `process.env`.
++// Embed tree-sitter.wasm into the bun-compile binary so the SDK's tree-sitter
++// parser singleton can find it at runtime. Must be the very first import in
++// `index.tsx`: subsequent imports (the SDK / code-map) eagerly construct the
++// parser, and its init reads what we publish here on `globalThis` and `process.env`.
+ //
+-// Without this, web-tree-sitter@0.25.10 falls back to `require.resolve` which —
+-// per the package's split `import`/`require` exports map — returns the build-time
+-// absolute path of `tree-sitter.cjs` and fails on user machines.
++// Why not just `locateFile` + a path? On Windows, bun --compile reports the
++// embedded path as `B:\~BUN\root\...`, and `fs.existsSync` returns false for
++// that path inside the running binary even though `fs.readFileSync` works. So
++// we read the bytes once at startup and pass them straight to `Parser.init`
++// via `wasmBinary`, sidestepping filesystem resolution entirely.
++
++import * as fs from 'fs'
+ 
+ // @ts-expect-error - Bun's `with { type: 'file' }` returns a string path; TS resolves
+ // the .wasm file via web-tree-sitter's exports map and has no loader for it.
+@@ -14,5 +18,20 @@ import treeSitterWasmPath from 'web-tree-sitter/tree-sitter.wasm' with {
+ }
+ 
+ if (treeSitterWasmPath) {
++  // Path stays for any consumer (tests, dev runs) that still resolves via fs.
+   process.env.CODEBUFF_TREE_SITTER_WASM_PATH = treeSitterWasmPath
++
++  try {
++    const binary = fs.readFileSync(treeSitterWasmPath)
++    // globalThis is the only cross-bundle channel: the SDK pre-built bundle
++    // inlines its own copy of `init-node.ts`, so a module-level variable in
++    // the source package wouldn't be visible to the singleton initialized
++    // via the SDK.
++    ;(globalThis as { __CODEBUFF_TREE_SITTER_WASM_BINARY__?: Uint8Array }).__CODEBUFF_TREE_SITTER_WASM_BINARY__ =
++      new Uint8Array(binary.buffer, binary.byteOffset, binary.byteLength)
++  } catch {
++    // readFileSync failure is unexpected (the file is supposed to be embedded)
++    // but we let init-node.ts fall back to path-based resolution and surface
++    // a clearer error if that also fails.
++  }
+ }
+diff --git a/packages/code-map/src/init-node.ts b/packages/code-map/src/init-node.ts
+index 2c8666f7f..d46793f68 100644
+--- a/packages/code-map/src/init-node.ts
++++ b/packages/code-map/src/init-node.ts
+@@ -4,26 +4,32 @@ import * as path from 'path'
+ import { Parser } from 'web-tree-sitter'
+ 
+ const TREE_SITTER_WASM_ENV_VAR = 'CODEBUFF_TREE_SITTER_WASM_PATH'
++const WASM_BINARY_GLOBAL_KEY = '__CODEBUFF_TREE_SITTER_WASM_BINARY__'
+ 
+ /**
+  * Override the path to `tree-sitter.wasm` used during {@link initTreeSitterForNode}.
+  *
+- * Needed for `bun build --compile` binaries: the embedded `tree-sitter.js` reports a
+- * `scriptDir` like `/$bunfs/root/`, but the runtime wasm isn't auto-embedded next to
+- * it, and `require.resolve('web-tree-sitter')` resolves to the build-time absolute
+- * path of `tree-sitter.cjs` (per the package's `require` exports condition added in
+- * 0.25.10), which doesn't exist on the end user's machine. Callers building binaries
+- * should embed the wasm via Bun's `import ... with { type: 'file' }` and pass the
+- * resulting path here before any tree-sitter use.
++ * Path-based fallback for environments that can't pre-load the wasm bytes (e.g.
++ * external SDK consumers using a custom layout). The CLI binary instead pre-loads
++ * bytes onto `globalThis.__CODEBUFF_TREE_SITTER_WASM_BINARY__` because Windows
++ * bunfs paths (`B:\~BUN\root\...`) round-trip inconsistently through
++ * `fs.existsSync` even when `fs.readFileSync` succeeds.
+  *
+- * Stored on `process.env` so it reaches every copy of this module — the SDK
+- * pre-built bundle inlines its own copy of `init-node.ts`, so a module-level
+- * variable here wouldn't be visible to the singleton initialized via the SDK.
++ * Stored on `process.env` (not a module-level var) so the value reaches every
++ * copy of this module — the SDK pre-built bundle inlines its own copy of
++ * `init-node.ts`, so a local variable here wouldn't be visible to the singleton
++ * initialized via the SDK.
+  */
+ export function setTreeSitterWasmPath(wasmPath: string): void {
+   process.env[TREE_SITTER_WASM_ENV_VAR] = wasmPath
+ }
+ 
++function getEmbeddedWasmBinary(): Uint8Array | undefined {
++  return (
++    globalThis as { [WASM_BINARY_GLOBAL_KEY]?: Uint8Array }
++  )[WASM_BINARY_GLOBAL_KEY]
++}
++
+ function resolveTreeSitterWasm(scriptDir: string): string {
+   const override = process.env[TREE_SITTER_WASM_ENV_VAR]
+   if (override && fs.existsSync(override)) {
+@@ -45,8 +51,11 @@ function resolveTreeSitterWasm(scriptDir: string): string {
+     // Package not resolvable; fall through.
+   }
+ 
++  const overrideDiagnostic = override
++    ? ` (env ${TREE_SITTER_WASM_ENV_VAR}=${override} did not exist)`
++    : ''
+   throw new Error(
+-    `Internal error: tree-sitter.wasm not found (looked at scriptDir=${scriptDir} and via web-tree-sitter package). Set ${TREE_SITTER_WASM_ENV_VAR} or ensure the file is included in your deployment bundle.`,
++    `Internal error: tree-sitter.wasm not found (looked at scriptDir=${scriptDir} and via web-tree-sitter package${overrideDiagnostic}). Set ${TREE_SITTER_WASM_ENV_VAR} or ensure the file is included in your deployment bundle.`,
+   )
+ }
+ 
+@@ -54,6 +63,15 @@ function resolveTreeSitterWasm(scriptDir: string): string {
+  * Initialize web-tree-sitter for Node.js environments with proper WASM file location
+  */
+ export async function initTreeSitterForNode(): Promise<void> {
++  const embedded = getEmbeddedWasmBinary()
++  if (embedded) {
++    // Pass the bytes directly so emscripten's `getBinarySync` returns them
++    // without ever calling `locateFile`. This avoids the path-resolution
++    // failure mode entirely and is the path the CLI binary takes.
++    await Parser.init({ wasmBinary: embedded })
++    return
++  }
++
+   // Use locateFile to override where the runtime looks for tree-sitter.wasm
+   await Parser.init({
+     locateFile: (name: string, scriptDir: string) => {

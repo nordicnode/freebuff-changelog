@@ -1,0 +1,380 @@
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index 2473ce95d..d3d2a2f4d 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -602,7 +602,8 @@ export const Chat = ({
+   const isWaitingForResponse = streamStatus === 'waiting'
+   const isStreaming = streamStatus !== 'idle'
+ 
+-  // When streaming completes, flush any pending bash commands into history
++  // When streaming completes, flush any pending bash commands into history (ghost mode only)
++  // Non-ghost mode commands are already in history and will be cleared when user sends next message
+   useEffect(() => {
+     if (
+       !isStreaming &&
+@@ -610,14 +611,13 @@ export const Chat = ({
+       !isChainInProgressRef.current &&
+       pendingBashMessages.length > 0
+     ) {
+-      // Collect completed messages to flush
+-      const completedMessages = pendingBashMessages.filter(
+-        (msg) => !msg.isRunning,
++      // Only flush ghost mode commands (those not already added to history) to UI
++      const ghostModeMessages = pendingBashMessages.filter(
++        (msg) => !msg.isRunning && !msg.addedToHistory,
+       )
+-      if (completedMessages.length === 0) return
+-
+-      // Batch: add all to history, then clear all completed
+-      for (const msg of completedMessages) {
++      
++      // Add ghost mode messages to UI history
++      for (const msg of ghostModeMessages) {
+         addBashMessageToHistory({
+           command: msg.command,
+           stdout: msg.stdout,
+@@ -627,13 +627,17 @@ export const Chat = ({
+           setMessages,
+         })
+       }
+-      // Batch remove all completed messages at once
+-      const completedIds = new Set(completedMessages.map((m) => m.id))
+-      useChatStore.setState((state) => ({
+-        pendingBashMessages: state.pendingBashMessages.filter(
+-          (m) => !completedIds.has(m.id),
+-        ),
+-      }))
++      
++      // Mark ghost mode messages as added to history (so they don't show as ghost UI)
++      // but keep them in pendingBashMessages so they get sent to LLM with next user message
++      if (ghostModeMessages.length > 0) {
++        const ghostIds = new Set(ghostModeMessages.map((m) => m.id))
++        useChatStore.setState((state) => ({
++          pendingBashMessages: state.pendingBashMessages.map((m) =>
++            ghostIds.has(m.id) ? { ...m, addedToHistory: true } : m,
++          ),
++        }))
++      }
+     }
+   }, [isStreaming, pendingBashMessages, setMessages])
+ 
+@@ -1214,14 +1218,16 @@ export const Chat = ({
+             />
+           )
+         })}
+-        {/* Pending bash messages as ghost messages */}
+-        {pendingBashMessages.map((msg) => (
+-          <PendingBashMessage
+-            key={`pending-bash-${msg.id}`}
+-            message={msg}
+-            width={separatorWidth - 4}
+-          />
+-        ))}
++        {/* Pending bash messages as ghost messages (only show those not already in history) */}
++        {pendingBashMessages
++          .filter((msg) => !msg.addedToHistory)
++          .map((msg) => (
++            <PendingBashMessage
++              key={`pending-bash-${msg.id}`}
++              message={msg}
++              width={separatorWidth - 4}
++            />
++          ))}
+       </scrollbox>
+ 
+       <box
+diff --git a/cli/src/commands/router.ts b/cli/src/commands/router.ts
+index 0a16ff07d..adc8fd633 100644
+--- a/cli/src/commands/router.ts
++++ b/cli/src/commands/router.ts
+@@ -109,6 +109,19 @@ function executeBashCommand(
+             return didUpdate ? { ...msg, blocks, isComplete: true } : msg
+           }),
+         )
++
++        // Also add to pending bash messages so the next user message includes this context for the LLM
++        // Mark as already added to history to avoid duplicate UI entries
++        useChatStore.getState().addPendingBashMessage({
++          id,
++          command,
++          stdout,
++          stderr,
++          exitCode,
++          isRunning: false,
++          cwd: commandCwd,
++          addedToHistory: true,
++        })
+       }
+     })
+     .catch((error) => {
+@@ -148,6 +161,19 @@ function executeBashCommand(
+             return didUpdate ? { ...msg, blocks, isComplete: true } : msg
+           }),
+         )
++
++        // Also add to pending bash messages so the next user message includes this context for the LLM
++        // Mark as already added to history to avoid duplicate UI entries
++        useChatStore.getState().addPendingBashMessage({
++          id,
++          command,
++          stdout: '',
++          stderr: errorMessage,
++          exitCode: 1,
++          isRunning: false,
++          cwd: commandCwd,
++          addedToHistory: true,
++        })
+       }
+     })
+ }
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index df8cfa132..bceb0ce4d 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -24,6 +24,7 @@ import { logger } from '../utils/logger'
+ import {
+   buildBashHistoryMessages,
+   createRunTerminalToolResult,
++  formatBashContextForPrompt,
+ } from '../utils/bash-messages'
+ import { getUserMessage } from '../utils/message-history'
+ import { NETWORK_ERROR_ID } from '../utils/validation-error-helpers'
+@@ -45,7 +46,6 @@ import type { ParamsOf } from '../types/function-params'
+ import type { SetElement } from '../types/utils'
+ import type { AgentMode } from '../utils/constants'
+ import type { AgentDefinition, RunState, ToolName } from '@codebuff/sdk'
+-import type { ToolMessage } from '@codebuff/common/types/messages/codebuff-message'
+ import type { SetStateAction } from 'react'
+ const hiddenToolNames = new Set<ToolName | 'spawn_agent_inline'>([
+   'spawn_agent_inline',
+@@ -452,37 +452,47 @@ export const useSendMessage = ({
+       }
+ 
+       // Include any pending bash messages in the UI before sending
+-      // (we no longer send these commands to the LLM context)
++      // and prepare context for the LLM
+       const { pendingBashMessages, clearPendingBashMessages } =
+         useChatStore.getState()
++      
++      // Format bash context to add to message history for the LLM
++      const bashContext = formatBashContextForPrompt(pendingBashMessages)
++      
+       if (pendingBashMessages.length > 0) {
+-        // Convert pending bash messages to chat messages and add to history
+-        applyMessageUpdate((prev) => {
+-          const bashMessages: ChatMessage[] = []
+-
+-          for (const bash of pendingBashMessages) {
+-            const toolCallId = crypto.randomUUID()
+-            const cwd = bash.cwd || process.cwd()
+-            const toolResultOutput = createRunTerminalToolResult({
+-              command: bash.command,
+-              cwd,
+-              stdout: bash.stdout || null,
+-              stderr: bash.stderr || null,
+-              exitCode: bash.exitCode,
+-            })
+-            const outputJson = JSON.stringify(toolResultOutput)
+-            const { assistantMessage } = buildBashHistoryMessages({
+-              command: bash.command,
+-              cwd,
+-              toolCallId,
+-              output: outputJson,
+-              isComplete: true,
+-            })
++        // Convert pending bash messages to chat messages and add to history (UI only)
++        // Skip messages that were already added to history (non-ghost mode)
++        const bashMessagesToAdd = pendingBashMessages.filter(
++          (bash) => !bash.addedToHistory,
++        )
++        if (bashMessagesToAdd.length > 0) {
++          applyMessageUpdate((prev) => {
++            const bashMessages: ChatMessage[] = []
++
++            for (const bash of bashMessagesToAdd) {
++              const toolCallId = crypto.randomUUID()
++              const cwd = bash.cwd || process.cwd()
++              const toolResultOutput = createRunTerminalToolResult({
++                command: bash.command,
++                cwd,
++                stdout: bash.stdout || null,
++                stderr: bash.stderr || null,
++                exitCode: bash.exitCode,
++              })
++              const outputJson = JSON.stringify(toolResultOutput)
++              const { assistantMessage } = buildBashHistoryMessages({
++                command: bash.command,
++                cwd,
++                toolCallId,
++                output: outputJson,
++                isComplete: true,
++              })
+ 
+-            bashMessages.push(assistantMessage)
+-          }
+-          return [...prev, ...bashMessages]
+-        })
++              bashMessages.push(assistantMessage)
++            }
++            return [...prev, ...bashMessages]
++          })
++        }
+         clearPendingBashMessages()
+       }
+ 
+@@ -982,21 +992,15 @@ export const useSendMessage = ({
+ 
+         let runState: RunState
+         try {
+-          // Get any pending tool results from user-executed bash commands
+-          const pendingToolResults = useChatStore.getState().pendingToolResults
+-          if (pendingToolResults.length > 0) {
+-            useChatStore.getState().clearPendingToolResults()
+-          }
++          // If there's bash context, always prepend it to the user's prompt
++          // This ensures consistent behavior whether or not there's a previous run
++          const promptToSend = bashContext ? bashContext + content : content
+ 
+           runState = await client.run({
+             logger,
+             agent: selectedAgentDefinition ?? agentId ?? fallbackAgent,
+-            prompt: content,
++            prompt: promptToSend,
+             previousRun: previousRunStateRef.current ?? undefined,
+-            extraToolResults:
+-              pendingToolResults.length > 0
+-                ? (pendingToolResults as unknown as ToolMessage[])
+-                : undefined,
+             abortController,
+             retry: {
+               maxRetries: MAX_RETRIES_PER_MESSAGE,
+diff --git a/cli/src/state/chat-store.ts b/cli/src/state/chat-store.ts
+index 91ea68b9a..7a9ba93df 100644
+--- a/cli/src/state/chat-store.ts
++++ b/cli/src/state/chat-store.ts
+@@ -53,19 +53,8 @@ export type PendingBashMessage = {
+   isRunning: boolean
+   startTime?: number
+   cwd?: string
+-}
+-
+-// Pending tool result stores tool results from user-executed commands to send to AI
+-// Note: Using inline type instead of importing ToolMessage to avoid deep type instantiation errors
+-export type PendingToolResult = {
+-  role: 'tool'
+-  toolCallId: string
+-  toolName: string
+-  content: Array<
+-    | { type: 'text'; text: string }
+-    | { type: 'json'; value: unknown }
+-    | { type: 'media'; data: string; mediaType: string }
+-  >
++  /** Whether the message was already added to UI chat history (non-ghost mode) */
++  addedToHistory?: boolean
+ }
+ 
+ export type ChatStoreState = {
+@@ -91,7 +80,6 @@ export type ChatStoreState = {
+   isRetrying: boolean
+   askUserState: AskUserState
+   pendingBashMessages: PendingBashMessage[]
+-  pendingToolResults: PendingToolResult[]
+ }
+ 
+ type ChatStoreActions = {
+@@ -134,8 +122,6 @@ type ChatStoreActions = {
+   ) => void
+   removePendingBashMessage: (id: string) => void
+   clearPendingBashMessages: () => void
+-  addPendingToolResult: (result: PendingToolResult) => void
+-  clearPendingToolResults: () => void
+   reset: () => void
+ }
+ 
+@@ -164,7 +150,6 @@ const initialState: ChatStoreState = {
+   isRetrying: false,
+   askUserState: null,
+   pendingBashMessages: [],
+-  pendingToolResults: [],
+ }
+ 
+ export const useChatStore = create<ChatStore>()(
+@@ -361,16 +346,6 @@ export const useChatStore = create<ChatStore>()(
+         state.pendingBashMessages = []
+       }),
+ 
+-    addPendingToolResult: (result) =>
+-      set((state) => {
+-        ;(state.pendingToolResults as PendingToolResult[]).push(result)
+-      }),
+-
+-    clearPendingToolResults: () =>
+-      set((state) => {
+-        state.pendingToolResults = []
+-      }),
+-
+     reset: () =>
+       set((state) => {
+         state.messages = initialState.messages.slice()
+@@ -397,7 +372,6 @@ export const useChatStore = create<ChatStore>()(
+         state.isRetrying = initialState.isRetrying
+         state.askUserState = initialState.askUserState
+         state.pendingBashMessages = []
+-        state.pendingToolResults = []
+       }),
+   })),
+ )
+diff --git a/cli/src/utils/bash-messages.ts b/cli/src/utils/bash-messages.ts
+index d95727db2..c198a78a5 100644
+--- a/cli/src/utils/bash-messages.ts
++++ b/cli/src/utils/bash-messages.ts
+@@ -2,6 +2,7 @@ import { formatTimestamp } from './helpers'
+ 
+ import type { ToolResultOutput } from '@codebuff/common/types/messages/content-part'
+ import type { ChatMessage, ContentBlock } from '../types/chat'
++import type { PendingBashMessage } from '../state/chat-store'
+ 
+ export function createRunTerminalToolResult(params: {
+   command: string
+@@ -67,3 +68,41 @@ export function buildBashHistoryMessages(params: {
+ 
+   return { assistantMessage, toolCallId }
+ }
++
++/**
++ * Format pending bash messages as context to prepend to the user's prompt.
++ * This provides the LLM with information about commands the user ran manually.
++ * Only includes completed (non-running) commands.
++ */
++export function formatBashContextForPrompt(
++  pendingBashMessages: PendingBashMessage[],
++): string {
++  // Only include completed commands
++  const completedCommands = pendingBashMessages.filter((msg) => !msg.isRunning)
++  
++  if (completedCommands.length === 0) {
++    return ''
++  }
++
++  const commandsContext = completedCommands
++    .map((bash) => {
++      const cwd = bash.cwd || process.cwd()
++      let result = `Command: ${bash.command}\nDirectory: ${cwd}\nExit code: ${bash.exitCode}`
++      if (bash.stdout) {
++        result += `\nStdout:\n${bash.stdout}`
++      }
++      if (bash.stderr) {
++        result += `\nStderr:\n${bash.stderr}`
++      }
++      return result
++    })
++    .join('\n\n---\n\n')
++
++  return `<user_terminal_commands>
++The user ran the following terminal command(s) before this message:
++
++${commandsContext}
++</user_terminal_commands>
++
++`
++}

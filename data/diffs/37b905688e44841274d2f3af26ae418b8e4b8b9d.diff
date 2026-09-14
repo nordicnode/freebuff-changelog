@@ -1,0 +1,206 @@
+diff --git a/common/src/constants/model-config.ts b/common/src/constants/model-config.ts
+index 494118b80..e86e2adfe 100644
+--- a/common/src/constants/model-config.ts
++++ b/common/src/constants/model-config.ts
+@@ -55,6 +55,7 @@ export type openrouterModel =
+ 
+ export const openCodeZenModels = {
+   opencode_kimi_k2_6: 'opencode/kimi-k2.6',
++  opencode_minimax_m2_7: 'opencode/minimax-m2.7',
+ } as const
+ export type OpenCodeZenModel =
+   (typeof openCodeZenModels)[keyof typeof openCodeZenModels]
+diff --git a/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts b/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts
+index c1dd1e99f..ba2f67507 100644
+--- a/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts
++++ b/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts
+@@ -869,13 +869,24 @@ describe('/api/v1/chat/completions POST endpoint', () => {
+     )
+ 
+     it(
+-      'routes OpenCode Zen models to the direct OpenCode Zen provider',
++      'routes OpenCode Zen-prefixed and Kimi models to the direct OpenCode Zen provider',
+       async () => {
+-        const expectedUpstreamModel: Record<string, string> = {
+-          'opencode/kimi-k2.6': 'kimi-k2.6',
+-        }
++        const testCases = [
++          {
++            codebuffModel: openCodeZenModels.opencode_kimi_k2_6,
++            upstreamModel: 'kimi-k2.6',
++          },
++          {
++            codebuffModel: openCodeZenModels.opencode_minimax_m2_7,
++            upstreamModel: 'minimax-m2.7',
++          },
++          {
++            codebuffModel: 'moonshotai/kimi-k2.6',
++            upstreamModel: 'kimi-k2.6',
++          },
++        ]
+ 
+-        for (const codebuffModel of Object.values(openCodeZenModels)) {
++        for (const { codebuffModel, upstreamModel } of testCases) {
+           const fetchedBodies: Record<string, unknown>[] = []
+           const fetchedUrls: string[] = []
+           const fetchViaOpenCodeZen = mock(
+@@ -889,7 +900,7 @@ describe('/api/v1/chat/completions POST endpoint', () => {
+               return new Response(
+                 JSON.stringify({
+                   id: 'test-id',
+-                  model: expectedUpstreamModel[codebuffModel],
++                  model: upstreamModel,
+                   choices: [{ message: { content: 'test response' } }],
+                   usage: {
+                     prompt_tokens: 10,
+@@ -968,9 +979,7 @@ describe('/api/v1/chat/completions POST endpoint', () => {
+           expect(fetchedUrls[0]).toBe(
+             'https://opencode.ai/zen/v1/chat/completions',
+           )
+-          expect(fetchedBodies[0].model).toBe(
+-            expectedUpstreamModel[codebuffModel],
+-          )
++          expect(fetchedBodies[0].model).toBe(upstreamModel)
+           expect(body.model).toBe(codebuffModel)
+           expect(body.provider).toBe('OpenCode Zen')
+         }
+@@ -978,6 +987,59 @@ describe('/api/v1/chat/completions POST endpoint', () => {
+       FETCH_PATH_TEST_TIMEOUT_MS,
+     )
+ 
++    it(
++      'rejects unsupported OpenCode Zen-prefixed models without calling the provider',
++      async () => {
++        const fetchViaOpenCodeZen = mock(
++          async (url: string | URL | Request) => {
++            if (String(url).startsWith('https://api.ipinfo.io/lookup/')) {
++              return Response.json({})
++            }
++
++            throw new Error('OpenCode Zen provider should not be called')
++          },
++        ) as unknown as typeof globalThis.fetch
++
++        const req = new NextRequest(
++          'http://localhost:3000/api/v1/chat/completions',
++          {
++            method: 'POST',
++            headers: {
++              Authorization: 'Bearer test-api-key-123',
++            },
++            body: JSON.stringify({
++              model: 'opencode/qwen3-coder',
++              messages: [{ role: 'user', content: 'hello' }],
++              stream: false,
++              codebuff_metadata: {
++                run_id: 'run-123',
++                client_id: 'test-client-id-123',
++              },
++            }),
++          },
++        )
++
++        const response = await postChatCompletions({
++          req,
++          getUserInfoFromApiKey: mockGetUserInfoFromApiKey,
++          logger: mockLogger,
++          trackEvent: mockTrackEvent,
++          getUserUsageData: mockGetUserUsageData,
++          getAgentRunFromId: mockGetAgentRunFromId,
++          fetch: fetchViaOpenCodeZen,
++          insertMessageBigquery: mockInsertMessageBigquery,
++          loggerWithContext: mockLoggerWithContext,
++        })
++
++        const body = await response.json()
++        expect(response.status).toBe(400)
++        expect(body.error.code).toBe('unsupported_model')
++        expect(body.error.message).toContain('opencode/qwen3-coder')
++        expect(fetchViaOpenCodeZen).toHaveBeenCalledTimes(0)
++      },
++      FETCH_PATH_TEST_TIMEOUT_MS,
++    )
++
+     it('rejects the DeepSeek V4 free agent when it requests another free model', async () => {
+       const req = new NextRequest(
+         'http://localhost:3000/api/v1/chat/completions',
+diff --git a/web/src/llm-api/opencode-zen.ts b/web/src/llm-api/opencode-zen.ts
+index 699f5e5f5..4a6397061 100644
+--- a/web/src/llm-api/opencode-zen.ts
++++ b/web/src/llm-api/opencode-zen.ts
+@@ -34,34 +34,56 @@ interface OpenCodeZenPricing {
+   outputCostPerToken: number
+ }
+ 
+-const OPENCODE_ZEN_MODELS: Record<
+-  string,
+-  { opencodeId: string; pricing: OpenCodeZenPricing }
+-> = {
+-  [openCodeZenModels.opencode_kimi_k2_6]: {
+-    opencodeId: 'kimi-k2.6',
+-    pricing: {
+-      inputCostPerToken: 0.95 / 1_000_000,
+-      cachedInputCostPerToken: 0.16 / 1_000_000,
+-      outputCostPerToken: 4.0 / 1_000_000,
+-    },
++const OPENCODE_MODEL_PREFIX = 'opencode/'
++const MOONSHOT_KIMI_MODEL = 'moonshotai/kimi-k2.6'
++const KIMI_ZEN_MODEL = 'kimi-k2.6'
++const MINIMAX_M2_7_ZEN_MODEL = 'minimax-m2.7'
++
++const OPENCODE_ZEN_MODEL_ALIASES: Record<string, string> = {
++  [openCodeZenModels.opencode_kimi_k2_6]: KIMI_ZEN_MODEL,
++  [openCodeZenModels.opencode_minimax_m2_7]: MINIMAX_M2_7_ZEN_MODEL,
++  [MOONSHOT_KIMI_MODEL]: KIMI_ZEN_MODEL,
++}
++const SUPPORTED_OPENCODE_ZEN_MODELS = Object.keys(OPENCODE_ZEN_MODEL_ALIASES)
++
++const KIMI_ZEN_PRICING: OpenCodeZenPricing = {
++  inputCostPerToken: 0.95 / 1_000_000,
++  cachedInputCostPerToken: 0.16 / 1_000_000,
++  outputCostPerToken: 4.0 / 1_000_000,
++}
++
++const OPENCODE_ZEN_PRICING: Record<string, OpenCodeZenPricing> = {
++  [KIMI_ZEN_MODEL]: KIMI_ZEN_PRICING,
++  [MINIMAX_M2_7_ZEN_MODEL]: {
++    inputCostPerToken: 0.3 / 1_000_000,
++    cachedInputCostPerToken: 0.06 / 1_000_000,
++    outputCostPerToken: 1.2 / 1_000_000,
+   },
+ }
+ 
+-export function isOpenCodeZenModel(model: string): boolean {
+-  return model in OPENCODE_ZEN_MODELS
++export function isOpenCodeZenModel(model: unknown): model is string {
++  if (typeof model !== 'string') return false
++  return (
++    model.startsWith(OPENCODE_MODEL_PREFIX) ||
++    model in OPENCODE_ZEN_MODEL_ALIASES
++  )
+ }
+ 
+ function getOpenCodeZenModelId(model: string): string {
+-  return OPENCODE_ZEN_MODELS[model]?.opencodeId ?? model
++  const opencodeId = OPENCODE_ZEN_MODEL_ALIASES[model]
++  if (opencodeId) return opencodeId
++
++  throw new OpenCodeZenError(400, 'Bad Request', {
++    error: {
++      message: `Unsupported OpenCode Zen model: ${model}. Supported models: ${SUPPORTED_OPENCODE_ZEN_MODELS.join(', ')}`,
++      code: 'unsupported_model',
++      type: 'invalid_request_error',
++    },
++  })
+ }
+ 
+ function getOpenCodeZenPricing(model: string): OpenCodeZenPricing {
+-  const entry = OPENCODE_ZEN_MODELS[model]
+-  if (!entry) {
+-    throw new Error(`No OpenCode Zen pricing found for model: ${model}`)
+-  }
+-  return entry.pricing
++  return OPENCODE_ZEN_PRICING[getOpenCodeZenModelId(model)] ?? KIMI_ZEN_PRICING
+ }
+ 
+ type StreamState = {

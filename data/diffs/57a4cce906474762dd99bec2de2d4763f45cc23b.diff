@@ -1,0 +1,1453 @@
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index 194d2a90b..3641515ab 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -15,6 +15,7 @@ import { getAdsEnabled } from './commands/ads'
+ import { routeUserPrompt, addBashMessageToHistory } from './commands/router'
+ import { AdBanner } from './components/ad-banner'
+ import { ChatInputBar } from './components/chat-input-bar'
++import { BottomStatusLine } from './components/bottom-status-line'
+ import { areCreditsRestored } from './components/out-of-credits-banner'
+ import { LoadPreviousButton } from './components/load-previous-button'
+ import { MessageWithAgents } from './components/message-with-agents'
+@@ -26,6 +27,7 @@ import { useAgentValidation } from './hooks/use-agent-validation'
+ import { useAskUserBridge } from './hooks/use-ask-user-bridge'
+ import { authQueryKeys } from './hooks/use-auth-query'
+ import { useChatInput } from './hooks/use-chat-input'
++import { useClaudeQuotaQuery } from './hooks/use-claude-quota-query'
+ import {
+   useChatKeyboard,
+   type ChatKeyboardHandlers,
+@@ -73,6 +75,7 @@ import {
+   getStatusIndicatorState,
+   type AuthStatus,
+ } from './utils/status-indicator-state'
++import { getClaudeOAuthStatus } from './utils/claude-oauth'
+ import { createPasteHandler } from './utils/strings'
+ import { computeInputLayoutMetrics } from './utils/text-layout'
+ import { createMarkdownPalette } from './utils/theme-system'
+@@ -1360,6 +1363,15 @@ export const Chat = ({
+     isAskUserActive: askUserState !== null,
+   })
+   const hasStatusIndicatorContent = statusIndicatorState.kind !== 'idle'
++
++  const isClaudeOAuthActive = getClaudeOAuthStatus().connected
++
++  // Fetch Claude quota when OAuth is active
++  const { data: claudeQuota } = useClaudeQuotaQuery({
++    enabled: isClaudeOAuthActive,
++    refetchInterval: 60 * 1000, // Refetch every 60 seconds
++  })
++
+   const inputBoxTitle = useMemo(() => {
+     const segments: string[] = []
+ 
+@@ -1380,6 +1392,9 @@ export const Chat = ({
+     !feedbackMode &&
+     (hasStatusIndicatorContent || shouldShowQueuePreview || !isAtBottom)
+ 
++  // Determine if Claude is actively streaming/waiting
++  const isClaudeActive = isStreaming || isWaitingForResponse
++
+   // Track mouse movement for ad activity (throttled)
+   const lastMouseActivityRef = useRef<number>(0)
+   const handleMouseActivity = useCallback(() => {
+@@ -1541,6 +1556,12 @@ export const Chat = ({
+             cwd: getProjectRoot() ?? process.cwd(),
+           })}
+         />
++
++        <BottomStatusLine
++          isClaudeConnected={isClaudeOAuthActive}
++          isClaudeActive={isClaudeActive}
++          claudeQuota={claudeQuota}
++        />
+       </box>
+     </box>
+   )
+diff --git a/cli/src/commands/command-registry.ts b/cli/src/commands/command-registry.ts
+index 03401fa04..b06242eb7 100644
+--- a/cli/src/commands/command-registry.ts
++++ b/cli/src/commands/command-registry.ts
+@@ -442,6 +442,16 @@ export const COMMAND_REGISTRY: CommandDefinition[] = [
+       return { openPublishMode: true }
+     },
+   }),
++  defineCommand({
++    name: 'connect:claude',
++    aliases: ['claude'],
++    handler: (params) => {
++      // Enter connect:claude mode to show the OAuth banner
++      useChatStore.getState().setInputMode('connect:claude')
++      params.saveToHistory(params.inputValue.trim())
++      clearInput(params)
++    },
++  }),
+ ]
+ 
+ export function findCommand(cmd: string): CommandDefinition | undefined {
+diff --git a/cli/src/commands/router.ts b/cli/src/commands/router.ts
+index 5f3faa251..75d3ddc2c 100644
+--- a/cli/src/commands/router.ts
++++ b/cli/src/commands/router.ts
+@@ -14,6 +14,7 @@ import {
+   extractReferralCode,
+   normalizeReferralCode,
+ } from './router-utils'
++import { handleClaudeAuthCode } from '../components/claude-connect-banner'
+ import { getProjectRoot } from '../project-files'
+ import { useChatStore } from '../state/chat-store'
+ import {
+@@ -284,6 +285,23 @@ export async function routeUserPrompt(
+     return
+   }
+ 
++  // Handle connect:claude mode input (authorization code)
++  if (inputMode === 'connect:claude') {
++    const code = trimmed
++    if (code) {
++      const result = await handleClaudeAuthCode(code)
++      setMessages((prev) => [
++        ...prev,
++        getUserMessage(trimmed),
++        getSystemMessage(result.message),
++      ])
++    }
++    saveToHistory(trimmed)
++    setInputValue({ text: '', cursorPosition: 0, lastEditDueToNav: false })
++    setInputMode('default')
++    return
++  }
++
+   // Handle referral mode input
+   if (inputMode === 'referral') {
+     // Validate the referral code (3-50 alphanumeric chars with optional dashes)
+diff --git a/cli/src/components/bottom-status-line.tsx b/cli/src/components/bottom-status-line.tsx
+new file mode 100644
+index 000000000..9d29ad27f
+--- /dev/null
++++ b/cli/src/components/bottom-status-line.tsx
+@@ -0,0 +1,82 @@
++import React from 'react'
++
++import { useTheme } from '../hooks/use-theme'
++
++import { formatResetTime } from '../utils/time-format'
++
++import type { ClaudeQuotaData } from '../hooks/use-claude-quota-query'
++
++interface BottomStatusLineProps {
++  /** Whether Claude OAuth is connected */
++  isClaudeConnected: boolean
++  /** Whether Claude is actively being used (streaming/waiting) */
++  isClaudeActive: boolean
++  /** Quota data from Anthropic API */
++  claudeQuota?: ClaudeQuotaData | null
++}
++
++/**
++ * Bottom status line component - shows below the input box
++ * Currently displays Claude subscription status when connected
++ */
++export const BottomStatusLine: React.FC<BottomStatusLineProps> = ({
++  isClaudeConnected,
++  isClaudeActive,
++  claudeQuota,
++}) => {
++  const theme = useTheme()
++
++  // Don't render if there's nothing to show
++  if (!isClaudeConnected) {
++    return null
++  }
++
++  // Use the more restrictive of the two quotas (5-hour window is usually the limiting factor)
++  const displayRemaining = claudeQuota
++    ? Math.min(claudeQuota.fiveHourRemaining, claudeQuota.sevenDayRemaining)
++    : null
++
++  // Check if quota is exhausted (0%)
++  const isExhausted = displayRemaining !== null && displayRemaining <= 0
++
++  // Get the reset time for the limiting quota window
++  const resetTime = claudeQuota
++    ? claudeQuota.fiveHourRemaining <= claudeQuota.sevenDayRemaining
++      ? claudeQuota.fiveHourResetsAt
++      : claudeQuota.sevenDayResetsAt
++    : null
++
++  // Determine dot color: red if exhausted, green if active, muted otherwise
++  const dotColor = isExhausted
++    ? theme.error
++    : isClaudeActive
++      ? theme.success
++      : theme.muted
++
++  return (
++    <box
++      style={{
++        width: '100%',
++        flexDirection: 'row',
++        justifyContent: 'flex-end',
++        paddingRight: 1,
++      }}
++    >
++      <box
++        style={{
++          flexDirection: 'row',
++          alignItems: 'center',
++          gap: 0,
++        }}
++      >
++        <text style={{ fg: dotColor }}>●</text>
++        <text style={{ fg: theme.muted }}> Claude subscription</text>
++        {isExhausted && resetTime ? (
++          <text style={{ fg: theme.muted }}>{` · resets in ${formatResetTime(resetTime)}`}</text>
++        ) : displayRemaining !== null ? (
++          <text style={{ fg: theme.foreground }}>{` ${Math.round(displayRemaining)}%`}</text>
++        ) : null}
++      </box>
++    </box>
++  )
++}
+diff --git a/cli/src/components/claude-connect-banner.tsx b/cli/src/components/claude-connect-banner.tsx
+new file mode 100644
+index 000000000..3283248db
+--- /dev/null
++++ b/cli/src/components/claude-connect-banner.tsx
+@@ -0,0 +1,162 @@
++import React, { useState, useEffect } from 'react'
++
++import { BottomBanner } from './bottom-banner'
++import { Button } from './button'
++import { useChatStore } from '../state/chat-store'
++import {
++  openOAuthInBrowser,
++  exchangeCodeForTokens,
++  disconnectClaudeOAuth,
++  getClaudeOAuthStatus,
++} from '../utils/claude-oauth'
++import { useTheme } from '../hooks/use-theme'
++
++type FlowState =
++  | 'checking'
++  | 'not-connected'
++  | 'waiting-for-code'
++  | 'connected'
++  | 'error'
++
++export const ClaudeConnectBanner = () => {
++  const setInputMode = useChatStore((state) => state.setInputMode)
++  const theme = useTheme()
++  const [flowState, setFlowState] = useState<FlowState>('checking')
++  const [error, setError] = useState<string | null>(null)
++  const [isDisconnectHovered, setIsDisconnectHovered] = useState(false)
++  const [isConnectHovered, setIsConnectHovered] = useState(false)
++
++  // Check initial connection status
++  useEffect(() => {
++    const status = getClaudeOAuthStatus()
++    if (status.connected) {
++      setFlowState('connected')
++    } else {
++      setFlowState('not-connected')
++    }
++  }, [])
++
++  const handleConnect = async () => {
++    try {
++      setFlowState('waiting-for-code')
++      await openOAuthInBrowser()
++    } catch (err) {
++      setError(err instanceof Error ? err.message : 'Failed to open browser')
++      setFlowState('error')
++    }
++  }
++
++  const handleDisconnect = () => {
++    disconnectClaudeOAuth()
++    setFlowState('not-connected')
++  }
++
++  const handleClose = () => {
++    setInputMode('default')
++  }
++
++  // Connected state
++  if (flowState === 'connected') {
++    const status = getClaudeOAuthStatus()
++    const connectedDate = status.connectedAt
++      ? new Date(status.connectedAt).toLocaleDateString()
++      : 'Unknown'
++
++    return (
++      <BottomBanner borderColorKey="success" onClose={handleClose}>
++        <box style={{ flexDirection: 'column', gap: 0, flexGrow: 1 }}>
++          <text style={{ fg: theme.success }}>✓ Connected to Claude</text>
++          <box style={{ flexDirection: 'row', gap: 2, marginTop: 1 }}>
++            <text style={{ fg: theme.muted }}>Since {connectedDate}</text>
++            <text style={{ fg: theme.muted }}>·</text>
++            <Button
++              onClick={handleDisconnect}
++              onMouseOver={() => setIsDisconnectHovered(true)}
++              onMouseOut={() => setIsDisconnectHovered(false)}
++            >
++              <text
++                style={{ fg: isDisconnectHovered ? theme.error : theme.muted }}
++              >
++                Disconnect
++              </text>
++            </Button>
++          </box>
++        </box>
++      </BottomBanner>
++    )
++  }
++
++  // Error state
++  if (flowState === 'error') {
++    return (
++      <BottomBanner
++        borderColorKey="error"
++        text={`Error: ${error}. Press Escape to close.`}
++        onClose={handleClose}
++      />
++    )
++  }
++
++  // Waiting for code state
++  if (flowState === 'waiting-for-code') {
++    return (
++      <BottomBanner borderColorKey="info" onClose={handleClose}>
++        <box style={{ flexDirection: 'column', gap: 0, flexGrow: 1 }}>
++          <text style={{ fg: theme.info }}>Waiting for authorization</text>
++          <text style={{ fg: theme.muted, marginTop: 1 }}>
++            Sign in with your Claude account in the browser, then paste the code
++            here.
++          </text>
++        </box>
++      </BottomBanner>
++    )
++  }
++
++  // Not connected / checking state - show connect button
++  return (
++    <BottomBanner borderColorKey="info" onClose={handleClose}>
++      <box style={{ flexDirection: 'column', gap: 0, flexGrow: 1 }}>
++        <text style={{ fg: theme.info }}>Connect to Claude</text>
++        <box style={{ flexDirection: 'row', gap: 2, marginTop: 1 }}>
++          <text style={{ fg: theme.muted }}>Use your Pro/Max subscription</text>
++          <text style={{ fg: theme.muted }}>·</text>
++          <Button
++            onClick={handleConnect}
++            onMouseOver={() => setIsConnectHovered(true)}
++            onMouseOut={() => setIsConnectHovered(false)}
++          >
++            <text style={{ fg: isConnectHovered ? theme.success : theme.link }}>
++              Click to connect →
++            </text>
++          </Button>
++        </box>
++      </box>
++    </BottomBanner>
++  )
++}
++
++/**
++ * Handle the authorization code input from the user.
++ * This is called when the user pastes their code in connect:claude mode.
++ */
++export async function handleClaudeAuthCode(code: string): Promise<{
++  success: boolean
++  message: string
++}> {
++  try {
++    await exchangeCodeForTokens(code)
++    return {
++      success: true,
++      message:
++        'Successfully connected your Claude subscription! Codebuff will now use it for Claude model requests.',
++    }
++  } catch (err) {
++    return {
++      success: false,
++      message:
++        err instanceof Error
++          ? err.message
++          : 'Failed to exchange authorization code',
++    }
++  }
++}
+diff --git a/cli/src/components/input-mode-banner.tsx b/cli/src/components/input-mode-banner.tsx
+index d04738080..bc1b1c1f6 100644
+--- a/cli/src/components/input-mode-banner.tsx
++++ b/cli/src/components/input-mode-banner.tsx
+@@ -1,5 +1,6 @@
+ import React from 'react'
+ 
++import { ClaudeConnectBanner } from './claude-connect-banner'
+ import { HelpBanner } from './help-banner'
+ import { PendingImagesBanner } from './pending-images-banner'
+ import { ReferralBanner } from './referral-banner'
+@@ -24,6 +25,7 @@ const BANNER_REGISTRY: Record<
+   usage: ({ showTime }) => <UsageBanner showTime={showTime} />,
+   referral: () => <ReferralBanner />,
+   help: () => <HelpBanner />,
++  'connect:claude': () => <ClaudeConnectBanner />,
+ }
+ 
+ /**
+diff --git a/cli/src/components/progress-bar.tsx b/cli/src/components/progress-bar.tsx
+new file mode 100644
+index 000000000..e161772d2
+--- /dev/null
++++ b/cli/src/components/progress-bar.tsx
+@@ -0,0 +1,79 @@
++import React from 'react'
++
++import { useTheme } from '../hooks/use-theme'
++
++interface ProgressBarProps {
++  /** Value from 0 to 100 */
++  value: number
++  /** Width in characters (default: 20) */
++  width?: number
++  /** Optional label to show before the bar */
++  label?: string
++  /** Show percentage text after the bar */
++  showPercentage?: boolean
++}
++
++/**
++ * Get color based on progress percentage - muted for normal, warning/error when low
++ */
++const getProgressColor = (
++  value: number,
++  theme: {
++    primary: string
++    foreground: string
++    warning: string
++    error: string
++  },
++): string => {
++  if (value <= 10) return theme.error
++  if (value <= 25) return theme.warning
++  return theme.foreground
++}
++
++/**
++ * Get color for the filled portion of the bar
++ */
++const getBarColor = (
++  value: number,
++  theme: { primary: string; warning: string; error: string },
++): string => {
++  if (value <= 10) return theme.error
++  if (value <= 25) return theme.warning
++  return theme.primary // Use primary for the bar itself
++}
++
++/**
++ * Terminal progress bar component
++ * Uses block characters for visual display
++ */
++export const ProgressBar: React.FC<ProgressBarProps> = ({
++  value,
++  width = 20,
++  label,
++  showPercentage = true,
++}) => {
++  const theme = useTheme()
++  const clampedValue = Math.max(0, Math.min(100, value))
++  const filledWidth = Math.round((clampedValue / 100) * width)
++  const emptyWidth = width - filledWidth
++
++  const filledChar = '█'
++  const emptyChar = '░'
++
++  const filled = filledChar.repeat(filledWidth)
++  const empty = emptyChar.repeat(emptyWidth)
++
++  const barColor = getBarColor(clampedValue, theme)
++  const textColor = getProgressColor(clampedValue, theme)
++
++  return (
++    <box style={{ flexDirection: 'row', alignItems: 'center', gap: 0 }}>
++      {label && <text style={{ fg: theme.muted }}>{label} </text>}
++      <text style={{ fg: barColor }}>{filled}</text>
++      <text style={{ fg: theme.muted }}>{empty}</text>
++      {showPercentage && (
++        <text style={{ fg: textColor }}> {Math.round(clampedValue)}%</text>
++      )}
++    </box>
++  )
++}
+diff --git a/cli/src/components/usage-banner.tsx b/cli/src/components/usage-banner.tsx
+index 70a7fcbf4..54742c436 100644
+--- a/cli/src/components/usage-banner.tsx
++++ b/cli/src/components/usage-banner.tsx
+@@ -3,25 +3,57 @@ import React, { useEffect } from 'react'
+ import open from 'open'
+ 
+ import { BottomBanner } from './bottom-banner'
++import { Button } from './button'
++import { ProgressBar } from './progress-bar'
++import { useClaudeQuotaQuery } from '../hooks/use-claude-quota-query'
+ import { usageQueryKeys, useUsageQuery } from '../hooks/use-usage-query'
+ import { useChatStore } from '../state/chat-store'
+ import {
+   getBannerColorLevel,
+-  generateUsageBannerText,
+   generateLoadingBannerText,
+ } from '../utils/usage-banner-state'
+ import { WEBSITE_URL } from '../login/constants'
+ import { useTheme } from '../hooks/use-theme'
+-import { Button } from './button'
++import { isClaudeOAuthValid } from '@codebuff/sdk'
++
++import { formatResetTime } from '../utils/time-format'
+ 
+ const MANUAL_SHOW_TIMEOUT = 60 * 1000 // 1 minute
+ const USAGE_POLL_INTERVAL = 30 * 1000 // 30 seconds
+ 
++/**
++ * Format the renewal date for display
++ */
++const formatRenewalDate = (dateStr: string | null): string => {
++  if (!dateStr) return ''
++  const resetDate = new Date(dateStr)
++  const today = new Date()
++  const isToday = resetDate.toDateString() === today.toDateString()
++  return isToday
++    ? resetDate.toLocaleString('en-US', {
++        hour: 'numeric',
++        minute: '2-digit',
++      })
++    : resetDate.toLocaleDateString('en-US', {
++        month: 'short',
++        day: 'numeric',
++      })
++}
++
+ export const UsageBanner = ({ showTime }: { showTime: number }) => {
+   const queryClient = useQueryClient()
+   const sessionCreditsUsed = useChatStore((state) => state.sessionCreditsUsed)
+   const setInputMode = useChatStore((state) => state.setInputMode)
+ 
++  // Check if Claude OAuth is connected
++  const isClaudeConnected = isClaudeOAuthValid()
++
++  // Fetch Claude quota data if connected
++  const { data: claudeQuota, isLoading: isClaudeLoading } = useClaudeQuotaQuery({
++    enabled: isClaudeConnected,
++    refetchInterval: 30 * 1000, // Refresh every 30 seconds when banner is open
++  })
++
+   const {
+     data: apiData,
+     isLoading,
+@@ -75,29 +107,84 @@ export const UsageBanner = ({ showTime }: { showTime: number }) => {
+   }
+ 
+   const colorLevel = getBannerColorLevel(activeData.remainingBalance)
+-
+-  // Show loading indicator if refreshing data
+-  const text = isLoadingData
+-    ? generateLoadingBannerText(sessionCreditsUsed)
+-    : generateUsageBannerText({
+-        sessionCreditsUsed,
+-        remainingBalance: activeData.remainingBalance,
+-        next_quota_reset: activeData.next_quota_reset,
+-        adCredits: activeData.balanceBreakdown?.ad,
+-      })
++  const adCredits = activeData.balanceBreakdown?.ad
++  const renewalDate = activeData.next_quota_reset ? formatRenewalDate(activeData.next_quota_reset) : null
+ 
+   return (
+     <BottomBanner
+       borderColorKey={isLoadingData ? 'muted' : colorLevel}
+       onClose={() => setInputMode('default')}
+     >
+-      <Button
+-        onClick={() => {
+-          open(WEBSITE_URL + '/usage')
+-        }}
+-      >
+-        <text style={{ fg: theme.foreground }}>{text}</text>
+-      </Button>
++      <box style={{ flexDirection: 'column', gap: 0 }}>
++        {/* Codebuff credits section - structured layout */}
++        <Button
++          onClick={() => {
++            open(WEBSITE_URL + '/usage')
++          }}
++        >
++          <box style={{ flexDirection: 'column', gap: 0 }}>
++            {/* Main stats row */}
++            <box style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 1 }}>
++              <text style={{ fg: theme.muted }}>Session:</text>
++              <text style={{ fg: theme.foreground }}>{sessionCreditsUsed.toLocaleString()}</text>
++              <text style={{ fg: theme.muted }}>·</text>
++              <text style={{ fg: theme.muted }}>Remaining:</text>
++              {isLoadingData ? (
++                <text style={{ fg: theme.muted }}>...</text>
++              ) : (
++                <text style={{ fg: theme.foreground }}>
++                  {activeData.remainingBalance?.toLocaleString() ?? '?'}
++                </text>
++              )}
++              {adCredits != null && adCredits > 0 && (
++                <text style={{ fg: theme.muted }}>{`(${adCredits} from ads)`}</text>
++              )}
++              {renewalDate && (
++                <>
++                  <text style={{ fg: theme.muted }}>· Renews:</text>
++                  <text style={{ fg: theme.foreground }}>{renewalDate}</text>
++                </>
++              )}
++            </box>
++            {/* See more link */}
++            <text style={{ fg: theme.muted }}>↗ See more on codebuff.com</text>
++          </box>
++        </Button>
++
++        {/* Claude subscription section - only show if connected */}
++        {isClaudeConnected && (
++          <box style={{ flexDirection: 'column', marginTop: 1 }}>
++            <text style={{ fg: theme.muted }}>Claude subscription</text>
++            {isClaudeLoading ? (
++              <text style={{ fg: theme.muted }}>Loading quota...</text>
++            ) : claudeQuota ? (
++              <box style={{ flexDirection: 'column', gap: 0 }}>
++                <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
++                  <text style={{ fg: theme.muted }}>5-hour:</text>
++                  <ProgressBar value={claudeQuota.fiveHourRemaining} width={15} />
++                  {claudeQuota.fiveHourResetsAt && (
++                    <text style={{ fg: theme.muted }}>
++                      (resets in {formatResetTime(claudeQuota.fiveHourResetsAt)})
++                    </text>
++                  )}
++                </box>
++                {/* Only show 7-day bar if the user has a 7-day limit */}
++                {claudeQuota.sevenDayResetsAt && (
++                  <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1 }}>
++                    <text style={{ fg: theme.muted }}>7-day: </text>
++                    <ProgressBar value={claudeQuota.sevenDayRemaining} width={15} />
++                    <text style={{ fg: theme.muted }}>
++                      (resets in {formatResetTime(claudeQuota.sevenDayResetsAt)})
++                    </text>
++                  </box>
++                )}
++              </box>
++            ) : (
++              <text style={{ fg: theme.muted }}>Unable to fetch quota</text>
++            )}
++          </box>
++        )}
++      </box>
+     </BottomBanner>
+   )
+ }
+diff --git a/cli/src/data/slash-commands.ts b/cli/src/data/slash-commands.ts
+index c8ecbdb61..73dcf4f73 100644
+--- a/cli/src/data/slash-commands.ts
++++ b/cli/src/data/slash-commands.ts
+@@ -66,7 +66,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
+   {
+     id: 'usage',
+     label: 'usage',
+-    description: 'View remaining or bonus credits',
++    description: 'View credits and subscription quota',
+     aliases: ['credits'],
+   },
+   {
+@@ -103,5 +103,11 @@ export const SLASH_COMMANDS: SlashCommand[] = [
+     label: 'publish',
+     description: 'Publish agents to the agent store',
+   },
++  {
++    id: 'connect:claude',
++    label: 'connect:claude',
++    description: 'Connect your Claude Pro/Max subscription',
++    aliases: ['claude'],
++  },
+   ...MODE_COMMANDS,
+ ]
+diff --git a/cli/src/hooks/use-claude-quota-query.ts b/cli/src/hooks/use-claude-quota-query.ts
+new file mode 100644
+index 000000000..91c1c98a9
+--- /dev/null
++++ b/cli/src/hooks/use-claude-quota-query.ts
+@@ -0,0 +1,125 @@
++import { useQuery } from '@tanstack/react-query'
++
++import { getClaudeOAuthCredentials, isClaudeOAuthValid } from '@codebuff/sdk'
++
++import { logger as defaultLogger } from '../utils/logger'
++
++import type { Logger } from '@codebuff/common/types/contracts/logger'
++
++// Query keys for type-safe cache management
++export const claudeQuotaQueryKeys = {
++  all: ['claude-quota'] as const,
++  current: () => [...claudeQuotaQueryKeys.all, 'current'] as const,
++}
++
++/**
++ * Response from Anthropic OAuth usage endpoint
++ */
++export interface ClaudeQuotaWindow {
++  utilization: number // Percentage used (0-100)
++  resets_at: string | null // ISO timestamp when quota resets
++}
++
++export interface ClaudeQuotaResponse {
++  five_hour: ClaudeQuotaWindow | null
++  seven_day: ClaudeQuotaWindow | null
++  seven_day_oauth_apps: ClaudeQuotaWindow | null
++  seven_day_opus: ClaudeQuotaWindow | null
++}
++
++/**
++ * Parsed quota data for display
++ */
++export interface ClaudeQuotaData {
++  /** Remaining percentage for the 5-hour window (0-100) */
++  fiveHourRemaining: number
++  /** When the 5-hour quota resets */
++  fiveHourResetsAt: Date | null
++  /** Remaining percentage for the 7-day window (0-100) */
++  sevenDayRemaining: number
++  /** When the 7-day quota resets */
++  sevenDayResetsAt: Date | null
++}
++
++/**
++ * Fetches Claude OAuth usage data from Anthropic API
++ */
++export async function fetchClaudeQuota(
++  accessToken: string,
++  logger: Logger = defaultLogger,
++): Promise<ClaudeQuotaData> {
++  const response = await fetch('https://api.anthropic.com/api/oauth/usage', {
++    method: 'GET',
++    headers: {
++      Authorization: `Bearer ${accessToken}`,
++      Accept: 'application/json',
++      'Content-Type': 'application/json',
++      // Required beta headers for OAuth endpoints (same as model requests)
++      'anthropic-version': '2023-06-01',
++      'anthropic-beta': 'oauth-2025-04-20,claude-code-20250219',
++    },
++  })
++
++  if (!response.ok) {
++    logger.debug(
++      { status: response.status },
++      'Failed to fetch Claude quota data',
++    )
++    throw new Error(`Failed to fetch Claude quota: ${response.status}`)
++  }
++
++  const data = (await response.json()) as ClaudeQuotaResponse
++
++  // Parse the response into a more usable format
++  const fiveHour = data.five_hour
++  const sevenDay = data.seven_day
++
++  return {
++    fiveHourRemaining: fiveHour ? Math.max(0, 100 - fiveHour.utilization) : 100,
++    fiveHourResetsAt: fiveHour?.resets_at ? new Date(fiveHour.resets_at) : null,
++    sevenDayRemaining: sevenDay ? Math.max(0, 100 - sevenDay.utilization) : 100,
++    sevenDayResetsAt: sevenDay?.resets_at ? new Date(sevenDay.resets_at) : null,
++  }
++}
++
++export interface UseClaudeQuotaQueryDeps {
++  logger?: Logger
++  enabled?: boolean
++  /** Refetch interval in milliseconds (default: 60 seconds) */
++  refetchInterval?: number | false
++}
++
++/**
++ * Hook to fetch Claude OAuth quota data from Anthropic API
++ * Only fetches when Claude OAuth is connected and valid
++ */
++export function useClaudeQuotaQuery(deps: UseClaudeQuotaQueryDeps = {}) {
++  const {
++    logger = defaultLogger,
++    enabled = true,
++    refetchInterval = 120 * 1000, // Default: refetch every 120 seconds
++  } = deps
++
++  const isConnected = isClaudeOAuthValid()
++
++  return useQuery({
++    queryKey: claudeQuotaQueryKeys.current(),
++    queryFn: () => {
++      // Get credentials inside queryFn to avoid stale closures
++      const credentials = getClaudeOAuthCredentials()
++      if (!credentials?.accessToken) {
++        throw new Error('No Claude OAuth credentials')
++      }
++      return fetchClaudeQuota(credentials.accessToken, logger)
++    },
++    enabled: enabled && isConnected,
++    staleTime: 30 * 1000, // Consider data stale after 30 seconds
++    gcTime: 5 * 60 * 1000, // 5 minutes
++    retry: 1, // Only retry once on failure
++    refetchOnMount: true,
++    refetchOnWindowFocus: false, // CLI doesn't have window focus
++    refetchOnReconnect: false,
++    refetchInterval,
++    refetchIntervalInBackground: true, // Required for terminal environments
++  })
++}
+diff --git a/cli/src/utils/__tests__/usage-banner-state.test.ts b/cli/src/utils/__tests__/usage-banner-state.test.ts
+index 36f75cc53..17d9e0001 100644
+--- a/cli/src/utils/__tests__/usage-banner-state.test.ts
++++ b/cli/src/utils/__tests__/usage-banner-state.test.ts
+@@ -3,7 +3,6 @@ import { describe, test, expect } from 'bun:test'
+ import {
+   getBannerColorLevel,
+   getThresholdInfo,
+-  generateUsageBannerText,
+   generateLoadingBannerText,
+   shouldAutoShowBanner,
+ } from '../usage-banner-state'
+@@ -111,55 +110,6 @@ describe('usage-banner-state', () => {
+     })
+   })
+ 
+-  describe('generateUsageBannerText', () => {
+-    test('always shows session usage', () => {
+-      const text = generateUsageBannerText({
+-        sessionCreditsUsed: 250,
+-        remainingBalance: null,
+-        next_quota_reset: null,
+-      })
+-      expect(text).toContain('250')
+-    })
+-
+-    test('shows remaining balance when available', () => {
+-      const text = generateUsageBannerText({
+-        sessionCreditsUsed: 100,
+-        remainingBalance: 500,
+-        next_quota_reset: null,
+-      })
+-      expect(text).toContain('500')
+-    })
+-
+-    test('omits balance when not available', () => {
+-      const text = generateUsageBannerText({
+-        sessionCreditsUsed: 100,
+-        remainingBalance: null,
+-        next_quota_reset: null,
+-      })
+-      expect(text).not.toContain('remaining')
+-    })
+-
+-    test('shows renewal date when available', () => {
+-      const text = generateUsageBannerText({
+-        sessionCreditsUsed: 100,
+-        remainingBalance: 500,
+-        next_quota_reset: '2025-03-15T00:00:00.000Z',
+-        today: new Date('2025-03-01'),
+-      })
+-      expect(text).toContain('Mar')
+-      expect(text).toContain('15')
+-    })
+-
+-    test('omits renewal date when not available', () => {
+-      const text = generateUsageBannerText({
+-        sessionCreditsUsed: 100,
+-        remainingBalance: 500,
+-        next_quota_reset: null,
+-      })
+-      expect(text.toLowerCase()).not.toContain('renew')
+-    })
+-  })
+-
+   describe('shouldAutoShowBanner', () => {
+     describe('when banner should NOT auto-show', () => {
+       test('during active AI response chain', () => {
+diff --git a/cli/src/utils/auth.ts b/cli/src/utils/auth.ts
+index 04c98e73b..fde353a54 100644
+--- a/cli/src/utils/auth.ts
++++ b/cli/src/utils/auth.ts
+@@ -24,11 +24,22 @@ const userSchema = z.object({
+ 
+ export type User = z.infer<typeof userSchema>
+ 
++// Claude OAuth credentials schema (for passthrough, not strict validation here)
++const claudeOAuthSchema = z
++  .object({
++    accessToken: z.string(),
++    refreshToken: z.string(),
++    expiresAt: z.number(),
++    connectedAt: z.number(),
++  })
++  .optional()
++
+ const credentialsSchema = z
+   .object({
+     default: userSchema,
++    claudeOAuth: claudeOAuthSchema,
+   })
+-  .catchall(userSchema)
++  .catchall(z.unknown())
+ 
+ // Get the config directory path
+ export const getConfigDir = (): string => {
+@@ -58,7 +69,9 @@ const userFromJson = (
+   try {
+     const allCredentials = credentialsSchema.parse(JSON.parse(json))
+     const profile = allCredentials[profileName]
+-    return profile
++    // Validate that the profile matches the user schema
++    const parsed = userSchema.safeParse(profile)
++    return parsed.success ? parsed.data : undefined
+   } catch (error) {
+     logger.error(
+       {
+diff --git a/cli/src/utils/claude-oauth.ts b/cli/src/utils/claude-oauth.ts
+new file mode 100644
+index 000000000..80bea1841
+--- /dev/null
++++ b/cli/src/utils/claude-oauth.ts
+@@ -0,0 +1,175 @@
++/**
++ * Claude OAuth PKCE flow implementation for connecting to user's Claude Pro/Max subscription.
++ */
++
++import crypto from 'crypto'
++import open from 'open'
++import { CLAUDE_OAUTH_CLIENT_ID } from '@codebuff/common/constants/claude-oauth'
++import {
++  saveClaudeOAuthCredentials,
++  clearClaudeOAuthCredentials,
++  getClaudeOAuthCredentials,
++  isClaudeOAuthValid,
++  resetClaudeOAuthRateLimit,
++} from '@codebuff/sdk'
++
++import type { ClaudeOAuthCredentials } from '@codebuff/sdk'
++
++// PKCE code verifier and challenge generation
++function generateCodeVerifier(): string {
++  // Generate 32 random bytes and encode as base64url
++  const buffer = crypto.randomBytes(32)
++  return buffer
++    .toString('base64')
++    .replace(/\+/g, '-')
++    .replace(/\//g, '_')
++    .replace(/=/g, '')
++}
++
++function generateCodeChallenge(verifier: string): string {
++  // SHA256 hash of the verifier, encoded as base64url
++  const hash = crypto.createHash('sha256').update(verifier).digest()
++  return hash
++    .toString('base64')
++    .replace(/\+/g, '-')
++    .replace(/\//g, '_')
++    .replace(/=/g, '')
++}
++
++// Store the code verifier and state during the OAuth flow
++let pendingCodeVerifier: string | null = null
++
++/**
++ * Start the OAuth authorization flow.
++ * Opens the browser to Anthropic's authorization page.
++ * @returns The code verifier to be used when exchanging the authorization code
++ */
++export function startOAuthFlow(): { codeVerifier: string; authUrl: string } {
++  const codeVerifier = generateCodeVerifier()
++  const codeChallenge = generateCodeChallenge(codeVerifier)
++
++  // Store the code verifier and state for later use
++  pendingCodeVerifier = codeVerifier
++
++  // Build the authorization URL
++  // Use claude.ai for Max subscription (same as opencode)
++  const authUrl = new URL('https://claude.ai/oauth/authorize')
++  authUrl.searchParams.set('code', 'true')
++  authUrl.searchParams.set('client_id', CLAUDE_OAUTH_CLIENT_ID)
++  authUrl.searchParams.set('response_type', 'code')
++  authUrl.searchParams.set(
++    'redirect_uri',
++    'https://console.anthropic.com/oauth/code/callback',
++  )
++  authUrl.searchParams.set(
++    'scope',
++    'org:create_api_key user:profile user:inference',
++  )
++  authUrl.searchParams.set('code_challenge', codeChallenge)
++  authUrl.searchParams.set('code_challenge_method', 'S256')
++  authUrl.searchParams.set('state', codeVerifier) // opencode uses verifier as state
++
++  return { codeVerifier, authUrl: authUrl.toString() }
++}
++
++/**
++ * Open the browser to start OAuth flow.
++ */
++export async function openOAuthInBrowser(): Promise<string> {
++  const { authUrl, codeVerifier } = startOAuthFlow()
++  await open(authUrl)
++  return codeVerifier
++}
++
++/**
++ * Exchange an authorization code for access and refresh tokens.
++ */
++export async function exchangeCodeForTokens(
++  authorizationCode: string,
++  codeVerifier?: string,
++): Promise<ClaudeOAuthCredentials> {
++  const verifier = codeVerifier ?? pendingCodeVerifier
++  if (!verifier) {
++    throw new Error(
++      'No code verifier found. Please start the OAuth flow again.',
++    )
++  }
++
++  // The authorization code from claude.ai comes in format: code#state
++  // We need to split it and send both parts
++  const splits = authorizationCode.trim().split('#')
++  const code = splits[0]
++  const state = splits[1]
++
++  // Use the v1 OAuth token endpoint (same as opencode)
++  const response = await fetch('https://console.anthropic.com/v1/oauth/token', {
++    method: 'POST',
++    headers: {
++      'Content-Type': 'application/json',
++    },
++    body: JSON.stringify({
++      code: code,
++      state: state,
++      grant_type: 'authorization_code',
++      client_id: CLAUDE_OAUTH_CLIENT_ID,
++      redirect_uri: 'https://console.anthropic.com/oauth/code/callback',
++      code_verifier: verifier,
++    }),
++  })
++
++  if (!response.ok) {
++    const errorText = await response.text()
++    throw new Error(`Failed to exchange code for tokens: ${errorText}`)
++  }
++
++  const data = await response.json()
++
++  // Clear the pending code verifier
++  pendingCodeVerifier = null
++
++  const credentials: ClaudeOAuthCredentials = {
++    accessToken: data.access_token,
++    refreshToken: data.refresh_token,
++    expiresAt: Date.now() + data.expires_in * 1000,
++    connectedAt: Date.now(),
++  }
++
++  // Save credentials to file
++  saveClaudeOAuthCredentials(credentials)
++
++  // Reset any cached rate limit since user just reconnected
++  resetClaudeOAuthRateLimit()
++
++  return credentials
++}
++
++/**
++ * Disconnect from Claude OAuth (clear credentials).
++ */
++export function disconnectClaudeOAuth(): void {
++  clearClaudeOAuthCredentials()
++}
++
++/**
++ * Get the current Claude OAuth connection status.
++ */
++export function getClaudeOAuthStatus(): {
++  connected: boolean
++  expiresAt?: number
++  connectedAt?: number
++} {
++  if (!isClaudeOAuthValid()) {
++    return { connected: false }
++  }
++
++  const credentials = getClaudeOAuthCredentials()
++  if (!credentials) {
++    return { connected: false }
++  }
++
++  return {
++    connected: true,
++    expiresAt: credentials.expiresAt,
++    connectedAt: credentials.connectedAt,
++  }
++}
+diff --git a/cli/src/utils/input-modes.ts b/cli/src/utils/input-modes.ts
+index 8d166a584..be2196223 100644
+--- a/cli/src/utils/input-modes.ts
++++ b/cli/src/utils/input-modes.ts
+@@ -11,6 +11,7 @@ export type InputMode =
+   | 'usage'
+   | 'image'
+   | 'help'
++  | 'connect:claude'
+   | 'outOfCredits'
+ 
+ // Theme color keys that are valid color values (must match ChatTheme keys)
+@@ -97,6 +98,14 @@ export const INPUT_MODE_CONFIGS: Record<InputMode, InputModeConfig> = {
+     showAgentModeToggle: true,
+     disableSlashSuggestions: false,
+   },
++  'connect:claude': {
++    icon: '🔗',
++    color: 'info',
++    placeholder: 'paste authorization code here...',
++    widthAdjustment: 3, // emoji width + padding
++    showAgentModeToggle: false,
++    disableSlashSuggestions: true,
++  },
+   outOfCredits: {
+     icon: null,
+     color: 'warning',
+diff --git a/cli/src/utils/time-format.ts b/cli/src/utils/time-format.ts
+new file mode 100644
+index 000000000..af178fde8
+--- /dev/null
++++ b/cli/src/utils/time-format.ts
+@@ -0,0 +1,20 @@
++/**
++ * Format time until reset in human-readable form
++ * @param resetDate - The date when the quota/resource resets
++ * @returns Human-readable string like "2h 30m" or "45m"
++ */
++export const formatResetTime = (resetDate: Date | null): string => {
++  if (!resetDate) return ''
++  const now = new Date()
++  const diffMs = resetDate.getTime() - now.getTime()
++  if (diffMs <= 0) return 'now'
++
++  const diffMins = Math.floor(diffMs / (1000 * 60))
++  const diffHours = Math.floor(diffMins / 60)
++  const remainingMins = diffMins % 60
++
++  if (diffHours > 0) {
++    return `${diffHours}h ${remainingMins}m`
++  }
++  return `${diffMins}m`
++}
+diff --git a/cli/src/utils/usage-banner-state.ts b/cli/src/utils/usage-banner-state.ts
+index b3bd360cd..cb9b8af20 100644
+--- a/cli/src/utils/usage-banner-state.ts
++++ b/cli/src/utils/usage-banner-state.ts
+@@ -62,16 +62,6 @@ export function getBannerColorLevel(balance: number | null): BannerColorLevel {
+   return getThresholdInfo(balance).colorLevel
+ }
+ 
+-export interface UsageBannerTextOptions {
+-  sessionCreditsUsed: number
+-  remainingBalance: number | null
+-  next_quota_reset: string | null
+-  /** Ad impression credits earned */
+-  adCredits?: number
+-  /** For testing purposes, allows overriding "today" */
+-  today?: Date
+-}
+-
+ /**
+  * Generates loading text for the usage banner while data is being fetched.
+  */
+@@ -79,57 +69,6 @@ export function generateLoadingBannerText(sessionCreditsUsed: number): string {
+   return `Session usage: ${sessionCreditsUsed.toLocaleString()}. Loading credit balance...`
+ }
+ 
+-/**
+- * Generates the text content for the usage banner.
+- */
+-export function generateUsageBannerText(
+-  options: UsageBannerTextOptions,
+-): string {
+-  const {
+-    sessionCreditsUsed,
+-    remainingBalance,
+-    next_quota_reset,
+-    adCredits,
+-    today = new Date(),
+-  } = options
+-
+-  let text = `Session usage: ${sessionCreditsUsed.toLocaleString()}`
+-
+-  if (remainingBalance !== null) {
+-    text += `. Credits remaining: ${remainingBalance.toLocaleString()}`
+-  }
+-
+-  // Show ad credits earned if any
+-  if (adCredits && adCredits > 0) {
+-    text += ` (${adCredits.toLocaleString()} from ads)`
+-  }
+-
+-  if (next_quota_reset) {
+-    const resetDate = new Date(next_quota_reset)
+-    const isToday = resetDate.toDateString() === today.toDateString()
+-
+-    const dateDisplay = isToday
+-      ? resetDate.toLocaleString('en-US', {
+-          month: 'short',
+-          day: 'numeric',
+-          year: 'numeric',
+-          hour: 'numeric',
+-          minute: '2-digit',
+-        })
+-      : resetDate.toLocaleDateString('en-US', {
+-          month: 'short',
+-          day: 'numeric',
+-          year: 'numeric',
+-        })
+-
+-    text += `. Free credits renew ${dateDisplay}`
+-  }
+-
+-  text += `. See more`
+-
+-  return text
+-}
+-
+ /**
+  * Gets the threshold tier for a given balance.
+  * Returns null if balance is above all thresholds.
+diff --git a/common/src/constants/claude-oauth.ts b/common/src/constants/claude-oauth.ts
+new file mode 100644
+index 000000000..faa3f3155
+--- /dev/null
++++ b/common/src/constants/claude-oauth.ts
+@@ -0,0 +1,110 @@
++/**
++ * Claude Code OAuth constants for connecting to user's Claude Pro/Max subscription.
++ * These are used by the CLI for the OAuth PKCE flow and by the SDK for direct Anthropic API calls.
++ */
++
++// OAuth client ID used by Claude Code and third-party apps like opencode
++export const CLAUDE_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
++
++// Anthropic OAuth endpoints
++export const CLAUDE_OAUTH_AUTHORIZE_URL = 'https://console.anthropic.com/oauth/authorize'
++export const CLAUDE_OAUTH_TOKEN_URL = 'https://console.anthropic.com/oauth/token'
++
++// Anthropic API endpoint for direct calls
++export const ANTHROPIC_API_BASE_URL = 'https://api.anthropic.com'
++
++// Environment variable for OAuth token override
++export const CLAUDE_OAUTH_TOKEN_ENV_VAR = 'CODEBUFF_CLAUDE_OAUTH_TOKEN'
++
++// Required Anthropic API version header
++export const ANTHROPIC_API_VERSION = '2023-06-01'
++
++/**
++ * Beta headers required for Claude OAuth access to Claude 4+ models.
++ * These must be included in the anthropic-beta header when making requests.
++ */
++export const CLAUDE_OAUTH_BETA_HEADERS = [
++  'oauth-2025-04-20',
++  'claude-code-20250219',
++  'interleaved-thinking-2025-05-14',
++  'fine-grained-tool-streaming-2025-05-14',
++] as const
++
++/**
++ * System prompt prefix required by Anthropic to allow OAuth access to Claude 4+ models.
++ * This must be prepended to the system prompt when using Claude OAuth with Claude 4+ models.
++ * Without this prefix, requests will fail with "This credential is only authorized for use with Claude Code".
++ */
++export const CLAUDE_CODE_SYSTEM_PROMPT_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
++
++/**
++ * Model ID mapping from OpenRouter format to Anthropic format.
++ * OpenRouter uses prefixed IDs like "anthropic/claude-sonnet-4",
++ * while Anthropic uses versioned IDs like "claude-3-5-haiku-20241022".
++ */
++export const OPENROUTER_TO_ANTHROPIC_MODEL_MAP: Record<string, string> = {
++  // Claude 3.x Haiku models
++  'anthropic/claude-3.5-haiku-20241022': 'claude-3-5-haiku-20241022',
++  'anthropic/claude-3.5-haiku': 'claude-3-5-haiku-20241022',
++  'anthropic/claude-3-5-haiku': 'claude-3-5-haiku-20241022',
++  'anthropic/claude-3-5-haiku-20241022': 'claude-3-5-haiku-20241022',
++  'anthropic/claude-3-haiku': 'claude-3-haiku-20240307',
++
++  // Claude 3.x Sonnet models
++  'anthropic/claude-3.5-sonnet': 'claude-3-5-sonnet-20241022',
++  'anthropic/claude-3-5-sonnet': 'claude-3-5-sonnet-20241022',
++  'anthropic/claude-3-5-sonnet-20241022': 'claude-3-5-sonnet-20241022',
++  'anthropic/claude-3-5-sonnet-20240620': 'claude-3-5-sonnet-20240620',
++  'anthropic/claude-3-sonnet': 'claude-3-sonnet-20240229',
++
++  // Claude 3.x Opus models
++  'anthropic/claude-3-opus': 'claude-3-opus-20240229',
++  'anthropic/claude-3-opus-20240229': 'claude-3-opus-20240229',
++
++  // Claude 4.x Haiku models
++  'anthropic/claude-haiku-4.5': 'claude-haiku-4-5-20251001',
++  'anthropic/claude-haiku-4': 'claude-haiku-4-20250514',
++
++  // Claude 4.x Sonnet models
++  'anthropic/claude-sonnet-4.5': 'claude-sonnet-4-5-20250929',
++  'anthropic/claude-sonnet-4': 'claude-sonnet-4-20250514',
++
++  // Claude 4.x Opus models
++  'anthropic/claude-opus-4.5': 'claude-opus-4-5-20251101',
++  'anthropic/claude-opus-4.1': 'claude-opus-4-1-20250805',
++  'anthropic/claude-opus-4': 'claude-opus-4-1-20250805',
++}
++
++/**
++ * Check if a model is a Claude/Anthropic model that can use OAuth.
++ */
++export function isClaudeModel(model: string): boolean {
++  return model.startsWith('anthropic/') || model.startsWith('claude-')
++}
++
++/**
++ * Convert an OpenRouter model ID to an Anthropic model ID.
++ * Throws an error if the model has a provider prefix but is not an Anthropic model.
++ */
++export function toAnthropicModelId(openrouterModel: string): string {
++  // If it's already an Anthropic model ID (no prefix), return as-is
++  if (!openrouterModel.includes('/')) {
++    return openrouterModel
++  }
++
++  // Require anthropic/ prefix for OpenRouter model IDs
++  if (!openrouterModel.startsWith('anthropic/')) {
++    throw new Error(
++      `Cannot convert non-Anthropic model to Anthropic model ID: ${openrouterModel}`,
++    )
++  }
++
++  // Check the mapping table
++  const mapped = OPENROUTER_TO_ANTHROPIC_MODEL_MAP[openrouterModel]
++  if (mapped) {
++    return mapped
++  }
++
++  // Fallback: strip the "anthropic/" prefix
++  return openrouterModel.replace('anthropic/', '')
++}
+diff --git a/sdk/package.json b/sdk/package.json
+index 8b881b311..8b36c205b 100644
+--- a/sdk/package.json
++++ b/sdk/package.json
+@@ -58,6 +58,7 @@
+     "url": "https://github.com/CodebuffAI/codebuff/issues"
+   },
+   "dependencies": {
++    "@ai-sdk/anthropic": "2.0.50",
+     "@jitl/quickjs-wasmfile-release-sync": "0.31.0",
+     "@vscode/tree-sitter-wasm": "0.1.4",
+     "ai": "^5.0.0",
+diff --git a/sdk/src/credentials.ts b/sdk/src/credentials.ts
+index 02d59ca16..c6f103f06 100644
+--- a/sdk/src/credentials.ts
++++ b/sdk/src/credentials.ts
+@@ -3,17 +3,33 @@ import path from 'node:path'
+ import os from 'os'
+ 
+ import { env } from '@codebuff/common/env'
++import { CLAUDE_OAUTH_CLIENT_ID } from '@codebuff/common/constants/claude-oauth'
+ import { userSchema } from '@codebuff/common/util/credentials'
+ import { z } from 'zod/v4'
+ 
++import { getClaudeOAuthTokenFromEnv } from './env'
++
+ import type { ClientEnv } from '@codebuff/common/types/contracts/env'
+ import type { User } from '@codebuff/common/util/credentials'
+ 
+-const credentialsSchema = z
+-  .object({
+-    default: userSchema,
+-  })
+-  .catchall(userSchema)
++/**
++ * Schema for Claude OAuth credentials.
++ */
++const claudeOAuthSchema = z.object({
++  accessToken: z.string(),
++  refreshToken: z.string(),
++  expiresAt: z.number(),
++  connectedAt: z.number(),
++})
++
++/**
++ * Unified schema for the credentials file.
++ * Contains both Codebuff user credentials and Claude OAuth credentials.
++ */
++const credentialsFileSchema = z.object({
++  default: userSchema.optional(),
++  claudeOAuth: claudeOAuthSchema.optional(),
++})
+ 
+ const ensureDirectoryExistsSync = (dir: string) => {
+   if (!fs.existsSync(dir)) {
+@@ -21,17 +37,12 @@ const ensureDirectoryExistsSync = (dir: string) => {
+   }
+ }
+ 
+-export const userFromJson = (
+-  json: string,
+-  profileName: string = 'default',
+-): User | undefined => {
++export const userFromJson = (json: string): User | null => {
+   try {
+-    const allCredentials = credentialsSchema.parse(JSON.parse(json))
+-    const profile = allCredentials[profileName]
+-    return profile
+-  } catch (error) {
+-    console.error('Error parsing user JSON:', error)
+-    return
++    const credentials = credentialsFileSchema.parse(JSON.parse(json))
++    return credentials.default ?? null
++  } catch {
++    return null
+   }
+ }
+ 
+@@ -55,11 +66,6 @@ export const getCredentialsPath = (clientEnv: ClientEnv = env): string => {
+   return path.join(getConfigDir(clientEnv), 'credentials.json')
+ }
+ 
+-// Legacy exports for backward compatibility - use getConfigDir() and getCredentialsPath() for testability
+-export const CONFIG_DIR = getConfigDir()
+-ensureDirectoryExistsSync(CONFIG_DIR)
+-export const CREDENTIALS_PATH = getCredentialsPath()
+-
+ export const getUserCredentials = (clientEnv: ClientEnv = env): User | null => {
+   const credentialsPath = getCredentialsPath(clientEnv)
+   if (!fs.existsSync(credentialsPath)) {
+@@ -75,3 +81,220 @@ export const getUserCredentials = (clientEnv: ClientEnv = env): User | null => {
+     return null
+   }
+ }
++
++/**
++ * Claude OAuth credentials stored in the credentials file.
++ */
++export interface ClaudeOAuthCredentials {
++  accessToken: string
++  refreshToken: string
++  expiresAt: number // Unix timestamp in milliseconds
++  connectedAt: number // Unix timestamp in milliseconds
++}
++
++/**
++ * Get Claude OAuth credentials from file or environment variable.
++ * Environment variable takes precedence.
++ * @returns 
+
+… [diff truncated: view full diff on GitHub] …

@@ -1,0 +1,298 @@
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 629fe87e0..25f318d71 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -867,6 +867,12 @@ export async function loopAgentSteps(
+       },
+       'Agent execution failed',
+     )
++
++    // Re-throw NetworkError to allow SDK retry wrapper to handle it
++    if (error instanceof Error && error.name === 'NetworkError') {
++      throw error
++    }
++
+     const errorMessage = typeof error === 'string' ? error : `${error}`
+ 
+     const status = checkLiveUserInput(params) ? 'failed' : 'cancelled'
+@@ -880,12 +886,6 @@ export async function loopAgentSteps(
+       errorMessage,
+     })
+ 
+-    // Re-throw NetworkError so retry logic can handle it
+-    // For other error types, wrap in error output for graceful handling
+-    if (error && typeof error === 'object' && 'code' in error && 'name' in error && error.name === 'NetworkError') {
+-      throw error
+-    }
+-
+     const errorObject = getErrorObject(error)
+     return {
+       agentState: currentAgentState,
+diff --git a/sdk/src/__tests__/run-with-retry.test.ts b/sdk/src/__tests__/run-with-retry.test.ts
+index a571558c6..c4b73d1fc 100644
+--- a/sdk/src/__tests__/run-with-retry.test.ts
++++ b/sdk/src/__tests__/run-with-retry.test.ts
+@@ -19,7 +19,7 @@ describe('run retry wrapper', () => {
+   })
+ 
+   it('returns immediately on success without retrying', async () => {
+-    const expectedState = { output: { type: 'success' } } as RunState
++    const expectedState = { sessionState: {} as any, output: { type: 'lastMessage', value: 'hi' } } as RunState
+     const runSpy = spyOn(runModule, 'runOnce').mockResolvedValueOnce(expectedState)
+ 
+     const result = await run(baseOptions)
+@@ -29,7 +29,7 @@ describe('run retry wrapper', () => {
+   })
+ 
+   it('retries once on retryable network error and then succeeds', async () => {
+-    const expectedState = { output: { type: 'success' } } as RunState
++    const expectedState = { sessionState: {} as any, output: { type: 'lastMessage', value: 'hi' } } as RunState
+     const runSpy = spyOn(runModule, 'runOnce')
+       .mockRejectedValueOnce(
+         new NetworkError('temporary', ErrorCodes.NETWORK_ERROR),
+@@ -91,7 +91,7 @@ describe('run retry wrapper', () => {
+   })
+ 
+   it('retries when provided custom retryableErrorCodes set', async () => {
+-    const expectedState = { output: { type: 'success' } } as RunState
++    const expectedState = { sessionState: {} as any, output: { type: 'lastMessage', value: 'hi' } } as RunState
+     const runSpy = spyOn(runModule, 'runOnce')
+       .mockRejectedValueOnce(
+         new NetworkError('temporary', ErrorCodes.SERVER_ERROR),
+diff --git a/sdk/src/run-state.ts b/sdk/src/run-state.ts
+index f732239f6..8be2dfced 100644
+--- a/sdk/src/run-state.ts
++++ b/sdk/src/run-state.ts
+@@ -27,7 +27,7 @@ import type {
+ import type * as fsType from 'fs'
+ 
+ export type RunState = {
+-  sessionState: SessionState
++  sessionState?: SessionState
+   output: AgentOutput
+ }
+ 
+@@ -459,7 +459,9 @@ export function withAdditionalMessage({
+ }): RunState {
+   const newRunState = cloneDeep(runState)
+ 
+-  newRunState.sessionState.mainAgentState.messageHistory.push(message)
++  if (newRunState.sessionState) {
++    newRunState.sessionState.mainAgentState.messageHistory.push(message)
++  }
+ 
+   return newRunState
+ }
+@@ -474,7 +476,9 @@ export function withMessageHistory({
+   // Deep copy
+   const newRunState = JSON.parse(JSON.stringify(runState)) as typeof runState
+ 
+-  newRunState.sessionState.mainAgentState.messageHistory = messages
++  if (newRunState.sessionState) {
++    newRunState.sessionState.mainAgentState.messageHistory = messages
++  }
+ 
+   return newRunState
+ }
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 1c86a33ed..26670edc2 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -274,7 +274,15 @@ export async function run(
+   let attemptIndex = 0
+   while (true) {
+     if (signal?.aborted) {
+-      throw createAbortError(signal)
++      // Return error output for abort instead of throwing
++      const abortError = createAbortError(signal)
++      return {
++        sessionState: rest.previousRun?.sessionState,
++        output: {
++          type: 'error',
++          message: abortError.message,
++        },
++      }
+     }
+ 
+     try {
+@@ -283,6 +291,66 @@ export async function run(
+         signal,
+       })
+ 
++      // Check if result contains a retryable error in the output
++      if (result.output.type === 'error') {
++        const retryableCode = getRetryableErrorCode(result.output.message)
++        const canRetry =
++          retryableCode &&
++          attemptIndex < retryOptions.maxRetries &&
++          retryOptions.retryableErrorCodes.has(retryableCode)
++
++        if (canRetry) {
++          // Treat this as a retryable error - continue retry loop
++          const delayMs = Math.min(
++            retryOptions.backoffBaseMs * Math.pow(2, attemptIndex),
++            retryOptions.backoffMaxMs,
++          )
++
++          // Log retry attempt with full context
++          if (rest.logger) {
++            rest.logger.warn(
++              {
++                attempt: attemptIndex + 1,
++                maxRetries: retryOptions.maxRetries,
++                delayMs,
++                errorCode: retryableCode,
++                errorMessage: result.output.message,
++              },
++              'SDK retrying after error',
++            )
++          }
++
++          await retryOptions.onRetry?.({
++            attempt: attemptIndex + 1,
++            error: new Error(result.output.message),
++            delayMs,
++            errorCode: retryableCode,
++          })
++
++          await waitWithAbort(delayMs, signal)
++          attemptIndex++
++          continue
++        } else if (attemptIndex > 0) {
++          // Non-retryable error or exhausted retries
++          if (rest.logger) {
++            rest.logger.warn(
++              {
++                attemptIndex,
++                totalAttempts: attemptIndex + 1,
++                errorCode: retryableCode,
++              },
++              'SDK exhausted all retries',
++            )
++          }
++
++          await retryOptions.onRetryExhausted?.({
++            totalAttempts: attemptIndex + 1,
++            error: new Error(result.output.message),
++            errorCode: retryableCode ?? undefined,
++          })
++        }
++      }
++
+       // Log successful completion after retries
+       if (attemptIndex > 0 && rest.logger) {
+         rest.logger.info(
+@@ -293,63 +361,86 @@ export async function run(
+ 
+       return result
+     } catch (error) {
++      // Handle unexpected exceptions by converting to error output
+       if (signal?.aborted) {
+-        throw createAbortError(signal)
++        const abortError = createAbortError(signal)
++        return {
++          sessionState: rest.previousRun?.sessionState,
++          output: {
++            type: 'error',
++            message: abortError.message,
++          },
++        }
+       }
+ 
++      // Unexpected exception - convert to error output and check if retryable
++      const errorMessage = error instanceof Error ? error.message : String(error)
++      const errorCode = isNetworkError(error) ? error.code : undefined
++      const retryableCode = errorCode ?? getRetryableErrorCode(errorMessage)
++
+       const canRetry =
++        retryableCode &&
+         attemptIndex < retryOptions.maxRetries &&
+-        shouldRetry(error, retryOptions.retryableErrorCodes)
++        retryOptions.retryableErrorCodes.has(retryableCode)
+ 
+-      const errorCode = isNetworkError(error) ? error.code : undefined
++      if (rest.logger) {
++        rest.logger.error(
++          {
++            attemptIndex,
++            errorCode: retryableCode,
++            canRetry,
++            error: errorMessage,
++          },
++          'Unexpected exception in SDK run',
++        )
++      }
+ 
+       if (!canRetry) {
+-        // Notify caller that SDK exhausted all retries
+-        if (attemptIndex > 0) {
+-          if (rest.logger) {
+-            rest.logger.warn(
+-              {
+-                attemptIndex,
+-                totalAttempts: attemptIndex + 1,
+-                errorCode,
+-              },
+-              'SDK exhausted all retries',
+-            )
+-          }
++        // Can't retry - convert to error output and return
++        if (attemptIndex > 0 && rest.logger) {
++          rest.logger.warn(
++            {
++              attemptIndex,
++              totalAttempts: attemptIndex + 1,
++            },
++            'SDK exhausted all retries after unexpected exception',
++          )
++        }
+ 
+-          await retryOptions.onRetryExhausted?.({
+-            totalAttempts: attemptIndex + 1,
+-            error,
+-            errorCode,
+-          })
++        // Return error output instead of throwing
++        return {
++          sessionState: rest.previousRun?.sessionState,
++          output: {
++            type: 'error',
++            message: errorMessage,
++          },
+         }
+-        throw error
+       }
+ 
++      // Exception is retryable - trigger retry
+       const delayMs = Math.min(
+         retryOptions.backoffBaseMs * Math.pow(2, attemptIndex),
+         retryOptions.backoffMaxMs,
+       )
+ 
+-      // Log retry attempt with full context
+       if (rest.logger) {
+         rest.logger.warn(
+           {
+             attempt: attemptIndex + 1,
+             maxRetries: retryOptions.maxRetries,
+             delayMs,
+-            errorCode,
+-            errorMessage: error instanceof Error ? error.message : String(error),
++            errorCode: retryableCode,
++            errorMessage,
+           },
+-          'SDK retrying after error',
++          'SDK retrying after unexpected exception',
+         )
+       }
+ 
+       await retryOptions.onRetry?.({
+         attempt: attemptIndex + 1,
+-        error,
++        error: error instanceof Error ? error : new Error(errorMessage),
+         delayMs,
+-        errorCode,
++        errorCode: retryableCode,
+       })
+ 
+       await waitWithAbort(delayMs, signal)

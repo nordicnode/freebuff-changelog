@@ -1,0 +1,1344 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 8366358e5..6f5ce2951 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -150,7 +150,13 @@ jobs:
+                 echo "No regular tests found in .agents"
+               fi
+             elif [ "${{ matrix.package }}" = "web" ]; then
+-              bun run test --runInBand
++              # Use bun test directly to pick up bunfig.toml preloads for Request global
++              TEST_FILES=$(find src -name '*.test.ts' ! -name '*.integration.test.ts' ! -path 'src/__tests__/e2e/*' 2>/dev/null | sort | tr '\n' ' ')
++              if [ -n "$TEST_FILES" ]; then
++                bun test $TEST_FILES
++              else
++                echo "No tests found in web"
++              fi
+             else
+               # Run all non-integration tests in a single bun test invocation
+               # This avoids xargs exit code issues with orphaned child processes
+diff --git a/bunfig.toml b/bunfig.toml
+index 87aea9fae..7068677e5 100644
+--- a/bunfig.toml
++++ b/bunfig.toml
+@@ -7,4 +7,4 @@ linkWorkspacePackages = true
+ [test]
+ # Exclude test repositories, integration tests, and Playwright e2e tests from test execution by default
+ exclude = ["evals/test-repos/**", "**/*.integration.test.*", "web/src/__tests__/e2e/**"]
+-preload = ["./sdk/test/setup-env.ts", "./test/setup-bigquery-mocks.ts"]
++preload = ["./sdk/test/setup-env.ts", "./test/setup-bigquery-mocks.ts", "./web/test/setup-globals.ts"]
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index 9e373227c..77674e0af 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -35,6 +35,7 @@ import { useChatState } from './hooks/use-chat-state'
+ import { useChatStreaming } from './hooks/use-chat-streaming'
+ import { useChatUI } from './hooks/use-chat-ui'
+ import { useClaudeQuotaQuery } from './hooks/use-claude-quota-query'
++import { useSubscriptionQuery } from './hooks/use-subscription-query'
+ import { useClipboard } from './hooks/use-clipboard'
+ import { useEvent } from './hooks/use-event'
+ import { useGravityAd } from './hooks/use-gravity-ad'
+@@ -57,6 +58,7 @@ import { getClaudeOAuthStatus } from './utils/claude-oauth'
+ import { showClipboardMessage } from './utils/clipboard'
+ import { readClipboardImage } from './utils/clipboard-image'
+ import { getInputModeConfig } from './utils/input-modes'
++
+ import {
+   type ChatKeyboardState,
+   createDefaultChatKeyboardState,
+@@ -161,6 +163,11 @@ export const Chat = ({
+   const { statusMessage } = useClipboard()
+   const { ad } = useGravityAd()
+ 
++  // Fetch subscription data early - needed for session credits tracking
++  const { data: subscriptionData } = useSubscriptionQuery({
++    refetchInterval: 60 * 1000,
++  })
++
+   // Set initial mode from CLI flag on mount
+   useEffect(() => {
+     if (initialMode) {
+@@ -425,6 +432,7 @@ export const Chat = ({
+     resumeQueue,
+     continueChat,
+     continueChatId,
++    subscriptionData,
+   })
+ 
+   sendMessageRef.current = sendMessage
+@@ -1278,6 +1286,26 @@ export const Chat = ({
+     refetchInterval: 60 * 1000, // Refetch every 60 seconds
+   })
+ 
++  // Auto-show subscription limit banner when rate limit becomes active
++  const subscriptionLimitShownRef = useRef(false)
++  const subscriptionRateLimit = subscriptionData?.hasSubscription ? subscriptionData.rateLimit : undefined
++  const fallbackToALaCarte = subscriptionData?.fallbackToALaCarte ?? false
++  useEffect(() => {
++    const isLimited = subscriptionRateLimit?.limited === true
++    if (isLimited && !subscriptionLimitShownRef.current) {
++      subscriptionLimitShownRef.current = true
++      // Skip showing the banner if user prefers to always fall back to a-la-carte
++      if (!fallbackToALaCarte) {
++        useChatStore.getState().setInputMode('subscriptionLimit')
++      }
++    } else if (!isLimited) {
++      subscriptionLimitShownRef.current = false
++      if (useChatStore.getState().inputMode === 'subscriptionLimit') {
++        useChatStore.getState().setInputMode('default')
++      }
++    }
++  }, [subscriptionRateLimit?.limited, fallbackToALaCarte])
++
+   const inputBoxTitle = useMemo(() => {
+     const segments: string[] = []
+ 
+diff --git a/cli/src/commands/command-registry.ts b/cli/src/commands/command-registry.ts
+index 9fa76b32c..1d990c7ae 100644
+--- a/cli/src/commands/command-registry.ts
++++ b/cli/src/commands/command-registry.ts
+@@ -382,6 +382,14 @@ export const COMMAND_REGISTRY: CommandDefinition[] = [
+       clearInput(params)
+     },
+   }),
++  defineCommand({
++    name: 'subscribe',
++    aliases: ['strong'],
++    handler: (params) => {
++      open(WEBSITE_URL + '/pricing')
++      clearInput(params)
++    },
++  }),
+   defineCommand({
+     name: 'buy-credits',
+     handler: (params) => {
+diff --git a/cli/src/components/bottom-status-line.tsx b/cli/src/components/bottom-status-line.tsx
+index a16c93437..bb876b88f 100644
+--- a/cli/src/components/bottom-status-line.tsx
++++ b/cli/src/components/bottom-status-line.tsx
+@@ -16,7 +16,7 @@ interface BottomStatusLineProps {
+ 
+ /**
+  * Bottom status line component - shows below the input box
+- * Currently displays Claude subscription status when connected
++ * Displays Claude subscription status and/or Codebuff Strong status
+  */
+ export const BottomStatusLine: React.FC<BottomStatusLineProps> = ({
+   isClaudeConnected,
+@@ -25,28 +25,28 @@ export const BottomStatusLine: React.FC<BottomStatusLineProps> = ({
+ }) => {
+   const theme = useTheme()
+ 
+-  // Don't render if there's nothing to show
+-  if (!isClaudeConnected) {
+-    return null
+-  }
+-
+   // Use the more restrictive of the two quotas (5-hour window is usually the limiting factor)
+-  const displayRemaining = claudeQuota
++  const claudeDisplayRemaining = claudeQuota
+     ? Math.min(claudeQuota.fiveHourRemaining, claudeQuota.sevenDayRemaining)
+     : null
+ 
+-  // Check if quota is exhausted (0%)
+-  const isExhausted = displayRemaining !== null && displayRemaining <= 0
++  // Check if Claude quota is exhausted (0%)
++  const isClaudeExhausted = claudeDisplayRemaining !== null && claudeDisplayRemaining <= 0
+ 
+-  // Get the reset time for the limiting quota window
+-  const resetTime = claudeQuota
++  // Get the reset time for the limiting Claude quota window
++  const claudeResetTime = claudeQuota
+     ? claudeQuota.fiveHourRemaining <= claudeQuota.sevenDayRemaining
+       ? claudeQuota.fiveHourResetsAt
+       : claudeQuota.sevenDayResetsAt
+     : null
+ 
+-  // Determine dot color: red if exhausted, green if active, muted otherwise
+-  const dotColor = isExhausted
++  // Only show when Claude is connected
++  if (!isClaudeConnected) {
++    return null
++  }
++
++  // Determine dot color for Claude: red if exhausted, green if active, muted otherwise
++  const claudeDotColor = isClaudeExhausted
+     ? theme.error
+     : isClaudeActive
+       ? theme.success
+@@ -59,23 +59,42 @@ export const BottomStatusLine: React.FC<BottomStatusLineProps> = ({
+         flexDirection: 'row',
+         justifyContent: 'flex-end',
+         paddingRight: 1,
++        gap: 2,
+       }}
+     >
+-      <box
+-        style={{
+-          flexDirection: 'row',
+-          alignItems: 'center',
+-          gap: 0,
+-        }}
+-      >
+-        <text style={{ fg: dotColor }}>●</text>
+-        <text style={{ fg: theme.muted }}> Claude subscription</text>
+-        {isExhausted && resetTime ? (
+-          <text style={{ fg: theme.muted }}>{` · resets in ${formatResetTime(resetTime)}`}</text>
+-        ) : displayRemaining !== null ? (
+-          <BatteryIndicator value={displayRemaining} theme={theme} />
+-        ) : null}
+-      </box>
++      {/* Show Claude subscription when connected and not depleted */}
++      {!isClaudeExhausted && (
++        <box
++          style={{
++            flexDirection: 'row',
++            alignItems: 'center',
++            gap: 0,
++          }}
++        >
++          <text style={{ fg: claudeDotColor }}>●</text>
++          <text style={{ fg: theme.muted }}> Claude subscription</text>
++          {claudeDisplayRemaining !== null ? (
++            <BatteryIndicator value={claudeDisplayRemaining} theme={theme} />
++          ) : null}
++        </box>
++      )}
++
++      {/* Show Claude as depleted when exhausted */}
++      {isClaudeExhausted && (
++        <box
++          style={{
++            flexDirection: 'row',
++            alignItems: 'center',
++            gap: 0,
++          }}
++        >
++          <text style={{ fg: theme.error }}>●</text>
++          <text style={{ fg: theme.muted }}> Claude</text>
++          {claudeResetTime && (
++            <text style={{ fg: theme.muted }}>{` · resets in ${formatResetTime(claudeResetTime)}`}</text>
++          )}
++        </box>
++      )}
+     </box>
+   )
+ }
+diff --git a/cli/src/components/input-mode-banner.tsx b/cli/src/components/input-mode-banner.tsx
+index e73b74f8a..1a69ff03d 100644
+--- a/cli/src/components/input-mode-banner.tsx
++++ b/cli/src/components/input-mode-banner.tsx
+@@ -4,6 +4,7 @@ import { ClaudeConnectBanner } from './claude-connect-banner'
+ import { HelpBanner } from './help-banner'
+ import { PendingAttachmentsBanner } from './pending-attachments-banner'
+ import { ReferralBanner } from './referral-banner'
++import { SubscriptionLimitBanner } from './subscription-limit-banner'
+ import { UsageBanner } from './usage-banner'
+ import { useChatStore } from '../state/chat-store'
+ 
+@@ -26,6 +27,7 @@ const BANNER_REGISTRY: Record<
+   referral: () => <ReferralBanner />,
+   help: () => <HelpBanner />,
+   'connect:claude': () => <ClaudeConnectBanner />,
++  subscriptionLimit: () => <SubscriptionLimitBanner />,
+ }
+ 
+ /**
+diff --git a/cli/src/components/message-footer.tsx b/cli/src/components/message-footer.tsx
+index 13c2b3e9c..678611302 100644
+--- a/cli/src/components/message-footer.tsx
++++ b/cli/src/components/message-footer.tsx
+@@ -1,3 +1,4 @@
++import { SUBSCRIPTION_DISPLAY_NAME } from '@codebuff/common/constants/subscription-plans'
+ import { pluralize } from '@codebuff/common/util/string'
+ import { TextAttributes } from '@opentui/core'
+ import React, { useCallback, useMemo } from 'react'
+@@ -5,6 +6,11 @@ import React, { useCallback, useMemo } from 'react'
+ import { CopyButton } from './copy-button'
+ import { ElapsedTimer } from './elapsed-timer'
+ import { FeedbackIconButton } from './feedback-icon-button'
++import { useSubscriptionQuery } from '../hooks/use-subscription-query'
++import {
++  getBlockPercentRemaining,
++  isCoveredBySubscription,
++} from '../utils/subscription'
+ import { useTheme } from '../hooks/use-theme'
+ import {
+   useFeedbackStore,
+@@ -157,19 +163,7 @@ export const MessageFooter: React.FC<MessageFooterProps> = ({
+   if (typeof credits === 'number' && credits > 0) {
+     footerItems.push({
+       key: 'credits',
+-      node: (
+-        <text
+-          attributes={TextAttributes.DIM}
+-          style={{
+-            wrapMode: 'none',
+-            fg: theme.secondary,
+-            marginTop: 0,
+-            marginBottom: 0,
+-          }}
+-        >
+-          {pluralize(credits, 'credit')}
+-        </text>
+-      ),
++      node: <CreditsOrSubscriptionIndicator credits={credits} />,
+     })
+   }
+   if (shouldRenderFeedbackButton) {
+@@ -222,3 +216,42 @@ export const MessageFooter: React.FC<MessageFooterProps> = ({
+     </box>
+   )
+ }
++
++const CreditsOrSubscriptionIndicator: React.FC<{ credits: number }> = ({ credits }) => {
++  const theme = useTheme()
++  const { data: subscriptionData } = useSubscriptionQuery({
++    refetchInterval: false,
++    refetchOnActivity: false,
++    pauseWhenIdle: false,
++  })
++
++  const blockPercentRemaining = useMemo(
++    () => getBlockPercentRemaining(subscriptionData),
++    [subscriptionData],
++  )
++
++  const showSubscriptionIndicator = isCoveredBySubscription(subscriptionData)
++
++  if (showSubscriptionIndicator) {
++    const label = (blockPercentRemaining ?? 0) < 20
++      ? `✓ ${SUBSCRIPTION_DISPLAY_NAME} (${blockPercentRemaining}% left)`
++      : `✓ ${SUBSCRIPTION_DISPLAY_NAME}`
++    return (
++      <text
++        attributes={TextAttributes.DIM}
++        style={{ wrapMode: 'none', fg: theme.success, marginTop: 0, marginBottom: 0 }}
++      >
++        {label}
++      </text>
++    )
++  }
++
++  return (
++    <text
++      attributes={TextAttributes.DIM}
++      style={{ wrapMode: 'none', fg: theme.secondary, marginTop: 0, marginBottom: 0 }}
++    >
++      {pluralize(credits, 'credit')}
++    </text>
++  )
++}
+diff --git a/cli/src/components/progress-bar.tsx b/cli/src/components/progress-bar.tsx
+index acc11fac9..e9e18353d 100644
+--- a/cli/src/components/progress-bar.tsx
++++ b/cli/src/components/progress-bar.tsx
+@@ -72,7 +72,7 @@ export const ProgressBar: React.FC<ProgressBarProps> = ({
+     <box style={{ flexDirection: 'row', alignItems: 'center', gap: 0 }}>
+       {label && <text style={{ fg: theme.muted }}>{label} </text>}
+       <text style={{ fg: barColor }}>{filled}</text>
+-      <text style={{ fg: theme.muted }}>{empty}</text>
++      {emptyWidth > 0 && <text style={{ fg: theme.muted }}>{empty}</text>}
+       {showPercentage && (
+         <text style={{ fg: textColor }}> {Math.round(clampedValue)}%</text>
+       )}
+diff --git a/cli/src/components/subscription-limit-banner.tsx b/cli/src/components/subscription-limit-banner.tsx
+new file mode 100644
+index 000000000..4f9a16686
+--- /dev/null
++++ b/cli/src/components/subscription-limit-banner.tsx
+@@ -0,0 +1,181 @@
++import { SUBSCRIPTION_TIERS } from '@codebuff/common/constants/subscription-plans'
++import open from 'open'
++import React from 'react'
++
++import { Button } from './button'
++import { ProgressBar } from './progress-bar'
++import { useSubscriptionQuery } from '../hooks/use-subscription-query'
++import { useTheme } from '../hooks/use-theme'
++import { useUpdatePreference } from '../hooks/use-update-preference'
++import { useUsageQuery } from '../hooks/use-usage-query'
++import { WEBSITE_URL } from '../login/constants'
++import { useChatStore } from '../state/chat-store'
++import { formatResetTime } from '../utils/time-format'
++import { BORDER_CHARS } from '../utils/ui-constants'
++
++export const SubscriptionLimitBanner = () => {
++  const setInputMode = useChatStore((state) => state.setInputMode)
++  const theme = useTheme()
++
++  const { data: subscriptionData } = useSubscriptionQuery({
++    refetchInterval: 15 * 1000,
++  })
++
++  const { data: usageData } = useUsageQuery({
++    enabled: true,
++    refetchInterval: 30 * 1000,
++  })
++
++  const rateLimit = subscriptionData?.hasSubscription ? subscriptionData.rateLimit : undefined
++  const remainingBalance = usageData?.remainingBalance ?? 0
++  const hasAlaCarteCredits = remainingBalance > 0
++
++  // Determine if user can upgrade (not on highest tier)
++  const maxTier = Math.max(...Object.keys(SUBSCRIPTION_TIERS).map(Number))
++  const currentTier = subscriptionData?.hasSubscription ? subscriptionData.subscription.tier : 0
++  const canUpgrade = currentTier < maxTier
++
++  const fallbackToALaCarte = subscriptionData?.fallbackToALaCarte ?? false
++  const updatePreference = useUpdatePreference()
++
++  const handleToggleFallbackToALaCarte = () => {
++    updatePreference.mutate({ fallbackToALaCarte: !fallbackToALaCarte })
++  }
++
++  if (!subscriptionData || !rateLimit?.limited) {
++    return null
++  }
++
++  const { reason, weeklyPercentUsed, weeklyResetsAt: weeklyResetsAtStr, blockResetsAt: blockResetsAtStr } = rateLimit
++  const isWeeklyLimit = reason === 'weekly_limit'
++  const isBlockExhausted = reason === 'block_exhausted'
++  const weeklyRemaining = 100 - weeklyPercentUsed
++  const weeklyResetsAt = weeklyResetsAtStr ? new Date(weeklyResetsAtStr) : null
++  const blockResetsAt = blockResetsAtStr ? new Date(blockResetsAtStr) : null
++
++  const handleContinueWithCredits = () => {
++    setInputMode('default')
++  }
++
++  const handleBuyCredits = () => {
++    open(WEBSITE_URL + '/usage')
++  }
++
++  const handleUpgrade = () => {
++    open(WEBSITE_URL + '/pricing')
++  }
++
++  const handleWait = () => {
++    setInputMode('default')
++  }
++
++  const borderColor = isWeeklyLimit ? theme.error : theme.warning
++
++  return (
++    <box
++      style={{
++        width: '100%',
++        borderStyle: 'single',
++        borderColor,
++        customBorderChars: BORDER_CHARS,
++        paddingLeft: 1,
++        paddingRight: 1,
++        paddingTop: 0,
++        paddingBottom: 0,
++        flexDirection: 'column',
++        gap: 0,
++      }}
++    >
++      <box
++        style={{
++          flexDirection: 'column',
++          justifyContent: 'center',
++          minHeight: 3,
++          gap: 0,
++        }}
++      >
++        {isWeeklyLimit ? (
++          <>
++            <text style={{ fg: theme.error, marginBottom: 1 }}>
++              🛑 Weekly limit reached
++            </text>
++            <text style={{ fg: theme.muted }}>
++              You've used all {rateLimit.weeklyLimit.toLocaleString()} credits for this week.
++            </text>
++            {weeklyResetsAt && (
++              <text style={{ fg: theme.muted }}>
++                Weekly usage resets in {formatResetTime(weeklyResetsAt)}
++              </text>
++            )}
++          </>
++        ) : isBlockExhausted ? (
++          <>
++            <text style={{ fg: theme.warning, marginBottom: 1 }}>
++              5 hour limit reached
++            </text>
++            {blockResetsAt && (
++              <text style={{ fg: theme.muted }}>
++                New session starts in {formatResetTime(blockResetsAt)}
++              </text>
++            )}
++          </>
++        ) : (
++          <text style={{ fg: theme.warning }}>
++            Subscription limit reached
++          </text>
++        )}
++
++        <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1, marginTop: 0 }}>
++          <text style={{ fg: theme.muted }}>Weekly:</text>
++          <ProgressBar value={weeklyRemaining} width={12} showPercentage={false} />
++          <text style={{ fg: theme.muted }}>{weeklyPercentUsed}% used</text>
++        </box>
++
++        {hasAlaCarteCredits && (
++          <Button onClick={handleToggleFallbackToALaCarte} disabled={updatePreference.isPending}>
++            <text style={{ fg: theme.muted }}>
++              {updatePreference.isPending ? '[...]' : fallbackToALaCarte ? '[x]' : '[ ]'} always use credits if subscription limit is reached
++            </text>
++          </Button>
++        )}
++
++        <box style={{ flexDirection: 'row', gap: 2, marginTop: 1 }}>
++          {hasAlaCarteCredits ? (
++            <>
++              <Button onClick={handleContinueWithCredits}>
++                <text style={{ fg: theme.background, bg: theme.foreground }}>
++                  {' '}Continue with credits ({remainingBalance.toLocaleString()}){' '}
++                </text>
++              </Button>
++              {canUpgrade ? (
++                <Button onClick={handleUpgrade}>
++                  <text style={{ fg: theme.background, bg: theme.foreground }}>{' '}Upgrade Plan ↗{' '}</text>
++                </Button>
++              ) : (
++                <Button onClick={handleBuyCredits}>
++                  <text style={{ fg: theme.background, bg: theme.muted }}>{' '}Buy Credits ↗{' '}</text>
++                </Button>
++              )}
++            </>
++          ) : (
++            <>
++              <text style={{ fg: theme.muted }}>No a-la-carte credits available.</text>
++              {canUpgrade ? (
++                <Button onClick={handleUpgrade}>
++                  <text style={{ fg: theme.background, bg: theme.muted }}>{' '}Upgrade Plan ↗{' '}</text>
++                </Button>
++              ) : (
++                <Button onClick={handleBuyCredits}>
++                  <text style={{ fg: theme.background, bg: theme.muted }}>{' '}Buy Credits ↗{' '}</text>
++                </Button>
++              )}
++              <Button onClick={handleWait}>
++                <text style={{ fg: theme.background, bg: theme.muted }}>{' '}Wait{' '}</text>
++              </Button>
++            </>
++          )}
++        </box>
++      </box>
++    </box>
++  )
++}
+diff --git a/cli/src/components/usage-banner.tsx b/cli/src/components/usage-banner.tsx
+index 1a86a231e..7f58741d6 100644
+--- a/cli/src/components/usage-banner.tsx
++++ b/cli/src/components/usage-banner.tsx
+@@ -1,17 +1,20 @@
+ import { isClaudeOAuthValid } from '@codebuff/sdk'
++import { TextAttributes } from '@opentui/core'
+ import open from 'open'
+-import React, { useEffect } from 'react'
++import React, { useEffect, useMemo } from 'react'
+ 
+ import { BottomBanner } from './bottom-banner'
+ import { Button } from './button'
+ import { ProgressBar } from './progress-bar'
+ import { getActivityQueryData } from '../hooks/use-activity-query'
+ import { useClaudeQuotaQuery } from '../hooks/use-claude-quota-query'
++import { useSubscriptionQuery } from '../hooks/use-subscription-query'
+ import { useTheme } from '../hooks/use-theme'
++import { useUpdatePreference } from '../hooks/use-update-preference'
+ import { usageQueryKeys, useUsageQuery } from '../hooks/use-usage-query'
+ import { WEBSITE_URL } from '../login/constants'
+ import { useChatStore } from '../state/chat-store'
+-import { formatResetTime } from '../utils/time-format'
++import { formatResetTime, formatResetTimeLong } from '../utils/time-format'
+ import {
+   getBannerColorLevel,
+   generateLoadingBannerText,
+@@ -31,13 +34,13 @@ const formatRenewalDate = (dateStr: string | null): string => {
+   const isToday = resetDate.toDateString() === today.toDateString()
+   return isToday
+     ? resetDate.toLocaleString('en-US', {
+-        hour: 'numeric',
+-        minute: '2-digit',
+-      })
++      hour: 'numeric',
++      minute: '2-digit',
++    })
+     : resetDate.toLocaleDateString('en-US', {
+-        month: 'short',
+-        day: 'numeric',
+-      })
++      month: 'short',
++      day: 'numeric',
++    })
+ }
+ 
+ export const UsageBanner = ({ showTime }: { showTime: number }) => {
+@@ -53,6 +56,11 @@ export const UsageBanner = ({ showTime }: { showTime: number }) => {
+     refetchInterval: 30 * 1000, // Refresh every 30 seconds when banner is open
+   })
+ 
++  // Fetch subscription data
++  const { data: subscriptionData, isLoading: isSubscriptionLoading } = useSubscriptionQuery({
++    refetchInterval: 30 * 1000,
++  })
++
+   const {
+     data: apiData,
+     isLoading,
+@@ -99,12 +107,25 @@ export const UsageBanner = ({ showTime }: { showTime: number }) => {
+   const adCredits = activeData.balanceBreakdown?.ad
+   const renewalDate = activeData.next_quota_reset ? formatRenewalDate(activeData.next_quota_reset) : null
+ 
++  const activeSubscription = subscriptionData?.hasSubscription ? subscriptionData : null
++  const { rateLimit, subscription: subscriptionInfo, displayName } = activeSubscription ?? {}
++
+   return (
+     <BottomBanner
+       borderColorKey={isLoadingData ? 'muted' : colorLevel}
+       onClose={() => setInputMode('default')}
+     >
+       <box style={{ flexDirection: 'column', gap: 0 }}>
++        {activeSubscription && (
++          <SubscriptionUsageSection
++            displayName={displayName}
++            subscriptionInfo={subscriptionInfo}
++            rateLimit={rateLimit}
++            isLoading={isSubscriptionLoading}
++            fallbackToALaCarte={activeSubscription.fallbackToALaCarte ?? false}
++          />
++        )}
++
+         {/* Codebuff credits section - structured layout */}
+         <Button
+           onClick={() => {
+@@ -115,20 +136,20 @@ export const UsageBanner = ({ showTime }: { showTime: number }) => {
+             {/* Main stats row */}
+             <box style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 1 }}>
+               <text style={{ fg: theme.muted }}>Session:</text>
+-              <text style={{ fg: theme.foreground }}>{sessionCreditsUsed.toLocaleString()}</text>
++              <text style={{ fg: theme.foreground }}>{sessionCreditsUsed.toLocaleString()} credits</text>
+               <text style={{ fg: theme.muted }}>·</text>
+               <text style={{ fg: theme.muted }}>Remaining:</text>
+               {isLoadingData ? (
+                 <text style={{ fg: theme.muted }}>...</text>
+               ) : (
+                 <text style={{ fg: theme.foreground }}>
+-                  {activeData.remainingBalance?.toLocaleString() ?? '?'}
++                  {activeData.remainingBalance?.toLocaleString() ?? '?'} credits
+                 </text>
+               )}
+               {adCredits != null && adCredits > 0 && (
+                 <text style={{ fg: theme.muted }}>{`(${adCredits} from ads)`}</text>
+               )}
+-              {renewalDate && (
++              {!activeSubscription && renewalDate && (
+                 <>
+                   <text style={{ fg: theme.muted }}>· Renews:</text>
+                   <text style={{ fg: theme.foreground }}>{renewalDate}</text>
+@@ -136,7 +157,7 @@ export const UsageBanner = ({ showTime }: { showTime: number }) => {
+               )}
+             </box>
+             {/* See more link */}
+-            <text style={{ fg: theme.muted }}>↗ See more on {WEBSITE_URL}</text>
++            <text style={{ fg: theme.muted }}>See more on {WEBSITE_URL} ↗</text>
+           </box>
+         </Button>
+ 
+@@ -177,3 +198,85 @@ export const UsageBanner = ({ showTime }: { showTime: number }) => {
+     </BottomBanner>
+   )
+ }
++
++interface SubscriptionUsageSectionProps {
++  displayName?: string
++  subscriptionInfo?: { tier: number }
++  rateLimit?: {
++    blockLimit?: number
++    blockUsed?: number
++    blockResetsAt?: string
++    weeklyPercentUsed: number
++    weeklyResetsAt: string
++  }
++  isLoading: boolean
++  fallbackToALaCarte: boolean
++}
++
++const SubscriptionUsageSection: React.FC<SubscriptionUsageSectionProps> = ({
++  displayName,
++  subscriptionInfo,
++  rateLimit,
++  isLoading,
++  fallbackToALaCarte,
++}) => {
++  const theme = useTheme()
++  const updatePreference = useUpdatePreference()
++
++  const handleToggleFallbackToALaCarte = () => {
++    updatePreference.mutate({ fallbackToALaCarte: !fallbackToALaCarte })
++  }
++
++  const blockPercent = useMemo(() => {
++    if (rateLimit?.blockLimit == null || rateLimit.blockUsed == null) return 100
++    return Math.max(0, 100 - Math.round((rateLimit.blockUsed / rateLimit.blockLimit) * 100))
++  }, [rateLimit?.blockLimit, rateLimit?.blockUsed])
++
++  const weeklyPercent = rateLimit ? 100 - rateLimit.weeklyPercentUsed : 100
++
++  return (
++    <box style={{ flexDirection: 'column', marginBottom: 1 }}>
++      <box style={{ flexDirection: 'row', gap: 1 }}>
++        <text style={{ fg: theme.foreground }}>
++          💪 {displayName ?? 'Strong'} subscription
++        </text>
++        {subscriptionInfo?.tier && (
++          <text style={{ fg: theme.muted }}>${subscriptionInfo.tier}/mo</text>
++        )}
++      </box>
++      {isLoading ? (
++        <text style={{ fg: theme.muted }}>Loading subscription data...</text>
++      ) : rateLimit ? (
++        <box style={{ flexDirection: 'column', gap: 0 }}>
++          <box style={{ flexDirection: 'row', alignItems: 'center', gap: 0 }}>
++            <text style={{ fg: theme.muted }}>{`5-hour limit ${`${blockPercent}%`.padStart(4)} `}</text>
++            <ProgressBar value={blockPercent} width={12} showPercentage={false} />
++            <text style={{ fg: theme.muted }}>
++              {rateLimit.blockResetsAt
++                ? ` resets in ${formatResetTime(new Date(rateLimit.blockResetsAt))}`
++                : ''}
++            </text>
++          </box>
++          <box style={{ flexDirection: 'row', alignItems: 'center', gap: 0 }}>
++            <text style={{ fg: theme.muted }}>{`Weekly limit ${`${weeklyPercent}%`.padStart(4)} `}</text>
++            <ProgressBar value={weeklyPercent} width={12} showPercentage={false} />
++            <text style={{ fg: theme.muted }}>
++              {` resets in ${formatResetTimeLong(rateLimit.weeklyResetsAt)}`}
++            </text>
++          </box>
++        </box>
++      ) : null}
++      <box style={{ flexDirection: 'row', alignItems: 'center', gap: 1, marginTop: 1 }}>
++        <text style={{ fg: theme.muted }}>When limit reached:</text>
++        <text style={{ fg: theme.muted }}>
++          {fallbackToALaCarte ? 'spend credits' : 'pause'}
++        </text>
++        <Button onClick={handleToggleFallbackToALaCarte} disabled={updatePreference.isPending}>
++          <text style={{ fg: theme.muted, attributes: TextAttributes.UNDERLINE }}>
++            {updatePreference.isPending ? '[updating...]' : `[${fallbackToALaCarte ? 'switch to pause' : 'switch to spend credits'}]`}
++          </text>
++        </Button>
++      </box>
++    </box>
++  )
++}
+diff --git a/cli/src/data/slash-commands.ts b/cli/src/data/slash-commands.ts
+index 02e2ddd57..8c7deb050 100644
+--- a/cli/src/data/slash-commands.ts
++++ b/cli/src/data/slash-commands.ts
+@@ -73,6 +73,12 @@ export const SLASH_COMMANDS: SlashCommand[] = [
+     description: 'View credits and subscription quota',
+     aliases: ['credits'],
+   },
++  {
++    id: 'subscribe',
++    label: 'subscribe',
++    description: 'Subscribe to Codebuff Strong',
++    aliases: ['strong'],
++  },
+   {
+     id: 'buy-credits',
+     label: 'buy-credits',
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index 4411c79e8..9cc0b6cf0 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -38,6 +38,9 @@ import type { SendMessageFn } from '../types/contracts/send-message'
+ import type { AgentMode } from '../utils/constants'
+ import type { SendMessageTimerEvent } from '../utils/send-message-timer'
+ import type { AgentDefinition, MessageContent, RunState } from '@codebuff/sdk'
++import { isCoveredBySubscription } from '../utils/subscription'
++
++import type { SubscriptionResponse } from './use-subscription-query'
+ 
+ interface UseSendMessageOptions {
+   inputRef: React.MutableRefObject<any>
+@@ -59,6 +62,7 @@ interface UseSendMessageOptions {
+   resumeQueue?: () => void
+   continueChat: boolean
+   continueChatId?: string
++  subscriptionData?: SubscriptionResponse | null
+ }
+ 
+ // Choose the agent definition by explicit selection or mode-based fallback.
+@@ -109,6 +113,7 @@ export const useSendMessage = ({
+   resumeQueue,
+   continueChat,
+   continueChatId,
++  subscriptionData,
+ }: UseSendMessageOptions): {
+   sendMessage: SendMessageFn
+   clearMessages: () => void
+@@ -431,7 +436,11 @@ export const useSendMessage = ({
+           setIsRetrying,
+           onTotalCost: (cost: number) => {
+             actualCredits = cost
+-            addSessionCredits(cost)
++            // Only add to session credits if not covered by subscription
++            // (subscription credits are shown separately in the UI)
++            if (!isCoveredBySubscription(subscriptionData)) {
++              addSessionCredits(cost)
++            }
+           },
+         })
+ 
+diff --git a/cli/src/hooks/use-subscription-query.ts b/cli/src/hooks/use-subscription-query.ts
+new file mode 100644
+index 000000000..75ea01166
+--- /dev/null
++++ b/cli/src/hooks/use-subscription-query.ts
+@@ -0,0 +1,70 @@
++import { useActivityQuery } from './use-activity-query'
++import { getAuthToken } from '../utils/auth'
++import { getApiClient } from '../utils/codebuff-api'
++import { logger as defaultLogger } from '../utils/logger'
++
++import type { Logger } from '@codebuff/common/types/contracts/logger'
++import type { SubscriptionResponse } from '@codebuff/common/types/subscription'
++
++export type { SubscriptionResponse }
++
++export const subscriptionQueryKeys = {
++  all: ['subscription'] as const,
++  current: () => [...subscriptionQueryKeys.all, 'current'] as const,
++}
++
++export async function fetchSubscriptionData(
++  logger: Logger = defaultLogger,
++): Promise<SubscriptionResponse> {
++  const client = getApiClient()
++  const response = await client.get<SubscriptionResponse>(
++    '/api/user/subscription',
++    { includeCookie: true },
++  )
++
++  if (!response.ok) {
++    logger.debug(
++      { status: response.status },
++      'Failed to fetch subscription data',
++    )
++    throw new Error(`Failed to fetch subscription: ${response.status}`)
++  }
++
++  return response.data!
++}
++
++export interface UseSubscriptionQueryDeps {
++  logger?: Logger
++  enabled?: boolean
++  refetchInterval?: number | false
++  refetchOnActivity?: boolean
++  pauseWhenIdle?: boolean
++  idleThreshold?: number
++}
++
++export function useSubscriptionQuery(deps: UseSubscriptionQueryDeps = {}) {
++  const {
++    logger = defaultLogger,
++    enabled = true,
++    refetchInterval = 60 * 1000,
++    refetchOnActivity = true,
++    pauseWhenIdle = true,
++    idleThreshold = 30_000,
++  } = deps
++
++  const authToken = getAuthToken()
++
++  return useActivityQuery({
++    queryKey: subscriptionQueryKeys.current(),
++    queryFn: () => fetchSubscriptionData(logger),
++    enabled: enabled && !!authToken,
++    staleTime: 30 * 1000,
++    gcTime: 5 * 60 * 1000,
++    retry: 1,
++    refetchOnMount: true,
++    refetchInterval,
++    refetchOnActivity,
++    pauseWhenIdle,
++    idleThreshold,
++  })
++}
+diff --git a/cli/src/hooks/use-update-preference.ts b/cli/src/hooks/use-update-preference.ts
+new file mode 100644
+index 000000000..7c72f304b
+--- /dev/null
++++ b/cli/src/hooks/use-update-preference.ts
+@@ -0,0 +1,66 @@
++import { useCallback, useState } from 'react'
++
++import {
++  getActivityQueryData,
++  invalidateActivityQuery,
++  setActivityQueryData,
++} from './use-activity-query'
++import { subscriptionQueryKeys } from './use-subscription-query'
++import { showClipboardMessage } from '../utils/clipboard'
++import { getApiClient } from '../utils/codebuff-api'
++import { logger } from '../utils/logger'
++
++import type { SubscriptionResponse } from '@codebuff/common/types/subscription'
++
++interface UpdatePreferenceParams {
++  fallbackToALaCarte?: boolean
++}
++
++export function useUpdatePreference() {
++  const [isPending, setIsPending] = useState(false)
++
++  const mutate = useCallback(async (params: UpdatePreferenceParams) => {
++    const queryKey = subscriptionQueryKeys.current()
++
++    // Snapshot the previous value for rollback
++    const previousData = getActivityQueryData<SubscriptionResponse>(queryKey)
++
++    // Optimistically update to the new value
++    if (previousData && params.fallbackToALaCarte !== undefined) {
++      setActivityQueryData<SubscriptionResponse>(queryKey, {
++        ...previousData,
++        fallbackToALaCarte: params.fallbackToALaCarte,
++      })
++    }
++
++    setIsPending(true)
++
++    try {
++      const client = getApiClient()
++      const response = await client.patch<{ success: boolean; error?: string }>(
++        '/api/user/preferences',
++        params as Record<string, unknown>,
++        { includeCookie: true },
++      )
++
++      if (!response.ok) {
++        const errorMessage = response.error || 'Failed to update preference'
++        throw new Error(errorMessage)
++      }
++
++      // Invalidate to refetch fresh data from server
++      invalidateActivityQuery(queryKey)
++    } catch (err) {
++      // Rollback to previous value on error
++      if (previousData) {
++        setActivityQueryData(queryKey, previousData)
++      }
++      logger.error({ err }, 'Failed to update preference')
++      showClipboardMessage('Failed to update preference', { durationMs: 3000 })
++    } finally {
++      setIsPending(false)
++    }
++  }, [])
++
++  return { mutate, isPending }
++}
+diff --git a/cli/src/hooks/use-user-details-query.ts b/cli/src/hooks/use-user-details-query.ts
+index 4c3f335ae..fa5f7524c 100644
+--- a/cli/src/hooks/use-user-details-query.ts
++++ b/cli/src/hooks/use-user-details-query.ts
+@@ -37,12 +37,13 @@ export async function fetchUserDetails<T extends UserField>({
+   logger = defaultLogger,
+   apiClient: providedApiClient,
+ }: FetchUserDetailsParams<T>): Promise<UserDetails<T> | null> {
+-  const apiClient =
+-    providedApiClient ??
+-    (() => {
+-      setApiClientAuthToken(authToken)
+-      return getApiClient()
+-    })()
++  let apiClient: CodebuffApiClient
++  if (providedApiClient) {
++    apiClient = providedApiClient
++  } else {
++    setApiClientAuthToken(authToken)
++    apiClient = getApiClient()
++  }
+ 
+   const response = await apiClient.me(fields)
+ 
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index fcef730c7..3fd6affed 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -24,8 +24,9 @@ import { runPlainLogin } from './login/plain-login'
+ import { initializeApp } from './init/init-app'
+ import { getProjectRoot, setProjectRoot } from './project-files'
+ import { initAnalytics, trackEvent } from './utils/analytics'
+-import { getAuthTokenDetails } from './utils/auth'
++import { getAuthToken, getAuthTokenDetails } from './utils/auth'
+ import { resetCodebuffClient } from './utils/codebuff-client'
++import { setApiClientAuthToken } from './utils/codebuff-api'
+ import { getCliEnv } from './utils/env'
+ import { initializeAgentRegistry } from './utils/local-agent-registry'
+ import { clearLogFile, logger } from './utils/logger'
+@@ -181,6 +182,9 @@ async function main(): Promise<void> {
+ 
+   await initializeApp({ cwd })
+ 
++  // Set the auth token for the API client
++  setApiClientAuthToken(getAuthToken())
++
+   // Handle login command before rendering the app
+   if (isLoginCommand) {
+     await runPlainLogin()
+diff --git a/cli/src/utils/fetch-usage.ts b/cli/src/utils/fetch-usage.ts
+index 8102cf85b..070687630 100644
+--- a/cli/src/utils/fetch-usage.ts
++++ b/cli/src/utils/fetch-usage.ts
+@@ -1,5 +1,5 @@
+ import { getAuthToken } from './auth'
+-import { getApiClient, setApiClientAuthToken } from './codebuff-api'
++import { getApiClient } from './codebuff-api'
+ import { logger } from './logger'
+ import { useChatStore } from '../state/chat-store'
+ 
+@@ -42,11 +42,7 @@ export async function fetchAndUpdateUsage(
+   }
+ 
+   const apiClient =
+-    providedApiClient ??
+-    (() => {
+-      setApiClientAuthToken(authToken)
+-      return getApiClient()
+-    })()
++    providedApiClient ?? getApiClient()
+ 
+   try {
+     const response = await apiClient.usage()
+diff --git a/cli/src/utils/input-modes.ts b/cli/src/utils/input-modes.ts
+index be2196223..a8fc12259 100644
+--- a/cli/src/utils/input-modes.ts
++++ b/cli/src/utils/input-modes.ts
+@@ -13,6 +13,7 @@ export type InputMode =
+   | 'help'
+   | 'connect:claude'
+   | 'outOfCredits'
++  | 'subscriptionLimit'
+ 
+ // Theme color keys that are valid color values (must match ChatTheme keys)
+ export type ThemeColorKey =
+@@ -114,6 +115,14 @@ export const INPUT_MODE_CONFIGS: Record<InputMode, InputModeConfig> = {
+     showAgentModeToggle: false,
+     disableSlashSuggestions: true,
+   },
++  subscriptionLimit: {
++    icon: null,
++    color: 'warning',
++    placeholder: '',
++    widthAdjustment: 0,
++    showAgentModeToggle: false,
++    disableSlashSuggestions: true,
++  },
+ }
+ 
+ export function getInputModeConfig(mode: InputMode): InputModeConfig {
+diff --git a/cli/src/utils/settings.ts b/cli/src/utils/settings.ts
+index 14a9f20fd..7ce71e2d6 100644
+--- a/cli/src/utils/settings.ts
++++ b/cli/src/utils/settings.ts
+@@ -20,6 +20,10 @@ const DEFAULT_SETTINGS: Settings = {
+ export interface Settings {
+   mode?: AgentMode
+   adsEnabled?: boolean
++  /** @deprecated Use server-side fallbackToALaCarte setting instead */
++  alwaysUseALaCarte?: boolean
++  /** @deprecated Use server-side fallbackToALaCarte setting instead */
++  fallbackToALaCarte?: boolean
+ }
+ 
+ /**
+@@ -92,6 +96,16 @@ const validateSettings = (parsed: unknown): Settings => {
+     settings.adsEnabled = obj.adsEnabled
+   }
+ 
++  // Validate alwaysUseALaCarte (legacy)
++  if (typeof obj.alwaysUseALaCarte === 'boolean') {
++    settings.alwaysUseALaCarte = obj.alwaysUseALaCarte
++  }
++
++  // Validate fallbackToALaCarte (legacy)
++  if (typeof obj.fallbackToALaCarte === 'boolean') {
++    settings.fallbackToALaCarte = obj.fallbackToALaCarte
++  }
++
+   return settings
+ }
+ 
+@@ -134,3 +148,4 @@ export const loadModePreference = (): AgentMode => {
+ export const saveModePreference = (mode: AgentMode): void => {
+   saveSettings({ mode })
+ }
++
+diff --git a/cli/src/utils/subscription.ts b/cli/src/utils/subscription.ts
+new file mode 100644
+index 000000000..5bbdc5ae9
+--- /dev/null
++++ b/cli/src/utils/subscription.ts
+@@ -0,0 +1,31 @@
++import type { SubscriptionResponse } from '../hooks/use-subscription-query'
++
++/**
++ * Calculates the percentage of subscription block credits remaining.
++ * Returns null if the subscription data is incomplete.
++ */
++export function getBlockPercentRemaining(
++  subscriptionData: SubscriptionResponse | null | undefined,
++): number | null {
++  if (!subscriptionData?.hasSubscription) return null
++  const rateLimit = subscriptionData.rateLimit
++  if (!rateLimit?.blockLimit || rateLimit.blockUsed == null) return null
++  return Math.round(
++    ((rateLimit.blockLimit - rateLimit.blockUsed) / rateLimit.blockLimit) * 100,
++  )
++}
++
++/**
++ * Determines if a request is covered by subscription based on subscription data.
++ * Returns true if the user has an active subscription that's not rate-limited
++ * and has remaining block credits.
++ */
++export function isCoveredBySubscription(
++  subscriptionData: SubscriptionResponse | null | undefined,
++): boolean {
++  if (!subscriptionData?.hasSubscription) return false
++  const rateLimit = subscriptionData.rateLimit
++  if (rateLimit?.limited) return false
++  const blockPercentRemaining = getBlockPercentRemaining(subscriptionData)
++  return blockPercentRemaining != null && blockPercentRemaining > 0
++}
+diff --git a/cli/src/utils/time-format.ts b/cli/src/utils/time-format.ts
+index af178fde8..e7b472360 100644
+--- a/cli/src/utils/time-format.ts
++++ b/cli/src/utils/time-format.ts
+@@ -1,20 +1,21 @@
++import { formatTimeUntil } from '@codebuff/common/util/dates'
++
+ /**
+- * Format time until reset in human-readable form
++ * Format time until reset in human-readable form.
+  * @param resetDate - The date when the quota/resource resets
+  * @returns Human-readable string like "2h 30m" or "45m"
+  */
+ export const formatResetTime = (resetDate: Date | null): string => {
+   if (!resetDate) return ''
+-  const now = new Date()
+-  const diffMs = resetDate.getTime() - now.getTime()
+-  if (diffMs <= 0) return 'now'
+-
+-  const diffMins = Math.floor(diffMs / (1000 * 60))
+-  const diffHours = Math.floor(diffMins / 60)
+-  const remainingMins = diffMins % 60
++  return formatTimeUntil(resetDate, { fallback: 'now' })
++}
+ 
+-  if (diffHours > 0) {
+-    return `${diffHours}h ${remainingMins}m`
+-  }
+-  return `${diffMins}m`
++/**
++ * Format time until reset in human-readable form, including days.
++ * @param resetDate - The date when the quota/resource resets
++ * @returns Human-readable string like "4d 7h" or "2h 30m"
++ */
++export const formatResetTimeLong = (resetDate: Date | string | null): string => {
++  if (!resetDate) return ''
++  return formatTimeUntil(resetDate, { fallback: 'now' })
+ }
+diff --git a/common/src/constants/subscription-plans.ts b/common/src/constants/subscription-plans.ts
+index 23309e2f4..5f9e3ec8e 100644
+--- a/common/src/constants/subscription-plans.ts
++++ b/common/src/constants/subscription-plans.ts
+@@ -10,21 +10,21 @@ export interface TierConfig {
+ export const SUBSCRIPTION_TIERS = {
+   100: {
+     monthlyPrice: 100,
+-    creditsPerBlock: 400,
++    creditsPerBlock: 350,
+     blockDurationHours: 5,
+-    weeklyCreditsLimit: 4000,
++    weeklyCreditsLimit: 3500,
+   },
+   200: {
+     monthlyPrice: 200,
+-    creditsPerBlock: 1200,
++    creditsPerBlock: 1050,
+     blockDurationHours: 5,
+-    weeklyCreditsLimit: 12000,
++    weeklyCreditsLimit: 10500,
+   },
+   500: {
+     monthlyPrice: 500,
+-    creditsPerBlock: 3200,
++    creditsPerBlock: 2800,
+     blockDurationHours: 5,
+-    weeklyCreditsLimit: 32000,
++    weeklyCreditsLimit: 28000,
+   },
+ } as const satisfies Record<number, TierConfig>
+ 
+diff --git a/common/src/types/subscription.ts b/common/src/types/subscription.ts
+new file mode 100644
+index 000000000..714bdf24e
+--- /dev/null
++++ b/common/src/types/subscription.ts
+@@ -0,0 +1,67 @@
++/**
++ * Core subscription information for an active subscription.
++ */
++export interface SubscriptionInfo {
++  id: string
++  status: string
++  billingPeriodEnd: string
++  cancelAtPeriodEnd: boolean
++  canceledAt: string | null
++  tier: number
++  scheduledTier?: number | null
++}
++
++/**
++ * Rate limit information for subscription usage.
++ */
++export interface SubscriptionRateLimit {
++  limited: boolean
++  reason?: 'block_exhausted' | 'weekly_limit'
++  canStartNewBlock: boolean
++  blockUsed?: number
++  blockLimit?: number
++  blockResetsAt?: string
++  weeklyUsed: number
++  weeklyLimit: number
++  weeklyResetsAt: string
++  weeklyPercentUsed: number
++}
++
++/**
++ * Subscription limits configuration.
++ */
++export interface SubscriptionLimits {
++  creditsPerBlock: number
++  blockDurationHours: number
++  weeklyCreditsLimit: number
++}
++
++/**
++ * Response when user has no active subscription.
++ */
++export interface NoSubscriptionResponse {
++  hasSubscription: false
++  /** Whether user prefers to fallback to a-la-carte credits when subscription limits are reached */
++  fallbackToALaCarte: boolean
++}
++
++/**
++ * Response when user has an active subscription.
++ * All fields are required - no invalid states possible.
++ */
++export interface ActiveSubscriptionResponse {
++  hasSubscription: true
++  displayName: string
++  subscription: SubscriptionInfo
++  rateLimit: SubscriptionRateLimit
++  limits: SubscriptionLimits
++
++  /** Whether user prefers to fallback to a-la-carte credits when subscription limits are reached */
++  fallbackToALaCarte: boolean
++}
++
++/**
++ * Discriminated union for subscription API response.
++ * Use `hasSubscription` to narrow the type.
++ */
++export type SubscriptionResponse = NoSubscriptionResponse | ActiveSubscriptionResponse
+diff --git a/common/src/util/dates.ts b/common/src/util/dates.ts
+index 6c75b68c1..57096e324 100644
+--- a/common/src/util/dates.ts
++++ b/common/src/util/dates.ts
+@@ -15,3 +15,67 @@ export const getNextQuotaReset = (referenceDate: Date | null): Date => {
+   }
+   return nextMonth
+ }
++
++export interface FormatTimeUntilOptions {
++  /**
++   * What to return when the date is in the past or invalid.
++   * @default 'now'
++   */
++  fallback?: string
++  /**
++   * Whether to include the smaller unit (hours in "Xd Yh", minutes in "Xh Ym").
++   * @default true
++   */
++  includeSubUnit?: boolean
++}
++
++/**
++ * Format the time until a future date in a human-readable string.
++ *
++ * @param date - The target date (Date object or ISO string)
++ * @param options - Formatting options
++ * @returns Human-readable string like "4d 7h", "2h 30m", or "45m"
++ *
++ * @example
++ * // Date 2 days and 5 hours in the future
++ * formatTimeUntil(futureDate)  // "2d 5h"
++ * formatTimeUntil(futureDate, { includeSubUnit: false })  // "2d"
++ *
++ * // Date 3 hours and 20 minutes in the future
++ * formatTimeUntil(futureDate)  // "3h 20m"
++ *
++ * // Date in the past
++ * formatTimeUntil(pastDate)  // "now"
++ * formatTimeUntil(pastDate, { fallback: '0h' })  // "0h"
++ */
++export const formatTimeUntil = (
++  date: Date | string | null,
++  options: FormatTimeUntilOptions = {},
++): string => {
++  const { fallback = 'now', includeSubUnit = true } = options
++
++  if (!date) return fallback
++
++  const target = typeof date === 'string' ? new Date(date) : date
++  const diffMs = target.getTime() - Date.now()
++
++  if (isNaN(diffMs) || diffMs <= 0) return fallback
++
++  const diffMins = Math.floor(diffMs / (1000 * 60))
++  const diffHours = Math.floor(diffMins / 60)
++  const diffDays = Math.floor(diffHours / 24)
++  const remainingHours = diffHours % 24
++  const remainingMins = diffMins % 60
++
++  if (diffDays > 0) {
++    return includeSubUnit && remainingHours > 0
++      ? `${diffDays}d ${remainingHours}h`
++      : `${diffDays}d`
++  }
++  if (diffHours > 0) {
++    return includeSubUnit && remainingMins > 0
++      ? `${diffHours}h ${remainingMins}m`
++      : `${diffHours}h`
++  }
++  return `${diffMins}m`
++}
+diff --git a/packages/billing/src/__tests__/balance-calculator.test.ts b/packages/billing/src/__tests__/balance-calculator.test.ts
+index 616a7e421..d0bdcbe8a 100644
+--- a/packages/billing/src/__tests__/balance-calculator.test.ts
++++ b/packages/billing/src/__tests__/balance-calculator.test.ts
+@@ -139,6 +139,199 @@ function createDbMockForUnion(options: {
+   }
+ }
+ 
++
+
+… [diff truncated: view full diff on GitHub] …

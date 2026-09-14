@@ -1,0 +1,1454 @@
+diff --git a/web/src/app/api/agents/[publisherId]/[agentId]/[version]/dependencies/_get.ts b/web/src/app/api/agents/[publisherId]/[agentId]/[version]/dependencies/_get.ts
+new file mode 100644
+index 000000000..3f488d947
+--- /dev/null
++++ b/web/src/app/api/agents/[publisherId]/[agentId]/[version]/dependencies/_get.ts
+@@ -0,0 +1,275 @@
++import db from '@codebuff/internal/db'
++import * as schema from '@codebuff/internal/db/schema'
++import { and, eq, or } from 'drizzle-orm'
++import { NextResponse } from 'next/server'
++
++import type { Logger } from '@codebuff/common/types/contracts/logger'
++
++import {
++  buildAgentTree,
++  type AgentLookupResult,
++  type AgentTreeData,
++} from '@/lib/agent-tree'
++
++interface RouteParams {
++  publisherId: string
++  agentId: string
++  version: string
++}
++
++export interface GetDependenciesParams {
++  params: Promise<RouteParams>
++  logger: Logger
++}
++
++interface PendingLookup {
++  resolve: (result: AgentLookupResult | null) => void
++  publisher: string
++  agentId: string
++  version: string
++}
++
++/**
++ * Creates a batching agent lookup function that automatically batches
++ * concurrent requests into a single database query.
++ * 
++ * This solves the N+1 query problem: when the tree builder processes siblings
++ * in parallel with Promise.all, all their lookupAgent calls will be queued
++ * and executed in a single batch query.
++ * 
++ * Query reduction: ~2N queries -> ~maxDepth queries (typically ≤6 total)
++ */
++function createBatchingAgentLookup(
++  publisherSet: Set<string>,
++  logger: Logger,
++) {
++  const cache = new Map<string, AgentLookupResult | null>()
++  const pending: PendingLookup[] = []
++  let batchScheduled = false
++
++  async function executeBatch() {
++    batchScheduled = false
++    if (pending.length === 0) return
++
++    // Grab all pending requests and clear the queue
++    const batch = [...pending]
++    pending.length = 0
++
++    try {
++      const uniqueRequests = new Map<
++        string,
++        { publisherId: string; agentId: string; version: string }
++      >()
++
++      for (const req of batch) {
++        const cacheKey = `${req.publisher}/${req.agentId}@${req.version}`
++
++        if (!publisherSet.has(req.publisher)) {
++          cache.set(cacheKey, null)
++          req.resolve(null)
++          continue
++        }
++
++        uniqueRequests.set(`${req.publisher}:${req.agentId}:${req.version}`, {
++          publisherId: req.publisher,
++          agentId: req.agentId,
++          version: req.version,
++        })
++      }
++
++      let agents: Array<typeof schema.agentConfig.$inferSelect> = []
++      if (uniqueRequests.size > 0) {
++        const conditions = [...uniqueRequests.values()].map((req) =>
++          and(
++            eq(schema.agentConfig.id, req.agentId),
++            eq(schema.agentConfig.version, req.version),
++            eq(schema.agentConfig.publisher_id, req.publisherId),
++          ),
++        )
++        agents = await db
++          .select()
++          .from(schema.agentConfig)
++          .where(conditions.length === 1 ? conditions[0] : or(...conditions))
++      }
++
++      // Create lookup map for quick access
++      const agentMap = new Map<string, typeof schema.agentConfig.$inferSelect>()
++      for (const agent of agents) {
++        agentMap.set(`${agent.publisher_id}:${agent.id}:${agent.version}`, agent)
++      }
++
++      // Resolve all pending requests
++      for (const req of batch) {
++        const cacheKey = `${req.publisher}/${req.agentId}@${req.version}`
++        
++        // Resolve duplicates from cache
++        if (cache.has(cacheKey)) {
++          req.resolve(cache.get(cacheKey) ?? null)
++          continue
++        }
++
++        if (!publisherSet.has(req.publisher)) {
++          cache.set(cacheKey, null)
++          req.resolve(null)
++          continue
++        }
++
++        const lookupKey = `${req.publisher}:${req.agentId}:${req.version}`
++        const agent = agentMap.get(lookupKey)
++        if (!agent) {
++          cache.set(cacheKey, null)
++          req.resolve(null)
++          continue
++        }
++
++        const agentData =
++          typeof agent.data === 'string' ? JSON.parse(agent.data) : agent.data
++
++        const result: AgentLookupResult = {
++          displayName: agentData?.displayName ?? agentData?.name ?? req.agentId,
++          spawnerPrompt: agentData?.spawnerPrompt ?? null,
++          spawnableAgents: Array.isArray(agentData?.spawnableAgents)
++            ? agentData.spawnableAgents
++            : [],
++          isAvailable: true,
++        }
++
++        cache.set(cacheKey, result)
++        req.resolve(result)
++      }
++    } catch (error) {
++      logger.error({ error }, 'Batch agent lookup failed')
++      for (const req of batch) {
++        const cacheKey = `${req.publisher}/${req.agentId}@${req.version}`
++        if (!cache.has(cacheKey)) {
++          cache.set(cacheKey, null)
++        }
++        req.resolve(cache.get(cacheKey) ?? null)
++      }
++    }
++  }
++
++  return async function lookupAgent(
++    publisher: string,
++    agentId: string,
++    version: string,
++  ): Promise<AgentLookupResult | null> {
++    const cacheKey = `${publisher}/${agentId}@${version}`
++
++    // Return from cache if available
++    if (cache.has(cacheKey)) {
++      return cache.get(cacheKey) ?? null
++    }
++
++    // Queue the request and schedule batch execution
++    return new Promise((resolve) => {
++      pending.push({ resolve, publisher, agentId, version })
++
++      if (!batchScheduled) {
++        batchScheduled = true
++        // Use setImmediate to batch all concurrent requests in the same tick
++        setImmediate(executeBatch)
++      }
++    })
++  }
++}
++
++export async function getDependencies({
++  params,
++  logger,
++}: GetDependenciesParams) {
++  try {
++    const { publisherId, agentId, version } = await params
++
++    if (!publisherId || !agentId || !version) {
++      return NextResponse.json(
++        { error: 'Missing required parameters' },
++        { status: 400 },
++      )
++    }
++
++    // Pre-fetch all publishers once (small table, single query)
++    // This eliminates N publisher queries
++    const allPublishers = await db.select().from(schema.publisher)
++    const publisherSet = new Set(allPublishers.map((p) => p.id))
++
++    // Verify the root publisher exists
++    if (!publisherSet.has(publisherId)) {
++      return NextResponse.json(
++        { error: 'Publisher not found' },
++        { status: 404 },
++      )
++    }
++
++    // Create batching lookup function
++    const lookupAgent = createBatchingAgentLookup(publisherSet, logger)
++
++    // Find the root agent
++    const rootAgent = await db
++      .select()
++      .from(schema.agentConfig)
++      .where(
++        and(
++          eq(schema.agentConfig.id, agentId),
++          eq(schema.agentConfig.version, version),
++          eq(schema.agentConfig.publisher_id, publisherId),
++        ),
++      )
++      .then((rows) => rows[0])
++
++    if (!rootAgent) {
++      return NextResponse.json({ error: 'Agent not found' }, { status: 404 })
++    }
++
++    const rootData =
++      typeof rootAgent.data === 'string'
++        ? JSON.parse(rootAgent.data)
++        : rootAgent.data
++
++    const spawnableAgents: string[] = Array.isArray(rootData.spawnableAgents)
++      ? rootData.spawnableAgents
++      : []
++
++    if (spawnableAgents.length === 0) {
++      const emptyTree: AgentTreeData = {
++        root: {
++          fullId: `${publisherId}/${agentId}@${version}`,
++          agentId,
++          publisher: publisherId,
++          version,
++          displayName: rootData.displayName ?? rootData.name ?? agentId,
++          spawnerPrompt: rootData.spawnerPrompt ?? null,
++          isAvailable: true,
++          children: [],
++          isCyclic: false,
++        },
++        totalAgents: 1,
++        maxDepth: 0,
++        hasCycles: false,
++      }
++      return NextResponse.json(emptyTree)
++    }
++
++    // Build the dependency tree
++    // The batching lookup will automatically batch all concurrent requests
++    // from each tree level into single queries
++    const tree = await buildAgentTree({
++      rootPublisher: publisherId,
++      rootAgentId: agentId,
++      rootVersion: version,
++      rootDisplayName: rootData.displayName ?? rootData.name ?? agentId,
++      rootSpawnerPrompt: rootData.spawnerPrompt ?? null,
++      rootSpawnableAgents: spawnableAgents,
++      lookupAgent,
++      maxDepth: 5,
++    })
++
++    return NextResponse.json(tree)
++  } catch (error) {
++    logger.error({ error }, 'Error fetching agent dependencies')
++    return NextResponse.json(
++      { error: 'Internal server error' },
++      { status: 500 },
++    )
++  }
++}
+diff --git a/web/src/app/api/agents/[publisherId]/[agentId]/[version]/dependencies/route.ts b/web/src/app/api/agents/[publisherId]/[agentId]/[version]/dependencies/route.ts
+new file mode 100644
+index 000000000..3dc064284
+--- /dev/null
++++ b/web/src/app/api/agents/[publisherId]/[agentId]/[version]/dependencies/route.ts
+@@ -0,0 +1,20 @@
++import { getDependencies } from './_get'
++
++import type { NextRequest } from 'next/server'
++
++import { logger } from '@/util/logger'
++
++interface RouteParams {
++  params: Promise<{
++    publisherId: string
++    agentId: string
++    version: string
++  }>
++}
++
++export async function GET(_request: NextRequest, { params }: RouteParams) {
++  return getDependencies({
++    params,
++    logger,
++  })
++}
+diff --git a/web/src/app/publishers/[id]/agents/[agentId]/[version]/agent-usage-metrics.tsx b/web/src/app/publishers/[id]/agents/[agentId]/[version]/agent-usage-metrics.tsx
+index 52daf6994..e9d100644 100644
+--- a/web/src/app/publishers/[id]/agents/[agentId]/[version]/agent-usage-metrics.tsx
++++ b/web/src/app/publishers/[id]/agents/[agentId]/[version]/agent-usage-metrics.tsx
+@@ -48,6 +48,14 @@ const formatUsageCount = (count?: number) => {
+   return count.toString()
+ }
+ 
++const formatLastUsed = (dateStr: string) => {
++  const date = new Date(dateStr)
++  return date.toLocaleDateString('en-US', {
++    month: 'short',
++    day: 'numeric',
++  })
++}
++
+ export const AgentUsageMetrics = ({
+   publisherId,
+   agentId,
+@@ -108,72 +116,62 @@ export const AgentUsageMetrics = ({
+   }
+ 
+   return (
+-    <div>
+-      <div className="grid grid-cols-2 xs:grid-cols-3 lg:grid-cols-5 gap-4 sm:gap-6">
+-        <div className="flex flex-col items-center gap-2">
+-          <div className="flex items-center gap-2">
+-            <TrendingUp className="h-4 w-4 text-emerald-400" />
+-            <span className="font-medium text-emerald-300">
+-              {formatCurrency(usageMetrics.weekly_spent)}
+-            </span>
+-          </div>
+-          <span className="text-xs text-muted-foreground">Weekly Spend</span>
++    <div className="grid grid-cols-2 xs:grid-cols-3 lg:grid-cols-6 gap-4 sm:gap-6">
++      <div className="flex flex-col items-center gap-2">
++        <div className="flex items-center gap-2">
++          <TrendingUp className="h-4 w-4 text-emerald-400" />
++          <span className="font-medium text-emerald-300">
++            {formatCurrency(usageMetrics.weekly_spent)}
++          </span>
+         </div>
+-        <div className="flex flex-col items-center gap-2">
+-          <div className="flex items-center gap-2">
+-            <Play className="h-4 w-4 text-blue-400" />
+-            <span className="font-medium text-blue-300">
+-              {formatUsageCount(usageMetrics.weekly_runs)}
+-            </span>
+-          </div>
+-          <span className="text-xs text-muted-foreground">Weekly Runs</span>
++        <span className="text-xs text-muted-foreground">Weekly Spend</span>
++      </div>
++      <div className="flex flex-col items-center gap-2">
++        <div className="flex items-center gap-2">
++          <Play className="h-4 w-4 text-blue-400" />
++          <span className="font-medium text-blue-300">
++            {formatUsageCount(usageMetrics.weekly_runs)}
++          </span>
+         </div>
+-        <div className="flex flex-col items-center gap-2">
+-          <div className="flex items-center gap-2">
+-            <Play className="h-4 w-4 text-muted-foreground" />
+-            <span>{formatUsageCount(usageMetrics.usage_count)}</span>
+-          </div>
+-          <span className="text-xs text-muted-foreground">Total Runs</span>
++        <span className="text-xs text-muted-foreground">Weekly Runs</span>
++      </div>
++      <div className="flex flex-col items-center gap-2">
++        <div className="flex items-center gap-2">
++          <Play className="h-4 w-4 text-muted-foreground" />
++          <span>{formatUsageCount(usageMetrics.usage_count)}</span>
+         </div>
+-        <div className="flex flex-col items-center gap-2">
+-          <div className="flex items-center gap-2">
+-            <Users className="h-4 w-4 text-muted-foreground" />
+-            <span>{usageMetrics.unique_users || 0}</span>
+-          </div>
+-          <span className="text-xs text-muted-foreground">Unique Users</span>
++        <span className="text-xs text-muted-foreground">Total Runs</span>
++      </div>
++      <div className="flex flex-col items-center gap-2">
++        <div className="flex items-center gap-2">
++          <Users className="h-4 w-4 text-muted-foreground" />
++          <span>{usageMetrics.unique_users || 0}</span>
+         </div>
+-        <div className="flex flex-col items-center gap-2">
+-          <div className="flex items-center gap-2">
+-            <DollarSign className="h-4 w-4 text-muted-foreground" />
+-            <span>
+-              {formatCurrency(usageMetrics.avg_cost_per_invocation).replace(
+-                '$',
+-                '',
+-              )}
+-            </span>
+-          </div>
+-          <span className="text-xs text-muted-foreground">
+-            Avg Cost per Run
++        <span className="text-xs text-muted-foreground">Unique Users</span>
++      </div>
++      <div className="flex flex-col items-center gap-2">
++        <div className="flex items-center gap-2">
++          <DollarSign className="h-4 w-4 text-muted-foreground" />
++          <span>
++            {formatCurrency(usageMetrics.avg_cost_per_invocation).replace(
++              '$',
++              '',
++            )}
+           </span>
+         </div>
++        <span className="text-xs text-muted-foreground">Avg Cost/Run</span>
+       </div>
+-      {usageMetrics.last_used && (
+-        <div className="mt-4 pt-4 border-t border-border/40">
+-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+-            <Calendar className="h-4 w-4" />
+-            <span>
+-              Last used:{' '}
+-              {new Date(usageMetrics.last_used).toLocaleDateString('en-US', {
+-                year: 'numeric',
+-                month: 'short',
+-                day: 'numeric',
+-                hour: '2-digit',
+-                minute: '2-digit',
+-              })}
+-            </span>
+-          </div>
++      <div className="flex flex-col items-center gap-2">
++        <div className="flex items-center gap-2">
++          <Calendar className="h-4 w-4 text-muted-foreground" />
++          <span>
++            {usageMetrics.last_used
++              ? formatLastUsed(usageMetrics.last_used)
++              : '—'}
++          </span>
+         </div>
+-      )}
++        <span className="text-xs text-muted-foreground">Last Used</span>
++      </div>
+     </div>
+   )
+ }
+diff --git a/web/src/app/publishers/[id]/agents/[agentId]/[version]/page.tsx b/web/src/app/publishers/[id]/agents/[agentId]/[version]/page.tsx
+index 0dc46f324..56bb0c2d5 100644
+--- a/web/src/app/publishers/[id]/agents/[agentId]/[version]/page.tsx
++++ b/web/src/app/publishers/[id]/agents/[agentId]/[version]/page.tsx
+@@ -11,6 +11,7 @@ import { RunAgentButton } from './run-agent-button'
+ import { SaveAgentButton } from './save-agent-button'
+ import { VersionUsageBadge } from './version-usage-badge'
+ 
++import { AgentDependencyTree } from '@/components/agent/agent-dependency-tree'
+ import { TypeScriptViewer } from '@/components/agent/typescript-viewer'
+ import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+ import { BackButton } from '@/components/ui/back-button'
+@@ -311,6 +312,18 @@ const AgentDetailPage = async ({ params }: AgentDetailPageProps) => {
+                 {/* Agent Definition */}
+                 <div className="border-t pt-6">
+                   <h3 className="text-base font-semibold mb-3">Definition</h3>
++                  
++                  {/* Subagents - part of the definition */}
++                  {agentData.spawnableAgents && agentData.spawnableAgents.length > 0 && (
++                    <div className="mb-4">
++                      <AgentDependencyTree
++                        publisherId={id}
++                        agentId={agentId}
++                        version={version}
++                      />
++                    </div>
++                  )}
++                  
+                   <TypeScriptViewer data={agentData} />
+                 </div>
+               </CardContent>
+diff --git a/web/src/components/agent/agent-dependency-tree.tsx b/web/src/components/agent/agent-dependency-tree.tsx
+new file mode 100644
+index 000000000..927f0fd1c
+--- /dev/null
++++ b/web/src/components/agent/agent-dependency-tree.tsx
+@@ -0,0 +1,342 @@
++'use client'
++
++import React, { useEffect, useState, useMemo } from 'react'
++import { GitBranch, ChevronDown, ChevronRight, ExternalLink, LayoutList, Network, AlertCircle } from 'lucide-react'
++import Link from 'next/link'
++
++import { MermaidDiagram } from '@/components/docs/mdx/mermaid-diagram'
++import { Badge } from '@/components/ui/badge'
++import { Button } from '@/components/ui/button'
++import {
++  generateMermaidDiagram,
++  type AgentTreeData,
++  type AgentTreeNode,
++} from '@/lib/agent-tree'
++import { cn } from '@/lib/utils'
++
++// Error boundary to catch Mermaid rendering errors
++interface MermaidErrorBoundaryState {
++  hasError: boolean
++}
++
++class MermaidErrorBoundary extends React.Component<
++  { children: React.ReactNode },
++  MermaidErrorBoundaryState
++> {
++  constructor(props: { children: React.ReactNode }) {
++    super(props)
++    this.state = { hasError: false }
++  }
++
++  static getDerivedStateFromError(): MermaidErrorBoundaryState {
++    return { hasError: true }
++  }
++
++  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
++    console.error('Mermaid diagram error:', error, errorInfo)
++  }
++
++  render() {
++    if (this.state.hasError) {
++      return (
++        <div className="flex items-center gap-2 text-sm text-muted-foreground py-4">
++          <AlertCircle className="h-4 w-4" />
++          <span>Unable to render diagram</span>
++        </div>
++      )
++    }
++    return this.props.children
++  }
++}
++
++interface AgentDependencyTreeProps {
++  publisherId: string
++  agentId: string
++  version: string
++}
++
++type ViewMode = 'list' | 'diagram'
++
++export function AgentDependencyTree({
++  publisherId,
++  agentId,
++  version,
++}: AgentDependencyTreeProps) {
++  const [treeData, setTreeData] = useState<AgentTreeData | null>(null)
++  const [isLoading, setIsLoading] = useState(true)
++  const [error, setError] = useState<string | null>(null)
++  const [isExpanded, setIsExpanded] = useState(false)
++  const [viewMode, setViewMode] = useState<ViewMode>('list')
++
++  // Memoize expensive Mermaid generation
++  const mermaidCode = useMemo(
++    () => (treeData ? generateMermaidDiagram(treeData) : ''),
++    [treeData]
++  )
++  const subagentCount = treeData ? treeData.totalAgents - 1 : 0
++
++  useEffect(() => {
++    let isMounted = true
++    const abortController = new AbortController()
++
++    const fetchTree = async () => {
++      try {
++        setIsLoading(true)
++        setError(null)
++
++        const response = await fetch(
++          `/api/agents/${publisherId}/${agentId}/${version}/dependencies`,
++          { signal: abortController.signal }
++        )
++
++        if (!response.ok) {
++          throw new Error(`Failed to fetch dependencies: ${response.statusText}`)
++        }
++
++        const data: AgentTreeData = await response.json()
++        if (isMounted) {
++          setTreeData(data)
++        }
++      } catch (err) {
++        if (err instanceof Error && err.name === 'AbortError') return
++        if (isMounted) {
++          console.error('Error fetching agent tree:', err)
++          setError(
++            err instanceof Error ? err.message : 'Failed to load dependencies',
++          )
++        }
++      } finally {
++        if (isMounted) {
++          setIsLoading(false)
++        }
++      }
++    }
++
++    fetchTree()
++    return () => {
++      isMounted = false
++      abortController.abort()
++    }
++  }, [publisherId, agentId, version])
++
++  if (isLoading) {
++    return (
++      <div className="flex items-center justify-center py-8 text-muted-foreground">
++        <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-current mr-2" />
++        Loading dependencies...
++      </div>
++    )
++  }
++
++  if (error) {
++    return (
++      <div className="text-sm text-muted-foreground py-4">
++        Unable to load dependency tree
++      </div>
++    )
++  }
++
++  if (!treeData || treeData.root.children.length === 0) {
++    return null
++  }
++
++  return (
++    <div className="space-y-3">
++      <button
++        onClick={() => setIsExpanded(!isExpanded)}
++        className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground transition-colors w-full text-left group"
++      >
++        {isExpanded ? (
++          <ChevronDown className="h-4 w-4" />
++        ) : (
++          <ChevronRight className="h-4 w-4" />
++        )}
++        <GitBranch className="h-4 w-4" />
++        <span>
++          {subagentCount} subagent{subagentCount !== 1 ? 's' : ''}
++        </span>
++        {treeData.hasCycles && (
++          <Badge variant="outline" className="text-xs">
++            Has cycles
++          </Badge>
++        )}
++        {!isExpanded && (
++          <span className="text-xs text-muted-foreground/70 group-hover:text-muted-foreground ml-1">
++            (click to expand)
++          </span>
++        )}
++      </button>
++
++      {isExpanded && (
++        <div className="ml-6 space-y-3">
++          <div className="flex items-center gap-2">
++            <Button
++              variant={viewMode === 'list' ? 'secondary' : 'ghost'}
++              size="sm"
++              onClick={() => setViewMode('list')}
++              className="h-7 text-xs gap-1.5"
++            >
++              <LayoutList className="h-3.5 w-3.5" />
++              List
++            </Button>
++            <Button
++              variant={viewMode === 'diagram' ? 'secondary' : 'ghost'}
++              size="sm"
++              onClick={() => setViewMode('diagram')}
++              className="h-7 text-xs gap-1.5"
++            >
++              <Network className="h-3.5 w-3.5" />
++              Diagram
++            </Button>
++          </div>
++
++          {viewMode === 'list' ? (
++            <div className="border rounded-lg overflow-hidden">
++              {treeData.root.children.map((node) => (
++                <SubagentTreeNode 
++                  key={node.fullId} 
++                  node={node} 
++                  depth={0}
++                />
++              ))}
++            </div>
++          ) : (
++            <div className="border rounded-lg p-4 bg-muted/30 overflow-x-auto">
++              <div className="min-w-fit">
++                <MermaidErrorBoundary>
++                  <MermaidDiagram code={mermaidCode} className="[&_svg]:max-w-none [&_svg]:min-w-[600px]" />
++                </MermaidErrorBoundary>
++              </div>
++            </div>
++          )}
++        </div>
++      )}
++    </div>
++  )
++}
++
++function ViewDetailsLink({ href, className }: { href: string; className?: string }) {
++  return (
++    <Link
++      href={href}
++      target="_blank"
++      rel="noopener noreferrer"
++      className={cn(
++        'inline-flex items-center gap-1 text-xs text-muted-foreground/60 hover:text-muted-foreground italic',
++        className
++      )}
++    >
++      View details
++      <ExternalLink className="h-2.5 w-2.5" />
++    </Link>
++  )
++}
++
++function SubagentTreeNode({ 
++  node, 
++  depth,
++}: { 
++  node: AgentTreeNode
++  depth: number
++}) {
++  const [isExpanded, setIsExpanded] = useState(false)
++  
++  const agentUrl = node.isAvailable
++    ? `/publishers/${node.publisher}/agents/${node.agentId}/${node.version}`
++    : null
++
++  const hasChildren = node.children.length > 0
++  const isExpandable = !!node.spawnerPrompt || hasChildren
++
++  // Calculate the left position for the depth indicator
++  // Depth 0 is at the edge (0), each subsequent level indents by 24px
++  const indicatorLeft = depth * 24
++
++  return (
++    <div className="group">
++      <div
++        className={cn(
++          'flex items-center gap-2 py-2.5 hover:bg-muted/50 transition-colors relative',
++          isExpandable && 'cursor-pointer',
++        )}
++        style={{ paddingLeft: `${indicatorLeft + 8}px`, paddingRight: '12px' }}
++        onClick={() => isExpandable && setIsExpanded(!isExpanded)}
++      >
++        {/* Depth-level indicator bar */}
++        <div 
++          className="absolute top-0 bottom-0 w-0.5 bg-primary/60"
++          style={{ left: `${indicatorLeft}px` }}
++        />
++        {/* Expand/collapse chevron */}
++        <div className={cn('w-4 h-4 flex items-center justify-center shrink-0', !isExpandable && 'opacity-0')}>
++          {isExpandable && (
++            isExpanded ? (
++              <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
++            ) : (
++              <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
++            )
++          )}
++        </div>
++
++        <div className="flex items-center gap-2 flex-1 min-w-0">
++          <span className="font-medium text-sm truncate">
++            {node.displayName}
++          </span>
++          <span className="text-xs text-muted-foreground font-mono shrink-0">
++            v{node.version}
++          </span>
++          {node.isCyclic && (
++            <Badge variant="secondary" className="text-xs shrink-0">
++              Circular
++            </Badge>
++          )}
++          {!node.isAvailable && (
++            <Badge variant="secondary" className="text-xs shrink-0">
++              Not found
++            </Badge>
++          )}
++          {hasChildren && (
++            <Badge variant="outline" className="text-xs shrink-0 font-normal">
++              {node.children.length} subagent{node.children.length !== 1 ? 's' : ''}
++            </Badge>
++          )}
++        </div>
++
++        <span className="text-xs text-muted-foreground shrink-0">@{node.publisher}</span>
++      </div>
++
++      {isExpanded && (
++        <>
++          {(node.spawnerPrompt || agentUrl) && (
++            <div 
++              className="py-2"
++              style={{ paddingLeft: `${indicatorLeft + 28}px`, paddingRight: '12px' }}
++            >
++              {node.spawnerPrompt ? (
++                <div className="text-sm text-muted-foreground leading-relaxed bg-muted/30 rounded-md p-3">
++                  <p>{node.spawnerPrompt}</p>
++                  {agentUrl && (
++                    <ViewDetailsLink href={agentUrl} className="mt-2" />
++                  )}
++                </div>
++              ) : agentUrl && (
++                <ViewDetailsLink href={agentUrl} />
++              )}
++            </div>
++          )}
++          {hasChildren && !node.isCyclic && (
++            <div>
++              {node.children.map((child) => (
++                <SubagentTreeNode 
++                  key={child.fullId} 
++                  node={child} 
++                  depth={depth + 1}
++                />
++              ))}
++            </div>
++          )}
++        </>
++      )}
++    </div>
++  )
++}
+diff --git a/web/src/components/agent/typescript-viewer.tsx b/web/src/components/agent/typescript-viewer.tsx
+index 8af169d15..5892f5a00 100644
+--- a/web/src/components/agent/typescript-viewer.tsx
++++ b/web/src/components/agent/typescript-viewer.tsx
+@@ -1,8 +1,9 @@
+ 'use client'
+ 
+ import { useState } from 'react'
+-import { Check, Copy } from 'lucide-react'
++import { Check, Copy, ExternalLink } from 'lucide-react'
+ import { Highlight, themes } from 'prism-react-renderer'
++import Link from 'next/link'
+ 
+ import { Button } from '@/components/ui/button'
+ 
+@@ -11,6 +12,35 @@ interface TypeScriptViewerProps {
+   className?: string
+ }
+ 
++// Pattern to match agent IDs like "codebuff/file-picker@0.0.7" (with quotes)
++const AGENT_ID_PATTERN = /^"([^/]+)\/([^@]+)@([^"]+)"$/
++
++// Only allow safe characters to prevent XSS: alphanumeric, hyphens, underscores, dots
++const SAFE_ID_PATTERN = /^[a-zA-Z0-9_.-]+$/
++
++function isValidAgentIdComponent(value: string): boolean {
++  return SAFE_ID_PATTERN.test(value) && value.length > 0 && value.length <= 128
++}
++
++function parseAgentIdFromToken(tokenContent: string): { publisher: string; agentId: string; version: string } | null {
++  const match = tokenContent.match(AGENT_ID_PATTERN)
++  if (match) {
++    const publisher = match[1]
++    const agentId = match[2]
++    const version = match[3]
++    
++    // Validate all components contain only safe characters
++    if (!isValidAgentIdComponent(publisher) || 
++        !isValidAgentIdComponent(agentId) || 
++        !isValidAgentIdComponent(version)) {
++      return null
++    }
++    
++    return { publisher, agentId, version }
++  }
++  return null
++}
++
+ function formatAsTypeScript(obj: any, indent: number = 0): string {
+   const spaces = '  '.repeat(indent)
+   const nextSpaces = '  '.repeat(indent + 1)
+@@ -152,6 +182,40 @@ export function TypeScriptViewer({
+                   {line.map((token, tokenIndex) => {
+                     // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                     const { key: _tokenKey, ...tokenProps } = getTokenProps({ token, key: tokenIndex })
++                    
++                    // Check if this token is an agent ID string
++                    const agentInfo = token.types.includes('string') 
++                      ? parseAgentIdFromToken(token.content)
++                      : null
++                    
++                    if (agentInfo) {
++                      const agentUrl = `/publishers/${agentInfo.publisher}/agents/${agentInfo.agentId}/${agentInfo.version}`
++                      return (
++                        <span key={tokenIndex} className="group/agent">
++                          <Link
++                            href={agentUrl}
++                            target="_blank"
++                            rel="noopener noreferrer"
++                            className="hover:underline cursor-pointer"
++                            style={tokenProps.style}
++                            onClick={(e) => e.stopPropagation()}
++                          >
++                            {token.content}
++                          </Link>
++                          <Link
++                            href={agentUrl}
++                            target="_blank"
++                            rel="noopener noreferrer"
++                            className="hidden group-hover/agent:inline-flex items-center ml-1 p-0.5 rounded hover:bg-muted-foreground/20"
++                            onClick={(e) => e.stopPropagation()}
++                            title="Open in new tab"
++                          >
++                            <ExternalLink className="h-3 w-3 text-muted-foreground" />
++                          </Link>
++                        </span>
++                      )
++                    }
++                    
+                     return <span key={tokenIndex} {...tokenProps} />
+                   })}
+                 </div>
+diff --git a/web/src/lib/__tests__/agent-tree.test.ts b/web/src/lib/__tests__/agent-tree.test.ts
+new file mode 100644
+index 000000000..56ccebc46
+--- /dev/null
++++ b/web/src/lib/__tests__/agent-tree.test.ts
+@@ -0,0 +1,584 @@
++import { describe, it, expect } from '@jest/globals'
++import {
++  buildAgentTree,
++  generateMermaidDiagram,
++  generateNodeDataMap,
++  type AgentLookupResult,
++  type AgentTreeData,
++  type AgentTreeNode,
++} from '../agent-tree'
++
++describe('buildAgentTree', () => {
++  const createMockLookup = (agents: Record<string, AgentLookupResult | null>) => {
++    return async (
++      publisher: string,
++      agentId: string,
++      version: string | null
++    ): Promise<AgentLookupResult | null> => {
++      const key = version ? `${publisher}/${agentId}@${version}` : `${publisher}/${agentId}`
++      return agents[key] ?? null
++    }
++  }
++
++  it('builds a tree with no spawnable agents', async () => {
++    const tree = await buildAgentTree({
++      rootPublisher: 'codebuff',
++      rootAgentId: 'base',
++      rootVersion: '1.0.0',
++      rootDisplayName: 'Base Agent',
++      rootSpawnerPrompt: 'A base agent',
++      rootSpawnableAgents: [],
++      lookupAgent: createMockLookup({}),
++    })
++
++    expect(tree.root.fullId).toBe('codebuff/base@1.0.0')
++    expect(tree.root.displayName).toBe('Base Agent')
++    expect(tree.root.children).toHaveLength(0)
++    expect(tree.totalAgents).toBe(1)
++    expect(tree.maxDepth).toBe(0)
++    expect(tree.hasCycles).toBe(false)
++  })
++
++  it('builds a tree with single level of children', async () => {
++    const mockAgents: Record<string, AgentLookupResult> = {
++      'codebuff/file-picker@0.1.0': {
++        displayName: 'File Picker',
++        spawnerPrompt: 'Picks files',
++        spawnableAgents: [],
++        isAvailable: true,
++      },
++      'codebuff/code-searcher@0.2.0': {
++        displayName: 'Code Searcher',
++        spawnerPrompt: 'Searches code',
++        spawnableAgents: [],
++        isAvailable: true,
++      },
++    }
++
++    const tree = await buildAgentTree({
++      rootPublisher: 'codebuff',
++      rootAgentId: 'orchestrator',
++      rootVersion: '1.0.0',
++      rootDisplayName: 'Orchestrator',
++      rootSpawnerPrompt: null,
++      rootSpawnableAgents: [
++        'codebuff/file-picker@0.1.0',
++        'codebuff/code-searcher@0.2.0',
++      ],
++      lookupAgent: createMockLookup(mockAgents),
++    })
++
++    expect(tree.root.children).toHaveLength(2)
++    expect(tree.root.children[0].displayName).toBe('File Picker')
++    expect(tree.root.children[1].displayName).toBe('Code Searcher')
++    expect(tree.totalAgents).toBe(3)
++    expect(tree.maxDepth).toBe(1)
++    expect(tree.hasCycles).toBe(false)
++  })
++
++  it('builds a nested tree with multiple levels', async () => {
++    const mockAgents: Record<string, AgentLookupResult> = {
++      'codebuff/level1@1.0.0': {
++        displayName: 'Level 1',
++        spawnerPrompt: null,
++        spawnableAgents: ['codebuff/level2@1.0.0'],
++        isAvailable: true,
++      },
++      'codebuff/level2@1.0.0': {
++        displayName: 'Level 2',
++        spawnerPrompt: null,
++        spawnableAgents: ['codebuff/level3@1.0.0'],
++        isAvailable: true,
++      },
++      'codebuff/level3@1.0.0': {
++        displayName: 'Level 3',
++        spawnerPrompt: null,
++        spawnableAgents: [],
++        isAvailable: true,
++      },
++    }
++
++    const tree = await buildAgentTree({
++      rootPublisher: 'codebuff',
++      rootAgentId: 'root',
++      rootVersion: '1.0.0',
++      rootDisplayName: 'Root',
++      rootSpawnerPrompt: null,
++      rootSpawnableAgents: ['codebuff/level1@1.0.0'],
++      lookupAgent: createMockLookup(mockAgents),
++    })
++
++    expect(tree.root.children).toHaveLength(1)
++    expect(tree.root.children[0].children).toHaveLength(1)
++    expect(tree.root.children[0].children[0].children).toHaveLength(1)
++    expect(tree.root.children[0].children[0].children[0].displayName).toBe('Level 3')
++    expect(tree.totalAgents).toBe(4)
++    expect(tree.maxDepth).toBe(3)
++  })
++
++  it('detects cycles and marks cyclic nodes', async () => {
++    const mockAgents: Record<string, AgentLookupResult> = {
++      'codebuff/agent-a@1.0.0': {
++        displayName: 'Agent A',
++        spawnerPrompt: null,
++        spawnableAgents: ['codebuff/agent-b@1.0.0'],
++        isAvailable: true,
++      },
++      'codebuff/agent-b@1.0.0': {
++        displayName: 'Agent B',
++        spawnerPrompt: null,
++        // This creates a cycle back to the root
++        spawnableAgents: ['codebuff/root@1.0.0'],
++        isAvailable: true,
++      },
++    }
++
++    const tree = await buildAgentTree({
++      rootPublisher: 'codebuff',
++      rootAgentId: 'root',
++      rootVersion: '1.0.0',
++      rootDisplayName: 'Root',
++      rootSpawnerPrompt: null,
++      rootSpawnableAgents: ['codebuff/agent-a@1.0.0'],
++      lookupAgent: createMockLookup(mockAgents),
++    })
++
++    expect(tree.hasCycles).toBe(true)
++    // The cyclic reference to root should be marked as cyclic
++    const cyclicNode = tree.root.children[0].children[0].children[0]
++    expect(cyclicNode.isCyclic).toBe(true)
++    expect(cyclicNode.fullId).toBe('codebuff/root@1.0.0')
++  })
++
++  it('respects maxDepth limit', async () => {
++    const mockAgents: Record<string, AgentLookupResult> = {
++      'codebuff/deep1@1.0.0': {
++        displayName: 'Deep 1',
++        spawnerPrompt: null,
++        spawnableAgents: ['codebuff/deep2@1.0.0'],
++        isAvailable: true,
++      },
++      'codebuff/deep2@1.0.0': {
++        displayName: 'Deep 2',
++        spawnerPrompt: null,
++        spawnableAgents: ['codebuff/deep3@1.0.0'],
++        isAvailable: true,
++      },
++      'codebuff/deep3@1.0.0': {
++        displayName: 'Deep 3',
++        spawnerPrompt: null,
++        spawnableAgents: [],
++        isAvailable: true,
++      },
++    }
++
++    const tree = await buildAgentTree({
++      rootPublisher: 'codebuff',
++      rootAgentId: 'root',
++      rootVersion: '1.0.0',
++      rootDisplayName: 'Root',
++      rootSpawnerPrompt: null,
++      rootSpawnableAgents: ['codebuff/deep1@1.0.0'],
++      lookupAgent: createMockLookup(mockAgents),
++      maxDepth: 2,
++    })
++
++    // With maxDepth 2, we should only have root -> deep1 -> deep2
++    // deep2's children should not be fetched
++    expect(tree.root.children[0].displayName).toBe('Deep 1')
++    expect(tree.root.children[0].children[0].displayName).toBe('Deep 2')
++    expect(tree.root.children[0].children[0].children).toHaveLength(0)
++    expect(tree.maxDepth).toBe(2)
++  })
++
++  it('handles unavailable agents', async () => {
++    const mockAgents: Record<string, AgentLookupResult | null> = {
++      'codebuff/available@1.0.0': {
++        displayName: 'Available',
++        spawnerPrompt: null,
++        spawnableAgents: [],
++        isAvailable: true,
++      },
++      'codebuff/missing@1.0.0': null, // Not found
++    }
++
++    const tree = await buildAgentTree({
++      rootPublisher: 'codebuff',
++      rootAgentId: 'root',
++      rootVersion: '1.0.0',
++      rootDisplayName: 'Root',
++      rootSpawnerPrompt: null,
++      rootSpawnableAgents: [
++        'codebuff/available@1.0.0',
++        'codebuff/missing@1.0.0',
++      ],
++      lookupAgent: createMockLookup(mockAgents),
++    })
++
++    expect(tree.root.children).toHaveLength(2)
++    expect(tree.root.children[0].isAvailable).toBe(true)
++    expect(tree.root.children[1].isAvailable).toBe(false)
++    expect(tree.root.children[1].displayName).toBe('missing') // Falls back to agentId
++  })
++
++  it('parses various agent ID formats', async () => {
++    const mockAgents: Record<string, AgentLookupResult> = {
++      'codebuff/with-version@2.0.0': {
++        displayName: 'With Version',
++        spawnerPrompt: null,
++        spawnableAgents: [],
++        isAvailable: true,
++      },
++      'other-pub/cross-publisher@1.0.0': {
++        displayName: 'Cross Publisher',
++        spawnerPrompt: null,
++        spawnableAgents: [],
++        isAvailable: true,
++      },
++    }
++
++    const tree = await buildAgentTree({
++      rootPublisher: 'codebuff',
++      rootAgentId: 'root',
++      rootVersion: '1.0.0',
++      rootDisplayName: 'Root',
++      rootSpawnerPrompt: null,
++      rootSpawnableAgents: [
++        'codebuff/with-version@2.0.0',
++        'other-pub/cross-publisher@1.0.0',
++      ],
++      lookupAgent: createMockLookup(mockAgents),
++    })
++
++    expect(tree.root.children).toHaveLength(2)
++    expect(tree.root.children[0].publisher).toBe('codebuff')
++    expect(tree.root.children[0].version).toBe('2.0.0')
++    expect(tree.root.children[1].publisher).toBe('other-pub')
++    expect(tree.root.children[1].version).toBe('1.0.0')
++  })
++})
++
++describe('generateMermaidDiagram', () => {
++  const createSimpleTree = (overrides: Partial<AgentTreeNode> = {}): AgentTreeData => ({
++    root: {
++      fullId: 'codebuff/root@1.0.0',
++      agentId: 'root',
++      publisher: 'codebuff',
++      version: '1.0.0',
++      displayName: 'Root Agent',
++      spawnerPrompt: null,
++      isAvailable: true,
++      children: [],
++      isCyclic: false,
++      ...overrides,
++    },
++    totalAgents: 1,
++    maxDepth: 0,
++    hasCycles: false,
++  })
++
++  it('generates valid flowchart structure', () => {
++    const tree = createSimpleTree()
++    const diagram = generateMermaidDiagram(tree)
++
++    expect(diagram).toContain('flowchart LR')
++    expect(diagram).toContain('classDef root')
++    expect(diagram).toContain('classDef default')
++    expect(diagram).toContain('classDef cyclic')
++    expect(diagram).toContain('classDef unavailable')
++  })
++
++  it('applies root styling to root node', () => {
++    const tree = createSimpleTree()
++    const diagram = generateMermaidDiagram(tree)
++
++    expect(diagram).toContain(':::root')
++  })
++
++  it('applies cyclic styling to cyclic nodes', () => {
++    const tree = createSimpleTree({
++      children: [
++        {
++          fullId: 'codebuff/cyclic@1.0.0',
++          agentId: 'cyclic',
++          publisher: 'codebuff',
++          version: '1.0.0',
++          displayName: 'Cyclic Node',
++          spawnerPrompt: null,
++          isAvailable: false,
++          children: [],
++          isCyclic: true,
++        },
++      ],
++    })
++    tree.hasCycles = true
++
++    const diagram = generateMermaidDiagram(tree)
++
++    expect(diagram).toContain(':::cyclic')
++  })
++
++  it('applies unavailable styling to unavailable nodes', () => {
++    const tree = createSimpleTree({
++      children: [
++        {
++          fullId: 'codebuff/missing@1.0.0',
++          agentId: 'missing',
++          publisher: 'codebuff',
++          version: '1.0.0',
++          displayName: 'Missing Node',
++          spawnerPrompt: null,
++          isAvailable: false,
++          children: [],
++          isCyclic: false,
++        },
++      ],
++    })
++
++    const diagram = generateMermaidDiagram(tree)
++
++    expect(diagram).toContain(':::unavailable')
++  })
++
++  it('generates connections between parent and child nodes', () => {
++    const tree = createSimpleTree({
++      children: [
++        {
++          fullId: 'codebuff/child@1.0.0',
++          agentId: 'child',
++          publisher: 'codebuff',
++          version: '1.0.0',
++          displayName: 'Child',
++          spawnerPrompt: null,
++          isAvailable: true,
++          children: [],
++          isCyclic: false,
++        },
++      ],
++    })
++
++    const diagram = generateMermaidDiagram(tree)
++
++    expect(diagram).toContain('codebuff_root_1_0_0 --> codebuff_child_1_0_0')
++  })
++
++  it('escapes special characters in node labels', () => {
++    const tree = createSimpleTree({
++      displayName: 'Agent with "quotes" and <brackets>',
++    })
++
++    const diagram = generateMermaidDiagram(tree)
++
++    // Should escape quotes
++    expect(diagram).toContain("'quotes'")
++    // Should escape angle brackets
++    expect(diagram).toContain('&lt;')
++    expect(diagram).toContain('&gt;')
++  })
++
++  it('includes version in node labels when present', () => {
++    const tree = createSimpleTree({
++      version: '2.5.0',
++      displayName: 'Versioned',
++    })
++
++    const diagram = generateMermaidDiagram(tree)
++
++    expect(diagram).toContain('v2.5.0')
++  })
++
++  it('sanitizes IDs for Mermaid compatibility', () => {
++    const tree = createSimpleTree({
++      fullId: 'pub/agent@1.2.3',
++    })
++
++    const diagram = generateMermaidDiagram(tree)
++
++    // Special chars should be replaced with underscores
++    expect(diagram).toContain('pub_agent_1_2_3')
++    expect(diagram).not.toContain('pub/agent@1.2.3[')
++  })
++})
++
++describe('generateNodeDataMap', () => {
++  const createSimpleTree = (): AgentTreeData => ({
++    root: {
++      fullId: 'codebuff/root@1.0.0',
++      agentId: 'root',
++      publisher: 'codebuff',
++      version: '1.0.0',
++      displayName: 'Root Agent',
++      spawnerPrompt: 'Root prompt',
++      isAvailable: true,
++      children: [
++        {
++          fullId: 'codebuff/child-a@1.0.0',
++          agentId: 'child-a',
++          publisher: 'codebuff',
++          version: '1.0.0',
++          displayName: 'Child A',
++          spawnerPrompt: 'Child A prompt',
++          isAvailable: true,
++          children: [],
++          isCyclic: false,
++        },
++        {
++          fullId: 'codebuff/child-b@2.0.0',
++          agentId: 'child-b',
++          publisher: 'codebuff',
++          version: '2.0.0',
++          displayName: 'Child B',
++          spawnerPrompt: null,
++          isAvailable: false,
++          children: [],
++          isCyclic: false,
++        },
++      ],
++      isCyclic: false,
++    },
++    totalAgents: 3,
++    maxDepth: 1,
++    hasCycles: false,
++  })
++
++  it('creates map entries for all nodes', () => {
++    const tree = createSimpleTree()
++    const nodeMap = generateNodeDataMap(tree)
++
++    expect(nodeMap.size).toBe(3)
++    expect(nodeMap.has('codebuff_root_1_0_0')).toBe(true)
++    expect(nodeMap.has('codebuff_child-a_1_0_0')).toBe(true)
++    expect(nodeMap.has('codebuff_child-b_2_0_0')).toBe(true)
++  })
++
++  it('includes correct node data', () => {
++    const tree = createSimpleTree()
++    const nodeMap = generateNodeDataMap(tree)
++
++    const rootNode = nodeMap.get('codebuff_root_1_0_0')
++    expect(rootNode).toBeDefined()
++    expect(rootNode?.displayName).toBe('Root Agent')
++    expect(rootNode?.spawnerPrompt).toBe('Root prompt')
++    expect(rootNode?.isAvailable).toBe(true)
++    expect(rootNode?.childCount).toBe(2)
++  })
++
++  it('tracks child count correctly', () => {
++    const tree = createSimpleTree()
++    const nodeMap = generateNodeDataMap(tree)
++
++    const rootNode = nodeMap.get('codebuff_root_1_0_0')
++    const childNode = nodeMap.get('codebuff_child-a_1_0_0')
++
++    expect(rootNode?.childCount).toBe(2)
++    expect(childNode?.childCount).toBe(0)
++  })
++
++  it('preserves all properties from tree nodes', () => {
++    const tree = createSimpleTree()
++    const nodeMap = generateNodeDataMap(tree)
++
++    const childB = nodeMap.get('codebuff_child-b_2_0_0')
++    expect(childB?.fullId).toBe('codebuff/child-b@2.0.0')
++    expect(childB?.agentId).toBe('child-b')
++    expect(childB?.publisher).toBe('codebuff')
++    expect(childB?.version).toBe('2.0.0')
++    expect(childB?.isAvailable).toBe(false)
++    expect(childB?.isCyclic).toBe(false)
++  })
++
++  it('handles cyclic nodes without infinite loop', () => {
++    const cyclicChild: AgentTreeNode = {
++      fullId: 'codebuff/cyclic@1.0.0',
++      agentId: 'cyclic',
++      publisher: 'codebuff',
++      version: '1.0.0',
++      displayName: 'Cyclic',
++      spawnerPrompt: null,
++      isAvailable: false,
++      children: [],
++      isCyclic: true,
++    }
++
++    const tree: AgentTreeData = {
++      root: {
++        fullId: 'codebuff/root@1.0.0',
++        agentId: 'root',
++        publisher: 'codebuff',
++        version: '1.0.0',
++        displayName: 'Root',
++        spawnerPrompt: null,
++        isAvailable: true,
++        children: [cyclicChild],
++        isCyclic: false,
++      },
++      totalAgents: 2,
++      maxDepth: 1,
++      hasCycles: true,
++    }
++
++    // Should not hang or throw
++    const nodeMap = generateNodeDataMap(tree)
++    expect(nodeMap.size).toBe(2)
++    expect(nodeMap.get('codebuff_cyclic_1_0_0')?.isCyclic).toBe(true)
++  })
++
++  it('deduplicates nodes that appear multiple times', () => {
++    // Simulate a diamond dependency pattern
++    c
+
+… [diff truncated: view full diff on GitHub] …

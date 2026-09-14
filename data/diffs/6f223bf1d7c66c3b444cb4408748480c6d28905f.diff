@@ -1,0 +1,162 @@
+diff --git a/cli/package.json b/cli/package.json
+index 5cb4628c8..ec5acab4c 100644
+--- a/cli/package.json
++++ b/cli/package.json
+@@ -23,7 +23,9 @@
+     "test:tmux-poc": "bun run src/__tests__/tmux-poc.ts",
+     "typecheck": "tsc --noEmit -p ."
+   },
+-  "sideEffects": false,
++  "sideEffects": [
++    "./src/pre-init/*.ts"
++  ],
+   "engines": {
+     "bun": "1.3.11"
+   },
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index 8a3ad503a..6a74c168f 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -1,5 +1,12 @@
+ #!/usr/bin/env bun
+ 
++// Embed tree-sitter.wasm into the bun-compile binary at a bunfs path the runtime
++// can find. Without this, web-tree-sitter resolves the wasm via require.resolve,
++// which (since 0.25.10's split exports map) returns the build-time absolute path
++// of tree-sitter.cjs and fails on user machines. Must run before the SDK / code-map
++// import chain triggers Parser.init.
++import './pre-init/tree-sitter-wasm'
++
+ import fs from 'fs'
+ import { createRequire } from 'module'
+ import os from 'os'
+diff --git a/cli/src/pre-init/tree-sitter-wasm.ts b/cli/src/pre-init/tree-sitter-wasm.ts
+new file mode 100644
+index 000000000..d5d62291f
+--- /dev/null
++++ b/cli/src/pre-init/tree-sitter-wasm.ts
+@@ -0,0 +1,16 @@
++// Embed tree-sitter.wasm into the bun-compile binary at a bunfs path the runtime
++// can find. Must be the very first import in `index.tsx`: subsequent imports
++// (the SDK / code-map) eagerly construct a tree-sitter parser singleton, and its
++// `locateFile` callback reads `CODEBUFF_TREE_SITTER_WASM_PATH` from `process.env`.
++//
++// Without this, web-tree-sitter@0.25.10 falls back to `require.resolve` which —
++// per the package's split `import`/`require` exports map — returns the build-time
++// absolute path of `tree-sitter.cjs` and fails on user machines.
++
++import treeSitterWasmPath from 'web-tree-sitter/tree-sitter.wasm' with {
++  type: 'file',
++}
++
++if (treeSitterWasmPath) {
++  process.env.CODEBUFF_TREE_SITTER_WASM_PATH = treeSitterWasmPath
++}
+diff --git a/packages/code-map/src/index.ts b/packages/code-map/src/index.ts
+index 4861eacc3..48a846cfa 100644
+--- a/packages/code-map/src/index.ts
++++ b/packages/code-map/src/index.ts
+@@ -1,3 +1,4 @@
+ import './types'
+ export * from './parse'
+ export * from './languages'
++export { setTreeSitterWasmPath } from './init-node'
+diff --git a/packages/code-map/src/init-node.ts b/packages/code-map/src/init-node.ts
+index fd3720124..2c8666f7f 100644
+--- a/packages/code-map/src/init-node.ts
++++ b/packages/code-map/src/init-node.ts
+@@ -3,6 +3,53 @@ import * as path from 'path'
+ 
+ import { Parser } from 'web-tree-sitter'
+ 
++const TREE_SITTER_WASM_ENV_VAR = 'CODEBUFF_TREE_SITTER_WASM_PATH'
++
++/**
++ * Override the path to `tree-sitter.wasm` used during {@link initTreeSitterForNode}.
++ *
++ * Needed for `bun build --compile` binaries: the embedded `tree-sitter.js` reports a
++ * `scriptDir` like `/$bunfs/root/`, but the runtime wasm isn't auto-embedded next to
++ * it, and `require.resolve('web-tree-sitter')` resolves to the build-time absolute
++ * path of `tree-sitter.cjs` (per the package's `require` exports condition added in
++ * 0.25.10), which doesn't exist on the end user's machine. Callers building binaries
++ * should embed the wasm via Bun's `import ... with { type: 'file' }` and pass the
++ * resulting path here before any tree-sitter use.
++ *
++ * Stored on `process.env` so it reaches every copy of this module — the SDK
++ * pre-built bundle inlines its own copy of `init-node.ts`, so a module-level
++ * variable here wouldn't be visible to the singleton initialized via the SDK.
++ */
++export function setTreeSitterWasmPath(wasmPath: string): void {
++  process.env[TREE_SITTER_WASM_ENV_VAR] = wasmPath
++}
++
++function resolveTreeSitterWasm(scriptDir: string): string {
++  const override = process.env[TREE_SITTER_WASM_ENV_VAR]
++  if (override && fs.existsSync(override)) {
++    return override
++  }
++
++  const fallback = path.join(scriptDir, 'tree-sitter.wasm')
++  if (fs.existsSync(fallback)) {
++    return fallback
++  }
++
++  try {
++    const pkgDir = path.dirname(require.resolve('web-tree-sitter'))
++    const wasm = path.join(pkgDir, 'tree-sitter.wasm')
++    if (fs.existsSync(wasm)) {
++      return wasm
++    }
++  } catch {
++    // Package not resolvable; fall through.
++  }
++
++  throw new Error(
++    `Internal error: tree-sitter.wasm not found (looked at scriptDir=${scriptDir} and via web-tree-sitter package). Set ${TREE_SITTER_WASM_ENV_VAR} or ensure the file is included in your deployment bundle.`,
++  )
++}
++
+ /**
+  * Initialize web-tree-sitter for Node.js environments with proper WASM file location
+  */
+@@ -11,22 +58,7 @@ export async function initTreeSitterForNode(): Promise<void> {
+   await Parser.init({
+     locateFile: (name: string, scriptDir: string) => {
+       if (name === 'tree-sitter.wasm') {
+-        // Fallback to script directory
+-        const fallback = path.join(scriptDir, name)
+-        if (fs.existsSync(fallback)) {
+-          return fallback
+-        }
+-
+-        // Find the installed package root
+-        const pkgDir = path.dirname(require.resolve('web-tree-sitter'))
+-        // The wasm ships at: node_modules/web-tree-sitter/tree-sitter.wasm
+-        const wasm = path.join(pkgDir, 'tree-sitter.wasm')
+-        if (fs.existsSync(wasm)) {
+-          return wasm
+-        }
+-        throw new Error(
+-          `Internal error: web-tree-sitter/tree-sitter.wasm not found at ${wasm}. Ensure the file is included in your deployment bundle.`,
+-        )
++        return resolveTreeSitterWasm(scriptDir)
+       }
+ 
+       // For other files, use default behavior
+diff --git a/sdk/src/index.ts b/sdk/src/index.ts
+index fe9b366b7..4b04f03af 100644
+--- a/sdk/src/index.ts
++++ b/sdk/src/index.ts
+@@ -82,7 +82,11 @@ export {
+ export type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
+ 
+ // Tree-sitter / code-map exports
+-export { getFileTokenScores, setWasmDir } from '@codebuff/code-map'
++export {
++  getFileTokenScores,
++  setWasmDir,
++  setTreeSitterWasmPath,
++} from '@codebuff/code-map'
+ export type { FileTokenData, TokenCallerMap } from '@codebuff/code-map'
+ 
+ export { runTerminalCommand } from './tools/run-terminal-command'

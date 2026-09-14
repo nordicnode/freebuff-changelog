@@ -1,0 +1,780 @@
+diff --git a/packages/internal/src/loops/client.ts b/packages/internal/src/loops/client.ts
+index 158e6164f..b3cf12d4e 100644
+--- a/packages/internal/src/loops/client.ts
++++ b/packages/internal/src/loops/client.ts
+@@ -199,3 +199,40 @@ export async function sendBasicEmail(
+     },
+   })
+ }
++
++/**
++ * Send a notification email when a user files a dispute.
++ * Offers to work with them to resolve the issue.
++ */
++export async function sendDisputeNotificationEmail(params: {
++  email: string
++  firstName: string
++  disputeAmount: string
++  logger: Logger
++}): Promise<SendEmailResult> {
++  const { email, firstName, disputeAmount, logger } = params
++
++  const subject = "We noticed a dispute on your account - let's resolve this together"
++  const message = `Hi ${firstName},
++
++We noticed that a dispute was filed for a ${disputeAmount} charge on your Codebuff account. We're sorry to hear you had an issue and we'd love the opportunity to make things right.
++
++If there was a problem with your experience or a charge you didn't recognize, please reach out to us directly and we'll be happy to:
++
++• Issue a full refund if appropriate
++• Help resolve any technical issues you experienced
++• Answer any questions about your billing
++
++Working with us directly is often faster than going through your bank, and it helps us improve our service for everyone.
++
++Please reply to this email or contact our support team - we're here to help!
++
++Best regards,
++The Codebuff Team`
++
++  return sendBasicEmail({
++    email,
++    data: { subject, message },
++    logger,
++  })
++}
+diff --git a/web/src/app/api/stripe/webhook/route.ts b/web/src/app/api/stripe/webhook/route.ts
+index 00918f831..b0aaf58c3 100644
+--- a/web/src/app/api/stripe/webhook/route.ts
++++ b/web/src/app/api/stripe/webhook/route.ts
+@@ -6,6 +6,7 @@ import {
+ import db from '@codebuff/internal/db'
+ import * as schema from '@codebuff/internal/db/schema'
+ import { env } from '@codebuff/internal/env'
++import { sendDisputeNotificationEmail } from '@codebuff/internal/loops'
+ import { stripeServer } from '@codebuff/internal/util/stripe'
+ import { eq } from 'drizzle-orm'
+ import { NextResponse } from 'next/server'
+@@ -13,6 +14,11 @@ import { NextResponse } from 'next/server'
+ import type { NextRequest } from 'next/server'
+ import type Stripe from 'stripe'
+ 
++import {
++  banUser,
++  evaluateBanConditions,
++  getUserByStripeCustomerId,
++} from '@/lib/ban-conditions'
+ import { getStripeCustomerId } from '@/lib/stripe-utils'
+ import { logger } from '@/util/logger'
+ 
+@@ -357,6 +363,111 @@ const webhookHandler = async (req: NextRequest): Promise<NextResponse> => {
+         await handleSubscriptionEvent(event.data.object as Stripe.Subscription)
+         break
+       }
++      case 'charge.dispute.created': {
++        const dispute = event.data.object as Stripe.Dispute
++        const chargeId =
++          typeof dispute.charge === 'string'
++            ? dispute.charge
++            : dispute.charge?.id
++
++        if (!chargeId) {
++          logger.warn(
++            { disputeId: dispute.id },
++            'Dispute received without charge ID',
++          )
++          break
++        }
++
++        // Get the charge to find the customer
++        const charge = await stripeServer.charges.retrieve(chargeId)
++        if (!charge.customer) {
++          logger.warn(
++            { disputeId: dispute.id, chargeId },
++            'Dispute charge has no customer (guest payment)',
++          )
++          break
++        }
++
++        const customerId = getStripeCustomerId(
++          charge.customer as string | Stripe.Customer | Stripe.DeletedCustomer,
++        )
++
++        if (!customerId) {
++          logger.warn(
++            { disputeId: dispute.id, chargeId },
++            'Dispute charge has no customer',
++          )
++          break
++        }
++
++        // Look up the user
++        const user = await getUserByStripeCustomerId(customerId)
++        if (!user) {
++          logger.info(
++            { disputeId: dispute.id, customerId },
++            'Dispute received for unknown customer (may be an organization)',
++          )
++          break
++        }
++
++        // Skip if already banned
++        if (user.banned) {
++          logger.debug(
++            { disputeId: dispute.id, userId: user.id },
++            'Dispute received for already-banned user, skipping evaluation',
++          )
++          break
++        }
++
++        // Evaluate ban conditions
++        const banResult = await evaluateBanConditions({
++          userId: user.id,
++          stripeCustomerId: customerId,
++          logger,
++        })
++
++        if (banResult.shouldBan) {
++          await banUser(user.id, banResult.reason, logger)
++          logger.warn(
++            {
++              disputeId: dispute.id,
++              userId: user.id,
++              customerId,
++              reason: banResult.reason,
++            },
++            'User auto-banned due to dispute threshold',
++          )
++          // Don't send email to banned users
++        } else {
++          // Send friendly dispute notification email to non-banned users
++          const firstName = user.name?.split(' ')[0] || 'there'
++          const disputeAmount = `$${(dispute.amount / 100).toFixed(2)}`
++          const emailResult = await sendDisputeNotificationEmail({
++            email: user.email,
++            firstName,
++            disputeAmount,
++            logger,
++          })
++
++          if (emailResult.success) {
++            logger.info(
++              { disputeId: dispute.id, userId: user.id, email: user.email },
++              'Sent dispute notification email to user',
++            )
++          } else {
++            logger.warn(
++              {
++                disputeId: dispute.id,
++                userId: user.id,
++                email: user.email,
++                error: emailResult.error,
++              },
++              'Failed to send dispute notification email',
++            )
++          }
++        }
++        break
++      }
+       case 'charge.refunded': {
+         const charge = event.data.object as Stripe.Charge
+         // Get the payment intent ID from the charge
+diff --git a/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts b/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts
+index bd80089b5..fb4871b90 100644
+--- a/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts
++++ b/web/src/app/api/v1/chat/completions/__tests__/completions.test.ts
+@@ -354,8 +354,8 @@ describe('/api/v1/chat/completions POST endpoint', () => {
+     })
+   })
+ 
+-  describe('Blocked users', () => {
+-    it('returns 503 with cryptic error for blocked user IDs', async () => {
++  describe('Banned users', () => {
++    it('returns 403 with clear message for banned users', async () => {
+       const req = new NextRequest(
+         'http://localhost:3000/api/v1/chat/completions',
+         {
+@@ -380,11 +380,12 @@ describe('/api/v1/chat/completions POST endpoint', () => {
+         loggerWithContext: mockLoggerWithContext,
+       })
+ 
+-      expect(response.status).toBe(503)
++      expect(response.status).toBe(403)
+       const body = await response.json()
+       expect(body).toEqual({
+-        error: 'upstream_timeout',
+-        message: 'Overloaded. Request could not be processed',
++        error: 'account_suspended',
++        message:
++          'Your account has been suspended due to billing issues. Please contact support@codebuff.com to resolve this.',
+       })
+     })
+   })
+diff --git a/web/src/app/api/v1/chat/completions/_post.ts b/web/src/app/api/v1/chat/completions/_post.ts
+index 2a9ad3190..c7ebfedc6 100644
+--- a/web/src/app/api/v1/chat/completions/_post.ts
++++ b/web/src/app/api/v1/chat/completions/_post.ts
+@@ -149,14 +149,20 @@ export async function postChatCompletions(params: {
+ 
+     const userId = userInfo.id
+ 
+-    // Check if user is banned. Return fake overloaded error to avoid revealing the block.
++    // Check if user is banned.
++    // We use a clear, helpful message rather than a cryptic error because:
++    // 1. Legitimate users banned by mistake deserve to know what's happening
++    // 2. Bad actors will figure out they're banned regardless of the message
++    // 3. Clear messaging encourages resolution (matches our dispute notification email)
++    // 4. 403 Forbidden is the correct HTTP status for "you're not allowed"
+     if (userInfo.banned) {
+       return NextResponse.json(
+         {
+-          error: 'upstream_timeout',
+-          message: 'Overloaded. Request could not be processed',
++          error: 'account_suspended',
++          message:
++            'Your account has been suspended due to billing issues. Please contact support@codebuff.com to resolve this.',
+         },
+-        { status: 503 },
++        { status: 403 },
+       )
+     }
+ 
+diff --git a/web/src/lib/__tests__/ban-conditions.test.ts b/web/src/lib/__tests__/ban-conditions.test.ts
+new file mode 100644
+index 000000000..2be3fcef1
+--- /dev/null
++++ b/web/src/lib/__tests__/ban-conditions.test.ts
+@@ -0,0 +1,364 @@
++import { describe, it, expect, beforeEach, mock, spyOn } from 'bun:test'
++
++import {
++  DISPUTE_THRESHOLD,
++  DISPUTE_WINDOW_DAYS,
++  evaluateBanConditions,
++  getUserByStripeCustomerId,
++  banUser,
++  type BanConditionContext,
++} from '../ban-conditions'
++
++// Mock the database module
++const mockSelect = mock(() => ({
++  from: mock(() => ({
++    where: mock(() => ({
++      limit: mock(() => Promise.resolve([])),
++    })),
++  })),
++}))
++
++const mockUpdate = mock(() => ({
++  set: mock(() => ({
++    where: mock(() => Promise.resolve()),
++  })),
++}))
++
++mock.module('@codebuff/internal/db', () => ({
++  default: {
++    select: mockSelect,
++    update: mockUpdate,
++  },
++}))
++
++mock.module('@codebuff/internal/db/schema', () => ({
++  user: {
++    id: 'id',
++    banned: 'banned',
++    email: 'email',
++    name: 'name',
++    stripe_customer_id: 'stripe_customer_id',
++  },
++}))
++
++// Mock Stripe server
++const mockDisputesList = mock(() =>
++  Promise.resolve({
++    data: [],
++  }),
++)
++
++mock.module('@codebuff/internal/util/stripe', () => ({
++  stripeServer: {
++    disputes: {
++      list: mockDisputesList,
++    },
++  },
++}))
++
++// Mock drizzle-orm eq function
++mock.module('drizzle-orm', () => ({
++  eq: mock((a: any, b: any) => ({ column: a, value: b })),
++}))
++
++const createMockLogger = () => ({
++  debug: mock(() => {}),
++  info: mock(() => {}),
++  warn: mock(() => {}),
++  error: mock(() => {}),
++})
++
++describe('ban-conditions', () => {
++  beforeEach(() => {
++    mockDisputesList.mockClear()
++    mockSelect.mockClear()
++    mockUpdate.mockClear()
++  })
++
++  describe('DISPUTE_THRESHOLD and DISPUTE_WINDOW_DAYS', () => {
++    it('has expected default threshold', () => {
++      expect(DISPUTE_THRESHOLD).toBe(5)
++    })
++
++    it('has expected default window', () => {
++      expect(DISPUTE_WINDOW_DAYS).toBe(14)
++    })
++  })
++
++  describe('evaluateBanConditions', () => {
++    it('returns shouldBan: false when no disputes exist', async () => {
++      mockDisputesList.mockResolvedValueOnce({ data: [] })
++
++      const logger = createMockLogger()
++      const context: BanConditionContext = {
++        userId: 'user-123',
++        stripeCustomerId: 'cus_123',
++        logger,
++      }
++
++      const result = await evaluateBanConditions(context)
++
++      expect(result.shouldBan).toBe(false)
++      expect(result.reason).toBe('')
++    })
++
++    it('returns shouldBan: false when disputes are below threshold', async () => {
++      // Create disputes for the customer (below threshold)
++      const disputes = Array.from({ length: DISPUTE_THRESHOLD - 1 }, (_, i) => ({
++        id: `dp_${i}`,
++        charge: { customer: 'cus_123' },
++        created: Math.floor(Date.now() / 1000),
++      }))
++
++      mockDisputesList.mockResolvedValueOnce({ data: disputes })
++
++      const logger = createMockLogger()
++      const context: BanConditionContext = {
++        userId: 'user-123',
++        stripeCustomerId: 'cus_123',
++        logger,
++      }
++
++      const result = await evaluateBanConditions(context)
++
++      expect(result.shouldBan).toBe(false)
++      expect(result.reason).toBe('')
++    })
++
++    it('returns shouldBan: true when disputes meet threshold', async () => {
++      // Create disputes for the customer (at threshold)
++      const disputes = Array.from({ length: DISPUTE_THRESHOLD }, (_, i) => ({
++        id: `dp_${i}`,
++        charge: { customer: 'cus_123' },
++        created: Math.floor(Date.now() / 1000),
++      }))
++
++      mockDisputesList.mockResolvedValueOnce({ data: disputes })
++
++      const logger = createMockLogger()
++      const context: BanConditionContext = {
++        userId: 'user-123',
++        stripeCustomerId: 'cus_123',
++        logger,
++      }
++
++      const result = await evaluateBanConditions(context)
++
++      expect(result.shouldBan).toBe(true)
++      expect(result.reason).toContain(`${DISPUTE_THRESHOLD} disputes`)
++      expect(result.reason).toContain(`${DISPUTE_WINDOW_DAYS} days`)
++    })
++
++    it('returns shouldBan: true when disputes exceed threshold', async () => {
++      // Create disputes for the customer (above threshold)
++      const disputes = Array.from({ length: DISPUTE_THRESHOLD + 3 }, (_, i) => ({
++        id: `dp_${i}`,
++        charge: { customer: 'cus_123' },
++        created: Math.floor(Date.now() / 1000),
++      }))
++
++      mockDisputesList.mockResolvedValueOnce({ data: disputes })
++
++      const logger = createMockLogger()
++      const context: BanConditionContext = {
++        userId: 'user-123',
++        stripeCustomerId: 'cus_123',
++        logger,
++      }
++
++      const result = await evaluateBanConditions(context)
++
++      expect(result.shouldBan).toBe(true)
++      expect(result.reason).toContain(`${DISPUTE_THRESHOLD + 3} disputes`)
++    })
++
++    it('only counts disputes for the specified customer', async () => {
++      // Mix of disputes from different customers
++      const disputes = [
++        // Disputes for our customer
++        { id: 'dp_1', charge: { customer: 'cus_123' }, created: Math.floor(Date.now() / 1000) },
++        { id: 'dp_2', charge: { customer: 'cus_123' }, created: Math.floor(Date.now() / 1000) },
++        // Disputes for other customers (should be ignored)
++        { id: 'dp_3', charge: { customer: 'cus_other' }, created: Math.floor(Date.now() / 1000) },
++        { id: 'dp_4', charge: { customer: 'cus_different' }, created: Math.floor(Date.now() / 1000) },
++        { id: 'dp_5', charge: { customer: 'cus_another' }, created: Math.floor(Date.now() / 1000) },
++        { id: 'dp_6', charge: { customer: 'cus_more' }, created: Math.floor(Date.now() / 1000) },
++      ]
++
++      mockDisputesList.mockResolvedValueOnce({ data: disputes })
++
++      const logger = createMockLogger()
++      const context: BanConditionContext = {
++        userId: 'user-123',
++        stripeCustomerId: 'cus_123',
++        logger,
++      }
++
++      const result = await evaluateBanConditions(context)
++
++      // Only 2 disputes for cus_123, which is below threshold
++      expect(result.shouldBan).toBe(false)
++    })
++
++    it('handles string customer ID in charge object', async () => {
++      // Customer ID as string instead of object
++      const disputes = Array.from({ length: DISPUTE_THRESHOLD }, (_, i) => ({
++        id: `dp_${i}`,
++        charge: { customer: 'cus_123' }, // String ID
++        created: Math.floor(Date.now() / 1000),
++      }))
++
++      mockDisputesList.mockResolvedValueOnce({ data: disputes })
++
++      const logger = createMockLogger()
++      const context: BanConditionContext = {
++        userId: 'user-123',
++        stripeCustomerId: 'cus_123',
++        logger,
++      }
++
++      const result = await evaluateBanConditions(context)
++
++      expect(result.shouldBan).toBe(true)
++    })
++
++    it('handles customer object with id property', async () => {
++      // Customer as object with id property
++      const disputes = Array.from({ length: DISPUTE_THRESHOLD }, (_, i) => ({
++        id: `dp_${i}`,
++        charge: { customer: { id: 'cus_123' } }, // Object with id
++        created: Math.floor(Date.now() / 1000),
++      }))
++
++      mockDisputesList.mockResolvedValueOnce({ data: disputes })
++
++      const logger = createMockLogger()
++      const context: BanConditionContext = {
++        userId: 'user-123',
++        stripeCustomerId: 'cus_123',
++        logger,
++      }
++
++      const result = await evaluateBanConditions(context)
++
++      expect(result.shouldBan).toBe(true)
++    })
++
++    it('calls Stripe API with correct time window', async () => {
++      mockDisputesList.mockResolvedValueOnce({ data: [] })
++
++      const logger = createMockLogger()
++      const context: BanConditionContext = {
++        userId: 'user-123',
++        stripeCustomerId: 'cus_123',
++        logger,
++      }
++
++      const beforeCall = Math.floor(Date.now() / 1000)
++      await evaluateBanConditions(context)
++      const afterCall = Math.floor(Date.now() / 1000)
++
++      expect(mockDisputesList).toHaveBeenCalledTimes(1)
++      const callArgs = mockDisputesList.mock.calls[0][0]
++      expect(callArgs.limit).toBe(100)
++
++      // Verify the created.gte is within the expected window
++      const expectedWindowStart = beforeCall - DISPUTE_WINDOW_DAYS * 24 * 60 * 60
++      const windowTolerance = afterCall - beforeCall + 1 // Allow for time passing during test
++      expect(callArgs.created.gte).toBeGreaterThanOrEqual(expectedWindowStart - windowTolerance)
++      expect(callArgs.created.gte).toBeLessThanOrEqual(expectedWindowStart + windowTolerance)
++    })
++
++    it('logs debug message after checking condition', async () => {
++      mockDisputesList.mockResolvedValueOnce({ data: [] })
++
++      const logger = createMockLogger()
++      const context: BanConditionContext = {
++        userId: 'user-123',
++        stripeCustomerId: 'cus_123',
++        logger,
++      }
++
++      await evaluateBanConditions(context)
++
++      expect(logger.debug).toHaveBeenCalled()
++    })
++  })
++
++  describe('getUserByStripeCustomerId', () => {
++    it('returns user when found', async () => {
++      const mockUser = {
++        id: 'user-123',
++        banned: false,
++        email: 'test@example.com',
++        name: 'Test User',
++      }
++
++      const limitMock = mock(() => Promise.resolve([mockUser]))
++      const whereMock = mock(() => ({ limit: limitMock }))
++      const fromMock = mock(() => ({ where: whereMock }))
++      mockSelect.mockReturnValueOnce({ from: fromMock })
++
++      const result = await getUserByStripeCustomerId('cus_123')
++
++      expect(result).toEqual(mockUser)
++    })
++
++    it('returns null when user not found', async () => {
++      const limitMock = mock(() => Promise.resolve([]))
++      const whereMock = mock(() => ({ limit: limitMock }))
++      const fromMock = mock(() => ({ where: whereMock }))
++      mockSelect.mockReturnValueOnce({ from: fromMock })
++
++      const result = await getUserByStripeCustomerId('cus_nonexistent')
++
++      expect(result).toBeNull()
++    })
++
++    it('queries with correct stripe_customer_id', async () => {
++      const limitMock = mock(() => Promise.resolve([]))
++      const whereMock = mock(() => ({ limit: limitMock }))
++      const fromMock = mock(() => ({ where: whereMock }))
++      mockSelect.mockReturnValueOnce({ from: fromMock })
++
++      await getUserByStripeCustomerId('cus_test_123')
++
++      expect(mockSelect).toHaveBeenCalled()
++      expect(fromMock).toHaveBeenCalled()
++      expect(whereMock).toHaveBeenCalled()
++      expect(limitMock).toHaveBeenCalledWith(1)
++    })
++  })
++
++  describe('banUser', () => {
++    it('updates user banned status to true', async () => {
++      const whereMock = mock(() => Promise.resolve())
++      const setMock = mock(() => ({ where: whereMock }))
++      mockUpdate.mockReturnValueOnce({ set: setMock })
++
++      const logger = createMockLogger()
++
++      await banUser('user-123', 'Test ban reason', logger)
++
++      expect(mockUpdate).toHaveBeenCalled()
++      expect(setMock).toHaveBeenCalledWith({ banned: true })
++    })
++
++    it('logs the ban action with user ID and reason', async () => {
++      const whereMock = mock(() => Promise.resolve())
++      const setMock = mock(() => ({ where: whereMock }))
++      mockUpdate.mockReturnValueOnce({ set: setMock })
++
++      const logger = createMockLogger()
++      const userId = 'user-123'
++      const reason = 'Too many disputes'
++
++      await banUser(userId, reason, logger)
++
++      expect(logger.info).toHaveBeenCalledWith(
++        { userId, reason },
++        'User banned',
++      )
++    })
++  })
++})
+diff --git a/web/src/lib/ban-conditions.ts b/web/src/lib/ban-conditions.ts
+new file mode 100644
+index 000000000..9880f6a3b
+--- /dev/null
++++ b/web/src/lib/ban-conditions.ts
+@@ -0,0 +1,163 @@
++import db from '@codebuff/internal/db'
++import * as schema from '@codebuff/internal/db/schema'
++import { stripeServer } from '@codebuff/internal/util/stripe'
++import { eq } from 'drizzle-orm'
++
++import type { Logger } from '@codebuff/common/types/contracts/logger'
++
++// =============================================================================
++// CONFIGURATION - Edit these values to adjust ban thresholds
++// =============================================================================
++
++/** Number of disputes within the time window that triggers a ban */
++export const DISPUTE_THRESHOLD = 5
++
++/** Time window in days to count disputes */
++export const DISPUTE_WINDOW_DAYS = 14
++
++// =============================================================================
++// TYPES
++// =============================================================================
++
++export interface BanConditionResult {
++  shouldBan: boolean
++  reason: string
++}
++
++export interface BanConditionContext {
++  userId: string
++  stripeCustomerId: string
++  logger: Logger
++}
++
++type BanCondition = (
++  context: BanConditionContext,
++) => Promise<BanConditionResult>
++
++// =============================================================================
++// BAN CONDITIONS
++// Add new condition functions here and register them in BAN_CONDITIONS array
++// =============================================================================
++
++/**
++ * Check if user has too many disputes in the configured time window
++ */
++async function disputeThresholdCondition(
++  context: BanConditionContext,
++): Promise<BanConditionResult> {
++  const { stripeCustomerId, logger } = context
++
++  const windowStart = Math.floor(
++    (Date.now() - DISPUTE_WINDOW_DAYS * 24 * 60 * 60 * 1000) / 1000,
++  )
++
++  const disputes = await stripeServer.disputes.list({
++    limit: 100,
++    created: { gte: windowStart },
++  })
++
++  // Filter to only this customer's disputes
++  const customerDisputes = disputes.data.filter((dispute) => {
++    const chargeCustomer = (dispute.charge as any)?.customer
++    if (typeof chargeCustomer === 'string') {
++      return chargeCustomer === stripeCustomerId
++    }
++    return chargeCustomer?.id === stripeCustomerId
++  })
++
++  const disputeCount = customerDisputes.length
++
++  logger.debug(
++    { stripeCustomerId, disputeCount, threshold: DISPUTE_THRESHOLD },
++    'Checked dispute threshold condition',
++  )
++
++  if (disputeCount >= DISPUTE_THRESHOLD) {
++    return {
++      shouldBan: true,
++      reason: `${disputeCount} disputes in past ${DISPUTE_WINDOW_DAYS} days (threshold: ${DISPUTE_THRESHOLD})`,
++    }
++  }
++
++  return {
++    shouldBan: false,
++    reason: '',
++  }
++}
++
++// =============================================================================
++// CONDITION REGISTRY
++// Add new conditions to this array to enable them
++// =============================================================================
++
++const BAN_CONDITIONS: BanCondition[] = [
++  disputeThresholdCondition,
++  // Add future conditions here, e.g.:
++  // ipRangeCondition,
++  // usageAnomalyCondition,
++]
++
++// =============================================================================
++// PUBLIC API
++// =============================================================================
++
++/**
++ * Look up a user by their Stripe customer ID
++ */
++export async function getUserByStripeCustomerId(
++  stripeCustomerId: string,
++): Promise<{
++  id: string
++  banned: boolean
++  email: string
++  name: string | null
++} | null> {
++  const users = await db
++    .select({
++      id: schema.user.id,
++      banned: schema.user.banned,
++      email: schema.user.email,
++      name: schema.user.name,
++    })
++    .from(schema.user)
++    .where(eq(schema.user.stripe_customer_id, stripeCustomerId))
++    .limit(1)
++
++  return users[0] ?? null
++}
++
++/**
++ * Ban a user and log the action
++ */
++export async function banUser(
++  userId: string,
++  reason: string,
++  logger: Logger,
++): Promise<void> {
++  await db
++    .update(schema.user)
++    .set({ banned: true })
++    .where(eq(schema.user.id, userId))
++
++  logger.info({ userId, reason }, 'User banned')
++}
++
++/**
++ * Evaluate all ban conditions for a user
++ * Returns as soon as any condition triggers a ban
++ */
++export async function evaluateBanConditions(
++  context: BanConditionContext,
++): Promise<BanConditionResult> {
++  for (const condition of BAN_CONDITIONS) {
++    const result = await condition(context)
++    if (result.shouldBan) {
++      return result
++    }
++  }
++
++  return {
++    shouldBan: false,
++    reason: '',
++  }
++}

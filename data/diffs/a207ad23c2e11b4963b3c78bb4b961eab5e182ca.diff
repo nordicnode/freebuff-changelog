@@ -1,0 +1,1537 @@
+diff --git a/.env.example b/.env.example
+index 2468ef832..8f81f4a5f 100644
+--- a/.env.example
++++ b/.env.example
+@@ -18,6 +18,9 @@ STRIPE_SECRET_KEY=sk_test_dummy_stripe_secret
+ STRIPE_WEBHOOK_SECRET_KEY=whsec_dummy_webhook_secret
+ STRIPE_USAGE_PRICE_ID=price_dummy_usage_id
+ STRIPE_TEAM_FEE_PRICE_ID=price_dummy_team_fee_id
++STRIPE_SUBSCRIPTION_100_PRICE_ID=price_dummy_subscription_100_id
++STRIPE_SUBSCRIPTION_200_PRICE_ID=price_dummy_subscription_200_id
++STRIPE_SUBSCRIPTION_500_PRICE_ID=price_dummy_subscription_500_id
+ 
+ # External Services
+ LINKUP_API_KEY=dummy_linkup_key
+diff --git a/common/src/constants/analytics-events.ts b/common/src/constants/analytics-events.ts
+index e620fdb72..a3d05e2ae 100644
+--- a/common/src/constants/analytics-events.ts
++++ b/common/src/constants/analytics-events.ts
+@@ -30,6 +30,16 @@ export enum AnalyticsEvent {
+   ADVISORY_LOCK_CONTENTION = 'backend.advisory_lock_contention',
+   TRANSACTION_RETRY_THRESHOLD_EXCEEDED = 'backend.transaction_retry_threshold_exceeded',
+ 
++  // Backend - Subscription
++  SUBSCRIPTION_CREATED = 'backend.subscription_created',
++  SUBSCRIPTION_CANCELED = 'backend.subscription_canceled',
++  SUBSCRIPTION_PAYMENT_FAILED = 'backend.subscription_payment_failed',
++  SUBSCRIPTION_BLOCK_CREATED = 'backend.subscription_block_created',
++  SUBSCRIPTION_BLOCK_LIMIT_HIT = 'backend.subscription_block_limit_hit',
++  SUBSCRIPTION_WEEKLY_LIMIT_HIT = 'backend.subscription_weekly_limit_hit',
++  SUBSCRIPTION_CREDITS_MIGRATED = 'backend.subscription_credits_migrated',
++  SUBSCRIPTION_TIER_CHANGED = 'backend.subscription_tier_changed',
++
+   // Web
+   SIGNUP = 'web.signup',
+ 
+diff --git a/common/src/constants/grant-priorities.ts b/common/src/constants/grant-priorities.ts
+index a2c1c84c3..49cae0786 100644
+--- a/common/src/constants/grant-priorities.ts
++++ b/common/src/constants/grant-priorities.ts
+@@ -1,6 +1,7 @@
+ import type { GrantType } from '@codebuff/common/types/grant'
+ 
+ export const GRANT_PRIORITIES: Record<GrantType, number> = {
++  subscription: 10,
+   free: 20,
+   referral: 30,
+   ad: 40,
+diff --git a/common/src/constants/subscription-plans.ts b/common/src/constants/subscription-plans.ts
+new file mode 100644
+index 000000000..23309e2f4
+--- /dev/null
++++ b/common/src/constants/subscription-plans.ts
+@@ -0,0 +1,49 @@
++export const SUBSCRIPTION_DISPLAY_NAME = 'Strong' as const
++
++export interface TierConfig {
++  monthlyPrice: number
++  creditsPerBlock: number
++  blockDurationHours: number
++  weeklyCreditsLimit: number
++}
++
++export const SUBSCRIPTION_TIERS = {
++  100: {
++    monthlyPrice: 100,
++    creditsPerBlock: 400,
++    blockDurationHours: 5,
++    weeklyCreditsLimit: 4000,
++  },
++  200: {
++    monthlyPrice: 200,
++    creditsPerBlock: 1200,
++    blockDurationHours: 5,
++    weeklyCreditsLimit: 12000,
++  },
++  500: {
++    monthlyPrice: 500,
++    creditsPerBlock: 3200,
++    blockDurationHours: 5,
++    weeklyCreditsLimit: 32000,
++  },
++} as const satisfies Record<number, TierConfig>
++
++export type SubscriptionTierPrice = keyof typeof SUBSCRIPTION_TIERS
++
++export const DEFAULT_TIER = SUBSCRIPTION_TIERS[200]
++
++export function createSubscriptionPriceMappings(priceIds: Record<SubscriptionTierPrice, string>) {
++  const priceToTier = Object.fromEntries(
++    Object.entries(priceIds).map(([tier, priceId]) => [priceId, Number(tier) as SubscriptionTierPrice]),
++  ) as Record<string, SubscriptionTierPrice>
++
++  function getTierFromPriceId(priceId: string): SubscriptionTierPrice | null {
++    return priceToTier[priceId] ?? null
++  }
++
++  function getPriceIdFromTier(tier: SubscriptionTierPrice): string | null {
++    return priceIds[tier] ?? null
++  }
++
++  return { getTierFromPriceId, getPriceIdFromTier }
++}
+diff --git a/common/src/types/grant.ts b/common/src/types/grant.ts
+index 93d708cb6..33534a435 100644
+--- a/common/src/types/grant.ts
++++ b/common/src/types/grant.ts
+@@ -1,6 +1,7 @@
+ export type GrantType =
+   | 'free'
+   | 'referral'
++  | 'subscription'
+   | 'purchase'
+   | 'admin'
+   | 'organization'
+@@ -9,6 +10,7 @@ export type GrantType =
+ export const GrantTypeValues = [
+   'free',
+   'referral',
++  'subscription',
+   'purchase',
+   'admin',
+   'organization',
+diff --git a/packages/billing/src/__tests__/subscription.test.ts b/packages/billing/src/__tests__/subscription.test.ts
+new file mode 100644
+index 000000000..b563eaf94
+--- /dev/null
++++ b/packages/billing/src/__tests__/subscription.test.ts
+@@ -0,0 +1,639 @@
++import { describe, expect, it } from 'bun:test'
++
++import {
++  DEFAULT_TIER,
++  SUBSCRIPTION_TIERS,
++} from '@codebuff/common/constants/subscription-plans'
++import type { Logger } from '@codebuff/common/types/contracts/logger'
++
++import {
++  checkRateLimit,
++  ensureActiveBlockGrantCallback,
++  expireActiveBlockGrants,
++  getWeekEnd,
++  getWeekStart,
++  getSubscriptionLimits,
++  isWeeklyLimitError,
++  migrateUnusedCredits,
++} from '../subscription'
++
++import type { BlockGrant, SubscriptionRow, WeeklyLimitError } from '../subscription'
++
++const logger: Logger = {
++  debug: () => {},
++  error: () => {},
++  info: () => {},
++  warn: () => {},
++}
++
++// Helper to create a UTC date on a specific day-of-week
++// dayOfWeek: 0=Sun, 1=Mon, ..., 6=Sat
++function utcDate(year: number, month: number, day: number): Date {
++  const d = new Date(Date.UTC(year, month - 1, day))
++  return d
++}
++
++function createMockSubscription(overrides?: Partial<{
++  stripe_subscription_id: string
++  tier: number
++  billing_period_start: Date
++}>) {
++  return {
++    stripe_subscription_id: 'sub-test-123',
++    tier: 200,
++    billing_period_start: utcDate(2025, 1, 8), // Wednesday
++    user_id: 'user-123',
++    status: 'active',
++    ...overrides,
++  } as SubscriptionRow
++}
++
++interface MockCaptures {
++  insertValues: Record<string, unknown>[]
++  updateSets: Record<string, unknown>[]
++}
++
++function createSequentialMock(options: {
++  selectResults?: unknown[][]
++  updateResults?: unknown[][]
++  insertResults?: unknown[][]
++}): { conn: any; captures: MockCaptures } {
++  let selectIdx = 0
++  let updateIdx = 0
++  let insertIdx = 0
++  const captures: MockCaptures = { insertValues: [], updateSets: [] }
++
++  function makeChain(result: unknown, type?: 'insert' | 'update'): Record<string, unknown> {
++    const chain: Record<string, unknown> = {}
++    for (const m of ['from', 'where', 'orderBy', 'limit', 'returning', 'onConflictDoNothing']) {
++      chain[m] = () => chain
++    }
++    chain.values = (data: Record<string, unknown>) => {
++      if (type === 'insert') captures.insertValues.push(data)
++      return chain
++    }
++    chain.set = (data: Record<string, unknown>) => {
++      if (type === 'update') captures.updateSets.push(data)
++      return chain
++    }
++    chain.then = (resolve: (v: unknown) => void, reject?: (e: unknown) => void) =>
++      Promise.resolve(result).then(resolve, reject)
++    return chain
++  }
++
++  const conn = {
++    select: () => {
++      const result = (options.selectResults ?? [])[selectIdx] ?? []
++      selectIdx++
++      return makeChain(result)
++    },
++    update: () => {
++      const result = (options.updateResults ?? [])[updateIdx] ?? []
++      updateIdx++
++      return makeChain(result, 'update')
++    },
++    insert: () => {
++      const result = (options.insertResults ?? [])[insertIdx] ?? []
++      insertIdx++
++      return makeChain(result, 'insert')
++    },
++  }
++
++  return { conn, captures }
++}
++
++describe('subscription', () => {
++  describe('getWeekStart', () => {
++    it('should return start of today when now is the same day-of-week as billing start', () => {
++      // 2025-01-08 is a Wednesday (3)
++      const billingStart = utcDate(2025, 1, 8)
++      // 2025-01-15 is also a Wednesday (3)
++      const now = utcDate(2025, 1, 15)
++
++      const result = getWeekStart(billingStart, now)
++
++      expect(result).toEqual(utcDate(2025, 1, 15))
++    })
++
++    it('should go back to the billing day-of-week when now is later in the week', () => {
++      // 2025-01-08 is a Wednesday (3)
++      const billingStart = utcDate(2025, 1, 8)
++      // 2025-01-17 is a Friday (5) — 2 days after Wednesday
++      const now = utcDate(2025, 1, 17)
++
++      const result = getWeekStart(billingStart, now)
++
++      // Should go back to Wednesday 2025-01-15
++      expect(result).toEqual(utcDate(2025, 1, 15))
++    })
++
++    it('should go back to previous week billing day when now is earlier in the week', () => {
++      // 2025-01-08 is a Wednesday (3)
++      const billingStart = utcDate(2025, 1, 8)
++      // 2025-01-13 is a Monday (1) — before Wednesday
++      const now = utcDate(2025, 1, 13)
++
++      const result = getWeekStart(billingStart, now)
++
++      // Should go back 5 days to Wednesday 2025-01-08
++      expect(result).toEqual(utcDate(2025, 1, 8))
++    })
++
++    it('should handle billing start on Sunday with now on Saturday', () => {
++      // 2025-01-05 is a Sunday (0)
++      const billingStart = utcDate(2025, 1, 5)
++      // 2025-01-18 is a Saturday (6) — 6 days after Sunday
++      const now = utcDate(2025, 1, 18)
++
++      const result = getWeekStart(billingStart, now)
++
++      // Should go back 6 days to Sunday 2025-01-12
++      expect(result).toEqual(utcDate(2025, 1, 12))
++    })
++
++    it('should handle billing start on Saturday with now on Sunday', () => {
++      // 2025-01-04 is a Saturday (6)
++      const billingStart = utcDate(2025, 1, 4)
++      // 2025-01-12 is a Sunday (0) — 1 day after Saturday
++      const now = utcDate(2025, 1, 12)
++
++      const result = getWeekStart(billingStart, now)
++
++      // Should go back 1 day to Saturday 2025-01-11
++      expect(result).toEqual(utcDate(2025, 1, 11))
++    })
++
++    it('should zero out hours/minutes/seconds', () => {
++      const billingStart = utcDate(2025, 1, 8) // Wednesday
++      const now = new Date(Date.UTC(2025, 0, 17, 14, 30, 45, 123)) // Friday with time
++
++      const result = getWeekStart(billingStart, now)
++
++      expect(result.getUTCHours()).toBe(0)
++      expect(result.getUTCMinutes()).toBe(0)
++      expect(result.getUTCSeconds()).toBe(0)
++      expect(result.getUTCMilliseconds()).toBe(0)
++    })
++  })
++
++  describe('getWeekEnd', () => {
++    it('should return exactly 7 days after week start', () => {
++      const billingStart = utcDate(2025, 1, 8) // Wednesday
++      const now = utcDate(2025, 1, 17) // Friday
++
++      const weekStart = getWeekStart(billingStart, now)
++      const weekEnd = getWeekEnd(billingStart, now)
++
++      const diffMs = weekEnd.getTime() - weekStart.getTime()
++      const diffDays = diffMs / (24 * 60 * 60 * 1000)
++
++      expect(diffDays).toBe(7)
++    })
++
++    it('should return start of next billing-aligned week', () => {
++      // 2025-01-08 is a Wednesday
++      const billingStart = utcDate(2025, 1, 8)
++      // 2025-01-17 is a Friday → week start is Wed 2025-01-15
++      const now = utcDate(2025, 1, 17)
++
++      const result = getWeekEnd(billingStart, now)
++
++      // Next Wednesday: 2025-01-22
++      expect(result).toEqual(utcDate(2025, 1, 22))
++    })
++  })
++
++  describe('isWeeklyLimitError', () => {
++    it('should return true for WeeklyLimitError', () => {
++      const error: WeeklyLimitError = {
++        error: 'weekly_limit_reached',
++        used: 1000,
++        limit: 1000,
++        resetsAt: new Date(),
++      }
++
++      expect(isWeeklyLimitError(error)).toBe(true)
++    })
++
++    it('should return false for BlockGrant', () => {
++      const grant: BlockGrant = {
++        grantId: 'grant-1',
++        credits: 500,
++        expiresAt: new Date(),
++        isNew: true,
++      }
++
++      expect(isWeeklyLimitError(grant)).toBe(false)
++    })
++  })
++
++  describe('getSubscriptionLimits', () => {
++    function createConnMock(overrides: Array<{
++      credits_per_block: number
++      block_duration_hours: number
++      weekly_credit_limit: number
++    }>) {
++      return {
++        select: () => ({
++          from: () => ({
++            where: () => ({
++              limit: () => overrides,
++            }),
++          }),
++        }),
++        update: () => ({}),
++        insert: () => ({}),
++      } as any
++    }
++
++    it('should use limit override when one exists', async () => {
++      const conn = createConnMock([{
++        credits_per_block: 9999,
++        block_duration_hours: 10,
++        weekly_credit_limit: 50000,
++      }])
++
++      const result = await getSubscriptionLimits({
++        userId: 'user-123',
++        logger,
++        conn,
++        tier: 200,
++      })
++
++      expect(result).toEqual({
++        creditsPerBlock: 9999,
++        blockDurationHours: 10,
++        weeklyCreditsLimit: 50000,
++      })
++    })
++
++    it('should use tier config when no override exists and tier is valid', async () => {
++      const conn = createConnMock([])
++
++      const result = await getSubscriptionLimits({
++        userId: 'user-123',
++        logger,
++        conn,
++        tier: 100,
++      })
++
++      expect(result).toEqual({
++        creditsPerBlock: SUBSCRIPTION_TIERS[100].creditsPerBlock,
++        blockDurationHours: SUBSCRIPTION_TIERS[100].blockDurationHours,
++        weeklyCreditsLimit: SUBSCRIPTION_TIERS[100].weeklyCreditsLimit,
++      })
++    })
++
++    it('should fall back to DEFAULT_TIER when tier is null', async () => {
++      const conn = createConnMock([])
++
++      const result = await getSubscriptionLimits({
++        userId: 'user-123',
++        logger,
++        conn,
++        tier: null,
++      })
++
++      expect(result).toEqual({
++        creditsPerBlock: DEFAULT_TIER.creditsPerBlock,
++        blockDurationHours: DEFAULT_TIER.blockDurationHours,
++        weeklyCreditsLimit: DEFAULT_TIER.weeklyCreditsLimit,
++      })
++    })
++
++    it('should fall back to DEFAULT_TIER when tier is invalid', async () => {
++      const conn = createConnMock([])
++
++      const result = await getSubscriptionLimits({
++        userId: 'user-123',
++        logger,
++        conn,
++        tier: 999,
++      })
++
++      expect(result).toEqual({
++        creditsPerBlock: DEFAULT_TIER.creditsPerBlock,
++        blockDurationHours: DEFAULT_TIER.blockDurationHours,
++        weeklyCreditsLimit: DEFAULT_TIER.weeklyCreditsLimit,
++      })
++    })
++
++  })
++
++  describe('migrateUnusedCredits', () => {
++    const futureDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
++
++    it('should insert idempotency marker when no unused grants exist', async () => {
++      const { conn, captures } = createSequentialMock({
++        selectResults: [[]], // no unused grants
++      })
++
++      await migrateUnusedCredits({
++        tx: conn,
++        userId: 'user-123',
++        subscriptionId: 'sub-123',
++        expiresAt: futureDate,
++        logger,
++      })
++
++      expect(captures.insertValues).toHaveLength(1)
++      expect(captures.insertValues[0].operation_id).toBe('subscribe-migrate-sub-123')
++      expect(captures.insertValues[0].principal).toBe(0)
++      expect(captures.insertValues[0].balance).toBe(0)
++    })
++
++    it('should zero old grants and create migration grant with correct total', async () => {
++      const { conn, captures } = createSequentialMock({
++        selectResults: [[
++          { operation_id: 'g1', balance: 300 },
++          { operation_id: 'g2', balance: 200 },
++        ]],
++      })
++
++      await migrateUnusedCredits({
++        tx: conn,
++        userId: 'user-123',
++        subscriptionId: 'sub-123',
++        expiresAt: futureDate,
++        logger,
++      })
++
++      expect(captures.updateSets).toHaveLength(2)
++      expect(captures.updateSets[0]).toEqual({
++        balance: 0,
++        description: 'Migrated 300 credits to subscribe-migrate-sub-123',
++      })
++      expect(captures.updateSets[1]).toEqual({
++        balance: 0,
++        description: 'Migrated 200 credits to subscribe-migrate-sub-123',
++      })
++
++      expect(captures.insertValues).toHaveLength(1)
++      expect(captures.insertValues[0].principal).toBe(500)
++      expect(captures.insertValues[0].balance).toBe(500)
++      expect(captures.insertValues[0].operation_id).toBe('subscribe-migrate-sub-123')
++      expect(captures.insertValues[0].type).toBe('free')
++    })
++  })
++
++  describe('expireActiveBlockGrants', () => {
++    it('should return count of expired grants', async () => {
++      const { conn } = createSequentialMock({
++        updateResults: [[{ operation_id: 'op1' }, { operation_id: 'op2' }]],
++      })
++
++      const count = await expireActiveBlockGrants({
++        userId: 'user-123',
++        subscriptionId: 'sub-123',
++        logger,
++        conn,
++      })
++
++      expect(count).toBe(2)
++    })
++
++    it('should return 0 when no active grants exist', async () => {
++      const { conn } = createSequentialMock({
++        updateResults: [[]],
++      })
++
++      const count = await expireActiveBlockGrants({
++        userId: 'user-123',
++        subscriptionId: 'sub-123',
++        logger,
++        conn,
++      })
++
++      expect(count).toBe(0)
++    })
++  })
++
++  describe('checkRateLimit', () => {
++    const subscription = createMockSubscription()
++
++    it('should report weekly_limit when usage reaches limit', async () => {
++      // tier 200 → weeklyCreditsLimit: 12000
++      const { conn } = createSequentialMock({
++        selectResults: [
++          [],                  // no limit overrides
++          [{ total: 12000 }], // weekly usage at limit
++        ],
++      })
++
++      const result = await checkRateLimit({
++        userId: 'user-123',
++        subscription,
++        logger,
++        conn,
++      })
++
++      expect(result.limited).toBe(true)
++      expect(result.reason).toBe('weekly_limit')
++      expect(result.canStartNewBlock).toBe(false)
++      expect(result.weeklyUsed).toBe(12000)
++      expect(result.weeklyLimit).toBe(SUBSCRIPTION_TIERS[200].weeklyCreditsLimit)
++    })
++
++    it('should allow new block when no active block exists', async () => {
++      const { conn } = createSequentialMock({
++        selectResults: [
++          [],                 // no limit overrides
++          [{ total: 5000 }], // under weekly limit
++          [],                 // no active blocks
++        ],
++      })
++
++      const result = await checkRateLimit({
++        userId: 'user-123',
++        subscription,
++        logger,
++        conn,
++      })
++
++      expect(result.limited).toBe(false)
++      expect(result.canStartNewBlock).toBe(true)
++      expect(result.weeklyUsed).toBe(5000)
++    })
++
++    it('should report block_exhausted when block has no balance', async () => {
++      const futureExpiry = new Date(Date.now() + 3 * 60 * 60 * 1000)
++      const { conn } = createSequentialMock({
++        selectResults: [
++          [],                 // no limit overrides
++          [{ total: 5000 }], // under weekly limit
++          [{ balance: 0, principal: 1200, expires_at: futureExpiry }],
++        ],
++      })
++
++      const result = await checkRateLimit({
++        userId: 'user-123',
++        subscription,
++        logger,
++        conn,
++      })
++
++      expect(result.limited).toBe(true)
++      expect(result.reason).toBe('block_exhausted')
++      expect(result.blockUsed).toBe(1200)
++      expect(result.blockLimit).toBe(1200)
++    })
++
++    it('should report not limited when block has remaining credits', async () => {
++      const futureExpiry = new Date(Date.now() + 3 * 60 * 60 * 1000)
++      const { conn } = createSequentialMock({
++        selectResults: [
++          [],                 // no limit overrides
++          [{ total: 5000 }], // under weekly limit
++          [{ balance: 800, principal: 1200, expires_at: futureExpiry }],
++        ],
++      })
++
++      const result = await checkRateLimit({
++        userId: 'user-123',
++        subscription,
++        logger,
++        conn,
++      })
++
++      expect(result.limited).toBe(false)
++      expect(result.canStartNewBlock).toBe(false)
++      expect(result.blockUsed).toBe(400)
++      expect(result.blockLimit).toBe(1200)
++    })
++  })
++
++  describe('ensureActiveBlockGrantCallback', () => {
++    const subscription = createMockSubscription()
++
++    it('should return existing active grant', async () => {
++      const futureExpiry = new Date(Date.now() + 3 * 60 * 60 * 1000)
++      const { conn } = createSequentialMock({
++        selectResults: [
++          [{ operation_id: 'existing-grant', balance: 500, expires_at: futureExpiry }],
++        ],
++      })
++
++      const result = await ensureActiveBlockGrantCallback({
++        conn,
++        userId: 'user-123',
++        subscription,
++        logger,
++      })
++
++      expect(isWeeklyLimitError(result)).toBe(false)
++      const grant = result as BlockGrant
++      expect(grant.grantId).toBe('existing-grant')
++      expect(grant.credits).toBe(500)
++      expect(grant.isNew).toBe(false)
++    })
++
++    it('should return weekly limit error when limit is reached', async () => {
++      // tier 200 → weeklyCreditsLimit: 12000
++      const { conn } = createSequentialMock({
++        selectResults: [
++          [],                  // no existing grants
++          [],                  // no limit overrides
++          [{ total: 12000 }], // weekly limit reached
++        ],
++      })
++
++      const result = await ensureActiveBlockGrantCallback({
++        conn,
++        userId: 'user-123',
++        subscription,
++        logger,
++      })
++
++      expect(isWeeklyLimitError(result)).toBe(true)
++      const error = result as WeeklyLimitError
++      expect(error.error).toBe('weekly_limit_reached')
++      expect(error.used).toBe(12000)
++      expect(error.limit).toBe(SUBSCRIPTION_TIERS[200].weeklyCreditsLimit)
++    })
++
++    it('should create new block grant when none exists', async () => {
++      const now = new Date('2025-01-15T10:00:00Z')
++      const { conn } = createSequentialMock({
++        selectResults: [
++          [],               // no existing grants
++          [],               // no limit overrides
++          [{ total: 0 }],  // no weekly usage
++        ],
++        insertResults: [
++          [{ operation_id: 'new-block-grant' }],
++        ],
++      })
++
++      const result = await ensureActiveBlockGrantCallback({
++        conn,
++        userId: 'user-123',
++        subscription,
++        logger,
++        now,
++      })
++
++      expect(isWeeklyLimitError(result)).toBe(false)
++      const grant = result as BlockGrant
++      expect(grant.isNew).toBe(true)
++      expect(grant.grantId).toBe('new-block-grant')
++      expect(grant.credits).toBe(SUBSCRIPTION_TIERS[200].creditsPerBlock)
++      expect(grant.expiresAt.getTime()).toBe(
++        now.getTime() + SUBSCRIPTION_TIERS[200].blockDurationHours * 60 * 60 * 1000,
++      )
++    })
++
++    it('should cap block credits to weekly remaining', async () => {
++      // tier 200: creditsPerBlock=1200, weeklyCreditsLimit=12000
++      // weekly used=11500 → remaining=500, block capped to 500
++      const now = new Date('2025-01-15T10:00:00Z')
++      const { conn, captures } = createSequentialMock({
++        selectResults: [
++          [],                  // no existing grants
++          [],                  // no limit overrides
++          [{ total: 11500 }], // 500 remaining
++        ],
++        insertResults: [
++          [{ operation_id: 'capped-block' }],
++        ],
++      })
++
++      const result = await ensureActiveBlockGrantCallback({
++        conn,
++        userId: 'user-123',
++        subscription,
++        logger,
++        now,
++      })
++
++      expect(isWeeklyLimitError(result)).toBe(false)
++      const grant = result as BlockGrant
++      expect(grant.credits).toBe(500)
++      expect(captures.insertValues[0].principal).toBe(500)
++      expect(captures.insertValues[0].balance).toBe(500)
++    })
++
++    it('should throw when insert returns no grant (duplicate operation)', async () => {
++      const now = new Date('2025-01-15T10:00:00Z')
++      const { conn } = createSequentialMock({
++        selectResults: [
++          [],               // no existing grants
++          [],               // no limit overrides
++          [{ total: 0 }],  // no weekly usage
++        ],
++        insertResults: [
++          [],               // empty — simulates onConflictDoNothing
++        ],
++      })
++
++      await expect(
++        ensureActiveBlockGrantCallback({
++          conn,
++          userId: 'user-123',
++          subscription,
++          logger,
++          now,
++        }),
++      ).rejects.toThrow('Failed to create block grant')
++    })
++  })
++})
+diff --git a/packages/billing/src/__tests__/usage-service.test.ts b/packages/billing/src/__tests__/usage-service.test.ts
+index e1f9466c0..c037b6031 100644
+--- a/packages/billing/src/__tests__/usage-service.test.ts
++++ b/packages/billing/src/__tests__/usage-service.test.ts
+@@ -19,8 +19,8 @@ const mockBalance = {
+   totalRemaining: 1000,
+   totalDebt: 0,
+   netBalance: 1000,
+-  breakdown: { free: 500, paid: 500, referral: 0, purchase: 0, admin: 0, organization: 0, ad: 0 },
+-  principals: { free: 500, paid: 500, referral: 0, purchase: 0, admin: 0, organization: 0, ad: 0 },
++  breakdown: { free: 500, referral: 0, subscription: 0, purchase: 500, admin: 0, organization: 0, ad: 0 },
++  principals: { free: 500, referral: 0, subscription: 0, purchase: 500, admin: 0, organization: 0, ad: 0 },
+ }
+ 
+ describe('usage-service', () => {
+@@ -49,6 +49,10 @@ describe('usage-service', () => {
+           }),
+         }))
+ 
++        await mockModule('@codebuff/billing/subscription', () => ({
++          getActiveSubscription: async () => null,
++        }))
++
+         const { getUserUsageData } = await import('@codebuff/billing/usage-service')
+ 
+         const result = await getUserUsageData({
+@@ -81,6 +85,10 @@ describe('usage-service', () => {
+           }),
+         }))
+ 
++        await mockModule('@codebuff/billing/subscription', () => ({
++          getActiveSubscription: async () => null,
++        }))
++
+         const { getUserUsageData } = await import('@codebuff/billing/usage-service')
+ 
+         const result = await getUserUsageData({
+@@ -110,6 +118,10 @@ describe('usage-service', () => {
+           }),
+         }))
+ 
++        await mockModule('@codebuff/billing/subscription', () => ({
++          getActiveSubscription: async () => null,
++        }))
++
+         const { getUserUsageData } = await import('@codebuff/billing/usage-service')
+ 
+         const result = await getUserUsageData({
+@@ -140,6 +152,10 @@ describe('usage-service', () => {
+           }),
+         }))
+ 
++        await mockModule('@codebuff/billing/subscription', () => ({
++          getActiveSubscription: async () => null,
++        }))
++
+         const { getUserUsageData } = await import('@codebuff/billing/usage-service')
+ 
+         const result = await getUserUsageData({
+@@ -171,6 +187,10 @@ describe('usage-service', () => {
+           }),
+         }))
+ 
++        await mockModule('@codebuff/billing/subscription', () => ({
++          getActiveSubscription: async () => null,
++        }))
++
+         const { getUserUsageData } = await import('@codebuff/billing/usage-service')
+ 
+         // Should not throw
+diff --git a/packages/billing/src/index.ts b/packages/billing/src/index.ts
+index 9545ea522..ac1cbcdfd 100644
+--- a/packages/billing/src/index.ts
++++ b/packages/billing/src/index.ts
+@@ -19,5 +19,11 @@ export * from './usage-service'
+ // Credit delegation
+ export * from './credit-delegation'
+ 
++// Subscription
++export * from './subscription'
++
++// Subscription webhooks
++export * from './subscription-webhooks'
++
+ // Utilities
+ export * from './utils'
+diff --git a/packages/billing/src/subscription-webhooks.ts b/packages/billing/src/subscription-webhooks.ts
+new file mode 100644
+index 000000000..cda205d00
+--- /dev/null
++++ b/packages/billing/src/subscription-webhooks.ts
+@@ -0,0 +1,377 @@
++import { trackEvent } from '@codebuff/common/analytics'
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
++import { createSubscriptionPriceMappings } from '@codebuff/common/constants/subscription-plans'
++import db from '@codebuff/internal/db'
++import * as schema from '@codebuff/internal/db/schema'
++import { env } from '@codebuff/internal/env'
++import {
++  getStripeId,
++  getUserByStripeCustomerId,
++  stripeServer,
++} from '@codebuff/internal/util/stripe'
++import { eq } from 'drizzle-orm'
++
++import { expireActiveBlockGrants, handleSubscribe } from './subscription'
++
++import type { Logger } from '@codebuff/common/types/contracts/logger'
++import type Stripe from 'stripe'
++
++type SubscriptionStatus = (typeof schema.subscriptionStatusEnum.enumValues)[number]
++
++/**
++ * Maps a Stripe subscription status to our local enum.
++ */
++function mapStripeStatus(status: Stripe.Subscription.Status): SubscriptionStatus {
++  const validStatuses: readonly string[] = schema.subscriptionStatusEnum.enumValues
++  if (validStatuses.includes(status)) return status as SubscriptionStatus
++  return 'incomplete'
++}
++
++export const { getTierFromPriceId, getPriceIdFromTier } = createSubscriptionPriceMappings({
++  100: env.STRIPE_SUBSCRIPTION_100_PRICE_ID,
++  200: env.STRIPE_SUBSCRIPTION_200_PRICE_ID,
++  500: env.STRIPE_SUBSCRIPTION_500_PRICE_ID,
++})
++
++// ---------------------------------------------------------------------------
++// invoice.paid
++// ---------------------------------------------------------------------------
++
++/**
++ * Handles a paid invoice for a subscription.
++ *
++ * - On first payment (`subscription_create`): calls `handleSubscribe` to
++ *   migrate the user's renewal date and unused credits.
++ * - On every payment: upserts the `subscription` row with fresh billing
++ *   period dates from Stripe.
++ */
++export async function handleSubscriptionInvoicePaid(params: {
++  invoice: Stripe.Invoice
++  logger: Logger
++}): Promise<void> {
++  const { invoice, logger } = params
++
++  if (!invoice.subscription) return
++  const subscriptionId = getStripeId(invoice.subscription)
++
++  if (!invoice.customer) {
++    logger.warn(
++      { invoiceId: invoice.id },
++      'Subscription invoice has no customer ID',
++    )
++    return
++  }
++  const customerId = getStripeId(invoice.customer)
++
++  const stripeSub = await stripeServer.subscriptions.retrieve(subscriptionId)
++  const priceId = stripeSub.items.data[0]?.price.id
++  if (!priceId) {
++    logger.error(
++      { subscriptionId },
++      'Stripe subscription has no price on first item',
++    )
++    return
++  }
++
++  const tier = getTierFromPriceId(priceId)
++  if (!tier) {
++    logger.debug(
++      { subscriptionId, priceId },
++      'Price ID does not match a Strong tier — skipping',
++    )
++    return
++  }
++
++  // Look up the user for this customer
++  const user = await getUserByStripeCustomerId(customerId)
++  if (!user) {
++    logger.warn(
++      { customerId, subscriptionId },
++      'No user found for customer — skipping handleSubscribe',
++    )
++    return
++  }
++  const userId = user.id
++
++  // On first invoice, migrate renewal date & credits
++  if (invoice.billing_reason === 'subscription_create') {
++    await handleSubscribe({
++      userId,
++      stripeSubscription: stripeSub,
++      logger,
++    })
++  }
++
++  const status = mapStripeStatus(stripeSub.status)
++
++  // Check for a pending scheduled tier change (downgrade)
++  const existingSub = await db
++    .select({
++      tier: schema.subscription.tier,
++      scheduled_tier: schema.subscription.scheduled_tier,
++    })
++    .from(schema.subscription)
++    .where(eq(schema.subscription.stripe_subscription_id, subscriptionId))
++    .limit(1)
++
++  const previousTier = existingSub[0]?.tier
++  const hadScheduledTier = existingSub[0]?.scheduled_tier != null
++
++  // Upsert subscription row — always apply the Stripe tier and clear
++  // scheduled_tier so pending downgrades take effect on renewal.
++  await db
++    .insert(schema.subscription)
++    .values({
++      stripe_subscription_id: subscriptionId,
++      stripe_customer_id: customerId,
++      user_id: userId,
++      stripe_price_id: priceId,
++      tier,
++      scheduled_tier: null,
++      status,
++      billing_period_start: new Date(stripeSub.current_period_start * 1000),
++      billing_period_end: new Date(stripeSub.current_period_end * 1000),
++      cancel_at_period_end: stripeSub.cancel_at_period_end,
++    })
++    .onConflictDoUpdate({
++      target: schema.subscription.stripe_subscription_id,
++      set: {
++        status,
++        user_id: userId,
++        stripe_price_id: priceId,
++        tier,
++        scheduled_tier: null,
++        billing_period_start: new Date(
++          stripeSub.current_period_start * 1000,
++        ),
++        billing_period_end: new Date(stripeSub.current_period_end * 1000),
++        cancel_at_period_end: stripeSub.cancel_at_period_end,
++        updated_at: new Date(),
++      },
++    })
++
++  // If a scheduled downgrade was applied, expire block grants so the user
++  // gets new grants at the lower tier's limits.
++  if (hadScheduledTier) {
++    await expireActiveBlockGrants({ userId, subscriptionId, logger })
++    logger.info(
++      { userId, subscriptionId, previousTier, tier },
++      'Applied scheduled tier change and expired block grants',
++    )
++  }
++
++  logger.info(
++    {
++      subscriptionId,
++      customerId,
++      billingReason: invoice.billing_reason,
++    },
++    'Processed subscription invoice.paid',
++  )
++}
++
++// ---------------------------------------------------------------------------
++// invoice.payment_failed
++// ---------------------------------------------------------------------------
++
++/**
++ * Immediately sets the subscription to `past_due` — no grace period.
++ * User reverts to free-tier behaviour until payment is fixed.
++ */
++export async function handleSubscriptionInvoicePaymentFailed(params: {
++  invoice: Stripe.Invoice
++  logger: Logger
++}): Promise<void> {
++  const { invoice, logger } = params
++
++  if (!invoice.subscription) return
++  const subscriptionId = getStripeId(invoice.subscription)
++  let userId = null
++  if (invoice.customer) {
++    const customerId = getStripeId(invoice.customer)
++    const user = await getUserByStripeCustomerId(customerId)
++    userId = user?.id
++  }
++
++  await db
++    .update(schema.subscription)
++    .set({
++      status: 'past_due',
++      updated_at: new Date(),
++    })
++    .where(eq(schema.subscription.stripe_subscription_id, subscriptionId))
++
++  trackEvent({
++    event: AnalyticsEvent.SUBSCRIPTION_PAYMENT_FAILED,
++    userId: userId ?? 'system',
++    properties: { subscriptionId, invoiceId: invoice.id },
++    logger,
++  })
++
++  logger.warn(
++    { subscriptionId, invoiceId: invoice.id },
++    'Subscription payment failed — set to past_due',
++  )
++}
++
++// ---------------------------------------------------------------------------
++// customer.subscription.updated
++// ---------------------------------------------------------------------------
++
++/**
++ * Syncs plan details and cancellation intent from Stripe.
++ */
++export async function handleSubscriptionUpdated(params: {
++  stripeSubscription: Stripe.Subscription
++  logger: Logger
++}): Promise<void> {
++  const { stripeSubscription, logger } = params
++  const subscriptionId = stripeSubscription.id
++  const priceId = stripeSubscription.items.data[0]?.price.id
++
++  if (!priceId) {
++    logger.error(
++      { subscriptionId },
++      'Subscription update has no price — skipping',
++    )
++    return
++  }
++
++  const tier = getTierFromPriceId(priceId)
++  if (!tier) {
++    logger.debug(
++      { subscriptionId, priceId },
++      'Price ID does not match a Strong tier — skipping',
++    )
++    return
++  }
++
++  const customerId = getStripeId(stripeSubscription.customer)
++  const user = await getUserByStripeCustomerId(customerId)
++  if (!user) {
++    logger.warn(
++      { customerId, subscriptionId },
++      'No user found for customer — skipping',
++    )
++    return
++  }
++  const userId = user.id
++
++  const status = mapStripeStatus(stripeSubscription.status)
++
++  // Check existing tier to detect downgrades. During a downgrade the old
++  // higher tier is kept in `scheduled_tier` so limits remain until renewal.
++  const existingSub = await db
++    .select({
++      tier: schema.subscription.tier,
++      scheduled_tier: schema.subscription.scheduled_tier,
++    })
++    .from(schema.subscription)
++    .where(eq(schema.subscription.stripe_subscription_id, subscriptionId))
++    .limit(1)
++
++  const existingTier = existingSub[0]?.tier
++  const isDowngrade = existingTier != null && existingTier > tier
++
++  // Upsert — webhook ordering is not guaranteed by Stripe, so this event
++  // may arrive before invoice.paid creates the row.
++  await db
++    .insert(schema.subscription)
++    .values({
++      stripe_subscription_id: subscriptionId,
++      stripe_customer_id: customerId,
++      user_id: userId,
++      stripe_price_id: priceId,
++      tier,
++      status,
++      cancel_at_period_end: stripeSubscription.cancel_at_period_end,
++      billing_period_start: new Date(
++        stripeSubscription.current_period_start * 1000,
++      ),
++      billing_period_end: new Date(
++        stripeSubscription.current_period_end * 1000,
++      ),
++    })
++    .onConflictDoUpdate({
++      target: schema.subscription.stripe_subscription_id,
++      set: {
++        user_id: userId,
++        // Downgrade: preserve current tier & stripe_price_id, schedule the
++        // new tier for the next billing period.
++        ...(isDowngrade
++          ? { scheduled_tier: tier }
++          : { tier, stripe_price_id: priceId, scheduled_tier: null }),
++        status,
++        cancel_at_period_end: stripeSubscription.cancel_at_period_end,
++        billing_period_start: new Date(
++          stripeSubscription.current_period_start * 1000,
++        ),
++        billing_period_end: new Date(
++          stripeSubscription.current_period_end * 1000,
++        ),
++        updated_at: new Date(),
++      },
++    })
++
++  // If this is an upgrade, expire old block grants so the user gets new
++  // grants at the higher tier's limits. Also serves as a fallback if the
++  // route handler's DB update failed.
++  const isUpgrade = existingTier != null && tier > existingTier
++  if (isUpgrade) {
++    await expireActiveBlockGrants({ userId, subscriptionId, logger })
++  }
++
++  logger.info(
++    {
++      subscriptionId,
++      cancelAtPeriodEnd: stripeSubscription.cancel_at_period_end,
++      isDowngrade,
++      isUpgrade,
++    },
++    isDowngrade
++      ? 'Processed subscription update — downgrade scheduled for next billing period'
++      : 'Processed subscription update',
++  )
++}
++
++// ---------------------------------------------------------------------------
++// customer.subscription.deleted
++// ---------------------------------------------------------------------------
++
++/**
++ * Marks the subscription as canceled in our database.
++ */
++export async function handleSubscriptionDeleted(params: {
++  stripeSubscription: Stripe.Subscription
++  logger: Logger
++}): Promise<void> {
++  const { stripeSubscription, logger } = params
++  const subscriptionId = stripeSubscription.id
++
++  const customerId = getStripeId(stripeSubscription.customer)
++  const user = await getUserByStripeCustomerId(customerId)
++  const userId = user?.id ?? null
++
++  await db
++    .update(schema.subscription)
++    .set({
++      status: 'canceled',
++      scheduled_tier: null,
++      canceled_at: new Date(),
++      updated_at: new Date(),
++    })
++    .where(eq(schema.subscription.stripe_subscription_id, subscriptionId))
++
++  if (userId) {
++    await expireActiveBlockGrants({ userId, subscriptionId, logger })
++  }
++
++  trackEvent({
++    event: AnalyticsEvent.SUBSCRIPTION_CANCELED,
++    userId: userId ?? 'system',
++    properties: { subscriptionId },
++    logger,
++  })
++
++  logger.info({ subscriptionId }, 'Subscription canceled')
++}
+diff --git a/packages/billing/src/subscription.ts b/packages/billing/src/subscription.ts
+new file mode 100644
+index 000000000..d83c998b8
+--- /dev/null
++++ b/packages/billing/src/subscription.ts
+@@ -0,0 +1,775 @@
++import { trackEvent } from '@codebuff/common/analytics'
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
++import { GRANT_PRIORITIES } from '@codebuff/common/constants/grant-priorities'
++import {
++  DEFAULT_TIER,
++  SUBSCRIPTION_DISPLAY_NAME,
++  SUBSCRIPTION_TIERS,
++} from '@codebuff/common/constants/subscription-plans'
++
++import type { SubscriptionTierPrice } from '@codebuff/common/constants/subscription-plans'
++import db from '@codebuff/internal/db'
++import * as schema from '@codebuff/internal/db/schema'
++import { withAdvisoryLockTransaction } from '@codebuff/internal/db/transaction'
++import {
++  and,
++  desc,
++  eq,
++  gt,
++  gte,
++  isNull,
++  lt,
++  lte,
++  ne,
++  sql,
++} from 'drizzle-orm'
++
++import type { Logger } from '@codebuff/common/types/contracts/logger'
++import type Stripe from 'stripe'
++
++// ---------------------------------------------------------------------------
++// Types
++// ---------------------------------------------------------------------------
++
++export type SubscriptionRow = typeof schema.subscription.$inferSelect
++
++export type DbConn = Pick<typeof db, 'select' | 'update' | 'insert'>
++
++export interface SubscriptionLimits {
++  creditsPerBlock: number
++  blockDurationHours: number
++  weeklyCreditsLimit: number
++}
++
++export interface WeeklyUsage {
++  used: number
++  limit: number
++  remaining: number
++  resetsAt: Date
++  percentUsed: number
++}
++
++export interface BlockGrant {
++  grantId: string
++  credits: number
++  expiresAt: Date
++  isNew: boolean
++}
++
++export interface WeeklyLimitError {
++  error: 'weekly_limit_reached'
++  used: number
++  limit: number
++  resetsAt: Date
++}
++
++export type BlockGrantResult = BlockGrant | WeeklyLimitError
++
++export function isWeeklyLimitError(
++  result: BlockGrantResult,
++): result is WeeklyLimitError {
++  return 'error' in result
++}
++
++export interface RateLimitStatus {
++  limited: boolean
++  reason?: 'block_exhausted' | 'weekly_limit'
++  canStartNewBlock: boolean
++
++  blockUsed?: number
++  blockLimit?: number
++  blockResetsAt?: Date
++
++  weeklyUsed: number
++  weeklyLimit: number
++  weeklyResetsAt: Date
++  weeklyPercentUsed: number
++}
++
++// ---------------------------------------------------------------------------
++// Date helpers
++// ---------------------------------------------------------------------------
++
++function startOfDay(date: Date): Date {
++  const d = new Date(date)
++  d.setUTCHours(0, 0, 0, 0)
++  return d
++}
++
++function addDays(date: Date, days: number): Date {
++  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000)
++}
++
++function addHours(date: Date, hours: number): Date {
++  return new Date(date.getTime() + hours * 60 * 60 * 1000)
++}
++
++/**
++ * Get the start of the current billing-aligned week.
++ * Weeks start on the same day-of-week as the billing period started.
++ */
++export function getWeekStart(
++  billingPeriodStart: Date,
++  now: Date = new Date(),
++): Date {
++  const billingDayOfWeek = billingPeriodStart.getUTCDay()
++  const currentDayOfWeek = now.getUTCDay()
++  const daysBack = (currentDayOfWeek - billingDayOfWeek + 7) % 7
++  return startOfDay(addDays(now, -daysBack))
++}
++
++/**
++ * Get the end of the current billing-aligned week (start of next week).
++ */
++export function getWeekEnd(
++  billingPeriodStart: Date,
++  now: Date = new Date(),
++): Date {
++  return addDays(getWeekStart(billingPeriodStart, now), 7)
++}
++
++// ---------------------------------------------------------------------------
++// Subscription limits
++// ---------------------------------------------------------------------------
++
++/**
++ * Resolves the effective subscription limits for a user.
++ * Checks `limit_override` first, then falls back to the default tier constants.
++ */
++export async function getSubscriptionLimits(params: {
++  userId: string
++  logger: Logger
++  conn?: DbConn
++  tier?: number | null
++}): Promise<SubscriptionLimits> {
++  const { userId, logger, conn = db, tier } = params
++
++  const overrides = await conn
++    .select()
++    .from(schema.limitOverride)
++    .where(eq(schema.limitOverride.user_id, userId))
++    .limit(1)
++
++  if (overrides.length > 0) {
++    const o = overrides[0]
++    logger.debug(
++      { userId, creditsPerBlock: o.credits_per_block },
++      'Using limit override for user',
++    )
++    return {
++      creditsPerBlock: o.credits_per_block,
++      blockDurationHours: o.block_duration_hours,
++      weeklyCreditsLimit: o.weekly_credit_limit,
++    }
++  }
++
++  const tierConfig =
++    tier != null && tier in SUBSCRIPTION_TIERS
++      ? SUBSCRIPTION_TIERS[tier as SubscriptionTierPrice]
++      : DEFAULT_TIER
++
++  return {
++    creditsPerBlock: tierConfig.creditsPerBlock,
++    blockDurationHours: tierConfig.blockDurationHours,
++    weeklyCreditsLimit: tierConfig.weeklyCreditsLimit,
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Weekly usage tracking
++// ---------------------------------------------------------------------------
++
++/**
++ * Calculates credits consumed from subscription grants during the current
++ * billing-aligned week.
++ */
++export async function getWeeklyUsage(params: {
++  userId: string
++  billingPeriodStart: Date
++  weeklyCreditsLimit: number
++  logger: Logger
++  conn?: DbConn
++}): Promise<WeeklyUsage> {
++  const {
++    userId,
++    billingPeriodStart,
++    weeklyCreditsLimit,
++    conn = db,
++  } = params
++
++  const now = new Date()
++  const weekStart = getWeekStart(billingPeriodStart, now)
++  const weekEnd = getWeekEnd(billingPeriodStart, now)
++
++  const result = await conn
++    .select({
++      total: sql<number>`COALESCE(SUM(${schema.creditLedger.principal} - ${schema.creditLedger.balance}), 0)`,
++    })
++    .from(schema.creditLedger)
++    .where(
++      and(
++        eq(schema.creditLedger.user_id, userId),
++        eq(schema.creditLedger.type, 'subscription'),
++        gte(schema.creditLedger.created_at, weekStart),
++        lt(schema.creditLedger.created_at, weekEnd),
++      ),
++    )
++
++  const used = Number(result[0]?.total ?? 0)
++
++  return {
++    used,
++    limit: weeklyCreditsLimit,
++    remaining: Math.max(0, weeklyCreditsLimit - used),
++    resetsAt: weekEnd,
++    percentUsed: weeklyCreditsLimit > 0
++      ? Math.round((used / weeklyCreditsLimit) * 100)
++      : 0,
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Block grant management
++// ---------------------------------------------------------------------------
++
++/**
++ * Ensures the user has an active subscription block grant.
++ *
++ * 1. Returns the existing active grant if one exists with balance > 0.
++ * 2. Checks the weekly limit — returns an error if reached.
++ * 3. Creates a new block grant and returns it.
++ *
++ * All operations are serialised under an advisory lock for the user.
++ */
++export async function ensureActiveBlockGrantCallback(params: {
++  conn: DbConn
++  userId: string
++  subscription: SubscriptionRow
++  logger: Logger
++  now?: Date
++}): Promise<BlockGrantResult> {
++  const { conn, userId, subscription, logger, now = new Date() } = params
++  const subscriptionId = subscription.stripe_subscription_id
++
++  // 1. Check for an existing active block grant
++  const existingGrants = await conn
++    .select()
++    .from(schema.creditLedger)
++    .where(
++      and(
++        eq(schema.creditLedger.user_id, userId),
++        eq(schema.creditLedger.type, 'subscription'),
++        gt(schema.creditLedger.expires_at, now),
++        gt(schema.creditLedger.balance, 0),
++      ),
++    )
++    .orderBy(desc(schema.creditLedger.expires_at))
++    .limit(1)
++
++  if (existingGrants.length > 0) {
++    const g = existingGrants[0]
++    return {
++      grantId: g.operation_id,
++      credits: g.balance,
++      expiresAt: g.expires_at!,
++      isNew: false,
++    } satisfies BlockGrant
++  }
++
++  // 2. Resolve limits
++  const limits = await getSubscriptionLimits({
++    userId,
++    logger,
++    conn,
++    tier: subscription.tier,
++  })
++
++  // 3. Check weekly limit before creating a new block
++  const weekly = await getWeeklyUsage({
++    userId,
++    billingPeriodStart: subscription.billing_period_start,
++    weeklyCreditsLimit: limits.weeklyCreditsLimit,
++    logger,
+
+
+… [diff truncated: view full diff on GitHub] …

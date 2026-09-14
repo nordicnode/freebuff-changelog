@@ -1,0 +1,971 @@
+diff --git a/scripts/fireworks-deployment-stats.ts b/scripts/fireworks-deployment-stats.ts
+new file mode 100644
+index 000000000..9cc75487c
+--- /dev/null
++++ b/scripts/fireworks-deployment-stats.ts
+@@ -0,0 +1,299 @@
++#!/usr/bin/env bun
++
++/**
++ * Fetch and render Fireworks deployment health + runtime stats.
++ *
++ * Data sources:
++ *   - GET /v1/accounts/{account}/deployments                  (list / per-deployment state)
++ *   - GET /v1/accounts/{account}/metrics                       (Prometheus text, all deployments)
++ *
++ * Usage:
++ *   bun scripts/fireworks-deployment-stats.ts                  # all deployments in the account
++ *   bun scripts/fireworks-deployment-stats.ts <deployment_id>  # filter to one deployment
++ *
++ * Env:
++ *   FIREWORKS_API_KEY    (required) — auto-loaded from .env.local via bun
++ *   FIREWORKS_ACCOUNT_ID (optional) — defaults to the account in fireworks-config.ts
++ */
++
++import { FIREWORKS_ACCOUNT_ID } from '../web/src/llm-api/fireworks-config'
++
++const API_BASE = 'https://api.fireworks.ai/v1'
++
++type Deployment = {
++  name: string
++  baseModel: string
++  state: string
++  status: { code: string; message: string }
++  replicaCount: number
++  desiredReplicaCount: number
++  minReplicaCount: number
++  maxReplicaCount: number
++  replicaStats: {
++    readyReplicaCount: number
++    initializingReplicaCount: number
++    pendingSchedulingReplicaCount: number
++    downloadingModelReplicaCount: number
++  }
++  createTime: string
++  updateTime: string
++  deploymentShape: string
++  autoscalingPolicy: {
++    loadTargets: Record<string, number>
++    scaleUpWindow: string
++    scaleDownWindow: string
++    scaleToZeroWindow: string
++  }
++}
++
++type PromSample = { name: string; labels: Record<string, string>; value: number }
++
++const HISTOGRAM_METRICS = [
++  { key: 'latency_to_first_token_ms', label: 'TTFT (ms)' },
++  { key: 'latency_prefill_ms', label: 'prefill (ms)' },
++  { key: 'latency_prefill_queue_ms', label: 'prefill-queue (ms)' },
++  { key: 'latency_generation_queue_ms', label: 'gen-queue (ms)' },
++  { key: 'latency_generation_per_token_ms', label: 'inter-token (ms)' },
++  { key: 'latency_overall_ms', label: 'overall (ms)' },
++  { key: 'tokens_prompt_per_request', label: 'prompt toks/req' },
++  { key: 'tokens_generated_per_request', label: 'gen toks/req' },
++] as const
++
++async function fetchDeployments(apiKey: string, accountId: string): Promise<Deployment[]> {
++  const res = await fetch(`${API_BASE}/accounts/${accountId}/deployments`, {
++    headers: { Authorization: `Bearer ${apiKey}` },
++  })
++  if (!res.ok) throw new Error(`Deployments list ${res.status}: ${await res.text()}`)
++  const data = (await res.json()) as { deployments: Deployment[] }
++  return data.deployments ?? []
++}
++
++async function fetchPrometheusMetrics(apiKey: string, accountId: string): Promise<PromSample[]> {
++  const res = await fetch(`${API_BASE}/accounts/${accountId}/metrics`, {
++    headers: { Authorization: `Bearer ${apiKey}` },
++  })
++  if (!res.ok) throw new Error(`Metrics ${res.status}: ${await res.text()}`)
++  const text = await res.text()
++  return parsePrometheus(text)
++}
++
++function parsePrometheus(text: string): PromSample[] {
++  const samples: PromSample[] = []
++  for (const line of text.split('\n')) {
++    if (!line || line.startsWith('#')) continue
++    const braceStart = line.indexOf('{')
++    const braceEnd = line.indexOf('}')
++    let name: string
++    let labelStr = ''
++    let rest: string
++    if (braceStart === -1) {
++      const parts = line.split(/\s+/)
++      name = parts[0]
++      rest = parts.slice(1).join(' ')
++    } else {
++      name = line.slice(0, braceStart)
++      labelStr = line.slice(braceStart + 1, braceEnd)
++      rest = line.slice(braceEnd + 1).trim()
++    }
++    const valueToken = rest.split(/\s+/)[0]
++    const value = Number(valueToken)
++    if (!Number.isFinite(value)) continue
++    const labels: Record<string, string> = {}
++    if (labelStr) {
++      const re = /(\w+)="((?:[^"\\]|\\.)*)"/g
++      let m: RegExpExecArray | null
++      while ((m = re.exec(labelStr)) !== null) labels[m[1]] = m[2]
++    }
++    samples.push({ name, labels, value })
++  }
++  return samples
++}
++
++function scalarFor(samples: PromSample[], name: string, deploymentId: string): number | undefined {
++  return samples.find((s) => s.name === name && s.labels.deployment_id === deploymentId)?.value
++}
++
++function bucketPercentiles(
++  samples: PromSample[],
++  metricKey: string,
++  deploymentId: string,
++  percentiles: number[] = [50, 90, 95, 99],
++): { total: number; values: Record<number, number> } | null {
++  const buckets = samples
++    .filter(
++      (s) => s.name === `${metricKey}_bucket:sum_by_deployment` && s.labels.deployment_id === deploymentId,
++    )
++    .map((s) => ({
++      le: s.labels.le === '+Inf' ? Number.POSITIVE_INFINITY : Number(s.labels.le),
++      cum: s.value,
++    }))
++    .sort((a, b) => a.le - b.le)
++
++  if (buckets.length === 0) return null
++  const total = buckets[buckets.length - 1].cum
++  if (total === 0) return { total, values: Object.fromEntries(percentiles.map((p) => [p, 0])) }
++
++  const values: Record<number, number> = {}
++  for (const p of percentiles) {
++    const target = total * (p / 100)
++    let prevLe = 0
++    let prevCum = 0
++    let picked = Number.POSITIVE_INFINITY
++    for (const { le, cum } of buckets) {
++      if (cum >= target) {
++        if (!Number.isFinite(le)) {
++          picked = prevLe
++        } else if (cum === prevCum) {
++          picked = le
++        } else {
++          const frac = (target - prevCum) / (cum - prevCum)
++          picked = prevLe + frac * (le - prevLe)
++        }
++        break
++      }
++      prevLe = le
++      prevCum = cum
++    }
++    values[p] = picked
++  }
++  return { total, values }
++}
++
++function fmt(n: number | undefined, digits = 0): string {
++  if (n === undefined || !Number.isFinite(n)) return '—'
++  if (Math.abs(n) >= 1000) return n.toFixed(0)
++  return n.toFixed(digits)
++}
++
++function fmtPct(n: number | undefined): string {
++  return n === undefined ? '—' : `${(n * 100).toFixed(1)}%`
++}
++
++function parseDuration(d: string): string {
++  const match = /^([\d.]+)s$/.exec(d)
++  if (!match) return d
++  const secs = Number(match[1])
++  if (secs >= 60) return `${(secs / 60).toFixed(0)}m`
++  return `${secs}s`
++}
++
++function renderDeployment(d: Deployment, samples: PromSample[]): void {
++  const deploymentId = d.name.split('/').pop()!
++  const shape = d.deploymentShape.split('/').slice(-3, -2)[0] ?? d.deploymentShape
++
++  const stateIcon = d.state === 'READY' ? '✅' : d.state === 'UPDATING' ? '🔄' : '⚠️'
++
++  console.log('━'.repeat(80))
++  console.log(`${stateIcon}  ${d.name}`)
++  console.log(`    model=${d.baseModel}  shape=${shape}`)
++  console.log(
++    `    state=${d.state} (${d.status.code})  replicas ready=${d.replicaStats.readyReplicaCount}/${d.replicaCount} ` +
++      `min=${d.minReplicaCount} max=${d.maxReplicaCount}`,
++  )
++  const p = d.autoscalingPolicy
++  console.log(
++    `    autoscale target=${p.loadTargets.default}  up=${parseDuration(p.scaleUpWindow)}  ` +
++      `down=${parseDuration(p.scaleDownWindow)}  to-zero=${parseDuration(p.scaleToZeroWindow)}`,
++  )
++  console.log(`    updated=${d.updateTime}`)
++
++  const kvBlocks = scalarFor(samples, 'generator_kv_blocks_fraction:avg_by_deployment', deploymentId)
++  const kvSlots = scalarFor(samples, 'generator_kv_slots_fraction:avg_by_deployment', deploymentId)
++  const active = scalarFor(samples, 'generator_num_active_fraction:avg_by_deployment', deploymentId)
++  const fwdTime = scalarFor(samples, 'generator_model_forward_time:avg_by_deployment', deploymentId)
++
++  const reqRate = scalarFor(samples, 'request_counter_total:sum_by_deployment', deploymentId)
++  const promptTokRate = scalarFor(samples, 'tokens_prompt_total:sum_by_deployment', deploymentId)
++  const cachedPromptRate = scalarFor(samples, 'tokens_cached_prompt_total:sum_by_deployment', deploymentId)
++  const genTokGauge = scalarFor(samples, 'tokens_generated_gauge:sum_by_deployment', deploymentId)
++  const err400 = samples.find(
++    (s) =>
++      s.name === 'requests_error_total:sum_by_deployment' &&
++      s.labels.deployment_id === deploymentId &&
++      s.labels.code === '400',
++  )?.value
++  const err500 = samples.find(
++    (s) =>
++      s.name === 'requests_error_total:sum_by_deployment' &&
++      s.labels.deployment_id === deploymentId &&
++      s.labels.code === '500',
++  )?.value
++
++  const cacheHitRate =
++    promptTokRate && promptTokRate > 0 && cachedPromptRate !== undefined
++      ? cachedPromptRate / promptTokRate
++      : undefined
++  const errRate400 =
++    reqRate && reqRate > 0 && err400 !== undefined ? err400 / reqRate : undefined
++
++  console.log('\n  GPU / capacity')
++  console.log(
++    `    kv_blocks=${fmtPct(kvBlocks)}  kv_slots=${fmtPct(kvSlots)}  ` +
++      `active_generators=${fmt(active, 2)}  fwd_time=${fmt((fwdTime ?? 0) * 1000, 1)}ms`,
++  )
++
++  console.log('\n  Throughput (per-sec rates)')
++  console.log(
++    `    requests=${fmt(reqRate, 2)}/s  prompt_tokens=${fmt(promptTokRate)}/s  ` +
++      `cached_prompt=${fmt(cachedPromptRate)}/s  cache_hit=${fmtPct(cacheHitRate)}  ` +
++      `generated_gauge=${fmt(genTokGauge, 1)}`,
++  )
++
++  console.log('\n  Errors (per-sec)')
++  console.log(
++    `    400=${fmt(err400 ?? 0, 3)}/s (${fmtPct(errRate400)})  500=${fmt(err500 ?? 0, 3)}/s`,
++  )
++
++  console.log('\n  Latency & size percentiles')
++  console.log(
++    `    ${'metric'.padEnd(22)}  ${'events'.padStart(9)}  ${'p50'.padStart(9)}  ${'p90'.padStart(9)}  ${'p95'.padStart(9)}  ${'p99'.padStart(9)}`,
++  )
++  for (const h of HISTOGRAM_METRICS) {
++    const pct = bucketPercentiles(samples, h.key, deploymentId)
++    if (!pct) {
++      console.log(`    ${h.label.padEnd(22)}  ${'—'.padStart(9)}`)
++      continue
++    }
++    console.log(
++      `    ${h.label.padEnd(22)}  ${fmt(pct.total, 2).padStart(9)}  ` +
++        `${fmt(pct.values[50]).padStart(9)}  ${fmt(pct.values[90]).padStart(9)}  ` +
++        `${fmt(pct.values[95]).padStart(9)}  ${fmt(pct.values[99]).padStart(9)}`,
++    )
++  }
++  console.log()
++}
++
++async function main() {
++  const apiKey = process.env.FIREWORKS_API_KEY
++  if (!apiKey || apiKey === 'dummy_fireworks_key') {
++    console.error('FIREWORKS_API_KEY not set (check .env.local)')
++    process.exit(1)
++  }
++  const accountId = process.env.FIREWORKS_ACCOUNT_ID ?? FIREWORKS_ACCOUNT_ID
++  const filter = process.argv[2]
++
++  const [deployments, samples] = await Promise.all([
++    fetchDeployments(apiKey, accountId),
++    fetchPrometheusMetrics(apiKey, accountId),
++  ])
++
++  const filtered = filter
++    ? deployments.filter((d) => d.name.endsWith(`/${filter}`) || d.name === filter)
++    : deployments
++
++  if (filtered.length === 0) {
++    console.error(`No deployments matched${filter ? ` "${filter}"` : ''} in account ${accountId}`)
++    process.exit(1)
++  }
++
++  console.log(`Fireworks account: ${accountId}  •  ${filtered.length} deployment(s)`)
++  console.log(`Rates below are per-second (Prometheus recording rules; ~30s update cadence).`)
++  console.log()
++
++  for (const d of filtered) renderDeployment(d, samples)
++}
++
++main().catch((err) => {
++  console.error(err)
++  process.exit(1)
++})
+diff --git a/web/src/server/free-session/__tests__/admission.test.ts b/web/src/server/free-session/__tests__/admission.test.ts
+index fc51fd74c..31ba1100c 100644
+--- a/web/src/server/free-session/__tests__/admission.test.ts
++++ b/web/src/server/free-session/__tests__/admission.test.ts
+@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
+ import { runAdmissionTick } from '../admission'
+ 
+ import type { AdmissionDeps } from '../admission'
++import type { FireworksHealth } from '../fireworks-health'
+ 
+ const NOW = new Date('2026-04-17T12:00:00Z')
+ 
+@@ -14,11 +15,12 @@ function makeAdmissionDeps(overrides: Partial<AdmissionDeps> = {}): AdmissionDep
+     calls,
+     sweepExpired: async () => 0,
+     queueDepth: async () => 0,
+-    isFireworksAdmissible: async () => true,
+-    admitFromQueue: async ({ isFireworksAdmissible }) => {
++    getFireworksHealth: async () => 'healthy',
++    admitFromQueue: async ({ getFireworksHealth }) => {
+       calls.admit += 1
+-      if (!(await isFireworksAdmissible())) {
+-        return { admitted: [], skipped: 'health' }
++      const health = await getFireworksHealth()
++      if (health !== 'healthy') {
++        return { admitted: [], skipped: health }
+       }
+       return { admitted: [{ user_id: 'u0' }], skipped: null }
+     },
+@@ -38,13 +40,22 @@ describe('runAdmissionTick', () => {
+     expect(result.skipped).toBeNull()
+   })
+ 
+-  test('skips admission when Fireworks not healthy', async () => {
++  test('skips admission when Fireworks is degraded', async () => {
+     const deps = makeAdmissionDeps({
+-      isFireworksAdmissible: async () => false,
++      getFireworksHealth: async () => 'degraded' as FireworksHealth,
+     })
+     const result = await runAdmissionTick(deps)
+     expect(result.admitted).toBe(0)
+-    expect(result.skipped).toBe('health')
++    expect(result.skipped).toBe('degraded')
++  })
++
++  test('skips admission when Fireworks is unhealthy', async () => {
++    const deps = makeAdmissionDeps({
++      getFireworksHealth: async () => 'unhealthy' as FireworksHealth,
++    })
++    const result = await runAdmissionTick(deps)
++    expect(result.admitted).toBe(0)
++    expect(result.skipped).toBe('unhealthy')
+   })
+ 
+   test('sweeps expired sessions even when skipping admission', async () => {
+@@ -54,7 +65,7 @@ describe('runAdmissionTick', () => {
+         swept = 3
+         return 3
+       },
+-      isFireworksAdmissible: async () => false,
++      getFireworksHealth: async () => 'unhealthy' as FireworksHealth,
+     })
+     const result = await runAdmissionTick(deps)
+     expect(swept).toBe(3)
+diff --git a/web/src/server/free-session/__tests__/fireworks-health.test.ts b/web/src/server/free-session/__tests__/fireworks-health.test.ts
+new file mode 100644
+index 000000000..29ac27feb
+--- /dev/null
++++ b/web/src/server/free-session/__tests__/fireworks-health.test.ts
+@@ -0,0 +1,122 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  KV_BLOCKS_DEGRADED_FRACTION,
++  KV_BLOCKS_UNHEALTHY_FRACTION,
++  PREFILL_QUEUE_DEGRADED_MS,
++  classify,
++} from '../fireworks-health'
++
++type PromSample = { name: string; labels: Record<string, string>; value: number }
++
++const DEPLOY = 'mjb4i7ea'
++
++function kvBlocks(value: number): PromSample {
++  return {
++    name: 'generator_kv_blocks_fraction:avg_by_deployment',
++    labels: { deployment_id: DEPLOY },
++    value,
++  }
++}
++
++/** Emit a minimal cumulative-counts histogram for prefill queue where every
++ *  event lands in exactly one bucket `le`. */
++function prefillQueueBuckets(p50Ms: number): PromSample[] {
++  const les = [50, 150, 300, 500, 750, 1000, 1500, 3000, 5000, 7500, 10000]
++  const name = 'latency_prefill_queue_ms_bucket:sum_by_deployment'
++  // cumulative count = 0 below p50, 1 at and above p50
++  return les.map((le) => ({
++    name,
++    labels: { deployment_id: DEPLOY, le: String(le) },
++    value: le >= p50Ms ? 1 : 0,
++  })).concat({
++    name,
++    labels: { deployment_id: DEPLOY, le: '+Inf' },
++    value: 1,
++  })
++}
++
++function requests(rate: number): PromSample {
++  return {
++    name: 'request_counter_total:sum_by_deployment',
++    labels: { deployment_id: DEPLOY },
++    value: rate,
++  }
++}
++
++function errors(code: string, rate: number): PromSample {
++  return {
++    name: 'requests_error_total:sum_by_deployment',
++    labels: { deployment_id: DEPLOY, code },
++    value: rate,
++  }
++}
++
++describe('fireworks health classifier', () => {
++  test('healthy when queue well under the threshold', () => {
++    const samples: PromSample[] = [kvBlocks(0.5), ...prefillQueueBuckets(300)]
++    expect(classify(samples, [DEPLOY])).toBe('healthy')
++  })
++
++  test('degraded when prefill queue p50 exceeds the threshold', () => {
++    const samples: PromSample[] = [
++      kvBlocks(0.5),
++      ...prefillQueueBuckets(PREFILL_QUEUE_DEGRADED_MS + 500),
++    ]
++    expect(classify(samples, [DEPLOY])).toBe('degraded')
++  })
++
++  test('degraded when KV blocks cross the soft threshold (leading indicator)', () => {
++    const samples: PromSample[] = [
++      kvBlocks(KV_BLOCKS_DEGRADED_FRACTION + 0.01),
++      ...prefillQueueBuckets(300),
++    ]
++    expect(classify(samples, [DEPLOY])).toBe('degraded')
++  })
++
++  test('unhealthy when KV blocks exceed the backstop', () => {
++    const samples: PromSample[] = [
++      kvBlocks(KV_BLOCKS_UNHEALTHY_FRACTION + 0.005),
++      ...prefillQueueBuckets(300),
++    ]
++    expect(classify(samples, [DEPLOY])).toBe('unhealthy')
++  })
++
++  test('unhealthy when 5xx error fraction exceeds the threshold', () => {
++    const samples: PromSample[] = [
++      kvBlocks(0.5),
++      ...prefillQueueBuckets(300),
++      requests(1),
++      errors('500', 0.2),
++    ]
++    expect(classify(samples, [DEPLOY])).toBe('unhealthy')
++  })
++
++  test('ignores high error fraction when traffic is too low to be meaningful', () => {
++    const samples: PromSample[] = [
++      kvBlocks(0.5),
++      ...prefillQueueBuckets(300),
++      requests(0.05),
++      errors('500', 0.05),
++    ]
++    expect(classify(samples, [DEPLOY])).toBe('healthy')
++  })
++
++  test('healthy with no data yet (new deployment, no events)', () => {
++    expect(classify([], [DEPLOY])).toBe('healthy')
++  })
++
++  test('worst-of across multiple deployments — unhealthy wins over degraded', () => {
++    const other = 'other123'
++    const samples: PromSample[] = [
++      kvBlocks(0.5),
++      ...prefillQueueBuckets(PREFILL_QUEUE_DEGRADED_MS + 500),
++      {
++        name: 'generator_kv_blocks_fraction:avg_by_deployment',
++        labels: { deployment_id: other },
++        value: KV_BLOCKS_UNHEALTHY_FRACTION + 0.005,
++      },
++    ]
++    expect(classify(samples, [DEPLOY, other])).toBe('unhealthy')
++  })
++})
+diff --git a/web/src/server/free-session/admission.ts b/web/src/server/free-session/admission.ts
+index 71c2c97c5..00b18c120 100644
+--- a/web/src/server/free-session/admission.ts
++++ b/web/src/server/free-session/admission.ts
+@@ -1,39 +1,15 @@
+-import { env } from '@codebuff/internal/env'
+-
+ import {
+   ADMISSION_TICK_MS,
+   getSessionGraceMs,
+   getSessionLengthMs,
+   isWaitingRoomEnabled,
+ } from './config'
++import { getFireworksHealth } from './fireworks-health'
+ import { admitFromQueue, queueDepth, sweepExpired } from './store'
+ 
+-import { FIREWORKS_ACCOUNT_ID } from '@/llm-api/fireworks-config'
+-import { logger } from '@/util/logger'
+-
+-const FIREWORKS_METRICS_URL = `https://api.fireworks.ai/v1/accounts/${FIREWORKS_ACCOUNT_ID}/metrics`
+-const HEALTH_CHECK_TIMEOUT_MS = 5_000
++import type { FireworksHealth } from './fireworks-health'
+ 
+-/** Fails closed on DNS failure, non-OK status, or timeout — so admission halts
+- *  whenever the upstream is unreachable and resumes on its own when it recovers. */
+-export async function isFireworksAdmissible(): Promise<boolean> {
+-  const apiKey = env.FIREWORKS_API_KEY
+-  if (!apiKey) return false
+-  const controller = new AbortController()
+-  const timeout = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS)
+-  try {
+-    const response = await fetch(FIREWORKS_METRICS_URL, {
+-      method: 'GET',
+-      headers: { Authorization: `Bearer ${apiKey}` },
+-      signal: controller.signal,
+-    })
+-    return response.ok
+-  } catch {
+-    return false
+-  } finally {
+-    clearTimeout(timeout)
+-  }
+-}
++import { logger } from '@/util/logger'
+ 
+ export interface AdmissionDeps {
+   sweepExpired: (now: Date, graceMs: number) => Promise<number>
+@@ -41,9 +17,9 @@ export interface AdmissionDeps {
+   admitFromQueue: (params: {
+     sessionLengthMs: number
+     now: Date
+-    isFireworksAdmissible: () => Promise<boolean>
+-  }) => Promise<{ admitted: { user_id: string }[]; skipped: 'health' | null }>
+-  isFireworksAdmissible: () => Promise<boolean>
++    getFireworksHealth: () => Promise<FireworksHealth>
++  }) => Promise<{ admitted: { user_id: string }[]; skipped: FireworksHealth | null }>
++  getFireworksHealth: () => Promise<FireworksHealth>
+   /** Plain values, not thunks — these never change at runtime. */
+   sessionLengthMs: number
+   graceMs: number
+@@ -56,10 +32,10 @@ const defaultDeps: AdmissionDeps = {
+   admitFromQueue,
+   // FREEBUFF_DEV_FORCE_ADMIT lets local `dev:freebuff` drive the full
+   // waiting-room → admitted → ended flow without a real upstream.
+-  isFireworksAdmissible:
++  getFireworksHealth:
+     process.env.FREEBUFF_DEV_FORCE_ADMIT === 'true'
+-      ? async () => true
+-      : isFireworksAdmissible,
++      ? async () => 'healthy'
++      : getFireworksHealth,
+   get sessionLengthMs() {
+     return getSessionLengthMs()
+   },
+@@ -72,21 +48,19 @@ export interface AdmissionTickResult {
+   expired: number
+   admitted: number
+   queueDepth: number
+-  skipped: 'health' | null
++  skipped: FireworksHealth | null
+ }
+ 
+ /**
+  * Run a single admission tick:
+  *   1. Expire sessions past their expires_at + grace.
+- *   2. Attempt to admit one queued user, gated by the Fireworks reachability
+- *      probe (done inside admitFromQueue so we don't pay for an HTTP call
+- *      when the advisory lock is already held by another pod — see
+- *      `admitFromQueue`).
++ *   2. Attempt to admit one queued user. Admission proceeds only when the
++ *      upstream health probe reports `healthy`; `degraded` and `unhealthy`
++ *      both pause admission so the deployment can catch up.
+  *
+- * There is no global concurrency cap — the Fireworks health probe is the
+- * primary gate. Admission drips at (1 / ADMISSION_TICK_MS), which drives
+- * utilization up slowly; once the probe fails, step 2 halts admission until
+- * things recover.
++ * Admission drips at (1 / ADMISSION_TICK_MS), which drives utilization up
++ * slowly; once the probe stops returning `healthy`, step 2 halts admission
++ * until the upstream recovers.
+  *
+  * Returns counts for observability. Safe to call concurrently across pods —
+  * admitFromQueue takes an advisory xact lock.
+@@ -100,7 +74,7 @@ export async function runAdmissionTick(
+   const { admitted, skipped } = await deps.admitFromQueue({
+     sessionLengthMs: deps.sessionLengthMs,
+     now,
+-    isFireworksAdmissible: deps.isFireworksAdmissible,
++    getFireworksHealth: deps.getFireworksHealth,
+   })
+ 
+   const depth = await deps.queueDepth()
+@@ -115,11 +89,7 @@ function runTick() {
+   inFlight = true
+   runAdmissionTick()
+     .then((result) => {
+-      if (
+-        result.admitted > 0 ||
+-        result.expired > 0 ||
+-        result.skipped === 'health'
+-      ) {
++      if (result.admitted > 0 || result.expired > 0 || result.skipped !== null) {
+         logger.info(
+           {
+             admitted: result.admitted,
+diff --git a/web/src/server/free-session/fireworks-health.ts b/web/src/server/free-session/fireworks-health.ts
+new file mode 100644
+index 000000000..a95849996
+--- /dev/null
++++ b/web/src/server/free-session/fireworks-health.ts
+@@ -0,0 +1,290 @@
++import { FIREWORKS_ACCOUNT_ID, FIREWORKS_DEPLOYMENT_MAP } from '@/llm-api/fireworks-config'
++import { env } from '@codebuff/internal/env'
++import { logger } from '@/util/logger'
++
++/**
++ * Health of the Fireworks deployments that free sessions depend on.
++ *
++ *   - `healthy`    — admit as usual
++ *   - `degraded`   — upstream reachable but loaded (prefill queue exceeds SLO);
++ *                    do NOT admit new users so the queue can drain
++ *   - `unhealthy`  — upstream unreachable / errored; do NOT admit
++ *
++ * Only `healthy` admits. `degraded` vs `unhealthy` is a logging/observability
++ * distinction.
++ */
++export type FireworksHealth = 'healthy' | 'degraded' | 'unhealthy'
++
++/** Degrade once median prefill-queue latency crosses this bound. Strict by
++ *  design — a 1s queue on top of ~1s prefill already means users feel 2s+
++ *  before first token. */
++export const PREFILL_QUEUE_DEGRADED_MS = 1_000
++
++/** Leading indicator of load — responds instantly to memory pressure, while
++ *  prefill-queue p50 is a lagging window statistic. Degrading here lets us
++ *  halt admission *before* users feel it. */
++export const KV_BLOCKS_DEGRADED_FRACTION = 0.9
++
++/** Hard backstop: if KV block memory gets this full, evictions dominate and
++ *  even the median request will start stalling. */
++export const KV_BLOCKS_UNHEALTHY_FRACTION = 0.98
++
++/** Treat the metrics snapshot as unreliable if the newest sample is older
++ *  than this (Fireworks exporter updates every ~30s, so 3min means 6 missed
++ *  updates in a row — something is off with the exporter or our fetch). */
++export const SNAPSHOT_STALE_MS = 3 * 60 * 1000
++
++/** Only check error rate when requests/s is at least this — otherwise a
++ *  single error spikes the ratio and causes false positives. */
++export const ERROR_RATE_MIN_REQUEST_RATE = 0.1
++
++/** 5xx fraction above this means the deployment is failing requests at a
++ *  rate we shouldn't pile more users onto. */
++export const ERROR_FRACTION_UNHEALTHY = 0.1
++
++const METRICS_URL = `https://api.fireworks.ai/v1/accounts/${FIREWORKS_ACCOUNT_ID}/metrics`
++const HEALTH_CHECK_TIMEOUT_MS = 5_000
++
++/** Fireworks updates the Prometheus exporter every ~30s and rate-limits to
++ *  6 requests/min per account. Cache a bit under the update cadence so every
++ *  pod hits the endpoint at most ~2.4/min. */
++const HEALTH_CACHE_TTL_MS = 25_000
++
++type CacheEntry = { expiresAt: number; health: FireworksHealth }
++let cache: CacheEntry | null = null
++
++export function __resetFireworksHealthCacheForTests(): void {
++  cache = null
++}
++
++export async function getFireworksHealth(): Promise<FireworksHealth> {
++  const now = Date.now()
++  if (cache && cache.expiresAt > now) return cache.health
++
++  const health = await probe()
++  cache = { expiresAt: now + HEALTH_CACHE_TTL_MS, health }
++  return health
++}
++
++async function probe(): Promise<FireworksHealth> {
++  const apiKey = env.FIREWORKS_API_KEY
++  if (!apiKey) return 'unhealthy'
++
++  const controller = new AbortController()
++  const timeout = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS)
++  let body: string
++  try {
++    const response = await fetch(METRICS_URL, {
++      method: 'GET',
++      headers: { Authorization: `Bearer ${apiKey}` },
++      signal: controller.signal,
++    })
++    if (!response.ok) return 'unhealthy'
++    body = await response.text()
++  } catch {
++    return 'unhealthy'
++  } finally {
++    clearTimeout(timeout)
++  }
++
++  const deploymentIds = Object.values(FIREWORKS_DEPLOYMENT_MAP).map(
++    (name) => name.split('/').pop()!,
++  )
++  if (deploymentIds.length === 0) return 'healthy'
++
++  const { samples, newestTimestampMs } = parsePrometheus(body)
++
++  if (
++    newestTimestampMs !== undefined &&
++    Date.now() - newestTimestampMs > SNAPSHOT_STALE_MS
++  ) {
++    logger.warn(
++      { ageMs: Date.now() - newestTimestampMs },
++      '[FireworksHealth] unhealthy: metrics snapshot is stale',
++    )
++    return 'unhealthy'
++  }
++
++  return classify(samples, deploymentIds)
++}
++
++/** Treat the whole fleet as degraded/unhealthy if any single deployment is. */
++export function classify(
++  samples: PromSample[],
++  deploymentIds: string[],
++): FireworksHealth {
++  let worst: FireworksHealth = 'healthy'
++  for (const deploymentId of deploymentIds) {
++    const h = classifyOne(samples, deploymentId)
++    if (h === 'unhealthy') return 'unhealthy'
++    if (h === 'degraded') worst = 'degraded'
++  }
++  return worst
++}
++
++function classifyOne(samples: PromSample[], deploymentId: string): FireworksHealth {
++  const kvBlocks = scalarFor(
++    samples,
++    'generator_kv_blocks_fraction:avg_by_deployment',
++    deploymentId,
++  )
++  if (kvBlocks !== undefined && kvBlocks >= KV_BLOCKS_UNHEALTHY_FRACTION) {
++    logger.info(
++      { deploymentId, kvBlocks },
++      '[FireworksHealth] unhealthy: KV blocks saturated',
++    )
++    return 'unhealthy'
++  }
++
++  const requestRate = scalarFor(
++    samples,
++    'request_counter_total:sum_by_deployment',
++    deploymentId,
++  )
++  const error5xxRate = errorRateFor(samples, deploymentId, '500')
++  if (
++    requestRate !== undefined &&
++    requestRate >= ERROR_RATE_MIN_REQUEST_RATE &&
++    error5xxRate !== undefined &&
++    error5xxRate / requestRate >= ERROR_FRACTION_UNHEALTHY
++  ) {
++    logger.info(
++      {
++        deploymentId,
++        requestRate,
++        error5xxRate,
++        errorFraction: error5xxRate / requestRate,
++      },
++      '[FireworksHealth] unhealthy: 5xx error rate over threshold',
++    )
++    return 'unhealthy'
++  }
++
++  const p50 = histogramPercentile(
++    samples,
++    'latency_prefill_queue_ms_bucket:sum_by_deployment',
++    deploymentId,
++    50,
++  )
++  if (p50 !== undefined && p50 > PREFILL_QUEUE_DEGRADED_MS) {
++    logger.info(
++      { deploymentId, prefillQueueP50Ms: Math.round(p50), kvBlocks },
++      '[FireworksHealth] degraded: prefill queue p50 over threshold',
++    )
++    return 'degraded'
++  }
++
++  if (kvBlocks !== undefined && kvBlocks >= KV_BLOCKS_DEGRADED_FRACTION) {
++    logger.info(
++      { deploymentId, kvBlocks },
++      '[FireworksHealth] degraded: KV blocks above soft threshold',
++    )
++    return 'degraded'
++  }
++
++  return 'healthy'
++}
++
++function errorRateFor(
++  samples: PromSample[],
++  deploymentId: string,
++  code: string,
++): number | undefined {
++  return samples.find(
++    (s) =>
++      s.name === 'requests_error_total:sum_by_deployment' &&
++      s.labels.deployment_id === deploymentId &&
++      s.labels.code === code,
++  )?.value
++}
++
++type PromSample = { name: string; labels: Record<string, string>; value: number }
++
++function parsePrometheus(text: string): {
++  samples: PromSample[]
++  newestTimestampMs: number | undefined
++} {
++  const samples: PromSample[] = []
++  let newestTimestampMs: number | undefined
++  for (const line of text.split('\n')) {
++    if (!line || line.startsWith('#')) continue
++    const braceStart = line.indexOf('{')
++    const braceEnd = line.indexOf('}')
++    let name: string
++    let labelStr = ''
++    let rest: string
++    if (braceStart === -1) {
++      const parts = line.split(/\s+/)
++      name = parts[0]
++      rest = parts.slice(1).join(' ')
++    } else {
++      name = line.slice(0, braceStart)
++      labelStr = line.slice(braceStart + 1, braceEnd)
++      rest = line.slice(braceEnd + 1).trim()
++    }
++    const tokens = rest.split(/\s+/)
++    const value = Number(tokens[0])
++    if (!Number.isFinite(value)) continue
++    // Prometheus text exposition: "<name>{<labels>} <value> [<timestamp_ms>]"
++    if (tokens.length >= 2) {
++      const ts = Number(tokens[1])
++      if (Number.isFinite(ts) && (newestTimestampMs === undefined || ts > newestTimestampMs)) {
++        newestTimestampMs = ts
++      }
++    }
++    const labels: Record<string, string> = {}
++    if (labelStr) {
++      const re = /(\w+)="((?:[^"\\]|\\.)*)"/g
++      let m: RegExpExecArray | null
++      while ((m = re.exec(labelStr)) !== null) labels[m[1]] = m[2]
++    }
++    samples.push({ name, labels, value })
++  }
++  return { samples, newestTimestampMs }
++}
++
++function scalarFor(
++  samples: PromSample[],
++  name: string,
++  deploymentId: string,
++): number | undefined {
++  return samples.find(
++    (s) => s.name === name && s.labels.deployment_id === deploymentId,
++  )?.value
++}
++
++function histogramPercentile(
++  samples: PromSample[],
++  bucketMetric: string,
++  deploymentId: string,
++  percentile: number,
++): number | undefined {
++  const buckets = samples
++    .filter(
++      (s) => s.name === bucketMetric && s.labels.deployment_id === deploymentId,
++    )
++    .map((s) => ({
++      le: s.labels.le === '+Inf' ? Number.POSITIVE_INFINITY : Number(s.labels.le),
++      cum: s.value,
++    }))
++    .sort((a, b) => a.le - b.le)
++
++  if (buckets.length === 0) return undefined
++  const total = buckets[buckets.length - 1].cum
++  if (total <= 0) return undefined
++
++  const target = total * (percentile / 100)
++  let prevLe = 0
++  let prevCum = 0
++  for (const { le, cum } of buckets) {
++    if (cum >= target) {
++      if (!Number.isFinite(le)) return prevLe
++      if (cum === prevCum) return le
++      const frac = (target - prevCum) / (cum - prevCum)
++      return prevLe + frac * (le - prevLe)
++    }
++    prevLe = le
++    prevCum = cum
++  }
++  return undefined
++}
+diff --git a/web/src/server/free-session/store.ts b/web/src/server/free-session/store.ts
+index baa03c0dc..7a9ac3f50 100644
+--- a/web/src/server/free-session/store.ts
++++ b/web/src/server/free-session/store.ts
+@@ -5,6 +5,7 @@ import { and, asc, count, eq, lt, sql } from 'drizzle-orm'
+ 
+ import { FREEBUFF_ADMISSION_LOCK_ID } from './config'
+ 
++import type { FireworksHealth } from './fireworks-health'
+ import type { InternalSessionRow } from './types'
+ 
+ /** Generate a cryptographically random instance id (token). */
+@@ -143,27 +144,29 @@ export async function sweepExpired(now: Date, graceMs: number): Promise<number>
+ }
+ 
+ /**
+- * Atomically admit one queued user, gated by an upstream reachability probe
+- * and guarded by an advisory xact lock so only one pod admits per tick.
++ * Atomically admit one queued user, gated by the upstream health probe and
++ * guarded by an advisory xact lock so only one pod admits per tick.
+  *
+  * Return semantics:
+  *   - `{ admitted: [row], skipped: null }` — admitted one user
+  *   - `{ admitted: [], skipped: null }` — empty queue or another pod held the lock
+- *   - `{ admitted: [], skipped: 'health' }` — probe failed, admission paused
++ *   - `{ admitted: [], skipped: 'degraded' | 'unhealthy' }` — probe blocked admission
+  *
+- * The probe runs before the transaction so a slow probe doesn't hold a
+- * Postgres connection open. Drip-admission of one user per tick keeps load
+- * on Fireworks smooth even when a large block of sessions expires at once.
++ * Only `healthy` admits; `degraded` and `unhealthy` both pause admission (the
++ * distinction is for observability — degraded means "upstream loaded",
++ * unhealthy means "upstream unreachable or saturated"). The probe runs before
++ * the transaction so a slow probe doesn't hold a Postgres connection open.
+  */
+ export async function admitFromQueue(params: {
+   sessionLengthMs: number
+   now: Date
+-  isFireworksAdmissible: () => Promise<boolean>
+-}): Promise<{ admitted: InternalSessionRow[]; skipped: 'health' | null }> {
+-  const { sessionLengthMs, now, isFireworksAdmissible } = params
++  getFireworksHealth: () => Promise<FireworksHealth>
++}): Promise<{ admitted: InternalSessionRow[]; skipped: FireworksHealth | null }> {
++  const { sessionLengthMs, now, getFireworksHealth } = params
+ 
+-  if (!(await isFireworksAdmissible())) {
+-    return { admitted: [], skipped: 'health' }
++  const health = await getFireworksHealth()
++  if (health !== 'healthy') {
++    return { admitted: [], skipped: health }
+   }
+ 
+   return db.transaction(async (tx) => {

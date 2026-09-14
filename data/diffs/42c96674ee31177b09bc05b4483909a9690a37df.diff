@@ -1,0 +1,332 @@
+diff --git a/evalbuff/src/commit-task-generator.ts b/evalbuff/src/commit-task-generator.ts
+index 036f93ef8..51357c829 100644
+--- a/evalbuff/src/commit-task-generator.ts
++++ b/evalbuff/src/commit-task-generator.ts
+@@ -14,6 +14,28 @@ export interface CommitTask {
+ 
+ const MAX_DIFF_CHARS = 200_000
+ 
++/**
++ * Files that add noise to diffs without useful signal.
++ * Lockfiles are huge and auto-generated — agents shouldn't replicate them.
++ */
++const NOISE_FILE_PATTERNS = [
++  'bun.lock',
++  'bun.lockb',
++  'package-lock.json',
++  'yarn.lock',
++  'pnpm-lock.yaml',
++  'Gemfile.lock',
++  'Cargo.lock',
++  'poetry.lock',
++  'composer.lock',
++  'go.sum',
++]
++
++function isNoiseFile(filePath: string): boolean {
++  const basename = filePath.split('/').pop() || ''
++  return NOISE_FILE_PATTERNS.includes(basename)
++}
++
+ /**
+  * Get a list of commits from the repo, oldest first.
+  * Starts from `startAfterSha` (exclusive) or HEAD~commitCount if no state.
+@@ -68,19 +90,24 @@ export function getCommitInfo(
+       encoding: 'utf-8',
+     }).trim()
+ 
+-    // Get diff
+-    const diff = execSync(`git diff ${parentSha} ${sha}`, {
+-      cwd: repoPath,
+-      encoding: 'utf-8',
+-      maxBuffer: 10 * 1024 * 1024,
+-    })
+-
+-    // Get files changed
++    // Get files changed (filter out noise files like lockfiles)
+     const filesOutput = execSync(`git diff --name-only ${parentSha} ${sha}`, {
+       cwd: repoPath,
+       encoding: 'utf-8',
+     }).trim()
+-    const filesChanged = filesOutput ? filesOutput.split('\n') : []
++    const allFiles = filesOutput ? filesOutput.split('\n') : []
++    const filesChanged = allFiles.filter((f) => !isNoiseFile(f))
++
++    // Get diff, excluding noise files (lockfiles etc.)
++    const excludeArgs = NOISE_FILE_PATTERNS.map((p) => `':!${p}'`).join(' ')
++    const diff = execSync(
++      `git diff ${parentSha} ${sha} -- . ${excludeArgs}`,
++      {
++        cwd: repoPath,
++        encoding: 'utf-8',
++        maxBuffer: 10 * 1024 * 1024,
++      },
++    )
+ 
+     return { parentSha, message, diff, filesChanged }
+   } catch {
+@@ -124,6 +151,7 @@ function readFilesAtParent(
+ 
+   for (const filePath of filesChanged) {
+     if (totalSize >= maxTotalSize) break
++    if (isNoiseFile(filePath)) continue
+ 
+     const content = readFileAtCommit(repoPath, parentSha, filePath)
+     if (content != null && content.length > 0) {
+@@ -209,9 +237,12 @@ ${diff}
+   try {
+     fs.writeFileSync(promptFile, `${PROMPT_GEN_SYSTEM}\n\n---\n\n${userPrompt}`)
+ 
++    // IMPORTANT: Run in tmpDir to avoid Claude reading the repo's CLAUDE.md/AGENTS.md,
++    // which can confuse prompt generation (e.g., generating prompts about evalbuff itself).
+     const output = execSync(
+       `claude --dangerously-skip-permissions -p "Read ${promptFile} and follow all instructions. Respond with ONLY the task prompt text."`,
+       {
++        cwd: tmpDir,
+         encoding: 'utf-8',
+         timeout: 2 * 60 * 1000,
+         stdio: ['ignore', 'pipe', 'pipe'],
+@@ -245,11 +276,17 @@ export async function buildCommitTask(
+     return null
+   }
+ 
+-  // Skip commits with no meaningful code changes
++  // Skip commits with no meaningful code changes (after filtering noise files)
+   if (info.filesChanged.length === 0) {
+     return null
+   }
+ 
++  // Skip commits where the diff is empty after filtering noise files
++  if (info.diff.trim().length === 0) {
++    console.log(`Skipping ${sha.slice(0, 8)}: only noise files changed (lockfiles, etc.)`)
++    return null
++  }
++
+   const prompt = await generatePromptFromCommit(
+     repoPath,
+     info.parentSha,
+diff --git a/evalbuff/src/docs-optimizer.ts b/evalbuff/src/docs-optimizer.ts
+index 9673eddfe..697a0c1b7 100644
+--- a/evalbuff/src/docs-optimizer.ts
++++ b/evalbuff/src/docs-optimizer.ts
+@@ -63,11 +63,37 @@ You MUST respond with ONLY a JSON object (no markdown fences, no explanation). T
+ Or if too task-specific:
+ {"skip": true, "reasoning": "explanation"}`
+ 
++function formatEditHistory(history?: DocEditHistoryEntry[]): string {
++  if (!history || history.length === 0) return ''
++
++  const lines = history.map((entry) => {
++    const score =
++      entry.scoreBefore != null && entry.scoreAfter != null
++        ? ` (score: ${entry.scoreBefore.toFixed(1)} → ${entry.scoreAfter.toFixed(1)})`
++        : ''
++    return `- **${entry.outcome.toUpperCase()}**: \`${entry.path}\`${score}\n  Reasoning: ${entry.reasoning}`
++  })
++
++  return `## Edit History (previous doc edits tried this session)
++
++Use this history to avoid repeating rejected approaches and to build on what worked.
++
++${lines.join('\n')}`
++}
++
+ /**
+  * Analyze agent run results and suggest a doc edit to improve future performance.
+  * Always analyzes — no score threshold check.
+  * Returns null if the doc writer decides the failure is too task-specific to generalize.
+  */
++export interface DocEditHistoryEntry {
++  path: string
++  reasoning: string
++  outcome: 'accepted' | 'rejected'
++  scoreBefore?: number
++  scoreAfter?: number
++}
++
+ export async function analyzeFailure({
+   judgeResult,
+   taskPrompt,
+@@ -75,6 +101,7 @@ export async function analyzeFailure({
+   agentTrace,
+   groundTruthDiff,
+   currentDocs,
++  editHistory,
+ }: {
+   judgeResult: JudgingResult
+   taskPrompt: string
+@@ -82,6 +109,7 @@ export async function analyzeFailure({
+   agentTrace?: string // stdout from the agent — reasoning, tool calls, errors
+   groundTruthDiff?: string // optional — not available in prompt mode
+   currentDocs: Record<string, string>
++  editHistory?: DocEditHistoryEntry[]
+ }): Promise<DocSuggestion | null> {
+   const docsContent = Object.entries(currentDocs)
+     .map(([docPath, content]) => `### ${docPath}\n\`\`\`\n${content}\n\`\`\``)
+@@ -145,6 +173,8 @@ ${traceSection}
+ ## Current Docs (already available to the agent)
+ ${docsContent || '(No docs yet)'}
+ 
++${formatEditHistory(editHistory)}
++
+ Based on the agent's trace (if available), the gap between what the agent did and what it should have done, and the judge's analysis, write a doc file that captures a GENERAL PATTERN that would help the agent across many similar tasks. Focus on what the agent MISUNDERSTOOD (visible in the trace) rather than just what it got wrong (visible in the diff). If this failure doesn't reveal a generalizable pattern, respond with {"skip": true, "reasoning": "..."}.
+ 
+ Respond with ONLY the JSON object.`
+@@ -156,9 +186,12 @@ Respond with ONLY the JSON object.`
+ 
+     let output: string
+     try {
++      // IMPORTANT: Run in tmpDir to avoid Claude reading the repo's CLAUDE.md/AGENTS.md,
++      // which can pollute the doc writer's analysis with unrelated project context.
+       output = execSync(
+         `claude --dangerously-skip-permissions -p "Read the file ${promptFile} and follow all instructions in it. Respond with ONLY the JSON object as specified."`,
+         {
++          cwd: tmpDir,
+           encoding: 'utf-8',
+           timeout: 5 * 60 * 1000,
+           stdio: ['ignore', 'pipe', 'pipe'],
+@@ -298,13 +331,18 @@ export function revertDocEdit(
+ 
+ /**
+  * Compare scores to determine if a doc edit improved things.
++ * Requires a minimum improvement of 0.3 points to count as "improved"
++ * to avoid accepting docs based on noise (especially with low parallelism).
+  */
++const MIN_IMPROVEMENT_THRESHOLD = 0.3
++
+ export function compareScores(
+   oldScore: number,
+   newScore: number,
+ ): 'improved' | 'same' | 'worse' {
+-  if (newScore > oldScore) return 'improved'
+-  if (newScore < oldScore) return 'worse'
++  const delta = newScore - oldScore
++  if (delta >= MIN_IMPROVEMENT_THRESHOLD) return 'improved'
++  if (delta <= -MIN_IMPROVEMENT_THRESHOLD) return 'worse'
+   return 'same'
+ }
+ 
+diff --git a/evalbuff/src/run-evalbuff.ts b/evalbuff/src/run-evalbuff.ts
+index 19307a6c3..54b257c2a 100644
+--- a/evalbuff/src/run-evalbuff.ts
++++ b/evalbuff/src/run-evalbuff.ts
+@@ -173,6 +173,13 @@ async function runAgentsInParallel(opts: {
+   }
+ }
+ 
++/**
++ * Copy docs into a test repo and commit them so they don't appear in the agent's diff.
++ *
++ * Without this commit, `git diff HEAD` after the agent runs would include
++ * the pre-copied docs as "new files", corrupting the diff attribution —
++ * the judge would penalize or credit the agent for docs it didn't create.
++ */
+ function copyDocsIntoRepo(
+   sourceRepoPath: string,
+   targetRepoPath: string,
+@@ -182,11 +189,31 @@ function copyDocsIntoRepo(
+   const targetDocsDir = path.join(targetRepoPath, 'docs')
+   const targetAgentsMd = path.join(targetRepoPath, 'AGENTS.md')
+ 
++  let copied = false
+   if (fs.existsSync(sourceDocsDir)) {
+     fs.cpSync(sourceDocsDir, targetDocsDir, { recursive: true })
++    copied = true
+   }
+   if (fs.existsSync(sourceAgentsMd)) {
+     fs.cpSync(sourceAgentsMd, targetAgentsMd)
++    copied = true
++  }
++
++  // Commit the docs so they become part of HEAD — otherwise git diff HEAD
++  // after the agent runs will include these docs as agent-created changes.
++  if (copied) {
++    try {
++      execSync('git add docs/ AGENTS.md 2>/dev/null; git add -u docs/ AGENTS.md 2>/dev/null', {
++        cwd: targetRepoPath,
++        stdio: 'ignore',
++      })
++      execSync('git commit -m "evalbuff: pre-load docs" --allow-empty', {
++        cwd: targetRepoPath,
++        stdio: 'ignore',
++      })
++    } catch {
++      // If nothing to commit, that's fine
++    }
+   }
+ }
+ 
+@@ -213,8 +240,8 @@ async function improveDocs(opts: {
+ }): Promise<{
+   finalScore: number
+   baselineScore: number
+-  docsKept: Array<{ path: string; reasoning: string }>
+-  docsRejected: Array<{ path: string; reasoning: string }>
++  docsKept: Array<{ path: string; reasoning: string; scoreBefore: number; scoreAfter: number }>
++  docsRejected: Array<{ path: string; reasoning: string; scoreBefore: number; scoreAfter: number }>
+   totalCost: number
+ }> {
+   const {
+@@ -233,8 +260,8 @@ async function improveDocs(opts: {
+   } = opts
+ 
+   let totalCost = 0
+-  const docsKept: Array<{ path: string; reasoning: string }> = []
+-  const docsRejected: Array<{ path: string; reasoning: string }> = []
++  const docsKept: Array<{ path: string; reasoning: string; scoreBefore: number; scoreAfter: number }> = []
++  const docsRejected: Array<{ path: string; reasoning: string; scoreBefore: number; scoreAfter: number }> = []
+ 
+   // Step 1: Baseline run
+   console.log(`\n  Running ${parallelism} agents in parallel (baseline)...`)
+@@ -259,7 +286,14 @@ async function improveDocs(opts: {
+ 
+   // Step 2: Iterative doc improvement
+   let improving = true
++  const MAX_IMPROVEMENT_ITERATIONS = 5
++  let iterationCount = 0
+   while (improving) {
++    iterationCount++
++    if (iterationCount > MAX_IMPROVEMENT_ITERATIONS) {
++      console.log(`  Hit max improvement iterations (${MAX_IMPROVEMENT_ITERATIONS}), stopping.`)
++      break
++    }
+     // Pick the worst-scoring judging for analysis
+     const worstIdx = baseline.judgings.reduce(
+       (minIdx, j, idx, arr) =>
+@@ -273,6 +307,10 @@ async function improveDocs(opts: {
+     const currentDocs = readCurrentDocs(repoPath)
+ 
+     console.log(`  Analyzing for doc improvements...`)
++    const editHistory = [
++      ...docsKept.map((d) => ({ ...d, outcome: 'accepted' as const })),
++      ...docsRejected.map((d) => ({ ...d, outcome: 'rejected' as const })),
++    ]
+     const docSuggestion = await analyzeFailure({
+       judgeResult: worstJudging,
+       taskPrompt: prompt,
+@@ -280,6 +318,7 @@ async function improveDocs(opts: {
+       agentTrace: worstTrace,
+       groundTruthDiff,
+       currentDocs,
++      editHistory,
+     })
+ 
+     if (!docSuggestion) {
+@@ -325,6 +364,8 @@ async function improveDocs(opts: {
+       docsKept.push({
+         path: docSuggestion.suggestedDocPath,
+         reasoning: docSuggestion.reasoning,
++        scoreBefore: currentScore,
++        scoreAfter: rerun.avgScore,
+       })
+ 
+       // Commit the doc change
+@@ -351,6 +392,8 @@ async function improveDocs(opts: {
+       docsRejected.push({
+         path: docSuggestion.suggestedDocPath,
+         reasoning: docSuggestion.reasoning,
++        scoreBefore: currentScore,
++        scoreAfter: rerun.avgScore,
+       })
+ 
+       // Revert the doc edit — restore previous content if it existed
