@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import {
   extractModelTableChanges, extractVersionBump, extractSlashCommandChanges,
   commandIdsFromRegistry,
-  areaOf, isNoiseFile, deterministicSummary, entryTitle, churnLabel, sourceRef, isSyncCommit,
+  areaOf, isNoiseFile, deterministicSummary, entryTitle, churnLabel, testLabel, sourceRef, isSyncCommit,
   extractCommentFacts, extractCleanDiff, parseMarkdownTables, catalogFromReadme,
   diffCatalogs
 } from '../lib/analyze.mjs'
@@ -274,6 +274,23 @@ test('churnLabel: names the filtered files; only a truly empty diff is a merge',
   const legacy = churnLabel({ files: { total: 1, meaningful: 0 }, stats: { additions: 2, deletions: 1 } })
   assert.equal(legacy.kind, 'other')
   assert.doesNotMatch(legacy.summary, /merge/i)
+})
+
+// Test-only snapshot commits have empty *source* file lists, so their rows were
+// titled "Shared/Core update" and named nothing.
+test('testLabel: describes the suite movement the source lists drop', () => {
+  const l = testLabel({
+    files: { total: 2, meaningful: 0, tests: ['packages/agent-runtime/src/run-agent-step.test.ts', 'cli/src/__tests__/foo.spec.ts'] },
+    stats: { additions: 120, deletions: 3 }
+  })
+  assert.match(l.title, /run-agent-step/)
+  assert.match(l.summary, /^Tests only/)
+  assert.match(l.summary, /`run-agent-step`/)
+  assert.match(l.summary, /\+120\/−3/)
+
+  const bare = testLabel({ files: { total: 1, meaningful: 0 }, stats: { additions: 4, deletions: 1 } })
+  assert.equal(bare.title, 'Test suite updated')
+  assert.match(bare.summary, /1 file/)
 })
 
 

@@ -204,11 +204,13 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /<h2><time datetime="2026-09-13">\[ Sep 13, 2026 \]<\/time><\/h2>/)
     assert.doesNotMatch(indexHtml, /== \[ Sep 13, 2026 \] ==/)
 
-    // Verify collapsible entries: latest commit is open by default, previous commit is collapsed
-    assert.match(indexHtml, /<details class="entry major" id="bbbb11112222" open>/)
-    // Older days render the same complete, open rows as the newest day: reading
-    // an entry must not need a click, let alone a second page.
-    assert.match(indexHtml, /<details class="entry major" id="aaaa11112222" open>/)
+    // Collapsible entries: the newest row is open by default and every older row
+    // starts collapsed. (Teaser mode used to expand the whole first day.)
+    assert.match(indexHtml, /<details class="entry noise" id="eeee11112222" open>/)
+    assert.doesNotMatch(indexHtml, /<details class="entry major" id="bbbb11112222" open>/)
+    // Older days render the same complete bodies as the newest day: no teaser,
+    // no "open full entry" hop. They start collapsed; only the newest row is open.
+    assert.match(indexHtml, /<details class="entry major" id="aaaa11112222">/)
     assert.match(indexHtml, /class="entry-summary"/)
     assert.doesNotMatch(indexHtml, /class="badge ai"/)
     assert.doesNotMatch(indexHtml, /Summarized by/)
@@ -426,8 +428,9 @@ test('buildSite generates valid static site output', async () => {
     // Every index row is a full body: no teaser class, no hop to a day page.
     assert.doesNotMatch(indexHtml, /class="entry teaser/)
     assert.doesNotMatch(indexHtml, /open full entry/)
-    assert.ok((indexHtml.match(/<details class="entry [a-z]+(?: [a-z]+)*" id="[0-9a-f]{12}" open>/g) || []).length === 4,
-      'all index rows render expanded')
+    // ...but only the newest one starts expanded; 256 open bodies is a wall.
+    assert.equal((indexHtml.match(/<details class="entry [a-z]+(?: [a-z]+)*" id="[0-9a-f]{12}" open>/g) || []).length, 1,
+      'exactly one index row starts expanded')
     assert.ok(indexHtml.includes('class="files"'), 'file chips are on the index, not only on day pages')
 
     // Churn is listed (complete timeline) but dimmed, unsummarized, and kept out

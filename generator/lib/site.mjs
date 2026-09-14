@@ -470,7 +470,7 @@ function entryCard (e, isExpanded = false, relatedIdx = null) {
 <div class="diff-body"><span class="diff-loading">Loading diff…</span></div>
 </details>`
   }
-  return `<details class="entry ${e.significance}" id="${anchor}"${(isExpanded || e.noise) ? ' open' : ''}>
+  return `<details class="entry ${e.significance}" id="${anchor}"${isExpanded ? ' open' : ''}>
 <summary class="entry-summary">
   <div class="entry-meta-top">
     <span class="entry-arrow">&gt;</span>
@@ -591,6 +591,10 @@ export async function buildSite ({ changelog, openPrs, dist }) {
   </div>
 </section>`
 
+  // Rows are complete on every surface now, but only the newest one starts
+  // expanded: a page of 256 open bodies is a wall, and the reader asked for the
+  // content, not for scrolling.
+  let isFirstIndex = true
   const daysHtml = idx.map(d => {
   const m = d.entries.filter(e => !e.noise).length
   const ch = d.entries.length - m
@@ -599,7 +603,11 @@ export async function buildSite ({ changelog, openPrs, dist }) {
   <h2><time datetime="${d.day}">[ ${esc(fmtDateHuman(d.day))} ]</time></h2>
   <span class="day-count">${m} change${m === 1 ? '' : 's'}${ch ? ` <span class="day-churn">+${ch} churn</span>` : ''}</span>
 </div>
-${d.entries.map(e => entryCard(e, true, relatedIdx)).join('\n')}</section>`
+${d.entries.map(e => {
+  const open = isFirstIndex
+  isFirstIndex = false
+  return entryCard(e, open, relatedIdx)
+}).join('\n')}</section>`
 }).join('')
 
   await write(dist, 'index.html', layout({ title: 'Home', path: '/', body: hero + daysHtml +

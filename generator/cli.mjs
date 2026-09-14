@@ -12,7 +12,7 @@ import { git, readJson, writeJson, writeText, log, ymd, pruneDiffs, pool, withLo
 import { capturePendingWrites, persistMerged } from './lib/mergedata.mjs'
 import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
-  extractCleanDiff, churnLabel, SYNC_SUBJECT, TEST_RE
+  extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE
 } from './lib/analyze.mjs'
 import { enrichWithLlm, llmConfigured } from './lib/llm.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
@@ -36,7 +36,11 @@ async function llmPatchFor (e) {
   if (e.kind !== 'sync') return ''
   const prev = e.prevSha || (await git(['rev-parse', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
   if (!prev) return ''
-  return extractCleanDiff(REPO_DIR, prev, e.sha, 48000, true)
+  // Test files are stripped from prompts to keep them about shipped behavior --
+  // except for test-only commits, where the tests *are* the change. Excluding
+  // them there handed the queue an empty patch, so those rows could never be
+  // summarized and the backlog counter never reached zero.
+  return extractCleanDiff(REPO_DIR, prev, e.sha, 48000, !e.testOnly)
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +146,15 @@ function decorate (e) {
   else if (e.areas.includes('Docs')) e.category = 'Docs'
   else if (e.areas.includes('Packaging')) e.category = 'Packaging'
   else e.category = 'Internal'
+  // A test-only snapshot commit names nothing in files.added/modified (those hold
+  // source files only), which left 29 rows titled "Shared/Core update" with an
+  // empty body. Community rows keep their commit message; areas still decide the
+  // category, since a test for the SDK is still SDK work.
+  if (testOnly && e.kind === 'sync') {
+    const label = testLabel(e)
+    e.title = label.title
+    e.summary = label.summary
+  }
   let significance = 'minor'
   if (e.modelChanges || e.version) significance = 'major'
   else if (e.cmdChanges || e.files.added.length || e.files.removed.length) significance = 'notable'

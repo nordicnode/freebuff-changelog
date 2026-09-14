@@ -362,6 +362,10 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
   const churnedPaths = files.filter(f => isNoiseFile(f.path)).map(f => f.path)
   const sourceMeaningful = meaningful.filter(f => !TEST_RE.test(f.path))
   const testOnly = meaningful.length > 0 && sourceMeaningful.length === 0
+  // And the same for tests: in a test-only commit these are the *only* files
+  // there are, so leaving them out produced rows titled "Shared/Core update"
+  // that named nothing and could never be summarized.
+  const testPaths = meaningful.filter(f => TEST_RE.test(f.path)).map(f => f.path)
   const areas = [...new Set(meaningful.map(f => areaOf(f.path)))].filter(a => a !== 'Repo')
 
   const facts = []
@@ -422,6 +426,7 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
       rawMeaningful: meaningful.length,
       testOnly,
       churned: churnedPaths.slice(0, 12),
+      tests: testPaths.slice(0, 12),
       added: added.slice(0, 12),
       removed: removed.slice(0, 12),
       renamed: renamed.slice(0, 8).map(r => ({ from: r.from, to: r.path })),
@@ -572,6 +577,24 @@ export function churnLabel (e) {
   return { kind: 'other', title: 'Non-source files updated', summary: `No source files changed (${shown}, ${stats}).` }
 }
 
+// Test-only commits: real work landed, but no shipped code moved. These rows
+// need their own wording because files.added/modified are built from the
+// *source* file list, which is empty for them by construction.
+export function testLabel (e) {
+  const paths = e.files.tests?.length
+    ? e.files.tests
+    : [...(e.files.added || []), ...(e.files.modified || []), ...(e.files.removed || [])]
+  const names = [...new Set(paths.map(p => p.split('/').pop().replace(/\.(test|spec)\.[jt]sx?$/, '')))]
+  const shown = names.slice(0, 3).map(p => '`' + p + '`').join(', ') + (names.length > 3 ? ` +${names.length - 3} more` : '')
+  const stats = `+${e.stats.additions}/−${e.stats.deletions}`
+  return {
+    title: names.length ? `Test coverage: ${names[0]}` : 'Test suite updated',
+    summary: names.length
+      ? `Tests only (${shown}, ${stats}): the suite moved, no shipped code edits.`
+      : `Tests only (${e.files.total} file(s), ${stats}): the suite moved, no shipped code edits.`
+  }
+}
+
 function listPhrase (arr) {
   arr = arr.slice(0, 5)
   return arr.length === 1 ? arr[0] : arr.slice(0, -1).join(', ') + ' and ' + arr.at(-1)
@@ -615,6 +638,7 @@ export async function analyzeCommunityCommit (repoDir, commit, prevSha, repoMeta
   const testOnly = meaningful.length > 0 && sourceMeaningful.length === 0
   const areas = [...new Set(meaningful.map(f => areaOf(f.path)))].filter(a => a !== 'Repo')
   const churnedPaths = files.filter(f => isNoiseFile(f.path)).map(f => f.path)
+  const testPaths = meaningful.filter(f => TEST_RE.test(f.path)).map(f => f.path)
   const prMatch = /\(#(\d+)\)/.exec(commit.subject)
   const verMatch = /[Bb]ump (?:\w+ )*version(?: to)? (\d+\.\d+\.\d+)/.exec(commit.subject)
   const entry = {
@@ -636,6 +660,7 @@ export async function analyzeCommunityCommit (repoDir, commit, prevSha, repoMeta
       rawMeaningful: meaningful.length,
       testOnly,
       churned: churnedPaths.slice(0, 12),
+      tests: testPaths.slice(0, 12),
       added: sourceMeaningful.filter(f => f.status === 'added').map(f => f.path).slice(0, 12),
       removed: sourceMeaningful.filter(f => f.status === 'removed').map(f => f.path).slice(0, 12),
       renamed: [],
