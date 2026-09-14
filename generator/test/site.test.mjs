@@ -134,6 +134,7 @@ test('buildSite generates valid static site output', async () => {
           summary: 'Model catalog: Muse Spark 1.3 replaced Muse Spark 1.2 in the free model lineup.',
           title: 'Muse Spark 1.3 replaces Muse Spark 1.2 in the free model lineup',
           ai: { title: 'Muse Spark 1.3 replaces Muse Spark 1.2', summary: 'AI summarized diff', model: 'mock-model' },
+          eli5: { text: 'A newer AI model is now available in the free list, replacing the older one.', v: 1, src: 'aaaaaaaaaaaa' },
           category: 'Model Catalog',
           significance: 'major',
           day: '2026-09-13',
@@ -189,6 +190,11 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /href="\/in-flight\/"/)
     assert.match(indexHtml, /class="diff-viewer" data-sha=/)
     assert.match(indexHtml, /View inline diff/)
+    // The plain-English line renders directly under the technical summary, and is
+    // spelled out for readers who have never seen the term "ELI5".
+    assert.match(indexHtml, /<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH<\/span>A newer AI model is now available/)
+    assert.ok(indexHtml.indexOf('class="eli5"') > indexHtml.indexOf('AI summarized diff'),
+      'the ELI5 line sits after the technical summary it explains')
     // Diffs lazy-load on toggle: no pre-rendered diff markup in pages
     assert.doesNotMatch(indexHtml, /<pre class="diff-pre">/)
     assert.doesNotMatch(indexHtml, /<div class="diff-line/)
@@ -445,6 +451,7 @@ test('buildSite generates valid static site output', async () => {
     const churnRow = indexHtml.slice(churnStart, churnNextRow === -1 ? churnStart + 4000 : churnNextRow)
     assert.match(churnRow, /bun\.lock/, 'churn row states which files changed')
     assert.doesNotMatch(churnRow, /View inline diff/, 'churn rows carry no source diff')
+    assert.doesNotMatch(churnRow, /class="eli5"/, 'churn rows carry no plain-English line either')
     // Day pages carry related links + per-day OG image
     assert.match(dayHtml2, /RELATED:/)
     assert.match(dayHtml2, /og\/2026-09-13\.svg/)

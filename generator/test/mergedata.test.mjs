@@ -12,7 +12,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mergeChangelog, mergeAiCache, mergeSyncState, capturePendingWrites, persistMerged } from '../lib/mergedata.mjs'
 import { syncReason, syncStaleMs, DEFAULT_SYNC_STALE_MIN } from '../lib/sync.mjs'
-import { withLock, writeJson } from '../lib/util.mjs'
+import { withLock, writeJson, shortHash, eli5Source } from '../lib/util.mjs'
+
+const withEli5 = (e, text) => ({ ...e, eli5: { text, v: 1, src: shortHash(eli5Source(e)) } })
 
 const entry = (sha, date, ai = null) => ({ sha, date, kind: 'sync', ...(ai ? { ai } : {}) })
 
@@ -209,4 +211,51 @@ test('withLock releases on throw and takes over a stale lock', async () => {
   assert.equal(held.result, 'held')
   const taken = await withLock(lockDir, async () => 'took over', { staleMs: 30 * 60000 })
   assert.equal(taken.acquired, true)
+})
+
+// The plain-English line is produced by the writer that holds the summary, which
+// is usually *not* the writer whose document wins the scalars. Losing it in the
+// merge would mean paying for the call again; keeping one that explains a
+// summary nobody has would be worse than having none.
+test('mergeChangelog carries the ELI5 line from whichever side produced it', () => {
+  const ai = { v: 5, title: 'Adds gemini-3', summary: 'Swaps the default model.' }
+  // Backfill snapshot (older stamp) holds the summary and its ELI5; disk has the
+  // entry with neither, because analyze re-derived it.
+  const ours = doc('2026-09-14T11:21:46.000Z', 'a1', [withEli5(entry('a', '2026-09-14T10:00:00Z', ai), 'The assistant can use a new model now.')])
+  const disk = doc('2026-09-14T14:30:00.000Z', 'b2', [entry('a', '2026-09-14T10:00:00Z')])
+  const merged = mergeChangelog(ours, disk)
+  assert.match(merged.entries[0].ai.title, /gemini/, 'the summary survives')
+  assert.match(merged.entries[0].eli5.text, /new model/, 'the ELI5 survives with it')
+  assert.equal(mergeChangelog(disk, ours).entries[0].eli5.text, merged.entries[0].eli5.text,
+    'commutative: push order must not decide who keeps their text')
+})
+
+test('mergeChangelog keeps the ELI5 that matches the surviving summary', () => {
+  const olderAi = { v: 5, title: 'Older', summary: 'An older summary.' }
+  const newerAi = { v: 6, title: 'Newer', summary: 'A newer summary.' }
+  // The document that wins the entry carries a line explaining a summary that
+  // loses; the other side holds a better summary and the line written from it.
+  const stalePair = () => ({
+    ...entry('a', '2026-09-14T10:00:00Z', olderAi),
+    eli5: { text: 'Explains the older summary.', v: 1, src: shortHash(eli5Source({ ai: olderAi })) }
+  })
+  const freshPair = withEli5(entry('a', '2026-09-14T10:00:00Z', newerAi), 'Explains this summary.')
+  const rounds = [
+    [doc('2026-09-14T14:30:00.000Z', 'b2', [stalePair()]), doc('2026-09-14T11:21:46.000Z', 'a1', [freshPair])],
+    [doc('2026-09-14T11:21:46.000Z', 'a1', [freshPair]), doc('2026-09-14T14:30:00.000Z', 'b2', [stalePair()])]
+  ]
+  for (const [x, y] of rounds) {
+    const m = mergeChangelog(x, y)
+    assert.equal(m.entries[0].ai.v, 6, 'the better summary wins')
+    assert.match(m.entries[0].eli5.text, /this summary/, 'and the line that explains it follows')
+  }
+})
+
+test('mergeChangelog is deterministic when two different ELI5 lines are equally stale', () => {
+  const ai = { v: 5, title: 'T', summary: 'S' }
+  const a = { ...entry('a', '2026-09-14T10:00:00Z', ai), eli5: { text: 'one', v: 1, src: 'aaaaaaaaaaaa' } }
+  const b = { ...entry('a', '2026-09-14T10:00:00Z', ai), eli5: { text: 'two', v: 1, src: 'bbbbbbbbbbbb' } }
+  const one = mergeChangelog(doc('2026-09-14T14:00:00.000Z', 'x', [a]), doc('2026-09-14T11:00:00.000Z', 'y', [b]))
+  const two = mergeChangelog(doc('2026-09-14T11:00:00.000Z', 'y', [b]), doc('2026-09-14T14:00:00.000Z', 'x', [a]))
+  assert.equal(one.entries[0].eli5.src, two.entries[0].eli5.src, 'same answer whichever writer pushed first')
 })

@@ -14,6 +14,22 @@ export function sha256 (text) {
   return createHash('sha256').update(text).digest('hex')
 }
 
+// Short content fingerprint for cache keys. Both LLM passes use it, and the
+// changelog merge uses it to tell whether an ELI5 line still describes the
+// summary it was written from -- which is why it lives here, not in llm.mjs
+// (mergedata must not import the module that imports it).
+export function shortHash (text) {
+  return createHash('sha1').update(String(text ?? '')).digest('hex').slice(0, 12)
+}
+
+// The text an ELI5 line is an explanation *of*. Lives here rather than in
+// llm.mjs because the changelog merge has to recompute it to tell whether an
+// incoming ELI5 still matches the summary that survived the merge, and mergedata
+// must not import the module that imports it.
+export function eli5Source (e) {
+  return `${e.ai?.title || ''}\n${e.ai?.summary || ''}`
+}
+
 export async function git (args, cwd, opts = {}) {
   try {
     const { stdout } = await execFileP('git', args, {

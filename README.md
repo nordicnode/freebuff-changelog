@@ -78,6 +78,7 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
 | Workers build on push | ~20–60s | Cloudflare |
 | edge/browser TTL on `/`, `/day/*` | ≤ 60s (+`stale-while-revalidate`) | `_headers` |
 | its summary replaces the deterministic one | next batch, ahead of the backlog | `CHANGELOG_LLM_LIMIT` |
+| its plain-English line appears | same batch (own queue, no diff needed) | `CHANGELOG_ELI5_LIMIT` |
 
 So a new commit is readable in roughly 2–3 minutes, and a long-open tab reloads
 itself once per data version when it comes back from the background past its
@@ -113,12 +114,34 @@ strictly in the diff text:
 | `CHANGELOG_LLM_LIMIT` | max commits summarized per run (default 60) |
 | `CHANGELOG_LLM_CONCURRENCY` | parallel API calls (default 5) |
 | `CHANGELOG_LLM_ERROR_COOLDOWN_MS` | retry failed entries after this (default 3600000) |
+| `CHANGELOG_ELI5_LIMIT` | plain-English lines per run (defaults to `CHANGELOG_LLM_LIMIT`) |
+| `CHANGELOG_ELI5_CONCURRENCY` | parallel ELI5 calls (defaults to `CHANGELOG_LLM_CONCURRENCY`) |
+| `CHANGELOG_ELI5=0` | disable the plain-English pass only, keep summaries |
 
 Priority order is user-visible first (models, releases, commands), then newest.
 The prompt carries deterministic signals (category, files, stats, catalog and
 command facts) so the model grounds in verifiable context; outputs are schema-
 validated with one repair retry and 429 backoff. Prompt edits bump `PROMPT_V`
 in `generator/lib/llm.mjs`, invalidating stale cache entries exactly once.
+
+**The ELI5 pass** is a second, separate call per entry: 1-3 sentences of plain
+English under the technical summary, for a reader who does not open code. It is
+*not* extra fields in the summary prompt, because that would mean bumping
+`PROMPT_V` and re-paying 912 summaries that are already good, and because the
+wording of a plain-English ask needs tuning without rewriting technical history.
+So it has its own `ELI5_V`, its own keys in the same cache file
+(`<sha>:eli5:v<N>:<hash>`), and its own budget. Its input is the finished summary
+rather than the diff: no git work, no patch tokens, and the rules that matter
+(hard jargon ban, no invented causes or numbers, no inflating small changes, and
+a non-answer like "N/A" is rejected rather than cached as success) apply to text
+rather than to raw code. It is keyed by the hash of the summary it explains, so a
+re-summarized entry loses a stale line automatically, and `mergeChangelog` keeps
+whichever side's line still matches the summary that survives the merge.
+
+Every entry that gets a summary gets an ELI5, including brand-new commits: the
+hourly pass runs over all entries rather than only the additions, and the loop's
+drain sits outside the summary branch so a commit summarized in one pass is
+explained in the same cycle.
 
 AI-titled entries are badged `ai`. Without AI, or on API failure, the
 rule-based summary is used: the site never depends on the LLM.

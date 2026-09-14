@@ -484,6 +484,7 @@ function entryCard (e, isExpanded = false, relatedIdx = null) {
 <div class="entry-body">
 ${modelDiffLine(e)}
 <div class="summary">${miniMd(e.ai?.summary || e.summary)}</div>
+${e.eli5?.text ? `<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH</span>${esc(e.eli5.text)}</p>` : ''}
 ${e.facts?.length ? `<ul class="facts">${e.facts.slice(0, 3).map(f => `<li>${miniMd(f)}</li>`).join('')}</ul>` : ''}
 ${fileChips(e)}
 ${diffViewer}

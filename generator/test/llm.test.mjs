@@ -1,7 +1,8 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, buildPrompt, enrichWithLlm, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V } from '../lib/llm.mjs'
+import { parseLlmJson, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5 } from '../lib/llm.mjs'
+import { shortHash } from '../lib/util.mjs'
 
 test('shortError: collapses HTML error pages to status line', () => {
   assert.equal(shortError(new Error('LLM HTTP 522: <!DOCTYPE html>\n<html>...')), 'LLM HTTP 522')
@@ -334,4 +335,112 @@ test('priorityShas: new commits jump the backlog and patch work stays bounded', 
   assert.equal(patched[0], freshSha, 'the new commit is diffed and queued first')
   assert.ok(patched.length <= Math.max(2 * 4, 2 + 5), `patch work bounded to the run window, got ${patched.length} of ${entries.length}`)
   assert.ok(patched.length < entries.length, 'the whole backlog is not diffed to fill 2 slots')
+})
+
+// ---------------------------------------------------------------------------
+// ELI5: the plain-English pass. Its contract is that it follows the summary --
+// same source text, so it re-runs exactly when that summary changes, and never
+// asks the model for a diff.
+
+const eli5Entry = (over = {}) => ({
+  kind: 'sync',
+  sha: 'e'.repeat(40),
+  date: '2026-09-13T10:00:00Z',
+  day: '2026-09-13',
+  category: 'CLI',
+  areas: ['CLI'],
+  significance: 'minor',
+  summary: 'CLI change.',
+  ai: { model: 'gpt', v: PROMPT_V, title: 'A new model is supported', summary: 'The snapshot now offers an additional model to the assistant.' },
+  ...over
+})
+
+test('eli5Eligible: only entries with a current technical summary', () => {
+  assert.equal(eli5Eligible(eli5Entry()), true)
+  assert.equal(eli5Eligible(eli5Entry({ noise: true, churn: 'lockfile' })), false, 'churn has nothing to explain')
+  assert.equal(eli5Eligible(eli5Entry({ ai: undefined })), false, 'community rows never went through the model')
+  assert.equal(eli5Eligible(eli5Entry({ ai: { v: PROMPT_V - 1, title: 't', summary: 's' } })), false,
+    'an entry that is about to be re-summarized waits for the newer summary')
+})
+
+test('eli5Done: pinned to the exact summary the line was written from', () => {
+  const e = eli5Entry()
+  assert.equal(eli5Done(e), false)
+  e.eli5 = { text: 'A new model is available.', v: ELI5_V, src: shortHash(eli5Source(e)) }
+  assert.equal(eli5Done(e), true)
+  e.ai.summary = 'Something entirely different.'
+  assert.equal(eli5Done(e), false, 'a re-summarized entry must lose its stale ELI5')
+})
+
+test('normalizeEli5: unwraps the reply, strips the echoed label, keeps it honest', () => {
+  assert.equal(normalizeEli5({ eli5: 'The assistant can use a new model now.' }), 'The assistant can use a new model now.')
+  assert.equal(normalizeEli5('ELI5:  A   new model works. '), 'A new model works.')
+  assert.equal(normalizeEli5({ eli5: 'A new model works' }), 'A new model works.')
+  // A terse but valid sentence must survive; a non-answer must not be parked as
+  // a "success" that then renders an empty-looking line forever.
+  assert.equal(normalizeEli5({ eli5: 'It is faster now' }), 'It is faster now.')
+  assert.throws(() => normalizeEli5({ eli5: 'too brief' }), /not an answer/)
+  assert.throws(() => normalizeEli5({ eli5: 'N/A' }), /not an answer/)
+  assert.throws(() => normalizeEli5({ eli5: 'I cannot answer that.' }), /not an answer/)
+  // ...but a real sentence that merely contains "cannot" is not a refusal.
+  assert.equal(normalizeEli5({ eli5: 'The assistant cannot use the broken model anymore' }),
+    'The assistant cannot use the broken model anymore.')
+  assert.throws(() => normalizeEli5({}), /not an answer/)
+  const cut = normalizeEli5({ eli5: 'word ' + 'many '.repeat(120) + 'tail' })
+  assert.ok(cut.length <= 421, `capped, got ${cut.length}`)
+  assert.ok(/word/.test(cut) && !/man$/.test(cut), 'cut on a word boundary')
+})
+
+test('enrichEli5: writes the line, caches it by the summary, asks once', async (t) => {
+  const { mkdtemp, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-eli5-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const env = {
+    CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1',
+    LLM_MODEL: 'test-model', CHANGELOG_LLM_LIMIT: '5'
+  }
+  let calls = 0
+  const orig = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    calls++
+    assert.match(url, /chat\/completions$/)
+    assert.match(init.body, /not a programmer/, 'the prompt asks for a non-technical reader')
+    assert.doesNotMatch(init.body, /diff --git/, 'the ELI5 prompt carries no patch')
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ eli5: 'A model the assistant can use is now available.' }) } }]
+      })
+    }
+  }
+  try {
+    const e = eli5Entry()
+    assert.equal(await enrichEli5([e], dir, env, { retryErrors: true }), 1)
+    assert.match(e.eli5.text, /now available/)
+    assert.equal(e.eli5.v, ELI5_V)
+    assert.equal(e.eli5.src, shortHash(eli5Source(e)), 'the entry records what it explains')
+    const cached = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    const keys = Object.keys(cached)
+    assert.equal(keys.length, 1)
+    assert.match(keys[0], new RegExp(`^${e.sha}:eli5:v${ELI5_V}:`), 'keyed in the same cache, separate namespace')
+
+    // Second pass over the same summary: served from cache, no API call, and the
+    // line still lands on the entry (a cache hit that rendered nothing would be
+    // indistinguishable from a failure in production).
+    const fresh = eli5Entry()
+    assert.equal(await enrichEli5([fresh], dir, env, { retryErrors: true }), 0)
+    assert.equal(calls, 1, 'cache hit must not spend a call')
+    assert.match(fresh.eli5.text, /now available/)
+
+    // Rewording the prompt version invalidates it, and the kill switch disables it.
+    assert.equal(eli5Key(e.sha, 'x'), `${e.sha}:eli5:v${ELI5_V}:${shortHash('x')}`)
+    assert.equal(await enrichEli5([eli5Entry()], dir, { ...env, CHANGELOG_ELI5: '0' }, {}), 0)
+    assert.equal(calls, 1, 'CHANGELOG_ELI5=0 must not spend a call either')
+  } finally {
+    globalThis.fetch = orig
+  }
 })

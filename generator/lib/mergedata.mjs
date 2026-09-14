@@ -12,7 +12,7 @@
 // document as the base, and graft only *our* additions on top. Both files are
 // commutative under these rules, so commit order stops mattering.
 import { existsSync } from 'node:fs'
-import { readJson, writeJson } from './util.mjs'
+import { readJson, writeJson, shortHash, eli5Source } from './util.mjs'
 
 export function sortEntries (entries) {
   return entries.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.sha < b.sha ? -1 : 1))
@@ -21,6 +21,25 @@ export function sortEntries (entries) {
 // A summary counts only if it carries content; error stubs never do.
 function usableAi (e) {
   return e && e.ai && (e.ai.summary || e.ai.title) ? e.ai : null
+}
+
+// A plain-English line belongs to one particular summary: eli5.src is the hash of
+// the title+summary it was written from. A merge must therefore not keep an ELI5
+// that explains a summary nobody has any more, and with one candidate on each
+// side it must reach the same answer whichever writer happened to push first.
+function pickEli5 (ours, theirs, entry) {
+  if (!ours) return theirs
+  if (!theirs) return ours
+  if (entry.ai?.title || entry.ai?.summary) {
+    const want = shortHash(eli5Source(entry))
+    if (ours.src === want && theirs.src !== want) return ours
+    if (theirs.src === want && ours.src !== want) return theirs
+  }
+  const ov = ours.v ?? 1
+  const tv = theirs.v ?? 1
+  if (ov !== tv) return ov > tv ? ours : theirs
+  // Equal standing: settle on the content, not on who won the merge.
+  return String(ours.src) <= String(theirs.src) ? ours : theirs
 }
 
 function stampOf (doc) {
@@ -56,6 +75,9 @@ export function mergeChangelog (ours, theirs) {
       cur.ai = mine
       grafted++
     }
+    // ...and its plain-English line has to follow whatever summary ended up here.
+    const kept = pickEli5(cur.eli5, e.eli5, cur)
+    if (kept && kept !== cur.eli5) cur.eli5 = kept
   }
 
   return {

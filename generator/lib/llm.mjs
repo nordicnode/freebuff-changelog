@@ -17,8 +17,7 @@
 //   CHANGELOG_LLM_ERROR_COOLDOWN_MS  retry failed entries after this (default 3600000)
 //   CHANGELOG_LLM_TRANSIENT_RETRY_MS  ...but gateway blips retry sooner (default 300000)
 //   options.priorityShas       SHAs to summarize ahead of the backlog
-import { createHash } from 'node:crypto'
-import { readJson, writeJson, log, pool } from './util.mjs'
+import { readJson, writeJson, log, pool, shortHash, eli5Source } from './util.mjs'
 import { mergeAiCache } from './mergedata.mjs'
 
 export function llmConfigured (env = process.env) {
@@ -34,7 +33,7 @@ export function firstSentence (s) {
 }
 
 function patchHash (patch) {
-  return createHash('sha1').update(patch).digest('hex').slice(0, 12)
+  return shortHash(patch)
 }
 
 export function cacheKey (sha, patch) {
@@ -130,7 +129,10 @@ export function shortError (err) {
   return msg.split('\n')[0].slice(0, 120)
 }
 
-async function callLlm (prompt, env, attempt = 1) {
+// `validate` is a parameter because the ELI5 pass speaks to the same gateway
+// with a different shape: the repair retry has to check the replacement against
+// the schema that was asked for, not the summary one.
+async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
   const base = env.LLM_API_BASE || 'https://api.openai.com/v1'
   const model = env.LLM_MODEL || 'gpt-4o-mini'
   const res = await fetch(`${base.replace(/\/$/, '')}/chat/completions`, {
@@ -164,13 +166,13 @@ async function callLlm (prompt, env, attempt = 1) {
   const data = parseLlmJson(rawText)
   const text = data.choices?.[0]?.message?.content ?? ''
   try {
-    return validateLlmOut(parseLlmJson(text))
+    return validate(parseLlmJson(text))
   } catch (err) {
     if (attempt > 2) throw err
     // One repair pass: ask for valid JSON only, no new analysis.
     log(`LLM output invalid (${err.message}): requesting repair ${attempt}/2`)
-    const fixed = await callLlm(`${prompt}\n\nPrevious output was invalid JSON: ${String(text).slice(0, 500)}\nReply with ONLY the corrected JSON object.`, env, attempt + 1)
-    return validateLlmOut(fixed)
+    const fixed = await callLlm(`${prompt}\n\nPrevious output was invalid JSON: ${String(text).slice(0, 500)}\nReply with ONLY the corrected JSON object.`, env, attempt + 1, validate)
+    return validate(fixed)
   }
 }
 
@@ -335,6 +337,182 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     // Union with what landed on disk while these calls were in flight: the
     // cache is keyed by content, so another writer's keys are additive and
     // must not be dropped by this run's snapshot.
+    await writeJson(cachePath, mergeAiCache(await readJson(cachePath, {}), cache))
+  }
+  return apiCalls
+}
+
+// ---------------------------------------------------------------------------
+// ELI5: a plain-English line beneath each technical summary.
+//
+// A second pass on purpose, not extra fields in buildPrompt:
+//   - its input is the summary, not the diff, so it costs no git work and a much
+//     shorter prompt;
+//   - adding it to the summary prompt means bumping PROMPT_V, which throws away
+//     912 summaries the project already paid for;
+//   - the wording of an ELI5 ask will want tuning, and rewording it must never
+//     rewrite technical history. So it has its own version, its own keys in the
+//     same cache file, and its own budget knobs.
+// It re-runs by itself whenever the summary it describes changes, because the
+// cache key hashes that summary and eli5Done() compares against it.
+export const ELI5_V = 1
+
+// eli5Source() lives in util.mjs because the changelog merge has to recompute it
+// to check a merged ELI5 against the summary that survived. Re-exported here as
+// part of this module's contract: its hash is the cache key suffix and the
+// entry's eli5.src, so a re-summarized entry drops a stale plain-English line.
+export { eli5Source }
+
+export function eli5Key (sha, source) {
+  return `${sha}:eli5:v${ELI5_V}:${shortHash(source)}`
+}
+
+// Explainable = has a current technical summary. Churn rows have nothing to
+// explain, and community rows are titled straight from their commit message and
+// never went through the model.
+export function eli5Eligible (e) {
+  return !e.noise && !!e.ai?.title && !!e.ai?.summary && (e.ai?.v ?? 1) >= PROMPT_V
+}
+
+export function eli5Done (e) {
+  return !!(e.eli5 && e.eli5.v >= ELI5_V && e.eli5.src === shortHash(eli5Source(e)))
+}
+
+export function buildEli5Prompt (e) {
+  return `Explain one software change to a reader who is not a programmer and will not look at the code.
+
+Date: ${e.day || ''}
+Area: ${e.category || ''}
+Title: ${e.ai.title}
+Technical summary: ${e.ai.summary}
+
+Write 1-3 sentences of plain English: what happened, and what it means for someone who just uses the product.
+
+Rules:
+- No jargon, acronyms, file names, function names, code or version numbers. Say what the thing does instead of what it is called ("the assistant can now use a new model", not "a provider adapter was wired up").
+- Use only what the summary says. Never invent a cause, a number, or a promise.
+- Plain words, active voice. No "This change", "We are excited", or marketing tone.
+- If the change is small or internal, say so shortly. Do not inflate it.
+- Never address the reader as a developer.
+
+Reply with JSON only: {"eli5": "..."}`
+}
+
+// Non-answers worth parking: a whole reply that is "N/A", or one that opens with
+// a refusal. Checked at the start of the sentence so a real explanation that
+// happens to contain "cannot" is not thrown away.
+const ELI5_JUNK = /^(n\/?a|none|not applicable|no comment|unknown)[.!]?$/i
+const ELI5_REFUSAL = /^(i\s+ca(?:n'?t|nnot|'m unable)|we\s+ca(?:n'?t|nnot)|unable to|sorry|as an ai|i'?m (just|only|an)|no information)\b/i
+
+export function normalizeEli5 (raw) {
+  // callLlm hands the validator the parsed object; a bare-string reply is also
+  // accepted because small models sometimes ignore the JSON envelope.
+  const value = raw && typeof raw === 'object' ? (raw.eli5 ?? raw.text ?? '') : raw
+  let s = String(value ?? '').trim()
+  // Models like to restate the label they were given.
+  s = s.replace(/^(ELI5|In plain English|Plain english)\s*[:–-]\s*/i, '').trim()
+  s = s.replace(/\s+/g, ' ').replace(/\s+([.,;:])/g, '$1').trim()
+  // The floor exists to catch non-answers, not to reject a terse but valid
+  // sentence: "It is faster now." is 16 characters and exactly what this field
+  // is for. A 25-character floor parked real answers as errors for an hour.
+  if (s.length < 12 || ELI5_JUNK.test(s) || ELI5_REFUSAL.test(s)) {
+    throw new Error(`eli5 not an answer: ${JSON.stringify(s).slice(0, 60)}`)
+  }
+  if (!/[.!?]$/.test(s)) s += '.'
+  return truncateWords(s, 420)
+}
+
+export async function enrichEli5 (entries, dataDir, env = process.env, options = {}) {
+  if (!llmConfigured(env) || env.CHANGELOG_ELI5 === '0') return 0
+  const cachePath = `${dataDir}/ai-summaries.json`
+  const cache = await readJson(cachePath, {})
+  // Separate knobs so the initial fill can be run down faster than the summary
+  // budget, without touching the pass that costs real diff tokens.
+  const limit = Number(env.CHANGELOG_ELI5_LIMIT || env.CHANGELOG_LLM_LIMIT || 20)
+  const concurrency = Number(env.CHANGELOG_ELI5_CONCURRENCY || env.CHANGELOG_LLM_CONCURRENCY || 5)
+  const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
+  const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
+  const priority = options.priorityShas instanceof Set ? options.priorityShas : new Set(options.priorityShas || [])
+  let apiCalls = 0
+  let cacheModified = false
+
+  const prio = (e) => (priority.has(e.sha) ? -1 : e.modelChanges ? 0 : e.version ? 1 : e.cmdChanges ? 2 : 3)
+  const pending = entries.filter(eli5Eligible).filter(e => !eli5Done(e))
+  pending.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
+  // Same bound as the summary pass: choosing this run's dozen entries must not
+  // mean hashing the whole backlog.
+  const candidates = pending.slice(0, Math.max(limit * 4, limit + 5))
+
+  const queue = []
+  for (const e of candidates) {
+    const src = eli5Source(e)
+    const key = eli5Key(e.sha, src)
+    const cached = cache[key]
+    if (cached?.error) {
+      if (!options.retryErrors) continue
+      const failedAt = Date.parse(cached.at || '') || 0
+      if (Date.now() - failedAt < (cached.transient ? transientRetryMs : errorCooldownMs)) continue
+    }
+    if (cached && !cached.error) {
+      // A cache hit costs nothing but still has to land on the entry, or the
+      // site renders no ELI5 line for it.
+      e.eli5 = { text: cached.text, model: cached.model, v: cached.v, src: shortHash(src), at: cached.at }
+      continue
+    }
+    queue.push({ entry: e, src, key })
+    if (queue.length >= limit) break
+  }
+
+  if (!queue.length) return 0
+
+  let activeIndex = 0
+  let gatewayFails = 0
+
+  async function worker () {
+    while (activeIndex < queue.length) {
+      if (gatewayFails >= 3) break
+      const idx = activeIndex++
+      const { entry: e, src, key } = queue[idx]
+      try {
+        const out = await callLlm(buildEli5Prompt(e), env, 1, normalizeEli5)
+        gatewayFails = 0
+        cache[key] = {
+          model: env.LLM_MODEL || 'gpt-4o-mini',
+          v: ELI5_V,
+          text: out,
+          at: new Date().toISOString()
+        }
+        e.eli5 = { text: out, model: cache[key].model, v: ELI5_V, src: shortHash(src), at: cache[key].at }
+        apiCalls++
+        cacheModified = true
+        log(`ELI5 wrote ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})`)
+      } catch (err) {
+        log(`ELI5 failed for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
+        const transient = isTransientError(err)
+        if (transient) {
+          if (options.retryErrors) {
+            cache[key] = { error: shortError(err).slice(0, 200), transient: true, at: new Date().toISOString() }
+            cacheModified = true
+          }
+          gatewayFails++
+          if (gatewayFails >= 3) {
+            log('LLM endpoint appears offline (3 consecutive gateway errors): skipping the ELI5 queue this run')
+            break
+          }
+          continue
+        }
+        // Bad or empty model output: parked for the long cooldown, since
+        // retrying the same prompt on the next cycle would fail the same way.
+        cache[key] = { error: shortError(err).slice(0, 200), at: new Date().toISOString() }
+        cacheModified = true
+      }
+    }
+  }
+
+  const poolSize = Math.min(concurrency, queue.length)
+  await Promise.all(Array.from({ length: poolSize }, () => worker()))
+
+  if (cacheModified) {
     await writeJson(cachePath, mergeAiCache(await readJson(cachePath, {}), cache))
   }
   return apiCalls

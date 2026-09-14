@@ -487,6 +487,27 @@ nav.term-nav a.active{
   line-height:1.6;
   color:#d1d7e0;
 }
+/* The plain-English line is a different register, not a lesser status: amber like
+   the terminal's own annotations, so it reads as the human note beside the
+   technical text without competing with it. */
+.eli5{
+  margin:8px 0 6px;
+  padding:7px 11px;
+  border-left:2px solid var(--term-amber);
+  background:rgba(210,153,34,.06);
+  font-size:.88rem;
+  line-height:1.55;
+  color:var(--txt);
+}
+.eli5-label{
+  display:inline-block;
+  margin-right:7px;
+  font-size:.62rem;
+  font-weight:700;
+  letter-spacing:.08em;
+  color:var(--term-amber);
+  vertical-align:1px;
+}
 .facts{
   margin:8px 0;
   padding-left:14px;

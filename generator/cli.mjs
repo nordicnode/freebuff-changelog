@@ -14,7 +14,7 @@ import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE
 } from './lib/analyze.mjs'
-import { enrichWithLlm, llmConfigured } from './lib/llm.mjs'
+import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, llmConfigured } from './lib/llm.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
 
@@ -228,6 +228,12 @@ async function generateOnce (argv) {
       log(`LLM enriched ${n} new entries`)
     }
   }
+  // ELI5 scans the whole entry set rather than only this run's additions: the
+  // summary it explains may have been written minutes ago by the other pass.
+  // This call is what makes a brand-new entry arrive with its plain-English line
+  // already attached instead of waiting for a backfill.
+  const eli5N = await enrichEli5(entries, DATA)
+  if (eli5N) log(`ELI5 wrote ${eli5N} plain-English line${eli5N === 1 ? '' : 's'}`)
 
   const prevScanned = existing.counts?.commitsScanned || 0
   const changelog = {
@@ -498,15 +504,16 @@ async function catchUpOnce (argv) {
   const unsummarizedSync = syncEntries.filter(e => !isCurrent(e))
   log(`[backfill] ${syncEntries.length} total sync entries (${unsummarizedSync.length} remaining to summarize)`)
 
+  let limit = Number(process.env.CHANGELOG_LLM_LIMIT || 5)
+  const limitIdx = argv.indexOf('--limit')
+  if (limitIdx !== -1 && argv[limitIdx + 1]) {
+    limit = Number(argv[limitIdx + 1]) || limit
+  }
+
   let didSummarize = false
   if (!unsummarizedSync.length) {
     log('[backfill] all existing sync entries already have AI summaries!')
   } else if (llmConfigured()) {
-    let limit = Number(process.env.CHANGELOG_LLM_LIMIT || 5)
-    const limitIdx = argv.indexOf('--limit')
-    if (limitIdx !== -1 && argv[limitIdx + 1]) {
-      limit = Number(argv[limitIdx + 1]) || limit
-    }
     await backfillDiffs(entries, 1000)
     const envWithLimit = { ...process.env, CHANGELOG_LLM_LIMIT: String(limit) }
     const n = await enrichWithLlm(entries, llmPatchFor, DATA, envWithLimit, {
@@ -519,6 +526,22 @@ async function catchUpOnce (argv) {
     didSummarize = remaining < unsummarizedSync.length
   } else {
     log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env)')
+  }
+
+  // The ELI5 drain sits *outside* that branch on purpose. In the steady state
+  // every summary already exists, so nothing below the first if would ever run
+  // and the plain-English backlog would never move; and a commit summarized a
+  // few lines above needs its line in the same cycle, not the next one.
+  if (llmConfigured()) {
+    const eli5Written = await enrichEli5(entries, DATA, { ...process.env, CHANGELOG_LLM_LIMIT: String(limit) }, {
+      retryErrors: true,
+      priorityShas: new Set(freshShas.slice(-limit))
+    })
+    const eli5Remaining = entries.filter(e => eli5Eligible(e) && !eli5Done(e)).length
+    if (eli5Written || eli5Remaining) {
+      log(`[backfill] ELI5 wrote ${eli5Written} entries (${eli5Remaining} remaining)`)
+    }
+    didSummarize = didSummarize || eli5Written > 0
   }
 
   // 4. Publish again, this time with the summaries in. Still unconditional on
