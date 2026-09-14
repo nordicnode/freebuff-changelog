@@ -415,20 +415,25 @@ function entryCard (e, isExpanded = false, mode = 'full', relatedIdx = null) {
   const anchor = e.sha.slice(0, 12)
   const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
   if (mode === 'teaser') {
-    // Lightweight homepage row: title + facts only, linking to the full
-    // card on the day page. A plain article (not <details>) so it never
-    // pretends to expand with nothing to show.
-    const factLine = e.facts?.length ? `<div class="teaser-facts">${e.facts.length} key fact${e.facts.length === 1 ? '' : 's'} &middot; +${e.stats.additions} / −${e.stats.deletions}</div>` : ''
-    return `<article class="entry teaser ${e.significance}" id="${anchor}">
+    // Lightweight homepage row: expandable facts + link to full card.
+    // Keeps toggle affordance without full body weight.
+    const factBody = e.facts?.length ? `<ul class="facts">${e.facts.slice(0, 3).map(f => `<li>${miniMd(f)}</li>`).join('')}</ul>` : `<p class="teaser-empty">No key facts extracted.</p>`
+    return `<details class="entry teaser ${e.significance}" id="${anchor}">
+<summary class="entry-summary">
   <div class="entry-meta-top">
-    <span class="commit-ref">commit <a href="/day/${e.day}/#${anchor}">${anchor}</a></span>
+    <span class="entry-arrow">&gt;</span>
+    <span class="commit-ref">commit <a href="/day/${e.day}/#${anchor}" onclick="event.stopPropagation()">${anchor}</a></span>
     <span class="entry-utc">${esc(time)} UTC</span>
     <div class="badges">${badges(e)}</div>
-    <a class="permalink" href="/day/${e.day}/#${anchor}" title="Permalink" aria-label="Permalink">#</a>
+    <a class="permalink" href="/day/${e.day}/#${anchor}" title="Permalink" aria-label="Permalink" onclick="event.stopPropagation()">#</a>
   </div>
-  <h3 class="entry-title"><a href="/day/${e.day}/#${anchor}">${title}</a></h3>
-  ${factLine}
-</article>`
+  <h3 class="entry-title">${title}</h3>
+</summary>
+<div class="entry-body">
+  ${factBody}
+  <div class="metarow"><span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i></span><a class="meta-link" href="/day/${e.day}/#${anchor}">open full entry &rarr;</a></div>
+</div>
+</details>`
   }
   // Diffs lazy-load in the browser on toggle (fetch /diffs/<sha>.diff),
   // so the server never holds diff text in memory or bloats pages with it.

@@ -358,15 +358,19 @@ nav.term-nav a.active{
   color:var(--term-cyan);
   text-decoration:underline;
 }
-.entry.teaser{
+.entry.teaser .entry-summary{
   padding:10px 14px;
-  cursor:default;
 }
 .entry.teaser .entry-meta-top{
   margin-bottom:2px;
 }
 .entry.teaser .entry-title{
   font-size:.95rem;
+}
+.teaser-empty{
+  margin:6px 0;
+  font-size:.82rem;
+  color:var(--txt-dim);
 }
 .teaser-facts{
   margin-top:4px;
