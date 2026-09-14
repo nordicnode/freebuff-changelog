@@ -59,7 +59,6 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
     <a href="/models/" class="${path.startsWith('/models/') ? 'active' : ''}">/models</a>
     <a href="/stats/" class="${path.startsWith('/stats/') ? 'active' : ''}">/stats</a>
     <a href="/changes/" class="${path.startsWith('/changes/') ? 'active' : ''}">/changes</a>
-    <a href="/watch/" class="${path.startsWith('/watch/') ? 'active' : ''}">/watch</a>
     <a href="/archive/" class="${path.startsWith('/archive/') ? 'active' : ''}">/archive</a>
     <a href="/search/" class="${path.startsWith('/search/') ? 'active' : ''}">/search</a>
     <a href="/in-flight/" class="${path.startsWith('/in-flight/') ? 'active' : ''}">/in-flight</a>
@@ -900,7 +899,6 @@ ${rows.map(e => {
   // ----- models timeline (catalog history: current lineup, retired, per-change rows)
   const { chrono: modelChrono, live: modelLive, retired: modelRetired } = modelTimeline(modelEntries)
   const modelLink = (m, cls, sign) => `<a class="${cls}" href="/models/${modelSlug(m)}/">${sign}${esc(m)}</a>`
-  const titleOfModel = (e) => e.ai?.title || e.title || deriveTitleSafe(e)
   const modelRows = modelChrono.map(e => {
     const { added = [], removed = [] } = e.modelChanges || {}
     const addHtml = added.map(m => modelLink(m, 'modelplus', '+')).join('<span class="model-sep">,</span> ')
@@ -927,7 +925,7 @@ ${rows.map(e => {
     <div class="model-lineup">${modelLive.map(m => modelLink(m, 'modelplus', '')).join('<span class="model-sep">,</span> ')}</div>
     ${modelRetired.length ? `<div style="font-size:.76rem;color:var(--txt-dim);margin:10px 0 6px">RETIRED:</div>
     <div class="model-lineup">${modelRetired.map(m => modelLink(m, 'modelminus', '')).join('<span class="model-sep">,</span> ')}</div>` : ''}
-    <p style="margin:10px 0 0;font-size:.78rem;color:var(--txt-dim)">SUBSCRIBE: <a href="/feed-models.xml">[models rss]</a> &middot; <a href="/feed.xml">[all changes]</a> &middot; per-model feeds on each model page</p>
+    <p style="margin:10px 0 0;font-size:.78rem;color:var(--txt-dim)">SUBSCRIBE: <a href="/feed-models.xml">[models rss]</a> &middot; <a href="/feed.xml">[all changes]</a> &middot; per-model pages</p>
   </div>
 </section>
 <div class="section-hdr">
@@ -936,7 +934,7 @@ ${rows.map(e => {
 <div class="model-history">${modelRows}</div>`
   }))
 
-  // ----- per-model pages (one page per catalog name: status, events, watch feed)
+  // ----- per-model pages (one page per catalog name: status, events)
   const byModel = new Map()
   for (const e of modelChrono) {
     for (const m of (e.modelChanges?.added || [])) {
@@ -962,13 +960,11 @@ ${rows.map(e => {
         + `<span class="model-row-change">${kind === 'added' ? '<span class="modelplus">+added</span>' : '<span class="modelminus">−removed</span>'}</span>`
         + `<span class="model-row-title">${esc(e.ai?.title || e.title || '')} ${detail}</span></div>`
     }).join('')
-    const evts = events.map(({ e }) => e)
-    await write(dist, `models/${slug}/feed.xml`, feedXml(SITE.url, SITE.name, SITE.desc, generated, `models/${slug}/feed.xml`, `${SITE.name}: ${name} (unofficial)`, `Catalog events for ${name}: additions, retirements, swaps.`, evts.map(e => feedItem(SITE.url, e, titleOfModel)).join('')))
     await write(dist, `models/${slug}/index.html`, layout({
       title: name, path: `/models/${slug}/`,
       desc: `${name} is ${status.toLowerCase()} in the Freebuff free picker: ${events.length} catalog events, ${firstSeen} to ${lastSeen}.`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">MODEL :: ${esc(name)}</span><span class="${status === 'LIVE' ? 'modelplus' : 'modelminus'}">[${status}]</span></div>`
-        + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">${events.length} catalog event${events.length === 1 ? '' : 's'} &middot; ${esc(firstSeen)} &rarr; ${esc(lastSeen)} &middot; <a href="/models/">[all models]</a> &middot; <a href="/models/${slug}/feed.xml">[watch rss]</a></p></div></section>`
+        + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">${events.length} catalog event${events.length === 1 ? '' : 's'} &middot; ${esc(firstSeen)} &rarr; ${esc(lastSeen)} &middot; <a href="/models/">[all models]</a></p></div></section>`
         + `<div class="section-hdr"><h2>== HISTORY (${events.length}) ==</h2></div><div class="model-history">${rows}</div>`
     }))
   }), 8)
@@ -1290,30 +1286,6 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
 </script>`
   }))
 
-  // ----- watchlist (saved searches + per-model RSS, client-side builder)
-  const watchModels = [...new Set([...modelLive, ...modelRetired])].sort().map(m => `<option value="/models/${modelSlug(m)}/feed.xml">${esc(m)}</option>`).join('')
-  await write(dist, 'watch/index.html', layout({
-    title: 'Watch', path: '/watch/',
-    desc: 'Build a personal Freebuff watchlist: per-model RSS feeds and saved search links.',
-    body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">WATCHLIST :: follow what matters</span><span>${modelLive.length} live models</span></div>`
-      + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Pick a model for its dedicated RSS feed, or build a saved search link. No account, no tracking — just URLs for your reader.</p></div></section>`
-      + `<div class="section-hdr"><h2>== PER-MODEL RSS ==</h2></div>`
-      + `<div class="watch-row"><select id="wmodel">${watchModels}</select><a id="wmodellink" href="#">[open feed]</a><button id="wmodelcopy">[copy url]</button></div>`
-      + `<div class="section-hdr"><h2>== SAVED SEARCH ==</h2></div>`
-      + `<div class="watch-row"><input id="wq" type="search" placeholder="pattern (e.g. byok, model swap)..." size="28"><select id="wcat"><option value="">--any category</option>${SEARCH_CATS.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('')}</select><select id="wsig"><option value="">--any impact</option>${SEARCH_SIGS.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('')}</select></div>`
-      + `<div class="watch-row"><a id="wlink" href="/search/">[open search]</a><button id="wcopy">[copy url]</button></div>`
-      + `<p class="watch-hint">Tip: paste the feed URL or search link into any RSS reader — new matches surface on every hourly sync.</p>`
-      + `<script>
-const wm=document.getElementById('wmodel'),wml=document.getElementById('wmodellink'),wmc=document.getElementById('wmodelcopy');
-const syncModel=()=>{const u=new URL(wm.value,location.origin).href;wml.href=wm.value;wmc.onclick=()=>navigator.clipboard.writeText(u).then(()=>{wmc.textContent='[copied!]';setTimeout(()=>wmc.textContent='[copy url]',1500)})};
-wm.addEventListener('change',syncModel);syncModel();
-const wq=document.getElementById('wq'),wc=document.getElementById('wcat'),ws=document.getElementById('wsig'),wl=document.getElementById('wlink'),wcp=document.getElementById('wcopy');
-const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q',wq.value.trim());if(wc.value)p.set('cat',wc.value);if(ws.value)p.set('sig',ws.value);const s=p.toString();const href='/search/'+(s?'?'+s:'');wl.href=href;const abs=new URL(href,location.origin).href;wcp.onclick=()=>navigator.clipboard.writeText(abs).then(()=>{wcp.textContent='[copied!]';setTimeout(()=>wcp.textContent='[copy url]',1500)})};
-[wq,wc,ws].forEach(el=>el.addEventListener('input',syncSearch));syncSearch();
-</script>`
-  }))
-
-
 
   // ----- about (user-facing overview)
   await write(dist, 'about/index.html', layout({
@@ -1334,7 +1306,7 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
       <p><strong>Every claim links to proof.</strong> Each entry carries its commit SHA, compare URL, inline diff (lazy-loaded, lockfiles and test-only hunks stripped), and per-file stats. Model swaps render before/after README rows inline.</p>
 
       <h4>WHAT WE TRACK</h4>
-      <p><strong>Model Catalog</strong> (${(cats.get('Model Catalog') || 0)} changes): additions, retirements, and swaps in the free picker, with access level and trait columns — plus a <a href="/models/">catalog timeline</a> and per-model pages with watch feeds.<br>
+      <p><strong>Model Catalog</strong> (${(cats.get('Model Catalog') || 0)} changes): additions, retirements, and swaps in the free picker, with access level and trait columns — plus a <a href="/models/">catalog timeline</a> and per-model pages.<br>
       <strong>Releases</strong> (${vers.length} tracked): CLI and core <code>package.json</code> bumps with per-release pages listing every commit in range.<br>
       <strong>Commands</strong> (${(cats.get('Commands') || 0)} changes): new or removed <code>/slash-commands</code> from the registry (renames surface as add+remove).<br>
       <strong>CLI</strong> (${(cats.get('CLI') || 0).toLocaleString()}), <strong>Core</strong> (${(cats.get('Core') || 0).toLocaleString()}), <strong>SDK</strong> (${(cats.get('SDK') || 0)}), <strong>Agent Runtime</strong> (${(cats.get('Agent Runtime') || 0)}), <strong>Agents</strong> (${(cats.get('Agents') || 0)}), <strong>LLM Providers</strong> (${(cats.get('LLM Providers') || 0)}), <strong>Packaging</strong> (${(cats.get('Packaging') || 0)}), <strong>Docs</strong> (${(cats.get('Docs') || 0)}), <strong>Internal</strong> (${(cats.get('Internal') || 0).toLocaleString()}): file-path categorization with per-file add/remove/rename tracking.<br>
@@ -1345,7 +1317,7 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
       <p>Snapshots squash upstream history, so intra-snapshot sequencing is approximate and authorship resolves to the snapshot bot. Diffs older than 90 days are pruned (day pages fall back to GitHub compare links). AI summaries describe only what the diff shows — no research, no speculation on model capabilities beyond the README row.</p>
 
       <h4>FOLLOW ALONG</h4>
-      <p><a href="/feed.xml">RSS</a> (major + notable), <a href="/feed-models.xml">models only</a>, <a href="/feed-releases.xml">releases only</a>, per-model feeds on each <a href="/models/">model page</a>. <a href="/search/">Search</a> supports category and impact filters; <a href="/changes/">Categories</a> list every change of each type, all time; <a href="/stats/">stats</a> charts churn and cadence; <a href="/watch/">watchlist</a> builds saved-search links. <a href="/archive/">Archive</a> holds every day and release. Source: hourly GitHub Action plus a local backfill daemon, both pushing <code>data/</code>; Cloudflare deploys on push.</p>
+      <p><a href="/feed.xml">RSS</a> (major + notable), <a href="/feed-models.xml">models only</a>, <a href="/feed-releases.xml">releases only</a>. <a href="/search/">Search</a> supports category and impact filters; <a href="/changes/">Categories</a> list every change of each type, all time; <a href="/stats/">stats</a> charts churn and cadence; <a href="/archive/">Archive</a> holds every day and release. Source: hourly GitHub Action plus a local backfill daemon, both pushing <code>data/</code>; Cloudflare deploys on push.</p>
     </div>
   </div>
 </section>`
@@ -1450,7 +1422,7 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
   const dayUrls = byDay.map(d => `/day/${d.day}/`)
   const relUrls = vers.map(v => `/release/${v.version}/`)
   const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`)]
-  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/watch/', '/changes/', ...browseList.map(b => `/changes/${b.slug}/`), ...(openPrs?.length ? ['/in-flight/'] : [])]
+  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/changes/', ...browseList.map(b => `/changes/${b.slug}/`), ...(openPrs?.length ? ['/in-flight/'] : [])]
   await write(dist, 'sitemap-days.xml', urlset(dayUrls))
   await write(dist, 'sitemap-releases.xml', urlset(relUrls))
   await write(dist, 'sitemap-models.xml', urlset(modelUrls))

@@ -424,27 +424,19 @@ test('buildSite generates valid static site output', async () => {
     assert.match(modelsHtml, /\/models\//)
     assert.match(modelsHtml, /href="\/feed-models\.xml"/)
 
-    // Verify per-model detail page: status, history, watch feed
+    // Verify per-model detail page: status, history
     const modelDetail = await readFile(join(tmpDist, 'models/muse-spark-1-3/index.html'), 'utf8')
     assert.match(modelDetail, /MODEL :: Muse Spark 1\.3/)
     assert.match(modelDetail, /\[LIVE\]|\[RETIRED\]/)
     assert.match(modelDetail, /HISTORY \(1\)/)
-    assert.match(modelDetail, /watch rss/)
-    const modelFeed = await readFile(join(tmpDist, 'models/muse-spark-1-3/feed.xml'), 'utf8')
-    assert.match(modelFeed, /Muse Spark 1\.3/)
 
-    // Verify stats + watch pages and nav entries
+    // Verify stats page and nav entries
     const statsHtml = await readFile(join(tmpDist, 'stats/index.html'), 'utf8')
     assert.match(statsHtml, /TELEMETRY/)
     assert.match(statsHtml, /MOST-CHANGED MODELS/)
     assert.match(statsHtml, /class="spark"/)
     assert.match(statsHtml, /12-MO TREND/)
-    const watchHtml = await readFile(join(tmpDist, 'watch/index.html'), 'utf8')
-    assert.match(watchHtml, /WATCHLIST/)
-    assert.match(watchHtml, /PER-MODEL RSS/)
-    assert.match(watchHtml, /SAVED SEARCH/)
     assert.match(indexHtml, /href="\/stats\/"/)
-    assert.match(indexHtml, /href="\/watch\/"/)
 
     // Verify day jump, split-view toggle, collapse, sitemap models
     const dayHtml2 = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')

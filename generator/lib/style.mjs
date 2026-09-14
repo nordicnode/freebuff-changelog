@@ -534,9 +534,6 @@ nav.term-nav a.active{
 .stat-bar{flex:1;height:8px;background:var(--code);border-radius:2px;overflow:hidden}
 .stat-bar-fill{display:block;height:100%;background:var(--term-cyan)}
 .stat-bar-n{width:44px;text-align:right;color:var(--txt-subtle)}
-.watch-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:8px 0;font-size:.82rem}
-.watch-row input,.watch-row select{background:var(--code);border:1px solid var(--term-border);color:var(--txt);padding:4px 8px;border-radius:2px;font:inherit}
-.watch-hint{font-size:.76rem;color:var(--txt-subtle)}
 
 .summary{
   margin:6px 0;
