@@ -1,0 +1,913 @@
+diff --git a/packages/agent-runtime/src/__tests__/compact-read-results.test.ts b/packages/agent-runtime/src/__tests__/compact-read-results.test.ts
+new file mode 100644
+index 000000000..12285f0d8
+--- /dev/null
++++ b/packages/agent-runtime/src/__tests__/compact-read-results.test.ts
+@@ -0,0 +1,177 @@
++import * as analytics from '@codebuff/common/analytics'
++import {
++  createTestAgentRuntimeParams,
++  mockFileContext,
++} from '@codebuff/common/testing/fixtures/agent-runtime'
++import {
++  createMockDbOperations,
++  setupDbSpies,
++} from '@codebuff/common/testing/mocks/database'
++import { getInitialSessionState } from '@codebuff/common/types/session-state'
++import { promptSuccess } from '@codebuff/common/util/error'
++import {
++  createFileReadLimiter,
++  windowFileRead,
++} from '@codebuff/common/util/file-read-limits'
++import { afterEach, expect, it, mock, spyOn } from 'bun:test'
++
++import { byokModelLimits } from '../../../../sdk/src/byok'
++import { loopAgentSteps } from '../run-agent-step'
++import { countTokens, countTokensMessages } from '../util/token-counter'
++import { createToolCallChunk } from './test-utils'
++
++import type { AgentTemplate } from '../templates/types'
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++
++afterEach(() => mock.restore())
++
++// The reporter's failure shape: a ~9k live request plus an SDK-limited batch
++// of file reads exceeds BYOK's default 25,804-token input threshold. Previously
++// each successful read vanished before inference, so the model could only
++// reread. The control uses identical history and files with a larger window.
++for (const contextWindow of [32768, 131072]) {
++  it(`progresses from reading to writing with a ${contextWindow}-token BYOK window`, async () => {
++    const db = setupDbSpies(createMockDbOperations())
++    spyOn(analytics, 'trackEvent').mockImplementation(() => {})
++    const limits = byokModelLimits({ contextWindow })
++    const runtime = createTestAgentRuntimeParams()
++    const template: AgentTemplate = {
++      ...runtime.agentTemplate,
++      spawnerPrompt: 'Read-result preservation probe',
++      outputMode: 'last_message',
++      toolNames: ['read_files', 'write_file', 'end_turn'],
++      instructionsPrompt: '',
++      mcpServers: {},
++      spawnableAgents: [],
++      windowedFileReads: true,
++      compactContext: {
++        maxContextLength: limits.maxContextLength,
++        cacheExpiryMs: null,
++      },
++    }
++    const source =
++      '// FILE_CONTENT_CANARY\n' +
++      Array.from(
++        { length: 1900 },
++        (_, i) =>
++          `export const row${i} = { label: 'Action ${i}', enabled: true };`,
++      ).join('\n')
++    let reads = 0
++    let compactions = 0
++    const writes: Record<string, string> = {}
++    const requests: Message[][] = []
++    runtime.requestFiles = mock(async ({ filePaths, fileWindows }) => {
++      const limiter = createFileReadLimiter({ countTokens })
++      const files = Object.fromEntries(
++        filePaths.map((path: string) => {
++          const window = fileWindows?.[path]?.[0]
++          return [
++            path,
++            limiter.limit(
++              windowFileRead(source, window?.offset, window?.limit),
++            ),
++          ]
++        }),
++      )
++      reads++
++      expect(JSON.stringify(files)).toContain('FILE_CONTENT_CANARY')
++      return files
++    })
++    runtime.requestToolCall = mock(async ({ toolName, input }) => {
++      expect(toolName).toBe('write_file')
++      writes[input.path] = input.content
++      return { output: [{ type: 'json', value: { message: 'File written' } }] }
++    })
++    runtime.promptAiSdkStream = mock(async function* ({
++      messages,
++    }: {
++      messages: Message[]
++    }) {
++      requests.push(structuredClone(messages))
++      expect(countTokensMessages(messages)).toBeLessThanOrEqual(
++        limits.maxContextLength,
++      )
++      if (writes['ready.ts'] || reads >= 3) {
++        yield createToolCallChunk('end_turn', {})
++      } else if (JSON.stringify(messages).includes('FILE_CONTENT_CANARY')) {
++        yield createToolCallChunk('write_file', {
++          path: 'ready.ts',
++          instructions: 'Record successful progress after the read.',
++          content: 'export const ready = true\n',
++        })
++      } else {
++        yield createToolCallChunk('read_files', {
++          paths: ['src/app.tsx', 'src/theme.ts'],
++        })
++      }
++      return promptSuccess('synthetic-response')
++    })
++
++    try {
++      const result = await loopAgentSteps({
++        ...runtime,
++        agentTemplate: template,
++        agentType: template.id,
++        localAgentTemplates: { [template.id]: template },
++        repoId: undefined,
++        repoUrl: undefined,
++        userInputId: 'test-input',
++        agentState: {
++          ...getInitialSessionState(mockFileContext).mainAgentState,
++          agentId: 'test-agent',
++          messageHistory: [
++            {
++              role: 'user',
++              tags: ['USER_PROMPT'],
++              sentAt: Date.now(),
++              content: [
++                {
++                  type: 'text',
++                  text: 'Improve accessibility, keyboard navigation, colors, layout, and help text.\n'.repeat(
++                    470,
++                  ),
++                },
++              ],
++            },
++          ],
++          stepsRemaining: 5,
++        },
++        prompt: undefined,
++        spawnParams: undefined,
++        fingerprintId: 'test-fingerprint',
++        userId: 'test-user',
++        clientSessionId: 'test-session',
++        ancestorRunIds: [],
++        onCompaction: () => {
++          compactions++
++        },
++        onResponseChunk: () => {},
++        signal: new AbortController().signal,
++      } as any)
++      expect(result.output?.type).not.toBe('error')
++      expect(reads).toBe(1)
++      expect(writes['ready.ts']).toBe('export const ready = true\n')
++      const afterRead = requests[1]
++      expect(
++        afterRead.some(
++          (message) =>
++            message.role === 'tool' && message.toolName === 'read_files',
++        ),
++      ).toBe(true)
++      expect(JSON.stringify(afterRead)).toContain('FILE_CONTENT_CANARY')
++      if (contextWindow === 32768) {
++        expect(compactions).toBeGreaterThan(0)
++        expect(JSON.stringify(afterRead)).toContain(
++          'omitted to fit the context window',
++        )
++      } else {
++        expect(compactions).toBe(0)
++        expect(JSON.stringify(afterRead)).not.toContain(
++          'omitted to fit the context window',
++        )
++      }
++    } finally {
++      db.restore()
++    }
++  })
++}
+diff --git a/packages/agent-runtime/src/__tests__/compact-request-budget.test.ts b/packages/agent-runtime/src/__tests__/compact-request-budget.test.ts
+new file mode 100644
+index 000000000..3315d9ce1
+--- /dev/null
++++ b/packages/agent-runtime/src/__tests__/compact-request-budget.test.ts
+@@ -0,0 +1,305 @@
++import { describe, expect, it } from 'bun:test'
++
++import { compactMessages, maybeCompactHistory } from '../compact-history'
++import { fitToolResults } from '../util/fit-tool-results'
++import { countTokensMessages } from '../util/token-counter'
++
++import type { JSONValue } from '@codebuff/common/types/json'
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++
++const user = (text: string): Message => ({
++  role: 'user',
++  tags: ['USER_PROMPT'],
++  content: [{ type: 'text', text }],
++})
++const call = (
++  id: string,
++  toolName = 'read_files',
++  paths: unknown[] = ['file.ts'],
++): Message => ({
++  role: 'assistant',
++  content: [{ type: 'tool-call', toolCallId: id, toolName, input: { paths } }],
++})
++const tool = (
++  id: string,
++  value: JSONValue,
++  toolName = 'read_files',
++): Message => ({
++  role: 'tool',
++  toolCallId: id,
++  toolName,
++  content: [{ type: 'json', value }],
++})
++const read = (id: string, content: string, path = 'file.ts') =>
++  tool(id, [{ path, content, referencedBy: {} }])
++const compact = (
++  messages: Message[],
++  maxContextLength = 4096,
++  fixedTokenCount = 500,
++) =>
++  maybeCompactHistory({
++    messages,
++    contextTokenCount: 100_000,
++    maxContextLength,
++    fixedTokenCount,
++    cacheExpiryMs: null,
++  })!
++
++describe('request-sized compaction', () => {
++  it('preserves every call/result in a parallel batch and the current prompt', () => {
++    const messages = [
++      user('older request'),
++      call('old'),
++      read('old', 'old payload '.repeat(5000)),
++      user('Edit both files, without changing their exports.'),
++      call('a', 'read_files', ['a.ts']),
++      call('b', 'read_files', ['b.ts']),
++      read('a', 'export const a = 1', 'a.ts'),
++      read('b', 'export const b = 2', 'b.ts'),
++    ]
++    const output = compact(messages)
++    expect(countTokensMessages(output) + 500).toBeLessThanOrEqual(4096)
++    expect(output.slice(-4)).toEqual(messages.slice(-4))
++    expect(
++      output.some(
++        (message) =>
++          message.tags?.includes('USER_PROMPT') &&
++          JSON.stringify(message).includes('without changing their exports'),
++      ),
++    ).toBe(true)
++    expect(JSON.stringify(output)).not.toContain('old payload')
++  })
++
++  it('keeps steering messages after the fresh tool batch in order', () => {
++    const messages = [
++      user('Original request'),
++      call('a'),
++      read('a', 'const value = 1'),
++      user('First correction'),
++      user('Second correction'),
++    ]
++    const output = compact(messages)
++    expect(output.slice(-4)).toEqual(messages.slice(-4))
++    expect(JSON.stringify(output)).toContain('Original request')
++  })
++
++  it('bounds a summary even when historical user messages exceed a small model window', () => {
++    const messages = [
++      ...Array.from({ length: 3 }, (_, i) =>
++        user(
++          `Old requirements ${i}: ` +
++            'Preserve keyboard navigation and layout. '.repeat(1000),
++        ),
++      ),
++      {
++        role: 'assistant' as const,
++        content: [
++          { type: 'text' as const, text: 'Completed the prior requests.' },
++        ],
++      },
++      user('Now change the color.'),
++      call('a'),
++      read('a', 'const color = "red"'),
++    ]
++    const first = compact(messages)
++    expect(countTokensMessages(first) + 500).toBeLessThanOrEqual(4096)
++    expect(JSON.stringify(first)).toContain('const color')
++    expect(JSON.stringify(first)).toContain('Now change the color.')
++    const second = compact([
++      ...first,
++      call('b'),
++      read('b', 'const next = "blue"'),
++    ])
++    expect(countTokensMessages(second) + 500).toBeLessThanOrEqual(4096)
++    expect(JSON.stringify(second)).toContain('const next')
++  })
++
++  it('does not preserve a tool result already followed by an assistant response', () => {
++    const output = compact([
++      user('task'),
++      call('a'),
++      read('a', 'ALREADY_CONSUMED '.repeat(1000)),
++      {
++        role: 'assistant',
++        content: [{ type: 'text', text: 'I used those contents.' }],
++      },
++    ])
++    expect(output.some((message) => message.role === 'tool')).toBe(false)
++    expect(JSON.stringify(output)).not.toContain('ALREADY_CONSUMED')
++  })
++
++  it('retains the task when resuming a legacy summary without USER_PROMPT tags', () => {
++    const legacy = compactMessages({
++      messages: [
++        user('KEEP_THE_LOGIN_BUTTON_BLUE'),
++        call('old'),
++        read('old', 'old code'),
++      ],
++    }).messages
++    expect(
++      legacy.some((message) => message.tags?.includes('USER_PROMPT')),
++    ).toBe(false)
++    const output = compact([
++      ...legacy,
++      call('a'),
++      read('a', 'const button = "red"\n'.repeat(3000)),
++    ])
++    expect(countTokensMessages(output) + 500).toBeLessThanOrEqual(4096)
++    expect(JSON.stringify(output)).toContain('KEEP_THE_LOGIN_BUTTON_BLUE')
++    expect(JSON.stringify(output)).toContain('const button')
++    const again = compact([
++      ...output,
++      call('b'),
++      read('b', 'const label = "Login"\n'.repeat(3000)),
++    ])
++    expect(JSON.stringify(again)).toContain('KEEP_THE_LOGIN_BUTTON_BLUE')
++    expect(JSON.stringify(again)).toContain('const label')
++  })
++
++  it('refuses when fixed instructions and the current prompt alone cannot fit', () => {
++    expect(() =>
++      compact([user('current request '.repeat(2000))], 4096, 3000),
++    ).toThrow('current request and agent instructions')
++  })
++
++  it('carries a live image through a clipped read without changing its bytes', () => {
++    const image = {
++      type: 'image' as const,
++      image: new Uint8Array([1, 2, 3]),
++      mediaType: 'image/png',
++    }
++    const prompt: Message = {
++      role: 'user',
++      tags: ['USER_PROMPT'],
++      content: [{ type: 'text', text: 'Match this design' }, image],
++    }
++    const output = compact(
++      [prompt, call('a'), read('a', 'const design = true\n'.repeat(2000))],
++      6000,
++    )
++    const preserved = output.find((message) =>
++      message.tags?.includes('USER_PROMPT'),
++    )!
++    expect(preserved.content).toEqual(prompt.content)
++    expect(countTokensMessages(output) + 500).toBeLessThanOrEqual(6000)
++  })
++})
++
++describe('oversized fresh tool results', () => {
++  it('keeps complete source lines and provides the correct non-default continuation offset', () => {
++    const content = Array.from(
++      { length: 1000 },
++      (_, i) => `const line${501 + i} = "日本語 🟢";`,
++    ).join('\n')
++    const messages = [
++      call('a', 'read_files', [{ path: 'file.ts', offset: 501, limit: 1000 }]),
++      read('a', content),
++    ]
++    const original = structuredClone(messages)
++    const output = fitToolResults(messages, 1000)
++    expect(countTokensMessages(output)).toBeLessThanOrEqual(1000)
++    const result = output[1]
++    if (result.role !== 'tool' || result.content[0].type !== 'json')
++      throw new Error('missing result')
++    const files = result.content[0].value as { content: string }[]
++    const prefix = files[0].content.split('\n[read_files:')[0]
++    expect(prefix.length).toBeGreaterThan(0)
++    expect(content.startsWith(prefix)).toBe(true)
++    expect(prefix.endsWith('\n')).toBe(true)
++    expect(files[0].content).toContain(
++      `offset=${501 + (prefix.match(/\n/g)?.length ?? 0)}`,
++    )
++    expect(messages).toEqual(original)
++  })
++
++  it('reserves explicit omission notices for later files in an oversized batch', () => {
++    const output = fitToolResults(
++      [
++        call('a', 'read_files', ['first.ts', 'second.ts']),
++        tool('a', [
++          { path: 'first.ts', content: 'const first = 1\n'.repeat(1000) },
++          { path: 'second.ts', content: 'const second = 2\n'.repeat(1000) },
++        ]),
++      ],
++      700,
++    )
++    expect(countTokensMessages(output)).toBeLessThanOrEqual(700)
++    expect(JSON.stringify(output)).toContain('const first')
++    expect(JSON.stringify(output)).toContain('second.ts')
++    expect(JSON.stringify(output)).toContain('Contents omitted')
++  })
++
++  it('does not invent offsets for a result combining multiple windows', () => {
++    const output = fitToolResults(
++      [
++        call('a', 'read_files', [
++          { path: 'file.ts', offset: 50 },
++          { path: 'file.ts', offset: 900 },
++        ]),
++        read('a', 'const value = 1\n'.repeat(1000)),
++      ],
++      700,
++    )
++    expect(JSON.stringify(output)).toContain('smaller explicit window')
++    expect(JSON.stringify(output)).not.toContain('offset=')
++  })
++
++  it('explains an oversized single line without pretending to return source code', () => {
++    const output = fitToolResults(
++      [call('a'), read('a', 'const huge = "' + 'x '.repeat(5000) + '"')],
++      700,
++    )
++    expect(JSON.stringify(output)).toContain('Contents omitted')
++    expect(JSON.stringify(output)).toContain('code_search for oversized lines')
++    expect(JSON.stringify(output)).not.toContain('const huge')
++  })
++
++  it('does not count SDK annotations or template headers as source lines', () => {
++    for (const content of [
++      'const value = 1\n'.repeat(1000) +
++        '\n[read_files: showing lines 1-1000 of 4000.]',
++      '[TEMPLATE]\n' + 'const value = 1\n'.repeat(1000),
++      'const value = 1\n'.repeat(1000) + '\n[FILE_TOO_LARGE]: output capped',
++    ]) {
++      const output = fitToolResults([call('a'), read('a', content)], 700)
++      expect(JSON.stringify(output)).toContain('smaller explicit window')
++      expect(JSON.stringify(output)).not.toContain('offset=')
++    }
++  })
++
++  it('bounds other tool outputs as valid JSON without suggesting a mutation be rerun', () => {
++    const output = fitToolResults(
++      [
++        call('a', 'run_terminal_command'),
++        tool(
++          'a',
++          { stdout: 'OUTPUT '.repeat(10000), exitCode: 0 },
++          'run_terminal_command',
++        ),
++      ],
++      800,
++    )
++    expect(countTokensMessages(output)).toBeLessThanOrEqual(800)
++    expect(JSON.stringify(output)).toContain('OUTPUT')
++    expect(JSON.stringify(output)).toContain(
++      'do not repeat state-changing actions',
++    )
++    expect(JSON.stringify(output)).toContain('truncated')
++  })
++
++  it('preserves indivisible media and refuses if it cannot fit', () => {
++    const messages: Message[] = [
++      call('a'),
++      {
++        role: 'tool',
++        toolName: 'read_files',
++        toolCallId: 'a',
++        content: [{ type: 'media', mediaType: 'image/png', data: 'aGVsbG8=' }],
++      },
++    ]
++    expect(fitToolResults(messages, 3000)).toEqual(messages)
++    expect(() => fitToolResults(messages, 100)).toThrow(
++      'result metadata exceed',
++    )
++  })
++})
+diff --git a/packages/agent-runtime/src/compact-history.ts b/packages/agent-runtime/src/compact-history.ts
+index e524705ab..a6b8bf6cc 100644
+--- a/packages/agent-runtime/src/compact-history.ts
++++ b/packages/agent-runtime/src/compact-history.ts
+@@ -23,6 +23,8 @@
+  */
+ 
+ import { DEFAULT_COMPACTION_POLICY } from '@codebuff/common/constants/compaction-policy'
++import { fitToolResults } from './util/fit-tool-results'
++import { countTokens, countTokensMessages } from './util/token-counter'
+ import type {
+   FilePart,
+   ImagePart,
+@@ -839,6 +841,185 @@ export function compactMessages(params: {
+   }
+ }
+ 
++/** The last unconsumed assistant/tool exchange, including parallel tool calls.
++ * Stream parsing appends assistant messages, then the whole tool-result batch.
++ * A later assistant response means that batch has already been consumed.
++ */
++function latestToolExchangeStart(messages: Message[]): number {
++  const lastTool = messages.findLastIndex((message) => message.role === 'tool')
++  if (
++    lastTool < 0 ||
++    messages.slice(lastTool + 1).some((message) => message.role === 'assistant')
++  ) {
++    return messages.length
++  }
++  let start = lastTool
++  while (start > 0 && messages[start - 1].role === 'tool') start--
++  const resultIds = new Set(
++    messages
++      .slice(start, lastTool + 1)
++      .flatMap((message) =>
++        message.role === 'tool' ? [message.toolCallId] : [],
++      ),
++  )
++  const calls = new Set<string>()
++  while (start > 0 && messages[start - 1].role === 'assistant') {
++    start--
++    const message = messages[start]
++    if (message.role === 'assistant') {
++      for (const part of message.content) {
++        if (part.type === 'tool-call') calls.add(part.toolCallId)
++      }
++    }
++  }
++  // Do not preserve orphan results (interrupted histories are cleaned by the
++  // request builder), or cut a call away from another result in its batch.
++  return calls.size === resultIds.size &&
++    [...calls].every((id) => resultIds.has(id))
++    ? start
++    : messages.length
++}
++
++/** Runtime-only request budgeting around the shared historical summarizer.
++ * The serialized context-pruner still uses compactMessages' summary algorithm;
++ * it does not own the parent's live model request or its fixed token overhead.
++ */
++function compactRequestHistory(messages: Message[], tokenBudget: number) {
++  const tailStart = latestToolExchangeStart(messages)
++  let promptStart = messages
++    .slice(0, tailStart)
++    .findLastIndex((message) => message.tags?.includes('USER_PROMPT'))
++  // Several steering prompts may have arrived together; keep all of them.
++  while (
++    promptStart > 0 &&
++    messages[promptStart - 1].tags?.includes('USER_PROMPT')
++  )
++    promptStart--
++  const instructionIndex = messages.findLastIndex((message) =>
++    message.tags?.includes('INSTRUCTIONS_PROMPT'),
++  )
++  const livePrompts = messages
++    .slice(Math.max(0, promptStart), tailStart)
++    .filter(
++      (message) => promptStart >= 0 && message.tags?.includes('USER_PROMPT'),
++    )
++  const prefix: Message[] = [
++    ...(instructionIndex >= 0 && instructionIndex < tailStart
++      ? [messages[instructionIndex]]
++      : []),
++    ...livePrompts,
++  ]
++  if (!prefix.some((message) => message.tags?.includes('USER_PROMPT'))) {
++    prefix.push({
++      role: 'user',
++      content: [{ type: 'text', text: CONTINUATION_TEXT }],
++      sentAt: Date.now(),
++    })
++  }
++  const fresh = messages
++    .slice(tailStart)
++    .filter((message) => !message.tags?.includes('STEP_PROMPT'))
++  const protectedMessages = new Set([...prefix, ...fresh])
++  const older = messages
++    .slice(0, tailStart)
++    .filter((message) => !protectedMessages.has(message))
++  const result = compactMessages({ messages: older })
++  const entries = parseSummaryIntoEntries(result.summaryText)
++  const now = Date.now()
++  // Old persisted compactions put the current request inside the summary and
++  // remove USER_PROMPT tags. Reserve that request as historical memory rather
++  // than letting a large fresh read squeeze the task itself out of context.
++  const historicalRequest =
++    livePrompts.length === 0 &&
++    !fresh.some((message) => message.tags?.includes('USER_PROMPT'))
++      ? entries.findLast(
++          (entry) =>
++            entry.role === 'user' &&
++            !entry.parts.includes(`[USER]\n${CONTINUATION_TEXT}`),
++        )
++      : undefined
++  const reservedMemory = historicalRequest
++    ? countTokensMessages([
++        buildSummaryMessage(renderSummaryText([historicalRequest]), [], now),
++      ])
++    : 0
++  const prefixTokens = countTokensMessages(prefix)
++  if (prefixTokens + reservedMemory > tokenBudget) {
++    throw new Error(
++      'The current request and agent instructions exceed the configured context window. Shorten the request/project instructions or configure a larger context window supported by your provider.',
++    )
++  }
++  const fitted = fitToolResults(
++    fresh,
++    tokenBudget - prefixTokens - reservedMemory,
++  )
++  const remainingTokens =
++    tokenBudget - prefixTokens - countTokensMessages(fitted)
++
++  // Keep the newest historical entries that fit the actual remainder. The
++  // 50k/20k summary budgets are ceilings, never permission to exceed a BYOK
++  // window. Count the envelope and images too, not just summary text.
++  const selected = new Set<SummaryEntry>(
++    historicalRequest ? [historicalRequest] : [],
++  )
++  let images = result.messages[0].content.filter(
++    (part): part is ImagePart | FilePart =>
++      part.type === 'image' || part.type === 'file',
++  )
++  if (
++    countTokensMessages([
++      buildSummaryMessage(renderSummaryText([...selected]), images, now),
++    ]) > remainingTokens
++  )
++    images = []
++  let available =
++    remainingTokens -
++    countTokensMessages([
++      buildSummaryMessage(renderSummaryText([...selected]), images, now),
++    ])
++  for (let i = entries.length - 1; i >= 0; i--) {
++    if (selected.has(entries[i])) continue
++    const tokens = countTokens(
++      entries[i].parts.join(ENTRY_SEPARATOR) + ENTRY_SEPARATOR,
++    )
++    if (tokens > available) continue
++    selected.add(entries[i])
++    available -= tokens
++  }
++  const kept = entries.filter((entry) => selected.has(entry))
++  let summary = buildSummaryMessage(renderSummaryText(kept), images, now)
++  while (kept.length && countTokensMessages([summary]) > remainingTokens) {
++    const removable = kept.findIndex((entry) => entry !== historicalRequest)
++    if (removable < 0) break
++    kept.splice(removable, 1)
++    summary = buildSummaryMessage(renderSummaryText(kept), images, now)
++  }
++  const output = [
++    ...(countTokensMessages([summary]) <= remainingTokens ? [summary] : []),
++    ...prefix.map((message) => ({ ...message, sentAt: now })),
++    ...fitted,
++  ]
++  if (countTokensMessages(output) > tokenBudget) {
++    throw new Error(
++      'Unable to fit the latest tool results into the configured context window. Request smaller outputs or configure a larger supported context window.',
++    )
++  }
++  return {
++    ...result,
++    messages: output,
++    stats: {
++      ...result.stats,
++      mid_turn: fresh.length > 0,
++      live_user_prompt_found: livePrompts.length > 0,
++      summary_estimated_tokens: Math.ceil(
++        renderSummaryText(kept).length / CHARS_PER_TOKEN,
++      ),
++      budget_dropped_summary_parts: entries.length - kept.length,
++      preserved_fresh_messages: fitted.length,
++    },
++  }
++}
++
+ /**
+  * How long the conversation sat idle before the live user prompt arrived, or
+  * null when the history has no pair of timestamps to measure between.
+@@ -937,6 +1118,8 @@ export function maybeCompactHistory(params: {
+   messages: Message[]
+   contextTokenCount: number
+   maxContextLength: number
++  /** System prompt, tool schemas and next step's scaffolding, outside history. */
++  fixedTokenCount?: number
+   /** Pass null to compact on the context limit only. */
+   cacheExpiryMs?: number | null
+   /** Pass null to take the opportunistic compaction at any size. */
+@@ -958,7 +1141,10 @@ export function maybeCompactHistory(params: {
+     })
+   if (!trigger) return null
+ 
+-  const result = compactMessages({ messages })
++  const result = compactRequestHistory(
++    messages,
++    maxContextLength - (params.fixedTokenCount ?? 0),
++  )
+   try {
+     params.onCompaction?.(trigger)
+   } catch {
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index e956a468d..596368154 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -1092,12 +1092,12 @@ export async function loopAgentSteps(
+ 
+       // Mechanical compaction: no model call, so it costs nothing but the
+       // prompt-cache break that rewriting the history forces anyway. The
+-      // budget is sized to the model in use (see contextPrunerBudgetForModel),
+-      // which is the same budget base2 hands the context-pruner agent.
++      // budget is sized to the model in use, including fixed request overhead.
++      // Preserve the fresh tool exchange; only older history becomes a summary.
+       //
+-      // Fires once per turn at most: compaction stamps every surviving message
+-      // with a fresh sentAt and drops the assistant messages that preceded the
+-      // live prompt, so the cache gap it measured is gone on the next step.
++      // Cache expiry fires once per turn. Size-triggered compaction can fire
++      // again after any tool batch, so its output must fit without erasing the
++      // results the model has not had a chance to consume yet.
+       if (agentTemplate.compactContext) {
+         const compacted = maybeCompactHistory({
+           // The option object is exactly the tunable subset, so it forwards
+@@ -1107,6 +1107,12 @@ export async function loopAgentSteps(
+             : {}),
+           messages: currentAgentState.messageHistory,
+           contextTokenCount: currentAgentState.contextTokenCount,
++          fixedTokenCount:
++            countTokens(system) +
++            countTokensJson(toolsForTokenCount) +
++            (stepPrompt
++              ? countTokensMessages([userMessage({ content: stepPrompt })])
++              : 0),
+           maxContextLength:
+             (typeof agentTemplate.compactContext === 'object'
+               ? agentTemplate.compactContext.maxContextLength
+diff --git a/packages/agent-runtime/src/util/fit-tool-results.ts b/packages/agent-runtime/src/util/fit-tool-results.ts
+new file mode 100644
+index 000000000..aba5b3240
+--- /dev/null
++++ b/packages/agent-runtime/src/util/fit-tool-results.ts
+@@ -0,0 +1,158 @@
++import { countTokensMessages } from './token-counter'
++
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++import type { JSONValue } from '@codebuff/common/types/json'
++
++/** Only used when fresh results cannot fit even with all older history removed. */
++export function fitToolResults(
++  messages: Message[],
++  tokenBudget: number,
++): Message[] {
++  if (countTokensMessages(messages) <= tokenBudget) return messages
++
++  // Never mutate the full results already handed to the UI/trace writer.
++  const fitted: Message[] = messages.map((message) =>
++    message.role === 'tool'
++      ? {
++          ...message,
++          content: message.content.map((part) =>
++            part.type === 'json'
++              ? { ...part, value: structuredClone(part.value) }
++              : part,
++          ),
++        }
++      : message,
++  )
++  const calls = new Map(
++    fitted.flatMap((message) =>
++      message.role === 'assistant'
++        ? message.content.flatMap((part) =>
++            part.type === 'tool-call'
++              ? [[part.toolCallId, part.input] as const]
++              : [],
++          )
++        : [],
++    ),
++  )
++  const slots: {
++    restore: () => void
++    clip: (chars: number) => void
++    length: number
++  }[] = []
++
++  for (const message of fitted) {
++    if (message.role !== 'tool') continue
++    for (const part of message.content) {
++      if (part.type !== 'json') continue // Images are indivisible.
++      const original = part.value
++      if (message.toolName === 'read_files' && Array.isArray(original)) {
++        for (let i = 0; i < original.length; i++) {
++          const file = original[i]
++          if (
++            !file ||
++            typeof file !== 'object' ||
++            Array.isArray(file) ||
++            typeof file.path !== 'string' ||
++            typeof file.content !== 'string'
++          )
++            continue
++          const { path, content } = file
++          const paths = calls.get(message.toolCallId)?.paths
++          const windows = Array.isArray(paths)
++            ? paths.filter(
++                (entry) =>
++                  entry === path ||
++                  (entry && typeof entry === 'object' && entry.path === path),
++              )
++            : []
++          // Multiple windows are joined into one result: do not invent a line
++          // number for a prefix that may cross that join.
++          const window = windows.length === 1 ? windows[0] : undefined
++          const annotated =
++            content.includes('[read_files:') ||
++            content.includes('[FILE_TOO_LARGE]') ||
++            content.startsWith('[TEMPLATE]')
++          const startLine = annotated
++            ? undefined
++            : typeof window === 'string'
++              ? 1
++              : window && typeof window === 'object'
++                ? Math.max(
++                    1,
++                    Math.floor(
++                      typeof window.offset === 'number' ? window.offset : 1,
++                    ),
++                  )
++                : undefined
++          const clip = (chars: number) => {
++            const end = chars > 0 ? content.lastIndexOf('\n', chars - 1) : -1
++            const prefix = end >= 0 ? content.slice(0, end + 1) : ''
++            const next =
++              startLine !== undefined
++                ? ` Read this file with offset=${startLine + (prefix.match(/\n/g)?.length ?? 0)} and a smaller limit to continue; use code_search for oversized lines.`
++                : ' Read a smaller explicit window of this file using offset and limit, or use code_search to locate the needed section.'
++            original[i] = {
++              path,
++              content:
++                prefix +
++                `\n[read_files: ${prefix ? 'Remaining contents' : 'Contents'} omitted to fit the context window.${next}]`,
++            }
++          }
++          slots.push({
++            length: content.length,
++            clip,
++            restore: () => {
++              original[i] = file
++            },
++          })
++          clip(0)
++        }
++      } else {
++        const text =
++          typeof original === 'string' ? original : JSON.stringify(original)
++        const clip = (chars: number) => {
++          part.value = {
++            truncated: true,
++            notice:
++              'Tool result shortened to fit the context window. The tool already ran; do not repeat state-changing actions. Request a smaller output if needed.',
++            preview: text.slice(0, chars),
++          } satisfies JSONValue
++        }
++        slots.push({
++          length: text.length,
++          clip,
++          restore: () => {
++            part.value = original
++          },
++        })
++        clip(0)
++      }
++    }
++  }
++
++  if (countTokensMessages(fitted) > tokenBudget) {
++    throw new Error(
++      'The latest tool calls and their result metadata exceed the configured context window. Use a larger supported context window or request fewer tools at once.',
++    )
++  }
++
++  // Requested order, with space already reserved for every later result's
++  // omission notice. Count the whole message envelope, not just source text.
++  for (const slot of slots) {
++    slot.restore()
++    if (countTokensMessages(fitted) <= tokenBudget) continue
++    let low = 0
++    let high = slot.length
++    while (low < high) {
++      const mid = Math.ceil((low + high) / 2)
++      slot.clip(mid)
++      if (countTokensMessages(fitted) <= tokenBudget) low = mid
++      else high = mid - 1
++    }
++    slot.clip(low)
++    // Tokenization isn't strictly monotonic at string boundaries. Never return
++    // an oversized request even for that edge case.
++    if (countTokensMessages(fitted) > tokenBudget) slot.clip(0)
++  }
++  return fitted
++}
