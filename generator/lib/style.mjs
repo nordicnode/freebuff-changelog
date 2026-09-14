@@ -367,11 +367,6 @@ nav.term-nav a.active{
 .entry.teaser .entry-title{
   font-size:.95rem;
 }
-.teaser-empty{
-  margin:6px 0;
-  font-size:.82rem;
-  color:var(--txt-dim);
-}
 .teaser-facts{
   margin-top:4px;
   font-size:.76rem;

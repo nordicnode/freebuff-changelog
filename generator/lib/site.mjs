@@ -415,9 +415,11 @@ function entryCard (e, isExpanded = false, mode = 'full', relatedIdx = null) {
   const anchor = e.sha.slice(0, 12)
   const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
   if (mode === 'teaser') {
-    // Lightweight homepage row: expandable facts + link to full card.
-    // Keeps toggle affordance without full body weight.
-    const factBody = e.facts?.length ? `<ul class="facts">${e.facts.slice(0, 3).map(f => `<li>${miniMd(f)}</li>`).join('')}</ul>` : `<p class="teaser-empty">No key facts extracted.</p>`
+    // Homepage row: summary + facts expand inline (the whole point of the
+    // toggle). Heavy pieces (diff viewer, file chips, related) stay on the
+    // day page; everything here is already in memory, no extra weight.
+    const teaserSummary = `<div class="summary">${miniMd(e.ai?.summary || e.summary)}</div>`
+    const factBody = e.facts?.length ? `<ul class="facts">${e.facts.slice(0, 3).map(f => `<li>${miniMd(f)}</li>`).join('')}</ul>` : ''
     return `<details class="entry teaser ${e.significance}" id="${anchor}">
 <summary class="entry-summary">
   <div class="entry-meta-top">
@@ -430,6 +432,8 @@ function entryCard (e, isExpanded = false, mode = 'full', relatedIdx = null) {
   <h3 class="entry-title">${title}</h3>
 </summary>
 <div class="entry-body">
+  ${modelDiffLine(e)}
+  ${teaserSummary}
   ${factBody}
   <div class="metarow"><span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i></span><a class="meta-link" href="/day/${e.day}/#${anchor}">open full entry &rarr;</a></div>
 </div>
