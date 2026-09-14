@@ -23,7 +23,7 @@ export function llmConfigured (env = process.env) {
 }
 
 // Bump when buildPrompt changes so stale entries re-summarize exactly once.
-export const PROMPT_V = 4
+export const PROMPT_V = 5
 
 export function firstSentence (s) {
   const m = String(s || '').trim().match(/^[^.?!]+[.?!]/)
@@ -89,7 +89,16 @@ export function buildPrompt (entry, patch) {
     `Stats: +${entry.stats?.additions ?? '?'} / -${entry.stats?.deletions ?? '?'}`,
     `Analysis notes: ${entry.summary}`
   ]
-  if (entry.modelChanges) lines.push(`Model catalog: +${entry.modelChanges.added.join(', ')} -${entry.modelChanges.removed.join(', ')}`)
+  if (entry.modelChanges) {
+    lines.push(`Model catalog: +${entry.modelChanges.added.join(', ')} -${entry.modelChanges.removed.join(', ')}`)
+    const tables = entry.modelChanges.tables || {}
+    const rows = []
+    for (const m of [...(entry.modelChanges.added || []), ...(entry.modelChanges.removed || [])]) {
+      const row = tables[m]?.after || tables[m]?.before
+      if (row) rows.push(`${m} [${row.slice(1).join(' · ') || row[0]}]`)
+    }
+    if (rows.length) lines.push(`Model rows (access + traits, use for DETAIL): ${rows.join(' | ')}`)
+  }
   if (entry.cmdChanges) lines.push(`Slash commands: +${(entry.cmdChanges.added || []).join(', ')} -${(entry.cmdChanges.removed || []).join(', ')}`)
   if (entry.version) lines.push(`Version bump: ${entry.version}`)
   const files = [...(entry.files?.added || []), ...(entry.files?.modified || []).slice(0, 8)]

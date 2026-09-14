@@ -197,11 +197,20 @@ test('golden: model-swap prompt carries catalog facts, no invented names', () =>
     stats: { additions: 12, deletions: 12 },
     files: { added: [], modified: ['README.md', 'README.zh-CN.md'] },
     summary: 'Model catalog: Muse Spark 1.3 replaced Muse Spark 1.2.',
-    modelChanges: { added: ['Muse Spark 1.3'], removed: ['Muse Spark 1.2'] }
+    modelChanges: {
+      added: ['Muse Spark 1.3'],
+      removed: ['Muse Spark 1.2'],
+      tables: {
+        'Muse Spark 1.3': { before: null, after: ['Muse Spark 1.3', 'Full access', 'Fast all-round pick'] },
+        'Muse Spark 1.2': { before: ['Muse Spark 1.2', 'Limited access', 'Legacy row'], after: null }
+      }
+    }
   }
   const prompt = buildPrompt(entry, 'diff --git a/README.md b/README.md\n-| **Muse Spark 1.2** | Full |\n+| **Muse Spark 1.3** | Full |')
   assert.match(prompt, /Model catalog: \+Muse Spark 1\.3 -Muse Spark 1\.2/)
   assert.match(prompt, /use ONLY facts from the diff/)
+  assert.match(prompt, /Model rows.*Fast all-round pick/)
+  assert.match(prompt, /Model rows.*Legacy row/)
   // No model names beyond what the entry and diff provide
   assert.doesNotMatch(prompt, /GPT-5|Gemini|DeepSeek|GLM|MiniMax|Solar|MiMo/)
 })
