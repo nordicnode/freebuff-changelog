@@ -63,6 +63,14 @@ strictly in the diff text:
 | `LLM_API_KEY` | key |
 | `LLM_MODEL` | model name |
 | `CHANGELOG_LLM_LIMIT` | max commits summarized per run (default 60) |
+| `CHANGELOG_LLM_CONCURRENCY` | parallel API calls (default 5) |
+| `CHANGELOG_LLM_ERROR_COOLDOWN_MS` | retry failed entries after this (default 3600000) |
+
+Priority order is user-visible first (models, releases, commands), then newest.
+The prompt carries deterministic signals (category, files, stats, catalog and
+command facts) so the model grounds in verifiable context; outputs are schema-
+validated with one repair retry and 429 backoff. Prompt edits bump `PROMPT_V`
+in `generator/lib/llm.mjs`, invalidating stale cache entries exactly once.
 
 AI-titled entries are badged `ai`. Without AI, or on API failure, the
 rule-based summary is used: the site never depends on the LLM.

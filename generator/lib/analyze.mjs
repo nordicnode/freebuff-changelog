@@ -91,7 +91,8 @@ export async function diffPatch (repoDir, base, head, paths, maxBytes = 24000) {
 }
 
 // Clean unified diff of a commit for in-browser inspection, excluding lockfiles.
-export async function extractCleanDiff (repoDir, base, head, maxBytes = 48000) {
+// With excludeTests, pure test files drop out too (matches what the LLM prompt claims).
+export async function extractCleanDiff (repoDir, base, head, maxBytes = 48000, excludeTests = false) {
   const args = [
     'diff', '--no-color', '-U3', `${base}...${head}`,
     '--', '.',
@@ -100,6 +101,9 @@ export async function extractCleanDiff (repoDir, base, head, maxBytes = 48000) {
     ':(exclude)*pnpm-lock.yaml',
     ':(exclude)*yarn.lock'
   ]
+  if (excludeTests) {
+    args.push(':(exclude)*__tests__*', ':(exclude)*test.*', ':(exclude)*spec.*', ':(exclude)*/tests/*')
+  }
   const out = await git(args, repoDir)
   if (!out) return ''
   return out.length > maxBytes ? out.slice(0, maxBytes) + '\n\n… [diff truncated: view full diff on GitHub] …\n' : out

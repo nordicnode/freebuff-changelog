@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { git, readJson, writeJson, writeText, log, ymd, pruneDiffs, pool } from './lib/util.mjs'
 import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
-  diffNameStatus, diffPatch, extractCleanDiff, SYNC_SUBJECT, TEST_RE
+  extractCleanDiff, SYNC_SUBJECT, TEST_RE
 } from './lib/analyze.mjs'
 import { enrichWithLlm, llmConfigured } from './lib/llm.mjs'
 import { buildSite } from './lib/site.mjs'
@@ -25,6 +25,16 @@ const CACHE = resolve(ROOT, '.cache')
 const REPO_DIR = resolve(CACHE, 'freebuff')
 const REPO_URL = process.env.FREEBUFF_REPO || 'https://github.com/CodebuffAI/freebuff.git'
 const META = { repoUrl: 'https://github.com/CodebuffAI/freebuff', compareUrl: 'https://github.com/CodebuffAI/freebuff/compare' }
+
+// Patch for LLM summarization: clean diff (lockfiles + pure test files
+// excluded), matching what the prompt claims. Single source for both
+// generate and catch-up paths.
+async function llmPatchFor (e) {
+  if (e.kind !== 'sync') return ''
+  const prev = e.prevSha || (await git(['rev-parse', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
+  if (!prev) return ''
+  return extractCleanDiff(REPO_DIR, prev, e.sha, 48000, true)
+}
 
 // ---------------------------------------------------------------------------
 
@@ -172,16 +182,7 @@ async function cmdGenerate (argv) {
   if (toEnrich.length > 0) {
     await backfillDiffs(toEnrich, 500)
     if (llmConfigured()) {
-      const getPatch = async (e) => {
-        if (e.kind !== 'sync') return ''
-        const prev = e.prevSha || (await git(['rev-parse', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
-        if (!prev) return ''
-        const files = await diffNameStatus(REPO_DIR, prev, e.sha)
-        const targets = files.map(f => f.path).filter(p => !p.endsWith('bun.lock') && !TEST_RE.test(p)).slice(0, 8)
-        if (!targets.length) return ''
-        return diffPatch(REPO_DIR, prev, e.sha, targets)
-      }
-      const n = await enrichWithLlm(toEnrich, getPatch, DATA)
+      const n = await enrichWithLlm(toEnrich, llmPatchFor, DATA)
       log(`LLM enriched ${n} new entries`)
     }
   }
@@ -296,22 +297,13 @@ async function cmdCatchUp (argv) {
   await backfillDiffs(entries, 1000)
 
   if (llmConfigured()) {
-    const getPatch = async (e) => {
-      if (e.kind !== 'sync') return ''
-      const prev = e.prevSha || (await git(['rev-parse', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
-      if (!prev) return ''
-      const files = await diffNameStatus(REPO_DIR, prev, e.sha)
-      const targets = files.map(f => f.path).filter(p => !p.endsWith('bun.lock') && !TEST_RE.test(p)).slice(0, 8)
-      if (!targets.length) return ''
-      return diffPatch(REPO_DIR, prev, e.sha, targets)
-    }
     let limit = Number(process.env.CHANGELOG_LLM_LIMIT || 5)
     const limitIdx = argv.indexOf('--limit')
     if (limitIdx !== -1 && argv[limitIdx + 1]) {
       limit = Number(argv[limitIdx + 1]) || limit
     }
     const envWithLimit = { ...process.env, CHANGELOG_LLM_LIMIT: String(limit) }
-    const n = await enrichWithLlm(entries, getPatch, DATA, envWithLimit, { retryErrors: true })
+    const n = await enrichWithLlm(entries, llmPatchFor, DATA, envWithLimit, { retryErrors: true })
     const remaining = entries.filter(e => e.kind === 'sync' && !e.ai?.title).length
     log(`[backfill] enriched ${n} entries with LLM (${remaining} remaining)`)
     if (remaining < unsummarizedSync.length) {
