@@ -111,26 +111,99 @@ export async function extractCleanDiff (repoDir, base, head, maxBytes = 48000) {
 
 // Model catalog rows look like:
 //   | **GPT-5.6 Luna** | Full access | Strong all-around with native images |
+// Tables are classified by header: model tables start with a Model/模型 cell,
+// product tables with Product/产品. Header gating (not a product-name denylist)
+// decides what counts, so new product rows can never leak into the catalog.
 const MODEL_ROW_RE = /^\|\s*\*\*(.+?)\*\*\s*\|/
+const MODEL_HEADER_RE = /^\|\s*(model|模型)\s*\|/i
+const PRODUCT_HEADER_RE = /^\|\s*(product|产品)\s*\|/i
 
-const PRODUCT_NAMES = new Set([
-  'Freebuff Desktop',
-  'Freebuff CLI',
-  'Freebuff Web',
-  'Freebuff Cloud',
-  'Freebuff Chat'
-])
+// Split markdown text into consecutive-pipe-line tables with header + rows.
+export function parseMarkdownTables (text) {
+  const tables = []
+  let current = null
+  for (const raw of text.split('\n')) {
+    if (/^\s*\|/.test(raw)) {
+      if (!current) current = []
+      current.push(raw.trim())
+    } else {
+      if (current && current.length >= 2) tables.push(current)
+      current = null
+    }
+  }
+  if (current && current.length >= 2) tables.push(current)
+  return tables
+}
+
+function isModelTable (lines) {
+  const header = lines[0]
+  if (!MODEL_HEADER_RE.test(header)) return false
+  return !PRODUCT_HEADER_RE.test(header)
+}
+
+// Model names from tables classified as model tables. Separator rows
+// (| --- | --- |) never match MODEL_ROW_RE, so no special-casing needed.
+export function catalogFromReadme (text) {
+  const names = new Set()
+  for (const lines of parseMarkdownTables(text || '')) {
+    if (!isModelTable(lines)) continue
+    for (const line of lines.slice(1)) {
+      const m = MODEL_ROW_RE.exec(line)
+      if (m) names.add(m[1].trim())
+    }
+  }
+  return names
+}
+
+export function diffCatalogs (before, after) {
+  const added = [...after].filter(m => !before.has(m))
+  const removed = [...before].filter(m => !after.has(m))
+  return { added, removed }
+}
+
+async function showFileAt (repoDir, rev, path) {
+  const out = await git(['show', `${rev}:${path}`], repoDir, { allowFail: true })
+  return out || ''
+}
+
+// Snapshot compare: parse the full model tables before/after instead of
+// scanning hunks. Immune to hunk fragmentation, diff truncation, and
+// product-table rows (header-gated). EN is primary, ZH cross-checks it.
+export async function snapshotModelChanges (repoDir, base, head) {
+  const beforeEn = catalogFromReadme(await showFileAt(repoDir, base, 'README.md'))
+  const afterEn = catalogFromReadme(await showFileAt(repoDir, head, 'README.md'))
+  if (!beforeEn.size && !afterEn.size) return null
+  const en = diffCatalogs(beforeEn, afterEn)
+  const beforeZh = catalogFromReadme(await showFileAt(repoDir, base, 'README.zh-CN.md'))
+  const afterZh = catalogFromReadme(await showFileAt(repoDir, head, 'README.zh-CN.md'))
+  const zh = diffCatalogs(beforeZh, afterZh)
+  // Both languages track the same catalog: intersect to kill translation lag.
+  // Fall back to EN when ZH is absent (older history) or disagrees entirely.
+  const zhEmpty = !zh.added.length && !zh.removed.length
+  const agree = (a, b) => a.every(x => b.includes(x))
+  if (!beforeZh.size && !afterZh.size) return en
+  if (zhEmpty && (en.added.length || en.removed.length)) return en
+  if (agree(en.added, zh.added) && agree(en.removed, zh.removed)) return en
+  if (agree(zh.added, en.added) && agree(zh.removed, en.removed)) return zh
+  const added = en.added.filter(x => zh.added.includes(x))
+  const removed = en.removed.filter(x => zh.removed.includes(x))
+  return { added, removed }
+}
 
 export function extractModelTableChanges (patch) {
+  // Hunk-scanning fallback for when full snapshots are unavailable (old
+  // history without README at that rev). Best-effort: header-gated when the
+  // hunk includes a table header, product-name guard otherwise. Prefer
+  // snapshotModelChanges whenever both SHAs are available.
   const rawAdded = [], rawRemoved = []
   let inProductTable = false
   for (const line of patch.split('\n')) {
-    if (/^@@/.test(line)) inProductTable = false
-    if (/\|\s*Product\s*\|/i.test(line) || /Choose your Freebuff/i.test(line)) {
+    if (/^(@@|diff --git)/.test(line)) inProductTable = false
+    if (PRODUCT_HEADER_RE.test(line) || /Choose your Freebuff/i.test(line)) {
       inProductTable = true
       continue
     }
-    if (/\|\s*Model\s*\|/i.test(line) || /model catalog/i.test(line)) {
+    if (MODEL_HEADER_RE.test(line) || /model catalog/i.test(line)) {
       inProductTable = false
       continue
     }
@@ -140,17 +213,13 @@ export function extractModelTableChanges (patch) {
       const m = MODEL_ROW_RE.exec(line.slice(1))
       if (m) {
         const name = m[1].trim()
-        if (!PRODUCT_NAMES.has(name) && !/^Freebuff (Desktop|CLI|Web|Cloud|Chat)/i.test(name)) {
-          rawAdded.push(name)
-        }
+        if (!isProductName(name)) rawAdded.push(name)
       }
     } else if (line.startsWith('-') && !line.startsWith('---')) {
       const m = MODEL_ROW_RE.exec(line.slice(1))
       if (m) {
         const name = m[1].trim()
-        if (!PRODUCT_NAMES.has(name) && !/^Freebuff (Desktop|CLI|Web|Cloud|Chat)/i.test(name)) {
-          rawRemoved.push(name)
-        }
+        if (!isProductName(name)) rawRemoved.push(name)
       }
     }
   }
@@ -159,6 +228,21 @@ export function extractModelTableChanges (patch) {
   const added = rawAdded.filter(m => !rawRemoved.includes(m))
   const removed = rawRemoved.filter(m => !rawAdded.includes(m))
   return { added, removed }
+}
+
+// Fallback-only guard for headerless hunks: the product table has no Model
+// header in-range, so its rows look identical to catalog rows.
+const PRODUCT_NAMES = new Set([
+  'Freebuff Desktop',
+  'Freebuff CLI',
+  'Freebuff Web',
+  'Freebuff Cloud',
+  'Freebuff Chat',
+  'Freebuff Enterprise'
+])
+
+function isProductName (name) {
+  return PRODUCT_NAMES.has(name) || /^Freebuff (Desktop|CLI|Web|Cloud|Chat|Enterprise)/i.test(name)
 }
 
 // Version bump in package.json
@@ -230,12 +314,19 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
   let modelChanges = null
   let version = null
   let cmdChanges = null
+  const readmeTouched = meaningful.some(f => f.path === 'README.md' || f.path === 'README.zh-CN.md')
+  if (readmeTouched) {
+    const mc = await snapshotModelChanges(repoDir, prevSha, commit.sha)
+    if (mc && (mc.added.length || mc.removed.length)) modelChanges = mc
+  }
   if (patchTargets.length) {
     const patch = await diffPatch(repoDir, prevSha, commit.sha, patchTargets)
-    const readmePatch = patchForFile(patch, 'README.md') || patchForFile(patch, 'README.zh-CN.md')
-    if (readmePatch) {
-      const mc = extractModelTableChanges(readmePatch)
-      if (mc.added.length || mc.removed.length) modelChanges = mc
+    if (!modelChanges) {
+      const readmePatch = patchForFile(patch, 'README.md') || patchForFile(patch, 'README.zh-CN.md')
+      if (readmePatch) {
+        const mc = extractModelTableChanges(readmePatch)
+        if (mc.added.length || mc.removed.length) modelChanges = mc
+      }
     }
     const pkgPatch = patchForFile(patch, 'cli/release/package.json')
     if (pkgPatch) version = extractVersionBump(pkgPatch) || version

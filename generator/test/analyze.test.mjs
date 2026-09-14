@@ -5,7 +5,8 @@ import assert from 'node:assert/strict'
 import {
   extractModelTableChanges, extractVersionBump, extractSlashCommandChanges,
   areaOf, isNoiseFile, deterministicSummary, entryTitle, sourceRef, isSyncCommit,
-  extractCommentFacts, extractCleanDiff
+  extractCommentFacts, extractCleanDiff, parseMarkdownTables, catalogFromReadme,
+  diffCatalogs
 } from '../lib/analyze.mjs'
 
 const README_PATCH = [
@@ -155,6 +156,57 @@ test('extractCommentFacts: only captures added comments and flushes properly', (
 
 test('extractCleanDiff: function is exported and callable', () => {
   assert.equal(typeof extractCleanDiff, 'function')
+})
+
+test('catalogFromReadme: header-gated, product rows excluded', () => {
+  const text = [
+    '| Product | What it does | Get started |',
+    '|---|---|---|',
+    '| **Freebuff Enterprise** | Custom deployments | link |',
+    '',
+    '| Model | Access | Best for |',
+    '|---|---|---|',
+    '| **Muse Spark 1.2** | Full access | Fast |',
+    '| **GPT-5.6 Luna** | Full access | Strong |'
+  ].join('\n')
+  const names = catalogFromReadme(text)
+  assert.ok(names.has('Muse Spark 1.2'))
+  assert.ok(names.has('GPT-5.6 Luna'))
+  assert.ok(!names.has('Freebuff Enterprise'))
+})
+
+test('catalogFromReadme: Chinese headers work', () => {
+  const text = [
+    '| 模型 | 访问范围 | 适用场景 |',
+    '|---|---|---|',
+    '| **Muse Spark 1.2** | 完整访问 | 快速 |',
+    '',
+    '| 产品 | 功能 | 开始使用 |',
+    '|---|---|---|',
+    '| **Freebuff CLI** | 从终端编程 | link |'
+  ].join('\n')
+  const names = catalogFromReadme(text)
+  assert.ok(names.has('Muse Spark 1.2'))
+  assert.ok(!names.has('Freebuff CLI'))
+})
+
+test('diffCatalogs: description edit yields no changes', () => {
+  const before = new Set(['Muse Spark 1.2', 'GPT-5.6 Luna'])
+  const after = new Set(['Muse Spark 1.2', 'GPT-5.6 Luna'])
+  assert.deepEqual(diffCatalogs(before, after), { added: [], removed: [] })
+})
+
+test('diffCatalogs: swap detected as add+remove', () => {
+  const before = new Set(['Muse Spark 1.3'])
+  const after = new Set(['Muse Spark 1.2'])
+  assert.deepEqual(diffCatalogs(before, after), { added: ['Muse Spark 1.2'], removed: ['Muse Spark 1.3'] })
+})
+
+test('parseMarkdownTables: groups consecutive pipe lines', () => {
+  const text = ['| a | b |', '|---|---|', '| **x** | y |', '', 'prose', '', '| c | d |', '|---|---|'].join('\n')
+  const tables = parseMarkdownTables(text)
+  assert.equal(tables.length, 2)
+  assert.equal(tables[0].length, 3)
 })
 
 
