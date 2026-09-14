@@ -118,6 +118,15 @@ export function parseLlmJson (text) {
   return JSON.parse(text.slice(jsonStart, jsonEnd + 1))
 }
 
+// Short one-line error for logs and cache: HTML error pages collapse to
+// their HTTP status so a 522 tunnel outage logs one line, not a page.
+export function shortError (err) {
+  const msg = String(err?.message || err || '')
+  const m = /LLM HTTP (\d+)/.exec(msg)
+  if (m) return `LLM HTTP ${m[1]}`
+  return msg.split('\n')[0].slice(0, 120)
+}
+
 async function callLlm (prompt, env, attempt = 1) {
   const base = env.LLM_API_BASE || 'https://api.openai.com/v1'
   const model = env.LLM_MODEL || 'gpt-4o-mini'
@@ -142,7 +151,12 @@ async function callLlm (prompt, env, attempt = 1) {
     await new Promise(r => setTimeout(r, Math.min(waitMs, 30000)))
     return callLlm(prompt, env, attempt + 1)
   }
-  if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
+  // 5xx gateways (tunnel 522s included): one delayed retry, then a short error.
+  if (res.status >= 500 && res.status <= 599 && attempt === 1) {
+    await new Promise(r => setTimeout(r, 5000))
+    return callLlm(prompt, env, attempt + 1)
+  }
+  if (!res.ok) throw new Error(shortError(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`))
   const rawText = await res.text()
   const data = parseLlmJson(rawText)
   const text = data.choices?.[0]?.message?.content ?? ''
@@ -233,15 +247,20 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   if (!queue.length) return 0
 
   let activeIndex = 0
-  let isOffline = false
+  // Consecutive gateway failures trip the breaker: the tunnel is down,
+  // stop burning calls this run. Tracked globally (not per worker) so 8
+  // parallel workers cannot each log their own "offline" line.
+  let gatewayFails = 0
 
   async function worker () {
-    while (activeIndex < queue.length && !isOffline) {
+    while (activeIndex < queue.length) {
+      if (gatewayFails >= 3) break
       const idx = activeIndex++
       const { entry: e, patch, key } = queue[idx]
       try {
         const out = await callLlm(buildPrompt(e, patch), env)
         const clean = validateLlmOut(out, e.significance || 'minor')
+        gatewayFails = 0
         cache[key] = {
           model: env.LLM_MODEL || 'gpt-4o-mini',
           v: PROMPT_V,
@@ -255,13 +274,16 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         cacheModified = true
         log(`LLM summarized ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})`)
       } catch (err) {
-        log(`LLM failed for ${e.sha.slice(0, 8)}: ${err.message}`)
+        log(`LLM failed for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
         if (isTransientError(err)) {
-          isOffline = true
-          log(`LLM endpoint appears offline (${err.message}): skipping further attempts this run`)
-          break
+          gatewayFails++
+          if (gatewayFails >= 3) {
+            log('LLM endpoint appears offline (3 consecutive gateway errors): skipping rest of queue this run')
+            break
+          }
+          continue
         }
-        cache[key] = { error: String(err.message).slice(0, 200), at: new Date().toISOString() }
+        cache[key] = { error: shortError(err).slice(0, 200), at: new Date().toISOString() }
         cacheModified = true
       }
     }

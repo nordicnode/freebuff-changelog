@@ -1,7 +1,12 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, buildPrompt, enrichWithLlm, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, PROMPT_V } from '../lib/llm.mjs'
+import { parseLlmJson, buildPrompt, enrichWithLlm, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V } from '../lib/llm.mjs'
+
+test('shortError: collapses HTML error pages to status line', () => {
+  assert.equal(shortError(new Error('LLM HTTP 522: <!DOCTYPE html>\n<html>...')), 'LLM HTTP 522')
+  assert.equal(shortError(new Error('fetch failed')), 'fetch failed')
+})
 
 test('isTransientError: 5xx gateway family, network faults transient', () => {
   for (const code of [502, 503, 504, 520, 521, 522, 523, 524]) {
