@@ -196,15 +196,17 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   syncEntries.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
 
   // Fetch patches in parallel (git-bound, independent) before queueing.
+  // Entries without a prompt version predate versioning: re-summarize once.
+  const isCurrent = (e) => e.ai?.model && (e.ai?.v ?? 1) >= PROMPT_V
   const patches = await pool(syncEntries.map(e => async () => {
-    if (e.ai?.model && e.ai?.v === PROMPT_V) return ''
+    if (isCurrent(e)) return ''
     try { return await getPatch(e) } catch { return '' }
   }), 8)
 
   const queue = []
   for (let qi = 0; qi < syncEntries.length; qi++) {
     const e = syncEntries[qi]
-    if (e.ai?.model && e.ai?.v === PROMPT_V) continue
+    if (isCurrent(e)) continue
     const patch = patches[qi]
     if (!patch) continue
     const key = cacheKey(e.sha, patch)
@@ -217,7 +219,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       if (Date.now() - failedAt < errorCooldownMs) continue
     }
     if (cached && !cached.error) {
-      e.ai = { model: cache[key].model, title: cache[key].title, summary: cache[key].summary, significance: cache[key].significance, at: cache[key].at }
+      e.ai = { model: cache[key].model, v: cache[key].v, title: cache[key].title, summary: cache[key].summary, significance: cache[key].significance, at: cache[key].at }
       continue // Cache hit does not consume the API budget
     }
     queue.push({ entry: e, patch, key })

@@ -279,7 +279,9 @@ async function cmdCatchUp (argv) {
   }
 
   const syncEntries = entries.filter(e => e.kind === 'sync')
-  const unsummarizedSync = syncEntries.filter(e => !e.ai?.title)
+  const { PROMPT_V: CATCHUP_PROMPT_V } = await import('./lib/llm.mjs')
+  const isCurrent = (e) => e.ai?.title && (e.ai?.v ?? 1) >= CATCHUP_PROMPT_V
+  const unsummarizedSync = syncEntries.filter(e => !isCurrent(e))
   log(`[backfill] ${syncEntries.length} total sync entries (${unsummarizedSync.length} remaining to summarize)`)
 
   if (unsummarizedSync.length === 0) {
@@ -304,7 +306,7 @@ async function cmdCatchUp (argv) {
     }
     const envWithLimit = { ...process.env, CHANGELOG_LLM_LIMIT: String(limit) }
     const n = await enrichWithLlm(entries, llmPatchFor, DATA, envWithLimit, { retryErrors: true })
-    const remaining = entries.filter(e => e.kind === 'sync' && !e.ai?.title).length
+    const remaining = entries.filter(e => e.kind === 'sync' && !isCurrent(e)).length
     log(`[backfill] enriched ${n} entries with LLM (${remaining} remaining)`)
     if (remaining < unsummarizedSync.length) {
       await writeJson(`${DATA}/changelog.json`, existing)
