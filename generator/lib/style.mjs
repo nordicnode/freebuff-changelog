@@ -444,7 +444,7 @@ nav.term-nav a.active{
 .chip-n{margin-left:5px;font-size:.68rem;color:var(--txt-subtle)}
 .chip-churn{border-style:dashed}
 .chip-churn.active{border-color:var(--term-amber);background:rgba(210,153,34,.1)}
-.filter-note{margin:0 0 10px;font-size:.72rem;color:var(--txt-subtle)}
+.filter-note{margin:0 0 10px;font-size:.8rem;color:var(--txt-subtle)}
 .filter-note b{color:var(--txt-dim)}
 .filter-note em{font-style:normal;color:var(--term-amber)}
 .related{
