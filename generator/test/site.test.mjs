@@ -228,11 +228,12 @@ test('buildSite generates valid static site output', async () => {
     const notFoundHtml = await readFile(join(tmpDist, '404.html'), 'utf8')
     assert.match(notFoundHtml, /<meta name="robots" content="noindex">/)
 
-    // Verify about page contains extended tracking and Qwen 3.8 Flash
+    // Verify about page covers method, categories, limits
     const aboutHtml = await readFile(join(tmpDist, 'about/index.html'), 'utf8')
-    assert.match(aboutHtml, /WHAT WE TRACK/)
-    assert.match(aboutHtml, /Qwen 3\.8 Flash/)
-    assert.match(aboutHtml, /Subsystems &amp; Areas:/)
+    assert.match(aboutHtml, /HOW IT WORKS/)
+    assert.match(aboutHtml, /Deterministic first/)
+    assert.match(aboutHtml, /LIMITS/)
+    assert.match(aboutHtml, /Model Catalog/)
 
     // Verify models page: lineup, retired, history rows, nav
     const modelsHtml = await readFile(join(tmpDist, 'models/index.html'), 'utf8')

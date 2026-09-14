@@ -925,28 +925,26 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
     </div>
     <div class="man-body">
       <h4>WHAT IS THIS?</h4>
-      <p>Freebuff Changelog is an automated, developer-focused changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>. It provides chronological visibility into everything that ships, reconstructed commit-by-commit directly from public git diffs.</p>
-      
-      <h4>WHY IT EXISTS</h4>
-      <p>The upstream Freebuff repository is updated via automated snapshot merges that frequently arrive with blank <em>"Sync public snapshot"</em> messages. Without commit notes, it is difficult to see when an AI model was replaced, when a new command was added, or what bug was fixed.</p>
-      <p>This project inspects the code diff behind every snapshot (${entries.length.toLocaleString()} tracked changes from ${scannedCount.toLocaleString()} scanned commits) to extract meaningful updates so developers and users always know what is new.</p>
-      
+      <p>A commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, reconstructed from public git diffs. Upstream ships via automated snapshot merges with blank <em>"Sync public snapshot"</em> messages, so this project diffs each snapshot against its parent and extracts what actually changed: model swaps, version bumps, new slash commands, file-level churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} scanned commits, refreshed hourly.</p>
+
+      <h4>HOW IT WORKS</h4>
+      <p><strong>Deterministic first.</strong> Every sync commit is diffed parent-to-head. Model tables in both READMEs are parsed before and after and set-differenced (description-only edits cancel out); the slash-command registry (<code>cli/src/data/slash-commands.ts</code>) gets the same snapshot treatment; version bumps are read from release <code>package.json</code> files. Zero dependencies, stdlib only.</p>
+      <p><strong>LLM summaries, cached forever.</strong> An optional model rewrites each entry once (keyed by commit SHA plus prompt version) into a technical 2-4 sentence summary. It sees only the diff plus extracted facts — model access/traits, command names, files, stats — and is schema-validated with one repair retry. No provider configured means deterministic summaries only; nothing breaks.</p>
+      <p><strong>Every claim links to proof.</strong> Each entry carries its commit SHA, compare URL, inline diff (lazy-loaded, lockfiles and test-only hunks stripped), and per-file stats. Model swaps render before/after README rows inline.</p>
+
       <h4>WHAT WE TRACK</h4>
-      <p><strong>Model Lineup:</strong> Additions, retirements, swaps, and provider changes in the free model catalog.<br>
-      <strong>Releases &amp; Versions:</strong> CLI and runtime version bumps (<code>v1.0.x</code>) and milestone release highlights.<br>
-      <strong>Commands &amp; Flags:</strong> New slash commands (<code>/commit</code>, <code>/plan</code>, etc.), CLI flags, arguments, and workflow capabilities.<br>
-      <strong>Subsystems &amp; Areas:</strong> Automatic categorization across 9 areas: <em>AI &amp; Agents</em>, <em>Models</em>, <em>UI &amp; CLI</em>, <em>Performance</em>, <em>Testing</em>, <em>Core</em>, <em>Packaging</em>, <em>Docs</em>, and <em>Internal</em>.<br>
-      <strong>Significance &amp; Impact:</strong> Tiering every commit as <code>major</code> (new models/features/releases), <code>notable</code> (UI changes, new files, large churn), or <code>minor</code> (internal refactors, types, dependencies).<br>
-      <strong>Code Churn &amp; Files:</strong> Additions (<code>+</code>) and deletions (<code>−</code>) across modified, added, renamed, or deleted files, distinguishing real code changes from massive generated lockfiles.<br>
-      <strong>Clean Code Diffs:</strong> Full unified diffs on every sync entry, loaded on demand, stripping out lockfile noise and pure test hunks.<br>
-      <strong>In-Flight PRs:</strong> Active community pull requests and drafts on upstream Freebuff ahead of merges with live diffstats.<br>
-      <strong>Upstream Attribution:</strong> Unmasking opaque <em>"Sync public snapshot"</em> commits to link back to the exact source commit SHA and author.</p>
-      
-      <h4>AI ENRICHMENT (QWEN 3.8 FLASH)</h4>
-      <p>To turn raw unified diffs into clear, human-readable entries, we use <strong>Qwen 3.8 Flash</strong> to synthesize commit diffs and deterministic metadata into concise, accurate summaries. The model is constrained strictly to verified code changes from the diff (never inventing features, versions, or filenames) to ensure complete technical accuracy.</p>
-      
-      <h4>VERIFIABLE & OPEN</h4>
-      <p>Every entry links directly to the underlying GitHub commit and snapshot compare view for complete ground truth. Stay up to date via the <a href="/feed.xml">RSS feed</a> (<a href="/feed-models.xml">models only</a>, <a href="/feed-releases.xml">releases only</a>), explore historical changes in the <a href="/archive/">Archive</a>, or inspect upcoming community contributions on the <a href="/in-flight/">In-Flight PRs</a> page.</p>
+      <p><strong>Model Catalog</strong> (${(cats.get('Model Catalog') || 0)} changes): additions, retirements, and swaps in the free picker, with access level and trait columns — plus a <a href="/models/">catalog timeline</a> and per-model pages with watch feeds.<br>
+      <strong>Releases</strong> (${vers.length} tracked): CLI and core <code>package.json</code> bumps with per-release pages listing every commit in range.<br>
+      <strong>Commands</strong> (${(cats.get('Commands') || 0)} changes): new or removed <code>/slash-commands</code> from the registry (renames surface as add+remove).<br>
+      <strong>CLI</strong> (${(cats.get('CLI') || 0).toLocaleString()}), <strong>Core</strong> (${(cats.get('Core') || 0).toLocaleString()}), <strong>SDK</strong> (${(cats.get('SDK') || 0)}), <strong>Agent Runtime</strong> (${(cats.get('Agent Runtime') || 0)}), <strong>Agents</strong> (${(cats.get('Agents') || 0)}), <strong>LLM Providers</strong> (${(cats.get('LLM Providers') || 0)}), <strong>Packaging</strong> (${(cats.get('Packaging') || 0)}), <strong>Docs</strong> (${(cats.get('Docs') || 0)}), <strong>Internal</strong> (${(cats.get('Internal') || 0).toLocaleString()}): file-path categorization with per-file add/remove/rename tracking.<br>
+      <strong>Significance:</strong> <code>major</code> (model/version/security/breaking), <code>notable</code> (visible behavior, new files, large churn), <code>minor</code> (internal). Deterministic by default; the LLM may only override with diff evidence.<br>
+      <strong>In-Flight PRs:</strong> open upstream pull requests with diffstat and 120-line diff previews, pruned when merged.</p>
+
+      <h4>LIMITS</h4>
+      <p>Snapshots squash upstream history, so intra-snapshot sequencing is approximate and authorship resolves to the snapshot bot. Diffs older than 90 days are pruned (day pages fall back to GitHub compare links). AI summaries describe only what the diff shows — no research, no speculation on model capabilities beyond the README row.</p>
+
+      <h4>FOLLOW ALONG</h4>
+      <p><a href="/feed.xml">RSS</a> (major + notable), <a href="/feed-models.xml">models only</a>, <a href="/feed-releases.xml">releases only</a>, per-model feeds on each <a href="/models/">model page</a>. <a href="/search/">Search</a> supports category and impact filters; <a href="/stats/">stats</a> charts churn and cadence; <a href="/watch/">watchlist</a> builds saved-search links. <a href="/archive/">Archive</a> holds every day and release. Source: hourly GitHub Action plus a local backfill daemon, both pushing <code>data/</code>; Cloudflare deploys on push.</p>
     </div>
   </div>
 </section>`
