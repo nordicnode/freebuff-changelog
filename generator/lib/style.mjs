@@ -151,39 +151,15 @@ nav.term-nav a.active{
   font-size:.8rem;
   color:var(--txt-dim);
 }
-.term-grid{
-  display:grid;
-  grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
-  gap:12px;
-  margin-bottom:14px;
+.term-box-slim{
+  padding:10px 14px;
 }
-.term-stat{
-  background:var(--code);
-  border:1px solid var(--term-border);
-  padding:10px 12px;
-  border-radius:2px;
+.term-box-slim .term-box-hdr{
+  margin-bottom:0;
 }
-.ts-lbl{
-  display:block;
-  font-size:.68rem;
-  color:var(--txt-subtle);
-  text-transform:uppercase;
-  letter-spacing:.05em;
-  margin-bottom:4px;
-}
-.ts-val{
-  display:block;
-  font-size:1.45rem;
-  color:var(--txt);
-  font-weight:700;
-  font-variant-numeric:tabular-nums;
-  line-height:1.2;
-}
-.ts-sub{
-  display:block;
-  font-size:.72rem;
-  color:var(--txt-subtle);
-  margin-top:2px;
+.term-box-slim .term-footer-bar{
+  border-top:none;
+  padding-top:6px;
 }
 .term-footer-bar{
   display:flex;

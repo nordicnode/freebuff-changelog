@@ -498,27 +498,14 @@ export async function buildSite ({ changelog, openPrs, dist }) {
   for (const d of byDay) { if (n >= NEW_WINDOW) break; idx.push(d); n += d.entries.length }
   const hero = `
 <section class="hero">
-  <div class="term-box">
-    <div class="term-grid">
-      <div class="term-stat">
-        <span class="ts-lbl">TRACKED CHANGES</span>
-        <b class="ts-val">${entries.length.toLocaleString()}</b>
-        <span class="ts-sub">${byDay.length} active dates</span>
-      </div>
-      <div class="term-stat">
-        <span class="ts-lbl">RELEASES</span>
-        <b class="ts-val">${releases.length.toLocaleString()}</b>
-        <span class="ts-sub">CLI & core pkgs</span>
-      </div>
-      <div class="term-stat">
-        <span class="ts-lbl">COMMITS SCANNED</span>
-        <b class="ts-val">${scannedCount.toLocaleString()}</b>
-        <span class="ts-sub">from upstream</span>
-      </div>
+  <div class="term-box term-box-slim">
+    <div class="term-box-hdr">
+      <span class="term-box-title">LATEST :: ${esc(first.day)} &rarr; ${esc(last.day)}</span>
+      <span>${entries.length.toLocaleString()} changes &middot; ${releases.length} releases</span>
     </div>
     <div class="term-footer-bar">
       <span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}">${esc(fmtDateHuman(generated))} UTC</span></span>
-      <span>NEXT SYNC: <span class="sync-val" style="color:var(--term-cyan);font-weight:600">--:--</span> &middot; COVERAGE: ${esc(first.day)} &rarr; ${esc(last.day)}</span>
+      <span>NEXT SYNC: <span class="sync-val" style="color:var(--term-cyan);font-weight:600">--:--</span></span>
     </div>
   </div>
 </section>`
