@@ -626,7 +626,10 @@ async function cmdBuild () {
   const dataDiffs = resolve(DATA, 'diffs')
   const dist = resolve(ROOT, 'dist')
   const t0 = Date.now()
-  await buildSite({ changelog, openPrs: prs, dist })
+  // Timeline pagination granularity: real changes per page, breaks on day
+  // boundaries only. 90 keeps the front page the size it has always been and
+  // puts the rest of history on /page/2/ and onward.
+  await buildSite({ changelog, openPrs: prs, dist, timelinePageSize: Number(process.env.CHANGELOG_TIMELINE_PAGE) || 90 })
 
   const distDiffs = resolve(dist, 'diffs')
   if (existsSync(dataDiffs)) {

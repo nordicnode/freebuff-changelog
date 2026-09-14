@@ -76,6 +76,18 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
   down to nothing. A day whose rows are all filtered out hides its own header, a
   `#sha` permalink into a filtered-out row reveals that row instead of landing on
   blank space, and day pages plus the archive stay the exhaustive view.
+* The timeline paginates in **whole days**: `/` holds the newest ~90 real changes
+  (plus their churn), `/page/2/` the next batch, 77 pages back to the first
+  entry. Page size is `CHANGELOG_TIMELINE_PAGE` (default 90), and the budget is
+  spent on changes rather than rows so churn cannot push history off the front
+  page. A page break never lands inside a day: a date split across two pages
+  would show the same heading twice and hide half of each day behind a click.
+  The chips are per page and their counts are page-scoped — `data-total` carries
+  the all-time figure beside them — and filter state is shared, so page 2 honours
+  what was picked on page 1. Only page 1 gets the live chrome (HEAD + sync
+  countdown + one expanded row); older pages say the data is settled, since a
+  countdown over 2024 is theatre and the reload-when-behind hook belongs to fresh
+  data.
 
 ## Freshness path (an upstream commit → a reader seeing it)
 
@@ -172,6 +184,7 @@ rule-based summary is used: the site never depends on the LLM.
 | route | content |
 |---|---|
 | `/` | last ~90 real changes plus the churn around them (churn hidden by default), category filter chips, hero stats |
+| `/page/2/` … | the same timeline, further back: ~90 changes per page, 77 pages, breaks only at day boundaries |
 | `/day/YYYY-MM-DD/` | every change pushed that UTC day |
 | `/release/1.0.NNN/` | entries since the previous version bump |
 | `/archive/` | every day, release, category |

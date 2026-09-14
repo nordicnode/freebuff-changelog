@@ -583,7 +583,7 @@ export function modelTimeline (modelEntries) {
 
 async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, '')}/${p}`, html) }
 
-export async function buildSite ({ changelog, openPrs, dist }) {
+export async function buildSite ({ changelog, openPrs, dist, timelinePageSize = 90 }) {
   const entries = [...changelog.entries].reverse() // newest first
   const byDay = groupByDay(entries)
   // "Related" is a reading aid for real changes: churn rows must neither appear
@@ -620,86 +620,122 @@ export async function buildSite ({ changelog, openPrs, dist }) {
   // of the next hour, describing a schedule that no longer owns freshness.
   const syncBudgetMin = Math.round(syncStaleMs() / 60000)
 
-  // ----- index: newest days worth of entries
-  // Budget is spent on real changes: with ~30% of recent commits being lockfile
-  // churn, counting rows would have pushed three weeks of actual work off the
-  // front page. Churn rows still render, inside the same day sections.
-  const NEW_WINDOW = 90
-  const idx = []
-  let n = 0
-  for (const d of byDay) { if (n >= NEW_WINDOW) break; idx.push(d); n += d.entries.filter(e => !e.noise).length }
-  const hero = `
-<section class="hero">
-  <div class="term-box term-box-slim">
-    <div class="term-box-hdr">
-      <span class="term-box-title">LATEST :: ${esc(first.day)} &rarr; ${esc(last.day)}</span>
-      <span>${meaningful.length.toLocaleString()} changes${churnNote} &middot; ${releases.length} releases</span>
-    </div>
-    <div class="term-footer-bar">
-      <span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}">${esc(fmtDateHuman(generated))} UTC</span></span>
-      <span>SYNC DUE: <span class="sync-val" style="color:var(--term-cyan);font-weight:600">--:--</span></span>
-    </div>
-  </div>
-</section>`
-
-  // Rows are complete on every surface now, but only the newest one starts
-  // expanded: a page of 256 open bodies is a wall, and the reader asked for the
-  // content, not for scrolling.
-  let isFirstIndex = true
-  const daysHtml = idx.map(d => {
-  const m = d.entries.filter(e => !e.noise).length
-  const ch = d.entries.length - m
-  return `<section class="day" id="${d.day}">
-<div class="day-line">
-  <h2><time datetime="${d.day}">[ ${esc(fmtDateHuman(d.day))} ]</time></h2>
-  <span class="day-count">${m} change${m === 1 ? '' : 's'}${ch ? ` <span class="day-churn">+${ch} churn</span>` : ''}</span>
-</div>
-${d.entries.map(e => {
-  // The newest *visible* row is the one that opens. Spending the flag on a churn
-  // row that is hidden by default would leave the timeline with nothing open.
-  const open = isFirstIndex && !e.noise
-  if (open) isFirstIndex = false
-  return entryCard(e, open, relatedIdx, { hideChurn: true })
-}).join('\n')}</section>`
-}).join('')
-
-  // Front-page filters. Every row the timeline can show is already in the DOM,
-  // so a filter is a visibility toggle rather than a request. Churn starts
-  // hidden *in the markup* (not by script), so a reader with JS off gets the
-  // quiet timeline -- the default was asked for, and defaults belong on the
-  // server. Chips only name categories actually present in this window, so no
-  // chip can filter the page down to nothing by accident.
-  const windowRows = idx.flatMap(d => d.entries)
-  const realRows = windowRows.filter(e => !e.noise)
-  const churnInWindow = windowRows.length - realRows.length
-  const catCounts = new Map()
-  for (const e of realRows) {
-    const slug = categorySlug(e.category)
-    const cur = catCounts.get(slug) || { slug, label: e.category || 'Other', n: 0 }
-    cur.n++
-    if (!catCounts.has(slug)) catCounts.set(slug, cur)
+  // ----- paginated timeline: whole days, ~90 real changes per page
+  // The budget is spent on real changes: with ~30% of recent commits being
+  // lockfile churn, counting rows would have pushed three weeks of actual work
+  // off the front page. Churn rows still render, inside the same day sections.
+  //
+  // Breaks happen only at day boundaries. A page that ended mid-day would put the
+  // same date header on two pages and hide half of each day's entries behind a
+  // click, which is the opposite of what a day heading is for. So pages are even
+  // in *content*, not in *days*: a 77-row day is its own page, a quiet week
+  // stretches across several.
+  const PAGE_WINDOW = timelinePageSize
+  const timelinePages = []
+  {
+    let chunk = [], real = 0
+    for (const d of byDay) {
+      chunk.push(d)
+      real += d.entries.filter(e => !e.noise).length
+      if (real >= PAGE_WINDOW) { timelinePages.push(chunk); chunk = []; real = 0 }
+    }
+    if (chunk.length) timelinePages.push(chunk)
   }
-  const chipList = [...catCounts.values()].sort((a, b) => b.n - a.n || a.label.localeCompare(b.label))
-  // Each chip states two different numbers: the rows it narrows *on this page*,
-  // and -- as data-total/data-href, picked up by the note line -- how many
-  // changes of that category exist in the whole database. A chip labelled "all"
-  // over 91 rows would be the site's biggest lie.
+  const pageCount = timelinePages.length
+  const pageHref = (i) => (i === 0 ? '/' : `/page/${i + 1}/`)
+  const pageFile = (i) => (i === 0 ? 'index.html' : `page/${i + 1}/index.html`)
+
+  // Chips are per page: each one counts the rows it can actually hide *here*.
   const chipHtml = (slug, label, n, active, extraClass) => {
     const b = browseBySlug.get(slug)
     const total = b ? b.list.length : meaningful.length
     const href = b ? `/changes/${b.slug}/` : '/changes/'
     return `  <button type="button" class="chip${active ? ' active' : ''}${extraClass}" data-filter="${esc(slug)}" data-label="${esc(label)}" data-total="${total}" data-href="${esc(href)}" aria-pressed="${active ? 'true' : 'false'}">${esc(label)}<span class="chip-n">${n.toLocaleString()}</span></button>`
   }
-  const filterBar = `<nav class="filterbar" id="filters" aria-label="Filter the rows on this page by category">
+
+  const pagePager = (i, top = false) => `<div class="pager pager-timeline${top ? ' pager-timeline-top' : ''}">
+  ${i > 0 ? `<a href="${pageHref(i - 1)}" rel="prev">&larr; newer</a>` : '<span></span>'}
+  <span class="pager-page">page ${i + 1} of ${pageCount} &middot; ${pageCount === 1 ? 'one page holds every day' : `${byDay.length} days`}</span>
+  ${i < pageCount - 1 ? `<a href="${pageHref(i + 1)}" rel="next">older &rarr;</a>` : '<span></span>'}
+</div>`
+
+  function renderTimelinePage (days, i) {
+    const firstDay = days.at(-1).day, lastDay = days[0].day
+    const pageRows = days.flatMap(d => d.entries)
+    const pageReal = pageRows.filter(e => !e.noise).length
+    // HEAD + the sync countdown are claims about *now*, so they belong on the
+    // page that shows now. Deep in history the data is settled: no ticking clock,
+    // and deliberately no `.sync-age`/`data-generated` hook either -- that is the
+    // element the shell's aging and reload-when-behind logic looks for, and an
+    // auto-refresh while someone is reading August 2024 would yank the page out
+    // from under them.
+    const freshness = i === 0
+      ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}">${esc(fmtDateHuman(generated))} UTC</span></span>
+      <span>SYNC DUE: <span class="sync-val" style="color:var(--term-cyan);font-weight:600">--:--</span></span>`
+      : `<span>DATA AS OF ${esc(String(generated).slice(0, 16).replace('T', ' '))} UTC</span>
+      <span>THIS PAGE IS SETTLED HISTORY</span>`
+    const hero = `
+<section class="hero">
+  <div class="term-box term-box-slim">
+    <div class="term-box-hdr">
+      <span class="term-box-title">${i === 0 ? 'LATEST' : 'TIMELINE'} :: ${esc(firstDay)} &rarr; ${esc(lastDay)}</span>
+      <span>${meaningful.length.toLocaleString()} changes${churnNote} &middot; ${releases.length} releases${pageCount > 1 ? ` &middot; page ${i + 1}/${pageCount}` : ''}</span>
+    </div>
+    <div class="term-footer-bar">
+      ${freshness}
+    </div>
+  </div>
+</section>`
+
+    const churnInWindow = pageRows.length - pageReal
+    const catCounts = new Map()
+    for (const e of pageRows.filter(e => !e.noise)) {
+      const slug = categorySlug(e.category)
+      const cur = catCounts.get(slug) || { slug, label: e.category || 'Other', n: 0 }
+      cur.n++
+      if (!catCounts.has(slug)) catCounts.set(slug, cur)
+    }
+    const chipList = [...catCounts.values()].sort((a, b) => b.n - a.n || a.label.localeCompare(b.label))
+    const filterBar = `<nav class="filterbar" id="filters" aria-label="Filter the rows on this page by category">
   <span class="filter-label">FILTER THIS PAGE:</span>
 ${[
-    chipHtml('*', 'recent', realRows.length, true, ''),
-    ...chipList.map(c => chipHtml(c.slug, c.label, c.n, false, '')),
-    chipHtml('churn', 'churn', churnInWindow, false, ' chip-churn')
-  ].join('\n')}
+      chipHtml('*', 'recent', pageReal, true, ''),
+      ...chipList.map(c => chipHtml(c.slug, c.label, c.n, false, '')),
+      chipHtml('churn', 'churn', churnInWindow, false, ' chip-churn')
+    ].join('\n')}
 </nav>
-<p class="filter-note" data-hub="/changes/" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${realRows.length}</b> of ${windowRows.length} rows on this page <em>${churnInWindow ? 'churn hidden' : 'no churn in this window'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/changes/">browse every change by category</a></span></p>`
+<p class="filter-note" data-hub="/changes/" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${pageReal}</b> of ${pageRows.length} rows on this page <em>${churnInWindow ? 'churn hidden' : 'no churn in this window'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/changes/">browse every change by category</a></span></p>`
 
+    // Only the first page opens a row: the newest entry on the site. On older
+    // pages the reader is skimming history, and an open body there would push the
+    // first day's list below the fold.
+    let isFirstIndex = i === 0
+    const daysHtml = days.map(d => {
+      const m = d.entries.filter(e => !e.noise).length
+      const ch = d.entries.length - m
+      return `<section class="day" id="${d.day}">
+<div class="day-line">
+  <h2><time datetime="${d.day}">[ ${esc(fmtDateHuman(d.day))} ]</time></h2>
+  <span class="day-count">${m} change${m === 1 ? '' : 's'}${ch ? ` <span class="day-churn">+${ch} churn</span>` : ''}</span>
+</div>
+${d.entries.map(e => {
+        const open = isFirstIndex && !e.noise
+        if (open) isFirstIndex = false
+        return entryCard(e, open, relatedIdx, { hideChurn: true })
+      }).join('\n')}</section>`
+    }).join('')
+
+    return hero + (i > 0 ? pagePager(i, true) : '') + filterBar + daysHtml + pagePager(i) +
+      (i === 0 ? `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>` : '')
+  }
+
+  // Front-page filters. Every row the timeline can show is already in the DOM,
+  // so a filter is a visibility toggle rather than a request. Churn starts
+  // hidden *in the markup* (not by script), so a reader with JS off gets the
+  // quiet timeline -- the default was asked for, and defaults belong on the
+  // server. Chips only name categories actually present on the page, so no chip
+  // can filter a page down to nothing by accident, and the `recent` chip on
+  // every page is the way back out of a selection that has no rows here.
   // Progressive enhancement only: no-JS readers see the server default (real
   // changes, no churn). Category labels live in data-* so the toggle never has
   // to parse markup, and a day whose rows are all filtered out is hidden with
@@ -809,8 +845,18 @@ ${[
 })();
 </script>`
 
-  await write(dist, 'index.html', layout({ title: 'Home', path: '/', body: hero + filterBar + daysHtml +
-    `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>` + filterScript }))
+  // Pages are independent writes over the same in-memory data, so the pool bounds
+  // file handles, not work: ~77 pages of full entry bodies.
+  const timelineTasks = timelinePages.map((days, i) => async () => {
+    await write(dist, pageFile(i), layout({
+      title: i === 0 ? 'Home' : `Timeline :: page ${i + 1}`,
+      path: pageHref(i),
+      desc: i === 0 ? SITE.desc
+        : `Freebuff changelog, page ${i + 1}: ${days.flatMap(d => d.entries).filter(e => !e.noise).length.toLocaleString()} changes from ${days.at(-1).day} to ${days[0].day}.`,
+      body: renderTimelinePage(days, i) + filterScript
+    }))
+  })
+  await pool(timelineTasks, 8)
 
   // ----- per-day pages (independent writes: bounded parallel pool)
   const dayOptions = byDay.map(d => `<option value="/day/${d.day}/">${esc(fmtDateHuman(d.day))} (${d.entries.filter(e => !e.noise).length})</option>`).join('')
@@ -1420,11 +1466,15 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
   const relUrls = vers.map(v => `/release/${v.version}/`)
   const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`)]
   const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/watch/', '/changes/', ...browseList.map(b => `/changes/${b.slug}/`), ...(openPrs?.length ? ['/in-flight/'] : [])]
+  // The timeline pages get their own sitemap: it grows every time ~90 more
+  // changes land, while the small `pages` list above is essentially fixed.
+  const timelineUrls = timelinePages.slice(1).map((d, i) => `/page/${i + 2}/`)
   await write(dist, 'sitemap-days.xml', urlset(dayUrls))
   await write(dist, 'sitemap-releases.xml', urlset(relUrls))
   await write(dist, 'sitemap-models.xml', urlset(modelUrls))
   await write(dist, 'sitemap-pages.xml', urlset(pageUrls))
-  await write(dist, 'sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-pages.xml'].map(f => `<sitemap><loc>${SITE.url}/${f}</loc></sitemap>`).join('')}</sitemapindex>`)
+  await write(dist, 'sitemap-timeline.xml', urlset(timelineUrls))
+  await write(dist, 'sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-timeline.xml', 'sitemap-pages.xml'].map(f => `<sitemap><loc>${SITE.url}/${f}</loc></sitemap>`).join('')}</sitemapindex>`)
   await write(dist, 'robots.txt', `User-agent: *\nAllow: /\nSitemap: ${SITE.url}/sitemap.xml\n`)
   // Cache policy. Entry data changes on every sync (~2min), so nothing that
   // carries it may hold a long TTL; only SHA-keyed immutable assets keep
@@ -1487,6 +1537,8 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
   Cache-Control: public, max-age=60, stale-while-revalidate=300
 /changes/*
   Cache-Control: public, max-age=60, stale-while-revalidate=300
+/page/*
+  Cache-Control: public, max-age=60, stale-while-revalidate=300
 /pr-diffs/*
   Content-Type: text/plain; charset=utf-8
   Cache-Control: public, max-age=300, stale-while-revalidate=1800
@@ -1500,6 +1552,8 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
 /sitemap-releases.xml
   Cache-Control: public, max-age=3600
 /sitemap-models.xml
+  Cache-Control: public, max-age=3600
+/sitemap-timeline.xml
   Cache-Control: public, max-age=3600
 /sitemap-pages.xml
   Cache-Control: public, max-age=3600

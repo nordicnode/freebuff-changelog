@@ -610,3 +610,97 @@ test('modelTimeline: replays adds/removes oldest-first', () => {
   assert.deepEqual(live, ['Muse Spark 1.2', 'Ox Alpha'])
   assert.deepEqual(retired, ['Muse Spark 1.3'])
 })
+
+// Timeline pagination. The day is the unit: a page ends where a day ends, so no
+// date header is ever split across two pages, and the set of pages covers every
+// entry exactly once. Built here at two changes per page so three days land on
+// two pages.
+test('timeline pages split on day boundaries and cover every entry once', async () => {
+  const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-pages-'))
+  try {
+    const row = (sha, date, extra = {}) => ({
+      kind: 'sync', sha, url: `https://github.com/CodebuffAI/freebuff/commit/${sha}`,
+      date, day: date.slice(0, 10), month: date.slice(0, 7),
+      areas: ['CLI'], category: 'CLI', significance: 'notable',
+      files: { total: 1, meaningful: 1, added: [], removed: [], modified: ['a.ts'] },
+      stats: { additions: 3, deletions: 1 },
+      title: 'Title ' + sha[0], summary: 'Summary ' + sha[0], ...extra
+    })
+    // Ascending, as changelog.json is stored: buildSite reverses it for display.
+    const entries = [
+      row('a'.repeat(40), '2026-09-10T10:00:00Z'),
+      row('b'.repeat(40), '2026-09-11T10:00:00Z'),
+      row('c'.repeat(40), '2026-09-11T12:00:00Z'),
+      row('d'.repeat(40), '2026-09-12T10:00:00Z'),
+      row('e'.repeat(40), '2026-09-12T12:00:00Z', { noise: true, churn: 'lockfile', category: 'Churn', significance: 'noise', title: 'Only bun.lock changed', summary: 'lockfile' })
+    ]
+    const changelog = {
+      version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-13T00:00:00Z',
+      headSha: 'f'.repeat(40), counts: { entries: entries.length }, entries
+    }
+    await buildSite({ changelog, openPrs: [], dist: tmpDist, timelinePageSize: 2 })
+
+    const p1 = await readFile(join(tmpDist, 'index.html'), 'utf8')
+    const p2 = await readFile(join(tmpDist, 'page/2/index.html'), 'utf8')
+    const pageDays = (h) => [...h.matchAll(/<section class="day" id="(\d{4}-\d{2}-\d{2})">/g)].map(m => m[1])
+    const anchors = (h) => [...h.matchAll(/<details class="entry [^"]*" id="([0-9a-f]{12})"[^>]*>/g)].map(m => m[1])
+    const tags = (h) => (h.match(/<details class="entry [^"]*" id="[0-9a-f]{12}"[^>]*>/g) || [])
+
+    assert.deepEqual(pageDays(p1), ['2026-09-12', '2026-09-11'])
+    assert.deepEqual(pageDays(p2), ['2026-09-10'], 'the older page carries the older days, none shared')
+    assert.equal(new Set([...anchors(p1), ...anchors(p2)]).size, entries.length, 'every entry rendered exactly once')
+
+    // Page 1 stays what it always was: no bar above the fold, one expanded row,
+    // the live HEAD + countdown. Older pages get the bar top and bottom, start
+    // fully collapsed, and say the data is settled rather than ticking a clock
+    // over history -- the shell's reload-when-behind hook belongs to fresh data.
+    assert.equal((p1.match(/<div class="pager pager-timeline/g) || []).length, 1)
+    assert.equal((p2.match(/<div class="pager pager-timeline/g) || []).length, 2, 'older pages have a way back above the list too')
+    assert.match(p1, /page 1 of 2/)
+    assert.match(p2, /page 2 of 2/)
+    assert.equal(tags(p1).filter(t => / open>$/.test(t)).length, 1, 'one open row, on the newest page only')
+    assert.equal(tags(p2).filter(t => / open>$/.test(t)).length, 0)
+    assert.match(p1, /class="sync-val"/)
+    assert.doesNotMatch(p2, /class="sync-val"/)
+    assert.match(p2, /SETTLED HISTORY/)
+    assert.match(p2, /DATA AS OF \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/, 'a settled page states the exact stamp it was built from')
+    // The shell's aging + reload-when-behind logic keys off .sync-age
+    // [data-generated]; leaving it on a history page would let a future edit
+    // start refreshing someone mid-read.
+    assert.doesNotMatch(p2, /class="sync-age"/)
+    assert.doesNotMatch(p2, /data-generated=/)
+    assert.match(p1, /class="sync-age" data-generated=/)
+    assert.match(p1, /<a href="\/page\/2\/" rel="next">/)
+    assert.doesNotMatch(p1, /rel="prev"/, 'nothing is newer than page 1')
+    assert.match(p2, /<a href="\/" rel="prev">/)
+    assert.doesNotMatch(p2, /rel="next"/, 'nothing is older than the last page')
+
+    // Chips count this page; the all-time figure behind them does not move.
+    assert.match(p1, /data-filter="\*"[^>]*>recent<span class="chip-n">3<\/span>/)
+    assert.match(p2, /data-filter="\*"[^>]*>recent<span class="chip-n">1<\/span>/)
+    assert.match(p1, /data-filter="cli"[^>]*data-total="4"/)
+    assert.match(p2, /data-filter="cli"[^>]*data-total="4"/)
+    assert.match(p2, /showing <b id="filter-count">1<\/b> of 1 rows on this page/)
+    // Churn stays hidden by default on every page, in the markup, not by script.
+    assert.ok(tags(p1).find(t => t.includes('data-churn="1"')).includes(' hidden'))
+    assert.equal(tags(p2).filter(t => t.includes('data-churn="1"')).length, 0, 'no churn on the older page')
+    // Filtering is per page but shares one memory, so page 2 honours what the
+    // reader picked on page 1 instead of snapping back to the default.
+    assert.match(p1, /fbIndexFilter/)
+    assert.match(p2, /fbIndexFilter/)
+    assert.match(p2, /getElementById\('filters'\)/)
+
+    // Reachability: prev/next links, the timeline sitemap, and a cache rule of
+    // its own that cannot collide with `/` or `/index.html`.
+    const tl = await readFile(join(tmpDist, 'sitemap-timeline.xml'), 'utf8')
+    assert.match(tl, /\/page\/2\//)
+    assert.match(await readFile(join(tmpDist, 'sitemap.xml'), 'utf8'), /sitemap-timeline\.xml/)
+    const rules = parseHeaderRules(await readFile(join(tmpDist, '_headers'), 'utf8'))
+    assert.equal(ruleFor(rules, '/page/*').headers['cache-control'], 'public, max-age=60, stale-while-revalidate=300')
+    for (const url of ['/page/2/', '/page/77/']) {
+      assert.deepEqual(duplicatedHeaders(rules, url), [], `overlapping _headers rules for ${url}`)
+    }
+  } finally {
+    await rm(tmpDist, { recursive: true, force: true })
+  }
+})

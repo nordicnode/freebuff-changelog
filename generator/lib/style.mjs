@@ -1111,6 +1111,20 @@ nav.term-nav a.active{
   color:#ffffff;
   text-decoration:none;
 }
+/* Timeline pagination: the same bar above and below the day sections, so the
+   way back is never something a reader has to scroll to find. */
+.pager-page{
+  font-size:.74rem;
+  color:var(--txt-subtle);
+}
+.pager-timeline{
+  flex-wrap:wrap;
+}
+.pager-timeline-top{
+  margin:10px 0 0;
+  padding-top:0;
+  border-top:none;
+}
 
 footer{
   margin-top:48px;
