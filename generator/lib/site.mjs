@@ -100,7 +100,7 @@ function updateSyncAge() {
   if (!el || !el.dataset.generated) return;
   const ageMin = Math.max(0, Math.floor((Date.now() - Date.parse(el.dataset.generated)) / 60000));
   const fresh = ageMin < 90;
-  el.textContent = el.textContent.replace(/\s*\[.*\]$/, '') + (fresh ? ' [fresh]' : ' [stale ' + ageMin + 'm]');
+  el.textContent = el.textContent.replace(/\\s*\\[.*\\]$/, '') + (fresh ? ' [fresh]' : ' [stale ' + ageMin + 'm]');
   el.style.color = fresh ? 'var(--term-green)' : 'var(--term-amber)';
 }
 updateSyncAge();
@@ -191,7 +191,7 @@ document.addEventListener('toggle', async (ev) => {
 function renderDiff(container, text, label, ghUrl, mode) {
   mode = mode || 'unified';
   container.dataset.raw = text;
-  const lines = text.split(/\r?\n/);
+  const lines = text.split(/\\r?\\n/);
   const frag = document.createDocumentFragment();
 
   const toolbar = document.createElement('div');
@@ -813,7 +813,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   const go = () => {
     const v = q.value.trim().toLowerCase();
     const cat = fcat ? fcat.value : '', sig = fsig ? fsig.value : '';
-    const w = v.split(/\s+/).filter(Boolean);
+    const w = v.split(/\\s+/).filter(Boolean);
     if (!w.length && !cat && !sig) { h.innerHTML = ''; cnt.textContent = ''; return; }
     const scored = [];
     for (const e of ix) {

@@ -278,8 +278,44 @@ test('buildSite generates valid static site output', async () => {
   }
 })
 
-test('modelSlug + scoreHit: slugs safe, titles outrank categories', () => {
-  assert.equal(modelSlug('Muse Spark 1.2'), 'muse-spark-1-2')
+test('inline scripts: template escaping preserves regex backslashes', async () => {
+  const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-test-js-'))
+  try {
+    const { writeFile: wf } = await import('node:fs/promises')
+    const mockChangelog = {
+      version: 1, repo: 'https://github.com/CodebuffAI/freebuff', generatedAt: '2026-09-13T12:00:00Z',
+      headSha: '1111222233334444555566667777888899990000',
+      counts: { commitsScanned: 1, entries: 1, syncEra: 1, community: 0 },
+      entries: [{
+        kind: 'sync', sha: 'bbbb111122223333444455556666777788889999',
+        url: 'https://github.com/CodebuffAI/freebuff/commit/bbbb', date: '2026-09-13T10:00:00Z',
+        areas: ['CLI'], modelChanges: null, cmdChanges: null,
+        files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/x.ts'] },
+        stats: { additions: 1, deletions: 0 }, facts: [], summary: 'Minor CLI tweak.', title: 'Minor CLI tweak.',
+        category: 'CLI', significance: 'minor', day: '2026-09-13', month: '2026-09'
+      }]
+    }
+    await buildSite({ changelog: mockChangelog, openPrs: [], dist: tmpDist })
+    const { execFileSync } = await import('node:child_process')
+    for (const f of ['index.html', 'search/index.html', 'day/2026-09-13/index.html']) {
+      const html = await readFile(join(tmpDist, f), 'utf8')
+      const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1])
+      assert.ok(blocks.length > 0, `${f} has inline scripts`)
+      for (const js of blocks) {
+        await wf(join(tmpDist, 'inline-check.mjs'), js)
+        execFileSync('node', ['--check', join(tmpDist, 'inline-check.mjs')])
+      }
+      // Backslash regexes survived template escaping intact
+      if (f !== 'search/index.html') assert.match(html, /split\(\/\\r\?\\n\/\)/)
+    }
+    const searchHtml = await readFile(join(tmpDist, 'search/index.html'), 'utf8')
+    assert.match(searchHtml, /split\(\/\\s\+\//)
+  } finally {
+    await rm(tmpDist, { recursive: true, force: true })
+  }
+})
+
+test('modelSlug + scoreHit: slugs safe, titles outrank categories', () => {  assert.equal(modelSlug('Muse Spark 1.2'), 'muse-spark-1-2')
   assert.equal(modelSlug('DeepSeek V4 Pro 08/13'), 'deepseek-v4-pro-08-13')
   assert.equal(modelSlug(''), 'model')
   assert.ok(scoreHit('Muse Spark added', 'Model Catalog', 'major', '2026-09-13', ['muse']) > scoreHit('Other title', 'Model Catalog', 'major', '2026-09-13', ['muse']))
