@@ -420,6 +420,7 @@ nav.term-nav a.active{
   display:flex;
   flex-wrap:wrap;
   align-items:center;
+  justify-content:center;
   gap:6px;
   margin:14px 0 4px;
   padding:8px 10px;
@@ -444,7 +445,7 @@ nav.term-nav a.active{
 .chip-n{margin-left:5px;font-size:.68rem;color:var(--txt-subtle)}
 .chip-churn{border-style:dashed}
 .chip-churn.active{border-color:var(--term-amber);background:rgba(210,153,34,.1)}
-.filter-note{margin:0 0 10px;font-size:.8rem;color:var(--txt-subtle)}
+.filter-note{margin:0 0 10px;font-size:.8rem;color:var(--txt-subtle);text-align:center}
 .filter-note b{color:var(--txt-dim)}
 .filter-note em{font-style:normal;color:var(--term-amber)}
 .related{
