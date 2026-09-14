@@ -358,6 +358,14 @@ nav.term-nav a.active{
   color:var(--term-cyan);
   text-decoration:underline;
 }
+.entry.teaser .entry-summary{
+  padding:10px 14px;
+}
+.teaser-facts{
+  margin-top:4px;
+  font-size:.76rem;
+  color:var(--txt-dim);
+}
 
 .entry-body{
   padding:12px 16px 14px;

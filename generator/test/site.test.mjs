@@ -104,8 +104,9 @@ test('buildSite generates valid static site output', async () => {
 
     // Verify collapsible entries: latest commit is open by default, previous commit is collapsed
     assert.match(indexHtml, /<details class="entry major" id="bbbb11112222" open>/)
-    assert.match(indexHtml, /<details class="entry major" id="aaaa11112222">/)
-    assert.doesNotMatch(indexHtml, /<details class="entry major" id="aaaa11112222" open>/)
+    // Second (older) day collapses to teasers on the homepage
+    assert.match(indexHtml, /<details class="entry teaser major" id="aaaa11112222">/)
+    assert.doesNotMatch(indexHtml, /<details class="entry teaser major" id="aaaa11112222" open>/)
     assert.match(indexHtml, /class="entry-summary"/)
     assert.doesNotMatch(indexHtml, /class="badge ai"/)
     assert.doesNotMatch(indexHtml, /Summarized by/)
@@ -196,9 +197,10 @@ test('buildSite generates valid static site output', async () => {
     const favSvg = await readFile(join(tmpDist, 'favicon.svg'), 'utf8')
     assert.match(favSvg, /<svg /)
 
-    // Verify index.html has data-theme="dark" and favicon links
+    // Verify index.html has data-theme="dark" and single SVG favicon
     assert.match(indexHtml, /<html lang="en" data-theme="dark">/)
-    assert.match(indexHtml, /href="\/favicon\.ico"/)
+    assert.match(indexHtml, /href="\/favicon\.svg"/)
+    assert.doesNotMatch(indexHtml, /href="\/favicon\.ico"/)
 
     // Verify split feeds: main, models-only, releases-only with correct self links
     assert.match(feedXml, /<atom:link href="https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/feed\.xml" rel="self"/)
@@ -223,6 +225,8 @@ test('buildSite generates valid static site output', async () => {
     assert.match(headers, /\/favicon\.ico/)
     assert.match(headers, /\/feed\.xsl/)
     assert.match(headers, /Access-Control-Allow-Origin: \*/)
+    // Root path caches like index.html (HAR showed must-revalidate on /)
+    assert.match(headers, /^\/\n  Cache-Control: public, max-age=300/m)
 
     // Verify 404 contains noindex
     const notFoundHtml = await readFile(join(tmpDist, '404.html'), 'utf8')
@@ -270,6 +274,8 @@ test('buildSite generates valid static site output', async () => {
     const dayHtml2 = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
     assert.match(dayHtml2, /class="day-jump"/)
     assert.match(dayHtml2, /data-mode="split"/)
+    // Homepage teasers: older days collapse, first day stays full
+    assert.match(indexHtml, /class="entry teaser/)
     const archiveHtml = await readFile(join(tmpDist, 'archive/index.html'), 'utf8')
     assert.match(archiveHtml, /cat-collapse/)
     const sitemapModels = await readFile(join(tmpDist, 'sitemap-models.xml'), 'utf8')

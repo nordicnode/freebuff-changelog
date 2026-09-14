@@ -38,7 +38,6 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (major + notable)" href="${SITE.url}/feed.xml">
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (models only)" href="${SITE.url}/feed-models.xml">
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (releases only)" href="${SITE.url}/feed-releases.xml">
-<link rel="icon" type="image/x-icon" href="/favicon.ico">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>${CSS}</style></head><body><main>
 <header class="top">
@@ -384,10 +383,28 @@ function fileChips (e) {
   return chips.length ? `<div class="files">${chips.join('')}</div>` : ''
 }
 
-function entryCard (e, isExpanded = false) {
+function entryCard (e, isExpanded = false, mode = 'full') {
   const time = e.date.slice(11, 16)
   const anchor = e.sha.slice(0, 12)
   const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
+  if (mode === 'teaser') {
+    // Lightweight homepage row: title + facts only. No diff viewer, file
+    // chips, or swap embeds (full card lives on the day page).
+    const factLine = e.facts?.length ? `<div class="teaser-facts">${e.facts.length} key fact${e.facts.length === 1 ? '' : 's'} &middot; +${e.stats.additions} / −${e.stats.deletions}</div>` : ''
+    return `<details class="entry teaser ${e.significance}" id="${anchor}">
+<summary class="entry-summary">
+  <div class="entry-meta-top">
+    <span class="entry-arrow">&gt;</span>
+    <span class="commit-ref">commit <a href="/day/${e.day}/#${anchor}">${anchor}</a></span>
+    <span class="entry-utc">${esc(time)} UTC</span>
+    <div class="badges">${badges(e)}</div>
+    <a class="permalink" href="/day/${e.day}/#${anchor}" title="Permalink" aria-label="Permalink" onclick="event.stopPropagation()">#</a>
+  </div>
+  <h3 class="entry-title"><a href="/day/${e.day}/#${anchor}">${title}</a></h3>
+  ${factLine}
+</summary>
+</details>`
+  }
   // Diffs lazy-load in the browser on toggle (fetch /diffs/<sha>.diff),
   // so the server never holds diff text in memory or bloats pages with it.
   // Compare view renders the fetched diff side-by-side inline on demand.
@@ -511,7 +528,7 @@ export async function buildSite ({ changelog, openPrs, dist }) {
 </section>`
 
   let isFirstIndex = true
-  const daysHtml = idx.map(d =>
+  const daysHtml = idx.map((d, di) =>
     `<section class="day" id="${d.day}">
 <div class="day-line">
   <h2><time datetime="${d.day}">[ ${esc(fmtDateHuman(d.day))} ]</time></h2>
@@ -520,7 +537,9 @@ export async function buildSite ({ changelog, openPrs, dist }) {
 ${d.entries.map(e => {
   const open = isFirstIndex
   isFirstIndex = false
-  return entryCard(e, open)
+  // Homepage weight: full bodies only for the first day; older entries
+  // collapse to title + facts (full body lives on the day page).
+  return entryCard(e, open, di === 0 ? 'full' : 'teaser')
 }).join('\n')}</section>`).join('')
 
   await write(dist, 'index.html', layout({ title: 'Home', path: '/', body: hero + daysHtml +
@@ -1054,6 +1073,8 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
   Cache-Control: public, max-age=300
 /*.json
   Access-Control-Allow-Origin: *
+/
+  Cache-Control: public, max-age=300
 /index.html
   Cache-Control: public, max-age=300
 /search-index.json
