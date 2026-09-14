@@ -12,7 +12,7 @@ import { git, readJson, writeJson, writeText, log, ymd, pruneDiffs, pool, withLo
 import { capturePendingWrites, persistMerged } from './lib/mergedata.mjs'
 import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
-  extractCleanDiff, SYNC_SUBJECT, TEST_RE
+  extractCleanDiff, churnLabel, SYNC_SUBJECT, TEST_RE
 } from './lib/analyze.mjs'
 import { enrichWithLlm, llmConfigured } from './lib/llm.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
@@ -109,7 +109,27 @@ function decorate (e) {
     ([...e.files.added, ...e.files.removed, ...e.files.modified].length > 0 &&
      [...e.files.added, ...e.files.removed, ...e.files.modified].every(p => TEST_RE.test(p))))
   const lockOnly = e.files.meaningful === 0 && !testOnly
-  e.skip = lockOnly || (testOnly && !e.modelChanges && !e.version && !e.cmdChanges)
+  // Nothing is dropped any more. A commit that only moved bun.lock is still a
+  // commit the repository received, and 30% of recent upstream commits were
+  // vanishing from a site whose whole purpose is to list them. Churn is marked
+  // instead of skipped: dimmed in the timeline, absent from feeds, search and
+  // the LLM queue, and never counted as a "change" in the headline.
+  // Test-only commits are *not* churn: real work landed, so they get a row, a
+  // category and a summary like any other entry.
+  const churn = (lockOnly || e.files.total === 0) && !e.modelChanges && !e.version && !e.cmdChanges
+  if (churn) {
+    const label = churnLabel(e)
+    e.noise = true
+    e.churn = label.kind
+    e.title = label.title
+    e.summary = label.summary
+    e.category = 'Churn'
+    e.significance = 'noise'
+    e.day = ymd(e.date)
+    e.month = ymd(e.date).slice(0, 7)
+    return e
+  }
+  e.testOnly = testOnly || undefined
   if (e.modelChanges) e.category = 'Model Catalog'
   else if (e.cmdChanges) e.category = 'Commands'
   else if (e.areas.includes('CLI')) e.category = 'CLI'
@@ -176,14 +196,13 @@ async function generateOnce (argv) {
       e = await analyzeCommunityCommit(REPO_DIR, c, c.parents[0] || null, META)
     }
     decorate(e)
-    if (e.skip) { bySha.set(c.sha, { sha: c.sha, skip: true, date: e.date }); continue }
     bySha.set(c.sha, e)
     newlyAddedEntries.push(e)
     added++
     if (added % 200 === 0) log(`${added} entries so far (${c.sha.slice(0, 8)})`)
   }
 
-  let entries = [...bySha.values()].filter(e => !e.skip)
+  let entries = [...bySha.values()]
   entries.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.sha < b.sha ? -1 : 1))
 
   // Hourly sync behavior: only generate diffs & summarize NEWLY added entries this run.
@@ -206,11 +225,21 @@ async function generateOnce (argv) {
     counts: {
       commitsScanned: full || !isAncestor ? commits.length : (prevScanned || entries.length) + commits.length,
       entries: entries.length,
+      // Split for the same reason the rows are dimmed: "9,526 commits" and
+      // "7,382 changes" are different claims, and the hero must not blur them.
+      changes: entries.filter(e => !e.noise).length,
+      churn: entries.filter(e => e.noise).length,
       syncEra: entries.filter(e => e.kind === 'sync').length,
       community: entries.filter(e => e.kind === 'community').length
     },
     entries
   }
+  // Prune first, then reconcile flags with what is on disk -- both before the
+  // write. backfillDiffs sets hasDiff when it creates a file, pruneDiffs deletes
+  // files older than 90 days, and running prune after the write left 58 rows
+  // advertising a diff that no longer existed (404 behind "View inline diff").
+  await pruneDiffs(resolve(DATA, 'diffs'), entries)
+  refreshDiffFlags(entries, resolve(DATA, 'diffs'))
   // Merge into whatever is on disk rather than overwriting it: a backfill
   // cycle may have committed summaries for other entries since this run read
   // changelog.json, and headSha/counts must still move forward.
@@ -218,7 +247,6 @@ async function generateOnce (argv) {
     [`${DATA}/changelog.json`]: changelog,
     [`${DATA}/state.json`]: { lastSha: head, runs: (state.runs || 0) + 1, updatedAt: changelog.generatedAt }
   }))
-  await pruneDiffs(resolve(DATA, 'diffs'), entries)
 
   const prs = await fetchOpenPrs()
   await prunePrDiffs(prs || [])
@@ -250,7 +278,7 @@ export async function prunePrDiffs (openPrs) {
 async function backfillDiffs (entries, max = 1000) {
   const diffDir = resolve(DATA, 'diffs')
   await mkdir(diffDir, { recursive: true })
-  const syncs = entries.filter(e => e.kind === 'sync').reverse()
+  const syncs = entries.filter(e => e.kind === 'sync' && !e.noise).reverse()
   let count = 0
   for (const e of syncs) {
     const diffFile = resolve(diffDir, `${e.sha}.diff`)
@@ -269,6 +297,23 @@ async function backfillDiffs (entries, max = 1000) {
     }
   }
   if (count > 0) log(`generated ${count} diffs in data/diffs/`)
+}
+
+// One source of truth for the diff toggle: the file on disk. Entries that were
+// summarized before a prune, or that a merge re-imported without the flag, both
+// end up wrong if the flag is trusted instead of checked.
+export function refreshDiffFlags (entries, diffDir) {
+  let fixed = 0
+  for (const e of entries) {
+    if (e.kind !== 'sync' || e.noise) continue
+    const want = existsSync(resolve(diffDir, `${e.sha}.diff`))
+    if (!!e.hasDiff !== want) {
+      e.hasDiff = want || undefined
+      fixed++
+    }
+  }
+  if (fixed) log(`reconciled ${fixed} diff flags with data/diffs/ on disk`)
+  return fixed
 }
 
 async function listCommitsRange (repoDir, lastSha) {
@@ -434,7 +479,7 @@ async function catchUpOnce (argv) {
     })
   }
 
-  const syncEntries = entries.filter(e => e.kind === 'sync')
+  const syncEntries = entries.filter(e => e.kind === 'sync' && !e.noise)
   const { PROMPT_V: CATCHUP_PROMPT_V } = await import('./lib/llm.mjs')
   const isCurrent = (e) => e.ai?.title && (e.ai?.v ?? 1) >= CATCHUP_PROMPT_V
   const unsummarizedSync = syncEntries.filter(e => !isCurrent(e))
@@ -456,7 +501,7 @@ async function catchUpOnce (argv) {
       // This cycle's commits go first; the backlog can wait, the news cannot.
       priorityShas: new Set(freshShas.slice(-limit))
     })
-    const remaining = entries.filter(e => e.kind === 'sync' && !isCurrent(e)).length
+    const remaining = entries.filter(e => e.kind === 'sync' && !e.noise && !isCurrent(e)).length
     log(`[backfill] enriched ${n} entries with LLM (${remaining} remaining)`)
     didSummarize = remaining < unsummarizedSync.length
   } else {

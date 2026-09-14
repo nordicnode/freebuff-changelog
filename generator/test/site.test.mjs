@@ -69,8 +69,8 @@ test('buildSite generates valid static site output', async () => {
       headSha: '1111222233334444555566667777888899990000',
       counts: {
         commitsScanned: 10,
-        entries: 2,
-        syncEra: 1,
+        entries: 4,
+        syncEra: 3,
         community: 1
       },
       entries: [
@@ -111,6 +111,7 @@ test('buildSite generates valid static site output', async () => {
           facts: [],
           summary: 'CLI flag tweak.',
           title: 'CLI flag tweak',
+          hasDiff: true,
           category: 'CLI',
           significance: 'minor',
           day: '2026-09-13',
@@ -137,6 +138,30 @@ test('buildSite generates valid static site output', async () => {
           significance: 'major',
           day: '2026-09-13',
           month: '2026-09'
+        },
+        {
+          kind: 'sync',
+          sha: 'eeee111122223333444455556666777788889999',
+          url: 'https://github.com/CodebuffAI/freebuff/commit/eeee',
+          compareUrl: 'https://github.com/CodebuffAI/freebuff/compare/dddd...eeee',
+          date: '2026-09-13T12:00:00Z',
+          areas: ['Repo'],
+          modelChanges: null,
+          cmdChanges: null,
+          noise: true,
+          churn: 'lockfile',
+          files: { total: 1, meaningful: 0, rawMeaningful: 0, testOnly: false, added: [], removed: [], renamed: [], modified: ['bun.lock'] },
+          stats: { additions: 49, deletions: 55 },
+          facts: [],
+          summary: 'Only `bun.lock` changed (+49/-55): resolved dependency versions, no source edits.',
+          title: 'Dependency lockfile updated',
+          // Deliberately flagged: a churn row must not offer a diff even if an
+          // older pass left the flag on it, because it has no source diff.
+          hasDiff: true,
+          category: 'Churn',
+          significance: 'noise',
+          day: '2026-09-13',
+          month: '2026-09'
         }
       ]
     }
@@ -154,7 +179,7 @@ test('buildSite generates valid static site output', async () => {
     ]
 
     const res = await buildSite({ changelog: mockChangelog, openPrs: mockOpenPrs, dist: tmpDist })
-    assert.equal(res.entries, 3)
+    assert.equal(res.entries, 4)
     assert.equal(res.days, 2)
     assert.equal(res.releases, 1)
 
@@ -181,8 +206,9 @@ test('buildSite generates valid static site output', async () => {
 
     // Verify collapsible entries: latest commit is open by default, previous commit is collapsed
     assert.match(indexHtml, /<details class="entry major" id="bbbb11112222" open>/)
-    // Second (older) day renders expandable teaser rows with facts
-    assert.match(indexHtml, /<details class="entry teaser major" id="aaaa11112222">/)
+    // Older days render the same complete, open rows as the newest day: reading
+    // an entry must not need a click, let alone a second page.
+    assert.match(indexHtml, /<details class="entry major" id="aaaa11112222" open>/)
     assert.match(indexHtml, /class="entry-summary"/)
     assert.doesNotMatch(indexHtml, /class="badge ai"/)
     assert.doesNotMatch(indexHtml, /Summarized by/)
@@ -226,8 +252,26 @@ test('buildSite generates valid static site output', async () => {
     // Verify sync freshness badge and status API
     assert.match(indexHtml, /class="sync-age"/)
     assert.match(indexHtml, /data-generated="2026-09-13T12:00:00Z"/)
+    const feedText = await readFile(join(tmpDist, 'feed.xml'), 'utf8')
+    assert.doesNotMatch(feedText, /eeee11112222/, 'churn does not appear in RSS')
+    const jsonFeedText = await readFile(join(tmpDist, 'feed.json'), 'utf8')
+    assert.ok(!jsonFeedText.includes('eeee1111'), 'churn does not appear in the JSON feed')
+    const searchIdx2 = JSON.parse(await readFile(join(tmpDist, 'search-index.json'), 'utf8'))
+    assert.ok(!searchIdx2.ix.some(r => r[3] === 'eeee11112222'), 'churn is not searchable')
+    assert.ok(!searchIdx2.cats.includes('Churn'), 'churn is not a browsable category')
+    const entriesApi = JSON.parse(await readFile(join(tmpDist, 'api/entries.json'), 'utf8'))
+    assert.equal(entriesApi.total, 4)
+    assert.equal(entriesApi.changes, 3)
+    assert.equal(entriesApi.churn, 1)
+    assert.ok(!entriesApi.latest.some(e => e.noise), 'the latest list in the API stays signal-only')
+    const dayChurn = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
+    assert.match(dayChurn, /Dependency lockfile updated/, 'churn is still on the day page')
+    assert.match(dayChurn, /2 changes \+ 1 churn/)
+
     const statusApi = JSON.parse(await readFile(join(tmpDist, 'api/status.json'), 'utf8'))
-    assert.equal(statusApi.total, 3)
+    assert.equal(statusApi.total, 4)
+    assert.equal(statusApi.changes, 3)
+    assert.equal(statusApi.churn, 1)
     assert.equal(statusApi.openPrs, 1)
     assert.equal(statusApi.models.changes, 1)
     assert.match(await readFile(join(tmpDist, '_headers'), 'utf8'), /\/pr-diffs\/\*/)
@@ -379,9 +423,25 @@ test('buildSite generates valid static site output', async () => {
     const dayHtml2 = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
     assert.match(dayHtml2, /class="day-jump"/)
     assert.match(dayHtml2, /data-mode="split"/)
-    // Homepage teasers: older days expand to facts, first day stays full
-    assert.match(indexHtml, /<details class="entry teaser/)
-    assert.match(indexHtml, /open full entry/)
+    // Every index row is a full body: no teaser class, no hop to a day page.
+    assert.doesNotMatch(indexHtml, /class="entry teaser/)
+    assert.doesNotMatch(indexHtml, /open full entry/)
+    assert.ok((indexHtml.match(/<details class="entry [a-z]+(?: [a-z]+)*" id="[0-9a-f]{12}" open>/g) || []).length === 4,
+      'all index rows render expanded')
+    assert.ok(indexHtml.includes('class="files"'), 'file chips are on the index, not only on day pages')
+
+    // Churn is listed (complete timeline) but dimmed, unsummarized, and kept out
+    // of every "changes" surface.
+    assert.match(indexHtml, /<details class="entry noise" id="eeee11112222" open>/)
+    assert.match(indexHtml, /Dependency lockfile updated/)
+    assert.match(indexHtml, /\[Churn\]/)
+    assert.match(indexHtml, /<span class="day-churn">\+1 churn<\/span>/)
+    assert.match(indexHtml, /3 changes &middot; 1 churn/, 'hero counts changes and churn separately')
+    const churnStart = indexHtml.indexOf('id="eeee11112222"')
+    const churnNextRow = indexHtml.indexOf('<details class="entry ', churnStart + 30)
+    const churnRow = indexHtml.slice(churnStart, churnNextRow === -1 ? churnStart + 4000 : churnNextRow)
+    assert.match(churnRow, /bun\.lock/, 'churn row states which files changed')
+    assert.doesNotMatch(churnRow, /View inline diff/, 'churn rows carry no source diff')
     // Day pages carry related links + per-day OG image
     assert.match(dayHtml2, /RELATED:/)
     assert.match(dayHtml2, /og\/2026-09-13\.svg/)

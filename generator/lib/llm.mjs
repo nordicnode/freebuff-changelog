@@ -228,7 +228,11 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   // commands — then newest. Recency-only ordering buried a model swap behind
   // dozens of minors.
   const prio = (e) => (priority.has(e.sha) ? -1 : e.modelChanges ? 0 : e.version ? 1 : e.cmdChanges ? 2 : 3)
-  const syncEntries = entries.filter(e => e.kind === 'sync')
+  // Churn rows (lockfile/icon-only, merges) are listed for completeness but have
+  // no source diff to describe: sending them to the model would cost ~1,900 calls
+  // to be told "dependency versions changed", which deterministicSummary already
+  // says. They never enter the queue.
+  const syncEntries = entries.filter(e => e.kind === 'sync' && !e.noise)
   syncEntries.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
 
   // Fetch patches in parallel (git-bound, independent) before queueing.

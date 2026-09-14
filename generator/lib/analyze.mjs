@@ -356,6 +356,10 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
   const files = await diffNameStatus(repoDir, prevSha, commit.sha)
   const { additions, deletions } = await diffNumstat(repoDir, prevSha, commit.sha)
   const meaningful = files.filter(f => !isNoiseFile(f.path))
+  // What got filtered out has to be remembered: a row that reports "no source
+  // changes" must still be able to name the files it actually touched, or 1,788
+  // lockfile commits would be described as merges.
+  const churnedPaths = files.filter(f => isNoiseFile(f.path)).map(f => f.path)
   const sourceMeaningful = meaningful.filter(f => !TEST_RE.test(f.path))
   const testOnly = meaningful.length > 0 && sourceMeaningful.length === 0
   const areas = [...new Set(meaningful.map(f => areaOf(f.path)))].filter(a => a !== 'Repo')
@@ -417,6 +421,7 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
       meaningful: sourceMeaningful.length,
       rawMeaningful: meaningful.length,
       testOnly,
+      churned: churnedPaths.slice(0, 12),
       added: added.slice(0, 12),
       removed: removed.slice(0, 12),
       renamed: renamed.slice(0, 8).map(r => ({ from: r.from, to: r.path })),
@@ -533,6 +538,40 @@ export function deterministicSummary (e) {
   return bits.join(' ') || `${e.areas.join(', ')}: ${e.files.total} file(s) changed.`
 }
 
+// Commits that touch no source at all: dependency lockfiles, icon assets, or
+// merges with nothing against their first parent. They are *listed* (the site's
+// job is to mirror the repository, and 30% of recent commits were silently
+// missing) but marked, so they can be dimmed and kept out of feeds, search and
+// the LLM queue -- there is nothing for a model to describe.
+export function churnLabel (e) {
+  const f = e.files || {}
+  // `churned` carries the paths isNoiseFile() filtered out. Without it a
+  // lockfile commit and a merge look identical -- both have an empty *source*
+  // file list -- and 1,788 "bun.lock" rows were being published as "Merge
+  // commit", which is not merely ugly, it is false.
+  const paths = [...(f.added || []), ...(f.removed || []), ...(f.modified || []), ...(f.churned || [])]
+  const stats = `+${e.stats.additions}/−${e.stats.deletions}`
+  if (!paths.length) {
+    // A real merge has an empty diff; a row from data written before `churned`
+    // existed has files but no names. Only the first may be called a merge.
+    if (!f.total) {
+      return { kind: 'merge', title: 'Merge commit', summary: 'Merge into main with no changes against its first parent.' }
+    }
+    return { kind: 'other', title: 'Non-source files updated', summary: `Only non-source files changed (${f.total} file${f.total === 1 ? '' : 's'}, ${stats}).` }
+  }
+  const names = [...new Set(paths.map(p => p.split('/').pop()))]
+  const shown = names.slice(0, 3).map(p => '`' + p + '`').join(', ') + (names.length > 3 ? ` +${names.length - 3} more` : '')
+  const isLock = p => /(^|\/)(bun\.lockb?|package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/.test(p) || p === '.bun-version'
+  const isAsset = p => /\.svg$/.test(p) || /icons?\//.test(p)
+  if (paths.every(isLock)) {
+    return { kind: 'lockfile', title: 'Dependency lockfile updated', summary: `Only ${shown} changed (${stats}): resolved dependency versions, no source or model-catalog edits.` }
+  }
+  if (paths.every(isAsset)) {
+    return { kind: 'assets', title: 'Icon and image assets updated', summary: `Only image assets changed (${shown}, ${stats}): no source edits.` }
+  }
+  return { kind: 'other', title: 'Non-source files updated', summary: `No source files changed (${shown}, ${stats}).` }
+}
+
 function listPhrase (arr) {
   arr = arr.slice(0, 5)
   return arr.length === 1 ? arr[0] : arr.slice(0, -1).join(', ') + ' and ' + arr.at(-1)
@@ -575,6 +614,7 @@ export async function analyzeCommunityCommit (repoDir, commit, prevSha, repoMeta
   const sourceMeaningful = meaningful.filter(f => !TEST_RE.test(f.path))
   const testOnly = meaningful.length > 0 && sourceMeaningful.length === 0
   const areas = [...new Set(meaningful.map(f => areaOf(f.path)))].filter(a => a !== 'Repo')
+  const churnedPaths = files.filter(f => isNoiseFile(f.path)).map(f => f.path)
   const prMatch = /\(#(\d+)\)/.exec(commit.subject)
   const verMatch = /[Bb]ump (?:\w+ )*version(?: to)? (\d+\.\d+\.\d+)/.exec(commit.subject)
   const entry = {
@@ -595,6 +635,7 @@ export async function analyzeCommunityCommit (repoDir, commit, prevSha, repoMeta
       meaningful: sourceMeaningful.length,
       rawMeaningful: meaningful.length,
       testOnly,
+      churned: churnedPaths.slice(0, 12),
       added: sourceMeaningful.filter(f => f.status === 'added').map(f => f.path).slice(0, 12),
       removed: sourceMeaningful.filter(f => f.status === 'removed').map(f => f.path).slice(0, 12),
       renamed: [],

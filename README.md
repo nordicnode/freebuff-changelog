@@ -53,6 +53,20 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
 * Incremental + idempotent: state tracks the last analyzed SHA; rewritten
   upstream history triggers a safe full rescan; AI summaries are keyed by
   SHA+patch-hash so each commit is summarized at most once, ever.
+* **Every commit is listed.** Nothing is dropped: a `bun.lock`-only sync is a
+  commit the repository received, and 1,877 of them (30% of recent history) used
+  to be invisible, which made the site look behind upstream. Churn rows carry
+  `noise: true` + `churn: 'lockfile' | 'assets' | 'merge'` and the names of the
+  files that were filtered out of the source diff, so they can state what
+  actually changed. They are dimmed in the timeline and excluded from feeds,
+  search, stats, the "changes" counts and the LLM queue — there is nothing for a
+  model to describe. Test-only commits are *not* churn: real work landed, so
+  they get a row, a category and a summary like any other entry.
+* An entry is complete where it is listed: index rows render the same full body
+  as day pages (files, facts, meta links), so reading one never needs a second
+  page. The inline diff toggle appears only when `data/diffs/<sha>.diff` is
+  actually published — `pruneDiffs` drops files after 90 days, and a toggle that
+  fetches a 404 is worse than the GitHub compare link beside it.
 
 ## Freshness path (an upstream commit → a reader seeing it)
 

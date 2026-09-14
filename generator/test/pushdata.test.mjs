@@ -13,7 +13,7 @@ import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { commitAndPushData } from '../cli.mjs'
+import { commitAndPushData, refreshDiffFlags } from '../cli.mjs'
 import { mergeChangelog } from '../lib/mergedata.mjs'
 
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
@@ -113,4 +113,24 @@ test('mergeChangelog alone still agrees with what the race converges to', () => 
   assert.equal(merged.headSha, 'h2')
   assert.equal(merged.entries.length, 3)
   assert.equal(merged.entries[0].ai.title, 'A')
+})
+
+// "View inline diff" must reflect data/diffs/ on disk. pruneDiffs deletes files
+// after 90 days while the row keeps hasDiff: true -- 58 rows did that, each
+// toggle fetching a 404 -- and a merged-in row can have a file with no flag, so
+// a readable diff nobody can open.
+test('refreshDiffFlags reconciles hasDiff with the files actually on disk', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-diffflags-'))
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
+  await writeFile(join(dir, 'b'.repeat(40) + '.diff'), 'diff --git a/x b/x\n')
+  const pruned = { kind: 'sync', sha: 'a'.repeat(40), hasDiff: true }
+  const onDisk = { kind: 'sync', sha: 'b'.repeat(40) }
+  const churn = { kind: 'sync', sha: 'c'.repeat(40), noise: true, hasDiff: true }
+  const community = { kind: 'community', sha: 'd'.repeat(40) }
+  const fixed = refreshDiffFlags([pruned, onDisk, churn, community], dir)
+  assert.equal(pruned.hasDiff, undefined, 'a pruned file must not advertise a diff')
+  assert.equal(onDisk.hasDiff, true, 'a published diff gets its toggle back')
+  assert.equal(churn.hasDiff, true, 'churn rows are not touched (they carry no source diff)')
+  assert.equal(community.hasDiff, undefined, 'community rows never had inline diffs')
+  assert.equal(fixed, 2)
 })

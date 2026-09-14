@@ -443,40 +443,21 @@ function relatedLine (e, relatedIdx) {
   return `<div class="related">RELATED: ${rel.map(r => `<a href="/day/${r.day}/#${r.sha.slice(0, 12)}">${esc((r.ai?.title || r.title || '').slice(0, 60))}</a>`).join(' · ')}</div>`
 }
 
-function entryCard (e, isExpanded = false, mode = 'full', relatedIdx = null) {
+function entryCard (e, isExpanded = false, relatedIdx = null) {
   const time = e.date.slice(11, 16)
   const anchor = e.sha.slice(0, 12)
   const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
-  if (mode === 'teaser') {
-    // Homepage row: summary + facts expand inline (the whole point of the
-    // toggle). Heavy pieces (diff viewer, file chips, related) stay on the
-    // day page; everything here is already in memory, no extra weight.
-    const teaserSummary = `<div class="summary">${miniMd(e.ai?.summary || e.summary)}</div>`
-    const factBody = e.facts?.length ? `<ul class="facts">${e.facts.slice(0, 3).map(f => `<li>${miniMd(f)}</li>`).join('')}</ul>` : ''
-    return `<details class="entry teaser ${e.significance}" id="${anchor}">
-<summary class="entry-summary">
-  <div class="entry-meta-top">
-    <span class="entry-arrow">&gt;</span>
-    <span class="commit-ref">commit <a href="/day/${e.day}/#${anchor}" onclick="event.stopPropagation()">${anchor}</a></span>
-    <span class="entry-utc">${esc(time)} UTC</span>
-    <div class="badges">${badges(e)}</div>
-    <a class="permalink" href="/day/${e.day}/#${anchor}" title="Permalink" aria-label="Permalink" onclick="event.stopPropagation()">#</a>
-  </div>
-  <h3 class="entry-title">${title}</h3>
-</summary>
-<div class="entry-body">
-  ${modelDiffLine(e)}
-  ${teaserSummary}
-  ${factBody}
-  <div class="metarow"><span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i></span><a class="meta-link" href="/day/${e.day}/#${anchor}">open full entry &rarr;</a></div>
-</div>
-</details>`
-  }
+  // One renderer for every surface: a row on the index is the whole entry, so
+  // there is no "open full entry" hop to a day page to read what already fits
+  // here. File chips, facts and meta links are in memory either way.
   // Diffs lazy-load in the browser on toggle (fetch /diffs/<sha>.diff),
   // so the server never holds diff text in memory or bloats pages with it.
   // Compare view renders the fetched diff side-by-side inline on demand.
   let diffViewer = ''
-  if (e.kind === 'sync') {
+  // Only when the diff file is actually published: prunes remove files after
+  // 90 days, and a toggle that fetches a 404 is worse than the GitHub compare
+  // link in the meta row (which the viewer's data-gh fallback also points at).
+  if (e.kind === 'sync' && !e.noise && e.hasDiff) {
     diffViewer = `<details class="diff-viewer" data-sha="${e.sha}" data-gh="${esc(e.compareUrl || e.url || '')}">
 <summary class="diff-toggle">
   <span class="diff-toggle-left">
@@ -489,7 +470,7 @@ function entryCard (e, isExpanded = false, mode = 'full', relatedIdx = null) {
 <div class="diff-body"><span class="diff-loading">Loading diff…</span></div>
 </details>`
   }
-  return `<details class="entry ${e.significance}" id="${anchor}"${isExpanded ? ' open' : ''}>
+  return `<details class="entry ${e.significance}" id="${anchor}"${(isExpanded || e.noise) ? ' open' : ''}>
 <summary class="entry-summary">
   <div class="entry-meta-top">
     <span class="entry-arrow">&gt;</span>
@@ -570,28 +551,38 @@ async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, ''
 export async function buildSite ({ changelog, openPrs, dist }) {
   const entries = [...changelog.entries].reverse() // newest first
   const byDay = groupByDay(entries)
-  const relatedIdx = buildRelatedIndex(entries)
+  // "Related" is a reading aid for real changes: churn rows must neither appear
+  // in it nor link out of it.
+  const relatedIdx = buildRelatedIndex(entries.filter(e => !e.noise))
   const modelEntries = entries.filter(e => e.modelChanges)
   const releases = entries.filter(e => e.version)
   const first = entries.at(-1), last = entries[0]
   const generated = changelog.generatedAt
   const scannedCount = changelog.counts?.commitsScanned || entries.length
+  // Two different claims: commits received vs changes worth reading. Churn rows
+  // are listed so nothing is hidden, but they must not inflate the headline.
+  const meaningful = entries.filter(e => !e.noise)
+  const churnCount = entries.length - meaningful.length
+  const churnNote = churnCount ? ` &middot; ${churnCount.toLocaleString()} churn` : ''
   // How long the data is allowed to sit before the sync loop re-analyzes. The
   // countdown below has to be stated in these terms: it used to tick to the top
   // of the next hour, describing a schedule that no longer owns freshness.
   const syncBudgetMin = Math.round(syncStaleMs() / 60000)
 
   // ----- index: newest days worth of entries
+  // Budget is spent on real changes: with ~30% of recent commits being lockfile
+  // churn, counting rows would have pushed three weeks of actual work off the
+  // front page. Churn rows still render, inside the same day sections.
   const NEW_WINDOW = 90
   const idx = []
   let n = 0
-  for (const d of byDay) { if (n >= NEW_WINDOW) break; idx.push(d); n += d.entries.length }
+  for (const d of byDay) { if (n >= NEW_WINDOW) break; idx.push(d); n += d.entries.filter(e => !e.noise).length }
   const hero = `
 <section class="hero">
   <div class="term-box term-box-slim">
     <div class="term-box-hdr">
       <span class="term-box-title">LATEST :: ${esc(first.day)} &rarr; ${esc(last.day)}</span>
-      <span>${entries.length.toLocaleString()} changes &middot; ${releases.length} releases</span>
+      <span>${meaningful.length.toLocaleString()} changes${churnNote} &middot; ${releases.length} releases</span>
     </div>
     <div class="term-footer-bar">
       <span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}">${esc(fmtDateHuman(generated))} UTC</span></span>
@@ -600,26 +591,22 @@ export async function buildSite ({ changelog, openPrs, dist }) {
   </div>
 </section>`
 
-  let isFirstIndex = true
-  const daysHtml = idx.map((d, di) =>
-    `<section class="day" id="${d.day}">
+  const daysHtml = idx.map(d => {
+  const m = d.entries.filter(e => !e.noise).length
+  const ch = d.entries.length - m
+  return `<section class="day" id="${d.day}">
 <div class="day-line">
   <h2><time datetime="${d.day}">[ ${esc(fmtDateHuman(d.day))} ]</time></h2>
-  <span class="day-count">${d.entries.length} change${d.entries.length === 1 ? '' : 's'}</span>
+  <span class="day-count">${m} change${m === 1 ? '' : 's'}${ch ? ` <span class="day-churn">+${ch} churn</span>` : ''}</span>
 </div>
-${d.entries.map(e => {
-  const open = isFirstIndex
-  isFirstIndex = false
-  // Homepage weight: full bodies only for the first day; older entries
-  // collapse to title + facts (full body lives on the day page).
-  return entryCard(e, open, di === 0 ? 'full' : 'teaser', relatedIdx)
-}).join('\n')}</section>`).join('')
+${d.entries.map(e => entryCard(e, true, relatedIdx)).join('\n')}</section>`
+}).join('')
 
   await write(dist, 'index.html', layout({ title: 'Home', path: '/', body: hero + daysHtml +
     `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>` }))
 
   // ----- per-day pages (independent writes: bounded parallel pool)
-  const dayOptions = byDay.map(d => `<option value="/day/${d.day}/">${esc(fmtDateHuman(d.day))} (${d.entries.length})</option>`).join('')
+  const dayOptions = byDay.map(d => `<option value="/day/${d.day}/">${esc(fmtDateHuman(d.day))} (${d.entries.filter(e => !e.noise).length})</option>`).join('')
   const dayJump = (current) => `<form class="day-jump" action="/day/${current}/" method="get" onsubmit="location.href=this.d.value;return false"><label>JUMP:<select name="d" onchange="if(this.value)location.href=this.value"><option value="">--pick a date--</option>${dayOptions}</select></label></form>`
   const dayTasks = byDay.map((d, i) => async () => {
     const prevDay = i < byDay.length - 1 ? byDay[i + 1] : null
@@ -631,16 +618,16 @@ ${d.entries.map(e => {
       `</div>`
     await write(dist, `day/${d.day}/index.html`, layout({
       title: fmtDateHuman(d.day), path: `/day/${d.day}/`,
-      desc: `${d.entries.length} Freebuff changes on ${d.day}`,
+      desc: `${d.entries.filter(e => !e.noise).length} Freebuff changes on ${d.day}`,
       ogImage: `/og/${d.day}.svg`,
-      body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">DAILY_LOG :: ${esc(d.day)}</span><span>${d.entries.length} entries</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Reconstructed public snapshot commits pushed to CodebuffAI/freebuff on this date.</p></div></section>` +
+      body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">DAILY_LOG :: ${esc(d.day)}</span><span>${d.entries.filter(e => !e.noise).length} changes${d.entries.some(e => e.noise) ? ` + ${d.entries.filter(e => e.noise).length} churn` : ''}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Reconstructed public snapshot commits pushed to CodebuffAI/freebuff on this date.</p></div></section>` +
         dayPager +
-        `<section class="day">${d.entries.map((e, entryIdx) => entryCard(e, entryIdx === 0, 'full', relatedIdx)).join('\n')}</section>` +
+        `<section class="day">${d.entries.map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx)).join('\n')}</section>` +
         dayPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/">&larr; [latest]</a> &middot; <a href="/archive/">[archive]</a></p>`
     }))
     const ogTitles = d.entries.slice(0, 3).map(e => e.ai?.title || e.title || '')
-    await write(dist, `og/${d.day}.svg`, ogCardSvg(fmtDateHuman(d.day), ogTitles, `${d.entries.length} changes`))
+    await write(dist, `og/${d.day}.svg`, ogCardSvg(fmtDateHuman(d.day), ogTitles, `${d.entries.filter(e => !e.noise).length} changes`))
   })
   await pool(dayTasks, 16)
 
@@ -666,7 +653,7 @@ ${d.entries.map(e => {
       desc: `Freebuff v${rel.version}: ${mine.length} changes since the previous release.`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(rel.version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Freebuff v${esc(rel.version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p></div></section>` +
         relPager +
-        `<section class="day">${[rel, ...mine].map((e, entryIdx) => entryCard(e, entryIdx === 0, 'full', relatedIdx)).join('\n')}</section>` +
+        `<section class="day">${[rel, ...mine].map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx)).join('\n')}</section>` +
         relPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/archive/#releases">&larr; [all releases]</a> &middot; <a href="/">[latest]</a></p>`
     }))
@@ -750,7 +737,7 @@ ${d.entries.map(e => {
 
   // ----- archive (all days + releases + categories)
   const cats = new Map()
-  for (const e of entries) cats.set(e.category, (cats.get(e.category) || 0) + 1)
+  for (const e of entries) if (!e.noise) cats.set(e.category, (cats.get(e.category) || 0) + 1)
   const catTiles = [...cats.entries()].sort((a, b) => b[1] - a[1]).map(([c, k]) =>
     `<a class="tile" href="/search/?q=${encodeURIComponent(c)}"><b>${esc(c)}</b><span>${k.toLocaleString()} changes</span></a>`).join('')
   
@@ -809,21 +796,23 @@ ${yearSections}`
   }
   const statCats = [...cats.entries()].sort((a, b) => b[1] - a[1])
   const catMax = statCats[0]?.[1] || 1
-  // Per-category monthly history for trend sparklines.
+  // Per-category monthly history for trend sparklines. Churn rows are excluded
+  // from every stat here: "which area moves" would be answered by bun.lock, and
+  // 1,880 lockfile commits added to a monthly bar measures nothing.
   const catMonths = new Map()
-  for (const e of entries) {
+  for (const e of meaningful) {
     const m = (e.day || '').slice(0, 7)
     if (!catMonths.has(e.category)) catMonths.set(e.category, new Map())
     const cm = catMonths.get(e.category)
     cm.set(m, (cm.get(m) || 0) + 1)
   }
-  const allMonths = [...new Set(entries.map(e => (e.day || '').slice(0, 7)))].sort().slice(-12)
+  const allMonths = [...new Set(meaningful.map(e => (e.day || '').slice(0, 7)))].sort().slice(-12)
   const catSpark = (c) => {
     const cm = catMonths.get(c) || new Map()
     return spark(allMonths.map(m => cm.get(m) || 0), 120, 22)
   }
   const churnByArea = new Map()
-  for (const e of entries) {
+  for (const e of meaningful) {
     const a = (e.areas || [])[0] || 'Repo'
     const c = churnByArea.get(a) || { add: 0, del: 0 }
     c.add += e.stats?.additions || 0
@@ -835,7 +824,7 @@ ${yearSections}`
   const byMonth = new Map()
   for (const d of byDay) {
     const m = d.day.slice(0, 7)
-    byMonth.set(m, (byMonth.get(m) || 0) + d.entries.length)
+    byMonth.set(m, (byMonth.get(m) || 0) + d.entries.filter(e => !e.noise).length)
   }
   const monthRows = [...byMonth.entries()].sort().slice(-12)
   const monthMax = Math.max(1, ...monthRows.map(([, n]) => n))
@@ -852,7 +841,7 @@ ${yearSections}`
   await write(dist, 'stats/index.html', layout({
     title: 'Stats', path: '/stats/',
     desc: `Freebuff changelog stats: ${entries.length} changes across ${byDay.length} days, ${vers.length} releases, ${modelEntries.length} model changes.`,
-    body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">TELEMETRY :: changelog stats</span><span>${entries.length.toLocaleString()} changes &middot; ${byDay.length} days</span></div>`
+    body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">TELEMETRY :: changelog stats</span><span>${meaningful.length.toLocaleString()} changes${churnNote} &middot; ${byDay.length} days</span></div>`
       + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Where the work lands, how fast it ships, and which models churn. Recomputed on every sync.</p></div></section>`
       + `<div class="stat-grid">`
       + `<div class="stat-card"><h3>CHANGES BY CATEGORY (12-MO TREND)</h3>${statCats.map(([c, n]) => bar(c, n, catMax, `/search/?cat=${encodeURIComponent(c)}`, catSpark(c))).join('')}</div>`
@@ -864,9 +853,9 @@ ${yearSections}`
 
   // ----- search (compact index: field codes + category/sig codebooks)
   // c/s/a as small ints keep the 7k-entry payload lean for Workers egress.
-  const SEARCH_CATS = [...new Set(entries.map(e => e.category))].sort()
+  const SEARCH_CATS = [...new Set(entries.filter(e => !e.noise).map(e => e.category))].sort()
   const SEARCH_SIGS = ['minor', 'notable', 'major']
-  const idxJson = entries.map(e => ([
+  const idxJson = entries.filter(e => !e.noise).map(e => ([
     e.day,
     (e.ai?.title || e.title || deriveTitleSafe(e)).slice(0, 90),
     SEARCH_CATS.indexOf(e.category),
@@ -1119,13 +1108,13 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
 
   // ----- feeds: main (major+notable), models-only, releases-only
   const titleOf = (e) => e.ai?.title || e.title || deriveTitleSafe(e)
-  const mainItems = entries.filter(e => e.significance !== 'minor').slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
+  const mainItems = entries.filter(e => !e.noise && e.significance !== 'minor').slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
   const modelItems = modelEntries.slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
   const releaseItems = [...vers].reverse().slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
   await write(dist, 'feed.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed.xml', `${SITE.name} (unofficial)`, SITE.desc, mainItems))
   await write(dist, 'feed-models.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-models.xml', `${SITE.name}: models (unofficial)`, 'Model catalog additions, retirements, and swaps in the Freebuff free picker.', modelItems))
   await write(dist, 'feed-releases.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-releases.xml', `${SITE.name}: releases (unofficial)`, 'Freebuff CLI and core package version bumps.', releaseItems))
-  const mainJsonItems = entries.filter(e => e.significance !== 'minor').slice(0, 60).map(e => jsonItem(SITE.url, e, titleOf))
+  const mainJsonItems = entries.filter(e => !e.noise && e.significance !== 'minor').slice(0, 60).map(e => jsonItem(SITE.url, e, titleOf))
   await write(dist, 'feed.json', feedJson(SITE.url, generated, `${SITE.name} (unofficial)`, SITE.desc, 'feed.json', mainJsonItems))
   await write(dist, 'feed.xsl', FEED_XSL)
   await writeBinary(`${dist.replace(/\/$/, '')}/favicon.ico`, generateFaviconIco())
@@ -1146,11 +1135,13 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
     ]
   }))
 
-  await write(dist, 'api/entries.json', JSON.stringify({ generatedAt: generated, head: changelog.headSha, total: entries.length, latest: entries.slice(0, 60) }))
+  await write(dist, 'api/entries.json', JSON.stringify({ generatedAt: generated, head: changelog.headSha, total: entries.length, changes: meaningful.length, churn: churnCount, latest: meaningful.slice(0, 60) }))
   await write(dist, 'api/status.json', JSON.stringify({
     generatedAt: generated,
     headSha: changelog.headSha,
     total: entries.length,
+    changes: meaningful.length,
+    churn: churnCount,
     days: byDay.length,
     releases: vers.length,
     models: { changes: modelEntries.length, live: modelLive.length },

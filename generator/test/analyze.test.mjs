@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import {
   extractModelTableChanges, extractVersionBump, extractSlashCommandChanges,
   commandIdsFromRegistry,
-  areaOf, isNoiseFile, deterministicSummary, entryTitle, sourceRef, isSyncCommit,
+  areaOf, isNoiseFile, deterministicSummary, entryTitle, churnLabel, sourceRef, isSyncCommit,
   extractCommentFacts, extractCleanDiff, parseMarkdownTables, catalogFromReadme,
   diffCatalogs
 } from '../lib/analyze.mjs'
@@ -239,6 +239,41 @@ test('commandIdsFromRegistry: description-only edit yields identical sets', () =
   const a = "  id: 'help',\n  description: 'old text',"
   const b = "  id: 'help',\n  description: 'new text',"
   assert.deepEqual([...commandIdsFromRegistry(a)], [...commandIdsFromRegistry(b)])
+})
+
+// Churn rows are listed rather than dropped, so their description has to be
+// true. Before files.churned was captured, the *source* file list was empty for
+// these commits and 1,788 lockfile syncs were published as "Merge commit".
+test('churnLabel: names the filtered files; only a truly empty diff is a merge', () => {
+  const lock = churnLabel({
+    files: { total: 1, meaningful: 0, added: [], removed: [], modified: [], churned: ['bun.lock'] },
+    stats: { additions: 49, deletions: 55 }
+  })
+  assert.equal(lock.kind, 'lockfile')
+  assert.equal(lock.title, 'Dependency lockfile updated')
+  assert.match(lock.summary, /`bun\.lock`/)
+  assert.doesNotMatch(lock.summary, /merge/i)
+
+  const assets = churnLabel({
+    files: { total: 2, meaningful: 0, churned: ['snapcraft/icons/app.svg', 'cli/assets/logo.svg'] },
+    stats: { additions: 1, deletions: 1 }
+  })
+  assert.equal(assets.kind, 'assets')
+
+  const mixed = churnLabel({
+    files: { total: 2, meaningful: 0, churned: ['bun.lock', 'snapcraft/icons/app.svg'] },
+    stats: { additions: 3, deletions: 1 }
+  })
+  assert.equal(mixed.kind, 'other')
+
+  const merge = churnLabel({ files: { total: 0, meaningful: 0, churned: [] }, stats: { additions: 0, deletions: 0 } })
+  assert.equal(merge.kind, 'merge')
+
+  // Rows written before churn paths existed: files counted, names unknown. They
+  // must not be invented into merges either.
+  const legacy = churnLabel({ files: { total: 1, meaningful: 0 }, stats: { additions: 2, deletions: 1 } })
+  assert.equal(legacy.kind, 'other')
+  assert.doesNotMatch(legacy.summary, /merge/i)
 })
 
 

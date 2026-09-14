@@ -358,19 +358,37 @@ nav.term-nav a.active{
   color:var(--term-cyan);
   text-decoration:underline;
 }
-.entry.teaser .entry-summary{
-  padding:10px 14px;
+/* Churn rows (lockfile/icon-only commits, merges) are listed so the timeline is
+   complete, but they must not compete with real changes for attention. */
+.entry.noise{
+  opacity:.52;
+  margin:4px 0;
+  background:transparent;
 }
-.entry.teaser .entry-meta-top{
-  margin-bottom:2px;
+.entry.noise:hover{
+  opacity:.92;
 }
-.entry.teaser .entry-title{
-  font-size:.95rem;
+.entry.noise .entry-summary{
+  padding:8px 14px;
 }
-.teaser-facts{
-  margin-top:4px;
+.entry.noise .entry-title{
+  font-size:.86rem;
+  font-weight:400;
+  color:var(--txt-dim);
+}
+.entry.noise .entry-body{
+  padding:2px 16px 9px;
+  border-top:none;
+}
+.entry.noise .summary{
   font-size:.76rem;
   color:var(--txt-dim);
+}
+.day-churn{
+  color:var(--txt-dim);
+  font-size:.72rem;
+  font-weight:400;
+  margin-left:6px;
 }
 .related{
   margin-top:8px;
