@@ -178,9 +178,9 @@ export function validateLlmOut (out, fallbackSig = 'minor') {
   return { title, summary, significance }
 }
 
-function isTransientError (err) {
+export function isTransientError (err) {
   const msg = String(err?.message || err || '')
-  return /fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|502|503|504|timeout/i.test(msg)
+  return /fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|50[234]|52[0-4]|timeout/i.test(msg)
 }
 
 export async function enrichWithLlm (entries, getPatch, dataDir, env = process.env, options = {}) {

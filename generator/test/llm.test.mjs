@@ -1,7 +1,16 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, buildPrompt, enrichWithLlm, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, PROMPT_V } from '../lib/llm.mjs'
+import { parseLlmJson, buildPrompt, enrichWithLlm, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, PROMPT_V } from '../lib/llm.mjs'
+
+test('isTransientError: 5xx gateway family, network faults transient', () => {
+  for (const code of [502, 503, 504, 520, 521, 522, 523, 524]) {
+    assert.ok(isTransientError(new Error(`LLM HTTP ${code}: <html>`)), `HTTP ${code} transient`)
+  }
+  assert.ok(isTransientError(new Error('fetch failed')))
+  assert.ok(!isTransientError(new Error('LLM HTTP 400: bad request')))
+  assert.ok(!isTransientError(new Error('LLM HTTP 429: too many')))
+})
 
 test('parseLlmJson: parses standard JSON object', () => {
   const json = '{"title": "New feature", "summary": "Added cool stuff", "significance": "major"}'
