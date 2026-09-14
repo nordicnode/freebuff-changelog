@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildSite } from '../lib/site.mjs'
+import { buildSite, modelTimeline } from '../lib/site.mjs'
 
 test('buildSite generates valid static site output', async () => {
   const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-test-dist-'))
@@ -180,7 +180,29 @@ test('buildSite generates valid static site output', async () => {
     assert.match(aboutHtml, /WHAT WE TRACK/)
     assert.match(aboutHtml, /Qwen 3\.8 Flash/)
     assert.match(aboutHtml, /Subsystems &amp; Areas:/)
+
+    // Verify models page: lineup, retired, history rows, nav
+    const modelsHtml = await readFile(join(tmpDist, 'models/index.html'), 'utf8')
+    assert.match(modelsHtml, /MODEL_LINEUP/)
+    assert.match(modelsHtml, /Muse Spark 1\.3/)
+    assert.match(modelsHtml, /Muse Spark 1\.2/)
+    assert.match(modelsHtml, /CATALOG HISTORY \(1 CHANGES\)/)
+    assert.match(modelsHtml, /\/day\/2026-09-13\/#bbbb11112222/)
+    assert.match(modelsHtml, /\/models\//)
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }
+})
+
+test('modelTimeline: replays adds/removes oldest-first', () => {
+  const mk = (sha, date, added, removed) => ({ sha, date, day: date.slice(0, 10), modelChanges: { added, removed } })
+  const entries = [
+    mk('c', '2026-09-13T10:00:00Z', ['Muse Spark 1.2'], ['Muse Spark 1.3']),
+    mk('a', '2026-09-11T10:00:00Z', ['Muse Spark 1.3'], []),
+    mk('b', '2026-09-12T10:00:00Z', ['Ox Alpha'], [])
+  ]
+  const { chrono, live, retired } = modelTimeline(entries)
+  assert.deepEqual(chrono.map(e => e.sha), ['c', 'b', 'a'])
+  assert.deepEqual(live, ['Muse Spark 1.2', 'Ox Alpha'])
+  assert.deepEqual(retired, ['Muse Spark 1.3'])
 })

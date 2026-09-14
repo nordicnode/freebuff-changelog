@@ -659,6 +659,47 @@ nav.term-nav a.active{
   color:var(--term-cyan);
 }
 
+.model-lineup{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  font-size:.84rem;
+}
+.model-history{
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}
+.model-row{
+  display:flex;
+  align-items:baseline;
+  gap:10px;
+  flex-wrap:wrap;
+  background:var(--panel);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  padding:8px 12px;
+  font-size:.84rem;
+}
+.model-row-date{
+  white-space:nowrap;
+  font-size:.76rem;
+}
+.model-row-date a{
+  color:var(--term-cyan);
+  text-decoration:none;
+}
+.model-row-change{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  flex-wrap:wrap;
+}
+.model-row-title{
+  color:var(--txt-subtle);
+  font-size:.78rem;
+}
+
 .search-input-row{
   display:flex;
   align-items:center;
@@ -964,6 +1005,7 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
   </div>
   <nav class="term-nav">
     <a href="/about/" class="${path === '/about/' ? 'active' : ''}">/about</a>
+    <a href="/models/" class="${path.startsWith('/models/') ? 'active' : ''}">/models</a>
     <a href="/archive/" class="${path.startsWith('/archive/') ? 'active' : ''}">/archive</a>
     <a href="/search/" class="${path.startsWith('/search/') ? 'active' : ''}">/search</a>
     <a href="/in-flight/" class="${path.startsWith('/in-flight/') ? 'active' : ''}">/in-flight</a>
@@ -1236,6 +1278,17 @@ function groupByDay (entries) {
     cur.entries.push(e)
   }
   return out
+}
+
+// Replay model catalog changes oldest-first: current lineup vs retired.
+export function modelTimeline (modelEntries) {
+  const chrono = [...modelEntries].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.sha < b.sha ? -1 : 1))
+  const live = new Set(), retired = new Set()
+  for (const e of chrono) {
+    for (const a of (e.modelChanges?.added || [])) { live.add(a); retired.delete(a) }
+    for (const r of (e.modelChanges?.removed || [])) { live.delete(r); retired.add(r) }
+  }
+  return { chrono: chrono.reverse(), live: [...live].sort(), retired: [...retired].sort() }
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,6 +1566,42 @@ ${d.entries.map(e => {
     }))
   }
 
+  // ----- models timeline (catalog history: current lineup, retired, per-change rows)
+  const { chrono: modelChrono, live: modelLive, retired: modelRetired } = modelTimeline(modelEntries)
+  const modelRows = modelChrono.map(e => {
+    const { added = [], removed = [] } = e.modelChanges || {}
+    const addHtml = added.map(m => `<span class="modelplus">+${esc(m)}</span>`).join(' ')
+    const remHtml = removed.map(m => `<span class="modelminus">−${esc(m)}</span>`).join(' ')
+    const swap = added.length && removed.length
+      ? `${addHtml} <span class="swap-arrow">-&gt;</span> ${remHtml}`
+      : [addHtml, remHtml].filter(Boolean).join(' ')
+    return `<div class="model-row">
+  <span class="model-row-date"><a href="/day/${e.day}/#${e.sha.slice(0, 12)}">${esc(e.day)}</a></span>
+  <span class="model-row-change">${swap}</span>
+  <span class="model-row-title">${esc(e.ai?.title || e.title || '')}</span>
+</div>`
+  }).join('')
+  await write(dist, 'models/index.html', layout({
+    title: 'Models', path: '/models/',
+    desc: `Free model catalog history: ${modelLive.length} live, ${modelRetired.length} retired across ${modelChrono.length} changes.`,
+    body: `<section class="hero">
+  <div class="term-box">
+    <div class="term-box-hdr">
+      <span class="term-box-title">MODEL_LINEUP :: free picker catalog</span>
+      <span>${modelLive.length} live &middot; ${modelRetired.length} retired</span>
+    </div>
+    <div style="font-size:.76rem;color:var(--txt-subtle);margin-bottom:6px">LIVE:</div>
+    <div class="model-lineup">${modelLive.map(m => `<span class="modelplus">${esc(m)}</span>`).join(' ')}</div>
+    ${modelRetired.length ? `<div style="font-size:.76rem;color:var(--txt-subtle);margin:10px 0 6px">RETIRED:</div>
+    <div class="model-lineup">${modelRetired.map(m => `<span class="modelminus">${esc(m)}</span>`).join(' ')}</div>` : ''}
+  </div>
+</section>
+<div class="section-hdr">
+  <h2>== CATALOG HISTORY (${modelChrono.length} CHANGES) ==</h2>
+</div>
+<div class="model-history">${modelRows}</div>`
+  }))
+
   // ----- archive (all days + releases + categories)
   const cats = new Map()
   for (const e of entries) cats.set(e.category, (cats.get(e.category) || 0) + 1)
@@ -1764,7 +1853,7 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
   const urls = ['/']
   for (const d of byDay) urls.push(`/day/${d.day}/`)
   for (const v of vers) urls.push(`/release/${v.version}/`)
-  urls.push('/archive/', '/search/', '/about/')
+  urls.push('/archive/', '/search/', '/about/', '/models/')
   if (openPrs?.length) urls.push('/in-flight/')
   await write(dist, 'sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.map(u => `<url><loc>${SITE.url}${u}</loc></url>`).join('')}</urlset>`)
