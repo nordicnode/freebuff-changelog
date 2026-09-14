@@ -317,11 +317,27 @@ async function cmdCatchUp (argv) {
     const status = (await git(['status', '--porcelain', 'data/'], ROOT, { allowFail: true })) || ''
     if (status.trim()) {
       log('committing and pushing data to git…')
-      await git(['pull', '--rebase', 'origin', currentBranch], ROOT, { allowFail: true })
       await git(['add', 'data'], ROOT)
       const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 16)
       await git(['commit', '-m', `data: LLM backfill (${nowUtc} UTC)`], ROOT)
-      await git(['push', 'origin', currentBranch], ROOT)
+      // Push race: the hourly workflow or another writer may move remote
+      // between our pull and push. Rebase + retry instead of failing the cycle.
+      let pushed = false
+      for (let attempt = 1; attempt <= 3 && !pushed; attempt++) {
+        const pushOut = await git(['push', 'origin', currentBranch], ROOT, { allowFail: true })
+        if (pushOut !== null) {
+          pushed = true
+        } else {
+          log(`push rejected (attempt ${attempt}/3): rebasing onto origin and retrying…`)
+          const pulled = await git(['pull', '--rebase', 'origin', currentBranch], ROOT, { allowFail: true })
+          if (pulled === null) {
+            await git(['rebase', '--abort'], ROOT, { allowFail: true })
+            log('rebase conflicted: leaving local commit in place, will retry next cycle')
+            break
+          }
+        }
+      }
+      if (!pushed) throw new Error(`git push origin ${currentBranch} failed after 3 attempts`)
       log('pushed to origin: Cloudflare Pages will deploy automatically.')
     } else {
       log('data is already up to date: nothing to push.')
