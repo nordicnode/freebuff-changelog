@@ -8,7 +8,7 @@ import { mkdir, readFile, cp } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { git, readJson, writeJson, writeText, log, ymd } from './lib/util.mjs'
+import { git, readJson, writeJson, writeText, log, ymd, pruneDiffs, pool } from './lib/util.mjs'
 import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   diffNameStatus, diffPatch, extractCleanDiff, SYNC_SUBJECT, TEST_RE
@@ -40,16 +40,54 @@ async function ensureRepo () {
 }
 
 async function fetchOpenPrs () {
-  // Nice-to-have, degrade silently. Uses unauthenticated API (or GITHUB_TOKEN).
+  // Nice-to-have, degrade silently. Cached 6h to protect the rate limit
+  // (hourly generate would otherwise burn 1 call/run + previews).
   try {
+    const cached = await readJson(`${DATA}/open-prs.json`, null)
+    if (cached?.fetchedAt && Date.now() - Date.parse(cached.fetchedAt) < 6 * 3600000 && cached.prs?.length) {
+      return cached.prs
+    }
     const headers = { 'user-agent': 'freebuff-changelog', accept: 'application/vnd.github+json' }
     if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`
     const res = await fetch('https://api.github.com/repos/CodebuffAI/freebuff/pulls?state=open&sort=created&direction=desc&per_page=60', { headers, signal: AbortSignal.timeout(15000) })
-    if (!res.ok) return null
-    return (await res.json()).map(p => ({
+    if (!res.ok) return cached?.prs || null
+    const prs = (await res.json()).map(p => ({
       number: p.number, title: p.title, url: p.html_url, author: p.user?.login,
-      created: p.created_at, updated: p.updated_at, draft: p.draft, comments: p.comments, additions: p.additions, deletions: p.deletions
+      created: p.created_at, updated: p.updated_at, draft: p.draft, comments: p.comments,
+      additions: p.additions, deletions: p.deletions, files: p.changed_files
     }))
+    // Per-PR stats need one extra call each: fetch with bounded concurrency.
+    // Missing stats degrade to null (card hides the diffstat).
+    const ghGet = async (path, accept) => {
+      try {
+        const r = await fetch(`https://api.github.com${path}`, { headers: { ...headers, ...(accept ? { accept } : {}) }, signal: AbortSignal.timeout(15000) })
+        if (!r.ok) return null
+        return accept ? await r.text() : await r.json()
+      } catch { return null }
+    }
+    await pool(prs.filter(p => p.additions == null).map(p => async () => {
+      const full = await ghGet(`/repos/CodebuffAI/freebuff/pulls/${p.number}`)
+      if (full) { p.additions = full.additions; p.deletions = full.deletions; p.files = full.changed_files; p.comments = full.comments ?? p.comments }
+    }), 4)
+    // Inline diff preview (first ~120 lines): fetched once per PR, persisted
+    // in data/pr-diffs/, served from /pr-diffs/<n>.diff. Missing file
+    // degrades to a GitHub link. Skips PRs already on disk so refreshes
+    // cost ~0 calls when the list is unchanged.
+    const { mkdir: mk, writeFile: wf } = await import('node:fs/promises')
+    await mk(resolve(DATA, 'pr-diffs'), { recursive: true })
+    await pool(prs.filter(p => !existsSync(resolve(DATA, `pr-diffs/${p.number}.diff`))).map(p => async () => {
+      const diff = await ghGet(`/repos/CodebuffAI/freebuff/pulls/${p.number}`, 'application/vnd.github.diff')
+      if (typeof diff === 'string' && diff.startsWith('diff --git')) {
+        await wf(resolve(DATA, `pr-diffs/${p.number}.diff`), diff.split('\n').slice(0, 120).join('\n'))
+        p.hasDiff = true
+      }
+    }), 4)
+    // Mark previews already on disk (skipped above, still viewable).
+    for (const p of prs) {
+      if (!p.hasDiff && existsSync(resolve(DATA, `pr-diffs/${p.number}.diff`))) p.hasDiff = true
+    }
+    await writeJson(`${DATA}/open-prs.json`, { fetchedAt: new Date().toISOString(), prs })
+    return prs
   } catch { return null }
 }
 
@@ -164,9 +202,9 @@ async function cmdGenerate (argv) {
   }
   await writeJson(`${DATA}/changelog.json`, changelog)
   await writeJson(`${DATA}/state.json`, { lastSha: head, runs: (state.runs || 0) + 1, updatedAt: changelog.generatedAt })
+  await pruneDiffs(resolve(DATA, 'diffs'), entries)
 
   const prs = await fetchOpenPrs()
-  if (prs) await writeJson(`${DATA}/open-prs.json`, prs)
 
   log(`wrote ${entries.length} entries (${added} new this run)` + (prs ? `, ${prs.length} open PRs` : ''))
 }
@@ -328,7 +366,8 @@ async function cmdBuild () {
       }
     }
   }
-  const prs = await readJson(`${DATA}/open-prs.json`, [])
+  const prsRaw = await readJson(`${DATA}/open-prs.json`, [])
+  const prs = Array.isArray(prsRaw) ? prsRaw : (prsRaw?.prs || [])
   const dataDiffs = resolve(DATA, 'diffs')
   const dist = resolve(ROOT, 'dist')
   const t0 = Date.now()
@@ -338,6 +377,11 @@ async function cmdBuild () {
   if (existsSync(dataDiffs)) {
     await mkdir(distDiffs, { recursive: true })
     await cp(dataDiffs, distDiffs, { recursive: true })
+  }
+  const dataPrDiffs = resolve(DATA, 'pr-diffs')
+  if (existsSync(dataPrDiffs)) {
+    await mkdir(resolve(dist, 'pr-diffs'), { recursive: true })
+    await cp(dataPrDiffs, resolve(dist, 'pr-diffs'), { recursive: true })
   }
 
   log(`site built in ${((Date.now() - t0) / 1000).toFixed(1)}s → ${dist}`)

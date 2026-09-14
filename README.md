@@ -87,7 +87,9 @@ rule-based summary is used: the site never depends on the LLM.
 | `/search/` | client filter over pre-built JSON index |
 | `/in-flight/` | open community PRs (via GitHub API, best effort) |
 | `/feed.xml` | RSS of major + notable entries |
-| `/changelog.json`, `/api/entries.json` | raw data / API |
+| `/feed-models.xml`, `/feed-releases.xml` | model-only / release-only RSS |
+| `/models/` | model catalog timeline (live, retired, per-change history) |
+| `/api/entries.json`, `/api/status.json` | raw data / deploy status API |
 
 ## Honest limitations
 

@@ -124,14 +124,39 @@ test('buildSite generates valid static site output', async () => {
     assert.doesNotMatch(inFlightHtml, /undefined/)
     assert.match(inFlightHtml, /#999 by contributor/)
 
-    // Verify search index includes compact fields without AI disclosure
+    // Verify search index uses codebook format with category/sig selects
     const searchIdx = JSON.parse(await readFile(join(tmpDist, 'search-index.json'), 'utf8'))
-    assert.equal(searchIdx.length, 2)
-    assert.equal(searchIdx[0].u, undefined)
-    assert.ok(searchIdx[0].s)
-    assert.ok(searchIdx[0].d)
-    assert.equal(searchIdx[0].m, undefined)
-    assert.equal(searchIdx[0].ai, undefined)
+    assert.ok(Array.isArray(searchIdx.cats))
+    assert.ok(searchIdx.cats.includes('CLI'))
+    assert.deepEqual(searchIdx.sigs, ['minor', 'notable', 'major'])
+    assert.equal(searchIdx.ix.length, 2)
+    assert.ok(Array.isArray(searchIdx.ix[0]))
+    assert.equal(searchIdx.ix[0].length, 5)
+    const searchHtml = await readFile(join(tmpDist, 'search/index.html'), 'utf8')
+    assert.match(searchHtml, /<select id="fcat">/)
+    assert.match(searchHtml, /<select id="fsig">/)
+    assert.match(searchHtml, /<option value="CLI">/)
+
+    // Verify in-flight cards render diffstats and diff preview placeholders
+    const prWithStats = { ...mockOpenPrs[0], additions: 10, deletions: 2, files: 1, hasDiff: true }
+    await buildSite({ changelog: mockChangelog, openPrs: [prWithStats], dist: tmpDist })
+    const inFlightStats = await readFile(join(tmpDist, 'in-flight/index.html'), 'utf8')
+    assert.match(inFlightStats, /\+10/)
+    assert.match(inFlightStats, /1 file/)
+    assert.match(inFlightStats, /data-pr="999"/)
+    assert.match(inFlightStats, /View diff preview/)
+
+    // Verify sync freshness badge and status API
+    assert.match(indexHtml, /class="sync-age"/)
+    assert.match(indexHtml, /data-generated="2026-09-13T12:00:00Z"/)
+    const statusApi = JSON.parse(await readFile(join(tmpDist, 'api/status.json'), 'utf8'))
+    assert.equal(statusApi.total, 2)
+    assert.equal(statusApi.openPrs, 1)
+    assert.equal(statusApi.models.changes, 1)
+    assert.match(await readFile(join(tmpDist, '_headers'), 'utf8'), /\/pr-diffs\/\*/)
+    assert.match(await readFile(join(tmpDist, '_headers'), 'utf8'), /\/models\//)
+    // Full changelog.json no longer ships to dist (6.9MB dead payload)
+    await assert.rejects(readFile(join(tmpDist, 'changelog.json'), 'utf8'))
 
     // Verify feed.xml contains atom:link, stylesheet, and lastBuildDate with correct domain
     const feedXml = await readFile(join(tmpDist, 'feed.xml'), 'utf8')

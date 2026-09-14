@@ -2,7 +2,7 @@
 // fully static, subdued/monochrome developer terminal site (system monospace,
 // authentic CLI/git-log presentation, dark theme, zero emojis, calm palette).
 import { writeText, writeBinary } from './util.mjs'
-import { escapeHtml as esc, fmtDateHuman } from './util.mjs'
+import { escapeHtml as esc, fmtDateHuman, pool } from './util.mjs'
 
 const SITE = {
   name: 'Freebuff Changelog',
@@ -764,6 +764,28 @@ nav.term-nav a.active{
   color:var(--txt-subtle);
   margin-top:8px;
 }
+.filter-row{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  flex-wrap:wrap;
+  margin-top:8px;
+  font-size:.78rem;
+}
+.filter-sel-lbl{
+  color:var(--txt-subtle);
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+}
+.filter-row select{
+  background:var(--panel);
+  border:1px solid var(--term-border);
+  color:var(--txt-dim);
+  padding:2px 6px;
+  border-radius:2px;
+  font:inherit;
+}
 
 .grid{
   display:grid;
@@ -1046,6 +1068,16 @@ function updateSyncTimer() {
 updateSyncTimer();
 setInterval(updateSyncTimer, 1000);
 
+function updateSyncAge() {
+  const el = document.querySelector('.sync-age');
+  if (!el || !el.dataset.generated) return;
+  const ageMin = Math.max(0, Math.floor((Date.now() - Date.parse(el.dataset.generated)) / 60000));
+  const fresh = ageMin < 90;
+  el.textContent = el.textContent.replace(/\s*\[.*\]$/, '') + (fresh ? ' [fresh]' : ' [stale ' + ageMin + 'm]');
+  el.style.color = fresh ? 'var(--term-green)' : 'var(--term-amber)';
+}
+updateSyncAge();
+
 function openHashTarget() {
   const hash = window.location.hash;
   if (!hash) return;
@@ -1082,56 +1114,59 @@ function copyDiff(btn) {
 document.addEventListener('toggle', async (ev) => {
   const el = ev.target;
   if (!el.classList.contains('diff-viewer') || !el.open || el.dataset.loaded) return;
-  const sha = el.dataset.sha;
+  const sha = el.dataset.sha, pr = el.dataset.pr;
   const body = el.querySelector('.diff-body');
-  if (!sha || !body) return;
+  if ((!sha && !pr) || !body) return;
   if (body.querySelector('.diff-pre')) { el.dataset.loaded = '1'; return; }
   body.innerHTML = '<span class="diff-loading">Loading diff…</span>';
   try {
-    let url = '/diffs/' + sha + '.diff';
+    let url = sha ? '/diffs/' + sha + '.diff' : '/pr-diffs/' + pr + '.diff';
     if (location.protocol === 'file:') {
       const idx = location.pathname.lastIndexOf('/dist/');
       if (idx !== -1) {
-        url = location.pathname.substring(0, idx + 6) + 'diffs/' + sha + '.diff';
+        url = location.pathname.substring(0, idx + 6) + (sha ? 'diffs/' + sha + '.diff' : 'pr-diffs/' + pr + '.diff');
       }
     }
     const res = await fetch(url);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const text = await res.text();
     el.dataset.loaded = '1';
-    renderDiff(body, text, sha);
+    const label = sha || ('PR-' + pr);
+    const viewUrl = el.dataset.gh || (sha ? 'https://github.com/CodebuffAI/freebuff/commit/' + sha : '');
+    renderDiff(body, text, label, viewUrl);
   } catch (err) {
-    const ghUrl = el.dataset.gh || ('https://github.com/CodebuffAI/freebuff/commit/' + sha);
-    body.innerHTML = '<div class="diff-notice">Full diff not cached locally. <a href="' + ghUrl + '" target="_blank" rel="noopener">View on GitHub &rarr;</a></div>';
+    const ghUrl = el.dataset.gh || (sha ? 'https://github.com/CodebuffAI/freebuff/commit/' + sha : '');
+    body.innerHTML = '<div class="diff-notice">Full diff not cached locally. ' + (ghUrl ? '<a href="' + ghUrl + '" target="_blank" rel="noopener">View on GitHub &rarr;</a>' : 'View the PR on GitHub for the full diff.') + '</div>';
   }
 }, true);
 
-function renderDiff(container, text, sha) {
+function renderDiff(container, text, label, ghUrl) {
   const lines = text.split(/\\r?\\n/);
   const frag = document.createDocumentFragment();
-  
+
   const toolbar = document.createElement('div');
   toolbar.className = 'diff-toolbar';
-  const shortSha = sha.slice(0, 12);
-  toolbar.innerHTML = '<span class="diff-toolbar-title">$ git diff ' + shortSha + '^!</span>';
-  
+  toolbar.innerHTML = '<span class="diff-toolbar-title">$ git diff ' + label.slice(0, 12) + '^!</span>';
+
   const actions = document.createElement('div');
   actions.className = 'diff-toolbar-actions';
-  
+
   const copyBtn = document.createElement('button');
   copyBtn.className = 'diff-copy-btn';
   copyBtn.textContent = '[copy diff]';
   copyBtn.onclick = () => copyDiff(copyBtn);
   actions.appendChild(copyBtn);
-  
-  const ghLink = document.createElement('a');
-  ghLink.className = 'diff-gh-btn';
-  ghLink.href = 'https://github.com/CodebuffAI/freebuff/commit/' + sha;
-  ghLink.target = '_blank';
-  ghLink.rel = 'noopener';
-  ghLink.textContent = '[github]';
-  actions.appendChild(ghLink);
-  
+
+  if (ghUrl) {
+    const ghLink = document.createElement('a');
+    ghLink.className = 'diff-gh-btn';
+    ghLink.href = ghUrl;
+    ghLink.target = '_blank';
+    ghLink.rel = 'noopener';
+    ghLink.textContent = '[github]';
+    actions.appendChild(ghLink);
+  }
+
   toolbar.appendChild(actions);
   frag.appendChild(toolbar);
 
@@ -1467,7 +1502,6 @@ async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, ''
 export async function buildSite ({ changelog, openPrs, dist }) {
   const entries = [...changelog.entries].reverse() // newest first
   const byDay = groupByDay(entries)
-  const major = entries.filter(e => e.significance === 'major')
   const modelEntries = entries.filter(e => e.modelChanges)
   const releases = entries.filter(e => e.version)
   const first = entries.at(-1), last = entries[0]
@@ -1500,7 +1534,7 @@ export async function buildSite ({ changelog, openPrs, dist }) {
       </div>
     </div>
     <div class="term-footer-bar">
-      <span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated ${esc(fmtDateHuman(generated))} UTC</span>
+      <span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}">${esc(fmtDateHuman(generated))} UTC</span></span>
       <span>NEXT SYNC: <span class="sync-val" style="color:var(--term-cyan);font-weight:600">--:--</span> &middot; COVERAGE: ${esc(first.day)} &rarr; ${esc(last.day)}</span>
     </div>
   </div>
@@ -1522,9 +1556,8 @@ ${d.entries.map(e => {
   await write(dist, 'index.html', layout({ title: 'Home', path: '/', body: hero + daysHtml +
     `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>` }))
 
-  // ----- per-day pages
-  for (let i = 0; i < byDay.length; i++) {
-    const d = byDay[i]
+  // ----- per-day pages (independent writes: bounded parallel pool)
+  const dayTasks = byDay.map((d, i) => async () => {
     const prevDay = i < byDay.length - 1 ? byDay[i + 1] : null
     const nextDay = i > 0 ? byDay[i - 1] : null
     const dayPager = `<div class="pager">` +
@@ -1540,17 +1573,20 @@ ${d.entries.map(e => {
         dayPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/">&larr; [latest]</a> &middot; <a href="/archive/">[archive]</a></p>`
     }))
-  }
+  })
+  await pool(dayTasks, 16)
 
-  // ----- release pages
+  // ----- release pages (ranges precomputed once, pages written in parallel)
   const verMap = new Map()
   for (const e of releases) verMap.set(e.version, e)
   const vers = [...verMap.values()]
   vers.sort((a, b) => a.date < b.date ? -1 : 1)
-  for (let i = 0; i < vers.length; i++) {
-    const rel = vers[i]
+  const relRanges = vers.map((rel, i) => {
     const lo = i > 0 ? vers[i - 1].date : '0000'
-    const mine = entries.filter(e => e.date > lo && e.date <= rel.date && e.sha !== rel.sha)
+    return entries.filter(e => e.date > lo && e.date <= rel.date && e.sha !== rel.sha)
+  })
+  await pool(vers.map((rel, i) => async () => {
+    const mine = relRanges[i]
     const prevRel = i > 0 ? vers[i - 1] : null
     const nextRel = i < vers.length - 1 ? vers[i + 1] : null
     const relPager = `<div class="pager">` +
@@ -1566,7 +1602,7 @@ ${d.entries.map(e => {
         relPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/archive/#releases">&larr; [all releases]</a> &middot; <a href="/">[latest]</a></p>`
     }))
-  }
+  }), 16)
 
   // ----- models timeline (catalog history: current lineup, retired, per-change rows)
   const { chrono: modelChrono, live: modelLive, retired: modelRetired } = modelTimeline(modelEntries)
@@ -1656,15 +1692,18 @@ ${d.entries.map(e => {
 ${yearSections}`
   }))
 
-  // ----- search (compact index with client URL derivation + ?q= support + filter chips)
-  const idxJson = entries.map(e => ({
-    d: e.day,
-    t: (e.ai?.title || e.title || deriveTitleSafe(e)).slice(0, 90),
-    c: e.category,
-    s: e.sha.slice(0, 12),
-    a: e.significance
-  }))
-  await write(dist, 'search-index.json', JSON.stringify(idxJson))
+  // ----- search (compact index: field codes + category/sig codebooks)
+  // c/s/a as small ints keep the 7k-entry payload lean for Workers egress.
+  const SEARCH_CATS = [...new Set(entries.map(e => e.category))].sort()
+  const SEARCH_SIGS = ['minor', 'notable', 'major']
+  const idxJson = entries.map(e => ([
+    e.day,
+    (e.ai?.title || e.title || deriveTitleSafe(e)).slice(0, 90),
+    SEARCH_CATS.indexOf(e.category),
+    e.sha.slice(0, 12),
+    SEARCH_SIGS.indexOf(e.significance)
+  ]))
+  await write(dist, 'search-index.json', JSON.stringify({ cats: SEARCH_CATS, sigs: SEARCH_SIGS, ix: idxJson }))
   await write(dist, 'search/index.html', layout({
     title: 'Search', path: '/search/',
     body: `<section class="hero">
@@ -1688,6 +1727,20 @@ ${yearSections}`
       <button class="filter-chip" data-filter="prompt">--prompt</button>
       <button class="filter-chip" data-filter="desktop">--desktop</button>
     </div>
+    <div class="filter-row">
+      <label class="filter-sel-lbl">CATEGORY:
+        <select id="fcat">
+          <option value="">--all categories</option>
+          ${SEARCH_CATS.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('')}
+        </select>
+      </label>
+      <label class="filter-sel-lbl">IMPACT:
+        <select id="fsig">
+          <option value="">--any impact</option>
+          ${SEARCH_SIGS.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('')}
+        </select>
+      </label>
+    </div>
     <div class="search-status"><span id="match-count"></span></div>
   </div>
 </section>
@@ -1695,31 +1748,38 @@ ${yearSections}`
 <div id="hits"></div>
 
 <script>
-fetch('/search-index.json').then(r=>r.json()).then(ix=>{
+fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   let t;
   const q = document.getElementById('q'), h = document.getElementById('hits'), cnt = document.getElementById('match-count');
   const chips = document.querySelectorAll('.filter-chip');
+  const fcat = document.getElementById('fcat'), fsig = document.getElementById('fsig');
   const esc = s => String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
-  
+
   const go = () => {
     const v = q.value.trim().toLowerCase();
-    if (!v) { h.innerHTML = ''; cnt.textContent = ''; return; }
-    const w = v.split(/\s+/);
+    const cat = fcat ? fcat.value : '', sig = fsig ? fsig.value : '';
+    const w = v.split(/\s+/).filter(Boolean);
+    if (!w.length && !cat && !sig) { h.innerHTML = ''; cnt.textContent = ''; return; }
     const hits = ix.filter(e => {
-      const s = (e.t + ' ' + e.c + ' ' + (e.a || '')).toLowerCase();
+      const c = cats[e[2]] || '', a = sigs[e[4]] || '';
+      if (cat && c !== cat) return false;
+      if (sig && a !== sig) return false;
+      if (!w.length) return true;
+      const s = (e[1] + ' ' + c + ' ' + a).toLowerCase();
       return w.every(x => s.includes(x));
     }).slice(0, 200);
-    
+
     cnt.textContent = hits.length ? ('MATCHES: ' + hits.length + (hits.length === 200 ? '+ (capped at 200)' : '')) : 'MATCHES: 0';
     h.innerHTML = hits.map(e => {
-      const u = '/day/' + e.d + '/#' + e.s;
-      const sigTag = e.a === 'major' ? '<span class="badge maj">[MAJOR]</span>' : (e.a === 'notable' ? '<span class="badge not">[NOTABLE]</span>' : '');
-      return '<article class="entry ' + (e.a || '') + '"><div class="entry-meta-top">' +
-        '<span class="commit-ref">commit ' + esc(e.s) + '</span>' +
-        '<span class="entry-utc">' + esc(e.d) + '</span>' +
-        '<div class="badges"><span class="badge cat">[' + esc(e.c) + ']</span>' + sigTag + '</div>' +
+      const u = '/day/' + e[0] + '/#' + e[3];
+      const a = sigs[e[4]] || '', c = cats[e[2]] || '';
+      const sigTag = a === 'major' ? '<span class="badge maj">[MAJOR]</span>' : (a === 'notable' ? '<span class="badge not">[NOTABLE]</span>' : '');
+      return '<article class="entry ' + a + '"><div class="entry-meta-top">' +
+        '<span class="commit-ref">commit ' + esc(e[3]) + '</span>' +
+        '<span class="entry-utc">' + esc(e[0]) + '</span>' +
+        '<div class="badges"><span class="badge cat">[' + esc(c) + ']</span>' + sigTag + '</div>' +
         '</div>' +
-        '<h3><a href="' + u + '">' + esc(e.t) + '</a></h3>' +
+        '<h3><a href="' + u + '">' + esc(e[1]) + '</a></h3>' +
         '</article>';
     }).join('') || '<p style="color:var(--txt-subtle);margin:20px 0">$ No matches found for pattern.</p>';
   };
@@ -1729,6 +1789,8 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
     clearTimeout(t);
     t = setTimeout(go, 90);
   });
+  if (fcat) fcat.addEventListener('change', go);
+  if (fsig) fsig.addEventListener('change', go);
 
   chips.forEach(chip => {
     chip.addEventListener('click', () => {
@@ -1741,6 +1803,9 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
 
   const params = new URLSearchParams(window.location.search);
   const initialQ = params.get('q') || (window.location.hash.startsWith('#q=') ? decodeURIComponent(window.location.hash.slice(3)) : '');
+  const initialCat = params.get('cat') || '', initialSig = params.get('sig') || '';
+  if (fcat && initialCat && [...fcat.options].some(o => o.value === initialCat)) fcat.value = initialCat;
+  if (fsig && initialSig && [...fsig.options].some(o => o.value === initialSig)) fsig.value = initialSig;
   if (initialQ) {
     q.value = initialQ;
     chips.forEach(c => {
@@ -1748,6 +1813,9 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
       else if (!c.dataset.filter && !initialQ) c.classList.add('active');
       else c.classList.remove('active');
     });
+  }
+  if (initialQ || initialCat || initialSig) {
+    chips.forEach(c => c.classList.remove('active'));
     go();
   }
 });
@@ -1792,11 +1860,23 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
 </section>`
   }))
 
-  // ----- open PRs page (community activity ahead of merges)
+  // ----- open PRs page (community activity ahead of merges, with diff previews)
   if (openPrs?.length) {
     const cards = openPrs.map(p => {
       const stats = (p.additions != null && p.deletions != null)
-        ? `<span class="diffstat"><b>+${p.additions}</b> / <i>−${p.deletions}</i></span>`
+        ? `<span class="diffstat"><b>+${p.additions}</b> / <i>−${p.deletions}</i></span>${p.files != null ? `<span style="font-size:.72rem;color:var(--txt-subtle)">${p.files} file${p.files === 1 ? '' : 's'}</span>` : ''}`
+        : ''
+      const preview = p.hasDiff
+        ? `<details class="diff-viewer" data-pr="${p.number}">
+<summary class="diff-toggle">
+  <span class="diff-toggle-left">
+    <span class="diff-arrow">&gt;</span>
+    <span>View diff preview</span>
+  </span>
+  ${stats}
+</summary>
+<div class="diff-body"><span class="diff-loading">Loading diff…</span></div>
+</details>`
         : ''
       return `<article class="pr-card">
   <div class="pr-card-header">
@@ -1811,6 +1891,7 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
     ${stats ? `<span>&middot;</span>${stats}` : ''}
     ${p.draft ? '<span>&middot;</span><span style="color:var(--txt-subtle)">draft</span>' : ''}
   </div>
+  ${preview}
 </article>`
     }).join('')
 
@@ -1853,8 +1934,16 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
   await writeBinary(`${dist.replace(/\/$/, '')}/favicon.ico`, generateFaviconIco())
   await write(dist, 'favicon.svg', FAVICON_SVG)
 
-  await write(dist, 'changelog.json', JSON.stringify(changelog))
   await write(dist, 'api/entries.json', JSON.stringify({ generatedAt: generated, head: changelog.headSha, total: entries.length, latest: entries.slice(0, 60) }))
+  await write(dist, 'api/status.json', JSON.stringify({
+    generatedAt: generated,
+    headSha: changelog.headSha,
+    total: entries.length,
+    days: byDay.length,
+    releases: vers.length,
+    models: { changes: modelEntries.length, live: modelLive.length },
+    openPrs: openPrs?.length || 0
+  }))
 
   // ----- sitemap / robots / headers / 404
   const urls = ['/']
@@ -1884,8 +1973,6 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
   Access-Control-Allow-Origin: *
 /index.html
   Cache-Control: public, max-age=300
-/changelog.json
-  Cache-Control: public, max-age=300
 /search-index.json
   Cache-Control: public, max-age=3600
 /feed.xml
@@ -1904,6 +1991,12 @@ fetch('/search-index.json').then(r=>r.json()).then(ix=>{
   Content-Type: text/plain; charset=utf-8
   Cache-Control: public, max-age=31536000, immutable
   Access-Control-Allow-Origin: *
+/pr-diffs/*
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=3600
+  Access-Control-Allow-Origin: *
+/models/
+  Cache-Control: public, max-age=3600
 `)
   await write(dist, '404.html', layout({ title: 'Not found', path: '/404', noindex: true, body: '<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">ERROR :: 404 NOT FOUND</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">No commit or snapshot shipped at this path. <a href="/">&larr; [back to index]</a></p></div></section>' }))
   return { entries: entries.length, days: byDay.length, releases: vers.length }

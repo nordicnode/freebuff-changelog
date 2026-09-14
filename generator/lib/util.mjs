@@ -79,3 +79,41 @@ export function fmtDateHuman (iso) {
 export function log (...args) {
   console.log('[changelog]', ...args)
 }
+
+// Bounded worker pool for independent async tasks. Returns results in order.
+export async function pool (tasks, n = 8) {
+  const out = new Array(tasks.length)
+  let i = 0
+  const workers = Array.from({ length: Math.min(n, tasks.length) }, async () => {
+    while (i < tasks.length) {
+      const k = i++
+      out[k] = await tasks[k]()
+    }
+  })
+  await Promise.all(workers)
+  return out
+}
+
+// Retention: delete *.diff files whose entry day is older than the cutoff.
+// Day pages degrade to a GitHub compare link when /diffs/<sha>.diff is
+// missing (client renders a notice), so pruning only loses inline diffs
+// for old entries — the site stays fully navigable.
+export async function pruneDiffs (diffDir, entries, retentionDays = 90) {
+  const { readdir, unlink } = await import('node:fs/promises')
+  const { existsSync } = await import('node:fs')
+  if (!existsSync(diffDir)) return 0
+  const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString().slice(0, 10)
+  const dayBySha = new Map()
+  for (const e of entries) dayBySha.set(e.sha, e.day)
+  let pruned = 0
+  for (const f of await readdir(diffDir)) {
+    if (!f.endsWith('.diff')) continue
+    const day = dayBySha.get(f.slice(0, -5))
+    if (day && day < cutoff) {
+      await unlink(`${diffDir}/${f}`)
+      pruned++
+    }
+  }
+  if (pruned > 0) log(`pruned ${pruned} diffs older than ${cutoff}`)
+  return pruned
+}
