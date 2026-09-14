@@ -443,7 +443,13 @@ function relatedLine (e, relatedIdx) {
   return `<div class="related">RELATED: ${rel.map(r => `<a href="/day/${r.day}/#${r.sha.slice(0, 12)}">${esc((r.ai?.title || r.title || '').slice(0, 60))}</a>`).join(' · ')}</div>`
 }
 
-function entryCard (e, isExpanded = false, relatedIdx = null) {
+// Categories double as filter keys in the DOM, so they need a URL/attribute-safe
+// form that both the chips and the rows compute identically.
+function categorySlug (c) {
+  return String(c || 'other').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'other'
+}
+
+function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) {
   const time = e.date.slice(11, 16)
   const anchor = e.sha.slice(0, 12)
   const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
@@ -470,7 +476,9 @@ function entryCard (e, isExpanded = false, relatedIdx = null) {
 <div class="diff-body"><span class="diff-loading">Loading diff…</span></div>
 </details>`
   }
-  return `<details class="entry ${e.significance}" id="${anchor}"${isExpanded ? ' open' : ''}>
+  // data-cat / data-churn are what the front-page filter toggles: every row the
+  // index renders is a row the reader can filter, with no second request.
+  return `<details class="entry ${e.significance}" id="${anchor}" data-cat="${esc(categorySlug(e.category))}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
 <summary class="entry-summary">
   <div class="entry-meta-top">
     <span class="entry-arrow">&gt;</span>
@@ -605,14 +613,115 @@ export async function buildSite ({ changelog, openPrs, dist }) {
   <span class="day-count">${m} change${m === 1 ? '' : 's'}${ch ? ` <span class="day-churn">+${ch} churn</span>` : ''}</span>
 </div>
 ${d.entries.map(e => {
-  const open = isFirstIndex
-  isFirstIndex = false
-  return entryCard(e, open, relatedIdx)
+  // The newest *visible* row is the one that opens. Spending the flag on a churn
+  // row that is hidden by default would leave the timeline with nothing open.
+  const open = isFirstIndex && !e.noise
+  if (open) isFirstIndex = false
+  return entryCard(e, open, relatedIdx, { hideChurn: true })
 }).join('\n')}</section>`
 }).join('')
 
-  await write(dist, 'index.html', layout({ title: 'Home', path: '/', body: hero + daysHtml +
-    `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>` }))
+  // Front-page filters. Every row the timeline can show is already in the DOM,
+  // so a filter is a visibility toggle rather than a request. Churn starts
+  // hidden *in the markup* (not by script), so a reader with JS off gets the
+  // quiet timeline -- the default was asked for, and defaults belong on the
+  // server. Chips only name categories actually present in this window, so no
+  // chip can filter the page down to nothing by accident.
+  const windowRows = idx.flatMap(d => d.entries)
+  const realRows = windowRows.filter(e => !e.noise)
+  const churnInWindow = windowRows.length - realRows.length
+  const catCounts = new Map()
+  for (const e of realRows) {
+    const slug = categorySlug(e.category)
+    const cur = catCounts.get(slug) || { slug, label: e.category || 'Other', n: 0 }
+    cur.n++
+    if (!catCounts.has(slug)) catCounts.set(slug, cur)
+  }
+  const chipList = [...catCounts.values()].sort((a, b) => b.n - a.n || a.label.localeCompare(b.label))
+  const filterBar = `<nav class="filterbar" id="filters" aria-label="Filter the timeline by category">
+  <span class="filter-label">FILTER:</span>
+  <button type="button" class="chip active" data-filter="*" aria-pressed="true">all<span class="chip-n">${realRows.length}</span></button>
+${chipList.map(c => `  <button type="button" class="chip" data-filter="${esc(c.slug)}" aria-pressed="false">${esc(c.label)}<span class="chip-n">${c.n}</span></button>`).join('\n')}
+  <button type="button" class="chip chip-churn" data-filter="churn" aria-pressed="false">churn<span class="chip-n">${churnInWindow}</span></button>
+</nav>
+<p class="filter-note">showing <b id="filter-count">${realRows.length}</b> of ${windowRows.length} rows on this page <em>${churnInWindow ? 'churn hidden' : 'no churn in this window'}</em> &middot; <a href="/search/">filter by text, impact, category</a></p>`
+
+  // Progressive enhancement only: no-JS readers see the server default (real
+  // changes, no churn). Category labels live in data-* so the toggle never has
+  // to parse markup, and a day whose rows are all filtered out is hidden with
+  // them rather than leaving a stray date header behind.
+  const filterScript = `<script>
+(function () {
+  var bar = document.getElementById('filters');
+  if (!bar) return;
+  var KEY = 'fbIndexFilter';
+  var rows = [].slice.call(document.querySelectorAll('details.entry'));
+  var days = [].slice.call(document.querySelectorAll('section.day'));
+  var countEl = document.getElementById('filter-count');
+  var noteEl = document.querySelector('.filter-note em');
+  var state = { cats: [], churn: false };
+  try {
+    var stored = JSON.parse(localStorage.getItem(KEY) || 'null');
+    if (stored && Object.prototype.toString.call(stored.cats) === '[object Array]') state = { cats: stored.cats, churn: !!stored.churn };
+  } catch (e) {}
+
+  function apply(save) {
+    var active = state.cats;
+    rows.forEach(function (r) {
+      var isChurn = r.hasAttribute('data-churn');
+      var want = isChurn ? state.churn : (!active.length || active.indexOf(r.getAttribute('data-cat')) !== -1);
+      r.hidden = !want;
+    });
+    days.forEach(function (d) {
+      d.hidden = !d.querySelector('details.entry:not([hidden])');
+    });
+    // A #sha link must land on something the reader can see, even when the
+    // filter would have hidden that row: revealing one entry (and its day) beats
+    // a URL that appears to go nowhere.
+    var hash = (location.hash || '').slice(1);
+    if (hash) {
+      var target = document.getElementById(hash);
+      if (target && target.classList && target.classList.contains('entry')) {
+        target.hidden = false;
+        var parent = target.closest ? target.closest('section.day') : null;
+        if (parent) parent.hidden = false;
+      }
+    }
+    var shown = rows.filter(function (r) { return !r.hidden }).length;
+    [].forEach.call(bar.querySelectorAll('.chip'), function (c) {
+      var f = c.getAttribute('data-filter');
+      var on = f === '*' ? !active.length && !state.churn : f === 'churn' ? state.churn : active.indexOf(f) !== -1;
+      c.classList.toggle('active', on);
+      c.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    if (countEl) countEl.textContent = shown;
+    if (noteEl) {
+      var bits = [];
+      if (active.length) bits.push(active.length === 1 ? active[0].replace(/-/g, ' ') : active.length + ' categories');
+      bits.push(state.churn ? 'churn shown' : 'churn hidden');
+      noteEl.textContent = bits.join(' \u00b7 ');
+    }
+    if (save) { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {} }
+  }
+
+  bar.addEventListener('click', function (ev) {
+    var chip = ev.target.closest ? ev.target.closest('.chip') : null;
+    if (!chip) return;
+    var f = chip.getAttribute('data-filter');
+    if (f === '*') { state.cats = []; state.churn = false; }
+    else if (f === 'churn') { state.churn = !state.churn; }
+    else {
+      var i = state.cats.indexOf(f);
+      if (i === -1) state.cats.push(f); else state.cats.splice(i, 1);
+    }
+    apply(true);
+  });
+  apply(false);
+})();
+</script>`
+
+  await write(dist, 'index.html', layout({ title: 'Home', path: '/', body: hero + filterBar + daysHtml +
+    `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>` + filterScript }))
 
   // ----- per-day pages (independent writes: bounded parallel pool)
   const dayOptions = byDay.map(d => `<option value="/day/${d.day}/">${esc(fmtDateHuman(d.day))} (${d.entries.filter(e => !e.noise).length})</option>`).join('')

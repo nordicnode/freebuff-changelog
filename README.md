@@ -67,6 +67,15 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
   page. The inline diff toggle appears only when `data/diffs/<sha>.diff` is
   actually published — `pruneDiffs` drops files after 90 days, and a toggle that
   fetches a 404 is worse than the GitHub compare link beside it.
+* The front page filters: a chip per category present in the current window, one
+  toggle for churn, state kept in `localStorage`. Filtering is a visibility flip
+  over rows that are already in the document, so it costs no request and no
+  backend. **Churn is hidden on the server** (`<details … hidden>`), not by
+  script — a default has to hold for readers with JavaScript off, and only the
+  categories actually in the window get a chip, so no chip can filter the page
+  down to nothing. A day whose rows are all filtered out hides its own header, a
+  `#sha` permalink into a filtered-out row reveals that row instead of landing on
+  blank space, and day pages plus the archive stay the exhaustive view.
 
 ## Freshness path (an upstream commit → a reader seeing it)
 
@@ -162,7 +171,7 @@ rule-based summary is used: the site never depends on the LLM.
 
 | route | content |
 |---|---|
-| `/` | latest ~150 changes grouped by day, hero stats |
+| `/` | last ~90 real changes plus the churn around them (churn hidden by default), category filter chips, hero stats |
 | `/day/YYYY-MM-DD/` | every change pushed that UTC day |
 | `/release/1.0.NNN/` | entries since the previous version bump |
 | `/archive/` | every day, release, category |

@@ -186,6 +186,12 @@ test('buildSite generates valid static site output', async () => {
 
     // Verify index.html contains permalinks, in-flight nav, diff-viewer, and sync countdown timer
     const indexHtml = await readFile(join(tmpDist, 'index.html'), 'utf8')
+    // Rows now carry filter metadata, so open/hidden has to be read off the tag
+    // instead of matching one fixed attribute order.
+    const rowTags = (html) => (html.match(/<details class="entry [^"]*" id="[0-9a-f]{12}"[^>]*>/g) || [])
+    const tagOf = (html, sha) => rowTags(html).find(t => t.includes('id="' + sha + '"'))
+    const isOpen = (t) => !!t && / open>$/.test(t)
+    const isHidden = (t) => !!t && / hidden/.test(t)
     assert.match(indexHtml, /class="permalink"/)
     assert.match(indexHtml, /href="\/in-flight\/"/)
     assert.match(indexHtml, /class="diff-viewer" data-sha=/)
@@ -210,13 +216,20 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /<h2><time datetime="2026-09-13">\[ Sep 13, 2026 \]<\/time><\/h2>/)
     assert.doesNotMatch(indexHtml, /== \[ Sep 13, 2026 \] ==/)
 
-    // Collapsible entries: the newest row is open by default and every older row
-    // starts collapsed. (Teaser mode used to expand the whole first day.)
-    assert.match(indexHtml, /<details class="entry noise" id="eeee11112222" open>/)
-    assert.doesNotMatch(indexHtml, /<details class="entry major" id="bbbb11112222" open>/)
-    // Older days render the same complete bodies as the newest day: no teaser,
-    // no "open full entry" hop. They start collapsed; only the newest row is open.
-    assert.match(indexHtml, /<details class="entry major" id="aaaa11112222">/)
+    // Collapsible entries: one row starts open, the rest collapsed. (Teaser mode
+    // used to expand the whole first day.) Churn is hidden on this page by
+    // default, so the rule is "first *visible* row": here the newest commit is
+    // churn, and the expanded state must pass to the next row rather than be
+    // spent on something the reader cannot see. Rows render in the document's
+    // display order, so the assertion states the rule instead of naming a sha.
+    assert.ok(isHidden(tagOf(indexHtml, 'eeee11112222')), 'the newest commit here is churn, hidden by default')
+    assert.ok(!isOpen(tagOf(indexHtml, 'eeee11112222')), 'a hidden row is not the expanded one')
+    const visibleRows = rowTags(indexHtml).filter(t => !isHidden(t))
+    assert.ok(isOpen(visibleRows[0]), 'the first visible row is the one that opens')
+    assert.equal(rowTags(indexHtml).filter(isOpen).length, 1, 'exactly one row starts expanded')
+    // Older days render the same complete bodies: no teaser, no "open full
+    // entry" hop. Collapsed, but the full text is in the document.
+    assert.ok(tagOf(indexHtml, 'aaaa11112222') && !isOpen(tagOf(indexHtml, 'aaaa11112222')))
     assert.match(indexHtml, /class="entry-summary"/)
     assert.doesNotMatch(indexHtml, /class="badge ai"/)
     assert.doesNotMatch(indexHtml, /Summarized by/)
@@ -434,14 +447,11 @@ test('buildSite generates valid static site output', async () => {
     // Every index row is a full body: no teaser class, no hop to a day page.
     assert.doesNotMatch(indexHtml, /class="entry teaser/)
     assert.doesNotMatch(indexHtml, /open full entry/)
-    // ...but only the newest one starts expanded; 256 open bodies is a wall.
-    assert.equal((indexHtml.match(/<details class="entry [a-z]+(?: [a-z]+)*" id="[0-9a-f]{12}" open>/g) || []).length, 1,
-      'exactly one index row starts expanded')
     assert.ok(indexHtml.includes('class="files"'), 'file chips are on the index, not only on day pages')
 
-    // Churn is listed (complete timeline) but dimmed, unsummarized, and kept out
-    // of every "changes" surface.
-    assert.match(indexHtml, /<details class="entry noise" id="eeee11112222" open>/)
+    // Churn is listed (complete timeline) but dimmed, unsummarized, kept out of
+    // every "changes" surface -- and hidden behind the churn chip by default.
+    assert.ok(isHidden(tagOf(indexHtml, 'eeee11112222')), 'churn starts hidden on the front page')
     assert.match(indexHtml, /Dependency lockfile updated/)
     assert.match(indexHtml, /\[Churn\]/)
     assert.match(indexHtml, /<span class="day-churn">\+1 churn<\/span>/)
@@ -452,6 +462,35 @@ test('buildSite generates valid static site output', async () => {
     assert.match(churnRow, /bun\.lock/, 'churn row states which files changed')
     assert.doesNotMatch(churnRow, /View inline diff/, 'churn rows carry no source diff')
     assert.doesNotMatch(churnRow, /class="eli5"/, 'churn rows carry no plain-English line either')
+
+    // Front-page filters: a chip per category present in this window, churn
+    // hidden in the markup (so the default holds without scripting), and the
+    // chip that reveals it. Nothing is removed from the document either way --
+    // filtering costs no request, and the day pages stay the exhaustive view.
+    assert.match(indexHtml, /<nav class="filterbar" id="filters"/)
+    assert.match(indexHtml, /data-filter="\*" aria-pressed="true">all<span class="chip-n">3<\/span>/,
+      'the all chip counts the visible rows, not churn')
+    assert.match(indexHtml, /data-filter="cli"/)
+    assert.match(indexHtml, /data-filter="model-catalog"/)
+    assert.match(indexHtml, /data-filter="churn" aria-pressed="false">churn<span class="chip-n">1<\/span>/)
+    assert.equal(rowTags(indexHtml).filter(t => t.includes('data-churn="1"')).length, 1)
+    assert.ok(rowTags(indexHtml).every(t => t.includes('data-cat="')), 'every row is filterable by category')
+    assert.equal(rowTags(indexHtml).filter(t => !isHidden(t)).length, 3, 'three rows shown, one hidden')
+    // The toggle is progressive enhancement: guarded on the bar existing, keeps
+    // its state across the auto-reload, and hides a day whose rows all filtered
+    // out instead of leaving a stray date header.
+    assert.match(indexHtml, /getElementById\('filters'\)/)
+    assert.match(indexHtml, /fbIndexFilter/)
+    assert.match(indexHtml, /details\.entry:not\(\[hidden\]\)/, 'empty day sections collapse with their rows')
+    // A #sha permalink into a filtered-out row must still land somewhere visible.
+    assert.match(indexHtml, /location\.hash/)
+    assert.match(indexHtml, /classList\.contains\('entry'\)/)
+    // The guard is load-bearing for the no-JS default: the hidden attribute only
+    // wins if no display rule outranks it.
+    assert.match(indexHtml, /\[hidden\]\{display:none!important\}/)
+    // Day pages stay exhaustive: no bar, nothing pre-hidden.
+    assert.doesNotMatch(dayHtml2, /id="filters"/)
+    assert.equal(rowTags(dayHtml2).filter(isHidden).length, 0, 'day pages still list churn')
     // Day pages carry related links + per-day OG image
     assert.match(dayHtml2, /RELATED:/)
     assert.match(dayHtml2, /og\/2026-09-13\.svg/)

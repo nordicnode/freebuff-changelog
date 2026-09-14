@@ -390,6 +390,42 @@ nav.term-nav a.active{
   font-weight:400;
   margin-left:6px;
 }
+/* Filtering is a visibility toggle, so the hidden attribute has to beat whatever
+   display rule a row class grows later. One guard here is cheaper than auditing
+   every rule that touches .entry, and it keeps the server default (churn hidden)
+   true even with scripting off. */
+[hidden]{display:none!important}
+.filterbar{
+  display:flex;
+  flex-wrap:wrap;
+  align-items:center;
+  gap:6px;
+  margin:14px 0 4px;
+  padding:8px 10px;
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  background:var(--panel);
+}
+.filter-label{font-size:.7rem;letter-spacing:.08em;color:var(--txt-subtle)}
+.chip{
+  font:inherit;
+  font-size:.76rem;
+  color:var(--txt-subtle);
+  background:transparent;
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  padding:2px 8px;
+  cursor:pointer;
+}
+.chip:hover{color:var(--txt);border-color:var(--term-border-strong)}
+.chip:focus-visible{outline:1px solid var(--term-cyan);outline-offset:1px}
+.chip.active{color:var(--txt);border-color:var(--term-cyan);background:rgba(88,166,255,.1)}
+.chip-n{margin-left:5px;font-size:.68rem;color:var(--txt-subtle)}
+.chip-churn{border-style:dashed}
+.chip-churn.active{border-color:var(--term-amber);background:rgba(210,153,34,.1)}
+.filter-note{margin:0 0 10px;font-size:.72rem;color:var(--txt-subtle)}
+.filter-note b{color:var(--txt-dim)}
+.filter-note em{font-style:normal;color:var(--term-amber)}
 .related{
   margin-top:8px;
   padding-top:6px;
