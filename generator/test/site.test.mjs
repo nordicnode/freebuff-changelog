@@ -415,7 +415,7 @@ test('buildSite generates valid static site output', async () => {
 
     // Verify models page: lineup, retired, history rows, nav
     const modelsHtml = await readFile(join(tmpDist, 'models/index.html'), 'utf8')
-    assert.match(modelsHtml, /MODEL_LINEUP/)
+    assert.match(modelsHtml, /Free model catalog/)
     assert.match(modelsHtml, /href="\/models\/muse-spark-1-3\/"/)
     assert.match(modelsHtml, /Muse Spark 1\.3/)
     assert.match(modelsHtml, /Muse Spark 1\.2/)

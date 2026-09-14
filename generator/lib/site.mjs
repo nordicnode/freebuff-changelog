@@ -918,7 +918,7 @@ ${rows.map(e => {
     body: `<section class="hero">
   <div class="term-box">
     <div class="term-box-hdr">
-      <span class="term-box-title">MODEL_LINEUP :: free picker catalog</span>
+      <span class="term-box-title">Free model catalog</span>
       <span>${modelLive.length} live &middot; ${modelRetired.length} retired</span>
     </div>
     <div style="font-size:.76rem;color:var(--txt-dim);margin-bottom:6px">LIVE:</div>
@@ -929,7 +929,7 @@ ${rows.map(e => {
   </div>
 </section>
 <div class="section-hdr">
-  <h2>== CATALOG HISTORY (${modelChrono.length} CHANGES) ==</h2>
+  <h2>CATALOG HISTORY (${modelChrono.length} CHANGES)</h2>
 </div>
 <div class="model-history">${modelRows}</div>`
   }))
@@ -965,7 +965,7 @@ ${rows.map(e => {
       desc: `${name} is ${status.toLowerCase()} in the Freebuff free picker: ${events.length} catalog events, ${firstSeen} to ${lastSeen}.`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">MODEL :: ${esc(name)}</span><span class="${status === 'LIVE' ? 'modelplus' : 'modelminus'}">[${status}]</span></div>`
         + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">${events.length} catalog event${events.length === 1 ? '' : 's'} &middot; ${esc(firstSeen)} &rarr; ${esc(lastSeen)} &middot; <a href="/models/">[all models]</a></p></div></section>`
-        + `<div class="section-hdr"><h2>== HISTORY (${events.length}) ==</h2></div><div class="model-history">${rows}</div>`
+        + `<div class="section-hdr"><h2>HISTORY (${events.length})</h2></div><div class="model-history">${rows}</div>`
     }))
   }), 8)
 
@@ -1071,11 +1071,11 @@ ${d.entries.map(changeRow).join('\n')}
   </div>
 </section>
 <div class="section-hdr">
-  <h2 id="releases">== RELEASES (${vers.length}) ==</h2>
+  <h2 id="releases">RELEASES (${vers.length})</h2>
 </div>
 <div class="release-grid">${relCards}</div>
 <div class="section-hdr">
-  <h2>== DAYS BY MONTH (${byDay.length} DATES) ==</h2>
+  <h2>DAYS BY MONTH (${byDay.length} DATES)</h2>
 </div>
 ${yearSections}`
   }))

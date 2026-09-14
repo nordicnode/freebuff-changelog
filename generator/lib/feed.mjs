@@ -199,7 +199,7 @@ export const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
       <body>
         <div class="feed-wrap">
           <div class="term-box">
-            <div class="term-box-hdr">== [ RSS FEED :: <xsl:value-of select="/rss/channel/title"/> ] ==</div>
+            <div class="term-box-hdr">[ RSS FEED :: <xsl:value-of select="/rss/channel/title"/> ]</div>
             <p><xsl:value-of select="/rss/channel/description"/></p>
             <div class="sub-callout">
               <span class="feed-badge">RSS 2.0</span>
