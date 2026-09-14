@@ -4,7 +4,7 @@
 //   node generator/cli.mjs generate [--repo URL] [--full]
 //   node generator/cli.mjs build
 //   node generator/cli.mjs preview [port]
-import { mkdir, readFile, cp } from 'node:fs/promises'
+import { mkdir, readFile, rm, cp } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { resolve, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -626,10 +626,16 @@ async function cmdBuild () {
   const dataDiffs = resolve(DATA, 'diffs')
   const dist = resolve(ROOT, 'dist')
   const t0 = Date.now()
-  // Timeline pagination granularity: real changes per page, breaks on day
-  // boundaries only. 90 keeps the front page the size it has always been and
-  // puts the rest of history on /page/2/ and onward.
-  await buildSite({ changelog, openPrs: prs, dist, timelinePageSize: Number(process.env.CHANGELOG_TIMELINE_PAGE) || 90 })
+  // dist/ is a pure build output, regenerated in full from data/ every run, so it
+  // is cleared first. Without this, any URL the generator stops emitting keeps
+  // shipping the markup of the build that made it -- today that would be a
+  // retired page family serving an old multi-day timeline beside the new one-day
+  // pages, and in general it is stale diffs outliving the entries they describe.
+  await rm(dist, { recursive: true, force: true })
+  await mkdir(dist, { recursive: true })
+  // The timeline paginates one day per page: `/` is the newest day, every older
+  // day is its own /day/<date>/ page.
+  await buildSite({ changelog, openPrs: prs, dist })
 
   const distDiffs = resolve(dist, 'diffs')
   if (existsSync(dataDiffs)) {

@@ -1,7 +1,7 @@
 // generator/test/site.test.mjs - tests for the static site generator
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { buildSite, modelTimeline, modelSlug, scoreHit } from '../lib/site.mjs'
@@ -227,9 +227,14 @@ test('buildSite generates valid static site output', async () => {
     const visibleRows = rowTags(indexHtml).filter(t => !isHidden(t))
     assert.ok(isOpen(visibleRows[0]), 'the first visible row is the one that opens')
     assert.equal(rowTags(indexHtml).filter(isOpen).length, 1, 'exactly one row starts expanded')
-    // Older days render the same complete bodies: no teaser, no "open full
-    // entry" hop. Collapsed, but the full text is in the document.
-    assert.ok(tagOf(indexHtml, 'aaaa11112222') && !isOpen(tagOf(indexHtml, 'aaaa11112222')))
+    // The front page is one day, so an older day's entry is not on it: it lives at
+    // its own URL, with the same complete body -- no teaser, no "open full entry"
+    // hop, and the same one-open-row rule.
+    assert.ok(!tagOf(indexHtml, 'aaaa11112222'), 'the front page holds exactly one day')
+    const olderDayHtml = await readFile(join(tmpDist, 'day/2026-09-12/index.html'), 'utf8')
+    assert.ok(tagOf(olderDayHtml, 'aaaa11112222'), 'older days keep their full bodies at their own URL')
+    assert.ok(isOpen(tagOf(olderDayHtml, 'aaaa11112222')), 'its newest visible row starts open there')
+    assert.equal(rowTags(olderDayHtml).filter(isOpen).length, 1)
     assert.match(indexHtml, /class="entry-summary"/)
     assert.doesNotMatch(indexHtml, /class="badge ai"/)
     assert.doesNotMatch(indexHtml, /Summarized by/)
@@ -287,7 +292,8 @@ test('buildSite generates valid static site output', async () => {
     assert.ok(!entriesApi.latest.some(e => e.noise), 'the latest list in the API stays signal-only')
     const dayChurn = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
     assert.match(dayChurn, /Dependency lockfile updated/, 'churn is still on the day page')
-    assert.match(dayChurn, /2 changes \+ 1 churn/)
+    assert.match(dayChurn, /<span class="day-count">2 changes <span class="day-churn">\+1 churn<\/span><\/span>/,
+      'the day heading still counts the churn it hides')
 
     const statusApi = JSON.parse(await readFile(join(tmpDist, 'api/status.json'), 'utf8'))
     assert.equal(statusApi.total, 4)
@@ -466,10 +472,11 @@ test('buildSite generates valid static site output', async () => {
     // Front-page filters: a chip per category present in this window, churn
     // hidden in the markup (so the default holds without scripting), and the
     // chip that reveals it. Nothing is removed from the document either way --
-    // filtering costs no request, and the day pages stay the exhaustive view.
+    // Filtering costs no request, and every day page carries the same bar and the
+    // same server-side default.
     assert.match(indexHtml, /<nav class="filterbar" id="filters"/)
-    assert.match(indexHtml, /data-filter="\*" data-label="recent"[^>]*aria-pressed="true">recent<span class="chip-n">3<\/span>/,
-      'the reset chip is named for what it counts: this window, not the database')
+    assert.match(indexHtml, /data-filter="\*" data-label="recent"[^>]*aria-pressed="true">recent<span class="chip-n">2<\/span>/,
+      'the reset chip counts this day, not the database')
     assert.match(indexHtml, /data-filter="cli"/)
     assert.match(indexHtml, /data-filter="model-catalog"/)
     assert.match(indexHtml, /data-filter="churn"[^>]*aria-pressed="false">churn<span class="chip-n">1<\/span>/)
@@ -481,7 +488,7 @@ test('buildSite generates valid static site output', async () => {
       'the note line states the all-time total next to the page count')
     assert.equal(rowTags(indexHtml).filter(t => t.includes('data-churn="1"')).length, 1)
     assert.ok(rowTags(indexHtml).every(t => t.includes('data-cat="')), 'every row is filterable by category')
-    assert.equal(rowTags(indexHtml).filter(t => !isHidden(t)).length, 3, 'three rows shown, one hidden')
+    assert.equal(rowTags(indexHtml).filter(t => !isHidden(t)).length, 2, 'one day per page: two changes, its churn row hidden')
     // The toggle is progressive enhancement: guarded on the bar existing, keeps
     // its state across the auto-reload, and hides a day whose rows all filtered
     // out instead of leaving a stray date header.
@@ -494,9 +501,15 @@ test('buildSite generates valid static site output', async () => {
     // The guard is load-bearing for the no-JS default: the hidden attribute only
     // wins if no display rule outranks it.
     assert.match(indexHtml, /\[hidden\]\{display:none!important\}/)
-    // Day pages stay exhaustive: no bar, nothing pre-hidden.
-    assert.doesNotMatch(dayHtml2, /id="filters"/)
-    assert.equal(rowTags(dayHtml2).filter(isHidden).length, 0, 'day pages still list churn')
+    // A day page is the same timeline read one day at a time, so it filters the
+    // same way: bar present, churn listed but hidden in markup. Nothing
+    // disappears -- the day heading still counts the churn row, and one click on
+    // the churn chip shows it.
+    assert.match(dayHtml2, /id="filters"/)
+    assert.equal(rowTags(dayHtml2).filter(t => t.includes('data-churn="1"')).length, 1, 'the churn row is still listed on its day page')
+    assert.ok(rowTags(dayHtml2).find(t => t.includes('data-churn="1"')).includes(' hidden'), 'hidden by default here too')
+    assert.match(dayHtml2, /<span class="day-churn">\+1 churn<\/span>/)
+    assert.match(dayHtml2, /fbIndexFilter/)
 
     // /changes/<category>/ is the all-time half of the filter question: complete
     // lists, compact rows, one click from the full body. A chip that says "27
@@ -611,11 +624,10 @@ test('modelTimeline: replays adds/removes oldest-first', () => {
   assert.deepEqual(retired, ['Muse Spark 1.3'])
 })
 
-// Timeline pagination. The day is the unit: a page ends where a day ends, so no
-// date header is ever split across two pages, and the set of pages covers every
-// entry exactly once. Built here at two changes per page so three days land on
-// two pages.
-test('timeline pages split on day boundaries and cover every entry once', async () => {
+// One day per page. `/` is the newest day and every day also has a /day/<date>/
+// page, which is what the permalinks aim at. Three days in this fixture so the
+// boundaries, the coverage, and the per-day chrome are all visible at once.
+test('the timeline paginates one day per page and keeps every entry reachable', async () => {
   const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-pages-'))
   try {
     const row = (sha, date, extra = {}) => ({
@@ -638,68 +650,102 @@ test('timeline pages split on day boundaries and cover every entry once', async 
       version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-13T00:00:00Z',
       headSha: 'f'.repeat(40), counts: { entries: entries.length }, entries
     }
-    await buildSite({ changelog, openPrs: [], dist: tmpDist, timelinePageSize: 2 })
+    await buildSite({ changelog, openPrs: [], dist: tmpDist })
 
-    const p1 = await readFile(join(tmpDist, 'index.html'), 'utf8')
-    const p2 = await readFile(join(tmpDist, 'page/2/index.html'), 'utf8')
+    const latest = await readFile(join(tmpDist, 'index.html'), 'utf8')
+    const d12 = await readFile(join(tmpDist, 'day/2026-09-12/index.html'), 'utf8')
+    const d11 = await readFile(join(tmpDist, 'day/2026-09-11/index.html'), 'utf8')
+    const d10 = await readFile(join(tmpDist, 'day/2026-09-10/index.html'), 'utf8')
     const pageDays = (h) => [...h.matchAll(/<section class="day" id="(\d{4}-\d{2}-\d{2})">/g)].map(m => m[1])
     const anchors = (h) => [...h.matchAll(/<details class="entry [^"]*" id="([0-9a-f]{12})"[^>]*>/g)].map(m => m[1])
     const tags = (h) => (h.match(/<details class="entry [^"]*" id="[0-9a-f]{12}"[^>]*>/g) || [])
 
-    assert.deepEqual(pageDays(p1), ['2026-09-12', '2026-09-11'])
-    assert.deepEqual(pageDays(p2), ['2026-09-10'], 'the older page carries the older days, none shared')
-    assert.equal(new Set([...anchors(p1), ...anchors(p2)]).size, entries.length, 'every entry rendered exactly once')
+    // A page *is* a day: one heading, and it matches the date in the URL.
+    assert.deepEqual(pageDays(latest), ['2026-09-12'])
+    assert.deepEqual(pageDays(d12), ['2026-09-12'])
+    assert.deepEqual(pageDays(d11), ['2026-09-11'])
+    assert.deepEqual(pageDays(d10), ['2026-09-10'])
 
-    // Page 1 stays what it always was: no bar above the fold, one expanded row,
-    // the live HEAD + countdown. Older pages get the bar top and bottom, start
-    // fully collapsed, and say the data is settled rather than ticking a clock
-    // over history -- the shell's reload-when-behind hook belongs to fresh data.
-    assert.equal((p1.match(/<div class="pager pager-timeline/g) || []).length, 1)
-    assert.equal((p2.match(/<div class="pager pager-timeline/g) || []).length, 2, 'older pages have a way back above the list too')
-    assert.match(p1, /page 1 of 2/)
-    assert.match(p2, /page 2 of 2/)
-    assert.equal(tags(p1).filter(t => / open>$/.test(t)).length, 1, 'one open row, on the newest page only')
-    assert.equal(tags(p2).filter(t => / open>$/.test(t)).length, 0)
-    assert.match(p1, /class="sync-val"/)
-    assert.doesNotMatch(p2, /class="sync-val"/)
-    assert.match(p2, /SETTLED HISTORY/)
-    assert.match(p2, /DATA AS OF \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/, 'a settled page states the exact stamp it was built from')
-    // The shell's aging + reload-when-behind logic keys off .sync-age
-    // [data-generated]; leaving it on a history page would let a future edit
-    // start refreshing someone mid-read.
-    assert.doesNotMatch(p2, /class="sync-age"/)
-    assert.doesNotMatch(p2, /data-generated=/)
-    assert.match(p1, /class="sync-age" data-generated=/)
-    assert.match(p1, /<a href="\/page\/2\/" rel="next">/)
-    assert.doesNotMatch(p1, /rel="prev"/, 'nothing is newer than page 1')
-    assert.match(p2, /<a href="\/" rel="prev">/)
-    assert.doesNotMatch(p2, /rel="next"/, 'nothing is older than the last page')
+    // Coverage. Paging by date is only honest if no day is skipped and no entry is
+    // counted twice, so the day pages together have to be the whole changelog.
+    const dayAnchors = [...anchors(d12), ...anchors(d11), ...anchors(d10)]
+    assert.equal(dayAnchors.length, entries.length, 'every entry rendered, none on two pages')
+    assert.equal(new Set(dayAnchors).size, entries.length)
 
-    // Chips count this page; the all-time figure behind them does not move.
-    assert.match(p1, /data-filter="\*"[^>]*>recent<span class="chip-n">3<\/span>/)
-    assert.match(p2, /data-filter="\*"[^>]*>recent<span class="chip-n">1<\/span>/)
-    assert.match(p1, /data-filter="cli"[^>]*data-total="4"/)
-    assert.match(p2, /data-filter="cli"[^>]*data-total="4"/)
-    assert.match(p2, /showing <b id="filter-count">1<\/b> of 1 rows on this page/)
-    // Churn stays hidden by default on every page, in the markup, not by script.
-    assert.ok(tags(p1).find(t => t.includes('data-churn="1"')).includes(' hidden'))
-    assert.equal(tags(p2).filter(t => t.includes('data-churn="1"')).length, 0, 'no churn on the older page')
-    // Filtering is per page but shares one memory, so page 2 honours what the
-    // reader picked on page 1 instead of snapping back to the default.
-    assert.match(p1, /fbIndexFilter/)
-    assert.match(p2, /fbIndexFilter/)
-    assert.match(p2, /getElementById\('filters'\)/)
+    // /day/<newest>/ is not decoration: archive rows, category lists, search
+    // results, feed items and related links all aim at /day/<date>/#sha, today
+    // included, so today needs that URL as well as `/`.
+    assert.equal(new Set(anchors(d12)).size, 2, 'the newest day holds both of its rows')
+    assert.ok(latest.match(/rel="canonical" href="[^"]*\/">/), 'the front page is canonical at /')
+    assert.ok(d10.match(/rel="canonical" href="[^"]*\/day\/2026-09-10\/">/), 'a day page is canonical at its own date')
 
-    // Reachability: prev/next links, the timeline sitemap, and a cache rule of
-    // its own that cannot collide with `/` or `/index.html`.
-    const tl = await readFile(join(tmpDist, 'sitemap-timeline.xml'), 'utf8')
-    assert.match(tl, /\/page\/2\//)
-    assert.match(await readFile(join(tmpDist, 'sitemap.xml'), 'utf8'), /sitemap-timeline\.xml/)
-    const rules = parseHeaderRules(await readFile(join(tmpDist, '_headers'), 'utf8'))
-    assert.equal(ruleFor(rules, '/page/*').headers['cache-control'], 'public, max-age=60, stale-while-revalidate=300')
-    for (const url of ['/page/2/', '/page/77/']) {
-      assert.deepEqual(duplicatedHeaders(rules, url), [], `overlapping _headers rules for ${url}`)
+    // Freshness follows the data, not the URL: both views of the newest day are
+    // live. A settled day prints the stamp it was built from and carries no
+    // `.sync-age`/`data-generated` hook, because that is what the shell's aging and
+    // reload-when-behind logic looks for -- an auto-refresh while someone reads an
+    // old day would yank the page out from under them.
+    assert.match(latest, /class="sync-val"/)
+    assert.match(d12, /class="sync-val"/)
+    assert.match(d11, /THIS DAY IS SETTLED HISTORY/)
+    assert.doesNotMatch(d11, /class="sync-val"|class="sync-age"|data-generated=/)
+    assert.match(d11, /DATA AS OF \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/)
+
+    // Walking dates: older to the left (rel=prev, the site's reading order), newer
+    // to the right, and the jump select on every page -- 721 days of one click at a
+    // time is not navigation.
+    assert.match(latest, /<a href="\/day\/2026-09-11\/" rel="prev">/)
+    assert.doesNotMatch(latest, /rel="next"/, 'nothing is newer than the newest day')
+    assert.match(d11, /<a href="\/day\/2026-09-10\/" rel="prev">/)
+    assert.match(d11, /<a href="\/" rel="next">/, 'newer than an old day is the front page itself')
+    assert.doesNotMatch(d10, /rel="prev"/, 'nothing is older than the first day')
+    for (const h of [latest, d12, d11, d10]) {
+      assert.match(h, /class="day-jump"/, 'every page can jump straight to a date')
+      assert.match(h, /<div class="pager pager-timeline pager-timeline-top"/, 'the bar sits above the list as well as below')
     }
+    // ...but the select itself appears once per page: two copies of every date in
+    // the database were over half the front page's bytes, so the lower bar points
+    // at the upper one instead of repeating it.
+    for (const h of [latest, d11]) {
+      assert.equal((h.match(/class="day-jump"/g) || []).length, 1)
+      assert.equal((h.match(/<option value="\/day\//g) || []).length, 3, 'one option per day, emitted once')
+    }
+    assert.match(d11, /<a href="#day-jump">/)
+    assert.match(d11, /id="day-jump"/)
+
+    // Each page opens exactly one row: the day's newest entry that a reader can
+    // actually see -- the flag passes over hidden churn.
+    for (const h of [latest, d11, d10]) {
+      assert.equal(tags(h).filter(t => / open>$/.test(t)).length, 1)
+    }
+
+    // Chips count the day. The all-time figure beside them does not move.
+    assert.match(latest, /data-filter="\*"[^>]*data-total="4"[^>]*>recent<span class="chip-n">1<\/span>/)
+    assert.match(d11, /data-filter="\*"[^>]*>this day<span class="chip-n">2<\/span>/, 'a day page names the reset for what it counts')
+    assert.match(d11, /data-filter="cli"[^>]*data-total="4"/)
+    assert.match(d11, /showing <b id="filter-count">2<\/b> of 2 rows on this page <em>no churn that day/)
+    assert.match(d10, /showing <b id="filter-count">1<\/b> of 1 rows on this page/)
+
+    // Churn is listed everywhere and shown by default nowhere: in the markup,
+    // hidden by the server, counted in the heading, one click from view.
+    assert.ok(tags(d12).find(t => t.includes('data-churn="1"')).includes(' hidden'))
+    assert.match(d12, /<span class="day-churn">\+1 churn<\/span>/)
+    assert.match(d12, /data-filter="churn"[^>]*>churn<span class="chip-n">1<\/span>/)
+    assert.equal(tags(d11).filter(t => t.includes('data-churn')).length, 0, 'that day had no churn')
+    // Selection is per page but shares one memory, so walking back keeps what the
+    // reader picked instead of snapping to the default.
+    assert.match(d11, /fbIndexFilter/)
+    assert.match(d11, /getElementById\('filters'\)/)
+
+    // No orphan URL family: the /page/ set is gone rather than lingering as stale
+    // markup, and the day pages that carry the timeline keep their own rule.
+    assert.equal((await readdir(tmpDist)).includes('page'), false)
+    const rules = parseHeaderRules(await readFile(join(tmpDist, '_headers'), 'utf8'))
+    assert.equal(ruleFor(rules, '/day/*').headers['cache-control'], 'public, max-age=60, stale-while-revalidate=300')
+    assert.deepEqual(duplicatedHeaders(rules, '/day/2026-09-11/'), [], 'overlapping _headers rules for /day/2026-09-11/')
+    const dayMap = await readFile(join(tmpDist, 'sitemap-days.xml'), 'utf8')
+    assert.match(dayMap, /\/day\/2026-09-10\//)
+    assert.doesNotMatch(dayMap, /\/page\//)
+
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }

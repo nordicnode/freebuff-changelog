@@ -67,27 +67,27 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
   page. The inline diff toggle appears only when `data/diffs/<sha>.diff` is
   actually published — `pruneDiffs` drops files after 90 days, and a toggle that
   fetches a 404 is worse than the GitHub compare link beside it.
-* The front page filters: a chip per category present in the current window, one
-  toggle for churn, state kept in `localStorage`. Filtering is a visibility flip
-  over rows that are already in the document, so it costs no request and no
-  backend. **Churn is hidden on the server** (`<details … hidden>`), not by
-  script — a default has to hold for readers with JavaScript off, and only the
-  categories actually in the window get a chip, so no chip can filter the page
-  down to nothing. A day whose rows are all filtered out hides its own header, a
-  `#sha` permalink into a filtered-out row reveals that row instead of landing on
-  blank space, and day pages plus the archive stay the exhaustive view.
-* The timeline paginates in **whole days**: `/` holds the newest ~90 real changes
-  (plus their churn), `/page/2/` the next batch, 77 pages back to the first
-  entry. Page size is `CHANGELOG_TIMELINE_PAGE` (default 90), and the budget is
-  spent on changes rather than rows so churn cannot push history off the front
-  page. A page break never lands inside a day: a date split across two pages
-  would show the same heading twice and hide half of each day behind a click.
-  The chips are per page and their counts are page-scoped — `data-total` carries
-  the all-time figure beside them — and filter state is shared, so page 2 honours
-  what was picked on page 1. Only page 1 gets the live chrome (HEAD + sync
-  countdown + one expanded row); older pages say the data is settled, since a
-  countdown over 2024 is theatre and the reload-when-behind hook belongs to fresh
-  data.
+* The front page filters: a chip per category present on the page, one toggle for
+  churn, state kept in `localStorage`. Filtering is a visibility flip over rows
+  that are already in the document, so it costs no request and no backend. **Churn
+  is hidden on the server** (`<details … hidden>`), not by script — a default has
+  to hold for readers with JavaScript off, and only the categories actually on the
+  page get a chip, so no chip can filter the page down to nothing. A day whose rows
+  are all filtered out hides its own header, and a `#sha` permalink into a
+  filtered-out row reveals that row rather than landing on blank space.
+* The timeline paginates **one day per page**: `/` is the newest day,
+  `/day/2026-09-13/` is that same day at its permalink, and older days walk back
+  721 pages to the first entry. A page *is* a date, so the heading on screen, the
+  URL, the pager and a link someone shared cannot disagree, and no page splits a
+  day in half. Chips count the day they sit on while `data-total` carries the
+  all-time figure, and filter state is shared, so walking back keeps the reader's
+  selection instead of snapping to the default. The live chrome — HEAD plus the
+  sync countdown — belongs to the newest day only: it is a claim about *now*, and
+  the shell's reload-when-behind hook keys off the same element, so a settled day
+  prints the exact stamp it was built from and carries no hook at all (an
+  auto-refresh while someone reads July 2024 would yank the page out from under
+  them). Every page also carries a jump-to-date select, because 721 days of one
+  click at a time is not navigation.
 
 ## Freshness path (an upstream commit → a reader seeing it)
 
@@ -183,9 +183,8 @@ rule-based summary is used: the site never depends on the LLM.
 
 | route | content |
 |---|---|
-| `/` | last ~90 real changes plus the churn around them (churn hidden by default), category filter chips, hero stats |
-| `/page/2/` … | the same timeline, further back: ~90 changes per page, 77 pages, breaks only at day boundaries |
-| `/day/YYYY-MM-DD/` | every change pushed that UTC day |
+| `/` | the newest day in full: every entry pushed that UTC day (churn hidden by default), category chips, live HEAD + sync countdown |
+| `/day/YYYY-MM-DD/` | one day of the timeline — the same full bodies and chips, one day per page; older/newer walk by date, and there is a jump-to-date select. `#sha` permalinks point here |
 | `/release/1.0.NNN/` | entries since the previous version bump |
 | `/archive/` | every day, release, category |
 | `/changes/`, `/changes/<category>/` | every change of one category, all time: compact rows, each linking to the full body on its day page |

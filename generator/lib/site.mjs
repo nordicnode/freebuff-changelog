@@ -583,7 +583,7 @@ export function modelTimeline (modelEntries) {
 
 async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, '')}/${p}`, html) }
 
-export async function buildSite ({ changelog, openPrs, dist, timelinePageSize = 90 }) {
+export async function buildSite ({ changelog, openPrs, dist }) {
   const entries = [...changelog.entries].reverse() // newest first
   const byDay = groupByDay(entries)
   // "Related" is a reading aid for real changes: churn rows must neither appear
@@ -620,30 +620,19 @@ export async function buildSite ({ changelog, openPrs, dist, timelinePageSize = 
   // of the next hour, describing a schedule that no longer owns freshness.
   const syncBudgetMin = Math.round(syncStaleMs() / 60000)
 
-  // ----- paginated timeline: whole days, ~90 real changes per page
-  // The budget is spent on real changes: with ~30% of recent commits being
-  // lockfile churn, counting rows would have pushed three weeks of actual work
-  // off the front page. Churn rows still render, inside the same day sections.
-  //
-  // Breaks happen only at day boundaries. A page that ended mid-day would put the
-  // same date header on two pages and hide half of each day's entries behind a
-  // click, which is the opposite of what a day heading is for. So pages are even
-  // in *content*, not in *days*: a 77-row day is its own page, a quiet week
-  // stretches across several.
-  const PAGE_WINDOW = timelinePageSize
-  const timelinePages = []
-  {
-    let chunk = [], real = 0
-    for (const d of byDay) {
-      chunk.push(d)
-      real += d.entries.filter(e => !e.noise).length
-      if (real >= PAGE_WINDOW) { timelinePages.push(chunk); chunk = []; real = 0 }
-    }
-    if (chunk.length) timelinePages.push(chunk)
-  }
-  const pageCount = timelinePages.length
-  const pageHref = (i) => (i === 0 ? '/' : `/page/${i + 1}/`)
-  const pageFile = (i) => (i === 0 ? 'index.html' : `page/${i + 1}/index.html`)
+  // ----- the timeline: one day per page
+  // `/` is the newest day and `/day/<date>/` is every older one, rendered by the
+  // same code. Two page families for the same list is how they start to disagree
+  // about what a row means; and because the page *is* a date, the heading on
+  // screen, the URL, the pager and a shared link can never drift apart.
+  const pageCount = byDay.length
+  const timelineHref = (i) => (i === 0 ? '/' : `/day/${byDay[i].day}/`)
+  const dayOptions = byDay.map(d => `<option value="/day/${d.day}/">${esc(fmtDateHuman(d.day))} (${d.entries.filter(e => !e.noise).length})</option>`).join('')
+  // One select per page, not two: 721 options is ~42 KB of markup, and the second
+  // copy used to be 55% of the front page's bytes. The bottom bar points at the
+  // top one instead, which also says where the control is.
+  const dayJump = (current, withId) => `<form class="day-jump"${withId ? ' id="day-jump"' : ''} action="/day/${current}/" method="get" onsubmit="location.href=this.d.value;return false"><label>JUMP:<select name="d" onchange="if(this.value)location.href=this.value"><option value="">--pick a date--</option>${dayOptions}</select></label></form>`
+  const jumpLink = '<a href="#day-jump">[jump to a date &uarr;]</a>'
 
   // Chips are per page: each one counts the rows it can actually hide *here*.
   const chipHtml = (slug, label, n, active, extraClass) => {
@@ -653,80 +642,89 @@ export async function buildSite ({ changelog, openPrs, dist, timelinePageSize = 
     return `  <button type="button" class="chip${active ? ' active' : ''}${extraClass}" data-filter="${esc(slug)}" data-label="${esc(label)}" data-total="${total}" data-href="${esc(href)}" aria-pressed="${active ? 'true' : 'false'}">${esc(label)}<span class="chip-n">${n.toLocaleString()}</span></button>`
   }
 
+  // Walking the timeline is walking dates: older to the left (the site's existing
+  // convention), newer to the right. The jump select lives in the bar under the
+  // hero, because 721 days of one click at a time is not navigation -- and only
+  // there: a second copy of 721 <option>s was over half the front page's bytes.
   const pagePager = (i, top = false) => `<div class="pager pager-timeline${top ? ' pager-timeline-top' : ''}">
-  ${i > 0 ? `<a href="${pageHref(i - 1)}" rel="prev">&larr; newer</a>` : '<span></span>'}
-  <span class="pager-page">page ${i + 1} of ${pageCount} &middot; ${pageCount === 1 ? 'one page holds every day' : `${byDay.length} days`}</span>
-  ${i < pageCount - 1 ? `<a href="${pageHref(i + 1)}" rel="next">older &rarr;</a>` : '<span></span>'}
+  ${i < pageCount - 1 ? `<a href="${timelineHref(i + 1)}" rel="prev">&larr; ${esc(fmtDateHuman(byDay[i + 1].day))}</a>` : '<span></span>'}
+  <span class="pager-page">${i === 0 ? 'NEWEST' : `day ${i + 1} of ${pageCount}`} &middot; ${esc(fmtDateHuman(byDay[i].day))}</span>
+  ${top ? dayJump(byDay[i].day, true) : jumpLink}
+  ${i > 0 ? `<a href="${timelineHref(i - 1)}" rel="next">${esc(fmtDateHuman(byDay[i - 1].day))} &rarr;</a>` : '<span></span>'}
 </div>`
 
-  function renderTimelinePage (days, i) {
-    const firstDay = days.at(-1).day, lastDay = days[0].day
-    const pageRows = days.flatMap(d => d.entries)
-    const pageReal = pageRows.filter(e => !e.noise).length
-    // HEAD + the sync countdown are claims about *now*, so they belong on the
-    // page that shows now. Deep in history the data is settled: no ticking clock,
-    // and deliberately no `.sync-age`/`data-generated` hook either -- that is the
+  function renderTimelineDay (day, i) {
+    const rows = day.entries
+    const real = rows.filter(e => !e.noise).length
+    const churn = rows.length - real
+    const latest = i === 0
+    // The footer on `/` is a live claim: HEAD, and a countdown to the next sync.
+    // Every other day is settled, so it states the stamp it was built from and
+    // deliberately carries no `.sync-age`/`data-generated` hook -- that is the
     // element the shell's aging and reload-when-behind logic looks for, and an
-    // auto-refresh while someone is reading August 2024 would yank the page out
-    // from under them.
-    const freshness = i === 0
+    // auto-refresh while someone reads July 2024 would yank the page out from
+    // under them.
+    const freshness = latest
       ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}">${esc(fmtDateHuman(generated))} UTC</span></span>
       <span>SYNC DUE: <span class="sync-val" style="color:var(--term-cyan);font-weight:600">--:--</span></span>`
       : `<span>DATA AS OF ${esc(String(generated).slice(0, 16).replace('T', ' '))} UTC</span>
-      <span>THIS PAGE IS SETTLED HISTORY</span>`
+      <span>THIS DAY IS SETTLED HISTORY</span>`
     const hero = `
 <section class="hero">
   <div class="term-box term-box-slim">
     <div class="term-box-hdr">
-      <span class="term-box-title">${i === 0 ? 'LATEST' : 'TIMELINE'} :: ${esc(firstDay)} &rarr; ${esc(lastDay)}</span>
-      <span>${meaningful.length.toLocaleString()} changes${churnNote} &middot; ${releases.length} releases${pageCount > 1 ? ` &middot; page ${i + 1}/${pageCount}` : ''}</span>
+      <span class="term-box-title">${latest ? 'LATEST' : 'DAILY_LOG'} :: ${esc(day.day)}</span>
+      <span>${latest
+    ? `${meaningful.length.toLocaleString()} changes${churnNote} &middot; ${releases.length} releases &middot; ${pageCount} days`
+    : `${real} change${real === 1 ? '' : 's'} that day${churn ? ` + ${churn} churn` : ''} &middot; day ${i + 1}/${pageCount}`}</span>
     </div>
     <div class="term-footer-bar">
       ${freshness}
     </div>
+    ${latest ? '' : `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Reconstructed public snapshot commits pushed to CodebuffAI/freebuff on this date.</p>`}
   </div>
 </section>`
 
-    const churnInWindow = pageRows.length - pageReal
     const catCounts = new Map()
-    for (const e of pageRows.filter(e => !e.noise)) {
+    for (const e of rows) {
+      if (e.noise) continue
       const slug = categorySlug(e.category)
       const cur = catCounts.get(slug) || { slug, label: e.category || 'Other', n: 0 }
       cur.n++
       if (!catCounts.has(slug)) catCounts.set(slug, cur)
     }
     const chipList = [...catCounts.values()].sort((a, b) => b.n - a.n || a.label.localeCompare(b.label))
+    // The reset chip is named for what it counts here. "recent" is only true of
+    // `/`; on a Tuesday in 2024 the rows are that day's, not recent ones.
     const filterBar = `<nav class="filterbar" id="filters" aria-label="Filter the rows on this page by category">
   <span class="filter-label">FILTER THIS PAGE:</span>
 ${[
-      chipHtml('*', 'recent', pageReal, true, ''),
+      chipHtml('*', latest ? 'recent' : 'this day', real, true, ''),
       ...chipList.map(c => chipHtml(c.slug, c.label, c.n, false, '')),
-      chipHtml('churn', 'churn', churnInWindow, false, ' chip-churn')
+      chipHtml('churn', 'churn', churn, false, ' chip-churn')
     ].join('\n')}
 </nav>
-<p class="filter-note" data-hub="/changes/" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${pageReal}</b> of ${pageRows.length} rows on this page <em>${churnInWindow ? 'churn hidden' : 'no churn in this window'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/changes/">browse every change by category</a></span></p>`
+<p class="filter-note" data-hub="/changes/" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? 'churn hidden' : 'no churn that day'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/changes/">browse every change by category</a></span></p>`
 
-    // Only the first page opens a row: the newest entry on the site. On older
-    // pages the reader is skimming history, and an open body there would push the
-    // first day's list below the fold.
-    let isFirstIndex = i === 0
-    const daysHtml = days.map(d => {
-      const m = d.entries.filter(e => !e.noise).length
-      const ch = d.entries.length - m
-      return `<section class="day" id="${d.day}">
+    // One row starts open: the day's newest *visible* entry. Churn is hidden by
+    // default, so the flag passes to the first row a reader can actually see
+    // rather than being spent on something off-screen.
+    let notYetOpen = true
+    const dayHtml = `<section class="day" id="${day.day}">
 <div class="day-line">
-  <h2><time datetime="${d.day}">[ ${esc(fmtDateHuman(d.day))} ]</time></h2>
-  <span class="day-count">${m} change${m === 1 ? '' : 's'}${ch ? ` <span class="day-churn">+${ch} churn</span>` : ''}</span>
+  <h2><time datetime="${day.day}">[ ${esc(fmtDateHuman(day.day))} ]</time></h2>
+  <span class="day-count">${real} change${real === 1 ? '' : 's'}${churn ? ` <span class="day-churn">+${churn} churn</span>` : ''}</span>
 </div>
-${d.entries.map(e => {
-        const open = isFirstIndex && !e.noise
-        if (open) isFirstIndex = false
-        return entryCard(e, open, relatedIdx, { hideChurn: true })
-      }).join('\n')}</section>`
-    }).join('')
+${rows.map(e => {
+      const open = notYetOpen && !e.noise
+      if (open) notYetOpen = false
+      return entryCard(e, open, relatedIdx, { hideChurn: true })
+    }).join('\n')}</section>`
 
-    return hero + (i > 0 ? pagePager(i, true) : '') + filterBar + daysHtml + pagePager(i) +
-      (i === 0 ? `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>` : '')
+    return hero + pagePager(i, true) + filterBar + dayHtml + pagePager(i) +
+      (latest
+        ? `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>`
+        : `<p style="margin-top:20px;font-size:.82rem"><a href="/">&larr; [latest]</a> &middot; <a href="/archive/">[archive]</a> &middot; <a href="/changes/">[by category]</a></p>`)
   }
 
   // Front-page filters. Every row the timeline can show is already in the DOM,
@@ -845,44 +843,31 @@ ${d.entries.map(e => {
 })();
 </script>`
 
-  // Pages are independent writes over the same in-memory data, so the pool bounds
-  // file handles, not work: ~77 pages of full entry bodies.
-  const timelineTasks = timelinePages.map((days, i) => async () => {
-    await write(dist, pageFile(i), layout({
-      title: i === 0 ? 'Home' : `Timeline :: page ${i + 1}`,
-      path: pageHref(i),
-      desc: i === 0 ? SITE.desc
-        : `Freebuff changelog, page ${i + 1}: ${days.flatMap(d => d.entries).filter(e => !e.noise).length.toLocaleString()} changes from ${days.at(-1).day} to ${days[0].day}.`,
-      body: renderTimelinePage(days, i) + filterScript
-    }))
-  })
-  await pool(timelineTasks, 8)
-
-  // ----- per-day pages (independent writes: bounded parallel pool)
-  const dayOptions = byDay.map(d => `<option value="/day/${d.day}/">${esc(fmtDateHuman(d.day))} (${d.entries.filter(e => !e.noise).length})</option>`).join('')
-  const dayJump = (current) => `<form class="day-jump" action="/day/${current}/" method="get" onsubmit="location.href=this.d.value;return false"><label>JUMP:<select name="d" onchange="if(this.value)location.href=this.value"><option value="">--pick a date--</option>${dayOptions}</select></label></form>`
-  const dayTasks = byDay.map((d, i) => async () => {
-    const prevDay = i < byDay.length - 1 ? byDay[i + 1] : null
-    const nextDay = i > 0 ? byDay[i - 1] : null
-    const dayPager = `<div class="pager">` +
-      (prevDay ? `<a href="/day/${prevDay.day}/">&larr; ${esc(fmtDateHuman(prevDay.day))}</a>` : '<span></span>') +
-      dayJump(d.day) +
-      (nextDay ? `<a href="/day/${nextDay.day}/">${esc(fmtDateHuman(nextDay.day))} &rarr;</a>` : '<span></span>') +
-      `</div>`
+  // One timeline, one renderer, one URL space: `/` is the newest day and each
+  // older day is its /day/<date>/ page. Writes are independent over the same
+  // in-memory data, so the pool bounds file handles rather than work.
+  const timelineTasks = byDay.map((d, i) => async () => {
+    const real = d.entries.filter(e => !e.noise).length
+    const body = renderTimelineDay(d, i) + filterScript
+    if (i === 0) {
+      await write(dist, 'index.html', layout({ title: 'Home', path: '/', desc: SITE.desc, body }))
+    }
+    // Every day has a /day/<date>/ page, the newest one included. That URL is not
+    // a copy for convenience: entry permalinks -- the archive rows, the category
+    // lists, search results, feed items, related links -- all point at
+    // /day/<date>/#sha, including for today's entries. `/` is the same day read as
+    // the front page, canonical to itself.
     await write(dist, `day/${d.day}/index.html`, layout({
-      title: fmtDateHuman(d.day), path: `/day/${d.day}/`,
-      desc: `${d.entries.filter(e => !e.noise).length} Freebuff changes on ${d.day}`,
+      title: i === 0 ? `Latest :: ${fmtDateHuman(d.day)}` : fmtDateHuman(d.day),
+      path: `/day/${d.day}/`,
+      desc: `${real.toLocaleString()} Freebuff change${real === 1 ? '' : 's'} pushed on ${d.day}.`,
       ogImage: `/og/${d.day}.svg`,
-      body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">DAILY_LOG :: ${esc(d.day)}</span><span>${d.entries.filter(e => !e.noise).length} changes${d.entries.some(e => e.noise) ? ` + ${d.entries.filter(e => e.noise).length} churn` : ''}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Reconstructed public snapshot commits pushed to CodebuffAI/freebuff on this date.</p></div></section>` +
-        dayPager +
-        `<section class="day">${d.entries.map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx)).join('\n')}</section>` +
-        dayPager +
-        `<p style="margin-top:20px;font-size:.82rem"><a href="/">&larr; [latest]</a> &middot; <a href="/archive/">[archive]</a></p>`
+      body
     }))
     const ogTitles = d.entries.slice(0, 3).map(e => e.ai?.title || e.title || '')
-    await write(dist, `og/${d.day}.svg`, ogCardSvg(fmtDateHuman(d.day), ogTitles, `${d.entries.filter(e => !e.noise).length} changes`))
+    await write(dist, `og/${d.day}.svg`, ogCardSvg(fmtDateHuman(d.day), ogTitles, `${real} changes`))
   })
-  await pool(dayTasks, 16)
+  await pool(timelineTasks, 16)
 
   // ----- release pages (ranges precomputed once, pages written in parallel)
   const verMap = new Map()
@@ -1466,15 +1451,11 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
   const relUrls = vers.map(v => `/release/${v.version}/`)
   const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`)]
   const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/watch/', '/changes/', ...browseList.map(b => `/changes/${b.slug}/`), ...(openPrs?.length ? ['/in-flight/'] : [])]
-  // The timeline pages get their own sitemap: it grows every time ~90 more
-  // changes land, while the small `pages` list above is essentially fixed.
-  const timelineUrls = timelinePages.slice(1).map((d, i) => `/page/${i + 2}/`)
   await write(dist, 'sitemap-days.xml', urlset(dayUrls))
   await write(dist, 'sitemap-releases.xml', urlset(relUrls))
   await write(dist, 'sitemap-models.xml', urlset(modelUrls))
   await write(dist, 'sitemap-pages.xml', urlset(pageUrls))
-  await write(dist, 'sitemap-timeline.xml', urlset(timelineUrls))
-  await write(dist, 'sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-timeline.xml', 'sitemap-pages.xml'].map(f => `<sitemap><loc>${SITE.url}/${f}</loc></sitemap>`).join('')}</sitemapindex>`)
+  await write(dist, 'sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-pages.xml'].map(f => `<sitemap><loc>${SITE.url}/${f}</loc></sitemap>`).join('')}</sitemapindex>`)
   await write(dist, 'robots.txt', `User-agent: *\nAllow: /\nSitemap: ${SITE.url}/sitemap.xml\n`)
   // Cache policy. Entry data changes on every sync (~2min), so nothing that
   // carries it may hold a long TTL; only SHA-keyed immutable assets keep
@@ -1536,8 +1517,6 @@ const syncSearch=()=>{const p=new URLSearchParams();if(wq.value.trim())p.set('q'
 /day/*
   Cache-Control: public, max-age=60, stale-while-revalidate=300
 /changes/*
-  Cache-Control: public, max-age=60, stale-while-revalidate=300
-/page/*
   Cache-Control: public, max-age=60, stale-while-revalidate=300
 /pr-diffs/*
   Content-Type: text/plain; charset=utf-8
