@@ -17,6 +17,7 @@
 //   CHANGELOG_LLM_ERROR_COOLDOWN_MS  retry failed entries after this (default 3600000)
 import { createHash } from 'node:crypto'
 import { readJson, writeJson, log, pool } from './util.mjs'
+import { mergeAiCache } from './mergedata.mjs'
 
 export function llmConfigured (env = process.env) {
   return env.CHANGELOG_LLM === '1' && !!env.LLM_API_KEY
@@ -293,7 +294,10 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   await Promise.all(Array.from({ length: poolSize }, () => worker()))
 
   if (cacheModified) {
-    await writeJson(cachePath, cache)
+    // Union with what landed on disk while these calls were in flight: the
+    // cache is keyed by content, so another writer's keys are additive and
+    // must not be dropped by this run's snapshot.
+    await writeJson(cachePath, mergeAiCache(await readJson(cachePath, {}), cache))
   }
   return apiCalls
 }

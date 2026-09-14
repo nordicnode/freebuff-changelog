@@ -1,7 +1,7 @@
 // generator/lib/util.mjs - small shared helpers, zero dependencies.
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import { readFile, writeFile, mkdir, rename } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { promisify } from 'node:util'
 
@@ -39,7 +39,16 @@ export async function readJson (path, fallback) {
 
 export async function writeJson (path, value) {
   await mkdir(dirname(path), { recursive: true })
-  await writeFile(path, JSON.stringify(value, null, 2) + '\n')
+  await writeAtomic(path, JSON.stringify(value, null, 2) + '\n')
+}
+
+// changelog.json is ~10MB and two processes read it while another writes it
+// (build, git add). A truncated read parses as nothing at all, so writes land
+// via a rename, which is atomic within a filesystem.
+async function writeAtomic (path, data) {
+  const tmp = `${path}.${process.pid}.tmp`
+  await writeFile(tmp, data)
+  await rename(tmp, path)
 }
 
 export async function writeText (path, text) {
@@ -92,6 +101,35 @@ export async function pool (tasks, n = 8) {
   })
   await Promise.all(workers)
   return out
+}
+
+// Exclusive worktree lock. The backfill daemon and a manual `npm run generate`
+// share one checkout and the same derived files, so overlapping runs would race
+// on git state (a pull --rebase cannot run over the other's half-written data/).
+// mkdir is atomic, and a stale lock is taken over so a killed service cannot
+// wedge the pipeline until someone notices.
+export async function withLock (lockDir, fn, { staleMs = 30 * 60000, retries = 2 } = {}) {
+  const { mkdir, rm, stat, writeFile } = await import('node:fs/promises')
+  let acquired = false
+  for (let attempt = 0; attempt <= retries && !acquired; attempt++) {
+    try {
+      await mkdir(lockDir, { recursive: false })
+      await writeFile(`${lockDir}/owner`, `${process.pid} ${new Date().toISOString()}\n`).catch(() => {})
+      acquired = true
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err
+      const held = await stat(lockDir).catch(() => null)
+      if (!held || Date.now() - held.mtimeMs <= staleMs) break
+      log(`taking over stale lock ${lockDir} (held ${Math.round((Date.now() - held.mtimeMs) / 60000)}m)`)
+      await rm(lockDir, { recursive: true, force: true })
+    }
+  }
+  if (!acquired) return { acquired: false }
+  try {
+    return { acquired: true, result: await fn() }
+  } finally {
+    await rm(lockDir, { recursive: true, force: true })
+  }
 }
 
 // Retention: delete *.diff files whose entry day is older than the cutoff.

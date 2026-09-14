@@ -11,7 +11,7 @@ that remains: **the diff behind every public commit**.
 ## How it works
 
 ```
-github.com/CodebuffAI/freebuff (hourly cron, zero secrets required)
+github.com/CodebuffAI/freebuff (fetched by the local sync loop; Actions backstop)
         │  git clone / fetch
         ▼
 generator/cli.mjs generate
@@ -31,8 +31,22 @@ data/changelog.json (+ state.json, ai-summaries.json)  ← committed to git
 generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
 ```
 
-* `generate` runs hourly in GitHub Actions (`.github/workflows/changelog-sync.yml`)
-  and pushes updated `data/` back: that push triggers the Pages build.
+* **Sync ownership.** A long-running loop (`npm run backfill`, systemd
+  `freebuff-backfill.service`) is the primary syncer: each cycle re-analyzes
+  upstream when the SHA moved *or* when `generatedAt` fell past
+  `CHANGELOG_SYNC_STALE_MIN` (default 45), then runs one LLM backfill batch.
+  Those two fields are the only inputs to the site's `[stale Nm]` counter, so
+  freshness never waits on the Actions schedule — which drifts badly in practice
+  (`0 * * * *` observed firing at 00:33, 05:35 and 11:21).
+  `.github/workflows/changelog-sync.yml` remains the backstop for when that box
+  is offline.
+* Both writers share one publish path (`cli.mjs push-data`), and every write to
+  `data/changelog.json` / `data/ai-summaries.json` is **merged, never
+  overwritten**: the newer `generatedAt` wins the scalars, entries are unioned by
+  SHA, and each side keeps the summaries it produced. A cycle holds a snapshot in
+  memory across minutes of LLM calls, so overwriting would push a stale `headSha`
+  back onto origin — the exact shape behind a site reading `[stale 184m]` while
+  git kept receiving commits.
 * `build` renders a **fully static site**: one inline stylesheet, zero client JS
   except the search page, system fonts, pre-rendered day/release/archive pages,
   RSS, sitemap, JSON API, `_headers` for edge caching.
@@ -82,7 +96,10 @@ rule-based summary is used: the site never depends on the LLM.
    output dir `dist`.
 3. Set the final URL as `SITE_URL` in the workflow env (for absolute links,
    RSS, sitemap) or edit `SITE.url` in `generator/lib/site.mjs`.
-4. Enable Actions workflows. Done: site self-updates hourly.
+4. Enable Actions workflows (backstop), then run the sync loop — e.g. a user
+   unit with `ExecStart=/usr/bin/node <repo>/generator/cli.mjs backfill --push`
+   and `Restart=always`. Done: the site keeps itself fresh; the cron only covers
+   the machine being offline.
 
 ## Site output
 
