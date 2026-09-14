@@ -6,7 +6,7 @@ import {
   extractModelTableChanges, extractVersionBump, extractSlashCommandChanges,
   commandIdsFromRegistry,
   areaOf, isNoiseFile, deterministicSummary, entryTitle, churnLabel, testLabel, sourceRef, isSyncCommit,
-  extractCommentFacts, extractCleanDiff, parseMarkdownTables, catalogFromReadme,
+  extractCommentFacts, extractCleanDiff, extractRawDiff, EMPTY_TREE, parseMarkdownTables, catalogFromReadme,
   diffCatalogs
 } from '../lib/analyze.mjs'
 
@@ -291,6 +291,43 @@ test('testLabel: describes the suite movement the source lists drop', () => {
   const bare = testLabel({ files: { total: 1, meaningful: 0 }, stats: { additions: 4, deletions: 1 } })
   assert.equal(bare.title, 'Test suite updated')
   assert.match(bare.summary, /1 file/)
+})
+
+// The diff extractor shells out to a real repository, so this builds one: a root
+// commit (no parent -- the base has to be the empty tree), a lockfile-only commit
+// (empty in the clean form by construction, which is why churn stores the raw
+// form), and a size cap that must hold without ever letting git's output through
+// the process buffer -- a 67 MB snapshot diff once threw there and killed an
+// entire backfill run.
+test('diff extraction: root commit, lockfile fallback, bounded output', async (t) => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { execFileSync } = await import('node:child_process')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-diffrepo-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const g = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  g('init', '-q', '-b', 'main')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+  await writeFile(join(dir, 'bun.lock'), 'x'.repeat(2000))
+  g('add', '.')
+  g('commit', '-q', '-m', 'root: lockfile only')
+  const root = g('rev-parse', 'HEAD').trim()
+
+  assert.equal((await extractCleanDiff(dir, EMPTY_TREE, root)).trim(), '',
+    'the clean form drops the lockfile, so a lock-only commit has nothing to show')
+  const raw = await extractRawDiff(dir, EMPTY_TREE, root)
+  assert.match(raw, /^diff --git a\/bun\.lock/, 'the raw form keeps it: that IS the change')
+  assert.doesNotMatch(raw, /diff truncated/, 'a small diff is not marked as cut')
+
+  await writeFile(join(dir, 'big.ts'), Array.from({ length: 4000 }, (_, i) => `export const v${i} = ${i}`).join('\n'))
+  g('add', '.')
+  g('commit', '-q', '-m', 'big')
+  const big = g('rev-parse', 'HEAD').trim()
+  const capped = await extractCleanDiff(dir, root, big, 5000)
+  assert.ok(capped.length <= 5100, `held to the budget, got ${capped.length}`)
+  assert.match(capped, /diff truncated: view full diff on GitHub/, 'and it says so')
 })
 
 

@@ -484,10 +484,10 @@ function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) {
   // so the server never holds diff text in memory or bloats pages with it.
   // Compare view renders the fetched diff side-by-side inline on demand.
   let diffViewer = ''
-  // Only when the diff file is actually published: prunes remove files after
-  // 90 days, and a toggle that fetches a 404 is worse than the GitHub compare
-  // link in the meta row (which the viewer's data-gh fallback also points at).
-  if (e.kind === 'sync' && !e.noise && e.hasDiff) {
+  // The flag is the contract: refreshDiffFlags sets it from data/diffs/ on disk,
+  // for every kind of row. Community commits and churn rows carry a stored diff
+  // too now, so gating on kind here would hide proof that is sitting right there.
+  if (e.hasDiff) {
     diffViewer = `<details class="diff-viewer" data-sha="${e.sha}" data-gh="${esc(e.compareUrl || e.url || '')}">
 <summary class="diff-toggle">
   <span class="diff-toggle-left">
@@ -1285,8 +1285,8 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
 
       <h4>HOW IT WORKS</h4>
       <p><strong>Deterministic first.</strong> Every sync commit is diffed parent-to-head. Model tables in both READMEs are parsed before and after and set-differenced (description-only edits cancel out); the slash-command registry (<code>cli/src/data/slash-commands.ts</code>) gets the same snapshot treatment; version bumps are read from release <code>package.json</code> files. Zero dependencies, stdlib only.</p>
-      <p><strong>LLM summaries, cached forever.</strong> An optional model rewrites each entry once (cached by commit SHA, prompt version, and diff hash, so a prompt edit re-summarizes exactly once) into a technical 2-4 sentence summary. It sees only the diff plus extracted facts — model access/traits, command names, files, stats — and is schema-validated with one repair retry. A second pass can add a one-line plain-English explanation under the summary, pinned to the exact summary it was written from. No provider configured means deterministic summaries only; nothing breaks.</p>
-      <p><strong>Every claim links to proof.</strong> Each entry carries its commit SHA, compare URL, inline diff (lazy-loaded, lockfiles and test-only hunks stripped), and per-file stats. Model swaps render before/after README rows inline.</p>
+      <p><strong>LLM summaries, cached forever.</strong> A model rewrites every change entry once (cached by commit SHA, prompt version, and diff hash, so a prompt edit re-summarizes exactly once) into a technical 2-4 sentence summary — community commits included, not just snapshot diffs. It sees only the diff plus extracted facts — model access/traits, command names, files, stats — and is schema-validated with one repair retry. A second pass adds a one-line plain-English explanation under the summary, pinned to the exact summary it was written from. Lockfile-only churn rows keep the deterministic label instead of paying for it. No provider configured means deterministic summaries only; nothing breaks.</p>
+      <p><strong>Every claim links to proof.</strong> Each entry carries its commit SHA, compare URL, inline diff, and per-file stats. The diff is stored for every entry — lockfiles and test-only hunks stripped where there is other content, kept whole for a commit whose only change <em>is</em> the lockfile — and it loads on demand rather than sitting in the page. Model swaps render before/after README rows inline.</p>
 
       <h4>WHAT WE TRACK</h4>
       <p><strong>Model Catalog</strong> (${(cats.get('Model Catalog') || 0)} changes): additions, retirements, and swaps in the free picker, with access level and trait columns — plus a <a href="/models/">catalog timeline</a> and per-model pages.<br>
@@ -1297,7 +1297,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <strong>In-Flight PRs:</strong> open upstream pull requests with diffstat and 120-line diff previews, pruned when merged.</p>
 
       <h4>HOW TO USE</h4>
-      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a>. Click a row to expand the full entry in place: summary, inline diff (where kept), per-file stats, and links to the exact commit and compare view on GitHub. Share <code>/day/&lt;date&gt;/#sha</code> to point at one specific change.</p>
+      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a>. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. Share <code>/day/&lt;date&gt;/#sha</code> to point at one specific change.</p>
       <p><strong>Find.</strong> The chip bar above the timeline filters the rows on that page by category (the churn chip toggles lockfile-only noise). <a href="/search/">/search/</a> queries every entry ever recorded — press <code>/</code> on any page to jump there — and the <a href="/archive/">/archive/</a> category tiles list each category across all time.</p>
       <p><strong>Models, releases, PRs.</strong> <a href="/models/">/models/</a> replays the free-picker catalog with a page per model; <a href="/archive/#releases">release pages</a> list every commit between two versions; <a href="/stats/">/stats/</a> charts churn and cadence; <a href="/in-flight/">/in-flight/</a> previews open upstream pull requests before they merge.</p>
 

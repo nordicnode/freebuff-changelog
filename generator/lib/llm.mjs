@@ -12,8 +12,11 @@
 //   LLM_API_BASE               default https://api.github.com (GitHub Models,
 //                              free tier; any OpenAI-compatible base works)
 //   LLM_MODEL                  default github:gpt-4o-mini
-//   CHANGELOG_LLM_LIMIT        max commits summarized per run (default 60)
+//   CHANGELOG_LLM_LIMIT        max commits summarized per run (default 60; 0 = no cap)
 //   CHANGELOG_LLM_CONCURRENCY  parallel API calls (default 5)
+//   CHANGELOG_ELI5_LIMIT       plain-English pass budget (defaults to the above)
+//   CHANGELOG_LLM_CHURN=1      also summarize lockfile/icon-only rows, from their
+//                              raw diff (~1,900 extra calls)
 //   CHANGELOG_LLM_ERROR_COOLDOWN_MS  retry failed entries after this (default 3600000)
 //   CHANGELOG_LLM_TRANSIENT_RETRY_MS  ...but gateway blips retry sooner (default 300000)
 //   options.priorityShas       SHAs to summarize ahead of the backlog
@@ -107,7 +110,7 @@ export function buildPrompt (entry, patch) {
   if (files.length) lines.push(`Files: ${files.join(', ')}`)
   const facts = (entry.facts || []).slice(0, 5)
   if (facts.length) lines.push(`Key facts (ground the WHY and DETAIL sentences in these): ${facts.map(f => `- ${f}`).join(' ')}`)
-  lines.push('', 'Diff (bun.lock and pure test hunks omitted):', '```diff', budgetPatch(patch), '```')
+  lines.push('', 'Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):', '```diff', budgetPatch(patch), '```')
   return lines.filter(Boolean).join('\n')
 }
 
@@ -212,7 +215,11 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   if (!llmConfigured(env)) return 0
   const cachePath = `${dataDir}/ai-summaries.json`
   const cache = await readJson(cachePath, {})
-  const limit = Number(env.CHANGELOG_LLM_LIMIT || 60)
+  // `0` means "no cap", which is how a full backfill runs; the daemon's
+  // per-cycle budget stays a small number so a fresh commit never queues behind
+  // history. An unset or empty value keeps the historical default of 60.
+  const rawLimit = env.CHANGELOG_LLM_LIMIT ? Number(env.CHANGELOG_LLM_LIMIT) : 60
+  const limit = rawLimit > 0 ? rawLimit : Infinity
   const concurrency = Number(env.CHANGELOG_LLM_CONCURRENCY || 5)
   const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
   // A gateway blip (502/timeout) must not park a commit for an hour, but it
@@ -227,25 +234,29 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   let cacheModified = false
 
   // User-visible work first: this cycle's fresh commits, then models, releases,
-  // commands — then newest. Recency-only ordering buried a model swap behind
-  // dozens of minors.
-  const prio = (e) => (priority.has(e.sha) ? -1 : e.modelChanges ? 0 : e.version ? 1 : e.cmdChanges ? 2 : 3)
-  // Churn rows (lockfile/icon-only, merges) are listed for completeness but have
-  // no source diff to describe: sending them to the model would cost ~1,900 calls
-  // to be told "dependency versions changed", which deterministicSummary already
-  // says. They never enter the queue.
-  const syncEntries = entries.filter(e => e.kind === 'sync' && !e.noise)
-  syncEntries.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
+  // commands — then newest, then churn last. Recency-only ordering buried a model
+  // swap behind dozens of minors.
+  const prio = (e) => (priority.has(e.sha) ? -1 : e.modelChanges ? 0 : e.version ? 1 : e.cmdChanges ? 2 : e.noise ? 4 : 3)
+  // Every kind is queueable now. The sync-only filter this replaced is what capped
+  // coverage at 913 of 9,527 entries: the 6,732 community commits have real
+  // parent-to-commit diffs in the clone and were never sent anywhere. Churn rows
+  // still stay out unless CHANGELOG_LLM_CHURN=1 -- their clean patch is empty by
+  // construction (the lockfile *is* the change), so llmPatchFor returns nothing
+  // and the queue skips them; the flag sends the raw lockfile diff instead.
+  const churnQueue = env.CHANGELOG_LLM_CHURN === '1'
+  const queueable = entries.filter(e => !e.noise || churnQueue)
+  queueable.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
 
   // Fetch patches in parallel (git-bound, independent) before queueing.
   // Entries without a prompt version predate versioning: re-summarize once.
   const isCurrent = (e) => e.ai?.model && (e.ai?.v ?? 1) >= PROMPT_V
   // Bound the git work to what this run can spend. Diffing every unsummarized
   // entry to pick `limit` of them made cycle time grow with the backlog, which
-  // delayed exactly the fresh entries the loop exists to publish.
-  const window = Math.max(limit * 4, limit + 5)
+  // delayed exactly the fresh entries the loop exists to publish. An uncapped run
+  // still bounds the window, so one pass cannot spend an hour on `git diff`.
+  const window = Number.isFinite(limit) ? Math.max(limit * 4, limit + 5) : 2000
   const candidates = []
-  for (const e of syncEntries) {
+  for (const e of queueable) {
     if (isCurrent(e)) continue
     candidates.push(e)
     if (candidates.length >= window) break
@@ -428,7 +439,8 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   const cache = await readJson(cachePath, {})
   // Separate knobs so the initial fill can be run down faster than the summary
   // budget, without touching the pass that costs real diff tokens.
-  const limit = Number(env.CHANGELOG_ELI5_LIMIT || env.CHANGELOG_LLM_LIMIT || 20)
+  const rawEli5Limit = env.CHANGELOG_ELI5_LIMIT || env.CHANGELOG_LLM_LIMIT
+  const limit = rawEli5Limit && Number(rawEli5Limit) <= 0 ? Infinity : Number(rawEli5Limit || 20)
   const concurrency = Number(env.CHANGELOG_ELI5_CONCURRENCY || env.CHANGELOG_LLM_CONCURRENCY || 5)
   const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
   const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
@@ -441,7 +453,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   pending.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
   // Same bound as the summary pass: choosing this run's dozen entries must not
   // mean hashing the whole backlog.
-  const candidates = pending.slice(0, Math.max(limit * 4, limit + 5))
+  const candidates = pending.slice(0, Number.isFinite(limit) ? Math.max(limit * 4, limit + 5) : 2000)
 
   const queue = []
   for (const e of candidates) {

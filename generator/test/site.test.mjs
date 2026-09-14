@@ -79,6 +79,7 @@ test('buildSite generates valid static site output', async () => {
           sha: 'aaaa111122223333444455556666777788889999',
           url: 'https://github.com/CodebuffAI/freebuff/commit/aaaa',
           date: '2026-09-12T10:00:00Z',
+          hasDiff: true,
           author: 'dev',
           pr: 100,
           prUrl: 'https://github.com/CodebuffAI/freebuff/pull/100',
@@ -156,8 +157,8 @@ test('buildSite generates valid static site output', async () => {
           facts: [],
           summary: 'Only `bun.lock` changed (+49/-55): resolved dependency versions, no source edits.',
           title: 'Dependency lockfile updated',
-          // Deliberately flagged: a churn row must not offer a diff even if an
-          // older pass left the flag on it, because it has no source diff.
+          // Flagged because it genuinely has one: a lockfile-only commit stores
+          // its unstripped diff, so the toggle opens real content.
           hasDiff: true,
           category: 'Churn',
           significance: 'noise',
@@ -233,6 +234,8 @@ test('buildSite generates valid static site output', async () => {
     assert.ok(!tagOf(indexHtml, 'aaaa11112222'), 'the front page holds exactly one day')
     const olderDayHtml = await readFile(join(tmpDist, 'day/2026-09-12/index.html'), 'utf8')
     assert.ok(tagOf(olderDayHtml, 'aaaa11112222'), 'older days keep their full bodies at their own URL')
+    assert.match(olderDayHtml, /class="diff-viewer" data-sha="aaaa11112222/,
+      'a community commit gets the inline diff toggle too -- kind is no longer a gate')
     assert.ok(isOpen(tagOf(olderDayHtml, 'aaaa11112222')), 'its newest visible row starts open there')
     assert.equal(rowTags(olderDayHtml).filter(isOpen).length, 1)
     assert.match(indexHtml, /class="entry-summary"/)
@@ -448,7 +451,7 @@ test('buildSite generates valid static site output', async () => {
     const churnNextRow = indexHtml.indexOf('<details class="entry ', churnStart + 30)
     const churnRow = indexHtml.slice(churnStart, churnNextRow === -1 ? churnStart + 4000 : churnNextRow)
     assert.match(churnRow, /bun\.lock/, 'churn row states which files changed')
-    assert.doesNotMatch(churnRow, /View inline diff/, 'churn rows carry no source diff')
+    assert.match(churnRow, /View inline diff/, 'a churn row opens its lockfile diff like any other row')
     assert.doesNotMatch(churnRow, /class="eli5"/, 'churn rows carry no plain-English line either')
 
     // Front-page filters: a chip per category present in this window, churn

@@ -10,6 +10,9 @@
 //   3. Classify + render a deterministic summary; an optional LLM layer can
 //      rewrite summaries later (cached per commit, see generator/lib/llm.mjs).
 import { git, US, RS } from './util.mjs'
+import { open, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { randomBytes } from "node:crypto";
 
 export const SYNC_SUBJECT = 'Sync public snapshot from freebuff-private'
 
@@ -92,21 +95,51 @@ export async function diffPatch (repoDir, base, head, paths, maxBytes = 24000) {
 
 // Clean unified diff of a commit for in-browser inspection, excluding lockfiles.
 // With excludeTests, pure test files drop out too (matches what the LLM prompt claims).
+const DIFF_TRUNCATED = '\n\n… [diff truncated: view full diff on GitHub] …\n'
+
+/**
+ * `git diff` into a temp file, read back at most maxBytes.
+ *
+ * Writing to a file rather than to stdout is the point. One snapshot commit in
+ * this repo produced a 67 MB diff: execFile's maxBuffer threw, and because the
+ * throw happened inside a `git` call the whole backfill run died. Truncating the
+ * returned string caps what we *keep*, never what git streams through the
+ * process, so it cannot protect against that.
+ */
+async function diffText (repoDir, range, pathspecs, maxBytes) {
+  const tmp = `${tmpdir()}/fb-diff-${randomBytes(8).toString('hex')}.patch`
+  try {
+    const ok = await git(['diff', '--no-color', '-U3', ...range, `--output=${tmp}`, '--', ...pathspecs], repoDir, { allowFail: true })
+    if (ok === null) return ''
+    let fh
+    try {
+      fh = await open(tmp, 'r')
+    } catch { return '' } // git wrote nothing at all: an empty diff
+    try {
+      const buf = Buffer.allocUnsafe(maxBytes + 1)
+      const { bytesRead } = await fh.read(buf, 0, maxBytes + 1, 0)
+      if (bytesRead === 0) return ''
+      const over = bytesRead > maxBytes
+      return buf.subarray(0, over ? maxBytes : bytesRead).toString('utf8') + (over ? DIFF_TRUNCATED : '')
+    } finally { await fh.close() }
+  } finally { await rm(tmp, { force: true }) }
+}
+
+// Clean unified diff of a commit for in-browser inspection, excluding lockfiles.
+// With excludeTests, pure test files drop out too (matches what the LLM prompt claims).
 export async function extractCleanDiff (repoDir, base, head, maxBytes = 48000, excludeTests = false) {
-  const args = [
-    'diff', '--no-color', '-U3', `${base}...${head}`,
-    '--', '.',
+  // `base...head` needs two commits; the empty tree is neither, so a root commit
+  // diffs against it directly.
+  const range = base === EMPTY_TREE ? [EMPTY_TREE, head] : [`${base}...${head}`]
+  const pathspecs = ['.',
     ':(exclude)*bun.lock*',
     ':(exclude)*package-lock.json',
     ':(exclude)*pnpm-lock.yaml',
-    ':(exclude)*yarn.lock'
-  ]
+    ':(exclude)*yarn.lock']
   if (excludeTests) {
-    args.push(':(exclude)*__tests__*', ':(exclude)*test.*', ':(exclude)*spec.*', ':(exclude)*/tests/*')
+    pathspecs.push(':(exclude)*__tests__*', ':(exclude)*test.*', ':(exclude)*spec.*', ':(exclude)*/tests/*')
   }
-  const out = await git(args, repoDir)
-  if (!out) return ''
-  return out.length > maxBytes ? out.slice(0, maxBytes) + '\n\n… [diff truncated: view full diff on GitHub] …\n' : out
+  return diffText(repoDir, range, pathspecs, maxBytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -673,4 +706,20 @@ export async function analyzeCommunityCommit (repoDir, commit, prevSha, repoMeta
   entry.title = entryTitle(entry)
   entry.tags = tagsFor(entry)
   return entry
+}
+// The unstripped diff. extractCleanDiff drops lockfiles on purpose -- but for a
+// commit whose only change IS bun.lock that leaves nothing, and the stored file
+// behind "View inline diff" would be empty. Churn rows get this form instead.
+// Git's empty tree object. A root commit has no parent to diff from, so the
+// base is "nothing at all" -- which is exactly what this hash names.
+export const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+// The unstripped diff. extractCleanDiff drops lockfiles on purpose -- but for a
+// commit whose only change IS bun.lock that leaves nothing, and the stored file
+// behind "View inline diff" would be empty. Churn rows get this form instead.
+// The unstripped diff. extractCleanDiff drops lockfiles on purpose -- but for a
+// commit whose only change IS bun.lock that leaves nothing, and the stored file
+// behind "View inline diff" would be empty. Churn rows get this form instead.
+export async function extractRawDiff (repoDir, base, head, maxBytes = 48000) {
+  const range = base === EMPTY_TREE ? [EMPTY_TREE, head] : [`${base}...${head}`]
+  return diffText(repoDir, range, ['.'], maxBytes)
 }

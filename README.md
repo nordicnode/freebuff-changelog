@@ -24,7 +24,8 @@ generator/cli.mjs generate
   │    • file added/removed/renamed      → structural changes
   │    • inline rationale comments       → verbatim facts (Freebuff devs document heavily)
   ├─ classify: category, areas, significance, noise skip (lock-only/test-only)
-  └─ optional LLM rewrite (env-gated, per-commit cached forever, diff-grounded)
+  └─ optional LLM rewrite (env-gated, per-commit cached forever, diff-grounded;
+     every non-churn entry, community commits included)
         ▼
 data/changelog.json (+ state.json, ai-summaries.json)  ← committed to git
         ▼
@@ -61,13 +62,19 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
   files that were filtered out of the source diff, so they can state what
   actually changed. They are dimmed in the timeline and excluded from feeds,
   search, stats, the "changes" counts and the LLM queue — there is nothing for a
-  model to describe. Test-only commits are *not* churn: real work landed, so
+  model to describe (their diff is still stored; see below). Test-only commits are
+  *not* churn: real work landed, so
   they get a row, a category and a summary like any other entry.
 * An entry is complete where it is listed: index rows render the same full body
   as day pages (files, facts, meta links), so reading one never needs a second
-  page. The inline diff toggle appears only when `data/diffs/<sha>.diff` is
-  actually published — `pruneDiffs` drops files after 90 days, and a toggle that
-  fetches a 404 is worse than the GitHub compare link beside it.
+  page. Every entry also has its diff on disk. `data/diffs/<sha>.diff` is
+  generated for community commits and churn rows as well as snapshots — a churn
+  row stores the *unstripped* diff, because the lockfile is its whole change —
+  and retention follows the entry list: `pruneDiffs` deletes a file only when no
+  entry references it. Age-based retention is what used to leave 58 rows
+  advertising a diff that had been deleted, and a toggle that fetches a 404 is
+  worse than the GitHub compare link beside it. The only rows without a toggle
+  are the handful whose commit is genuinely empty (a net-zero merge).
 * The front page filters: a chip per category present on the page, one toggle for
   churn, state kept in `localStorage`. Filtering is a visibility flip over rows
   that are already in the document, so it costs no request and no backend. **Churn
@@ -133,12 +140,13 @@ strictly in the diff text:
 | `LLM_API_BASE` | any OpenAI-compatible endpoint (default `https://api.openai.com/v1`) |
 | `LLM_API_KEY` | key |
 | `LLM_MODEL` | model name |
-| `CHANGELOG_LLM_LIMIT` | max commits summarized per run (default 60) |
+| `CHANGELOG_LLM_LIMIT` | max commits summarized per run (default 60; `0` = no cap) |
 | `CHANGELOG_LLM_CONCURRENCY` | parallel API calls (default 5) |
 | `CHANGELOG_LLM_ERROR_COOLDOWN_MS` | retry failed entries after this (default 3600000) |
 | `CHANGELOG_ELI5_LIMIT` | plain-English lines per run (defaults to `CHANGELOG_LLM_LIMIT`) |
 | `CHANGELOG_ELI5_CONCURRENCY` | parallel ELI5 calls (defaults to `CHANGELOG_LLM_CONCURRENCY`) |
 | `CHANGELOG_ELI5=0` | disable the plain-English pass only, keep summaries |
+| `CHANGELOG_LLM_CHURN=1` | also summarize lockfile/icon-only rows, from their raw diff (~1,900 extra calls) |
 
 Priority order is user-visible first (models, releases, commands), then newest.
 The prompt carries deterministic signals (category, files, stats, catalog and
@@ -149,7 +157,7 @@ in `generator/lib/llm.mjs`, invalidating stale cache entries exactly once.
 **The ELI5 pass** is a second, separate call per entry: 1-3 sentences of plain
 English under the technical summary, for a reader who does not open code. It is
 *not* extra fields in the summary prompt, because that would mean bumping
-`PROMPT_V` and re-paying 912 summaries that are already good, and because the
+`PROMPT_V` and re-paying every summary that is already good, and because the
 wording of a plain-English ask needs tuning without rewriting technical history.
 So it has its own `ELI5_V`, its own keys in the same cache file
 (`<sha>:eli5:v<N>:<hash>`), and its own budget. Its input is the finished summary
@@ -164,6 +172,16 @@ Every entry that gets a summary gets an ELI5, including brand-new commits: the
 hourly pass runs over all entries rather than only the additions, and the loop's
 drain sits outside the summary branch so a commit summarized in one pass is
 explained in the same cycle.
+
+**Full coverage is a command, not a hope.** `npm run enrich-all` (`--batch N`,
+or `--batch 0` for everything left, plus `--push`) runs one pass: store any
+missing diffs, spend N calls on summaries and N on plain-English lines, publish,
+exit. It is resumable by construction — summaries are cached by SHA + prompt
+version + diff hash, and a diff already on disk is never regenerated — so
+looping it until a pass reports `0 summaries, 0 eli5` left drains the whole
+history. One pass at a time is deliberate: the run holds the worktree lock, and
+the gaps between passes are when the sync daemon gets to publish fresh upstream
+commits.
 
 AI-titled entries are badged `ai`. Without AI, or on API failure, the
 rule-based summary is used: the site never depends on the LLM.

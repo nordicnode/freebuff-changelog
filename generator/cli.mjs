@@ -12,9 +12,8 @@ import { git, readJson, writeJson, writeText, log, ymd, pruneDiffs, pool, withLo
 import { capturePendingWrites, persistMerged } from './lib/mergedata.mjs'
 import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
-  extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE
-} from './lib/analyze.mjs'
-import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, llmConfigured } from './lib/llm.mjs'
+  extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE } from './lib/analyze.mjs'
+import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, llmConfigured, PROMPT_V } from './lib/llm.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
 
@@ -32,15 +31,42 @@ const LOCK = resolve(CACHE, 'generator.lock')
 // Patch for LLM summarization: clean diff (lockfiles + pure test files
 // excluded), matching what the prompt claims. Single source for both
 // generate and catch-up paths.
+// Every entry has a base to diff from: sync rows carry the snapshot parent the
+// analyze pass recorded, community rows have their own commit parent, and a root
+// commit diffs against the empty tree.
+async function baseShaFor (e) {
+  if (e.prevSha) return e.prevSha
+  const parent = (await git(['rev-parse', '--verify', '--quiet', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
+  return parent || EMPTY_TREE
+}
+
+// Patch for LLM summarization: the clean diff (lockfiles + pure test hunks
+// excluded), matching what the prompt claims. Single source for both the generate
+// and catch-up paths.
 async function llmPatchFor (e) {
-  if (e.kind !== 'sync') return ''
-  const prev = e.prevSha || (await git(['rev-parse', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
-  if (!prev) return ''
+  const base = await baseShaFor(e)
   // Test files are stripped from prompts to keep them about shipped behavior --
   // except for test-only commits, where the tests *are* the change. Excluding
   // them there handed the queue an empty patch, so those rows could never be
   // summarized and the backlog counter never reached zero.
-  return extractCleanDiff(REPO_DIR, prev, e.sha, 48000, !e.testOnly)
+  const clean = await extractCleanDiff(REPO_DIR, base, e.sha, 48000, !e.testOnly)
+  if (clean.trim()) return clean
+  // A churn row's entire change IS the lockfile, so the clean form is empty by
+  // construction. CHANGELOG_LLM_CHURN=1 sends the raw diff instead; off by
+  // default because "dependency versions moved" is what the deterministic label
+  // already says, and it costs ~1,900 calls to be told it again.
+  return e.noise && process.env.CHANGELOG_LLM_CHURN === '1'
+    ? extractRawDiff(REPO_DIR, base, e.sha, 12000)
+    : ''
+}
+
+// The text stored at data/diffs/<sha>.diff, i.e. what "View inline diff" opens.
+// Same clean form for real changes; a churn row keeps its lockfile hunks, or the
+// toggle would fetch an empty file.
+async function storedDiffFor (e) {
+  const base = await baseShaFor(e)
+  const clean = await extractCleanDiff(REPO_DIR, base, e.sha)
+  return clean.trim() ? clean : extractRawDiff(REPO_DIR, base, e.sha)
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +248,7 @@ async function generateOnce (argv) {
   // Backfilling of historical/existing entries is handled by the 1-minute loop (npm run backfill / watch).
   const toEnrich = (full || !state.lastSha) ? entries : newlyAddedEntries
   if (toEnrich.length > 0) {
-    await backfillDiffs(toEnrich, 500)
+    await backfillDiffs(toEnrich, toEnrich.length)
     if (llmConfigured()) {
       const n = await enrichWithLlm(toEnrich, llmPatchFor, DATA)
       log(`LLM enriched ${n} new entries`)
@@ -294,37 +320,46 @@ export async function prunePrDiffs (openPrs) {
   return pruned
 }
 
-async function backfillDiffs (entries, max = 1000) {
+/**
+ * Store a diff for every entry that lacks one -- community commits and churn
+ * rows included, which used to be filtered out and left 855 of 9,527 rows with
+ * a diff to open. Newest first, so an interrupted run leaves the pages a reader
+ * actually lands on complete rather than the 2024 archive.
+ */
+async function backfillDiffs (entries, max = Infinity) {
   const diffDir = resolve(DATA, 'diffs')
   await mkdir(diffDir, { recursive: true })
-  const syncs = entries.filter(e => e.kind === 'sync' && !e.noise).reverse()
+  const todo = entries.filter(e => !existsSync(resolve(diffDir, `${e.sha}.diff`))).reverse()
   let count = 0
-  for (const e of syncs) {
-    const diffFile = resolve(diffDir, `${e.sha}.diff`)
-    if (existsSync(diffFile)) {
-      e.hasDiff = true
-      continue
-    }
-    if (count >= max) continue
-    const prev = e.prevSha || (await git(['rev-parse', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
-    if (!prev) continue
-    const diff = await extractCleanDiff(REPO_DIR, prev, e.sha)
-    if (diff) {
-      await writeText(diffFile, diff)
-      e.hasDiff = true
-      count++
-    }
-  }
+  let empty = 0
+  let failed = 0
+  await pool(todo.map(e => async () => {
+    if (count >= max) return
+    // One unreadable commit must not end a run over thousands of them: this is
+    // the pass that died on a single 67 MB diff.
+    let diff = ''
+    try { diff = await storedDiffFor(e) } catch (err) { failed++; log(`diff failed for ${e.sha.slice(0, 8)}: ${err.message.slice(0, 80)}`) }
+    if (!diff) { empty++; return }
+    await writeText(resolve(diffDir, `${e.sha}.diff`), diff)
+    e.hasDiff = true
+    count++
+  }), 8)
   if (count > 0) log(`generated ${count} diffs in data/diffs/`)
+  if (empty > 0) log(`${empty} entries produced no diff text (empty, net-zero merge, or unreadable)`)
+  if (failed > 0) log(`${failed} diffs could not be extracted from the clone`)
+  return count
 }
 
 // One source of truth for the diff toggle: the file on disk. Entries that were
 // summarized before a prune, or that a merge re-imported without the flag, both
 // end up wrong if the flag is trusted instead of checked.
+// One source of truth for the diff toggle: the file on disk. Entries that were
+// summarized before a prune, or that a merge re-imported without the flag, both
+// end up wrong if the flag is trusted instead of checked. Every kind, because
+// every kind now has a stored diff.
 export function refreshDiffFlags (entries, diffDir) {
   let fixed = 0
   for (const e of entries) {
-    if (e.kind !== 'sync' || e.noise) continue
     const want = existsSync(resolve(diffDir, `${e.sha}.diff`))
     if (!!e.hasDiff !== want) {
       e.hasDiff = want || undefined
@@ -510,11 +545,10 @@ async function catchUpOnce (argv) {
     })
   }
 
-  const syncEntries = entries.filter(e => e.kind === 'sync' && !e.noise)
-  const { PROMPT_V: CATCHUP_PROMPT_V } = await import('./lib/llm.mjs')
-  const isCurrent = (e) => e.ai?.title && (e.ai?.v ?? 1) >= CATCHUP_PROMPT_V
-  const unsummarizedSync = syncEntries.filter(e => !isCurrent(e))
-  log(`[backfill] ${syncEntries.length} total sync entries (${unsummarizedSync.length} remaining to summarize)`)
+  const queueable = entries.filter(e => !e.noise)
+  const isCurrent = (e) => e.ai?.title && (e.ai?.v ?? 1) >= PROMPT_V
+  const unsummarized = queueable.filter(e => !isCurrent(e))
+  log(`[backfill] ${queueable.length} total entries (${unsummarized.length} remaining to summarize)`)
 
   let limit = Number(process.env.CHANGELOG_LLM_LIMIT || 5)
   const limitIdx = argv.indexOf('--limit')
@@ -523,7 +557,7 @@ async function catchUpOnce (argv) {
   }
 
   let didSummarize = false
-  if (!unsummarizedSync.length) {
+  if (!unsummarized.length) {
     log('[backfill] all existing sync entries already have AI summaries!')
   } else if (llmConfigured()) {
     await backfillDiffs(entries, 1000)
@@ -533,9 +567,9 @@ async function catchUpOnce (argv) {
       // This cycle's commits go first; the backlog can wait, the news cannot.
       priorityShas: new Set(freshShas.slice(-limit))
     })
-    const remaining = entries.filter(e => e.kind === 'sync' && !e.noise && !isCurrent(e)).length
+    const remaining = queueable.filter(e => !isCurrent(e)).length
     log(`[backfill] enriched ${n} entries with LLM (${remaining} remaining)`)
-    didSummarize = remaining < unsummarizedSync.length
+    didSummarize = remaining < unsummarized.length
   } else {
     log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env)')
   }
@@ -704,6 +738,7 @@ if (IS_MAIN) {
   else if (cmd === 'catch-up') await cmdCatchUp(rest)
   else if (cmd === 'watch' || cmd === 'backfill') await cmdWatch(rest)
   else if (cmd === 'push-data') await cmdPushData(rest)
+  else if (cmd === 'enrich-all') await cmdEnrichAll(rest)
   else if (cmd === 'build') await cmdBuild()
   else if (cmd === 'preview') await cmdPreview(Number(rest[0]) || 8788)
   else {
@@ -713,8 +748,62 @@ if (IS_MAIN) {
   node generator/cli.mjs backfill [--push]        # continuous sync + backfill loop (the daemon)
   node generator/cli.mjs watch [--push]           # alias for backfill
   node generator/cli.mjs push-data [--message M]  # commit+push data/ with the shared race handling
+  node generator/cli.mjs enrich-all [--batch N] [--push]  # one pass toward a diff + summary + ELI5 for every entry (0 = everything left)
   node generator/cli.mjs build                    # render static site → dist/
   node generator/cli.mjs preview [port]           # local preview of dist/`)
     process.exit(cmd ? 1 : 0)
   }
+}
+/**
+ * One pass toward complete coverage: store every missing diff, then spend a
+ * batch of API calls on technical summaries and plain-English lines, and publish.
+ *
+ * A *pass*, not a loop, on purpose: the run holds the worktree lock, and the
+ * daemon needs that lock to publish fresh upstream commits. Looping this from
+ * outside (`until` it reports nothing left) hands the daemon a window between
+ * passes. Everything is resumable -- summaries are cached by sha + prompt
+ * version + diff hash, and a diff already on disk is never regenerated.
+ */
+async function cmdEnrichAll (argv) {
+  const { acquired } = await withLock(LOCK, () => enrichAllPass(argv))
+  if (!acquired) log('another generate/backfill run holds the worktree lock: retry this pass shortly')
+}
+
+async function enrichAllPass (argv) {
+  // --batch 0 means "everything still missing", bounded per pass by the queue's
+  // own git-work window rather than by a call count.
+  const at = argv.indexOf('--batch')
+  const batch = at !== -1 ? Math.max(0, Number(argv[at + 1]) || 0) : 200
+  const env = { ...process.env, CHANGELOG_LLM_LIMIT: String(batch), CHANGELOG_ELI5_LIMIT: String(batch) }
+  const doc = await readJson(`${DATA}/changelog.json`, null)
+  if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
+  const entries = doc.entries
+  const diffDir = resolve(DATA, 'diffs')
+
+  // 1. Diffs: git work only, no API cost, and the LLM queue needs the patch.
+  await ensureRepo()
+  const stored = await backfillDiffs(entries, batch > 0 ? batch * 10 : Infinity)
+  refreshDiffFlags(entries, diffDir)
+
+  // 2. Summaries + plain-English lines, newest-first inside their own priorities.
+  const calls = llmConfigured(env) ? await enrichWithLlm(entries, llmPatchFor, DATA, env, { retryErrors: true }) : 0
+  const eli5 = llmConfigured(env) ? await enrichEli5(entries, DATA, env, { retryErrors: true }) : 0
+  if (!llmConfigured(env)) log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env): stored diffs only')
+
+  const isCurrent = (e) => e.ai?.title && (e.ai?.v ?? 1) >= PROMPT_V
+  const left = {
+    diffs: entries.filter(e => !existsSync(resolve(diffDir, `${e.sha}.diff`))).length,
+    summaries: entries.filter(e => !e.noise && !isCurrent(e)).length,
+    eli5: entries.filter(e => eli5Eligible(e) && !eli5Done(e)).length
+  }
+
+  // 3. Publish, so a run of thousands of passes never loses work to a kill.
+  if (argv.includes('--push')) {
+    await commitAndPushData({ message: `data: coverage backfill (${utcStamp()} UTC)`, overrides: { [`${DATA}/changelog.json`]: doc } })
+  } else {
+    await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: doc }))
+  }
+
+  log(`[enrich-all] +${stored} diffs, +${calls} summaries, +${eli5} eli5 | left: ${left.diffs} diffs, ${left.summaries} summaries, ${left.eli5} eli5`)
+  return left
 }

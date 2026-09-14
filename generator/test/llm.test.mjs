@@ -3,6 +3,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { parseLlmJson, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5 } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
+import { mkdtemp, readFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 test('shortError: collapses HTML error pages to status line', () => {
   assert.equal(shortError(new Error('LLM HTTP 522: <!DOCTYPE html>\n<html>...')), 'LLM HTTP 522')
@@ -335,6 +338,64 @@ test('priorityShas: new commits jump the backlog and patch work stays bounded', 
   assert.equal(patched[0], freshSha, 'the new commit is diffed and queued first')
   assert.ok(patched.length <= Math.max(2 * 4, 2 + 5), `patch work bounded to the run window, got ${patched.length} of ${entries.length}`)
   assert.ok(patched.length < entries.length, 'the whole backlog is not diffed to fill 2 slots')
+})
+
+// Coverage, not just freshness: the sync-only filter is what left 913 of 9,527
+// entries without a summary. Community commits have real parent-to-commit diffs
+// in the clone, so they belong in the queue; churn rows do not, because their
+// clean patch is empty by construction.
+test('the summary queue covers every kind of entry, churn excepted', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-kinds-'))
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
+  const community = { kind: 'community', sha: 'c'.repeat(40), date: '2024-07-09T10:00:00Z', areas: ['CLI'], summary: 'Community commit.' }
+  const sync = { kind: 'sync', sha: 'a'.repeat(40), date: '2026-09-14T10:00:00Z', areas: ['CLI'], summary: 'Sync commit.' }
+  const churn = { kind: 'sync', sha: 'b'.repeat(40), noise: true, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'lockfile' }
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
+  const patched = []
+  const orig = globalThis.fetch
+  globalThis.fetch = async (...a) => { await Promise.resolve(); return orig(...a) }
+  try {
+    await enrichWithLlm([churn, community, sync], async (e) => { patched.push(e.sha); return 'diff --git a/x b/x\n+new\n' }, dir, env, { retryErrors: true })
+  } finally { globalThis.fetch = orig }
+  assert.ok(patched.includes(community.sha), 'a community commit is diffed and queued')
+  assert.ok(patched.includes(sync.sha), 'sync snapshots still queue')
+  assert.ok(!patched.includes(churn.sha), 'churn stays out of the queue without CHANGELOG_LLM_CHURN=1')
+})
+
+test('CHANGELOG_LLM_CHURN=1 admits churn rows', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-churn-'))
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
+  const churn = { kind: 'sync', sha: 'b'.repeat(40), noise: true, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'lockfile' }
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_CHURN: '1' }
+  const patched = []
+  const orig = globalThis.fetch
+  globalThis.fetch = async (...a) => { await Promise.resolve(); return orig(...a) }
+  try {
+    await enrichWithLlm([churn], async (e) => { patched.push(e.sha); return 'diff --git a/bun.lock b/bun.lock\n+1\n' }, dir, env, { retryErrors: true })
+  } finally { globalThis.fetch = orig }
+  assert.deepEqual(patched, [churn.sha], 'the flag sends lockfile rows with their raw diff')
+})
+
+// A full backfill runs uncapped, but "uncapped" may not mean "diff every entry
+// in the repository to pick this pass's dozen": the window stays bounded.
+test('CHANGELOG_LLM_LIMIT=0 drops the call cap but keeps the git window', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-nocap-'))
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
+  const rows = Array.from({ length: 40 }, (_, i) => ({
+    kind: i % 2 ? 'community' : 'sync', sha: `${i.toString(16).padStart(2, '0')}`.padEnd(40, '0'),
+    date: `2026-09-${String(1 + (i % 27)).padStart(2, '0')}T10:00:00Z`, areas: ['CLI'], summary: 'Change.'
+  }))
+  const orig = globalThis.fetch
+  const run = async (limit) => {
+    const patched = []
+    globalThis.fetch = async (...a) => { await Promise.resolve(); return orig(...a) }
+    try {
+      await enrichWithLlm(rows, async (e) => { patched.push(e.sha); return 'diff --git a/x b/x\n+new\n' }, dir, { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: limit }, { retryErrors: true })
+    } finally { globalThis.fetch = orig }
+    return patched.length
+  }
+  assert.ok(await run('5') < 40, 'a capped pass does not touch the whole backlog')
+  assert.equal(await run('0'), 40, 'limit 0 queues everything the window allows')
 })
 
 // ---------------------------------------------------------------------------

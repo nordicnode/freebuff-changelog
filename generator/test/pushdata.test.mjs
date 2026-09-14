@@ -10,10 +10,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { commitAndPushData, refreshDiffFlags } from '../cli.mjs'
+import { pruneDiffs } from '../lib/util.mjs'
 import { mergeChangelog } from '../lib/mergedata.mjs'
 
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
@@ -115,24 +117,39 @@ test('mergeChangelog alone still agrees with what the race converges to', () => 
   assert.equal(merged.entries[0].ai.title, 'A')
 })
 
-// "View inline diff" must reflect data/diffs/ on disk. pruneDiffs deletes files
-// after 90 days while the row keeps hasDiff: true -- 58 rows did that, each
-// toggle fetching a 404 -- and a merged-in row can have a file with no flag, so
-// a readable diff nobody can open.
+// "View inline diff" must reflect data/diffs/ on disk, for every kind of row.
+// Age-based retention used to delete an old entry's file while the row kept
+// hasDiff: true -- 58 rows did that, each toggle fetching a 404 -- and a
+// merged-in row can have a file with no flag, so a readable diff nobody can open.
 test('refreshDiffFlags reconciles hasDiff with the files actually on disk', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'fbweb-diffflags-'))
   t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
   await writeFile(join(dir, 'b'.repeat(40) + '.diff'), 'diff --git a/x b/x\n')
+  await writeFile(join(dir, 'd'.repeat(40) + '.diff'), 'diff --git a/y b/y\n')
   const pruned = { kind: 'sync', sha: 'a'.repeat(40), hasDiff: true }
   const onDisk = { kind: 'sync', sha: 'b'.repeat(40) }
   const churn = { kind: 'sync', sha: 'c'.repeat(40), noise: true, hasDiff: true }
   const community = { kind: 'community', sha: 'd'.repeat(40) }
   const fixed = refreshDiffFlags([pruned, onDisk, churn, community], dir)
-  assert.equal(pruned.hasDiff, undefined, 'a pruned file must not advertise a diff')
+  assert.equal(pruned.hasDiff, undefined, 'a deleted file must not advertise a diff')
   assert.equal(onDisk.hasDiff, true, 'a published diff gets its toggle back')
-  assert.equal(churn.hasDiff, true, 'churn rows are not touched (they carry no source diff)')
-  assert.equal(community.hasDiff, undefined, 'community rows never had inline diffs')
-  assert.equal(fixed, 2)
+  assert.equal(churn.hasDiff, undefined, 'a churn row is reconciled like any other -- its lockfile diff is stored now')
+  assert.equal(community.hasDiff, true, 'community rows carry inline diffs too')
+  assert.equal(fixed, 4, 'every row is reconciled, whatever its kind or its flag')
+})
+
+// The invariant behind "every entry has a diff": retention is the entry list,
+// not the calendar. A 2024 row is as viewable as today's.
+test('pruneDiffs keeps every entry and drops only orphans', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-prune-'))
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
+  const old = 'e'.repeat(40)
+  await writeFile(join(dir, `${old}.diff`), 'diff --git a/x b/x\n')
+  await writeFile(join(dir, 'f'.repeat(40) + '.diff'), 'diff --git a/z b/z\n')
+  const kept = await pruneDiffs(dir, [{ sha: old, day: '2024-07-09' }])
+  assert.equal(kept, 1, 'only a file no entry references is removed')
+  assert.ok(existsSync(join(dir, `${old}.diff`)), 'a two-year-old entry keeps its diff')
+  assert.ok(!existsSync(join(dir, 'f'.repeat(40) + '.diff')), 'the orphan goes')
 })
 
 // The push-recovery path used to run a worktree-wide `git reset --hard`: on a

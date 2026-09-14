@@ -152,22 +152,30 @@ export async function withLock (lockDir, fn, { staleMs = 30 * 60000, retries = 2
 // Day pages degrade to a GitHub compare link when /diffs/<sha>.diff is
 // missing (client renders a notice), so pruning only loses inline diffs
 // for old entries — the site stays fully navigable.
-export async function pruneDiffs (diffDir, entries, retentionDays = 90) {
+/**
+ * Retention: a stored diff lives exactly as long as its entry. Age-based
+ * retention is what left rows advertising a diff that had been deleted (58 of
+ * them, each toggle fetching a 404), and now that every entry -- community
+ * commits and churn rows included -- has a diff on disk, "delete anything older
+ * than N days" contradicts the site's own promise. The only thing allowed to go
+ * is a file no entry references any more.
+ *
+ * Callers run this *before* refreshing the hasDiff flags, so a deleted file
+ * cannot survive the write as a toggle that leads nowhere.
+ */
+export async function pruneDiffs (diffDir, entries) {
   const { readdir, unlink } = await import('node:fs/promises')
   const { existsSync } = await import('node:fs')
   if (!existsSync(diffDir)) return 0
-  const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString().slice(0, 10)
-  const dayBySha = new Map()
-  for (const e of entries) dayBySha.set(e.sha, e.day)
+  const shas = new Set(entries.map(e => e.sha))
   let pruned = 0
   for (const f of await readdir(diffDir)) {
     if (!f.endsWith('.diff')) continue
-    const day = dayBySha.get(f.slice(0, -5))
-    if (day && day < cutoff) {
+    if (!shas.has(f.slice(0, -5))) {
       await unlink(`${diffDir}/${f}`)
       pruned++
     }
   }
-  if (pruned > 0) log(`pruned ${pruned} diffs older than ${cutoff}`)
+  if (pruned > 0) log(`pruned ${pruned} orphaned diffs (no matching entry)`)
   return pruned
 }
