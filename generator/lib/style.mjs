@@ -99,8 +99,11 @@ nav.term-nav{
   flex-wrap:wrap;
 }
 nav.term-nav a{
+  display:inline-flex;
+  align-items:center;
+  min-height:24px;
   color:var(--txt-dim);
-  padding:3px 8px;
+  padding:5px 10px;
   border:1px solid var(--term-border);
   border-radius:2px;
   background:var(--panel);
@@ -276,18 +279,21 @@ nav.term-nav a.active{
 }
 .badges{
   display:inline-flex;
-  gap:5px;
+  gap:8px;
   flex-wrap:wrap;
   align-items:center;
 }
 .badge{
+  display:inline-flex;
+  align-items:center;
+  min-height:24px;
   font-size:.7rem;
   font-weight:600;
-  padding:1px 5px;
+  padding:4px 9px;
   border-radius:2px;
   background:transparent;
   border:1px solid var(--term-border);
-  color:var(--txt-subtle);
+  color:var(--txt-dim);
   text-decoration:none;
 }
 .badge.maj{
@@ -318,9 +324,12 @@ nav.term-nav a.active{
 .permalink{
   opacity:0;
   margin-left:auto;
-  color:var(--txt-subtle);
+  color:var(--txt-dim);
   font-size:.85em;
-  padding:0 4px;
+  padding:4px 8px;
+  min-height:24px;
+  display:inline-flex;
+  align-items:center;
   text-decoration:none;
 }
 .entry:hover .permalink{
@@ -406,7 +415,7 @@ nav.term-nav a.active{
 .snap-row.del .snap-name{color:var(--term-red);text-decoration:line-through}
 .snap-cells{color:var(--txt-dim)}
 .diff-view-modes{display:flex;gap:6px;margin:8px 0 0}
-.diff-mode{background:var(--panel);border:1px solid var(--term-border);color:var(--txt-dim);padding:1px 8px;border-radius:2px;font:inherit;font-size:.72rem;cursor:pointer}
+.diff-mode{background:var(--panel);border:1px solid var(--term-border);color:var(--txt-dim);padding:5px 12px;min-height:24px;border-radius:2px;font:inherit;font-size:.72rem;cursor:pointer}
 .diff-mode.active{border-color:var(--term-cyan);color:var(--term-cyan);font-weight:700}
 .diff-split{width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:.76rem;line-height:1.5}
 .diff-cell{width:50%;vertical-align:top;padding:1px 8px;white-space:pre-wrap;word-break:break-word;border-top:1px solid rgba(48,54,61,0.4)}
@@ -561,7 +570,10 @@ nav.term-nav a.active{
   border:none;
   color:var(--txt-dim);
   cursor:pointer;
-  padding:0;
+  padding:4px 6px;
+  min-height:24px;
+  display:inline-flex;
+  align-items:center;
   font:inherit;
   font-size:.72rem;
   text-decoration:underline dotted;
@@ -753,7 +765,8 @@ nav.term-nav a.active{
   background:var(--panel);
   border:1px solid var(--term-border);
   color:var(--txt-dim);
-  padding:2px 8px;
+  padding:5px 12px;
+  min-height:24px;
   border-radius:2px;
   font:inherit;
   cursor:pointer;
