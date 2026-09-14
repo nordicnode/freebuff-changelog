@@ -49,7 +49,8 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
   git kept receiving commits.
 * `build` renders a **fully static site**: one inline stylesheet, zero client JS
   except the search page, system fonts, pre-rendered day/release/archive pages,
-  RSS, sitemap, JSON API, `_headers` for edge caching.
+  RSS, sitemap, JSON API, `_headers` for content types, CORS and a site-wide
+  `no-cache` policy (caching removed; browsers revalidate every request).
 * Incremental + idempotent: state tracks the last analyzed SHA; rewritten
   upstream history triggers a safe full rescan; AI summaries are keyed by
   SHA+patch-hash so each commit is summarized at most once, ever.
@@ -97,7 +98,7 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
 | analyze + merge-safe write | ~10–40s | — |
 | new rows published **before** the LLM batch | ~1s | `commitAndPushData` |
 | Workers build on push | ~20–60s | Cloudflare |
-| edge/browser TTL on `/`, `/day/*` | ≤ 60s (+`stale-while-revalidate`) | `_headers` |
+| browser reuse of any page | none (`Cache-Control: no-cache`; revalidate, 304 when unchanged) | `_headers` |
 | its summary replaces the deterministic one | next batch, ahead of the backlog | `CHANGELOG_LLM_LIMIT` |
 | its plain-English line appears | same batch (own queue, no diff needed) | `CHANGELOG_ELI5_LIMIT` |
 

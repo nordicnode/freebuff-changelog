@@ -1418,85 +1418,41 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   await write(dist, 'sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-pages.xml'].map(f => `<sitemap><loc>${SITE.url}/${f}</loc></sitemap>`).join('')}</sitemapindex>`)
   await write(dist, 'robots.txt', `User-agent: *\nAllow: /\nSitemap: ${SITE.url}/sitemap.xml\n`)
   await write(dist, '_redirects', '/changes/ /archive/ 301\n')
-  // Cache policy. Entry data changes on every sync (~2min), so nothing that
-  // carries it may hold a long TTL; only SHA-keyed immutable assets keep
-  // year-scale caching. Rules must also never overlap on one header: _headers
-  // does not override, it *merges*, so two rules matching the same URL join
-  // their values with a comma — which is how /feed.json came to serve
-  // "public, max-age=600, public, max-age=600", and /api/entries.json
-  // "access-control-allow-origin: *, *" (browsers reject a multi-valued ACAO, so
-  // CORS for JSON lives in exactly one rule).
+  // Header policy. Caching is off site-wide: one `no-cache` on /* makes every
+  // browser revalidate with the edge before reuse, so a deploy can never be
+  // hidden behind a stale TTL (cheap 304s, not re-downloads). What remains here
+  // is content types and CORS -- and rules must still never overlap on one
+  // header: _headers does not override, it *merges*, so two rules matching the
+  // same URL join their values with a comma (browsers reject a multi-valued
+  // ACAO, so CORS for JSON lives in exactly one rule).
   await write(dist, '_headers', `/*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
+  Cache-Control: no-cache
 /favicon.ico
   Content-Type: image/x-icon
-  Cache-Control: public, max-age=604800
 /favicon.svg
   Content-Type: image/svg+xml
-  Cache-Control: public, max-age=604800
 /icon-192.png
   Content-Type: image/png
-  Cache-Control: public, max-age=604800
 /icon-512.png
   Content-Type: image/png
-  Cache-Control: public, max-age=604800
 /manifest.webmanifest
   Content-Type: application/manifest+json
-  Cache-Control: public, max-age=86400
 /og/*
   Content-Type: image/svg+xml
-  Cache-Control: public, max-age=86400
 /feed.xsl
   Content-Type: text/xsl; charset=utf-8
-  Cache-Control: public, max-age=86400
 /diffs/*
   Content-Type: text/plain; charset=utf-8
-  Cache-Control: public, max-age=31536000, immutable
   Access-Control-Allow-Origin: *
 /*.json
   Access-Control-Allow-Origin: *
-/api/*
-  Cache-Control: public, max-age=30, stale-while-revalidate=60
-/
-  Cache-Control: public, max-age=30, stale-while-revalidate=60
-/index.html
-  Cache-Control: public, max-age=30, stale-while-revalidate=60
-/search-index.json
-  Cache-Control: public, max-age=120, stale-while-revalidate=600
-/models/
-  Cache-Control: public, max-age=120, stale-while-revalidate=600
-/feed.xml
-  Cache-Control: public, max-age=60, stale-while-revalidate=300
-/feed.json
-  Content-Type: application/feed+json; charset=utf-8
-  Cache-Control: public, max-age=60, stale-while-revalidate=300
-/feed-models.xml
-  Cache-Control: public, max-age=60, stale-while-revalidate=300
-/feed-releases.xml
-  Cache-Control: public, max-age=60, stale-while-revalidate=300
-/day/*
-  Cache-Control: public, max-age=60, stale-while-revalidate=300
-/changes/*
-  Cache-Control: public, max-age=60, stale-while-revalidate=300
 /pr-diffs/*
   Content-Type: text/plain; charset=utf-8
-  Cache-Control: public, max-age=300, stale-while-revalidate=1800
   Access-Control-Allow-Origin: *
-/release/*
-  Cache-Control: public, max-age=600, stale-while-revalidate=3600
-/sitemap.xml
-  Cache-Control: public, max-age=3600
-/sitemap-days.xml
-  Cache-Control: public, max-age=3600
-/sitemap-releases.xml
-  Cache-Control: public, max-age=3600
-/sitemap-models.xml
-  Cache-Control: public, max-age=3600
-/sitemap-timeline.xml
-  Cache-Control: public, max-age=3600
-/sitemap-pages.xml
-  Cache-Control: public, max-age=3600
+/feed.json
+  Content-Type: application/feed+json; charset=utf-8
 `)
   await write(dist, '404.html', layout({ title: 'Not found', path: '/404', noindex: true, body: '<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">ERROR :: 404 NOT FOUND</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">No commit or snapshot shipped at this path. <a href="/">&larr; [back to index]</a></p></div></section>' }))
   return { entries: entries.length, days: byDay.length, releases: vers.length }

@@ -302,10 +302,10 @@ test('buildSite generates valid static site output', async () => {
     assert.equal(statusApi.openPrs, 1)
     assert.equal(statusApi.models.changes, 1)
     assert.match(await readFile(join(tmpDist, '_headers'), 'utf8'), /\/pr-diffs\/\*/)
-    assert.match(await readFile(join(tmpDist, '_headers'), 'utf8'), /\/models\//)
+    assert.match(await readFile(join(tmpDist, '_headers'), 'utf8'), /\/feed\.json/)
 
-    // CDN policy: fresh data must reach readers quickly, no rule may collide with
-    // another, and immutable assets keep their long TTL.
+    // Header policy: caching is off site-wide, no rule may collide with
+    // another, and content types/CORS keep their dedicated rules.
     const headerText = await readFile(join(tmpDist, '_headers'), 'utf8')
     const rules = parseHeaderRules(headerText)
     for (const url of ['/', '/index.html', '/about/', '/day/2026-09-13/', '/release/1.0.100/',
@@ -313,16 +313,11 @@ test('buildSite generates valid static site output', async () => {
       '/diffs/aaa.diff', '/pr-diffs/999.diff', '/models/', '/og/day-2026-09-13.svg', '/sitemap.xml']) {
       assert.deepEqual(duplicatedHeaders(rules, url), [], `overlapping _headers rules for ${url}`)
     }
-    assert.equal(ruleFor(rules, '/').headers['cache-control'], 'public, max-age=30, stale-while-revalidate=60')
-    assert.equal(ruleFor(rules, '/day/*').headers['cache-control'], 'public, max-age=60, stale-while-revalidate=300')
-    assert.equal(ruleFor(rules, '/api/*').headers['cache-control'], 'public, max-age=30, stale-while-revalidate=60')
-    assert.equal(ruleFor(rules, '/diffs/*').headers['cache-control'], 'public, max-age=31536000, immutable')
-    // Nothing that carries entry data may outlive the sync budget.
-    for (const p of ['/', '/index.html', '/day/*', '/changes/*', '/api/*', '/feed.xml', '/feed.json', '/search-index.json']) {
-      const maxAge = Number((ruleFor(rules, p).headers['cache-control'].match(/max-age=(\d+)/) || [])[1])
-      assert.ok(maxAge > 0 && maxAge <= 300, `${p} max-age=${maxAge} is too long for a ~2min sync`)
-    }
-    assert.equal(rules.filter(r => r.path === '/feed.json').length, 1, 'duplicate /feed.json rule joins Cache-Control')
+    assert.equal(ruleFor(rules, '/*').headers['cache-control'], 'no-cache')
+    assert.doesNotMatch(headerText, /max-age|stale-while-revalidate|immutable/, 'no TTL directives remain')
+    assert.equal(ruleFor(rules, '/diffs/*').headers['content-type'], 'text/plain; charset=utf-8')
+    assert.equal(ruleFor(rules, '/*.json').headers['access-control-allow-origin'], '*')
+    assert.equal(rules.filter(r => r.path === '/feed.json').length, 1, 'single /feed.json rule')
 
     // The header widget must key off the budget, and a backgrounded tab must not
     // sit on an old stamp forever once the loop has moved on.
@@ -388,19 +383,14 @@ test('buildSite generates valid static site output', async () => {
     assert.match(feedReleases, /releases \(unofficial\)/)
     assert.match(indexHtml, /href="\/feed-models\.xml"/)
     assert.match(indexHtml, /href="\/feed-releases\.xml"/)
-    // Verify _headers contains wildcard rules, diffs, favicons, feeds, and CORS
+    // Verify _headers keeps content types, CORS, and the site-wide no-cache rule
     const headers = await readFile(join(tmpDist, '_headers'), 'utf8')
-    assert.match(headers, /\/feed-models\.xml/)
-    assert.match(headers, /\/feed-releases\.xml/)
-    assert.match(headers, /\/day\/\*/)
-    assert.match(headers, /\/release\/\*/)
     assert.match(headers, /\/diffs\/\*/)
     assert.match(headers, /\/favicon\.ico/)
     assert.match(headers, /\/feed\.xsl/)
     assert.match(headers, /Access-Control-Allow-Origin: \*/)
-    // Root path caches like index.html, and short: a new sync must surface in
-    // seconds, not after a 5-minute edge TTL.
-    assert.match(headers, /^\/\n  Cache-Control: public, max-age=30, stale-while-revalidate=60/m)
+    assert.match(headers, /^\/\*\n(?: {2}\S[^\n]*\n)*? {2}Cache-Control: no-cache/m,
+      'the wildcard rule carries the site-wide no-cache')
 
     // Verify 404 contains noindex
     const notFoundHtml = await readFile(join(tmpDist, '404.html'), 'utf8')
@@ -534,7 +524,7 @@ test('buildSite generates valid static site output', async () => {
     await assert.rejects(readFile(join(tmpDist, 'changes/index.html'), 'utf8'), 'the hub page is gone')
     const redirectsTxt = await readFile(join(tmpDist, '_redirects'), 'utf8')
     assert.match(redirectsTxt, /^\/changes\/ \/archive\/ 301$/m, 'old hub URL redirects to archive')
-    assert.equal(ruleFor(rules, '/changes/*').headers['cache-control'], 'public, max-age=60, stale-while-revalidate=300')
+    assert.doesNotMatch(headerText, /\/changes\/\*/, 'cache-only /changes/* rule retired with the hub')
     for (const url of ['/changes/', '/changes/cli/', '/changes/churn/']) {
       assert.deepEqual(duplicatedHeaders(rules, url), [], `overlapping _headers rules for ${url}`)
     }
@@ -735,7 +725,7 @@ test('the timeline paginates one day per page and keeps every entry reachable', 
     // markup, and the day pages that carry the timeline keep their own rule.
     assert.equal((await readdir(tmpDist)).includes('page'), false)
     const rules = parseHeaderRules(await readFile(join(tmpDist, '_headers'), 'utf8'))
-    assert.equal(ruleFor(rules, '/day/*').headers['cache-control'], 'public, max-age=60, stale-while-revalidate=300')
+    assert.equal(ruleFor(rules, '/*').headers['cache-control'], 'no-cache')
     assert.deepEqual(duplicatedHeaders(rules, '/day/2026-09-11/'), [], 'overlapping _headers rules for /day/2026-09-11/')
     const dayMap = await readFile(join(tmpDist, 'sitemap-days.xml'), 'utf8')
     assert.match(dayMap, /\/day\/2026-09-10\//)
