@@ -523,8 +523,6 @@ nav.term-nav a.active{
 .diff-cell.diff-add{background:rgba(126,231,135,0.07)}
 .diff-cell.diff-del{background:rgba(248,81,73,0.07)}
 .diff-cell.diff-ctx{color:var(--txt-dim)}
-.cat-collapse{margin-top:6px}
-.cat-toggle{cursor:pointer;color:var(--txt-subtle);font-size:.76rem}
 .day-jump{display:inline-flex;align-items:center;gap:6px;font-size:.76rem;color:var(--txt-subtle)}
 .day-jump select{background:var(--panel);border:1px solid var(--term-border);color:var(--txt-dim);padding:1px 6px;border-radius:2px;font:inherit;max-width:190px}
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin:12px 0}
@@ -982,31 +980,41 @@ nav.term-nav a.active{
   color:var(--txt);
   margin:0;
 }
-.release-grid{
-  display:grid;
-  grid-template-columns:repeat(auto-fill,minmax(170px,1fr));
-  gap:6px;
-  margin-bottom:20px;
-}
-.release-card{
-  background:var(--panel);
-  border:1px solid var(--term-border);
-  padding:6px 10px;
-  border-radius:2px;
+/* Archive: one list on screen at a time, and each list folded by month. The tab
+   bar reuses the chip look on purpose -- it *is* the same control, choosing which
+   rows to show -- and .atab only differs in carrying a total, not a count. */
+.archive-tabs{
   display:flex;
-  justify-content:space-between;
+  flex-wrap:wrap;
   align-items:center;
-  font-size:.82rem;
+  gap:6px;
+  margin-top:8px;
 }
-.release-card a{
-  font-weight:700;
-  color:var(--txt);
-  text-decoration:none;
+.atab{
+  font:inherit;
+  font-size:.78rem;
+  letter-spacing:.06em;
+  color:var(--txt-subtle);
+  background:var(--code);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  padding:3px 10px;
+  cursor:pointer;
 }
-.release-card a:hover{
-  color:#ffffff;
-  text-decoration:underline;
+.atab:hover{color:var(--txt);border-color:var(--term-border-strong)}
+.atab:focus-visible{outline:1px solid var(--term-cyan);outline-offset:1px}
+.atab.active{color:var(--txt);border-color:var(--term-cyan);background:rgba(88,166,255,.1)}
+.atab-fold{margin-left:auto;display:flex;gap:6px}
+.atab-fold button{
+  font:inherit;
+  font-size:.72rem;
+  color:var(--txt-dim);
+  background:none;
+  border:none;
+  padding:0;
+  cursor:pointer;
 }
+.atab-fold button:hover{color:var(--term-cyan);text-decoration:underline}
 
 .archive-year{
   margin-top:20px;
@@ -1015,18 +1023,57 @@ nav.term-nav a.active{
   border-bottom:1px solid var(--term-border);
   padding-bottom:4px;
 }
-.archive-month{
-  margin:10px 0 6px;
-  font-size:.8rem;
-  color:var(--txt-dim);
+/* A month is a <details>: the fold works with scripting off, and the summary
+   line carries the counts that decide whether opening it is worth a click. */
+details.amonth{
+  background:var(--panel);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  margin:0 0 6px;
 }
+details.amonth>summary{
+  list-style:none;
+  display:flex;
+  flex-wrap:wrap;
+  align-items:baseline;
+  gap:10px;
+  padding:7px 10px;
+  cursor:pointer;
+}
+details.amonth>summary::-webkit-details-marker{display:none}
+details.amonth>summary::before{content:'\\25B8';color:var(--txt-dim);font-size:.7rem}
+details.amonth[open]>summary::before{content:'\\25BE'}
+details.amonth[open]>summary{border-bottom:1px solid var(--term-border)}
+details.amonth>summary:hover .am-name{color:#ffffff}
+.am-name{font-size:.84rem;font-weight:700;color:var(--txt)}
+.am-meta{font-size:.74rem;color:var(--txt-subtle)}
+.am-body{padding:8px 10px 10px}
+.rel-chips{
+  display:flex;
+  flex-wrap:wrap;
+  gap:4px;
+}
+.rel-chip{
+  display:inline-flex;
+  align-items:baseline;
+  gap:5px;
+  padding:2px 7px;
+  background:var(--code);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  text-decoration:none;
+}
+.rel-chip b{font-size:.78rem;font-weight:400;color:var(--txt-dim)}
+.rel-chip span{font-size:.68rem;color:var(--txt-subtle)}
+.rel-chip:hover{border-color:var(--term-border-strong);text-decoration:none}
+.rel-chip:hover b{color:var(--term-cyan)}
 .archive-days{
   display:grid;
   grid-template-columns:repeat(auto-fill,minmax(105px,1fr));
   gap:4px;
   list-style:none;
   padding:0;
-  margin:0 0 12px;
+  margin:0;
 }
 .archive-days li a{
   display:flex;

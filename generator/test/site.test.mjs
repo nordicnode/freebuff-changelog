@@ -469,7 +469,7 @@ test('buildSite generates valid static site output', async () => {
     // and where to find it: a bare "27" for CLI reads as "that is all there is".
     assert.match(indexHtml, /data-filter="cli" data-label="CLI" data-total="2" data-href="\/changes\/cli\/"/)
     assert.match(indexHtml, /data-filter="churn" data-label="churn" data-total="1" data-href="\/changes\/churn\/"/)
-    assert.match(indexHtml, /id="filter-all">3 changes all-time across 2 categories <a href="\/archive\/"/,
+    assert.match(indexHtml, /id="filter-all">3 changes all-time across 2 categories <a href="\/archive\/#categories"/,
       'the note line states the all-time total next to the page count')
     assert.equal(rowTags(indexHtml).filter(t => t.includes('data-churn="1"')).length, 1)
     assert.ok(rowTags(indexHtml).every(t => t.includes('data-cat="')), 'every row is filterable by category')
@@ -546,7 +546,21 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /property="og:image"/)
     assert.match(indexHtml, /type="application\/feed\+json"/)
     const archiveHtml = await readFile(join(tmpDist, 'archive/index.html'), 'utf8')
-    assert.match(archiveHtml, /cat-collapse/)
+    // One list on screen at a time, each folded by month: the page must carry all
+    // three views server-side (no-JS readers see them all), and exactly the
+    // newest month of each list starts open.
+    assert.equal((archiveHtml.match(/class="aview"/g) || []).length, 3, 'days, releases and categories are all rendered')
+    assert.equal((archiveHtml.match(/class="atab[" ]/g) || []).length, 3, 'the tab bar offers all three views')
+    assert.match(archiveHtml, /data-view="days" aria-pressed="true">DAYS<span class="chip-n">2<\/span>/)
+    assert.match(archiveHtml, /data-view="rel" aria-pressed="false">RELEASES<span class="chip-n">1<\/span>/)
+    assert.equal((archiveHtml.match(/<details class="amonth"/g) || []).length, 2, 'one month per list, both folded')
+    assert.equal((archiveHtml.match(/<details class="amonth" open/g) || []).length, 2, 'the newest month of each list is the open one')
+    assert.match(archiveHtml, /id="days-m-2026-09"/)
+    assert.match(archiveHtml, /Sep 2026<\/span><span class="am-meta">2 days &middot; 3 changes<\/span>/)
+    assert.match(archiveHtml, /<a class="rel-chip" href="\/release\/1\.0\.100\/"/)
+    assert.ok(!/release-card/.test(archiveHtml), 'the card grid is gone')
+    // Release pages link back to /archive/#releases; the anchor still has to exist.
+    assert.match(archiveHtml, /class="aview" data-view="rel" id="releases"/)
     const sitemapModels = await readFile(join(tmpDist, 'sitemap-models.xml'), 'utf8')
     assert.match(sitemapModels, /\/models\/muse-spark-1-3\//)
   } finally {

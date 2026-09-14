@@ -205,8 +205,8 @@ rule-based summary is used: the site never depends on the LLM.
 | `/` | the newest day in full: every entry pushed that UTC day (churn hidden by default), category chips, live HEAD + sync countdown |
 | `/day/YYYY-MM-DD/` | one day of the timeline — the same full bodies and chips, one day per page; older/newer walk by date, and there is a jump-to-date select. `#sha` permalinks point here |
 | `/release/1.0.NNN/` | entries since the previous version bump |
-| `/archive/` | every day, release, category |
-| `/changes/<category>/` | every change of one category, all time: compact rows, each linking to the full body on its day page (category tiles live on `/archive/`; `/changes/` 301-redirects there) |
+| `/archive/` | one list at a time — DAYS / RELEASES / CATEGORIES — each grouped into months that stay folded until opened (`<details>`, so no-JS gets the long version). `#releases`, `#categories` and `#days-m-YYYY-MM` deep-link into a view |
+| `/changes/<category>/` | every change of one category, all time: compact rows, each linking to the full body on its day page (category tiles live on `/archive/#categories`; `/changes/` 301-redirects there) |
 | `/search/` | client filter over pre-built JSON index |
 | `/in-flight/` | open community PRs (via GitHub API, best effort) |
 | `/feed.xml` | RSS of major + notable entries |

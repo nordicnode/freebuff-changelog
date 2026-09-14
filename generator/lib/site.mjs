@@ -636,7 +636,7 @@ export async function buildSite ({ changelog, openPrs, dist }) {
   const chipHtml = (slug, label, n, active, extraClass) => {
     const b = browseBySlug.get(slug)
     const total = b ? b.list.length : meaningful.length
-    const href = b ? `/changes/${b.slug}/` : '/archive/'
+    const href = b ? `/changes/${b.slug}/` : '/archive/#categories'
     return `  <button type="button" class="chip${active ? ' active' : ''}${extraClass}" data-filter="${esc(slug)}" data-label="${esc(label)}" data-total="${total}" data-href="${esc(href)}" aria-pressed="${active ? 'true' : 'false'}">${esc(label)}<span class="chip-n">${n.toLocaleString()}</span></button>`
   }
 
@@ -702,7 +702,7 @@ ${[
       chipHtml('churn', 'churn', churn, false, ' chip-churn')
     ].join('\n')}
 </nav>
-<p class="filter-note" data-hub="/archive/" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? 'churn hidden' : 'no churn that day'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/archive/">browse every change by category</a></span></p>`
+<p class="filter-note" data-hub="/archive/#categories" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? 'churn hidden' : 'no churn that day'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/archive/#categories">browse every change by category</a></span></p>`
 
     // One row starts open: the day's newest *visible* entry. Churn is hidden by
     // default, so the flag passes to the first row a reader can actually see
@@ -747,7 +747,7 @@ ${rows.map(e => {
   var noteEl = document.querySelector('.filter-note em');
   var noteWrap = document.querySelector('.filter-note');
   var allEl = document.getElementById('filter-all');
-  var HUB = (noteWrap && noteWrap.getAttribute('data-hub')) || '/archive/';
+  var HUB = (noteWrap && noteWrap.getAttribute('data-hub')) || '/archive/#categories';
   var ALL_TOTAL = Number(noteWrap && noteWrap.getAttribute('data-all')) || 0;
   var CAT_COUNT = Number(noteWrap && noteWrap.getAttribute('data-cats')) || 0;
   function chipFor(slug) { return bar.querySelector('.chip[data-filter="' + slug + '"]') }
@@ -987,7 +987,7 @@ ${rows.map(e => {
     </div>
     <div class="term-footer-bar">
       <span>${days.length} days &middot; ${esc(list.at(-1).day)} &rarr; ${esc(list[0].day)}</span>
-      <span><a href="/archive/">[ all categories ]</a></span>
+      <span><a href="/archive/#categories">[ all categories ]</a></span>
     </div>
   </div>
 </section>
@@ -995,7 +995,7 @@ ${rows.map(e => {
   <div class="day-line"><h2><time datetime="${d.day}">[ ${esc(fmtDateHuman(d.day))} ]</time></h2><span class="day-count">${d.entries.length} ${unit}${d.entries.length === 1 ? '' : 's'}</span></div>
 ${d.entries.map(changeRow).join('\n')}
 </section>`).join('\n') + `
-<div class="pager"><a href="/archive/">[ all categories ]</a><a href="/">[ back to the timeline ]</a></div>`
+<div class="pager"><a href="/archive/#categories">[ all categories ]</a><a href="/">[ back to the timeline ]</a></div>`
     await write(dist, `changes/${b.slug}/index.html`, layout({
       title: `${b.label} — all time`, path: `/changes/${b.slug}/`,
       desc: `All ${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : b.label + ' changes'} recorded from Freebuff's public snapshots, newest first.`,
@@ -1015,52 +1015,155 @@ ${d.entries.map(changeRow).join('\n')}
   const cats = new Map([...catLists.entries()].map(([c, list]) => [c, list.length]))
   const catTiles = browseList.map(b =>
     `<a class="tile" href="/changes/${b.slug}/"><b>${esc(b.label)}</b><span>${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : 'changes'}</span></a>`).join('')
-  
-  const relCards = [...vers].reverse().map(v =>
-    `<div class="release-card"><a href="/release/${v.version}/">v${esc(v.version)}</a><span style="font-size:.74rem;color:var(--txt-subtle)">${esc(v.date.slice(0, 10))}</span></div>`
-  ).join('')
 
-  const years = new Map()
-  for (const d of byDay) {
-    const y = d.day.slice(0, 4)
-    const m = d.day.slice(0, 7)
-    if (!years.has(y)) years.set(y, new Map())
-    const months = years.get(y)
-    if (!months.has(m)) months.set(m, [])
-    months.get(m).push(d)
-  }
+  // The archive is a directory of ~720 days and ~645 releases. Flat, that is
+  // 1,366 links on one page: a reader looking for August 2025 had to walk past
+  // every month since, and the two lists were interleaved with each other. So
+  // one list is on screen at a time (days / releases / categories), each grouped
+  // into months that stay folded until opened, with the counts that decide
+  // whether to open it on the summary line itself.
+  //
+  // The fold is a <details>, not a script: with JS off the page is simply
+  // longer, never shorter or missing rows. The tab bar only chooses which of the
+  // three server-rendered lists to show.
   const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-  const yearSections = [...years.entries()].map(([y, months]) => {
-    const monthHtml = [...months.entries()].map(([m, days]) => {
-      const [, mo] = m.split('-')
-      const name = monthNames[Number(mo) - 1]
-      const dayItems = days.map(d => `<li><a href="/day/${d.day}/"><span>${d.day.slice(8)}</span><span style="font-size:.7rem;color:var(--txt-subtle)">${d.entries.length}</span></a></li>`).join('')
-      return `<h4 class="archive-month">${name} ${y}</h4><ul class="archive-days">${dayItems}</ul>`
-    }).join('')
-    return `<h3 class="archive-year">${y}</h3>${monthHtml}`
-  }).join('')
+  const monthLabel = (m) => `${monthNames[Number(m.slice(5, 7)) - 1]} ${m.slice(0, 4)}`
+  const realCount = (d) => d.entries.reduce((n, e) => n + (e.noise ? 0 : 1), 0)
+
+  const groupByMonth = (list, keyOf) => {
+    const map = new Map()
+    for (const item of list) {
+      const m = keyOf(item)
+      if (!map.has(m)) map.set(m, [])
+      map.get(m).push(item)
+    }
+    return map
+  }
+
+  // Newest month first, and open: it is where a reader arriving from the front
+  // page is looking. Only the first section of each list gets the attribute, so
+  // the page leads with a handful of rows rather than a wall.
+  const monthSections = (map, view, summaryOf, bodyOf) => {
+    const years = groupByMonth([...map.entries()], ([m]) => m.slice(0, 4))
+    let seen = 0
+    return [...years.entries()].map(([y, months]) =>
+      `<h3 class="archive-year">${y}</h3>` + months.map(([m, items]) => {
+        const open = seen++ === 0 ? ' open' : ''
+        return `<details class="amonth"${open} id="${view}-m-${m}"><summary><span class="am-name">${monthLabel(m)}</span><span class="am-meta">${summaryOf(items)}</span></summary><div class="am-body">${bodyOf(items)}</div></details>`
+      }).join('')).join('')
+  }
+
+  const dayBody = (days) => `<ul class="archive-days">${days.map(d => {
+    const real = realCount(d)
+    const churn = d.entries.length - real
+    return `<li><a href="/day/${d.day}/" title="${esc(fmtDateHuman(d.day))}: ${real} change${real === 1 ? '' : 's'}${churn ? ` + ${churn} churn` : ''}"><span>${d.day.slice(8)}</span><span>${real}</span></a></li>`
+  }).join('')}</ul>`
+
+  // A release is a number and a date; it never needed a card. Day-of-month only
+  // -- the month is the heading of the section it sits in.
+  const relBody = (list) => `<div class="rel-chips">${list.map(v =>
+    `<a class="rel-chip" href="/release/${esc(v.version)}/" title="${esc(v.date.slice(0, 10))}"><b>${esc(v.version)}</b><span>${v.date.slice(8)}</span></a>`).join('')}</div>`
+
+  const daysByMonth = groupByMonth(byDay, d => d.day.slice(0, 7))
+  const relDesc = [...vers].reverse()
+  const relByMonth = groupByMonth(relDesc, v => v.date.slice(0, 7))
+  const daySections = monthSections(daysByMonth, 'days',
+    (days) => {
+      const n = days.reduce((t, d) => t + realCount(d), 0)
+      return `${days.length} day${days.length === 1 ? '' : 's'} &middot; ${n.toLocaleString()} change${n === 1 ? '' : 's'}`
+    }, dayBody)
+  const relSections = monthSections(relByMonth, 'rel',
+    (list) => `${list.length} release${list.length === 1 ? '' : 's'} &middot; ${esc(list.at(-1).version)} &rarr; ${esc(list[0].version)}`,
+    relBody)
+
+  const archiveTabs = `<nav class="archive-tabs" id="archive-tabs" aria-label="Choose which list the archive shows">
+  <button type="button" class="atab active" data-view="days" aria-pressed="true">DAYS<span class="chip-n">${byDay.length}</span></button>
+  <button type="button" class="atab" data-view="rel" aria-pressed="false">RELEASES<span class="chip-n">${vers.length}</span></button>
+  <button type="button" class="atab" data-view="cats" aria-pressed="false">CATEGORIES<span class="chip-n">${cats.size}</span></button>
+  <span class="atab-fold"><button type="button" data-fold="open">[expand months]</button><button type="button" data-fold="close">[collapse]</button></span>
+</nav>`
+
+  const archiveScript = `<script>
+(function () {
+  var tabs = document.getElementById('archive-tabs');
+  if (!tabs) return;
+  var views = [].slice.call(document.querySelectorAll('.aview'));
+  // The URL spells a view the way the section heading does, so a pasted
+  // /archive/#releases reads the same as the link that produced it.
+  var HASH = { days: 'days', rel: 'releases', cats: 'categories' };
+  function show (name, push) {
+    if (!views.some(function (v) { return v.getAttribute('data-view') === name })) return;
+    views.forEach(function (v) { v.hidden = v.getAttribute('data-view') !== name; });
+    [].slice.call(tabs.querySelectorAll('.atab')).forEach(function (b) {
+      var on = b.getAttribute('data-view') === name;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    if (push) { try { history.replaceState(null, '', '#' + (HASH[name] || name)) } catch (e) {} }
+  }
+  tabs.addEventListener('click', function (ev) {
+    var b = ev.target.closest ? ev.target.closest('.atab') : null;
+    if (b) { show(b.getAttribute('data-view'), true); return; }
+    var f = ev.target.closest ? ev.target.closest('[data-fold]') : null;
+    if (!f) return;
+    var open = f.getAttribute('data-fold') === 'open';
+    views.forEach(function (v) {
+      if (v.hidden) return;
+      v.querySelectorAll('details.amonth').forEach(function (d) { d.open = open; });
+    });
+  });
+  // A month link (#days-m-2026-09) or a bare #releases has to land on a view
+  // that is not hidden, or the anchor scrolls to nothing.
+  function fromHash () {
+    var h = (location.hash || '').slice(1);
+    if (!h) return;
+    var m = /^(days|rel|cats)-m-/.exec(h);
+    if (m) {
+      show(m[1], false);
+      var d = document.getElementById(h);
+      if (d) { d.open = true; try { d.scrollIntoView({ block: 'start' }) } catch (e) {} }
+      return;
+    }
+    if (h === 'releases') show('rel', false);
+    else if (h === 'categories') show('cats', false);
+    else if (h === 'days') show('days', false);
+  }
+  document.addEventListener('DOMContentLoaded', fromHash);
+  window.addEventListener('hashchange', fromHash);
+  // Days is the default. The other two are hidden only now, once JS is known to
+  // be running, so a reader without it sees all three lists instead of losing two.
+  views.forEach(function (v) { if (v.getAttribute('data-view') !== 'days') v.hidden = true; });
+})();
+</script>`
 
   await write(dist, 'archive/index.html', layout({
     title: 'Archive', path: '/archive/',
+    desc: `Every date, release and category in the Freebuff changelog: ${byDay.length} days, ${vers.length} releases, ${cats.size} categories.`,
     body: `<section class="hero">
   <div class="term-box">
     <div class="term-box-hdr">
       <span class="term-box-title">ARCHIVE_INDEX :: historical directory</span>
-      <span>${entries.length.toLocaleString()} total commits</span>
+      <span>${entries.length.toLocaleString()} commits &middot; ${byDay.length} days &middot; ${vers.length} releases</span>
     </div>
-    <div style="font-size:.76rem;color:var(--txt-subtle);margin-bottom:6px">CATEGORIES:</div>
-    <details class="cat-collapse" open><summary class="cat-toggle">[${cats.size} categories — toggle]</summary><div class="grid">${catTiles}</div></details>
+    ${archiveTabs}
   </div>
 </section>
-<p class="list-note">Every entry is listed, newest first, ${esc(first.day)} through ${esc(last.day)}. Churn -- dependency lockfiles, icon sets, empty merges -- gets its own list rather than being hidden: it is real repository activity, just not the kind a reader wants mixed into change lists.</p>
-<div class="section-hdr">
-  <h2 id="releases">RELEASES (${vers.length})</h2>
+<div class="aview" data-view="days">
+  <p class="list-note">Every date that holds commits, newest first, ${esc(first.day)} through ${esc(last.day)}. Open a month to see its days; the number on a day is the changes it holds, and hovering says how much of it was churn. Churn -- dependency lockfiles, icon sets, empty merges -- keeps its own list under CATEGORIES rather than being hidden.</p>
+  <div class="section-hdr"><h2 id="days">DAYS BY MONTH (${byDay.length} DATES)</h2></div>
+  ${daySections}
 </div>
-<div class="release-grid">${relCards}</div>
-<div class="section-hdr">
-  <h2>DAYS BY MONTH (${byDay.length} DATES)</h2>
+<div class="aview" data-view="rel" id="releases">
+  <p class="list-note">Every release page, newest first. Each version links to the commits between it and the version before.</p>
+  <div class="section-hdr"><h2>RELEASES BY MONTH (${vers.length})</h2></div>
+  ${relSections}
 </div>
-${yearSections}`
+<div class="aview" data-view="cats" id="categories">
+  <p class="list-note">Every change of one category, all time -- the complete list behind the front page's chips.</p>
+  <div class="section-hdr"><h2>CATEGORIES (${cats.size})</h2></div>
+  <div class="grid">${catTiles}</div>
+</div>
+${archiveScript}`
   }))
 
   // ----- stats (counts, churn, cadence: zero-dependency CSS bars + SVG sparklines)
@@ -1122,7 +1225,7 @@ ${yearSections}`
       + `<div class="stat-grid">`
       + `<div class="stat-card"><h3>CHANGES BY CATEGORY (12-MO TREND)</h3>${statCats.map(([c, n]) => bar(c, n, catMax, `/search/?cat=${encodeURIComponent(c)}`, catSpark(c))).join('')}</div>`
       + `<div class="stat-card"><h3>CODE CHURN BY AREA (+/-)</h3>${churnRows.map(([a, c]) => bar(`${a} +${(c.add / 1000).toFixed(0)}k/-${(c.del / 1000).toFixed(0)}k`, c.add + c.del, churnMax)).join('')}</div>`
-      + `<div class="stat-card"><h3>SHIPPING CADENCE (LAST 12 MO)</h3>${cadenceSpark}${monthRows.map(([m, n]) => bar(m, n, monthMax, `/archive/`)).join('')}</div>`
+      + `<div class="stat-card"><h3>SHIPPING CADENCE (LAST 12 MO)</h3>${cadenceSpark}${monthRows.map(([m, n]) => bar(m, n, monthMax, `/archive/#days-m-${m}`)).join('')}</div>`
       + `<div class="stat-card"><h3>MOST-CHANGED MODELS</h3>${modelRows2.map(([m, n]) => bar(m, n, modelMax, `/models/${modelSlug(m)}/`)).join('')}</div>`
       + `</div>`
   }))
@@ -1297,8 +1400,8 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <strong>In-Flight PRs:</strong> open upstream pull requests with diffstat and 120-line diff previews, pruned when merged.</p>
 
       <h4>HOW TO USE</h4>
-      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a>. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. Share <code>/day/&lt;date&gt;/#sha</code> to point at one specific change.</p>
-      <p><strong>Find.</strong> The chip bar above the timeline filters the rows on that page by category (the churn chip toggles lockfile-only noise). <a href="/search/">/search/</a> queries every entry ever recorded — press <code>/</code> on any page to jump there — and the <a href="/archive/">/archive/</a> category tiles list each category across all time.</p>
+      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a> — which shows one list at a time (days, releases, categories) with each month folded until opened. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. Share <code>/day/&lt;date&gt;/#sha</code> to point at one specific change.</p>
+      <p><strong>Find.</strong> The chip bar above the timeline filters the rows on that page by category (the churn chip toggles lockfile-only noise). <a href="/search/">/search/</a> queries every entry ever recorded — press <code>/</code> on any page to jump there — and <a href="/archive/#categories">/archive/</a> lists each category across all time.</p>
       <p><strong>Models, releases, PRs.</strong> <a href="/models/">/models/</a> replays the free-picker catalog with a page per model; <a href="/archive/#releases">release pages</a> list every commit between two versions; <a href="/stats/">/stats/</a> charts churn and cadence; <a href="/in-flight/">/in-flight/</a> previews open upstream pull requests before they merge.</p>
 
       <h4>LIMITS</h4>
