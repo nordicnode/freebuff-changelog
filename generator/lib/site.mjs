@@ -665,6 +665,9 @@ nav.term-nav a.active{
   gap:8px;
   font-size:.84rem;
 }
+.model-sep{
+  color:var(--txt-subtle);
+}
 .model-history{
   display:flex;
   flex-direction:column;
@@ -1227,8 +1230,8 @@ function badges (e) {
 function modelDiffLine (e) {
   if (!e.modelChanges) return ''
   const { added = [], removed = [] } = e.modelChanges
-  const addHtml = added.map(m => `<span class="modelplus">+${esc(m)}</span>`).join(' ')
-  const remHtml = removed.map(m => `<span class="modelminus">−${esc(m)}</span>`).join(' ')
+  const addHtml = added.map(m => `<span class="modelplus">+${esc(m)}</span>`).join('<span class="model-sep">,</span> ')
+  const remHtml = removed.map(m => `<span class="modelminus">−${esc(m)}</span>`).join('<span class="model-sep">,</span> ')
   let swapContent = ''
   if (added.length && removed.length) {
     swapContent = `${addHtml} <span class="swap-arrow">-></span> ${remHtml}`
@@ -1608,8 +1611,8 @@ ${d.entries.map(e => {
   const { chrono: modelChrono, live: modelLive, retired: modelRetired } = modelTimeline(modelEntries)
   const modelRows = modelChrono.map(e => {
     const { added = [], removed = [] } = e.modelChanges || {}
-    const addHtml = added.map(m => `<span class="modelplus">+${esc(m)}</span>`).join(' ')
-    const remHtml = removed.map(m => `<span class="modelminus">−${esc(m)}</span>`).join(' ')
+    const addHtml = added.map(m => `<span class="modelplus">+${esc(m)}</span>`).join('<span class="model-sep">,</span> ')
+    const remHtml = removed.map(m => `<span class="modelminus">−${esc(m)}</span>`).join('<span class="model-sep">,</span> ')
     const swap = added.length && removed.length
       ? `${addHtml} <span class="swap-arrow">-&gt;</span> ${remHtml}`
       : [addHtml, remHtml].filter(Boolean).join(' ')
@@ -1629,9 +1632,9 @@ ${d.entries.map(e => {
       <span>${modelLive.length} live &middot; ${modelRetired.length} retired</span>
     </div>
     <div style="font-size:.76rem;color:var(--txt-subtle);margin-bottom:6px">LIVE:</div>
-    <div class="model-lineup">${modelLive.map(m => `<span class="modelplus">${esc(m)}</span>`).join(' ')}</div>
+    <div class="model-lineup">${modelLive.map(m => `<span class="modelplus">${esc(m)}</span>`).join('<span class="model-sep">,</span> ')}</div>
     ${modelRetired.length ? `<div style="font-size:.76rem;color:var(--txt-subtle);margin:10px 0 6px">RETIRED:</div>
-    <div class="model-lineup">${modelRetired.map(m => `<span class="modelminus">${esc(m)}</span>`).join(' ')}</div>` : ''}
+    <div class="model-lineup">${modelRetired.map(m => `<span class="modelminus">${esc(m)}</span>`).join('<span class="model-sep">,</span> ')}</div>` : ''}
   </div>
 </section>
 <div class="section-hdr">
