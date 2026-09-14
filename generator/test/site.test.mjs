@@ -5,6 +5,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { buildSite, modelTimeline, modelSlug, scoreHit } from '../lib/site.mjs'
+import { syncStaleMs } from '../lib/sync.mjs'
 
 test('buildSite generates valid static site output', async () => {
   const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-test-dist-'))
@@ -117,7 +118,12 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /Loading diff…/)
     assert.doesNotMatch(indexHtml, /class="sync-badge"/)
     assert.match(indexHtml, /class="sync-val"/)
-    assert.match(indexHtml, /NEXT SYNC:/)
+    assert.match(indexHtml, /SYNC DUE:/)
+    // The countdown must key off the sync budget, not the wall-clock hour: the
+    // backfill loop owns freshness now, so "next :00" would be fiction.
+    assert.match(indexHtml, new RegExp('data-budget-min="' + Math.round(syncStaleMs({}) / 60000) + '"'))
+    assert.doesNotMatch(indexHtml, /setUTCHours/)
+    assert.match(indexHtml, /dataset\.budgetMin/)
     assert.match(indexHtml, /<h2><time datetime="2026-09-13">\[ Sep 13, 2026 \]<\/time><\/h2>/)
     assert.doesNotMatch(indexHtml, /== \[ Sep 13, 2026 \] ==/)
 

@@ -5,6 +5,7 @@ import { writeText, writeBinary } from './util.mjs'
 import { escapeHtml as esc, fmtDateHuman, pool } from './util.mjs'
 import { CSS } from './style.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, ogCardSvg } from './feed.mjs'
+import { syncStaleMs } from './sync.mjs'
 
 const SITE = {
   name: 'Freebuff Changelog',
@@ -75,27 +76,28 @@ ${body}
 <script>
 function updateSyncTimer() {
   const el = document.querySelector('.sync-val');
-  if (!el) return;
-  // Freeze when stale: a countdown to a sync that already missed is a lie.
   const ageEl = document.querySelector('.sync-age');
-  const ageMin = ageEl && ageEl.dataset.generated
-    ? Math.max(0, Math.floor((Date.now() - Date.parse(ageEl.dataset.generated)) / 60000))
-    : 0;
-  const now = new Date();
-  if (now.getUTCMinutes() === 0 || ageMin >= 90) {
+  if (!el || !ageEl || !ageEl.dataset.generated) return;
+  const generated = Date.parse(ageEl.dataset.generated);
+  if (!Number.isFinite(generated)) return;
+  // Budget-based, not wall-clock. The loop re-analyzes when upstream moves or
+  // when the data passes its age budget (data-budget-min); an upstream commit
+  // can trigger it sooner, so this is a worst case, not a promised minute. The
+  // old version ticked to the next :00, describing a schedule that stopped
+  // owning freshness.
+  const budgetMin = Number(ageEl.dataset.budgetMin) || 45;
+  const leftMs = generated + budgetMin * 60000 - Date.now();
+  if (leftMs <= 0) {
+    // Overdue: a pass is running now, or the loop is down and the age counter
+    // is about to turn amber. Either way "next sync at :00" would be fiction.
     el.textContent = 'syncing…';
     el.style.color = 'var(--term-green)';
     return;
   }
   el.style.color = 'var(--term-cyan)';
-  const next = new Date(now);
-  next.setUTCSeconds(0, 0);
-  next.setUTCHours(next.getUTCHours() + 1);
-  next.setUTCMinutes(0);
-  const diffSec = Math.max(0, Math.floor((next.getTime() - now.getTime()) / 1000));
-  const m = Math.floor(diffSec / 60);
-  const s = diffSec % 60;
-  el.textContent = m + 'm ' + (s < 10 ? '0' : '') + s + 's';
+  const m = Math.floor(leftMs / 60000);
+  const s = Math.floor((leftMs % 60000) / 1000);
+  el.textContent = '≤ ' + m + 'm ' + (s < 10 ? '0' : '') + s + 's';
 }
 updateSyncTimer();
 setInterval(updateSyncTimer, 1000);
@@ -543,6 +545,10 @@ export async function buildSite ({ changelog, openPrs, dist }) {
   const first = entries.at(-1), last = entries[0]
   const generated = changelog.generatedAt
   const scannedCount = changelog.counts?.commitsScanned || entries.length
+  // How long the data is allowed to sit before the sync loop re-analyzes. The
+  // countdown below has to be stated in these terms: it used to tick to the top
+  // of the next hour, describing a schedule that no longer owns freshness.
+  const syncBudgetMin = Math.round(syncStaleMs() / 60000)
 
   // ----- index: newest days worth of entries
   const NEW_WINDOW = 90
@@ -557,8 +563,8 @@ export async function buildSite ({ changelog, openPrs, dist }) {
       <span>${entries.length.toLocaleString()} changes &middot; ${releases.length} releases</span>
     </div>
     <div class="term-footer-bar">
-      <span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}">${esc(fmtDateHuman(generated))} UTC</span></span>
-      <span>NEXT SYNC: <span class="sync-val" style="color:var(--term-cyan);font-weight:600">--:--</span></span>
+      <span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}">${esc(fmtDateHuman(generated))} UTC</span></span>
+      <span>SYNC DUE: <span class="sync-val" style="color:var(--term-cyan);font-weight:600">--:--</span></span>
     </div>
   </div>
 </section>`
