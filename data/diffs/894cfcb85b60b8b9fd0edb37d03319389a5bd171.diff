@@ -1,0 +1,320 @@
+diff --git a/backend/src/get-documentation-for-query.ts b/backend/src/get-documentation-for-query.ts
+new file mode 100644
+index 000000000..efc8ffb3b
+--- /dev/null
++++ b/backend/src/get-documentation-for-query.ts
+@@ -0,0 +1,130 @@
++import { geminiModels } from 'common/constants'
++import { generateCompactId } from 'common/util/string'
++
++import {
++  context7ProjectsPromise,
++  getContext7ProjectChunks,
++} from './llm-apis/context7-api'
++import { promptGeminiWithFallbacks } from './llm-apis/gemini-with-fallbacks'
++
++import { logger } from '@/util/logger'
++
++interface ProjectAnalysis {
++  projectId: string
++  topic: string
++  confidence: number
++}
++
++/**
++ * Gets relevant documentation chunks for a query by using Gemini to analyze the best project and topic
++ * @param query The user's query to find documentation for
++ * @param options Optional parameters for the request
++ * @param options.tokens Number of tokens to retrieve (default: 5000)
++ * @param options.clientSessionId Unique ID for the client session
++ * @param options.fingerprintId Unique ID for the user's device/fingerprint
++ * @param options.userId The ID of the user making the request
++ * @returns The documentation text chunks or null if no relevant docs found
++ */
++export async function getDocumentationForQuery(
++  query: string,
++  options: {
++    tokens?: number
++    clientSessionId: string
++    fingerprintId: string
++    userId?: string
++  }
++): Promise<string | null> {
++  const startTime = Date.now()
++  let geminiDuration: number | null = null
++
++  // Get the list of available projects
++  const projects = await context7ProjectsPromise
++  if (projects.length === 0) {
++    logger.warn('No Context7 projects available')
++    return null
++  }
++
++  // Create a prompt for Gemini to analyze the query and projects
++  const projectsList = projects
++    .map((p) => `${p.settings.title} (ID: ${p.settings.project})`)
++    .join('\n')
++
++  const prompt = `You are an expert at analyzing documentation queries and matching them to the most relevant project and topic. Given a user's query and a list of available documentation projects, determine which project would be most relevant and what topic/keywords would help find the most relevant chunks of documentation.
++
++Available projects:
++${projectsList}
++
++User query:
++${query}
++
++Respond in this exact JSON format:
++{
++  "projectId": "the-project-id",
++  "topic": "relevant search keywords",
++  "confidence": 0.8  // 0-1 score of how confident you are this is relevant
++}`
++
++  // Get project analysis from Gemini
++  const geminiStartTime = Date.now()
++  let response: string
++  try {
++    response = await promptGeminiWithFallbacks(
++      [
++        { role: 'user', content: prompt },
++        { role: 'assistant', content: '{' },
++      ],
++      undefined,
++      {
++        model: geminiModels.gemini2flash,
++        clientSessionId: options.clientSessionId,
++        fingerprintId: options.fingerprintId,
++        userInputId: generateCompactId(),
++        userId: options.userId,
++        temperature: 0,
++      }
++    )
++  } catch (error) {
++    logger.error({ error }, 'Failed to get Gemini response')
++    return null
++  }
++  geminiDuration = Date.now() - geminiStartTime
++
++  // Parse Gemini response
++  let analysis: ProjectAnalysis
++  try {
++    analysis = JSON.parse('{' + response) as ProjectAnalysis
++  } catch (error) {
++    logger.error({ error, response }, 'Failed to parse Gemini response')
++    return null
++  }
++
++  // Only proceed if we're confident in the match
++  if (analysis.confidence <= 0.7) {
++    logger.info(
++      { analysis, query, geminiDuration },
++      'Low confidence in documentation chunks match'
++    )
++    return null
++  }
++
++  // Get the chunks using the analyzed project and topic
++  const chunks = await getContext7ProjectChunks(analysis.projectId, {
++    tokens: options.tokens,
++    topic: analysis.topic,
++  })
++
++  const totalDuration = Date.now() - startTime
++  logger.info(
++    {
++      geminiResponse: response,
++      chunks,
++      timings: {
++        total: totalDuration,
++        gemini: geminiDuration,
++      },
++    },
++    'Documentation chunks results'
++  )
++
++  return chunks
++}
+diff --git a/backend/src/llm-apis/context7-api.ts b/backend/src/llm-apis/context7-api.ts
+new file mode 100644
+index 000000000..904061967
+--- /dev/null
++++ b/backend/src/llm-apis/context7-api.ts
+@@ -0,0 +1,129 @@
++import { logger } from '../util/logger'
++
++const CONTEXT7_BASE_URL = 'https://context7.com'
++const FETCH_TIMEOUT_MS = 10_000
++
++interface ProjectSettings {
++  title: string
++  project: string
++  folders: string[]
++  docsRepoUrl: string
++}
++
++interface Version {
++  lastUpdate: string
++  state:
++    | 'initial'
++    | 'parsed'
++    | 'finalized'
++    | 'invalid_docs'
++    | 'error'
++    | 'stop'
++    | 'delete'
++  parseDuration: number
++  totalTokens: number
++  totalSnippets: number
++  averageTokens: number
++}
++
++interface Project {
++  settings: ProjectSettings
++  version: Version
++}
++
++interface GetChunksOptions {
++  tokens?: number
++  topic?: string
++  folders?: string
++}
++
++/**
++ * Lists all available documentation projects from Context7
++ * @returns Array of projects with their metadata, or empty array if the request fails
++ */
++async function listContext7Projects(): Promise<Project[]> {
++  try {
++    const timeoutPromise = new Promise<never>((_, reject) =>
++      setTimeout(() => reject(new Error('Request timed out')), FETCH_TIMEOUT_MS)
++    )
++
++    const response = await Promise.race([
++      fetch(`${CONTEXT7_BASE_URL}/api/projects`),
++      timeoutPromise,
++    ])
++
++    if (!response.ok) {
++      logger.error(`Failed to fetch Context7 projects: ${response.status}`)
++      return []
++    }
++    return await response.json()
++  } catch (error) {
++    logger.error({ error }, 'Error fetching Context7 projects')
++    return []
++  }
++}
++
++// Initialize the projects list once and export it as a promise
++export const context7ProjectsPromise: Promise<Project[]> =
++  listContext7Projects()
++
++/**
++ * Gets documentation chunks for a specific project
++ * @param projectId The project ID or path to fetch documentation for
++ * @param options Optional parameters for the request
++ * @param options.tokens Number of tokens to retrieve (default: 5000)
++ * @param options.topic Optional topic to rerank context for
++ * @param options.folders Optional comma-separated list of folders to include
++ * @returns The documentation text chunks or null if no results or request fails
++ */
++export async function getContext7ProjectChunks(
++  projectId: string,
++  options: GetChunksOptions = {}
++): Promise<string | null> {
++  try {
++    // Remove leading slash if present
++    if (projectId.startsWith('/')) {
++      projectId = projectId.slice(1)
++    }
++
++    // Build the URL with query parameters
++    const params = new URLSearchParams()
++    if (options.tokens) {
++      params.append('tokens', options.tokens.toString())
++    }
++    if (options.topic) {
++      params.append('topic', options.topic)
++    }
++    if (options.folders) {
++      params.append('folders', options.folders)
++    }
++
++    const url = `${CONTEXT7_BASE_URL}/${projectId}/llms.txt${params.toString() ? `?${params.toString()}` : ''}`
++
++    const timeoutPromise = new Promise<never>((_, reject) =>
++      setTimeout(() => reject(new Error('Request timed out')), FETCH_TIMEOUT_MS)
++    )
++
++    const response = await Promise.race([fetch(url), timeoutPromise])
++
++    if (!response.ok) {
++      logger.error(
++        `Failed to fetch Context7 documentation chunks: ${response.status}`
++      )
++      return null
++    }
++
++    const text = await response.text()
++    if (
++      !text ||
++      text === 'No content available' ||
++      text === 'No context data available'
++    ) {
++      return null
++    }
++    return text
++  } catch (error) {
++    logger.error({ error }, 'Error fetching Context7 project chunks')
++    return null
++  }
++}
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index 602a262a3..8123c22db 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -18,6 +18,7 @@ import { WebSocket } from 'ws'
+ 
+ import { checkTerminalCommand } from './check-terminal-command'
+ import { requestRelevantFiles } from './find-files/request-files-prompt'
++import { getDocumentationForQuery } from './get-documentation-for-query'
+ import { promptClaudeStream } from './llm-apis/claude'
+ import { streamGemini25ProWithFallbacks } from './llm-apis/gemini-with-fallbacks'
+ import { processFileBlock } from './process-file-block'
+@@ -70,6 +71,15 @@ export const mainPrompt = async (
+     action
+   const { messageHistory, fileContext, agentContext } = agentState
+ 
++  const relevantDocumentationPromise = prompt
++    ? getDocumentationForQuery(prompt, {
++        tokens: 5000,
++        clientSessionId,
++        fingerprintId,
++        userId,
++      })
++    : Promise.resolve(null)
++
+   const hasKnowledgeFiles =
+     Object.keys(fileContext.knowledgeFiles).length > 0 ||
+     Object.keys(fileContext.userKnowledgeFiles ?? {}).length > 0
+@@ -302,6 +312,8 @@ ${newFiles.map((file) => file.path).join('\n')}
+     })
+   }
+ 
++  const relevantDocumentation = await relevantDocumentationPromise
++
+   const messagesWithUserMessage = buildArray(
+     ...messageHistory,
+ 
+@@ -329,6 +341,11 @@ ${newFiles.map((file) => file.path).join('\n')}
+           content: toolInstructions,
+         },
+ 
++    relevantDocumentation && {
++      role: 'user' as const,
++      content: `Relevant context from web documentation:\n${relevantDocumentation}`,
++    },
++
+     prompt && {
+       role: 'user' as const,
+       content: prompt,

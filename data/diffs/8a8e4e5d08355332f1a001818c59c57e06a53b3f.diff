@@ -1,0 +1,411 @@
+diff --git a/common/src/constants/analytics-events.ts b/common/src/constants/analytics-events.ts
+index 7dd916154..3e88f6848 100644
+--- a/common/src/constants/analytics-events.ts
++++ b/common/src/constants/analytics-events.ts
+@@ -4,7 +4,10 @@
+ export enum AnalyticsEvent {
+   // CLI
+   APP_LAUNCHED = 'cli.app_launched',
+-  BACKGROUND_PROCESS_STARTED = 'cli.background_process_started',
++  BACKGROUND_PROCESS_CONTINUE = 'cli.background_process_continue',
++  BACKGROUND_PROCESS_END = 'cli.background_process_end',
++  BACKGROUND_PROCESS_LEFTOVER_DETECTED = 'cli.background_process_leftover_detected',
++  BACKGROUND_PROCESS_START = 'cli.background_process_start',
+   LOGIN = 'cli.login',
+ 
+   // Backend
+diff --git a/npm-app/src/background-process-manager.ts b/npm-app/src/background-process-manager.ts
+index 0349180b7..dafcb4ebc 100644
+--- a/npm-app/src/background-process-manager.ts
++++ b/npm-app/src/background-process-manager.ts
+@@ -15,6 +15,7 @@ import {
+ import path from 'path'
+ import process from 'process'
+ 
++import { AnalyticsEvent } from 'common/src/constants/analytics-events'
+ import { ToolResult } from 'common/types/agent-state'
+ import { buildArray } from 'common/util/array'
+ import { truncateStringWithMessage } from 'common/util/string'
+@@ -22,6 +23,7 @@ import { gray, red } from 'picocolors'
+ import { z } from 'zod'
+ 
+ import { CONFIG_DIR } from './credentials'
++import { logger } from './utils/logger'
+ 
+ const COMMAND_OUTPUT_LIMIT = 5000 // Limit output to 10KB per stream
+ const COMMAND_KILL_TIMEOUT_MS = 5000
+@@ -254,6 +256,13 @@ export function spawnAndTrack(
+     detached: true,
+   })
+   assert(child.pid !== undefined)
++  logger.info(
++    {
++      eventId: AnalyticsEvent.BACKGROUND_PROCESS_START,
++      pid: child.pid,
++    },
++    `Process start: \`${command} ${args.join(' ')}\``
++  )
+ 
+   mkdirSync(LOCK_DIR, { recursive: true })
+   const filePath = path.join(LOCK_DIR, `${child.pid}`)
+@@ -261,6 +270,10 @@ export function spawnAndTrack(
+ 
+   child.on('exit', () => {
+     deleteFileIfExists(filePath)
++    logger.info(
++      { eventId: AnalyticsEvent.BACKGROUND_PROCESS_END, pid: child.pid },
++      `Graceful exit: \`${command} ${args.join(' ')}\``
++    )
+   })
+   return child
+ }
+@@ -400,6 +413,10 @@ export function cleanupStoredProcesses(): {
+ 
+   if (locksToProcess.length) {
+     console.log(gray('Detected running codebuff processes. Cleaning...\n'))
++    logger.info({
++      eventId: AnalyticsEvent.BACKGROUND_PROCESS_LEFTOVER_DETECTED,
++      pids: locksToProcess,
++    })
+   }
+ 
+   // Actually kill processes (async)
+@@ -409,10 +426,18 @@ export function cleanupStoredProcesses(): {
+     const pid = parseInt(pidName, 10)
+     if (isNaN(pid)) {
+       deleteFileIfExists(lockFile)
++      logger.info(
++        { eventId: AnalyticsEvent.BACKGROUND_PROCESS_END, pid },
++        'Lock found but process not running.'
++      )
+       return
+     }
+ 
+     if (backgroundProcesses.has(pid)) {
++      logger.error(
++        { eventId: AnalyticsEvent.BACKGROUND_PROCESS_END, pid },
++        'Process running in current session. Should not occur.'
++      )
+       return
+     }
+ 
+@@ -420,10 +445,28 @@ export function cleanupStoredProcesses(): {
+       killProcessTreeSoftly(pid)
+       if (await waitForProcessExit(pid)) {
+         deleteFileIfExists(lockFile)
++        logger.info(
++          { eventId: AnalyticsEvent.BACKGROUND_PROCESS_END, pid },
++          'Process successfully killed.'
++        )
++      } else {
++        logger.warn(
++          { eventId: AnalyticsEvent.BACKGROUND_PROCESS_CONTINUE, pid },
++          'Process unable to be killed. Leaving lock file.'
++        )
+       }
+     } catch (err: any) {
+       if (err.code === 'ESRCH') {
+         deleteFileIfExists(lockFile)
++        logger.info(
++          { eventId: AnalyticsEvent.BACKGROUND_PROCESS_END, pid },
++          'Leftover process (with lock) died naturally.'
++        )
++      } else {
++        logger.error(
++          { eventId: AnalyticsEvent.BACKGROUND_PROCESS_CONTINUE, err, pid },
++          'Error killing process'
++        )
+       }
+     }
+   }
+diff --git a/npm-app/src/cli.ts b/npm-app/src/cli.ts
+index 2fa2bdfb7..1816dac4d 100644
+--- a/npm-app/src/cli.ts
++++ b/npm-app/src/cli.ts
+@@ -114,14 +114,14 @@ export class CLI {
+     process.on('SIGTERM', async () => {
+       Spinner.get().restoreCursor()
+       await killAllBackgroundProcesses()
+-      flushAnalytics()
++      await flushAnalytics()
+       process.exit(0)
+     })
+     process.on('SIGTSTP', async () => await this.handleExit())
+     process.on('SIGHUP', async () => {
+       Spinner.get().restoreCursor()
+       await killAllBackgroundProcesses()
+-      flushAnalytics()
++      await flushAnalytics()
+       process.exit(0)
+     })
+     // Doesn't catch SIGKILL (e.g. `kill -9`)
+@@ -501,7 +501,6 @@ export class CLI {
+     console.log('\n')
+ 
+     await killAllBackgroundProcesses()
+-    flushAnalytics()
+ 
+     const logMessages = []
+     const totalCreditsUsedThisSession = Object.values(
+@@ -526,7 +525,9 @@ export class CLI {
+     }
+ 
+     console.log(logMessages.join(' '))
++    await flushAnalytics()
+     console.log(green('Codebuff out!'))
++
+     process.exit(0)
+   }
+ 
+diff --git a/npm-app/src/client.ts b/npm-app/src/client.ts
+index c4ed2b45e..95fd8a17e 100644
+--- a/npm-app/src/client.ts
++++ b/npm-app/src/client.ts
+@@ -70,7 +70,7 @@ import {
+ import { handleToolCall } from './tool-handlers'
+ import { GitCommand } from './types'
+ import { identifyUser } from './utils/analytics'
+-import { logger } from './utils/logger'
++import { logger, loggerContext } from './utils/logger'
+ import { Spinner } from './utils/spinner'
+ import { toolRenderers } from './utils/tool-renderers'
+ import { createXMLStreamParser } from './utils/xml-stream-parser'
+@@ -184,7 +184,7 @@ export class Client {
+     this.freshPrompt = freshPrompt
+     this.reconnectWhenNextIdle = reconnectWhenNextIdle
+     this.rl = rl
+-    logger.info({ eventId: AnalyticsEvent.APP_LAUNCHED })
++    logger.info({ eventId: AnalyticsEvent.APP_LAUNCHED }, 'App launched')
+   }
+ 
+   async exit() {
+@@ -216,7 +216,11 @@ export class Client {
+       identifyUser(user.id, {
+         email: user.email,
+         name: user.name,
++        fingerprintId: this.fingerprintId,
+       })
++      loggerContext.userId = user.id
++      loggerContext.userEmail = user.email
++      loggerContext.fingerprintId = user.fingerprintId
+     }
+     return user
+   }
+@@ -428,7 +432,6 @@ export class Client {
+         this.freshPrompt()
+         return
+       }
+-
+       const { loginUrl, fingerprintHash, expiresAt } = await response.json()
+ 
+       const responseToUser = [
+@@ -492,10 +495,17 @@ export class Client {
+             identifyUser(user.id, {
+               email: user.email,
+               name: user.name,
++              fingerprintId: fingerprintId,
+             })
+-            trackEvent(AnalyticsEvent.LOGIN, user.id, {
+-              fingerprintId,
+-            })
++            loggerContext.userId = user.id
++            loggerContext.userEmail = user.email
++            loggerContext.fingerprintId = fingerprintId
++            logger.info(
++              {
++                eventId: AnalyticsEvent.LOGIN,
++              },
++              'login'
++            )
+ 
+             const credentialsPathDir = path.dirname(CREDENTIALS_PATH)
+             mkdirSync(credentialsPathDir, { recursive: true })
+diff --git a/npm-app/src/utils/analytics.ts b/npm-app/src/utils/analytics.ts
+index 91f0b8382..4065e57cf 100644
+--- a/npm-app/src/utils/analytics.ts
++++ b/npm-app/src/utils/analytics.ts
+@@ -5,6 +5,8 @@ import { PostHog } from 'posthog-node'
+ let currentUserId: string | undefined
+ let client: PostHog | undefined
+ 
++export let identified: boolean = false
++
+ export function initAnalytics() {
+   if (
+     !process.env.NEXT_PUBLIC_POSTHOG_API_KEY ||
+@@ -19,11 +21,11 @@ export function initAnalytics() {
+     host: process.env.NEXT_PUBLIC_POSTHOG_HOST_URL,
+   })
+ }
+-export function flushAnalytics() {
++export async function flushAnalytics() {
+   if (!client) {
+     return
+   }
+-  client.flush()
++  await client.flush()
+ }
+ 
+ export function trackEvent(
+@@ -32,23 +34,12 @@ export function trackEvent(
+ ) {
+   const distinctId = currentUserId
+   if (!distinctId) {
+-    if (process.env.NEXT_PUBLIC_CB_ENVIRONMENT !== 'production') {
+-      console.log(
+-        '[dev] Analytics event dropped due to missing user ID:',
+-        event
+-      )
+-    }
+     return
+   }
+   if (!client) {
+     throw new Error('Analytics client not initialized')
+   }
+ 
+-  if (process.env.NEXT_PUBLIC_CB_ENVIRONMENT !== 'production') {
+-    console.log('[dev] Analytics event tracked:', event)
+-    return
+-  }
+-
+   client.capture({
+     distinctId,
+     event,
+@@ -60,11 +51,6 @@ export function identifyUser(userId: string, properties?: Record<string, any>) {
+   // Store the user ID for future events
+   currentUserId = userId
+ 
+-  if (process.env.NEXT_PUBLIC_CB_ENVIRONMENT !== 'production') {
+-    console.log('[dev] Analytics user identified:', userId)
+-    return
+-  }
+-
+   if (!client) {
+     throw new Error('Analytics client not initialized')
+   }
+diff --git a/npm-app/src/utils/logger.ts b/npm-app/src/utils/logger.ts
+index e2a43df44..491fb6ee4 100644
+--- a/npm-app/src/utils/logger.ts
++++ b/npm-app/src/utils/logger.ts
+@@ -1,10 +1,9 @@
+-import { AsyncLocalStorage } from 'async_hooks'
+ import path from 'path'
+ import { format as stringFormat } from 'util'
+ 
+ import { AnalyticsEvent } from 'common/constants/analytics-events'
+ import pino from 'pino'
+-import { getCurrentChatDir } from 'src/project-files'
++import { getCurrentChatDir, getProjectRoot } from 'src/project-files'
+ 
+ import { trackEvent } from './analytics'
+ 
+@@ -17,15 +16,9 @@ export interface LoggerContext {
+   [key: string]: any // Allow for future extensions
+ }
+ 
+-const loggerAsyncStorage = new AsyncLocalStorage<LoggerContext>()
++export const loggerContext: LoggerContext = {}
+ 
+-export const withLoggerContext = <T>(
+-  additionalContext: Partial<LoggerContext>,
+-  fn: () => Promise<T>
+-) => {
+-  const store = loggerAsyncStorage.getStore() ?? {}
+-  return loggerAsyncStorage.run({ ...store, ...additionalContext }, fn)
+-}
++const analyticsBuffer: { analyticsEventId: AnalyticsEvent; toTrack: any }[] = []
+ 
+ const localFileTransport = pino.transport({
+   target: 'pino/file',
+@@ -35,18 +28,12 @@ const localFileTransport = pino.transport({
+   level: 'debug',
+ })
+ 
+-const productionFileTransport = pino.transport({
+-  target: 'pino/file',
+-  options: { destination: path.join(getCurrentChatDir(), 'log.jsonl') },
+-  level: 'debug',
+-})
++let productionFileTransport: any
++let storedDir: string | undefined
+ 
+ const pinoLogger = pino(
+   {
+     level: 'debug',
+-    mixin() {
+-      return { logTrace: loggerAsyncStorage.getStore() }
+-    },
+     formatters: {
+       level: (label) => {
+         return { level: label.toUpperCase() }
+@@ -68,15 +55,37 @@ function sendAnalyticsAndLog(
+   msg?: string,
+   ...args: any[]
+ ): void {
+-  if (Object.values(AnalyticsEvent).includes(data.eventId)) {
+-    trackEvent(data.eventId as AnalyticsEvent, {
+-      ...data,
++  if (!productionFileTransport || storedDir !== getProjectRoot()) {
++    productionFileTransport = pino.transport({
++      target: 'pino/file',
++      options: { destination: path.join(getCurrentChatDir(), 'log.jsonl') },
++      level: 'debug',
++    })
++  }
++
++  logOrStore: if (Object.values(AnalyticsEvent).includes(data.eventId)) {
++    const analyticsEventId = data.eventId as AnalyticsEvent
++    const toTrack = {
++      data,
+       level,
++      loggerContext,
+       msg: stringFormat(msg, ...args),
+-    })
++    }
++
++    // Not accurate for anonymous users
++    if (!loggerContext.userId) {
++      analyticsBuffer.push({ analyticsEventId, toTrack })
++      break logOrStore
++    }
++
++    for (const item of analyticsBuffer) {
++      trackEvent(item.analyticsEventId, item.toTrack)
++    }
++    analyticsBuffer.length = 0
++    trackEvent(analyticsEventId, toTrack)
+   }
+ 
+-  pinoLogger[level](data, msg, ...args)
++  pinoLogger[level]({ ...loggerContext, data }, msg, ...args)
+ }
+ 
+ /**
+@@ -84,17 +93,14 @@ function sendAnalyticsAndLog(
+  *
+  * To also send to Posthog, set data.eventId to type AnalyticsEvent
+  *
+- * e.g. logger.info({eventId: AnalyticsEvent.SOME_EVENT, data: otherData}, 'some message')
++ * e.g. logger.info({eventId: AnalyticsEvent.SOME_EVENT, field: value}, 'some message')
+  */
+-export const logger: Record<LogLevel, pino.LogFn> =
+-  process.env.NEXT_PUBLIC_CB_ENVIRONMENT === 'local'
+-    ? pinoLogger
+-    : (Object.fromEntries(
+-        loggingLevels.map((level) => {
+-          return [
+-            level,
+-            (data: any, msg?: string, ...args: any[]) =>
+-              sendAnalyticsAndLog(level, data, msg, ...args),
+-          ]
+-        })
+-      ) as Record<LogLevel, pino.LogFn>)
++export const logger: Record<LogLevel, pino.LogFn> = Object.fromEntries(
++  loggingLevels.map((level) => {
++    return [
++      level,
++      (data: any, msg?: string, ...args: any[]) =>
++        sendAnalyticsAndLog(level, data, msg, ...args),
++    ]
++  })
++) as Record<LogLevel, pino.LogFn>

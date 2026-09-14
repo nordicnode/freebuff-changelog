@@ -1,0 +1,956 @@
+diff --git a/backend/src/run-agent-step.ts b/backend/src/run-agent-step.ts
+index 7e98a5a8a..e648067b5 100644
+--- a/backend/src/run-agent-step.ts
++++ b/backend/src/run-agent-step.ts
+@@ -25,13 +25,18 @@ import { checkLiveUserInput } from './live-user-inputs'
+ import { processFileBlock } from './process-file-block'
+ import { processStrReplace } from './process-str-replace'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+-import { runTool } from './run-tool'
++import { runToolInner } from './run-tool'
+ import { additionalSystemPrompts } from './system-prompt/prompts'
+ import { saveAgentRequest } from './system-prompt/save-agent-request'
+ import { agentTemplates } from './templates/agent-list'
+ import { processAgentOverrides } from './templates/agent-overrides'
+ import { formatPrompt, getAgentPrompt } from './templates/strings'
+-import { AgentTemplate } from './templates/types'
++import { AgentTemplateUnion } from './templates/types'
++import {
++  ProgrammaticAgentTemplate,
++  AgentTemplate as LLMAgentTemplate,
++} from './templates/types'
++import { runProgrammaticAgent } from './run-programmatic-agent'
+ import {
+   parseRawToolCall,
+   ToolCallError,
+@@ -83,7 +88,7 @@ export interface AgentOptions {
+ async function getAgentTemplateWithOverrides(
+   agentType: AgentTemplateType,
+   fileContext: ProjectFileContext
+-): Promise<AgentTemplate> {
++): Promise<AgentTemplateUnion> {
+   // Initialize registry if needed
+   await agentRegistry.initialize(fileContext)
+ 
+@@ -95,6 +100,11 @@ async function getAgentTemplateWithOverrides(
+     )
+   }
+ 
++  if (baseTemplate.implementation === 'programmatic') {
++    // Programmatic agents cannot be overridden.
++    return baseTemplate
++  }
++
+   return processAgentOverrides(baseTemplate, fileContext)
+ }
+ 
+@@ -133,6 +143,23 @@ export const runAgentStep = async (
+     agentType,
+     fileContext
+   )
++  if (!agentTemplate) {
++    throw new Error(
++      `Agent template not found for type: ${agentType}. Available types: ${Object.keys(agentTemplates).join(', ')}`
++    )
++  }
++
++  if (agentTemplate.implementation === 'programmatic') {
++    const agentState = await runProgrammaticAgent(agentTemplate, {
++      ...options,
++      ws,
++    })
++    return {
++      agentState,
++      shouldEndTurn: true,
++      fullResponse: '',
++    }
++  }
+ 
+   const { model } = agentTemplate
+ 
+@@ -650,7 +677,7 @@ export const runAgentStep = async (
+ 
+     // Use the new runTool function for other tools
+     try {
+-      const toolResult = await runTool(toolCall, {
++      const toolResult = await runToolInner(toolCall, {
+         ws,
+         userId,
+         userInputId,
+@@ -805,7 +832,7 @@ export const runAgentStep = async (
+         },
+       ]
+ 
+-      const toolResult = await runTool(spawnAgentsToolCall, {
++      const toolResult = await runToolInner(spawnAgentsToolCall, {
+         ws,
+         userId,
+         userInputId,
+@@ -911,7 +938,15 @@ export const loopAgentSteps = async (
+     initialAssistantPrefix,
+     stepAssistantMessage,
+     stepAssistantPrefix,
+-  } = agentTemplate
++  } =
++    agentTemplate.implementation === 'llm'
++      ? agentTemplate
++      : {
++          initialAssistantMessage: undefined,
++          initialAssistantPrefix: undefined,
++          stepAssistantMessage: undefined,
++          stepAssistantPrefix: undefined,
++        }
+   let isFirstStep = true
+   let currentPrompt = prompt
+   let currentParams = params
+diff --git a/backend/src/run-programmatic-agent.ts b/backend/src/run-programmatic-agent.ts
+new file mode 100644
+index 000000000..a801104bb
+--- /dev/null
++++ b/backend/src/run-programmatic-agent.ts
+@@ -0,0 +1,122 @@
++import {
++  AgentState,
++  AgentTemplateType,
++} from '@codebuff/common/types/session-state'
++import { ProjectFileContext } from '@codebuff/common/util/file'
++import {
++  ProgrammaticAgentTemplate,
++  ProgrammaticAgentContext,
++} from './templates/types'
++import { logger } from './util/logger'
++import { runTool } from './run-tool'
++import { WebSocket } from 'ws'
++import { getRequestContext } from './websockets/request-context'
++import { CodebuffToolCall } from './tools/constants'
++
++// Function to handle programmatic agents
++export async function runProgrammaticAgent(
++  template: ProgrammaticAgentTemplate,
++  options: {
++    userId: string | undefined
++    userInputId: string
++    clientSessionId: string
++    fingerprintId: string
++    onResponseChunk: (chunk: string) => void
++    agentType: AgentTemplateType
++    fileContext: ProjectFileContext
++    agentState: AgentState
++    prompt: string | undefined
++    params: Record<string, any> | undefined
++    assistantMessage: string | undefined
++    assistantPrefix: string | undefined
++    ws: WebSocket
++  }
++): Promise<AgentState> {
++  const {
++    agentState,
++    onResponseChunk,
++    ws,
++    userId,
++    userInputId,
++    clientSessionId,
++    fingerprintId,
++    fileContext,
++  } = options
++
++  logger.info(
++    {
++      template: template.type,
++      agentType: options.agentType,
++      prompt: options.prompt,
++      params: options.params,
++    },
++    'Running programmatic agent'
++  )
++  // Create context for the programmatic agent
++  const context: ProgrammaticAgentContext = {
++    prompt: options.prompt || '',
++    params: options.params || {},
++  }
++
++  try {
++    // Run the generator function and handle tool calls
++    const generator = template.handler(context)
++    let result = generator.next()
++
++    // Process tool calls yielded by the generator
++    while (!result.done) {
++      const toolCallWithoutId = result.value
++      const toolCall = {
++        ...toolCallWithoutId,
++        toolCallId: crypto.randomUUID(),
++      } as CodebuffToolCall
++
++      // Generate a unique agent step ID for this tool execution
++      const agentStepId = crypto.randomUUID()
++
++      // Get the extracted repo ID from request context
++      const requestContext = getRequestContext()
++      const repoId = requestContext?.processedRepoId
++
++      // Execute the tool call using the simplified wrapper
++      const toolResult = await runTool(toolCall, {
++        ws,
++        userId,
++        userInputId,
++        clientSessionId,
++        fingerprintId,
++        agentStepId,
++        fileContext,
++        messages: agentState.messageHistory,
++        agentTemplate: template,
++        repoId,
++        agentState,
++      })
++
++      // Send the tool result back to the generator
++      result = generator.next(toolResult)
++
++      if (result.value && result.value.toolName === 'end_turn') {
++        break
++      }
++    }
++
++    logger.info(
++      { report: agentState.report },
++      'Programmatic agent execution completed'
++    )
++    return agentState
++  } catch (error) {
++    logger.error(
++      { error, template: template.type },
++      'Programmatic agent execution failed'
++    )
++
++    const errorMessage = `Error executing programmatic agent: ${error instanceof Error ? error.message : 'Unknown error'}`
++    onResponseChunk(errorMessage)
++
++    agentState.report.error = errorMessage
++
++    return agentState
++  }
++}
+diff --git a/backend/src/run-tool.ts b/backend/src/run-tool.ts
+index 816c954e8..b676343c7 100644
+--- a/backend/src/run-tool.ts
++++ b/backend/src/run-tool.ts
+@@ -23,16 +23,18 @@ import { fetchContext7LibraryDocumentation } from './llm-apis/context7-api'
+ import { searchWeb } from './llm-apis/linkup-api'
+ import { PROFIT_MARGIN } from './llm-apis/message-cost-tracker'
+ import { getSearchSystemPrompt } from './system-prompt/search-system-prompt'
+-import { agentTemplates } from './templates/agent-list'
+-import { AgentTemplate } from './templates/types'
++import { AgentTemplate, ProgrammaticAgentTemplate } from './templates/types'
+ import { agentRegistry } from './templates/agent-registry'
+ import { ClientToolCall, CodebuffToolCall } from './tools/constants'
+ import { logger } from './util/logger'
+ import { renderReadFilesResult } from './util/parse-tool-call-xml'
+ import { countTokens, countTokensJson } from './util/token-counter'
+ import { getRequestContext } from './websockets/request-context'
+-import { requestFiles } from './websockets/websocket-action'
++import { requestFiles, requestToolCall } from './websockets/websocket-action'
+ 
++// Turn this on to collect full file context, using Claude-4-Opus to pick which files to send up
++// TODO: We might want to be able to turn this on on a per-repo basis.
++const COLLECT_FULL_FILE_CONTEXT = false
+ export interface RunToolOptions {
+   ws: WebSocket
+   userId?: string
+@@ -42,7 +44,7 @@ export interface RunToolOptions {
+   agentStepId: string
+   fileContext: ProjectFileContext
+   messages: CoreMessage[]
+-  agentTemplate: AgentTemplate
++  agentTemplate: AgentTemplate | ProgrammaticAgentTemplate
+   repoId?: string
+   // Additional context for update_report
+   agentState?: AgentState
+@@ -54,14 +56,66 @@ export type RunToolResult =
+   | { type: 'no_result' }
+   | { type: 'state_update'; result: ToolResult; updatedAgentState: AgentState }
+ 
+-// Turn this on to collect full file context, using Claude-4-Opus to pick which files to send up
+-// TODO: We might want to be able to turn this on on a per-repo basis.
+-const COLLECT_FULL_FILE_CONTEXT = false
++export async function runTool(
++  toolCall: CodebuffToolCall,
++  options: RunToolOptions
++): Promise<ToolResult> {
++  const { ws, userInputId, agentState } = options
++
++  try {
++    // Execute the tool call using runToolInner
++    const toolResult = await runToolInner(toolCall, options)
++
++    if (toolResult.type === 'server_result') {
++      // Direct server result - return as-is
++      return toolResult.result
++    } else if (toolResult.type === 'client_call') {
++      // For client calls, execute them via WebSocket and return the result
++      const clientResult = await requestToolCall(
++        ws,
++        userInputId,
++        toolResult.call.toolName,
++        toolResult.call.args
++      )
++
++      return {
++        toolName: toolResult.call.toolName,
++        toolCallId: toolResult.call.toolCallId,
++        result: clientResult.success
++          ? clientResult.result
++          : clientResult.error ?? 'Unknown error',
++      }
++    } else if (toolResult.type === 'state_update') {
++      if (!agentState) {
++        throw new Error('agentState is required for state_update')
++      }
++      // Update the agent state and return the result
++      Object.assign(agentState, toolResult.updatedAgentState!)
++      return toolResult.result
++    } else {
++      // no_result type - return a success message
++      return {
++        toolName: toolCall.toolName,
++        toolCallId: toolCall.toolCallId,
++        result: 'Tool executed successfully',
++      }
++    }
++  } catch (error) {
++    logger.error({ error, toolCall }, 'Error executing tool call in runTool')
++
++    // Return error as tool result
++    return {
++      toolName: toolCall.toolName,
++      toolCallId: toolCall.toolCallId,
++      result: `Error executing ${toolCall.toolName}: ${error instanceof Error ? error.message : 'Unknown error'}`,
++    }
++  }
++}
+ 
+ /**
+  * Executes a tool call and returns the appropriate result
+  */
+-export async function runTool(
++export async function runToolInner(
+   toolCall: CodebuffToolCall,
+   options: RunToolOptions
+ ): Promise<RunToolResult> {
+@@ -627,7 +681,10 @@ export async function runTool(
+           const agentTemplate = allTemplates[agentState.agentType!]
+           let report = ''
+ 
+-          if (agentTemplate.outputMode === 'report') {
++          if (
++            agentTemplate.implementation === 'programmatic' ||
++            agentTemplate.outputMode === 'report'
++          ) {
+             report = JSON.stringify(result.value.agentState.report, null, 2)
+           } else if (agentTemplate.outputMode === 'last_message') {
+             const { agentState } = result.value
+@@ -649,7 +706,9 @@ export async function runTool(
+             const agentMessages = agentState.messageHistory.slice(1)
+             report = `Agent messages:\n\n${JSON.stringify(agentMessages, null, 2)}`
+           } else {
+-            throw new Error(`Unknown output mode: ${agentTemplate.outputMode}`)
++            throw new Error(
++              `Unknown output mode: ${'outputMode' in agentTemplate ? agentTemplate.outputMode : 'undefined'}`
++            )
+           }
+ 
+           return `**${agentName}:**\n${report}`
+diff --git a/backend/src/templates/agent-list.ts b/backend/src/templates/agent-list.ts
+index eb543769a..660547938 100644
+--- a/backend/src/templates/agent-list.ts
++++ b/backend/src/templates/agent-list.ts
+@@ -14,9 +14,13 @@ import { researcher } from './agents/researcher'
+ import { reviewer } from './agents/reviewer'
+ import { thinker } from './agents/thinker'
+ import { thinkingBase } from './agents/thinking-base'
+-import { AgentTemplate } from './types'
++import { AgentTemplate, AgentTemplateUnion } from './types'
++import { exampleProgrammatic } from './agents/example-programmatic'
+ 
+-export const agentTemplates: Record<AgentTemplateType, AgentTemplate> = {
++export const agentTemplates: Record<
++  AgentTemplateType | string,
++  AgentTemplateUnion
++> = {
+   base: {
+     type: AgentTemplateTypes.base,
+     ...base(models.openrouter_claude_sonnet_4),
+@@ -70,4 +74,5 @@ export const agentTemplates: Record<AgentTemplateType, AgentTemplate> = {
+     type: AgentTemplateTypes.sonnet4_agent_builder,
+     ...agentBuilder(models.openrouter_claude_sonnet_4),
+   },
++  'example_programmatic': exampleProgrammatic,
+ }
+diff --git a/backend/src/templates/agent-registry.ts b/backend/src/templates/agent-registry.ts
+index 000095aa2..154b16d8a 100644
+--- a/backend/src/templates/agent-registry.ts
++++ b/backend/src/templates/agent-registry.ts
+@@ -1,5 +1,5 @@
+ import { ProjectFileContext } from '@codebuff/common/util/file'
+-import { AgentTemplate } from './types'
++import { AgentTemplate, AgentTemplateUnion } from './types'
+ import { agentTemplates as staticTemplates } from './agent-list'
+ import { dynamicAgentService } from './dynamic-agent-service'
+ import { logger } from '../util/logger'
+@@ -8,7 +8,7 @@ import { logger } from '../util/logger'
+  * Global agent registry that combines static and dynamic agents
+  */
+ class AgentRegistry {
+-  private allTemplates: Record<string, AgentTemplate> = {}
++  private allTemplates: Record<string, AgentTemplateUnion> = {}
+   private allAgentNames: Record<string, string> = {}
+   private isInitialized = false
+   private validationErrors: Array<{ filePath: string; message: string }> = []
+@@ -100,7 +100,7 @@ class AgentRegistry {
+   /**
+    * Get an agent template by type
+    */
+-  getTemplate(agentType: string): AgentTemplate | undefined {
++  getTemplate(agentType: string): AgentTemplateUnion | undefined {
+     if (!this.isInitialized) {
+       logger.warn('Agent registry not initialized, falling back to static templates only')
+       return staticTemplates[agentType as keyof typeof staticTemplates]
+@@ -112,7 +112,7 @@ class AgentRegistry {
+   /**
+    * Get all available agent templates
+    */
+-  getAllTemplates(): Record<string, AgentTemplate> {
++  getAllTemplates(): Record<string, AgentTemplateUnion> {
+     if (!this.isInitialized) {
+       logger.warn('Agent registry not initialized, falling back to static templates only')
+       return staticTemplates
+diff --git a/backend/src/templates/agents/agent-builder.ts b/backend/src/templates/agents/agent-builder.ts
+index 58e3a1c71..d7e2ae61c 100644
+--- a/backend/src/templates/agents/agent-builder.ts
++++ b/backend/src/templates/agents/agent-builder.ts
+@@ -7,6 +7,7 @@ import { AgentTemplateTypes } from '@codebuff/common/types/session-state'
+ export const agentBuilder = (model: Model): Omit<AgentTemplate, 'type'> => ({
+   name: 'Agent Builder',
+   description: 'Creates new agent templates for the codebuff mult-agent system',
++  implementation: 'llm',
+   model,
+   promptSchema: {
+     prompt: z.string().optional().describe('What agent type you would like to create. Include as many details as possible.'),
+diff --git a/backend/src/templates/agents/archive/dry-run.ts b/backend/src/templates/agents/archive/dry-run.ts
+index 59e3b8ff3..2178f88af 100644
+--- a/backend/src/templates/agents/archive/dry-run.ts
++++ b/backend/src/templates/agents/archive/dry-run.ts
+@@ -8,6 +8,7 @@ import { AgentTemplate, PLACEHOLDER } from '../../types'
+ export const dryRun = (model: Model): Omit<AgentTemplate, 'type'> => ({
+   model,
+   name: AGENT_PERSONAS['dry_run'].name,
++  implementation: 'llm',
+   description: AGENT_PERSONAS['dry_run'].description,
+   promptSchema: {
+     prompt: z.string().describe('A coding task to complete'),
+diff --git a/backend/src/templates/agents/ask.ts b/backend/src/templates/agents/ask.ts
+index b7b3618e8..fdd318fc4 100644
+--- a/backend/src/templates/agents/ask.ts
++++ b/backend/src/templates/agents/ask.ts
+@@ -12,6 +12,7 @@ import { AGENT_PERSONAS } from '@codebuff/common/constants/agents'
+ export const ask = (model: Model): Omit<AgentTemplate, 'type'> => ({
+   model,
+   name: AGENT_PERSONAS['ask'].name,
++  implementation: 'llm',
+   description: 'Base ask-mode agent that orchestrates the full response.',
+   promptSchema: {
+     prompt: z.string().describe('A question you would like answered about this project.'),
+diff --git a/backend/src/templates/agents/base.ts b/backend/src/templates/agents/base.ts
+index 9a99f032d..009f3d0ae 100644
+--- a/backend/src/templates/agents/base.ts
++++ b/backend/src/templates/agents/base.ts
+@@ -15,6 +15,7 @@ import { AgentTemplate, PLACEHOLDER } from '../types'
+ export const base = (model: Model, allAvailableAgents?: string[]): Omit<AgentTemplate, 'type'> => ({
+   model,
+   name: AGENT_PERSONAS['base'].name,
++  implementation: 'llm',
+   description: AGENT_PERSONAS['base'].description,
+   promptSchema: {
+     prompt: z.string().describe('A coding task to complete'),
+diff --git a/backend/src/templates/agents/example-programmatic.ts b/backend/src/templates/agents/example-programmatic.ts
+new file mode 100644
+index 000000000..6ff788ffa
+--- /dev/null
++++ b/backend/src/templates/agents/example-programmatic.ts
+@@ -0,0 +1,40 @@
++import { z } from 'zod/v4'
++import {
++  ProgrammaticAgentTemplate,
++  ProgrammaticAgentContext,
++  ProgrammaticAgentFunction,
++} from '../types'
++import { baseAgentToolNames, baseAgentSpawnableAgents } from '../types'
++
++// Example generator function
++const exampleHandler: ProgrammaticAgentFunction = function* (
++  context: ProgrammaticAgentContext
++) {
++  // This is a simple example that just returns a greeting
++  const greeting = `Hello! You said: "${context.prompt}"`
++
++  yield {
++    toolName: 'update_report' as const,
++    args: {
++      json_update: {
++        greeting,
++      },
++    },
++  }
++}
++
++export const exampleProgrammatic: ProgrammaticAgentTemplate = {
++  type: 'example_programmatic',
++  implementation: 'programmatic',
++  name: 'Example Programmatic Agent',
++  description:
++    'A simple example of a programmatic agent using direct generator functions',
++  handler: exampleHandler,
++  includeMessageHistory: true,
++  promptSchema: {
++    prompt: z.string().optional(),
++    params: z.any().optional(),
++  },
++  toolNames: ['update_report'] as const,
++  spawnableAgents: [],
++}
+diff --git a/backend/src/templates/agents/file-picker.ts b/backend/src/templates/agents/file-picker.ts
+index c7bfbf7f9..d2c1ffa84 100644
+--- a/backend/src/templates/agents/file-picker.ts
++++ b/backend/src/templates/agents/file-picker.ts
+@@ -9,6 +9,7 @@ import { AgentTemplate, PLACEHOLDER } from '../types'
+ export const filePicker = (model: Model): Omit<AgentTemplate, 'type'> => ({
+   model,
+   name: AGENT_PERSONAS['file_picker'].name,
++  implementation: 'llm',
+   description: AGENT_PERSONAS['file_picker'].description,
+   promptSchema: {
+     prompt: z.string().describe('A coding task to complete'),
+diff --git a/backend/src/templates/agents/planner.ts b/backend/src/templates/agents/planner.ts
+index 980dc35c9..412b5445f 100644
+--- a/backend/src/templates/agents/planner.ts
++++ b/backend/src/templates/agents/planner.ts
+@@ -7,6 +7,7 @@ import { AgentTemplate, baseAgentStopSequences, PLACEHOLDER } from '../types'
+ export const planner = (model: Model): Omit<AgentTemplate, 'type'> => ({
+   model,
+   name: AGENT_PERSONAS['planner'].name,
++  implementation: 'llm',
+   description: AGENT_PERSONAS['planner'].description,
+   promptSchema: {
+     prompt: z
+diff --git a/backend/src/templates/agents/researcher.ts b/backend/src/templates/agents/researcher.ts
+index 5d5e0b7ab..9313eb455 100644
+--- a/backend/src/templates/agents/researcher.ts
++++ b/backend/src/templates/agents/researcher.ts
+@@ -9,6 +9,7 @@ import { AgentTemplate, PLACEHOLDER } from '../types'
+ export const researcher = (model: Model): Omit<AgentTemplate, 'type'> => ({
+   model,
+   name: AGENT_PERSONAS['researcher'].name,
++  implementation: 'llm',
+   description: AGENT_PERSONAS['researcher'].description,
+   promptSchema: {
+     prompt: z.string().describe('A question you would like answered using web search and documentation'),
+diff --git a/backend/src/templates/agents/reviewer.ts b/backend/src/templates/agents/reviewer.ts
+index b60b65316..38bde011d 100644
+--- a/backend/src/templates/agents/reviewer.ts
++++ b/backend/src/templates/agents/reviewer.ts
+@@ -8,6 +8,7 @@ import { AgentTemplate, PLACEHOLDER } from '../types'
+ export const reviewer = (model: Model): Omit<AgentTemplate, 'type'> => ({
+   model,
+   name: AGENT_PERSONAS['reviewer'].name,
++  implementation: 'llm',
+   description: AGENT_PERSONAS['reviewer'].description,
+   promptSchema: {
+     prompt: z.string().describe('What should be reviewed. Be brief.'),
+diff --git a/backend/src/templates/agents/thinker.ts b/backend/src/templates/agents/thinker.ts
+index d4815698d..51d3beefa 100644
+--- a/backend/src/templates/agents/thinker.ts
++++ b/backend/src/templates/agents/thinker.ts
+@@ -8,6 +8,7 @@ import { AgentTemplate, PLACEHOLDER } from '../types'
+ export const thinker = (model: Model): Omit<AgentTemplate, 'type'> => ({
+   model,
+   name: AGENT_PERSONAS['thinker'].name,
++  implementation: 'llm',
+   description: AGENT_PERSONAS['thinker'].description,
+   promptSchema: {
+     prompt: z.string().describe('The problem you are trying to solve'),
+diff --git a/backend/src/templates/agents/thinking-base.ts b/backend/src/templates/agents/thinking-base.ts
+index 2f38f0c0e..a81d6817b 100644
+--- a/backend/src/templates/agents/thinking-base.ts
++++ b/backend/src/templates/agents/thinking-base.ts
+@@ -20,6 +20,7 @@ export const thinkingBase = (
+   allAvailableAgents?: string[]
+ ): Omit<AgentTemplate, 'type'> => ({
+   model,
++  implementation: 'llm',
+   name: AGENT_PERSONAS['base_lite'].name,
+   description: AGENT_PERSONAS['base_lite'].description,
+   promptSchema: {
+diff --git a/backend/src/templates/dynamic-agent-service.ts b/backend/src/templates/dynamic-agent-service.ts
+index 07451560c..8a351db35 100644
+--- a/backend/src/templates/dynamic-agent-service.ts
++++ b/backend/src/templates/dynamic-agent-service.ts
+@@ -1,13 +1,19 @@
+ import * as fs from 'fs'
+ import * as path from 'path'
+ import { z } from 'zod'
+-import { DynamicAgentTemplateSchema, validateSpawnableAgents } from '@codebuff/common/types/dynamic-agent-template'
+-import { AgentTemplateType, AgentTemplateTypes } from '@codebuff/common/types/session-state'
++import {
++  DynamicAgentTemplateSchema,
++  validateSpawnableAgents,
++} from '@codebuff/common/types/dynamic-agent-template'
++import {
++  AgentTemplateType,
++  AgentTemplateTypes,
++} from '@codebuff/common/types/session-state'
+ import { ProjectFileContext } from '@codebuff/common/util/file'
+ import { normalizeAgentNames } from '@codebuff/common/util/agent-name-normalization'
+ import { resolvePromptField } from '../util/file-resolver'
+ import { logger } from '../util/logger'
+-import { AgentTemplate } from './types'
++import { AgentTemplate, AgentTemplateUnion } from './types'
+ 
+ export interface DynamicAgentValidationError {
+   filePath: string
+@@ -16,7 +22,7 @@ export interface DynamicAgentValidationError {
+ }
+ 
+ export interface DynamicAgentLoadResult {
+-  templates: Record<string, AgentTemplate>
++  templates: Record<string, AgentTemplateUnion>
+   validationErrors: DynamicAgentValidationError[]
+ }
+ 
+@@ -32,53 +38,75 @@ export class DynamicAgentService {
+   /**
+    * Load and validate dynamic agent templates from .agents/templates directory
+    */
+-  async loadAgents(fileContext: ProjectFileContext): Promise<DynamicAgentLoadResult> {
++  async loadAgents(
++    fileContext: ProjectFileContext
++  ): Promise<DynamicAgentLoadResult> {
+     const templatesDir = path.join(fileContext.projectRoot, '.agents/templates')
+-    
++
+     this.templates = {}
+     this.validationErrors = []
+ 
+     if (!fs.existsSync(templatesDir)) {
+       logger.debug('No .agents/templates directory found')
+       this.isLoaded = true
+-      return { templates: this.templates, validationErrors: this.validationErrors }
++      return {
++        templates: this.templates,
++        validationErrors: this.validationErrors,
++      }
+     }
+ 
+     // Get available agent types for validation
+     const availableAgentTypes = [
+       ...Object.values(AgentTemplateTypes),
+-      ...Object.keys(this.templates) // Include any already loaded dynamic agents
++      ...Object.keys(this.templates), // Include any already loaded dynamic agents
+     ]
+ 
+     try {
+       const files = fs.readdirSync(templatesDir)
+-      logger.info({ templatesDir, fileCount: files.length }, 'Loading dynamic agent templates')
++      logger.info(
++        { templatesDir, fileCount: files.length },
++        'Loading dynamic agent templates'
++      )
+ 
+       for (const fileName of files) {
+         if (!fileName.endsWith('.json')) {
+           continue
+         }
+ 
+-        await this.loadSingleAgent(templatesDir, fileName, availableAgentTypes, fileContext)
++        await this.loadSingleAgent(
++          templatesDir,
++          fileName,
++          availableAgentTypes,
++          fileContext
++        )
+       }
+     } catch (error) {
+-      logger.error({ templatesDir, error }, 'Failed to read .agents/templates directory')
++      logger.error(
++        { templatesDir, error },
++        'Failed to read .agents/templates directory'
++      )
+       this.validationErrors.push({
+         filePath: templatesDir,
+         message: 'Failed to read templates directory',
+-        details: error instanceof Error ? error.message : 'Unknown error'
++        details: error instanceof Error ? error.message : 'Unknown error',
+       })
+     }
+ 
+     this.isLoaded = true
+-    
+-    logger.info({
+-      loadedAgents: Object.keys(this.templates).length,
+-      validationErrors: this.validationErrors.length,
+-      agentTypes: Object.keys(this.templates)
+-    }, 'Dynamic agent loading complete')
+-
+-    return { templates: this.templates, validationErrors: this.validationErrors }
++
++    logger.info(
++      {
++        loadedAgents: Object.keys(this.templates).length,
++        validationErrors: this.validationErrors.length,
++        agentTypes: Object.keys(this.templates),
++      },
++      'Dynamic agent loading complete'
++    )
++
++    return {
++      templates: this.templates,
++      validationErrors: this.validationErrors,
++    }
+   }
+ 
+   /**
+@@ -99,7 +127,10 @@ export class DynamicAgentService {
+ 
+       // Skip override templates (they modify existing agents)
+       if (parsedContent.override !== false) {
+-        logger.debug({ fileName, override: parsedContent.override }, 'Skipping override template')
++        logger.debug(
++          { fileName, override: parsedContent.override },
++          'Skipping override template'
++        )
+         return
+       }
+ 
+@@ -107,7 +138,9 @@ export class DynamicAgentService {
+       const dynamicAgent = DynamicAgentTemplateSchema.parse(parsedContent)
+ 
+       // Validate spawnable agents
+-      const normalizedSpawnableAgents = normalizeAgentNames(dynamicAgent.spawnableAgents)
++      const normalizedSpawnableAgents = normalizeAgentNames(
++        dynamicAgent.spawnableAgents
++      )
+       const spawnableValidation = validateSpawnableAgents(
+         normalizedSpawnableAgents,
+         availableAgentTypes
+@@ -117,7 +150,7 @@ export class DynamicAgentService {
+         this.validationErrors.push({
+           filePath: relativeFilePath,
+           message: `Invalid spawnable agents: ${spawnableValidation.invalidAgents.join(', ')}`,
+-          details: `Available agents: ${availableAgentTypes.join(', ')}`
++          details: `Available agents: ${availableAgentTypes.join(', ')}`,
+         })
+         return
+       }
+@@ -126,6 +159,7 @@ export class DynamicAgentService {
+       const agentTemplate: AgentTemplate = {
+         type: dynamicAgent.type as AgentTemplateType,
+         name: dynamicAgent.name,
++        implementation: 'llm',
+         description: dynamicAgent.description,
+         model: dynamicAgent.model as any,
+         promptSchema: this.convertPromptSchema(dynamicAgent.promptSchema),
+@@ -134,10 +168,19 @@ export class DynamicAgentService {
+         toolNames: dynamicAgent.toolNames as any[],
+         stopSequences: dynamicAgent.stopSequences,
+         spawnableAgents: normalizedSpawnableAgents as AgentTemplateType[],
+-        
+-        systemPrompt: resolvePromptField(dynamicAgent.systemPrompt, fileContext.projectRoot),
+-        userInputPrompt: resolvePromptField(dynamicAgent.userInputPrompt, fileContext.projectRoot),
+-        agentStepPrompt: resolvePromptField(dynamicAgent.agentStepPrompt, fileContext.projectRoot),
++
++        systemPrompt: resolvePromptField(
++          dynamicAgent.systemPrompt,
++          fileContext.projectRoot
++        ),
++        userInputPrompt: resolvePromptField(
++          dynamicAgent.userInputPrompt,
++          fileContext.projectRoot
++        ),
++        agentStepPrompt: resolvePromptField(
++          dynamicAgent.agentStepPrompt,
++          fileContext.projectRoot
++        ),
+ 
+         initialAssistantMessage: undefined,
+         initialAssistantPrefix: undefined,
+@@ -147,38 +190,54 @@ export class DynamicAgentService {
+ 
+       // Add optional prompt fields only if they exist
+       if (dynamicAgent.initialAssistantMessage) {
+-        agentTemplate.initialAssistantMessage = resolvePromptField(dynamicAgent.initialAssistantMessage, fileContext.projectRoot)
++        agentTemplate.initialAssistantMessage = resolvePromptField(
++          dynamicAgent.initialAssistantMessage,
++          fileContext.projectRoot
++        )
+       }
+-      
++
+       if (dynamicAgent.initialAssistantPrefix) {
+-        agentTemplate.initialAssistantPrefix = resolvePromptField(dynamicAgent.initialAssistantPrefix, fileContext.projectRoot)
++        agentTemplate.initialAssistantPrefix = resolvePromptField(
++          dynamicAgent.initialAssistantPrefix,
++          fileContext.projectRoot
++        )
+       }
+-      
++
+       if (dynamicAgent.stepAssistantMessage) {
+-        agentTemplate.stepAssistantMessage = resolvePromptField(dynamicAgent.stepAssistantMessage, fileContext.projectRoot)
++        agentTemplate.stepAssistantMessage = resolvePromptField(
++          dynamicAgent.stepAssistantMessage,
++          fileContext.projectRoot
++        )
+       }
+-      
++
+       if (dynamicAgent.stepAssistantPrefix) {
+-        agentTemplate.stepAssistantPrefix = resolvePromptField(dynamicAgent.stepAssistantPrefix, fileContext.projectRoot)
++        agentTemplate.stepAssistantPrefix = resolvePromptField(
++          dynamicAgent.stepAssistantPrefix,
++          fileContext.projectRoot
++        )
+       }
+ 
+       this.templates[dynamicAgent.type] = agentTemplate
+-      
+-      logger.debug({ agentType: dynamicAgent.type, filePath: relativeFilePath }, 'Loaded dynamic agent')
+ 
++      logger.debug(
++        { agentType: dynamicAgent.type, filePath: relativeFilePath },
++        'Loaded dynamic agent'
++      )
+     } catch (error) {
+-      const errorMessage = error instanceof Error ? error.message : 'Unknown error'
++      const errorMessage =
++        error instanceof Error ? error.message : 'Unknown error'
+       this.validationErrors.push({
+         filePath: relativeFilePath,
+         message: 'Failed to load agent template',
+-        details: errorMessage
++        details: errorMessage,
+       })
+-      logger.warn({ fileName, error: errorMessage }, 'Failed to load dynamic agent template')
++      logger.warn(
++        { fileName, error: errorMessage },
++        'Failed to load dynamic agent template'
++      )
+     }
+   }
+ 
+-
+-
+   /**
+    * Convert dynamic agent prompt schema to internal Zod schema format.
+    * This is done once during loading to avoid repeated conversions.
+@@ -207,7 +266,10 @@ export class DynamicAgentService {
+           default:
+             // Fallback to string for unknown types
+             result[key] = z.string().describe(field.description)
+-            logger.warn({ type: field.type, key }, 'Unknown schema type, defaulting to string')
++            logger.warn(
++              { type: field.type, key },
++              'Unknown schema type, defaulting to string'
++            )
+         }
+       }
+     } else {
+diff --git a/backend/src/templates/types.ts b/backend/src/templates/types.ts
+index 4f0f32d57..1bd663543 100644
+--- a/backend/src/templates/types.ts
++++ b/backend/src/templates/types.ts
+@@ -5,16 +5,17 @@ import { ToolName } from '@codebuff/common/constants/tools'
+ import {
+   AgentTemplateType,
+   AgentTemplateTypes,
++  ToolResult,
+ } from '@codebuff/common/types/session-state'
+ import { closeXmlTags } from '@codebuff/common/util/xml'
+-// Removed FallbackProvider import - no longer needed
++import { CodebuffToolCall } from '../tools/constants'
+ 
+ export type AgentTemplate = {
+   type: AgentTemplateType
+   name: string
+   description: string
+   model: Model
+-  // Fallback providers removed - all models now use ai-sdk directly
++  implementation: 'llm'
+   // Required parameters for spawning this agent.
+   promptSchema: {
+     prompt?: z.ZodSchema<string | undefined>
+@@ -36,6 +37,35 @@ export type AgentTemplate = {
+   agentStepPrompt: string
+ }
+ 
++export interface ProgrammaticAgentTemplate {
++  type: AgentTemplateType
++  implementation: 'programmatic'
++  name: string
++  description: string
++  handler: ProgrammaticAgentFunction // Direct generator function. TODO: replace with path to a file or string of source code?
++  includeMessageHistory: boolean
++  promptSchema: {
++    prompt?: z.ZodSchema<string | undefined>
++    params?: z.ZodSchema<any>
++  }
++  toolNames: ToolName[] // Tools this programmatic agent can use
++  spawnableAgents: AgentTemplateType[] // Agents it can spawn
++}
++
++// Union type for all agent templates
++export type AgentTemplateUnion = AgentTemplate | ProgrammaticAgentTemplate
++
++// Context passed to programmatic agents
++export interface ProgrammaticAgentContext {
++  prompt: string
++  params: any
++}
++
++// The generator function signature
++export type ProgrammaticAgentFunction = (
++  context: ProgrammaticAgentContext
++) => Generator<Omit<CodebuffToolCall, 'toolCallId'>, void, ToolResult>
++
+ const placeholderNames = [
+   'AGENT_NAME',
+   'CONFIG_SCHEMA',
+diff --git a/common/src/types/session-state.ts b/common/src/types/session-state.ts
+index 348aed0d6..1bf5f8c37 100644
+--- a/common/src/types/session-state.ts
++++ b/common/src/types/session-state.ts
+@@ -59,6 +59,7 @@ export const AgentTemplateTypeList = [
+   'researcher',
+   'reviewer',
+   'sonnet4_agent_builder',
++  'example_programmatic',
+ ] as const
+ export const AgentTemplateTypes = Object.fromEntries(
+   AgentTemplateTypeList.map((name) => [name, name])
+diff --git a/knowledge.md b/knowledge.md
+index bd3aed9ac..903fcd8bb 100644
+--- a/knowledge.md
++++ b/knowledge.md
+@@ -40,6 +40,14 @@ Codebuff is a tool for editing codebases via natural language instruction to Buf
+ - Backend uses tool calls to request additional information or perform actions
+ - Client-side handles tool calls and sends results back to server
+ 
++## Agent System
++
++- **LLM-based Agents**: Traditional agents defined in `backend/src/templates/` using prompts and LLM models
++- **Programmatic Agents**: Custom agents using JavaScript/TypeScript generator functions in `.agents/templates/`
++- Agent templates define available tools, spawnable sub-agents, and execution behavior
++- Programmatic agents allow complex orchestration logic, conditional flows, and iterative refinement
++- Both types integrate seamlessly through the same tool execution system
++
+ ## CLI Interface Features
+ 
+ - ESC key to toggle menu or stop AI response

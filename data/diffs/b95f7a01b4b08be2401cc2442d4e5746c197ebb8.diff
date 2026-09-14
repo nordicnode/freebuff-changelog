@@ -1,0 +1,215 @@
+diff --git a/backend/src/system-prompt.ts b/backend/src/system-prompt.ts
+index c799d543c..c2d1a1e0d 100644
+--- a/backend/src/system-prompt.ts
++++ b/backend/src/system-prompt.ts
+@@ -18,6 +18,7 @@ export function getSearchSystemPrompt(fileContext: ProjectFileContext) {
+     text: [
+       getProjectFileTreePrompt(fileContext),
+       getRelevantFilesPromptPart1(fileContext),
++      gitChangesPrompt(fileContext),
+     ].join('\n\n'),
+   })
+ 
+@@ -294,7 +295,7 @@ As you can see, some files that you might find useful are already provided. If t
+ }
+ 
+ const gitChangesPrompt = (fileContext: ProjectFileContext) => {
+-  const { gitChanges } = fileContext
++  const { gitChanges, changesSinceLastChat } = fileContext
+   if (!gitChanges) {
+     return ''
+   }
+@@ -315,6 +316,13 @@ ${gitChanges.diffCached}
+ <git_commit_messages_most_recent_first>
+ ${gitChanges.lastCommitMessages}
+ </git_commit_messages_most_recent_first>
++
++The user has made the following changes to the code since your last response. Please try to preserve these changes!
++<user_edits_since_last_chat>
++${Object.entries(changesSinceLastChat)
++  .map(([filePath, diff]) => createFileBlock(filePath, diff))
++  .join('\n')}
++</user_edits_since_last_chat>
+ `.trim()
+ }
+ 
+diff --git a/common/src/util/file.ts b/common/src/util/file.ts
+index 80a9f0c9e..efdeea4b2 100644
+--- a/common/src/util/file.ts
++++ b/common/src/util/file.ts
+@@ -24,6 +24,7 @@ export const ProjectFileContextSchema = z.object({
+     diffCached: z.string(),
+     lastCommitMessages: z.string(),
+   }),
++  changesSinceLastChat: z.record(z.string(), z.string()),
+ })
+ 
+ export type ProjectFileContext = z.infer<typeof ProjectFileContextSchema>
+diff --git a/npm-app/src/cli.ts b/npm-app/src/cli.ts
+index b1418897c..51213a08d 100644
+--- a/npm-app/src/cli.ts
++++ b/npm-app/src/cli.ts
+@@ -1,7 +1,7 @@
+ import { uniq } from 'lodash'
+ import { applyChanges } from 'common/util/changes'
+ import * as readline from 'readline'
+-import { green, yellow, bold } from 'picocolors'
++import { green, yellow } from 'picocolors'
+ import { parse } from 'path'
+ 
+ import { websocketUrl } from './config'
+@@ -256,7 +256,8 @@ export class CLI {
+     await this.readyPromise
+ 
+     const newMessage: Message = { role: 'user', content: userInput }
+-    this.chatStorage.addMessage(this.chatStorage.getCurrentChat(), newMessage)
++    const currentChat = this.chatStorage.getCurrentChat()
++    this.chatStorage.addMessage(currentChat, newMessage)
+ 
+     this.isReceivingResponse = true
+     const { response, changes } = await this.sendUserInputAndAwaitResponse()
+diff --git a/npm-app/src/client.ts b/npm-app/src/client.ts
+index b7d9457f8..30f4ed463 100644
+--- a/npm-app/src/client.ts
++++ b/npm-app/src/client.ts
+@@ -126,7 +126,8 @@ export class Client {
+   }
+ 
+   async sendUserInput(previousChanges: FileChanges, userInputId: string) {
+-    const messages = this.chatStorage.getCurrentChat().messages
++    const currentChat = this.chatStorage.getCurrentChat()
++    const { messages, fileVersions } = currentChat
+     const messageText = messages
+       .map((m) => JSON.stringify(m.content))
+       .join('\n')
+@@ -150,7 +151,12 @@ export class Client {
+       lastMessage.content += '\n\n' + blocks.join('\n\n')
+     }
+ 
+-    const fileContext = await getProjectFileContext(fileList)
++    const currentFileVersion =
++      fileVersions[fileVersions.length - 1]?.files ?? {}
++    const fileContext = await getProjectFileContext(
++      fileList,
++      currentFileVersion
++    )
+     this.webSocket.sendAction({
+       type: 'user-input',
+       userInputId,
+@@ -229,7 +235,7 @@ export class Client {
+   }
+ 
+   public async warmContextCache() {
+-    const fileContext = await getProjectFileContext([])
++    const fileContext = await getProjectFileContext([], {})
+ 
+     return new Promise<void>((resolve) => {
+       this.webSocket.subscribe('warm-context-cache-response', () => {
+diff --git a/npm-app/src/index.ts b/npm-app/src/index.ts
+index 7d0094763..c7899a773 100644
+--- a/npm-app/src/index.ts
++++ b/npm-app/src/index.ts
+@@ -13,7 +13,7 @@ async function manicode(projectDir: string | undefined) {
+ 
+   // Preload stuff.
+   const fingerprintPromise = initFingerprint()
+-  const initProjectFileContextPromise = await getProjectFileContext([])
++  const initProjectFileContextPromise = await getProjectFileContext([], {})
+ 
+   const readyPromise = Promise.all([
+     fingerprintPromise,
+diff --git a/npm-app/src/project-files.ts b/npm-app/src/project-files.ts
+index 618970201..2c1031ae2 100644
+--- a/npm-app/src/project-files.ts
++++ b/npm-app/src/project-files.ts
+@@ -2,6 +2,7 @@ import fs from 'fs'
+ import path from 'path'
+ import { exec } from 'child_process'
+ import { promisify } from 'util'
++import { createPatch } from 'diff'
+ 
+ import { createFileBlock, ProjectFileContext } from 'common/util/file'
+ import { filterObject } from 'common/util/object'
+@@ -45,12 +46,24 @@ export function getProjectRoot() {
+ 
+ let cachedProjectFileContext: ProjectFileContext | undefined
+ 
+-export const getProjectFileContext = async (fileList: string[]) => {
++export const getProjectFileContext = async (
++  fileList: string[],
++  lastFileVersion: Record<string, string>
++) => {
+   const root = getProjectRoot()
+   const cwd = getCurrentWorkingDirectory()
+ 
+   const contextRoot = path.relative(root, cwd).startsWith('..') ? cwd : root
+ 
++  const files = getFiles(fileList)
++  const gitChanges = await getGitChanges()
++  const changesSinceLastChat = getChangesSinceLastFileVersion(lastFileVersion)
++  const updatedProps = {
++    files,
++    gitChanges,
++    changesSinceLastChat,
++  }
++
+   if (
+     !cachedProjectFileContext ||
+     cachedProjectFileContext.currentWorkingDirectory !== contextRoot
+@@ -65,25 +78,17 @@ export const getProjectFileContext = async (fileList: string[]) => {
+     const allFilePaths = getAllFilePaths(fileTree)
+     const fileTokenScores = await getFileTokenScores(contextRoot, allFilePaths)
+ 
+-    const files = getFiles(fileList)
+-
+-    const gitChanges = await getGitChanges()
+-
+     cachedProjectFileContext = {
+       currentWorkingDirectory: contextRoot,
+       fileTree,
+       fileTokenScores,
+       knowledgeFiles,
+-      files,
+-      gitChanges,
++      ...updatedProps,
+     }
+   } else {
+-    const files = getFiles(fileList)
+-    const gitChanges = await getGitChanges()
+     cachedProjectFileContext = {
+       ...cachedProjectFileContext,
+-      files,
+-      gitChanges,
++      ...updatedProps,
+     }
+   }
+ 
+@@ -118,6 +123,28 @@ async function getGitChanges() {
+   }
+ }
+ 
++function getChangesSinceLastFileVersion(
++  lastFileVersion: Record<string, string>
++) {
++  return Object.fromEntries(
++    Object.entries(lastFileVersion)
++      .map(([filePath, file]) => {
++        const fullFilePath = path.join(getProjectRoot(), filePath)
++        try {
++          const currentContent = fs.readFileSync(fullFilePath, 'utf8')
++          if (currentContent === file) {
++            return [filePath, null]
++          }
++          return [filePath, createPatch(filePath, file, currentContent)]
++        } catch (error) {
++          // console.error(`Error reading file ${fullFilePath}:`, error)
++          return [filePath, null]
++        }
++      })
++      .filter(([_, diff]) => diff !== null)
++  )
++}
++
+ export function getFiles(filePaths: string[]) {
+   const result: Record<string, string | null> = {}
+   for (const filePath of filePaths) {

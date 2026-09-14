@@ -1,0 +1,283 @@
+diff --git a/packages/code-map/src/languages.ts b/packages/code-map/src/languages.ts
+index c741432fc..e0f449508 100644
+--- a/packages/code-map/src/languages.ts
++++ b/packages/code-map/src/languages.ts
+@@ -1,5 +1,8 @@
+ import * as path from 'path'
+ 
++// Import some types for wasm & .scm files
++import './types.d.ts'
++
+ /* ------------------------------------------------------------------ */
+ /* 1 .  WASM files
+ /* ------------------------------------------------------------------ */
+@@ -129,8 +132,13 @@ export async function getLanguageConfig(
+       const parser = new Parser()
+       // NOTE (James): For some reason, Bun gives the wrong path to the imported WASM file,
+       // so we need to delete one level of ../.
+-      const actualPath = cfg.wasmFile.replace('../', '')
+-      const lang = await Language.load(actualPath)
++      let lang
++      try {
++        const actualPath = cfg.wasmFile.replace('../', '')
++        lang = await Language.load(actualPath)
++      } catch (err) {
++        lang = await Language.load(cfg.wasmFile)
++      }
+       parser.setLanguage(lang)
+ 
+       cfg.language = lang
+diff --git a/packages/code-map/src/parse.ts b/packages/code-map/src/parse.ts
+index e2a88f84b..40c9c8f07 100644
+--- a/packages/code-map/src/parse.ts
++++ b/packages/code-map/src/parse.ts
+@@ -27,6 +27,7 @@ export interface FileTokenData {
+ export async function getFileTokenScores(
+   projectRoot: string,
+   filePaths: string[],
++  readFile?: (filePath: string) => string | null,
+ ): Promise<FileTokenData> {
+   const startTime = Date.now()
+   const tokenScores: { [filePath: string]: { [token: string]: number } } = {}
+@@ -38,9 +39,10 @@ export async function getFileTokenScores(
+     const fullPath = path.join(projectRoot, filePath)
+     const languageConfig = await getLanguageConfig(fullPath)
+     if (languageConfig) {
+-      const { identifiers, calls, numLines } = await parseTokens(
+-        fullPath,
++      const { identifiers, calls, numLines } = parseTokens(
++        filePath,
+         languageConfig,
++        readFile,
+       )
+ 
+       const tokenScoresForFile: { [token: string]: number } = {}
+@@ -146,14 +148,22 @@ export async function getFileTokenScores(
+   return { tokenScores, tokenCallers }
+ }
+ 
+-export async function parseTokens(
++export function parseTokens(
+   filePath: string,
+   languageConfig: LanguageConfig,
++  readFile?: (filePath: string) => string | null,
+ ) {
+   const { parser, query } = languageConfig
+ 
+   try {
+-    const sourceCode = fs.readFileSync(filePath, 'utf8')
++    const sourceCode = readFile ? readFile(filePath) : fs.readFileSync(filePath, 'utf8')
++    if (sourceCode === null) {
++      return {
++        numLines: 0,
++        identifiers: [] as string[],
++        calls: [] as string[],
++      }
++    }
+     const numLines = sourceCode.match(/\n/g)?.length ?? 0 + 1
+     if (!parser || !query) {
+       throw new Error('Parser or query not found')
+diff --git a/sdk/package.json b/sdk/package.json
+index 81ef3e045..e6a7340d5 100644
+--- a/sdk/package.json
++++ b/sdk/package.json
+@@ -53,7 +53,9 @@
+   },
+   "dependencies": {
+     "ai": "^5.0.0",
+-    "zod": "^4.0.0"
++    "zod": "^4.0.0",
++    "@vscode/tree-sitter-wasm": "0.1.4",
++    "web-tree-sitter": "0.25.6"
+   },
+   "devDependencies": {
+     "@types/node": "22",
+diff --git a/sdk/src/client.ts b/sdk/src/client.ts
+index 3a7cf4227..6c0f6b0c0 100644
+--- a/sdk/src/client.ts
++++ b/sdk/src/client.ts
+@@ -144,13 +144,13 @@ export class CodebuffClient {
+     const promptId = Math.random().toString(36).substring(2, 15)
+     const sessionState =
+       previousRun?.sessionState ??
+-      initialSessionState(this.cwd, {
++      (await initialSessionState(this.cwd, {
+         knowledgeFiles,
+         agentDefinitions,
+         customToolDefinitions,
+         projectFiles,
+         maxAgentSteps,
+-      })
++      }))
+     sessionState.mainAgentState.stepsRemaining = maxAgentSteps
+     const toolResults = previousRun?.toolResults ?? []
+     if (handleEvent) {
+diff --git a/sdk/src/run-state.ts b/sdk/src/run-state.ts
+index 4ad4859c6..afd72a288 100644
+--- a/sdk/src/run-state.ts
++++ b/sdk/src/run-state.ts
+@@ -1,23 +1,26 @@
+ import * as os from 'os'
+ 
+ import { type CustomToolDefinition } from './custom-tool'
++import { getFileTokenScores } from '../../packages/code-map/src/parse'
+ import { getInitialSessionState } from '../../common/src/types/session-state'
+ 
+ import type { ServerAction } from '../../common/src/actions'
+ import type { AgentDefinition } from '../../common/src/templates/initial-agents-dir/types/agent-definition'
+ import type { CodebuffMessage } from '../../common/src/types/message'
+ import type { SessionState } from '../../common/src/types/session-state'
+-import type { CustomToolDefinitions } from '../../common/src/util/file'
++import type {
++  CustomToolDefinitions,
++  FileTreeNode,
++} from '../../common/src/util/file'
+ 
+ export type RunState = {
+   sessionState: SessionState
+   toolResults: ServerAction<'prompt-response'>['toolResults']
+ }
+ 
+-export function initialSessionState(
++export async function initialSessionState(
+   cwd: string,
+   options: {
+-    // TODO: Parse projectFiles into fileTree, fileTokenScores, tokenCallers
+     projectFiles?: Record<string, string>
+     knowledgeFiles?: Record<string, string>
+     agentDefinitions?: AgentDefinition[]
+@@ -76,12 +79,35 @@ export function initialSessionState(
+     ]),
+   )
+ 
++  // Generate file tree and token scores from projectFiles
++  const filePaths = Object.keys(projectFiles).sort()
++
++  // Build hierarchical file tree with directories
++  const fileTree = buildFileTree(filePaths)
++  let fileTokenScores = {}
++  let tokenCallers = {}
++
++  if (filePaths.length > 0) {
++    try {
++      const tokenData = await getFileTokenScores(
++        cwd,
++        filePaths,
++        (filePath: string) => projectFiles[filePath] || null,
++      )
++      fileTokenScores = tokenData.tokenScores
++      tokenCallers = tokenData.tokenCallers
++    } catch (error) {
++      // If token scoring fails, continue with empty scores
++      console.warn('Failed to generate parsed symbol scores:', error)
++    }
++  }
++
+   const initialState = getInitialSessionState({
+     projectRoot: cwd,
+     cwd,
+-    fileTree: [],
+-    fileTokenScores: {},
+-    tokenCallers: {},
++    fileTree,
++    fileTokenScores,
++    tokenCallers,
+     knowledgeFiles,
+     userKnowledgeFiles: {},
+     agentTemplates: processedAgentTemplates,
+@@ -111,7 +137,7 @@ export function initialSessionState(
+   return initialState
+ }
+ 
+-export function generateInitialRunState({
++export async function generateInitialRunState({
+   cwd,
+   projectFiles,
+   knowledgeFiles,
+@@ -125,9 +151,9 @@ export function generateInitialRunState({
+   agentDefinitions?: AgentDefinition[]
+   customToolDefinitions?: CustomToolDefinition[]
+   maxAgentSteps?: number
+-}): RunState {
++}): Promise<RunState> {
+   return {
+-    sessionState: initialSessionState(cwd, {
++    sessionState: await initialSessionState(cwd, {
+       projectFiles,
+       knowledgeFiles,
+       agentDefinitions,
+@@ -167,3 +193,74 @@ export function withMessageHistory({
+ 
+   return newRunState
+ }
++
++/**
++ * Builds a hierarchical file tree from a flat list of file paths
++ */
++function buildFileTree(filePaths: string[]): FileTreeNode[] {
++  const tree: Record<string, FileTreeNode> = {}
++
++  // Build the tree structure
++  for (const filePath of filePaths) {
++    const parts = filePath.split('/')
++
++    for (let i = 0; i < parts.length; i++) {
++      const currentPath = parts.slice(0, i + 1).join('/')
++      const isFile = i === parts.length - 1
++
++      if (!tree[currentPath]) {
++        tree[currentPath] = {
++          name: parts[i],
++          type: isFile ? 'file' : 'directory',
++          filePath: currentPath,
++          children: isFile ? undefined : [],
++        }
++      }
++    }
++  }
++
++  // Organize into hierarchical structure
++  const rootNodes: FileTreeNode[] = []
++  const processed = new Set<string>()
++
++  for (const [path, node] of Object.entries(tree)) {
++    if (processed.has(path)) continue
++
++    const parentPath = path.substring(0, path.lastIndexOf('/'))
++    if (parentPath && tree[parentPath]) {
++      // This node has a parent, add it to parent's children
++      const parent = tree[parentPath]
++      if (
++        parent.children &&
++        !parent.children.some((child) => child.filePath === path)
++      ) {
++        parent.children.push(node)
++      }
++    } else {
++      // This is a root node
++      rootNodes.push(node)
++    }
++    processed.add(path)
++  }
++
++  // Sort function for nodes
++  function sortNodes(nodes: FileTreeNode[]): void {
++    nodes.sort((a, b) => {
++      // Directories first, then files
++      if (a.type !== b.type) {
++        return a.type === 'directory' ? -1 : 1
++      }
++      return a.name.localeCompare(b.name)
++    })
++
++    // Recursively sort children
++    for (const node of nodes) {
++      if (node.children) {
++        sortNodes(node.children)
++      }
++    }
++  }
++
++  sortNodes(rootNodes)
++  return rootNodes
++}

@@ -1,0 +1,243 @@
+diff --git a/evals/git-evals/run-eval-set.ts b/evals/git-evals/run-eval-set.ts
+index 93c4d6df6..d8a27c3e1 100644
+--- a/evals/git-evals/run-eval-set.ts
++++ b/evals/git-evals/run-eval-set.ts
+@@ -5,7 +5,7 @@ import { Model } from 'common/constants'
+ import type { GitEvalResultRequest } from 'common/db/schema'
+ import { sendEvalResultsEmail } from './email-eval-results'
+ import { analyzeEvalResults, PostEvalAnalysis } from './post-eval-analysis'
+-import { mockRunGitEvals, runGitEvals } from './run-git-evals'
++import { mockRunGitEvals, runGitEvals, setGlobalConcurrencyLimit } from './run-git-evals'
+ import { FullEvalLog } from './types'
+ 
+ const DEFAULT_OUTPUT_DIR = 'git-evals'
+@@ -44,6 +44,9 @@ async function runEvalSet(
+   console.log('Starting eval set run...')
+   console.log(`Output directory: ${outputDir}`)
+ 
++  // Set global concurrency limit of 20 processes across ALL repositories
++  setGlobalConcurrencyLimit(20)
++
+   // Define the eval configurations
+   const evalConfigs: EvalConfig[] = [
+     {
+diff --git a/evals/git-evals/run-git-evals.ts b/evals/git-evals/run-git-evals.ts
+index 1f88c103f..8e1231ee9 100644
+--- a/evals/git-evals/run-git-evals.ts
++++ b/evals/git-evals/run-git-evals.ts
+@@ -1,6 +1,7 @@
+ import { execSync, fork } from 'child_process'
+ import fs from 'fs'
+ import path from 'path'
++import pLimit from 'p-limit'
+ 
+ import { promptAiSdkStructured } from '../../backend/src/llm-apis/vercel-ai-sdk/ai-sdk'
+ import { claudeModels } from '../../common/src/constants'
+@@ -284,6 +285,13 @@ export function mockRunGitEvals(path: string) {
+   return result
+ }
+ 
++// Global concurrency limiter that can be shared across multiple repository evaluations
++let globalConcurrencyLimiter: ReturnType<typeof pLimit> | null = null
++
++export function setGlobalConcurrencyLimit(limit: number) {
++  globalConcurrencyLimiter = pLimit(limit)
++}
++
+ export async function runGitEvals(
+   evalDataPath: string,
+   outputDir: string,
+@@ -323,93 +331,98 @@ export async function runGitEvals(
+     ? evalData.evalCommits.slice(0, limit)
+     : evalData.evalCommits
+ 
+-  console.log(`Running ${commitsToRun.length} evaluations in parallel...`)
+-
+-  const evalPromises = commitsToRun.map((evalCommit, index) => {
+-    return new Promise<EvalRunJudged>(async (resolve, reject) => {
+-      try {
+-        console.log(
+-          `Setting up test repository for commit ${evalCommit.sha}...`
+-        )
+-        const projectPath = await setupTestRepo(
+-          repoUrl,
+-          testRepoName,
+-          evalCommit.sha
+-        )
+-
+-        console.log(
+-          `Starting ${testRepoName} eval ${index + 1}/${commitsToRun.length} for commit ${evalCommit.message}...`
+-        )
++  console.log(`Running ${commitsToRun.length} evaluations with max 20 concurrent processes...`)
+ 
+-        const safeMessage = evalCommit.message
+-          .split('\n')[0]
+-          .replace(/[^a-zA-Z0-9]/g, '_')
+-          .slice(0, 30)
+-        const logFilename = `${safeMessage}-${evalCommit.sha.slice(0, 7)}.log`
+-        const logPath = path.join(logsDir, logFilename)
+-        const logStream = fs.createWriteStream(logPath)
+-
+-        // Write evalCommit to temporary file to avoid long command line arguments
+-        const tempEvalCommitPath = path.join(
+-          logsDir,
+-          `eval-commit-${evalCommit.sha.slice(0, 7)}.json`
+-        )
+-        fs.writeFileSync(tempEvalCommitPath, JSON.stringify(evalCommit))
++  // Use global limiter if available, otherwise create a local one
++  const limitConcurrency = globalConcurrencyLimiter || pLimit(20)
+ 
+-        const child = fork(
+-          path.resolve(__dirname, 'run-single-eval-process.ts'),
+-          [tempEvalCommitPath, projectPath, clientSessionId, fingerprintId],
+-          { stdio: ['pipe', 'pipe', 'pipe', 'ipc'] }
+-        )
+-
+-        child.stdout?.pipe(logStream)
+-        child.stderr?.pipe(logStream)
+-
+-        child.on(
+-          'message',
+-          (message: { type: string; result?: EvalRunJudged; error?: any }) => {
+-            // Clean up temp file
+-            try {
+-              fs.unlinkSync(tempEvalCommitPath)
+-            } catch (e) {
+-              console.warn(
+-                `Failed to clean up temp file ${tempEvalCommitPath}:`,
+-                e
+-              )
++  const evalPromises = commitsToRun.map((evalCommit, index) => {
++    return limitConcurrency(() =>
++      new Promise<EvalRunJudged>(async (resolve, reject) => {
++        try {
++          console.log(
++            `Setting up test repository for commit ${evalCommit.sha}...`
++          )
++          const projectPath = await setupTestRepo(
++            repoUrl,
++            testRepoName,
++            evalCommit.sha
++          )
++
++          console.log(
++            `Starting ${testRepoName} eval ${index + 1}/${commitsToRun.length} for commit ${evalCommit.message}...`
++          )
++
++          const safeMessage = evalCommit.message
++            .split('\n')[0]
++            .replace(/[^a-zA-Z0-9]/g, '_')
++            .slice(0, 30)
++          const logFilename = `${safeMessage}-${evalCommit.sha.slice(0, 7)}.log`
++          const logPath = path.join(logsDir, logFilename)
++          const logStream = fs.createWriteStream(logPath)
++
++          // Write evalCommit to temporary file to avoid long command line arguments
++          const tempEvalCommitPath = path.join(
++            logsDir,
++            `eval-commit-${evalCommit.sha.slice(0, 7)}.json`
++          )
++          fs.writeFileSync(tempEvalCommitPath, JSON.stringify(evalCommit))
++
++          const child = fork(
++            path.resolve(__dirname, 'run-single-eval-process.ts'),
++            [tempEvalCommitPath, projectPath, clientSessionId, fingerprintId],
++            { stdio: ['pipe', 'pipe', 'pipe', 'ipc'] }
++          )
++
++          child.stdout?.pipe(logStream)
++          child.stderr?.pipe(logStream)
++
++          child.on(
++            'message',
++            (message: { type: string; result?: EvalRunJudged; error?: any }) => {
++              // Clean up temp file
++              try {
++                fs.unlinkSync(tempEvalCommitPath)
++              } catch (e) {
++                console.warn(
++                  `Failed to clean up temp file ${tempEvalCommitPath}:`,
++                  e
++                )
++              }
++              if (message.type === 'result' && message.result) {
++                console.log(
++                  `Completed eval for commit ${testRepoName} - ${evalCommit.message}`
++                )
++                resolve(message.result)
++              } else if (message.type === 'error') {
++                console.error(
++                  `Received error while running eval: ${message.error.stack}\n`,
++                  { message }
++                )
++                const err = new Error(message.error.message)
++                reject(err)
++              }
+             }
+-            if (message.type === 'result' && message.result) {
+-              console.log(
+-                `Completed eval for commit ${testRepoName} - ${evalCommit.message}`
+-              )
+-              resolve(message.result)
+-            } else if (message.type === 'error') {
++          )
++
++          child.on('exit', (code) => {
++            logStream.end()
++            if (code !== 0) {
+               console.error(
+-                `Received error while running eval: ${message.error.stack}\n`,
+-                { message }
++                `Eval process for ${evalCommit.sha} exited with code ${code}. See logs at ${logPath}`
+               )
+-              const err = new Error(message.error.message)
+-              reject(err)
+-            }
+-          }
+-        )
+-
+-        child.on('exit', (code) => {
+-          logStream.end()
+-          if (code !== 0) {
+-            console.error(
+-              `Eval process for ${evalCommit.sha} exited with code ${code}. See logs at ${logPath}`
+-            )
+-            reject(
+-              new Error(
+-                `Eval process for ${evalCommit.sha} exited with code ${code}`
++              reject(
++                new Error(
++                  `Eval process for ${evalCommit.sha} exited with code ${code}`
++                )
+               )
+-            )
+-          }
+-        })
+-      } catch (e) {
+-        reject(e)
+-      }
+-    })
++            }
++          })
++        } catch (e) {
++          reject(e)
++        }
++      })
++    )
+   })
+ 
+   const results = await Promise.allSettled(evalPromises)
+diff --git a/evals/package.json b/evals/package.json
+index db1c6ce58..1d61515db 100644
+--- a/evals/package.json
++++ b/evals/package.json
+@@ -16,7 +16,8 @@
+   },
+   "dependencies": {
+     "async": "^3.2.6",
+-    "lodash": "^4.17.21"
++    "lodash": "^4.17.21",
++    "p-limit": "^6.2.0"
+   },
+   "devDependencies": {
+     "@types/async": "^3.2.24",

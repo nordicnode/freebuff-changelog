@@ -1,0 +1,413 @@
+diff --git a/backend/src/billing/message-cost-tracker.ts b/backend/src/billing/message-cost-tracker.ts
+index b582faf08..34ab5e899 100644
+--- a/backend/src/billing/message-cost-tracker.ts
++++ b/backend/src/billing/message-cost-tracker.ts
+@@ -6,7 +6,6 @@ import { stripeServer } from 'common/util/stripe'
+ import * as schema from 'common/db/schema'
+ import { eq } from 'drizzle-orm'
+ import { logger, withLoggerContext } from '@/util/logger'
+-import { pluralize } from 'common/util/string'
+ 
+ const PROFIT_MARGIN = 0.2
+ 
+@@ -20,6 +19,7 @@ const TOKENS_COST_PER_M = {
+     [models.gpt4o]: 2.5,
+     [models.gpt4omini]: 0.15,
+     [models.o1]: 15,
++    [models.deepseekChat]: 0.14,
+   },
+   output: {
+     [models.sonnet]: 15,
+@@ -27,6 +27,7 @@ const TOKENS_COST_PER_M = {
+     [models.gpt4o]: 10.0,
+     [models.gpt4omini]: 0.6,
+     [models.o1]: 60,
++    [models.deepseekChat]: 0.28,
+   },
+   cache_creation: {
+     [models.sonnet]: 3.75,
+@@ -35,6 +36,7 @@ const TOKENS_COST_PER_M = {
+   cache_read: {
+     [models.sonnet]: 0.3,
+     [models.haiku]: 0.1,
++    [models.deepseekChat]: 0.014,
+   },
+ }
+ 
+diff --git a/backend/src/deepseek-api.ts b/backend/src/deepseek-api.ts
+new file mode 100644
+index 000000000..30063f8d1
+--- /dev/null
++++ b/backend/src/deepseek-api.ts
+@@ -0,0 +1,150 @@
++import OpenAI from 'openai'
++import { env } from './env.mjs'
++import { saveMessage } from './billing/message-cost-tracker'
++import { logger } from './util/logger'
++import { OpenAIMessage } from './openai-api'
++import { CompletionUsage } from 'openai/resources/completions'
++
++export type DeepseekMessage = OpenAI.Chat.ChatCompletionMessageParam
++
++let deepseekClient: OpenAI | null = null
++
++const getDeepseekClient = (fingerprintId: string) => {
++  if (!deepseekClient) {
++    deepseekClient = new OpenAI({
++      apiKey: env.DEEPSEEK_API_KEY,
++      baseURL: 'https://api.deepseek.com',
++      defaultHeaders: {
++        'Helicone-Auth': `Bearer ${env.HELICONE_API_KEY}`,
++        'Helicone-User-Id': fingerprintId,
++      },
++    })
++  }
++
++  return deepseekClient
++}
++
++export async function* promptDeepseekStream(
++  messages: OpenAIMessage[],
++  options: {
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
++    model: string
++    userId: string | undefined
++    maxTokens?: number
++    temperature?: number
++  }
++): AsyncGenerator<string, void, unknown> {
++  const {
++    clientSessionId,
++    fingerprintId,
++    userInputId,
++    model,
++    userId,
++    maxTokens,
++    temperature,
++  } = options
++  const deepseek = getDeepseekClient(fingerprintId)
++  const startTime = Date.now()
++
++  try {
++    const stream = await deepseek.chat.completions.create({
++      model,
++      messages,
++      temperature: temperature ?? 0,
++      max_tokens: maxTokens,
++      stream: true,
++    })
++
++    let content = ''
++    let messageId: string | undefined
++    let inputTokens = 0
++    let cacheReadInputTokens = 0
++    let outputTokens = 0
++
++    for await (const chunk of stream) {
++      if (chunk.choices[0]?.delta?.content) {
++        const delta = chunk.choices[0].delta.content
++        content += delta
++        yield delta
++      }
++
++      if (chunk.usage) {
++        const usage = chunk.usage as CompletionUsage & {
++          prompt_cache_miss_tokens: number
++          prompt_cache_hit_tokens: number
++        }
++        messageId = chunk.id
++        inputTokens = usage.prompt_cache_miss_tokens
++        cacheReadInputTokens = usage.prompt_cache_hit_tokens
++        outputTokens = usage.completion_tokens
++      }
++    }
++
++    if (messageId && messages.length > 0) {
++      saveMessage({
++        messageId: `deepseek-${messageId}`,
++        userId,
++        clientSessionId,
++        fingerprintId,
++        userInputId,
++        model,
++        request: messages,
++        response: content,
++        inputTokens,
++        cacheReadInputTokens,
++        outputTokens,
++        finishedAt: new Date(),
++        latencyMs: Date.now() - startTime,
++      })
++    }
++  } catch (error) {
++    logger.error(
++      {
++        error:
++          error && typeof error === 'object' && 'message' in error
++            ? error.message
++            : 'Unknown error',
++        messages,
++      },
++      'Error calling Deepseek API'
++    )
++
++    throw error
++  }
++}
++
++export async function promptDeepseek(
++  messages: OpenAIMessage[],
++  options: {
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
++    model: string
++    userId: string | undefined
++    maxTokens?: number
++    temperature?: number
++  }
++) {
++  const stream = promptDeepseekStream(messages, options)
++
++  try {
++    let content = ''
++    for await (const chunk of stream) {
++      content += chunk
++    }
++    return content
++  } catch (error) {
++    logger.error(
++      {
++        error:
++          error && typeof error === 'object' && 'message' in error
++            ? error.message
++            : 'Unknown error',
++      },
++      'Error calling Deepseek API'
++    )
++    throw error
++  }
++}
+diff --git a/backend/src/env.mjs b/backend/src/env.mjs
+index 95fa93f6f..40a03e248 100644
+--- a/backend/src/env.mjs
++++ b/backend/src/env.mjs
+@@ -24,6 +24,7 @@ export const env = createEnv({
+     HELICONE_API_KEY: z.string().min(1).startsWith('pk-helicone-'),
+     OPEN_AI_KEY: z.string().min(1).startsWith('sk-proj-'),
+     GEMINI_API_KEY: z.string().min(1).startsWith('AI'),
++    DEEPSEEK_API_KEY: z.string().min(1).startsWith('sk-'),
+     OPEN_ROUTER_API_KEY: z.string().min(1).startsWith('sk-or-v1-'),
+     STRIPE_SECRET_KEY: z.string().min(1),
+     STRIPE_WEBHOOK_SECRET_KEY: z.string().min(1),
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index b1b48d6b2..1d874d8fd 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -6,6 +6,7 @@ import {
+   TOOL_RESULT_MARKER,
+   STOP_MARKER,
+   getModelForMode,
++  models,
+ } from 'common/constants'
+ import { FileVersion, ProjectFileContext } from 'common/util/file'
+ import { didClientUseTool } from 'common/util/tools'
+@@ -29,6 +30,8 @@ import {
+   checkToAllowUnboundedIteration,
+ } from './conversation-progress'
+ import { getRelevantFilesForPlanning, planComplexChange } from './planning'
++import { promptDeepseekStream } from './deepseek-api'
++import { messagesWithSystem } from '@/util/messages'
+ 
+ export async function mainPrompt(
+   ws: WebSocket,
+@@ -106,6 +109,7 @@ export async function mainPrompt(
+     const system = getSearchSystemPrompt(fileContext)
+     warmCacheForRequestRelevantFiles(
+       system,
++      costMode,
+       clientSessionId,
+       fingerprintId,
+       userInputId,
+@@ -171,14 +175,30 @@ export async function mainPrompt(
+       'Prompting Claude Main'
+     )
+ 
+-    const stream = promptClaudeStream(messagesWithContinuedMessage, {
+-      system,
+-      model: getModelForMode(costMode, 'agent') as model_types,
+-      clientSessionId,
+-      fingerprintId,
+-      userInputId,
+-      userId,
+-    })
++    let stream: AsyncGenerator<string, void, unknown>
++    if (costMode === 'lite') {
++      stream = promptDeepseekStream(
++        messagesWithSystem(messagesWithContinuedMessage, system),
++        {
++          model: models.deepseekChat,
++          clientSessionId,
++          fingerprintId,
++          userInputId,
++          userId,
++        }
++      )
++      onResponseChunk('\n\n')
++      fullResponse += '\n\n'
++    } else {
++      stream = promptClaudeStream(messagesWithContinuedMessage, {
++        system,
++        model: getModelForMode(costMode, 'agent') as model_types,
++        clientSessionId,
++        fingerprintId,
++        userInputId,
++        userId,
++      })
++    }
+     const streamWithTags = processStreamWithTags(stream, {
+       edit_file: {
+         attributeNames: ['path'],
+diff --git a/backend/src/request-files-prompt.ts b/backend/src/request-files-prompt.ts
+index 70378ffa8..a6019b964 100644
+--- a/backend/src/request-files-prompt.ts
++++ b/backend/src/request-files-prompt.ts
+@@ -10,6 +10,8 @@ import { claudeModels, models } from 'common/constants'
+ import { getAllFilePaths } from 'common/project-file-tree'
+ import { logger } from './util/logger'
+ import { OpenAIMessage, promptOpenAI } from './openai-api'
++import { promptDeepseek } from './deepseek-api'
++import { messagesWithSystem } from '@/util/messages'
+ 
+ export async function requestRelevantFiles(
+   {
+@@ -309,14 +311,28 @@ async function getRelevantFiles(
+     },
+   ]
+   const start = performance.now()
+-  const response = await promptClaude(messagesWithPrompt, {
+-    model: getModelForMode(costMode, 'file-requests') as model_types,
+-    system,
+-    clientSessionId,
+-    fingerprintId,
+-    userInputId,
+-    userId,
+-  })
++  let response: string
++  if (costMode === 'lite') {
++    response = await promptDeepseek(
++      messagesWithSystem(messagesWithPrompt, system),
++      {
++        model: models.deepseekChat,
++        clientSessionId,
++        fingerprintId,
++        userInputId,
++        userId,
++      }
++    )
++  } else {
++    response = await promptClaude(messagesWithPrompt, {
++      model: getModelForMode(costMode, 'file-requests') as model_types,
++      system,
++      clientSessionId,
++      fingerprintId,
++      userInputId,
++      userId,
++    })
++  }
+   const end = performance.now()
+   const duration = end - start
+ 
+@@ -577,28 +593,39 @@ Please limit your response just the file paths on new lines. Do not write anythi
+ 
+ export const warmCacheForRequestRelevantFiles = async (
+   system: System,
++  costMode: CostMode,
+   clientSessionId: string,
+   fingerprintId: string,
+   userInputId: string,
+   userId: string | undefined
+ ) => {
+-  await promptClaude(
+-    [
+-      {
+-        role: 'user' as const,
+-        content: 'hi',
+-      },
+-    ],
+-    {
+-      model: claudeModels.haiku,
+-      system,
+-      clientSessionId,
+-      fingerprintId,
+-      userId,
+-      userInputId,
+-      maxTokens: 1,
+-    }
+-  ).catch((error) => {
++  const promise =
++    costMode === 'lite'
++      ? promptDeepseek(messagesWithSystem([], system), {
++          model: models.deepseekChat,
++          clientSessionId,
++          fingerprintId,
++          userInputId,
++          userId,
++        })
++      : promptClaude(
++          [
++            {
++              role: 'user' as const,
++              content: 'hi',
++            },
++          ],
++          {
++            model: claudeModels.haiku,
++            system,
++            clientSessionId,
++            fingerprintId,
++            userId,
++            userInputId,
++            maxTokens: 1,
++          }
++        )
++  await promise.catch((error) => {
+     logger.error(error, 'Error warming cache for requestRelevantFiles')
+   })
+ }
+diff --git a/backend/src/util/messages.ts b/backend/src/util/messages.ts
+new file mode 100644
+index 000000000..72a4badae
+--- /dev/null
++++ b/backend/src/util/messages.ts
+@@ -0,0 +1,6 @@
++import { Message } from 'common/actions'
++import { System } from '../claude'
++import { OpenAIMessage } from '../openai-api'
++
++export const messagesWithSystem = (messages: Message[], system: System) =>
++  [{ role: 'system', content: system }, ...messages] as OpenAIMessage[]
+diff --git a/common/src/constants.ts b/common/src/constants.ts
+index 907227a18..d11426a28 100644
+--- a/common/src/constants.ts
++++ b/common/src/constants.ts
+@@ -124,11 +124,16 @@ export const geminiModels = {
+   gemini2flash: 'gemini-2.0-flash-exp',
+ } as const
+ 
++export const deepseekModels = {
++  deepseekChat: 'deepseek-chat',
++} as const
++
+ export const models = {
+   ...claudeModels,
+   ...openaiModels,
+   ...geminiModels,
+-}
++  ...deepseekModels,
++} as const
+ 
+ export const OVERAGE_RATE_PRO = 0.99
+ export const OVERAGE_RATE_PRO_PLUS = 0.9

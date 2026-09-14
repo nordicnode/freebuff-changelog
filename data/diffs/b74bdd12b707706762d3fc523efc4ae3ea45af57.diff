@@ -1,0 +1,333 @@
+diff --git a/backend/src/generate-diffs-prompt.ts b/backend/src/generate-diffs-prompt.ts
+index d1be98b7b..65a54c33d 100644
+--- a/backend/src/generate-diffs-prompt.ts
++++ b/backend/src/generate-diffs-prompt.ts
+@@ -3,10 +3,9 @@ import {
+   createSearchReplaceBlock,
+   parseFileBlocks,
+ } from 'common/util/file'
+-import { CostMode, models, STOP_MARKER } from 'common/constants'
+-import { promptClaude } from './claude'
++import { CostMode, models } from 'common/constants'
+ import { logger } from './util/logger'
+-import { promptDeepseek } from './deepseek-api'
++import { promptOpenAI } from './openai-api'
+ 
+ export const parseAndGetDiffBlocks = (
+   response: string,
+@@ -175,7 +174,7 @@ const tryToDoStringReplacementWithExtraIndentation = (
+   return null
+ }
+ 
+-export const retryDiffBlocksPrompt = async (
++export async function retryDiffBlocksPrompt(
+   filePath: string,
+   oldContent: string,
+   costMode: CostMode,
+@@ -184,7 +183,7 @@ export const retryDiffBlocksPrompt = async (
+   userInputId: string,
+   userId: string | undefined,
+   diffBlocksThatDidntMatch: { searchContent: string; replaceContent: string }[]
+-) => {
++) {
+   const newPrompt =
+     `The assistant failed to find a match for the following changes. Please help the assistant understand what the changes should be.
+ 
+@@ -199,24 +198,13 @@ You should:
+ 1. Use <thinking> blocks to explain what might have gone wrong in these SEARCH/REPLACE blocks that didn't match. The search content needs to match an exact substring of the old file content.
+ 2. Provide a new set of SEARCH/REPLACE changes to make the intended edit from the old file.`.trim()
+ 
+-  let response: string
+-  if (costMode === 'lite') {
+-    response = await promptDeepseek([{ role: 'user', content: newPrompt }], {
+-      clientSessionId,
+-      fingerprintId,
+-      userInputId,
+-      model: models.deepseekChat,
+-      userId,
+-    })
+-  } else {
+-    response = await promptClaude([{ role: 'user', content: newPrompt }], {
+-      clientSessionId,
+-      fingerprintId,
+-      userInputId,
+-      model: models.sonnet,
+-      userId,
+-    })
+-  }
++  const response = await promptOpenAI([{ role: 'user', content: newPrompt }], {
++    model: models.o3mini,
++    clientSessionId,
++    fingerprintId,
++    userInputId,
++    userId,
++  })
+   const {
+     diffBlocks: newDiffBlocks,
+     diffBlocksThatDidntMatch: newDiffBlocksThatDidntMatch,
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index f843ed47c..f3edc685a 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -32,6 +32,7 @@ import {
+   loadFilesForPlanning,
+   planComplexChange,
+ } from './planning'
++import { getMessageText } from './util/messages'
+ 
+ export async function mainPrompt(
+   ws: WebSocket,
+@@ -52,6 +53,7 @@ export async function mainPrompt(
+       !message.content.includes(TOOL_RESULT_MARKER)
+   )
+   const lastUserMessage = messages[lastUserMessageIndex]
++  const lastUserPrompt = getMessageText(lastUserMessage)
+   const assistantReplyMessageIndex = lastUserMessageIndex + 1
+   const assistantReplyMessage = messages[assistantReplyMessageIndex]
+   const assistantIsExecutingPlan =
+@@ -189,18 +191,17 @@ export async function mainPrompt(
+             : fileContent
+           fileProcessingPromises.push(
+             processFileBlock(
+-              clientSessionId,
+-              fingerprintId,
+-              userInputId,
+-              ws,
+               path,
+               fileContentWithoutStartNewline,
+               messages,
+               fullResponse,
++              lastUserPrompt,
++              clientSessionId,
++              fingerprintId,
++              userInputId,
+               userId,
+-              typeof lastUserMessage?.content === 'string'
+-                ? lastUserMessage.content
+-                : undefined
++              ws,
++              costMode
+             ).catch((error) => {
+               logger.error(error, 'Error processing file block')
+               return null
+diff --git a/backend/src/process-file-block.ts b/backend/src/process-file-block.ts
+index 4c46ed997..21707a227 100644
+--- a/backend/src/process-file-block.ts
++++ b/backend/src/process-file-block.ts
+@@ -7,22 +7,26 @@ import { promptRelaceAI } from './relace-api'
+ import { cleanMarkdownCodeBlock, parseFileBlocks } from 'common/util/file'
+ import { generateCompactId, hasLazyEdit } from 'common/util/string'
+ import { countTokens } from './util/token-counter'
+-import { promptClaude } from './claude'
+-import { claudeModels, geminiModels } from 'common/constants'
+-import { parseAndGetDiffBlocksSingleFile } from './generate-diffs-prompt'
++import { geminiModels, CostMode, models } from 'common/constants'
++import {
++  parseAndGetDiffBlocksSingleFile,
++  retryDiffBlocksPrompt,
++} from './generate-diffs-prompt'
+ import { GeminiMessage, promptGemini } from './gemini-api'
++import { promptOpenAI } from './openai-api'
+ 
+ export async function processFileBlock(
+-  clientSessionId: string,
+-  fingerprintId: string,
+-  userInputId: string,
+-  ws: WebSocket,
+   filePath: string,
+   newContent: string,
+   messages: Message[],
+   fullResponse: string,
++  lastUserPrompt: string | undefined,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
+   userId: string | undefined,
+-  userMessage: string | undefined
++  ws: WebSocket,
++  costMode: CostMode
+ ): Promise<FileChange | null> {
+   if (newContent.trim() === '[UPDATED_BY_ANOTHER_ASSISTANT]') {
+     return null
+@@ -31,7 +35,6 @@ export async function processFileBlock(
+   const initialContent = await requestFile(ws, filePath)
+ 
+   if (initialContent === null) {
+-    // Remove markdown code block syntax if present
+     let cleanContent = cleanMarkdownCodeBlock(newContent)
+ 
+     if (hasLazyEdit(cleanContent)) {
+@@ -46,7 +49,11 @@ export async function processFileBlock(
+       { filePath, cleanContent },
+       `processFileBlock: Created new file ${filePath}`
+     )
+-    return { filePath, content: cleanContent, type: 'file' }
++    return {
++      type: 'file',
++      filePath,
++      content: cleanContent,
++    }
+   }
+ 
+   if (newContent === initialContent) {
+@@ -72,7 +79,9 @@ export async function processFileBlock(
+       clientSessionId,
+       fingerprintId,
+       userInputId,
+-      userId
++      userId,
++      filePath,
++      costMode
+     )
+ 
+     if (!largeFileContent) {
+@@ -89,7 +98,7 @@ export async function processFileBlock(
+       fingerprintId,
+       userInputId,
+       userId,
+-      userMessage
++      lastUserPrompt
+     )
+     const shouldAddPlaceholders = await shouldAddFilePlaceholders(
+       clientSessionId,
+@@ -114,7 +123,7 @@ export async function processFileBlock(
+         fingerprintId,
+         userInputId,
+         userId,
+-        userMessage
++        lastUserPrompt
+       )
+     }
+   }
+@@ -146,7 +155,11 @@ export async function processFileBlock(
+     },
+     `processFileBlock: Generated patch for ${filePath}`
+   )
+-  return { filePath, content: patch, type: 'patch' }
++  return {
++    type: 'patch',
++    filePath,
++    content: patch,
++  }
+ }
+ 
+ /**
+@@ -276,7 +289,7 @@ export async function fastRewrite(
+   return response + '\n'
+ }
+ 
+-const LARGE_FILE_TOKEN_LIMIT = 12000
++const LARGE_FILE_TOKEN_LIMIT = 10_000
+ 
+ async function handleLargeFile(
+   oldContent: string,
+@@ -284,8 +297,12 @@ async function handleLargeFile(
+   clientSessionId: string,
+   fingerprintId: string,
+   userInputId: string,
+-  userId: string | undefined
++  userId: string | undefined,
++  filePath: string,
++  costMode: CostMode
+ ): Promise<string | null> {
++  const startTime = Date.now()
++
+   const prompt = `You are an expert programmer tasked with creating SEARCH/REPLACE blocks to implement a change in a large file. The change should match the intent of the edit snippet while using exact content from the old file.
+ 
+ Old file content:
+@@ -313,30 +330,70 @@ Format your response with SEARCH/REPLACE blocks like this:
+ [new content that matches edit snippet intent]
+ >>>>>>> REPLACE`
+ 
+-  const response = await promptClaude([{ role: 'user', content: prompt }], {
++  const response = await promptOpenAI([{ role: 'user', content: prompt }], {
++    model: models.o3mini,
+     clientSessionId,
+     fingerprintId,
+     userInputId,
+     userId,
+-    model: claudeModels.sonnet,
+   })
+ 
+   const { diffBlocks, diffBlocksThatDidntMatch } =
+     parseAndGetDiffBlocksSingleFile(response, oldContent)
+ 
++  let updatedContent = oldContent
++  for (const { searchContent, replaceContent } of diffBlocks) {
++    updatedContent = updatedContent.replace(searchContent, replaceContent)
++  }
++
+   if (diffBlocksThatDidntMatch.length > 0) {
+-    logger.error(
++    logger.debug(
+       { diffBlocksThatDidntMatch },
+-      'Failed to create matching diff blocks for large file'
++      'Initial diff blocks failed to match, retrying...'
+     )
+-    return null
+-  }
+ 
+-  // Apply the diff blocks in sequence
+-  let updatedContent = oldContent
+-  for (const { searchContent, replaceContent } of diffBlocks) {
+-    updatedContent = updatedContent.replace(searchContent, replaceContent)
++    const { newDiffBlocks, newDiffBlocksThatDidntMatch } =
++      await retryDiffBlocksPrompt(
++        filePath,
++        updatedContent,
++        costMode,
++        clientSessionId,
++        fingerprintId,
++        userInputId,
++        userId,
++        diffBlocksThatDidntMatch
++      )
++
++    if (newDiffBlocksThatDidntMatch.length > 0) {
++      logger.error(
++        {
++          diffBlocks: newDiffBlocks,
++          diffBlocksThatDidntMatch: newDiffBlocksThatDidntMatch,
++          originalDiffBlocksThatDidntMatch: diffBlocksThatDidntMatch,
++          originalDiffBlocks: diffBlocks,
++          filePath,
++          oldContent,
++          editSnippet,
++        },
++        'Failed to create matching diff blocks for large file after retry'
++      )
++      return null
++    }
++
++    for (const { searchContent, replaceContent } of newDiffBlocks) {
++      updatedContent = updatedContent.replace(searchContent, replaceContent)
++    }
+   }
+ 
++  logger.debug(
++    {
++      updatedContent,
++      oldContent,
++      editSnippet,
++      filePath,
++      duration: Date.now() - startTime,
++    },
++    'handleLargeFile'
++  )
+   return updatedContent
+ }
+diff --git a/backend/src/util/messages.ts b/backend/src/util/messages.ts
+index 72a4badae..0ff5bca21 100644
+--- a/backend/src/util/messages.ts
++++ b/backend/src/util/messages.ts
+@@ -4,3 +4,10 @@ import { OpenAIMessage } from '../openai-api'
+ 
+ export const messagesWithSystem = (messages: Message[], system: System) =>
+   [{ role: 'system', content: system }, ...messages] as OpenAIMessage[]
++
++export function getMessageText(message: Message): string | undefined {
++  if (typeof message.content === 'string') {
++    return message.content
++  }
++  return message.content.map((c) => ('text' in c ? c.text : '')).join('\n')
++}

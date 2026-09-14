@@ -1,0 +1,1426 @@
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index c213a2944..0cadb2c54 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -362,7 +362,7 @@ export const mainPrompt = async (
+       name: 'file_updates',
+       result:
+         `These are the updates made to the files since the last response (either by you or by the user). These are the most recent versions of these files. You MUST be considerate of the user's changes:\n` +
+-        renderReadFilesResult(updatedFiles),
++        renderReadFilesResult(updatedFiles, fileContext.tokenCallers ?? {}),
+     })
+   }
+ 
+@@ -371,7 +371,7 @@ export const mainPrompt = async (
+     const readFilesToolResult = {
+       id: generateCompactId(),
+       name: 'read_files',
+-      result: renderReadFilesResult(newFiles),
++      result: renderReadFilesResult(newFiles, fileContext.tokenCallers ?? {}),
+     }
+ 
+     readFileMessages.push(
+@@ -756,7 +756,10 @@ export const mainPrompt = async (
+       serverToolResults.push({
+         id: generateCompactId(),
+         name: 'read_files',
+-        result: renderReadFilesResult(addedFiles),
++        result: renderReadFilesResult(
++          addedFiles,
++          fileContext.tokenCallers ?? {}
++        ),
+       })
+     } else if (name === 'find_files') {
+       const { addedFiles, updatedFilePaths, printedPaths } =
+@@ -802,7 +805,7 @@ export const mainPrompt = async (
+         name: 'find_files',
+         result:
+           addedFiles.length > 0
+-            ? renderReadFilesResult(addedFiles)
++            ? renderReadFilesResult(addedFiles, fileContext.tokenCallers ?? {})
+             : `No new files found for description: ${parameters.description}`,
+       })
+       if (printedPaths.length > 0) {
+diff --git a/backend/src/util/parse-tool-call-xml.ts b/backend/src/util/parse-tool-call-xml.ts
+index ba23e4237..e81b26f89 100644
+--- a/backend/src/util/parse-tool-call-xml.ts
++++ b/backend/src/util/parse-tool-call-xml.ts
+@@ -67,29 +67,40 @@ export const parseToolResults = (xmlString: string): ToolResult[] => {
+   return results
+ }
+ 
++export interface TokenCallerMap {
++  [filePath: string]: {
++    [token: string]: string[] // Array of files that call this token
++  }
++}
++
+ export function renderReadFilesResult(
+-  files: { path: string; content: string }[]
++  files: { path: string; content: string }[],
++  tokenCallers: TokenCallerMap
+ ) {
+   return files
+-    .map(
+-      (file) =>
+-        `<read_file>\n<path>${file.path}</path>\n<content>${file.content}</content>\n</read_file>`
+-    )
++    .map((file) => {
++      const referencedBy =
++        Object.entries(tokenCallers[file.path] ?? {})
++          .filter(([_, callers]) => callers.length > 0)
++          .map(([token, callers]) => `${token}: ${callers.join(', ')}`)
++          .join('\n') || 'None'
++      return `<read_file>\n<path>${file.path}</path>\n<content>${file.content}</content>\n<referenced_by>${referencedBy}</referenced_by>\n</read_file>`
++    })
+     .join('\n\n')
+ }
+ 
+ export function parseReadFilesResult(
+   xmlString: string
+-): { path: string; content: string }[] {
+-  const files: { path: string; content: string }[] = []
++): { path: string; content: string; referencedBy: string }[] {
++  const files: { path: string; content: string; referencedBy: string }[] = []
+   const filePattern =
+-    /<read_file>\n<path>([^<>]+)<\/path>\n<content>([\s\S]*?)<\/content>\n<\/read_file>/g
++    /<read_file>\n<path>([^<>]+)<\/path>\n<content>([\s\S]*?)<\/content>\n<referenced_by>([\s\S]*?)<\/referenced_by>\n<\/read_file>/g
+   let match
+ 
+   while ((match = filePattern.exec(xmlString)) !== null) {
+-    const [, filePath, content] = match
++    const [, filePath, content, referencedBy] = match
+     if (filePath.trim()) {
+-      files.push({ path: filePath.trim(), content })
++      files.push({ path: filePath.trim(), content, referencedBy })
+     }
+   }
+ 
+diff --git a/common/src/util/file.ts b/common/src/util/file.ts
+index 8261619e9..ce57f32e2 100644
+--- a/common/src/util/file.ts
++++ b/common/src/util/file.ts
+@@ -37,6 +37,9 @@ export const ProjectFileContextSchema = z.object({
+   currentWorkingDirectory: z.string(),
+   fileTree: z.array(z.custom<FileTreeNode>()),
+   fileTokenScores: z.record(z.string(), z.record(z.string(), z.number())),
++  tokenCallers: z
++    .record(z.string(), z.record(z.string(), z.array(z.string())))
++    .optional(),
+   knowledgeFiles: z.record(z.string(), z.string()),
+   userKnowledgeFiles: z.record(z.string(), z.string()).optional(),
+   gitChanges: z.object({
+diff --git a/npm-app/src/client.ts b/npm-app/src/client.ts
+index 91cfe84f9..a91950144 100644
+--- a/npm-app/src/client.ts
++++ b/npm-app/src/client.ts
+@@ -1075,6 +1075,9 @@ Go to https://www.codebuff.com/config for more information.`) +
+ 
+   public async warmContextCache() {
+     const fileContext = await getProjectFileContext(getProjectRoot(), {})
++    if (!fileContext) {
++      throw new Error('Failed to initialize project file context')
++    }
+ 
+     this.webSocket.subscribe('init-response', (a) => {
+       const parsedAction = InitResponseSchema.safeParse(a)
+diff --git a/npm-app/src/project-files.ts b/npm-app/src/project-files.ts
+index 421c9bd99..4dca660a7 100644
+--- a/npm-app/src/project-files.ts
++++ b/npm-app/src/project-files.ts
+@@ -218,12 +218,13 @@ export const getProjectFileContext = async (
+       await addScrapedContentToFiles(userKnowledgeFiles)
+ 
+     const shellConfigFiles = loadShellConfigFiles()
+-    const fileTokenScores = await getFileTokenScores(projectRoot, allFilePaths)
++    const { tokenScores, tokenCallers } = await getFileTokenScores(projectRoot, allFilePaths)
+ 
+     cachedProjectFileContext = {
+       currentWorkingDirectory: projectRoot,
+       fileTree,
+-      fileTokenScores,
++      fileTokenScores: tokenScores,
++      tokenCallers,
+       knowledgeFiles: knowledgeFilesWithScrapedContent,
+       shellConfigFiles,
+       systemInfo: getSystemInfo(),
+diff --git a/npm-app/src/workers/project-context.ts b/npm-app/src/workers/project-context.ts
+index 26cea04f5..d007085f2 100644
+--- a/npm-app/src/workers/project-context.ts
++++ b/npm-app/src/workers/project-context.ts
+@@ -9,6 +9,9 @@ if (maybeParentPort) {
+   parentPort.on('message', async ({ dir }) => {
+     setProjectRoot(dir)
+     const initFileContext = await getProjectFileContext(dir, {})
++    if (!initFileContext) {
++      throw new Error('Failed to initialize project file context')
++    }
+ 
+     const relativeFilepaths = getAllFilePaths(initFileContext.fileTree)
+     await initializeCheckpointFileManager({
+diff --git a/packages/code-map/__tests__/languages.test.ts b/packages/code-map/__tests__/languages.test.ts
+new file mode 100644
+index 000000000..f5b713f97
+--- /dev/null
++++ b/packages/code-map/__tests__/languages.test.ts
+@@ -0,0 +1,527 @@
++import * as path from 'path'
++import * as fs from 'fs'
++import { describe, it, expect } from 'bun:test'
++import { execSync } from 'child_process'
++
++// Sample code snippets for each language
++const samples = {
++  typescript: `
++interface Greeter {
++    greet(name: string): string;
++}
++
++class HelloGreeter implements Greeter {
++    greet(name: string): string {
++        return \`Hello, \${name}!\`;
++    }
++}
++
++function createGreeter(): Greeter {
++    return new HelloGreeter();
++}
++
++const greeter = createGreeter();
++greeter.greet("World");
++`,
++
++  javascript: `
++class Greeter {
++    greet(name) {
++        return \`Hello, \${name}!\`;
++    }
++}
++
++function createGreeter() {
++    return new Greeter();
++}
++
++const greeter = createGreeter();
++greeter.greet("World");
++`,
++
++  python: `
++from abc import ABC, abstractmethod
++
++class Greeter(ABC):
++    @abstractmethod
++    def greet(self, name: str) -> str:
++        pass
++
++class HelloGreeter(Greeter):
++    def greet(self, name: str) -> str:
++        return f"Hello, {name}!"
++
++def create_greeter() -> Greeter:
++    return HelloGreeter()
++
++greeter = create_greeter()
++greeter.greet("World")
++`,
++
++  java: `
++interface Greeter {
++    String greet(String name);
++}
++
++class HelloGreeter implements Greeter {
++    public String greet(String name) {
++        return "Hello, " + name + "!";
++    }
++}
++
++public class Main {
++    public static Greeter createGreeter() {
++        return new HelloGreeter();
++    }
++
++    public static void main(String[] args) {
++        Greeter greeter = createGreeter();
++        greeter.greet("World");
++    }
++}
++`,
++
++  csharp: `
++interface IGreeter {
++    string Greet(string name);
++}
++
++class HelloGreeter : IGreeter {
++    public string Greet(string name) {
++        return $"Hello, {name}!";
++    }
++}
++
++class Program {
++    static IGreeter CreateGreeter() {
++        return new HelloGreeter();
++    }
++
++    static void Main() {
++        var greeter = CreateGreeter();
++        greeter.Greet("World");
++    }
++}
++`,
++
++  cpp: `
++class Greeter {
++public:
++    virtual std::string greet(const std::string& name) = 0;
++};
++
++class HelloGreeter : public Greeter {
++public:
++    std::string greet(const std::string& name) override {
++        return "Hello, " + name + "!";
++    }
++};
++
++Greeter* createGreeter() {
++    return new HelloGreeter();
++}
++
++int main() {
++    auto greeter = createGreeter();
++    greeter->greet("World");
++    delete greeter;
++    return 0;
++}
++`,
++
++  c: `
++typedef struct Greeter {
++    void (*greet)(const char* name);
++} Greeter;
++
++void hello_greet(const char* name) {
++    printf("Hello, %s!\\n", name);
++}
++
++Greeter* create_greeter() {
++    Greeter* greeter = malloc(sizeof(Greeter));
++    greeter->greet = hello_greet;
++    return greeter;
++}
++
++int main() {
++    Greeter* greeter = create_greeter();
++    greeter->greet("World");
++    free(greeter);
++    return 0;
++}
++`,
++
++  rust: `
++trait Greeter {
++    fn greet(&self, name: &str) -> String;
++}
++
++struct HelloGreeter;
++
++impl Greeter for HelloGreeter {
++    fn greet(&self, name: &str) -> String {
++        format!("Hello, {}!", name)
++    }
++}
++
++fn create_greeter() -> impl Greeter {
++    HelloGreeter
++}
++
++fn main() {
++    let greeter = create_greeter();
++    greeter.greet("World");
++}
++`,
++
++  ruby: `
++class Greeter
++  def greet(name)
++    "Hello, #{name}!"
++  end
++end
++
++def create_greeter
++  Greeter.new
++end
++
++greeter = create_greeter
++greeter.greet("World")
++`,
++
++  go: `
++package main
++
++type Greeter interface {
++    Greet(name string) string
++}
++
++type HelloGreeter struct{}
++
++func (g HelloGreeter) Greet(name string) string {
++    return "Hello, " + name + "!"
++}
++
++func createGreeter() Greeter {
++    return HelloGreeter{}
++}
++
++func main() {
++    greeter := createGreeter()
++    greeter.Greet("World")
++}
++`,
++
++  php: `
++<?php
++
++interface Greeter {
++    public function greet(string $name): string;
++}
++
++class HelloGreeter implements Greeter {
++    public function greet(string $name): string {
++        return "Hello, $name!";
++    }
++}
++
++function createGreeter(): Greeter {
++    return new HelloGreeter();
++}
++
++$greeter = createGreeter();
++$greeter->greet("World");
++`
++}
++
++// Helper function to run tree-sitter parsing in a separate Node process
++async function parseFile(filePath: string, content: string) {
++  const tempScriptPath = path.join(__dirname, 'temp-parse-file.js')
++  const scriptContent = `
++const Parser = require('tree-sitter')
++const { Query } = require('tree-sitter')
++
++// Language configs
++const languageConfigs = [
++  {
++    extensions: ['.ts', '.tsx'],
++    queryFile: 'tree-sitter-typescript-tags.scm',
++    packageName: 'tree-sitter-typescript',
++    getLanguage: (module) => module.typescript
++  },
++  {
++    extensions: ['.js', '.jsx'],
++    queryFile: 'tree-sitter-javascript-tags.scm',
++    packageName: 'tree-sitter-javascript',
++    getLanguage: (module) => module
++  },
++  {
++    extensions: ['.py'],
++    queryFile: 'tree-sitter-python-tags.scm',
++    packageName: 'tree-sitter-python',
++    getLanguage: (module) => module
++  },
++  {
++    extensions: ['.java'],
++    queryFile: 'tree-sitter-java-tags.scm',
++    packageName: 'tree-sitter-java',
++    getLanguage: (module) => module
++  },
++  {
++    extensions: ['.cs'],
++    queryFile: 'tree-sitter-c_sharp-tags.scm',
++    packageName: 'tree-sitter-c-sharp',
++    getLanguage: (module) => module
++  },
++  {
++    extensions: ['.cpp', '.hpp'],
++    queryFile: 'tree-sitter-cpp-tags.scm',
++    packageName: 'tree-sitter-cpp',
++    getLanguage: (module) => module
++  },
++  {
++    extensions: ['.c', '.h'],
++    queryFile: 'tree-sitter-c-tags.scm',
++    packageName: 'tree-sitter-c',
++    getLanguage: (module) => module
++  },
++  {
++    extensions: ['.rs'],
++    queryFile: 'tree-sitter-rust-tags.scm',
++    packageName: 'tree-sitter-rust',
++    getLanguage: (module) => module
++  },
++  {
++    extensions: ['.rb'],
++    queryFile: 'tree-sitter-ruby-tags.scm',
++    packageName: 'tree-sitter-ruby',
++    getLanguage: (module) => module
++  },
++  {
++    extensions: ['.go'],
++    queryFile: 'tree-sitter-go-tags.scm',
++    packageName: 'tree-sitter-go',
++    getLanguage: (module) => module
++  },
++  {
++    extensions: ['.php'],
++    queryFile: 'tree-sitter-php-tags.scm',
++    packageName: 'tree-sitter-php',
++    getLanguage: (module) => module.php
++  }
++]
++
++async function parseSourceCode(filePath, sourceCode) {
++  const extension = require('path').extname(filePath)
++  const config = languageConfigs.find(c => c.extensions.includes(extension))
++  if (!config) return { identifiers: [], calls: [] }
++
++  try {
++    const parser = new Parser()
++    const languageModule = require(config.packageName)
++    const language = config.getLanguage(languageModule)
++    parser.setLanguage(language)
++
++    const queryFilePath = require('path').join(__dirname, '../tree-sitter-queries', config.queryFile)
++    const queryString = require('fs').readFileSync(queryFilePath, 'utf8')
++    const query = new Query(parser.getLanguage(), queryString)
++
++    const tree = parser.parse(sourceCode)
++    const captures = query.captures(tree.rootNode)
++
++    const result = {}
++    for (const capture of captures) {
++      const { name, node } = capture
++      if (!result[name]) {
++        result[name] = []
++      }
++      result[name].push(node.text)
++    }
++
++    return {
++      identifiers: [...new Set(result.identifier || [])],
++      calls: [...new Set(result['call.identifier'] || [])]
++    }
++  } catch (err) {
++    console.error('Error:', err)
++    return { identifiers: [], calls: [] }
++  }
++}
++
++const filePath = process.argv[2]
++const sourceCode = process.argv[3]
++
++parseSourceCode(filePath, sourceCode)
++  .then(result => {
++    console.log(JSON.stringify(result))
++  })
++  .catch(err => {
++    console.error('Error:', err)
++    process.exit(1)
++  })
++`
++
++  try {
++    // Write the temporary script
++    fs.writeFileSync(tempScriptPath, scriptContent)
++
++    // Execute the script with node and capture output
++    const output = execSync(
++      `node "${tempScriptPath}" "${filePath}" "${content.replace(/"/g, '\\"')}"`,
++      {
++        encoding: 'utf8',
++        stdio: ['pipe', 'pipe', 'pipe']
++      }
++    ).toString()
++
++    // Parse the JSON output
++    return JSON.parse(output)
++  } finally {
++    // Clean up the temporary script
++    try {
++      fs.unlinkSync(tempScriptPath)
++    } catch (err) {
++      console.warn('Failed to clean up temporary script:', err)
++    }
++  }
++}
++
++describe('language parsing', () => {
++  it('should parse TypeScript', async () => {
++    const result = await parseFile('test.ts', samples.typescript)
++    
++    expect(result.identifiers).toContain('Greeter')
++    expect(result.identifiers).toContain('HelloGreeter')
++    expect(result.identifiers).toContain('createGreeter')
++    expect(result.identifiers).toContain('greet')
++    
++    expect(result.calls).toContain('HelloGreeter')
++    expect(result.calls).toContain('createGreeter')
++    expect(result.calls).toContain('greet')
++  })
++
++  it('should parse JavaScript', async () => {
++    const result = await parseFile('test.js', samples.javascript)
++    
++    expect(result.identifiers).toContain('Greeter')
++    expect(result.identifiers).toContain('createGreeter')
++    expect(result.identifiers).toContain('greet')
++    
++    expect(result.calls).toContain('Greeter')
++    expect(result.calls).toContain('createGreeter')
++    expect(result.calls).toContain('greet')
++  })
++
++  it('should parse Python', async () => {
++    const result = await parseFile('test.py', samples.python)
++    
++    expect(result.identifiers).toContain('Greeter')
++    expect(result.identifiers).toContain('HelloGreeter')
++    expect(result.identifiers).toContain('create_greeter')
++    expect(result.identifiers).toContain('greet')
++    
++    expect(result.calls).toContain('create_greeter')
++    expect(result.calls).toContain('greet')
++  })
++
++  it('should parse Java', async () => {
++    const result = await parseFile('test.java', samples.java)
++    
++    expect(result.identifiers).toContain('Greeter')
++    expect(result.identifiers).toContain('HelloGreeter')
++    expect(result.identifiers).toContain('createGreeter')
++    expect(result.identifiers).toContain('greet')
++    
++    expect(result.calls).toContain('HelloGreeter')
++    expect(result.calls).toContain('createGreeter')
++    expect(result.calls).toContain('greet')
++  })
++
++  it('should parse C#', async () => {
++    const result = await parseFile('test.cs', samples.csharp)
++    
++    expect(result.identifiers).toContain('IGreeter')
++    expect(result.identifiers).toContain('HelloGreeter')
++    expect(result.identifiers).toContain('CreateGreeter')
++    expect(result.identifiers).toContain('Greet')
++  })
++
++  it('should parse C++', async () => {
++    const result = await parseFile('test.cpp', samples.cpp)
++    
++    expect(result.identifiers).toContain('Greeter')
++    expect(result.identifiers).toContain('HelloGreeter')
++    expect(result.identifiers).toContain('createGreeter')
++    expect(result.identifiers).toContain('greet')
++  })
++
++  it('should parse C', async () => {
++    const result = await parseFile('test.c', samples.c)
++    
++    expect(result.identifiers).toContain('Greeter')
++    expect(result.identifiers).toContain('create_greeter')
++    expect(result.identifiers).toContain('hello_greet')
++  })
++
++  it('should parse Rust', async () => {
++    const result = await parseFile('test.rs', samples.rust)
++    
++    expect(result.identifiers).toContain('Greeter')
++    expect(result.identifiers).toContain('HelloGreeter')
++    expect(result.identifiers).toContain('create_greeter')
++    expect(result.identifiers).toContain('greet')
++    
++    expect(result.calls).toContain('create_greeter')
++    expect(result.calls).toContain('greet')
++  })
++
++  it('should parse Ruby', async () => {
++    const result = await parseFile('test.rb', samples.ruby)
++    
++    expect(result.identifiers).toContain('Greeter')
++    expect(result.identifiers).toContain('create_greeter')
++    expect(result.identifiers).toContain('greet')
++    
++    expect(result.calls).toContain('create_greeter')
++    expect(result.calls).toContain('greet')
++    expect(result.calls).toContain('new')
++  })
++
++  it('should parse Go', async () => {
++    const result = await parseFile('test.go', samples.go)
++    
++    expect(result.identifiers).toContain('Greeter')
++    expect(result.identifiers).toContain('HelloGreeter')
++    expect(result.identifiers).toContain('createGreeter')
++    expect(result.identifiers).toContain('Greet')
++    
++    expect(result.calls).toContain('createGreeter')
++    expect(result.calls).toContain('Greet')
++  })
++
++  it.skip('should parse PHP', async () => {
++    const result = await parseFile('test.php', samples.php)
++    
++    expect(result.identifiers).toContain('Greeter')
++    expect(result.identifiers).toContain('HelloGreeter')
++    expect(result.identifiers).toContain('createGreeter')
++    expect(result.identifiers).toContain('greet')
++    
++    expect(result.calls).toContain('HelloGreeter')
++    expect(result.calls).toContain('createGreeter')
++    expect(result.calls).toContain('greet')
++  })
++
++  it('should handle empty files', async () => {
++    const result = await parseFile('empty.ts', '')
++    expect(result.identifiers).toHaveLength(0)
++    expect(result.calls).toHaveLength(0)
++  })
++
++  it('should handle invalid file extensions', async () => {
++    const result = await parseFile('test.invalid', samples.typescript)
++    expect(result.identifiers).toHaveLength(0)
++    expect(result.calls).toHaveLength(0)
++  })
++})
+\ No newline at end of file
+diff --git a/packages/code-map/__tests__/parse.test.ts b/packages/code-map/__tests__/parse.test.ts
+new file mode 100644
+index 000000000..76e701dbf
+--- /dev/null
++++ b/packages/code-map/__tests__/parse.test.ts
+@@ -0,0 +1,221 @@
++import * as path from 'path'
++import * as fs from 'fs'
++import { describe, it, expect } from 'bun:test'
++import { execSync } from 'child_process'
++
++// Test data
++const tsFile = `
++interface Greeter {
++    greet(name: string): string;
++}
++
++class Greeting implements Greeter {
++    private prefix: string;
++
++    constructor(prefix: string) {
++        this.prefix = prefix;
++    }
++
++    greet(name: string): string {
++        return \`\${this.prefix}, \${name}!\`;
++    }
++
++    static printGreeting(greeter: Greeter, name: string): void {
++        console.log(greeter.greet(name));
++    }
++}
++
++function createGreeter(prefix: string): Greeter {
++    return new Greeting(prefix);
++}
++
++const greeting = createGreeter('Hello');
++Greeting.printGreeting(greeting, 'World');
++`
++
++const pyFile = `
++from abc import ABC, abstractmethod
++
++class Greeter(ABC):
++    @abstractmethod
++    def greet(self, name: str) -> str:
++        pass
++
++class Greeting(Greeter):
++    def __init__(self, prefix: str):
++        self.prefix = prefix
++
++    def greet(self, name: str) -> str:
++        return f'{self.prefix}, {name}!'
++
++def print_greeting(greeter: Greeter, name: str):
++    print(greeter.greet(name))
++
++if __name__ == "__main__":
++    greeting = Greeting("Hello")
++    print_greeting(greeting, "World")
++`
++
++const multiDefFile1 = `
++export function utils() {
++    console.log('utils from file 1');
++}
++`
++
++const multiDefFile2 = `
++// This file is deeper in the directory structure, so it will have a lower base score
++export function utils() {
++    console.log('utils from file 2');
++}
++`
++
++const noDefsOnlyCallsFile = `
++import { utils } from './utils';
++utils();
++console.log('no definitions here');
++`
++
++const noCallsOnlyDefsFile = `
++export function unusedFunction() {
++    console.log('never called');
++}
++`
++
++const emptyFile = ''
++
++// Helper function to run tree-sitter parsing in a separate Node process
++async function parseFile(filePath: string, content: string) {
++  const tempScriptPath = path.join(__dirname, 'temp-parse-file.js')
++  const scriptContent = `
++const Parser = require('tree-sitter')
++const { Query } = require('tree-sitter')
++
++// Language configs (simplified from languages.ts)
++const languageConfigs = [
++  {
++    extensions: ['.ts', '.tsx'],
++    queryFile: 'tree-sitter-typescript-tags.scm',
++    packageName: 'tree-sitter-typescript',
++    getLanguage: (module) => module.typescript
++  },
++  {
++    extensions: ['.py'],
++    queryFile: 'tree-sitter-python-tags.scm',
++    packageName: 'tree-sitter-python',
++    getLanguage: (module) => module
++  }
++]
++
++async function parseSourceCode(filePath, sourceCode) {
++  const extension = require('path').extname(filePath)
++  const config = languageConfigs.find(c => c.extensions.includes(extension))
++  if (!config) return { identifiers: [], calls: [] }
++
++  try {
++    const parser = new Parser()
++    const languageModule = require(config.packageName)
++    const language = config.getLanguage(languageModule)
++    parser.setLanguage(language)
++
++    const queryFilePath = require('path').join(__dirname, '../tree-sitter-queries', config.queryFile)
++    const queryString = require('fs').readFileSync(queryFilePath, 'utf8')
++    const query = new Query(parser.getLanguage(), queryString)
++
++    const tree = parser.parse(sourceCode)
++    const captures = query.captures(tree.rootNode)
++
++    const result = {}
++    for (const capture of captures) {
++      const { name, node } = capture
++      if (!result[name]) {
++        result[name] = []
++      }
++      result[name].push(node.text)
++    }
++
++    return {
++      identifiers: [...new Set(result.identifier || [])],
++      calls: [...new Set(result['call.identifier'] || [])]
++    }
++  } catch (err) {
++    console.error('Error:', err)
++    return { identifiers: [], calls: [] }
++  }
++}
++
++const filePath = process.argv[2]
++const sourceCode = process.argv[3]
++
++parseSourceCode(filePath, sourceCode)
++  .then(result => {
++    console.log(JSON.stringify(result))
++  })
++  .catch(err => {
++    console.error('Error:', err)
++    process.exit(1)
++  })
++`
++
++  try {
++    // Write the temporary script
++    fs.writeFileSync(tempScriptPath, scriptContent)
++
++    // Execute the script with node
++    const output = execSync(
++      `node "${tempScriptPath}" "${filePath}" "${content.replace(/"/g, '\\"')}"`,
++      {
++        encoding: 'utf8',
++        stdio: ['ignore', 'pipe', 'pipe']
++      }
++    )
++
++    // Parse the JSON output
++    return JSON.parse(output)
++  } finally {
++    // Clean up the temporary script
++    try {
++      fs.unlinkSync(tempScriptPath)
++    } catch (err) {
++      console.warn('Failed to clean up temporary script:', err)
++    }
++  }
++}
++
++describe('tree-sitter parsing', () => {
++  it('should correctly identify tokens and calls in TypeScript', async () => {
++    const result = await parseFile('test.ts', tsFile)
++
++    // Check identifiers
++    expect(result.identifiers).toContain('Greeter')
++    expect(result.identifiers).toContain('Greeting')
++    expect(result.identifiers).toContain('createGreeter')
++    expect(result.identifiers).toContain('greet')
++    expect(result.identifiers).toContain('printGreeting')
++
++    // Check calls
++    expect(result.calls).toContain('createGreeter')
++    expect(result.calls).toContain('printGreeting')
++    expect(result.calls).toContain('greet')
++  })
++
++  it('should correctly identify tokens and calls in Python', async () => {
++    const result = await parseFile('test.py', pyFile)
++
++    // Check identifiers
++    expect(result.identifiers).toContain('Greeter')
++    expect(result.identifiers).toContain('Greeting')
++    expect(result.identifiers).toContain('print_greeting')
++    expect(result.identifiers).toContain('greet')
++
++    // Check calls
++    expect(result.calls).toContain('print_greeting')
++    expect(result.calls).toContain('greet')
++  })
++
++  it('should handle empty files', async () => {
++    const result = await parseFile('empty.ts', emptyFile)
++
++    expect(result.identifiers).toHaveLength(0)
++    expect(result.calls).toHaveLength(0)
++  })
++})
+diff --git a/packages/code-map/test-langs/test.c b/packages/code-map/__tests__/test-langs/test.c
+similarity index 100%
+rename from packages/code-map/test-langs/test.c
+rename to packages/code-map/__tests__/test-langs/test.c
+diff --git a/packages/code-map/test-langs/test.cpp b/packages/code-map/__tests__/test-langs/test.cpp
+similarity index 100%
+rename from packages/code-map/test-langs/test.cpp
+rename to packages/code-map/__tests__/test-langs/test.cpp
+diff --git a/packages/code-map/test-langs/test.cs b/packages/code-map/__tests__/test-langs/test.cs
+similarity index 100%
+rename from packages/code-map/test-langs/test.cs
+rename to packages/code-map/__tests__/test-langs/test.cs
+diff --git a/packages/code-map/test-langs/test.go b/packages/code-map/__tests__/test-langs/test.go
+similarity index 100%
+rename from packages/code-map/test-langs/test.go
+rename to packages/code-map/__tests__/test-langs/test.go
+diff --git a/packages/code-map/test-langs/test.java b/packages/code-map/__tests__/test-langs/test.java
+similarity index 100%
+rename from packages/code-map/test-langs/test.java
+rename to packages/code-map/__tests__/test-langs/test.java
+diff --git a/packages/code-map/test-langs/test.js b/packages/code-map/__tests__/test-langs/test.js
+similarity index 100%
+rename from packages/code-map/test-langs/test.js
+rename to packages/code-map/__tests__/test-langs/test.js
+diff --git a/packages/code-map/test-langs/test.php b/packages/code-map/__tests__/test-langs/test.php
+similarity index 100%
+rename from packages/code-map/test-langs/test.php
+rename to packages/code-map/__tests__/test-langs/test.php
+diff --git a/packages/code-map/test-langs/test.py b/packages/code-map/__tests__/test-langs/test.py
+similarity index 100%
+rename from packages/code-map/test-langs/test.py
+rename to packages/code-map/__tests__/test-langs/test.py
+diff --git a/packages/code-map/test-langs/test.rb b/packages/code-map/__tests__/test-langs/test.rb
+similarity index 100%
+rename from packages/code-map/test-langs/test.rb
+rename to packages/code-map/__tests__/test-langs/test.rb
+diff --git a/packages/code-map/test-langs/test.rs b/packages/code-map/__tests__/test-langs/test.rs
+similarity index 100%
+rename from packages/code-map/test-langs/test.rs
+rename to packages/code-map/__tests__/test-langs/test.rs
+diff --git a/packages/code-map/test-langs/test.ts b/packages/code-map/__tests__/test-langs/test.ts
+similarity index 100%
+rename from packages/code-map/test-langs/test.ts
+rename to packages/code-map/__tests__/test-langs/test.ts
+diff --git a/packages/code-map/languages.ts b/packages/code-map/languages.ts
+index 44ec6b0cf..ef3444825 100644
+--- a/packages/code-map/languages.ts
++++ b/packages/code-map/languages.ts
+@@ -5,7 +5,7 @@ import { Query } from 'tree-sitter'
+ 
+ import { DEBUG_PARSING } from './parse'
+ 
+-interface LanguageConfig {
++export interface LanguageConfig {
+   language: any
+   extensions: string[]
+   packageName: string
+@@ -108,8 +108,10 @@ export async function getLanguageConfig(
+         config.queryFile
+       )
+       const queryString = fs.readFileSync(queryFilePath, 'utf8')
+-      config.query = new Query(parser.getLanguage(), queryString)
++      const query = new Query(parser.getLanguage(), queryString)
++
+       config.parser = parser
++      config.query = query
+       config.language = language
+     } catch (e) {
+       if (DEBUG_PARSING) {
+@@ -119,5 +121,5 @@ export async function getLanguageConfig(
+     }
+   }
+ 
+-  return config 
++  return config
+ }
+diff --git a/packages/code-map/package.json b/packages/code-map/package.json
+index a8ae68d54..68189194a 100644
+--- a/packages/code-map/package.json
++++ b/packages/code-map/package.json
+@@ -6,7 +6,8 @@
+     "build": "tsc && cp -R tree-sitter-queries ./dist/",
+     "typecheck": "tsc --noEmit",
+     "build-and-typecheck": "bun run build && bun run typecheck",
+-    "typecheck-only": "tsc --noEmit"
++    "typecheck-only": "tsc --noEmit",
++    "test": "bun test"
+   },
+   "dependencies": {
+     "tree-sitter": "0.22.4",
+@@ -23,6 +24,7 @@
+     "tree-sitter-typescript": "0.23.0"
+   },
+   "devDependencies": {
+-    "@types/node": "22"
++    "@types/node": "22",
++    "@types/bun": "^1.2.11"
+   }
+ }
+diff --git a/packages/code-map/parse.ts b/packages/code-map/parse.ts
+index cf3d381b3..fa833a782 100644
+--- a/packages/code-map/parse.ts
++++ b/packages/code-map/parse.ts
+@@ -1,21 +1,42 @@
+ import * as fs from 'fs'
+ import * as path from 'path'
++import { uniq } from 'lodash'
+ import Parser from 'tree-sitter'
+-
+-import { getLanguageConfig } from './languages'
++import { LanguageConfig, getLanguageConfig } from './languages'
+ 
+ export const DEBUG_PARSING = false
+ const IGNORE_TOKENS = ['__init__', '__post_init__', '__call__', 'constructor']
++const MAX_CALLERS = 25
+ 
+-export async function getFileTokenScores(projectRoot: string, filePaths: string[]) {
++export interface TokenCallerMap {
++  [filePath: string]: {
++    [token: string]: string[] // Array of files that call this token
++  }
++}
++
++export interface FileTokenData {
++  tokenScores: { [filePath: string]: { [token: string]: number } }
++  tokenCallers: TokenCallerMap
++}
++
++export async function getFileTokenScores(
++  projectRoot: string,
++  filePaths: string[]
++): Promise<FileTokenData> {
+   const startTime = Date.now()
+   const tokenScores: { [filePath: string]: { [token: string]: number } } = {}
+   const externalCalls: { [token: string]: number } = {}
++  const fileCallsMap = new Map<string, string[]>()
+ 
++  // First pass: collect all identifiers and calls
+   for (const filePath of filePaths) {
+     const fullPath = path.join(projectRoot, filePath)
+-    if (!!getLanguageConfig(fullPath)) {
+-      const { identifiers, calls, numLines } = await parseTokens(fullPath)
++    const languageConfig = await getLanguageConfig(fullPath)
++    if (languageConfig) {
++      const { identifiers, calls, numLines } = await parseTokens(
++        fullPath,
++        languageConfig
++      )
+ 
+       const tokenScoresForFile: { [token: string]: number } = {}
+       tokenScores[filePath] = tokenScoresForFile
+@@ -25,11 +46,17 @@ export async function getFileTokenScores(projectRoot: string, filePaths: string[
+       const tokenBaseScore =
+         0.8 ** depth * Math.sqrt(numLines / (identifiers.length + 1))
+ 
++      // Store defined tokens
+       for (const identifier of identifiers) {
+         if (!IGNORE_TOKENS.includes(identifier)) {
+           tokenScoresForFile[identifier] = tokenBaseScore
+         }
+       }
++
++      // Store calls for this file
++      fileCallsMap.set(filePath, calls)
++
++      // Track external calls
+       for (const call of calls) {
+         if (!tokenScoresForFile[call]) {
+           externalCalls[call] = (externalCalls[call] ?? 0) + 1
+@@ -38,11 +65,55 @@ export async function getFileTokenScores(projectRoot: string, filePaths: string[
+     }
+   }
+ 
++  // Build a map of tokens to their defining files for O(1) lookup
++  const tokenDefinitionMap = new Map<string, string>()
++  const highestScores = new Map<string, number>()
++  for (const [filePath, scores] of Object.entries(tokenScores)) {
++    for (const [token, score] of Object.entries(scores)) {
++      const currentHighestScore = highestScores.get(token) ?? -Infinity
++      // Keep the file with the higher score for this token
++      if (score > currentHighestScore) {
++        highestScores.set(token, score)
++        tokenDefinitionMap.set(token, filePath)
++      }
++    }
++  }
++
++  const tokenCallers: TokenCallerMap = {}
++
++  // For each file's calls, add it as a caller to the defining file's tokens
++  for (const [callingFile, calls] of fileCallsMap.entries()) {
++    for (const call of calls) {
++      const definingFile = tokenDefinitionMap.get(call)
++      if (!definingFile || callingFile === definingFile) {
++        continue
++      }
++
++      if (!tokenCallers[definingFile]) {
++        tokenCallers[definingFile] = {}
++      }
++
++      if (!tokenCallers[definingFile][call]) {
++        tokenCallers[definingFile][call] = []
++      }
++      const callerFiles = tokenCallers[definingFile][call]
++      if (
++        callerFiles.length < MAX_CALLERS &&
++        !callerFiles.includes(callingFile)
++      ) {
++        callerFiles.push(callingFile)
++      }
++    }
++  }
++
++  // Apply call frequency boost to token scores
+   for (const scores of Object.values(tokenScores)) {
+     for (const token of Object.keys(scores)) {
+       const numCalls = externalCalls[token] ?? 0
+       if (typeof numCalls !== 'number') continue
+       scores[token] *= 1 + Math.log(1 + numCalls)
++      // Round to 3 decimal places
++      scores[token] = Math.round(scores[token] * 1000) / 1000
+     }
+   }
+ 
+@@ -50,54 +121,56 @@ export async function getFileTokenScores(projectRoot: string, filePaths: string[
+     const endTime = Date.now()
+     console.log(`Parsed ${filePaths.length} files in ${endTime - startTime}ms`)
+ 
+-    console.log('externalCalls', externalCalls)
+-
+-    // Save exportedTokens to a file
+-    const exportedTokensFilePath = path.join(
+-      projectRoot,
+-      'exported-tokens.json'
++    fs.writeFileSync(
++      '../debug/debug-parse.json',
++      JSON.stringify({
++        tokenCallers,
++        tokenScores,
++        fileCallsMap,
++        externalCalls,
++      })
+     )
+-    try {
+-      fs.writeFileSync(
+-        exportedTokensFilePath,
+-        JSON.stringify(tokenScores, null, 2)
+-      )
+-      console.log(`Exported tokens saved to ${exportedTokensFilePath}`)
+-    } catch (error) {
+-      console.error(`Failed to save exported tokens to file: ${error}`)
+-    }
+   }
+ 
+-  return tokenScores
++  return { tokenScores, tokenCallers }
+ }
+ 
+-export async function parseTokens(filePath: string) {
+-  const languageConfig = await getLanguageConfig(filePath)
+-  if (languageConfig) {
+-    const { parser, query } = languageConfig
+-
+-    try {
+-      const sourceCode = fs.readFileSync(filePath, 'utf8')
+-      const numLines = sourceCode.match(/\n/g)?.length ?? 0 + 1
+-      const parseResults = parseFile(parser, query, sourceCode)
+-      const identifiers = parseResults.identifier
+-      const calls = parseResults['call.identifier']
+-      return {
+-        numLines,
+-        identifiers: identifiers ?? [],
+-        calls: calls ?? [],
+-      }
+-    } catch (e) {
+-      if (DEBUG_PARSING) {
+-        console.error(`Error parsing query: ${e}`)
+-        console.log(filePath)
+-      }
++export async function parseTokens(
++  filePath: string,
++  languageConfig: LanguageConfig
++) {
++  const { parser, query } = languageConfig
++
++  try {
++    const sourceCode = fs.readFileSync(filePath, 'utf8')
++    const numLines = sourceCode.match(/\n/g)?.length ?? 0 + 1
++    const parseResults = parseFile(parser, query, sourceCode)
++    const identifiers = uniq(parseResults.identifier)
++    const calls = uniq(parseResults['call.identifier'])
++
++    if (DEBUG_PARSING) {
++      console.log(`\nParsing ${filePath}:`)
++      console.log('Source:', sourceCode)
++      console.log('Parse results:', parseResults)
++      console.log('Identifiers:', identifiers)
++      console.log('Calls:', calls)
++    }
++
++    return {
++      numLines,
++      identifiers: identifiers ?? [],
++      calls: calls ?? [],
++    }
++  } catch (e) {
++    if (DEBUG_PARSING) {
++      console.error(`Error parsing query: ${e}`)
++      console.log(filePath)
++    }
++    return {
++      numLines: 0,
++      identifiers: [] as string[],
++      calls: [] as string[],
+     }
+-  }
+-  return {
+-    numLines: 0,
+-    identifiers: [] as string[],
+-    calls: [] as string[],
+   }
+ }
+ 
+@@ -112,6 +185,10 @@ function parseFile(
+   const captures = query.captures(tree.rootNode)
+   const result: { [key: string]: string[] } = {}
+ 
++  if (DEBUG_PARSING) {
++    console.log('\nCaptures:', captures)
++  }
++
+   for (const capture of captures) {
+     const { name, node } = capture
+     if (!result[name]) {
+diff --git a/packages/code-map/tree-sitter-queries/tree-sitter-c-tags.scm b/packages/code-map/tree-sitter-queries/tree-sitter-c-tags.scm
+index 9e352d85d..84ea851a4 100644
+--- a/packages/code-map/tree-sitter-queries/tree-sitter-c-tags.scm
++++ b/packages/code-map/tree-sitter-queries/tree-sitter-c-tags.scm
+@@ -8,4 +8,9 @@
+ 
+ (enum_specifier name: (type_identifier) @identifier)
+ 
+-; TODO add calls
++; Function calls
++(call_expression
++  function: (identifier) @call.identifier)
++
++(call_expression
++  function: (field_expression field: (field_identifier) @call.identifier))
+diff --git a/packages/code-map/tree-sitter-queries/tree-sitter-c_sharp-tags.scm b/packages/code-map/tree-sitter-queries/tree-sitter-c_sharp-tags.scm
+index de6286d2e..75f451f24 100644
+--- a/packages/code-map/tree-sitter-queries/tree-sitter-c_sharp-tags.scm
++++ b/packages/code-map/tree-sitter-queries/tree-sitter-c_sharp-tags.scm
+@@ -10,4 +10,14 @@
+  name: (identifier) @identifier
+  )
+ 
+-; TODO add calls
+\ No newline at end of file
++; Method calls
++(invocation_expression
++  function: (identifier) @call.identifier)
++
++(invocation_expression
++  function: (member_access_expression
++    name: (identifier) @call.identifier))
++
++; Constructor calls
++(object_creation_expression
++  type: (identifier) @call.identifier)
+\ No newline at end of file
+diff --git a/packages/code-map/tree-sitter-queries/tree-sitter-cpp-tags.scm b/packages/code-map/tree-sitter-queries/tree-sitter-cpp-tags.scm
+index 5d1eea1f3..7d823789c 100644
+--- a/packages/code-map/tree-sitter-queries/tree-sitter-cpp-tags.scm
++++ b/packages/code-map/tree-sitter-queries/tree-sitter-cpp-tags.scm
+@@ -14,4 +14,16 @@
+ 
+ (class_specifier name: (type_identifier) @identifier)
+ 
+-; TODO add calls
+\ No newline at end of file
++; Function calls
++(call_expression
++  function: (identifier) @call.identifier)
++
++(call_expression
++  function: (field_expression field: (field_identifier) @call.identifier))
++
++; Constructor calls
++(class_specifier
++  name: (type_identifier) @call.identifier)
++
++(new_expression
++  type: (type_identifier) @call.identifier)
+\ No newline at end of file
+diff --git a/packages/code-map/tree-sitter-queries/tree-sitter-javascript-tags.scm b/packages/code-map/tree-sitter-queries/tree-sitter-javascript-tags.scm
+index d42131ec1..525ea5aca 100644
+--- a/packages/code-map/tree-sitter-queries/tree-sitter-javascript-tags.scm
++++ b/packages/code-map/tree-sitter-queries/tree-sitter-javascript-tags.scm
+@@ -12,4 +12,5 @@
+       name: (identifier) @identifier)))
+ 
+ (call_expression function: (identifier) @call.identifier)
++(call_expression function: (member_expression property: (property_identifier) @call.identifier))
+ (new_expression constructor: (identifier) @call.identifier)
+diff --git a/packages/code-map/tree-sitter-queries/tree-sitter-php-tags.scm b/packages/code-map/tree-sitter-queries/tree-sitter-php-tags.scm
+index 998f48533..b174ac915 100644
+--- a/packages/code-map/tree-sitter-queries/tree-sitter-php-tags.scm
++++ b/packages/code-map/tree-sitter-queries/tree-sitter-php-tags.scm
+@@ -1,3 +1,6 @@
++(interface_declaration
++  name: (name) @identifier)
++
+ (class_declaration
+   name: (name) @identifier)
+ 
+@@ -8,16 +11,10 @@
+   name: (name) @identifier)
+ 
+ (object_creation_expression
+-  [
+-    (qualified_name (name) @call.identifier)
+-    (variable_name (name) @call.identifier)
+-  ])
++  type: (qualified_name) @call.identifier)
+ 
+ (function_call_expression
+-  function: [
+-    (qualified_name (name) @call.identifier)
+-    (variable_name (name)) @call.identifier
+-  ])
++  function: (name) @call.identifier)
+ 
+ (scoped_call_expression
+   name: (name) @call.identifier)
+diff --git a/packages/code-map/tree-sitter-queries/tree-sitter-python-tags.scm b/packages/code-map/tree-sitter-queries/tree-sitter-python-tags.scm
+index 6cd8d7339..23c40cef7 100644
+--- a/packages/code-map/tree-sitter-queries/tree-sitter-python-tags.scm
++++ b/packages/code-map/tree-sitter-queries/tree-sitter-python-tags.scm
+@@ -1,4 +1,4 @@
+-(class_definition "class"
++(class_definition
+   name: (identifier) @identifier)
+ 
+ (function_definition
+@@ -6,4 +6,7 @@
+ 
+ (call
+   function: (identifier) @call.identifier)
+-  
+\ No newline at end of file
++
++(call
++  function: (attribute
++    attribute: (identifier) @call.identifier))
+diff --git a/packages/code-map/tree-sitter-queries/tree-sitter-typescript-tags.scm b/packages/code-map/tree-sitter-queries/tree-sitter-typescript-tags.scm
+index 02603475c..5877ebd6a 100644
+--- a/packages/code-map/tree-sitter-queries/tree-sitter-typescript-tags.scm
++++ b/packages/code-map/tree-sitter-queries/tree-sitter-typescript-tags.scm
+@@ -1,15 +1,22 @@
+ (function_declaration name: (identifier) @identifier)
+ (class_declaration name: (type_identifier) @identifier)
++(interface_declaration name: (type_identifier) @identifier)
+ (method_definition name: (property_identifier) @identifier)
+ 
++(export_statement
++  declaration: (function_declaration
++    name: (identifier) @identifier))
++
+ (export_statement
+   declaration: (lexical_declaration
+     (variable_declarator
+       name: (identifier) @identifier)))
++
+ (export_statement
+   declaration: (variable_declaration
+     (variable_declarator
+       name: (identifier) @identifier)))
+ 
+ (call_expression function: (identifier) @call.identifier)
++(call_expression function: (member_expression property: (property_identifier) @call.identifier))
+ (new_expression constructor: (identifier) @call.identifier)
+diff --git a/packages/code-map/tsconfig.json b/packages/code-map/tsconfig.json
+index 1bbce7992..45868dbee 100644
+--- a/packages/code-map/tsconfig.json
++++ b/packages/code-map/tsconfig.json
+@@ -1,8 +1,15 @@
+ {
+   "extends": "../../tsconfig.base.json",
+   "compilerOptions": {
+-    "types": ["node"],
++    "types": ["node", "bun"],
+     "typeRoots": ["node_modules/@types", "../../node_modules/@types"],
+-    "outDir": "./dist"
++    "outDir": "./dist",
++    "esModuleInterop": true
+   },
++  "exclude": [
++    "node_modules",
++    "dist",
++    "**/*.test.ts",
++    "__tests__"
++  ]
+ }

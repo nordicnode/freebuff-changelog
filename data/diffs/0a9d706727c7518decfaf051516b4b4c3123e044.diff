@@ -1,0 +1,779 @@
+diff --git a/backend/src/run-agent-step.ts b/backend/src/run-agent-step.ts
+index 1fed9b1a3..3168415b3 100644
+--- a/backend/src/run-agent-step.ts
++++ b/backend/src/run-agent-step.ts
+@@ -23,14 +23,14 @@ import { asyncAgentManager } from './async-agent-manager'
+ import { getFileReadingUpdates } from './get-file-reading-updates'
+ import { checkLiveUserInput } from './live-user-inputs'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+-import { runProgrammaticAgent } from './run-programmatic-agent'
++import { runProgrammaticStep } from './run-programmatic-step'
+ import { additionalSystemPrompts } from './system-prompt/prompts'
+ import { saveAgentRequest } from './system-prompt/save-agent-request'
+ import { agentTemplates } from './templates/agent-list'
+ import { processAgentOverrides } from './templates/agent-overrides'
+ import { agentRegistry } from './templates/agent-registry'
+ import { formatPrompt, getAgentPrompt } from './templates/strings'
+-import { AgentTemplateUnion } from './templates/types'
++import { AgentTemplate } from './templates/types'
+ import { processStreamWithTools } from './tools/stream-parser'
+ import { logger } from './util/logger'
+ import {
+@@ -70,7 +70,7 @@ export interface AgentOptions {
+ async function getAgentTemplateWithOverrides(
+   agentType: AgentTemplateType,
+   fileContext: ProjectFileContext
+-): Promise<AgentTemplateUnion> {
++): Promise<AgentTemplate> {
+   // Initialize registry if needed
+   await agentRegistry.initialize(fileContext)
+ 
+@@ -82,11 +82,6 @@ async function getAgentTemplateWithOverrides(
+     )
+   }
+ 
+-  if (baseTemplate.implementation === 'programmatic') {
+-    // Programmatic agents cannot be overridden.
+-    return baseTemplate
+-  }
+-
+   return processAgentOverrides(baseTemplate, fileContext)
+ }
+ 
+@@ -106,12 +101,12 @@ export const runAgentStep = async (
+     onResponseChunk,
+     fileContext,
+     agentType,
+-    agentState,
+     prompt,
+     params,
+     assistantMessage,
+     assistantPrefix,
+   } = options
++  let agentState = options.agentState
+ 
+   const { agentContext } = agentState
+ 
+@@ -131,16 +126,13 @@ export const runAgentStep = async (
+     )
+   }
+ 
+-  if (agentTemplate.implementation === 'programmatic') {
+-    const agentState = await runProgrammaticAgent(agentTemplate, {
++  const { handleStep } = agentTemplate
++  if (handleStep) {
++    agentState = await runProgrammaticStep(agentState, {
+       ...options,
+       ws,
++      template: agentTemplate,
+     })
+-    return {
+-      agentState,
+-      shouldEndTurn: true,
+-      fullResponse: '',
+-    }
+   }
+ 
+   const { model } = agentTemplate
+@@ -569,15 +561,7 @@ export const loopAgentSteps = async (
+     initialAssistantPrefix,
+     stepAssistantMessage,
+     stepAssistantPrefix,
+-  } =
+-    agentTemplate.implementation === 'llm'
+-      ? agentTemplate
+-      : {
+-          initialAssistantMessage: undefined,
+-          initialAssistantPrefix: undefined,
+-          stepAssistantMessage: undefined,
+-          stepAssistantPrefix: undefined,
+-        }
++  } = agentTemplate
+   let isFirstStep = true
+   let currentPrompt = prompt
+   let currentParams = params
+diff --git a/backend/src/run-programmatic-agent.ts b/backend/src/run-programmatic-step.ts
+similarity index 65%
+rename from backend/src/run-programmatic-agent.ts
+rename to backend/src/run-programmatic-step.ts
+index e9611bd76..da8b7e914 100644
+--- a/backend/src/run-programmatic-agent.ts
++++ b/backend/src/run-programmatic-step.ts
+@@ -1,22 +1,24 @@
+ import {
+   AgentState,
+   AgentTemplateType,
++  ToolResult,
+ } from '@codebuff/common/types/session-state'
+ import { ProjectFileContext } from '@codebuff/common/util/file'
+ import { WebSocket } from 'ws'
+ import { runTool } from './run-tool'
+-import {
+-  ProgrammaticAgentContext,
+-  ProgrammaticAgentTemplate,
+-} from './templates/types'
++import { AgentTemplate, StepGenerator } from './templates/types'
+ import { CodebuffToolCall } from './tools/constants'
+ import { logger } from './util/logger'
+ import { getRequestContext } from './websockets/request-context'
+ 
++// Maintains generator state for all agents. Generator state can't be serialized, so we store it in memory.
++const agentIdToGenerator: Record<string, StepGenerator | undefined> = {}
++
+ // Function to handle programmatic agents
+-export async function runProgrammaticAgent(
+-  template: ProgrammaticAgentTemplate,
+-  options: {
++export async function runProgrammaticStep(
++  agentState: AgentState,
++  params: {
++    template: AgentTemplate
+     userId: string | undefined
+     userInputId: string
+     clientSessionId: string
+@@ -24,7 +26,6 @@ export async function runProgrammaticAgent(
+     onResponseChunk: (chunk: string) => void
+     agentType: AgentTemplateType
+     fileContext: ProjectFileContext
+-    agentState: AgentState
+     prompt: string | undefined
+     params: Record<string, any> | undefined
+     assistantMessage: string | undefined
+@@ -33,7 +34,7 @@ export async function runProgrammaticAgent(
+   }
+ ): Promise<AgentState> {
+   const {
+-    agentState,
++    template,
+     onResponseChunk,
+     ws,
+     userId,
+@@ -41,30 +42,47 @@ export async function runProgrammaticAgent(
+     clientSessionId,
+     fingerprintId,
+     fileContext,
+-  } = options
++  } = params
+ 
+   logger.info(
+     {
+       template: template.id,
+-      agentType: options.agentType,
+-      prompt: options.prompt,
+-      params: options.params,
++      agentType: params.agentType,
++      prompt: params.prompt,
++      params: params.params,
+     },
+-    'Running programmatic agent'
++    'Running programmatic step'
+   )
+-  // Create context for the programmatic agent
+-  const context: ProgrammaticAgentContext = {
+-    prompt: options.prompt || '',
+-    params: options.params || {},
++
++  let generator = agentIdToGenerator[agentState.agentId]
++  if (!generator) {
++    if (!template.handleStep) {
++      throw new Error('No step handler found for agent template ' + template.id)
++    }
++    generator = template.handleStep(agentState)
++    agentIdToGenerator[agentState.agentId] = generator
+   }
+ 
++  if (Math.random() <= 1) {
++    throw new Error('Not implemented yet!')
++  }
++
++  let toolResult: ToolResult | undefined
++
+   try {
+-    // Run the generator function and handle tool calls
+-    const generator = template.handler(context)
+-    let result = generator.next()
++    do {
++      let result = generator.next(toolResult)
++      if (result.done) {
++        break
++      }
++      if (result.value === 'STEP') {
++        break
++      }
++      if (result.value === 'STEP_ALL') {
++        break
++      }
+ 
+-    // Process tool calls yielded by the generator
+-    while (!result.done) {
++      // Process tool calls yielded by the generator
+       const toolCallWithoutId = result.value
+       const toolCall = {
+         ...toolCallWithoutId,
+@@ -79,7 +97,7 @@ export async function runProgrammaticAgent(
+       const repoId = requestContext?.processedRepoId
+ 
+       // Execute the tool call using the simplified wrapper
+-      const toolResult = await runTool(toolCall, {
++      toolResult = await runTool(toolCall, {
+         ws,
+         userId,
+         userInputId,
+@@ -93,13 +111,10 @@ export async function runProgrammaticAgent(
+         agentState,
+       })
+ 
+-      // Send the tool result back to the generator
+-      result = generator.next(toolResult)
+-
+       if (result.value && result.value.toolName === 'end_turn') {
+         break
+       }
+-    }
++    } while (true)
+ 
+     logger.info(
+       { report: agentState.report },
+diff --git a/backend/src/run-tool.ts b/backend/src/run-tool.ts
+index 51409d340..41075e859 100644
+--- a/backend/src/run-tool.ts
++++ b/backend/src/run-tool.ts
+@@ -23,7 +23,7 @@ import { searchWeb } from './llm-apis/linkup-api'
+ import { PROFIT_MARGIN } from './llm-apis/message-cost-tracker'
+ import { getSearchSystemPrompt } from './system-prompt/search-system-prompt'
+ import { agentRegistry } from './templates/agent-registry'
+-import { AgentTemplate, ProgrammaticAgentTemplate } from './templates/types'
++import { AgentTemplate } from './templates/types'
+ import { ClientToolCall, CodebuffToolCall } from './tools/constants'
+ import { logger } from './util/logger'
+ import { renderReadFilesResult } from './util/parse-tool-call-xml'
+@@ -43,7 +43,7 @@ export interface RunToolOptions {
+   agentStepId: string
+   fileContext: ProjectFileContext
+   messages: CoreMessage[]
+-  agentTemplate: AgentTemplate | ProgrammaticAgentTemplate
++  agentTemplate: AgentTemplate
+   repoId?: string
+   // Additional context for update_report
+   agentState?: AgentState
+@@ -681,10 +681,7 @@ export async function runToolInner(
+           const agentTemplate = allTemplates[agentState.agentType!]
+           let report = ''
+ 
+-          if (
+-            agentTemplate.implementation === 'programmatic' ||
+-            agentTemplate.outputMode === 'report'
+-          ) {
++          if (agentTemplate.outputMode === 'report') {
+             report = JSON.stringify(result.value.agentState.report, null, 2)
+           } else if (agentTemplate.outputMode === 'last_message') {
+             const { agentState } = result.value
+diff --git a/backend/src/templates/__tests__/agent-overrides.test.ts b/backend/src/templates/__tests__/agent-overrides.test.ts
+index 6fbcb8d89..74245dfde 100644
+--- a/backend/src/templates/__tests__/agent-overrides.test.ts
++++ b/backend/src/templates/__tests__/agent-overrides.test.ts
+@@ -23,7 +23,6 @@ describe('processAgentOverrides', () => {
+     systemPrompt: 'Base system prompt',
+     userInputPrompt: 'Base user input prompt',
+     agentStepPrompt: 'Base agent step prompt',
+-    implementation: 'llm',
+   }
+ 
+   const mockFileContext: ProjectFileContext = {
+diff --git a/backend/src/templates/agent-list.ts b/backend/src/templates/agent-list.ts
+index 42be94b29..2a4dc6a3c 100644
+--- a/backend/src/templates/agent-list.ts
++++ b/backend/src/templates/agent-list.ts
+@@ -8,76 +8,72 @@ import { agentBuilder } from './agents/agent-builder'
+ import { dryRun } from './agents/archive/dry-run'
+ import { ask } from './agents/ask'
+ import { base } from './agents/base'
+-import { exampleProgrammatic } from './agents/example-programmatic'
+ import { filePicker } from './agents/file-picker'
+ import { planner } from './agents/planner'
+ import { researcher } from './agents/researcher'
+ import { reviewer } from './agents/reviewer'
++import { superagent } from './agents/superagent'
+ import { thinker } from './agents/thinker'
+ import { thinkingBase } from './agents/thinking-base'
+-import { AgentTemplateUnion } from './types'
+-import { superagent } from './agents/superagent'
++import { AgentTemplate } from './types'
+ 
+-export const agentTemplates: Record<
+-  AgentTemplateType | string,
+-  AgentTemplateUnion
+-> = {
+-  base: {
+-    id: AgentTemplateTypes.base,
+-    ...base(models.openrouter_claude_sonnet_4),
+-  },
+-  base_lite: {
+-    id: AgentTemplateTypes.base_lite,
+-    ...base(models.gemini2_5_flash),
+-  },
+-  base_max: {
+-    id: AgentTemplateTypes.base_max,
+-    ...base(models.openrouter_claude_opus_4),
+-  },
+-  base_experimental: {
+-    id: AgentTemplateTypes.base_experimental,
+-    ...base(models.gemini2_5_pro_preview),
+-  },
+-  ask: {
+-    id: AgentTemplateTypes.ask,
+-    ...ask(models.gemini2_5_pro_preview),
+-  },
+-  superagent: {
+-    id: AgentTemplateTypes.superagent,
+-    ...superagent(models.openrouter_claude_sonnet_4),
+-  },
+-  claude4_gemini_thinking: {
+-    id: AgentTemplateTypes.claude4_gemini_thinking,
+-    ...thinkingBase(models.openrouter_claude_sonnet_4),
+-  },
++export const agentTemplates: Record<AgentTemplateType | string, AgentTemplate> =
++  {
++    base: {
++      id: AgentTemplateTypes.base,
++      ...base(models.openrouter_claude_sonnet_4),
++    },
++    base_lite: {
++      id: AgentTemplateTypes.base_lite,
++      ...base(models.gemini2_5_flash),
++    },
++    base_max: {
++      id: AgentTemplateTypes.base_max,
++      ...base(models.openrouter_claude_opus_4),
++    },
++    base_experimental: {
++      id: AgentTemplateTypes.base_experimental,
++      ...base(models.gemini2_5_pro_preview),
++    },
++    ask: {
++      id: AgentTemplateTypes.ask,
++      ...ask(models.gemini2_5_pro_preview),
++    },
++    superagent: {
++      id: AgentTemplateTypes.superagent,
++      ...superagent(models.openrouter_claude_sonnet_4),
++    },
++    claude4_gemini_thinking: {
++      id: AgentTemplateTypes.claude4_gemini_thinking,
++      ...thinkingBase(models.openrouter_claude_sonnet_4),
++    },
+ 
+-  thinker: {
+-    id: AgentTemplateTypes.thinker,
+-    ...thinker(models.openrouter_grok_4),
+-  },
+-  file_picker: {
+-    id: AgentTemplateTypes.file_picker,
+-    ...filePicker(models.gemini2_5_flash),
+-  },
+-  researcher: {
+-    id: AgentTemplateTypes.researcher,
+-    ...researcher(models.gemini2_5_flash),
+-  },
+-  planner: {
+-    id: AgentTemplateTypes.planner,
+-    ...planner(models.openrouter_grok_4),
+-  },
+-  dry_run: {
+-    id: AgentTemplateTypes.dry_run,
+-    ...dryRun(models.gemini2_5_flash),
+-  },
+-  reviewer: {
+-    id: AgentTemplateTypes.reviewer,
+-    ...reviewer(models.gemini2_5_pro_preview),
+-  },
+-  sonnet4_agent_builder: {
+-    id: AgentTemplateTypes.sonnet4_agent_builder,
+-    ...agentBuilder(models.openrouter_claude_sonnet_4),
+-  },
+-  example_programmatic: exampleProgrammatic,
+-}
++    thinker: {
++      id: AgentTemplateTypes.thinker,
++      ...thinker(models.openrouter_grok_4),
++    },
++    file_picker: {
++      id: AgentTemplateTypes.file_picker,
++      ...filePicker(models.gemini2_5_flash),
++    },
++    researcher: {
++      id: AgentTemplateTypes.researcher,
++      ...researcher(models.gemini2_5_flash),
++    },
++    planner: {
++      id: AgentTemplateTypes.planner,
++      ...planner(models.openrouter_grok_4),
++    },
++    dry_run: {
++      id: AgentTemplateTypes.dry_run,
++      ...dryRun(models.gemini2_5_flash),
++    },
++    reviewer: {
++      id: AgentTemplateTypes.reviewer,
++      ...reviewer(models.gemini2_5_pro_preview),
++    },
++    sonnet4_agent_builder: {
++      id: AgentTemplateTypes.sonnet4_agent_builder,
++      ...agentBuilder(models.openrouter_claude_sonnet_4),
++    },
++  }
+diff --git a/backend/src/templates/agent-registry.ts b/backend/src/templates/agent-registry.ts
+index 404d919ce..735c2e0de 100644
+--- a/backend/src/templates/agent-registry.ts
++++ b/backend/src/templates/agent-registry.ts
+@@ -1,16 +1,16 @@
+ import { AGENT_NAMES } from '@codebuff/common/constants/agents'
+ import { ProjectFileContext } from '@codebuff/common/util/file'
+ 
++import { logger } from '../util/logger'
+ import { agentTemplates as staticTemplates } from './agent-list'
+ import { dynamicAgentService } from './dynamic-agent-service'
+-import { AgentTemplateUnion } from './types'
+-import { logger } from '../util/logger'
++import { AgentTemplate } from './types'
+ 
+ /**
+  * Global agent registry that combines static and dynamic agents
+  */
+ export class AgentRegistry {
+-  private allTemplates: Record<string, AgentTemplateUnion> = {}
++  private allTemplates: Record<string, AgentTemplate> = {}
+   private allAgentNames: Record<string, string> = {}
+   private isInitialized = false
+   private validationErrors: Array<{ filePath: string; message: string }> = []
+@@ -106,7 +106,7 @@ export class AgentRegistry {
+   /**
+    * Get an agent template by type
+    */
+-  getTemplate(agentType: string): AgentTemplateUnion | undefined {
++  getTemplate(agentType: string): AgentTemplate | undefined {
+     if (!this.isInitialized) {
+       logger.warn(
+         'Agent registry not initialized, falling back to static templates only'
+@@ -120,7 +120,7 @@ export class AgentRegistry {
+   /**
+    * Get all available agent templates
+    */
+-  getAllTemplates(): Record<string, AgentTemplateUnion> {
++  getAllTemplates(): Record<string, AgentTemplate> {
+     if (!this.isInitialized) {
+       logger.warn(
+         'Agent registry not initialized, falling back to static templates only'
+diff --git a/backend/src/templates/agents/agent-builder.ts b/backend/src/templates/agents/agent-builder.ts
+index 4962995cd..d088055f0 100644
+--- a/backend/src/templates/agents/agent-builder.ts
++++ b/backend/src/templates/agents/agent-builder.ts
+@@ -7,7 +7,6 @@ import { AgentTemplate } from '../types'
+ export const agentBuilder = (model: Model): Omit<AgentTemplate, 'id'> => ({
+   name: 'Agent Builder',
+   purpose: 'Creates new agent templates for the codebuff mult-agent system',
+-  implementation: 'llm',
+   model,
+   promptSchema: {
+     prompt: z
+diff --git a/backend/src/templates/agents/archive/dry-run.ts b/backend/src/templates/agents/archive/dry-run.ts
+index 855c5f33a..99aba415c 100644
+--- a/backend/src/templates/agents/archive/dry-run.ts
++++ b/backend/src/templates/agents/archive/dry-run.ts
+@@ -7,7 +7,6 @@ import { AgentTemplate, PLACEHOLDER } from '../../types'
+ export const dryRun = (model: Model): Omit<AgentTemplate, 'id'> => ({
+   model,
+   name: AGENT_PERSONAS['dry_run'].name,
+-  implementation: 'llm',
+   purpose: AGENT_PERSONAS['dry_run'].purpose,
+   promptSchema: {
+     prompt: z.string().describe('A coding task to complete'),
+diff --git a/backend/src/templates/agents/ask.ts b/backend/src/templates/agents/ask.ts
+index b13abedf0..9241a5ab6 100644
+--- a/backend/src/templates/agents/ask.ts
++++ b/backend/src/templates/agents/ask.ts
+@@ -12,7 +12,6 @@ import { AgentTemplate, PLACEHOLDER } from '../types'
+ export const ask = (model: Model): Omit<AgentTemplate, 'id'> => ({
+   model,
+   name: AGENT_PERSONAS['ask'].name,
+-  implementation: 'llm',
+   purpose: 'Base ask-mode agent that orchestrates the full response.',
+   promptSchema: {
+     prompt: z
+diff --git a/backend/src/templates/agents/base.ts b/backend/src/templates/agents/base.ts
+index 07311fd0f..1c96a947d 100644
+--- a/backend/src/templates/agents/base.ts
++++ b/backend/src/templates/agents/base.ts
+@@ -16,7 +16,6 @@ export const base = (
+ ): Omit<AgentTemplate, 'id'> => ({
+   model,
+   name: AGENT_PERSONAS['base'].name,
+-  implementation: 'llm',
+   purpose: AGENT_PERSONAS['base'].purpose,
+   promptSchema: {
+     prompt: z.string().describe('A coding task to complete'),
+diff --git a/backend/src/templates/agents/example-programmatic.ts b/backend/src/templates/agents/example-programmatic.ts
+deleted file mode 100644
+index c2aebf7ff..000000000
+--- a/backend/src/templates/agents/example-programmatic.ts
++++ /dev/null
+@@ -1,39 +0,0 @@
+-import { z } from 'zod/v4'
+-import {
+-  ProgrammaticAgentContext,
+-  ProgrammaticAgentFunction,
+-  ProgrammaticAgentTemplate,
+-} from '../types'
+-
+-// Example generator function
+-const exampleHandler: ProgrammaticAgentFunction = function* (
+-  context: ProgrammaticAgentContext
+-) {
+-  // This is a simple example that just returns a greeting
+-  const greeting = `Hello! You said: "${context.prompt}"`
+-
+-  yield {
+-    toolName: 'update_report' as const,
+-    args: {
+-      json_update: {
+-        greeting,
+-      },
+-    },
+-  }
+-}
+-
+-export const exampleProgrammatic: ProgrammaticAgentTemplate = {
+-  id: 'example_programmatic',
+-  implementation: 'programmatic',
+-  name: 'Example Programmatic Agent',
+-  purpose:
+-    'A simple example of a programmatic agent using direct generator functions',
+-  handler: exampleHandler,
+-  includeMessageHistory: true,
+-  promptSchema: {
+-    prompt: z.string().optional(),
+-    params: z.any().optional(),
+-  },
+-  toolNames: ['update_report'] as const,
+-  spawnableAgents: [],
+-}
+diff --git a/backend/src/templates/agents/file-picker.ts b/backend/src/templates/agents/file-picker.ts
+index 2289aa531..89f561f66 100644
+--- a/backend/src/templates/agents/file-picker.ts
++++ b/backend/src/templates/agents/file-picker.ts
+@@ -9,7 +9,6 @@ import { AgentTemplate, PLACEHOLDER } from '../types'
+ export const filePicker = (model: Model): Omit<AgentTemplate, 'id'> => ({
+   model,
+   name: AGENT_PERSONAS['file_picker'].name,
+-  implementation: 'llm',
+   purpose: AGENT_PERSONAS['file_picker'].purpose,
+   promptSchema: {
+     prompt: z.string().describe('A coding task to complete'),
+diff --git a/backend/src/templates/agents/planner.ts b/backend/src/templates/agents/planner.ts
+index 1881caac4..a32c51d6a 100644
+--- a/backend/src/templates/agents/planner.ts
++++ b/backend/src/templates/agents/planner.ts
+@@ -7,7 +7,6 @@ import { AgentTemplate, PLACEHOLDER } from '../types'
+ export const planner = (model: Model): Omit<AgentTemplate, 'id'> => ({
+   model,
+   name: AGENT_PERSONAS['planner'].name,
+-  implementation: 'llm',
+   purpose: AGENT_PERSONAS['planner'].purpose,
+   promptSchema: {
+     prompt: z
+diff --git a/backend/src/templates/agents/researcher.ts b/backend/src/templates/agents/researcher.ts
+index c404d76ad..f5238f46d 100644
+--- a/backend/src/templates/agents/researcher.ts
++++ b/backend/src/templates/agents/researcher.ts
+@@ -8,7 +8,6 @@ import { AgentTemplate, PLACEHOLDER } from '../types'
+ export const researcher = (model: Model): Omit<AgentTemplate, 'id'> => ({
+   model,
+   name: AGENT_PERSONAS['researcher'].name,
+-  implementation: 'llm',
+   purpose: AGENT_PERSONAS['researcher'].purpose,
+   promptSchema: {
+     prompt: z
+diff --git a/backend/src/templates/agents/reviewer.ts b/backend/src/templates/agents/reviewer.ts
+index eb5b66a65..622d78bd0 100644
+--- a/backend/src/templates/agents/reviewer.ts
++++ b/backend/src/templates/agents/reviewer.ts
+@@ -8,7 +8,6 @@ import { AgentTemplate, PLACEHOLDER } from '../types'
+ export const reviewer = (model: Model): Omit<AgentTemplate, 'id'> => ({
+   model,
+   name: AGENT_PERSONAS['reviewer'].name,
+-  implementation: 'llm',
+   purpose: AGENT_PERSONAS['reviewer'].purpose,
+   promptSchema: {
+     prompt: z.string().describe('What should be reviewed. Be brief.'),
+diff --git a/backend/src/templates/agents/superagent.ts b/backend/src/templates/agents/superagent.ts
+index c35a81c9e..9528eedc2 100644
+--- a/backend/src/templates/agents/superagent.ts
++++ b/backend/src/templates/agents/superagent.ts
+@@ -11,7 +11,6 @@ export const superagent = (
+ ): Omit<AgentTemplate, 'id'> => ({
+   model,
+   name: AGENT_PERSONAS['superagent'].name,
+-  implementation: 'llm',
+   purpose: AGENT_PERSONAS['superagent'].purpose,
+   promptSchema: {
+     prompt: z.string().describe('A coding task to complete'),
+diff --git a/backend/src/templates/agents/thinker.ts b/backend/src/templates/agents/thinker.ts
+index c97d8a5bb..58244130f 100644
+--- a/backend/src/templates/agents/thinker.ts
++++ b/backend/src/templates/agents/thinker.ts
+@@ -8,7 +8,6 @@ import { AgentTemplate, PLACEHOLDER } from '../types'
+ export const thinker = (model: Model): Omit<AgentTemplate, 'id'> => ({
+   model,
+   name: AGENT_PERSONAS['thinker'].name,
+-  implementation: 'llm',
+   purpose: AGENT_PERSONAS['thinker'].purpose,
+   promptSchema: {
+     prompt: z.string().describe('The problem you are trying to solve'),
+diff --git a/backend/src/templates/agents/thinking-base.ts b/backend/src/templates/agents/thinking-base.ts
+index d91328028..2f6e0de4d 100644
+--- a/backend/src/templates/agents/thinking-base.ts
++++ b/backend/src/templates/agents/thinking-base.ts
+@@ -19,7 +19,6 @@ export const thinkingBase = (
+   allAvailableAgents?: string[]
+ ): Omit<AgentTemplate, 'id'> => ({
+   model,
+-  implementation: 'llm',
+   name: AGENT_PERSONAS['base_lite'].name,
+   purpose: AGENT_PERSONAS['base_lite'].purpose,
+   promptSchema: {
+diff --git a/backend/src/templates/dynamic-agent-service.ts b/backend/src/templates/dynamic-agent-service.ts
+index eb18a5752..89703904e 100644
+--- a/backend/src/templates/dynamic-agent-service.ts
++++ b/backend/src/templates/dynamic-agent-service.ts
+@@ -14,7 +14,7 @@ import { jsonSchemaToZod } from 'json-schema-to-zod'
+ import { z } from 'zod'
+ 
+ import { logger } from '../util/logger'
+-import { AgentTemplate, AgentTemplateUnion } from './types'
++import { AgentTemplate } from './types'
+ 
+ export interface DynamicAgentValidationError {
+   filePath: string
+@@ -23,7 +23,7 @@ export interface DynamicAgentValidationError {
+ }
+ 
+ export interface DynamicAgentLoadResult {
+-  templates: Record<string, AgentTemplateUnion>
++  templates: Record<string, AgentTemplate>
+   validationErrors: DynamicAgentValidationError[]
+ }
+ 
+@@ -245,7 +245,6 @@ export class DynamicAgentService {
+       const agentTemplate: AgentTemplate = {
+         id: dynamicAgent.id as AgentTemplateType,
+         name: dynamicAgent.name,
+-        implementation: 'llm',
+         purpose: dynamicAgent.purpose,
+         model: dynamicAgent.model as any,
+         promptSchema,
+diff --git a/backend/src/templates/strings.ts b/backend/src/templates/strings.ts
+index 09c112b1a..87f099137 100644
+--- a/backend/src/templates/strings.ts
++++ b/backend/src/templates/strings.ts
+@@ -110,7 +110,7 @@ export async function collectParentInstructions(
+   const allTemplates = agentRegistry.getAllTemplates()
+ 
+   for (const template of Object.values(allTemplates)) {
+-    if (template.implementation === 'llm' && template.parentInstructions) {
++    if (template.parentInstructions) {
+       const instruction = template.parentInstructions[agentType]
+       if (instruction) {
+         instructions.push(instruction)
+diff --git a/backend/src/templates/types.ts b/backend/src/templates/types.ts
+index c3a39f70c..29e3eab92 100644
+--- a/backend/src/templates/types.ts
++++ b/backend/src/templates/types.ts
+@@ -3,6 +3,7 @@ import { z } from 'zod/v4'
+ import { Model } from '@codebuff/common/constants'
+ import { ToolName } from '@codebuff/common/constants/tools'
+ import {
++  AgentState,
+   AgentTemplateType,
+   AgentTemplateTypes,
+   ToolResult,
+@@ -14,7 +15,6 @@ export type AgentTemplate = {
+   name: string
+   purpose: string
+   model: Model
+-  implementation: 'llm'
+   // Required parameters for spawning this agent.
+   promptSchema: {
+     prompt?: z.ZodSchema<string | undefined>
+@@ -34,36 +34,17 @@ export type AgentTemplate = {
+   systemPrompt: string
+   userInputPrompt: string
+   agentStepPrompt: string
+-}
+ 
+-export interface ProgrammaticAgentTemplate {
+-  id: AgentTemplateType
+-  implementation: 'programmatic'
+-  name: string
+-  purpose: string
+-  handler: ProgrammaticAgentFunction // Direct generator function. TODO: replace with path to a file or string of source code?
+-  includeMessageHistory: boolean
+-  promptSchema: {
+-    prompt?: z.ZodSchema<string | undefined>
+-    params?: z.ZodSchema<any>
+-  }
+-  toolNames: ToolName[] // Tools this programmatic agent can use
+-  spawnableAgents: AgentTemplateType[] // Agents it can spawn
++  handleStep?: StepHandler
+ }
+ 
+-// Union type for all agent templates
+-export type AgentTemplateUnion = AgentTemplate | ProgrammaticAgentTemplate
+-
+-// Context passed to programmatic agents
+-export interface ProgrammaticAgentContext {
+-  prompt: string
+-  params: any
+-}
++export type StepGenerator = Generator<
++  Omit<CodebuffToolCall, 'toolCallId'> | 'STEP' | 'STEP_ALL',
++  void,
++  ToolResult | undefined
++>
+ 
+-// The generator function signature
+-export type ProgrammaticAgentFunction = (
+-  context: ProgrammaticAgentContext
+-) => Generator<Omit<CodebuffToolCall, 'toolCallId'>, void, ToolResult>
++export type StepHandler = (agentState: AgentState) => StepGenerator
+ 
+ const placeholderNames = [
+   'AGENT_NAME',
+diff --git a/backend/src/tools/handlers/spawn-agents-async.ts b/backend/src/tools/handlers/spawn-agents-async.ts
+index 342c6cb5f..4301555e5 100644
+--- a/backend/src/tools/handlers/spawn-agents-async.ts
++++ b/backend/src/tools/handlers/spawn-agents-async.ts
+@@ -190,7 +190,7 @@ export const handleSpawnAgentsAsync = ((params: {
+             })
+ 
+             // Send completion message to parent if agent has appropriate output mode
+-            if (agentState.parentId && agentTemplate.implementation === 'llm') {
++            if (agentState.parentId) {
+               const { outputMode } = agentTemplate
+               if (
+                 outputMode === 'last_message' ||
+diff --git a/backend/src/tools/handlers/spawn-agents.ts b/backend/src/tools/handlers/spawn-agents.ts
+index 99b0e127c..8093861b6 100644
+--- a/backend/src/tools/handlers/spawn-agents.ts
++++ b/backend/src/tools/handlers/spawn-agents.ts
+@@ -187,10 +187,7 @@ export const handleSpawnAgents = ((params: {
+         const agentTemplate = allTemplates[agentState.agentType!]
+         let report = ''
+ 
+-        if (
+-          agentTemplate.implementation === 'programmatic' ||
+-          agentTemplate.outputMode === 'report'
+-        ) {
++        if (agentTemplate.outputMode === 'report') {
+           report = JSON.stringify(result.value.agentState.report, null, 2)
+         } else if (agentTemplate.outputMode === 'last_message') {
+           const { agentState } = result.value

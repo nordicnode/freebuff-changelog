@@ -1,0 +1,685 @@
+diff --git a/npm-app/src/background-process-manager.ts b/npm-app/src/background-process-manager.ts
+index e52ded017..500279c70 100644
+--- a/npm-app/src/background-process-manager.ts
++++ b/npm-app/src/background-process-manager.ts
+@@ -1,6 +1,11 @@
+ import { ChildProcessByStdio } from 'child_process'
+ import { Readable } from 'stream'
+ 
++import { buildArray } from 'common/util/array'
++import { truncateStringWithMessage } from 'common/util/string'
++
++const COMMAND_OUTPUT_LIMIT = 5000 // Limit output to 10KB per stream
++
+ /**
+  * Interface describing the information stored for each background process.
+  */
+@@ -16,12 +21,16 @@ export interface BackgroundProcessInfo {
+   stderrBuffer: string[]
+   // Current status of the process
+   status: 'running' | 'completed' | 'error'
+-  // Exit code if the process has completed or errored after starting
+-  exitCode: number | null
+   // Timestamp when the process was started
+   startTime: number
+   // Timestamp when the process ended (completed or errored)
+   endTime: number | null
++  // Length of stdout content that has been reported
++  lastReportedStdoutLength: number
++  // Length of stderr content that has been reported
++  lastReportedStderrLength: number
++  // Last reported status
++  lastReportedStatus: 'running' | 'completed' | 'error' | null
+ }
+ 
+ /**
+@@ -29,3 +38,111 @@ export interface BackgroundProcessInfo {
+  * Keyed by the OS-assigned Process ID (PID).
+  */
+ export const backgroundProcesses = new Map<number, BackgroundProcessInfo>()
++
++/**
++ * Gets output with context about whether there was previous content
++ */
++function getOutputWithContext(
++  newContent: string,
++  lastReportedLength: number
++): string {
++  if (newContent) {
++    const hasOldContent = lastReportedLength > 0
++    return hasOldContent ? '[PREVIOUS OUTPUT]\n' + newContent : newContent
++  }
++  return '[NO NEW OUTPUT]'
++}
++
++/**
++ * Formats a single background process's info into a string
++ */
++export function getBackgroundProcessInfoString(
++  info: BackgroundProcessInfo
++): string {
++  const newStdout = info.stdoutBuffer
++    .join('')
++    .slice(info.lastReportedStdoutLength)
++  const newStderr = info.stderrBuffer
++    .join('')
++    .slice(info.lastReportedStderrLength)
++
++  // For completed/error processes, only report if there are changes
++  if (
++    info.status !== 'running' &&
++    !newStdout &&
++    !newStderr &&
++    info.status === info.lastReportedStatus
++  ) {
++    return ''
++  }
++
++  // Calculate duration in milliseconds
++  const duration = info.endTime
++    ? info.endTime - info.startTime
++    : Date.now() - info.startTime
++
++  return buildArray(
++    '<background_process>',
++    `  <process_id>${info.id}</process_id>`,
++    `  <command>${info.command}</command>`,
++    `  <start_time_utc>${new Date(info.startTime).toISOString()}</start_time_utc>`,
++    `  <duration_ms>${duration}</duration_ms>`,
++    `  <terminal_command_result>`,
++    `    <stdout>${truncateStringWithMessage({
++      str: getOutputWithContext(newStdout, info.lastReportedStdoutLength),
++      maxLength: COMMAND_OUTPUT_LIMIT,
++      truncate: 'START',
++    })}</stdout>`,
++    `    <stderr>${truncateStringWithMessage({
++      str: getOutputWithContext(newStderr, info.lastReportedStderrLength),
++      maxLength: COMMAND_OUTPUT_LIMIT,
++      truncate: 'START',
++    })}</stderr>`,
++    '  </terminal_command_result>',
++    `  <status>${info.status}</status>`,
++    info.process.exitCode !== null &&
++      `  <exit_code>${info.process.exitCode}</exit_code>`,
++    info.process.signalCode &&
++      `  <signal_code>${info.process.signalCode}</signal_code>`,
++    '</background_process>'
++  )
++    .filter(Boolean)
++    .join('\n')
++}
++
++/**
++ * Gets updates from all background processes and updates tracking info
++ */
++export function getBackgroundProcessUpdates(): string {
++  const updates = Array.from(backgroundProcesses.values())
++    .map(getBackgroundProcessInfoString)
++    .filter(Boolean)
++
++  // Update tracking info after getting updates
++  for (const process of backgroundProcesses.values()) {
++    process.lastReportedStdoutLength = process.stdoutBuffer.join('').length
++    process.lastReportedStderrLength = process.stderrBuffer.join('').length
++    process.lastReportedStatus = process.status
++  }
++
++  // Clean up completed processes that we've already reported
++  cleanupReportedProcesses()
++
++  return updates.join('\n')
++}
++
++/**
++ * Removes completed processes that have been fully reported
++ */
++function cleanupReportedProcesses(): void {
++  for (const [pid, info] of backgroundProcesses.entries()) {
++    if (
++      (info.status === 'completed' || info.status === 'error') &&
++      info.lastReportedStatus === info.status &&
++      info.lastReportedStdoutLength === info.stdoutBuffer.join('').length &&
++      info.lastReportedStderrLength === info.stderrBuffer.join('').length
++    ) {
++      backgroundProcesses.delete(pid)
++    }
++  }
++}
+diff --git a/npm-app/src/client.ts b/npm-app/src/client.ts
+index d3e2969c0..f4c2740bf 100644
+--- a/npm-app/src/client.ts
++++ b/npm-app/src/client.ts
+@@ -27,7 +27,7 @@ import {
+ } from 'common/types/agent-state'
+ import { User } from 'common/util/credentials'
+ import { ProjectFileContext } from 'common/util/file'
+-import { pluralize } from 'common/util/string'
++import { generateCompactId, pluralize } from 'common/util/string'
+ import { APIRealtimeClient } from 'common/websockets/websocket-client'
+ import {
+   blue,
+@@ -40,6 +40,7 @@ import {
+ } from 'picocolors'
+ import { match, P } from 'ts-pattern'
+ 
++import { getBackgroundProcessUpdates } from './background-process-manager'
+ import { activeBrowserRunner } from './browser-runner'
+ import { setMessages } from './chat-storage'
+ import { checkpointManager } from './checkpoints/checkpoint-manager'
+@@ -560,13 +561,25 @@ export class Client {
+       prompt
+     )
+ 
++    // Get new output from all running background processes
++    const processUpdates = getBackgroundProcessUpdates()
++
++    // Append process updates to existing tool results
++    const toolResults = processUpdates
++      ? (this.lastToolResults || []).concat({
++          id: generateCompactId(),
++          name: 'background_process_updates',
++          result: processUpdates,
++        })
++      : this.lastToolResults
++
+     Spinner.get().start()
+     this.webSocket.sendAction({
+       type: 'prompt',
+       promptId: userInputId,
+       prompt,
+       agentState: this.agentState,
+-      toolResults: this.lastToolResults,
++      toolResults,
+       fingerprintId: await this.fingerprintId,
+       authToken: this.user?.authToken,
+       costMode: this.costMode,
+diff --git a/npm-app/src/utils/__tests__/background-process-manager.test.ts b/npm-app/src/utils/__tests__/background-process-manager.test.ts
+new file mode 100644
+index 000000000..9ee1588d6
+--- /dev/null
++++ b/npm-app/src/utils/__tests__/background-process-manager.test.ts
+@@ -0,0 +1,377 @@
++// @ts-ignore
++import {
++  afterEach,
++  beforeEach,
++  describe,
++  expect,
++  mock,
++  spyOn,
++  test,
++} from 'bun:test'
++
++import {
++  BackgroundProcessInfo,
++  getBackgroundProcessInfoString,
++} from '../../background-process-manager'
++
++// Mock the child process
++const mockChildProcess = {
++  exitCode: null,
++  signalCode: null,
++} as any
++
++describe('getBackgroundProcessInfoString', () => {
++  let dateNowSpy: ReturnType<typeof spyOn>
++  const currentTime = 3000
++
++  beforeEach(() => {
++    spyOn(Date, 'now').mockReturnValue(currentTime)
++  })
++
++  afterEach(() => {
++    mock.restore()
++  })
++
++  test('formats a running process correctly', () => {
++    const startTime = 1000
++
++    const info: BackgroundProcessInfo = {
++      id: 123,
++      command: 'npm test',
++      process: mockChildProcess,
++      stdoutBuffer: ['test output'],
++      stderrBuffer: ['test error'],
++      status: 'running',
++      startTime,
++      endTime: null,
++      lastReportedStdoutLength: 0,
++      lastReportedStderrLength: 0,
++      lastReportedStatus: null,
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++
++    expect(result).toContain('<background_process>')
++    expect(result).toContain('<process_id>123</process_id>')
++    expect(result).toContain('<command>npm test</command>')
++    expect(result).toContain('<duration_ms>2000</duration_ms>')
++    expect(result).toContain('<status>running</status>')
++    expect(result).toContain('<stdout>test output</stdout>')
++    expect(result).toContain('<stderr>test error</stderr>')
++    expect(result).not.toContain('<exit_code>')
++    expect(result).not.toContain('<signal_code>')
++  })
++
++  test('formats a completed process correctly', () => {
++    const startTime = 1000
++    const endTime = 2000
++
++    const mockCompletedProcess = {
++      ...mockChildProcess,
++      exitCode: 0,
++    }
++
++    const info: BackgroundProcessInfo = {
++      id: 456,
++      command: 'npm build',
++      process: mockCompletedProcess,
++      stdoutBuffer: ['build successful'],
++      stderrBuffer: [],
++      status: 'completed',
++      startTime,
++      endTime,
++      lastReportedStdoutLength: 0,
++      lastReportedStderrLength: 0,
++      lastReportedStatus: null,
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++
++    expect(result).toContain('<background_process>')
++    expect(result).toContain('<process_id>456</process_id>')
++    expect(result).toContain('<command>npm build</command>')
++    expect(result).toContain('<duration_ms>1000</duration_ms>')
++    expect(result).toContain('<status>completed</status>')
++    expect(result).toContain('<exit_code>0</exit_code>')
++    expect(result).toContain('<stdout>build successful</stdout>')
++    expect(result).toContain('<stderr>[NO NEW OUTPUT]</stderr>')
++  })
++
++  test('formats an errored process correctly', () => {
++    const startTime = 1000
++    const endTime = 2500
++
++    const mockErroredProcess = {
++      ...mockChildProcess,
++      exitCode: 1,
++      signalCode: 'SIGTERM',
++    }
++
++    const info: BackgroundProcessInfo = {
++      id: 789,
++      command: 'invalid-command',
++      process: mockErroredProcess,
++      stdoutBuffer: [],
++      stderrBuffer: ['command not found'],
++      status: 'error',
++      startTime,
++      endTime,
++      lastReportedStdoutLength: 0,
++      lastReportedStderrLength: 0,
++      lastReportedStatus: null,
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++
++    expect(result).toContain('<background_process>')
++    expect(result).toContain('<process_id>789</process_id>')
++    expect(result).toContain('<command>invalid-command</command>')
++    expect(result).toContain('<duration_ms>1500</duration_ms>')
++    expect(result).toContain('<status>error</status>')
++    expect(result).toContain('<exit_code>1</exit_code>')
++    expect(result).toContain('<signal_code>SIGTERM</signal_code>')
++    expect(result).toContain('<stdout>[NO NEW OUTPUT]</stdout>')
++    expect(result).toContain('<stderr>command not found</stderr>')
++  })
++
++  test('returns empty string for completed process with no changes', () => {
++    const startTime = 1000
++    const endTime = 2000
++
++    const info: BackgroundProcessInfo = {
++      id: 101,
++      command: 'echo test',
++      process: mockChildProcess,
++      stdoutBuffer: ['test'],
++      stderrBuffer: [],
++      status: 'completed',
++      startTime,
++      endTime,
++      lastReportedStdoutLength: 4, // Length of 'test'
++      lastReportedStderrLength: 0,
++      lastReportedStatus: 'completed',
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++    expect(result).toBe('')
++  })
++
++  test('handles new output since last report', () => {
++    const startTime = 1000
++    const endTime = 2000
++
++    const info: BackgroundProcessInfo = {
++      id: 102,
++      command: 'echo test',
++      process: mockChildProcess,
++      stdoutBuffer: ['test', ' more output'],
++      stderrBuffer: [],
++      status: 'completed',
++      startTime,
++      endTime,
++      lastReportedStdoutLength: 4, // Only 'test' was reported
++      lastReportedStderrLength: 0,
++      lastReportedStatus: 'completed',
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++
++    expect(result).toContain('<duration_ms>1000</duration_ms>')
++    expect(result).toContain('<stdout>[PREVIOUS OUTPUT]\n more output</stdout>')
++    expect(result).toContain('<stderr>[NO NEW OUTPUT]</stderr>')
++  })
++
++  test('returns [NO NEW OUTPUT] when no new content', () => {
++    const startTime = 1000
++    const endTime = 2000
++
++    const info: BackgroundProcessInfo = {
++      id: 103,
++      command: 'echo test',
++      process: mockChildProcess,
++      stdoutBuffer: ['test'],
++      stderrBuffer: [],
++      status: 'running',
++      startTime,
++      endTime,
++      lastReportedStdoutLength: 4, // All content reported
++      lastReportedStderrLength: 0,
++      lastReportedStatus: 'running',
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++    expect(result).toContain('<duration_ms>1000</duration_ms>')
++    expect(result).toContain('<stdout>[NO NEW OUTPUT]</stdout>')
++    expect(result).toContain('<stderr>[NO NEW OUTPUT]</stderr>')
++  })
++
++  test('shows new stderr without [PREVIOUS OUTPUT] when no previous stderr', () => {
++    const startTime = 1000
++    const endTime = 2000
++
++    const info: BackgroundProcessInfo = {
++      id: 104,
++      command: 'echo test',
++      process: mockChildProcess,
++      stdoutBuffer: [],
++      stderrBuffer: ['new error'],
++      status: 'error',
++      startTime,
++      endTime,
++      lastReportedStdoutLength: 0,
++      lastReportedStderrLength: 0, // No previous stderr
++      lastReportedStatus: null,
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++    expect(result).toContain('<duration_ms>1000</duration_ms>')
++    expect(result).toContain('<stdout>[NO NEW OUTPUT]</stdout>')
++    expect(result).toContain('<stderr>new error</stderr>')
++  })
++
++  test('shows new stdout without [PREVIOUS OUTPUT] when no previous stdout', () => {
++    const startTime = 1000
++
++    const info: BackgroundProcessInfo = {
++      id: 105,
++      command: 'echo test',
++      process: mockChildProcess,
++      stdoutBuffer: ['first output'],
++      stderrBuffer: [],
++      status: 'running',
++      startTime,
++      endTime: null,
++      lastReportedStdoutLength: 0, // No previous stdout
++      lastReportedStderrLength: 0,
++      lastReportedStatus: null,
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++    expect(result).toContain('<duration_ms>2000</duration_ms>')
++    expect(result).toContain('<stdout>first output</stdout>')
++    expect(result).toContain('<stderr>[NO NEW OUTPUT]</stderr>')
++  })
++
++  test('reports completed process with new stderr even if stdout unchanged', () => {
++    const startTime = 1000
++    const endTime = 2000
++
++    const info: BackgroundProcessInfo = {
++      id: 106,
++      command: 'echo test',
++      process: mockChildProcess,
++      stdoutBuffer: ['test'],
++      stderrBuffer: ['new error'],
++      status: 'completed',
++      startTime,
++      endTime,
++      lastReportedStdoutLength: 4, // All stdout reported
++      lastReportedStderrLength: 0, // No stderr reported
++      lastReportedStatus: 'completed',
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++    expect(result).not.toBe('')
++    expect(result).toContain('<duration_ms>1000</duration_ms>')
++    expect(result).toContain('<stdout>[NO NEW OUTPUT]</stdout>')
++    expect(result).toContain('<stderr>new error</stderr>')
++  })
++
++  test('reports completed process with new stdout even if stderr unchanged', () => {
++    const startTime = 1000
++    const endTime = 2000
++
++    const info: BackgroundProcessInfo = {
++      id: 107,
++      command: 'echo test',
++      process: mockChildProcess,
++      stdoutBuffer: ['test', ' more'],
++      stderrBuffer: ['error'],
++      status: 'completed',
++      startTime,
++      endTime,
++      lastReportedStdoutLength: 4, // Only 'test' reported
++      lastReportedStderrLength: 5, // All stderr reported
++      lastReportedStatus: 'completed',
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++    expect(result).not.toBe('')
++    expect(result).toContain('<duration_ms>1000</duration_ms>')
++    expect(result).toContain('<stdout>[PREVIOUS OUTPUT]\n more</stdout>')
++    expect(result).toContain('<stderr>[NO NEW OUTPUT]</stderr>')
++  })
++
++  test('reports process when status changes even without output changes', () => {
++    const startTime = 1000
++    const endTime = 2000
++
++    const info: BackgroundProcessInfo = {
++      id: 108,
++      command: 'echo test',
++      process: mockChildProcess,
++      stdoutBuffer: ['test'],
++      stderrBuffer: [],
++      status: 'completed',
++      startTime,
++      endTime,
++      lastReportedStdoutLength: 4, // All output reported
++      lastReportedStderrLength: 0,
++      lastReportedStatus: 'running', // Status changed from running to completed
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++    expect(result).not.toBe('')
++    expect(result).toContain('<duration_ms>1000</duration_ms>')
++    expect(result).toContain('<stdout>[NO NEW OUTPUT]</stdout>')
++    expect(result).toContain('<stderr>[NO NEW OUTPUT]</stderr>')
++    expect(result).toContain('<status>completed</status>')
++  })
++
++  test('calculates duration from endTime when available', () => {
++    const startTime = 1000
++    const endTime = 2500
++
++    const info: BackgroundProcessInfo = {
++      id: 109,
++      command: 'echo test',
++      process: mockChildProcess,
++      stdoutBuffer: ['test'],
++      stderrBuffer: [],
++      status: 'completed',
++      startTime,
++      endTime,
++      lastReportedStdoutLength: 0,
++      lastReportedStderrLength: 0,
++      lastReportedStatus: null,
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++    expect(result).toContain('<duration_ms>1500</duration_ms>') // endTime - startTime = 1500
++    expect(result).toContain('<stdout>test</stdout>')
++    expect(result).toContain('<stderr>[NO NEW OUTPUT]</stderr>')
++  })
++
++  test('calculates duration from current time when no endTime', () => {
++    const startTime = 1000
++
++    const info: BackgroundProcessInfo = {
++      id: 110,
++      command: 'echo test',
++      process: mockChildProcess,
++      stdoutBuffer: ['test'],
++      stderrBuffer: [],
++      status: 'running',
++      startTime,
++      endTime: null,
++      lastReportedStdoutLength: 0,
++      lastReportedStderrLength: 0,
++      lastReportedStatus: null,
++    }
++
++    const result = getBackgroundProcessInfoString(info)
++    expect(result).toContain('<duration_ms>2000</duration_ms>') // currentTime - startTime = 2000
++    expect(result).toContain('<stdout>test</stdout>')
++    expect(result).toContain('<stderr>[NO NEW OUTPUT]</stderr>')
++  })
++})
+diff --git a/npm-app/src/utils/terminal.ts b/npm-app/src/utils/terminal.ts
+index 1f386a7ec..1ca5b9e6a 100644
+--- a/npm-app/src/utils/terminal.ts
++++ b/npm-app/src/utils/terminal.ts
+@@ -169,33 +169,18 @@ export const resetShell = (projectPath: string) => {
+   }
+ }
+ 
+-function formatResult(stdout: string, status: string): string {
+-  let result = '<terminal_command_result>\n'
+-  result += `<output>${truncateStringWithMessage({ str: stdout, maxLength: COMMAND_OUTPUT_LIMIT })}</output>\n`
+-  result += `<status>${status}</status>\n`
+-  result += '</terminal_command_result>'
+-  return result
++function formatResult(command: string, stdout: string, status: string): string {
++  return buildArray(
++    `<command>${command}</command>`,
++    '<terminal_command_result>',
++    `<output>${truncateStringWithMessage({ str: stdout, maxLength: COMMAND_OUTPUT_LIMIT })}</output>`,
++    `<status>${status}</status>`,
++    '</terminal_command_result>'
++  ).join('\n')
+ }
+ 
+ const MAX_EXECUTION_TIME = 30_000
+ 
+-const getBackgroundProcessInfoString = (info: BackgroundProcessInfo) => {
+-  return buildArray([
+-    '<background_process>',
+-    `  <process_id>${info.id}</process_id>`,
+-    `  <command>${info.command}</command>`,
+-    `  <start_time>${info.startTime}</start_time>`,
+-    `  <duration_ms>${info.endTime === null ? Date.now() - info.startTime : info.endTime - info.startTime}</duration_ms>`,
+-    `  <terminal_command_result>`,
+-    `    <status>${info.status}</status>`,
+-    info.exitCode !== null && `  <exit_code>${info.exitCode}</exit_code>`,
+-    `    <stdout>${truncateStringWithMessage({ str: info.stdoutBuffer.join(''), maxLength: COMMAND_OUTPUT_LIMIT / 2, truncate: 'END' })}</stdout>`,
+-    `    <stderr>${truncateStringWithMessage({ str: info.stderrBuffer.join(''), maxLength: COMMAND_OUTPUT_LIMIT / 2, truncate: 'START' })}</stderr>`,
+-    '  </terminal_command_result>',
+-    '</background_process>',
+-  ]).join('\n')
+-}
+-
+ const runBackgroundCommand = (
+   command: string,
+   projectPath: string,
+@@ -231,14 +216,16 @@ const runBackgroundCommand = (
+     const processId = childProcess.pid
+     const processInfo: BackgroundProcessInfo = {
+       id: processId,
+-      command: command,
++      command,
+       process: childProcess,
+       stdoutBuffer: [],
+       stderrBuffer: [],
+       status: 'running',
+-      exitCode: null,
+       startTime: Date.now(),
+       endTime: null,
++      lastReportedStdoutLength: 0,
++      lastReportedStderrLength: 0,
++      lastReportedStatus: null,
+     }
+     backgroundProcesses.set(processId, processInfo)
+ 
+@@ -262,7 +249,6 @@ const runBackgroundCommand = (
+ 
+     childProcess.on('close', (code) => {
+       processInfo.status = code === 0 ? 'completed' : 'error'
+-      processInfo.exitCode = code
+       processInfo.endTime = Date.now()
+     })
+ 
+@@ -358,6 +344,7 @@ export const runCommandPty = (
+ 
+       resolve({
+         result: formatResult(
++          command,
+           commandOutput,
+           `Command timed out after ${MAX_EXECUTION_TIME / 1000} seconds and was terminated. Shell has been restarted.`
+         ),
+@@ -411,7 +398,7 @@ export const runCommandPty = (
+         ptyProcess.write(`cd ${projectPath}\r`)
+ 
+         resolve({
+-          result: formatResult(commandOutput, 'Command completed'),
++          result: formatResult(command, commandOutput, 'Command completed'),
+           stdout: commandOutput,
+         })
+         return
+@@ -480,6 +467,7 @@ const runCommandChildProcess = (
+     if (mode === 'assistant') {
+       resolve({
+         result: formatResult(
++          command,
+           commandOutput,
+           `Command timed out after ${MAX_EXECUTION_TIME / 1000} seconds and was terminated.`
+         ),
+@@ -515,7 +503,7 @@ const runCommandChildProcess = (
+     }
+ 
+     resolve({
+-      result: formatResult(commandOutput, `Command completed`),
++      result: formatResult(command, commandOutput, `Command completed`),
+       stdout: commandOutput,
+     })
+   })

@@ -1,0 +1,1009 @@
+diff --git a/.agents/factory/superagent.ts b/.agents/factory/superagent.ts
+deleted file mode 100644
+index 5f40f218f..000000000
+--- a/.agents/factory/superagent.ts
++++ /dev/null
+@@ -1,45 +0,0 @@
+-import { AGENT_PERSONAS } from '@codebuff/common/constants/agents'
+-import { AgentTemplateTypes } from '@codebuff/common/types/session-state'
+-
+-import type { SecretAgentDefinition } from '../types/secret-agent-definition'
+-import type { Model } from '@codebuff/common/old-constants'
+-
+-export const superagent = (
+-  model: Model,
+-  allAvailableAgents?: string[],
+-): Omit<SecretAgentDefinition, 'id'> => ({
+-  model,
+-  displayName: 'Superagent',
+-  spawnerPrompt: 'Superagent that can spawn multiple code editing agents to complete a task.',
+-  inputSchema: {
+-    prompt: {
+-      type: 'string',
+-      description: 'A coding task to complete',
+-    },
+-  },
+-  outputMode: 'last_message',
+-  includeMessageHistory: false,
+-  toolNames: ['spawn_agents', 'spawn_agents_async', 'end_turn', 'think_deeply'],
+-  spawnableAgents: allAvailableAgents
+-    ? (allAvailableAgents as any[])
+-    : [
+-        AgentTemplateTypes.thinker,
+-        AgentTemplateTypes.base,
+-        AgentTemplateTypes.ask,
+-      ],
+-
+-  systemPrompt: `You are an expert orchestrator that can solve any problem, including coding tasks.`,
+-  instructionsPrompt: `
+-Answer the user's question or complete the task by spawning copies of the base agent.
+-
+-If you have all the information you need, just write out the response and do not spawn any agents.
+-
+-If you are gathering information, spawn the "ask" agent synchronously (spawn_agents) so you can understand something before proceeding.
+-
+-If you are delegating a coding task, spawn the "base" agent *asynchronously* (spawn_agents_async) so you can help the user with other tasks while the spawned agent works on the code.
+-
+-Feel free to ask the user for clarification if you are unsure what to do.
+-`.trim(),
+-  stepPrompt:
+-    'Spawn as many agents as you can to help. Use the end_turn tool at the end of your response when you have completed the user request or want the user to respond to your message or if you are waiting for a response from an agent.',
+-})
+diff --git a/.agents/types/secret-agent-definition.ts b/.agents/types/secret-agent-definition.ts
+index fe39bee95..69bb29095 100644
+--- a/.agents/types/secret-agent-definition.ts
++++ b/.agents/types/secret-agent-definition.ts
+@@ -7,7 +7,6 @@ export type AllToolNames =
+   | 'add_subgoal'
+   | 'browser_logs'
+   | 'create_plan'
+-  | 'spawn_agents_async'
+   | 'spawn_agent_inline'
+   | 'update_subgoal'
+ 
+diff --git a/backend/src/async-agent-manager.ts b/backend/src/async-agent-manager.ts
+deleted file mode 100644
+index ed87752df..000000000
+--- a/backend/src/async-agent-manager.ts
++++ /dev/null
+@@ -1,344 +0,0 @@
+-import { assembleLocalAgentTemplates } from './templates/agent-registry'
+-import { logger } from './util/logger'
+-
+-import type { AgentState } from '@codebuff/common/types/session-state'
+-import type { ProjectFileContext } from '@codebuff/common/util/file'
+-import type { WebSocket } from 'ws'
+-
+-export interface AsyncAgentInfo {
+-  agentState: AgentState
+-  sessionId: string
+-  userId: string
+-  fingerprintId: string
+-  userInputId: string
+-  ws: WebSocket
+-  fileContext: ProjectFileContext
+-  startTime: Date
+-  status: 'running' | 'completed' | 'failed' | 'cancelled'
+-  promise?: Promise<{ agentState: AgentState; hasEndTurn?: boolean }>
+-}
+-
+-export interface AsyncAgentMessage {
+-  fromAgentId: string
+-  toAgentId: string
+-  prompt: string
+-  params?: Record<string, any>
+-  timestamp: Date
+-}
+-
+-/**
+- * Manages asynchronous agent spawning and communication
+- */
+-export class AsyncAgentManager {
+-  private agents = new Map<string, AsyncAgentInfo>()
+-  private messageQueues = new Map<string, AsyncAgentMessage[]>()
+-  private sessionAgents = new Map<string, Set<string>>() // sessionId -> agentIds
+-
+-  /**
+-   * Register a new agent
+-   */
+-  registerAgent(agentInfo: AsyncAgentInfo): void {
+-    const { agentState, sessionId } = agentInfo
+-    const { agentId, agentType } = agentState
+-    this.agents.set(agentId, agentInfo)
+-
+-    // Track agents by session for cleanup
+-    if (!this.sessionAgents.has(sessionId)) {
+-      this.sessionAgents.set(sessionId, new Set())
+-    }
+-    this.sessionAgents.get(sessionId)!.add(agentId)
+-  }
+-
+-  /**
+-   * Update agent state and status
+-   */
+-  updateAgentState(
+-    agentState: AgentState,
+-    status: AsyncAgentInfo['status'],
+-  ): void {
+-    const agent = this.agents.get(agentState.agentId)
+-    if (agent) {
+-      agent.status = status
+-      agent.agentState = agentState
+-    }
+-  }
+-
+-  /**
+-   * Get agent info by ID
+-   */
+-  getAgent(agentId: string): AsyncAgentInfo | undefined {
+-    return this.agents.get(agentId)
+-  }
+-
+-  /**
+-   * Get all agents for a session
+-   */
+-  getSessionAgents(sessionId: string): AsyncAgentInfo[] {
+-    const agentIds = this.sessionAgents.get(sessionId) || new Set()
+-    return Array.from(agentIds)
+-      .map((id) => this.agents.get(id))
+-      .filter((agent): agent is AsyncAgentInfo => agent !== undefined)
+-  }
+-
+-  /**
+-   * Get child agents of a parent
+-   */
+-  getChildAgents(parentAgentId: string): AsyncAgentInfo[] {
+-    return Array.from(this.agents.values()).filter(
+-      (agent) => agent.agentState.parentId === parentAgentId,
+-    )
+-  }
+-
+-  /**
+-   * Check if agent has running children
+-   */
+-  hasRunningChildren(agentId: string): boolean {
+-    return this.getChildAgents(agentId).some(
+-      (child) => child.status === 'running',
+-    )
+-  }
+-
+-  /**
+-   * Send message to an agent and trigger execution if not running
+-   */
+-  sendMessage(message: AsyncAgentMessage): void {
+-    const queue = this.messageQueues.get(message.toAgentId) || []
+-    queue.push(message)
+-    this.messageQueues.set(message.toAgentId, queue)
+-
+-    logger.debug(
+-      {
+-        fromAgentId: message.fromAgentId,
+-        toAgentId: message.toAgentId,
+-        prompt: message.prompt.slice(0, 50) + '...',
+-      },
+-      'Queued message for async agent',
+-    )
+-
+-    // Trigger agent execution if not currently running (fire and forget)
+-    this.triggerAgentIfIdle(message.toAgentId).catch((error) => {
+-      logger.error(
+-        { agentId: message.toAgentId, error },
+-        'Failed to trigger agent',
+-      )
+-    })
+-  }
+-
+-  /**
+-   * Trigger agent execution if it's not currently running
+-   */
+-  private async triggerAgentIfIdle(agentId: string): Promise<void> {
+-    const agent = this.agents.get(agentId)
+-    if (!agent) {
+-      logger.debug(
+-        { agentId },
+-        'Agent not found in async manager - may be a parent agent that will be triggered by normal agent loop',
+-      )
+-      return
+-    }
+-
+-    // Atomic check and update to prevent race conditions
+-    if (agent.status === 'running') {
+-      return // Already running, nothing to do
+-    }
+-
+-    logger.debug({ agentId }, 'Triggering idle agent due to new message')
+-
+-    const { ws, userId, sessionId, userInputId } = agent
+-
+-    let agentPromise: Promise<{ agentState: AgentState; hasEndTurn?: boolean }>
+-    try {
+-      if (agent.agentState.agentId === 'main-agent') {
+-        // Dynamic import to avoid circular dependency
+-        const { callMainPrompt } = await import('./websockets/websocket-action')
+-        const mainAgentPromise = callMainPrompt(
+-          ws,
+-          {
+-            type: 'prompt',
+-            prompt: undefined,
+-            promptId: userInputId,
+-            fingerprintId: agent.fingerprintId,
+-            costMode: 'normal',
+-            agentId: agent.agentState.agentType!,
+-            sessionState: {
+-              ...agent.agentState,
+-              fileContext: agent.fileContext,
+-              mainAgentState: agent.agentState,
+-            },
+-            toolResults: [],
+-          },
+-          {
+-            userId,
+-            promptId: userInputId,
+-            clientSessionId: sessionId,
+-          },
+-        )
+-        agentPromise = mainAgentPromise.then(({ sessionState }) => ({
+-          agentState: sessionState.mainAgentState,
+-          hasEndTurn: true,
+-        }))
+-      } else {
+-        // Import loopAgentSteps dynamically to avoid circular dependency
+-        const { loopAgentSteps } = await import('./run-agent-step')
+-        const { agentTemplates: localAgentTemplates } =
+-          assembleLocalAgentTemplates(agent.fileContext)
+-
+-        agentPromise = loopAgentSteps(ws, {
+-          userInputId,
+-          prompt: undefined, // No initial prompt, will get messages from queue
+-          params: undefined,
+-          agentType: agent.agentState.agentType!,
+-          agentState: agent.agentState,
+-          fingerprintId: agent.fingerprintId,
+-          fileContext: agent.fileContext,
+-          localAgentTemplates,
+-          userId: agent.userId,
+-          clientSessionId: sessionId,
+-          onResponseChunk: () => {}, // Async agents don't stream to parent
+-        })
+-      }
+-      // Store the promise and handle completion
+-      agent.promise = agentPromise
+-      await agentPromise
+-      agent.promise = undefined
+-
+-      logger.debug(
+-        { agentId },
+-        'Agent completed execution after message trigger',
+-      )
+-    } catch (error) {
+-      // Reset status to allow retry and clean up promise
+-      agent.status = 'failed' // Allow retry by setting to completed
+-      agent.promise = undefined
+-      logger.error(
+-        { agentId, error },
+-        'Agent failed during message-triggered execution',
+-      )
+-    }
+-  }
+-
+-  /**
+-   * Get pending messages for an agent, without clearing them.
+-   */
+-  getMessages(agentId: string): AsyncAgentMessage[] {
+-    return [...(this.messageQueues.get(agentId) || [])]
+-  }
+-
+-  /**
+-   * Retrieve pending messages for an agent, and clear them.
+-   */
+-  getAndClearMessages(agentId: string): AsyncAgentMessage[] {
+-    const messages = this.messageQueues.get(agentId) || []
+-    this.messageQueues.set(agentId, []) // Clear queue after reading
+-    return messages
+-  }
+-
+-  /**
+-   * Remove agent and cleanup
+-   */
+-  removeAgent(agentId: string): void {
+-    const agent = this.agents.get(agentId)
+-    if (agent) {
+-      // Remove from session tracking
+-      const sessionAgents = this.sessionAgents.get(agent.sessionId)
+-      if (sessionAgents) {
+-        sessionAgents.delete(agentId)
+-        if (sessionAgents.size === 0) {
+-          this.sessionAgents.delete(agent.sessionId)
+-        }
+-      }
+-
+-      // Clear message queue
+-      this.messageQueues.delete(agentId)
+-
+-      // Remove agent
+-      this.agents.delete(agentId)
+-    }
+-  }
+-
+-  /**
+-   * Cleanup all agents for a session (e.g., on disconnect)
+-   */
+-  cleanupSession(sessionId: string): void {
+-    const agentIds = this.sessionAgents.get(sessionId) || new Set()
+-
+-    for (const agentId of agentIds) {
+-      const agent = this.agents.get(agentId)
+-      if (agent && agent.status === 'running') {
+-        agent.status = 'cancelled'
+-        // Note: We don't terminate the WebSocket here as it might be shared
+-        // The actual cleanup should happen in the agent execution loop
+-      }
+-      this.removeAgent(agentId)
+-    }
+-
+-    // logger.debug(
+-    //   { sessionId, agentCount: agentIds.size },
+-    //   'Cleaned up session agents',
+-    // )
+-  }
+-
+-  /**
+-   * Cleanup all agents associated with a specific user input ID
+-   */
+-  cleanupUserInputAgents(userInputId: string): void {
+-    const agentsToCleanup: string[] = []
+-
+-    // Find all agents with the matching userInputId
+-    for (const [agentId, agent] of this.agents.entries()) {
+-      if (agent.userInputId.startsWith(userInputId)) {
+-        agentsToCleanup.push(agentId)
+-      }
+-    }
+-
+-    // Cancel and remove the agents
+-    for (const agentId of agentsToCleanup) {
+-      const agent = this.agents.get(agentId)
+-      if (agent && agent.status === 'running') {
+-        agent.status = 'cancelled'
+-        // Note: We don't terminate the WebSocket here as it might be shared
+-        // The actual cleanup should happen in the agent execution loop
+-      }
+-      this.removeAgent(agentId)
+-    }
+-
+-    logger.debug(
+-      { userInputId, agentCount: agentsToCleanup.length },
+-      'Cleaned up agents for user input ID',
+-    )
+-  }
+-
+-  /**
+-   * Get all running agents
+-   */
+-  getRunningAgents(): AsyncAgentInfo[] {
+-    return Array.from(this.agents.values()).filter(
+-      (agent) => agent.status === 'running',
+-    )
+-  }
+-
+-  /**
+-   * Get agent statistics
+-   */
+-  getStats(): {
+-    totalAgents: number
+-    runningAgents: number
+-    completedAgents: number
+-    failedAgents: number
+-    cancelledAgents: number
+-    activeSessions: number
+-  } {
+-    const agents = Array.from(this.agents.values())
+-    return {
+-      totalAgents: agents.length,
+-      runningAgents: agents.filter((a) => a.status === 'running').length,
+-      completedAgents: agents.filter((a) => a.status === 'completed').length,
+-      failedAgents: agents.filter((a) => a.status === 'failed').length,
+-      cancelledAgents: agents.filter((a) => a.status === 'cancelled').length,
+-      activeSessions: this.sessionAgents.size,
+-    }
+-  }
+-}
+-
+-// Global instance
+-export const asyncAgentManager = new AsyncAgentManager()
+diff --git a/backend/src/run-agent-step.ts b/backend/src/run-agent-step.ts
+index bf934388c..db3ac6500 100644
+--- a/backend/src/run-agent-step.ts
++++ b/backend/src/run-agent-step.ts
+@@ -11,7 +11,6 @@ import { getErrorObject } from '@codebuff/common/util/error'
+ import { cloneDeep } from 'lodash'
+ 
+ import { addAgentStep, finishAgentRun, startAgentRun } from './agent-run'
+-import { asyncAgentManager } from './async-agent-manager'
+ import { checkLiveUserInput } from './live-user-inputs'
+ import { getMCPToolData } from './mcp/util'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+@@ -169,27 +168,6 @@ export const runAgentStep = async (
+     }
+   }
+ 
+-  if (ASYNC_AGENTS_ENABLED) {
+-    // Register this agent in the async manager so it can receive messages
+-    const isRegistered = asyncAgentManager.getAgent(agentState.agentId)
+-    if (!isRegistered && userId) {
+-      asyncAgentManager.registerAgent({
+-        agentState,
+-        sessionId: clientSessionId,
+-        userId,
+-        fingerprintId,
+-        userInputId,
+-        ws,
+-        fileContext,
+-        startTime: new Date(),
+-        status: 'running',
+-      })
+-    } else {
+-      // Update status to running for existing agents
+-      asyncAgentManager.updateAgentState(agentState, 'running')
+-    }
+-  }
+-
+   const agentTemplate = await getAgentTemplate(agentType, localAgentTemplates)
+   if (!agentTemplate) {
+     throw new Error(
+@@ -386,11 +364,6 @@ export const runAgentStep = async (
+     agentContext: newAgentContext,
+   }
+ 
+-  // Mark agent as completed if it should end turn
+-  if (ASYNC_AGENTS_ENABLED && shouldEndTurn) {
+-    asyncAgentManager.updateAgentState(agentState, 'completed')
+-  }
+-
+   logger.debug(
+     {
+       iteration: iterationNum,
+@@ -617,14 +590,6 @@ export const loopAgentSteps = async (
+         }
+       }
+ 
+-      if (ASYNC_AGENTS_ENABLED) {
+-        const hasMessages =
+-          asyncAgentManager.getMessages(agentState.agentId).length > 0
+-        if (hasMessages) {
+-          shouldEndTurn = false
+-        }
+-      }
+-
+       // Check if output is required but missing
+       if (
+         agentTemplate.outputSchema &&
+diff --git a/backend/src/tools/definitions/list.ts b/backend/src/tools/definitions/list.ts
+index 34f35c0a3..f3d0a33d2 100644
+--- a/backend/src/tools/definitions/list.ts
++++ b/backend/src/tools/definitions/list.ts
+@@ -15,7 +15,6 @@ import { runTerminalCommandTool } from './tool/run-terminal-command'
+ import { setMessagesTool } from './tool/set-messages'
+ import { setOutputTool } from './tool/set-output'
+ import { spawnAgentsTool } from './tool/spawn-agents'
+-import { spawnAgentsAsyncTool } from './tool/spawn-agents-async'
+ import { spawnAgentInlineTool } from './tool/spawn-agent-inline'
+ import { strReplaceTool } from './tool/str-replace'
+ import { thinkDeeplyTool } from './tool/think-deeply'
+@@ -43,7 +42,6 @@ const toolDescriptions = {
+   set_messages: setMessagesTool,
+   set_output: setOutputTool,
+   spawn_agents: spawnAgentsTool,
+-  spawn_agents_async: spawnAgentsAsyncTool,
+   spawn_agent_inline: spawnAgentInlineTool,
+   str_replace: strReplaceTool,
+   think_deeply: thinkDeeplyTool,
+diff --git a/backend/src/tools/definitions/tool/spawn-agents-async.ts b/backend/src/tools/definitions/tool/spawn-agents-async.ts
+deleted file mode 100644
+index 76ea436b2..000000000
+--- a/backend/src/tools/definitions/tool/spawn-agents-async.ts
++++ /dev/null
+@@ -1,30 +0,0 @@
+-import { getToolCallString } from '@codebuff/common/tools/utils'
+-
+-import type { ToolDescription } from '../tool-def-type'
+-
+-const toolName = 'spawn_agents_async'
+-export const spawnAgentsAsyncTool = {
+-  toolName,
+-  description: `
+-Use this tool to spawn agents asynchronously to help you complete the user request. Unlike spawn_agents, this tool does not wait for the agents to complete and allows the parent agent to continue execution. The spawned agents can continue to run even if the parent agent ends its turn.
+-
+-The spawned agents run independently. The parent agent can end its turn without waiting for the async agents to complete.
+-
+-Prefer to use spawn_agents unless you really need this ability to spawn asynchronous agents.
+-
+-Example:
+-${getToolCallString(toolName, {
+-  agents: [
+-    {
+-      agent_type: 'file-picker',
+-      prompt: 'Find files related to authentication',
+-    },
+-    {
+-      agent_type: 'researcher',
+-      prompt: 'Research best practices for user authentication',
+-      params: { keywords: ['authentication', 'nextjs', 'auth0'] },
+-    },
+-  ],
+-})}
+-    `.trim(),
+-} satisfies ToolDescription
+diff --git a/backend/src/tools/handlers/list.ts b/backend/src/tools/handlers/list.ts
+index d959d8bb2..b7f62bf93 100644
+--- a/backend/src/tools/handlers/list.ts
++++ b/backend/src/tools/handlers/list.ts
+@@ -13,7 +13,6 @@ import { handleRunTerminalCommand } from './tool/run-terminal-command'
+ import { handleSetMessages } from './tool/set-messages'
+ import { handleSetOutput } from './tool/set-output'
+ import { handleSpawnAgents } from './tool/spawn-agents'
+-import { handleSpawnAgentsAsync } from './tool/spawn-agents-async'
+ import { handleSpawnAgentInline } from './tool/spawn-agent-inline'
+ import { handleStrReplace } from './tool/str-replace'
+ import { handleThinkDeeply } from './tool/think-deeply'
+@@ -49,7 +48,6 @@ export const codebuffToolHandlers = {
+   set_messages: handleSetMessages,
+   set_output: handleSetOutput,
+   spawn_agents: handleSpawnAgents,
+-  spawn_agents_async: handleSpawnAgentsAsync,
+   spawn_agent_inline: handleSpawnAgentInline,
+   str_replace: handleStrReplace,
+   think_deeply: handleThinkDeeply,
+diff --git a/backend/src/tools/handlers/tool/spawn-agents-async.ts b/backend/src/tools/handlers/tool/spawn-agents-async.ts
+deleted file mode 100644
+index 68906e9f7..000000000
+--- a/backend/src/tools/handlers/tool/spawn-agents-async.ts
++++ /dev/null
+@@ -1,286 +0,0 @@
+-import { ASYNC_AGENTS_ENABLED } from '@codebuff/common/old-constants'
+-
+-import {
+-  validateSpawnState,
+-  validateAndGetAgentTemplate,
+-  validateAgentInput,
+-  createAgentState,
+-  logAgentSpawn,
+-  executeSubagent,
+-} from './spawn-agent-utils'
+-import { handleSpawnAgents } from './spawn-agents'
+-import { asyncAgentManager } from '../../../async-agent-manager'
+-import { logger } from '../../../util/logger'
+-
+-import type { CodebuffToolHandlerFunction } from '../handler-function-type'
+-import type { SendSubagentChunk } from './spawn-agents'
+-import type {
+-  CodebuffToolCall,
+-  CodebuffToolOutput,
+-} from '@codebuff/common/tools/list'
+-import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+-import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+-import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+-import type { AgentState } from '@codebuff/common/types/session-state'
+-import type { ProjectFileContext } from '@codebuff/common/util/file'
+-import type { WebSocket } from 'ws'
+-
+-type ToolName = 'spawn_agents_async'
+-export const handleSpawnAgentsAsync = ((params: {
+-  previousToolCallFinished: Promise<void>
+-  toolCall: CodebuffToolCall<ToolName>
+-
+-  fileContext: ProjectFileContext
+-  clientSessionId: string
+-  userInputId: string
+-  writeToClient: (chunk: string | PrintModeEvent) => void
+-
+-  getLatestState: () => { messages: Message[] }
+-  state: {
+-    ws?: WebSocket
+-    fingerprintId?: string
+-    userId?: string
+-    agentTemplate?: AgentTemplate
+-    localAgentTemplates?: Record<string, AgentTemplate>
+-    sendSubagentChunk?: SendSubagentChunk
+-    messages?: Message[]
+-    agentState?: AgentState
+-    system?: string
+-  }
+-}): { result: Promise<CodebuffToolOutput<ToolName>>; state: {} } => {
+-  if (!ASYNC_AGENTS_ENABLED) {
+-    return handleSpawnAgents({
+-      ...params,
+-      toolCall: {
+-        ...params.toolCall,
+-        toolName: 'spawn_agents',
+-      },
+-    })
+-  }
+-
+-  const {
+-    previousToolCallFinished,
+-    toolCall,
+-
+-    fileContext,
+-    clientSessionId,
+-    userInputId,
+-    getLatestState,
+-    state,
+-  } = params
+-  const { agents } = toolCall.input
+-  const {
+-    ws,
+-    fingerprintId,
+-    userId,
+-    agentTemplate: parentAgentTemplate,
+-    localAgentTemplates,
+-    agentState,
+-  } = validateSpawnState(state, 'spawn_agents_async')
+-  const { sendSubagentChunk, system: parentSystemPrompt } = state
+-
+-  if (!sendSubagentChunk) {
+-    throw new Error(
+-      'Internal error for spawn_agents_async: Missing sendSubagentChunk in state',
+-    )
+-  }
+-
+-  const triggerSpawnAgentsAsync: () => Promise<
+-    CodebuffToolOutput<ToolName>[0]['value']
+-  > = async () => {
+-    const results: CodebuffToolOutput<ToolName>[0]['value'] = []
+-
+-    // Validate and spawn agents asynchronously
+-    for (const { agent_type: agentTypeStr, prompt, params } of agents) {
+-      try {
+-        const { agentTemplate, agentType } = await validateAndGetAgentTemplate(
+-          agentTypeStr,
+-          parentAgentTemplate,
+-          localAgentTemplates,
+-        )
+-
+-        validateAgentInput(agentTemplate, agentType, prompt, params)
+-
+-        const subAgentMessages: Message[] = []
+-        if (agentTemplate.includeMessageHistory) {
+-          subAgentMessages.push(...getLatestState().messages)
+-        }
+-
+-        const asyncAgentState = createAgentState(
+-          agentType,
+-          agentTemplate,
+-          agentState,
+-          subAgentMessages,
+-          {},
+-        )
+-
+-        logAgentSpawn(
+-          agentTemplate,
+-          agentType,
+-          asyncAgentState.agentId,
+-          asyncAgentState.parentId,
+-          prompt,
+-          params,
+-        )
+-
+-        // Start the agent asynchronously
+-        const agentPromise = (async () => {
+-          try {
+-            const result = await executeSubagent({
+-              ws,
+-              userInputId: `${userInputId}-async-${agentType}-${asyncAgentState.agentId}`,
+-              prompt: prompt || '',
+-              params,
+-              agentTemplate,
+-              parentAgentState: agentState,
+-              agentState: asyncAgentState,
+-              fingerprintId,
+-              fileContext,
+-              localAgentTemplates,
+-              userId,
+-              clientSessionId,
+-              parentSystemPrompt,
+-              onResponseChunk: (chunk: string | PrintModeEvent) => {
+-                if (typeof chunk !== 'string') {
+-                  return
+-                }
+-                sendSubagentChunk({
+-                  userInputId,
+-                  agentId: asyncAgentState.agentId,
+-                  agentType,
+-                  chunk,
+-                  prompt,
+-                })
+-              },
+-            })
+-
+-            // Send completion message to parent if agent has appropriate output mode
+-            if (asyncAgentState.parentId) {
+-              const { outputMode } = agentTemplate
+-              if (
+-                outputMode === 'last_message' ||
+-                outputMode === 'all_messages'
+-              ) {
+-                try {
+-                  let messageContent = ''
+-
+-                  if (outputMode === 'last_message') {
+-                    const assistantMessages =
+-                      result.agentState.messageHistory.filter(
+-                        (message) => message.role === 'assistant',
+-                      )
+-                    const lastAssistantMessage =
+-                      assistantMessages[assistantMessages.length - 1]
+-                    if (lastAssistantMessage) {
+-                      if (typeof lastAssistantMessage.content === 'string') {
+-                        messageContent = lastAssistantMessage.content
+-                      } else {
+-                        messageContent = JSON.stringify(
+-                          lastAssistantMessage.content,
+-                          null,
+-                          2,
+-                        )
+-                      }
+-                    } else {
+-                      messageContent = 'No response from agent'
+-                    }
+-                  } else if (outputMode === 'all_messages') {
+-                    // Remove the first message, which includes the previous conversation history
+-                    const agentMessages =
+-                      result.agentState.messageHistory.slice(1)
+-                    messageContent = `Agent messages:\n\n${JSON.stringify(agentMessages, null, 2)}`
+-                  }
+-
+-                  // Send the message to the parent agent
+-                  const { asyncAgentManager } = await import(
+-                    '../../../async-agent-manager'
+-                  )
+-                  asyncAgentManager.sendMessage({
+-                    fromAgentId: asyncAgentState.agentId,
+-                    toAgentId: asyncAgentState.parentId,
+-                    prompt: `Agent ${agentType} completed with output:\n\n${messageContent}`,
+-                    params: {
+-                      agentType,
+-                      agentId: asyncAgentState.agentId,
+-                      outputMode,
+-                      completed: true,
+-                    },
+-                    timestamp: new Date(),
+-                  })
+-
+-                  logger.debug(
+-                    {
+-                      agentId: asyncAgentState.agentId,
+-                      parentId: asyncAgentState.parentId,
+-                      agentType,
+-                      outputMode,
+-                      messageContent,
+-                    },
+-                    'Sent completion message to parent agent',
+-                  )
+-                } catch (error) {
+-                  logger.error(
+-                    {
+-                      agentId: asyncAgentState.agentId,
+-                      parentId: asyncAgentState.parentId,
+-                      error,
+-                    },
+-                    'Failed to send completion message to parent agent',
+-                  )
+-                }
+-              }
+-            }
+-
+-            return result
+-          } catch (error) {
+-            logger.error(
+-              { agentId: asyncAgentState.agentId, error },
+-              'Async agent failed',
+-            )
+-            throw error
+-          }
+-        })()
+-
+-        // Store the promise in the agent info
+-        const agentInfo = asyncAgentManager.getAgent(asyncAgentState.agentId)
+-        if (agentInfo) {
+-          agentInfo.promise = agentPromise
+-        }
+-
+-        results.push({
+-          agentType: agentTypeStr,
+-          success: true,
+-          agentId: asyncAgentState.agentId,
+-        })
+-      } catch (error) {
+-        const errorMessage =
+-          error instanceof Error ? error.message : String(error)
+-        results.push({
+-          agentType: agentTypeStr,
+-          success: false,
+-          errorMessage,
+-        })
+-        logger.error(
+-          { agentType: agentTypeStr, error },
+-          'Failed to spawn async agent',
+-        )
+-        // Continue with other agents even if one fails
+-      }
+-    }
+-
+-    return results
+-  }
+-
+-  return {
+-    result: (async () => {
+-      await previousToolCallFinished
+-      return [
+-        {
+-          type: 'json',
+-          value: await triggerSpawnAgentsAsync(),
+-        },
+-      ]
+-    })(),
+-    state: {},
+-  }
+-}) satisfies CodebuffToolHandlerFunction<ToolName>
+diff --git a/backend/src/websockets/server.ts b/backend/src/websockets/server.ts
+index 40bca36c5..2b822da29 100644
+--- a/backend/src/websockets/server.ts
++++ b/backend/src/websockets/server.ts
+@@ -3,7 +3,6 @@ import { CLIENT_MESSAGE_SCHEMA } from '@codebuff/common/websockets/websocket-sch
+ import { isError } from 'lodash'
+ import { WebSocketServer } from 'ws'
+ 
+-import { asyncAgentManager } from '../async-agent-manager'
+ import { setSessionConnected } from '../live-user-inputs'
+ import { Switchboard } from './switchboard'
+ import { onWebsocketAction } from './websocket-action'
+@@ -143,11 +142,6 @@ export function listen(server: HttpServer, path: string) {
+       // Mark session as disconnected to stop all agents
+       setSessionConnected(clientSessionId, false)
+ 
+-      if (ASYNC_AGENTS_ENABLED) {
+-        // Cleanup async agents for this session
+-        asyncAgentManager.cleanupSession(clientSessionId)
+-      }
+-
+       SWITCHBOARD.disconnect(ws)
+     })
+     ws.on('error', (err: Error) => {
+diff --git a/backend/src/websockets/websocket-action.ts b/backend/src/websockets/websocket-action.ts
+index 9fc93c065..0814b3286 100644
+--- a/backend/src/websockets/websocket-action.ts
++++ b/backend/src/websockets/websocket-action.ts
+@@ -12,7 +12,6 @@ import { ensureEndsWithNewline } from '@codebuff/common/util/file'
+ import { generateCompactId } from '@codebuff/common/util/string'
+ import { eq } from 'drizzle-orm'
+ 
+-import { asyncAgentManager } from '../async-agent-manager'
+ import {
+   cancelUserInput,
+   checkLiveUserInput,
+@@ -319,9 +318,6 @@ const onCancelUserInput = async ({
+     return
+   }
+   cancelUserInput(userId, promptId)
+-  if (ASYNC_AGENTS_ENABLED) {
+-    asyncAgentManager.cleanupUserInputAgents(promptId)
+-  }
+ }
+ 
+ /**
+diff --git a/common/src/tools/constants.ts b/common/src/tools/constants.ts
+index d2d8f14fc..6334e3390 100644
+--- a/common/src/tools/constants.ts
++++ b/common/src/tools/constants.ts
+@@ -33,7 +33,6 @@ export const toolNames = [
+   'set_messages',
+   'set_output',
+   'spawn_agents',
+-  'spawn_agents_async',
+   'spawn_agent_inline',
+   'str_replace',
+   'think_deeply',
+@@ -59,7 +58,6 @@ export const publishedTools = [
+   'think_deeply',
+   'web_search',
+   'write_file',
+-  // 'spawn_agents_async',
+   // 'spawn_agent_inline',
+ ] as const
+ 
+diff --git a/common/src/tools/list.ts b/common/src/tools/list.ts
+index e7d10e7cd..9211c1a04 100644
+--- a/common/src/tools/list.ts
++++ b/common/src/tools/list.ts
+@@ -17,7 +17,6 @@ import { setMessagesParams } from './params/tool/set-messages'
+ import { setOutputParams } from './params/tool/set-output'
+ import { spawnAgentInlineParams } from './params/tool/spawn-agent-inline'
+ import { spawnAgentsParams } from './params/tool/spawn-agents'
+-import { spawnAgentsAsyncParams } from './params/tool/spawn-agents-async'
+ import { strReplaceParams } from './params/tool/str-replace'
+ import { thinkDeeplyParams } from './params/tool/think-deeply'
+ import { updateSubgoalParams } from './params/tool/update-subgoal'
+@@ -52,7 +51,6 @@ export const $toolParams = {
+   set_messages: setMessagesParams,
+   set_output: setOutputParams,
+   spawn_agents: spawnAgentsParams,
+-  spawn_agents_async: spawnAgentsAsyncParams,
+   spawn_agent_inline: spawnAgentInlineParams,
+   str_replace: strReplaceParams,
+   think_deeply: thinkDeeplyParams,
+diff --git a/common/src/tools/params/tool/spawn-agents-async.ts b/common/src/tools/params/tool/spawn-agents-async.ts
+deleted file mode 100644
+index ed251cb8d..000000000
+--- a/common/src/tools/params/tool/spawn-agents-async.ts
++++ /dev/null
+@@ -1,46 +0,0 @@
+-import z from 'zod/v4'
+-
+-import { spawnAgentsOutputSchema } from './spawn-agents'
+-
+-import type { $ToolParams } from '../../constants'
+-
+-const toolName = 'spawn_agents_async'
+-const endsAgentStep = false
+-export const spawnAgentsAsyncParams = {
+-  toolName,
+-  endsAgentStep,
+-  parameters: z.object({
+-    agents: z
+-      .object({
+-        agent_type: z.string().describe('Agent to spawn'),
+-        prompt: z.string().optional().describe('Prompt to send to the agent'),
+-        params: z
+-          .record(z.string(), z.any())
+-          .optional()
+-          .describe('Parameters object for the agent (if any)'),
+-      })
+-      .array(),
+-  }),
+-  outputs: z.tuple([
+-    z.object({
+-      type: z.literal('json'),
+-      value: z.union([
+-        z
+-          .discriminatedUnion('success', [
+-            z.object({
+-              agentType: z.string(),
+-              success: z.literal(true),
+-              agentId: z.string(),
+-            }),
+-            z.object({
+-              agentType: z.string(),
+-              success: z.literal(false),
+-              errorMessage: z.string(),
+-            }),
+-          ])
+-          .array(),
+-        spawnAgentsOutputSchema,
+-      ]),
+-    }),
+-  ]),
+-} satisfies $ToolParams
+diff --git a/npm-app/src/utils/tool-renderers.ts b/npm-app/src/utils/tool-renderers.ts
+index 57207b5c6..1db6ed748 100644
+--- a/npm-app/src/utils/tool-renderers.ts
++++ b/npm-app/src/utils/tool-renderers.ts
+@@ -310,18 +310,6 @@ export const toolRenderers: Record<ToolName, ToolCallRenderer> = {
+       }
+     },
+   },
+-  spawn_agents_async: {
+-    onToolStart: (toolName) => {
+-      return '\n\n' + gray(`[${bold('Spawn Agents')}]`) + '\n'
+-    },
+-    onParamEnd: renderSpawnAgentsParam,
+-    onToolEnd: () => {
+-      return () => {
+-        Spinner.get().start('Agents running...')
+-        return '\n'
+-      }
+-    },
+-  },
+   spawn_agent_inline: {
+     // Don't render anything
+   },

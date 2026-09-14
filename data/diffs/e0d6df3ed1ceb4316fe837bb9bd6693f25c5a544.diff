@@ -1,0 +1,203 @@
+diff --git a/.agents/file-explorer/code-searcher.ts b/.agents/file-explorer/code-searcher.ts
+index 5c0d9ba75..df57f64ee 100644
+--- a/.agents/file-explorer/code-searcher.ts
++++ b/.agents/file-explorer/code-searcher.ts
+@@ -1,3 +1,4 @@
++import { JSONValue } from 'types/util-types'
+ import { publisher } from '../constants'
+ 
+ import type { SecretAgentDefinition } from '../types/secret-agent-definition'
+@@ -51,18 +52,19 @@ const codeSearcher: SecretAgentDefinition = {
+     'Mechanically runs multiple code search queries (using ripgrep line-oriented search) and returns all results',
+   model: 'anthropic/claude-sonnet-4.5',
+   publisher,
+-  outputMode: 'all_messages',
+   includeMessageHistory: false,
+-  toolNames: ['code_search'],
++  toolNames: ['code_search', 'set_output'],
+   spawnableAgents: [],
+   inputSchema: {
+     params: paramsSchema,
+   },
++  outputMode: 'structured_output',
+   handleSteps: function* ({ params }) {
+     const searchQueries: SearchQuery[] = params?.searchQueries ?? []
+ 
++    const toolResults: JSONValue[] = []
+     for (const query of searchQueries) {
+-      yield {
++      const { toolResult } = yield {
+         toolName: 'code_search',
+         input: {
+           pattern: query.pattern,
+@@ -71,6 +73,20 @@ const codeSearcher: SecretAgentDefinition = {
+           maxResults: query.maxResults,
+         },
+       }
++      if (toolResult) {
++        toolResults.push(
++          ...toolResult
++            .filter((result) => result.type === 'json')
++            .map((result) => result.value),
++        )
++      }
++    }
++
++    yield {
++      toolName: 'set_output',
++      input: {
++        results: toolResults,
++      },
+     }
+   },
+ }
+diff --git a/common/src/util/format-code-search.ts b/common/src/util/format-code-search.ts
+new file mode 100644
+index 000000000..a9fe0b785
+--- /dev/null
++++ b/common/src/util/format-code-search.ts
+@@ -0,0 +1,60 @@
++/**
++ * Formats code search output to group matches by file.
++ *
++ * Input format: ./file.ts:line content
++ * Output format:
++ * ./file.ts:
++ * line content
++ * another line content
++ * yet another line content
++ *
++ * (double newline between distinct files)
++ *
++ * @param stdout The raw stdout from ripgrep
++ * @returns Formatted output with matches grouped by file
++ */
++export function formatCodeSearchOutput(stdout: string): string {
++  const lines = stdout.split('\n')
++  const formatted: string[] = []
++  let currentFile: string | null = null
++
++  for (const line of lines) {
++    if (!line.trim()) {
++      formatted.push(line)
++      continue
++    }
++
++    // Find the first colon to separate file path from content
++    const colonIndex = line.indexOf(':')
++    if (colonIndex === -1) {
++      formatted.push(line)
++      continue
++    }
++
++    const filePath = line.substring(0, colonIndex)
++    const content = line.substring(colonIndex)
++
++    // Check if this is a new file (file paths don't start with whitespace)
++    if (filePath && !filePath.startsWith(' ') && !filePath.startsWith('\t')) {
++      if (filePath !== currentFile) {
++        // New file - add double newline before it (except for the first file)
++        if (currentFile !== null) {
++          formatted.push('')
++        }
++        currentFile = filePath
++        // Show file path with colon on its own line
++        formatted.push(filePath + ':')
++        // Show content without leading colon on next line
++        formatted.push(content.substring(1))
++      } else {
++        // Same file - just show content without leading colon
++        formatted.push(content.substring(1))
++      }
++    } else {
++      // Line doesn't match expected format, keep as-is
++      formatted.push(line)
++    }
++  }
++
++  return formatted.join('\n')
++}
+diff --git a/npm-app/src/tool-handlers.ts b/npm-app/src/tool-handlers.ts
+index 9084572c8..65bd701d7 100644
+--- a/npm-app/src/tool-handlers.ts
++++ b/npm-app/src/tool-handlers.ts
+@@ -10,6 +10,7 @@ import {
+   getProjectFileTree,
+ } from '@codebuff/common/project-file-tree'
+ import { truncateStringWithMessage } from '@codebuff/common/util/string'
++import { formatCodeSearchOutput } from '@codebuff/common/util/format-code-search'
+ import micromatch from 'micromatch'
+ import { cyan, green, red, yellow } from 'picocolors'
+ 
+@@ -371,9 +372,10 @@ export const handleCodeSearch: ToolHandler<'code_search'> = async (
+         }
+       }
+ 
+-      const previewResults = limitedLines.slice(0, 3)
+-      if (previewResults.length > 0) {
+-        console.log(previewResults.join('\n'))
++      const previewResults = limitedLines.slice(0, 3).join('\n')
++      if (previewResults) {
++        const formattedPreview = formatCodeSearchOutput(previewResults)
++        console.log(formattedPreview)
+         if (limitedLines.length > 3) {
+           console.log('...')
+         }
+@@ -408,7 +410,7 @@ export const handleCodeSearch: ToolHandler<'code_search'> = async (
+         limitedStdout += `\n\n[${truncationMessages.join('\n\n')}]`
+       }
+ 
+-      const finalStdout = limitedStdout
++      const finalStdout = formatCodeSearchOutput(limitedStdout)
+ 
+       const truncatedStdout = truncateStringWithMessage({
+         str: finalStdout,
+@@ -421,8 +423,7 @@ export const handleCodeSearch: ToolHandler<'code_search'> = async (
+       const result = {
+         stdout: truncatedStdout,
+         ...(truncatedStderr && { stderr: truncatedStderr }),
+-        ...(code !== null && { exitCode: code }),
+-        message: 'Code search completed',
++        message: code !== null ? `Exit code: ${code}` : '',
+       }
+       resolve([
+         {
+diff --git a/sdk/src/tools/code-search.ts b/sdk/src/tools/code-search.ts
+index e09b96290..c3efe58e4 100644
+--- a/sdk/src/tools/code-search.ts
++++ b/sdk/src/tools/code-search.ts
+@@ -1,6 +1,7 @@
+ import { spawn } from 'child_process'
+ import * as path from 'path'
+ 
++import { formatCodeSearchOutput } from '../../../common/src/util/format-code-search'
+ import { getBundledRgPath } from '../native/ripgrep'
+ 
+ import type { CodebuffToolOutput } from '../../../common/src/tools/list'
+@@ -62,13 +63,14 @@ export function codeSearch({
+       const lines = stdout.split('\n')
+       const limitedLines = lines.slice(0, maxResults)
+       const limitedStdout = limitedLines.join('\n')
++      const formattedStdout = formatCodeSearchOutput(limitedStdout)
+ 
+       // Add truncation message if results were limited
+       const finalStdout =
+         lines.length > maxResults
+-          ? limitedStdout +
++          ? formattedStdout +
+             `\n\n[Results limited to ${maxResults} of ${lines.length} total matches]`
+-          : limitedStdout
++          : formattedStdout
+ 
+       // Truncate output to prevent memory issues
+       const maxLength = 10000
+@@ -86,8 +88,7 @@ export function codeSearch({
+       const result = {
+         stdout: truncatedStdout,
+         ...(truncatedStderr && { stderr: truncatedStderr }),
+-        ...(code !== null && { exitCode: code }),
+-        message: 'Code search completed',
++        message: code !== null ? `Exit code: ${code}` : '',
+       }
+ 
+       resolve([

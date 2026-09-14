@@ -1,0 +1,312 @@
+diff --git a/backend/src/websockets/websocket-action.ts b/backend/src/websockets/websocket-action.ts
+index 5dc500cc0..528b1f092 100644
+--- a/backend/src/websockets/websocket-action.ts
++++ b/backend/src/websockets/websocket-action.ts
+@@ -13,13 +13,17 @@ const sendAction = (ws: WebSocket, action: ServerAction) => {
+ }
+ 
+ const onUserInput = async (
+-  { messages, fileContext }: Extract<ClientAction, { type: 'user-input' }>,
++  {
++    messages,
++    fileContext,
++    previousChanges,
++  }: Extract<ClientAction, { type: 'user-input' }>,
+   ws: WebSocket
+ ) => {
+   const lastMessage = messages[messages.length - 1]
+   if (typeof lastMessage.content === 'string')
+     console.log('Input:', lastMessage)
+-  const { changes, toolCall, response } = await mainPrompt(
++  const { toolCall, response, changes } = await mainPrompt(
+     ws,
+     messages,
+     fileContext,
+@@ -30,12 +34,7 @@ const onUserInput = async (
+       })
+   )
+ 
+-  if (changes.length > 0) {
+-    sendAction(ws, {
+-      type: 'change-files',
+-      changes,
+-    })
+-  }
++  const allChanges = [...previousChanges, ...changes]
+ 
+   if (toolCall) {
+     console.log('toolCall', toolCall.name, toolCall.input)
+@@ -43,6 +42,14 @@ const onUserInput = async (
+       type: 'tool-call',
+       response,
+       data: toolCall,
++      changes: allChanges,
++    })
++  } else {
++    console.log('response-complete')
++    sendAction(ws, {
++      type: 'response-complete',
++      response,
++      changes: allChanges,
+     })
+   }
+ }
+diff --git a/common/src/actions.ts b/common/src/actions.ts
+index 7788677eb..2c954b632 100644
+--- a/common/src/actions.ts
++++ b/common/src/actions.ts
+@@ -47,6 +47,7 @@ export const CLIENT_ACTIONS = {
+     type: z.literal('user-input'),
+     messages: z.array(MessageSchema),
+     fileContext: ProjectFileContextSchema,
++    previousChanges: CHANGES,
+   }),
+   readFilesResponse: z.object({
+     type: z.literal('read-files-response'),
+@@ -65,8 +66,9 @@ export const SERVER_ACTIONS = {
+     type: z.literal('response-chunk'),
+     chunk: z.string(),
+   }),
+-  changeFiles: z.object({
+-    type: z.literal('change-files'),
++  responseComplete: z.object({
++    type: z.literal('response-complete'),
++    response: z.string(),
+     changes: CHANGES,
+   }),
+   readFiles: z.object({
+@@ -77,11 +79,12 @@ export const SERVER_ACTIONS = {
+     type: z.literal('tool-call'),
+     response: z.string(),
+     data: ToolCallSchema,
++    changes: CHANGES,
+   }),
+ }
+ export const SERVER_ACTION_SCHEMA = z.union([
+   SERVER_ACTIONS.responseChunk,
+-  SERVER_ACTIONS.changeFiles,
++  SERVER_ACTIONS.responseComplete,
+   SERVER_ACTIONS.readFiles,
+   SERVER_ACTIONS.toolCall,
+ ])
+diff --git a/src/chat-client.ts b/src/chat-client.ts
+index 401600dd6..1ee6ff963 100644
+--- a/src/chat-client.ts
++++ b/src/chat-client.ts
+@@ -1,12 +1,7 @@
+ import { APIRealtimeClient } from 'common/websockets/websocket-client'
+-import {
+-  applyChanges,
+-  getFileBlocks,
+-  getFiles,
+-  getProjectFileContext,
+-} from './project-files'
++import { getFileBlocks, getFiles, getProjectFileContext } from './project-files'
+ import { ChatStorage } from './chat-storage'
+-import { Message } from 'common/actions'
++import { FileChanges, Message } from 'common/actions'
+ 
+ export class ChatClient {
+   private ws: APIRealtimeClient
+@@ -23,16 +18,8 @@ export class ChatClient {
+   }
+ 
+   private setupSubscriptions() {
+-    this.ws.subscribe('change-files', (a) => {
+-      const changesSuceeded = applyChanges(a.changes)
+-      for (const change of changesSuceeded) {
+-        const { filePath, old } = change
+-        console.log('>', old ? 'Updated' : 'Created', filePath)
+-      }
+-    })
+-
+     this.ws.subscribe('tool-call', (a) => {
+-      const { response, data } = a
++      const { response, changes, data } = a
+       const { id, name, input } = data
+ 
+       const assistantMessage: Message = {
+@@ -74,7 +61,7 @@ export class ChatClient {
+           toolResultMessage
+         )
+ 
+-        this.sendUserInput()
++        this.sendUserInput(changes)
+       }
+     })
+ 
+@@ -89,18 +76,47 @@ export class ChatClient {
+     })
+   }
+ 
+-  sendUserInput() {
++  sendUserInput(previousChanges: FileChanges) {
+     this.ws.sendAction({
+       type: 'user-input',
+       messages: this.chatStorage.getCurrentChat().messages,
+       fileContext: getProjectFileContext(),
++      previousChanges,
+     })
+   }
+ 
+-  subscribeToResponseChunks(callback: (chunk: string) => void) {
+-    return this.ws.subscribe('response-chunk', (a) => {
+-      const { chunk } = a
+-      callback(chunk)
++  subscribeToResponse(onChunk: (chunk: string) => void) {
++    let unsubscribe: () => void
++    const unsubscribeWrapper = () => {
++      unsubscribe()
++    }
++
++    const resolvePromise = new Promise<{
++      response: string
++      changes: FileChanges
++    }>((resolve) => {
++      const unsubscribeChunks = this.ws.subscribe('response-chunk', (a) => {
++        const { chunk } = a
++        onChunk(chunk)
++      })
++
++      const unsubscribeComplete = this.ws.subscribe(
++        'response-complete',
++        (a) => {
++          unsubscribeChunks()
++          unsubscribeComplete()
++          resolve(a)
++        }
++      )
++      unsubscribe = () => {
++        unsubscribeChunks()
++        unsubscribeComplete()
++      }
+     })
++
++    return {
++      result: resolvePromise,
++      unsubscribe: unsubscribeWrapper,
++    }
+   }
+ }
+diff --git a/src/cli.ts b/src/cli.ts
+index f99595c3c..e294d4541 100644
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -1,8 +1,11 @@
++import { uniqBy } from 'lodash'
++
+ import { ChatStorage } from './chat-storage'
+ import { ChatClient } from './chat-client'
+ import { Message } from 'common/actions'
+-import { STOP_MARKER } from 'common/constants'
+ import { displayMenu, initializeMenu, navigateMenu, selectChat } from './menu'
++import { applyChanges } from './project-files'
++import { STOP_MARKER } from 'common/constants'
+ 
+ export class CLI {
+   private chatStorage: ChatStorage
+@@ -174,14 +177,24 @@ export class CLI {
+     this.stopResponseRequested = false
+     this.responseBuffer = ''
+ 
+-    const mannyResponse = await this.sendUserInputAndAwaitResponse()
++    const onStreamEnd = () => {
++      console.log('\nGenerating file changes...')
++    }
++    const { response, changes } =
++      await this.sendUserInputAndAwaitResponse(onStreamEnd)
++    const changesSuceeded = applyChanges(changes)
++    for (const change of uniqBy(changesSuceeded, 'filePath')) {
++      const { filePath, old } = change
++      console.log('-', old ? 'Updated' : 'Created', filePath)
++    }
++    console.log('Complete!')
+ 
+     this.isReceivingResponse = false
+ 
+     if (!this.stopResponseRequested) {
+       const assistantMessage: Message = {
+         role: 'assistant',
+-        content: mannyResponse,
++        content: response,
+       }
+       this.chatStorage.addMessage(
+         this.chatStorage.getCurrentChat(),
+@@ -202,12 +215,11 @@ export class CLI {
+     }
+   }
+ 
+-  private async sendUserInputAndAwaitResponse(): Promise<string> {
+-    return new Promise<string>((resolve) => {
+-      const unsubscribe = this.chartClient.subscribeToResponseChunks((chunk) => {
++  private async sendUserInputAndAwaitResponse(onStreamEnd: () => void) {
++    const { unsubscribe, result } = this.chartClient.subscribeToResponse(
++      (chunk) => {
+         if (this.stopResponseRequested) {
+           unsubscribe()
+-          resolve(this.responseBuffer)
+           return
+         }
+ 
+@@ -215,17 +227,14 @@ export class CLI {
+         this.responseBuffer += chunk
+ 
+         if (this.responseBuffer.includes(STOP_MARKER)) {
+-          unsubscribe()
+-          this.responseBuffer = this.responseBuffer
+-            .replace(STOP_MARKER, '')
+-            .trim()
+-          console.log()
+-          resolve(this.responseBuffer)
++          onStreamEnd()
+         }
+-      })
++      }
++    )
++
++    this.chartClient.sendUserInput([])
+ 
+-      this.chartClient.sendUserInput()
+-    })
++    return await result
+   }
+ 
+   promptUser() {
+diff --git a/src/index.ts b/src/index.ts
+index eae5e52e0..fb70b4733 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -3,27 +3,22 @@ import { ChatClient } from './chat-client'
+ import { ChatStorage } from './chat-storage'
+ import { CLI } from './cli'
+ 
+-const runScript = (fn: () => Promise<void>) => {
+-  loadEnvironmentVariables()
+-  fn()
+-}
+-
+-runScript(async () => {
+-  const userPrompt = process.argv[2] || undefined
+-  await manicode(userPrompt)
+-})
+-
+ async function manicode(userPrompt: string | undefined) {
+   console.log('What would you like to do?')
+ 
+   const chatStorage = new ChatStorage(projectRoot)
+   const wsClient = new ChatClient(websocketUrl, chatStorage)
+-  await wsClient.connect()
+ 
+   const cli = new CLI(chatStorage, wsClient)
+   cli.start()
+ 
++  await wsClient.connect()
++
+   if (userPrompt) {
+     await cli.handleUserInput(userPrompt)
+   }
+ }
++
++loadEnvironmentVariables()
++const userPrompt = process.argv[2] || undefined
++manicode(userPrompt)

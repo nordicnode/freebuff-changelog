@@ -1,0 +1,770 @@
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index e71ff6c97..e2414f786 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -6,7 +6,11 @@ import {
+ } from '@codebuff/bigquery'
+ import { ClientAction } from 'common/actions'
+ import {
++  geminiModels,
++  getModelForMode,
++  getModelFromShortName,
+   HIDDEN_FILE_READ_STATUS,
++  Model,
+   models,
+   ONE_TIME_LABELS,
+   type CostMode,
+@@ -35,6 +39,7 @@ import { checkForUnproductiveLoop } from './llm-apis/check-for-loop'
+ import { processFileBlock } from './process-file-block'
+ import { processStrReplace } from './process-str-replace'
+ import { getAgentStream } from './prompt-agent-stream'
++import { research } from './research'
+ import { getAgentSystemPrompt } from './system-prompt/agent-system-prompt'
+ import { additionalSystemPrompts } from './system-prompt/prompts'
+ import { saveAgentRequest } from './system-prompt/save-agent-request'
+@@ -79,7 +84,6 @@ import {
+   requestOptionalFile,
+ } from './websockets/websocket-action'
+ import { processStreamWithTags } from './xml-stream-parser'
+-import { research } from './research'
+ 
+ const MAX_CONSECUTIVE_ASSISTANT_MESSAGES = 12
+ // Turn this on to collect full file context, using Claude-4-Opus to pick which files to send up
+@@ -92,6 +96,7 @@ export interface MainPromptOptions {
+   onResponseChunk: (chunk: string) => void
+   selectedModel: string | undefined
+   readOnlyMode?: boolean
++  modelConfig?: { agentModel?: Model; reasoningModel?: Model } // Used by the backend for automatic evals
+ }
+ 
+ export const mainPrompt = async (
+@@ -109,6 +114,7 @@ export const mainPrompt = async (
+     onResponseChunk,
+     selectedModel,
+     readOnlyMode = false,
++    modelConfig,
+   } = options
+ 
+   const {
+@@ -128,14 +134,20 @@ export const mainPrompt = async (
+   const requestContext = getRequestContext()
+   const repoId = requestContext?.processedRepoId
+ 
+-  const { getStream, model } = getAgentStream({
++  const model =
++    modelConfig?.agentModel ??
++    getModelFromShortName(selectedModel) ??
++    getModelForMode(costMode, 'agent')
++
++  const getStream = getAgentStream({
+     costMode,
+-    selectedModel,
++    selectedModel: model,
+     stopSequences: TOOLS_WHICH_END_THE_RESPONSE.map((tool) => `</${tool}>`),
+     clientSessionId,
+     fingerprintId,
+     userInputId: promptId,
+     userId,
++    modelConfig,
+   })
+ 
+   // Generates a unique ID for each main prompt run (ie: a step of the agent loop)
+@@ -164,12 +176,13 @@ export const mainPrompt = async (
+   const isExporting =
+     prompt &&
+     (prompt.toLowerCase() === '/export' || prompt.toLowerCase() === 'export')
+-  const geminiThinkingEnabled = costMode === 'max'
++  const thinkingEnabled =
++    costMode === 'max' || modelConfig?.reasoningModel !== undefined
+   const isLiteMode = costMode === 'lite'
+   const isGeminiPro = model === models.gemini2_5_pro_preview
+   const isFlash =
+-    model === 'gemini-2.5-flash-preview-04-17:thinking' ||
+-    (model as any) === 'gemini-2.5-flash-preview-04-17'
++    (model as Model) === geminiModels.gemini2_5_flash_thinking ||
++    model === geminiModels.gemini2_5_flash
+   const toolsInstructions = getFilteredToolsInstructions(costMode)
+   const userInstructions = buildArray(
+     isAskMode &&
+@@ -215,7 +228,7 @@ export const mainPrompt = async (
+     (isFlash || isGeminiPro) &&
+       'Important: When using write_file, do NOT rewrite the entire file. Only show the parts of the file that have changed and write "// ... existing code ..." comments (or "# ... existing code ..", "/* ... existing code ... */", "<!-- ... existing code ... -->", whichever is appropriate for the language) around the changed area. Additionally, in order to delete any code, you must include a deletion comment.',
+ 
+-    geminiThinkingEnabled
++    thinkingEnabled
+       ? 'Start your response with the think_deeply tool call to decide how to proceed.'
+       : 'If the user request is very complex, consider invoking think_deeply.',
+ 
+@@ -610,7 +623,7 @@ export const mainPrompt = async (
+   > = {}
+ 
+   // Think deeply at the start of every response
+-  if (geminiThinkingEnabled) {
++  if (thinkingEnabled) {
+     let response = await getThinkingStream(
+       coreMessagesWithSystem(agentMessages, system),
+       (chunk) => {
+@@ -622,6 +635,7 @@ export const mainPrompt = async (
+         fingerprintId,
+         userInputId: promptId,
+         userId,
++        model: modelConfig?.reasoningModel,
+       }
+     )
+     if (model === models.gpt4_1) {
+diff --git a/backend/src/manager-prompt.ts b/backend/src/manager-prompt.ts
+index 718b9e615..b4dbe95aa 100644
+--- a/backend/src/manager-prompt.ts
++++ b/backend/src/manager-prompt.ts
+@@ -1,6 +1,7 @@
+ import { CoreMessage } from 'ai'
+ import { WebSocket } from 'ws'
+ 
++import { getModelForMode, getModelFromShortName } from 'common/constants'
+ import { toolSchema } from 'common/constants/tools'
+ import { AgentState, ToolResult } from 'common/types/agent-state'
+ import { ProjectFileContext } from 'common/util/file'
+@@ -84,9 +85,10 @@ export async function managerPrompt(
+     'Manager prompt'
+   )
+ 
+-  const { getStream } = getAgentStream({
++  const getStream = getAgentStream({
+     costMode: costMode as any,
+-    selectedModel: model,
++    selectedModel:
++      getModelFromShortName(model) ?? getModelForMode(costMode as any, 'agent'),
+     stopSequences: ['</run_terminal_command>', '</sleep>', '</kill_terminal>'],
+     clientSessionId,
+     fingerprintId: action.fingerprintId,
+diff --git a/backend/src/prompt-agent-stream.ts b/backend/src/prompt-agent-stream.ts
+index d1513735b..d81f5a34f 100644
+--- a/backend/src/prompt-agent-stream.ts
++++ b/backend/src/prompt-agent-stream.ts
+@@ -2,22 +2,22 @@ import { CoreMessage } from 'ai'
+ import {
+   AnthropicModel,
+   CostMode,
+-  getModelForMode,
++  Model,
+   providerModelNames,
+-  shortModelNames,
+ } from 'common/constants'
+ 
+ import { promptAiSdkStream } from './llm-apis/vercel-ai-sdk/ai-sdk'
+ 
+ export const getAgentStream = (params: {
+   costMode: CostMode
+-  selectedModel: string | undefined
++  selectedModel: Model
+   stopSequences?: string[]
+   clientSessionId: string
+   fingerprintId: string
+   userInputId: string
+   userId: string | undefined
+   thinkingBudget?: number
++  modelConfig?: { agentModel?: string; reasoningModel?: string } // Used by the backend for automatic evals
+ }) => {
+   const {
+     costMode,
+@@ -30,19 +30,7 @@ export const getAgentStream = (params: {
+     userId,
+   } = params
+ 
+-  if (selectedModel && !(selectedModel in shortModelNames)) {
+-    throw new Error(
+-      `Unknown model: ${selectedModel}. Please use a valid model. Valid models are: ${Object.keys(
+-        shortModelNames
+-      ).join(', ')}`
+-    )
+-  }
+-
+-  const fullSelectedModel = selectedModel
+-    ? shortModelNames[selectedModel as keyof typeof shortModelNames]
+-    : undefined
+-
+-  const model: string = fullSelectedModel ?? getModelForMode(costMode, 'agent')
++  const model = selectedModel
+ 
+   const provider = providerModelNames[model as keyof typeof providerModelNames]
+ 
+@@ -82,8 +70,5 @@ export const getAgentStream = (params: {
+         })()
+   }
+ 
+-  return {
+-    model: model,
+-    getStream,
+-  }
++  return getStream
+ }
+diff --git a/backend/src/thinking-stream.ts b/backend/src/thinking-stream.ts
+index 98c33a940..c061d7768 100644
+--- a/backend/src/thinking-stream.ts
++++ b/backend/src/thinking-stream.ts
+@@ -1,9 +1,9 @@
+-import { CostMode, models } from 'common/constants'
++import { CostMode, geminiModels, Model, models } from 'common/constants'
+ 
+ import { CoreMessage } from 'ai'
+ import { getAgentStream } from './prompt-agent-stream'
+-import { logger } from './util/logger'
+ import { TOOL_LIST } from './tools'
++import { logger } from './util/logger'
+ 
+ export async function getThinkingStream(
+   messages: CoreMessage[],
+@@ -14,11 +14,13 @@ export async function getThinkingStream(
+     fingerprintId: string
+     userInputId: string
+     userId: string | undefined
++    model?: Model
+   }
+ ) {
+-  const { getStream, model } = getAgentStream({
++  const model = options.model ?? geminiModels.gemini2_5_pro_preview
++  const getStream = getAgentStream({
+     costMode: options.costMode,
+-    selectedModel: 'gemini-2.5-pro',
++    selectedModel: model,
+     stopSequences: [
+       '</think_deeply>',
+       '<think_deeply>',
+diff --git a/common/src/constants.ts b/common/src/constants.ts
+index 13df8073b..6f04a2258 100644
+--- a/common/src/constants.ts
++++ b/common/src/constants.ts
+@@ -262,3 +262,18 @@ export const providerModelNames = {
+ export type Model = (typeof models)[keyof typeof models]
+ 
+ export const TEST_USER_ID = 'test-user-id'
++
++export function getModelFromShortName(
++  modelName: string | undefined
++): Model | undefined {
++  if (!modelName) return undefined
++  if (modelName && !(modelName in shortModelNames)) {
++    throw new Error(
++      `Unknown model: ${modelName}. Please use a valid model. Valid models are: ${Object.keys(
++        shortModelNames
++      ).join(', ')}`
++    )
++  }
++
++  return shortModelNames[modelName as keyof typeof shortModelNames]
++}
+diff --git a/common/src/db/schema.ts b/common/src/db/schema.ts
+index 209021885..60b75cccf 100644
+--- a/common/src/db/schema.ts
++++ b/common/src/db/schema.ts
+@@ -388,7 +388,12 @@ export const orgFeature = pgTable(
+ export type GitEvalMetadata = {
+   numCases?: number // Number of eval cases successfully run (total)
+   avgScore?: number // Average score across all cases
++  avgCompletion?: number // Average completion across all cases
++  avgEfficiency?: number // Average efficiency across all cases
++  avgCodeQuality?: number // Average code quality across all cases
++  avgDuration?: number // Average duration across all cases
+   suite?: string // Name of the repo (eg: codebuff, manifold)
++  avgTurns?: number // Average number of user turns across all cases
+ }
+ 
+ // Request type for the insert API
+diff --git a/evals/git-evals/run-eval-set.ts b/evals/git-evals/run-eval-set.ts
+index 72254e35e..b18e19507 100644
+--- a/evals/git-evals/run-eval-set.ts
++++ b/evals/git-evals/run-eval-set.ts
+@@ -1,43 +1,19 @@
+ #!/usr/bin/env bun
+ 
+-import { Model } from 'common/constants'
+ import type { GitEvalResultRequest } from 'common/db/schema'
+-import path from 'path'
+ import { sendEvalResultsEmail } from './email-eval-results'
+-import { analyzeEvalResults, PostEvalAnalysis } from './post-eval-analysis'
++import { analyzeEvalResults } from './post-eval-analysis'
+ import {
+   mockRunGitEvals,
+   runGitEvals,
+   setGlobalConcurrencyLimit,
+ } from './run-git-evals'
+-import { FullEvalLog } from './types'
++import { EvalConfig, EvalResult } from './types'
+ 
+ const DEFAULT_OUTPUT_DIR = 'git-evals'
+ const MOCK_PATH = 'git-evals/eval-result-codebuff-mock.json'
+ const API_BASE = process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000/'
+ 
+-interface ModelConfig {
+-  reasoningModel?: Model
+-  agentModel?: Model
+-}
+-
+-interface EvalConfig {
+-  name: string
+-  evalDataPath: string
+-  outputDir: string
+-  modelConfig: ModelConfig
+-  limit?: number
+-}
+-
+-interface EvalResult {
+-  name: string
+-  status: 'success' | 'error'
+-  result?: FullEvalLog
+-  analysis?: PostEvalAnalysis
+-  error?: string
+-  duration: number
+-}
+-
+ async function runEvalSet(
+   outputDir: string = DEFAULT_OUTPUT_DIR,
+   sendEmail: boolean = true,
+@@ -55,7 +31,7 @@ async function runEvalSet(
+   const evalConfigs: EvalConfig[] = [
+     {
+       name: 'codebuff',
+-      evalDataPath: path.join(__dirname, 'eval-codebuff.json'),
++      evalDataPath: 'git-evals/eval-codebuff.json',
+       outputDir,
+       modelConfig: {},
+     },
+@@ -85,7 +61,12 @@ async function runEvalSet(
+     try {
+       const result = mockEval
+         ? mockRunGitEvals(MOCK_PATH)
+-        : await runGitEvals(config.evalDataPath, config.outputDir, config.limit)
++        : await runGitEvals(
++            config.evalDataPath,
++            config.outputDir,
++            config.modelConfig,
++            config.limit
++          )
+       const evalDuration = Date.now() - evalStartTime
+       console.log(
+         `✅ ${config.name} evaluation completed in ${(evalDuration / 1000).toFixed(1)}s`
+@@ -252,6 +233,14 @@ async function runEvalSet(
+           const evalResult = resultWrapper.result
+           const config = evalConfigs.find((c) => c.name === resultWrapper.name)
+ 
++          // average number of user turns
++          const totalTurns = evalResult?.eval_runs?.reduce((acc, run) => {
++            return acc + run.trace.length
++          }, 0)
++          const numCases = evalResult?.eval_runs?.length
++          const avgTurns =
++            totalTurns && numCases ? totalTurns / numCases : undefined
++
+           // Map the eval result data to the database schema
+           const payload: GitEvalResultRequest = {
+             cost_mode: 'normal', // You can modify this based on your needs
+@@ -260,7 +249,12 @@ async function runEvalSet(
+             metadata: {
+               numCases: evalResult?.overall_metrics?.total_runs,
+               avgScore: evalResult?.overall_metrics?.average_overall,
++              avgCompletion: evalResult?.overall_metrics?.average_completion,
++              avgEfficiency: evalResult?.overall_metrics?.average_efficiency,
++              avgCodeQuality: evalResult?.overall_metrics?.average_code_quality,
++              avgDuration: evalResult?.overall_metrics?.average_duration_ms,
+               suite: resultWrapper.name,
++              avgTurns,
+             },
+             cost: 0, // You'll need to calculate actual cost based on your eval results
+           }
+diff --git a/evals/git-evals/run-git-evals.ts b/evals/git-evals/run-git-evals.ts
+index 8e1231ee9..9246e0957 100644
+--- a/evals/git-evals/run-git-evals.ts
++++ b/evals/git-evals/run-git-evals.ts
+@@ -1,7 +1,7 @@
+ import { execSync, fork } from 'child_process'
+ import fs from 'fs'
+-import path from 'path'
+ import pLimit from 'p-limit'
++import path from 'path'
+ 
+ import { promptAiSdkStructured } from '../../backend/src/llm-apis/vercel-ai-sdk/ai-sdk'
+ import { claudeModels } from '../../common/src/constants'
+@@ -25,6 +25,7 @@ import {
+   EvalRunLog,
+   FullEvalLog,
+   GitRepoEvalData,
++  ModelConfig,
+ } from './types'
+ 
+ // Try Gemini!
+@@ -34,7 +35,8 @@ export async function runSingleEval(
+   evalCommit: EvalCommit,
+   projectPath: string,
+   clientSessionId: string,
+-  fingerprintId: string
++  fingerprintId: string,
++  modelConfig: ModelConfig
+ ): Promise<EvalRunJudged> {
+   const startTime = new Date()
+   const trace: CodebuffTrace[] = []
+@@ -142,6 +144,7 @@ Explain your reasoning in detail.`,
+             maxIterations: 20,
+             options: {
+               costMode: COST_MODE,
++              modelConfig,
+             },
+           }),
+           // Timeout after 30 minutes
+@@ -295,6 +298,7 @@ export function setGlobalConcurrencyLimit(limit: number) {
+ export async function runGitEvals(
+   evalDataPath: string,
+   outputDir: string,
++  modelConfig: ModelConfig,
+   limit?: number
+ ): Promise<FullEvalLog> {
+   const evalData = JSON.parse(
+@@ -331,97 +335,104 @@ export async function runGitEvals(
+     ? evalData.evalCommits.slice(0, limit)
+     : evalData.evalCommits
+ 
+-  console.log(`Running ${commitsToRun.length} evaluations with max 20 concurrent processes...`)
++  console.log(
++    `Running ${commitsToRun.length} evaluations with max 20 concurrent processes...`
++  )
+ 
+   // Use global limiter if available, otherwise create a local one
+   const limitConcurrency = globalConcurrencyLimiter || pLimit(20)
+ 
+   const evalPromises = commitsToRun.map((evalCommit, index) => {
+-    return limitConcurrency(() =>
+-      new Promise<EvalRunJudged>(async (resolve, reject) => {
+-        try {
+-          console.log(
+-            `Setting up test repository for commit ${evalCommit.sha}...`
+-          )
+-          const projectPath = await setupTestRepo(
+-            repoUrl,
+-            testRepoName,
+-            evalCommit.sha
+-          )
+-
+-          console.log(
+-            `Starting ${testRepoName} eval ${index + 1}/${commitsToRun.length} for commit ${evalCommit.message}...`
+-          )
+-
+-          const safeMessage = evalCommit.message
+-            .split('\n')[0]
+-            .replace(/[^a-zA-Z0-9]/g, '_')
+-            .slice(0, 30)
+-          const logFilename = `${safeMessage}-${evalCommit.sha.slice(0, 7)}.log`
+-          const logPath = path.join(logsDir, logFilename)
+-          const logStream = fs.createWriteStream(logPath)
+-
+-          // Write evalCommit to temporary file to avoid long command line arguments
+-          const tempEvalCommitPath = path.join(
+-            logsDir,
+-            `eval-commit-${evalCommit.sha.slice(0, 7)}.json`
+-          )
+-          fs.writeFileSync(tempEvalCommitPath, JSON.stringify(evalCommit))
+-
+-          const child = fork(
+-            path.resolve(__dirname, 'run-single-eval-process.ts'),
+-            [tempEvalCommitPath, projectPath, clientSessionId, fingerprintId],
+-            { stdio: ['pipe', 'pipe', 'pipe', 'ipc'] }
+-          )
+-
+-          child.stdout?.pipe(logStream)
+-          child.stderr?.pipe(logStream)
+-
+-          child.on(
+-            'message',
+-            (message: { type: string; result?: EvalRunJudged; error?: any }) => {
+-              // Clean up temp file
+-              try {
+-                fs.unlinkSync(tempEvalCommitPath)
+-              } catch (e) {
+-                console.warn(
+-                  `Failed to clean up temp file ${tempEvalCommitPath}:`,
+-                  e
+-                )
++    return limitConcurrency(
++      () =>
++        new Promise<EvalRunJudged>(async (resolve, reject) => {
++          try {
++            console.log(
++              `Setting up test repository for commit ${evalCommit.sha}...`
++            )
++            const projectPath = await setupTestRepo(
++              repoUrl,
++              testRepoName,
++              evalCommit.sha
++            )
++
++            console.log(
++              `Starting ${testRepoName} eval ${index + 1}/${commitsToRun.length} for commit ${evalCommit.message}...`
++            )
++
++            const safeMessage = evalCommit.message
++              .split('\n')[0]
++              .replace(/[^a-zA-Z0-9]/g, '_')
++              .slice(0, 30)
++            const logFilename = `${safeMessage}-${evalCommit.sha.slice(0, 7)}.log`
++            const logPath = path.join(logsDir, logFilename)
++            const logStream = fs.createWriteStream(logPath)
++
++            // Write evalCommit to temporary file to avoid long command line arguments
++            const tempEvalCommitPath = path.join(
++              logsDir,
++              `eval-commit-${evalCommit.sha.slice(0, 7)}.json`
++            )
++            fs.writeFileSync(tempEvalCommitPath, JSON.stringify(evalCommit))
++
++            const child = fork(
++              path.resolve(__dirname, 'run-single-eval-process.ts'),
++              [tempEvalCommitPath, projectPath, clientSessionId, fingerprintId],
++              { stdio: ['pipe', 'pipe', 'pipe', 'ipc'] }
++            )
++
++            child.stdout?.pipe(logStream)
++            child.stderr?.pipe(logStream)
++
++            child.on(
++              'message',
++              (message: {
++                type: string
++                result?: EvalRunJudged
++                error?: any
++              }) => {
++                // Clean up temp file
++                try {
++                  fs.unlinkSync(tempEvalCommitPath)
++                } catch (e) {
++                  console.warn(
++                    `Failed to clean up temp file ${tempEvalCommitPath}:`,
++                    e
++                  )
++                }
++                if (message.type === 'result' && message.result) {
++                  console.log(
++                    `Completed eval for commit ${testRepoName} - ${evalCommit.message}`
++                  )
++                  resolve(message.result)
++                } else if (message.type === 'error') {
++                  console.error(
++                    `Received error while running eval: ${message.error.stack}\n`,
++                    { message }
++                  )
++                  const err = new Error(message.error.message)
++                  reject(err)
++                }
+               }
+-              if (message.type === 'result' && message.result) {
+-                console.log(
+-                  `Completed eval for commit ${testRepoName} - ${evalCommit.message}`
+-                )
+-                resolve(message.result)
+-              } else if (message.type === 'error') {
++            )
++
++            child.on('exit', (code) => {
++              logStream.end()
++              if (code !== 0) {
+                 console.error(
+-                  `Received error while running eval: ${message.error.stack}\n`,
+-                  { message }
++                  `Eval process for ${evalCommit.sha} exited with code ${code}. See logs at ${logPath}`
+                 )
+-                const err = new Error(message.error.message)
+-                reject(err)
+-              }
+-            }
+-          )
+-
+-          child.on('exit', (code) => {
+-            logStream.end()
+-            if (code !== 0) {
+-              console.error(
+-                `Eval process for ${evalCommit.sha} exited with code ${code}. See logs at ${logPath}`
+-              )
+-              reject(
+-                new Error(
+-                  `Eval process for ${evalCommit.sha} exited with code ${code}`
++                reject(
++                  new Error(
++                    `Eval process for ${evalCommit.sha} exited with code ${code}`
++                  )
+                 )
+-              )
+-            }
+-          })
+-        } catch (e) {
+-          reject(e)
+-        }
+-      })
++              }
++            })
++          } catch (e) {
++            reject(e)
++          }
++        })
+     )
+   })
+ 
+@@ -494,7 +505,7 @@ if (require.main === module) {
+   const evalDataPath = args[0] || 'git-evals/git-evals.json'
+   const outputDir = args[1] || 'git-evals'
+ 
+-  runGitEvals(evalDataPath, outputDir)
++  runGitEvals(evalDataPath, outputDir, {})
+     .then(() => {
+       console.log('Done!')
+       process.exit(0)
+diff --git a/evals/git-evals/run-single-eval-process.ts b/evals/git-evals/run-single-eval-process.ts
+index b797c9e1e..b8e455ebd 100644
+--- a/evals/git-evals/run-single-eval-process.ts
++++ b/evals/git-evals/run-single-eval-process.ts
+@@ -7,17 +7,23 @@ import { recreateShell } from '../../npm-app/src/terminal/base'
+ import { createFileReadingMock } from '../scaffolding'
+ import { setupTestEnvironmentVariables } from '../test-setup'
+ import { runSingleEval } from './run-git-evals'
+-import { EvalCommit } from './types'
++import { EvalCommit, ModelConfig } from './types'
+ 
+ async function main() {
+-  const [evalCommitFilePath, projectPath, clientSessionId, fingerprintId] =
+-    process.argv.slice(2)
++  const [
++    evalCommitFilePath,
++    projectPath,
++    clientSessionId,
++    fingerprintId,
++    modelConfigStr,
++  ] = process.argv.slice(2)
+ 
+   if (
+     !evalCommitFilePath ||
+     !projectPath ||
+     !clientSessionId ||
+-    !fingerprintId
++    !fingerprintId ||
++    !modelConfigStr
+   ) {
+     console.error('Missing required arguments for single eval process')
+     process.exit(1)
+@@ -31,6 +37,7 @@ async function main() {
+     console.error('Failed to read evalCommit from file:', error)
+     process.exit(1)
+   }
++  const modelConfig: ModelConfig = JSON.parse(modelConfigStr)
+ 
+   try {
+     // Setup environment for this process
+@@ -44,7 +51,8 @@ async function main() {
+       evalCommit,
+       projectPath,
+       clientSessionId,
+-      fingerprintId
++      fingerprintId,
++      modelConfig
+     )
+     console.log('Final result:', { result })
+     if (process.send) {
+diff --git a/evals/git-evals/types.ts b/evals/git-evals/types.ts
+index 1174f7abb..37cb95848 100644
+--- a/evals/git-evals/types.ts
++++ b/evals/git-evals/types.ts
+@@ -1,5 +1,7 @@
++import { Model } from 'common/constants'
+ import { z } from 'zod'
+ import { AgentStep } from '../scaffolding'
++import { PostEvalAnalysis } from './post-eval-analysis'
+ 
+ // Base commit types
+ export interface CommitInfo {
+@@ -97,3 +99,26 @@ export const JudgingAnalysisSchema = z.object({
+     overallScore: z.number().min(0).max(10),
+   }),
+ })
++
++// Types for run-eval-set
++export interface ModelConfig {
++  reasoningModel?: Model
++  agentModel?: Model
++}
++
++export interface EvalConfig {
++  name: string
++  evalDataPath: string
++  outputDir: string
++  modelConfig: ModelConfig
++  limit?: number
++}
++
++export interface EvalResult {
++  name: string
++  status: 'success' | 'error'
++  result?: FullEvalLog
++  analysis?: PostEvalAnalysis
++  error?: string
++  duration: number
++}
+diff --git a/evals/scaffolding.ts b/evals/scaffolding.ts
+index d4a4aaca6..54ae588f5 100644
+--- a/evals/scaffolding.ts
++++ b/evals/scaffolding.ts
+@@ -3,10 +3,11 @@ import { EventEmitter } from 'events'
+ import fs from 'fs'
+ import path from 'path'
+ 
++import { mock } from 'bun:test'
++import { blue } from 'picocolors'
++import { WebSocket } from 'ws'
+ import * as mainPromptModule from '../backend/src/main-prompt'
+ import { ClientToolCall } from '../backend/src/tools'
+-import { mock } from 'bun:test'
+-import { getFileTokenScores } from '../packages/code-map/parse'
+ import { FileChanges } from '../common/src/actions'
+ import { TEST_USER_ID } from '../common/src/constants'
+ import {
+@@ -19,8 +20,8 @@ import { ProjectFileContext } from '../common/src/util/file'
+ import { generateCompactId } from '../common/src/util/string'
+ import { handleToolCall } from '../npm-app/src/tool-handlers'
+ import { getSystemInfo } from '../npm-app/src/utils/system-info'
+-import { blue } from 'picocolors'
+-import { WebSocket } from 'ws'
++import { getFileTokenScores } from '../packages/code-map/parse'
++import { ModelConfig } from './git-evals/types'
+ 
+ const DEBUG_MODE = true
+ 
+@@ -93,6 +94,7 @@ export async function runMainPrompt(
+   sessionId: string,
+   options: {
+     costMode: 'lite' | 'normal' | 'max' | 'experimental'
++    modelConfig: ModelConfig
+   }
+ ) {
+   const mockWs = new EventEmitter() as WebSocket
+@@ -121,8 +123,9 @@ export async function runMainPrompt(
+       }
+       fullResponse += chunk
+     },
+-    selectedModel: undefined, // selectedModel
+-    readOnlyMode: false // readOnlyMode = false for evals
++    selectedModel: undefined,
++    readOnlyMode: false, // readOnlyMode = false for evals
++    modelConfig: options.modelConfig,
+   })
+ 
+   return {
+@@ -148,6 +151,7 @@ export async function loopMainPrompt({
+   stopCondition,
+   options = {
+     costMode: 'normal',
++    modelConfig: {},
+   },
+ }: {
+   agentState: AgentState
+@@ -160,6 +164,7 @@ export async function loopMainPrompt({
+   ) => boolean
+   options: {
+     costMode: 'lite' | 'normal' | 'max' | 'experimental'
++    modelConfig: ModelConfig
+   }
+ }) {
+   console.log(blue(prompt))

@@ -1,0 +1,342 @@
+diff --git a/npm-app/src/checkpoint-file-manager.ts b/npm-app/src/checkpoint-file-manager.ts
+index c8e471e80..391641341 100644
+--- a/npm-app/src/checkpoint-file-manager.ts
++++ b/npm-app/src/checkpoint-file-manager.ts
+@@ -2,20 +2,15 @@ import * as crypto from 'crypto'
+ import * as fs from 'fs'
+ import * as git from 'isomorphic-git'
+ import * as path from 'path'
++import { getProjectDataDir } from './project-files'
+ 
+-import { getProjectRoot, getProjectDataDir } from './project-files'
+-
+-let projectDir: string
+-let bareRepoPath: string
+-
+-export async function initializeCheckpointFileManager(): Promise<void> {
+-  projectDir = getProjectRoot()
++export function getBareRepoPath(dir: string) {
++  const bareRepoName = crypto.createHash('sha256').update(dir).digest('hex')
++  return path.join(getProjectDataDir(), bareRepoName)
++}
+ 
+-  const bareRepoName = crypto
+-    .createHash('sha256')
+-    .update(projectDir)
+-    .digest('hex')
+-  bareRepoPath = path.join(getProjectDataDir(), bareRepoName)
++export async function initializeCheckpointFileManager(dir: string) {
++  const bareRepoPath = getBareRepoPath(dir)
+ 
+   // Create the bare repo directory if it doesn't exist
+   fs.mkdirSync(bareRepoPath, { recursive: true })
+@@ -32,10 +27,13 @@ export async function initializeCheckpointFileManager(): Promise<void> {
+   await git.init({ fs, dir: bareRepoPath, bare: true })
+ 
+   // Commit the files in the bare repo
+-  await storeFileState('Initial Commit')
++  await storeFileState(dir, bareRepoPath, 'Initial Commit')
+ }
+ 
+-async function addFilesIndividually(): Promise<void> {
++async function stageFilesIndividually(
++  projectDir: string,
++  bareRepoPath: string
++): Promise<void> {
+   // Get status of all files in the project directory
+   const statusMatrix = await git.statusMatrix({
+     fs,
+@@ -43,23 +41,39 @@ async function addFilesIndividually(): Promise<void> {
+     gitdir: bareRepoPath,
+   })
+ 
+-  try {
+-    for (const [
+-      filepath,
+-      headStatus,
+-      workdirStatus,
+-      stageStatus,
+-    ] of statusMatrix) {
+-      await git.add({
+-        fs,
+-        dir: projectDir,
+-        gitdir: bareRepoPath,
+-        filepath,
+-      })
+-    }
+-  } catch (error) {
+-    // Could not add file
+-  }
++  await Promise.all(
++    statusMatrix.map(async ([filepath, , workdirStatus, stageStatus]) => {
++      if (workdirStatus === stageStatus) {
++        return
++      }
++
++      if (workdirStatus === 2) {
++        // existing file different from HEAD
++        try {
++          return git.add({
++            fs,
++            dir: projectDir,
++            gitdir: bareRepoPath,
++            filepath,
++          })
++        } catch (error) {
++          // error adding file
++        }
++      } else if (workdirStatus === 0) {
++        // deleted file
++        try {
++          git.remove({
++            fs,
++            dir: projectDir,
++            gitdir: bareRepoPath,
++            filepath,
++          })
++        } catch (error) {
++          // error adding file
++        }
++      }
++    })
++  )
+ }
+ 
+ /**
+@@ -67,36 +81,61 @@ async function addFilesIndividually(): Promise<void> {
+  * @param message The commit message to use for this file state
+  * @returns A promise that resolves to the id hash that can be used to restore this file state
+  */
+-export async function storeFileState(message: string): Promise<string> {
+-  try {
+-    await git.add({
+-      fs,
+-      dir: projectDir,
+-      gitdir: bareRepoPath,
+-      filepath: '.',
+-    })
+-  } catch (error) {
+-    await addFilesIndividually()
+-  }
++export async function storeFileState(
++  projectDir: string,
++  bareRepoPath: string,
++  message: string
++): Promise<string> {
++  await stageFilesIndividually(projectDir, bareRepoPath)
+ 
+   const commitHash = await git.commit({
+     fs,
+     dir: projectDir,
+     gitdir: bareRepoPath,
+     author: { name: 'codebuff' },
++    ref: 'refs/heads/master',
+     message,
+   })
+ 
++  await git.checkout({
++    fs,
++    dir: projectDir,
++    gitdir: bareRepoPath,
++    ref: commitHash,
++  })
++
+   return commitHash
+ }
+ 
+-export async function checkoutFileState(fileStateId: string): Promise<void> {
+-  // Checkout the given hash
++/**
++ * Resets the index and working directory to the specified commit.
++ * @param dir - The working tree directory path.
++ * @param gitdir - The git directory path (typically the .git folder).
++ * @param commit - The commit hash to reset to.
++ */
++export async function gitResetHard({
++  dir,
++  gitdir,
++  commit,
++}: {
++  dir: string
++  gitdir: string
++  commit: string
++}): Promise<void> {
++  // Update the working directory to reflect the specified commit
+   await git.checkout({
+     fs,
+-    dir: projectDir,
+-    gitdir: bareRepoPath,
+-    ref: fileStateId,
++    dir,
++    gitdir,
++    ref: commit,
+     force: true,
+   })
++
++  // Reset the index to match the specified commit
++  const files = await git.listFiles({ fs, dir, gitdir })
++  await Promise.all(
++    files.map((filepath) =>
++      git.resetIndex({ fs, dir, gitdir, filepath, ref: commit })
++    )
++  )
+ }
+diff --git a/npm-app/src/checkpoints.ts b/npm-app/src/checkpoints.ts
+index c64f92e03..4c979e267 100644
+--- a/npm-app/src/checkpoints.ts
++++ b/npm-app/src/checkpoints.ts
+@@ -1,16 +1,8 @@
+-import {
+-  blue,
+-  bold,
+-  cyan,
+-  gray,
+-  green,
+-  red,
+-  underline,
+-  yellow,
+-} from 'picocolors'
++import { blue, bold, cyan, gray, underline, yellow } from 'picocolors'
+ 
+ import { AgentState } from 'common/types/agent-state'
+ import * as checkpointFileManager from './checkpoint-file-manager'
++import { getProjectRoot } from './project-files'
+ 
+ /**
+  * Interface representing a checkpoint of agent state
+@@ -30,6 +22,15 @@ export interface Checkpoint {
+ export class CheckpointManager {
+   private checkpoints: Map<number, Checkpoint> = new Map()
+   private nextId: number = 1
++  private bareRepoPath: string | null = null
++
++  getBareRepoPath(): string {
++    if (!this.bareRepoPath) {
++      this.bareRepoPath =
++        checkpointFileManager.getBareRepoPath(getProjectRoot())
++    }
++    return this.bareRepoPath
++  }
+ 
+   /**
+    * Add a new checkpoint
+@@ -45,6 +46,8 @@ export class CheckpointManager {
+     const id = this.nextId++
+ 
+     const fileStateIdPromise = checkpointFileManager.storeFileState(
++      getProjectRoot(),
++      this.getBareRepoPath(),
+       `Checkpoint ${id}`
+     )
+ 
+@@ -98,7 +101,11 @@ export class CheckpointManager {
+       return false
+     }
+ 
+-    checkpointFileManager.checkoutFileState(await checkpoint.fileStateIdPromise)
++    await checkpointFileManager.gitResetHard({
++      dir: getProjectRoot(),
++      gitdir: this.getBareRepoPath(),
++      commit: await checkpoint.fileStateIdPromise,
++  })
+     return true
+   }
+ 
+diff --git a/npm-app/src/cli.ts b/npm-app/src/cli.ts
+index bcc4c54d0..e6c2aec56 100644
+--- a/npm-app/src/cli.ts
++++ b/npm-app/src/cli.ts
+@@ -10,7 +10,7 @@ import {
+ import { getAllFilePaths } from 'common/project-file-tree'
+ import { AgentState } from 'common/types/agent-state'
+ import { Message } from 'common/types/message'
+-import { createFileBlock, ProjectFileContext } from 'common/util/file'
++import { ProjectFileContext } from 'common/util/file'
+ import { pluralize } from 'common/util/string'
+ 
+ import { setMessages } from './chat-storage'
+@@ -43,7 +43,7 @@ export class CLI {
+   private isPasting: boolean = false
+ 
+   constructor(
+-    readyPromise: Promise<[void, ProjectFileContext, void]>,
++    readyPromise: Promise<[void, ProjectFileContext]>,
+     { git, costMode }: CliOptions
+   ) {
+     this.git = git
+@@ -64,7 +64,7 @@ export class CLI {
+ 
+     this.readyPromise = Promise.all([
+       readyPromise.then((results) => {
+-        const [_, fileContext, __] = results
++        const [_, fileContext] = results
+         this.client.initAgentState(fileContext)
+         return this.client.warmContextCache()
+       }),
+@@ -198,6 +198,10 @@ export class CLI {
+     Spinner.get().start()
+     await this.readyPromise
+     Spinner.get().stop()
++
++    // Make sure the previous checkpoint is done
++    await checkpointManager.getLatestCheckpoint()?.fileStateIdPromise
++
+     // Save the current agent state
+     await checkpointManager.addCheckpoint(
+       this.client.agentState as AgentState,
+@@ -703,6 +707,10 @@ export class CLI {
+       return
+     }
+ 
++    // Wait for save before trying to restore checkpoint
++    const latestCheckpoint = checkpointManager.getLatestCheckpoint()
++    await latestCheckpoint?.fileStateIdPromise
++
+     await this.restoreAgentStateAndFiles(checkpoint)
+ 
+     console.log(green(`Restored to checkpoint #${id}.`))
+diff --git a/npm-app/src/index.ts b/npm-app/src/index.ts
+index 3d4fbe9aa..789b46ee8 100644
+--- a/npm-app/src/index.ts
++++ b/npm-app/src/index.ts
+@@ -12,7 +12,6 @@ import {
+ import { updateCodebuff } from './update-codebuff'
+ import { CliOptions } from './types'
+ import { recreateShell } from './utils/terminal'
+-import { initializeCheckpointFileManager } from './checkpoint-file-manager'
+ import { createTemplateProject } from './create-template-project'
+ 
+ async function codebuff(
+@@ -24,9 +23,8 @@ async function codebuff(
+ 
+   const updatePromise = updateCodebuff()
+   const initFileContextPromise = initProjectFileContextWithWorker(dir)
+-  const initCpfm = initializeCheckpointFileManager()
+ 
+-  const readyPromise = Promise.all([updatePromise, initFileContextPromise, initCpfm])
++  const readyPromise = Promise.all([updatePromise, initFileContextPromise])
+ 
+   const cli = new CLI(readyPromise, { git, costMode })
+ 
+diff --git a/npm-app/src/worker-script-project-context.ts b/npm-app/src/worker-script-project-context.ts
+index 151d1baba..3879b754f 100644
+--- a/npm-app/src/worker-script-project-context.ts
++++ b/npm-app/src/worker-script-project-context.ts
+@@ -1,12 +1,16 @@
+ import { parentPort as maybeParentPort } from 'worker_threads'
+ import { getProjectFileContext, setProjectRoot } from './project-files'
++import { initializeCheckpointFileManager } from './checkpoint-file-manager'
+ 
+ if (maybeParentPort) {
+   const parentPort = maybeParentPort
+ 
+   parentPort.on('message', async ({ dir }) => {
+     setProjectRoot(dir)
+-    const initFileContext = await getProjectFileContext(dir, {})
++    const [initFileContext, _] = await Promise.all([
++      getProjectFileContext(dir, {}),
++      initializeCheckpointFileManager(dir),
++    ])
+     parentPort.postMessage(initFileContext)
+   })
+ }

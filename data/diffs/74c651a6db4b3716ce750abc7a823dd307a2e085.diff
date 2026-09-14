@@ -1,0 +1,1196 @@
+diff --git a/backend/src/__tests__/process-file-block.test.ts b/backend/src/__tests__/process-file-block.test.ts
+index 8f5a2dea1..57852dec3 100644
+--- a/backend/src/__tests__/process-file-block.test.ts
++++ b/backend/src/__tests__/process-file-block.test.ts
+@@ -1,8 +1,9 @@
+-import { describe, it, expect, mock } from 'bun:test'
+-import { applyPatch } from 'common/util/patch'
+-import { processFileBlock } from '../process-file-block'
++import { describe, expect, it, mock } from 'bun:test'
+ import { TEST_USER_ID } from 'common/constants'
+ import { cleanMarkdownCodeBlock } from 'common/util/file'
++import { applyPatch } from 'common/util/patch'
++
++import { processFileBlock } from '../process-file-block'
+ 
+ // Mock database interactions
+ mock.module('pg-pool', () => ({
+@@ -242,11 +243,11 @@ function divide(a: number, b: number) {
+       expect(result.patch).toContain('\r\n')
+       const updatedFile = applyPatch(oldContent, result.patch)
+       expect(updatedFile).toBe(newContent)
+-      
++
+       // Verify patch can be applied and preserves line endings
+       const patchLines = result.patch.split('\r\n')
+-      expect(patchLines.some(line => line.startsWith('-const y'))).toBe(true)
+-      expect(patchLines.some(line => line.startsWith('+const z'))).toBe(true)
++      expect(patchLines.some((line) => line.startsWith('-const y'))).toBe(true)
++      expect(patchLines.some((line) => line.startsWith('+const z'))).toBe(true)
+     }
+   })
+ })
+diff --git a/backend/src/find-files/request-files-prompt.ts b/backend/src/find-files/request-files-prompt.ts
+index 0bddc9728..214b14b58 100644
+--- a/backend/src/find-files/request-files-prompt.ts
++++ b/backend/src/find-files/request-files-prompt.ts
+@@ -1,6 +1,8 @@
+ import { dirname, isAbsolute, normalize } from 'path'
+ 
+ import { TextBlockParam } from '@anthropic-ai/sdk/resources'
++import { insertTrace } from 'common/bigquery/client'
++import { GetRelevantFilesTrace } from 'common/bigquery/schema'
+ import { models, type CostMode } from 'common/constants'
+ import { getAllFilePaths } from 'common/project-file-tree'
+ import { Message } from 'common/types/message'
+@@ -35,6 +37,7 @@ export async function requestRelevantFiles(
+   },
+   fileContext: ProjectFileContext,
+   assistantPrompt: string | null,
++  agentStepId: string,
+   clientSessionId: string,
+   fingerprintId: string,
+   userInputId: string,
+@@ -84,6 +87,7 @@ export async function requestRelevantFiles(
+     },
+     keyPrompt,
+     'Key',
++    agentStepId,
+     clientSessionId,
+     fingerprintId,
+     userInputId,
+@@ -112,6 +116,7 @@ export async function requestRelevantFiles(
+       },
+       nonObviousPrompt,
+       'Non-Obvious',
++      agentStepId,
+       clientSessionId,
+       fingerprintId,
+       userInputId,
+@@ -169,6 +174,7 @@ async function getRelevantFiles(
+   },
+   userPrompt: string,
+   requestType: string,
++  agentStepId: string,
+   clientSessionId: string,
+   fingerprintId: string,
+   userInputId: string,
+@@ -200,6 +206,28 @@ async function getRelevantFiles(
+ 
+   const files = validateFilePaths(response.split('\n'))
+ 
++  const trace: GetRelevantFilesTrace = {
++    id: crypto.randomUUID(),
++    agent_step_id: agentStepId,
++    user_id: userId ?? '',
++    created_at: new Date(),
++    type: 'get-relevant-files',
++    payload: {
++      messages: messagesWithPrompt,
++      system,
++      output: response,
++      request_type: requestType,
++      cost_mode: costMode,
++      user_input_id: userInputId,
++      client_session_id: clientSessionId,
++      fingerprint_id: fingerprintId,
++    },
++  }
++
++  insertTrace(trace).catch((error: Error) => {
++    logger.error({ error }, 'Failed to insert trace')
++  })
++
+   return { files, duration, requestType, response }
+ }
+ 
+diff --git a/backend/src/index.ts b/backend/src/index.ts
+index 349d6439e..4a2db4d62 100644
+--- a/backend/src/index.ts
++++ b/backend/src/index.ts
+@@ -4,6 +4,7 @@ import { listen as webSocketListen } from './websockets/server'
+ import { env } from './env.mjs'
+ import { logger } from './util/logger'
+ import usageHandler from './api/usage'
++import { setupBigQuery } from 'common/src/bigquery/client'
+ 
+ const app = express()
+ const port = env.PORT
+@@ -33,6 +34,16 @@ app.use(
+ )
+ 
+ logger.info('Initializing server')
++
++// Initialize BigQuery before starting the server
++setupBigQuery()
++  .catch((err) => {
++    logger.error('Failed to initialize BigQuery client', err)
++  })
++  .finally(() => {
++    logger.debug('BigQuery client initialized')
++  })
++
+ const server = http.createServer(app)
+ 
+ server.listen(port, () => {
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index 07e048870..29bab4d55 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -1,12 +1,14 @@
+ import { TextBlockParam } from '@anthropic-ai/sdk/resources'
+ import { ClientAction } from 'common/actions'
++import { insertTrace } from 'common/bigquery/client'
++import { AgentResponseTrace } from 'common/bigquery/schema'
+ import {
+   HIDDEN_FILE_READ_STATUS,
+   models,
+   ONE_TIME_TAGS,
+   type CostMode,
+ } from 'common/constants'
+-import { getToolCallString } from 'common/src/constants/tools'
++import { getToolCallString } from 'common/constants/tools'
+ import { AgentState, ToolResult } from 'common/types/agent-state'
+ import { Message } from 'common/types/message'
+ import { buildArray } from 'common/util/array'
+@@ -82,6 +84,10 @@ export const mainPrompt = async (
+     userId,
+   })
+ 
++  // Generates a unique ID for each main prompt run (ie: a step of the agent loop)
++  // This is used to link logs within a single agent loop
++  const agentStepId = crypto.randomUUID()
++
+   const relevantDocumentationPromise = prompt
+     ? getDocumentationForQuery(prompt, {
+         tokens: 5000,
+@@ -253,7 +259,14 @@ export const mainPrompt = async (
+   const searchSystem = getSearchSystemPrompt(
+     fileContext,
+     costMode,
+-    fileRequestMessagesTokens
++    fileRequestMessagesTokens,
++    {
++      agentStepId,
++      clientSessionId,
++      fingerprintId,
++      userInputId: promptId,
++      userId: userId,
++    }
+   )
+   const {
+     addedFiles,
+@@ -268,6 +281,7 @@ export const mainPrompt = async (
+     null,
+     {
+       skipRequestingFiles: !prompt,
++      agentStepId,
+       clientSessionId,
+       fingerprintId,
+       userInputId: promptId,
+@@ -522,6 +536,22 @@ export const mainPrompt = async (
+     fullResponse = '<end_turn></end_turn>'
+   }
+ 
++  const agentResponseTrace: AgentResponseTrace = {
++    type: 'agent-response',
++    created_at: new Date(),
++    agent_step_id: agentStepId,
++    user_id: userId ?? '',
++    id: crypto.randomUUID(),
++    payload: {
++      output: fullResponse,
++      user_input_id: promptId,
++      client_session_id: clientSessionId,
++      fingerprint_id: fingerprintId,
++    },
++  }
++
++  insertTrace(agentResponseTrace)
++
+   const messagesWithResponse = [
+     ...agentMessages,
+     {
+@@ -529,6 +559,7 @@ export const mainPrompt = async (
+       content: fullResponse,
+     },
+   ]
++
+   const toolCalls = parseToolCalls(fullResponse)
+   const clientToolCalls: ClientToolCall[] = []
+   const serverToolResults: ToolResult[] = []
+@@ -579,12 +610,24 @@ export const mainPrompt = async (
+       const { addedFiles, updatedFilePaths } = await getFileReadingUpdates(
+         ws,
+         messagesWithResponse,
+-        getSearchSystemPrompt(fileContext, costMode, fileRequestMessagesTokens),
++        getSearchSystemPrompt(
++          fileContext,
++          costMode,
++          fileRequestMessagesTokens,
++          {
++            agentStepId,
++            clientSessionId,
++            fingerprintId,
++            userInputId: promptId,
++            userId,
++          }
++        ),
+         fileContext,
+         null,
+         {
+           skipRequestingFiles: false,
+           requestedFiles: paths,
++          agentStepId,
+           clientSessionId,
+           fingerprintId,
+           userInputId: promptId,
+@@ -746,6 +789,7 @@ async function getFileReadingUpdates(
+   options: {
+     skipRequestingFiles: boolean
+     requestedFiles?: string[]
++    agentStepId: string
+     clientSessionId: string
+     fingerprintId: string
+     userInputId: string
+@@ -756,6 +800,7 @@ async function getFileReadingUpdates(
+   const FILE_TOKEN_BUDGET = 100_000
+   const {
+     skipRequestingFiles,
++    agentStepId,
+     clientSessionId,
+     fingerprintId,
+     userInputId,
+@@ -789,6 +834,7 @@ async function getFileReadingUpdates(
+         { messages, system },
+         fileContext,
+         prompt,
++        agentStepId,
+         clientSessionId,
+         fingerprintId,
+         userInputId,
+diff --git a/backend/src/system-prompt/search-system-prompt.ts b/backend/src/system-prompt/search-system-prompt.ts
+index 0ea175283..d1588139e 100644
+--- a/backend/src/system-prompt/search-system-prompt.ts
++++ b/backend/src/system-prompt/search-system-prompt.ts
+@@ -1,8 +1,10 @@
+-import { ProjectFileContext } from 'common/util/file'
+-import { buildArray } from 'common/util/array'
++import { insertTrace } from 'common/bigquery/client'
+ import { CostMode } from 'common/constants'
+-import { countTokens, countTokensJson } from '../util/token-counter'
++import { buildArray } from 'common/util/array'
++import { ProjectFileContext } from 'common/util/file'
++
+ import { logger } from '../util/logger'
++import { countTokens, countTokensJson } from '../util/token-counter'
+ import {
+   getGitChangesPrompt,
+   getProjectFileTreePrompt,
+@@ -12,7 +14,14 @@ import {
+ export function getSearchSystemPrompt(
+   fileContext: ProjectFileContext,
+   costMode: CostMode,
+-  messagesTokens: number
++  messagesTokens: number,
++  options: {
++    agentStepId: string
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
++    userId: string | undefined
++  }
+ ) {
+   const startTime = Date.now()
+ 
+@@ -37,6 +46,34 @@ export function getSearchSystemPrompt(
+     fileTreeTokenBudget,
+     'search'
+   )
++
++  const t = Date.now()
++  const truncationBudgets = [5_000, 20_000, 40_000, 100_000, 500_000]
++  const truncatedTrees = truncationBudgets.reduce(
++    (acc, budget) => {
++      acc[budget] = getProjectFileTreePrompt(fileContext, budget, 'search')
++      return acc
++    },
++    {} as Record<number, string>
++  )
++
++  const trace = {
++    id: crypto.randomUUID(),
++    agent_step_id: options.agentStepId,
++    created_at: new Date(),
++    type: 'file-trees' as const,
++    user_id: options.userId ?? '',
++    payload: {
++      filetrees: truncatedTrees,
++      user_input_id: options.userInputId,
++      client_session_id: options.clientSessionId,
++      fingerprint_id: options.fingerprintId,
++    },
++  }
++
++  insertTrace(trace).catch((error: Error) => {
++    logger.error({ error }, 'Failed to insert file trees trace')
++  })
+   const fileTreeTokens = countTokensJson(projectFileTreePrompt)
+ 
+   const systemInfoPrompt = getSystemInfoPrompt(fileContext)
+diff --git a/codebuff.json b/codebuff.json
+index 626931f3b..1f6ca8208 100644
+--- a/codebuff.json
++++ b/codebuff.json
+@@ -9,4 +9,4 @@
+       "command": "bun start-web"
+     }
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/common/src/bigquery/client.ts b/common/src/bigquery/client.ts
+new file mode 100644
+index 000000000..75c24e68f
+--- /dev/null
++++ b/common/src/bigquery/client.ts
+@@ -0,0 +1,233 @@
++import { BigQuery } from '@google-cloud/bigquery'
++
++import { logger } from '../util/logger'
++import {
++  GetRelevantFilesTrace,
++  Relabel,
++  RELABELS_SCHEMA,
++  Trace,
++  TRACES_SCHEMA,
++} from './schema'
++
++const DATASET =
++  process.env.ENVIRONMENT === 'production'
++    ? 'codebuff_data'
++    : 'codebuff_data_dev'
++
++const TRACES_TABLE = 'traces'
++const RELABELS_TABLE = 'relabels'
++
++// Create a single BigQuery client instance to be used by all functions
++const client = new BigQuery()
++
++export async function setupBigQuery(dataset: string = DATASET) {
++  try {
++    // Ensure dataset exists
++    const [ds] = await client.dataset(dataset).get({ autoCreate: true })
++
++    // Ensure tables exist
++    await ds.table(TRACES_TABLE).get({
++      autoCreate: true,
++      schema: TRACES_SCHEMA,
++      timePartitioning: {
++        type: 'MONTH',
++        field: 'created_at',
++      },
++      clustering: {
++        fields: ['user_id', 'agent_step_id'],
++      },
++    })
++    await ds.table(RELABELS_TABLE).get({
++      autoCreate: true,
++      schema: RELABELS_SCHEMA,
++      timePartitioning: {
++        type: 'MONTH',
++        field: 'created_at',
++      },
++      clustering: {
++        fields: ['user_id', 'agent_step_id'],
++      },
++    })
++  } catch (error) {
++    console.log('Failed to initialize BigQuery', JSON.stringify(error))
++    logger.error({ error }, 'Failed to initialize BigQuery')
++  }
++}
++
++export async function insertTrace(trace: Trace, dataset: string = DATASET) {
++  try {
++    // Create a copy of the trace and stringify payload if needed
++    const traceToInsert = {
++      ...trace,
++      payload:
++        trace.payload && typeof trace.payload !== 'string'
++          ? JSON.stringify(trace.payload)
++          : trace.payload,
++    }
++
++    await client.dataset(dataset).table(TRACES_TABLE).insert(traceToInsert)
++
++    logger.debug(
++      { traceId: trace.id, type: trace.type },
++      'Inserted trace into BigQuery'
++    )
++    return true
++  } catch (error) {
++    logger.error(
++      { error, traceId: trace.id },
++      'Failed to insert trace into BigQuery'
++    )
++    return false
++  }
++}
++
++export async function insertRelabel(
++  relabel: Relabel,
++  dataset: string = DATASET
++) {
++  try {
++    // Stringify payload if needed
++    const relabelToInsert = {
++      ...relabel,
++      payload:
++        relabel.payload && typeof relabel.payload !== 'string'
++          ? JSON.stringify(relabel.payload)
++          : relabel.payload,
++    }
++
++    await client.dataset(dataset).table(RELABELS_TABLE).insert(relabelToInsert)
++
++    logger.debug({ relabelId: relabel.id }, 'Inserted relabel into BigQuery')
++    return true
++  } catch (error) {
++    logger.error(
++      { error, relabelId: relabel.id },
++      'Failed to insert relabel into BigQuery'
++    )
++    return false
++  }
++}
++
++export async function getRecentTraces(
++  limit: number = 10,
++  dataset: string = DATASET
++) {
++  const query = `
++    SELECT * FROM ${dataset}.${TRACES_TABLE}
++    ORDER BY createdAt DESC
++    LIMIT ${limit}
++  `
++  const [rows] = await client.query(query)
++  // Parse the payload as JSON if it's a string
++  return rows.map((row) => ({
++    ...row,
++    payload:
++      typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload,
++  })) as Trace[]
++}
++
++export async function getRecentRelabels(
++  limit: number = 10,
++  dataset: string = DATASET
++) {
++  const query = `
++    SELECT * FROM ${dataset}.${RELABELS_TABLE}
++    ORDER BY createdAt DESC
++    LIMIT ${limit}
++  `
++  const [rows] = await client.query(query)
++  // Parse the payload as JSON if it's a string
++  return rows.map((row) => ({
++    ...row,
++    payload:
++      typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload,
++  })) as Relabel[]
++}
++
++export async function getTracesWithoutRelabels(
++  model: string,
++  limit: number = 100,
++  dataset: string = DATASET
++) {
++  // TODO: Optimize query, maybe only get traces in last 30 days etc
++  const query = `
++    SELECT t.* 
++    FROM \`${dataset}.${TRACES_TABLE}\` t
++    LEFT JOIN (
++      SELECT r.agentStepId, r.userId, JSON_EXTRACT_SCALAR(r.payload, '$.userInputId') as userInputId
++      FROM \`${dataset}.${RELABELS_TABLE}\` r
++      WHERE r.model = '${model}'
++    ) r
++    ON t.agentStepId = r.agentStepId 
++       AND t.userId = r.userId
++       AND JSON_EXTRACT_SCALAR(t.payload, '$.userInputId') = r.userInputId
++    WHERE t.type = 'get-relevant-files'
++      AND r.agentStepId IS NULL
++    ORDER BY t.createdAt DESC
++    LIMIT ${limit}
++  `
++
++  const [rows] = await client.query(query)
++  // Parse the payload as JSON if it's a string
++  return rows.map((row) => ({
++    ...row,
++    payload:
++      typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload,
++  })) as GetRelevantFilesTrace[]
++}
++
++export async function getTracesWithRelabels(
++  model: string,
++  limit: number = 100,
++  dataset: string = DATASET
++) {
++  // Get traces that DO have matching relabels for the specified model
++  const query = `
++  SELECT 
++    t as trace,
++    r as relabel
++  FROM \`${dataset}.${TRACES_TABLE}\` t
++  INNER JOIN (
++    SELECT *
++    FROM \`${dataset}.${RELABELS_TABLE}\` r
++    WHERE r.model = '${model}'
++  ) r
++  ON t.agentStepId = r.agentStepId 
++     AND t.userId = r.userId
++     AND JSON_EXTRACT_SCALAR(t.payload, '$.userInputId') = JSON_EXTRACT_SCALAR(r.payload, '$.userInputId')
++  WHERE t.type = 'get-relevant-files'
++    AND JSON_EXTRACT_SCALAR(t.payload, '$.output') IS NOT NULL
++    AND JSON_EXTRACT_SCALAR(r.payload, '$.output') IS NOT NULL
++  ORDER BY t.createdAt DESC
++  LIMIT ${limit}
++  `
++
++  const [rows] = await client.query(query)
++
++  // Filter out any results where either trace or relabel data is missing
++  const res = rows
++    .filter((row) => row.trace && row.relabel)
++    .map((row) => ({
++      trace: row.trace as GetRelevantFilesTrace,
++      relabel: row.relabel as Relabel,
++    }))
++
++  // Parse the payload as JSON if it's a string
++  return res.map((row) => ({
++    ...row,
++    trace: {
++      ...row.trace,
++      payload:
++        typeof row.trace.payload === 'string'
++          ? JSON.parse(row.trace.payload)
++          : row.trace.payload,
++    },
++    relabel: {
++      ...row.relabel,
++      payload:
++        typeof row.relabel.payload === 'string'
++          ? JSON.parse(row.relabel.payload)
++          : row.relabel.payload,
++    },
++  })) as { trace: GetRelevantFilesTrace; relabel: Relabel }[]
++}
+diff --git a/common/src/bigquery/schema.ts b/common/src/bigquery/schema.ts
+new file mode 100644
+index 000000000..4cb5e58b5
+--- /dev/null
++++ b/common/src/bigquery/schema.ts
+@@ -0,0 +1,90 @@
++import { TableSchema } from '@google-cloud/bigquery'
++
++interface BaseEvent {
++  id: string // primary key, ID for this specific event
++  agent_step_id: string // ID for a step of the agent loop, ie: a mainPrompt call
++  user_id: string // user ID
++}
++
++interface BasePayload {
++  user_input_id: string // ID of a given user input in a sesson
++  client_session_id: string // ID for a given client session
++  fingerprint_id: string // ID for a specific device
++}
++
++// Define possible trace types
++export type TraceType = 'get-relevant-files' | 'file-trees' | 'agent-response'
++
++// Base trace interface
++export interface BaseTrace extends BaseEvent {
++  created_at: Date
++  type: TraceType
++  payload: unknown
++}
++
++// Type-specific payload interfaces
++export interface GetRelevantFilesPayload extends BasePayload {
++  messages: unknown
++  system: unknown
++  output: string
++  request_type: string
++  cost_mode: string
++}
++
++export interface GetRelevantFilesTrace extends BaseTrace {
++  type: 'get-relevant-files'
++  payload: GetRelevantFilesPayload
++}
++
++interface FileTreePayload extends BasePayload {
++  filetrees: Record<number, string>
++}
++
++export interface FileTreeTrace extends BaseTrace {
++  type: 'file-trees'
++  payload: FileTreePayload
++}
++
++interface AgentResponsePayload extends BasePayload {
++  output: string
++}
++
++export interface AgentResponseTrace extends BaseTrace {
++  type: 'agent-response'
++  payload: AgentResponsePayload
++}
++
++// Union type for all trace records
++export type Trace = GetRelevantFilesTrace | FileTreeTrace | AgentResponseTrace
++
++export const TRACES_SCHEMA: TableSchema = {
++  fields: [
++    { name: 'id', type: 'STRING', mode: 'REQUIRED' }, // UUID
++    { name: 'agent_step_id', type: 'STRING', mode: 'REQUIRED' }, // Used to link traces together within a single agent step
++    { name: 'user_id', type: 'STRING', mode: 'REQUIRED' }, // user ID
++    { name: 'created_at', type: 'TIMESTAMP', mode: 'REQUIRED' },
++    { name: 'type', type: 'STRING', mode: 'REQUIRED' },
++    { name: 'payload', type: 'JSON', mode: 'REQUIRED' },
++  ],
++}
++
++interface RelabelPayload extends BasePayload {
++  output: string
++}
++
++export interface Relabel extends BaseEvent {
++  created_at: Date
++  model: string
++  payload: RelabelPayload
++}
++
++export const RELABELS_SCHEMA: TableSchema = {
++  fields: [
++    { name: 'id', type: 'STRING', mode: 'REQUIRED' }, // UUID
++    { name: 'agent_step_id', type: 'STRING', mode: 'REQUIRED' }, // Used to link traces together within a single agent step
++    { name: 'user_id', type: 'STRING', mode: 'REQUIRED' }, // user ID
++    { name: 'created_at', type: 'TIMESTAMP', mode: 'REQUIRED' },
++    { name: 'model', type: 'STRING', mode: 'REQUIRED' },
++    { name: 'payload', type: 'JSON', mode: 'REQUIRED' },
++  ],
++}
+diff --git a/package.json b/package.json
+index 72e190c95..052d7acce 100644
+--- a/package.json
++++ b/package.json
+@@ -63,6 +63,8 @@
+     "tree-sitter-rust"
+   ],
+   "dependencies": {
++    "@google-cloud/bigquery": "^7.9.4",
+     "codebuff": "^1.0.119"
+-  }
++  },
++  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+ }
+diff --git a/scripts/ft-file-selection/.gitignore b/scripts/ft-file-selection/.gitignore
+new file mode 100644
+index 000000000..96898b41b
+--- /dev/null
++++ b/scripts/ft-file-selection/.gitignore
+@@ -0,0 +1,2 @@
++# Ignore any other potential tuning data files
++*-tune-data*.jsonl
+diff --git a/scripts/ft-file-selection/README.md b/scripts/ft-file-selection/README.md
+new file mode 100644
+index 000000000..7dc657f47
+--- /dev/null
++++ b/scripts/ft-file-selection/README.md
+@@ -0,0 +1,12 @@
++## Scripts
++
++Contains a variety of scripts for inspecting and processing finetuning data from BigQuery.
++
++`print-recent-traces.ts [--prod]` - Prints the most recent traces from BigQuery.
++
++`print-recent-relabels.ts [--prod]` - Prints the most recent relabels from BigQuery.
++
++`relabel-traces.ts [--prod]` - Relabels traces in BigQuery, ie: generates new outputs using more powerful models for real production inputs.
++
++`collect-tuning-data.ts <model> [--prod]` - Downloads tuning data from BigQuery, using real inputs + relabeled outputs. The `model` parameter controls which relabeler model is used. 
++
+diff --git a/scripts/ft-file-selection/collect-tuning-data.ts b/scripts/ft-file-selection/collect-tuning-data.ts
+new file mode 100644
+index 000000000..eb823f62b
+--- /dev/null
++++ b/scripts/ft-file-selection/collect-tuning-data.ts
+@@ -0,0 +1,274 @@
++import { existsSync, readdirSync, writeFileSync } from 'fs'
++
++import { getTracesWithRelabels } from 'common/bigquery/client'
++import { Message } from 'common/types/message'
++
++// Get model from command line args
++const model = process.argv[2]
++const isProd = process.argv.includes('--production')
++const DATASET = isProd ? 'codebuff_data' : 'codebuff_data_dev'
++
++if (!model) {
++  console.log('Missing model argument')
++  console.log(
++    'Usage: bun run scripts/ft-file-selection/collect-tuning-data.ts <model> [--production]'
++  )
++  process.exit(1)
++}
++
++// Utility function to get next available filename with auto-incrementing number
++function getNextAvailableFilename(
++  baseFilename: string,
++  extension: string
++): string {
++  const dir = 'scripts/ft-file-selection'
++  const files = readdirSync(dir)
++
++  // If base file doesn't exist yet, use it
++  const basePath = `${dir}/${baseFilename}.${extension}`
++  if (!existsSync(basePath)) {
++    return basePath
++  }
++
++  // Find all numbered versions
++  const pattern = new RegExp(`${baseFilename}-(\\d+)\\.${extension}`)
++  const numbers = files
++    .map((file) => {
++      const match = file.match(pattern)
++      return match ? parseInt(match[1]) : 0
++    })
++    .filter((n) => n > 0)
++
++  // Get next number (or start at 001 if no numbered files exist)
++  const nextNum = numbers.length > 0 ? Math.max(...numbers) + 1 : 1
++
++  // Format with padded zeros
++  const paddedNum = nextNum.toString().padStart(3, '0')
++  return `${dir}/${baseFilename}-${paddedNum}.${extension}`
++}
++
++interface SystemMessage {
++  text: string
++  type: 'text'
++}
++
++interface GeminiPart {
++  text: string
++}
++
++interface GeminiMessage {
++  role: 'user' | 'model' | 'system'
++  parts: GeminiPart[]
++}
++
++interface GeminiTuningExample {
++  systemInstruction: GeminiMessage
++  contents: GeminiMessage[]
++}
++
++interface OpenAIMessage {
++  role: string
++  content: string
++  weight?: number
++}
++
++interface OpenAITuningExample {
++  messages: OpenAIMessage[]
++}
++
++function convertRole(role: string): 'user' | 'model' | 'system' {
++  if (role === 'assistant') return 'model'
++  return 'user'
++}
++
++function convertToGeminiFormat(
++  system: SystemMessage[],
++  messages: Message[],
++  output: string
++): GeminiTuningExample {
++  // Handle system message
++  let allMessages: Message[] = [
++    ...messages,
++    { role: 'assistant', content: output },
++  ]
++  let systemMessage: GeminiMessage
++
++  if (Array.isArray(system)) {
++    systemMessage = {
++      role: 'system',
++      parts: system.map((s) => ({ text: s.text })),
++    }
++  } else if (typeof system === 'string') {
++    systemMessage = {
++      role: 'system',
++      parts: [{ text: system }],
++    }
++  } else {
++    throw new Error(
++      `Invalid system message, expected string or array, got ${typeof system}`
++    )
++  }
++
++  // Convert all messages to Gemini format
++  // @ts-ignore
++  const geminiMessages: GeminiMessage[] = allMessages
++    .map((msg) => {
++      if (typeof msg.content === 'string') {
++        return {
++          role: convertRole(msg.role),
++          parts: [{ text: msg.content }],
++        }
++      } else if (Array.isArray(msg.content)) {
++        const textContent = msg.content.find((c) => c.type === 'text')?.text
++        if (textContent) {
++          return {
++            role: convertRole(msg.role),
++            parts: [{ text: textContent }],
++          }
++        }
++        return null
++      }
++      return null
++    })
++    .filter((msg): msg is GeminiMessage => msg !== null)
++
++  // If there are multiple messages in a row with the same role, we need to combine them into a single message with multiple parts
++  const combinedMessages: GeminiMessage[] = []
++  for (const msg of geminiMessages) {
++    if (
++      combinedMessages.length > 0 &&
++      combinedMessages[combinedMessages.length - 1].role === msg.role
++    ) {
++      combinedMessages[combinedMessages.length - 1].parts.push(...msg.parts)
++    } else {
++      combinedMessages.push(msg)
++    }
++  }
++
++  return {
++    systemInstruction: systemMessage,
++    contents: combinedMessages,
++  }
++}
++
++function convertToOpenAIFormat(
++  system: SystemMessage[],
++  messages: Message[],
++  output: string
++): OpenAITuningExample {
++  // Handle system message
++  let systemMessages: OpenAIMessage[] = []
++
++  if (Array.isArray(system)) {
++    systemMessages = system.map((s, i) => ({
++      role: i === 0 ? 'system' : 'user',
++      content: s.text,
++    }))
++  } else if (typeof system === 'string') {
++    systemMessages = [{ role: 'system', content: system }]
++  }
++
++  // Convert all messages to OpenAI format
++  const openaiMessages: OpenAIMessage[] = messages.map((msg) => {
++    if (typeof msg.content === 'string') {
++      return {
++        role: msg.role,
++        content: msg.content,
++      }
++    } else if (Array.isArray(msg.content)) {
++      const textContent = msg.content.find((c) => c.type === 'text')?.text
++      if (textContent) {
++        return {
++          role: msg.role,
++          content: textContent,
++        }
++      }
++    }
++    throw new Error('Invalid message format')
++  })
++
++  return {
++    messages: [
++      ...systemMessages,
++      ...openaiMessages,
++      { role: 'assistant', content: output },
++    ],
++  }
++}
++
++async function main() {
++  try {
++    console.log(`Using dataset: ${DATASET}`)
++
++    // Get traces for the specified model from BigQuery
++    const traces = await getTracesWithRelabels(model, 1000, DATASET)
++    console.log(`Found ${traces.length} traces for model ${model}`)
++
++    // Process traces and convert to Gemini format
++    const tuningData = traces
++      .map(({ trace, relabel }) => {
++        try {
++          return convertToGeminiFormat(
++            trace.payload.system as SystemMessage[],
++            trace.payload.messages as Message[],
++            relabel.payload.output
++          )
++        } catch (error) {
++          console.error('Error processing trace:', error)
++          return null
++        }
++      })
++      .filter(Boolean)
++
++    // Save as JSONL with auto-incrementing filename
++    const jsonlContent = tuningData
++      .map((example) => JSON.stringify(example))
++      .join('\n')
++
++    const geminiPath = getNextAvailableFilename('gemini-tune-data', 'jsonl')
++    writeFileSync(geminiPath, jsonlContent)
++
++    console.log(
++      `Successfully saved ${tuningData.length} examples to ${geminiPath}`
++    )
++
++    // Convert to OpenAI format
++    const openaiTuningData = traces
++      .map(({ trace, relabel }) => {
++        try {
++          return convertToOpenAIFormat(
++            trace.payload.system as SystemMessage[],
++            trace.payload.messages as Message[],
++            relabel.payload.output
++          )
++        } catch (error) {
++          console.error('Error processing trace for OpenAI:', error)
++          return null
++        }
++      })
++      .filter(Boolean)
++
++    // OpenAI gets mad if we have <10 examples, lets repeat the last example until we have 10
++    // Terrible terrible idea, but good for testing.
++    while (openaiTuningData.length < 10 && openaiTuningData.length > 0) {
++      openaiTuningData.push(openaiTuningData[openaiTuningData.length - 1])
++    }
++
++    // Save as JSONL with auto-incrementing filename
++    const openaiJsonlContent = openaiTuningData
++      .map((example) => JSON.stringify(example))
++      .join('\n')
++
++    const openaiPath = getNextAvailableFilename('openai-tune-data', 'jsonl')
++    writeFileSync(openaiPath, openaiJsonlContent)
++
++    console.log(
++      `Successfully saved ${openaiTuningData.length} examples to ${openaiPath}`
++    )
++  } catch (error) {
++    console.error('Error:', error)
++    process.exit(1)
++  }
++}
++
++main()
+diff --git a/scripts/ft-file-selection/print-recent-relabels.ts b/scripts/ft-file-selection/print-recent-relabels.ts
+new file mode 100644
+index 000000000..b87aed389
+--- /dev/null
++++ b/scripts/ft-file-selection/print-recent-relabels.ts
+@@ -0,0 +1,32 @@
++import { getRecentRelabels } from 'common/src/bigquery/client'
++
++// Parse command line arguments to check for --prod flag
++const isProd = process.argv.includes('--prod')
++const DATASET = isProd ? 'codebuff_data' : 'codebuff_data_dev'
++
++async function printRecentRelabels() {
++  try {
++    // Use the BigQuery client to get recent relabels
++    const relabels = await getRecentRelabels(10, DATASET)
++
++    console.log('\nLast 10 relabels by timestamp:')
++    console.log('--------------------------------')
++    console.log(`Using dataset: ${DATASET}`)
++    console.log('--------------------------------')
++
++    relabels.forEach((relabel) => {
++      console.log(`
++ID: ${relabel.id}
++User ID: ${relabel.user_id}
++Agent Step ID: ${relabel.agent_step_id}
++Created at: ${JSON.stringify(relabel.created_at)}
++Payload: ${JSON.stringify(relabel.payload).slice(0, 100)}...
++--------------------------------`)
++    })
++  } catch (error) {
++    console.error('Error fetching relabels:', error)
++  }
++}
++
++// Run the function
++printRecentRelabels()
+diff --git a/scripts/ft-file-selection/print-recent-traces.ts b/scripts/ft-file-selection/print-recent-traces.ts
+new file mode 100644
+index 000000000..3869cff59
+--- /dev/null
++++ b/scripts/ft-file-selection/print-recent-traces.ts
+@@ -0,0 +1,33 @@
++import { getRecentTraces } from 'common/src/bigquery/client'
++
++// Parse command line arguments to check for --prod flag
++const isProd = process.argv.includes('--prod')
++const DATASET = isProd ? 'codebuff_data' : 'codebuff_data_dev'
++
++async function printRecentTraces() {
++  try {
++    // Use the BigQuery client to get recent traces
++    const traces = await getRecentTraces(10, DATASET)
++
++    console.log('\nLast 10 traces by timestamp:')
++    console.log('--------------------------------')
++    console.log(`Using dataset: ${DATASET}`)
++    console.log('--------------------------------')
++
++    traces.forEach((trace) => {
++      console.log(`
++ID: ${trace.id}
++User ID: ${trace.user_id}
++Agent Step ID: ${trace.agent_step_id}
++Type: ${trace.type}
++Created at: ${JSON.stringify(trace.created_at)}
++Payload: ${JSON.stringify(trace.payload, null, 2).slice(0, 100)}...
++--------------------------------`)
++    })
++  } catch (error) {
++    console.error('Error fetching traces:', error)
++  }
++}
++
++// Run the function
++printRecentTraces()
+diff --git a/scripts/ft-file-selection/relabel-traces.ts b/scripts/ft-file-selection/relabel-traces.ts
+new file mode 100644
+index 000000000..b0dc4801e
+--- /dev/null
++++ b/scripts/ft-file-selection/relabel-traces.ts
+@@ -0,0 +1,107 @@
++import { promptGeminiWithFallbacks } from 'backend/llm-apis/gemini-with-fallbacks'
++import { GetRelevantFilesPayload } from 'common/bigquery/schema'
++import { claudeModels, models } from 'common/constants'
++import {
++  getTracesWithoutRelabels,
++  insertRelabel,
++} from 'common/src/bigquery/client'
++import { Message } from 'common/types/message'
++import { generateCompactId } from 'common/util/string'
++
++import { promptClaude, System } from '../../backend/src/llm-apis/claude'
++
++// Models we want to test
++const MODELS_TO_TEST = [models.gemini2_5_pro_exp, claudeModels.sonnet] as const
++
++const isProd = process.argv.includes('--prod')
++const DATASET = isProd ? 'codebuff_data' : 'codebuff_data_dev'
++
++async function runTraces() {
++  try {
++    for (const model of MODELS_TO_TEST) {
++      console.log(`\nProcessing traces for model ${model}...`)
++
++      // Get the last 100 traces that don't have relabels for this model
++      const traces = await getTracesWithoutRelabels(model, 100, DATASET)
++
++      console.log(
++        `Found ${traces.length} get-relevant-files traces without relabels for model ${model}`
++      )
++
++      for (const trace of traces) {
++        console.log(`Processing trace ${trace.id}`)
++        const payload = (
++          typeof trace.payload === 'string'
++            ? JSON.parse(trace.payload)
++            : trace.payload
++        ) as GetRelevantFilesPayload
++
++        try {
++          let output: string
++          const messages = payload.messages
++          const system = payload.system
++
++          console.log('messages', messages)
++          console.log('system', system)
++          if (model.startsWith('claude')) {
++            output = await promptClaude(messages as Message[], {
++              system: system as System,
++              model: model as typeof claudeModels.sonnet,
++              clientSessionId: 'relabel-trace-run',
++              fingerprintId: 'relabel-trace-run',
++              userInputId: 'relabel-trace-run',
++              ignoreDatabaseAndHelicone: true,
++            })
++          } else {
++            output = await promptGeminiWithFallbacks(
++              messages as Message[],
++              system as System,
++              {
++                model: model as typeof models.gemini2_5_pro_exp,
++                clientSessionId: 'relabel-trace-run',
++                fingerprintId: 'relabel-trace-run',
++                userInputId: 'relabel-trace-run',
++                userId: 'relabel-trace-run',
++              }
++            )
++          }
++
++          // Create relabel record
++          const relabel = {
++            id: generateCompactId(),
++            agent_step_id: trace.agent_step_id,
++            user_id: trace.user_id,
++            created_at: new Date(),
++            model: model,
++            payload: {
++              user_input_id: payload.user_input_id,
++              client_session_id: payload.client_session_id,
++              fingerprint_id: payload.fingerprint_id,
++              output: output,
++            },
++          }
++
++          // Store the relabel
++          try {
++            const res = await insertRelabel(relabel, DATASET)
++            console.log('res', JSON.stringify(res, null, 2))
++          } catch (error) {
++            console.error(
++              `Error inserting relabel for trace ${trace.id}:`,
++              JSON.stringify(error, null, 2)
++            )
++          }
++
++          console.log(`Successfully stored relabel for trace ${trace.id}`)
++        } catch (error) {
++          console.error(`Error processing trace ${trace.id}:`, error)
++        }
++      }
++    }
++  } catch (error) {
++    console.error('Error running traces:', error)
++  }
++}
++
++// Run the script
++runTraces()

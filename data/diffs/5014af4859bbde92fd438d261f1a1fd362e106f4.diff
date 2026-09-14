@@ -1,0 +1,1191 @@
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index 485a34be6..60b3e1fd7 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -35,7 +35,6 @@ import { toolFormatter } from './llm-apis/relace-api'
+ import { processFileBlock } from './process-file-block'
+ import { processStrReplace } from './process-str-replace'
+ import { getAgentStream } from './prompt-agent-stream'
+-import { getAgentSystemPrompt } from './system-prompt/agent-system-prompt'
+ import { additionalSystemPrompts } from './system-prompt/prompts'
+ import { saveAgentRequest } from './system-prompt/save-agent-request'
+ import { getSearchSystemPrompt } from './system-prompt/search-system-prompt'
+@@ -78,6 +77,7 @@ import {
+   requestOptionalFile,
+ } from './websockets/websocket-action'
+ import { processStreamWithTags } from './xml-stream-parser'
++import { getAgentSystemPrompt } from './system-prompt/agent-system-prompt'
+ 
+ const MAX_CONSECUTIVE_ASSISTANT_MESSAGES = 12
+ // Turn this on to collect full file context, using Claude-4-Opus to pick which files to send up
+@@ -148,7 +148,7 @@ export const mainPrompt = async (
+   const isFlash =
+     model === 'gemini-2.5-flash-preview-04-17:thinking' ||
+     (model as any) === 'gemini-2.5-flash-preview-04-17'
+-
++  const toolsInstructions = getFilteredToolsInstructions(costMode)
+   const userInstructions = buildArray(
+     isAskMode &&
+       'You are a coding agent in "ASK" mode so the user can ask questions, which means you do not have access to tools that can modify files or run terminal commands. You should instead answer the user\'s questions and come up with brilliant plans which can later be implemented.',
+@@ -167,7 +167,7 @@ export const mainPrompt = async (
+     'Important: When using write_file, do NOT rewrite the entire file. Only show the parts of the file that have changed and write "// ... existing code ..." comments (or "# ... existing code ...", "/* ... existing code ... */", "<!-- ... existing code ... -->", whichever is appropriate for the language) around the changed area.',
+ 
+     isGeminiPro
+-      ? getFilteredToolsInstructions(costMode)
++      ? toolsInstructions
+       : `Any tool calls will be run from the project root (${agentState.fileContext.currentWorkingDirectory}) unless otherwise specified`,
+ 
+     'You must read additional files with the read_files tool whenever it could possibly improve your response. Before you use write_file to edit an existing file, make sure to read it.',
+diff --git a/backend/src/manager-prompt.ts b/backend/src/manager-prompt.ts
+new file mode 100644
+index 000000000..718b9e615
+--- /dev/null
++++ b/backend/src/manager-prompt.ts
+@@ -0,0 +1,206 @@
++import { CoreMessage } from 'ai'
++import { WebSocket } from 'ws'
++
++import { toolSchema } from 'common/constants/tools'
++import { AgentState, ToolResult } from 'common/types/agent-state'
++import { ProjectFileContext } from 'common/util/file'
++import { generateCompactId } from 'common/util/string'
++import { getAgentStream } from './prompt-agent-stream'
++import { getManagerSystemPrompt } from './system-prompt/manager-system-prompt'
++import {
++  ClientToolCall,
++  parseRawToolCall,
++  TOOL_LIST,
++  ToolCall,
++  ToolName,
++} from './tools'
++import { logger } from './util/logger'
++import { processStreamWithTags } from './xml-stream-parser'
++
++interface ManagerPromptAction {
++  type: 'manager-prompt'
++  prompt?: string // Optional for tool result responses
++  agentState: AgentState
++  toolResults: ToolResult[]
++  fingerprintId: string
++  authToken?: string
++  costMode?: string
++  model?: string
++  cwd?: string
++  repoName?: string
++}
++
++export async function managerPrompt(
++  ws: WebSocket,
++  action: ManagerPromptAction,
++  userId: string | undefined,
++  clientSessionId: string,
++  onResponseChunk: (chunk: string) => void,
++  fileContext: ProjectFileContext
++): Promise<{
++  toolCalls: ClientToolCall[]
++  toolResults: ToolResult[]
++  agentState: AgentState
++}> {
++  const messages: CoreMessage[] = [...action.agentState.messageHistory]
++
++  // Check if this is the first message in agent mode, a new user prompt, or tool results
++  if (messages.length === 0) {
++    logger.debug(
++      { userId },
++      'First time entering manager mode - initializing with system prompt'
++    )
++    // First time entering agent mode - initialize with system prompt
++    messages.push({
++      role: 'system',
++      content: getManagerSystemPrompt(),
++    })
++  }
++  // If we have tool results, add them as system message
++  if (action.toolResults.length > 0) {
++    const toolResultsXml = action.toolResults
++      .map(
++        (result) =>
++          `<tool_result name="${result.name}" id="${result.id}">${result.result}</tool_result>`
++      )
++      .join('\n')
++
++    messages.push({
++      role: 'user',
++      content: `<system>${toolResultsXml}</system>`,
++    })
++  }
++
++  if (action.prompt) {
++    messages.push({ role: 'user', content: action.prompt })
++  }
++
++  // Get manager stream
++  const costMode = action.costMode || 'normal'
++  const model = action.model
++
++  logger.debug(
++    { model, messages, toolResults: action.toolResults },
++    'Manager prompt'
++  )
++
++  const { getStream } = getAgentStream({
++    costMode: costMode as any,
++    selectedModel: model,
++    stopSequences: ['</run_terminal_command>', '</sleep>', '</kill_terminal>'],
++    clientSessionId,
++    fingerprintId: action.fingerprintId,
++    userInputId: 'agent-' + Date.now(),
++    userId,
++  })
++
++  const stream = getStream(messages)
++
++  const allToolCalls: ToolCall[] = []
++  const clientToolCalls: ClientToolCall[] = []
++  const serverToolResults: ToolResult[] = []
++
++  function toolCallback<T extends ToolName>(
++    tool: T,
++    after: (toolCall: Extract<ToolCall, { name: T }>) => void
++  ): {
++    params: (string | RegExp)[]
++    onTagStart: () => void
++    onTagEnd: (
++      name: string,
++      parameters: Record<string, string>
++    ) => Promise<void>
++  } {
++    return {
++      params: toolSchema[tool],
++      onTagStart: () => {},
++      onTagEnd: async (_: string, parameters: Record<string, string>) => {
++        const toolCall = parseRawToolCall({
++          name: tool,
++          parameters,
++        })
++        if ('error' in toolCall) {
++          serverToolResults.push({
++            name: tool,
++            id: generateCompactId(),
++            result: toolCall.error,
++          })
++          return
++        }
++        allToolCalls.push(toolCall as Extract<ToolCall, { name: T }>)
++
++        after(toolCall as Extract<ToolCall, { name: T }>)
++      },
++    }
++  }
++  const streamWithTags = processStreamWithTags(
++    stream,
++    {
++      ...Object.fromEntries(
++        TOOL_LIST.map((tool) => [tool, toolCallback(tool, () => {})])
++      ),
++      ...Object.fromEntries(
++        (['sleep', 'kill_terminal'] as const).map((tool) => [
++          tool,
++          toolCallback(tool, (toolCall) => {
++            clientToolCalls.push({
++              ...toolCall,
++              id: generateCompactId(),
++            } as ClientToolCall)
++          }),
++        ])
++      ),
++      run_terminal_command: toolCallback('run_terminal_command', (toolCall) => {
++        const clientToolCall = {
++          ...{
++            ...toolCall,
++            parameters: {
++              ...toolCall.parameters,
++              mode: 'manager' as const,
++            },
++          },
++          id: generateCompactId(),
++        }
++        clientToolCalls.push(clientToolCall)
++      }),
++    },
++    (name, error) => {
++      serverToolResults.push({ id: generateCompactId(), name, result: error })
++    }
++  )
++
++  let fullResponse = ''
++
++  for await (const chunk of streamWithTags) {
++    fullResponse += chunk
++    onResponseChunk(chunk)
++  }
++
++  messages.push({
++    role: 'assistant',
++    content: fullResponse,
++  })
++
++  // Update agent state
++  const updatedAgentState: AgentState = {
++    ...action.agentState,
++    messageHistory: messages,
++  }
++  logger.debug(
++    {
++      prompt,
++      messages,
++      toolCalls: allToolCalls,
++      serverToolResults,
++      clientToolCalls,
++      model,
++    },
++    'Manager prompt response'
++  )
++
++  return {
++    agentState: updatedAgentState,
++    toolCalls: clientToolCalls,
++    toolResults: [],
++  }
++}
+diff --git a/backend/src/system-prompt/manager-system-prompt.ts b/backend/src/system-prompt/manager-system-prompt.ts
+new file mode 100644
+index 000000000..65aed6085
+--- /dev/null
++++ b/backend/src/system-prompt/manager-system-prompt.ts
+@@ -0,0 +1,79 @@
++import { getManagerToolsInstructions } from '../tools'
++import { getToolCallString } from 'common/constants/tools'
++
++export function getManagerSystemPrompt() {
++  const toolsInstructions = getManagerToolsInstructions()
++
++  return `You are a highly capable agent that oversees software projects. You are good at working at a high level and prompting the coding agent, Codebuff, to accomplish tasks. Your goal is to accomplish the user's multi-step task autonomously through conversation.
++
++Your primary method of interaction is through tools, especially \`run_terminal_command\`.
++
++Terminal commands will automatically wait for output to settle (0.5 seconds of no new output) or timeout based on the timeout_seconds parameter. If a command times out, the terminal will NOT be killed - you'll just get the output captured so far. Use \`kill_terminal\` if you need to forcefully restart the terminal.
++
++Use \`sleep\` to pause execution for a specified number of seconds when needed.
++
++Explain your plan, actions, and results clearly in your response before calling tools.
++
++Focus on achieving the user's task. Be methodical. If a step fails, try to understand why and correct it.
++
++You are in a conversational mode - the user will give you tasks and you should work on them step by step, asking for clarification when needed.
++
++# Codebuff
++
++Codebuff is an expert AI coding agent that helps developers edit code through natural language conversation. Codebuff can be invoked from the terminal to get help with coding tasks, from simple edits to complex refactoring and feature implementation.
++
++Invoke Codebuff like this from the root of your project:
++${getToolCallString('run_terminal_command', {
++  command: 'codebuff --lite',
++  timeout_seconds: '300',
++  process_type: 'SYNC',
++})}
++
++(We use --lite to use a more economical model. You can also start with 'codebuff --ask' to begin in ask mode if you don't want to change files yet.)
++
++This opens a shell where you can interact with Codebuff. You can also run commands directly in the shell. Then you can enter your prompt as a command.
++
++You can send prompts in natural language directly, e.g.:
++${getToolCallString('run_terminal_command', {
++  command: 'Add a console.log to the start of the npm index file',
++  timeout_seconds: '300',
++  process_type: 'SYNC',
++})}
++
++Codebuff will go and make the change and stream it's thought process as well as the tools it is using. This can take a few seconds or a few minutes. It's best to give it a long timeout, because if it finishes early it will return results back immediately. If it doesn't finish in time, you can sleep for longer to give it more time, or kill the terminal and try again.
++
++You should expect to guide Codebuff over multiple prompts. When it goes off track, you should guide it back to the task at hand.
++
++However, Codebuff is a highly capable agent that is an expert at understanding complex codebases. Instead of trying to figure out the codebase on your own, you should ask Codebuff or prompt Codebuff to just make the change and let it figure out which files to edit and how.
++
++DO NOT run grep or find commands to try to locate files or understand the codebase. Instead, you should ask Codebuff your questions.
++
++Inside Codebuff, you can use special commands that have various effects, e.g.:
++
++${getToolCallString('run_terminal_command', {
++  command: 'help',
++  timeout_seconds: '10',
++  process_type: 'SYNC',
++})}
++
++Selected commands:
++- help: Help with Codebuff, including tips and a list of all commands
++- ask: Enter a mode to ask questions. Codebuff will not make any changes to the project while in this mode. It's a good idea to start here when fleshing out a plan.
++- lite: Switch back to lite mode where Codebuff can make changes to the project
++- diff: For each file changed in the most recent response, show the diff
++- reset: Reset the conversation history (helps if Codebuff gets off track)
++- exit: Exit Codebuff
++
++You can also run any terminal command within Codebuff by prefixing with the '!' character. For example:
++${getToolCallString('run_terminal_command', {
++  command: '!ls -la',
++  timeout_seconds: '10',
++  process_type: 'SYNC',
++})}
++
++You should prefer running commands this way if you are already in Codebuff. No need to exit to run terminal commands.
++
++# Tools
++
++${toolsInstructions}`
++}
+diff --git a/backend/src/tools.ts b/backend/src/tools.ts
+index 5ed9c7643..bbbb7bcff 100644
+--- a/backend/src/tools.ts
++++ b/backend/src/tools.ts
+@@ -340,10 +340,8 @@ ${getToolCallString('code_search', { pattern: 'import.*foo' })}
+     name: 'run_terminal_command',
+     schema: z
+       .object({
+-        command: z
+-          .string()
+-          .min(1, 'Command cannot be empty')
+-          .describe(`CLI command valid for user's OS.`),
++        // Can be empty to use it for a timeout.
++        command: z.string().describe(`CLI command valid for user's OS.`),
+         process_type: z
+           .enum(['SYNC', 'BACKGROUND'])
+           .default('SYNC')
+@@ -574,6 +572,44 @@ ${getToolCallString('browser_logs', {
+ })}
+     `.trim(),
+   },
++  {
++    name: 'kill_terminal',
++    schema: z
++      .object({})
++      .transform(() => ({}))
++      .describe(
++        `Kill the current terminal process and restart it. Only available in agent mode.`
++      ),
++    additionalInfo: `
++Purpose: Use this tool to forcefully terminate the current terminal session and start fresh. This is useful when a command is stuck or the terminal is in an unresponsive state.
++
++This tool is only available in agent mode and will not work in regular Codebuff.
++
++Example:
++${getToolCallString('kill_terminal', {})}
++    `.trim(),
++  },
++  {
++    name: 'sleep',
++    schema: z
++      .object({
++        seconds: z
++          .string()
++          .min(1, 'Seconds cannot be empty')
++          .describe(`Number of seconds to sleep (as string)`),
++      })
++      .describe(
++        `Sleep for a specified number of seconds. Only available in agent mode.`
++      ),
++    additionalInfo: `
++Purpose: Use this tool to pause execution for a specified amount of time. This can be useful when waiting for processes to complete, giving time for services to start up, or adding delays between operations.
++
++This tool is only available in agent mode and will not work in regular Codebuff.
++
++Example:
++${getToolCallString('sleep', { seconds: '5' })}
++    `.trim(),
++  },
+   {
+     name: 'end_turn',
+     schema: z
+@@ -680,6 +716,12 @@ const tools = toolConfigsList.map((config) => ({
+   ),
+ })) as { name: GlobalToolNameImport; description: string }[]
+ 
++const managerTools = tools.filter((tool) =>
++  ['run_terminal_command', 'kill_terminal', 'sleep', 'end_turn'].includes(
++    tool.name
++  )
++)
++
+ const toolSchemas = Object.fromEntries(
+   toolConfigsList.map((tool) => [tool.name, tool.schema])
+ ) as {
+@@ -1166,20 +1208,29 @@ function renderSubgoalUpdate(subgoal: {
+   return getToolCallString('add_subgoal', params)
+ }
+ 
+-// Function to get filtered tools based on cost mode
++export function getManagerToolsInstructions() {
++  return getToolsInstructions(managerTools.map((tool) => tool.description))
++}
++
++// Function to get filtered tools based on cost mode and agent mode
+ export function getFilteredToolsInstructions(costMode: string) {
+-  const allowedTools =
+-    costMode === 'ask'
+-      ? // For ask mode, exclude write_file, str_replace, create_plan, and run_terminal_command
+-        tools.filter(
+-          (tool) =>
+-            ![
+-              'write_file',
+-              'str_replace',
+-              'create_plan',
+-              'run_terminal_command',
+-            ].includes(tool.name)
+-        )
+-      : tools
++  let allowedTools = tools.filter(
++    (tool) => !['kill_terminal', 'sleep'].includes(tool.name)
++  )
++
++  // Filter based on cost mode
++  if (costMode === 'ask') {
++    // For ask mode, exclude write_file, str_replace, create_plan, and run_terminal_command
++    allowedTools = allowedTools.filter(
++      (tool) =>
++        ![
++          'write_file',
++          'str_replace',
++          'create_plan',
++          'run_terminal_command',
++        ].includes(tool.name)
++    )
++  }
++
+   return getToolsInstructions(allowedTools.map((tool) => tool.description))
+ }
+diff --git a/backend/src/websockets/websocket-action.ts b/backend/src/websockets/websocket-action.ts
+index 7e4d50041..8bb7f0f08 100644
+--- a/backend/src/websockets/websocket-action.ts
++++ b/backend/src/websockets/websocket-action.ts
+@@ -13,6 +13,7 @@ import { eq } from 'drizzle-orm'
+ import { WebSocket } from 'ws'
+ 
+ import { mainPrompt } from '../main-prompt'
++import { managerPrompt } from '../manager-prompt'
+ import { protec } from './middleware'
+ import { sendMessage } from './server'
+ 
+@@ -123,8 +124,15 @@ const onPrompt = async (
+   clientSessionId: string,
+   ws: WebSocket
+ ) => {
+-  const { fingerprintId, authToken, promptId, prompt, toolResults, model, costMode } =
+-    action
++  const {
++    fingerprintId,
++    authToken,
++    promptId,
++    prompt,
++    toolResults,
++    model,
++    costMode,
++  } = action
+ 
+   await withLoggerContext(
+     { fingerprintId, clientRequestId: promptId, costMode },
+@@ -139,6 +147,7 @@ const onPrompt = async (
+         trackEvent(AnalyticsEvent.USER_INPUT, userId, {
+           prompt,
+           promptId,
++          isAgentMode: false,
+         })
+       }
+ 
+@@ -216,6 +225,124 @@ const onPrompt = async (
+   )
+ }
+ 
++/**
++ * Handles agent prompt actions from the client
++ */
++const onManagerPrompt = async (
++  action: Extract<ClientAction, { type: 'manager-prompt' }>,
++  clientSessionId: string,
++  ws: WebSocket
++) => {
++  const {
++    fingerprintId,
++    authToken,
++    prompt,
++    promptId,
++    agentState,
++    toolResults,
++    costMode,
++    model,
++  } = action
++
++  await withLoggerContext(
++    { fingerprintId, clientRequestId: 'manager-' + Date.now(), costMode },
++    async () => {
++      const userId = await getUserIdFromAuthToken(authToken)
++      if (!userId) {
++        throw new Error('User not found')
++      }
++
++      if (prompt) {
++        logger.info({ userId, fingerprintId }, `MANAGER PROMPT: ${prompt}`)
++      }
++
++      trackEvent(AnalyticsEvent.USER_INPUT, userId, {
++        prompt,
++        promptId,
++        isManagerMode: true,
++      })
++
++      try {
++        const {
++          toolCalls,
++          toolResults: serverToolResults,
++          agentState: updatedAgentState,
++        } = await managerPrompt(
++          ws,
++          {
++            type: 'manager-prompt',
++            prompt,
++            agentState,
++            toolResults,
++            fingerprintId,
++            authToken,
++            costMode,
++            model,
++          },
++          userId,
++          clientSessionId,
++          (chunk) => {
++            sendAction(ws, {
++              type: 'response-chunk',
++              userInputId: promptId,
++              chunk,
++            })
++          },
++          agentState.fileContext
++        )
++        sendAction(ws, {
++          type: 'manager-prompt-response',
++          promptId,
++          toolCalls: toolCalls as any[],
++          toolResults: serverToolResults,
++          agentState: updatedAgentState,
++        })
++      } catch (e) {
++        logger.error(e, 'Error in handleManagerPrompt')
++        const response =
++          e && typeof e === 'object' && 'message' in e ? `\n\n${e.message}` : ''
++
++        sendAction(ws, {
++          type: 'response-chunk',
++          userInputId: promptId,
++          chunk: response,
++        })
++
++        const updatedAgentState = {
++          ...agentState,
++          messageHistory: buildArray(
++            ...agentState.messageHistory,
++            prompt && {
++              role: 'user' as const,
++              content: [{ type: 'text' as const, text: prompt }],
++            },
++            {
++              role: 'assistant' as const,
++              content: [{ type: 'text' as const, text: response }],
++            }
++          ),
++        }
++        setTimeout(() => {
++          sendAction(ws, {
++            type: 'manager-prompt-response',
++            promptId,
++            toolCalls: [],
++            agentState: updatedAgentState,
++            toolResults: [],
++          })
++        }, 100)
++      } finally {
++        const usageResponse = await genUsageResponse(
++          fingerprintId,
++          userId,
++          undefined
++        )
++        sendAction(ws, usageResponse)
++      }
++    }
++  )
++}
++
+ /**
+  * Handles initialization actions from the client
+  * @param fileContext - The file context information
+@@ -328,6 +455,7 @@ export const onWebsocketAction = async (
+ // Register action handlers
+ subscribeToAction('prompt', protec.run(onPrompt))
+ subscribeToAction('init', protec.run(onInit, { silent: true }))
++subscribeToAction('manager-prompt', protec.run(onManagerPrompt))
+ 
+ /**
+  * Requests multiple files from the client
+diff --git a/codebuff-export-agent-mode-planning.md b/codebuff-export-agent-mode-planning.md
+new file mode 100644
+index 000000000..9c60b885e
+--- /dev/null
++++ b/codebuff-export-agent-mode-planning.md
+@@ -0,0 +1,140 @@
++# Codebuff Agent Mode: Conversation Export
++
++This document summarizes the planning and key decisions made for implementing a new "Agent Mode" in Codebuff.
++
++## I. Initial Concept & Brainstorming
++
++The core idea is to evolve Codebuff into an agent capable of handling complex development workflows, including its own development and evaluations.
++
++**User's Initial Thoughts:**
++*   Enable Codebuff to manage all parts of the development lifecycle.
++*   Introduce an `/agent` mode where Codebuff can be prompted to follow workflows.
++*   This mode would use Codebuff (or a version of it) as a primary tool, potentially enabling recursive self-improvement.
++*   Key features: persistent terminal, stored memory (in files), auto-context cleaning.
++*   Future possibilities: reading the screen, using Codebuff for dogfooding/evals by other companies.
++*   Open question: Should the agent delegate tasks to a core Codebuff instance, or should Codebuff's functionality be integrated directly into the agent?
++
++## II. MVP Definition & Detailed Implementation Steps
++
++**User's MVP Goal:**
++Create a minimal working example of `/agent` mode that can:
++1.  Take an initial prompt from the user.
++2.  Operate the terminal using the refined persistent PTY logic.
++3.  Have pre-existing knowledge about Codebuff's codebase to allow for self-modification.
++
++### A. CLI Integration & Mode Activation
++
++**Objective:** Allow users to invoke `/agent <initial_task_prompt>` from the CLI.
++
++1.  **Modify `npm-app/src/cli.ts`:**
++    *   In the `processCommand` method (or similar input handling logic):
++        *   Add a condition to detect if `userInput` starts with `/agent ` (or is just `/agent`).
++        *   If matched, extract the `initial_task_prompt` (the part after `/agent `).
++        *   Track an analytics event for `/agent` command usage.
++        *   The `processCommand` method should return the `initial_task_prompt` (or the full `/agent ...` string) to be handled by `forwardUserInput`.
++        *   Modify `forwardUserInput` in `npm-app/src/cli.ts` or `Client.getInstance().sendUserInput` in `npm-app/src/client.ts` to detect if the prompt is an agent command.
++        *   If it's an agent command, send a specific message type to the backend, e.g., `{ type: 'agent_initial_prompt', task: initial_task_prompt, agentState: ... }` instead of the standard `{ type: 'prompt', prompt: ... }`.
++2.  **Modify `npm-app/src/menu.ts`:**
++    *   Add a new entry to the `interactiveCommandDetails` array for the `/agent` command, describing its purpose and syntax (e.g., `/agent [your multi-step task]`).
++3.  **Update `npm-app/src/client.ts`:**
++    *   Ensure `sendUserInput` (or a new dedicated method) can construct and send the `agent_initial_prompt` message type.
++4.  **Update `common/src/actions.ts` (or equivalent schema definition):**
++    *   Define the new `AgentInitialPromptActionSchema` for the message sent from client to server (e.g., including `task`, `agentState`, `toolResults?`).
++    *   Define an `AgentToolResponseActionSchema` for subsequent messages from the client containing tool results for the agent.
++5.  **Update Backend WebSocket Handler (e.g., `backend/src/websockets/server.ts`):**
++    *   Add a case to `processMessage` (or equivalent) to handle the new `agent_initial_prompt` action type and the `agent_tool_response` action type.
++    *   These cases should call the new `handleAgentPrompt` function, passing the current `agentState` (retrieved or initialized by the client's session/ID).
++
++### B. Backend: Agent-Specific System Prompt
++
++**Objective:** Create and utilize a system prompt tailored for Agent Mode.
++
++1.  **Define `AGENT_SYSTEM_PROMPT` (likely as a const string within `backend/src/agent-prompt.ts`):**
++    *   **Content Guidelines:**
++        *   "You are Codebuff operating in Agent Mode. Your goal is to accomplish the user's multi-step task autonomously."
++        *   "Your primary method of interaction is through tools, especially `run_terminal_command`. Analyze output carefully to decide subsequent actions."
++        *   "Available tools: `run_terminal_command`, `read_files`, `write_file`, `code_search`, `add_subgoal`, `update_subgoal`, `end_turn`." (List only essential tools for MVP).
++        *   "**Self-Awareness of Codebuff:** You are an instance of Codebuff. You can modify your own source code located in `/Users/jahooma/codebuff`."
++        *   "Key Codebuff files: `backend/src/tools.ts`, `npm-app/src/cli.ts`, `npm-app/src/utils/terminal.ts`, `backend/src/agent-prompt.ts`."
++        *   "To build/test Codebuff: run `bun run build && bun run test` from the project root (`/Users/jahooma/codebuff`)."
++        *   "Terminal commands might return output before they fully complete. The status will indicate this. Use `<command_signal>CTRL_C</command_signal>` with `run_terminal_command` to attempt to stop such processes."
++        *   "Use `add_subgoal` and `update_subgoal` to create a plan and track your progress."
++        *   "Explain your plan, actions, and results clearly in your response before calling tools."
++        *   "Use `end_turn` *only* when the entire task is complete or you absolutely require user input to proceed."
++        *   "Focus on achieving the user's task. Be methodical. If a step fails, try to understand why and correct it."
++2.  **Integration:** This system prompt will be used directly within `backend/src/agent-prompt.ts`.
++
++### C. Terminal Implementation Refinement (in `npm-app/src/utils/terminal.ts`)
++
++**Objective:** Implement robust, persistent terminal interaction for the agent.
++*(This section summarizes the already discussed and (conceptually) implemented changes)*
++*No new sub-steps, this section is a summary of prior decisions.*
++
++### D. Backend: New Agent Prompt Handler (`backend/src/agent-prompt.ts`)
++
++**Objective:** Create a new, simplified backend prompt handler for Agent Mode using Gemini Pro.
++
++1.  **Create `backend/src/agent-prompt.ts`:**
++2.  **Define `AGENT_SYSTEM_PROMPT` String:**
++    *   Store the system prompt content from **Section II.B.1** directly in this file.
++3.  **Implement `handleAgentPrompt` Function:**
++    *   **Signature:** `async function handleAgentPrompt(ws: WebSocket, action: AgentInitialPromptAction | AgentToolResponseAction, userId: string | undefined, clientSessionId: string, agentState: AgentState, onResponseChunk: (chunk: string) => void, fileContext: ProjectFileContext)`
++    *   **Message History Management:**
++        *   Initialize `currentMessageHistory` based on `agentState.messageHistory`.
++        *   If `action.type === 'agent_initial_prompt'`, and `agentState.messageHistory` is empty or a new task is indicated, reset `currentMessageHistory = [{ role: 'system', content: AGENT_SYSTEM_PROMPT }, { role: 'user', content: action.task }]`.
++        *   If `action.type === 'agent_tool_response'`, append `action.toolResults` (as a system message containing XML tool results) to `currentMessageHistory`.
++    *   **Model Configuration & Streaming:**
++        *   Use `getAgentStream` (from `backend/src/prompt-agent-stream.ts` - this might need to be generalized or a new similar function created if `getAgentStream` is too specific to existing flows).
++        *   Pass `currentMessageHistory`.
++        *   Configure for `model: models.gemini2_5_pro_preview` (or a specific Gemini Pro model).
++        *   **Stop Sequences:** Include a string that matches the end of a terminal command tool call, e.g., `_terminal_command>`. Also include standard tool call closing tags like `</tool_name>` for other tools.
++    *   **Response Processing Loop (Conceptual):**
++        *   `fullResponse = ""`
++        *   `toolCalls: RawToolCall[] = []`
++        *   `for await (const chunk of llmStream)`:
++            *   `fullResponse += chunk`
++            *   `onResponseChunk(chunk)` (stream to client via WebSocket).
++            *   Parse `fullResponse` for complete tool calls using `parseToolCalls` (from `backend/src/tools.ts`). If new complete tool calls are found, add them to `toolCalls`.
++        *   Append `{ role: 'assistant', content: fullResponse }` to `currentMessageHistory`.
++    *   **Tool Execution & State Update:**
++        *   If `toolCalls` is not empty:
++            *   Send `toolCalls` to the client via WebSocket (e.g., `{ type: 'agent_request_tool_execution', toolCalls: toolCalls }`).
++            *   Update `agentState.messageHistory = currentMessageHistory`.
++            *   The client will execute tools and send back an `agent_tool_response` action, triggering `handleAgentPrompt` again.
++        *   If `toolCalls` is empty (LLM decided to `end_turn` or finished the task):
++            *   Update `agentState.messageHistory = currentMessageHistory`.
++            *   The `fullResponse` is the agent's final textual response for this turn.
++            *   If `fullResponse` contains `<end_turn></end_turn>`, the agent considers its current sub-task or overall task complete for now.
++    *   **Agent State Persistence:**
++        *   The `agentState` (including `messageHistory`, `subgoals`, etc.) needs to be persisted between calls. This could be managed by the `backend/src/websockets/server.ts` layer, associating it with `clientSessionId` or `userId`. For MVP, it might be held in memory on the server, associated with the WebSocket connection, or passed back and forth with each client-server message.
++    *   **Subgoal Handling:**
++        *   Tool calls for `add_subgoal` and `update_subgoal` should be processed by the backend (similar to how `mainPrompt` might handle them, perhaps by directly modifying `agentState.subgoals` after parsing the tool call, before sending to client if these tools don't require client-side execution).
++        *   Alternatively, these could be special tool calls the client handles by updating its local `agentState` and then sending the updated state back. For simplicity, backend processing might be easier initially.
++
++### E. Client-Side Agent Logic (`npm-app/src/client.ts` and `npm-app/src/tool-handlers.ts`)
++
++**Objective:** Enable the client to interact with the agent backend and execute tools.
++
++1.  **Modify `npm-app/src/client.ts`:**
++    *   **Agent State Management:**
++        *   Store `agentState: AgentState` within the `Client` instance. Initialize with `getInitialAgentState()`.
++        *   When sending `agent_initial_prompt` or `agent_tool_response`, include the current `agentState`.
++        *   When receiving messages from the agent backend, update the local `agentState` if the backend sends updates (e.g., to subgoals).
++    *   **Handle `agent_request_tool_execution` message from backend:**
++        *   Iterate through `toolCalls`.
++        *   For each tool call, invoke the appropriate handler from `npm-app/src/tool-handlers.ts` (e.g., `handleRunTerminalCommand`, `handleReadFile`, etc.).
++        *   Ensure `handleRunTerminalCommand` uses `isAgentMode: true`.
++        *   Collect all `ToolResult` objects.
++        *   Send an `agent_tool_response` message back to the server: `{ type: 'agent_tool_response', toolResults: collectedResults, agentState: currentAgentState }`.
++2.  **Modify `npm-app/src/tool-handlers.ts`:**
++    *   Ensure all tool handlers used by the agent can be called programmatically and return `ToolResult` objects.
++    *   `handleRunTerminalCommand` needs to correctly use the `isAgentMode` flag passed down from the agent invocation path.
++
++## III. Future Considerations (Post-MVP)
++*   More sophisticated memory management for the agent (e.g., vector DB for long-term memory).
++*   Agent ability to run Codebuff CLI commands itself (recursive self-operation).
++*   Screen reading capabilities.
++*   More complex planning and decomposition of tasks.
++*   Error handling and self-correction loops for the agent.
++
++This captures the main points of our discussion and the plan for the Agent Mode MVP.
+diff --git a/common/src/actions.ts b/common/src/actions.ts
+index a2c232f2e..6602a19e8 100644
+--- a/common/src/actions.ts
++++ b/common/src/actions.ts
+@@ -39,6 +39,19 @@ export const CLIENT_ACTION_SCHEMA = z.discriminatedUnion('type', [
+     cwd: z.string().optional(),
+     repoName: z.string().optional(),
+   }),
++  z.object({
++    type: z.literal('manager-prompt'),
++    promptId: z.string(),
++    prompt: z.string().optional(), // Optional for tool result responses
++    agentState: AgentStateSchema,
++    toolResults: z.array(ToolResultSchema),
++    fingerprintId: z.string(),
++    authToken: z.string().optional(),
++    costMode: z.enum(costModes).optional().default('normal'),
++    model: z.string().optional(),
++    cwd: z.string().optional(),
++    repoName: z.string().optional(),
++  }),
+   z.object({
+     type: z.literal('read-files-response'),
+     files: z.record(z.string(), z.union([z.string(), z.null()])),
+@@ -117,6 +130,15 @@ export const PromptResponseSchema = z.object({
+ })
+ export type PromptResponse = z.infer<typeof PromptResponseSchema>
+ 
++export const ManagerPromptResponseSchema = z.object({
++  type: z.literal('manager-prompt-response'),
++  promptId: z.string(),
++  agentState: AgentStateSchema,
++  toolCalls: z.array(NewToolCallSchema),
++  toolResults: z.array(ToolResultSchema),
++})
++export type ManagerPromptResponse = z.infer<typeof ManagerPromptResponseSchema>
++
+ export const SERVER_ACTION_SCHEMA = z.discriminatedUnion('type', [
+   z.object({
+     type: z.literal('response-chunk'),
+@@ -125,6 +147,7 @@ export const SERVER_ACTION_SCHEMA = z.discriminatedUnion('type', [
+   }),
+   ResponseCompleteSchema,
+   PromptResponseSchema,
++  ManagerPromptResponseSchema,
+   z.object({
+     type: z.literal('read-files'),
+     filePaths: z.array(z.string()),
+diff --git a/common/src/constants/tools.ts b/common/src/constants/tools.ts
+index 0b8e6f2c4..1956790c8 100644
+--- a/common/src/constants/tools.ts
++++ b/common/src/constants/tools.ts
+@@ -19,6 +19,10 @@ export const toolSchema = {
+ 
+   browser_logs: ['type', 'url', 'waitUntil'],
+ 
++  // Agent-only tools
++  kill_terminal: [],
++  sleep: ['seconds'],
++
+   end_turn: [],
+ }
+ 
+diff --git a/npm-app/package.json b/npm-app/package.json
+index eb40c1e03..662fb169d 100644
+--- a/npm-app/package.json
++++ b/npm-app/package.json
+@@ -18,6 +18,7 @@
+     "start-max": "nx build npm-app > /dev/null && bun run with-env -- sh -c 'TS_NODE_PROJECT=./tsconfig.json ts-node -r tsconfig-paths/register src/index.ts .. --max'",
+     "start-lite": "nx build npm-app > /dev/null && bun run with-env -- sh -c 'TS_NODE_PROJECT=./tsconfig.json ts-node -r tsconfig-paths/register src/index.ts .. --lite'",
+     "start-ask": "nx build npm-app > /dev/null && bun run with-env -- sh -c 'TS_NODE_PROJECT=./tsconfig.json ts-node -r tsconfig-paths/register src/index.ts .. --ask'",
++    "start-superagent": "nx build npm-app > /dev/null && bun run with-env -- sh -c 'TS_NODE_PROJECT=./tsconfig.json ts-node -r tsconfig-paths/register src/index.ts .. --superagent'",
+     "start-dir": "bun run with-env -- ts-node -r tsconfig-paths/register src/index.ts",
+     "start-experimental": "nx build npm-app > /dev/null && bun run with-env -- sh -c 'TS_NODE_PROJECT=./tsconfig.json ts-node -r tsconfig-paths/register src/index.ts .. --experimental'",
+     "with-env": "env-cmd -f ./loadEnv.js",
+diff --git a/npm-app/src/cli-definitions.ts b/npm-app/src/cli-definitions.ts
+index 3c6bdca66..cbe0d4707 100644
+--- a/npm-app/src/cli-definitions.ts
++++ b/npm-app/src/cli-definitions.ts
+@@ -56,7 +56,8 @@ export const cliOptions: CliParam[] = [
+   },
+   {
+     flags: '--ask',
+-    description: 'Start in ask mode (questions & planning only, no code changes)',
++    description:
++      'Start in ask mode (questions & planning only, no code changes)',
+     menuDescription: 'Start in ask mode (questions & planning only)',
+     hidden: false,
+   },
+@@ -65,4 +66,10 @@ export const cliOptions: CliParam[] = [
+     description: 'Use cutting-edge experimental features and models',
+     hidden: true,
+   },
++  {
++    flags: '--superagent',
++    description: 'Start in superagent mode (autonomously use codebuff)',
++    menuDescription: 'Start in superagent mode (autonomously use codebuff)',
++    hidden: true,
++  },
+ ]
+diff --git a/npm-app/src/cli.ts b/npm-app/src/cli.ts
+index 5b0630017..03e806972 100644
+--- a/npm-app/src/cli.ts
++++ b/npm-app/src/cli.ts
+@@ -83,15 +83,17 @@ export class CLI {
+   private pastedContent: string = ''
+   private isPasting: boolean = false
+   private shouldReconnectWhenIdle: boolean = false
++  public isManagerMode: boolean
+ 
+   public rl!: readline.Interface
+ 
+   private constructor(
+     readyPromise: Promise<[ProjectFileContext, void, void]>,
+-    { git, costMode, model }: CliOptions
++    { git, costMode, model, isManager }: CliOptions
+   ) {
+     this.git = git
+     this.costMode = costMode
++    this.isManagerMode = isManager ?? false
+ 
+     this.setupSignalHandlers()
+     this.initReadlineInterface()
+@@ -384,7 +386,10 @@ export class CLI {
+   }
+ 
+   private getModeIndicator(): string {
+-    return this.costMode !== 'normal' ? ` (${this.costMode})` : ''
++    const costModeIndicator =
++      this.costMode !== 'normal' ? ` (${this.costMode})` : ''
++    const managerModeIndicator = this.isManagerMode ? ' (superagent)' : ''
++    return costModeIndicator + managerModeIndicator
+   }
+ 
+   private setPrompt() {
+@@ -799,6 +804,7 @@ export class CLI {
+     }
+ 
+     this.isReceivingResponse = true
++
+     const { responsePromise, stopResponse } =
+       await Client.getInstance().sendUserInput(cleanedInput)
+ 
+diff --git a/npm-app/src/client.ts b/npm-app/src/client.ts
+index 30a3690af..fd1872706 100644
+--- a/npm-app/src/client.ts
++++ b/npm-app/src/client.ts
+@@ -13,6 +13,7 @@ import {
+   FileChanges,
+   FileChangeSchema,
+   InitResponseSchema,
++  ManagerPromptResponseSchema,
+   MessageCostResponseSchema,
+   PromptResponseSchema,
+   ServerAction,
+@@ -82,6 +83,7 @@ import { Spinner } from './utils/spinner'
+ import { toolRenderers } from './utils/tool-renderers'
+ import { createXMLStreamParser } from './utils/xml-stream-parser'
+ import { getScrapedContentBlocks, parseUrlsFromContent } from './web-scraper'
++import { readNewTerminalOutput } from './utils/terminal'
+ 
+ const LOW_BALANCE_THRESHOLD = 100
+ 
+@@ -871,7 +873,9 @@ export class Client {
+ 
+   async sendUserInput(prompt: string): Promise<{
+     responsePromise: Promise<
+-      ServerAction & { type: 'prompt-response' } & { wasStoppedByUser: boolean }
++      ServerAction & { type: 'prompt-response' | 'manager-prompt-response' } & {
++        wasStoppedByUser: boolean
++      }
+     >
+     stopResponse: () => void
+   }> {
+@@ -886,7 +890,14 @@ export class Client {
+     loggerContext.clientRequestId = userInputId
+     const startTime = Date.now() // Capture start time
+ 
+-    const { responsePromise, stopResponse } = this.subscribeToResponse(
++    // Check if we're in manager mode using CLI's isManagerMode flag
++    const cli = CLI.getInstance()
++
++    const f = cli.isManagerMode
++      ? this.subscribeToManagerResponse.bind(this)
++      : this.subscribeToResponse.bind(this)
++
++    const { responsePromise, stopResponse } = f(
+       (chunk) => {
+         Spinner.get().stop()
+         process.stdout.write(chunk)
+@@ -909,6 +920,11 @@ export class Client {
+     const toolResults = buildArray(
+       ...(this.lastToolResults || []),
+       ...getBackgroundProcessUpdates(),
++      cli.isManagerMode && {
++        id: 'continued-terminal-output',
++        name: 'run_terminal_command',
++        result: readNewTerminalOutput(),
++      },
+       scrapedContent && {
+         id: 'scraped-content',
+         name: 'web-scraper',
+@@ -917,8 +933,8 @@ export class Client {
+     )
+ 
+     Spinner.get().start()
+-    this.webSocket.sendAction({
+-      type: 'prompt',
++
++    const action = {
+       promptId: userInputId,
+       prompt,
+       agentState: this.agentState,
+@@ -929,7 +945,18 @@ export class Client {
+       model: this.model,
+       cwd: getWorkingDirectory(),
+       repoName: loggerContext.repoName,
+-    })
++    }
++    if (cli.isManagerMode) {
++      this.webSocket.sendAction({
++        type: 'manager-prompt',
++        ...action,
++      })
++    } else {
++      this.webSocket.sendAction({
++        type: 'prompt',
++        ...action,
++      })
++    }
+ 
+     return {
+       responsePromise,
+@@ -1379,4 +1406,248 @@ Go to https://www.codebuff.com/config for more information.`) +
+ 
+     await this.fetchStoredApiKeyTypes()
+   }
++
++  private subscribeToManagerResponse(
++    onChunk: (chunk: string) => void,
++    userInputId: string,
++    onStreamStart: () => void,
++    prompt: string,
++    startTime: number
++  ) {
++    const rawChunkBuffer: string[] = []
++    this.responseBuffer = ''
++    let streamStarted = false
++    let responseStopped = false
++    let resolveResponse: (
++      value: ServerAction & { type: 'manager-prompt-response' } & {
++        wasStoppedByUser: boolean
++      }
++    ) => void
++    let rejectResponse: (reason?: any) => void
++    let unsubscribeChunks: () => void
++    let unsubscribeComplete: () => void
++
++    const responsePromise = new Promise<
++      ServerAction & { type: 'manager-prompt-response' } & {
++        wasStoppedByUser: boolean
++      }
++    >((resolve, reject) => {
++      resolveResponse = resolve
++      rejectResponse = reject
++    })
++
++    const stopResponse = () => {
++      responseStopped = true
++      unsubscribeChunks()
++      unsubscribeComplete()
++
++      const additionalMessages = [
++        { role: 'user' as const, content: prompt },
++        {
++          role: 'user' as const,
++          content: `<system><assistant_message>${rawChunkBuffer.join('')}</assistant_message>[RESPONSE_CANCELED_BY_USER]</system>`,
++        },
++      ]
++
++      // Update the agent state with just the assistant's response
++      const { messageHistory } = this.agentState!
++      const newMessages = [...messageHistory, ...additionalMessages]
++      this.agentState = {
++        ...this.agentState!,
++        messageHistory: newMessages,
++      }
++      setMessages(newMessages)
++
++      resolveResponse({
++        type: 'manager-prompt-response',
++        promptId: userInputId,
++        agentState: this.agentState!,
++        toolCalls: [],
++        toolResults: [],
++        wasStoppedByUser: true,
++      })
++    }
++
++    const xmlStreamParser = createXMLStreamParser(toolRenderers, (chunk) => {
++      onChunk(chunk)
++    })
++
++    unsubscribeChunks = this.webSocket.subscribe('response-chunk', (a) => {
++      if (a.userInputId !== userInputId) return
++      const { chunk } = a
++
++      rawChunkBuffer.push(chunk)
++
++      const trimmed = chunk.trim()
++      for (const tag of ONE_TIME_TAGS) {
++        if (trimmed.startsWith(`<${tag}>`) && trimmed.endsWith(`</${tag}>`)) {
++          if (this.oneTimeFlags[tag]) {
++            return
++          }
++          Spinner.get().stop()
++          const warningMessage = trimmed
++            .replace(`<${tag}>`, '')
++            .replace(`</${tag}>`, '')
++          process.stdout.write(yellow(`\n\n${warningMessage}\n\n`))
++          this.oneTimeFlags[tag as (typeof ONE_TIME_LABELS)[number]] = true
++          return
++        }
++      }
++
++      if (chunk && chunk.trim()) {
++        if (!streamStarted && chunk.trim()) {
++          streamStarted = true
++          onStreamStart()
++        }
++      }
++
++      try {
++        xmlStreamParser.write(chunk, 'utf8')
++      } catch (e) {
++        // console.error('Error writing chunk', e)
++      }
++    })
++
++    let stepsCount = 0
++    let toolCallsCount = 0
++    unsubscribeComplete = this.webSocket.subscribe(
++      'manager-prompt-response',
++      async (action) => {
++        const parsedAction = ManagerPromptResponseSchema.safeParse(action)
++        if (!parsedAction.success) {
++          const message = [
++            'Received invalid manager-prompt-response from server:',
++            JSON.stringify(parsedAction.error.errors),
++            'If this issues persists, please contact support@codebuff.com',
++          ].join('\n')
++          console.error(message)
++          logger.error(message, {
++            eventId: AnalyticsEvent.MALFORMED_PROMPT_RESPONSE,
++          })
++          return
++        }
++        if (action.promptId !== userInputId) return
++        const a = parsedAction.data
++        let isComplete = false
++
++        Spinner.get().stop()
++
++        this.agentState = a.agentState
++        const toolResults: ToolResult[] = [...a.toolResults]
++
++        for (const toolCall of a.toolCalls) {
++          try {
++            if (toolCall.name === 'end_turn') {
++              this.responseComplete = true
++              isComplete = true
++              continue
++            }
++            if (toolCall.name === 'run_terminal_command') {
++              if (toolCall.parameters.mode === 'user') {
++                // Special case: when terminal command is run as a user command, then no need to reprompt assistant.
++                this.responseComplete = true
++                isComplete = true
++              }
++            }
++            const toolResult = await handleToolCall(toolCall)
++            toolResults.push(toolResult)
++          } catch (error) {
++            console.error(
++              '\n\n' +
++                red(`Error parsing tool call ${toolCall.name}:\n${error}`) +
++                '\n'
++            )
++          }
++        }
++        stepsCount++
++        toolCallsCount += a.toolCalls.length
++        if (a.toolCalls.length === 0 && a.toolResults.length === 0) {
++          this.responseComplete = true
++          isComplete = true
++        }
++        console.log('\n')
++
++        // If we had any file changes, update the project context
++        if (this.hadFileChanges) {
++          this.fileContext = await getProjectFileContext(getProjectRoot(), {})
++        }
++
++        if (!isComplete) {
++          // Append process updates to existing tool results
++          toolResults.push(...getBackgroundProcessUpdates())
++          toolResults.push({
++            id: 'continued-terminal-output',
++            name: 'run_terminal_command',
++            result: readNewTerminalOutput(),
++          })
++          // Continue the prompt with the tool results.
++          Spinner.get().start()
++          this.webSocket.sendAction({
++            type: 'manager-prompt',
++            promptId: userInputId,
++            prompt: undefined,
++            agentState: this.agentS
+
+… [diff truncated: view full diff on GitHub] …

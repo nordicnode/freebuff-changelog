@@ -1,0 +1,407 @@
+diff --git a/backend/src/get-documentation-for-query.ts b/backend/src/get-documentation-for-query.ts
+index 6da969c30..231b5101b 100644
+--- a/backend/src/get-documentation-for-query.ts
++++ b/backend/src/get-documentation-for-query.ts
+@@ -1,28 +1,16 @@
+-import { geminiModels } from 'common/constants'
+-
+-import {
+-  context7LibrariesPromise,
+-  fetchContext7LibraryDocumentation,
+-} from './llm-apis/context7-api'
+-
+ import { logger } from '@/util/logger'
+ import { z } from 'zod'
++import { uniq } from 'lodash'
++
++import { geminiModels } from 'common/constants'
+ import { promptAiSdkStructured } from './llm-apis/vercel-ai-sdk/ai-sdk'
++import { fetchContext7LibraryDocumentation } from './llm-apis/context7-api'
+ 
+-interface ProjectAnalysis {
+-  projectId: string
+-  topic: string
+-  confidence: number
+-}
+ 
+-const zodSchema = z.object({
+-  projectId: z.string(),
+-  topic: z.string(),
+-  confidence: z.number().describe('0-1 score of relevance'),
+-}) satisfies z.ZodType<ProjectAnalysis>
++const DELIMITER = `\n\n----------------------------------------\n\n`
+ 
+ /**
+- * Gets relevant documentation chunks for a query by using Gemini to analyze the best project and topic
++ * Gets relevant documentation chunks for a query by using Flash to analyze the best project and topic
+  * @param query The user's query to find documentation for
+  * @param options Optional parameters for the request
+  * @param options.tokens Number of tokens to retrieve (default: 5000)
+@@ -42,44 +30,160 @@ export async function getDocumentationForQuery(
+   }
+ ): Promise<string | null> {
+   const startTime = Date.now()
+-  let geminiDuration: number | null = null
+ 
+-  // Get the list of available projects
+-  const projects = await context7LibrariesPromise
+-  if (projects.length === 0) {
+-    logger.warn('No Context7 projects available')
++  // 1. Search for relevant libraries
++  const libraryResults = await suggestLibraries(query, options)
++
++  if (!libraryResults || libraryResults.libraries.length === 0) {
++    logger.info(
++      {
++        query,
++        timings: {
++          total: Date.now() - startTime,
++        },
++      },
++      'Documentation chunks: No relevant libraries suggested.'
++    )
+     return null
+   }
+ 
+-  // Create a prompt for Gemini to analyze the query and projects
+-  const projectsList = projects
+-    .map((p) => `${p.settings.title} (ID: ${p.settings.project})`)
+-    .join('\n')
++  const { libraries, geminiDuration: geminiDuration1 } = libraryResults
+ 
+-  const prompt = `You are an expert at analyzing documentation queries and matching them to the most relevant project and topic. Given a user's query and a list of available documentation projects, determine which project would be most relevant and what topic/keywords would help find the most relevant chunks of documentation.
++  // 2. Fetch documentation for these libraries
++  const allRawChunks = (
++    await Promise.all(
++      libraries.map(({ libraryName, topic }) =>
++        fetchContext7LibraryDocumentation(libraryName, {
++          tokens: options.tokens,
++          topic,
++        })
++      )
++    )
++  ).flat()
+ 
+-Available projects:
+-${projectsList}
++  const allUniqueChunks = uniq(
++    allRawChunks
++      .filter((chunk) => chunk !== null)
++      .join(DELIMITER)
++      .split(DELIMITER)
++  )
+ 
+-User query (in quotes):
+-${JSON.stringify(query)}
+-`
++  if (allUniqueChunks.length === 0) {
++    logger.info(
++      {
++        query,
++        libraries,
++        timings: {
++          total: Date.now() - startTime,
++          gemini1: geminiDuration1,
++        },
++      },
++      'Documentation chunks: No chunks found after fetching from Context7.'
++    )
++    return null
++  }
++
++  // 3. Filter relevant chunks using another LLM call
++  const filterResults = await filterRelevantChunks(
++    query,
++    allUniqueChunks,
++    options
++  )
++
++  const totalDuration = Date.now() - startTime
++
++  if (!filterResults || filterResults.relevantChunks.length === 0) {
++    logger.info(
++      {
++        query,
++        libraries,
++        chunks: allUniqueChunks,
++        chunksCount: allUniqueChunks.length,
++        geminiDuration1,
++        geminiDuration2: filterResults?.geminiDuration,
++        timings: {
++          total: totalDuration,
++          gemini1: geminiDuration1,
++          gemini2: filterResults?.geminiDuration,
++        },
++      },
++      'Documentation chunks: No relevant chunks selected by the filter, or filter failed.'
++    )
++    return null
++  }
++
++  const { relevantChunks, geminiDuration: geminiDuration2 } = filterResults
++
++  logger.info(
++    {
++      query,
++      libraries,
++      chunks: allUniqueChunks,
++      chunksCount: allUniqueChunks.length,
++      relevantChunks,
++      relevantChunksCount: relevantChunks.length,
++      timings: {
++        total: totalDuration,
++        gemini1: geminiDuration1,
++        gemini2: geminiDuration2,
++      },
++    },
++    'Documentation chunks: results'
++  )
++
++  return relevantChunks.join(DELIMITER)
++}
++
++
++const suggestLibraries = async (
++  query: string,
++  options: {
++    clientSessionId: string
++    userInputId: string
++    fingerprintId: string
++    userId?: string
++  }
++) => {
++  const prompt =
++    `You are an expert at documentation for libraries. Given a user's query return a list of (library name, topic) where each library name is the name of a library and topic is a keyword or phrase that specifies a topic within the library that is most relevant to the user's query.
++
++For example, the library name could be "Node.js" and the topic could be "async/await".
++
++You can include the same library name multiple times with different topics, or the same topic multiple times with different library names.
++
++If there are no obvious libraries that would be helpful, return an empty list. It is common that you would return an empty list.
++
++Please just return an empty list of libraries/topics unless you are really, really sure that they are relevant.
++
++<user_query>
++${query}
++</user_query>
++    `.trim()
+ 
+-  // Get project analysis from Gemini
+   const geminiStartTime = Date.now()
+-  let response: ProjectAnalysis
+   try {
+-    response = await promptAiSdkStructured(
++    const response = await promptAiSdkStructured(
+       [{ role: 'user', content: prompt }],
+       {
+         ...options,
+         userId: options.userId,
+         model: geminiModels.gemini2flash,
+         temperature: 0,
+-        schema: zodSchema,
+-        timeout: 10_000,
++        schema: z.object({
++          libraries: z.array(
++            z.object({
++              libraryName: z.string(),
++              topic: z.string(),
++            })
++          ),
++        }),
++        timeout: 5_000,
+       }
+     )
++    return {
++      libraries: response.libraries,
++      geminiDuration: Date.now() - geminiStartTime,
++    }
+   } catch (error) {
+     logger.error(
+       { error },
+@@ -87,35 +191,65 @@ ${JSON.stringify(query)}
+     )
+     return null
+   }
+-  geminiDuration = Date.now() - geminiStartTime
++}
+ 
+-  // Only proceed if we're confident in the match
+-  if (response.confidence <= 0.7) {
+-    logger.info(
+-      { response, query, geminiDuration },
+-      'Low confidence in documentation chunks match'
+-    )
+-    return null
++/**
++ * Filters a list of documentation chunks to find those relevant to a query, using an LLM.
++ * @param query The user's query.
++ * @param allChunks An array of all documentation chunks to filter.
++ * @param options Common request options including session and user identifiers.
++ * @returns A promise that resolves to an object containing the relevant chunks and Gemini call duration, or null if an error occurs.
++ */
++async function filterRelevantChunks(
++  query: string,
++  allChunks: string[],
++  options: {
++    clientSessionId: string
++    userInputId: string
++    fingerprintId: string
++    userId?: string
+   }
++): Promise<{ relevantChunks: string[]; geminiDuration: number } | null> {
++  const prompt = `You are an expert at analyzing documentation queries. Given a user's query and a list of documentation chunks, determine which chunks are relevant to the query. Choose as few chunks as possible, likely none. Only include chunks if they are relevant to the user query.
+ 
+-  // Get the chunks using the analyzed project and topic
+-  const chunks = await fetchContext7LibraryDocumentation(response.projectId, {
+-    tokens: options.tokens,
+-    topic: response.topic,
+-  })
++<user_query>
++${query}
++</user_query>
+ 
+-  const totalDuration = Date.now() - startTime
+-  logger.info(
+-    {
+-      geminiResponse: response,
+-      chunks,
+-      timings: {
+-        total: totalDuration,
+-        gemini: geminiDuration,
+-      },
+-    },
+-    'Documentation chunks results'
+-  )
++<documentation_chunks>
++${allChunks.map((chunk, i) => `<chunk_${i}>${chunk}</chunk_${i}>`).join(DELIMITER)}
++</documentation_chunks>
++`
+ 
+-  return chunks
++  const geminiStartTime = Date.now()
++  try {
++    const response = await promptAiSdkStructured(
++      [{ role: 'user', content: prompt }],
++      {
++        clientSessionId: options.clientSessionId,
++        userInputId: options.userInputId,
++        fingerprintId: options.fingerprintId,
++        userId: options.userId,
++        model: geminiModels.gemini2_5_flash,
++        temperature: 0,
++        schema: z.object({
++          relevant_chunks: z.array(z.number()),
++        }),
++        timeout: 12_000,
++      }
++    )
++    const geminiDuration = Date.now() - geminiStartTime
++
++    const selectedChunks = response.relevant_chunks
++      .filter((index) => index >= 0 && index < allChunks.length) // Sanity check indices
++      .map((i) => allChunks[i])
++
++    return { relevantChunks: selectedChunks, geminiDuration }
++  } catch (error) {
++    logger.error(
++      { ...(error as Error), query, allChunksCount: allChunks.length },
++      'Failed to get Gemini response in filterRelevantChunks'
++    )
++    return null
++  }
+ }
+diff --git a/backend/src/llm-apis/context7-api.ts b/backend/src/llm-apis/context7-api.ts
+index d16698d48..5719c478e 100644
+--- a/backend/src/llm-apis/context7-api.ts
++++ b/backend/src/llm-apis/context7-api.ts
+@@ -1,7 +1,7 @@
+ import { withTimeout } from 'common/util/promise'
+ import { logger } from '../util/logger'
+ 
+-const CONTEXT7_API_BASE_URL = 'https://context7.com/api'
++const CONTEXT7_API_BASE_URL = 'https://context7.com/api/v1'
+ const DEFAULT_TYPE = 'txt'
+ const FETCH_TIMEOUT_MS = 10_000
+ 
+@@ -31,15 +31,32 @@ export interface SearchResponse {
+   }>
+ }
+ 
++type DocumentState = 'initial' | 'finalized' | 'error' | 'delete'
++export interface SearchResult {
++  id: string
++  title: string
++  description: string
++  branch: string
++  lastUpdateDate: string
++  state: DocumentState
++  totalTokens: number
++  totalSnippets: number
++  totalPages: number
++  stars?: number
++  trustScore?: number
++}
++
+ /**
+  * Lists all available documentation projects from Context7
+  * @returns Array of projects with their metadata, or null if the request fails
+  */
+-export async function listLibraries(): Promise<
+-  SearchResponse['projects'] | null
+-> {
++export async function searchLibraries(
++  query: string
++): Promise<SearchResult[] | null> {
+   try {
+-    const url = new URL(`${CONTEXT7_API_BASE_URL}/projects`)
++    const url = new URL(`${CONTEXT7_API_BASE_URL}/search`)
++    url.searchParams.set('query', query)
++    console.log('url', url)
+     const response = await withTimeout(fetch(url), FETCH_TIMEOUT_MS)
+ 
+     if (!response.ok) {
+@@ -48,15 +65,12 @@ export async function listLibraries(): Promise<
+     }
+ 
+     const projects = await response.json()
+-    return projects
++    return projects.results
+   } catch (error) {
+     logger.error('Error searching libraries:', error)
+     return null
+   }
+ }
+-// Initialize the projects list once and export it as a promise
+-export const context7LibrariesPromise: Promise<SearchResponse['projects']> =
+-  listLibraries().then((res) => res || [])
+ 
+ /**
+  * Fetches documentation context for a specific library
+@@ -65,19 +79,21 @@ export const context7LibrariesPromise: Promise<SearchResponse['projects']> =
+  * @returns The documentation text or null if the request fails
+  */
+ export async function fetchContext7LibraryDocumentation(
+-  libraryId: string,
++  query: string,
+   options: {
+     tokens?: number
+     topic?: string
+     folders?: string
+   } = {}
+ ): Promise<string | null> {
+-  try {
+-    if (libraryId.startsWith('/')) {
+-      libraryId = libraryId.slice(1)
+-    }
++  const libraries = await searchLibraries(query)
++  if (!libraries || libraries.length === 0) {
++    return null
++  }
+ 
+-    const url = new URL(`${CONTEXT7_API_BASE_URL}/v1/${libraryId}`)
++  const libraryId = libraries[0].id
++  try {
++    const url = new URL(`${CONTEXT7_API_BASE_URL}/${libraryId}`)
+     if (options.tokens)
+       url.searchParams.set('tokens', options.tokens.toString())
+     if (options.topic) url.searchParams.set('topic', options.topic)

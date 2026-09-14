@@ -1,0 +1,482 @@
+diff --git a/backend/src/templates/agent-registry.ts b/backend/src/templates/agent-registry.ts
+index 5b5c92eac..d70f094fa 100644
+--- a/backend/src/templates/agent-registry.ts
++++ b/backend/src/templates/agent-registry.ts
+@@ -9,7 +9,9 @@ import { agentTemplates as staticTemplates } from './agent-list'
+ import {
+   DynamicAgentValidationError,
+   validateAgents,
++  validateSingleAgent,
+ } from '@codebuff/common/templates/agent-validation'
++import { DynamicAgentTemplate } from '@codebuff/common/types/dynamic-agent-template'
+ 
+ export type AgentRegistry = Record<string, AgentTemplate>
+ 
+@@ -45,20 +47,17 @@ function parseAgentId(fullAgentId: string): {
+ /**
+  * Fetch an agent from the database by publisher/agent-id[@version] format
+  */
+-async function fetchAgentFromDatabase(
+-  fullAgentId: string,
+-): Promise<AgentTemplate | null> {
+-  const parsed = parseAgentId(fullAgentId)
+-  if (!parsed) {
+-    return null
+-  }
+-
+-  const { publisherId, agentId, version } = parsed
++async function fetchAgentFromDatabase(parsedAgentId: {
++  publisherId: string
++  agentId: string
++  version?: string
++}): Promise<AgentTemplate | null> {
++  const { publisherId, agentId, version } = parsedAgentId
+ 
+   try {
+     let agentConfig
+ 
+-    if (version) {
++    if (version && version !== 'latest') {
+       // Query for specific version
+       agentConfig = await db
+         .select()
+@@ -94,30 +93,55 @@ async function fetchAgentFromDatabase(
+     if (!agentConfig) {
+       logger.debug(
+         { publisherId, agentId, version },
+-        'Agent not found in database',
++        'fetchAgentFromDatabase: Agent not found in database',
+       )
+       return null
+     }
+ 
+-    // Convert database agent config to AgentTemplate format
+-    const agentTemplate = agentConfig.data as AgentTemplate
++    const rawAgentData = agentConfig.data as DynamicAgentTemplate
+ 
+-    // Ensure the agent has the full publisher/agent-id as its ID (without version)
+-    const fullAgentTemplate: AgentTemplate = {
+-      ...agentTemplate,
+-      id: `${publisherId}/${agentId}`,
++    // Ensure the agent has the full publisher/agent-id@version as its ID
++    const agentDataWithId = {
++      ...rawAgentData,
++      id: `${publisherId}/${agentId}@${agentConfig.version}`,
++    }
++
++    // Use validateSingleAgent to convert to AgentTemplate type
++    const validationResult = validateSingleAgent(agentDataWithId, {
++      filePath: `${publisherId}/${agentId}@${agentConfig.version}`,
++      skipSubagentValidation: true,
++    })
++
++    if (!validationResult.success) {
++      logger.error(
++        {
++          publisherId,
++          agentId,
++          version: agentConfig.version,
++          fullAgentId: agentDataWithId.id,
++          error: validationResult.error,
++        },
++        'fetchAgentFromDatabase: Agent validation failed',
++      )
++      return null
+     }
+ 
+     logger.debug(
+-      { publisherId, agentId, version: agentConfig.version },
+-      'Successfully loaded agent from database',
++      {
++        publisherId,
++        agentId,
++        version: agentConfig.version,
++        fullAgentId: agentDataWithId.id,
++        agentConfig,
++      },
++      'fetchAgentFromDatabase: Successfully loaded and validated agent from database',
+     )
+ 
+-    return fullAgentTemplate
++    return validationResult.agentTemplate!
+   } catch (error) {
+     logger.error(
+       { publisherId, agentId, version, error },
+-      'Error fetching agent from database',
++      'fetchAgentFromDatabase: Error fetching agent from database',
+     )
+     return null
+   }
+@@ -143,15 +167,19 @@ export async function getAgentTemplate(
+     return databaseAgentCache.get(cacheKey) || null
+   }
+ 
++  const parsed = parseAgentId(agentId)
++  if (!parsed) {
++    logger.debug({ agentId }, 'getAgentTemplate: Failed to parse agent ID')
++    return null
++  }
++
+   // 3. Query database (only for publisher/agent-id format)
+-  if (agentId.includes('/')) {
+-    const dbAgent = await fetchAgentFromDatabase(agentId)
+-    // Cache the result (including null for non-existent agents)
++  const dbAgent = await fetchAgentFromDatabase(parsed)
++  if (dbAgent && parsed.version && parsed.version !== 'latest') {
++    // Cache only specific versions to avoid stale 'latest' results
+     databaseAgentCache.set(cacheKey, dbAgent)
+-    return dbAgent
+   }
+-
+-  return null
++  return dbAgent
+ }
+ 
+ /**
+diff --git a/common/src/__tests__/agent-validation.test.ts b/common/src/__tests__/agent-validation.test.ts
+index ce775f783..a1aa76670 100644
+--- a/common/src/__tests__/agent-validation.test.ts
++++ b/common/src/__tests__/agent-validation.test.ts
+@@ -216,9 +216,7 @@ describe('Agent Validation', () => {
+             instructionsPrompt: 'Test user prompt',
+             stepPrompt: 'Test step prompt',
+             inputSchema: {
+-              prompt: {
+-                type: 'number' as any, // Invalid - should only allow strings
+-              },
++              prompt: null as any, // Invalid - null schema
+             },
+             outputMode: 'last_message',
+             includeMessageHistory: true,
+@@ -232,10 +230,7 @@ describe('Agent Validation', () => {
+ 
+       expect(result.validationErrors).toHaveLength(1)
+       expect(result.validationErrors[0].message).toContain(
+-        'Invalid inputSchema.prompt',
+-      )
+-      expect(result.validationErrors[0].message).toContain(
+-        'Schema must allow string or undefined values',
++        'Failed to convert inputSchema.prompt to Zod',
+       )
+       expect(result.templates).not.toHaveProperty('invalid_schema_agent')
+     })
+@@ -543,9 +538,7 @@ describe('Agent Validation', () => {
+               instructionsPrompt: 'Test user prompt',
+               stepPrompt: 'Test step prompt',
+               inputSchema: {
+-                prompt: {
+-                  type: 'boolean' as any, // Invalid for prompt schema
+-                },
++                prompt: null as any, // Invalid - null schema
+               },
+               outputMode: 'last_message',
+               includeMessageHistory: true,
+diff --git a/common/src/templates/agent-validation.ts b/common/src/templates/agent-validation.ts
+index 589b33d5a..c951770b7 100644
+--- a/common/src/templates/agent-validation.ts
++++ b/common/src/templates/agent-validation.ts
+@@ -73,56 +73,54 @@ export function validateAgents(
+     }
+   }
+ 
+-  try {
+-    const agentKeys = Object.keys(agentTemplates)
+-
+-    // Pass 1: Collect all agent IDs from template files
+-    const dynamicAgentIds = collectAgentIds(agentTemplates)
+-
+-    // Pass 2: Load and validate each agent template
+-    for (const agentKey of agentKeys) {
+-      try {
+-        const content = agentTemplates[agentKey]
+-        if (!content) {
+-          continue
+-        }
++  const agentKeys = Object.keys(agentTemplates)
+ 
+-        const validationResult = validateSingleAgent(
+-          dynamicAgentIds,
+-          content,
+-          agentKey,
+-        )
++  // Pass 1: Collect all agent IDs from template files
++  const dynamicAgentIds = collectAgentIds(agentTemplates)
+ 
+-        if (!validationResult.success) {
+-          validationErrors.push({
+-            filePath: agentKey,
+-            message: validationResult.error!,
+-          })
+-          continue
+-        }
++  // Pass 2: Load and validate each agent template
++  for (const agentKey of agentKeys) {
++    try {
++      const content = agentTemplates[agentKey]
++      if (!content) {
++        continue
++      }
+ 
+-        templates[content.id] = validationResult.agentTemplate!
+-      } catch (error) {
+-        const errorMessage =
+-          error instanceof Error ? error.message : 'Unknown error'
++      const validationResult = validateSingleAgent(content, {
++        filePath: agentKey,
++        dynamicAgentIds,
++      })
+ 
++      if (!validationResult.success) {
+         validationErrors.push({
+           filePath: agentKey,
+-          message: `Error in agent template ${agentKey}: ${errorMessage}`,
++          message: validationResult.error!,
+         })
++        continue
++      }
+ 
+-        logger.warn(
+-          { filePath: agentKey, error: errorMessage },
+-          'Failed to load dynamic agent template',
+-        )
++      if (templates[content.id]) {
++        validationErrors.push({
++          filePath: agentKey,
++          message: `Duplicate agent ID: ${content.id}`,
++        })
++        continue
+       }
++      templates[content.id] = validationResult.agentTemplate!
++    } catch (error) {
++      const errorMessage =
++        error instanceof Error ? error.message : 'Unknown error'
++
++      validationErrors.push({
++        filePath: agentKey,
++        message: `Error in agent template ${agentKey}: ${errorMessage}`,
++      })
++
++      logger.warn(
++        { filePath: agentKey, error: errorMessage },
++        'Failed to load dynamic agent template',
++      )
+     }
+-  } catch (error) {
+-    logger.error({ error }, 'Failed to process agent templates')
+-    validationErrors.push({
+-      filePath: 'agentTemplates',
+-      message: 'Failed to process agent templates',
+-    })
+   }
+ 
+   return {
+@@ -137,31 +135,44 @@ export function validateAgents(
+  *
+  * @param dynamicAgentIds - Array of all available dynamic agent IDs for validation
+  * @param template - The dynamic agent template to validate
+- * @param filePath - Optional file path for error context
++ * @param options - Optional configuration object
++ * @param options.filePath - Optional file path for error context
++ * @param options.skipSubagentValidation - Skip subagent validation when loading from database
+  * @returns Validation result with either the converted AgentTemplate or an error
+  */
+ export function validateSingleAgent(
+-  dynamicAgentIds: string[],
+   template: DynamicAgentTemplate,
+-  filePath?: string,
++  options?: {
++    dynamicAgentIds?: string[]
++    filePath?: string
++    skipSubagentValidation?: boolean
++  },
+ ): {
+   success: boolean
+   agentTemplate?: AgentTemplate
+   error?: string
+ } {
++  const {
++    filePath,
++    skipSubagentValidation = false,
++    dynamicAgentIds = [],
++  } = options || {}
++
+   try {
+-    // Validate subagents
+-    const subagentValidation = validateSubagents(
+-      template.subagents,
+-      dynamicAgentIds,
+-    )
+-    if (!subagentValidation.valid) {
+-      return {
+-        success: false,
+-        error: formatSubagentError(
+-          subagentValidation.invalidAgents,
+-          subagentValidation.availableAgents,
+-        ),
++    // Validate subagents (skip if requested, e.g., for database agents)
++    if (!skipSubagentValidation) {
++      const subagentValidation = validateSubagents(
++        template.subagents,
++        dynamicAgentIds,
++      )
++      if (!subagentValidation.valid) {
++        return {
++          success: false,
++          error: formatSubagentError(
++            subagentValidation.invalidAgents,
++            subagentValidation.availableAgents,
++          ),
++        }
+       }
+     }
+ 
+@@ -254,11 +265,8 @@ export function validateSingleAgent(
+  */
+ function isValidGeneratorFunction(code: string): boolean {
+   const trimmed = code.trim()
+-  return (
+-    trimmed.startsWith('function*') ||
+-    // Also allow arrow function generators
+-    /^\s*\*\s*\(/.test(trimmed)
+-  )
++  // Check if it's a generator function (must start with function*)
++  return trimmed.startsWith('function*')
+ }
+ 
+ /**
+diff --git a/common/src/templates/dynamic-agent-functions.ts b/common/src/templates/dynamic-agent-functions.ts
+new file mode 100644
+index 000000000..9bc16f4cc
+--- /dev/null
++++ b/common/src/templates/dynamic-agent-functions.ts
+@@ -0,0 +1,130 @@
++import { logger } from '../util/logger'
++import { validateSingleAgent } from './agent-validation'
++
++import type { AgentTemplate } from '../types/agent-template'
++import type { DynamicAgentTemplate } from '../types/dynamic-agent-template'
++
++export interface DynamicAgentValidationError {
++  filePath: string
++  message: string
++  details?: string
++}
++
++export interface DynamicAgentLoadResult {
++  templates: Record<string, AgentTemplate>
++  validationErrors: DynamicAgentValidationError[]
++}
++
++/**
++ * Collect all agent IDs from template files without full validation
++ */
++export function collectAgentIds(
++  agentTemplates: Record<string, DynamicAgentTemplate> = {},
++): string[] {
++  const agentIds: string[] = []
++  const jsonFiles = Object.keys(agentTemplates)
++
++  for (const filePath of jsonFiles) {
++    try {
++      const content = agentTemplates[filePath]
++      if (!content) {
++        continue
++      }
++
++      // Extract the agent ID if it exists
++      if (content.id && typeof content.id === 'string') {
++        agentIds.push(content.id)
++      }
++    } catch (error) {
++      // Log but don't fail the collection process for other errors
++      logger.debug(
++        { filePath, error },
++        'Failed to extract agent ID during collection phase',
++      )
++    }
++  }
++
++  return agentIds
++}
++
++/**
++ * Validate and load dynamic agent templates from user-provided agentTemplates
++ */
++export function validateAgents(
++  agentTemplates: Record<string, DynamicAgentTemplate> = {},
++): DynamicAgentLoadResult {
++  const templates: Record<string, AgentTemplate> = {}
++  const validationErrors: DynamicAgentValidationError[] = []
++
++  const hasAgentTemplates = Object.keys(agentTemplates).length > 0
++
++  if (!hasAgentTemplates) {
++    return {
++      templates,
++      validationErrors,
++    }
++  }
++
++  try {
++    const agentKeys = Object.keys(agentTemplates)
++
++    // Pass 1: Collect all agent IDs from template files
++    const dynamicAgentIds = collectAgentIds(agentTemplates)
++
++    // Pass 2: Load and validate each agent template
++    for (const agentKey of agentKeys) {
++      try {
++        const content = agentTemplates[agentKey]
++        if (!content) {
++          continue
++        }
++
++        const validationResult = validateSingleAgent(content, {
++          dynamicAgentIds,
++          filePath: agentKey,
++        })
++
++        if (!validationResult.success) {
++          validationErrors.push({
++            filePath: agentKey,
++            message: validationResult.error!,
++          })
++          continue
++        }
++
++        if (templates[content.id]) {
++          validationErrors.push({
++            filePath: agentKey,
++            message: `Duplicate agent ID: ${content.id}`,
++          })
++          continue
++        }
++        templates[content.id] = validationResult.agentTemplate!
++      } catch (error) {
++        const errorMessage =
++          error instanceof Error ? error.message : 'Unknown error'
++
++        validationErrors.push({
++          filePath: agentKey,
++          message: `Error in agent template ${agentKey}: ${errorMessage}`,
++        })
++
++        logger.warn(
++          { filePath: agentKey, error: errorMessage },
++          'Failed to load dynamic agent template',
++        )
++      }
++    }
++  } catch (error) {
++    logger.error({ error }, 'Failed to process agent templates')
++    validationErrors.push({
++      filePath: 'agentTemplates',
++      message: 'Failed to process agent templates',
++    })
++  }
++
++  return {
++    templates,
++    validationErrors,
++  }
++}

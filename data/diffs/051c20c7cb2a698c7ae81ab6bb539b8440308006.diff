@@ -1,0 +1,212 @@
+diff --git a/backend/src/claude.ts b/backend/src/claude.ts
+index 1d667aa3b..ba2440c2d 100644
+--- a/backend/src/claude.ts
++++ b/backend/src/claude.ts
+@@ -171,7 +171,7 @@ async function* promptClaudeStreamWithoutRetry(
+   }
+ }
+ 
+-export const promptClaudeStream = async function* (
++export const promptClaudeStream = (
+   messages: Message[],
+   options: {
+     system?: System
+@@ -184,37 +184,53 @@ export const promptClaudeStream = async function* (
+     userId?: string
+     ignoreDatabaseAndHelicone?: boolean
+   }
+-): AsyncGenerator<string, void, unknown> {
+-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+-    try {
+-      yield* promptClaudeStreamWithoutRetry(messages, options)
+-      return
+-    } catch (error) {
+-      // Only retry on connection errors (e.g. internal server error, overloaded, etc.)
+-      if (error instanceof APIConnectionError) {
+-        logger.error(
+-          { error, attempt },
+-          'Claude API connection error, retrying...'
+-        )
++): ReadableStream<string> => {
++  // Use a readable stream to prevent base stream from being closed prematurely.
++  return new ReadableStream({
++    async start(controller) {
++      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
++        try {
++          const baseStream = promptClaudeStreamWithoutRetry(messages, options)
++
++          // Stream all chunks from the generator to the controller
++          for await (const chunk of baseStream) {
++            controller.enqueue(chunk)
++          }
++          controller.close()
++          return
++        } catch (error) {
++          // Only retry on connection errors (e.g. internal server error, overloaded, etc.)
++          if (error instanceof APIConnectionError) {
++            logger.error(
++              { error, attempt },
++              'Claude API connection error, retrying...'
++            )
++            if (attempt < MAX_RETRIES - 1) {
++              // Exponential backoff
++              const delayMs = INITIAL_RETRY_DELAY * Math.pow(2, attempt)
++              await sleep(delayMs)
++              continue
++            }
++          }
+ 
+-        if (attempt < MAX_RETRIES - 1) {
+-          // Exponential backoff
+-          const delayMs = INITIAL_RETRY_DELAY * Math.pow(2, attempt)
+-          await sleep(delayMs)
++          // For other types of errors, throw immediately
++          const parsedError = error as APIError
++          controller.error(
++            new Error(
++              `Anthropic API error: ${parsedError.message}. Please try again later or reach out to ${env.NEXT_PUBLIC_SUPPORT_EMAIL} for help.`
++            )
++          )
++          return
+         }
+-      } else {
+-        // For other types of errors, throw immediately
+-        const parsedError = error as APIError
+-        throw new Error(
+-          `Anthropic API error: ${parsedError.message}. Please try again later or reach out to ${env.NEXT_PUBLIC_SUPPORT_EMAIL} for help.`
+-        )
+       }
+-    }
+-  }
+ 
+-  throw new Error(
+-    `Sorry, system's a bit overwhelmed. Please try again later or reach out to ${env.NEXT_PUBLIC_SUPPORT_EMAIL} for help.`
+-  )
++      controller.error(
++        new Error(
++          `Sorry, system's a bit overwhelmed. Please try again later or reach out to ${env.NEXT_PUBLIC_SUPPORT_EMAIL} for help.`
++        )
++      )
++    },
++  })
+ }
+ 
+ export const promptClaude = async (
+diff --git a/backend/src/deepseek-api.ts b/backend/src/deepseek-api.ts
+index faeba98f5..f49d8951e 100644
+--- a/backend/src/deepseek-api.ts
++++ b/backend/src/deepseek-api.ts
+@@ -40,7 +40,7 @@ const getDeepseekClient = (fingerprintId: string) => {
+   return deepseekClient
+ }
+ 
+-export async function* promptDeepseekStream(
++async function* innerPromptDeepseekStream(
+   messages: OpenAIMessage[],
+   options: {
+     clientSessionId: string
+@@ -167,6 +167,41 @@ export async function* promptDeepseekStream(
+   }
+ }
+ 
++export const promptDeepseekStream = (
++  messages: OpenAIMessage[],
++  options: {
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
++    model: string
++    userId: string | undefined
++    maxTokens?: number
++    temperature?: number
++  }
++): ReadableStream<string> => {
++  // Use a readable stream to prevent base stream from being closed prematurely.
++  return new ReadableStream({
++    async start(controller) {
++      try {
++        const baseStream = innerPromptDeepseekStream(messages, options)
++
++        // Stream all chunks from the generator to the controller
++        for await (const chunk of baseStream) {
++          controller.enqueue(chunk)
++        }
++        controller.close()
++      } catch (error) {
++        // For errors, send error message to client
++        controller.error(
++          new Error(
++            `Deepseek API error: ${error instanceof Error ? error.message : 'Unknown error'}. Please try again later or reach out to ${env.NEXT_PUBLIC_SUPPORT_EMAIL} for help.`
++          )
++        )
++      }
++    },
++  })
++}
++
+ export async function promptDeepseek(
+   messages: OpenAIMessage[],
+   options: {
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index bb81df67b..4ee9835c4 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -179,7 +179,7 @@ export async function mainPrompt(
+       'Prompting Claude Main'
+     )
+ 
+-    let stream: AsyncGenerator<string, void, unknown>
++    let stream: ReadableStream<string>
+     if (costMode === 'lite') {
+       stream = promptDeepseekStream(
+         messagesWithSystem(messagesWithContinuedMessage, system),
+@@ -306,6 +306,7 @@ export async function mainPrompt(
+ 
+       onResponseChunk(`\nPrompt: ${prompt}\n`)
+ 
++      const fetchFilesStart = Date.now()
+       const filePaths = await getRelevantFilesForPlanning(
+         messages,
+         prompt,
+@@ -316,11 +317,11 @@ export async function mainPrompt(
+         userInputId,
+         userId
+       )
+-
++      const fetchFilesDuration = Date.now() - fetchFilesStart
+       const loadedFiles = await requestFiles(ws, filePaths)
+       const fileContents = Object.fromEntries(
+         Object.entries(loadedFiles).filter(
+-          ([_, content]) => content !== null
++          ([, content]) => content !== null
+         ) as [string, string][]
+       )
+ 
+@@ -329,16 +330,8 @@ export async function mainPrompt(
+       fullResponse += `\nRelevant files:\n${existingFilePaths.join('\n')}\n`
+ 
+       onResponseChunk(`\nThinking deeply (can take a minute)...\n\n`)
+-
+-      logger.debug(
+-        {
+-          prompt,
+-          filePaths,
+-          existingFilePaths,
+-        },
+-        'Thinking deeply'
+-      )
+-
++      logger.debug({ prompt, filePaths, existingFilePaths }, 'Thinking deeply')
++      const planningStart = Date.now()
+       const { response, fileProcessingPromises: promises } =
+         await planComplexChange(prompt, fileContents, onResponseChunk, {
+           clientSessionId,
+@@ -356,6 +349,8 @@ export async function mainPrompt(
+           prompt,
+           file_paths: filePaths,
+           response,
++          fetchFilesDuration,
++          planDuration: Date.now() - planningStart,
+         },
+         'Generated plan'
+       )

@@ -1,0 +1,322 @@
+diff --git a/common/src/billing/balance-calculator.ts b/common/src/billing/balance-calculator.ts
+index 9b12013c0..c60ced591 100644
+--- a/common/src/billing/balance-calculator.ts
++++ b/common/src/billing/balance-calculator.ts
+@@ -195,6 +195,10 @@ export async function calculateUsageAndBalance(
+ 
+   // Calculate both metrics in one pass
+   let usageThisCycle = 0
++  let totalPositiveBalance = 0
++  let totalDebt = 0
++
++  // First pass: calculate initial totals and usage
+   for (const grant of grants) {
+     const grantType = grant.type as GrantType
+ 
+@@ -210,23 +214,38 @@ export async function calculateUsageAndBalance(
+     // Add to balance if grant is currently active
+     if (!grant.expires_at || grant.expires_at > now) {
+       if (grant.balance > 0) {
+-        balance.totalRemaining += grant.balance
++        totalPositiveBalance += grant.balance
+         balance.breakdown[grantType] =
+           (balance.breakdown[grantType] || 0) + grant.balance
+         balance.principals[grantType] =
+           (balance.principals[grantType] || 0) + grant.principal
+       } else if (grant.balance < 0) {
+-        balance.totalDebt += Math.abs(grant.balance)
++        totalDebt += Math.abs(grant.balance)
+       }
+     }
+   }
+ 
+-  // Calculate net balance
+-  balance.netBalance = balance.totalRemaining - balance.totalDebt
++  // Perform in-memory settlement if there's both debt and positive balance
++  if (totalDebt > 0 && totalPositiveBalance > 0) {
++    const settlementAmount = Math.min(totalDebt, totalPositiveBalance)
++    logger.debug(
++      { userId, totalDebt, totalPositiveBalance, settlementAmount },
++      'Performing in-memory settlement'
++    )
++    
++    // After settlement:
++    totalPositiveBalance -= settlementAmount
++    totalDebt -= settlementAmount
++  }
++
++  // Set final balance values after settlement
++  balance.totalRemaining = totalPositiveBalance
++  balance.totalDebt = totalDebt
++  balance.netBalance = totalPositiveBalance - totalDebt
+ 
+   logger.debug(
+     { userId, balance, usageThisCycle, grantsCount: grants.length },
+-    'Calculated usage and balance'
++    'Calculated usage and settled balance'
+   )
+ 
+   return { usageThisCycle, balance }
+@@ -240,7 +259,6 @@ export async function calculateUsageAndBalance(
+  * @param userId The ID of the user
+  * @param creditsToConsume Number of credits being consumed
+  * @returns Promise resolving to number of credits consumed
+- * @throws Error if user has any debt
+  */
+ export async function consumeCredits(
+   userId: string,
+@@ -258,17 +276,6 @@ export async function consumeCredits(
+       throw new Error('No active grants found')
+     }
+ 
+-    const hasDebt = activeGrants.some((grant) => grant.balance < 0)
+-    if (hasDebt) {
+-      logger.error(
+-        { userId, creditsToConsume },
+-        'Cannot consume credits - user has existing debt'
+-      )
+-      throw new Error(
+-        'Cannot use credits while you have unpaid debt. Please add credits to clear your debt first.'
+-      )
+-    }
+-
+     const result = await consumeFromOrderedGrants(
+       userId,
+       creditsToConsume,
+diff --git a/common/src/billing/billing.knowledge.md b/common/src/billing/billing.knowledge.md
+index 29076d88f..624dea956 100644
+--- a/common/src/billing/billing.knowledge.md
++++ b/common/src/billing/billing.knowledge.md
+@@ -40,27 +40,25 @@ When a refund is issued in Stripe:
+   - balance: Current remaining amount (can go negative)
+ - Usage is calculated as (principal - balance) for each grant
+ - When consuming credits:
+-  - First check if user has any debt - if yes, block usage
+-  - Then consume from remaining grants in order:
++  - System calculates netBalance = totalRemaining - totalDebt
++  - If netBalance <= 0, request is blocked
++  - Otherwise, consume from remaining grants in order:
+     1. Expiring soonest first (never-expiring last)
+     2. Within same expiry, by priority (free -> referral -> purchase -> admin)
+     3. Within same priority, oldest first (by created_at)
+-  - Example:
+-    ```
+-    Initial state:
+-    free (NULL): -20 (debt)
++    
++  Example:
++    debt: -20
+     referral (2024-02-01): 30
+     free (2024-03-01): 50
+     
+-    Result: Request blocked due to debt
+-    System tries auto-topup to clear debt if enabled
+-    If auto-topup fails, user must manually add credits
+-    ```
++    netBalance = (30 + 50) - 20 = 60
++    Request allowed, will consume from referral first
++
+   - Skip grants with 0 or negative balance when consuming
+   - Only let the last grant go negative
+   - Principal stays at original value
+   - Never create new grants for debt
+-  - Users cannot use any credits if they have debt
+   - Maximum debt limit of 100 credits per user
+   - If a request would exceed max debt limit, it's truncated and fails
+ 
+@@ -90,8 +88,11 @@ When testing balance calculation:
+ 
+ 1. User makes a request
+ 2. System checks balance:
+-   - If user has any debt: Try auto-topup, then block if still insufficient
+-   - If totalRemaining <= 0: Try auto-topup, then block if still insufficient
++   - Calculate netBalance = totalRemaining - totalDebt
++   - If auto-topup enabled:
++     - If debt exists OR balance below threshold: Try auto-topup
++     - If auto-topup succeeds: Recalculate netBalance
++   - If netBalance <= 0: Block request
+ 3. If allowed, system:
+    - Calculates credit cost based on tokens used
+    - Consumes from grants in expiry + priority order
+diff --git a/web/src/app/api/user/usage/route.ts b/web/src/app/api/user/usage/route.ts
+index dda44659b..1e70cfcef 100644
+--- a/web/src/app/api/user/usage/route.ts
++++ b/web/src/app/api/user/usage/route.ts
+@@ -2,10 +2,9 @@ import { NextResponse } from 'next/server'
+ import { getServerSession } from 'next-auth'
+ import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
+ import db from 'common/db'
+-import { and, eq, gt, or, sql } from 'drizzle-orm'
++import { eq } from 'drizzle-orm'
+ import * as schema from 'common/db/schema'
+-import { CreditBalance } from 'common/src/billing/balance-calculator'
+-import { GrantType } from 'common/db/schema'
++import { calculateUsageAndBalance } from 'common/src/billing/balance-calculator'
+ import {
+   getPlanFromPriceId,
+   getMonthlyGrantForPlan,
+@@ -38,112 +37,12 @@ export async function GET() {
+     const now = new Date()
+     const quotaResetDate = user.next_quota_reset ?? new Date(0)
+ 
+-    // SQL helper for checking if a grant is currently active
+-    const isActive = sql<boolean>`
+-      ${schema.creditLedger.expires_at} IS NULL OR
+-      ${schema.creditLedger.expires_at} > ${now}
+-    `
+-
+-    // SQL helper for positive balance amount
+-    const positiveBalance = sql<number>`
+-      CASE WHEN ${schema.creditLedger.balance} > 0
+-      THEN ${schema.creditLedger.balance}
+-      ELSE 0 END
+-    `
+-
+-    // SQL helper for negative balance amount (as positive number)
+-    const debtAmount = sql<number>`
+-      CASE WHEN ${schema.creditLedger.balance} < 0
+-      THEN ABS(${schema.creditLedger.balance})
+-      ELSE 0 END
+-    `
+-
+-    // SQL helper for current balance of active grants
+-    const activeBalance = sql<number>`
+-      CASE WHEN ${isActive} THEN ${positiveBalance} ELSE 0 END
+-    `
+-
+-    // SQL helper for current debt of active grants
+-    const activeDebt = sql<number>`
+-      CASE WHEN ${isActive} THEN ${debtAmount} ELSE 0 END
+-    `
+-
+-    // SQL helper for usage calculation
+-    const usage = sql<number>`
+-      ${schema.creditLedger.principal} - ${schema.creditLedger.balance}
+-    `
+-
+-    // Get all grant totals in a single query
+-    const grantTotals = await db
+-      .select({
+-        // Current balances (only active grants)
+-        currentBalance: sql<number>`
+-          COALESCE(SUM(${activeBalance})::integer, 0)`,
+-        // Total debt (only active grants)
+-        totalDebt: sql<number>`
+-          COALESCE(SUM(${activeDebt})::integer, 0)`,
+-        // Usage this cycle (all grants)
+-        usageThisCycle: sql<number>`
+-          COALESCE(SUM(${usage})::integer, 0)`,
+-        // Type-specific totals
+-        type: schema.creditLedger.type,
+-        // Current balance per type
+-        typeBalance: sql<number>`
+-          COALESCE(SUM(${activeBalance})::integer, 0)`,
+-        // Principal per type
+-        typePrincipal: sql<number>`
+-          COALESCE(SUM(${schema.creditLedger.principal})::integer, 0)`,
+-      })
+-      .from(schema.creditLedger)
+-      .where(
+-        and(
+-          eq(schema.creditLedger.user_id, userId),
+-          or(
+-            // - Expires after cycle start (or never expires)
+-            sql`${schema.creditLedger.expires_at} IS NULL`,
+-            gt(schema.creditLedger.expires_at, now)
+-          )
+-        )
+-      )
+-      .groupBy(schema.creditLedger.type)
+-
+-    // Initialize balance structure with all grant types set to 0
+-    const balance: CreditBalance = {
+-      totalRemaining: 0,
+-      totalDebt: 0,
+-      netBalance: 0,
+-      breakdown: {
+-        free: 0,
+-        referral: 0,
+-        purchase: 0,
+-        admin: 0,
+-      },
+-      principals: {
+-        free: 0,
+-        referral: 0,
+-        purchase: 0,
+-        admin: 0,
+-      },
+-    }
+-
+-    let usageThisCycle = 0
+-
+-    // Process totals from the query
+-    for (const total of grantTotals) {
+-      const grantType = total.type as GrantType
+-
+-      // Add to type-specific totals (overwriting the 0 defaults)
+-      balance.breakdown[grantType] = total.typeBalance
+-      balance.principals[grantType] = total.typePrincipal
+-
+-      // Add to overall totals
+-      balance.totalRemaining += total.currentBalance
+-      balance.totalDebt += total.totalDebt
+-      usageThisCycle += total.usageThisCycle
+-    }
+-
+-    // Calculate net balance
+-    balance.netBalance = balance.totalRemaining - balance.totalDebt
++    // Use the canonical balance calculation function
++    const { usageThisCycle, balance } = await calculateUsageAndBalance(
++      userId,
++      quotaResetDate,
++      now
++    )
+ 
+     // Calculate next monthly grant
+     const currentPlan = getPlanFromPriceId(
+diff --git a/web/src/app/usage/usage-display.tsx b/web/src/app/usage/usage-display.tsx
+index 8b928514e..39b80f009 100644
+--- a/web/src/app/usage/usage-display.tsx
++++ b/web/src/app/usage/usage-display.tsx
+@@ -209,7 +209,8 @@ export const UsageDisplay = ({
+   balance,
+   nextQuotaReset,
+ }: UsageDisplayProps) => {
+-  const { totalRemaining, breakdown, totalDebt, principals } = balance
++  const { totalRemaining, breakdown, totalDebt, netBalance, principals } =
++    balance
+ 
+   // Calculate used credits per type
+   const usedCredits: Record<GrantType, number> = {
+@@ -330,9 +331,28 @@ export const UsageDisplay = ({
+         {/* Total remaining */}
+         <div className="pt-4 mt-2 border-t">
+           <div className="flex justify-between items-center md:px-6">
+-            <span className="text-xl font-medium">Total Left</span>
+-            <span className="text-xl font-bold">
+-              {totalRemaining.toLocaleString()}
++            <TooltipProvider>
++              <Tooltip>
++                <TooltipTrigger asChild>
++                  <span className="text-xl font-medium flex items-center gap-2">
++                    Total
++                    {totalDebt > 0 ? <p>Owed</p> : <p>Left</p>}
++                  </span>
++                </TooltipTrigger>
++                <TooltipContent>
++                  <p>
++                    Available credits after accounting for any existing debt
++                  </p>
++                </TooltipContent>
++              </Tooltip>
++            </TooltipProvider>
++            <span
++              className={cn(
++                'text-xl font-bold',
++                netBalance < 0 && 'text-red-500'
++              )}
++            >
++              {netBalance.toLocaleString()}
+             </span>
+           </div>
+         </div>

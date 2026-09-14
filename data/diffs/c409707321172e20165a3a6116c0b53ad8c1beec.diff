@@ -1,0 +1,1556 @@
+diff --git a/authentication.knowledge.md b/authentication.knowledge.md
+index 132fd5b7e..c4d2fe87e 100644
+--- a/authentication.knowledge.md
++++ b/authentication.knowledge.md
+@@ -27,13 +27,13 @@ Manicode implements a secure authentication flow that involves the npm-app (CLI)
+ 
+ 4. Credential Verification:
+ 
+-   - After OAuth, the browser calls the backend with the auth code and user credentials.
+-   - Backend verifies the hash using received values.
+-   - Backend stores the `fingerprintId` with the user row in the database.
++   - After OAuth, the browser calls the `app/onboard` server component with the auth code and user credentials.
++   - The server component verifies the hash using received values and stores the `fingerprintId` + hash in a new session row in the database.
+ 
+ 5. Session Establishment:
+-   - Backend sends a WebSocket message to the CLI connected on the same `fingerprintId`, containing user data.
+-   - Alternatively, backend sends user credentials to the user's CLI via WebSockets.
++   - npm-app sends a WebSocket message every few seconds to the backend to check for a session with the same `fingerprintId` and hash.
++   - If a matching session is found, the backend sends the user's credentials to the CLI via WebSockets.
++   - npm-app saves the credentials locally.
+ 
+ ## Security Considerations
+ 
+diff --git a/backend/package.json b/backend/package.json
+index 467a457fa..7fb5fc802 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -16,7 +16,7 @@
+     "test:watch": "bun test --watch"
+   },
+   "dependencies": {
+-    "@anthropic-ai/sdk": "0.27.1",
++    "@anthropic-ai/sdk": "0.27.3",
+     "@t3-oss/env-core": "^0.11.1",
+     "diff": "5.2.0",
+     "dotenv": "16.4.5",
+diff --git a/backend/src/billing/message.ts b/backend/src/billing/message.ts
+new file mode 100644
+index 000000000..68be4e6e0
+--- /dev/null
++++ b/backend/src/billing/message.ts
+@@ -0,0 +1,265 @@
++import { models } from 'common/constants'
++import { OpenAIMessage } from '@/openai-api'
++import { Message } from 'common/actions'
++import { CREDITS_USAGE_LIMITS } from 'common/constants'
++import db from 'common/db'
++import * as schema from 'common/db/schema'
++import { and, between, eq, or, SQL, sql } from 'drizzle-orm'
++import { getNextQuotaReset } from 'common/util/dates'
++
++const PROFIT_MARGIN = 0.2
++
++// Pricing details:
++// - https://www.anthropic.com/pricing#anthropic-api
++// - https://openai.com/pricing
++const TOKENS_COST_PER_M = {
++  input: {
++    [models.sonnet]: 3,
++    [models.haiku]: 0.25,
++    [models.gpt4o]: 2.5,
++    [models.gpt4omini]: 0.15,
++  },
++  output: {
++    [models.sonnet]: 15,
++    [models.haiku]: 1.25,
++    [models.gpt4o]: 10.0,
++    [models.gpt4omini]: 0.6,
++  },
++  cache_creation: {
++    [models.sonnet]: 3.75,
++    [models.haiku]: 0.3,
++  },
++  cache_read: {
++    [models.sonnet]: 0.3,
++    [models.haiku]: 0.03,
++  },
++}
++
++export const saveMessage = async (value: {
++  messageId: string
++  userId?: string
++  clientSessionId: string
++  fingerprintId: string
++  userInputId: string
++  model: string
++  request: Message[] | OpenAIMessage[]
++  response: string
++  inputTokens: number
++  outputTokens: number
++  cacheCreationInputTokens?: number
++  cacheReadInputTokens?: number
++  finishedAt: Date
++}) => {
++  const cost = calcCost(
++    value.model,
++    value.inputTokens,
++    value.outputTokens,
++    value.cacheCreationInputTokens ?? 0,
++    value.cacheReadInputTokens ?? 0
++  )
++
++  const creditsUsed = Math.round(cost * 100 * (1 + PROFIT_MARGIN))
++
++  return db.insert(schema.message).values({
++    id: value.messageId,
++    user_id: value.userId,
++    fingerprint_id: value.fingerprintId,
++    client_id: value.clientSessionId,
++    client_request_id: value.userInputId,
++    model: value.model,
++    request: value.request,
++    response: value.response,
++    input_tokens: value.inputTokens,
++    output_tokens: value.outputTokens,
++    cache_creation_input_tokens: value.cacheCreationInputTokens,
++    cache_read_input_tokens: value.cacheReadInputTokens,
++    cost: cost.toString(),
++    credits: creditsUsed,
++    finished_at: value.finishedAt,
++  })
++}
++
++export const setQuotaExceeded = async (
++  fingerprintId: string,
++  userId?: string
++) => {
++  if (userId) {
++    // Signed-in user
++    const nextQuotaReset = await db
++      .select({
++        next_quota_reset: schema.user.next_quota_reset,
++      })
++      .from(schema.user)
++      .where(eq(schema.user.id, userId))
++      .then((users) => {
++        if (users.length === 1) {
++          return users[0].next_quota_reset
++        }
++        return null
++      })
++
++    // Now, we have a date in the future, so we can set the quota
++    await db
++      .update(schema.user)
++      .set({
++        quota_exceeded: true,
++        next_quota_reset: getNextQuotaReset(nextQuotaReset),
++      })
++      .where(eq(schema.user.id, userId))
++    return
++  } else {
++    // Anonymous user
++    const nextQuotaReset = await db
++      .select({
++        next_quota_reset: schema.fingerprint.next_quota_reset,
++      })
++      .from(schema.fingerprint)
++      .where(eq(schema.fingerprint.id, fingerprintId))
++      .then((fingerprints) => {
++        if (fingerprints.length === 1) {
++          return fingerprints[0].next_quota_reset
++        }
++        return null
++      })
++
++    await db
++      .update(schema.fingerprint)
++      .set({
++        quota_exceeded: true,
++        next_quota_reset: getNextQuotaReset(nextQuotaReset),
++      })
++      .where(eq(schema.fingerprint.id, fingerprintId))
++  }
++}
++
++const getPerTokenCost = (
++  model: string,
++  type: keyof typeof TOKENS_COST_PER_M
++): number => {
++  // @ts-ignore
++  return (TOKENS_COST_PER_M[type][model] ?? 0) / 1_000_000
++}
++
++const calcCost = (
++  model: string,
++  input_tokens: number,
++  output_tokens: number,
++  cache_creation_input_tokens: number,
++  cache_read_input_tokens: number
++) => {
++  return (
++    input_tokens * getPerTokenCost(model, 'input') +
++    output_tokens * getPerTokenCost(model, 'output') +
++    cache_creation_input_tokens * getPerTokenCost(model, 'cache_creation') +
++    cache_read_input_tokens * getPerTokenCost(model, 'cache_read')
++  )
++}
++
++export const updateQuota = async (
++  fingerprintId: string,
++  userId?: string
++): Promise<{
++  creditsUsed: number
++  quota: number
++  // userId?: string
++  // endDate: Date | SQL<Date>
++  // quotaExceeded: boolean
++}> => {
++  const { creditsUsed, quota, endDate } = await checkQuota(fingerprintId)
++
++  if (creditsUsed >= quota) {
++    setQuotaExceeded(fingerprintId, userId)
++    return {
++      creditsUsed,
++      quota,
++    }
++  }
++  return {
++    creditsUsed,
++    quota,
++  }
++}
++
++export const checkQuota = async (
++  fingerprintId: string
++): Promise<{
++  creditsUsed: number
++  quota: number
++  userId?: string
++  endDate: Date | SQL<Date>
++}> => {
++  // Default case: anonymous user
++  let quota = CREDITS_USAGE_LIMITS.ANON
++  let startDate: Date | SQL<Date> =
++    sql<Date>`COALESCE(${schema.user.next_quota_reset}, ${schema.fingerprint.next_quota_reset}, now()) - INTERVAL '1 month'`
++  let endDate: Date | SQL<Date> =
++    sql<Date>`COALESCE(${schema.user.next_quota_reset}, ${schema.fingerprint.next_quota_reset}, now())`
++
++  const result = await db
++    .select({
++      id: schema.user.id,
++      quota: schema.user.quota,
++      stripe_customer_id: schema.user.stripe_customer_id,
++      stripe_price_id: schema.user.stripe_price_id,
++      credits: sql<number>`SUM(COALESCE(${schema.message.credits}, 0))`,
++    })
++    .from(schema.user)
++    .leftJoin(schema.session, eq(schema.user.id, schema.session.userId))
++    .leftJoin(
++      schema.fingerprint,
++      eq(schema.session.fingerprint_id, fingerprintId)
++    )
++    .leftJoin(
++      schema.message,
++      and(
++        or(
++          eq(schema.message.fingerprint_id, fingerprintId),
++          eq(schema.message.user_id, schema.user.id)
++        ),
++        between(schema.message.finished_at, startDate, endDate)
++      )
++    )
++    .where(eq(schema.session.fingerprint_id, fingerprintId))
++    .groupBy(
++      schema.user.id,
++      schema.user.quota,
++      schema.user.stripe_customer_id,
++      schema.user.stripe_price_id
++    )
++    .limit(1)
++    .then((rows) => rows[0])
++
++  if (result) {
++    quota =
++      // TODO: check the type of plan they're on instead of assuming they're the free tier
++      !result.stripe_customer_id && !result.stripe_price_id
++        ? CREDITS_USAGE_LIMITS.FREE
++        : result.quota
++  }
++
++  return {
++    creditsUsed: result?.credits ?? 0,
++    quota,
++    userId: result?.id,
++    endDate,
++  }
++}
++
++export const resetQuota = async (fingerprintId: string, userId?: string) => {
++  if (userId) {
++    // Signed-in user
++    await db
++      .update(schema.user)
++      .set({ quota_exceeded: false, next_quota_reset: null })
++      .where(eq(schema.user.id, userId))
++  } else {
++    // Anonymous user
++    await db
++      .update(schema.fingerprint)
++      .set({
++        quota_exceeded: false,
++        next_quota_reset: null,
++      })
++      .where(eq(schema.fingerprint.id, fingerprintId))
++  }
++}
+diff --git a/backend/src/claude.ts b/backend/src/claude.ts
+index 222e3f588..b858286b6 100644
+--- a/backend/src/claude.ts
++++ b/backend/src/claude.ts
+@@ -2,17 +2,13 @@ import Anthropic from '@anthropic-ai/sdk'
+ import { TextBlockParam, Tool } from '@anthropic-ai/sdk/resources'
+ import { removeUndefinedProps } from 'common/util/object'
+ import { Message, ToolCall } from 'common/actions'
+-import { STOP_MARKER } from 'common/constants'
++import { claudeModels, STOP_MARKER } from 'common/constants'
+ import { debugLog } from './util/debug'
+ import { RATE_LIMIT_POLICY } from './constants'
+ import { env } from './env.mjs'
++import { saveMessage } from './billing/message'
+ 
+-export const models = {
+-  sonnet: 'claude-3-5-sonnet-20240620' as const,
+-  haiku: 'claude-3-haiku-20240307' as const,
+-}
+-
+-export type model_types = (typeof models)[keyof typeof models]
++export type model_types = (typeof claudeModels)[keyof typeof claudeModels]
+ 
+ export type System = string | Array<TextBlockParam>
+ 
+@@ -23,15 +19,20 @@ export const promptClaudeStream = async function* (
+     tools?: Tool[]
+     model?: model_types
+     maxTokens?: number
+-    userId: string
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
+     ignoreHelicone?: boolean
+-  }
++  },
++  userId?: string
+ ): AsyncGenerator<string, void, unknown> {
+   const {
+-    model = models.sonnet,
++    model = claudeModels.sonnet,
+     system,
+     tools,
+-    userId,
++    clientSessionId,
++    fingerprintId,
++    userInputId,
+     maxTokens,
+     ignoreHelicone = false,
+   } = options
+@@ -55,7 +56,7 @@ export const promptClaudeStream = async function* (
+         ? {}
+         : {
+             'Helicone-Auth': `Bearer ${env.HELICONE_API_KEY}`,
+-            'Helicone-User-Id': userId,
++            'Helicone-User-Id': fingerprintId,
+             'Helicone-RateLimit-Policy': RATE_LIMIT_POLICY,
+             'Helicone-LLM-Security-Enabled': 'true',
+           }),
+@@ -79,14 +80,34 @@ export const promptClaudeStream = async function* (
+     id: '',
+     json: '',
+   }
++  let messageId: string | undefined
++  let inputTokens = 0
++  let outputTokens = 0
++  let cacheCreationInputTokens = 0
++  let cacheReadInputTokens = 0
++  let fullResponse = ''
+   for await (const chunk of stream) {
+     const { type } = chunk
+ 
++    // Start of turn
++    if (type === 'message_start') {
++      messageId = chunk.message.id
++      inputTokens = chunk.message.usage.input_tokens
++      outputTokens = chunk.message.usage.output_tokens
++      // @ts-ignore
++      cacheReadInputTokens = chunk.message.usage.cache_read_input_tokens ?? 0
++      cacheCreationInputTokens =
++        // @ts-ignore
++        chunk.message.usage.cache_creation_input_tokens ?? 0
++    }
++
++    // Text (most common case)
+     if (type === 'content_block_delta' && chunk.delta.type === 'text_delta') {
++      fullResponse += chunk.delta.text
+       yield chunk.delta.text
+     }
+ 
+-    // For Tool use!
++    // Tool use!
+     if (
+       type === 'content_block_start' &&
+       chunk.content_block.type === 'tool_use'
+@@ -110,16 +131,42 @@ export const promptClaudeStream = async function* (
+       console.error('tried to yield tool call', name, id, input)
+       // yield { name, id, input }
+     }
+-    // if (type === 'message_start') {
+-    //   console.log('message start', chunk)
+-    // }
++
++    // End of turn
++    if (type === 'message_delta' && chunk.delta.stop_reason === 'end_turn') {
++      if (!messageId) {
++        console.error('No messageId found')
++        break
++      }
++
++      outputTokens += chunk.usage.output_tokens
++      if (messages.length > 0) {
++        saveMessage({
++          messageId,
++          userId,
++          clientSessionId,
++          fingerprintId,
++          userInputId,
++          request: messages,
++          model,
++          response: fullResponse,
++          inputTokens,
++          outputTokens,
++          cacheCreationInputTokens,
++          cacheReadInputTokens,
++          finishedAt: new Date(),
++        })
++      }
++    }
+   }
+ }
+ 
+ export const promptClaude = async (
+   messages: Message[],
+   options: {
+-    userId: string
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
+     system?: string | Array<TextBlockParam>
+     tools?: Tool[]
+     model?: model_types
+@@ -137,7 +184,9 @@ export const promptClaude = async (
+ export async function promptClaudeWithContinuation(
+   messages: Message[],
+   options: {
+-    userId: string
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
+     system?: string
+     model?: model_types
+     ignoreHelicone?: boolean
+diff --git a/backend/src/generate-diffs-prompt.ts b/backend/src/generate-diffs-prompt.ts
+index 8b16b0f72..8d55cc0c3 100644
+--- a/backend/src/generate-diffs-prompt.ts
++++ b/backend/src/generate-diffs-prompt.ts
+@@ -3,9 +3,12 @@ import { Message } from 'common/actions'
+ import { debugLog } from './util/debug'
+ import { STOP_MARKER } from 'common/constants'
+ import { promptOpenAIWithContinuation } from './openai-api'
++import { openaiModels } from 'common/constants'
+ 
+ export async function generateExpandedFileWithDiffBlocks(
+-  userId: string,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
+   messageHistory: Message[],
+   fullResponse: string,
+   filePath: string,
+@@ -13,7 +16,9 @@ export async function generateExpandedFileWithDiffBlocks(
+   newContent: string
+ ) {
+   const diffBlocks = await generateDiffBlocks(
+-    userId,
++    clientSessionId,
++    fingerprintId,
++    userInputId,
+     messageHistory,
+     fullResponse,
+     filePath,
+@@ -51,7 +56,9 @@ export async function generateExpandedFileWithDiffBlocks(
+ }
+ 
+ export async function generateDiffBlocks(
+-  userId: string,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
+   messageHistory: Message[],
+   fullResponse: string,
+   filePath: string,
+@@ -435,11 +442,11 @@ Your Response:`
+ 
+   // const { response } = await promptClaudeWithContinuation(
+   //   [{ role: 'user', content: prompt }],
+-  //   { userId }
++  //   { fingerprintId }
+   // )
+   const response = await promptOpenAIWithContinuation(
+     [{ role: 'user', content: prompt }],
+-    { model: 'gpt-4o-2024-08-06', userId }
++    { clientSessionId, model: openaiModels.gpt4o, fingerprintId, userInputId }
+   )
+ 
+   debugLog('OpenAI response for diff blocks:', response)
+@@ -485,7 +492,7 @@ ${STOP_MARKER}
+     debugLog('Trying a second prompt for getDiffBlocks', filePath)
+     const response = await promptOpenAIWithContinuation(
+       [{ role: 'user', content: newPrompt }],
+-      { userId, model: 'gpt-4o-2024-08-06' }
++      { clientSessionId, fingerprintId, userInputId, model: openaiModels.gpt4o }
+     )
+     debugLog('Second Claude response for diff blocks:', response)
+ 
+diff --git a/backend/src/generate-diffs-via-expansion.ts b/backend/src/generate-diffs-via-expansion.ts
+index 32f80e279..a9977dd9c 100644
+--- a/backend/src/generate-diffs-via-expansion.ts
++++ b/backend/src/generate-diffs-via-expansion.ts
+@@ -2,6 +2,7 @@ import { debugLog } from './util/debug'
+ import { Message } from 'common/actions'
+ import { createFileBlock } from 'common/util/file'
+ import { promptOpenAI } from './openai-api'
++import { openaiModels } from 'common/constants'
+ 
+ export async function expandNewContent(
+   userId: string,
+@@ -679,7 +680,7 @@ ${createFileBlock(filePath, newContent)}
+         content: prompt,
+       },
+     ],
+-    'gpt-4o-2024-08-06'
++    openaiModels.gpt4o
+   )
+ 
+   debugLog('New file (unexpanded) for filePath', filePath, newContent)
+diff --git a/backend/src/generate-knowledge-files.ts b/backend/src/generate-knowledge-files.ts
+index e10d391d8..92e990254 100644
+--- a/backend/src/generate-knowledge-files.ts
++++ b/backend/src/generate-knowledge-files.ts
+@@ -8,7 +8,9 @@ import { debugLog } from './util/debug'
+ import { env } from './env.mjs'
+ 
+ export async function generateKnowledgeFiles(
+-  userId: string,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
+   ws: WebSocket,
+   fullResponse: string,
+   fileContext: ProjectFileContext,
+@@ -96,7 +98,9 @@ export async function generateKnowledgeFiles(
+   ]
+ 
+   const response = await promptClaude(messages, {
+-    userId,
++    clientSessionId,
++    fingerprintId,
++    userInputId,
+     system: systemPrompt,
+   })
+ 
+@@ -108,7 +112,9 @@ export async function generateKnowledgeFiles(
+   const fileChangePromises = Object.entries(files).map(
+     ([filePath, fileContent]) =>
+       processFileBlock(
+-        userId,
++        clientSessionId,
++        fingerprintId,
++        userInputId,
+         ws,
+         messages,
+         fullResponse,
+diff --git a/backend/src/generate-patch.ts b/backend/src/generate-patch.ts
+index 28240ee9f..631d62e4d 100644
+--- a/backend/src/generate-patch.ts
++++ b/backend/src/generate-patch.ts
+@@ -2,9 +2,12 @@ import { Message } from 'common/actions'
+ import { OpenAIMessage, promptOpenAI } from './openai-api'
+ import { debugLog } from './util/debug'
+ import { createPatch } from 'diff'
++import { openaiModels } from 'common/constants'
+ 
+ export async function generatePatch(
+-  userId: string,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
+   oldContent: string,
+   newContent: string,
+   filePath: string,
+@@ -19,7 +22,9 @@ export async function generatePatch(
+   let patch = ''
+   const { isSketchComplete, shouldAddPlaceholderComments } =
+     await isSketchCompletePrompt(
+-      userId,
++      clientSessionId,
++      fingerprintId,
++      userInputId,
+       normalizedOldContent,
+       normalizedNewContent,
+       filePath,
+@@ -38,7 +43,9 @@ export async function generatePatch(
+       ? `... existing code ...\n\n${normalizedNewContent}\n\n... existing code ...`
+       : normalizedNewContent
+     patch = await generatePatchPrompt(
+-      userId,
++      clientSessionId,
++      fingerprintId,
++      userInputId,
+       normalizedOldContent,
+       newContentWithPlaceholders,
+       filePath,
+@@ -51,7 +58,9 @@ export async function generatePatch(
+ }
+ 
+ const isSketchCompletePrompt = async (
+-  userId: string,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
+   oldContent: string,
+   newContent: string,
+   filePath: string,
+@@ -92,9 +101,11 @@ If you strongly believe this is the scenario, please write "INCOMPLETE_SKETCH".
+     },
+   ]
+   const response = await promptOpenAI(
+-    userId,
++    clientSessionId,
++    fingerprintId,
++    userInputId,
+     messages as OpenAIMessage[],
+-    'gpt-4o-2024-08-06'
++    openaiModels.gpt4o
+   )
+   const shouldAddPlaceholderComments = response.includes('INCOMPLETE_SKETCH')
+   const isSketchComplete =
+@@ -111,7 +122,9 @@ If you strongly believe this is the scenario, please write "INCOMPLETE_SKETCH".
+ }
+ 
+ const generatePatchPrompt = async (
+-  userId: string,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
+   oldContent: string,
+   newContent: string,
+   filePath: string,
+@@ -145,9 +158,11 @@ Please produce a patch file based on this change.
+     },
+   ]
+   return await promptOpenAI(
+-    userId,
++    clientSessionId,
++    fingerprintId,
++    userInputId,
+     messages,
+-    'ft:gpt-4o-2024-08-06:manifold-markets::A7wELpag'
+-    // 'ft:gpt-4o-2024-08-06:manifold-markets:run-1:A4VfZwvz'
++    `ft:${openaiModels.gpt4o}:manifold-markets::A7wELpag`
++    // ft:${models.gpt4o}:manifold-markets:run-1:A4VfZwvz`
+   )
+ }
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index 02fb47bb4..1d22eb4f1 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -28,7 +28,9 @@ export async function mainPrompt(
+   ws: WebSocket,
+   messages: Message[],
+   fileContext: ProjectFileContext,
+-  userId: string,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
+   onResponseChunk: (chunk: string) => void
+ ) {
+   debugLog(
+@@ -36,7 +38,6 @@ export async function mainPrompt(
+     'messages:',
+     messages.length
+   )
+-
+   let fullResponse = ''
+   let genKnowledgeFilesPromise: Promise<Promise<FileChange | null>[]> =
+     Promise.resolve([])
+@@ -53,7 +54,9 @@ export async function mainPrompt(
+       fileContext,
+       { messages, system },
+       null,
+-      userId
++      clientSessionId,
++      fingerprintId,
++      userInputId
+     )
+     if (responseChunk !== null) {
+       onResponseChunk(responseChunk.readFilesMessage)
+@@ -61,7 +64,12 @@ export async function mainPrompt(
+ 
+       // Prompt cache the new files.
+       const system = getSearchSystemPrompt(fileContext)
+-      warmCacheForRequestRelevantFiles(system, userId)
++      warmCacheForRequestRelevantFiles(
++        system,
++        clientSessionId,
++        fingerprintId,
++        userInputId
++      )
+     }
+   }
+ 
+@@ -74,7 +82,9 @@ export async function mainPrompt(
+     // Already have context from existing chat
+     // If client used tool, we don't want to generate knowledge files because the user isn't really in control
+     genKnowledgeFilesPromise = generateKnowledgeFiles(
+-      userId,
++      clientSessionId,
++      fingerprintId,
++      userInputId,
+       ws,
+       fullResponse,
+       fileContext,
+@@ -138,7 +148,9 @@ ${STOP_MARKER}
+ 
+     const stream = promptClaudeStream(messagesWithContinuedMessage, {
+       system,
+-      userId,
++      clientSessionId,
++      fingerprintId,
++      userInputId,
+     })
+     const streamWithTags = processStreamWithTags(stream, {
+       edit_file: {
+@@ -153,7 +165,9 @@ ${STOP_MARKER}
+             : fileContent
+           fileProcessingPromises.push(
+             processFileBlock(
+-              userId,
++              clientSessionId,
++              fingerprintId,
++              userInputId,
+               ws,
+               messages,
+               fullResponse,
+@@ -239,7 +253,9 @@ ${STOP_MARKER}
+         fileContext,
+         { messages, system: getSearchSystemPrompt(fileContext) },
+         fullResponse,
+-        userId
++        clientSessionId,
++        fingerprintId,
++        userInputId
+       )
+       if (response !== null) {
+         const { readFilesMessage } = response
+@@ -318,13 +334,17 @@ async function updateFileContext(
+     system: string | Array<TextBlockParam>
+   },
+   prompt: string | null,
+-  userId: string
++  clientSessionId: string,
++  fingerprntId: string,
++  userInputId: string
+ ) {
+   const relevantFiles = await requestRelevantFiles(
+     { messages, system },
+     fileContext,
+     prompt,
+-    userId
++    clientSessionId,
++    fingerprntId,
++    userInputId
+   )
+ 
+   if (relevantFiles === null || relevantFiles.length === 0) {
+@@ -365,7 +385,9 @@ async function updateFileContext(
+ }
+ 
+ export async function processFileBlock(
+-  userId: string,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
+   ws: WebSocket,
+   messageHistory: Message[],
+   fullResponse: string,
+@@ -387,7 +409,9 @@ export async function processFileBlock(
+   }
+ 
+   const patch = await generatePatch(
+-    userId,
++    clientSessionId,
++    fingerprintId,
++    userInputId,
+     oldContent,
+     newContent,
+     filePath,
+diff --git a/backend/src/openai-api.ts b/backend/src/openai-api.ts
+index c147dba01..4d27e30bb 100644
+--- a/backend/src/openai-api.ts
++++ b/backend/src/openai-api.ts
+@@ -3,19 +3,20 @@ import { RATE_LIMIT_POLICY } from './constants'
+ import { STOP_MARKER } from 'common/constants'
+ import { Stream } from 'openai/streaming'
+ import { env } from './env.mjs'
++import { saveMessage } from './billing/message'
+ 
+ export type OpenAIMessage = OpenAI.Chat.ChatCompletionMessageParam
+ 
+ let openai: OpenAI | null = null
+ 
+-const getOpenAI = (userId: string) => {
++const getOpenAI = (fingerprintId: string) => {
+   if (!openai) {
+     openai = new OpenAI({
+       apiKey: env.OPEN_AI_KEY,
+       baseURL: 'https://oai.helicone.ai/v1',
+       defaultHeaders: {
+         'Helicone-Auth': `Bearer ${env.HELICONE_API_KEY}`,
+-        'Helicone-User-Id': userId,
++        'Helicone-User-Id': fingerprintId,
+         'Helicone-RateLimit-Policy': RATE_LIMIT_POLICY,
+         // 'Helicone-LLM-Security-Enabled': 'true',
+       },
+@@ -31,11 +32,14 @@ const timeoutPromise = (ms: number) =>
+   )
+ 
+ export async function promptOpenAI(
+-  userId: string,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
+   messages: OpenAIMessage[],
+-  model: string
++  model: string,
++  userId?: string
+ ) {
+-  const openai = getOpenAI(userId)
++  const openai = getOpenAI(fingerprintId)
+   try {
+     const response = await Promise.race([
+       openai.chat.completions.create({
+@@ -52,7 +56,24 @@ export async function promptOpenAI(
+       response.choices.length > 0 &&
+       response.choices[0].message
+     ) {
+-      return response.choices[0].message.content || ''
++      const messageId = response.id
++      const content = response.choices[0].message.content || ''
++      if (messages.length > 0) {
++        saveMessage({
++          messageId,
++          userId,
++          clientSessionId,
++          fingerprintId,
++          userInputId,
++          model,
++          request: messages,
++          response: content,
++          inputTokens: response.usage?.prompt_tokens || 0,
++          outputTokens: response.usage?.completion_tokens || 0,
++          finishedAt: new Date(),
++        })
++      }
++      return content
+     } else {
+       throw new Error('No response from OpenAI')
+     }
+@@ -69,14 +90,19 @@ export async function promptOpenAI(
+ 
+ export async function promptOpenAIWithContinuation(
+   messages: OpenAIMessage[],
+-  options: { model: string; userId: string }
++  options: {
++    model: string
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
++    userId?: string
++  }
+ ) {
+-  const { model, userId } = options
++  const { model, clientSessionId, fingerprintId, userInputId, userId } = options
+   let fullResponse = ''
+   let continuedMessage: OpenAIMessage | null = null
+   let isComplete = false
+ 
+-  // Add the instruction to end with the stop marker to the last user message
+   const lastUserMessageIndex = messages.findLastIndex(
+     (msg) => msg.role === 'user'
+   )
+@@ -90,7 +116,7 @@ export async function promptOpenAIWithContinuation(
+     })
+   }
+ 
+-  const openai = getOpenAI(userId)
++  const openai = getOpenAI(fingerprintId)
+ 
+   while (!isComplete) {
+     const messagesWithContinuedMessage = continuedMessage
+@@ -104,6 +130,9 @@ export async function promptOpenAIWithContinuation(
+           messages: messagesWithContinuedMessage,
+           stream: true,
+           temperature: 0,
++          stream_options: {
++            include_usage: true,
++          },
+         }),
+         timeoutPromise(120000) as Promise<
+           Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
+@@ -114,6 +143,23 @@ export async function promptOpenAIWithContinuation(
+         if (chunk.choices[0]?.delta?.content) {
+           fullResponse += chunk.choices[0].delta.content
+         }
++
++        if (chunk.usage) {
++          const messageId = chunk.id
++          saveMessage({
++            messageId,
++            userId,
++            clientSessionId,
++            fingerprintId,
++            userInputId,
++            model,
++            request: messages,
++            response: fullResponse,
++            inputTokens: chunk.usage.prompt_tokens,
++            outputTokens: chunk.usage.completion_tokens,
++            finishedAt: new Date(),
++          })
++        }
+       }
+ 
+       if (continuedMessage) {
+diff --git a/backend/src/request-files-prompt.ts b/backend/src/request-files-prompt.ts
+index ad180356f..4089bfb67 100644
+--- a/backend/src/request-files-prompt.ts
++++ b/backend/src/request-files-prompt.ts
+@@ -4,7 +4,8 @@ import { TextBlockParam, Tool } from '@anthropic-ai/sdk/resources'
+ 
+ import { Message } from 'common/actions'
+ import { ProjectFileContext } from 'common/util/file'
+-import { model_types, models, promptClaude, System } from './claude'
++import { model_types, promptClaude, System } from './claude'
++import { claudeModels } from 'common/constants'
+ import { debugLog } from './util/debug'
+ import { getAllFilePaths } from 'common/project-file-tree'
+ 
+@@ -18,7 +19,9 @@ export async function requestRelevantFiles(
+   },
+   fileContext: ProjectFileContext,
+   assistantPrompt: string | null,
+-  userId: string
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string
+ ) {
+   const previousFiles = Object.keys(fileContext.files)
+   const countPerRequest = assistantPrompt ? 8 : 5
+@@ -38,7 +41,9 @@ export async function requestRelevantFiles(
+     : checkNewFilesNecessary(
+         messagesExcludingLastIfByUser,
+         system,
+-        userId,
++        clientSessionId,
++        fingerprintId,
++        userInputId,
+         previousFiles,
+         userPrompt
+       )
+@@ -50,7 +55,9 @@ export async function requestRelevantFiles(
+     countPerRequest,
+     messagesExcludingLastIfByUser,
+     system,
+-    userId
++    clientSessionId,
++    fingerprintId,
++    userInputId
+   )
+ 
+   const newFilesNecessary = await newFilesNecessaryPromise
+@@ -73,7 +80,9 @@ async function generateFileRequests(
+   countPerRequest: number,
+   messagesExcludingLastIfByUser: Message[],
+   system: string | Array<TextBlockParam>,
+-  userId: string
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string
+ ) {
+   const numNonObviousPrompts = assistantPrompt ? 1 : 1
+   const nonObviousPrompts = range(1, numNonObviousPrompts + 1).map((index) =>
+@@ -92,9 +101,11 @@ async function generateFileRequests(
+         system,
+       },
+       nonObviousPrompt,
+-      models.sonnet,
++      claudeModels.sonnet,
+       `Non-obvious ${index + 1}`,
+-      userId
++      clientSessionId,
++      fingerprintId,
++      userInputId
+     ).catch((error) => {
+       console.error('Error requesting files:', error)
+       return { files: [], duration: 0 }
+@@ -119,9 +130,11 @@ async function generateFileRequests(
+         system,
+       },
+       keyPrompt,
+-      models.sonnet,
++      claudeModels.sonnet,
+       `Key ${index + 1}`,
+-      userId
++      clientSessionId,
++      fingerprintId,
++      userInputId
+     ).catch((error) => {
+       console.error('Error requesting key files:', error)
+       return { files: [], duration: 0 }
+@@ -140,7 +153,9 @@ async function generateFileRequests(
+ const checkNewFilesNecessary = async (
+   messages: Message[],
+   system: System,
+-  userId: string,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
+   previousFiles: string[],
+   userPrompt: string
+ ) => {
+@@ -156,9 +171,11 @@ Answer with just 'YES' if new files are necessary, or 'NO' if the current files
+   const response = await promptClaude(
+     [...messages, { role: 'user', content: prompt }],
+     {
+-      model: models.sonnet,
++      model: claudeModels.sonnet,
+       system,
+-      userId,
++      clientSessionId,
++      fingerprintId,
++      userInputId,
+     }
+   ).catch((error) => {
+     console.error('Error checking new files necessary:', error)
+@@ -179,7 +196,9 @@ async function getRelevantFiles(
+   userPrompt: string,
+   model: model_types,
+   requestType: string,
+-  userId: string
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string
+ ): Promise<{ files: string[]; duration: number }> {
+   const messagesWithPrompt = [
+     ...messages,
+@@ -192,7 +211,9 @@ async function getRelevantFiles(
+   const response = await promptClaude(messagesWithPrompt, {
+     model,
+     system,
+-    userId,
++    clientSessionId,
++    fingerprintId,
++    userInputId,
+   })
+   const end = performance.now()
+   const duration = end - start
+@@ -350,7 +371,9 @@ ${topLevelDirectories(fileContext).join('\n')}
+ 
+ export const warmCacheForRequestRelevantFiles = async (
+   system: System,
+-  userId: string
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string
+ ) => {
+   await promptClaude(
+     [
+@@ -360,9 +383,11 @@ export const warmCacheForRequestRelevantFiles = async (
+       },
+     ],
+     {
+-      model: models.sonnet,
++      model: claudeModels.sonnet,
+       system,
+-      userId,
++      clientSessionId,
++      fingerprintId,
++      userInputId,
+       maxTokens: 1,
+     }
+   ).catch((error) => {
+diff --git a/backend/src/websockets/middleware.ts b/backend/src/websockets/middleware.ts
+new file mode 100644
+index 000000000..fa8db8234
+--- /dev/null
++++ b/backend/src/websockets/middleware.ts
+@@ -0,0 +1,48 @@
++import { WebSocket } from 'ws'
++import { ClientAction } from 'common/actions'
++
++export class WebSocketMiddleware {
++  private middlewares: Array<
++    (action: ClientAction, ws: WebSocket) => void | Promise<void>
++  > = []
++
++  use<T extends ClientAction['type']>(
++    callback: (
++      action: Extract<ClientAction, { type: T }>,
++      ws: WebSocket
++    ) => void | Promise<void>
++  ) {
++    this.middlewares.push(
++      callback as (action: ClientAction, ws: WebSocket) => void | Promise<void>
++    )
++  }
++
++  async execute(action: ClientAction, ws: WebSocket): Promise<boolean> {
++    try {
++      for (const middleware of this.middlewares) {
++        await middleware(action, ws)
++      }
++      return true
++    } catch (error) {
++      console.error('Middleware execution halted:', error)
++      return false
++    }
++  }
++
++  run<T extends ClientAction['type']>(
++    baseAction: (
++      action: Extract<ClientAction, { type: T }>,
++      ws: WebSocket
++    ) => void
++  ) {
++    return async (
++      action: Extract<ClientAction, { type: T }>,
++      ws: WebSocket
++    ) => {
++      const shouldContinue = await this.execute(action, ws)
++      if (shouldContinue) {
++        baseAction(action, ws)
++      }
++    }
++  }
++}
+diff --git a/backend/src/websockets/server.ts b/backend/src/websockets/server.ts
+index 0ab07cbd0..a2ce08931 100644
+--- a/backend/src/websockets/server.ts
++++ b/backend/src/websockets/server.ts
+@@ -1,6 +1,6 @@
+ import { Server as HttpServer } from 'node:http'
+ import { Server as WebSocketServer, RawData, WebSocket } from 'ws'
+-import { isError } from 'lodash'
++import { isError, set } from 'lodash'
+ import {
+   ClientMessage,
+   ServerMessage,
+@@ -9,7 +9,7 @@ import {
+ import { Switchboard } from './switchboard'
+ import { onWebsocketAction } from './websocket-action'
+ 
+-const SWITCHBOARD = new Switchboard()
++export const SWITCHBOARD = new Switchboard()
+ 
+ // if a connection doesn't ping for this long, we assume the other side is toast
+ const CONNECTION_TIMEOUT_MS = 60 * 1000
+@@ -50,16 +50,16 @@ function parseMessage(data: RawData): ClientMessage {
+   }
+ }
+ 
+-function processMessage(ws: WebSocket, data: RawData): ServerMessage<'ack'> {
++async function processMessage(
++  ws: WebSocket,
++  clientSessionId: string,
++  data: RawData
++): Promise<ServerMessage<'ack'>> {
+   try {
+     const msg = parseMessage(data)
+     const { type, txid } = msg
+     try {
+       switch (type) {
+-        case 'identify': {
+-          SWITCHBOARD.identify(ws, msg.uid)
+-          break
+-        }
+         case 'subscribe': {
+           SWITCHBOARD.subscribe(ws, ...msg.topics)
+           break
+@@ -73,7 +73,7 @@ function processMessage(ws: WebSocket, data: RawData): ServerMessage<'ack'> {
+           break
+         }
+         case 'action': {
+-          onWebsocketAction(ws, msg)
++          onWebsocketAction(ws, clientSessionId, msg)
+           break
+         }
+         default:
+@@ -118,8 +118,10 @@ export function listen(server: HttpServer, path: string) {
+     // todo: should likely kill connections that haven't sent any ping for a long time
+     // console.log('WS client connected.')
+     SWITCHBOARD.connect(ws)
+-    ws.on('message', (data) => {
+-      const result = processMessage(ws, data)
++    const clientSessionId =
++      SWITCHBOARD.clients.get(ws)?.sessionId ?? 'mc-client-unknown'
++    ws.on('message', async (data) => {
++      const result = await processMessage(ws, clientSessionId, data)
+       // mqp: check ws.readyState before sending?
+       ws.send(JSON.stringify(result))
+     })
+diff --git a/backend/src/websockets/switchboard.ts b/backend/src/websockets/switchboard.ts
+index 58f3d8bad..3ff27e070 100644
+--- a/backend/src/websockets/switchboard.ts
++++ b/backend/src/websockets/switchboard.ts
+@@ -1,7 +1,7 @@
+ import { WebSocket } from 'ws'
+ 
+ export type ClientState = {
+-  uid?: string
++  sessionId?: string
+   lastSeen: number
+   subscriptions: Set<string>
+ }
+@@ -31,23 +31,19 @@ export class Switchboard {
+     if (existing != null) {
+       throw new Error("Client already connected! Shouldn't happen.")
+     }
+-    this.clients.set(ws, { lastSeen: Date.now(), subscriptions: new Set() })
++    this.clients.set(ws, {
++      lastSeen: Date.now(),
++      sessionId: `mc-client-` + Math.random().toString(36).slice(2, 15),
++      subscriptions: new Set(),
++    })
+   }
+   disconnect(ws: WebSocket) {
+-    this.getClient(ws)
++    this.getClient(ws).sessionId = undefined
+     this.clients.delete(ws)
+   }
+   markSeen(ws: WebSocket) {
+     this.getClient(ws).lastSeen = Date.now()
+   }
+-  identify(ws: WebSocket, uid: string) {
+-    this.getClient(ws).uid = uid
+-    this.markSeen(ws)
+-  }
+-  deidentify(ws: WebSocket) {
+-    this.getClient(ws).uid = undefined
+-    this.markSeen(ws)
+-  }
+   subscribe(ws: WebSocket, ...topics: string[]) {
+     const client = this.getClient(ws)
+     for (const topic of topics) {
+diff --git a/backend/src/websockets/websocket-action.ts b/backend/src/websockets/websocket-action.ts
+index 11ccd92e7..0b6b59985 100644
+--- a/backend/src/websockets/websocket-action.ts
++++ b/backend/src/websockets/websocket-action.ts
+@@ -2,16 +2,20 @@ import { WebSocket } from 'ws'
+ import { ClientMessage } from 'common/websockets/websocket-schema'
+ import { mainPrompt } from '../main-prompt'
+ import { ClientAction, ServerAction } from 'common/actions'
+-import { sendMessage } from './server'
++import { sendMessage, SWITCHBOARD } from './server'
+ import { isEqual } from 'lodash'
+ import { getSearchSystemPrompt } from '../system-prompt'
+-import { promptClaude, models } from '../claude'
++import { promptClaude } from '../claude'
+ import { env } from '../env.mjs'
+ import db from 'common/src/db'
+ import * as schema from 'common/db/schema'
+-import { eq, and, gt } from 'drizzle-orm'
++import { eq, and, gt, sql } from 'drizzle-orm'
+ import { genAuthCode } from 'common/util/credentials'
+ import { match, P } from 'ts-pattern'
++import { claudeModels } from 'common/constants'
++import { WebSocketMiddleware } from './middleware'
++import { resetQuota, updateQuota } from '@/billing/message'
++import { getNextQuotaReset } from 'common/util/dates'
+ 
+ const sendAction = (ws: WebSocket, action: ServerAction) => {
+   sendMessage(ws, {
+@@ -28,6 +32,7 @@ const onUserInput = async (
+     fileContext,
+     previousChanges,
+   }: Extract<ClientAction, { type: 'user-input' }>,
++  clientSessionId: string,
+   ws: WebSocket
+ ) => {
+   const lastMessage = messages[messages.length - 1]
+@@ -39,7 +44,9 @@ const onUserInput = async (
+       ws,
+       messages,
+       fileContext,
++      clientSessionId,
+       fingerprintId,
++      userInputId,
+       (chunk) =>
+         sendAction(ws, {
+           type: 'response-chunk',
+@@ -66,6 +73,12 @@ const onUserInput = async (
+         response,
+         changes: allChanges,
+       })
++      const { creditsUsed, quota } = await updateQuota(fingerprintId)
++      // sendAction(ws, {
++      //   type: 'usage',
++      //   usage: creditsUsed,
++      //   limit: quota,
++      // })
+     }
+   } catch (e) {
+     console.error('Error in mainPrompt', e)
+@@ -78,7 +91,7 @@ const onUserInput = async (
+       userInputId,
+       chunk: response,
+     })
+-    setTimeout(() => {
++    setTimeout(async () => {
+       sendAction(ws, {
+         type: 'response-complete',
+         userInputId,
+@@ -96,7 +109,8 @@ const onClearAuthTokenRequest = async (
+     fingerprintId,
+     fingerprintHash,
+   }: Extract<ClientAction, { type: 'clear-auth-token' }>,
+-  ws: WebSocket
++  _clientSessionId: string,
++  _ws: WebSocket
+ ) => {
+   const validDeletion = await db
+     .delete(schema.session)
+@@ -107,8 +121,7 @@ const onClearAuthTokenRequest = async (
+         gt(schema.session.expires, new Date()), // active session
+ 
+         // probably not necessary, but just in case. paranoia > death
+-        eq(schema.session.fingerprintId, fingerprintId),
+-        eq(schema.session.fingerprintHash, fingerprintHash)
++        eq(schema.session.fingerprint_id, fingerprintId)
+       )
+     )
+     .returning({
+@@ -127,6 +140,7 @@ const onClearAuthTokenRequest = async (
+ 
+ const onLoginCodeRequest = (
+   { fingerprintId }: Extract<ClientAction, { type: 'login-code-request' }>,
++  _clientSessionId: string,
+   ws: WebSocket
+ ): void => {
+   const expiresAt = Date.now() + 5 * 60 * 1000 // 5 minutes in the future
+@@ -150,6 +164,7 @@ const onLoginStatusRequest = async (
+     fingerprintId,
+     fingerprintHash,
+   }: Extract<ClientAction, { type: 'login-status-request' }>,
++  _clientSessionId: string,
+   ws: WebSocket
+ ) => {
+   try {
+@@ -162,10 +177,14 @@ const onLoginStatusRequest = async (
+       })
+       .from(schema.user)
+       .leftJoin(schema.session, eq(schema.user.id, schema.session.userId))
++      .leftJoin(
++        schema.fingerprint,
++        eq(schema.session.fingerprint_id, schema.fingerprint.id)
++      )
+       .where(
+         and(
+-          eq(schema.session.fingerprintId, fingerprintId),
+-          eq(schema.session.fingerprintHash, fingerprintHash)
++          eq(schema.session.fingerprint_id, fingerprintId),
++          eq(schema.fingerprint.sig_hash, fingerprintHash)
+         )
+       )
+ 
+@@ -204,13 +223,20 @@ const onLoginStatusRequest = async (
+   }
+ }
+ 
+-const onWarmContextCache = async (
+-  {
+-    fileContext,
+-    fingerprintId,
+-  }: Extract<ClientAction, { type: 'warm-context-cache' }>,
++const onInit = async (
++  { fileContext, fingerprintId }: Extract<ClientAction, { type: 'init' }>,
++  clientSessionId: string,
+   ws: WebSocket
+ ) => {
++  // Create a new session for fingerprint if it doesn't exist
++  await db
++    .insert(schema.fingerprint)
++    .values({
++      id: fingerprintId,
++    })
++    .onConflictDoNothing()
++
++  // warm context cache
+   const startTime = Date.now()
+   const system = getSearchSystemPrompt(fileContext)
+   await promptClaude(
+@@ -221,28 +247,39 @@ const onWarmContextCache = async (
+       },
+     ],
+     {
+-      model: models.sonnet,
++      model: claudeModels.sonnet,
+       system,
+-      userId: fingerprintId,
++      clientSessionId,
++      fingerprintId,
++      userInputId: 'init-cache',
++      maxTokens: 1,
+     }
+   )
+   sendAction(ws, {
+-    type: 'warm-context-cache-response',
++    type: 'init-response',
+   })
+   console.log('Warming context cache done', Date.now() - startTime)
+ }
+ 
+ const callbacksByAction = {} as Record<
+   ClientAction['type'],
+-  ((action: ClientAction, ws: WebSocket) => void)[]
++  ((action: ClientAction, clientSessionId: string, ws: WebSocket) => void)[]
+ >
+ 
+ export const subscribeToAction = <T extends ClientAction['type']>(
+   type: T,
+-  callback: (action: Extract<ClientAction, { type: T }>, ws: WebSocket) => void
++  callback: (
++    action: Extract<ClientAction, { type: T }>,
++    clientSessionId: string,
++    ws: WebSocket
++  ) => void
+ ) => {
+   callbacksByAction[type] = (callbacksByAction[type] ?? []).concat(
+-    callback as (action: ClientAction, ws: WebSocket) => void
++    callback as (
++      action: ClientAction,
++      clientSessionId: string,
++      ws: WebSocket
++    ) => void
+   )
+   return () => {
+     callbacksByAction[type] = (callbacksByAction[type] ?? []).filter(
+@@ -253,11 +290,12 @@ export const subscribeToAction = <T extends ClientAction['type']>(
+ 
+ export const onWebsocketAction = async (
+   ws: WebSocket,
++  clientSessionId: string,
+   msg: ClientMessage & { type: 'action' }
+ ) => {
+   const callbacks = callbacksByAction[msg.data.type] ?? []
+   try {
+-    await Promise.all(callbacks.map((cb) => cb(msg.data, ws)))
++    await Promise.all(callbacks.map((cb) => cb(msg.data, clientSessionId, ws)))
+   } catch (e) {
+     console.error(
+       'Got error running subscribeToAction callback',
+@@ -267,8 +305,60 @@ export const onWebsocketAction = async (
+   }
+ }
+ 
++const protec = new WebSocketMiddleware()
++protec.use(async (action, _) => {
++  console.log(
++    `Protecting action of type: '${action.type}' (currently disabled)`
++  )
++})
++// protec.use(async (action, ws) => {
++//   const fingerprintId = match(action)
++//     .with(
++//       {
++//         fingerprintId: P.string,
++//       },
++//       ({ fingerprintId }) => fingerprintId
++//     )
++//     .otherwise(() => null)
++
++//   if (!fingerprintId) {
++//     console.error('No fingerprintId found, cannot check quota')
++//     throw new Error('No fingerprintId found')
++//   }
++
++//   const quotas = await db
++//     .select({
++//       userId: schema.user.id,
++//       quotaExceeded: sql<boolean>`COALESCE(${schema.user.quota_exceeded}, ${schema.fingerprint.quota_exceeded}, true)`,
++//       nextQuotaReset: sql<Date>`COALESCE(${schema.user.next_quota_reset}, ${schema.fingerprint.next_quota_reset}, now())`,
++//     })
++//     .from(schema.user)
++//     .leftJoin(schema.fingerprint, eq(schema.user.id, schema.fingerprint.id))
++
++//   const quota = quotas[0]
++//   if (!quota) {
++//     throw new Error('User is not in the system!')
++//   }
++
++//   if (quota.quotaExceeded) {
++//     if (quota.nextQuotaReset < new Date()) {
++//       // End date is in the past, so we should reset the quota
++//       resetQuota(fingerprintId, quota.userId)
++//     } else {
++//       sendAction(ws, {
++//         type: 'quota-exceeded',
++//         nextQuotaReset: getNextQuotaReset(quota.nextQuotaReset),
++//       })
++//       throw new Error(`Quota exceeded for user ${fingerprintId}`)
++//     }
++//   }
++// })
++
++// subscribeToAction('user-input', protec.run(onUserInput))
++// subscribeToAction('init', protec.run(onInit))
+ subscribeToAction('user-input', onUserInput)
+-subscribeToAction('warm-context-cache', onWarmContextCache)
++subscribeToAction('init', onInit)
++
+ subscribeToAction('clear-auth-token', onClearAuthTokenRequest)
+ subscribeToAction('login-code-request', onLoginCodeRequest)
+ subscribeToAction('login-status-request', onLoginStatusRequest)
+diff --git a/billing.knowledge.md b/billing.knowledge.md
+new file mode 100644
+index 000000000..070f0d654
+--- /dev/null
++++ b/billing.knowledge.md
+@@ -0,0 +1,77 @@
++# Billing and Usage Tracking
++
++## Overview
++
++This file contains information about the billing system and usage tracking for the Manicode project.
++
++- The `subscriptionActive` status affects the user's usage limits and access to premium features.
++
++## User Tracking
++
++- The system tracks both authenticated and non-authenticated users.
++
++- Usage tracking is now focused on authenticated users only.
++- The `usage` table in the database is the single source of truth for usage data.
++- Only authenticated users have entries in the `usage` table.
++- Anonymous users have their usage capped at a set 
+
+… [diff truncated: view full diff on GitHub] …

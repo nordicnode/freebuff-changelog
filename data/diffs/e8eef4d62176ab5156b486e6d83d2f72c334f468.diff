@@ -1,0 +1,335 @@
+diff --git a/evals/git-evals/prompting-agent.ts b/evals/git-evals/prompting-agent.ts
+new file mode 100644
+index 000000000..5e4a714cb
+--- /dev/null
++++ b/evals/git-evals/prompting-agent.ts
+@@ -0,0 +1,109 @@
++import type { AgentDecisionSchema } from './types'
++import type { AgentDefinition } from '@codebuff/common/templates/initial-agents-dir/types/agent-definition'
++import type { z } from 'zod/v4'
++import { CodebuffClient } from '../../sdk/src'
++
++// Agent definition for prompting
++const promptingAgentDefinition: AgentDefinition = {
++  id: 'eval-prompting-agent',
++  displayName: 'Evaluation Prompting Agent',
++  model: 'openai/gpt-5-chat',
++  toolNames: ['set_output', 'end_turn'],
++  inputSchema: {
++    prompt: {
++      type: 'string',
++      description: 'The evaluation context and conversation history',
++    },
++  },
++  outputMode: 'structured_output',
++  outputSchema: {
++    type: 'object',
++    properties: {
++      reasoning: {
++        type: 'string',
++        description: 'Detailed reasoning for the decision',
++      },
++      decision: {
++        type: 'string',
++        enum: ['continue', 'complete', 'halt'],
++        description:
++          'Whether to continue, complete, or halt the implementation',
++      },
++      next_prompt: {
++        type: 'string',
++        description:
++          'The next prompt to send to Codebuff (required if decision is continue)',
++      },
++    },
++    required: ['decision', 'reasoning'],
++  },
++  systemPrompt: `You are an expert software engineer tasked with implementing a specification using Codebuff, an AI coding assistant. Your goal is to prompt Codebuff to implement the spec correctly.
++
++You cannot and should not make changes yourself. You have no access to tools. You are merely prompting a coding assistant to make changes on your behalf in order to implement the spec.`,
++  instructionsPrompt: `Analyze the conversation history and determine whether to:
++1. 'continue' - Generate a follow-up prompt for Codebuff the coding agent
++2. 'complete' - The implementation is done and satisfies the spec  
++3. 'halt' - The implementation is off track and unlikely to be completed
++
++If deciding to continue, include a clear, focused prompt for Codebuff in next_prompt. Don't ask to see files or specific code, instead you should mostly describe the changes you want to make (based on the spec). It's fine to ask questions if you need to in order best implement the spec. But keep in mind you only have a few turns to implement the spec.
++
++Explain your reasoning in detail.
++
++You must use the set_output tool to output your reasoning, decision and next_prompt.`,
++}
++
++/**
++ * Get the next evaluation prompt using the Codebuff SDK
++ */
++export async function getNextEvalPrompt({
++  client,
++  spec,
++  conversationHistory,
++  attemptsRemaining,
++}: {
++  client: CodebuffClient
++  spec: string
++  conversationHistory: string
++  attemptsRemaining: number
++}): Promise<z.infer<typeof AgentDecisionSchema>> {
++  const prompt = `You are in a conversation with Codebuff, an AI coding assistant.
++Your conversation with Codebuff so far:
++<conversation>${conversationHistory}</conversation>
++    
++You need to implement the spec via prompting Codebuff the coding agent. You only have ${attemptsRemaining} turns left to implement the spec.
++
++Current spec to implement:
++<spec>${spec}</spec>
++
++Note that files can only be changed with tools. If no tools are called, no files were changed.
++
++Analyze the conversation and decide your next action.`
++
++  const result = await client.run({
++    agent: 'eval-prompting-agent',
++    prompt,
++    agentDefinitions: [promptingAgentDefinition],
++    maxAgentSteps: 5,
++    handleEvent: (event) => {
++      console.log('event:', event)
++    },
++  })
++
++  const output = result.sessionState.mainAgentState.output
++  if (output) {
++    return output as z.infer<typeof AgentDecisionSchema>
++  }
++
++  // Print this so we can debug when it doesn't output anything.
++  console.error(
++    'Error: no output from prompting agent. Message history:',
++    result.sessionState.mainAgentState.messageHistory,
++  )
++
++  // Fallback response
++  return {
++    decision: 'halt' as const,
++    reasoning: `No valid response from prompting agent.`,
++    next_prompt: undefined,
++  }
++}
+diff --git a/evals/git-evals/run-git-evals.ts b/evals/git-evals/run-git-evals.ts
+index c5c3c6946..51a08d84e 100644
+--- a/evals/git-evals/run-git-evals.ts
++++ b/evals/git-evals/run-git-evals.ts
+@@ -3,11 +3,10 @@ import fs from 'fs'
+ import path from 'path'
+ 
+ import { disableLiveUserInputCheck } from '@codebuff/backend/live-user-inputs'
+-import { promptAiSdkStructured } from '@codebuff/backend/llm-apis/vercel-ai-sdk/ai-sdk'
+-import { models } from '@codebuff/common/constants'
+ import { withTimeout } from '@codebuff/common/util/promise'
+ import { generateCompactId } from '@codebuff/common/util/string'
+ import pLimit from 'p-limit'
++import { getUserCredentials } from '@codebuff/npm-app/credentials'
+ 
+ import { resetRepoToCommit } from '../scaffolding'
+ import { createInitialSessionState } from '../test-setup'
+@@ -16,6 +15,7 @@ import { ClaudeRunner } from './runners/claude'
+ import { CodebuffRunner } from './runners/codebuff'
+ import { extractRepoNameFromUrl, setupTestRepo } from './setup-test-repo'
+ import { AgentDecisionSchema } from './types'
++import { getNextEvalPrompt } from './prompting-agent'
+ 
+ import type { AgentStep } from '../scaffolding'
+ import type { Runner } from './runners/runner'
+@@ -30,6 +30,8 @@ import type {
+ } from './types'
+ import type { z } from 'zod/v4'
+ import type { ChildProcess } from 'child_process'
++import { CodebuffClient } from '../../sdk/src/client'
++import { API_KEY_ENV_VAR } from '@codebuff/common/constants'
+ 
+ disableLiveUserInputCheck()
+ 
+@@ -64,6 +66,16 @@ export async function runSingleEval(
+   process.on('uncaughtException', uncaughtHandler)
+   process.on('unhandledRejection', unhandledHandler)
+ 
++  // SDK client for prompting agent
++  const apiKey = process.env[API_KEY_ENV_VAR] || getLocalAuthToken()
++  const sdkClient = new CodebuffClient({
++    apiKey,
++    cwd: projectPath,
++    onError: (error) => {
++      throw new Error(`Prompting agent error: ${error.message}`)
++    },
++  })
++
+   try {
+     // Reset to the commit before the target commit
+     resetRepoToCommit(projectPath, `${evalCommit.sha}^`)
+@@ -110,43 +122,21 @@ export async function runSingleEval(
+         )
+         .join('\n\n')
+ 
+-      // Get next prompt from Sonnet agent with timeout
++      // Get next prompt from prompting agent using Codebuff SDK
+       let agentResponse: z.infer<typeof AgentDecisionSchema>
+       try {
+-        agentResponse = await promptAiSdkStructured({
+-          messages: [
+-            {
+-              role: 'user',
+-              content: `You are an expert software engineer tasked with implementing a specification using CodeBuff, an AI coding assistant. Your goal is to prompt CodeBuff to implement the spec correctly. You are in a conversation with this coding agent.
+-
+-Current spec to implement:
+-<spec>${evalCommit.spec}</spec>
+-
+-Your conversation with Codebuff so far:
+-<conversation>${renderedTrace}</conversation>
+-
+-Note that files can only be changed with tools. If no tools are called, no files were changed.
+-
+-You must decide whether to:
+-1. 'continue' - Generate a follow-up prompt for Codebuff
+-2. 'complete' - The implementation is done and satisfies the spec
+-3. 'halt' - The implementation is off track and unlikely to be completed within ${MAX_ATTEMPTS - attempts} more attempts
+-
+-If deciding to continue, include a clear, focused prompt for Codebuff in next_prompt.
+-Explain your reasoning in detail.`,
+-            },
+-          ],
+-          schema: AgentDecisionSchema,
+-          model: models.gemini2_5_flash,
+-          clientSessionId,
+-          fingerprintId,
+-          userInputId: generateCompactId(),
+-          userId: undefined,
+-          timeout: 5 * 60_000, // 5 minute timeout
+-        })
++        agentResponse = await withTimeout(
++          getNextEvalPrompt({
++            client: sdkClient,
++            spec: evalCommit.spec,
++            conversationHistory: renderedTrace,
++            attemptsRemaining: MAX_ATTEMPTS - attempts,
++          }),
++          5 * 60_000, // 5 minute timeout
++        )
+       } catch (agentError) {
+         throw new Error(
+-          `Agent decision failed: ${agentError instanceof Error ? agentError.message : String(agentError)}`,
++          `Agent decision failed: ${agentError instanceof Error ? `${agentError.message}\n${JSON.stringify(agentError)}\n${agentError.stack}` : String(agentError)}`,
+         )
+       }
+ 
+@@ -197,6 +187,8 @@ Explain your reasoning in detail.`,
+         process.on('unhandledRejection', handler)
+       }
+     })
++
++    sdkClient.closeConnection()
+   }
+ 
+   // If we caught a process-level error, use that
+@@ -249,6 +241,10 @@ Explain your reasoning in detail.`,
+   }
+ }
+ 
++const getLocalAuthToken = () => {
++  return getUserCredentials()?.authToken
++}
++
+ function getCodebuffFileStates(
+   evalCommitSha: string,
+   projectPath: string,
+diff --git a/sdk/src/client.ts b/sdk/src/client.ts
+index 58efe5432..331ea06b3 100644
+--- a/sdk/src/client.ts
++++ b/sdk/src/client.ts
+@@ -1,5 +1,3 @@
+-import { buildArray } from '@codebuff/common/util/array'
+-
+ import {
+   initialSessionState,
+   applyOverridesToSessionState,
+@@ -54,7 +52,7 @@ export class CodebuffClient {
+   >
+   private readonly fingerprintId = `codebuff-sdk-${Math.random().toString(36).substring(2, 15)}`
+ 
+-  private readonly promptIdValues: Record<
++  private readonly promptIdToHandlers: Record<
+     string,
+     {
+       handleEvent?: (event: PrintModeEvent) => void
+@@ -95,12 +93,12 @@ export class CodebuffClient {
+         const { userInputId, chunk } = action
+         if (typeof chunk === 'string') {
+           const handleStreamChunk =
+-            this.promptIdValues[userInputId]?.handleStreamChunk
++            this.promptIdToHandlers[userInputId]?.handleStreamChunk
+           if (handleStreamChunk) {
+             handleStreamChunk(chunk)
+           }
+         } else {
+-          const handleEvent = this.promptIdValues[userInputId]?.handleEvent
++          const handleEvent = this.promptIdToHandlers[userInputId]?.handleEvent
+           if (handleEvent) {
+             handleEvent(chunk)
+           }
+@@ -187,12 +185,12 @@ export class CodebuffClient {
+       })
+     }
+     const toolResults = previousRun?.toolResults ?? []
+-    this.promptIdValues[promptId] = {
++    this.promptIdToHandlers[promptId] = {
+       handleEvent,
+       handleStreamChunk,
+     }
+     if (customToolDefinitions) {
+-      this.promptIdValues[promptId].customToolHandler = async ({
++      this.promptIdToHandlers[promptId].customToolHandler = async ({
+         toolName,
+         input,
+       }) => {
+@@ -246,7 +244,7 @@ export class CodebuffClient {
+     })
+ 
+     return new Promise<RunState>((resolve, reject) => {
+-      this.promptIdValues[promptId].resolveResponse = { resolve, reject }
++      this.promptIdToHandlers[promptId].resolveResponse = { resolve, reject }
+     })
+   }
+ 
+@@ -255,12 +253,12 @@ export class CodebuffClient {
+   ) {
+     const promptId =
+       action.type === 'prompt-response' ? action.promptId : action.userInputId
+-    const promiseActions = this.promptIdValues[promptId]?.resolveResponse
++    const promiseActions = this.promptIdToHandlers[promptId]?.resolveResponse
+     if (!promiseActions) {
+       return
+     }
+ 
+-    delete this.promptIdValues[promptId]
++    delete this.promptIdToHandlers[promptId]
+ 
+     if (action.type === 'prompt-error') {
+       promiseActions.reject(new Error(action.message))
+@@ -302,7 +300,7 @@ export class CodebuffClient {
+     let result: string
+     if (!toolNames.includes(toolName as ToolName)) {
+       const customToolHandler =
+-        this.promptIdValues[action.userInputId].customToolHandler
++        this.promptIdToHandlers[action.userInputId].customToolHandler
+       if (!customToolHandler) {
+         throw new Error(
+           `Custom tool handler not found for user input ID ${action.userInputId}`,
+diff --git a/sdk/src/websocket-client.ts b/sdk/src/websocket-client.ts
+index 2fc1de572..124aba560 100644
+--- a/sdk/src/websocket-client.ts
++++ b/sdk/src/websocket-client.ts
+@@ -99,6 +99,7 @@ export class WebSocketHandler {
+ 
+   public close() {
+     this.cbWebSocket.close()
++    this.isConnected = false
+   }
+ 
+   private setupSubscriptions() {

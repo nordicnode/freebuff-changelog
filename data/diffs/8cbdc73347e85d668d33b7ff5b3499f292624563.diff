@@ -1,0 +1,328 @@
+diff --git a/backend/src/billing/billing.knowledge.md b/backend/src/billing/billing.knowledge.md
+index bc73447e4..eb303d8cb 100644
+--- a/backend/src/billing/billing.knowledge.md
++++ b/backend/src/billing/billing.knowledge.md
+@@ -448,6 +448,15 @@ When previewing subscription changes:
+ - Include `subscription_proration_date` to ensure consistent calculations between preview and actual update
+ - The preview includes credits for unused time and charges for the new plan
+ 
++## Cache Cost Analysis
++
++Cache behavior significantly impacts costs:
++- Initial cache creation is expensive ($[redacted]/1M tokens)
++- Subsequent cache reads are much cheaper ($[redacted]/1M tokens)
++- Large cache creations (80k+ tokens) can dominate the cost of a request
++- Cache reads of 50k-70k tokens are common for subsequent similar requests
++- Cache creation and reading can happen in the same request
++
+ ## Stripe API Best Practices
+ 
+ ### Pagination
+@@ -475,3 +484,26 @@ When previewing subscription changes:
+     }
+   }
+   ```
++
++### API Error Handling
++
++- Only retry on connection errors (type "APIConnectionError") for most APIs
++- Other error types indicate issues that won't be resolved by retrying
++- Exception: Deepseek API rarely errors but can be very slow
++  - Use timeouts (2min) with retries rather than waiting indefinitely
++  - Only retry on timeout errors, not API errors
++- In stream handlers:
++  - Store errors in a variable instead of throwing immediately
++  - Complete cleanup in finally block (e.g. saving partial content)
++  - Throw stored error after cleanup if needed
++  - This ensures cleanup runs even for retryable errors
++
++- Only retry on connection errors (type "APIConnectionError") for most APIs
++- Other error types indicate issues that won't be resolved by retrying
++- Exception: Deepseek API rarely errors but can be very slow
++  - Use timeouts (2min) with retries rather than waiting indefinitely
++  - Only retry on timeout errors, not API errors
++- In stream handlers:
++  - Only throw APIConnectionError instances
++  - Log but swallow other errors
++  - This allows partial content to be processed even if stream ends early
+diff --git a/backend/src/claude.ts b/backend/src/claude.ts
+index b45b96eb3..b7647b1e4 100644
+--- a/backend/src/claude.ts
++++ b/backend/src/claude.ts
+@@ -85,7 +85,6 @@ async function* promptClaudeStreamWithoutRetry(
+         : {
+             'Helicone-Auth': `Bearer ${env.HELICONE_API_KEY}`,
+             'Helicone-User-Id': fingerprintId,
+-            // 'Helicone-RateLimit-Policy': RATE_LIMIT_POLICY,
+             'Helicone-LLM-Security-Enabled': 'true',
+           }),
+     },
+@@ -94,10 +93,17 @@ async function* promptClaudeStreamWithoutRetry(
+   const startTime = Date.now()
+ 
+   // Transform messages before sending to Anthropic
+-  const transformedMsgs = transformMessages(
+-    messages,
+-    options.model ?? claudeModels.sonnet
+-  )
++  const transformedMsgs = transformMessages(messages, model)
++
++  let content = ''
++  let usage: {
++    input_tokens: number
++    output_tokens: number
++    cache_read_input_tokens: number | undefined
++    cache_creation_input_tokens: number | undefined
++  } | null = null
++  let cacheCreationInputTokens = 0
++  let cacheReadInputTokens = 0
+ 
+   const stream = anthropic.messages.stream(
+     removeUndefinedProps({
+@@ -111,55 +117,47 @@ async function* promptClaudeStreamWithoutRetry(
+     })
+   )
+ 
+-  let content = ''
+-  let usage: { input_tokens: number; output_tokens: number } | null = null
+-  let cacheCreationInputTokens = 0
+-  let cacheReadInputTokens = 0
+-
+-  try {
+-    for await (const chunk of stream) {
+-      if (chunk.type === 'content_block_delta') {
+-        // make sure we only read chunks that include text
+-        if ('text' in chunk.delta) {
+-          content += chunk.delta.text
+-          yield chunk.delta.text
+-        }
+-      } else if (chunk.type === 'message_delta' && 'usage' in chunk.delta) {
+-        usage = chunk.delta.usage as {
+-          input_tokens: number
+-          output_tokens: number
+-        }
+-        // @ts-ignore
+-        cacheReadInputTokens = chunk.message.usage.cache_read_input_tokens ?? 0
+-        cacheCreationInputTokens =
+-          // @ts-ignore
+-          chunk.message.usage.cache_creation_input_tokens ?? 0
++  for await (const chunk of stream) {
++    if (chunk.type === 'content_block_delta') {
++      // make sure we only read chunks that include text
++      if ('text' in chunk.delta) {
++        content += chunk.delta.text
++        yield chunk.delta.text
+       }
++    } else if (chunk.type === 'message_delta' && 'usage' in chunk.delta) {
++      usage = chunk.delta.usage as {
++        input_tokens: number
++        output_tokens: number
++        cache_read_input_tokens: number | undefined
++        cache_creation_input_tokens: number | undefined
++      }
++      cacheReadInputTokens = usage.cache_read_input_tokens ?? 0
++      cacheCreationInputTokens = usage.cache_creation_input_tokens ?? 0
+     }
+-  } finally {
+-    if (content && !options.ignoreDatabaseAndHelicone) {
+-      const latencyMs = Date.now() - startTime
+-      const inputTokens = usage?.input_tokens ?? 0
+-      const outputTokens = usage?.output_tokens ?? 0
+-      saveMessage({
+-        messageId: userInputId,
+-        userId,
+-        fingerprintId,
+-        clientSessionId,
+-        userInputId,
+-        model,
+-        request: messages,
+-        response: content,
+-        inputTokens,
+-        outputTokens,
+-        cacheCreationInputTokens,
+-        cacheReadInputTokens,
+-        finishedAt: new Date(),
+-        latencyMs,
+-      }).catch((error) => {
+-        logger.error({ error }, 'Failed to save message')
+-      })
+-    }
++  }
++
++  if (content && !options.ignoreDatabaseAndHelicone) {
++    const latencyMs = Date.now() - startTime
++    const inputTokens = usage?.input_tokens ?? 0
++    const outputTokens = usage?.output_tokens ?? 0
++    saveMessage({
++      messageId: userInputId,
++      userId,
++      fingerprintId,
++      clientSessionId,
++      userInputId,
++      model,
++      request: messages,
++      response: content,
++      inputTokens,
++      outputTokens,
++      cacheCreationInputTokens,
++      cacheReadInputTokens,
++      finishedAt: new Date(),
++      latencyMs,
++    }).catch((error) => {
++      logger.error({ error }, 'Failed to save message')
++    })
+   }
+ }
+ 
+diff --git a/backend/src/deepseek-api.ts b/backend/src/deepseek-api.ts
+index 2a0031caa..2a2947097 100644
+--- a/backend/src/deepseek-api.ts
++++ b/backend/src/deepseek-api.ts
+@@ -9,8 +9,11 @@ import { models } from 'common/constants'
+ import { DeepseekModel } from 'common/constants'
+ import { removeUndefinedProps } from 'common/util/object'
+ 
+-function transformMessages(messages: OpenAIMessage[], model: DeepseekModel): OpenAIMessage[] {
+-  return messages.map(msg => {
++function transformMessages(
++  messages: OpenAIMessage[],
++  model: DeepseekModel
++): OpenAIMessage[] {
++  return messages.map((msg) => {
+     // When Deepseek properly adds image support to their models, we can update this to handle images
+     if (typeof msg.content === 'object' && Array.isArray(msg.content)) {
+       const hasImages = msg.content.some(
+@@ -22,9 +25,9 @@ function transformMessages(messages: OpenAIMessage[], model: DeepseekModel): Ope
+         )
+         return {
+           ...msg,
+-          content: msg.content.filter(
+-            (obj: { type: string }) => obj.type !== 'image'
+-          ).map(obj => ({ type: 'text', text: String(obj) })),
++          content: msg.content
++            .filter((obj: { type: string }) => obj.type !== 'image')
++            .map((obj) => ({ type: 'text', text: String(obj) })),
+         } as OpenAIMessage
+       }
+     }
+@@ -81,13 +84,16 @@ async function* innerPromptDeepseekStream(
+     fingerprintId,
+     userInputId,
+     temperature,
++    userId,
++    model,
++    maxTokens,
+   } = options
+   const deepseek = getDeepseekClient(fingerprintId)
+   const startTime = Date.now()
+-  let modifiedMessages = transformMessages(messages, options.model) as OpenAIMessage[]
++  let modifiedMessages = transformMessages(messages, model) as OpenAIMessage[]
+ 
+   const lastMessage = modifiedMessages[modifiedMessages.length - 1]
+-  if (options.model === models.deepseekReasoner && lastMessage.role === 'assistant') {
++  if (model === models.deepseekReasoner && lastMessage.role === 'assistant') {
+     modifiedMessages = [
+       ...modifiedMessages.slice(0, -1),
+       { ...lastMessage, role: 'assistant', prefix: true } as any,
+@@ -99,12 +105,12 @@ async function* innerPromptDeepseekStream(
+       async () => {
+         const streamPromise = deepseek.chat.completions.create(
+           removeUndefinedProps({
+-            model: options.model,
++            model: model,
+             messages: modifiedMessages,
+-            max_tokens: options.maxTokens,
++            max_tokens: maxTokens,
+             stream: true,
+             temperature:
+-              options.model === models.deepseekReasoner ? undefined : temperature ?? 0,
++              model === models.deepseekReasoner ? undefined : temperature ?? 0,
+           })
+         )
+ 
+@@ -158,11 +164,11 @@ async function* innerPromptDeepseekStream(
+     if (messageId && messages.length > 0) {
+       saveMessage({
+         messageId: `deepseek-${messageId}`,
+-        userId: options.userId,
++        userId,
+         clientSessionId,
+         fingerprintId,
+         userInputId,
+-        model: options.model,
++        model,
+         request: messages,
+         response: content,
+         inputTokens,
+diff --git a/backend/src/gemini-api.ts b/backend/src/gemini-api.ts
+index 77de564aa..e13d5be18 100644
+--- a/backend/src/gemini-api.ts
++++ b/backend/src/gemini-api.ts
+@@ -11,8 +11,11 @@ import { match, P } from 'ts-pattern'
+  * Transform messages between our internal format and Gemini's format.
+  * All Gemini models support images in their specific format.
+  */
+-function transformMessages(messages: OpenAIMessage[], model: GeminiModel): OpenAIMessage[] {
+-  return messages.map(msg => 
++function transformMessages(
++  messages: OpenAIMessage[],
++  model: GeminiModel
++): OpenAIMessage[] {
++  return messages.map((msg) =>
+     match(msg as any)
+       .with(
+         {
+@@ -68,18 +71,27 @@ export function promptGeminiStream(
+     temperature?: number
+   }
+ ): ReadableStream<string> {
++  const {
++    clientSessionId,
++    fingerprintId,
++    userInputId,
++    temperature,
++    userId,
++    model,
++    maxTokens,
++  } = options
+   return new ReadableStream({
+     async start(controller) {
+-      const gemini = getGeminiClient(options.fingerprintId)
++      const gemini = getGeminiClient(fingerprintId)
+       const startTime = Date.now()
+       try {
+-        const transformedMessages = transformMessages(messages, options.model)
++        const transformedMessages = transformMessages(messages, model)
+ 
+         const stream = await gemini.chat.completions.create({
+-          model: options.model,
++          model: model,
+           messages: transformedMessages,
+-          temperature: options.temperature ?? 0,
+-          max_tokens: options.maxTokens,
++          temperature: temperature ?? 0,
++          max_tokens: maxTokens,
+           stream: true,
+         })
+ 
+@@ -102,14 +114,14 @@ export function promptGeminiStream(
+           }
+         }
+ 
+-        if (messageId && messages.length > 0 && options.userId !== TEST_USER_ID) {
++        if (messageId && messages.length > 0 && userId !== TEST_USER_ID) {
+           saveMessage({
+             messageId: `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+-            userId: options.userId,
+-            clientSessionId: options.clientSessionId,
+-            fingerprintId: options.fingerprintId,
+-            userInputId: options.userInputId,
+-            model: options.model,
++            userId,
++            clientSessionId,
++            fingerprintId,
++            userInputId,
++            model,
+             request: messages,
+             response: content,
+             inputTokens: inputTokens || 0,

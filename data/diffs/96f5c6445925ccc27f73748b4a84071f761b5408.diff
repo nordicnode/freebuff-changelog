@@ -1,0 +1,417 @@
+diff --git a/npm-app/src/checkpoints/checkpoint-manager.ts b/npm-app/src/checkpoints/checkpoint-manager.ts
+index 33559418f..ba82feebc 100644
+--- a/npm-app/src/checkpoints/checkpoint-manager.ts
++++ b/npm-app/src/checkpoints/checkpoint-manager.ts
+@@ -6,6 +6,8 @@ import {
+   getBareRepoPath,
+   storeFileState,
+   restoreFileState,
++  hasUnsavedChanges,
++  getLatestCommit,
+ } from './file-manager'
+ import { getProjectRoot } from '../project-files'
+ 
+@@ -14,7 +16,6 @@ import { getProjectRoot } from '../project-files'
+  */
+ export interface Checkpoint {
+   agentStateString: string
+-  enabled: boolean
+   fileStateIdPromise: Promise<string>
+   historyLength: number
+   id: number
+@@ -26,9 +27,9 @@ export interface Checkpoint {
+  * Simple in-memory checkpoint manager for agent states
+  */
+ export class CheckpointManager {
+-  private checkpoints: Map<number, Checkpoint> = new Map()
+-  private nextId: number = 1
++  checkpoints: Array<Checkpoint> = []
+   private bareRepoPath: string | null = null
++  enabled: boolean = true
+ 
+   getBareRepoPath(): string {
+     if (!this.bareRepoPath) {
+@@ -46,23 +47,42 @@ export class CheckpointManager {
+   async addCheckpoint(
+     agentState: AgentState,
+     userInput: string
+-  ): Promise<Checkpoint> {
++  ): Promise<Checkpoint | null> {
++    if (!this.enabled) {
++      return null
++    }
+     // Use incremental ID starting at 1
+-    const id = this.nextId++
++    const id = this.checkpoints.length + 1
+ 
++    const projectDir = getProjectRoot()
++    const bareRepoPath = this.getBareRepoPath()
+     const relativeFilepaths = getAllFilePaths(agentState.fileContext.fileTree)
+-    const enabled = relativeFilepaths.length < DEFAULT_MAX_FILES
+ 
+-    const fileStateIdPromise = enabled ? storeFileState({
+-        projectDir: getProjectRoot(),
+-        bareRepoPath: this.getBareRepoPath(),
+-        message: `Checkpoint ${id}`,
+-        relativeFilepaths: getAllFilePaths(agentState.fileContext.fileTree),
+-      }) : Promise.resolve('')
++    if (relativeFilepaths.length >= DEFAULT_MAX_FILES) {
++      this.enabled = false
++      return null
++    }
++
++    const needToStage = await hasUnsavedChanges({
++      projectDir,
++      bareRepoPath,
++      relativeFilepaths,
++    })
++    if (!needToStage && this.checkpoints.length > 0) {
++      return null
++    }
++
++    const fileStateIdPromise = needToStage
++      ? storeFileState({
++          projectDir,
++          bareRepoPath,
++          message: `Checkpoint ${id}`,
++          relativeFilepaths,
++        })
++      : getLatestCommit({ bareRepoPath })
+ 
+     const checkpoint: Checkpoint = {
+       agentStateString: JSON.stringify(agentState), // Deep clone to prevent reference issues
+-      enabled,
+       fileStateIdPromise,
+       historyLength: agentState.messageHistory.length,
+       id,
+@@ -71,42 +91,23 @@ export class CheckpointManager {
+     }
+ 
+     // Add to map
+-    this.checkpoints.set(id, checkpoint)
++    this.checkpoints.push(checkpoint)
+ 
+     return checkpoint
+   }
+ 
+-  /**
+-   * Get a checkpoint by ID
+-   * @param id The checkpoint ID
+-   * @returns The checkpoint or null if not found
+-   */
+-  getCheckpoint(id: number | null): Checkpoint | null {
+-    if (id === null) {
+-      return null
+-    }
+-    const checkpoint = this.checkpoints.get(id)
+-    return checkpoint || null
+-  }
+-
+-  /**
+-   * Get all checkpoints
+-   * @returns Array of all checkpoints
+-   */
+-  getAllCheckpoints(): Checkpoint[] {
+-    return Array.from(this.checkpoints.values())
+-  }
+-
+   /**
+    * Get the most recent checkpoint
+    * @returns The most recent checkpoint or null if none exist
+    */
+   getLatestCheckpoint(): Checkpoint | null {
+-    return this.checkpoints.get(this.nextId - 1) || null
++    return this.checkpoints.length === 0
++      ? null
++      : this.checkpoints[this.checkpoints.length - 1]
+   }
+ 
+   async restoreCheckointFileState(id: number): Promise<boolean> {
+-    const checkpoint = this.getCheckpoint(id)
++    const checkpoint = this.checkpoints[id - 1]
+     if (!checkpoint) {
+       return false
+     }
+@@ -129,8 +130,7 @@ export class CheckpointManager {
+    * Clear all checkpoints
+    */
+   clearCheckpoints(): void {
+-    this.checkpoints.clear()
+-    this.nextId = 1 // Reset the ID counter when clearing
++    this.checkpoints = []
+   }
+ 
+   /**
+@@ -139,15 +139,13 @@ export class CheckpointManager {
+    * @returns A formatted string representation of all checkpoints
+    */
+   getCheckpointsAsString(detailed: boolean = false): string {
+-    const checkpoints = this.getAllCheckpoints().sort((a, b) => a.id - b.id)
+-
+-    if (checkpoints.length === 0) {
++    if (this.checkpoints.length === 0) {
+       return yellow('No checkpoints available.')
+     }
+ 
+     const lines: string[] = [bold(underline('Agent State Checkpoints:')), '']
+ 
+-    checkpoints.forEach((checkpoint) => {
++    this.checkpoints.forEach((checkpoint) => {
+       const date = new Date(checkpoint.timestamp)
+       const formattedDate = date.toLocaleString()
+ 
+@@ -184,7 +182,7 @@ export class CheckpointManager {
+    * @returns A formatted string with detailed information about the checkpoint, or an error message if not found
+    */
+   getCheckpointDetails(id: number): string {
+-    const checkpoint = this.getCheckpoint(id)
++    const checkpoint = this.checkpoints[id - 1]
+     if (!checkpoint) {
+       return cyan(`\nCheckpoint #${id} not found.`)
+     }
+@@ -209,10 +207,6 @@ export class CheckpointManager {
+ 
+     return lines.join('\n')
+   }
+-
+-  getNextId(): number {
+-    return this.nextId
+-  }
+ }
+ 
+ // Export a singleton instance for use throughout the application
+diff --git a/npm-app/src/checkpoints/file-manager.ts b/npm-app/src/checkpoints/file-manager.ts
+index 26d9641ee..4bac25a82 100644
+--- a/npm-app/src/checkpoints/file-manager.ts
++++ b/npm-app/src/checkpoints/file-manager.ts
+@@ -15,13 +15,18 @@ import { execFileSync } from 'child_process'
+ 
+ import { getProjectDataDir } from '../project-files'
+ 
++let cachedGitAvailable: boolean | null = null
+ function gitCommandIsAvailable(): boolean {
+-  try {
+-    execFileSync('git', ['--version'])
+-    return true
+-  } catch (error) {
+-    return false
++  if (cachedGitAvailable === null) {
++    try {
++      execFileSync('git', ['--version'])
++      cachedGitAvailable = true
++    } catch (error) {
++      cachedGitAvailable = false
++    }
+   }
++
++  return cachedGitAvailable
+ }
+ 
+ export function getBareRepoPath(dir: string): string {
+@@ -29,6 +34,70 @@ export function getBareRepoPath(dir: string): string {
+   return join(getProjectDataDir(), bareRepoName)
+ }
+ 
++export async function hasUnsavedChanges({
++  projectDir,
++  bareRepoPath,
++  relativeFilepaths,
++}: {
++  projectDir: string
++  bareRepoPath: string
++  relativeFilepaths: Array<string>
++}): Promise<boolean> {
++  if (gitCommandIsAvailable()) {
++    try {
++      const output = execFileSync('git', [
++        '--git-dir',
++        bareRepoPath,
++        '--work-tree',
++        projectDir,
++        'status',
++        '--porcelain',
++      ]).toString()
++      return output.trim().length > 0
++    } catch (error) {
++      // error running git
++    }
++  }
++
++  for (const [, , workdirStatus, stageStatus] of await statusMatrix({
++    fs,
++    dir: projectDir,
++    gitdir: bareRepoPath,
++    filepaths: relativeFilepaths,
++  })) {
++    if (workdirStatus !== stageStatus) {
++      return true
++    }
++  }
++  return false
++}
++
++export async function getLatestCommit({
++  bareRepoPath,
++}: {
++  bareRepoPath: string
++}): Promise<string> {
++  if (gitCommandIsAvailable()) {
++    try {
++      return execFileSync('git', [
++        '--git-dir',
++        bareRepoPath,
++        'rev-parse',
++        'HEAD',
++      ])
++        .toString()
++        .trim()
++    } catch (error) {
++      // unable to get head
++    }
++  }
++  return await resolveRef({
++    fs,
++    dir: bareRepoPath,
++    ref: 'HEAD',
++  })
++}
++
+ export async function initializeCheckpointFileManager({
+   projectDir,
+   relativeFilepaths,
+@@ -58,7 +127,7 @@ export async function initializeCheckpointFileManager({
+   })
+ }
+ 
+-async function stageFilesIndividually({
++async function stageFiles({
+   projectDir,
+   bareRepoPath,
+   relativeFilepaths,
+@@ -67,6 +136,26 @@ async function stageFilesIndividually({
+   bareRepoPath: string
+   relativeFilepaths: Array<string>
+ }): Promise<void> {
++  if (gitCommandIsAvailable()) {
++    try {
++      execFileSync('git', [
++        '--git-dir',
++        bareRepoPath,
++        '--work-tree',
++        projectDir,
++        '-C',
++        projectDir,
++        'add',
++        '.',
++      ])
++      return
++    } catch (error) {
++      // Failed to add .
++    }
++  }
++
++  // Stage files with isomorphic-git
++
+   // Get status of all files in the project directory
+   const currStatusMatrix = await statusMatrix({
+     fs,
+@@ -115,32 +204,11 @@ export async function storeFileState({
+   message: string
+   relativeFilepaths: Array<string>
+ }): Promise<string> {
+-  let added = false
+-  if (gitCommandIsAvailable()) {
+-    try {
+-      execFileSync('git', [
+-        '--git-dir',
+-        bareRepoPath,
+-        '--work-tree',
+-        projectDir,
+-        '-C',
+-        projectDir,
+-        'add',
+-        '.',
+-      ])
+-      added = true
+-    } catch (error) {
+-      // Failed to add .
+-    }
+-  }
+-
+-  if (!added) {
+-    await stageFilesIndividually({
+-      projectDir,
+-      bareRepoPath,
+-      relativeFilepaths,
+-    })
+-  }
++  await stageFiles({
++    projectDir,
++    bareRepoPath,
++    relativeFilepaths,
++  })
+ 
+   const commitHash = await commit({
+     fs,
+diff --git a/npm-app/src/cli.ts b/npm-app/src/cli.ts
+index 08615233f..47e54e7f4 100644
+--- a/npm-app/src/cli.ts
++++ b/npm-app/src/cli.ts
+@@ -186,17 +186,19 @@ export class CLI {
+     await this.readyPromise
+     Spinner.get().stop()
+ 
+-    // Make sure the previous checkpoint is done
+-    await checkpointManager.getLatestCheckpoint()?.fileStateIdPromise
+-
+-    // Save the current agent state
+-    const checkpoint = await checkpointManager.addCheckpoint(
+-      this.client.agentState as AgentState,
+-      userInput
+-    )
++    if (checkpointManager.enabled) {
++      // Make sure the previous checkpoint is done
++      await checkpointManager.getLatestCheckpoint()?.fileStateIdPromise
++
++      // Save the current agent state
++      const checkpoint = await checkpointManager.addCheckpoint(
++        this.client.agentState as AgentState,
++        userInput
++      )
+ 
+-    if (checkpoint.enabled) {
+-      console.log(green(`Checkpoint #${checkpoint.id} saved!`))
++      if (checkpoint) {
++        console.log(green(`Checkpoint #${checkpoint.id} saved!`))
++      }
+     }
+   }
+ 
+@@ -654,7 +656,13 @@ export class CLI {
+   }
+ 
+   private async handleRestoreCheckpoint(id: number): Promise<void> {
+-    const checkpoint = checkpointManager.getCheckpoint(id)
++    if (!checkpointManager.enabled) {
++      console.log(red(`Checkpoints not enabled: project too large`))
++      this.rl.prompt()
++      return
++    }
++
++    const checkpoint = checkpointManager.checkpoints[id - 1]
+     if (!checkpoint) {
+       console.log(red(`Checkpoint #${id} not found.`))
+       this.rl.prompt()
+@@ -665,12 +673,6 @@ export class CLI {
+     const latestCheckpoint = checkpointManager.getLatestCheckpoint()
+     await latestCheckpoint?.fileStateIdPromise
+ 
+-    if (!latestCheckpoint?.enabled) {
+-      console.log(red(`Checkpoints not enabled: project too large`))
+-      this.rl.prompt()
+-      return
+-    }
+-
+     await this.restoreAgentStateAndFiles(checkpoint)
+ 
+     console.log(green(`Restored to checkpoint #${id}.`))

@@ -1,0 +1,277 @@
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index 4c4963c8d..bf52912c2 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -7,9 +7,9 @@ import { getModelForMode } from 'common/constants'
+ import { parseFileBlocks, ProjectFileContext } from 'common/util/file'
+ import { getSearchSystemPrompt } from './system-prompt/search-system-prompt'
+ import { Message } from 'common/types/message'
+-import { ClientAction, FileChange } from 'common/actions'
++import { ClientAction } from 'common/actions'
+ import { type CostMode } from 'common/constants'
+-import { requestFiles } from './websockets/websocket-action'
++import { requestFile, requestFiles } from './websockets/websocket-action'
+ import { processFileBlock } from './process-file-block'
+ import { requestRelevantFiles } from './find-files/request-files-prompt'
+ import { processStreamWithTags } from './process-stream'
+@@ -100,7 +100,10 @@ export const mainPrompt = async (
+   }
+ 
+   let fullResponse = ''
+-  const fileProcessingPromises: Promise<FileChange | null>[] = []
++  const fileProcessingPromisesByPath: Record<
++    string,
++    Promise<{ path: string; content: string; patch?: string } | null>[]
++  > = {}
+ 
+   const justUsedATool = toolResults.length > 0
+   const justRanTerminalCommand = toolResults.some(
+@@ -246,6 +249,7 @@ ${existingNewFilePaths.join('\n')}
+     userInputId: promptId,
+     userId,
+   })
++
+   const streamWithTags = processStreamWithTags(stream, {
+     write_file: {
+       attributeNames: [],
+@@ -254,28 +258,42 @@ ${existingNewFilePaths.join('\n')}
+         const { path, content } = parseToolCallXml(body)
+         if (!content) return false
+ 
++        // Initialize state for this file path if needed
++        if (!fileProcessingPromisesByPath[path]) {
++          fileProcessingPromisesByPath[path] = []
++        }
++        const previousPromises = fileProcessingPromisesByPath[path]
++        const previousEdit = previousPromises[previousPromises.length - 1]
++
++        const latestContentPromise = previousEdit
++          ? previousEdit.then(
++              (maybeResult) => maybeResult?.content ?? requestFile(ws, path)
++            )
++          : requestFile(ws, path)
++
+         const fileContentWithoutStartNewline = content.startsWith('\n')
+           ? content.slice(1)
+           : content
+ 
+-        fileProcessingPromises.push(
+-          processFileBlock(
+-            path,
+-            fileContentWithoutStartNewline,
+-            messagesWithOptionalReadFiles,
+-            fullResponse,
+-            prompt,
+-            clientSessionId,
+-            fingerprintId,
+-            promptId,
+-            userId,
+-            ws,
+-            costMode
+-          ).catch((error) => {
+-            logger.error(error, 'Error processing file block')
+-            return null
+-          })
+-        )
++        const newPromise = processFileBlock(
++          path,
++          latestContentPromise,
++          fileContentWithoutStartNewline,
++          messagesWithOptionalReadFiles,
++          fullResponse,
++          prompt,
++          clientSessionId,
++          fingerprintId,
++          promptId,
++          userId,
++          costMode
++        ).catch((error) => {
++          logger.error(error, 'Error processing file block')
++          return null
++        })
++
++        fileProcessingPromisesByPath[path].push(newPromise)
++
+         return false
+       },
+     },
+@@ -285,9 +303,7 @@ ${existingNewFilePaths.join('\n')}
+         {
+           attributeNames: [],
+           onTagStart: () => {},
+-          onTagEnd: (body) => {
+-            return false
+-          },
++          onTagEnd: () => false,
+         },
+       ])
+     ),
+@@ -422,22 +438,29 @@ ${existingNewFilePaths.join('\n')}
+         },
+         'Create plan'
+       )
+-      fileProcessingPromises.push(
+-        Promise.resolve({
+-          path,
+-          type: 'file',
+-          content: plan,
+-        })
+-      )
++      // Add the plan file to the processing queue
++      if (!fileProcessingPromisesByPath[path]) {
++        fileProcessingPromisesByPath[path] = []
++      }
++      const change = {
++        path,
++        content: plan,
++      }
++      fileProcessingPromisesByPath[path].push(Promise.resolve(change))
+     } else {
+       throw new Error(`Unknown tool: ${name}`)
+     }
+   }
+ 
+-  if (fileProcessingPromises.length > 0) {
++  if (Object.keys(fileProcessingPromisesByPath).length > 0) {
+     onResponseChunk('Applying file changes, please wait.\n')
+   }
+ 
++  // Flatten all promises while maintaining order within each file path
++  const fileProcessingPromises = Object.values(
++    fileProcessingPromisesByPath
++  ).flat()
++
+   const changes = (await Promise.all(fileProcessingPromises)).filter(
+     (change) => change !== null
+   )
+@@ -447,9 +470,19 @@ ${existingNewFilePaths.join('\n')}
+     onResponseChunk(`\n`)
+   }
+ 
+-  const changeToolCalls = changes.map((change) => ({
++  const changeToolCalls = changes.map(({ path, content, patch }) => ({
+     name: 'write_file' as const,
+-    parameters: change,
++    parameters: patch
++      ? {
++          type: 'patch' as const,
++          path,
++          content: patch,
++        }
++      : {
++          type: 'file' as const,
++          path,
++          content,
++        },
+     id: generateCompactId(),
+   }))
+   clientToolCalls.unshift(...changeToolCalls)
+@@ -701,7 +734,7 @@ async function getFileVersionUpdates(
+   }
+ }
+ 
+-const getMessagesSubset = (messages: Message[], otherTokens: number) => {
++function getMessagesSubset(messages: Message[], otherTokens: number) {
+   const indexLastSubgoalComplete = messages.findLastIndex(({ content }) => {
+     JSON.stringify(content).includes('COMPLETE')
+   })
+diff --git a/backend/src/process-file-block.ts b/backend/src/process-file-block.ts
+index c4941bb48..6121089ca 100644
+--- a/backend/src/process-file-block.ts
++++ b/backend/src/process-file-block.ts
+@@ -1,9 +1,6 @@
+-import { WebSocket } from 'ws'
+ import { createPatch } from 'diff'
+-import { FileChange } from 'common/actions'
+ import { Message } from 'common/types/message'
+ import { logger } from './util/logger'
+-import { requestFile } from './websockets/websocket-action'
+ import { cleanMarkdownCodeBlock, parseFileBlocks } from 'common/util/file'
+ import { generateCompactId, hasLazyEdit } from 'common/util/string'
+ import { countTokens } from './util/token-counter'
+@@ -19,6 +16,7 @@ import { buildArray } from 'common/util/array'
+ 
+ export async function processFileBlock(
+   path: string,
++  initialContentPromise: Promise<string | null>,
+   newContent: string,
+   messages: Message[],
+   fullResponse: string,
+@@ -27,14 +25,13 @@ export async function processFileBlock(
+   fingerprintId: string,
+   userInputId: string,
+   userId: string | undefined,
+-  ws: WebSocket,
+   costMode: CostMode
+-): Promise<FileChange | null> {
++): Promise<{ path: string; content: string; patch?: string } | null> {
+   if (newContent.trim() === '[UPDATED_BY_ANOTHER_ASSISTANT]') {
+     return null
+   }
+ 
+-  const initialContent = await requestFile(ws, path)
++  const initialContent = await initialContentPromise
+ 
+   if (initialContent === null) {
+     let cleanContent = cleanMarkdownCodeBlock(newContent)
+@@ -52,7 +49,6 @@ export async function processFileBlock(
+       `processFileBlock: Created new file ${path}`
+     )
+     return {
+-      type: 'file',
+       path,
+       content: cleanContent,
+     }
+@@ -131,7 +127,13 @@ export async function processFileBlock(
+     }
+   }
+ 
+-  let patch = createPatch(path, normalizedInitialContent, updatedContent)
++  const normalizedUpdatedContent = updatedContent.replaceAll('\n', lineEnding)
++
++  let patch = createPatch(
++    path,
++    normalizedInitialContent,
++    normalizedUpdatedContent
++  )
+   const lines = patch.split('\n')
+   const hunkStartIndex = lines.findIndex((line) => line.startsWith('@@'))
+   if (hunkStartIndex !== -1) {
+@@ -148,20 +150,20 @@ export async function processFileBlock(
+     )
+     return null
+   }
+-  patch = patch.replaceAll('\n', lineEnding)
+ 
+   logger.debug(
+     {
+       path,
+       editSnippet: newContent,
++      updatedContent,
+       patch,
+     },
+-    `processFileBlock: Generated patch for ${path}`
++    `processFileBlock: Updated file ${path}`
+   )
+   return {
+-    type: 'patch',
+     path,
+-    content: patch,
++    content: normalizedUpdatedContent,
++    patch,
+   }
+ }
+ 
+@@ -327,7 +329,11 @@ export async function fastRewrite(
+   })
+ 
+   // Check if response still contains lazy edits
+-  if (hasLazyEdit(editSnippet) && !hasLazyEdit(initialContent) && hasLazyEdit(response)) {
++  if (
++    hasLazyEdit(editSnippet) &&
++    !hasLazyEdit(initialContent) &&
++    hasLazyEdit(response)
++  ) {
+     const relaceResponse = response
+     response = await rewriteWithGemini(
+       initialContent,

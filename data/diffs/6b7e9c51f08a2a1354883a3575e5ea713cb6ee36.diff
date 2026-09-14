@@ -1,0 +1,337 @@
+diff --git a/backend/package.json b/backend/package.json
+index 4fe695e7a..9d3169efd 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -6,7 +6,7 @@
+   "license": "UNLICENSED",
+   "scripts": {
+     "start": "bun run -r tsconfig-paths/register src/index.ts",
+-    "dev": "lsof -t -i:4242 | xargs kill -9 2>/dev/null || true && bun --hot run -r tsconfig-paths/register src/index.ts",
++    "dev": "bun --hot run -r tsconfig-paths/register src/index.ts",
+     "build": "tsc",
+     "typecheck-this-package": "tsc --noEmit && tsc-alias",
+     "typecheck": "bun run --cwd ../common build && bun run typecheck-this-package",
+@@ -49,4 +49,4 @@
+   "peerDependencies": {
+     "@types/lodash": "*"
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/backend/src/index.ts b/backend/src/index.ts
+index 9bb4fa31f..fb0a5033c 100644
+--- a/backend/src/index.ts
++++ b/backend/src/index.ts
+@@ -4,12 +4,19 @@ import { setupBigQuery } from 'common/src/bigquery/client'
+ import cors from 'cors'
+ import express from 'express'
+ 
+-import { getTracesForUserHandler, relabelForUserHandler } from './admin/relabelRuns'
++import {
++  getTracesForUserHandler,
++  relabelForUserHandler,
++} from './admin/relabelRuns'
+ import usageHandler from './api/usage'
+ import { env } from './env.mjs'
+-import { logger } from './util/logger'
+-import { listen as webSocketListen } from './websockets/server'
+ import { checkAdmin } from './util/check-auth'
++import { logger } from './util/logger'
++import {
++  sendRequestReconnect,
++  waitForAllClientsDisconnected,
++  listen as webSocketListen,
++} from './websockets/server'
+ 
+ const app = express()
+ const port = env.PORT
+@@ -75,9 +82,36 @@ server.listen(port, () => {
+ 
+ webSocketListen(server, '/ws')
+ 
+-process.on('SIGINT', () => {
+-  process.exit()
+-})
++let shutdownInProgress = false
++// Graceful shutdown handler for both SIGTERM and SIGINT
++function handleShutdown(signal: string) {
++  if (shutdownInProgress) {
++    console.log(`\nReceived ${signal}. Already shutting down...`)
++    return
++  }
++  shutdownInProgress = true
++  console.log(`\nReceived ${signal}. Starting graceful shutdown...`)
++
++  // Don't shutdown, instead ask clients to disconnect from us
++  sendRequestReconnect()
++
++  waitForAllClientsDisconnected().then(() => {
++    console.log('All clients disconnected. Shutting down...')
++    process.exit(0)
++  })
++
++  // If graceful shutdown is not achieved after 5 minutes,
++  // force exit the process
++  setTimeout(() => {
++    console.error(
++      'Could not close connections in time, forcefully shutting down'
++    )
++    process.exit(1)
++  }, 300000).unref()
++}
++
++process.on('SIGTERM', () => handleShutdown('SIGTERM'))
++process.on('SIGINT', () => handleShutdown('SIGINT'))
+ 
+ process.on('unhandledRejection', (reason, promise) => {
+   // Don't rethrow the error, just log it. Keep the server running.
+diff --git a/backend/src/websockets/server.ts b/backend/src/websockets/server.ts
+index 767db6798..878b071b8 100644
+--- a/backend/src/websockets/server.ts
++++ b/backend/src/websockets/server.ts
+@@ -1,13 +1,15 @@
+ import { Server as HttpServer } from 'node:http'
+-import { Server as WebSocketServer, RawData, WebSocket } from 'ws'
+-import { isError } from 'lodash'
++
+ import {
+-  ServerMessage,
+   CLIENT_MESSAGE_SCHEMA,
++  ServerMessage,
+ } from 'common/websockets/websocket-schema'
++import { isError } from 'lodash'
++import { RawData, WebSocket, Server as WebSocketServer } from 'ws'
++
++import { logger } from '../util/logger'
+ import { Switchboard } from './switchboard'
+ import { onWebsocketAction } from './websocket-action'
+-import { logger } from '../util/logger'
+ 
+ export const SWITCHBOARD = new Switchboard()
+ 
+@@ -148,3 +150,13 @@ export function listen(server: HttpServer, path: string) {
+ export const sendMessage = (ws: WebSocket, server: ServerMessage) => {
+   ws.send(JSON.stringify(server))
+ }
++
++export function sendRequestReconnect() {
++  for (const ws of SWITCHBOARD.clients.keys()) {
++    sendMessage(ws, { type: 'action', data: { type: 'request-reconnect' } })
++  }
++}
++
++export function waitForAllClientsDisconnected() {
++  return SWITCHBOARD.waitForAllClientsDisconnected()
++}
+diff --git a/backend/src/websockets/switchboard.ts b/backend/src/websockets/switchboard.ts
+index 3ff27e070..de820459b 100644
+--- a/backend/src/websockets/switchboard.ts
++++ b/backend/src/websockets/switchboard.ts
+@@ -9,6 +9,9 @@ export type ClientState = {
+ /** Tracks the relationship of clients to websockets and subscription lists. */
+ export class Switchboard {
+   clients: Map<WebSocket, ClientState>
++  private allClientsDisconnectedPromise: Promise<true> | null = null
++  private allClientsDisconnectedResolver: ((value: true) => void) | null = null
++
+   constructor() {
+     this.clients = new Map()
+   }
+@@ -40,6 +43,14 @@ export class Switchboard {
+   disconnect(ws: WebSocket) {
+     this.getClient(ws).sessionId = undefined
+     this.clients.delete(ws)
++
++    // If this was the last client, resolve the promise
++    if (this.clients.size === 0 && this.allClientsDisconnectedResolver) {
++      console.log('Last client disconnected. Resolving promise.')
++      this.allClientsDisconnectedResolver(true)
++      this.allClientsDisconnectedResolver = null
++      this.allClientsDisconnectedPromise = Promise.resolve(true)
++    }
+   }
+   markSeen(ws: WebSocket) {
+     this.getClient(ws).lastSeen = Date.now()
+@@ -58,4 +69,26 @@ export class Switchboard {
+     }
+     this.markSeen(ws)
+   }
++
++  // Note: This function assumes that new clients are
++  // no longer being added to the switchboard after this is called
++  waitForAllClientsDisconnected(): Promise<true> {
++    // If there are no clients, resolve immediately
++    if (this.clients.size === 0) {
++      console.log('No clients connected. Resolving immediately.')
++      return Promise.resolve(true)
++    }
++
++    // If we don't have a promise yet, create one
++    if (
++      !this.allClientsDisconnectedPromise ||
++      this.allClientsDisconnectedPromise === Promise.resolve(true)
++    ) {
++      this.allClientsDisconnectedPromise = new Promise<true>((resolve) => {
++        this.allClientsDisconnectedResolver = resolve
++      })
++    }
++
++    return this.allClientsDisconnectedPromise
++  }
+ }
+diff --git a/common/src/actions.ts b/common/src/actions.ts
+index 15448fb71..fc90a9894 100644
+--- a/common/src/actions.ts
++++ b/common/src/actions.ts
+@@ -1,12 +1,13 @@
+ import { z } from 'zod'
+-import { FileVersionSchema, ProjectFileContextSchema } from './util/file'
++
+ import { costModes } from './constants'
+ import {
+   AgentStateSchema,
+-  ToolResultSchema,
+   ToolCallSchema as NewToolCallSchema,
++  ToolResultSchema,
+ } from './types/agent-state'
+ import { GrantTypeValues } from './types/grant'
++import { FileVersionSchema, ProjectFileContextSchema } from './util/file'
+ 
+ export const FileChangeSchema = z.object({
+   type: z.enum(['patch', 'file']),
+@@ -161,6 +162,10 @@ export const SERVER_ACTION_SCHEMA = z.discriminatedUnion('type', [
+     type: z.literal('commit-message-response'),
+     commitMessage: z.string(),
+   }),
++  z.object({
++    // The server is imminently going to shutdown, and the client should reconnect
++    type: z.literal('request-reconnect'),
++  }),
+ ])
+ 
+ export type ServerAction = z.infer<typeof SERVER_ACTION_SCHEMA>
+diff --git a/common/src/websockets/websocket-client.ts b/common/src/websockets/websocket-client.ts
+index 58364ab9f..4bdc97038 100644
+--- a/common/src/websockets/websocket-client.ts
++++ b/common/src/websockets/websocket-client.ts
+@@ -1,6 +1,6 @@
+ import { WebSocket } from 'ws'
+ 
+-import { ServerAction, ClientAction } from '../actions'
++import { ClientAction, ServerAction } from '../actions'
+ import {
+   ClientMessage,
+   ClientMessageType,
+@@ -149,6 +149,20 @@ export class APIRealtimeClient {
+     }
+   }
+ 
++  forceReconnect() {
++    // Close the current connection if it's open
++    if (this.ws && this.state !== WebSocket.CLOSED) {
++      this.ws.close(1000, 'Forced reconnection due to server shutdown notice')
++    }
++
++    // Immediately attempt to reconnect
++    this.connect().catch((err) => {
++      console.error('Failed to reconnect after server shutdown notice:', err)
++      // Still set up delayed reconnect as fallback
++      this.waitAndReconnect()
++    })
++  }
++
+   receiveMessage(msg: ServerMessage) {
+     if (VERBOSE_LOGGING) {
+       console.info('< Incoming API websocket message: ', msg)
+diff --git a/npm-app/src/cli.ts b/npm-app/src/cli.ts
+index cf8e8c374..847263493 100644
+--- a/npm-app/src/cli.ts
++++ b/npm-app/src/cli.ts
+@@ -52,6 +52,7 @@ export class CLI {
+   private consecutiveFastInputs: number = 0
+   private pastedContent: string = ''
+   private isPasting: boolean = false
++  private shouldReconnectWhenIdle: boolean = false
+ 
+   constructor(
+     readyPromise: Promise<[void, ProjectFileContext]>,
+@@ -68,6 +69,7 @@ export class CLI {
+       this.onWebSocketError.bind(this),
+       this.onWebSocketReconnect.bind(this),
+       this.returnControlToUser.bind(this),
++      this.reconnectWhenNextIdle.bind(this),
+       this.costMode,
+       this.git,
+       this.rl,
+@@ -381,7 +383,19 @@ export class CLI {
+     this.freshPrompt()
+   }
+ 
++  private reconnectWhenNextIdle() {
++    if (!this.isReceivingResponse) {
++      this.client.reconnect()
++    } else {
++      this.shouldReconnectWhenIdle = true
++    }
++  }
++
+   private returnControlToUser() {
++    if (this.shouldReconnectWhenIdle) {
++      this.client.reconnect()
++      this.shouldReconnectWhenIdle = false
++    }
+     this.freshPrompt()
+     this.isReceivingResponse = false
+     if (this.stopResponse) {
+diff --git a/npm-app/src/client.ts b/npm-app/src/client.ts
+index d3d114d12..1638cce88 100644
+--- a/npm-app/src/client.ts
++++ b/npm-app/src/client.ts
+@@ -102,6 +102,7 @@ const WARNING_CONFIG = {
+ export class Client {
+   private webSocket: APIRealtimeClient
+   private returnControlToUser: () => void
++  private reconnectWhenNextIdle: () => void
+   private fingerprintId!: string | Promise<string>
+   private costMode: CostMode
+   private hadFileChanges: boolean = false
+@@ -139,6 +140,7 @@ export class Client {
+     onWebSocketError: () => void,
+     onWebSocketReconnect: () => void,
+     returnControlToUser: () => void,
++    reconnectWhenNextIdle: () => void,
+     costMode: CostMode,
+     git: GitCommand,
+     rl: readline.Interface,
+@@ -155,6 +157,7 @@ export class Client {
+     this.user = this.getUser()
+     this.initFingerprintId()
+     this.returnControlToUser = returnControlToUser
++    this.reconnectWhenNextIdle = reconnectWhenNextIdle
+     this.rl = rl
+   }
+ 
+@@ -489,6 +492,11 @@ export class Client {
+     this.usageData = usageData
+   }
+ 
++  public reconnect() {
++    console.log(yellow('Server updated - reconnecting...'))
++    this.webSocket.forceReconnect()
++  }
++
+   private setupSubscriptions() {
+     this.webSocket.subscribe('action-error', (action) => {
+       if (action.error === 'Insufficient credits') {
+@@ -566,6 +574,11 @@ export class Client {
+         this.showUsageWarning()
+       }
+     })
++
++    // Used to handle server restarts gracefully
++    this.webSocket.subscribe('request-reconnect', () => {
++      this.reconnectWhenNextIdle()
++    })
+   }
+ 
+   private showUsageWarning() {

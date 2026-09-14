@@ -1,0 +1,802 @@
+diff --git a/backend/src/billing/message-cost-tracker.ts b/backend/src/billing/message-cost-tracker.ts
+index 5497ac432..b582faf08 100644
+--- a/backend/src/billing/message-cost-tracker.ts
++++ b/backend/src/billing/message-cost-tracker.ts
+@@ -19,12 +19,14 @@ const TOKENS_COST_PER_M = {
+     [models.haiku]: 1,
+     [models.gpt4o]: 2.5,
+     [models.gpt4omini]: 0.15,
++    [models.o1]: 15,
+   },
+   output: {
+     [models.sonnet]: 15,
+     [models.haiku]: 5,
+     [models.gpt4o]: 10.0,
+     [models.gpt4omini]: 0.6,
++    [models.o1]: 60,
+   },
+   cache_creation: {
+     [models.sonnet]: 3.75,
+diff --git a/backend/src/conversation-progress.ts b/backend/src/conversation-progress.ts
+index f42d687e3..a3d59ceba 100644
+--- a/backend/src/conversation-progress.ts
++++ b/backend/src/conversation-progress.ts
+@@ -1,6 +1,11 @@
+ import { Message } from 'common/actions'
+ import { ProjectFileContext } from 'common/util/file'
+-import { openaiModels, claudeModels, STOP_MARKER } from 'common/constants'
++import {
++  openaiModels,
++  claudeModels,
++  STOP_MARKER,
++  CostMode,
++} from 'common/constants'
+ import { promptOpenAI } from './openai-api'
+ import { promptClaude } from './claude'
+ import { getAgentSystemPrompt } from './system-prompt'
+@@ -10,6 +15,7 @@ export async function checkConversationProgress(
+   messages: Message[],
+   fileContext: ProjectFileContext,
+   options: {
++    costMode: CostMode
+     clientSessionId: string
+     fingerprintId: string
+     userInputId: string
+@@ -18,7 +24,7 @@ export async function checkConversationProgress(
+ ) {
+   const prompt =
+     `Review the conversation since the last user input and determine if we should stop. We should stop if either:
+-1. The user's request appears to be satisfied based on the changes and responses made
++1. The user's request appears to be completely satisfied based on the changes and responses made
+ 2. The conversation seems stuck in a loop or not making meaningful progress toward the user's request.
+ 
+ Consider the conversation history:
+@@ -38,7 +44,7 @@ Answer with "STOP" or "CONTINUE". If "STOP", do not include any other text.
+ Otherwise, say very briefly what still needs to be completed to satify the user request.
+ `.trim()
+ 
+-  const system = getAgentSystemPrompt(fileContext)
++  const system = getAgentSystemPrompt(fileContext, options.costMode)
+ 
+   const response = await promptClaude([{ role: 'user', content: prompt }], {
+     model: claudeModels.sonnet,
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index a8beda97e..57144049f 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -1,11 +1,12 @@
+ import { WebSocket } from 'ws'
+ import { TextBlockParam } from '@anthropic-ai/sdk/resources'
+ 
+-import { model_types, promptClaudeStream } from './claude'
++import { model_types, promptClaude, promptClaudeStream } from './claude'
+ import {
+   TOOL_RESULT_MARKER,
+   STOP_MARKER,
+   getModelForMode,
++  claudeModels,
+ } from 'common/constants'
+ import { FileVersion, ProjectFileContext } from 'common/util/file'
+ import { didClientUseTool } from 'common/util/tools'
+@@ -20,19 +21,16 @@ import {
+   warmCacheForRequestRelevantFiles,
+ } from './request-files-prompt'
+ import { processStreamWithTags } from './process-stream'
+-import { generateKnowledgeFiles } from './generate-knowledge-files'
+ import { countTokens, countTokensJson } from './util/token-counter'
+ import { logger } from './util/logger'
+ import { difference, uniq, zip } from 'lodash'
+-import { filterDefined } from 'common/util/array'
++import { buildArray } from 'common/util/array'
+ import {
+   checkConversationProgress,
+   checkToAllowUnboundedIteration,
+ } from './conversation-progress'
++import { getRelevantFilesForPlanning, planComplexChange } from './planning'
+ 
+-/**
+- * Prompt claude, handle tool calls, and generate file changes.
+- */
+ export async function mainPrompt(
+   ws: WebSocket,
+   messages: Message[],
+@@ -110,7 +108,7 @@ export async function mainPrompt(
+     )
+   }
+ 
+-  const allowUnboundedIteration = await allowUnboundedIterationPromise
++  let allowUnboundedIteration = await allowUnboundedIterationPromise
+ 
+   const numAssistantMessages = messages
+     .slice(lastUserMessageIndex)
+@@ -140,31 +138,26 @@ export async function mainPrompt(
+   if (lastMessage.role === 'user' && typeof lastMessage.content === 'string') {
+     newLastMessage = {
+       ...lastMessage,
+-      content: `
+-<system_instruction>
+-Please preserve as much of the existing code, its comments, and its behavior as possible. Make minimal edits to accomplish only the core of what is requested. Then pause to get more instructions from the user.
+-</system_instruction>
+-<system_instruction>
+-Always end your response with the following marker:
+-${STOP_MARKER}
+-</system_instruction>
+-${
+-  lastMessage.content.includes(TOOL_RESULT_MARKER)
+-    ? `
+-<system_instruction>
+-If the tool result above is of a terminal command succeeding and you have completed the user's request, please write the ${STOP_MARKER} marker and do not write anything else to wait for further instructions from the user. Otherwise, please continue to fulfill the user's request.
+-</system_instruction>
+-  `.trim()
+-    : ''
+-}
+-
+-${lastMessage.content}
+-`.trim(),
++      content:
++        buildArray(
++          'Please preserve as much of the existing code, its comments, and its behavior as possible. Make minimal edits to accomplish only the core of what is requested. Then pause to get more instructions from the user.',
++          costMode === 'pro' &&
++            'If the user request is complex (e.g. requires changes across multiple files or systems), please consider invoking the plan_complex_change tool to create a plan.',
++          `Always end your response with the following marker:\n${STOP_MARKER}`,
++          lastMessage.content.includes(TOOL_RESULT_MARKER) &&
++            "If the tool result above is of a terminal command succeeding and you have completed the user's request, please write the ${STOP_MARKER} marker and do not write anything else to wait for further instructions from the user. Otherwise, please continue to fulfill the user's request."
++        )
++          .map(
++            (line) => `<important_instruction>${line}</important_instruction>`
++          )
++          .join('\n') +
++        '\n\n' +
++        lastMessage.content,
+     }
+   }
+ 
+   while (!isComplete) {
+-    const system = getAgentSystemPrompt(fileContext)
++    const system = getAgentSystemPrompt(fileContext, costMode)
+     const messagesWithContinuedMessage = continuedMessages
+       ? [...messagesWithoutLastMessage, newLastMessage, ...continuedMessages]
+       : messages
+@@ -231,6 +224,8 @@ ${lastMessage.content}
+             contentAttributes.file_paths = content
+           } else if (name === 'code_search') {
+             contentAttributes.pattern = content
++          } else if (name === 'plan_complex_change') {
++            contentAttributes.prompt = content
+           }
+           fullResponse += `<tool_call name="${attributes.name}">${content}</tool_call>`
+           toolCall = {
+@@ -280,7 +275,76 @@ ${lastMessage.content}
+ 
+     const toolCallResult = toolCall as ToolCall | null
+ 
+-    if (toolCallResult?.name === 'find_files') {
++    if (toolCallResult?.name === 'plan_complex_change') {
++      const { prompt } = toolCallResult.input
++
++      onResponseChunk(`\nPrompt: ${prompt}\n`)
++
++      const filePaths = await getRelevantFilesForPlanning(
++        messages,
++        prompt,
++        fileContext,
++        clientSessionId,
++        fingerprintId,
++        userInputId,
++        userId
++      )
++
++      const loadedFiles = await requestFiles(ws, filePaths)
++      const fileContents = Object.fromEntries(
++        Object.entries(loadedFiles).filter(
++          ([_, content]) => content !== null
++        ) as [string, string][]
++      )
++
++      const existingFilePaths = Object.keys(fileContents)
++      onResponseChunk(`\nRelevant files:\n${existingFilePaths.join(' ')}\n`)
++      fullResponse += `\nRelevant files:\n${existingFilePaths.join('\n')}\n`
++
++      onResponseChunk(`\nThinking deeply (can take a few minutes)...\n\n`)
++
++      logger.debug(
++        {
++          prompt,
++          filePaths,
++          existingFilePaths,
++        },
++        'Thinking deeply'
++      )
++
++      const plan = await planComplexChange(
++        prompt,
++        fileContents,
++        onResponseChunk,
++        {
++          clientSessionId,
++          fingerprintId,
++          userInputId,
++          userId,
++        }
++      )
++      fullResponse += plan
++      logger.debug(
++        {
++          prompt,
++          file_paths: filePaths,
++          response: plan,
++        },
++        'Generated plan'
++      )
++
++      // Enable unbounded iteration mode after generating plan
++      allowUnboundedIteration = true
++
++      toolCall = null
++      isComplete = false
++      continuedMessages = [
++        {
++          role: 'assistant',
++          content: fullResponse.trim(),
++        },
++      ]
++    } else if (toolCallResult?.name === 'find_files') {
+       logger.debug(toolCallResult, 'tool call')
+       const description = toolCallResult.input.description
+       const {
+@@ -399,6 +463,7 @@ ${lastMessage.content}
+           ],
+           fileContext,
+           {
++            costMode,
+             clientSessionId,
+             fingerprintId,
+             userInputId,
+diff --git a/backend/src/openai-api.ts b/backend/src/openai-api.ts
+index 49e880046..2fdb507ec 100644
+--- a/backend/src/openai-api.ts
++++ b/backend/src/openai-api.ts
+@@ -1,5 +1,4 @@
+ import OpenAI from 'openai'
+-import { RATE_LIMIT_POLICY } from './constants'
+ import { STOP_MARKER, TEST_USER_ID } from 'common/constants'
+ import { Stream } from 'openai/streaming'
+ import { env } from './env.mjs'
+@@ -27,12 +26,7 @@ const getOpenAI = (fingerprintId: string) => {
+   return openai
+ }
+ 
+-const timeoutPromise = (ms: number) =>
+-  new Promise((_, reject) =>
+-    setTimeout(() => reject(new Error('OpenAI API request timed out')), ms)
+-  )
+-
+-export async function promptOpenAI(
++export async function* promptOpenAIStream(
+   messages: OpenAIMessage[],
+   options: {
+     clientSessionId: string
+@@ -41,8 +35,9 @@ export async function promptOpenAI(
+     model: string
+     userId: string | undefined
+     predictedContent?: string
++    temperature?: number
+   }
+-) {
++): AsyncGenerator<string, void, unknown> {
+   const {
+     clientSessionId,
+     fingerprintId,
+@@ -53,47 +48,103 @@ export async function promptOpenAI(
+   } = options
+   const openai = getOpenAI(fingerprintId)
+   const startTime = Date.now()
++
+   try {
+-    const response = await Promise.race([
+-      openai.chat.completions.create({
++    const stream = await openai.chat.completions.create({
++      model,
++      messages,
++      temperature: options.temperature ?? 0,
++      stream: true,
++      ...(predictedContent
++        ? { prediction: { type: 'content', content: predictedContent } }
++        : {}),
++    })
++
++    let content = ''
++    let messageId: string | undefined
++    let inputTokens = 0
++    let outputTokens = 0
++
++    for await (const chunk of stream) {
++      if (chunk.choices[0]?.delta?.content) {
++        const delta = chunk.choices[0].delta.content
++        content += delta
++        yield delta
++      }
++
++      if (chunk.usage) {
++        messageId = chunk.id
++        inputTokens = chunk.usage.prompt_tokens
++        outputTokens = chunk.usage.completion_tokens
++      }
++    }
++
++    if (messageId && messages.length > 0 && userId !== TEST_USER_ID) {
++      saveMessage({
++        messageId,
++        userId,
++        clientSessionId,
++        fingerprintId,
++        userInputId,
+         model,
+-        messages,
+-        temperature: 0,
+-        // store: true,
+-        ...(predictedContent
+-          ? { prediction: { type: 'content', content: predictedContent } }
+-          : {}),
+-      }),
+-      timeoutPromise(200_000) as Promise<OpenAI.Chat.ChatCompletion>,
++        request: messages,
++        response: content,
++        inputTokens: inputTokens || 0,
++        outputTokens: outputTokens || 0,
++        finishedAt: new Date(),
++        latencyMs: Date.now() - startTime,
++      })
++    }
++  } catch (error) {
++    logger.error(
++      {
++        error:
++          error && typeof error === 'object' && 'message' in error
++            ? error.message
++            : 'Unknown error',
++      },
++      'Error calling OpenAI API'
++    )
++    throw error
++  }
++}
++
++const timeoutPromise = (ms: number) =>
++  new Promise((_, reject) =>
++    setTimeout(() => reject(new Error('OpenAI API request timed out')), ms)
++  )
++
++export async function promptOpenAI(
++  messages: OpenAIMessage[],
++  options: {
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
++    model: string
++    userId: string | undefined
++    predictedContent?: string
++    temperature?: number
++  }
++) {
++  try {
++    const timeout = options.model.startsWith('o1') ? 800_000 : 200_000
++    const stream = promptOpenAIStream(messages, options)
++
++    let content = ''
++    await Promise.race([
++      (async () => {
++        for await (const chunk of stream) {
++          content += chunk
++        }
++      })(),
++      timeoutPromise(timeout),
+     ])
++    const result = content
+ 
+-    if (
+-      response.choices &&
+-      response.choices.length > 0 &&
+-      response.choices[0].message
+-    ) {
+-      const messageId = response.id
+-      const content = response.choices[0].message.content || ''
+-      if (messages.length > 0 && userId !== TEST_USER_ID) {
+-        saveMessage({
+-          messageId,
+-          userId,
+-          clientSessionId,
+-          fingerprintId,
+-          userInputId,
+-          model,
+-          request: messages,
+-          response: content,
+-          inputTokens: response.usage?.prompt_tokens || 0,
+-          outputTokens: response.usage?.completion_tokens || 0,
+-          finishedAt: new Date(),
+-          latencyMs: Date.now() - startTime,
+-        })
+-      }
+-      return content
+-    } else {
++    if (!result) {
+       throw new Error('No response from OpenAI')
+     }
++    return result
+   } catch (error) {
+     logger.error(
+       {
+@@ -104,7 +155,6 @@ export async function promptOpenAI(
+       },
+       'Error calling OpenAI API'
+     )
+-
+     throw error
+   }
+ }
+diff --git a/backend/src/planning.ts b/backend/src/planning.ts
+new file mode 100644
+index 000000000..96c3721a7
+--- /dev/null
++++ b/backend/src/planning.ts
+@@ -0,0 +1,78 @@
++import { Message } from 'common/actions'
++import { models, claudeModels } from 'common/constants'
++import { createMarkdownFileBlock, ProjectFileContext } from 'common/util/file'
++import { promptClaude } from './claude'
++import { OpenAIMessage, promptOpenAIStream } from './openai-api'
++import { getSearchSystemPrompt } from './system-prompt'
++
++export async function planComplexChange(
++  prompt: string,
++  files: Record<string, string>,
++  onChunk: (chunk: string) => void,
++  options: {
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
++    userId: string | undefined
++  }
++) {
++  const messages: OpenAIMessage[] = [
++    {
++      role: 'user',
++      content: `${
++        Object.keys(files).length > 0
++          ? `Relevant Files:\n\n${Object.entries(files)
++              .map(([path, content]) => createMarkdownFileBlock(path, content))
++              .join('\n')}\n\n`
++          : ''
++      }${prompt}
++
++Please plan and create a detailed solution.`,
++    },
++  ]
++
++  let fullResponse = ''
++  for await (const chunk of promptOpenAIStream(messages, {
++    ...options,
++    model: models.o1,
++    temperature: 1,
++  })) {
++    fullResponse += chunk
++    onChunk(chunk)
++  }
++
++  return fullResponse
++}
++
++/**
++ * Prompt claude, handle tool calls, and generate file changes.
++ */
++export async function getRelevantFilesForPlanning(
++  messages: Message[],
++  prompt: string,
++  fileContext: ProjectFileContext,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
++  userId: string | undefined
++) {
++  const response = await promptClaude(
++    [
++      ...messages,
++      {
++        role: 'user',
++        content: `Given this request:\n${prompt}\n\nPlease list up to 20 file paths from the project that would be most relevant for implementing this change. Only output the file paths, one per line, nothing else.`,
++      },
++    ],
++    {
++      model: claudeModels.sonnet,
++      system: getSearchSystemPrompt(fileContext),
++      clientSessionId,
++      fingerprintId,
++      userInputId,
++      userId,
++    }
++  )
++
++  return response.split('\n').filter((line) => line.trim().length > 0)
++}
+\ No newline at end of file
+diff --git a/backend/src/process-stream.ts b/backend/src/process-stream.ts
+index d81a6f634..75b9f354c 100644
+--- a/backend/src/process-stream.ts
++++ b/backend/src/process-stream.ts
+@@ -11,7 +11,7 @@ export async function* processStreamWithTags<T extends string>(
+   let buffer = ''
+   let insideTag: string | null = null
+   let currentAttributes: Record<string, string> = {}
+-  const bufferSize = 150
++  let streamCompleted = false
+ 
+   const escapeRegExp = (string: string) =>
+     string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+@@ -23,69 +23,96 @@ export async function* processStreamWithTags<T extends string>(
+     `</(${tagNames.map(escapeRegExp).join('|')})>`
+   )
+ 
+-  function parseBuffer(bufferSize: number) {
+-    let toYield = ''
++  function* parseBuffer(
++    isEOF: boolean = false
++  ): Generator<string, void, unknown> {
++    let didParse = true
++
++    while (!streamCompleted && didParse) {
++      didParse = false
+ 
+-    while (buffer.length > bufferSize) {
+       if (insideTag === null) {
+-        const match = buffer.match(openTagRegex)
+-        if (match && match.index !== undefined) {
+-          const [fullMatch, openTag, attributesString] = match
++        // Outside a tag: try to find the next opening tag
++        const openMatch = buffer.match(openTagRegex)
++        if (openMatch && openMatch.index !== undefined) {
++          const [fullMatch, openTag, attributesString] = openMatch
++          const beforeTag = buffer.slice(0, openMatch.index)
++          const afterMatchIndex = openMatch.index + fullMatch.length
++
++          // Yield any text before the tag
++          if (beforeTag) {
++            yield beforeTag
++          }
+ 
+-          const afterMatchIndex = match.index + fullMatch.length
+-          toYield += buffer.slice(0, match.index)
++          // Move buffer forward
+           buffer = buffer.slice(afterMatchIndex)
+ 
++          // We are now inside this tag
+           insideTag = openTag
+           currentAttributes = parseAttributes(
+             attributesString,
+             tags[openTag].attributeNames
+           )
++
++          // Call onTagStart
+           const startTagYield = tags[openTag].onTagStart(currentAttributes)
+           if (startTagYield) {
+-            toYield += startTagYield
++            yield startTagYield
+           }
++
++          didParse = true
+         } else {
+-          toYield += buffer.slice(0, buffer.length - bufferSize)
+-          buffer = buffer.slice(buffer.length - bufferSize)
++          // No opening tag found. If it's EOF, yield remaining text.
++          if (isEOF && buffer.length > 0) {
++            yield buffer
++            buffer = ''
++          }
+         }
+       } else {
++        // Inside a tag: try to find the closing tag
+         const closeMatch = buffer.match(closeTagRegex)
+         if (closeMatch && closeMatch.index !== undefined) {
+           const [fullMatch, closeTag] = closeMatch
+-          const closeIndex = closeMatch.index
+-          const content = buffer.slice(0, closeIndex)
+-          const complete = tags[insideTag].onTagEnd(content, currentAttributes)
++          const content = buffer.slice(0, closeMatch.index)
++
++          // Move buffer forward
++          buffer = buffer.slice(closeMatch.index + fullMatch.length)
+ 
+-          buffer = buffer.slice(closeIndex + fullMatch.length)
++          // Close the tag
++          const complete = tags[insideTag].onTagEnd(content, currentAttributes)
+           insideTag = null
+           currentAttributes = {}
++
+           if (complete) {
+-            return { toYield, isComplete: true }
++            // If onTagEnd signals completion, set streamCompleted and return
++            streamCompleted = true
++            return
++          }
++
++          didParse = true
++        } else if (isEOF) {
++          // We reached EOF without finding a closing tag
++          // Depending on your needs, yield what's there or handle as malformed.
++          if (buffer.length > 0) {
++            yield buffer
++            buffer = ''
+           }
+-        } else {
+-          break
+         }
+       }
+     }
+-    return { toYield, isComplete: false }
+   }
+ 
+   for await (const chunk of stream) {
++    if (streamCompleted) break
+     buffer += chunk
+ 
+-    const { toYield, isComplete } = parseBuffer(bufferSize)
+-    if (toYield) {
+-      yield toYield
+-    }
+-    if (isComplete) {
+-      return
+-    }
++    yield* parseBuffer()
++    if (streamCompleted) break
+   }
+ 
+-  const { toYield } = parseBuffer(0)
+-  if (toYield) {
+-    yield toYield
++  if (!streamCompleted) {
++    // After the stream ends, try parsing one last time in case there's leftover text
++    yield* parseBuffer(true)
+   }
+ }
+ 
+diff --git a/backend/src/system-prompt.ts b/backend/src/system-prompt.ts
+index e1f112642..97a307e54 100644
+--- a/backend/src/system-prompt.ts
++++ b/backend/src/system-prompt.ts
+@@ -8,7 +8,7 @@ import {
+ } from 'common/util/file'
+ import { buildArray } from 'common/util/array'
+ import { truncateString } from 'common/util/string'
+-import { STOP_MARKER } from 'common/constants'
++import { CostMode, STOP_MARKER } from 'common/constants'
+ import { countTokensJson } from './util/token-counter'
+ import { logger } from './util/logger'
+ import { sortBy, sum, uniq } from 'lodash'
+@@ -54,7 +54,10 @@ export function getSearchSystemPrompt(fileContext: ProjectFileContext) {
+   return systemPrompt
+ }
+ 
+-export const getAgentSystemPrompt = (fileContext: ProjectFileContext) => {
++export const getAgentSystemPrompt = (
++  fileContext: ProjectFileContext,
++  costMode: CostMode
++) => {
+   const { fileVersions } = fileContext
+   const files = uniq(fileVersions.flatMap((files) => files.map((f) => f.path)))
+ 
+@@ -80,7 +83,7 @@ export const getAgentSystemPrompt = (fileContext: ProjectFileContext) => {
+       cache_control: { type: 'ephemeral' as const },
+       text: buildArray(
+         getGitChangesPrompt(fileContext),
+-        getResponseFormatPrompt(fileContext, files)
++        getResponseFormatPrompt(fileContext, files, costMode)
+       ).join('\n\n'),
+     }
+   )
+@@ -244,11 +247,13 @@ You have access to the following tools:
+ - <tool_call name="find_files">[DESCRIPTION_OF_FILES]</tool_call>: Find files given a brief natural language description of the files or the name of a function or class you are looking for.
+ - <tool_call name="read_files">[LIST_OF_FILE_PATHS]</tool_call>: Provide a list of file paths to read, separated by newlines. The file paths must be the full path relative to the project root directory. Prefer using this tool over find_files when you know the exact file(s) you want to read.
+ - <tool_call name="code_search">[PATTERN]</tool_call>: Search for the given pattern in the project directory. Use this tool to search for code in the project, like function names, class names, variable names, types, where a function is called from, where it is defined, etc.
++- <tool_call name="plan_complex_change">[PROMPT]</tool_call>: Plan a complex change to the codebase, like implementing a new feature or refactoring some code. Provide a clear, specific problem statement folllowed by additional context that is relevant to the problem in the tool call body. Use this tool to solve a user request that is not immediately obvious or requires more than a few lines of code.
+ - <tool_call name="run_terminal_command">[YOUR COMMAND HERE]</tool_call>: Execute a command in the terminal and return the result.
+ - <tool_call name="scrape_web_page">[URL HERE]</tool_call>: Scrape the web page at the given url and return the content.
+ 
+ Important notes:
+ - Immediately after you write out a tool call, you should write ${STOP_MARKER}, and then do not write out any other text. You will automatically be prompted to continue with the result of the tool call.
++- Do not write out a tool call within another tool call block.
+ - Do not write out a tool call within an <edit_file> block. If you want to read a file before editing it, write the <tool_call> first. Similarly, do not write a tool call to run a terminal command within an <edit_file> block.
+ - You can freely explain what tools you have available, but do not write out <tool_call name="..." />" unless you are actually intending to call the tool, otherwise you will accidentally be calling the tool when explaining it.
+ 
+@@ -310,6 +315,31 @@ Do not use code_search when:
+ - You want to load the contents of files (use find_files instead)
+ - You're inside an <edit_file> block
+ 
++## Plan complex change
++
++When you need a detailed technical plan for complex changes, use the plan_complex_change tool. This tool leverages O1's deep reasoning capabilities to break down difficult problems into clear implementation steps.
++
++Format:
++- First line must be a clear, specific problem statement
++- Additional lines provide context. Please be generous in providing any context that could help solve the problem.
++
++Example problem statement & context:
++Add rate limiting to all API endpoints
++Current system has no rate limiting. Need to prevent abuse while allowing legitimate traffic. Should use Redis to track request counts.
++
++Use cases:
++1. Implementing features
++2. Planning refactoring operations
++3. Making architectural decisions
++4. Breaking down difficult problems into steps
++5. When you seem to be stuck and need
++
++Best practices:
++- Make problem statement specific and actionable
++- Include relevant constraints in context
++- Use for complex changes that need careful planning
++- Don't use for simple changes or quick decisions
++
+ ## Running terminal commands
+ 
+ You can write out <tool_call name="run_terminal_command">...</tool_call> to execute shell commands in the user's terminal. This can be useful for tasks such as:
+@@ -478,12 +508,39 @@ ${truncateString(gitChanges.lastCommitMessages, maxLength / 10)}
+ 
+ const getResponseFormatPrompt = (
+   fileContext: ProjectFileContext,
+-  files: string[]
++  files: string[],
++  costMode: CostMode
+ ) => {
+   const hasKnowledgeFiles = Object.keys(fileContext.knowledgeFiles).length > 0
+   return `
+ # Response format
+ 
++${
++  costMode === 'pro'
++    ? `## 0. Invoke the plan_complex_change tool
++
++Consider using the plan_complex_change tool when the user's request meets multiple of these criteria:
++- Requires changes across multiple files or systems
++- Involves complex logic or architectural decisions
++- Would benefit from breaking down into smaller steps
++- Has potential edge cases or risks that need consideration
++- Requires careful coordination of changes
++- Could impact performance or security
++
++Examples of when to use it:
++- Adding a new feature that touches multiple parts of the system
++- Refactoring core functionality used by many components
++- Making architectural changes that affect the system design
++- Implementing complex business logic with many edge cases
++
++Do not use it for simple changes like:
++- Adding a single function or endpoint
++- Updating text or styles
++- Simple bug fixes
++- Configuration changes
++`
++    : ''
++}
+ ## 1. Edit files & run terminal commands
+ 
+ Respond to the user's request by editing files and running terminal commands as needed. The goal is to make as few changes as possible to the codebase to address the user's request. Only do what the user has asked for and no more. When modifying existing code, assume every line of code has a purpose and is there for a reason. Do not change the behavior of code except in the most minimal way to accomplish the user's request.
+diff --git a/common/src/constants.ts b/common/src/constants.ts
+index 646f9a9e9..1f4aa4080 100644
+--- a/common/src/constants.ts
++++ b/common/src/constants.ts
+@@ -116,6 +116,8 @@ export const claudeModels = {
+ export const openaiModels = {
+   gpt4o: 'gpt-4o-2024-08-06',
+   gpt4omini: 'gpt-4o-mini-2024-07-18',
++  // o1: 'o1-2024-12-17',
++  o1: 'o1-preview',
+ } as const
+ 
+ export const geminiModels = {
+@@ -129,6 +131,6 @@ export const models = {
+ }
+ 
+ export const OVERAGE_RATE_PRO = 0.99
+-export const OVERAGE_RATE_PRO_PLUS = 0.90
++export const OVERAGE_RATE_PRO_PLUS = 0.9
+ 
+ export const TEST_USER_ID = 'test-user-id'

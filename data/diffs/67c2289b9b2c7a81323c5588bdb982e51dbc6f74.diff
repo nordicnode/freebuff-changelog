@@ -1,0 +1,365 @@
+diff --git a/backend/src/api/usage.ts b/backend/src/api/usage.ts
+index 640cae0ab..8fd83edef 100644
+--- a/backend/src/api/usage.ts
++++ b/backend/src/api/usage.ts
+@@ -2,7 +2,6 @@ import { getOrganizationUsageResponse } from '@codebuff/billing'
+ import { INVALID_AUTH_TOKEN_MESSAGE } from '@codebuff/common/old-constants'
+ import { z } from 'zod/v4'
+ 
+-import { BACKEND_AGENT_RUNTIME_IMPL } from '../impl/agent-runtime'
+ import { checkAuth } from '../util/check-auth'
+ import { logger } from '../util/logger'
+ import { getUserInfoFromApiKey } from '../websockets/auth'
+@@ -32,9 +31,10 @@ async function usageHandler(
+     const clientSessionId = `api-${fingerprintId}-${Date.now()}`
+ 
+     const authResult = await checkAuth({
+-      ...BACKEND_AGENT_RUNTIME_IMPL,
++      fingerprintId,
+       authToken,
+       clientSessionId,
++      logger,
+     })
+     if (authResult) {
+       const errorMessage =
+diff --git a/backend/src/util/check-auth.ts b/backend/src/util/check-auth.ts
+index 2fe4a0d71..a045b1158 100644
+--- a/backend/src/util/check-auth.ts
++++ b/backend/src/util/check-auth.ts
+@@ -1,31 +1,29 @@
++import db from '@codebuff/common/db'
++import * as schema from '@codebuff/common/db/schema'
+ import { utils } from '@codebuff/internal'
++import { eq } from 'drizzle-orm'
+ 
+ import { extractAuthTokenFromHeader } from './auth-helpers'
+-import { getUserInfoFromApiKey } from '../websockets/auth'
+ 
+ import type { ServerAction } from '@codebuff/common/actions'
+-import type { GetUserInfoFromApiKeyFn } from '@codebuff/common/types/contracts/database'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { Request, Response, NextFunction } from 'express'
+ 
+ export const checkAuth = async (params: {
++  fingerprintId?: string
+   authToken?: string
+   clientSessionId: string
+-  getUserInfoFromApiKey: GetUserInfoFromApiKeyFn
+   logger: Logger
+ }): Promise<void | ServerAction> => {
+-  const { authToken, clientSessionId, getUserInfoFromApiKey, logger } = params
+-
++  const { fingerprintId, authToken, clientSessionId, logger } = params
+   // Use shared auth check functionality
+-  const authResult = authToken
+-    ? await getUserInfoFromApiKey({
+-        apiKey: authToken,
+-        fields: ['id'],
+-      })
+-    : null
++  const authResult = await utils.checkAuthToken({
++    fingerprintId,
++    authToken,
++  })
+ 
+-  if (!authResult) {
+-    const errorMessage = 'Authentication failed'
++  if (!authResult.success) {
++    const errorMessage = authResult.error?.message || 'Authentication failed'
+     logger.error({ clientSessionId, error: errorMessage }, errorMessage)
+     return {
+       type: 'action-error',
+@@ -45,44 +43,65 @@ export const checkAuth = async (params: {
+ }
+ 
+ // Express middleware for checking admin access
+-export const checkAdmin =
+-  (logger: Logger) =>
+-  async (req: Request, res: Response, next: NextFunction) => {
+-    // Extract auth token from x-codebuff-api-key header
+-    const authToken = extractAuthTokenFromHeader(req)
+-    if (!authToken) {
+-      return res
+-        .status(401)
+-        .json({ error: 'Missing x-codebuff-api-key header' })
+-    }
++export const checkAdmin = (logger: Logger) => async (
++  req: Request,
++  res: Response,
++  next: NextFunction,
++) => {
++  // Extract auth token from x-codebuff-api-key header
++  const authToken = extractAuthTokenFromHeader(req)
++  if (!authToken) {
++    return res.status(401).json({ error: 'Missing x-codebuff-api-key header' })
++  }
+ 
+-    // Generate a client session ID for this request
+-    const clientSessionId = `admin-relabel-${Date.now()}`
++  // Generate a client session ID for this request
++  const clientSessionId = `admin-relabel-${Date.now()}`
+ 
+-    // Check authentication
+-    const user = await getUserInfoFromApiKey({
+-      apiKey: authToken,
+-      fields: ['id', 'email'],
+-    })
++  // Check authentication
++  const authResult = await checkAuth({
++    authToken,
++    clientSessionId,
++    logger,
++  })
+ 
+-    if (!user) {
+-      return res.status(401).json({ error: 'Invalid session' })
+-    }
++  if (authResult) {
++    // checkAuth returns an error action if auth fails
++    const errorMessage =
++      authResult.type === 'action-error'
++        ? authResult.message
++        : 'Authentication failed'
++    return res.status(401).json({ error: errorMessage })
++  }
+ 
+-    // Check if user has admin access using shared utility
+-    const adminUser = await utils.checkUserIsCodebuffAdmin(user.id)
+-    if (!adminUser) {
+-      logger.warn(
+-        { userId: user.id, email: user.email, clientSessionId },
+-        'Unauthorized access attempt to admin endpoint',
+-      )
+-      return res.status(403).json({ error: 'Forbidden' })
+-    }
++  // Get the user ID associated with this session token
++  const user = await db
++    .select({
++      id: schema.user.id,
++      email: schema.user.email,
++    })
++    .from(schema.user)
++    .innerJoin(schema.session, eq(schema.user.id, schema.session.userId))
++    .where(eq(schema.session.sessionToken, authToken))
++    .then((users) => users[0])
+ 
+-    // Store user info in request for handlers to use if needed
+-    // req.user = adminUser // TODO: ensure type check passes
++  if (!user) {
++    return res.status(401).json({ error: 'Invalid session' })
++  }
+ 
+-    // Auth passed and user is admin, proceed to next middleware
+-    next()
+-    return
++  // Check if user has admin access using shared utility
++  const adminUser = await utils.checkUserIsCodebuffAdmin(user.id)
++  if (!adminUser) {
++    logger.warn(
++      { userId: user.id, email: user.email, clientSessionId },
++      'Unauthorized access attempt to admin endpoint',
++    )
++    return res.status(403).json({ error: 'Forbidden' })
+   }
++
++  // Store user info in request for handlers to use if needed
++  // req.user = adminUser // TODO: ensure type check passes
++
++  // Auth passed and user is admin, proceed to next middleware
++  next()
++  return
++}
+diff --git a/backend/src/websockets/middleware.ts b/backend/src/websockets/middleware.ts
+index b5015f7f5..03a59f9c2 100644
+--- a/backend/src/websockets/middleware.ts
++++ b/backend/src/websockets/middleware.ts
+@@ -60,27 +60,25 @@ export class WebSocketMiddleware {
+   }
+ 
+   use<T extends ClientAction['type']>(
+-    callback: (
+-      params: {
+-        action: ClientAction<T>
+-        clientSessionId: string
+-        ws: WebSocket
+-        userInfo: { id: string } | null
+-      } & AgentRuntimeDeps,
+-    ) => Promise<void | ServerAction>,
++    callback: (params: {
++      action: ClientAction<T>
++      clientSessionId: string
++      ws: WebSocket
++      userInfo: { id: string } | null
++      logger: Logger
++    }) => Promise<void | ServerAction>,
+   ) {
+     this.middlewares.push(callback as MiddlewareCallback)
+   }
+ 
+-  async execute(
+-    params: {
+-      action: ClientAction
+-      clientSessionId: string
+-      ws: WebSocket
+-      silent?: boolean
+-      getUserInfoFromApiKey: GetUserInfoFromApiKeyFn
+-    } & AgentRuntimeDeps,
+-  ): Promise<boolean> {
++  async execute(params: {
++    action: ClientAction
++    clientSessionId: string
++    ws: WebSocket
++    silent?: boolean
++    getUserInfoFromApiKey: GetUserInfoFromApiKeyFn
++    logger: Logger
++  }): Promise<boolean> {
+     const { action, clientSessionId, ws, silent, logger } = params
+ 
+     const userInfo =
+@@ -175,13 +173,14 @@ export class WebSocketMiddleware {
+ 
+ export const protec = new WebSocketMiddleware(BACKEND_AGENT_RUNTIME_IMPL)
+ 
+-protec.use(async (params) => {
+-  const { action } = params
+-  return checkAuth({
+-    ...params,
++protec.use(async ({ action, clientSessionId, logger }) =>
++  checkAuth({
++    fingerprintId: 'fingerprintId' in action ? action.fingerprintId : undefined,
+     authToken: 'authToken' in action ? action.authToken : undefined,
+-  })
+-})
++    clientSessionId,
++    logger,
++  }),
++)
+ 
+ // Organization repository coverage detection middleware
+ protec.use(async ({ action, userInfo, logger }) => {
+diff --git a/packages/internal/src/knowledge.md b/packages/internal/src/knowledge.md
+index a470cf904..875a8109f 100644
+--- a/packages/internal/src/knowledge.md
++++ b/packages/internal/src/knowledge.md
+@@ -25,3 +25,9 @@ All environment variables are defined and validated in `env.ts`:
+ - **Purpose**: Transactional emails (invitations, basic messages)
+ - **Functions**: `sendOrganizationInvitationEmail`, `sendBasicEmail`, `sendSignupEventToLoops`
+ - **Environment**: Requires `LOOPS_API_KEY`
++
++### Auth Utilities
++
++- **Purpose**: Admin user verification and session validation
++- **Functions**: `checkAuthToken`, `checkSessionIsAdmin`, `isCodebuffAdmin`
++- **Usage**: Used by admin routes and protected endpoints
+diff --git a/packages/internal/src/utils/auth.ts b/packages/internal/src/utils/auth.ts
+index 924593f5b..9c7925edf 100644
+--- a/packages/internal/src/utils/auth.ts
++++ b/packages/internal/src/utils/auth.ts
+@@ -2,6 +2,8 @@ import db from '@codebuff/common/db'
+ import * as schema from '@codebuff/common/db/schema'
+ import { eq } from 'drizzle-orm'
+ 
++import { INVALID_AUTH_TOKEN_MESSAGE } from '@codebuff/common/old-constants'
++
+ // List of admin user emails - single source of truth
+ const CODEBUFF_ADMIN_USER_EMAILS = [
+   'venkateshrameshkumar+1@gmail.com',
+@@ -36,6 +38,62 @@ export interface AuthResult {
+   }
+ }
+ 
++/**
++ * Check authentication based on auth token and fingerprint ID
++ * Returns structured result instead of throwing or logging directly
++ */
++export async function checkAuthToken({
++  fingerprintId,
++  authToken,
++}: {
++  fingerprintId?: string
++  authToken?: string
++}): Promise<AuthResult> {
++  if (!authToken) {
++    if (!fingerprintId) {
++      return {
++        success: false,
++        error: {
++          type: 'missing-credentials',
++          message: 'Auth token and fingerprint ID are missing',
++        },
++      }
++    }
++    return { success: true }
++  }
++
++  const user = await db
++    .select({
++      id: schema.user.id,
++      email: schema.user.email,
++      discord_id: schema.user.discord_id,
++    })
++    .from(schema.user)
++    .innerJoin(schema.session, eq(schema.user.id, schema.session.userId))
++    .where(eq(schema.session.sessionToken, authToken))
++    .then((users) => {
++      if (users.length === 1) {
++        return users[0]
++      }
++      return undefined
++    })
++
++  if (!user) {
++    return {
++      success: false,
++      error: {
++        type: 'invalid-token',
++        message: INVALID_AUTH_TOKEN_MESSAGE,
++      },
++    }
++  }
++
++  return {
++    success: true,
++    user,
++  }
++}
++
+ /**
+  * Check if the current user session corresponds to a Codebuff admin
+  * Returns the admin user if authorized, null if not
+diff --git a/web/src/app/api/agents/publish/route.ts b/web/src/app/api/agents/publish/route.ts
+index 40dcba403..9936670c3 100644
+--- a/web/src/app/api/agents/publish/route.ts
++++ b/web/src/app/api/agents/publish/route.ts
+@@ -3,6 +3,7 @@ import * as schema from '@codebuff/common/db/schema'
+ import { validateAgentsWithSpawnableAgents } from '@codebuff/common/templates/agent-validation'
+ import { publishAgentsRequestSchema } from '@codebuff/common/types/api/agents/publish'
+ import {
++  checkAuthToken,
+   determineNextVersion,
+   stringifyVersion,
+   versionExists,
+@@ -21,7 +22,6 @@ import { authOptions } from '../../auth/[...nextauth]/auth-options'
+ import type { Version } from '@codebuff/internal'
+ import type { NextRequest } from 'next/server'
+ 
+-import { getUserInfoFromApiKey } from '@/db/user'
+ import { logger } from '@/util/logger'
+ 
+ async function getPublishedAgentIds(publisherId: string) {
+@@ -96,12 +96,9 @@ export async function POST(request: NextRequest) {
+     if (session?.user?.id) {
+       userId = session.user.id
+     } else if (authToken) {
+-      const user = await getUserInfoFromApiKey({
+-        apiKey: authToken,
+-        fields: ['id'],
+-      })
+-      if (user) {
+-        userId = user.id
++      const authResult = await checkAuthToken({ authToken })
++      if (authResult.success && authResult.user) {
++        userId = authResult.user.id
+       }
+     }
+ 

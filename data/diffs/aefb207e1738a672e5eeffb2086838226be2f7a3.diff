@@ -1,0 +1,250 @@
+diff --git a/common/src/billing/quota-manager.ts b/common/src/billing/quota-manager.ts
+index d2f79be41..c89a48593 100644
+--- a/common/src/billing/quota-manager.ts
++++ b/common/src/billing/quota-manager.ts
+@@ -1,3 +1,4 @@
++import { stripeServer } from '../util/stripe'
+ import { CREDITS_USAGE_LIMITS } from '../constants'
+ import db from '../db'
+ import * as schema from '../db/schema'
+@@ -102,6 +103,57 @@ export class AnonymousQuotaManager implements IQuotaManager {
+ }
+ 
+ export class AuthenticatedQuotaManager implements IQuotaManager {
++  async getStripeSubscriptionQuota(
++    userId: string
++  ): Promise<{ quota: number; overageRate: number | null }> {
++    // Get user's subscription from Stripe
++    const user = await db.query.user.findFirst({
++      where: eq(schema.user.id, userId),
++      columns: {
++        stripe_customer_id: true,
++        stripe_price_id: true,
++      },
++    })
++
++    let overageRate: number | null = null
++    let quota = CREDITS_USAGE_LIMITS.PAID
++    if (user?.stripe_customer_id && user?.stripe_price_id) {
++      const subscriptions = await stripeServer.subscriptions.list({
++        customer: user.stripe_customer_id,
++        status: 'active',
++        limit: 1,
++      })
++
++      if (subscriptions.data[0]?.id) {
++        const subscription = await stripeServer.subscriptions.retrieve(
++          subscriptions.data[0].id,
++          {
++            expand: ['items.data.price.tiers'],
++          }
++        )
++
++        // Get the metered price item which contains our overage rate
++        const meteredPrice = subscription.items.data.find(
++          (item) => item.price.recurring?.usage_type === 'metered'
++        )
++
++        if (meteredPrice?.price.tiers) {
++          for (const tier of meteredPrice.price.tiers) {
++            if (tier.up_to) {
++              quota = Math.max(quota, tier.up_to)
++            }
++            if (tier.up_to === null && tier.unit_amount_decimal) {
++              overageRate = parseFloat(tier.unit_amount_decimal)
++              break
++            }
++          }
++        }
++      }
++    }
++
++    return { quota, overageRate }
++  }
++
+   async checkQuota(userId: string, sessionId?: string): CheckQuotaResult {
+     const startDate: SQL<string> = sql<string>`COALESCE(${schema.user.next_quota_reset}, now()) - INTERVAL '1 month'`
+     const endDate: SQL<string> = sql<string>`COALESCE(${schema.user.next_quota_reset}, now())`
+diff --git a/web/src/app/api/stripe/webhook/route.ts b/web/src/app/api/stripe/webhook/route.ts
+index c697bced7..16e889bc6 100644
+--- a/web/src/app/api/stripe/webhook/route.ts
++++ b/web/src/app/api/stripe/webhook/route.ts
+@@ -6,8 +6,9 @@ import { env } from '@/env.mjs'
+ import { stripeServer } from 'common/src/util/stripe'
+ import db from 'common/db'
+ import * as schema from 'common/db/schema'
+-import { CREDITS_USAGE_LIMITS } from 'common/constants'
++import { CREDITS_USAGE_LIMITS, UsageLimits } from 'common/constants'
+ import { match, P } from 'ts-pattern'
++import { AuthenticatedQuotaManager } from 'common/billing/quota-manager'
+ 
+ const getCustomerId = (
+   customer: string | Stripe.Customer | Stripe.DeletedCustomer
+@@ -73,16 +74,26 @@ const webhookHandler = async (req: NextRequest): Promise<NextResponse> => {
+         break
+       default:
+         console.log(`Unhandled event type ${event.type}`)
++        return NextResponse.json(
++          {
++            error: {
++              message: 'Method Not Allowed',
++            },
++          },
++          { status: 405 }
++        )
+     }
+     return NextResponse.json({ received: true })
+-  } catch {
++  } catch (err) {
++    const error = err as Error
++    console.error('Error processing webhook:', error)
+     return NextResponse.json(
+       {
+         error: {
+-          message: 'Method Not Allowed',
++          message: error.message,
+         },
+       },
+-      { status: 405 }
++      { status: 500 }
+     )
+   }
+ }
+@@ -112,18 +123,33 @@ async function getTotalReferralCreditsForCustomer(
+ 
+ async function handleSubscriptionChange(
+   subscription: Stripe.Subscription,
+-  usageTier: keyof typeof CREDITS_USAGE_LIMITS
++  usageTier: UsageLimits
+ ) {
+   const customerId = getCustomerId(subscription.customer)
++  console.log(`Customer ID: ${customerId}`)
+ 
+-  // Fetch the user's current quota and referral credits
+-  const referralCredits = await getTotalReferralCreditsForCustomer(customerId)
++  // Get the user ID from the customer ID
++  const user = await db.query.user.findFirst({
++    where: eq(schema.user.stripe_customer_id, customerId),
++    columns: { id: true },
++  })
+ 
+-  const baseQuota = CREDITS_USAGE_LIMITS[usageTier]
+-  const newQuota = baseQuota + referralCredits
++  if (!user) {
++    throw new Error('No user found for customer ID')
++  }
++  console.log(`Found user ID: ${user.id}`)
+ 
+-  // TODO: If downgrading, check Stripe to see if they have exceeded quota, don't just blindly reset. But for now it's fine to just trust them.
+-  // A good indicator that we've created compelling value is if people are subscribing and unsubscribing just to get some more free usage
++  // Get quota from Stripe subscription
++  const quotaManager = new AuthenticatedQuotaManager()
++  const { quota } = await quotaManager.getStripeSubscriptionQuota(user.id)
++  const baseQuota = Math.max(quota, CREDITS_USAGE_LIMITS[usageTier])
++
++  // Add referral credits
++  const referralCredits = await getTotalReferralCreditsForCustomer(customerId)
++  const newQuota = baseQuota + referralCredits
++  console.log(
++    `Calculated new quota: ${newQuota} (base: ${baseQuota}, referral: ${referralCredits})`
++  )
+ 
+   let newSubscriptionId: string | null = subscription.id
+   if (subscription.cancellation_details?.reason) {
+@@ -132,6 +158,8 @@ async function handleSubscriptionChange(
+     )
+     newSubscriptionId = null
+   }
++  console.log(`New subscription ID: ${newSubscriptionId}`)
++
+   await db
+     .update(schema.user)
+     .set({
+diff --git a/web/src/app/usage/page.tsx b/web/src/app/usage/page.tsx
+index 831a7da2f..07ba462d9 100644
+--- a/web/src/app/usage/page.tsx
++++ b/web/src/app/usage/page.tsx
+@@ -4,14 +4,9 @@ import { getServerSession } from 'next-auth'
+ import { authOptions } from '../api/auth/[...nextauth]/auth-options'
+ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+ import { SignInCardFooter } from '@/components/sign-in/sign-in-card-footer'
+-import { getQuotaManager } from 'common/src/billing/quota-manager'
++import { AuthenticatedQuotaManager } from 'common/src/billing/quota-manager'
+ import { getNextQuotaReset } from 'common/util/dates'
+ import { UsageData } from 'common/src/types/usage'
+-import { OVERAGE_RATE_PRO } from 'common/constants'
+-import db from 'common/db'
+-import * as schema from 'common/db/schema'
+-import { eq } from 'drizzle-orm'
+-import { stripeServer } from 'common/src/util/stripe'
+ 
+ const SignInCard = () => (
+   <Card>
+@@ -95,59 +90,20 @@ const UsagePage = async () => {
+     return <SignInCard />
+   }
+ 
+-  const quotaManager = getQuotaManager('authenticated', session.user.id)
+-  let q = await quotaManager.checkQuota()
++  // const quotaManager = getQuotaManager('authenticated', session.user.id)
++  const quotaManager = new AuthenticatedQuotaManager()
++  let q = await quotaManager.checkQuota(session.user.id)
+   if (q.endDate < new Date()) {
+     // endDate is in the past, so reset the quota
+     const nextQuotaReset = getNextQuotaReset(q.endDate)
+-    await quotaManager.setNextQuota(false, nextQuotaReset)
++    await quotaManager.setNextQuota(session.user.id, false, nextQuotaReset)
+ 
+     // get their newly updated info
+-    q = await quotaManager.checkQuota()
+-  }
+-
+-  // Get user's subscription from Stripe
+-  const user = await db.query.user.findFirst({
+-    where: eq(schema.user.id, session.user.id),
+-    columns: {
+-      stripe_customer_id: true,
+-      stripe_price_id: true,
+-    },
+-  })
+-
+-  let overageRate: number | null = null
+-  if (user?.stripe_customer_id && user?.stripe_price_id) {
+-    const subscriptions = await stripeServer.subscriptions.list({
+-      customer: user.stripe_customer_id,
+-      status: 'active',
+-      limit: 1,
+-    })
+-
+-    if (subscriptions.data[0]?.id) {
+-      const subscription = await stripeServer.subscriptions.retrieve(
+-        subscriptions.data[0].id,
+-        {
+-          expand: ['items.data.price.tiers'],
+-        }
+-      )
+-
+-      // Get the metered price item which contains our overage rate
+-      const meteredPrice = subscription.items.data.find(
+-        (item) => item.price.recurring?.usage_type === 'metered'
+-      )
+-
+-      if (meteredPrice?.price.tiers) {
+-        for (const tier of meteredPrice.price.tiers) {
+-          if (tier.up_to === null || q.creditsUsed <= tier.up_to) {
+-            if (tier.unit_amount_decimal) {
+-              overageRate = parseFloat(tier.unit_amount_decimal)
+-              break
+-            }
+-          }
+-        }
+-      }
+-    }
++    q = await quotaManager.checkQuota(session.user.id)
+   }
++  const { overageRate } = await quotaManager.getStripeSubscriptionQuota(
++    session.user.id
++  )
+ 
+   const usageData: UsageData = {
+     creditsUsed: q.creditsUsed,

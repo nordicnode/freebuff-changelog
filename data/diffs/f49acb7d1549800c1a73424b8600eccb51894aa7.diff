@@ -1,0 +1,513 @@
+diff --git a/backend/knowledge.md b/backend/knowledge.md
+index 873bcfb7f..05aabf066 100644
+--- a/backend/knowledge.md
++++ b/backend/knowledge.md
+@@ -27,6 +27,26 @@ Credits are managed through a combination of:
+ - Stripe for payment processing
+ - WebSocket actions for real-time updates
+ 
++### Transaction Isolation Levels
++
++Critical credit operations use SERIALIZABLE isolation with automatic retries:
++- Credit consumption must be serializable to prevent "double spending"
++- Monthly resets must be serializable to prevent duplicate grants
++- Both operations retry on serialization failures (error code 40001)
++- Helper: `withSerializableTransaction` in `common/src/db/transaction.ts`
++
++Other operations use default isolation (READ COMMITTED):
++- Grant operations (protected by unique operation IDs)
++- Revocations (idempotent balance zeroing)
++
++### Monthly Credit Resets
++
++Monthly credit resets are handled atomically:
++- Multiple processes might check reset dates simultaneously
++- SERIALIZABLE isolation prevents duplicate grants
++- One process will complete while others wait
++- After lock release, others will see updated reset date
++
+ ## Middleware System
+ 
+ The WebSocket middleware stack:
+diff --git a/backend/src/util/check-auth.ts b/backend/src/util/check-auth.ts
+index a8952c2a2..b1291bcca 100644
+--- a/backend/src/util/check-auth.ts
++++ b/backend/src/util/check-auth.ts
+@@ -5,6 +5,7 @@ import db from 'common/db'
+ import * as schema from 'common/db/schema'
+ import { ServerAction } from 'common/actions'
+ import { logger } from '@/util/logger'
++import { triggerMonthlyResetAndGrant } from 'common/src/billing/grant-credits'
+ 
+ // List of admin user emails
+ const ADMIN_USER_EMAILS = [
+@@ -61,6 +62,9 @@ export const checkAuth = async ({
+     }
+   }
+ 
++  // Check and trigger monthly reset if needed
++  await triggerMonthlyResetAndGrant(user.id)
++
+   return
+ }
+ 
+diff --git a/backend/src/websockets/websocket-action.ts b/backend/src/websockets/websocket-action.ts
+index 38a8d64a3..6a392ecf3 100644
+--- a/backend/src/websockets/websocket-action.ts
++++ b/backend/src/websockets/websocket-action.ts
+@@ -16,7 +16,11 @@ import { generateCompactId } from 'common/util/string'
+ import { renderToolResults } from '@/util/parse-tool-call-xml'
+ import { buildArray } from 'common/util/array'
+ import { toOptionalFile, UsageLimits, PLAN_CONFIGS } from 'common/constants'
+-import { getPlanFromPriceId, getMonthlyGrantForPlan } from 'common/src/billing/plans'
++import {
++  getPlanFromPriceId,
++  getMonthlyGrantForPlan,
++} from 'common/src/billing/plans'
++import { triggerMonthlyResetAndGrant } from 'common/src/billing/grant-credits'
+ 
+ /**
+  * Sends an action to the client via WebSocket
+@@ -91,7 +95,7 @@ export async function genUsageResponse(
+     }
+ 
+     try {
+-      // Now userId is guaranteed to be a string
++      // Get the usage data
+       const { balance: balanceDetails, usageThisCycle } =
+         await calculateUsageAndBalance(userId, new Date())
+       const currentPlan = getPlanFromPriceId(user.stripe_price_id)
+diff --git a/common/src/billing/balance-calculator.ts b/common/src/billing/balance-calculator.ts
+index c60ced591..7a1b39bc1 100644
+--- a/common/src/billing/balance-calculator.ts
++++ b/common/src/billing/balance-calculator.ts
+@@ -4,6 +4,7 @@ import { and, asc, gt, isNull, or, eq, sql } from 'drizzle-orm'
+ import { GrantType } from '../db/schema'
+ import { logger } from '../util/logger'
+ import { GRANT_PRIORITIES } from '../constants/grant-priorities'
++import { withSerializableTransaction } from '../db/transaction'
+ 
+ export interface CreditBalance {
+   totalRemaining: number
+@@ -232,7 +233,7 @@ export async function calculateUsageAndBalance(
+       { userId, totalDebt, totalPositiveBalance, settlementAmount },
+       'Performing in-memory settlement'
+     )
+-    
++
+     // After settlement:
+     totalPositiveBalance -= settlementAmount
+     totalDebt -= settlementAmount
+@@ -256,6 +257,9 @@ export async function calculateUsageAndBalance(
+  * Follows priority order strictly - higher priority grants (lower number) are consumed first.
+  * Returns details about credit consumption including how many came from purchased credits.
+  *
++ * Uses SERIALIZABLE isolation to prevent concurrent modifications that could lead to
++ * incorrect credit usage (e.g., "double spending" credits).
++ *
+  * @param userId The ID of the user
+  * @param creditsToConsume Number of credits being consumed
+  * @returns Promise resolving to number of credits consumed
+@@ -264,27 +268,30 @@ export async function consumeCredits(
+   userId: string,
+   creditsToConsume: number
+ ): Promise<CreditConsumptionResult> {
+-  return await db.transaction(async (tx) => {
+-    const now = new Date()
+-    const activeGrants = await getOrderedActiveGrants(userId, now, tx as DbConn)
+-
+-    if (activeGrants.length === 0) {
+-      logger.error(
+-        { userId, creditsToConsume },
+-        'No active grants found to consume credits from'
+-      )
+-      throw new Error('No active grants found')
+-    }
++  return await withSerializableTransaction(
++    async (tx) => {
++      const now = new Date()
++      const activeGrants = await getOrderedActiveGrants(userId, now, tx)
++
++      if (activeGrants.length === 0) {
++        logger.error(
++          { userId, creditsToConsume },
++          'No active grants found to consume credits from'
++        )
++        throw new Error('No active grants found')
++      }
+ 
+-    const result = await consumeFromOrderedGrants(
+-      userId,
+-      creditsToConsume,
+-      activeGrants,
+-      tx
+-    )
++      const result = await consumeFromOrderedGrants(
++        userId,
++        creditsToConsume,
++        activeGrants,
++        tx
++      )
+ 
+-    return result
+-  })
++      return result
++    },
++    { userId, creditsToConsume }
++  )
+ }
+ 
+ /**
+diff --git a/common/src/billing/grant-credits.ts b/common/src/billing/grant-credits.ts
+index 7a0ab805c..fcabbb3fb 100644
+--- a/common/src/billing/grant-credits.ts
++++ b/common/src/billing/grant-credits.ts
+@@ -9,6 +9,9 @@ import { generateCompactId } from '../util/string'
+ import { CREDITS_USAGE_LIMITS } from '../constants'
+ import { withRetry } from '../util/promise'
+ import { logSyncFailure } from '../util/sync-failure'
++import { getNextQuotaReset } from '../util/dates'
++import { getPlanFromPriceId, getMonthlyGrantForPlan } from './plans'
++import { withSerializableTransaction } from '../db/transaction'
+ 
+ type CreditGrantSelect = typeof schema.creditLedger.$inferSelect
+ 
+@@ -260,3 +263,85 @@ export async function revokeGrantByOperationId(
+     return true
+   })
+ }
++
++/**
++ * Checks if a user's quota needs to be reset, and if so:
++ * 1. Calculates their new monthly grant amount
++ * 2. Issues the grant with the appropriate expiry
++ * 3. Updates their next_quota_reset date
++ * All of this is done in a single transaction with SERIALIZABLE isolation
++ * to prevent concurrent resets from creating duplicate grants.
++ *
++ * @param userId The ID of the user
++ * @returns The effective quota reset date (either existing or new)
++ */
++export async function triggerMonthlyResetAndGrant(
++  userId: string
++): Promise<Date> {
++  return await withSerializableTransaction(async (tx) => {
++    const now = new Date()
++
++    // Get user's current reset date and plan
++    const user = await tx.query.user.findFirst({
++      where: eq(schema.user.id, userId),
++      columns: {
++        next_quota_reset: true,
++        stripe_price_id: true,
++      },
++    })
++
++    if (!user) {
++      throw new Error(`User ${userId} not found`)
++    }
++
++    const currentResetDate = user.next_quota_reset
++
++    // If reset date is in the future, no action needed
++    if (currentResetDate && currentResetDate > now) {
++      return currentResetDate
++    }
++
++    // Calculate new reset date
++    const newResetDate = getNextQuotaReset(currentResetDate)
++
++    // Calculate grant amount based on user's plan
++    const currentPlan = getPlanFromPriceId(
++      user.stripe_price_id,
++      process.env.STRIPE_PRO_PRICE_ID,
++      process.env.STRIPE_MOAR_PRO_PRICE_ID
++    )
++    const grantAmount = await getMonthlyGrantForPlan(currentPlan, userId)
++
++    // Generate a unique operation ID for this grant
++    const operationId = `free-${userId}-${generateCompactId()}`
++
++    // Update the user's next reset date first
++    await tx
++      .update(schema.user)
++      .set({ next_quota_reset: newResetDate })
++      .where(eq(schema.user.id, userId))
++
++    // Then issue the grant
++    await grantCreditOperation(
++      userId,
++      grantAmount,
++      'free',
++      'Monthly free credits',
++      newResetDate, // Grant expires at next reset
++      operationId
++    )
++
++    logger.info(
++      {
++        userId,
++        operationId,
++        grantAmount,
++        newResetDate,
++        previousResetDate: currentResetDate,
++      },
++      'Processed monthly credit grant and reset'
++    )
++
++    return newResetDate
++  }, { userId })
++}
+diff --git a/common/src/db/transaction.ts b/common/src/db/transaction.ts
+new file mode 100644
+index 000000000..dc2e13d3e
+--- /dev/null
++++ b/common/src/db/transaction.ts
+@@ -0,0 +1,47 @@
++import { logger } from '../util/logger'
++import { withRetry } from '../util/promise'
++import db from './index'
++
++type TransactionCallback<T> = Parameters<typeof db.transaction<T>>[0]
++
++/**
++ * Executes a database transaction with SERIALIZABLE isolation level and automatic
++ * retries on serialization failures.
++ * 
++ * @param callback The transaction callback
++ * @param context Additional context for logging (e.g., userId, operationId)
++ * @returns The result of the transaction
++ */
++export async function withSerializableTransaction<T>(
++  callback: TransactionCallback<T>,
++  context: Record<string, any> = {}
++): Promise<T> {
++  return withRetry(
++    async () => {
++      return await db.transaction(
++        callback,
++        { isolationLevel: 'serializable' }
++      )
++    },
++    {
++      maxRetries: 3,
++      retryIf: (error) => {
++        // Retry on serialization failures (PostgreSQL error code 40001)
++        if (error?.code === '40001') {
++          logger.warn(
++            { ...context, error },
++            'Serialization failure in transaction, retrying...'
++          )
++          return true
++        }
++        return false
++      },
++      onRetry: (error, attempt) => {
++        logger.warn(
++          { ...context, attempt, error },
++          `Transaction retry ${attempt}`
++        )
++      },
++    }
++  )
++}
+\ No newline at end of file
+diff --git a/npm-app/src/client.ts b/npm-app/src/client.ts
+index 1638cce88..5001b48e3 100644
+--- a/npm-app/src/client.ts
++++ b/npm-app/src/client.ts
+@@ -935,8 +935,16 @@ export class Client {
+       )
+ 
+       if (this.usageData.next_quota_reset) {
++        const resetDate = new Date(this.usageData.next_quota_reset);
++        const today = new Date();
++        const isToday = resetDate.toDateString() === today.toDateString();
++        
++        const dateDisplay = isToday 
++          ? resetDate.toLocaleString() // Show full date and time for today
++          : resetDate.toLocaleDateString(); // Just show date otherwise
++        
+         console.log(
+-          `Free credits will renew on ${this.usageData.next_quota_reset.toLocaleDateString()}. Details: ${underline(blue(usageLink))}`
++          `Free credits will renew on ${dateDisplay}. Details: ${underline(blue(usageLink))}`
+         )
+       }
+ 
+diff --git a/web/src/app/api/user/usage/route.ts b/web/src/app/api/user/usage/route.ts
+index 1e70cfcef..e579aea31 100644
+--- a/web/src/app/api/user/usage/route.ts
++++ b/web/src/app/api/user/usage/route.ts
+@@ -9,6 +9,7 @@ import {
+   getPlanFromPriceId,
+   getMonthlyGrantForPlan,
+ } from 'common/src/billing/plans'
++import { triggerMonthlyResetAndGrant } from 'common/src/billing/grant-credits'
+ import { env } from '@/env.mjs'
+ 
+ export async function GET() {
+@@ -21,11 +22,22 @@ export async function GET() {
+   const userId = session.user.id
+ 
+   try {
+-    // Fetch user's quota reset date and stripe price id
++    const now = new Date()
++
++    // Check if we need to reset quota and grant new credits
++    const effectiveQuotaResetDate = await triggerMonthlyResetAndGrant(userId)
++
++    // Use the canonical balance calculation function with the effective reset date
++    const { usageThisCycle, balance } = await calculateUsageAndBalance(
++      userId,
++      effectiveQuotaResetDate,
++      now
++    )
++
++    // Fetch user's current plan
+     const user = await db.query.user.findFirst({
+       where: eq(schema.user.id, userId),
+       columns: {
+-        next_quota_reset: true,
+         stripe_price_id: true,
+       },
+     })
+@@ -34,16 +46,6 @@ export async function GET() {
+       return NextResponse.json({ error: 'User not found' }, { status: 404 })
+     }
+ 
+-    const now = new Date()
+-    const quotaResetDate = user.next_quota_reset ?? new Date(0)
+-
+-    // Use the canonical balance calculation function
+-    const { usageThisCycle, balance } = await calculateUsageAndBalance(
+-      userId,
+-      quotaResetDate,
+-      now
+-    )
+-
+     // Calculate next monthly grant
+     const currentPlan = getPlanFromPriceId(
+       user.stripe_price_id,
+@@ -56,7 +58,7 @@ export async function GET() {
+     const usageData = {
+       usageThisCycle,
+       balance,
+-      nextQuotaReset: user.next_quota_reset,
++      nextQuotaReset: effectiveQuotaResetDate,
+       nextMonthlyGrant,
+     }
+ 
+diff --git a/web/src/components/auto-topup/AutoTopupSettingsForm.tsx b/web/src/components/auto-topup/AutoTopupSettingsForm.tsx
+index a80e4e28b..31815abdb 100644
+--- a/web/src/components/auto-topup/AutoTopupSettingsForm.tsx
++++ b/web/src/components/auto-topup/AutoTopupSettingsForm.tsx
+@@ -11,6 +11,7 @@ import { AUTO_TOPUP_CONSTANTS } from './constants'
+ import { AutoTopupSettingsFormProps } from './types'
+ import { useState, useEffect } from 'react'
+ import { cn } from '@/lib/utils'
++import { dollarsToCredits, creditsToDollars } from '@/lib/currency'
+ 
+ const {
+   MIN_THRESHOLD_CREDITS,
+@@ -20,15 +21,9 @@ const {
+   CENTS_PER_CREDIT,
+ } = AUTO_TOPUP_CONSTANTS
+ 
+-// Convert dollars to credits and vice versa
+-const dollarsToCredits = (dollars: number) =>
+-  Math.round((dollars * 100) / CENTS_PER_CREDIT)
+-const creditsToDollars = (credits: number) =>
+-  ((credits * CENTS_PER_CREDIT) / 100).toFixed(2)
+-
+ // Define min/max credits based on dollar limits
+-const MIN_TOPUP_CREDITS = dollarsToCredits(MIN_TOPUP_DOLLARS)
+-const MAX_TOPUP_CREDITS = dollarsToCredits(MAX_TOPUP_DOLLARS)
++const MIN_TOPUP_CREDITS = dollarsToCredits(MIN_TOPUP_DOLLARS, CENTS_PER_CREDIT)
++const MAX_TOPUP_CREDITS = dollarsToCredits(MAX_TOPUP_DOLLARS, CENTS_PER_CREDIT)
+ 
+ export function AutoTopupSettingsForm({
+   isEnabled,
+@@ -42,7 +37,7 @@ export function AutoTopupSettingsForm({
+   const [topUpCreditsError, setTopUpCreditsError] = useState<string>('')
+ 
+   // Convert dollar amount to credits for display
+-  const topUpAmountCredits = dollarsToCredits(topUpAmountDollars)
++  const topUpAmountCredits = dollarsToCredits(topUpAmountDollars, CENTS_PER_CREDIT)
+ 
+   // Check threshold limits
+   useEffect(() => {
+@@ -152,7 +147,7 @@ export function AutoTopupSettingsForm({
+               </p>
+             ) : (
+               <p className="text-xs text-muted-foreground mt-1 pl-1">
+-                ${creditsToDollars(topUpAmountCredits)}
++                ${creditsToDollars(topUpAmountCredits, CENTS_PER_CREDIT)}
+               </p>
+             )}
+           </div>
+diff --git a/web/src/components/credits/CreditPurchaseSection.tsx b/web/src/components/credits/CreditPurchaseSection.tsx
+index a8def0e2d..d0b53f6c3 100644
+--- a/web/src/components/credits/CreditPurchaseSection.tsx
++++ b/web/src/components/credits/CreditPurchaseSection.tsx
+@@ -7,6 +7,7 @@ import { cn } from '@/lib/utils'
+ import { useState } from 'react'
+ import { convertCreditsToUsdCents } from 'common/src/billing/credit-conversion'
+ import { toast } from '@/components/ui/use-toast'
++import { formatDollars } from '@/lib/currency'
+ 
+ export const CREDIT_OPTIONS = [1000, 2500, 5000, 10000] as const
+ export const CENTS_PER_CREDIT = 1
+@@ -88,7 +89,8 @@ export function CreditPurchaseSection({
+   const costInCents = effectiveCredits
+     ? convertCreditsToUsdCents(effectiveCredits, CENTS_PER_CREDIT)
+     : 0
+-  const costInDollars = (costInCents / 100).toFixed(2)
++  
++  const costInDollars = formatDollars(costInCents)
+ 
+   return (
+     <div className="space-y-6">
+@@ -98,7 +100,7 @@ export function CreditPurchaseSection({
+             credits,
+             CENTS_PER_CREDIT
+           )
+-          const optionCostInDollars = (optionCostInCents / 100).toFixed(2)
++          const optionCostInDollars = formatDollars(optionCostInCents)
+ 
+           return (
+             <Button
+diff --git a/web/src/lib/currency.ts b/web/src/lib/currency.ts
+new file mode 100644
+index 000000000..30f88ac88
+--- /dev/null
++++ b/web/src/lib/currency.ts
+@@ -0,0 +1,28 @@
++/**
++ * Format a cents amount to dollars, showing cents only when non-zero
++ * @param cents Amount in cents
++ * @returns Formatted dollar amount as string (e.g. "10" or "10.50")
++ */
++export const formatDollars = (cents: number) => {
++  return cents % 100 === 0 
++    ? Math.floor(cents / 100).toString()
++    : (cents / 100).toFixed(2)
++}
++
++/**
++ * Convert dollars to credits based on cents per credit
++ * @param dollars Amount in dollars
++ * @param centsPerCredit Cost in cents per credit
++ */
++export const dollarsToCredits = (dollars: number, centsPerCredit: number) =>
++  Math.round((dollars * 100) / centsPerCredit)
++
++/**
++ * Convert credits to dollars based on cents per credit
++ * @param credits Amount in credits
++ * @param centsPerCredit Cost in cents per credit
++ */
++export const creditsToDollars = (credits: number, centsPerCredit: number) => {
++  const dollars = (credits * centsPerCredit) / 100
++  return dollars % 1 === 0 ? Math.floor(dollars).toString() : dollars.toFixed(2)
++}
+\ No newline at end of file

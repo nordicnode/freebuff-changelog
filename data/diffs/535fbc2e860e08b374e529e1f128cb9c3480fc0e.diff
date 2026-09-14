@@ -1,0 +1,896 @@
+diff --git a/backend/src/billing/billing.knowledge.md b/backend/src/billing/billing.knowledge.md
+index 6ee69147b..bfb9de883 100644
+--- a/backend/src/billing/billing.knowledge.md
++++ b/backend/src/billing/billing.knowledge.md
+@@ -31,6 +31,13 @@ Key fields in the `user` table:
+ 
+ ### QuotaManager
+ 
++#### Data Flow Principles
++
++- Propagate data through existing query chains instead of making new DB queries
++- When checking quota status, include all relevant user state (subscription status, etc.)
++- Pass complete state through websocket messages to avoid redundant DB calls
++- Example: subscription status flows from quota check → usage response → client display
++
+ Two implementations:
+ 
+ 1. `AnonymousQuotaManager`: For unauthenticated users.
+@@ -39,9 +46,29 @@ Two implementations:
+ Key methods:
+ 
+ - `updateQuota`: Updates user's quota after usage.
+-- `checkQuota`: Verifies if a user has exceeded their quota.
++- `checkQuota`: Verifies if a user has exceeded their quota. Important: Active subscriptions always bypass quota exceeded checks.
+ - `resetQuota`: Resets quota at the end of a billing cycle.
+ 
++### Subscription Status
++
++- Active subscriptions completely bypass quota exceeded checks
++- Non-subscribed users are blocked when exceeding their quota
++- Quota tracking continues even when checks are bypassed for billing purposes
++- Subscription and quota status must flow from backend to client via websocket messages:
++  - Backend determines subscription status and quota state
++  - Communicates via 'usage-response' message type
++  - Client displays appropriate messages based on backend response
++  - Never implement quota/subscription logic directly in client
++- Display different messages for subscribed vs non-subscribed users:
++  - Subscribed: Show usage exceeded but allow continued use
++  - Non-subscribed: Show usage exceeded and block further use
++
++### Subscription Status
++
++- Active subscriptions completely bypass quota exceeded checks
++- Non-subscribed users are blocked when exceeding their quota
++- Quota tracking continues even when checks are bypassed for billing purposes
++
+ ### Usage Limits
+ 
+ Defined in `common/src/constants.ts`:
+@@ -92,6 +119,16 @@ WebSocket actions (`backend/src/websockets/websocket-action.ts`) manage:
+ 3. Update quotas after successful operations that consume credits.
+ 4. Ensure proper error handling for quota exceeded scenarios.
+ 5. Regularly review and adjust pricing and quota limits based on usage patterns.
++6. Combine related database queries into single operations:
++   - Methods should return all necessary data in one query
++   - Avoid separate queries for related data (e.g., subscription status with quota info)
++   - Example: checkQuota returns quota and subscription status together
++6. Test all billing code paths thoroughly:
++   - Test both anonymous and authenticated users
++   - Verify subscription status handling
++   - Test quota exceeded scenarios
++   - Test edge cases like subscription transitions
++   - Add integration tests for full quota check flow
+ 
+ ## Future Considerations
+ 
+diff --git a/backend/src/websockets/websocket-action.ts b/backend/src/websockets/websocket-action.ts
+index 504f486c0..bc0cf56d2 100644
+--- a/backend/src/websockets/websocket-action.ts
++++ b/backend/src/websockets/websocket-action.ts
+@@ -52,8 +52,9 @@ async function calculateUsage(fingerprintId: string, userId?: string) {
+     userId ? 'authenticated' : 'anonymous',
+     userId ?? fingerprintId
+   )
+-  const { creditsUsed, quota } = await quotaManager.updateQuota()
+-  return { usage: creditsUsed, limit: quota }
++  const { creditsUsed, quota, subscription_active } =
++    await quotaManager.updateQuota()
++  return { usage: creditsUsed, limit: quota, subscription_active }
+ }
+ 
+ export async function genUsageResponse(
+@@ -63,7 +64,10 @@ export async function genUsageResponse(
+   const params = await withLoggerContext(
+     { fingerprintId, userId },
+     async () => {
+-      const { usage, limit } = await calculateUsage(fingerprintId, userId)
++      const { usage, limit, subscription_active } = await calculateUsage(
++        fingerprintId,
++        userId
++      )
+       logger.info('Sending usage info')
+ 
+       let referralLink: string | undefined = undefined
+@@ -87,6 +91,7 @@ export async function genUsageResponse(
+         usage,
+         limit,
+         referralLink,
++        subscription_active,
+       }
+     }
+   )
+@@ -149,10 +154,8 @@ const onUserInput = async (
+             changes,
+           })
+         } else {
+-          const { usage, limit, referralLink } = await genUsageResponse(
+-            fingerprintId,
+-            userId
+-          )
++          const { usage, limit, referralLink, subscription_active } =
++            await genUsageResponse(fingerprintId, userId)
+           sendAction(ws, {
+             type: 'response-complete',
+             userInputId,
+@@ -160,6 +163,7 @@ const onUserInput = async (
+             changes,
+             usage,
+             limit,
++            subscription_active,
+             referralLink,
+           })
+         }
+diff --git a/common/src/actions.ts b/common/src/actions.ts
+index 411536481..9ff9f7ef0 100644
+--- a/common/src/actions.ts
++++ b/common/src/actions.ts
+@@ -128,6 +128,7 @@ export const SERVER_ACTION_SCHEMA = z.discriminatedUnion('type', [
+     changes: CHANGES,
+     usage: z.number().optional(),
+     limit: z.number().optional(),
++    subscription_active: z.boolean().optional(),
+     referralLink: z.string().optional(),
+   }),
+   z.object({
+@@ -170,6 +171,7 @@ export const SERVER_ACTION_SCHEMA = z.discriminatedUnion('type', [
+     usage: z.number(),
+     limit: z.number(),
+     referralLink: z.string().optional(),
++    subscription_active: z.boolean(),
+   }),
+   z.object({
+     type: z.literal('action-error'),
+diff --git a/common/src/billing/quota-manager.ts b/common/src/billing/quota-manager.ts
+index 3c9be7177..93047b168 100644
+--- a/common/src/billing/quota-manager.ts
++++ b/common/src/billing/quota-manager.ts
+@@ -9,20 +9,19 @@ export interface IQuotaManager {
+   updateQuota(id: string): Promise<{
+     creditsUsed: number
+     quota: number
++    subscription_active: boolean
+   }>
+   checkQuota(id: string): Promise<{
+     creditsUsed: number
+     quota: number
+-    endDate: Date | SQL<Date>
++    endDate: Date
++    subscription_active: boolean
+   }>
+   resetQuota(id: string): Promise<void>
+ }
+ 
+ export class AnonymousQuotaManager implements IQuotaManager {
+-  async updateQuota(fingerprintId: string): Promise<{
+-    creditsUsed: number
+-    quota: number
+-  }> {
++  async updateQuota(fingerprintId: string) {
+     const { creditsUsed, quota, endDate } = await this.checkQuota(fingerprintId)
+ 
+     if (creditsUsed >= quota) {
+@@ -31,6 +30,7 @@ export class AnonymousQuotaManager implements IQuotaManager {
+     return {
+       creditsUsed,
+       quota,
++      subscription_active: false,
+     }
+   }
+ 
+@@ -38,10 +38,11 @@ export class AnonymousQuotaManager implements IQuotaManager {
+     creditsUsed: number
+     quota: number
+     endDate: Date
++    subscription_active: boolean
+   }> {
+     const quota = CREDITS_USAGE_LIMITS.ANON
+-    const startDate: SQL<Date> = sql<Date>`COALESCE(${schema.fingerprint.next_quota_reset}, now()) - INTERVAL '1 month'`
+-    const endDate: SQL<Date> = sql<Date>`COALESCE(${schema.fingerprint.next_quota_reset}, now())`
++    const startDate: SQL<string> = sql<string>`COALESCE(${schema.fingerprint.next_quota_reset}, now()) - INTERVAL '1 month'`
++    const endDate: SQL<string> = sql<string>`COALESCE(${schema.fingerprint.next_quota_reset}, now())`
+ 
+     const result = await db
+       .select({
+@@ -63,14 +64,15 @@ export class AnonymousQuotaManager implements IQuotaManager {
+         return {
+           creditsUsed: 0,
+           quota,
+-          endDate: new Date(),
++          endDate: new Date().toDateString(),
+         }
+       })
+ 
+     return {
+       creditsUsed: result.creditsUsed,
+       quota,
+-      endDate: result.endDate,
++      endDate: new Date(result.endDate),
++      subscription_active: false,
+     }
+   }
+ 
+@@ -109,34 +111,30 @@ export class AnonymousQuotaManager implements IQuotaManager {
+ }
+ 
+ export class AuthenticatedQuotaManager implements IQuotaManager {
+-  async updateQuota(userId: string): Promise<{
+-    creditsUsed: number
+-    quota: number
+-  }> {
+-    const { creditsUsed, quota, endDate } = await this.checkQuota(userId)
++  async updateQuota(userId: string) {
++    const { creditsUsed, quota, subscription_active } =
++      await this.checkQuota(userId)
+ 
+-    if (creditsUsed >= quota) {
++    if (creditsUsed >= quota && !subscription_active) {
+       await this.setQuotaExceeded(userId)
+     }
+     return {
+       creditsUsed,
+       quota,
++      subscription_active,
+     }
+   }
+ 
+-  async checkQuota(userId: string): Promise<{
+-    creditsUsed: number
+-    quota: number
+-    endDate: Date
+-  }> {
+-    const startDate: SQL<Date> = sql<Date>`COALESCE(${schema.user.next_quota_reset}, now()) - INTERVAL '1 month'`
+-    const endDate: SQL<Date> = sql<Date>`COALESCE(${schema.user.next_quota_reset}, now())`
++  async checkQuota(userId: string) {
++    const startDate: SQL<string> = sql<string>`COALESCE(${schema.user.next_quota_reset}, now()) - INTERVAL '1 month'`
++    const endDate: SQL<string> = sql<string>`COALESCE(${schema.user.next_quota_reset}, now())`
+ 
+     const result = await db
+       .select({
+         quota: schema.user.quota,
+         stripe_customer_id: schema.user.stripe_customer_id,
+         stripe_price_id: schema.user.stripe_price_id,
++        subscription_active: schema.user.subscription_active,
+         endDate,
+         creditsUsed: sql<string>`SUM(COALESCE(${schema.message.credits}, 0))`,
+       })
+@@ -153,7 +151,8 @@ export class AuthenticatedQuotaManager implements IQuotaManager {
+         schema.user.quota,
+         schema.user.stripe_customer_id,
+         schema.user.stripe_price_id,
+-        schema.user.next_quota_reset
++        schema.user.next_quota_reset,
++        schema.user.subscription_active
+       )
+       .then((rows) => {
+         if (rows.length > 0) return rows[0]
+@@ -162,7 +161,8 @@ export class AuthenticatedQuotaManager implements IQuotaManager {
+           stripe_customer_id: null,
+           stripe_price_id: null,
+           creditsUsed: '0',
+-          endDate: new Date(),
++          endDate: new Date().toDateString(),
++          subscription_active: false,
+         }
+       })
+ 
+@@ -174,7 +174,8 @@ export class AuthenticatedQuotaManager implements IQuotaManager {
+     return {
+       creditsUsed: parseInt(result.creditsUsed),
+       quota,
+-      endDate: result.endDate,
++      endDate: new Date(result.endDate),
++      subscription_active: !!result.subscription_active,
+     }
+   }
+ 
+diff --git a/common/src/constants.ts b/common/src/constants.ts
+index 7d8f7d26b..c0fa0c616 100644
+--- a/common/src/constants.ts
++++ b/common/src/constants.ts
+@@ -52,12 +52,12 @@ export const CREDITS_USAGE_LIMITS: Record<UsageLimits, number> =
+     ? {
+         ANON: 1_000_000,
+         FREE: 2_500_000,
+-        PAID: 50_000_000,
++        PAID: 10_000_000,
+       }
+     : {
+         ANON: 1_000,
+         FREE: 2_500,
+-        PAID: 50_000,
++        PAID: 10_000,
+       }
+ export const CREDITS_REFERRAL_BONUS = 500
+ 
+diff --git a/common/src/types/usage.ts b/common/src/types/usage.ts
+index e775e279e..7d6f5ebd1 100644
+--- a/common/src/types/usage.ts
++++ b/common/src/types/usage.ts
+@@ -5,6 +5,7 @@ export const usageDataSchema = z.object({
+   totalQuota: z.number(),
+   remainingCredits: z.number(),
+   billingCycleEnd: z.coerce.date(),
++  subscriptionActive: z.boolean(),
+ })
+ 
+ export type UsageData = z.infer<typeof usageDataSchema>
+diff --git a/npm-app/src/cli.ts b/npm-app/src/cli.ts
+index 5ff392fd6..53ba3d630 100644
+--- a/npm-app/src/cli.ts
++++ b/npm-app/src/cli.ts
+@@ -419,7 +419,7 @@ export class CLI {
+     }
+     if (created.length > 0 || modified.length > 0) {
+       console.log('\nComplete! Type "diff" to see the changes made.')
+-      this.client.showUsageWarning(this.client.usage, this.client.limit)
++      this.client.showUsageWarning()
+     }
+     console.log()
+ 
+diff --git a/npm-app/src/client.ts b/npm-app/src/client.ts
+index 764d0996b..5906e3639 100644
+--- a/npm-app/src/client.ts
++++ b/npm-app/src/client.ts
+@@ -34,6 +34,7 @@ export class Client {
+   public lastWarnedPct: number = 0
+   public usage: number = 0
+   public limit: number = 0
++  public subscription_active: boolean = false
+ 
+   constructor(
+     websocketUrl: string,
+@@ -276,14 +277,17 @@ export class Client {
+     })
+ 
+     this.webSocket.subscribe('usage-response', (action) => {
+-      const { usage, limit, referralLink } = action
++      const { usage, limit, subscription_active, referralLink } = action
+       console.log(`Usage: ${usage} / ${limit} credits`)
+-      this.showUsageWarning(usage, limit, referralLink)
++      this.usage = usage
++      this.limit = limit
++      this.subscription_active = subscription_active
++      this.showUsageWarning(referralLink)
+       this.returnControlToUser()
+     })
+   }
+ 
+-  public showUsageWarning(usage: number, limit: number, referralLink?: string) {
++  public showUsageWarning(referralLink?: string) {
+     const errorCopy = [
+       this.user
+         ? green(`Visit ${process.env.NEXT_PUBLIC_APP_URL}/pricing to upgrade.`)
+@@ -295,14 +299,24 @@ export class Client {
+         : '',
+     ].join('\n')
+ 
+-    const pct: number = match(Math.floor((usage / limit) * 100))
++    const pct: number = match(Math.floor((this.usage / this.limit) * 100))
+       .with(P.number.gte(100), () => 100)
+       .with(P.number.gte(75), () => 75)
+       .with(P.number.gte(50), () => 50)
+       .with(P.number.gte(25), () => 25)
+       .otherwise(() => 0)
+ 
+-    if (pct >= 100) {
++    // User has used all their allotted credits, but they haven't been notified yet
++    if (pct >= 100 && this.lastWarnedPct < 100) {
++      if (this.subscription_active) {
++        console.warn(
++          yellow(
++            `You have exceeded your monthly quota, but feel free to keep using Manicode! We'll charge you a discounted rate ($0.90/100) credits until your next billing cycle. See ${process.env.NEXT_PUBLIC_APP_URL}/usage for more details.`
++          )
++        )
++        this.lastWarnedPct = 100
++        return
++      }
+       console.error(
+         [red('You have reached your monthly usage limit.'), errorCopy].join(
+           '\n'
+@@ -318,7 +332,7 @@ export class Client {
+         [
+           '',
+           yellow(
+-            `You have used over ${pct}% of your monthly usage limit (${usage}/${limit} credits).`
++            `You have used over ${pct}% of your monthly usage limit (${this.usage}/${this.limit} credits).`
+           ),
+           errorCopy,
+         ].join('\n')
+@@ -437,8 +451,9 @@ export class Client {
+       resolveResponse({ ...a, wasStoppedByUser: false })
+       this.currentUserInputId = undefined
+ 
+-      if (!a.usage || !a.limit) return
++      if (!a.usage || !a.limit || a.subscription_active === undefined) return
+ 
++      this.subscription_active = a.subscription_active
+       this.usage = a.usage
+       if (this.limit !== a.limit) {
+         // Indicates a change in the user's plan
+@@ -446,7 +461,7 @@ export class Client {
+         this.limit = a.limit
+       }
+ 
+-      this.showUsageWarning(a.usage, a.limit, a.referralLink)
++      this.showUsageWarning(a.referralLink)
+     })
+ 
+     return {
+diff --git a/test/__src__/quota-manager.test.ts b/test/__src__/quota-manager.test.ts
+index 41d8a456c..337ff29f6 100644
+--- a/test/__src__/quota-manager.test.ts
++++ b/test/__src__/quota-manager.test.ts
+@@ -2,38 +2,122 @@ import { beforeAll, describe, expect, it, mock } from 'bun:test'
+ import {
+   AnonymousQuotaManager,
+   AuthenticatedQuotaManager,
+-} from '../../backend/src/billing/quota-manager'
++} from '../../common/src/billing/quota-manager'
+ import { CREDITS_USAGE_LIMITS } from '../../common/src/constants'
+ import { SQL } from 'drizzle-orm'
+ 
+ // Mock the database
++const mockDb = {
++  select: () => ({
++    from: () => ({
++      leftJoin: () => ({
++        where: () => ({
++          groupBy: () => ({
++            then: (callback: any) =>
++              callback([
++                {
++                  creditsUsed: 500,
++                  subscription_active: false,
++                  quota: CREDITS_USAGE_LIMITS.FREE,
++                  endDate: new Date(),
++                },
++              ]),
++          }),
++        }),
++      }),
++      where: () => ({
++        groupBy: () => ({
++          then: (callback: any) =>
++            callback([
++              {
++                creditsUsed: 500,
++                subscription_active: false,
++                quota: CREDITS_USAGE_LIMITS.FREE,
++                endDate: new Date(),
++              },
++            ]),
++        }),
++      }),
++    }),
++  }),
++  update: () => ({
++    set: () => ({
++      where: () => Promise.resolve(),
++    }),
++  }),
++  insert: () => createChainableMock(undefined),
++}
++
++// Helper to create chainable mock
++const createChainableMock = (returnValue: any) => {
++  const chainable = {
++    from: () => chainable,
++    leftJoin: () => chainable,
++    where: () => chainable,
++    groupBy: () => chainable,
++    then: (cb: any) => cb([returnValue]),
++    select: () => chainable,
++    update: () => chainable,
++    set: () => chainable,
++    values: () => chainable,
++    insert: () => chainable,
++    execute: () => Promise.resolve(),
++  }
++  return chainable
++}
++
++mock.module('../../common/src/db', () => ({
++  default: mockDb,
++}))
++
+ mock.module('../../common/src/db', () => ({
+-  default: {
+-    select: mock(() => ({
+-      from: mock(() => ({
+-        leftJoin: mock(() => ({
+-          where: mock(() => ({
+-            then: mock((callback) => callback([{ credits: 500 }])),
+-            groupBy: mock(() => ({
+-              limit: mock(() => ({
+-                then: mock((callback) => callback([{ credits: 500 }])),
++  default: mockDb,
++}))
++
++describe('QuotaManager', () => {
++  describe('Client Display Messages', () => {
++    it('should show correct message for subscribed users over quota', async () => {
++      const quotaManager = new AuthenticatedQuotaManager()
++      const result = await quotaManager.updateQuota('test-user-id')
++
++      // Verify the response has all fields needed for client display
++      expect(result).toHaveProperty('subscription_active')
++      expect(result).toHaveProperty('creditsUsed')
++      expect(result).toHaveProperty('quota')
++    })
++  })
++  describe('Usage Response Flow', () => {
++    it('should flow subscription status through calculateUsage', async () => {
++      // Mock authenticated user with subscription
++      mock.module('../../common/src/db', () => ({
++        default: {
++          select: mock(() => ({
++            from: mock(() => ({
++              leftJoin: mock(() => ({
++                where: mock(() => ({
++                  then: mock((callback) =>
++                    callback([
++                      {
++                        credits: 500,
++                        subscription_active: true,
++                      },
++                    ])
++                  ),
++                })),
+               })),
+             })),
+           })),
+-        })),
+-      })),
+-    })),
+-    update: mock(() => ({
+-      set: mock(() => ({
+-        where: mock(() => ({
+-          execute: mock(),
+-        })),
+-      })),
+-    })),
+-  },
+-}))
++        },
++      }))
+ 
+-describe('QuotaManager', () => {
++      const quotaManager = new AuthenticatedQuotaManager()
++      const result = await quotaManager.updateQuota('test-user-id')
++
++      expect(result.subscription_active).toBe(true)
++      expect(result.creditsUsed).toBe(500)
++      expect(result.quota).toBe(CREDITS_USAGE_LIMITS.FREE)
++    })
++  })
+   let anonymousManager: AnonymousQuotaManager
+   let authenticatedManager: AuthenticatedQuotaManager
+ 
+@@ -56,6 +140,32 @@ describe('QuotaManager', () => {
+ 
+       expect(result.creditsUsed).toBe(500)
+       expect(result.quota).toBe(CREDITS_USAGE_LIMITS.ANON)
++      expect(result.subscription_active).toBe(false)
++    })
++
++    it('should always return subscription_active as false', async () => {
++      // Even with high usage
++      mock.module('../../common/src/db', () => ({
++        default: {
++          select: mock(() => ({
++            from: mock(() => ({
++              leftJoin: mock(() => ({
++                where: mock(() => ({
++                  then: mock((callback) => callback([{ credits: 15000 }])),
++                  groupBy: mock(() => ({
++                    limit: mock(() => ({
++                      then: mock((callback) => callback([{ credits: 15000 }])),
++                    })),
++                  })),
++                })),
++              })),
++            })),
++          })),
++        },
++      }))
++
++      const result = await anonymousManager.updateQuota('test-fingerprint')
++      expect(result.subscription_active).toBe(false)
+     })
+ 
+     it('should reset quota for anonymous user', async () => {
+@@ -78,6 +188,42 @@ describe('QuotaManager', () => {
+ 
+       expect(result.creditsUsed).toBe(500)
+       expect(result.quota).toBe(CREDITS_USAGE_LIMITS.FREE)
++      expect(result.subscription_active).toBe(false)
++    })
++
++    it('should allow subscribed users to exceed quota', async () => {
++      // Mock the DB to return a subscribed user
++      mock.module('../../common/src/db', () => ({
++        default: {
++          select: mock(() => ({
++            from: mock(() => ({
++              leftJoin: mock(() => ({
++                where: mock(() => ({
++                  then: mock((callback) => callback([{ credits: 15000 }])),
++                  groupBy: mock(() => ({
++                    limit: mock(() => ({
++                      then: mock((callback) => callback([{ credits: 15000 }])),
++                    })),
++                  })),
++                })),
++              })),
++            })),
++          })),
++          update: mock(() => ({
++            set: mock(() => ({
++              where: mock(() => ({
++                execute: mock(),
++              })),
++            })),
++          })),
++        },
++      }))
++
++      const result = await authenticatedManager.updateQuota('test-user-id')
++
++      expect(result.creditsUsed).toBe(15000)
++      expect(result.quota).toBe(CREDITS_USAGE_LIMITS.FREE)
++      expect(result.subscription_active).toBe(true)
+     })
+ 
+     it('should reset quota for authenticated user', async () => {
+diff --git a/web/src/app/api/stripe/checkout-session/route.ts b/web/src/app/api/stripe/checkout-session/route.ts
+index e69d88137..e3204b801 100644
+--- a/web/src/app/api/stripe/checkout-session/route.ts
++++ b/web/src/app/api/stripe/checkout-session/route.ts
+@@ -29,7 +29,7 @@ export const GET = async () => {
+         quantity: 1,
+       },
+     ],
+-    success_url: `${env.NEXT_PUBLIC_APP_URL}?session_id={CHECKOUT_SESSION_ID}`,
++    success_url: `${env.NEXT_PUBLIC_APP_URL}/pricing?session_id={CHECKOUT_SESSION_ID}`,
+     cancel_url: env.NEXT_PUBLIC_APP_URL,
+   })
+ 
+diff --git a/web/src/app/api/stripe/webhook/route.ts b/web/src/app/api/stripe/webhook/route.ts
+index c8decd70e..52e977f1c 100644
+--- a/web/src/app/api/stripe/webhook/route.ts
++++ b/web/src/app/api/stripe/webhook/route.ts
+@@ -56,10 +56,10 @@ const webhookHandler = async (req: NextRequest): Promise<NextResponse> => {
+         // We should use this webhook to send general onboarding material, welcome emails, etc.
+         break
+       case 'customer.subscription.created':
+-      case 'customer.subscription.updated':
+         await handleSubscriptionChange(event.data.object, 'PAID')
+         break
+       case 'customer.subscription.deleted':
++        // Only downgrade to FREE tier when subscription period has ended
+         await handleSubscriptionChange(event.data.object, 'FREE')
+         break
+       case 'invoice.paid':
+diff --git a/web/src/app/api/usage/route.ts b/web/src/app/api/usage/route.ts
+deleted file mode 100644
+index b68933a12..000000000
+--- a/web/src/app/api/usage/route.ts
++++ /dev/null
+@@ -1,35 +0,0 @@
+-import { NextResponse } from 'next/server'
+-import { getServerSession } from 'next-auth'
+-import { authOptions } from '../auth/[...nextauth]/auth-options'
+-import { getQuotaManager } from 'common/src/billing/quota-manager'
+-import { UsageData } from 'common/src/types/usage'
+-
+-export async function GET() {
+-  const session = await getServerSession(authOptions)
+-
+-  if (!session || !session.user || !session.user.id) {
+-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+-  }
+-
+-  const userId = session.user.id
+-  const quotaManager = getQuotaManager('authenticated', userId)
+-
+-  try {
+-    const { creditsUsed, quota, endDate } = await quotaManager.checkQuota()
+-
+-    const usageData: UsageData = {
+-      creditsUsed,
+-      totalQuota: quota,
+-      remainingCredits: Math.max(0, quota - creditsUsed),
+-      billingCycleEnd: endDate,
+-    }
+-
+-    return NextResponse.json(usageData)
+-  } catch (error) {
+-    console.error('Error fetching usage data:', error)
+-    return NextResponse.json(
+-      { error: 'Internal Server Error' },
+-      { status: 500 }
+-    )
+-  }
+-}
+diff --git a/web/src/app/pricing/page.tsx b/web/src/app/pricing/page.tsx
+index ba2dedcae..7b8129d29 100644
+--- a/web/src/app/pricing/page.tsx
++++ b/web/src/app/pricing/page.tsx
+@@ -70,7 +70,7 @@ const PricingPage = () => {
+     {
+       name: 'Pro',
+       price: '$99/month',
+-      credits: 10_000,
++      credits: CREDITS_USAGE_LIMITS.PAID,
+       features: [
+         '$0.90 per 100 credits afterwards',
+         'Priority support over email or Discord',
+diff --git a/web/src/app/usage/page.tsx b/web/src/app/usage/page.tsx
+index 7db66c13a..05d9a041e 100644
+--- a/web/src/app/usage/page.tsx
++++ b/web/src/app/usage/page.tsx
+@@ -1,24 +1,35 @@
+-'use client'
+-
+-import { useQuery } from '@tanstack/react-query'
++import { getServerSession } from 'next-auth'
++import { authOptions } from '../api/auth/[...nextauth]/auth-options'
+ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+-import { Skeleton } from '@/components/ui/skeleton'
+-import { UsageData, usageDataSchema } from 'common/src/types/usage'
+-import { match, P } from 'ts-pattern'
++import { SignInCardFooter } from '@/components/sign-in/sign-in-card-footer'
++import { getQuotaManager } from 'common/src/billing/quota-manager'
++
++const UsagePage = async () => {
++  const session = await getServerSession(authOptions)
++
++  if (!session?.user) {
++    return (
++      <Card>
++        <CardHeader>
++          <CardTitle>Sign in to view usage</CardTitle>
++        </CardHeader>
++        <CardContent>
++          <p>Please sign in to view your usage statistics.</p>
++        </CardContent>
++        <SignInCardFooter />
++      </Card>
++    )
++  }
+ 
+-const UsagePage = () => {
+-  const queryResult = useQuery<UsageData>({
+-    queryKey: ['usage'],
+-    queryFn: async () => {
+-      const response = await fetch('/api/usage')
+-      if (!response.ok) {
+-        throw new Error('Failed to fetch usage data')
+-      }
++  const quotaManager = getQuotaManager('authenticated', session.user.id)
++  const {
++    creditsUsed,
++    quota: totalQuota,
++    endDate,
++    subscription_active: subscriptionActive,
++  } = await quotaManager.checkQuota()
+ 
+-      const responseData = await response.json()
+-      return usageDataSchema.parse(responseData)
+-    },
+-  })
++  const remainingCredits = Math.max(0, totalQuota - creditsUsed)
+ 
+   return (
+     <Card className="w-full max-w-2xl mx-auto mt-8">
+@@ -26,68 +37,47 @@ const UsagePage = () => {
+         <CardTitle>Usage</CardTitle>
+       </CardHeader>
+       <CardContent>
+-        {match(queryResult)
+-          .with(
+-            {
+-              error: P.nonNullable,
+-            },
+-            ({ error }) => {
+-              return <div>An error occurred: {error.message}</div>
+-            }
+-          )
+-          .with(
+-            {
+-              isLoading: true,
+-              data: P.nullish,
+-            },
+-            () => (
+-              <div className="space-y-4">
+-                <Skeleton className="h-4 w-full" />
+-                <Skeleton className="h-4 w-5/6" />
+-                <Skeleton className="h-4 w-4/6" />
+-              </div>
+-            )
+-          )
+-          .with(
+-            {
+-              data: P.nonNullable,
+-              error: P.nullish,
+-            },
+-            ({
+-              data: {
+-                creditsUsed,
+-                totalQuota,
+-                remainingCredits,
+-                billingCycleEnd,
+-              },
+-            }) => {
+-              return (
+-                <div className="space-y-4">
+-                  <div className="flex justify-between items-center">
+-                    <span className="font-semibold">Remaining credits:</span>
+-                    <span>
+-                      <b>{remainingCredits.toLocaleString('en-US')}</b>
+-                    </span>
+-                  </div>
+-                  <div className="flex justify-between items-center">
+-                    <span className="font-semibold">Credits used:</span>
+-                    <span>{creditsUsed.toLocaleString('en-US')}</span>
+-                  </div>
+-                  <div className="flex justify-between items-center">
+-                    <span className="font-semibold">Quota:</span>
+-                    <span>{totalQuota.toLocaleString('en-US')}</span>
+-                  </div>
+-                  <div className="flex justify-between items-center">
+-                    <span className="font-semibold">Billing cycle end:</span>
+-                    <span>{billingCycleEnd.toLocaleDateString()}</span>
+-                  </div>
+-                </div>
+-              )
+-            }
+-          )
+-          .otherwise(() => (
+-            <></>
+-          ))}
++        <div className="space-y-4">
++          {creditsUsed > totalQuota && subscriptionActive && (
++            <div className="p-4 mb-4 bg-yellow-100 dark:bg-blue-900 rounded-md space-y-2">
++              <p>
++                You have exceeded your monthly quota, but you can continue using
++                Manicode.
++              </p>
++              <p>
++                You will be charged an overage fee of $0.90 per 100 additional
++                credits.
++              </p>
++              <p className="mt-2">
++                Current overage:{' '}
++                <b>
++                  $
++                  {(Math.ceil((creditsUsed - totalQuota) / 100) * 0.9).toFixed(
++                    2
++                  )}
++                </b>
++              </p>
++            </div>
++          )}
++          <div className="flex justify-between items-center">
++            <span className="font-semibold">Remaining credits:</span>
++            <span>
++              <b>{remainingCredits.toLocaleString('en-US')}</b>
++            </span>
++          </div>
++          <div className="flex justify-between items-center">
++            <span className="font-semibold">Credits used:</span>
++            <span>{creditsUsed.toLocaleString('en-US')}</span>
++          </div>
++          <div className="flex justify-between items-center">
++            <span className="font-semibold">Quota:</span>
++            <span>{totalQuota.toLocaleString('en-US')}</span>
++          </div>
++          <div className="flex justify-between items-center">
++            <span className="font-semibold">Billing cycle end:</span>
++            <p>{endDate.toDateString()}</p>
++          </div>
++        </div>
+       </CardContent>
+     </Card>
+   )

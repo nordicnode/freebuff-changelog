@@ -1,0 +1,215 @@
+diff --git a/backend/src/__tests__/main-prompt.test.ts b/backend/src/__tests__/main-prompt.test.ts
+index c47c1af7a..748b3b70b 100644
+--- a/backend/src/__tests__/main-prompt.test.ts
++++ b/backend/src/__tests__/main-prompt.test.ts
+@@ -287,6 +287,85 @@ describe('mainPrompt', () => {
+     expect(params.path).toBe('new-file.txt')
+     expect(params.content).toBe('Hello World')
+   })
++
++  it('should force end_turn after MAX_CONSECUTIVE_ASSISTANT_MESSAGES', async () => {
++    const agentState = getInitialAgentState(mockFileContext)
++
++    // Set up message history with many consecutive assistant messages
++    agentState.lastUserPromptIndex = 0
++    agentState.messageHistory = [
++      { role: 'user', content: 'Initial prompt' },
++      ...Array(20).fill({ role: 'assistant', content: 'Assistant response' }),
++    ]
++
++    const { toolCalls } = await mainPrompt(
++      new MockWebSocket() as unknown as WebSocket,
++      {
++        type: 'prompt',
++        prompt: '', // No new prompt
++        agentState,
++        fingerprintId: 'test',
++        costMode: 'max',
++        promptId: 'test',
++        toolResults: [],
++      },
++      TEST_USER_ID,
++      'test-session',
++      () => {}
++    )
++
++    expect(toolCalls).toHaveLength(1)
++    expect(toolCalls[0].name).toBe('end_turn')
++    expect(toolCalls[0].parameters).toEqual({})
++  })
++
++  it('should update lastUserPromptIndex when new prompt is received', async () => {
++    const agentState = getInitialAgentState(mockFileContext)
++    agentState.lastUserPromptIndex = 0
++
++    const { agentState: newAgentState } = await mainPrompt(
++      new MockWebSocket() as unknown as WebSocket,
++      {
++        type: 'prompt',
++        prompt: 'New user prompt',
++        agentState,
++        fingerprintId: 'test',
++        costMode: 'max',
++        promptId: 'test',
++        toolResults: [],
++      },
++      TEST_USER_ID,
++      'test-session',
++      () => {}
++    )
++
++    // The new lastUserPromptIndex should be the index of the new prompt message
++    expect(newAgentState.lastUserPromptIndex).toBeGreaterThan(0)
++  })
++
++  it('should not update lastUserPromptIndex when no new prompt', async () => {
++    const agentState = getInitialAgentState(mockFileContext)
++    const initialIndex = 5
++    agentState.lastUserPromptIndex = initialIndex
++
++    const { agentState: newAgentState } = await mainPrompt(
++      new MockWebSocket() as unknown as WebSocket,
++      {
++        type: 'prompt',
++        prompt: '', // No new prompt
++        agentState,
++        fingerprintId: 'test',
++        costMode: 'max',
++        promptId: 'test',
++        toolResults: [],
++      },
++      TEST_USER_ID,
++      'test-session',
++      () => {}
++    )
++
++    expect(newAgentState.lastUserPromptIndex).toBe(initialIndex)
++  })
+ })
+ 
+ // Helper function (consider moving to a test utility file)
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index 2d1134695..030b51f94 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -40,13 +40,20 @@ import { checkTerminalCommand } from './check-terminal-command'
+ import { withCacheControl, toContentString } from 'common/util/messages'
+ import { saveAgentRequest } from './system-prompt/save-agent-request'
+ 
++// Maximum number of consecutive assistant messages allowed before forcing end_turn
++const MAX_CONSECUTIVE_ASSISTANT_MESSAGES = 20
++
+ export const mainPrompt = async (
+   ws: WebSocket,
+   action: Extract<ClientAction, { type: 'prompt' }>,
+   userId: string | undefined,
+   clientSessionId: string,
+   onResponseChunk: (chunk: string) => void
+-) => {
++): Promise<{
++  agentState: AgentState
++  toolCalls: Array<ClientToolCall>
++  toolResults: Array<ToolResult>
++}> => {
+   const { prompt, agentState, fingerprintId, costMode, promptId, toolResults } =
+     action
+   const { messageHistory, fileContext, agentContext } = agentState
+@@ -115,8 +122,8 @@ export const mainPrompt = async (
+     }
+   )
+ 
+-  // Check if this is a direct terminal command
+   if (prompt) {
++    // Check if this is a direct terminal command
+     const startTime = Date.now()
+     const terminalCommand = await checkTerminalCommand(prompt, {
+       clientSessionId,
+@@ -137,6 +144,7 @@ export const mainPrompt = async (
+       const newAgentState = {
+         ...agentState,
+         messageHistory: messagesWithToolResultsAndUser,
++        lastUserPromptIndex: messagesWithToolResultsAndUser.length - 1,
+       }
+       return {
+         agentState: newAgentState,
+@@ -153,6 +161,47 @@ export const mainPrompt = async (
+         toolResults: [],
+       }
+     }
++  } else {
++    // Check number of assistant messages since last user message with prompt
++    const lastUserPromptIndex = agentState.lastUserPromptIndex ?? -1
++    if (lastUserPromptIndex >= 0) {
++      const messagesSincePrompt = messageHistory.slice(lastUserPromptIndex + 1)
++      const consecutiveAssistantMessages = messagesSincePrompt.filter(
++        (msg) => msg.role === 'assistant'
++      ).length
++
++      if (consecutiveAssistantMessages >= MAX_CONSECUTIVE_ASSISTANT_MESSAGES) {
++        logger.warn(
++          `Detected ${consecutiveAssistantMessages} consecutive assistant messages without user prompt`
++        )
++
++        const warningString = [
++          "I've made quite a few responses in a row.",
++          "Let me pause here to make sure we're still on the right track.",
++          "Please let me know if you'd like me to continue or if you'd like to guide me in a different direction.",
++        ].join(' ')
++
++        onResponseChunk(`${warningString}\n\n`)
++
++        return {
++          agentState: {
++            ...agentState,
++            messageHistory: [
++              ...messageHistory,
++              { role: 'assistant', content: warningString },
++            ],
++          },
++          toolCalls: [
++            {
++              id: generateCompactId(),
++              name: 'end_turn',
++              parameters: {},
++            },
++          ],
++          toolResults: [],
++        }
++      }
++    }
+   }
+ 
+   const fileRequestMessagesTokens = countTokensJson(
+@@ -568,7 +617,11 @@ ${newFiles.map((file) => file.path).join('\n')}
+     ...agentState,
+     messageHistory: messagesWithResponse,
+     agentContext: newAgentContext,
++    lastUserPromptIndex: prompt
++      ? messagesWithUserMessage.length - 1
++      : agentState.lastUserPromptIndex,
+   }
++
+   logger.debug(
+     {
+       iteration: iterationNum,
+diff --git a/common/src/types/agent-state.ts b/common/src/types/agent-state.ts
+index 9da7de4fb..fd4d93cb0 100644
+--- a/common/src/types/agent-state.ts
++++ b/common/src/types/agent-state.ts
+@@ -19,6 +19,7 @@ export const AgentStateSchema = z.object({
+   agentContext: z.string(),
+   fileContext: ProjectFileContextSchema,
+   messageHistory: z.array(MessageSchema),
++  lastUserPromptIndex: z.number().optional(),
+ })
+ export type AgentState = z.infer<typeof AgentStateSchema>
+ 
+@@ -29,5 +30,6 @@ export function getInitialAgentState(
+     agentContext: '',
+     messageHistory: [],
+     fileContext,
++    lastUserPromptIndex: -1,
+   }
+-}
+\ No newline at end of file
++}

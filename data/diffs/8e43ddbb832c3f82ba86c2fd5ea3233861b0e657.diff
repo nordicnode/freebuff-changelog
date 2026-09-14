@@ -1,0 +1,1463 @@
+diff --git a/packages/billing/src/org-billing.ts b/packages/billing/src/org-billing.ts
+index f194ef7ed..7c731fee9 100644
+--- a/packages/billing/src/org-billing.ts
++++ b/packages/billing/src/org-billing.ts
+@@ -8,6 +8,7 @@ import { withSerializableTransaction } from 'common/db/transaction'
+ import { GrantTypeValues } from 'common/types/grant'
+ import { stripeServer } from 'common/util/stripe'
+ import { getNextQuotaReset } from 'common/util/dates'
++import { env } from '@/env'
+ import {
+   CreditBalance,
+   CreditUsageAndBalance,
+@@ -20,6 +21,15 @@ import {
+ // Add a minimal structural type that both `db` and `tx` satisfy
+ type DbConn = Pick<typeof db, 'select' | 'update'>
+ 
++interface UpdateSubscriptionQuantityParams {
++  stripeSubscriptionId: string
++  actualQuantity: number
++  orgId: string
++  userId?: string
++  context: string
++  addedCount?: number
++}
++
+ /**
+  * Syncs organization billing cycle with Stripe subscription and returns the current cycle start date.
+  * All organizations are expected to have Stripe subscriptions.
+@@ -444,3 +454,57 @@ export function validateAndNormalizeRepositoryUrl(url: string): {
+     return { isValid: false, error: 'Invalid URL format' }
+   }
+ }
++
++/**
++ * Updates Stripe subscription quantity based on actual member count
++ * Only updates if the quantity differs from what's in Stripe
++ */
++export async function updateStripeSubscriptionQuantity({
++  stripeSubscriptionId,
++  actualQuantity,
++  orgId,
++  userId,
++  context,
++  addedCount
++}: UpdateSubscriptionQuantityParams): Promise<void> {
++  try {
++    const subscription = await stripeServer.subscriptions.retrieve(stripeSubscriptionId)
++    
++    const teamFeeItem = subscription.items.data.find(
++      item => item.price.id === env.STRIPE_TEAM_FEE_PRICE_ID
++    )
++    
++    if (teamFeeItem && teamFeeItem.quantity !== actualQuantity) {
++      await stripeServer.subscriptionItems.update(teamFeeItem.id, {
++        quantity: actualQuantity,
++        proration_behavior: 'create_prorations',
++        proration_date: Math.floor(Date.now() / 1000),
++      })
++
++      const logData: any = { 
++        orgId, 
++        actualQuantity, 
++        previousQuantity: teamFeeItem.quantity,
++        context
++      }
++      
++      if (userId) logData.userId = userId
++      if (addedCount !== undefined) logData.addedCount = addedCount
++
++      logger.info(logData, `Updated Stripe subscription quantity: ${context}`)
++    }
++  } catch (stripeError) {
++    const logData: any = { 
++      orgId, 
++      actualQuantity,
++      context,
++      error: stripeError 
++    }
++    
++    if (userId) logData.userId = userId
++    if (addedCount !== undefined) logData.addedCount = addedCount
++
++    logger.error(logData, `Failed to update Stripe subscription quantity: ${context}`)
++    // Don't throw - we don't want Stripe failures to break the core functionality
++  }
++}
+diff --git a/web/src/app/api/invites/[token]/route.ts b/web/src/app/api/invites/[token]/route.ts
+index e351300b5..58139b01e 100644
+--- a/web/src/app/api/invites/[token]/route.ts
++++ b/web/src/app/api/invites/[token]/route.ts
+@@ -3,8 +3,8 @@ import { getServerSession } from 'next-auth'
+ import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
+ import db from 'common/db'
+ import * as schema from 'common/db/schema'
+-import { eq, and, gt, isNull } from 'drizzle-orm'
+-// import { sendOrganizationWelcomeEmail } from '@codebuff/integrations'
++import { eq, and, gt, isNull, sql } from 'drizzle-orm'
++import { updateStripeSubscriptionQuantity } from '@codebuff/billing'
+ import { logger } from '@/util/logger'
+ 
+ interface RouteParams {
+@@ -138,7 +138,8 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
+       )
+     }
+ 
+-    // Accept the invitation in a transaction
++    // Accept the invitation in a transaction and get updated count
++    let actualQuantity = 0; // Initialize to handle edge cases
+     await db.transaction(async (tx) => {
+       // Add user to organization
+       await tx.insert(schema.orgMember).values({
+@@ -155,8 +156,27 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
+           accepted_by: session.user!.id,
+         })
+         .where(eq(schema.orgInvite.id, inv.id))
++
++      // Get current member count immediately after addition
++      const memberCount = await tx
++        .select({ count: sql<number>`count(*)` })
++        .from(schema.orgMember)
++        .where(eq(schema.orgMember.org_id, inv.org_id))
++
++      actualQuantity = Math.max(1, memberCount[0].count) // Minimum 1 seat
+     })
+ 
++    // Update Stripe subscription quantity if subscription exists
++    if (org.stripe_subscription_id && actualQuantity > 0) {
++      await updateStripeSubscriptionQuantity({
++        stripeSubscriptionId: org.stripe_subscription_id,
++        actualQuantity,
++        orgId: inv.org_id,
++        userId: session.user!.id,
++        context: 'invite accepted'
++      })
++    }
++
+     // // Send welcome email
+     // await sendOrganizationWelcomeEmail({
+     //   email: session.user.email!,
+diff --git a/web/src/app/api/orgs/[orgId]/billing/setup/route.ts b/web/src/app/api/orgs/[orgId]/billing/setup/route.ts
+index 7ee20e9ed..cbfaeda43 100644
+--- a/web/src/app/api/orgs/[orgId]/billing/setup/route.ts
++++ b/web/src/app/api/orgs/[orgId]/billing/setup/route.ts
+@@ -1,6 +1,6 @@
+ import { NextRequest, NextResponse } from 'next/server'
+ import { getServerSession } from 'next-auth'
+-import { eq, and } from 'drizzle-orm'
++import { eq, and, sql } from 'drizzle-orm'
+ 
+ import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
+ import db from 'common/db'
+@@ -8,6 +8,7 @@ import * as schema from 'common/db/schema'
+ import { logger } from '@/util/logger'
+ import { stripeServer } from 'common/src/util/stripe'
+ import { env } from '@/env'
++import { pluralize } from 'common/src/util/string'
+ 
+ interface RouteParams {
+   params: {
+@@ -143,12 +144,21 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
+       )
+     }
+ 
++    // Get member count for the organization
++    const memberCount = await db
++      .select({ count: sql<number>`count(*)` })
++      .from(schema.orgMember)
++      .where(eq(schema.orgMember.org_id, orgId))
++
++    const seatCount = Math.max(1, memberCount[0].count) // Minimum 1 seat
++
+     let stripeCustomerId = organization.stripe_customer_id
+ 
+     // Create Stripe customer if it doesn't exist
+     if (!stripeCustomerId) {
+       const customer = await stripeServer.customers.create({
+         name: organization.name,
++        email: session.user.email || undefined,
+         metadata: {
+           organization_id: orgId,
+           type: 'organization',
+@@ -177,12 +187,9 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
+       customer: stripeCustomerId,
+       mode: 'subscription',
+       line_items: [
+-        // {
+-        //   price: env.STRIPE_TEAM_USAGE_PRICE_ID,
+-        // },
+         {
+           price: env.STRIPE_TEAM_FEE_PRICE_ID,
+-          quantity: 1,
++          quantity: seatCount,
+         },
+       ],
+       allow_promotion_codes: true,
+@@ -193,10 +200,16 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
+         type: 'subscription_setup',
+       },
+       subscription_data: {
++        description: `Team subscription for ${organization.name} - Monthly billing for ${pluralize(seatCount, 'seat')}. You will be charged for each member of your organization. Add or remove team members anytime and your billing will adjust automatically.`,
+         metadata: {
+           organization_id: orgId,
+         },
+       },
++      custom_text: {
++        submit: {
++          message: `You're subscribing to a team plan with ${pluralize(seatCount, 'seat')}. Your billing will automatically adjust when you add or remove team members.`,
++        },
++      },
+     })
+ 
+     if (!checkoutSession.url) {
+@@ -208,8 +221,8 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
+     }
+ 
+     logger.info(
+-      { orgId, sessionId: checkoutSession.id },
+-      'Created Stripe checkout session for billing setup'
++      { orgId, sessionId: checkoutSession.id, seatCount },
++      'Created Stripe checkout session for billing setup with seat-based pricing'
+     )
+ 
+     return NextResponse.json({ sessionId: checkoutSession.id })
+diff --git a/web/src/app/api/orgs/[orgId]/billing/subscription/route.ts b/web/src/app/api/orgs/[orgId]/billing/subscription/route.ts
+new file mode 100644
+index 000000000..873fe1928
+--- /dev/null
++++ b/web/src/app/api/orgs/[orgId]/billing/subscription/route.ts
+@@ -0,0 +1,96 @@
++import { NextRequest, NextResponse } from 'next/server'
++import { getServerSession } from 'next-auth'
++import { eq, and } from 'drizzle-orm'
++
++import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
++import db from 'common/db'
++import * as schema from 'common/db/schema'
++import { logger } from '@/util/logger'
++import { stripeServer } from 'common/src/util/stripe'
++
++interface RouteParams {
++  params: {
++    orgId: string
++  }
++}
++
++export async function DELETE(req: NextRequest, { params }: RouteParams) {
++  const session = await getServerSession(authOptions)
++  if (!session?.user?.id) {
++    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
++  }
++
++  const { orgId } = params
++
++  try {
++    // Check if user has access to this organization and get org details
++    const membership = await db
++      .select({
++        role: schema.orgMember.role,
++        organization: schema.org,
++      })
++      .from(schema.orgMember)
++      .innerJoin(schema.org, eq(schema.orgMember.org_id, schema.org.id))
++      .where(
++        and(
++          eq(schema.orgMember.org_id, orgId),
++          eq(schema.orgMember.user_id, session.user.id)
++        )
++      )
++      .limit(1)
++
++    if (membership.length === 0) {
++      return NextResponse.json(
++        { error: 'Organization not found' },
++        { status: 404 }
++      )
++    }
++
++    const { role, organization } = membership[0]
++
++    // Check if user has permission to cancel subscription (owner/admin only)
++    if (role !== 'owner' && role !== 'admin') {
++      return NextResponse.json(
++        { error: 'Insufficient permissions' },
++        { status: 403 }
++      )
++    }
++
++    // Check if organization has an active subscription
++    if (!organization.stripe_subscription_id) {
++      return NextResponse.json(
++        { error: 'No active subscription found' },
++        { status: 404 }
++      )
++    }
++
++    // Cancel the Stripe subscription
++    await stripeServer.subscriptions.cancel(organization.stripe_subscription_id)
++
++    // Update organization record
++    await db
++      .update(schema.org)
++      .set({
++        stripe_subscription_id: null,
++        auto_topup_enabled: false,
++        updated_at: new Date(),
++      })
++      .where(eq(schema.org.id, orgId))
++
++    logger.info(
++      { orgId, subscriptionId: organization.stripe_subscription_id },
++      'Successfully cancelled organization subscription'
++    )
++
++    return NextResponse.json({ success: true })
++  } catch (error: any) {
++    logger.error(
++      { error: error.message, orgId },
++      'Failed to cancel subscription'
++    )
++    return NextResponse.json(
++      { error: 'Internal server error' },
++      { status: 500 }
++    )
++  }
++}
+diff --git a/web/src/app/api/orgs/[orgId]/invitations/[[...email]]/route.ts b/web/src/app/api/orgs/[orgId]/invitations/[[...email]]/route.ts
+deleted file mode 100644
+index 183f5e440..000000000
+--- a/web/src/app/api/orgs/[orgId]/invitations/[[...email]]/route.ts
++++ /dev/null
+@@ -1,377 +0,0 @@
+-import { NextRequest, NextResponse } from 'next/server'
+-import { getServerSession } from 'next-auth'
+-import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
+-import db from 'common/db'
+-import * as schema from 'common/db/schema'
+-import { eq, and, isNull, inArray } from 'drizzle-orm' // Added inArray
+-import { checkOrganizationPermission } from '@/lib/organization-permissions'
+-import { loops } from '@codebuff/internal'
+-import { logger } from '@/util/logger'
+-import crypto from 'crypto'
+-import { env } from '@/env'
+-
+-interface RouteParams {
+-  params: {
+-    orgId: string
+-    email?: string[] // e.g., ['user@example.com'] or ['user@example.com', 'resend']
+-  }
+-}
+-
+-interface InviteRequest {
+-  email: string
+-  role: 'admin' | 'member'
+-}
+-
+-// POST handles:
+-// 1. Create new invitation (if params.email is undefined)
+-// 2. Resend invitation (if params.email is [email, 'resend'])
+-export async function POST(request: NextRequest, { params }: RouteParams) {
+-  const session = await getServerSession(authOptions)
+-  if (!session?.user?.id) {
+-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+-  }
+-
+-  const { orgId, email: emailParams } = params
+-  const action = emailParams?.[1]
+-  const specificEmail = emailParams?.[0]
+-
+-  // Check permissions - only owners and admins can invite/resend
+-  const permissionResult = await checkOrganizationPermission(orgId, [
+-    'owner',
+-    'admin',
+-  ])
+-  if (!permissionResult.success) {
+-    return NextResponse.json(
+-      { error: permissionResult.error },
+-      { status: permissionResult.status || 500 }
+-    )
+-  }
+-  const { organization } = permissionResult
+-
+-  // Inviter information (common for create and resend)
+-  const inviter = await db
+-    .select({ name: schema.user.name })
+-    .from(schema.user)
+-    .where(eq(schema.user.id, session.user.id))
+-    .limit(1)
+-  const inviterName = inviter[0]?.name || 'Someone'
+-
+-  // === RESEND INVITATION LOGIC ===
+-  if (action === 'resend' && specificEmail) {
+-    try {
+-      const existingInvitation = await db
+-        .select()
+-        .from(schema.orgInvite)
+-        .where(
+-          and(
+-            eq(schema.orgInvite.org_id, orgId),
+-            eq(schema.orgInvite.email, specificEmail),
+-            isNull(schema.orgInvite.accepted_at)
+-          )
+-        )
+-        .limit(1)
+-
+-      if (existingInvitation.length === 0) {
+-        return NextResponse.json(
+-          { error: 'No pending invitation found for this email to resend' },
+-          { status: 404 }
+-        )
+-      }
+-      const inviteRecord = existingInvitation[0]
+-      const newExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
+-
+-      await db
+-        .update(schema.orgInvite)
+-        .set({ expires_at: newExpiresAt })
+-        .where(eq(schema.orgInvite.id, inviteRecord.id))
+-
+-      const invitationUrl = `${env.NEXT_PUBLIC_APP_URL}/invites/${inviteRecord.token}` // Replaced request.nextUrl.origin
+-      const emailResult = await loops.sendOrganizationInvitationEmail({
+-        email: inviteRecord.email,
+-        organizationName: organization!.name,
+-        inviterName, // Using fetched inviterName
+-        invitationUrl,
+-        role: inviteRecord.role,
+-      })
+-
+-      if (!emailResult.success) {
+-        return NextResponse.json(
+-          { error: 'Failed to resend invitation email' },
+-          { status: 500 }
+-        )
+-      }
+-      logger.info(
+-        {
+-          organizationId: orgId,
+-          invitedEmail: specificEmail,
+-          resentBy: session.user.id,
+-          newExpiresAt,
+-        },
+-        'Organization invitation resent successfully'
+-      )
+-      return NextResponse.json({
+-        success: true,
+-        message: 'Invitation resent successfully',
+-        expires_at: newExpiresAt.toISOString(),
+-      })
+-    } catch (error) {
+-      logger.error(
+-        { organizationId: orgId, email: specificEmail, error },
+-        'Error resending organization invitation'
+-      )
+-      return NextResponse.json(
+-        { error: 'Internal server error during resend' },
+-        { status: 500 }
+-      )
+-    }
+-  }
+-  // === CREATE NEW INVITATION LOGIC ===
+-  else if (!emailParams || emailParams.length === 0) {
+-    try {
+-      const body: InviteRequest = await request.json()
+-      if (!body.email || !body.role) {
+-        return NextResponse.json(
+-          { error: 'Email and role are required for new invitation' },
+-          { status: 400 }
+-        )
+-      }
+-      if (!['admin', 'member'].includes(body.role)) {
+-        return NextResponse.json(
+-          { error: 'Role must be admin or member' },
+-          { status: 400 }
+-        )
+-      }
+-
+-      const existingMember = await db
+-        .select()
+-        .from(schema.orgMember)
+-        .innerJoin(schema.user, eq(schema.orgMember.user_id, schema.user.id))
+-        .where(
+-          and(
+-            eq(schema.orgMember.org_id, orgId),
+-            eq(schema.user.email, body.email)
+-          )
+-        )
+-        .limit(1)
+-      if (existingMember.length > 0) {
+-        return NextResponse.json(
+-          { error: 'User is already a member of this organization' },
+-          { status: 409 }
+-        )
+-      }
+-
+-      const existingInvitation = await db
+-        .select()
+-        .from(schema.orgInvite)
+-        .where(
+-          and(
+-            eq(schema.orgInvite.org_id, orgId),
+-            eq(schema.orgInvite.email, body.email),
+-            isNull(schema.orgInvite.accepted_at)
+-          )
+-        )
+-        .limit(1)
+-      if (existingInvitation.length > 0) {
+-        return NextResponse.json(
+-          { error: 'Invitation already sent to this email' },
+-          { status: 409 }
+-        )
+-      }
+-
+-      const token = crypto.randomBytes(32).toString('hex')
+-      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
+-
+-      const [invitation] = await db
+-        .insert(schema.orgInvite)
+-        .values({
+-          org_id: orgId,
+-          email: body.email,
+-          role: body.role,
+-          token,
+-          invited_by: session.user.id,
+-          expires_at: expiresAt,
+-        })
+-        .returning()
+-
+-      const invitationUrl = `${env.NEXT_PUBLIC_APP_URL}/invites/${token}` // Replaced request.nextUrl.origin
+-      const emailResult = await loops.sendOrganizationInvitationEmail({
+-        email: body.email,
+-        organizationName: organization!.name,
+-        inviterName, // Using fetched inviterName
+-        invitationUrl,
+-        role: body.role,
+-      })
+-
+-      if (!emailResult.success) {
+-        await db
+-          .delete(schema.orgInvite)
+-          .where(eq(schema.orgInvite.id, invitation.id))
+-        return NextResponse.json(
+-          { error: 'Failed to send invitation email' },
+-          { status: 500 }
+-        )
+-      }
+-      logger.info(
+-        {
+-          organizationId: orgId,
+-          invitedEmail: body.email,
+-          invitedBy: session.user.id,
+-          role: body.role,
+-        },
+-        'Organization invitation sent successfully'
+-      )
+-      return NextResponse.json({
+-        success: true,
+-        invitation: {
+-          id: invitation.id,
+-          email: invitation.email,
+-          role: invitation.role,
+-          expires_at: invitation.expires_at.toISOString(),
+-        },
+-      })
+-    } catch (error) {
+-      logger.error(
+-        { organizationId: orgId, error },
+-        'Error sending organization invitation'
+-      )
+-      return NextResponse.json(
+-        { error: 'Internal server error during create' },
+-        { status: 500 }
+-      )
+-    }
+-  }
+-  // Fallback for invalid POST requests to /invitations/*
+-  return NextResponse.json(
+-    { error: 'Invalid request path for POST' },
+-    { status: 404 }
+-  )
+-}
+-
+-// GET handles:
+-// 1. List invitations (if params.email is undefined)
+-export async function GET(request: NextRequest, { params }: RouteParams) {
+-  const session = await getServerSession(authOptions)
+-  if (!session?.user?.id) {
+-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+-  }
+-
+-  const { orgId, email: emailParams } = params
+-
+-  // Check permissions - only members can view invitations
+-  const permissionResult = await checkOrganizationPermission(orgId, 'member')
+-  if (!permissionResult.success) {
+-    return NextResponse.json(
+-      { error: permissionResult.error },
+-      { status: permissionResult.status || 500 }
+-    )
+-  }
+-
+-  // === LIST INVITATIONS LOGIC ===
+-  if (!emailParams || emailParams.length === 0) {
+-    try {
+-      const invitations = await db
+-        .select({
+-          id: schema.orgInvite.id,
+-          email: schema.orgInvite.email,
+-          role: schema.orgInvite.role,
+-          invited_by_name: schema.user.name,
+-          created_at: schema.orgInvite.created_at,
+-          expires_at: schema.orgInvite.expires_at,
+-        })
+-        .from(schema.orgInvite)
+-        .innerJoin(schema.user, eq(schema.orgInvite.invited_by, schema.user.id))
+-        .where(
+-          and(
+-            eq(schema.orgInvite.org_id, orgId),
+-            isNull(schema.orgInvite.accepted_at)
+-          )
+-        )
+-        .orderBy(schema.orgInvite.created_at)
+-      return NextResponse.json({ invitations })
+-    } catch (error) {
+-      logger.error(
+-        { organizationId: orgId, error },
+-        'Error fetching organization invitations'
+-      )
+-      return NextResponse.json(
+-        { error: 'Internal server error during list' },
+-        { status: 500 }
+-      )
+-    }
+-  }
+-  // Fallback for invalid GET requests to /invitations/*
+-  return NextResponse.json(
+-    { error: 'Invalid request path for GET' },
+-    { status: 404 }
+-  )
+-}
+-
+-// DELETE handles:
+-// 1. Cancel/delete invitation (if params.email is [email])
+-export async function DELETE(request: NextRequest, { params }: RouteParams) {
+-  const session = await getServerSession(authOptions)
+-  if (!session?.user?.id) {
+-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+-  }
+-
+-  const { orgId, email: emailParams } = params
+-  const specificEmail = emailParams?.[0]
+-
+-  // Check permissions - only owners and admins can cancel invitations
+-  const permissionResult = await checkOrganizationPermission(orgId, [
+-    'owner',
+-    'admin',
+-  ])
+-  if (!permissionResult.success) {
+-    return NextResponse.json(
+-      { error: permissionResult.error },
+-      { status: permissionResult.status || 500 }
+-    )
+-  }
+-
+-  // === CANCEL INVITATION LOGIC ===
+-  if (specificEmail && emailParams?.length === 1) {
+-    try {
+-      const deletedInvitations = await db
+-        .delete(schema.orgInvite)
+-        .where(
+-          and(
+-            eq(schema.orgInvite.org_id, orgId),
+-            eq(schema.orgInvite.email, specificEmail),
+-            isNull(schema.orgInvite.accepted_at)
+-          )
+-        )
+-        .returning()
+-
+-      if (deletedInvitations.length === 0) {
+-        return NextResponse.json(
+-          { error: 'No pending invitation found for this email to delete' },
+-          { status: 404 }
+-        )
+-      }
+-      logger.info(
+-        {
+-          organizationId: orgId,
+-          cancelledEmail: specificEmail,
+-          cancelledBy: session.user.id,
+-        },
+-        'Organization invitation cancelled'
+-      )
+-      return NextResponse.json({ success: true })
+-    } catch (error) {
+-      logger.error(
+-        { organizationId: orgId, email: specificEmail, error },
+-        'Error cancelling organization invitation'
+-      )
+-      return NextResponse.json(
+-        { error: 'Internal server error during delete' },
+-        { status: 500 }
+-      )
+-    }
+-  }
+-  // Fallback for invalid DELETE requests to /invitations/*
+-  return NextResponse.json(
+-    { error: 'Invalid request path for DELETE' },
+-    { status: 404 }
+-  )
+-}
+diff --git a/web/src/app/api/orgs/[orgId]/invitations/[email]/resend/route.ts b/web/src/app/api/orgs/[orgId]/invitations/[email]/resend/route.ts
+new file mode 100644
+index 000000000..7df2bf7d0
+--- /dev/null
++++ b/web/src/app/api/orgs/[orgId]/invitations/[email]/resend/route.ts
+@@ -0,0 +1,94 @@
++import { NextRequest, NextResponse } from 'next/server'
++import { getServerSession } from 'next-auth'
++import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
++import db from 'common/db'
++import * as schema from 'common/db/schema'
++import { eq, and, isNull } from 'drizzle-orm'
++import { logger } from '@/util/logger'
++
++interface RouteParams {
++  params: { orgId: string; email: string }
++}
++
++export async function POST(
++  request: NextRequest,
++  { params }: RouteParams
++) {
++  try {
++    const session = await getServerSession(authOptions)
++    if (!session?.user?.id) {
++      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
++    }
++
++    const { orgId, email } = params
++    const decodedEmail = decodeURIComponent(email)
++
++    // Check if user is owner or admin
++    const membership = await db
++      .select({ role: schema.orgMember.role })
++      .from(schema.orgMember)
++      .where(
++        and(
++          eq(schema.orgMember.org_id, orgId),
++          eq(schema.orgMember.user_id, session.user.id)
++        )
++      )
++      .limit(1)
++
++    if (membership.length === 0) {
++      return NextResponse.json({ error: 'Organization not found' }, { status: 404 })
++    }
++
++    const { role: userRole } = membership[0]
++    if (userRole !== 'owner' && userRole !== 'admin') {
++      return NextResponse.json({ error: 'Insufficient permissions' }, { status: 403 })
++    }
++
++    // Find the existing invitation
++    const existingInvitation = await db
++      .select()
++      .from(schema.orgInvite)
++      .where(
++        and(
++          eq(schema.orgInvite.org_id, orgId),
++          eq(schema.orgInvite.email, decodedEmail),
++          isNull(schema.orgInvite.accepted_at)
++        )
++      )
++      .limit(1)
++
++    if (existingInvitation.length === 0) {
++      return NextResponse.json(
++        { error: 'Invitation not found' },
++        { status: 404 }
++      )
++    }
++
++    // Update the invitation with new token and expiry
++    const newToken = crypto.randomUUID()
++    const newExpiresAt = new Date()
++    newExpiresAt.setDate(newExpiresAt.getDate() + 7) // 7 days from now
++
++    await db
++      .update(schema.orgInvite)
++      .set({
++        token: newToken,
++        expires_at: newExpiresAt,
++        invited_by: session.user.id, // Update who resent it
++      })
++      .where(eq(schema.orgInvite.id, existingInvitation[0].id))
++
++    logger.info(
++      { orgId, email: decodedEmail },
++      'Organization invitation resent'
++    )
++
++    return NextResponse.json({ success: true })
++  } catch (error) {
++    console.error('Error resending invitation:', error)
++    return NextResponse.json(
++      { error: 'Internal server error' },
++      { status: 500 }
++    )
++  }
++}
+diff --git a/web/src/app/api/orgs/[orgId]/invitations/[email]/route.ts b/web/src/app/api/orgs/[orgId]/invitations/[email]/route.ts
+new file mode 100644
+index 000000000..ef80afe1d
+--- /dev/null
++++ b/web/src/app/api/orgs/[orgId]/invitations/[email]/route.ts
+@@ -0,0 +1,71 @@
++import { NextRequest, NextResponse } from 'next/server'
++import { getServerSession } from 'next-auth'
++import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
++import db from 'common/db'
++import * as schema from 'common/db/schema'
++import { eq, and, isNull } from 'drizzle-orm'
++import { logger } from '@/util/logger'
++
++interface RouteParams {
++  params: { orgId: string; email: string }
++}
++
++export async function DELETE(
++  request: NextRequest,
++  { params }: RouteParams
++) {
++  try {
++    const session = await getServerSession(authOptions)
++    if (!session?.user?.id) {
++      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
++    }
++
++    const { orgId, email } = params
++    const decodedEmail = decodeURIComponent(email)
++
++    // Check if user is owner or admin
++    const membership = await db
++      .select({ role: schema.orgMember.role })
++      .from(schema.orgMember)
++      .where(
++        and(
++          eq(schema.orgMember.org_id, orgId),
++          eq(schema.orgMember.user_id, session.user.id)
++        )
++      )
++      .limit(1)
++
++    if (membership.length === 0) {
++      return NextResponse.json({ error: 'Organization not found' }, { status: 404 })
++    }
++
++    const { role: userRole } = membership[0]
++    if (userRole !== 'owner' && userRole !== 'admin') {
++      return NextResponse.json({ error: 'Insufficient permissions' }, { status: 403 })
++    }
++
++    // Delete the invitation
++    const result = await db
++      .delete(schema.orgInvite)
++      .where(
++        and(
++          eq(schema.orgInvite.org_id, orgId),
++          eq(schema.orgInvite.email, decodedEmail),
++          isNull(schema.orgInvite.accepted_at)
++        )
++      )
++
++    logger.info(
++      { orgId, email: decodedEmail },
++      'Organization invitation cancelled'
++    )
++
++    return NextResponse.json({ success: true })
++  } catch (error) {
++    console.error('Error cancelling invitation:', error)
++    return NextResponse.json(
++      { error: 'Internal server error' },
++      { status: 500 }
++    )
++  }
++}
+diff --git a/web/src/app/api/orgs/[orgId]/invitations/bulk/route.ts b/web/src/app/api/orgs/[orgId]/invitations/bulk/route.ts
+index dca84441e..2ce6f909c 100644
+--- a/web/src/app/api/orgs/[orgId]/invitations/bulk/route.ts
++++ b/web/src/app/api/orgs/[orgId]/invitations/bulk/route.ts
+@@ -3,12 +3,9 @@ import { getServerSession } from 'next-auth'
+ import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
+ import db from 'common/db'
+ import * as schema from 'common/db/schema'
+-import { eq, and, isNull, inArray } from 'drizzle-orm'
+-import { checkOrganizationPermission } from '@/lib/organization-permissions'
+-import { loops } from '@codebuff/internal'
++import { eq, and, inArray, sql } from 'drizzle-orm'
++import { updateStripeSubscriptionQuantity } from '@codebuff/billing'
+ import { logger } from '@/util/logger'
+-import crypto from 'crypto'
+-import { env } from '@/env' // Added import
+ 
+ interface RouteParams {
+   params: { orgId: string }
+@@ -23,20 +20,17 @@ interface BulkInviteRequest {
+ 
+ interface BulkInviteResult {
+   success: boolean
+-  results: Array<{
++  added: number
++  skipped: Array<{
+     email: string
+-    success: boolean
+-    error?: string
+-    invitationId?: string
++    reason: string
+   }>
+-  summary: {
+-    total: number
+-    successful: number
+-    failed: number
+-  }
+ }
+ 
+-export async function POST(request: NextRequest, { params }: RouteParams) {
++export async function POST(
++  request: NextRequest,
++  { params }: RouteParams
++) {
+   try {
+     const session = await getServerSession(authOptions)
+     if (!session?.user?.id) {
+@@ -46,217 +40,120 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
+     const { orgId } = params
+     const body: BulkInviteRequest = await request.json()
+ 
+-    // Validate input
+-    if (
+-      !body.invitations ||
+-      !Array.isArray(body.invitations) ||
+-      body.invitations.length === 0
+-    ) {
+-      return NextResponse.json(
+-        { error: 'Invitations array is required and must not be empty' },
+-        { status: 400 }
+-      )
+-    }
+-
+-    if (body.invitations.length > 50) {
+-      return NextResponse.json(
+-        { error: 'Maximum 50 invitations allowed per bulk request' },
+-        { status: 400 }
+-      )
++    if (!body.invitations || !Array.isArray(body.invitations) || body.invitations.length === 0) {
++      return NextResponse.json({ error: 'Invalid invitations array' }, { status: 400 })
+     }
+ 
+-    // Validate each invitation
+-    for (const invitation of body.invitations) {
+-      if (!invitation.email || !invitation.role) {
+-        return NextResponse.json(
+-          { error: 'Each invitation must have email and role' },
+-          { status: 400 }
++    // Check if user is owner or admin and get organization details
++    const membership = await db
++      .select({
++        role: schema.orgMember.role,
++        organization: schema.org
++      })
++      .from(schema.orgMember)
++      .innerJoin(schema.org, eq(schema.orgMember.org_id, schema.org.id))
++      .where(
++        and(
++          eq(schema.orgMember.org_id, orgId),
++          eq(schema.orgMember.user_id, session.user.id)
+         )
+-      }
++      )
++      .limit(1)
+ 
+-      if (!['admin', 'member'].includes(invitation.role)) {
+-        return NextResponse.json(
+-          { error: 'Role must be admin or member' },
+-          { status: 400 }
+-        )
+-      }
++    if (membership.length === 0) {
++      return NextResponse.json({ error: 'Organization not found' }, { status: 404 })
+     }
+ 
+-    // Check permissions - only owners and admins can send bulk invitations
+-    const permissionResult = await checkOrganizationPermission(orgId, [
+-      'owner',
+-      'admin',
+-    ])
+-    if (!permissionResult.success) {
+-      return NextResponse.json(
+-        { error: permissionResult.error },
+-        { status: permissionResult.status || 500 }
+-      )
++    const { role: userRole, organization } = membership[0]
++    if (userRole !== 'owner' && userRole !== 'admin') {
++      return NextResponse.json({ error: 'Insufficient permissions' }, { status: 403 })
+     }
+ 
+-    const { organization } = permissionResult
++    // Find users by email
++    const emails = body.invitations.map(inv => inv.email)
++    const users = await db
++      .select({ id: schema.user.id, email: schema.user.email })
++      .from(schema.user)
++      .where(inArray(schema.user.email, emails))
+ 
+-    // Get all emails to check for existing members and invitations
+-    const emails = body.invitations.map((inv) => inv.email)
++    const userMap = new Map(users.map(user => [user.email, user.id]))
+ 
+-    // Check for existing members
+-    const existingMembers = await db
+-      .select({ email: schema.user.email })
++    // Check existing memberships
++    const existingMemberships = await db
++      .select({ user_id: schema.orgMember.user_id })
+       .from(schema.orgMember)
+-      .innerJoin(schema.user, eq(schema.orgMember.user_id, schema.user.id))
+       .where(
+         and(
+           eq(schema.orgMember.org_id, orgId),
+-          inArray(schema.user.email, emails)
+-        )
+-      )
+-
+-    const existingMemberEmails = new Set(existingMembers.map((m) => m.email))
+-
+-    // Check for existing pending invitations
+-    const existingInvitations = await db
+-      .select({ email: schema.orgInvite.email })
+-      .from(schema.orgInvite)
+-      .where(
+-        and(
+-          eq(schema.orgInvite.org_id, orgId),
+-          inArray(schema.orgInvite.email, emails),
+-          isNull(schema.orgInvite.accepted_at)
++          inArray(schema.orgMember.user_id, users.map(u => u.id))
+         )
+       )
+ 
+-    const existingInvitationEmails = new Set(
+-      existingInvitations.map((i) => i.email)
+-    )
+-
+-    // Get inviter information
+-    const inviter = await db
+-      .select({ name: schema.user.name })
+-      .from(schema.user)
+-      .where(eq(schema.user.id, session.user.id))
+-      .limit(1)
+-
+-    const inviterName = inviter[0]?.name || 'Someone'
++    const existingMemberIds = new Set(existingMemberships.map(m => m.user_id))
+ 
+-    // Process each invitation
+-    const results: BulkInviteResult['results'] = []
+-    let successful = 0
+-    let failed = 0
++    // Process invitations
++    const validInvitations: Array<{ userId: string; role: 'admin' | 'member' }> = []
++    const skipped: Array<{ email: string; reason: string }> = []
+ 
+     for (const invitation of body.invitations) {
+-      try {
+-        // Check if user is already a member
+-        if (existingMemberEmails.has(invitation.email)) {
+-          results.push({
+-            email: invitation.email,
+-            success: false,
+-            error: 'User is already a member of this organization',
+-          })
+-          failed++
+-          continue
+-        }
++      const userId = userMap.get(invitation.email)
+ 
+-        // Check if invitation already exists
+-        if (existingInvitationEmails.has(invitation.email)) {
+-          results.push({
+-            email: invitation.email,
+-            success: false,
+-            error: 'Invitation already sent to this email',
+-          })
+-          failed++
+-          continue
+-        }
++      if (!userId) {
++        skipped.push({ email: invitation.email, reason: 'User not found' })
++        continue
++      }
+ 
+-        // Generate secure invitation token
+-        const token = crypto.randomBytes(32).toString('hex')
+-        const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
++      if (existingMemberIds.has(userId)) {
++        skipped.push({ email: invitation.email, reason: 'Already a member' })
++        continue
++      }
+ 
+-        // Create invitation record
+-        const [inviteRecord] = await db
+-          .insert(schema.orgInvite)
+-          .values({
++      validInvitations.push({ userId, role: invitation.role })
++    }
++
++    // Add all valid members in a transaction and get updated count
++    let addedCount = 0;
++    let actualQuantity = 0; // Initialize to handle edge cases
++    if (validInvitations.length > 0) {
++      await db.transaction(async (tx) => {
++        for (const invitation of validInvitations) {
++          await tx.insert(schema.orgMember).values({
+             org_id: orgId,
+-            email: invitation.email,
++            user_id: invitation.userId,
+             role: invitation.role,
+-            token,
+-            invited_by: session.user.id,
+-            expires_at: expiresAt,
+-          })
+-          .returning()
+-
+-        // Send invitation email
+-        const invitationUrl = `${env.NEXT_PUBLIC_APP_URL}/invites/${token}` // Replaced request.nextUrl.origin
+-        const emailResult = await loops.sendOrganizationInvitationEmail({
+-          email: invitation.email,
+-          organizationName: organization!.name,
+-          inviterName,
+-          invitationUrl,
+-          role: invitation.role,
+-        })
+-
+-        if (!emailResult.success) {
+-          // Delete the invitation if email failed
+-          await db
+-            .delete(schema.orgInvite)
+-            .where(eq(schema.orgInvite.id, inviteRecord.id))
+-
+-          results.push({
+-            email: invitation.email,
+-            success: false,
+-            error: 'Failed to send invitation email',
+           })
+-          failed++
+-          continue
++          addedCount++
+         }
+ 
+-        results.push({
+-          email: invitation.email,
+-          success: true,
+-          invitationId: inviteRecord.id,
+-        })
+-        successful++
+-      } catch (error) {
+-        logger.error(
+-          { organizationId: orgId, email: invitation.email, error },
+-          'Error processing bulk invitation'
+-        )
++        // Get current member count immediately after all inserts
++        const memberCount = await tx
++          .select({ count: sql<number>`count(*)` })
++          .from(schema.orgMember)
++          .where(eq(schema.orgMember.org_id, orgId))
+ 
+-        results.push({
+-          email: invitation.email,
+-          success: false,
+-          error: 'Internal error processing invitation',
+-        })
+-        failed++
+-      }
++        actualQuantity = Math.max(1, memberCount[0].count) // Minimum 1 seat
++      })
+     }
+ 
+-    logger.info(
+-      {
+-        organizationId: orgId,
+-        invitedBy: session.user.id,
+-        total: body.invitations.length,
+-        successful,
+-        failed,
+-      },
+-      'Bulk organization invitations processed'
+-    )
+-
+-    const response: BulkInviteResult = {
+-      success: successful > 0,
+-      results,
+-      summary: {
+-        total: body.invitations.length,
+-        successful,
+-        failed,
+-      },
++    // Update Stripe subscription quantity once if members were added
++    if (addedCount > 0 && organization.stripe_subscription_id && actualQuantity > 0) {
++      await updateStripeSubscriptionQuantity({
++        stripeSubscriptionId: organization.stripe_subscription_id,
++        actualQuantity,
++        orgId,
++        context: 'bulk added members',
++        addedCount
++      })
+     }
+ 
+-    return NextResponse.json(response)
++    return NextResponse.json({
++      success: true,
++      added: addedCount,
++      skipped,
++    }, { status: 201 })
++
+   } catch (error) {
+-    logger.error(
+-      { organizationId: params.orgId, error },
+-      'Error processing bulk organization invitations'
+-    )
++    console.error('Error bulk inviting members:', error)
+     return NextResponse.json(
+       { error: 'Internal server error' },
+       { status: 500 }
+diff --git a/web/src/app/api/orgs/[orgId]/invitations/route.ts b/web/src/app/api/orgs/[orgId]/invitations/route.ts
+new file mode 100644
+index 000000000..c9b44ecf5
+--- /dev/null
++++ b/web/src/app/api/orgs/[orgId]/invitations/route.ts
+@@ -0,0 +1,151 @@
++import { NextRequest, NextResponse } from 'next/server'
++import { getServerSession } from 'next-auth'
++import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
++import db from 'common/db'
++import * as schema from 'common/db/schema'
++import { eq, and, isNull } from 'drizzle-orm'
++import { logger } from '@/util/logger'
++
++interface RouteParams {
++  params: { orgId: string }
++}
++
++export async function GET(
++  request: NextRequest,
++  { params }: RouteParams
++) {
++  try {
++    const session = await getServerSession(authOptions)
++    if (!session?.user?.id) {
++      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
++    }
++
++    const { orgId } = params
++
++    // Check if user is a member of this organization
++    const userMembership = await db
++      .select({ role: schema.orgMember.role })
++      .from(schema.orgMember)
++      .where(
++        and(
++          eq(schema.orgMember.org_id, orgId),
++          eq(schema.orgMember.user_id, session.user.id)
++        )
++      )
++      .limit(1)
++
++    if (userMembership.length === 0) {
++      return NextResponse.json({ error: 'Organization not found' }, { status: 404 })
++    }
++
++    // Get all pending invitations
++    const invitations = await db
++      .select({
++        id: schema.orgInvite.id,
++        email: schema.orgInvite.email,
++        role: schema.orgInvite.role,
++        invited_by_name: schema.user.name,
++        created_at: schema.orgInvite.created_at,
++        expires_at: schema.orgInvite.expires_at,
++      })
++      .from(schema.orgInvite)
++      .innerJoin(schema.user, eq(schema.orgInvite.invited_by, schema.user.id))
++      .where(
++        and(
++          eq(schema.orgInvite.org_id, orgId),
++          isNull(schema.orgInvite.accepted_at)
++        )
++      )
++
++    return NextResponse.json({ invitations })
++  } catch (error) {
++    console.error('Error fetching organization invitations:', error)
++    return NextResponse.json(
++      { error: 'Internal server error' },
++      { status: 500 }
++    )
++  }
++}
++
++export async function POST(
++  request: NextRequest,
++  { params }: RouteParams
++) {
++  try {
++    const session = await getServerSession(authOptions)
++    if (!session?.user?.id) {
++      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
++    }
++
++    const { orgId } = params
++    const body = await request.json()
++
++    // Check if user is owner or admin
++    const membership = await db
++      .select({ role: schema.orgMember.role })
++      .from(schema.orgMember)
++      .where(
++        and(
++          eq(schema.orgMember.org_id, orgId),
++          eq(schema.orgMember.user_id, session.user.id)
++        )
++      )
++      .limit(1)
++
++    if (membership.length === 0) {
++      return NextResponse.json({ error: 'Organization not found' }, { status: 404 })
++    }
++
++    const { role: userRole } = membership[0]
++    if (userRole !== 'owner' && userRole !== 'admin') {
++      return NextResponse.json({ error: 'Insufficient permissions' }, { status: 403 })
++    }
++
++    // Check if invitation already exists
++    const existingInvitation = await db
++      .select()
++      .from(schema.orgInvite)
++      .where(
++        and(
++          eq(schema.orgInvite.org_id, orgId),
++          eq(schema.orgInvite.email, body.email),
++          isNull(schema.orgInvite.accepted_at)
++        )
++      )
++      .limit(1)
++
++    if (existingInvitation.length > 0) {
++      return NextResponse.json(
++        { error: 'Invitation already exists for this email' },
++        { status: 409 }
++      )
++    }
++
++    // Create invitation
++    const token = crypto.randomUUID()
++    const expiresAt = new Date()
++    expiresAt.setDate(expiresAt.getDate() + 7) // 7 days from now
++
++    await db.insert(schema.orgInvite).values({
++      org_id: orgId,
++      email: body.email,
++      role: body.role,
++      token,
++      invited_by: session.user.id,
++      expires_at: expiresAt,
++    })
++
++    logger.info(
++      { orgId, email: body.email, role: body.role },
++      'Organization invitation created'
++    )
++
++    return NextResponse.json({ success: true }, { status: 201 })
++  } catch (error) {
++    console.error('Error creating invitation:', error)
++    return NextResponse.json(
++      { error: 'Internal server error' },
++      { status: 500 }
++    )
++  }
++}
+diff --git a/web/src/app/api/orgs/[orgId]/members/[userId]/route.ts b/web/src/app/api/orgs/[orgId]/members/[userId]/route.ts
+index f445ab4e2..1a7710f51 100644
+--- a/web/src/app/api/orgs/[orgId]/members/[userId]/route.ts
++++ b/web/src/app/api/orgs/[orgId]/members/[userId]/route.ts
+@@ -3,8 +3,10 @@ import { getServerSession } from 'next-auth'
+ import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
+ import db from 'common/db'
+ import * as schema from 'common/db/schema'
+-import { eq, and } from 'drizzle-orm'
++import { eq, and, isNull, sql } from 'drizzle-orm'
+ import { UpdateMemberRoleRequest } from 'common/types/organization'
++import { updateStripeSubscriptionQuantity } from '@codebuff/billing'
++import { logger } from '@/util/logger'
+ 
+ interface RouteParams {
+   params: { orgId: string; userId: string }
+@@ -44,10 +46,14 @@ export async function PATCH(
+       return NextResponse.json({ error: 'Insufficient permissions' }, { status: 403 })
+     }
+ 
+-    // Get target member's current role
++    // Get target member's role and email
+     const targetMembership = await db
+-      .select({ role: schema.orgMember.role })
++      .select({
++        role: schema.orgMember.role,
++        email: schema.user.email
++      })
+       .from(schema.orgMember)
++      .innerJoin(schema.user, eq(schema.orgMember.user_id, schema.user.id))
+       .where(
+         and(
+           eq(schema.orgMember.org_id, orgId),
+@@ -60,7 +66,7 @@ export async function PATCH(
+       return NextResponse.json({ error: 'Member not found' }, { status: 404 })
+     }
+ 
+-    const { role: targetRole } = targetMembership[0]
++    const { role: targetRole, email: targetEmail } = targetMembership[0]
+ 
+     // Only owners can change owner roles
+     if (targetRole === 'owner') {
+@@ -102,10 +108,14 @@ export async function DELETE(
+ 
+     const { orgId, userId } = params
+ 
+-    // Check if current user is owner or admin, or removing themselves
++    // Check if current user is owner or admin, or removing themselves, and get organization details
+     const currentUserMembership = await db
+-      .select({ role: schema.orgMember.role })
++      .select({
++        role: schema.orgMember.role,
++        organization: schema.org
++      })
+       .from(schema.orgMember)
++      .innerJoin(schema.org, eq(schema.orgMember.org_id, schema.org.id))
+       .where(
+         and(
+           eq(schema.orgMember.org_id, orgId),
+@@ -118,17 +128,21 @@ export async function DELETE(
+       return NextResponse.json({ error: 'Organization not found' }, { status: 404 })
+     }
+ 
+-    const { role: currentUserRole } = currentUserMembership[0]
++    const { role: currentUserRole, organization } = currentUserMembership[0]
+     const isRemovingSelf = session.user.id === userId
+ 
+     if (!isRemovingSelf && currentUserRole !== 'owner' && currentUserRole !== 'admin') {
+       return NextResponse.json({ error: 'Insufficient permissions' }, { status: 403 })
+     }
+ 
+-    // Get target member's role
++    // Get target member's role and email
+     
+
+… [diff truncated: view full diff on GitHub] …

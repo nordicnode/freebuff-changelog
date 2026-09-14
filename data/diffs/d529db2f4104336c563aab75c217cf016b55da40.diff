@@ -1,0 +1,340 @@
+diff --git a/backend/src/tools/constants.ts b/backend/src/tools/constants.ts
+index 8a2ee828f..7f1e39ae2 100644
+--- a/backend/src/tools/constants.ts
++++ b/backend/src/tools/constants.ts
+@@ -26,6 +26,7 @@ import { handleCreatePlan } from './handlers/create-plan'
+ import { handleEndTurn } from './handlers/end-turn'
+ import { handleRunFileChangeHooks } from './handlers/run-file-change-hooks'
+ import { handleRunTerminalCommand } from './handlers/run-terminal-command'
++import { handleStrReplace } from './handlers/str-replace'
+ import { handleUpdateSubgoal } from './handlers/update-subgoal'
+ import { handleWriteFile } from './handlers/write-file'
+ 
+@@ -93,7 +94,6 @@ const WIP_TOOLS = [
+   'read_docs',
+   'read_files',
+   'spawn_agents',
+-  'str_replace',
+   'think_deeply',
+   'update_report',
+   'web_search',
+@@ -134,6 +134,7 @@ const codebuffToolHandlers = {
+   end_turn: handleEndTurn,
+   run_file_change_hooks: handleRunFileChangeHooks,
+   run_terminal_command: handleRunTerminalCommand,
++  str_replace: handleStrReplace,
+   update_subgoal: handleUpdateSubgoal,
+   write_file: handleWriteFile,
+ } satisfies {
+diff --git a/backend/src/tools/handlers/create-plan.ts b/backend/src/tools/handlers/create-plan.ts
+index 3b29d4593..b12c61aac 100644
+--- a/backend/src/tools/handlers/create-plan.ts
++++ b/backend/src/tools/handlers/create-plan.ts
+@@ -1,13 +1,12 @@
+ import { trackEvent } from '@codebuff/common/analytics'
+ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+-import { partition } from 'lodash'
+ import { logger } from '../../util/logger'
+ import {
+   ClientToolCall,
+   CodebuffToolCall,
+   CodebuffToolHandlerFunction,
+ } from '../constants'
+-import { FileProcessingMutableState } from './write-file'
++import { FileProcessingMutableState, postStreamProcessing } from './write-file'
+ 
+ export const handleCreatePlan = ((params: {
+   previousToolCallFinished: Promise<void>
+@@ -86,62 +85,15 @@ export const handleCreatePlan = ((params: {
+   mutableState.promisesByPath[path].push(Promise.resolve(change))
+   mutableState.allPromises.push(Promise.resolve(change))
+ 
+-  const postStreamProcessing = async () => {
+-    const allFileProcessingResults = await Promise.all(mutableState.allPromises)
+-    if (!mutableState.firstFileProcessed) {
+-      ;[mutableState.fileChangeErrors, mutableState.fileChanges] = partition(
+-        allFileProcessingResults,
+-        (result) => 'error' in result
+-      )
+-      if (
+-        mutableState.fileChanges.length === 0 &&
+-        allFileProcessingResults.length > 0
+-      ) {
+-        writeToClient('No changes to existing files.\n')
+-      }
+-      if (mutableState.fileChanges.length > 0) {
+-        writeToClient(`\n`)
+-      }
+-      mutableState.firstFileProcessed = true
+-    }
+-
+-    const toolCallResults: string[] = []
+-
+-    const errors = mutableState.fileChangeErrors.filter(
+-      (result) => result.toolCallId === toolCall.toolCallId
+-    )
+-    toolCallResults.push(
+-      ...errors.map(({ path, error }) => `Error processing ${path}: ${error}`)
+-    )
+-
+-    const changes = mutableState.fileChanges.filter(
+-      (result) => result.toolCallId === toolCall.toolCallId
+-    )
+-    for (const { path, content, patch, tool } of changes) {
+-      const clientResult = await requestClientToolCall({
+-        toolName: 'create_plan',
+-        toolCallId: toolCall.toolCallId,
+-        args: patch
+-          ? {
+-              type: 'patch' as const,
+-              path,
+-              content: patch,
+-            }
+-          : {
+-              type: 'file' as const,
+-              path,
+-              content,
+-            },
+-      })
+-
+-      toolCallResults.push(clientResult)
+-    }
+-
+-    return toolCallResults.join('\n\n')
+-  }
+-
+   return {
+-    result: previousToolCallFinished.then(postStreamProcessing),
++    result: previousToolCallFinished.then(async () => {
++      return await postStreamProcessing(
++        toolCall,
++        mutableState,
++        writeToClient,
++        requestClientToolCall
++      )
++    }),
+     state: { mutableState },
+   }
+ }) satisfies CodebuffToolHandlerFunction<'create_plan'>
+diff --git a/backend/src/tools/handlers/str-replace.ts b/backend/src/tools/handlers/str-replace.ts
+new file mode 100644
+index 000000000..1731eed84
+--- /dev/null
++++ b/backend/src/tools/handlers/str-replace.ts
+@@ -0,0 +1,90 @@
++import { WebSocket } from 'ws'
++import { processStrReplace } from '../../process-str-replace'
++import { logger } from '../../util/logger'
++import { requestOptionalFile } from '../../websockets/websocket-action'
++import {
++  ClientToolCall,
++  CodebuffToolCall,
++  CodebuffToolHandlerFunction,
++} from '../constants'
++import { FileProcessingMutableState, postStreamProcessing } from './write-file'
++
++export const handleStrReplace = ((params: {
++  previousToolCallFinished: Promise<void>
++  toolCall: CodebuffToolCall<'str_replace'>
++  requestClientToolCall: (
++    toolCall: ClientToolCall<'str_replace'>
++  ) => Promise<string>
++  writeToClient: (chunk: string) => void
++
++  state: {
++    ws?: WebSocket
++    mutableState?: FileProcessingMutableState
++  }
++}): {
++  result: Promise<string>
++  state: { mutableState: FileProcessingMutableState }
++} => {
++  const {
++    previousToolCallFinished,
++    toolCall,
++    requestClientToolCall,
++    writeToClient,
++    state,
++  } = params
++  const { path, replacements } = toolCall.args
++  const { ws } = state
++  if (ws === undefined) {
++    throw new Error(
++      'Internal error for str_replace: Missing WebSocket in state'
++    )
++  }
++  const mutableState = {
++    promisesByPath: {},
++    allPromises: [],
++    fileChangeErrors: [],
++    fileChanges: [],
++    firstFileProcessed: false,
++    ...state.mutableState,
++  }
++
++  if (!mutableState.promisesByPath[path]) {
++    mutableState.promisesByPath[path] = []
++  }
++
++  const latestContentPromise = Promise.all(
++    mutableState.promisesByPath[path]
++  ).then((results) => {
++    const previousEdit = results.findLast((r) => 'content' in r)
++    return previousEdit ? previousEdit.content : requestOptionalFile(ws, path)
++  })
++
++  const newPromise = processStrReplace(path, replacements, latestContentPromise)
++    .catch((error: any) => {
++      logger.error(error, 'Error processing str_replace block')
++      return {
++        tool: 'str_replace' as const,
++        path,
++        error: 'Unknown error: Failed to process the str_replace block.',
++      }
++    })
++    .then((fileProcessingResult) => ({
++      ...fileProcessingResult,
++      toolCallId: toolCall.toolCallId,
++    }))
++
++  mutableState.promisesByPath[path].push(newPromise)
++  mutableState.allPromises.push(newPromise)
++
++  return {
++    result: previousToolCallFinished.then(async () => {
++      return await postStreamProcessing(
++        toolCall,
++        mutableState,
++        writeToClient,
++        requestClientToolCall
++      )
++    }),
++    state: { mutableState },
++  }
++}) satisfies CodebuffToolHandlerFunction<'str_replace'>
+diff --git a/backend/src/tools/handlers/write-file.ts b/backend/src/tools/handlers/write-file.ts
+index 7749c0693..a18797df6 100644
+--- a/backend/src/tools/handlers/write-file.ts
++++ b/backend/src/tools/handlers/write-file.ts
+@@ -149,62 +149,69 @@ export const handleWriteFile = ((params: {
+   fileProcessingPromisesByPath[path].push(newPromise)
+   fileProcessingPromises.push(newPromise)
+ 
+-  const postStreamProcessing = async () => {
+-    const allFileProcessingResults = await Promise.all(fileProcessingPromises)
+-    if (!mutableState.firstFileProcessed) {
+-      ;[mutableState.fileChangeErrors, mutableState.fileChanges] = partition(
+-        allFileProcessingResults,
+-        (result) => 'error' in result
++  return {
++    result: previousToolCallFinished.then(async () => {
++      return await postStreamProcessing(
++        toolCall,
++        mutableState,
++        writeToClient,
++        requestClientToolCall
+       )
+-      if (
+-        mutableState.fileChanges.length === 0 &&
+-        allFileProcessingResults.length > 0
+-      ) {
+-        writeToClient('No changes to existing files.\n')
+-      }
+-      if (mutableState.fileChanges.length > 0) {
+-        writeToClient(`\n`)
+-      }
+-      mutableState.firstFileProcessed = true
+-    }
+-
+-    const toolCallResults: string[] = []
+-
+-    const errors = mutableState.fileChangeErrors.filter(
+-      (result) => result.toolCallId === toolCall.toolCallId
+-    )
+-    toolCallResults.push(
+-      ...errors.map(({ path, error }) => `Error processing ${path}: ${error}`)
+-    )
++    }),
++    state: { mutableState },
++  }
++}) satisfies CodebuffToolHandlerFunction<'write_file'>
+ 
+-    const changes = mutableState.fileChanges.filter(
+-      (result) => result.toolCallId === toolCall.toolCallId
++export async function postStreamProcessing<
++  T extends 'write_file' | 'str_replace' | 'create_plan',
++>(
++  toolCall: CodebuffToolCall<T>,
++  mutableState: FileProcessingMutableState,
++  writeToClient: (chunk: string) => void,
++  requestClientToolCall: (toolCall: ClientToolCall<T>) => Promise<string>
++) {
++  const allFileProcessingResults = await Promise.all(mutableState.allPromises)
++  if (!mutableState.firstFileProcessed) {
++    ;[mutableState.fileChangeErrors, mutableState.fileChanges] = partition(
++      allFileProcessingResults,
++      (result) => 'error' in result
+     )
+-    for (const { path, content, patch, tool } of changes) {
+-      const clientResult = await requestClientToolCall({
+-        toolName: 'write_file',
+-        toolCallId: toolCall.toolCallId,
+-        args: patch
+-          ? {
+-              type: 'patch' as const,
+-              path,
+-              content: patch,
+-            }
+-          : {
+-              type: 'file' as const,
+-              path,
+-              content,
+-            },
+-      })
+-
+-      toolCallResults.push(clientResult)
++    if (
++      mutableState.fileChanges.length === 0 &&
++      allFileProcessingResults.length > 0
++    ) {
++      writeToClient('No changes to existing files.\n')
+     }
+-
+-    return toolCallResults.join('\n\n')
++    if (mutableState.fileChanges.length > 0) {
++      writeToClient(`\n`)
++    }
++    mutableState.firstFileProcessed = true
+   }
+ 
+-  return {
+-    result: previousToolCallFinished.then(postStreamProcessing),
+-    state: { mutableState },
++  const toolCallResults: string[] = []
++
++  const errors = mutableState.fileChangeErrors.filter(
++    (result) => result.toolCallId === toolCall.toolCallId
++  )
++  toolCallResults.push(
++    ...errors.map(({ path, error }) => `Error processing ${path}: ${error}`)
++  )
++
++  const changes = mutableState.fileChanges.filter(
++    (result) => result.toolCallId === toolCall.toolCallId
++  )
++  for (const { path, content, patch } of changes) {
++    const clientToolCall: ClientToolCall<T> = {
++      toolCallId: toolCall.toolCallId,
++      toolName: toolCall.toolName,
++      args: patch
++        ? { type: 'patch' as const, path, content: patch }
++        : { type: 'file' as const, path, content },
++    } as ClientToolCall<T>
++    const clientResult = await requestClientToolCall(clientToolCall)
++
++    toolCallResults.push(clientResult)
+   }
+-}) satisfies CodebuffToolHandlerFunction<'write_file'>
++
++  return toolCallResults.join('\n\n')
++}

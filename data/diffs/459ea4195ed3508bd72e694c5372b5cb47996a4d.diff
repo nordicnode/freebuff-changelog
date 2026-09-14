@@ -1,0 +1,206 @@
+diff --git a/npm-app/src/checkpoints/checkpoint-manager.ts b/npm-app/src/checkpoints/checkpoint-manager.ts
+index ea6470104..b981766c0 100644
+--- a/npm-app/src/checkpoints/checkpoint-manager.ts
++++ b/npm-app/src/checkpoints/checkpoint-manager.ts
+@@ -37,6 +37,7 @@ interface WorkerResponse {
+   result?: unknown
+   /** Error message if operation failed */
+   error?: string
++  message: WorkerMessage
+ }
+ 
+ /**
+@@ -49,6 +50,7 @@ export interface Checkpoint {
+   /** Number of messages in the agent's history at checkpoint time */
+   historyLength: number
+   id: number
++  parentId: number
+   timestamp: number
+   /** User input that triggered this checkpoint */
+   userInput: string
+@@ -61,8 +63,12 @@ export interface Checkpoint {
+  */
+ export class CheckpointManager {
+   checkpoints: Array<Checkpoint> = []
+-  private bareRepoPath: string | null = null
++  currentCheckpointId: number = 0
+   disabledReason: string | null = null
++
++  private bareRepoPath: string | null = null
++  /** Stores the undo chain (leaf node first, current node last) */
++  private undoIds: Array<number> = []
+   /** Worker thread for git operations */
+   private worker: Worker | null = null
+ 
+@@ -95,6 +101,11 @@ export class CheckpointManager {
+       const timeoutMs = 30000 // 30 seconds timeout
+ 
+       const handler = (response: WorkerResponse) => {
++        for (const key of ['type', 'commit', 'message'] as const) {
++          if (response.message[key] !== message[key]) {
++            return
++          }
++        }
+         if (response.success) {
+           resolve(response.result as T)
+         } else {
+@@ -173,11 +184,14 @@ export class CheckpointManager {
+       fileStateIdPromise,
+       historyLength: agentState.messageHistory.length,
+       id,
++      parentId: this.currentCheckpointId,
+       timestamp: Date.now(),
+       userInput,
+     }
+ 
+     this.checkpoints.push(checkpoint)
++    this.currentCheckpointId = id
++    this.undoIds = []
+     return checkpoint
+   }
+ 
+@@ -200,6 +214,10 @@ export class CheckpointManager {
+    * @returns True if restoration succeeded, false if checkpoint not found
+    */
+   async restoreCheckointFileState(id: number): Promise<boolean> {
++    if (this.disabledReason !== null) {
++      return false
++    }
++
+     const checkpoint = this.checkpoints[id - 1]
+     if (!checkpoint) {
+       return false
+@@ -217,14 +235,64 @@ export class CheckpointManager {
+       commit: await checkpoint.fileStateIdPromise,
+       relativeFilepaths,
+     })
++    this.currentCheckpointId = id
+     return true
+   }
+ 
++  async restoreUndoCheckpoint(): Promise<boolean> {
++    if (this.disabledReason !== null) {
++      return false
++    }
++
++    const currentCheckpoint = this.checkpoints[this.currentCheckpointId - 1]
++    if (!currentCheckpoint) {
++      return false
++    }
++
++    if (currentCheckpoint.parentId === 0) {
++      return false
++    }
++
++    const restored = await this.restoreCheckointFileState(
++      currentCheckpoint.parentId
++    )
++    if (!restored) {
++      return false
++    }
++
++    this.undoIds.push(currentCheckpoint.id)
++
++    return true
++  }
++
++  async restoreRedoCheckpoint(): Promise<boolean> {
++    if (this.disabledReason !== null) {
++      return false
++    }
++
++    const targetId = this.undoIds.pop()
++    // Check if targetId is either 0 or undefined
++    if (!targetId) {
++      return false
++    }
++
++    console.log('asdf', {targetId})
++    const restored = await this.restoreCheckointFileState(targetId)
++    if (restored) {
++      return true
++    }
++
++    this.undoIds.push(targetId)
++    return false
++  }
++
+   /**
+    * Clear all checkpoints
+    */
+   clearCheckpoints(): void {
+     this.checkpoints = []
++    this.currentCheckpointId = 0
++    this.undoIds = []
+   }
+ 
+   /**
+diff --git a/npm-app/src/cli.ts b/npm-app/src/cli.ts
+index 38a41a0c4..1b2413c10 100644
+--- a/npm-app/src/cli.ts
++++ b/npm-app/src/cli.ts
+@@ -255,6 +255,11 @@ export class CLI {
+       this.handleUndo()
+       return true
+     }
++    if (userInput === 'redo') {
++      await this.saveCheckpoint(userInput)
++      this.handleRedo()
++      return true
++    }
+     if (userInput === 'quit' || userInput === 'exit' || userInput === 'q') {
+       this.handleExit()
+       return true
+@@ -362,21 +367,29 @@ export class CLI {
+       return
+     }
+ 
+-    const checkpoint = checkpointManager.getLatestCheckpoint()
+-    if (checkpoint === null) {
+-      console.log(red('Unable to undo: internal error: no checkpoints found'))
+-      this.freshPrompt()
+-      return
++    if (await checkpointManager.restoreUndoCheckpoint()) {
++      console.log(green(`Checkpoint #${checkpointManager.currentCheckpointId} restored.`))
++    } else {
++      console.log(red('Unable to undo'))
+     }
++    this.freshPrompt()
++  }
+ 
+-    // Get previous checkpoint number (not including undo command)
+-    const checkpointId = checkpoint.id - 1
+-    if (checkpointId < 1) {
+-      console.log(red('Nothing to undo.'))
++  private async handleRedo(): Promise<void> {
++    if (checkpointManager.disabledReason !== null) {
++      console.log(
++        red(`Checkpoints not enabled: ${checkpointManager.disabledReason}`)
++      )
+       this.freshPrompt()
+       return
+     }
+-    await this.handleRestoreCheckpoint(checkpointId)
++
++    if (await checkpointManager.restoreRedoCheckpoint()) {
++      console.log(green(`Checkpoint #${checkpointManager.currentCheckpointId} restored.`))
++    } else {
++      console.log(red('Unable to redo'))
++    }
++    this.freshPrompt()
+   }
+ 
+   private handleKeyPress(str: string, key: any) {
+diff --git a/npm-app/src/workers/checkpoint-worker.ts b/npm-app/src/workers/checkpoint-worker.ts
+index ef6adf9d4..52a37f6ea 100644
+--- a/npm-app/src/workers/checkpoint-worker.ts
++++ b/npm-app/src/workers/checkpoint-worker.ts
+@@ -50,7 +50,7 @@ if (maybeParentPort) {
+         throw new Error(`Unknown operation type: ${type}`)
+       }
+ 
+-      parentPort.postMessage({ success: true, result })
++      parentPort.postMessage({ success: true, result, message })
+     } catch (error) {
+       parentPort.postMessage({ 
+         success: false, 

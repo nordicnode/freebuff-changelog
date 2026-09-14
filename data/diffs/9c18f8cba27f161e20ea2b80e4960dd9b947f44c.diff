@@ -1,0 +1,281 @@
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index ab327aacb..c252b5127 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -11,6 +11,7 @@ import { WebSocket } from 'ws'
+ import { renderToolResults } from '@codebuff/common/constants/tools'
+ import { checkTerminalCommand } from './check-terminal-command'
+ import { loopAgentSteps } from './run-agent-step'
++import { agentRegistry } from './templates/agent-registry'
+ import { ClientToolCall } from './tools/constants'
+ import { logger } from './util/logger'
+ import { expireMessages } from './util/messages'
+@@ -39,6 +40,8 @@ export const mainPrompt = async (
+     fingerprintId,
+     costMode,
+     promptId,
++    agentId,
++    promptParams,
+   } = action
+   const { fileContext, mainAgentState } = sessionState
+ 
+@@ -98,20 +101,46 @@ export const mainPrompt = async (
+     }
+   }
+ 
+-  const agentType = (
+-    {
+-      ask: AgentTemplateTypes.ask,
+-      lite: AgentTemplateTypes.base_lite,
+-      normal: AgentTemplateTypes.base,
+-      max: AgentTemplateTypes.base_max,
+-      experimental: AgentTemplateTypes.base_experimental,
+-    } satisfies Record<CostMode, AgentTemplateType>
+-  )[costMode]
++  // Determine agent type - prioritize CLI agent selection over cost mode
++  let agentType: AgentTemplateType
++
++  if (agentId) {
++    // Initialize agent registry to validate agent ID
++    await agentRegistry.initialize(fileContext)
++
++    if (!agentRegistry.hasAgent(agentId)) {
++      const availableAgents = agentRegistry.getAvailableTypes()
++      throw new Error(
++        `Invalid agent ID: "${agentId}". Available agents: ${availableAgents.join(', ')}`
++      )
++    }
++
++    agentType = agentId
++    logger.info(
++      {
++        agentId,
++        promptParams,
++        prompt: prompt?.slice(0, 50),
++      },
++      `Using CLI-specified agent: ${agentId}`
++    )
++  } else {
++    // Fall back to cost mode mapping
++    agentType = (
++      {
++        ask: AgentTemplateTypes.ask,
++        lite: AgentTemplateTypes.base_lite,
++        normal: AgentTemplateTypes.base,
++        max: AgentTemplateTypes.base_max,
++        experimental: AgentTemplateTypes.base_experimental,
++      } satisfies Record<CostMode, AgentTemplateType>
++    )[costMode]
++  }
+ 
+   const { agentState } = await loopAgentSteps(ws, {
+     userInputId: promptId,
+     prompt,
+-    params: undefined,
++    params: promptParams,
+     agentType,
+     agentState: mainAgentState,
+     fingerprintId,
+diff --git a/common/src/actions.ts b/common/src/actions.ts
+index 56a1b2c7a..c4201e4d2 100644
+--- a/common/src/actions.ts
++++ b/common/src/actions.ts
+@@ -23,6 +23,7 @@ export const CLIENT_ACTION_SCHEMA = z.discriminatedUnion('type', [
+     type: z.literal('prompt'),
+     promptId: z.string(),
+     prompt: z.string().or(z.undefined()),
++    promptParams: z.record(z.string(), z.any()).optional(), // Additional json params.
+     fingerprintId: z.string(),
+     authToken: z.string().optional(),
+     costMode: z.enum(costModes).optional().default('normal'),
+@@ -30,6 +31,7 @@ export const CLIENT_ACTION_SCHEMA = z.discriminatedUnion('type', [
+     toolResults: z.array(toolResultSchema),
+     model: z.string().optional(),
+     repoUrl: z.string().optional(),
++    agentId: z.string().optional(),
+   }),
+   z.object({
+     type: z.literal('read-files-response'),
+diff --git a/npm-app/src/cli-definitions.ts b/npm-app/src/cli-definitions.ts
+index 775838e81..89f4ea673 100644
+--- a/npm-app/src/cli-definitions.ts
++++ b/npm-app/src/cli-definitions.ts
+@@ -34,6 +34,19 @@ export const cliOptions: CliParam[] = [
+       'Initialize codebuff on this project for a smoother experience',
+     menuDescription: 'Initialize Codebuff for the project',
+   },
++  {
++    flags: '--agent <agent-id>',
++    description:
++      'Specify which agent to invoke (e.g., "file_picker", "reviewer", "thinker")',
++    menuDescription: 'Invoke a specific agent by ID',
++    hidden: false,
++  },
++  {
++    flags: '--params <json>',
++    description: 'JSON parameters to pass to the agent',
++    menuDescription: 'JSON parameters for the agent',
++    hidden: false,
++  },
+   {
+     flags: '--model <model>',
+     description:
+diff --git a/npm-app/src/cli.ts b/npm-app/src/cli.ts
+index 760c0a38f..a7a40e508 100644
+--- a/npm-app/src/cli.ts
++++ b/npm-app/src/cli.ts
+@@ -94,6 +94,8 @@ export class CLI {
+   private readyPromise: Promise<any>
+   private git: GitCommand
+   private costMode: CostMode
++  public agent?: string
++  public initialParams?: Record<string, any>
+   private isReceivingResponse: boolean = false
+   private stopResponse: (() => void) | null = null
+   private lastSigintTime: number = 0
+@@ -107,10 +109,12 @@ export class CLI {
+ 
+   private constructor(
+     readyPromise: Promise<[ProjectFileContext, void]>,
+-    { git, costMode, model }: CliOptions
++    { git, costMode, model, agent, params }: CliOptions
+   ) {
+     this.git = git
+     this.costMode = costMode
++    this.agent = agent
++    this.initialParams = params
+ 
+     this.setupSignalHandlers()
+     this.initReadlineInterface()
+diff --git a/npm-app/src/client.ts b/npm-app/src/client.ts
+index 7f566c027..d441f0feb 100644
+--- a/npm-app/src/client.ts
++++ b/npm-app/src/client.ts
+@@ -940,9 +940,6 @@ export class Client {
+     loggerContext.clientRequestId = userInputId
+     const startTime = Date.now() // Capture start time
+ 
+-    // Check if we're in manager mode using CLI's isManagerMode flag
+-    const cli = CLI.getInstance()
+-
+     const f = this.subscribeToResponse.bind(this)
+ 
+     const { responsePromise, stopResponse } = f(
+@@ -987,11 +984,18 @@ export class Client {
+ 
+     Spinner.get().start('Thinking...')
+ 
+-    const action = {
++    // Get agent and params from CLI instance
++    const cli = CLI.getInstance()
++    const cliAgent = cli.agent
++    const cliParams = cli.initialParams
++    cli.initialParams = undefined
++
++    const action: ClientAction = {
++      type: 'prompt',
+       promptId: userInputId,
+       prompt: cleanPrompt,
+-      originalPrompt: prompt, // Keep original for context
+-      preferredAgents,
++      agentId: cliAgent, // Add explicit agent selection
++      promptParams: cliParams, // Add parsed params
+       sessionState: this.sessionState,
+       toolResults,
+       fingerprintId: await this.fingerprintId,
+@@ -999,12 +1003,9 @@ export class Client {
+       costMode: this.costMode,
+       model: this.model,
+       repoUrl: loggerContext.repoUrl,
+-      repoName: loggerContext.repoName,
++      // repoName: loggerContext.repoName,
+     }
+-    this.webSocket.sendAction({
+-      type: 'prompt',
+-      ...action,
+-    })
++    this.webSocket.sendAction(action)
+ 
+     return {
+       responsePromise,
+diff --git a/npm-app/src/index.ts b/npm-app/src/index.ts
+index daf053281..f95b9dd82 100644
+--- a/npm-app/src/index.ts
++++ b/npm-app/src/index.ts
+@@ -25,7 +25,7 @@ import { logger } from './utils/logger'
+ 
+ async function codebuff(
+   projectDir: string | undefined,
+-  { initialInput, git, costMode, runInitFlow, model }: CliOptions
++  { initialInput, git, costMode, runInitFlow, model, agent, params }: CliOptions
+ ) {
+   initSquashNewLines()
+   enableSquashNewlines()
+@@ -52,7 +52,7 @@ async function codebuff(
+   ])
+ 
+   // Initialize the CLI singleton
+-  CLI.initialize(readyPromise, { git, costMode, model })
++  CLI.initialize(readyPromise, { git, costMode, model, agent, params })
+   const cli = CLI.getInstance()
+ 
+   await cli.printInitialPrompt({ initialInput, runInitFlow })
+@@ -89,6 +89,8 @@ Examples:
+   $ codebuff                            # Start in current directory
+   $ codebuff my-project                 # Start in specific directory
+   $ codebuff --create nextjs my-app     # Create and scaffold a new Next.js project
++  $ codebuff --agent file_picker "find relevant files for authentication"
++  $ codebuff --agent reviewer --params '{"focus": "security"}' "review this code"
+ 
+ For all commands and options, run 'codebuff' and then type 'help'.
+ `
+@@ -141,6 +143,19 @@ For all commands and options, run 'codebuff' and then type 'help'.
+   // Handle git integration
+   const git = options.git === 'stage' ? ('stage' as const) : undefined
+ 
++  // Parse agent params if provided
++  let parsedAgentParams: Record<string, any> | undefined
++  if (options.params) {
++    try {
++      parsedAgentParams = JSON.parse(options.params)
++    } catch (error) {
++      console.error(
++        red(`Error parsing --params JSON: ${error}`)
++      )
++      process.exit(1)
++    }
++  }
++
+   // Get project directory and initial input
+   const projectPath = args[0]
+   const initialInput = args.slice(1).join(' ')
+@@ -151,5 +166,7 @@ For all commands and options, run 'codebuff' and then type 'help'.
+     costMode,
+     runInitFlow: options.init,
+     model: options.model,
++    agent: options.agent,
++    params: parsedAgentParams,
+   })
+ }
+diff --git a/npm-app/src/types.ts b/npm-app/src/types.ts
+index 4d69be898..c9696658c 100644
+--- a/npm-app/src/types.ts
++++ b/npm-app/src/types.ts
+@@ -1,13 +1,15 @@
+-import { CostMode } from '@codebuff/common/constants'
++import type { CostMode } from '@codebuff/common/constants'
+ 
+ export type GitCommand = 'stage' | undefined
+ 
+ export interface CliOptions {
+   initialInput?: string
+-  git: GitCommand
++  git?: GitCommand
+   costMode: CostMode
+   runInitFlow?: boolean
+   model?: string
++  agent?: string
++  params?: Record<string, any>
+ }
+ 
+ /**

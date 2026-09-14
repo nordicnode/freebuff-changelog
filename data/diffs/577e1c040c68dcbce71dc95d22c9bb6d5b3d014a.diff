@@ -1,0 +1,360 @@
+diff --git a/backend/src/prompts.ts b/backend/src/prompts.ts
+index c867db658..f03d219ac 100644
+--- a/backend/src/prompts.ts
++++ b/backend/src/prompts.ts
+@@ -1,4 +1,5 @@
+ import { Tool } from '@anthropic-ai/sdk/resources'
++import { WebSocket } from 'ws'
+ 
+ import { promptClaudeStream, promptClaude, model_types } from './claude'
+ import {
+@@ -6,8 +7,6 @@ import {
+   createFileBlock,
+   parseFileBlocks,
+   fileRegex,
+-  parseFileBlocksWithoutPath,
+-  createFileBlockWithoutPath,
+ } from '@manicode/common/src/util/file'
+ import { getSystemPrompt } from './system-prompt'
+ import { STOP_MARKER } from '@manicode/common/src/prompts'
+@@ -15,6 +14,7 @@ import { getTools } from './tools'
+ import { Message } from 'common/src/actions'
+ import { ToolCall } from 'common/src/actions'
+ import { debugLog } from './debug'
++import { requestFile } from './websockets/websocket-action'
+ 
+ export const getInitialPrompt = (userPrompt: string) => {
+   return `
+@@ -112,6 +112,7 @@ ${userPrompt}`
+ }
+ 
+ export async function promptClaudeAndGetFileChanges(
++  ws: WebSocket,
+   messages: Message[],
+   fileContext: ProjectFileContext,
+   onResponseChunk: (chunk: string) => void
+@@ -133,20 +134,6 @@ export async function promptClaudeAndGetFileChanges(
+   const system = getSystemPrompt(fileContext)
+   const tools = getTools()
+ 
+-  const fileBlocksFromToolCalls = parseFileBlocks(
+-    messages
+-      .filter((m) => typeof m.content === 'object')
+-      .map((m) => m.content)
+-      .flat()
+-      .filter(
+-        (c) => typeof c === 'object' && 'type' in c && c.type === 'tool_result'
+-      )
+-      .map((c) => (c as any).content as string)
+-      .join('\n')
+-  )
+-
+-  debugLog('File blocks from tool calls:', Object.keys(fileBlocksFromToolCalls))
+-
+   while (!isComplete) {
+     const messagesWithContinuedMessage = continuedMessage
+       ? [...messages, continuedMessage]
+@@ -170,16 +157,8 @@ export async function promptClaudeAndGetFileChanges(
+ 
+       const fileBlocks = parseFileBlocks(currentFileBlock)
+       for (const [filePath, newFileContent] of Object.entries(fileBlocks)) {
+-        // TODO: Include newly created files?
+-        const oldContent: string | undefined = fileBlocksFromToolCalls[filePath]
+         fileProcessingPromises.push(
+-          processFileBlock(
+-            messages,
+-            fileContext,
+-            filePath,
+-            oldContent,
+-            newFileContent
+-          )
++          processFileBlock(ws, messages, filePath, newFileContent)
+         )
+ 
+         currentFileBlock = currentFileBlock.replace(fileRegex, '')
+@@ -258,26 +237,20 @@ async function promptClaudeWithContinuation(
+ }
+ 
+ async function processFileBlock(
++  ws: WebSocket,
+   messageHistory: Message[],
+-  fileContext: ProjectFileContext,
+   filePath: string,
+-  oldContent: string | undefined,
+   newContent: string
+ ) {
+-  
+   debugLog('Processing file block', filePath)
+-  const fileExisted = fileContext.filePaths.includes(filePath)
+ 
+-  if (!fileExisted) {
++  const oldContent = await requestFile(ws, filePath)
++
++  if (oldContent === null) {
+     debugLog(`Created new file: ${filePath}`)
+     return [{ filePath, old: '', new: newContent }]
+   }
+ 
+-  if (!oldContent) {
+-    debugLog(`Error: Old content not found for file: ${filePath}`)
+-    return []
+-  }
+-
+   // File exists, generate diff
+   const diffBlocks = await generateDiffBlocks(
+     messageHistory,
+diff --git a/backend/src/websockets/websocket-action.ts b/backend/src/websockets/websocket-action.ts
+index befac5073..140b7ca81 100644
+--- a/backend/src/websockets/websocket-action.ts
++++ b/backend/src/websockets/websocket-action.ts
+@@ -1,9 +1,9 @@
+ import { WebSocket } from 'ws'
+ import { ClientMessage } from '@manicode/common/src/websockets/websocket-schema'
+-import { ProjectFileContext } from 'common/src/util/file'
+ import { promptClaudeAndGetFileChanges } from '../prompts'
+ import { ClientAction, ServerAction } from 'common/src/actions'
+ import { sendMessage } from './server'
++import { isEqual } from 'lodash'
+ 
+ const sendAction = (ws: WebSocket, action: ServerAction) => {
+   sendMessage(ws, {
+@@ -13,13 +13,14 @@ const sendAction = (ws: WebSocket, action: ServerAction) => {
+ }
+ 
+ const onUserInput = async (
+-  ws: WebSocket,
+-  { messages, fileContext }: Extract<ClientAction, { type: 'user-input' }>
++  { messages, fileContext }: Extract<ClientAction, { type: 'user-input' }>,
++  ws: WebSocket
+ ) => {
+   const lastMessage = messages[messages.length - 1]
+   if (typeof lastMessage.content === 'string')
+     console.log('Input:', lastMessage)
+   const { changes, toolCall, response } = await promptClaudeAndGetFileChanges(
++    ws,
+     messages,
+     fileContext,
+     (chunk) =>
+@@ -46,21 +47,63 @@ const onUserInput = async (
+   }
+ }
+ 
++const callbacksByAction = {} as Record<
++  ClientAction['type'],
++  ((action: ClientAction, ws: WebSocket) => void)[]
++>
++
++export const subscribeToAction = <T extends ClientAction['type']>(
++  type: T,
++  callback: (action: Extract<ClientAction, { type: T }>, ws: WebSocket) => void
++) => {
++  callbacksByAction[type] = (callbacksByAction[type] ?? []).concat(
++    callback as (action: ClientAction, ws: WebSocket) => void
++  )
++  return () => {
++    callbacksByAction[type] = (callbacksByAction[type] ?? []).filter(
++      (cb) => cb !== callback
++    )
++  }
++}
++
+ export const onWebsocketAction = async (
+   ws: WebSocket,
+   msg: ClientMessage & { type: 'action' }
+ ) => {
++  const callbacks = callbacksByAction[msg.data.type] ?? []
+   try {
+-    switch (msg.data.type) {
+-      case 'user-input':
+-        await onUserInput(ws, msg.data)
+-        return
++    for (const callback of callbacks) {
++      callback(msg.data, ws)
+     }
+   } catch (e) {
+     console.error(
+-      'Got error running websocket action',
++      'Got error running subscribeToAction callback',
+       msg,
+       e && typeof e === 'object' && 'message' in e ? e.message : e
+     )
+   }
+ }
++
++subscribeToAction('user-input', onUserInput)
++
++export async function requestFiles(ws: WebSocket, filePaths: string[]) {
++  return new Promise<Record<string, string | null>>((resolve) => {
++    const unsubscribe = subscribeToAction('read-files-response', (action) => {
++      console.log('read-files-response', action)
++      const receivedFilePaths = Object.keys(action.files)
++      if (isEqual(receivedFilePaths, filePaths)) {
++        unsubscribe()
++        resolve(action.files)
++      }
++    })
++    sendAction(ws, {
++      type: 'read-files',
++      filePaths,
++    })
++  })
++}
++
++export async function requestFile(ws: WebSocket, filePath: string) {
++  const files = await requestFiles(ws, [filePath])
++  return files[filePath]
++}
+\ No newline at end of file
+diff --git a/common/src/actions.ts b/common/src/actions.ts
+index 32eaf6a5e..7788677eb 100644
+--- a/common/src/actions.ts
++++ b/common/src/actions.ts
+@@ -48,15 +48,15 @@ export const CLIENT_ACTIONS = {
+     messages: z.array(MessageSchema),
+     fileContext: ProjectFileContextSchema,
+   }),
+-  somethingElse: z.object({
+-    type: z.literal('something-else'),
+-    message: z.string(),
++  readFilesResponse: z.object({
++    type: z.literal('read-files-response'),
++    files: z.record(z.string(), z.union([z.string(), z.null()])),
+   }),
+ } as const
+ 
+ export const CLIENT_ACTION_SCHEMA = z.union([
+   CLIENT_ACTIONS.userInput,
+-  CLIENT_ACTIONS.somethingElse,
++  CLIENT_ACTIONS.readFilesResponse,
+ ])
+ export type ClientAction = z.infer<typeof CLIENT_ACTION_SCHEMA>
+ 
+@@ -69,6 +69,10 @@ export const SERVER_ACTIONS = {
+     type: z.literal('change-files'),
+     changes: CHANGES,
+   }),
++  readFiles: z.object({
++    type: z.literal('read-files'),
++    filePaths: z.array(z.string()),
++  }),
+   toolCall: z.object({
+     type: z.literal('tool-call'),
+     response: z.string(),
+@@ -78,6 +82,7 @@ export const SERVER_ACTIONS = {
+ export const SERVER_ACTION_SCHEMA = z.union([
+   SERVER_ACTIONS.responseChunk,
+   SERVER_ACTIONS.changeFiles,
++  SERVER_ACTIONS.readFiles,
+   SERVER_ACTIONS.toolCall,
+ ])
+ export type ServerAction = z.infer<typeof SERVER_ACTION_SCHEMA>
+diff --git a/common/src/util/object.ts b/common/src/util/object.ts
+index e57e847a2..9d424546e 100644
+--- a/common/src/util/object.ts
++++ b/common/src/util/object.ts
+@@ -87,4 +87,16 @@ export const hasSignificantDeepChanges = <T extends object>(
+   }
+ 
+   return false
++}
++
++export const filterObject = <T extends object>(obj: T, predicate: (value: any, key: keyof T) => boolean): { [P in keyof T]: T[P] } => {
++  const result = {} as { [P in keyof T]: T[P] }
++  for (const key in obj) {
++    if (Object.prototype.hasOwnProperty.call(obj, key)) {
++      if (predicate(obj[key], key)) {
++        result[key] = obj[key]
++      }
++    }
++  }
++  return result
+ }
+\ No newline at end of file
+diff --git a/musings.knowledge.md b/musings.knowledge.md
+index 70c0cfe8f..4690b0aa0 100644
+--- a/musings.knowledge.md
++++ b/musings.knowledge.md
+@@ -165,3 +165,4 @@ Problems
+ - Should indicate if diff is still generating somehow...
+ - Improve speed by prompting it to rely more on diffs instead of reproducing the whole file
+ - Prompt engineer it to automatically make knowledge changes when you correct it
++- it's doing a poor job loading all the relevant files into context. Need to add more explicity steps for this.
+diff --git a/src/index.ts b/src/index.ts
+index 92e0b5259..fca429d92 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -7,6 +7,7 @@ import {
+   applyChanges,
+   getProjectFileContext,
+   getFileBlocks,
++  getFiles,
+ } from './project-files'
+ import { APIRealtimeClient } from 'common/src/websockets/websocket-client'
+ import { Message } from 'common/src/actions'
+@@ -120,6 +121,16 @@ async function manicode(userPrompt: string | undefined) {
+     }
+   })
+ 
++  ws.subscribe('read-files', (a) => {
++    const { filePaths } = a
++    const files = getFiles(filePaths)
++
++    ws.sendAction({
++      type: 'read-files-response',
++      files,
++    })
++  })
++
+   const rl = readline.createInterface({
+     input: process.stdin,
+     output: process.stdout,
+diff --git a/src/project-files.ts b/src/project-files.ts
+index f4fa3424d..a97210ac2 100644
+--- a/src/project-files.ts
++++ b/src/project-files.ts
+@@ -7,6 +7,7 @@ import {
+   ProjectFileContext,
+ } from '@manicode/common/src/util/file'
+ import { FileChanges } from 'common/src/actions'
++import { filterObject } from '@manicode/common'
+ 
+ const projectRoot = path.normalize(path.resolve(__dirname, '..'))
+ 
+@@ -29,8 +30,7 @@ export const applyChanges = (changes: FileChanges) => {
+       fs.writeFileSync(fullPath, updatedContent, 'utf8')
+       console.log(fileAlreadyExists ? 'Updated' : 'Created', filePath)
+       changesSuceeded.push(change)
+-    }
+-    else {
++    } else {
+       console.log('No changes to', filePath)
+     }
+   }
+@@ -91,15 +91,22 @@ function getProjectFilePaths() {
+ }
+ 
+ function getKnowledgeFiles(knowledgeFilePaths: string[]) {
+-  return getFiles(knowledgeFilePaths)
++  return filterObject(
++    getFiles(knowledgeFilePaths),
++    (value) => value !== null
++  ) as Record<string, string>
+ }
+ 
+-function getFiles(filePaths: string[]) {
+-  const result: Record<string, string> = {}
++export function getFiles(filePaths: string[]) {
++  const result: Record<string, string | null> = {}
+   for (const filePath of filePaths) {
+     const fullPath = path.join(projectRoot, filePath)
+-    const content = fs.readFileSync(fullPath, 'utf8')
+-    result[filePath] = content
++    try {
++      const content = fs.readFileSync(fullPath, 'utf8')
++      result[filePath] = content
++    } catch (error) {
++      result[filePath] = null
++    }
+   }
+   return result
+ }

@@ -1,0 +1,1526 @@
+diff --git a/cli/knowledge.md b/cli/knowledge.md
+index f856d13d6..a901b8fe7 100644
+--- a/cli/knowledge.md
++++ b/cli/knowledge.md
+@@ -507,7 +507,36 @@ The bug occurred when tool toggles were rendered. Agent toggles worked fine, but
+ 
+ ## Toggle Branch Rendering
+ 
+-Agent and tool toggles in the TUI render inside `<text>` components. Expanded content must resolve to plain strings or StyledText-compatible fragments (`<span>`, `<strong>`, `<em>`).
++Agent and tool toggles in the TUI render inside `<text>` components. Expanded content must resolve to plain strings or StyledText-compatible fragments (`<span>`, `<strong>`, `<em>`). Any React tree we pass into a toggle must either already be a `<text>` node or be wrapped in one so that downstream child elements never escape a text container. If we hand off plain markdown React fragments directly to `<box>`, OpenTUI will crash because the fragments often expand to bare `<span>` elements.
++
++Example:
++Tool markdown output (via `renderMarkdown`) now gets wrapped in a `<text>` element before reaching `BranchItem`. Without this wrapper, the renderer emits `<span>` nodes that hit `<box>` and cause `Component of type "span" must be created inside of a text node`. Wrapping the markdown and then composing it with any extra metadata keeps OpenTUI happy.
++
++  ```tsx
++  const displayContent = renderContentWithMarkdown(fullContent, false, options)
++
++  const renderableDisplayContent =
++    displayContent
++      ? (
++          <text
++            fg={resolveThemeColor(theme.agentText)}
++            style={{ wrapMode: 'word' }}
++            attributes={theme.messageTextAttributes || undefined}
++          >
++            {displayContent}
++          </text>
++        )
++      : null
++
++  const combinedContent = toolRenderConfig.content ? (
++    <box style={{ flexDirection: 'column', gap: renderableDisplayContent ? 1 : 0 }}>
++      <box style={{ flexDirection: 'column', gap: 0 }}>
++        {toolRenderConfig.content}
++      </box>
++      {renderableDisplayContent}
++    </box>
++  ) : renderableDisplayContent
++  ```
+ 
+ ### TextNodeRenderable Constraint
+ 
+diff --git a/cli/package.json b/cli/package.json
+index adbde6d11..d6b230a90 100644
+--- a/cli/package.json
++++ b/cli/package.json
+@@ -33,8 +33,8 @@
+   },
+   "dependencies": {
+     "@codebuff/sdk": "workspace:*",
+-    "@opentui/core": "^0.1.28",
+-    "@opentui/react": "^0.1.28",
++    "@opentui/core": "0.1.33",
++    "@opentui/react": "0.1.33",
+     "@tanstack/react-query": "^5.62.8",
+     "commander": "^14.0.1",
+     "immer": "^10.1.3",
+diff --git a/cli/src/chat.tsx b/cli/src/chat.tsx
+index 1abbd4d59..d62ea0972 100644
+--- a/cli/src/chat.tsx
++++ b/cli/src/chat.tsx
+@@ -31,7 +31,7 @@ import { useMessageRenderer } from './hooks/use-message-renderer'
+ import { useChatScrollbox } from './hooks/use-scroll-management'
+ import { useSendMessage } from './hooks/use-send-message'
+ import { useSuggestionEngine } from './hooks/use-suggestion-engine'
+-import { useSystemThemeDetector } from './hooks/use-system-theme-detector'
++import { useTheme, useResolvedThemeName } from './hooks/use-theme'
+ import { useChatStore } from './state/chat-store'
+ import { flushAnalytics } from './utils/analytics'
+ import { getUserCredentials } from './utils/auth'
+@@ -45,11 +45,23 @@ import {
+ import { logger } from './utils/logger'
+ import { buildMessageTree } from './utils/message-tree-utils'
+ import { openFileAtPath } from './utils/open-file'
+-import { chatThemes, createMarkdownPalette } from './utils/theme-system'
++import { handleSlashCommands } from './utils/slash-commands'
++import {
++  chatThemes,
++  createMarkdownPalette,
++} from './utils/theme-system'
++import { env } from '@codebuff/common/env'
++import { clientEnvVars } from '@codebuff/common/env-schema'
+ import { formatValidationError } from './utils/validation-error-formatting'
++import { getCodebuffClient } from './utils/codebuff-client'
+ 
+ import type { SendMessageTimerEvent } from './hooks/use-send-message'
+-import type { ChatMessage, ContentBlock } from './types/chat'
++import type {
++  ChatMessage,
++  ContentBlock,
++  ChatVariant,
++  AgentMessage,
++} from './types/chat'
+ import type { SendMessageFn } from './types/contracts/send-message'
+ import type { User } from './utils/auth'
+ import type { ScrollBoxRenderable } from '@opentui/core'
+@@ -91,14 +103,19 @@ export const App = ({
+   const terminalWidth = resolvedTerminalWidth
+   const separatorWidth = Math.max(1, Math.floor(terminalWidth) - 2)
+ 
++  // Use theme hooks (transparent variant is default)
++  const theme = useTheme()
++  const resolvedThemeName = useResolvedThemeName()
++
++  const markdownPalette = useMemo(
++    () => createMarkdownPalette(theme),
++    [theme],
++  )
++
+   // Get formatted logo for display in chat messages
+   const contentMaxWidth = Math.max(10, Math.min(terminalWidth - 4, 80))
+   const { textBlock: logoBlock } = useLogo({ availableWidth: contentMaxWidth })
+ 
+-  const themeName = useSystemThemeDetector()
+-  const theme = chatThemes[themeName]
+-  const markdownPalette = useMemo(() => createMarkdownPalette(theme), [theme])
+-
+   // Set up agent validation (manual trigger)
+   const { validationErrors: liveValidationErrors, validate: validateAgents } =
+     useAgentValidation(validationErrors)
+@@ -114,7 +131,12 @@ export const App = ({
+   const authQuery = useAuthQuery()
+   const logoutMutation = useLogoutMutation()
+ 
+-  const [isAuthenticated, setIsAuthenticated] = useState(requireAuth === false)
++  // If requireAuth is null (checking), defer showing auth UI until resolved
++  const initialAuthState =
++    requireAuth === false ? true : requireAuth === true ? false : null
++  const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(
++    initialAuthState,
++  )
+   const [user, setUser] = useState<User | null>(null)
+ 
+   // Update authentication state when requireAuth changes
+@@ -175,19 +197,37 @@ export const App = ({
+     }
+   }, [logoBlock])
+ 
+-  // Initialize with loaded agents message
++  // Initialize and update loaded agents message when theme changes
+   useEffect(() => {
+-    if (loadedAgentsData && messages.length === 0) {
+-      const agentListId = 'loaded-agents-list'
+-      const userCredentials = getUserCredentials()
+-      const greeting = userCredentials?.name?.trim().length
+-        ? `Welcome back, ${userCredentials.name.trim()}!`
+-        : null
++    if (!loadedAgentsData) {
++      return
++    }
++
++    const agentListId = 'loaded-agents-list'
++    const userCredentials = getUserCredentials()
++    const greeting = userCredentials?.name?.trim().length
++      ? `Welcome back, ${userCredentials.name.trim()}!`
++      : null
++
++    const baseTextColor = theme.foreground
++
++    const homeDir = os.homedir()
++    const repoRoot = path.dirname(loadedAgentsData.agentsDir)
++    const relativePath = path.relative(homeDir, repoRoot)
++    const displayPath = relativePath.startsWith('..')
++      ? repoRoot
++      : `~/${relativePath}`
+ 
++    const agentSectionHeader = agentId
++      ? `**Active agent: ${agentId}**`
++      : `**Active agent:** *fast default (base2-fast)*`
++
++    const buildBlocks = (listId: string): ContentBlock[] => {
+       const blocks: ContentBlock[] = [
+         {
+           type: 'text',
+           content: '\n\n' + logoBlock,
++          color: theme.foreground,
+         },
+       ]
+ 
+@@ -195,70 +235,114 @@ export const App = ({
+         blocks.push({
+           type: 'text',
+           content: greeting,
++          color: baseTextColor,
+         })
+       }
+ 
+-      // Calculate path from home directory to repository root
+-      // agentsDir is typically in the root, so use its parent as the repository root
+-      const homeDir = os.homedir()
+-      const repoRoot = path.dirname(loadedAgentsData.agentsDir)
+-      const relativePath = path.relative(homeDir, repoRoot)
+-      const displayPath = relativePath.startsWith('..')
+-        ? repoRoot // If outside home dir, show absolute path
+-        : `~/${relativePath}`
+-
+-      const renderRepoPathInfo = () => (
+-        <text wrap={true}>
+-          Codebuff can read and write files in{' '}
+-          <TerminalLink
+-            text={displayPath}
+-            color="#3b82f6"
+-            inline={true}
+-            underlineOnHover={true}
+-            onActivate={() => openFileAtPath(repoRoot)}
+-          />
+-          , and run terminal commands to help you build.
+-        </text>
+-      )
++      // Log all client environment variables (works with both dev and binary modes)
++      const envVarsList = clientEnvVars
++        .map((key) => {
++          const value = env[key]
++          const displayValue =
++            typeof value === 'string' && value.length > 50
++              ? value.substring(0, 47) + '...'
++              : value
++          return `  ${key}=${displayValue}`
++        })
++        .join('\n')
++
++      blocks.push({
++        type: 'text',
++        content: `\nCLI Environment variables:\n${envVarsList}`,
++        marginTop: 1,
++        color: baseTextColor,
++      })
++
++      // Display SDK environment variables when the client is available
++      const client = getCodebuffClient()
++      const envGetter = client ? (client as any)?.getEnvironmentInfo : null
++
++      if (typeof envGetter === 'function') {
++        const sdkEnv = envGetter.call(client) as {
++          rawEnv: Record<string, string>
++          computed: Record<string, unknown>
++        }
++        const sdkEnvLines = [
++          'Raw SDK env vars:',
++          ...Object.entries(sdkEnv.rawEnv).map(
++            ([key, value]) => `  ${key}=${value}`,
++          ),
++          '',
++          'Computed SDK constants:',
++          ...Object.entries(sdkEnv.computed).map(([key, value]) => {
++            const displayValue =
++              typeof value === 'string' && value.length > 50
++                ? value.substring(0, 47) + '...'
++                : String(value)
++            return `  ${key}=${displayValue}`
++          }),
++        ].join('\n')
++
++        blocks.push({
++          type: 'text',
++          content: `\nSDK Environment:\n${sdkEnvLines}`,
++          marginTop: 1,
++          color: baseTextColor,
++        })
++      }
+ 
+       blocks.push({
+         type: 'html',
+-        render: renderRepoPathInfo,
++        render: () => (
++          <text style={{ wrapMode: 'word' }}>
++            <span fg={baseTextColor}>
++              Codebuff can read and write files in{' '}
++              <TerminalLink
++                text={displayPath}
++                inline={true}
++                underlineOnHover={true}
++                onActivate={() => openFileAtPath(repoRoot)}
++              />
++              , and run terminal commands to help you build.
++            </span>
++          </text>
++        ),
+       })
+ 
++
++
+       blocks.push({
+         type: 'agent-list',
+-        id: agentListId,
++        id: listId,
+         agents: loadedAgentsData.agents,
+         agentsDir: loadedAgentsData.agentsDir,
+       })
+ 
+-      const agentDisplayId = agentId ?? 'base2-fast'
+-      const agentSectionHeader = agentId
+-        ? `**Active agent: ${agentId}**`
+-        : `**Active agent:** *fast default (base2-fast)*`
+-
+       blocks.push({
+         type: 'text',
+         content: agentSectionHeader,
+         marginTop: 1,
+         marginBottom: 0,
++        color: baseTextColor,
+       })
+ 
++      return blocks
++    }
++
++    if (messages.length === 0) {
++      const initialBlocks = buildBlocks(agentListId)
+       const initialMessage: ChatMessage = {
+         id: `system-loaded-agents-${Date.now()}`,
+         variant: 'ai',
+-        content: '', // Content is in the block
+-        blocks,
++        content: '',
++        blocks: initialBlocks,
+         timestamp: new Date().toISOString(),
+       }
+ 
+-      // Set as collapsed by default
+       setCollapsedAgents((prev) => new Set([...prev, agentListId]))
+ 
+       const messagesToAdd: ChatMessage[] = [initialMessage]
+ 
+-      // Add validation error message if there are errors
+       if (validationErrors.length > 0) {
+         const errorBlocks = createValidationErrorBlocks({
+           errors: validationErrors,
+@@ -278,8 +362,47 @@ export const App = ({
+       }
+ 
+       setMessages(messagesToAdd)
++      return
+     }
+-  }, [loadedAgentsData, validationErrors]) // Run when loadedAgentsData or validationErrors change
++
++    setMessages((prev) => {
++      if (prev.length === 0) {
++        return prev
++      }
++
++      const [firstMessage, ...rest] = prev
++      if (!firstMessage.blocks) {
++        return prev
++      }
++
++      const agentListBlock = firstMessage.blocks.find(
++        (block): block is Extract<ContentBlock, { type: 'agent-list' }> =>
++          block.type === 'agent-list',
++      )
++
++      if (!agentListBlock) {
++        return prev
++      }
++
++      const updatedBlocks = buildBlocks(agentListBlock.id)
++
++      return [
++        {
++          ...firstMessage,
++          blocks: updatedBlocks,
++        },
++        ...rest,
++      ]
++    })
++  }, [
++    agentId,
++    loadedAgentsData,
++    logoBlock,
++    resolvedThemeName,
++    separatorWidth,
++    theme,
++    validationErrors,
++  ])
+ 
+   const {
+     inputValue,
+@@ -376,7 +499,7 @@ export const App = ({
+   )
+ 
+   useEffect(() => {
+-    if (!isAuthenticated) return
++    if (isAuthenticated !== true) return
+ 
+     setInputFocused(true)
+ 
+@@ -421,10 +544,6 @@ export const App = ({
+     activeSubagentsRef.current = activeSubagents
+   }, [activeSubagents])
+ 
+-  useEffect(() => {
+-    renderer?.setBackgroundColor(theme.background)
+-  }, [renderer, theme.background])
+-
+   useEffect(() => {
+     if (exitArmedRef.current && inputValue.length > 0) {
+       exitArmedRef.current = false
+@@ -870,6 +989,7 @@ export const App = ({
+         stopStreaming,
+       }),
+     [
++      agentMode,
+       inputValue,
+       isStreaming,
+       sendMessage,
+@@ -960,8 +1080,11 @@ export const App = ({
+ 
+   const virtualizationNotice =
+     shouldVirtualize && hiddenTopLevelCount > 0 ? (
+-      <text key="virtualization-notice" wrap={false} style={{ width: '100%' }}>
+-        <span fg={theme.statusSecondary}>
++      <text
++        key="virtualization-notice"
++        style={{ width: '100%', wrapMode: 'none' }}
++      >
++        <span fg={theme.secondary}>
+           Showing latest {virtualTopLevelMessages.length} of{' '}
+           {topLevelMessages.length} messages. Scroll up to load more.
+         </span>
+@@ -975,7 +1098,6 @@ export const App = ({
+ 
+   const statusIndicatorNode = (
+     <StatusIndicator
+-      theme={theme}
+       clipboardMessage={clipboardMessage}
+       isActive={isStatusActive}
+       timer={mainAgentTimer}
+@@ -1041,6 +1163,9 @@ export const App = ({
+       return output
+     }
+ 
++    const messageAiTextColor = theme.foreground
++    const statusSecondaryColor = theme.secondary
++
+     return (
+       <box
+         style={{
+@@ -1049,10 +1174,10 @@ export const App = ({
+           paddingRight: 1,
+           paddingTop: 1,
+           paddingBottom: 1,
+-          backgroundColor: theme.panelBg,
++          backgroundColor: theme.surface,
+           border: true,
+           borderStyle: 'single',
+-          borderColor: '#FFA500',
++          borderColor: theme.warning,
+         }}
+       >
+         {/* Header */}
+@@ -1063,7 +1188,7 @@ export const App = ({
+             paddingBottom: 0,
+           }}
+         >
+-          <text wrap={false} style={{ fg: theme.messageAiText }}>
++          <text style={{ wrapMode: 'none', fg: messageAiTextColor }}>
+             {`⚠️  ${errorCount === 1 ? '1 agent has validation issues' : `${errorCount} agents have validation issues`}`}
+             {hasMoreErrors &&
+               ` (showing ${MAX_VISIBLE_ERRORS} of ${errorCount})`}
+@@ -1071,7 +1196,7 @@ export const App = ({
+         </box>
+ 
+         {/* Error list - build as single text with newlines */}
+-        <text wrap style={{ fg: theme.messageAiText }}>
++        <text style={{ wrapMode: 'word', fg: messageAiTextColor }}>
+           {visibleErrors.map(formatErrorLine).join('')}
+         </text>
+ 
+@@ -1083,7 +1208,7 @@ export const App = ({
+               paddingTop: 0,
+             }}
+           >
+-            <text wrap={false} style={{ fg: theme.statusSecondary }}>
++            <text style={{ wrapMode: 'none', fg: statusSecondaryColor }}>
+               {`... and ${errorCount - MAX_VISIBLE_ERRORS} more`}
+             </text>
+           </box>
+@@ -1110,7 +1235,7 @@ export const App = ({
+           paddingRight: 0,
+           paddingTop: 0,
+           paddingBottom: 0,
+-          backgroundColor: theme.panelBg,
++          backgroundColor: 'transparent',
+         }}
+       >
+         <scrollbox
+@@ -1128,20 +1253,20 @@ export const App = ({
+               gap: 0,
+               flexDirection: 'column',
+               shouldFill: true,
+-              backgroundColor: theme.panelBg,
++              backgroundColor: 'transparent',
+             },
+             wrapperOptions: {
+               flexGrow: 1,
+               border: false,
+               shouldFill: true,
+-              backgroundColor: theme.panelBg,
++              backgroundColor: 'transparent',
+             },
+             contentOptions: {
+               flexDirection: 'column',
+               gap: 0,
+               shouldFill: true,
+               justifyContent: 'flex-end',
+-              backgroundColor: theme.panelBg,
++              backgroundColor: 'transparent',
+             },
+           }}
+         >
+@@ -1155,7 +1280,7 @@ export const App = ({
+           flexShrink: 0,
+           paddingLeft: 0,
+           paddingRight: 0,
+-          backgroundColor: theme.panelBg,
++          backgroundColor: 'transparent',
+         }}
+       >
+         {shouldShowStatusLine && (
+@@ -1166,15 +1291,15 @@ export const App = ({
+               width: '100%',
+             }}
+           >
+-            <text wrap={false}>
++            <text style={{ wrapMode: 'none' }}>
+               {hasStatus && statusIndicatorNode}
+               {hasStatus && (exitWarning || shouldShowQueuePreview) && '  '}
+               {exitWarning && (
+-                <span fg={theme.statusSecondary}>{exitWarning}</span>
++                <span fg={theme.secondary}>{exitWarning}</span>
+               )}
+               {exitWarning && shouldShowQueuePreview && '  '}
+               {shouldShowQueuePreview && (
+-                <span fg={theme.statusSecondary} bg={theme.inputFocusedBg}>
++                <span fg={theme.secondary} bg={theme.inputFocusedBg}>
+                   {' '}
+                   {formatQueuedPreview(
+                     queuedMessages,
+@@ -1185,7 +1310,7 @@ export const App = ({
+             </text>
+           </box>
+         )}
+-        <Separator theme={theme} width={separatorWidth} />
++        <Separator width={separatorWidth} />
+         {agentMode === 'PLAN' && hasReceivedPlanResponse && (
+           <BuildModeButtons
+             theme={theme}
+@@ -1197,7 +1322,6 @@ export const App = ({
+           <SuggestionMenu
+             items={slashSuggestionItems}
+             selectedIndex={slashSelectedIndex}
+-            theme={theme}
+             maxVisible={5}
+             prefix="/"
+           />
+@@ -1208,7 +1332,6 @@ export const App = ({
+           <SuggestionMenu
+             items={agentSuggestionItems}
+             selectedIndex={agentSelectedIndex}
+-            theme={theme}
+             maxVisible={5}
+             prefix="@"
+           />
+@@ -1216,11 +1339,11 @@ export const App = ({
+         <box
+           style={{
+             flexDirection: 'row',
+-            alignItems: 'flex-start',
++            alignItems: 'center',
+             width: '100%',
+           }}
+         >
+-          <box style={{ flexGrow: 1 }}>
++          <box style={{ flexGrow: 1, minWidth: 0 }}>
+             <MultilineInput
+               value={inputValue}
+               onChange={setInputValue}
+@@ -1228,9 +1351,9 @@ export const App = ({
+               placeholder="Share your thoughts and press Enter…"
+               focused={inputFocused}
+               maxHeight={5}
+-              theme={theme}
+               width={inputWidth}
+               onKeyIntercept={handleSuggestionMenuKey}
++              textAttributes={theme.messageTextAttributes}
+               ref={inputRef}
+             />
+           </box>
+@@ -1242,19 +1365,17 @@ export const App = ({
+           >
+             <AgentModeToggle
+               mode={agentMode}
+-              theme={theme}
+               onToggle={toggleAgentMode}
+             />
+           </box>
+         </box>
+-        <Separator theme={theme} width={separatorWidth} />
++        <Separator width={separatorWidth} />
+       </box>
+ 
+       {/* Login Modal Overlay - show when not authenticated and done checking */}
+-      {requireAuth !== null && !isAuthenticated && (
++      {requireAuth !== null && isAuthenticated === false && (
+         <LoginModal
+           onLoginSuccess={handleLoginSuccess}
+-          theme={theme}
+           hasInvalidCredentials={hasInvalidCredentials}
+         />
+       )}
+diff --git a/cli/src/commands/router.ts b/cli/src/commands/router.ts
+index 0c169755c..24d10a69e 100644
+--- a/cli/src/commands/router.ts
++++ b/cli/src/commands/router.ts
+@@ -25,7 +25,7 @@ export function routeUserPrompt(params: {
+   setCanProcessQueue: (value: React.SetStateAction<boolean>) => void
+   setInputFocused: (focused: boolean) => void
+   setInputValue: (value: string | ((prev: string) => string)) => void
+-  setIsAuthenticated: (value: React.SetStateAction<boolean>) => void
++  setIsAuthenticated: (value: React.SetStateAction<boolean | null>) => void
+   setMessages: (
+     value: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[]),
+   ) => void
+diff --git a/cli/src/components/__tests__/message-block.completion.test.tsx b/cli/src/components/__tests__/message-block.completion.test.tsx
+index adf6d3835..660b95f60 100644
+--- a/cli/src/components/__tests__/message-block.completion.test.tsx
++++ b/cli/src/components/__tests__/message-block.completion.test.tsx
+@@ -4,6 +4,7 @@ import { describe, test, expect } from 'bun:test'
+ import { renderToStaticMarkup } from 'react-dom/server'
+ 
+ import { MessageBlock } from '../message-block'
++import '../../state/theme-store' // Initialize theme store
+ import { chatThemes, createMarkdownPalette } from '../../utils/theme-system'
+ import type { MarkdownPalette } from '../../utils/markdown-renderer'
+ 
+@@ -13,8 +14,8 @@ const basePalette = createMarkdownPalette(theme)
+ 
+ const palette: MarkdownPalette = {
+   ...basePalette,
+-  inlineCodeFg: theme.messageAiText,
+-  codeTextFg: theme.messageAiText,
++  inlineCodeFg: theme.foreground,
++  codeTextFg: theme.foreground,
+ }
+ 
+ const baseProps = {
+@@ -34,9 +35,8 @@ const baseProps = {
+     elapsedSeconds: 0,
+     startTime: null,
+   },
+-  theme,
+-  textColor: theme.messageAiText,
+-  timestampColor: theme.timestampAi,
++  textColor: theme.foreground,
++  timestampColor: theme.muted,
+   markdownOptions: {
+     codeBlockWidth: 72,
+     palette,
+diff --git a/cli/src/components/__tests__/message-block.streaming.test.tsx b/cli/src/components/__tests__/message-block.streaming.test.tsx
+index 5efee1b19..46d0045c8 100644
+--- a/cli/src/components/__tests__/message-block.streaming.test.tsx
++++ b/cli/src/components/__tests__/message-block.streaming.test.tsx
+@@ -4,6 +4,7 @@ import { describe, test, expect } from 'bun:test'
+ import { renderToStaticMarkup } from 'react-dom/server'
+ 
+ import { MessageBlock } from '../message-block'
++import '../../state/theme-store' // Initialize theme store
+ import { chatThemes, createMarkdownPalette } from '../../utils/theme-system'
+ import type { MarkdownPalette } from '../../utils/markdown-renderer'
+ 
+@@ -13,8 +14,8 @@ const basePalette = createMarkdownPalette(theme)
+ 
+ const palette: MarkdownPalette = {
+   ...basePalette,
+-  inlineCodeFg: theme.messageAiText,
+-  codeTextFg: theme.messageAiText,
++  inlineCodeFg: theme.foreground,
++  codeTextFg: theme.foreground,
+ }
+ 
+ const baseProps = {
+@@ -27,9 +28,8 @@ const baseProps = {
+   timestamp: '12:00',
+   completionTime: undefined,
+   credits: undefined,
+-  theme,
+-  textColor: theme.messageAiText,
+-  timestampColor: theme.timestampAi,
++  textColor: theme.foreground,
++  timestampColor: theme.muted,
+   markdownOptions: {
+     codeBlockWidth: 72,
+     palette,
+diff --git a/cli/src/components/__tests__/status-indicator.timer.test.tsx b/cli/src/components/__tests__/status-indicator.timer.test.tsx
+index 2336ca77e..5c5c0e327 100644
+--- a/cli/src/components/__tests__/status-indicator.timer.test.tsx
++++ b/cli/src/components/__tests__/status-indicator.timer.test.tsx
+@@ -13,12 +13,10 @@ import {
+ } from 'bun:test'
+ 
+ import { StatusIndicator } from '../status-indicator'
+-import { chatThemes } from '../../utils/theme-system'
++import '../../state/theme-store' // Initialize theme store
+ import { renderToStaticMarkup } from 'react-dom/server'
+ import * as codebuffClient from '../../utils/codebuff-client'
+ 
+-const theme = chatThemes.dark
+-
+ const createTimer = (elapsedSeconds: number, started: boolean) => ({
+   start: () => {},
+   stop: () => {},
+@@ -42,7 +40,6 @@ describe('StatusIndicator timer rendering', () => {
+   test('shows elapsed seconds when timer is active', () => {
+     const markup = renderToStaticMarkup(
+       <StatusIndicator
+-        theme={theme}
+         clipboardMessage={null}
+         isActive={true}
+         timer={createTimer(5, true)}
+@@ -53,7 +50,6 @@ describe('StatusIndicator timer rendering', () => {
+ 
+     const inactiveMarkup = renderToStaticMarkup(
+       <StatusIndicator
+-        theme={theme}
+         clipboardMessage={null}
+         isActive={false}
+         timer={createTimer(0, false)}
+@@ -66,7 +62,6 @@ describe('StatusIndicator timer rendering', () => {
+   test('clipboard message takes priority over timer output', () => {
+     const markup = renderToStaticMarkup(
+       <StatusIndicator
+-        theme={theme}
+         clipboardMessage="Copied!"
+         isActive={true}
+         timer={createTimer(12, true)}
+diff --git a/cli/src/components/agent-branch-item.tsx b/cli/src/components/agent-branch-item.tsx
+new file mode 100644
+index 000000000..77ea6774d
+--- /dev/null
++++ b/cli/src/components/agent-branch-item.tsx
+@@ -0,0 +1,340 @@
++import { TextAttributes, type BorderCharacters } from '@opentui/core'
++import React, { type ReactNode } from 'react'
++
++import { RaisedPill } from './raised-pill'
++import { useTheme } from '../hooks/use-theme'
++
++interface AgentBranchItemProps {
++  name: string
++  content: ReactNode
++  prompt?: string
++  agentId?: string
++  isCollapsed: boolean
++  isStreaming: boolean
++  branchChar?: string
++  streamingPreview: string
++  finishedPreview: string
++  statusLabel?: string
++  statusColor?: string
++  statusIndicator?: string
++  onToggle?: () => void
++  titleSuffix?: string
++}
++
++const containerBorderChars: BorderCharacters = {
++  topLeft: '╭',
++  topRight: '╮',
++  bottomLeft: '╰',
++  bottomRight: '╯',
++  horizontal: '─',
++  vertical: '│',
++  topT: '┬',
++  bottomT: '┴',
++  leftT: '├',
++  rightT: '┤',
++  cross: '┼',
++}
++
++export const AgentBranchItem = ({
++  name,
++  content,
++  prompt,
++  agentId,
++  isCollapsed,
++  isStreaming,
++  streamingPreview,
++  finishedPreview,
++  branchChar = '',
++  statusLabel,
++  statusColor,
++  statusIndicator = '●',
++  onToggle,
++  titleSuffix,
++}: AgentBranchItemProps) => {
++  const theme = useTheme()
++
++  const baseTextAttributes = theme.messageTextAttributes ?? 0
++  const getAttributes = (extra: number = 0): number | undefined => {
++    const combined = baseTextAttributes | extra
++    return combined === 0 ? undefined : combined
++  }
++
++  const isExpanded = !isCollapsed
++  const toggleFrameColor = isExpanded
++    ? theme.agentToggleExpandedBg
++    : theme.muted
++  const toggleIconColor = isStreaming ? theme.primary : theme.foreground
++  const toggleIndicator = onToggle ? (isCollapsed ? '▸ ' : '▾ ') : ''
++  const toggleLabel = `${branchChar}${toggleIndicator}`
++  const collapseButtonFrame = theme.agentToggleExpandedBg
++  const collapseButtonText = collapseButtonFrame
++  const statusText =
++    statusLabel && statusLabel.length > 0
++      ? statusIndicator === '✓'
++        ? `${statusLabel} ${statusIndicator}`
++        : `${statusIndicator} ${statusLabel}`
++      : null
++  const showCollapsedPreview =
++    (isStreaming && !!streamingPreview) || (!isStreaming && !!finishedPreview)
++
++  const isTextRenderable = (value: ReactNode): boolean => {
++    if (value === null || value === undefined || typeof value === 'boolean') {
++      return false
++    }
++
++    if (typeof value === 'string' || typeof value === 'number') {
++      return true
++    }
++
++    if (Array.isArray(value)) {
++      return value.every((child) => isTextRenderable(child))
++    }
++
++    if (React.isValidElement(value)) {
++      if (value.type === React.Fragment) {
++        return isTextRenderable(value.props.children)
++      }
++
++      if (typeof value.type === 'string') {
++        if (
++          value.type === 'span' ||
++          value.type === 'strong' ||
++          value.type === 'em'
++        ) {
++          return isTextRenderable(value.props.children)
++        }
++
++        return false
++      }
++    }
++
++    return false
++  }
++
++  const renderExpandedContent = (value: ReactNode): ReactNode => {
++    if (
++      value === null ||
++      value === undefined ||
++      value === false ||
++      value === true
++    ) {
++      return null
++    }
++
++    if (isTextRenderable(value)) {
++      return (
++        <text
++          fg={theme.foreground}
++          key="expanded-text"
++          attributes={getAttributes()}
++        >
++          {value}
++        </text>
++      )
++    }
++
++    if (React.isValidElement(value)) {
++      if (value.key === null || value.key === undefined) {
++        return (
++          <box key="expanded-node" style={{ flexDirection: 'column', gap: 0 }}>
++            {value}
++          </box>
++        )
++      }
++      return value
++    }
++
++    if (Array.isArray(value)) {
++      return (
++        <box key="expanded-array" style={{ flexDirection: 'column', gap: 0 }}>
++          {value.map((child, idx) => (
++            <box
++              key={`expanded-array-${idx}`}
++              style={{ flexDirection: 'column', gap: 0 }}
++            >
++              {child}
++            </box>
++          ))}
++        </box>
++      )
++    }
++
++    return (
++      <box key="expanded-unknown" style={{ flexDirection: 'column', gap: 0 }}>
++        {value}
++      </box>
++    )
++  }
++
++  return (
++    <box
++      style={{
++        flexDirection: 'column',
++        gap: 0,
++        flexShrink: 0,
++        marginTop: 0,
++        marginBottom: 0,
++        paddingBottom: 0,
++        width: '100%',
++      }}
++    >
++      <box
++        border
++        borderStyle="single"
++        borderColor={toggleFrameColor}
++        customBorderChars={containerBorderChars}
++        style={{
++          flexDirection: 'column',
++          gap: 0,
++          paddingLeft: 0,
++          paddingRight: 0,
++          paddingTop: 0,
++          paddingBottom: 0,
++          width: '100%',
++        }}
++      >
++        {prompt ? (
++          <box
++            style={{
++              flexDirection: 'column',
++              gap: 0,
++              paddingLeft: 0,
++              paddingRight: 0,
++              paddingTop: 0,
++              paddingBottom: 0,
++              width: '100%',
++            }}
++          >
++            <text fg={theme.foreground}>Prompt</text>
++            <text
++              fg={theme.foreground}
++              style={{ wrapMode: 'word' }}
++              attributes={getAttributes()}
++            >
++              {prompt}
++            </text>
++          </box>
++        ) : null}
++        <box
++          style={{
++            flexDirection: 'row',
++            alignItems: 'center',
++            paddingLeft: 1,
++            paddingRight: 1,
++            paddingTop: 0,
++            paddingBottom: isCollapsed ? 0 : 1,
++            width: '100%',
++          }}
++          onMouseDown={onToggle}
++        >
++          <text style={{ wrapMode: 'none' }}>
++            <span fg={toggleIconColor}>
++              {toggleLabel}
++            </span>
++            <span
++              fg={theme.foreground}
++              attributes={isExpanded ? TextAttributes.BOLD : undefined}
++            >
++              {name}
++            </span>
++            {titleSuffix ? (
++              <span
++                fg={theme.foreground}
++                attributes={TextAttributes.BOLD}
++              >
++                {` ${titleSuffix}`}
++              </span>
++            ) : null}
++            {statusText ? (
++              <span
++                fg={statusColor ?? theme.muted}
++                attributes={TextAttributes.DIM}
++              >
++                {` ${statusText}`}
++              </span>
++            ) : null}
++          </text>
++        </box>
++
++        {isCollapsed ? (
++          showCollapsedPreview ? (
++            <box
++              style={{
++                paddingLeft: 0,
++                paddingRight: 0,
++                paddingTop: 0,
++                paddingBottom: 0,
++              }}
++            >
++              <text
++                fg={isStreaming ? theme.foreground : theme.muted}
++                attributes={getAttributes(TextAttributes.ITALIC)}
++              >
++                {isStreaming ? streamingPreview : finishedPreview}
++              </text>
++            </box>
++          ) : null
++        ) : (
++          <box
++            style={{
++              flexDirection: 'column',
++              gap: 0,
++              paddingLeft: 0,
++              paddingRight: 0,
++              paddingTop: 0,
++              paddingBottom: 0,
++            }}
++          >
++            {prompt && (
++              <box
++                style={{
++                  flexDirection: 'column',
++                  gap: 0,
++                  marginBottom: content ? 1 : 0,
++                }}
++              >
++                <text fg={theme.foreground}>
++                  Prompt
++                </text>
++                <text
++                  fg={theme.foreground}
++                  style={{ wrapMode: 'word' }}
++                  attributes={getAttributes()}
++                >
++                  {prompt}
++                </text>
++                {content && (
++                  <text
++                    fg={theme.foreground}
++                    style={{ marginTop: 1 }}
++                  >
++                    Response
++                  </text>
++                )}
++              </box>
++            )}
++            {renderExpandedContent(content)}
++            {onToggle && (
++              <box
++                style={{
++                  alignSelf: 'flex-end',
++                  marginTop: content ? 0 : 1,
++                  paddingRight: 1,
++                  paddingBottom: 0,
++                  marginBottom: 0,
++                }}
++              >
++                <RaisedPill
++                  segments={[{ text: 'Collapse', fg: collapseButtonText }]}
++                  frameColor={collapseButtonFrame}
++                  textColor={collapseButtonText}
++                  onPress={onToggle}
++                />
++              </box>
++            )}
++          </box>
++        )}
++      </box>
++    </box>
++  )
++}
+diff --git a/cli/src/components/agent-mode-toggle.tsx b/cli/src/components/agent-mode-toggle.tsx
+index 874d5514a..18dc4916b 100644
+--- a/cli/src/components/agent-mode-toggle.tsx
++++ b/cli/src/components/agent-mode-toggle.tsx
+@@ -1,39 +1,45 @@
+-import type { ChatTheme } from '../types/theme-system'
++import { RaisedPill } from './raised-pill'
++import { useTheme } from '../hooks/use-theme'
++
+ import type { AgentMode } from '../utils/constants'
++import type { ChatTheme } from '../types/theme-system'
++
++const getModeConfig = (theme: ChatTheme) =>
++  ({
++    FAST: {
++      frameColor: theme.modeFastBg,
++      textColor: theme.modeFastText,
++      label: 'FAST',
++    },
++    MAX: {
++      frameColor: theme.modeMaxBg,
++      textColor: theme.modeMaxText,
++      label: '💪 MAX',
++    },
++    PLAN: {
++      frameColor: theme.modePlanBg,
++      textColor: theme.modePlanText,
++      label: '📋 PLAN',
++    },
++  }) as const
+ 
+ export const AgentModeToggle = ({
+   mode,
+-  theme,
+   onToggle,
+ }: {
+   mode: AgentMode
+-  theme: ChatTheme
+   onToggle: () => void
+ }) => {
+-  const isFast = mode === 'FAST'
+-  const isMax = mode === 'MAX'
+-  const isPlan = mode === 'PLAN'
+-
+-  const bgColor = isFast ? '#0a6515' : isMax ? '#ac1626' : '#1e40af'
+-  const textColor = '#ffffff'
+-  const label = isFast ? 'FAST' : isMax ? '💪 MAX' : 'PLAN'
+-
+-  const needsPadding = isFast || isPlan
++  const theme = useTheme()
++  const config = getModeConfig(theme)
++  const { frameColor, textColor, label } = config[mode]
+ 
+   return (
+-    <box
+-      style={{
+-        flexDirection: 'row',
+-        alignItems: 'center',
+-        backgroundColor: bgColor,
+-        paddingLeft: needsPadding ? 2 : 1,
+-        paddingRight: needsPadding ? 2 : 1,
+-      }}
+-      onMouseDown={onToggle}
+-    >
+-      <text wrap={false}>
+-        <span fg={textColor}>{label}</span>
+-      </text>
+-    </box>
++    <RaisedPill
++      segments={[{ text: label, fg: textColor }]}
++      frameColor={frameColor}
++      textColor={textColor}
++      onPress={onToggle}
++    />
+   )
+ }
+diff --git a/cli/src/components/branch-item.tsx b/cli/src/components/branch-item.tsx
+deleted file mode 100644
+index 626f40991..000000000
+--- a/cli/src/components/branch-item.tsx
++++ /dev/null
+@@ -1,241 +0,0 @@
+-import { TextAttributes, type BorderCharacters } from '@opentui/core'
+-import React, { type ReactNode } from 'react'
+-
+-import type { ChatTheme } from '../types/theme-system'
+-
+-const borderCharsWithoutVertical: BorderCharacters = {
+-  topLeft: '┌',
+-  topRight: '┐',
+-  bottomLeft: '└',
+-  bottomRight: '┘',
+-  horizontal: '─',
+-  vertical: ' ',
+-  topT: ' ',
+-  bottomT: ' ',
+-  leftT: ' ',
+-  rightT: ' ',
+-  cross: ' ',
+-}
+-
+-interface BranchItemProps {
+-  name: string
+-  content: ReactNode
+-  prompt?: string
+-  agentId?: string
+-  isCollapsed: boolean
+-  isStreaming: boolean
+-  branchChar: string
+-  streamingPreview: string
+-  finishedPreview: string
+-  theme: ChatTheme
+-  onToggle: () => void
+-}
+-
+-export const BranchItem = ({
+-  name,
+-  content,
+-  prompt,
+-  agentId,
+-  isCollapsed,
+-  isStreaming,
+-  branchChar,
+-  streamingPreview,
+-  finishedPreview,
+-  theme,
+-  onToggle,
+-}: BranchItemProps) => {
+-  const cornerColor = theme.agentPrefix
+-
+-  const toggleBackground = isStreaming
+-    ? theme.agentToggleHeaderBg
+-    : isCollapsed
+-      ? theme.agentResponseCount
+-      : theme.agentPrefix
+-  const toggleTextColor =
+-    (isStreaming ? theme.agentToggleHeaderText : theme.agentToggleText) ??
+-    theme.agentToggleText
+-  const toggleLabel = `${isCollapsed ? '▸' : '▾'} `
+-
+-  const isTextRenderable = (value: ReactNode): boolean => {
+-    if (value === null || value === undefined || typeof value === 'boolean') {
+-      return false
+-    }
+-
+-    if (typeof value === 'string' || typeof value === 'number') {
+-      return true
+-    }
+-
+-    if (Array.isArray(value)) {
+-      return value.every((child) => isTextRenderable(child))
+-    }
+-
+-    if (React.isValidElement(value)) {
+-      if (value.type === React.Fragment) {
+-        return isTextRenderable(value.props.children)
+-      }
+-
+-      if (typeof value.type === 'string') {
+-        if (
+-          value.type === 'span' ||
+-          value.type === 'strong' ||
+-          value.type === 'em'
+-        ) {
+-          return isTextRenderable(value.props.children)
+-        }
+-
+-        return false
+-      }
+-    }
+-
+-    return false
+-  }
+-
+-  const renderExpandedContent = (value: ReactNode): ReactNode => {
+-    if (
+-      value === null ||
+-      value === undefined ||
+-      value === false ||
+-      value === true
+-    ) {
+-      return null
+-    }
+-
+-    if (isTextRenderable(value)) {
+-      return (
+-        <text wrap fg={theme.agentText} key="expanded-text">
+-          {value}
+-        </text>
+-      )
+-    }
+-
+-    if (React.isValidElement(value)) {
+-      if (value.key === null || value.key === undefined) {
+-        return (
+-          <box key="expanded-node" style={{ flexDirection: 'column', gap: 0 }}>
+-            {value}
+-          </box>
+-        )
+-      }
+-      return value
+-    }
+-
+-    if (Array.isArray(value)) {
+-      return (
+-        <box key="expanded-array" style={{ flexDirection: 'column', gap: 0 }}>
+-          {value.map((child, idx) => (
+-            <box
+-              key={`expanded-array-${idx}`}
+-              style={{ flexDirection: 'column', gap: 0 }}
+-            >
+-              {child}
+-            </box>
+-          ))}
+-        </box>
+-      )
+-    }
+-
+-    return (
+-      <box key="expanded-unknown" style={{ flexDirection: 'column', gap: 0 }}>
+-        {value}
+-      </box>
+-    )
+-  }
+-
+-  return (
+-    <box
+-      style={{
+-        flexDirection: 'column',
+-        gap: 0,
+-        flexShrink: 0,
+-        marginTop: 1,
+-        marginBottom: 1,
+-      }}
+-    >
+-      <box style={{ flexDirection: 'column', gap: 0 }}>
+-        <box
+-          style={{
+-            flexDirection: 'row',
+-            alignSelf: 'flex-start',
+-            backgroundColor: toggleBackground,
+-            paddingLeft: 1,
+-            paddingRight: 1,
+-          }}
+-          onMouseDown={onToggle}
+-        >
+-          <text wrap>
+-            <span fg={toggleTextColor}>{toggleLabel}</span>
+-            <span fg={toggleTextColor} attributes={TextAttributes.BOLD}>
+-              {name}
+-            </span>
+-          </text>
+-        </box>
+-        <box style={{ flexShrink: 1, marginBottom: 0 }}>
+-          {isCollapsed &&
+-            (isStreaming ? streamingPreview : finishedPreview) && (
+-              <text
+-                key={isStreaming ? 'streaming-preview' : 'finished-preview'}
+-                wrap
+-                fg={isStreaming ? theme.agentText : theme.agentResponseCount}
+-                attributes={TextAttributes.ITALIC}
+-              >
+-                {isStreaming ? streamingPreview : finishedPreview}
+-              </text>
+-            )}
+-          {!isCollapsed && (
+-            <box style={{ flexDirection: 'column', gap: 1 }}>
+-              {content && (
+-                <box
+-                  border
+-                  borderStyle="single"
+-                  borderColor={cornerColor}
+-                  customBorderChars={borderCharsWithoutVertical}
+-                  style={{
+-                    flexDirection: 'column',
+-                    gap: 0,
+-                    paddingLeft: 1,
+-                    paddingRight: 1,
+-                    paddingTop: 0,
+-                    paddingBottom: 0,
+-                  }}
+-                >
+-                  {prompt && (
+-                    <box style={{ flexDirection: 'column', gap: 0 }}>
+-                      <text wrap fg={theme.agentToggleHeaderText}>
+-                        Prompt
+-                      </text>
+-                      <text wrap fg={theme.agentText}>
+-                        {prompt}
+-                      </text>
+-                      <text> </text>
+-                      <text wrap fg={theme.agentToggleHeaderText}>
+-                        Response
+-                      </text>
+-                    </box>
+-                  )}
+-                  {renderExpandedContent(content)}
+-                </box>
+-              )}
+-              <box
+-                style={{
+-                  alignSelf: 'flex-end',
+-                  backgroundColor: theme.agentFocusedBg,
+-                  paddingLeft: 1,
+-                  paddingRight: 1,
+-                  paddingTop: 0,
+-                  paddingBottom: 0,
+-                }}
+-                onMouseDown={onToggle}
+-              >
+-                <text wrap={false}>
+-                  <span fg={toggleTextColor} attributes={TextAttributes.BOLD}>
+-                    Collapse
+-                  </span>
+-                </text>
+-              </box>
+-            </box>
+-          )}
+-        </box>
+-      </box>
+-    </box>
+-  )
+-}
+diff --git a/cli/src/components/build-mode-buttons.tsx b/cli/src/components/build-mode-buttons.tsx
+index 3c0fc7bbd..6ae1e9d59 100644
+--- a/cli/src/components/build-mode-buttons.tsx
++++ b/cli/src/components/build-mode-buttons.tsx
+@@ -29,7 +29,7 @@ export const BuildModeButtons = ({
+         }}
+         onMouseDown={onBuildFast}
+       >
+-        <text wrap={false}>
++        <text wrapMode="none">
+           <span fg="#ffffff">Build Fast</span>
+         </text>
+       </box>
+@@ -43,7 +43,7 @@ export const BuildModeButtons = ({
+         }}
+         onMouseDown={onBuildMax}
+       >
+-        <text wrap={false}>
++        <text wrapMode="none">
+           <span fg="#ffffff">Build Max</span>
+         </text>
+       </box>
+diff --git a/cli/src/components/login-modal-utils.ts b/cli/src/components/login-modal-utils.ts
+index b3afb0074..f28f5e18b 100644
+--- a/cli/src/components/login-modal-utils.ts
++++ b/cli/src/components/login-modal-utils.ts
+@@ -2,22 +2,6 @@
+  * Utility functions for the login screen component
+  */
+ 
+-/**
+- * Calculates the relative luminance of a hex color to determine if it's light or dark mode
+- */
+-export function isLightModeColor(hexColor: string): boolean {
+-  if (!hexColor) return false
+-
+-  const hex = hexColor.replace('#', '')
+-  const r = parseInt(hex.substring(0, 2), 16)
+-  const g = parseInt(hex.substring(2, 4), 16)
+-  const b = parseInt(hex.substring(4, 6), 16)
+-
+-  // Calculate relative luminance
+-  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+-  return luminance > 0.5
+-}
+-
+ /**
+  * Formats a URL for display by wrapping it at logical breakpoints
+  */
+diff --git a/cli/src/components/login-modal.tsx b/cli/src/components/login-modal.tsx
+index f0d699846..384588807 100644
+--- a/cli/src/components/login-modal.tsx
++++ b/cli/src/components/login-modal.tsx
+@@ -9,12 +9,8 @@ import { useLoginKeyboardHandlers } from '../hooks/use-login-keyboard-handlers'
+ import { useLoginPolling } from '../hooks/use-login-polling'
+ import { useLogo } from '../hooks/use-logo'
+ import { useSheenAnimation } from '../hooks/use-sheen-animation'
++import { useTheme } from '../hooks/use-theme'
+ import {
+-  LINK_COLOR_DEFAULT,
+-  LINK_COLOR_CLICKED,
+-  COPY_SUCCESS_COLOR,
+-  COPY_ERROR_COLOR,
+-  WARNING_COLOR,
+   DEFAULT_TERMINAL_HEIGHT,
+   MODAL_VERTICAL_MARGIN,
+   MAX_MODAL_BASE_HEIGHT,
+@@ -23,7 +19,6 @@ import {
+ import {
+   formatUrl,
+   generateFingerprintId,
+-  isLightModeColor,
+   calculateResponsiveLayout,
+   calculateModalDimensions,
+ } from '../login/utils'
+@@ -31,21 +26,19 @@ import { useLoginStore } from '../state/login-store'
+ import { copyTextToClipboard } from '../utils/clipboard'
+ import { logger } from '../utils/logger'
+ 
+-import type { ChatTheme } from '../types/theme-system'
+ import type { User } from '../utils/auth'
+ 
+ interface LoginModalProps {
+   onLoginSuccess: (user: User) => void
+-  theme: ChatTheme
+   hasInvalidCredentials?: boolean | null
+ }
+ 
+ export const LoginModal = ({
+   onLoginSuccess,
+-  theme,
+   hasInvalidCredentials = false,
+ }: LoginModalProps) => {
+   const renderer = useRenderer()
++  const theme = useTheme()
+ 
+   // Use zustand store for all state
+   const {
+@@ -219,15 +212,6 @@ export const LoginModal = ({
+     }
+   }, [hasOpenedBrowser, loginUrl, copyToClipboard])
+ 
+-  // Determine if we're in light mode by checking background color luminance
+-  const isLightMode = useMemo(
+-    () => isLightModeColor(theme.background),
+-    [theme.background],
+-  )
+-
+-  // Use pure black/white for logo
+-  const logoColor = isLightMode ? '#000000' : '#ffffff'
+-
+   // Calculate terminal width and height for responsive display
+   const terminalWidth = renderer?.width || 80
+   const terminalHeight = renderer?.height || 24
+@@ -265,7 +249,7 @@ export const LoginModal = ({
+ 
+   // Use custom hook for sheen animation
+   const { applySheenToChar } = useSheenAnimation({
+-    logoColor,
++    logoColor: theme.foreground,
+     terminalWidth: renderer?.width
+
+… [diff truncated: view full diff on GitHub] …

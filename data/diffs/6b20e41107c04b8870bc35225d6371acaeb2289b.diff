@@ -1,0 +1,416 @@
+diff --git a/backend/knowledge.md b/backend/knowledge.md
+index 9863ddce0..7f0f1c318 100644
+--- a/backend/knowledge.md
++++ b/backend/knowledge.md
+@@ -67,7 +67,11 @@ The Codebuff backend is built on Node.js using TypeScript. It uses an Express se
+ 
+ 3. **Claude Integration (claude.ts)**: Provides functions for interacting with the Claude AI model, including streaming responses and handling tool calls.
+ 
+-4. **Main Prompt Handler (main-prompt.ts)**: Processes user inputs, generates responses, and manages file changes and tool calls.
++4. **Main Prompt Handler (main-prompt.ts)**: Processes user inputs, generates responses, and manages file changes and tool calls. Key features:
++   - Smart conversation flow management
++   - Progress detection to avoid infinite loops
++   - Graceful pause/continue handling when STOP_MARKER is reached
++   - Uses GPT-4 Mini for quick classification of conversation state
+ 
+ 5. **System Prompt Generator (system-prompt.ts)**: Creates the initial prompt for the AI assistant with project-specific context and instructions.
+ 
+@@ -85,6 +89,39 @@ The backend uses WebSockets for real-time, bidirectional communication with clie
+ - **Action Handling**: The `websocket-action.ts` file processes incoming action messages and triggers appropriate responses.
+ - **Subscription Management**: Clients can subscribe to specific topics for targeted updates.
+ 
++## WebSocket Communication Flow
++
++1. Client connects to the WebSocket server.
++2. Client sends user input and file context to the server.
++3. Server processes the input using Claude AI.
++4. Server streams response chunks back to the client.
++5. Client receives and displays the response in real-time.
++6. Server sends file changes to the client for application.
++
++## Conversation Flow Management
++
++The system uses a multi-layered approach to manage conversation flow:
++
++1. **Progress Detection**: When handling unbounded iterations (e.g., "do all cases"), the system periodically checks if:
++   - The user's request has been satisfied
++   - The conversation is stuck in a loop
++   - No meaningful progress is being made
++
++2. **Smart Continuation**: 
++   - Uses Claude Sonnet with agent system prompt for conversation state decisions
++   - Ensures consistent context and quality by using same model as main conversation
++   - If progress is satisfactory, gracefully stops
++   - If more work needed, continues with clear context
++   - Checks progress when STOP_MARKER is reached
++
++3. **Client-Server Coordination**:
++   - Uses tool calls to delegate continuation decisions to client
++   - Server sends 'continue' tool call instead of continuing server-side
++   - Maintains client control over conversation flow
++   - Allows client to check in between iterations
++
++This architecture prevents infinite loops while allowing productive work to continue, and ensures the client maintains control over the conversation flow.
++
+ ## Claude Integration
+ 
+ The backend integrates with the Claude AI model to process user inputs and generate code changes. Important aspects include:
+@@ -152,8 +189,9 @@ This approach ensures that clients receive immediate feedback about their quota
+ The backend implements a tool handling system that allows the AI assistant to perform various actions:
+ 
+ 1. **Tool Definition**: Tools are defined in `tools.ts`, specifying their name, description, and input schema.
+-2. **Available Tools**: Current tools include read_files, scrape_web_page, search_manifold_markets, and run_terminal_command.
+-3. **Tool Execution**: When the AI makes a tool call, the backend processes it and provides the results back to the AI.
++2. **Tool Implementation**: All tool handlers must be implemented in `npm-app/src/tool-handlers.ts`. Never implement handlers elsewhere.
++3. **Available Tools**: Current tools include read_files, scrape_web_page, search_manifold_markets, run_terminal_command, and continue.
++4. **Tool Execution**: When the AI makes a tool call, the backend processes it and provides the results back to the AI.
+ 
+ ### Change Tracking During Tool Calls
+ 
+diff --git a/backend/src/conversation-progress.ts b/backend/src/conversation-progress.ts
+new file mode 100644
+index 000000000..3c279a82d
+--- /dev/null
++++ b/backend/src/conversation-progress.ts
+@@ -0,0 +1,97 @@
++import { Message } from 'common/actions'
++import { ProjectFileContext } from 'common/util/file'
++import { openaiModels, claudeModels } from 'common/constants'
++import { promptOpenAI } from './openai-api'
++import { promptClaude } from './claude'
++import { getAgentSystemPrompt } from './system-prompt'
++import { logger } from './util/logger'
++
++export async function checkConversationProgress(
++  messages: Message[],
++  fileContext: ProjectFileContext,
++  options: {
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
++    userId: string | undefined
++  }
++) {
++  const prompt = `Review the conversation since the last user input and determine if we should stop. We should stop if either:
++1. A minimal version of the user's request appears to be satisfied based on the changes and responses made
++2. The conversation seems stuck in a loop or not making meaningful progress
++
++Consider the conversation history:
++${messages
++  .map(
++    (m) =>
++      `${m.role.toUpperCase()}: ${
++        typeof m.content === 'string'
++          ? m.content
++          : m.content.map((c) => ('text' in c ? c.text : '')).join('\n')
++      }`
++  )
++  .join('\n\n')}
++
++Answer with only "STOP" or "CONTINUE". Do not include any other text.`
++
++  const system = getAgentSystemPrompt(fileContext)
++
++  const response = await promptClaude([{ role: 'user', content: prompt }], {
++    model: claudeModels.sonnet,
++    system,
++    ...options,
++  })
++
++  const shouldStop = response.toUpperCase().trim() === 'STOP'
++  logger.debug(
++    { response, shouldStop },
++    `checkConversationProgress ${response}`
++  )
++
++  return shouldStop
++}
++
++export async function checkToAllowUnboundedIteration(
++  message: Message,
++  options: {
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
++    userId: string | undefined
++  }
++): Promise<boolean> {
++  if (message.role !== 'user' || typeof message.content !== 'string') {
++    return false
++  }
++
++  const checkInfinitePrompt = `Does this user message indicate they want the assistant to continue until all cases are done or a condition is met? Answer only "yes" or "no", and do not include any other text.
++Message: "${message.content}"
++
++Examples of language indicating "yes":
++- "do all of the cases"
++- "run until condition X is satisfied" 
++- "do the rest of the cases"
++- "keep going until finished"
++- "continue until complete"
++- "build the whole thing"
++- "complete the entire task"
++
++Examples of language indicating "no":
++- "Please continue"
++- "Build feature X for me"
++`
++  const response = await promptOpenAI(
++    [{ role: 'user', content: checkInfinitePrompt }],
++    {
++      model: openaiModels.gpt4omini,
++      ...options,
++    }
++  )
++
++  logger.debug(
++    { response, userMessage: message.content },
++    'checkToAllowUnboundedIteration'
++  )
++
++  return response.toLowerCase().includes('yes')
++}
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index 02deb284c..1c2cc9792 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -3,8 +3,7 @@ import { TextBlockParam } from '@anthropic-ai/sdk/resources'
+ import path from 'path'
+ 
+ import { promptClaudeStream } from './claude'
+-import { openaiModels } from 'common/constants'
+-import { promptOpenAI } from './openai-api'
++import { TOOL_RESULT_MARKER, STOP_MARKER } from 'common/constants'
+ import {
+   createFileBlock,
+   FileVersion,
+@@ -12,7 +11,6 @@ import {
+ } from 'common/util/file'
+ import { didClientUseTool } from 'common/util/tools'
+ import { getSearchSystemPrompt, getAgentSystemPrompt } from './system-prompt'
+-import { STOP_MARKER, TOOL_RESULT_MARKER } from 'common/constants'
+ import { FileChange, FileChanges, Message } from 'common/actions'
+ import { ToolCall } from 'common/actions'
+ import { requestFile, requestFiles } from './websockets/websocket-action'
+@@ -27,6 +25,10 @@ import { countTokens, countTokensJson } from './util/token-counter'
+ import { logger } from './util/logger'
+ import { difference, uniq, zip } from 'lodash'
+ import { filterDefined } from 'common/util/array'
++import {
++  checkConversationProgress,
++  checkToAllowUnboundedIteration,
++} from './conversation-progress'
+ 
+ /**
+  * Prompt claude, handle tool calls, and generate file changes.
+@@ -133,11 +135,12 @@ export async function mainPrompt(
+     })
+   }
+ 
++  const allowUnboundedIteration = await allowUnboundedIterationPromise
++
+   const numAssistantMessages = messages
+     .slice(lastUserMessageIndex)
+     .filter((message) => message.role === 'assistant').length
+-  const shouldPause =
+-    !(await allowUnboundedIterationPromise) && numAssistantMessages >= 3
++  const shouldPause = !allowUnboundedIteration && numAssistantMessages >= 3
+   if (shouldPause) {
+     const response = `\nI'll pause to get more instructions from the user.\n`
+     onResponseChunk(response)
+@@ -162,22 +165,31 @@ export async function mainPrompt(
+   if (lastMessage.role === 'user' && typeof lastMessage.content === 'string') {
+     newLastMessage = {
+       ...lastMessage,
+-      content: `${lastMessage.content}
+-
+-<additional_instruction>
++      content: `
++<system_instruction>
+ Please preserve as much of the existing code, its comments, and its behavior as possible. Make minimal edits to accomplish only the core of what is requested. Then pause to get more instructions from the user.
+-</additional_instruction>
+-<additional_instruction>
++</system_instruction>
++<system_instruction>
+ Always end your response with the following marker:
+ ${STOP_MARKER}
+-</additional_instruction>`,
++</system_instruction>
++${
++  lastMessage.content.includes(TOOL_RESULT_MARKER)
++    ? `
++<system_instruction>
++If the tool result above is of a terminal command succeeding, and you have completed a minimal version of the user's request, please write the ${STOP_MARKER} marker and do not write anything else to wait for further instructions from the user.
++</system_instruction>
++  `.trim()
++    : ''
++}
++
++${lastMessage.content}
++`.trim(),
+     }
+   }
+ 
+   while (!isComplete && iterationCount < MAX_ITERATIONS) {
+-    const system = getAgentSystemPrompt(fileContext, {
+-      checkFiles: false,
+-    })
++    const system = getAgentSystemPrompt(fileContext)
+     const messagesWithContinuedMessage = continuedMessages
+       ? [...messagesWithoutLastMessage, newLastMessage, ...continuedMessages]
+       : messages
+@@ -330,9 +342,40 @@ ${STOP_MARKER}
+       isComplete = true
+       logger.debug(maybeToolCall, 'tool call')
+     } else if (fullResponse.includes(STOP_MARKER)) {
+-      isComplete = true
+-      fullResponse = fullResponse.replace(STOP_MARKER, '')
+-      logger.debug('Reached STOP_MARKER')
++      // Check if we should actually stop or continue
++      const shouldStop =
++        !allowUnboundedIteration ||
++        (await checkConversationProgress(
++          [
++            ...messages.slice(lastUserMessageIndex),
++            {
++              role: 'assistant' as const,
++              content: fullResponse,
++            },
++          ],
++          fileContext,
++          {
++            clientSessionId,
++            fingerprintId,
++            userInputId,
++            userId,
++          }
++        ))
++
++      if (shouldStop) {
++        isComplete = true
++        fullResponse = fullResponse.replace(STOP_MARKER, '')
++        logger.debug('Reached STOP_MARKER and confirmed should stop')
++      } else {
++        // Signal to client to continue the conversation
++        logger.debug('Reached STOP_MARKER but should continue')
++        toolCall = {
++          id: Math.random().toString(36).slice(2),
++          name: 'continue',
++          input: {},
++        }
++        isComplete = true
++      }
+     } else {
+       logger.debug('Continuing to generate')
+       const fullResponseMinusLastLine =
+@@ -570,46 +613,3 @@ async function getFileVersionUpdates(
+     toolCallMessage,
+   }
+ }
+-
+-async function checkToAllowUnboundedIteration(
+-  message: Message,
+-  options: {
+-    clientSessionId: string
+-    fingerprintId: string
+-    userInputId: string
+-    userId: string | undefined
+-  }
+-): Promise<boolean> {
+-  if (message.role !== 'user' || typeof message.content !== 'string') {
+-    return false
+-  }
+-
+-  const checkInfinitePrompt = `Does this user message indicate they want the assistant to continue until all cases are done or a condition is met? Answer only "yes" or "no", and do not include any other text.
+-Message: "${message.content}"
+-
+-Examples of language indicating "yes":
+-- "do all of the cases"
+-- "run until condition X is satisfied" 
+-- "do the rest of the cases"
+-- "keep going until finished"
+-- "continue until complete"
+-- "build the whole thing"
+-- "complete the entire task"
+-
+-Examples of language indicating "no":
+-- "Please continue"
+-- "Build feature X for me"
+-`
+-  const response = await promptOpenAI(
+-    [{ role: 'user', content: checkInfinitePrompt }],
+-    {
+-      model: openaiModels.gpt4omini,
+-      ...options,
+-    }
+-  )
+-  logger.debug(
+-    { response, userMessage: message.content },
+-    'checkToAllowUnboundedIteration'
+-  )
+-  return response.toLowerCase().includes('yes')
+-}
+diff --git a/backend/src/system-prompt.ts b/backend/src/system-prompt.ts
+index 5fba8ed52..84b8ec4ef 100644
+--- a/backend/src/system-prompt.ts
++++ b/backend/src/system-prompt.ts
+@@ -47,12 +47,8 @@ export function getSearchSystemPrompt(fileContext: ProjectFileContext) {
+   return systemPrompt
+ }
+ 
+-export const getAgentSystemPrompt = (
+-  fileContext: ProjectFileContext,
+-  options: { checkFiles: boolean }
+-) => {
++export const getAgentSystemPrompt = (fileContext: ProjectFileContext) => {
+   const { fileVersions } = fileContext
+-  const { checkFiles } = options
+   const files = uniq(fileVersions.flatMap((files) => files.map((f) => f.path)))
+ 
+   const projectFileTreePrompt = getProjectFileTreePrompt(fileContext)
+@@ -77,7 +73,7 @@ export const getAgentSystemPrompt = (
+       cache_control: { type: 'ephemeral' as const },
+       text: buildArray(
+         getGitChangesPrompt(fileContext),
+-        getResponseFormatPrompt(checkFiles, files)
++        getResponseFormatPrompt(files)
+       ).join('\n\n'),
+     }
+   )
+@@ -412,7 +408,7 @@ ${truncateString(gitChanges.lastCommitMessages, maxLength / 10)}
+ `.trim()
+ }
+ 
+-const getResponseFormatPrompt = (checkFiles: boolean, files: string[]) => {
++const getResponseFormatPrompt = (files: string[]) => {
+   return `
+ # Response format
+ 
+@@ -430,7 +426,7 @@ If the user is requesting a change that you think has already been made based on
+ 
+ Do not write code except when editing files with <edit_file> blocks.
+ 
+-When adding new packages, use the <tool_call name="run_terminal_command">...</tool_call> tool to install the package rather than editing the package.json file with a guess at the version number to use. This way, you will be sure to have the latest version of the package.
++When adding new packages, use the <tool_call name="run_terminal_command">...</tool_call> tool to install the package rather than editing the package.json file with a guess at the version number to use. This way, you will be sure to have the latest version of the package. Do not install packages globally unless asked by the user (e.g. Don't run \`npm install -g <package-name>\`). Always try to use the package manager associated with the project (e.g. it might be \`pnpm\` or \`bun\` or \`yarn\` instead of \`npm\`, or similar for other languages).
+ It's super important to be mindful about getting the current version of packages no matter the language or package manager. In npm, use \`npm install\` for new packages rather than just editing the package.json file, because only running the install command will get the latest version. If adding a package with maven or another package manager, make sure you update the version to the latest rather than just writing out any version number.
+ 
+ Whenever you modify an exported token like a function or class or variable, you should grep to find all references to it before it was renamed (or had its type/parameters changed) and update the references appropriately.
+@@ -443,7 +439,7 @@ At the end of every response to the user, you should verify the changes you've m
+ 
+ First, check the knowledge files to see what the protocol is for verifying changes. For example, a \`knowledge.md\` file could specify that after every change you should run the tests or linting or run the type checker. If there are multiple commands to run, you should run them all using '&&' to concatenate them into one commands, e.g. \`npm run lint && npm run test\`.
+ 
+-By default, after editing any files, you should run the related tests and/or the type checker and/or the linter, if you are confident in how to run these checks from the terminal and you think the checks will be informative. Use these checks to ensure your changes did not break anything. If you get an error, you should fix it by editing the code. If the project is set up with unit tests, consider adding a new unit test to verify your change in addition to running the existing checks.
++By default, after editing any files, you should run the related tests and/or the type checker and/or the linter, if you are confident in how to run these checks from the terminal and you think the checks will be informative. Prefer running scripts in package.json (or similar spec for other languages) if possible. Use these checks to ensure your changes did not break anything. If you get an error, you should fix it by editing the code. If the project is set up with unit tests, consider adding a new unit test to verify your change in addition to running the existing checks.
+ 
+ <important_instruction>
+ Confine your edits to only what is directly necessary. Preserve the behavior of all existing code. Change only what you must to accomplish the user's request or add to a knowledge file.
+diff --git a/npm-app/src/tool-handlers.ts b/npm-app/src/tool-handlers.ts
+index 58ce8b0cc..ff91571fc 100644
+--- a/npm-app/src/tool-handlers.ts
++++ b/npm-app/src/tool-handlers.ts
+@@ -150,4 +150,5 @@ export const toolHandlers: Record<string, ToolHandler> = {
+     handleRunTerminalCommand(input, id, 'assistant').then(
+       (result) => result.result
+     )) as ToolHandler,
++  continue: async () => 'Please continue.',
+ }

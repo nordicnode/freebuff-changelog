@@ -1,0 +1,1033 @@
+diff --git a/backend/src/admin/grade-runs.ts b/backend/src/admin/grade-runs.ts
+new file mode 100644
+index 000000000..7e44ed547
+--- /dev/null
++++ b/backend/src/admin/grade-runs.ts
+@@ -0,0 +1,165 @@
++import { promptClaude } from '@/llm-apis/claude'
++import { Relabel } from '@codebuff/bigquery'
++
++import { GetRelevantFilesTrace } from '@codebuff/bigquery'
++
++const PROMPT = `
++You are an evaluator system, measuring how well various models perform at selecting the most relevant files for a given user request.
++You will be provided the context given to the other models, in the <request_context></request_context> tags.
++You will then be provided with multiple outputs, in the <model_outputs></model_outputs> tags. 
++It will be provided in the following format:
++
++<request_context>
++  ...
++</request_context>
++
++<model_outputs>
++  <output>
++    <model_id>1</model_id>
++    ...
++  </output>
++  <output>
++    <model_id>2</model_id>
++    ...
++  </output>
++</model_outputs>
++
++Your goal is to rank and grade the outputs from best to worst, and provide 1-5 scores based on how well they followed the instructions in the <request_context> tags.
++Provide the best output first, and the worst output last. Multiple models may receive the same score, but you should break ties by quality.
++Multiple models may receive the same score.
++
++You will provide your response in the following format:
++
++<scores>
++  <score>
++    <model_id>2</model_id>
++    <score>4</score>
++  </score>
++  <score>
++    <model_id>1</model_id>
++    <score>4</score>
++  </score>
++  <score>
++    <model_id>3</model_id>
++    <score>2</score>
++  </score>
++  ...
++</scores>
++`
++
++function modelsToXML(models: { model: string; output: string }[]) {
++  // 1-indexed ID, and then the output
++  return models
++    .map(
++      (model, index) =>
++        `<output>
++<model_id>${index + 1}</model_id>
++${model.output}
++</output>`
++    )
++    .join('\n')
++}
++function extractResponse(response: string): {
++  scores: { id: string; score: number }[]
++} {
++  const scoresMatch = response.match(/<scores>([\s\S]*?)<\/scores>/)
++  if (!scoresMatch) {
++    throw new Error('No scores found in response')
++  }
++
++  const scoresXml = scoresMatch[1]
++  const scoreMatches = scoresXml.match(
++    /<score>[\s\S]*?<model_id>(\d+)<\/model_id>[\s\S]*?<score>(\d+)<\/score>[\s\S]*?<\/score>/g
++  )
++
++  if (!scoreMatches) {
++    throw new Error('No valid score entries found')
++  }
++
++  return {
++    scores: scoreMatches.map((scoreXml) => {
++      const modelMatch = scoreXml.match(/<model_id>[\s]*(\d+)[\s]*<\/model_id>/)
++      const scoreMatch = scoreXml.match(/<score>[\s]*(\d+)[\s]*<\/score>/)
++
++      if (!modelMatch || !scoreMatch) {
++        throw new Error('Invalid score entry format')
++      }
++
++      return {
++        id: modelMatch[1],
++        score: parseInt(scoreMatch[1], 10),
++      }
++    }),
++  }
++}
++
++export async function gradeRun(tracesAndRelabels: {
++  trace: GetRelevantFilesTrace
++  relabels: Relabel[]
++}) {
++  const { trace, relabels } = tracesAndRelabels
++  const messages = trace.payload.messages
++
++  const originalOutput = trace.payload.output
++  const originalModel = trace.payload.model
++
++  const modelsWithOutputs: {
++    model: string
++    output: string
++  }[] = [
++    {
++      model: originalModel ?? 'original',
++      output: originalOutput,
++    },
++  ]
++
++  for (const relabel of relabels) {
++    const model = relabel.model
++    const output = relabel.payload.output
++    modelsWithOutputs.push({ model, output })
++  }
++
++  // randomize the order of the models, but remember the original order
++  modelsWithOutputs.sort(() => Math.random() - 0.5)
++
++  const modelOutputs = modelsToXML(modelsWithOutputs)
++
++  console.log(relabels)
++
++  const stringified = JSON.stringify(messages)
++  const response = await promptClaude(
++    [
++      {
++        role: 'user',
++        content: `<request_context>${stringified}</request_context>`,
++      },
++      {
++        role: 'user',
++        content: `<model_outputs>${modelOutputs}</model_outputs>`,
++      },
++      { role: 'user', content: PROMPT },
++    ],
++    {
++      system: PROMPT,
++      clientSessionId: 'relabel-trace-api',
++      fingerprintId: 'relabel-trace-api',
++      userInputId: 'relabel-trace-api',
++      ignoreDatabaseAndHelicone: true,
++      //   thinking: {
++      //     type: 'enabled',
++      //     budget_tokens: 10000,
++      //   },
++    }
++  )
++
++  const { scores } = extractResponse(response)
++
++  // Combine the scores with the model name from modelsWithOutputs
++  const scoresWithModelName = scores.map((score, index) => {
++    const model = modelsWithOutputs[index]
++    return { model: model.model, score: score.score, rank: index + 1 }
++  })
++
++  console.log(response)
++  console.log(scoresWithModelName)
++}
+diff --git a/backend/src/admin/relabelRuns.ts b/backend/src/admin/relabelRuns.ts
+index efa813f13..606054d45 100644
+--- a/backend/src/admin/relabelRuns.ts
++++ b/backend/src/admin/relabelRuns.ts
+@@ -1,18 +1,22 @@
+-import { GetRelevantFilesPayload } from '@codebuff/bigquery'
++import {
++  GetExpandedFileContextForTrainingBlobTrace,
++  GetExpandedFileContextForTrainingTrace,
++  GetRelevantFilesPayload,
++  GetRelevantFilesTrace,
++  getTracesAndAllDataForUser,
++  getTracesWithoutRelabels,
++  insertRelabel,
++} from '@codebuff/bigquery'
+ import {
+   claudeModels,
+   finetunedVertexModels,
+   geminiModels,
+ } from 'common/constants'
+-import {
+-  getTracesAndRelabelsForUser,
+-  getTracesWithoutRelabels,
+-  insertRelabel,
+-} from '@codebuff/bigquery'
+ import { Message } from 'common/types/message'
+ import { generateCompactId } from 'common/util/string'
+ import { Request, Response } from 'express'
+ 
++import { rerank } from '@/llm-apis/relace-api'
+ import { promptClaude, System } from '../llm-apis/claude'
+ import { promptFlashWithFallbacks } from '../llm-apis/gemini-with-fallbacks'
+ import { logger } from '../util/logger'
+@@ -34,50 +38,68 @@ export async function getTracesForUserHandler(req: Request, res: Response) {
+     }
+ 
+     // Call the function to get traces and relabels
+-    const tracesAndRelabels = await getTracesAndRelabelsForUser(userId)
++    const tracesAndRelabels = await getTracesAndAllDataForUser(userId)
+ 
+     // Transform data for the frontend
+-    const formattedResults = tracesAndRelabels.map(({ trace, relabels }) => {
+-      // Extract timestamp
+-      const timestamp = (trace.created_at as unknown as { value: string }).value
+-
+-      // Extract query from the last message in the messages array
+-      const messages = trace.payload.messages || []
+-      const queryBody =
+-        Array.isArray(messages) && messages.length > 0
+-          ? messages[messages.length - 1].content[0].text || 'Unknown query'
+-          : 'Unknown query'
+-
+-      // User prompt: User prompt: \"still not seeing it, can you see it on the page?\"
+-      // Extract using regex the above specific substring, matching the bit inside quotes
+-      const query = queryBody.match(/"(.*?)"/)?.[1] || 'Unknown query'
+-
+-      // Get base model output
+-      const baseOutput = trace.payload.output || ''
+-
+-      // Initialize outputs with base model
+-      const outputs: Record<string, string> = {
+-        base: baseOutput,
+-      }
++    const formattedResults = tracesAndRelabels.map(
++      ({ trace, relatedTraces, relabels }) => {
++        // Extract timestamp
++        const timestamp = (trace.created_at as unknown as { value: string })
++          .value
++
++        // Extract query from the last message in the messages array
++        const messages = trace.payload.messages || []
++        const queryBody =
++          Array.isArray(messages) && messages.length > 0
++            ? messages[messages.length - 1].content[0].text || 'Unknown query'
++            : 'Unknown query'
++
++        // User prompt: User prompt: \"still not seeing it, can you see it on the page?\"
++        // Extract using regex the above specific substring, matching the bit inside quotes
++        const query = queryBody.match(/"(.*?)"/)?.[1] || 'Unknown query'
++
++        // Get base model output
++        const baseOutput = trace.payload.output || ''
+ 
+-      // Add outputs from relabels
+-      relabels.forEach((relabel) => {
+-        if (relabel.model && relabel.payload?.output) {
+-          outputs[relabel.model] = relabel.payload.output
++        // Initialize outputs with base model
++        const outputs: Record<string, string> = {
++          base: baseOutput,
+         }
+-      })
+ 
+-      return {
+-        timestamp,
+-        query,
+-        outputs,
++        // Add outputs from relabels
++        relabels.forEach((relabel) => {
++          if (relabel.model && relabel.payload?.output) {
++            outputs[relabel.model] = relabel.payload.output
++          }
++        })
++
++        relatedTraces.forEach((trace) => {
++          if (trace.type === 'get-expanded-file-context-for-training') {
++            outputs['files-uploaded'] = (
++              trace.payload as GetRelevantFilesPayload
++            ).output
++          }
++        })
++
++        return {
++          timestamp,
++          query,
++          outputs,
++        }
+       }
+-    })
++    )
+ 
+     // Return the formatted data
+     return res.json({ data: formattedResults })
+   } catch (error) {
+-    logger.error('Error fetching traces and relabels:', error)
++    logger.error(
++      {
++        error: error,
++        stack: error instanceof Error ? error.stack : undefined,
++        message: error instanceof Error ? error.message : 'Unknown error',
++      },
++      'Error fetching traces and relabels'
++    )
+     return res
+       .status(500)
+       .json({ error: 'Failed to fetch traces and relabels' })
+@@ -87,7 +109,7 @@ export async function getTracesForUserHandler(req: Request, res: Response) {
+ // --- POST Handler Logic ---
+ 
+ const models = [
+-  geminiModels.gemini2_5_pro_exp,
++  geminiModels.gemini2_5_pro_preview,
+   claudeModels.sonnet,
+   finetunedVertexModels.ft_filepicker_005,
+ ] as const
+@@ -108,6 +130,8 @@ export async function relabelForUserHandler(req: Request, res: Response) {
+ 
+     const allResults = []
+ 
++    const relaceResults = relabelUsingFullFilesForUser(userId, limit)
++
+     // Process each model
+     for (const model of models) {
+       logger.info(`Processing traces for model ${model} and user ${userId}...`)
+@@ -209,6 +233,10 @@ export async function relabelForUserHandler(req: Request, res: Response) {
+       allResults.push(...modelResults)
+     }
+ 
++    await relaceResults
++
++    // TODO: Add the judging step right here?
++
+     // Return success response
+     return res.json({
+       success: true,
+@@ -216,7 +244,172 @@ export async function relabelForUserHandler(req: Request, res: Response) {
+       data: allResults,
+     })
+   } catch (error) {
+-    logger.error('Error relabeling traces:', error)
++    logger.error(
++      {
++        error: error,
++        stack: error instanceof Error ? error.stack : undefined,
++        message: error instanceof Error ? error.message : 'Unknown error',
++      },
++      'Error relabeling traces'
++    )
+     return res.status(500).json({ error: 'Failed to relabel traces' })
+   }
+ }
++
++async function relabelUsingFullFilesForUser(userId: string, limit: 10) {
++  // TODO: We need to figure out changing _everything_ to use `getTracesAndAllDataForUser`
++  const tracesBundles = await getTracesAndAllDataForUser(userId)
++
++  let relabeled = 0
++  const relabelPromises = []
++  for (const traceBundle of tracesBundles) {
++    const trace = traceBundle.trace as GetRelevantFilesTrace
++    const files = traceBundle.relatedTraces.find(
++      (t) =>
++        t.type === 'get-expanded-file-context-for-training' &&
++        (t.payload as GetRelevantFilesPayload)
++    ) as GetExpandedFileContextForTrainingTrace
++    // TODO: We might be messing this up by not storing if 'Key' or 'Non-obvious', now that we collect both (?)
++    const fileBlobs = traceBundle.relatedTraces.find(
++      (t) => t.type === 'get-expanded-file-context-for-training-blobs'
++    ) as GetExpandedFileContextForTrainingBlobTrace
++
++    if (!files || !fileBlobs) {
++      continue
++    }
++
++    if (!traceBundle.relabels.some((r) => r.model === 'relace-ranker')) {
++      relabelPromises.push(relabelWithRelace(trace, fileBlobs))
++    }
++    if (
++      !traceBundle.relabels.some(
++        (r) => r.model === 'claude-3-5-sonnet-with-full-file-context'
++      )
++    ) {
++      relabelPromises.push(
++        relabelWithClaudeWithFullFileContext(trace, fileBlobs)
++      )
++    }
++    relabeled++
++
++    if (relabeled >= limit) {
++      break
++    }
++  }
++
++  await Promise.all(relabelPromises)
++
++  return relabeled
++}
++
++async function relabelWithRelace(
++  trace: GetRelevantFilesTrace,
++  fileBlobs: GetExpandedFileContextForTrainingBlobTrace
++) {
++  logger.info(`Relabeling ${trace.id} with Relace`)
++  const messages = trace.payload.messages || []
++  const queryBody =
++    Array.isArray(messages) && messages.length > 0
++      ? messages[messages.length - 1].content[0].text || 'Unknown query'
++      : 'Unknown query'
++
++  // User prompt: User prompt: \"still not seeing it, can you see it on the page?\"
++  // Extract using regex the above specific substring, matching the bit inside quotes
++  const query = queryBody.match(/"(.*?)"/)?.[1] || 'Unknown query'
++
++  const filesWithPath = Object.entries(fileBlobs.payload.files).map(
++    ([path, file]) => ({
++      path,
++      content: file.content,
++    })
++  )
++
++  const relaced = await rerank(filesWithPath, query, {
++    clientSessionId: trace.payload.client_session_id,
++    fingerprintId: trace.payload.fingerprint_id,
++    userInputId: trace.payload.user_input_id,
++    userId: 'test-user-id', // Make sure we don't bill em for it!!
++    messageId: trace.id,
++  })
++
++  const relabel = {
++    id: generateCompactId(),
++    agent_step_id: trace.agent_step_id,
++    user_id: trace.user_id,
++    created_at: new Date(),
++    model: 'relace-ranker',
++    payload: {
++      user_input_id: trace.payload.user_input_id,
++      client_session_id: trace.payload.client_session_id,
++      fingerprint_id: trace.payload.fingerprint_id,
++      output: relaced.join('\n'),
++    },
++  }
++
++  await insertRelabel(relabel)
++
++  return relaced
++}
++
++async function relabelWithClaudeWithFullFileContext(
++  trace: GetRelevantFilesTrace,
++  fileBlobs: GetExpandedFileContextForTrainingBlobTrace
++) {
++  logger.info(`Relabeling ${trace.id} with Claude with full file context`)
++  const filesWithPath = Object.entries(fileBlobs.payload.files).map(
++    ([path, file]) => ({
++      path,
++      content: file.content,
++    })
++  )
++
++  const filesString = filesWithPath
++    .map(
++      (f) => `<file-contents>
++      <name>${f.path}</name>
++      <contents>${f.content}</contents>
++    </file-contents>`
++    )
++    .join('\n')
++
++  const partialFileContext = `## Partial file context\n In addition to the file-tree, you've also been provided with some full files to make a better decision. Use these to help you decide which files are most relevant to the query. \n<partial-file-context>\n${filesString}\n</partial-file-context>`
++
++  let system = trace.payload.system as System
++  if (typeof system === 'string') {
++    system = system + partialFileContext
++    console.log({ system: system }, 'Updated system for Claude')
++  } else {
++    // append partialFileContext to the last element of the system array
++    system[system.length - 1].text =
++      system[system.length - 1].text + partialFileContext
++
++    console.log({ system: JSON.stringify(system) }, 'Updated system for Claude')
++  }
++
++  const output = await promptClaude(trace.payload.messages as Message[], {
++    system: system,
++    model: claudeModels.sonnet,
++    clientSessionId: 'relabel-trace-api',
++    fingerprintId: 'relabel-trace-api',
++    userInputId: 'relabel-trace-api',
++    ignoreDatabaseAndHelicone: true,
++  })
++
++  const relabel = {
++    id: generateCompactId(),
++    agent_step_id: trace.agent_step_id,
++    user_id: trace.user_id,
++    created_at: new Date(),
++    model: 'claude-3-5-sonnet-with-full-file-context',
++    payload: {
++      user_input_id: trace.payload.user_input_id,
++      client_session_id: trace.payload.client_session_id,
++      fingerprint_id: trace.payload.fingerprint_id,
++      output: output,
++    },
++  }
++
++  await insertRelabel(relabel)
++
++  return relabel
++}
+diff --git a/packages/bigquery/src/client.ts b/packages/bigquery/src/client.ts
+index a7e0cd4c2..1e155c10f 100644
+--- a/packages/bigquery/src/client.ts
++++ b/packages/bigquery/src/client.ts
+@@ -2,6 +2,7 @@ import { BigQuery } from '@google-cloud/bigquery'
+ 
+ import { logger } from 'common/src/util/logger'
+ import {
++  BaseTrace,
+   GetRelevantFilesTrace,
+   Relabel,
+   RELABELS_SCHEMA,
+@@ -261,9 +262,10 @@ export async function getTracesWithRelabels(
+ }
+ 
+ export async function getTracesAndRelabelsForUser(
+-  userId: string,
++  userId?: string,
+   limit: number = 50,
+-  dataset: string = DATASET
++  dataset: string = DATASET,
++  joinType: 'INNER' | 'LEFT' = 'LEFT'
+ ) {
+   // Get recent traces for the user and any associated relabels
+   const query = `
+@@ -276,7 +278,8 @@ export async function getTracesAndRelabelsForUser(
+       type,
+       payload
+     FROM \`${dataset}.${TRACES_TABLE}\`
+-    WHERE user_id = '${userId}' AND type = 'get-relevant-files'
++    WHERE type = 'get-relevant-files'
++    ${userId ? `AND user_id = '${userId}'` : ''}
+     ORDER BY created_at DESC
+     LIMIT ${limit}
+   )
+@@ -289,7 +292,7 @@ export async function getTracesAndRelabelsForUser(
+     ANY_VALUE(t.payload) as payload,
+     ARRAY_AGG(r IGNORE NULLS) as relabels
+   FROM traces t
+-  LEFT JOIN \`${dataset}.${RELABELS_TABLE}\` r
++  ${joinType === 'INNER' ? 'INNER JOIN' : 'LEFT JOIN'} \`${dataset}.${RELABELS_TABLE}\` r
+   ON t.agent_step_id = r.agent_step_id
+      AND t.user_id = r.user_id
+      AND JSON_EXTRACT_SCALAR(t.payload, '$.user_input_id') = JSON_EXTRACT_SCALAR(r.payload, '$.user_input_id')
+@@ -326,4 +329,109 @@ export async function getTracesAndRelabelsForUser(
+ 
+     return { trace, relabels }
+   })
+-}
+\ No newline at end of file
++}
++
++interface TraceBundle {
++  trace: GetRelevantFilesTrace // the base row
++  relatedTraces: BaseTrace[] // the extras (runtime-typed)
++  relabels: Relabel[]
++}
++export async function getTracesAndAllDataForUser(
++  userId?: string,
++  limit = 50,
++  dataset = DATASET
++): Promise<TraceBundle[]> {
++  const EXTRA_TRACE_TYPES = [
++    'get-expanded-file-context-for-training',
++    'get-expanded-file-context-for-training-blobs',
++    'grade-run',
++  ] as const
++
++  /* prettier-ignore */
++  const sql = `
++  /*──────────────── base (latest N get-relevant-files rows) ─────────────*/
++  WITH base AS (
++    SELECT id, agent_step_id, user_id, created_at, type, payload
++    FROM   \`${dataset}.${TRACES_TABLE}\` 
++    WHERE  ${userId ? 'user_id = @userId AND' : ''} type = 'get-relevant-files' AND JSON_EXTRACT_SCALAR(payload, '$.request_type') = 'Key'
++    ORDER  BY created_at DESC
++    LIMIT  @limit
++  ),
++
++  /*───────────── extra traces that share agent_step_id,user_id ──────────*/
++  filtered AS (
++    SELECT t.id, t.agent_step_id, t.user_id, t.created_at, t.type, t.payload
++    FROM   \`${dataset}.${TRACES_TABLE}\` AS t
++    JOIN   base                         AS b
++           USING (agent_step_id, user_id)
++    WHERE  t.type IN (${EXTRA_TRACE_TYPES.map(t => `'${t}'`).join(', ')})
++  ),
++
++  all_rows AS (
++    SELECT * FROM base
++    UNION ALL
++    SELECT * FROM filtered
++  )
++
++  /*────────────────────────── final aggregation ─────────────────────────*/
++  SELECT
++    ANY_VALUE(IF(type='get-relevant-files', t.id,         NULL)) AS id,
++    t.agent_step_id,
++    ANY_VALUE(IF(type='get-relevant-files', t.user_id,    NULL)) AS user_id,
++    ANY_VALUE(IF(type='get-relevant-files', t.created_at, NULL)) AS created_at,
++    ANY_VALUE(IF(type='get-relevant-files', t.payload,    NULL)) AS payload,
++
++    ARRAY_AGG(
++      CASE
++        WHEN type <> 'get-relevant-files'
++        THEN STRUCT(t.id, t.created_at, t.type, t.payload)
++      END
++      IGNORE NULLS
++      ORDER BY t.created_at
++    ) AS related_traces,
++
++    ARRAY_AGG(r IGNORE NULLS) AS relabels
++  FROM all_rows AS t
++  LEFT JOIN \`${dataset}.${RELABELS_TABLE}\` AS r
++    ON  t.agent_step_id = r.agent_step_id
++    AND t.user_id       = r.user_id
++    AND JSON_EXTRACT_SCALAR(t.payload, '$.user_input_id')
++        = JSON_EXTRACT_SCALAR(r.payload, '$.user_input_id')
++  GROUP BY agent_step_id
++  ORDER BY created_at DESC
++  `
++
++  const [rows] = await getClient().query({
++    query: sql,
++    params: { ...(userId ? { userId } : {}), limit },
++  })
++
++  /*──────────────────── shape rows into typed bundles ───────────────────*/
++  return rows.map((row: any) => {
++    const trace: GetRelevantFilesTrace = {
++      id: row.id,
++      agent_step_id: row.agent_step_id,
++      user_id: row.user_id,
++      created_at: row.created_at,
++      type: 'get-relevant-files',
++      payload:
++        typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload,
++    }
++
++    const relatedTraces: BaseTrace[] = (row.related_traces || []).map(
++      (r: any) => ({
++        ...r,
++        payload:
++          typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload,
++      })
++    )
++
++    const relabels: Relabel[] = (row.relabels || []).map((r: any) => ({
++      ...r,
++      payload:
++        typeof r.payload === 'string' ? JSON.parse(r.payload) : r.payload,
++    }))
++
++    return { trace, relatedTraces, relabels }
++  })
++}
+diff --git a/packages/bigquery/src/schema.ts b/packages/bigquery/src/schema.ts
+index e850b2240..ae676c149 100644
+--- a/packages/bigquery/src/schema.ts
++++ b/packages/bigquery/src/schema.ts
+@@ -19,6 +19,7 @@ export type TraceType =
+   | 'agent-response' // Response from the agent at the end
+   | 'get-expanded-file-context-for-training' // Additional capture of a stronger-model + higher-file limit call
+   | 'get-expanded-file-context-for-training-blobs' // Capture of full file context from get-relevant-files-for-training call
++  | 'grade-run' // Run grades (by a judge model)
+ 
+ // Base trace interface
+ export interface BaseTrace extends BaseEvent {
+@@ -74,6 +75,16 @@ export interface AgentResponseTrace extends BaseTrace {
+   payload: AgentResponsePayload
+ }
+ 
++interface GradeRunPayload extends BasePayload {
++  type: 'grade-run'
++  scores: string // Of format: [{model_name: "foo", score: 4}, {model_name: "bar", score: 3}, {model_name: "baz", score: 3}]
++}
++
++export interface GradeRunTrace extends BaseTrace {
++  type: 'grade-run'
++  payload: GradeRunPayload
++}
++
+ // Union type for all trace records
+ export type Trace =
+   | GetRelevantFilesTrace
+@@ -81,6 +92,7 @@ export type Trace =
+   | AgentResponseTrace
+   | GetExpandedFileContextForTrainingBlobTrace
+   | GetExpandedFileContextForTrainingTrace
++  | GradeRunTrace
+ 
+ export const TRACES_SCHEMA: TableSchema = {
+   fields: [
+diff --git a/scripts/ft-file-selection/grade-traces.ts b/scripts/ft-file-selection/grade-traces.ts
+new file mode 100644
+index 000000000..e101b9dd4
+--- /dev/null
++++ b/scripts/ft-file-selection/grade-traces.ts
+@@ -0,0 +1,88 @@
++import { getTracesAndRelabelsForUser, setupBigQuery } from '@codebuff/bigquery'
++import { logger } from 'common/src/util/logger'
++import { gradeRun } from '../../backend/src/admin/grade-runs'
++
++// Parse command line arguments to check for --prod flag
++const isProd = process.argv.includes('--prod')
++const DATASET = isProd ? 'codebuff_data' : 'codebuff_data_dev'
++const MAX_PARALLEL = 1 // Maximum number of traces to process in parallel
++
++async function gradeTraces() {
++  try {
++    // Initialize BigQuery
++    await setupBigQuery(DATASET)
++
++    console.log(`\nGrading traces from dataset: ${DATASET}`)
++
++    // Get traces with their relabels
++    const unfilteredTracesAndRelabels = await getTracesAndRelabelsForUser(
++      undefined,
++      1000,
++      DATASET,
++      'INNER'
++    )
++
++    const tracesAndRelabels = unfilteredTracesAndRelabels
++      .filter((traceAndRelabels) => traceAndRelabels.relabels.length > 0)
++      .slice(0, 1)
++
++    console.log(`Found ${tracesAndRelabels.length} traces to grade`)
++
++    // Process traces in batches of MAX_PARALLEL
++    for (let i = 0; i < tracesAndRelabels.length; i += MAX_PARALLEL) {
++      const batch = tracesAndRelabels.slice(i, i + MAX_PARALLEL)
++      console.log(
++        `Processing batch of ${batch.length} traces (${i + 1}-${Math.min(
++          i + MAX_PARALLEL,
++          tracesAndRelabels.length
++        )})`
++      )
++
++      // Process each trace in the batch in parallel
++      const results = await Promise.all(
++        batch.map(async (traceAndRelabels) => {
++          try {
++            console.log(`Grading trace ${traceAndRelabels.trace.id}`)
++            const result = await gradeRun(traceAndRelabels)
++            return {
++              traceId: traceAndRelabels.trace.id,
++              status: 'success',
++              result,
++            }
++          } catch (error) {
++            logger.error(
++              `Error grading trace ${traceAndRelabels.trace.id}:`,
++              error
++            )
++            return {
++              traceId: traceAndRelabels.trace.id,
++              status: 'error',
++              error: error instanceof Error ? error.message : 'Unknown error',
++            }
++          }
++        })
++      )
++
++      // Log results for this batch
++      results.forEach((result) => {
++        if (result.status === 'success') {
++          console.log(`Successfully graded trace ${result.traceId}:`)
++          console.log(result.result)
++        } else {
++          console.error(
++            `Failed to grade trace ${result.traceId}:`,
++            result.error
++          )
++        }
++      })
++
++      console.log(`Completed batch of ${batch.length} traces`)
++    }
++  } catch (error) {
++    console.error('Error running trace grading:', error)
++    process.exit(1)
++  }
++}
++
++// Run the script
++gradeTraces()
+diff --git a/web/src/app/admin/file-picker/page.tsx b/web/src/app/admin/file-picker/page.tsx
+index 5eff93f02..4e6ba86e9 100644
+--- a/web/src/app/admin/file-picker/page.tsx
++++ b/web/src/app/admin/file-picker/page.tsx
+@@ -1,11 +1,19 @@
+ 'use client'
+ 
+ import { finetunedVertexModels } from 'common/constants'
++import { Eye, Info } from 'lucide-react'
+ import { useSession } from 'next-auth/react'
+ import { useState } from 'react'
+ 
+ import { Button } from '@/components/ui/button'
+ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
++import {
++  Dialog,
++  DialogContent,
++  DialogHeader,
++  DialogTitle,
++  DialogTrigger,
++} from '@/components/ui/dialog'
+ import { Input } from '@/components/ui/input'
+ import {
+   Table,
+@@ -25,7 +33,7 @@ const productionUsers = [
+ ]
+ 
+ const localUsers = [
+-  { name: 'Venki', id: 'fad054ab-150b-4a1a-b6ec-1a797972638b' },
++  { name: 'Venki', id: '3e503b10-a3c8-4fac-ac7e-043e32a6f5d1' },
+ ]
+ 
+ const nameOverrides = {
+@@ -51,6 +59,9 @@ export default function FilePicker() {
+   const [results, setResults] = useState<Result[]>([])
+   const [isLoading, setIsLoading] = useState(false)
+   const [error, setError] = useState('')
++  const [isInfoOpen, setIsInfoOpen] = useState(false)
++  const [isColumnSettingsOpen, setIsColumnSettingsOpen] = useState(false)
++  const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set())
+ 
+   const fetchUserTraces = async (userId: string) => {
+     if (status !== 'authenticated') {
+@@ -151,6 +162,39 @@ export default function FilePicker() {
+     new Set(results.flatMap((result) => Object.keys(result.outputs)))
+   )
+ 
++  // Define the desired column order
++  const columnOrder = [
++    'base',
++    'files-uploaded',
++    'relace-ranker',
++    'claude-3-5-sonnet-with-full-file-context'
++  ]
++
++  // Sort model names according to the desired order
++  const sortedModelNames = [...modelNames].sort((a, b) => {
++    const aIndex = columnOrder.indexOf(a)
++    const bIndex = columnOrder.indexOf(b)
++    if (aIndex === -1 && bIndex === -1) return 0 // Keep other columns in their original order
++    if (aIndex === -1) return 1 // Put unspecified columns at the end
++    if (bIndex === -1) return -1
++    return aIndex - bIndex
++  })
++
++  // Filter out hidden columns
++  const visibleModelNames = sortedModelNames.filter(model => !hiddenColumns.has(model))
++
++  const toggleColumn = (model: string) => {
++    setHiddenColumns(prev => {
++      const newSet = new Set(prev)
++      if (newSet.has(model)) {
++        newSet.delete(model)
++      } else {
++        newSet.add(model)
++      }
++      return newSet
++    })
++  }
++
+   return (
+     <div className="container mx-auto py-8">
+       <Card>
+@@ -206,13 +250,89 @@ export default function FilePicker() {
+                     <h3 className="text-lg font-medium">
+                       Results ({results.length})
+                     </h3>
+-                    <Button
+-                      onClick={handleRunRelabelling}
+-                      variant="outline"
+-                      disabled={isLoading}
+-                    >
+-                      Run relabelling
+-                    </Button>
++                    <div className="flex items-center gap-2">
++                      <Dialog open={isInfoOpen} onOpenChange={setIsInfoOpen}>
++                        <DialogTrigger asChild>
++                          <Button variant="outline" size="icon">
++                            <Info className="h-4 w-4" />
++                          </Button>
++                        </DialogTrigger>
++                        <DialogContent>
++                          <DialogHeader>
++                            <DialogTitle>Column Information</DialogTitle>
++                          </DialogHeader>
++                          <div className="space-y-4">
++                            <div>
++                              <h4 className="font-medium mb-1">base</h4>
++                              <p className="text-sm text-muted-foreground">
++                                The model that's currently in production.
++                              </p>
++                            </div>
++                            <div>
++                              <h4 className="font-medium mb-1">claude-3.5-sonnet / gemini-2.5-pro</h4>
++                              <p className="text-sm text-muted-foreground">
++                                Regular relabels using these models, ie: we take the exact same request in prod, but instead send it to this stronger model. Does not use the full-file contents.
++                              </p>
++                            </div>
++                            <div>
++                              <h4 className="font-medium mb-1">files-uploaded</h4>
++                              <p className="text-sm text-muted-foreground">
++                                Files selected for full file-context upload by a claude-3.5-sonnet specifically asked to pick as many relevant files as possible.
++                              </p>
++                            </div>
++                            <div>
++                              <h4 className="font-medium mb-1">relace-ranker</h4>
++                              <p className="text-sm text-muted-foreground">
++                                A re-ordering of files-uploaded using the Relace API. Does use the file list as well as file contents from the full request from claude-3.5-sonnet. (TODO: We're currently only giving it the last user-query - giving it more search context might help its quality!)
++                              </p>
++                            </div>
++                            <div>
++                              <h4 className="font-medium mb-1">claude-3.5-sonnet-with-full-file-context</h4>
++                              <p className="text-sm text-muted-foreground">
++                                Similar to the regular claude-3.5-sonnet relabel, but we append all full files we have to the system prompt.
++                              </p>
++                            </div>
++                          </div>
++                        </DialogContent>
++                      </Dialog>
++
++                      <Dialog open={isColumnSettingsOpen} onOpenChange={setIsColumnSettingsOpen}>
++                        <DialogTrigger asChild>
++                          <Button variant="outline" size="icon">
++                            <Eye className="h-4 w-4" />
++                          </Button>
++                        </DialogTrigger>
++                        <DialogContent>
++                          <DialogHeader>
++                            <DialogTitle>Column Visibility</DialogTitle>
++                          </DialogHeader>
++                          <div className="space-y-4">
++                            {sortedModelNames.map((model) => (
++                              <div key={model} className="flex items-center space-x-2">
++                                <input
++                                  type="checkbox"
++                                  id={model}
++                                  checked={!hiddenColumns.has(model)}
++                                  onChange={() => toggleColumn(model)}
++                                  className="h-4 w-4 rounded border-gray-300"
++                                />
++                                <label htmlFor={model} className="text-sm">
++                                  {nameOverrides[model as keyof typeof nameOverrides] || model}
++                                </label>
++                              </div>
++                            ))}
++                          </div>
++                        </DialogContent>
++                      </Dialog>
++
++                      <Button
++                        onClick={handleRunRelabelling}
++                        variant="outline"
++                        disabled={isLoading}
++                      >
++                        Run relabelling
++                      </Button>
++                    </div>
+                   </div>
+ 
+                   <Table>
+@@ -220,7 +340,7 @@ export default function FilePicker() {
+                       <TableRow>
+                         <TableHead className="w-[180px]">Timestamp</TableHead>
+                         <TableHead>Query</TableHead>
+-                        {modelNames.map((model) => (
++                        {visibleModelNames.map((model) => (
+                           <TableHead key={model}>
+                             {nameOverrides[model as keyof typeof nameOverrides] ||
+                               model}
+@@ -235,27 +355,29 @@ export default function FilePicker() {
+                             {new Date(result.timestamp).toLocaleString()}
+                           </TableCell>
+                           <TableCell>{result.query}</TableCell>
+-                          {modelNames.map((model) => (
++                          {visibleModelNames.map((model) => (
+                             <TableCell
+                               key={model}
+                               className="max-w-[300px] break-words"
+                             >
+-                              {result.outputs[model]
+-                                ? result.outputs[model]
+-                                  .split('\n')
+-                                  .map((file) => file.trim())
+-                                  .filter((file) => file.length > 0)
+-                                  .map((file, fileIndex) => (
+-                                    <div
+-                                      key={fileIndex}
+-                                      className="block mb-2"
+-                                    >
+-                                      <span className="px-2 py-1 bg-secondary rounded-full text-xs">
+-                                        {file}
+-                                      </span>
+-                                    </div>
+-                                  ))
+-                                : 'N/A'}
++                              <div className="max-h-[200px] overflow-y-auto">
++                                {result.outputs[model]
++                                  ? result.outputs[model]
++                                    .split('\n')
++                                    .map((file) => file.trim())
++                                    .filter((file) => file.length > 0)
++                                    .map((file, fileIndex) => (
++                                      <div
++                                        key={fileIndex}
++                                        className="block mb-2"
++                                      >
++                                        <span className="px-2 py-1 bg-secondary rounded-full text-xs">
++                                          {file}
++                                        </span>
++                                      </div>
++                                    ))
++                                  : 'N/A'}
++                              </div>
+                             </TableCell>
+                           ))}
+                         </TableRow>

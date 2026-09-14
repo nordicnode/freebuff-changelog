@@ -1,0 +1,1529 @@
+diff --git a/backend/src/browser-debugging.knowledge.md b/backend/src/browser-debugging.knowledge.md
+index 257c4b092..8bfa44ac7 100644
+--- a/backend/src/browser-debugging.knowledge.md
++++ b/backend/src/browser-debugging.knowledge.md
+@@ -576,3 +576,20 @@ When transforming message content:
+    - Comprehensive test coverage
+    - Error path testing
+    - Cleanup verification
++
++### Screenshot Handling
++
++- Screenshots are taken at two points:
++  - Pre-action: Only if browser is already running
++  - Post-action: After action completes
++- Both screenshots are optional in the response
++- Screenshots object only included if at least one screenshot exists
++- Handle screenshot failures gracefully:
++  - Log warning for pre-action failures
++  - Log error for post-action failures
++  - Continue execution even if screenshots fail
++- Screenshots require active browser session:
++  - Only attempt screenshots when page is available
++  - No need to check browser state (page implies browser)
++  - Screenshots are jpeg format with configurable quality
++  - Default compression quality is 25%
+diff --git a/backend/src/claude.ts b/backend/src/claude.ts
+index 8a1da4c0a..22fbd2b19 100644
+--- a/backend/src/claude.ts
++++ b/backend/src/claude.ts
+@@ -1,58 +1,41 @@
+-import Anthropic, { APIConnectionError } from '@anthropic-ai/sdk'
+-import { TextBlockParam, Tool } from '@anthropic-ai/sdk/resources'
++import { Anthropic, APIConnectionError } from '@anthropic-ai/sdk'
+ import { removeUndefinedProps } from 'common/util/object'
+ import { Message } from 'common/actions'
+ import { claudeModels, STOP_MARKER, AnthropicModel } from 'common/constants'
+ import { match, P } from 'ts-pattern'
++import { logger } from './util/logger'
++import { limitScreenshots } from 'common/util/messages'
++import { env } from './env.mjs'
++import { saveMessage } from './billing/message-cost-tracker'
++import { sleep } from 'common/util/promise'
++import { APIError } from '@anthropic-ai/sdk/error'
++import type { Tool, TextBlockParam } from '@anthropic-ai/sdk/resources'
++
++const MAX_SCREENSHOTS = 2
+ 
+ /**
+  * Transform messages for Anthropic API.
+  * Anthropic's format matches our internal format, but we still want to be explicit
+  * about when we don't send images to certain models.
+- *
+- * @param message The message to transform
+- * @param model The Anthropic model being used
+- * @returns The transformed message
+  */
+-function transformedMessage(message: Message, model: AnthropicModel): Message {
++function transformMessages(
++  messages: Message[],
++  model: AnthropicModel
++): Message[] {
+   return match(model)
+-    .with(claudeModels.sonnet, () => message) // Sonnet supports images natively
++    .with(claudeModels.sonnet, () =>
++      limitScreenshots(messages, MAX_SCREENSHOTS)
++    )
+     .with(claudeModels.haiku, () =>
+-      match<Message, Message>(message)
+-        .with({ content: P.string }, () => message)
+-        .with(
+-          {
+-            content: P.array({
+-              type: P.string,
+-            }),
+-          },
+-          (msg) => {
+-            const hasImages = msg.content.some(
+-              (obj: { type: string }) => obj.type === 'image'
+-            )
+-            if (hasImages) {
+-              logger.info(
+-                'Stripping images from message - Claude Haiku does not support images'
+-              )
+-              return {
+-                ...msg,
+-                content: msg.content.filter(
+-                  (obj: { type: string }) => obj.type !== 'image'
+-                ),
+-              }
+-            }
+-            return msg
+-          }
+-        )
+-        .exhaustive()
++      messages.map((msg) => ({
++        ...msg,
++        content: Array.isArray(msg.content)
++          ? msg.content.filter((item) => item.type !== 'image')
++          : msg.content,
++      }))
+     )
+     .exhaustive()
+ }
+-import { env } from './env.mjs'
+-import { saveMessage } from './billing/message-cost-tracker'
+-import { logger } from './util/logger'
+-import { sleep } from 'common/util/promise'
+-import { APIError } from '@anthropic-ai/sdk/error'
+ 
+ const MAX_RETRIES = 3
+ const INITIAL_RETRY_DELAY = 1000 // 1 second
+@@ -73,49 +56,20 @@ async function* promptClaudeStreamWithoutRetry(
+     ignoreDatabaseAndHelicone?: boolean
+   }
+ ): AsyncGenerator<string, void, unknown> {
+-  const {
+-    model = claudeModels.sonnet,
+-    system,
+-    tools,
+-    clientSessionId,
+-    fingerprintId,
+-    userInputId,
+-    userId,
+-    maxTokens,
+-    ignoreDatabaseAndHelicone = false,
+-  } = options
+-
+-  const apiKey = env.ANTHROPIC_API_KEY2
+-
+-  if (!apiKey) {
+-    throw new Error('Missing ANTHROPIC_API_KEY')
+-  }
+-
+   const anthropic = new Anthropic({
+-    apiKey,
+-    ...(ignoreDatabaseAndHelicone
+-      ? {}
+-      : {
+-          baseURL: 'https://anthropic.helicone.ai/',
+-        }),
+-    defaultHeaders: {
+-      'anthropic-beta': 'prompt-caching-2024-07-31',
+-      ...(ignoreDatabaseAndHelicone
+-        ? {}
+-        : {
+-            'Helicone-Auth': `Bearer ${env.HELICONE_API_KEY}`,
+-            'Helicone-User-Id': fingerprintId,
+-            // 'Helicone-RateLimit-Policy': RATE_LIMIT_POLICY,
+-            'Helicone-LLM-Security-Enabled': 'true',
+-          }),
+-    },
++    apiKey: env.ANTHROPIC_API_KEY,
+   })
+ 
++  const model = options.model ?? claudeModels.sonnet
++  const maxTokens = options.maxTokens ?? 8192
++  const { system, tools } = options
++
+   const startTime = Date.now()
+ 
+   // Transform messages before sending to Anthropic
+-  const transformedMessages = messages.map((msg) =>
+-    transformedMessage(msg, options.model ?? claudeModels.sonnet)
++  const transformedMsgs = transformMessages(
++    messages,
++    options.model ?? claudeModels.sonnet
+   )
+ 
+   const stream = anthropic.messages.stream(
+@@ -123,103 +77,55 @@ async function* promptClaudeStreamWithoutRetry(
+       model,
+       max_tokens: maxTokens ?? 8192,
+       temperature: 0,
+-      messages: transformedMessages,
++      messages: transformedMsgs,
+       system,
+       tools,
+       stop_sequences: [],
+     })
+   )
+ 
+-  let toolInfo = {
+-    name: '',
+-    id: '',
+-    json: '',
+-  }
+-  let messageId: string | undefined
+-  let inputTokens = 0
+-  let outputTokens = 0
+-  let cacheCreationInputTokens = 0
+-  let cacheReadInputTokens = 0
+-  let fullResponse = ''
+-  for await (const chunk of stream) {
+-    const { type } = chunk
++  let content = ''
++  let usage: { input_tokens: number; output_tokens: number } | null = null
+ 
+-    // Start of turn
+-    if (type === 'message_start') {
+-      messageId = chunk.message.id
+-      inputTokens = chunk.message.usage.input_tokens
+-      outputTokens = chunk.message.usage.output_tokens
+-      // @ts-ignore
+-      cacheReadInputTokens = chunk.message.usage.cache_read_input_tokens ?? 0
+-      cacheCreationInputTokens =
+-        // @ts-ignore
+-        chunk.message.usage.cache_creation_input_tokens ?? 0
+-    }
+-
+-    // Text (most common case)
+-    if (type === 'content_block_delta' && chunk.delta.type === 'text_delta') {
+-      fullResponse += chunk.delta.text
+-      yield chunk.delta.text
+-    }
+-
+-    // Tool use!
+-    if (
+-      type === 'content_block_start' &&
+-      chunk.content_block.type === 'tool_use'
+-    ) {
+-      const { name, id } = chunk.content_block
+-      toolInfo = {
+-        name,
+-        id,
+-        json: '',
++  try {
++    for await (const chunk of stream) {
++      if (chunk.type === 'content_block_delta') {
++        // make sure we only read chunks that include text
++        if ('text' in chunk.delta) {
++          content += chunk.delta.text
++          yield chunk.delta.text
++        }
++      } else if (chunk.type === 'message_delta' && 'usage' in chunk.delta) {
++        usage = chunk.delta.usage as { input_tokens: number; output_tokens: number }
+       }
+     }
+-    if (
+-      type === 'content_block_delta' &&
+-      chunk.delta.type === 'input_json_delta'
+-    ) {
+-      toolInfo.json += chunk.delta.partial_json
+-    }
+-    if (type === 'message_delta' && chunk.delta.stop_reason === 'tool_use') {
+-      const { name, id, json } = toolInfo
+-      const input = JSON.parse(json)
+-      logger.error({ name, id, input }, 'Tried to yield tool call')
+-    }
+-
+-    // End of turn
+-    if (
+-      type === 'message_delta' &&
+-      'usage' in chunk &&
+-      !ignoreDatabaseAndHelicone
+-    ) {
+-      if (!messageId) {
+-        logger.error('No messageId found')
+-        break
+-      }
+-
+-      outputTokens += chunk.usage.output_tokens
+-
++  } finally {
++    if (content && !options.ignoreDatabaseAndHelicone) {
++      const latencyMs = Date.now() - startTime
++      const inputTokens = usage?.input_tokens ?? 0
++      const outputTokens = usage?.output_tokens ?? 0
++      
+       saveMessage({
+-        messageId,
+-        userId,
+-        clientSessionId,
+-        fingerprintId,
+-        userInputId,
+-        request: messages,
++        messageId: options.userInputId,
++        userId: options.userId,
++        fingerprintId: options.fingerprintId,
++        clientSessionId: options.clientSessionId,
++        userInputId: options.userInputId,
+         model,
+-        response: fullResponse,
++        request: messages,
++        response: content,
+         inputTokens,
+         outputTokens,
+-        cacheCreationInputTokens,
+-        cacheReadInputTokens,
+         finishedAt: new Date(),
+-        latencyMs: Date.now() - startTime,
++        latencyMs,
++      }).catch((error) => {
++        logger.error({ error }, 'Failed to save message')
+       })
+     }
+   }
+ }
+ 
+-export const promptClaudeStream = (
++export async function* promptClaudeStream(
+   messages: Message[],
+   options: {
+     system?: System
+@@ -232,127 +138,81 @@ export const promptClaudeStream = (
+     userId?: string
+     ignoreDatabaseAndHelicone?: boolean
+   }
+-): ReadableStream<string> => {
+-  // Use a readable stream to prevent base stream from being closed prematurely.
+-  return new ReadableStream({
+-    async start(controller) {
+-      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+-        try {
+-          const baseStream = promptClaudeStreamWithoutRetry(messages, options)
+-
+-          // Stream all chunks from the generator to the controller
+-          for await (const chunk of baseStream) {
+-            controller.enqueue(chunk)
+-          }
+-          controller.close()
+-          return
+-        } catch (error) {
+-          // Only retry on connection errors (e.g. internal server error, overloaded, etc.)
+-          if (error instanceof APIConnectionError) {
+-            logger.error(
+-              { error, attempt },
+-              'Claude API connection error, retrying...'
+-            )
+-            if (attempt < MAX_RETRIES - 1) {
+-              // Exponential backoff
+-              const delayMs = INITIAL_RETRY_DELAY * Math.pow(2, attempt)
+-              await sleep(delayMs)
+-              continue
+-            }
+-          }
+-
+-          // For other types of errors, throw immediately
+-          const parsedError = error as APIError
+-          controller.error(
+-            new Error(
+-              `Anthropic API error: ${parsedError.message}. Please try again later or reach out to ${env.NEXT_PUBLIC_SUPPORT_EMAIL} for help.`
+-            )
++): AsyncGenerator<string, void, unknown> {
++  let retryCount = 0
++  let retryDelay = INITIAL_RETRY_DELAY
++
++  while (true) {
++    try {
++      yield* promptClaudeStreamWithoutRetry(messages, options)
++      return
++    } catch (error) {
++      if (error instanceof APIConnectionError) {
++        if (retryCount < MAX_RETRIES) {
++          logger.warn(
++            { error, retryCount, retryDelay },
++            'Connection error in Claude API call, retrying...'
+           )
+-          return
++          await sleep(retryDelay)
++          retryCount++
++          retryDelay *= 2
++          continue
+         }
+       }
+-
+-      controller.error(
+-        new Error(
+-          `Sorry, system's a bit overwhelmed. Please try again later or reach out to ${env.NEXT_PUBLIC_SUPPORT_EMAIL} for help.`
+-        )
+-      )
+-    },
+-  })
++      throw error
++    }
++  }
+ }
+ 
+-export const promptClaude = async (
++export async function promptClaude(
+   messages: Message[],
+   options: {
+-    clientSessionId: string
+-    fingerprintId: string
+-    userInputId: string
+-    userId?: string
+     system?: string | Array<TextBlockParam>
+     tools?: Tool[]
+     model?: AnthropicModel
+     maxTokens?: number
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
++    userId?: string
+     ignoreDatabaseAndHelicone?: boolean
+   }
+-) => {
+-  let fullResponse = ''
++): Promise<string> {
++  let result = ''
+   for await (const chunk of promptClaudeStream(messages, options)) {
+-    fullResponse += chunk
++    result += chunk
+   }
+-  return fullResponse
++  return result
+ }
+ 
+ export async function promptClaudeWithContinuation(
+   messages: Message[],
+   options: {
++    system?: string | Array<TextBlockParam>
++    tools?: Tool[]
++    model?: AnthropicModel
++    maxTokens?: number
+     clientSessionId: string
+     fingerprintId: string
+     userInputId: string
+     userId?: string
+-    system?: string
+-    model?: AnthropicModel
+-    ignoreHelicone?: boolean
+-  }
+-) {
+-  let fullResponse = ''
+-  let continuedMessage: Message | null = null
+-  let isComplete = false
+-
+-  // Add the instruction to end with the stop market to the system prompt
+-  if (options.system) {
+-    options.system += `\n\nAlways end your response with "${STOP_MARKER}".`
+-  } else {
+-    options.system = `Always end your response with "${STOP_MARKER}".`
++    ignoreDatabaseAndHelicone?: boolean
+   }
+-
+-  while (!isComplete) {
+-    const messagesWithContinuedMessage = continuedMessage
+-      ? [...messages, continuedMessage]
+-      : messages
+-    logger.debug(
+-      { messagesLength: messagesWithContinuedMessage.length },
+-      'Prompt claude with continuation'
+-    )
+-    const stream = promptClaudeStream(messagesWithContinuedMessage, options)
+-
+-    for await (const chunk of stream) {
+-      fullResponse += chunk
+-    }
+-
+-    if (continuedMessage) {
+-      logger.debug({ fullResponse }, 'Got continuation response')
+-    }
+-
+-    if (fullResponse.includes(STOP_MARKER)) {
+-      isComplete = true
+-      fullResponse = fullResponse.replace(STOP_MARKER, '')
+-    } else {
+-      continuedMessage = {
+-        role: 'assistant',
+-        content: fullResponse,
+-      }
++): Promise<string> {
++  let result = ''
++  for await (const chunk of promptClaudeStream(messages, options)) {
++    result += chunk
++    if (result.includes(STOP_MARKER)) {
++      break
+     }
+   }
++  return result
++}
+ 
+-  return { response: fullResponse }
++export function start() {
++  return {
++    promptClaude,
++    promptClaudeWithContinuation,
++    promptClaudeStream,
++  }
+ }
+diff --git a/backend/src/deepseek-api.ts b/backend/src/deepseek-api.ts
+index 1b118fdcc..2a0031caa 100644
+--- a/backend/src/deepseek-api.ts
++++ b/backend/src/deepseek-api.ts
+@@ -9,25 +9,27 @@ import { models } from 'common/constants'
+ import { DeepseekModel } from 'common/constants'
+ import { removeUndefinedProps } from 'common/util/object'
+ 
+-function transformedMessage(message: any, model: DeepseekModel): OpenAIMessage {
+-  // When Deepseek properly adds image support to their models, we can update this to handle images
+-  if (typeof message.content === 'object' && Array.isArray(message.content)) {
+-    const hasImages = message.content.some(
+-      (obj: { type: string }) => obj.type === 'image'
+-    )
+-    if (hasImages) {
+-      logger.info(
+-        'Stripping images from message - Deepseek does not support images yet'
++function transformMessages(messages: OpenAIMessage[], model: DeepseekModel): OpenAIMessage[] {
++  return messages.map(msg => {
++    // When Deepseek properly adds image support to their models, we can update this to handle images
++    if (typeof msg.content === 'object' && Array.isArray(msg.content)) {
++      const hasImages = msg.content.some(
++        (obj: { type: string }) => obj.type === 'image'
+       )
+-      return {
+-        ...message,
+-        content: message.content.filter(
+-          (obj: { type: string }) => obj.type !== 'image'
+-        ),
++      if (hasImages) {
++        logger.info(
++          'Stripping images from message - Deepseek does not support images yet'
++        )
++        return {
++          ...msg,
++          content: msg.content.filter(
++            (obj: { type: string }) => obj.type !== 'image'
++          ).map(obj => ({ type: 'text', text: String(obj) })),
++        } as OpenAIMessage
+       }
+     }
+-  }
+-  return message
++    return msg
++  }) as OpenAIMessage[]
+ }
+ 
+ export type DeepseekMessage = OpenAI.Chat.ChatCompletionMessageParam
+@@ -78,19 +80,14 @@ async function* innerPromptDeepseekStream(
+     clientSessionId,
+     fingerprintId,
+     userInputId,
+-    model,
+-    userId,
+-    maxTokens,
+     temperature,
+   } = options
+   const deepseek = getDeepseekClient(fingerprintId)
+   const startTime = Date.now()
+-  let modifiedMessages = messages.map((msg) =>
+-    transformedMessage(msg, options.model)
+-  )
++  let modifiedMessages = transformMessages(messages, options.model) as OpenAIMessage[]
+ 
+   const lastMessage = modifiedMessages[modifiedMessages.length - 1]
+-  if (model === models.deepseekReasoner && lastMessage.role === 'assistant') {
++  if (options.model === models.deepseekReasoner && lastMessage.role === 'assistant') {
+     modifiedMessages = [
+       ...modifiedMessages.slice(0, -1),
+       { ...lastMessage, role: 'assistant', prefix: true } as any,
+@@ -102,12 +99,12 @@ async function* innerPromptDeepseekStream(
+       async () => {
+         const streamPromise = deepseek.chat.completions.create(
+           removeUndefinedProps({
+-            model,
++            model: options.model,
+             messages: modifiedMessages,
+-            max_tokens: maxTokens,
++            max_tokens: options.maxTokens,
+             stream: true,
+             temperature:
+-              model === models.deepseekReasoner ? undefined : temperature ?? 0,
++              options.model === models.deepseekReasoner ? undefined : temperature ?? 0,
+           })
+         )
+ 
+@@ -161,11 +158,11 @@ async function* innerPromptDeepseekStream(
+     if (messageId && messages.length > 0) {
+       saveMessage({
+         messageId: `deepseek-${messageId}`,
+-        userId,
++        userId: options.userId,
+         clientSessionId,
+         fingerprintId,
+         userInputId,
+-        model,
++        model: options.model,
+         request: messages,
+         response: content,
+         inputTokens,
+diff --git a/backend/src/gemini-api.ts b/backend/src/gemini-api.ts
+index fcb9a76bc..77de564aa 100644
+--- a/backend/src/gemini-api.ts
++++ b/backend/src/gemini-api.ts
+@@ -10,33 +10,31 @@ import { match, P } from 'ts-pattern'
+ /**
+  * Transform messages between our internal format and Gemini's format.
+  * All Gemini models support images in their specific format.
+- *
+- * @param message The message to transform
+- * @param model The Gemini model being used
+- * @returns The transformed message in Gemini's expected format
+  */
+-function transformedMessage(message: any, model: GeminiModel): OpenAIMessage {
+-  return match(message)
+-    .with(
+-      {
+-        content: {
+-          type: 'image',
+-          source: {
+-            type: 'base64',
+-            media_type: 'image/jpeg',
+-            data: P.string,
++function transformMessages(messages: OpenAIMessage[], model: GeminiModel): OpenAIMessage[] {
++  return messages.map(msg => 
++    match(msg as any)
++      .with(
++        {
++          content: {
++            type: 'image',
++            source: {
++              type: 'base64',
++              media_type: 'image/jpeg',
++              data: P.string,
++            },
+           },
+         },
+-      },
+-      (m) => ({
+-        ...message,
+-        content: {
+-          inlineData: m.content.source.data,
+-          mimeType: 'image/jpeg',
+-        },
+-      })
+-    )
+-    .otherwise(() => message)
++        (m) => ({
++          ...msg,
++          content: {
++            inlineData: m.content.source.data,
++            mimeType: 'image/jpeg',
++          },
++        })
++      )
++      .otherwise(() => msg)
++  ) as OpenAIMessage[]
+ }
+ 
+ export type GeminiMessage = OpenAI.Chat.ChatCompletionMessageParam
+@@ -51,8 +49,6 @@ const getGeminiClient = (fingerprintId: string) => {
+       defaultHeaders: {
+         'Helicone-Auth': `Bearer ${env.HELICONE_API_KEY}`,
+         'Helicone-User-Id': fingerprintId,
+-        // 'Helicone-RateLimit-Policy': RATE_LIMIT_POLICY,
+-        // 'Helicone-LLM-Security-Enabled': 'true',
+       },
+     })
+   }
+@@ -72,31 +68,18 @@ export function promptGeminiStream(
+     temperature?: number
+   }
+ ): ReadableStream<string> {
+-  const {
+-    clientSessionId,
+-    fingerprintId,
+-    userInputId,
+-    model,
+-    userId,
+-    maxTokens,
+-    temperature,
+-  } = options
+-
+   return new ReadableStream({
+     async start(controller) {
+-      const gemini = getGeminiClient(fingerprintId)
++      const gemini = getGeminiClient(options.fingerprintId)
+       const startTime = Date.now()
+       try {
+-        // Transform messages to Gemini's format
+-        const transformedMessages = messages.map((msg) =>
+-          transformedMessage(msg, options.model)
+-        )
++        const transformedMessages = transformMessages(messages, options.model)
+ 
+         const stream = await gemini.chat.completions.create({
+-          model,
++          model: options.model,
+           messages: transformedMessages,
+-          temperature: temperature ?? 0,
+-          max_tokens: maxTokens,
++          temperature: options.temperature ?? 0,
++          max_tokens: options.maxTokens,
+           stream: true,
+         })
+ 
+@@ -106,7 +89,6 @@ export function promptGeminiStream(
+         let outputTokens = 0
+ 
+         for await (const chunk of stream) {
+-          console.log('chunk', chunk)
+           if (chunk.choices[0]?.delta?.content) {
+             const delta = chunk.choices[0].delta.content
+             content += delta
+@@ -120,14 +102,14 @@ export function promptGeminiStream(
+           }
+         }
+ 
+-        if (messageId && messages.length > 0 && userId !== TEST_USER_ID) {
++        if (messageId && messages.length > 0 && options.userId !== TEST_USER_ID) {
+           saveMessage({
+             messageId: `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+-            userId,
+-            clientSessionId,
+-            fingerprintId,
+-            userInputId,
+-            model,
++            userId: options.userId,
++            clientSessionId: options.clientSessionId,
++            fingerprintId: options.fingerprintId,
++            userInputId: options.userInputId,
++            model: options.model,
+             request: messages,
+             response: content,
+             inputTokens: inputTokens || 0,
+@@ -149,7 +131,6 @@ export function promptGeminiStream(
+           },
+           'Error calling Gemini API'
+         )
+-
+         controller.error(error)
+       }
+     },
+@@ -167,50 +148,13 @@ export async function promptGemini(
+     maxTokens?: number
+     temperature?: number
+   }
+-) {
+-  const {
+-    clientSessionId,
+-    fingerprintId,
+-    userInputId,
+-    model,
+-    userId,
+-    maxTokens,
+-    temperature,
+-  } = options
+-  const gemini = getGeminiClient(fingerprintId)
+-  const startTime = Date.now()
++): Promise<string> {
++  const stream = promptGeminiStream(messages, options)
+   try {
+-    // Transform messages to Gemini's format
+-    const transformedMessages = messages.map((msg) =>
+-      transformedMessage(msg, options.model)
+-    )
+-
+-    const response = await gemini.chat.completions.create({
+-      model,
+-      messages: transformedMessages,
+-      temperature: temperature ?? 0,
+-      max_tokens: maxTokens,
+-    })
+-
+-    const content = response.choices[0].message.content ?? ''
+-    const { usage } = response
+-    if (usage) {
+-      saveMessage({
+-        messageId: `msg-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+-        userId,
+-        clientSessionId,
+-        fingerprintId,
+-        userInputId,
+-        model,
+-        request: messages,
+-        response: content,
+-        inputTokens: usage.prompt_tokens,
+-        outputTokens: usage.completion_tokens,
+-        finishedAt: new Date(),
+-        latencyMs: Date.now() - startTime,
+-      })
++    let content = ''
++    for await (const chunk of stream) {
++      content += chunk
+     }
+-
+     return content
+   } catch (error) {
+     logger.error(
+@@ -219,11 +163,9 @@ export async function promptGemini(
+           error && typeof error === 'object' && 'message' in error
+             ? error.message
+             : 'Unknown error',
+-        messages,
+       },
+       'Error calling Gemini API'
+     )
+-
+     throw error
+   }
+ }
+diff --git a/backend/src/gemini-vertex-api.ts b/backend/src/gemini-vertex-api.ts
+index 049fc2ae2..7982db152 100644
+--- a/backend/src/gemini-vertex-api.ts
++++ b/backend/src/gemini-vertex-api.ts
+@@ -26,41 +26,38 @@ export type GeminiMessage = OpenAIMessage
+  * Transform messages between our internal format and Vertex AI's format.
+  * Converts OpenAI message format to Vertex AI Content/Part structure.
+  */
+-function transformedMessage(message: OpenAIMessage): Content {
+-  const role = message.role === 'assistant' ? 'model' : message.role
+-
+-  // For system messages, we need to handle them specially
+-  if (role === 'system') {
++function transformMessages(messages: OpenAIMessage[]): Content[] {
++  return messages.map(message => {
++    const role = message.role === 'assistant' ? 'model' : message.role
++    if (role === 'system') {
++      return {
++        role,
++        parts: [{ text: String(message.content) }] as Part[]
++      }
++    }
++    if (typeof message.content === 'object' && message.content !== null) {
++      if (Array.isArray(message.content)) {
++        const parts: Part[] = message.content.map(part => {
++          if (typeof part === 'object' && part !== null && 'type' in part && part.type === 'image_url') {
++            // handle image URL: extract base64 data if needed
++            const base64Data = (part as any).image_url.url.split(',')[1] || ''
++            return {
++              inlineData: {
++                data: base64Data,
++                mimeType: 'image/jpeg'
++              }
++            } as Part
++          }
++          return { text: String(part) } as Part
++        })
++        return { role, parts }
++      }
++    }
+     return {
+       role,
+       parts: [{ text: String(message.content) }] as Part[]
+     }
+-  }
+-
+-  if (typeof message.content === 'object' && message.content !== null) {
+-    if (Array.isArray(message.content)) {
+-      // Handle array content
+-      const parts: Part[] = message.content.map(part => {
+-        if (typeof part === 'object' && part !== null && 'type' in part && part.type === 'image_url') {
+-          const base64Data = part.image_url.url.split(',')[1] || ''
+-          return {
+-            inlineData: {
+-              data: base64Data,
+-              mimeType: 'image/jpeg'
+-            }
+-          } as Part
+-        }
+-        return { text: String(part) } as Part
+-      })
+-      return { role, parts }
+-    }
+-  }
+-
+-  // Default to text content
+-  return {
+-    role,
+-    parts: [{ text: String(message.content) }] as Part[]
+-  }
++  })
+ }
+ 
+ export async function promptGemini(
+@@ -88,13 +85,11 @@ export async function promptGemini(
+ 
+   try {
+     const vertex = getVertexAI()
+-
+-    // Find system message if it exists
+     const systemMessage = messages.find(m => m.role === 'system')
+     const nonSystemMessages = messages.filter(m => m.role !== 'system')
+ 
+     // Transform messages to Vertex AI's format
+-    const transformedMessages = nonSystemMessages.map(transformedMessage)
++    const transformedMessages = transformMessages(nonSystemMessages)
+ 
+     const generativeModel = vertex.getGenerativeModel({
+       model,
+@@ -107,7 +102,6 @@ export async function promptGemini(
+       history: transformedMessages.slice(0, -1),
+     })
+ 
+-    // If there's a system message, send it first
+     if (systemMessage) {
+       await chat.sendMessage([{ text: String(systemMessage.content) }] as Part[])
+     }
+@@ -117,7 +111,6 @@ export async function promptGemini(
+ 
+     const content = response.response.candidates?.[0]?.content?.parts?.[0]?.text ?? ''
+ 
+-    // Estimate token counts since Vertex AI doesn't provide them directly
+     const inputTokens = countTokensJson(transformedMessages)
+     const outputTokens = countTokens(content)
+ 
+diff --git a/backend/src/openai-api.ts b/backend/src/openai-api.ts
+index 4925c8bd7..936688c89 100644
+--- a/backend/src/openai-api.ts
++++ b/backend/src/openai-api.ts
+@@ -30,65 +30,78 @@ const getOpenAI = (fingerprintId: string) => {
+   return openai
+ }
+ 
+-function transformedMessage(message: any, model: OpenAIModel): OpenAIMessage {
+-  return match(model)
+-    .with(
+-      openaiModels.gpt4o,
+-      openaiModels.gpt4omini,
+-      openaiModels.generatePatch,
+-      () =>
+-        match(message)
+-          .with(
+-            {
+-              content: {
+-                type: 'image',
+-                source: {
+-                  type: 'base64',
+-                  media_type: 'image/jpeg',
+-                  data: P.string,
+-                },
+-              },
+-            },
+-            (m) => ({
+-              // Convert to OpenAI's image_url format while preserving the base64 data
+-              ...message,
+-              content: {
+-                type: 'image_url',
+-                image_url: {
+-                  url: `data:image/jpeg;base64,${m.content.source.data}`,
++/**
++ * Transform messages between our internal format and OpenAI's format.
++ */
++function transformMessages(
++  messages: OpenAIMessage[],
++  model: OpenAIModel
++): OpenAIMessage[] {
++  return messages.map((msg) =>
++    match(model)
++      .with(
++        openaiModels.gpt4o,
++        openaiModels.gpt4omini,
++        openaiModels.generatePatch,
++        () =>
++          match(msg as any)
++            .with(
++              {
++                content: {
++                  type: 'image',
++                  source: {
++                    type: 'base64',
++                    media_type: 'image/jpeg',
++                    data: P.string,
++                  },
+                 },
+               },
+-            })
+-          )
+-          .otherwise(() => message)
+-    )
+-    .with(openaiModels.o3mini, () => {
+-      const hasImages = [message.content ?? []].some(
+-        (obj: { type: string }) => obj.type === 'image'
++              (m) => ({
++                ...msg,
++                content: {
++                  type: 'image_url',
++                  image_url: {
++                    url: `data:image/jpeg;base64,${m.content.source.data}`,
++                  },
++                } as any,
++              })
++            )
++            .otherwise(() => msg)
+       )
+-      if (hasImages) {
+-        logger.info(
+-          'Stripping images from message - o3mini does not support images'
+-        )
+-        return {
+-          ...message,
+-          content: message.content.filter(
+-            (obj: { type: string }) => obj.type !== 'image'
+-          ),
++      .with(openaiModels.o3mini, () => {
++        if (
++          Array.isArray(msg.content) &&
++          msg.content.some((obj: any) => obj.type === 'image')
++        ) {
++          logger.info(
++            'Stripping images from message - o3mini does not support images'
++          )
++          return {
++            ...msg,
++            content: Array.isArray(msg.content)
++              ? msg.content.filter((obj: any) => obj.type !== 'image')
++              : msg.content,
++          }
+         }
+-      }
+-      return message
+-    })
+-    .exhaustive()
++        return msg
++      })
++      .exhaustive()
++  ) as OpenAIMessage[]
+ }
+ 
+ export async function* promptOpenAIStream(
+   messages: OpenAIMessage[],
+-  options: OpenAIOptions
++  options: {
++    clientSessionId: string
++    fingerprintId: string
++    userInputId: string
++    model: OpenAIModel
++    userId: string | undefined
++    predictedContent?: string
++    temperature?: number
++  }
+ ): AsyncGenerator<string, void, unknown> {
+-  const transformedMessages = messages.map((msg) =>
+-    transformedMessage(msg, options.model)
+-  )
++  const transformedMessages = transformMessages(messages, options.model)
+   const {
+     clientSessionId,
+     fingerprintId,
+diff --git a/backend/src/system-prompt.ts b/backend/src/system-prompt.ts
+index a0ea27fe4..7d1868f6a 100644
+--- a/backend/src/system-prompt.ts
++++ b/backend/src/system-prompt.ts
+@@ -416,7 +416,7 @@ IMPORTANT: Assume the user's development server is ALREADY running and active, u
+ Never offer to interact with the website aside from reading them (see available actions below). The user will manipulate the website themselves and bring you to the UI they want you to interact with.
+ 
+ ### Critical Limitations
+-- NO clicking on any elements
++- IMPORTANT: NO clicking on any elements, don't even try.
+ - NO form submissions
+ - NO button interactions
+ - NO drag and drop
+diff --git a/backend/src/util/__tests__/screenshot-formatter.test.ts b/backend/src/util/__tests__/screenshot-formatter.test.ts
+deleted file mode 100644
+index a29ea39a6..000000000
+--- a/backend/src/util/__tests__/screenshot-formatter.test.ts
++++ /dev/null
+@@ -1,30 +0,0 @@
+-import { createImageBlock } from '../screenshot-formatter'
+-import { describe, expect, it } from 'bun:test'
+-import { models } from 'common/constants'
+-
+-describe('createImageBlock', () => {
+-  const base64Data = 'base64encodeddata'
+-
+-  it('should return image block for vision models', () => {
+-    const result = createImageBlock(base64Data, models.gpt4o)
+-    expect(result).toEqual({
+-      type: 'image',
+-      source: {
+-        type: 'base64',
+-        media_type: 'image/jpeg',
+-        data: base64Data,
+-      },
+-      cache_control: {
+-        type: 'ephemeral',
+-      },
+-    })
+-  })
+-
+-  it('should return text block for non-vision models', () => {
+-    const result = createImageBlock(base64Data, models.o3mini)
+-    expect(result).toEqual({
+-      type: 'text',
+-      text: base64Data,
+-    })
+-  })
+-})
+diff --git a/backend/src/util/screenshot-formatter.ts b/backend/src/util/screenshot-formatter.ts
+deleted file mode 100644
+index a20acded1..000000000
+--- a/backend/src/util/screenshot-formatter.ts
++++ /dev/null
+@@ -1,44 +0,0 @@
+-import { MessageContentObject } from 'common/actions'
+-import { Model, models } from 'common/constants'
+-import { match, P } from 'ts-pattern'
+-
+-export function createImageBlock(
+-  base64Data: string,
+-  model: Model
+-): MessageContentObject {
+-  // Base image block structure
+-  const imageBlock: MessageContentObject = {
+-    type: 'image' as const,
+-    source: {
+-      type: 'base64' as const,
+-      media_type: 'image/jpeg' as const,
+-      data: base64Data,
+-    },
+-  }
+-
+-  const textBlock: MessageContentObject = {
+-    type: 'text' as const,
+-    text: base64Data,
+-  }
+-
+-  return match(model)
+-    .with(models.sonnet, () => imageBlock)
+-    .with(
+-      models.gpt4o,
+-      models.gpt4omini,
+-      models.generatePatch,
+-      () =>
+-      base64Data.length > 200000
+-        ? { ...imageBlock, cache_control: { type: 'ephemeral' as const } }
+-        : imageBlock
+-    )
+-    .with(
+-      models.o3mini,
+-      models.deepseekReasoner,
+-      models.deepseekChat,
+-      models.gemini2flash,
+-      models.haiku,
+-      () => textBlock
+-    )
+-    .exhaustive()
+-}
+diff --git a/common/src/browser-actions.ts b/common/src/browser-actions.ts
+index 7bb02d8b3..1c9ec2e34 100644
+--- a/common/src/browser-actions.ts
++++ b/common/src/browser-actions.ts
+@@ -159,12 +159,16 @@ export type ImageContent = z.infer<typeof ImageContentSchema>
+ export const BrowserResponseSchema = z.object({
+   success: z.boolean(),
+   error: z.string().optional(),
+-  screenshot: ImageContentSchema.optional(),
+   logs: z.array(LogSchema),
+-  metrics: MetricsSchema.optional(),
+-  networkEvents: z.array(NetworkEventSchema).optional(),
+   logFilter: LogFilterSchema.optional(),
+-  chunks: z.array(BrowserResponseChunkSchema).optional(),
++  networkEvents: z.array(NetworkEventSchema).optional(),
++  metrics: MetricsSchema.optional(),
++  screenshots: z
++    .object({
++      pre: ImageContentSchema.optional(),
++      post: ImageContentSchema,
++    })
++    .optional(),
+ })
+ 
+ // Update action schemas to include retry options
+diff --git a/common/src/types/bun-test.d.ts b/common/src/types/bun-test.d.ts
+new file mode 100644
+index 000000000..5bca0b85b
+--- /dev/null
++++ b/common/src/types/bun-test.d.ts
+@@ -0,0 +1,5 @@
++declare module 'bun:test' {
++  export const describe: (name: string, fn: () => void) => void
++  export const it: (name: string, fn: () => void | Promise<void>) => void
++  export const expect: any
++}
+diff --git a/common/src/util/__tests__/messages.test.ts b/common/src/util/__tests__/messages.test.ts
+new file mode 100644
+index 000000000..2a943757a
+--- /dev/null
++++ b/common/src/util/__tests__/messages.test.ts
+@@ -0,0 +1,76 @@
++import { describe, expect, it } from 'bun:test'
++import { limitScreenshots } from '../messages'
++import { Message } from '../../actions'
++
++describe('limitScreenshots', () => {
++  const createImageContent = (id: number) => ({
++    type: 'image' as const,
++    source: {
++      type: 'base64' as const,
++      media_type: 'image/jpeg' as const,
++      data: `base64data${id}`,
++    },
++  })
++
++  const createTextContent = (text: string) => ({
++    type: 'text' as const,
++    text,
++  })
++
++  it('should return messages unchanged when no screenshots present', () => {
++    const messages: Message[] = [
++      { role: 'user', content: 'hello' },
++      { role: 'assistant', content: [createTextContent('world')] },
++    ]
++    expect(limitScreenshots(messages, 2)).toEqual(messages)
++  })
++
++  it('should return messages unchanged when screenshots under limit', () => {
++    const messages: Message[] = [
++      { role: 'user', content: [createImageContent(1)] },
++      { role: 'assistant', content: [createImageContent(2)] },
++    ]
++    expect(limitScreenshots(messages, 2)).toEqual(messages)
++  })
++
++  it('should keep only most recent screenshots when over limit', () => {
++    const messages: Message[] = [
++      {
++        role: 'user',
++        content: [createImageContent(1), createTextContent('hello')],
++      },
++      {
++        role: 'assistant',
++        content: [createImageContent(2), createImageContent(3)],
++      },
++    ]
++    const result = limitScreenshots(messages, 2)
++    const images = result.flatMap(msg =>
++      Array.isArray(msg.content)
++        ? msg.content.filter(item => item.type === 'image')
++        : []
++    )
++    expect(images).toHaveLength(2)
++    expect(images[0]).toEqual(createImageContent(2))
++    expect(images[1]).toEqual(createImageContent(3))
++  })
++
++  it('should preserve non-image content when filtering', () => {
++    const messages: Message[] = [
++      {
++        role: 'user',
++        content: [createImageContent(1), createTextContent('hello')],
++      },
++      {
++        role: 'assistant',
++        content: [createImageContent(2), createTextContent('world')],
++      },
++    ]
++    const result = limitScreenshots(messages, 1)
++    expect(result[0].content).toEqual([createTextContent('hello')])
++    expect(result[1].content).toEqual([
++      createImageContent(2),
++      createTextContent('world'),
++    ])
++  })
++})
+diff --git a/common/src/util/messages.ts b/common/src/util/messages.ts
+new file mode 100644
+index 000000000..486071cb9
+--- /dev/null
++++ b/common/src/util/messages.ts
+@@ -0,0 +1,37 @@
++import { Message } from '../actions'
++
++interface ScreenshotRef {
++  msgIdx: number
++  contentIdx: number
++}
++
++/**
++ * Limits the total number of screenshots across all messages to maxCount,
++ * keeping only the most recent ones.
++ */
++export function limitScreenshots(messages: Message[], maxCount: number): Message[] {
++  const screenshots = messages.flatMap((msg, msgIdx) =>
++    Array.isArray(msg.content)
++      ? msg.content.map((item, contentIdx) =>
++          item.type === 'image' ? { msgIdx, contentIdx } : null
++        ).filter((ref): ref is ScreenshotRef => ref !== null)
++      : []
++  )
++
++  if (screenshots.length <= maxCount) return messages
++
++  const keepRefs = new Set(
++    screenshots.slice(-maxCount).map(ref => `${ref.msgIdx}-${ref.contentIdx}`)
++  )
++
++  return messages.map((msg, msgIdx) =>
++    Array.isArray(msg.content)
++      ? {
++          ...msg,
++          content: msg.content.filter((item, contentIdx) =>
++            item.type !== 'image' || keepRefs.has(`${msgIdx}-${contentIdx}`)
++          )
++        }
++      : msg
++  )
++}
+diff --git a/common/tsconfig.json b/common/tsconfig.json
+index 4069e8142..46bec5c24 100644
+--- a/common/tsconfig.json
++++ b/common/tsconfig.json
+@@ -13,7 +13,7 @@
+     "isolatedModules": true,
+     "skipLibCheck": true,
+     "types": ["node"],
+-    "typeRoots": ["node_modules/@types", "../node_modules/@types"],
++    "typeRoots": ["./node_modules/@types", "../node_modules/@types", "./src/types"],
+     "baseUrl": ".",
+     "outDir": "./dist",
+     "rootDir": "./src"
+diff --git a/npm-app/src/browser-runner.ts b/npm-app/src/browser-runner.ts
+index e6aeb84a7..fd3db2bdb 100644
+--- a/npm-app/src/browser-runner.ts
++++ b/npm-app/src/browser-runner.ts
+@@ -136,6 +136,18 @@ export class BrowserRunner {
+ 
+   private async executeAction(action: BrowserAction): Promise<BrowserResponse> {
+     try {
++      // Only take pre-action screenshot if browser is already running
++      let preActionResult = null
++      if (this.browser && this.page) {
++        preActionResult = await this.takeScreenshot(
++          {
++            type: 'screenshot',
++          },
++          this.page
++        )
++      }
++
++      let response: BrowserResponse
+       switch (action.type) {
+         case 'start':
+           await this.getBrowser(action)
+@@ -143,7 +155,8 @@ export class BrowserRunner {
+             break
+           }
+         case 'navigate':
+-          return await this.navigate({ ...action, type: 'navigate' })
++          response = await this.navigate({ ...action, type: 'navigate' })
++          break
+         case 'click':
+           console.log('Clicking has not been implemented yet')
+           break
+@@ -154,7 +167,7 @@ export class BrowserRunner {
+           await this.scroll(action)
+           break
+         case 'screenshot':
+-          return await this.takeScreenshot(action)
++          break
+         case 'stop':
+           await this.shutdown()
+           return {
+@@ -168,11 +181,44 @@ export class BrowserRunner {
+           )
+       }
+ 
++      // Take post-action screenshot
++      let postActionResult = null
++      if (this.page) {
++        postActionResult = await this.takeScreenshot(
++          {
++            type: 'screenshot',
++          },
++          this.page
++        )
++      }
++
+       const metrics = await this.collectMetrics()
+-      const response: BrowserResponse = {
++      response = {
+         success: true,
+         logs: this.logs,
+         metrics,
++        ...(postActionResult && {
++          screenshots: {
++            ...(preActionResult && {
++              pre: {
++                type: 'image',
++                source: {
++                  type: 'base64',
++                  media_type: 'image/jpeg',
++                  data: preActionResult.data,
++                },
++              },
++            }),
++            post: {
++              type: 'image',
++              source: {
++                type: 'base64',
++                media_type: 'image/jpeg',
++                data: postActionResult.data,
++              },
++            },
++          },
++        }),
+       }
+ 
+       return response
+@@ -355,7 +401,6 @@ export class BrowserRunner {
+   ): Promise<BrowserResponse> {
+     try {
+       const { page } = await this.getBrowser(action)
+-
+       const url = ensureUrlProtocol(action.url)
+ 
+       await page.goto(url, {
+@@ -370,19 +415,10 @@ export class BrowserRunner {
+         source: 'tool',
+       })
+ 
+-      // Take a screenshot after navigation
+-      const { screenshot, logs } = await this.takeScreenshot({
+-        type: 'screenshot',
+-        screenshotCompressionQuality:
+-          BROWSER_DEFAULTS.screenshotCompressionQuality,
+-      })
+-      this.logs.push(...logs)
+-
+       return {
+         success: true,
+         logs: this.logs,
+         networkEvents: [],
+-        screenshot: screenshot,
+       }
+     } catch (error: any) {
+       const errorMessage = error?.message || 'Unknown navigation error'
+@@ -431,30 +467,23 @@ export class BrowserRunner {
+       source: 'tool',
+     })
+ 
+-    // Take a screenshot after navigation
+-    const { screenshot, logs } = await this.takeScreenshot({
+-      type: 'screenshot',
+-      screenshotCompressionQuality:
+-        BROWSER_DEFAULTS.screenshotCompressionQuality,
+-    })
+-    this.logs.push(...logs)
+-
+     return {
+       success: true,
+       logs: this.logs,
+       networkEvents: [],
+-      screenshot,
+     }
+   }
+ 
+   private async takeScreenshot(
+-    action: Extract<BrowserAction, { type: 'screenshot' }>
+-  ): Promise<NonOptional<BrowserResponse, 'screenshot'>> {
+-    const { page } = await this.getBrowser()
+-
++    action: Extract<BrowserAction, { type: 'screenshot' }>,
++    page: Page
++  ): Promise<{
++    data: string
++    logs: BrowserResponse['logs']
++  }> {
+     // Take a screenshot with aggressive compression settings
+     const screenshot = await page.screenshot({
+-      fullPage: BROWSER_DEFAULTS.fullPage, // action.fullPage ?? BROWSER_DEFAULTS.fullPage,
++      fullPage: BROWSER_DEFAULTS.fullPage,
+       type: 'jpeg',
+       quality:
+         action.screenshotCompressionQuality ??
+@@ -472,16 +501,6 @@ export class BrowserRunner {
+       source: 'tool',
+     })
+ 
+-    // Format screenshot in Anthropic's image content format
+-    const imageContent = {
+-      type: 'image',
+-      source: {
+-        type: 'base64',
+-        media_type: 'image/jpeg',
+-        data: screenshot,
+-      },
+-    } as const
+-
+     // If debug mode is enabled, save the screenshot
+     if (action.debug) {
+       console.debug({
+@@ -529,12 +548,9 @@ export class BrowserRunner {
+       }
+     }
+ 
+-    const metrics = await this.collectMetrics()
+     return {
+-      success: true,
++      data: screenshot,
+       logs: this.logs,
+-      screenshot: imageContent,
+-      metrics,
+     }
+   }
+ 
+diff --git a/npm-app/src/chat-storage.ts b/npm-app/src/chat-storage.ts
+index cd4b11b73..562189e90 100644
+--- a/npm-app/src/chat-storage.ts
++++ b/npm-app/src/chat-storage.ts
+@@ -76,7 +76,6 @@ export class ChatStorage {
+             (acc, contentObj) => [
+               ...acc,
+               ...match(contentObj)
+-                .with({ type: 'image' }, () => [])
+                 .with({ type: 'tool_result', content: P.string }, (obj) => [
+                   {
+                     ...obj,
+diff --git a/npm-app/src/client.ts b/npm-app/src/client.ts
+index 2c93379ee..7b0510128 100644
+--- a/npm-app/src/client.ts
++++ b/npm-app/src/client.ts
+@@ -295,12 +295,13 @@ export class Client {
+         const toolResultMessage: Message = {
+           role: 'user',
+           content: match(content)
+-            .with({ screenshot: P.not(P.nullish) }, (response) => [
++            .with({ screenshots: P.not(P.nullish) }, (response) => [
++              ...(response.screenshots.pre ? [response.screenshots.pre] : []),
+               {
+                 type: 'text' as const,
+-                text: JSON.stringify({ ...response, screenshot: undefined }),
++                text: JSON.stringify({ ...response, screenshots: undefined }),
+               },
+-              response.screenshot,
++              response.screenshots.post,
+             ])
+             .with(P.string, (str) => str)
+             .otherwise((val) => JSON.stringify(val)),
+diff --git a/package.json b/package.json
+index 7257c6f9e..fbbc09d26 100644
+--- a/package.json
++++ b/package.json
+@@ -31,9 +31,9 @@
+   },
+   "devDepen
+
+… [diff truncated: view full diff on GitHub] …

@@ -1,0 +1,960 @@
+diff --git a/backend/package.json b/backend/package.json
+index 610c98d99..4fe695e7a 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -18,7 +18,9 @@
+     "@google-cloud/vertexai": "^1.9.3",
+     "@google/generative-ai": "^0.24.0",
+     "@t3-oss/env-core": "0.11.1",
++    "@types/cors": "^2.8.17",
+     "ai": "^4.3.6",
++    "cors": "^2.8.5",
+     "diff": "5.2.0",
+     "dotenv": "16.4.5",
+     "express": "4.19.2",
+diff --git a/backend/src/admin/relabelRuns.ts b/backend/src/admin/relabelRuns.ts
+new file mode 100644
+index 000000000..20d8dd1d9
+--- /dev/null
++++ b/backend/src/admin/relabelRuns.ts
+@@ -0,0 +1,131 @@
++import { GetRelevantFilesPayload } from 'common/bigquery/schema'
++import { claudeModels, geminiModels } from 'common/constants'
++import {
++  getTracesWithoutRelabels,
++  insertRelabel,
++} from 'common/src/bigquery/client'
++import { Message } from 'common/types/message'
++import { generateCompactId } from 'common/util/string'
++import { Request, Response } from 'express'
++
++import { promptClaude, System } from '../llm-apis/claude'
++import { promptGeminiWithFallbacks } from '../llm-apis/gemini-with-fallbacks'
++import { logger } from '../util/logger'
++
++const models = [geminiModels.gemini2_5_pro_exp, claudeModels.sonnet] as const
++
++export async function relabelForUser(req: Request, res: Response) {
++  try {
++    // Extract userId from the URL query params
++    const userId = req.query.userId as string
++
++    if (!userId) {
++      return res
++        .status(400)
++        .json({ error: 'Missing required parameter: userId' })
++    }
++
++    // Parse request body to get the relabeling data
++    const limit = req.body.limit || 10 // Default to 10 traces per model if not specified
++
++    const allResults = []
++
++    // Process each model
++    for (const model of models) {
++      logger.info(`Processing traces for model ${model} and user ${userId}...`)
++
++      // Get traces without relabels for this model and user
++      const traces = await getTracesWithoutRelabels(model, limit, userId)
++
++      logger.info(
++        `Found ${traces.length} traces without relabels for model ${model}`
++      )
++
++      // Process traces for this model
++      const modelResults = await Promise.all(
++        traces.map(async (trace) => {
++          logger.info(`Processing trace ${trace.id}`)
++          const payload = (
++            typeof trace.payload === 'string'
++              ? JSON.parse(trace.payload)
++              : trace.payload
++          ) as GetRelevantFilesPayload
++
++          try {
++            let output: string
++            const messages = payload.messages
++            const system = payload.system
++
++            if (model.startsWith('claude')) {
++              output = await promptClaude(messages as Message[], {
++                system: system as System,
++                model: model as typeof claudeModels.sonnet,
++                clientSessionId: 'relabel-trace-api',
++                fingerprintId: 'relabel-trace-api',
++                userInputId: 'relabel-trace-api',
++                ignoreDatabaseAndHelicone: true,
++              })
++            } else {
++              output = await promptGeminiWithFallbacks(
++                messages as Message[],
++                system as System,
++                {
++                  model: model as typeof geminiModels.gemini2_5_pro_exp,
++                  clientSessionId: 'relabel-trace-api',
++                  fingerprintId: 'relabel-trace-api',
++                  userInputId: 'relabel-trace-api',
++                  userId: 'relabel-trace-api',
++                }
++              )
++            }
++
++            // Create relabel record
++            const relabel = {
++              id: generateCompactId(),
++              agent_step_id: trace.agent_step_id,
++              user_id: trace.user_id,
++              created_at: new Date(),
++              model: model,
++              payload: {
++                user_input_id: payload.user_input_id,
++                client_session_id: payload.client_session_id,
++                fingerprint_id: payload.fingerprint_id,
++                output: output,
++              },
++            }
++
++            // Store the relabel
++            await insertRelabel(relabel)
++            logger.info(`Successfully stored relabel for trace ${trace.id}`)
++
++            return {
++              traceId: trace.id,
++              status: 'success',
++              model: model,
++            }
++          } catch (error) {
++            logger.error(`Error processing trace ${trace.id}:`, error)
++            return {
++              traceId: trace.id,
++              status: 'error',
++              model: model,
++              error: error instanceof Error ? error.message : 'Unknown error',
++            }
++          }
++        })
++      )
++
++      allResults.push(...modelResults)
++    }
++
++    // Return success response
++    return res.json({
++      success: true,
++      message: 'Traces relabeled successfully',
++      data: allResults,
++    })
++  } catch (error) {
++    logger.error('Error relabeling traces:', error)
++    return res.status(500).json({ error: 'Failed to relabel traces' })
++  }
++}
+diff --git a/backend/src/index.ts b/backend/src/index.ts
+index 4a2db4d62..e2ecf57be 100644
+--- a/backend/src/index.ts
++++ b/backend/src/index.ts
+@@ -1,11 +1,14 @@
+-import express from 'express'
+ import http from 'http'
+-import { listen as webSocketListen } from './websockets/server'
+-import { env } from './env.mjs'
+-import { logger } from './util/logger'
+-import usageHandler from './api/usage'
++
+ import { setupBigQuery } from 'common/src/bigquery/client'
++import cors from 'cors'
++import express from 'express'
+ 
++import { relabelForUser } from './admin/relabelRuns'
++import usageHandler from './api/usage'
++import { env } from './env.mjs'
++import { logger } from './util/logger'
++import { listen as webSocketListen } from './websockets/server'
+ const app = express()
+ const port = env.PORT
+ 
+@@ -21,6 +24,16 @@ app.get('/healthz', (req, res) => {
+ 
+ app.post('/api/usage', usageHandler)
+ 
++// Enable CORS for preflight requests to the admin relabel endpoint
++app.options('/api/admin/32ff11e1a368da3d2cea24e50/relabel-for-user', cors())
++
++// Add the admin route with CORS
++app.post(
++  '/api/admin/32ff11e1a368da3d2cea24e50/relabel-for-user',
++  cors(),
++  relabelForUser
++)
++
+ app.use(
+   (
+     err: Error,
+diff --git a/common/src/bigquery/client.ts b/common/src/bigquery/client.ts
+index 75c24e68f..960666289 100644
+--- a/common/src/bigquery/client.ts
++++ b/common/src/bigquery/client.ts
+@@ -114,7 +114,7 @@ export async function getRecentTraces(
+ ) {
+   const query = `
+     SELECT * FROM ${dataset}.${TRACES_TABLE}
+-    ORDER BY createdAt DESC
++    ORDER BY created_at DESC
+     LIMIT ${limit}
+   `
+   const [rows] = await client.query(query)
+@@ -132,7 +132,7 @@ export async function getRecentRelabels(
+ ) {
+   const query = `
+     SELECT * FROM ${dataset}.${RELABELS_TABLE}
+-    ORDER BY createdAt DESC
++    ORDER BY created_at DESC
+     LIMIT ${limit}
+   `
+   const [rows] = await client.query(query)
+@@ -147,6 +147,7 @@ export async function getRecentRelabels(
+ export async function getTracesWithoutRelabels(
+   model: string,
+   limit: number = 100,
++  userId: string | undefined = undefined,
+   dataset: string = DATASET
+ ) {
+   // TODO: Optimize query, maybe only get traces in last 30 days etc
+@@ -154,16 +155,17 @@ export async function getTracesWithoutRelabels(
+     SELECT t.* 
+     FROM \`${dataset}.${TRACES_TABLE}\` t
+     LEFT JOIN (
+-      SELECT r.agentStepId, r.userId, JSON_EXTRACT_SCALAR(r.payload, '$.userInputId') as userInputId
++      SELECT r.agent_step_id, r.user_id, JSON_EXTRACT_SCALAR(r.payload, '$.user_input_id') as user_input_id
+       FROM \`${dataset}.${RELABELS_TABLE}\` r
+       WHERE r.model = '${model}'
++      ${userId ? `AND r.user_id = '${userId}'` : ''}
+     ) r
+-    ON t.agentStepId = r.agentStepId 
+-       AND t.userId = r.userId
+-       AND JSON_EXTRACT_SCALAR(t.payload, '$.userInputId') = r.userInputId
++    ON t.agent_step_id = r.agent_step_id 
++       AND t.user_id = r.user_id
++       AND JSON_EXTRACT_SCALAR(t.payload, '$.user_input_id') = r.user_input_id
+     WHERE t.type = 'get-relevant-files'
+-      AND r.agentStepId IS NULL
+-    ORDER BY t.createdAt DESC
++      AND r.agent_step_id IS NULL
++    ORDER BY t.created_at DESC
+     LIMIT ${limit}
+   `
+ 
+@@ -192,13 +194,13 @@ export async function getTracesWithRelabels(
+     FROM \`${dataset}.${RELABELS_TABLE}\` r
+     WHERE r.model = '${model}'
+   ) r
+-  ON t.agentStepId = r.agentStepId 
+-     AND t.userId = r.userId
+-     AND JSON_EXTRACT_SCALAR(t.payload, '$.userInputId') = JSON_EXTRACT_SCALAR(r.payload, '$.userInputId')
++  ON t.agent_step_id = r.agent_step_id 
++     AND t.user_id = r.user_id
++     AND JSON_EXTRACT_SCALAR(t.payload, '$.user_input_id') = JSON_EXTRACT_SCALAR(r.payload, '$.user_input_id')
+   WHERE t.type = 'get-relevant-files'
+     AND JSON_EXTRACT_SCALAR(t.payload, '$.output') IS NOT NULL
+     AND JSON_EXTRACT_SCALAR(r.payload, '$.output') IS NOT NULL
+-  ORDER BY t.createdAt DESC
++  ORDER BY t.created_at DESC
+   LIMIT ${limit}
+   `
+ 
+@@ -231,3 +233,71 @@ export async function getTracesWithRelabels(
+     },
+   })) as { trace: GetRelevantFilesTrace; relabel: Relabel }[]
+ }
++
++export async function getTracesAndRelabelsForUser(
++  userId: string,
++  limit: number = 50,
++  dataset: string = DATASET
++) {
++  // Get recent traces for the user and any associated relabels
++  const query = `
++  WITH traces AS (
++    SELECT 
++      id, 
++      agent_step_id, 
++      user_id, 
++      created_at, 
++      type, 
++      payload
++    FROM \`${dataset}.${TRACES_TABLE}\`
++    WHERE user_id = '${userId}' AND type = 'get-relevant-files'
++    ORDER BY created_at DESC
++    LIMIT ${limit}
++  )
++  SELECT 
++    t.id, 
++    ANY_VALUE(t.agent_step_id) as agent_step_id, 
++    ANY_VALUE(t.user_id) as user_id, 
++    ANY_VALUE(t.created_at) as created_at, 
++    ANY_VALUE(t.type) as type, 
++    ANY_VALUE(t.payload) as payload,
++    ARRAY_AGG(r IGNORE NULLS) as relabels
++  FROM traces t
++  LEFT JOIN \`${dataset}.${RELABELS_TABLE}\` r
++  ON t.agent_step_id = r.agent_step_id 
++     AND t.user_id = r.user_id
++     AND JSON_EXTRACT_SCALAR(t.payload, '$.user_input_id') = JSON_EXTRACT_SCALAR(r.payload, '$.user_input_id')
++  GROUP BY t.id
++  ORDER BY ANY_VALUE(t.created_at) DESC
++  `
++
++  const [rows] = await client.query(query)
++
++  // Process and parse the results
++  return rows.map((row) => {
++    // Create trace object from individual fields
++    const trace = {
++      id: row.id,
++      agent_step_id: row.agent_step_id,
++      user_id: row.user_id,
++      created_at: row.created_at,
++      type: row.type,
++      payload:
++        typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload,
++    } as GetRelevantFilesTrace
++
++    // Parse relabel payloads (if any exist)
++    const relabels =
++      row.relabels && row.relabels.length > 0
++        ? (row.relabels.map((relabel: any) => ({
++            ...relabel,
++            payload:
++              typeof relabel.payload === 'string'
++                ? JSON.parse(relabel.payload)
++                : relabel.payload,
++          })) as Relabel[])
++        : []
++
++    return { trace, relabels }
++  })
++}
+diff --git a/scripts/ft-file-selection/relabel-traces.ts b/scripts/ft-file-selection/relabel-traces.ts
+index b0dc4801e..5263ab1f5 100644
+--- a/scripts/ft-file-selection/relabel-traces.ts
++++ b/scripts/ft-file-selection/relabel-traces.ts
+@@ -15,6 +15,7 @@ const MODELS_TO_TEST = [models.gemini2_5_pro_exp, claudeModels.sonnet] as const
+ 
+ const isProd = process.argv.includes('--prod')
+ const DATASET = isProd ? 'codebuff_data' : 'codebuff_data_dev'
++const MAX_PARALLEL = 5 // Maximum number of traces to process in parallel
+ 
+ async function runTraces() {
+   try {
+@@ -22,80 +23,95 @@ async function runTraces() {
+       console.log(`\nProcessing traces for model ${model}...`)
+ 
+       // Get the last 100 traces that don't have relabels for this model
+-      const traces = await getTracesWithoutRelabels(model, 100, DATASET)
++      const traces = await getTracesWithoutRelabels(
++        model,
++        100,
++        undefined,
++        DATASET
++      )
+ 
+       console.log(
+         `Found ${traces.length} get-relevant-files traces without relabels for model ${model}`
+       )
+ 
+-      for (const trace of traces) {
+-        console.log(`Processing trace ${trace.id}`)
+-        const payload = (
+-          typeof trace.payload === 'string'
+-            ? JSON.parse(trace.payload)
+-            : trace.payload
+-        ) as GetRelevantFilesPayload
++      // Process traces in batches of MAX_PARALLEL
++      for (let i = 0; i < traces.length; i += MAX_PARALLEL) {
++        const batch = traces.slice(i, i + MAX_PARALLEL)
++        console.log(
++          `Processing batch of ${batch.length} traces (${i + 1}-${Math.min(i + MAX_PARALLEL, traces.length)})`
++        )
++
++        await Promise.all(
++          batch.map(async (trace) => {
++            console.log(`Processing trace ${trace.id}`)
++            const payload = (
++              typeof trace.payload === 'string'
++                ? JSON.parse(trace.payload)
++                : trace.payload
++            ) as GetRelevantFilesPayload
+ 
+-        try {
+-          let output: string
+-          const messages = payload.messages
+-          const system = payload.system
++            try {
++              let output: string
++              const messages = payload.messages
++              const system = payload.system
+ 
+-          console.log('messages', messages)
+-          console.log('system', system)
+-          if (model.startsWith('claude')) {
+-            output = await promptClaude(messages as Message[], {
+-              system: system as System,
+-              model: model as typeof claudeModels.sonnet,
+-              clientSessionId: 'relabel-trace-run',
+-              fingerprintId: 'relabel-trace-run',
+-              userInputId: 'relabel-trace-run',
+-              ignoreDatabaseAndHelicone: true,
+-            })
+-          } else {
+-            output = await promptGeminiWithFallbacks(
+-              messages as Message[],
+-              system as System,
+-              {
+-                model: model as typeof models.gemini2_5_pro_exp,
+-                clientSessionId: 'relabel-trace-run',
+-                fingerprintId: 'relabel-trace-run',
+-                userInputId: 'relabel-trace-run',
+-                userId: 'relabel-trace-run',
++              if (model.startsWith('claude')) {
++                output = await promptClaude(messages as Message[], {
++                  system: system as System,
++                  model: model as typeof claudeModels.sonnet,
++                  clientSessionId: 'relabel-trace-run',
++                  fingerprintId: 'relabel-trace-run',
++                  userInputId: 'relabel-trace-run',
++                  ignoreDatabaseAndHelicone: true,
++                })
++              } else {
++                output = await promptGeminiWithFallbacks(
++                  messages as Message[],
++                  system as System,
++                  {
++                    model: model as typeof models.gemini2_5_pro_exp,
++                    clientSessionId: 'relabel-trace-run',
++                    fingerprintId: 'relabel-trace-run',
++                    userInputId: 'relabel-trace-run',
++                    userId: 'relabel-trace-run',
++                  }
++                )
+               }
+-            )
+-          }
+ 
+-          // Create relabel record
+-          const relabel = {
+-            id: generateCompactId(),
+-            agent_step_id: trace.agent_step_id,
+-            user_id: trace.user_id,
+-            created_at: new Date(),
+-            model: model,
+-            payload: {
+-              user_input_id: payload.user_input_id,
+-              client_session_id: payload.client_session_id,
+-              fingerprint_id: payload.fingerprint_id,
+-              output: output,
+-            },
+-          }
++              // Create relabel record
++              const relabel = {
++                id: generateCompactId(),
++                agent_step_id: trace.agent_step_id,
++                user_id: trace.user_id,
++                created_at: new Date(),
++                model: model,
++                payload: {
++                  user_input_id: payload.user_input_id,
++                  client_session_id: payload.client_session_id,
++                  fingerprint_id: payload.fingerprint_id,
++                  output: output,
++                },
++              }
++
++              // Store the relabel
++              try {
++                const res = await insertRelabel(relabel, DATASET)
++                console.log('res', JSON.stringify(res, null, 2))
++              } catch (error) {
++                console.error(
++                  `Error inserting relabel for trace ${trace.id}:`,
++                  JSON.stringify(error, null, 2)
++                )
++              }
+ 
+-          // Store the relabel
+-          try {
+-            const res = await insertRelabel(relabel, DATASET)
+-            console.log('res', JSON.stringify(res, null, 2))
+-          } catch (error) {
+-            console.error(
+-              `Error inserting relabel for trace ${trace.id}:`,
+-              JSON.stringify(error, null, 2)
+-            )
+-          }
++              console.log(`Successfully stored relabel for trace ${trace.id}`)
++            } catch (error) {
++              console.error(`Error processing trace ${trace.id}:`, error)
++            }
++          })
++        )
+ 
+-          console.log(`Successfully stored relabel for trace ${trace.id}`)
+-        } catch (error) {
+-          console.error(`Error processing trace ${trace.id}:`, error)
+-        }
++        console.log(`Completed batch of ${batch.length} traces`)
+       }
+     }
+   } catch (error) {
+diff --git a/web/src/app/admin/32ff11e1a368da3d2cea24e50/file-picker/page.tsx b/web/src/app/admin/32ff11e1a368da3d2cea24e50/file-picker/page.tsx
+new file mode 100644
+index 000000000..6a7a146da
+--- /dev/null
++++ b/web/src/app/admin/32ff11e1a368da3d2cea24e50/file-picker/page.tsx
+@@ -0,0 +1,252 @@
++"use client"
++
++import { useState } from "react"
++
++import { Button } from "@/components/ui/button"
++import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
++import { Input } from "@/components/ui/input"
++import {
++    Table,
++    TableBody,
++    TableCell,
++    TableHead,
++    TableHeader,
++    TableRow
++} from "@/components/ui/table"
++
++// Mock user IDs
++const productionUsers = [
++    { name: "Venki", id: "4c89ad24-e4ba-40f3-8473-b9e416a4ee99" },
++    { name: "Brandon", id: "fbdfd453-23db-4401-980e-da30515638ed" },
++    { name: "James", id: "a6474b40-ec21-4ace-a967-374d9fb3cc70" },
++    { name: "Charles", id: "dbbf5ce1-8de6-42c0-9e43-f93de88eba15" },
++]
++
++const localUsers = [
++    { name: "Venki", id: "fad054ab-150b-4a1a-b6ec-1a797972638b" },
++]
++
++// Choose user list based on environment
++const suggestedUsers = process.env.NEXT_PUBLIC_ENVIRONMENT === 'local'
++    ? localUsers
++    : productionUsers
++
++// Mock response data
++const mockResponses = [
++    {
++        timestamp: "2023-11-05T14:30:45Z",
++        query: "Find files related to quarterly reports",
++        outputs: {
++            "GPT-4": "quarterly_report_q3_2023.pdf, financial_summary_2023.xlsx",
++            "Claude": "Q3_report_2023.pdf, Q3_financials.xlsx, quarterly_presentation.pptx",
++            "Mixtral": "2023_Q3_report.pdf, Q3_financial_data.csv, 2023_quarterly_overview.docx"
++        }
++    },
++    {
++        timestamp: "2023-11-05T14:32:12Z",
++        query: "Show me marketing campaign materials",
++        outputs: {
++            "GPT-4": "summer_campaign_2023.pptx, ad_copy_q3.docx",
++            "Claude": "marketing_campaign_2023.pdf, social_media_assets.zip, campaign_metrics.xlsx",
++            "Mixtral": "campaign_2023_brief.pdf, marketing_visuals.zip, campaign_schedule.xlsx"
++        }
++    }
++]
++
++type Result = {
++    timestamp: string
++    query: string
++    outputs: Record<string, string>
++}
++
++export default function FilePicker() {
++    const [userId, setUserId] = useState("")
++    const [results, setResults] = useState<Result[]>([])
++    const [isLoading, setIsLoading] = useState(false)
++    const [error, setError] = useState("")
++
++    const fetchUserTraces = async (userId: string) => {
++        try {
++            setIsLoading(true)
++            setError("")
++
++            const response = await fetch(`/api/admin/32ff11e1a368da3d2cea24e50/get-traces-for-user?userId=${userId}`)
++
++            if (!response.ok) {
++                throw new Error(`Failed to fetch: ${response.status} ${response.statusText}`)
++            }
++
++            const { data } = await response.json() as { data: Result[] }
++
++            if (!data || !Array.isArray(data)) {
++                throw new Error("Invalid data format received from API")
++            }
++
++            console.log("data", data)
++
++            setResults(data)
++        } catch (err) {
++            console.error("Error fetching traces:", err)
++            setError(err instanceof Error ? err.message : "Failed to fetch user traces")
++        } finally {
++            setIsLoading(false)
++        }
++    }
++
++    const handleSubmit = async (e: React.FormEvent) => {
++        e.preventDefault()
++        if (!userId.trim()) {
++            setError("Please enter a user ID")
++            return
++        }
++
++        await fetchUserTraces(userId)
++    }
++
++    const handleRunRelabelling = async () => {
++        if (!userId.trim()) {
++            setError("Please enter a user ID")
++            return
++        }
++
++        try {
++            setIsLoading(true)
++            setError("")
++
++            const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'localhost:4242'
++            const protocol = backendUrl.startsWith('localhost') ? 'http://' : 'https://'
++            const response = await fetch(`${protocol}${backendUrl}/api/admin/32ff11e1a368da3d2cea24e50/relabel-for-user?userId=${userId}`, {
++                method: 'POST',
++                headers: {
++                    'Content-Type': 'application/json',
++                },
++                body: JSON.stringify({ limit: 10 }),
++            })
++
++            if (!response.ok) {
++                throw new Error(`Failed to run relabelling: ${response.status} ${response.statusText}`)
++            }
++
++            const result = await response.json()
++            console.log("Relabelling result:", result)
++
++            // Refresh the user traces to show updated data
++            await fetchUserTraces(userId)
++        } catch (err) {
++            console.error("Error running relabelling:", err)
++            setError(err instanceof Error ? err.message : "Failed to run relabelling")
++        } finally {
++            setIsLoading(false)
++        }
++    }
++
++    // Get unique model names from all results
++    const modelNames = Array.from(
++        new Set(
++            results.flatMap(result => Object.keys(result.outputs))
++        )
++    )
++
++    return (
++        <div className="container mx-auto py-8">
++            <Card>
++                <CardHeader>
++                    <CardTitle className="text-2xl font-bold">File-picker model comparison</CardTitle>
++                </CardHeader>
++                <CardContent>
++                    <form onSubmit={handleSubmit} className="space-y-4">
++                        <div className="flex space-x-2">
++                            <Input
++                                placeholder="Enter user_id"
++                                value={userId}
++                                onChange={(e) => setUserId(e.target.value)}
++                                className="flex-1"
++                            />
++                            <Button type="submit" disabled={isLoading}>
++                                {isLoading ? "Loading..." : "Submit"}
++                            </Button>
++                        </div>
++
++                        <div>
++                            <div className="flex flex-wrap gap-2">
++                                {suggestedUsers.map((user) => (
++                                    <div
++                                        key={user.id}
++                                        className="inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold cursor-pointer bg-secondary text-secondary-foreground hover:bg-secondary/80"
++                                        onClick={() => setUserId(user.id)}
++                                    >
++                                        {user.name}
++                                    </div>
++                                ))}
++                            </div>
++                        </div>
++
++                        {error && (
++                            <div className="text-red-500 text-sm mt-2">
++                                {error}
++                            </div>
++                        )}
++                    </form>
++
++                    {results.length > 0 && (
++                        <div className="mt-8">
++                            <div className="flex justify-between items-center mb-4">
++                                <h3 className="text-lg font-medium">Results ({results.length})</h3>
++                                <Button
++                                    onClick={handleRunRelabelling}
++                                    variant="outline"
++                                    disabled={isLoading}
++                                >
++                                    Run relabelling
++                                </Button>
++                            </div>
++
++                            <Table>
++                                <TableHeader>
++                                    <TableRow>
++                                        <TableHead className="w-[180px]">Timestamp</TableHead>
++                                        <TableHead>Query</TableHead>
++                                        {modelNames.map(model => (
++                                            <TableHead key={model}>{model}</TableHead>
++                                        ))}
++                                    </TableRow>
++                                </TableHeader>
++                                <TableBody>
++                                    {results.map((result, index) => (
++                                        <TableRow key={index}>
++                                            <TableCell className="font-mono text-xs">
++                                                {new Date(result.timestamp).toLocaleString()}
++                                            </TableCell>
++                                            <TableCell>{result.query}</TableCell>
++                                            {modelNames.map(model => (
++                                                <TableCell key={model} className="max-w-[300px] break-words">
++                                                    {result.outputs[model] ?
++                                                        result.outputs[model]
++                                                            .split('\n')
++                                                            .map(file => file.trim())
++                                                            .filter(file => file.length > 0)
++                                                            .sort()
++                                                            .map((file, fileIndex) => (
++                                                                <div
++                                                                    key={fileIndex}
++                                                                    className="block mb-2"
++                                                                >
++                                                                    <span className="px-2 py-1 bg-secondary rounded-full text-xs">
++                                                                        {file}
++                                                                    </span>
++                                                                </div>
++                                                            ))
++                                                        : "N/A"}
++                                                </TableCell>
++                                            ))}
++                                        </TableRow>
++                                    ))}
++                                </TableBody>
++                            </Table>
++                        </div>
++                    )}
++                </CardContent>
++            </Card>
++        </div>
++    )
++}
+diff --git a/web/src/app/api/admin/32ff11e1a368da3d2cea24e50/get-traces-for-user/route.ts b/web/src/app/api/admin/32ff11e1a368da3d2cea24e50/get-traces-for-user/route.ts
+new file mode 100644
+index 000000000..6277a479d
+--- /dev/null
++++ b/web/src/app/api/admin/32ff11e1a368da3d2cea24e50/get-traces-for-user/route.ts
+@@ -0,0 +1,66 @@
++import { getTracesAndRelabelsForUser } from 'common/src/bigquery/client'
++import { NextRequest, NextResponse } from 'next/server'
++export async function GET(request: NextRequest) {
++  try {
++    // Extract userId from the URL search params
++    const searchParams = request.nextUrl.searchParams
++    const userId = searchParams.get('userId')
++
++    if (!userId) {
++      return NextResponse.json(
++        { error: 'Missing required parameter: userId' },
++        { status: 400 }
++      )
++    }
++
++    // Call the function to get traces and relabels
++    const tracesAndRelabels = await getTracesAndRelabelsForUser(userId)
++
++    // Transform data for the frontend
++    const formattedResults = tracesAndRelabels.map(({ trace, relabels }) => {
++      // Extract timestamp
++      const timestamp = (trace.created_at as unknown as { value: string }).value
++
++      // Extract query from the last message in the messages array
++      const messages = trace.payload.messages || []
++      const queryBody =
++        Array.isArray(messages) && messages.length > 0
++          ? messages[messages.length - 1].content[0].text || 'Unknown query'
++          : 'Unknown query'
++
++      // User prompt: User prompt: \"still not seeing it, can you see it on the page?\"
++      // Extract using regex the above specific substring, matching the bit inside quotes
++      const query = queryBody.match(/"(.*?)"/)?.[1] || 'Unknown query'
++
++      // Get base model output
++      const baseOutput = trace.payload.output || ''
++
++      // Initialize outputs with base model
++      const outputs: Record<string, string> = {
++        base: baseOutput,
++      }
++
++      // Add outputs from relabels
++      relabels.forEach((relabel) => {
++        if (relabel.model && relabel.payload?.output) {
++          outputs[relabel.model] = relabel.payload.output
++        }
++      })
++
++      return {
++        timestamp,
++        query,
++        outputs,
++      }
++    })
++
++    // Return the formatted data
++    return NextResponse.json({ data: formattedResults })
++  } catch (error) {
++    console.error('Error fetching traces and relabels:', error)
++    return NextResponse.json(
++      { error: 'Failed to fetch traces and relabels' },
++      { status: 500 }
++    )
++  }
++}
+diff --git a/web/src/components/ui/table.tsx b/web/src/components/ui/table.tsx
+new file mode 100644
+index 000000000..7f3502f8b
+--- /dev/null
++++ b/web/src/components/ui/table.tsx
+@@ -0,0 +1,117 @@
++import * as React from "react"
++
++import { cn } from "@/lib/utils"
++
++const Table = React.forwardRef<
++  HTMLTableElement,
++  React.HTMLAttributes<HTMLTableElement>
++>(({ className, ...props }, ref) => (
++  <div className="relative w-full overflow-auto">
++    <table
++      ref={ref}
++      className={cn("w-full caption-bottom text-sm", className)}
++      {...props}
++    />
++  </div>
++))
++Table.displayName = "Table"
++
++const TableHeader = React.forwardRef<
++  HTMLTableSectionElement,
++  React.HTMLAttributes<HTMLTableSectionElement>
++>(({ className, ...props }, ref) => (
++  <thead ref={ref} className={cn("[&_tr]:border-b", className)} {...props} />
++))
++TableHeader.displayName = "TableHeader"
++
++const TableBody = React.forwardRef<
++  HTMLTableSectionElement,
++  React.HTMLAttributes<HTMLTableSectionElement>
++>(({ className, ...props }, ref) => (
++  <tbody
++    ref={ref}
++    className={cn("[&_tr:last-child]:border-0", className)}
++    {...props}
++  />
++))
++TableBody.displayName = "TableBody"
++
++const TableFooter = React.forwardRef<
++  HTMLTableSectionElement,
++  React.HTMLAttributes<HTMLTableSectionElement>
++>(({ className, ...props }, ref) => (
++  <tfoot
++    ref={ref}
++    className={cn(
++      "border-t bg-muted/50 font-medium [&>tr]:last:border-b-0",
++      className
++    )}
++    {...props}
++  />
++))
++TableFooter.displayName = "TableFooter"
++
++const TableRow = React.forwardRef<
++  HTMLTableRowElement,
++  React.HTMLAttributes<HTMLTableRowElement>
++>(({ className, ...props }, ref) => (
++  <tr
++    ref={ref}
++    className={cn(
++      "border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted",
++      className
++    )}
++    {...props}
++  />
++))
++TableRow.displayName = "TableRow"
++
++const TableHead = React.forwardRef<
++  HTMLTableCellElement,
++  React.ThHTMLAttributes<HTMLTableCellElement>
++>(({ className, ...props }, ref) => (
++  <th
++    ref={ref}
++    className={cn(
++      "h-12 px-4 text-left align-middle font-medium text-muted-foreground [&:has([role=checkbox])]:pr-0",
++      className
++    )}
++    {...props}
++  />
++))
++TableHead.displayName = "TableHead"
++
++const TableCell = React.forwardRef<
++  HTMLTableCellElement,
++  React.TdHTMLAttributes<HTMLTableCellElement>
++>(({ className, ...props }, ref) => (
++  <td
++    ref={ref}
++    className={cn("p-4 align-middle [&:has([role=checkbox])]:pr-0", className)}
++    {...props}
++  />
++))
++TableCell.displayName = "TableCell"
++
++const TableCaption = React.forwardRef<
++  HTMLTableCaptionElement,
++  React.HTMLAttributes<HTMLTableCaptionElement>
++>(({ className, ...props }, ref) => (
++  <caption
++    ref={ref}
++    className={cn("mt-4 text-sm text-muted-foreground", className)}
++    {...props}
++  />
++))
++TableCaption.displayName = "TableCaption"
++
++export {
++  Table,
++  TableHeader,
++  TableBody,
++  TableFooter,
++  TableHead,
++  TableRow,
++  TableCell,
++  TableCaption,
++}

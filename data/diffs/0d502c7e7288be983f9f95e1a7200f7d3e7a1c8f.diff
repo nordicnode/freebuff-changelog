@@ -1,0 +1,994 @@
+diff --git a/backend/src/api/usage.ts b/backend/src/api/usage.ts
+new file mode 100644
+index 000000000..566369d50
+--- /dev/null
++++ b/backend/src/api/usage.ts
+@@ -0,0 +1,40 @@
++import { Request, Response } from 'express'
++import { checkAuth } from '../util/check-auth'
++import {
++  genUsageResponse,
++  getUserIdFromAuthToken,
++} from '../websockets/websocket-action'
++import { UsageReponseSchema } from 'common/actions'
++
++export async function handler(req: Request, res: Response) {
++  // Only allow POST requests
++  if (req.method !== 'POST') {
++    return res.status(405).json({
++      type: 'action-error',
++      message: 'Method not allowed',
++    })
++  }
++
++  // Get params from request body
++  const { fingerprintId, authToken } = req.body
++
++  if (!fingerprintId || !authToken) {
++    return res.status(400).json({
++      type: 'action-error',
++      message: 'Missing fingerprintId or authToken parameter',
++    })
++  }
++
++  const result = await checkAuth({ fingerprintId, authToken })
++  if (result?.type === 'action-error') {
++    return res.status(401).json(result)
++  }
++
++  const response = await genUsageResponse(
++    fingerprintId,
++    authToken ? await getUserIdFromAuthToken(authToken) : undefined,
++    undefined
++  )
++
++  return res.json(response)
++}
+diff --git a/backend/src/index.ts b/backend/src/index.ts
+index 7bff44327..749ab0ccd 100644
+--- a/backend/src/index.ts
++++ b/backend/src/index.ts
+@@ -3,6 +3,7 @@ import http from 'http'
+ import { listen as webSocketListen } from './websockets/server'
+ import { env } from './env.mjs'
+ import { logger } from './util/logger'
++import { handler as usageHandler } from './api/usage'
+ 
+ const app = express()
+ const port = env.PORT
+@@ -17,6 +18,8 @@ app.get('/healthz', (req, res) => {
+   res.send('ok')
+ })
+ 
++app.post('/api/usage', usageHandler)
++
+ app.use(
+   (
+     err: Error,
+diff --git a/backend/src/llm-apis/message-cost-tracker.ts b/backend/src/llm-apis/message-cost-tracker.ts
+index 351c3df47..2ded850d9 100644
+--- a/backend/src/llm-apis/message-cost-tracker.ts
++++ b/backend/src/llm-apis/message-cost-tracker.ts
+@@ -6,6 +6,10 @@ import { stripeServer } from 'common/util/stripe'
+ import * as schema from 'common/db/schema'
+ import { eq } from 'drizzle-orm'
+ import { logger, withLoggerContext } from '@/util/logger'
++import { SWITCHBOARD } from '@/websockets/server'
++import { sendAction } from '@/websockets/websocket-action'
++import { ClientState } from '@/websockets/switchboard'
++import { WebSocket } from 'ws'
+ import { stripNullChars } from 'common/util/string'
+ 
+ const PROFIT_MARGIN = 0.2
+@@ -118,7 +122,9 @@ export const saveMessage = async (value: {
+       }
+ 
+       // Clean request messages by converting to JSON and back to remove null chars
+-      const cleanRequest = JSON.parse(stripNullChars(JSON.stringify(value.request)))
++      const cleanRequest = JSON.parse(
++        stripNullChars(JSON.stringify(value.request))
++      )
+ 
+       const savedMessage = await db.insert(schema.message).values({
+         id: value.messageId,
+@@ -147,6 +153,30 @@ export const saveMessage = async (value: {
+             subscription_active: true,
+           },
+         })
++
++        // Find WebSocket connection using existing clientSessionId
++        const clientEntry = Array.from(SWITCHBOARD.clients.entries()).find(
++          ([_, state]: [WebSocket, ClientState]) =>
++            state.sessionId === value.clientSessionId
++        )
++
++        if (!clientEntry) {
++          logger.warn(
++            { clientSessionId: value.clientSessionId },
++            'No WebSocket connection found'
++          )
++          return savedMessage
++        }
++
++        const [ws] = clientEntry
++
++        // Send immediate message cost response
++        sendAction(ws, {
++          type: 'message-cost-response',
++          promptId: value.userInputId,
++          credits: creditsUsed,
++        })
++
+         if (
+           !user ||
+           !user.stripe_customer_id ||
+diff --git a/backend/src/util/check-auth.ts b/backend/src/util/check-auth.ts
+new file mode 100644
+index 000000000..c4baa09de
+--- /dev/null
++++ b/backend/src/util/check-auth.ts
+@@ -0,0 +1,74 @@
++import { match, P } from 'ts-pattern'
++import db from 'common/db'
++import * as schema from 'common/db/schema'
++import { ServerAction } from 'common/actions'
++import { sql, eq } from 'drizzle-orm'
++import { genUsageResponse } from '../websockets/websocket-action'
++import { getNextQuotaReset } from 'common/util/dates'
++import { AnonymousQuotaManager, AuthenticatedQuotaManager } from 'common/billing/quota-manager'
++import { env } from '../env.mjs'
++
++export async function checkAuth(params: {
++  fingerprintId?: string
++  authToken?: string
++  clientSessionId?: string
++}): Promise<ServerAction | undefined> {
++  if (!params.fingerprintId) {
++    return {
++      type: 'action-error' as const,
++      message: 'Access denied. Missing fingerprintId.'
++    }
++  }
++
++  return match(params)
++    .with(
++      { authToken: P.string, fingerprintId: P.string },
++      async ({ authToken, fingerprintId, clientSessionId }) => {
++        const quota = await db.select({
++          userId: schema.user.id,
++          quotaExceeded: sql<boolean>`COALESCE(${schema.user.quota_exceeded}, false)`,
++          nextQuotaReset: sql<string>`COALESCE(${schema.user.next_quota_reset}, now())`
++        })
++        .from(schema.user)
++        .leftJoin(schema.session, eq(schema.user.id, schema.session.userId))
++        .where(eq(schema.session.sessionToken, authToken))
++        .limit(1)
++        .then(rows => rows[0])
++
++        if (!quota) {
++          return {
++            type: 'action-error' as const,
++            message: `Unable to find user for given token! Please reach out to ${env.NEXT_PUBLIC_SUPPORT_EMAIL} for help.`
++          }
++        }
++
++        const currentQuotaReset = new Date(quota.nextQuotaReset)
++        if (currentQuotaReset <= new Date()) {
++          const nextQuotaReset = getNextQuotaReset(currentQuotaReset)
++          await Promise.all([
++            new AnonymousQuotaManager().setNextQuota(
++              fingerprintId,
++              false,
++              nextQuotaReset
++            ),
++            new AuthenticatedQuotaManager().setNextQuota(
++              quota.userId,
++              false,
++              nextQuotaReset
++            )
++          ])
++          return undefined
++        }
++
++        if (quota.quotaExceeded) {
++          return genUsageResponse(fingerprintId, quota.userId, clientSessionId)
++        }
++
++        return undefined
++      }
++    )
++    .otherwise(() => ({
++      type: 'action-error' as const,
++      message: 'Access denied. Missing auth token, please enter "login" to continue.'
++    }))
++}
+\ No newline at end of file
+diff --git a/backend/src/websockets/auth.ts b/backend/src/websockets/auth.ts
+new file mode 100644
+index 000000000..d01818328
+--- /dev/null
++++ b/backend/src/websockets/auth.ts
+@@ -0,0 +1,15 @@
++import db from 'common/db'
++import * as schema from 'common/db/schema'
++import { eq } from 'drizzle-orm'
++
++export async function getUserIdFromAuthToken(authToken: string): Promise<string | undefined> {
++  const user = await db
++    .select({ id: schema.user.id })
++    .from(schema.user)
++    .leftJoin(schema.session, eq(schema.user.id, schema.session.userId))
++    .where(eq(schema.session.sessionToken, authToken))
++    .limit(1)
++    .then(rows => rows[0])
++
++  return user?.id
++}
+\ No newline at end of file
+diff --git a/backend/src/websockets/middleware.ts b/backend/src/websockets/middleware.ts
+index 050428d43..9eb7933eb 100644
+--- a/backend/src/websockets/middleware.ts
++++ b/backend/src/websockets/middleware.ts
+@@ -1,17 +1,8 @@
+ import { WebSocket } from 'ws'
+ import { ClientAction, ServerAction } from 'common/actions'
+-import { match, P } from 'ts-pattern'
+-import db from 'common/db'
+-import * as schema from 'common/db/schema'
+-import {
+-  AnonymousQuotaManager,
+-  AuthenticatedQuotaManager,
+-} from 'common/billing/quota-manager'
+-import { sql, eq } from 'drizzle-orm'
+-import { genUsageResponse, sendAction } from './websocket-action'
++import { sendAction } from './websocket-action'
++import { checkAuth } from '../util/check-auth'
+ import { logger } from '@/util/logger'
+-import { env } from '@/env.mjs'
+-import { getNextQuotaReset } from 'common/util/dates'
+ 
+ export class WebSocketMiddleware {
+   private middlewares: Array<
+@@ -94,63 +85,9 @@ export class WebSocketMiddleware {
+ export const protec = new WebSocketMiddleware()
+ 
+ protec.use(async (action, clientSessionId, ws) =>
+-  match(action)
+-    .with(
+-      { authToken: P.string, fingerprintId: P.string },
+-      async ({ authToken, fingerprintId }) => {
+-        const quota = await db
+-          .select({
+-            userId: schema.user.id,
+-            quotaExceeded: sql<boolean>`COALESCE(${schema.user.quota_exceeded}, false)`,
+-            nextQuotaReset: sql<string>`COALESCE(${schema.user.next_quota_reset}, now())`,
+-          })
+-          .from(schema.user)
+-          .leftJoin(schema.session, eq(schema.user.id, schema.session.userId))
+-          .where(eq(schema.session.sessionToken, authToken))
+-          .limit(1)
+-          .then((rows) => rows[0])
+-
+-        if (!quota) {
+-          return {
+-            type: 'action-error' as const,
+-            message: `Unable to find user for given token ${authToken}! Please reach out to ${env.NEXT_PUBLIC_SUPPORT_EMAIL} for help.`,
+-          }
+-        }
+-
+-        const currentQuotaReset = new Date(quota.nextQuotaReset)
+-        if (currentQuotaReset <= new Date()) {
+-          const nextQuotaReset = getNextQuotaReset(currentQuotaReset)
+-          logger.info(
+-            {
+-              userId: quota.userId,
+-              fingerprintId,
+-              currentQuotaReset,
+-              nextQuotaReset,
+-            },
+-            `Setting next quota reset for user ${quota.userId}`
+-          )
+-          await Promise.all([
+-            new AnonymousQuotaManager().setNextQuota(
+-              fingerprintId,
+-              false,
+-              nextQuotaReset
+-            ),
+-            new AuthenticatedQuotaManager().setNextQuota(
+-              quota.userId,
+-              false,
+-              nextQuotaReset
+-            ),
+-          ])
+-          return
+-        } else if (quota.quotaExceeded) {
+-          logger.warn(`Quota exceeded for user ${quota.userId}`)
+-          return genUsageResponse(clientSessionId, fingerprintId, quota.userId)
+-        }
+-        return
+-      }
+-    )
+-    .otherwise(() => ({
+-      type: 'action-error' as const,
+-      message: `Access denied. Missing auth token, please enter "login" to continue.`,
+-    }))
++  checkAuth({
++    fingerprintId: 'fingerprintId' in action ? action.fingerprintId : undefined,
++    authToken: 'authToken' in action ? action.authToken : undefined,
++    clientSessionId,
++  })
+ )
+diff --git a/backend/src/websockets/websocket-action.ts b/backend/src/websockets/websocket-action.ts
+index 2c27ca389..9d81e9520 100644
+--- a/backend/src/websockets/websocket-action.ts
++++ b/backend/src/websockets/websocket-action.ts
+@@ -113,47 +113,30 @@ async function calculateUsage(
+ 
+ /**
+  * Generates a usage response object for the client
+- * @param sessionId - The current session ID
+  * @param fingerprintId - The fingerprint ID for the user/device
+  * @param userId - Optional user ID for authenticated users
++ * @param clientSessionId - Optional session ID
++ * @param requestedByUser - Whether the request was made by the user
+  * @returns A UsageResponse object containing usage metrics and referral information
+  */
+ export async function genUsageResponse(
+-  sessionId: string,
+   fingerprintId: string,
+-  userId?: string
++  userId: string | undefined,
++  clientSessionId: string | undefined,
++  requestedByUser: boolean = false
+ ): Promise<UsageResponse> {
+-  const params = await withLoggerContext(
+-    { fingerprintId, userId },
+-    async () => {
+-      const {
+-        usage,
+-        limit,
+-        subscription_active,
+-        next_quota_reset,
+-        session_credits_used,
+-      } = await calculateUsage(fingerprintId, userId, sessionId)
+-      logger.info(
+-        {
+-          fingerprintId,
+-          userId,
+-          sessionId,
+-          limit,
+-          subscription_active,
+-          next_quota_reset,
+-          session_credits_used,
+-        },
+-        'Sending usage info'
+-      )
+-
+-      return {
+-        usage,
+-        limit,
+-        subscription_active,
+-        next_quota_reset,
+-        session_credits_used,
+-      }
+-    }
++  const params = await calculateUsage(fingerprintId, userId, clientSessionId)
++  logger.info(
++    {
++      fingerprintId,
++      userId,
++      sessionId: clientSessionId,
++      limit: params.limit,
++      subscription_active: params.subscription_active,
++      next_quota_reset: params.next_quota_reset,
++      session_credits_used: params.session_credits_used,
++    },
++    'Sending usage info'
+   )
+ 
+   return {
+@@ -198,24 +181,13 @@ const onPrompt = async (
+             })
+         )
+ 
+-        const {
+-          usage,
+-          limit,
+-          subscription_active,
+-          next_quota_reset,
+-          session_credits_used,
+-        } = await genUsageResponse(clientSessionId, fingerprintId, userId)
++        // Send prompt data back
+         sendAction(ws, {
+           type: 'prompt-response',
+           promptId,
+           agentState,
+           toolCalls,
+           toolResults,
+-          usage,
+-          limit,
+-          subscription_active,
+-          next_quota_reset,
+-          session_credits_used,
+         })
+       } catch (e) {
+         logger.error(e, 'Error in mainPrompt')
+@@ -263,6 +235,14 @@ const onPrompt = async (
+             toolResults: [],
+           })
+         }, 100)
++      } finally {
++        const usageResponse = await genUsageResponse(
++          fingerprintId,
++          userId,
++          undefined,
++          false
++        )
++        sendAction(ws, usageResponse)
+       }
+     }
+   )
+@@ -323,41 +303,20 @@ const onInit = async (
+     //   logger.error(e, 'Error in init')
+     // }
+ 
+-    const {
+-      usage,
+-      limit,
+-      subscription_active,
+-      next_quota_reset,
+-      session_credits_used,
+-    } = await calculateUsage(fingerprintId, userId, clientSessionId)
++    // Send combined init and usage response
++    const { type, ...params } = await genUsageResponse(
++      fingerprintId,
++      userId,
++      clientSessionId,
++      false
++    )
+     sendAction(ws, {
+       type: 'init-response',
+-      usage,
+-      limit,
+-      subscription_active,
+-      next_quota_reset,
+-      session_credits_used,
++      ...params,
+     })
+   })
+ }
+ 
+-/**
+- * Handles usage request actions from the client
+- * @param fingerprintId - The fingerprint ID for the user/device
+- * @param authToken - The authentication token
+- * @param clientSessionId - The client's session ID
+- * @param ws - The WebSocket connection
+- */
+-export const onUsageRequest = async (
+-  { fingerprintId, authToken }: Extract<ClientAction, { type: 'usage' }>,
+-  clientSessionId: string,
+-  ws: WebSocket
+-) => {
+-  const userId = await getUserIdFromAuthToken(authToken)
+-  const action = await genUsageResponse(clientSessionId, fingerprintId, userId)
+-  sendAction(ws, action)
+-}
+-
+ /**
+  * Storage for action callbacks organized by action type
+  */
+@@ -426,7 +385,6 @@ export const onWebsocketAction = async (
+ // Register action handlers
+ subscribeToAction('prompt', protec.run(onPrompt))
+ subscribeToAction('init', protec.run(onInit, { silent: true }))
+-subscribeToAction('usage', onUsageRequest)
+ 
+ /**
+  * Requests multiple files from the client
+diff --git a/common/src/actions.ts b/common/src/actions.ts
+index 6c1ab3fac..591c7d45f 100644
+--- a/common/src/actions.ts
++++ b/common/src/actions.ts
+@@ -35,7 +35,6 @@ export const CLIENT_ACTION_SCHEMA = z.discriminatedUnion('type', [
+     changesAlreadyApplied: CHANGES,
+     costMode: z.enum(costModes).optional().default('normal'),
+   }),
+-  // New schema for strange-loop.
+   z.object({
+     type: z.literal('prompt'),
+     promptId: z.string(),
+@@ -57,11 +56,6 @@ export const CLIENT_ACTION_SCHEMA = z.discriminatedUnion('type', [
+     authToken: z.string().optional(),
+     fileContext: ProjectFileContextSchema,
+   }),
+-  z.object({
+-    type: z.literal('usage'),
+-    fingerprintId: z.string(),
+-    authToken: z.string().optional(),
+-  }),
+   z.object({
+     type: z.literal('generate-commit-message'),
+     fingerprintId: z.string(),
+@@ -109,20 +103,20 @@ export const ResponseCompleteSchema = z
+     }).partial()
+   )
+ 
+-// New schema for strange-loop.
+-export const PromptResponseSchema = z
+-  .object({
+-    type: z.literal('prompt-response'),
+-    promptId: z.string(),
+-    agentState: AgentStateSchema,
+-    toolCalls: z.array(NewToolCallSchema),
+-    toolResults: z.array(ToolResultSchema),
+-  })
+-  .merge(
+-    UsageReponseSchema.omit({
+-      type: true,
+-    }).partial()
+-  )
++export const MessageCostResponseSchema = z.object({
++  type: z.literal('message-cost-response'),
++  promptId: z.string(),
++  credits: z.number(),
++})
++export type MessageCostResponse = z.infer<typeof MessageCostResponseSchema>
++
++export const PromptResponseSchema = z.object({
++  type: z.literal('prompt-response'),
++  promptId: z.string(),
++  agentState: AgentStateSchema,
++  toolCalls: z.array(NewToolCallSchema),
++  toolResults: z.array(ToolResultSchema),
++})
+ export type PromptResponse = z.infer<typeof PromptResponseSchema>
+ 
+ export const SERVER_ACTION_SCHEMA = z.discriminatedUnion('type', [
+@@ -160,6 +154,7 @@ export const SERVER_ACTION_SCHEMA = z.discriminatedUnion('type', [
+   }),
+   InitResponseSchema,
+   UsageReponseSchema,
++  MessageCostResponseSchema,
+   z.object({
+     type: z.literal('action-error'),
+     message: z.string(),
+diff --git a/common/src/billing/quota-manager.ts b/common/src/billing/quota-manager.ts
+index d0f928f98..753ca6e1b 100644
+--- a/common/src/billing/quota-manager.ts
++++ b/common/src/billing/quota-manager.ts
+@@ -14,7 +14,10 @@ type CheckQuotaResult = Promise<{
+ }>
+ 
+ export interface IQuotaManager {
+-  checkQuota(id: string): CheckQuotaResult
++  checkQuota(
++    id: string,
++    sessionId?: string
++  ): CheckQuotaResult
+   setNextQuota(
+     id: string,
+     quota_exceeded: boolean,
+@@ -257,7 +260,8 @@ export const getQuotaManager = (authType: AuthType, id: string) => {
+     .exhaustive()
+ 
+   return {
+-    checkQuota: (sessionId?: string) => manager.checkQuota(id, sessionId),
++    checkQuota: (sessionId?: string) => 
++      manager.checkQuota(id, sessionId),
+     setNextQuota: (quota_exceeded: boolean, next_quota_reset: Date) =>
+       manager.setNextQuota(id, quota_exceeded, next_quota_reset),
+   }
+diff --git a/npm-app/src/cli.ts b/npm-app/src/cli.ts
+index 866a9f659..38a41a0c4 100644
+--- a/npm-app/src/cli.ts
++++ b/npm-app/src/cli.ts
+@@ -1,6 +1,15 @@
+ import { parse } from 'path'
+ 
+-import { green, red, yellow, blue, cyan, magenta, bold } from 'picocolors'
++import {
++  green,
++  red,
++  yellow,
++  blue,
++  cyan,
++  magenta,
++  bold,
++  underline,
++} from 'picocolors'
+ import * as readline from 'readline'
+ 
+ import { REQUEST_CREDIT_SHOW_THRESHOLD } from 'common/constants'
+@@ -238,7 +247,7 @@ export class CLI {
+       return true
+     }
+     if (userInput === 'usage' || userInput === 'credits') {
+-      this.client.getUsage()
++      await this.client.getUsage()
+       return true
+     }
+     if (userInput === 'undo' || userInput === 'u') {
+@@ -318,14 +327,6 @@ export class CLI {
+ 
+     Spinner.get().stop()
+ 
+-    if (this.client.lastRequestCredits >= REQUEST_CREDIT_SHOW_THRESHOLD) {
+-      console.log(
+-        `\n${pluralize(this.client.lastRequestCredits, 'credit')} used for this request.`
+-      )
+-    }
+-    this.client.showUsageWarning()
+-    console.log()
+-
+     this.freshPrompt()
+   }
+ 
+@@ -612,11 +613,14 @@ export class CLI {
+ 
+   private handleExit() {
+     Spinner.get().restoreCursor()
+-    console.log('\n\n')
++    console.log('\n')
+ 
+-    console.log(
+-      `${pluralize(this.client.sessionCreditsUsed, 'credit')} used this session.`
+-    )
++    const logMessages = []
++    const totalCredits = Object.values(this.client.creditsByPromptId)
++      .flat()
++      .reduce((sum, credits) => sum + credits, 0)
++
++    logMessages.push(`${pluralize(totalCredits, 'credit')} used this session.`)
+     if (this.client.limit && this.client.usage && this.client.nextQuotaReset) {
+       const daysUntilReset = Math.max(
+         0,
+@@ -625,13 +629,15 @@ export class CLI {
+             (1000 * 60 * 60 * 24)
+         )
+       )
+-      console.log(
++      logMessages.push(
+         `${Math.max(
+           0,
+           this.client.limit - this.client.usage
+-        )} / ${this.client.limit} credits remaining. Renews in ${pluralize(daysUntilReset, 'day')}.`
++        )} credits remaining. Renews in ${pluralize(daysUntilReset, 'day')}.`
+       )
+     }
++
++    console.log(logMessages.join(' '))
+     console.log(green('Codebuff out!'))
+     process.exit(0)
+   }
+diff --git a/npm-app/src/client.ts b/npm-app/src/client.ts
+index 8fdb58063..408c7abe8 100644
+--- a/npm-app/src/client.ts
++++ b/npm-app/src/client.ts
+@@ -22,9 +22,14 @@ import {
+   ServerAction,
+   UsageReponseSchema,
+   UsageResponse,
++  MessageCostResponse,
++  MessageCostResponseSchema,
+ } from 'common/actions'
+ import { User } from 'common/util/credentials'
+-import { CREDITS_REFERRAL_BONUS } from 'common/constants'
++import {
++  CREDITS_REFERRAL_BONUS,
++  REQUEST_CREDIT_SHOW_THRESHOLD,
++} from 'common/constants'
+ import {
+   AgentState,
+   ToolResult,
+@@ -33,12 +38,11 @@ import {
+ import { FileVersion, ProjectFileContext } from 'common/util/file'
+ import { APIRealtimeClient } from 'common/websockets/websocket-client'
+ import type { CostMode } from 'common/constants'
+-import { Message } from 'common/types/message'
+ import { setMessages } from './chat-storage'
+ 
+ import { activeBrowserRunner } from './browser-runner'
+ import { checkpointManager, Checkpoint } from './checkpoints/checkpoint-manager'
+-import { backendUrl } from './config'
++import { backendUrl, websiteUrl } from './config'
+ import { userFromJson, CREDENTIALS_PATH } from './credentials'
+ import { calculateFingerprint } from './fingerprint'
+ import { displayGreeting } from './menu'
+@@ -52,6 +56,8 @@ import { GitCommand } from './types'
+ import { Spinner } from './utils/spinner'
+ import { createXMLStreamParser } from './utils/xml-stream-parser'
+ import { toolRenderers } from './utils/tool-renderers'
++import { pluralize } from 'common/util/string'
++import { logger } from './utils/logger'
+ 
+ export class Client {
+   private webSocket: APIRealtimeClient
+@@ -62,20 +68,18 @@ export class Client {
+   public lastChanges: FileChanges = []
+   public agentState: AgentState | undefined
+   public originalFileVersions: Record<string, string | null> = {}
++  public creditsByPromptId: Record<string, number[]> = {}
+ 
+   public user: User | undefined
+   public lastWarnedPct: number = 0
+   public usage: number = 0
+   public limit: number = 0
+   public subscription_active: boolean = false
+-  public lastRequestCredits: number = 0
+-  public sessionCreditsUsed: number = 0
+   public nextQuotaReset: Date | null = null
+   private hadFileChanges: boolean = false
+   private git: GitCommand
+   private rl: readline.Interface
+   private lastToolResults: ToolResult[] = []
+-  private pendingRequestId: string | null = null
+ 
+   constructor(
+     websocketUrl: string,
+@@ -179,7 +183,7 @@ export class Client {
+   async logout() {
+     if (this.user) {
+       try {
+-        const response = await fetch(`${backendUrl}/api/auth/cli/logout`, {
++        const response = await fetch(`${websiteUrl}/api/auth/cli/logout`, {
+           method: 'POST',
+           headers: { 'Content-Type': 'application/json' },
+           body: JSON.stringify({
+@@ -218,7 +222,7 @@ export class Client {
+     }
+ 
+     try {
+-      const response = await fetch(`${backendUrl}/api/auth/cli/code`, {
++      const response = await fetch(`${websiteUrl}/api/auth/cli/code`, {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+         body: JSON.stringify({
+@@ -274,7 +278,7 @@ export class Client {
+ 
+         try {
+           const statusResponse = await fetch(
+-            `${backendUrl}/api/auth/cli/status?fingerprintId=${await this.getFingerprintId()}&fingerprintHash=${fingerprintHash}`
++            `${websiteUrl}/api/auth/cli/status?fingerprintId=${await this.getFingerprintId()}&fingerprintHash=${fingerprintHash}`
+           )
+ 
+           if (!statusResponse.ok) {
+@@ -327,20 +331,11 @@ export class Client {
+     limit,
+     subscription_active,
+     next_quota_reset,
+-    session_credits_used,
+   }: Omit<UsageResponse, 'type'>) {
+     this.usage = usage
+     this.limit = limit
+     this.subscription_active = subscription_active
+     this.nextQuotaReset = next_quota_reset
+-
+-    if (!!session_credits_used && !this.pendingRequestId) {
+-      this.lastRequestCredits = Math.max(
+-        session_credits_used - this.sessionCreditsUsed,
+-        0
+-      )
+-      this.sessionCreditsUsed = session_credits_used
+-    }
+   }
+ 
+   private setupSubscriptions() {
+@@ -372,17 +367,23 @@ export class Client {
+       }
+     })
+ 
++    this.webSocket.subscribe('message-cost-response', (action) => {
++      const parsedAction = MessageCostResponseSchema.safeParse(action)
++      if (!parsedAction.success) return
++      const response = parsedAction.data
++
++      // Store credits used for this prompt
++      if (!this.creditsByPromptId[response.promptId]) {
++        this.creditsByPromptId[response.promptId] = []
++      }
++      this.creditsByPromptId[response.promptId].push(response.credits)
++    })
++
+     this.webSocket.subscribe('usage-response', (action) => {
+       const parsedAction = UsageReponseSchema.safeParse(action)
+       if (!parsedAction.success) return
+-      const a = parsedAction.data
+-      console.log()
+-      console.log(
+-        green(underline(`Codebuff usage:`)),
+-        `${a.usage} / ${a.limit} credits`
+-      )
+-      this.setUsage(a)
+-      this.returnControlToUser()
++
++      this.setUsage(parsedAction.data)
+     })
+   }
+ 
+@@ -459,8 +460,6 @@ export class Client {
+     const userInputId =
+       `mc-input-` + Math.random().toString(36).substring(2, 15)
+ 
+-    this.pendingRequestId = userInputId
+-
+     const { responsePromise, stopResponse } = this.subscribeToResponse(
+       (chunk) => {
+         Spinner.get().stop()
+@@ -492,7 +491,7 @@ export class Client {
+     }
+   }
+ 
+-  subscribeToResponse(
++  private subscribeToResponse(
+     onChunk: (chunk: string) => void,
+     userInputId: string,
+     onStreamStart: () => void,
+@@ -521,8 +520,8 @@ export class Client {
+ 
+     const stopResponse = () => {
+       responseStopped = true
+-      // Only unsubscribe from chunks, keep listening for final credits
+       unsubscribeChunks()
++      unsubscribeComplete()
+ 
+       const assistantMessage = {
+         role: 'assistant' as const,
+@@ -579,21 +578,7 @@ export class Client {
+         if (action.promptId !== userInputId) return
+         const a = parsedAction.data
+ 
+-        // Only process usage data if this is our pending request
+-        const usageData = UsageReponseSchema.omit({ type: true }).safeParse(a)
+-        if (usageData.success) {
+-          this.pendingRequestId = null
+-          this.setUsage(usageData.data)
+-        }
+-        if (responseStopped) {
+-          unsubscribeComplete()
+-          xmlStreamParser.end()
+-          return
+-        }
+-
+         this.agentState = a.agentState
+-
+-        Spinner.get().stop()
+         let isComplete = false
+         const toolResults: ToolResult[] = [...a.toolResults]
+ 
+@@ -605,7 +590,6 @@ export class Client {
+           if (toolCall.name === 'write_file') {
+             // Save lastChanges for `diff` command
+             this.lastChanges.push(FileChangeSchema.parse(toolCall.parameters))
+-
+             this.hadFileChanges = true
+           }
+           if (
+@@ -641,14 +625,20 @@ export class Client {
+         }
+ 
+         this.lastToolResults = toolResults
+-
+         xmlStreamParser.end()
+ 
+         if (this.agentState) {
+           setMessages(this.agentState.messageHistory)
+         }
+ 
+-        this.showUsageWarning()
++        // Show total credits used for this prompt if significant
++        const credits =
++          this.creditsByPromptId[userInputId]?.reduce((a, b) => a + b, 0) ?? 0
++        if (credits >= REQUEST_CREDIT_SHOW_THRESHOLD) {
++          console.log(
++            `\n${pluralize(credits, 'credit')} used for this request.`
++          )
++        }
+ 
+         if (this.hadFileChanges) {
+           const latestCheckpoint = checkpointManager.getLatestCheckpoint()
+@@ -662,6 +652,8 @@ export class Client {
+           this.hadFileChanges = false
+         }
+ 
++        this.showUsageWarning()
++
+         unsubscribeChunks()
+         unsubscribeComplete()
+         resolveResponse({ ...a, wasStoppedByUser: false })
+@@ -675,11 +667,47 @@ export class Client {
+   }
+ 
+   public async getUsage() {
+-    this.webSocket.sendAction({
+-      type: 'usage',
+-      fingerprintId: await this.getFingerprintId(),
+-      authToken: this.user?.authToken,
+-    })
++    try {
++      const response = await fetch(`${backendUrl}/api/usage`, {
++        method: 'POST',
++        headers: {
++          'Content-Type': 'application/json',
++        },
++        body: JSON.stringify({
++          fingerprintId: await this.getFingerprintId(),
++          authToken: this.user?.authToken,
++        }),
++      })
++
++      const data = await response.json()
++
++      // Use zod schema to validate response
++      const parsedResponse = UsageReponseSchema.parse(data)
++
++      if (data.type === 'action-error') {
++        console.error(red(data.message))
++        return
++      }
++
++      this.setUsage(parsedResponse)
++
++      console.log(
++        green(underline(`Codebuff usage:`)),
++        `${parsedResponse.usage} / ${parsedResponse.limit} credits`
++      )
++
++      this.showUsageWarning()
++    } catch (error) {
++      console.log({ error })
++
++      console.error(
++        red(
++          `Error checking usage: Please reach out to ${process.env.NEXT_PUBLIC_SUPPORT_EMAIL} for help.`
++        )
++      )
++    } finally {
++      this.returnControlToUser()
++    }
+   }
+ 
+   public async warmContextCache() {
+@@ -689,6 +717,7 @@ export class Client {
+       const parsedAction = InitResponseSchema.safeParse(a)
+       if (!parsedAction.success) return
+ 
++      // Set initial usage data from the init response
+       this.setUsage(parsedAction.data)
+     })
+ 
+@@ -700,7 +729,7 @@ export class Client {
+         fileContext,
+       })
+       .catch((e) => {
+-        // console.error('Error warming context cache', e)
++        logger.error(e, 'Error sending init action')
+       })
+   }
+ }
+diff --git a/npm-app/src/config.ts b/npm-app/src/config.ts
+index 28847c3ec..44ad2406a 100644
+--- a/npm-app/src/config.ts
++++ b/npm-app/src/config.ts
+@@ -4,4 +4,7 @@ export const websocketUrl = isProduction
+   ? `wss://${process.env.NEXT_PUBLIC_BACKEND_URL}/ws`
+   : `ws://${process.env.NEXT_PUBLIC_BACKEND_URL}/ws`
+ 
+-export const backendUrl = process.env.NEXT_PUBLIC_APP_URL
++export const websiteUrl = process.env.NEXT_PUBLIC_APP_URL
++export const backendUrl = isProduction
++  ? `https://${process.env.NEXT_PUBLIC_BACKEND_URL}`
++  : `http://${process.env.NEXT_PUBLIC_BACKEND_URL}`
+diff --git a/npm-app/src/menu.ts b/npm-app/src/menu.ts
+index f12bb38cb..8ee1bb21a 100644
+--- a/npm-app/src/menu.ts
++++ b/npm-app/src/menu.ts
+@@ -48,7 +48,7 @@ export function displayGreeting(costMode: CostMode, username: string | null) {
+   }
+ 
+   console.log(
+-    `\nWelcome${username ? ` back ${username}` : ''}! What would you like to do? 🍀`
++    `\nWelcome${username ? ` back ${username}` : ''}! What would you like to do?`
+   )
+ }
+ 

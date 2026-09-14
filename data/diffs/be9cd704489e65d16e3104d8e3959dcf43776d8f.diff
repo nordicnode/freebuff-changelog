@@ -1,0 +1,1182 @@
+diff --git a/web/src/app/api/orgs/[orgId]/invitations/[[...email]]/route.ts b/web/src/app/api/orgs/[orgId]/invitations/[[...email]]/route.ts
+new file mode 100644
+index 000000000..9ed2c27a2
+--- /dev/null
++++ b/web/src/app/api/orgs/[orgId]/invitations/[[...email]]/route.ts
+@@ -0,0 +1,377 @@
++import { NextRequest, NextResponse } from 'next/server'
++import { getServerSession } from 'next-auth'
++import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
++import db from 'common/db'
++import * as schema from 'common/db/schema'
++import { eq, and, isNull, inArray } from 'drizzle-orm' // Added inArray
++import { checkOrganizationPermission } from '@/lib/organization-permissions'
++import { sendOrganizationInvitationEmail } from '@codebuff/integrations'
++import { logger } from '@/util/logger'
++import crypto from 'crypto'
++import { env } from '@/env.mjs'
++
++interface RouteParams {
++  params: {
++    orgId: string
++    email?: string[] // e.g., ['user@example.com'] or ['user@example.com', 'resend']
++  }
++}
++
++interface InviteRequest {
++  email: string
++  role: 'admin' | 'member'
++}
++
++// POST handles:
++// 1. Create new invitation (if params.email is undefined)
++// 2. Resend invitation (if params.email is [email, 'resend'])
++export async function POST(request: NextRequest, { params }: RouteParams) {
++  const session = await getServerSession(authOptions)
++  if (!session?.user?.id) {
++    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
++  }
++
++  const { orgId, email: emailParams } = params
++  const action = emailParams?.[1]
++  const specificEmail = emailParams?.[0]
++
++  // Check permissions - only owners and admins can invite/resend
++  const permissionResult = await checkOrganizationPermission(orgId, [
++    'owner',
++    'admin',
++  ])
++  if (!permissionResult.success) {
++    return NextResponse.json(
++      { error: permissionResult.error },
++      { status: permissionResult.status || 500 }
++    )
++  }
++  const { organization } = permissionResult
++
++  // Inviter information (common for create and resend)
++  const inviter = await db
++    .select({ name: schema.user.name })
++    .from(schema.user)
++    .where(eq(schema.user.id, session.user.id))
++    .limit(1)
++  const inviterName = inviter[0]?.name || 'Someone'
++
++  // === RESEND INVITATION LOGIC ===
++  if (action === 'resend' && specificEmail) {
++    try {
++      const existingInvitation = await db
++        .select()
++        .from(schema.orgInvite)
++        .where(
++          and(
++            eq(schema.orgInvite.org_id, orgId),
++            eq(schema.orgInvite.email, specificEmail),
++            isNull(schema.orgInvite.accepted_at)
++          )
++        )
++        .limit(1)
++
++      if (existingInvitation.length === 0) {
++        return NextResponse.json(
++          { error: 'No pending invitation found for this email to resend' },
++          { status: 404 }
++        )
++      }
++      const inviteRecord = existingInvitation[0]
++      const newExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
++
++      await db
++        .update(schema.orgInvite)
++        .set({ expires_at: newExpiresAt })
++        .where(eq(schema.orgInvite.id, inviteRecord.id))
++
++      const invitationUrl = `${env.NEXT_PUBLIC_APP_URL}/invites/${inviteRecord.token}` // Replaced request.nextUrl.origin
++      const emailResult = await sendOrganizationInvitationEmail({
++        email: inviteRecord.email,
++        organizationName: organization!.name,
++        inviterName, // Using fetched inviterName
++        invitationUrl,
++        role: inviteRecord.role,
++      })
++
++      if (!emailResult.success) {
++        return NextResponse.json(
++          { error: 'Failed to resend invitation email' },
++          { status: 500 }
++        )
++      }
++      logger.info(
++        {
++          organizationId: orgId,
++          invitedEmail: specificEmail,
++          resentBy: session.user.id,
++          newExpiresAt,
++        },
++        'Organization invitation resent successfully'
++      )
++      return NextResponse.json({
++        success: true,
++        message: 'Invitation resent successfully',
++        expires_at: newExpiresAt.toISOString(),
++      })
++    } catch (error) {
++      logger.error(
++        { organizationId: orgId, email: specificEmail, error },
++        'Error resending organization invitation'
++      )
++      return NextResponse.json(
++        { error: 'Internal server error during resend' },
++        { status: 500 }
++      )
++    }
++  }
++  // === CREATE NEW INVITATION LOGIC ===
++  else if (!emailParams || emailParams.length === 0) {
++    try {
++      const body: InviteRequest = await request.json()
++      if (!body.email || !body.role) {
++        return NextResponse.json(
++          { error: 'Email and role are required for new invitation' },
++          { status: 400 }
++        )
++      }
++      if (!['admin', 'member'].includes(body.role)) {
++        return NextResponse.json(
++          { error: 'Role must be admin or member' },
++          { status: 400 }
++        )
++      }
++
++      const existingMember = await db
++        .select()
++        .from(schema.orgMember)
++        .innerJoin(schema.user, eq(schema.orgMember.user_id, schema.user.id))
++        .where(
++          and(
++            eq(schema.orgMember.org_id, orgId),
++            eq(schema.user.email, body.email)
++          )
++        )
++        .limit(1)
++      if (existingMember.length > 0) {
++        return NextResponse.json(
++          { error: 'User is already a member of this organization' },
++          { status: 409 }
++        )
++      }
++
++      const existingInvitation = await db
++        .select()
++        .from(schema.orgInvite)
++        .where(
++          and(
++            eq(schema.orgInvite.org_id, orgId),
++            eq(schema.orgInvite.email, body.email),
++            isNull(schema.orgInvite.accepted_at)
++          )
++        )
++        .limit(1)
++      if (existingInvitation.length > 0) {
++        return NextResponse.json(
++          { error: 'Invitation already sent to this email' },
++          { status: 409 }
++        )
++      }
++
++      const token = crypto.randomBytes(32).toString('hex')
++      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
++
++      const [invitation] = await db
++        .insert(schema.orgInvite)
++        .values({
++          org_id: orgId,
++          email: body.email,
++          role: body.role,
++          token,
++          invited_by: session.user.id,
++          expires_at: expiresAt,
++        })
++        .returning()
++
++      const invitationUrl = `${env.NEXT_PUBLIC_APP_URL}/invites/${token}` // Replaced request.nextUrl.origin
++      const emailResult = await sendOrganizationInvitationEmail({
++        email: body.email,
++        organizationName: organization!.name,
++        inviterName, // Using fetched inviterName
++        invitationUrl,
++        role: body.role,
++      })
++
++      if (!emailResult.success) {
++        await db
++          .delete(schema.orgInvite)
++          .where(eq(schema.orgInvite.id, invitation.id))
++        return NextResponse.json(
++          { error: 'Failed to send invitation email' },
++          { status: 500 }
++        )
++      }
++      logger.info(
++        {
++          organizationId: orgId,
++          invitedEmail: body.email,
++          invitedBy: session.user.id,
++          role: body.role,
++        },
++        'Organization invitation sent successfully'
++      )
++      return NextResponse.json({
++        success: true,
++        invitation: {
++          id: invitation.id,
++          email: invitation.email,
++          role: invitation.role,
++          expires_at: invitation.expires_at.toISOString(),
++        },
++      })
++    } catch (error) {
++      logger.error(
++        { organizationId: orgId, error },
++        'Error sending organization invitation'
++      )
++      return NextResponse.json(
++        { error: 'Internal server error during create' },
++        { status: 500 }
++      )
++    }
++  }
++  // Fallback for invalid POST requests to /invitations/*
++  return NextResponse.json(
++    { error: 'Invalid request path for POST' },
++    { status: 404 }
++  )
++}
++
++// GET handles:
++// 1. List invitations (if params.email is undefined)
++export async function GET(request: NextRequest, { params }: RouteParams) {
++  const session = await getServerSession(authOptions)
++  if (!session?.user?.id) {
++    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
++  }
++
++  const { orgId, email: emailParams } = params
++
++  // Check permissions - only members can view invitations
++  const permissionResult = await checkOrganizationPermission(orgId, 'member')
++  if (!permissionResult.success) {
++    return NextResponse.json(
++      { error: permissionResult.error },
++      { status: permissionResult.status || 500 }
++    )
++  }
++
++  // === LIST INVITATIONS LOGIC ===
++  if (!emailParams || emailParams.length === 0) {
++    try {
++      const invitations = await db
++        .select({
++          id: schema.orgInvite.id,
++          email: schema.orgInvite.email,
++          role: schema.orgInvite.role,
++          invited_by_name: schema.user.name,
++          created_at: schema.orgInvite.created_at,
++          expires_at: schema.orgInvite.expires_at,
++        })
++        .from(schema.orgInvite)
++        .innerJoin(schema.user, eq(schema.orgInvite.invited_by, schema.user.id))
++        .where(
++          and(
++            eq(schema.orgInvite.org_id, orgId),
++            isNull(schema.orgInvite.accepted_at)
++          )
++        )
++        .orderBy(schema.orgInvite.created_at)
++      return NextResponse.json({ invitations })
++    } catch (error) {
++      logger.error(
++        { organizationId: orgId, error },
++        'Error fetching organization invitations'
++      )
++      return NextResponse.json(
++        { error: 'Internal server error during list' },
++        { status: 500 }
++      )
++    }
++  }
++  // Fallback for invalid GET requests to /invitations/*
++  return NextResponse.json(
++    { error: 'Invalid request path for GET' },
++    { status: 404 }
++  )
++}
++
++// DELETE handles:
++// 1. Cancel/delete invitation (if params.email is [email])
++export async function DELETE(request: NextRequest, { params }: RouteParams) {
++  const session = await getServerSession(authOptions)
++  if (!session?.user?.id) {
++    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
++  }
++
++  const { orgId, email: emailParams } = params
++  const specificEmail = emailParams?.[0]
++
++  // Check permissions - only owners and admins can cancel invitations
++  const permissionResult = await checkOrganizationPermission(orgId, [
++    'owner',
++    'admin',
++  ])
++  if (!permissionResult.success) {
++    return NextResponse.json(
++      { error: permissionResult.error },
++      { status: permissionResult.status || 500 }
++    )
++  }
++
++  // === CANCEL INVITATION LOGIC ===
++  if (specificEmail && emailParams?.length === 1) {
++    try {
++      const deletedInvitations = await db
++        .delete(schema.orgInvite)
++        .where(
++          and(
++            eq(schema.orgInvite.org_id, orgId),
++            eq(schema.orgInvite.email, specificEmail),
++            isNull(schema.orgInvite.accepted_at)
++          )
++        )
++        .returning()
++
++      if (deletedInvitations.length === 0) {
++        return NextResponse.json(
++          { error: 'No pending invitation found for this email to delete' },
++          { status: 404 }
++        )
++      }
++      logger.info(
++        {
++          organizationId: orgId,
++          cancelledEmail: specificEmail,
++          cancelledBy: session.user.id,
++        },
++        'Organization invitation cancelled'
++      )
++      return NextResponse.json({ success: true })
++    } catch (error) {
++      logger.error(
++        { organizationId: orgId, email: specificEmail, error },
++        'Error cancelling organization invitation'
++      )
++      return NextResponse.json(
++        { error: 'Internal server error during delete' },
++        { status: 500 }
++      )
++    }
++  }
++  // Fallback for invalid DELETE requests to /invitations/*
++  return NextResponse.json(
++    { error: 'Invalid request path for DELETE' },
++    { status: 404 }
++  )
++}
+diff --git a/web/src/app/api/orgs/[orgId]/invitations/[email]/resend/route.ts b/web/src/app/api/orgs/[orgId]/invitations/[email]/resend/route.ts
+deleted file mode 100644
+index c4894b57c..000000000
+--- a/web/src/app/api/orgs/[orgId]/invitations/[email]/resend/route.ts
++++ /dev/null
+@@ -1,118 +0,0 @@
+-import { NextRequest, NextResponse } from 'next/server'
+-import { getServerSession } from 'next-auth'
+-import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
+-import db from 'common/db'
+-import * as schema from 'common/db/schema'
+-import { eq, and, isNull } from 'drizzle-orm'
+-import { checkOrganizationPermission } from '@/lib/organization-permissions'
+-import { sendOrganizationInvitationEmail } from '@codebuff/integrations' // Updated import
+-import { logger } from '@/util/logger'
+-
+-interface RouteParams {
+-  params: { orgId: string; email: string }
+-}
+-
+-export async function POST(request: NextRequest, { params }: RouteParams) {
+-  try {
+-    const session = await getServerSession(authOptions)
+-    if (!session?.user?.id) {
+-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+-    }
+-
+-    const { orgId, email } = params
+-
+-    // Check permissions - only owners and admins can resend invitations
+-    const permissionResult = await checkOrganizationPermission(orgId, [
+-      'owner',
+-      'admin',
+-    ])
+-    if (!permissionResult.success) {
+-      return NextResponse.json(
+-        { error: permissionResult.error },
+-        { status: permissionResult.status || 500 }
+-      )
+-    }
+-
+-    const { organization } = permissionResult
+-
+-    // Find the pending invitation
+-    const invitation = await db
+-      .select()
+-      .from(schema.orgInvite)
+-      .where(
+-        and(
+-          eq(schema.orgInvite.org_id, orgId),
+-          eq(schema.orgInvite.email, email),
+-          isNull(schema.orgInvite.accepted_at)
+-        )
+-      )
+-      .limit(1)
+-
+-    if (invitation.length === 0) {
+-      return NextResponse.json(
+-        { error: 'No pending invitation found for this email' },
+-        { status: 404 }
+-      )
+-    }
+-
+-    const inviteRecord = invitation[0]
+-
+-    // Extend expiration date by 7 days from now
+-    const newExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+-
+-    // Update the invitation with new expiration date
+-    await db
+-      .update(schema.orgInvite)
+-      .set({ expires_at: newExpiresAt })
+-      .where(eq(schema.orgInvite.id, inviteRecord.id))
+-
+-    // Get inviter information
+-    const inviter = await db
+-      .select({ name: schema.user.name })
+-      .from(schema.user)
+-      .where(eq(schema.user.id, session.user.id))
+-      .limit(1)
+-
+-    // Send invitation email
+-    const invitationUrl = `${request.nextUrl.origin}/invites/${inviteRecord.token}`
+-    const emailResult = await sendOrganizationInvitationEmail({
+-      email: inviteRecord.email,
+-      organizationName: organization!.name,
+-      inviterName: inviter[0]?.name || 'A teammate',
+-      invitationUrl,
+-      role: inviteRecord.role,
+-    })
+-
+-    if (!emailResult.success) {
+-      return NextResponse.json(
+-        { error: 'Failed to resend invitation email' },
+-        { status: 500 }
+-      )
+-    }
+-
+-    logger.info(
+-      {
+-        organizationId: orgId,
+-        invitedEmail: email,
+-        resentBy: session.user.id,
+-        newExpiresAt,
+-      },
+-      'Organization invitation resent successfully'
+-    )
+-
+-    return NextResponse.json({
+-      success: true,
+-      message: 'Invitation resent successfully',
+-      expires_at: newExpiresAt.toISOString(),
+-    })
+-  } catch (error) {
+-    logger.error(
+-      { organizationId: params.orgId, email: params.email, error },
+-      'Error resending organization invitation'
+-    )
+-    return NextResponse.json(
+-      { error: 'Internal server error' },
+-      { status: 500 }
+-    )
+-  }
+-}
+diff --git a/web/src/app/api/orgs/[orgId]/invitations/[email]/route.ts b/web/src/app/api/orgs/[orgId]/invitations/[email]/route.ts
+deleted file mode 100644
+index 3cf8898ce..000000000
+--- a/web/src/app/api/orgs/[orgId]/invitations/[email]/route.ts
++++ /dev/null
+@@ -1,74 +0,0 @@
+-import { NextRequest, NextResponse } from 'next/server'
+-import { getServerSession } from 'next-auth'
+-import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
+-import db from 'common/db'
+-import * as schema from 'common/db/schema'
+-import { eq, and, isNull } from 'drizzle-orm'
+-import { checkOrganizationPermission } from '@/lib/organization-permissions'
+-import { logger } from '@/util/logger'
+-
+-interface RouteParams {
+-  params: { orgId: string; email: string }
+-}
+-
+-export async function DELETE(request: NextRequest, { params }: RouteParams) {
+-  try {
+-    const session = await getServerSession(authOptions)
+-    if (!session?.user?.id) {
+-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+-    }
+-
+-    const { orgId, email } = params
+-
+-    // Check permissions - only owners and admins can cancel invitations
+-    const permissionResult = await checkOrganizationPermission(orgId, [
+-      'owner',
+-      'admin',
+-    ])
+-    if (!permissionResult.success) {
+-      return NextResponse.json(
+-        { error: permissionResult.error },
+-        { status: permissionResult.status || 500 }
+-      )
+-    }
+-
+-    // Find and delete the pending invitation
+-    const deletedInvitations = await db
+-      .delete(schema.orgInvite)
+-      .where(
+-        and(
+-          eq(schema.orgInvite.org_id, orgId),
+-          eq(schema.orgInvite.email, email),
+-          isNull(schema.orgInvite.accepted_at)
+-        )
+-      )
+-      .returning()
+-
+-    if (deletedInvitations.length === 0) {
+-      return NextResponse.json(
+-        { error: 'No pending invitation found for this email' },
+-        { status: 404 }
+-      )
+-    }
+-
+-    logger.info(
+-      {
+-        organizationId: orgId,
+-        cancelledEmail: email,
+-        cancelledBy: session.user.id,
+-      },
+-      'Organization invitation cancelled'
+-    )
+-
+-    return NextResponse.json({ success: true })
+-  } catch (error) {
+-    logger.error(
+-      { organizationId: params.orgId, email: params.email, error },
+-      'Error cancelling organization invitation'
+-    )
+-    return NextResponse.json(
+-      { error: 'Internal server error' },
+-      { status: 500 }
+-    )
+-  }
+-}
+diff --git a/web/src/app/api/orgs/[orgId]/invitations/bulk/route.ts b/web/src/app/api/orgs/[orgId]/invitations/bulk/route.ts
+index e1310f7ea..1171af5f6 100644
+--- a/web/src/app/api/orgs/[orgId]/invitations/bulk/route.ts
++++ b/web/src/app/api/orgs/[orgId]/invitations/bulk/route.ts
+@@ -8,6 +8,7 @@ import { checkOrganizationPermission } from '@/lib/organization-permissions'
+ import { sendOrganizationInvitationEmail } from '@codebuff/integrations' // Updated import
+ import { logger } from '@/util/logger'
+ import crypto from 'crypto'
++import { env } from '@/env.mjs'; // Added import
+ 
+ interface RouteParams {
+   params: { orgId: string }
+@@ -183,10 +184,8 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
+           })
+           .returning()
+ 
+-
+-
+         // Send invitation email
+-        const invitationUrl = `${request.nextUrl.origin}/invites/${token}`
++        const invitationUrl = `${env.NEXT_PUBLIC_APP_URL}/invites/${token}` // Replaced request.nextUrl.origin
+         const emailResult = await sendOrganizationInvitationEmail({
+           email: invitation.email,
+           organizationName: organization!.name,
+diff --git a/web/src/app/api/orgs/[orgId]/invitations/route.ts b/web/src/app/api/orgs/[orgId]/invitations/route.ts
+deleted file mode 100644
+index e1c9e86f3..000000000
+--- a/web/src/app/api/orgs/[orgId]/invitations/route.ts
++++ /dev/null
+@@ -1,227 +0,0 @@
+-import { NextRequest, NextResponse } from 'next/server'
+-import { getServerSession } from 'next-auth'
+-import { authOptions } from '@/app/api/auth/[...nextauth]/auth-options'
+-import db from 'common/db'
+-import * as schema from 'common/db/schema'
+-import { eq, and, isNull } from 'drizzle-orm'
+-import { checkOrganizationPermission } from '@/lib/organization-permissions'
+-import { sendOrganizationInvitationEmail } from '@codebuff/integrations'
+-import { logger } from '@/util/logger'
+-import crypto from 'crypto'
+-
+-interface RouteParams {
+-  params: { orgId: string }
+-}
+-
+-interface InviteRequest {
+-  email: string
+-  role: 'admin' | 'member'
+-  // Removed firstName, as we will fetch it from the DB or default it
+-}
+-
+-export async function POST(request: NextRequest, { params }: RouteParams) {
+-  try {
+-    const session = await getServerSession(authOptions)
+-    if (!session?.user?.id) {
+-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+-    }
+-
+-    const { orgId } = params
+-    const body: InviteRequest = await request.json()
+-
+-    // Validate input
+-    if (!body.email || !body.role) {
+-      return NextResponse.json(
+-        { error: 'Email and role are required' },
+-        { status: 400 }
+-      )
+-    }
+-
+-    if (!['admin', 'member'].includes(body.role)) {
+-      return NextResponse.json(
+-        { error: 'Role must be admin or member' },
+-        { status: 400 }
+-      )
+-    }
+-
+-    // Check permissions - only owners and admins can invite
+-    const permissionResult = await checkOrganizationPermission(orgId, [
+-      'owner',
+-      'admin',
+-    ])
+-    if (!permissionResult.success) {
+-      return NextResponse.json(
+-        { error: permissionResult.error },
+-        { status: permissionResult.status || 500 }
+-      )
+-    }
+-
+-    const { organization } = permissionResult
+-
+-    // Check if user is already a member
+-    const existingMember = await db
+-      .select()
+-      .from(schema.orgMember)
+-      .innerJoin(schema.user, eq(schema.orgMember.user_id, schema.user.id))
+-      .where(
+-        and(
+-          eq(schema.orgMember.org_id, orgId),
+-          eq(schema.user.email, body.email)
+-        )
+-      )
+-      .limit(1)
+-
+-    if (existingMember.length > 0) {
+-      return NextResponse.json(
+-        { error: 'User is already a member of this organization' },
+-        { status: 409 }
+-      )
+-    }
+-
+-    // Check if there's already a pending invitation
+-    const existingInvitation = await db
+-      .select()
+-      .from(schema.orgInvite)
+-      .where(
+-        and(
+-          eq(schema.orgInvite.org_id, orgId),
+-          eq(schema.orgInvite.email, body.email),
+-          isNull(schema.orgInvite.accepted_at)
+-        )
+-      )
+-      .limit(1)
+-
+-    if (existingInvitation.length > 0) {
+-      return NextResponse.json(
+-        { error: 'Invitation already sent to this email' },
+-        { status: 409 }
+-      )
+-    }
+-
+-    // Generate secure invitation token
+-    const token = crypto.randomBytes(32).toString('hex')
+-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
+-
+-    // Create invitation record
+-    const [invitation] = await db
+-      .insert(schema.orgInvite)
+-      .values({
+-        org_id: orgId,
+-        email: body.email,
+-        role: body.role,
+-        token,
+-        invited_by: session.user.id,
+-        expires_at: expiresAt,
+-      })
+-      .returning()
+-
+-    // Get inviter information
+-    const inviter = await db
+-      .select({ name: schema.user.name })
+-      .from(schema.user)
+-      .where(eq(schema.user.id, session.user.id))
+-      .limit(1)
+-
+-    // Send invitation email
+-    const invitationUrl = `${request.nextUrl.origin}/invites/${token}`
+-    const emailResult = await sendOrganizationInvitationEmail({
+-      email: body.email,
+-      organizationName: organization!.name,
+-      inviterName: inviter[0]?.name || 'Someone',
+-      invitationUrl,
+-      role: body.role,
+-    })
+-
+-    if (!emailResult.success) {
+-      // Delete the invitation if email failed
+-      await db
+-        .delete(schema.orgInvite)
+-        .where(eq(schema.orgInvite.id, invitation.id))
+-
+-      return NextResponse.json(
+-        { error: 'Failed to send invitation email' },
+-        { status: 500 }
+-      )
+-    }
+-
+-    logger.info(
+-      {
+-        organizationId: orgId,
+-        invitedEmail: body.email,
+-        invitedBy: session.user.id,
+-        role: body.role,
+-      },
+-      'Organization invitation sent successfully'
+-    )
+-
+-    return NextResponse.json({
+-      success: true,
+-      invitation: {
+-        id: invitation.id,
+-        email: invitation.email,
+-        role: invitation.role,
+-        expires_at: invitation.expires_at.toISOString(),
+-      },
+-    })
+-  } catch (error) {
+-    logger.error(
+-      { organizationId: params.orgId, error },
+-      'Error sending organization invitation'
+-    )
+-    return NextResponse.json(
+-      { error: 'Internal server error' },
+-      { status: 500 }
+-    )
+-  }
+-}
+-
+-export async function GET(request: NextRequest, { params }: RouteParams) {
+-  try {
+-    const session = await getServerSession(authOptions)
+-    if (!session?.user?.id) {
+-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+-    }
+-
+-    const { orgId } = params
+-
+-    // Check permissions - only members can view invitations
+-    const permissionResult = await checkOrganizationPermission(orgId, 'member')
+-    if (!permissionResult.success) {
+-      return NextResponse.json(
+-        { error: permissionResult.error },
+-        { status: permissionResult.status || 500 }
+-      )
+-    }
+-
+-    // Get pending invitations
+-    const invitations = await db
+-      .select({
+-        id: schema.orgInvite.id,
+-        email: schema.orgInvite.email,
+-        role: schema.orgInvite.role,
+-        invited_by_name: schema.user.name,
+-        created_at: schema.orgInvite.created_at,
+-        expires_at: schema.orgInvite.expires_at,
+-      })
+-      .from(schema.orgInvite)
+-      .innerJoin(schema.user, eq(schema.orgInvite.invited_by, schema.user.id))
+-      .where(
+-        and(
+-          eq(schema.orgInvite.org_id, orgId),
+-          isNull(schema.orgInvite.accepted_at)
+-        )
+-      )
+-      .orderBy(schema.orgInvite.created_at)
+-
+-    return NextResponse.json({ invitations })
+-  } catch (error) {
+-    logger.error(
+-      { organizationId: params.orgId, error },
+-      'Error fetching organization invitations'
+-    )
+-    return NextResponse.json(
+-      { error: 'Internal server error' },
+-      { status: 500 }
+-    )
+-  }
+-}
+diff --git a/web/src/app/api/orgs/[orgId]/monitoring/route.ts b/web/src/app/api/orgs/[orgId]/monitoring/route.ts
+index 445671368..6b0bb76ef 100644
+--- a/web/src/app/api/orgs/[orgId]/monitoring/route.ts
++++ b/web/src/app/api/orgs/[orgId]/monitoring/route.ts
+@@ -5,6 +5,7 @@ import db from 'common/db'
+ import * as schema from 'common/db/schema'
+ import { eq, and, gte, sql } from 'drizzle-orm'
+ import { calculateOrganizationUsageAndBalance } from '@codebuff/billing'
++import { env } from '@/env.mjs';
+ 
+ interface RouteParams {
+   params: { orgId: string }
+@@ -127,7 +128,7 @@ export async function GET(
+     const daysRemaining = dailyBurnRate > 0 ? Math.floor(currentBalance / dailyBurnRate) : 999
+ 
+     // Get alerts count
+-    const alertsResponse = await fetch(`${request.nextUrl.origin}/api/orgs/${orgId}/alerts`, {
++    const alertsResponse = await fetch(`${env.NEXT_PUBLIC_APP_URL}/api/orgs/${orgId}/alerts`, {
+       headers: {
+         'Cookie': request.headers.get('Cookie') || ''
+       }
+diff --git a/web/src/app/invites/[token]/page.tsx b/web/src/app/invites/[token]/page.tsx
+index 01f893c43..7af806b57 100644
+--- a/web/src/app/invites/[token]/page.tsx
++++ b/web/src/app/invites/[token]/page.tsx
+@@ -85,14 +85,14 @@ export default function InvitationPage({ params }: PageProps) {
+ 
+   if (loading) {
+     return (
+-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+-        <Card className="w-full max-w-md">
++      <div className="min-h-screen flex items-center justify-center bg-black text-white">
++        <Card className="w-full max-w-md bg-gray-900 border border-gray-700 shadow-xl">
+           <CardHeader>
+-            <Skeleton className="h-6 w-3/4" />
+-            <Skeleton className="h-4 w-full" />
++            <Skeleton className="h-6 w-3/4 bg-gray-700" />
++            <Skeleton className="h-4 w-full bg-gray-700" />
+           </CardHeader>
+           <CardContent>
+-            <Skeleton className="h-10 w-full" />
++            <Skeleton className="h-10 w-full bg-gray-700" />
+           </CardContent>
+         </Card>
+       </div>
+@@ -101,20 +101,20 @@ export default function InvitationPage({ params }: PageProps) {
+ 
+   if (error) {
+     return (
+-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+-        <Card className="w-full max-w-md">
++      <div className="min-h-screen flex items-center justify-center bg-black text-white">
++        <Card className="w-full max-w-md bg-gray-900 border border-red-500 shadow-xl">
+           <CardHeader>
+             <div className="flex items-center gap-2">
+-              <XCircle className="h-5 w-5 text-red-500" />
+-              <CardTitle>Invalid Invitation</CardTitle>
++              <XCircle className="h-5 w-5 text-red-400" />
++              <CardTitle className="text-red-400">Invalid Invitation</CardTitle>
+             </div>
+-            <CardDescription>{error}</CardDescription>
++            <CardDescription className="text-gray-400">{error}</CardDescription>
+           </CardHeader>
+           <CardContent>
+             <Button 
+               onClick={() => router.push('/')} 
+               variant="outline" 
+-              className="w-full"
++              className="w-full border-gray-600 hover:bg-gray-700 text-white"
+             >
+               Go to Homepage
+             </Button>
+@@ -126,14 +126,14 @@ export default function InvitationPage({ params }: PageProps) {
+ 
+   if (success) {
+     return (
+-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+-        <Card className="w-full max-w-md">
++      <div className="min-h-screen flex items-center justify-center bg-black text-white">
++        <Card className="w-full max-w-md bg-gray-900 border border-green-500 shadow-xl">
+           <CardHeader>
+             <div className="flex items-center gap-2">
+-              <CheckCircle className="h-5 w-5 text-green-500" />
+-              <CardTitle>Welcome to {invitation?.organization_name}!</CardTitle>
++              <CheckCircle className="h-5 w-5 text-green-400" />
++              <CardTitle className="text-green-400">Welcome to {invitation?.organization_name}!</CardTitle>
+             </div>
+-            <CardDescription>
++            <CardDescription className="text-gray-400">
+               You've successfully joined the organization. Redirecting...
+             </CardDescription>
+           </CardHeader>
+@@ -149,29 +149,29 @@ export default function InvitationPage({ params }: PageProps) {
+   const isExpired = new Date(invitation.expires_at) < new Date()
+ 
+   return (
+-    <div className="min-h-screen flex items-center justify-center bg-gray-50">
+-      <Card className="w-full max-w-md">
++    <div className="min-h-screen flex items-center justify-center bg-black text-white relative overflow-hidden">
++      <Card className="w-full max-w-md bg-gray-900 border border-gray-700 shadow-xl z-10">
+         <CardHeader>
+           <div className="flex items-center gap-2">
+-            <Users className="h-5 w-5 text-blue-500" />
++            <Users className="h-5 w-5 text-blue-400" />
+             <CardTitle>Organization Invitation</CardTitle>
+           </div>
+-          <CardDescription>
++          <CardDescription className="text-gray-400">
+             {invitation.inviter_name} has invited you to join {invitation.organization_name}
+           </CardDescription>
+         </CardHeader>
+         <CardContent className="space-y-4">
+           <div className="space-y-2">
+-            <div className="text-sm text-gray-600">
++            <div className="text-sm text-gray-300">
+               <strong>Organization:</strong> {invitation.organization_name}
+             </div>
+-            <div className="text-sm text-gray-600">
++            <div className="text-sm text-gray-300">
+               <strong>Role:</strong> {invitation.role}
+             </div>
+-            <div className="text-sm text-gray-600">
++            <div className="text-sm text-gray-300">
+               <strong>Email:</strong> {invitation.email}
+             </div>
+-            <div className="flex items-center gap-2 text-sm text-gray-600">
++            <div className="flex items-center gap-2 text-sm text-gray-300">
+               <Clock className="h-4 w-4" />
+               <span>
+                 Expires: {new Date(invitation.expires_at).toLocaleDateString()}
+@@ -181,11 +181,11 @@ export default function InvitationPage({ params }: PageProps) {
+ 
+           {isExpired ? (
+             <div className="text-center">
+-              <p className="text-red-600 mb-4">This invitation has expired.</p>
++              <p className="text-red-400 mb-4">This invitation has expired.</p>
+               <Button 
+                 onClick={() => router.push('/')} 
+                 variant="outline" 
+-                className="w-full"
++                className="w-full border-gray-600 hover:bg-gray-700 text-white"
+               >
+                 Go to Homepage
+               </Button>
+@@ -193,28 +193,28 @@ export default function InvitationPage({ params }: PageProps) {
+           ) : (
+             <div className="space-y-3">
+               {status === 'loading' ? (
+-                <Skeleton className="h-10 w-full" />
++                <Skeleton className="h-10 w-full bg-gray-700" />
+               ) : !session ? (
+                 <div className="text-center">
+-                  <p className="text-gray-600 mb-4">
++                  <p className="text-gray-400 mb-4">
+                     Please sign in to accept this invitation.
+                   </p>
+                   <Button 
+                     onClick={() => router.push(`/login?callbackUrl=${encodeURIComponent(window.location.href)}`)}
+-                    className="w-full"
++                    className="w-full bg-blue-600 hover:bg-blue-700 text-white"
+                   >
+                     Sign In to Accept
+                   </Button>
+                 </div>
+               ) : session.user?.email !== invitation.email ? (
+                 <div className="text-center">
+-                  <p className="text-red-600 mb-4">
++                  <p className="text-red-400 mb-4">
+                     This invitation is for {invitation.email}, but you're signed in as {session.user?.email}.
+                   </p>
+                   <Button 
+                     onClick={() => router.push('/login')}
+                     variant="outline" 
+-                    className="w-full"
++                    className="w-full border-gray-600 hover:bg-gray-700 text-white"
+                   >
+                     Sign in with correct account
+                   </Button>
+@@ -223,7 +223,7 @@ export default function InvitationPage({ params }: PageProps) {
+                 <Button 
+                   onClick={acceptInvitation}
+                   disabled={accepting}
+-                  className="w-full"
++                  className="w-full bg-green-600 hover:bg-green-700 text-white"
+                 >
+                   {accepting ? 'Accepting...' : 'Accept Invitation'}
+                 </Button>
+diff --git a/web/src/components/organization/team-management.tsx b/web/src/components/organization/team-management.tsx
+index 08b3037d7..28bf13882 100644
+--- a/web/src/components/organization/team-management.tsx
++++ b/web/src/components/organization/team-management.tsx
+@@ -22,6 +22,7 @@ import {
+   DialogHeader,
+   DialogTitle,
+   DialogTrigger,
++  DialogClose,
+ } from '@/components/ui/dialog'
+ import {
+   DropdownMenu,
+@@ -96,6 +97,8 @@ export function TeamManagement({
+     new Set()
+   )
+   const [refreshing, setRefreshing] = useState(false)
++  const [confirmResendDialogOpen, setConfirmResendDialogOpen] = useState(false);
++  const [currentInvitationToResend, setCurrentInvitationToResend] = useState<Invitation | null>(null);
+ 
+   const canManageTeam = userRole === 'owner' || userRole === 'admin'
+   const isMobile = useIsMobile()
+@@ -342,7 +345,66 @@ export function TeamManagement({
+     }
+   }
+ 
++  const handleInitiateResend = (invitation: Invitation) => {
++    setCurrentInvitationToResend(invitation);
++    setConfirmResendDialogOpen(true);
++  };
++
++  const handleConfirmResend = async () => {
++    if (!currentInvitationToResend) return;
++
++    const email = currentInvitationToResend.email;
++    setResendingInvites((prev) => new Set(prev).add(email));
++    setConfirmResendDialogOpen(false); // Close dialog
++
++    try {
++      const response = await fetch(
++        `/api/orgs/${organizationId}/invitations/${encodeURIComponent(email)}/resend`,
++        {
++          method: 'POST',
++        }
++      )
++
++      const data = await response.json()
++
++      if (!response.ok) {
++        throw new Error(data.error || 'Failed to resend invitation')
++      }
++
++      toast({
++        title: 'Success',
++        description: `Invitation resent to ${email}`,
++      })
++
++      fetchTeamData(false) // Refresh without showing skeleton
++    } catch (error) {
++      toast({
++        title: 'Error',
++        description:
++          error instanceof Error
++            ? error.message
++            : 'Failed to resend invitation',
++        variant: 'destructive',
++      })
++    } finally {
++      setResendingInvites((prev) => {
++        const newSet = new Set(prev)
++        newSet.delete(email)
++        return newSet
++      })
++      setCurrentInvitationToResend(null);
++    }
++  }
++
+   const handleCancelInvitation = async (email: string) => {
++    if (
++      !confirm(
++        `Are you sure you want to remove ${email} from the organization?`
++      )
++    ) {
++      return
++    }
++
+     try {
+       const response = await fetch(
+         `/api/orgs/${organizationId}/invitations/${encodeURIComponent(email)}`,
+@@ -864,20 +926,23 @@ export function TeamManagement({
+                       {canManageTeam && (
+                         <div className="flex items-center space-x-1">
+                           <Button
+-                            variant="ghost"
++                            variant="outline" // Changed variant for better visibility
+                             size="sm"
+-                            onClick={() =>
+-                              handleResendInvitation(invitation.email)
+-                            }
+-                            disabled={isResending}
++                            onClick={() => handleInitiateResend(invitation)} // Changed to initiate dialog
++                            disabled={isResending || isExpired} // Disable if expired
+                             title="Resend invitation"
+-                            className={
+-                              isMobile ? 'h-10 w-10 p-0' : 'h-8 w-8 p-0'
+-                            }
++                            className={cn(
++                              isMobile ? 'px-2 py-1 text-xs' : 'text-xs', // Adjusted padding/text for mobile
++                              isExpired && 'opacity-50 cursor-not-allowed'
++                            )}
+                           >
+                             <RefreshCw
+-                              className={`h-4 w-4 ${isResending ? 'animate-spin' : ''}`}
++                              className={cn(
++                                'mr-1 h-3 w-3 sm:h-4 sm:w-4', // Adjusted icon size and margin
++                                isResending ? 'animate-spin' : ''
++                              )}
+                             />
++                            {isResending ? 'Resending...' : 'Resend Invite'}
+                           </Button>
+                           <Button
+                             variant="ghost"
+@@ -902,6 +967,29 @@ export function TeamManagement({
+           </CardContent>
+         </Card>
+       )}
++
++      {/* Confirmation Dialog for Resend */}
++      <Dialog open={confirmResendDialogOpen} onOpenChange={setConfirmResendDialogOpen}>
++        <DialogContent>
++          <DialogHeader>
++            <DialogTitle>Confirm Resend Invitation</DialogTitle>
++            <DialogDescription>
++              Are you sure you want to resend the invitation to{' '}
++              <strong>{currentInvitationToResend?.email}</strong>?
++            </DialogDescription>
++          </DialogHeader>
++          <DialogFooter className="gap-2 sm:gap-0">
++            <DialogClose asChild>
++              <Button variant="destructive" onClick={() => setCurrentInvitationToResend(null)}>
++                Cancel
++              </Button>
++            </DialogClose>
++            <Button onClick={handleConfirmResend} disabled={resendingInvites.has(currentInvitationToResend?.email || '')}>
++              {resendingInvites.has(currentInvitationToResend?.email || '') ? 'Resending...' : 'Confirm Resend'}
++            </Button>
++          </DialogFooter>
++        </DialogContent>
++      </Dialog>
+     </div>
+   )
+ }

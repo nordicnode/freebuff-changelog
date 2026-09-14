@@ -1,0 +1,212 @@
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index 653041cb3..bb81df67b 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -339,25 +339,23 @@ export async function mainPrompt(
+         'Thinking deeply'
+       )
+ 
+-      const plan = await planComplexChange(
+-        prompt,
+-        fileContents,
+-        onResponseChunk,
+-        {
++      const { response, fileProcessingPromises: promises } =
++        await planComplexChange(prompt, fileContents, onResponseChunk, {
+           clientSessionId,
+           fingerprintId,
+           userInputId,
+           userId,
+-        }
+-      )
++          costMode,
++        })
++      fileProcessingPromises.push(...promises)
+       // For now, don't print the plan to the user.
+       // onResponseChunk(`${plan}\n\n`)
+-      fullResponse += plan + '\n\n'
++      fullResponse += response + '\n\n'
+       logger.debug(
+         {
+           prompt,
+           file_paths: filePaths,
+-          response: plan,
++          response,
+         },
+         'Generated plan'
+       )
+@@ -366,7 +364,7 @@ export async function mainPrompt(
+         id: Math.random().toString(36).slice(2),
+         name: 'continue',
+         input: {
+-          response: `Please implement the full plan.`,
++          response: `Please review the implementation and make improvements if needed.`,
+         },
+       }
+       isComplete = true
+diff --git a/backend/src/planning.ts b/backend/src/planning.ts
+index b6b32bdbb..a6b7b80e6 100644
+--- a/backend/src/planning.ts
++++ b/backend/src/planning.ts
+@@ -1,14 +1,46 @@
+-import { Message } from 'common/actions'
++import { Message, FileChange } from 'common/actions'
+ import { models, claudeModels, CostMode } from 'common/constants'
+ import { countTokensJson } from './util/token-counter'
+ import {
++  createFileBlock,
+   createMarkdownFileBlock,
+   isValidFilePath,
+   ProjectFileContext,
++  parseFileBlocks,
+ } from 'common/util/file'
+ import { promptClaude } from './claude'
+ import { OpenAIMessage, promptOpenAI } from './openai-api'
+ import { getSearchSystemPrompt } from './system-prompt'
++import { hasLazyEdit } from 'common/util/string'
++import { applyRemainingChanges } from './process-file-block'
++
++const systemPrompt = `
++You are a senior software engineer. You are given a request from a user and a set of files that are relevant to the request.
++
++Use the following syntax to edit a file using xml tags. This example adds a console.log statement to the foo function in the file at path/to/file.ts:
++
++${createFileBlock(
++  'path/to/file.ts',
++  `// ... existing code ...
++function foo() {
++  console.log('foo');
++  // ... existing code ...
++`
++)}
++
++Notes for editing a file:
++- You must specify a file path using the filePath attribute.
++- Do not wrap the file content in markdown code blocks.
++- You can edit multiple files in your response by including multiple edit_file blocks.
++- The content of the file can be abridged by using placeholder comments like: // ... existing code ... or # ... existing code ... (or whichever is appropriate for the language). In this case, the placeholder sections will not be changed. Only the written out code will be updated.
++- If you don't use any placeholder comments (matched by a regex), the entire file will be replaced.
++- Similarly, you can create new files by specifying a new file path and including the entire content of the file.
++
++If you don't want to edit a file, but want to show code to the user, you can use the markdown format for that:
++\`\`\`typescript
++// Some code to show the user...
++\`\`\`
++`.trim()
+ 
+ export async function planComplexChange(
+   prompt: string,
+@@ -19,9 +51,14 @@ export async function planComplexChange(
+     fingerprintId: string
+     userInputId: string
+     userId: string | undefined
++    costMode: CostMode
+   }
+ ) {
+   const messages: OpenAIMessage[] = [
++    {
++      role: 'system',
++      content: systemPrompt,
++    },
+     {
+       role: 'user',
+       content: `${
+@@ -42,7 +79,62 @@ Please plan and create a detailed solution.`,
+     reasoningEffort: 'high',
+   })
+ 
+-  return fullResponse
++  const fileBlocks = parseFileBlocks(fullResponse)
++
++  const fileProcessingPromises = Object.entries(fileBlocks).map(
++    ([filePath, content]) =>
++      processFileBlock(
++        filePath,
++        content,
++        files[filePath] || null,
++        fullResponse,
++        options.costMode,
++        options.clientSessionId,
++        options.fingerprintId,
++        options.userInputId,
++        options.userId
++      )
++  )
++
++  return {
++    response: fullResponse,
++    fileProcessingPromises,
++  }
++}
++
++async function processFileBlock(
++  filePath: string,
++  newContent: string,
++  oldContent: string | null,
++  fullResponse: string,
++  costMode: CostMode,
++  clientSessionId: string,
++  fingerprintId: string,
++  userInputId: string,
++  userId: string | undefined
++): Promise<FileChange | null> {
++  // For new files, just create them directly
++  if (!oldContent) {
++    return { filePath, content: newContent, type: 'file' }
++  }
++
++  if (hasLazyEdit(newContent)) {
++    const updatedContent = await applyRemainingChanges(
++      oldContent,
++      newContent,
++      filePath,
++      fullResponse,
++      clientSessionId,
++      fingerprintId,
++      userInputId,
++      userId,
++      costMode,
++      true // hasLazyEdit = true
++    )
++    return { filePath, content: updatedContent, type: 'file' }
++  }
++
++  return { filePath, content: newContent, type: 'file' }
+ }
+ 
+ /**
+diff --git a/backend/src/process-file-block.ts b/backend/src/process-file-block.ts
+index 40177be7e..b1b4f75f6 100644
+--- a/backend/src/process-file-block.ts
++++ b/backend/src/process-file-block.ts
+@@ -209,7 +209,7 @@ export async function processFileBlock(
+   return { filePath, content: patch, type: 'patch' }
+ }
+ 
+-async function applyRemainingChanges(
++export async function applyRemainingChanges(
+   updatedContent: string,
+   changes: string,
+   filePath: string,
+diff --git a/backend/src/system-prompt.ts b/backend/src/system-prompt.ts
+index 5ee875260..66947ba70 100644
+--- a/backend/src/system-prompt.ts
++++ b/backend/src/system-prompt.ts
+@@ -386,7 +386,7 @@ Do not use code_search when:
+ 
+ ## Plan complex change
+ 
+-When you need a detailed technical plan for complex changes, use the plan_complex_change tool. This tool leverages O1's deep reasoning capabilities to break down difficult problems into clear implementation steps.
++When you need a detailed technical plan for complex changes, use the plan_complex_change tool. This tool leverages deep reasoning capabilities to break down difficult problems into clear implementation steps.
+ 
+ Format:
+ - First line must be a clear, specific problem statement
+@@ -401,7 +401,7 @@ Use cases:
+ 2. Planning refactoring operations
+ 3. Making architectural decisions
+ 4. Breaking down difficult problems into steps
+-5. When you seem to be stuck and need
++5. When you seem to be stuck and need to get unstuck
+ 
+ Best practices:
+ - Make problem statement specific and actionable

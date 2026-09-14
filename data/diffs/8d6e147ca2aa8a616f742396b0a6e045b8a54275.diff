@@ -1,0 +1,370 @@
+diff --git a/codebuff.json b/codebuff.json
+index 786300c01..626931f3b 100644
+--- a/codebuff.json
++++ b/codebuff.json
+@@ -1,5 +1,9 @@
+ {
+   "startupProcesses": [
++    {
++      "name": "drizzle",
++      "command": "bun start-studio"
++    },
+     {
+       "name": "web server",
+       "command": "bun start-web"
+diff --git a/npm-app/src/background-process-manager.ts b/npm-app/src/background-process-manager.ts
+index 39771ec60..f89f47a2a 100644
+--- a/npm-app/src/background-process-manager.ts
++++ b/npm-app/src/background-process-manager.ts
+@@ -1,12 +1,48 @@
+-import { ChildProcessByStdio } from 'child_process'
+-import { Readable } from 'stream'
++import assert from 'assert'
++import {
++  ChildProcess,
++  ChildProcessByStdio,
++  ChildProcessWithoutNullStreams,
++  spawn,
++  SpawnOptionsWithoutStdio,
++} from 'child_process'
++import { mkdirSync, readdirSync, unlinkSync, writeFileSync } from 'fs'
++import path from 'path'
++import process from 'process'
+ 
+ import { ToolResult } from 'common/types/agent-state'
+ import { buildArray } from 'common/util/array'
+ import { truncateStringWithMessage } from 'common/util/string'
++import { red, yellow } from 'picocolors'
++
++import { CONFIG_DIR } from './credentials'
+ 
+ const COMMAND_OUTPUT_LIMIT = 5000 // Limit output to 10KB per stream
+ 
++const LOCK_DIR = path.join(CONFIG_DIR, 'background_processes')
++
++export function spawnAndTrack(
++  command: string,
++  args: string[] = [],
++  options: SpawnOptionsWithoutStdio
++): ChildProcessWithoutNullStreams {
++  const child = spawn(command, args, options)
++  assert(child.pid !== undefined)
++
++  mkdirSync(LOCK_DIR, { recursive: true })
++  const filePath = path.join(LOCK_DIR, `${child.pid}`)
++  writeFileSync(filePath, '')
++
++  child.on('exit', () => {
++    try {
++      unlinkSync(filePath)
++    } catch (err) {
++      // do nothing
++    }
++  })
++  return child
++}
++
+ /**
+  * Interface describing the information stored for each background process.
+  */
+@@ -16,7 +52,7 @@ export interface BackgroundProcessInfo {
+   toolCallId: string
+   command: string
+   // The actual child process object
+-  process: ChildProcessByStdio<null, Readable, Readable>
++  process: ChildProcessByStdio<any, any, any>
+   // Buffer to store stdout chunks
+   stdoutBuffer: string[]
+   // Buffer to store stderr chunks
+@@ -156,3 +192,91 @@ function cleanupReportedProcesses(): void {
+     }
+   }
+ }
++function killAndWait(proc: ChildProcess, command: string): Promise<void> {
++  return new Promise((resolve, reject) => {
++    const timeout = setTimeout(() => {
++      console.warn(yellow(`Force killing process: \`${command}\``))
++      proc.kill('SIGKILL')
++    }, 5000)
++
++    proc.once('exit', () => {
++      clearTimeout(timeout)
++      resolve()
++    })
++
++    proc.once('error', (err) => {
++      clearTimeout(timeout)
++      reject(err)
++    })
++
++    try {
++      proc.kill('SIGTERM')
++    } catch (error: any) {
++      if (error.code === 'ESRCH') {
++        clearTimeout(timeout)
++        resolve()
++      } else {
++        reject(error)
++      }
++    }
++  })
++}
++
++export async function killAllBackgroundProcesses(): Promise<void> {
++  const killPromises = Array.from(backgroundProcesses.entries())
++    .filter(([, p]) => p.status === 'running')
++    .map(async ([pid, processInfo]) => {
++      try {
++        await killAndWait(processInfo.process, processInfo.command)
++        console.log(yellow(`Killed process: \`${processInfo.command}\``))
++      } catch (error: any) {
++        if (error?.code !== 'ESRCH') {
++          console.error(
++            red(
++              `Failed to kill: \`${processInfo.command}\` (pid ${pid}): ${error?.message || error}`
++            )
++          )
++        }
++      }
++    })
++
++  await Promise.all(killPromises)
++  backgroundProcesses.clear()
++}
++
++/**
++ * Cleans up stale lock files and attempts to kill orphaned processes found in the lock directory.
++ * This function is intended to run on startup or periodically to handle cases where
++ * the application might have exited uncleanly, leaving orphaned processes or lock files.
++ */
++export function cleanupStoredProcesses() {
++  try {
++    mkdirSync(LOCK_DIR, { recursive: true })
++    const files = readdirSync(LOCK_DIR)
++
++    for (const file of files) {
++      const filePath = path.join(LOCK_DIR, file)
++      const pid = parseInt(file, 10)
++
++      if (isNaN(pid)) {
++        try {
++          unlinkSync(filePath)
++        } catch (unlinkErr: any) {}
++        continue
++      }
++
++      if (backgroundProcesses.has(pid)) {
++        continue
++      }
++
++      try {
++        process.kill(pid, 'SIGTERM')
++        unlinkSync(filePath)
++      } catch (err: any) {
++        if (err.code === 'ESRCH') {
++          unlinkSync(filePath)
++        }
++      }
++    }
++  } catch (error: any) {}
++}
+diff --git a/npm-app/src/cli.ts b/npm-app/src/cli.ts
+index fa840d836..cf8e8c374 100644
+--- a/npm-app/src/cli.ts
++++ b/npm-app/src/cli.ts
+@@ -7,19 +7,9 @@ import { getAllFilePaths } from 'common/project-file-tree'
+ import { Message } from 'common/types/message'
+ import { ProjectFileContext } from 'common/util/file'
+ import { pluralize } from 'common/util/string'
+-import {
+-  blue,
+-  bold,
+-  cyan,
+-  green,
+-  gray,
+-  magenta,
+-  red,
+-  underline,
+-  yellow,
+-} from 'picocolors'
+-
+-import { backgroundProcesses } from './background-process-manager'
++import { green, yellow } from 'picocolors'
++
++import { killAllBackgroundProcesses } from './background-process-manager'
+ import { setMessages } from './chat-storage'
+ import { checkpointManager } from './checkpoints/checkpoint-manager'
+ import { detectApiKey, handleApiKeyInput } from './cli-handlers/api-key'
+@@ -36,7 +26,7 @@ import {
+ import { handleDiff } from './cli-handlers/diff'
+ import { showEasterEgg } from './cli-handlers/easter-egg'
+ import { Client } from './client'
+-import { websocketUrl, websiteUrl } from './config'
++import { websocketUrl } from './config'
+ import { displayGreeting, displayMenu } from './menu'
+ import { getProjectRoot } from './project-files'
+ import { CliOptions, GitCommand } from './types'
+@@ -115,7 +105,7 @@ export class CLI {
+       Spinner.get().restoreCursor()
+       process.exit(0)
+     })
+-    process.on('SIGTSTP', () => this.handleExit())
++    process.on('SIGTSTP', async () => await this.handleExit())
+   }
+ 
+   private initReadlineInterface() {
+@@ -128,8 +118,8 @@ export class CLI {
+     })
+ 
+     this.rl.on('line', (line) => this.handleLine(line))
+-    this.rl.on('SIGINT', () => this.handleSigint())
+-    this.rl.on('close', () => this.handleExit())
++    this.rl.on('SIGINT', async () => await this.handleSigint())
++    this.rl.on('close', async () => await this.handleExit())
+ 
+     process.stdin.on('keypress', (str, key) => this.handleKeyPress(str, key))
+   }
+@@ -289,7 +279,7 @@ export class CLI {
+       return true
+     }
+     if (userInput === 'quit' || userInput === 'exit' || userInput === 'q') {
+-      this.handleExit()
++      await this.handleExit()
+       return true
+     }
+     if (['diff', 'doff', 'dif', 'iff', 'd'].includes(userInput)) {
+@@ -437,7 +427,7 @@ export class CLI {
+     this.detectPasting()
+   }
+ 
+-  private handleSigint() {
++  private async handleSigint() {
+     if (isCommandRunning()) {
+       resetShell(getProjectRoot())
+     }
+@@ -451,7 +441,7 @@ export class CLI {
+     } else {
+       const now = Date.now()
+       if (now - this.lastSigintTime < 5000) {
+-        this.handleExit()
++        await this.handleExit()
+       } else {
+         this.lastSigintTime = now
+         console.log('\nPress Ctrl-C again to exit')
+@@ -475,26 +465,11 @@ export class CLI {
+     Spinner.get().stop()
+   }
+ 
+-  private handleExit() {
++  private async handleExit() {
+     Spinner.get().restoreCursor()
+     console.log('\n')
+ 
+-    for (const [pid, processInfo] of backgroundProcesses.entries()) {
+-      if (processInfo.status === 'running') {
+-        try {
+-          processInfo.process.kill()
+-          console.log(yellow(`Killed process: ${processInfo.command}`))
+-        } catch (error) {
+-          const errorMessage =
+-            error instanceof Error ? error.message : String(error)
+-          console.error(
+-            red(
+-              `Error killing process with PID ${pid} (${processInfo.command}): ${errorMessage}`
+-            )
+-          )
+-        }
+-      }
+-    }
++    await killAllBackgroundProcesses()
+ 
+     const logMessages = []
+     const totalCreditsUsedThisSession = Object.values(
+diff --git a/npm-app/src/index.ts b/npm-app/src/index.ts
+index 2a850bd1c..67cd13c04 100644
+--- a/npm-app/src/index.ts
++++ b/npm-app/src/index.ts
+@@ -5,6 +5,7 @@ import { type CostMode } from 'common/constants'
+ import { red } from 'picocolors'
+ 
+ import packageJson from '../package.json'
++import { cleanupStoredProcesses } from './background-process-manager'
+ import { CLI } from './cli'
+ import { createTemplateProject } from './create-template-project'
+ import { startDevProcesses } from './json-config/dev-process-manager'
+@@ -24,6 +25,9 @@ async function codebuff(
+   const dir = setProjectRoot(projectDir)
+   recreateShell(dir)
+ 
++  // Kill all processes we failed to kill before
++  cleanupStoredProcesses()
++
+   const updatePromise = updateCodebuff()
+ 
+   // Load codebuff.json config if it exists
+diff --git a/npm-app/src/json-config/dev-process-manager.ts b/npm-app/src/json-config/dev-process-manager.ts
+index 0fe84a83c..a14931c7a 100644
+--- a/npm-app/src/json-config/dev-process-manager.ts
++++ b/npm-app/src/json-config/dev-process-manager.ts
+@@ -14,7 +14,7 @@ export async function startDevProcesses(
+   projectPath: string
+ ) {
+   if (processes.length) {
+-    console.log(yellow('Starting dev processes:'))
++    console.log(yellow('Starting development processes:'))
+   }
+   for (const { name, command, cwd } of processes) {
+     // Resolve working directory
+@@ -25,14 +25,19 @@ export async function startDevProcesses(
+       : projectPath
+ 
+     // Start the process
+-    console.log(yellow(`- ${name}: \`${command}\``))
+-
+     await runBackgroundCommand(
+       generateCompactId(),
+       command,
+       'user',
+       workingDir,
+-      () => {}
++      ({ result }) => {
++        const m = result.match(/<process_id>(\d+)<\/process_id>/)
++        if (m) {
++          console.log(yellow(`- ${name}: \`${command}\` (pid: ${m[1]})`))
++        } else {
++          console.log(yellow(`- ${name}: \`${command}\` failed to start`))
++        }
++      }
+     )
+   }
+ }
+diff --git a/npm-app/src/utils/terminal.ts b/npm-app/src/utils/terminal.ts
+index 2d8a7ee82..6fb10ab11 100644
+--- a/npm-app/src/utils/terminal.ts
++++ b/npm-app/src/utils/terminal.ts
+@@ -11,6 +11,7 @@ import { green } from 'picocolors'
+ import {
+   backgroundProcesses,
+   BackgroundProcessInfo,
++  spawnAndTrack,
+ } from '../background-process-manager'
+ import { setProjectRoot } from '../project-files'
+ import { detectShell } from './detect-shell'
+@@ -200,7 +201,7 @@ export const runBackgroundCommand = (
+   const initialStderr = ''
+ 
+   try {
+-    const childProcess = spawn(shell, [...shellArgs, command], {
++    const childProcess = spawnAndTrack(shell, [...shellArgs, command], {
+       cwd: projectPath,
+       env: {
+         ...process.env,
+@@ -208,7 +209,7 @@ export const runBackgroundCommand = (
+       },
+       // Ensure detached is always false to link child lifetime to parent
+       detached: false,
+-      stdio: ['ignore', 'pipe', 'pipe'],
++      stdio: 'pipe',
+     })
+ 
+     // An error should have been thrown when we called `spawn`

@@ -1,0 +1,1499 @@
+diff --git a/backend/src/generate-knowledge-files.ts b/backend/src/generate-knowledge-files.ts
+new file mode 100644
+index 000000000..63e45c566
+--- /dev/null
++++ b/backend/src/generate-knowledge-files.ts
+@@ -0,0 +1,107 @@
++import { WebSocket } from 'ws'
++import { FileChange, Message } from 'common/actions'
++import { parseFileBlocks, ProjectFileContext } from 'common/util/file'
++import { processFileBlock } from './main-prompt'
++import { promptClaude } from './claude'
++import { getRelevantFilesPrompt, knowledgeFilesPrompt } from './system-prompt'
++import { DEFAULT_TOOLS } from 'common/src/util/tools'
++import { debugLog } from './util/debug'
++
++export async function generateKnowledgeFiles(
++  userId: string,
++  ws: WebSocket,
++  fullResponse: string,
++  fileContext: ProjectFileContext,
++  initialMessages: Message[]
++): Promise<Promise<FileChange>[]> {
++  // debugLog('generateKnowledgeFiles', {
++  //   fileContext,
++  //   initialMessages,
++  // })
++  const systemPrompt = `
++    You are an assistant that helps developers create knowledge files for their codebase. You are helpful and concise, knowing exactly when enough information has been gathered to create a knowledge file. Here's some more information on knowledge files:
++    ${knowledgeFilesPrompt}
++
++    In this conversation, the assistant and user are making changes to a codebase. You should use this chat history to create a knowledge file if their changes are meaningful. If their changes are not meaningful, you should not create/update a knowledge file.
++    IMPORTANT: a meaningful change is one that is not easily self-evident in the code. An example of a meaningful change is if the user wants to use a package manager aside from the default, because that is hard to find in the codebase. A good rule of thumb is if a quick, hurried glance through the code is enough to understand the change, it is not meaningful to add to our knowledge files. If the change is too complex or requires a lot of context to understand, it's meaningful and thus a good idea to add it to the knowledge file.
++    Here are some examples of meaningful changes:
++    - user added a new package to the project -> this means developers likely want to use this package to extend the project's functionality in a particular way and other developers/LLMs may want to use it as well. A knowledge file would be a great way for everyone to be on the same page about the new package and how it fits into the project.
++    - user has corrected your previous response because you made a mistake -> this means the user had something else in mind. A knowledge file would be a great way for everyone to learn from your mistake and improve your responses in the future.
++    
++    Here are some examples of meaningless changes:
++    - user has asked you to keep adding new features to the project -> this means the user is likely not interested in the project's current functionality and is looking for something else.
++    - code is sufficient to explain the change -> this means developers can easily figure out the context of the change without needing a knowledge file.
++
++    Here are some relevant files and code diffs that you should consider: 
++    ${getRelevantFilesPrompt(fileContext)}
++    
++    <important>
++    Reminder: a meaningful change is one that is not self-evident in the code. 
++    If the change isn't important enough to warrant a new knowledge file, please do not output anything. We don't want to waste the user's time on irrelevant changes.
++    This is also meant to be helpful for future LLMs like yourself. Thus, please be concise and avoid unnecessary details. If the change is important, please provide a detailed description of what we're doing and why.
++    
++    Do not include any code or other files in the knowledge file. Don't use any tools. Make the most minimal changes necessary to the files to ensure the information is captured.
++    </important>
++    `
++  const userPrompt = `    
++    Think before you write the knowledge file in <thinking> tags. Use that space to think about why the change is important and what it means for the project, and verify that we don't already have something similar in the existing knowledge files. Make sure to show your work!
++
++    First, please summarize the penultimate and last set of messages between the user and the assistant. Use the following format:
++    [user]: [message summary]
++    [assistant]: [message summary]
++    [change made]: [note about the change]
++
++    [user]: [message summary]
++    [assistant]: [message summary]
++    [change made]: [note about the change]
++    
++    Think through this next step carefully by answering the following questions:
++    1. What was the last change asked?
++    2. Is this a minor implementation detail?
++    3. If another senior developer read the code, would they quickly grasp at what this change does? Assume they have strong foundational knowledge.
++    4. If the answer to question 3 is "no", why not?
++
++    Evaluate your answer to question 4 objectively. Is it a good answer? Why or why not?
++    
++    If the answer was bad, skip the rest of the response and don't output anything.
++    Otherwise, check the existing knowledge files to see if there isn't something written about it yet. If there is, don't output anything because we don't want to repeat ourselves.
++    Finally, for any meaningful change that hasn't been captured in the knowledge file, you should output a knowledge file with <file> blocks. Make sure the file path ends in '.knowledge.md'.
++    `
++
++  const messages = [
++    ...initialMessages,
++    {
++      role: 'assistant' as const,
++      content:
++        "Got it, I'll determine if I need to create/update the knowledge file and generate if necessary. Can you share any relevant information about the project?",
++    },
++    {
++      role: 'user' as const,
++      content: userPrompt,
++    },
++  ]
++
++  const response = await promptClaude(messages, {
++    userId,
++    system: systemPrompt,
++    tools: DEFAULT_TOOLS,
++  })
++
++  const files = parseFileBlocks(response)
++
++  console.log('knowledge files to upsert:', Object.keys(files))
++  debugLog('deciding on upserting knowledge files', response)
++
++  const fileChangePromises = Object.entries(files).map(
++    ([filePath, fileContent]) =>
++      processFileBlock(
++        userId,
++        ws,
++        messages,
++        fullResponse,
++        filePath,
++        fileContent
++      )
++  )
++  return fileChangePromises
++}
+diff --git a/backend/src/main-prompt.ts b/backend/src/main-prompt.ts
+index d538aba49..0a8bd8235 100644
+--- a/backend/src/main-prompt.ts
++++ b/backend/src/main-prompt.ts
+@@ -2,12 +2,13 @@ import { WebSocket } from 'ws'
+ import fs from 'fs'
+ import path from 'path'
+ import { TextBlockParam, Tool } from '@anthropic-ai/sdk/resources'
++import { match, P } from 'ts-pattern'
+ 
+ import { promptClaudeStream } from './claude'
+ import { createFileBlock, ProjectFileContext } from 'common/util/file'
++import { didClientUseTool, DEFAULT_TOOLS } from 'common/src/util/tools'
+ import { getSearchSystemPrompt, getAgentSystemPrompt } from './system-prompt'
+ import { STOP_MARKER } from 'common/constants'
+-import { getTools } from './tools'
+ import { FileChange, Message } from 'common/actions'
+ import { ToolCall } from 'common/actions'
+ import { debugLog } from './util/debug'
+@@ -15,6 +16,8 @@ import { requestFiles, requestFile } from './websockets/websocket-action'
+ import { generatePatch } from './generate-patch'
+ import { requestRelevantFiles } from './request-files-prompt'
+ import { processStreamWithFiles } from './process-stream'
++import { countTokens } from './util/token-counter'
++import { generateKnowledgeFiles } from './generate-knowledge-files'
+ 
+ /**
+  * Prompt claude, handle tool calls, and generate file changes.
+@@ -33,10 +36,15 @@ export async function mainPrompt(
+   )
+ 
+   let fullResponse = ''
+-  const tools = getTools()
++  let genKnowledgeFilesPromise: Promise<Promise<FileChange>[]> =
++    Promise.resolve([])
++  const fileProcessingPromises: Promise<FileChange | null>[] = []
++  const tools = DEFAULT_TOOLS
++  const lastMessage = messages[messages.length - 1]
+ 
+   let shouldCheckFiles = true
+   if (Object.keys(fileContext.files).length === 0) {
++    // Getting here typically means it's the first message from the user.
+     const system = getSearchSystemPrompt(fileContext)
+     // If the fileContext.files is empty, use prompts to select files and add them to context.
+     const responseChunk = await updateFileContext(
+@@ -49,6 +57,20 @@ export async function mainPrompt(
+     )
+     fullResponse += responseChunk
+     shouldCheckFiles = false
++  } else {
++    // Already have context from existing chat
++
++    // If client used tool, we don't want to generate knowledge files because the user isn't really in control
++
++    if (!didClientUseTool(lastMessage)) {
++      genKnowledgeFilesPromise = generateKnowledgeFiles(
++        userId,
++        ws,
++        fullResponse,
++        fileContext,
++        messages
++      )
++    }
+   }
+ 
+   const lastUserMessageIndex = messages.findLastIndex(
+@@ -68,8 +90,6 @@ export async function mainPrompt(
+     }
+   }
+ 
+-  const lastMessage = messages[messages.length - 1]
+-  const fileProcessingPromises: Promise<FileChange | null>[] = []
+   let toolCall: ToolCall | null = null
+   let continuedMessages: Message[] = []
+   let isComplete = false
+@@ -183,11 +203,11 @@ ${STOP_MARKER}
+     console.log('Reached maximum number of iterations in mainPrompt')
+     debugLog('Reached maximum number of iterations in mainPrompt')
+   }
+-
++  const knowledgeChanges = await genKnowledgeFilesPromise
++  fileProcessingPromises.push(...knowledgeChanges)
+   const changes = (await Promise.all(fileProcessingPromises)).filter(
+     (change) => change !== null
+   )
+-
+   const changeAppendix =
+     changes.length > 0
+       ? `\n\n<edits_made_by_assistant>\n${changes
+diff --git a/backend/src/system-prompt.ts b/backend/src/system-prompt.ts
+index 6f59db2a5..f4bc988a2 100644
+--- a/backend/src/system-prompt.ts
++++ b/backend/src/system-prompt.ts
+@@ -129,7 +129,7 @@ Do not write code to the user except when editing files with <file> blocks.
+ </editing_instructions>
+ `.trim()
+ 
+-const knowledgeFilesPrompt = `
++export const knowledgeFilesPrompt = `
+ # Knowledge files
+ 
+ Knowledge files are your guide to the project. There are two types of knowledge files you can create and update:
+@@ -138,9 +138,9 @@ Knowledge files are your guide to the project. There are two types of knowledge
+ 
+ 2. File-specific knowledge files: For knowledge specific to a particular file, create a knowledge file using the original filename followed by \`.knowledge.md\`. For example, for a file named \`generate-diffs-haiku.ts\`, create \`generate-diffs-haiku.knowledge.md\` in the same directory.
+ 
+-Whenever you think of a key concept or helpful tip that is not obvious from the code, you should add it to the appropriate knowledge file. If the knowledge file does not exist, you should create it.
++Knowledge files contain key concepts or helpful tips that is not obvious from the code. For example, if the user wants to use a package manager aside from the default, because that is hard to find in the codebase, that is an appropriate piece of information to add to a knowledge file.
+ 
+-If a user corrects you or contradicts you or gives broad advice, you should update a knowledge file with a concise rule to follow or bit of advice so you won't make the mistake again.
++If a user corrects you or contradicts you or gives broad advice, that is a good candidate for updating a knowledge file with a concise rule to follow or bit of advice so you won't make the mistake again.
+ 
+ Each knowledge file should develop over time into a concise but rich repository of knowledge about the files within the directory, subdirectories, or the specific file it's associated with.
+ 
+@@ -319,6 +319,13 @@ ${gitChanges.lastCommitMessages}
+ `.trim()
+ }
+ 
++export const getRelevantFilesPrompt = (fileContext: ProjectFileContext) => {
++  const part1 = getRelevantFilesPromptPart1(fileContext)
++  const part2 = getRelevantFilesPromptPart2(fileContext, fileContext.files)
++
++  return [part1, part2].join('\n\n')
++}
++
+ const getResponseFormatPrompt = (checkFiles: boolean, files: string[]) => {
+   let bulletNumber = 1
+   return `
+@@ -338,8 +345,6 @@ ${
+ 
+ ${bulletNumber++}. You may edit files to address the user's request and run commands in the terminal. However, if previous two previous commands have failed, you should not run anymore terminal commands.
+ 
+-If the user corrected you or gave feedback and it helped you understand something better, you must edit a knowledge file with a short note that condenses what you learned and what to do next time you so you don't make the same mistake again. Pure documentation of code doesn't need to be added to knowlege. But if the user says use yarn instead of npm, or to use one function instead of another, or to use a certain style, or that you should always write tests, then this is good information to add to a knoweldge file (create the file if it doesn't exist!). To edit a knowledge file, use a <file> block.
+-
+ Do not write code except when editing files with <file> blocks.
+ 
+ <important_instruction>
+diff --git a/backend/src/websockets/websocket-action.ts b/backend/src/websockets/websocket-action.ts
+index 232fbb2d7..dc49b4e71 100644
+--- a/backend/src/websockets/websocket-action.ts
++++ b/backend/src/websockets/websocket-action.ts
+@@ -6,7 +6,7 @@ import { sendMessage } from './server'
+ import { isEqual } from 'lodash'
+ import fs from 'fs'
+ import path from 'path'
+-import { getTools } from '../tools'
++import { getTools } from 'common/src/util/tools'
+ import { getSearchSystemPrompt } from '../system-prompt'
+ import { promptClaude, models } from '../claude'
+ 
+diff --git a/backend/src/tools.ts b/common/src/util/tools.ts
+similarity index 90%
+rename from backend/src/tools.ts
+rename to common/src/util/tools.ts
+index 688c7daff..ddcc7d050 100644
+--- a/backend/src/tools.ts
++++ b/common/src/util/tools.ts
+@@ -1,5 +1,18 @@
++import { Message } from 'src/actions'
++import { match, P } from 'ts-pattern'
+ import { Tool } from '@anthropic-ai/sdk/resources'
+ 
++export const didClientUseTool = (message: Message) =>
++  match(message)
++    .with(
++      {
++        role: 'user',
++        content: P.array({ type: 'tool_result' }),
++      },
++      () => true
++    )
++    .otherwise(() => false)
++
+ export const getTools = (): Tool[] => {
+   return [
+     {
+@@ -64,3 +77,5 @@ export const getTools = (): Tool[] => {
+     // } as Tool,
+   ]
+ }
++
++export const DEFAULT_TOOLS: Tool[] = getTools()
+diff --git a/exported-tokens.json b/exported-tokens.json
+index 944bdca9c..212926ba8 100644
+--- a/exported-tokens.json
++++ b/exported-tokens.json
+@@ -43,7 +43,7 @@
+   "backend/src/system-prompt.ts": {
+     "getSystemPrompt": 10.768293153451244
+   },
+-  "backend/src/tools.ts": {
++  "common/src/util/tools.ts": {
+     "getTools": 3.9295594162366996
+   },
+   "backend/src/util/debug.ts": {
+@@ -525,4 +525,4 @@
+     "projectTest": 2.644531900718091
+   },
+   "test/__src__/setup.ts": {}
+-}
+\ No newline at end of file
++}
+diff --git a/npm-app/knowledge.md b/npm-app/knowledge.md
+index 6a3a78e99..65ec72e9b 100644
+--- a/npm-app/knowledge.md
++++ b/npm-app/knowledge.md
+@@ -53,6 +53,8 @@ The build process is defined in `package.json`:
+ 
+ ## Dependencies
+ 
++- ts-pattern: Used for pattern matching in TypeScript. Installed to improve type safety and readability when checking message types.
++
+ - The project depends on a `common` package (version 1.0.0) which is likely a shared library.
+ - Uses `lodash` for utility functions.
+ - TypeScript is used for development.
+@@ -85,6 +87,7 @@ When publishing the Manicode package, we use a custom process to ensure that onl
+ 4. The `postpublish` script restores the original `package.json` from `temp.package.json` and then deletes the temporary file.
+ 
+ This approach ensures that:
++
+ - The published package only includes necessary dependencies and scripts.
+ - The development environment remains intact after publishing.
+ - NODE_ENV is set to 'production' for the published package at runtime.
+@@ -104,11 +107,11 @@ Remember to increment the version number in `package.json` before publishing a n
+ Manicode uses Bun as its package manager. Always use Bun commands for managing dependencies instead of npm.
+ 
+ Key points:
++
+ - Use `bun add <package-name>` to install new packages.
+ - Use `bun remove <package-name>` to remove packages.
+ - Use `bun install` to install all dependencies after cloning the repository.
+ 
+-
+ ## CLI Functionality
+ 
+ The CLI (Command Line Interface) has been updated to provide a more standard terminal experience:
+diff --git a/npm-app/package.json b/npm-app/package.json
+index 60a610718..394d84f11 100644
+--- a/npm-app/package.json
++++ b/npm-app/package.json
+@@ -52,6 +52,7 @@
+     "tree-sitter-ruby": "0.23.0",
+     "tree-sitter-rust": "0.23.0",
+     "tree-sitter-typescript": "0.23.0",
++    "ts-pattern": "5.3.1",
+     "ws": "8.18.0",
+     "zod": "3.23.8"
+   },
+diff --git a/test/__mock-data__/hallucinated/expected.ts b/test/__mock-data__/hallucinated/expected.ts
+index b530cf404..b03a4fc27 100644
+--- a/test/__mock-data__/hallucinated/expected.ts
++++ b/test/__mock-data__/hallucinated/expected.ts
+@@ -288,4 +288,4 @@ const savePromptLengthInfo = (
+   debugArray.push(promptDebugInfo)
+ 
+   fs.writeFileSync(debugFilePath, JSON.stringify(debugArray, null, 2))
+-}
++}
+\ No newline at end of file
+diff --git a/test/__mock-data__/hallucinated/old.ts b/test/__mock-data__/hallucinated/old.ts
+index b70d3e27f..02963d9b4 100644
+--- a/test/__mock-data__/hallucinated/old.ts
++++ b/test/__mock-data__/hallucinated/old.ts
+@@ -250,4 +250,4 @@ const savePromptLengthInfo = (
+   debugArray.push(promptDebugInfo)
+ 
+   fs.writeFileSync(debugFilePath, JSON.stringify(debugArray, null, 2))
+-}
++}
+\ No newline at end of file
+diff --git a/test/__mock-data__/knowledge-files/cache-expiration.ts b/test/__mock-data__/knowledge-files/cache-expiration.ts
+new file mode 100644
+index 000000000..eaffdb064
+--- /dev/null
++++ b/test/__mock-data__/knowledge-files/cache-expiration.ts
+@@ -0,0 +1,1642 @@
++import { FileChange, Message } from 'common/src/actions'
++import { ProjectFileContext } from 'common/src/util/file'
++
++export const mockFileContext: ProjectFileContext = {
++  currentWorkingDirectory: '/Users/me/Documents/manicode',
++  fileTree: [
++    {
++      name: '.gitignore',
++      type: 'file',
++    },
++    {
++      name: '.manicodeignore',
++      type: 'file',
++    },
++    {
++      name: '.prettierrc',
++      type: 'file',
++    },
++    {
++      name: 'README.md',
++      type: 'file',
++    },
++    {
++      name: 'authentication_and_billing.knowledge.md',
++      type: 'file',
++    },
++    {
++      name: 'backend',
++      type: 'directory',
++      children: [
++        {
++          name: '.dockerignore',
++          type: 'file',
++        },
++        {
++          name: '.env.example',
++          type: 'file',
++        },
++        {
++          name: '.gitignore',
++          type: 'file',
++        },
++        {
++          name: 'Dockerfile',
++          type: 'file',
++        },
++        {
++          name: 'deploy.sh',
++          type: 'file',
++        },
++        {
++          name: 'jest.config.js',
++          type: 'file',
++        },
++        {
++          name: 'jest.setup.js',
++          type: 'file',
++        },
++        {
++          name: 'knowledge.md',
++          type: 'file',
++        },
++        {
++          name: 'package.json',
++          type: 'file',
++        },
++        {
++          name: 'src',
++          type: 'directory',
++          children: [
++            {
++              name: 'claude.ts',
++              type: 'file',
++            },
++            {
++              name: 'constants.ts',
++              type: 'file',
++            },
++            {
++              name: 'generate-diffs-prompt.ts',
++              type: 'file',
++            },
++            {
++              name: 'generate-diffs-via-expansion.ts',
++              type: 'file',
++            },
++            {
++              name: 'generate-knowledge-files.ts',
++              type: 'file',
++            },
++            {
++              name: 'generate-patch.ts',
++              type: 'file',
++            },
++            {
++              name: 'index.ts',
++              type: 'file',
++            },
++            {
++              name: 'main-prompt.ts',
++              type: 'file',
++            },
++            {
++              name: 'openai-api.ts',
++              type: 'file',
++            },
++            {
++              name: 'process-stream.ts',
++              type: 'file',
++            },
++            {
++              name: 'request-files-prompt.ts',
++              type: 'file',
++            },
++            {
++              name: 'system-prompt.ts',
++              type: 'file',
++            },
++            {
++              name: 'util',
++              type: 'directory',
++              children: [
++                {
++                  name: 'debug.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'token-counter.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'websockets',
++              type: 'directory',
++              children: [
++                {
++                  name: 'server.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'switchboard.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'websocket-action.ts',
++                  type: 'file',
++                },
++              ],
++            },
++          ],
++        },
++        {
++          name: 'tsconfig.json',
++          type: 'file',
++        },
++      ],
++    },
++    {
++      name: 'bun.lockb',
++      type: 'file',
++    },
++    {
++      name: 'common',
++      type: 'directory',
++      children: [
++        {
++          name: 'package.json',
++          type: 'file',
++        },
++        {
++          name: 'src',
++          type: 'directory',
++          children: [
++            {
++              name: 'actions.ts',
++              type: 'file',
++            },
++            {
++              name: 'codemap',
++              type: 'directory',
++              children: [
++                {
++                  name: 'languages.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'parse.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'test-langs',
++                  type: 'directory',
++                  children: [
++                    {
++                      name: 'test.c',
++                      type: 'file',
++                    },
++                    {
++                      name: 'test.cpp',
++                      type: 'file',
++                    },
++                    {
++                      name: 'test.cs',
++                      type: 'file',
++                    },
++                    {
++                      name: 'test.go',
++                      type: 'file',
++                    },
++                    {
++                      name: 'test.java',
++                      type: 'file',
++                    },
++                    {
++                      name: 'test.js',
++                      type: 'file',
++                    },
++                    {
++                      name: 'test.php',
++                      type: 'file',
++                    },
++                    {
++                      name: 'test.py',
++                      type: 'file',
++                    },
++                    {
++                      name: 'test.rb',
++                      type: 'file',
++                    },
++                    {
++                      name: 'test.rs',
++                      type: 'file',
++                    },
++                    {
++                      name: 'test.ts',
++                      type: 'file',
++                    },
++                  ],
++                },
++                {
++                  name: 'tree-sitter-queries',
++                  type: 'directory',
++                  children: [
++                    {
++                      name: 'readme.md',
++                      type: 'file',
++                    },
++                    {
++                      name: 'tree-sitter-c-tags.scm',
++                      type: 'file',
++                    },
++                    {
++                      name: 'tree-sitter-c_sharp-tags.scm',
++                      type: 'file',
++                    },
++                    {
++                      name: 'tree-sitter-cpp-tags.scm',
++                      type: 'file',
++                    },
++                    {
++                      name: 'tree-sitter-go-tags.scm',
++                      type: 'file',
++                    },
++                    {
++                      name: 'tree-sitter-java-tags.scm',
++                      type: 'file',
++                    },
++                    {
++                      name: 'tree-sitter-javascript-tags.scm',
++                      type: 'file',
++                    },
++                    {
++                      name: 'tree-sitter-php-tags.scm',
++                      type: 'file',
++                    },
++                    {
++                      name: 'tree-sitter-python-tags.scm',
++                      type: 'file',
++                    },
++                    {
++                      name: 'tree-sitter-ruby-tags.scm',
++                      type: 'file',
++                    },
++                    {
++                      name: 'tree-sitter-rust-tags.scm',
++                      type: 'file',
++                    },
++                    {
++                      name: 'tree-sitter-typescript-tags.scm',
++                      type: 'file',
++                    },
++                  ],
++                },
++                {
++                  name: 'tree-sitter.d.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'constants.ts',
++              type: 'file',
++            },
++            {
++              name: 'project-file-tree.ts',
++              type: 'file',
++            },
++            {
++              name: 'util',
++              type: 'directory',
++              children: [
++                {
++                  name: 'array.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'changes.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'file.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'object.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'patch.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'promise.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'tools.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'websockets',
++              type: 'directory',
++              children: [
++                {
++                  name: 'websocket-client.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'websocket-schema.ts',
++                  type: 'file',
++                },
++              ],
++            },
++          ],
++        },
++        {
++          name: 'tsconfig.json',
++          type: 'file',
++        },
++      ],
++    },
++    {
++      name: 'exported-tokens.json',
++      type: 'file',
++    },
++    {
++      name: 'knowledge.md',
++      type: 'file',
++    },
++    {
++      name: 'musings.knowledge.md',
++      type: 'file',
++    },
++    {
++      name: 'npm-app',
++      type: 'directory',
++      children: [
++        {
++          name: 'README.md',
++          type: 'file',
++        },
++        {
++          name: 'clean-package.js',
++          type: 'file',
++        },
++        {
++          name: 'knowledge.md',
++          type: 'file',
++        },
++        {
++          name: 'package.json',
++          type: 'file',
++        },
++        {
++          name: 'src',
++          type: 'directory',
++          children: [
++            {
++              name: 'chat-storage.ts',
++              type: 'file',
++            },
++            {
++              name: 'cli.ts',
++              type: 'file',
++            },
++            {
++              name: 'client.ts',
++              type: 'file',
++            },
++            {
++              name: 'config.ts',
++              type: 'file',
++            },
++            {
++              name: 'fingerprint.ts',
++              type: 'file',
++            },
++            {
++              name: 'index.ts',
++              type: 'file',
++            },
++            {
++              name: 'manifold-api.ts',
++              type: 'file',
++            },
++            {
++              name: 'menu.ts',
++              type: 'file',
++            },
++            {
++              name: 'project-files.ts',
++              type: 'file',
++            },
++            {
++              name: 'tool-handlers.ts',
++              type: 'file',
++            },
++            {
++              name: 'web-scraper.ts',
++              type: 'file',
++            },
++          ],
++        },
++        {
++          name: 'storage',
++          type: 'directory',
++          children: [
++            {
++              name: 'key_value_stores',
++              type: 'directory',
++              children: [
++                {
++                  name: 'default',
++                  type: 'directory',
++                  children: [],
++                },
++              ],
++            },
++            {
++              name: 'request_queues',
++              type: 'directory',
++              children: [
++                {
++                  name: 'default',
++                  type: 'directory',
++                  children: [],
++                },
++              ],
++            },
++          ],
++        },
++        {
++          name: 'tsconfig.json',
++          type: 'file',
++        },
++      ],
++    },
++    {
++      name: 'package.json',
++      type: 'file',
++    },
++    {
++      name: 'python-app',
++      type: 'directory',
++      children: [
++        {
++          name: 'LICENSE',
++          type: 'file',
++        },
++        {
++          name: 'README.md',
++          type: 'file',
++        },
++        {
++          name: 'knowledge.md',
++          type: 'file',
++        },
++        {
++          name: 'pyproject.toml',
++          type: 'file',
++        },
++        {
++          name: 'src',
++          type: 'directory',
++          children: [
++            {
++              name: 'manicode',
++              type: 'directory',
++              children: [
++                {
++                  name: '__init__.py',
++                  type: 'file',
++                },
++                {
++                  name: '__pycache__',
++                  type: 'directory',
++                  children: [
++                    {
++                      name: '__init__.cpython-39.pyc',
++                      type: 'file',
++                    },
++                  ],
++                },
++              ],
++            },
++            {
++              name: 'manicode.egg-info',
++              type: 'directory',
++              children: [
++                {
++                  name: 'PKG-INFO',
++                  type: 'file',
++                },
++                {
++                  name: 'SOURCES.txt',
++                  type: 'file',
++                },
++                {
++                  name: 'dependency_links.txt',
++                  type: 'file',
++                },
++                {
++                  name: 'entry_points.txt',
++                  type: 'file',
++                },
++                {
++                  name: 'top_level.txt',
++                  type: 'file',
++                },
++              ],
++            },
++          ],
++        },
++      ],
++    },
++    {
++      name: 'scripts',
++      type: 'directory',
++      children: [
++        {
++          name: 'bump-version.ts',
++          type: 'file',
++        },
++        {
++          name: 'bun.lockb',
++          type: 'file',
++        },
++        {
++          name: 'generate-fine-tuning-dataset.ts',
++          type: 'file',
++        },
++        {
++          name: 'package.json',
++          type: 'file',
++        },
++        {
++          name: 'tsconfig.json',
++          type: 'file',
++        },
++      ],
++    },
++    {
++      name: 'start-dev.sh',
++      type: 'file',
++    },
++    {
++      name: 'test',
++      type: 'directory',
++      children: [
++        {
++          name: '__mock-data__',
++          type: 'directory',
++          children: [
++            {
++              name: 'actions',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'app',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'delete-comment',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'duplicate-imports',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'existing-comments',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'graph',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'hallucinated',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'indentation',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'knowledge-files',
++              type: 'directory',
++              children: [
++                {
++                  name: 'cache-expiration.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'crawlee.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'many-updates',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'missing-line-actions',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'schema',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'simple',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++            {
++              name: 'system-prompt',
++              type: 'directory',
++              children: [
++                {
++                  name: 'expected.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'new.ts',
++                  type: 'file',
++                },
++                {
++                  name: 'old.ts',
++                  type: 'file',
++                },
++              ],
++            },
++          ],
++        },
++        {
++          name: '__src__',
++          type: 'directory',
++          children: [
++            {
++              name: 'diff-prompt.test.ts',
++              type: 'file',
++            },
++            {
++              name: 'generate-knowledge-files.test.ts',
++              type: 'file',
++            },
++            {
++              name: 'generate-patch.test.ts',
++              type: 'file',
++            },
++            {
++              name: 'main-prompt.test.ts',
++              type: 'file',
++            },
++            {
++              name: 'manifold-project.test.ts',
++              type: 'file',
++            },
++            {
++              name: 'patch.test.ts',
++              type: 'file',
++            },
++            {
++              name: 'process-stream.test.ts',
++              type: 'file',
++            },
++            {
++              name: 'score-tests.ts',
++              type: 'file',
++            },
++            {
++              name: 'setup.ts',
++              type: 'file',
++            },
++          ],
++        },
++        {
++          name: 'bun.lockb',
++          type: 'file',
++        },
++        {
++          name: 'bunfig.toml',
++          type: 'file',
++        },
++        {
++          name: 'package.json',
++          type: 'file',
++        },
++        {
++          name: 'tsconfig.json',
++          type: 'file',
++        },
++      ],
++    },
++    {
++      name: 'todo.knowledge.md',
++      type: 'file',
++    },
++    {
++      name: 'tsconfig.json',
++      type: 'file',
++    },
++  ],
++  fileTokenScores: {
++    '.gitignore': {},
++    '.manicodeignore': {},
++    '.prettierrc': {},
++    'README.md': {},
++    'authentication_and_billing.knowledge.md': {},
++    'backend/.dockerignore': {},
++    'backend/.env.example': {},
++    'backend/.gitignore': {},
++    'backend/Dockerfile': {},
++    'backend/deploy.sh': {},
++    'backend/jest.config.js': {},
++    'backend/jest.setup.js': {},
++    'backend/knowledge.md': {},
++    'backend/package.json': {},
++    'backend/src/claude.ts': {
++      models: 1.2756477605939975,
++      promptClaudeStream: 3.044071057880673,
++      promptClaude: 3.328723629405636,
++      promptClaudeWithContinuation: 1.2756477605939975,
++    },
++    'backend/src/constants.ts': {
++      RATE_LIMIT_POLICY: 0.14829104003789312,
++    },
++    'backend/src/generate-diffs-prompt.ts': {
++      generateExpandedFileWithDiffBlocks: 4.987981645339687,
++      generateDiffBlocks: 2.9459823118803516,
++    },
++    'backend/src/generate-diffs-via-expansion.ts': {
++      expandNewContent: 3.9485535176648794,
++    },
++    'backend/src/generate-knowledge-files.ts': {
++      generateKnowledgeFiles: 3.2341413751451915,
++    },
++    'backend/src/generate-patch.ts': {
++      generatePatch: 3.260551418852098,
++    },
++    'backend/src/index.ts': {},
++    'backend/src/main-prompt.ts': {
++      mainPrompt: 2.9064444180083515,
++      getRelevantFileInfoMessage: 1.716592893623786,
++      updateFileContext: 1.716592893623786,
++      processFileBlock: 3.602462941199226,
++    },
++    'backend/src/openai-api.ts': {
++      promptOpenAI: 3.0702795580141005,
++      promptOpenAIWithContinuation: 3.0702795580141005,
++    },
++    'backend/src/process-stream.ts': {},
++    'backend/src/request-files-prompt.ts': {
++      requestRelevantFiles: 3.9212536839853986,
++      getRelevantFiles: 1.3310839386064968,
++      topLevelDirectories: 1.3310839386064968,
++      getExampleFileList: 1.3310839386064968,
++      generateNonObviousRequestFilesPrompt: 1.3310839386064968,
++      generateKeyRequestFilesPrompt: 1.3310839386064968,
++    },
++    'backend/src/system-prompt.ts': {
++      getSearchSystemPrompt: 4.763410644019523,
++      getAgentSystemPrompt: 3.379782240270602,
++      knowledgeFilesPrompt: 1.9961538365216809,
++      getRelevantFilesPrompt: 3.379782240270602,
++    },
++    'backend/src/util/debug.ts': {
++      DEBUG_MODE: 0.3656509454897687,
++      debugLog: 1.8747415355448414,
++      clearDebugLog: 0.3656509454897687,
++    },
++    'backend/src/util/token-counter.ts': {
++      countTokens: 1.2968841558128552,
++      countTokensForFiles: 0.786534719817593,
++    },
++    'backend/src/websockets/server.ts': {
++      MessageParseError: 0.7167229817000064,
++      serializeError: 0.7167229817000064,
++      parseMessage: 0.7167229817000064,
++      processMessage: 0.7167229817000064,
++      listen: 0.7167229817000064,
++      sendMessage: 1.2135174957078831,
++    },
++    'backend/src/websockets/switchboard.ts': {
++      Switchboard: 0.635184087735273,
++      getClient: 0.3751499544919713,
++      getAll: 0.3751499544919713,
++      getSubscribers: 0.3751499544919713,
++      connect: 0.3751499544919713,
++      disconnect: 0.3751499544919713,
++      markSeen: 0.3751499544919713,
++      identify: 0.3751499544919713,
++      deidentify: 0.3751499544919713,
++      subscribe: 0.3751499544919713,
++      unsubscribe: 1.337390589217878,
++    },
++    'backend/src/websockets/websocket-action.ts': {
++      subscribeToAction: 1.0610843071323905,
++      onWebsocketAction: 1.7965719029576102,
++      requestFiles: 2.53205949878283,
++      requestFile: 2.53205949878283,
++    },
++    'backend/tsconfig.json': {},
++    'bun.lockb': {},
++    'common/package.json': {},
++    'common/src/actions.ts': {
++      FileChangeSchema: 0.8550878507329176,
++      CHANGES: 0.8550878507329176,
++      ToolCallSchema: 0.8550878507329176,
++      CLIENT_ACTIONS: 0.8550878507329176,
++      CLIENT_ACTION_SCHEMA: 0.8550878507329176,
++      SERVER_ACTIONS: 0.8550878507329176,
++      SERVER_ACTION_SCHEMA: 0.8550878507329176,
++    },
++    'common/src/codemap/languages.ts': {
++      getLanguageConfig: 2.761147870196878,
++    },
++    'common/src/codemap/parse.ts': {
++      DEBUG_PARSING: 0.8354986189350809,
++      getFileTokenScores: 1.7533876688623948,
++      parseTokens: 0.8354986189350809,
++      parseFile: 0.8354986189350809,
++    },
++    'common/src/codemap/test-langs/test.c': {
++      Greeter: 0.3287649480356627,
++      create_greeter: 0.3287649480356627,
++      greet: 0.3287649480356627,
++      free_greeter: 0.3287649480356627,
++      print_greeting: 0.5566474448335192,
++      main: 0.3287649480356627,
++    },
++    'common/src/codemap/test-langs/test.cpp': {
++      greet: 0.29580146559145953,
++      Greeting: 0.29580146559145953,
++      printGreeting: 0.29580146559145953,
++      main: 0.29580146559145953,
++    },
++    'common/src/codemap/test-langs/test.cs': {
++      IGreeter: 0.29580146559145953,
++      Greet: 0.29580146559145953,
++      Greeting: 0.29580146559145953,
++      PrintGreeting: 0.29580146559145953,
++      Main: 0.29580146559145953,
++    },
++    'common/src/codemap/test-langs/test.go': {
++      Greeter: 0.1659862434495759,
++      string: 0.1659862434495759,
++      Greeting: 0.1659862434495759,
++      Greet: 0.1659862434495759,
++      PrintGreeting: 0.1659862434495759,
++      main: 0.1659862434495759,
++    },
++    'common/src/codemap/test-langs/test.java': {
++      Greeter: 0.28245008504511326,
++      greet: 0.28245008504511326,
++      Greeting: 0.28245008504511326,
++      printGreeting: 0.28245008504511326,
++      main: 0.28245008504511326,
++    },
++    'common/src/codemap/test-langs/test.js': {
++      greet: 0.3587119667194399,
++      Greeting: 0.3587119667194399,
++      printGreeting: 0.3587119667194399,
++      createGreeter: 0.3587119667194399,
++    },
++    'common/src/codemap/test-langs/test.php': {
++      greet: 0.29580146559145953,
++      Greeting: 0.29580146559145953,
++      __construct: 0.29580146559145953,
++      printGreeting: 0.29580146559145953,
++      createGreeter: 0.29580146559145953,
++    },
++    'common/src/codemap/test-langs/test.py': {
++      Greeter: 0.2536476641600791,
++      greet: 0.2536476641600791,
++      Greeting: 0.2536476641600791,
++      print_greeting: 0.42946282742825387,
++    },
++    'common/src/codemap/test-langs/test.rb': {
++      Greeter: 0.25109837670360796,
++      greet: 0.25109837670360796,
++      prefix: 0.25109837670360796,
++      Greeting: 0.25109837670360796,
++      initialize: 0.25109837670360796,
++      print_greeting: 0.4251465085588929,
++    },
++    'common/src/codemap/test-langs/test.rs': {
++      Greeter: 0.28994343076581225,
++      Greeting: 0.28994343076581225,
++      new: 0.6084788468237248,
++      greet: 0.28994343076581225,
++      main: 0.28994343076581225,
++    },
++    'common/src/codemap/test-langs/test.ts': {
++      Greeting: 0.3050809602367711,
++      gre
+
+… [diff truncated: view full diff on GitHub] …
