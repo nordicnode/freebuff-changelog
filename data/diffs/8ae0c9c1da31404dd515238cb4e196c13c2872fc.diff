@@ -1,0 +1,369 @@
+diff --git a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+index 966f2ddcc..d6e8787eb 100644
+--- a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
++++ b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+@@ -33,6 +33,10 @@ import {
+   REPEATED_STREAM_INTERRUPTIONS_MESSAGE,
+   STREAM_INTERRUPTED_TAG,
+ } from '../tools/stream-parser'
++import {
++  TODO_LOOP_RECOVERY_MESSAGE,
++  TODO_LOOP_STOP_MESSAGE,
++} from '../util/todo-loop'
+ import { createToolCallChunk, mockFileContext } from './test-utils'
+ 
+ import type { AgentTemplate } from '../templates/types'
+@@ -158,6 +162,120 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+     clearMockedModules()
+   })
+ 
++  it('stops an unchanged to-do loop after recovery attempts and can resume on a new prompt', async () => {
++    mockTemplate.toolNames.push('write_todos')
++    mockAgentState.stepsRemaining = 200
++    let calls = 0
++    const seenPrompts: string[] = []
++    const result = await loopAgentSteps({
++      ...loopAgentStepsBaseParams,
++      promptAiSdkStream: async function* ({ messages }) {
++        calls++
++        seenPrompts.push(JSON.stringify(messages))
++        yield { type: 'reasoning', text: 'I should stop repeating the list.' }
++        yield { type: 'text', text: 'Executing now.' }
++        yield createToolCallChunk('write_todos', {
++          todos: [{ task: 'x', completed: false }],
++        })
++        return promptSuccess(`todo-${calls}`)
++      },
++    })
++
++    expect(calls).toBe(6)
++    expect(seenPrompts[2]).not.toContain(TODO_LOOP_RECOVERY_MESSAGE)
++    expect(seenPrompts[3]).toContain(TODO_LOOP_RECOVERY_MESSAGE)
++    expect(result.output).toMatchObject({
++      type: 'error',
++      message: TODO_LOOP_STOP_MESSAGE,
++    })
++    // The real tool handler completed each call; the error is the model loop,
++    // not a lost result or a tool that never resolves.
++    expect(
++      result.agentState.messageHistory.filter(
++        (m) => m.role === 'tool' && m.toolName === 'write_todos',
++      ),
++    ).toHaveLength(6)
++
++    let resumeCalls = 0
++    const resumed = await loopAgentSteps({
++      ...loopAgentStepsBaseParams,
++      agentState: result.agentState,
++      prompt: 'Continue with a different approach',
++      promptAiSdkStream: async function* () {
++        if (++resumeCalls === 1) {
++          yield createToolCallChunk('write_todos', {
++            todos: [{ task: 'x', completed: false }],
++          })
++        } else {
++          yield createToolCallChunk('end_turn', {})
++        }
++        return promptSuccess(`resumed-${resumeCalls}`)
++      },
++    })
++    expect(resumeCalls).toBe(2)
++    expect(resumed.output.type).not.toBe('error')
++  })
++
++  it('allows the model to recover by using another tool, then update its list again', async () => {
++    mockTemplate.toolNames.push('write_todos')
++    let calls = 0
++    const result = await loopAgentSteps({
++      ...loopAgentStepsBaseParams,
++      promptAiSdkStream: async function* ({ messages }) {
++        calls++
++        if (calls === 4) {
++          expect(JSON.stringify(messages)).toContain(
++            TODO_LOOP_RECOVERY_MESSAGE,
++          )
++          yield createToolCallChunk('read_files', { paths: ['src/example.ts'] })
++        } else if (calls === 7) {
++          yield createToolCallChunk('end_turn', {})
++        } else {
++          yield createToolCallChunk('write_todos', {
++            todos: [{ task: 'x', completed: false }],
++          })
++        }
++        return promptSuccess(`recovery-${calls}`)
++      },
++    })
++    expect(calls).toBe(7)
++    expect(result.output.type).not.toBe('error')
++    expect(
++      JSON.stringify(result.agentState.messageHistory).split(
++        TODO_LOOP_RECOVERY_MESSAGE,
++      ),
++    ).toHaveLength(2)
++  })
++
++  it('does not interrupt changing to-do lists or completion updates', async () => {
++    mockTemplate.toolNames.push('write_todos')
++    let calls = 0
++    const result = await loopAgentSteps({
++      ...loopAgentStepsBaseParams,
++      promptAiSdkStream: async function* () {
++        calls++
++        if (calls === 9) {
++          yield createToolCallChunk('end_turn', {})
++        } else {
++          yield createToolCallChunk('write_todos', {
++            todos: [
++              {
++                task: calls <= 4 ? 'Read code' : 'Run tests',
++                completed: calls % 4 > 2 || calls % 4 === 0,
++              },
++            ],
++          })
++        }
++        return promptSuccess(`progress-${calls}`)
++      },
++    })
++    expect(calls).toBe(9)
++    expect(result.output.type).not.toBe('error')
++    expect(JSON.stringify(result.agentState.messageHistory)).not.toContain(
++      TODO_LOOP_RECOVERY_MESSAGE,
++    )
++  })
++
+   it('retains completed steps after a spending cap and resumes under a new run id', async () => {
+     mockTemplate.handleSteps = function* () {
+       yield 'STEP'
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 596368154..7d2083dbb 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -30,6 +30,14 @@ import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+ import { getMCPToolData } from './mcp'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+ import { isThinkOnlyResponse } from './util/think-tags'
++import {
++  TODO_LOOP_RECOVERY_MESSAGE,
++  TODO_LOOP_RECOVERY_TAG,
++  TODO_LOOP_RECOVERY_THRESHOLD,
++  TODO_LOOP_STOP_THRESHOLD,
++  TodoLoopError,
++  trailingIdenticalTodoCalls,
++} from './util/todo-loop'
+ import {
+   clearProgrammaticRunState,
+   runProgrammaticStep,
+@@ -557,6 +565,28 @@ export const runAgentStep = async (
+ 
+   fullResponse = fullResponseAfterStream
+ 
++  // A successful no-op is not progress. GLM can keep emitting the same to-do
++  // list (even while acknowledging the loop in prose) until the general step
++  // budget is exhausted. Give it a chance to recover, then fail explicitly.
++  if (
++    !hadToolCallError &&
++    toolCalls.length > 0 &&
++    toolCalls.every((call) => call.toolName === 'write_todos')
++  ) {
++    const consecutive = trailingIdenticalTodoCalls(agentState.messageHistory)
++    if (consecutive >= TODO_LOOP_STOP_THRESHOLD) {
++      throw new TodoLoopError()
++    }
++    if (consecutive >= TODO_LOOP_RECOVERY_THRESHOLD) {
++      agentState.messageHistory.push(
++        userMessage({
++          content: withSystemTags(TODO_LOOP_RECOVERY_MESSAGE),
++          tags: [TODO_LOOP_RECOVERY_TAG],
++        }),
++      )
++    }
++  }
++
+   agentState.messageHistory = expireMessages(
+     agentState.messageHistory,
+     'agentStep',
+@@ -1381,9 +1411,12 @@ export async function loopAgentSteps(
+     const apiErrorDetails = extractApiErrorDetails(error)
+     const isIdleTimeout = isFetchIdleTimeoutError(error)
+     const isNetworkError = !isIdleTimeout && isTransientNetworkError(error)
++    const isTodoLoop = error instanceof TodoLoopError
+     const hasServerMessage = apiErrorDetails.message !== undefined
+     let fallbackMessage: string
+-    if (isIdleTimeout) {
++    if (isTodoLoop) {
++      fallbackMessage = error.message
++    } else if (isIdleTimeout) {
+       fallbackMessage = FETCH_IDLE_TIMEOUT_USER_MESSAGE
+     } else if (isNetworkError) {
+       fallbackMessage = TRANSIENT_NETWORK_ERROR_USER_MESSAGE
+@@ -1422,7 +1455,7 @@ export async function loopAgentSteps(
+       output: {
+         type: 'error',
+         message:
+-          hasServerMessage || isIdleTimeout || isNetworkError
++          hasServerMessage || isIdleTimeout || isNetworkError || isTodoLoop
+             ? errorMessage
+             : 'Agent run error: ' + errorMessage,
+         ...(statusCode !== undefined && { statusCode }),
+diff --git a/packages/agent-runtime/src/util/__tests__/todo-loop.test.ts b/packages/agent-runtime/src/util/__tests__/todo-loop.test.ts
+new file mode 100644
+index 000000000..8f694ec27
+--- /dev/null
++++ b/packages/agent-runtime/src/util/__tests__/todo-loop.test.ts
+@@ -0,0 +1,77 @@
++import { assistantMessage, userMessage } from '@codebuff/common/util/messages'
++import { describe, expect, it } from 'bun:test'
++
++import {
++  TODO_LOOP_RECOVERY_TAG,
++  trailingIdenticalTodoCalls,
++} from '../todo-loop'
++
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++
++function exchange(
++  id: string,
++  todos: unknown = [{ task: 'x', completed: false }],
++  toolName = 'write_todos',
++): Message[] {
++  return [
++    assistantMessage({
++      type: 'tool-call',
++      toolCallId: id,
++      toolName,
++      input: { todos },
++    }),
++    { role: 'tool', toolCallId: id, toolName, content: [] },
++  ]
++}
++
++describe('trailingIdenticalTodoCalls', () => {
++  it('counts completed calls across reasoning, prose, step prompts and recovery notes', () => {
++    expect(
++      trailingIdenticalTodoCalls([
++        userMessage('Implement the plan'),
++        ...exchange('a'),
++        assistantMessage({
++          type: 'reasoning',
++          text: 'I should stop repeating.',
++        }),
++        userMessage({ content: 'Continue', tags: ['STEP_PROMPT'] }),
++        ...exchange('b', [{ completed: false, task: 'x' }]),
++        userMessage({
++          content: 'Stop repeating',
++          tags: [TODO_LOOP_RECOVERY_TAG],
++        }),
++        assistantMessage('Executing now.'),
++        ...exchange('c'),
++      ]),
++    ).toBe(3)
++  })
++
++  it('counts batched calls with results grouped after the assistant message', () => {
++    const [call1, result1] = exchange('a')
++    const [call2, result2] = exchange('b')
++    expect(
++      trailingIdenticalTodoCalls([call1!, call2!, result1!, result2!]),
++    ).toBe(2)
++  })
++
++  it.each([
++    ['user steering', [userMessage('Do something else')]],
++    ['another tool', exchange('read', [], 'read_files')],
++    [
++      'a different task',
++      exchange('different', [{ task: 'y', completed: false }]),
++    ],
++    ['a completion update', exchange('done', [{ task: 'x', completed: true }])],
++    ['a malformed historical list', exchange('bad', [null])],
++    ['an unmatched call', exchange('orphan').slice(0, 1)],
++  ] satisfies [string, Message[]][])('resets at %s', (_, boundary) => {
++    expect(
++      trailingIdenticalTodoCalls([
++        ...exchange('old1'),
++        ...exchange('old2'),
++        ...boundary,
++        ...exchange('new'),
++      ]),
++    ).toBe(1)
++  })
++})
+diff --git a/packages/agent-runtime/src/util/todo-loop.ts b/packages/agent-runtime/src/util/todo-loop.ts
+new file mode 100644
+index 000000000..f813fa764
+--- /dev/null
++++ b/packages/agent-runtime/src/util/todo-loop.ts
+@@ -0,0 +1,73 @@
++import { writeTodosParams } from '@codebuff/common/tools/params/tool/write-todos'
++
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++
++export const TODO_LOOP_RECOVERY_TAG = 'TODO_LOOP_RECOVERY'
++export const TODO_LOOP_RECOVERY_THRESHOLD = 3
++export const TODO_LOOP_STOP_THRESHOLD = 6
++
++export const TODO_LOOP_RECOVERY_MESSAGE =
++  'You have repeatedly called write_todos with the same unchanged list and no other tool use in between. The list is already recorded. Stop repeating it. Use an available tool to make progress on the task, or explain the blocker to the user and end your turn. Respect the current mode and tool permissions.'
++
++export const TODO_LOOP_STOP_MESSAGE =
++  'The model got stuck repeating the same to-do list without making progress. This turn was stopped to avoid wasting more of your session. Try a different model or reasoning level, then continue.'
++
++export class TodoLoopError extends Error {
++  constructor() {
++    super(TODO_LOOP_STOP_MESSAGE)
++    this.name = 'TodoLoopError'
++  }
++}
++
++/** Count identical completed to-do calls at the tail of this user turn.
++ * Prose/reasoning and per-step scaffolding are not progress. A different list,
++ * another tool, or a user message is. Only matched, completed calls count, so
++ * interrupted/failed tool execution cannot masquerade as this model loop.
++ */
++export function trailingIdenticalTodoCalls(messages: Message[]): number {
++  let count = 0
++  let latestList: string | undefined
++  const completed = new Set<string>()
++
++  for (let i = messages.length - 1; i >= 0; i--) {
++    const message = messages[i]!
++    if (message.role === 'user') {
++      if (
++        message.tags?.includes('STEP_PROMPT') ||
++        message.tags?.includes(TODO_LOOP_RECOVERY_TAG)
++      ) {
++        continue
++      }
++      break
++    }
++    if (message.role === 'tool') {
++      if (message.toolName !== 'write_todos') break
++      completed.add(message.toolCallId)
++      continue
++    }
++    if (message.role !== 'assistant' || !Array.isArray(message.content))
++      continue
++
++    for (let j = message.content.length - 1; j >= 0; j--) {
++      const part = message.content[j]!
++      if (part.type !== 'tool-call') continue
++      if (
++        part.toolName !== 'write_todos' ||
++        !completed.delete(part.toolCallId)
++      ) {
++        return count
++      }
++      const parsed = writeTodosParams.inputSchema.safeParse(part.input)
++      if (!parsed.success) return count
++      // Compare task/status rather than object key order or provider call IDs.
++      const list = JSON.stringify(
++        parsed.data.todos.map((todo) => [todo.task, todo.completed]),
++      )
++      if (latestList !== undefined && list !== latestList) return count
++      latestList = list
++      count++
++    }
++  }
++
++  return count
++}
