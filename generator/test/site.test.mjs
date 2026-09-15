@@ -939,3 +939,36 @@ test('discordText: a monster entry still fits the 2000-char cap, giving up detai
   assert.ok(t.includes('**In plain English**'), 'and so does the plain-English quote')
   assert.ok(t.includes('word word'), 'the summary keeps its head and loses its tail')
 })
+
+test('in-flight page is honest about a short or stale PR list', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-inflight-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const one = {
+    kind: 'community', sha: 'aaaa111122223333444455556666777788889999', date: '2026-09-12T10:00:00Z',
+    day: '2026-09-12', author: 'dev', areas: ['CLI'], category: 'CLI', significance: 'notable',
+    title: 'Add awesome feature', summary: 'A feature.', stats: { additions: 10, deletions: 2 },
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: ['a.ts'], removed: [], renamed: [], modified: [] }
+  }
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-15T00:00:00Z',
+    headSha: 'a'.repeat(40), counts: { entries: 1 }, entries: [one]
+  }
+  const prs = Array.from({ length: 60 }, (_, i) => ({ number: i + 1, title: `PR ${i + 1}`, author: 'x', created: '2026-09-01T00:00:00Z' }))
+
+  await buildSite({ changelog, openPrs: prs, prMeta: { total: 116, ageMin: 4 }, dist })
+  const short = await readFile(join(dist, 'in-flight/index.html'), 'utf8')
+  assert.match(short, /<span>60 of 116 open<\/span>/, 'the header names GitHub\'s count, not just our row count')
+  assert.match(short, /56 are not listed yet/, 'and says how many are missing')
+  assert.doesNotMatch(short, /Last successful check/, 'a four-minute-old list is not stale')
+
+  await buildSite({ changelog, openPrs: prs, prMeta: { total: 60, ageMin: 300 }, dist })
+  const stale = await readFile(join(dist, 'in-flight/index.html'), 'utf8')
+  assert.match(stale, /<span>60 open<\/span>/, 'a complete list shows a bare count')
+  assert.match(stale, /Last successful check was 5 h ago/, 'but a five-hour silence is announced, not hidden')
+  assert.doesNotMatch(stale, /not listed yet/)
+
+  await buildSite({ changelog, openPrs: prs, prMeta: { total: 116, ageMin: 2 }, dist })
+  const status = JSON.parse(await readFile(join(dist, 'api/status.json'), 'utf8'))
+  assert.equal(status.openPrsTotal, 116, 'the API carries the authoritative count too')
+  assert.equal(status.openPrsCheckedMinAgo, 2, 'and when it was last checked')
+})

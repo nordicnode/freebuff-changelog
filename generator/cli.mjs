@@ -9,7 +9,7 @@ import { existsSync } from 'node:fs'
 import { resolve, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { git, readJson, writeJson, writeText, log, ymd, toUtc, normalizeDate, pruneDiffs, pool, withLock } from './lib/util.mjs'
-import { capturePendingWrites, persistMerged } from './lib/mergedata.mjs'
+import { capturePendingWrites, persistMerged, mergeOpenPrs } from './lib/mergedata.mjs'
 import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE } from './lib/analyze.mjs'
@@ -85,70 +85,145 @@ async function ensureRepo () {
 /**
  * Open pull requests, with per-PR stats and a truncated diff preview.
  *
- * GitHub answers one page per request and `per_page` caps at 100. Asking for 60
- * and never asking again silently truncated the list: the page said "60 open"
- * while upstream had 114, and what went missing was the tail -- the older,
- * stalled PRs a reader of an in-flight page most wants to see. So follow the
- * pages until one comes back short.
+ * Three bugs have made /in-flight/ under-report, all of them the same mistake --
+ * treating the rows that happened to arrive as the whole truth:
+ *   1. asking for 60 per page and never asking again (GitHub caps per_page at 100);
+ *   2. stopping at a short page. Under load or abuse detection GitHub hands back
+ *      fewer items than `per_page` and *still* points at the rest with
+ *      `Link: rel="next"`. A 116-PR repo was published as 60 that way, and
+ *      `prunePrDiffs` then deleted the previews of the 56 PRs never mentioned;
+ *   3. last-writer-wins between the two publishers of data/open-prs.json -- the
+ *      local daemon and the hourly CI backstop. CI's HTTP 500 on page 2 pushed 60
+ *      rows over the daemon's complete 116 the next morning.
+ *
+ * So: the walk follows Link headers; completeness is judged against GitHub's own
+ * count (one `per_page=1` request, whose `rel="last"` page number *is* the number
+ * of open PRs) rather than against our arithmetic; a short walk unions over the
+ * stored list instead of replacing it; a partial list prunes nothing; and
+ * `mergeOpenPrs` applies the same union rule at commit time, so whichever writer
+ * pushes last can only ever add to what the other found. The count is refreshed
+ * every few minutes, not every six hours -- see PR_REFRESH_MIN.
  *
  * `fetchImpl`/`dataDir` are injectable because this is the only part of the
- * pipeline that talks to a live third party, and its truncation rule needs a
- * test rather than an outage to notice.
+ * pipeline that talks to a live third party, and these rules need tests rather
+ * than an outage to notice them.
  */
 export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DATA } = {}) {
-  // Nice-to-have, degrade silently. Cached 6h to protect the rate limit
-  // (hourly generate would otherwise burn a page of calls per run + previews).
   const PR_PER_PAGE = 100
   // 10 pages is 1,000 open PRs. Past that the list itself is the story, and
   // walking further would cost a call per page for no extra truth.
   const PR_MAX_PAGES = 10
   // Without a token GitHub allows 60 calls/hour and trips abuse detection well
-  // before that. One call per PR for its stats plus one for its diff is 228
-  // calls for 114 PRs, and most of them came back 403 -- degraded to nothing,
+  // before that. One call per PR for its stats plus one for its diff is 232
+  // calls for 116 PRs, and most of them came back 403 -- degraded to nothing,
   // silently, every run. So the decoration gets a budget, and the run stops
   // asking the moment the API says no. A token lifts the ceiling to 5,000/hour,
   // which is enough to finish a list of this size in one pass.
   const PR_CALL_BUDGET = Number(process.env.CHANGELOG_PR_CALLS) ||
     (process.env.GITHUB_TOKEN ? 500 : 25)
+  // How old the stored list may get before the count on the page stops being
+  // trusted. The watch loop can wake every 30s, so this is the throttle: five
+  // minutes is 12 refreshes an hour, which an unauthenticated token budget can
+  // actually afford, and no reader ever sees a number more than that stale.
+  const PR_REFRESH_MIN = Number(process.env.CHANGELOG_PR_REFRESH_MIN) || 5
+  const LIST = 'https://api.github.com/repos/CodebuffAI/freebuff/pulls'
+  const linkHeader = (res) => { try { return res?.headers?.get?.('link') || '' } catch (_) { return '' } }
+  const nextUrl = (res) => /<([^>]+)>;\s*rel="next"/.exec(linkHeader(res))?.[1] || null
+  const lastPage = (res) => Number(/[?&]page=(\d+)[^>]*>;\s*rel="last"/.exec(linkHeader(res))?.[1]) || null
+  const headers = { 'user-agent': 'freebuff-changelog', accept: 'application/vnd.github+json' }
+  if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`
+  const get = (url) => fetchImpl(url, { headers, signal: AbortSignal.timeout(15000) })
+  // GitHub's own count, from one `per_page=1` request: with one row per page the
+  // `rel="last"` page number *is* the number of open PRs. Never derived from the
+  // rows we happened to receive -- that is the arithmetic that reported 60.
+  const probeTotal = async () => {
+    try {
+      const res = await get(`${LIST}?state=open&sort=created&direction=desc&per_page=1`)
+      return res.ok ? lastPage(res) : null
+    } catch (_) { return null }
+  }
   try {
-    const cached = await readJson(`${dataDir}/open-prs.json`, null)
-    // A list that ran out of budget comes back for the rest in half an hour
-    // rather than six: the previews converge over a few passes instead of
-    // staying missing for the day. Half an hour, not minutes, because the budget
-    // is spent per refresh -- a 5-minute loop would spend 300 calls an hour
-    // against an unauthenticated ceiling of 60 and earn nothing but 403s.
-    const maxAgeMs = cached?.partial ? 30 * 60000 : 6 * 3600000
-    if (cached?.fetchedAt && Date.now() - Date.parse(cached.fetchedAt) < maxAgeMs && cached.prs?.length) {
-      return cached.prs
-    }
-    const headers = { 'user-agent': 'freebuff-changelog', accept: 'application/vnd.github+json' }
-    if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`
+    const raw = await readJson(`${dataDir}/open-prs.json`, null)
+    const cached = Array.isArray(raw) ? { prs: raw } : raw
+    const cachedPrs = cached?.prs || []
+    const prevByNum = new Map(cachedPrs.map(p => [p.number, p]))
+    const age = cached?.fetchedAt ? Date.now() - Date.parse(cached.fetchedAt) : Infinity
+    if (cachedPrs.length && age < PR_REFRESH_MIN * 60000) return cachedPrs
+
+    let total = await probeTotal()
     const prs = []
+    let stoppedEarly = false
     let page = 0
-    for (; page < PR_MAX_PAGES; page++) {
-      const url = `https://api.github.com/repos/CodebuffAI/freebuff/pulls?state=open&sort=created&direction=desc&per_page=${PR_PER_PAGE}&page=${page + 1}`
-      const res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(15000) })
+    let url = `${LIST}?state=open&sort=created&direction=desc&per_page=${PR_PER_PAGE}`
+    for (; page < PR_MAX_PAGES && url; page++) {
+      const res = await get(url)
       const batch = res.ok ? await res.json() : null
       if (!Array.isArray(batch)) {
+        // Silent is the one thing this must not be: an empty /in-flight/ page
+        // otherwise looks like a quiet repo rather than a refused call.
         if (!res.ok) {
-            // Silent is the one thing this must not be: an empty /in-flight/ page
-            // otherwise looks like a quiet repo rather than a refused call.
-            log(`open PR list page ${page + 1}: HTTP ${res.status}${res.status === 403 || res.status === 429 ? ` (rate limited${process.env.GITHUB_TOKEN ? '' : ', no GITHUB_TOKEN set'})` : ''}${cached?.prs?.length ? `: keeping the ${cached.prs.length} cached PRs` : ': no cached list to fall back on'}`)
+          log(`open PR list page ${page + 1}: HTTP ${res.status}${res.status === 403 || res.status === 429 ? ` (rate limited${process.env.GITHUB_TOKEN ? '' : ', no GITHUB_TOKEN set'})` : ''}${cachedPrs.length ? `: keeping the ${cachedPrs.length} cached PRs` : ': no cached list to fall back on'}`)
         }
-          // A later page failing still leaves the earlier ones true, and they are
-        // the newest PRs; only an immediate failure is worth falling back on the
-        // cache for.
-        if (prs.length) break
-        return cached?.prs || null
+        stoppedEarly = true
+        break
       }
+      // The probe can be skipped when a repo fits in one page and the caller
+      // asked for all of it; the page header says the same thing for free.
+      if (total == null) total = lastPage(res)
       prs.push(...batch.map(p => ({
         number: p.number, title: p.title, url: p.html_url, author: p.user?.login,
         created: p.created_at, updated: p.updated_at, draft: p.draft, comments: p.comments,
         additions: p.additions, deletions: p.deletions, files: p.changed_files
       })))
-      if (batch.length < PR_PER_PAGE) break
+      // The next link, not the page length, decides whether there is more to come.
+      const next = nextUrl(res)
+      if (next && !batch.length) {
+        // A next link with nothing behind it would spin forever on the same page.
+        stoppedEarly = true
+        break
+      }
+      url = next
     }
-    if (page === PR_MAX_PAGES) log(`open PR list hit the ${PR_MAX_PAGES}-page cap: reporting ${prs.length}`)
+    if (url && !stoppedEarly) {
+      // Only say this when the walk actually ran out of pages: after a `break`
+      // on a failed request `url` is still set, and blaming the page cap for a
+        // 403 sent me chasing a paging bug that did not exist.
+      log(`open PR list hit the ${PR_MAX_PAGES}-page cap with more pages to go: reporting ${prs.length}`)
+      stoppedEarly = true
+    }
+    // Complete means every page arrived and the row count reaches GitHub's own
+    // total. Only then is the fresh list authoritative -- and only then may
+    // merged/closed PRs drop off it. Short of that, the walk is a partial
+    // sighting: union it over what is already known, so the count can move up
+    // but never backwards because of a bad HTTP 500.
+    const complete = !stoppedEarly && prs.length > 0 && (total == null || prs.length >= total)
+    let list
+    if (complete) {
+      list = prs
+    } else if (prs.length) {
+      list = mergeOpenPrs(cached, { total, prs }).prs
+      log(`open PR list came back with ${prs.length} of ${total ?? 'an unknown number'}: kept ${list.length - prs.length} already-known PRs so the count cannot go backwards`)
+    } else {
+      if (cachedPrs.length) {
+        log(`open PR fetch returned nothing: still reporting the ${cachedPrs.length} PRs on disk${total != null ? ` (upstream says ${total} open)` : ''}`)
+        return cachedPrs
+      }
+      return null
+    }
+    // Carry the expensive per-PR facts forward: the list endpoint answers
+    // additions: null where a previous pass paid for the number, and a preview
+    // already on disk costs nothing to keep. A PR whose `updated` moved gets
+    // re-decorated, so a pushed update does not keep showing an old diff.
+    for (const p of list) {
+      const prev = prevByNum.get(p.number)
+      if (!prev) continue
+      if (prev.updated && p.updated && prev.updated !== p.updated) { p.stalePreview = true; continue }
+      if (p.additions == null && prev.additions != null) {
+        p.additions = prev.additions; p.deletions = prev.deletions; p.files = prev.files
+        p.comments = prev.comments ?? p.comments
+      }
+      if (!p.hasDiff && prev.hasDiff) p.hasDiff = true
+    }
     // The list endpoint omits additions/deletions/changed_files entirely, so
     // every extra number on a card costs a call: budget them, and stop asking
     // the moment GitHub refuses. Diffs first -- a preview a reader can open is
@@ -175,34 +250,47 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
     // and PRs already on disk are skipped -- so a steady list costs nothing.
     const { mkdir: mk, writeFile: wf } = await import('node:fs/promises')
     await mk(resolve(dataDir, 'pr-diffs'), { recursive: true })
-    await pool(prs.filter(p => !existsSync(resolve(dataDir, `pr-diffs/${p.number}.diff`))).map(p => async () => {
+    const previewPath = (n) => resolve(dataDir, `pr-diffs/${n}.diff`)
+    await pool(list.filter(p => !p.hasDiff || p.stalePreview || !existsSync(previewPath(p.number))).map(p => async () => {
       const diff = await ghGet(`/repos/CodebuffAI/freebuff/pulls/${p.number}`, 'application/vnd.github.diff')
       if (typeof diff === 'string' && diff.startsWith('diff --git')) {
-        await wf(resolve(dataDir, `pr-diffs/${p.number}.diff`), diff.split('\n').slice(0, 120).join('\n'))
+        await wf(previewPath(p.number), diff.split('\n').slice(0, 120).join('\n'))
         p.hasDiff = true
+        delete p.stalePreview
       }
     }), 4)
-    await pool(prs.filter(p => p.additions == null).map(p => async () => {
+    await pool(list.filter(p => p.additions == null).map(p => async () => {
       const full = await ghGet(`/repos/CodebuffAI/freebuff/pulls/${p.number}`)
       if (full) { p.additions = full.additions; p.deletions = full.deletions; p.files = full.changed_files; p.comments = full.comments ?? p.comments }
     }), 4)
     // Mark previews already on disk (skipped above, still viewable).
-    for (const p of prs) {
-      if (!p.hasDiff && existsSync(resolve(dataDir, `pr-diffs/${p.number}.diff`))) p.hasDiff = true
+    for (const p of list) {
+      if (!p.hasDiff && existsSync(previewPath(p.number))) p.hasDiff = true
+      if (p.stalePreview) delete p.stalePreview
     }
     // Say what is missing and why, in the same breath as the budget: a reader
-    // of the log should not have to infer that 114 PRs and 25 calls do not
+    // of the log should not have to infer that 116 PRs and 25 calls do not
     // meet, or that the gap is being closed on purpose.
-    const noDiff = prs.filter(p => !p.hasDiff).length
-    const noStats = prs.filter(p => p.additions == null).length
+    const noDiff = list.filter(p => !p.hasDiff).length
+    const noStats = list.filter(p => p.additions == null).length
     if (noDiff || noStats) {
-      log(`open PRs: ${prs.length} listed, ${used}/${PR_CALL_BUDGET} per-PR calls spent${refused ? ' (refused)' : ''}; ${noDiff} without a preview, ${noStats} without a diffstat -- the next run continues`)
+      log(`open PRs: ${list.length} listed${total != null ? ` of ${total} open` : ''}, ${used}/${PR_CALL_BUDGET} per-PR calls spent${refused ? ' (refused)' : ''}; ${noDiff} without a preview, ${noStats} without a diffstat -- the next run continues`)
     }
-    // `partial` is what turns the 6h cache into a checkpoint: the next run comes
-    // back for the previews the budget could not pay for.
-    const partial = refused || used >= PR_CALL_BUDGET
-    await writeJson(`${dataDir}/open-prs.json`, { fetchedAt: new Date().toISOString(), prs, ...(partial ? { partial: true } : {}) })
-    return prs
+    // `partial` says the run is unfinished; `listComplete` says something narrower
+    // and is the one `prunePrDiffs` reads. They differ in the common case: an
+    // unauthenticated run lists all 116 PRs (so a merged PR's preview may be
+    // deleted) but cannot afford 232 per-PR calls (so it stays `partial` and keeps
+    // chasing diffstats). Conflating them meant previews of long-dead PRs were
+    // never pruned, because decoration is always the thing that runs out.
+    const partial = refused || used >= PR_CALL_BUDGET || !complete
+    await writeJson(`${dataDir}/open-prs.json`, {
+      fetchedAt: new Date().toISOString(),
+      ...(total != null ? { total } : {}),
+      listComplete: complete,
+      prs: list,
+      ...(partial ? { partial: true } : {})
+    })
+    return list
   } catch (err) {
     log(`open PR fetch failed: ${String(err?.message || err).slice(0, 120)}`)
     return null
@@ -373,7 +461,7 @@ async function generateOnce (argv) {
   }))
 
   const prs = await fetchOpenPrs()
-  await prunePrDiffs(prs || [])
+  await prunePrDiffs(prs || [], await readJson(`${DATA}/open-prs.json`, null))
 
   log(`wrote ${entries.length} entries (${added} new this run)` + (prs ? `, ${prs.length} open PRs` : ''))
   // Newest last, matching analyze order: callers front-load these for
@@ -383,9 +471,15 @@ async function generateOnce (argv) {
 
 // Retention: delete pr-diffs/*.diff for PRs no longer open. Stale previews
 // accumulate as PRs merge; the client degrades to a GitHub link when missing.
-export async function prunePrDiffs (openPrs) {
+export async function prunePrDiffs (openPrs, doc = null, dataDir = DATA) {
+  // A short list is not a closed PR. Pruning against one deletes the previews of
+  // every PR the fetch failed to mention -- which is exactly what a truncated
+  // 60-of-116 run did to 56 stored diffs. Only a walk that reached GitHub's own
+  // count may remove files; an unknown shape (no flag at all) is treated as short.
+  if (doc && !doc.listComplete) { log('open PR list is not known-complete: keeping every cached preview rather than pruning against a short list'); return 0 }
+  if (!doc) { log('no stored open PR list: pruning nothing'); return 0 }
   const { readdir, unlink } = await import('node:fs/promises')
-  const dir = resolve(DATA, 'pr-diffs')
+  const dir = resolve(dataDir, 'pr-diffs')
   if (!existsSync(dir)) return 0
   const open = new Set((openPrs || []).map(p => `${p.number}.diff`))
   let pruned = 0
@@ -736,6 +830,19 @@ async function cmdBuild () {
   }
   const prsRaw = await readJson(`${DATA}/open-prs.json`, [])
   const prs = Array.isArray(prsRaw) ? prsRaw : (prsRaw?.prs || [])
+  // GitHub's own count, carried from the fetch: when it is above the number of
+  // cards, the page says so instead of presenting a short list as the whole truth.
+  // How long ago the last successful check was, in minutes: a list nobody has
+  // refreshed is not a quiet repo either, and the page says so rather than
+  // presenting an old count as today's.
+  const prAgeMin = prsRaw?.fetchedAt
+    ? Math.max(0, Math.round((Date.now() - Date.parse(prsRaw.fetchedAt)) / 60000))
+    : null
+  const prMeta = {
+    total: Array.isArray(prsRaw) ? null : (prsRaw?.total ?? null),
+    partial: !Array.isArray(prsRaw) && !!prsRaw?.partial,
+    ageMin: prAgeMin
+  }
   const dataDiffs = resolve(DATA, 'diffs')
   const dist = resolve(ROOT, 'dist')
   const t0 = Date.now()
@@ -748,7 +855,7 @@ async function cmdBuild () {
   await mkdir(dist, { recursive: true })
   // The timeline paginates one day per page: `/` is the newest day, every older
   // day is its own /day/<date>/ page.
-  await buildSite({ changelog, openPrs: prs, dist })
+  await buildSite({ changelog, openPrs: prs, prMeta, dist })
 
   const distDiffs = resolve(dist, 'diffs')
   if (existsSync(dataDiffs)) {

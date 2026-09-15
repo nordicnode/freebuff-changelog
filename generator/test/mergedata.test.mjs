@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { mergeChangelog, mergeAiCache, mergeSyncState, capturePendingWrites, persistMerged } from '../lib/mergedata.mjs'
+import { mergeChangelog, mergeAiCache, mergeSyncState, mergeOpenPrs, capturePendingWrites, persistMerged } from '../lib/mergedata.mjs'
 import { syncReason, syncStaleMs, DEFAULT_SYNC_STALE_MIN } from '../lib/sync.mjs'
 import { withLock, writeJson, shortHash, eli5Source } from '../lib/util.mjs'
 
@@ -270,6 +270,77 @@ test('mergeChangelog rewrites an offset timestamp on the way out', () => {
   assert.equal(a.date, '2026-09-15T01:25:50.000Z')
   assert.equal(a.day, '2026-09-15', 'the row moves to the UTC day it belongs to')
   assert.equal(m.entries[0].sha, 'b', 'which also puts the two rows in the right order')
+})
+
+test('mergeOpenPrs: a short CI list cannot erase the daemon’s complete one', () => {
+  // The exact regression: CI's page 2 answered HTTP 500, it published 60 rows,
+  // and last-writer-wins took /in-flight/ from 116 open back to 60.
+  const full = {
+    fetchedAt: '2026-09-15T06:00:00.000Z', total: 116,
+    prs: Array.from({ length: 116 }, (_, i) => ({ number: i + 1, created: `2026-09-${String((i % 15) + 1).padStart(2, '0')}T00:00:00Z`, title: `PR ${i + 1}` }))
+  }
+  const short = {
+    fetchedAt: '2026-09-15T06:29:00.000Z',
+    prs: full.prs.slice(0, 60).map(p => ({ ...p, title: p.title }))
+  }
+  const m = mergeOpenPrs(short, full)
+  assert.equal(m.prs.length, 116, 'the union is kept, not the shorter write')
+  assert.equal(m.total, 116)
+  assert.ok(!m.partial, 'and the merged list is complete, so it stops retrying')
+  const m2 = mergeOpenPrs(full, short)
+  assert.equal(m2.prs.length, 116, 'commutative: commit order cannot lose PRs')
+})
+
+test('mergeOpenPrs keeps a filled diffstat and preview against a blanker record', () => {
+  const rich = {
+    fetchedAt: '2026-09-15T06:00:00.000Z', total: 2, prs: [
+      { number: 7, created: '2026-09-07T00:00:00Z', additions: 12, deletions: 3, files: 2, hasDiff: true },
+      { number: 8, created: '2026-09-08T00:00:00Z', additions: 1, deletions: 0, files: 1, hasDiff: true }
+    ]
+  }
+  // A list-endpoint row: additions is explicitly null, hasDiff absent.
+  const lean = {
+    fetchedAt: '2026-09-15T07:00:00.000Z', total: 2, prs: [
+      { number: 7, created: '2026-09-07T00:00:00Z', title: 'T7', additions: null, deletions: null, files: null },
+      { number: 8, created: '2026-09-08T00:00:00Z', title: 'T8', additions: null, deletions: null, files: null }
+    ]
+  }
+  const m = mergeOpenPrs(rich, lean)
+  const p7 = m.prs.find(p => p.number === 7)
+  assert.equal(p7.additions, 12, 'a newer but blanker record does not erase a known diffstat')
+  assert.equal(p7.hasDiff, true, 'and never loses a preview that is on disk')
+  assert.equal(p7.title, 'T7', 'new fields still arrive')
+  assert.equal(m.fetchedAt, '2026-09-15T07:00:00.000Z', 'the stamp is the fresher one')
+})
+
+test('mergeOpenPrs keeps partial set while the union is short of GitHub’s total', () => {
+  const a = { fetchedAt: '2026-09-15T06:00:00.000Z', total: 116, partial: true, prs: [{ number: 1, created: '2026-09-01T00:00:00Z' }] }
+  const b = { fetchedAt: '2026-09-15T06:30:00.000Z', total: 116, prs: [{ number: 2, created: '2026-09-02T00:00:00Z' }] }
+  const m = mergeOpenPrs(a, b)
+  assert.equal(m.prs.length, 2)
+  assert.equal(m.partial, true, '1 PR of 116 known: the next run must chase the rest')
+})
+
+test('mergeOpenPrs: listComplete is the permission to forget, and a short side revokes it', () => {
+  const row = (n) => ({ number: n, created: `2026-09-0${n}T00:00:00Z` })
+  const complete = { fetchedAt: '2026-09-15T06:00:00.000Z', total: 2, listComplete: true, prs: [row(1), row(2)] }
+  const short = { fetchedAt: '2026-09-15T07:00:00.000Z', total: 3, listComplete: false, prs: [row(3)] }
+  assert.equal(mergeOpenPrs(complete, short).listComplete, false, 'the short side may have missed a PR: nothing may be deleted on this list')
+  assert.equal(mergeOpenPrs(complete, { ...complete, fetchedAt: '2026-09-15T07:00:00.000Z' }).listComplete, true, 'two complete sightings stay complete')
+})
+
+test('persistMerged merges open-prs.json rather than overwriting it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-prs-'))
+  const path = join(dir, 'open-prs.json')
+  const full = {
+    fetchedAt: '2026-09-15T06:00:00.000Z', total: 3,
+    prs: [1, 2, 3].map(n => ({ number: n, created: `2026-09-0${n}T00:00:00Z` }))
+  }
+  await writeFile(path, JSON.stringify(full))
+  // Our process only ever saw two of them; origin holds three.
+  await persistMerged({ [path]: { fetchedAt: '2026-09-15T05:00:00.000Z', total: 3, prs: [{ number: 1, created: '2026-09-01T00:00:00Z' }, { number: 2, created: '2026-09-02T00:00:00Z' }] } })
+  const out = JSON.parse(await readFile(path, 'utf8'))
+  assert.deepEqual(out.prs.map(p => p.number).sort((x, y) => x - y), [1, 2, 3], 'a push cannot drop a PR the other writer found')
 })
 
 test('mergeChangelog is deterministic when two different ELI5 lines are equally stale', () => {

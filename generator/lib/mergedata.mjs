@@ -122,6 +122,66 @@ function betterCacheEntry (x, y) {
 }
 
 /**
+ * Merge-safe write for data/open-prs.json.
+ *
+ * Two independent writers push this file -- the local daemon and the hourly CI
+ * backstop -- and neither knows what the other just fetched. Last push wins,
+ * which is how a CI run whose page 2 answered HTTP 500 published 60 PRs over the
+ * daemon's complete 116 and the page read "60 open" again. So the union is taken
+ * by PR number: a PR either side saw stays listed, a field one side filled in
+ * (diffstat, preview) survives the other side's blank, and the count can only
+ * move toward GitHub's own total, never below it.
+ *
+ * `listComplete` is the permission to *forget*: it says the stored set is exactly
+ * the open set, so a PR missing from it has closed and its cached preview can go.
+ * A union of a complete list with a short one is not complete -- the short side
+ * may simply have failed to see a PR, and deleting on that assumption is how 56
+ * previews disappeared once. Only two complete sides make a complete merge.
+ */
+export function mergeOpenPrs (ours, theirs) {
+  const norm = (v) => Array.isArray(v) ? { prs: v } : (v || {})
+  const a = norm(ours)
+  const b = norm(theirs)
+  const byNum = new Map()
+  // `theirs` is applied last, so a fresher record of the same PR wins -- except
+  // where it simply knows less, which the per-field guard below protects.
+  for (const p of [...(a.prs || []), ...(b.prs || [])]) {
+    if (!p || p.number == null) continue
+    const prev = byNum.get(p.number)
+    if (!prev) { byNum.set(p.number, { ...p }); continue }
+    const merged = { ...prev }
+    for (const [k, v] of Object.entries(p)) {
+      // A page-1 list row carries additions: null where a per-PR call filled it;
+      // hasDiff is only ever set true. Never let a lesser record erase the better.
+      if (v == null || v === false) {
+        if (k === 'hasDiff' && v === false && prev.hasDiff === true) continue
+        if (k === 'hasDiff') continue
+        if (merged[k] == null) merged[k] = v
+        continue
+      }
+      merged[k] = v
+    }
+    byNum.set(p.number, merged)
+  }
+  const prs = [...byNum.values()]
+    .sort((x, y) => String(y.created || '').localeCompare(String(x.created || '')))
+  const total = Math.max(Number(a.total) || 0, Number(b.total) || 0, prs.length) || null
+  const fetchedAt = (Date.parse(b.fetchedAt || '') || 0) > (Date.parse(a.fetchedAt || '') || 0)
+    ? (b.fetchedAt || a.fetchedAt)
+    : (a.fetchedAt || b.fetchedAt)
+  // Still short of what GitHub reported? Then this is unfinished work, not a
+  // smaller repo: partial keeps the cache hot so the next run chases the rest.
+  const partial = Boolean(a.partial || b.partial) || (total != null && prs.length < total)
+  return {
+    ...(fetchedAt ? { fetchedAt } : {}),
+    ...(total != null ? { total } : {}),
+    listComplete: Boolean(a.listComplete && b.listComplete),
+    prs,
+    ...(partial ? { partial: true } : {})
+  }
+}
+
+/**
  * Merge-safe write for data/state.json. lastSha must never move backward, or
  * the next analyze pass re-scans commits it already handled and inflates
  * counts.commitsScanned.
@@ -140,7 +200,7 @@ export function mergeSyncState (ours, theirs) {
  */
 export async function capturePendingWrites (DATA, overrides = {}) {
   const onDisk = {}
-  for (const name of ['changelog.json', 'ai-summaries.json', 'state.json']) {
+  for (const name of ['changelog.json', 'ai-summaries.json', 'state.json', 'open-prs.json']) {
     const path = `${DATA}/${name}`
     // Only carry files that exist: a missing ai-summaries.json must not be
     // materialized as {} by an unrelated write, which would make a quiet
@@ -153,7 +213,8 @@ export async function capturePendingWrites (DATA, overrides = {}) {
 const MERGERS = {
   'changelog.json': mergeChangelog,
   'ai-summaries.json': mergeAiCache,
-  'state.json': mergeSyncState
+  'state.json': mergeSyncState,
+  'open-prs.json': mergeOpenPrs
 }
 
 /**

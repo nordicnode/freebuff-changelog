@@ -742,7 +742,7 @@ export function modelTimeline (modelEntries) {
 
 async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, '')}/${p}`, html) }
 
-export async function buildSite ({ changelog, openPrs, dist }) {
+export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
   const entries = [...changelog.entries].reverse() // newest first
   const byDay = groupByDay(entries)
   // "Related" is a reading aid for real changes: churn rows must neither appear
@@ -1627,11 +1627,13 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   <div class="term-box">
     <div class="term-box-hdr">
       <span class="term-box-title">PULL_REQUESTS :: CodebuffAI/freebuff [in flight]</span>
-      <span>${openPrs.length} open</span>
+      <span>${openPrs.length}${prMeta.total > openPrs.length ? ` of ${prMeta.total}` : ''} open</span>
     </div>
     <p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">
       Community contributions awaiting merge or snapshot sync. Updated ${esc(fmtDateHuman(generated))} UTC.
     </p>
+    ${prMeta.total > openPrs.length ? `<p style="margin:6px 0 0;font-size:.8rem;color:var(--term-amber)">Upstream reports ${prMeta.total} open pull requests; ${prMeta.total - openPrs.length} ${prMeta.total - openPrs.length === 1 ? 'is' : 'are'} not listed yet. The fetch came back short of the count GitHub gives, and every sync run retries it until the list is whole.</p>` : ''}
+    ${prMeta.ageMin > 90 ? `<p style="margin:6px 0 0;font-size:.8rem;color:var(--term-amber)">Last successful check was ${prMeta.ageMin >= 60 ? `${Math.round(prMeta.ageMin / 60)} h` : `${prMeta.ageMin} min`} ago -- the sync has not reached GitHub since. A healthy run refreshes this list every few minutes.</p>` : ''}
   </div>
 </section>
 <div class="pr-list">${cards}</div>`
@@ -1677,7 +1679,9 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     days: byDay.length,
     releases: vers.length,
     models: { changes: modelEntries.length, live: modelLive.length },
-    openPrs: openPrs?.length || 0
+    openPrs: openPrs?.length || 0,
+    openPrsTotal: prMeta.total || openPrs?.length || 0,
+    openPrsCheckedMinAgo: prMeta.ageMin ?? null
   }))
 
   // ----- stable commit permalink: /c/<sha>
