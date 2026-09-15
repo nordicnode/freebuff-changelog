@@ -41,6 +41,23 @@ function patternMatches (pattern, url) {
   return pattern.endsWith('*') || at === url.length
 }
 
+// Cloudflare validates _redirects against the *version*, not the build: a rule
+// whose target can reach itself fails the whole deploy, and it strips `.html`
+// and a trailing `/index` from the target before matching -- so
+// `/c/* -> /c/index.html` is an "infinite loop" even though it looks like a
+// plain rewrite. Catch it here, where it costs a test run, not a deploy.
+function redirectLoops (text) {
+  const bad = []
+  for (const line of text.split('\n')) {
+    const [from, to] = line.trim().split(/\s+/)
+    if (!from || !to) continue
+    for (const cand of [to, to.replace(/\.html$/, ''), to.replace(/\/index$/, '')]) {
+      if (patternMatches(from, cand)) { bad.push(`${from} -> ${to}`); break }
+    }
+  }
+  return bad
+}
+
 function duplicatedHeaders (rules, url) {
   const seen = new Map()
   for (const r of rules) {
@@ -548,8 +565,9 @@ test('buildSite generates valid static site output', async () => {
     assert.deepEqual(Object.keys(shaDay).sort(), mockChangelog.entries.map(e => e.sha.slice(0, 12)).sort(),
       'every entry is resolvable by its anchor')
     assert.equal(shaDay[mockChangelog.entries[0].sha.slice(0, 12)], mockChangelog.entries[0].day)
-    assert.match(redirectsTxt, /^\/c\/\* \/c\/index\.html 200$/m, 'the resolver answers every /c/ address')
-    const resolver = await readFile(join(tmpDist, 'c/index.html'), 'utf8')
+    assert.match(redirectsTxt, /^\/c\/\* \/permalink\.html 200$/m, 'the resolver answers every /c/ address')
+    assert.deepEqual(redirectLoops(redirectsTxt), [], 'no rule may reach itself: Cloudflare fails the deploy on one')
+    const resolver = await readFile(join(tmpDist, 'permalink.html'), 'utf8')
     assert.match(resolver, /name="robots" content="noindex"/, 'a lookup page must not dilute the day pages in search')
     assert.match(resolver, /location\.replace\(href\)/, 'it sends the visitor on, not just tells them')
     assert.match(resolver, /<noscript>/, 'and says so when JS is off')
