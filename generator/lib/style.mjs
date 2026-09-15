@@ -798,6 +798,20 @@ nav.term-nav a.active{
 .meta-link:hover{
   color:var(--term-cyan);
 }
+/* The discord copy control sits in the same row as the meta links, so it has to
+   look like one -- a <button> would otherwise arrive with the UA's chrome. */
+button.meta-link{
+  background:none;
+  border:0;
+  padding:0;
+  margin:0;
+  font:inherit;
+  cursor:pointer;
+}
+button.meta-link.dc-ok{
+  color:var(--term-green);
+  text-decoration:none;
+}
 
 .models-intro{margin:0 0 12px;font-size:.82rem;color:var(--txt-dim)}
 .model-grid{display:flex;flex-wrap:wrap;gap:6px}

@@ -82,6 +82,15 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
   advertising a diff that had been deleted, and a toggle that fetches a 404 is
   worse than the GitHub compare link beside it. The only rows without a toggle
   are the handful whose commit is genuinely empty (a net-zero merge).
+* Every entry card carries a `discord` button that copies a Discord-formatted version
+  of that entry, composed at build time and clipped to Discord's 2,000-character
+  limit: bold header line, `###` heading, the plain-English line as a quote, the
+  summary, facts as a list, model in/out, stats, then links. GitHub links are
+  angle-bracketed so they stay text and the single bare URL — the `/c/<sha>` permalink
+  — is the only embed, drawn from the site's own `og:image`. Stray `**` and `_` are
+  escaped outside code spans (README bullets arrive with unbalanced markers, which
+  would otherwise bold the rest of the message); balanced pairs in the AI summaries
+  pass through, because the summaries already use the subset `miniMd` renders.
 * The front page filters: a chip per category present on the page, one toggle for
   churn, state kept in `localStorage`. Filtering is a visibility flip over rows
   that are already in the document, so it costs no request and no backend. **Churn

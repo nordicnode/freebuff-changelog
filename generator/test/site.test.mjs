@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildSite, modelTimeline, modelSlug, scoreHit } from '../lib/site.mjs'
+import { buildSite, modelTimeline, modelSlug, scoreHit, discordText } from '../lib/site.mjs'
 import { syncStaleMs } from '../lib/sync.mjs'
 
 // _headers rules cannot override each other on Cloudflare: every rule whose
@@ -461,6 +461,14 @@ test('buildSite generates valid static site output', async () => {
 
     // Verify day jump, split-view toggle, collapse, sitemap models
     const dayHtml2 = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
+    // Every entry card carries a copy-to-Discord button whose payload is composed at
+    // build time. The attribute is the risky part: a quoted attribute value has to
+    // survive real newlines and markdown punctuation on its way back out of the parser.
+    const dcAttr = /data-dc="([^"]*)"/.exec(dayHtml2)?.[1]
+    assert.ok(dcAttr, 'the card ships a discord payload')
+    assert.ok(dcAttr.includes('\n\n'), 'blank lines survive the attribute')
+    assert.ok(dcAttr.startsWith('**FREEBUFF'), 'it opens with the bold header line')
+    assert.ok(/\/c\/[0-9a-f]{12}$/.test(dcAttr.trim()), 'and closes on the bare permalink Discord will embed')
     assert.match(dayHtml2, /class="day-jump"/)
     assert.match(dayHtml2, /data-mode="split"/)
     // Every index row is a full body: no teaser class, no hop to a day page.
@@ -858,4 +866,43 @@ test('release page: a long window folds its tail into compact rows', async () =>
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }
+})
+
+const dcEntry = () => ({
+  kind: 'community', sha: 'a'.repeat(40), day: '2026-09-13', date: '2026-09-13T10:00:00.000Z',
+  category: 'Model Catalog', significance: 'major', author: 'Ada', pr: 12,
+  prUrl: 'https://github.com/CodebuffAI/freebuff/pull/12',
+  url: 'https://github.com/CodebuffAI/freebuff/commit/' + 'a'.repeat(40),
+  ai: { title: 'Muse Spark 1.3 ships', summary: 'Swaps muse_spark_1_2 for `muse_spark_1_3` in **backend**.' },
+  eli5: { text: 'The free model was replaced with a newer one.' },
+  facts: ['Adds /new /command'],
+  modelChanges: { added: ['Muse Spark 1.3'], removed: ['Muse Spark 1.2'] },
+  files: { total: 3 }, stats: { additions: 12, deletions: 4 }, version: '1.0.598'
+})
+
+test('discordText: the paste is valid Discord markdown inside the 2000-char cap', () => {
+  const t = discordText(dcEntry())
+  assert.ok(t.length <= 2000)
+  assert.ok(t.startsWith('**FREEBUFF · Model Catalog · 2026-09-13 · MAJOR**'), 'bold header line')
+  assert.match(t, /^### Muse Spark 1\.3 ships$/m, 'a heading, not a plain line')
+  assert.match(t, /^> The free model was replaced with a newer one\.$/m, 'the plain-English line quotes')
+  assert.ok(t.includes('muse\\_spark\\_1\\_2'), 'stray underscores are escaped: Discord reads them as italics')
+  assert.ok(t.includes('`muse_spark_1_3`'), 'but not inside a code span, where they are already literal')
+  const stray = discordText({ ...dcEntry(), facts: ['Five products.** No subscription needed.'] })
+  assert.ok(stray.includes('Five products.\\*\\* No subscription'), 'a stray ** is escaped, or it would bold the rest of the message')
+  assert.ok(t.includes('**backend**'), 'a balanced pair still renders as bold')
+  assert.match(t, /^- Adds \/new \/command$/m)
+  assert.match(t, /out: Muse Spark 1\.2 → in: Muse Spark 1\.3/)
+  assert.ok(t.includes('`aaaaaaaaaaaa` · +12 / −4 · 3 files · v1.0.598 · PR #12 · by Ada'), 'stats, version, PR and author on one line')
+  assert.ok(t.includes('<https://github.com/CodebuffAI/freebuff/pull/12>'), 'angle-bracketed links do not embed')
+  assert.ok(t.endsWith('/c/' + 'a'.repeat(12)), 'the one bare URL is last, so Discord embeds the changelog card')
+  assert.equal((t.match(/https?:\/\//g) || []).length, 3, 'exactly one embeddable URL in the message')
+})
+
+test('discordText: a monster entry still fits, and never loses its permalink', () => {
+  const e = { ...dcEntry(), eli5: { text: 'long. '.repeat(400) }, facts: [], ai: { title: 'T', summary: 'word '.repeat(1200) } }
+  const t = discordText(e)
+  assert.ok(t.length <= 2000, `${t.length} chars exceeds the Discord limit and the paste would be rejected`)
+  assert.ok(t.endsWith('/c/' + 'a'.repeat(12)), 'the summary gives way first, the permalink never does')
+  assert.ok(t.includes('> long.'), 'the plain-English line is kept')
 })

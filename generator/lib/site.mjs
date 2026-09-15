@@ -171,6 +171,44 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+// Delegated, not wired per element: the /c/ page imports its card from another
+// document after load, so a listener attached at build time would not exist on it.
+document.addEventListener('click', (ev) => {
+  const btn = ev.target.closest ? ev.target.closest('.dc-copy') : null;
+  if (!btn) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  copyText(btn.dataset.dc || '').then((ok) => {
+    const orig = btn.textContent;
+    btn.textContent = ok ? '[copied: paste into Discord]' : '[copy blocked]';
+    btn.classList.toggle('dc-ok', ok);
+    setTimeout(() => { btn.textContent = orig; btn.classList.remove('dc-ok'); }, 2400);
+  });
+});
+
+function copyText (text) {
+  // The async clipboard API is secure-context only; the Workers site is https, but
+  // a file:// preview or a plain-http mirror falls through to execCommand.
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text).then(() => true, () => legacyCopy(text));
+  }
+  return Promise.resolve(legacyCopy(text));
+}
+
+function legacyCopy (text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.top = '-1000px';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+  document.body.removeChild(ta);
+  return ok;
+}
+
 function copyDiff(btn) {
   const body = btn.closest('.diff-body');
   const pre = body ? body.querySelector('.diff-pre') : null;
@@ -524,6 +562,7 @@ ${relatedLine(e, relatedIdx)}
 <div class="metarow">
   <span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i> &middot; ${e.files.total} file${e.files.total === 1 ? '' : 's'}</span>
   <div class="meta-links">
+    <button class="meta-link dc-copy" type="button" data-dc="${esc(discordText(e))}" title="Copy this entry as Discord-formatted text">discord</button>
     ${e.sourceSha ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" rel="noopener" target="_blank">snapshot</a>` : ''}
     ${e.pr ? `<a class="meta-link" href="${esc(e.prUrl || '')}" rel="noopener" target="_blank">PR #${e.pr}</a>` : ''}
     ${e.compareUrl ? `<a class="meta-link" href="${esc(e.compareUrl)}" rel="noopener" target="_blank">compare</a>` : e.url ? `<a class="meta-link" href="${esc(e.url)}" rel="noopener" target="_blank">commit</a>` : ''}
@@ -535,6 +574,80 @@ ${relatedLine(e, relatedIdx)}
 
 function deriveTitleSafe (e) {
   return (e.summary || '').split(/[.:]/)[0].slice(0, 70) || `${e.category} update`
+}
+
+// Discord's markdown is a small, specific dialect: **bold**, ### headings, >
+// quotes, `code`, a `- ` list, and a bare URL that becomes an embed. The stored
+// summaries are already written in that same subset (miniMd renders `code`,
+// **bold** and [links](url)), so almost nothing has to be rewritten -- the one
+// real job is escaping underscores, which Discord reads as italics and which
+// file paths and snake_case identifiers are full of.
+const DC_LIMIT = 2000
+
+// Escape outside `code spans` only: inside one, a literal underscore is already
+// safe, and escaping it there would show the backslash.
+function dcEsc (s) {
+  const segs = String(s).split(/(`[^`]*`)/)
+  // The stored summaries use **bold** deliberately, so a balanced pair passes
+  // through. A *loner* does not: README bullets arrive as `text.** More text`,
+  // which is one pair with nothing to close against, and Discord would bold the
+  // rest of the message from there. Parity is checked on pairs and on leftover
+  // single stars separately -- two stars is a pair, not two stray italics markers.
+  let pairs = 0, singles = 0
+  for (let i = 0; i < segs.length; i += 2) {
+    const t = segs[i]
+    const n = (t.match(/\*/g) || []).length
+    pairs += Math.floor(n / 2)
+    singles += n % 2
+  }
+  const escapeStars = pairs % 2 === 1 || singles > 0
+  return segs.map((part, i) => {
+    if (i % 2) return part
+    let out = part.replace(/_/g, '\\_').replace(/\|\|/g, '\\|\\|')
+    if (escapeStars) out = out.replace(/\*/g, '\\*')
+    return out
+  }).join('')
+}
+
+export function discordText (e) {
+  const anchor = e.sha.slice(0, 12)
+  const title = e.ai?.title || e.title || deriveTitleSafe(e)
+  const sum = String(e.ai?.summary || e.summary || '').replace(/\s+/g, ' ').trim()
+  const head = ['FREEBUFF', e.category || 'Change', e.day]
+  if (e.significance && e.significance !== 'minor') head.push(e.significance.toUpperCase())
+  const parts = [`**${dcEsc(head.join(' · '))}**`, `### ${dcEsc(title)}`]
+  if (e.eli5?.text) parts.push(`> ${dcEsc(clipText(e.eli5.text, 300))}`)
+  let sumIdx = -1
+  if (sum) { sumIdx = parts.length; parts.push(dcEsc(sum)) }
+  const facts = (e.facts || []).slice(0, 3).map(f => `- ${dcEsc(clipText(f, 160))}`)
+  if (facts.length) parts.push(facts.join('\n'))
+  const added = e.modelChanges?.added || [], removed = e.modelChanges?.removed || []
+  if (added.length || removed.length) {
+    const pills = []
+    if (removed.length) pills.push('out: ' + removed.map(dcEsc).join(', '))
+    if (added.length) pills.push('in: ' + added.map(dcEsc).join(', '))
+    parts.push(`**Model catalog** — ${pills.join(' → ')}`)
+  }
+  const total = e.files?.total ?? 0
+  const meta = [`\`${anchor}\``, `+${e.stats?.additions ?? 0} / −${e.stats?.deletions ?? 0}`, `${total} file${total === 1 ? '' : 's'}`]
+  if (e.version) meta.push(`v${e.version}`)
+  if (e.pr) meta.push(`PR #${e.pr}`)
+  if (e.author && e.kind === 'community') meta.push(`by ${e.author}`)
+  parts.push(dcEsc(meta.join(' · ')))
+  // Angle brackets suppress a link, so these stay text: pasting five bare URLs
+  // into Discord yields five embeds, and the changelog card is the one worth seeing.
+  const links = [e.compareUrl || e.url, e.prUrl].filter(Boolean).map(u => `<${u}>`)
+  if (links.length) parts.push(links.join('   '))
+  // Last, bare: this is what turns the paste into a rich card, via the site's own
+  // og:image. It also keeps the entry's permalink in the message.
+  parts.push(`${SITE.url}/c/${anchor}`)
+  let text = parts.join('\n\n')
+  if (text.length > DC_LIMIT && sumIdx >= 0) {
+    const room = DC_LIMIT - (text.length - parts[sumIdx].length) - 8
+    parts[sumIdx] = dcEsc(clipText(sum, Math.max(0, room)))
+    text = parts.join('\n\n')
+  }
+  return text.length > DC_LIMIT ? text.slice(0, DC_LIMIT - 1) + '…' : text
 }
 
 // Search ranking (mirrored client-side): title hits beat category hits,
@@ -1411,7 +1524,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <strong>In-Flight PRs:</strong> every open upstream pull request, followed across API pages, with diffstat and a 120-line diff preview. Previews are fetched a budgeted batch per run — the unauthenticated GitHub API allows 60 calls an hour, and the list of 100+ PRs needs one per PR — so they fill in over successive runs; a PR missing one still links to GitHub, and previews are pruned once a PR closes.</p>
 
       <h4>HOW TO USE</h4>
-      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a> — which shows one list at a time (days, releases, categories) with each month folded until opened. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code>: that change alone, expanded, with nothing else from its day — and it survives the entry moving day.</p>
+      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a> — which shows one list at a time (days, releases, categories) with each month folded until opened. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code>: that change alone, expanded, with nothing else from its day — and it survives the entry moving day. The <code>discord</code> button on any entry copies a Discord-formatted version of it — heading, plain-English line, summary, stats and a link that renders as a card — ready to paste.</p>
       <p><strong>Find.</strong> The chip bar above the timeline filters the rows on that page by category (the churn chip toggles lockfile-only noise). <a href="/search/">/search/</a> queries every entry ever recorded — press <code>/</code> on any page to jump there — and <a href="/archive/#categories">/archive/</a> lists each category across all time.</p>
       <p><strong>Models, releases, PRs.</strong> <a href="/models/">/models/</a> replays the free-picker catalog with a page per model; <a href="/archive/#releases">release pages</a> list every commit between two versions; <a href="/stats/">/stats/</a> charts churn and cadence; <a href="/in-flight/">/in-flight/</a> previews open upstream pull requests before they merge.</p>
 
