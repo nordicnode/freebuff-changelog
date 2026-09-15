@@ -84,13 +84,22 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
   are the handful whose commit is genuinely empty (a net-zero merge).
 * Every entry card carries a `discord` button that copies a Discord-formatted version
   of that entry, composed at build time and clipped to Discord's 2,000-character
-  limit: bold header line, `###` heading, the plain-English line as a quote, the
-  summary, facts as a list, model in/out, stats, then links. GitHub links are
-  angle-bracketed so they stay text and the single bare URL — the `/c/<sha>` permalink
-  — is the only embed, drawn from the site's own `og:image`. Stray `**` and `_` are
-  escaped outside code spans (README bullets arrive with unbalanced markers, which
-  would otherwise bold the rest of the message); balanced pairs in the AI summaries
-  pass through, because the summaries already use the subset `miniMd` renders.
+  limit. The shape is Discord's own dialect: a header line, a `###` headline, the
+  plain-English line as a labelled quote, the summary **one sentence per line**
+  (Discord does not hard-wrap, so a paragraph pastes as one wall), model changes as
+  struck/bold list rows, highlights, then the commit, churn, release, PR and author
+  in a fenced code block — the only place Discord gives you aligned columns, and the
+  only place nothing has to be escaped. Links are masked (`[commit on GitHub](url)`),
+  and there is no link back to this site: the paste is the artifact, not a referral.
+  Markup that would run away with the
+  message is neutralised: an unbalanced `**` is *dropped* (README bullets arrive
+  like that, and escaping it would still print the debris), a stray or triple
+  backtick run is *escaped* (some prompt-text commits quote fences, and one opened
+  fence swallows everything after it), while `_` is escaped rather than deleted,
+  because it is usually part of a real path. Balanced pairs in the AI summaries pass
+  through untouched — they already use the subset `miniMd` renders. Over the cap, the
+  highlights list goes, then the tail of the summary; the header, quote, details and
+  links never do.
 * The front page filters: a chip per category present on the page, one toggle for
   churn, state kept in `localStorage`. Filtering is a visibility flip over rows
   that are already in the document, so it costs no request and no backend. **Churn

@@ -467,8 +467,9 @@ test('buildSite generates valid static site output', async () => {
     const dcAttr = /data-dc="([^"]*)"/.exec(dayHtml2)?.[1]
     assert.ok(dcAttr, 'the card ships a discord payload')
     assert.ok(dcAttr.includes('\n\n'), 'blank lines survive the attribute')
-    assert.ok(dcAttr.startsWith('**FREEBUFF'), 'it opens with the bold header line')
-    assert.ok(/\/c\/[0-9a-f]{12}$/.test(dcAttr.trim()), 'and closes on the bare permalink Discord will embed')
+    assert.ok(dcAttr.startsWith('**FREEBUFF** · `'), 'it opens with the header line')
+    assert.ok(dcAttr.includes('**Details**'), 'and closes with the aligned details block')
+    assert.ok(!/freebuff-changelog|workers\.dev/.test(dcAttr), 'no link to our own site anywhere in it')
     assert.match(dayHtml2, /class="day-jump"/)
     assert.match(dayHtml2, /data-mode="split"/)
     // Every index row is a full body: no teaser class, no hop to a day page.
@@ -880,29 +881,46 @@ const dcEntry = () => ({
   files: { total: 3 }, stats: { additions: 12, deletions: 4 }, version: '1.0.598'
 })
 
-test('discordText: the paste is valid Discord markdown inside the 2000-char cap', () => {
+test('discordText: organized for Discord -- labelled quote, one sentence per line, an aligned details block', () => {
   const t = discordText(dcEntry())
   assert.ok(t.length <= 2000)
-  assert.ok(t.startsWith('**FREEBUFF · Model Catalog · 2026-09-13 · MAJOR**'), 'bold header line')
+  assert.ok(t.startsWith('**FREEBUFF** · `Model Catalog` · Sep 13, 2026 · **MAJOR**'), 'header line')
   assert.match(t, /^### Muse Spark 1\.3 ships$/m, 'a heading, not a plain line')
-  assert.match(t, /^> The free model was replaced with a newer one\.$/m, 'the plain-English line quotes')
+  assert.match(t, /^> \*\*In plain English\*\*\n> The free model was replaced with a newer one\.$/m, 'the ELI5 line, labelled and quoted')
+  assert.ok(!/freebuff-changelog|workers\.dev/.test(t), 'the paste carries no link to our own site')
   assert.ok(t.includes('muse\\_spark\\_1\\_2'), 'stray underscores are escaped: Discord reads them as italics')
   assert.ok(t.includes('`muse_spark_1_3`'), 'but not inside a code span, where they are already literal')
-  const stray = discordText({ ...dcEntry(), facts: ['Five products.** No subscription needed.'] })
-  assert.ok(stray.includes('Five products.\\*\\* No subscription'), 'a stray ** is escaped, or it would bold the rest of the message')
   assert.ok(t.includes('**backend**'), 'a balanced pair still renders as bold')
-  assert.match(t, /^- Adds \/new \/command$/m)
-  assert.match(t, /out: Muse Spark 1\.2 → in: Muse Spark 1\.3/)
-  assert.ok(t.includes('`aaaaaaaaaaaa` · +12 / −4 · 3 files · v1.0.598 · PR #12 · by Ada'), 'stats, version, PR and author on one line')
-  assert.ok(t.includes('<https://github.com/CodebuffAI/freebuff/pull/12>'), 'angle-bracketed links do not embed')
-  assert.ok(t.endsWith('/c/' + 'a'.repeat(12)), 'the one bare URL is last, so Discord embeds the changelog card')
-  assert.equal((t.match(/https?:\/\//g) || []).length, 3, 'exactly one embeddable URL in the message')
+  const stray = discordText({ ...dcEntry(), facts: ['Five products.** No subscription needed.'] })
+  assert.ok(stray.includes('- Five products. No subscription needed.'), 'a stray ** is dropped, not escaped: escaping still prints the debris')
+  assert.match(t, /\*\*Model catalog\*\*\n- `−` ~~Muse Spark 1\.2~~\n- `\+` \*\*Muse Spark 1\.3\*\*/, 'retired struck, new bold, each on its own line')
+  assert.match(t, /\*\*Highlights\*\*\n- Adds \/new \/command/)
+  const block = /```([^`]*)```/.exec(t)[1].trim().split('\n')
+  assert.match(block[0], /^commit\s+a{12}$/, 'the commit is the first row')
+  assert.equal(new Set(block.map(l => l.match(/^\S+\s+/)[0].length)).size, 1, 'every value starts in the same column')
+  for (const row of [/^churn\s+\+12 \/ −4$/, /^files\s+3$/, /^release\s+v1\.0\.598$/, /^pull\s+#12$/, /^author\s+Ada$/]) {
+    assert.ok(block.some(l => row.test(l)), `details block is missing ${row}`)
+  }
+  assert.match(t, /\*\*Links\*\* · \[commit on GitHub\]\([^)]+\) · \[PR #12\]\([^)]+\)/, 'masked links on one tidy line')
+  assert.ok(!t.includes('<https://'), 'no raw URLs in the message')
+  // Prompt-text commits quote Discord fences verbatim, and an opened fence swallows
+  // the rest of the message. Ours is the only one that survives into the paste.
+  const fenced = discordText({ ...dcEntry(), facts: [], modelChanges: null, ai: { title: 'Use ``` tags', summary: 'Say ``` to fence it.' } })
+  assert.equal(fenced.split('```').length - 1, 2, 'exactly one fence pair: the details block')
+  assert.ok(fenced.includes('\\`'.repeat(3)), 'the data backticks arrive escaped, so they render as text')
+  const prose = discordText({
+    ...dcEntry(), facts: [], modelChanges: null,
+    ai: { title: 'T', summary: 'First thing happened. It touched `a_b`. Third part done.' }
+  })
+  assert.ok(prose.includes('First thing happened.\nIt touched `a_b`.\nThird part done.'), 'a paragraph becomes one sentence per line')
 })
 
-test('discordText: a monster entry still fits, and never loses its permalink', () => {
-  const e = { ...dcEntry(), eli5: { text: 'long. '.repeat(400) }, facts: [], ai: { title: 'T', summary: 'word '.repeat(1200) } }
+test('discordText: a monster entry still fits the 2000-char cap, giving up detail in reverse order', () => {
+  const e = { ...dcEntry(), eli5: { text: 'long. '.repeat(400) }, facts: ['keep me'], ai: { title: 'T', summary: 'word '.repeat(1200) } }
   const t = discordText(e)
   assert.ok(t.length <= 2000, `${t.length} chars exceeds the Discord limit and the paste would be rejected`)
-  assert.ok(t.endsWith('/c/' + 'a'.repeat(12)), 'the summary gives way first, the permalink never does')
-  assert.ok(t.includes('> long.'), 'the plain-English line is kept')
+  assert.ok(!t.includes('keep me'), 'the highlights list goes first')
+  assert.ok(t.includes('```'), 'the details block survives')
+  assert.ok(t.includes('**In plain English**'), 'and so does the plain-English quote')
+  assert.ok(t.includes('word word'), 'the summary keeps its head and loses its tail')
 })

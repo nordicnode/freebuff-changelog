@@ -576,23 +576,43 @@ function deriveTitleSafe (e) {
   return (e.summary || '').split(/[.:]/)[0].slice(0, 70) || `${e.category} update`
 }
 
-// Discord's markdown is a small, specific dialect: **bold**, ### headings, >
-// quotes, `code`, a `- ` list, and a bare URL that becomes an embed. The stored
-// summaries are already written in that same subset (miniMd renders `code`,
-// **bold** and [links](url)), so almost nothing has to be rewritten -- the one
-// real job is escaping underscores, which Discord reads as italics and which
-// file paths and snake_case identifiers are full of.
+// Discord's markdown is a small dialect: **bold**, ### headings, > quotes, `- `
+// lists, ``` fenced blocks and [label](url) masked links. No tables, and no
+// alignment outside a code block -- which is why the figures go into a fenced
+// block: monospace columns are the only tidy table Discord has, and inside one
+// nothing needs escaping at all.
+//
+// It also does not hard-wrap, so a four-sentence summary arrives as one
+// unreadable wall. Hence the layout: header, headline, the plain-English line as
+// a quote, the summary one sentence per line, model changes, highlights, an
+// aligned details block, then masked links. No link to our own site: the message
+// is the artifact, not a referral.
 const DC_LIMIT = 2000
 
 // Escape outside `code spans` only: inside one, a literal underscore is already
 // safe, and escaping it there would show the backslash.
 function dcEsc (s) {
-  const segs = String(s).split(/(`[^`]*`)/)
+  let raw = String(s)
+  // Backticks first, because they decide whether anything else is read as text:
+  // an odd count leaves an inline span open for the rest of the message, and a run
+  // of three opens a fence -- which some prompt-text summaries contain. Escaping
+  // them costs the styling and keeps the message readable; leaving them would do
+  // the opposite. An even count means the pairs are the intended code spans.
+  const odd = ((raw.match(/`/g) || []).length) % 2 === 1
+  if (odd) raw = raw.replace(/`/g, '\\`')
+  else raw = raw.replace(/`{3,}/g, run => run.replace(/`/g, '\\`'))
+  const segs = odd ? [raw] : raw.split(/(`[^`]*`)/)
   // The stored summaries use **bold** deliberately, so a balanced pair passes
   // through. A *loner* does not: README bullets arrive as `text.** More text`,
-  // which is one pair with nothing to close against, and Discord would bold the
-  // rest of the message from there. Parity is checked on pairs and on leftover
-  // single stars separately -- two stars is a pair, not two stray italics markers.
+  // one pair with nothing to close against, and Discord would bold the rest of the
+  // message from there. Parity is checked on pairs and on leftover single stars
+  // separately -- two stars is a pair, not two italics markers.
+  //
+  // An unbalanced line has its markers *dropped*, not backslash-escaped: escaping
+  // would print `research.\*\* No subscription` in the source and render a stray
+  // `**` in the message, and either way the reader sees debris that meant nothing.
+  // Underscores are the opposite case -- they are usually part of a real path or
+  // identifier -- so those are escaped rather than removed.
   let pairs = 0, singles = 0
   for (let i = 0; i < segs.length; i += 2) {
     const t = segs[i]
@@ -600,48 +620,68 @@ function dcEsc (s) {
     pairs += Math.floor(n / 2)
     singles += n % 2
   }
-  const escapeStars = pairs % 2 === 1 || singles > 0
+  const dropStars = pairs % 2 === 1 || singles > 0
   return segs.map((part, i) => {
     if (i % 2) return part
     let out = part.replace(/_/g, '\\_').replace(/\|\|/g, '\\|\\|')
-    if (escapeStars) out = out.replace(/\*/g, '\\*')
+    if (dropStars) out = out.replace(/\*/g, '')
     return out
   }).join('')
 }
 
+// Sentence boundaries, so each can go on its own line. The lookahead keeps a
+// decimal (`+1.5`) and an initial (`v1. e.g.`) from splitting mid-thought.
+function dcSentences (text) {
+  return String(text).split(/(?<=[.!?])\s+(?=[A-Z(`_$\d])/).map(s => s.trim()).filter(Boolean)
+}
+
+// The one place Discord gives you columns. Values here are hex, digits and names,
+// so no backtick or fence can arrive from the data.
+function dcDetails (e) {
+  const rows = [['commit', e.sha.slice(0, 12)]]
+  if (e.sourceSha) rows.push(['snapshot', String(e.sourceSha).slice(0, 12)])
+  rows.push(['churn', `+${e.stats?.additions ?? 0} / −${e.stats?.deletions ?? 0}`])
+  rows.push(['files', String(e.files?.total ?? 0)])
+  if (e.version) rows.push(['release', `v${e.version}`])
+  if (e.pr) rows.push(['pull', `#${e.pr}`])
+  if (e.author) rows.push(['author', e.author])
+  const w = Math.max(...rows.map(r => r[0].length))
+  // Values are hex, digits and names, but a backtick in any of them would close the
+  // fence early and turn the rest of the message into code.
+  return rows.map(r => `${r[0].padEnd(w)}  ${String(r[1]).replace(/`/g, '')}`).join('\n')
+}
+
 export function discordText (e) {
-  const anchor = e.sha.slice(0, 12)
   const title = e.ai?.title || e.title || deriveTitleSafe(e)
   const sum = String(e.ai?.summary || e.summary || '').replace(/\s+/g, ' ').trim()
-  const head = ['FREEBUFF', e.category || 'Change', e.day]
-  if (e.significance && e.significance !== 'minor') head.push(e.significance.toUpperCase())
-  const parts = [`**${dcEsc(head.join(' · '))}**`, `### ${dcEsc(title)}`]
-  if (e.eli5?.text) parts.push(`> ${dcEsc(clipText(e.eli5.text, 300))}`)
+  const sig = e.significance === 'noise' ? 'churn' : e.significance
+  const head = ['**FREEBUFF**', `\`${e.category || 'Change'}\``, fmtDateHuman(e.day)]
+  if (sig && sig !== 'minor') head.push(`**${sig.toUpperCase()}**`)
+  const parts = [head.join(' · '), `### ${dcEsc(title)}`]
+  // Every line of a quote needs its own `>`: a wrapped continuation is fine, but a
+  // hard newline without it would drop out of the quote and lose the rule.
+  if (e.eli5?.text) {
+    parts.push(`> **In plain English**\n> ${dcSentences(clipText(e.eli5.text, 300)).join('\n> ')}`)
+  }
   let sumIdx = -1
-  if (sum) { sumIdx = parts.length; parts.push(dcEsc(sum)) }
-  const facts = (e.facts || []).slice(0, 3).map(f => `- ${dcEsc(clipText(f, 160))}`)
-  if (facts.length) parts.push(facts.join('\n'))
+  if (sum) { sumIdx = parts.length; parts.push(dcSentences(sum).map(dcEsc).join('\n')) }
   const added = e.modelChanges?.added || [], removed = e.modelChanges?.removed || []
   if (added.length || removed.length) {
-    const pills = []
-    if (removed.length) pills.push('out: ' + removed.map(dcEsc).join(', '))
-    if (added.length) pills.push('in: ' + added.map(dcEsc).join(', '))
-    parts.push(`**Model catalog** — ${pills.join(' → ')}`)
+    const rows = [...removed.map(m => `- \`−\` ~~${dcEsc(m)}~~`), ...added.map(m => `- \`+\` **${dcEsc(m)}**`)]
+    parts.push(`**Model catalog**\n${rows.join('\n')}`)
   }
-  const total = e.files?.total ?? 0
-  const meta = [`\`${anchor}\``, `+${e.stats?.additions ?? 0} / −${e.stats?.deletions ?? 0}`, `${total} file${total === 1 ? '' : 's'}`]
-  if (e.version) meta.push(`v${e.version}`)
-  if (e.pr) meta.push(`PR #${e.pr}`)
-  if (e.author && e.kind === 'community') meta.push(`by ${e.author}`)
-  parts.push(dcEsc(meta.join(' · ')))
-  // Angle brackets suppress a link, so these stay text: pasting five bare URLs
-  // into Discord yields five embeds, and the changelog card is the one worth seeing.
-  const links = [e.compareUrl || e.url, e.prUrl].filter(Boolean).map(u => `<${u}>`)
-  if (links.length) parts.push(links.join('   '))
-  // Last, bare: this is what turns the paste into a rich card, via the site's own
-  // og:image. It also keeps the entry's permalink in the message.
-  parts.push(`${SITE.url}/c/${anchor}`)
+  const facts = (e.facts || []).slice(0, 3).map(f => `- ${dcEsc(clipText(f, 160))}`)
+  let factsIdx = -1
+  if (facts.length) { factsIdx = parts.length; parts.push(`**Highlights**\n${facts.join('\n')}`) }
+  parts.push(`**Details**\n\`\`\`\n${dcDetails(e)}\n\`\`\``)
+  const links = []
+  if (e.compareUrl || e.url) links.push(`[${e.compareUrl ? 'compare' : 'commit'} on GitHub](${e.compareUrl || e.url})`)
+  if (e.prUrl) links.push(`[PR #${e.pr}](${e.prUrl})`)
+  if (links.length) parts.push(`**Links** · ${links.join(' · ')}`)
   let text = parts.join('\n\n')
+  // Give up detail in reverse order of value: the highlights list, then the tail of
+  // the summary. The header, quote, details and links are what identifies the change.
+  if (text.length > DC_LIMIT && factsIdx >= 0) { parts.splice(factsIdx, 1); text = parts.join('\n\n') }
   if (text.length > DC_LIMIT && sumIdx >= 0) {
     const room = DC_LIMIT - (text.length - parts[sumIdx].length) - 8
     parts[sumIdx] = dcEsc(clipText(sum, Math.max(0, room)))
@@ -1524,7 +1564,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <strong>In-Flight PRs:</strong> every open upstream pull request, followed across API pages, with diffstat and a 120-line diff preview. Previews are fetched a budgeted batch per run — the unauthenticated GitHub API allows 60 calls an hour, and the list of 100+ PRs needs one per PR — so they fill in over successive runs; a PR missing one still links to GitHub, and previews are pruned once a PR closes.</p>
 
       <h4>HOW TO USE</h4>
-      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a> — which shows one list at a time (days, releases, categories) with each month folded until opened. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code>: that change alone, expanded, with nothing else from its day — and it survives the entry moving day. The <code>discord</code> button on any entry copies a Discord-formatted version of it — heading, plain-English line, summary, stats and a link that renders as a card — ready to paste.</p>
+      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a> — which shows one list at a time (days, releases, categories) with each month folded until opened. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code>: that change alone, expanded, with nothing else from its day — and it survives the entry moving day. The <code>discord</code> button on any entry copies a Discord-formatted version of it — headline, the plain-English line, the summary one sentence per line, model changes, and an aligned details block with the commit, churn, release and author — ready to paste, no link back here.</p>
       <p><strong>Find.</strong> The chip bar above the timeline filters the rows on that page by category (the churn chip toggles lockfile-only noise). <a href="/search/">/search/</a> queries every entry ever recorded — press <code>/</code> on any page to jump there — and <a href="/archive/#categories">/archive/</a> lists each category across all time.</p>
       <p><strong>Models, releases, PRs.</strong> <a href="/models/">/models/</a> replays the free-picker catalog with a page per model; <a href="/archive/#releases">release pages</a> list every commit between two versions; <a href="/stats/">/stats/</a> charts churn and cadence; <a href="/in-flight/">/in-flight/</a> previews open upstream pull requests before they merge.</p>
 
