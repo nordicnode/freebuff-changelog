@@ -1589,7 +1589,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
 
         <h4>WHAT WE TRACK</h4>
         <dl class="man-dl">
-          <dt>Model Catalog</dt><dd>${(cats.get('Model Catalog') || 0).toLocaleString()}</dd><dd class="man-note">additions, retirements and swaps in the free picker, with access and trait columns &mdash; <a href="/models/">catalog timeline</a></dd>
+          <dt>Model Catalog</dt><dd>${(cats.get('Model Catalog') || 0).toLocaleString()}</dd><dd class="man-note">additions, retirements and swaps in the free picker, with access and trait columns. See the <a href="/models/">catalog timeline</a></dd>
           <dt>Releases</dt><dd>${vers.length.toLocaleString()}</dd><dd class="man-note">CLI and core version bumps, each page listing every commit in range</dd>
           <dt>Commands</dt><dd>${(cats.get('Commands') || 0).toLocaleString()}</dd><dd class="man-note">slash commands added or removed; renames surface as add+remove</dd>
           <dt>Code areas</dt><dd>${areaTotal.toLocaleString()}</dd><dd class="man-note">${areaLine}</dd>
@@ -1612,7 +1612,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         <p>Snapshots squash upstream history, so ordering inside one snapshot is approximate and authorship resolves to the bot. AI text describes only what the diff shows: no research, no speculation about capabilities.</p>
 
         <h4>FRESHNESS</h4>
-        <p>A loop polls upstream every 30 seconds, re-analyzes, and pushes the data &mdash; a commit is readable here about 2 minutes after it lands in the public repo. Upstream's own snapshot squash usually delays a change longer than our whole pipeline does. An hourly GitHub Action covers the loop being down.</p>
+        <p>A loop polls upstream every 30 seconds, re-analyzes, and pushes the data, so a commit is readable here about 2 minutes after it lands in the public repo. Upstream's own snapshot squash usually delays a change longer than our whole pipeline does. An hourly GitHub Action covers the loop being down.</p>
 
         <h4>FEEDS + SOURCE</h4>
         <p><a href="/feed.xml">RSS major + notable</a> &middot; <a href="/feed-models.xml">models only</a> &middot; <a href="/feed-releases.xml">releases only</a>. Generator: <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener">nordicnode/freebuff-changelog</a>; Cloudflare deploys on every data push.</p>

@@ -439,9 +439,11 @@ test('buildSite generates valid static site output', async () => {
     assert.match(aboutHtml, /class="man-routes"/)
     // The page explains itself; it is not allowed to become a manual again. It ran
     // to 2,300 words of prose before being cut back to the chase.
-    const aboutWords = aboutHtml.split('man-body">')[1].split('</section>')[0]
+    const aboutBody = aboutHtml.split('man-body">')[1].split('</section>')[0]
+    const aboutWords = aboutBody
       .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length
     assert.ok(aboutWords < 500, `about page is ${aboutWords} words; keep it under 500`)
+    assert.doesNotMatch(aboutBody, /&mdash;|\u2014/, 'about copy carries no em-dashes')
 
     // Verify models page: lineup, retired, history rows, nav
     const modelsHtml = await readFile(join(tmpDist, 'models/index.html'), 'utf8')
