@@ -210,6 +210,13 @@ hourly pass runs over all entries rather than only the additions, and the loop's
 drain sits outside the summary branch so a commit summarized in one pass is
 explained in the same cycle.
 
+Backlog order is by how much a plain line can say, not by date: this cycle's
+commits, then model swaps, then new commands, then rows carrying a developer
+comment, then notable work, then the rest — with bare version bumps last. They
+are tagged `major` by the release heuristic and there are 650 of them, so a
+date-ordered queue spends the whole budget explaining that a number went up
+while the interesting rows wait behind them.
+
 **Full coverage is a command, not a hope.** `npm run enrich-all` (`--batch N`,
 or `--batch 0` for everything left, plus `--push`) runs one pass: store any
 missing diffs, spend N calls on summaries and N on plain-English lines, publish,

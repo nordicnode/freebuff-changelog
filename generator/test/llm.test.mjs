@@ -474,6 +474,48 @@ test('eli5Patch: an unreadable diff never fails the pass', async () => {
   assert.equal(await eli5Patch(eli5Entry(), async () => 'patch text'), 'patch text')
 })
 
+test('enrichEli5: spends the budget where a story exists, not on version bumps', async (t) => {
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-eli5-order-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const env = {
+    CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1',
+    LLM_MODEL: 'm', CHANGELOG_ELI5_LIMIT: '2'
+  }
+  const ai = (title) => ({ model: 'm', v: PROMPT_V, title, summary: 'A version string changed.' })
+  // 650 rows in the real backlog look like this: tagged major by the release
+  // heuristic, and the only thing they do is raise a number.
+  const bump = (i) => eli5Entry({
+    sha: String(i).repeat(40), version: `0.0.${i}`, significance: 'major',
+    stats: { additions: 2, deletions: 2 }, files: { total: 2, meaningful: 2 }, ai: ai(`Version bump to 1.0.${i}`)
+  })
+  const entries = [
+    bump(1), bump(2), bump(3),
+    eli5Entry({ sha: 'a'.repeat(40), facts: ['Verified YC companies earn one credit.'], ai: ai('Credit program rules') }),
+    eli5Entry({ sha: 'b'.repeat(40), cmdChanges: { added: ['plan'], removed: [] }, ai: ai('New plan command') })
+  ]
+  const asked = []
+  const orig = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    // The body is JSON, so real newlines arrive escaped: stop at the backslash.
+    asked.push(/Title: ([^\\]*)/.exec(init.body)[1])
+    return {
+      ok: true, status: 200, headers: { get: () => null },
+      text: async () => JSON.stringify({ choices: [{ message: { content: JSON.stringify({ eli5: 'The assistant gained a new capability.' }) } }] })
+    }
+  }
+  try {
+    assert.equal(await enrichEli5(entries, dir, env, { retryErrors: true }), 2)
+  } finally {
+    globalThis.fetch = orig
+  }
+  assert.deepEqual(asked.slice().sort(), ['Credit program rules', 'New plan command'],
+    'a new command and a documented audience outrank a release whose only change is its number')
+  assert.ok(!asked.some(x => /Version bump/.test(x)), 'no bump consumed a call')
+})
+
 test('normalizeEli5: unwraps the reply, strips the echoed label, keeps it honest', () => {
   assert.equal(normalizeEli5({ eli5: 'The assistant can use a new model now.' }), 'The assistant can use a new model now.')
   assert.equal(normalizeEli5('ELI5:  A   new model works. '), 'A new model works.')

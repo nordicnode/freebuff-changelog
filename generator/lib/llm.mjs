@@ -512,7 +512,19 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   let apiCalls = 0
   let cacheModified = false
 
-  const prio = (e) => (priority.has(e.sha) ? -1 : e.modelChanges ? 0 : e.version ? 1 : e.cmdChanges ? 2 : 3)
+  // Ordered by how much a plain-English line can actually say. A model swap or a
+  // new command has a reader-facing story; a comment beside the code names its
+  // audience; a bare version bump has neither, and the honest line about it is "a
+  // number went up" -- so 650 of those must not drink the budget first.
+  const bumpOnly = (e) => !!e.version && !e.modelChanges && !e.cmdChanges &&
+    (e.stats?.additions ?? 99) <= 10 && (e.files?.meaningful ?? 99) <= 2
+  const prio = (e) => (priority.has(e.sha) ? -1
+    : e.modelChanges ? 0
+    : e.cmdChanges ? 1
+    : e.facts?.length ? 2
+    : bumpOnly(e) ? 5
+    : e.significance === 'major' || e.significance === 'notable' ? 3
+    : 4)
   const pending = entries.filter(eli5Eligible).filter(e => !eli5Done(e))
   pending.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
   // Same bound as the summary pass: choosing this run's dozen entries must not
