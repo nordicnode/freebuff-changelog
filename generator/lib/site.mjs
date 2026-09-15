@@ -1583,7 +1583,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         <h4>HOW IT WORKS</h4>
         <ul class="man-ul">
           <li><strong>Deterministic first.</strong> Model tables in both READMEs and the slash-command registry are parsed before and after each commit and set-differenced, so a description-only edit cancels out; version bumps come from release <code>package.json</code>. Timestamps normalize to UTC. Zero dependencies.</li>
-          <li><strong>LLM once per commit.</strong> A model rewrites each entry into a 2-4 sentence technical summary from the diff and nothing else, and a second pass adds the plain-English line under it. Cached by SHA, prompt version and diff hash, so a prompt edit re-summarizes exactly once. With no provider configured the deterministic text stands alone; nothing breaks.</li>
+          <li><strong>LLM once per commit.</strong> A model rewrites each entry into a 2-4 sentence technical summary from the diff and nothing else, and a second pass writes the plain-English line under it from the same evidence. Both are cached by SHA, prompt version and diff hash, so a prompt edit re-runs exactly once. With no provider configured the deterministic text stands alone; nothing breaks.</li>
           <li><strong>Every claim links to proof.</strong> Commit SHA, compare URL, stored diff and per-file stats on every row, with the diff loaded on demand.</li>
         </ul>
 

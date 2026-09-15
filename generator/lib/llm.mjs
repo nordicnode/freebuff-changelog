@@ -15,6 +15,8 @@
 //   CHANGELOG_LLM_LIMIT        max commits summarized per run (default 60; 0 = no cap)
 //   CHANGELOG_LLM_CONCURRENCY  parallel API calls (default 5)
 //   CHANGELOG_ELI5_LIMIT       plain-English pass budget (defaults to the above)
+//   CHANGELOG_ELI5_DIFF=0      explain from the summary only, skip the diff
+//   CHANGELOG_ELI5_DIFF_BYTES  diff budget sent to the plain-English pass (6000)
 //   CHANGELOG_LLM_CHURN=1      also summarize lockfile/icon-only rows, from their
 //                              raw diff (~1,900 extra calls)
 //   CHANGELOG_LLM_ERROR_COOLDOWN_MS  retry failed entries after this (default 3600000)
@@ -367,11 +369,12 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
 //     same cache file, and its own budget knobs.
 // It re-runs by itself whenever the summary it describes changes, because the
 // cache key hashes that summary and eli5Done() compares against it.
-// v2: the prompt now carries the developers' own comments and forbids widening a
-// named audience to "users". Every v1 line was written by a prompt that could only
-// see the title and the summary, so all of them are re-explained once, through the
-// same resumable budget (CHANGELOG_ELI5_LIMIT) rather than in one expensive pass.
-export const ELI5_V = 2
+// v3: the pass now sees what the summarizer saw -- the stored diff, the file list,
+// the catalog rows, same-day siblings and up to 8 comments -- because a line written
+// from the title and the summary alone repeats the summary and cannot correct it.
+// The whole backlog re-explains once through the same resumable budget
+// (CHANGELOG_ELI5_LIMIT); a diff costs ~1k tokens on top of a ~400 token ask.
+export const ELI5_V = 3
 
 // eli5Source() lives in util.mjs because the changelog merge has to recompute it
 // to check a merged ELI5 against the summary that survived. Re-exported here as
@@ -394,24 +397,59 @@ export function eli5Done (e) {
   return !!(e.eli5 && e.eli5.v >= ELI5_V && e.eli5.src === shortHash(eli5Source(e)))
 }
 
-export function buildEli5Prompt (e, notes = []) {
+export function buildEli5Prompt (e, notes = [], ctx = {}) {
+  const { patch = '', siblings = [], diffBytes = 6000 } = ctx
+  const evidence = []
+  if (e.summary && e.summary !== e.ai.summary) evidence.push(`What the analyzer measured: ${e.summary}`)
+  if (e.stats) {
+    // `meaningful`, not `total`: total counts the lockfile riding along in the
+    // snapshot, and the analyzer's own note right above it says otherwise.
+    const n = e.files?.meaningful ?? e.files?.total
+    evidence.push(`Size: ${e.stats.additions ?? '?'} lines added, ${e.stats.deletions ?? '?'} removed${n ? ` across ${n} file${n === 1 ? '' : 's'}` : ''}`)
+  }
+  const touched = [...(e.files?.added || []), ...(e.files?.modified || [])].slice(0, 12)
+  if (touched.length) evidence.push(`Where it landed: ${touched.join(', ')}`)
+  if (e.files?.churned?.length) evidence.push(`In the snapshot but not part of this change: ${e.files.churned.slice(0, 4).join(', ')}`)
+  if (e.modelChanges) {
+    const added = e.modelChanges.added || [], removed = e.modelChanges.removed || []
+    if (added.length || removed.length) evidence.push(`Model picker: in (${added.join(', ') || 'nothing'}), out (${removed.join(', ') || 'nothing'})`)
+    const tables = e.modelChanges.tables || {}
+    const rows = []
+    for (const m of [...added, ...removed]) {
+      const row = tables[m]?.after || tables[m]?.before
+      if (row) rows.push(`${m}: ${row.join(' | ')}`)
+    }
+    if (rows.length) evidence.push(`What the catalog says about them: ${rows.join(' || ')}`)
+  }
+  if (e.cmdChanges?.added?.length || e.cmdChanges?.removed?.length) {
+    evidence.push(`Slash commands: in (${e.cmdChanges.added.join(', ') || 'nothing'}), out (${e.cmdChanges.removed.join(', ') || 'nothing'})`)
+  }
+  if (e.version) evidence.push(`Shipped in version ${e.version}`)
+  if (siblings.length) evidence.push(`Other changes the same snapshot: ${siblings.slice(0, 6).join(' ; ')}`)
   const noteBlock = notes.length
     ? `\nComments the developers wrote beside this code. Read them: they say who this is for and what it does today, which the constant names do not.\n${notes.map(n => `- ${n}`).join('\n')}\n`
+    : ''
+  const diffBlock = patch
+    ? `\nThe change itself. Lockfiles and test-only hunks are already stripped; the full diff is on GitHub.\n\`\`\`diff\n${budgetPatch(patch, diffBytes, Math.max(800, Math.round(diffBytes / 4)))}\n\`\`\`\n`
     : ''
   return `Explain one software change to a reader who is not a programmer and will not look at the code.
 
 Date: ${e.day || ''}
-Area: ${e.category || ''}
+Area: ${e.category || (e.areas || []).join(', ')}
+Weight the tooling gave it: ${e.significance || 'minor'}
 Title: ${e.ai.title}
 Technical summary: ${e.ai.summary}
-${noteBlock}
-Write 1-3 sentences of plain English: what happened, and what it means for someone who just uses the product.
+${evidence.length ? `\nEvidence. Use it; do not repeat it back verbatim.\n${evidence.map(x => `- ${x}`).join('\n')}\n` : ''}
+${noteBlock}${diffBlock}
+Write 2-4 sentences of plain English: what happened, who it affects, and what that person would notice if they looked. Say the concrete thing, not the category of thing.
 
 Rules:
 - No jargon, acronyms, file names, function names, code or version numbers. Say what the thing does instead of what it is called ("the assistant can now use a new model", not "a provider adapter was wired up").
-- Use only what the summary and the comments say. Never invent a cause, a number, or a promise.
+- The diff and the file list are evidence, not vocabulary. Read them for the part the summary skipped: the threshold, the condition, the plan or region it applies to, the thing that stops working. Then translate that into plain words.
+- If the summary and the diff disagree about what happened, follow the diff.
+- Say whether it is live today. A constant, a flag, a field or a type that nothing reads yet is not a feature: say it is in place and does nothing yet.
+- Use only what the summary, the evidence and the comments say. Never invent a cause, a number, or a promise.
 - Keep the audience the text gives, and keep it narrow. If the change is for one kind of customer, one plan, one region, or only after some step, name that group. Never widen it to "users", "everyone" or "customers" because that reads more naturally: a program for verified YC companies is not available to users.
-- If nothing happens for anyone yet (a constant, a flag, scaffolding ahead of a launch), say that plainly. Do not describe a future behavior as if it is live today.
 - Plain words, active voice. No "This change", "We are excited", or marketing tone.
 - If the change is small or internal, say so shortly. Do not inflate it.
 - Never address the reader as a developer.
@@ -455,9 +493,22 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
   const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
   const priority = options.priorityShas instanceof Set ? options.priorityShas : new Set(options.priorityShas || [])
-  // Same patch reader the summary pass uses, so the plain-English line can read the
-  // comments the analysis pass may not have turned into facts.
+  // The patch reader the summary pass uses. The plain-English line reads the same
+  // stored diff: it is where the threshold, the condition and the audience live,
+  // and the pass already paid for the git work to mine comments out of it.
   const getPatch = typeof options.getPatch === 'function' ? options.getPatch : null
+  const wantDiff = env.CHANGELOG_ELI5_DIFF !== '0'
+  const diffBytes = Number(env.CHANGELOG_ELI5_DIFF_BYTES || 6000)
+  // Same-day titles, so a line can place its change instead of explaining one
+  // commit in a vacuum. Built once per run from entries already in memory.
+  const byDay = new Map()
+  for (const e of entries) {
+    if (e.noise || !e.day) continue
+    const t = e.ai?.title || e.title
+    if (!t) continue
+    const list = byDay.get(e.day) || []
+    if (list.length < 12) { list.push(t); byDay.set(e.day, list) }
+  }
   let apiCalls = 0
   let cacheModified = false
 
@@ -499,8 +550,12 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
       const idx = activeIndex++
       const { entry: e, src, key } = queue[idx]
       try {
-        const notes = await eli5Notes(e, getPatch)
-        const out = await callLlm(buildEli5Prompt(e, notes), env, 1, normalizeEli5)
+          const patch = await eli5Patch(e, wantDiff || !e.facts?.length ? getPatch : null)
+          const out = await callLlm(buildEli5Prompt(e, eli5Notes(e, patch), {
+            patch: wantDiff ? patch : '',
+            siblings: (byDay.get(e.day) || []).filter(t => t !== e.ai.title).slice(0, 6),
+            diffBytes
+          }), env, 1, normalizeEli5)
         gatewayFails = 0
         cache[key] = {
           model: env.LLM_MODEL || 'gpt-4o-mini',
@@ -543,17 +598,21 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   }
   return apiCalls
 }
-export async function eli5Notes (e, getPatch) {
-  if (e.facts?.length) return e.facts.slice(0, 5)
-  if (!getPatch) return []
-  // Rows analyzed before the comment extractor counted words rather than letter
-  // runs have no facts at all, and the sentence that names who a program is for is
-  // sitting in their diff. Re-read the stored patch rather than ship an ELI5 that
-  // has to guess the audience.
+// Comments beside the code, from the recorded facts and the patch, best first.
+// Merged rather than either-or: a row can carry facts the extractor kept and sit
+// next to a comment it dropped, and the audience is usually in the dropped one.
+export function eli5Notes (e, patch) {
+  const fromPatch = patch ? extractCommentFacts(patch) : []
+  return [...new Set([...(e.facts || []), ...fromPatch])].slice(0, 8)
+}
+
+// The stored clean diff, or ''. A missing worktree or an unreadable row must never
+// fail the pass: the summary alone still explains the change.
+export async function eli5Patch (e, getPatch) {
+  if (!getPatch) return ''
   try {
-    const patch = await getPatch(e)
-    return patch ? extractCommentFacts(patch).slice(0, 5) : []
+    return await getPatch(e) || ''
   } catch {
-    return []
+    return ''
   }
 }

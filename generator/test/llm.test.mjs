@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes } from '../lib/llm.mjs'
+import { parseLlmJson, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -399,10 +399,10 @@ test('CHANGELOG_LLM_LIMIT=0 drops the call cap but keeps the git window', async 
 })
 
 // ---------------------------------------------------------------------------
-// ELI5: the plain-English pass. Its contract is that it follows the summary --
-// same source text, so it re-runs exactly when that summary changes. It never pays
-// for a diff call, but it does read the stored diff for the comments the authors
-// wrote, because that is where an audience is named.
+// ELI5: the plain-English pass. It follows the summary -- the cache key hashes it,
+// so it re-runs exactly when that summary changes -- and it reads the same stored
+// diff the summarizer saw, because a line written from the summary alone can only
+// repeat the summary.
 
 const eli5Entry = (over = {}) => ({
   kind: 'sync',
@@ -434,25 +434,44 @@ test('eli5Done: pinned to the exact summary the line was written from', () => {
   assert.equal(eli5Done(e), false, 'a re-summarized entry must lose its stale ELI5')
 })
 
-test('buildEli5Prompt: hands the model the comments beside the code and bars widening the audience', () => {
-  const e = eli5Entry()
+test('buildEli5Prompt: hands the model the evidence and the comments, and bars what it must not do', () => {
+  const e = eli5Entry({
+    significance: 'notable',
+    stats: { additions: 104, deletions: 14 },
+    files: { total: 3, meaningful: 1, added: [], modified: ['common/src/ads/pilot.ts'], churned: ['bun.lock'] },
+    version: '0.0.175'
+  })
   const note = 'Verified YC companies earn one $1,000 credit only after $1,000 is collected.'
-  const p = buildEli5Prompt(e, [note])
+  const patch = `diff --git a/common/src/ads/pilot.ts b/common/src/ads/pilot.ts\n+/** ${note} */\n+export const PILOT = 1\n`
+  const p = buildEli5Prompt(e, [note], { patch, siblings: ['CLI session restart rotates chat id'], diffBytes: 6000 })
   assert.ok(p.includes(note), 'the sentence from beside the code reaches the prompt')
+  assert.match(p, /diff --git a\/common/, 'the diff itself reaches the prompt')
+  assert.match(p, /104 lines added, 14 removed across 1 file/, 'the size the analyzer measured, counting only the files the change touches')
+  assert.match(p, /Where it landed: common\/src\/ads\/pilot\.ts/)
+  assert.match(p, /not part of this change: bun\.lock/, 'lockfile churn is labelled as not the change')
+  assert.match(p, /Shipped in version 0\.0\.175/)
+  assert.match(p, /CLI session restart rotates chat id/, 'the same snapshot gives it company')
   assert.match(p, /Keep the audience the text gives/)
   assert.match(p, /Never widen it to "users"/)
+  assert.match(p, /evidence, not vocabulary/, 'it may read the diff but must not name files')
+  assert.match(p, /follow the diff/, 'the diff outranks the summary where they disagree')
   assert.ok(!buildEli5Prompt(e).includes('Comments the developers wrote'), 'no notes, no empty block')
+  assert.ok(!buildEli5Prompt(e).includes('```diff'), 'no patch, no empty diff fence')
 })
 
-test('eli5Notes: prefers recorded facts, falls back to the stored patch', async () => {
-  const recorded = eli5Entry({ facts: ['Recorded fact.'] })
-  assert.deepEqual(await eli5Notes(recorded, async () => { throw new Error('must not read the patch') }), ['Recorded fact.'])
-  const bare = eli5Entry({ facts: [] })
+test('eli5Notes: merges the recorded facts with the comments in the patch', () => {
   const note = 'Verified YC companies earn one $1,000 credit only after $1,000 is collected.'
-  assert.deepEqual(await eli5Notes(bare, async () => `+ /** ${note} */`), [note],
-    'a row whose facts were never extracted still gets its own comments')
-  assert.deepEqual(await eli5Notes(bare, null), [], 'without a patch reader it degrades to the summary alone')
-  assert.deepEqual(await eli5Notes(bare, async () => { throw new Error('no worktree') }), [], 'an unreadable diff never fails the pass')
+  const e = eli5Entry({ facts: ['Recorded fact.'] })
+  assert.deepEqual(eli5Notes(e, `+ /** ${note} */`), ['Recorded fact.', note], 'both, recorded first')
+  assert.deepEqual(eli5Notes(e, ''), ['Recorded fact.'])
+  assert.deepEqual(eli5Notes(eli5Entry({ facts: [] }), ''), [], 'nothing to say beyond the summary')
+  assert.deepEqual(eli5Notes(eli5Entry({ facts: [note] }), `+ /** ${note} */`), [note], 'a comment already recorded as a fact is not said twice')
+})
+
+test('eli5Patch: an unreadable diff never fails the pass', async () => {
+  assert.equal(await eli5Patch(eli5Entry(), null), '', 'without a patch reader it explains from the summary alone')
+  assert.equal(await eli5Patch(eli5Entry(), async () => { throw new Error('no worktree') }), '')
+  assert.equal(await eli5Patch(eli5Entry(), async () => 'patch text'), 'patch text')
 })
 
 test('normalizeEli5: unwraps the reply, strips the echoed label, keeps it honest', () => {
@@ -485,12 +504,16 @@ test('enrichEli5: writes the line, caches it by the summary, asks once', async (
     LLM_MODEL: 'test-model', CHANGELOG_LLM_LIMIT: '5'
   }
   let calls = 0
-  const orig = globalThis.fetch
-  globalThis.fetch = async (url, init) => {
+  let expectDiff = true
+  const withPatch = async () => 'diff --git a/cli/src/model.ts b/cli/src/model.ts\n+export const MUSE = "1.3"\n'
+    const orig = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
     calls++
     assert.match(url, /chat\/completions$/)
     assert.match(init.body, /not a programmer/, 'the prompt asks for a non-technical reader')
-    assert.doesNotMatch(init.body, /diff --git/, 'the ELI5 prompt carries no patch')
+    assert.match(init.body, /Weight the tooling gave it/, 'and the structured evidence with it')
+    if (expectDiff) assert.match(init.body, /diff --git/, 'the plain-English pass reads the change, not only its summary')
+    else assert.doesNotMatch(init.body, /diff --git/, 'CHANGELOG_ELI5_DIFF=0 sends no patch')
     return {
       ok: true,
       status: 200,
@@ -502,7 +525,7 @@ test('enrichEli5: writes the line, caches it by the summary, asks once', async (
   }
   try {
     const e = eli5Entry()
-    assert.equal(await enrichEli5([e], dir, env, { retryErrors: true }), 1)
+    assert.equal(await enrichEli5([e], dir, env, { retryErrors: true, getPatch: withPatch }), 1)
     assert.match(e.eli5.text, /now available/)
     assert.equal(e.eli5.v, ELI5_V)
     assert.equal(e.eli5.src, shortHash(eli5Source(e)), 'the entry records what it explains')
@@ -515,7 +538,7 @@ test('enrichEli5: writes the line, caches it by the summary, asks once', async (
     // line still lands on the entry (a cache hit that rendered nothing would be
     // indistinguishable from a failure in production).
     const fresh = eli5Entry()
-    assert.equal(await enrichEli5([fresh], dir, env, { retryErrors: true }), 0)
+    assert.equal(await enrichEli5([fresh], dir, env, { retryErrors: true, getPatch: withPatch }), 0)
     assert.equal(calls, 1, 'cache hit must not spend a call')
     assert.match(fresh.eli5.text, /now available/)
 
@@ -523,6 +546,12 @@ test('enrichEli5: writes the line, caches it by the summary, asks once', async (
     assert.equal(eli5Key(e.sha, 'x'), `${e.sha}:eli5:v${ELI5_V}:${shortHash('x')}`)
     assert.equal(await enrichEli5([eli5Entry()], dir, { ...env, CHANGELOG_ELI5: '0' }, {}), 0)
     assert.equal(calls, 1, 'CHANGELOG_ELI5=0 must not spend a call either')
+
+    // The diff is a knob, not a constant: a cheap run explains from the summary.
+    expectDiff = false
+      assert.equal(await enrichEli5([eli5Entry({ sha: 'a'.repeat(40) })], dir,
+        { ...env, CHANGELOG_ELI5_DIFF: '0' }, { retryErrors: true, getPatch: withPatch }), 1)
+    assert.equal(calls, 2, 'the cheap run still spends its call')
   } finally {
     globalThis.fetch = orig
   }

@@ -131,7 +131,7 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
 | Workers build on push | ~20–60s | Cloudflare |
 | browser reuse of any page | none (`Cache-Control: no-cache`; revalidate, 304 when unchanged) | `_headers` |
 | its summary replaces the deterministic one | next batch, ahead of the backlog | `CHANGELOG_LLM_LIMIT` |
-| its plain-English line appears | same batch (own queue, no diff needed) | `CHANGELOG_ELI5_LIMIT` |
+| its plain-English line appears | same batch (own queue; reads the stored diff) | `CHANGELOG_ELI5_LIMIT` |
 
 So a new commit is readable in about 2 minutes, and a long-open tab reloads
 itself once per data version when it comes back from the background past its
@@ -173,6 +173,8 @@ strictly in the diff text:
 | `CHANGELOG_LLM_ERROR_COOLDOWN_MS` | retry failed entries after this (default 3600000) |
 | `CHANGELOG_ELI5_LIMIT` | plain-English lines per run (defaults to `CHANGELOG_LLM_LIMIT`) |
 | `CHANGELOG_ELI5_CONCURRENCY` | parallel ELI5 calls (defaults to `CHANGELOG_LLM_CONCURRENCY`) |
+| `CHANGELOG_ELI5_DIFF=0` | explain from the summary only; skip the diff on the plain-English pass |
+| `CHANGELOG_ELI5_DIFF_BYTES` | how much diff the plain-English pass is shown (default 6000, ~1.7k tokens) |
 | `CHANGELOG_ELI5=0` | disable the plain-English pass only, keep summaries |
 | `CHANGELOG_LLM_CHURN=1` | also summarize lockfile/icon-only rows, from their raw diff (~1,900 extra calls) |
 
@@ -182,19 +184,26 @@ command facts) so the model grounds in verifiable context; outputs are schema-
 validated with one repair retry and 429 backoff. Prompt edits bump `PROMPT_V`
 in `generator/lib/llm.mjs`, invalidating stale cache entries exactly once.
 
-**The ELI5 pass** is a second, separate call per entry: 1-3 sentences of plain
+**The ELI5 pass** is a second, separate call per entry: 2-4 sentences of plain
 English under the technical summary, for a reader who does not open code. It is
 *not* extra fields in the summary prompt, because that would mean bumping
 `PROMPT_V` and re-paying every summary that is already good, and because the
 wording of a plain-English ask needs tuning without rewriting technical history.
 So it has its own `ELI5_V`, its own keys in the same cache file
-(`<sha>:eli5:v<N>:<hash>`), and its own budget. Its input is the finished summary
-rather than the diff: no git work, no patch tokens, and the rules that matter
-(hard jargon ban, no invented causes or numbers, no inflating small changes, and
-a non-answer like "N/A" is rejected rather than cached as success) apply to text
-rather than to raw code. It is keyed by the hash of the summary it explains, so a
-re-summarized entry loses a stale line automatically, and `mergeChangelog` keeps
-whichever side's line still matches the summary that survives the merge.
+(`<sha>:eli5:v<N>:<hash>`), and its own budget. Its input is the summary *plus*
+the evidence the summarizer had: the stored diff (budgeted, lockfiles and test
+hunks already stripped), the analyzer's own measurements, the files touched, the
+catalog rows with access and traits, same-snapshot siblings, and up to 8 comments
+the developers wrote beside the code — merged from the recorded facts and the
+patch, because the sentence naming who a program is for is usually in the one the
+extractor dropped. The diff is evidence, not vocabulary: the hard jargon ban
+stands, so the model reads `SUPABASE_AGENTIC_PILOT_VERSION` and writes about an
+experiment that keeps two offers apart. Where the summary and the diff disagree
+the prompt tells it to follow the diff, and a constant or flag nothing reads yet
+must be called prepared rather than shipped. It is keyed by the hash of the
+summary it explains, so a re-summarized entry loses a stale line automatically,
+and `mergeChangelog` keeps whichever side's line still matches the summary that
+survives the merge.
 
 Every entry that gets a summary gets an ELI5, including brand-new commits: the
 hourly pass runs over all entries rather than only the additions, and the loop's
