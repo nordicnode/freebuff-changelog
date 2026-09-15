@@ -433,6 +433,13 @@ test('buildSite generates valid static site output', async () => {
     assert.match(aboutHtml, /Deterministic first/)
     assert.match(aboutHtml, /LIMITS/)
     assert.match(aboutHtml, /Model Catalog/)
+    assert.match(aboutHtml, /class="man-dl"/, 'what is tracked is a list of surfaces, not a paragraph')
+    assert.match(aboutHtml, /class="man-routes"/)
+    // The page explains itself; it is not allowed to become a manual again. It ran
+    // to 2,300 words of prose before being cut back to the chase.
+    const aboutWords = aboutHtml.split('man-body">')[1].split('</section>')[0]
+      .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length
+    assert.ok(aboutWords < 500, `about page is ${aboutWords} words; keep it under 500`)
 
     // Verify models page: lineup, retired, history rows, nav
     const modelsHtml = await readFile(join(tmpDist, 'models/index.html'), 'utf8')
@@ -457,6 +464,14 @@ test('buildSite generates valid static site output', async () => {
     assert.match(statsHtml, /MOST-CHANGED MODELS/)
     assert.match(statsHtml, /class="spark"/)
     assert.match(statsHtml, /12-MO TREND/)
+    // The page opens with the numbers, not with forty bars, and it is the one page
+    // that opts into the wide canvas: the rows need the room.
+    assert.match(statsHtml, /<body class="page-wide">/, 'stats opts into the wide measure')
+    assert.match(statsHtml, /class="stat-figure-lbl">CHANGES</)
+    assert.match(statsHtml, /class="stat-row"><span class="stat-lbl">/, 'every bar is one budgeted grid row')
+    assert.match(statsHtml, /class="stat-fill add"/, 'churn is drawn as added and removed, not one folded number')
+    assert.match(statsHtml, /class="heat h\d"/, 'daily activity cells render')
+    assert.match(statsHtml, /class="sig-seg sig-/) 
     assert.match(indexHtml, /href="\/stats\/"/)
 
     // Verify day jump, split-view toggle, collapse, sitemap models

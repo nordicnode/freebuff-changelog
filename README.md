@@ -237,6 +237,7 @@ rule-based summary is used: the site never depends on the LLM.
 | `/feed.xml` | RSS of major + notable entries |
 | `/feed-models.xml`, `/feed-releases.xml` | model-only / release-only RSS |
 | `/models/` | model catalog timeline (live, retired, per-change history) |
+| `/stats/` | the one wide page: six headline figures open it, then per-category bars with 12-month sparklines, +/- churn by area as two segments of one track, monthly cadence with month-over-month deltas, a 26-week daily activity strip, and the significance split. Churn rows are counted on the timeline and excluded from every figure here |
 | `/api/entries.json`, `/api/status.json` | raw data / deploy status API |
 
 ## Honest limitations

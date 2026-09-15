@@ -64,6 +64,13 @@ code{
   border:1px solid var(--term-border);
 }
 
+/* The measure on the main column is set for prose. /stats/ is the one page that
+   is not prose -- six headline figures and two columns of budgeted bars do not
+   fit in 920px without the rows colliding -- so it opts into a wider canvas per
+   page rather than widening the column everywhere and making the timeline
+   unreadable. */
+body.page-wide main{max-width:1180px}
+
 header.top{
   border-bottom:1px solid var(--term-border);
   padding:14px 0;
@@ -531,14 +538,67 @@ nav.term-nav a.active{
 .diff-cell.diff-ctx{color:var(--txt-dim)}
 .day-jump{display:inline-flex;align-items:center;gap:6px;font-size:.76rem;color:var(--txt-subtle)}
 .day-jump select{background:var(--panel);border:1px solid var(--term-border);color:var(--txt-dim);padding:1px 6px;border-radius:2px;font:inherit;max-width:190px}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin:12px 0}
-.stat-card{background:var(--panel);border:1px solid var(--term-border);border-radius:2px;padding:10px 12px}
-.stat-card h3{margin:0 0 8px;font-size:.8rem;color:var(--txt)}
-.stat-bar-row{display:flex;align-items:center;gap:8px;font-size:.74rem;margin:3px 0;color:var(--txt-dim)}
-.stat-bar-lbl{width:110px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.stat-bar{flex:1;height:8px;background:var(--code);border-radius:2px;overflow:hidden}
-.stat-bar-fill{display:block;height:100%;background:var(--term-cyan)}
-.stat-bar-n{width:44px;text-align:right;color:var(--txt-subtle)}
+/* /stats/ opens with six numbers rather than forty bars: the strip is one bordered
+   box with 1px gaps, so it reads as a table of contents for the page below rather
+   than as more cards of the same shape. */
+.stat-figures{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--term-border);border:1px solid var(--term-border);border-radius:3px;margin:0 0 14px}
+.stat-figure{background:var(--panel);padding:10px 12px;display:flex;flex-direction:column;gap:1px}
+.stat-figure-lbl{font-size:.66rem;letter-spacing:.07em;color:var(--txt-subtle)}
+.stat-figure-val{font-size:1.45rem;line-height:1.2;font-weight:600;color:var(--txt);font-variant-numeric:tabular-nums}
+.stat-figure-note{font-size:.68rem;color:var(--txt-subtle);line-height:1.4}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;margin:12px 0}
+.stat-card{background:var(--panel);border:1px solid var(--term-border);border-radius:3px;padding:12px 14px 14px}
+.stat-span{grid-column:1/-1}
+.stat-card-hdr{display:flex;align-items:baseline;justify-content:space-between;gap:12px;border-bottom:1px solid var(--term-border);padding-bottom:7px;margin-bottom:10px}
+.stat-card h3{margin:0;font-size:.74rem;letter-spacing:.07em;color:var(--txt)}
+.stat-card-note{font-size:.68rem;color:var(--txt-subtle);text-align:right}
+.stat-rows{display:flex;flex-direction:column;gap:6px}
+/* The old row was flex with a fixed 110px label and a 44px number inside a card
+   that was never 260px wide, so the bar got the remainder (nothing) and the
+   sparkline hung out of the card. Every column is budgeted now, and the track is
+   the one that flexes. */
+.stat-row{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(48px,2fr) auto minmax(0,112px);grid-template-areas:"lbl track num trend";align-items:center;gap:4px 10px;font-size:.76rem;color:var(--txt-dim)}
+.stat-row:hover{color:var(--txt)}
+.stat-lbl{grid-area:lbl;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stat-lbl a{color:var(--txt-dim);text-decoration:none}
+.stat-row:hover .stat-lbl a{color:var(--term-cyan);text-decoration:underline}
+.stat-track{grid-area:track;display:flex;height:9px;background:var(--code);border-radius:2px;overflow:hidden}
+.stat-fill{display:block;height:100%;background:var(--term-cyan);opacity:.85}
+.stat-fill.add{background:var(--term-green)}
+.stat-fill.del{background:var(--term-red)}
+.stat-num{grid-area:num;min-width:78px;text-align:right;color:var(--txt-subtle);font-variant-numeric:tabular-nums;white-space:nowrap}
+.stat-num i{font-style:normal}
+.stat-num .pos,.stat-figure-val .pos{color:var(--term-green)}
+.stat-num .neg,.stat-figure-val .neg{color:var(--term-red)}
+.stat-share{margin-left:7px;opacity:.65}
+.stat-delta{margin-left:6px}
+.stat-trend{grid-area:trend;display:flex;justify-content:flex-end;min-width:0}
+.stat-trend .spark{margin:0;width:100%;max-width:112px}
+.cad-spark{margin:0 0 10px}
+.cad-spark .spark{height:52px}
+.sig-split{display:flex;height:13px;border-radius:2px;overflow:hidden;background:var(--code);margin-bottom:10px}
+.sig-seg{display:block;height:100%}
+.sig-major{background:var(--term-amber)}
+.sig-notable{background:var(--term-cyan)}
+.sig-minor{background:var(--term-border-strong)}
+/* One column per week, seven rows, Monday on top: fixed cells distributed across
+   the card, so the strip fills the width without stretching a cell into a tile. */
+.heat-grid{display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,11px);grid-auto-columns:11px;gap:3px;justify-content:space-between}
+.heat{display:block;border-radius:2px;background:var(--code)}
+.heat.h-1{background:transparent}
+.heat.h0{background:var(--code)}
+.heat.h1{background:rgba(63,185,80,.28)}
+.heat.h2{background:rgba(63,185,80,.5)}
+.heat.h3{background:rgba(63,185,80,.72)}
+.heat.h4{background:var(--term-green)}
+.heat-legend{display:flex;align-items:center;gap:4px;font-size:.66rem;color:var(--txt-subtle);margin-top:10px}
+.heat-legend .heat{width:10px;height:10px}
+@media (max-width:560px){
+  .stat-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"lbl num" "track track"}
+  .stat-trend{display:none}
+  .stat-num{min-width:0}
+  .heat-grid{grid-template-rows:repeat(7,9px);grid-auto-columns:9px;gap:2px}
+}
 
 .summary{
   margin:6px 0;
@@ -1226,6 +1286,20 @@ details.more-rows[open]>summary{margin-bottom:6px}
   font-size:.84rem;
   letter-spacing:.05em;
 }
+.man-ul{margin:0 0 12px;padding-left:18px}
+.man-ul li{margin:0 0 6px;color:var(--txt-dim)}
+.man-ul li strong{color:var(--txt)}
+/* What the project tracks is a list of surfaces, not prose: name, count, one
+   clause on what the count means. A three-column grid aligns the numbers without
+   dragging a table element into a page that is otherwise paragraphs. */
+.man-dl{display:grid;grid-template-columns:auto auto minmax(0,1fr);gap:4px 12px;margin:0 0 12px;font-size:.82rem;align-items:baseline}
+.man-dl dt{color:var(--txt);white-space:nowrap}
+.man-dl dd{margin:0;color:var(--txt-subtle);font-variant-numeric:tabular-nums;text-align:right}
+.man-dl .man-note{color:var(--txt-dim);text-align:left}
+.man-routes{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:3px 16px;margin:0 0 10px;font-size:.82rem;color:var(--txt-dim)}
+.man-routes a{color:var(--term-cyan);text-decoration:none}
+.man-routes a:hover{text-decoration:underline}
+
 .man-body p{
   margin:0 0 10px;
   color:var(--txt-dim);

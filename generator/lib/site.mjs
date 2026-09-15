@@ -25,7 +25,7 @@ function miniMd (text) {
   return s
 }
 
-function layout ({ title, path, body, desc, noindex, ogImage }) {
+function layout ({ title, path, body, desc, noindex, ogImage, wide }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -46,7 +46,7 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="apple-touch-icon" href="/icon-192.png">
-<style>${CSS}</style></head><body><main>
+<style>${CSS}</style></head><body${wide ? ' class="page-wide"' : ''}><main>
 <header class="top">
   <div class="brand">
     <a class="logo" href="/">
@@ -1339,12 +1339,22 @@ ${d.entries.map(changeRow).join('\n')}
 ${archiveScript}`
   }))
 
-  // ----- stats (counts, churn, cadence: zero-dependency CSS bars + SVG sparklines)
-  // Sparkline: inline SVG trend (history, not snapshot).
-  const spark = (vals, w = 220, h = 36) => {
+  // ----- stats (headline figures first, then the charts that explain them)
+  // Four identical cards in a three-up grid inside a 920px column, each row a
+  // flex line already spending 110px on the label and 44px on the number: the bar
+  // got whatever was left, which was nothing, and the 120px sparkline hung out of
+  // the card. The layout was spending pixels the container never granted. So a
+  // wider canvas, two-up, a grid row that budgets every column, and the six
+  // numbers a reader came for sitting above the charts instead of buried in them.
+  const trim1 = (v) => String(Number(v))
+  const kfmt = (n) => n >= 1e6 ? trim1((n / 1e6).toFixed(2)) + 'M' : n >= 1e3 ? trim1((n / 1e3).toFixed(1)) + 'k' : String(n)
+  const share = (n, of) => (of ? Math.round(n / of * 100) : 0)
+  const spark = (vals, w = 220, h = 36, stroke = 'var(--term-cyan)') => {
     const max = Math.max(1, ...vals)
-    const pts = vals.map((v, i) => `${(i / Math.max(1, vals.length - 1) * w).toFixed(1)},${(h - 3 - (v / max) * (h - 6)).toFixed(1)}`).join(' ')
-    return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="trend: ${vals.join(', ')}"><polyline points="${pts}" fill="none" stroke="var(--term-cyan)" stroke-width="1.5"/></svg>`
+    const px = (i) => (i / Math.max(1, vals.length - 1) * w).toFixed(1)
+    const py = (v) => (h - 3 - (v / max) * (h - 6)).toFixed(1)
+    const pts = vals.map((v, i) => `${px(i)},${py(v)}`).join(' ')
+    return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="trend: ${vals.join(', ')}"><polygon points="0,${h} ${pts} ${w},${h}" fill="${stroke}" opacity=".1"/><polyline points="${pts}" fill="none" stroke="${stroke}" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`
   }
   const statCats = [...cats.entries()].sort((a, b) => b[1] - a[1])
   const catMax = statCats[0]?.[1] || 1
@@ -1361,7 +1371,7 @@ ${archiveScript}`
   const allMonths = [...new Set(meaningful.map(e => (e.day || '').slice(0, 7)))].sort().slice(-12)
   const catSpark = (c) => {
     const cm = catMonths.get(c) || new Map()
-    return spark(allMonths.map(m => cm.get(m) || 0), 120, 22)
+    return spark(allMonths.map(m => cm.get(m) || 0), 110, 20)
   }
   const churnByArea = new Map()
   for (const e of meaningful) {
@@ -1380,7 +1390,7 @@ ${archiveScript}`
   }
   const monthRows = [...byMonth.entries()].sort().slice(-12)
   const monthMax = Math.max(1, ...monthRows.map(([, n]) => n))
-  const cadenceSpark = spark(monthRows.map(([, n]) => n))
+  const cadenceSpark = spark(monthRows.map(([, n]) => n), 300, 52)
   const modelCounts = new Map()
   for (const e of modelEntries) {
     for (const m of [...(e.modelChanges?.added || []), ...(e.modelChanges?.removed || [])]) {
@@ -1389,17 +1399,68 @@ ${archiveScript}`
   }
   const modelRows2 = [...modelCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)
   const modelMax = Math.max(1, ...modelRows2.map(([, n]) => n))
-  const bar = (lbl, n, max, href, trend) => `<div class="stat-bar-row"><span class="stat-bar-lbl">${href ? `<a href="${href}">${esc(lbl)}</a>` : esc(lbl)}</span><span class="stat-bar"><span class="stat-bar-fill" style="width:${Math.max(2, Math.round(n / max * 100))}%"></span></span><span class="stat-bar-n">${n.toLocaleString()}</span>${trend || ''}</div>`
+  const modelTotal = [...modelCounts.values()].reduce((s, n) => s + n, 0)
+  const dayCount = new Map(byDay.map(d => [d.day, d.entries.filter(e => !e.noise).length]))
+  const activeDays = dayCount.size
+  const medianDay = [...dayCount.values()].sort((a, b) => a - b)[Math.floor(activeDays / 2)] || 0
+  const busiestDay = activeDays ? [...dayCount.entries()].sort((a, b) => b[1] - a[1])[0] : null
+  const totalAdd = meaningful.reduce((s, e) => s + (e.stats?.additions || 0), 0)
+  const totalDel = meaningful.reduce((s, e) => s + (e.stats?.deletions || 0), 0)
+  const spanDays = Math.max(1, Math.round((Date.parse(String(last.day).slice(0, 10)) - Date.parse(String(first.day).slice(0, 10))) / 86400000) + 1)
+  const spanMonths = Math.max(1, Math.round(spanDays / 30.44))
+  const sigTotal = meaningful.length
+  const sigRows = ['major', 'notable', 'minor'].map(s => [s, meaningful.filter(e => e.significance === s).length])
+  const sigMax = Math.max(1, ...sigRows.map(([, n]) => n))
+
+  // 26 weeks of daily volume, Monday-first, one grid column per week. Cadence
+  // answers "how much per month"; nothing with twelve bars can answer "when did it
+  // actually move", which is what this is for. Days outside the record stay blank
+  // rather than drawn as zero, so a quiet week reads as quiet and a repo that did
+  // not exist yet reads as absent.
+  const HEAT_WEEKS = 26
+  const heatEndMs = Date.parse(String(last.day).slice(0, 10) + 'T00:00:00Z')
+  const heatStartMs = heatEndMs - (((new Date(heatEndMs).getUTCDay() + 6) % 7) + 7 * (HEAT_WEEKS - 1)) * 86400000
+  const heatCells = []
+  for (let i = 0; i < HEAT_WEEKS * 7; i++) {
+    const key = new Date(heatStartMs + i * 86400000).toISOString().slice(0, 10)
+    const n = dayCount.get(key)
+    const lvl = n === undefined ? -1 : n === 0 ? 0 : n <= 3 ? 1 : n <= 8 ? 2 : n <= 18 ? 3 : 4
+    heatCells.push(`<span class="heat h${lvl}"${n === undefined ? '' : ` title="${key} &middot; ${n} change${n === 1 ? '' : 's'}"`}></span>`)
+  }
+  const heatRange = `${esc(fmtDateHuman(new Date(heatStartMs).toISOString().slice(0, 10)))} &rarr; ${esc(fmtDateHuman(String(last.day).slice(0, 10)))}`
+
+  // One row, one grid: label / track / figure / trend. The track is the flexible
+  // column, so a long label or a wide figure can never eat the bar again.
+  const bar = (lbl, n, max, { href, trend = '', num = '', pct = -1 } = {}) => `<div class="stat-row"><span class="stat-lbl">${href ? `<a href="${href}">${esc(lbl)}</a>` : esc(lbl)}</span><span class="stat-track"><span class="stat-fill" style="width:${Math.max(2, Math.round(n / max * 100))}%"></span></span><span class="stat-num">${num || n.toLocaleString()}${pct >= 0 ? `<i class="stat-share">${pct}%</i>` : ''}</span><span class="stat-trend">${trend}</span></div>`
+  // Churn is two numbers, not one: +12k of new code and -12k of deleted code are
+  // different work, so they get two segments of one track instead of both folded
+  // into the label, which is what made the old churn rows unreadable.
+  const churnBar = ([a, c]) => `<div class="stat-row"><span class="stat-lbl">${esc(a)}</span><span class="stat-track"><span class="stat-fill add" style="width:${c.add ? Math.max(1, Math.round(c.add / churnMax * 100)) : 0}%"></span><span class="stat-fill del" style="width:${c.del ? Math.max(1, Math.round(c.del / churnMax * 100)) : 0}%"></span></span><span class="stat-num"><i class="pos">+${kfmt(c.add)}</i><i class="neg"> &minus;${kfmt(c.del)}</i></span><span class="stat-trend"></span></div>`
+  const card = (title, note, body, extra = '') => `<section class="stat-card${extra ? ' ' + extra : ''}"><div class="stat-card-hdr"><h3>${esc(title)}</h3>${note ? `<span class="stat-card-note">${note}</span>` : ''}</div><div class="stat-rows">${body}</div></section>`
+  const figure = (label, val, note) => `<div class="stat-figure"><span class="stat-figure-lbl">${esc(label)}</span><span class="stat-figure-val">${val}</span><span class="stat-figure-note">${note}</span></div>`
   await write(dist, 'stats/index.html', layout({
-    title: 'Stats', path: '/stats/',
+    title: 'Stats', path: '/stats/', wide: true,
     desc: `Freebuff changelog stats: ${entries.length} changes across ${byDay.length} days, ${vers.length} releases, ${modelEntries.length} model changes.`,
-    body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">TELEMETRY :: changelog stats</span><span>${meaningful.length.toLocaleString()} changes${churnNote} &middot; ${byDay.length} days</span></div>`
-      + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Where the work lands, how fast it ships, and which models churn. Recomputed on every sync.</p></div></section>`
+    body: `<section class="hero"><div class="term-box term-box-slim"><div class="term-box-hdr"><span class="term-box-title">TELEMETRY :: changelog stats</span><span>${meaningful.length.toLocaleString()} changes${churnNote} &middot; ${byDay.length} days &middot; ${spanDays.toLocaleString()} days of history</span></div><p class="list-note">Where the work lands, how fast it ships, and which models churn. Churn rows &mdash; lockfiles, icon sets, empty merges &mdash; are counted on the timeline and excluded from every figure here. Recomputed on every sync.</p></div></section>`
+      + `<div class="stat-figures">`
+      + figure('CHANGES', meaningful.length.toLocaleString(), `of ${entries.length.toLocaleString()} commits &middot; ${churnCount.toLocaleString()} churn rows excluded`)
+      + figure('MEDIAN / DAY', String(medianDay), `${activeDays} days with commits${busiestDay ? ` &middot; ${busiestDay[1]} on the busiest, ${esc(fmtDateHuman(busiestDay[0]))}` : ''}`)
+      + figure('RELEASES', String(releases.length), `${trim1((releases.length / spanMonths).toFixed(1))} releases a month across ${spanMonths} months`)
+      + figure('LINES MOVED', `<span class="pos">+${kfmt(totalAdd)}</span><span class="neg"> &minus;${kfmt(totalDel)}</span>`, `net ${totalAdd >= totalDel ? '+' : '&minus;'}${kfmt(Math.abs(totalAdd - totalDel))} over ${spanDays.toLocaleString()} days`)
+      + figure('MAJOR', sigRows[0][1].toLocaleString(), `${share(sigRows[0][1], sigTotal)}% of changes &middot; ${sigRows[1][1].toLocaleString()} notable`)
+      + figure('CATEGORIES', String(cats.size), statCats.length ? `led by ${esc(statCats[0][0])} at ${share(statCats[0][1], sigTotal)}%` : '')
+      + `</div>`
       + `<div class="stat-grid">`
-      + `<div class="stat-card"><h3>CHANGES BY CATEGORY (12-MO TREND)</h3>${statCats.map(([c, n]) => bar(c, n, catMax, `/search/?cat=${encodeURIComponent(c)}`, catSpark(c))).join('')}</div>`
-      + `<div class="stat-card"><h3>CODE CHURN BY AREA (+/-)</h3>${churnRows.map(([a, c]) => bar(`${a} +${(c.add / 1000).toFixed(0)}k/-${(c.del / 1000).toFixed(0)}k`, c.add + c.del, churnMax)).join('')}</div>`
-      + `<div class="stat-card"><h3>SHIPPING CADENCE (LAST 12 MO)</h3>${cadenceSpark}${monthRows.map(([m, n]) => bar(m, n, monthMax, `/archive/#days-m-${m}`)).join('')}</div>`
-      + `<div class="stat-card"><h3>MOST-CHANGED MODELS</h3>${modelRows2.map(([m, n]) => bar(m, n, modelMax, `/models/${modelSlug(m)}/`)).join('')}</div>`
+      + card('CHANGES BY CATEGORY (12-MO TREND)', `${statCats.length} categories &middot; sparkline covers ${allMonths.length} months`, statCats.map(([c, n]) => bar(c, n, catMax, { href: `/search/?cat=${encodeURIComponent(c)}`, pct: share(n, sigTotal), trend: catSpark(c) })).join(''), 'stat-span')
+      + card('CODE CHURN BY AREA', `top ${churnRows.length} of ${churnByArea.size} areas &middot; lines added / removed`, churnRows.map(churnBar).join(''))
+      + card('MOST-CHANGED MODELS', modelTotal ? `${modelTotal} catalog moves across ${modelCounts.size} models` : 'no catalog moves recorded', modelRows2.map(([m, n]) => bar(m, n, modelMax, { href: `/models/${modelSlug(m)}/`, pct: share(n, modelTotal) })).join(''))
+      + card('SHIPPING CADENCE (LAST 12 MO)', `${monthRows.length} of ${byMonth.size} months &middot; peak ${monthMax.toLocaleString()} changes`, `<div class="cad-spark">${cadenceSpark}</div>` + monthRows.map(([m, n], i) => {
+        const prev = i ? monthRows[i - 1][1] : 0
+        const d = prev ? Math.round((n - prev) / prev * 100) : null
+        return bar(m, n, monthMax, { href: `/archive/#days-m-${m}`, num: `${n.toLocaleString()}${d === null ? '' : ` <i class="stat-delta ${d >= 0 ? 'pos' : 'neg'}">${d >= 0 ? '+' : '&minus;'}${Math.abs(d)}%</i>`}` })
+      }).join(''), 'stat-span')
+      + card('ACTIVITY (LAST 26 WEEKS)', heatRange, `<div class="heat-grid">${heatCells.join('')}</div><div class="heat-legend">QUIETER<span class="heat h0"></span><span class="heat h1"></span><span class="heat h2"></span><span class="heat h3"></span><span class="heat h4"></span>BUSIER</div>`)
+      + card('WHAT COUNTED', `${sigTotal.toLocaleString()} changes split by weight`, `<div class="sig-split">${sigRows.map(([s, n]) => `<span class="sig-seg sig-${s}" style="width:${share(n, sigTotal)}%" title="${s}: ${n.toLocaleString()}"></span>`).join('')}</div>` + sigRows.map(([s, n]) => bar(s.toUpperCase(), n, sigMax, { pct: share(n, sigTotal) })).join(''))
       + `</div>`
   }))
 
@@ -1547,6 +1608,13 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
 
 
   // ----- about (user-facing overview)
+  // The page names the four surfaces that have their own pages and lumps the rest
+  // into one line built from the categories that actually exist, so a new category
+  // is never left unlisted by a rewrite of this copy.
+  const aboutSpecial = new Set(['Model Catalog', 'Commands'])
+  const areaCats = [...cats.entries()].filter(([c]) => !aboutSpecial.has(c)).sort((a, b) => b[1] - a[1])
+  const areaTotal = areaCats.reduce((s, [, n]) => s + n, 0)
+  const areaLine = areaCats.map(([c, n]) => `${esc(c)} ${n.toLocaleString()}`).join(' &middot; ')
   await write(dist, 'about/index.html', layout({
     title: 'About', path: '/about/',
     body: `<section class="hero">
@@ -1557,31 +1625,41 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     </div>
     <div class="man-body">
       <h4>WHAT IS THIS?</h4>
-      <p>A commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, reconstructed from public git diffs. Upstream ships via automated snapshot merges with blank <em>"Sync public snapshot"</em> messages, so this project diffs each snapshot against its parent and extracts what actually changed: model swaps, version bumps, new slash commands, file-level churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} scanned commits. A sync daemon re-analyzes whenever upstream commits, and at least every 45 minutes.</p>
+        <p>A commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, rebuilt from public git diffs. Upstream ships through automated snapshot merges with blank <em>"Sync public snapshot"</em> messages, so this project diffs each snapshot against its parent and extracts what actually changed: model swaps, version bumps, new slash commands, file churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} scanned commits, re-analyzed whenever upstream moves.</p>
 
-      <h4>HOW IT WORKS</h4>
-      <p><strong>Deterministic first.</strong> Every sync commit is diffed parent-to-head. Model tables in both READMEs are parsed before and after and set-differenced (description-only edits cancel out); the slash-command registry (<code>cli/src/data/slash-commands.ts</code>) gets the same snapshot treatment; version bumps are read from release <code>package.json</code> files. Timestamps are normalized to UTC on the way in — upstream commits arrive in whatever zone the author's machine was in, and a commit at 17:25 <code>-08:00</code> belongs to the next UTC day. Zero dependencies, stdlib only.</p>
-      <p><strong>LLM summaries, cached forever.</strong> A model rewrites every change entry once (cached by commit SHA, prompt version, and diff hash, so a prompt edit re-summarizes exactly once) into a technical 2-4 sentence summary — community commits included, not just snapshot diffs. It sees only the diff plus extracted facts — model access/traits, command names, files, stats — and is schema-validated with one repair retry. A second pass adds a one-line plain-English explanation under the summary, pinned to the exact summary it was written from. Lockfile-only churn rows keep the deterministic label instead of paying for it. No provider configured means deterministic summaries only; nothing breaks.</p>
-      <p><strong>Every claim links to proof.</strong> Each entry carries its commit SHA, compare URL, inline diff, and per-file stats. The diff is stored for every entry — lockfiles and test-only hunks stripped where there is other content, kept whole for a commit whose only change <em>is</em> the lockfile — and it loads on demand rather than sitting in the page. Model swaps render before/after README rows inline.</p>
+        <h4>HOW IT WORKS</h4>
+        <ul class="man-ul">
+          <li><strong>Deterministic first.</strong> Model tables in both READMEs and the slash-command registry are parsed before and after each commit and set-differenced, so a description-only edit cancels out; version bumps come from release <code>package.json</code>. Timestamps normalize to UTC. Zero dependencies.</li>
+          <li><strong>LLM once per commit.</strong> A model rewrites each entry into a 2-4 sentence technical summary from the diff and nothing else, and a second pass adds the plain-English line under it. Cached by SHA, prompt version and diff hash, so a prompt edit re-summarizes exactly once. With no provider configured the deterministic text stands alone; nothing breaks.</li>
+          <li><strong>Every claim links to proof.</strong> Commit SHA, compare URL, stored diff and per-file stats on every row, with the diff loaded on demand.</li>
+        </ul>
 
-      <h4>WHAT WE TRACK</h4>
-      <p><strong>Model Catalog</strong> (${(cats.get('Model Catalog') || 0)} changes): additions, retirements, and swaps in the free picker, with access level and trait columns — plus a <a href="/models/">catalog timeline</a> and per-model pages.<br>
-      <strong>Releases</strong> (${vers.length} tracked): CLI and core <code>package.json</code> bumps with per-release pages listing every commit in range — the newest 40 as full entries, the rest as compact rows under one fold, because a release that shipped a month of work owns 1,000+ commits.<br>
-      <strong>Commands</strong> (${(cats.get('Commands') || 0)} changes): new or removed <code>/slash-commands</code> from the registry (renames surface as add+remove).<br>
-      <strong>CLI</strong> (${(cats.get('CLI') || 0).toLocaleString()}), <strong>Core</strong> (${(cats.get('Core') || 0).toLocaleString()}), <strong>SDK</strong> (${(cats.get('SDK') || 0)}), <strong>Agent Runtime</strong> (${(cats.get('Agent Runtime') || 0)}), <strong>Agents</strong> (${(cats.get('Agents') || 0)}), <strong>LLM Providers</strong> (${(cats.get('LLM Providers') || 0)}), <strong>Packaging</strong> (${(cats.get('Packaging') || 0)}), <strong>Docs</strong> (${(cats.get('Docs') || 0)}), <strong>Internal</strong> (${(cats.get('Internal') || 0).toLocaleString()}): file-path categorization with per-file add/remove/rename tracking.<br>
-      <strong>Significance:</strong> <code>major</code> (model or version change), <code>notable</code> (command changes, added/removed files, &gt;400-line churn), <code>minor</code> (internal), <code>noise</code> (lockfile-only churn — listed but hidden behind the churn chip by default). Deterministic by default; the LLM may only override with diff evidence.<br>
-      <strong>In-Flight PRs:</strong> every open upstream pull request, followed across API pages, with diffstat and a 120-line diff preview. Previews are fetched a budgeted batch per run — the unauthenticated GitHub API allows 60 calls an hour, and the list of 100+ PRs needs one per PR — so they fill in over successive runs; a PR missing one still links to GitHub, and previews are pruned once a PR closes.</p>
+        <h4>WHAT WE TRACK</h4>
+        <dl class="man-dl">
+          <dt>Model Catalog</dt><dd>${(cats.get('Model Catalog') || 0).toLocaleString()}</dd><dd class="man-note">additions, retirements and swaps in the free picker, with access and trait columns &mdash; <a href="/models/">catalog timeline</a></dd>
+          <dt>Releases</dt><dd>${vers.length.toLocaleString()}</dd><dd class="man-note">CLI and core version bumps, each page listing every commit in range</dd>
+          <dt>Commands</dt><dd>${(cats.get('Commands') || 0).toLocaleString()}</dd><dd class="man-note">slash commands added or removed; renames surface as add+remove</dd>
+          <dt>Code areas</dt><dd>${areaTotal.toLocaleString()}</dd><dd class="man-note">${areaLine}</dd>
+          <dt>Significance</dt><dd></dd><dd class="man-note"><code>major</code> model or version &middot; <code>notable</code> user-visible or a new file &middot; <code>minor</code> internal &middot; <code>noise</code> lockfile-only churn, listed but hidden behind the churn chip</dd>
+          ${openPrs?.length ? `<dt>In-flight</dt><dd>${openPrs.length.toLocaleString()}</dd><dd class="man-note">open upstream PRs with diffstat and a 120-line preview, filled a budgeted batch per run</dd>` : ''}
+        </dl>
 
-      <h4>HOW TO USE</h4>
-      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a> — which shows one list at a time (days, releases, categories) with each month folded until opened. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code>: that change alone, expanded, with nothing else from its day — and it survives the entry moving day. The <code>discord</code> button on any entry copies a Discord-formatted version of it — headline, the plain-English line, the summary one sentence per line, model changes, and an aligned details block with the commit, churn, release and author. Ready to paste, and it carries no links at all: the commit is named by its SHA.</p>
-      <p><strong>Find.</strong> The chip bar above the timeline filters the rows on that page by category (the churn chip toggles lockfile-only noise). <a href="/search/">/search/</a> queries every entry ever recorded — press <code>/</code> on any page to jump there — and <a href="/archive/#categories">/archive/</a> lists each category across all time.</p>
-      <p><strong>Models, releases, PRs.</strong> <a href="/models/">/models/</a> replays the free-picker catalog with a page per model; <a href="/archive/#releases">release pages</a> list every commit between two versions; <a href="/stats/">/stats/</a> charts churn and cadence; <a href="/in-flight/">/in-flight/</a> previews open upstream pull requests before they merge.</p>
+        <h4>WHERE TO GO</h4>
+        <div class="man-routes">
+          <span><a href="/">/</a> the newest day</span>
+          <span><code>/day/&lt;date&gt;/</code> any single day</span>
+          <span><a href="/archive/">/archive/</a> days, releases, categories</span>
+          <span><a href="/search/">/search/</a> every entry, ever</span>
+          <span><a href="/stats/">/stats/</a> volume, churn, cadence</span>
+          ${openPrs?.length ? '<span><a href="/in-flight/">/in-flight/</a> open PRs</span>' : ''}
+        </div>
+        <p>The chips above the timeline filter that day's rows and the churn chip reveals the noise. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code> &mdash; that change alone, which survives the entry moving day &mdash; and <code>discord</code> copies a paste-ready version of it. Press <code>/</code> anywhere to search.</p>
 
-      <h4>LIMITS</h4>
-      <p>Snapshots squash upstream history, so intra-snapshot sequencing is approximate and authorship resolves to the snapshot bot. A stored diff lives as long as its entry does — nothing is deleted for being old, only orphaned files whose entry is gone. AI summaries describe only what the diff shows — no research, no speculation on model capabilities beyond the README row.</p>
+        <h4>LIMITS</h4>
+        <p>Snapshots squash upstream history, so ordering inside one snapshot is approximate and authorship resolves to the bot. AI text describes only what the diff shows: no research, no speculation about capabilities.</p>
 
-      <h4>FOLLOW ALONG</h4>
-      <p><a href="/feed.xml">RSS</a> (major + notable), <a href="/feed-models.xml">models only</a>, <a href="/feed-releases.xml">releases only</a>. <a href="/search/">Search</a> supports category and impact filters; <a href="/archive/">Categories</a> list every change of each type, all time; <a href="/stats/">stats</a> charts churn and cadence; <a href="/archive/">Archive</a> holds every day and release. Source: a local sync daemon pushing <code>data/</code> on every upstream commit (45-minute freshness budget), with an hourly GitHub Action as fallback; Cloudflare deploys on push.</p>
+        <h4>FEEDS + SOURCE</h4>
+        <p><a href="/feed.xml">RSS major + notable</a> &middot; <a href="/feed-models.xml">models only</a> &middot; <a href="/feed-releases.xml">releases only</a>. A sync daemon pushes <code>data/</code> on every upstream commit (45-minute freshness budget) with an hourly GitHub Action as fallback; Cloudflare deploys on push.</p>
     </div>
   </div>
 </section>`
