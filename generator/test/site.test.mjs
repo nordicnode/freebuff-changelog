@@ -469,7 +469,7 @@ test('buildSite generates valid static site output', async () => {
     assert.ok(dcAttr.includes('\n\n'), 'blank lines survive the attribute')
     assert.ok(dcAttr.startsWith('**FREEBUFF** · `'), 'it opens with the header line')
     assert.ok(dcAttr.includes('**Details**'), 'and closes with the aligned details block')
-    assert.ok(!/freebuff-changelog|workers\.dev/.test(dcAttr), 'no link to our own site anywhere in it')
+    assert.ok(!/https?:\/\//.test(dcAttr), 'it carries no links at all')
     assert.match(dayHtml2, /class="day-jump"/)
     assert.match(dayHtml2, /data-mode="split"/)
     // Every index row is a full body: no teaser class, no hop to a day page.
@@ -887,7 +887,7 @@ test('discordText: organized for Discord -- labelled quote, one sentence per lin
   assert.ok(t.startsWith('**FREEBUFF** · `Model Catalog` · Sep 13, 2026 · **MAJOR**'), 'header line')
   assert.match(t, /^### Muse Spark 1\.3 ships$/m, 'a heading, not a plain line')
   assert.match(t, /^> \*\*In plain English\*\*\n> The free model was replaced with a newer one\.$/m, 'the ELI5 line, labelled and quoted')
-  assert.ok(!/freebuff-changelog|workers\.dev/.test(t), 'the paste carries no link to our own site')
+  assert.ok(!/https?:\/\//.test(t), 'the paste carries no links at all')
   assert.ok(t.includes('muse\\_spark\\_1\\_2'), 'stray underscores are escaped: Discord reads them as italics')
   assert.ok(t.includes('`muse_spark_1_3`'), 'but not inside a code span, where they are already literal')
   assert.ok(t.includes('**backend**'), 'a balanced pair still renders as bold')
@@ -901,8 +901,23 @@ test('discordText: organized for Discord -- labelled quote, one sentence per lin
   for (const row of [/^churn\s+\+12 \/ −4$/, /^files\s+3$/, /^release\s+v1\.0\.598$/, /^pull\s+#12$/, /^author\s+Ada$/]) {
     assert.ok(block.some(l => row.test(l)), `details block is missing ${row}`)
   }
-  assert.match(t, /\*\*Links\*\* · \[commit on GitHub\]\([^)]+\) · \[PR #12\]\([^)]+\)/, 'masked links on one tidy line')
-  assert.ok(!t.includes('<https://'), 'no raw URLs in the message')
+  assert.ok(!t.includes('**Links**'), 'no links section')
+  // Seventeen summaries mention an endpoint as the subject of the commit. The words
+  // are the content; only the reachability has to go.
+  const ZW = String.fromCharCode(0x200b)
+  const urls = discordText({
+    ...dcEntry(), facts: [], modelChanges: null, eli5: null,
+    ai: { title: 'T', summary: 'Points at https://example.com/x but keeps `https://safe.dev/y` intact. Docs at [the registry](https://npmjs.org/r).' }
+  })
+  assert.ok(urls.includes('`https://safe.dev/y`'), 'a URL in a code span is content and stays whole')
+  assert.ok(!urls.includes('https://example.com'), 'a bare URL outside one is never linkifiable')
+  assert.ok(urls.includes(`https:${ZW}//example.com`), 'and it is still readable as text')
+  assert.ok(urls.includes('Docs at the registry.'), 'a markdown link collapses to its label')
+  assert.ok(!/https?:\/\//.test(urls.replace(/`[^`]*`/g, '')), 'with code spans removed, not one URL is linkifiable')
+  // The quote is a separate push, so it is easy to forget it needs the same care.
+  const quoted = discordText({ ...dcEntry(), facts: [], modelChanges: null, eli5: { text: "It hides 'http://x' now. It reads agent_config better." } })
+  assert.ok(quoted.includes(`hides 'http:${ZW}//x'`), 'the plain-English line is escaped like everything else')
+  assert.ok(quoted.includes('agent\\_config'), 'including its underscores')
   // Prompt-text commits quote Discord fences verbatim, and an opened fence swallows
   // the rest of the message. Ours is the only one that survives into the paste.
   const fenced = discordText({ ...dcEntry(), facts: [], modelChanges: null, ai: { title: 'Use ``` tags', summary: 'Say ``` to fence it.' } })

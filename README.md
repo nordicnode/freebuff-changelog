@@ -89,17 +89,16 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
   (Discord does not hard-wrap, so a paragraph pastes as one wall), model changes as
   struck/bold list rows, highlights, then the commit, churn, release, PR and author
   in a fenced code block — the only place Discord gives you aligned columns, and the
-  only place nothing has to be escaped. Links are masked (`[commit on GitHub](url)`),
-  and there is no link back to this site: the paste is the artifact, not a referral.
-  Markup that would run away with the
-  message is neutralised: an unbalanced `**` is *dropped* (README bullets arrive
-  like that, and escaping it would still print the debris), a stray or triple
-  backtick run is *escaped* (some prompt-text commits quote fences, and one opened
-  fence swallows everything after it), while `_` is escaped rather than deleted,
-  because it is usually part of a real path. Balanced pairs in the AI summaries pass
-  through untouched — they already use the subset `miniMd` renders. Over the cap, the
-  highlights list goes, then the tail of the summary; the header, quote, details and
-  links never do.
+  only place nothing has to be escaped. There are no links in it at all, masked or
+  otherwise: the paste has to stand on its own wherever it lands, and the commit is
+  named by its SHA. Markup that would run away with the message is neutralised: an
+  unbalanced `**` is *dropped* (README bullets arrive like that, and escaping it
+  would still print the debris), a stray or triple backtick run is *escaped* (some
+  prompt-text commits quote fences, and one opened fence swallows everything after
+  it), while `_` is escaped rather than deleted, because it is usually part of a real
+  path. Balanced pairs in the AI summaries pass through untouched — they already use
+  the subset `miniMd` renders. Over the cap, the highlights list goes, then the tail
+  of the summary; the header, quote and details never do.
 * The front page filters: a chip per category present on the page, one toggle for
   churn, state kept in `localStorage`. Filtering is a visibility flip over rows
   that are already in the document, so it costs no request and no backend. **Churn

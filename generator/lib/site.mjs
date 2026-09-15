@@ -577,17 +577,20 @@ function deriveTitleSafe (e) {
 }
 
 // Discord's markdown is a small dialect: **bold**, ### headings, > quotes, `- `
-// lists, ``` fenced blocks and [label](url) masked links. No tables, and no
-// alignment outside a code block -- which is why the figures go into a fenced
-// block: monospace columns are the only tidy table Discord has, and inside one
-// nothing needs escaping at all.
+// lists and ``` fenced blocks. No tables, and no alignment outside a code block --
+// which is why the figures go into a fenced block: monospace columns are the only
+// tidy table Discord has, and inside one nothing needs escaping at all.
 //
-// It also does not hard-wrap, so a four-sentence summary arrives as one
-// unreadable wall. Hence the layout: header, headline, the plain-English line as
-// a quote, the summary one sentence per line, model changes, highlights, an
-// aligned details block, then masked links. No link to our own site: the message
-// is the artifact, not a referral.
+// It also does not hard-wrap, so a four-sentence summary arrives as one unreadable
+// wall. Hence the layout: header, headline, the plain-English line as a quote, the
+// summary one sentence per line, model changes, highlights, and an aligned details
+// block. No links of any kind -- the commit is identified by its SHA, and the
+// message has to stand on its own wherever it lands.
 const DC_LIMIT = 2000
+
+// Zero-width space. Invisible in the paste, fatal to Discord's URL matcher, so a
+// mentioned endpoint stays readable text instead of becoming a link or an embed.
+const ZWSP = String.fromCharCode(0x200b)
 
 // Escape outside `code spans` only: inside one, a literal underscore is already
 // safe, and escaping it there would show the backslash.
@@ -624,6 +627,15 @@ function dcEsc (s) {
   return segs.map((part, i) => {
     if (i % 2) return part
     let out = part.replace(/_/g, '\\_').replace(/\|\|/g, '\\|\\|')
+    // Nothing in the paste may be clickable. But seventeen summaries *mention* an
+    // endpoint as the subject of the commit, and deleting that would delete the
+    // change -- so the words stay and the reachability goes: a markdown link
+    // collapses to its label, and a zero-width space after the colon stops Discord
+    // linkifying or embedding a bare URL. Inside a code span nothing is touched,
+    // because Discord does not linkify there and `https://registry.npmjs.org` as
+    // monospace text is exactly what the reader needs.
+    out = out.replace(/\[([^\]]+)\]\((?:https?:)?\/\/[^)]*\)/g, '$1')
+    out = out.replace(/(https?):\/\//g, (m, p) => `${p}:${ZWSP}//`)
     if (dropStars) out = out.replace(/\*/g, '')
     return out
   }).join('')
@@ -661,7 +673,7 @@ export function discordText (e) {
   // Every line of a quote needs its own `>`: a wrapped continuation is fine, but a
   // hard newline without it would drop out of the quote and lose the rule.
   if (e.eli5?.text) {
-    parts.push(`> **In plain English**\n> ${dcSentences(clipText(e.eli5.text, 300)).join('\n> ')}`)
+    parts.push(`> **In plain English**\n> ${dcSentences(clipText(e.eli5.text, 300)).map(dcEsc).join('\n> ')}`)
   }
   let sumIdx = -1
   if (sum) { sumIdx = parts.length; parts.push(dcSentences(sum).map(dcEsc).join('\n')) }
@@ -674,13 +686,9 @@ export function discordText (e) {
   let factsIdx = -1
   if (facts.length) { factsIdx = parts.length; parts.push(`**Highlights**\n${facts.join('\n')}`) }
   parts.push(`**Details**\n\`\`\`\n${dcDetails(e)}\n\`\`\``)
-  const links = []
-  if (e.compareUrl || e.url) links.push(`[${e.compareUrl ? 'compare' : 'commit'} on GitHub](${e.compareUrl || e.url})`)
-  if (e.prUrl) links.push(`[PR #${e.pr}](${e.prUrl})`)
-  if (links.length) parts.push(`**Links** · ${links.join(' · ')}`)
   let text = parts.join('\n\n')
   // Give up detail in reverse order of value: the highlights list, then the tail of
-  // the summary. The header, quote, details and links are what identifies the change.
+  // the summary. The header, quote and details are what identify the change.
   if (text.length > DC_LIMIT && factsIdx >= 0) { parts.splice(factsIdx, 1); text = parts.join('\n\n') }
   if (text.length > DC_LIMIT && sumIdx >= 0) {
     const room = DC_LIMIT - (text.length - parts[sumIdx].length) - 8
@@ -1564,7 +1572,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <strong>In-Flight PRs:</strong> every open upstream pull request, followed across API pages, with diffstat and a 120-line diff preview. Previews are fetched a budgeted batch per run — the unauthenticated GitHub API allows 60 calls an hour, and the list of 100+ PRs needs one per PR — so they fill in over successive runs; a PR missing one still links to GitHub, and previews are pruned once a PR closes.</p>
 
       <h4>HOW TO USE</h4>
-      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a> — which shows one list at a time (days, releases, categories) with each month folded until opened. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code>: that change alone, expanded, with nothing else from its day — and it survives the entry moving day. The <code>discord</code> button on any entry copies a Discord-formatted version of it — headline, the plain-English line, the summary one sentence per line, model changes, and an aligned details block with the commit, churn, release and author — ready to paste, no link back here.</p>
+      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a> — which shows one list at a time (days, releases, categories) with each month folded until opened. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code>: that change alone, expanded, with nothing else from its day — and it survives the entry moving day. The <code>discord</code> button on any entry copies a Discord-formatted version of it — headline, the plain-English line, the summary one sentence per line, model changes, and an aligned details block with the commit, churn, release and author. Ready to paste, and it carries no links at all: the commit is named by its SHA.</p>
       <p><strong>Find.</strong> The chip bar above the timeline filters the rows on that page by category (the churn chip toggles lockfile-only noise). <a href="/search/">/search/</a> queries every entry ever recorded — press <code>/</code> on any page to jump there — and <a href="/archive/#categories">/archive/</a> lists each category across all time.</p>
       <p><strong>Models, releases, PRs.</strong> <a href="/models/">/models/</a> replays the free-picker catalog with a page per model; <a href="/archive/#releases">release pages</a> list every commit between two versions; <a href="/stats/">/stats/</a> charts churn and cadence; <a href="/in-flight/">/in-flight/</a> previews open upstream pull requests before they merge.</p>
 
