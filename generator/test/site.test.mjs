@@ -463,6 +463,9 @@ test('buildSite generates valid static site output', async () => {
     assert.match(statsHtml, /TELEMETRY/)
     assert.match(statsHtml, /MOST-CHANGED MODELS/)
     assert.match(statsHtml, /class="spark"/)
+    // The spark svg carries an intrinsic width, so max-width alone leaves the
+    // cadence line at 300px inside a card three times as wide.
+    assert.match(statsHtml, /\.cad-spark \.spark\{[^}]*width:100%/, 'the cadence line stretches to its card')
     assert.match(statsHtml, /12-MO TREND/)
     // The page opens with the numbers, not with forty bars, and it is the one page
     // that opts into the wide canvas: the rows need the room.

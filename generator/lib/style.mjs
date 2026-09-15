@@ -575,7 +575,11 @@ nav.term-nav a.active{
 .stat-trend{grid-area:trend;display:flex;justify-content:flex-end;min-width:0}
 .stat-trend .spark{margin:0;width:100%;max-width:112px}
 .cad-spark{margin:0 0 10px}
-.cad-spark .spark{height:52px}
+/* The svg carries an intrinsic width, so max-width:100% only caps it — the cadence
+   line sat at its authored 300px inside a 1,100px card. Stretch it: the viewBox is
+   already preserveAspectRatio="none" and the stroke is non-scaling, so the only
+   thing that changes is the horizontal spacing between months. */
+.cad-spark .spark{width:100%;height:52px}
 .sig-split{display:flex;height:13px;border-radius:2px;overflow:hidden;background:var(--code);margin-bottom:10px}
 .sig-seg{display:block;height:100%}
 .sig-major{background:var(--term-amber)}
