@@ -90,8 +90,22 @@ export function truncate (s, n) {
   return s.length <= n ? s : s.slice(0, n - 1) + '…'
 }
 
-// UTC-safe date helpers (avoid TZ surprises: everything in this pipeline is UTC).
+// Day/month keys are taken straight from the stored timestamp, so they are only
+// UTC-safe once every date has been through toUtc() (see below).
 export function ymd (iso) { return iso.slice(0, 10) }
+
+// Committer dates arrive in whatever zone the author's machine was in: `%cI`
+// yields `2025-11-24T17:25:50-08:00`, and a third of this repository's commits
+// were authored on a -07:00/-08:00 box. Every comparison downstream is either a
+// string compare or a `slice(0, 10)`, both of which silently ignore the offset
+// -- so a commit at 17:25-08:00 (01:25Z the next day) landed on the wrong day
+// page and in the wrong release window. Normalize once, at the boundary.
+export function toUtc (iso) {
+  if (typeof iso !== 'string' || !iso) return iso
+  if (/[Zz]$/.test(iso)) return iso
+  const t = Date.parse(iso)
+  return Number.isNaN(t) ? iso : new Date(t).toISOString()
+}
 export function monthKey (iso) { return iso.slice(0, 7) }
 export function isoDate (d) { return d.toISOString() }
 
@@ -199,4 +213,20 @@ export async function pruneDiffs (diffDir, entries) {
   }
   if (pruned > 0) log(`pruned ${pruned} orphaned diffs (no matching entry)`)
   return pruned
+}
+// Bring one entry's timestamp, and the day/month keys cut from it, into UTC.
+// Idempotent, so it is safe to run over the whole corpus on every merge.
+// Bring one entry's timestamp, and the day/month keys cut from it, into UTC.
+// A row that is already UTC is left strictly untouched -- the writers compare
+// before and after to decide whether anything changed, so a no-op must not
+// rewrite a field that was never there.
+export function normalizeDate (e) {
+  if (!e || typeof e.date !== 'string') return e
+  const date = toUtc(e.date)
+  if (date === e.date) return e
+  e.date = date
+  const day = ymd(date)
+  if (e.day !== undefined) e.day = day
+  if (e.month !== undefined) e.month = day.slice(0, 7)
+  return e
 }

@@ -12,7 +12,7 @@
 // document as the base, and graft only *our* additions on top. Both files are
 // commutative under these rules, so commit order stops mattering.
 import { existsSync } from 'node:fs'
-import { readJson, writeJson, shortHash, eli5Source } from './util.mjs'
+import { readJson, writeJson, shortHash, eli5Source, normalizeDate } from './util.mjs'
 
 export function sortEntries (entries) {
   return entries.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.sha < b.sha ? -1 : 1))
@@ -79,6 +79,12 @@ export function mergeChangelog (ours, theirs) {
     const kept = pickEli5(cur.eli5, e.eli5, cur)
     if (kept && kept !== cur.eli5) cur.eli5 = kept
   }
+
+  // Every write passes through here, which makes this the place a stale in-memory
+  // snapshot gets healed rather than re-published: an entry analyzed before the UTC
+  // normalization still carries `-07:00`, and sortEntries -- plus every day page and
+  // release window the site renders -- compares those strings.
+  for (const e of entries) normalizeDate(e)
 
   return {
     ...base,

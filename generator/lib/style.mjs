@@ -1048,6 +1048,24 @@ details.amonth>summary:hover .am-name{color:#ffffff}
 .am-name{font-size:.84rem;font-weight:700;color:var(--txt)}
 .am-meta{font-size:.74rem;color:var(--txt-subtle)}
 .am-body{padding:8px 10px 10px}
+/* A release window can hold a thousand commits: the tail folds into compact rows
+   so the page stays openable while staying complete. Same affordance as the
+   archive month folds, so the arrow reads the same way. */
+details.more-rows{margin:10px 0 0}
+details.more-rows>summary{
+  list-style:none;
+  cursor:pointer;
+  padding:7px 10px;
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  background:var(--panel);
+  font-size:.8rem;
+  color:var(--txt-dim);
+}
+details.more-rows>summary::-webkit-details-marker{display:none}
+details.more-rows>summary::before{content:'\\25B8';color:var(--txt-dim);font-size:.7rem;margin-right:6px}
+details.more-rows[open]>summary::before{content:'\\25BE'}
+details.more-rows[open]>summary{margin-bottom:6px}
 .rel-chips{
   display:flex;
   flex-wrap:wrap;

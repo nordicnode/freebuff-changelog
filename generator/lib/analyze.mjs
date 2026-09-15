@@ -9,7 +9,7 @@
 //      (model catalog moves, version bumps, file adds/removes, touched areas).
 //   3. Classify + render a deterministic summary; an optional LLM layer can
 //      rewrite summaries later (cached per commit, see generator/lib/llm.mjs).
-import { git, US, RS } from './util.mjs'
+import { git, US, RS, toUtc } from './util.mjs'
 import { open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
@@ -35,7 +35,7 @@ export async function listCommits (repoDir, { since, until } = {}) {
     commits.push({
       sha: sha.trim(),
       parents: parents.trim() ? parents.trim().split(' ') : [],
-      date: date.trim(),
+      date: toUtc(date.trim()),
       subject: (subject || '').trim(),
       author: (author || '').trim(),
       body: (body || '').trim()

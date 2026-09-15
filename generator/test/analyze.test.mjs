@@ -9,6 +9,7 @@ import {
   extractCommentFacts, extractCleanDiff, extractRawDiff, EMPTY_TREE, parseMarkdownTables, catalogFromReadme,
   diffCatalogs
 } from '../lib/analyze.mjs'
+import { toUtc, ymd } from '../lib/util.mjs'
 
 const README_PATCH = [
   'diff --git a/README.md b/README.md',
@@ -328,6 +329,18 @@ test('diff extraction: root commit, lockfile fallback, bounded output', async (t
   const capped = await extractCleanDiff(dir, root, big, 5000)
   assert.ok(capped.length <= 5100, `held to the budget, got ${capped.length}`)
   assert.match(capped, /diff truncated: view full diff on GitHub/, 'and it says so')
+})
+
+// Every comparison downstream is a string compare or a slice(0,10), and both
+// ignore a UTC offset: a commit at 17:25-08:00 is 01:25Z the next day, and it was
+// being filed under the author's local calendar day. listCommits normalizes at the
+// boundary -- this is that normalizer.
+test('toUtc: offsets collapse to Z, UTC and junk pass through', () => {
+  assert.equal(toUtc('2025-11-24T17:25:50-08:00'), '2025-11-25T01:25:50.000Z')
+  assert.equal(toUtc('2026-09-12T10:00:00Z'), '2026-09-12T10:00:00Z')
+  assert.equal(ymd(toUtc('2025-11-24T17:25:50-08:00')), '2025-11-25', 'the day key follows UTC, not the author')
+  assert.equal(toUtc(''), '')
+  assert.equal(toUtc('not a date'), 'not a date')
 })
 
 

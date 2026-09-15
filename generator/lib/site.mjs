@@ -878,6 +878,17 @@ ${rows.map(e => {
   })
   await pool(vers.map((rel, i) => async () => {
     const mine = relRanges[i]
+    // A release that shipped a month of work owns 1,000+ commits, and 1,000+ full
+    // entry cards is a 2.6 MB page nobody scrolls. The newest 40 keep the full
+    // card (body, files, diff toggle); the rest become the compact rows the
+    // /changes/ pages use -- same completeness, one click from the full text.
+    const mineSorted = [...mine].sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0))
+    const REL_FULL = 40
+    const relHead = mineSorted.slice(0, REL_FULL)
+    const relTail = mineSorted.slice(REL_FULL)
+    const relTailRows = relTail.length
+      ? `<details class="more-rows"><summary>[ ${relTail.length.toLocaleString()} earlier commits in this release ]</summary>${relTail.map(changeRow).join('\n')}</details>`
+      : ''
     const prevRel = i > 0 ? vers[i - 1] : null
     const nextRel = i < vers.length - 1 ? vers[i + 1] : null
     const relPager = `<div class="pager">` +
@@ -889,7 +900,7 @@ ${rows.map(e => {
       desc: `Freebuff v${rel.version}: ${mine.length} changes since the previous release.`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(rel.version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Freebuff v${esc(rel.version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p></div></section>` +
         relPager +
-        `<section class="day">${[rel, ...mine].map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx)).join('\n')}</section>` +
+        `<section class="day">${[rel, ...relHead].map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx)).join('\n')}${relTailRows}</section>` +
         relPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/archive/#releases">&larr; [all releases]</a> &middot; <a href="/">[latest]</a></p>`
     }))
@@ -1387,13 +1398,13 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <p>A commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, reconstructed from public git diffs. Upstream ships via automated snapshot merges with blank <em>"Sync public snapshot"</em> messages, so this project diffs each snapshot against its parent and extracts what actually changed: model swaps, version bumps, new slash commands, file-level churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} scanned commits. A sync daemon re-analyzes whenever upstream commits, and at least every 45 minutes.</p>
 
       <h4>HOW IT WORKS</h4>
-      <p><strong>Deterministic first.</strong> Every sync commit is diffed parent-to-head. Model tables in both READMEs are parsed before and after and set-differenced (description-only edits cancel out); the slash-command registry (<code>cli/src/data/slash-commands.ts</code>) gets the same snapshot treatment; version bumps are read from release <code>package.json</code> files. Zero dependencies, stdlib only.</p>
+      <p><strong>Deterministic first.</strong> Every sync commit is diffed parent-to-head. Model tables in both READMEs are parsed before and after and set-differenced (description-only edits cancel out); the slash-command registry (<code>cli/src/data/slash-commands.ts</code>) gets the same snapshot treatment; version bumps are read from release <code>package.json</code> files. Timestamps are normalized to UTC on the way in — upstream commits arrive in whatever zone the author's machine was in, and a commit at 17:25 <code>-08:00</code> belongs to the next UTC day. Zero dependencies, stdlib only.</p>
       <p><strong>LLM summaries, cached forever.</strong> A model rewrites every change entry once (cached by commit SHA, prompt version, and diff hash, so a prompt edit re-summarizes exactly once) into a technical 2-4 sentence summary — community commits included, not just snapshot diffs. It sees only the diff plus extracted facts — model access/traits, command names, files, stats — and is schema-validated with one repair retry. A second pass adds a one-line plain-English explanation under the summary, pinned to the exact summary it was written from. Lockfile-only churn rows keep the deterministic label instead of paying for it. No provider configured means deterministic summaries only; nothing breaks.</p>
       <p><strong>Every claim links to proof.</strong> Each entry carries its commit SHA, compare URL, inline diff, and per-file stats. The diff is stored for every entry — lockfiles and test-only hunks stripped where there is other content, kept whole for a commit whose only change <em>is</em> the lockfile — and it loads on demand rather than sitting in the page. Model swaps render before/after README rows inline.</p>
 
       <h4>WHAT WE TRACK</h4>
       <p><strong>Model Catalog</strong> (${(cats.get('Model Catalog') || 0)} changes): additions, retirements, and swaps in the free picker, with access level and trait columns — plus a <a href="/models/">catalog timeline</a> and per-model pages.<br>
-      <strong>Releases</strong> (${vers.length} tracked): CLI and core <code>package.json</code> bumps with per-release pages listing every commit in range.<br>
+      <strong>Releases</strong> (${vers.length} tracked): CLI and core <code>package.json</code> bumps with per-release pages listing every commit in range — the newest 40 as full entries, the rest as compact rows under one fold, because a release that shipped a month of work owns 1,000+ commits.<br>
       <strong>Commands</strong> (${(cats.get('Commands') || 0)} changes): new or removed <code>/slash-commands</code> from the registry (renames surface as add+remove).<br>
       <strong>CLI</strong> (${(cats.get('CLI') || 0).toLocaleString()}), <strong>Core</strong> (${(cats.get('Core') || 0).toLocaleString()}), <strong>SDK</strong> (${(cats.get('SDK') || 0)}), <strong>Agent Runtime</strong> (${(cats.get('Agent Runtime') || 0)}), <strong>Agents</strong> (${(cats.get('Agents') || 0)}), <strong>LLM Providers</strong> (${(cats.get('LLM Providers') || 0)}), <strong>Packaging</strong> (${(cats.get('Packaging') || 0)}), <strong>Docs</strong> (${(cats.get('Docs') || 0)}), <strong>Internal</strong> (${(cats.get('Internal') || 0).toLocaleString()}): file-path categorization with per-file add/remove/rename tracking.<br>
       <strong>Significance:</strong> <code>major</code> (model or version change), <code>notable</code> (command changes, added/removed files, &gt;400-line churn), <code>minor</code> (internal), <code>noise</code> (lockfile-only churn — listed but hidden behind the churn chip by default). Deterministic by default; the LLM may only override with diff evidence.<br>
@@ -1405,7 +1416,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <p><strong>Models, releases, PRs.</strong> <a href="/models/">/models/</a> replays the free-picker catalog with a page per model; <a href="/archive/#releases">release pages</a> list every commit between two versions; <a href="/stats/">/stats/</a> charts churn and cadence; <a href="/in-flight/">/in-flight/</a> previews open upstream pull requests before they merge.</p>
 
       <h4>LIMITS</h4>
-      <p>Snapshots squash upstream history, so intra-snapshot sequencing is approximate and authorship resolves to the snapshot bot. Diffs older than 90 days are pruned (day pages fall back to GitHub compare links). AI summaries describe only what the diff shows — no research, no speculation on model capabilities beyond the README row.</p>
+      <p>Snapshots squash upstream history, so intra-snapshot sequencing is approximate and authorship resolves to the snapshot bot. A stored diff lives as long as its entry does — nothing is deleted for being old, only orphaned files whose entry is gone. AI summaries describe only what the diff shows — no research, no speculation on model capabilities beyond the README row.</p>
 
       <h4>FOLLOW ALONG</h4>
       <p><a href="/feed.xml">RSS</a> (major + notable), <a href="/feed-models.xml">models only</a>, <a href="/feed-releases.xml">releases only</a>. <a href="/search/">Search</a> supports category and impact filters; <a href="/archive/">Categories</a> list every change of each type, all time; <a href="/stats/">stats</a> charts churn and cadence; <a href="/archive/">Archive</a> holds every day and release. Source: a local sync daemon pushing <code>data/</code> on every upstream commit (45-minute freshness budget), with an hourly GitHub Action as fallback; Cloudflare deploys on push.</p>
@@ -1520,7 +1531,16 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   await write(dist, 'sitemap-pages.xml', urlset(pageUrls))
   await write(dist, 'sitemap.xml', `<?xml version="1.0" encoding="UTF-8"?>\n<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-pages.xml'].map(f => `<sitemap><loc>${SITE.url}/${f}</loc></sitemap>`).join('')}</sitemapindex>`)
   await write(dist, 'robots.txt', `User-agent: *\nAllow: /\nSitemap: ${SITE.url}/sitemap.xml\n`)
-  await write(dist, '_redirects', '/changes/ /archive/ 301\n')
+  // Dead URLs from removed sections, so a bookmark or a search hit lands somewhere
+  // live instead of on the 404. Workers evaluates these in order, most specific
+  // first; `*` matches any characters, and the splat is deliberately discarded.
+  await write(dist, '_redirects', [
+    '/changes/ /archive/ 301',
+    '/watch /models/ 301',
+    '/watch/ /models/ 301',
+    '/models/*/feed.xml /feed-models.xml 301',
+    '/models/*/feed /feed-models.xml 301'
+  ].join('\n') + '\n')
   // Header policy. Caching is off site-wide: one `no-cache` on /* makes every
   // browser revalidate with the edge before reuse, so a deploy can never be
   // hidden behind a stale TTL (cheap 304s, not re-downloads). What remains here

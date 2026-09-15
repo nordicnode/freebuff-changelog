@@ -47,7 +47,14 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
   SHA, and each side keeps the summaries it produced. A cycle holds a snapshot in
   memory across minutes of LLM calls, so overwriting would push a stale `headSha`
   back onto origin — the exact shape behind a site reading `[stale 184m]` while
-  git kept receiving commits.
+  git kept receiving commits. The merge also re-normalizes any timestamp it is
+  handed, so a snapshot taken before that rule can't reintroduce an offset.
+* **All timestamps are UTC.** `git log --format=%cI` yields the *author's* zone
+  (`2025-11-24T17:25:50-08:00`), and every comparison downstream — the day pages,
+  the release windows, the sort key — is a string compare or a `slice(0, 10)`,
+  both of which ignore the offset. `toUtc()` collapses it at the boundary
+  (`analyze.mjs` `listCommits`), and `npm run normalize-dates` repaired the 6,365
+  rows stored before it did. A commit's day page is its **UTC** day.
 * `build` renders a **fully static site**: one inline stylesheet, zero client JS
   except the search page, system fonts, pre-rendered day/release/archive pages,
   RSS, sitemap, JSON API, `_headers` for content types, CORS and a site-wide
@@ -204,7 +211,7 @@ rule-based summary is used: the site never depends on the LLM.
 |---|---|
 | `/` | the newest day in full: every entry pushed that UTC day (churn hidden by default), category chips, live HEAD + sync countdown |
 | `/day/YYYY-MM-DD/` | one day of the timeline — the same full bodies and chips, one day per page; older/newer walk by date, and there is a jump-to-date select. `#sha` permalinks point here |
-| `/release/1.0.NNN/` | entries since the previous version bump |
+| `/release/1.0.NNN/` | every commit since the previous version bump — the newest 40 as full entries, the rest as compact rows under one fold |
 | `/archive/` | one list at a time — DAYS / RELEASES / CATEGORIES — each grouped into months that stay folded until opened (`<details>`, so no-JS gets the long version). `#releases`, `#categories` and `#days-m-YYYY-MM` deep-link into a view |
 | `/changes/<category>/` | every change of one category, all time: compact rows, each linking to the full body on its day page (category tiles live on `/archive/#categories`; `/changes/` 301-redirects there) |
 | `/search/` | client filter over pre-built JSON index |

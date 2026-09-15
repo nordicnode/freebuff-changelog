@@ -257,6 +257,21 @@ test('mergeChangelog keeps the ELI5 that matches the surviving summary', () => {
   }
 })
 
+// A snapshot taken before the UTC normalization still carries the author's offset,
+// and every day page and release window compares those strings. The merge is the
+// one choke point both writers pass through, so it is where a stale row gets healed
+// rather than re-published.
+test('mergeChangelog rewrites an offset timestamp on the way out', () => {
+  const stale = { ...entry('a', '2026-09-14T17:25:50-08:00'), day: '2026-09-14', month: '2026-09' }
+  const m = mergeChangelog(
+    doc('2026-09-15T00:00:00.000Z', 'x', [stale]),
+    doc('2026-09-14T21:00:00.000Z', 'y', [entry('b', '2026-09-14T23:00:00Z')]))
+  const a = m.entries.find(e => e.sha === 'a')
+  assert.equal(a.date, '2026-09-15T01:25:50.000Z')
+  assert.equal(a.day, '2026-09-15', 'the row moves to the UTC day it belongs to')
+  assert.equal(m.entries[0].sha, 'b', 'which also puts the two rows in the right order')
+})
+
 test('mergeChangelog is deterministic when two different ELI5 lines are equally stale', () => {
   const ai = { v: 5, title: 'T', summary: 'S' }
   const a = { ...entry('a', '2026-09-14T10:00:00Z', ai), eli5: { text: 'one', v: 1, src: 'aaaaaaaaaaaa' } }

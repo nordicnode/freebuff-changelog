@@ -8,7 +8,7 @@ import { mkdir, readFile, rm, cp } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { resolve, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { git, readJson, writeJson, writeText, log, ymd, pruneDiffs, pool, withLock } from './lib/util.mjs'
+import { git, readJson, writeJson, writeText, log, ymd, toUtc, normalizeDate, pruneDiffs, pool, withLock } from './lib/util.mjs'
 import { capturePendingWrites, persistMerged } from './lib/mergedata.mjs'
 import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
@@ -210,6 +210,10 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
 }
 
 function decorate (e) {
+  // Upstream commits carry the author's offset (`-08:00`); the day pages, the
+  // release windows and every sort key off the string, so the zone has to go
+  // before anything reads it. Idempotent: an already-UTC date passes through.
+  e.date = toUtc(e.date)
   const testOnly = e.files.testOnly ?? ((e.files.meaningful === 0 && (e.files.rawMeaningful || 0) > 0) ||
     ([...e.files.added, ...e.files.removed, ...e.files.modified].length > 0 &&
      [...e.files.added, ...e.files.removed, ...e.files.modified].every(p => TEST_RE.test(p))))
@@ -355,8 +359,8 @@ async function generateOnce (argv) {
     entries
   }
   // Prune first, then reconcile flags with what is on disk -- both before the
-  // write. backfillDiffs sets hasDiff when it creates a file, pruneDiffs deletes
-  // files older than 90 days, and running prune after the write left 58 rows
+  // write. backfillDiffs sets hasDiff when it creates a file, pruneDiffs removes
+  // files no entry references, and running prune after the write left 58 rows
   // advertising a diff that no longer existed (404 behind "View inline diff").
   await pruneDiffs(resolve(DATA, 'diffs'), entries)
   refreshDiffFlags(entries, resolve(DATA, 'diffs'))
@@ -814,6 +818,7 @@ if (IS_MAIN) {
   else if (cmd === 'watch' || cmd === 'backfill') await cmdWatch(rest)
   else if (cmd === 'push-data') await cmdPushData(rest)
   else if (cmd === 'enrich-all') await cmdEnrichAll(rest)
+  else if (cmd === 'normalize-dates') await cmdNormalizeDates(rest)
   else if (cmd === 'build') await cmdBuild()
   else if (cmd === 'preview') await cmdPreview(Number(rest[0]) || 8788)
   else {
@@ -824,6 +829,7 @@ if (IS_MAIN) {
   node generator/cli.mjs watch [--push]           # alias for backfill
   node generator/cli.mjs push-data [--message M]  # commit+push data/ with the shared race handling
   node generator/cli.mjs enrich-all [--batch N] [--push]  # one pass toward a diff + summary + ELI5 for every entry (0 = everything left)
+  node generator/cli.mjs normalize-dates [--push]  # one-off: rewrite stored timestamps to UTC and fix the day/month keys
   node generator/cli.mjs build                    # render static site → dist/
   node generator/cli.mjs preview [port]           # local preview of dist/`)
     process.exit(cmd ? 1 : 0)
@@ -881,4 +887,36 @@ async function enrichAllPass (argv) {
 
   log(`[enrich-all] +${stored} diffs, +${calls} summaries, +${eli5} eli5 | left: ${left.diffs} diffs, ${left.summaries} summaries, ${left.eli5} eli5`)
   return left
+}
+/**
+ * One-off repair of the stored history: rewrite every timestamp to UTC and
+ * recompute the day/month keys derived from it.
+ *
+ * `%cI` handed us the author's offset (`2025-11-24T17:25:50-08:00`) and the
+ * renderer compares those strings lexicographically and slices them for day
+ * keys, which ignores the offset entirely: 2,370 entries were filed under the
+ * author's local calendar day and 371 of 645 release windows held the wrong
+ * commits. `decorate` normalizes on the way in now; this repairs the rows that
+ * were stored before it did. Safe to re-run -- an already-UTC entry is skipped.
+ */
+async function cmdNormalizeDates (argv) {
+  const { acquired } = await withLock(LOCK, async () => {
+    const doc = await readJson(`${DATA}/changelog.json`, null)
+    if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
+    let moved = 0
+    for (const e of doc.entries) {
+      const was = `${e.date}|${e.day}`
+      normalizeDate(e)
+      if (`${e.date}|${e.day}` !== was) moved++
+    }
+    if (!moved) { log('[normalize-dates] every stored date is already UTC: nothing to do'); return 0 }
+    if (argv.includes('--push')) {
+      await commitAndPushData({ message: `data: normalize stored commit dates to UTC (${moved} rows)`, overrides: { [`${DATA}/changelog.json`]: doc } })
+    } else {
+      await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: doc }))
+    }
+    log(`[normalize-dates] rewrote ${moved} entries`)
+    return moved
+  })
+  if (!acquired) log('[normalize-dates] another generate/backfill run holds the worktree lock: retry shortly')
 }
