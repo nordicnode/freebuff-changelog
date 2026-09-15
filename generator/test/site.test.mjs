@@ -529,6 +529,23 @@ test('buildSite generates valid static site output', async () => {
     assert.match(redirectsTxt, /^\/changes\/ \/archive\/ 301$/m, 'old hub URL redirects to archive')
     assert.match(redirectsTxt, /^\/watch\/ \/models\/ 301$/m, 'the removed watchlist still resolves for old bookmarks')
     assert.match(redirectsTxt, /^\/models\/\*\/feed\.xml \/feed-models\.xml 301$/m, 'deleted per-model feeds point at the model feed')
+    // /c/<sha> is the date-free permalink. A day URL is a function of a timestamp
+    // that has already moved once, so shared links need an address that encodes no
+    // date -- and one page plus a lookup table, because ~9,500 static redirect
+    // files would blow the Workers asset cap.
+    const shaDay = JSON.parse(await readFile(join(tmpDist, 'api/sha-day.json'), 'utf8'))
+    assert.deepEqual(Object.keys(shaDay).sort(), mockChangelog.entries.map(e => e.sha.slice(0, 12)).sort(),
+      'every entry is resolvable by its anchor')
+    assert.equal(shaDay[mockChangelog.entries[0].sha.slice(0, 12)], mockChangelog.entries[0].day)
+    assert.match(redirectsTxt, /^\/c\/\* \/c\/index\.html 200$/m, 'the resolver answers every /c/ address')
+    const resolver = await readFile(join(tmpDist, 'c/index.html'), 'utf8')
+    assert.match(resolver, /name="robots" content="noindex"/, 'a lookup page must not dilute the day pages in search')
+    assert.match(resolver, /location\.replace\(href\)/, 'it sends the visitor on, not just tells them')
+    assert.match(resolver, /<noscript>/, 'and says so when JS is off')
+    // The script is emitted from inside a template literal, where one backslash in
+    // the source becomes nothing in the output -- an escaped regex or quote can
+    // silently arrive in the page un-escaped and dead. Parse what actually shipped.
+    new Function(resolver.match(/<script>([\s\S]*?)<\/script>/)[1])
     assert.doesNotMatch(headerText, /\/changes\/\*/, 'cache-only /changes/* rule retired with the hub')
     for (const url of ['/changes/', '/changes/cli/', '/changes/churn/']) {
       assert.deepEqual(duplicatedHeaders(rules, url), [], `overlapping _headers rules for ${url}`)

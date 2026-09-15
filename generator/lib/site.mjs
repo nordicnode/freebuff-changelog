@@ -1411,7 +1411,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <strong>In-Flight PRs:</strong> every open upstream pull request, followed across API pages, with diffstat and a 120-line diff preview. Previews are fetched a budgeted batch per run — the unauthenticated GitHub API allows 60 calls an hour, and the list of 100+ PRs needs one per PR — so they fill in over successive runs; a PR missing one still links to GitHub, and previews are pruned once a PR closes.</p>
 
       <h4>HOW TO USE</h4>
-      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a> — which shows one list at a time (days, releases, categories) with each month folded until opened. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. Share <code>/day/&lt;date&gt;/#sha</code> to point at one specific change.</p>
+      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a> — which shows one list at a time (days, releases, categories) with each month folded until opened. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. Share <code>/day/&lt;date&gt;/#sha</code> to point at one specific change, or <code>/c/&lt;sha&gt;</code> for a permalink that survives the entry moving day.</p>
       <p><strong>Find.</strong> The chip bar above the timeline filters the rows on that page by category (the churn chip toggles lockfile-only noise). <a href="/search/">/search/</a> queries every entry ever recorded — press <code>/</code> on any page to jump there — and <a href="/archive/#categories">/archive/</a> lists each category across all time.</p>
       <p><strong>Models, releases, PRs.</strong> <a href="/models/">/models/</a> replays the free-picker catalog with a page per model; <a href="/archive/#releases">release pages</a> list every commit between two versions; <a href="/stats/">/stats/</a> charts churn and cadence; <a href="/in-flight/">/in-flight/</a> previews open upstream pull requests before they merge.</p>
 
@@ -1519,6 +1519,45 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     openPrs: openPrs?.length || 0
   }))
 
+  // ----- stable commit permalink: /c/<sha>
+  // A day URL is a function of the commit timestamp, and that timestamp's day has
+  // moved twice over this project's life (once by an author's UTC offset, once by
+  // the backfill that fixed it). Links already shared cannot be rewritten, so
+  // they need an address that encodes no date at all. 9,527 static redirect pages
+  // would blow the Workers asset cap, so it is one page plus a lookup table:
+  // `/c/*` rewrites here and the resolver sends the visitor to whichever day page
+  // holds that commit now.
+  const shaDay = {}
+  for (const e of entries) shaDay[e.sha.slice(0, 12)] = e.day
+  await write(dist, 'api/sha-day.json', JSON.stringify(shaDay))
+  await write(dist, 'c/index.html', layout({
+    title: 'Commit permalink', path: '/c/', noindex: true,
+    desc: 'Resolve a Freebuff commit SHA to the changelog entry that records it.',
+    body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">PERMALINK :: COMMIT LOOKUP</span></div>
+<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)" id="c-status">Searching the changelog for this commit&hellip;</p>
+<p style="margin:8px 0 0;font-size:.8rem;color:var(--txt-subtle)"><a href="/">[ latest day ]</a> &middot; <a href="/search/">[ search ]</a> &middot; <a href="/archive/">[ archive ]</a></p>
+<noscript><p style="margin:8px 0 0;font-size:.8rem">This resolver needs JavaScript: open <a href="/search/">/search/</a> and paste the commit SHA.</p></noscript>
+</div></section>
+<script>
+(function () {
+  var want = (location.pathname.split('/')[2] || '').toLowerCase()
+  var el = document.getElementById('c-status')
+  if (!/^[0-9a-f]{4,40}$/.test(want)) { el.textContent = 'Not a commit address. A permalink looks like /c/0fb475fc1234.'; return }
+  fetch('/api/sha-day.json').then(function (r) {
+  return r.ok ? r.json() : Promise.reject(new Error('lookup returned HTTP ' + r.status))
+  }).then(function (map) {
+  var keys = Object.keys(map)
+  var key = Object.prototype.hasOwnProperty.call(map, want) ? want
+    : keys.find(function (k) { return k.indexOf(want) === 0 || want.indexOf(k) === 0 })
+  if (!key) { el.textContent = 'No changelog entry records ' + want + ' — it may predate the archive.'; return }
+  var href = '/day/' + map[key] + '/#' + key
+  el.innerHTML = 'Found <a href="' + href + '">' + key + '</a> &mdash; redirecting…'
+  location.replace(href)
+  }).catch(function (err) { el.textContent = 'Lookup failed: ' + err.message })
+})()
+</script>`
+  }))
+
   // ----- sitemap index (day pages change daily, release/pages rarely)
   const urlset = (urls) => `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.map(u => `<url><loc>${SITE.url}${u}</loc></url>`).join('')}</urlset>`
   const dayUrls = byDay.map(d => `/day/${d.day}/`)
@@ -1539,7 +1578,10 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     '/watch /models/ 301',
     '/watch/ /models/ 301',
     '/models/*/feed.xml /feed-models.xml 301',
-    '/models/*/feed /feed-models.xml 301'
+    '/models/*/feed /feed-models.xml 301',
+    // A rewrite, not a redirect: the resolver reads the SHA off the path it was
+    // asked for, so the address a person shared stays in the URL bar.
+    '/c/* /c/index.html 200'
   ].join('\n') + '\n')
   // Header policy. Caching is off site-wide: one `no-cache` on /* makes every
   // browser revalidate with the edge before reuse, so a deploy can never be
