@@ -161,7 +161,7 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
         if (!r.ok) {
           if (r.status === 403 || r.status === 429) {
             refused = true
-            log(`GitHub refused per-PR calls (HTTP ${r.status}${process.env.GITHUB_TOKEN ? '' : ', no GITHUB_TOKEN set'}): ${prs.length - used} PRs left without a preview, retrying shortly`)
+            log(`GitHub refused per-PR calls (HTTP ${r.status}${process.env.GITHUB_TOKEN ? '' : ', no GITHUB_TOKEN set'}): stopping the decoration pass, retrying shortly`)
           }
           return null
         }
@@ -187,6 +187,14 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
     // Mark previews already on disk (skipped above, still viewable).
     for (const p of prs) {
       if (!p.hasDiff && existsSync(resolve(dataDir, `pr-diffs/${p.number}.diff`))) p.hasDiff = true
+    }
+    // Say what is missing and why, in the same breath as the budget: a reader
+    // of the log should not have to infer that 114 PRs and 25 calls do not
+    // meet, or that the gap is being closed on purpose.
+    const noDiff = prs.filter(p => !p.hasDiff).length
+    const noStats = prs.filter(p => p.additions == null).length
+    if (noDiff || noStats) {
+      log(`open PRs: ${prs.length} listed, ${used}/${PR_CALL_BUDGET} per-PR calls spent${refused ? ' (refused)' : ''}; ${noDiff} without a preview, ${noStats} without a diffstat -- the next run continues`)
     }
     // `partial` is what turns the 6h cache into a checkpoint: the next run comes
     // back for the previews the budget could not pay for.
