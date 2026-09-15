@@ -470,8 +470,12 @@ test('buildSite generates valid static site output', async () => {
     assert.match(statsHtml, /class="stat-figure-lbl">CHANGES</)
     assert.match(statsHtml, /class="stat-row"><span class="stat-lbl">/, 'every bar is one budgeted grid row')
     assert.match(statsHtml, /class="stat-fill add"/, 'churn is drawn as added and removed, not one folded number')
-    assert.match(statsHtml, /class="heat h\d"/, 'daily activity cells render')
-    assert.match(statsHtml, /class="sig-seg sig-/) 
+    assert.doesNotMatch(statsHtml, /ACTIVITY|heat-grid/, 'the daily activity strip is gone')
+    // Card order is the layout: the grid places three half-width cards side by
+    // side, so WHAT COUNTED reads as adjacent to the models it weighs.
+    const statCards = [...statsHtml.matchAll(/<h3>([^<]*)<\/h3>/g)].map(m => m[1])
+    assert.equal(statCards.indexOf('WHAT COUNTED'), statCards.indexOf('MOST-CHANGED MODELS') + 1, 'what counted sits beside the models card')
+    assert.match(statsHtml, /class="sig-seg sig-/)
     assert.match(indexHtml, /href="\/stats\/"/)
 
     // Verify day jump, split-view toggle, collapse, sitemap models

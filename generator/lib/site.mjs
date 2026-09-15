@@ -1412,23 +1412,6 @@ ${archiveScript}`
   const sigRows = ['major', 'notable', 'minor'].map(s => [s, meaningful.filter(e => e.significance === s).length])
   const sigMax = Math.max(1, ...sigRows.map(([, n]) => n))
 
-  // 26 weeks of daily volume, Monday-first, one grid column per week. Cadence
-  // answers "how much per month"; nothing with twelve bars can answer "when did it
-  // actually move", which is what this is for. Days outside the record stay blank
-  // rather than drawn as zero, so a quiet week reads as quiet and a repo that did
-  // not exist yet reads as absent.
-  const HEAT_WEEKS = 26
-  const heatEndMs = Date.parse(String(last.day).slice(0, 10) + 'T00:00:00Z')
-  const heatStartMs = heatEndMs - (((new Date(heatEndMs).getUTCDay() + 6) % 7) + 7 * (HEAT_WEEKS - 1)) * 86400000
-  const heatCells = []
-  for (let i = 0; i < HEAT_WEEKS * 7; i++) {
-    const key = new Date(heatStartMs + i * 86400000).toISOString().slice(0, 10)
-    const n = dayCount.get(key)
-    const lvl = n === undefined ? -1 : n === 0 ? 0 : n <= 3 ? 1 : n <= 8 ? 2 : n <= 18 ? 3 : 4
-    heatCells.push(`<span class="heat h${lvl}"${n === undefined ? '' : ` title="${key} &middot; ${n} change${n === 1 ? '' : 's'}"`}></span>`)
-  }
-  const heatRange = `${esc(fmtDateHuman(new Date(heatStartMs).toISOString().slice(0, 10)))} &rarr; ${esc(fmtDateHuman(String(last.day).slice(0, 10)))}`
-
   // One row, one grid: label / track / figure / trend. The track is the flexible
   // column, so a long label or a wide figure can never eat the bar again.
   const bar = (lbl, n, max, { href, trend = '', num = '', pct = -1 } = {}) => `<div class="stat-row"><span class="stat-lbl">${href ? `<a href="${href}">${esc(lbl)}</a>` : esc(lbl)}</span><span class="stat-track"><span class="stat-fill" style="width:${Math.max(2, Math.round(n / max * 100))}%"></span></span><span class="stat-num">${num || n.toLocaleString()}${pct >= 0 ? `<i class="stat-share">${pct}%</i>` : ''}</span><span class="stat-trend">${trend}</span></div>`
@@ -1454,13 +1437,12 @@ ${archiveScript}`
       + card('CHANGES BY CATEGORY (12-MO TREND)', `${statCats.length} categories &middot; sparkline covers ${allMonths.length} months`, statCats.map(([c, n]) => bar(c, n, catMax, { href: `/search/?cat=${encodeURIComponent(c)}`, pct: share(n, sigTotal), trend: catSpark(c) })).join(''), 'stat-span')
       + card('CODE CHURN BY AREA', `top ${churnRows.length} of ${churnByArea.size} areas &middot; lines added / removed`, churnRows.map(churnBar).join(''))
       + card('MOST-CHANGED MODELS', modelTotal ? `${modelTotal} catalog moves across ${modelCounts.size} models` : 'no catalog moves recorded', modelRows2.map(([m, n]) => bar(m, n, modelMax, { href: `/models/${modelSlug(m)}/`, pct: share(n, modelTotal) })).join(''))
+      + card('WHAT COUNTED', `${sigTotal.toLocaleString()} changes split by weight`, `<div class="sig-split">${sigRows.map(([s, n]) => `<span class="sig-seg sig-${s}" style="width:${share(n, sigTotal)}%" title="${s}: ${n.toLocaleString()}"></span>`).join('')}</div>` + sigRows.map(([s, n]) => bar(s.toUpperCase(), n, sigMax, { pct: share(n, sigTotal) })).join(''))
       + card('SHIPPING CADENCE (LAST 12 MO)', `${monthRows.length} of ${byMonth.size} months &middot; peak ${monthMax.toLocaleString()} changes`, `<div class="cad-spark">${cadenceSpark}</div>` + monthRows.map(([m, n], i) => {
         const prev = i ? monthRows[i - 1][1] : 0
         const d = prev ? Math.round((n - prev) / prev * 100) : null
         return bar(m, n, monthMax, { href: `/archive/#days-m-${m}`, num: `${n.toLocaleString()}${d === null ? '' : ` <i class="stat-delta ${d >= 0 ? 'pos' : 'neg'}">${d >= 0 ? '+' : '&minus;'}${Math.abs(d)}%</i>`}` })
       }).join(''), 'stat-span')
-      + card('ACTIVITY (LAST 26 WEEKS)', heatRange, `<div class="heat-grid">${heatCells.join('')}</div><div class="heat-legend">QUIETER<span class="heat h0"></span><span class="heat h1"></span><span class="heat h2"></span><span class="heat h3"></span><span class="heat h4"></span>BUSIER</div>`)
-      + card('WHAT COUNTED', `${sigTotal.toLocaleString()} changes split by weight`, `<div class="sig-split">${sigRows.map(([s, n]) => `<span class="sig-seg sig-${s}" style="width:${share(n, sigTotal)}%" title="${s}: ${n.toLocaleString()}"></span>`).join('')}</div>` + sigRows.map(([s, n]) => bar(s.toUpperCase(), n, sigMax, { pct: share(n, sigTotal) })).join(''))
       + `</div>`
   }))
 

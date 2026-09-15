@@ -581,23 +581,11 @@ nav.term-nav a.active{
 .sig-major{background:var(--term-amber)}
 .sig-notable{background:var(--term-cyan)}
 .sig-minor{background:var(--term-border-strong)}
-/* One column per week, seven rows, Monday on top: fixed cells distributed across
-   the card, so the strip fills the width without stretching a cell into a tile. */
-.heat-grid{display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,11px);grid-auto-columns:11px;gap:3px;justify-content:space-between}
-.heat{display:block;border-radius:2px;background:var(--code)}
-.heat.h-1{background:transparent}
-.heat.h0{background:var(--code)}
-.heat.h1{background:rgba(63,185,80,.28)}
-.heat.h2{background:rgba(63,185,80,.5)}
-.heat.h3{background:rgba(63,185,80,.72)}
-.heat.h4{background:var(--term-green)}
-.heat-legend{display:flex;align-items:center;gap:4px;font-size:.66rem;color:var(--txt-subtle);margin-top:10px}
-.heat-legend .heat{width:10px;height:10px}
+
 @media (max-width:560px){
   .stat-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"lbl num" "track track"}
   .stat-trend{display:none}
   .stat-num{min-width:0}
-  .heat-grid{grid-template-rows:repeat(7,9px);grid-auto-columns:9px;gap:2px}
 }
 
 .summary{
