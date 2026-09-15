@@ -224,9 +224,11 @@ test('buildSite generates valid static site output', async () => {
     assert.doesNotMatch(indexHtml, /<div class="diff-line/)
     assert.match(indexHtml, /Loading diff…/)
     assert.doesNotMatch(indexHtml, /class="sync-badge"/)
-    assert.match(indexHtml, /class="sync-val"/)
-    assert.match(indexHtml, /SYNC DUE:/)
-    // The countdown must key off the sync budget, not the wall-clock hour: the
+    // No countdown on the page: the loop re-analyzes the moment upstream moves, so
+    // "sync due in 34m" described a schedule that never existed. The age badge and
+    // its budget stay.
+    assert.doesNotMatch(indexHtml, /class="sync-val"|SYNC DUE|updateSyncTimer/)
+    // The age badge must key off the sync budget, not the wall-clock hour: the
     // backfill loop owns freshness now, so "next :00" would be fiction.
     assert.match(indexHtml, new RegExp('data-budget-min="' + Math.round(syncStaleMs({}) / 60000) + '"'))
     assert.doesNotMatch(indexHtml, /setUTCHours/)
@@ -789,8 +791,8 @@ test('the timeline paginates one day per page and keeps every entry reachable', 
     // `.sync-age`/`data-generated` hook, because that is what the shell's aging and
     // reload-when-behind logic looks for -- an auto-refresh while someone reads an
     // old day would yank the page out from under them.
-    assert.match(latest, /class="sync-val"/)
-    assert.match(d12, /class="sync-val"/)
+    assert.match(latest, /class="sync-age"/)
+    assert.match(d12, /class="sync-age"/)
     assert.match(d11, /THIS DAY IS SETTLED HISTORY/)
     assert.doesNotMatch(d11, /class="sync-val"|class="sync-age"|data-generated=/)
     assert.match(d11, /DATA AS OF \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/)

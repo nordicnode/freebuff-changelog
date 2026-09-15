@@ -73,34 +73,6 @@ ${body}
   </div>
 </footer>
 <script>
-function updateSyncTimer() {
-  const el = document.querySelector('.sync-val');
-  const ageEl = document.querySelector('.sync-age');
-  if (!el || !ageEl || !ageEl.dataset.generated) return;
-  const generated = Date.parse(ageEl.dataset.generated);
-  if (!Number.isFinite(generated)) return;
-  // Budget-based, not wall-clock. The loop re-analyzes when upstream moves or
-  // when the data passes its age budget (data-budget-min); an upstream commit
-  // can trigger it sooner, so this is a worst case, not a promised minute. The
-  // old version ticked to the next :00, describing a schedule that stopped
-  // owning freshness.
-  const budgetMin = Number(ageEl.dataset.budgetMin) || 45;
-  const leftMs = generated + budgetMin * 60000 - Date.now();
-  if (leftMs <= 0) {
-    // Overdue: a pass is running now, or the loop is down and the age counter
-    // is about to turn amber. Either way "next sync at :00" would be fiction.
-    el.textContent = 'syncing…';
-    el.style.color = 'var(--term-green)';
-    return;
-  }
-  el.style.color = 'var(--term-cyan)';
-  const m = Math.floor(leftMs / 60000);
-  const s = Math.floor((leftMs % 60000) / 1000);
-  el.textContent = '≤ ' + m + 'm ' + (s < 10 ? '0' : '') + s + 's';
-}
-updateSyncTimer();
-setInterval(updateSyncTimer, 1000);
-
 function updateSyncAge() {
   const el = document.querySelector('.sync-age');
   if (!el || !el.dataset.generated) return;
@@ -775,8 +747,8 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
   browseList.sort((a, b) => b.list.length - a.list.length || a.label.localeCompare(b.label))
   const browseBySlug = new Map(browseList.map(b => [b.slug, b]))
   // How long the data is allowed to sit before the sync loop re-analyzes. The
-  // countdown below has to be stated in these terms: it used to tick to the top
-  // of the next hour, describing a schedule that no longer owns freshness.
+  // [fresh]/[stale] badge has to be stated in these terms: it used to tick to the
+  // top of the next hour, describing a schedule that no longer owns freshness.
   const syncBudgetMin = Math.round(syncStaleMs() / 60000)
 
   // ----- the timeline: one day per page
@@ -817,15 +789,14 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
     const real = rows.filter(e => !e.noise).length
     const churn = rows.length - real
     const latest = i === 0
-    // The footer on `/` is a live claim: HEAD, and a countdown to the next sync.
+    // The footer on `/` is a live claim: HEAD and how old the data is.
     // Every other day is settled, so it states the stamp it was built from and
     // deliberately carries no `.sync-age`/`data-generated` hook -- that is the
     // element the shell's aging and reload-when-behind logic looks for, and an
     // auto-refresh while someone reads July 2024 would yank the page out from
     // under them.
     const freshness = latest
-      ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}">${esc(fmtDateHuman(generated))} UTC</span></span>
-      <span>SYNC DUE: <span class="sync-val" style="color:var(--term-cyan);font-weight:600">--:--</span></span>`
+      ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}">${esc(fmtDateHuman(generated))} UTC</span></span>`
       : `<span>DATA AS OF ${esc(String(generated).slice(0, 16).replace('T', ' '))} UTC</span>
       <span>THIS DAY IS SETTLED HISTORY</span>`
     const hero = `
@@ -1635,13 +1606,16 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
           <span><a href="/stats/">/stats/</a> volume, churn, cadence</span>
           ${openPrs?.length ? '<span><a href="/in-flight/">/in-flight/</a> open PRs</span>' : ''}
         </div>
-        <p>The chips above the timeline filter that day's rows and the churn chip reveals the noise. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code> &mdash; that change alone, which survives the entry moving day &mdash; and <code>discord</code> copies a paste-ready version of it. Press <code>/</code> anywhere to search.</p>
+        <p>The chips above the timeline filter that day's rows; the churn chip reveals the noise. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code>, a link to that change alone which survives it moving day, and <code>discord</code> copies a paste-ready version. Press <code>/</code> anywhere to search.</p>
 
         <h4>LIMITS</h4>
         <p>Snapshots squash upstream history, so ordering inside one snapshot is approximate and authorship resolves to the bot. AI text describes only what the diff shows: no research, no speculation about capabilities.</p>
 
+        <h4>FRESHNESS</h4>
+        <p>A loop polls upstream every 30 seconds, re-analyzes, and pushes the data &mdash; a commit is readable here about 2 minutes after it lands in the public repo. Upstream's own snapshot squash usually delays a change longer than our whole pipeline does. An hourly GitHub Action covers the loop being down.</p>
+
         <h4>FEEDS + SOURCE</h4>
-        <p><a href="/feed.xml">RSS major + notable</a> &middot; <a href="/feed-models.xml">models only</a> &middot; <a href="/feed-releases.xml">releases only</a>. A sync daemon pushes <code>data/</code> on every upstream commit (45-minute freshness budget) with an hourly GitHub Action as fallback; Cloudflare deploys on push.</p>
+        <p><a href="/feed.xml">RSS major + notable</a> &middot; <a href="/feed-models.xml">models only</a> &middot; <a href="/feed-releases.xml">releases only</a>. Generator: <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener">nordicnode/freebuff-changelog</a>; Cloudflare deploys on every data push.</p>
     </div>
   </div>
 </section>`

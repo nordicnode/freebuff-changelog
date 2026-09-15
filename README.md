@@ -114,7 +114,7 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
   day in half. Chips count the day they sit on while `data-total` carries the
   all-time figure, and filter state is shared, so walking back keeps the reader's
   selection instead of snapping to the default. The live chrome — HEAD plus the
-  sync countdown — belongs to the newest day only: it is a claim about *now*, and
+  data age — belongs to the newest day only: it is a claim about *now*, and
   the shell's reload-when-behind hook keys off the same element, so a settled day
   prints the exact stamp it was built from and carries no hook at all (an
   auto-refresh while someone reads July 2024 would yank the page out from under
@@ -126,16 +126,20 @@ generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
 | step | latency | knob |
 |---|---|---|
 | loop notices the new SHA | ≤ `WATCH_INTERVAL` (30s) | systemd unit env |
-| analyze + merge-safe write | ~10–40s | — |
+| analyze + merge-safe write | 8–35s (measured 2026-09-15) | — |
 | new rows published **before** the LLM batch | ~1s | `commitAndPushData` |
 | Workers build on push | ~20–60s | Cloudflare |
 | browser reuse of any page | none (`Cache-Control: no-cache`; revalidate, 304 when unchanged) | `_headers` |
 | its summary replaces the deterministic one | next batch, ahead of the backlog | `CHANGELOG_LLM_LIMIT` |
 | its plain-English line appears | same batch (own queue, no diff needed) | `CHANGELOG_ELI5_LIMIT` |
 
-So a new commit is readable in roughly 2–3 minutes, and a long-open tab reloads
+So a new commit is readable in about 2 minutes, and a long-open tab reloads
 itself once per data version when it comes back from the background past its
-budget. Summarization order: this cycle's commits, then model swaps, releases
+budget. The clock starts when the snapshot lands in the public repo, not when
+Freebuff writes the code: upstream squashes commits into "Sync public snapshot"
+merges, and on 2026-09-15 a commit authored 18:09:52Z only reached the public
+repo by 18:31 — 21 minutes of upstream latency against 8 seconds from our
+detection to push. Summarization order: this cycle's commits, then model swaps, releases
 and commands, then newest-first — and only `4 × limit` candidates are diffed per
 run, so a deep backlog can neither slow a cycle nor starve the new commit.
 Gateway blips park a commit for `CHANGELOG_LLM_TRANSIENT_RETRY_MS` (default 5
@@ -226,7 +230,7 @@ rule-based summary is used: the site never depends on the LLM.
 
 | route | content |
 |---|---|
-| `/` | the newest day in full: every entry pushed that UTC day (churn hidden by default), category chips, live HEAD + sync countdown |
+| `/` | the newest day in full: every entry pushed that UTC day (churn hidden by default), category chips, live HEAD + data age |
 | `/day/YYYY-MM-DD/` | one day of the timeline — the same full bodies and chips, one day per page; older/newer walk by date, and there is a jump-to-date select. `#sha` permalinks point here |
 | `/release/1.0.NNN/` | every commit since the previous version bump — the newest 40 as full entries, the rest as compact rows under one fold |
 | `/archive/` | one list at a time — DAYS / RELEASES / CATEGORIES — each grouped into months that stay folded until opened (`<details>`, so no-JS gets the long version). `#releases`, `#categories` and `#days-m-YYYY-MM` deep-link into a view |
