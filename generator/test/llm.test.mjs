@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5 } from '../lib/llm.mjs'
+import { parseLlmJson, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -400,8 +400,9 @@ test('CHANGELOG_LLM_LIMIT=0 drops the call cap but keeps the git window', async 
 
 // ---------------------------------------------------------------------------
 // ELI5: the plain-English pass. Its contract is that it follows the summary --
-// same source text, so it re-runs exactly when that summary changes, and never
-// asks the model for a diff.
+// same source text, so it re-runs exactly when that summary changes. It never pays
+// for a diff call, but it does read the stored diff for the comments the authors
+// wrote, because that is where an audience is named.
 
 const eli5Entry = (over = {}) => ({
   kind: 'sync',
@@ -431,6 +432,27 @@ test('eli5Done: pinned to the exact summary the line was written from', () => {
   assert.equal(eli5Done(e), true)
   e.ai.summary = 'Something entirely different.'
   assert.equal(eli5Done(e), false, 'a re-summarized entry must lose its stale ELI5')
+})
+
+test('buildEli5Prompt: hands the model the comments beside the code and bars widening the audience', () => {
+  const e = eli5Entry()
+  const note = 'Verified YC companies earn one $1,000 credit only after $1,000 is collected.'
+  const p = buildEli5Prompt(e, [note])
+  assert.ok(p.includes(note), 'the sentence from beside the code reaches the prompt')
+  assert.match(p, /Keep the audience the text gives/)
+  assert.match(p, /Never widen it to "users"/)
+  assert.ok(!buildEli5Prompt(e).includes('Comments the developers wrote'), 'no notes, no empty block')
+})
+
+test('eli5Notes: prefers recorded facts, falls back to the stored patch', async () => {
+  const recorded = eli5Entry({ facts: ['Recorded fact.'] })
+  assert.deepEqual(await eli5Notes(recorded, async () => { throw new Error('must not read the patch') }), ['Recorded fact.'])
+  const bare = eli5Entry({ facts: [] })
+  const note = 'Verified YC companies earn one $1,000 credit only after $1,000 is collected.'
+  assert.deepEqual(await eli5Notes(bare, async () => `+ /** ${note} */`), [note],
+    'a row whose facts were never extracted still gets its own comments')
+  assert.deepEqual(await eli5Notes(bare, null), [], 'without a patch reader it degrades to the summary alone')
+  assert.deepEqual(await eli5Notes(bare, async () => { throw new Error('no worktree') }), [], 'an unreadable diff never fails the pass')
 })
 
 test('normalizeEli5: unwraps the reply, strips the echoed label, keeps it honest', () => {

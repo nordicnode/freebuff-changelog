@@ -517,7 +517,10 @@ export function extractCommentFacts (patch) {
     text = text.replace(/^(TODO|FIXME|NOTE|WHY|HOW)\s*:?\s*/i, '')
     const lower = (text.match(/[a-z]/g) || []).length
     if (lower < text.length * 0.5) return
-    if ((text.match(/[a-z]{3,}/g) || []).length < 9) return
+    // Count words, not runs of lowercase letters: a sentence about money ("$1,000")
+    // or an acronym ("YC") breaks its own letter runs, and counting runs threw away
+    // exactly the terse eligibility comments that say who a change is for.
+    if ((text.split(/\s+/).filter(w => /[a-z]{3,}/i.test(w)).length) < 5) return
     if (!/[.!?]$/.test(text)) return
     if (/^(Removed|Added|Modified|See|See also)\b.*\b(docs|test|section)\b/i.test(text) && text.length < 80) return
     facts.push(text)

@@ -154,6 +154,13 @@ test('extractCommentFacts: only captures added comments and flushes properly', (
   assert.equal(facts.length, 1)
   assert.ok(facts[0].startsWith('Re-enabled with new high-throughput'))
   assert.ok(!facts[0].includes('Deprecated model access'))
+  // A terse sentence about money and an acronym breaks its own lowercase runs.
+  // Counting runs rather than words threw this away -- and with it the only line
+  // in the change that says who the program is for.
+  assert.deepEqual(
+    extractCommentFacts('+ /** Verified YC companies earn one $1,000 credit only after $1,000 is collected. */'),
+    ['Verified YC companies earn one $1,000 credit only after $1,000 is collected.'])
+  assert.deepEqual(extractCommentFacts('+ // fooBar\n+ // x = y'), [], 'identifier junk still dies')
 })
 
 test('extractCleanDiff: function is exported and callable', () => {

@@ -425,7 +425,7 @@ async function generateOnce (argv) {
   // summary it explains may have been written minutes ago by the other pass.
   // This call is what makes a brand-new entry arrive with its plain-English line
   // already attached instead of waiting for a backfill.
-  const eli5N = await enrichEli5(entries, DATA)
+  const eli5N = await enrichEli5(entries, DATA, process.env, { getPatch: llmPatchFor })
   if (eli5N) log(`ELI5 wrote ${eli5N} plain-English line${eli5N === 1 ? '' : 's'}`)
 
   const prevScanned = existing.counts?.commitsScanned || 0
@@ -754,7 +754,8 @@ async function catchUpOnce (argv) {
   if (llmConfigured()) {
     const eli5Written = await enrichEli5(entries, DATA, { ...process.env, CHANGELOG_LLM_LIMIT: String(limit) }, {
       retryErrors: true,
-      priorityShas: new Set(freshShas.slice(-limit))
+      priorityShas: new Set(freshShas.slice(-limit)),
+      getPatch: llmPatchFor
     })
     const eli5Remaining = entries.filter(e => eli5Eligible(e) && !eli5Done(e)).length
     if (eli5Written || eli5Remaining) {
@@ -975,7 +976,7 @@ async function enrichAllPass (argv) {
 
   // 2. Summaries + plain-English lines, newest-first inside their own priorities.
   const calls = llmConfigured(env) ? await enrichWithLlm(entries, llmPatchFor, DATA, env, { retryErrors: true }) : 0
-  const eli5 = llmConfigured(env) ? await enrichEli5(entries, DATA, env, { retryErrors: true }) : 0
+  const eli5 = llmConfigured(env) ? await enrichEli5(entries, DATA, env, { retryErrors: true, getPatch: llmPatchFor }) : 0
   if (!llmConfigured(env)) log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env): stored diffs only')
 
   const isCurrent = (e) => e.ai?.title && (e.ai?.v ?? 1) >= PROMPT_V
