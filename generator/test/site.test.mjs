@@ -586,8 +586,15 @@ test('buildSite generates valid static site output', async () => {
     assert.deepEqual(duplicatedHeaders(rules, '/c/505752f9'), [], 'no header set twice on the resolver path')
     const resolver = await readFile(join(tmpDist, 'permalink'), 'utf8')
     assert.match(resolver, /name="robots" content="noindex"/, 'a lookup page must not dilute the day pages in search')
-    assert.match(resolver, /location\.replace\(href\)/, 'it sends the visitor on, not just tells them')
+    // It renders the entry here rather than forwarding to the day page: the card is
+    // lifted out of the day page's own markup, so there is no second renderer.
+    assert.match(resolver, /new DOMParser\(\)/)
+    assert.match(resolver, /document\.importNode\(card, true\)/)
+    assert.match(resolver, /card\.open = true/, 'shown expanded, which is the whole point')
+    assert.match(resolver, /rel = 'canonical'/, 'and the day page keeps the canonical URL')
     assert.match(resolver, /<noscript>/, 'and says so when JS is off')
+    // The # on a card is the permalink, so it must aim at /c/, not the day page.
+    assert.match(dayHtml2, /class="permalink" href="\/c\/[0-9a-f]{12}"/)
     // The script is emitted from inside a template literal, where one backslash in
     // the source becomes nothing in the output -- an escaped regex or quote can
     // silently arrive in the page un-escaped and dead. Parse what actually shipped.

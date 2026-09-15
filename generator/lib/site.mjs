@@ -509,7 +509,7 @@ function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) {
     <span class="commit-ref">commit <a href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${anchor}</a></span>
     <span class="entry-utc">${esc(time)} UTC</span>
     <div class="badges">${badges(e)}</div>
-    <a class="permalink" href="/day/${e.day}/#${anchor}" title="Permalink" aria-label="Permalink" onclick="event.stopPropagation()">#</a>
+    <a class="permalink" href="/c/${anchor}" title="Permalink: this change alone" aria-label="Permalink" onclick="event.stopPropagation()">#</a>
   </div>
   <h3 class="entry-title">${title}</h3>
 </summary>
@@ -1411,7 +1411,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <strong>In-Flight PRs:</strong> every open upstream pull request, followed across API pages, with diffstat and a 120-line diff preview. Previews are fetched a budgeted batch per run — the unauthenticated GitHub API allows 60 calls an hour, and the list of 100+ PRs needs one per PR — so they fill in over successive runs; a PR missing one still links to GitHub, and previews are pruned once a PR closes.</p>
 
       <h4>HOW TO USE</h4>
-      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a> — which shows one list at a time (days, releases, categories) with each month folded until opened. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. Share <code>/day/&lt;date&gt;/#sha</code> to point at one specific change, or <code>/c/&lt;sha&gt;</code> for a permalink that survives the entry moving day.</p>
+      <p><strong>Timeline.</strong> The <a href="/">front page</a> is the newest day; every day also has its own <code>/day/&lt;date&gt;/</code> page, reachable from the pager, the date jump, or <a href="/archive/">/archive/</a> — which shows one list at a time (days, releases, categories) with each month folded until opened. Click a row to expand the full entry in place: summary, inline diff, per-file stats, and links to the exact commit and compare view on GitHub. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code>: that change alone, expanded, with nothing else from its day — and it survives the entry moving day.</p>
       <p><strong>Find.</strong> The chip bar above the timeline filters the rows on that page by category (the churn chip toggles lockfile-only noise). <a href="/search/">/search/</a> queries every entry ever recorded — press <code>/</code> on any page to jump there — and <a href="/archive/#categories">/archive/</a> lists each category across all time.</p>
       <p><strong>Models, releases, PRs.</strong> <a href="/models/">/models/</a> replays the free-picker catalog with a page per model; <a href="/archive/#releases">release pages</a> list every commit between two versions; <a href="/stats/">/stats/</a> charts churn and cadence; <a href="/in-flight/">/in-flight/</a> previews open upstream pull requests before they merge.</p>
 
@@ -1523,10 +1523,13 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   // A day URL is a function of the commit timestamp, and that timestamp's day has
   // moved twice over this project's life (once by an author's UTC offset, once by
   // the backfill that fixed it). Links already shared cannot be rewritten, so
-  // they need an address that encodes no date at all. 9,527 static redirect pages
-  // would blow the Workers asset cap, so it is one page plus a lookup table:
-  // `/c/*` rewrites here and the resolver sends the visitor to whichever day page
-  // holds that commit now.
+  // they need an address that encodes no date at all. 9,527 static entry pages
+  // would blow the Workers asset cap (13.2k files of a 20k limit), so this is one
+  // page plus a lookup table: `/c/*` rewrites here, and the page fetches the day
+  // that holds the commit and lifts that one entry out of it. The card arrives as
+  // the server-rendered markup the day page already ships -- no second renderer to
+  // keep in sync, and the diff toggle keeps working because its listeners are
+  // delegated on `document` in the shared script.
   const shaDay = {}
   for (const e of entries) shaDay[e.sha.slice(0, 12)] = e.day
   await write(dist, 'api/sha-day.json', JSON.stringify(shaDay))
@@ -1540,27 +1543,59 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   await write(dist, 'permalink', layout({
     title: 'Commit permalink', path: '/c/', noindex: true,
     desc: 'Resolve a Freebuff commit SHA to the changelog entry that records it.',
-    body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">PERMALINK :: COMMIT LOOKUP</span></div>
-<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)" id="c-status">Searching the changelog for this commit&hellip;</p>
-<p style="margin:8px 0 0;font-size:.8rem;color:var(--txt-subtle)"><a href="/">[ latest day ]</a> &middot; <a href="/search/">[ search ]</a> &middot; <a href="/archive/">[ archive ]</a></p>
-<noscript><p style="margin:8px 0 0;font-size:.8rem">This resolver needs JavaScript: open <a href="/search/">/search/</a> and paste the commit SHA.</p></noscript>
+    body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title" id="c-hdr">CHANGE :: resolving&hellip;</span><span id="c-when"></span></div>
+<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)" id="c-status">Loading this change&hellip;</p>
+<noscript><p style="margin:8px 0 0;font-size:.8rem">This page needs JavaScript to find the entry. <a href="/search/">[ search ]</a> and <a href="/archive/">[ archive ]</a> work without it.</p></noscript>
 </div></section>
+<div id="c-entry"></div>
+<div class="pager" id="c-context" hidden></div>
 <script>
-(function () {
+  (function () {
   var want = (location.pathname.split('/')[2] || '').toLowerCase()
-  var el = document.getElementById('c-status')
-  if (!/^[0-9a-f]{4,40}$/.test(want)) { el.textContent = 'Not a commit address. A permalink looks like /c/0fb475fc1234.'; return }
+  var status = document.getElementById('c-status')
+  var hdr = document.getElementById('c-hdr')
+  var when = document.getElementById('c-when')
+  var slot = document.getElementById('c-entry')
+  var ctx = document.getElementById('c-context')
+  function fail(msg) { status.innerHTML = msg }
+    if (!/^[0-9a-f]{4,40}$/.test(want)) { fail('Not a commit address. A permalink looks like /c/0fb475fc1234. <a href="/archive/">[ archive ]</a>'); return }
   fetch('/api/sha-day.json').then(function (r) {
-  return r.ok ? r.json() : Promise.reject(new Error('lookup returned HTTP ' + r.status))
+  return r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))
   }).then(function (map) {
   var keys = Object.keys(map)
   var key = Object.prototype.hasOwnProperty.call(map, want) ? want
-    : keys.find(function (k) { return k.indexOf(want) === 0 || want.indexOf(k) === 0 })
-  if (!key) { el.textContent = 'No changelog entry records ' + want + ' — it may predate the archive.'; return }
-  var href = '/day/' + map[key] + '/#' + key
-  el.innerHTML = 'Found <a href="' + href + '">' + key + '</a> &mdash; redirecting…'
-  location.replace(href)
-  }).catch(function (err) { el.textContent = 'Lookup failed: ' + err.message })
+: keys.find(function (k) { return k.indexOf(want) === 0 || want.indexOf(k) === 0 })
+if (!key) { fail('No changelog entry records ' + want + '. It may predate the archive. <a href="/search/">[ search ]</a>'); return }
+var day = map[key]
+return fetch('/day/' + day + '/').then(function (r) {
+if (!r.ok) throw new Error('HTTP ' + r.status)
+return r.text()
+}).then(function (html) {
+var doc = new DOMParser().parseFromString(html, 'text/html')
+var card = doc.getElementById(key)
+if (!card) throw new Error('entry is not on its day page')
+var rows = [].slice.call(doc.querySelectorAll('section.day details.entry'))
+var i = rows.indexOf(card)
+var older = i >= 0 && i < rows.length - 1 ? rows[i + 1] : null
+var newer = i > 0 ? rows[i - 1] : null
+var title = (card.querySelector('h3') || {}).textContent || key
+document.title = title + ' \u00b7 Freebuff Changelog'
+var canon = document.createElement('link')
+canon.rel = 'canonical'
+canon.href = location.origin + '/day/' + day + '/'
+document.head.appendChild(canon)
+hdr.textContent = 'CHANGE :: ' + key
+when.textContent = day + ' \u00b7 day ' + (i + 1) + ' of ' + rows.length
+status.innerHTML = '<a href="/day/' + day + '/#' + key + '">[' + rows.length + ' changes that day]</a>'
+card.open = true
+card.hidden = false
+slot.appendChild(document.importNode(card, true))
+ctx.innerHTML = (older ? '<a href="/c/' + older.id + '">&larr; older change</a>' : '<span></span>') +
+'<a href="/day/' + day + '/">' + day + '</a>' +
+(newer ? '<a href="/c/' + newer.id + '">newer change &rarr;</a>' : '<span></span>')
+ctx.hidden = false
+})
+}).catch(function (err) { fail('Could not load this change (' + err.message + '). <a href="/archive/">[ archive ]</a>') })
 })()
 </script>`
   }))

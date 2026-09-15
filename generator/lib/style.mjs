@@ -1104,6 +1104,17 @@ details.more-rows>summary::-webkit-details-marker{display:none}
 details.more-rows>summary::before{content:'\\25B8';color:var(--txt-dim);font-size:.7rem;margin-right:6px}
 details.more-rows[open]>summary::before{content:'\\25BE'}
 details.more-rows[open]>summary{margin-bottom:6px}
+
+/* /c/<sha> is one change alone. The card is the day page's own server-rendered
+   markup, so it needs room to breathe and a slightly stronger edge -- not a
+   second design to keep in sync. */
+#c-entry{
+  max-width:860px;
+  margin:14px auto 0;
+}
+#c-entry>details.entry{
+  border-color:var(--term-border-strong);
+}
 .rel-chips{
   display:flex;
   flex-wrap:wrap;
