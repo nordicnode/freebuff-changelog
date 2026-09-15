@@ -863,7 +863,7 @@ ${[
       chipHtml('churn', 'churn', churn, false, ' chip-churn')
     ].join('\n')}
 </nav>
-<p class="filter-note" data-hub="/archive/#categories" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? 'churn hidden' : 'no churn that day'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/archive/#categories">browse every change by category</a></span></p>`
+<p class="filter-note" data-hub="/archive/#categories" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? '(' + churn + ' churn hidden)' : '(no churn that day)'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/archive/#categories">browse every change by category</a></span></p>`
 
     // One row starts open: the day's newest *visible* entry. Churn is hidden by
     // default, so the flag passes to the first row a reader can actually see
@@ -978,10 +978,11 @@ ${rows.map(e => {
     });
     if (countEl) countEl.textContent = shown;
     if (noteEl) {
+      var churnRows = rows.filter(function (r) { return r.hasAttribute('data-churn') }).length;
       var bits = [];
       if (active.length) bits.push(active.length === 1 ? active[0].replace(/-/g, ' ') : active.length + ' categories');
-      bits.push(state.churn ? 'churn shown' : 'churn hidden');
-      noteEl.textContent = bits.join(' \u00b7 ');
+      bits.push(!churnRows ? 'no churn that day' : churnRows + ' churn ' + (state.churn ? 'shown' : 'hidden'));
+      noteEl.textContent = '(' + bits.join(' \u00b7 ') + ')';
     }
     if (save) { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {} }
   }

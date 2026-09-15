@@ -805,7 +805,7 @@ test('the timeline paginates one day per page and keeps every entry reachable', 
     assert.match(latest, /data-filter="\*"[^>]*data-total="4"[^>]*>recent<span class="chip-n">1<\/span>/)
     assert.match(d11, /data-filter="\*"[^>]*>this day<span class="chip-n">2<\/span>/, 'a day page names the reset for what it counts')
     assert.match(d11, /data-filter="cli"[^>]*data-total="4"/)
-    assert.match(d11, /showing <b id="filter-count">2<\/b> of 2 rows on this page <em>no churn that day/)
+    assert.match(d11, /showing <b id="filter-count">2<\/b> of 2 rows on this page <em>\(no churn that day\)/)
     assert.match(d10, /showing <b id="filter-count">1<\/b> of 1 rows on this page/)
 
     // Churn is listed everywhere and shown by default nowhere: in the markup,
@@ -813,6 +813,8 @@ test('the timeline paginates one day per page and keeps every entry reachable', 
     assert.ok(tags(d12).find(t => t.includes('data-churn="1"')).includes(' hidden'))
     assert.match(d12, /<span class="day-churn">\+1 churn<\/span>/)
     assert.match(d12, /data-filter="churn"[^>]*>churn<span class="chip-n">1<\/span>/)
+    // The count is the point of the note: "3 of 9" begs "where are the other 6?"
+    assert.match(d12, /showing <b id="filter-count">1<\/b> of 2 rows on this page <em>\(1 churn hidden\)<\/em>/, 'the parenthetical accounts for the hidden rows by number')
     assert.equal(tags(d11).filter(t => t.includes('data-churn')).length, 0, 'that day had no churn')
     // Selection is per page but shares one memory, so walking back keeps what the
     // reader picked instead of snapping to the default.
