@@ -115,6 +115,19 @@ test('the per-PR fan-out stays inside its budget and marks the list partial', as
   assert.equal(persisted.partial, true, 'a budgeted-out run is refreshed in minutes, not hours')
 })
 
+test('a token lifts the decoration budget to finish the list in one pass', async (t) => {
+  const dir = await tmpData(t)
+  process.env.GITHUB_TOKEN = 'ghp_test'
+  t.after(() => { delete process.env.GITHUB_TOKEN })
+  const { fetchImpl, calls } = fakeGithub([100, 14], { stats: false })
+  const prs = await fetchOpenPrs({ fetchImpl, dataDir: dir })
+  const perPr = calls.filter(c => /\/pulls\/\d+$/.test(new URL(c).pathname))
+  assert.equal(perPr.length, 228, '114 diffs + 114 stats, unthrottled: 5,000 calls/hr is the authenticated ceiling')
+  assert.ok(prs.every(p => p.hasDiff && p.additions === 7))
+  const persisted = JSON.parse(await readFile(join(dir, 'open-prs.json'), 'utf8'))
+  assert.ok(!persisted.partial, 'a finished list is not re-fetched for half an hour')
+})
+
 test('a refusal stops the remaining per-PR calls at once', async (t) => {
   const dir = await tmpData(t)
   process.env.CHANGELOG_PR_CALLS = '500'

@@ -106,8 +106,10 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
   // before that. One call per PR for its stats plus one for its diff is 228
   // calls for 114 PRs, and most of them came back 403 -- degraded to nothing,
   // silently, every run. So the decoration gets a budget, and the run stops
-  // asking the moment the API says no.
-  const PR_CALL_BUDGET = Number(process.env.CHANGELOG_PR_CALLS) || 25
+  // asking the moment the API says no. A token lifts the ceiling to 5,000/hour,
+  // which is enough to finish a list of this size in one pass.
+  const PR_CALL_BUDGET = Number(process.env.CHANGELOG_PR_CALLS) ||
+    (process.env.GITHUB_TOKEN ? 500 : 25)
   try {
     const cached = await readJson(`${dataDir}/open-prs.json`, null)
     // A list that ran out of budget comes back for the rest in half an hour

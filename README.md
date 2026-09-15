@@ -208,7 +208,7 @@ rule-based summary is used: the site never depends on the LLM.
 | `/archive/` | one list at a time — DAYS / RELEASES / CATEGORIES — each grouped into months that stay folded until opened (`<details>`, so no-JS gets the long version). `#releases`, `#categories` and `#days-m-YYYY-MM` deep-link into a view |
 | `/changes/<category>/` | every change of one category, all time: compact rows, each linking to the full body on its day page (category tiles live on `/archive/#categories`; `/changes/` 301-redirects there) |
 | `/search/` | client filter over pre-built JSON index |
-| `/in-flight/` | every open upstream PR (the list endpoint is paginated), with diffstat + 120-line diff previews fetched a budgeted batch per run — `CHANGELOG_PR_CALLS`, default 25, because unauthenticated GitHub allows 60 calls/hr |
+| `/in-flight/` | every open upstream PR (the list endpoint is paginated), with diffstat + 120-line diff previews fetched a budgeted batch per run — `CHANGELOG_PR_CALLS`, default 25 unauthenticated (GitHub allows 60 calls/hr) or 500 when `GITHUB_TOKEN` is set, which finishes a list of 100+ PRs in one pass |
 | `/feed.xml` | RSS of major + notable entries |
 | `/feed-models.xml`, `/feed-releases.xml` | model-only / release-only RSS |
 | `/models/` | model catalog timeline (live, retired, per-change history) |
