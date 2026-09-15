@@ -27,6 +27,12 @@ html{
   color:var(--txt);
   scroll-behavior:smooth;
   -webkit-font-smoothing:antialiased;
+  /* Mobile browsers inflate type they judge "too small" (Android's text
+     autosizing, iOS's boosting) -- which at a 13.5px base means everything on
+     the site. It hit the search box hardest: the same query text rendered at
+     two sizes side by side. Opt out and let the sheet say what it means. */
+  -webkit-text-size-adjust:100%;
+  text-size-adjust:100%;
 }
 body{
   margin:0;
@@ -863,19 +869,33 @@ nav.term-nav a.active{
   border:1px solid var(--term-border);
   padding:6px 10px;
   border-radius:2px;
+  min-width:0;
 }
+#q{
+  /* A flex item defaults to min-width:auto, i.e. never narrower than its
+     content -- and an 18-character placeholder is *content*, so the row grew
+     past the box on a phone instead of clipping inside the input. */
+  flex:1 1 auto;
+  min-width:0;
+  background:none;
+  border:none;
+  color:var(--txt);
+  font-family:inherit;
+  /* 1rem = the 13.5px base, i.e. exactly the size of the "$ grep -i" prompt
+     beside it; the old font:inherit looked oversized next to .72rem text. */
+  font-size:1rem;
+  line-height:1.45;
+  padding:1px 0;
+  outline:none;
+  -webkit-appearance:none;
+  appearance:none;
+}
+#q::placeholder{color:var(--txt-subtle);opacity:1}
+#q::-webkit-search-cancel-button{-webkit-appearance:none;appearance:none}
 .search-prompt{
   color:var(--term-green);
   font-weight:700;
   white-space:nowrap;
-}
-#q{
-  flex-grow:1;
-  background:none;
-  border:none;
-  color:var(--txt);
-  font:inherit;
-  outline:none;
 }
 .search-hint{
   font-size:.72rem;
@@ -939,7 +959,25 @@ nav.term-nav a.active{
   color:var(--txt-dim);
   padding:2px 6px;
   border-radius:2px;
-  font:inherit;
+  font-family:inherit;
+  font-size:.94rem;
+}
+
+/* Phones only. iOS zooms the page when a focused control is smaller than 16px,
+   so the form controls go to exactly 16px -- and the prompt label with them, so
+   the row still reads as one size. The "press / to focus" hint is dropped: a
+   touch keyboard makes it both irrelevant and the thing that overflowed. */
+@media (max-width:600px){
+  #q,.search-prompt,.filter-row select{
+    font-size:16px;
+  }
+  .search-hint{
+    display:none;
+  }
+  .search-input-row{
+    gap:6px;
+    padding:6px 8px;
+  }
 }
 
 .grid{

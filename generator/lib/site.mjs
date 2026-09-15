@@ -1263,7 +1263,7 @@ ${archiveScript}`
     </div>
     <div class="search-input-row">
       <span class="search-prompt">$ grep -i</span>
-      <input id="q" type="search" placeholder="regex / pattern (e.g. muse, claude, CLI, release)..." autocomplete="off" autofocus>
+      <input id="q" type="search" placeholder="muse, claude, CLI…" autocomplete="off" autofocus>
       <span class="search-hint">[press / to focus]</span>
     </div>
     <div class="filter-chips">

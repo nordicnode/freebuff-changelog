@@ -265,6 +265,17 @@ test('buildSite generates valid static site output', async () => {
     assert.ok(Array.isArray(searchIdx.ix[0]))
     assert.equal(searchIdx.ix[0].length, 5)
     const searchHtml = await readFile(join(tmpDist, 'search/index.html'), 'utf8')
+    // The two things that made /search/ unusable on a phone, pinned:
+    // min-width:0 because a flex item defaults to min-width:auto and a long
+    // placeholder is *content* (the row grew past the box); text-size-adjust
+    // because mobile browsers inflate type they judge small, and the base is 13.5px.
+    assert.match(searchHtml, /#q\{[^}]*min-width:0/, 'the query input must shrink below its placeholder')
+    assert.match(searchHtml, /-webkit-text-size-adjust:100%/, 'no font boosting over the sheet')
+    assert.match(searchHtml, /@media \(max-width:600px\)/, 'form controls go to 16px on phones so iOS does not zoom on focus')
+    assert.doesNotMatch(searchHtml, /placeholder="regex/, 'the matcher is word-substring AND, not regex')
+    // 360px viewport - 40 main padding - 34 box - 18 row - 6 gap - 86 for the
+    // "$ grep -i" prompt = 180px of input, and a 16px monospace advance is 9.6px.
+    assert.doesNotMatch(searchHtml, /placeholder="[^"]{19,}"/, 'the placeholder has to fit the narrowest phone')
     assert.match(searchHtml, /<select id="fcat">/)
     assert.match(searchHtml, /<select id="fsig">/)
     assert.match(searchHtml, /<option value="CLI">/)
