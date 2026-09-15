@@ -565,9 +565,26 @@ test('buildSite generates valid static site output', async () => {
     assert.deepEqual(Object.keys(shaDay).sort(), mockChangelog.entries.map(e => e.sha.slice(0, 12)).sort(),
       'every entry is resolvable by its anchor')
     assert.equal(shaDay[mockChangelog.entries[0].sha.slice(0, 12)], mockChangelog.entries[0].day)
-    assert.match(redirectsTxt, /^\/c\/\* \/permalink\.html 200$/m, 'the resolver answers every /c/ address')
+    assert.match(redirectsTxt, /^\/c\/\* \/permalink 200$/m, 'the resolver answers every /c/ address')
     assert.deepEqual(redirectLoops(redirectsTxt), [], 'no rule may reach itself: Cloudflare fails the deploy on one')
-    const resolver = await readFile(join(tmpDist, 'permalink.html'), 'utf8')
+    // A rewrite at a `.html` asset is answered with a 307 to the extensionless
+    // path, which throws the /c/<sha> away before the resolver can read it.
+    for (const line of redirectsTxt.trim().split('\n')) {
+      const [, to, status] = line.trim().split(/\s+/)
+      if (status === '200') assert.doesNotMatch(to, /\.html$/, `rewrite target ${to} would be canonicalized, losing the path`)
+    }
+    // ...and nosniff on /* means the extensionless file only renders as HTML
+    // because a header rule says so.
+    assert.equal(ruleFor(rules, '/permalink').headers['content-type'], 'text/html; charset=utf-8')
+    // _headers matches the REQUEST path, so a rule on the rewrite target never
+    // applies to a /c/<sha> hit: without its own rule the resolver arrives with no
+    // Content-Type next to nosniff, and the browser downloads it instead of running
+    // the script. Verified against `wrangler dev`, which reproduces exactly that.
+    const onC = rules.filter(r => patternMatches(r.path, '/c/505752f9'))
+    assert.deepEqual(onC.map(r => r.headers['content-type']).filter(Boolean), ['text/html; charset=utf-8'],
+      'the resolver must arrive as HTML')
+    assert.deepEqual(duplicatedHeaders(rules, '/c/505752f9'), [], 'no header set twice on the resolver path')
+    const resolver = await readFile(join(tmpDist, 'permalink'), 'utf8')
     assert.match(resolver, /name="robots" content="noindex"/, 'a lookup page must not dilute the day pages in search')
     assert.match(resolver, /location\.replace\(href\)/, 'it sends the visitor on, not just tells them')
     assert.match(resolver, /<noscript>/, 'and says so when JS is off')

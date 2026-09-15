@@ -1530,12 +1530,14 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   const shaDay = {}
   for (const e of entries) shaDay[e.sha.slice(0, 12)] = e.day
   await write(dist, 'api/sha-day.json', JSON.stringify(shaDay))
-  // The page must live OUTSIDE the pattern that rewrites to it: Cloudflare
-  // rejects a rule whose own target matches it (`/c/* -> /c/index.html` fails the
-  // deploy with "Infinite loop detected", because stripping .html/index lands
-  // back on the same rule), and it rejects the version, not the build -- so the
-  // whole deploy fails, not just the one rule.
-  await write(dist, 'permalink.html', layout({
+  // Two Cloudflare asset rules make this fiddly, and both were learned the hard
+  // way. (1) A rule whose target can reach itself fails the *deploy*: it strips
+  // `.html` and a trailing `/index` before matching, so `/c/* -> /c/index.html`
+  // is an "infinite loop". (2) An asset written as `foo.html` answers `/foo.html`
+  // with a 307 to `/foo` -- which throws away the `/c/<sha>` the resolver reads
+  // its argument from. So the file is extensionless and `_headers` gives it its
+  // content type.
+  await write(dist, 'permalink', layout({
     title: 'Commit permalink', path: '/c/', noindex: true,
     desc: 'Resolve a Freebuff commit SHA to the changelog entry that records it.',
     body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">PERMALINK :: COMMIT LOOKUP</span></div>
@@ -1586,8 +1588,8 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     '/models/*/feed /feed-models.xml 301',
     // A rewrite, not a redirect: the resolver reads the SHA off the path it was
     // asked for, so the address a person shared stays in the URL bar. The target
-    // is deliberately outside the pattern (see permalink.html above).
-    '/c/* /permalink.html 200'
+    // is outside the pattern and carries no extension (see above).
+    '/c/* /permalink 200'
   ].join('\n') + '\n')
   // Header policy. Caching is off site-wide: one `no-cache` on /* makes every
   // browser revalidate with the edge before reuse, so a deploy can never be
@@ -1614,6 +1616,10 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   Content-Type: image/svg+xml
 /feed.xsl
   Content-Type: text/xsl; charset=utf-8
+/permalink
+  Content-Type: text/html; charset=utf-8
+/c/*
+  Content-Type: text/html; charset=utf-8
 /diffs/*
   Content-Type: text/plain; charset=utf-8
   Access-Control-Allow-Origin: *
