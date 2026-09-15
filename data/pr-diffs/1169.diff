@@ -1,0 +1,120 @@
+diff --git a/cli/src/utils/__tests__/write-file-atomic.test.ts b/cli/src/utils/__tests__/write-file-atomic.test.ts
+index 0da7b44e97..bb7711e12d 100644
+--- a/cli/src/utils/__tests__/write-file-atomic.test.ts
++++ b/cli/src/utils/__tests__/write-file-atomic.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
++import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+ import * as fs from 'fs'
+ import * as os from 'os'
+ import * as path from 'path'
+@@ -124,4 +124,75 @@ describe('writeFileAtomicAsync', () => {
+     )
+     expect(fs.readdirSync(tempDir)).toEqual(['out.json'])
+   })
++
++  test('retries a transient Windows rename lock and succeeds', async () => {
++    const target = path.join(tempDir, 'out.json')
++    let attempts = 0
++    const realRename = fs.promises.rename.bind(fs.promises)
++    const spy = spyOn(fs.promises, 'rename').mockImplementation(
++      async (from, to) => {
++        attempts++
++        if (attempts <= 2) {
++          throw Object.assign(new Error('locked'), { code: 'EPERM' })
++        }
++        return realRename(from, to)
++      },
++    )
++    try {
++      await writeFileAtomicAsync(target, 'recovered')
++    } finally {
++      spy.mockRestore()
++    }
++
++    expect(attempts).toBe(3)
++    expect(fs.readFileSync(target, 'utf8')).toBe('recovered')
++  })
++
++  test('rethrows a non-transient rename error immediately', async () => {
++    const target = path.join(tempDir, 'out.json')
++    let attempts = 0
++    const spy = spyOn(fs.promises, 'rename').mockImplementation(async () => {
++      attempts++
++      throw Object.assign(new Error('missing'), { code: 'ENOENT' })
++    })
++    try {
++      await expect(writeFileAtomicAsync(target, 'data')).rejects.toThrow()
++    } finally {
++      spy.mockRestore()
++    }
++
++    expect(attempts).toBe(1)
++  })
++})
++
++describe('writeFileAtomic durability ordering', () => {
++  beforeEach(() => {
++    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codebuff-atomic-'))
++  })
++
++  afterEach(() => {
++    fs.rmSync(tempDir, { recursive: true, force: true })
++  })
++
++  test('fsyncs the temp before the rename goes live', () => {
++    const target = path.join(tempDir, 'out.json')
++    const order: string[] = []
++    const fsyncSpy = spyOn(fs, 'fsyncSync').mockImplementation(() => {
++      order.push('fsync')
++    })
++    const realRename = fs.renameSync.bind(fs)
++    const renameSpy = spyOn(fs, 'renameSync').mockImplementation((from, to) => {
++      order.push('rename')
++      return realRename(from, to)
++    })
++    try {
++      writeFileAtomic(target, '{"a":1}')
++    } finally {
++      fsyncSpy.mockRestore()
++      renameSpy.mockRestore()
++    }
++
++    expect(order).toEqual(['fsync', 'rename'])
++    expect(fs.readFileSync(target, 'utf8')).toBe('{"a":1}')
++  })
+ })
+diff --git a/cli/src/utils/write-file-atomic.ts b/cli/src/utils/write-file-atomic.ts
+index 85b922e248..b10cd1825e 100644
+--- a/cli/src/utils/write-file-atomic.ts
++++ b/cli/src/utils/write-file-atomic.ts
+@@ -10,15 +10,41 @@ function tempPathFor(filePath: string): string {
+ }
+ 
+ /**
+- * Write a file atomically: write to a temp file in the same directory, then
+- * rename over the target. Chat files grow to multiple MB and are rewritten on
+- * every agent step, so a plain writeFileSync interrupted by a crash/kill
+- * leaves truncated JSON that hides the chat from /history.
++ * Flush a file's data to disk before its name goes live. Without this, the
++ * rename is durable but the data blocks behind it are not: after a power cut
++ * or hard hang the rename can survive while the file's contents were never
++ * written, leaving a truncated/garbage file exactly where the atomic rename
++ * was supposed to guarantee a complete one. Cheap on tmpfs-sized writes and
++ * called at most a few times per second per chat, so correctness wins.
++ */
++function fsyncFile(fd: number): void {
++  try {
++    fs.fsyncSync(fd)
++  } catch {
++    // EINVAL on some filesystems that do not support fsync; nothing useful to
++    // do — the rename below is still atomic against concurrent processes.
++  }
++}
++
++/**
++ * Write a file atomically AND durably: write to a temp file in the same
++ * directory, fsync it, then rename over the target. Chat files grow to
++ * multiple MB and are rewritten on every agent step, so a plain
++ * writeFileSync interrupted by a crash/kill leaves truncated JSON that hides
++ * the chat from /history — and without the fsync, even this rename pattern
