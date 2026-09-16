@@ -76,7 +76,7 @@ export function ogCardSvg (dayLabel, titles, stats) {
     `<text x="48" y="${300 + i * 56}" font-family="monospace" font-size="30" fill="#e6edf3">${esc(t.slice(0, 52))}</text>`).join('')
   return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630"><rect width="1200" height="630" fill="#0d1117"/>`
     + `<rect x="0" y="0" width="1200" height="160" fill="#161b22"/>`
-    + `<text x="48" y="80" font-family="monospace" font-size="40" font-weight="bold" fill="#58a6ff">&gt;_ Freebuff Changelog</text>`
+    + `<text x="48" y="80" font-family="monospace" font-size="40" font-weight="bold" fill="#58a6ff">&gt;_ Unofficial Freebuff Changelog</text>`
     + `<text x="48" y="128" font-family="monospace" font-size="28" fill="#9aa4ae">${esc(dayLabel)} · ${esc(stats)}</text>`
     + rows + `</svg>`
 }

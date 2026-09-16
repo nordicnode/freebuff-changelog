@@ -409,11 +409,11 @@ test('buildSite generates valid static site output', async () => {
     const feedModels = await readFile(join(tmpDist, 'feed-models.xml'), 'utf8')
     assert.match(feedModels, /<atom:link href="https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/feed-models\.xml" rel="self"/)
     assert.match(feedModels, /Muse Spark 1\.3 replaces Muse Spark 1\.2/)
-    assert.match(feedModels, /models \(unofficial\)/)
+    assert.match(feedModels, /Unofficial Freebuff Changelog: models/)
     const feedReleases = await readFile(join(tmpDist, 'feed-releases.xml'), 'utf8')
     assert.match(feedReleases, /<atom:link href="https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/feed-releases\.xml" rel="self"/)
     assert.match(feedReleases, /Add awesome feature/)
-    assert.match(feedReleases, /releases \(unofficial\)/)
+    assert.match(feedReleases, /Unofficial Freebuff Changelog: releases/)
     assert.match(indexHtml, /href="\/feed-models\.xml"/)
     assert.match(indexHtml, /href="\/feed-releases\.xml"/)
     // Verify _headers keeps content types, CORS, and the site-wide no-cache rule
