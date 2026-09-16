@@ -644,9 +644,12 @@ export function discordText (e) {
   const parts = [head.join(' · '), `### ${dcEsc(title)}`]
   // Every line of a quote needs its own `>`: a wrapped continuation is fine, but a
   // hard newline without it would drop out of the quote and lose the rule.
-  if (e.eli5?.text) {
-    parts.push(`> **In plain English**\n> ${dcSentences(clipText(e.eli5.text, 300)).map(dcEsc).join('\n> ')}`)
-  }
+    let eli5Idx = -1, eli5Full = ''
+    if (e.eli5?.text) {
+      eli5Full = String(e.eli5.text).replace(/\s+/g, ' ').trim()
+      eli5Idx = parts.length
+      parts.push(`> **In plain English**\n> ${dcSentences(eli5Full).map(dcEsc).join('\n> ')}`)
+    }
   let sumIdx = -1
   if (sum) { sumIdx = parts.length; parts.push(dcSentences(sum).map(dcEsc).join('\n')) }
   const added = e.modelChanges?.added || [], removed = e.modelChanges?.removed || []
@@ -658,16 +661,23 @@ export function discordText (e) {
   let factsIdx = -1
   if (facts.length) { factsIdx = parts.length; parts.push(`**Highlights**\n${facts.join('\n')}`) }
   parts.push(`**Details**\n\`\`\`\n${dcDetails(e)}\n\`\`\``)
-  let text = parts.join('\n\n')
-  // Give up detail in reverse order of value: the highlights list, then the tail of
-  // the summary. The header, quote and details are what identify the change.
-  if (text.length > DC_LIMIT && factsIdx >= 0) { parts.splice(factsIdx, 1); text = parts.join('\n\n') }
-  if (text.length > DC_LIMIT && sumIdx >= 0) {
-    const room = DC_LIMIT - (text.length - parts[sumIdx].length) - 8
-    parts[sumIdx] = dcEsc(clipText(sum, Math.max(0, room)))
-    text = parts.join('\n\n')
-  }
-  return text.length > DC_LIMIT ? text.slice(0, DC_LIMIT - 1) + '…' : text
+    let text = parts.join('\n\n')
+    // Give up detail in reverse order of value: the highlights list, then the tail
+    // of the summary, then the tail of the quote. The header and details are what
+    // identify the change, so they are never cut; the quote keeps its head.
+    if (text.length > DC_LIMIT && factsIdx >= 0) { parts.splice(factsIdx, 1); if (sumIdx > factsIdx) sumIdx--; if (eli5Idx > factsIdx) eli5Idx--; text = parts.join('\n\n') }
+    if (text.length > DC_LIMIT && sumIdx >= 0) {
+      const room = DC_LIMIT - (text.length - parts[sumIdx].length) - 8
+      parts[sumIdx] = dcEsc(clipText(sum, Math.max(0, room)))
+      text = parts.join('\n\n')
+    }
+    if (text.length > DC_LIMIT && eli5Idx >= 0) {
+      const room = DC_LIMIT - (text.length - parts[eli5Idx].length) - 8
+      const clipped = clipText(eli5Full, Math.max(0, room))
+      parts[eli5Idx] = `> **In plain English**\n> ${dcSentences(clipped).map(dcEsc).join('\n> ')}`
+      text = parts.join('\n\n')
+    }
+    return text.length > DC_LIMIT ? text.slice(0, DC_LIMIT - 1) + '…' : text
 }
 
 // Search ranking (mirrored client-side): title hits beat category hits,
@@ -1583,7 +1593,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         <h4>HOW IT WORKS</h4>
         <ul class="man-ul">
           <li><strong>Deterministic first.</strong> Model tables in both READMEs and the slash-command registry are parsed before and after each commit and set-differenced, so a description-only edit cancels out; version bumps come from release <code>package.json</code>. Timestamps normalize to UTC. Zero dependencies.</li>
-          <li><strong>LLM once per commit.</strong> A model rewrites each entry into a 2-4 sentence technical summary from the diff and nothing else, and a second pass writes the plain-English line under it from the same evidence. Both are cached by SHA, prompt version and diff hash, so a prompt edit re-runs exactly once. With no provider configured the deterministic text stands alone; nothing breaks.</li>
+          <li><strong>Muse Spark 1.3 summarizes.</strong> Muse Spark 1.3 rewrites each entry into a 2-4 sentence technical summary from the diff and nothing else, and a second pass writes the plain-English line under it from the same evidence. Both are cached by SHA, prompt version and diff hash, so a prompt edit re-runs exactly once. With no provider configured the deterministic text stands alone; nothing breaks.</li>
           <li><strong>Every claim links to proof.</strong> Commit SHA, compare URL, stored diff and per-file stats on every row, with the diff loaded on demand.</li>
         </ul>
 

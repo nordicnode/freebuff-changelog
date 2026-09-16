@@ -51,6 +51,13 @@ async function llmPatchFor (e) {
   // summarized and the backlog counter never reached zero.
   const clean = await extractCleanDiff(REPO_DIR, base, e.sha, 48000, !e.testOnly)
   if (clean.trim()) return clean
+  // Stale entries built before testOnly existed (or with narrower TEST_RE)
+  // carry no flag, so the exclusion above empties their patch. Retry without
+  // the test exclusion before giving up; churn rows stay empty either way.
+  if (!e.testOnly) {
+    const incl = await extractCleanDiff(REPO_DIR, base, e.sha, 48000, false)
+    if (incl.trim()) return incl
+  }
   // A churn row's entire change IS the lockfile, so the clean form is empty by
   // construction. CHANGELOG_LLM_CHURN=1 sends the raw diff instead; off by
   // default because "dependency versions moved" is what the deterministic label

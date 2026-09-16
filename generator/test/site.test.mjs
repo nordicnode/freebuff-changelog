@@ -958,14 +958,23 @@ test('discordText: organized for Discord -- labelled quote, one sentence per lin
   assert.ok(prose.includes('First thing happened.\nIt touched `a_b`.\nThird part done.'), 'a paragraph becomes one sentence per line')
 })
 
+test('discordText: the plain-English quote is never clipped', () => {
+  const full = 'People filling out the welcome questions see fewer choices now. The how-you-heard list no longer offers Reddit or GitHub. Any old picks for those now count as something else, and the system recounts past answers under the new lists.'
+  const t = discordText({ ...dcEntry(), facts: [], modelChanges: null, ai: { title: 'T', summary: 'Short summary.' }, eli5: { text: full } })
+  assert.ok(t.includes(full.split('. ')[0]), 'quote head present')
+  assert.ok(t.includes('recounts past answers'), 'quote tail present: no 300-char clip')
+  assert.ok(!t.includes('…') || t.indexOf('…') > t.indexOf('recounts past answers'), 'no ellipsis inside the quote')
+})
+
 test('discordText: a monster entry still fits the 2000-char cap, giving up detail in reverse order', () => {
-  const e = { ...dcEntry(), eli5: { text: 'long. '.repeat(400) }, facts: ['keep me'], ai: { title: 'T', summary: 'word '.repeat(1200) } }
+  const e = { ...dcEntry(), eli5: { text: 'long. '.repeat(120) }, facts: ['keep me'], ai: { title: 'T', summary: 'word '.repeat(1200) } }
   const t = discordText(e)
   assert.ok(t.length <= 2000, `${t.length} chars exceeds the Discord limit and the paste would be rejected`)
   assert.ok(!t.includes('keep me'), 'the highlights list goes first')
   assert.ok(t.includes('```'), 'the details block survives')
   assert.ok(t.includes('**In plain English**'), 'and so does the plain-English quote')
   assert.ok(t.includes('word word'), 'the summary keeps its head and loses its tail')
+  assert.ok(t.includes('long. long.'), 'the quote keeps its head too, clipped only as a last resort')
 })
 
 test('in-flight page is honest about a short or stale PR list', async (t) => {

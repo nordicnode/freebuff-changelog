@@ -79,7 +79,7 @@ export function buildPrompt (entry, patch) {
   const lines = [
     'You write changelog entries for Freebuff, a free AI coding agent. Your reader is a TECHNICAL user: a developer who uses Freebuff daily and reads diffs.',
     'Rules: use ONLY facts from the diff and the analysis notes below. Never invent file names, features, or versions.',
-    'Title: plain text, max 70 chars, no backticks, no markdown, no trailing period. Lead with the concrete change (model name, command with leading slash, version, subsystem).',
+    'Title: plain text, max 70 chars, no backticks, no markdown, no trailing period. Lead with the concrete change (model name, command with leading slash, version, subsystem). Translate code identifiers into plain words (split snake_case/camelCase/CONSTANT_CASE, drop glued version suffixes); never emit a raw glued identifier as a title word.',
     'Summary shape (2-4 sentences, technical prose, backticks allowed for identifiers):',
     '1. WHAT changed, precisely: names, versions, commands, files. Lead with the user-visible change, then the mechanism.',
     '2. WHY it happened, grounded in the notes/diff (root cause, upstream failure, deprecation). If the reason is not visible, describe the mechanism instead — never invent motives.',
@@ -126,6 +126,40 @@ export function parseLlmJson (text) {
   return JSON.parse(text.slice(jsonStart, jsonEnd + 1))
 }
 
+// Some OpenAI-compatible gateways answer /chat/completions with SSE chunk
+// frames (one JSON object per `data:` line) even when stream was not asked
+// for. Reassemble those into the message text; plain JSON bodies pass through.
+export function extractResponseText (rawText) {
+  if (!/^\s*data:\s*\{/m.test(rawText)) {
+    const data = parseLlmJson(rawText)
+    return data.choices?.[0]?.message?.content ?? ''
+  }
+  let text = ''
+  for (const line of String(rawText).split('\n')) {
+    const m = /^\s*data:\s*(\{.*\})\s*$/.exec(line)
+    if (!m) continue
+    try {
+      const chunk = JSON.parse(m[1])
+      const delta = chunk.choices?.[0]?.delta?.content
+      if (typeof delta === 'string') text += delta
+    } catch { /* skip malformed chunk lines */ }
+  }
+  if (!text) {
+    // No delta chunks found: fall back to the first message-shaped object.
+    for (const line of String(rawText).split('\n')) {
+      const m = /^\s*data:\s*(\{.*\})\s*$/.exec(line)
+      if (!m) continue
+      try {
+        const chunk = JSON.parse(m[1])
+        const content = chunk.choices?.[0]?.message?.content
+        if (typeof content === 'string' && content) return content
+      } catch { /* keep looking */ }
+    }
+    throw new Error('LLM returned no JSON')
+  }
+  return text
+}
+
 // Short one-line error for logs and cache: HTML error pages collapse to
 // their HTTP status so a 522 tunnel outage logs one line, not a page.
 export function shortError (err) {
@@ -149,7 +183,7 @@ async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
     },
     body: JSON.stringify({
       model,
-      temperature: 0.1,
+              temperature: 0.1,
       response_format: { type: 'json_object' },
       messages: [{ role: 'user', content: prompt }]
     }),
@@ -167,10 +201,9 @@ async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
     await new Promise(r => setTimeout(r, 5000))
     return callLlm(prompt, env, attempt + 1)
   }
-  if (!res.ok) throw new Error(shortError(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`))
-  const rawText = await res.text()
-  const data = parseLlmJson(rawText)
-  const text = data.choices?.[0]?.message?.content ?? ''
+    if (!res.ok) throw new Error(shortError(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`))
+    const rawText = await res.text()
+    const text = extractResponseText(rawText)
   try {
     return validate(parseLlmJson(text))
   } catch (err) {
@@ -192,7 +225,10 @@ export function validateLlmOut (out, fallbackSig = 'minor') {
   if (!out || typeof out !== 'object') throw new Error('LLM output not an object')
   const rawTitle = String(out.title || '').trim()
   if (!rawTitle) throw new Error('LLM output missing title')
-  const title = truncateWords(rawTitle.replace(/[`*#_[\]]/g, '').replace(/\s+/g, ' '), 70)
+      const title = truncateWords(rawTitle.replace(/[`*#_[\]]/g, '').replace(/\s+/g, ' '), 70)
+    // Raw code identifiers read as noise in a human title (advertiserreasonredaction202609v3).
+    // Real English words this long are vanishingly rare; the repair pass rewords the few.
+    if (title.split(/[^A-Za-z0-9]+/).some(w => w.length >= 18)) throw new Error('LLM title contains raw identifier')
   const rawSummary = String(out.summary || '').trim()
   if (!rawSummary) throw new Error('LLM output missing summary')
   if (NOACTION_RE.test(rawSummary)) {
@@ -441,7 +477,7 @@ Title: ${e.ai.title}
 Technical summary: ${e.ai.summary}
 ${evidence.length ? `\nEvidence. Use it; do not repeat it back verbatim.\n${evidence.map(x => `- ${x}`).join('\n')}\n` : ''}
 ${noteBlock}${diffBlock}
-Write 2-4 sentences of plain English: what happened, who it affects, and what that person would notice if they looked. Say the concrete thing, not the category of thing.
+  Write 2-4 sentences of plain English: what happened, who it affects, and what you would notice if you looked. Say the concrete thing, not the category of thing. Lead with what the reader experiences, then the mechanism.
 
 Rules:
 - No jargon, acronyms, file names, function names, code or version numbers. Say what the thing does instead of what it is called ("the assistant can now use a new model", not "a provider adapter was wired up").
@@ -450,9 +486,11 @@ Rules:
 - Say whether it is live today. A constant, a flag, a field or a type that nothing reads yet is not a feature: say it is in place and does nothing yet.
 - Use only what the summary, the evidence and the comments say. Never invent a cause, a number, or a promise.
 - Keep the audience the text gives, and keep it narrow. If the change is for one kind of customer, one plan, one region, or only after some step, name that group. Never widen it to "users", "everyone" or "customers" because that reads more naturally: a program for verified YC companies is not available to users.
-- Plain words, active voice. No "This change", "We are excited", or marketing tone.
-- If the change is small or internal, say so shortly. Do not inflate it.
-- Never address the reader as a developer.
+  - Plain words, active voice. No "This change", "We are excited", or marketing tone.
+  - If the change is small or internal, say so shortly. Do not inflate it.
+  - Never address the reader as a developer.
+  - Address the reader as "you", or name the group ("users", "subscribers"); never write "that person", "the viewer" or "that individual".
+  - Stop after 2-4 sentences. Never list dates, day counts or archive calendars; end the reply there.
 
 Reply with JSON only: {"eli5": "..."}`
 }
@@ -470,15 +508,20 @@ export function normalizeEli5 (raw) {
   let s = String(value ?? '').trim()
   // Models like to restate the label they were given.
   s = s.replace(/^(ELI5|In plain English|Plain english)\s*[:–-]\s*/i, '').trim()
-  s = s.replace(/\s+/g, ' ').replace(/\s+([.,;:])/g, '$1').trim()
+      s = s.replace(/\s+/g, ' ').replace(/\s+([.,;:])/g, '$1').trim()
+    // Backstop for phrasing the prompt now forbids: point it at the reader.
+    s = s.replace(/\bthat person\b/gi, 'you').replace(/\bthe viewer\b/gi, 'you').replace(/\bthat individual\b/gi, 'you')
+    // Runaway generations recite the site archive (May 13, 2025 (22)...). Cut there.
+    const bleed = s.search(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\s*\(\d+\)/)
+    if (bleed !== -1) { s = s.slice(0, bleed).trim(); if (!/[.!?]$/.test(s)) s += '.' }
   // The floor exists to catch non-answers, not to reject a terse but valid
   // sentence: "It is faster now." is 16 characters and exactly what this field
   // is for. A 25-character floor parked real answers as errors for an hour.
   if (s.length < 12 || ELI5_JUNK.test(s) || ELI5_REFUSAL.test(s)) {
     throw new Error(`eli5 not an answer: ${JSON.stringify(s).slice(0, 60)}`)
   }
-  if (!/[.!?]$/.test(s)) s += '.'
-  return truncateWords(s, 420)
+    if (!/[.!?]$/.test(s)) s += '.'
+    return truncateWords(s, 800)
 }
 
 export async function enrichEli5 (entries, dataDir, env = process.env, options = {}) {

@@ -56,6 +56,16 @@ test('parseLlmJson: throws when no JSON object is found', () => {
   assert.throws(() => parseLlmJson('} inverted {'), /LLM returned no JSON/)
 })
 
+test('extractResponseText: reassembles SSE delta chunks into message text', async () => {
+  const { extractResponseText } = await import('../lib/llm.mjs')
+  const sse = 'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"{\\"title\\": \\"AI"},"finish_reason":null}]}\n'
+    + 'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":" Feature\\", \\"summary\\": \\"x\\", \\"significance\\": \\"minor\\"}"},"finish_reason":null}]}\n'
+    + 'data: [DONE]\n\n'
+  assert.equal(parseLlmJson(extractResponseText(sse)).title, 'AI Feature')
+  const plain = '{"id":"chatcmpl-123","choices":[{"message":{"content":"{\\"title\\":\\"AI Feature\\",\\"summary\\":\\"x\\",\\"significance\\":\\"minor\\"}"}}]}'
+  assert.equal(parseLlmJson(extractResponseText(plain)).title, 'AI Feature')
+})
+
 test('llmConfigured: checks CHANGELOG_LLM and LLM_API_KEY from env', () => {
   assert.equal(llmConfigured({ CHANGELOG_LLM: '1', LLM_API_KEY: 'test-key' }), true)
   assert.equal(llmConfigured({ CHANGELOG_LLM: '0', LLM_API_KEY: 'test-key' }), false)
@@ -530,9 +540,37 @@ test('normalizeEli5: unwraps the reply, strips the echoed label, keeps it honest
   assert.equal(normalizeEli5({ eli5: 'The assistant cannot use the broken model anymore' }),
     'The assistant cannot use the broken model anymore.')
   assert.throws(() => normalizeEli5({}), /not an answer/)
-  const cut = normalizeEli5({ eli5: 'word ' + 'many '.repeat(120) + 'tail' })
-  assert.ok(cut.length <= 421, `capped, got ${cut.length}`)
+  const cut = normalizeEli5({ eli5: 'word ' + 'many '.repeat(220) + 'tail' })
+  assert.ok(cut.length <= 801, `capped, got ${cut.length}`)
   assert.ok(/word/.test(cut) && !/man$/.test(cut), 'cut on a word boundary')
+})
+
+test('validateLlmOut: rejects raw glued identifiers in the title', () => {
+  assert.throws(() => validateLlmOut({ title: 'advertiserreasonredaction202609v3 adds semantic refusal codes', summary: 'Did stuff.' }, 'minor'), /raw identifier/)
+  assert.throws(() => validateLlmOut({ title: 'Add searchmanifoldmarkets tool for queries', summary: 'Did stuff.' }, 'minor'), /raw identifier/)
+  const out = validateLlmOut({ title: 'Ad Reason Redaction v3 adds semantic refusal codes', summary: 'Did stuff.' }, 'minor')
+  assert.equal(out.title, 'Ad Reason Redaction v3 adds semantic refusal codes')
+})
+
+test('normalizeEli5: points robotic pronouns at the reader and cuts archive bleed', () => {
+  assert.equal(normalizeEli5({ eli5: 'Workers put rules in place, so that person would notice nothing different today.' }),
+    'Workers put rules in place, so you would notice nothing different today.')
+  assert.equal(normalizeEli5({ eli5: 'Nothing changes for the viewer today.' }), 'Nothing changes for you today.')
+  const bled = normalizeEli5({ eli5: 'You will see no changes today because this only collects details. May 13, 2025 (22)May 12, 2025 (15)' })
+  assert.ok(!/2025/.test(bled), 'archive calendar cut')
+  assert.ok(bled.endsWith('.'), 'cut end repunctuated')
+})
+
+test('buildEli5Prompt: addresses you, leads with experience, stops at sentences', () => {
+  const p = buildEli5Prompt(eli5Entry(), [], {})
+  assert.match(p, /what you would notice/)
+  assert.match(p, /never write "that person"/)
+  assert.match(p, /Never list dates/)
+})
+
+test('buildPrompt: tells the model to translate identifiers', () => {
+  const p = buildPrompt({ date: '2026-09-16T00:00:00Z', areas: ['CLI'], significance: 'minor' }, 'diff')
+  assert.match(p, /glued identifier/)
 })
 
 test('enrichEli5: writes the line, caches it by the summary, asks once', async (t) => {
