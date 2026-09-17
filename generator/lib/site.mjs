@@ -1516,7 +1516,13 @@ ${rows.map(e => {
     }
   })
 
-  // Model timeline cards (fits full width, zero horizontal scroll)
+  const matrixAxisHeader = `<div class="mt-axis-hdr">
+    <span class="mt-axis-label">${esc(minDate)}</span>
+    <span class="mt-axis-title">FREE MODEL LIFESPAN TIMELINE</span>
+    <span class="mt-axis-label">${esc(maxDate)} (latest)</span>
+  </div>`
+
+  // Model timeline items: tightened, high-density, zero horizontal scroll
   const matrixRows = modelTimelineData.map(d => {
     const segmentsHtml = d.barSegments.map(seg =>
       `<div class="mt-bar-segment ${d.isLive ? 'live' : 'retired'}" style="left:${seg.leftPct}%;width:${seg.widthPct}%;" title="${esc(d.model)} active: ${esc(seg.start)} to ${esc(seg.end)} (${seg.days}d)"></div>`
@@ -1532,22 +1538,24 @@ ${rows.map(e => {
     ).join('')
 
     return `<div class="matrix-row model-timeline-item" data-model="${esc(d.model.toLowerCase())}" data-status="${d.isLive ? 'live' : 'retired'}">
-      <div class="mt-item-hdr">
-        <div class="mt-item-title-wrap">
+      <div class="mt-item-main">
+        <div class="mt-item-left">
+          <span class="model-status-tag ${d.isLive ? 'live' : 'retired'}">[${d.isLive ? 'LIVE' : 'RETIRED'}]</span>
           <a href="/models/${modelSlug(d.model)}/" class="mt-model-name">${esc(d.model)}</a>
-          <span class="mt-status-badge ${d.isLive ? 'live' : 'out'}">${d.isLive ? 'LIVE' : 'OUT'}</span>
-          <span class="mt-date-indicator">ACTIVE AT DATE</span>
         </div>
-        <div class="mt-item-meta">
+        <div class="mt-item-right">
           <span class="mt-lifespan">${d.lifespanText}</span>
           <span class="mt-days-pill">${d.totalDays}d active</span>
         </div>
       </div>
-      <div class="mt-bar-container">
-        <div class="mt-bar-track">${segmentsHtml}</div>
-        <div class="mt-bar-axis"><span>${esc(minDate)}</span><span>${esc(maxDate)} (latest)</span></div>
-      </div>
-      ${milestonesHtml ? `<div class="mt-milestones">${milestonesHtml}</div>` : ''}
+      <div class="mt-bar-track">${segmentsHtml}</div>
+      ${d.milestones.length ? `<details class="mt-milestones-details">
+        <summary class="mt-milestones-summary">
+          <span class="diff-arrow">&gt;</span>
+          <span>${d.milestones.length} milestone${d.milestones.length === 1 ? '' : 's'}</span>
+        </summary>
+        <div class="mt-milestones-body">${milestonesHtml}</div>
+      </details>` : ''}
     </div>`
   }).join('')
 
@@ -1586,6 +1594,7 @@ ${rows.map(e => {
 </section>
 <div class="model-matrix-wrap">
   <div class="model-matrix-table">
+    ${matrixAxisHeader}
     ${matrixRows}
   </div>
 </div>
