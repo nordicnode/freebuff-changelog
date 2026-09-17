@@ -1,323 +1,52 @@
-# Freebuff Changelog - unofficial changelog generator + static site
+# Freebuff Changelog
 
-Tracks what actually ships in [CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff),
-a project whose public repo is a **mirror**: a bot pushes opaque
-`Sync public snapshot from freebuff-private` commits, so the community sees no
-changelog, no release notes, and no commit messages.
+Unofficial changelog generator and static site for [CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff).
 
-This project reconstructs an accurate changelog from the one source of truth
-that remains: **the diff behind every public commit**.
+Upstream commits are squashed into opaque `Sync public snapshot` commits with no release notes. This tool reconstructs an accurate changelog directly from the **git diff behind every public commit**.
 
-## How it works
+## Quickstart
 
-```
-github.com/CodebuffAI/freebuff (fetched by the local sync loop; Actions backstop)
-        │  git clone / fetch
-        ▼
-generator/cli.mjs generate
-  ├─ segment history: sync-snapshot commits vs. community commits
-  ├─ diff parent..commit per snapshot (avg 1–4 files → one focused change)
-  ├─ rule extractors:
-  │    • README model-table ±rows        → model lineup added/retired/replaced
-  │    • cli/release/package.json ±ver   → release marker (v1.0.NNN)
-  │    • slash-command registry diffs    → new/removed commands
-  │    • file added/removed/renamed      → structural changes
-  │    • inline rationale comments       → verbatim facts (Freebuff devs document heavily)
-  ├─ classify: category, areas, significance, noise skip (lock-only/test-only)
-  └─ optional LLM rewrite (env-gated, per-commit cached forever, diff-grounded;
-     every non-churn entry, community commits included)
-        ▼
-data/changelog.json (+ state.json, ai-summaries.json)  ← committed to git
-        ▼
-generator/cli.mjs build  →  dist/  (static site → Cloudflare Pages)
-```
-
-* **Sync ownership.** A long-running loop (`npm run backfill`, systemd
-  `freebuff-backfill.service`) is the primary syncer: each cycle re-analyzes
-  upstream when the SHA moved *or* when `generatedAt` fell past
-  `CHANGELOG_SYNC_STALE_MIN` (default 45), then runs one LLM backfill batch.
-  Those two fields are the only inputs to the site's `[stale Nm]` counter, so
-  freshness never waits on the Actions schedule — which drifts badly in practice
-  (`0 * * * *` observed firing at 00:33, 05:35 and 11:21).
-  `.github/workflows/changelog-sync.yml` remains the backstop for when that box
-  is offline.
-* Both writers share one publish path (`cli.mjs push-data`), and every write to
-  `data/changelog.json` / `data/ai-summaries.json` is **merged, never
-  overwritten**: the newer `generatedAt` wins the scalars, entries are unioned by
-  SHA, and each side keeps the summaries it produced. A cycle holds a snapshot in
-  memory across minutes of LLM calls, so overwriting would push a stale `headSha`
-  back onto origin — the exact shape behind a site reading `[stale 184m]` while
-  git kept receiving commits. The merge also re-normalizes any timestamp it is
-  handed, so a snapshot taken before that rule can't reintroduce an offset.
-* **All timestamps are UTC.** `git log --format=%cI` yields the *author's* zone
-  (`2025-11-24T17:25:50-08:00`), and every comparison downstream — the day pages,
-  the release windows, the sort key — is a string compare or a `slice(0, 10)`,
-  both of which ignore the offset. `toUtc()` collapses it at the boundary
-  (`analyze.mjs` `listCommits`), and `npm run normalize-dates` repaired the 6,365
-  rows stored before it did. A commit's day page is its **UTC** day.
-* `build` renders a **fully static site**: one inline stylesheet, zero client JS
-  except the search page, system fonts, pre-rendered day/release/archive pages,
-  RSS, sitemap, JSON API, `_headers` for content types, CORS and a site-wide
-  `no-cache` policy (caching removed; browsers revalidate every request).
-* Incremental + idempotent: state tracks the last analyzed SHA; rewritten
-  upstream history triggers a safe full rescan; AI summaries are keyed by
-  SHA+patch-hash so each commit is summarized at most once, ever.
-* **Every commit is listed.** Nothing is dropped: a `bun.lock`-only sync is a
-  commit the repository received, and 1,877 of them (30% of recent history) used
-  to be invisible, which made the site look behind upstream. Churn rows carry
-  `noise: true` + `churn: 'lockfile' | 'assets' | 'merge'` and the names of the
-  files that were filtered out of the source diff, so they can state what
-  actually changed. They are dimmed in the timeline and excluded from feeds,
-  search, stats, the "changes" counts and the LLM queue — there is nothing for a
-  model to describe (their diff is still stored; see below). Test-only commits are
-  *not* churn: real work landed, so
-  they get a row, a category and a summary like any other entry.
-* An entry is complete where it is listed: index rows render the same full body
-  as day pages (files, facts, meta links), so reading one never needs a second
-  page. Every entry also has its diff on disk. `data/diffs/<sha>.diff` is
-  generated for community commits and churn rows as well as snapshots — a churn
-  row stores the *unstripped* diff, because the lockfile is its whole change —
-  and retention follows the entry list: `pruneDiffs` deletes a file only when no
-  entry references it. Age-based retention is what used to leave 58 rows
-  advertising a diff that had been deleted, and a toggle that fetches a 404 is
-  worse than the GitHub compare link beside it. The only rows without a toggle
-  are the handful whose commit is genuinely empty (a net-zero merge).
-* Every entry card carries a `discord` button that copies a Discord-formatted version
-  of that entry, composed at build time and clipped to Discord's 2,000-character
-  limit. The shape is Discord's own dialect: a header line, a `###` headline, the
-  plain-English line as a labelled quote, the summary **one sentence per line**
-  (Discord does not hard-wrap, so a paragraph pastes as one wall), model changes as
-  struck/bold list rows, highlights, then the commit, churn, release, PR and author
-  in a fenced code block — the only place Discord gives you aligned columns, and the
-  only place nothing has to be escaped. There are no links in it at all, masked or
-  otherwise: the paste has to stand on its own wherever it lands, and the commit is
-  named by its SHA. Markup that would run away with the message is neutralised: an
-  unbalanced `**` is *dropped* (README bullets arrive like that, and escaping it
-  would still print the debris), a stray or triple backtick run is *escaped* (some
-  prompt-text commits quote fences, and one opened fence swallows everything after
-  it), while `_` is escaped rather than deleted, because it is usually part of a real
-  path. Balanced pairs in the AI summaries pass through untouched — they already use
-  the subset `miniMd` renders. Over the cap, the highlights list goes, then the tail
-  of the summary; the header, quote and details never do.
-* The front page filters: a chip per category present on the page, one toggle for
-  churn, state kept in `localStorage`. Filtering is a visibility flip over rows
-  that are already in the document, so it costs no request and no backend. **Churn
-  is hidden on the server** (`<details … hidden>`), not by script — a default has
-  to hold for readers with JavaScript off, and only the categories actually on the
-  page get a chip, so no chip can filter the page down to nothing. A day whose rows
-  are all filtered out hides its own header, and a `#sha` permalink into a
-  filtered-out row reveals that row rather than landing on blank space.
-* The timeline paginates **one day per page**: `/` is the newest day,
-  `/day/2026-09-13/` is that same day at its permalink, and older days walk back
-  721 pages to the first entry. A page *is* a date, so the heading on screen, the
-  URL, the pager and a link someone shared cannot disagree, and no page splits a
-  day in half. Chips count the day they sit on while `data-total` carries the
-  all-time figure, and filter state is shared, so walking back keeps the reader's
-  selection instead of snapping to the default. The live chrome — HEAD plus the
-  data age — belongs to the newest day only: it is a claim about *now*, and
-  the shell's reload-when-behind hook keys off the same element, so a settled day
-  prints the exact stamp it was built from and carries no hook at all (an
-  auto-refresh while someone reads July 2024 would yank the page out from under
-  them). Every page also carries a jump-to-date select, because 721 days of one
-  click at a time is not navigation.
-
-## Freshness path (an upstream commit → a reader seeing it)
-
-| step | latency | knob |
-|---|---|---|
-| loop notices the new SHA | ≤ `WATCH_INTERVAL` (30s) | systemd unit env |
-| analyze + merge-safe write | 8–35s (measured 2026-09-15) | — |
-| new rows published **before** the LLM batch | ~1s | `commitAndPushData` |
-| Workers build on push | ~20–60s | Cloudflare |
-| browser reuse of any page | none (`Cache-Control: no-cache`; revalidate, 304 when unchanged) | `_headers` |
-| its summary replaces the deterministic one | next batch, ahead of the backlog | `CHANGELOG_LLM_LIMIT` |
-| its plain-English line appears | same batch (own queue; reads the stored diff) | `CHANGELOG_ELI5_LIMIT` |
-
-So a new commit is readable in about 2 minutes, and a long-open tab reloads
-itself once per data version when it comes back from the background past its
-budget. The clock starts when the snapshot lands in the public repo, not when
-Freebuff writes the code: upstream squashes commits into "Sync public snapshot"
-merges, and on 2026-09-15 a commit authored 18:09:52Z only reached the public
-repo by 18:31 — 21 minutes of upstream latency against 8 seconds from our
-detection to push. Summarization order: this cycle's commits, then model swaps, releases
-and commands, then newest-first — and only `4 × limit` candidates are diffed per
-run, so a deep backlog can neither slow a cycle nor starve the new commit.
-Gateway blips park a commit for `CHANGELOG_LLM_TRANSIENT_RETRY_MS` (default 5
-min) instead of re-consuming a call every cycle; hard failures keep the hour
-cooldown.
-
-## Commands
+Requires **Node.js ≥ 20.11** (zero npm dependencies).
 
 ```bash
-node generator/cli.mjs generate [--full]   # analyze upstream → data/
-node generator/cli.mjs build               # data/ → dist/
-node generator/cli.mjs preview [port]      # serve dist/ locally (default 8788)
+npm run build     # Build static site to dist/
+npm run preview   # Serve locally at http://localhost:8788
+npm test          # Run test suite
+npm run generate  # Analyze upstream repo -> data/
+npm run backfill  # Run continuous sync daemon (--push)
 ```
 
-No npm dependencies. Node ≥ 20.11.
+## How It Works
 
-## Optional AI layer
+1. **Fetch & Diff**: Pulls upstream snapshots and diffs parent commits to isolate individual changes.
+2. **Deterministic Extraction**: Extracts model lineup changes (README tables), version bumps (`package.json`), slash commands, and developer comments.
+3. **Classification**: Categorizes by area and significance. Churn commits (lockfiles, assets) are dimmed in the UI rather than dropped.
+4. **AI Enrichment (Optional)**: Adds technical summaries and ELI5 plain-English explanations, cached by SHA and diff hash.
+5. **Static Generation**: Builds zero-JS, pre-rendered HTML/CSS to `dist/` with instant revalidation.
 
-Deterministic analysis alone produces accurate entries. Setting these (repo
-Variables/Secrets in Actions, or locally) enables an AI rewrite pass grounded
-strictly in the diff text:
+## Site & Feeds
 
-| env | meaning |
-|---|---|
-| `CHANGELOG_LLM=1` | enable |
-| `LLM_API_BASE` | any OpenAI-compatible endpoint (default `https://api.openai.com/v1`) |
-| `LLM_API_KEY` | key |
-| `LLM_MODEL` | model name |
-| `CHANGELOG_LLM_LIMIT` | max commits summarized per run (default 60; `0` = no cap) |
-| `CHANGELOG_LLM_CONCURRENCY` | parallel API calls (default 5) |
-| `CHANGELOG_LLM_ERROR_COOLDOWN_MS` | retry failed entries after this (default 3600000) |
-| `CHANGELOG_ELI5_LIMIT` | plain-English lines per run (defaults to `CHANGELOG_LLM_LIMIT`) |
-| `CHANGELOG_ELI5_CONCURRENCY` | parallel ELI5 calls (defaults to `CHANGELOG_LLM_CONCURRENCY`) |
-| `CHANGELOG_ELI5_DIFF=0` | explain from the summary only; skip the diff on the plain-English pass |
-| `CHANGELOG_ELI5_DIFF_BYTES` | how much diff the plain-English pass is shown (default 6000, ~1.7k tokens) |
-| `CHANGELOG_ELI5=0` | disable the plain-English pass only, keep summaries |
-| `CHANGELOG_LLM_CHURN=1` | also summarize lockfile/icon-only rows, from their raw diff (~1,900 extra calls) |
+- **Timeline**: Daily changelog views (`/day/YYYY-MM-DD/`), releases (`/release/1.0.NNN/`), model tracker (`/models/`), and live metrics (`/stats/`).
+- **Feeds**: `/feed.xml` (all changes), `/feed-major.xml` (major only), `/feed-models.xml`, `/feed-releases.xml`, `/feed.json` (JSON Feed 1.1).
+- **Discord**: Every entry includes one-click Discord markdown copy (≤ 2,000 chars). Feeds support MonitoRSS and webhooks natively.
 
-Priority order is user-visible first (models, releases, commands), then newest.
-The prompt carries deterministic signals (category, files, stats, catalog and
-command facts) so the model grounds in verifiable context; outputs are schema-
-validated with one repair retry and 429 backoff. Prompt edits bump `PROMPT_V`
-in `generator/lib/llm.mjs`, invalidating stale cache entries exactly once.
+## Configuration
 
-**The ELI5 pass** is a second, separate call per entry: 2-4 sentences of plain
-English under the technical summary, for a reader who does not open code. It is
-*not* extra fields in the summary prompt, because that would mean bumping
-`PROMPT_V` and re-paying every summary that is already good, and because the
-wording of a plain-English ask needs tuning without rewriting technical history.
-So it has its own `ELI5_V`, its own keys in the same cache file
-(`<sha>:eli5:v<N>:<hash>`), and its own budget. Its input is the summary *plus*
-the evidence the summarizer had: the stored diff (budgeted, lockfiles and test
-hunks already stripped), the analyzer's own measurements, the files touched, the
-catalog rows with access and traits, same-snapshot siblings, and up to 8 comments
-the developers wrote beside the code — merged from the recorded facts and the
-patch, because the sentence naming who a program is for is usually in the one the
-extractor dropped. The diff is evidence, not vocabulary: the hard jargon ban
-stands, so the model reads `SUPABASE_AGENTIC_PILOT_VERSION` and writes about an
-experiment that keeps two offers apart. Where the summary and the diff disagree
-the prompt tells it to follow the diff, and a constant or flag nothing reads yet
-must be called prepared rather than shipped. It is keyed by the hash of the
-summary it explains, so a re-summarized entry loses a stale line automatically,
-and `mergeChangelog` keeps whichever side's line still matches the summary that
-survives the merge.
+Set via environment variables:
 
-Every entry that gets a summary gets an ELI5, including brand-new commits: the
-hourly pass runs over all entries rather than only the additions, and the loop's
-drain sits outside the summary branch so a commit summarized in one pass is
-explained in the same cycle.
-
-Backlog order is by how much a plain line can say, not by date: this cycle's
-commits, then model swaps, then new commands, then rows carrying a developer
-comment, then notable work, then the rest — with bare version bumps last. They
-are tagged `major` by the release heuristic and there are 650 of them, so a
-date-ordered queue spends the whole budget explaining that a number went up
-while the interesting rows wait behind them.
-
-**Full coverage is a command, not a hope.** `npm run enrich-all` (`--batch N`,
-or `--batch 0` for everything left, plus `--push`) runs one pass: store any
-missing diffs, spend N calls on summaries and N on plain-English lines, publish,
-exit. It is resumable by construction — summaries are cached by SHA + prompt
-version + diff hash, and a diff already on disk is never regenerated — so
-looping it until a pass reports `0 summaries, 0 eli5` left drains the whole
-history. One pass at a time is deliberate: the run holds the worktree lock, and
-the gaps between passes are when the sync daemon gets to publish fresh upstream
-commits.
-
-AI-titled entries are badged `ai`. Without AI, or on API failure, the
-rule-based summary is used: the site never depends on the LLM.
-
-## Deploy on Cloudflare Pages (free)
-
-1. Push this repo to GitHub.
-2. Cloudflare Pages → connect repo → build command `node generator/cli.mjs build`,
-   output dir `dist`.
-3. Set the final URL as `SITE_URL` in the workflow env (for absolute links,
-   RSS, sitemap) or edit `SITE.url` in `generator/lib/site.mjs`.
-4. Enable Actions workflows (backstop), then run the sync loop — e.g. a user
-   unit with `ExecStart=/usr/bin/node <repo>/generator/cli.mjs backfill --push`
-   and `Restart=always`. Done: the site keeps itself fresh; the cron only covers
-   the machine being offline.
-
-## Site output
-
-| route | content |
-|---|---|
-| `/` | the newest day in full: every entry pushed that UTC day (churn hidden by default), category chips, live HEAD + data age |
-| `/day/YYYY-MM-DD/` | one day of the timeline — the same full bodies and chips, one day per page; older/newer walk by date, and there is a jump-to-date select. `#sha` permalinks point here |
-| `/release/1.0.NNN/` | every commit since the previous version bump — the newest 40 as full entries, the rest as compact rows under one fold |
-| `/archive/` | one list at a time — DAYS / RELEASES / CATEGORIES — each grouped into months that stay folded until opened (`<details>`, so no-JS gets the long version). `#releases`, `#categories` and `#days-m-YYYY-MM` deep-link into a view |
-| `/changes/<category>/` | every change of one category, all time: compact rows, each linking to the full body on its day page (category tiles live on `/archive/#categories`; `/changes/` 301-redirects there) |
-| `/search/` | client filter over pre-built JSON index |
-| `/c/<sha>` | **one change alone**: the entry card, expanded, lifted out of its day page at runtime via `api/sha-day.json` — no second renderer, no 9,500 extra assets (the Workers cap is 20,000 files). Date-free, so it survives the entry moving day; accepts any SHA prefix. The `#` on every card points here |
-| `/in-flight/` | every open upstream PR, with diffstat + 120-line diff previews. The count is GitHub's, never our arithmetic: one `per_page=1` call whose `Link: rel="last"` page number *is* the number of open PRs. The walk follows `Link` headers rather than page lengths (GitHub answers short pages under load and still points at the rest), a refresh runs at most every `CHANGELOG_PR_REFRESH_MIN` (5) minutes so the number on the page is never hours old, and a walk that comes up short unions over the stored list instead of replacing it — the count can move up but never backwards because of one HTTP 500. Decoration is incremental: an unchanged PR costs no call, a pushed one gets its preview refetched, so a steady list costs ~2 requests. `CHANGELOG_PR_CALLS` budgets the rest, default 25 unauthenticated (GitHub allows 60 calls/hr) or 500 with a token, which finishes 100+ PRs in one pass. `listComplete` is what licenses `prunePrDiffs` to delete a merged PR's preview; `partial` only means decoration is unfinished. Both writers (local daemon, hourly CI) merge `open-prs.json` through `mergeOpenPrs` at commit time, so last-push-wins cannot resurrect the bug. Token: `GITHUB_TOKEN` in the local env file, `CHANGELOG_GITHUB_TOKEN` repo secret for CI (the built-in `GITHUB_TOKEN` cannot read upstream) |
-| `/feed.xml` | RSS of all tracked changes (Discord bot and reader friendly, with `<dc:creator>`, categories, and plain-English quotes) |
-| `/feed-major.xml` | RSS of major + notable entries only |
-| `/feed-models.xml`, `/feed-releases.xml` | model-only / release-only RSS |
-| `/models/` | model catalog timeline (live, retired, per-change history) |
-| `/stats/` | the one wide page: six headline figures open it, then per-category bars with 12-month sparklines, +/- churn by area as two segments of one track, the most-changed models beside the significance split, and monthly cadence with month-over-month deltas. Churn rows are counted on the timeline and excluded from every figure here |
-| `/api/entries.json`, `/api/status.json` | raw data / deploy status API |
-
-## Discord Bot & Webhook Setup
-
-The RSS feeds are specifically formatted for Discord bots ([MonitoRSS](https://monitorss.xyz/), [Feedcord](https://github.com/Feedcord/Feedcord), RSS Bot) and webhook automations (Zapier, Make, IFTTT):
-- `<title>` carries `[YYYY-MM-DD] <Title>`.
-- `<description>` provides Discord-ready markdown: plain-English quotes (`> **In plain English**`), clean technical summaries without title repetition, and bulleted highlights.
-- `<dc:creator>` identifies the author.
-- `<category>` includes the category (e.g. `CLI`, `Model Catalog`), significance (`major`, `notable`, `minor`), and areas for tag filtering.
-- `<pubDate>` provides the standard UTC timestamp for Discord embed timestamps.
-
-### Feed URLs
-
-| Feed | URL | Use Case |
+| Variable | Default | Description |
 |---|---|---|
-| **All Changes** | `https://freebuff-changelog.nordicnode.workers.dev/feed.xml` | Real-time updates for every commit/fix (recommended) |
-| **Major & Notable** | `https://freebuff-changelog.nordicnode.workers.dev/feed-major.xml` | Low-frequency announcements (model swaps, large features) |
-| **Model Catalog** | `https://freebuff-changelog.nordicnode.workers.dev/feed-models.xml` | Only model additions, retirements, and picker changes |
-| **Releases Only** | `https://freebuff-changelog.nordicnode.workers.dev/feed-releases.xml` | CLI and package version bumps |
-| **JSON Feed** | `https://freebuff-changelog.nordicnode.workers.dev/feed.json` | JSON Feed 1.1 for bots and custom integrations |
+| `CHANGELOG_LLM` | `0` | Enable AI enrichment (`1`) |
+| `LLM_API_KEY` | — | OpenAI-compatible API key |
+| `LLM_MODEL` | — | Model identifier (e.g. `gpt-4o-mini`) |
+| `LLM_API_BASE` | `https://api.openai.com/v1` | API endpoint URL |
+| `CHANGELOG_LLM_LIMIT` | `60` | Max commits summarized per run |
+| `CHANGELOG_ELI5` | `1` | Enable plain-English explanations |
+| `SITE_URL` | — | Base URL for RSS and sitemaps |
 
-### Setting up with MonitoRSS (Recommended)
+## Deployment
 
-1. Invite **MonitoRSS** to your server: [monitorss.xyz](https://monitorss.xyz/)
-2. Run the add command in your updates channel:
-   ```text
-   /feed add url:https://freebuff-changelog.nordicnode.workers.dev/feed.xml
-   ```
-3. Customize the embed fields in the MonitoRSS control panel or slash commands:
-   * **Title**: `{title}`
-   * **URL**: `{link}`
-   * **Description**: `{description}`
-   * **Author**: `{author}`
-   * **Timestamp**: `{date}`
-   * **Footer**: `{tags}`
-
-### Setting up with Discord Webhooks (Zapier / Make / IFTTT)
-
-1. In Discord: Channel Settings → **Integrations** → **Webhooks** → **New Webhook** → Copy Webhook URL.
-2. In Zapier / Make / IFTTT:
-   * **Trigger**: *RSS by Zapier* (New Item in Feed) pointing to `/feed.xml`.
-   * **Action**: *Discord Webhook* (POST JSON):
-     ```json
-     {
-       "embeds": [{
-         "title": "{title}",
-         "url": "{link}",
-         "description": "{description}",
-         "color": 5809919,
-         "author": { "name": "{author}" }
-       }]
-     }
-     ```
-
-## Honest limitations
-
-* Multiple private commits can be squashed into one public snapshot; entries
-  describe the *net effect*, with commit + compare links to ground truth.
-* Purely internal refactors show as area-level entries (they're real but less
-  user-meaningful); lockfile/test-only snapshots are skipped.
-* The pre–June 2026 history had real commit messages and is imported as-is
-  (`kind: community`), including community PR references.
+Deploy `dist/` to **Cloudflare Pages**:
+- **Build command**: `node generator/cli.mjs build`
+- **Output directory**: `dist`
+- Run continuous updates via `npm run backfill --push` (systemd) or GitHub Actions (`.github/workflows/changelog-sync.yml`).
