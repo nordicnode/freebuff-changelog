@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildStoryIndex, accessEvidence, dayStories, dayStoryLead, storyHeadline } from '../lib/story.mjs'
+import { buildStoryIndex, accessEvidence, dayStories, dayStoryLead } from '../lib/story.mjs'
 import { buildSite, discordText } from '../lib/site.mjs'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -50,29 +50,6 @@ test('story links exclude unrelated categories, generic files, churn and other d
   const snapshot = JSON.stringify([a, b])
   buildStoryIndex([a, b])
   assert.equal(JSON.stringify([a, b]), snapshot, 'derived notes never mutate cached entries')
-})
-
-test('story leads broaden to every same-code cluster; access still leads with evidence', () => {
-  const accessA = entry('a', '00', 'This update does not change who is eligible today.',
-    ['SG and IL left full access on 2026-09-15: ads fill 8-25% of requests.'])
-  const accessB = entry('b', '01', 'Singapore and Israel subscribers who bought full-access plans before September 15 keep their full allowances.')
-  const plain = (sha) => ({
-    sha: sha.repeat(40), day: '2026-09-16', date: `2026-09-16T02:00:00Z`,
-    title: 'Supabase invitation', files: { modified: ['common/src/ads/supabase-setup-invitation.ts'] },
-    eli5: { text: 'The app now recognizes provider packages before offering setup.' }, facts: []
-  })
-  const index = buildStoryIndex([accessA, accessB, plain('c'), plain('d')])
-  const clusters = dayStories(index, '2026-09-16')
-  assert.equal(clusters.length, 2)
-  assert.equal(clusters[0].access, true, 'access cluster sorts first')
-  const accessLead = dayStoryLead([clusters[0]])
-  assert.equal(accessLead.headline, 'Singapore and Israel left full access on 2026-09-15.')
-  assert.equal(accessLead.access, accessLead.headline, 'the evidence survives for the site renderer')
-  const plainLead = dayStoryLead([clusters[1]])
-  assert.equal(plainLead.headline, '2 linked changes · supabase-setup-invitation.ts')
-  assert.equal(plainLead.access, '', 'no invented claim on a non-access cluster')
-  assert.equal(storyHeadline(null, 2), '', 'no basis, no headline')
-  assert.equal(storyHeadline({ name: 'x.ts', n: 2 }, 1), '', 'singletons never lead')
 })
 
 test('story context reaches rendered cards, day leads, feeds and Discord', async t => {

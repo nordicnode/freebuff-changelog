@@ -1,10 +1,7 @@
 // generator/lib/story.mjs - conservative, same-day story context.
 // Candidate links use specific paths or shared identifiers, not category alone.
-// Every same-day, same-code cluster earns a day-level lead grouping its
-// plain-English lines side by side; explicit access-transition evidence supplies
-// an additional headline, and related ELI5 text supplies context. Headlines are
-// never invented for clusters without evidence: the box alone is the glanceable
-// part. These are heuristics, not proof of a shared policy change.
+// Explicit access-transition evidence supplies the headline; related ELI5 text
+// supplies context. These are heuristics, not proof of a shared policy change.
 // Recompute at render time so newly arrived entries require neither another API
 // call nor cache invalidation. Never mutate per-commit summaries.
 
@@ -128,41 +125,6 @@ function describe (e) {
   }
 }
 
-function rankedNames (counts, size, min = 2) {
-  return [...counts.entries()]
-    .filter(([, n]) => n >= Math.min(min, size) && n >= 2)
-    .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])))
-    .map(([name, n]) => ({ name, n }))
-}
-
-// The asserted-only-what-we-computed handle for a day lead: the shared path or
-// token the pair-triangulation itself counted, with the unanimous count. Never
-// a generated summary claim -- "5 linked changes · freebuff-countries.ts" is a
-// fact about the cluster; "a tiering overhaul" would be an invented one.
-function clusterBasis (members) {
-  const pathCounts = new Map(), tokCounts = new Map()
-  for (const m of members) {
-    for (const p of new Set(linkPaths(m.entry))) pathCounts.set(p, (pathCounts.get(p) || 0) + 1)
-    for (const t of new Set(m.tokens)) tokCounts.set(t, (tokCounts.get(t) || 0) + 1)
-  }
-  const size = members.length
-  const unanimousPath = rankedNames(pathCounts, size).find(p => p.n === size)
-  if (unanimousPath) return { kind: 'path', ...unanimousPath }
-  const majorityPath = rankedNames(pathCounts, size)[0]
-  if (majorityPath) return { kind: 'path', ...majorityPath }
-  const unanimousTok = rankedNames(tokCounts, size).find(t => t.n === size)
-  if (unanimousTok) return { kind: 'token', ...unanimousTok }
-  return rankedNames(tokCounts, size)[0] || null
-}
-
-// Headline where evidence exists to quote it: the access box leads with the dated
-// transition; other clusters group their own ELI5 lines under a structural
-// handle (what we counted, never a generated summary claim).
-export function storyHeadline (basis, count) {
-  if (!basis || !basis.name || count < 2) return ''
-  return `${count} linked changes · ${basename(basis.name)}`
-}
-
 function clustersOf (list) {
   const desc = list.map(describe)
   const seen = new Array(desc.length).fill(false)
@@ -190,7 +152,6 @@ function clustersOf (list) {
     out.push({
       day: list[0].day,
       access: members.some(m => m.access),
-      basis: clusterBasis(members),
       members: members.map(m => ({
         sha: m.entry.sha,
         anchor: String(m.entry.sha || '').slice(0, 12),
@@ -251,27 +212,21 @@ export function buildStoryIndex (entries) {
   return { notes, days }
 }
 
-/** Every multi-entry cluster worth a day-level line; access ones first. */
+/** The clusters worth a day-level line: a real story, and one that moved access. */
 export function dayStories (index, day) {
-  return (index?.days?.get(day) || [])
-    .filter(c => c.members.length >= 2)
-    .sort((a, b) => (b.access ? 1 : 0) - (a.access ? 1 : 0) || b.members.length - a.members.length)
+  return (index?.days?.get(day) || []).filter(c => c.access && c.members.length >= 2)
 }
 
-// Lead with explicit access evidence where recorded, otherwise the structural
-// handle (count + shared file/token) above the linked entries' own lines. The
-// effective date comes from evidence, independently of the publication day.
+// Lead with explicit access evidence, followed by the linked entries' own lines.
+// The effective date comes from evidence, independently of the publication day.
 export function dayStoryLead (clusters) {
   const c = (clusters || [])[0]
   if (!c) return null
   const shown = c.members.filter(m => m.line).slice(0, PARSED_MAX)
-  if (!shown.length) return null
-  const access = c.members.map(m => accessEvidence(m.raw)).find(Boolean)
-  const headline = access || storyHeadline(c.basis, c.members.length)
-  if (!headline) return null
+  const headline = c.members.map(m => accessEvidence(m.raw)).find(Boolean)
+  if (!shown.length || !headline) return null
   return {
     headline,
-    access: access || '',
     day: c.day,
     count: c.members.length,
     rest: c.members.length - shown.length,
