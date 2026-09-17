@@ -1170,3 +1170,67 @@ test('models page includes interactive lineup matrix and date scrubber', async (
   assert.match(modelsHtml, /<div class="footer-shortcuts">[\s\S]*?<button[^>]*data-kb-modal[^>]*>\[\?\]<\/button>/, 'footer has single dedicated shortcuts [?] button')
 })
 
+test('in-flight page paginates open PRs into pages of 25 with keyboard and pill navigation', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-inflight-pager-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+
+  const one = {
+    kind: 'community', sha: 'aaaa111122223333444455556666777788889999', date: '2026-09-12T10:00:00Z',
+    day: '2026-09-12', author: 'dev', areas: ['CLI'], category: 'CLI', significance: 'notable',
+    title: 'Add awesome feature', summary: 'A feature.', stats: { additions: 10, deletions: 2 },
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: ['a.ts'], removed: [], renamed: [], modified: [] }
+  }
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-15T00:00:00Z',
+    headSha: 'a'.repeat(40), counts: { entries: 1 }, entries: [one]
+  }
+  const prs = Array.from({ length: 65 }, (_, i) => ({
+    number: i + 1,
+    title: `Community contribution #${i + 1}`,
+    author: `coder-${i + 1}`,
+    created: '2026-09-01T00:00:00Z',
+    labels: i % 2 === 0 ? ['ui'] : ['cli']
+  }))
+
+  await buildSite({ changelog, openPrs: prs, prMeta: { total: 65, ageMin: 5 }, dist })
+
+  // Page 1 (index.html)
+  const page1 = await readFile(join(dist, 'in-flight/index.html'), 'utf8')
+  assert.match(page1, /<span>65 open<\/span>/)
+  assert.match(page1, /Showing <b id="pr-filter-count">25<\/b> of 25 PRs on this page \(PRs 1&ndash;25 of 65 total &middot; page 1 of 3\)/)
+  assert.match(page1, /Community contribution #1<\/a>/)
+  assert.match(page1, /Community contribution #25<\/a>/)
+  assert.doesNotMatch(page1, /Community contribution #26<\/a>/)
+  assert.match(page1, /<a href="\/in-flight\/page\/2\/" rel="next">older PRs &rarr;<\/a>/)
+  assert.match(page1, /<span class="pager-disabled">&larr; newer PRs<\/span>/)
+  assert.match(page1, /<span class="pager-num active">\[1\]<\/span>/)
+  assert.match(page1, /<a href="\/in-flight\/page\/2\/" class="pager-num">\[2\]<\/a>/)
+  assert.match(page1, /<a href="\/in-flight\/page\/3\/" class="pager-num">\[3\]<\/a>/)
+
+  // Page 1 canonical alias (page/1/index.html)
+  const page1Alias = await readFile(join(dist, 'in-flight/page/1/index.html'), 'utf8')
+  assert.equal(page1Alias, page1)
+
+  // Page 2
+  const page2 = await readFile(join(dist, 'in-flight/page/2/index.html'), 'utf8')
+  assert.match(page2, /Showing <b id="pr-filter-count">25<\/b> of 25 PRs on this page \(PRs 26&ndash;50 of 65 total &middot; page 2 of 3\)/)
+  assert.doesNotMatch(page2, /Community contribution #25<\/a>/)
+  assert.match(page2, /Community contribution #26<\/a>/)
+  assert.match(page2, /Community contribution #50<\/a>/)
+  assert.doesNotMatch(page2, /Community contribution #51<\/a>/)
+  assert.match(page2, /<a href="\/in-flight\/" rel="prev">&larr; newer PRs<\/a>/)
+  assert.match(page2, /<a href="\/in-flight\/page\/3\/" rel="next">older PRs &rarr;<\/a>/)
+  assert.match(page2, /<a href="\/in-flight\/" class="pager-num">\[1\]<\/a>/)
+  assert.match(page2, /<span class="pager-num active">\[2\]<\/span>/)
+
+  // Page 3 (final page)
+  const page3 = await readFile(join(dist, 'in-flight/page/3/index.html'), 'utf8')
+  assert.match(page3, /Showing <b id="pr-filter-count">15<\/b> of 15 PRs on this page \(PRs 51&ndash;65 of 65 total &middot; page 3 of 3\)/)
+  assert.match(page3, /Community contribution #51<\/a>/)
+  assert.match(page3, /Community contribution #65<\/a>/)
+  assert.match(page3, /<a href="\/in-flight\/page\/2\/" rel="prev">&larr; newer PRs<\/a>/)
+  assert.match(page3, /<span class="pager-disabled">older PRs &rarr;<\/span>/)
+  assert.match(page3, /<span class="pager-num active">\[3\]<\/span>/)
+})
+
+

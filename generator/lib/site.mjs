@@ -2310,7 +2310,10 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       </div>`
       : ''
 
-    const cards = openPrs.map(p => {
+    const PR_PAGE_SIZE = 25
+    const totalPages = Math.max(1, Math.ceil(openPrs.length / PR_PAGE_SIZE))
+
+    const renderPrCard = (p) => {
       const stats = (p.additions != null && p.deletions != null)
         ? `<span class="diffstat"><b>+${p.additions}</b> / <i>−${p.deletions}</i></span>${p.files != null ? `<span style="font-size:.72rem;color:var(--txt-subtle)">${p.files} file${p.files === 1 ? '' : 's'}</span>` : ''}`
         : ''
@@ -2432,7 +2435,36 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   ${commitsHtml}
   ${commentsHtml}
 </article>`
-    }).join('')
+    }
+
+    const makePrPager = (currentPage, totalPages, totalCount, startIdx, endIdx, isTop = false) => {
+      if (totalPages <= 1) return ''
+      const prevUrl = currentPage > 1 ? (currentPage === 2 ? '/in-flight/' : `/in-flight/page/${currentPage - 1}/`) : null
+      const nextUrl = currentPage < totalPages ? `/in-flight/page/${currentPage + 1}/` : null
+
+      const pageNums = []
+      for (let i = 1; i <= totalPages; i++) {
+        const url = i === 1 ? '/in-flight/' : `/in-flight/page/${i}/`
+        if (i === currentPage) {
+          pageNums.push(`<span class="pager-num active">[${i}]</span>`)
+        } else {
+          pageNums.push(`<a href="${url}" class="pager-num">[${i}]</a>`)
+        }
+      }
+
+      return `<nav class="pager pager-timeline ${isTop ? 'pager-timeline-top' : ''}" aria-label="In-flight pagination page ${currentPage}">
+  <div>
+    ${prevUrl ? `<a href="${prevUrl}" rel="prev">&larr; newer PRs</a>` : '<span class="pager-disabled">&larr; newer PRs</span>'}
+  </div>
+  <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
+    <span class="pager-page">page ${currentPage} of ${totalPages}</span>
+    ${pageNums.join(' ')}
+  </div>
+  <div>
+    ${nextUrl ? `<a href="${nextUrl}" rel="next">older PRs &rarr;</a>` : '<span class="pager-disabled">older PRs &rarr;</span>'}
+  </div>
+</nav>`
+    }
 
     const inFlightScript = `<script>
 (function(){
@@ -2441,14 +2473,20 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       document.querySelectorAll('.pr-tag-btn').forEach(function(b){ b.classList.remove('active'); });
       btn.classList.add('active');
       var filterTag = btn.dataset.tag || 'all';
+      var visibleCount = 0;
       document.querySelectorAll('.pr-card').forEach(function(card){
         if (filterTag === 'all') {
           card.style.display = '';
+          visibleCount++;
         } else {
           var cardTags = card.dataset.tags ? card.dataset.tags.split(',') : [];
-          card.style.display = cardTags.includes(filterTag) ? '' : 'none';
+          var matches = cardTags.includes(filterTag);
+          card.style.display = matches ? '' : 'none';
+          if (matches) visibleCount++;
         }
       });
+      var countEl = document.getElementById('pr-filter-count');
+      if (countEl) countEl.textContent = visibleCount;
     });
   });
 
@@ -2510,9 +2548,20 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
 })();
 </script>`
 
-    await write(dist, 'in-flight/index.html', layout({
-      title: 'In flight', path: '/in-flight/',
-      body: `<section class="hero">
+    for (let pageIdx = 0; pageIdx < totalPages; pageIdx++) {
+      const pageNum = pageIdx + 1
+      const startIdx = pageIdx * PR_PAGE_SIZE
+      const endIdx = Math.min(startIdx + PR_PAGE_SIZE, openPrs.length)
+      const pagePrs = openPrs.slice(startIdx, endIdx)
+      const cardsHtml = pagePrs.map(renderPrCard).join('')
+
+      const topPager = makePrPager(pageNum, totalPages, openPrs.length, startIdx, endIdx, true)
+      const bottomPager = makePrPager(pageNum, totalPages, openPrs.length, startIdx, endIdx, false)
+
+      const pageTitle = pageNum === 1 ? 'In flight' : `In flight (page ${pageNum})`
+      const pagePath = pageNum === 1 ? '/in-flight/' : `/in-flight/page/${pageNum}/`
+
+      const bodyHtml = `<section class="hero">
   <div class="term-box">
     <div class="term-box-hdr">
       <span class="term-box-title">PULL_REQUESTS :: CodebuffAI/freebuff [in flight]</span>
@@ -2524,11 +2573,33 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     ${prMeta.total > openPrs.length ? `<p style="margin:6px 0 0;font-size:.8rem;color:var(--term-amber)">Upstream reports ${prMeta.total} open pull requests; ${prMeta.total - openPrs.length} ${prMeta.total - openPrs.length === 1 ? 'is' : 'are'} not listed yet. The fetch came back short of the count GitHub gives, and every sync run retries it until the list is whole.</p>` : ''}
     ${prMeta.ageMin > 90 ? `<p style="margin:6px 0 0;font-size:.8rem;color:var(--term-amber)">Last successful check was ${prMeta.ageMin >= 60 ? `${Math.round(prMeta.ageMin / 60)} h` : `${prMeta.ageMin} min`} ago -- the sync has not reached GitHub since. A healthy run refreshes this list every few minutes.</p>` : ''}
     ${tagFiltersHtml}
+    ${totalPages > 1 ? `<p style="margin:8px 0 0;font-size:.76rem;color:var(--txt-subtle)">Showing <b id="pr-filter-count">${pagePrs.length}</b> of ${pagePrs.length} PRs on this page (PRs ${startIdx + 1}&ndash;${endIdx} of ${openPrs.length} total &middot; page ${pageNum} of ${totalPages}) &middot; press <kbd>n</kbd> / <kbd>p</kbd> to paginate</p>` : ''}
   </div>
 </section>
-<div class="pr-list">${cards}</div>
+${topPager}
+<div class="pr-list">${cardsHtml}</div>
+${bottomPager}
 ${inFlightScript}`
-    }))
+
+      if (pageNum === 1) {
+        await write(dist, 'in-flight/index.html', layout({
+          title: pageTitle, path: pagePath,
+          desc: `${openPrs.length} open community pull requests awaiting merge or snapshot sync in CodebuffAI/freebuff.`,
+          body: bodyHtml
+        }))
+        await write(dist, 'in-flight/page/1/index.html', layout({
+          title: pageTitle, path: '/in-flight/',
+          desc: `${openPrs.length} open community pull requests awaiting merge or snapshot sync in CodebuffAI/freebuff.`,
+          body: bodyHtml
+        }))
+      } else {
+        await write(dist, `in-flight/page/${pageNum}/index.html`, layout({
+          title: pageTitle, path: pagePath,
+          desc: `Page ${pageNum} of open community pull requests awaiting merge or snapshot sync in CodebuffAI/freebuff.`,
+          body: bodyHtml
+        }))
+      }
+    }
   }
 
   // ----- feeds: main (all changes), major+notable, models-only, releases-only

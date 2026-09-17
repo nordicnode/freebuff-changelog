@@ -2054,6 +2054,35 @@ details.more-rows[open]>summary{margin-bottom:6px}
   font-size:.74rem;
   color:var(--txt-subtle);
 }
+.pager-num{
+  font-family:monospace;
+  font-size:.74rem;
+  padding:2px 6px;
+  border-radius:2px;
+  color:var(--txt-dim);
+  text-decoration:none;
+  background:var(--code);
+  border:1px solid var(--term-border);
+  transition:all .1s ease;
+}
+a.pager-num:hover{
+  color:var(--term-cyan);
+  border-color:var(--term-cyan);
+}
+span.pager-num.active{
+  color:var(--term-cyan);
+  border-color:var(--term-cyan);
+  background:var(--cyan-tint-bg);
+  font-weight:700;
+}
+.pager-disabled{
+  color:var(--txt-subtle);
+  opacity:0.35;
+  padding:3px 8px;
+  font-size:.75rem;
+  font-family:monospace;
+  user-select:none;
+}
 .pager-timeline{
   flex-wrap:wrap;
   margin:28px 0 0;
