@@ -763,13 +763,16 @@ function storyNoteHtml (notes) {
 
 // The day's version of the same fix: a cluster's plain-English lines side by
 // side, in the order they shipped, so skimming the day cannot bury the change.
-// Rendered only when the cluster records a change to who has access.
+// Access clusters lead with the recorded transition; every other cluster groups
+// its lines under a structural handle (what we counted, never a summary claim).
 function dayLeadHtml (clusters) {
   const lead = dayStoryLead(clusters)
   if (!lead) return ''
   const items = lead.parts.map(p => `<li><a href="/day/${p.day}/#${p.anchor}">${esc(p.title)}</a>${p.text ? ` — ${esc(p.text)}` : ''}</li>`).join('')
   const rest = lead.rest > 0 ? `<li class="story-more">+${lead.rest} more in this cluster</li>` : ''
-  return `<div class="story-lead"><span class="story-lead-label">RELATED CHANGES · IN PLAIN ENGLISH</span><p><strong>${esc(lead.headline)}</strong></p><p>${lead.count} linked changes recorded on ${esc(lead.day)}:</p><ul>${items}${rest}</ul></div>`
+  const accessLine = lead.access ? `<p><strong>${esc(lead.access)}</strong></p>` : ''
+  const basisLine = lead.access ? '' : `<p>${lead.count} linked changes recorded on ${esc(lead.day)}:</p>`
+  return `<div class="story-lead"><span class="story-lead-label">RELATED CHANGES · IN PLAIN ENGLISH</span><p><strong>${esc(lead.headline)}</strong></p>${accessLine}${basisLine}<ul>${items}${rest}</ul></div>`
 }
 
 // Categories double as filter keys in the DOM, so they need a URL/attribute-safe
