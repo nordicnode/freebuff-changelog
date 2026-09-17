@@ -35,6 +35,7 @@ npm run backfill  # Run continuous sync daemon (--push)
 - **Timeline**: Daily changelog views (`/day/YYYY-MM-DD/`), releases (`/release/1.0.NNN/`), model tracker (`/models/`), and live metrics (`/stats/`).
 - **Feeds**: `/feed.xml` (all changes), `/feed-major.xml` (major only), `/feed-models.xml`, `/feed-releases.xml`, `/feed.json` (JSON Feed 1.1).
 - **Discord**: Every entry includes one-click Discord markdown copy (≤ 2,000 chars). Feeds support MonitoRSS and webhooks natively.
+- **Story context**: Same-day entries linked by specific files or identifiers can show an access-change headline and cross-note beside their plain-English explanations. Notes are derived from explicit recorded evidence at build time and included in feeds and Discord exports; they do not rewrite cached summaries. Detection is conservative and does not cover every wording or cross-day story. ELI5 prompt v4 also preserves evidence-backed eligibility changes and effective dates; existing explanations refresh through the normal enrichment budget.
 - **Keyboard Navigation**: Vim-style shortcuts (`j`/`k`, `o`, `d`, `c`, `n`/`p`, `/`, and `?` for cheat sheet).
 
 ## Configuration
@@ -47,6 +48,7 @@ Set via environment variables:
 | `LLM_API_KEY` | — | OpenAI-compatible API key |
 | `LLM_MODEL` | — | Model identifier (e.g. `gpt-4o-mini`) |
 | `LLM_API_BASE` | `https://api.openai.com/v1` | API endpoint URL |
+| `LLM_TIMEOUT_MS` | `60000` | Per-request timeout in milliseconds, including response-body reads, for summaries and ELI5. Set `300000` for slow models (5 minutes per attempt). Invalid values fall back to the default. |
 | `CHANGELOG_LLM_LIMIT` | `60` | Max commits summarized per run |
 | `CHANGELOG_ELI5` | `1` | Enable plain-English explanations |
 | `SITE_URL` | — | Base URL for RSS and sitemaps |

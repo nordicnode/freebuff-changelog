@@ -584,7 +584,9 @@ test('buildEli5Prompt: addresses you, leads with experience, stops at sentences'
   assert.match(p, /what you would notice/)
   assert.match(p, /never write "that person"/)
   assert.match(p, /NEVER use conversational preambles/)
-  assert.match(p, /Never list dates/)
+  assert.match(p, /An access change recorded in the evidence is a change/)
+  assert.match(p, /without|Never invent/)
+  assert.match(p, /Include an effective date only when the evidence supplies it/)
 })
 
 test('buildPrompt: tells the model to translate identifiers', () => {

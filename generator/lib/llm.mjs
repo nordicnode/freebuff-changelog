@@ -12,6 +12,7 @@
 //   LLM_API_BASE               default https://api.github.com (GitHub Models,
 //                              free tier; any OpenAI-compatible base works)
 //   LLM_MODEL                  default github:gpt-4o-mini
+//   LLM_TIMEOUT_MS            per-request timeout including body reads (default 60000)
 //   CHANGELOG_LLM_LIMIT        max commits summarized per run (default 60; 0 = no cap)
 //   CHANGELOG_LLM_CONCURRENCY  parallel API calls (default 5)
 //   CHANGELOG_ELI5_LIMIT       plain-English pass budget (defaults to the above)
@@ -180,6 +181,11 @@ export function shortError (err) {
 async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
   const base = env.LLM_API_BASE || 'https://api.openai.com/v1'
   const model = env.LLM_MODEL || 'gpt-4o-mini'
+  const configuredTimeout = Number(env.LLM_TIMEOUT_MS)
+  // Bound each attempt, including response-body/SSE consumption. Invalid values
+  // retain the historical timeout instead of aborting immediately or overflowing.
+  const timeoutMs = Number.isInteger(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 2147483647
+    ? configuredTimeout : 60000
   const res = await fetch(`${base.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -192,7 +198,7 @@ async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
       response_format: { type: 'json_object' },
       messages: [{ role: 'user', content: prompt }]
     }),
-    signal: AbortSignal.timeout(60000)
+    signal: AbortSignal.timeout(timeoutMs)
   })
   if (res.status === 429 && attempt <= 3) {
     // Honor Retry-After; fall back to exponential backoff.
@@ -415,7 +421,13 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
 // from the title and the summary alone repeats the summary and cannot correct it.
 // The whole backlog re-explains once through the same resumable budget
 // (CHANGELOG_ELI5_LIMIT); a diff costs ~1k tokens on top of a ~400 token ask.
-export const ELI5_V = 3
+// v4: an access change the evidence records is a change, even when the commit only
+// publishes the list that says so. "This update does not change who is eligible
+// today" shipped above a comment recording that SG and IL had left full access the
+// day before -- true of the commit, false of the story. The rule now says to carry
+// the recorded change into the line, without inventing an effective date.
+// Render-time story notes also expose explicit access evidence from related entries.
+export const ELI5_V = 4
 
 // eli5Source() lives in util.mjs because the changelog merge has to recompute it
 // to check a merged ELI5 against the summary that survived. Re-exported here as
@@ -489,6 +501,7 @@ Rules:
 - The diff and the file list are evidence, not vocabulary. Read them for the part the summary skipped: the threshold, the condition, the plan or region it applies to, the thing that stops working. Then translate that into plain words.
 - If the summary and the diff disagree about what happened, follow the diff.
 - Say whether it is live today. A constant, a flag, a field or a type that nothing reads yet is not a feature: say it is in place and does nothing yet.
+- An access change recorded in the evidence is a change, even when this commit only publishes it. If a comment, a fact or the diff says a region, a plan or a group lost or gained access, left or joined a list, or keeps something it bought, say that, with the date the evidence gives. "Who is eligible today did not change" is a false comfort when the evidence records that it changed yesterday. The nothing-reads-yet rule is for constants nobody consumes, not for access that already moved.
 - Use only what the summary, the evidence and the comments say. Never invent a cause, a number, or a promise.
 - Keep the audience the text gives, and keep it narrow. If the change is for one kind of customer, one plan, one region, or only after some step, name that group. Never widen it to "users", "everyone" or "customers" because that reads more naturally: a program for verified YC companies is not available to users.
 - Plain words, active voice. No "This change", "We are excited", marketing tone, or generic tautologies ("various bug fixes and improvements").
@@ -497,7 +510,7 @@ Rules:
 - If the change is small or internal, say so shortly. Do not inflate it.
 - Never address the reader as a developer.
 - Address the reader as "you", or name the group ("users", "subscribers"); never write "that person", "the viewer" or "that individual".
-- Stop after 2-4 sentences. Never list dates, day counts or archive calendars; end the reply there.
+- Stop after 2-4 sentences. Include an effective date only when the evidence supplies it and it clarifies the change; never recite day counts or archive calendars.
 
 Reply with JSON only: {"eli5": "..."}`
 }
