@@ -1268,33 +1268,227 @@ details.more-rows[open]>summary{margin-bottom:6px}
 }
 
 .man-body{
-  padding:6px 0;
-  font-size:.84rem;
+  padding:10px 0 6px;
+  font-size:.95rem;
+  line-height:1.65;
+}
+.man-lead{
+  font-size:.95rem;
+  color:var(--txt);
   line-height:1.6;
+  margin-bottom:12px;
 }
-.man-body h4{
-  margin:12px 0 4px;
-  color:var(--term-amber);
-  font-size:.84rem;
-  letter-spacing:.05em;
+.man-meta-line{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  margin-bottom:20px;
 }
-.man-ul{margin:0 0 12px;padding-left:18px}
-.man-ul li{margin:0 0 6px;color:var(--txt-dim)}
-.man-ul li strong{color:var(--txt)}
-/* What the project tracks is a list of surfaces, not prose: name, count, one
-   clause on what the count means. A three-column grid aligns the numbers without
-   dragging a table element into a page that is otherwise paragraphs. */
-.man-dl{display:grid;grid-template-columns:auto auto minmax(0,1fr);gap:4px 12px;margin:0 0 12px;font-size:.82rem;align-items:baseline}
-.man-dl dt{color:var(--txt);white-space:nowrap}
-.man-dl dd{margin:0;color:var(--txt-subtle);font-variant-numeric:tabular-nums;text-align:right}
-.man-dl .man-note{color:var(--txt-dim);text-align:left}
-.man-routes{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:3px 16px;margin:0 0 10px;font-size:.82rem;color:var(--txt-dim)}
-.man-routes a{color:var(--term-cyan);text-decoration:none}
-.man-routes a:hover{text-decoration:underline}
-
-.man-body p{
-  margin:0 0 10px;
+.man-tag{
+  font-size:.76rem;
+  padding:2px 8px;
+  border-radius:2px;
+  background:var(--code);
+  border:1px solid var(--term-border);
   color:var(--txt-dim);
+}
+.man-section{
+  margin-bottom:24px;
+}
+.man-section-hdr{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  margin:22px 0 12px;
+  color:var(--term-amber);
+  font-size:.95rem;
+  font-weight:700;
+  letter-spacing:.04em;
+  text-transform:uppercase;
+  border-bottom:1px solid var(--term-border);
+  padding-bottom:5px;
+}
+.man-section-hdr .term-prompt-sym{
+  color:var(--term-cyan);
+  font-weight:700;
+}
+.man-grid-3{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(250px,1fr));
+  gap:12px;
+  margin:12px 0 20px;
+}
+.man-grid-2{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(280px,1fr));
+  gap:12px;
+  margin:12px 0 20px;
+}
+.man-card{
+  background:var(--code);
+  border:1px solid var(--term-border);
+  border-radius:3px;
+  padding:12px 14px;
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}
+.man-card-title{
+  color:var(--txt);
+  font-weight:700;
+  font-size:.9rem;
+}
+.man-card p{
+  margin:0;
+  font-size:.88rem;
+  color:var(--txt-dim);
+  line-height:1.55;
+}
+/* Surfaces tracked: aligned tabular stats with badge tags */
+.man-dl{
+  display:grid;
+  grid-template-columns:auto auto minmax(0,1fr);
+  gap:8px 14px;
+  margin:12px 0 20px;
+  font-size:.88rem;
+  align-items:baseline;
+}
+.man-dl dt{
+  color:var(--txt);
+  white-space:nowrap;
+}
+.man-badge{
+  font-weight:600;
+  color:var(--txt);
+}
+.man-dl dd{
+  margin:0;
+  color:var(--term-cyan);
+  font-weight:600;
+  font-variant-numeric:tabular-nums;
+  text-align:right;
+}
+.man-dl .man-note{
+  color:var(--txt-dim);
+  text-align:left;
+  font-size:.86rem;
+  line-height:1.5;
+}
+.man-routes{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+  gap:8px;
+  margin:12px 0 10px;
+  font-size:.88rem;
+}
+.man-route-card{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding:7px 12px;
+  background:var(--code);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  color:var(--txt-dim);
+  text-decoration:none;
+  transition:all .1s ease;
+}
+.man-route-card code{
+  color:var(--term-cyan);
+  background:transparent;
+  font-weight:700;
+}
+a.man-route-card:hover{
+  border-color:var(--term-cyan);
+  color:var(--txt);
+  text-decoration:none;
+}
+.man-shortcuts-bar{
+  margin:10px 0 20px;
+  padding:6px 12px;
+  background:var(--code);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  font-size:.8rem;
+  color:var(--txt-subtle);
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.man-key{
+  color:var(--term-amber);
+  font-weight:700;
+  padding:1px 5px;
+  background:var(--panel);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+}
+.man-feeds-panel{
+  background:var(--code);
+  border:1px solid var(--term-border);
+  border-radius:3px;
+  padding:14px;
+  margin:12px 0 20px;
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+}
+.man-feed-buttons{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.man-feed-btn{
+  padding:4px 10px;
+  background:var(--panel);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  color:var(--txt);
+  font-size:.82rem;
+  text-decoration:none;
+  transition:all .1s ease;
+}
+.man-feed-btn:hover{
+  border-color:var(--term-cyan);
+  color:var(--term-cyan);
+  text-decoration:none;
+}
+.man-discord-box{
+  background:var(--panel);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  padding:10px 14px;
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}
+.man-discord-title{
+  color:var(--term-cyan);
+  font-size:.84rem;
+  font-weight:700;
+}
+.man-discord-cmd code{
+  display:block;
+  padding:6px 10px;
+  background:var(--code);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  color:var(--term-green);
+  font-size:.85rem;
+}
+.man-discord-tokens{
+  font-size:.78rem;
+  color:var(--txt-subtle);
+}
+.man-discord-tokens code{
+  color:var(--txt-dim);
+  padding:1px 4px;
+}
+.man-body p{
+  margin:0 0 12px;
+  color:var(--txt-dim);
+  font-size:.92rem;
 }
 
 .pager{

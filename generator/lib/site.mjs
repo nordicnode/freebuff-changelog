@@ -1614,45 +1614,84 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <span>${entries.length.toLocaleString()} tracked changes</span>
     </div>
     <div class="man-body">
-      <h4>WHAT IS THIS?</h4>
-        <p>A commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, rebuilt from public git diffs. Upstream ships through automated snapshot merges with blank <em>"Sync public snapshot"</em> messages, so this project diffs each snapshot against its parent and extracts what actually changed: model swaps, version bumps, new slash commands, file churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} scanned commits, re-analyzed whenever upstream moves.</p>
+      <div class="man-lead">
+        A commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, rebuilt from public git diffs. Upstream ships through automated snapshot merges with blank <em>"Sync public snapshot"</em> messages. This mirror diffs each snapshot against its parent to extract what actually changed: model swaps, version bumps, slash commands, and file churn.
+      </div>
+      <div class="man-meta-line">
+        <span class="man-tag">${entries.length.toLocaleString()} entries</span>
+        <span class="man-tag">${scannedCount.toLocaleString()} commits scanned</span>
+        <span class="man-tag">re-analyzed on git push</span>
+      </div>
 
-        <h4>HOW IT WORKS</h4>
-        <ul class="man-ul">
-          <li><strong>Deterministic first.</strong> Model tables in both READMEs and the slash-command registry are parsed before and after each commit and set-differenced, so a description-only edit cancels out; version bumps come from release <code>package.json</code>. Timestamps normalize to UTC. Zero dependencies.</li>
-          <li><strong>DeepSeek V4.1 Flash summarizes.</strong> DeepSeek V4.1 Flash rewrites each entry into a 2-4 sentence technical summary from the diff and nothing else, and a second pass writes the plain-English line under it from the same evidence. Both are cached by SHA, prompt version and diff hash, so a prompt edit re-runs exactly once. With no provider configured the deterministic text stands alone; nothing breaks.</li>
-          <li><strong>Every claim links to proof.</strong> Commit SHA, compare URL, stored diff and per-file stats on every row, with the diff loaded on demand.</li>
-        </ul>
-
-        <h4>WHAT WE TRACK</h4>
-        <dl class="man-dl">
-          <dt>Model Catalog</dt><dd>${(cats.get('Model Catalog') || 0).toLocaleString()}</dd><dd class="man-note">additions, retirements and swaps in the free picker, with access and trait columns. See the <a href="/models/">catalog timeline</a></dd>
-          <dt>Releases</dt><dd>${vers.length.toLocaleString()}</dd><dd class="man-note">CLI and core version bumps, each page listing every commit in range</dd>
-          <dt>Commands</dt><dd>${(cats.get('Commands') || 0).toLocaleString()}</dd><dd class="man-note">slash commands added or removed; renames surface as add+remove</dd>
-          <dt>Code areas</dt><dd>${areaTotal.toLocaleString()}</dd><dd class="man-note">${areaLine}</dd>
-          <dt>Significance</dt><dd></dd><dd class="man-note"><code>major</code> model or version &middot; <code>notable</code> user-visible or a new file &middot; <code>minor</code> internal &middot; <code>noise</code> lockfile-only churn, listed but hidden behind the churn chip</dd>
-          ${openPrs?.length ? `<dt>In-flight</dt><dd>${openPrs.length.toLocaleString()}</dd><dd class="man-note">open upstream PRs with diffstat and a 120-line preview, filled a budgeted batch per run</dd>` : ''}
-        </dl>
-
-        <h4>WHERE TO GO</h4>
-        <div class="man-routes">
-          <span><a href="/">/</a> the newest day</span>
-          <span><code>/day/&lt;date&gt;/</code> any single day</span>
-          <span><a href="/archive/">/archive/</a> days, releases, categories</span>
-          <span><a href="/search/">/search/</a> every entry, ever</span>
-          <span><a href="/stats/">/stats/</a> volume, churn, cadence</span>
-          ${openPrs?.length ? '<span><a href="/in-flight/">/in-flight/</a> open PRs</span>' : ''}
+      <div class="man-section-hdr"><span class="term-prompt-sym">&gt;</span> HOW IT WORKS</div>
+      <div class="man-grid-3">
+        <div class="man-card">
+          <div class="man-card-title">Deterministic first</div>
+          <p>Model tables in both READMEs and slash-command registries are set-differenced; version bumps come from release <code>package.json</code>. Timestamps normalize to UTC with zero dependencies.</p>
         </div>
-        <p>The chips above the timeline filter that day's rows; the churn chip reveals the noise. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code>, a link to that change alone which survives it moving day, and <code>discord</code> copies a paste-ready version. Press <code>/</code> anywhere to search.</p>
+        <div class="man-card">
+          <div class="man-card-title">AI summarizes the diff</div>
+          <p>An LLM generates concise technical summaries from diff evidence alone, plus plain-English takeaways. Summaries are cached by SHA, prompt version, and diff hash.</p>
+        </div>
+        <div class="man-card">
+          <div class="man-card-title">Every claim links to proof</div>
+          <p>Commit SHA, compare URL, stored diff, and per-file stats accompany every entry, with the complete diff loaded on demand.</p>
+        </div>
+      </div>
 
-        <h4>LIMITS</h4>
-        <p>Snapshots squash upstream history, so ordering inside one snapshot is approximate and authorship resolves to the bot. AI text describes only what the diff shows: no research, no speculation about capabilities.</p>
+      <div class="man-section-hdr"><span class="term-prompt-sym">&gt;</span> WHAT WE TRACK</div>
+      <dl class="man-dl">
+        <dt><span class="man-badge">Model Catalog</span></dt><dd>${(cats.get('Model Catalog') || 0).toLocaleString()}</dd><dd class="man-note">Additions, retirements, and swaps in the free picker. See the <a href="/models/">catalog timeline</a></dd>
+        <dt><span class="man-badge">Releases</span></dt><dd>${vers.length.toLocaleString()}</dd><dd class="man-note">CLI and core version bumps, each page listing every commit in range</dd>
+        <dt><span class="man-badge">Commands</span></dt><dd>${(cats.get('Commands') || 0).toLocaleString()}</dd><dd class="man-note">Slash commands added, renamed, or retired</dd>
+        <dt><span class="man-badge">Code areas</span></dt><dd>${areaTotal.toLocaleString()}</dd><dd class="man-note">${areaLine}</dd>
+        <dt><span class="man-badge">Significance</span></dt><dd></dd><dd class="man-note"><span class="badge maj">[MAJOR]</span> model/version &middot; <span class="badge not">[NOTABLE]</span> user-visible &middot; <span class="badge cat">[minor]</span> internal &middot; <span class="badge">[noise]</span> lockfile churn</dd>
+        ${openPrs?.length ? `<dt><span class="man-badge">In-flight</span></dt><dd>${openPrs.length.toLocaleString()}</dd><dd class="man-note">Open upstream PRs with diffstat and a 120-line preview, filled a budgeted batch per run</dd>` : ''}
+      </dl>
 
-        <h4>FRESHNESS</h4>
-        <p>A loop polls upstream every 30 seconds, re-analyzes, and pushes the data, so a commit is readable here about 2 minutes after it lands in the public repo. Upstream's own snapshot squash usually delays a change longer than our whole pipeline does. An hourly GitHub Action covers the loop being down.</p>
+      <div class="man-section-hdr"><span class="term-prompt-sym">&gt;</span> WHERE TO GO</div>
+      <div class="man-routes">
+        <a class="man-route-card" href="/"><code>/</code> <span>the newest day</span></a>
+        <span class="man-route-card"><code>/day/&lt;date&gt;/</code> <span>any single day</span></span>
+        <a class="man-route-card" href="/archive/"><code>/archive/</code> <span>days, releases, categories</span></a>
+        <a class="man-route-card" href="/search/"><code>/search/</code> <span>every entry, ever</span></a>
+        <a class="man-route-card" href="/stats/"><code>/stats/</code> <span>volume, churn, cadence</span></a>
+        ${openPrs?.length ? '<a class="man-route-card" href="/in-flight/"><code>/in-flight/</code> <span>open PRs</span></a>' : ''}
+      </div>
+      <div class="man-shortcuts-bar">
+        <span>Timeline filters: select categories or reveal churn.</span>
+        <span><span class="man-key">#</span> links to entry alone.</span>
+        <span><span class="man-key">discord</span> copies paste-ready block.</span>
+        <span>Press <span class="man-key">/</span> to search.</span>
+      </div>
 
-        <h4>FEEDS + DISCORD</h4>
-        <p><a href="/feed.xml">RSS all changes</a> &middot; <a href="/feed-major.xml">major + notable</a> &middot; <a href="/feed-models.xml">models only</a> &middot; <a href="/feed-releases.xml">releases only</a> &middot; <a href="/feed.json">JSON</a>. For Discord bots (MonitoRSS, RSS Bot), run <code>/feed add &lt;url&gt;</code> with <code>{title}</code>, <code>{description}</code>, <code>{author}</code>. See README for bot setup. Generator: <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener">GitHub</a>; Cloudflare deploys on push.</p>
+      <div class="man-section-hdr"><span class="term-prompt-sym">&gt;</span> FEEDS + DISCORD</div>
+      <div class="man-feeds-panel">
+        <div class="man-feed-buttons">
+          <a href="/feed.xml" class="man-feed-btn">[all changes]</a>
+          <a href="/feed-major.xml" class="man-feed-btn">[major + notable]</a>
+          <a href="/feed-models.xml" class="man-feed-btn">[models only]</a>
+          <a href="/feed-releases.xml" class="man-feed-btn">[releases only]</a>
+          <a href="/feed.json" class="man-feed-btn">[json]</a>
+        </div>
+        <div class="man-discord-box">
+          <div class="man-discord-title">Discord Bot Setup (MonitoRSS, RSS Bot)</div>
+          <div class="man-discord-cmd"><code>/feed add &lt;feed-url&gt;</code></div>
+          <div class="man-discord-tokens">Supported message tokens: <code>{title}</code> &middot; <code>{description}</code> &middot; <code>{author}</code> &middot; Generator on <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener">GitHub</a></div>
+        </div>
+      </div>
+
+      <div class="man-section-hdr"><span class="term-prompt-sym">&gt;</span> LIMITS &amp; FRESHNESS</div>
+      <div class="man-grid-2">
+        <div class="man-card">
+          <div class="man-card-title">LIMITS</div>
+          <p>Snapshots squash upstream history, so ordering inside one snapshot is approximate and authorship resolves to the bot. AI text describes only what the diff shows: no external speculation.</p>
+        </div>
+        <div class="man-card">
+          <div class="man-card-title">FRESHNESS</div>
+          <p>A loop polls upstream every 30 seconds, re-analyzes, and pushes data within ~2 minutes of landing. An hourly GitHub Action covers the loop being down.</p>
+        </div>
+      </div>
     </div>
   </div>
 </section>`
