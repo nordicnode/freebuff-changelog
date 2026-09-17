@@ -1073,7 +1073,18 @@ test('in-flight page renders review badges and comment activity', async (t) => {
     }]
   }
   const prs = [
-    { number: 101, title: 'Approved PR', author: 'alice', created: '2026-09-01T00:00:00Z', reviewState: 'APPROVED', comments: 4, reviewComments: 2 },
+    {
+      number: 101, title: 'Approved PR', author: 'alice', created: '2026-09-01T00:00:00Z',
+      reviewState: 'APPROVED', comments: 4, reviewComments: 2,
+      labels: [{ name: 'enhancement', color: 'a2eeef' }, { name: 'cli', color: '1d76db' }],
+      commitsList: [
+        { sha: 'abcdef1234', message: 'feat: add awesome feature', author: 'alice', date: '2026-09-01', url: 'https://github.com/CodebuffAI/freebuff/commit/abcdef1234' }
+      ],
+      commentsList: [
+        { id: 1, author: 'reviewer1', body: 'Looks great to me!', created: '2026-09-01 12:00', url: 'https://github.com/CodebuffAI/freebuff/pull/101#issuecomment-1', isReview: false },
+        { id: 2, author: 'reviewer2', body: 'Please verify error handling', created: '2026-09-01 13:00', url: 'https://github.com/CodebuffAI/freebuff/pull/101#discussion_r1', isReview: true, path: 'src/cli.ts', line: 42 }
+      ]
+    },
     { number: 102, title: 'Changes Requested PR', author: 'bob', created: '2026-09-02T00:00:00Z', reviewState: 'CHANGES_REQUESTED', comments: 1, reviewComments: 0 },
     { number: 103, title: 'In Review PR', author: 'carol', created: '2026-09-03T00:00:00Z', reviewState: 'COMMENTED', comments: 0, reviewComments: 5 }
   ]
@@ -1084,6 +1095,15 @@ test('in-flight page renders review badges and comment activity', async (t) => {
   assert.match(html, /4 comments &middot; 2 reviews/)
   assert.match(html, /1 comment/)
   assert.match(html, /5 reviews/)
+  assert.match(html, /\[enhancement\]/)
+  assert.match(html, /\[cli\]/)
+  assert.match(html, /feat: add awesome feature/)
+  assert.match(html, /abcdef1234/)
+  assert.match(html, /@reviewer1/)
+  assert.match(html, /Looks great to me!/)
+  assert.match(html, /\[review: src\/cli\.ts:42\]/)
+  assert.match(html, /Please verify error handling/)
+  assert.match(html, /FILTER TAG:/)
   assert.doesNotMatch(html, /[\u{1F300}-\u{1FAFF}]/u, 'no emojis on in-flight page')
 })
 
@@ -1139,4 +1159,14 @@ test('models page includes interactive lineup matrix and date scrubber', async (
   assert.match(modelsHtml, /data-filter="all"/)
   assert.match(modelsHtml, /data-filter="live"/)
   assert.match(modelsHtml, /data-filter="retired"/)
+  assert.doesNotMatch(modelsHtml, /id="matrix-active-list"/, 'no duplicate matrix active list')
+  assert.doesNotMatch(modelsHtml, /class="model-grid"/, 'no duplicate model grid in hero')
+
+  // Verify shortcuts button deduplication across site
+  const footerKbMatches = (modelsHtml.match(/data-kb-modal/g) || []).length
+  // 1 in footer shortcuts button, 1 in about page text if present, 1 in modal listener / dialog close
+  assert.doesNotMatch(modelsHtml, /class="footer-links"[^>]*>[\s\S]*?\[shortcuts/, 'no duplicate shortcuts in footer-links')
+  assert.doesNotMatch(modelsHtml, /class="timeline-bulk-toggle"[^>]*>[\s\S]*?\[shortcuts/, 'no duplicate shortcuts in timeline-bulk-toggle')
+  assert.match(modelsHtml, /<div class="footer-shortcuts">[\s\S]*?<button[^>]*data-kb-modal[^>]*>\[\?\]<\/button>/, 'footer has single dedicated shortcuts [?] button')
 })
+

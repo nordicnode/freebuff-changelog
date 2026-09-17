@@ -159,6 +159,9 @@ export function mergeOpenPrs (ours, theirs) {
         if (merged[k] == null) merged[k] = v
         continue
       }
+      if (Array.isArray(v) && v.length === 0 && Array.isArray(prev[k]) && prev[k].length > 0) {
+        continue
+      }
       merged[k] = v
     }
     byNum.set(p.number, merged)

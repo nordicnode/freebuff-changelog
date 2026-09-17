@@ -74,7 +74,6 @@ ${body}
     <div class="footer-links">
       <a href="/about/">[about]</a>
       <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">[github]</a>
-      <button type="button" data-kb-modal title="Keyboard shortcuts (press ?)">[shortcuts: ?]</button>
     </div>
   </div>
   <div class="footer-row footer-sub">
@@ -1047,6 +1046,17 @@ export function modelTimeline (modelEntries) {
   return { chrono: chrono.reverse(), live: [...live].sort(), retired: [...retired].sort() }
 }
 
+export function formatCommentHtml (text) {
+  if (!text) return ''
+  const clean = text.replace(/[\u{1F300}-\u{1FAFF}]/gu, '')
+  const escaped = esc(clean)
+  const withCodeBlocks = escaped.replace(/```([a-z0-9_-]*)\n([\s\S]*?)```/g, (_, lang, code) =>
+    `<pre class="pr-code-block"><code>${code}</code></pre>`
+  )
+  const withInlineCode = withCodeBlocks.replace(/`([^`\n]+)`/g, '<code>$1</code>')
+  const parts = withInlineCode.split(/(<pre[\s\S]*?<\/pre>)/g)
+  return parts.map((part, i) => i % 2 === 1 ? part : part.replace(/\n\n+/g, '<br><br>').replace(/\n/g, '<br>')).join('')
+}
 
 async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, '')}/${p}`, html) }
 
@@ -1169,7 +1179,6 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
     <div class="timeline-bulk-toggle">
       <button type="button" class="timeline-bulk-btn" data-bulk="expand">[expand all]</button>
       <button type="button" class="timeline-bulk-btn" data-bulk="collapse">[collapse all]</button>
-      <button type="button" class="timeline-bulk-btn" data-kb-modal title="Keyboard shortcuts (press ?)">[shortcuts: ?]</button>
     </div>
   </div>`
 
@@ -1525,8 +1534,9 @@ ${rows.map(e => {
     return `<div class="matrix-row model-timeline-item" data-model="${esc(d.model.toLowerCase())}" data-status="${d.isLive ? 'live' : 'retired'}">
       <div class="mt-item-hdr">
         <div class="mt-item-title-wrap">
-          <a class="mt-model-name" href="/models/${modelSlug(d.model)}/">${esc(d.model)}</a>
-          <span class="mc-tag ${d.isLive ? 'live' : 'out'}">${d.isLive ? 'LIVE' : 'OUT'}</span>
+          <a href="/models/${modelSlug(d.model)}/" class="mt-model-name">${esc(d.model)}</a>
+          <span class="mt-status-badge ${d.isLive ? 'live' : 'out'}">${d.isLive ? 'LIVE' : 'OUT'}</span>
+          <span class="mt-date-indicator">ACTIVE AT DATE</span>
         </div>
         <div class="mt-item-meta">
           <span class="mt-lifespan">${d.lifespanText}</span>
@@ -1541,27 +1551,6 @@ ${rows.map(e => {
     </div>`
   }).join('')
 
-  const matrixHtml = `<div class="model-matrix-wrap">
-    <div class="matrix-scrubber-box">
-      <div class="matrix-scrubber-hdr">
-        <div><strong>CATALOG DATE SCRUBBER:</strong> <span id="matrix-selected-date" class="matrix-date-display">${dateSnapshots.at(-1)?.date || ''}</span></div>
-        <div id="matrix-active-count" class="matrix-active-count">${modelLive.length} models active</div>
-      </div>
-      <input type="range" id="matrix-slider" class="matrix-slider" min="0" max="${Math.max(0, dateSnapshots.length - 1)}" value="${Math.max(0, dateSnapshots.length - 1)}">
-      <div id="matrix-selected-event" class="matrix-selected-event"></div>
-      <div id="matrix-active-list" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">${modelLive.map(m => `<span class="model-card live"><span class="mc-tag">LIVE</span>${esc(m)}</span>`).join('')}</div>
-    </div>
-    <div class="model-matrix-filters">
-      <span style="font-size:.75rem;color:var(--txt-subtle);align-self:center;margin-right:4px">FILTER:</span>
-      <button type="button" class="model-filter-btn active" data-filter="all">[All (${allModels.length})]</button>
-      <button type="button" class="model-filter-btn" data-filter="live">[Active Now (${modelLive.length})]</button>
-      <button type="button" class="model-filter-btn" data-filter="retired">[Retired (${modelRetired.length})]</button>
-    </div>
-    <div class="model-matrix-table">
-      ${matrixRows}
-    </div>
-  </div>`
-
   await write(dist, 'models/index.html', layout({
     title: 'Models', path: '/models/',
     desc: `Free model catalog history: ${modelLive.length} live, ${modelRetired.length} retired across ${modelChrono.length} changes.`,
@@ -1569,45 +1558,53 @@ ${rows.map(e => {
   <div class="term-box">
     <div class="term-box-hdr">
       <span class="term-box-title">Free model catalog</span>
-      <span>${modelLive.length} live &middot; ${modelRetired.length} retired</span>
+      <span>${modelLive.length} live &middot; ${modelRetired.length} retired &middot; ${allModels.length} all-time</span>
     </div>
-    <p class="models-intro">Every model that has been free in the Freebuff picker, oldest first. Click a name for its full history. Rows below read <span class="modelminus">&minus;out</span> <span class="swap-arrow">&rarr;</span> <span class="modelplus">+in</span>.</p>
+    <p class="models-intro">Every model that has been free in the Freebuff picker, oldest first. Click a model name for its dedicated changelog and history. Scrub the date slider to inspect active models over time, or search and filter below.</p>
     <div class="model-search-row">
-      <span class="model-search-prompt">$ grep model</span>
-      <input type="search" id="model-filter" class="model-search-input" placeholder="filter by name: claude, deepseek, gpt…" autocomplete="off">
+      <div class="model-search-group">
+        <span class="model-search-prompt">$ grep model</span>
+        <input type="search" id="model-filter" class="model-search-input" placeholder="filter by name: claude, deepseek, gpt…" autocomplete="off">
+      </div>
+      <div class="model-matrix-filters">
+        <span class="model-filter-label">FILTER:</span>
+        <button type="button" class="model-filter-btn active" data-filter="all">[All (${allModels.length})]</button>
+        <button type="button" class="model-filter-btn" data-filter="live">[Active Now (${modelLive.length})]</button>
+        <button type="button" class="model-filter-btn" data-filter="retired">[Retired (${modelRetired.length})]</button>
+      </div>
     </div>
-    <div class="model-grid">${modelLive.map(m => modelCard(m, 'live', 'LIVE')).join('')}</div>
-    ${modelRetired.length ? `<details class="model-retired"><summary class="model-retired-toggle">RETIRED (${modelRetired.length})</summary><div class="model-grid" style="margin-top:8px">${modelRetired.map(m => modelCard(m, 'out', 'OUT')).join('')}</div></details>` : ''}
-    <p style="margin:12px 0 0;font-size:.78rem;color:var(--txt-dim)">SUBSCRIBE: <a href="/feed-models.xml">[models rss]</a> &middot; <a href="/feed.xml">[all changes]</a></p>
+    <div class="matrix-scrubber-box">
+      <div class="matrix-scrubber-hdr">
+        <div><strong>CATALOG DATE SCRUBBER:</strong> <span id="matrix-selected-date" class="matrix-date-display">${dateSnapshots.at(-1)?.date || ''}</span></div>
+        <div id="matrix-active-count" class="matrix-active-count">${modelLive.length} models active</div>
+      </div>
+      <input type="range" id="matrix-slider" class="matrix-slider" min="0" max="${Math.max(0, dateSnapshots.length - 1)}" value="${Math.max(0, dateSnapshots.length - 1)}">
+      <div id="matrix-selected-event" class="matrix-selected-event"></div>
+    </div>
+    <p style="margin:10px 0 0;font-size:.78rem;color:var(--txt-dim)">SUBSCRIBE: <a href="/feed-models.xml">[models rss]</a> &middot; <a href="/feed.xml">[all changes]</a></p>
   </div>
 </section>
-${matrixHtml}
-<div class="section-hdr">
-  <h2>CATALOG HISTORY (${modelChrono.length} CHANGES)</h2>
+<div class="model-matrix-wrap">
+  <div class="model-matrix-table">
+    ${matrixRows}
+  </div>
 </div>
-<div class="model-history">${modelRows}</div>
+<details class="more-rows">
+  <summary>[ View chronological transition stream (${modelChrono.length} changes) ]</summary>
+  <div class="section-hdr" style="margin-top:12px">
+    <h2>CATALOG HISTORY (${modelChrono.length} CHANGES)</h2>
+  </div>
+  <div class="model-history">${modelRows}</div>
+</details>
 <script>
 (function(){
   var mf = document.getElementById('model-filter');
-  var cards = document.querySelectorAll('.model-card');
-  var rows = document.querySelectorAll('.model-row');
-  var matrixRows = document.querySelectorAll('.matrix-row');
-  var retiredDetails = document.querySelector('.model-retired');
+  var matrixRows = document.querySelectorAll('.model-timeline-item');
+  var historyRows = document.querySelectorAll('.model-row');
   var currentFilter = 'all';
 
   function applyFilters() {
     var q = mf ? mf.value.trim().toLowerCase() : '';
-    cards.forEach(function(c){
-      var text = c.textContent.toLowerCase();
-      var isOut = c.classList.contains('out');
-      var statusMatch = currentFilter === 'all' || (currentFilter === 'live' && !isOut) || (currentFilter === 'retired' && isOut);
-      var textMatch = !q || text.includes(q);
-      c.style.display = (statusMatch && textMatch) ? '' : 'none';
-    });
-    rows.forEach(function(r){
-      var match = !q || r.textContent.toLowerCase().includes(q);
-      r.style.display = match ? '' : 'none';
-    });
     matrixRows.forEach(function(mr){
       var model = mr.dataset.model || '';
       var status = mr.dataset.status || '';
@@ -1615,9 +1612,10 @@ ${matrixHtml}
       var textMatch = !q || model.includes(q);
       mr.style.display = (statusMatch && textMatch) ? '' : 'none';
     });
-    if ((q || currentFilter === 'retired') && retiredDetails) {
-      retiredDetails.open = true;
-    }
+    historyRows.forEach(function(r){
+      var match = !q || r.textContent.toLowerCase().includes(q);
+      r.style.display = match ? '' : 'none';
+    });
   }
 
   if (mf) mf.addEventListener('input', applyFilters);
@@ -1643,7 +1641,6 @@ ${matrixHtml}
   var dateDisplay = document.getElementById('matrix-selected-date');
   var countDisplay = document.getElementById('matrix-active-count');
   var eventDisplay = document.getElementById('matrix-selected-event');
-  var activeList = document.getElementById('matrix-active-list');
 
   function updateScrubber(idx) {
     var snap = snapshots[idx];
@@ -1657,17 +1654,14 @@ ${matrixHtml}
       var diffStr = diffs.length ? ' (' + diffs.join(' ') + ')' : '';
       eventDisplay.innerHTML = '<span style="color:var(--txt-subtle)">EVENT:</span> <a href="/day/' + snap.date + '/#' + snap.sha + '">' + (snap.title || snap.date) + '</a>' + diffStr;
     }
-    if (activeList) {
-      activeList.innerHTML = snap.active.map(function(m){
-        return '<span class="model-card live"><span class="mc-tag">LIVE</span>' + m + '</span>';
-      }).join('');
-    }
     matrixRows.forEach(function(mr){
       var modelName = mr.querySelector('.mt-model-name')?.textContent?.trim() || '';
       if (snap.active.includes(modelName)) {
         mr.classList.add('active-at-date');
+        mr.classList.remove('inactive-at-date');
       } else {
         mr.classList.remove('active-at-date');
+        mr.classList.add('inactive-at-date');
       }
     });
   }
@@ -2296,6 +2290,15 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
 
   // ----- open PRs page (community activity ahead of merges, with diff previews)
   if (openPrs?.length) {
+    const allTags = [...new Set(openPrs.flatMap(p => (p.labels || []).map(l => typeof l === 'string' ? l : l.name)))].sort()
+    const tagFiltersHtml = allTags.length > 0
+      ? `<div class="pr-tag-filters" style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
+        <span style="font-size:.75rem;color:var(--txt-subtle);align-self:center;margin-right:4px">FILTER TAG:</span>
+        <button type="button" class="pr-tag-btn active" data-tag="all">[All (${openPrs.length})]</button>
+        ${allTags.slice(0, 15).map(t => `<button type="button" class="pr-tag-btn" data-tag="${esc(t.toLowerCase())}">[${esc(t)}]</button>`).join('')}
+      </div>`
+      : ''
+
     const cards = openPrs.map(p => {
       const stats = (p.additions != null && p.deletions != null)
         ? `<span class="diffstat"><b>+${p.additions}</b> / <i>−${p.deletions}</i></span>${p.files != null ? `<span style="font-size:.72rem;color:var(--txt-subtle)">${p.files} file${p.files === 1 ? '' : 's'}</span>` : ''}`
@@ -2325,11 +2328,83 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       const activity = actParts.length > 0
         ? `<span>&middot;</span><span class="pr-activity">${actParts.join(' &middot; ')}</span>`
         : ''
-      return `<article class="pr-card">
+
+      const labels = p.labels || []
+      const labelTags = labels.map(l => {
+        const name = typeof l === 'string' ? l : l.name
+        const color = (typeof l === 'object' && l.color) ? l.color : '6e7681'
+        return `<span class="pr-tag" data-tag="${esc(name.toLowerCase())}" style="border-color:#${esc(color)}">[${esc(name)}]</span>`
+      }).join(' ')
+      const tagsHtml = labels.length ? `<div class="pr-labels">${labelTags}</div>` : ''
+
+      const commits = p.commitsList || []
+      const commitsHtml = commits.length
+        ? `<details class="pr-section pr-commits-section">
+<summary class="pr-section-toggle">
+  <span class="diff-arrow">&gt;</span>
+  <span>Commits (${commits.length})</span>
+</summary>
+<div class="pr-section-body pr-commits-list">
+  ${commits.map(c => `
+    <div class="pr-commit-row">
+      <a href="${esc(c.url)}" target="_blank" rel="noopener" class="pr-commit-sha"><code>${esc(c.sha)}</code></a>
+      <span class="pr-commit-msg">${esc(c.message)}</span>
+      <span class="pr-commit-meta">&middot; ${esc(c.author)} &middot; ${esc(c.date)}</span>
+    </div>
+  `).join('')}
+</div>
+</details>`
+        : `<details class="pr-section pr-commits-section dynamic-load" data-pr="${p.number}" data-type="commits">
+<summary class="pr-section-toggle">
+  <span class="diff-arrow">&gt;</span>
+  <span>View commits</span>
+</summary>
+<div class="pr-section-body pr-commits-list">
+  <span class="diff-loading">Loading commits from GitHub&hellip;</span>
+</div>
+</details>`
+
+      const comments = p.commentsList || []
+      const totalCommentsCount = (p.comments || 0) + (p.reviewComments || 0)
+      const commentsHtml = comments.length
+        ? `<details class="pr-section pr-comments-section">
+<summary class="pr-section-toggle">
+  <span class="diff-arrow">&gt;</span>
+  <span>Comments (${comments.length})</span>
+</summary>
+<div class="pr-section-body pr-comments-list">
+  ${comments.map(c => `
+    <div class="pr-comment-row ${c.isReview ? 'is-review' : ''}">
+      <div class="pr-comment-hdr">
+        <span class="pr-comment-author">@${esc(c.author)}</span>
+        ${c.isReview ? `<span class="pr-comment-badge">[review${c.path ? `: ${esc(c.path)}` : ''}${c.line ? `:${c.line}` : ''}]</span>` : ''}
+        <a href="${esc(c.url)}" target="_blank" rel="noopener" class="pr-comment-time">${esc(c.created)}</a>
+      </div>
+      <div class="pr-comment-body">${formatCommentHtml(c.body)}</div>
+    </div>
+  `).join('')}
+</div>
+</details>`
+        : (totalCommentsCount > 0
+          ? `<details class="pr-section pr-comments-section dynamic-load" data-pr="${p.number}" data-type="comments">
+<summary class="pr-section-toggle">
+  <span class="diff-arrow">&gt;</span>
+  <span>Comments (${totalCommentsCount})</span>
+</summary>
+<div class="pr-section-body pr-comments-list">
+  <span class="diff-loading">Loading comments from GitHub&hellip;</span>
+</div>
+</details>`
+          : '')
+
+      const tagDataStr = labels.map(l => (typeof l === 'string' ? l : l.name).toLowerCase()).join(',')
+
+      return `<article class="pr-card" data-tags="${esc(tagDataStr)}">
   <div class="pr-card-header">
-    <div style="display:flex;align-items:center;gap:6px">
+    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
       <span class="pr-status ${p.draft ? 'draft' : 'open'}">[${p.draft ? 'DRAFT' : 'OPEN PR'}]</span>
       ${reviewBadge}
+      ${tagsHtml}
     </div>
     <a href="${esc(p.url)}" target="_blank" rel="noopener">#${p.number}</a>
   </div>
@@ -2343,8 +2418,86 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     ${p.draft ? '<span>&middot;</span><span style="color:var(--txt-subtle)">draft</span>' : ''}
   </div>
   ${preview}
+  ${commitsHtml}
+  ${commentsHtml}
 </article>`
     }).join('')
+
+    const inFlightScript = `<script>
+(function(){
+  document.querySelectorAll('.pr-tag-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      document.querySelectorAll('.pr-tag-btn').forEach(function(b){ b.classList.remove('active'); });
+      btn.classList.add('active');
+      var filterTag = btn.dataset.tag || 'all';
+      document.querySelectorAll('.pr-card').forEach(function(card){
+        if (filterTag === 'all') {
+          card.style.display = '';
+        } else {
+          var cardTags = card.dataset.tags ? card.dataset.tags.split(',') : [];
+          card.style.display = cardTags.includes(filterTag) ? '' : 'none';
+        }
+      });
+    });
+  });
+
+  document.addEventListener('toggle', async function (ev) {
+    var el = ev.target;
+    if (!el.classList.contains('dynamic-load') || !el.open || el.dataset.loaded) return;
+    var prNum = el.dataset.pr;
+    var type = el.dataset.type;
+    var body = el.querySelector('.pr-section-body');
+    if (!prNum || !type || !body) return;
+    
+    try {
+      if (type === 'commits') {
+        var res = await fetch('https://api.github.com/repos/CodebuffAI/freebuff/pulls/' + prNum + '/commits');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        var commits = await res.json();
+        if (!Array.isArray(commits) || !commits.length) {
+          body.innerHTML = '<span style="color:var(--txt-subtle);font-size:.78rem">No commits found.</span>';
+        } else {
+          body.innerHTML = commits.map(function(c){
+            var sha = (c.sha || '').slice(0, 10);
+            var msg = (c.commit && c.commit.message ? c.commit.message.split('\\n')[0] : '').replace(/[\\u{1F300}-\\u{1FAFF}]/gu, '');
+            var author = (c.commit && c.commit.author ? c.commit.author.name : '') || (c.author ? c.author.login : '') || 'contributor';
+            var date = (c.commit && c.commit.author && c.commit.author.date ? c.commit.author.date.slice(0, 10) : '');
+            var url = c.html_url || ('https://github.com/CodebuffAI/freebuff/commit/' + c.sha);
+            return '<div class="pr-commit-row">' +
+              '<a href="' + url + '" target="_blank" rel="noopener" class="pr-commit-sha"><code>' + sha + '</code></a> ' +
+              '<span class="pr-commit-msg">' + msg + '</span> ' +
+              '<span class="pr-commit-meta">&middot; ' + author + ' &middot; ' + date + '</span>' +
+            '</div>';
+          }).join('');
+        }
+        el.dataset.loaded = '1';
+      } else if (type === 'comments') {
+        var issueRes = await fetch('https://api.github.com/repos/CodebuffAI/freebuff/issues/' + prNum + '/comments');
+        var comments = issueRes.ok ? await issueRes.json() : [];
+        if (!Array.isArray(comments) || !comments.length) {
+          body.innerHTML = '<span style="color:var(--txt-subtle);font-size:.78rem">No discussion comments found. <a href="https://github.com/CodebuffAI/freebuff/pull/' + prNum + '" target="_blank" rel="noopener">View on GitHub &rarr;</a></span>';
+        } else {
+          body.innerHTML = comments.map(function(c){
+            var author = (c.user && c.user.login) ? c.user.login : 'user';
+            var date = (c.created_at || '').slice(0, 16).replace('T', ' ');
+            var text = (c.body || '').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/[\\u{1F300}-\\u{1FAFF}]/gu, '');
+            return '<div class="pr-comment-row">' +
+              '<div class="pr-comment-hdr">' +
+                '<span class="pr-comment-author">@' + author + '</span>' +
+                '<a href="' + (c.html_url || '') + '" target="_blank" rel="noopener" class="pr-comment-time">' + date + '</a>' +
+              '</div>' +
+              '<div class="pr-comment-body">' + text.replace(/\\n/g, '<br>') + '</div>' +
+            '</div>';
+          }).join('');
+        }
+        el.dataset.loaded = '1';
+      }
+    } catch (err) {
+      body.innerHTML = '<span style="color:var(--txt-subtle);font-size:.78rem">Could not load live from GitHub. <a href="https://github.com/CodebuffAI/freebuff/pull/' + prNum + '" target="_blank" rel="noopener">View on GitHub &rarr;</a></span>';
+    }
+  }, true);
+})();
+</script>`
 
     await write(dist, 'in-flight/index.html', layout({
       title: 'In flight', path: '/in-flight/',
@@ -2359,9 +2512,11 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     </p>
     ${prMeta.total > openPrs.length ? `<p style="margin:6px 0 0;font-size:.8rem;color:var(--term-amber)">Upstream reports ${prMeta.total} open pull requests; ${prMeta.total - openPrs.length} ${prMeta.total - openPrs.length === 1 ? 'is' : 'are'} not listed yet. The fetch came back short of the count GitHub gives, and every sync run retries it until the list is whole.</p>` : ''}
     ${prMeta.ageMin > 90 ? `<p style="margin:6px 0 0;font-size:.8rem;color:var(--term-amber)">Last successful check was ${prMeta.ageMin >= 60 ? `${Math.round(prMeta.ageMin / 60)} h` : `${prMeta.ageMin} min`} ago -- the sync has not reached GitHub since. A healthy run refreshes this list every few minutes.</p>` : ''}
+    ${tagFiltersHtml}
   </div>
 </section>
-<div class="pr-list">${cards}</div>`
+<div class="pr-list">${cards}</div>
+${inFlightScript}`
     }))
   }
 

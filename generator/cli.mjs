@@ -182,7 +182,12 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
         created: p.created_at, updated: p.updated_at, draft: p.draft,
         comments: p.comments ?? 0,
         reviewComments: p.review_comments ?? 0,
-        additions: p.additions, deletions: p.deletions, files: p.changed_files
+        additions: p.additions, deletions: p.deletions, files: p.changed_files,
+        labels: (p.labels || []).map(l => ({
+          name: typeof l === 'string' ? l : l.name,
+          color: (typeof l === 'object' && l.color) ? l.color : '6e7681',
+          description: (typeof l === 'object' && l.description) ? l.description : ''
+        }))
       })))
       // The next link, not the page length, decides whether there is more to come.
       const next = nextUrl(res)
@@ -196,7 +201,7 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
     if (url && !stoppedEarly) {
       // Only say this when the walk actually ran out of pages: after a `break`
       // on a failed request `url` is still set, and blaming the page cap for a
-        // 403 sent me chasing a paging bug that did not exist.
+      // 403 sent me chasing a paging bug that did not exist.
       log(`open PR list hit the ${PR_MAX_PAGES}-page cap with more pages to go: reporting ${prs.length}`)
       stoppedEarly = true
     }
@@ -234,6 +239,9 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
       p.reviewComments = prev.reviewComments ?? p.reviewComments
       if (p.reviewState == null && prev.reviewState != null) p.reviewState = prev.reviewState
       if (!p.hasDiff && prev.hasDiff) p.hasDiff = true
+      if ((!p.labels || p.labels.length === 0) && prev.labels?.length) p.labels = prev.labels
+      if (!p.commitsList && prev.commitsList) p.commitsList = prev.commitsList
+      if (!p.commentsList && prev.commentsList) p.commentsList = prev.commentsList
     }
     // The list endpoint omits additions/deletions/changed_files entirely, so
     // every extra number on a card costs a call: budget them, and stop asking
@@ -279,6 +287,55 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
         p.comments = full.comments ?? p.comments
         p.reviewComments = full.review_comments ?? p.reviewComments
       }
+    }), 4)
+    // Decorate individual commits on PRs
+    await pool(list.filter(p => p.commitsList == null && used < PR_CALL_BUDGET).slice(0, 40).map(p => async () => {
+      const commits = await ghGet(`/repos/CodebuffAI/freebuff/pulls/${p.number}/commits`)
+      if (Array.isArray(commits)) {
+        p.commitsList = commits.map(c => ({
+          sha: (c.sha || '').slice(0, 10),
+          message: (c.commit?.message || '').split('\n')[0],
+          author: c.commit?.author?.name || c.author?.login || 'contributor',
+          date: (c.commit?.author?.date || '').slice(0, 10),
+          url: c.html_url || `https://github.com/CodebuffAI/freebuff/commit/${c.sha}`
+        }))
+      }
+    }), 4)
+    // Decorate PR discussion & review comments
+    await pool(list.filter(p => ((p.comments || 0) + (p.reviewComments || 0)) > 0 && p.commentsList == null && used < PR_CALL_BUDGET).slice(0, 40).map(p => async () => {
+      const [issueComments, reviewComments] = await Promise.all([
+        ghGet(`/repos/CodebuffAI/freebuff/issues/${p.number}/comments`),
+        (p.reviewComments > 0) ? ghGet(`/repos/CodebuffAI/freebuff/pulls/${p.number}/comments`) : null
+      ])
+      const cList = []
+      if (Array.isArray(issueComments)) {
+        for (const c of issueComments) {
+          cList.push({
+            id: c.id,
+            author: c.user?.login || 'user',
+            body: c.body || '',
+            created: (c.created_at || '').slice(0, 16).replace('T', ' '),
+            url: c.html_url || p.url,
+            isReview: false
+          })
+        }
+      }
+      if (Array.isArray(reviewComments)) {
+        for (const rc of reviewComments) {
+          cList.push({
+            id: rc.id,
+            author: rc.user?.login || 'reviewer',
+            body: rc.body || '',
+            created: (rc.created_at || '').slice(0, 16).replace('T', ' '),
+            url: rc.html_url || p.url,
+            isReview: true,
+            path: rc.path || '',
+            line: rc.line || null
+          })
+        }
+      }
+      cList.sort((a, b) => a.created.localeCompare(b.created))
+      p.commentsList = cList
     }), 4)
     // Optional review state decoration (when explicitly requested, e.g. CHANGELOG_PR_REVIEWS=1)
     if (process.env.CHANGELOG_PR_REVIEWS === '1') {
