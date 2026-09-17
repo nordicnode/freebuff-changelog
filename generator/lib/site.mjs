@@ -39,7 +39,8 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
 <meta property="og:image" content="${abs(ogImage || '/favicon.svg')}">
 <meta name="twitter:card" content="summary_large_image">
 <meta property="og:type" content="website"><meta property="og:url" content="${abs(path)}">
-<link rel="alternate" type="application/rss+xml" title="${SITE.name} (major + notable)" href="${SITE.url}/feed.xml">
+<link rel="alternate" type="application/rss+xml" title="${SITE.name} (all changes)" href="${SITE.url}/feed.xml">
+<link rel="alternate" type="application/rss+xml" title="${SITE.name} (major + notable)" href="${SITE.url}/feed-major.xml">
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (models only)" href="${SITE.url}/feed-models.xml">
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (releases only)" href="${SITE.url}/feed-releases.xml">
 <link rel="alternate" type="application/feed+json" title="${SITE.name} (JSON)" href="${SITE.url}/feed.json">
@@ -1625,7 +1626,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         <p>A loop polls upstream every 30 seconds, re-analyzes, and pushes the data, so a commit is readable here about 2 minutes after it lands in the public repo. Upstream's own snapshot squash usually delays a change longer than our whole pipeline does. An hourly GitHub Action covers the loop being down.</p>
 
         <h4>FEEDS + SOURCE</h4>
-        <p><a href="/feed.xml">RSS major + notable</a> &middot; <a href="/feed-models.xml">models only</a> &middot; <a href="/feed-releases.xml">releases only</a>. Generator: <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener">nordicnode/freebuff-changelog</a>; Cloudflare deploys on every data push.</p>
+        <p><a href="/feed.xml">RSS all changes</a> &middot; <a href="/feed-major.xml">major + notable</a> &middot; <a href="/feed-models.xml">models only</a> &middot; <a href="/feed-releases.xml">releases only</a> &middot; <a href="/feed.json">JSON feed</a>. Generator: <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener">nordicnode/freebuff-changelog</a>; Cloudflare deploys on every data push.</p>
     </div>
   </div>
 </section>`
@@ -1685,15 +1686,17 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     }))
   }
 
-  // ----- feeds: main (major+notable), models-only, releases-only
+  // ----- feeds: main (all changes), major+notable, models-only, releases-only
   const titleOf = (e) => e.ai?.title || e.title || deriveTitleSafe(e)
-  const mainItems = entries.filter(e => !e.noise && e.significance !== 'minor').slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
+  const mainItems = entries.filter(e => !e.noise).slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
+  const majorItems = entries.filter(e => !e.noise && e.significance !== 'minor').slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
   const modelItems = modelEntries.slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
   const releaseItems = [...vers].reverse().slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
   await write(dist, 'feed.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed.xml', SITE.name, SITE.desc, mainItems))
+  await write(dist, 'feed-major.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-major.xml', `${SITE.name}: major + notable`, 'Major model additions and notable user-visible feature changes.', majorItems))
   await write(dist, 'feed-models.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-models.xml', `${SITE.name}: models`, 'Model catalog additions, retirements, and swaps in the Freebuff free picker.', modelItems))
   await write(dist, 'feed-releases.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-releases.xml', `${SITE.name}: releases`, 'Freebuff CLI and core package version bumps.', releaseItems))
-  const mainJsonItems = entries.filter(e => !e.noise && e.significance !== 'minor').slice(0, 60).map(e => jsonItem(SITE.url, e, titleOf))
+  const mainJsonItems = entries.filter(e => !e.noise).slice(0, 60).map(e => jsonItem(SITE.url, e, titleOf))
   await write(dist, 'feed.json', feedJson(SITE.url, generated, SITE.name, SITE.desc, 'feed.json', mainJsonItems))
   await write(dist, 'feed.xsl', FEED_XSL)
   await writeBinary(`${dist.replace(/\/$/, '')}/favicon.ico`, generateFaviconIco())
@@ -1875,6 +1878,12 @@ ctx.hidden = false
   Access-Control-Allow-Origin: *
 /feed.json
   Content-Type: application/feed+json; charset=utf-8
+/feed.xml
+  Content-Type: application/rss+xml; charset=utf-8
+  Access-Control-Allow-Origin: *
+/feed-*.xml
+  Content-Type: application/rss+xml; charset=utf-8
+  Access-Control-Allow-Origin: *
 `)
   await write(dist, '404.html', layout({ title: 'Not found', path: '/404', noindex: true, body: '<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">ERROR :: 404 NOT FOUND</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">No commit or snapshot shipped at this path. <a href="/">&larr; [back to index]</a></p></div></section>' }))
   return { entries: entries.length, days: byDay.length, releases: vers.length }

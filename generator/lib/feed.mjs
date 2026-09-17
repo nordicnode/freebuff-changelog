@@ -146,7 +146,7 @@ export function generateIconPng (size = 192) {
 export const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="4" fill="#0d1117"/><text x="5" y="22" font-family="monospace" font-weight="bold" font-size="20" fill="#58a6ff">&gt;_</text></svg>`
 
 export const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
-<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:atom="http://www.w3.org/2005/Atom">
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:dc="http://purl.org/dc/elements/1.1/">
   <xsl:output method="html" version="1.0" encoding="UTF-8" indent="yes"/>
   <xsl:template match="/">
     <html lang="en" data-theme="dark">
@@ -192,7 +192,7 @@ export const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
           .item-card:hover{border-color:var(--txt-subtle);background:var(--panel-hover)}
           .item-title{font-size:14px;font-weight:600;margin:0 0 4px}
           .item-meta{font-size:11px;color:var(--txt-subtle);margin-bottom:8px}
-          .item-desc{color:var(--txt-dim);font-size:12px;margin:0}
+          .item-desc{color:var(--txt-dim);font-size:12px;margin:0;white-space:pre-line}
           .sub-callout{background:#1c1e24;border-left:3px solid var(--term-amber);padding:10px 14px;margin:12px 0}
         </style>
       </head>
@@ -203,7 +203,7 @@ export const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
             <p><xsl:value-of select="/rss/channel/description"/></p>
             <div class="sub-callout">
               <span class="feed-badge">RSS 2.0</span>
-              <p style="margin-top:6px">This is an RSS feed. To subscribe and receive updates automatically in your newsreader (Feedly, NetNewsWire, Miniflux, etc.), copy this URL:</p>
+              <p style="margin-top:6px">This is an RSS feed. To subscribe and receive updates automatically in your newsreader (Feedly, NetNewsWire, Miniflux, etc.) or Discord bot, copy this URL:</p>
               <code style="color:var(--term-green);font-size:12px"><xsl:value-of select="/rss/channel/atom:link/@href"/></code>
             </div>
             <p style="font-size:12px;margin-top:8px">
@@ -220,6 +220,7 @@ export const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
               <article class="item-card">
                 <div class="item-meta">
                   <xsl:value-of select="pubDate"/>
+                  <xsl:if test="category"> &#183; <span class="feed-badge"><xsl:value-of select="category"/></span></xsl:if>
                 </div>
                 <h3 class="item-title">
                   <a target="_blank" rel="noopener">
@@ -242,26 +243,66 @@ export const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
 </xsl:stylesheet>
 `
 
-// One feed <item>: title link, stable guid, summary + facts in content.
+// One feed <item>: title, link, stable guid, author, categories,
+// Discord-friendly clean description (no duplicated title, no 300-char truncation,
+// plain-English quote if available), and rich HTML in content:encoded.
 export function feedItem (siteUrl, e, titleOf) {
   // Date-prefix disambiguates repeat titles across days ("New slash
   // command /queue" shipped once; model swaps repeat names often).
   const title = `[${e.day}] ${titleOf(e)}`
-  const summary = String(e.ai?.summary || e.summary || '').replace(/[*`#]/g, '')
-  const facts = (e.facts || []).slice(0, 5).map(f => `<li>${esc(String(f)).slice(0, 400)}</li>`).join('')
-  const content = facts
-    ? `<p>${esc(summary)}</p><p><b>Details:</b></p><ul>${facts}</ul>`
-    : `<p>${esc(summary)}</p>`
+  const summary = String(e.ai?.summary || e.summary || '').replace(/[*`#]/g, '').trim()
+  const eli5 = e.eli5?.text ? String(e.eli5.text).replace(/[*`#]/g, '').trim() : ''
+
+  // Description is optimized for Discord bots (embed description or message)
+  // as well as standard RSS readers:
+  // - Never duplicates the title at the top of the description.
+  // - Includes plain-English summary as a Discord-friendly blockquote when present.
+  // - Full technical summary without harsh 300-char truncation.
+  // - Clean bulleted highlights for quick scanning.
+  const descParts = []
+  if (eli5) descParts.push(`> **In plain English**\n> ${eli5}`)
+  if (summary) descParts.push(summary)
+  if (e.facts?.length) {
+    const highlights = e.facts.slice(0, 3).map(f => `• ${String(f).replace(/[*`#]/g, '').trim()}`).join('\n')
+    descParts.push(`**Highlights**\n${highlights}`)
+  }
+  let desc = descParts.join('\n\n')
+  // Discord description max is 4096 (standard message 2000); keep description bounded under 1800 chars cleanly
+  if (desc.length > 1800) {
+    desc = desc.slice(0, 1799) + '…'
+  }
+
+  // Enriched HTML for readers that render content:encoded (Feedly, NetNewsWire, etc.)
+  const factsHtml = (e.facts || []).slice(0, 5).map(f => `<li>${esc(String(f)).slice(0, 400)}</li>`).join('')
+  const modelChangesHtml = (e.modelChanges?.added?.length || e.modelChanges?.removed?.length)
+    ? `<p><b>Model catalog:</b></p><ul>`
+      + (e.modelChanges.removed || []).map(m => `<li><del>${esc(m)}</del></li>`).join('')
+      + (e.modelChanges.added || []).map(m => `<li><b>+ ${esc(m)}</b></li>`).join('')
+      + `</ul>`
+    : ''
+  const content = [
+    eli5 ? `<blockquote><p><b>In plain English:</b> ${esc(eli5)}</p></blockquote>` : '',
+    summary ? `<p>${esc(summary)}</p>` : '',
+    modelChangesHtml,
+    factsHtml ? `<p><b>Details:</b></p><ul>${factsHtml}</ul>` : '',
+    `<p><a href="${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}">View on changelog</a> · <a href="${e.url || `https://github.com/CodebuffAI/freebuff/commit/${e.sha}`}">Commit ${e.sha.slice(0, 8)}</a>${e.prUrl ? ` · <a href="${e.prUrl}">PR #${e.pr}</a>` : ''}</p>`
+  ].filter(Boolean).join('')
+
+  const authorTag = e.author ? `<dc:creator>${esc(e.author)}</dc:creator>` : ''
+  const categories = [e.category, e.significance, ...(e.areas || [])].filter(Boolean)
+  const categoryTags = categories.map(c => `<category>${esc(c)}</category>`).join('')
+
   return `<item><title>${esc(title)}</title><link>${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}</link>`
     + `<guid isPermaLink="false">${esc(e.sha)}</guid><pubDate>${new Date(e.date).toUTCString()}</pubDate>`
-    + `<description>${esc(title)}: ${esc(summary.slice(0, 300))}</description>`
+    + `${authorTag}${categoryTags}`
+    + `<description>${esc(desc)}</description>`
     + `<content:encoded xmlns:content="http://purl.org/rss/1.0/modules/content/"><![CDATA[${content}]]></content:encoded></item>`
 }
 
 export function feedXml (siteUrl, siteName, siteDesc, generated, name, title, desc, items) {
   return `<?xml version="1.0" encoding="UTF-8"?>`
     + `<?xml-stylesheet type="text/xsl" href="/feed.xsl"?>`
-    + `<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>${esc(title)}</title>`
+    + `<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:dc="http://purl.org/dc/elements/1.1/"><channel><title>${esc(title)}</title>`
     + `<link>${siteUrl}</link><atom:link href="${siteUrl}/${name}" rel="self" type="application/rss+xml" /><description>${esc(desc)}</description><language>en</language><lastBuildDate>${new Date(generated).toUTCString()}</lastBuildDate>${items}</channel></rss>`
 }
 
@@ -277,8 +318,10 @@ export function feedJson (siteUrl, generated, title, desc, feedPath, items) {
       id: it.id,
       url: it.url,
       title: it.title,
-      content_html: it.html,
-      date_published: it.date,
+      content_html: it.content_html,
+      summary: it.summary,
+      date_published: it.date_published,
+      ...(it.authors ? { authors: it.authors } : {}),
       tags: it.tags
     }))
   })
@@ -286,14 +329,23 @@ export function feedJson (siteUrl, generated, title, desc, feedPath, items) {
 
 export function jsonItem (siteUrl, e, titleOf) {
   const title = titleOf(e)
-  const summary = String(e.ai?.summary || e.summary || '').replace(/[*`#]/g, '')
+  const summary = String(e.ai?.summary || e.summary || '').replace(/[*`#]/g, '').trim()
+  const eli5 = e.eli5?.text ? String(e.eli5.text).replace(/[*`#]/g, '').trim() : ''
   const facts = (e.facts || []).slice(0, 5).map(f => `<li>${esc(String(f)).slice(0, 400)}</li>`).join('')
+  const html = [
+    eli5 ? `<blockquote><p><b>In plain English:</b> ${esc(eli5)}</p></blockquote>` : '',
+    summary ? `<p>${esc(summary)}</p>` : '',
+    facts ? `<ul>${facts}</ul>` : ''
+  ].filter(Boolean).join('')
+
   return {
     id: e.sha,
     url: `${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}`,
     title: `[${e.day}] ${title}`,
-    html: facts ? `<p>${esc(summary)}</p><ul>${facts}</ul>` : `<p>${esc(summary)}</p>`,
-    date: new Date(e.date).toISOString(),
-    tags: [e.category, e.significance].filter(Boolean)
+    summary: eli5 ? `[In plain English] ${eli5} — ${summary}` : summary,
+    content_html: html,
+    date_published: new Date(e.date).toISOString(),
+    ...(e.author ? { authors: [{ name: e.author }] } : {}),
+    tags: [e.category, e.significance, ...(e.areas || [])].filter(Boolean)
   }
 }

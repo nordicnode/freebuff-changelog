@@ -403,9 +403,21 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /href="\/favicon\.svg"/)
     assert.doesNotMatch(indexHtml, /href="\/favicon\.ico"/)
 
-    // Verify split feeds: main, models-only, releases-only with correct self links
+    // Verify split feeds: main (all changes), major-only, models-only, releases-only with correct self links
     assert.match(feedXml, /<atom:link href="https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/feed\.xml" rel="self"/)
+    assert.match(feedXml, /xmlns:dc="http:\/\/purl\.org\/dc\/elements\/1\.1\/"/)
     assert.match(feedXml, /\[2026-09-13\] Muse Spark 1\.3 replaces Muse Spark 1\.2/)
+    assert.match(feedXml, /CLI flag tweak/, 'feed.xml includes all non-noise changes including minor entries')
+    assert.doesNotMatch(feedXml, /\[2026-09-13\] CLI flag tweak: CLI flag tweak/, 'description does not duplicate title')
+    assert.match(feedXml, /<dc:creator>dev<\/dc:creator>/)
+    assert.match(feedXml, /<category>Model Catalog<\/category>/)
+    assert.match(feedXml, /<category>major<\/category>/)
+
+    const feedMajor = await readFile(join(tmpDist, 'feed-major.xml'), 'utf8')
+    assert.match(feedMajor, /<atom:link href="https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/feed-major\.xml" rel="self"/)
+    assert.match(feedMajor, /Muse Spark 1\.3 replaces Muse Spark 1\.2/)
+    assert.doesNotMatch(feedMajor, /CLI flag tweak/, 'feed-major.xml excludes minor changes')
+
     const feedModels = await readFile(join(tmpDist, 'feed-models.xml'), 'utf8')
     assert.match(feedModels, /<atom:link href="https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/feed-models\.xml" rel="self"/)
     assert.match(feedModels, /Muse Spark 1\.3 replaces Muse Spark 1\.2/)
@@ -414,6 +426,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(feedReleases, /<atom:link href="https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/feed-releases\.xml" rel="self"/)
     assert.match(feedReleases, /Add awesome feature/)
     assert.match(feedReleases, /Unofficial Freebuff Changelog: releases/)
+    assert.match(indexHtml, /feed-major\.xml/)
     assert.match(indexHtml, /href="\/feed-models\.xml"/)
     assert.match(indexHtml, /href="\/feed-releases\.xml"/)
     // Verify _headers keeps content types, CORS, and the site-wide no-cache rule
@@ -422,6 +435,10 @@ test('buildSite generates valid static site output', async () => {
     assert.match(headers, /\/favicon\.ico/)
     assert.match(headers, /\/feed\.xsl/)
     assert.match(headers, /Access-Control-Allow-Origin: \*/)
+    assert.equal(ruleFor(rules, '/feed.xml').headers['content-type'], 'application/rss+xml; charset=utf-8')
+    assert.equal(ruleFor(rules, '/feed.xml').headers['access-control-allow-origin'], '*')
+    assert.equal(ruleFor(rules, '/feed-*.xml').headers['content-type'], 'application/rss+xml; charset=utf-8')
+    assert.equal(ruleFor(rules, '/feed-*.xml').headers['access-control-allow-origin'], '*')
     assert.match(headers, /^\/\*\n(?: {2}\S[^\n]*\n)*? {2}Cache-Control: no-cache/m,
       'the wildcard rule carries the site-wide no-cache')
 
