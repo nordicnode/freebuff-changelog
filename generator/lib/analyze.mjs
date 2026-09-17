@@ -127,7 +127,7 @@ async function diffText (repoDir, range, pathspecs, maxBytes) {
 
 // Clean unified diff of a commit for in-browser inspection, excluding lockfiles.
 // With excludeTests, pure test files drop out too (matches what the LLM prompt claims).
-export async function extractCleanDiff (repoDir, base, head, maxBytes = 48000, excludeTests = false) {
+export async function extractCleanDiff (repoDir, base, head, maxBytes = 250000, excludeTests = false) {
   // `base...head` needs two commits; the empty tree is neither, so a root commit
   // diffs against it directly.
   const range = base === EMPTY_TREE ? [EMPTY_TREE, head] : [`${base}...${head}`]

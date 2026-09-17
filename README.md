@@ -1,5 +1,10 @@
 # Freebuff Changelog
 
+[![Version](https://changelog.freebuff.dev/badge/version.svg)](https://changelog.freebuff.dev)
+[![Models](https://changelog.freebuff.dev/badge/models.svg)](https://changelog.freebuff.dev/models/)
+[![Status](https://changelog.freebuff.dev/badge/status.svg)](https://changelog.freebuff.dev)
+[![Changes](https://changelog.freebuff.dev/badge/changes.svg)](https://changelog.freebuff.dev/archive/)
+
 Unofficial changelog generator and static site for [CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff).
 
 Upstream commits are squashed into opaque `Sync public snapshot` commits with no release notes. This tool reconstructs an accurate changelog directly from the **git diff behind every public commit**.
@@ -12,6 +17,7 @@ Requires **Node.js ≥ 20.11** (zero npm dependencies).
 npm run build     # Build static site to dist/
 npm run preview   # Serve locally at http://localhost:8788
 npm test          # Run test suite
+npm run broadcast # Broadcast new commits to Discord webhook (--dry-run)
 npm run generate  # Analyze upstream repo -> data/
 npm run backfill  # Run continuous sync daemon (--push)
 ```

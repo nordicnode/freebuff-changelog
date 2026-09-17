@@ -49,13 +49,13 @@ async function llmPatchFor (e) {
   // except for test-only commits, where the tests *are* the change. Excluding
   // them there handed the queue an empty patch, so those rows could never be
   // summarized and the backlog counter never reached zero.
-  const clean = await extractCleanDiff(REPO_DIR, base, e.sha, 48000, !e.testOnly)
+  const clean = await extractCleanDiff(REPO_DIR, base, e.sha, 250000, !e.testOnly)
   if (clean.trim()) return clean
   // Stale entries built before testOnly existed (or with narrower TEST_RE)
   // carry no flag, so the exclusion above empties their patch. Retry without
   // the test exclusion before giving up; churn rows stay empty either way.
   if (!e.testOnly) {
-    const incl = await extractCleanDiff(REPO_DIR, base, e.sha, 48000, false)
+    const incl = await extractCleanDiff(REPO_DIR, base, e.sha, 250000, false)
     if (incl.trim()) return incl
   }
   // A churn row's entire change IS the lockfile, so the clean form is empty by
@@ -63,7 +63,7 @@ async function llmPatchFor (e) {
   // default because "dependency versions moved" is what the deterministic label
   // already says, and it costs ~1,900 calls to be told it again.
   return e.noise && process.env.CHANGELOG_LLM_CHURN === '1'
-    ? extractRawDiff(REPO_DIR, base, e.sha, 12000)
+    ? extractRawDiff(REPO_DIR, base, e.sha, 50000)
     : ''
 }
 
@@ -179,7 +179,9 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
       if (total == null) total = lastPage(res)
       prs.push(...batch.map(p => ({
         number: p.number, title: p.title, url: p.html_url, author: p.user?.login,
-        created: p.created_at, updated: p.updated_at, draft: p.draft, comments: p.comments,
+        created: p.created_at, updated: p.updated_at, draft: p.draft,
+        comments: p.comments ?? 0,
+        reviewComments: p.review_comments ?? 0,
         additions: p.additions, deletions: p.deletions, files: p.changed_files
       })))
       // The next link, not the page length, decides whether there is more to come.
@@ -227,8 +229,10 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
       if (prev.updated && p.updated && prev.updated !== p.updated) { p.stalePreview = true; continue }
       if (p.additions == null && prev.additions != null) {
         p.additions = prev.additions; p.deletions = prev.deletions; p.files = prev.files
-        p.comments = prev.comments ?? p.comments
       }
+      p.comments = prev.comments ?? p.comments
+      p.reviewComments = prev.reviewComments ?? p.reviewComments
+      if (p.reviewState == null && prev.reviewState != null) p.reviewState = prev.reviewState
       if (!p.hasDiff && prev.hasDiff) p.hasDiff = true
     }
     // The list endpoint omits additions/deletions/changed_files entirely, so
@@ -268,8 +272,32 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
     }), 4)
     await pool(list.filter(p => p.additions == null).map(p => async () => {
       const full = await ghGet(`/repos/CodebuffAI/freebuff/pulls/${p.number}`)
-      if (full) { p.additions = full.additions; p.deletions = full.deletions; p.files = full.changed_files; p.comments = full.comments ?? p.comments }
+      if (full) {
+        p.additions = full.additions
+        p.deletions = full.deletions
+        p.files = full.changed_files
+        p.comments = full.comments ?? p.comments
+        p.reviewComments = full.review_comments ?? p.reviewComments
+      }
     }), 4)
+    // Optional review state decoration (when explicitly requested, e.g. CHANGELOG_PR_REVIEWS=1)
+    if (process.env.CHANGELOG_PR_REVIEWS === '1') {
+      await pool(list.filter(p => !p.draft && p.reviewState == null && used < PR_CALL_BUDGET).slice(0, 50).map(p => async () => {
+        const reviews = await ghGet(`/repos/CodebuffAI/freebuff/pulls/${p.number}/reviews`)
+        if (Array.isArray(reviews) && reviews.length > 0) {
+          const latestByUser = new Map()
+          for (const r of reviews) {
+            if (r.user?.login && r.state && r.state !== 'DISMISSED') {
+              latestByUser.set(r.user.login, r.state)
+            }
+          }
+          const states = [...latestByUser.values()]
+          if (states.includes('CHANGES_REQUESTED')) p.reviewState = 'CHANGES_REQUESTED'
+          else if (states.includes('APPROVED')) p.reviewState = 'APPROVED'
+          else if (states.includes('COMMENTED')) p.reviewState = 'COMMENTED'
+        }
+      }), 4)
+    }
     // Mark previews already on disk (skipped above, still viewable).
     for (const p of list) {
       if (!p.hasDiff && existsSync(previewPath(p.number))) p.hasDiff = true
@@ -934,6 +962,7 @@ if (IS_MAIN) {
   else if (cmd === 'push-data') await cmdPushData(rest)
   else if (cmd === 'enrich-all') await cmdEnrichAll(rest)
   else if (cmd === 'normalize-dates') await cmdNormalizeDates(rest)
+  else if (cmd === 'broadcast') await cmdBroadcast(rest)
   else if (cmd === 'build') await cmdBuild()
   else if (cmd === 'preview') await cmdPreview(Number(rest[0]) || 8788)
   else {
@@ -945,6 +974,7 @@ if (IS_MAIN) {
   node generator/cli.mjs push-data [--message M]  # commit+push data/ with the shared race handling
   node generator/cli.mjs enrich-all [--batch N] [--push]  # one pass toward a diff + summary + ELI5 for every entry (0 = everything left)
   node generator/cli.mjs normalize-dates [--push]  # one-off: rewrite stored timestamps to UTC and fix the day/month keys
+  node generator/cli.mjs broadcast [--webhook URL] [--limit N] [--dry-run]  # broadcast latest commits to Discord
   node generator/cli.mjs build                    # render static site → dist/
   node generator/cli.mjs preview [port]           # local preview of dist/`)
     process.exit(cmd ? 1 : 0)
@@ -1035,3 +1065,113 @@ async function cmdNormalizeDates (argv) {
   })
   if (!acquired) log('[normalize-dates] another generate/backfill run holds the worktree lock: retry shortly')
 }
+
+/**
+ * Broadcast new commits to a Discord webhook.
+ * Tracks last broadcast SHA in data/state.json to prevent duplicate broadcasts.
+ */
+export async function cmdBroadcast (argv = [], { fetchImpl = globalThis.fetch, dataDir = DATA } = {}) {
+  const webhookIdx = argv.indexOf('--webhook')
+  const webhook = webhookIdx !== -1 ? argv[webhookIdx + 1] : process.env.DISCORD_WEBHOOK_URL
+  const limitIdx = argv.indexOf('--limit')
+  const limit = limitIdx !== -1 ? Math.max(1, Number(argv[limitIdx + 1]) || 5) : 5
+  const dryRun = argv.includes('--dry-run')
+  const force = argv.includes('--force')
+
+  if (!webhook && !dryRun) {
+    console.error('Error: Discord webhook URL required (via --webhook <url> or DISCORD_WEBHOOK_URL env var).')
+    if (IS_MAIN) process.exit(1)
+    return { ok: false, error: 'missing_webhook' }
+  }
+
+  const doc = await readJson(`${dataDir}/changelog.json`, null)
+  if (!doc?.entries?.length) {
+    console.error('Error: changelog.json missing: run generate first.')
+    if (IS_MAIN) process.exit(1)
+    return { ok: false, error: 'missing_changelog' }
+  }
+
+  const statePath = `${dataDir}/state.json`
+  const state = (await readJson(statePath, null)) || {}
+  const lastBroadcast = state.lastBroadcastSha
+
+  // Candidates: meaningful commits only
+  const meaningful = doc.entries.filter(e => !e.noise)
+  let pending = []
+
+  if (force || !lastBroadcast) {
+    pending = meaningful.slice(0, limit).reverse()
+  } else {
+    const idx = meaningful.findIndex(e => e.sha === lastBroadcast)
+    if (idx === -1) {
+      pending = meaningful.slice(0, 1)
+    } else if (idx > 0) {
+      pending = meaningful.slice(0, idx).reverse().slice(0, limit)
+    }
+  }
+
+  if (!pending.length) {
+    log('[broadcast] no new commits to broadcast')
+    return { ok: true, count: 0 }
+  }
+
+  log(`[broadcast] ${pending.length} commit${pending.length === 1 ? '' : 's'} to broadcast${dryRun ? ' (dry-run)' : ''}`)
+
+  const { discordText } = await import('./lib/site.mjs')
+
+  let sent = 0
+  for (const e of pending) {
+    const text = discordText(e)
+    if (dryRun) {
+      console.log(`\n--- [DRY-RUN BROADCAST ${e.sha.slice(0, 10)}] ---\n${text}\n-----------------------------------\n`)
+      sent++
+      continue
+    }
+
+    let retries = 3
+    let ok = false
+    while (retries > 0) {
+      try {
+        const res = await fetchImpl(webhook, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ content: text }),
+          signal: AbortSignal.timeout(15000)
+        })
+        if (res.ok || res.status === 204) {
+          ok = true
+          break
+        }
+        if (res.status === 429) {
+          const body = await res.json().catch(() => ({}))
+          const waitMs = Math.round((Number(body.retry_after) || 1) * 1000) + 500
+          log(`[broadcast] Discord rate limited: waiting ${waitMs}ms`)
+          await new Promise(r => setTimeout(r, waitMs))
+        } else {
+          log(`[broadcast] Discord HTTP error ${res.status}: ${await res.text().catch(() => '')}`)
+          break
+        }
+      } catch (err) {
+        log(`[broadcast] webhook POST failed: ${err.message}`)
+      }
+      retries--
+      if (retries > 0) await new Promise(r => setTimeout(r, 1000))
+    }
+
+    if (ok) {
+      sent++
+      state.lastBroadcastSha = e.sha
+      state.updatedAt = new Date().toISOString()
+      await writeJson(statePath, state)
+      log(`[broadcast] sent commit ${e.sha.slice(0, 10)}: ${e.ai?.title || e.title}`)
+      await new Promise(r => setTimeout(r, 300))
+    } else {
+      log(`[broadcast] stopping broadcast after failed delivery for ${e.sha.slice(0, 10)}`)
+      break
+    }
+  }
+
+  log(`[broadcast] finished: ${sent}/${pending.length} sent`)
+  return { ok: true, count: sent }
+}
+

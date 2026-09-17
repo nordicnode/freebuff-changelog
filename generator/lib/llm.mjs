@@ -55,9 +55,8 @@ export function truncateWords (s, n) {
 }
 
 // Per-file budget: split on file boundaries, cap each file, keep order.
-// Head hunks (what changed) survive; tail overflow drops with a marker.
-// Better than a flat slice, which silently drops whole trailing files.
-export function budgetPatch (patch, maxBytes = 12000, perFile = 3000) {
+// Defaults allow up to 250 KB (uncapped for modern LLM context windows).
+export function budgetPatch (patch, maxBytes = 250000, perFile = 60000) {
   const parts = String(patch || '').split(/(?=^diff --git )/m)
   if (parts.length <= 1) {
     return patch.length > maxBytes
@@ -113,7 +112,8 @@ export function buildPrompt (entry, patch) {
   if (files.length) lines.push(`Files: ${files.join(', ')}`)
   const facts = (entry.facts || []).slice(0, 5)
   if (facts.length) lines.push(`Key facts (ground the WHY and DETAIL sentences in these): ${facts.map(f => `- ${f}`).join(' ')}`)
-  lines.push('', 'Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):', '```diff', budgetPatch(patch), '```')
+  const maxDiff = Number(process.env.CHANGELOG_LLM_MAX_DIFF_BYTES) || 250000
+  lines.push('', 'Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):', '```diff', budgetPatch(patch, maxDiff, Math.max(60000, Math.round(maxDiff / 4))), '```')
   return lines.filter(Boolean).join('\n')
 }
 
@@ -492,6 +492,7 @@ Rules:
 - Use only what the summary, the evidence and the comments say. Never invent a cause, a number, or a promise.
 - Keep the audience the text gives, and keep it narrow. If the change is for one kind of customer, one plan, one region, or only after some step, name that group. Never widen it to "users", "everyone" or "customers" because that reads more naturally: a program for verified YC companies is not available to users.
   - Plain words, active voice. No "This change", "We are excited", or marketing tone.
+  - If the change is an internal refactor, test suite update, dependency bump, or maintenance change with no direct user-facing behavior, explain it honestly and plainly as behind-the-scenes housekeeping or stability maintenance. Do NOT invent or fabricate user-facing features, performance claims, or speed improvements.
   - If the change is small or internal, say so shortly. Do not inflate it.
   - Never address the reader as a developer.
   - Address the reader as "you", or name the group ("users", "subscribers"); never write "that person", "the viewer" or "that individual".
