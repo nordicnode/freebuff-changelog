@@ -65,6 +65,7 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
     <a href="/search/" class="${path.startsWith('/search/') ? 'active' : ''}">/search</a>
     <a href="/in-flight/" class="${path.startsWith('/in-flight/') ? 'active' : ''}">/in-flight</a>
     <a href="/feed.xml" class="nav-feed">/rss</a>
+    <button type="button" class="nav-kb-btn" data-kb-modal title="Keyboard shortcuts (press ?)">keys [?]</button>
   </nav>
 </header>
 ${body}
@@ -74,6 +75,7 @@ ${body}
     <div class="footer-links">
       <a href="/about/">[about]</a>
       <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">[github]</a>
+      <button type="button" data-kb-modal title="Keyboard shortcuts (press ?)">[shortcuts: ?]</button>
     </div>
   </div>
   <div class="footer-row footer-sub">
@@ -82,6 +84,10 @@ ${body}
       <a href="/feed.xml">[all rss]</a>
       <a href="/feed-models.xml">[models rss]</a>
       <a href="/feed-releases.xml">[releases rss]</a>
+    </div>
+    <div class="footer-shortcuts">
+      <span class="footer-label">shortcuts:</span>
+      <button type="button" class="theme-btn" data-kb-modal title="Keyboard shortcuts (press ?)">[?]</button>
     </div>
     <div class="footer-theme">
       <span class="footer-label">theme:</span>
@@ -277,6 +283,14 @@ document.addEventListener('keydown', (e) => {
     if (prevLink && prevLink.href) { window.location.href = prevLink.href; }
     return;
   }
+});
+
+// Keyboard shortcuts modal toggle
+document.addEventListener('click', (ev) => {
+  const btn = ev.target.closest ? ev.target.closest('[data-kb-modal]') : null;
+  if (!btn) return;
+  const modal = document.getElementById('kb-modal');
+  if (modal) modal.hidden = !modal.hidden;
 });
 
 // Bulk expand/collapse for timeline
@@ -720,7 +734,7 @@ function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) {
   // too now, so gating on kind here would hide proof that is sitting right there.
   if (e.hasDiff) {
     diffViewer = `<details class="diff-viewer" data-sha="${e.sha}" data-gh="${esc(e.compareUrl || e.url || '')}">
-<summary class="diff-toggle">
+<summary class="diff-toggle" title="Toggle inline diff (d)">
   <span class="diff-toggle-left">
     <span class="diff-arrow">&gt;</span>
     <span>View inline diff</span>
@@ -755,7 +769,7 @@ ${relatedLine(e, relatedIdx)}
 <div class="metarow">
   <span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i> &middot; ${e.files.total} file${e.files.total === 1 ? '' : 's'}</span>
   <div class="meta-links">
-    <button class="meta-link dc-copy" type="button" data-dc="${esc(discordText(e))}" title="Copy this entry as Discord-formatted text">discord</button>
+    <button class="meta-link dc-copy" type="button" data-dc="${esc(discordText(e))}" title="Copy this entry as Discord-formatted text (c)">discord</button>
     ${e.sourceSha ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" rel="noopener" target="_blank">snapshot</a>` : ''}
     ${e.pr ? `<a class="meta-link" href="${esc(e.prUrl || '')}" rel="noopener" target="_blank">PR #${e.pr}</a>` : ''}
     ${e.compareUrl ? `<a class="meta-link" href="${esc(e.compareUrl)}" rel="noopener" target="_blank">compare</a>` : e.url ? `<a class="meta-link" href="${esc(e.url)}" rel="noopener" target="_blank">commit</a>` : ''}
@@ -1064,6 +1078,7 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
     <div class="timeline-bulk-toggle">
       <button type="button" class="timeline-bulk-btn" data-bulk="expand">[expand all]</button>
       <button type="button" class="timeline-bulk-btn" data-bulk="collapse">[collapse all]</button>
+      <button type="button" class="timeline-bulk-btn" data-kb-modal title="Keyboard shortcuts (press ?)">[shortcuts: ?]</button>
     </div>
   </div>`
 
@@ -1931,6 +1946,19 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         ${openPrs?.length ? '<span><a href="/in-flight/">/in-flight/</a> open PRs</span>' : ''}
       </div>
       <p style="margin-top:6px">The chips above the timeline filter that day's rows; the churn chip reveals the noise. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code>, a link to that change alone which survives it moving day, and <code>discord</code> copies a paste-ready version. Press <code>/</code> anywhere to search.</p>
+
+      <h4>KEYBOARD SHORTCUTS</h4>
+      <p>Single-key and vim-style shortcuts for rapid navigation. Press <kbd>?</kbd> anywhere or click <button type="button" class="theme-btn" data-kb-modal style="display:inline;color:var(--term-cyan);padding:0">[shortcuts: ?]</button> to toggle the cheat sheet.</p>
+      <div class="man-routes">
+        <span><kbd>j</kbd> / <kbd>k</kbd> next / prev entry</span>
+        <span><kbd>o</kbd> / <kbd>Enter</kbd> expand / collapse</span>
+        <span><kbd>d</kbd> toggle inline diff</span>
+        <span><kbd>c</kbd> copy Discord text</span>
+        <span><kbd>n</kbd> / <kbd>p</kbd> next / prev page</span>
+        <span><kbd>/</kbd> focus search</span>
+        <span><kbd>?</kbd> cheat-sheet modal</span>
+        <span><kbd>Esc</kbd> close dialog / blur</span>
+      </div>
 
       <h4>LIMITS</h4>
       <p>Snapshots squash upstream history, so ordering inside one snapshot is approximate and authorship resolves to the bot. AI text describes only what the diff shows: no research, no speculation about capabilities.</p>

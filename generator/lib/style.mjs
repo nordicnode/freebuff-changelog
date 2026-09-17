@@ -217,7 +217,7 @@ nav.term-nav{
   font-size:.84rem;
   flex-wrap:wrap;
 }
-nav.term-nav a{
+nav.term-nav a, nav.term-nav button{
   display:inline-flex;
   align-items:center;
   min-height:24px;
@@ -228,11 +228,19 @@ nav.term-nav a{
   background:var(--panel);
   text-decoration:none;
   transition:all .1s ease;
+  font:inherit;
+  cursor:pointer;
 }
-nav.term-nav a:hover{
+nav.term-nav a:hover, nav.term-nav button:hover{
   color:var(--txt);
   border-color:var(--term-border-strong);
   text-decoration:none;
+}
+.nav-kb-btn{
+  color:var(--term-cyan)!important;
+}
+.nav-kb-btn:hover{
+  border-color:var(--term-cyan)!important;
 }
 nav.term-nav a.active{
   color:var(--term-cyan);
@@ -1699,19 +1707,24 @@ footer{
   color:var(--txt-subtle);
   line-height:1.4;
 }
-.footer-links, .footer-feeds{
+.footer-links, .footer-feeds, .footer-shortcuts{
   display:inline-flex;
   align-items:center;
   gap:10px;
   flex-wrap:wrap;
 }
-.footer-links a, .footer-feeds a{
+.footer-links a, .footer-feeds a, .footer-links button, .footer-shortcuts button{
+  background:none;
+  border:none;
+  padding:0;
+  font:inherit;
   color:var(--txt-subtle);
   text-decoration:none;
   font-size:.73rem;
+  cursor:pointer;
   transition:color .1s ease;
 }
-.footer-links a:hover, .footer-feeds a:hover{
+.footer-links a:hover, .footer-feeds a:hover, .footer-links button:hover, .footer-shortcuts button:hover{
   color:var(--term-cyan);
 }
 .footer-label{
@@ -1813,7 +1826,7 @@ details.entry.kb-active .entry-arrow{
   padding:12px 14px;
   align-items:center;
 }
-.kb-key{
+.kb-key, kbd{
   color:var(--term-cyan);
   font-weight:700;
   background:var(--code);
@@ -1824,6 +1837,7 @@ details.entry.kb-active .entry-arrow{
   min-width:20px;
   text-align:center;
   font-size:.76rem;
+  font-family:inherit;
 }
 
 /* Timeline Bulk Toggle */

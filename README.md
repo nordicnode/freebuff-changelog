@@ -29,6 +29,7 @@ npm run backfill  # Run continuous sync daemon (--push)
 - **Timeline**: Daily changelog views (`/day/YYYY-MM-DD/`), releases (`/release/1.0.NNN/`), model tracker (`/models/`), and live metrics (`/stats/`).
 - **Feeds**: `/feed.xml` (all changes), `/feed-major.xml` (major only), `/feed-models.xml`, `/feed-releases.xml`, `/feed.json` (JSON Feed 1.1).
 - **Discord**: Every entry includes one-click Discord markdown copy (≤ 2,000 chars). Feeds support MonitoRSS and webhooks natively.
+- **Keyboard Navigation**: Vim-style shortcuts (`j`/`k`, `o`, `d`, `c`, `n`/`p`, `/`, and `?` for cheat sheet).
 
 ## Configuration
 
