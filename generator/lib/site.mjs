@@ -47,7 +47,8 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="apple-touch-icon" href="/icon-192.png">
-<style>${CSS}</style></head><body${wide ? ' class="page-wide"' : ''}><main>
+<style>${CSS}</style>
+<script>(function(){try{var t=localStorage.getItem('fbTheme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(_){}})();</script></head><body${wide ? ' class="page-wide"' : ''}><main>
 <header class="top">
   <div class="brand">
     <a class="logo" href="/">
@@ -81,8 +82,33 @@ ${body}
       <a href="/feed-models.xml">[models rss]</a>
       <a href="/feed-releases.xml">[releases rss]</a>
     </div>
+    <div class="footer-theme">
+      <span class="footer-label">theme:</span>
+      <button type="button" class="theme-btn active" data-theme-val="dark">[dark]</button>
+      <button type="button" class="theme-btn" data-theme-val="amber">[amber]</button>
+      <button type="button" class="theme-btn" data-theme-val="green">[green]</button>
+      <button type="button" class="theme-btn" data-theme-val="light">[light]</button>
+    </div>
   </div>
 </footer>
+<div id="kb-modal" class="kb-modal" hidden onclick="if(event.target===this)this.hidden=true">
+  <div class="kb-dialog">
+    <div class="kb-header">
+      <span>KEYBOARD SHORTCUTS</span>
+      <button type="button" class="kb-close" onclick="document.getElementById('kb-modal').hidden=true">[esc]</button>
+    </div>
+    <div class="kb-grid">
+      <div><span class="kb-key">j</span> / <span class="kb-key">k</span></div><div>Next / prev entry</div>
+      <div><span class="kb-key">o</span> / <span class="kb-key">Enter</span></div><div>Open / close details</div>
+      <div><span class="kb-key">d</span></div><div>Toggle inline diff</div>
+      <div><span class="kb-key">c</span></div><div>Copy Discord text</div>
+      <div><span class="kb-key">n</span> / <span class="kb-key">p</span></div><div>Next / prev page</div>
+      <div><span class="kb-key">/</span></div><div>Focus search</div>
+      <div><span class="kb-key">?</span></div><div>Toggle cheat-sheet</div>
+      <div><span class="kb-key">Esc</span></div><div>Close dialog / blur</div>
+    </div>
+  </div>
+</div>
 </main>
 <script>
 function updateSyncAge() {
@@ -146,14 +172,142 @@ function openHashTarget() {
 window.addEventListener('DOMContentLoaded', openHashTarget);
 window.addEventListener('hashchange', openHashTarget);
 
+let activeEntryIdx = -1;
+function getVisibleEntries() {
+  return Array.from(document.querySelectorAll('details.entry:not([hidden])'));
+}
+function setActiveEntry(idx) {
+  const entries = getVisibleEntries();
+  if (!entries.length) return;
+  if (idx < 0) idx = 0;
+  if (idx >= entries.length) idx = entries.length - 1;
+  activeEntryIdx = idx;
+  entries.forEach((e, i) => e.classList.toggle('kb-active', i === idx));
+  entries[idx].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
 document.addEventListener('keydown', (e) => {
-  if (e.key === '/' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
+  const tag = document.activeElement ? document.activeElement.tagName : '';
+  const isInput = ['INPUT', 'TEXTAREA', 'SELECT'].includes(tag);
+
+  if (e.key === 'Escape') {
+    const modal = document.getElementById('kb-modal');
+    if (modal && !modal.hidden) { modal.hidden = true; return; }
+    if (isInput) { document.activeElement.blur(); return; }
+  }
+
+  if (isInput) return;
+
+  if (e.key === '?') {
+    e.preventDefault();
+    const modal = document.getElementById('kb-modal');
+    if (modal) modal.hidden = !modal.hidden;
+    return;
+  }
+
+  if (e.key === '/') {
     e.preventDefault();
     const q = document.getElementById('q');
     if (q) { q.focus(); q.select(); }
     else { window.location.href = '/search/'; }
+    return;
+  }
+
+  if (e.key === 'j' || e.key === 'ArrowDown') {
+    const entries = getVisibleEntries();
+    if (entries.length) {
+      e.preventDefault();
+      setActiveEntry(activeEntryIdx + 1);
+    }
+    return;
+  }
+
+  if (e.key === 'k' || e.key === 'ArrowUp') {
+    const entries = getVisibleEntries();
+    if (entries.length) {
+      e.preventDefault();
+      setActiveEntry(activeEntryIdx - 1);
+    }
+    return;
+  }
+
+  if (e.key === 'o' || e.key === 'Enter') {
+    const entries = getVisibleEntries();
+    if (entries.length && activeEntryIdx >= 0 && activeEntryIdx < entries.length) {
+      e.preventDefault();
+      const ent = entries[activeEntryIdx];
+      ent.open = !ent.open;
+    }
+    return;
+  }
+
+  if (e.key === 'd') {
+    const entries = getVisibleEntries();
+    if (entries.length && activeEntryIdx >= 0 && activeEntryIdx < entries.length) {
+      const dv = entries[activeEntryIdx].querySelector('.diff-viewer');
+      if (dv) {
+        e.preventDefault();
+        dv.open = !dv.open;
+      }
+    }
+    return;
+  }
+
+  if (e.key === 'c') {
+    const entries = getVisibleEntries();
+    if (entries.length && activeEntryIdx >= 0 && activeEntryIdx < entries.length) {
+      const btn = entries[activeEntryIdx].querySelector('.dc-copy');
+      if (btn) {
+        e.preventDefault();
+        btn.click();
+      }
+    }
+    return;
+  }
+
+  if (e.key === 'n') {
+    const nextLink = document.querySelector('.pager-timeline a[rel="' + 'next"], .pager a:last-child');
+    if (nextLink && nextLink.href) { window.location.href = nextLink.href; }
+    return;
+  }
+
+  if (e.key === 'p') {
+    const prevLink = document.querySelector('.pager-timeline a[rel="' + 'prev"], .pager a:first-child');
+    if (prevLink && prevLink.href) { window.location.href = prevLink.href; }
+    return;
   }
 });
+
+// Bulk expand/collapse for timeline
+document.addEventListener('click', (ev) => {
+  const btn = ev.target.closest ? ev.target.closest('[data-bulk]') : null;
+  if (!btn) return;
+  const action = btn.getAttribute('data-bulk');
+  const open = action === 'expand';
+  document.querySelectorAll('section.day details.entry:not([hidden])').forEach(e => {
+    e.open = open;
+  });
+});
+
+// Theme switcher button click handler
+document.addEventListener('click', (ev) => {
+  const btn = ev.target.closest ? ev.target.closest('[data-theme-val]') : null;
+  if (!btn) return;
+  const val = btn.getAttribute('data-theme-val');
+  document.documentElement.setAttribute('data-theme', val);
+  try { localStorage.setItem('fbTheme', val); } catch (_) {}
+  document.querySelectorAll('[data-theme-val]').forEach(b => {
+    b.classList.toggle('active', b.getAttribute('data-theme-val') === val);
+  });
+});
+
+function syncThemeButtons() {
+  const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+  document.querySelectorAll('[data-theme-val]').forEach(b => {
+    b.classList.toggle('active', b.getAttribute('data-theme-val') === cur);
+  });
+}
+window.addEventListener('DOMContentLoaded', syncThemeButtons);
 
 // Delegated, not wired per element: the /c/ page imports its card from another
 // document after load, so a listener attached at build time would not exist on it.
@@ -171,8 +325,6 @@ document.addEventListener('click', (ev) => {
 });
 
 function copyText (text) {
-  // The async clipboard API is secure-context only; the Workers site is https, but
-  // a file:// preview or a plain-http mirror falls through to execCommand.
   if (navigator.clipboard && window.isSecureContext) {
     return navigator.clipboard.writeText(text).then(() => true, () => legacyCopy(text));
   }
@@ -253,9 +405,25 @@ function renderDiff(container, text, label, ghUrl, mode) {
   const lines = text.split(/\\r?\\n/);
   const frag = document.createDocumentFragment();
 
+  const files = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('diff --git a/')) {
+      const parts = lines[i].split(' ');
+      const bFile = (parts[3] && parts[3].startsWith('b/')) ? parts[3].slice(2) : (parts[3] || '');
+      if (bFile) files.push({ file: bFile, lineIdx: i });
+    }
+  }
+
   const toolbar = document.createElement('div');
   toolbar.className = 'diff-toolbar';
-  toolbar.innerHTML = '<span class="diff-toolbar-title">$ git diff ' + label.slice(0, 12) + '^!</span>';
+
+  let filesJump = '';
+  if (files.length > 1) {
+    filesJump = '<select class="diff-file-jump" aria-label="Jump to file"><option value="">' + files.length + ' files changed…</option>' +
+      files.map((f, i) => '<option value="' + i + '">' + f.file + '</option>').join('') +
+      '</select>';
+  }
+  toolbar.innerHTML = '<span class="diff-toolbar-title">$ git diff ' + label.slice(0, 12) + '^!</span>' + filesJump;
 
   const actions = document.createElement('div');
   actions.className = 'diff-toolbar-actions';
@@ -280,7 +448,6 @@ function renderDiff(container, text, label, ghUrl, mode) {
   frag.appendChild(toolbar);
 
   if (mode === 'split') {
-    // Before/after columns: pair runs of - lines with following + runs.
     const table = document.createElement('table');
     table.className = 'diff-split';
     const addCell = (tr, cls, txt) => {
@@ -340,39 +507,75 @@ function renderDiff(container, text, label, ghUrl, mode) {
 
   const pre = document.createElement('pre');
   pre.className = 'diff-pre';
-  for (const line of lines) {
+  let oldLine = 0, newLine = 0;
+  let fileIdx = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const row = document.createElement('div');
     row.className = 'diff-line';
+
+    if (line.startsWith('diff --git')) {
+      row.id = 'diff-f-' + (fileIdx++);
+    }
+
+    const hunkMatch = line.match(/^@@ -(\\d+)(?:,\\d+)? \\+(\\d+)(?:,\\d+)? @@/);
+    if (hunkMatch) {
+      oldLine = parseInt(hunkMatch[1], 10);
+      newLine = parseInt(hunkMatch[2], 10);
+    }
+
+    const numOld = document.createElement('span');
+    numOld.className = 'diff-num old';
+    const numNew = document.createElement('span');
+    numNew.className = 'diff-num new';
     const marker = document.createElement('span');
     marker.className = 'diff-marker';
     const textSpan = document.createElement('span');
     textSpan.className = 'diff-text';
-    
+
     if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff --git') || line.startsWith('index ')) {
       row.classList.add('diff-hdr');
       marker.textContent = ' ';
       textSpan.textContent = line;
-    } else if (line.startsWith('+')) {
-      row.classList.add('diff-add');
-      marker.textContent = '+';
-      textSpan.textContent = line.slice(1);
-    } else if (line.startsWith('-')) {
-      row.classList.add('diff-del');
-      marker.textContent = '−';
-      textSpan.textContent = line.slice(1);
     } else if (line.startsWith('@@')) {
       row.classList.add('diff-hunk');
       marker.textContent = ' ';
       textSpan.textContent = line;
+    } else if (line.startsWith('+')) {
+      row.classList.add('diff-add');
+      numNew.textContent = String(newLine++);
+      marker.textContent = '+';
+      textSpan.textContent = line.slice(1);
+    } else if (line.startsWith('-')) {
+      row.classList.add('diff-del');
+      numOld.textContent = String(oldLine++);
+      marker.textContent = '−';
+      textSpan.textContent = line.slice(1);
     } else {
+      numOld.textContent = String(oldLine++);
+      numNew.textContent = String(newLine++);
       marker.textContent = ' ';
       textSpan.textContent = line.startsWith(' ') ? line.slice(1) : line;
     }
+    row.appendChild(numOld);
+    row.appendChild(numNew);
     row.appendChild(marker);
     row.appendChild(textSpan);
     pre.appendChild(row);
   }
   frag.appendChild(pre);
+
+  const jumpSel = toolbar.querySelector('.diff-file-jump');
+  if (jumpSel) {
+    jumpSel.onchange = (e) => {
+      const idx = e.target.value;
+      if (idx !== '') {
+        const target = pre.querySelector('#diff-f-' + idx);
+        if (target) target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    };
+  }
 
   container.innerHTML = '';
   container.appendChild(frag);
@@ -852,6 +1055,10 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
     <div class="timeline-stats">${latest
     ? `${meaningful.length.toLocaleString()} changes${churnNote}`
     : `${real} change${real === 1 ? '' : 's'} that day${churn ? ` + ${churn} churn` : ''}`}</div>
+    <div class="timeline-bulk-toggle">
+      <button type="button" class="timeline-bulk-btn" data-bulk="expand">[expand all]</button>
+      <button type="button" class="timeline-bulk-btn" data-bulk="collapse">[collapse all]</button>
+    </div>
   </div>`
 
     const filterRow = `<div class="timeline-filter-row">
@@ -1104,7 +1311,11 @@ ${rows.map(e => {
       <span class="term-box-title">Free model catalog</span>
       <span>${modelLive.length} live &middot; ${modelRetired.length} retired</span>
     </div>
-    <p class="models-intro">Every model that has been free in the Freebuff picker, oldest first. Click a name for its full history &mdash; rows below read <span class="modelminus">&minus;out</span> <span class="swap-arrow">&rarr;</span> <span class="modelplus">+in</span>.</p>
+    <p class="models-intro">Every model that has been free in the Freebuff picker, oldest first. Click a name for its full history. Rows below read <span class="modelminus">&minus;out</span> <span class="swap-arrow">&rarr;</span> <span class="modelplus">+in</span>.</p>
+    <div class="model-search-row">
+      <span class="model-search-prompt">$ grep model</span>
+      <input type="search" id="model-filter" class="model-search-input" placeholder="filter by name: claude, deepseek, gpt…" autocomplete="off">
+    </div>
     <div class="model-grid">${modelLive.map(m => modelCard(m, 'live', 'LIVE')).join('')}</div>
     ${modelRetired.length ? `<details class="model-retired"><summary class="model-retired-toggle">RETIRED (${modelRetired.length})</summary><div class="model-grid" style="margin-top:8px">${modelRetired.map(m => modelCard(m, 'out', 'OUT')).join('')}</div></details>` : ''}
     <p style="margin:12px 0 0;font-size:.78rem;color:var(--txt-dim)">SUBSCRIBE: <a href="/feed-models.xml">[models rss]</a> &middot; <a href="/feed.xml">[all changes]</a></p>
@@ -1113,7 +1324,30 @@ ${rows.map(e => {
 <div class="section-hdr">
   <h2>CATALOG HISTORY (${modelChrono.length} CHANGES)</h2>
 </div>
-<div class="model-history">${modelRows}</div>`
+<div class="model-history">${modelRows}</div>
+<script>
+(function(){
+  var mf = document.getElementById('model-filter');
+  if (!mf) return;
+  var cards = document.querySelectorAll('.model-card');
+  var rows = document.querySelectorAll('.model-row');
+  var retiredDetails = document.querySelector('.model-retired');
+  mf.addEventListener('input', function(){
+    var q = mf.value.trim().toLowerCase();
+    cards.forEach(function(c){
+      var match = !q || c.textContent.toLowerCase().includes(q);
+      c.style.display = match ? '' : 'none';
+    });
+    rows.forEach(function(r){
+      var match = !q || r.textContent.toLowerCase().includes(q);
+      r.style.display = match ? '' : 'none';
+    });
+    if (q && retiredDetails) {
+      retiredDetails.open = true;
+    }
+  });
+})();
+</script>`
   }))
 
   // ----- per-model pages (one page per catalog name: status, events)
@@ -1178,7 +1412,7 @@ ${d.entries.map(changeRow).join('\n')}
 </section>`).join('\n') + `
 <div class="pager"><a href="/archive/#categories">[ all categories ]</a><a href="/">[ back to the timeline ]</a></div>`
     await write(dist, `changes/${b.slug}/index.html`, layout({
-      title: `${b.label} — all time`, path: `/changes/${b.slug}/`,
+      title: `${b.label} · all time`, path: `/changes/${b.slug}/`,
       desc: `All ${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : b.label + ' changes'} recorded from Freebuff's public snapshots, newest first.`,
       ogImage: `/og/category-${b.slug}.svg`,
       body
@@ -1432,7 +1666,7 @@ ${archiveScript}`
   await write(dist, 'stats/index.html', layout({
     title: 'Stats', path: '/stats/',
     desc: `Freebuff changelog stats: ${entries.length} changes across ${byDay.length} days, ${vers.length} releases, ${modelEntries.length} model changes.`,
-    body: `<section class="hero"><div class="term-box term-box-slim"><div class="term-box-hdr"><span class="term-box-title">TELEMETRY :: changelog stats</span><span>${meaningful.length.toLocaleString()} changes${churnNote} &middot; ${byDay.length} days &middot; ${spanDays.toLocaleString()} days of history</span></div><p class="list-note">Where the work lands, how fast it ships, and which models churn. Churn rows &mdash; lockfiles, icon sets, empty merges &mdash; are counted on the timeline and excluded from every figure here. Recomputed on every sync.</p></div></section>`
+    body: `<section class="hero"><div class="term-box term-box-slim"><div class="term-box-hdr"><span class="term-box-title">TELEMETRY :: changelog stats</span><span>${meaningful.length.toLocaleString()} changes${churnNote} &middot; ${byDay.length} days &middot; ${spanDays.toLocaleString()} days of history</span></div><p class="list-note">Where the work lands, how fast it ships, and which models churn. Churn rows (lockfiles, icon sets, empty merges) are counted on the timeline and excluded from every figure here. Recomputed on every sync.</p></div></section>`
       + `<div class="stat-figures">`
       + figure('CHANGES', meaningful.length.toLocaleString(), `of ${entries.length.toLocaleString()} commits &middot; ${churnCount.toLocaleString()} churn rows excluded`)
       + figure('MEDIAN / DAY', String(medianDay), `${activeDays} days with commits${busiestDay ? ` &middot; ${busiestDay[1]} on the busiest, ${esc(fmtDateHuman(busiestDay[0]))}` : ''}`)
@@ -1487,6 +1721,7 @@ ${archiveScript}`
       <button class="filter-chip" data-filter="release">--releases</button>
       <button class="filter-chip" data-filter="CLI">--cli</button>
       <button class="filter-chip" data-filter="prompt">--prompt</button>
+      <button class="filter-chip" data-filter="command">--commands</button>
       <button class="filter-chip" data-filter="desktop">--desktop</button>
     </div>
     <div class="filter-row">
@@ -1512,12 +1747,59 @@ ${archiveScript}`
 <script>
 fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   let t;
+  let selectedHitIdx = -1;
   const q = document.getElementById('q'), h = document.getElementById('hits'), cnt = document.getElementById('match-count');
   const chips = document.querySelectorAll('.filter-chip');
   const fcat = document.getElementById('fcat'), fsig = document.getElementById('fsig');
   const esc = s => String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 
+  const highlight = (title, words) => {
+    let s = esc(title);
+    for (const word of words) {
+      if (!word) continue;
+      const escaped = word.replace(/[^a-zA-Z0-9_]/g, '\\\\$&');
+      try {
+        const rx = new RegExp('(' + escaped + ')', 'gi');
+        s = s.replace(rx, '<mark class="search-match">$1</mark>');
+      } catch (_) {}
+    }
+    return s;
+  };
+
+  const updateHitSelection = (newIdx) => {
+    const articles = h.querySelectorAll('article.entry');
+    if (!articles.length) return;
+    if (newIdx < 0) newIdx = 0;
+    if (newIdx >= articles.length) newIdx = articles.length - 1;
+    selectedHitIdx = newIdx;
+    articles.forEach((a, i) => a.classList.toggle('search-hit-active', i === selectedHitIdx));
+    articles[selectedHitIdx].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  };
+
+  q.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown') {
+      const articles = h.querySelectorAll('article.entry');
+      if (articles.length) {
+        e.preventDefault();
+        updateHitSelection(selectedHitIdx + 1);
+      }
+    } else if (e.key === 'ArrowUp') {
+      const articles = h.querySelectorAll('article.entry');
+      if (articles.length) {
+        e.preventDefault();
+        updateHitSelection(selectedHitIdx - 1);
+      }
+    } else if (e.key === 'Enter') {
+      const articles = h.querySelectorAll('article.entry');
+      if (selectedHitIdx >= 0 && selectedHitIdx < articles.length) {
+        const link = articles[selectedHitIdx].querySelector('h3 a');
+        if (link) { e.preventDefault(); window.location.href = link.href; }
+      }
+    }
+  });
+
   const go = () => {
+    selectedHitIdx = -1;
     const v = q.value.trim().toLowerCase();
     const cat = fcat ? fcat.value : '', sig = fsig ? fsig.value : '';
     const w = v.split(/\\s+/).filter(Boolean);
@@ -1528,7 +1810,6 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       if (cat && c !== cat) continue;
       if (sig && a !== sig) continue;
       if (!w.length) { scored.push([0, e[0], e]); continue; }
-      // Title hits outrank category hits; significance boosts.
       const t = e[1].toLowerCase(), cl = c.toLowerCase();
       let s = 0, ok = true;
       for (const x of w) {
@@ -1553,7 +1834,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         '<span class="entry-utc">' + esc(e[0]) + '</span>' +
         '<div class="badges"><span class="badge cat">[' + esc(c) + ']</span>' + sigTag + '</div>' +
         '</div>' +
-        '<h3><a href="' + u + '">' + esc(e[1]) + '</a></h3>' +
+        '<h3><a href="' + u + '">' + highlight(e[1], w) + '</a></h3>' +
         '</article>';
     }).join('') || '<p style="color:var(--txt-subtle);margin:20px 0">$ No matches found for pattern.</p>';
   };

@@ -348,7 +348,7 @@ export function jsonItem (siteUrl, e, titleOf) {
     id: e.sha,
     url: `${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}`,
     title: `[${e.day}] ${title}`,
-    summary: eli5 ? `[In plain English] ${eli5} — ${summary}` : summary,
+    summary: eli5 ? `[In plain English] ${eli5} · ${summary}` : summary,
     content_html: html,
     date_published: new Date(e.date).toISOString(),
     ...(e.author ? { authors: [{ name: e.author }] } : {}),
