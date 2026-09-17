@@ -66,6 +66,24 @@ test('extractResponseText: reassembles SSE delta chunks into message text', asyn
   assert.equal(parseLlmJson(extractResponseText(plain)).title, 'AI Feature')
 })
 
+test('extractResponseText: unwraps a { data: { choices } } envelope', async () => {
+  const { extractResponseText } = await import('../lib/llm.mjs')
+  // The cl/cline-free gateway answers 200 with the completion nested one level
+  // down and `data: [DONE]` appended, so a top-level `choices` read finds nothing.
+  const inner = '{"title":"Ads fetch log fields","summary":"x","significance":"minor"}'
+  const enveloped = '{"data":{"choices":[{"finish_reason":"stop","index":0,"message":'
+    + JSON.stringify({ content: inner }) + '}],"model":"deepseek/deepseek-v4.1-flash"},"success":true}\ndata: [DONE]\n'
+  assert.equal(parseLlmJson(extractResponseText(enveloped)).title, 'Ads fetch log fields')
+  // Same envelope, no `data:` line at all.
+  const bare = '{"data":{"choices":[{"message":' + JSON.stringify({ content: inner }) + '}]},"success":true}'
+  assert.equal(parseLlmJson(extractResponseText(bare)).title, 'Ads fetch log fields')
+  // Enveloped SSE deltas reassemble too.
+  const envSse = 'data: {"data":{"choices":[{"delta":{"content":"{\\"title\\": \\"Nested"}}]}}\n'
+    + 'data: {"data":{"choices":[{"delta":{"content":" deltas\\"}"}}]}}\n'
+  assert.equal(parseLlmJson(extractResponseText(envSse)).title, 'Nested deltas')
+  assert.throws(() => extractResponseText('{"data":{"choices":[]}}'), /no JSON/)
+})
+
 test('llmConfigured: checks CHANGELOG_LLM and LLM_API_KEY from env', () => {
   assert.equal(llmConfigured({ CHANGELOG_LLM: '1', LLM_API_KEY: 'test-key' }), true)
   assert.equal(llmConfigured({ CHANGELOG_LLM: '0', LLM_API_KEY: 'test-key' }), false)

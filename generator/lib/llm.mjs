@@ -130,34 +130,39 @@ export function parseLlmJson (text) {
 // frames (one JSON object per `data:` line) even when stream was not asked
 // for. Reassemble those into the message text; plain JSON bodies pass through.
 export function extractResponseText (rawText) {
-  if (!/^\s*data:\s*\{/m.test(rawText)) {
-    const data = parseLlmJson(rawText)
-    return data.choices?.[0]?.message?.content ?? ''
-  }
-  let text = ''
-  for (const line of String(rawText).split('\n')) {
-    const m = /^\s*data:\s*(\{.*\})\s*$/.exec(line)
-    if (!m) continue
-    try {
-      const chunk = JSON.parse(m[1])
-      const delta = chunk.choices?.[0]?.delta?.content
-      if (typeof delta === 'string') text += delta
-    } catch { /* skip malformed chunk lines */ }
-  }
-  if (!text) {
-    // No delta chunks found: fall back to the first message-shaped object.
-    for (const line of String(rawText).split('\n')) {
+  const raw = String(rawText)
+  const frames = raw.split('\n').filter(l => /^\s*data:\s*\{/.test(l))
+  if (frames.length) {
+    let text = ''
+    for (const line of frames) {
       const m = /^\s*data:\s*(\{.*\})\s*$/.exec(line)
       if (!m) continue
       try {
         const chunk = JSON.parse(m[1])
-        const content = chunk.choices?.[0]?.message?.content
-        if (typeof content === 'string' && content) return content
+        const delta = chunk.choices?.[0]?.delta?.content ?? chunk.data?.choices?.[0]?.delta?.content
+        if (typeof delta === 'string') text += delta
+      } catch { /* skip malformed chunk lines */ }
+    }
+    if (text) return text
+    // No deltas: a gateway may still have sent whole messages per frame.
+    for (const line of frames) {
+      const m = /^\s*data:\s*(\{.*\})\s*$/.exec(line)
+      if (!m) continue
+      try {
+        const content = messageContent(JSON.parse(m[1]))
+        if (content) return content
       } catch { /* keep looking */ }
     }
+  }
+  let parsed
+  try {
+    parsed = parseLlmJson(raw)
+  } catch {
     throw new Error('LLM returned no JSON')
   }
-  return text
+  const content = messageContent(parsed)
+  if (content) return content
+  throw new Error('LLM returned no JSON')
 }
 
 // Short one-line error for logs and cache: HTML error pages collapse to
@@ -670,4 +675,17 @@ export async function eli5Patch (e, getPatch) {
   } catch {
     return ''
   }
+}
+// The assistant text inside one OpenAI-shaped reply. Gateways differ on where
+// they put it: canonical `choices[0].message.content`, or the same object one
+// level down inside a `{ data: … }` envelope.
+function messageContent (obj) {
+  const direct = obj?.choices?.[0]?.message?.content
+  if (typeof direct === 'string' && direct) return direct
+  const wrapped = obj?.data
+  if (wrapped && typeof wrapped === 'object') {
+    const inner = wrapped.choices?.[0]?.message?.content
+    if (typeof inner === 'string' && inner) return inner
+  }
+  return ''
 }
