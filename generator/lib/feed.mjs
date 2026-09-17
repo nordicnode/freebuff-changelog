@@ -252,7 +252,7 @@ export const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
 // One feed <item>: title, link, stable guid, author, categories,
 // Discord-friendly clean description (no duplicated title, no 300-char truncation,
 // plain-English quote if available), and rich HTML in content:encoded.
-export function feedItem (siteUrl, e, titleOf) {
+export function feedItem (siteUrl, e, titleOf, storyNotes = []) {
   // Date-prefix disambiguates repeat titles across days ("New slash
   // command /queue" shipped once; model swaps repeat names often).
   const title = `[${e.day}] ${titleOf(e)}`
@@ -265,7 +265,7 @@ export function feedItem (siteUrl, e, titleOf) {
   // - Includes plain-English summary as a Discord-friendly blockquote when present.
   // - Full technical summary without harsh 300-char truncation.
   // - Clean bulleted highlights for quick scanning.
-  const descParts = []
+  const descParts = storyNotes.map(n => `> **Related access context**\n> ${n.text}`)
   if (eli5) descParts.push(`> **In plain English**\n> ${eli5}`)
   if (summary) descParts.push(summary)
   if (e.facts?.length) {
@@ -287,6 +287,7 @@ export function feedItem (siteUrl, e, titleOf) {
       + `</ul>`
     : ''
   const content = [
+    ...storyNotes.map(n => `<p><b>Related access context:</b> ${esc(n.text)} <a href="${siteUrl}/day/${n.day}/#${n.anchor}">Related entry</a></p>`),
     eli5 ? `<blockquote><p><b>In plain English:</b> ${esc(eli5)}</p></blockquote>` : '',
     summary ? `<p>${esc(summary)}</p>` : '',
     modelChangesHtml,
@@ -333,12 +334,13 @@ export function feedJson (siteUrl, generated, title, desc, feedPath, items) {
   })
 }
 
-export function jsonItem (siteUrl, e, titleOf) {
+export function jsonItem (siteUrl, e, titleOf, storyNotes = []) {
   const title = titleOf(e)
   const summary = String(e.ai?.summary || e.summary || '').replace(/[*`#]/g, '').trim()
   const eli5 = e.eli5?.text ? String(e.eli5.text).replace(/[*`#]/g, '').trim() : ''
   const facts = (e.facts || []).slice(0, 5).map(f => `<li>${esc(String(f)).slice(0, 400)}</li>`).join('')
   const html = [
+    ...storyNotes.map(n => `<p><b>Related access context:</b> ${esc(n.text)} <a href="${siteUrl}/day/${n.day}/#${n.anchor}">Related entry</a></p>`),
     eli5 ? `<blockquote><p><b>In plain English:</b> ${esc(eli5)}</p></blockquote>` : '',
     summary ? `<p>${esc(summary)}</p>` : '',
     facts ? `<ul>${facts}</ul>` : ''
@@ -348,7 +350,7 @@ export function jsonItem (siteUrl, e, titleOf) {
     id: e.sha,
     url: `${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}`,
     title: `[${e.day}] ${title}`,
-    summary: eli5 ? `[In plain English] ${eli5} · ${summary}` : summary,
+    summary: [...storyNotes.map(n => `[Related access context] ${n.text}`), eli5 ? `[In plain English] ${eli5} · ${summary}` : summary].join(' · '),
     content_html: html,
     date_published: new Date(e.date).toISOString(),
     ...(e.author ? { authors: [{ name: e.author }] } : {}),

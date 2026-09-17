@@ -2498,4 +2498,57 @@ mark.search-match{
   color:var(--term-amber);
   margin-right:4px;
 }
+/* A same-day, same-code note sits with RELATED but must survive plain-English
+   reading mode: the reader it exists for is the one who sees only the
+   plain-English line, so hiding it with the technical detail would hide the fix
+   with the problem. */
+.story-note{
+  margin-top:6px;
+  padding-top:6px;
+  border-top:1px dotted rgba(210,153,34,0.35);
+  font-size:.78rem;
+  line-height:1.5;
+  color:var(--txt-dim);
+}
+.story-note-label{
+  font-size:.68rem;
+  font-weight:700;
+  letter-spacing:.05em;
+  color:var(--term-amber);
+  margin-right:2px;
+}
+.story-note a{color:var(--term-cyan);text-decoration:none}
+.story-note a:hover{text-decoration:underline}
+.reading-mode-plain .story-note{
+  display:block !important;
+  border-top:1px dotted var(--term-border);
+}
+/* The day-level lead: a cluster's plain-English lines side by side. Same rule as
+   above -- this is plain-English content, so plain reading mode keeps it. */
+.story-lead{
+  margin:2px 0 14px;
+  padding:8px 12px;
+  border:1px solid rgba(210,153,34,0.3);
+  border-left:3px solid var(--term-amber);
+  background:var(--eli5-bg);
+  border-radius:0 2px 2px 0;
+  font-size:.8rem;
+  line-height:1.55;
+  color:var(--txt-dim);
+}
+.story-lead-label{
+  display:block;
+  font-size:.68rem;
+  font-weight:700;
+  letter-spacing:.05em;
+  color:var(--term-amber);
+  margin-bottom:2px;
+}
+.story-lead p{margin:0 0 6px}
+.story-lead ul{margin:0;padding-left:16px}
+.story-lead li{margin:3px 0}
+.story-lead a{color:var(--term-cyan);text-decoration:none}
+.story-lead a:hover{text-decoration:underline}
+.story-lead .story-more{color:var(--txt-subtle)}
+.reading-mode-plain .story-lead{display:block !important}
 `

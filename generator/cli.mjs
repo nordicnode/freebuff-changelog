@@ -1191,10 +1191,12 @@ export async function cmdBroadcast (argv = [], { fetchImpl = globalThis.fetch, d
   log(`[broadcast] ${pending.length} commit${pending.length === 1 ? '' : 's'} to broadcast${dryRun ? ' (dry-run)' : ''}${plainOnly ? ' [plain english]' : ''}`)
 
   const { discordText } = await import('./lib/site.mjs')
+  const { buildStoryIndex } = await import('./lib/story.mjs')
+  const storyIndex = buildStoryIndex(doc.entries)
 
   let sent = 0
   for (const e of pending) {
-    const text = discordText(e, { plainOnly })
+    const text = discordText(e, { plainOnly, storyNotes: storyIndex.notes.get(e.sha) })
     if (dryRun) {
       console.log(`\n--- [DRY-RUN BROADCAST${plainOnly ? ' (PLAIN ENGLISH)' : ''} ${e.sha.slice(0, 10)}] ---\n${text}\n-----------------------------------\n`)
       sent++

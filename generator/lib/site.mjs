@@ -6,6 +6,7 @@ import { escapeHtml as esc, fmtDateHuman, pool } from './util.mjs'
 import { CSS } from './style.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, ogCardSvg } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
+import { buildStoryIndex, dayStories, dayStoryLead } from './story.mjs'
 
 const SITE = {
   name: 'Unofficial Freebuff Changelog',
@@ -748,6 +749,29 @@ function relatedLine (e, relatedIdx) {
   return `<div class="related">RELATED: ${rel.map(r => `<a href="/day/${r.day}/#${r.sha.slice(0, 12)}">${esc((r.ai?.title || r.title || '').slice(0, 60))}</a>`).join(' · ')}</div>`
 }
 
+// The RELATED line above links by category. This one links by *code*, and it
+// exists because a plain-English line can be true of its own commit and still
+// mislead about the day: "This update does not change who is eligible today" was
+// published the morning after the change that took SG and IL off full access. The
+// note carries the other entry's own plain-English line and links to it -- it
+// never rewrites this entry's line, so it cannot contradict the entry it points
+// at, and no model writes it (see story.mjs).
+function storyNoteHtml (notes) {
+  if (!notes?.length) return ''
+  return notes.map(n => `<div class="story-note"><span class="story-note-label">SAME DAY · SAME CODE</span> <a href="/day/${n.day}/#${n.anchor}">${esc(n.title)}</a>${n.text ? ` — ${esc(n.text)}` : ''}</div>`).join('')
+}
+
+// The day's version of the same fix: a cluster's plain-English lines side by
+// side, in the order they shipped, so skimming the day cannot bury the change.
+// Rendered only when the cluster records a change to who has access.
+function dayLeadHtml (clusters) {
+  const lead = dayStoryLead(clusters)
+  if (!lead) return ''
+  const items = lead.parts.map(p => `<li><a href="/day/${p.day}/#${p.anchor}">${esc(p.title)}</a>${p.text ? ` — ${esc(p.text)}` : ''}</li>`).join('')
+  const rest = lead.rest > 0 ? `<li class="story-more">+${lead.rest} more in this cluster</li>` : ''
+  return `<div class="story-lead"><span class="story-lead-label">RELATED CHANGES · IN PLAIN ENGLISH</span><p><strong>${esc(lead.headline)}</strong></p><p>${lead.count} linked changes recorded on ${esc(lead.day)}:</p><ul>${items}${rest}</ul></div>`
+}
+
 // Categories double as filter keys in the DOM, so they need a URL/attribute-safe
 // form that both the chips and the rows compute identically.
 function categorySlug (c) {
@@ -827,11 +851,12 @@ ${e.facts?.length ? `<ul class="facts">${e.facts.slice(0, 3).map(f => `<li>${min
 ${fileChips(e)}
 ${diffViewer}
 ${relatedLine(e, relatedIdx)}
+${storyNoteHtml(opts.storyNotes)}
 <div class="metarow">
   <span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i> &middot; ${e.files.total} file${e.files.total === 1 ? '' : 's'}</span>
   <div class="meta-links">
-    <button class="meta-link dc-copy" type="button" data-dc="${esc(discordText(e))}" title="Copy this entry as Discord-formatted text (c)">discord</button>
-    ${e.eli5?.text ? `<button class="meta-link eli5-copy" type="button" data-eli5="${esc(discordText(e, { plainOnly: true }))}" title="Copy plain-English update formatted for Discord">plain english</button>` : ''}
+    <button class="meta-link dc-copy" type="button" data-dc="${esc(discordText(e, { storyNotes: opts.storyNotes }))}" title="Copy this entry as Discord-formatted text (c)">discord</button>
+    ${e.eli5?.text ? `<button class="meta-link eli5-copy" type="button" data-eli5="${esc(discordText(e, { plainOnly: true, storyNotes: opts.storyNotes }))}" title="Copy plain-English update formatted for Discord">plain english</button>` : ''}
     ${e.sourceSha ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" rel="noopener" target="_blank">snapshot</a>` : ''}
     ${e.pr ? `<a class="meta-link" href="${esc(e.prUrl || '')}" rel="noopener" target="_blank">PR #${e.pr}</a>` : ''}
     ${e.compareUrl ? `<a class="meta-link" href="${esc(e.compareUrl)}" rel="noopener" target="_blank">compare</a>` : e.url ? `<a class="meta-link" href="${esc(e.url)}" rel="noopener" target="_blank">commit</a>` : ''}
@@ -944,6 +969,9 @@ export function discordText (e, opts = {}) {
   const parts = [head.join(' · '), `### ${dcEsc(title)}`]
   // Every line of a quote needs its own `>`: a wrapped continuation is fine, but a
   // hard newline without it would drop out of the quote and lose the rule.
+  if (opts.storyNotes?.length) {
+    parts.push(`> **Related access context**\n> ${opts.storyNotes.map(n => dcEsc(clipText(n.text, 600))).join('\n> ')}`)
+  }
   let eli5Idx = -1, eli5Full = ''
   if (e.eli5?.text) {
     eli5Full = String(e.eli5.text).replace(/\s+/g, ' ').trim()
@@ -1127,6 +1155,10 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
   // "Related" is a reading aid for real changes: churn rows must neither appear
   // in it nor link out of it.
   const relatedIdx = buildRelatedIndex(entries.filter(e => !e.noise))
+  // Same-day, same-code clusters. Derived per build from the entries in hand, so a
+  // note appears the moment the second half of a story lands -- no cache, no
+  // version and nothing to merge (see story.mjs).
+  const storyIdx = buildStoryIndex(entries)
   const modelEntries = entries.filter(e => e.modelChanges)
   const releases = entries.filter(e => e.version)
   const first = entries.at(-1), last = entries[0]
@@ -1275,10 +1307,11 @@ ${[
   <h2><time datetime="${day.day}">[ ${esc(fmtDateHuman(day.day))} ]</time></h2>
   <span class="day-count">${real} change${real === 1 ? '' : 's'}${churn ? ` <span class="day-churn">+${churn} churn</span>` : ''}</span>
 </div>
+${dayStories(storyIdx, day.day).map(cluster => dayLeadHtml([cluster])).join('')}
 ${rows.map(e => {
       const open = notYetOpen && !e.noise
       if (open) notYetOpen = false
-      return entryCard(e, open, relatedIdx, { hideChurn: true })
+      return entryCard(e, open, relatedIdx, { hideChurn: true, storyNotes: storyIdx.notes.get(e.sha) })
     }).join('\n')}</section>`
 
     return hero + dayHtml + pagePager(i)
@@ -1461,7 +1494,7 @@ ${rows.map(e => {
       desc: `Freebuff v${rel.version}: ${mine.length} changes since the previous release.`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(rel.version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Freebuff v${esc(rel.version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p><div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button type="button" class="btn-copy-relnotes" onclick="navigator.clipboard.writeText(document.getElementById('relnotes-md').value).then(()=>{const b=this;b.textContent='[copied: paste into GitHub release]';setTimeout(()=>b.textContent='[copy release notes]',3000)})">[copy release notes]</button><textarea id="relnotes-md" hidden style="display:none">${esc(relNotesMd)}</textarea></div></div></section>` +
         relPager +
-        `<section class="day">${[rel, ...relHead].map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx)).join('\n')}${relTailRows}</section>` +
+        `<section class="day">${[rel, ...relHead].map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx, { storyNotes: storyIdx.notes.get(e.sha) })).join('\n')}${relTailRows}</section>` +
         relPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/archive/#releases">&larr; [all releases]</a> &middot; <a href="/">[latest]</a></p>`
     }))
@@ -2674,15 +2707,16 @@ ${inFlightScript}`
 
   // ----- feeds: main (all changes), major+notable, models-only, releases-only
   const titleOf = (e) => e.ai?.title || e.title || deriveTitleSafe(e)
-  const mainItems = entries.filter(e => !e.noise).slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
-  const majorItems = entries.filter(e => !e.noise && e.significance !== 'minor').slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
-  const modelItems = modelEntries.slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
-  const releaseItems = [...vers].reverse().slice(0, 60).map(e => feedItem(SITE.url, e, titleOf)).join('')
+  const rssItem = e => feedItem(SITE.url, e, titleOf, storyIdx.notes.get(e.sha))
+  const mainItems = entries.filter(e => !e.noise).slice(0, 60).map(rssItem).join('')
+  const majorItems = entries.filter(e => !e.noise && e.significance !== 'minor').slice(0, 60).map(rssItem).join('')
+  const modelItems = modelEntries.slice(0, 60).map(rssItem).join('')
+  const releaseItems = [...vers].reverse().slice(0, 60).map(rssItem).join('')
   await write(dist, 'feed.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed.xml', SITE.name, SITE.desc, mainItems))
   await write(dist, 'feed-major.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-major.xml', `${SITE.name}: major + notable`, 'Major model additions and notable user-visible feature changes.', majorItems))
   await write(dist, 'feed-models.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-models.xml', `${SITE.name}: models`, 'Model catalog additions, retirements, and swaps in the Freebuff free picker.', modelItems))
   await write(dist, 'feed-releases.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-releases.xml', `${SITE.name}: releases`, 'Freebuff CLI and core package version bumps.', releaseItems))
-  const mainJsonItems = entries.filter(e => !e.noise).slice(0, 60).map(e => jsonItem(SITE.url, e, titleOf))
+  const mainJsonItems = entries.filter(e => !e.noise).slice(0, 60).map(e => jsonItem(SITE.url, e, titleOf, storyIdx.notes.get(e.sha)))
   await write(dist, 'feed.json', feedJson(SITE.url, generated, SITE.name, SITE.desc, 'feed.json', mainJsonItems))
   await write(dist, 'feed.xsl', FEED_XSL)
   await writeBinary(`${dist.replace(/\/$/, '')}/favicon.ico`, generateFaviconIco())
