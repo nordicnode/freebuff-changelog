@@ -474,11 +474,6 @@ nav.term-nav a.active{
 .badge.cat{
   color:var(--txt-subtle);
 }
-.badge.badge-eli5{
-  color:var(--term-amber);
-  border-color:var(--amber-tint-border);
-  background:var(--eli5-bg);
-}
 .permalink{
   opacity:0;
   margin-left:auto;

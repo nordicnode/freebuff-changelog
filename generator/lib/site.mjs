@@ -650,7 +650,6 @@ function badges (e) {
   if (e.version) b.push(`<a class="badge ver" href="/release/${e.version}/" onclick="event.stopPropagation()">[v${e.version}]</a>`)
   if (e.kind === 'community' && e.pr) b.push(`<span class="badge">[PR #${e.pr}]</span>`)
   b.push(`<span class="badge cat">[${esc(e.category)}]</span>`)
-  if (e.eli5?.text) b.push('<span class="badge badge-eli5" title="Plain English explanation inside">[plain english]</span>')
   return b.join('')
 }
 
@@ -2208,12 +2207,11 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       const u = '/day/' + e[0] + '/#' + e[3];
       const a = sigs[e[4]] || '', c = cats[e[2]] || '';
       const sigTag = a === 'major' ? '<span class="badge maj">[MAJOR]</span>' : (a === 'notable' ? '<span class="badge not">[NOTABLE]</span>' : '');
-      const eli5Tag = e[5] ? '<span class="badge badge-eli5">[plain english]</span>' : '';
       const eli5Snippet = e[5] ? '<p class="search-eli5"><span class="search-eli5-lbl">PLAIN ENGLISH:</span> ' + highlight(e[5], w) + '</p>' : '';
       return '<article class="entry ' + a + '"><div class="entry-meta-top">' +
         '<span class="commit-ref">commit ' + esc(e[3]) + '</span>' +
         '<span class="entry-utc">' + esc(e[0]) + '</span>' +
-        '<div class="badges"><span class="badge cat">[' + esc(c) + ']</span>' + sigTag + eli5Tag + '</div>' +
+        '<div class="badges"><span class="badge cat">[' + esc(c) + ']</span>' + sigTag + '</div>' +
         '</div>' +
         '<h3><a href="' + u + '">' + highlight(e[1], w) + '</a></h3>' +
         eli5Snippet +
