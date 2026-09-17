@@ -214,6 +214,7 @@ document.addEventListener('keydown', (e) => {
   }
 
   if (isInput) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
 
   if (e.key === '?') {
     e.preventDefault();
@@ -282,14 +283,14 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
-  if (e.key === 'n') {
-    const nextLink = document.querySelector('.pager-timeline a[rel="' + 'next"], .pager a:last-child');
+  if (e.key === 'n' || e.key === 'N') {
+    const nextLink = document.querySelector('.pager a[rel="' + 'next"]');
     if (nextLink && nextLink.href) { window.location.href = nextLink.href; }
     return;
   }
 
-  if (e.key === 'p') {
-    const prevLink = document.querySelector('.pager-timeline a[rel="' + 'prev"], .pager a:first-child');
+  if (e.key === 'p' || e.key === 'P') {
+    const prevLink = document.querySelector('.pager a[rel="' + 'prev"]');
     if (prevLink && prevLink.href) { window.location.href = prevLink.href; }
     return;
   }
@@ -1390,8 +1391,8 @@ ${rows.map(e => {
     const prevRel = i > 0 ? vers[i - 1] : null
     const nextRel = i < vers.length - 1 ? vers[i + 1] : null
     const relPager = `<div class="pager">` +
-      (prevRel ? `<a href="/release/${prevRel.version}/">&larr; v${esc(prevRel.version)}</a>` : '<span></span>') +
-      (nextRel ? `<a href="/release/${nextRel.version}/">v${esc(nextRel.version)} &rarr;</a>` : '<span></span>') +
+      (prevRel ? `<a href="/release/${prevRel.version}/" rel="prev">&larr; v${esc(prevRel.version)}</a>` : '<span class="pager-disabled">&larr;</span>') +
+      (nextRel ? `<a href="/release/${nextRel.version}/" rel="next">v${esc(nextRel.version)} &rarr;</a>` : '<span class="pager-disabled">&rarr;</span>') +
       `</div>`
     const relNotesMd = generateReleaseNotesMarkdown(rel, mineSorted)
     await write(dist, `release/${rel.version}/index.html`, layout({

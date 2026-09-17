@@ -1231,6 +1231,11 @@ test('in-flight page paginates open PRs into pages of 25 with keyboard and pill 
   assert.match(page3, /<a href="\/in-flight\/page\/2\/" rel="prev">&larr; newer PRs<\/a>/)
   assert.match(page3, /<span class="pager-disabled">older PRs &rarr;<\/span>/)
   assert.match(page3, /<span class="pager-num active">\[3\]<\/span>/)
+
+  // Verify n / p keyboard script has no flawed first-child / last-child fallbacks
+  assert.match(page1, /\.pager a\[rel=/, 'script strictly targets rel pager links')
+  assert.doesNotMatch(page1, /\.pager a:(?:first|last)-child/, 'no broken first-child/last-child fallbacks that bounce pages')
+  assert.match(page1, /ctrlKey \|\| e\.metaKey \|\| e\.altKey/, 'modifier keys like Cmd+P / Ctrl+P are protected')
 })
 
 
