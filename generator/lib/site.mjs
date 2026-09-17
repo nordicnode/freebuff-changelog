@@ -28,7 +28,7 @@ function miniMd (text) {
 function layout ({ title, path, body, desc, noindex, ogImage, wide }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
-<script>(function(){try{var t=localStorage.getItem('fbTheme');if(t){document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='light'?'#f6f8fa':(t==='amber'?'#120d04':(t==='green'?'#051207':'#0d1117'));}}catch(_){}})();</script>
+<script>(function(){try{var t=localStorage.getItem('fbTheme');if(t){document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='light'?'#f6f8fa':(t==='amber'?'#120d04':(t==='green'?'#051207':'#0d1117'));}if(localStorage.getItem('fbPlainMode')==='1'){document.documentElement.classList.add('reading-mode-plain');}}catch(_){}})();</script>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#0d1117">
 <title>${esc(title)} · ${SITE.name}</title>
@@ -315,18 +315,41 @@ document.addEventListener('click', (ev) => {
   });
 });
 
-// Plain English reading mode toggle for timeline
-document.addEventListener('click', (ev) => {
-  const btn = ev.target.closest ? ev.target.closest('[data-reading-mode]') : null;
-  if (!btn) return;
-  const isPlain = document.body.classList.toggle('reading-mode-plain');
-  btn.textContent = isPlain ? '[plain english: on]' : '[plain english: off]';
-  btn.classList.toggle('active', isPlain);
+// Plain English reading mode toggle for timeline & persistence across refresh
+function applyReadingMode (isPlain) {
+  document.documentElement.classList.toggle('reading-mode-plain', isPlain);
+  if (document.body) document.body.classList.toggle('reading-mode-plain', isPlain);
+  document.querySelectorAll('[data-reading-mode]').forEach(btn => {
+    btn.textContent = isPlain ? '[plain english: on]' : '[plain english: off]';
+    btn.classList.toggle('active', isPlain);
+  });
   if (isPlain) {
     document.querySelectorAll('section.day details.entry:not([hidden])').forEach(e => {
       if (e.querySelector('.eli5')) e.open = true;
     });
   }
+}
+
+function syncReadingMode () {
+  let isPlain = false;
+  try { isPlain = localStorage.getItem('fbPlainMode') === '1'; } catch (_) {}
+  if (isPlain || document.documentElement.classList.contains('reading-mode-plain')) {
+    applyReadingMode(true);
+  }
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', syncReadingMode);
+} else {
+  syncReadingMode();
+}
+
+document.addEventListener('click', (ev) => {
+  const btn = ev.target.closest ? ev.target.closest('[data-reading-mode]') : null;
+  if (!btn) return;
+  const isCurrentlyPlain = document.documentElement.classList.contains('reading-mode-plain') || (document.body && document.body.classList.contains('reading-mode-plain'));
+  const nextPlain = !isCurrentlyPlain;
+  try { localStorage.setItem('fbPlainMode', nextPlain ? '1' : '0'); } catch (_) {}
+  applyReadingMode(nextPlain);
 });
 
 // Theme switcher button click handler

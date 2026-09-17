@@ -357,6 +357,8 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /budgetMin \* 2/)
     assert.match(indexHtml, /fbReload:/)
     assert.match(indexHtml, /visibilitychange/)
+    assert.match(indexHtml, /fbPlainMode/, 'layout head and client scripts persist plain English mode')
+    assert.match(indexHtml, /reading-mode-plain/, 'reading-mode-plain is supported in layout scripts')
     // Full changelog.json no longer ships to dist (6.9MB dead payload)
     await assert.rejects(readFile(join(tmpDist, 'changelog.json'), 'utf8'))
 
