@@ -474,6 +474,11 @@ nav.term-nav a.active{
 .badge.cat{
   color:var(--txt-subtle);
 }
+.badge.badge-eli5{
+  color:var(--term-amber);
+  border-color:var(--amber-tint-border);
+  background:var(--eli5-bg);
+}
 .permalink{
   opacity:0;
   margin-left:auto;
@@ -2441,5 +2446,47 @@ mark.search-match{
 .model-search-input:focus{
   outline:none;
   border-color:var(--term-cyan);
+}
+.timeline-reading-mode-btn.active{
+  color:var(--term-amber);
+  font-weight:700;
+}
+.reading-mode-plain .entry:has(.eli5){
+  border-left-color:var(--term-amber);
+}
+.reading-mode-plain .entry-body{
+  display:flex;
+  flex-direction:column;
+}
+.reading-mode-plain .eli5{
+  order:-1;
+  margin:0 0 12px;
+  box-shadow:0 0 8px rgba(210,153,34,0.15);
+}
+.eli5-copy{
+  color:var(--term-amber);
+  border-color:rgba(210,153,34,0.3);
+}
+.eli5-copy:hover{
+  color:var(--term-amber);
+  border-color:var(--term-amber);
+  background:var(--eli5-bg);
+}
+.search-eli5{
+  margin:6px 0 0;
+  font-size:.82rem;
+  line-height:1.45;
+  color:var(--txt-dim);
+  padding:4px 8px;
+  background:var(--eli5-bg);
+  border-left:2px solid var(--term-amber);
+  border-radius:0 2px 2px 0;
+}
+.search-eli5-lbl{
+  font-size:.7rem;
+  font-weight:700;
+  letter-spacing:.05em;
+  color:var(--term-amber);
+  margin-right:4px;
 }
 `

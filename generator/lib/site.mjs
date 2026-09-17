@@ -315,6 +315,20 @@ document.addEventListener('click', (ev) => {
   });
 });
 
+// Plain English reading mode toggle for timeline
+document.addEventListener('click', (ev) => {
+  const btn = ev.target.closest ? ev.target.closest('[data-reading-mode]') : null;
+  if (!btn) return;
+  const isPlain = document.body.classList.toggle('reading-mode-plain');
+  btn.textContent = isPlain ? '[plain english: on]' : '[plain english: off]';
+  btn.classList.toggle('active', isPlain);
+  if (isPlain) {
+    document.querySelectorAll('section.day details.entry:not([hidden])').forEach(e => {
+      if (e.querySelector('.eli5')) e.open = true;
+    });
+  }
+});
+
 // Theme switcher button click handler
 document.addEventListener('click', (ev) => {
   const btn = ev.target.closest ? ev.target.closest('[data-theme-val]') : null;
@@ -350,6 +364,19 @@ document.addEventListener('click', (ev) => {
   copyText(btn.dataset.dc || '').then((ok) => {
     const orig = btn.textContent;
     btn.textContent = ok ? '[copied: paste into Discord]' : '[copy blocked]';
+    btn.classList.toggle('dc-ok', ok);
+    setTimeout(() => { btn.textContent = orig; btn.classList.remove('dc-ok'); }, 2400);
+  });
+});
+
+document.addEventListener('click', (ev) => {
+  const btn = ev.target.closest ? ev.target.closest('.eli5-copy') : null;
+  if (!btn) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  copyText(btn.dataset.eli5 || '').then((ok) => {
+    const orig = btn.textContent;
+    btn.textContent = ok ? '[copied plain english]' : '[copy blocked]';
     btn.classList.toggle('dc-ok', ok);
     setTimeout(() => { btn.textContent = orig; btn.classList.remove('dc-ok'); }, 2400);
   });
@@ -623,6 +650,7 @@ function badges (e) {
   if (e.version) b.push(`<a class="badge ver" href="/release/${e.version}/" onclick="event.stopPropagation()">[v${e.version}]</a>`)
   if (e.kind === 'community' && e.pr) b.push(`<span class="badge">[PR #${e.pr}]</span>`)
   b.push(`<span class="badge cat">[${esc(e.category)}]</span>`)
+  if (e.eli5?.text) b.push('<span class="badge badge-eli5" title="Plain English explanation inside">[plain english]</span>')
   return b.join('')
 }
 
@@ -781,6 +809,7 @@ ${relatedLine(e, relatedIdx)}
   <span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i> &middot; ${e.files.total} file${e.files.total === 1 ? '' : 's'}</span>
   <div class="meta-links">
     <button class="meta-link dc-copy" type="button" data-dc="${esc(discordText(e))}" title="Copy this entry as Discord-formatted text (c)">discord</button>
+    ${e.eli5?.text ? `<button class="meta-link eli5-copy" type="button" data-eli5="${esc(e.eli5.text)}" title="Copy plain-English explanation to clipboard">plain english</button>` : ''}
     ${e.sourceSha ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" rel="noopener" target="_blank">snapshot</a>` : ''}
     ${e.pr ? `<a class="meta-link" href="${esc(e.prUrl || '')}" rel="noopener" target="_blank">PR #${e.pr}</a>` : ''}
     ${e.compareUrl ? `<a class="meta-link" href="${esc(e.compareUrl)}" rel="noopener" target="_blank">compare</a>` : e.url ? `<a class="meta-link" href="${esc(e.url)}" rel="noopener" target="_blank">commit</a>` : ''}
@@ -881,7 +910,8 @@ function dcDetails (e) {
   return rows.map(r => `${r[0].padEnd(w)}  ${String(r[1]).replace(/`/g, '')}`).join('\n')
 }
 
-export function discordText (e) {
+export function discordText (e, opts = {}) {
+  const plainOnly = Boolean(opts.plainOnly)
   const title = e.ai?.title || e.title || deriveTitleSafe(e)
   const sum = String(e.ai?.summary || e.summary || '').replace(/\s+/g, ' ').trim()
   const sig = e.significance === 'noise' ? 'churn' : e.significance
@@ -890,49 +920,55 @@ export function discordText (e) {
   const parts = [head.join(' · '), `### ${dcEsc(title)}`]
   // Every line of a quote needs its own `>`: a wrapped continuation is fine, but a
   // hard newline without it would drop out of the quote and lose the rule.
-    let eli5Idx = -1, eli5Full = ''
-    if (e.eli5?.text) {
-      eli5Full = String(e.eli5.text).replace(/\s+/g, ' ').trim()
-      eli5Idx = parts.length
-      parts.push(`> **In plain English**\n> ${dcSentences(eli5Full).map(dcEsc).join('\n> ')}`)
-    }
+  let eli5Idx = -1, eli5Full = ''
+  if (e.eli5?.text) {
+    eli5Full = String(e.eli5.text).replace(/\s+/g, ' ').trim()
+    eli5Idx = parts.length
+    parts.push(`> **In plain English**\n> ${dcSentences(eli5Full).map(dcEsc).join('\n> ')}`)
+  }
   let sumIdx = -1
-  if (sum) { sumIdx = parts.length; parts.push(dcSentences(sum).map(dcEsc).join('\n')) }
+  if (!plainOnly && sum) { sumIdx = parts.length; parts.push(dcSentences(sum).map(dcEsc).join('\n')) }
   const added = e.modelChanges?.added || [], removed = e.modelChanges?.removed || []
   if (added.length || removed.length) {
     const rows = [...removed.map(m => `- \`−\` ~~${dcEsc(m)}~~`), ...added.map(m => `- \`+\` **${dcEsc(m)}**`)]
     parts.push(`**Model catalog**\n${rows.join('\n')}`)
   }
-  const facts = (e.facts || []).slice(0, 3).map(f => `- ${dcEsc(clipText(f, 160))}`)
   let factsIdx = -1
-  if (facts.length) { factsIdx = parts.length; parts.push(`**Highlights**\n${facts.join('\n')}`) }
-  parts.push(`**Details**\n\`\`\`\n${dcDetails(e)}\n\`\`\``)
-    let text = parts.join('\n\n')
-    // Give up detail in reverse order of value: the highlights list, then the tail
-    // of the summary, then the tail of the quote. The header and details are what
-    // identify the change, so they are never cut; the quote keeps its head.
-    if (text.length > DC_LIMIT && factsIdx >= 0) { parts.splice(factsIdx, 1); if (sumIdx > factsIdx) sumIdx--; if (eli5Idx > factsIdx) eli5Idx--; text = parts.join('\n\n') }
-    if (text.length > DC_LIMIT && sumIdx >= 0) {
-      const room = DC_LIMIT - (text.length - parts[sumIdx].length) - 8
-      parts[sumIdx] = dcEsc(clipText(sum, Math.max(0, room)))
-      text = parts.join('\n\n')
-    }
-    if (text.length > DC_LIMIT && eli5Idx >= 0) {
-      const room = DC_LIMIT - (text.length - parts[eli5Idx].length) - 8
-      const clipped = clipText(eli5Full, Math.max(0, room))
-      parts[eli5Idx] = `> **In plain English**\n> ${dcSentences(clipped).map(dcEsc).join('\n> ')}`
-      text = parts.join('\n\n')
-    }
-    return text.length > DC_LIMIT ? text.slice(0, DC_LIMIT - 1) + '…' : text
+  if (!plainOnly) {
+    const facts = (e.facts || []).slice(0, 3).map(f => `- ${dcEsc(clipText(f, 160))}`)
+    if (facts.length) { factsIdx = parts.length; parts.push(`**Highlights**\n${facts.join('\n')}`) }
+    parts.push(`**Details**\n\`\`\`\n${dcDetails(e)}\n\`\`\``)
+  } else if (!e.eli5?.text && sum) {
+    sumIdx = parts.length
+    parts.push(dcSentences(sum).map(dcEsc).join('\n'))
+  }
+  let text = parts.join('\n\n')
+  // Give up detail in reverse order of value: the highlights list, then the tail
+  // of the summary, then the tail of the quote. The header and details are what
+  // identify the change, so they are never cut; the quote keeps its head.
+  if (text.length > DC_LIMIT && factsIdx >= 0) { parts.splice(factsIdx, 1); if (sumIdx > factsIdx) sumIdx--; if (eli5Idx > factsIdx) eli5Idx--; text = parts.join('\n\n') }
+  if (text.length > DC_LIMIT && sumIdx >= 0) {
+    const room = DC_LIMIT - (text.length - parts[sumIdx].length) - 8
+    parts[sumIdx] = dcEsc(clipText(sum, Math.max(0, room)))
+    text = parts.join('\n\n')
+  }
+  if (text.length > DC_LIMIT && eli5Idx >= 0) {
+    const room = DC_LIMIT - (text.length - parts[eli5Idx].length) - 8
+    const clipped = clipText(eli5Full, Math.max(0, room))
+    parts[eli5Idx] = `> **In plain English**\n> ${dcSentences(clipped).map(dcEsc).join('\n> ')}`
+    text = parts.join('\n\n')
+  }
+  return text.length > DC_LIMIT ? text.slice(0, DC_LIMIT - 1) + '…' : text
 }
 
 // Search ranking (mirrored client-side): title hits beat category hits,
 // significance boosts, recency breaks ties. Exported for unit tests.
-export function scoreHit (title, cat, sig, day, words) {
-  const t = title.toLowerCase(), c = cat.toLowerCase()
+export function scoreHit (title, cat, sig, day, words, eli5 = '') {
+  const t = title.toLowerCase(), c = cat.toLowerCase(), el = (eli5 || '').toLowerCase()
   let s = 0
   for (const w of words) {
     if (t.includes(w)) s += w.length > 4 ? 3 : 2
+    else if (el.includes(w)) s += 2
     else if (c.includes(w)) s += 1
     else return -1
   }
@@ -1180,6 +1216,7 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
     <div class="timeline-bulk-toggle">
       <button type="button" class="timeline-bulk-btn" data-bulk="expand">[expand all]</button>
       <button type="button" class="timeline-bulk-btn" data-bulk="collapse">[collapse all]</button>
+      <button type="button" class="timeline-bulk-btn timeline-reading-mode-btn" data-reading-mode title="Toggle Plain English reading mode (prioritizes plain-language summaries on every card)">[plain english: off]</button>
     </div>
   </div>`
 
@@ -2028,13 +2065,17 @@ ${archiveScript}`
   // c/s/a as small ints keep the 7k-entry payload lean for Workers egress.
   const SEARCH_CATS = [...new Set(entries.filter(e => !e.noise).map(e => e.category))].sort()
   const SEARCH_SIGS = ['minor', 'notable', 'major']
-  const idxJson = entries.filter(e => !e.noise).map(e => ([
-    e.day,
-    (e.ai?.title || e.title || deriveTitleSafe(e)).slice(0, 90),
-    SEARCH_CATS.indexOf(e.category),
-    e.sha.slice(0, 12),
-    SEARCH_SIGS.indexOf(e.significance)
-  ]))
+  const idxJson = entries.filter(e => !e.noise).map(e => {
+    const row = [
+      e.day,
+      (e.ai?.title || e.title || deriveTitleSafe(e)).slice(0, 90),
+      SEARCH_CATS.indexOf(e.category),
+      e.sha.slice(0, 12),
+      SEARCH_SIGS.indexOf(e.significance)
+    ]
+    if (e.eli5?.text) row.push(e.eli5.text.slice(0, 160))
+    return row
+  })
   await write(dist, 'search-index.json', JSON.stringify({ cats: SEARCH_CATS, sigs: SEARCH_SIGS, ix: idxJson }))
   await write(dist, 'search/index.html', layout({
     title: 'Search', path: '/search/',
@@ -2069,12 +2110,13 @@ ${archiveScript}`
       </label>
       <label class="filter-sel-lbl">IMPACT:
         <select id="fsig">
-          <option value="">--any impact</option>
-          ${SEARCH_SIGS.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('')}
+          <option value="">--all levels</option>
+          <option value="major">major only</option>
+          <option value="notable">notable + major</option>
         </select>
       </label>
+      <span id="match-count" style="font-size:.76rem;color:var(--txt-subtle);margin-left:auto;align-self:center"></span>
     </div>
-    <div class="search-status"><span id="match-count"></span></div>
   </div>
 </section>
 
@@ -2146,10 +2188,11 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       if (cat && c !== cat) continue;
       if (sig && a !== sig) continue;
       if (!w.length) { scored.push([0, e[0], e]); continue; }
-      const t = e[1].toLowerCase(), cl = c.toLowerCase();
+      const t = e[1].toLowerCase(), cl = c.toLowerCase(), el = (e[5] || '').toLowerCase();
       let s = 0, ok = true;
       for (const x of w) {
-        if (t.includes(x)) s += x.length > 4 ? 3 : 2;
+        if (t.includes(x)) s += x.length > 4 ? 4 : 3;
+        else if (el.includes(x)) s += 2;
         else if (cl.includes(x)) s += 1;
         else { ok = false; break; }
       }
@@ -2165,12 +2208,15 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       const u = '/day/' + e[0] + '/#' + e[3];
       const a = sigs[e[4]] || '', c = cats[e[2]] || '';
       const sigTag = a === 'major' ? '<span class="badge maj">[MAJOR]</span>' : (a === 'notable' ? '<span class="badge not">[NOTABLE]</span>' : '');
+      const eli5Tag = e[5] ? '<span class="badge badge-eli5">[plain english]</span>' : '';
+      const eli5Snippet = e[5] ? '<p class="search-eli5"><span class="search-eli5-lbl">PLAIN ENGLISH:</span> ' + highlight(e[5], w) + '</p>' : '';
       return '<article class="entry ' + a + '"><div class="entry-meta-top">' +
         '<span class="commit-ref">commit ' + esc(e[3]) + '</span>' +
         '<span class="entry-utc">' + esc(e[0]) + '</span>' +
-        '<div class="badges"><span class="badge cat">[' + esc(c) + ']</span>' + sigTag + '</div>' +
+        '<div class="badges"><span class="badge cat">[' + esc(c) + ']</span>' + sigTag + eli5Tag + '</div>' +
         '</div>' +
         '<h3><a href="' + u + '">' + highlight(e[1], w) + '</a></h3>' +
+        eli5Snippet +
         '</article>';
     }).join('') || '<p style="color:var(--txt-subtle);margin:20px 0">$ No matches found for pattern.</p>';
   };

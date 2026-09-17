@@ -281,8 +281,8 @@ test('buildSite generates valid static site output', async () => {
     assert.ok(searchIdx.cats.includes('CLI'))
     assert.deepEqual(searchIdx.sigs, ['minor', 'notable', 'major'])
     assert.equal(searchIdx.ix.length, 3)
-    assert.ok(Array.isArray(searchIdx.ix[0]))
-    assert.equal(searchIdx.ix[0].length, 5)
+    assert.equal(searchIdx.ix[0].length, 6, 'search index tuple includes ELI5 plain English text')
+    assert.ok(typeof searchIdx.ix[0][5] === 'string')
     const searchHtml = await readFile(join(tmpDist, 'search/index.html'), 'utf8')
     // The two things that made /search/ unusable on a phone, pinned:
     // min-width:0 because a flex item defaults to min-width:auto and a long
@@ -737,6 +737,14 @@ test('modelSlug + scoreHit: slugs safe, titles outrank categories', () => {  ass
   assert.ok(scoreHit('Muse Spark added', 'Model Catalog', 'major', '2026-09-13', ['muse']) > scoreHit('Other title', 'Model Catalog', 'major', '2026-09-13', ['muse']))
   assert.ok(scoreHit('Muse Spark added', 'Model Catalog', 'major', '2026-09-13', ['muse']) > scoreHit('Muse Spark added', 'Model Catalog', 'minor', '2026-09-13', ['muse']))
   assert.equal(scoreHit('Unrelated', 'CLI', 'minor', '2026-09-13', ['muse']), -1)
+
+  // ELI5 matching: title matches outrank ELI5 matches, ELI5 matches outrank category matches
+  const titleScore = scoreHit('CLI speedup', 'CLI', 'notable', '2026-09-13', ['speedup'], 'Terminal is faster')
+  const eli5Score = scoreHit('CLI overhaul', 'CLI', 'notable', '2026-09-13', ['faster'], 'Terminal is faster')
+  const catScore = scoreHit('CLI overhaul', 'Terminal CLI', 'notable', '2026-09-13', ['terminal'], 'Some note')
+  assert.ok(titleScore > eli5Score, 'title match outranks ELI5 match')
+  assert.ok(eli5Score > catScore, 'ELI5 match outranks category match')
+  assert.ok(eli5Score > 0, 'ELI5 match produces positive score')
 })
 
 test('modelTimeline: replays adds/removes oldest-first', () => {
@@ -994,6 +1002,22 @@ test('discordText: a monster entry still fits the 2000-char cap, giving up detai
   assert.ok(t.includes('**In plain English**'), 'and so does the plain-English quote')
   assert.ok(t.includes('word word'), 'the summary keeps its head and loses its tail')
   assert.ok(t.includes('long. long.'), 'the quote keeps its head too, clipped only as a last resort')
+})
+
+test('discordText: plainOnly omits codeblock diffs and produces clean plain announcement', () => {
+  const e = dcEntry()
+  const plain = discordText(e, { plainOnly: true })
+  assert.match(plain, /^### Muse Spark 1\.3 ships$/m)
+  assert.match(plain, /^> \*\*In plain English\*\*\n> The free model was replaced with a newer one\.$/m)
+  assert.ok(!plain.includes('```'), 'no details codeblock')
+  assert.ok(!plain.includes('**Details**'), 'no details section header')
+  assert.ok(!plain.includes('**Highlights**'), 'no developer highlights')
+
+  // When entry has no ELI5, plainOnly falls back cleanly to summary
+  const noEli5 = { ...e, eli5: null }
+  const plainFallback = discordText(noEli5, { plainOnly: true })
+  assert.ok(!plainFallback.includes('```'))
+  assert.ok(plainFallback.includes('Swaps muse\\_spark\\_1\\_2'))
 })
 
 test('in-flight page is honest about a short or stale PR list', async (t) => {

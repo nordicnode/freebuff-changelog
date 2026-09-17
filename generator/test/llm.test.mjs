@@ -583,6 +583,7 @@ test('buildEli5Prompt: addresses you, leads with experience, stops at sentences'
   const p = buildEli5Prompt(eli5Entry(), [], {})
   assert.match(p, /what you would notice/)
   assert.match(p, /never write "that person"/)
+  assert.match(p, /NEVER use conversational preambles/)
   assert.match(p, /Never list dates/)
 })
 

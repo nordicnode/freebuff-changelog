@@ -491,12 +491,13 @@ Rules:
 - Say whether it is live today. A constant, a flag, a field or a type that nothing reads yet is not a feature: say it is in place and does nothing yet.
 - Use only what the summary, the evidence and the comments say. Never invent a cause, a number, or a promise.
 - Keep the audience the text gives, and keep it narrow. If the change is for one kind of customer, one plan, one region, or only after some step, name that group. Never widen it to "users", "everyone" or "customers" because that reads more naturally: a program for verified YC companies is not available to users.
-  - Plain words, active voice. No "This change", "We are excited", or marketing tone.
-  - If the change is an internal refactor, test suite update, dependency bump, or maintenance change with no direct user-facing behavior, explain it honestly and plainly as behind-the-scenes housekeeping or stability maintenance. Do NOT invent or fabricate user-facing features, performance claims, or speed improvements.
-  - If the change is small or internal, say so shortly. Do not inflate it.
-  - Never address the reader as a developer.
-  - Address the reader as "you", or name the group ("users", "subscribers"); never write "that person", "the viewer" or "that individual".
-  - Stop after 2-4 sentences. Never list dates, day counts or archive calendars; end the reply there.
+- Plain words, active voice. No "This change", "We are excited", marketing tone, or generic tautologies ("various bug fixes and improvements").
+- Jump straight into what happened. NEVER use conversational preambles, filler intros, or framing phrases like "In simple terms", "Basically", "To put it simply", "In plain English", "This commit", "This update", or "This pull request". Start directly with the concrete action or subject.
+- If the change is an internal refactor, test suite update, dependency bump, or maintenance change with no direct user-facing behavior, explain it honestly and plainly as behind-the-scenes housekeeping or stability maintenance. Do NOT invent or fabricate user-facing features, performance claims, or speed improvements.
+- If the change is small or internal, say so shortly. Do not inflate it.
+- Never address the reader as a developer.
+- Address the reader as "you", or name the group ("users", "subscribers"); never write "that person", "the viewer" or "that individual".
+- Stop after 2-4 sentences. Never list dates, day counts or archive calendars; end the reply there.
 
 Reply with JSON only: {"eli5": "..."}`
 }

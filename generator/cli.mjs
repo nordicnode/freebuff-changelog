@@ -1134,6 +1134,7 @@ export async function cmdBroadcast (argv = [], { fetchImpl = globalThis.fetch, d
   const limit = limitIdx !== -1 ? Math.max(1, Number(argv[limitIdx + 1]) || 5) : 5
   const dryRun = argv.includes('--dry-run')
   const force = argv.includes('--force')
+  const plainOnly = argv.includes('--plain') || argv.includes('--eli5')
 
   if (!webhook && !dryRun) {
     console.error('Error: Discord webhook URL required (via --webhook <url> or DISCORD_WEBHOOK_URL env var).')
@@ -1172,15 +1173,15 @@ export async function cmdBroadcast (argv = [], { fetchImpl = globalThis.fetch, d
     return { ok: true, count: 0 }
   }
 
-  log(`[broadcast] ${pending.length} commit${pending.length === 1 ? '' : 's'} to broadcast${dryRun ? ' (dry-run)' : ''}`)
+  log(`[broadcast] ${pending.length} commit${pending.length === 1 ? '' : 's'} to broadcast${dryRun ? ' (dry-run)' : ''}${plainOnly ? ' [plain english]' : ''}`)
 
   const { discordText } = await import('./lib/site.mjs')
 
   let sent = 0
   for (const e of pending) {
-    const text = discordText(e)
+    const text = discordText(e, { plainOnly })
     if (dryRun) {
-      console.log(`\n--- [DRY-RUN BROADCAST ${e.sha.slice(0, 10)}] ---\n${text}\n-----------------------------------\n`)
+      console.log(`\n--- [DRY-RUN BROADCAST${plainOnly ? ' (PLAIN ENGLISH)' : ''} ${e.sha.slice(0, 10)}] ---\n${text}\n-----------------------------------\n`)
       sent++
       continue
     }

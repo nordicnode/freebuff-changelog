@@ -99,3 +99,28 @@ test('cmdBroadcast: ignores churn/noise commits', async (t) => {
   const state = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
   assert.equal(state.lastBroadcastSha, '222222222222')
 })
+
+test('cmdBroadcast: supports --plain / --eli5 flag to broadcast plain English announcements', async (t) => {
+  const dir = await tmpData(t)
+  await writeFile(join(dir, 'changelog.json'), JSON.stringify({
+    entries: [mockCommit('222222222222', 'Feature commit')]
+  }))
+  await writeFile(join(dir, 'state.json'), JSON.stringify({
+    lastSha: '222222222222', runs: 1
+  }))
+
+  const calls = []
+  const fetchImpl = async (url, opts) => {
+    calls.push({ url, opts, body: JSON.parse(opts.body) })
+    return { ok: true, status: 204 }
+  }
+
+  const res = await cmdBroadcast(['--webhook', 'https://discord.com/api/webhooks/test', '--plain', '--force'], { fetchImpl, dataDir: dir })
+  assert.equal(res.ok, true)
+  assert.equal(res.count, 1)
+  assert.equal(calls.length, 1)
+  assert.match(calls[0].body.content, /> \*\*In plain English\*\*/)
+  assert.match(calls[0].body.content, /Plain english explanation\./)
+  assert.ok(!calls[0].body.content.includes('```'), 'plain broadcast omits monospace details block')
+  assert.ok(!calls[0].body.content.includes('**Details**'), 'plain broadcast omits details section')
+})
