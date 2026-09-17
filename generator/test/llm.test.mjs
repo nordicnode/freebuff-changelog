@@ -502,6 +502,35 @@ test('eli5Patch: an unreadable diff never fails the pass', async () => {
   assert.equal(await eli5Patch(eli5Entry(), async () => 'patch text'), 'patch text')
 })
 
+test('enrichEli5: a 5xx retry keeps the eli5 validator (not the summary schema)', async (t) => {
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-eli5-retry-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  // Fire retry timers immediately: the behavior under test is the validator
+  // handoff, not the backoff delay.
+  t.mock.method(globalThis, 'setTimeout', (fn, ...args) => { fn(...args); return 0 })
+  let calls = 0
+  const orig = globalThis.fetch
+  globalThis.fetch = async () => {
+    calls++
+    if (calls === 1) return { ok: false, status: 503, headers: { get: () => null }, text: async () => 'bad gateway' }
+    return {
+      ok: true, status: 200, headers: { get: () => null },
+      text: async () => JSON.stringify({ choices: [{ message: { content: JSON.stringify({ eli5: 'Access moved for that region last week.' }) } }] })
+    }
+  }
+  try {
+    const e = eli5Entry()
+    assert.equal(await enrichEli5([e], dir, { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1', LLM_MODEL: 'm' }), 1)
+    assert.equal(calls, 2, 'the request was retried once')
+    assert.match(e.eli5.text, /Access moved/, 'the retried response was validated as eli5, not rejected as missing a title')
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
 test('enrichEli5: spends the budget where a story exists, not on version bumps', async (t) => {
   const { mkdtemp, rm } = await import('node:fs/promises')
   const { tmpdir } = await import('node:os')

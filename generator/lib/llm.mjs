@@ -205,12 +205,12 @@ async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
     const waitMs = Number(res.headers.get('retry-after')) * 1000 || 1000 * 2 ** attempt
     log(`LLM rate-limited (429): waiting ${(waitMs / 1000).toFixed(0)}s before retry ${attempt}/3`)
     await new Promise(r => setTimeout(r, Math.min(waitMs, 30000)))
-    return callLlm(prompt, env, attempt + 1)
+    return callLlm(prompt, env, attempt + 1, validate)
   }
   // 5xx gateways (tunnel 522s included): one delayed retry, then a short error.
   if (res.status >= 500 && res.status <= 599 && attempt === 1) {
     await new Promise(r => setTimeout(r, 5000))
-    return callLlm(prompt, env, attempt + 1)
+    return callLlm(prompt, env, attempt + 1, validate)
   }
     if (!res.ok) throw new Error(shortError(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`))
     const rawText = await res.text()
