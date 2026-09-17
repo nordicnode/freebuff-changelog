@@ -1074,6 +1074,8 @@ button.meta-link.dc-ok{
   border-radius:2px;
   padding:8px 12px;
   font-size:.84rem;
+  word-break:break-word;
+  overflow-wrap:anywhere;
 }
 .model-row-date{
   white-space:nowrap;
@@ -1092,6 +1094,8 @@ button.meta-link.dc-ok{
 .model-row-title{
   color:var(--txt-dim);
   font-size:.78rem;
+  word-break:break-word;
+  overflow-wrap:anywhere;
 }
 
 .model-matrix-wrap{
@@ -1100,6 +1104,7 @@ button.meta-link.dc-ok{
   border:1px solid var(--term-border);
   border-radius:3px;
   padding:12px;
+  overflow-x:hidden;
 }
 .matrix-scrubber-box{
   display:flex;
@@ -1130,10 +1135,25 @@ button.meta-link.dc-ok{
   cursor:pointer;
   accent-color:var(--term-cyan);
 }
+.matrix-selected-event{
+  font-size:.78rem;
+  color:var(--txt-dim);
+  margin-top:2px;
+  word-break:break-word;
+  overflow-wrap:anywhere;
+}
+.matrix-selected-event a{
+  color:var(--txt);
+  text-decoration:none;
+}
+.matrix-selected-event a:hover{
+  text-decoration:underline;
+  color:var(--term-cyan);
+}
 .model-matrix-filters{
   display:flex;
   gap:6px;
-  margin-bottom:10px;
+  margin-bottom:12px;
   flex-wrap:wrap;
 }
 .model-filter-btn{
@@ -1156,36 +1176,141 @@ button.meta-link.dc-ok{
   color:var(--term-cyan);
   font-weight:700;
 }
-.matrix-table-scroll{
-  overflow-x:auto;
-  -webkit-overflow-scrolling:touch;
-}
 .model-matrix-table{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
   width:100%;
-  border-collapse:collapse;
+  box-sizing:border-box;
+}
+.model-timeline-item{
+  background:var(--code);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  padding:10px 12px;
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  transition:border-color .15s, background .15s;
+  box-sizing:border-box;
+  width:100%;
+}
+.model-timeline-item:hover{
+  border-color:var(--term-border-strong);
+}
+.model-timeline-item.active-at-date{
+  border-color:rgba(88,166,255,0.45);
+  background:rgba(88,166,255,0.03);
+}
+.mt-item-hdr{
+  display:flex;
+  justify-content:space-between;
+  align-items:baseline;
+  flex-wrap:wrap;
+  gap:8px;
+}
+.mt-item-title-wrap{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
+.mt-model-name{
+  font-size:.88rem;
+  font-weight:700;
+  color:var(--txt);
+  text-decoration:none;
+}
+.mt-model-name:hover{
+  color:var(--term-cyan);
+  text-decoration:underline;
+}
+.mt-item-meta{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-size:.76rem;
+  color:var(--txt-dim);
+  flex-wrap:wrap;
+}
+.mt-lifespan{
+  color:var(--txt-subtle);
+  font-family:monospace;
+}
+.mt-days-pill{
+  background:rgba(255,255,255,0.06);
+  padding:1px 6px;
+  border-radius:2px;
+  font-size:.72rem;
+  color:var(--txt-dim);
+}
+.mt-bar-container{
+  display:flex;
+  flex-direction:column;
+  gap:3px;
+  width:100%;
+}
+.mt-bar-track{
+  position:relative;
+  width:100%;
+  height:8px;
+  background:rgba(255,255,255,0.04);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  overflow:hidden;
+}
+.mt-bar-segment{
+  position:absolute;
+  top:0;
+  bottom:0;
+  border-radius:1px;
+}
+.mt-bar-segment.live{
+  background:var(--term-green);
+  box-shadow:0 0 6px rgba(63,185,80,0.35);
+}
+.mt-bar-segment.retired{
+  background:var(--term-cyan);
+  opacity:0.85;
+}
+.mt-bar-axis{
+  display:flex;
+  justify-content:space-between;
+  font-size:.68rem;
+  color:var(--txt-subtle);
+  font-family:monospace;
+}
+.mt-milestones{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  border-top:1px dashed var(--term-border);
+  padding-top:6px;
+  margin-top:2px;
+}
+.mt-milestone{
+  display:flex;
+  align-items:baseline;
+  gap:6px;
+  font-size:.76rem;
+  flex-wrap:wrap;
+  word-break:break-word;
+  overflow-wrap:anywhere;
+}
+.mt-milestone-tag{
+  font-family:monospace;
+  font-weight:700;
   font-size:.74rem;
 }
-.model-matrix-table th, .model-matrix-table td{
-  padding:5px 8px;
-  border:1px solid var(--term-border);
-  text-align:left;
-  white-space:nowrap;
+.mt-milestone-date a{
+  color:var(--term-cyan);
+  text-decoration:none;
 }
-.model-matrix-table th{
-  background:var(--code);
+.mt-milestone-date a:hover{
+  text-decoration:underline;
+}
+.mt-milestone-desc{
   color:var(--txt-dim);
-  font-weight:700;
-}
-.matrix-cell-active{
-  background:rgba(63,185,80,0.18);
-  color:var(--term-green);
-  text-align:center;
-  font-weight:700;
-}
-.matrix-cell-inactive{
-  background:transparent;
-  color:var(--txt-subtle);
-  text-align:center;
 }
 
 .search-input-row{

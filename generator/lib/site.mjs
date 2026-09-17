@@ -1427,25 +1427,118 @@ ${rows.map(e => {
       date: e.day,
       sha: e.sha.slice(0, 10),
       title: e.ai?.title || e.title || '',
+      added: e.modelChanges?.added || [],
+      removed: e.modelChanges?.removed || [],
       active: [...currentLineup].sort()
     })
   }
 
-  // Model matrix table
-  const matrixHeaders = dateSnapshots.map(s => `<th title="${esc(s.title)}">${esc(s.date.slice(5))}</th>`).join('')
-  const matrixRows = allModels.map(m => {
+  const minDate = dateSnapshots[0]?.date || ''
+  const maxDate = dateSnapshots.at(-1)?.date || ''
+  const minTime = minDate ? new Date(minDate).getTime() : 0
+  const maxTime = maxDate ? new Date(maxDate).getTime() : 0
+  const totalTime = Math.max(1, maxTime - minTime)
+
+  const modelTimelineData = allModels.map(m => {
     const isLive = modelLive.includes(m)
-    const cells = dateSnapshots.map(s => {
-      const active = s.active.includes(m)
-      return active
-        ? `<td class="matrix-cell-active" title="${esc(m)} active on ${s.date}">●</td>`
-        : `<td class="matrix-cell-inactive" title="Inactive">·</td>`
-    }).join('')
-    return `<tr class="matrix-row" data-model="${esc(m.toLowerCase())}" data-status="${isLive ? 'live' : 'retired'}">
-      <td><b><a href="/models/${modelSlug(m)}/">${esc(m)}</a></b></td>
-      <td><span class="mc-tag" style="color:${isLive ? 'var(--term-green)' : 'var(--term-red)'}">${isLive ? 'LIVE' : 'OUT'}</span></td>
-      ${cells}
-    </tr>`
+    const intervals = []
+    let inInterval = false
+    let start = null
+    for (const s of dateSnapshots) {
+      const isActive = s.active.includes(m)
+      if (isActive && !inInterval) {
+        inInterval = true
+        start = s.date
+      } else if (!isActive && inInterval) {
+        inInterval = false
+        intervals.push({ start, end: s.date })
+        start = null
+      }
+    }
+    if (inInterval) {
+      intervals.push({ start, end: null })
+    }
+
+    const milestones = []
+    for (const e of sortedModelEntries) {
+      const isAdded = (e.modelChanges?.added || []).includes(m)
+      const isRemoved = (e.modelChanges?.removed || []).includes(m)
+      if (isAdded) {
+        const tableRow = e.modelChanges?.tables?.[m]
+        const spec = tableRow?.after ? tableRow.after.slice(1).join(' · ') : ''
+        milestones.push({ date: e.day, sha: e.sha.slice(0, 10), kind: 'added', title: e.ai?.title || e.title || '', spec })
+      }
+      if (isRemoved) {
+        milestones.push({ date: e.day, sha: e.sha.slice(0, 10), kind: 'removed', title: e.ai?.title || e.title || '' })
+      }
+    }
+
+    let totalDays = 0
+    const barSegments = intervals.map(iv => {
+      const startTime = new Date(iv.start).getTime()
+      const endTime = iv.end ? new Date(iv.end).getTime() : maxTime
+      const days = Math.max(1, Math.round((endTime - startTime) / (1000 * 60 * 60 * 24)))
+      totalDays += days
+      const leftPct = Math.max(0, Math.min(100, ((startTime - minTime) / totalTime) * 100))
+      const rightPct = Math.max(0, Math.min(100, ((endTime - minTime) / totalTime) * 100))
+      const widthPct = Math.max(3, Math.min(100 - leftPct, rightPct - leftPct))
+      return {
+        start: iv.start,
+        end: iv.end || 'Present',
+        days,
+        leftPct: leftPct.toFixed(1),
+        widthPct: widthPct.toFixed(1)
+      }
+    })
+
+    const firstSeen = intervals[0]?.start || ''
+    const lastSeen = intervals.at(-1)?.end || 'Present'
+    const lifespanText = intervals.length === 1 && !intervals[0].end
+      ? `${firstSeen} &rarr; Present`
+      : `${firstSeen} &rarr; ${lastSeen}`
+
+    return {
+      model: m,
+      isLive,
+      lifespanText,
+      totalDays,
+      barSegments,
+      milestones
+    }
+  })
+
+  // Model timeline cards (fits full width, zero horizontal scroll)
+  const matrixRows = modelTimelineData.map(d => {
+    const segmentsHtml = d.barSegments.map(seg =>
+      `<div class="mt-bar-segment ${d.isLive ? 'live' : 'retired'}" style="left:${seg.leftPct}%;width:${seg.widthPct}%;" title="${esc(d.model)} active: ${esc(seg.start)} to ${esc(seg.end)} (${seg.days}d)"></div>`
+    ).join('')
+
+    const milestonesHtml = d.milestones.map(ms =>
+      `<div class="mt-milestone">
+        <span class="mt-milestone-tag ${ms.kind === 'added' ? 'modelplus' : 'modelminus'}">${ms.kind === 'added' ? '+added' : '&minus;removed'}</span>
+        <span class="mt-milestone-date"><a href="/day/${ms.date}/#${ms.sha}">${esc(ms.date)}</a></span>
+        <span class="mt-milestone-desc">${esc(ms.title)}</span>
+        ${ms.spec ? `<span class="snap-cells">${esc(ms.spec)}</span>` : ''}
+      </div>`
+    ).join('')
+
+    return `<div class="matrix-row model-timeline-item" data-model="${esc(d.model.toLowerCase())}" data-status="${d.isLive ? 'live' : 'retired'}">
+      <div class="mt-item-hdr">
+        <div class="mt-item-title-wrap">
+          <a class="mt-model-name" href="/models/${modelSlug(d.model)}/">${esc(d.model)}</a>
+          <span class="mc-tag ${d.isLive ? 'live' : 'out'}">${d.isLive ? 'LIVE' : 'OUT'}</span>
+        </div>
+        <div class="mt-item-meta">
+          <span class="mt-lifespan">${d.lifespanText}</span>
+          <span class="mt-days-pill">${d.totalDays}d active</span>
+        </div>
+      </div>
+      <div class="mt-bar-container">
+        <div class="mt-bar-track">${segmentsHtml}</div>
+        <div class="mt-bar-axis"><span>${esc(minDate)}</span><span>${esc(maxDate)} (latest)</span></div>
+      </div>
+      ${milestonesHtml ? `<div class="mt-milestones">${milestonesHtml}</div>` : ''}
+    </div>`
   }).join('')
 
   const matrixHtml = `<div class="model-matrix-wrap">
@@ -1455,6 +1548,7 @@ ${rows.map(e => {
         <div id="matrix-active-count" class="matrix-active-count">${modelLive.length} models active</div>
       </div>
       <input type="range" id="matrix-slider" class="matrix-slider" min="0" max="${Math.max(0, dateSnapshots.length - 1)}" value="${Math.max(0, dateSnapshots.length - 1)}">
+      <div id="matrix-selected-event" class="matrix-selected-event"></div>
       <div id="matrix-active-list" style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">${modelLive.map(m => `<span class="model-card live"><span class="mc-tag">LIVE</span>${esc(m)}</span>`).join('')}</div>
     </div>
     <div class="model-matrix-filters">
@@ -1463,19 +1557,8 @@ ${rows.map(e => {
       <button type="button" class="model-filter-btn" data-filter="live">[Active Now (${modelLive.length})]</button>
       <button type="button" class="model-filter-btn" data-filter="retired">[Retired (${modelRetired.length})]</button>
     </div>
-    <div class="matrix-table-scroll">
-      <table class="model-matrix-table">
-        <thead>
-          <tr>
-            <th>Model</th>
-            <th>Status</th>
-            ${matrixHeaders}
-          </tr>
-        </thead>
-        <tbody>
-          ${matrixRows}
-        </tbody>
-      </table>
+    <div class="model-matrix-table">
+      ${matrixRows}
     </div>
   </div>`
 
@@ -1548,25 +1631,52 @@ ${matrixHtml}
     });
   });
 
-  var snapshots = ${JSON.stringify(dateSnapshots.map(s => ({ date: s.date, active: s.active })))};
+  var snapshots = ${JSON.stringify(dateSnapshots.map(s => ({
+    date: s.date,
+    sha: s.sha,
+    title: s.title,
+    added: s.added,
+    removed: s.removed,
+    active: s.active
+  })))};
   var slider = document.getElementById('matrix-slider');
   var dateDisplay = document.getElementById('matrix-selected-date');
   var countDisplay = document.getElementById('matrix-active-count');
+  var eventDisplay = document.getElementById('matrix-selected-event');
   var activeList = document.getElementById('matrix-active-list');
+
+  function updateScrubber(idx) {
+    var snap = snapshots[idx];
+    if (!snap) return;
+    if (dateDisplay) dateDisplay.textContent = snap.date;
+    if (countDisplay) countDisplay.textContent = snap.active.length + ' models active';
+    if (eventDisplay) {
+      var diffs = [];
+      if (snap.added && snap.added.length) diffs.push('<span class="modelplus">+' + snap.added.join(', ') + '</span>');
+      if (snap.removed && snap.removed.length) diffs.push('<span class="modelminus">&minus;' + snap.removed.join(', ') + '</span>');
+      var diffStr = diffs.length ? ' (' + diffs.join(' ') + ')' : '';
+      eventDisplay.innerHTML = '<span style="color:var(--txt-subtle)">EVENT:</span> <a href="/day/' + snap.date + '/#' + snap.sha + '">' + (snap.title || snap.date) + '</a>' + diffStr;
+    }
+    if (activeList) {
+      activeList.innerHTML = snap.active.map(function(m){
+        return '<span class="model-card live"><span class="mc-tag">LIVE</span>' + m + '</span>';
+      }).join('');
+    }
+    matrixRows.forEach(function(mr){
+      var modelName = mr.querySelector('.mt-model-name')?.textContent?.trim() || '';
+      if (snap.active.includes(modelName)) {
+        mr.classList.add('active-at-date');
+      } else {
+        mr.classList.remove('active-at-date');
+      }
+    });
+  }
 
   if (slider && snapshots.length) {
     slider.addEventListener('input', function(){
-      var idx = Number(slider.value);
-      var snap = snapshots[idx];
-      if (!snap) return;
-      if (dateDisplay) dateDisplay.textContent = snap.date;
-      if (countDisplay) countDisplay.textContent = snap.active.length + ' models active';
-      if (activeList) {
-        activeList.innerHTML = snap.active.map(function(m){
-          return '<span class="model-card live"><span class="mc-tag">LIVE</span>' + m + '</span>';
-        }).join('');
-      }
+      updateScrubber(Number(slider.value));
     });
+    updateScrubber(Number(slider.value));
   }
 })();
 </script>`
