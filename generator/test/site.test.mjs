@@ -490,9 +490,9 @@ test('buildSite generates valid static site output', async () => {
     // cadence line at 300px inside a card three times as wide.
     assert.match(statsHtml, /\.cad-spark \.spark\{[^}]*width:100%/, 'the cadence line stretches to its card')
     assert.match(statsHtml, /12-MO TREND/)
-    // The page opens with the numbers, not with forty bars, and it is the one page
-    // that opts into the wide canvas: the rows need the room.
-    assert.match(statsHtml, /<body class="page-wide">/, 'stats opts into the wide measure')
+    // The page opens with the numbers, not with forty bars, and shares the
+    // standard layout measure with the rest of the site.
+    assert.doesNotMatch(statsHtml, /class="page-wide"/, 'stats shares the standard measure with the rest of the site')
     assert.match(statsHtml, /class="stat-figure-lbl">CHANGES</)
     assert.match(statsHtml, /class="stat-row"><span class="stat-lbl">/, 'every bar is one budgeted grid row')
     assert.match(statsHtml, /class="stat-fill add"/, 'churn is drawn as added and removed, not one folded number')

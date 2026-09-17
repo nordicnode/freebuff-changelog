@@ -64,12 +64,6 @@ code{
   border:1px solid var(--term-border);
 }
 
-/* The measure on the main column is set for prose. /stats/ is the one page that
-   is not prose -- six headline figures and two columns of budgeted bars do not
-   fit in 920px without the rows colliding -- so it opts into a wider canvas per
-   page rather than widening the column everywhere and making the timeline
-   unreadable. */
-body.page-wide main{max-width:1180px}
 
 header.top{
   border-bottom:1px solid var(--term-border);
@@ -541,7 +535,13 @@ nav.term-nav a.active{
 /* /stats/ opens with six numbers rather than forty bars: the strip is one bordered
    box with 1px gaps, so it reads as a table of contents for the page below rather
    than as more cards of the same shape. */
-.stat-figures{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--term-border);border:1px solid var(--term-border);border-radius:3px;margin:0 0 14px}
+.stat-figures{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:1px;background:var(--term-border);border:1px solid var(--term-border);border-radius:3px;margin:0 0 14px}
+@media (max-width:768px){
+  .stat-figures{grid-template-columns:repeat(3,minmax(0,1fr))}
+}
+@media (max-width:480px){
+  .stat-figures{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
 .stat-figure{background:var(--panel);padding:10px 12px;display:flex;flex-direction:column;gap:1px}
 .stat-figure-lbl{font-size:.66rem;letter-spacing:.07em;color:var(--txt-subtle)}
 .stat-figure-val{font-size:1.45rem;line-height:1.2;font-weight:600;color:var(--txt);font-variant-numeric:tabular-nums}
@@ -566,6 +566,9 @@ nav.term-nav a.active{
 .stat-fill{display:block;height:100%;background:var(--term-cyan);opacity:.85}
 .stat-fill.add{background:var(--term-green)}
 .stat-fill.del{background:var(--term-red)}
+.stat-fill.sig-major{background:var(--term-amber)}
+.stat-fill.sig-notable{background:var(--term-cyan)}
+.stat-fill.sig-minor{background:var(--term-border-strong)}
 .stat-num{grid-area:num;min-width:78px;text-align:right;color:var(--txt-subtle);font-variant-numeric:tabular-nums;white-space:nowrap}
 .stat-num i{font-style:normal}
 .stat-num .pos,.stat-figure-val .pos{color:var(--term-green)}
@@ -602,22 +605,34 @@ nav.term-nav a.active{
    the terminal's own annotations, so it reads as the human note beside the
    technical text without competing with it. */
 .eli5{
-  margin:8px 0 6px;
-  padding:7px 11px;
-  border-left:2px solid var(--term-amber);
-  background:rgba(210,153,34,.06);
-  font-size:.88rem;
-  line-height:1.55;
+  margin:10px 0 8px;
+  padding:10px 14px;
+  border-left:3px solid var(--term-amber);
+  background:rgba(210,153,34,.07);
+  border-radius:0 3px 3px 0;
+  font-size:.92rem;
+  line-height:1.6;
   color:var(--txt);
 }
 .eli5-label{
-  display:inline-block;
-  margin-right:7px;
-  font-size:.62rem;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  font-size:.74rem;
   font-weight:700;
   letter-spacing:.08em;
   color:var(--term-amber);
-  vertical-align:1px;
+  margin-bottom:8px;
+}
+.eli5-label::before{
+  content:':: ';
+  opacity:.7;
+}
+.eli5-label::after{
+  content:'';
+  flex:1;
+  height:1px;
+  background:rgba(210,153,34,.25);
 }
 .facts{
   margin:8px 0;

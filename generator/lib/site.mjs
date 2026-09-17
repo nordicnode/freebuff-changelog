@@ -1422,7 +1422,7 @@ ${archiveScript}`
 
   // One row, one grid: label / track / figure / trend. The track is the flexible
   // column, so a long label or a wide figure can never eat the bar again.
-  const bar = (lbl, n, max, { href, trend = '', num = '', pct = -1 } = {}) => `<div class="stat-row"><span class="stat-lbl">${href ? `<a href="${href}">${esc(lbl)}</a>` : esc(lbl)}</span><span class="stat-track"><span class="stat-fill" style="width:${Math.max(2, Math.round(n / max * 100))}%"></span></span><span class="stat-num">${num || n.toLocaleString()}${pct >= 0 ? `<i class="stat-share">${pct}%</i>` : ''}</span><span class="stat-trend">${trend}</span></div>`
+  const bar = (lbl, n, max, { href, trend = '', num = '', pct = -1, cls = '' } = {}) => `<div class="stat-row"><span class="stat-lbl">${href ? `<a href="${href}">${esc(lbl)}</a>` : esc(lbl)}</span><span class="stat-track"><span class="stat-fill${cls ? ' ' + cls : ''}" style="width:${Math.max(2, Math.round(n / max * 100))}%"></span></span><span class="stat-num">${num || n.toLocaleString()}${pct >= 0 ? `<i class="stat-share">${pct}%</i>` : ''}</span><span class="stat-trend">${trend}</span></div>`
   // Churn is two numbers, not one: +12k of new code and -12k of deleted code are
   // different work, so they get two segments of one track instead of both folded
   // into the label, which is what made the old churn rows unreadable.
@@ -1430,7 +1430,7 @@ ${archiveScript}`
   const card = (title, note, body, extra = '') => `<section class="stat-card${extra ? ' ' + extra : ''}"><div class="stat-card-hdr"><h3>${esc(title)}</h3>${note ? `<span class="stat-card-note">${note}</span>` : ''}</div><div class="stat-rows">${body}</div></section>`
   const figure = (label, val, note) => `<div class="stat-figure"><span class="stat-figure-lbl">${esc(label)}</span><span class="stat-figure-val">${val}</span><span class="stat-figure-note">${note}</span></div>`
   await write(dist, 'stats/index.html', layout({
-    title: 'Stats', path: '/stats/', wide: true,
+    title: 'Stats', path: '/stats/',
     desc: `Freebuff changelog stats: ${entries.length} changes across ${byDay.length} days, ${vers.length} releases, ${modelEntries.length} model changes.`,
     body: `<section class="hero"><div class="term-box term-box-slim"><div class="term-box-hdr"><span class="term-box-title">TELEMETRY :: changelog stats</span><span>${meaningful.length.toLocaleString()} changes${churnNote} &middot; ${byDay.length} days &middot; ${spanDays.toLocaleString()} days of history</span></div><p class="list-note">Where the work lands, how fast it ships, and which models churn. Churn rows &mdash; lockfiles, icon sets, empty merges &mdash; are counted on the timeline and excluded from every figure here. Recomputed on every sync.</p></div></section>`
       + `<div class="stat-figures">`
@@ -1445,7 +1445,7 @@ ${archiveScript}`
       + card('CHANGES BY CATEGORY (12-MO TREND)', `${statCats.length} categories &middot; sparkline covers ${allMonths.length} months`, statCats.map(([c, n]) => bar(c, n, catMax, { href: `/search/?cat=${encodeURIComponent(c)}`, pct: share(n, sigTotal), trend: catSpark(c) })).join(''), 'stat-span')
       + card('CODE CHURN BY AREA', `top ${churnRows.length} of ${churnByArea.size} areas &middot; lines added / removed`, churnRows.map(churnBar).join(''))
       + card('MOST-CHANGED MODELS', modelTotal ? `${modelTotal} catalog moves across ${modelCounts.size} models` : 'no catalog moves recorded', modelRows2.map(([m, n]) => bar(m, n, modelMax, { href: `/models/${modelSlug(m)}/`, pct: share(n, modelTotal) })).join(''))
-      + card('WHAT COUNTED', `${sigTotal.toLocaleString()} changes split by weight`, `<div class="sig-split">${sigRows.map(([s, n]) => `<span class="sig-seg sig-${s}" style="width:${share(n, sigTotal)}%" title="${s}: ${n.toLocaleString()}"></span>`).join('')}</div>` + sigRows.map(([s, n]) => bar(s.toUpperCase(), n, sigMax, { pct: share(n, sigTotal) })).join(''))
+      + card('WHAT COUNTED', `${sigTotal.toLocaleString()} changes split by weight`, `<div class="sig-split">${sigRows.map(([s, n]) => `<span class="sig-seg sig-${s}" style="width:${share(n, sigTotal)}%" title="${s}: ${n.toLocaleString()}"></span>`).join('')}</div>` + sigRows.map(([s, n]) => bar(s.toUpperCase(), n, sigMax, { pct: share(n, sigTotal), cls: 'sig-' + s })).join(''), 'stat-span')
       + card('SHIPPING CADENCE (LAST 12 MO)', `${monthRows.length} of ${byMonth.size} months &middot; peak ${monthMax.toLocaleString()} changes`, `<div class="cad-spark">${cadenceSpark}</div>` + monthRows.map(([m, n], i) => {
         const prev = i ? monthRows[i - 1][1] : 0
         const d = prev ? Math.round((n - prev) / prev * 100) : null
