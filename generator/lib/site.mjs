@@ -67,12 +67,23 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
 </header>
 ${body}
 <footer>
-  <div>freebuff-changes :: unofficial public snapshot mirror reconstructed from <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a></div>
-  <div class="footer-links">
-    <a href="/about/">[about]</a>
-    <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">[github]</a>
+  <div class="footer-row">
+    <div class="footer-desc">freebuff-changes <span class="term-sep">::</span> unofficial public snapshot mirror reconstructed from <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a></div>
+    <div class="footer-links">
+      <a href="/about/">[about]</a>
+      <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">[github]</a>
+    </div>
+  </div>
+  <div class="footer-row footer-sub">
+    <div class="footer-feeds">
+      <span class="footer-label">feeds:</span>
+      <a href="/feed.xml">[all rss]</a>
+      <a href="/feed-models.xml">[models rss]</a>
+      <a href="/feed-releases.xml">[releases rss]</a>
+    </div>
   </div>
 </footer>
+</main>
 <script>
 function updateSyncAge() {
   const el = document.querySelector('.sync-age');
@@ -788,11 +799,17 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
   // convention), newer to the right. The jump select lives in the bar under the
   // hero, because 721 days of one click at a time is not navigation -- and only
   // there: a second copy of 721 <option>s was over half the front page's bytes.
-  const pagePager = (i, top = false) => `<div class="pager pager-timeline${top ? ' pager-timeline-top' : ''}">
-  ${i < pageCount - 1 ? `<a href="${timelineHref(i + 1)}" rel="prev">&larr; ${esc(fmtDateHuman(byDay[i + 1].day))}</a>` : '<span></span>'}
-  <span class="pager-page">${i === 0 ? 'NEWEST' : `day ${i + 1} of ${pageCount}`} &middot; ${esc(fmtDateHuman(byDay[i].day))}</span>
-  ${top ? dayJump(byDay[i].day, true) : jumpLink}
-  ${i > 0 ? `<a href="${timelineHref(i - 1)}" rel="next">${esc(fmtDateHuman(byDay[i - 1].day))} &rarr;</a>` : '<span></span>'}
+  const pagePager = (i) => `<div class="pager">
+  <div class="timeline-nav-group">
+    ${i < pageCount - 1 ? `<a href="${timelineHref(i + 1)}" rel="prev">&larr; ${esc(fmtDateHuman(byDay[i + 1].day))}</a>` : ''}
+    <span class="pager-page">${i === 0 ? 'NEWEST' : `day ${i + 1} of ${pageCount}`} &middot; ${esc(fmtDateHuman(byDay[i].day))}</span>
+    ${i > 0 ? `<a href="${timelineHref(i - 1)}" rel="next">${esc(fmtDateHuman(byDay[i - 1].day))} &rarr;</a>` : ''}
+  </div>
+  <div class="timeline-nav-group">
+    ${i > 1 ? '<a href="/">[latest]</a>' : ''}
+    ${jumpLink}
+    <a href="/archive/">[full archive &rarr;]</a>
+  </div>
 </div>`
 
   function renderTimelineDay (day, i) {
@@ -874,10 +891,7 @@ ${rows.map(e => {
       return entryCard(e, open, relatedIdx, { hideChurn: true })
     }).join('\n')}</section>`
 
-    return hero + dayHtml + pagePager(i) +
-      (latest
-        ? `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>`
-        : `<p style="margin-top:20px;font-size:.82rem"><a href="/">&larr; [latest]</a> &middot; <a href="/archive/">[archive]</a></p>`)
+    return hero + dayHtml + pagePager(i)
   }
 
   // Front-page filters. Every row the timeline can show is already in the DOM,

@@ -1308,16 +1308,17 @@ details.more-rows[open]>summary{margin-bottom:6px}
 }
 .pager a{
   color:var(--txt-dim);
-  padding:4px 10px;
+  padding:3px 8px;
   border:1px solid var(--term-border);
   border-radius:2px;
-  background:var(--panel);
-  font-size:.8rem;
+  background:var(--code);
+  font-size:.75rem;
   text-decoration:none;
+  transition:all .1s ease;
 }
 .pager a:hover{
-  border-color:var(--term-border-strong);
-  color:#ffffff;
+  border-color:var(--term-cyan);
+  color:var(--txt);
   text-decoration:none;
 }
 /* Timeline pagination: the same bar above and below the day sections, so the
@@ -1328,6 +1329,9 @@ details.more-rows[open]>summary{margin-bottom:6px}
 }
 .pager-timeline{
   flex-wrap:wrap;
+  margin:28px 0 0;
+  padding-top:14px;
+  border-top:1px solid var(--term-border);
 }
 .pager-timeline-top{
   margin:10px 0 0;
@@ -1460,26 +1464,53 @@ details.more-rows[open]>summary{margin-bottom:6px}
 }
 
 footer{
-  margin-top:48px;
-  padding-top:16px;
+  margin-top:36px;
+  padding-top:14px;
   border-top:1px solid var(--term-border);
-  font-size:.76rem;
+  font-size:.74rem;
   color:var(--txt-subtle);
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.footer-row{
   display:flex;
   justify-content:space-between;
   align-items:center;
   flex-wrap:wrap;
-  gap:8px;
+  gap:10px;
 }
-.footer-links{
+.footer-desc{
+  color:var(--txt-subtle);
+  line-height:1.4;
+}
+.footer-links, .footer-feeds{
   display:inline-flex;
-  gap:12px;
+  align-items:center;
+  gap:10px;
+  flex-wrap:wrap;
 }
-.footer-links a{
+.footer-links a, .footer-feeds a{
   color:var(--txt-subtle);
   text-decoration:none;
+  font-size:.73rem;
+  transition:color .1s ease;
 }
-.footer-links a:hover{
-  color:var(--txt-dim);
+.footer-links a:hover, .footer-feeds a:hover{
+  color:var(--term-cyan);
+}
+.footer-label{
+  color:var(--txt-subtle);
+  font-size:.72rem;
+  text-transform:uppercase;
+  letter-spacing:.03em;
+}
+.footer-sub{
+  justify-content:center;
+  font-size:.72rem;
+}
+.term-sep{
+  color:var(--term-border-strong);
+  margin:0 4px;
 }
 `
