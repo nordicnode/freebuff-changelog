@@ -2231,60 +2231,62 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     </div>
     <div class="man-body">
       <h4>WHAT IS THIS?</h4>
-      <p>A commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, rebuilt from public git diffs. Upstream ships through automated snapshot merges with blank <em>"Sync public snapshot"</em> messages. This mirror diffs each snapshot against its parent to extract what actually changed: model swaps, version bumps, slash commands, and file churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} commits scanned, re-analyzed whenever upstream moves.</p>
+      <p>Commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, rebuilt from public git diffs. Upstream ships through snapshot merges with blank messages. This mirror diffs each snapshot to extract model swaps, version bumps, slash commands, and file churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} commits, updated whenever upstream moves.</p>
 
       <h4>HOW IT WORKS</h4>
       <ul class="man-ul">
-        <li><strong>Deterministic first.</strong> Model tables in both READMEs and slash-command registries are set-differenced; version bumps come from release <code>package.json</code>. Timestamps normalize to UTC with zero dependencies.</li>
-        <li><strong>AI summarizes the diff.</strong> An LLM generates concise technical summaries from diff evidence alone, plus plain-English takeaways. Summaries are cached by SHA, prompt version, and diff hash.</li>
-        <li><strong>Every claim links to proof.</strong> Commit SHA, compare URL, stored diff, and per-file stats accompany every entry, with the complete diff loaded on demand.</li>
+        <li><strong>Deterministic first.</strong> Model tables and slash-command registries are set-differenced; version bumps come from <code>package.json</code>. Timestamps normalize to UTC.</li>
+        <li><strong>AI diff summaries.</strong> Technical summaries and plain-English takeaways generated from diff evidence alone, cached by SHA, prompt version, and diff hash.</li>
+        <li><strong>Linked proof.</strong> Every entry includes commit SHA, compare URL, stored diff, and stats, with the full diff loaded on demand.</li>
       </ul>
 
       <h4>WHAT WE TRACK</h4>
       <dl class="man-dl">
-        <dt>Model Catalog</dt><dd>${(cats.get('Model Catalog') || 0).toLocaleString()}</dd><dd class="man-note">Additions, retirements, and swaps in the free picker. See the <a href="/models/">catalog timeline</a></dd>
-        <dt>Releases</dt><dd>${vers.length.toLocaleString()}</dd><dd class="man-note">CLI and core version bumps, each page listing every commit in range</dd>
+        <dt>Model Catalog</dt><dd>${(cats.get('Model Catalog') || 0).toLocaleString()}</dd><dd class="man-note">Additions, retirements, and swaps in the free picker. See <a href="/models/">models</a></dd>
+        <dt>Releases</dt><dd>${vers.length.toLocaleString()}</dd><dd class="man-note">Version bumps, each page listing every commit in range</dd>
         <dt>Commands</dt><dd>${(cats.get('Commands') || 0).toLocaleString()}</dd><dd class="man-note">Slash commands added, renamed, or retired</dd>
         <dt>Code areas</dt><dd>${areaTotal.toLocaleString()}</dd><dd class="man-note">${areaLine}</dd>
-        <dt>Significance</dt><dd></dd><dd class="man-note"><code>[MAJOR]</code> model/version &middot; <code>[NOTABLE]</code> user-visible &middot; <code>[minor]</code> internal &middot; <code>[noise]</code> lockfile churn</dd>
-        ${openPrs?.length ? `<dt>In-flight</dt><dd>${openPrs.length.toLocaleString()}</dd><dd class="man-note">Open upstream PRs with diffstat and a 120-line preview, filled a budgeted batch per run</dd>` : ''}
+        <dt>Significance</dt><dd></dd><dd class="man-note"><code>[MAJOR]</code> model/version &middot; <code>[NOTABLE]</code> user-visible &middot; <code>[minor]</code> internal &middot; <code>[noise]</code> churn</dd>
+        ${openPrs?.length ? `<dt>In-flight</dt><dd>${openPrs.length.toLocaleString()}</dd><dd class="man-note">Open PRs with diffstat, commits, comments, and preview</dd>` : ''}
       </dl>
 
       <h4>WHERE TO GO</h4>
       <div class="man-routes">
-        <span><a href="/">/</a> the newest day</span>
-        <span><code>/day/&lt;date&gt;/</code> any single day</span>
-        <span><a href="/archive/">/archive/</a> days, releases, categories</span>
-        <span><a href="/search/">/search/</a> every entry, ever</span>
-        <span><a href="/stats/">/stats/</a> volume, churn, cadence</span>
+        <span><a href="/">/</a> newest day</span>
+        <span><code>/day/&lt;date&gt;/</code> single day</span>
+        <span><a href="/models/">/models/</a> catalog timeline</span>
+        <span><a href="/archive/">/archive/</a> history</span>
+        <span><a href="/search/">/search/</a> search index</span>
+        <span><a href="/stats/">/stats/</a> telemetry</span>
         ${openPrs?.length ? '<span><a href="/in-flight/">/in-flight/</a> open PRs</span>' : ''}
       </div>
-      <p style="margin-top:6px">The chips above the timeline filter that day's rows; the churn chip reveals the noise. The <code>#</code> on any entry is <code>/c/&lt;sha&gt;</code>, a link to that change alone which survives it moving day, and <code>discord</code> copies a paste-ready version. Press <code>/</code> anywhere to search.</p>
+
+      <h4>FEEDS + DISCORD</h4>
+      <p>Keep your community or team updated via native Discord webhooks, one-click copy, or feeds:</p>
+      <ul class="man-ul">
+        <li><strong>Automated Webhook Dispatcher:</strong> Run <code>npm run broadcast -- --webhook &lt;url&gt;</code> to post new commits. Formats quotes, summaries, and stats, tracking <code>lastBroadcastSha</code> in <code>data/state.json</code> so entries never repeat. Supports <code>--limit &lt;n&gt;</code> and <code>--dry-run</code>.</li>
+        <li><strong>One-Click Discord Copy:</strong> Click <code>[copy discord]</code> on any entry (or press <kbd>c</kbd>) for paste-ready Discord markdown.</li>
+        <li><strong>Feeds:</strong> <a href="/feed.xml">all changes</a> &middot; <a href="/feed-major.xml">major + notable</a> &middot; <a href="/feed-models.xml">models only</a> &middot; <a href="/feed-releases.xml">releases only</a> &middot; <a href="/feed.json">JSON</a>. For Discord RSS bots, use <code>/feed add &lt;url&gt;</code>.</li>
+      </ul>
 
       <h4>KEYBOARD SHORTCUTS</h4>
-      <p>Single-key and vim-style shortcuts for rapid navigation. Press <kbd>?</kbd> anywhere or click <button type="button" class="theme-btn" data-kb-modal style="display:inline;color:var(--term-cyan);padding:0">[shortcuts: ?]</button> to toggle the cheat sheet.</p>
+      <p>Single-key shortcuts for rapid navigation. Press <kbd>?</kbd> anywhere or click <button type="button" class="theme-btn" data-kb-modal style="display:inline;color:var(--term-cyan);padding:0">[shortcuts: ?]</button> to toggle the cheat sheet.</p>
       <div class="man-routes">
         <span><kbd>j</kbd> / <kbd>k</kbd> next / prev entry</span>
         <span><kbd>o</kbd> / <kbd>Enter</kbd> expand / collapse</span>
-        <span><kbd>d</kbd> toggle inline diff</span>
+        <span><kbd>d</kbd> toggle diff</span>
         <span><kbd>c</kbd> copy Discord text</span>
-        <span><kbd>n</kbd> / <kbd>p</kbd> next / prev page</span>
+        <span><kbd>n</kbd> / <kbd>p</kbd> next / prev day</span>
         <span><kbd>/</kbd> focus search</span>
-        <span><kbd>?</kbd> cheat-sheet modal</span>
-        <span><kbd>Esc</kbd> close dialog / blur</span>
+        <span><kbd>?</kbd> cheat-sheet</span>
+        <span><kbd>Esc</kbd> close / blur</span>
       </div>
 
-      <h4>LIMITS</h4>
-      <p>Snapshots squash upstream history, so ordering inside one snapshot is approximate and authorship resolves to the bot. AI text describes only what the diff shows: no research, no speculation about capabilities.</p>
-
-      <h4>FRESHNESS</h4>
-      <p>A loop polls upstream every 30 seconds, re-analyzes, and pushes data within ~2 minutes of landing. An hourly GitHub Action covers the loop being down.</p>
-
-      <h4>FEEDS + DISCORD</h4>
-      <p><a href="/feed.xml">RSS all changes</a> &middot; <a href="/feed-major.xml">major + notable</a> &middot; <a href="/feed-models.xml">models only</a> &middot; <a href="/feed-releases.xml">releases only</a> &middot; <a href="/feed.json">JSON</a>. For Discord bots (MonitoRSS, RSS Bot), run <code>/feed add &lt;url&gt;</code> with <code>{title}</code>, <code>{description}</code>, <code>{author}</code>. Generator on <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener">GitHub</a>; Cloudflare deploys on push.</p>
+      <h4>LIMITS &amp; FRESHNESS</h4>
+      <p>Snapshots squash history, so intra-snapshot commit ordering is approximate. AI text describes only diff evidence. Upstream sync polls every 30 seconds and redeploys to Cloudflare within ~2 minutes of landing.</p>
 
       <h4>STATUS BADGES</h4>
-      <p>Embed live status badges in your README or docs:</p>
+      <p>Embed dynamic SVG status badges in your README or docs:</p>
       <div style="display:flex;flex-wrap:wrap;gap:8px;margin:8px 0">
         <img src="/badge/version.svg" alt="Version">
         <img src="/badge/models.svg" alt="Models">
