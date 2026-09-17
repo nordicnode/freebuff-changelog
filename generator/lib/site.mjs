@@ -810,21 +810,6 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
       ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}">${esc(fmtDateHuman(generated))} UTC</span></span>`
       : `<span>DATA AS OF ${esc(String(generated).slice(0, 16).replace('T', ' '))} UTC</span>
       <span>THIS DAY IS SETTLED HISTORY</span>`
-    const hero = `
-<section class="hero">
-  <div class="term-box term-box-slim">
-    <div class="term-box-hdr">
-      <span class="term-box-title">${latest ? 'LATEST' : 'DAILY_LOG'} :: ${esc(day.day)}</span>
-      <span>${latest
-    ? `${meaningful.length.toLocaleString()} changes${churnNote} &middot; ${releases.length} releases &middot; ${pageCount} days`
-    : `${real} change${real === 1 ? '' : 's'} that day${churn ? ` + ${churn} churn` : ''} &middot; day ${i + 1}/${pageCount}`}</span>
-    </div>
-    <div class="term-footer-bar">
-      ${freshness}
-    </div>
-    ${latest ? '' : `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Reconstructed public snapshot commits pushed to CodebuffAI/freebuff on this date.</p>`}
-  </div>
-</section>`
 
     const catCounts = new Map()
     for (const e of rows) {
@@ -835,17 +820,44 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
       if (!catCounts.has(slug)) catCounts.set(slug, cur)
     }
     const chipList = [...catCounts.values()].sort((a, b) => b.n - a.n || a.label.localeCompare(b.label))
-    // The reset chip is named for what it counts here. "recent" is only true of
-    // `/`; on a Tuesday in 2024 the rows are that day's, not recent ones.
-    const filterBar = `<nav class="filterbar" id="filters" aria-label="Filter the rows on this page by category">
-  <span class="filter-label">FILTER THIS PAGE:</span>
+
+    const topPager = `<div class="pager pager-timeline pager-timeline-top">
+    <div class="timeline-nav-group">
+      ${i < pageCount - 1 ? `<a href="${timelineHref(i + 1)}" rel="prev">&larr; ${esc(fmtDateHuman(byDay[i + 1].day))}</a>` : ''}
+      <span class="pager-page">${i === 0 ? 'NEWEST' : `day ${i + 1} of ${pageCount}`} &middot; ${esc(fmtDateHuman(byDay[i].day))}</span>
+      ${i > 0 ? `<a href="${timelineHref(i - 1)}" rel="next">${esc(fmtDateHuman(byDay[i - 1].day))} &rarr;</a>` : ''}
+    </div>
+    ${dayJump(byDay[i].day, true)}
+  </div>`
+
+    const statusRow = `<div class="timeline-status-bar">
+    <div class="timeline-freshness">${freshness}</div>
+    <div class="timeline-stats">${latest
+    ? `${meaningful.length.toLocaleString()} changes${churnNote}`
+    : `${real} change${real === 1 ? '' : 's'} that day${churn ? ` + ${churn} churn` : ''}`}</div>
+  </div>`
+
+    const filterRow = `<div class="timeline-filter-row">
+    <nav class="filterbar" id="filters" aria-label="Filter the rows on this page by category">
+      <span class="filter-label">FILTER:</span>
 ${[
       chipHtml('*', latest ? 'recent' : 'this day', real, true, ''),
       ...chipList.map(c => chipHtml(c.slug, c.label, c.n, false, '')),
       chipHtml('churn', 'churn', churn, false, ' chip-churn')
     ].join('\n')}
-</nav>
-<p class="filter-note" data-hub="/archive/#categories" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? '(' + churn + ' churn hidden)' : '(no churn that day)'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/archive/#categories">browse every change by category</a></span></p>`
+    </nav>
+    <p class="filter-note" data-hub="/archive/#categories" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? '(' + churn + ' churn hidden)' : '(no churn that day)'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/archive/#categories">browse every change by category</a></span></p>
+  </div>`
+
+    const hero = `
+<section class="hero timeline-hero">
+  <div class="term-box term-box-slim timeline-control">
+    ${topPager}
+    ${statusRow}
+    ${filterRow}
+    ${latest ? '' : `<p class="timeline-settled-note">Reconstructed public snapshot commits pushed to CodebuffAI/freebuff on this date.</p>`}
+  </div>
+</section>`
 
     // One row starts open: the day's newest *visible* entry. Churn is hidden by
     // default, so the flag passes to the first row a reader can actually see
@@ -862,7 +874,7 @@ ${rows.map(e => {
       return entryCard(e, open, relatedIdx, { hideChurn: true })
     }).join('\n')}</section>`
 
-    return hero + pagePager(i, true) + filterBar + dayHtml + pagePager(i) +
+    return hero + dayHtml + pagePager(i) +
       (latest
         ? `<div class="pager"><a href="/archive/">[ full archive &rarr; ]</a><a href="/feed.xml">[ rss ]</a><a href="/feed-models.xml">[ models rss ]</a><a href="/feed-releases.xml">[ releases rss ]</a></div>`
         : `<p style="margin-top:20px;font-size:.82rem"><a href="/">&larr; [latest]</a> &middot; <a href="/archive/">[archive]</a></p>`)
