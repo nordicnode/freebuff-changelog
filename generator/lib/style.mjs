@@ -247,12 +247,6 @@ nav.term-nav a:hover, nav.term-nav button:hover{
   border-color:var(--term-border-strong);
   text-decoration:none;
 }
-.nav-kb-btn{
-  color:var(--term-cyan)!important;
-}
-.nav-kb-btn:hover{
-  border-color:var(--term-cyan)!important;
-}
 nav.term-nav a.active{
   color:var(--term-cyan);
   border-color:var(--cyan-tint-border);

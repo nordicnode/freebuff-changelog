@@ -65,7 +65,6 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
     <a href="/search/" class="${path.startsWith('/search/') ? 'active' : ''}">/search</a>
     <a href="/in-flight/" class="${path.startsWith('/in-flight/') ? 'active' : ''}">/in-flight</a>
     <a href="/feed.xml" class="nav-feed">/rss</a>
-    <button type="button" class="nav-kb-btn" data-kb-modal title="Keyboard shortcuts (press ?)">keys [?]</button>
   </nav>
 </header>
 ${body}
