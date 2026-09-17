@@ -1,0 +1,153 @@
+diff --git a/cli/src/utils/image-handler.ts b/cli/src/utils/image-handler.ts
+index a0188edb7..9e6349649 100644
+--- a/cli/src/utils/image-handler.ts
++++ b/cli/src/utils/image-handler.ts
+@@ -9,6 +9,7 @@ import {
+   MAX_TOTAL_IMAGE_SIZE,
+   IMAGE_EXTENSIONS_PATTERN,
+   getImageMimeType,
++  isProviderSupportedImageMediaType,
+ } from '@codebuff/common/constants/images'
+ import { Jimp } from 'jimp'
+ 
+@@ -244,14 +245,33 @@ export async function processImageFile(
+     // Continue without dimensions if we can't read them
+   }
+ 
+-  // Check if compression is needed
+-  let base64Data = fileBuffer.toString('base64')
+   let processedBuffer = fileBuffer
+   let finalMediaType = mediaType
++
++  // A BMP or TIFF is recognised above but no vision provider decodes it — sent
++  // as-is it 400s the turn, and every later turn of the session too, since the
++  // history is replayed. Jimp reads both, so transcode to PNG; a file it
++  // cannot read was never going to be seen by the model either.
++  if (!isProviderSupportedImageMediaType(mediaType)) {
++    try {
++      const image = await Jimp.read(fileBuffer)
++      processedBuffer = Buffer.from(await image.getBuffer('image/png'))
++      finalMediaType = 'image/png'
++    } catch (error) {
++      logger.debug({ resolvedPath, error }, 'Image handler: Failed to transcode to PNG')
++      return {
++        success: false,
++        error: `Unsupported image format: ${filePath}. Convert it to PNG or JPEG and try again.`,
++      }
++    }
++  }
++
++  // Check if compression is needed
++  let base64Data = processedBuffer.toString('base64')
+   let wasCompressed = false
+ 
+   if (base64Data.length > MAX_IMAGE_BASE64_SIZE) {
+-    const compressionResult = await compressImageToFitSize(fileBuffer)
++    const compressionResult = await compressImageToFitSize(processedBuffer)
+     
+     if (!compressionResult.success) {
+       return { success: false, error: compressionResult.error }
+diff --git a/common/src/constants/images.ts b/common/src/constants/images.ts
+index f9b3affa2..54d8d1926 100644
+--- a/common/src/constants/images.ts
++++ b/common/src/constants/images.ts
+@@ -21,6 +21,29 @@ export const IMAGE_EXTENSION_TO_MIME: Record<string, string> = {
+  */
+ export const SUPPORTED_IMAGE_EXTENSIONS = new Set(Object.keys(IMAGE_EXTENSION_TO_MIME))
+ 
++/**
++ * The formats vision providers accept as inline image input. Every image part
++ * that reaches a provider has to be one of these; BMP and TIFF above are
++ * recognised as images (so a path to one is detected and read as an image, not
++ * as text) but no provider decodes them — the request 400s with "You have
++ * uploaded an unsupported image ... webp, png, jpeg, and gif", and because
++ * clients replay their history, so does every later turn of that thread until
++ * the part is converted or dropped. Anything that builds an image part from
++ * bytes must transcode to one of these or refuse with a reason the model can act
++ * on; the chat completions route strips whatever slips through.
++ */
++export const PROVIDER_IMAGE_MEDIA_TYPES: ReadonlySet<string> = new Set([
++  'image/png',
++  'image/jpeg',
++  'image/gif',
++  'image/webp',
++])
++
++/** Whether an inline image with this media type can be sent to a vision provider. */
++export function isProviderSupportedImageMediaType(mediaType: string | null | undefined): boolean {
++  return !!mediaType && PROVIDER_IMAGE_MEDIA_TYPES.has(mediaType.trim().toLowerCase())
++}
++
+ /**
+  * Check if a file extension is a supported image format
+  */
+diff --git a/sdk/src/__tests__/read-files.test.ts b/sdk/src/__tests__/read-files.test.ts
+index d6a7e16d4..f133c454e 100644
+--- a/sdk/src/__tests__/read-files.test.ts
++++ b/sdk/src/__tests__/read-files.test.ts
+@@ -897,6 +897,30 @@ describe('getImageFile', () => {
+     expect('error' in result ? result.error : '').toContain('downscaled copy')
+   })
+ 
++  test('refuses a BMP or TIFF, which no provider decodes, and says how to convert it', async () => {
++    // Attached anyway, the part 400s this turn and every replayed turn after
++    // it: "You have uploaded an unsupported image ... webp, png, jpeg, and gif".
++    const mockFs = createMockFs({
++      files: {
++        '/project/scan.tiff': { content: 'II*' },
++        '/project/shot.bmp': { content: 'BM' },
++      },
++    })
++
++    for (const filePath of ['scan.tiff', 'shot.bmp']) {
++      const result = await getImageFile({
++        filePath,
++        cwd: '/project',
++        fs: mockFs,
++      })
++      expect('data' in result).toBe(false)
++      const error = 'error' in result ? result.error : ''
++      expect(error).toContain(FILE_READ_STATUS.ERROR)
++      expect(error).toContain('PNG, JPEG, GIF and WebP')
++      expect(error).toContain(`magick ${filePath}`)
++    }
++  })
++
+   test('applies the gitignore and filter policy of read_files', async () => {
+     const mockFs = createMockFs({
+       files: { '/project/shot.png': { content: 'PNGDATA' } },
+diff --git a/sdk/src/tools/read-files.ts b/sdk/src/tools/read-files.ts
+index 93974a145..d0d4eb231 100644
+--- a/sdk/src/tools/read-files.ts
++++ b/sdk/src/tools/read-files.ts
+@@ -3,6 +3,7 @@ import path from 'path'
+ import { countTokens } from '@codebuff/agent-runtime/util/token-counter'
+ import {
+   getImageMimeType,
++  isProviderSupportedImageMediaType,
+   MAX_IMAGE_BASE64_SIZE,
+ } from '@codebuff/common/constants/images'
+ import { FILE_READ_STATUS } from '@codebuff/common/old-constants'
+@@ -173,8 +174,21 @@ export async function getImageFile(params: {
+     cwd,
+     filePath,
+   )
+-  const mediaType = getImageMimeType(path.extname(relativePath))
++  const ext = path.extname(relativePath)
++  const mediaType = getImageMimeType(ext)
+   if (!mediaType) return { path: relativePath, error: FILE_READ_STATUS.ERROR }
++  // A BMP or TIFF is an image we recognise but no vision provider decodes:
++  // attached anyway, it 400s this turn AND every later turn of the thread
++  // (history is replayed) with "unsupported image ... webp, png, jpeg, and
++  // gif". Refuse here, where the model can still act on it.
++  if (!isProviderSupportedImageMediaType(mediaType)) {
++    return {
++      path: relativePath,
++      error:
++        FILE_READ_STATUS.ERROR +
++        ` [${ext} images cannot be attached; models accept only PNG, JPEG, GIF and WebP. Convert it with a terminal command (for example \`magick ${relativePath} /tmp/preview.png\`) and read that instead.]`,
++    }
++  }
+   if (fileFilter?.(relativePath).status === 'blocked') {
+     return { path: relativePath, error: FILE_READ_STATUS.IGNORED }
+   }
