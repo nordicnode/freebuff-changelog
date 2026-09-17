@@ -115,7 +115,7 @@ async function ensureRepo () {
  * pipeline that talks to a live third party, and these rules need tests rather
  * than an outage to notice them.
  */
-export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DATA } = {}) {
+export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DATA, force = false } = {}) {
   const PR_PER_PAGE = 100
   // 10 pages is 1,000 open PRs. Past that the list itself is the story, and
   // walking further would cost a call per page for no extra truth.
@@ -129,10 +129,9 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
   const PR_CALL_BUDGET = Number(process.env.CHANGELOG_PR_CALLS) ||
     (process.env.GITHUB_TOKEN ? 500 : 25)
   // How old the stored list may get before the count on the page stops being
-  // trusted. The watch loop can wake every 30s, so this is the throttle: five
-  // minutes is 12 refreshes an hour, which an unauthenticated token budget can
-  // actually afford, and no reader ever sees a number more than that stale.
-  const PR_REFRESH_MIN = Number(process.env.CHANGELOG_PR_REFRESH_MIN) || 5
+  // trusted. The watch loop wakes every 30s; a 2-minute cadence ensures new
+  // PRs appear quickly without tripping rate limits.
+  const PR_REFRESH_MIN = Number(process.env.CHANGELOG_PR_REFRESH_MIN) || 2
   const LIST = 'https://api.github.com/repos/CodebuffAI/freebuff/pulls'
   const linkHeader = (res) => { try { return res?.headers?.get?.('link') || '' } catch (_) { return '' } }
   const nextUrl = (res) => /<([^>]+)>;\s*rel="next"/.exec(linkHeader(res))?.[1] || null
@@ -155,7 +154,7 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
     const cachedPrs = cached?.prs || []
     const prevByNum = new Map(cachedPrs.map(p => [p.number, p]))
     const age = cached?.fetchedAt ? Date.now() - Date.parse(cached.fetchedAt) : Infinity
-    if (cachedPrs.length && age < PR_REFRESH_MIN * 60000) return cachedPrs
+    if (!force && cachedPrs.length && age < PR_REFRESH_MIN * 60000) return cachedPrs
 
     let total = await probeTotal()
     const prs = []
@@ -791,6 +790,19 @@ async function catchUpOnce (argv) {
     }
   }
 
+  // 1.5. Refresh open PRs even when git main is quiet, so newly opened, updated,
+  //      or merged PRs appear on /in-flight/ quickly rather than waiting up to
+  //      45m for the next commit-sync cycle.
+  let didPrSync = false
+  if (!didSync) {
+    const prevPrs = await readJson(`${DATA}/open-prs.json`, null)
+    const prs = await fetchOpenPrs()
+    if (prs) {
+      await prunePrDiffs(prs, prevPrs)
+      didPrSync = Boolean(await dirtyData())
+    }
+  }
+
   // 2. Snapshot *after* the sync — generate rewrote changelog.json, so a copy
   //    taken before it would be stale by write time.
   const existing = await readJson(`${DATA}/changelog.json`, { version: 1, entries: [] })
@@ -861,14 +873,17 @@ async function catchUpOnce (argv) {
   //    exactly the case that was stalling, and leftover uncommitted diffs would
   //    block the next cycle's rebase.
   if (argv.includes('--push')) {
+    const commitMsg = didSummarize
+      ? `data: LLM backfill (${utcStamp()} UTC)`
+      : (didSync
+        ? `data: update changelog (${utcStamp()} UTC)`
+        : (didPrSync ? `data: update open PRs (${utcStamp()} UTC)` : `data: update (${utcStamp()} UTC)`))
     await commitAndPushData({
-      message: didSummarize
-        ? `data: LLM backfill (${utcStamp()} UTC)`
-        : `data: update changelog (${utcStamp()} UTC)`,
+      message: commitMsg,
       // entries carry this cycle's AI grafts in memory only until we write them.
       overrides: { [`${DATA}/changelog.json`]: existing }
     })
-  } else if (didSync || didSummarize) {
+  } else if (didSync || didSummarize || didPrSync) {
     log('dry run: data written locally, not committed (pass --push)')
   }
 }
