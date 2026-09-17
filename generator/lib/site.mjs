@@ -1215,7 +1215,7 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
     <div class="timeline-bulk-toggle">
       <button type="button" class="timeline-bulk-btn" data-bulk="expand">[expand all]</button>
       <button type="button" class="timeline-bulk-btn" data-bulk="collapse">[collapse all]</button>
-      <button type="button" class="timeline-bulk-btn timeline-reading-mode-btn" data-reading-mode title="Toggle Plain English reading mode (prioritizes plain-language summaries on every card)">[plain english: off]</button>
+      <button type="button" class="timeline-bulk-btn timeline-reading-mode-btn" data-reading-mode title="Toggle Plain English reading mode (hides technical diffs and details, focusing on plain-language summaries)">[plain english: off]</button>
     </div>
   </div>`
 

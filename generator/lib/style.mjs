@@ -2455,8 +2455,22 @@ mark.search-match{
 }
 .reading-mode-plain .eli5{
   order:-1;
-  margin:0 0 12px;
-  box-shadow:0 0 8px rgba(210,153,34,0.15);
+  margin:4px 0 10px;
+  box-shadow:0 0 8px rgba(210,153,34,0.12);
+}
+/* In plain English mode, hide developer & technical mechanics */
+.reading-mode-plain .entry:has(.eli5) .summary,
+.reading-mode-plain .entry .facts,
+.reading-mode-plain .entry .files,
+.reading-mode-plain .entry .diff-viewer,
+.reading-mode-plain .entry .diffstat,
+.reading-mode-plain .entry .dc-copy,
+.reading-mode-plain .entry .model-snap{
+  display:none !important;
+}
+.reading-mode-plain .metarow{
+  justify-content:flex-end;
+  border-top-color:rgba(210,153,34,0.15);
 }
 .eli5-copy{
   color:var(--term-amber);
