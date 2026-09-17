@@ -1625,8 +1625,8 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         <h4>FRESHNESS</h4>
         <p>A loop polls upstream every 30 seconds, re-analyzes, and pushes the data, so a commit is readable here about 2 minutes after it lands in the public repo. Upstream's own snapshot squash usually delays a change longer than our whole pipeline does. An hourly GitHub Action covers the loop being down.</p>
 
-        <h4>FEEDS + SOURCE</h4>
-        <p><a href="/feed.xml">RSS all changes</a> &middot; <a href="/feed-major.xml">major + notable</a> &middot; <a href="/feed-models.xml">models only</a> &middot; <a href="/feed-releases.xml">releases only</a> &middot; <a href="/feed.json">JSON feed</a>. Generator: <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener">nordicnode/freebuff-changelog</a>; Cloudflare deploys on every data push.</p>
+        <h4>FEEDS + DISCORD</h4>
+        <p><a href="/feed.xml">RSS all changes</a> &middot; <a href="/feed-major.xml">major + notable</a> &middot; <a href="/feed-models.xml">models only</a> &middot; <a href="/feed-releases.xml">releases only</a> &middot; <a href="/feed.json">JSON</a>. For Discord bots (MonitoRSS, RSS Bot), run <code>/feed add &lt;url&gt;</code> with <code>{title}</code>, <code>{description}</code>, <code>{author}</code>. See README for bot setup. Generator: <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener">GitHub</a>; Cloudflare deploys on push.</p>
     </div>
   </div>
 </section>`

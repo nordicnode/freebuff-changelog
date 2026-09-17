@@ -388,9 +388,10 @@ test('buildSite generates valid static site output', async () => {
     assert.match(feedXml, /<content:encoded/)
     assert.match(feedXml, /New high-speed endpoint enabled\./)
 
-    // Verify feed.xsl exists and sets data-theme="dark"
+    // Verify feed.xsl exists and sets data-theme="dark" with Discord bot setup guidance
     const feedXsl = await readFile(join(tmpDist, 'feed.xsl'), 'utf8')
     assert.match(feedXsl, /data-theme="dark"/)
+    assert.match(feedXsl, /Discord Bot Setup/)
 
     // Verify favicon files exist
     const favIco = await readFile(join(tmpDist, 'favicon.ico'))
@@ -452,6 +453,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(aboutHtml, /Deterministic first/)
     assert.match(aboutHtml, /LIMITS/)
     assert.match(aboutHtml, /Model Catalog/)
+    assert.match(aboutHtml, /FEEDS \+ DISCORD/)
     assert.match(aboutHtml, /class="man-dl"/, 'what is tracked is a list of surfaces, not a paragraph')
     assert.match(aboutHtml, /class="man-routes"/)
     // The page explains itself; it is not allowed to become a manual again. It ran

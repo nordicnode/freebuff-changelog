@@ -261,6 +261,58 @@ rule-based summary is used: the site never depends on the LLM.
 | `/stats/` | the one wide page: six headline figures open it, then per-category bars with 12-month sparklines, +/- churn by area as two segments of one track, the most-changed models beside the significance split, and monthly cadence with month-over-month deltas. Churn rows are counted on the timeline and excluded from every figure here |
 | `/api/entries.json`, `/api/status.json` | raw data / deploy status API |
 
+## Discord Bot & Webhook Setup
+
+The RSS feeds are specifically formatted for Discord bots ([MonitoRSS](https://monitorss.xyz/), [Feedcord](https://github.com/Feedcord/Feedcord), RSS Bot) and webhook automations (Zapier, Make, IFTTT):
+- `<title>` carries `[YYYY-MM-DD] <Title>`.
+- `<description>` provides Discord-ready markdown: plain-English quotes (`> **In plain English**`), clean technical summaries without title repetition, and bulleted highlights.
+- `<dc:creator>` identifies the author.
+- `<category>` includes the category (e.g. `CLI`, `Model Catalog`), significance (`major`, `notable`, `minor`), and areas for tag filtering.
+- `<pubDate>` provides the standard UTC timestamp for Discord embed timestamps.
+
+### Feed URLs
+
+| Feed | URL | Use Case |
+|---|---|---|
+| **All Changes** | `https://freebuff-changelog.nordicnode.workers.dev/feed.xml` | Real-time updates for every commit/fix (recommended) |
+| **Major & Notable** | `https://freebuff-changelog.nordicnode.workers.dev/feed-major.xml` | Low-frequency announcements (model swaps, large features) |
+| **Model Catalog** | `https://freebuff-changelog.nordicnode.workers.dev/feed-models.xml` | Only model additions, retirements, and picker changes |
+| **Releases Only** | `https://freebuff-changelog.nordicnode.workers.dev/feed-releases.xml` | CLI and package version bumps |
+| **JSON Feed** | `https://freebuff-changelog.nordicnode.workers.dev/feed.json` | JSON Feed 1.1 for bots and custom integrations |
+
+### Setting up with MonitoRSS (Recommended)
+
+1. Invite **MonitoRSS** to your server: [monitorss.xyz](https://monitorss.xyz/)
+2. Run the add command in your updates channel:
+   ```text
+   /feed add url:https://freebuff-changelog.nordicnode.workers.dev/feed.xml
+   ```
+3. Customize the embed fields in the MonitoRSS control panel or slash commands:
+   * **Title**: `{title}`
+   * **URL**: `{link}`
+   * **Description**: `{description}`
+   * **Author**: `{author}`
+   * **Timestamp**: `{date}`
+   * **Footer**: `{tags}`
+
+### Setting up with Discord Webhooks (Zapier / Make / IFTTT)
+
+1. In Discord: Channel Settings → **Integrations** → **Webhooks** → **New Webhook** → Copy Webhook URL.
+2. In Zapier / Make / IFTTT:
+   * **Trigger**: *RSS by Zapier* (New Item in Feed) pointing to `/feed.xml`.
+   * **Action**: *Discord Webhook* (POST JSON):
+     ```json
+     {
+       "embeds": [{
+         "title": "{title}",
+         "url": "{link}",
+         "description": "{description}",
+         "color": 5809919,
+         "author": { "name": "{author}" }
+       }]
+     }
+     ```
+
 ## Honest limitations
 
 * Multiple private commits can be squashed into one public snapshot; entries

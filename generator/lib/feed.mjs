@@ -206,6 +206,12 @@ export const FEED_XSL = `<?xml version="1.0" encoding="utf-8"?>
               <p style="margin-top:6px">This is an RSS feed. To subscribe and receive updates automatically in your newsreader (Feedly, NetNewsWire, Miniflux, etc.) or Discord bot, copy this URL:</p>
               <code style="color:var(--term-green);font-size:12px"><xsl:value-of select="/rss/channel/atom:link/@href"/></code>
             </div>
+            <div class="sub-callout" style="border-left-color:var(--term-cyan)">
+              <span class="feed-badge" style="background:#1b2d42">Discord Bot Setup</span>
+              <p style="margin-top:6px">To post updates automatically to Discord using <b>MonitoRSS</b> or <b>RSS Bot</b>, run in your channel:</p>
+              <code style="color:var(--term-green);font-size:12px">/feed add url:<xsl:value-of select="/rss/channel/atom:link/@href"/></code>
+              <p style="margin-top:6px;font-size:11px">Embed mapping: Title = <code>{title}</code>, URL = <code>{link}</code>, Description = <code>{description}</code>, Author = <code>{author}</code>.</p>
+            </div>
             <p style="font-size:12px;margin-top:8px">
               <a href="/">&lt; [back to changelog]</a>
               <span style="margin:0 6px">&#183;</span>
