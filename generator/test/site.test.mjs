@@ -1010,6 +1010,7 @@ test('discordText: plainOnly omits codeblock diffs and produces clean plain anno
   const e = dcEntry()
   const plain = discordText(e, { plainOnly: true })
   assert.match(plain, /^### Muse Spark 1\.3 ships$/m)
+  assert.ok(plain.includes('Sep 13, 2026 · 10:00 UTC'), 'plain Discord text includes formatted date and time')
   assert.match(plain, /^> \*\*In plain English\*\*\n> The free model was replaced with a newer one\.$/m)
   assert.ok(!plain.includes('```'), 'no details codeblock')
   assert.ok(!plain.includes('**Details**'), 'no details section header')

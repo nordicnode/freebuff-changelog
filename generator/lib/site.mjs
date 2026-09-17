@@ -831,7 +831,7 @@ ${relatedLine(e, relatedIdx)}
   <span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i> &middot; ${e.files.total} file${e.files.total === 1 ? '' : 's'}</span>
   <div class="meta-links">
     <button class="meta-link dc-copy" type="button" data-dc="${esc(discordText(e))}" title="Copy this entry as Discord-formatted text (c)">discord</button>
-    ${e.eli5?.text ? `<button class="meta-link eli5-copy" type="button" data-eli5="${esc(e.eli5.text)}" title="Copy plain-English explanation to clipboard">plain english</button>` : ''}
+    ${e.eli5?.text ? `<button class="meta-link eli5-copy" type="button" data-eli5="${esc(discordText(e, { plainOnly: true }))}" title="Copy plain-English update formatted for Discord">plain english</button>` : ''}
     ${e.sourceSha ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" rel="noopener" target="_blank">snapshot</a>` : ''}
     ${e.pr ? `<a class="meta-link" href="${esc(e.prUrl || '')}" rel="noopener" target="_blank">PR #${e.pr}</a>` : ''}
     ${e.compareUrl ? `<a class="meta-link" href="${esc(e.compareUrl)}" rel="noopener" target="_blank">compare</a>` : e.url ? `<a class="meta-link" href="${esc(e.url)}" rel="noopener" target="_blank">commit</a>` : ''}
@@ -937,7 +937,9 @@ export function discordText (e, opts = {}) {
   const title = e.ai?.title || e.title || deriveTitleSafe(e)
   const sum = String(e.ai?.summary || e.summary || '').replace(/\s+/g, ' ').trim()
   const sig = e.significance === 'noise' ? 'churn' : e.significance
-  const head = ['**FREEBUFF**', `\`${e.category || 'Change'}\``, fmtDateHuman(e.day)]
+  const time = (e.date && e.date.includes('T')) ? e.date.slice(11, 16) : ''
+  const dateStr = (plainOnly && time) ? `${fmtDateHuman(e.day)} · ${time} UTC` : fmtDateHuman(e.day)
+  const head = ['**FREEBUFF**', `\`${e.category || 'Change'}\``, dateStr]
   if (sig && sig !== 'minor') head.push(`**${sig.toUpperCase()}**`)
   const parts = [head.join(' · '), `### ${dcEsc(title)}`]
   // Every line of a quote needs its own `>`: a wrapped continuation is fine, but a
