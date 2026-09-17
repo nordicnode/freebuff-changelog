@@ -28,6 +28,7 @@ function miniMd (text) {
 function layout ({ title, path, body, desc, noindex, ogImage, wide }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
+<script>(function(){try{var t=localStorage.getItem('fbTheme');if(t){document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='light'?'#f6f8fa':(t==='amber'?'#120d04':(t==='green'?'#051207':'#0d1117'));}}catch(_){}})();</script>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#0d1117">
 <title>${esc(title)} · ${SITE.name}</title>
@@ -48,7 +49,7 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="apple-touch-icon" href="/icon-192.png">
 <style>${CSS}</style>
-<script>(function(){try{var t=localStorage.getItem('fbTheme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(_){}})();</script></head><body${wide ? ' class="page-wide"' : ''}><main>
+</head><body${wide ? ' class="page-wide"' : ''}><main>
 <header class="top">
   <div class="brand">
     <a class="logo" href="/">
@@ -296,6 +297,11 @@ document.addEventListener('click', (ev) => {
   const val = btn.getAttribute('data-theme-val');
   document.documentElement.setAttribute('data-theme', val);
   try { localStorage.setItem('fbTheme', val); } catch (_) {}
+  const tc = document.querySelector('meta[name="theme-color"]');
+  if (tc) {
+    const colors = { dark: '#0d1117', amber: '#120d04', green: '#051207', light: '#f6f8fa' };
+    tc.content = colors[val] || '#0d1117';
+  }
   document.querySelectorAll('[data-theme-val]').forEach(b => {
     b.classList.toggle('active', b.getAttribute('data-theme-val') === val);
   });
