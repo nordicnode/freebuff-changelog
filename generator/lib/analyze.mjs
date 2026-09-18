@@ -106,7 +106,7 @@ const DIFF_TRUNCATED = '\n\n… [diff truncated: view full diff on GitHub] …\n
  * returned string caps what we *keep*, never what git streams through the
  * process, so it cannot protect against that.
  */
-async function diffText (repoDir, range, pathspecs, maxBytes, contextLines = 12) {
+async function diffText (repoDir, range, pathspecs, maxBytes, contextLines = 25) {
   const tmp = `${tmpdir()}/fb-diff-${randomBytes(8).toString('hex')}.patch`
   try {
     const ok = await git(['diff', '--no-color', `-U${contextLines}`, ...range, `--output=${tmp}`, '--', ...pathspecs], repoDir, { allowFail: true })
@@ -127,7 +127,7 @@ async function diffText (repoDir, range, pathspecs, maxBytes, contextLines = 12)
 
 // Clean unified diff of a commit for in-browser inspection, excluding lockfiles.
 // With excludeTests, pure test files drop out too (matches what the LLM prompt claims).
-export async function extractCleanDiff (repoDir, base, head, maxBytes = 250000, excludeTests = false, contextLines = 12) {
+export async function extractCleanDiff (repoDir, base, head, maxBytes = 250000, excludeTests = false, contextLines = 25) {
   // `base...head` needs two commits; the empty tree is neither, so a root commit
   // diffs against it directly.
   const range = base === EMPTY_TREE ? [EMPTY_TREE, head] : [`${base}...${head}`]
@@ -140,6 +140,63 @@ export async function extractCleanDiff (repoDir, base, head, maxBytes = 250000, 
     pathspecs.push(':(exclude)*__tests__*', ':(exclude)*test.*', ':(exclude)*spec.*', ':(exclude)*/tests/*')
   }
   return diffText(repoDir, range, pathspecs, maxBytes, contextLines)
+}
+
+/**
+ * Extract leading module-level documentation comments or headers from touched files.
+ * Provides ground-truth architectural purpose directly to the LLM to prevent hallucinations.
+ */
+export async function extractFileHeaders (repoDir, ref, files, maxFiles = 6, maxLinesPerFile = 40) {
+  if (!repoDir || !ref || !files || !files.length) return []
+  const targets = files
+    .map(f => (typeof f === 'string' ? f : f?.path || ''))
+    .filter(p => p && /\.(?:ts|tsx|js|mjs|cjs|py|go|rs|md)$/i.test(p) && !/(?:test|spec|__tests__)/i.test(p))
+    .slice(0, maxFiles)
+
+  const headers = []
+  for (const path of targets) {
+    try {
+      const content = await git(['show', `${ref}:${path}`], repoDir, { allowFail: true })
+      if (!content) continue
+      const lines = content.split('\n').slice(0, maxLinesPerFile)
+      if (/\.md$/i.test(path)) {
+        const mdSnippet = lines.slice(0, 25).join('\n').trim()
+        if (mdSnippet) headers.push({ path, header: mdSnippet })
+        continue
+      }
+      const commentLines = []
+      let inBlock = false
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]
+        const trimmed = line.trim()
+        if (i === 0 && trimmed.startsWith('#!')) continue
+        if (!inBlock && (trimmed.startsWith('/**') || trimmed.startsWith('/*'))) {
+          inBlock = true
+          commentLines.push(line)
+          if (trimmed.endsWith('*/') && trimmed.length > 2) inBlock = false
+        } else if (inBlock) {
+          commentLines.push(line)
+          if (trimmed.endsWith('*/')) {
+            inBlock = false
+            break
+          }
+        } else if (trimmed.startsWith('//') || trimmed.startsWith('#')) {
+          commentLines.push(line)
+        } else if (trimmed === '') {
+          if (commentLines.length > 0) commentLines.push(line)
+        } else {
+          break
+        }
+      }
+      const headerText = commentLines.join('\n').trim()
+      if (headerText) {
+        headers.push({ path, header: headerText })
+      }
+    } catch {
+      // ignore individual git read errors (e.g. deleted files or binary)
+    }
+  }
+  return headers
 }
 
 // ---------------------------------------------------------------------------

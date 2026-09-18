@@ -27,6 +27,7 @@ import { readJson, writeJson, log, pool, shortHash, eli5Source } from './util.mj
 import { mergeAiCache } from './mergedata.mjs'
 import {
   extractCommentFacts,
+  extractFileHeaders,
   isBumpEntry,
   versionTrackOf,
   VERSION_TRACKS,
@@ -184,8 +185,13 @@ export function buildPrompt (entry, patch, ctx = {}) {
   }
   if (ctx.prMeta || entry.messageBody) {
     lines.push('Author intent & PR motivation:')
-    if (ctx.prMeta?.number) lines.push(`- PR #${ctx.prMeta.number}: ${ctx.prMeta.title || ''}`)
-    if (entry.messageBody) lines.push(`- Commit message details: ${truncateWords(entry.messageBody, 1000)}`)
+    if (ctx.prMeta?.number) {
+      lines.push(`- PR #${ctx.prMeta.number}: ${ctx.prMeta.title || ''}`)
+      if (ctx.prMeta.body) {
+        lines.push(`  PR Description: ${truncateWords(ctx.prMeta.body, 1500)}`)
+      }
+    }
+    if (entry.messageBody) lines.push(`- Commit message details: ${truncateWords(entry.messageBody, 2000)}`)
   }
   if (ctx.sequence && (ctx.sequence.earlier?.length || ctx.sequence.later?.length)) {
     lines.push('Same-day commit sequence (ground this commit within its surrounding work):')
@@ -223,6 +229,15 @@ export function buildPrompt (entry, patch, ctx = {}) {
   if (renamed.length) lines.push(`Renamed files: ${renamed.slice(0, 8).join(', ')}`)
   const facts = (entry.facts || []).slice(0, 5)
   if (facts.length) lines.push(`Key facts (ground the WHY and DETAIL sentences in these): ${facts.map(f => `- ${f}`).join(' ')}`)
+  if (ctx.fileHeaders && ctx.fileHeaders.length) {
+    lines.push('Module & File Purpose (ground-truth documentation from touched files):')
+    for (const h of ctx.fileHeaders) {
+      lines.push(`- File \`${h.path}\`:`)
+      lines.push('```')
+      lines.push(h.header)
+      lines.push('```')
+    }
+  }
   const maxDiff = Number(process.env.CHANGELOG_LLM_MAX_DIFF_BYTES) || 500000
   lines.push('', 'Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):', '```diff', budgetPatch(patch, maxDiff, Math.max(100000, Math.round(maxDiff / 4))), '```')
   return lines.filter(Boolean).join('\n')
@@ -580,6 +595,7 @@ export function findPrMeta (e, prIndex) {
     number: pr.number,
     title: pr.title,
     author: pr.author,
+    body: pr.body || '',
     labels: (pr.labels || []).map(l => typeof l === 'string' ? l : l.name).filter(Boolean)
   }
 }
@@ -604,7 +620,7 @@ export function groupEntriesByDay (entries) {
   return byDay
 }
 
-export function sequenceForEntry (byDay, e, maxEach = 15) {
+export function sequenceForEntry (byDay, e, maxEach = 25) {
   const day = e?.day || (e?.date ? e.date.slice(0, 10) : '')
   if (!day || !byDay) return null
   const list = byDay.get(day)
@@ -698,7 +714,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       }
       continue
     }
-    const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 15)
+    const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 25)
     const sequence = sequenceForEntry(byDayEntries, e, seqWindow)
     const prMeta = findPrMeta(e, prIndex)
     queue.push({ entry: e, patch, key, relText, sequence, prMeta })
@@ -716,7 +732,12 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       const idx = activeIndex++
       const { entry: e, patch, key, relText = '', sequence = null, prMeta = null } = queue[idx]
       try {
-        const out = await callLlm(buildPrompt(e, patch, { releaseCtx: relText, sequence, prMeta, architectureMap: archMap }), env)
+        let fileHeaders = queue[idx].fileHeaders
+        if (!fileHeaders && options.repoDir) {
+          const files = [...(e.files?.modified || []), ...(e.files?.added || [])]
+          fileHeaders = await extractFileHeaders(options.repoDir, e.sha, files)
+        }
+        const out = await callLlm(buildPrompt(e, patch, { releaseCtx: relText, sequence, prMeta, architectureMap: archMap, fileHeaders }), env)
         const clean = validateLlmOut(out, e.significance || 'minor')
         gatewayFails = 0
         cache[key] = {
@@ -865,8 +886,11 @@ export function buildEli5Prompt (e, notes = [], ctx = {}) {
     evidence.push(`Architectural component: ${e.category || areas} (${areas || 'Freebuff codebase'})`)
   }
   if (prMeta || e.messageBody) {
-    if (prMeta?.number) evidence.push(`Developer intent (PR #${prMeta.number}): ${prMeta.title || ''}`)
-    if (e.messageBody) evidence.push(`Commit message details: ${truncateWords(e.messageBody, 400)}`)
+    if (prMeta?.number) {
+      evidence.push(`Developer intent (PR #${prMeta.number}): ${prMeta.title || ''}`)
+      if (prMeta.body) evidence.push(`PR details: ${truncateWords(prMeta.body, 800)}`)
+    }
+    if (e.messageBody) evidence.push(`Commit message details: ${truncateWords(e.messageBody, 800)}`)
   }
   if (sequence && (sequence.earlier?.length || sequence.later?.length)) {
     const seq = []
@@ -903,6 +927,10 @@ export function buildEli5Prompt (e, notes = [], ctx = {}) {
   if (e.freebuffVersion) evidence.push(`Shipped in freebuff app version ${e.freebuffVersion}`)
   if (releaseCtx) evidence.push(releaseCtx)
   if (siblings.length) evidence.push(`Other changes the same snapshot: ${siblings.slice(0, 15).join(' ; ')}`)
+  if (ctx.fileHeaders && ctx.fileHeaders.length) {
+    const fhText = ctx.fileHeaders.map(h => `File ${h.path}:\n${h.header}`).join('\n\n')
+    evidence.push(`Module purpose from touched files:\n${fhText}`)
+  }
   const noteBlock = notes.length
     ? `\nComments the developers wrote beside this code. Read them: they say who this is for and what it does today, which the constant names do not.\n${notes.map(n => `- ${n}`).join('\n')}\n`
     : ''
@@ -1104,7 +1132,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
       e.eli5 = { text: cached.text, model: cached.model, v: cached.v, src: shortHash(src), ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}), at: cached.at }
       continue
     }
-    const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 15)
+    const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 25)
     const sequence = sequenceForEntry(byDayEntries, e, seqWindow)
     const prMeta = findPrMeta(e, prIndex)
     queue.push({ entry: e, src, key, relText, sequence, prMeta })
@@ -1122,16 +1150,22 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
       const idx = activeIndex++
       const { entry: e, src, key, relText = '', sequence = null, prMeta = null } = queue[idx]
       try {
-          const patch = await eli5Patch(e, wantDiff || !e.facts?.length ? getPatch : null)
-          const out = await callLlm(buildEli5Prompt(e, eli5Notes(e, patch), {
-            patch: wantDiff ? patch : '',
-            siblings: (byDay.get(e.day) || []).filter(t => t !== e.ai.title).slice(0, 15),
-            diffBytes,
-            releaseCtx: relText,
-            prMeta,
-            sequence,
-            architectureMap: archMap
-          }), env, 1, (out) => normalizeEli5(out, relText ? ELI5_ROLLUP_MAX_CHARS : ELI5_MAX_CHARS))
+        let fileHeaders = queue[idx].fileHeaders
+        if (!fileHeaders && options.repoDir) {
+          const files = [...(e.files?.modified || []), ...(e.files?.added || [])]
+          fileHeaders = await extractFileHeaders(options.repoDir, e.sha, files)
+        }
+        const patch = await eli5Patch(e, wantDiff || !e.facts?.length ? getPatch : null)
+        const out = await callLlm(buildEli5Prompt(e, eli5Notes(e, patch), {
+          patch: wantDiff ? patch : '',
+          siblings: (byDay.get(e.day) || []).filter(t => t !== e.ai.title).slice(0, 15),
+          diffBytes,
+          releaseCtx: relText,
+          prMeta,
+          sequence,
+          architectureMap: archMap,
+          fileHeaders
+        }), env, 1, (out) => normalizeEli5(out, relText ? ELI5_ROLLUP_MAX_CHARS : ELI5_MAX_CHARS))
         gatewayFails = 0
         cache[key] = {
           model: env.LLM_MODEL || 'gpt-4o-mini',

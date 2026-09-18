@@ -1139,27 +1139,78 @@ test('groupEntriesByDay & sequenceForEntry: computes preceding and succeeding co
   assert.equal(seqFirst?.later?.length, 2)
 })
 
-test('sequenceForEntry: default window of 15 captures full day with a dozen+ updates', () => {
+test('sequenceForEntry: default window of 25 captures larger same-day batches', () => {
   const day = '2026-09-17'
   const entries = []
-  for (let i = 1; i <= 14; i++) {
+  for (let i = 1; i <= 35; i++) {
     entries.push({
       sha: `sha${String(i).padStart(6, '0')}`,
       day,
-      date: `2026-09-17T${String(7 + i).padStart(2, '0')}:00:00Z`,
+      date: `2026-09-17T00:00:${String(i).padStart(2, '0')}Z`,
       title: `Commit #${i}`,
       category: 'CLI'
     })
   }
   const byDay = groupEntriesByDay(entries)
-  // Check commit #7 (0-indexed 6): should have 6 earlier and 7 later
-  const seq = sequenceForEntry(byDay, entries[6])
-  assert.equal(seq?.earlier?.length, 6)
+  // Check commit #28 (index 27): has 27 earlier entries, default window should take 25
+  const seq = sequenceForEntry(byDay, entries[27])
+  assert.equal(seq?.earlier?.length, 25)
   assert.equal(seq?.later?.length, 7)
-  assert.equal(seq?.earlier[0].title, 'Commit #1')
-  assert.equal(seq?.earlier[5].title, 'Commit #6')
-  assert.equal(seq?.later[0].title, 'Commit #8')
-  assert.equal(seq?.later[6].title, 'Commit #14')
+  assert.equal(seq?.earlier[0].title, 'Commit #3')
+  assert.equal(seq?.earlier[24].title, 'Commit #27')
 })
+
+test('findPrMeta: preserves PR description body', () => {
+  const prIndex = {
+    prsByNum: new Map([
+      [1234, { number: 1234, title: 'Add budget limits', author: 'alice', body: 'Implements advertiser campaign budget caps.', labels: ['core'] }]
+    ]),
+    prsBySha: new Map()
+  }
+  const entry = { pr: 1234, sha: 'abc1234' }
+  const meta = findPrMeta(entry, prIndex)
+  assert.equal(meta?.number, 1234)
+  assert.equal(meta?.title, 'Add budget limits')
+  assert.equal(meta?.body, 'Implements advertiser campaign budget caps.')
+})
+
+test('buildPrompt & buildEli5Prompt: formats fileHeaders and PR body into context', () => {
+  const entry = {
+    sha: '71b2827c5f1d55176b4a03edc8b254f7bbca0c9d',
+    date: '2026-09-18T00:00:00Z',
+    category: 'Common',
+    summary: 'Update default daily placement cap',
+    files: { modified: ['common/src/ads/campaigns.ts'] }
+  }
+  const patch = '+export const PLACEMENT_DAILY_CAP_DEFAULT_CENTS = 10000;'
+  const fileHeaders = [
+    {
+      path: 'common/src/ads/campaigns.ts',
+      header: '/**\n * Ad placement campaigns and self-serve advertiser spending limits.\n */'
+    }
+  ]
+  const prMeta = {
+    number: 1380,
+    title: 'Raise default ad campaign budget',
+    body: 'Advertisers requested a higher starting budget ceiling for text placement campaigns.'
+  }
+
+  // Check buildPrompt
+  const prompt = buildPrompt(entry, patch, { fileHeaders, prMeta })
+  assert.ok(prompt.includes('Module & File Purpose (ground-truth documentation from touched files):'))
+  assert.ok(prompt.includes('File `common/src/ads/campaigns.ts`:'))
+  assert.ok(prompt.includes('Ad placement campaigns and self-serve advertiser spending limits.'))
+  assert.ok(prompt.includes('PR #1380: Raise default ad campaign budget'))
+  assert.ok(prompt.includes('PR Description: Advertisers requested a higher starting budget ceiling'))
+
+  // Check buildEli5Prompt
+  const eli5Prompt = buildEli5Prompt(entry, [], { fileHeaders, prMeta, patch })
+  assert.ok(eli5Prompt.includes('Module purpose from touched files:'))
+  assert.ok(eli5Prompt.includes('File common/src/ads/campaigns.ts:'))
+  assert.ok(eli5Prompt.includes('Ad placement campaigns and self-serve advertiser spending limits.'))
+  assert.ok(eli5Prompt.includes('Developer intent (PR #1380): Raise default ad campaign budget'))
+  assert.ok(eli5Prompt.includes('PR details: Advertisers requested a higher starting budget ceiling'))
+})
+
 
 

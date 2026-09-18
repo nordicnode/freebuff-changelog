@@ -6,7 +6,7 @@ import {
   extractModelTableChanges, extractVersionBump, extractSlashCommandChanges, isBumpEntry, versionTrackOf, VERSION_TRACKS,
   commandIdsFromRegistry,
   areaOf, isNoiseFile, deterministicSummary, entryTitle, churnLabel, testLabel, sourceRef, isSyncCommit,
-  extractCommentFacts, extractCleanDiff, extractRawDiff, EMPTY_TREE, parseMarkdownTables, catalogFromReadme,
+  extractCommentFacts, extractCleanDiff, extractRawDiff, extractFileHeaders, EMPTY_TREE, parseMarkdownTables, catalogFromReadme,
   diffCatalogs, commitNatureOf, analyzeCommunityCommit, analyzeSyncCommit,
   MONOREPO_COMPONENTS, formatArchitectureMap, discoverMonorepoArchitecture
 } from '../lib/analyze.mjs'
@@ -486,3 +486,74 @@ test('discoverMonorepoArchitecture: dynamic discovery of unknown subsystems and 
   assert.equal(plugins?.area, 'Plugins')
   assert.equal(plugins?.desc, 'Monorepo subsystem plugins/')
 })
+
+test('extractFileHeaders: extracts top comment blocks and markdown overviews while filtering test files', async (t) => {
+  const { mkdtemp, rm, mkdir, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { execFileSync } = await import('node:child_process')
+
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-headers-test-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const g = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  g('init', '-q', '-b', 'main')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+
+  // File 1: JSDoc block comment
+  await mkdir(join(dir, 'common', 'src', 'ads'), { recursive: true })
+  await writeFile(join(dir, 'common', 'src', 'ads', 'campaigns.ts'), `/**
+ * Ad placement campaigns and self-serve advertiser spending limits.
+ * Not related to developer coding sessions or token credits.
+ */
+
+export const PLACEMENT_DEFAULT = 10000;
+`)
+
+  // File 2: Line comments with shebang
+  await mkdir(join(dir, 'cli', 'bin'), { recursive: true })
+  await writeFile(join(dir, 'cli', 'bin', 'run.mjs'), `#!/usr/bin/env node
+// Freebuff CLI entrypoint.
+// Initializes direnv sandbox and boots interactive REPL.
+
+import { run } from './cli.js';
+`)
+
+  // File 3: Markdown documentation
+  await writeFile(join(dir, 'README.md'), `# Freebuff AI Agent
+Freebuff is an open-source coding agent designed for terminal and desktop environments.
+`)
+
+  // File 4: Test file (should be excluded)
+  await writeFile(join(dir, 'common', 'src', 'ads', 'campaigns.test.ts'), `// Test suite for campaigns\n`)
+
+  g('add', '.')
+  g('commit', '-q', '-m', 'feat: initial files')
+
+  const files = [
+    'common/src/ads/campaigns.ts',
+    'cli/bin/run.mjs',
+    'README.md',
+    'common/src/ads/campaigns.test.ts'
+  ]
+
+  const headers = await extractFileHeaders(dir, 'HEAD', files)
+  assert.equal(headers.length, 3)
+
+  const campaignsHeader = headers.find(h => h.path === 'common/src/ads/campaigns.ts')
+  assert.ok(campaignsHeader)
+  assert.ok(campaignsHeader.header.includes('Ad placement campaigns and self-serve advertiser spending limits'))
+
+  const runHeader = headers.find(h => h.path === 'cli/bin/run.mjs')
+  assert.ok(runHeader)
+  assert.ok(runHeader.header.includes('Freebuff CLI entrypoint'))
+  assert.ok(!runHeader.header.includes('#!/usr/bin/env node'))
+
+  const readmeHeader = headers.find(h => h.path === 'README.md')
+  assert.ok(readmeHeader)
+  assert.ok(readmeHeader.header.includes('# Freebuff AI Agent'))
+
+  // Verify test file was filtered out
+  assert.equal(headers.find(h => h.path.includes('test.ts')), undefined)
+})
+
