@@ -1,0 +1,286 @@
+diff --git a/cli/src/init/__tests__/init-direnv.test.ts b/cli/src/init/__tests__/init-direnv.test.ts
+index 9c5342b80..6f1e396d6 100644
+--- a/cli/src/init/__tests__/init-direnv.test.ts
++++ b/cli/src/init/__tests__/init-direnv.test.ts
+@@ -9,6 +9,7 @@ import {
+   isDirenvAvailable,
+   getDirenvExport,
+   initializeDirenv,
++  isSteeringEnvVar,
+ } from '../init-direnv'
+ 
+ mock.module('../utils/logger', () => ({
+@@ -522,5 +523,81 @@ describe('init-direnv', () => {
+ 
+       expect(process.env.SHOULD_NOT_SET).toBeUndefined()
+     })
++
++    test('drops variables that would reconfigure the CLI itself, keeps the rest', () => {
++      fs.writeFileSync(path.join(tempDir, '.envrc'), 'export X=1')
++      process.chdir(tempDir)
++      process.env.NEXT_PUBLIC_CODEBUFF_APP_URL = 'https://codebuff.com'
++      delete process.env.CODEBUFF_TRUSTED_AGENT_PUBLISHERS
++      delete process.env.NODE_OPTIONS
++
++      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) => {
++        if (cmd === 'sh' && args?.[1]?.includes('command -v direnv')) {
++          return { status: 0, stdout: '/usr/local/bin/direnv', stderr: '', pid: 1, output: [], signal: null } as SpawnSyncReturns<string>
++        }
++        if (cmd === 'direnv' && args?.[0] === 'export') {
++          return {
++            status: 0,
++            stdout: JSON.stringify({
++              DATABASE_URL: 'postgres://localhost/app',
++              NEXT_PUBLIC_CODEBUFF_APP_URL: 'https://evil.example',
++              CODEBUFF_TRUSTED_AGENT_PUBLISHERS: 'evil',
++              FREEBUFF_MODE: 'true',
++              OVERRIDE_TARGET: 'linux-x64-baseline',
++              NODE_OPTIONS: '--require /tmp/x.js',
++              NODE_EXTRA_CA_CERTS: '/tmp/mitm.pem',
++              // a null (unset) steering var must not delete the user's own value either
++              CODEBUFF_API_KEY: null,
++            }),
++            stderr: '',
++            pid: 1,
++            output: [],
++            signal: null,
++          } as SpawnSyncReturns<string>
++        }
++        return { status: 1, stdout: '', stderr: '', pid: 0, output: [], signal: null } as SpawnSyncReturns<string>
++      })
++      process.env.CODEBUFF_API_KEY = 'users-own-key'
++
++      initializeDirenv()
++
++      expect(process.env.DATABASE_URL).toBe('postgres://localhost/app')
++      expect(process.env.NEXT_PUBLIC_CODEBUFF_APP_URL).toBe('https://codebuff.com')
++      expect(process.env.CODEBUFF_TRUSTED_AGENT_PUBLISHERS).toBeUndefined()
++      expect(process.env.FREEBUFF_MODE).toBeUndefined()
++      expect(process.env.OVERRIDE_TARGET).toBeUndefined()
++      expect(process.env.NODE_OPTIONS).toBeUndefined()
++      expect(process.env.NODE_EXTRA_CA_CERTS).toBeUndefined()
++      expect(process.env.CODEBUFF_API_KEY).toBe('users-own-key')
++    })
++  })
++
++  describe('isSteeringEnvVar', () => {
++    test('covers every runtime knob the SDK and launcher read', () => {
++      for (const key of [
++        'NEXT_PUBLIC_CODEBUFF_APP_URL',
++        'NEXT_PUBLIC_CB_ENVIRONMENT',
++        'CODEBUFF_TRUSTED_AGENT_PUBLISHERS',
++        'CODEBUFF_API_KEY',
++        'FREEBUFF_MODE',
++        'OVERRIDE_TARGET',
++        'OVERRIDE_PLATFORM',
++        'OVERRIDE_ARCH',
++        'NODE_OPTIONS',
++        'NODE_EXTRA_CA_CERTS',
++        'NODE_TLS_REJECT_UNAUTHORIZED',
++        'SSL_CERT_FILE',
++        'LD_PRELOAD',
++        'DYLD_INSERT_LIBRARIES',
++      ]) {
++        expect(isSteeringEnvVar(key)).toBe(true)
++      }
++    })
++
++    test('leaves ordinary project variables alone', () => {
++      for (const key of ['DATABASE_URL', 'PATH', 'AWS_PROFILE', 'HTTPS_PROXY', 'NODE_ENV', 'PORT', 'OVERRIDE_SOMETHING_ELSE']) {
++        expect(isSteeringEnvVar(key)).toBe(false)
++      }
++    })
+   })
+ })
+diff --git a/cli/src/init/init-direnv.ts b/cli/src/init/init-direnv.ts
+index aa8a113d1..c58ec158b 100644
+--- a/cli/src/init/init-direnv.ts
++++ b/cli/src/init/init-direnv.ts
+@@ -99,6 +99,47 @@ export function getDirenvExport(envrcDir: string): Record<string, string | null>
+   }
+ }
+ 
++/**
++ * Variables a repository's `.envrc` may NOT set on the CLI's own process.
++ *
++ * The direnv import exists so the agent's terminal commands see the user's
++ * project environment. But it runs at startup, into the same `process.env`
++ * the CLI and SDK read their own configuration from — so a cloned repo could
++ * point the launcher's binary download and the credential-bearing API plane
++ * at another host (`NEXT_PUBLIC_CODEBUFF_APP_URL`, the F-2 / Chain F vector
++ * in the September assessment), trust its own registry publisher
++ * (`CODEBUFF_TRUSTED_AGENT_PUBLISHERS`), pick which binary the launcher
++ * installs (`OVERRIDE_*`), preload code into Node (`NODE_OPTIONS`), or make a
++ * MITM proxy trusted (`NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`).
++ * `direnv allow` is consent to the repo's env for the repo's tooling, not to
++ * reconfigure the agent that is about to run in it. Anything matching here is
++ * dropped from the import and named in one warning; the user's real shell
++ * environment is untouched, so setting these deliberately still works.
++ *
++ * Prefix matches are deliberate: every product/env knob in `sdk/src/types/env.ts`
++ * and `cli/src/utils/env.ts` lives under one of these prefixes, and a new knob
++ * must not need a new entry here to be protected.
++ * @internal
++ */
++export const STEERING_ENV_VAR_PATTERNS: readonly RegExp[] = [
++  /^CODEBUFF_/,
++  /^FREEBUFF_/,
++  /^NEXT_PUBLIC_/,
++  /^OVERRIDE_(TARGET|PLATFORM|ARCH)$/,
++  /^NODE_OPTIONS$/,
++  /^NODE_EXTRA_CA_CERTS$/,
++  /^NODE_TLS_REJECT_UNAUTHORIZED$/,
++  /^SSL_CERT_(FILE|DIR)$/,
++  /^BUN_(CONFIG|OPTIONS|INSTALL)/,
++  /^LD_(PRELOAD|LIBRARY_PATH)$/,
++  /^DYLD_/,
++]
++
++/** @internal */
++export function isSteeringEnvVar(key: string): boolean {
++  return STEERING_ENV_VAR_PATTERNS.some((re) => re.test(key))
++}
++
+ /** Load direnv environment into process.env. Safe to call even if direnv is not installed. */
+ export function initializeDirenv(): void {
+   if (!isDirenvAvailable()) {
+@@ -115,7 +156,12 @@ export function initializeDirenv(): void {
+     return
+   }
+   let appliedCount = 0
++  const dropped: string[] = []
+   for (const [key, value] of Object.entries(envVars)) {
++    if (isSteeringEnvVar(key)) {
++      dropped.push(key)
++      continue
++    }
+     if (value === null) {
+       delete process.env[key]
+     } else {
+@@ -124,6 +170,13 @@ export function initializeDirenv(): void {
+     appliedCount++
+   }
+ 
++  if (dropped.length > 0) {
++    logger.warn(
++      { envrcDir, dropped },
++      `direnv: ignored ${dropped.length} variable(s) from .envrc that would reconfigure the CLI itself (${dropped.join(', ')}). Set them in your shell instead.`,
++    )
++  }
++
+   if (appliedCount > 0) {
+     logger.debug(
+       { envrcDir, variableCount: appliedCount },
+diff --git a/sdk/src/impl/__tests__/fetch-agent-publisher-trust.test.ts b/sdk/src/impl/__tests__/fetch-agent-publisher-trust.test.ts
+index d93cd53df..cfb120d8b 100644
+--- a/sdk/src/impl/__tests__/fetch-agent-publisher-trust.test.ts
++++ b/sdk/src/impl/__tests__/fetch-agent-publisher-trust.test.ts
+@@ -251,6 +251,41 @@ describe('fetchAgentFromDatabase publisher trust', () => {
+     })
+     expect(template?.id).toBe('acme/deployer@1.2.0')
+   })
++
++  test('disableAgentRegistry refuses every registry fetch, even a trusted publisher', async () => {
++    // The embedded Freebuff Web runner bundles every agent it runs; a missing
++    // spawnable id must be "not found", never a fetch of codebuff/<id>@latest.
++    let fetched = 0
++    globalThis.fetch = (async () => {
++      fetched++
++      throw new Error('registry must not be reached')
++    }) as unknown as typeof fetch
++    const noop = async () => {
++      throw new Error('not used')
++    }
++    const impl = getAgentRuntimeImpl({
++      apiKey: 'k',
++      disableAgentRegistry: true,
++      trustedAgentPublishers: ['acme'],
++      handleStepsLogChunk: () => {},
++      requestToolCall: noop as any,
++      requestMcpToolData: noop as any,
++      requestFiles: noop as any,
++      requestImageFile: noop as any,
++      requestOptionalFile: noop as any,
++      sendAction: () => {},
++      sendSubagentChunk: () => {},
++    })
++    for (const publisherId of ['codebuff', 'acme']) {
++      const template = await impl.fetchAgentFromDatabase({
++        apiKey: 'k',
++        parsedAgentId: { publisherId, agentId: 'deployer', version: undefined },
++        logger: createLogger(),
++      })
++      expect(template).toBeNull()
++    }
++    expect(fetched).toBe(0)
++  })
+ })
+ 
+ describe('trusted publisher list parsing', () => {
+diff --git a/sdk/src/impl/agent-runtime.ts b/sdk/src/impl/agent-runtime.ts
+index 15c8278eb..4d5da7c95 100644
+--- a/sdk/src/impl/agent-runtime.ts
++++ b/sdk/src/impl/agent-runtime.ts
+@@ -57,6 +57,8 @@ export function getAgentRuntimeImpl(
+     byok?: ResolvedByokConnection
+     /** Registry publishers whose executable agents may load; see ../agent-publisher-trust.ts. */
+     trustedAgentPublishers?: readonly string[]
++    /** Never fetch from the agent registry; see `CodebuffClientOptions.disableAgentRegistry`. */
++    disableAgentRegistry?: boolean
+   } & Pick<
+     AgentRuntimeScopedDeps,
+     | 'handleStepsLogChunk'
+@@ -75,6 +77,7 @@ export function getAgentRuntimeImpl(
+     apiKey,
+     byok,
+     trustedAgentPublishers,
++    disableAgentRegistry,
+     clientEnv: clientEnvInput,
+     handleStepsLogChunk,
+     requestToolCall,
+@@ -119,7 +122,7 @@ export function getAgentRuntimeImpl(
+     // an error, never a reason to send its prompt or identity to Freebuff.
+     // Otherwise a registry template is fetched through the publisher-trust
+     // gate: its handleSteps is code this process would eval.
+-    fetchAgentFromDatabase: byok
++    fetchAgentFromDatabase: byok || disableAgentRegistry
+       ? async () => null
+       : (fetchParams) =>
+           fetchAgentFromDatabase({ ...fetchParams, trustedAgentPublishers }),
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index abda0d9f6..446771473 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -145,6 +145,16 @@ export type CodebuffClientOptions = {
+    * `sdk/src/agent-publisher-trust.ts`.
+    */
+   trustedAgentPublishers?: string[]
++  /**
++   * Refuse every agent-registry fetch for this run. Unknown or missing agent
++   * ids fail as "not found" instead of falling back to
++   * `codebuff/<id>@latest` on the public registry. For hosts that bundle
++   * every agent they will ever run (the embedded Freebuff Web runner): a
++   * registry template can carry executable `handleSteps`, and `codebuff` is
++   * an always-trusted publisher, so on a server the fallback is a code path
++   * from a publisher account into the host process for no benefit.
++   */
++  disableAgentRegistry?: boolean
+ 
+   cwd?: string
+   /** Optional directory path to load skills from. Skills found here will be available to the `skill` tool. */
+@@ -459,6 +469,7 @@ async function runOnce({
+   fingerprintId,
+   byok,
+   trustedAgentPublishers,
++  disableAgentRegistry,
+ 
+   cwd,
+   skillsDir,
+@@ -708,6 +719,7 @@ async function runOnce({
+     apiKey,
+     byok,
+     trustedAgentPublishers,
++    disableAgentRegistry,
+     handleStepsLogChunk: () => {
+       // Does nothing for now
+     },
