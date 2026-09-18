@@ -164,6 +164,21 @@ test('extractCommentFacts: only captures added comments and flushes properly', (
   assert.deepEqual(extractCommentFacts('+ // fooBar\n+ // x = y'), [], 'identifier junk still dies')
 })
 
+test('extractCommentFacts: captures surrounding context comments when no additions present', () => {
+  const patch = [
+    ' /**',
+    '  * Bounds for a placements campaign daily cap in cents.',
+    '  * Self-serve ceiling for advertiser campaign budgets.',
+    '  */',
+    ' export const PLACEMENT_DAILY_CAP_MIN_CENTS = 500;',
+    '-export const PLACEMENT_DAILY_CAP_DEFAULT_CENTS = 2500;',
+    '+export const PLACEMENT_DAILY_CAP_DEFAULT_CENTS = 10000;'
+  ].join('\n')
+  const facts = extractCommentFacts(patch)
+  assert.ok(facts.length >= 1)
+  assert.match(facts[0], /Bounds for a placements campaign/i)
+})
+
 test('extractCleanDiff: function is exported and callable', () => {
   assert.equal(typeof extractCleanDiff, 'function')
 })

@@ -106,10 +106,10 @@ const DIFF_TRUNCATED = '\n\n… [diff truncated: view full diff on GitHub] …\n
  * returned string caps what we *keep*, never what git streams through the
  * process, so it cannot protect against that.
  */
-async function diffText (repoDir, range, pathspecs, maxBytes) {
+async function diffText (repoDir, range, pathspecs, maxBytes, contextLines = 12) {
   const tmp = `${tmpdir()}/fb-diff-${randomBytes(8).toString('hex')}.patch`
   try {
-    const ok = await git(['diff', '--no-color', '-U3', ...range, `--output=${tmp}`, '--', ...pathspecs], repoDir, { allowFail: true })
+    const ok = await git(['diff', '--no-color', `-U${contextLines}`, ...range, `--output=${tmp}`, '--', ...pathspecs], repoDir, { allowFail: true })
     if (ok === null) return ''
     let fh
     try {
@@ -127,7 +127,7 @@ async function diffText (repoDir, range, pathspecs, maxBytes) {
 
 // Clean unified diff of a commit for in-browser inspection, excluding lockfiles.
 // With excludeTests, pure test files drop out too (matches what the LLM prompt claims).
-export async function extractCleanDiff (repoDir, base, head, maxBytes = 250000, excludeTests = false) {
+export async function extractCleanDiff (repoDir, base, head, maxBytes = 250000, excludeTests = false, contextLines = 12) {
   // `base...head` needs two commits; the empty tree is neither, so a root commit
   // diffs against it directly.
   const range = base === EMPTY_TREE ? [EMPTY_TREE, head] : [`${base}...${head}`]
@@ -139,7 +139,7 @@ export async function extractCleanDiff (repoDir, base, head, maxBytes = 250000, 
   if (excludeTests) {
     pathspecs.push(':(exclude)*__tests__*', ':(exclude)*test.*', ':(exclude)*spec.*', ':(exclude)*/tests/*')
   }
-  return diffText(repoDir, range, pathspecs, maxBytes)
+  return diffText(repoDir, range, pathspecs, maxBytes, contextLines)
 }
 
 // ---------------------------------------------------------------------------
@@ -704,38 +704,42 @@ function patchForFile (patch, file) {
 // (they write unusually thorough rationale comments; e.g. model retirements).
 // Consecutive added comment lines are joined into paragraphs; only
 // mostly-prose, sentence-terminated paragraphs survive (kills identifier junk).
+// Added comments take precedence, supplemented by surrounding context comments.
 export function extractCommentFacts (patch) {
-  const facts = []
+  const addedFacts = []
+  const contextFacts = []
   let buf = []
+  let isAddedBlock = false
+
   const flush = () => {
     if (!buf.length) return
     let text = buf.join(' ').replace(/\s+/g, ' ').trim()
+    const target = isAddedBlock ? addedFacts : contextFacts
     buf = []
-    if (text.length < 45 || text.length > 300) return
+    isAddedBlock = false
+    if (text.length < 35 || text.length > 300) return
     if (!/^[A-Z"'\[(-]/.test(text)) return // drop mid-sentence continuations
     text = text.replace(/^(TODO|FIXME|NOTE|WHY|HOW)\s*:?\s*/i, '')
     const lower = (text.match(/[a-z]/g) || []).length
     if (lower < text.length * 0.5) return
-    // Count words, not runs of lowercase letters: a sentence about money ("$1,000")
-    // or an acronym ("YC") breaks its own letter runs, and counting runs threw away
-    // exactly the terse eligibility comments that say who a change is for.
-    if ((text.split(/\s+/).filter(w => /[a-z]{3,}/i.test(w)).length) < 5) return
+    if ((text.split(/\s+/).filter(w => /[a-z]{3,}/i.test(w)).length) < 4) return
     if (!/[.!?]$/.test(text)) return
     if (/^(Removed|Added|Modified|See|See also)\b.*\b(docs|test|section)\b/i.test(text) && text.length < 80) return
-    facts.push(text)
+    target.push(text)
   }
+
   for (const line of patch.split('\n')) {
-    const m = /^([+-])\s*(?:\/\/|\/\*+|\*+)\s?(.*)$/.exec(line)
+    const m = /^([+ -])\s*(?:\/\/|\/\*+|\*+)\s?(.*)$/.exec(line)
     if (!m) { flush(); continue }
-    // Only capture added comments; ignore deletions and flush on deletion
-    if (m[1] !== '+') { flush(); continue }
-    const t = m[2].replace(/\*\/\s*$/, '').trim()
+    if (m[1] === '-') { flush(); continue }
+    if (m[1] === '+') isAddedBlock = true
+    const t = m[2].replace(/\*\/\s*$/, '').replace(/\/+$/, '').trim()
     if (!t) { flush(); continue }
     buf.push(t)
     if (buf.join(' ').length > 280) flush()
   }
   flush()
-  return [...new Set(facts)].slice(0, 5)
+  return [...new Set([...addedFacts, ...contextFacts])].slice(0, 5)
 }
 
 function tagsFor (e) {

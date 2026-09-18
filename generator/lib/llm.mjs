@@ -45,6 +45,12 @@ export const PROMPT_V = 7
 
 export const FREEBUFF_ARCHITECTURE_MAP = formatArchitectureMap(MONOREPO_COMPONENTS)
 
+export const FREEBUFF_DOMAIN_LEXICON = `Freebuff Subsystem Disambiguation & Domain Lexicon:
+- Placements & Ads ('common/src/ads/', 'common/src/constants/freebuff-placements.ts', 'freebuff-ads.ts'): First-party text ads and sponsored ad placement campaigns bought by advertisers. PLACEMENT_* constants set self-serve daily budget limits and ladders for advertisers, NOT developer coding sessions or token allowances.
+- Conversions API / CAPI ('common/src/gravity-capi.ts', 'common/src/reddit-capi.ts'): Server-side Conversions API integration with Meta Graph API and Reddit for advertising attribution with DNT/GPC privacy signals, NOT CLI or developer API endpoints.
+- Freebucks & Spend Ceilings ('freebuff-topups.ts', 'freebuff-spend-ceilings.ts', 'subscription-plans.ts'): Compute credits, model tier windows, and token usage allowances for end-user developers.
+- Direnv & Steering Isolation ('cli/src/init/direnv.ts'): Local repository sandbox security dropping CODEBUFF_*, FREEBUFF_*, NODE_OPTIONS, and LD_* steering variables from cloned .envrc to prevent repo-driven CLI hijacking.`
+
 export function firstSentence (s) {
   const m = String(s || '').trim().match(/^[^.?!]+[.?!]/)
   return (m ? m[0] : String(s || '').trim()).trim()
@@ -150,6 +156,12 @@ export function buildPrompt (entry, patch, ctx = {}) {
     '- DETAIL: include one concrete technical fact (migration behavior, trait change, alias, flag, or constraint). Never paste raw diff lines. Never write "Nothing to do" or no-action boilerplate.',
     '',
     ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP,
+    '',
+    FREEBUFF_DOMAIN_LEXICON,
+    '',
+    'Anti-Hallucination & Speculation Constraints:',
+    '- Strict Non-Extrapolation: If a change modifies constants, defaults, limits, or configurations without altering runtime execution logic, describe only what literal value changed and where. NEVER extrapolate or hallucinate runtime session consequences, developer workflow friction, or automatic shutdowns that are not in the diff.',
+    '- Audience Precision: Distinguish strictly between end-user developers (CLI/Web assistant users), advertisers/sponsors (ad campaigns & placements), and internal maintainers. Never attribute advertiser settings or internal tooling to regular users.',
     '',
     'Output format: First, identify and cite the concrete evidence in the diff (function name, file, or hunk) in "evidence", then produce title and summary.',
     `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, flag, or diff hunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "${entry.significance || 'minor'}"}.`,
@@ -901,6 +913,8 @@ export function buildEli5Prompt (e, notes = [], ctx = {}) {
 
 ${ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP}
 
+${FREEBUFF_DOMAIN_LEXICON}
+
 Date: ${e.day || ''}
 Area: ${e.category || (e.areas || []).join(', ')}
 Weight the tooling gave it: ${e.significance || 'minor'}
@@ -919,6 +933,7 @@ Rules:
 - If the summary and the diff disagree about what happened, follow the diff.
 - Say whether it is live today. A constant, a flag, a field or a type that nothing reads yet is not a feature: say it is in place and does nothing yet.
 - Test & Documentation Guardian: If the change or commit nature is test-only, docs-only, or internal tooling, do NOT invent or claim user-facing assistant features, performance gains, or UI changes. State clearly and concisely that this is an internal test suite or documentation update that does not alter how the application behaves for users.
+- Anti-Speculation & Audience Precision: Never extrapolate internal limits, advertiser budgets, or default constants into imagined runtime developer workflows, session cutoffs, or free-tier usage restrictions. If a constant is for advertisers or internal infrastructure, state its exact audience honestly. Do NOT tell assistant users that their coding sessions or personal quotas are affected by advertiser ad placement changes.
 - An access change recorded in the evidence is a change, even when this commit only publishes it. If a comment, a fact or the diff says a region, a plan or a group lost or gained access, left or joined a list, or keeps something it bought, say that, with the date the evidence gives. "Who is eligible today did not change" is a false comfort when the evidence records that it changed yesterday. The nothing-reads-yet rule is for constants nobody consumes, not for access that already moved.
 - Use only what the summary, the evidence and the comments say. Never invent a cause, a number, or a promise.
 - Keep the audience the text gives, and keep it narrow. If the change is for one kind of customer, one plan, one region, or only after some step, name that group. Never widen it to "users", "everyone" or "customers" because that reads more naturally: a program for verified YC companies is not available to users.
