@@ -142,31 +142,59 @@ updateSyncAge();
   onScroll();
 })();
 
-// A tab left open keeps the stamp it loaded with, so a reader can watch a fixed
-// sync count up "[stale 184m]" on an otherwise healthy site. Reload once per
-// data version, and only when the visitor returns to a backgrounded tab on the
-// page that carries the sync line — never mid-interaction, never in a loop.
-(function refreshWhenBehind() {
+// Automatically pick up new entries when they land without requiring manual refresh.
+// Polls /api/status.json every 30s or on tab return. If a new commit or entry is detected:
+// - If reader is near the top and not typing, reloads seamlessly.
+// - If reader is scrolled deep down reading, reloads once they scroll back up or switch tabs.
+(function autoUpdate() {
   const path = location.pathname;
   if (path !== '/' && path !== '/index.html') return;
   const el = document.querySelector('.sync-age');
   if (!el || !el.dataset.generated) return;
-  const generated = Date.parse(el.dataset.generated);
-  if (!Number.isFinite(generated)) return;
-  const flag = 'fbReload:' + el.dataset.generated;
-  let hiddenAt = 0;
-  let stored = false;
-  try { stored = !!sessionStorage.getItem(flag); } catch (_) { return; }
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) { hiddenAt = Date.now(); return; }
-    const awayMs = hiddenAt ? Date.now() - hiddenAt : 0;
-    hiddenAt = 0;
-    if (stored || awayMs < 5 * 60000) return;
-    const budgetMs = (Number(el.dataset.budgetMin) || 45) * 60000;
-    if (Date.now() - generated <= budgetMs) return;
-    stored = true;
-    try { sessionStorage.setItem(flag, '1'); } catch (_) {}
+  const initialGenerated = el.dataset.generated;
+  const initialHead = el.dataset.head || '';
+  const initialChanges = el.dataset.changes || '';
+  const flag = 'fbReload:' + initialGenerated;
+
+  let updatePending = false;
+
+  function tryReload() {
+    const isTyping = document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA');
+    if (isTyping) return false;
+    if (window.scrollY > 300) return false;
     location.reload();
+    return true;
+  }
+
+  async function check() {
+    try {
+      const res = await fetch('/api/status.json?_=' + Date.now());
+      if (!res.ok) return;
+      const data = await res.json();
+      const headChanged = initialHead && data.headSha && data.headSha !== initialHead;
+      const changesChanged = initialChanges && data.changes && String(data.changes) !== String(initialChanges);
+      const genChanged = data.generatedAt && data.generatedAt !== initialGenerated;
+
+      if (headChanged || changesChanged || genChanged) {
+        updatePending = true;
+        if (!tryReload()) {
+          window.addEventListener('scroll', function onScrollUp() {
+            if (tryReload()) window.removeEventListener('scroll', onScrollUp);
+          }, { passive: true });
+        }
+      }
+    } catch (_) {}
+  }
+
+  setInterval(check, 30000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    if (updatePending) { location.reload(); return; }
+    check();
+  });
+  window.addEventListener('focus', () => {
+    if (updatePending) { location.reload(); return; }
+    check();
   });
 })();
 
@@ -1245,7 +1273,7 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
     // auto-refresh while someone reads July 2024 would yank the page out from
     // under them.
     const freshness = latest
-      ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}">${esc(fmtDateHuman(generated))} UTC</span></span>`
+      ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}" data-head="${esc(changelog.headSha || '')}" data-changes="${meaningful.length}">${esc(fmtDateHuman(generated))} UTC</span></span>`
       : `<span>DATA AS OF ${esc(String(generated).slice(0, 16).replace('T', ' '))} UTC</span>
       <span>THIS DAY IS SETTLED HISTORY</span>`
 
