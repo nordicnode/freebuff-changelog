@@ -281,13 +281,89 @@ export function buildPrompt (entry, patch, ctx = {}) {
   return lines.filter(Boolean).join('\n')
 }
 
+export function sanitizeJsonText (str) {
+  let inString = false
+  let escaped = false
+  let out = ''
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i]
+
+    if (!inString) {
+      if (ch === '"') {
+        inString = true
+        out += ch
+      } else {
+        out += ch
+      }
+      continue
+    }
+
+    if (escaped) {
+      escaped = false
+      if (/^["\\/bfnrt]$/.test(ch)) {
+        out += ch
+      } else if (ch === 'u') {
+        const hex = str.slice(i + 1, i + 5)
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+          out += ch
+        } else {
+          out += '\\u'
+        }
+      } else {
+        out += '\\' + ch
+      }
+      continue
+    }
+
+    if (ch === '\\') {
+      escaped = true
+      out += ch
+      continue
+    }
+
+    if (ch === '"') {
+      inString = false
+      out += ch
+      continue
+    }
+
+    const code = ch.charCodeAt(0)
+    if (code < 0x20) {
+      if (ch === '\n') out += '\\n'
+      else if (ch === '\r') out += '\\r'
+      else if (ch === '\t') out += '\\t'
+      else if (ch === '\b') out += '\\b'
+      else if (ch === '\f') out += '\\f'
+      else out += '\\u' + code.toString(16).padStart(4, '0')
+      continue
+    }
+
+    out += ch
+  }
+
+  if (escaped) out += '\\'
+  if (inString) out += '"'
+  out = out.replace(/,\s*([\]}])/g, '$1')
+  return out
+}
+
 export function parseLlmJson (text) {
   const jsonStart = text.indexOf('{')
   const jsonEnd = text.lastIndexOf('}')
   if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
     throw new Error('LLM returned no JSON')
   }
-  return JSON.parse(text.slice(jsonStart, jsonEnd + 1))
+  const slice = text.slice(jsonStart, jsonEnd + 1)
+  try {
+    return JSON.parse(slice)
+  } catch (initialErr) {
+    try {
+      return JSON.parse(sanitizeJsonText(slice))
+    } catch (_) {
+      throw initialErr
+    }
+  }
 }
 
 // Some OpenAI-compatible gateways answer /chat/completions with SSE chunk
@@ -438,15 +514,38 @@ export function validateLlmOut (out, fallbackSig = 'minor') {
   }
 }
 
-export function isTransientError (err) {
+export function isGatewayError (err) {
   const msg = String(err?.message || err || '')
-  // Any 5xx from the gateway family, not just the canonical 502/503/504: the
-  // endpoint sits behind a cloudflared tunnel, and 530 (tunnel error) plus
-  // 521/522/523/524/525/526/527 were all being recorded as *permanent* hour-long
-  // failures for what is a second-long blip. Anchored on "HTTP 5xx" so an error
-  // text that merely contains those digits cannot misclassify; 4xx (400, 429)
-  // stays a real failure and keeps the long cooldown.
   return /fetch failed|ECONNREFUSED|ECONNRESET|ECONNABORTED|EPIPE|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|socket hang up|terminated|HTTP 5\d\d|timeout/i.test(msg)
+}
+
+export function isTransientError (err) {
+  if (isGatewayError(err)) return true
+  const msg = String(err?.message || err || '')
+  if (/HTTP 4\d\d/i.test(msg)) return false
+  // A malformed JSON token, truncated response, or bad escape character from
+  // the model is non-deterministic and should retry on the short cooldown (5 min)
+  // rather than parking the entry on the 1-hour cooldown.
+  if (err instanceof SyntaxError || /Bad escaped character|Unexpected token|is not valid JSON|no JSON|invalid message|malformed JSON/i.test(msg)) {
+    return true
+  }
+  return false
+}
+
+export function pruneExpiredErrors (cache, { errorCooldownMs = 3600000, transientRetryMs = 300000, now = Date.now() } = {}) {
+  if (!cache || typeof cache !== 'object') return 0
+  let pruned = 0
+  for (const [k, v] of Object.entries(cache)) {
+    if (v && v.error) {
+      const at = Date.parse(v.at || '') || 0
+      const limit = v.transient ? transientRetryMs : errorCooldownMs
+      if (now - at >= limit) {
+        delete cache[k]
+        pruned++
+      }
+    }
+  }
+  return pruned
 }
 
 // ---------------------------------------------------------------------------
@@ -827,10 +926,12 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
             cache[key] = { error: shortError(err).slice(0, 200), transient: true, at: new Date().toISOString() }
             cacheModified = true
           }
-          gatewayFails++
-          if (gatewayFails >= 3) {
-            log('LLM endpoint appears offline (3 consecutive gateway errors): skipping rest of queue this run')
-            break
+          if (isGatewayError(err)) {
+            gatewayFails++
+            if (gatewayFails >= 3) {
+              log('LLM endpoint appears offline (3 consecutive gateway errors): skipping rest of queue this run')
+              break
+            }
           }
           continue
         }
@@ -844,7 +945,9 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   await Promise.all(Array.from({ length: poolSize }, () => worker()))
 
   if (cacheModified) {
-    await writeJson(cachePath, mergeAiCache(await readJson(cachePath, {}), cache))
+    const merged = mergeAiCache(await readJson(cachePath, {}), cache)
+    pruneExpiredErrors(merged, { errorCooldownMs, transientRetryMs })
+    await writeJson(cachePath, merged)
   }
   return apiCalls
 }
@@ -1309,10 +1412,12 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
             cache[key] = { error: shortError(err).slice(0, 200), transient: true, at: new Date().toISOString() }
             cacheModified = true
           }
-          gatewayFails++
-          if (gatewayFails >= 3) {
-            log('LLM endpoint appears offline (3 consecutive gateway errors): skipping the ELI5 queue this run')
-            break
+          if (isGatewayError(err)) {
+            gatewayFails++
+            if (gatewayFails >= 3) {
+              log('LLM endpoint appears offline (3 consecutive gateway errors): skipping the ELI5 queue this run')
+              break
+            }
           }
           continue
         }
@@ -1328,7 +1433,9 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   await Promise.all(Array.from({ length: poolSize }, () => worker()))
 
   if (cacheModified) {
-    await writeJson(cachePath, mergeAiCache(await readJson(cachePath, {}), cache))
+    const merged = mergeAiCache(await readJson(cachePath, {}), cache)
+    pruneExpiredErrors(merged, { errorCooldownMs, transientRetryMs })
+    await writeJson(cachePath, merged)
   }
   return apiCalls
 }

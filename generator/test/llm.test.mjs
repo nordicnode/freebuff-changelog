@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -26,6 +26,17 @@ test('isTransientError: 5xx gateway family, network faults transient', () => {
   assert.ok(!isTransientError(new Error('LLM HTTP 429: too many')))
   // Anchored: a payload that merely contains gateway-looking digits is not one.
   assert.ok(!isTransientError(new Error('LLM HTTP 400: {"upstream":"502 seen at proxy"}')))
+})
+
+test('isTransientError: JSON parse and malformed output errors are transient', () => {
+  assert.ok(isTransientError(new Error('Bad escaped character in JSON at position 236 (line 1 column 237)')))
+  assert.ok(isTransientError(new Error('Unexpected token \'C\', ..." "title": CLI 1.0.62"... is not valid JSON')))
+  assert.ok(isTransientError(new Error('LLM returned no JSON')))
+  assert.ok(isTransientError(new SyntaxError('Unexpected end of JSON input')))
+  // Validation schema errors are permanent (not transient)
+  assert.ok(!isTransientError(new Error('LLM title contains raw identifier')))
+  assert.ok(!isTransientError(new Error('LLM summary contains no-action boilerplate')))
+  assert.ok(!isTransientError(new Error('ELI5 rejected: output contains roll-up boilerplate')))
 })
 
 test('parseLlmJson: parses standard JSON object', () => {
@@ -54,6 +65,51 @@ test('parseLlmJson: safely parses OpenAI response envelope with trailing SSE dat
 test('parseLlmJson: throws when no JSON object is found', () => {
   assert.throws(() => parseLlmJson('no json here'), /LLM returned no JSON/)
   assert.throws(() => parseLlmJson('} inverted {'), /LLM returned no JSON/)
+})
+
+test('parseLlmJson: resiliently repairs invalid escape sequences, bad unicode, and control characters', () => {
+  // Invalid escape \x20 (the exact error from entry ac85e181)
+  const badEscape = '{"eli5": "Code \\x20 sample and regex \\d+ and path \\user\\bin"}'
+  const res1 = parseLlmJson(badEscape)
+  assert.ok(res1.eli5.includes('Code'))
+  assert.ok(res1.eli5.includes('\\x20'))
+  assert.ok(res1.eli5.includes('\\d+'))
+
+  // Unescaped literal newlines and tabs inside string literal
+  const unescapedCtrl = '{\n  "title": "Title",\n  "summary": "Line 1\nLine 2\twith tab"\n}'
+  const res2 = parseLlmJson(unescapedCtrl)
+  assert.equal(res2.title, 'Title')
+  assert.equal(res2.summary, 'Line 1\nLine 2\twith tab')
+
+  // Trailing commas in objects and arrays
+  const trailingComma = '{"title": "Valid", "items": [1, 2, ], }'
+  const res3 = parseLlmJson(trailingComma)
+  assert.equal(res3.title, 'Valid')
+  assert.deepEqual(res3.items, [1, 2])
+})
+
+test('pruneExpiredErrors: prunes errors past cooldown, preserves active and valid entries', () => {
+  const now = Date.parse('2026-09-18T16:00:00.000Z')
+  const cache = {
+    // Expired transient error (6 min old, limit is 5 min)
+    'k1': { error: '503', transient: true, at: new Date(now - 6 * 60000).toISOString() },
+    // Active transient error (2 min old, limit is 5 min)
+    'k2': { error: '503', transient: true, at: new Date(now - 2 * 60000).toISOString() },
+    // Expired permanent error (70 min old, limit is 60 min)
+    'k3': { error: 'bad output', at: new Date(now - 70 * 60000).toISOString() },
+    // Active permanent error (30 min old, limit is 60 min)
+    'k4': { error: 'bad output', at: new Date(now - 30 * 60000).toISOString() },
+    // Valid summary entry (should never be pruned)
+    'k5': { title: 'Summary', summary: 'Text', at: new Date(now - 120 * 60000).toISOString() }
+  }
+
+  const pruned = pruneExpiredErrors(cache, { now })
+  assert.equal(pruned, 2)
+  assert.equal(cache.k1, undefined, 'k1 expired transient pruned')
+  assert.ok(cache.k2, 'k2 active transient retained')
+  assert.equal(cache.k3, undefined, 'k3 expired permanent pruned')
+  assert.ok(cache.k4, 'k4 active permanent retained')
+  assert.ok(cache.k5, 'k5 valid entry retained')
 })
 
 test('extractResponseText: reassembles SSE delta chunks into message text', async () => {
