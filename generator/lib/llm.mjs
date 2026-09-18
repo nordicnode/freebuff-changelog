@@ -544,7 +544,7 @@ export function groupEntriesByDay (entries) {
   return byDay
 }
 
-export function sequenceForEntry (byDay, e, maxEach = 3) {
+export function sequenceForEntry (byDay, e, maxEach = 15) {
   const day = e?.day || (e?.date ? e.date.slice(0, 10) : '')
   if (!day || !byDay) return null
   const list = byDay.get(day)
@@ -632,7 +632,8 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       }
       continue
     }
-    const sequence = sequenceForEntry(byDayEntries, e)
+    const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 15)
+    const sequence = sequenceForEntry(byDayEntries, e, seqWindow)
     const prMeta = findPrMeta(e, prIndex)
     queue.push({ entry: e, patch, key, relText, sequence, prMeta })
     if (queue.length >= limit) break
@@ -793,9 +794,9 @@ export function buildEli5Prompt (e, notes = [], ctx = {}) {
   }
   if (sequence && (sequence.earlier?.length || sequence.later?.length)) {
     const seq = []
-    for (const s of sequence.earlier || []) seq.push(`Earlier: ${s.title}`)
+    for (const s of sequence.earlier || []) seq.push(`Earlier: ${s.title || s.summary || s.sha.slice(0, 8)}`)
     seq.push(`Current: ${e.ai?.title || e.title || ''}`)
-    for (const s of sequence.later || []) seq.push(`Later: ${s.title}`)
+    for (const s of sequence.later || []) seq.push(`Later: ${s.title || s.summary || s.sha.slice(0, 8)}`)
     evidence.push(`Same-day commit sequence: ${seq.join(' -> ')}`)
   }
   if (e.summary && e.summary !== e.ai?.summary) evidence.push(`What the analyzer measured: ${e.summary}`)
@@ -825,7 +826,7 @@ export function buildEli5Prompt (e, notes = [], ctx = {}) {
   if (e.version) evidence.push(`Shipped in version ${e.version}`)
   if (e.freebuffVersion) evidence.push(`Shipped in freebuff app version ${e.freebuffVersion}`)
   if (releaseCtx) evidence.push(releaseCtx)
-  if (siblings.length) evidence.push(`Other changes the same snapshot: ${siblings.slice(0, 6).join(' ; ')}`)
+  if (siblings.length) evidence.push(`Other changes the same snapshot: ${siblings.slice(0, 15).join(' ; ')}`)
   const noteBlock = notes.length
     ? `\nComments the developers wrote beside this code. Read them: they say who this is for and what it does today, which the constant names do not.\n${notes.map(n => `- ${n}`).join('\n')}\n`
     : ''
@@ -959,7 +960,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     const t = e.ai?.title || e.title
     if (!t) continue
     const list = byDay.get(e.day) || []
-    if (list.length < 12) { list.push(t); byDay.set(e.day, list) }
+    if (list.length < 30) { list.push(t); byDay.set(e.day, list) }
   }
   let apiCalls = 0
   let cacheModified = false
@@ -1016,7 +1017,8 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
       e.eli5 = { text: cached.text, model: cached.model, v: cached.v, src: shortHash(src), ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}), at: cached.at }
       continue
     }
-    const sequence = sequenceForEntry(byDayEntries, e)
+    const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 15)
+    const sequence = sequenceForEntry(byDayEntries, e, seqWindow)
     const prMeta = findPrMeta(e, prIndex)
     queue.push({ entry: e, src, key, relText, sequence, prMeta })
     if (queue.length >= limit) break
@@ -1036,7 +1038,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
           const patch = await eli5Patch(e, wantDiff || !e.facts?.length ? getPatch : null)
           const out = await callLlm(buildEli5Prompt(e, eli5Notes(e, patch), {
             patch: wantDiff ? patch : '',
-            siblings: (byDay.get(e.day) || []).filter(t => t !== e.ai.title).slice(0, 6),
+            siblings: (byDay.get(e.day) || []).filter(t => t !== e.ai.title).slice(0, 15),
             diffBytes,
             releaseCtx: relText,
             prMeta,

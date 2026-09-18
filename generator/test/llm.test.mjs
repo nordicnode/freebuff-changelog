@@ -1110,3 +1110,27 @@ test('groupEntriesByDay & sequenceForEntry: computes preceding and succeeding co
   assert.equal(seqFirst?.later?.length, 2)
 })
 
+test('sequenceForEntry: default window of 15 captures full day with a dozen+ updates', () => {
+  const day = '2026-09-17'
+  const entries = []
+  for (let i = 1; i <= 14; i++) {
+    entries.push({
+      sha: `sha${String(i).padStart(6, '0')}`,
+      day,
+      date: `2026-09-17T${String(7 + i).padStart(2, '0')}:00:00Z`,
+      title: `Commit #${i}`,
+      category: 'CLI'
+    })
+  }
+  const byDay = groupEntriesByDay(entries)
+  // Check commit #7 (0-indexed 6): should have 6 earlier and 7 later
+  const seq = sequenceForEntry(byDay, entries[6])
+  assert.equal(seq?.earlier?.length, 6)
+  assert.equal(seq?.later?.length, 7)
+  assert.equal(seq?.earlier[0].title, 'Commit #1')
+  assert.equal(seq?.earlier[5].title, 'Commit #6')
+  assert.equal(seq?.later[0].title, 'Commit #8')
+  assert.equal(seq?.later[6].title, 'Commit #14')
+})
+
+
