@@ -433,6 +433,12 @@ export const RELEASE_CTX_MAX_ITEMS = 100
 export const RELEASE_CTX_MAX_CHARS = 30000
 export const RELEASE_CTX_SUMMARY_CHARS = 300
 
+// Version of the roll-up ASK itself (wording of the prompt rule above), not of
+// the window: folded into contextualized eli5 keys only, so rewording the
+// instruction re-explains the ~715 bump rows without re-spending a cent on the
+// thousands of non-bump lines. Bump from 1 when the roll-up rule changes.
+export const RELEASE_ROLLUP_V = 2
+
 // Which release line a bump row belongs to. Prefers the recorded track, then
 // the touched manifest path (file lists on old rows), then the version string
 // shape (1.x = codebuff-cli, 0.x = freebuff-cli). Null when nothing says.
@@ -549,11 +555,13 @@ export const ELI5_V = 4
 // entry's eli5.src, so a re-summarized entry drops a stale plain-English line.
 export { eli5Source }
 
-export function eli5Key (sha, source, releaseCtx = '') {
+export function eli5Key (sha, source, releaseCtx = '', rollupV = 0) {
   // Bump rows explain their release window, not just their own diff, so the
   // window hash joins the key: predecessors gaining summaries refreshes the
   // roll-up, while non-bump rows keep byte-identical keys (no cache churn).
-  const extra = releaseCtx ? `:${shortHash(releaseCtx)}` : ''
+  // rollupV rides on the window segment so a reworded roll-up ask re-explains
+  // bump rows only -- and a key with no window can never grow one.
+  const extra = releaseCtx ? `:${shortHash(releaseCtx)}${rollupV ? `-r${rollupV}` : ''}` : ''
   return `${sha}:eli5:v${ELI5_V}:${shortHash(source)}${extra}`
 }
 
@@ -635,7 +643,7 @@ Rules:
 - Keep the audience the text gives, and keep it narrow. If the change is for one kind of customer, one plan, one region, or only after some step, name that group. Never widen it to "users", "everyone" or "customers" because that reads more naturally: a program for verified YC companies is not available to users.
 - Plain words, active voice. No "This change", "We are excited", marketing tone, or generic tautologies ("various bug fixes and improvements").
 - Jump straight into what happened. NEVER use conversational preambles, filler intros, or framing phrases like "In simple terms", "Basically", "To put it simply", "In plain English", "This commit", "This update", or "This pull request". Start directly with the concrete action or subject.
-- This row may be a version-label commit whose own diff is packaging: when the evidence lists "Updates included in this release", summarize what updating to this version gives the reader from THAT list (strongest user-visible items first), not from the one-line version diff. When the list has no user-visible change, say so honestly as behind-the-scenes housekeeping.
+- This row may be a version-label commit whose own diff is only packaging. When the evidence lists "Updates included in this release", THAT list is what this row is about: the "Technical summary" above describes only the label change itself and must not drive the line. Summarize what updating to this version gives the reader, drawn from that list, strongest user-visible item first. Only when the list is absent or holds no user-visible change, say honestly that this is a routine behind-the-scenes update that keeps installs current.
 - If the change is an internal refactor, test suite update, dependency bump, or maintenance change with no direct user-facing behavior, explain it honestly and plainly as behind-the-scenes housekeeping or stability maintenance. Do NOT invent or fabricate user-facing features, performance claims, or speed improvements.
 - If the change is small or internal, say so shortly. Do not inflate it.
 - Never address the reader as a developer.
@@ -753,7 +761,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     const src = eli5Source(e)
     const hit = bumpOnly(e) ? releaseOf(e) : null
     const relText = hit?.text || ''
-    const key = eli5Key(e.sha, src, relText)
+    const key = eli5Key(e.sha, src, relText, relText ? RELEASE_ROLLUP_V : 0)
     const cached = cache[key]
     if (cached?.error) {
       if (!options.retryErrors) continue

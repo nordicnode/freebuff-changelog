@@ -622,6 +622,19 @@ test('release context: empty window yields no prompt section and stable keys', a
   assert.doesNotMatch(p, /Updates included in this release \([\d.]+/)
   assert.match(p, /Shipped in version 1\.0\.690/)
   assert.equal(eli5Key(bump.sha, 's'), `${bump.sha}:eli5:v${ELI5_V}:${shortHash('s')}`, 'non-context keys unchanged')
+  assert.equal(eli5Key(bump.sha, 's', ''), `${bump.sha}:eli5:v${ELI5_V}:${shortHash('s')}`, 'empty window never grows a version segment')
+  const p2 = buildEli5Prompt(bump, [], { releaseCtx: 'Updates included in this release (1.0.690 since 1.0.689):\n- one shipped thing' })
+  assert.match(p2, /Technical summary.*must not drive the line/s, 'roll-up rule subordinates the label-commit summary to the window')
+  assert.equal(
+    eli5Key(bump.sha, 's', 'window text', 2),
+    `${bump.sha}:eli5:v${ELI5_V}:${shortHash('s')}:${shortHash('window text')}-r2`,
+    'contextualized key carries the roll-up ask version'
+  )
+  assert.equal(
+    eli5Key(bump.sha, 's', 'window text', 3),
+    `${bump.sha}:eli5:v${ELI5_V}:${shortHash('s')}:${shortHash('window text')}-r3`,
+    'bumping RELEASE_ROLLUP_V changes only contextualized keys'
+  )
   const done = { ...bump, eli5: { text: 'Housekeeping.', v: ELI5_V, src: shortHash(eli5Source(bump)) } }
   assert.equal(eli5Done(done), true, 'single-arg callers keep old semantics')
 })
