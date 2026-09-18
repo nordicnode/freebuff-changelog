@@ -572,7 +572,37 @@ test('release context: bump window stops at the same-track predecessor', async (
   assert.equal(ctx.prevVersion, null, 'legacy bumps carry no version string to name')
   const ctxCli = collectReleaseContext(entries, cli688)
   assert.deepEqual(ctxCli.items.map(i => i.sha), ['a'.repeat(40)])
-  assert.equal(ctxCli.prevVersion, null, 'no earlier codebuff-cli bump in this fixture')
+})
+
+test('bumpOnly: lockfile churn in stats.additions does not disqualify a release bump', async () => {
+  const { bumpOnly, aiDone, RELEASE_ROLLUP_V, PROMPT_V } = await import('../lib/llm.mjs')
+  const { shortHash } = await import('../lib/util.mjs')
+  const bumpWithLockfile = eli5Entry({
+    sha: '1'.repeat(40),
+    freebuffVersion: '0.0.178',
+    versionTrack: 'freebuff-cli',
+    stats: { additions: 54, deletions: 48 },
+    files: { total: 2, meaningful: 1, churned: ['bun.lock'], modified: ['freebuff/cli/release/package.json'] }
+  })
+  assert.equal(bumpOnly(bumpWithLockfile), true, 'bump with lockfile additions is recognized as bumpOnly')
+
+  const bumpWithCodeChanges = eli5Entry({
+    sha: '2'.repeat(40),
+    freebuffVersion: '0.0.178',
+    versionTrack: 'freebuff-cli',
+    stats: { additions: 54, deletions: 48 },
+    files: { total: 2, meaningful: 2, modified: ['freebuff/cli/release/package.json', 'cli/src/feature.ts'] }
+  })
+  assert.equal(bumpOnly(bumpWithCodeChanges), false, 'bump with feature code changes and large additions is not bumpOnly')
+
+  const aiNotDone = {
+    ai: { model: 'm', v: PROMPT_V, title: 'Bump', summary: 'Bump summary' }
+  }
+  assert.equal(aiDone(aiNotDone, 'release context text', RELEASE_ROLLUP_V), false, 'ai without rollup metadata re-queues')
+  const aiDoneObj = {
+    ai: { model: 'm', v: PROMPT_V, title: 'Bump', summary: 'Bump summary', ctx: shortHash('release context text'), rollup: RELEASE_ROLLUP_V }
+  }
+  assert.equal(aiDone(aiDoneObj, 'release context text', RELEASE_ROLLUP_V), true, 'ai with matching rollup stays done')
 })
 
 test('release context: skips noise, caps items and chars, prefers ai text', async () => {

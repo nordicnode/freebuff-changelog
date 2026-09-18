@@ -13,7 +13,7 @@ import { capturePendingWrites, persistMerged, mergeOpenPrs } from './lib/mergeda
 import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf } from './lib/analyze.mjs'
-import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, llmConfigured, PROMPT_V } from './lib/llm.mjs'
+import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone } from './lib/llm.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
 
@@ -906,7 +906,7 @@ async function catchUpOnce (argv) {
       getPatch: llmPatchFor,
       repoDir: REPO_DIR
     })
-    const eli5Remaining = entries.filter(e => eli5Eligible(e) && !eli5Done(e)).length
+    const eli5Remaining = countPendingEli5(entries)
     if (eli5Written || eli5Remaining) {
       log(`[backfill] ELI5 wrote ${eli5Written} entries (${eli5Remaining} remaining)`)
     }
@@ -1137,7 +1137,7 @@ async function enrichAllPass (argv) {
   const left = {
     diffs: entries.filter(e => !existsSync(resolve(diffDir, `${e.sha}.diff`))).length,
     summaries: entries.filter(e => !e.noise && !isCurrent(e)).length,
-    eli5: entries.filter(e => eli5Eligible(e) && !eli5Done(e)).length
+    eli5: countPendingEli5(entries)
   }
 
   // 3. Publish, so a run of thousands of passes never loses work to a kill.

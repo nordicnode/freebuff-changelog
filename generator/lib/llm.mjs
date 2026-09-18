@@ -196,7 +196,7 @@ export function buildPrompt (entry, patch, ctx = {}) {
     if (rows.length) lines.push(`Model rows (access + traits, use for DETAIL): ${rows.join(' | ')}`)
   }
   if (entry.cmdChanges) lines.push(`Slash commands: +${(entry.cmdChanges.added || []).join(', ')} -${(entry.cmdChanges.removed || []).join(', ')}`)
-  if (entry.version) lines.push(`Version bump: ${entry.version}`)
+  if (entry.version || entry.freebuffVersion) lines.push(`Version bump: ${entry.version || entry.freebuffVersion}`)
   if (ctx.releaseCtx) {
     lines.push('', ctx.releaseCtx, '')
     lines.push('Release instructions: This row is a version bump. Use the release updates above to summarize what user-visible features, model changes, and CLI improvements shipped in this release, rather than describing the version number change itself.')
@@ -416,8 +416,14 @@ export function trackOfBump (e) {
   return null
 }
 
-export const bumpOnly = (e) => isBumpEntry(e) && !e.modelChanges && !e.cmdChanges &&
-  (e.stats?.additions ?? 99) <= 10 && (e.files?.meaningful ?? 99) <= 2
+export function bumpOnly (e) {
+  if (!isBumpEntry(e) || e.modelChanges || e.cmdChanges) return false
+  const meaningful = e.files?.meaningful ?? 99
+  if (meaningful > 2) return false
+  const mods = [...(e.files?.added || []), ...(e.files?.modified || [])]
+  if (mods.length > 0 && mods.every(p => p in VERSION_TRACKS)) return true
+  return (e.stats?.additions ?? 99) <= 15
+}
 
 function releaseItemText (e, maxSummary = RELEASE_CTX_SUMMARY_CHARS) {
   const title = e?.ai?.title || e?.title || ''
@@ -626,7 +632,13 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   const ctxCache = new Map()
   const releaseOf = (e) => getReleaseContextFor(entries, e, posIndex, ctxCache)
 
-  const prio = (e) => (priority.has(e.sha) ? -1 : e.modelChanges ? 0 : e.version ? 1 : e.cmdChanges ? 2 : e.noise ? 4 : 3)
+  const prio = (e) => (priority.has(e.sha) ? -1
+    : e.modelChanges ? 0
+    : releaseOf(e) ? 1
+    : (e.version || e.freebuffVersion) ? 1
+    : e.cmdChanges ? 2
+    : e.noise ? 4
+    : 3)
   const churnQueue = env.CHANGELOG_LLM_CHURN === '1'
   const queueable = entries.filter(e => !e.noise || churnQueue)
   queueable.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
@@ -669,6 +681,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         summary: cache[key].summary,
         significance: cache[key].significance,
         ...(cache[key].evidence ? { evidence: cache[key].evidence } : {}),
+        ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}),
         at: cache[key].at
       }
       continue
@@ -701,6 +714,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           summary: clean.summary,
           significance: clean.significance,
           ...(clean.evidence ? { evidence: clean.evidence } : {}),
+          ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}),
           at: new Date().toISOString()
         }
         e.ai = { ...cache[key] }
@@ -789,6 +803,16 @@ export function eli5Key (sha, source, releaseCtx = '', rollupV = 0) {
 // never went through the model.
 export function eli5Eligible (e) {
   return !e.noise && !!e.ai?.title && !!e.ai?.summary && (e.ai?.v ?? 1) >= PROMPT_V
+}
+
+export function aiDone (e, releaseCtx = '', rollupV = 0) {
+  if (!e?.ai?.title || !e?.ai?.summary || !e.ai.model) return false
+  if ((e.ai.v ?? 1) < PROMPT_V) return false
+  if (!releaseCtx) return true
+  if (!e.ai.ctx) return false
+  if (e.ai.ctx !== shortHash(releaseCtx)) return false
+  if (rollupV && e.ai.rollup !== rollupV) return false
+  return true
 }
 
 export function eli5Done (e, releaseCtx = '', rollupV = 0) {
@@ -971,6 +995,18 @@ export function normalizeEli5 (raw, maxChars = ELI5_MAX_CHARS) {
   return cutToSentence(s, maxChars)
 }
 
+export function countPendingEli5 (entries) {
+  if (!Array.isArray(entries)) return 0
+  const posIndex = new Map(entries.map((x, i) => [x.sha, i]))
+  const ctxCache = new Map()
+  const releaseOf = (e) => getReleaseContextFor(entries, e, posIndex, ctxCache)
+  return entries.filter(e => {
+    if (!eli5Eligible(e)) return false
+    const hit = bumpOnly(e) ? releaseOf(e) : null
+    return !eli5Done(e, hit?.text || '', hit ? RELEASE_ROLLUP_V : 0)
+  }).length
+}
+
 export async function enrichEli5 (entries, dataDir, env = process.env, options = {}) {
   if (!llmConfigured(env) || env.CHANGELOG_ELI5 === '0') return 0
   const cachePath = `${dataDir}/ai-summaries.json`
@@ -1009,10 +1045,6 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   // new command has a reader-facing story; a comment beside the code names its
   // audience; a bare version bump has neither, and the honest line about it is "a
   // number went up" -- so 650 of those must not drink the budget first.
-  // A bare version label (either track) with no catalog/command payload and a
-  // tiny diff: its own patch says "a number went up" and nothing else.
-  const bumpOnly = (e) => isBumpEntry(e) && !e.modelChanges && !e.cmdChanges &&
-    (e.stats?.additions ?? 99) <= 10 && (e.files?.meaningful ?? 99) <= 2
   // Positions for the release-window walk (entries are oldest-first). Built
   // once per run so per-bump context stays O(window), not O(history).
   const posIndex = new Map(entries.map((x, i) => [x.sha, i]))

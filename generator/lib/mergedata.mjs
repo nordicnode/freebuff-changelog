@@ -35,6 +35,9 @@ function pickEli5 (ours, theirs, entry) {
     if (ours.src === want && theirs.src !== want) return ours
     if (theirs.src === want && ours.src !== want) return theirs
   }
+  const or = ours.rollup ?? 0
+  const tr = theirs.rollup ?? 0
+  if (or !== tr) return or > tr ? ours : theirs
   const ov = ours.v ?? 1
   const tv = theirs.v ?? 1
   if (ov !== tv) return ov > tv ? ours : theirs
@@ -71,7 +74,7 @@ export function mergeChangelog (ours, theirs) {
     // Only reach into the base entry when we have a strictly better summary.
     const mine = usableAi(e)
     const theirsAi = usableAi(cur)
-    if (mine && (!theirsAi || (theirsAi.v ?? 1) < (mine.v ?? 1))) {
+    if (mine && (!theirsAi || (theirsAi.v ?? 1) < (mine.v ?? 1) || (!theirsAi.rollup && mine.rollup))) {
       cur.ai = mine
       grafted++
     }
