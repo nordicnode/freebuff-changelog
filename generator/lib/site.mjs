@@ -2448,12 +2448,17 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
 
   // ----- open PRs page (community activity ahead of merges, with diff previews)
   if (openPrs?.length) {
-    const allTags = [...new Set(openPrs.flatMap(p => (p.labels || []).map(l => typeof l === 'string' ? l : l.name)))].sort()
+    const allTags = [...new Set(openPrs.flatMap(p => (p.labels || []).map(l => typeof l === 'string' ? l : l.name)))]
+      .filter(t => !/^bot:/i.test(t))
+      .sort()
     const tagFiltersHtml = allTags.length > 0
       ? `<div class="pr-tag-filters" style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
         <span style="font-size:.75rem;color:var(--txt-subtle);align-self:center;margin-right:4px">FILTER TAG:</span>
         <button type="button" class="pr-tag-btn active" data-tag="all">[All (${openPrs.length})]</button>
-        ${allTags.slice(0, 15).map(t => `<button type="button" class="pr-tag-btn" data-tag="${esc(t.toLowerCase())}">[${esc(t)}]</button>`).join('')}
+        ${allTags.slice(0, 15).map(t => {
+          const clean = t.replace(/^pr:/i, '')
+          return `<button type="button" class="pr-tag-btn" data-tag="${esc(t.toLowerCase())}">[${esc(clean)}]</button>`
+        }).join('')}
       </div>`
       : ''
 
@@ -2490,11 +2495,29 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         ? `<span>&middot;</span><span class="pr-activity">${actParts.join(' &middot; ')}</span>`
         : ''
 
-      const labels = p.labels || []
-      const labelTags = labels.map(l => {
+      const labels = (p.labels || []).filter(l => {
         const name = typeof l === 'string' ? l : l.name
-        const color = (typeof l === 'object' && l.color) ? l.color : '6e7681'
-        return `<span class="pr-tag" data-tag="${esc(name.toLowerCase())}" style="border-color:#${esc(color)}">[${esc(name)}]</span>`
+        return !/^bot:/i.test(name)
+      })
+      const labelTags = labels.map(l => {
+        const rawName = typeof l === 'string' ? l : l.name
+        const color = (typeof l === 'object' && l.color) ? String(l.color).replace(/^#/, '') : '6e7681'
+        const fullHex = color.length === 3 ? color.split('').map(c => c + c).join('') : (color.length === 6 ? color : '6e7681')
+        const r = parseInt(fullHex.slice(0, 2), 16) || 110
+        const g = parseInt(fullHex.slice(2, 4), 16) || 118
+        const b = parseInt(fullHex.slice(4, 6), 16) || 129
+        const luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        let textColor = `#${fullHex}`
+        if (luminance < 110) {
+          const br = Math.min(255, Math.round(r * 1.5 + 70))
+          const bg = Math.min(255, Math.round(g * 1.5 + 70))
+          const bb = Math.min(255, Math.round(b * 1.5 + 70))
+          textColor = `rgb(${br},${bg},${bb})`
+        }
+        const bg = `rgba(${r},${g},${b},0.12)`
+        const border = `rgba(${r},${g},${b},0.35)`
+        const displayName = rawName.replace(/^pr:/i, '')
+        return `<span class="pr-tag" data-tag="${esc(rawName.toLowerCase())}" style="background:${bg};border-color:${border};color:${textColor}"><span class="pr-tag-dot" style="background:${textColor}"></span>${esc(displayName)}</span>`
       }).join(' ')
       const tagsHtml = labels.length ? `<div class="pr-labels">${labelTags}</div>` : ''
 
@@ -2558,7 +2581,10 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
 </details>`
           : '')
 
-      const tagDataStr = labels.map(l => (typeof l === 'string' ? l : l.name).toLowerCase()).join(',')
+      const tagDataStr = labels.flatMap(l => {
+        const n = (typeof l === 'string' ? l : l.name).toLowerCase()
+        return [n, n.replace(/^pr:/i, '')]
+      }).join(',')
 
       return `<article class="pr-card" data-tags="${esc(tagDataStr)}">
   <div class="pr-card-header">
