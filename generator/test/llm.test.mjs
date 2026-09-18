@@ -1212,5 +1212,80 @@ test('buildPrompt & buildEli5Prompt: formats fileHeaders and PR body into contex
   assert.ok(eli5Prompt.includes('PR details: Advertisers requested a higher starting budget ceiling'))
 })
 
+test('buildPrompt & buildEli5Prompt: formats fileHistory, fullFiles, exportOutlines, and subsystemDocs into context', () => {
+  const entry = {
+    sha: '82c3938d6f2e66287c5b14fee9c365f8ccba1d0e',
+    date: '2026-09-18T00:00:00Z',
+    category: 'Common',
+    summary: 'Add sponsored placement ranking algorithm',
+    files: { modified: ['common/src/ads/ranking.ts', 'common/src/ads/types.ts'] }
+  }
+  const patch = '+export function rankAds() { return []; }'
+  const fileHistory = [
+    {
+      sha: '11111111',
+      date: '2026-09-17',
+      overlap: ['common/src/ads/ranking.ts'],
+      title: 'Initial ad ranking stub',
+      summary: 'Added baseline ranking interface'
+    }
+  ]
+  const fullFiles = [
+    {
+      path: 'common/src/ads/types.ts',
+      lines: 45,
+      content: 'export interface AdPlacement {\n  id: string;\n  score: number;\n}'
+    }
+  ]
+  const exportOutlines = [
+    {
+      path: 'common/src/ads/ranking.ts',
+      totalLines: 320,
+      outline: 'export function rankAds(candidates: AdPlacement[]): AdPlacement[];'
+    }
+  ]
+  const subsystemDocs = [
+    {
+      path: 'common/src/ads/README.md',
+      content: '# Ads Subsystem\nManages sponsored ad placements and budgets.'
+    }
+  ]
+
+  // Verify buildPrompt
+  const prompt = buildPrompt(entry, patch, {
+    fileHistory,
+    fullFiles,
+    exportOutlines,
+    subsystemDocs
+  })
+
+  assert.ok(prompt.includes('Recent commit lineage for touched files (last up to 10 changes to these files):'))
+  assert.ok(prompt.includes('[11111111] (2026-09-17) touched common/src/ads/ranking.ts: Initial ad ranking stub'))
+  assert.ok(prompt.includes('Added baseline ranking interface'))
+
+  assert.ok(prompt.includes('Complete Source of Modified Files (for complete module context):'))
+  assert.ok(prompt.includes('File `common/src/ads/types.ts` (45 lines):'))
+  assert.ok(prompt.includes('export interface AdPlacement'))
+
+  assert.ok(prompt.includes('Exported Interface & Symbol Outline (public contract for larger touched files):'))
+  assert.ok(prompt.includes('File `common/src/ads/ranking.ts` (320 lines):'))
+  assert.ok(prompt.includes('export function rankAds(candidates: AdPlacement[]): AdPlacement[];'))
+
+  assert.ok(prompt.includes('Subsystem Architecture Documentation (from nearby package guides):'))
+  assert.ok(prompt.includes('From `common/src/ads/README.md`:'))
+  assert.ok(prompt.includes('# Ads Subsystem'))
+
+  // Verify buildEli5Prompt
+  const eli5Prompt = buildEli5Prompt(entry, [], {
+    fileHistory,
+    subsystemDocs,
+    patch
+  })
+
+  assert.ok(eli5Prompt.includes('Recent changes to these files: 2026-09-17 [11111111]: Initial ad ranking stub'))
+  assert.ok(eli5Prompt.includes('Subsystem guide: common/src/ads/README.md: # Ads Subsystem'))
+})
+
+
 
 

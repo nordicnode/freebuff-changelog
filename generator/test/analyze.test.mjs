@@ -8,7 +8,8 @@ import {
   areaOf, isNoiseFile, deterministicSummary, entryTitle, churnLabel, testLabel, sourceRef, isSyncCommit,
   extractCommentFacts, extractCleanDiff, extractRawDiff, extractFileHeaders, EMPTY_TREE, parseMarkdownTables, catalogFromReadme,
   diffCatalogs, commitNatureOf, analyzeCommunityCommit, analyzeSyncCommit,
-  MONOREPO_COMPONENTS, formatArchitectureMap, discoverMonorepoArchitecture
+  MONOREPO_COMPONENTS, formatArchitectureMap, discoverMonorepoArchitecture,
+  findFileHistory, extractFullOrOutlinedFiles, extractSubsystemDocs
 } from '../lib/analyze.mjs'
 import { toUtc, ymd } from '../lib/util.mjs'
 
@@ -556,4 +557,120 @@ Freebuff is an open-source coding agent designed for terminal and desktop enviro
   // Verify test file was filtered out
   assert.equal(headers.find(h => h.path.includes('test.ts')), undefined)
 })
+
+test('findFileHistory: retrieves up to 10 commits that touched overlapping files across history', () => {
+  const entries = []
+  for (let i = 1; i <= 15; i++) {
+    entries.push({
+      sha: `sha${i.toString().padStart(37, '0')}`,
+      date: `2026-09-${i.toString().padStart(2, '0')}T10:00:00Z`,
+      day: `2026-09-${i.toString().padStart(2, '0')}`,
+      title: `Commit #${i}`,
+      summary: `Summary of #${i}`,
+      noise: i === 5, // noise entry should be skipped
+      files: {
+        modified: i % 2 === 0 ? ['common/src/ads/campaigns.ts'] : ['cli/src/main.ts'],
+        added: []
+      }
+    })
+  }
+
+  // Target entry is #15 which modifies cli/src/main.ts
+  const target = entries[14]
+  const history = findFileHistory(entries, target, 10)
+
+  // There are 7 previous odd-numbered commits: 13, 11, 9, 7, 5 (noise: skipped), 3, 1 => 6 commits
+  assert.equal(history.length, 6)
+  assert.equal(history[0].sha, 'sha0000000000000000000000000000000000013'.slice(0, 8))
+  assert.deepEqual(history[0].overlap, ['cli/src/main.ts'])
+  assert.equal(history[0].title, 'Commit #13')
+
+  // Target entry modifying campaigns.ts
+  const targetCampaigns = {
+    sha: 'newshatarget000000000000000000000000000',
+    date: '2026-09-20T10:00:00Z',
+    files: { modified: ['common/src/ads/campaigns.ts'] }
+  }
+  const campaignsHistory = findFileHistory(entries, targetCampaigns, 10)
+  // Even-numbered commits: 14, 12, 10, 8, 6, 4, 2 => 7 commits
+  assert.equal(campaignsHistory.length, 7)
+  assert.equal(campaignsHistory[0].title, 'Commit #14')
+  assert.equal(campaignsHistory[6].title, 'Commit #2')
+})
+
+test('extractFullOrOutlinedFiles: splits files by line count into full source vs outlines', async (t) => {
+  const { mkdtemp, rm, mkdir, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { execFileSync } = await import('node:child_process')
+
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-full-outline-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+
+  const g = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' })
+  g('init', '-q')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+
+  // 1. Small file (30 lines)
+  await mkdir(join(dir, 'common', 'src'), { recursive: true })
+  const smallLines = Array.from({ length: 30 }, (_, i) => `// line ${i + 1}`).join('\n')
+  await writeFile(join(dir, 'common', 'src', 'small.ts'), smallLines)
+
+  // 2. Large file (260 lines) with exports
+  const largeLines = [
+    'export const DEFAULT_BUDGET = 500;',
+    'export function computeScore(x: number): number { return x * 2; }',
+    'export type Mode = "strict" | "loose";',
+    ...Array.from({ length: 257 }, (_, i) => `const internalVar${i} = ${i};`)
+  ].join('\n')
+  await writeFile(join(dir, 'common', 'src', 'large.ts'), largeLines)
+
+  g('add', '.')
+  g('commit', '-q', '-m', 'feat: add small and large files')
+
+  const res = await extractFullOrOutlinedFiles(dir, 'HEAD', ['common/src/small.ts', 'common/src/large.ts'])
+
+  assert.equal(res.fullFiles.length, 1)
+  assert.equal(res.fullFiles[0].path, 'common/src/small.ts')
+  assert.equal(res.fullFiles[0].lines, 30)
+  assert.equal(res.fullFiles[0].content, smallLines)
+
+  assert.equal(res.exportOutlines.length, 1)
+  assert.equal(res.exportOutlines[0].path, 'common/src/large.ts')
+  assert.equal(res.exportOutlines[0].totalLines, 260)
+  assert.ok(res.exportOutlines[0].outline.includes('export const DEFAULT_BUDGET'))
+  assert.ok(res.exportOutlines[0].outline.includes('export function computeScore'))
+  assert.ok(res.exportOutlines[0].outline.includes('export type Mode'))
+  assert.ok(!res.exportOutlines[0].outline.includes('internalVar0'))
+})
+
+test('extractSubsystemDocs: locates nearest parent README.md guide', async (t) => {
+  const { mkdtemp, rm, mkdir, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { execFileSync } = await import('node:child_process')
+
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-subsystem-docs-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+
+  const g = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' })
+  g('init', '-q')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+
+  await mkdir(join(dir, 'packages', 'auth', 'src', 'tokens'), { recursive: true })
+  await writeFile(join(dir, 'packages', 'auth', 'README.md'), '# Auth Subsystem\nProvides JWT issuance and OAuth integration.\n')
+  await writeFile(join(dir, 'packages', 'auth', 'src', 'tokens', 'jwt.ts'), 'export const TOKEN_TTL = 3600;\n')
+
+  g('add', '.')
+  g('commit', '-q', '-m', 'feat: add auth package')
+
+  const docs = await extractSubsystemDocs(dir, 'HEAD', ['packages/auth/src/tokens/jwt.ts'])
+  assert.equal(docs.length, 1)
+  assert.equal(docs[0].path, 'packages/auth/README.md')
+  assert.ok(docs[0].content.includes('# Auth Subsystem'))
+  assert.ok(docs[0].content.includes('Provides JWT issuance'))
+})
+
 

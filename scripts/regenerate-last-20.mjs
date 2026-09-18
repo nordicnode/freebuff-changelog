@@ -8,6 +8,9 @@ import { git, readJson, writeJson, writeText, log, pool, shortHash, eli5Source }
 import {
   extractCleanDiff,
   extractFileHeaders,
+  findFileHistory,
+  extractFullOrOutlinedFiles,
+  extractSubsystemDocs,
   discoverMonorepoArchitecture,
   formatArchitectureMap,
   EMPTY_TREE
@@ -101,12 +104,15 @@ async function main () {
 
         const files = [...(e.files?.modified || []), ...(e.files?.added || [])]
         const fileHeaders = await extractFileHeaders(REPO_DIR, e.sha, files)
+        const fileHistory = findFileHistory(doc.entries, e, 10)
+        const subsystemDocs = await extractSubsystemDocs(REPO_DIR, e.sha, files)
+        const { fullFiles, exportOutlines } = await extractFullOrOutlinedFiles(REPO_DIR, e.sha, files)
         const sequence = sequenceForEntry(byDayEntries, e, 25)
         const prMeta = findPrMeta(e, prIndex)
         const hit = bumpOnly(e) ? releaseOf(e) : null
         const relText = hit?.text || ''
 
-        log(`[${num}/${targets.length}] ${short}: ${fileHeaders.length} headers, diff ${patch.length} bytes, PR #${prMeta?.number || 'none'}`)
+        log(`[${num}/${targets.length}] ${short}: ${fileHeaders.length} headers, ${fileHistory.length} history, ${fullFiles.length} full files, ${exportOutlines.length} outlines, ${subsystemDocs.length} docs, diff ${patch.length} bytes, PR #${prMeta?.number || 'none'}`)
 
         // 1. Technical summary pass
         const summaryPrompt = buildPrompt(e, patch, {
@@ -114,7 +120,11 @@ async function main () {
           sequence,
           prMeta,
           architectureMap: archMap,
-          fileHeaders
+          fileHeaders,
+          fileHistory,
+          subsystemDocs,
+          fullFiles,
+          exportOutlines
         })
         log(`[${num}/${targets.length}] Calling LLM for summary: ${short}...`)
         const rawSummary = await callLlm(summaryPrompt, env)
@@ -144,7 +154,9 @@ async function main () {
           prMeta,
           sequence,
           architectureMap: archMap,
-          fileHeaders
+          fileHeaders,
+          fileHistory,
+          subsystemDocs
         })
         log(`[${num}/${targets.length}] Calling LLM for ELI5: ${short}...`)
         const rawEli5 = await callLlm(

@@ -28,6 +28,9 @@ import { mergeAiCache } from './mergedata.mjs'
 import {
   extractCommentFacts,
   extractFileHeaders,
+  findFileHistory,
+  extractFullOrOutlinedFiles,
+  extractSubsystemDocs,
   isBumpEntry,
   versionTrackOf,
   VERSION_TRACKS,
@@ -89,7 +92,7 @@ export function truncateWords (s, n) {
 // Clean sentence-preserving text truncation: never truncates valid text under maxLen,
 // preserves sentence boundaries when text is longer, and never leaves dangling connectors.
 export function cleanText (s, maxLen = 2000, isSentence = false) {
-  s = String(s || '').trim()
+  s = String(s || '').replace(/[\u2014\u2013—–]|&mdash;|&ndash;/g, ' - ').replace(/[ ]{2,}/g, ' ').trim()
   if (!s) return ''
   if (s.length <= maxLen) {
     if (isSentence && DANGLING_CONNECTOR_RE.test(s.replace(/[.,;:!?]+$/, ''))) {
@@ -152,9 +155,10 @@ export function buildPrompt (entry, patch, ctx = {}) {
     'Title: plain text, max 70 chars, no backticks, no markdown, no trailing period. Lead with the concrete change (model name, command with leading slash, version, subsystem). Translate code identifiers into plain words (split snake_case/camelCase/CONSTANT_CASE, drop glued version suffixes); never emit a raw glued identifier as a title word.',
     'Summary guidelines (2-4 sentences of fluid technical prose, backticks allowed for identifiers):',
     '- State WHAT changed and the mechanism precisely: names, versions, commands, flags, files. Lead with the functional change, then the technical mechanism.',
-    '- State WHY it happened if grounded in notes/diff/PR context (root cause, upstream failure, deprecation). If reason is not visible, describe the mechanism — never invent motives.',
+    '- State WHY it happened if grounded in notes/diff/PR context (root cause, upstream failure, deprecation). If reason is not visible, describe the mechanism - never invent motives.',
     '- Ground the change in the Freebuff Monorepo Architecture below. Name the affected package or surface naturally without repetitive template phrases like "Scope limited to...".',
     '- DETAIL: include one concrete technical fact (migration behavior, trait change, alias, flag, or constraint). Never paste raw diff lines. Never write "Nothing to do" or no-action boilerplate.',
+    '- Punctuation: Never use em-dashes; use commas, parentheses, or hyphens instead.',
     '',
     ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP,
     '',
@@ -235,6 +239,40 @@ export function buildPrompt (entry, patch, ctx = {}) {
       lines.push(`- File \`${h.path}\`:`)
       lines.push('```')
       lines.push(h.header)
+      lines.push('```')
+    }
+  }
+  if (ctx.subsystemDocs && ctx.subsystemDocs.length) {
+    lines.push('Subsystem Architecture Documentation (from nearby package guides):')
+    for (const d of ctx.subsystemDocs) {
+      lines.push(`- From \`${d.path}\`:`)
+      lines.push('```markdown')
+      lines.push(d.content)
+      lines.push('```')
+    }
+  }
+  if (ctx.fileHistory && ctx.fileHistory.length) {
+    lines.push('Recent commit lineage for touched files (last up to 10 changes to these files):')
+    for (const h of ctx.fileHistory) {
+      lines.push(`- [${h.sha}] (${h.date}) touched ${h.overlap.join(', ')}: ${h.title}`)
+      if (h.summary) lines.push(`  Context: ${truncateWords(h.summary, 250)}`)
+    }
+  }
+  if (ctx.exportOutlines && ctx.exportOutlines.length) {
+    lines.push('Exported Interface & Symbol Outline (public contract for larger touched files):')
+    for (const o of ctx.exportOutlines) {
+      lines.push(`- File \`${o.path}\` (${o.totalLines} lines):`)
+      lines.push('```')
+      lines.push(o.outline)
+      lines.push('```')
+    }
+  }
+  if (ctx.fullFiles && ctx.fullFiles.length) {
+    lines.push('Complete Source of Modified Files (for complete module context):')
+    for (const f of ctx.fullFiles) {
+      lines.push(`- File \`${f.path}\` (${f.lines} lines):`)
+      lines.push('```')
+      lines.push(f.content)
       lines.push('```')
     }
   }
@@ -380,7 +418,7 @@ export function validateLlmOut (out, fallbackSig = 'minor') {
   if (rawWords.some(w => w.length >= 18 || CAMEL_IDENT_RE.test(w) || SNAKE_IDENT_RE.test(w))) {
     throw new Error('LLM title contains raw identifier')
   }
-  let title = truncateWords(rawTitle.replace(/[`*#_[\]]/g, ' ').replace(/\s+/g, ' '), 140)
+  let title = truncateWords(rawTitle.replace(/[\u2014\u2013—–]|&mdash;|&ndash;/g, ' - ').replace(/[`*#_[\]]/g, ' ').replace(/\s+/g, ' '), 140)
   title = title.replace(/[.!?:;]+$/, '').trim()
   if (title) title = title.charAt(0).toUpperCase() + title.slice(1)
   const rawSummary = String(out.summary || '').trim()
@@ -734,12 +772,37 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       const idx = activeIndex++
       const { entry: e, patch, key, relText = '', sequence = null, prMeta = null } = queue[idx]
       try {
+        const files = [...(e.files?.modified || []), ...(e.files?.added || [])]
         let fileHeaders = queue[idx].fileHeaders
-        if (!fileHeaders && options.repoDir) {
-          const files = [...(e.files?.modified || []), ...(e.files?.added || [])]
+        if (!fileHeaders && options.repoDir && files.length) {
           fileHeaders = await extractFileHeaders(options.repoDir, e.sha, files)
         }
-        const out = await callLlm(buildPrompt(e, patch, { releaseCtx: relText, sequence, prMeta, architectureMap: archMap, fileHeaders }), env)
+        let fileHistory = queue[idx].fileHistory
+        if (!fileHistory && entries) {
+          fileHistory = findFileHistory(entries, e, 10)
+        }
+        let subsystemDocs = queue[idx].subsystemDocs
+        if (!subsystemDocs && options.repoDir && files.length) {
+          subsystemDocs = await extractSubsystemDocs(options.repoDir, e.sha, files)
+        }
+        let fullFiles = queue[idx].fullFiles
+        let exportOutlines = queue[idx].exportOutlines
+        if ((!fullFiles || !exportOutlines) && options.repoDir && files.length) {
+          const res = await extractFullOrOutlinedFiles(options.repoDir, e.sha, files)
+          if (!fullFiles) fullFiles = res.fullFiles
+          if (!exportOutlines) exportOutlines = res.exportOutlines
+        }
+        const out = await callLlm(buildPrompt(e, patch, {
+          releaseCtx: relText,
+          sequence,
+          prMeta,
+          architectureMap: archMap,
+          fileHeaders,
+          fileHistory,
+          subsystemDocs,
+          fullFiles,
+          exportOutlines
+        }), env)
         const clean = validateLlmOut(out, e.significance || 'minor')
         gatewayFails = 0
         cache[key] = {
@@ -933,6 +996,14 @@ export function buildEli5Prompt (e, notes = [], ctx = {}) {
     const fhText = ctx.fileHeaders.map(h => `File ${h.path}:\n${h.header}`).join('\n\n')
     evidence.push(`Module purpose from touched files:\n${fhText}`)
   }
+  if (ctx.fileHistory && ctx.fileHistory.length) {
+    const hist = ctx.fileHistory.slice(0, 5).map(h => `${h.date} [${h.sha}]: ${h.title}`).join(' ; ')
+    evidence.push(`Recent changes to these files: ${hist}`)
+  }
+  if (ctx.subsystemDocs && ctx.subsystemDocs.length) {
+    const docOverview = ctx.subsystemDocs.map(d => `${d.path}: ${d.content.split('\n')[0]}`).join(' ; ')
+    evidence.push(`Subsystem guide: ${docOverview}`)
+  }
   const noteBlock = notes.length
     ? `\nComments the developers wrote beside this code. Read them: they say who this is for and what it does today, which the constant names do not.\n${notes.map(n => `- ${n}`).join('\n')}\n`
     : ''
@@ -974,6 +1045,7 @@ Rules:
 - If the change is small or internal, say so shortly. Do not inflate it.
 - Never address the reader as a developer.
 - Address the reader as "you", or name the group ("users", "subscribers"); never write "that person", "the viewer" or "that individual".
+- Punctuation: Never use em-dashes; use commas, parentheses, or hyphens instead.
 - ${releaseCtx ? 'A release roll-up may run longer: stop after up to 8 sentences. Lead with a strong user-facing headline summarizing the main theme of what shipped before listing key highlights.' : 'Stop after 2-4 sentences.'} Include an effective date only when the evidence supplies it and it clarifies the change; never recite day counts or archive calendars.
 
 Reply with JSON only: {"eli5": "..."}`
@@ -1009,7 +1081,7 @@ export function normalizeEli5 (raw, maxChars = ELI5_MAX_CHARS) {
   // callLlm hands the validator the parsed object; a bare-string reply is also
   // accepted because small models sometimes ignore the JSON envelope.
   const value = raw && typeof raw === 'object' ? (raw.eli5 ?? raw.text ?? '') : raw
-  let s = String(value ?? '').trim()
+  let s = String(value ?? '').replace(/[\u2014\u2013—–]|&mdash;|&ndash;/g, ' - ').trim()
   // Models like to restate the label they were given.
   s = s.replace(/^(ELI5|In plain English|Plain english)\s*[:–-]\s*/i, '').trim()
   s = s.replace(/\s+/g, ' ').replace(/\s+([.,;:])/g, '$1').trim()
@@ -1152,10 +1224,18 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
       const idx = activeIndex++
       const { entry: e, src, key, relText = '', sequence = null, prMeta = null } = queue[idx]
       try {
+        const files = [...(e.files?.modified || []), ...(e.files?.added || [])]
         let fileHeaders = queue[idx].fileHeaders
-        if (!fileHeaders && options.repoDir) {
-          const files = [...(e.files?.modified || []), ...(e.files?.added || [])]
+        if (!fileHeaders && options.repoDir && files.length) {
           fileHeaders = await extractFileHeaders(options.repoDir, e.sha, files)
+        }
+        let fileHistory = queue[idx].fileHistory
+        if (!fileHistory && entries) {
+          fileHistory = findFileHistory(entries, e, 10)
+        }
+        let subsystemDocs = queue[idx].subsystemDocs
+        if (!subsystemDocs && options.repoDir && files.length) {
+          subsystemDocs = await extractSubsystemDocs(options.repoDir, e.sha, files)
         }
         const patch = await eli5Patch(e, wantDiff || !e.facts?.length ? getPatch : null)
         const out = await callLlm(buildEli5Prompt(e, eli5Notes(e, patch), {
@@ -1166,7 +1246,9 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
           prMeta,
           sequence,
           architectureMap: archMap,
-          fileHeaders
+          fileHeaders,
+          fileHistory,
+          subsystemDocs
         }), env, 1, (out) => normalizeEli5(out, relText ? ELI5_ROLLUP_MAX_CHARS : ELI5_MAX_CHARS))
         gatewayFails = 0
         cache[key] = {

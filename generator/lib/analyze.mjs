@@ -205,6 +205,123 @@ export async function extractFileHeaders (repoDir, ref, files, maxFiles = 6, max
   return headers
 }
 
+/**
+ * Longitudinal commit lineage: finds up to `maxEntries` previous commits that modified
+ * any of the same files as `targetEntry`, establishing how the subsystem evolved.
+ */
+export function findFileHistory (entries, targetEntry, maxEntries = 10) {
+  if (!entries || !targetEntry) return []
+  const targetFiles = new Set(
+    [...(targetEntry.files?.modified || []), ...(targetEntry.files?.added || [])]
+      .filter(f => f && !/(?:test|spec|__tests__)/i.test(f) && !/(?:bun\.lock|package-lock|yarn\.lock)/i.test(f))
+  )
+  if (!targetFiles.size) return []
+
+  const targetIdx = entries.findIndex(e => e.sha === targetEntry.sha)
+  let pool = []
+  if (targetIdx !== -1) {
+    const isOldestFirst = entries.length < 2 || String(entries[0].date || '') <= String(entries[entries.length - 1].date || '')
+    if (isOldestFirst) {
+      pool = entries.slice(0, targetIdx).reverse()
+    } else {
+      pool = entries.slice(targetIdx + 1)
+    }
+  } else {
+    pool = [...entries]
+      .filter(e => e.sha !== targetEntry.sha && (!targetEntry.date || e.date <= targetEntry.date))
+      .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0))
+  }
+
+  const history = []
+  for (const prev of pool) {
+    if (history.length >= maxEntries) break
+    if (prev.noise) continue
+    const prevFiles = [...(prev.files?.modified || []), ...(prev.files?.added || []), ...(prev.files?.removed || [])]
+    const overlap = prevFiles.filter(f => targetFiles.has(f))
+    if (overlap.length > 0) {
+      history.push({
+        sha: prev.sha.slice(0, 8),
+        date: prev.day || (prev.date ? prev.date.slice(0, 10) : ''),
+        overlap,
+        title: prev.ai?.title || prev.title || '',
+        summary: prev.ai?.summary || prev.summary || ''
+      })
+    }
+  }
+  return history
+}
+
+/**
+ * For small/focused modules (<= 250 lines), injects the complete source file.
+ * For larger modules (> 250 lines), extracts the public exported interface outline.
+ */
+export async function extractFullOrOutlinedFiles (repoDir, ref, files, maxLines = 250, maxFiles = 4) {
+  if (!repoDir || !ref || !files || !files.length) return { fullFiles: [], exportOutlines: [] }
+  const targets = files
+    .map(f => (typeof f === 'string' ? f : f?.path || ''))
+    .filter(p => p && /\.(?:ts|tsx|js|mjs|cjs|py|go|rs|md)$/i.test(p) && !/(?:test|spec|__tests__)/i.test(p))
+    .slice(0, maxFiles)
+
+  const fullFiles = []
+  const exportOutlines = []
+
+  for (const path of targets) {
+    try {
+      const content = await git(['show', `${ref}:${path}`], repoDir, { allowFail: true })
+      if (!content) continue
+      const lines = content.split('\n')
+      if (lines.length <= maxLines) {
+        fullFiles.push({ path, content: content.trim(), lines: lines.length })
+      } else {
+        const exports = lines
+          .filter(l => /^\s*export\s+(const|function|type|interface|class|enum|let|var|async\s+function|default)\s+/.test(l))
+          .slice(0, 30)
+        if (exports.length) {
+          exportOutlines.push({ path, outline: exports.join('\n').trim(), totalLines: lines.length })
+        }
+      }
+    } catch {
+      // ignore individual git read errors
+    }
+  }
+  return { fullFiles, exportOutlines }
+}
+
+/**
+ * Finds the nearest parent directory README or architecture guide for touched files.
+ */
+export async function extractSubsystemDocs (repoDir, ref, files, maxDocs = 2) {
+  if (!repoDir || !ref || !files || !files.length) return []
+  const targets = files
+    .map(f => (typeof f === 'string' ? f : f?.path || ''))
+    .filter(p => p && !/(?:test|spec|__tests__)/i.test(p))
+
+  const seenPaths = new Set()
+  const docs = []
+
+  for (const file of targets) {
+    if (docs.length >= maxDocs) break
+    const parts = file.split('/')
+    while (parts.length > 1 && docs.length < maxDocs) {
+      parts.pop()
+      const candidate = parts.join('/') + '/README.md'
+      if (seenPaths.has(candidate)) break
+      seenPaths.add(candidate)
+      try {
+        const content = await git(['show', `${ref}:${candidate}`], repoDir, { allowFail: true })
+        if (content) {
+          const overview = content.split('\n').slice(0, 35).join('\n').trim()
+          docs.push({ path: candidate, content: overview })
+          break
+        }
+      } catch {
+        // continue climbing
+      }
+    }
+  }
+  return docs
+}
+
 // ---------------------------------------------------------------------------
 // 3. Semantic extractors
 // ---------------------------------------------------------------------------
