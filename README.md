@@ -35,6 +35,7 @@ npm run backfill  # Run continuous sync daemon (--push)
 - **Timeline**: Daily changelog views (`/day/YYYY-MM-DD/`), releases (`/release/1.0.NNN/`), model tracker (`/models/`), and live metrics (`/stats/`).
 - **Feeds**: `/feed.xml` (all changes), `/feed-major.xml` (major only), `/feed-models.xml`, `/feed-releases.xml`, `/feed.json` (JSON Feed 1.1).
 - **Discord**: Every entry includes one-click Discord markdown copy (≤ 2,000 chars). Feeds support MonitoRSS and webhooks natively.
+- **Release roll-ups**: version-label rows (both the `1.0.x` CLI line and the `0.0.x` free-app line) explain the user-visible changes shipped since the previous bump of the same line, fed from the already-written titles and summaries in that window (up to 100 entries). Rows with an empty window keep the honest housekeeping line.
 - **Story context**: Same-day entries linked by specific files or identifiers can show an access-change headline and cross-note beside their plain-English explanations. Notes are derived from explicit recorded evidence at build time and included in feeds and Discord exports; they do not rewrite cached summaries. Detection is conservative and does not cover every wording or cross-day story. ELI5 prompt v4 also preserves evidence-backed eligibility changes and effective dates; existing explanations refresh through the normal enrichment budget.
 - **Keyboard Navigation**: Vim-style shortcuts (`j`/`k`, `o`, `d`, `c`, `n`/`p`, `/`, and `?` for cheat sheet).
 

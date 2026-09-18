@@ -531,6 +531,164 @@ test('enrichEli5: a 5xx retry keeps the eli5 validator (not the summary schema)'
   }
 })
 
+test('release context: bump window stops at the same-track predecessor', async () => {
+  const { collectReleaseContext, trackOfBump } = await import('../lib/llm.mjs')
+  const feat = (sha, day, title) => ({
+    sha, date: `${day}T12:00:00Z`, day, noise: false, significance: 'notable',
+    stats: { additions: 50, deletions: 10 },
+    files: { total: 2, meaningful: 1, added: [], modified: ['cli/src/x.ts'] },
+    title, ai: { model: 'm', v: PROMPT_V, title, summary: `${title} shipped.` }
+  })
+  const bump176 = eli5Entry({
+    sha: '1'.repeat(40), date: '2026-09-17T19:08:31Z', day: '2026-09-17',
+    files: { total: 2, meaningful: 1, modified: ['freebuff/cli/release/package.json'] },
+    stats: { additions: 3, deletions: 1 },
+    ai: { model: 'm', v: PROMPT_V, title: 'Freebuff CLI 0.0.176', summary: 'Manifest bumped to 0.0.176.' }
+  })
+  const cli688 = eli5Entry({
+    sha: '2'.repeat(40), date: '2026-09-17T20:00:00Z', day: '2026-09-17', version: '1.0.688',
+    files: { total: 2, meaningful: 1, modified: ['cli/release/package.json'] },
+    stats: { additions: 47, deletions: 55 },
+    ai: { model: 'm', v: PROMPT_V, title: 'CLI 1.0.688', summary: 'Manifest bumped to 1.0.688.' }
+  })
+  const bump177 = eli5Entry({
+    sha: '3'.repeat(40), date: '2026-09-17T23:17:09Z', day: '2026-09-17',
+    files: { total: 2, meaningful: 1, modified: ['freebuff/cli/release/package.json'] },
+    stats: { additions: 2, deletions: 4 },
+    ai: { model: 'm', v: PROMPT_V, title: 'freebuff CLI 0.0.177', summary: 'Manifest bumped to 0.0.177.' }
+  })
+  const entries = [
+    bump176,
+    feat('a'.repeat(40), '2026-09-17', 'Sponsored proposal card guidance'),
+    cli688,
+    feat('b'.repeat(40), '2026-09-17', 'Model selector list prices'),
+    bump177
+  ]
+  assert.equal(trackOfBump(bump177), 'freebuff-cli')
+  assert.equal(trackOfBump(cli688), 'codebuff-cli')
+  const ctx = collectReleaseContext(entries, bump177)
+  // Sails past the interleaved 1.0.688 bump, stops at 0.0.176, keeps both feats.
+  assert.deepEqual(ctx.items.map(i => i.sha), ['a'.repeat(40), 'b'.repeat(40)])
+  assert.equal(ctx.prevVersion, null, 'legacy bumps carry no version string to name')
+  const ctxCli = collectReleaseContext(entries, cli688)
+  assert.deepEqual(ctxCli.items.map(i => i.sha), ['a'.repeat(40)])
+  assert.equal(ctxCli.prevVersion, null, 'no earlier codebuff-cli bump in this fixture')
+})
+
+test('release context: skips noise, caps items and chars, prefers ai text', async () => {
+  const { collectReleaseContext } = await import('../lib/llm.mjs')
+  const mk = (sha, over = {}) => eli5Entry({
+    sha, date: '2026-09-17T10:00:00Z', day: '2026-09-17', significance: 'minor',
+    stats: { additions: 5, deletions: 5 },
+    files: { total: 1, meaningful: 1, modified: ['cli/src/y.ts'] },
+    ai: { model: 'm', v: PROMPT_V, title: `Change ${sha.slice(0, 4)}`, summary: `Change ${sha.slice(0, 4)} landed.` },
+    ...over
+  })
+  const bump = eli5Entry({
+    sha: 'f'.repeat(40), version: '1.0.689', date: '2026-09-17T23:00:00Z', day: '2026-09-17',
+    stats: { additions: 1, deletions: 1 }, files: { total: 2, meaningful: 1, modified: ['cli/release/package.json'] },
+    ai: { model: 'm', v: PROMPT_V, title: 'CLI 1.0.689', summary: 'Manifest bumped.' }
+  })
+  const noisy = mk('e'.repeat(40), { noise: true })
+  const entries = [mk('c'.repeat(40)), noisy, mk('d'.repeat(40)), bump]
+  const full = collectReleaseContext(entries, bump)
+  assert.ok(!full.items.some(i => i.sha === 'e'.repeat(40)), 'noise excluded')
+  assert.equal(full.items.length, 2)
+  const capped = collectReleaseContext(entries, bump, { maxItems: 1 })
+  assert.equal(capped.items.length, 1)
+  assert.equal(capped.truncated, true)
+  assert.equal(capped.items[0].sha, 'd'.repeat(40), 'newest kept when capped')
+  const tiny = collectReleaseContext(entries, bump, { maxChars: 10 })
+  assert.equal(tiny.items.length, 0)
+  assert.equal(tiny.truncated, true)
+})
+
+test('release context: empty window yields no prompt section and stable keys', async () => {
+  const { collectReleaseContext, buildEli5Prompt, eli5Key, eli5Done } = await import('../lib/llm.mjs')
+  const bump = eli5Entry({
+    sha: '9'.repeat(40), version: '1.0.690', date: '2026-09-17T23:00:00Z', day: '2026-09-17',
+    stats: { additions: 1, deletions: 1 }, files: { total: 2, meaningful: 1, modified: ['cli/release/package.json'] },
+    ai: { model: 'm', v: PROMPT_V, title: 'CLI 1.0.690', summary: 'Manifest bumped.' }
+  })
+  const prev = eli5Entry({
+    sha: '8'.repeat(40), version: '1.0.689', date: '2026-09-16T23:00:00Z', day: '2026-09-16',
+    stats: { additions: 1, deletions: 1 }, files: { total: 2, meaningful: 1, modified: ['cli/release/package.json'] },
+    ai: { model: 'm', v: PROMPT_V, title: 'CLI 1.0.689', summary: 'Manifest bumped.' }
+  })
+  const ctx = collectReleaseContext([prev, bump], bump)
+  assert.equal(ctx.items.length, 0)
+  assert.equal(ctx.prevVersion, '1.0.689')
+  const p = buildEli5Prompt(bump, [], { releaseCtx: '' })
+  assert.doesNotMatch(p, /Updates included in this release \([\d.]+/)
+  assert.match(p, /Shipped in version 1\.0\.690/)
+  assert.equal(eli5Key(bump.sha, 's'), `${bump.sha}:eli5:v${ELI5_V}:${shortHash('s')}`, 'non-context keys unchanged')
+  const done = { ...bump, eli5: { text: 'Housekeeping.', v: ELI5_V, src: shortHash(eli5Source(bump)) } }
+  assert.equal(eli5Done(done), true, 'single-arg callers keep old semantics')
+})
+
+test('enrichEli5: bump rows carry the release window and refresh when it fills in', async (t) => {
+  const { mkdtemp, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-eli5-relctx-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const env = {
+    CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1',
+    LLM_MODEL: 'test-model', CHANGELOG_ELI5_LIMIT: '5'
+  }
+  const prompts = []
+  const orig = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    prompts.push(init.body)
+    return {
+      ok: true, status: 200, headers: { get: () => null },
+      text: async () => JSON.stringify({ choices: [{ message: { content: JSON.stringify({ eli5: 'Updating pulls in sponsored card guidance and list prices.' }) } }] })
+    }
+  }
+  try {
+    const featAi = (title) => ({ model: 'm', v: PROMPT_V, title, summary: `${title} shipped.` })
+    const feat = eli5Entry({
+      sha: 'a'.repeat(40), date: '2026-09-17T21:14:00Z', day: '2026-09-17', significance: 'notable',
+      stats: { additions: 134, deletions: 20 }, files: { total: 3, meaningful: 2, modified: ['cli/src/a.ts'] },
+      ai: featAi('Sponsored proposal card guidance')
+    })
+    const bump = eli5Entry({
+      sha: 'b'.repeat(40), date: '2026-09-17T23:17:09Z', day: '2026-09-17',
+      stats: { additions: 2, deletions: 4 },
+      files: { total: 2, meaningful: 1, modified: ['freebuff/cli/release/package.json'] },
+      ai: { model: 'm', v: PROMPT_V, title: 'freebuff CLI 0.0.177', summary: 'Manifest bumped to 0.0.177.' }
+    })
+    const entries = [feat, bump]
+    assert.equal(await enrichEli5(entries, dir, env, { retryErrors: true, getPatch: async () => '' }), 2)
+    const titleOf = (b) => /Title: ([^\\]*)/.exec(b)?.[1]
+    const bumpPrompt = prompts.find(b => titleOf(b) === 'freebuff CLI 0.0.177')
+    assert.ok(bumpPrompt, 'the bump row was asked')
+    assert.match(bumpPrompt, /Updates included in this release/)
+    assert.match(bumpPrompt, /Sponsored proposal card guidance/)
+    const featPrompt = prompts.find(b => titleOf(b) === 'Sponsored proposal card guidance')
+    assert.ok(featPrompt, 'the feature row was asked too')
+    assert.doesNotMatch(featPrompt, /^- Updates included in this release/m)
+    assert.ok(bump.eli5.ctx, 'roll-up records its window hash')
+    // Second run: window unchanged -> cache hit, no call.
+    prompts.length = 0
+    const again = [
+      { ...feat },
+      { ...bump, eli5: { ...bump.eli5 } }
+    ]
+    assert.equal(await enrichEli5(again, dir, env, { retryErrors: true, getPatch: async () => '' }), 0)
+    assert.equal(prompts.length, 0)
+    // Predecessor summarized late -> window hash moves -> bump re-queues
+    // (the feat row re-queues too, for its own new summary: expect 2).
+    const late = { ...feat, ai: { ...feat.ai, summary: 'Sponsored proposal card guidance shipped with setup steps.' } }
+    const stale = [{ ...late }, { ...bump, eli5: { ...bump.eli5 } }]
+    prompts.length = 0
+    assert.equal(await enrichEli5(stale, dir, env, { retryErrors: true, getPatch: async () => '' }), 2)
+    assert.ok(prompts.some(b => titleOf(b) === 'freebuff CLI 0.0.177'), 'stale roll-up re-asked')
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
 test('enrichEli5: spends the budget where a story exists, not on version bumps', async (t) => {
   const { mkdtemp, rm } = await import('node:fs/promises')
   const { tmpdir } = await import('node:os')

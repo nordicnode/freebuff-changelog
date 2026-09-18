@@ -315,6 +315,41 @@ export function extractVersionBump (patch) {
   return adds.length ? adds[adds.length - 1] : null
 }
 
+// The two package files whose bumps mark a shippable build. `cli/release/`
+// feeds the 1.0.x line (e.version, release pages); `freebuff/cli/release/`
+// feeds the 0.0.x line (e.freebuffVersion, ELI5 roll-up only, no release page
+// per product decision). Track identity is what lets a release-window walk
+// stop at the previous bump of the *same* line instead of the nearest bump of
+// either line -- the two interleave constantly.
+export const VERSION_TRACKS = {
+  'cli/release/package.json': 'codebuff-cli',
+  'freebuff/cli/release/package.json': 'freebuff-cli'
+}
+
+// Old rows predate versionTrack, so windows must also infer it from the file
+// lists below. That inference is conservative on purpose: an unknown track
+// means "same line as whoever asks", never "stop here".
+export function versionTrackOf (e) {
+  if (e && typeof e.versionTrack === 'string' && e.versionTrack) return e.versionTrack
+  return null
+}
+
+export function isBumpEntry (e) {
+  if (!e) return false
+  if (versionTrackOf(e) || e.version || e.freebuffVersion) return true
+  // Legacy rows predate versionTrack AND freebuffVersion (the 0.0.x line was
+  // never extracted): a versionless row whose only meaningful file is a
+  // release manifest is a bump by shape. meaningful<=1 keeps mixed rows
+  // (manifest riding along with real work, e.g. a4b3d0fa mean=3) out of the
+  // boundary set -- they are window *content*, not its edge.
+  if (e.version || e.freebuffVersion) return false
+  // NOTE: stats.additions counts the whole snapshot including lockfile churn
+  // (1.0.688 itself is +47/-55), so shape comes from the file lists only.
+  const mods = [...(e.files?.added || []), ...(e.files?.modified || [])]
+  if ((e.files?.meaningful ?? 99) > 1) return false
+  return mods.length === 1 && (mods[0] in VERSION_TRACKS)
+}
+
 // Slash-commands registry: cli/src/data/slash-commands.ts holds ALL_SLASH_COMMANDS
 // with string `id:` fields. Snapshot both revs and set-diff the ids: renames
 // (same block, new id) surface as add+remove, description edits as nothing.
@@ -406,6 +441,8 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
 
   let modelChanges = null
   let version = null
+  let freebuffVersion = null
+  let versionTrack = null
   let cmdChanges = null
   const readmeTouched = meaningful.some(f => f.path === 'README.md' || f.path === 'README.zh-CN.md')
   if (readmeTouched) {
@@ -421,8 +458,16 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
         if (mc.added.length || mc.removed.length) modelChanges = mc
       }
     }
-    const pkgPatch = patchForFile(patch, 'cli/release/package.json')
-    if (pkgPatch) version = extractVersionBump(pkgPatch) || version
+    for (const [pkgPath, track] of Object.entries(VERSION_TRACKS)) {
+      const pkgPatch = patchForFile(patch, pkgPath)
+      const bumped = pkgPatch ? extractVersionBump(pkgPatch) : null
+      if (!bumped) continue
+      if (track === 'codebuff-cli') version = bumped
+      else freebuffVersion = bumped
+      // First bump wins when a snapshot touches both manifests: the row is one
+      // release of one line, and the codebuff-cli page owns the combined range.
+      if (!versionTrack) versionTrack = track
+    }
     const registryTouched = meaningful.some(f => f.path === CMD_REGISTRY)
     if (registryTouched) {
       const cc = await snapshotCommandChanges(repoDir, prevSha, commit.sha)
@@ -450,6 +495,8 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
     date: commit.date,
     sourceSha: sourceRef(commit),
     version,
+    ...(freebuffVersion ? { freebuffVersion } : {}),
+    ...(versionTrack ? { versionTrack } : {}),
     areas: areas.length ? areas : ['Repo'],
     modelChanges,
     cmdChanges,
@@ -565,6 +612,7 @@ export function deterministicSummary (e) {
     else if (removed.length) bits.push(`Model catalog: ${listPhrase(removed)} removed from the free model picker.`)
   }
   if (e.version) bits.push(`CLI release ${e.version} published.`)
+  if (e.freebuffVersion) bits.push(`Freebuff CLI release ${e.freebuffVersion} published.`)
   if (e.cmdChanges) {
     if (e.cmdChanges.added.length) bits.push(`New slash commands: ${e.cmdChanges.added.map(c => '`' + c + '`').join(', ')}.`)
     if (e.cmdChanges.removed.length) bits.push(`Removed slash commands: ${e.cmdChanges.removed.map(c => '`' + c + '`').join(', ')}.`)
@@ -645,6 +693,7 @@ export function entryTitle (e) {
     if (removed.length) return `${removed[0]} retired from the lineup`
   }
   if (e.version) return `Version ${e.version}`
+  if (e.freebuffVersion) return `Freebuff CLI ${e.freebuffVersion}`
   if (e.cmdChanges?.added?.length) return `New slash command ${e.cmdChanges.added[0]}`
   const area = e.areas.filter(a => a !== 'Repo')[0]
   if (e.files.added.length && e.files.added.length >= e.files.meaningful) return `New ${area ? area.toLowerCase() + ' ' : ''}files landed`

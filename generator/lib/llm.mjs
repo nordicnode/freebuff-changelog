@@ -25,7 +25,7 @@
 //   options.priorityShas       SHAs to summarize ahead of the backlog
 import { readJson, writeJson, log, pool, shortHash, eli5Source } from './util.mjs'
 import { mergeAiCache } from './mergedata.mjs'
-import { extractCommentFacts } from './analyze.mjs'
+import { extractCommentFacts, isBumpEntry, versionTrackOf, VERSION_TRACKS } from './analyze.mjs'
 
 export function llmConfigured (env = process.env) {
   return env.CHANGELOG_LLM === '1' && !!env.LLM_API_KEY
@@ -404,6 +404,120 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
 }
 
 // ---------------------------------------------------------------------------
+// Release-window context for version-bump rows.
+//
+// A bump row's own diff is one version string, so from its patch alone the
+// only honest ELI5 is "packaging housekeeping" -- even when the window since
+// the previous bump shipped real features (e.g. freebuff-cli 0.0.177's own
+// diff is a 1-line manifest edit, but the 20 commits since 0.0.176 include
+// sponsored-card guidance, telemetry contracts and pricing-badge work).
+//
+// The fix is to feed the bump's ELI5 the window it releases: the
+// already-vetted titles + first sentences of the non-noise predecessors back
+// to the previous bump of the same track. Summaries, not diffs: the window
+// was already summarized once, and re-sending full diffs would re-litigate
+// that work at ~100x the tokens.
+//
+// Track identity matters because the 1.0.x (cli/release) and 0.0.x
+// (freebuff/cli/release) lines interleave: a 0.0.177 window must stop at
+// 0.0.176, not at the 1.0.688 bump in between. Old rows predate versionTrack,
+// so the boundary also infers the line from the touched manifest path and the
+// version string shape (see trackOfBump); an unknowable line means "same line
+// as whoever asks", never "stop here" -- a missing stop only widens the
+// draft, a wrong stop silently drops half the release.
+
+// Caps: large on purpose. The 200k-token window fits even the biggest 1.0.x
+// gaps (61+ commits) once compressed to title+summary lines; items cap the
+// prompt, chars cap it harder. No extra LLM calls: context is in-memory.
+export const RELEASE_CTX_MAX_ITEMS = 100
+export const RELEASE_CTX_MAX_CHARS = 30000
+export const RELEASE_CTX_SUMMARY_CHARS = 300
+
+// Which release line a bump row belongs to. Prefers the recorded track, then
+// the touched manifest path (file lists on old rows), then the version string
+// shape (1.x = codebuff-cli, 0.x = freebuff-cli). Null when nothing says.
+export function trackOfBump (e) {
+  const direct = versionTrackOf(e)
+  if (direct) return direct
+  const files = [...(e?.files?.added || []), ...(e?.files?.modified || []), ...(e?.files?.removed || [])]
+  for (const [pkgPath, track] of Object.entries(VERSION_TRACKS)) {
+    if (files.includes(pkgPath)) return track
+  }
+  const v = e?.version || e?.freebuffVersion || ''
+  if (/^1\./.test(v)) return 'codebuff-cli'
+  if (/^0\./.test(v)) return 'freebuff-cli'
+  return null
+}
+
+function releaseItemText (e, maxSummary = RELEASE_CTX_SUMMARY_CHARS) {
+  const title = e?.ai?.title || e?.title || ''
+  const raw = e?.ai?.summary || e?.summary || ''
+  const summary = firstSentence(raw)
+  const sig = e?.ai?.significance || e?.significance || ''
+  const head = `${(e?.date || '').slice(0, 10)} ${title}`.trim()
+  const tail = summary && summary !== title ? `: ${truncateWords(summary, maxSummary)}` : ''
+  const tag = sig && sig !== 'noise' ? ` [${sig}]` : ''
+  return `${head}${tail}${tag}`.trim()
+}
+
+// The window a bump row releases: non-noise, non-bump predecessors back to
+// (excluding) the previous bump of the same track. Entries arrive
+// oldest-first (changelog.json order); position lookups come from a caller-
+// supplied index so this stays O(window) inside the enrichment loop.
+export function collectReleaseContext (entries, bump, opts = {}) {
+  const out = { items: [], prevVersion: null, truncated: false }
+  if (!Array.isArray(entries) || !bump) return out
+  const maxItems = opts.maxItems ?? RELEASE_CTX_MAX_ITEMS
+  const maxChars = opts.maxChars ?? RELEASE_CTX_MAX_CHARS
+  const idx = opts.index ?? new Map(entries.map((x, i) => [x.sha, i]))
+  const pos = idx.get(bump.sha)
+  if (pos == null || pos <= 0) return out
+  const line = trackOfBump(bump)
+  const picked = []
+  let used = 0
+  for (let i = pos - 1; i >= 0; i--) {
+    const e = entries[i]
+    if (!e || e.sha === bump.sha) continue
+    if (isBumpEntry(e)) {
+      // A bump of the same line (or an unknowable line) closes the window. A
+      // bump of the *other* line is interleaved traffic, not our release: the
+      // window sails past it but never includes it.
+      if (!line) break
+      const other = trackOfBump(e)
+      if (!other || other === line) {
+        out.prevVersion = e.version || e.freebuffVersion || null
+        break
+      }
+      continue
+    }
+    if (e.noise) continue
+    const text = releaseItemText(e)
+    if (!text) continue
+    // Churn rows that slipped past noise (belt and suspenders): versionless,
+    // meaningless, lockfile-only leftovers add tokens, never signal.
+    if (!e.ai?.title && !e.ai?.summary && (e.files?.meaningful ?? 1) <= 0) continue
+    if (picked.length >= maxItems || used + text.length + 1 > maxChars) {
+      out.truncated = true
+      break
+    }
+    picked.push({ sha: e.sha, text })
+    used += text.length + 1
+  }
+  // Chronological reads better in the prompt ("since X, the team shipped...").
+  out.items = picked.reverse()
+  return out
+}
+
+function formatReleaseContext (ctx, bump) {
+  if (!ctx || !ctx.items.length) return ''
+  const v = bump?.version || bump?.freebuffVersion || ''
+  const since = ctx.prevVersion ? ` since ${ctx.prevVersion}` : ''
+  const head = `Updates included in this release${v ? ` (${v}${since})` : since}:`
+  const lines = ctx.items.map(it => `- ${it.text}`)
+  if (ctx.truncated) lines.push(`- ...[earlier changes truncated; newest ${ctx.items.length} shown]...`)
+  return [head, ...lines].join('\n')
+}
+// ---------------------------------------------------------------------------
 // ELI5: a plain-English line beneath each technical summary.
 //
 // A second pass on purpose, not extra fields in buildPrompt:
@@ -435,8 +549,12 @@ export const ELI5_V = 4
 // entry's eli5.src, so a re-summarized entry drops a stale plain-English line.
 export { eli5Source }
 
-export function eli5Key (sha, source) {
-  return `${sha}:eli5:v${ELI5_V}:${shortHash(source)}`
+export function eli5Key (sha, source, releaseCtx = '') {
+  // Bump rows explain their release window, not just their own diff, so the
+  // window hash joins the key: predecessors gaining summaries refreshes the
+  // roll-up, while non-bump rows keep byte-identical keys (no cache churn).
+  const extra = releaseCtx ? `:${shortHash(releaseCtx)}` : ''
+  return `${sha}:eli5:v${ELI5_V}:${shortHash(source)}${extra}`
 }
 
 // Explainable = has a current technical summary. Churn rows have nothing to
@@ -446,12 +564,21 @@ export function eli5Eligible (e) {
   return !e.noise && !!e.ai?.title && !!e.ai?.summary && (e.ai?.v ?? 1) >= PROMPT_V
 }
 
-export function eli5Done (e) {
-  return !!(e.eli5 && e.eli5.v >= ELI5_V && e.eli5.src === shortHash(eli5Source(e)))
+export function eli5Done (e, releaseCtx = '') {
+  // e.eli5.ctx is the window hash the line was written from. enrichEli5 always
+  // passes the current window for bumps, so a roll-up whose window filled in
+  // since (predecessors summarized late, or a rescan moved the boundary)
+  // re-queues on its own. Single-arg callers (status counters) keep the old
+  // v+src semantics exactly -- otherwise every contextualized bump would read
+  // as permanently "remaining".
+  if (!(e.eli5 && e.eli5.v >= ELI5_V && e.eli5.src === shortHash(eli5Source(e)))) return false
+  if (!releaseCtx) return true
+  if (!e.eli5.ctx) return false
+  return e.eli5.ctx === shortHash(releaseCtx)
 }
 
 export function buildEli5Prompt (e, notes = [], ctx = {}) {
-  const { patch = '', siblings = [], diffBytes = 6000 } = ctx
+  const { patch = '', siblings = [], diffBytes = 6000, releaseCtx = '' } = ctx
   const evidence = []
   if (e.summary && e.summary !== e.ai.summary) evidence.push(`What the analyzer measured: ${e.summary}`)
   if (e.stats) {
@@ -478,6 +605,8 @@ export function buildEli5Prompt (e, notes = [], ctx = {}) {
     evidence.push(`Slash commands: in (${e.cmdChanges.added.join(', ') || 'nothing'}), out (${e.cmdChanges.removed.join(', ') || 'nothing'})`)
   }
   if (e.version) evidence.push(`Shipped in version ${e.version}`)
+  if (e.freebuffVersion) evidence.push(`Shipped in freebuff app version ${e.freebuffVersion}`)
+  if (releaseCtx) evidence.push(releaseCtx)
   if (siblings.length) evidence.push(`Other changes the same snapshot: ${siblings.slice(0, 6).join(' ; ')}`)
   const noteBlock = notes.length
     ? `\nComments the developers wrote beside this code. Read them: they say who this is for and what it does today, which the constant names do not.\n${notes.map(n => `- ${n}`).join('\n')}\n`
@@ -506,6 +635,7 @@ Rules:
 - Keep the audience the text gives, and keep it narrow. If the change is for one kind of customer, one plan, one region, or only after some step, name that group. Never widen it to "users", "everyone" or "customers" because that reads more naturally: a program for verified YC companies is not available to users.
 - Plain words, active voice. No "This change", "We are excited", marketing tone, or generic tautologies ("various bug fixes and improvements").
 - Jump straight into what happened. NEVER use conversational preambles, filler intros, or framing phrases like "In simple terms", "Basically", "To put it simply", "In plain English", "This commit", "This update", or "This pull request". Start directly with the concrete action or subject.
+- This row may be a version-label commit whose own diff is packaging: when the evidence lists "Updates included in this release", summarize what updating to this version gives the reader from THAT list (strongest user-visible items first), not from the one-line version diff. When the list has no user-visible change, say so honestly as behind-the-scenes housekeeping.
 - If the change is an internal refactor, test suite update, dependency bump, or maintenance change with no direct user-facing behavior, explain it honestly and plainly as behind-the-scenes housekeeping or stability maintenance. Do NOT invent or fabricate user-facing features, performance claims, or speed improvements.
 - If the change is small or internal, say so shortly. Do not inflate it.
 - Never address the reader as a developer.
@@ -579,16 +709,40 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   // new command has a reader-facing story; a comment beside the code names its
   // audience; a bare version bump has neither, and the honest line about it is "a
   // number went up" -- so 650 of those must not drink the budget first.
-  const bumpOnly = (e) => !!e.version && !e.modelChanges && !e.cmdChanges &&
+  // A bare version label (either track) with no catalog/command payload and a
+  // tiny diff: its own patch says "a number went up" and nothing else.
+  const bumpOnly = (e) => isBumpEntry(e) && !e.modelChanges && !e.cmdChanges &&
     (e.stats?.additions ?? 99) <= 10 && (e.files?.meaningful ?? 99) <= 2
+  // Positions for the release-window walk (entries are oldest-first). Built
+  // once per run so per-bump context stays O(window), not O(history).
+  const posIndex = new Map(entries.map((x, i) => [x.sha, i]))
+  // Memoized windows: the same bump row is hashed by pending-filter, queue
+  // build and worker without re-walking.
+  const ctxCache = new Map()
+  const releaseOf = (e) => {
+    if (!bumpOnly(e)) return null
+    let hit = ctxCache.get(e.sha)
+    if (!hit) {
+      const ctx = collectReleaseContext(entries, e, { index: posIndex })
+      hit = { ctx, text: formatReleaseContext(ctx, e) }
+      ctxCache.set(e.sha, hit)
+    }
+    return hit.text ? hit : null
+  }
   const prio = (e) => (priority.has(e.sha) ? -1
     : e.modelChanges ? 0
+    : releaseOf(e) ? 1
     : e.cmdChanges ? 1
     : e.facts?.length ? 2
     : bumpOnly(e) ? 5
     : e.significance === 'major' || e.significance === 'notable' ? 3
     : 4)
-  const pending = entries.filter(eli5Eligible).filter(e => !eli5Done(e))
+  // eli5Done is context-aware for bumps: a roll-up whose window filled in
+  // since (predecessors summarized late) re-queues on its own.
+  const pending = entries.filter(eli5Eligible).filter(e => {
+    const hit = bumpOnly(e) ? releaseOf(e) : null
+    return !eli5Done(e, hit?.text || '')
+  })
   pending.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
   // Same bound as the summary pass: choosing this run's dozen entries must not
   // mean hashing the whole backlog.
@@ -597,7 +751,9 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   const queue = []
   for (const e of candidates) {
     const src = eli5Source(e)
-    const key = eli5Key(e.sha, src)
+    const hit = bumpOnly(e) ? releaseOf(e) : null
+    const relText = hit?.text || ''
+    const key = eli5Key(e.sha, src, relText)
     const cached = cache[key]
     if (cached?.error) {
       if (!options.retryErrors) continue
@@ -607,10 +763,10 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     if (cached && !cached.error) {
       // A cache hit costs nothing but still has to land on the entry, or the
       // site renders no ELI5 line for it.
-      e.eli5 = { text: cached.text, model: cached.model, v: cached.v, src: shortHash(src), at: cached.at }
+      e.eli5 = { text: cached.text, model: cached.model, v: cached.v, src: shortHash(src), ctx: relText ? shortHash(relText) : undefined, at: cached.at }
       continue
     }
-    queue.push({ entry: e, src, key })
+    queue.push({ entry: e, src, key, relText })
     if (queue.length >= limit) break
   }
 
@@ -623,22 +779,24 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     while (activeIndex < queue.length) {
       if (gatewayFails >= 3) break
       const idx = activeIndex++
-      const { entry: e, src, key } = queue[idx]
+      const { entry: e, src, key, relText = '' } = queue[idx]
       try {
           const patch = await eli5Patch(e, wantDiff || !e.facts?.length ? getPatch : null)
           const out = await callLlm(buildEli5Prompt(e, eli5Notes(e, patch), {
             patch: wantDiff ? patch : '',
             siblings: (byDay.get(e.day) || []).filter(t => t !== e.ai.title).slice(0, 6),
-            diffBytes
+            diffBytes,
+            releaseCtx: relText
           }), env, 1, normalizeEli5)
         gatewayFails = 0
         cache[key] = {
           model: env.LLM_MODEL || 'gpt-4o-mini',
           v: ELI5_V,
           text: out,
+          ...(relText ? { ctx: shortHash(relText) } : {}),
           at: new Date().toISOString()
         }
-        e.eli5 = { text: out, model: cache[key].model, v: ELI5_V, src: shortHash(src), at: cache[key].at }
+        e.eli5 = { text: out, model: cache[key].model, v: ELI5_V, src: shortHash(src), ...(relText ? { ctx: shortHash(relText) } : {}), at: cache[key].at }
         apiCalls++
         cacheModified = true
         log(`ELI5 wrote ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})`)

@@ -3,7 +3,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  extractModelTableChanges, extractVersionBump, extractSlashCommandChanges,
+  extractModelTableChanges, extractVersionBump, extractSlashCommandChanges, isBumpEntry, versionTrackOf, VERSION_TRACKS,
   commandIdsFromRegistry,
   areaOf, isNoiseFile, deterministicSummary, entryTitle, churnLabel, testLabel, sourceRef, isSyncCommit,
   extractCommentFacts, extractCleanDiff, extractRawDiff, EMPTY_TREE, parseMarkdownTables, catalogFromReadme,
@@ -349,5 +349,6 @@ test('toUtc: offsets collapse to Z, UTC and junk pass through', () => {
   assert.equal(toUtc(''), '')
   assert.equal(toUtc('not a date'), 'not a date')
 })
+
 
 

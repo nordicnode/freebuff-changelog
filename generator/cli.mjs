@@ -404,7 +404,7 @@ function decorate (e) {
   // the LLM queue, and never counted as a "change" in the headline.
   // Test-only commits are *not* churn: real work landed, so they get a row, a
   // category and a summary like any other entry.
-  const churn = (lockOnly || e.files.total === 0) && !e.modelChanges && !e.version && !e.cmdChanges
+  const churn = (lockOnly || e.files.total === 0) && !e.modelChanges && !e.version && !e.freebuffVersion && !e.cmdChanges
   if (churn) {
     const label = churnLabel(e)
     e.noise = true
