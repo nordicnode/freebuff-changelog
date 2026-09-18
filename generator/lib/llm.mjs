@@ -221,7 +221,7 @@ export function buildPrompt (entry, patch, ctx = {}) {
   if (entry.version || entry.freebuffVersion) lines.push(`Version bump: ${entry.version || entry.freebuffVersion}`)
   if (ctx.releaseCtx) {
     lines.push('', ctx.releaseCtx, '')
-    lines.push('Release instructions: This row is a version bump. Use the release updates above to summarize what user-visible features, model changes, and CLI improvements shipped in this release, rather than describing the version number change itself.')
+    lines.push('Release instructions: This row is a version bump. Lead directly with the major user-visible features, model additions or swaps, and security hardenings shipped in this release, rather than describing the version number change itself. Never write "Bumped the manifest" or "Manifest bumped" as the lead; state what capabilities, models, and tools actually shipped.')
   }
   const added = entry.files?.added || []
   const modified = entry.files?.modified || []
@@ -468,7 +468,7 @@ export const RELEASE_CTX_MAX_ITEMS = 200
 export const RELEASE_CTX_MAX_CHARS = 200000
 export const RELEASE_CTX_SUMMARY_CHARS = 1200
 
-export const RELEASE_ROLLUP_V = 6
+export const RELEASE_ROLLUP_V = 7
 
 export function trackOfBump (e) {
   const direct = versionTrackOf(e)
@@ -933,6 +933,42 @@ export function eli5Done (e, releaseCtx = '', rollupV = 0) {
 
 export function buildEli5Prompt (e, notes = [], ctx = {}) {
   const { patch = '', siblings = [], diffBytes = 60000, releaseCtx = '', prMeta = null, sequence = null } = ctx
+
+  if (releaseCtx) {
+    return `Explain what shipped in this software release to a reader who is not a programmer and will not look at the code. This is a RELEASE ROLL-UP summarizing the capabilities, models, security protections, and improvements bundled into this version.
+
+${ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP}
+
+${FREEBUFF_DOMAIN_LEXICON}
+
+Release: ${e.version || e.freebuffVersion || ''}
+Title: ${e.ai?.title || e.title || ''}
+Date: ${e.day || ''}
+Category: ${e.category || (e.areas || []).join(', ')}
+
+${releaseCtx}
+
+Your task:
+Write 3-6 sentences of plain English that tell the user WHAT WAS ADDED, CHANGED, AND IMPROVED in this release.
+
+Structure:
+1. Lead / Core Additions: Announce the main features, model updates, and improvements that this release delivers.
+2. Concrete Highlights: Detail 2 to 4 of the most important specific user-visible changes or safety enhancements from the list above. Specifically state what each one does in clear, everyday words.
+3. Everyday Impact: Explain how upgrading to this version benefits the user in daily use.
+
+Rules:
+- DO NOT write meta-boilerplate saying "this is just a packaging update", "this is an internal packaging marker", "simply bundles together a collection of improvements", "nothing breaks, nothing changes", "no action is required on your part", or "your workflow will not be any different". You MUST name and describe the actual features, model changes, and improvements that were added!
+- The Technical summary of the packaging commit describes only the label change itself and must not drive the line. You must summarize what updating to this version gives the reader, drawn directly from the "Updates included in this release" list above.
+- If the list ends with a "Final catalog state" line, that is authoritative: announce only what survives it -- something an item says was added but the final-state line leaves out of the picker is NOT in this release.
+- A release roll-up may run longer: stop after up to 8 sentences. Lead with a strong user-facing headline summarizing the main theme of what shipped before listing key highlights.
+- No jargon, acronyms, code identifiers, file names, or raw function names. Explain the capability in plain words (e.g. "you can now use a new AI model" instead of function names).
+- Address the reader as "you" or "users". Never write "that person", "the viewer", or "that individual".
+- Punctuation: Never use em-dashes; use commas, parentheses, or hyphens instead.
+- Jump straight into what shipped. Never start with conversational preambles ("In this release...", "Behind the scenes...", "What you would notice..."). Lead directly with the concrete capabilities or theme.
+
+Reply with JSON only: {"eli5": "..."}`
+  }
+
   const evidence = []
   if (e.commitNature) {
     const natureDesc = e.commitNature === 'test-only'
@@ -1107,6 +1143,9 @@ export function normalizeEli5 (raw, maxChars = ELI5_MAX_CHARS) {
   // is for. A 25-character floor parked real answers as errors for an hour.
   if (s.length < 12 || ELI5_JUNK.test(s) || ELI5_REFUSAL.test(s)) {
     throw new Error(`eli5 not an answer: ${JSON.stringify(s).slice(0, 60)}`)
+  }
+  if (maxChars > ELI5_MAX_CHARS && /(?:simply bundles?|internal packaging marker|nothing breaks,? nothing changes|no action is required on your part|(?:workflow|project setup|outputs?)(?: [a-z,]+)* will not be (?:any )?different)/i.test(s)) {
+    throw new Error(`eli5 roll-up contains no-action packaging boilerplate without describing features: ${JSON.stringify(s).slice(0, 80)}`)
   }
   if (!/[.!?]$/.test(s)) s += '.'
   return cutToSentence(s, maxChars)

@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON } from '../lib/llm.mjs'
+import { parseLlmJson, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -1285,6 +1285,35 @@ test('buildPrompt & buildEli5Prompt: formats fileHistory, fullFiles, exportOutli
   assert.ok(eli5Prompt.includes('Recent changes to these files: 2026-09-17 [11111111]: Initial ad ranking stub'))
   assert.ok(eli5Prompt.includes('Subsystem guide: common/src/ads/README.md: # Ads Subsystem'))
 })
+
+test('normalizeEli5: rejects no-action packaging boilerplate on roll-up rows', () => {
+  const boilerplate1 = 'The developer tool was quietly updated to a new packaged version, which simply bundles together a collection of improvements that were already rolled out to users throughout the day - nothing breaks, nothing changes how you call it, and no action is required on your part.'
+  assert.throws(() => normalizeEli5(boilerplate1, ELI5_ROLLUP_MAX_CHARS), /no-action packaging boilerplate/)
+
+  const boilerplate2 = 'If you use this tool to build or modify code, this is an internal packaging marker rather than a feature change - your workflow, project setup, and outputs will not be any different after updating.'
+  assert.throws(() => normalizeEli5(boilerplate2, ELI5_ROLLUP_MAX_CHARS), /no-action packaging boilerplate/)
+
+  const good = 'This release adds Fable 5.1 to the free trial tier, verifies release archives with sha256 checksums, and displays off-peak Freebucks pricing in the terminal model picker.'
+  assert.equal(normalizeEli5(good, ELI5_ROLLUP_MAX_CHARS), good)
+})
+
+test('buildEli5Prompt: roll-up mode commands description of what was added and forbids meta packaging boilerplate', () => {
+  const bump = {
+    sha: 'f61c4efa8a0d8fabb774756afdd610b7b7726010',
+    day: '2026-09-18',
+    version: '0.0.178',
+    category: 'CLI',
+    ai: { title: 'Freebuff CLI release 0.0.178' }
+  }
+  const relCtx = 'Updates included in this release (0.0.178 since 0.0.177):\n- 2026-09-18 Fable 5.1 replaces Fable 5 in Freebuff free trials\n- 2026-09-18 Release launcher enforces archive sha256 verification'
+  const prompt = buildEli5Prompt(bump, [], { releaseCtx: relCtx })
+
+  assert.ok(prompt.includes('RELEASE ROLL-UP summarizing the capabilities, models, security protections, and improvements'))
+  assert.ok(prompt.includes('Updates included in this release (0.0.178 since 0.0.177):'))
+  assert.ok(prompt.includes('DO NOT write meta-boilerplate saying "this is just a packaging update"'))
+  assert.ok(prompt.includes('Write 3-6 sentences of plain English that tell the user WHAT WAS ADDED, CHANGED, AND IMPROVED in this release.'))
+})
+
 
 
 
