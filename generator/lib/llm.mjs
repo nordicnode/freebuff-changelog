@@ -436,8 +436,9 @@ export const RELEASE_CTX_SUMMARY_CHARS = 300
 // Version of the roll-up ASK itself (wording of the prompt rule above), not of
 // the window: folded into contextualized eli5 keys only, so rewording the
 // instruction re-explains the ~715 bump rows without re-spending a cent on the
-// thousands of non-bump lines. Bump from 1 when the roll-up rule changes.
-export const RELEASE_ROLLUP_V = 2
+// thousands of non-bump lines. v3: roll-ups may run to 8 sentences under the
+// widened cap instead of being sheared at the old 800-char cutter.
+export const RELEASE_ROLLUP_V = 3
 
 // Which release line a bump row belongs to. Prefers the recorded track, then
 // the touched manifest path (file lists on old rows), then the version string
@@ -470,8 +471,16 @@ function releaseItemText (e, maxSummary = RELEASE_CTX_SUMMARY_CHARS) {
 // (excluding) the previous bump of the same track. Entries arrive
 // oldest-first (changelog.json order); position lookups come from a caller-
 // supplied index so this stays O(window) inside the enrichment loop.
+//
+// Alongside the item list, the walk accumulates the window's structured
+// catalog events (model add/remove, slash-command add/remove) and folds them
+// into a NET effect: the last event per name wins, so a model swapped out
+// again later the same window shows as removed even though an early item
+// announced its arrival. Per-commit summaries cannot see reversals -- each
+// was true the day it landed -- but the final state is what installing the
+// version gives the reader, so the net lines are authoritative in the prompt.
 export function collectReleaseContext (entries, bump, opts = {}) {
-  const out = { items: [], prevVersion: null, truncated: false }
+  const out = { items: [], prevVersion: null, truncated: false, net: { modelsIn: [], modelsOut: [], commandsIn: [], commandsOut: [] } }
   if (!Array.isArray(entries) || !bump) return out
   const maxItems = opts.maxItems ?? RELEASE_CTX_MAX_ITEMS
   const maxChars = opts.maxChars ?? RELEASE_CTX_MAX_CHARS
@@ -480,6 +489,7 @@ export function collectReleaseContext (entries, bump, opts = {}) {
   if (pos == null || pos <= 0) return out
   const line = trackOfBump(bump)
   const picked = []
+  const events = []
   let used = 0
   for (let i = pos - 1; i >= 0; i--) {
     const e = entries[i]
@@ -502,6 +512,20 @@ export function collectReleaseContext (entries, bump, opts = {}) {
     // Churn rows that slipped past noise (belt and suspenders): versionless,
     // meaningless, lockfile-only leftovers add tokens, never signal.
     if (!e.ai?.title && !e.ai?.summary && (e.files?.meaningful ?? 1) <= 0) continue
+    // Catalog events feed the net effect from every window entry, capped or
+    // not: the item list may truncate on huge gaps, the final state must not.
+    // A name in BOTH lists of one commit is a description-only edit (the
+    // analyzer's own net rule) and contributes nothing.
+    if (e.modelChanges) {
+      const adds = e.modelChanges.added || [], rems = e.modelChanges.removed || []
+      for (const m of adds) if (!rems.includes(m)) events.push({ kind: 'model', name: m, dir: 1 })
+      for (const m of rems) if (!adds.includes(m)) events.push({ kind: 'model', name: m, dir: -1 })
+    }
+    if (e.cmdChanges) {
+      const adds = e.cmdChanges.added || [], rems = e.cmdChanges.removed || []
+      for (const c of adds) if (!rems.includes(c)) events.push({ kind: 'cmd', name: c, dir: 1 })
+      for (const c of rems) if (!adds.includes(c)) events.push({ kind: 'cmd', name: c, dir: -1 })
+    }
     if (picked.length >= maxItems || used + text.length + 1 > maxChars) {
       out.truncated = true
       break
@@ -511,16 +535,42 @@ export function collectReleaseContext (entries, bump, opts = {}) {
   }
   // Chronological reads better in the prompt ("since X, the team shipped...").
   out.items = picked.reverse()
+  // Fold the catalog events into the net effect. The walk collected them
+  // newest-first, so reversing restores true chronology; the newest event per
+  // name wins, which keeps an early add that a later commit removed OUT of
+  // the release and keeps a model swapped-in twice counted by its final state.
+  const chrono = events.slice().reverse()
+  const finalDir = new Map()
+  for (const ev of chrono) finalDir.set(`${ev.kind}:${ev.name}`, ev.dir)
+  for (const ev of chrono) {
+    if (finalDir.get(`${ev.kind}:${ev.name}`) !== ev.dir) continue
+    const list = ev.kind === 'model'
+      ? (ev.dir > 0 ? out.net.modelsIn : out.net.modelsOut)
+      : (ev.dir > 0 ? out.net.commandsIn : out.net.commandsOut)
+    if (!list.includes(ev.name)) list.push(ev.name)
+  }
   return out
 }
 
-function formatReleaseContext (ctx, bump) {
-  if (!ctx || !ctx.items.length) return ''
+export function formatReleaseContext (ctx, bump) {
+  if (!ctx) return ''
   const v = bump?.version || bump?.freebuffVersion || ''
   const since = ctx.prevVersion ? ` since ${ctx.prevVersion}` : ''
   const head = `Updates included in this release${v ? ` (${v}${since})` : since}:`
-  const lines = ctx.items.map(it => `- ${it.text}`)
-  if (ctx.truncated) lines.push(`- ...[earlier changes truncated; newest ${ctx.items.length} shown]...`)
+  const lines = (ctx.items || []).map(it => `- ${it.text}`)
+  if (ctx.truncated) lines.push(`- ...[earlier changes truncated; newest ${(ctx.items || []).length} shown]...`)
+  const net = ctx.net || {}
+  const netLines = []
+  if (net.modelsIn.length || net.modelsOut.length) {
+    netLines.push(`- Free model picker, final state: ${net.modelsIn.length ? `added ${net.modelsIn.join(', ')}` : 'nothing added'}${net.modelsOut.length ? `; removed ${net.modelsOut.join(', ')}` : ''}.`)
+  }
+  if (net.commandsIn.length || net.commandsOut.length) {
+    netLines.push(`- Slash commands, final state: ${net.commandsIn.length ? `added ${net.commandsIn.join(', ')}` : 'nothing added'}${net.commandsOut.length ? `; removed ${net.commandsOut.join(', ')}` : ''}.`)
+  }
+  if (netLines.length) lines.push('Net effect by the time of this release (the final state; overrides any item above it contradicts):', ...netLines)
+  // An empty window (no items, no net effect) stays out of the prompt and out
+  // of the cache key: the honest line for it is housekeeping, not an empty list.
+  if (!lines.length) return ''
   return [head, ...lines].join('\n')
 }
 // ---------------------------------------------------------------------------
@@ -648,12 +698,12 @@ Rules:
 - Keep the audience the text gives, and keep it narrow. If the change is for one kind of customer, one plan, one region, or only after some step, name that group. Never widen it to "users", "everyone" or "customers" because that reads more naturally: a program for verified YC companies is not available to users.
 - Plain words, active voice. No "This change", "We are excited", marketing tone, or generic tautologies ("various bug fixes and improvements").
 - Jump straight into what happened. NEVER use conversational preambles, filler intros, or framing phrases like "In simple terms", "Basically", "To put it simply", "In plain English", "This commit", "This update", or "This pull request". Start directly with the concrete action or subject.
-- This row may be a version-label commit whose own diff is only packaging. When the evidence lists "Updates included in this release", THAT list is what this row is about: the "Technical summary" above describes only the label change itself and must not drive the line. Summarize what updating to this version gives the reader, drawn from that list, strongest user-visible item first. Only when the list is absent or holds no user-visible change, say honestly that this is a routine behind-the-scenes update that keeps installs current.
+- This row may be a version-label commit whose own diff is only packaging. When the evidence lists "Updates included in this release", THAT list is what this row is about: the "Technical summary" above describes only the label change itself and must not drive the line. Summarize what updating to this version gives the reader, drawn from that list, strongest user-visible item first. If the list ends with a "Net effect" line, that is the final state the reader ends up with: announce only what survives it -- something an item says was added but the net line says was later removed is NOT in this release. Only when the list is absent or holds no user-visible change, say honestly that this is a routine behind-the-scenes update that keeps installs current.
 - If the change is an internal refactor, test suite update, dependency bump, or maintenance change with no direct user-facing behavior, explain it honestly and plainly as behind-the-scenes housekeeping or stability maintenance. Do NOT invent or fabricate user-facing features, performance claims, or speed improvements.
 - If the change is small or internal, say so shortly. Do not inflate it.
 - Never address the reader as a developer.
 - Address the reader as "you", or name the group ("users", "subscribers"); never write "that person", "the viewer" or "that individual".
-- Stop after 2-4 sentences. Include an effective date only when the evidence supplies it and it clarifies the change; never recite day counts or archive calendars.
+- ${releaseCtx ? 'A release roll-up may run longer: stop after up to 8 sentences.' : 'Stop after 2-4 sentences.'} Include an effective date only when the evidence supplies it and it clarifies the change; never recite day counts or archive calendars.
 
 Reply with JSON only: {"eli5": "..."}`
 }
@@ -664,7 +714,27 @@ Reply with JSON only: {"eli5": "..."}`
 const ELI5_JUNK = /^(n\/?a|none|not applicable|no comment|unknown)[.!]?$/i
 const ELI5_REFUSAL = /^(i\s+ca(?:n'?t|nnot|'m unable)|we\s+ca(?:n'?t|nnot)|unable to|sorry|as an ai|i'?m (just|only|an)|no information)\b/i
 
-export function normalizeEli5 (raw) {
+// ELI5 length caps. The old single 800-char cap predates roll-ups: a release
+// window legitimately enumerates several shipped changes, so it piled against
+// the ceiling and the cutter sheared it mid-sentence. Normal rows keep the
+// original bound; roll-ups get a wider one -- and every cut lands on a sentence
+// end, never mid-word.
+export const ELI5_MAX_CHARS = 800
+export const ELI5_ROLLUP_MAX_CHARS = 2400
+
+// Cut to the last complete sentence that fits the budget. Scanning backwards
+// means an abbreviation earlier in the text ("3 a.m.") can never win the cut:
+// the nearest boundary to the cap is found first. A single sentence longer
+// than the whole budget is the only case that hard-cuts.
+function cutToSentence (s, maxChars) {
+  if (s.length <= maxChars) return s
+  for (let i = Math.min(maxChars, s.length - 1); i > 0; i--) {
+    if ('.!?'.includes(s[i]) && (i === s.length - 1 || /\s/.test(s[i + 1]))) return s.slice(0, i + 1).trim()
+  }
+  return `${s.slice(0, maxChars).trimEnd()}…`
+}
+
+export function normalizeEli5 (raw, maxChars = ELI5_MAX_CHARS) {
   // callLlm hands the validator the parsed object; a bare-string reply is also
   // accepted because small models sometimes ignore the JSON envelope.
   const value = raw && typeof raw === 'object' ? (raw.eli5 ?? raw.text ?? '') : raw
@@ -684,7 +754,7 @@ export function normalizeEli5 (raw) {
     throw new Error(`eli5 not an answer: ${JSON.stringify(s).slice(0, 60)}`)
   }
     if (!/[.!?]$/.test(s)) s += '.'
-    return truncateWords(s, 800)
+    return cutToSentence(s, maxChars)
 }
 
 export async function enrichEli5 (entries, dataDir, env = process.env, options = {}) {
@@ -800,7 +870,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
             siblings: (byDay.get(e.day) || []).filter(t => t !== e.ai.title).slice(0, 6),
             diffBytes,
             releaseCtx: relText
-          }), env, 1, normalizeEli5)
+          }), env, 1, (out) => normalizeEli5(out, relText ? ELI5_ROLLUP_MAX_CHARS : ELI5_MAX_CHARS))
         gatewayFails = 0
         cache[key] = {
           model: env.LLM_MODEL || 'gpt-4o-mini',

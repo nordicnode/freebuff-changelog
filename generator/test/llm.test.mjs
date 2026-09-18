@@ -603,6 +603,50 @@ test('release context: skips noise, caps items and chars, prefers ai text', asyn
   assert.equal(tiny.truncated, true)
 })
 
+test('release context: net effect folds catalog events so reversals lose', async () => {
+  const { collectReleaseContext, formatReleaseContext, RELEASE_ROLLUP_V } = await import('../lib/llm.mjs')
+  const mk = (sha, over = {}) => eli5Entry({
+    sha, date: '2026-09-17T10:00:00Z', day: '2026-09-17', significance: 'minor',
+    stats: { additions: 5, deletions: 5 },
+    files: { total: 1, meaningful: 1, modified: ['cli/src/y.ts'] },
+    ai: { model: 'm', v: PROMPT_V, title: `Change ${sha.slice(0, 4)}`, summary: `Change ${sha.slice(0, 4)} landed.` },
+    ...over
+  })
+  const bump = eli5Entry({
+    sha: 'f'.repeat(40), version: '1.0.689', date: '2026-09-17T23:00:00Z', day: '2026-09-17',
+    stats: { additions: 1, deletions: 1 }, files: { total: 2, meaningful: 1, modified: ['cli/release/package.json'] },
+    ai: { model: 'm', v: PROMPT_V, title: 'CLI 1.0.689', summary: 'Manifest bumped.' }
+  })
+  const addSpark13 = mk('c'.repeat(40), {
+    modelChanges: { added: ['Muse Spark 1.3'], removed: [] }
+  })
+  const swapToSpark12 = mk('d'.repeat(40), {
+    modelChanges: { added: ['Muse Spark 1.2'], removed: ['Muse Spark 1.3'] }
+  })
+  const ctx = collectReleaseContext([addSpark13, swapToSpark12, bump], bump)
+  // The 1.3 add lost to the later 1.2 swap: net is 1.2 in, 1.3 out.
+  assert.deepEqual(ctx.net.modelsIn, ['Muse Spark 1.2'])
+  assert.deepEqual(ctx.net.modelsOut, ['Muse Spark 1.3'])
+  // Both item texts still sit in the prompt (context, not truth), but the net
+  // lines are present and authoritative, and the ask version rides the key.
+  const rel = formatReleaseContext(ctx, bump)
+  assert.match(rel, /Muse Spark 1\.3/)
+  assert.match(rel, /final state.*added Muse Spark 1\.2; removed Muse Spark 1\.3/)
+  assert.match(rel, /overrides any item above it contradicts/)
+  const p = buildEli5Prompt(bump, [], { releaseCtx: rel })
+  assert.match(p, /announce only what survives it/)
+  assert.match(p, /A release roll-up may run longer/)
+  assert.ok(RELEASE_ROLLUP_V >= 3, 'changed roll-up ask implies a version bump')
+  // A window with no catalog events formats exactly as before the net lines.
+  const plain = collectReleaseContext([mk('c'.repeat(40)), bump], bump)
+  assert.equal(plain.net.modelsIn.length + plain.net.modelsOut.length, 0)
+  assert.doesNotMatch(formatReleaseContext(plain, bump), /Net effect/)
+  // Same-window add+remove cancels to nothing (mirrors the analyzer's net rule).
+  const churned = collectReleaseContext([mk('e'.repeat(40), { modelChanges: { added: ['X'], removed: ['X'] } }), bump], bump)
+  assert.deepEqual(churned.net.modelsIn, [])
+  assert.deepEqual(churned.net.modelsOut, [])
+})
+
 test('release context: empty window yields no prompt section and stable keys', async () => {
   const { collectReleaseContext, buildEli5Prompt, eli5Key, eli5Done } = await import('../lib/llm.mjs')
   const bump = eli5Entry({
