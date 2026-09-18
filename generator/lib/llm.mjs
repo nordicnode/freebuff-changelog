@@ -148,12 +148,11 @@ export function buildPrompt (entry, patch, ctx = {}) {
     '- State WHY it happened if grounded in notes/diff/PR context (root cause, upstream failure, deprecation). If reason is not visible, describe the mechanism — never invent motives.',
     '- Ground the change in the Freebuff Monorepo Architecture below. Name the affected package or surface naturally without repetitive template phrases like "Scope limited to...".',
     '- DETAIL: include one concrete technical fact (migration behavior, trait change, alias, flag, or constraint). Never paste raw diff lines. Never write "Nothing to do" or no-action boilerplate.',
-    '- If this change is a breaking change, deprecation, or requires developer action (e.g. migrating preferences, setting an env var), describe it in "actionRequired". Otherwise set "actionRequired" to null.',
     '',
     ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP,
     '',
     'Output format: First, identify and cite the concrete evidence in the diff (function name, file, or hunk) in "evidence", then produce title and summary.',
-    `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, flag, or diff hunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "${entry.significance || 'minor'}", "actionRequired": null | "<action description>"}.`,
+    `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, flag, or diff hunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "${entry.significance || 'minor'}"}.`,
     `Significance (deterministic default "${entry.significance || 'minor'}"): keep it unless the diff clearly contradicts it.`,
     'major = new feature, model added/removed, security, breaking. notable = user-visible behavior/UI change, new file, API change. minor = internal, refactor, types, comments, deps.',
     '',
@@ -339,7 +338,6 @@ async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
 // needed") is rejected for one repair pass. Significance falls back to
 // the deterministic default.
 const NOACTION_RE = /nothing to do|no action (is )?needed|no changes? required|you don'?t need to do anything/i
-const NOACTION_ACTION_RE = /^(?:none|n\/?a|no|null|no action(?: required| needed)?|nothing(?: to do)?)[.!]?$/i
 const CAMEL_IDENT_RE = /\b(?!(?:iOS|macOS|gRPC|eBay)\b)[a-z]+[A-Z][a-zA-Z0-9]*\b/
 const SNAKE_IDENT_RE = /\b[a-z0-9]+_[a-z0-9_]+\b/
 
@@ -363,18 +361,13 @@ export function validateLlmOut (out, fallbackSig = 'minor') {
   }
   const summary = cleanText(rawSummary, 2000, true)
   const significance = ['minor', 'notable', 'major'].includes(out.significance) ? out.significance : fallbackSig
-  const rawAction = out.actionRequired && typeof out.actionRequired === 'string' ? out.actionRequired.trim() : ''
-  const actionRequired = rawAction && !NOACTION_RE.test(rawAction) && !NOACTION_ACTION_RE.test(rawAction)
-    ? cleanText(rawAction, 2000, true)
-    : null
   const rawEvidence = out.evidence && typeof out.evidence === 'string' ? out.evidence.trim() : ''
   const evidence = rawEvidence ? cleanText(rawEvidence, 1500, true) : ''
   return {
     title,
     summary,
     significance,
-    ...(evidence ? { evidence } : {}),
-    ...(actionRequired ? { actionRequired } : {})
+    ...(evidence ? { evidence } : {})
   }
 }
 
@@ -433,9 +426,8 @@ function releaseItemText (e, maxSummary = RELEASE_CTX_SUMMARY_CHARS) {
   const sig = e?.ai?.significance || e?.significance || ''
   const head = `${(e?.date || '').slice(0, 10)} ${title}`.trim()
   const tail = summary && summary !== title ? `: ${truncateWords(summary, maxSummary)}` : ''
-  const action = e?.ai?.actionRequired ? ` (Action: ${e.ai.actionRequired})` : ''
   const tag = sig && sig !== 'noise' ? ` [${sig}]` : ''
-  return `${head}${tail}${action}${tag}`.trim()
+  return `${head}${tail}${tag}`.trim()
 }
 
 export function collectReleaseContext (entries, bump, opts = {}) {
@@ -676,7 +668,6 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         title: cache[key].title,
         summary: cache[key].summary,
         significance: cache[key].significance,
-        ...(cache[key].actionRequired ? { actionRequired: cache[key].actionRequired } : {}),
         ...(cache[key].evidence ? { evidence: cache[key].evidence } : {}),
         at: cache[key].at
       }
@@ -709,7 +700,6 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           title: clean.title,
           summary: clean.summary,
           significance: clean.significance,
-          ...(clean.actionRequired ? { actionRequired: clean.actionRequired } : {}),
           ...(clean.evidence ? { evidence: clean.evidence } : {}),
           at: new Date().toISOString()
         }

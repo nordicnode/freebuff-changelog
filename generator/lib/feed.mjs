@@ -258,17 +258,14 @@ export function feedItem (siteUrl, e, titleOf, storyNotes = []) {
   const title = `[${e.day}] ${titleOf(e)}`
   const summary = String(e.ai?.summary || e.summary || '').replace(/[*`#]/g, '').trim()
   const eli5 = e.eli5?.text ? String(e.eli5.text).replace(/[*`#]/g, '').trim() : ''
-  const actionRequired = e.ai?.actionRequired ? String(e.ai.actionRequired).replace(/[*`#]/g, '').trim() : ''
 
   // Description is optimized for Discord bots (embed description or message)
   // as well as standard RSS readers:
   // - Never duplicates the title at the top of the description.
-  // - Includes action required warning when migrations or breaking changes exist.
   // - Includes plain-English summary as a Discord-friendly blockquote when present.
   // - Full technical summary without harsh 300-char truncation.
   // - Clean bulleted highlights for quick scanning.
   const descParts = storyNotes.map(n => `> **Related access context**\n> ${n.text}`)
-  if (actionRequired) descParts.push(`⚠️ **Action Required**: ${actionRequired}`)
   if (eli5) descParts.push(`> **In plain English**\n> ${eli5}`)
   if (summary) descParts.push(summary)
   if (e.facts?.length) {
@@ -291,7 +288,6 @@ export function feedItem (siteUrl, e, titleOf, storyNotes = []) {
     : ''
   const content = [
     ...storyNotes.map(n => `<p><b>Related access context:</b> ${esc(n.text)} <a href="${siteUrl}/day/${n.day}/#${n.anchor}">Related entry</a></p>`),
-    actionRequired ? `<p><b>⚠️ Action Required:</b> ${esc(actionRequired)}</p>` : '',
     eli5 ? `<blockquote><p><b>In plain English:</b> ${esc(eli5)}</p></blockquote>` : '',
     summary ? `<p>${esc(summary)}</p>` : '',
     modelChangesHtml,
@@ -342,11 +338,9 @@ export function jsonItem (siteUrl, e, titleOf, storyNotes = []) {
   const title = titleOf(e)
   const summary = String(e.ai?.summary || e.summary || '').replace(/[*`#]/g, '').trim()
   const eli5 = e.eli5?.text ? String(e.eli5.text).replace(/[*`#]/g, '').trim() : ''
-  const actionRequired = e.ai?.actionRequired ? String(e.ai.actionRequired).replace(/[*`#]/g, '').trim() : ''
   const facts = (e.facts || []).slice(0, 5).map(f => `<li>${esc(String(f)).slice(0, 400)}</li>`).join('')
   const html = [
     ...storyNotes.map(n => `<p><b>Related access context:</b> ${esc(n.text)} <a href="${siteUrl}/day/${n.day}/#${n.anchor}">Related entry</a></p>`),
-    actionRequired ? `<p><b>⚠️ Action Required:</b> ${esc(actionRequired)}</p>` : '',
     eli5 ? `<blockquote><p><b>In plain English:</b> ${esc(eli5)}</p></blockquote>` : '',
     summary ? `<p>${esc(summary)}</p>` : '',
     facts ? `<ul>${facts}</ul>` : ''
@@ -358,7 +352,6 @@ export function jsonItem (siteUrl, e, titleOf, storyNotes = []) {
     title: `[${e.day}] ${title}`,
     summary: [
       ...storyNotes.map(n => `[Related access context] ${n.text}`),
-      actionRequired ? `[Action Required] ${actionRequired}` : '',
       eli5 ? `[In plain English] ${eli5} · ${summary}` : summary
     ].filter(Boolean).join(' · '),
     content_html: html,

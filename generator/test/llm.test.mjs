@@ -821,19 +821,18 @@ test('validateLlmOut: rejects raw glued identifiers in the title', () => {
   assert.equal(out.title, 'Ad Reason Redaction v3 adds semantic refusal codes')
 })
 
-test('validateLlmOut: extracts and validates actionRequired', () => {
+test('validateLlmOut: ignores actionRequired from LLM output', () => {
   const withAction = validateLlmOut({
     title: 'Breaking API migration',
     summary: 'The old endpoint has been deprecated.',
     actionRequired: 'Update your config key to use the new endpoint name.',
     significance: 'major'
   }, 'major')
-  assert.equal(withAction.actionRequired, 'Update your config key to use the new endpoint name.')
+  assert.equal(withAction.actionRequired, undefined)
 
   const withoutAction = validateLlmOut({
     title: 'Safe update',
     summary: 'Internal performance improvements.',
-    actionRequired: 'None',
     significance: 'minor'
   }, 'minor')
   assert.equal(withoutAction.actionRequired, undefined)
@@ -891,7 +890,7 @@ test('buildPrompt: tells the model to translate identifiers and includes guardia
   assert.match(p, /glued identifier/)
   assert.match(p, /Commit nature: test-only/i)
   assert.match(p, /Test & Documentation Guardian/i)
-  assert.match(p, /actionRequired/)
+  assert.doesNotMatch(p, /actionRequired/)
 })
 
 test('enrichEli5: writes the line, caches it by the summary, asks once', async (t) => {
@@ -1028,12 +1027,10 @@ test('validateLlmOut: extracts and validates evidence field', () => {
     evidence: 'Modified handleStream in packages/agent-runtime/src/stream.ts hunk @@ -10,5 +10,12 @@',
     title: 'Stream response chunking',
     summary: 'Added streaming chunk buffers to reduce latency on slow connections. Preserves backpressure.',
-    significance: 'notable',
-    actionRequired: 'Update SDK client to v1.2'
+    significance: 'notable'
   })
   assert.equal(out.title, 'Stream response chunking')
   assert.match(out.evidence, /handleStream in packages\/agent-runtime/)
-  assert.equal(out.actionRequired, 'Update SDK client to v1.2')
   assert.equal(out.significance, 'notable')
 })
 

@@ -457,7 +457,6 @@ test('buildSite generates valid static site output', async () => {
     assert.match(aboutHtml, /HOW IT WORKS/)
     assert.match(aboutHtml, /Deterministic first/)
     assert.match(aboutHtml, /ACCURACY &amp; ANALYSIS PIPELINE/)
-    assert.match(aboutHtml, /ACTION REQUIRED/)
     assert.match(aboutHtml, /ELI5 plain-English/)
     assert.match(aboutHtml, /LIMITS/)
     assert.match(aboutHtml, /Model Catalog/)
@@ -1029,7 +1028,7 @@ test('discordText: plainOnly omits codeblock diffs and produces clean plain anno
   assert.ok(plainFallback.includes('Swaps muse\\_spark\\_1\\_2'))
 })
 
-test('actionRequired: surfaces on entryCard, discordText, and feed items', () => {
+test('actionRequired: is omitted from entryCard, discordText, and feed items', () => {
   const sample = {
     kind: 'sync',
     sha: '1234567890abcdef1234567890abcdef12345678',
@@ -1053,23 +1052,21 @@ test('actionRequired: surfaces on entryCard, discordText, and feed items', () =>
 
   // 1. entryCard
   const cardHtml = entryCard(sample)
-  assert.match(cardHtml, /class="action-required"/)
-  assert.match(cardHtml, /class="action-label">ACTION REQUIRED<\/span>/)
-  assert.match(cardHtml, /Update ~\/\.freebuff\/models\.json to use the model_ids array format\./)
+  assert.doesNotMatch(cardHtml, /class="action-required"/)
+  assert.doesNotMatch(cardHtml, /ACTION REQUIRED/)
 
   // 2. discordText
   const dc = discordText(sample)
-  assert.match(dc, /⚠️ \*\*Action Required\*\*: Update ~\/\.freebuff\/models\.json/)
+  assert.doesNotMatch(dc, /Action Required/)
 
   // 3. feedItem (RSS)
   const itemXml = feedItem('https://freebuff-changelog.nordicnode.workers.dev', sample, (e) => e.title)
-  assert.match(itemXml, /⚠️ \*\*Action Required\*\*: Update ~\/\.freebuff\/models\.json/)
-  assert.match(itemXml, /<b>⚠️ Action Required:<\/b> Update ~\/\.freebuff\/models\.json/)
+  assert.doesNotMatch(itemXml, /Action Required/)
 
   // 4. jsonItem
   const jItem = jsonItem('https://freebuff-changelog.nordicnode.workers.dev', sample, (e) => e.title)
-  assert.match(jItem.summary, /\[Action Required\] Update ~\/\.freebuff\/models\.json/)
-  assert.match(jItem.content_html, /<b>⚠️ Action Required:<\/b> Update ~\/\.freebuff\/models\.json/)
+  assert.doesNotMatch(jItem.summary, /Action Required/)
+  assert.doesNotMatch(jItem.content_html, /Action Required/)
 })
 
 test('in-flight page is honest about a short or stale PR list', async (t) => {
