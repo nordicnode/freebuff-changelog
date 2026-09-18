@@ -803,7 +803,7 @@ function changeRow (e) {
 </div>`
 }
 
-function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) {
+export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) {
   const time = e.date.slice(11, 16)
   const anchor = e.sha.slice(0, 12)
   const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
@@ -846,6 +846,7 @@ function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) {
 <div class="entry-body">
 ${modelDiffLine(e)}
 <div class="summary">${miniMd(e.ai?.summary || e.summary)}</div>
+${e.ai?.actionRequired ? `<div class="action-required"><span class="action-label">ACTION REQUIRED</span>${esc(e.ai.actionRequired)}</div>` : ''}
 ${e.eli5?.text ? `<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH</span>${esc(e.eli5.text)}</p>` : ''}
 ${e.facts?.length ? `<ul class="facts">${e.facts.slice(0, 3).map(f => `<li>${miniMd(f)}</li>`).join('')}</ul>` : ''}
 ${fileChips(e)}
@@ -967,6 +968,9 @@ export function discordText (e, opts = {}) {
   const head = ['**FREEBUFF**', `\`${e.category || 'Change'}\``, dateStr]
   if (sig && sig !== 'minor') head.push(`**${sig.toUpperCase()}**`)
   const parts = [head.join(' · '), `### ${dcEsc(title)}`]
+  if (e.ai?.actionRequired) {
+    parts.push(`⚠️ **Action Required**: ${dcEsc(e.ai.actionRequired)}`)
+  }
   // Every line of a quote needs its own `>`: a wrapped continuation is fine, but a
   // hard newline without it would drop out of the quote and lose the rule.
   if (opts.storyNotes?.length) {

@@ -4,7 +4,8 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildSite, modelTimeline, modelSlug, scoreHit, discordText, renderBadgeSvg, generateReleaseNotesMarkdown } from '../lib/site.mjs'
+import { buildSite, modelTimeline, modelSlug, scoreHit, discordText, renderBadgeSvg, generateReleaseNotesMarkdown, entryCard } from '../lib/site.mjs'
+import { feedItem, jsonItem } from '../lib/feed.mjs'
 import { syncStaleMs } from '../lib/sync.mjs'
 
 // _headers rules cannot override each other on Cloudflare: every rule whose
@@ -1021,6 +1022,49 @@ test('discordText: plainOnly omits codeblock diffs and produces clean plain anno
   const plainFallback = discordText(noEli5, { plainOnly: true })
   assert.ok(!plainFallback.includes('```'))
   assert.ok(plainFallback.includes('Swaps muse\\_spark\\_1\\_2'))
+})
+
+test('actionRequired: surfaces on entryCard, discordText, and feed items', () => {
+  const sample = {
+    kind: 'sync',
+    sha: '1234567890abcdef1234567890abcdef12345678',
+    date: '2026-09-14T12:00:00Z',
+    day: '2026-09-14',
+    category: 'CLI',
+    significance: 'major',
+    title: 'Model config syntax updated',
+    summary: 'The model configuration schema has been migrated.',
+    stats: { additions: 15, deletions: 5 },
+    files: { total: 2, meaningful: 2, added: [], modified: ['cli/src/config.ts'], removed: [] },
+    ai: {
+      title: 'Model config syntax updated',
+      summary: 'The model configuration schema has been migrated to v2.',
+      actionRequired: 'Update ~/.freebuff/models.json to use the model_ids array format.'
+    },
+    eli5: {
+      text: 'You need to update your models configuration file because the layout changed.'
+    }
+  }
+
+  // 1. entryCard
+  const cardHtml = entryCard(sample)
+  assert.match(cardHtml, /class="action-required"/)
+  assert.match(cardHtml, /class="action-label">ACTION REQUIRED<\/span>/)
+  assert.match(cardHtml, /Update ~\/\.freebuff\/models\.json to use the model_ids array format\./)
+
+  // 2. discordText
+  const dc = discordText(sample)
+  assert.match(dc, /⚠️ \*\*Action Required\*\*: Update ~\/\.freebuff\/models\.json/)
+
+  // 3. feedItem (RSS)
+  const itemXml = feedItem('https://freebuff-changelog.nordicnode.workers.dev', sample, (e) => e.title)
+  assert.match(itemXml, /⚠️ \*\*Action Required\*\*: Update ~\/\.freebuff\/models\.json/)
+  assert.match(itemXml, /<b>⚠️ Action Required:<\/b> Update ~\/\.freebuff\/models\.json/)
+
+  // 4. jsonItem
+  const jItem = jsonItem('https://freebuff-changelog.nordicnode.workers.dev', sample, (e) => e.title)
+  assert.match(jItem.summary, /\[Action Required\] Update ~\/\.freebuff\/models\.json/)
+  assert.match(jItem.content_html, /<b>⚠️ Action Required:<\/b> Update ~\/\.freebuff\/models\.json/)
 })
 
 test('in-flight page is honest about a short or stale PR list', async (t) => {

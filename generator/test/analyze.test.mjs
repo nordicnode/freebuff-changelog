@@ -7,7 +7,7 @@ import {
   commandIdsFromRegistry,
   areaOf, isNoiseFile, deterministicSummary, entryTitle, churnLabel, testLabel, sourceRef, isSyncCommit,
   extractCommentFacts, extractCleanDiff, extractRawDiff, EMPTY_TREE, parseMarkdownTables, catalogFromReadme,
-  diffCatalogs
+  diffCatalogs, commitNatureOf
 } from '../lib/analyze.mjs'
 import { toUtc, ymd } from '../lib/util.mjs'
 
@@ -348,6 +348,15 @@ test('toUtc: offsets collapse to Z, UTC and junk pass through', () => {
   assert.equal(ymd(toUtc('2025-11-24T17:25:50-08:00')), '2025-11-25', 'the day key follows UTC, not the author')
   assert.equal(toUtc(''), '')
   assert.equal(toUtc('not a date'), 'not a date')
+})
+
+test('commitNatureOf classifies test-only, docs-only, config-only, churn, release-bump, and production', () => {
+  assert.equal(commitNatureOf({ noise: true }), 'churn')
+  assert.equal(commitNatureOf({ version: '1.0.688', files: { modified: ['cli/package.json'] } }), 'release-bump')
+  assert.equal(commitNatureOf({ files: { added: ['test/unit.test.ts', 'mock/data.json'] } }), 'test-only')
+  assert.equal(commitNatureOf({ files: { modified: ['docs/guide.md', 'README.md'] } }), 'docs-only')
+  assert.equal(commitNatureOf({ files: { modified: ['.eslintrc.json', 'tsconfig.json'] } }), 'config-only')
+  assert.equal(commitNatureOf({ files: { modified: ['cli/src/main.ts', 'test/main.test.ts'] } }), 'production')
 })
 
 

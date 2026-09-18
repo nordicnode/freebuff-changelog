@@ -350,6 +350,30 @@ export function isBumpEntry (e) {
   return mods.length === 1 && (mods[0] in VERSION_TRACKS)
 }
 
+export const TEST_RE = /(^|\/)(__tests__|tests?|fixtures?|mocks?)\/|\.(test|spec)\.[jt]sx?$/
+
+export function commitNatureOf (e) {
+  if (!e) return 'production'
+  if (e.testOnly || e.files?.testOnly) return 'test-only'
+  if (e.noise || e.churn) return 'churn'
+  if (isBumpEntry(e)) return 'release-bump'
+  const files = e.files
+  if (files) {
+    const active = [
+      ...(files.added || []),
+      ...(files.modified || []),
+      ...(files.removed || []),
+      ...(files.renamed ? files.renamed.map(r => r.to || r.path) : [])
+    ]
+    if (active.length > 0) {
+      if (active.every(p => TEST_RE.test(p))) return 'test-only'
+      if (active.every(p => p.startsWith('docs/') || p.endsWith('.md'))) return 'docs-only'
+      if (active.every(p => p.endsWith('.json') || p.endsWith('.yaml') || p.endsWith('.yml') || p.endsWith('.toml'))) return 'config-only'
+    }
+  }
+  return 'production'
+}
+
 // Slash-commands registry: cli/src/data/slash-commands.ts holds ALL_SLASH_COMMANDS
 // with string `id:` fields. Snapshot both revs and set-diff the ids: renames
 // (same block, new id) surface as add+remove, description edits as nothing.
@@ -413,8 +437,6 @@ export function isNoiseFile (p) {
     /\.svg$/.test(p)
   )
 }
-
-export const TEST_RE = /(^|\/)(__tests__|tests?)\/|\.(test|spec)\.[jt]sx?$/
 
 // ---------------------------------------------------------------------------
 // 4. Entry builder for one sync commit
@@ -515,6 +537,7 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
     stats: { additions, deletions },
     facts: facts.slice(0, 6)
   }
+  entry.commitNature = commitNatureOf(entry)
   entry.title = entryTitle(entry)
   entry.summary = deterministicSummary(entry)
   entry.tags = tagsFor(entry)
@@ -754,6 +777,7 @@ export async function analyzeCommunityCommit (repoDir, commit, prevSha, repoMeta
     stats,
     facts: []
   }
+  entry.commitNature = commitNatureOf(entry)
   entry.summary = commit.subject
   entry.title = entryTitle(entry)
   entry.tags = tagsFor(entry)

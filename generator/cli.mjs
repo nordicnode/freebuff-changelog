@@ -12,7 +12,7 @@ import { git, readJson, writeJson, writeText, log, ymd, toUtc, normalizeDate, pr
 import { capturePendingWrites, persistMerged, mergeOpenPrs } from './lib/mergedata.mjs'
 import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
-  extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE } from './lib/analyze.mjs'
+  extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf } from './lib/analyze.mjs'
 import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, llmConfigured, PROMPT_V } from './lib/llm.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
@@ -418,6 +418,7 @@ function decorate (e) {
     return e
   }
   e.testOnly = testOnly || undefined
+  e.commitNature = commitNatureOf(e)
   if (e.modelChanges) e.category = 'Model Catalog'
   else if (e.cmdChanges) e.category = 'Commands'
   else if (e.areas.includes('CLI')) e.category = 'CLI'

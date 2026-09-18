@@ -110,7 +110,7 @@ test('buildPrompt: includes diff, date, model changes, files, stats', () => {
   assert.match(prompt, /technical prose, backticks allowed/)
   assert.match(prompt, /Never write "Nothing to do"/)
   assert.match(prompt, /GOOD \(technical, precise/)
-  assert.match(prompt, /Files: README\.md/)
+  assert.match(prompt, /Modified files: README\.md/)
   assert.match(prompt, /Stats: \+5 \/ -5/)
 })
 
@@ -815,8 +815,28 @@ test('normalizeEli5: unwraps the reply, strips the echoed label, keeps it honest
 test('validateLlmOut: rejects raw glued identifiers in the title', () => {
   assert.throws(() => validateLlmOut({ title: 'advertiserreasonredaction202609v3 adds semantic refusal codes', summary: 'Did stuff.' }, 'minor'), /raw identifier/)
   assert.throws(() => validateLlmOut({ title: 'Add searchmanifoldmarkets tool for queries', summary: 'Did stuff.' }, 'minor'), /raw identifier/)
+  assert.throws(() => validateLlmOut({ title: 'Add useSuggestionEngine hook for completions', summary: 'Did stuff.' }, 'minor'), /raw identifier/)
+  assert.throws(() => validateLlmOut({ title: 'Handle stop_response event from server', summary: 'Did stuff.' }, 'minor'), /raw identifier/)
   const out = validateLlmOut({ title: 'Ad Reason Redaction v3 adds semantic refusal codes', summary: 'Did stuff.' }, 'minor')
   assert.equal(out.title, 'Ad Reason Redaction v3 adds semantic refusal codes')
+})
+
+test('validateLlmOut: extracts and validates actionRequired', () => {
+  const withAction = validateLlmOut({
+    title: 'Breaking API migration',
+    summary: 'The old endpoint has been deprecated.',
+    actionRequired: 'Update your config key to use the new endpoint name.',
+    significance: 'major'
+  }, 'major')
+  assert.equal(withAction.actionRequired, 'Update your config key to use the new endpoint name.')
+
+  const withoutAction = validateLlmOut({
+    title: 'Safe update',
+    summary: 'Internal performance improvements.',
+    actionRequired: 'None',
+    significance: 'minor'
+  }, 'minor')
+  assert.equal(withoutAction.actionRequired, undefined)
 })
 
 test('normalizeEli5: points robotic pronouns at the reader and cuts archive bleed', () => {
@@ -828,9 +848,32 @@ test('normalizeEli5: points robotic pronouns at the reader and cuts archive blee
   assert.ok(bled.endsWith('.'), 'cut end repunctuated')
 })
 
-test('buildEli5Prompt: addresses you, leads with experience, stops at sentences', () => {
-  const p = buildEli5Prompt(eli5Entry(), [], {})
-  assert.match(p, /what you would notice/)
+test('normalizeEli5: strips prompt echo openings and filler intros', () => {
+  assert.equal(
+    normalizeEli5({ eli5: 'If you looked at the screen, models now load faster.' }),
+    'Models now load faster.'
+  )
+  assert.equal(
+    normalizeEli5({ eli5: 'What you would notice is the model picker shows more options.' }),
+    'The model picker shows more options.'
+  )
+  assert.equal(
+    normalizeEli5({ eli5: 'Behind the scenes, internal fixtures were cleaned up.' }),
+    'Internal fixtures were cleaned up.'
+  )
+  assert.equal(
+    normalizeEli5({ eli5: 'In simple terms: the app no longer freezes during sync.' }),
+    'The app no longer freezes during sync.'
+  )
+})
+
+test('buildEli5Prompt: 3-pillar framework, guardian rules, addresses you', () => {
+  const p = buildEli5Prompt(eli5Entry({ commitNature: 'test-only' }), [], {})
+  assert.match(p, /three pillars/i)
+  assert.match(p, /Core Change/i)
+  assert.match(p, /Everyday Impact/i)
+  assert.match(p, /Test & Documentation Guardian/i)
+  assert.match(p, /Commit nature: test-only/i)
   assert.match(p, /never write "that person"/)
   assert.match(p, /NEVER use conversational preambles/)
   assert.match(p, /An access change recorded in the evidence is a change/)
@@ -838,9 +881,17 @@ test('buildEli5Prompt: addresses you, leads with experience, stops at sentences'
   assert.match(p, /Include an effective date only when the evidence supplies it/)
 })
 
-test('buildPrompt: tells the model to translate identifiers', () => {
-  const p = buildPrompt({ date: '2026-09-16T00:00:00Z', areas: ['CLI'], significance: 'minor' }, 'diff')
+test('buildPrompt: tells the model to translate identifiers and includes guardian rules', () => {
+  const p = buildPrompt({
+    date: '2026-09-16T00:00:00Z',
+    areas: ['Tests'],
+    commitNature: 'test-only',
+    significance: 'minor'
+  }, 'diff')
   assert.match(p, /glued identifier/)
+  assert.match(p, /Commit nature: test-only/i)
+  assert.match(p, /Test & Documentation Guardian/i)
+  assert.match(p, /actionRequired/)
 })
 
 test('enrichEli5: writes the line, caches it by the summary, asks once', async (t) => {

@@ -25,14 +25,14 @@
 //   options.priorityShas       SHAs to summarize ahead of the backlog
 import { readJson, writeJson, log, pool, shortHash, eli5Source } from './util.mjs'
 import { mergeAiCache } from './mergedata.mjs'
-import { extractCommentFacts, isBumpEntry, versionTrackOf, VERSION_TRACKS } from './analyze.mjs'
+import { extractCommentFacts, isBumpEntry, versionTrackOf, VERSION_TRACKS, commitNatureOf } from './analyze.mjs'
 
 export function llmConfigured (env = process.env) {
   return env.CHANGELOG_LLM === '1' && !!env.LLM_API_KEY
 }
 
 // Bump when buildPrompt changes so stale entries re-summarize exactly once.
-export const PROMPT_V = 5
+export const PROMPT_V = 6
 
 export function firstSentence (s) {
   const m = String(s || '').trim().match(/^[^.?!]+[.?!]/)
@@ -43,8 +43,9 @@ function patchHash (patch) {
   return shortHash(patch)
 }
 
-export function cacheKey (sha, patch) {
-  return `${sha}:v${PROMPT_V}:${patchHash(patch)}`
+export function cacheKey (sha, patch, releaseCtx = '', rollupV = 0) {
+  const extra = releaseCtx ? `:${shortHash(releaseCtx)}${rollupV ? `-r${rollupV}` : ''}` : ''
+  return `${sha}:v${PROMPT_V}:${patchHash(patch)}${extra}`
 }
 
 // Word-boundary cut: never slice mid-word or mid-token.
@@ -75,17 +76,19 @@ export function budgetPatch (patch, maxBytes = 250000, perFile = 60000) {
   return out.join('')
 }
 
-export function buildPrompt (entry, patch) {
+export function buildPrompt (entry, patch, ctx = {}) {
+  const nature = entry.commitNature || commitNatureOf(entry)
   const lines = [
     'You write changelog entries for Freebuff, a free AI coding agent. Your reader is a TECHNICAL user: a developer who uses Freebuff daily and reads diffs.',
     'Rules: use ONLY facts from the diff and the analysis notes below. Never invent file names, features, or versions.',
     'Title: plain text, max 70 chars, no backticks, no markdown, no trailing period. Lead with the concrete change (model name, command with leading slash, version, subsystem). Translate code identifiers into plain words (split snake_case/camelCase/CONSTANT_CASE, drop glued version suffixes); never emit a raw glued identifier as a title word.',
-    'Summary shape (2-4 sentences, technical prose, backticks allowed for identifiers):',
-    '1. WHAT changed, precisely: names, versions, commands, files. Lead with the user-visible change, then the mechanism.',
-    '2. WHY it happened, grounded in the notes/diff (root cause, upstream failure, deprecation). If the reason is not visible, describe the mechanism instead — never invent motives.',
-    '3. SCOPE: which packages/surfaces carry the change (core constants, CLI picker, Web/Desktop, docs). Name the files that matter.',
-    '4. DETAIL: one concrete technical fact — migration behavior, trait/column change, alias, flag, or follow-up constraint. Never paste raw diff lines. Never write "Nothing to do" or any no-action boilerplate: if no action is needed, say nothing about action at all.',
-    `Output a JSON object: {"title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "${entry.significance || 'minor'}"}.`,
+    'Summary guidelines (2-4 sentences of fluid technical prose, backticks allowed for identifiers):',
+    '- State WHAT changed and the mechanism precisely: names, versions, commands, flags, files. Lead with the functional change, then the technical mechanism.',
+    '- State WHY it happened if grounded in notes/diff (root cause, upstream failure, deprecation). If reason is not visible, describe the mechanism — never invent motives.',
+    '- Weave scope and touched packages (CLI, SDK, Common, Web, etc.) naturally into the explanation. Do NOT write repetitive template phrases like "Scope limited to...".',
+    '- DETAIL: include one concrete technical fact (migration behavior, trait change, alias, flag, or constraint). Never paste raw diff lines. Never write "Nothing to do" or no-action boilerplate.',
+    '- If this change is a breaking change, deprecation, or requires developer action (e.g. migrating preferences, setting an env var), describe it in "actionRequired". Otherwise set "actionRequired" to null.',
+    `Output a JSON object: {"title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "${entry.significance || 'minor'}", "actionRequired": null | "<action description>"}.`,
     `Significance (deterministic default "${entry.significance || 'minor'}"): keep it unless the diff clearly contradicts it.`,
     'major = new feature, model added/removed, security, breaking. notable = user-visible behavior/UI change, new file, API change. minor = internal, refactor, types, comments, deps.',
     '',
@@ -94,9 +97,15 @@ export function buildPrompt (entry, patch) {
     `Date: ${entry.date}`,
     `Category: ${entry.category || (entry.areas || []).join(', ')}`,
     `Areas: ${(entry.areas || []).join(', ')}`,
+    `Commit nature: ${nature}`,
     `Stats: +${entry.stats?.additions ?? '?'} / -${entry.stats?.deletions ?? '?'}`,
     `Analysis notes: ${entry.summary}`
   ]
+  if (nature === 'test-only') {
+    lines.push('Test & Documentation Guardian: This commit modifies internal tests, test fixtures, or mocks only. No production runtime behavior changed; describe this accurately as test suite verification.')
+  } else if (nature === 'docs-only') {
+    lines.push('Test & Documentation Guardian: This commit updates documentation only. Describe it as documentation/reference updates; do not describe it as a software feature.')
+  }
   if (entry.modelChanges) {
     lines.push(`Model catalog: +${entry.modelChanges.added.join(', ')} -${entry.modelChanges.removed.join(', ')}`)
     const tables = entry.modelChanges.tables || {}
@@ -109,8 +118,18 @@ export function buildPrompt (entry, patch) {
   }
   if (entry.cmdChanges) lines.push(`Slash commands: +${(entry.cmdChanges.added || []).join(', ')} -${(entry.cmdChanges.removed || []).join(', ')}`)
   if (entry.version) lines.push(`Version bump: ${entry.version}`)
-  const files = [...(entry.files?.added || []), ...(entry.files?.modified || []).slice(0, 8)]
-  if (files.length) lines.push(`Files: ${files.join(', ')}`)
+  if (ctx.releaseCtx) {
+    lines.push('', ctx.releaseCtx, '')
+    lines.push('Release instructions: This row is a version bump. Use the release updates above to summarize what user-visible features, model changes, and CLI improvements shipped in this release, rather than describing the version number change itself.')
+  }
+  const added = entry.files?.added || []
+  const modified = entry.files?.modified || []
+  const removed = entry.files?.removed || []
+  const renamed = (entry.files?.renamed || []).map(r => `${r.from} -> ${r.to || r.path}`)
+  if (added.length) lines.push(`Added files: ${added.slice(0, 8).join(', ')}`)
+  if (modified.length) lines.push(`Modified files: ${modified.slice(0, 8).join(', ')}`)
+  if (removed.length) lines.push(`Removed files: ${removed.slice(0, 8).join(', ')}`)
+  if (renamed.length) lines.push(`Renamed files: ${renamed.slice(0, 8).join(', ')}`)
   const facts = (entry.facts || []).slice(0, 5)
   if (facts.length) lines.push(`Key facts (ground the WHY and DETAIL sentences in these): ${facts.map(f => `- ${f}`).join(' ')}`)
   const maxDiff = Number(process.env.CHANGELOG_LLM_MAX_DIFF_BYTES) || 250000
@@ -194,7 +213,7 @@ async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
     },
     body: JSON.stringify({
       model,
-              temperature: 0.1,
+      temperature: 0.1,
       response_format: { type: 'json_object' },
       messages: [{ role: 'user', content: prompt }]
     }),
@@ -212,11 +231,20 @@ async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
     await new Promise(r => setTimeout(r, 5000))
     return callLlm(prompt, env, attempt + 1, validate)
   }
-    if (!res.ok) throw new Error(shortError(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`))
-    const rawText = await res.text()
-    const text = extractResponseText(rawText)
+  if (!res.ok) throw new Error(shortError(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`))
+  const rawText = await res.text()
+  let text = ''
   try {
-    return validate(parseLlmJson(text))
+    text = extractResponseText(rawText)
+  } catch (err) {
+    if (attempt > 2) throw err
+    log(`LLM response body contained no valid message: requesting repair ${attempt}/2`)
+    const fixed = await callLlm(`${prompt}\n\nPrevious response was empty or malformed: ${rawText.slice(0, 300)}\nReply with ONLY the JSON object.`, env, attempt + 1, validate)
+    return validate(fixed)
+  }
+  try {
+    const parsed = parseLlmJson(text)
+    return validate(parsed)
   } catch (err) {
     if (attempt > 2) throw err
     // One repair pass: ask for valid JSON only, no new analysis.
@@ -231,15 +259,23 @@ async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
 // needed") is rejected for one repair pass. Significance falls back to
 // the deterministic default.
 const NOACTION_RE = /nothing to do|no action (is )?needed|no changes? required|you don'?t need to do anything/i
+const NOACTION_ACTION_RE = /^(?:none|n\/?a|no|null|no action(?: required| needed)?|nothing(?: to do)?)[.!]?$/i
+const CAMEL_IDENT_RE = /\b(?!(?:iOS|macOS|gRPC|eBay)\b)[a-z]+[A-Z][a-zA-Z0-9]*\b/
+const SNAKE_IDENT_RE = /\b[a-z0-9]+_[a-z0-9_]+\b/
 
 export function validateLlmOut (out, fallbackSig = 'minor') {
   if (!out || typeof out !== 'object') throw new Error('LLM output not an object')
   const rawTitle = String(out.title || '').trim()
   if (!rawTitle) throw new Error('LLM output missing title')
-      const title = truncateWords(rawTitle.replace(/[`*#_[\]]/g, '').replace(/\s+/g, ' '), 70)
-    // Raw code identifiers read as noise in a human title (advertiserreasonredaction202609v3).
-    // Real English words this long are vanishingly rare; the repair pass rewords the few.
-    if (title.split(/[^A-Za-z0-9]+/).some(w => w.length >= 18)) throw new Error('LLM title contains raw identifier')
+  // Raw code identifiers read as noise in a human title (advertiserreasonredaction202609v3, useSuggestionEngine, stop_response).
+  // Real English words this long or with internal camel/snake case are vanishingly rare; the repair pass rewords the few.
+  const rawWords = rawTitle.replace(/[`*#]/g, ' ').split(/\s+/).filter(Boolean)
+  if (rawWords.some(w => w.length >= 18 || CAMEL_IDENT_RE.test(w) || SNAKE_IDENT_RE.test(w))) {
+    throw new Error('LLM title contains raw identifier')
+  }
+  let title = truncateWords(rawTitle.replace(/[`*#_[\]]/g, ' ').replace(/\s+/g, ' '), 70)
+  title = title.replace(/[.!?:;]+$/, '').trim()
+  if (title) title = title.charAt(0).toUpperCase() + title.slice(1)
   const rawSummary = String(out.summary || '').trim()
   if (!rawSummary) throw new Error('LLM output missing summary')
   if (NOACTION_RE.test(rawSummary)) {
@@ -247,7 +283,11 @@ export function validateLlmOut (out, fallbackSig = 'minor') {
   }
   const summary = truncateWords(rawSummary, 1200)
   const significance = ['minor', 'notable', 'major'].includes(out.significance) ? out.significance : fallbackSig
-  return { title, summary, significance }
+  const rawAction = out.actionRequired && typeof out.actionRequired === 'string' ? out.actionRequired.trim() : ''
+  const actionRequired = rawAction && !NOACTION_RE.test(rawAction) && !NOACTION_ACTION_RE.test(rawAction)
+    ? truncateWords(rawAction, 300)
+    : null
+  return { title, summary, significance, ...(actionRequired ? { actionRequired } : {}) }
 }
 
 export function isTransientError (err) {
@@ -261,188 +301,27 @@ export function isTransientError (err) {
   return /fetch failed|ECONNREFUSED|ECONNRESET|ECONNABORTED|EPIPE|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|socket hang up|terminated|HTTP 5\d\d|timeout/i.test(msg)
 }
 
-export async function enrichWithLlm (entries, getPatch, dataDir, env = process.env, options = {}) {
-  if (!llmConfigured(env)) return 0
-  const cachePath = `${dataDir}/ai-summaries.json`
-  const cache = await readJson(cachePath, {})
-  // `0` means "no cap", which is how a full backfill runs; the daemon's
-  // per-cycle budget stays a small number so a fresh commit never queues behind
-  // history. An unset or empty value keeps the historical default of 60.
-  const rawLimit = env.CHANGELOG_LLM_LIMIT ? Number(env.CHANGELOG_LLM_LIMIT) : 60
-  const limit = rawLimit > 0 ? rawLimit : Infinity
-  const concurrency = Number(env.CHANGELOG_LLM_CONCURRENCY || 5)
-  const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
-  // A gateway blip (502/timeout) must not park a commit for an hour, but it
-  // must park it *somehow*: an uncached transient failure re-entered the queue
-  // every cycle and burned a call on it — c59bde7f retried at 3-minute
-  // intervals for three cycles before succeeding.
-  const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
-  // SHAs this cycle's sync just added. Newest commits are the whole point of a
-  // live changelog, so they queue ahead of the historical backlog.
-  const priority = options.priorityShas instanceof Set ? options.priorityShas : new Set(options.priorityShas || [])
-  let apiCalls = 0
-  let cacheModified = false
-
-  // User-visible work first: this cycle's fresh commits, then models, releases,
-  // commands — then newest, then churn last. Recency-only ordering buried a model
-  // swap behind dozens of minors.
-  const prio = (e) => (priority.has(e.sha) ? -1 : e.modelChanges ? 0 : e.version ? 1 : e.cmdChanges ? 2 : e.noise ? 4 : 3)
-  // Every kind is queueable now. The sync-only filter this replaced is what capped
-  // coverage at 913 of 9,527 entries: the 6,732 community commits have real
-  // parent-to-commit diffs in the clone and were never sent anywhere. Churn rows
-  // still stay out unless CHANGELOG_LLM_CHURN=1 -- their clean patch is empty by
-  // construction (the lockfile *is* the change), so llmPatchFor returns nothing
-  // and the queue skips them; the flag sends the raw lockfile diff instead.
-  const churnQueue = env.CHANGELOG_LLM_CHURN === '1'
-  const queueable = entries.filter(e => !e.noise || churnQueue)
-  queueable.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
-
-  // Fetch patches in parallel (git-bound, independent) before queueing.
-  // Entries without a prompt version predate versioning: re-summarize once.
-  const isCurrent = (e) => e.ai?.model && (e.ai?.v ?? 1) >= PROMPT_V
-  // Bound the git work to what this run can spend. Diffing every unsummarized
-  // entry to pick `limit` of them made cycle time grow with the backlog, which
-  // delayed exactly the fresh entries the loop exists to publish. An uncapped run
-  // still bounds the window, so one pass cannot spend an hour on `git diff`.
-  const window = Number.isFinite(limit) ? Math.max(limit * 4, limit + 5) : 2000
-  const candidates = []
-  for (const e of queueable) {
-    if (isCurrent(e)) continue
-    candidates.push(e)
-    if (candidates.length >= window) break
-  }
-  const patches = await pool(candidates.map(e => async () => {
-    try { return await getPatch(e) } catch { return '' }
-  }), 8)
-
-  const queue = []
-  for (let qi = 0; qi < candidates.length; qi++) {
-    const e = candidates[qi]
-    const patch = patches[qi]
-    if (!patch) continue
-    const key = cacheKey(e.sha, patch)
-    const cached = cache[key]
-    if (cached?.error) {
-      // Failed entries cool down before retrying: a 60s watch loop must not
-      // re-hit a failing endpoint on every cycle.
-      if (!options.retryErrors) continue
-      const failedAt = Date.parse(cached.at || '') || 0
-      if (Date.now() - failedAt < (cached.transient ? transientRetryMs : errorCooldownMs)) continue
-    }
-    if (cached && !cached.error) {
-      e.ai = { model: cache[key].model, v: cache[key].v, title: cache[key].title, summary: cache[key].summary, significance: cache[key].significance, at: cache[key].at }
-      continue // Cache hit does not consume the API budget
-    }
-    queue.push({ entry: e, patch, key })
-    if (queue.length >= limit) break
-  }
-
-  if (!queue.length) return 0
-
-  let activeIndex = 0
-  // Consecutive gateway failures trip the breaker: the tunnel is down,
-  // stop burning calls this run. Tracked globally (not per worker) so 8
-  // parallel workers cannot each log their own "offline" line.
-  let gatewayFails = 0
-
-  async function worker () {
-    while (activeIndex < queue.length) {
-      if (gatewayFails >= 3) break
-      const idx = activeIndex++
-      const { entry: e, patch, key } = queue[idx]
-      try {
-        const out = await callLlm(buildPrompt(e, patch), env)
-        const clean = validateLlmOut(out, e.significance || 'minor')
-        gatewayFails = 0
-        cache[key] = {
-          model: env.LLM_MODEL || 'gpt-4o-mini',
-          v: PROMPT_V,
-          title: clean.title,
-          summary: clean.summary,
-          significance: clean.significance,
-          at: new Date().toISOString()
-        }
-        e.ai = { ...cache[key] }
-        apiCalls++
-        cacheModified = true
-        log(`LLM summarized ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})`)
-      } catch (err) {
-        log(`LLM failed for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
-        const transient = isTransientError(err)
-        if (transient) {
-          // Record it, or this commit re-enters next cycle's queue and burns
-          // another call on the same failure. One-shot callers (retryErrors
-          // unset: the workflow's analyze pass) must not park it, since nobody
-          // will come back for them — the daemon retries those.
-          if (options.retryErrors) {
-            cache[key] = { error: shortError(err).slice(0, 200), transient: true, at: new Date().toISOString() }
-            cacheModified = true
-          }
-          gatewayFails++
-          if (gatewayFails >= 3) {
-            log('LLM endpoint appears offline (3 consecutive gateway errors): skipping rest of queue this run')
-            break
-          }
-          continue
-        }
-        cache[key] = { error: shortError(err).slice(0, 200), at: new Date().toISOString() }
-        cacheModified = true
-      }
-    }
-  }
-
-  const poolSize = Math.min(concurrency, queue.length)
-  await Promise.all(Array.from({ length: poolSize }, () => worker()))
-
-  if (cacheModified) {
-    // Union with what landed on disk while these calls were in flight: the
-    // cache is keyed by content, so another writer's keys are additive and
-    // must not be dropped by this run's snapshot.
-    await writeJson(cachePath, mergeAiCache(await readJson(cachePath, {}), cache))
-  }
-  return apiCalls
-}
-
 // ---------------------------------------------------------------------------
 // Release-window context for version-bump rows.
 //
 // A bump row's own diff is one version string, so from its patch alone the
-// only honest ELI5 is "packaging housekeeping" -- even when the window since
+// only honest summary is "packaging housekeeping" -- even when the window since
 // the previous bump shipped real features (e.g. freebuff-cli 0.0.177's own
 // diff is a 1-line manifest edit, but the 20 commits since 0.0.176 include
 // sponsored-card guidance, telemetry contracts and pricing-badge work).
 //
-// The fix is to feed the bump's ELI5 the window it releases: the
-// already-vetted titles + first sentences of the non-noise predecessors back
+// Both the technical summary and the ELI5 pass are fed the window it releases:
+// the already-vetted titles + first sentences of the non-noise predecessors back
 // to the previous bump of the same track. Summaries, not diffs: the window
 // was already summarized once, and re-sending full diffs would re-litigate
 // that work at ~100x the tokens.
-//
-// Track identity matters because the 1.0.x (cli/release) and 0.0.x
-// (freebuff/cli/release) lines interleave: a 0.0.177 window must stop at
-// 0.0.176, not at the 1.0.688 bump in between. Old rows predate versionTrack,
-// so the boundary also infers the line from the touched manifest path and the
-// version string shape (see trackOfBump); an unknowable line means "same line
-// as whoever asks", never "stop here" -- a missing stop only widens the
-// draft, a wrong stop silently drops half the release.
 
-// Caps: large on purpose. The 200k-token window fits even the biggest 1.0.x
-// gaps (61+ commits) once compressed to title+summary lines; items cap the
-// prompt, chars cap it harder. No extra LLM calls: context is in-memory.
 export const RELEASE_CTX_MAX_ITEMS = 100
 export const RELEASE_CTX_MAX_CHARS = 30000
 export const RELEASE_CTX_SUMMARY_CHARS = 300
 
-// Version of the roll-up ASK itself (wording of the prompt rule above), not of
-// the window: folded into contextualized eli5 keys only, so rewording the
-// instruction re-explains the ~715 bump rows without re-spending a cent on the
-// thousands of non-bump lines. v3: roll-ups may run to 8 sentences under the
-// widened cap instead of being sheared at the old 800-char cutter.
-export const RELEASE_ROLLUP_V = 4
+export const RELEASE_ROLLUP_V = 5
 
-// Which release line a bump row belongs to. Prefers the recorded track, then
-// the touched manifest path (file lists on old rows), then the version string
-// shape (1.x = codebuff-cli, 0.x = freebuff-cli). Null when nothing says.
 export function trackOfBump (e) {
   const direct = versionTrackOf(e)
   if (direct) return direct
@@ -456,6 +335,9 @@ export function trackOfBump (e) {
   return null
 }
 
+export const bumpOnly = (e) => isBumpEntry(e) && !e.modelChanges && !e.cmdChanges &&
+  (e.stats?.additions ?? 99) <= 10 && (e.files?.meaningful ?? 99) <= 2
+
 function releaseItemText (e, maxSummary = RELEASE_CTX_SUMMARY_CHARS) {
   const title = e?.ai?.title || e?.title || ''
   const raw = e?.ai?.summary || e?.summary || ''
@@ -467,18 +349,6 @@ function releaseItemText (e, maxSummary = RELEASE_CTX_SUMMARY_CHARS) {
   return `${head}${tail}${tag}`.trim()
 }
 
-// The window a bump row releases: non-noise, non-bump predecessors back to
-// (excluding) the previous bump of the same track. Entries arrive
-// oldest-first (changelog.json order); position lookups come from a caller-
-// supplied index so this stays O(window) inside the enrichment loop.
-//
-// Alongside the item list, the walk accumulates the window's structured
-// catalog events (model add/remove, slash-command add/remove) and folds them
-// into a NET effect: the last event per name wins, so a model swapped out
-// again later the same window shows as removed even though an early item
-// announced its arrival. Per-commit summaries cannot see reversals -- each
-// was true the day it landed -- but the final state is what installing the
-// version gives the reader, so the net lines are authoritative in the prompt.
 export function collectReleaseContext (entries, bump, opts = {}) {
   const out = { items: [], prevVersion: null, truncated: false, net: { modelsIn: [], modelsOut: [], commandsIn: [], commandsOut: [] } }
   if (!Array.isArray(entries) || !bump) return out
@@ -495,9 +365,6 @@ export function collectReleaseContext (entries, bump, opts = {}) {
     const e = entries[i]
     if (!e || e.sha === bump.sha) continue
     if (isBumpEntry(e)) {
-      // A bump of the same line (or an unknowable line) closes the window. A
-      // bump of the *other* line is interleaved traffic, not our release: the
-      // window sails past it but never includes it.
       if (!line) break
       const other = trackOfBump(e)
       if (!other || other === line) {
@@ -509,13 +376,7 @@ export function collectReleaseContext (entries, bump, opts = {}) {
     if (e.noise) continue
     const text = releaseItemText(e)
     if (!text) continue
-    // Churn rows that slipped past noise (belt and suspenders): versionless,
-    // meaningless, lockfile-only leftovers add tokens, never signal.
     if (!e.ai?.title && !e.ai?.summary && (e.files?.meaningful ?? 1) <= 0) continue
-    // Catalog events feed the net effect from every window entry, capped or
-    // not: the item list may truncate on huge gaps, the final state must not.
-    // A name in BOTH lists of one commit is a description-only edit (the
-    // analyzer's own net rule) and contributes nothing.
     if (e.modelChanges) {
       const adds = e.modelChanges.added || [], rems = e.modelChanges.removed || []
       for (const m of adds) if (!rems.includes(m)) events.push({ kind: 'model', name: m, dir: 1 })
@@ -533,12 +394,7 @@ export function collectReleaseContext (entries, bump, opts = {}) {
     picked.push({ sha: e.sha, text })
     used += text.length + 1
   }
-  // Chronological reads better in the prompt ("since X, the team shipped...").
   out.items = picked.reverse()
-  // Fold the catalog events into the net effect. The walk collected them
-  // newest-first, so reversing restores true chronology; the newest event per
-  // name wins, which keeps an early add that a later commit removed OUT of
-  // the release and keeps a model swapped-in twice counted by its final state.
   const chrono = events.slice().reverse()
   const finalDir = new Map()
   for (const ev of chrono) finalDir.set(`${ev.kind}:${ev.name}`, ev.dir)
@@ -560,10 +416,6 @@ export function formatReleaseContext (ctx, bump) {
   const lines = (ctx.items || []).map(it => `- ${it.text}`)
   if (ctx.truncated) lines.push(`- ...[earlier changes truncated; newest ${(ctx.items || []).length} shown]...`)
   const net = ctx.net || {}
-  // Presence phrasing, not add/remove: the fold knows each name's final
-  // direction, not whether the reader already had it before the window. "The
-  // picker includes Muse Spark 1.2" stays true whether it just landed or was
-  // merely re-confirmed; "added 1.2" would not be.
   const netLines = []
   if (net.modelsIn.length || net.modelsOut.length) {
     const inPart = net.modelsIn.length ? `includes ${net.modelsIn.join(', ')}` : 'no newly added models'
@@ -576,11 +428,134 @@ export function formatReleaseContext (ctx, bump) {
     netLines.push(`- Slash commands at this release: ${inPart}${outPart ? `; ${outPart}` : ''}.`)
   }
   if (netLines.length) lines.push('Final catalog state at this release (authoritative; overrides any item above it that contradicts):', ...netLines)
-  // An empty window (no items, no net effect) stays out of the prompt and out
-  // of the cache key: the honest line for it is housekeeping, not an empty list.
   if (!lines.length) return ''
   return [head, ...lines].join('\n')
 }
+
+export function getReleaseContextFor (entries, bump, posIndex, ctxCache) {
+  if (!bumpOnly(bump)) return null
+  let hit = ctxCache ? ctxCache.get(bump.sha) : null
+  if (!hit) {
+    const ctx = collectReleaseContext(entries, bump, { index: posIndex })
+    hit = { ctx, text: formatReleaseContext(ctx, bump) }
+    if (ctxCache) ctxCache.set(bump.sha, hit)
+  }
+  return hit.text ? hit : null
+}
+
+export async function enrichWithLlm (entries, getPatch, dataDir, env = process.env, options = {}) {
+  if (!llmConfigured(env)) return 0
+  const cachePath = `${dataDir}/ai-summaries.json`
+  const cache = await readJson(cachePath, {})
+  const rawLimit = env.CHANGELOG_LLM_LIMIT ? Number(env.CHANGELOG_LLM_LIMIT) : 60
+  const limit = rawLimit > 0 ? rawLimit : Infinity
+  const concurrency = Number(env.CHANGELOG_LLM_CONCURRENCY || 5)
+  const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
+  const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
+  const priority = options.priorityShas instanceof Set ? options.priorityShas : new Set(options.priorityShas || [])
+  let apiCalls = 0
+  let cacheModified = false
+
+  const posIndex = new Map(entries.map((x, i) => [x.sha, i]))
+  const ctxCache = new Map()
+  const releaseOf = (e) => getReleaseContextFor(entries, e, posIndex, ctxCache)
+
+  const prio = (e) => (priority.has(e.sha) ? -1 : e.modelChanges ? 0 : e.version ? 1 : e.cmdChanges ? 2 : e.noise ? 4 : 3)
+  const churnQueue = env.CHANGELOG_LLM_CHURN === '1'
+  const queueable = entries.filter(e => !e.noise || churnQueue)
+  queueable.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
+
+  const isCurrent = (e) => e.ai?.model && (e.ai?.v ?? 1) >= PROMPT_V
+  const window = Number.isFinite(limit) ? Math.max(limit * 4, limit + 5) : 2000
+  const candidates = []
+  for (const e of queueable) {
+    if (isCurrent(e)) continue
+    candidates.push(e)
+    if (candidates.length >= window) break
+  }
+  const patches = await pool(candidates.map(e => async () => {
+    try { return await getPatch(e) } catch { return '' }
+  }), 8)
+
+  const queue = []
+  for (let qi = 0; qi < candidates.length; qi++) {
+    const e = candidates[qi]
+    const patch = patches[qi]
+    if (!patch) continue
+    const hit = bumpOnly(e) ? releaseOf(e) : null
+    const relText = hit?.text || ''
+    const key = cacheKey(e.sha, patch, relText, relText ? RELEASE_ROLLUP_V : 0)
+    const cached = cache[key]
+    if (cached?.error) {
+      if (!options.retryErrors) continue
+      const failedAt = Date.parse(cached.at || '') || 0
+      if (Date.now() - failedAt < (cached.transient ? transientRetryMs : errorCooldownMs)) continue
+    }
+    if (cached && !cached.error) {
+      e.ai = { model: cache[key].model, v: cache[key].v, title: cache[key].title, summary: cache[key].summary, significance: cache[key].significance, ...(cache[key].actionRequired ? { actionRequired: cache[key].actionRequired } : {}), at: cache[key].at }
+      continue
+    }
+    queue.push({ entry: e, patch, key, relText })
+    if (queue.length >= limit) break
+  }
+
+  if (!queue.length) return 0
+
+  let activeIndex = 0
+  let gatewayFails = 0
+
+  async function worker () {
+    while (activeIndex < queue.length) {
+      if (gatewayFails >= 3) break
+      const idx = activeIndex++
+      const { entry: e, patch, key, relText = '' } = queue[idx]
+      try {
+        const out = await callLlm(buildPrompt(e, patch, { releaseCtx: relText }), env)
+        const clean = validateLlmOut(out, e.significance || 'minor')
+        gatewayFails = 0
+        cache[key] = {
+          model: env.LLM_MODEL || 'gpt-4o-mini',
+          v: PROMPT_V,
+          title: clean.title,
+          summary: clean.summary,
+          significance: clean.significance,
+          ...(clean.actionRequired ? { actionRequired: clean.actionRequired } : {}),
+          at: new Date().toISOString()
+        }
+        e.ai = { ...cache[key] }
+        apiCalls++
+        cacheModified = true
+        log(`LLM summarized ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})`)
+      } catch (err) {
+        log(`LLM failed for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
+        const transient = isTransientError(err)
+        if (transient) {
+          if (options.retryErrors) {
+            cache[key] = { error: shortError(err).slice(0, 200), transient: true, at: new Date().toISOString() }
+            cacheModified = true
+          }
+          gatewayFails++
+          if (gatewayFails >= 3) {
+            log('LLM endpoint appears offline (3 consecutive gateway errors): skipping rest of queue this run')
+            break
+          }
+          continue
+        }
+        cache[key] = { error: shortError(err).slice(0, 200), at: new Date().toISOString() }
+        cacheModified = true
+      }
+    }
+  }
+
+  const poolSize = Math.min(concurrency, queue.length)
+  await Promise.all(Array.from({ length: poolSize }, () => worker()))
+
+  if (cacheModified) {
+    await writeJson(cachePath, mergeAiCache(await readJson(cachePath, {}), cache))
+  }
+  return apiCalls
+}
+
 // ---------------------------------------------------------------------------
 // ELI5: a plain-English line beneath each technical summary.
 //
@@ -605,7 +580,10 @@ export function formatReleaseContext (ctx, bump) {
 // day before -- true of the commit, false of the story. The rule now says to carry
 // the recorded change into the line, without inventing an effective date.
 // Render-time story notes also expose explicit access evidence from related entries.
-export const ELI5_V = 4
+// v5: 3-Pillar Reader Framework (core change, audience, everyday impact),
+// Test & Docs Guardian constraint, commit nature injection, prompt-echo stripping,
+// and headline-first release roll-ups.
+export const ELI5_V = 5
 
 // eli5Source() lives in util.mjs because the changelog merge has to recompute it
 // to check a merged ELI5 against the summary that survived. Re-exported here as
@@ -651,7 +629,19 @@ export function eli5Done (e, releaseCtx = '', rollupV = 0) {
 export function buildEli5Prompt (e, notes = [], ctx = {}) {
   const { patch = '', siblings = [], diffBytes = 6000, releaseCtx = '' } = ctx
   const evidence = []
-  if (e.summary && e.summary !== e.ai.summary) evidence.push(`What the analyzer measured: ${e.summary}`)
+  if (e.commitNature) {
+    const natureDesc = e.commitNature === 'test-only'
+      ? 'affects only test suites/fixtures/mocks; no user-facing behavior changes'
+      : e.commitNature === 'docs-only'
+        ? 'affects only documentation/comments'
+        : e.commitNature === 'config-only'
+          ? 'affects only build/linter/tooling configuration'
+          : e.commitNature === 'churn'
+            ? 'lockfile or dependency churning'
+            : e.commitNature
+    evidence.push(`Commit nature: ${e.commitNature} (${natureDesc})`)
+  }
+  if (e.summary && e.summary !== e.ai?.summary) evidence.push(`What the analyzer measured: ${e.summary}`)
   if (e.stats) {
     // `meaningful`, not `total`: total counts the lockfile riding along in the
     // snapshot, and the analyzer's own note right above it says otherwise.
@@ -683,35 +673,39 @@ export function buildEli5Prompt (e, notes = [], ctx = {}) {
     ? `\nComments the developers wrote beside this code. Read them: they say who this is for and what it does today, which the constant names do not.\n${notes.map(n => `- ${n}`).join('\n')}\n`
     : ''
   const diffBlock = patch
-    ? `\nThe change itself. Lockfiles and test-only hunks are already stripped; the full diff is on GitHub.\n\`\`\`diff\n${budgetPatch(patch, diffBytes, Math.max(800, Math.round(diffBytes / 4)))}\n\`\`\`\n`
+    ? `\nThe change itself. Lockfiles and test-only hunks are already stripped; the full diff is on GitHub.\n\`\`\`diff\n${budgetPatch(patch, diffBytes, Math.max(800, Math.round(diffBytes / 4)))} \`\`\`\n`
     : ''
   return `Explain one software change to a reader who is not a programmer and will not look at the code.
 
 Date: ${e.day || ''}
 Area: ${e.category || (e.areas || []).join(', ')}
 Weight the tooling gave it: ${e.significance || 'minor'}
-Title: ${e.ai.title}
-Technical summary: ${e.ai.summary}
+Title: ${e.ai?.title || e.title || ''}
+Technical summary: ${e.ai?.summary || e.summary || ''}
 ${evidence.length ? `\nEvidence. Use it; do not repeat it back verbatim.\n${evidence.map(x => `- ${x}`).join('\n')}\n` : ''}
 ${noteBlock}${diffBlock}
-  Write 2-4 sentences of plain English: what happened, who it affects, and what you would notice if you looked. Say the concrete thing, not the category of thing. Lead with what the reader experiences, then the mechanism.
+  Write 2-4 sentences of plain English structured around three pillars:
+  1. Core Change: What actually changed in plain words (lead with concrete action or outcome).
+  2. Who It Affects: Specify the exact audience (e.g. users on free tiers, teams deploying self-hosted, developers editing config), or state clearly if it is internal.
+  3. Everyday Impact: What the reader experiences or notices in daily use. If there is no visible effect or action needed, state that plainly.
 
 Rules:
 - No jargon, acronyms, file names, function names, code or version numbers. Say what the thing does instead of what it is called ("the assistant can now use a new model", not "a provider adapter was wired up").
 - The diff and the file list are evidence, not vocabulary. Read them for the part the summary skipped: the threshold, the condition, the plan or region it applies to, the thing that stops working. Then translate that into plain words.
 - If the summary and the diff disagree about what happened, follow the diff.
 - Say whether it is live today. A constant, a flag, a field or a type that nothing reads yet is not a feature: say it is in place and does nothing yet.
+- Test & Documentation Guardian: If the change or commit nature is test-only, docs-only, or internal tooling, do NOT invent or claim user-facing assistant features, performance gains, or UI changes. State clearly and concisely that this is an internal test suite or documentation update that does not alter how the application behaves for users.
 - An access change recorded in the evidence is a change, even when this commit only publishes it. If a comment, a fact or the diff says a region, a plan or a group lost or gained access, left or joined a list, or keeps something it bought, say that, with the date the evidence gives. "Who is eligible today did not change" is a false comfort when the evidence records that it changed yesterday. The nothing-reads-yet rule is for constants nobody consumes, not for access that already moved.
 - Use only what the summary, the evidence and the comments say. Never invent a cause, a number, or a promise.
 - Keep the audience the text gives, and keep it narrow. If the change is for one kind of customer, one plan, one region, or only after some step, name that group. Never widen it to "users", "everyone" or "customers" because that reads more naturally: a program for verified YC companies is not available to users.
 - Plain words, active voice. No "This change", "We are excited", marketing tone, or generic tautologies ("various bug fixes and improvements").
-- Jump straight into what happened. NEVER use conversational preambles, filler intros, or framing phrases like "In simple terms", "Basically", "To put it simply", "In plain English", "This commit", "This update", or "This pull request". Start directly with the concrete action or subject.
-- This row may be a version-label commit whose own diff is only packaging. When the evidence lists "Updates included in this release", THAT list is what this row is about: the "Technical summary" above describes only the label change itself and must not drive the line. Summarize what updating to this version gives the reader, drawn from that list, strongest user-visible item first. If the list ends with a "Final catalog state" line, that is what the reader ends up with: announce only what survives it -- something an item says was added but the final-state line leaves out of the picker is NOT in this release. Only when the list is absent or holds no user-visible change, say honestly that this is a routine behind-the-scenes update that keeps installs current.
-- If the change is an internal refactor, test suite update, dependency bump, or maintenance change with no direct user-facing behavior, explain it honestly and plainly as behind-the-scenes housekeeping or stability maintenance. Do NOT invent or fabricate user-facing features, performance claims, or speed improvements.
+- Jump straight into what happened. NEVER use conversational preambles, filler intros, prompt echoes, or framing phrases like "If you looked...", "What you would notice...", "Behind the scenes...", "Under the hood...", "In simple terms", "Basically", "To put it simply", "In plain English", "This commit", "This update", or "This pull request". Start directly with the concrete action or subject.
+- This row may be a version-label commit whose own diff is only packaging. When the evidence lists "Updates included in this release", THAT list is what this row is about: the "Technical summary" above describes only the label change itself and must not drive the line. Summarize what updating to this version gives the reader, drawn from that list, strongest user-visible item first. If the list ends with a "Final catalog state" line, that is what the reader ends up with: announce only what survives it -- something an item says was added but the final-state line leaves out of the picker is NOT in this release. Only when the list is absent or holds no user-visible change, say honestly that this is a routine update that keeps installs current.
+- If the change is an internal refactor, dependency bump, or maintenance change with no direct user-facing behavior, explain it honestly and plainly as stability or maintenance work. Do NOT invent or fabricate user-facing features, performance claims, or speed improvements.
 - If the change is small or internal, say so shortly. Do not inflate it.
 - Never address the reader as a developer.
 - Address the reader as "you", or name the group ("users", "subscribers"); never write "that person", "the viewer" or "that individual".
-- ${releaseCtx ? 'A release roll-up may run longer: stop after up to 8 sentences.' : 'Stop after 2-4 sentences.'} Include an effective date only when the evidence supplies it and it clarifies the change; never recite day counts or archive calendars.
+- ${releaseCtx ? 'A release roll-up may run longer: stop after up to 8 sentences. Lead with a strong user-facing headline summarizing the main theme of what shipped before listing key highlights.' : 'Stop after 2-4 sentences.'} Include an effective date only when the evidence supplies it and it clarifies the change; never recite day counts or archive calendars.
 
 Reply with JSON only: {"eli5": "..."}`
 }
@@ -749,20 +743,32 @@ export function normalizeEli5 (raw, maxChars = ELI5_MAX_CHARS) {
   let s = String(value ?? '').trim()
   // Models like to restate the label they were given.
   s = s.replace(/^(ELI5|In plain English|Plain english)\s*[:–-]\s*/i, '').trim()
-      s = s.replace(/\s+/g, ' ').replace(/\s+([.,;:])/g, '$1').trim()
-    // Backstop for phrasing the prompt now forbids: point it at the reader.
-    s = s.replace(/\bthat person\b/gi, 'you').replace(/\bthe viewer\b/gi, 'you').replace(/\bthat individual\b/gi, 'you')
-    // Runaway generations recite the site archive (May 13, 2025 (22)...). Cut there.
-    const bleed = s.search(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\s*\(\d+\)/)
-    if (bleed !== -1) { s = s.slice(0, bleed).trim(); if (!/[.!?]$/.test(s)) s += '.' }
+  s = s.replace(/\s+/g, ' ').replace(/\s+([.,;:])/g, '$1').trim()
+  // Strip prompt-echo openings
+  const withoutEcho = s.replace(/^(?:if you looked(?: at [^,]+)?,?|what you would notice(?: is)?,?|behind the scenes,?|under the hood,?)\s*/i, '').trim()
+  if (withoutEcho !== s) {
+    s = withoutEcho
+    if (s.length > 0) s = s.charAt(0).toUpperCase() + s.slice(1)
+  }
+  // Strip filler introductory preambles
+  const withoutFiller = s.replace(/^(?:in simple terms|basically|to put it simply|at a high level|in plain english)[,:\s]+/i, '').trim()
+  if (withoutFiller !== s) {
+    s = withoutFiller
+    if (s.length > 0) s = s.charAt(0).toUpperCase() + s.slice(1)
+  }
+  // Backstop for phrasing the prompt now forbids: point it at the reader.
+  s = s.replace(/\bthat person\b/gi, 'you').replace(/\bthe viewer\b/gi, 'you').replace(/\bthat individual\b/gi, 'you')
+  // Runaway generations recite the site archive (May 13, 2025 (22)...). Cut there.
+  const bleed = s.search(/\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\s*\(\d+\)/)
+  if (bleed !== -1) { s = s.slice(0, bleed).trim(); if (!/[.!?]$/.test(s)) s += '.' }
   // The floor exists to catch non-answers, not to reject a terse but valid
   // sentence: "It is faster now." is 16 characters and exactly what this field
   // is for. A 25-character floor parked real answers as errors for an hour.
   if (s.length < 12 || ELI5_JUNK.test(s) || ELI5_REFUSAL.test(s)) {
     throw new Error(`eli5 not an answer: ${JSON.stringify(s).slice(0, 60)}`)
   }
-    if (!/[.!?]$/.test(s)) s += '.'
-    return cutToSentence(s, maxChars)
+  if (!/[.!?]$/.test(s)) s += '.'
+  return cutToSentence(s, maxChars)
 }
 
 export async function enrichEli5 (entries, dataDir, env = process.env, options = {}) {
@@ -810,16 +816,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   // Memoized windows: the same bump row is hashed by pending-filter, queue
   // build and worker without re-walking.
   const ctxCache = new Map()
-  const releaseOf = (e) => {
-    if (!bumpOnly(e)) return null
-    let hit = ctxCache.get(e.sha)
-    if (!hit) {
-      const ctx = collectReleaseContext(entries, e, { index: posIndex })
-      hit = { ctx, text: formatReleaseContext(ctx, e) }
-      ctxCache.set(e.sha, hit)
-    }
-    return hit.text ? hit : null
-  }
+  const releaseOf = (e) => getReleaseContextFor(entries, e, posIndex, ctxCache)
   const prio = (e) => (priority.has(e.sha) ? -1
     : e.modelChanges ? 0
     : releaseOf(e) ? 1

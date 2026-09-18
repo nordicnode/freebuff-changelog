@@ -726,6 +726,37 @@ nav.term-nav a.active{
   line-height:1.6;
   color:var(--txt-dim);
 }
+.action-required{
+  margin:10px 0 8px;
+  padding:10px 14px;
+  border-left:3px solid var(--term-red);
+  background:var(--card-bg);
+  border-radius:0 3px 3px 0;
+  font-size:.92rem;
+  line-height:1.6;
+  color:var(--txt);
+}
+.action-label{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  font-size:.74rem;
+  font-weight:700;
+  letter-spacing:.08em;
+  color:var(--term-red);
+  margin-bottom:8px;
+}
+.action-label::before{
+  content:'⚠ ';
+  opacity:.9;
+}
+.action-label::after{
+  content:'';
+  flex:1;
+  height:1px;
+  background:var(--term-red);
+  opacity:.25;
+}
 /* The plain-English line is a different register, not a lesser status: amber like
    the terminal's own annotations, so it reads as the human note beside the
    technical text without competing with it. */
