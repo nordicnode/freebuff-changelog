@@ -303,7 +303,7 @@ export function shortError (err) {
 // `validate` is a parameter because the ELI5 pass speaks to the same gateway
 // with a different shape: the repair retry has to check the replacement against
 // the schema that was asked for, not the summary one.
-async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
+export async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
   const base = env.LLM_API_BASE || 'https://api.openai.com/v1'
   const model = env.LLM_MODEL || 'gpt-4o-mini'
   const configuredTimeout = Number(env.LLM_TIMEOUT_MS)
@@ -332,9 +332,11 @@ async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
     await new Promise(r => setTimeout(r, Math.min(waitMs, 30000)))
     return callLlm(prompt, env, attempt + 1, validate)
   }
-  // 5xx gateways (tunnel 522s included): one delayed retry, then a short error.
-  if (res.status >= 500 && res.status <= 599 && attempt === 1) {
-    await new Promise(r => setTimeout(r, 5000))
+  // 5xx gateways (tunnel 503s/522s included): retry with backoff up to 3 attempts.
+  if (res.status >= 500 && res.status <= 599 && attempt <= 3) {
+    const waitMs = 2000 * 2 ** (attempt - 1)
+    log(`LLM HTTP ${res.status} gateway blip: waiting ${(waitMs / 1000).toFixed(1)}s before retry ${attempt}/3`)
+    await new Promise(r => setTimeout(r, waitMs))
     return callLlm(prompt, env, attempt + 1, validate)
   }
   if (!res.ok) throw new Error(shortError(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`))

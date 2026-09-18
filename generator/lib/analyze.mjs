@@ -166,12 +166,14 @@ export async function extractFileHeaders (repoDir, ref, files, maxFiles = 6, max
       }
       const commentLines = []
       let inBlock = false
+      let seenComment = false
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i]
         const trimmed = line.trim()
         if (i === 0 && trimmed.startsWith('#!')) continue
         if (!inBlock && (trimmed.startsWith('/**') || trimmed.startsWith('/*'))) {
           inBlock = true
+          seenComment = true
           commentLines.push(line)
           if (trimmed.endsWith('*/') && trimmed.length > 2) inBlock = false
         } else if (inBlock) {
@@ -181,9 +183,13 @@ export async function extractFileHeaders (repoDir, ref, files, maxFiles = 6, max
             break
           }
         } else if (trimmed.startsWith('//') || trimmed.startsWith('#')) {
+          seenComment = true
           commentLines.push(line)
         } else if (trimmed === '') {
-          if (commentLines.length > 0) commentLines.push(line)
+          if (seenComment) commentLines.push(line)
+        } else if (!seenComment && (trimmed.startsWith('import ') || trimmed.startsWith('} from ') || trimmed.startsWith('export *') || /^const .+ = require\(/.test(trimmed))) {
+          // Allow leading imports before top comment block
+          continue
         } else {
           break
         }

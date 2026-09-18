@@ -703,7 +703,7 @@ nav.term-nav a.active{
 .stat-trend{grid-area:trend;display:flex;justify-content:flex-end;min-width:0}
 .stat-trend .spark{margin:0;width:100%;max-width:112px}
 .cad-spark{margin:0 0 10px}
-/* The svg carries an intrinsic width, so max-width:100% only caps it — the cadence
+/* The svg carries an intrinsic width, so max-width:100% only caps it, the cadence
    line sat at its authored 300px inside a 1,100px card. Stretch it: the viewBox is
    already preserveAspectRatio="none" and the stroke is non-scaling, so the only
    thing that changes is the horizontal spacing between months. */
