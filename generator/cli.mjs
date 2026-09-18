@@ -824,7 +824,7 @@ async function catchUpOnce (argv) {
   }
 
   const queueable = entries.filter(e => !e.noise)
-  const isCurrent = (e) => e.ai?.title && (e.ai?.v ?? 1) >= PROMPT_V
+  const isCurrent = (e) => e.ai?.title && (process.env.CHANGELOG_LLM_FORCE_REWRITE === '1' ? (e.ai?.v ?? 1) >= PROMPT_V : true)
   const unsummarized = queueable.filter(e => !isCurrent(e))
   log(`[backfill] ${queueable.length} total entries (${unsummarized.length} remaining to summarize)`)
 
@@ -1091,7 +1091,7 @@ async function enrichAllPass (argv) {
   const eli5 = llmConfigured(env) ? await enrichEli5(entries, DATA, env, { retryErrors: true, getPatch: llmPatchFor, repoDir: REPO_DIR }) : 0
   if (!llmConfigured(env)) log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env): stored diffs only')
 
-  const isCurrent = (e) => e.ai?.title && (e.ai?.v ?? 1) >= PROMPT_V
+  const isCurrent = (e) => e.ai?.title && (env.CHANGELOG_LLM_FORCE_REWRITE === '1' ? (e.ai?.v ?? 1) >= PROMPT_V : true)
   const left = {
     diffs: entries.filter(e => !existsSync(resolve(diffDir, `${e.sha}.diff`))).length,
     summaries: entries.filter(e => !e.noise && !isCurrent(e)).length,

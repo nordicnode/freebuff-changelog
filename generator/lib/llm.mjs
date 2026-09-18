@@ -589,7 +589,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   const queueable = entries.filter(e => !e.noise || churnQueue)
   queueable.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
 
-  const isCurrent = (e) => e.ai?.model && (e.ai?.v ?? 1) >= PROMPT_V
+  const isCurrent = (e) => e.ai?.model && (env.CHANGELOG_LLM_FORCE_REWRITE === '1' ? (e.ai?.v ?? 1) >= PROMPT_V : true)
   const window = Number.isFinite(limit) ? Math.max(limit * 4, limit + 5) : 2000
   const candidates = []
   for (const e of queueable) {
