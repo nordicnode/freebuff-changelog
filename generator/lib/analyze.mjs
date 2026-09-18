@@ -436,7 +436,7 @@ export const MONOREPO_COMPONENTS = [
     prefix: 'common/',
     pattern: /^common\//,
     area: 'Shared/Core',
-    desc: 'Core types, model catalog definitions, free model picker configurations, shared protocols, telemetry, auth.'
+    desc: 'Core types, model catalog definitions, free model picker configurations, shared protocols, telemetry, auth, advertising marketplace, and first-party sponsored ad placement campaigns.'
   },
   {
     prefix: 'sdk/',
