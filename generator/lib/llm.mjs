@@ -572,7 +572,7 @@ export function eli5Eligible (e) {
   return !e.noise && !!e.ai?.title && !!e.ai?.summary && (e.ai?.v ?? 1) >= PROMPT_V
 }
 
-export function eli5Done (e, releaseCtx = '') {
+export function eli5Done (e, releaseCtx = '', rollupV = 0) {
   // e.eli5.ctx is the window hash the line was written from. enrichEli5 always
   // passes the current window for bumps, so a roll-up whose window filled in
   // since (predecessors summarized late, or a rescan moved the boundary)
@@ -582,7 +582,12 @@ export function eli5Done (e, releaseCtx = '') {
   if (!(e.eli5 && e.eli5.v >= ELI5_V && e.eli5.src === shortHash(eli5Source(e)))) return false
   if (!releaseCtx) return true
   if (!e.eli5.ctx) return false
-  return e.eli5.ctx === shortHash(releaseCtx)
+  if (e.eli5.ctx !== shortHash(releaseCtx)) return false
+  // rollupV gates the ASK, not the window: a row explained under an older
+  // roll-up instruction re-queues once the versioned pass wants it back.
+  // Callers that pass no version keep hash-only semantics.
+  if (rollupV && e.eli5.rollup !== rollupV) return false
+  return true
 }
 
 export function buildEli5Prompt (e, notes = [], ctx = {}) {
@@ -749,7 +754,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   // since (predecessors summarized late) re-queues on its own.
   const pending = entries.filter(eli5Eligible).filter(e => {
     const hit = bumpOnly(e) ? releaseOf(e) : null
-    return !eli5Done(e, hit?.text || '')
+    return !eli5Done(e, hit?.text || '', hit ? RELEASE_ROLLUP_V : 0)
   })
   pending.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
   // Same bound as the summary pass: choosing this run's dozen entries must not
@@ -771,7 +776,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     if (cached && !cached.error) {
       // A cache hit costs nothing but still has to land on the entry, or the
       // site renders no ELI5 line for it.
-      e.eli5 = { text: cached.text, model: cached.model, v: cached.v, src: shortHash(src), ctx: relText ? shortHash(relText) : undefined, at: cached.at }
+      e.eli5 = { text: cached.text, model: cached.model, v: cached.v, src: shortHash(src), ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}), at: cached.at }
       continue
     }
     queue.push({ entry: e, src, key, relText })
@@ -801,10 +806,10 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
           model: env.LLM_MODEL || 'gpt-4o-mini',
           v: ELI5_V,
           text: out,
-          ...(relText ? { ctx: shortHash(relText) } : {}),
+          ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}),
           at: new Date().toISOString()
         }
-        e.eli5 = { text: out, model: cache[key].model, v: ELI5_V, src: shortHash(src), ...(relText ? { ctx: shortHash(relText) } : {}), at: cache[key].at }
+        e.eli5 = { text: out, model: cache[key].model, v: ELI5_V, src: shortHash(src), ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}), at: cache[key].at }
         apiCalls++
         cacheModified = true
         log(`ELI5 wrote ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})`)

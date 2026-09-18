@@ -637,6 +637,11 @@ test('release context: empty window yields no prompt section and stable keys', a
   )
   const done = { ...bump, eli5: { text: 'Housekeeping.', v: ELI5_V, src: shortHash(eli5Source(bump)) } }
   assert.equal(eli5Done(done), true, 'single-arg callers keep old semantics')
+  const rollupEntry = { ...bump, eli5: { text: 'x', v: ELI5_V, src: shortHash(eli5Source(bump)), ctx: shortHash('window text') } }
+  assert.equal(eli5Done(rollupEntry, 'window text', 2), false, 'a line written under an older roll-up ask re-queues')
+  rollupEntry.eli5.rollup = 2
+  assert.equal(eli5Done(rollupEntry, 'window text', 2), true, 'matching rollup version stays done')
+  assert.equal(eli5Done(rollupEntry, 'window text'), true, 'version-less callers keep hash-only semantics')
 })
 
 test('enrichEli5: bump rows carry the release window and refresh when it fills in', async (t) => {
