@@ -438,7 +438,7 @@ export const RELEASE_CTX_SUMMARY_CHARS = 300
 // instruction re-explains the ~715 bump rows without re-spending a cent on the
 // thousands of non-bump lines. v3: roll-ups may run to 8 sentences under the
 // widened cap instead of being sheared at the old 800-char cutter.
-export const RELEASE_ROLLUP_V = 3
+export const RELEASE_ROLLUP_V = 4
 
 // Which release line a bump row belongs to. Prefers the recorded track, then
 // the touched manifest path (file lists on old rows), then the version string
@@ -560,14 +560,22 @@ export function formatReleaseContext (ctx, bump) {
   const lines = (ctx.items || []).map(it => `- ${it.text}`)
   if (ctx.truncated) lines.push(`- ...[earlier changes truncated; newest ${(ctx.items || []).length} shown]...`)
   const net = ctx.net || {}
+  // Presence phrasing, not add/remove: the fold knows each name's final
+  // direction, not whether the reader already had it before the window. "The
+  // picker includes Muse Spark 1.2" stays true whether it just landed or was
+  // merely re-confirmed; "added 1.2" would not be.
   const netLines = []
   if (net.modelsIn.length || net.modelsOut.length) {
-    netLines.push(`- Free model picker, final state: ${net.modelsIn.length ? `added ${net.modelsIn.join(', ')}` : 'nothing added'}${net.modelsOut.length ? `; removed ${net.modelsOut.join(', ')}` : ''}.`)
+    const inPart = net.modelsIn.length ? `includes ${net.modelsIn.join(', ')}` : 'no newly added models'
+    const outPart = net.modelsOut.length ? `not part of it: ${net.modelsOut.join(', ')}` : ''
+    netLines.push(`- Free model picker at this release: ${inPart}${outPart ? `; ${outPart}` : ''}.`)
   }
   if (net.commandsIn.length || net.commandsOut.length) {
-    netLines.push(`- Slash commands, final state: ${net.commandsIn.length ? `added ${net.commandsIn.join(', ')}` : 'nothing added'}${net.commandsOut.length ? `; removed ${net.commandsOut.join(', ')}` : ''}.`)
+    const inPart = net.commandsIn.length ? `includes ${net.commandsIn.join(', ')}` : 'no newly added commands'
+    const outPart = net.commandsOut.length ? `not part of it: ${net.commandsOut.join(', ')}` : ''
+    netLines.push(`- Slash commands at this release: ${inPart}${outPart ? `; ${outPart}` : ''}.`)
   }
-  if (netLines.length) lines.push('Net effect by the time of this release (the final state; overrides any item above it contradicts):', ...netLines)
+  if (netLines.length) lines.push('Final catalog state at this release (authoritative; overrides any item above it that contradicts):', ...netLines)
   // An empty window (no items, no net effect) stays out of the prompt and out
   // of the cache key: the honest line for it is housekeeping, not an empty list.
   if (!lines.length) return ''
@@ -698,7 +706,7 @@ Rules:
 - Keep the audience the text gives, and keep it narrow. If the change is for one kind of customer, one plan, one region, or only after some step, name that group. Never widen it to "users", "everyone" or "customers" because that reads more naturally: a program for verified YC companies is not available to users.
 - Plain words, active voice. No "This change", "We are excited", marketing tone, or generic tautologies ("various bug fixes and improvements").
 - Jump straight into what happened. NEVER use conversational preambles, filler intros, or framing phrases like "In simple terms", "Basically", "To put it simply", "In plain English", "This commit", "This update", or "This pull request". Start directly with the concrete action or subject.
-- This row may be a version-label commit whose own diff is only packaging. When the evidence lists "Updates included in this release", THAT list is what this row is about: the "Technical summary" above describes only the label change itself and must not drive the line. Summarize what updating to this version gives the reader, drawn from that list, strongest user-visible item first. If the list ends with a "Net effect" line, that is the final state the reader ends up with: announce only what survives it -- something an item says was added but the net line says was later removed is NOT in this release. Only when the list is absent or holds no user-visible change, say honestly that this is a routine behind-the-scenes update that keeps installs current.
+- This row may be a version-label commit whose own diff is only packaging. When the evidence lists "Updates included in this release", THAT list is what this row is about: the "Technical summary" above describes only the label change itself and must not drive the line. Summarize what updating to this version gives the reader, drawn from that list, strongest user-visible item first. If the list ends with a "Final catalog state" line, that is what the reader ends up with: announce only what survives it -- something an item says was added but the final-state line leaves out of the picker is NOT in this release. Only when the list is absent or holds no user-visible change, say honestly that this is a routine behind-the-scenes update that keeps installs current.
 - If the change is an internal refactor, test suite update, dependency bump, or maintenance change with no direct user-facing behavior, explain it honestly and plainly as behind-the-scenes housekeeping or stability maintenance. Do NOT invent or fabricate user-facing features, performance claims, or speed improvements.
 - If the change is small or internal, say so shortly. Do not inflate it.
 - Never address the reader as a developer.

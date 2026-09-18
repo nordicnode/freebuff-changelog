@@ -631,8 +631,8 @@ test('release context: net effect folds catalog events so reversals lose', async
   // lines are present and authoritative, and the ask version rides the key.
   const rel = formatReleaseContext(ctx, bump)
   assert.match(rel, /Muse Spark 1\.3/)
-  assert.match(rel, /final state.*added Muse Spark 1\.2; removed Muse Spark 1\.3/)
-  assert.match(rel, /overrides any item above it contradicts/)
+  assert.match(rel, /Free model picker at this release: includes Muse Spark 1\.2; not part of it: Muse Spark 1\.3/)
+  assert.match(rel, /overrides any item above it that contradicts/)
   const p = buildEli5Prompt(bump, [], { releaseCtx: rel })
   assert.match(p, /announce only what survives it/)
   assert.match(p, /A release roll-up may run longer/)
