@@ -152,6 +152,20 @@ test('an unchanged PR costs no per-PR call: the steady list is nearly free', asy
   assert.equal(calls.filter(c => /\/pulls\/\d+$/.test(c)).length, 0, 'and costs nothing to keep')
 })
 
+test('an unchanged PR list does not rewrite open-prs.json, keeping the working tree clean', async (t) => {
+  const dir = await tmpData(t)
+  const initialTime = new Date(Date.now() - 20 * 60000).toISOString()
+  await writeFile(join(dir, 'open-prs.json'), JSON.stringify({
+    fetchedAt: initialTime, total: 2, listComplete: true,
+    prs: [1, 2].map(n => ({ number: n, title: `PR ${n}`, url: `https://github.com/${REPO}/pull/${n}`, author: 'a', created: '2026-09-01T00:00:00Z', updated: '2026-09-01T00:00:00Z', draft: false, comments: 0, reviewComments: 0, additions: 1, deletions: 0, files: 1, labels: [], hasDiff: true }))
+  }))
+  const { fetchImpl } = fakeGithub([2])
+  const prs = await fetchOpenPrs({ fetchImpl, dataDir: dir })
+  assert.equal(prs.length, 2)
+  const persisted = JSON.parse(await readFile(join(dir, 'open-prs.json'), 'utf8'))
+  assert.equal(persisted.fetchedAt, initialTime, 'fetchedAt was not bumped because data did not change')
+})
+
 test('a pushed PR gets its preview refetched, its stale diffstat dropped', async (t) => {
   const dir = await tmpData(t)
   const { mkdir, writeFile: wf, readFile: rf } = await import('node:fs/promises')

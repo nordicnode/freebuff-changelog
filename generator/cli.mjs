@@ -115,6 +115,32 @@ async function ensureRepo () {
  * pipeline that talks to a live third party, and these rules need tests rather
  * than an outage to notice them.
  */
+export const lastDiskFetchedMap = new Map()
+export const lastCheckTimeMap = new Map()
+
+export function prsEqual (cachedDoc, newPrs, total, complete, partial) {
+  if (!cachedDoc || !cachedDoc.fetchedAt) return false
+  if (Boolean(cachedDoc.listComplete) !== Boolean(complete)) return false
+  if (Boolean(cachedDoc.partial) !== Boolean(partial)) return false
+  if ((cachedDoc.total ?? null) !== (total ?? null)) return false
+  const oldPrs = cachedDoc.prs || []
+  if (oldPrs.length !== newPrs.length) return false
+  for (let i = 0; i < newPrs.length; i++) {
+    const o = oldPrs[i]
+    const n = newPrs[i]
+    if (o.number !== n.number || o.updated !== n.updated || o.title !== n.title ||
+        o.draft !== n.draft || o.comments !== n.comments || o.reviewComments !== n.reviewComments ||
+        o.additions !== n.additions || o.deletions !== n.deletions || o.files !== n.files ||
+        Boolean(o.hasDiff) !== Boolean(n.hasDiff) || o.reviewState !== n.reviewState) {
+      return false
+    }
+    if (JSON.stringify(o.labels || []) !== JSON.stringify(n.labels || [])) return false
+    if (JSON.stringify(o.commitsList || null) !== JSON.stringify(n.commitsList || null)) return false
+    if (JSON.stringify(o.commentsList || null) !== JSON.stringify(n.commentsList || null)) return false
+  }
+  return true
+}
+
 export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DATA, force = false } = {}) {
   const PR_PER_PAGE = 100
   // 10 pages is 1,000 open PRs. Past that the list itself is the story, and
@@ -153,8 +179,18 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
     const cached = Array.isArray(raw) ? { prs: raw } : raw
     const cachedPrs = cached?.prs || []
     const prevByNum = new Map(cachedPrs.map(p => [p.number, p]))
-    const age = cached?.fetchedAt ? Date.now() - Date.parse(cached.fetchedAt) : Infinity
+
+    const currentDiskFetched = cached?.fetchedAt || null
+    const prevDiskFetched = lastDiskFetchedMap.get(dataDir)
+    if (currentDiskFetched !== prevDiskFetched) {
+      lastDiskFetchedMap.set(dataDir, currentDiskFetched)
+      lastCheckTimeMap.set(dataDir, currentDiskFetched ? Date.parse(currentDiskFetched) : 0)
+    }
+    const lastChecked = lastCheckTimeMap.get(dataDir) || 0
+    const age = lastChecked ? Date.now() - lastChecked : Infinity
     if (!force && cachedPrs.length && age < PR_REFRESH_MIN * 60000) return cachedPrs
+
+    lastCheckTimeMap.set(dataDir, Date.now())
 
     let total = await probeTotal()
     const prs = []
@@ -374,13 +410,19 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
     // chasing diffstats). Conflating them meant previews of long-dead PRs were
     // never pruned, because decoration is always the thing that runs out.
     const partial = refused || used >= PR_CALL_BUDGET || !complete
-    await writeJson(`${dataDir}/open-prs.json`, {
-      fetchedAt: new Date().toISOString(),
-      ...(total != null ? { total } : {}),
-      listComplete: complete,
-      prs: list,
-      ...(partial ? { partial: true } : {})
-    })
+    const hasChanges = !prsEqual(cached, list, total, complete, partial)
+    if (hasChanges || force || !cached?.fetchedAt) {
+      const nowIso = new Date().toISOString()
+      lastDiskFetchedMap.set(dataDir, nowIso)
+      lastCheckTimeMap.set(dataDir, Date.now())
+      await writeJson(`${dataDir}/open-prs.json`, {
+        fetchedAt: nowIso,
+        ...(total != null ? { total } : {}),
+        listComplete: complete,
+        prs: list,
+        ...(partial ? { partial: true } : {})
+      })
+    }
     return list
   } catch (err) {
     log(`open PR fetch failed: ${String(err?.message || err).slice(0, 120)}`)

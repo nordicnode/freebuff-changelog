@@ -59,12 +59,62 @@ export function cacheKey (sha, patch, releaseCtx = '', rollupV = 0) {
   return `${sha}:v${PROMPT_V}:${patchHash(patch)}${extra}`
 }
 
-// Word-boundary cut: never slice mid-word or mid-token.
+export const DANGLING_CONNECTOR_RE = /(?:\s+|^)(?:and|or|in|to|the|with|for|of|from|by|as|at|is|are|a|an)\s*$/i
+
+// Word-boundary cut: never slice mid-word or mid-token, and never leave dangling prepositions/conjunctions.
 export function truncateWords (s, n) {
   s = String(s || '').trim()
-  if (s.length <= n) return s
+  if (s.length <= n) {
+    let res = s
+    while (DANGLING_CONNECTOR_RE.test(res.replace(/[.,;:!?]+$/, ''))) {
+      res = res.replace(/[.,;:!?]+$/, '').replace(DANGLING_CONNECTOR_RE, '').trim()
+    }
+    return res.replace(/[,;:]+$/, '').trim()
+  }
   const cut = s.lastIndexOf(' ', n)
-  return (cut > n * 0.5 ? s.slice(0, cut) : s.slice(0, n)).trim()
+  let res = (cut > n * 0.5 ? s.slice(0, cut) : s.slice(0, n)).trim()
+  while (DANGLING_CONNECTOR_RE.test(res.replace(/[.,;:!?]+$/, ''))) {
+    res = res.replace(/[.,;:!?]+$/, '').replace(DANGLING_CONNECTOR_RE, '').trim()
+  }
+  return res.replace(/[,;:]+$/, '').trim()
+}
+
+// Clean sentence-preserving text truncation: never truncates valid text under maxLen,
+// preserves sentence boundaries when text is longer, and never leaves dangling connectors.
+export function cleanText (s, maxLen = 2000, isSentence = false) {
+  s = String(s || '').trim()
+  if (!s) return ''
+  if (s.length <= maxLen) {
+    if (isSentence && DANGLING_CONNECTOR_RE.test(s.replace(/[.,;:!?]+$/, ''))) {
+      let text = s
+      while (DANGLING_CONNECTOR_RE.test(text.replace(/[.,;:!?]+$/, ''))) {
+        text = text.replace(/[.,;:!?]+$/, '').replace(DANGLING_CONNECTOR_RE, '').trim()
+      }
+      if (!/[.!?]$/.test(text)) text += '.'
+      return text
+    }
+    return s
+  }
+  if (isSentence) {
+    const sentenceEnd = Math.max(
+      s.lastIndexOf('. ', maxLen),
+      s.lastIndexOf('.\n', maxLen),
+      s.lastIndexOf('! ', maxLen),
+      s.lastIndexOf('? ', maxLen)
+    )
+    if (sentenceEnd > maxLen * 0.4) {
+      return s.slice(0, sentenceEnd + 1).trim()
+    }
+  }
+  let cut = s.lastIndexOf(' ', maxLen)
+  let text = (cut > maxLen * 0.4 ? s.slice(0, cut) : s.slice(0, maxLen)).trim()
+  while (DANGLING_CONNECTOR_RE.test(text.replace(/[.,;:!?]+$/, ''))) {
+    text = text.replace(/[.,;:!?]+$/, '').replace(DANGLING_CONNECTOR_RE, '').trim()
+  }
+  if (isSentence && !/[.!?]$/.test(text)) {
+    text += '.'
+  }
+  return text
 }
 
 // Per-file budget: split on file boundaries, cap each file, keep order.
@@ -303,7 +353,7 @@ export function validateLlmOut (out, fallbackSig = 'minor') {
   if (rawWords.some(w => w.length >= 18 || CAMEL_IDENT_RE.test(w) || SNAKE_IDENT_RE.test(w))) {
     throw new Error('LLM title contains raw identifier')
   }
-  let title = truncateWords(rawTitle.replace(/[`*#_[\]]/g, ' ').replace(/\s+/g, ' '), 70)
+  let title = truncateWords(rawTitle.replace(/[`*#_[\]]/g, ' ').replace(/\s+/g, ' '), 140)
   title = title.replace(/[.!?:;]+$/, '').trim()
   if (title) title = title.charAt(0).toUpperCase() + title.slice(1)
   const rawSummary = String(out.summary || '').trim()
@@ -311,14 +361,14 @@ export function validateLlmOut (out, fallbackSig = 'minor') {
   if (NOACTION_RE.test(rawSummary)) {
     throw new Error('LLM summary contains no-action boilerplate')
   }
-  const summary = truncateWords(rawSummary, 1200)
+  const summary = cleanText(rawSummary, 2000, true)
   const significance = ['minor', 'notable', 'major'].includes(out.significance) ? out.significance : fallbackSig
   const rawAction = out.actionRequired && typeof out.actionRequired === 'string' ? out.actionRequired.trim() : ''
   const actionRequired = rawAction && !NOACTION_RE.test(rawAction) && !NOACTION_ACTION_RE.test(rawAction)
-    ? truncateWords(rawAction, 300)
+    ? cleanText(rawAction, 2000, true)
     : null
   const rawEvidence = out.evidence && typeof out.evidence === 'string' ? out.evidence.trim() : ''
-  const evidence = rawEvidence ? truncateWords(rawEvidence, 500) : ''
+  const evidence = rawEvidence ? cleanText(rawEvidence, 1500, true) : ''
   return {
     title,
     summary,
