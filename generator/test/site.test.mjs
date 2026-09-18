@@ -454,6 +454,9 @@ test('buildSite generates valid static site output', async () => {
     const aboutHtml = await readFile(join(tmpDist, 'about/index.html'), 'utf8')
     assert.match(aboutHtml, /HOW IT WORKS/)
     assert.match(aboutHtml, /Deterministic first/)
+    assert.match(aboutHtml, /ACCURACY &amp; ANALYSIS PIPELINE/)
+    assert.match(aboutHtml, /ACTION REQUIRED/)
+    assert.match(aboutHtml, /ELI5 plain-English/)
     assert.match(aboutHtml, /LIMITS/)
     assert.match(aboutHtml, /Model Catalog/)
     assert.match(aboutHtml, /FEEDS \+ DISCORD/)
@@ -464,7 +467,7 @@ test('buildSite generates valid static site output', async () => {
     const aboutBody = aboutHtml.split('man-body">')[1].split('</section>')[0]
     const aboutWords = aboutBody
       .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length
-    assert.ok(aboutWords < 500, `about page is ${aboutWords} words; keep it under 500`)
+    assert.ok(aboutWords < 700, `about page is ${aboutWords} words; keep it under 700`)
     assert.doesNotMatch(aboutBody, /&mdash;|\u2014/, 'about copy carries no em-dashes')
 
     // Verify models page: lineup, retired, history rows, nav

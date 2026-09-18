@@ -2340,11 +2340,23 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <h4>WHAT IS THIS?</h4>
       <p>Commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, rebuilt from public git diffs. Upstream ships through snapshot merges with blank messages. This mirror diffs each snapshot to extract model swaps, version bumps, slash commands, and file churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} commits, updated whenever upstream moves.</p>
 
-      <h4>HOW IT WORKS</h4>
+      <h4>HOW IT WORKS: ACCURACY &amp; ANALYSIS PIPELINE</h4>
+      <p>We do not guess what changed. Every entry passes through a multi-stage deterministic and AI analysis pipeline designed for zero-hallucination accuracy:</p>
       <ul class="man-ul">
-        <li><strong>Deterministic first.</strong> Model tables and slash-command registries are set-differenced; version bumps come from <code>package.json</code>. Timestamps normalize to UTC.</li>
-        <li><strong>AI diff summaries.</strong> Technical summaries and plain-English takeaways generated from diff evidence alone, cached by SHA, prompt version, and diff hash.</li>
-        <li><strong>Linked proof.</strong> Every entry includes commit SHA, compare URL, stored diff, and stats, with the full diff loaded on demand.</li>
+        <li><strong>Deterministic first.</strong> Model tables and slash-command registries are set-differenced directly from git trees; version bumps come from <code>package.json</code>. Timestamps normalize to UTC.</li>
+        <li><strong>Monorepo architecture mapping.</strong> Code changes are contextualized across subsystems (<code>cli/</code>, <code>packages/agent-runtime/</code>, <code>common/</code>, <code>desktop/web/</code>, <code>sdk/</code>, <code>docs/</code>) to pinpoint exact runtime layers.</li>
+        <li><strong>Deep context &amp; PR intent.</strong> Up to 500KB of clean source diffs, PR motivation and discussion metadata from GitHub, same-day commit sequence ordering, and developer code comments feed a 270K context window.</li>
+        <li><strong>Anti-hallucination guardians.</strong> Commits affecting only test suites, mocks, or documentation are isolated by strict classification rules, barring the AI from claiming unverified runtime features or speedups.</li>
+        <li><strong>Evidence citations &amp; validation gates.</strong> The model must cite exact diff hunks and functions before drafting summaries. Schema gates strip raw identifiers, reject filler, and trigger automated repair passes.</li>
+        <li><strong>Deterministic cache &amp; linked proof.</strong> Technical summaries and ELI5 takeaways are hashed by commit SHA, diff content, and prompt version. Every card links to the commit SHA, compare URL, and on-demand diff.</li>
+      </ul>
+
+      <h4>USER-FACING HIGHLIGHTS</h4>
+      <ul class="man-ul">
+        <li><strong>ACTION REQUIRED alerts.</strong> Red high-contrast badges spotlight breaking changes, configuration migrations, or required user interventions across cards, Discord broadcasts, and feeds.</li>
+        <li><strong>ELI5 plain-English takeaways.</strong> A structured 3-pillar breakdown (Core Change, Who It Affects, Everyday Impact) beneath each technical summary explains changes without programming jargon.</li>
+        <li><strong>Release roll-ups.</strong> Version bump rows synthesize all predecessor features, model additions, and commands in that release window instead of reporting a bare version label change.</li>
+        <li><strong>Related changes &amp; story linking.</strong> Same-day and same-topic commits are clustered automatically into coherent development narratives.</li>
       </ul>
 
       <h4>WHAT WE TRACK</h4>

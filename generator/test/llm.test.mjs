@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch } from '../lib/llm.mjs'
+import { parseLlmJson, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -957,3 +957,156 @@ test('enrichEli5: writes the line, caches it by the summary, asks once', async (
     globalThis.fetch = orig
   }
 })
+
+test('versions bumped for 270K context overhaul', () => {
+  assert.equal(PROMPT_V, 7, 'PROMPT_V bumped to 7')
+  assert.equal(ELI5_V, 6, 'ELI5_V bumped to 6')
+})
+
+test('buildPrompt: injects architecture map, PR motivation, sequence context, and requires evidence', () => {
+  const entry = {
+    sha: 'abcdef1234567890abcdef1234567890abcdef12',
+    date: '2026-09-17T12:00:00Z',
+    category: 'Agent Runtime',
+    areas: ['Agent Runtime'],
+    significance: 'notable',
+    summary: 'Streaming agent runner implemented.',
+    messageBody: 'Resolves memory leak during recursive subagent execution.'
+  }
+  const sequence = {
+    earlier: [{ sha: '1111111111', title: 'Earlier work', summary: 'Preceding step', category: 'CLI' }],
+    later: [{ sha: '2222222222', title: 'Later work', summary: 'Succeeding step', category: 'Agent Runtime' }]
+  }
+  const prMeta = { number: 1372, title: 'Support agent plugins' }
+  const prompt = buildPrompt(entry, 'diff --git a/x b/x\n+export const agent = 1\n', { sequence, prMeta })
+
+  assert.match(prompt, /Freebuff Monorepo Architecture Context:/)
+  assert.match(prompt, /packages\/agent-runtime/)
+  assert.match(prompt, /Author intent & PR motivation:/)
+  assert.match(prompt, /PR #1372: Support agent plugins/)
+  assert.match(prompt, /Resolves memory leak during recursive subagent execution/)
+  assert.match(prompt, /Same-day commit sequence/)
+  assert.match(prompt, /Earlier: \[11111111\] Earlier work/)
+  assert.match(prompt, /Current: \[abcdef12\] \(This commit\)/)
+  assert.match(prompt, /Later:   \[22222222\] Later work/)
+  assert.match(prompt, /"evidence": "<1-2 sentences citing exact file, function, flag, or diff hunk>"/)
+})
+
+test('buildEli5Prompt: injects architecture map, PR motivation, sequence context, and 60KB diff budget', () => {
+  const entry = {
+    sha: 'abcdef1234567890abcdef1234567890abcdef12',
+    day: '2026-09-17',
+    category: 'CLI',
+    areas: ['CLI'],
+    significance: 'notable',
+    title: 'New /byok slash command',
+    summary: 'Brings own API key support to terminal.',
+    messageBody: 'Fixes #1374 for users with enterprise keys.'
+  }
+  const sequence = {
+    earlier: [{ sha: '1111111111', title: 'Earlier CLI work' }],
+    later: [{ sha: '2222222222', title: 'Later CLI work' }]
+  }
+  const prMeta = { number: 1374, title: 'Add BYOK support' }
+  const prompt = buildEli5Prompt(entry, [], {
+    patch: 'diff --git a/cli/src/byok.ts b/cli/src/byok.ts\n+const byok = true\n',
+    diffBytes: 60000,
+    sequence,
+    prMeta
+  })
+
+  assert.match(prompt, /Freebuff Monorepo Architecture Context:/)
+  assert.match(prompt, /cli\//)
+  assert.match(prompt, /Developer intent \(PR #1374\): Add BYOK support/)
+  assert.match(prompt, /Fixes #1374 for users with enterprise keys/)
+  assert.match(prompt, /Same-day commit sequence: Earlier: Earlier CLI work -> Current: New \/byok slash command -> Later: Later CLI work/)
+  assert.match(prompt, /diff --git a\/cli\/src\/byok\.ts/)
+})
+
+test('validateLlmOut: extracts and validates evidence field', () => {
+  const out = validateLlmOut({
+    evidence: 'Modified handleStream in packages/agent-runtime/src/stream.ts hunk @@ -10,5 +10,12 @@',
+    title: 'Stream response chunking',
+    summary: 'Added streaming chunk buffers to reduce latency on slow connections. Preserves backpressure.',
+    significance: 'notable',
+    actionRequired: 'Update SDK client to v1.2'
+  })
+  assert.equal(out.title, 'Stream response chunking')
+  assert.match(out.evidence, /handleStream in packages\/agent-runtime/)
+  assert.equal(out.actionRequired, 'Update SDK client to v1.2')
+  assert.equal(out.significance, 'notable')
+})
+
+test('loadPrIndex & findPrMeta: matches PR by number, commit sha, or commit message', async (t) => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-pr-test-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+
+  const fakePrs = {
+    prs: [
+      {
+        number: 1377,
+        title: 'fix(cli): guard systeminformation.cpu()',
+        author: 'heavymio',
+        commitsList: [{ sha: '31878f417cd8d61477ce700bef161524bdec5736' }]
+      },
+      {
+        number: 1372,
+        title: 'Support agent plugins',
+        author: 'hsm207',
+        commitsList: [{ sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }]
+      }
+    ]
+  }
+  await writeFile(join(dir, 'open-prs.json'), JSON.stringify(fakePrs))
+
+  const index = await loadPrIndex(dir)
+  assert.ok(index.prsByNum.has(1377))
+  assert.ok(index.prsBySha.has('31878f417c'))
+
+  // Match by e.pr
+  const byPr = findPrMeta({ pr: 1377 }, index)
+  assert.equal(byPr?.number, 1377)
+  assert.equal(byPr?.author, 'heavymio')
+
+  // Match by e.sha
+  const bySha = findPrMeta({ sha: '31878f417cd8d61477ce700bef161524bdec5736' }, index)
+  assert.equal(bySha?.number, 1377)
+
+  // Match by #1372 in title
+  const byTitle = findPrMeta({ title: 'feat: agent plugins (#1372)' }, index)
+  assert.equal(byTitle?.number, 1372)
+
+  // Non-matching
+  const noMatch = findPrMeta({ title: 'unrelated commit' }, index)
+  assert.equal(noMatch, null)
+})
+
+test('groupEntriesByDay & sequenceForEntry: computes preceding and succeeding commits on same day', () => {
+  const entries = [
+    { sha: '1111111111', day: '2026-09-17', date: '2026-09-17T09:00:00Z', title: 'Commit 1', category: 'CLI' },
+    { sha: '2222222222', day: '2026-09-17', date: '2026-09-17T11:00:00Z', title: 'Commit 2', category: 'CLI' },
+    { sha: '3333333333', day: '2026-09-17', date: '2026-09-17T13:00:00Z', title: 'Commit 3', category: 'Agent Runtime' },
+    { sha: '4444444444', day: '2026-09-17', date: '2026-09-17T15:00:00Z', title: 'Commit 4', category: 'Shared/Core' },
+    { sha: '5555555555', day: '2026-09-18', date: '2026-09-18T09:00:00Z', title: 'Next Day Commit', category: 'CLI' }
+  ]
+
+  const byDay = groupEntriesByDay(entries)
+  assert.equal(byDay.get('2026-09-17')?.length, 4)
+  assert.equal(byDay.get('2026-09-18')?.length, 1)
+
+  const seq = sequenceForEntry(byDay, entries[2], 2) // Target Commit 3
+  assert.equal(seq?.earlier?.length, 2)
+  assert.equal(seq?.earlier[0].title, 'Commit 1')
+  assert.equal(seq?.earlier[1].title, 'Commit 2')
+  assert.equal(seq?.later?.length, 1)
+  assert.equal(seq?.later[0].title, 'Commit 4')
+
+  // First commit has no earlier
+  const seqFirst = sequenceForEntry(byDay, entries[0], 2)
+  assert.equal(seqFirst?.earlier?.length, 0)
+  assert.equal(seqFirst?.later?.length, 2)
+})
+

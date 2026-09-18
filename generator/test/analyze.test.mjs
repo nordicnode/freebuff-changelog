@@ -7,7 +7,8 @@ import {
   commandIdsFromRegistry,
   areaOf, isNoiseFile, deterministicSummary, entryTitle, churnLabel, testLabel, sourceRef, isSyncCommit,
   extractCommentFacts, extractCleanDiff, extractRawDiff, EMPTY_TREE, parseMarkdownTables, catalogFromReadme,
-  diffCatalogs, commitNatureOf
+  diffCatalogs, commitNatureOf, analyzeCommunityCommit, analyzeSyncCommit,
+  MONOREPO_COMPONENTS, formatArchitectureMap, discoverMonorepoArchitecture
 } from '../lib/analyze.mjs'
 import { toUtc, ymd } from '../lib/util.mjs'
 
@@ -359,5 +360,114 @@ test('commitNatureOf classifies test-only, docs-only, config-only, churn, releas
   assert.equal(commitNatureOf({ files: { modified: ['cli/src/main.ts', 'test/main.test.ts'] } }), 'production')
 })
 
+test('commit messageBody: extracted on community and sync commits, stripping source line', async (t) => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { execFileSync } = await import('node:child_process')
+  const repoMeta = { repoUrl: 'https://github.com/CodebuffAI/freebuff', compareUrl: 'https://github.com/CodebuffAI/freebuff/compare' }
+  const communityCommit = {
+    sha: '1234567890abcdef1234567890abcdef12345678',
+    subject: 'fix: improve token handling (#100)',
+    body: 'This improves token handling by streaming chunks.\nDetailed explanation here.',
+    author: 'alice',
+    date: '2026-09-17T12:00:00Z'
+  }
+  const commEntry = await analyzeCommunityCommit('', communityCommit, null, repoMeta)
+  assert.equal(commEntry.messageBody, 'This improves token handling by streaming chunks.\nDetailed explanation here.')
 
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-syncbody-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const g = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  g('init', '-q', '-b', 'main')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+  await writeFile(join(dir, 'a.txt'), '1\n')
+  g('add', '.')
+  g('commit', '-q', '-m', 'root')
+  const prevSha = g('rev-parse', 'HEAD').trim()
 
+  await writeFile(join(dir, 'a.txt'), '2\n')
+  g('add', '.')
+  g('commit', '-q', '-m', 'sync: mirror updates', '-m', 'Source: upstream/freebuff@1234567890abcdef1234567890abcdef12345678\nFix crash on startup when config file is missing.')
+  const commitSha = g('rev-parse', 'HEAD').trim()
+
+  const syncCommit = {
+    sha: commitSha,
+    subject: 'sync: mirror updates',
+    body: 'Source: upstream/freebuff@1234567890abcdef1234567890abcdef12345678\nFix crash on startup when config file is missing.',
+    author: 'bob',
+    date: '2026-09-17T13:00:00Z'
+  }
+  const syncEntry = await analyzeSyncCommit(dir, syncCommit, prevSha, repoMeta)
+  assert.equal(syncEntry.messageBody, 'Fix crash on startup when config file is missing.')
+})
+
+test('MONOREPO_COMPONENTS & formatArchitectureMap: contains verified monorepo subsystems', () => {
+  assert.ok(Array.isArray(MONOREPO_COMPONENTS))
+  assert.ok(MONOREPO_COMPONENTS.length >= 12)
+  const prefixes = MONOREPO_COMPONENTS.map(c => c.prefix)
+  assert.ok(prefixes.includes('cli/'))
+  assert.ok(prefixes.includes('packages/agent-runtime/'))
+  assert.ok(prefixes.includes('packages/code-map/'))
+  assert.ok(prefixes.includes('packages/llm-providers/'))
+  assert.ok(prefixes.includes('common/'))
+  assert.ok(prefixes.includes('sdk/'))
+
+  const formatted = formatArchitectureMap(MONOREPO_COMPONENTS)
+  assert.match(formatted, /^Freebuff Monorepo Architecture Context:/)
+  assert.match(formatted, /- `cli\/`: /)
+  assert.match(formatted, /- `packages\/agent-runtime\/`: /)
+})
+
+test('discoverMonorepoArchitecture: dynamic discovery of unknown subsystems and packages', async (t) => {
+  const { mkdtemp, writeFile, mkdir, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { execFileSync } = await import('node:child_process')
+
+  // Case 1: no repoDir returns default MONOREPO_COMPONENTS
+  const fallback = await discoverMonorepoArchitecture(null)
+  assert.equal(fallback.length, MONOREPO_COMPONENTS.length)
+
+  // Case 2: dynamic git repo with a new top-level dir and a new package
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-arch-test-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const g = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  g('init', '-q', '-b', 'main')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+
+  // Create known directory
+  await mkdir(join(dir, 'cli'), { recursive: true })
+  await writeFile(join(dir, 'cli', 'index.ts'), 'export const cli = 1\n')
+
+  // Create new unknown top-level subsystem
+  await mkdir(join(dir, 'plugins'), { recursive: true })
+  await writeFile(join(dir, 'plugins', 'README.md'), 'Freebuff plugins\n')
+
+  // Create new packages/ subsystem with package.json
+  await mkdir(join(dir, 'packages', 'vector-search'), { recursive: true })
+  await writeFile(join(dir, 'packages', 'vector-search', 'package.json'), JSON.stringify({
+    name: '@freebuff/vector-search',
+    description: 'Semantic vector search engine for codebase indexing.'
+  }))
+
+  g('add', '.')
+  g('commit', '-q', '-m', 'feat: initial monorepo with custom packages')
+
+  const discovered = await discoverMonorepoArchitecture(dir, 'HEAD')
+  const discoveredPrefixes = discovered.map(c => c.prefix)
+
+  assert.ok(discoveredPrefixes.includes('cli/'))
+  assert.ok(discoveredPrefixes.includes('plugins/'))
+  assert.ok(discoveredPrefixes.includes('packages/vector-search/'))
+
+  const vectorSearch = discovered.find(c => c.prefix === 'packages/vector-search/')
+  assert.equal(vectorSearch?.area, 'Vector Search')
+  assert.equal(vectorSearch?.desc, 'Semantic vector search engine for codebase indexing.')
+
+  const plugins = discovered.find(c => c.prefix === 'plugins/')
+  assert.equal(plugins?.area, 'Plugins')
+  assert.equal(plugins?.desc, 'Monorepo subsystem plugins/')
+})

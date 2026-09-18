@@ -407,26 +407,150 @@ export function extractSlashCommandChanges (patch) {
   }
 }
 
-const AREA_MAP = [
-  [/^cli\//, 'CLI'],
-  [/^common\//, 'Shared/Core'],
-  [/^packages\/agent-runtime\//, 'Agent Runtime'],
-  [/^packages\/code-map\//, 'Code Map'],
-  [/^packages\/llm-providers\//, 'LLM Providers'],
-  [/^packages\//, 'Packages'],
-  [/^sdk\//, 'SDK'],
-  [/^agents\//, 'Agents'],
-  [/^docs\//, 'Docs'],
-  [/^freebuff\//, 'Packaging'],
-  [/^evals\//, 'Evals'],
-  [/^scripts\//, 'Tooling'],
-  [/^\.github\//, 'CI'],
-  [/^assets\//, 'Assets']
+export const MONOREPO_COMPONENTS = [
+  {
+    prefix: 'cli/',
+    pattern: /^cli\//,
+    area: 'CLI',
+    desc: 'Command-line interface, terminal UI, keyboard shortcuts, slash commands (/ask, /undo, /diff, /byok), terminal rendering, settings.'
+  },
+  {
+    prefix: 'packages/agent-runtime/',
+    pattern: /^packages\/agent-runtime\//,
+    area: 'Agent Runtime',
+    desc: 'Core autonomous agent loop, tool execution engine, subagent orchestration, tool runner, execution planning.'
+  },
+  {
+    prefix: 'packages/code-map/',
+    pattern: /^packages\/code-map\//,
+    area: 'Code Map',
+    desc: 'Code structure intelligence, AST parsing via Tree-Sitter, syntax tree symbol extraction.'
+  },
+  {
+    prefix: 'packages/llm-providers/',
+    pattern: /^packages\/llm-providers\//,
+    area: 'LLM Providers',
+    desc: 'Model provider adapters, OpenAI-compatible streaming endpoints, protocol translation.'
+  },
+  {
+    prefix: 'common/',
+    pattern: /^common\//,
+    area: 'Shared/Core',
+    desc: 'Core types, model catalog definitions, free model picker configurations, shared protocols, telemetry, auth.'
+  },
+  {
+    prefix: 'sdk/',
+    pattern: /^sdk\//,
+    area: 'SDK',
+    desc: 'Public SDK client library, developer extension points, programmatic access to Freebuff.'
+  },
+  {
+    prefix: 'agents/',
+    pattern: /^agents\//,
+    area: 'Agents',
+    desc: 'Built-in agent definitions, prompt templates, system instructions.'
+  },
+  {
+    prefix: 'freebuff/',
+    pattern: /^freebuff\//,
+    area: 'Packaging',
+    desc: 'Package manifests, release packaging, binary distribution configs.'
+  },
+  {
+    prefix: 'evals/',
+    pattern: /^evals\//,
+    area: 'Evals',
+    desc: 'Agent evaluation benchmarks, test harnesses, accuracy scoring.'
+  },
+  {
+    prefix: 'docs/',
+    pattern: /^docs\//,
+    area: 'Docs',
+    desc: 'Documentation, setup guides, protocol specifications.'
+  },
+  {
+    prefix: 'scripts/',
+    pattern: /^scripts\//,
+    area: 'Tooling',
+    desc: 'Internal build scripts, local development helpers, dev environment automation.'
+  },
+  {
+    prefix: '.github/',
+    pattern: /^\.github\//,
+    area: 'CI',
+    desc: 'GitHub Actions workflows, automated CI/CD checks, PR hygiene automation.'
+  },
+  {
+    prefix: 'assets/',
+    pattern: /^assets\//,
+    area: 'Assets',
+    desc: 'Static branding assets, images, icons.'
+  }
+]
+
+export const AREA_MAP = [
+  ...MONOREPO_COMPONENTS.map(c => [c.pattern, c.area]),
+  [/^packages\//, 'Packages']
 ]
 
 export function areaOf (path) {
   for (const [re, name] of AREA_MAP) if (re.test(path)) return name
   return 'Repo'
+}
+
+export function formatArchitectureMap (components = MONOREPO_COMPONENTS) {
+  const lines = [
+    'Freebuff Monorepo Architecture Context:',
+    ...components.map(c => `- \`${c.prefix}\`: ${c.desc}`)
+  ]
+  return lines.join('\n')
+}
+
+export async function discoverMonorepoArchitecture (repoDir, ref = 'origin/main') {
+  if (!repoDir) return [...MONOREPO_COMPONENTS]
+  try {
+    const rootTree = await git(['ls-tree', '-d', '--name-only', ref], repoDir, { allowFail: true })
+    if (!rootTree) return [...MONOREPO_COMPONENTS]
+    const rootNames = rootTree.split('\n').map(s => s.trim()).filter(Boolean)
+
+    let pkgNames = []
+    if (rootNames.includes('packages')) {
+      const pkgsTree = await git(['ls-tree', '-d', '--name-only', `${ref}:packages`], repoDir, { allowFail: true })
+      if (pkgsTree) {
+        pkgNames = pkgsTree.split('\n').map(s => s.trim()).filter(Boolean).map(p => `packages/${p}`)
+      }
+    }
+
+    const allPaths = [...rootNames.filter(r => r !== 'packages'), ...pkgNames]
+    const unmapped = []
+
+    for (const p of allPaths) {
+      if (p.includes('.') && !p.startsWith('.github')) continue
+      const pathWithSlash = p.endsWith('/') ? p : `${p}/`
+      const isMapped = MONOREPO_COMPONENTS.some(c => c.prefix === pathWithSlash || c.pattern.test(pathWithSlash))
+      if (!isMapped) {
+        let desc = ''
+        try {
+          const pkgJson = await git(['show', `${ref}:${p}/package.json`], repoDir, { allowFail: true })
+          if (pkgJson) {
+            const parsed = JSON.parse(pkgJson)
+            desc = parsed.description || parsed.name || ''
+          }
+        } catch { /* not a node package or unreadable */ }
+
+        const areaName = p.replace(/^packages\//, '').replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+        unmapped.push({
+          prefix: pathWithSlash,
+          pattern: new RegExp(`^${p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`),
+          area: areaName,
+          desc: desc || `Monorepo subsystem ${p}/`
+        })
+      }
+    }
+    return [...MONOREPO_COMPONENTS, ...unmapped]
+  } catch {
+    return [...MONOREPO_COMPONENTS]
+  }
 }
 
 export function isNoiseFile (p) {
@@ -508,6 +632,10 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
   const renamed = sourceMeaningful.filter(f => f.status === 'renamed')
   const modified = sourceMeaningful.filter(f => f.status === 'modified').map(f => f.path)
 
+  const cleanBody = (commit.body || '')
+    .replace(/^Source:\s*[\w./-]+@[0-9a-f]{40}\s*$/m, '')
+    .trim()
+
   const entry = {
     kind: 'sync',
     sha: commit.sha,
@@ -516,6 +644,7 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
     compareUrl: `${repoMeta.compareUrl}/${prevSha.slice(0, 12)}...${commit.sha.slice(0, 12)}`,
     date: commit.date,
     sourceSha: sourceRef(commit),
+    ...(cleanBody ? { messageBody: cleanBody } : {}),
     version,
     ...(freebuffVersion ? { freebuffVersion } : {}),
     ...(versionTrack ? { versionTrack } : {}),
@@ -758,6 +887,7 @@ export async function analyzeCommunityCommit (repoDir, commit, prevSha, repoMeta
     pr: prMatch ? Number(prMatch[1]) : null,
     prUrl: prMatch ? `${repoMeta.repoUrl}/pull/${prMatch[1]}` : null,
     messageTitle: commit.subject,
+    ...(commit.body?.trim() ? { messageBody: commit.body.trim() } : {}),
     version: verMatch ? verMatch[1] : null,
     areas: areas.length ? areas : ['Repo'],
     modelChanges: null,

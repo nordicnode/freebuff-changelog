@@ -509,7 +509,7 @@ async function generateOnce (argv) {
   if (toEnrich.length > 0) {
     await backfillDiffs(toEnrich, toEnrich.length)
     if (llmConfigured()) {
-      const n = await enrichWithLlm(toEnrich, llmPatchFor, DATA)
+      const n = await enrichWithLlm(toEnrich, llmPatchFor, DATA, process.env, { repoDir: REPO_DIR })
       log(`LLM enriched ${n} new entries`)
     }
   }
@@ -517,7 +517,7 @@ async function generateOnce (argv) {
   // summary it explains may have been written minutes ago by the other pass.
   // This call is what makes a brand-new entry arrive with its plain-English line
   // already attached instead of waiting for a backfill.
-  const eli5N = await enrichEli5(entries, DATA, process.env, { getPatch: llmPatchFor })
+  const eli5N = await enrichEli5(entries, DATA, process.env, { getPatch: llmPatchFor, repoDir: REPO_DIR })
   if (eli5N) log(`ELI5 wrote ${eli5N} plain-English line${eli5N === 1 ? '' : 's'}`)
 
   const prevScanned = existing.counts?.commitsScanned || 0
@@ -843,7 +843,8 @@ async function catchUpOnce (argv) {
     const n = await enrichWithLlm(entries, llmPatchFor, DATA, envWithLimit, {
       retryErrors: true,
       // This cycle's commits go first; the backlog can wait, the news cannot.
-      priorityShas: new Set(freshShas.slice(-limit))
+      priorityShas: new Set(freshShas.slice(-limit)),
+      repoDir: REPO_DIR
     })
     const remaining = queueable.filter(e => !isCurrent(e)).length
     log(`[backfill] enriched ${n} entries with LLM (${remaining} remaining)`)
@@ -860,7 +861,8 @@ async function catchUpOnce (argv) {
     const eli5Written = await enrichEli5(entries, DATA, { ...process.env, CHANGELOG_LLM_LIMIT: String(limit) }, {
       retryErrors: true,
       priorityShas: new Set(freshShas.slice(-limit)),
-      getPatch: llmPatchFor
+      getPatch: llmPatchFor,
+      repoDir: REPO_DIR
     })
     const eli5Remaining = entries.filter(e => eli5Eligible(e) && !eli5Done(e)).length
     if (eli5Written || eli5Remaining) {
@@ -1085,8 +1087,8 @@ async function enrichAllPass (argv) {
   refreshDiffFlags(entries, diffDir)
 
   // 2. Summaries + plain-English lines, newest-first inside their own priorities.
-  const calls = llmConfigured(env) ? await enrichWithLlm(entries, llmPatchFor, DATA, env, { retryErrors: true }) : 0
-  const eli5 = llmConfigured(env) ? await enrichEli5(entries, DATA, env, { retryErrors: true, getPatch: llmPatchFor }) : 0
+  const calls = llmConfigured(env) ? await enrichWithLlm(entries, llmPatchFor, DATA, env, { retryErrors: true, repoDir: REPO_DIR }) : 0
+  const eli5 = llmConfigured(env) ? await enrichEli5(entries, DATA, env, { retryErrors: true, getPatch: llmPatchFor, repoDir: REPO_DIR }) : 0
   if (!llmConfigured(env)) log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env): stored diffs only')
 
   const isCurrent = (e) => e.ai?.title && (e.ai?.v ?? 1) >= PROMPT_V

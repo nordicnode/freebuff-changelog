@@ -25,14 +25,25 @@
 //   options.priorityShas       SHAs to summarize ahead of the backlog
 import { readJson, writeJson, log, pool, shortHash, eli5Source } from './util.mjs'
 import { mergeAiCache } from './mergedata.mjs'
-import { extractCommentFacts, isBumpEntry, versionTrackOf, VERSION_TRACKS, commitNatureOf } from './analyze.mjs'
+import {
+  extractCommentFacts,
+  isBumpEntry,
+  versionTrackOf,
+  VERSION_TRACKS,
+  commitNatureOf,
+  MONOREPO_COMPONENTS,
+  formatArchitectureMap,
+  discoverMonorepoArchitecture
+} from './analyze.mjs'
 
 export function llmConfigured (env = process.env) {
   return env.CHANGELOG_LLM === '1' && !!env.LLM_API_KEY
 }
 
 // Bump when buildPrompt changes so stale entries re-summarize exactly once.
-export const PROMPT_V = 6
+export const PROMPT_V = 7
+
+export const FREEBUFF_ARCHITECTURE_MAP = formatArchitectureMap(MONOREPO_COMPONENTS)
 
 export function firstSentence (s) {
   const m = String(s || '').trim().match(/^[^.?!]+[.?!]/)
@@ -57,8 +68,8 @@ export function truncateWords (s, n) {
 }
 
 // Per-file budget: split on file boundaries, cap each file, keep order.
-// Defaults allow up to 250 KB (uncapped for modern LLM context windows).
-export function budgetPatch (patch, maxBytes = 250000, perFile = 60000) {
+// Defaults allow up to 500 KB (optimized for 270K+ context windows).
+export function budgetPatch (patch, maxBytes = 500000, perFile = 120000) {
   const parts = String(patch || '').split(/(?=^diff --git )/m)
   if (parts.length <= 1) {
     return patch.length > maxBytes
@@ -80,15 +91,19 @@ export function buildPrompt (entry, patch, ctx = {}) {
   const nature = entry.commitNature || commitNatureOf(entry)
   const lines = [
     'You write changelog entries for Freebuff, a free AI coding agent. Your reader is a TECHNICAL user: a developer who uses Freebuff daily and reads diffs.',
-    'Rules: use ONLY facts from the diff and the analysis notes below. Never invent file names, features, or versions.',
+    'Rules: use ONLY facts from the diff, the commit metadata, and the analysis notes below. Never invent file names, features, or versions.',
     'Title: plain text, max 70 chars, no backticks, no markdown, no trailing period. Lead with the concrete change (model name, command with leading slash, version, subsystem). Translate code identifiers into plain words (split snake_case/camelCase/CONSTANT_CASE, drop glued version suffixes); never emit a raw glued identifier as a title word.',
     'Summary guidelines (2-4 sentences of fluid technical prose, backticks allowed for identifiers):',
     '- State WHAT changed and the mechanism precisely: names, versions, commands, flags, files. Lead with the functional change, then the technical mechanism.',
-    '- State WHY it happened if grounded in notes/diff (root cause, upstream failure, deprecation). If reason is not visible, describe the mechanism — never invent motives.',
-    '- Weave scope and touched packages (CLI, SDK, Common, Web, etc.) naturally into the explanation. Do NOT write repetitive template phrases like "Scope limited to...".',
+    '- State WHY it happened if grounded in notes/diff/PR context (root cause, upstream failure, deprecation). If reason is not visible, describe the mechanism — never invent motives.',
+    '- Ground the change in the Freebuff Monorepo Architecture below. Name the affected package or surface naturally without repetitive template phrases like "Scope limited to...".',
     '- DETAIL: include one concrete technical fact (migration behavior, trait change, alias, flag, or constraint). Never paste raw diff lines. Never write "Nothing to do" or no-action boilerplate.',
     '- If this change is a breaking change, deprecation, or requires developer action (e.g. migrating preferences, setting an env var), describe it in "actionRequired". Otherwise set "actionRequired" to null.',
-    `Output a JSON object: {"title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "${entry.significance || 'minor'}", "actionRequired": null | "<action description>"}.`,
+    '',
+    ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP,
+    '',
+    'Output format: First, identify and cite the concrete evidence in the diff (function name, file, or hunk) in "evidence", then produce title and summary.',
+    `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, flag, or diff hunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "${entry.significance || 'minor'}", "actionRequired": null | "<action description>"}.`,
     `Significance (deterministic default "${entry.significance || 'minor'}"): keep it unless the diff clearly contradicts it.`,
     'major = new feature, model added/removed, security, breaking. notable = user-visible behavior/UI change, new file, API change. minor = internal, refactor, types, comments, deps.',
     '',
@@ -105,6 +120,21 @@ export function buildPrompt (entry, patch, ctx = {}) {
     lines.push('Test & Documentation Guardian: This commit modifies internal tests, test fixtures, or mocks only. No production runtime behavior changed; describe this accurately as test suite verification.')
   } else if (nature === 'docs-only') {
     lines.push('Test & Documentation Guardian: This commit updates documentation only. Describe it as documentation/reference updates; do not describe it as a software feature.')
+  }
+  if (ctx.prMeta || entry.messageBody) {
+    lines.push('Author intent & PR motivation:')
+    if (ctx.prMeta?.number) lines.push(`- PR #${ctx.prMeta.number}: ${ctx.prMeta.title || ''}`)
+    if (entry.messageBody) lines.push(`- Commit message details: ${truncateWords(entry.messageBody, 1000)}`)
+  }
+  if (ctx.sequence && (ctx.sequence.earlier?.length || ctx.sequence.later?.length)) {
+    lines.push('Same-day commit sequence (ground this commit within its surrounding work):')
+    for (const s of ctx.sequence.earlier || []) {
+      lines.push(`- Earlier: [${s.sha.slice(0, 8)}] ${s.title} (${s.summary || s.category || ''})`)
+    }
+    lines.push(`- Current: [${entry.sha.slice(0, 8)}] (This commit)`)
+    for (const s of ctx.sequence.later || []) {
+      lines.push(`- Later:   [${s.sha.slice(0, 8)}] ${s.title} (${s.summary || s.category || ''})`)
+    }
   }
   if (entry.modelChanges) {
     lines.push(`Model catalog: +${entry.modelChanges.added.join(', ')} -${entry.modelChanges.removed.join(', ')}`)
@@ -132,8 +162,8 @@ export function buildPrompt (entry, patch, ctx = {}) {
   if (renamed.length) lines.push(`Renamed files: ${renamed.slice(0, 8).join(', ')}`)
   const facts = (entry.facts || []).slice(0, 5)
   if (facts.length) lines.push(`Key facts (ground the WHY and DETAIL sentences in these): ${facts.map(f => `- ${f}`).join(' ')}`)
-  const maxDiff = Number(process.env.CHANGELOG_LLM_MAX_DIFF_BYTES) || 250000
-  lines.push('', 'Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):', '```diff', budgetPatch(patch, maxDiff, Math.max(60000, Math.round(maxDiff / 4))), '```')
+  const maxDiff = Number(process.env.CHANGELOG_LLM_MAX_DIFF_BYTES) || 500000
+  lines.push('', 'Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):', '```diff', budgetPatch(patch, maxDiff, Math.max(100000, Math.round(maxDiff / 4))), '```')
   return lines.filter(Boolean).join('\n')
 }
 
@@ -287,7 +317,15 @@ export function validateLlmOut (out, fallbackSig = 'minor') {
   const actionRequired = rawAction && !NOACTION_RE.test(rawAction) && !NOACTION_ACTION_RE.test(rawAction)
     ? truncateWords(rawAction, 300)
     : null
-  return { title, summary, significance, ...(actionRequired ? { actionRequired } : {}) }
+  const rawEvidence = out.evidence && typeof out.evidence === 'string' ? out.evidence.trim() : ''
+  const evidence = rawEvidence ? truncateWords(rawEvidence, 500) : ''
+  return {
+    title,
+    summary,
+    significance,
+    ...(evidence ? { evidence } : {}),
+    ...(actionRequired ? { actionRequired } : {})
+  }
 }
 
 export function isTransientError (err) {
@@ -316,11 +354,11 @@ export function isTransientError (err) {
 // was already summarized once, and re-sending full diffs would re-litigate
 // that work at ~100x the tokens.
 
-export const RELEASE_CTX_MAX_ITEMS = 100
-export const RELEASE_CTX_MAX_CHARS = 30000
-export const RELEASE_CTX_SUMMARY_CHARS = 300
+export const RELEASE_CTX_MAX_ITEMS = 200
+export const RELEASE_CTX_MAX_CHARS = 200000
+export const RELEASE_CTX_SUMMARY_CHARS = 1200
 
-export const RELEASE_ROLLUP_V = 5
+export const RELEASE_ROLLUP_V = 6
 
 export function trackOfBump (e) {
   const direct = versionTrackOf(e)
@@ -341,12 +379,13 @@ export const bumpOnly = (e) => isBumpEntry(e) && !e.modelChanges && !e.cmdChange
 function releaseItemText (e, maxSummary = RELEASE_CTX_SUMMARY_CHARS) {
   const title = e?.ai?.title || e?.title || ''
   const raw = e?.ai?.summary || e?.summary || ''
-  const summary = firstSentence(raw)
+  const summary = raw.replace(/\s+/g, ' ').trim()
   const sig = e?.ai?.significance || e?.significance || ''
   const head = `${(e?.date || '').slice(0, 10)} ${title}`.trim()
   const tail = summary && summary !== title ? `: ${truncateWords(summary, maxSummary)}` : ''
+  const action = e?.ai?.actionRequired ? ` (Action: ${e.ai.actionRequired})` : ''
   const tag = sig && sig !== 'noise' ? ` [${sig}]` : ''
-  return `${head}${tail}${tag}`.trim()
+  return `${head}${tail}${action}${tag}`.trim()
 }
 
 export function collectReleaseContext (entries, bump, opts = {}) {
@@ -443,6 +482,91 @@ export function getReleaseContextFor (entries, bump, posIndex, ctxCache) {
   return hit.text ? hit : null
 }
 
+export async function loadPrIndex (dataDir) {
+  const prsData = await readJson(`${dataDir}/open-prs.json`, { prs: [] })
+  const prsByNum = new Map()
+  const prsBySha = new Map()
+  for (const pr of (prsData.prs || [])) {
+    if (pr.number) prsByNum.set(pr.number, pr)
+    for (const c of (pr.commitsList || [])) {
+      if (c.sha) {
+        prsBySha.set(c.sha.toLowerCase(), pr)
+        prsBySha.set(c.sha.slice(0, 10).toLowerCase(), pr)
+      }
+    }
+  }
+  return { prsByNum, prsBySha }
+}
+
+export function findPrMeta (e, prIndex) {
+  if (!prIndex) return null
+  const { prsByNum, prsBySha } = prIndex
+  let pr = null
+  if (e.pr && prsByNum?.has(e.pr)) {
+    pr = prsByNum.get(e.pr)
+  }
+  if (!pr && e.sha && prsBySha) {
+    pr = prsBySha.get(e.sha.toLowerCase()) || prsBySha.get(e.sha.slice(0, 10).toLowerCase())
+  }
+  if (!pr && prsByNum) {
+    const text = `${e.title || ''} ${e.messageTitle || ''} ${e.messageBody || ''}`
+    const m = /#(\d+)\b/.exec(text)
+    if (m && prsByNum.has(Number(m[1]))) {
+      pr = prsByNum.get(Number(m[1]))
+    }
+  }
+  if (!pr) return null
+  return {
+    number: pr.number,
+    title: pr.title,
+    author: pr.author,
+    labels: (pr.labels || []).map(l => typeof l === 'string' ? l : l.name).filter(Boolean)
+  }
+}
+
+export function groupEntriesByDay (entries) {
+  const byDay = new Map()
+  if (!Array.isArray(entries)) return byDay
+  for (const e of entries) {
+    if (e.noise) continue
+    const day = e.day || (e.date ? e.date.slice(0, 10) : '')
+    if (!day) continue
+    let list = byDay.get(day)
+    if (!list) {
+      list = []
+      byDay.set(day, list)
+    }
+    list.push(e)
+  }
+  for (const list of byDay.values()) {
+    list.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.sha < b.sha ? -1 : 1)))
+  }
+  return byDay
+}
+
+export function sequenceForEntry (byDay, e, maxEach = 3) {
+  const day = e?.day || (e?.date ? e.date.slice(0, 10) : '')
+  if (!day || !byDay) return null
+  const list = byDay.get(day)
+  if (!list) return null
+  const idx = list.findIndex(x => x.sha === e.sha)
+  if (idx === -1) return null
+  const earlier = list.slice(0, idx).slice(-maxEach).map(x => ({
+    sha: x.sha,
+    title: x.ai?.title || x.title || '',
+    summary: x.ai?.summary || x.summary || '',
+    category: x.category || (x.areas || []).join(', ')
+  }))
+  const later = list.slice(idx + 1).slice(0, maxEach).map(x => ({
+    sha: x.sha,
+    title: x.ai?.title || x.title || '',
+    summary: x.ai?.summary || x.summary || '',
+    category: x.category || (x.areas || []).join(', ')
+  }))
+  if (!earlier.length && !later.length) return null
+  return { earlier, later }
+}
+
 export async function enrichWithLlm (entries, getPatch, dataDir, env = process.env, options = {}) {
   if (!llmConfigured(env)) return 0
   const cachePath = `${dataDir}/ai-summaries.json`
@@ -477,6 +601,10 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     try { return await getPatch(e) } catch { return '' }
   }), 8)
 
+  const prIndex = options.prIndex || await loadPrIndex(dataDir)
+  const byDayEntries = groupEntriesByDay(entries)
+  const archMap = options.architectureMap || (options.repoDir ? formatArchitectureMap(await discoverMonorepoArchitecture(options.repoDir)) : FREEBUFF_ARCHITECTURE_MAP)
+
   const queue = []
   for (let qi = 0; qi < candidates.length; qi++) {
     const e = candidates[qi]
@@ -492,10 +620,21 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       if (Date.now() - failedAt < (cached.transient ? transientRetryMs : errorCooldownMs)) continue
     }
     if (cached && !cached.error) {
-      e.ai = { model: cache[key].model, v: cache[key].v, title: cache[key].title, summary: cache[key].summary, significance: cache[key].significance, ...(cache[key].actionRequired ? { actionRequired: cache[key].actionRequired } : {}), at: cache[key].at }
+      e.ai = {
+        model: cache[key].model,
+        v: cache[key].v,
+        title: cache[key].title,
+        summary: cache[key].summary,
+        significance: cache[key].significance,
+        ...(cache[key].actionRequired ? { actionRequired: cache[key].actionRequired } : {}),
+        ...(cache[key].evidence ? { evidence: cache[key].evidence } : {}),
+        at: cache[key].at
+      }
       continue
     }
-    queue.push({ entry: e, patch, key, relText })
+    const sequence = sequenceForEntry(byDayEntries, e)
+    const prMeta = findPrMeta(e, prIndex)
+    queue.push({ entry: e, patch, key, relText, sequence, prMeta })
     if (queue.length >= limit) break
   }
 
@@ -508,9 +647,9 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     while (activeIndex < queue.length) {
       if (gatewayFails >= 3) break
       const idx = activeIndex++
-      const { entry: e, patch, key, relText = '' } = queue[idx]
+      const { entry: e, patch, key, relText = '', sequence = null, prMeta = null } = queue[idx]
       try {
-        const out = await callLlm(buildPrompt(e, patch, { releaseCtx: relText }), env)
+        const out = await callLlm(buildPrompt(e, patch, { releaseCtx: relText, sequence, prMeta, architectureMap: archMap }), env)
         const clean = validateLlmOut(out, e.significance || 'minor')
         gatewayFails = 0
         cache[key] = {
@@ -520,6 +659,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           summary: clean.summary,
           significance: clean.significance,
           ...(clean.actionRequired ? { actionRequired: clean.actionRequired } : {}),
+          ...(clean.evidence ? { evidence: clean.evidence } : {}),
           at: new Date().toISOString()
         }
         e.ai = { ...cache[key] }
@@ -583,7 +723,9 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
 // v5: 3-Pillar Reader Framework (core change, audience, everyday impact),
 // Test & Docs Guardian constraint, commit nature injection, prompt-echo stripping,
 // and headline-first release roll-ups.
-export const ELI5_V = 5
+// v6: Monorepo Architecture Context injection, PR motivation & developer intent injection,
+// same-day commit sequence grounding, expanded diff budget (60KB), and 270K context window scaling.
+export const ELI5_V = 6
 
 // eli5Source() lives in util.mjs because the changelog merge has to recompute it
 // to check a merged ELI5 against the summary that survived. Re-exported here as
@@ -627,7 +769,7 @@ export function eli5Done (e, releaseCtx = '', rollupV = 0) {
 }
 
 export function buildEli5Prompt (e, notes = [], ctx = {}) {
-  const { patch = '', siblings = [], diffBytes = 6000, releaseCtx = '' } = ctx
+  const { patch = '', siblings = [], diffBytes = 60000, releaseCtx = '', prMeta = null, sequence = null } = ctx
   const evidence = []
   if (e.commitNature) {
     const natureDesc = e.commitNature === 'test-only'
@@ -640,6 +782,21 @@ export function buildEli5Prompt (e, notes = [], ctx = {}) {
             ? 'lockfile or dependency churning'
             : e.commitNature
     evidence.push(`Commit nature: ${e.commitNature} (${natureDesc})`)
+  }
+  const areas = (e.areas || []).join(', ')
+  if (areas || e.category) {
+    evidence.push(`Architectural component: ${e.category || areas} (${areas || 'Freebuff codebase'})`)
+  }
+  if (prMeta || e.messageBody) {
+    if (prMeta?.number) evidence.push(`Developer intent (PR #${prMeta.number}): ${prMeta.title || ''}`)
+    if (e.messageBody) evidence.push(`Commit message details: ${truncateWords(e.messageBody, 400)}`)
+  }
+  if (sequence && (sequence.earlier?.length || sequence.later?.length)) {
+    const seq = []
+    for (const s of sequence.earlier || []) seq.push(`Earlier: ${s.title}`)
+    seq.push(`Current: ${e.ai?.title || e.title || ''}`)
+    for (const s of sequence.later || []) seq.push(`Later: ${s.title}`)
+    evidence.push(`Same-day commit sequence: ${seq.join(' -> ')}`)
   }
   if (e.summary && e.summary !== e.ai?.summary) evidence.push(`What the analyzer measured: ${e.summary}`)
   if (e.stats) {
@@ -673,9 +830,11 @@ export function buildEli5Prompt (e, notes = [], ctx = {}) {
     ? `\nComments the developers wrote beside this code. Read them: they say who this is for and what it does today, which the constant names do not.\n${notes.map(n => `- ${n}`).join('\n')}\n`
     : ''
   const diffBlock = patch
-    ? `\nThe change itself. Lockfiles and test-only hunks are already stripped; the full diff is on GitHub.\n\`\`\`diff\n${budgetPatch(patch, diffBytes, Math.max(800, Math.round(diffBytes / 4)))} \`\`\`\n`
+    ? `\nThe change itself. Lockfiles and test-only hunks are already stripped; the full diff is on GitHub.\n\`\`\`diff\n${budgetPatch(patch, diffBytes, Math.max(10000, Math.round(diffBytes / 4)))}\n\`\`\`\n`
     : ''
   return `Explain one software change to a reader who is not a programmer and will not look at the code.
+
+${ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP}
 
 Date: ${e.day || ''}
 Area: ${e.category || (e.areas || []).join(', ')}
@@ -788,7 +947,10 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   // and the pass already paid for the git work to mine comments out of it.
   const getPatch = typeof options.getPatch === 'function' ? options.getPatch : null
   const wantDiff = env.CHANGELOG_ELI5_DIFF !== '0'
-  const diffBytes = Number(env.CHANGELOG_ELI5_DIFF_BYTES || 6000)
+  const diffBytes = Number(env.CHANGELOG_ELI5_DIFF_BYTES || 60000)
+  const prIndex = options.prIndex || await loadPrIndex(dataDir)
+  const byDayEntries = groupEntriesByDay(entries)
+  const archMap = options.architectureMap || (options.repoDir ? formatArchitectureMap(await discoverMonorepoArchitecture(options.repoDir)) : FREEBUFF_ARCHITECTURE_MAP)
   // Same-day titles, so a line can place its change instead of explaining one
   // commit in a vacuum. Built once per run from entries already in memory.
   const byDay = new Map()
@@ -854,7 +1016,9 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
       e.eli5 = { text: cached.text, model: cached.model, v: cached.v, src: shortHash(src), ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}), at: cached.at }
       continue
     }
-    queue.push({ entry: e, src, key, relText })
+    const sequence = sequenceForEntry(byDayEntries, e)
+    const prMeta = findPrMeta(e, prIndex)
+    queue.push({ entry: e, src, key, relText, sequence, prMeta })
     if (queue.length >= limit) break
   }
 
@@ -867,14 +1031,17 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     while (activeIndex < queue.length) {
       if (gatewayFails >= 3) break
       const idx = activeIndex++
-      const { entry: e, src, key, relText = '' } = queue[idx]
+      const { entry: e, src, key, relText = '', sequence = null, prMeta = null } = queue[idx]
       try {
           const patch = await eli5Patch(e, wantDiff || !e.facts?.length ? getPatch : null)
           const out = await callLlm(buildEli5Prompt(e, eli5Notes(e, patch), {
             patch: wantDiff ? patch : '',
             siblings: (byDay.get(e.day) || []).filter(t => t !== e.ai.title).slice(0, 6),
             diffBytes,
-            releaseCtx: relText
+            releaseCtx: relText,
+            prMeta,
+            sequence,
+            architectureMap: archMap
           }), env, 1, (out) => normalizeEli5(out, relText ? ELI5_ROLLUP_MAX_CHARS : ELI5_MAX_CHARS))
         gatewayFails = 0
         cache[key] = {
