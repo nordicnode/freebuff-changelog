@@ -2563,7 +2563,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         <li><strong>Monorepo architecture mapping.</strong> Code changes are contextualized across subsystems (<code>cli/</code>, <code>packages/agent-runtime/</code>, <code>common/</code>, <code>desktop/web/</code>, <code>sdk/</code>, <code>docs/</code>) to pinpoint exact runtime layers.</li>
         <li><strong>Deep context &amp; PR intent.</strong> Up to 500KB of clean source diffs, PR motivation and discussion metadata from GitHub, same-day commit sequence ordering, and developer code comments feed a 270K context window.</li>
         <li><strong>Anti-hallucination guardians.</strong> Commits affecting only test suites, mocks, or documentation are isolated by strict classification rules, barring the AI from claiming unverified runtime features or speedups.</li>
-        <li><strong>Evidence citations &amp; validation gates.</strong> The model must cite exact diff hunks and functions before drafting summaries. Schema gates strip raw identifiers, reject filler, and trigger automated repair passes.</li>
+        <li><strong>Evidence citations &amp; grounding gates.</strong> The model must cite exact diff hunks and functions. Backticked identifiers are verified against the repository corpus; unverified names are flagged or rejected. Constants (<code>old -&gt; new</code>), env vars, flags, and test assertions are extracted deterministically.</li>
         <li><strong>Deterministic cache &amp; linked proof.</strong> Technical summaries and ELI5 takeaways are hashed by commit SHA, diff content, and prompt version. Every card links to the commit SHA, compare URL, and on-demand diff.</li>
       </ul>
 
@@ -2571,6 +2571,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <ul class="man-ul">
         <li><strong>ELI5 plain-English takeaways.</strong> A structured 3-pillar breakdown (Core Change, Who It Affects, Everyday Impact) beneath each technical summary explains changes without programming jargon.</li>
         <li><strong>Release roll-ups.</strong> Version bump rows synthesize all predecessor features, model additions, and commands in that release window instead of reporting a bare version label change.</li>
+        <li><strong>Weekly digests &amp; shipped-in tracking.</strong> <code>/week/</code> rolls up releases, catalog moves, and top work per week. Every card links to the first release that shipped the commit.</li>
         <li><strong>Related changes &amp; story linking.</strong> Same-day and same-topic commits are clustered automatically into coherent development narratives.</li>
       </ul>
 
@@ -2580,7 +2581,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         <dt>Releases</dt><dd>${vers.length.toLocaleString()}</dd><dd class="man-note">Version bumps, each page listing every commit in range</dd>
         <dt>Commands</dt><dd>${(cats.get('Commands') || 0).toLocaleString()}</dd><dd class="man-note">Slash commands added, renamed, or retired</dd>
         <dt>Code areas</dt><dd>${areaTotal.toLocaleString()}</dd><dd class="man-note">${areaLine}</dd>
-        <dt>Significance</dt><dd></dd><dd class="man-note"><code>[MAJOR]</code> model/version &middot; <code>[NOTABLE]</code> user-visible &middot; <code>[minor]</code> internal &middot; <code>[noise]</code> churn</dd>
+        <dt>Significance</dt><dd></dd><dd class="man-note"><code>[MAJOR]</code> models &amp; code bumps &middot; <code>[NOTABLE]</code> user-visible &amp; bumps &middot; <code>[minor]</code> internal &middot; <code>[SECURITY]</code> trust/keys</dd>
         ${openPrs?.length ? `<dt>In-flight</dt><dd>${openPrs.length.toLocaleString()}</dd><dd class="man-note">Open PRs with diffstat, commits, comments, and preview</dd>` : ''}
       </dl>
 
@@ -2588,10 +2589,11 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <div class="man-routes">
         <span><a href="/">/</a> newest day</span>
         <span><code>/day/&lt;date&gt;/</code> single day</span>
+        <span><a href="/week/">/week/</a> weekly digests</span>
         <span><a href="/models/">/models/</a> catalog timeline</span>
         <span><a href="/archive/">/archive/</a> history</span>
         <span><a href="/search/">/search/</a> search index</span>
-        <span><a href="/stats/">/stats/</a> telemetry</span>
+        <span><a href="/stats/">/stats/</a> telemetry &amp; quality</span>
         ${openPrs?.length ? '<span><a href="/in-flight/">/in-flight/</a> open PRs</span>' : ''}
       </div>
 
@@ -2600,7 +2602,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <ul class="man-ul">
         <li><strong>Automated Webhook Dispatcher:</strong> Run <code>npm run broadcast -- --webhook &lt;url&gt;</code> to post new commits. Formats quotes, summaries, and stats, tracking <code>lastBroadcastSha</code> in <code>data/state.json</code> so entries never repeat. Supports <code>--limit &lt;n&gt;</code> and <code>--dry-run</code>.</li>
         <li><strong>One-Click Discord Copy:</strong> Click <code>[copy discord]</code> on any entry (or press <kbd>c</kbd>) for paste-ready Discord markdown.</li>
-        <li><strong>Feeds:</strong> <a href="/feed.xml">all changes</a> &middot; <a href="/feed-major.xml">major + notable</a> &middot; <a href="/feed-models.xml">models only</a> &middot; <a href="/feed-releases.xml">releases only</a> &middot; <a href="/feed.json">JSON</a>. For Discord RSS bots, use <code>/feed add &lt;url&gt;</code>.</li>
+        <li><strong>Feeds:</strong> <a href="/feed.xml">all changes</a> &middot; <a href="/feed-major.xml">major</a> &middot; <a href="/feed-security.xml">security</a> &middot; <a href="/feed-weekly.xml">weekly</a> &middot; <a href="/feed-models.xml">models</a> &middot; <a href="/feed-releases.xml">releases</a> &middot; <a href="/feed.json">JSON</a>. For Discord RSS bots, use <code>/feed add &lt;url&gt;</code>.</li>
       </ul>
 
       <h4>KEYBOARD SHORTCUTS</h4>
