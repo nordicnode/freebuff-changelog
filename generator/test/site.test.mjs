@@ -1350,4 +1350,33 @@ test('in-flight page paginates open PRs into pages of 25 with keyboard and pill 
   assert.match(page1, /ctrlKey \|\| e\.metaKey \|\| e\.altKey/, 'modifier keys like Cmd+P / Ctrl+P are protected')
 })
 
+test('fileChips: renders source files, test files, churned files, and renames with exact count match', () => {
+  const entry = {
+    sha: '1234567890abcdef1234567890abcdef12345678',
+    date: '2026-09-19T10:00:00Z',
+    day: '2026-09-19',
+    category: 'Core',
+    significance: 'notable',
+    stats: { additions: 10, deletions: 5 },
+    files: {
+      total: 5,
+      added: ['src/app.ts'],
+      modified: ['src/utils.ts'],
+      tests: ['src/app.test.ts', 'src/utils.test.ts'],
+      churned: ['bun.lock'],
+      removed: [],
+      renamed: []
+    }
+  }
+  const html = entryCard(entry)
+  assert.match(html, /<details class="files-details"/)
+  assert.match(html, /File changes[\s\S]*?<span class="files-hint">\(5 files\)<\/span>/)
+  assert.match(html, /class="fchip add"[^>]*>src\/app\.ts/)
+  assert.match(html, /class="fchip mod"[^>]*>src\/utils\.ts/)
+  assert.match(html, /class="fchip test"[^>]*>src\/app\.test\.ts/)
+  assert.match(html, /class="fchip test"[^>]*>src\/utils\.test\.ts/)
+  assert.match(html, /class="fchip churn"[^>]*>bun\.lock/)
+  assert.doesNotMatch(html, /class="fchip more"/, 'all 5 files are shown, so no overflow chip is needed')
+})
+
 

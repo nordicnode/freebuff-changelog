@@ -774,20 +774,37 @@ function shortPath (p) {
 
 function fileChips (e) {
   if (!e?.files) return ''
-  const chips = []
-  const totalListed = (e.files.added?.length || 0) + (e.files.removed?.length || 0) + (e.files.modified?.length || 0)
-  const shownAdded = (e.files.added || []).slice(0, 3), shownRemoved = (e.files.removed || []).slice(0, 3)
-  const modCap = shownAdded.length + shownRemoved.length ? 3 : 5
-  const shownModified = (e.files.modified || []).slice(0, modCap)
-  for (const p of shownAdded) chips.push(`<span class="fchip add" title="${esc(p)}">${esc(shortPath(p))}</span>`)
-  for (const p of shownRemoved) chips.push(`<span class="fchip del" title="${esc(p)}">${esc(shortPath(p))}</span>`)
-  for (const p of shownModified) chips.push(`<span class="fchip mod" title="${esc(p)}">${esc(shortPath(p))}</span>`)
-  const shown = shownAdded.length + shownRemoved.length + shownModified.length
-  const extra = Math.max(totalListed - shown, (e.files.meaningful || 0) - shown)
-  if (extra > 0) chips.push(`<span class="fchip more">+${extra} more</span>`)
-  if (!chips.length) return ''
+  const added = e.files.added || []
+  const removed = e.files.removed || []
+  const renamed = e.files.renamed || []
+  const modified = e.files.modified || []
+  const tests = e.files.tests || []
+  const churned = e.files.churned || []
 
-  const totalFiles = e.files.total || totalListed || chips.length
+  const allItems = []
+  for (const p of added) allItems.push({ type: 'add', title: p, label: shortPath(p) })
+  for (const p of removed) allItems.push({ type: 'del', title: p, label: shortPath(p) })
+  for (const r of renamed) {
+    const from = typeof r === 'object' ? r.from : r
+    const to = typeof r === 'object' ? r.to : ''
+    const title = to ? `${from} -> ${to}` : from
+    const label = to ? `${shortPath(from)} → ${shortPath(to)}` : shortPath(from)
+    allItems.push({ type: 'ren', title, label })
+  }
+  for (const p of modified) allItems.push({ type: 'mod', title: p, label: shortPath(p) })
+  for (const p of tests) allItems.push({ type: 'test', title: `Test: ${p}`, label: shortPath(p) })
+  for (const p of churned) allItems.push({ type: 'churn', title: `Lockfile / config: ${p}`, label: shortPath(p) })
+
+  if (!allItems.length) return ''
+
+  const maxShown = 12
+  const shownItems = allItems.slice(0, maxShown)
+  const chips = shownItems.map(item => `<span class="fchip ${item.type}" title="${esc(item.title)}">${esc(item.label)}</span>`)
+
+  const totalFiles = Math.max(e.files.total || 0, allItems.length)
+  const extra = totalFiles - shownItems.length
+  if (extra > 0) chips.push(`<span class="fchip more">+${extra} more</span>`)
+
   const hint = `(${totalFiles} file${totalFiles === 1 ? '' : 's'})`
 
   return `<details class="files-details">

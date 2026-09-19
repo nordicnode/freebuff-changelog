@@ -953,6 +953,23 @@ nav.term-nav a.active{
   content:"~ ";
   color:var(--txt-subtle);
 }
+.fchip.ren::before{
+  content:"→ ";
+  color:var(--term-cyan);
+}
+.fchip.test::before{
+  content:"✓ ";
+  color:var(--term-cyan);
+  font-weight:600;
+}
+.fchip.churn::before{
+  content:"⚙ ";
+  color:var(--txt-subtle);
+}
+.fchip.more{
+  color:var(--txt-subtle);
+  border-style:dashed;
+}
 
 .diff-viewer{
   margin:10px 0 6px;
