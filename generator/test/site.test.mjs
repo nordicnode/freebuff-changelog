@@ -472,9 +472,9 @@ test('buildSite generates valid static site output', async () => {
       .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length
     assert.ok(aboutWords < 700, `about page is ${aboutWords} words; keep it under 700`)
     assert.doesNotMatch(aboutBody, /&mdash;|\u2014/, 'about copy carries no em-dashes')
-    assert.match(aboutHtml, /class="footer-badges"/)
-    assert.match(aboutHtml, /badge\/clones\.svg/)
-    assert.match(aboutHtml, /badge\/cloners\.svg/)
+    assert.match(aboutHtml, /class="footer-traffic"/)
+    assert.match(aboutHtml, /id="footer-clones"/)
+    assert.match(aboutHtml, /id="footer-cloners"/)
 
     // Verify models page: lineup, retired, history rows, nav
     const modelsHtml = await readFile(join(tmpDist, 'models/index.html'), 'utf8')

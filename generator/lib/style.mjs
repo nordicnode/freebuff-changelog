@@ -2283,26 +2283,13 @@ footer{
   color:var(--txt-subtle);
   line-height:1.4;
 }
-.footer-links, .footer-feeds, .footer-shortcuts{
+.footer-links, .footer-feeds, .footer-shortcuts, .footer-traffic{
   display:inline-flex;
   align-items:center;
   gap:10px;
   flex-wrap:wrap;
 }
-.footer-badges{
-  display:inline-flex;
-  align-items:center;
-  gap:6px;
-}
-.footer-badges a{
-  display:inline-flex;
-  line-height:1;
-}
-.footer-badges img{
-  display:block;
-  height:20px;
-}
-.footer-links a, .footer-feeds a, .footer-links button, .footer-shortcuts button{
+.footer-links a, .footer-feeds a, .footer-traffic a, .footer-links button, .footer-shortcuts button{
   background:none;
   border:none;
   padding:0;
@@ -2313,7 +2300,7 @@ footer{
   cursor:pointer;
   transition:color .1s ease;
 }
-.footer-links a:hover, .footer-feeds a:hover, .footer-links button:hover, .footer-shortcuts button:hover{
+.footer-links a:hover, .footer-feeds a:hover, .footer-traffic a:hover, .footer-links button:hover, .footer-shortcuts button:hover{
   color:var(--term-cyan);
 }
 .footer-label{

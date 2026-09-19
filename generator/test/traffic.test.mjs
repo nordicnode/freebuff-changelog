@@ -142,9 +142,9 @@ test('buildSite renders traffic badges and about page counters', async (t) => {
   await buildSite({ changelog, openPrs: [], dist, traffic })
 
   const indexHtml = await readFile(join(dist, 'index.html'), 'utf8')
-  assert.match(indexHtml, /class="footer-badges"/)
-  assert.match(indexHtml, /badge\/clones\.svg/)
-  assert.match(indexHtml, /badge\/cloners\.svg/)
+  assert.match(indexHtml, /class="footer-traffic"/)
+  assert.match(indexHtml, /id="footer-clones">11\.2k/)
+  assert.match(indexHtml, /id="footer-cloners">1\.46k/)
 
   const clonesSvg = await readFile(join(dist, 'badge/clones.svg'), 'utf8')
   assert.match(clonesSvg, /14d clones/)

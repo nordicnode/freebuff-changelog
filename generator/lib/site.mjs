@@ -28,6 +28,9 @@ function miniMd (text) {
   return s
 }
 
+export const fmtTraffic = (n) => n >= 10000 ? `${(n / 1000).toFixed(1)}k` : (n >= 1000 ? `${(n / 1000).toFixed(2)}k` : `${n}`)
+let activeTraffic = { count: 0, uniques: 0 }
+
 function layout ({ title, path, body, desc, noindex, ogImage, wide }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
@@ -76,10 +79,6 @@ ${body}
   <div class="footer-row">
     <div class="footer-desc">freebuff-changes <span class="term-sep">::</span> unofficial public snapshot mirror reconstructed from <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a></div>
     <div class="footer-links">
-      <span class="footer-badges">
-        <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener" title="14-day git clones"><img src="/badge/clones.svg" alt="14d clones" height="20"></a>
-        <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener" title="14-day unique cloners"><img src="/badge/cloners.svg" alt="14d cloners" height="20"></a>
-      </span>
       <a href="/about/">[about]</a>
       <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">[github]</a>
     </div>
@@ -91,6 +90,11 @@ ${body}
       <a href="/feed-weekly.xml">[weekly rss]</a>
       <a href="/feed-models.xml">[models rss]</a>
       <a href="/feed-releases.xml">[releases rss]</a>
+    </div>
+    <div class="footer-traffic">
+      <span class="footer-label">traffic:</span>
+      <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener" title="14-day git clones">[<span id="footer-clones">${fmtTraffic(activeTraffic.count)}</span> clones]</a>
+      <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener" title="14-day unique cloners">[<span id="footer-cloners">${fmtTraffic(activeTraffic.uniques)}</span> cloners]</a>
     </div>
     <div class="footer-shortcuts">
       <span class="footer-label">shortcuts:</span>
@@ -182,6 +186,14 @@ updateSyncAge();
       const headChanged = initialHead && data.headSha && data.headSha !== initialHead;
       const changesChanged = initialChanges && data.changes && String(data.changes) !== String(initialChanges);
       const genChanged = data.generatedAt && data.generatedAt !== initialGenerated;
+
+      if (data.traffic) {
+        var fc = document.getElementById('footer-clones');
+        var fu = document.getElementById('footer-cloners');
+        var fmt = function(n) { return n >= 10000 ? (n / 1000).toFixed(1) + 'k' : (n >= 1000 ? (n / 1000).toFixed(2) + 'k' : '' + n); };
+        if (fc && typeof data.traffic.count === 'number') fc.textContent = fmt(data.traffic.count);
+        if (fu && typeof data.traffic.uniques === 'number') fu.textContent = fmt(data.traffic.uniques);
+      }
 
       if (headChanged || changesChanged || genChanged) {
         updatePending = true;
@@ -1332,6 +1344,7 @@ async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, ''
 export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null }) {
   const trafficCount = traffic?.count ?? 0
   const trafficUniques = traffic?.uniques ?? 0
+  activeTraffic = { count: trafficCount, uniques: trafficUniques }
   const entries = [...changelog.entries].reverse() // newest first
   const byDay = groupByDay(entries)
   // "Related" is a reading aid for real changes: churn rows must neither appear
@@ -3260,7 +3273,6 @@ ${inFlightScript}`
   await write(dist, 'badge/models.svg', renderBadgeSvg('free models', `${modelLive.length} active`, '#2ea043'))
   await write(dist, 'badge/status.svg', renderBadgeSvg('changelog', isFresh ? 'fresh' : 'stale', isFresh ? '#2ea043' : '#d29922'))
   await write(dist, 'badge/changes.svg', renderBadgeSvg('tracked changes', `${meaningful.length.toLocaleString()}`, '#8250df'))
-  const fmtTraffic = (n) => n >= 10000 ? `${(n / 1000).toFixed(1)}k` : (n >= 1000 ? `${(n / 1000).toFixed(2)}k` : `${n}`)
   await write(dist, 'badge/clones.svg', renderBadgeSvg('14d clones', fmtTraffic(trafficCount), '#0969da'))
   await write(dist, 'badge/cloners.svg', renderBadgeSvg('14d cloners', fmtTraffic(trafficUniques), '#2ea043'))
 
