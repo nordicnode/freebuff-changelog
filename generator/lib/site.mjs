@@ -725,7 +725,7 @@ function badges (e) {
   if (e.significance === 'major') b.push(`<span class="badge maj"${tip}>[MAJOR]</span>`)
   else if (e.significance === 'notable') b.push(`<span class="badge not"${tip}>[NOTABLE]</span>`)
   if (e.modelChanges) b.push('<span class="badge model">[MODEL]</span>')
-  if (isSecurityEntry(e)) b.push('<span class="badge sec" title="Security-relevant: trust, credentials, checksums, permissions or privacy">[SECURITY]</span>')
+  if (isSecurityEntry(e)) b.push('<span class="badge sec" title="Security-relevant: trust gates, credentials, checksums, permissions or sandboxing">[SECURITY]</span>')
   if (e.ai?.breaking) b.push('<span class="badge brk" title="The technical pass marked this as changing existing behavior, config, an API or a command">[BREAKING]</span>')
   if (e.ai?.confidence === 'low') b.push('<span class="badge lowc" title="The model rated its own confidence low: the diff is truncated, the consumer of a change is not visible, or the motive is guessed">[LOW CONFIDENCE]</span>')
   if (e.ai?.audience && AUDIENCE_DESC[e.ai.audience]) b.push(`<span class="badge aud" title="Who this change is for: ${esc(AUDIENCE_DESC[e.ai.audience])}">[${esc(e.ai.audience.toUpperCase())}]</span>`)

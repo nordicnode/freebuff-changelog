@@ -1169,12 +1169,14 @@ function tagsFor (e) {
 
 // A cheap path-and-title test for the `security` tag on brand-new rows (the
 // summary-aware version lives in llm.mjs: isSecurityEntry, used at build time).
-export const SECURITY_HINT_RE = /\b(?:security|secur(?:e|ed|ing)|trust(?:ed)?|untrusted|checksum|sha-?256|tamper|hijack|sandbox|credential|secrets?|permission|redirect|csrf|xss|injection|privacy|abuse|enforcement)\b/i
+export const SECURITY_HINT_RE = /\b(?:security|secur(?:e|ed|ing)|trust(?:ed|s)? (?:gate|boundary|floor|prompt|list|publisher|enforcement)|untrusted|checksums?\b|sha-?256|signature verif|tamper(?:ing)?|hijack(?:ing)?|steering (?:var|prefix|environment)|sandbox(?:ing)?|(?:process|sandbox|container|dotenv) isolation|credential (?:leak|leakage|theft|storage|permission|redaction|stripping|mode|file)|credentials?\.json|secret (?:leak|leakage|redaction|stripping|exposure|scanning)|token leak|permission(?:s)? (?:mode|bits|tighten)|0o?[67]00\b|owner-only|redirect (?:allowlist|gate)|(?:protocol|tls|ssl|crypto|cipher|version) downgrade|downgrade attack|https-to-http|csrf|xss|(?:prompt|command|sql|code|script|crlf|shell|template) injection|injection attack|exfiltrat(?:e|ion|ing)|ban sweep|anti-abuse|foreign[- ]client (?:detection|signals?|enforcement))\b/i
 
 export function securityHint (e) {
   const paths = [...(e?.files?.added || []), ...(e?.files?.modified || [])]
-  if (paths.some(p => /(?:^|\/)(?:auth|security|trust|permissions?|credentials?|sandbox|direnv|checksums?)[^/]*\.[a-z]+$/i.test(p))) return true
-  return SECURITY_HINT_RE.test(`${e?.messageTitle || ''} ${e?.messageBody || ''} ${(e?.facts || []).join(' ')}`)
+  if (paths.length > 0 && paths.every(f => /^(?:common\/src\/ads\/|.*ad-provider.*|.*imprezia.*|.*paid-social.*|.*marketing.*)/.test(f))) return false
+  const nonAdFiles = paths.filter(f => !/^(?:common\/src\/ads\/|docs\/|marketing\/|\.github\/)/.test(f))
+  if (nonAdFiles.some(p => /(?:^|\/)(?:auth|security|trust|permissions?|credentials?|sandbox|agent-dir-trust|agent-publisher-trust|checksums?|write-binary-checksums|foreign-client-signals|runtime-app-url|disposable-email)[^/]*\.[a-z]+$/i.test(p))) return true
+  return SECURITY_HINT_RE.test(`${e?.messageTitle || ''} ${e?.messageBody || ''}`)
 }
 
 // ---------------------------------------------------------------------------

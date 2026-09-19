@@ -167,9 +167,15 @@ test('isSecurityEntry and securityHint: trust gates, checksums and env stripping
   assert.ok(isSecurityEntry({ files: { added: [], modified: ['x.ts'] }, ai: { title: 'Launcher verifies archive checksums before install', summary: 'sha256.' } }))
   assert.equal(isSecurityEntry({ files: { added: [], modified: ['README.md'] }, ai: { title: 'Fix typo', summary: 'A typo.' } }), false)
   assert.equal(isSecurityEntry({ noise: true }), false)
+  // Ad experiments with courtesy/opt-out or dependency injection must not qualify as security
+  assert.equal(isSecurityEntry({ files: { added: ['common/src/ads/supabase-format-cpc-experiment.ts'], modified: [] }, ai: { title: 'Add Supabase CPC experiment', summary: 'opt-out and review gates stay enforced' } }), false)
+  assert.equal(isSecurityEntry({ files: { added: [], modified: ['web/src/hook.ts'] }, ai: { title: 'Add getClient dependency injection', summary: 'Dependency injection for client.' } }), false)
+  assert.equal(isSecurityEntry({ files: { added: [], modified: ['common/src/models.ts'] }, ai: { title: 'catch tiktoken error / downgrade', summary: 'fallback to cheaper model' } }), false)
+  assert.equal(isSecurityEntry({ files: { added: ['common/src/util/ad-provider-policy.ts'], modified: ['common/src/util/imprezia-client.ts'] }, ai: { title: 'Gravity ad provider exclusivity', summary: 'retires Imprezia network' } }), false)
   assert.ok(securityHint({ files: { modified: ['cli/src/utils/auth.ts'] } }))
   assert.ok(securityHint({ files: { modified: ['x.ts'] }, messageTitle: 'fix: refuse untrusted publishers' }))
   assert.equal(securityHint({ files: { modified: ['x.ts'] }, messageTitle: 'chore: bump deps' }), false)
+  assert.equal(securityHint({ files: { modified: ['common/src/ads/supabase-format-cpc-experiment.ts'] }, messageTitle: 'Add Supabase CPC experiment' }), false)
 })
 
 test('rememberClosedPrs: PRs that left the open list are kept with what the prompt needs', () => {

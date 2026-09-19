@@ -2074,14 +2074,16 @@ export function computeShippedIn (entries) {
 // where it landed. A heuristic for a feed, not a CVE tracker: the words are
 // the ones the summaries above actually use for trust gates, checksums, env
 // stripping and credential handling.
-const SECURITY_TEXT_RE = /\b(?:security|secur(?:e|ed|ing)|trust(?:ed|s)? (?:gate|boundary|floor|prompt|list|publisher)|untrusted|checksum|sha-?256|signature verif|tamper|hijack|steering (?:var|prefix|environment)|sandbox|isolation|credential|secret(?:s)?\b(?! key)|token leak|permission(?:s)? (?:mode|bits|tighten)|0o?[67]00\b|owner-only|redirect (?:allowlist|gate|target)|downgrade|https-to-http|csrf|xss|injection|prompt injection|exfiltrat|dnt|global privacy control|opt-out|privacy|abuse|enforcement|ban sweep|rate[- ]limit(?:ed|ing)? (?:rejection|abuse|enforc))/i
-const SECURITY_PATH_RE = /(?:^|\/)(?:auth|security|trust|permissions?|credentials?|sandbox|direnv|agent-dir-trust|agent-publisher-trust|checksums?|write-binary-checksums|foreign-client-signals|runtime-app-url|disposable-email|enforcement)[^/]*\.[a-z]+$/i
+const SECURITY_TEXT_RE = /\b(?:security|secur(?:e|ed|ing)|trust(?:ed|s)? (?:gate|boundary|floor|prompt|list|publisher|enforcement)|untrusted|checksums?\b|sha-?256|signature verif|tamper(?:ing)?|hijack(?:ing)?|steering (?:var|prefix|environment)|sandbox(?:ing)?|(?:process|sandbox|container|dotenv) isolation|credential (?:leak|leakage|theft|storage|permission|redaction|stripping|mode|file)|credentials?\.json|secret (?:leak|leakage|redaction|stripping|exposure|scanning)|token leak|permission(?:s)? (?:mode|bits|tighten)|0o?[67]00\b|owner-only|redirect (?:allowlist|gate)|(?:protocol|tls|ssl|crypto|cipher|version) downgrade|downgrade attack|https-to-http|csrf|xss|(?:prompt|command|sql|code|script|crlf|shell|template) injection|injection attack|exfiltrat(?:e|ion|ing)|ban sweep|anti-abuse|foreign[- ]client (?:detection|signals?|enforcement))/i
+const SECURITY_PATH_RE = /(?:^|\/)(?:auth|security|trust|permissions?|credentials?|sandbox|agent-dir-trust|agent-publisher-trust|checksums?|write-binary-checksums|foreign-client-signals|runtime-app-url|disposable-email)[^/]*\.[a-z]+$/i
 
 export function isSecurityEntry (e) {
   if (!e || e.noise) return false
   const files = [...(e.files?.added || []), ...(e.files?.modified || [])]
-  if (files.some(p => SECURITY_PATH_RE.test(p))) return true
-  const text = [e.ai?.title, e.ai?.summary, e.ai?.evidence, ...(e.facts || [])].filter(Boolean).join(' ')
+  if (files.length > 0 && files.every(f => /^(?:common\/src\/ads\/|.*ad-provider.*|.*imprezia.*|.*paid-social.*|.*marketing.*)/.test(f))) return false
+  const nonAdFiles = files.filter(f => !/^(?:common\/src\/ads\/|docs\/|marketing\/|\.github\/)/.test(f))
+  if (nonAdFiles.some(p => SECURITY_PATH_RE.test(p))) return true
+  const text = [e.ai?.title || e.title, e.ai?.summary || e.summary, e.ai?.evidence].filter(Boolean).join(' ')
   return SECURITY_TEXT_RE.test(text)
 }
 
