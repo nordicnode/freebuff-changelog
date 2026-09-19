@@ -2704,4 +2704,298 @@ mark.search-match{
 .sig-seg.aud-advertisers{background:var(--term-yellow,#d29922)}
 .sig-seg.aud-operators{background:var(--term-purple,#a371f7)}
 .sig-seg.aud-maintainers{background:var(--txt-subtle)}
+
+/* Weekly digests index hub: hero spotlight, year jump pills, filter, and structured cards. */
+.week-hero{
+  margin:12px 0 20px;
+  padding:18px 20px;
+  background:var(--panel);
+  border:1px solid var(--cyan-tint-border);
+  border-radius:2px;
+}
+.week-hero-top{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:8px;
+}
+.week-hero-tag{
+  font-size:.68rem;
+  font-weight:700;
+  letter-spacing:.08em;
+  color:var(--term-cyan);
+  text-transform:uppercase;
+  background:var(--cyan-tint-bg);
+  padding:2px 8px;
+  border-radius:2px;
+  border:1px solid var(--cyan-tint-border);
+}
+.week-hero-dates{
+  font-size:.78rem;
+  color:var(--txt-subtle);
+}
+.week-hero-title{
+  font-size:1.18rem;
+  font-weight:700;
+  margin:0 0 10px;
+}
+.week-hero-title a{
+  color:var(--txt);
+  text-decoration:none;
+}
+.week-hero-title a:hover{
+  color:var(--term-cyan);
+  text-decoration:underline;
+}
+.week-badges{
+  display:flex;
+  gap:6px;
+  flex-wrap:wrap;
+  align-items:center;
+  margin:8px 0;
+}
+.week-hero-releases{
+  margin:10px 0;
+  font-size:.82rem;
+  display:flex;
+  gap:6px;
+  align-items:center;
+  flex-wrap:wrap;
+}
+.releases-label{
+  color:var(--txt-subtle);
+  font-size:.78rem;
+  font-weight:600;
+}
+.week-ver-chip{
+  display:inline-flex;
+  align-items:center;
+  font-size:.72rem;
+  font-weight:700;
+  padding:1px 7px;
+  border-radius:2px;
+  background:rgba(63,185,80,.12);
+  color:var(--term-green);
+  border:1px solid rgba(63,185,80,.4);
+  text-decoration:none;
+  transition:all .1s ease;
+}
+.week-ver-chip:hover{
+  background:rgba(63,185,80,.25);
+  color:#fff;
+  text-decoration:none;
+}
+.week-hero-highlights{
+  margin:10px 0 12px;
+  padding-left:18px;
+  font-size:.86rem;
+  line-height:1.6;
+  color:var(--txt-dim);
+}
+.week-hero-highlights li{
+  margin:4px 0;
+}
+.week-hero-highlights a{
+  color:var(--txt-dim);
+  text-decoration:none;
+}
+.week-hero-highlights a:hover{
+  color:var(--term-cyan);
+  text-decoration:underline;
+}
+.week-hero-actions{
+  display:flex;
+  gap:12px;
+  align-items:center;
+  margin-top:14px;
+  padding-top:12px;
+  border-top:1px solid var(--term-border);
+}
+.week-hero-btn{
+  display:inline-flex;
+  align-items:center;
+  background:var(--term-cyan);
+  color:#0d1117!important;
+  font-weight:700;
+  font-size:.82rem;
+  padding:6px 14px;
+  border-radius:2px;
+  text-decoration:none;
+  transition:opacity .12s ease;
+}
+.week-hero-btn:hover{
+  opacity:.9;
+  text-decoration:none;
+}
+.week-year-pills{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  flex-wrap:wrap;
+  margin:16px 0 12px;
+}
+.year-pills-label{
+  font-size:.72rem;
+  letter-spacing:.08em;
+  color:var(--txt-subtle);
+  font-weight:700;
+}
+.year-pill{
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  font-size:.78rem;
+  font-weight:600;
+  padding:4px 10px;
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  background:var(--panel);
+  color:var(--txt-dim);
+  text-decoration:none;
+  transition:all .12s ease;
+}
+.year-pill:hover{
+  border-color:var(--term-cyan);
+  color:var(--term-cyan);
+  text-decoration:none;
+}
+.week-filter-wrap{
+  position:relative;
+  margin:12px 0 20px;
+  display:flex;
+  align-items:center;
+  gap:12px;
+}
+.week-search-input{
+  flex:1;
+  max-width:560px;
+  background:var(--code);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  padding:8px 12px;
+  color:var(--txt);
+  font-family:inherit;
+  font-size:.84rem;
+  outline:none;
+  transition:border-color .12s ease;
+}
+.week-search-input:focus{
+  border-color:var(--term-cyan);
+}
+.week-filter-count{
+  font-size:.78rem;
+  color:var(--txt-subtle);
+}
+.year-section{
+  margin:28px 0 18px;
+}
+.year-section .section-hdr{
+  display:flex;
+  justify-content:space-between;
+  align-items:baseline;
+  border-bottom:1px solid var(--term-border);
+  padding-bottom:6px;
+  margin-bottom:12px;
+}
+.year-section .section-hdr h2{
+  font-size:.86rem;
+  letter-spacing:.06em;
+  color:var(--txt-dim);
+  margin:0;
+}
+.back-to-top{
+  font-size:.72rem;
+  color:var(--txt-subtle);
+  text-decoration:none;
+}
+.back-to-top:hover{
+  color:var(--term-cyan);
+  text-decoration:none;
+}
+.week-grid{
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+}
+.week-card{
+  display:grid;
+  grid-template-columns:180px 1fr auto;
+  gap:16px;
+  align-items:center;
+  padding:12px 16px;
+  background:var(--panel);
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  transition:border-color .12s ease, background .12s ease;
+}
+.week-card:hover{
+  background:var(--panel-hover);
+  border-color:var(--term-border-strong);
+}
+.week-card-date{
+  display:flex;
+  flex-direction:column;
+  gap:3px;
+}
+.week-card-key{
+  font-weight:700;
+  font-size:.9rem;
+  color:var(--txt);
+  font-family:monospace;
+  text-decoration:none;
+}
+.week-card-key:hover{
+  color:var(--term-cyan);
+  text-decoration:underline;
+}
+.week-card-span{
+  font-size:.74rem;
+  color:var(--txt-subtle);
+}
+.week-card-main{
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  min-width:0;
+}
+.week-card-releases{
+  display:flex;
+  gap:6px;
+  align-items:center;
+  flex-wrap:wrap;
+}
+.week-card-headline{
+  font-size:.78rem;
+  color:var(--txt-dim);
+  line-height:1.45;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.week-card-action{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  white-space:nowrap;
+  justify-content:flex-end;
+}
+.week-open-link{
+  font-size:.78rem;
+  font-weight:600;
+  color:var(--term-cyan);
+  text-decoration:none;
+}
+.week-open-link:hover{
+  text-decoration:underline;
+}
+@media (max-width:720px){
+  .week-card{
+    grid-template-columns:1fr;
+    gap:10px;
+  }
+  .week-card-action{
+    justify-content:flex-start;
+    margin-top:4px;
+  }
+}
 `

@@ -2218,11 +2218,166 @@ ${archiveScript}`
     }))
   }), 8)
   if (weeks.length) {
+    const totalReleases = weeks.reduce((sum, w) => sum + w.releases.length, 0)
+    const latestWeek = weeks[0]
+
+    const formatWeekRange = (monday, sunday) => {
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+      const [y1, m1, d1] = monday.split('-')
+      const [y2, m2, d2] = sunday.split('-')
+      if (y1 === y2 && m1 === m2) {
+        return `${months[Number(m1) - 1]} ${Number(d1)} – ${Number(d2)}, ${y1}`
+      } else if (y1 === y2) {
+        return `${months[Number(m1) - 1]} ${Number(d1)} – ${months[Number(m2) - 1]} ${Number(d2)}, ${y1}`
+      }
+      return `${months[Number(m1) - 1]} ${Number(d1)}, ${y1} – ${months[Number(m2) - 1]} ${Number(d2)}, ${y2}`
+    }
+
+    const weeksByYear = new Map()
+    for (const w of weeks) {
+      const year = w.key.slice(0, 4)
+      if (!weeksByYear.has(year)) weeksByYear.set(year, [])
+      weeksByYear.get(year).push(w)
+    }
+
+    const heroReleases = latestWeek.releases.map(r => {
+      const v = r.version || r.freebuffVersion
+      return v ? `<a class="week-ver-chip" href="/release/${esc(v)}/" title="Release ${esc(v)}">v${esc(v)}</a>` : ''
+    }).filter(Boolean).join(' ')
+
+    const heroHighlights = latestWeek.top.slice(0, 3).map(e => {
+      const t = e.ai?.title || e.title
+      return `<li><a href="/day/${esc(e.day)}/#${esc(e.sha.slice(0, 12))}">${esc(t)}</a></li>`
+    }).join('')
+
+    const heroCard = `
+<div class="week-hero">
+  <div class="week-hero-top">
+    <span class="week-hero-tag">CURRENT WEEK</span>
+    <span class="week-hero-dates">${formatWeekRange(latestWeek.monday, latestWeek.sunday)}</span>
+  </div>
+  <h2 class="week-hero-title"><a href="${weekHref(latestWeek)}">WEEK ${esc(latestWeek.key)}</a></h2>
+  <div class="week-badges">
+    ${latestWeek.releases.length ? `<span class="badge ver">${latestWeek.releases.length} release${latestWeek.releases.length === 1 ? '' : 's'}</span>` : ''}
+    ${latestWeek.models.length ? `<span class="badge model">${latestWeek.models.length} model change${latestWeek.models.length === 1 ? '' : 's'}</span>` : ''}
+    ${latestWeek.security.length ? `<span class="badge sec">${latestWeek.security.length} security</span>` : ''}
+    <span class="badge not">${latestWeek.counts.changes} changes &middot; ${latestWeek.dayCount} days</span>
+  </div>
+  ${heroReleases ? `<div class="week-hero-releases"><span class="releases-label">Shipped:</span> ${heroReleases}</div>` : ''}
+  ${heroHighlights ? `<ul class="week-hero-highlights">${heroHighlights}</ul>` : ''}
+  <div class="week-hero-actions">
+    <a class="week-hero-btn" href="${weekHref(latestWeek)}">Read Week ${esc(latestWeek.key)} Digest &rarr;</a>
+    <button class="meta-link dc-copy" type="button" data-dc="${esc(`**FREEBUFF weekly** · ${latestWeek.key}\n${weeklyText(latestWeek, SITE.url)}`.slice(0, 1990))}" title="Copy this digest as Discord-formatted text">copy discord</button>
+  </div>
+</div>`
+
+    const weekCard = (w) => {
+      const vers = w.releases.map(r => r.version || r.freebuffVersion).filter(Boolean)
+      const verPills = vers.map(v => `<a class="week-ver-chip" href="/release/${esc(v)}/" title="Release ${esc(v)}">v${esc(v)}</a>`).join(' ')
+      const range = formatWeekRange(w.monday, w.sunday)
+      const topTitles = w.top.slice(0, 2).map(e => e.ai?.title || e.title).filter(Boolean)
+      const headline = topTitles.length ? topTitles.join(' · ') : weeklyHeadline(w)
+      const searchTerms = [w.key, range, ...vers, ...topTitles, weeklyHeadline(w)].join(' ').toLowerCase()
+
+      return `
+<div class="week-card" data-search="${esc(searchTerms)}">
+  <div class="week-card-date">
+    <a class="week-card-key" href="${weekHref(w)}">${esc(w.key)}</a>
+    <span class="week-card-span">${esc(range)}</span>
+  </div>
+  <div class="week-card-main">
+    <div class="week-badges">
+      ${w.releases.length ? `<span class="badge ver">${w.releases.length} release${w.releases.length === 1 ? '' : 's'}</span>` : ''}
+      ${w.models.length ? `<span class="badge model">${w.models.length} model${w.models.length === 1 ? '' : 's'}</span>` : ''}
+      ${w.security.length ? `<span class="badge sec">${w.security.length} sec</span>` : ''}
+      <span class="badge not">${w.counts.changes} changes</span>
+    </div>
+    ${verPills ? `<div class="week-card-releases">${verPills}</div>` : ''}
+    <div class="week-card-headline" title="${esc(headline)}">${esc(headline)}</div>
+  </div>
+  <div class="week-card-action">
+    <a class="week-open-link" href="${weekHref(w)}">digest &rarr;</a>
+    <button class="meta-link dc-copy" type="button" data-dc="${esc(`**FREEBUFF weekly** · ${w.key}\n${weeklyText(w, SITE.url)}`.slice(0, 1990))}" title="Copy Discord markdown">discord</button>
+  </div>
+</div>`
+    }
+
+    const yearPills = `
+<div class="week-year-pills">
+  <span class="year-pills-label">ARCHIVE:</span>
+  ${[...weeksByYear.entries()].map(([yr, yrWeeks]) => `
+    <a href="#year-${esc(yr)}" class="year-pill">${esc(yr)} <span class="chip-n">${yrWeeks.length}</span></a>
+  `).join('')}
+</div>`
+
+    const filterBar = `
+<div class="week-filter-wrap">
+  <input type="search" id="week-filter" class="week-search-input" placeholder="Filter weeks by version, date, or topic (e.g. '0.0.178', 'models', 'security')…" aria-label="Filter weekly digests" />
+  <span class="week-filter-count" id="week-filter-count"></span>
+</div>`
+
+    const yearSections = [...weeksByYear.entries()].map(([yr, yrWeeks]) => {
+      const yrReleases = yrWeeks.reduce((s, w) => s + w.releases.length, 0)
+      const yrChanges = yrWeeks.reduce((s, w) => s + w.counts.changes, 0)
+      return `
+<section class="year-section" id="year-${esc(yr)}">
+  <div class="section-hdr">
+    <h2>${esc(yr)} ARCHIVE (${yrWeeks.length} WEEKS &middot; ${yrReleases} RELEASES &middot; ${yrChanges.toLocaleString()} CHANGES)</h2>
+    <a href="#top" class="back-to-top">[&uarr; top]</a>
+  </div>
+  <div class="week-grid">
+    ${yrWeeks.map(weekCard).join('\n')}
+  </div>
+</section>`
+    }).join('\n')
+
+    const filterScript = `
+<script>
+(function () {
+  var input = document.getElementById('week-filter');
+  var countEl = document.getElementById('week-filter-count');
+  if (!input) return;
+  var cards = [].slice.call(document.querySelectorAll('.week-card'));
+  var sections = [].slice.call(document.querySelectorAll('.year-section'));
+  input.addEventListener('input', function () {
+    var q = input.value.trim().toLowerCase();
+    var visible = 0;
+    cards.forEach(function (card) {
+      var text = (card.getAttribute('data-search') || card.textContent || '').toLowerCase();
+      var match = !q || text.indexOf(q) !== -1;
+      card.hidden = !match;
+      if (match) visible++;
+    });
+    sections.forEach(function (sec) {
+      var hasVisible = sec.querySelectorAll('.week-card:not([hidden])').length > 0;
+      sec.hidden = !hasVisible;
+    });
+    if (countEl) {
+      countEl.textContent = q ? (visible + ' of ' + cards.length + ' weeks') : '';
+    }
+  });
+})();
+</script>`
+
+    const body = `<section class="hero" id="top">
+  <div class="term-box">
+    <div class="term-box-hdr">
+      <span class="term-box-title">WEEKLY_DIGESTS :: high-level rollups</span>
+      <span>${weeks.length} weeks &middot; ${totalReleases} releases &middot; <a href="/feed-weekly.xml">[rss]</a></span>
+    </div>
+    <p class="list-note">High-level weekly rollups synthesizing releases, model catalog shifts, security updates, and notable architectural work. Select a week to read its digest or copy a Markdown summary formatted for Discord.</p>
+  </div>
+</section>
+${heroCard}
+${yearPills}
+${filterBar}
+${yearSections}
+${filterScript}`
+
     await write(dist, 'week/index.html', layout({
       title: 'Weekly digests', path: '/week/',
-      desc: 'Freebuff changes summarized one week at a time.',
-      body: `<section class="hero"><div class="term-box term-box-slim"><div class="term-box-hdr"><span class="term-box-title">WEEKLY_DIGESTS</span><span>${weeks.length} weeks &middot; <a href="/feed-weekly.xml">[rss]</a></span></div></div></section>` +
-        `<section class="week-rows">${weeks.map(w => `<div class="crow"><span class="crow-time">${esc(w.key)}</span><a class="crow-title" href="${weekHref(w)}">${esc(weekLabel(w))}</a><span class="crow-sum">${esc(weeklyHeadline(w))}</span></div>`).join('')}</section>`
+      desc: 'Freebuff changes summarized one week at a time: releases, model catalog updates, and notable work.',
+      body
     }))
     await write(dist, 'weekly/index.html', `<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=/week/"><link rel="canonical" href="${SITE.url}/week/"><title>Redirecting to /week/…</title></head><body><script>location.replace('/week/')</script><p><a href="/week/">Redirecting to /week/…</a></p></body></html>\n`)
   }

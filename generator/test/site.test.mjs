@@ -623,6 +623,13 @@ test('buildSite generates valid static site output', async () => {
     assert.match(redirectsTxt, /^\/changes\/ \/archive\/ 301$/m, 'old hub URL redirects to archive')
     assert.match(redirectsTxt, /^\/watch\/ \/models\/ 301$/m, 'the removed watchlist still resolves for old bookmarks')
     assert.match(redirectsTxt, /^\/models\/\*\/feed\.xml \/feed-models\.xml 301$/m, 'deleted per-model feeds point at the model feed')
+
+    const weekIndex = await readFile(join(tmpDist, 'week/index.html'), 'utf8')
+    assert.match(weekIndex, /class="week-hero"/, 'week index carries featured latest week spotlight card')
+    assert.match(weekIndex, /class="week-year-pills"/, 'week index offers year jump pills')
+    assert.match(weekIndex, /class="year-section"/, 'week index groups weeks by year section')
+    assert.match(weekIndex, /class="week-card"/, 'week index renders structured week cards')
+    assert.match(weekIndex, /id="week-filter"/, 'week index includes interactive search filter')
     // /c/<sha> is the date-free permalink. A day URL is a function of a timestamp
     // that has already moved once, so shared links need an address that encodes no
     // date -- and one page plus a lookup table, because ~9,500 static redirect
