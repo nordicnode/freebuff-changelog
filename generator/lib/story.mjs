@@ -4,6 +4,18 @@
 // supplies context. These are heuristics, not proof of a shared policy change.
 // Recompute at render time so newly arrived entries require neither another API
 // call nor cache invalidation. Never mutate per-commit summaries.
+//
+// One deliberate reach across the day boundary: a version bump usually lands
+// the morning after the work it ships, so a bump row also joins the previous
+// day's clustering. Links and notes always point at a member's own day.
+import { isBumpEntry } from './analyze.mjs'
+
+function previousDay (day) {
+  const d = new Date(`${day}T00:00:00Z`)
+  if (Number.isNaN(d.getTime())) return null
+  d.setUTCDate(d.getUTCDate() - 1)
+  return d.toISOString().slice(0, 10)
+}
 
 // Files whose *name* says nothing about which change this is. Two entries both
 // editing a README are not one story, and pairing them would put a note on rows
@@ -125,7 +137,7 @@ function describe (e) {
   }
 }
 
-function clustersOf (list) {
+function clustersOf (list, day = list[0]?.day) {
   const desc = list.map(describe)
   const seen = new Array(desc.length).fill(false)
   const out = []
@@ -149,8 +161,12 @@ function clustersOf (list) {
     // line was written before the other one existed comes before it.
     members.sort((a, b) => String(a.entry.date || '').localeCompare(String(b.entry.date || '')) ||
       String(a.entry.sha || '').localeCompare(String(b.entry.sha || '')))
+    // A cluster whose only native member is one row and the rest are borrowed
+    // bumps is still a real link (the bump ships that row), but it needs one
+    // member that belongs to this day.
+    if (!members.some(m => m.entry.day === day)) continue
     out.push({
-      day: list[0].day,
+      day,
       access: members.some(m => m.access),
       members: members.map(m => ({
         sha: m.entry.sha,
@@ -187,23 +203,36 @@ export function buildStoryIndex (entries) {
   const notes = new Map()
   const days = new Map()
   const byDay = new Map()
+  const push = (day, e) => {
+    const list = byDay.get(day) || []
+    list.push(e)
+    byDay.set(day, list)
+  }
   for (const e of entries || []) {
     if (!e || e.noise || !e.day) continue
     if (!entryTitle(e)) continue
-    const list = byDay.get(e.day) || []
-    list.push(e)
-    byDay.set(e.day, list)
+    push(e.day, e)
+    if (isBumpEntry(e)) {
+      const prev = previousDay(e.day)
+      if (prev) push(prev, e)
+    }
   }
   for (const [day, list] of byDay) {
-    const clusters = clustersOf(list)
+    // A bump borrowed from tomorrow must not seed a cluster by itself; drop the
+    // list when nothing native to the day is in it.
+    if (!list.some(e => e.day === day)) continue
+    const clusters = clustersOf(list, day)
     if (!clusters.length) continue
     days.set(day, clusters)
     for (const cluster of clusters) {
       for (const m of cluster.members) {
         const rel = cluster.members.filter(p => p !== m && noteWanted(m.raw, p.raw))
         if (!rel.length) continue
+        // A note written under day D for a bump that lives on D+1 must not
+        // overwrite the one its own day computed.
+        if (m.raw.day !== day && notes.has(m.sha)) continue
         notes.set(m.sha, rel.slice(0, NOTE_MAX).map(p => ({
-          sha: p.sha, day, anchor: p.anchor, title: p.title,
+          sha: p.sha, day: p.raw.day || day, anchor: p.anchor, title: p.title,
           text: [accessEvidence(m.raw) || accessEvidence(p.raw), p.line].filter(Boolean).join(' ')
         })))
       }
@@ -230,6 +259,6 @@ export function dayStoryLead (clusters) {
     day: c.day,
     count: c.members.length,
     rest: c.members.length - shown.length,
-    parts: shown.map(m => ({ anchor: m.anchor, day: c.day, title: m.title, text: m.line }))
+    parts: shown.map(m => ({ anchor: m.anchor, day: m.raw?.day || c.day, title: m.title, text: m.line }))
   }
 }

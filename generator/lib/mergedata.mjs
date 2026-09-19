@@ -13,6 +13,7 @@
 // commutative under these rules, so commit order stops mattering.
 import { existsSync } from 'node:fs'
 import { readJson, writeJson, shortHash, eli5Source, normalizeDate } from './util.mjs'
+import { pruneStaleCache } from './versions.mjs'
 
 export function sortEntries (entries) {
   return entries.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.sha < b.sha ? -1 : 1))
@@ -101,6 +102,10 @@ export function mergeChangelog (ours, theirs) {
  * patch hash), so equal keys mean equal inputs; on collision prefer a real
  * summary over an error stub, then the newer write.
  */
+// Keys from retired prompt versions are dropped on every merge: a local prune
+// would otherwise be undone the moment origin's copy (still carrying them) is
+// unioned back in. Entries keep their own copy of every summary, so nothing on
+// the site depends on these keys.
 export function mergeAiCache (ours, theirs) {
   const a = ours || {}
   const b = theirs || {}
@@ -109,6 +114,7 @@ export function mergeAiCache (ours, theirs) {
     if (!a[key] || !b[key]) continue
     out[key] = betterCacheEntry(a[key], b[key])
   }
+  pruneStaleCache(out)
   return out
 }
 

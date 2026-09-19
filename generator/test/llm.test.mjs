@@ -1045,9 +1045,9 @@ test('enrichEli5: writes the line, caches it by the summary, asks once', async (
   }
 })
 
-test('versions bumped for 270K context overhaul', () => {
-  assert.equal(PROMPT_V, 7, 'PROMPT_V bumped to 7')
-  assert.equal(ELI5_V, 6, 'ELI5_V bumped to 6')
+test('versions bumped for structured facts + PR threads + glossary overhaul', () => {
+  assert.equal(PROMPT_V, 9, 'PROMPT_V bumped to 9')
+  assert.equal(ELI5_V, 7, 'ELI5_V bumped to 7')
 })
 
 test('buildPrompt: injects architecture map, PR motivation, sequence context, and requires evidence', () => {
@@ -1069,7 +1069,7 @@ test('buildPrompt: injects architecture map, PR motivation, sequence context, an
 
   assert.match(prompt, /Freebuff Monorepo Architecture Context:/)
   assert.match(prompt, /packages\/agent-runtime/)
-  assert.match(prompt, /Author intent & PR motivation:/)
+  assert.match(prompt, /Author intent & PR motivation/)
   assert.match(prompt, /PR #1372: Support agent plugins/)
   assert.match(prompt, /Resolves memory leak during recursive subagent execution/)
   assert.match(prompt, /Same-day commit sequence/)

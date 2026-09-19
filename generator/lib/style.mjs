@@ -2583,4 +2583,73 @@ mark.search-match{
 .story-lead a:hover{text-decoration:underline}
 .story-lead .story-more{color:var(--txt-subtle)}
 .reading-mode-plain .story-lead{display:block !important}
+
+/* Evidence: the model's citation, collapsed under the summary. */
+.evidence{margin:8px 0 0;font-size:.8rem}
+.evidence-toggle{cursor:pointer;color:var(--txt-dim);list-style:none;display:flex;gap:6px;align-items:center;user-select:none}
+.evidence-toggle::-webkit-details-marker{display:none}
+.evidence-toggle:hover{color:var(--term-cyan)}
+.evidence[open] .evidence-toggle .diff-arrow{transform:rotate(90deg)}
+.evidence-warn{color:var(--term-yellow,#d29922)}
+.evidence-body{margin:6px 0 0 14px;padding:6px 10px;border-left:2px solid var(--border,#30363d);color:var(--txt-dim);line-height:1.5}
+.evidence-body p{margin:0 0 4px}
+.evidence-body code{font-size:.78rem}
+.evidence-flag{color:var(--term-yellow,#d29922)}
+.reading-mode-plain .evidence{display:none}
+
+/* Which release first carried this commit. */
+.shipped-in{margin:8px 0 0;font-size:.78rem;color:var(--txt-dim)}
+.shipped-lbl{color:var(--txt-subtle);letter-spacing:.06em;margin-right:6px}
+.shipped-in a{color:var(--term-cyan);text-decoration:none}
+.shipped-in a:hover{text-decoration:underline}
+
+/* Badges added in v8: security, audience, human-edited. */
+.badge.sec{color:var(--term-red,#f85149);border-color:rgba(248,81,73,.45)}
+.badge.aud{color:var(--txt-dim);border-color:var(--border,#30363d);text-transform:uppercase}
+.badge.human{color:var(--term-green,#3fb950);border-color:rgba(63,185,80,.45)}
+
+/* AI preview on an open PR card. */
+.pr-preview-ai{margin:6px 0 8px;padding:8px 10px;background:var(--eli5-bg);border-left:2px solid var(--eli5-rule);font-size:.84rem;line-height:1.5}
+.pr-preview-ai .eli5-label{display:block;margin-bottom:4px}
+.pr-preview-note{display:block;margin-top:4px;font-size:.72rem;color:var(--txt-subtle)}
+
+/* Weekly digest rows reuse the compact change rows. */
+.week-rows{margin:6px 0 14px}
+.week-rows .crow .model-swap{display:inline-flex;gap:6px;flex-wrap:wrap}
+
+/* v9: structured-fact chips, per-topic changes, action / unknowns lines. */
+.schips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0}
+.schip{font-size:.72rem;padding:2px 7px;border:1px solid var(--border,#30363d);border-radius:3px;color:var(--txt-dim);white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+.schip.const{border-color:rgba(210,153,34,.45)}
+.schip.const b{color:var(--term-yellow,#d29922);font-weight:600}
+.schip.env{color:var(--term-purple,#a371f7);border-color:rgba(163,113,247,.4)}
+.schip.flag{color:var(--term-cyan)}
+.schip.exp{color:var(--term-green,#3fb950)}
+.schip.exp.del{color:var(--term-red,#f85149)}
+.tests-assert{margin:6px 0 0;font-size:.78rem;color:var(--txt-dim)}
+.tests-assert summary{cursor:pointer;list-style:none;user-select:none}
+.tests-assert summary::-webkit-details-marker{display:none}
+.tests-assert summary::before{content:'> ';color:var(--txt-subtle)}
+.tests-assert[open] summary::before{content:'v '}
+.tests-assert ul{margin:4px 0 0 14px;padding:0 0 0 12px;line-height:1.5}
+.changes{margin:8px 0 0;padding:0 0 0 16px;font-size:.86rem;line-height:1.55}
+.changes li{margin:2px 0}
+.changes-area{color:var(--term-cyan);font-size:.72rem;letter-spacing:.04em;text-transform:uppercase;margin-right:4px}
+.changes-files code{font-size:.72rem;color:var(--txt-subtle)}
+.migration,.unknowns{margin:8px 0 0;font-size:.82rem;line-height:1.5}
+.migration{padding:6px 10px;border-left:2px solid var(--term-yellow,#d29922);background:rgba(210,153,34,.06)}
+.migration-lbl,.unknowns-lbl{display:inline-block;font-size:.68rem;letter-spacing:.08em;color:var(--txt-subtle);margin-right:8px}
+.migration-lbl{color:var(--term-yellow,#d29922)}
+.unknowns{color:var(--txt-dim)}
+.badge.brk{color:var(--term-red,#f85149);border-color:rgba(248,81,73,.55);font-weight:600}
+.badge.lowc{color:var(--txt-subtle);border-style:dashed}
+.meta-link.report{color:var(--txt-subtle)}
+.reading-mode-plain .schips,.reading-mode-plain .tests-assert,.reading-mode-plain .unknowns{display:none}
+
+/* Quality card notes and audience split colours. */
+.stat-note{font-size:.7rem;color:var(--txt-subtle);white-space:nowrap}
+.sig-seg.aud-end-users{background:var(--term-cyan)}
+.sig-seg.aud-advertisers{background:var(--term-yellow,#d29922)}
+.sig-seg.aud-operators{background:var(--term-purple,#a371f7)}
+.sig-seg.aud-maintainers{background:var(--txt-subtle)}
 `

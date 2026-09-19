@@ -142,6 +142,24 @@ export async function extractCleanDiff (repoDir, base, head, maxBytes = 250000, 
   return diffText(repoDir, range, pathspecs, maxBytes, contextLines)
 }
 
+// `git show <ref>:<path>`, memoized per process. The summary pass and the ELI5
+// pass read the same files for the same entry minutes apart, and the header,
+// outline and README extractors each re-read them; one read per (ref, path)
+// is enough. Bounded so a long backfill cannot grow it without limit.
+const SHOW_CACHE = new Map()
+const SHOW_CACHE_MAX = 3000
+
+export async function showCached (repoDir, ref, path) {
+  const key = `${repoDir}\0${ref}\0${path}`
+  if (SHOW_CACHE.has(key)) return SHOW_CACHE.get(key)
+  const out = (await git(['show', `${ref}:${path}`], repoDir, { allowFail: true })) || ''
+  if (SHOW_CACHE.size >= SHOW_CACHE_MAX) SHOW_CACHE.delete(SHOW_CACHE.keys().next().value)
+  SHOW_CACHE.set(key, out)
+  return out
+}
+
+export function clearShowCache () { SHOW_CACHE.clear() }
+
 /**
  * Extract leading module-level documentation comments or headers from touched files.
  * Provides ground-truth architectural purpose directly to the LLM to prevent hallucinations.
@@ -156,7 +174,7 @@ export async function extractFileHeaders (repoDir, ref, files, maxFiles = 6, max
   const headers = []
   for (const path of targets) {
     try {
-      const content = await git(['show', `${ref}:${path}`], repoDir, { allowFail: true })
+      const content = await showCached(repoDir, ref, path)
       if (!content) continue
       const lines = content.split('\n').slice(0, maxLinesPerFile)
       if (/\.md$/i.test(path)) {
@@ -267,7 +285,7 @@ export async function extractFullOrOutlinedFiles (repoDir, ref, files, maxLines 
 
   for (const path of targets) {
     try {
-      const content = await git(['show', `${ref}:${path}`], repoDir, { allowFail: true })
+      const content = await showCached(repoDir, ref, path)
       if (!content) continue
       const lines = content.split('\n')
       if (lines.length <= maxLines) {
@@ -308,7 +326,7 @@ export async function extractSubsystemDocs (repoDir, ref, files, maxDocs = 2) {
       if (seenPaths.has(candidate)) break
       seenPaths.add(candidate)
       try {
-        const content = await git(['show', `${ref}:${candidate}`], repoDir, { allowFail: true })
+        const content = await showCached(repoDir, ref, candidate)
         if (content) {
           const overview = content.split('\n').slice(0, 35).join('\n').trim()
           docs.push({ path: candidate, content: overview })
@@ -532,6 +550,28 @@ export function isBumpEntry (e) {
 
 export const TEST_RE = /(^|\/)(__tests__|tests?|fixtures?|mocks?)\/|\.(test|spec)\.[jt]sx?$/
 
+// Deterministic weight, with the reason it was given. The reason travels to the
+// badge tooltip so a reader (and the LLM, which may override the weight) can see
+// what the rule saw. A bump-only row is `notable`, not `major`: the label moved,
+// and the release page carries the story; `major` is for a model, a command, or
+// a bump that also ships code.
+export const LARGE_CHANGE_LINES = 400
+
+export function significanceOf (e) {
+  const f = e?.files || {}
+  const lines = (e?.stats?.additions || 0) + (e?.stats?.deletions || 0)
+  if (e?.modelChanges) return { significance: 'major', reason: 'model catalog changed' }
+  const bump = !!(e?.version || e?.freebuffVersion)
+  const bumpOnlyShape = bump && (f.meaningful ?? 99) <= 1 && !(f.added || []).length && !(f.removed || []).length
+  if (bump && !bumpOnlyShape) return { significance: 'major', reason: 'version bump shipping code' }
+  if (e?.cmdChanges) return { significance: 'notable', reason: 'slash commands changed' }
+  if (bumpOnlyShape) return { significance: 'notable', reason: 'version bump' }
+  if ((f.added || []).length) return { significance: 'notable', reason: 'new files' }
+  if ((f.removed || []).length) return { significance: 'notable', reason: 'files removed' }
+  if (lines > LARGE_CHANGE_LINES) return { significance: 'notable', reason: `large change (${lines} lines)` }
+  return { significance: 'minor', reason: 'edits to existing files' }
+}
+
 export function commitNatureOf (e) {
   if (!e) return 'production'
   if (e.testOnly || e.files?.testOnly) return 'test-only'
@@ -686,6 +726,41 @@ export function formatArchitectureMap (components = MONOREPO_COMPONENTS) {
   return lines.join('\n')
 }
 
+// Glossary candidates from the upstream docs: every `## Heading` in docs/**.md
+// and the package READMEs, with the first sentence beneath it as a hint. The
+// result seeds data/glossary.json; a human fills in or deletes definitions, and
+// only filled definitions are ever injected into a prompt.
+export async function discoverGlossary (repoDir, ref = 'origin/main', { maxTerms = 80 } = {}) {
+  const out = {}
+  if (!repoDir) return out
+  const list = await git(['ls-tree', '-r', '--name-only', ref], repoDir, { allowFail: true })
+  if (!list) return out
+  const docs = list.split('\n').map(s => s.trim()).filter(p => /^docs\/.*\.md$|^(?:cli|sdk|common|web|agents|freebuff)\/README\.md$/i.test(p)).slice(0, 60)
+  for (const path of docs) {
+    const text = await showCached(repoDir, ref, path)
+    if (!text) continue
+    const lines = text.split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      const m = /^##\s+([A-Z][\w .'/&-]{2,40})\s*$/.exec(lines[i])
+      if (!m) continue
+      const term = m[1].trim()
+      if (/^(?:overview|introduction|usage|installation|getting started|examples?|notes?|see also|license|contributing|faq|table of contents|prerequisites|development|testing|configuration|architecture)$/i.test(term)) continue
+      if (out[term] !== undefined) continue
+      let hint = ''
+      for (let j = i + 1; j < Math.min(lines.length, i + 8); j++) {
+        const t = lines[j].trim()
+        if (!t || t.startsWith('#') || t.startsWith('|') || t.startsWith('```') || t.startsWith('-') || t.startsWith('*')) continue
+        const first = /^[^.!?]+[.!?]/.exec(t.replace(/[`*_]/g, ''))
+        hint = (first ? first[0] : t.replace(/[`*_]/g, '')).slice(0, 160)
+        break
+      }
+      out[term] = hint
+      if (Object.keys(out).length >= maxTerms) return out
+    }
+  }
+  return out
+}
+
 export async function discoverMonorepoArchitecture (repoDir, ref = 'origin/main') {
   if (!repoDir) return [...MONOREPO_COMPONENTS]
   try {
@@ -764,6 +839,7 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
 
   const facts = []
   const patchTargets = pickPatchTargets(meaningful)
+  let entryStructured = null
 
   let modelChanges = null
   let version = null
@@ -804,6 +880,8 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
       if (cc.added.length || cc.removed.length) cmdChanges = cc
     }
     facts.push(...extractCommentFacts(patch))
+    const structured = extractStructuredFacts(patch)
+    if (hasStructuredFacts(structured)) entryStructured = structured
   }
 
   // Consistent source file lists (tests excluded so headlines and chips match real code)
@@ -825,6 +903,7 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
     date: commit.date,
     sourceSha: sourceRef(commit),
     ...(cleanBody ? { messageBody: cleanBody } : {}),
+    ...(entryStructured ? { structured: entryStructured } : {}),
     version,
     ...(freebuffVersion ? { freebuffVersion } : {}),
     ...(versionTrack ? { versionTrack } : {}),
@@ -897,29 +976,182 @@ export function extractCommentFacts (patch) {
     const target = isAddedBlock ? addedFacts : contextFacts
     buf = []
     isAddedBlock = false
-    if (text.length < 35 || text.length > 300) return
-    if (!/^[A-Z"'\[(-]/.test(text)) return // drop mid-sentence continuations
+    // JSDoc tags carry the audience and the units ("@param limit Daily cap in
+    // cents for advertisers"): keep them as "name: description".
+    const tag = /^@(param|returns?|throws|default|deprecated|since)\s+(?:\{[^}]*\}\s*)?(?:(\w+)\s+)?[-:]?\s*(.*)$/.exec(text)
+    if (tag) text = `${tag[1] === 'param' && tag[2] ? tag[2] : tag[1]}: ${tag[3] || tag[2] || ''}`.trim()
+    // 20, not 35: "Staff accounts only." is 20 characters and exactly the kind
+    // of sentence this exists to keep. 92% of rows carried no fact at 35.
+    if (text.length < 20 || text.length > 300) return
+    if (!/^[A-Z"'\[(@-]|^[a-z]+: /.test(text)) return // drop mid-sentence continuations
     text = text.replace(/^(TODO|FIXME|NOTE|WHY|HOW)\s*:?\s*/i, '')
     const lower = (text.match(/[a-z]/g) || []).length
     if (lower < text.length * 0.5) return
-    if ((text.split(/\s+/).filter(w => /[a-z]{3,}/i.test(w)).length) < 4) return
-    if (!/[.!?]$/.test(text)) return
+    if ((text.split(/\s+/).filter(w => /[a-z]{3,}/i.test(w)).length) < 3) return
+    if (!/[.!?]$/.test(text) && !tag) return
     if (/^(Removed|Added|Modified|See|See also)\b.*\b(docs|test|section)\b/i.test(text) && text.length < 80) return
     target.push(text)
   }
 
   for (const line of patch.split('\n')) {
-    const m = /^([+ -])\s*(?:\/\/|\/\*+|\*+)\s?(.*)$/.exec(line)
+    const m = /^([+ -])\s*(?:\/\/|\/\*+|\*+|#(?!!))\s?(.*)$/.exec(line)
     if (!m) { flush(); continue }
     if (m[1] === '-') { flush(); continue }
     if (m[1] === '+') isAddedBlock = true
     const t = m[2].replace(/\*\/\s*$/, '').replace(/\/+$/, '').trim()
     if (!t) { flush(); continue }
+    // A JSDoc tag starts its own fact even mid-block.
+    if (/^@\w+/.test(t) && buf.length) flush()
     buf.push(t)
     if (buf.join(' ').length > 280) flush()
   }
   flush()
-  return [...new Set([...addedFacts, ...contextFacts])].slice(0, 5)
+  return [...new Set([...addedFacts, ...contextFacts])].slice(0, 8)
+}
+
+// ---------------------------------------------------------------------------
+// Structured facts: typed, deterministic, and copied into the prompt verbatim.
+//
+// The prompt asks the model to "describe only what literal value changed"; this
+// hands it the literal values. Constants that changed value (old -> new), new
+// env vars read, new CLI flags, exports added or removed, and the names of new
+// tests -- which are the nearest thing to a behavior spec the diff contains and
+// were previously stripped from the prompt along with the test hunks.
+// Every item is also added to the grounding corpus and shown as a chip.
+
+export const STRUCTURED_LIMITS = { constants: 12, envVars: 12, flags: 12, exportsAdded: 16, exportsRemoved: 16, testNames: 14 }
+
+const CONST_LINE_RE = /^([+-])\s*(?:export\s+)?(?:const|let|var)\s+([A-Z][A-Z0-9_]{2,})(?:\s*:\s*[^=]+)?\s*=\s*(.+?)\s*;?\s*$/
+const ENV_RE = /process\.env\.([A-Z][A-Z0-9_]{2,})|env\(['"`]([A-Z][A-Z0-9_]{2,})['"`]\)|\benv\.([A-Z][A-Z0-9_]{3,})\b/g
+const FLAG_RE = /['"`](--[a-z][a-z0-9-]{1,40})(?:[=\s<\[][^'"`]*)?['"`]/g
+const EXPORT_RE = /^([+-])\s*export\s+(?:default\s+)?(?:async\s+)?(?:function\*?|const|let|var|class|type|interface|enum)\s+([A-Za-z_$][\w$]*)/
+const TEST_NAME_RE = /^\+\s*(?:it|test|describe)(?:\.(?:only|skip|each\([^)]*\)))?\s*\(\s*(['"`])((?:(?!\1).){8,140})\1/
+
+function trimValue (v) {
+  const s = String(v).replace(/\s+/g, ' ').trim()
+  return s.length > 80 ? `${s.slice(0, 77)}...` : s
+}
+
+// A value that is only the opening of a multi-line literal (`[`, `{`, `new Map(`)
+// is not a value; reporting `[ -> [] as const` misleads more than it informs.
+function isOpenerValue (v) {
+  return /^[[{(]$|[[{(,]$|^new \w+\($|=>\s*[{(]?$/.test(String(v).trim())
+}
+
+const DOC_FILE_RE = /\.(?:mdx?|txt|rst)$/i
+// Flags on a line that invokes another program are that program's flags, not
+// ours (`git(['rev-parse', '--verify', '--quiet'])`).
+const SUBPROCESS_LINE_RE = /\b(?:git|spawn(?:Sync)?|exec(?:Sync|File|FileSync)?|execa|run|\$)\s*\(|\[\s*['"`](?:git|npm|bun|npx|pnpm|yarn|docker|node)['"`]/
+
+export function extractStructuredFacts (patch) {
+  const out = { constants: [], envVars: [], flags: [], exportsAdded: [], exportsRemoved: [], testNames: [] }
+  if (!patch) return out
+  const removedConst = new Map()
+  const addedConst = new Map()
+  const removedExports = new Set()
+  const addedExports = new Set()
+  const envSeen = new Set()
+  const envBefore = new Set()
+  const flagSeen = new Set()
+  const flagBefore = new Set()
+  const tests = new Set()
+  let inTestFile = false
+  let inDocFile = false
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      const path = line.split(' b/').pop() || ''
+      inTestFile = TEST_RE.test(path)
+      inDocFile = DOC_FILE_RE.test(path)
+      continue
+    }
+    const sign = line[0]
+    if (sign !== '+' && sign !== '-') continue
+    if (line.startsWith('+++') || line.startsWith('---')) continue
+    const c = CONST_LINE_RE.exec(line)
+    if (c && !inTestFile && !inDocFile && !isOpenerValue(c[3])) (c[1] === '-' ? removedConst : addedConst).set(c[2], trimValue(c[3]))
+    const x = EXPORT_RE.exec(line)
+    if (x && !inTestFile && !inDocFile) (x[1] === '-' ? removedExports : addedExports).add(x[2])
+    // Docs mentioning an existing variable or flag for the first time are not
+    // introducing it; subprocess argument lists are another program's flags.
+    if (!inTestFile && !inDocFile) {
+      for (const m of line.matchAll(ENV_RE)) {
+        const name = m[1] || m[2] || m[3]
+        if (!name) continue
+        if (sign === '+') envSeen.add(name); else envBefore.add(name)
+      }
+      if (!SUBPROCESS_LINE_RE.test(line)) {
+        for (const m of line.matchAll(FLAG_RE)) {
+          if (sign === '+') flagSeen.add(m[1]); else flagBefore.add(m[1])
+        }
+      }
+    }
+    if (sign === '+') {
+      const t = TEST_NAME_RE.exec(line)
+      if (t) tests.add(t[2].replace(/\s+/g, ' ').trim())
+    }
+  }
+  for (const [name, to] of addedConst) {
+    const from = removedConst.get(name)
+    if (from != null && from !== to) out.constants.push({ name, from, to })
+  }
+  // Reads that exist on the removed side too are moved code, not new inputs.
+  out.envVars = [...envSeen].filter(n => !envBefore.has(n))
+  out.flags = [...flagSeen].filter(f => !flagBefore.has(f))
+  out.exportsAdded = [...addedExports].filter(n => !removedExports.has(n))
+  out.exportsRemoved = [...removedExports].filter(n => !addedExports.has(n))
+  out.testNames = [...tests]
+  for (const k of Object.keys(STRUCTURED_LIMITS)) out[k] = out[k].slice(0, STRUCTURED_LIMITS[k])
+  return out
+}
+
+export function hasStructuredFacts (s) {
+  return !!s && Object.values(s).some(v => Array.isArray(v) && v.length)
+}
+
+// Prompt lines. Each list is labelled with what the model may conclude from it.
+export function formatStructuredFacts (s) {
+  if (!hasStructuredFacts(s)) return []
+  const lines = ['Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):']
+  if (s.constants.length) lines.push(`- Constants whose value changed: ${s.constants.map(c => `${c.name}: ${c.from} -> ${c.to}`).join(' ; ')}`)
+  if (s.envVars.length) lines.push(`- Environment variables newly read: ${s.envVars.join(', ')}`)
+  if (s.flags.length) lines.push(`- Command-line flags newly introduced: ${s.flags.join(', ')}`)
+  if (s.exportsAdded.length) lines.push(`- Exports added: ${s.exportsAdded.join(', ')}`)
+  if (s.exportsRemoved.length) lines.push(`- Exports removed: ${s.exportsRemoved.join(', ')}`)
+  if (s.testNames.length) lines.push(`- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): ${s.testNames.map(t => `"${t}"`).join(' ; ')}`)
+  return lines
+}
+
+// Text for the grounding corpus.
+export function structuredFactsText (s) {
+  if (!hasStructuredFacts(s)) return ''
+  return [
+    ...s.constants.flatMap(c => [c.name, c.from, c.to]),
+    ...s.envVars, ...s.flags, ...s.exportsAdded, ...s.exportsRemoved, ...s.testNames
+  ].join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// Diff ordering for the prompt budget. `git diff` emits files alphabetically,
+// so a 90 KB `__snapshots__/x.snap` or a generated schema could crowd out the
+// 3 KB `.ts` that is the change. Source first, then docs and config, then
+// generated or test files, and within a tier smaller files first so the budget
+// covers as many whole files as possible.
+
+export function diffPartPriority (part) {
+  const head = String(part).split('\n', 1)[0]
+  const path = (head.split(' b/').pop() || '').trim()
+  if (/(?:^|\/)__snapshots__\/|\.snap$|\.(?:lock|lockb|min\.js|map)$|(?:^|\/)(?:generated|gen|dist|build)\//i.test(path)) return 4
+  if (TEST_RE.test(path)) return 3
+  if (/\.(?:md|mdx|json|ya?ml|toml|txt|csv)$/i.test(path)) return 2
+  if (/\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|sql|css|scss|html|sh)$/i.test(path)) return 0
+  return 1
+}
+
+export function prioritizeDiffParts (parts) {
+  return parts
+    .map((p, i) => ({ p, i, pri: diffPartPriority(p), len: p.length }))
+    .sort((a, b) => a.pri - b.pri || a.len - b.len || a.i - b.i)
+    .map(x => x.p)
 }
 
 function tagsFor (e) {
@@ -933,6 +1165,16 @@ function tagsFor (e) {
   if (e.areas.some(a => a === 'CLI')) tags.push('cli')
   if (e.files.total > 25) tags.push('large')
   return tags
+}
+
+// A cheap path-and-title test for the `security` tag on brand-new rows (the
+// summary-aware version lives in llm.mjs: isSecurityEntry, used at build time).
+export const SECURITY_HINT_RE = /\b(?:security|secur(?:e|ed|ing)|trust(?:ed)?|untrusted|checksum|sha-?256|tamper|hijack|sandbox|credential|secrets?|permission|redirect|csrf|xss|injection|privacy|abuse|enforcement)\b/i
+
+export function securityHint (e) {
+  const paths = [...(e?.files?.added || []), ...(e?.files?.modified || [])]
+  if (paths.some(p => /(?:^|\/)(?:auth|security|trust|permissions?|credentials?|sandbox|direnv|checksums?)[^/]*\.[a-z]+$/i.test(p))) return true
+  return SECURITY_HINT_RE.test(`${e?.messageTitle || ''} ${e?.messageBody || ''} ${(e?.facts || []).join(' ')}`)
 }
 
 // ---------------------------------------------------------------------------

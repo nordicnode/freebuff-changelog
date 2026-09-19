@@ -5,15 +5,16 @@
 //   node generator/cli.mjs build
 //   node generator/cli.mjs preview [port]
 import { mkdir, readFile, rm, cp } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { git, readJson, writeJson, writeText, log, ymd, toUtc, normalizeDate, pruneDiffs, pool, withLock } from './lib/util.mjs'
 import { capturePendingWrites, persistMerged, mergeOpenPrs } from './lib/mergedata.mjs'
 import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
-  extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf } from './lib/analyze.mjs'
-import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone } from './lib/llm.mjs'
+  extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
+  extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
+import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary } from './lib/llm.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
 
@@ -74,6 +75,14 @@ async function storedDiffFor (e) {
   const base = await baseShaFor(e)
   const clean = await extractCleanDiff(REPO_DIR, base, e.sha)
   return clean.trim() ? clean : extractRawDiff(REPO_DIR, base, e.sha)
+}
+
+// The full stored diff (test hunks included), for the structured-facts
+// extractor: test titles are the point, and the prompt patch strips them.
+// Disk first, git second, never fails the caller.
+async function fullPatchFor (e) {
+  try { return await readFile(resolve(DATA, `diffs/${e.sha}.diff`), 'utf8') } catch {}
+  try { return await storedDiffFor(e) } catch { return '' }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +223,10 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
       if (total == null) total = lastPage(res)
       prs.push(...batch.map(p => ({
         number: p.number, title: p.title, url: p.html_url, author: p.user?.login,
+        // The description is the author's stated intent: the summary prompt
+        // quotes it, and it was never stored before, so findPrMeta().body was
+        // always empty. Bounded: some PR templates run to pages.
+        body: typeof p.body === 'string' ? p.body.slice(0, 4000) : '',
         created: p.created_at, updated: p.updated_at, draft: p.draft,
         comments: p.comments ?? 0,
         reviewComments: p.review_comments ?? 0,
@@ -277,6 +290,21 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
       if ((!p.labels || p.labels.length === 0) && prev.labels?.length) p.labels = prev.labels
       if (!p.commitsList && prev.commitsList) p.commitsList = prev.commitsList
       if (!p.commentsList && prev.commentsList) p.commentsList = prev.commentsList
+      if (!p.body && prev.body) p.body = prev.body
+    }
+    // PRs that left the open list since the last complete fetch: remember them,
+    // so the sync commit that lands them later still finds its PR context.
+    // Only a complete walk may conclude that a missing number has closed.
+    if (complete && cachedPrs.length) {
+      const mergedPath = `${dataDir}/merged-prs.json`
+      // The preview diff is read now, before prunePrDiffs deletes it: its file
+      // paths are what lets a later sync commit be matched back to this PR.
+      const pathsOf = (p) => { try { return diffPaths(readFileSync(resolve(dataDir, `pr-diffs/${p.number}.diff`), 'utf8')) } catch { return [] } }
+      const { doc: mergedDoc, added } = rememberClosedPrs(cachedPrs, list, await readJson(mergedPath, { prs: [] }), new Date().toISOString(), { pathsOf })
+      if (added) {
+        await writeJson(mergedPath, mergedDoc)
+        log(`open PRs: ${added} left the open list; remembered in merged-prs.json (${mergedDoc.prs.length} kept)`)
+      }
     }
     // The list endpoint omits additions/deletions/changed_files entirely, so
     // every extra number on a card costs a call: budget them, and stop asking
@@ -482,14 +510,61 @@ function decorate (e) {
     e.title = label.title
     e.summary = label.summary
   }
-  let significance = 'minor'
-  if (e.modelChanges || e.version) significance = 'major'
-  else if (e.cmdChanges || e.files.added.length || e.files.removed.length) significance = 'notable'
-  else if (e.stats.additions + e.stats.deletions > 400) significance = 'notable'
-  e.significance = significance
+  const weight = significanceOf(e)
+  e.significance = weight.significance
+  e.significanceReason = weight.reason
+  if (securityHint(e)) {
+    e.tags = e.tags || []
+    if (!e.tags.includes('security')) e.tags.push('security')
+  }
   e.day = ymd(e.date)
   e.month = ymd(e.date).slice(0, 7)
   return e
+}
+
+// Re-derive every field that later rules compute from the stored shape of a
+// row, without touching titles, summaries or AI text. Stored history predates
+// several of them: commitNature was on 37 of 9,686 rows, significanceReason on
+// none, the security tag on none. Idempotent; returns how many rows changed.
+export function repairEntry (e, { diffText = null } = {}) {
+  if (!e || !e.files) return false
+  let changed = false
+  const set = (k, v) => { if (e[k] !== v) { e[k] = v; changed = true } }
+  if (e.noise) {
+    set('commitNature', 'churn')
+    return changed
+  }
+  // Structured facts from the stored diff, for rows analyzed before the
+  // extractor existed (the prompt and the chips both read them).
+  if (diffText && !hasStructuredFacts(e.structured)) {
+    const s = extractStructuredFacts(diffText)
+    if (hasStructuredFacts(s)) { e.structured = s; changed = true }
+  }
+  const testOnly = e.files.testOnly ?? ((e.files.meaningful === 0 && (e.files.rawMeaningful || 0) > 0) ||
+    ([...(e.files.added || []), ...(e.files.removed || []), ...(e.files.modified || [])].length > 0 &&
+     [...(e.files.added || []), ...(e.files.removed || []), ...(e.files.modified || [])].every(p => TEST_RE.test(p))))
+  if (testOnly && !e.testOnly) set('testOnly', true)
+  set('commitNature', commitNatureOf(e))
+  const weight = significanceOf(e)
+  set('significance', weight.significance)
+  set('significanceReason', weight.reason)
+  if (securityHint(e)) {
+    e.tags = e.tags || []
+    if (!e.tags.includes('security')) { e.tags.push('security'); changed = true }
+  }
+  return changed
+}
+
+export function repairEntries (entries, { diffDir = null } = {}) {
+  let n = 0
+  for (const e of entries || []) {
+    let diffText = null
+    if (diffDir && !e.noise && !hasStructuredFacts(e.structured)) {
+      try { diffText = readFileSync(resolve(diffDir, `${e.sha}.diff`), 'utf8') } catch {}
+    }
+    if (repairEntry(e, { diffText })) n++
+  }
+  return n
 }
 
 // ---------------------------------------------------------------------------
@@ -551,7 +626,7 @@ async function generateOnce (argv) {
   if (toEnrich.length > 0) {
     await backfillDiffs(toEnrich, toEnrich.length)
     if (llmConfigured()) {
-      const n = await enrichWithLlm(toEnrich, llmPatchFor, DATA, process.env, { repoDir: REPO_DIR })
+      const n = await enrichWithLlm(toEnrich, llmPatchFor, DATA, process.env, { repoDir: REPO_DIR, getFullPatch: fullPatchFor })
       log(`LLM enriched ${n} new entries`)
     }
   }
@@ -559,7 +634,7 @@ async function generateOnce (argv) {
   // summary it explains may have been written minutes ago by the other pass.
   // This call is what makes a brand-new entry arrive with its plain-English line
   // already attached instead of waiting for a backfill.
-  const eli5N = await enrichEli5(entries, DATA, process.env, { getPatch: llmPatchFor, repoDir: REPO_DIR })
+  const eli5N = await enrichEli5(entries, DATA, process.env, { getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
   if (eli5N) log(`ELI5 wrote ${eli5N} plain-English line${eli5N === 1 ? '' : 's'}`)
 
   const prevScanned = existing.counts?.commitsScanned || 0
@@ -596,6 +671,12 @@ async function generateOnce (argv) {
 
   const prs = await fetchOpenPrs()
   await prunePrDiffs(prs || [], await readJson(`${DATA}/open-prs.json`, null))
+  // Previews for open PRs: same summary ask on the stored preview diff, a few
+  // per run (CHANGELOG_PR_LLM_LIMIT), cached by number + diff hash.
+  if (prs?.length && llmConfigured()) {
+    const n = await enrichOpenPrs(prs, DATA, process.env, { getDiff: (p) => readFile(resolve(DATA, `pr-diffs/${p.number}.diff`), 'utf8').catch(() => '') })
+    if (n) log(`LLM previewed ${n} open PR${n === 1 ? '' : 's'}`)
+  }
 
   log(`wrote ${entries.length} entries (${added} new this run)` + (prs ? `, ${prs.length} open PRs` : ''))
   // Newest last, matching analyze order: callers front-load these for
@@ -981,8 +1062,18 @@ async function cmdBuild () {
       }
     }
   }
+  // Human corrections win over everything the model wrote, on every surface
+  // (cards, feeds, Discord copy, search), and survive re-summarization because
+  // they are applied at render time from their own file.
+  const overrides = await readJson(`${DATA}/overrides.json`, {})
+  const overridden = applyOverrides(changelog.entries, overrides)
+  if (overridden) log(`applied ${overridden} human override${overridden === 1 ? '' : 's'} from data/overrides.json`)
   const prsRaw = await readJson(`${DATA}/open-prs.json`, [])
   const prs = Array.isArray(prsRaw) ? prsRaw : (prsRaw?.prs || [])
+  const prSummaries = await readJson(`${DATA}/pr-summaries.json`, {})
+  attachPrSummaries(prs, prSummaries, (p) => {
+    try { return readFileSync(resolve(DATA, `pr-diffs/${p.number}.diff`), 'utf8') } catch { return null }
+  })
   // GitHub's own count, carried from the fetch: when it is above the number of
   // cards, the page says so instead of presenting a short list as the whole truth.
   // How long ago the last successful check was, in minutes: a list nobody has
@@ -999,6 +1090,10 @@ async function cmdBuild () {
   const dataDiffs = resolve(DATA, 'diffs')
   const dist = resolve(ROOT, 'dist')
   const t0 = Date.now()
+  // hasDiff trimming (below) must happen before render so the cards agree with
+  // what dist/ actually holds.
+  const keepDiff = diffShipFilter(changelog.entries, process.env)
+  if (keepDiff) for (const e of changelog.entries) if (e.hasDiff && !keepDiff(e)) e.hasDiff = false
   // dist/ is a pure build output, regenerated in full from data/ every run, so it
   // is cleared first. Without this, any URL the generator stops emitting keeps
   // shipping the markup of the build that made it -- today that would be a
@@ -1010,10 +1105,25 @@ async function cmdBuild () {
   // day is its own /day/<date>/ page.
   await buildSite({ changelog, openPrs: prs, prMeta, dist })
 
+  // data/diffs is 106 MB of a 352 MB dist. Two opt-in trims: skip the churn
+  // rows' lockfile diffs (CHANGELOG_DIST_SKIP_CHURN_DIFFS=1) and/or ship only
+  // the last N months (CHANGELOG_DIST_DIFF_MONTHS=N). Rows whose diff is not
+  // shipped lose their hasDiff flag before render, so the card shows the
+  // GitHub compare link instead of a viewer that would 404. Default: ship all.
   const distDiffs = resolve(dist, 'diffs')
   if (existsSync(dataDiffs)) {
     await mkdir(distDiffs, { recursive: true })
-    await cp(dataDiffs, distDiffs, { recursive: true })
+    if (!keepDiff) {
+      await cp(dataDiffs, distDiffs, { recursive: true })
+    } else {
+      let shipped = 0, skipped = 0
+      for (const e of changelog.entries) {
+        const src = resolve(dataDiffs, `${e.sha}.diff`)
+        if (!existsSync(src)) continue
+        if (e.hasDiff) { await cp(src, resolve(distDiffs, `${e.sha}.diff`)); shipped++ } else skipped++
+      }
+      log(`shipped ${shipped} stored diffs to dist/, skipped ${skipped} (CHANGELOG_DIST_* trim options set)`)
+    }
   }
   const dataPrDiffs = resolve(DATA, 'pr-diffs')
   if (existsSync(dataPrDiffs)) {
@@ -1022,6 +1132,49 @@ async function cmdBuild () {
   }
 
   log(`site built in ${((Date.now() - t0) / 1000).toFixed(1)}s → ${dist}`)
+}
+
+// Which stored diffs to ship to dist/. Returns null when everything ships.
+export function diffShipFilter (entries, env = process.env) {
+  const skipChurn = env.CHANGELOG_DIST_SKIP_CHURN_DIFFS === '1'
+  const months = Number(env.CHANGELOG_DIST_DIFF_MONTHS)
+  if (!skipChurn && !(months > 0)) return null
+  const cutoff = months > 0 ? new Date(Date.now() - months * 30.44 * 86400000).toISOString().slice(0, 10) : null
+  return (e) => {
+    if (skipChurn && e.noise) return false
+    if (cutoff && String(e.day || e.date || '').slice(0, 10) < cutoff) return false
+    return true
+  }
+}
+
+// data/overrides.json: { "<sha>": { "title": "...", "summary": "...", "eli5": "...", "significance": "...", "note": "why" } }
+// A 12-char prefix works as a key too. Fields not given are left alone.
+export function applyOverrides (entries, overrides) {
+  if (!overrides || typeof overrides !== 'object' || !Array.isArray(entries)) return 0
+  const byPrefix = new Map()
+  for (const [k, v] of Object.entries(overrides)) {
+    if (!v || typeof v !== 'object' || !/^[0-9a-f]{7,40}$/i.test(k)) continue
+    byPrefix.set(k.toLowerCase(), v)
+  }
+  if (!byPrefix.size) return 0
+  let n = 0
+  for (const e of entries) {
+    const sha = String(e.sha || '').toLowerCase()
+    let o = byPrefix.get(sha)
+    if (!o) for (const [k, v] of byPrefix) if (sha.startsWith(k)) { o = v; break }
+    if (!o) continue
+    if (o.title || o.summary || o.significance || o.evidence || o.audience) {
+      e.ai = { ...(e.ai || { model: 'human', v: PROMPT_V }), ...(o.title ? { title: String(o.title) } : {}), ...(o.summary ? { summary: String(o.summary) } : {}), ...(o.evidence ? { evidence: String(o.evidence) } : {}), ...(o.audience ? { audience: String(o.audience) } : {}), ...(o.significance ? { significance: String(o.significance) } : {}), overridden: true }
+      if (!e.ai.title) e.ai.title = e.title
+      if (!e.ai.summary) e.ai.summary = e.summary
+      delete e.ai.ungrounded
+      if (o.significance && ['major', 'notable', 'minor'].includes(o.significance)) e.significance = o.significance
+    }
+    if (o.eli5) e.eli5 = { ...(e.eli5 || {}), text: String(o.eli5), model: 'human', v: ELI5_V, overridden: true }
+    e.overridden = true
+    n++
+  }
+  return n
 }
 
 async function cmdPreview (port = 8788) {
@@ -1078,6 +1231,10 @@ if (IS_MAIN) {
   else if (cmd === 'watch' || cmd === 'backfill') await cmdWatch(rest)
   else if (cmd === 'push-data') await cmdPushData(rest)
   else if (cmd === 'enrich-all') await cmdEnrichAll(rest)
+  else if (cmd === 'repair-entries') await cmdRepairEntries(rest)
+  else if (cmd === 'prune-cache') await cmdPruneCache(rest)
+  else if (cmd === 'glossary') await cmdGlossary(rest)
+  else if (cmd === 'eval') await cmdEval(rest)
   else if (cmd === 'normalize-dates') await cmdNormalizeDates(rest)
   else if (cmd === 'broadcast') await cmdBroadcast(rest)
   else if (cmd === 'build') await cmdBuild()
@@ -1089,7 +1246,11 @@ if (IS_MAIN) {
   node generator/cli.mjs backfill [--push]        # continuous sync + backfill loop (the daemon)
   node generator/cli.mjs watch [--push]           # alias for backfill
   node generator/cli.mjs push-data [--message M]  # commit+push data/ with the shared race handling
-  node generator/cli.mjs enrich-all [--batch N] [--push]  # one pass toward a diff + summary + ELI5 for every entry (0 = everything left)
+  node generator/cli.mjs enrich-all [--batch N] [--push] [--rewrite-stale]  # one pass toward a diff + summary + ELI5 for every entry (0 = everything left); --rewrite-stale also refreshes rows on an older prompt, major first
+  node generator/cli.mjs repair-entries [--push]   # recompute commitNature / significance / security tag on stored rows (no text touched)
+  node generator/cli.mjs prune-cache [--push]      # drop ai-summaries.json keys from retired prompt versions
+  node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
+  node generator/cli.mjs eval [--seed N] [--limit N] [--judge]  # summary-quality evaluation against data/eval/golden.json
   node generator/cli.mjs normalize-dates [--push]  # one-off: rewrite stored timestamps to UTC and fix the day/month keys
   node generator/cli.mjs broadcast [--webhook URL] [--limit N] [--dry-run]  # broadcast latest commits to Discord
   node generator/cli.mjs build                    # render static site → dist/
@@ -1117,6 +1278,11 @@ async function enrichAllPass (argv) {
   // own git-work window rather than by a call count.
   const at = argv.indexOf('--batch')
   const batch = at !== -1 ? Math.max(0, Number(argv[at + 1]) || 0) : 200
+  // --rewrite-stale: rows summarized under an older prompt version re-queue,
+  // major first, then notable, then minor (newest first within each), after any
+  // row with no summary at all. Their ELI5 follows automatically, because a
+  // fresh summary changes the hash the plain-English line is keyed on.
+  const rewriteStale = argv.includes('--rewrite-stale')
   const env = { ...process.env, CHANGELOG_LLM_LIMIT: String(batch), CHANGELOG_ELI5_LIMIT: String(batch) }
   const doc = await readJson(`${DATA}/changelog.json`, null)
   if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
@@ -1129,14 +1295,15 @@ async function enrichAllPass (argv) {
   refreshDiffFlags(entries, diffDir)
 
   // 2. Summaries + plain-English lines, newest-first inside their own priorities.
-  const calls = llmConfigured(env) ? await enrichWithLlm(entries, llmPatchFor, DATA, env, { retryErrors: true, repoDir: REPO_DIR }) : 0
-  const eli5 = llmConfigured(env) ? await enrichEli5(entries, DATA, env, { retryErrors: true, getPatch: llmPatchFor, repoDir: REPO_DIR }) : 0
+  const calls = llmConfigured(env) ? await enrichWithLlm(entries, llmPatchFor, DATA, env, { retryErrors: true, repoDir: REPO_DIR, rewriteStale, getFullPatch: fullPatchFor }) : 0
+  const eli5 = llmConfigured(env) ? await enrichEli5(entries, DATA, env, { retryErrors: true, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR }) : 0
   if (!llmConfigured(env)) log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env): stored diffs only')
 
-  const isCurrent = (e) => e.ai?.title && (env.CHANGELOG_LLM_FORCE_REWRITE === '1' ? (e.ai?.v ?? 1) >= PROMPT_V : true)
+  const isCurrent = (e) => e.ai?.title && ((rewriteStale || env.CHANGELOG_LLM_FORCE_REWRITE === '1') ? (e.ai?.v ?? 1) >= PROMPT_V : true)
   const left = {
     diffs: entries.filter(e => !existsSync(resolve(diffDir, `${e.sha}.diff`))).length,
     summaries: entries.filter(e => !e.noise && !isCurrent(e)).length,
+    stale: entries.filter(e => !e.noise && e.ai?.title && (e.ai?.v ?? 1) < PROMPT_V).length,
     eli5: countPendingEli5(entries)
   }
 
@@ -1147,8 +1314,108 @@ async function enrichAllPass (argv) {
     await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: doc }))
   }
 
-  log(`[enrich-all] +${stored} diffs, +${calls} summaries, +${eli5} eli5 | left: ${left.diffs} diffs, ${left.summaries} summaries, ${left.eli5} eli5`)
+  log(`[enrich-all] +${stored} diffs, +${calls} summaries, +${eli5} eli5 | left: ${left.diffs} diffs, ${left.summaries} summaries (${left.stale} on an older prompt${rewriteStale ? '' : ', add --rewrite-stale to refresh'}), ${left.eli5} eli5`)
   return left
+}
+
+/**
+ * Repair stored rows: recompute commitNature, testOnly, significance (+reason)
+ * and the security tag from each row's stored shape. Titles, summaries and AI
+ * text are never touched. Safe to re-run.
+ */
+async function cmdRepairEntries (argv) {
+  const { acquired } = await withLock(LOCK, async () => {
+    const doc = await readJson(`${DATA}/changelog.json`, null)
+    if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
+    const n = repairEntries(doc.entries, { diffDir: resolve(DATA, 'diffs') })
+    if (!n) { log('[repair-entries] every row already carries current derived fields'); return }
+    doc.generatedAt = new Date().toISOString()
+    if (argv.includes('--push')) {
+      await commitAndPushData({ message: `data: repair derived fields on ${n} entries (${utcStamp()} UTC)`, overrides: { [`${DATA}/changelog.json`]: doc } })
+    } else {
+      await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: doc }))
+    }
+    log(`[repair-entries] updated ${n} of ${doc.entries.length} rows`)
+  })
+  if (!acquired) log('another generate/backfill run holds the worktree lock: retry shortly')
+}
+
+/**
+ * data/glossary.json: plain-English meanings for Freebuff's internal terms,
+ * injected into both prompts. `--discover` mines candidate terms from the
+ * upstream docs headings at origin/main and adds any not already present, with
+ * an empty definition to fill in (empty definitions are never injected).
+ */
+async function cmdGlossary (argv) {
+  const path = `${DATA}/glossary.json`
+  const glossary = await loadGlossary(DATA)
+  if (argv.includes('--discover')) {
+    await ensureRepo()
+    const found = await discoverGlossary(REPO_DIR)
+    let added = 0
+    for (const [term, hint] of Object.entries(found)) {
+      if (term in glossary) continue
+      glossary[term] = hint || ''
+      added++
+    }
+    await writeJson(path, glossary)
+    log(`[glossary] ${added} candidate term${added === 1 ? '' : 's'} added from upstream docs (${Object.keys(glossary).length} total); definitions left empty are not injected until filled in`)
+    return
+  }
+  const filled = Object.values(glossary).filter(v => typeof v === 'string' && v.trim()).length
+  log(`[glossary] ${Object.keys(glossary).length} terms, ${filled} with a definition (injected)`)
+  for (const [k, v] of Object.entries(glossary)) console.log(`  ${k}${v ? `: ${v}` : '  (no definition yet)'}`)
+}
+
+/**
+ * Summary-quality evaluation against a golden set. See lib/eval.mjs.
+ *   eval --seed N       write data/eval/golden.json from the N most recent
+ *                        major/notable rows (labels provisional until reviewed)
+ *   eval [--limit N] [--judge]   re-summarize the golden rows on the current
+ *                        prompt into a scratch cache, score, and compare with
+ *                        the previous run
+ */
+async function cmdEval (argv) {
+  const { seedGolden, runEval, formatEvalReport } = await import('./lib/eval.mjs')
+  const doc = await readJson(`${DATA}/changelog.json`, null)
+  if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
+  const at = argv.indexOf('--seed')
+  if (at !== -1) {
+    const n = Number(argv[at + 1]) || 40
+    const res = await seedGolden(doc.entries, DATA, { count: n })
+    log(`[eval] wrote ${res.count} golden rows to data/eval/golden.json (${res.kept} kept from the previous file); review the labels, then run eval`)
+    return
+  }
+  if (!llmConfigured()) throw new Error('eval needs CHANGELOG_LLM=1 and LLM_API_KEY')
+  await ensureRepo()
+  const lim = argv.indexOf('--limit')
+  const report = await runEval(doc.entries, DATA, process.env, {
+    repoDir: REPO_DIR,
+    getPatch: llmPatchFor,
+    getFullPatch: fullPatchFor,
+    limit: lim !== -1 ? Number(argv[lim + 1]) || 0 : 0,
+    judge: argv.includes('--judge')
+  })
+  console.log(formatEvalReport(report))
+}
+
+/**
+ * Drop cache keys written under retired prompt versions. Entries keep their
+ * own copy of every summary, so nothing on the site changes; the file just
+ * stops carrying 30k dead records into every merge.
+ */
+async function cmdPruneCache (argv) {
+  const path = `${DATA}/ai-summaries.json`
+  const cache = await readJson(path, {})
+  const before = Object.keys(cache).length
+  const pruned = pruneStaleCache(cache)
+  if (!pruned) { log(`[prune-cache] nothing to prune (${before} keys, all current)`); return }
+  if (argv.includes('--push')) {
+    await commitAndPushData({ message: `data: prune ${pruned} stale AI cache keys (${utcStamp()} UTC)`, overrides: { [path]: cache } })
+  } else {
+    await writeJson(path, cache)
+  }
+  log(`[prune-cache] removed ${pruned} of ${before} keys (${Object.keys(cache).length} kept)`)
 }
 /**
  * One-off repair of the stored history: rewrite every timestamp to UTC and
@@ -1208,6 +1475,8 @@ export async function cmdBroadcast (argv = [], { fetchImpl = globalThis.fetch, d
     if (IS_MAIN) process.exit(1)
     return { ok: false, error: 'missing_changelog' }
   }
+  // Human corrections reach Discord too, not only the rendered site.
+  applyOverrides(doc.entries, await readJson(`${dataDir}/overrides.json`, {}))
 
   const statePath = `${dataDir}/state.json`
   const state = (await readJson(statePath, null)) || {}

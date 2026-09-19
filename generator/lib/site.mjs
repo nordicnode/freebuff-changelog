@@ -7,6 +7,8 @@ import { CSS } from './style.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, ogCardSvg } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
 import { buildStoryIndex, dayStories, dayStoryLead } from './story.mjs'
+import { computeShippedIn, isSecurityEntry, PROMPT_V, ELI5_V, AUDIENCE_DESC } from './llm.mjs'
+import { buildWeeklyDigests, weeklyFeedItem, weeklyHeadline, weekLabel, weeklyText, summaryQuality } from './digest.mjs'
 
 const SITE = {
   name: 'Unofficial Freebuff Changelog',
@@ -696,9 +698,20 @@ function renderDiff(container, text, label, ghUrl, mode) {
 
 function badges (e) {
   const b = []
-  if (e.significance === 'major') b.push('<span class="badge maj">[MAJOR]</span>')
-  else if (e.significance === 'notable') b.push('<span class="badge not">[NOTABLE]</span>')
+  // The tooltip says what the rule saw (or that the model overrode it), so a
+  // weight is a claim a reader can check rather than a colour.
+  const why = e.ai?.significance && e.ai.significance !== e.significance
+    ? `AI weighted this ${e.ai.significance}; deterministic rule said ${e.significance}${e.significanceReason ? ` (${e.significanceReason})` : ''}`
+    : (e.significanceReason || '')
+  const tip = why ? ` title="${esc(why)}"` : ''
+  if (e.significance === 'major') b.push(`<span class="badge maj"${tip}>[MAJOR]</span>`)
+  else if (e.significance === 'notable') b.push(`<span class="badge not"${tip}>[NOTABLE]</span>`)
   if (e.modelChanges) b.push('<span class="badge model">[MODEL]</span>')
+  if (isSecurityEntry(e)) b.push('<span class="badge sec" title="Security-relevant: trust, credentials, checksums, permissions or privacy">[SECURITY]</span>')
+  if (e.ai?.breaking) b.push('<span class="badge brk" title="The technical pass marked this as changing existing behavior, config, an API or a command">[BREAKING]</span>')
+  if (e.ai?.confidence === 'low') b.push('<span class="badge lowc" title="The model rated its own confidence low: the diff is truncated, the consumer of a change is not visible, or the motive is guessed">[LOW CONFIDENCE]</span>')
+  if (e.ai?.audience && AUDIENCE_DESC[e.ai.audience]) b.push(`<span class="badge aud" title="Who this change is for: ${esc(AUDIENCE_DESC[e.ai.audience])}">[${esc(e.ai.audience.toUpperCase())}]</span>`)
+  if (e.overridden) b.push('<span class="badge human" title="This entry was corrected by a human editor (data/overrides.json)">[EDITED]</span>')
   if (e.version) b.push(`<a class="badge ver" href="/release/${e.version}/" onclick="event.stopPropagation()">[v${e.version}]</a>`)
   if (e.kind === 'community' && e.pr) b.push(`<span class="badge">[PR #${e.pr}]</span>`)
   b.push(`<span class="badge cat">[${esc(e.category)}]</span>`)
@@ -875,6 +888,11 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
 ${modelDiffLine(e)}
 <div class="summary">${miniMd(e.ai?.summary || e.summary)}</div>
 ${e.eli5?.text ? `<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH</span>${esc(e.eli5.text)}</p>` : ''}
+${changesHtml(e)}
+${migrationHtml(e)}
+${structuredChips(e)}
+${evidenceHtml(e)}
+${shippedInHtml(e, opts.shipped)}
 ${e.facts?.length ? `<ul class="facts">${e.facts.slice(0, 3).map(f => `<li>${miniMd(f)}</li>`).join('')}</ul>` : ''}
 ${fileChips(e)}
 ${diffViewer}
@@ -888,6 +906,8 @@ ${storyNoteHtml(opts.storyNotes)}
     ${e.sourceSha ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" rel="noopener" target="_blank">snapshot</a>` : ''}
     ${e.pr ? `<a class="meta-link" href="${esc(e.prUrl || '')}" rel="noopener" target="_blank">PR #${e.pr}</a>` : ''}
     ${e.compareUrl ? `<a class="meta-link" href="${esc(e.compareUrl)}" rel="noopener" target="_blank">compare</a>` : e.url ? `<a class="meta-link" href="${esc(e.url)}" rel="noopener" target="_blank">commit</a>` : ''}
+    ${e.ai?.pr && e.kind === 'sync' ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/pull/${Number(e.ai.pr)}" rel="noopener" target="_blank" title="${e.ai.prMatched === 'files' ? `Matched to this snapshot by its touched files (${Math.round((e.ai.prConfidence || 0) * 100)}% confidence)` : 'Pull request this change came from'}">PR #${Number(e.ai.pr)}${e.ai.prMatched === 'files' ? '?' : ''}</a>` : ''}
+    <a class="meta-link report" href="${esc(reportIssueUrl(e))}" rel="noopener" target="_blank" title="Something wrong in this entry? Open a prefilled issue; fixes land in data/overrides.json">report</a>
   </div>
 </div>
 </div>
@@ -896,6 +916,124 @@ ${storyNoteHtml(opts.storyNotes)}
 
 function deriveTitleSafe (e) {
   return (e.summary || '').split(/[.:]/)[0].slice(0, 70) || `${e.category} update`
+}
+
+// Prefilled issue for a wrong or missing detail. The fix path is a human
+// override, so the template asks for exactly what overrides.json needs.
+const ISSUES_URL = process.env.CHANGELOG_ISSUES_URL || 'https://github.com/nordicnode/freebuff-changelog/issues/new'
+
+function reportIssueUrl (e) {
+  const title = `Entry ${e.sha.slice(0, 12)}: ${(e.ai?.title || e.title || '').slice(0, 60)}`
+  const body = [
+    `Commit: https://github.com/CodebuffAI/freebuff/commit/${e.sha}`,
+    `Changelog: ${SITE.url}/day/${e.day}/#${e.sha.slice(0, 12)}`,
+    '',
+    '**What is wrong or missing?**',
+    '',
+    '',
+    '**Corrected text (optional; title / summary / plain English)**',
+    '',
+    ''
+  ].join('\n')
+  return `${ISSUES_URL}?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}&labels=${encodeURIComponent('entry-correction')}`
+}
+
+// Per-topic list for multi-area snapshots.
+function changesHtml (e) {
+  const list = e.ai?.changes
+  if (!Array.isArray(list) || list.length < 2) return ''
+  return `<ul class="changes">${list.map(c => `<li>${c.area ? `<span class="changes-area">${esc(c.area)}</span> ` : ''}${miniMd(c.what)}${c.files?.length ? ` <span class="changes-files">${c.files.slice(0, 3).map(f => `<code title="${esc(f)}">${esc(shortPath(f))}</code>`).join(' ')}</span>` : ''}</li>`).join('')}</ul>`
+}
+
+// What a user or operator has to do, and what the diff does not show.
+function migrationHtml (e) {
+  const a = e.ai || {}
+  const parts = []
+  if (a.migration) parts.push(`<p class="migration"><span class="migration-lbl">ACTION</span>${esc(a.migration)}</p>`)
+  if (a.unknowns) parts.push(`<p class="unknowns"><span class="unknowns-lbl">NOT IN THE DIFF</span>${esc(a.unknowns)}</p>`)
+  return parts.join('\n')
+}
+
+// Chips for the mechanically extracted facts: values that moved, new settings,
+// new flags, exports, and the titles of new tests.
+function structuredChips (e) {
+  const s = e.structured
+  const a = e.ai || {}
+  const chips = []
+  for (const c of (s?.constants || []).slice(0, 4)) chips.push(`<span class="schip const" title="${esc(`${c.name}: ${c.from} -> ${c.to}`)}"><b>${esc(c.name)}</b> ${esc(c.from.length > 18 ? c.from.slice(0, 15) + '…' : c.from)} &rarr; ${esc(c.to.length > 18 ? c.to.slice(0, 15) + '…' : c.to)}</span>`)
+  const envs = [...new Set([...(a.newEnvVars || []), ...(s?.envVars || [])])].slice(0, 4)
+  for (const v of envs) chips.push(`<span class="schip env" title="Environment variable newly read">ENV ${esc(v)}</span>`)
+  const flags = [...new Set([...(a.newFlags || []), ...(s?.flags || [])])].slice(0, 4)
+  for (const f of flags) chips.push(`<span class="schip flag" title="Command-line flag introduced">${esc(f)}</span>`)
+  for (const x of (s?.exportsAdded || []).slice(0, 3)) chips.push(`<span class="schip exp" title="Export added">+${esc(x)}</span>`)
+  for (const x of (s?.exportsRemoved || []).slice(0, 2)) chips.push(`<span class="schip exp del" title="Export removed">&minus;${esc(x)}</span>`)
+  const tests = (s?.testNames || []).slice(0, 3)
+  const testHtml = tests.length ? `<details class="tests-assert"><summary>Behavior asserted by ${s.testNames.length} new test${s.testNames.length === 1 ? '' : 's'}</summary><ul>${s.testNames.slice(0, 8).map(t => `<li>${esc(t)}</li>`).join('')}</ul></details>` : ''
+  if (!chips.length && !testHtml) return ''
+  return `${chips.length ? `<div class="schips">${chips.join('')}</div>` : ''}${testHtml}`
+}
+
+// The model's own citation of what in the diff supports the summary, plus any
+// identifiers the grounding check could not find. Collapsed: it is the proof,
+// not the reading.
+function evidenceHtml (e) {
+  const ev = e.ai?.evidence
+  const bad = e.ai?.ungrounded || []
+  if (!ev && !bad.length) return ''
+  const flag = bad.length
+    ? `<p class="evidence-flag">Not found in the diff or source context: ${bad.map(x => `<code>${esc(x)}</code>`).join(', ')}. Treat these names as unverified.</p>`
+    : ''
+  const verify = e.ai?.verify === 'flagged' ? '<p class="evidence-flag">A second model still objected to claims in this summary after one repair.</p>' : ''
+  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> Evidence${bad.length ? ` <span class="evidence-warn">(${bad.length} unverified name${bad.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}</div></details>`
+}
+
+// The numbers the prompt work is judged by, as a /stats/ card. Every figure is
+// recomputed from the entries as rendered, so a prompt regression shows on the
+// next deploy rather than in a spot check.
+function qualityCard (q, card, bar, share) {
+  const rows = [
+    ['on current prompt', q.onCurrentPrompt, q.summarized, `v${PROMPT_V}`],
+    ['on an older prompt', q.stalePrompt, q.summarized, 'enrich-all --rewrite-stale'],
+    ['with evidence cited', q.withEvidence, q.summarized, ''],
+    ['unverified identifiers', q.ungrounded, q.summarized, 'names not found in the diff'],
+    ['second-model verified', q.verified, q.summarized, q.verifyFlagged ? `${q.verifyFlagged} flagged` : ''],
+    ['weight overridden by AI', q.sigOverridden, q.summarized, ''],
+    ['cause (why) visible', q.whyVisible, q.summarized, 'because / so that / to prevent...'],
+    ['structured facts attached', q.withStructured, q.changes, 'constants, env vars, flags, tests'],
+    ['PR context linked', q.prLinked, q.summarized, q.prMatchedByFiles ? `${q.prMatchedByFiles} matched by files` : ''],
+    ['multi-topic breakdown', q.multiTopic, q.summarized, '2+ changes listed'],
+    ['marked breaking', q.breaking, q.summarized, ''],
+    ['low self-confidence', q.lowConfidence, q.summarized, `${q.withUnknowns} name what the diff omits`],
+    ['"scope limited to" boilerplate', q.scopeBoilerplate, q.summarized, 'v5 prompt artifact'],
+    ['plain-English current', q.eli5Current, q.explained, `v${ELI5_V} · ${q.eli5Template} templated`],
+    ['plain-English preambles', q.eli5Preamble, q.explained, '"Behind the scenes..."'],
+    ['plain-English hype words', q.eli5Hype, q.explained, '"smarter", "faster"...'],
+    ['plain-English identifiers', q.eli5Identifiers, q.explained, 'camelCase / snake_case / .ts'],
+    ['human-corrected', q.overridden, q.changes, 'data/overrides.json'],
+    ['security-relevant', q.security, q.changes, '/feed-security.xml']
+  ]
+  const max = Math.max(1, q.summarized)
+  const aud = Object.entries(q.audience).filter(([, n]) => n)
+  const audHtml = aud.length
+    ? `<div class="sig-split">${aud.map(([a, n]) => `<span class="sig-seg aud-${a}" style="width:${share(n, q.summarized - q.audienceUnset)}%" title="${a}: ${n}"></span>`).join('')}</div>` + aud.map(([a, n]) => bar(a, n, Math.max(1, ...aud.map(([, x]) => x)), { pct: share(n, q.summarized - q.audienceUnset) })).join('')
+    : '<p class="list-note">No audience classifications yet: rows gain one as they are summarized on the current prompt.</p>'
+  return card('SUMMARY QUALITY', `${q.summarized.toLocaleString()} AI summaries &middot; ${q.explained.toLocaleString()} plain-English lines &middot; ${Object.entries(q.models).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([m, n]) => `${esc(m)} ${n.toLocaleString()}`).join(', ')}`,
+    rows.map(([lbl, n, of, note]) => bar(lbl, n, max, { pct: share(n, of || 1), trend: note ? `<span class="stat-note">${esc(note)}</span>` : '' })).join('') +
+    `<div class="stat-card-hdr" style="margin-top:10px"><h3>AUDIENCE</h3><span class="stat-card-note">${q.audienceUnset.toLocaleString()} unclassified</span></div>` + audHtml,
+    'stat-span')
+}
+
+// Which release first included this commit, per version track. `shipped` is the
+// Map computeShippedIn() builds once per build.
+function shippedInHtml (e, shipped) {
+  if (!shipped || e.noise || e.version || e.freebuffVersion) return ''
+  const hit = shipped.get(e.sha)
+  if (!hit) return ''
+  const parts = []
+  if (hit['codebuff-cli']) parts.push(`<a href="/release/${esc(hit['codebuff-cli'].version)}/">CLI ${esc(hit['codebuff-cli'].version)}</a>`)
+  if (hit['freebuff-cli']) parts.push(`<a href="/day/${esc(hit['freebuff-cli'].day)}/#${esc(hit['freebuff-cli'].sha.slice(0, 12))}">Freebuff CLI ${esc(hit['freebuff-cli'].version)}</a>`)
+  if (!parts.length) return ''
+  return `<p class="shipped-in"><span class="shipped-lbl">SHIPPED IN</span> ${parts.join(' <span class="model-sep">&middot;</span> ')}</p>`
 }
 
 // Discord's markdown is a small dialect: **bold**, ### headings, > quotes, `- `
@@ -1008,6 +1146,10 @@ export function discordText (e, opts = {}) {
   }
   let sumIdx = -1
   if (!plainOnly && sum) { sumIdx = parts.length; parts.push(dcSentences(sum).map(dcEsc).join('\n')) }
+  // The citation travels with the claim; it is the first thing dropped when the
+  // message is over the cap.
+  let evIdx = -1
+  if (!plainOnly && e.ai?.evidence) { evIdx = parts.length; parts.push(`**Evidence**\n${dcEsc(clipText(String(e.ai.evidence).replace(/\s+/g, ' ').trim(), 300))}`) }
   const added = e.modelChanges?.added || [], removed = e.modelChanges?.removed || []
   if (added.length || removed.length) {
     const rows = [...removed.map(m => `- \`−\` ~~${dcEsc(m)}~~`), ...added.map(m => `- \`+\` **${dcEsc(m)}**`)]
@@ -1023,9 +1165,11 @@ export function discordText (e, opts = {}) {
     parts.push(dcSentences(sum).map(dcEsc).join('\n'))
   }
   let text = parts.join('\n\n')
-  // Give up detail in reverse order of value: the highlights list, then the tail
-  // of the summary, then the tail of the quote. The header and details are what
-  // identify the change, so they are never cut; the quote keeps its head.
+  // Give up detail in reverse order of value: the evidence line, the highlights
+  // list, then the tail of the summary, then the tail of the quote. The header
+  // and details are what identify the change, so they are never cut; the quote
+  // keeps its head.
+  if (text.length > DC_LIMIT && evIdx >= 0) { parts.splice(evIdx, 1); if (sumIdx > evIdx) sumIdx--; if (eli5Idx > evIdx) eli5Idx--; if (factsIdx > evIdx) factsIdx--; text = parts.join('\n\n') }
   if (text.length > DC_LIMIT && factsIdx >= 0) { parts.splice(factsIdx, 1); if (sumIdx > factsIdx) sumIdx--; if (eli5Idx > factsIdx) eli5Idx--; text = parts.join('\n\n') }
   if (text.length > DC_LIMIT && sumIdx >= 0) {
     const room = DC_LIMIT - (text.length - parts[sumIdx].length) - 8
@@ -1043,13 +1187,15 @@ export function discordText (e, opts = {}) {
 
 // Search ranking (mirrored client-side): title hits beat category hits,
 // significance boosts, recency breaks ties. Exported for unit tests.
-export function scoreHit (title, cat, sig, day, words, eli5 = '') {
-  const t = title.toLowerCase(), c = cat.toLowerCase(), el = (eli5 || '').toLowerCase()
+export function scoreHit (title, cat, sig, day, words, eli5 = '', extra = '') {
+  const t = title.toLowerCase(), c = cat.toLowerCase(), el = (eli5 || '').toLowerCase(), ex = (extra || '').toLowerCase()
   let s = 0
   for (const w of words) {
     if (t.includes(w)) s += w.length > 4 ? 3 : 2
     else if (el.includes(w)) s += 2
     else if (c.includes(w)) s += 1
+    // File paths and the evidence citation: what a developer searches by.
+    else if (ex.includes(w)) s += 1
     else return -1
   }
   if (sig === 'major') s += 2
@@ -1187,6 +1333,9 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
   // note appears the moment the second half of a story lands -- no cache, no
   // version and nothing to merge (see story.mjs).
   const storyIdx = buildStoryIndex(entries)
+  // Which release first carried each commit (per track), from the bumps in hand.
+  const shipped = computeShippedIn(changelog.entries)
+  const cardOpts = (e, extra = {}) => ({ storyNotes: storyIdx.notes.get(e.sha), shipped, ...extra })
   const modelEntries = entries.filter(e => e.modelChanges)
   const releases = entries.filter(e => e.version)
   const first = entries.at(-1), last = entries[0]
@@ -1339,7 +1488,7 @@ ${dayStories(storyIdx, day.day).map(cluster => dayLeadHtml([cluster])).join('')}
 ${rows.map(e => {
       const open = notYetOpen && !e.noise
       if (open) notYetOpen = false
-      return entryCard(e, open, relatedIdx, { hideChurn: true, storyNotes: storyIdx.notes.get(e.sha) })
+      return entryCard(e, open, relatedIdx, cardOpts(e, { hideChurn: true }))
     }).join('\n')}</section>`
 
     return hero + dayHtml + pagePager(i)
@@ -1522,7 +1671,7 @@ ${rows.map(e => {
       desc: `Freebuff v${rel.version}: ${mine.length} changes since the previous release.`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(rel.version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Freebuff v${esc(rel.version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p><div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button type="button" class="btn-copy-relnotes" onclick="navigator.clipboard.writeText(document.getElementById('relnotes-md').value).then(()=>{const b=this;b.textContent='[copied: paste into GitHub release]';setTimeout(()=>b.textContent='[copy release notes]',3000)})">[copy release notes]</button><textarea id="relnotes-md" hidden style="display:none">${esc(relNotesMd)}</textarea></div></div></section>` +
         relPager +
-        `<section class="day">${[rel, ...relHead].map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx, { storyNotes: storyIdx.notes.get(e.sha) })).join('\n')}${relTailRows}</section>` +
+        `<section class="day">${[rel, ...relHead].map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx, cardOpts(e))).join('\n')}${relTailRows}</section>` +
         relPager +
         `<p style="margin-top:20px;font-size:.82rem"><a href="/archive/#releases">&larr; [all releases]</a> &middot; <a href="/">[latest]</a></p>`
     }))
@@ -1860,7 +2009,7 @@ ${rows.map(e => {
     </div>
     <div class="term-footer-bar">
       <span>${days.length} days &middot; ${esc(list.at(-1).day)} &rarr; ${esc(list[0].day)}</span>
-      <span><a href="/archive/#categories">[ all categories ]</a></span>
+      <span>${b.churn || ['major', 'models', 'releases', 'security', 'weekly'].includes(b.slug) ? '' : `<a href="/feed-${esc(b.slug)}.xml">[ rss for ${esc(b.label)} ]</a> `}<a href="/archive/#categories">[ all categories ]</a></span>
     </div>
   </div>
 </section>
@@ -2039,6 +2188,42 @@ ${d.entries.map(changeRow).join('\n')}
 ${archiveScript}`
   }))
 
+  // ----- weekly digests: /week/YYYY-Www/ (one page a week, newest first)
+  // Releases, catalog moves, then the heaviest work; deterministic, so a digest
+  // exists the moment the week has its first commit and never waits on a model.
+  const weeks = buildWeeklyDigests(entries)
+  const weekHref = (w) => `/week/${w.key}/`
+  const weekRow = (e) => changeRow(e)
+  const weekSection = (title, list) => list.length ? `<div class="section-hdr"><h2>${title} (${list.length})</h2></div><section class="week-rows">${list.map(weekRow).join('\n')}</section>` : ''
+  await pool(weeks.map((w, i) => async () => {
+    const newer = i > 0 ? weeks[i - 1] : null
+    const older = i < weeks.length - 1 ? weeks[i + 1] : null
+    const pager = `<div class="pager">${older ? `<a href="${weekHref(older)}" rel="prev">&larr; ${esc(older.key)}</a>` : '<span class="pager-disabled">&larr;</span>'}<span class="pager-page">WEEK ${esc(w.key)} &middot; ${esc(weekLabel(w))}</span>${newer ? `<a href="${weekHref(newer)}" rel="next">${esc(newer.key)} &rarr;</a>` : '<a href="/">[latest day]</a>'}</div>`
+    const modelLines = w.models.map(e => `<div class="crow"><span class="crow-time">${esc(e.day.slice(5))}</span>${modelDiffLine(e)}</div>`).join('')
+    const body = `<section class="hero"><div class="term-box term-box-slim"><div class="term-box-hdr"><span class="term-box-title">WEEKLY_DIGEST :: ${esc(w.key)}</span><span>${esc(weekLabel(w))}</span></div>` +
+      `<p class="list-note">${esc(weeklyHeadline(w))}. <a href="/feed-weekly.xml">[rss]</a> <button class="meta-link dc-copy" type="button" data-dc="${esc(`**FREEBUFF weekly** · ${w.key}\n${weeklyText(w, SITE.url)}`.slice(0, 1990))}" title="Copy this digest as Discord-formatted text">discord</button></p></div></section>` +
+      pager +
+      weekSection('RELEASES', w.releases) +
+      (w.models.length ? `<div class="section-hdr"><h2>MODEL CATALOG (${w.models.length})</h2></div><section class="week-rows">${modelLines}</section>` : '') +
+      weekSection('NOTABLE WORK', w.top) +
+      (w.security.length ? weekSection('SECURITY-RELEVANT', w.security.slice(0, 12)) : '') +
+      `<details class="more-rows"><summary>[ all ${w.counts.changes} changes this week ]</summary>${w.entries.map(changeRow).join('\n')}</details>` +
+      pager
+    await write(dist, `week/${w.key}/index.html`, layout({
+      title: `Week ${w.key}`, path: weekHref(w),
+      desc: `Freebuff changes ${weekLabel(w)}: ${weeklyHeadline(w)}.`,
+      body
+    }))
+  }), 8)
+  if (weeks.length) {
+    await write(dist, 'week/index.html', layout({
+      title: 'Weekly digests', path: '/week/',
+      desc: 'Freebuff changes summarized one week at a time.',
+      body: `<section class="hero"><div class="term-box term-box-slim"><div class="term-box-hdr"><span class="term-box-title">WEEKLY_DIGESTS</span><span>${weeks.length} weeks &middot; <a href="/feed-weekly.xml">[rss]</a></span></div></div></section>` +
+        `<section class="week-rows">${weeks.map(w => `<div class="crow"><span class="crow-time">${esc(w.key)}</span><a class="crow-title" href="${weekHref(w)}">${esc(weekLabel(w))}</a><span class="crow-sum">${esc(weeklyHeadline(w))}</span></div>`).join('')}</section>`
+    }))
+  }
+
   // ----- stats (headline figures first, then the charts that explain them)
   // Four identical cards in a three-up grid inside a 920px column, each row a
   // flex line already spending 110px on the label and 44px on the number: the bar
@@ -2138,6 +2323,7 @@ ${archiveScript}`
       + card('CODE CHURN BY AREA', `top ${churnRows.length} of ${churnByArea.size} areas &middot; lines added / removed`, churnRows.map(churnBar).join(''))
       + card('MOST-CHANGED MODELS', modelTotal ? `${modelTotal} catalog moves across ${modelCounts.size} models` : 'no catalog moves recorded', modelRows2.map(([m, n]) => bar(m, n, modelMax, { href: `/models/${modelSlug(m)}/`, pct: share(n, modelTotal) })).join(''))
       + card('WHAT COUNTED', `${sigTotal.toLocaleString()} changes split by weight`, `<div class="sig-split">${sigRows.map(([s, n]) => `<span class="sig-seg sig-${s}" style="width:${share(n, sigTotal)}%" title="${s}: ${n.toLocaleString()}"></span>`).join('')}</div>` + sigRows.map(([s, n]) => bar(s.toUpperCase(), n, sigMax, { pct: share(n, sigTotal), cls: 'sig-' + s })).join(''), 'stat-span')
+      + qualityCard(summaryQuality(entries), card, bar, share)
       + card('SHIPPING CADENCE (LAST 12 MO)', `${monthRows.length} of ${byMonth.size} months &middot; peak ${monthMax.toLocaleString()} changes`, `<div class="cad-spark">${cadenceSpark}</div>` + monthRows.map(([m, n], i) => {
         const prev = i ? monthRows[i - 1][1] : 0
         const d = prev ? Math.round((n - prev) / prev * 100) : null
@@ -2159,6 +2345,11 @@ ${archiveScript}`
       SEARCH_SIGS.indexOf(e.significance)
     ]
     if (e.eli5?.text) row.push(e.eli5.text.slice(0, 160))
+    // e[6]: search-only text (never rendered): touched paths + the evidence
+    // citation, so `agent-dir-trust` or `checkRemoteAgentTemplateTrust` finds
+    // the row even when the title says it in plain words.
+    const extra = [...(e.files?.added || []), ...(e.files?.modified || []), e.ai?.evidence || ''].filter(Boolean).join(' ').slice(0, 400)
+    if (extra) { if (row.length < 6) row.push(''); row.push(extra) }
     return row
   })
   await write(dist, 'search-index.json', JSON.stringify({ cats: SEARCH_CATS, sigs: SEARCH_SIGS, ix: idxJson }))
@@ -2273,12 +2464,13 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       if (cat && c !== cat) continue;
       if (sig && a !== sig) continue;
       if (!w.length) { scored.push([0, e[0], e]); continue; }
-      const t = e[1].toLowerCase(), cl = c.toLowerCase(), el = (e[5] || '').toLowerCase();
+      const t = e[1].toLowerCase(), cl = c.toLowerCase(), el = (e[5] || '').toLowerCase(), ex = (e[6] || '').toLowerCase();
       let s = 0, ok = true;
       for (const x of w) {
         if (t.includes(x)) s += x.length > 4 ? 4 : 3;
         else if (el.includes(x)) s += 2;
         else if (cl.includes(x)) s += 1;
+        else if (ex.includes(x)) s += 1;
         else { ok = false; break; }
       }
       if (!ok) continue;
@@ -2591,6 +2783,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     <a href="${esc(p.url)}" target="_blank" rel="noopener">#${p.number}</a>
   </div>
   <h3 class="pr-title"><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a></h3>
+  ${p.ai?.summary ? `<div class="pr-preview-ai"><span class="eli5-label">WHAT IT PROPOSES</span>${p.ai.title && p.ai.title !== p.title ? `<b>${esc(p.ai.title)}.</b> ` : ''}${esc(p.ai.summary)}${p.ai.audience && AUDIENCE_DESC[p.ai.audience] ? ` <span class="badge aud" title="${esc(AUDIENCE_DESC[p.ai.audience])}">[${esc(p.ai.audience.toUpperCase())}]</span>` : ''}<span class="pr-preview-note">AI preview from the description and the first lines of the diff; not shipped yet.${p.ai.stale ? ' Written for an earlier revision of this PR.' : ''}</span></div>` : ''}
   <div class="pr-meta">
     <span>#${p.number} by ${esc(p.author || 'contributor')}</span>
     <span>&middot;</span>
@@ -2781,6 +2974,18 @@ ${inFlightScript}`
   await write(dist, 'feed-major.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-major.xml', `${SITE.name}: major + notable`, 'Major model additions and notable user-visible feature changes.', majorItems))
   await write(dist, 'feed-models.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-models.xml', `${SITE.name}: models`, 'Model catalog additions, retirements, and swaps in the Freebuff free picker.', modelItems))
   await write(dist, 'feed-releases.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-releases.xml', `${SITE.name}: releases`, 'Freebuff CLI and core package version bumps.', releaseItems))
+  // Security: trust gates, checksums, credential handling, env stripping, privacy.
+  const securityEntries = meaningful.filter(isSecurityEntry)
+  await write(dist, 'feed-security.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-security.xml', `${SITE.name}: security`, 'Security-relevant changes: trust boundaries, checksum verification, credential and permission handling, privacy signals.', securityEntries.slice(0, 60).map(rssItem).join('')))
+  // One feed per category, so a CLI-only or SDK-only reader can subscribe to
+  // just that surface. Linked from each /changes/<slug>/ page.
+  const RESERVED_FEEDS = new Set(['major', 'models', 'releases', 'security', 'weekly'])
+  for (const b of browseList) {
+    if (b.churn || RESERVED_FEEDS.has(b.slug)) continue
+    await write(dist, `feed-${b.slug}.xml`, feedXml(SITE.url, SITE.name, SITE.desc, generated, `feed-${b.slug}.xml`, `${SITE.name}: ${b.label}`, `Changes in the ${b.label} area of Freebuff.`, b.list.slice(0, 60).map(rssItem).join('')))
+  }
+  // Weekly digest feed: one item per ISO week, built from the digest pages.
+  await write(dist, 'feed-weekly.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-weekly.xml', `${SITE.name}: weekly digest`, 'One item a week: releases, model changes and the notable work that landed.', weeks.slice(0, 26).map(w => weeklyFeedItem(SITE.url, w)).join('')))
   const mainJsonItems = entries.filter(e => !e.noise).slice(0, 60).map(e => jsonItem(SITE.url, e, titleOf, storyIdx.notes.get(e.sha)))
   await write(dist, 'feed.json', feedJson(SITE.url, generated, SITE.name, SITE.desc, 'feed.json', mainJsonItems))
   await write(dist, 'feed.xsl', FEED_XSL)
@@ -2911,7 +3116,7 @@ ctx.hidden = false
   const dayUrls = byDay.map(d => `/day/${d.day}/`)
   const relUrls = vers.map(v => `/release/${v.version}/`)
   const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`)]
-  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', ...browseList.map(b => `/changes/${b.slug}/`), ...(openPrs?.length ? ['/in-flight/'] : [])]
+  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/week/', ...weeks.slice(0, 52).map(w => `/week/${w.key}/`), ...browseList.map(b => `/changes/${b.slug}/`), ...(openPrs?.length ? ['/in-flight/'] : [])]
   await write(dist, 'sitemap-days.xml', urlset(dayUrls))
   await write(dist, 'sitemap-releases.xml', urlset(relUrls))
   await write(dist, 'sitemap-models.xml', urlset(modelUrls))

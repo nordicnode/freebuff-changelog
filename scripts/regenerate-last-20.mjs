@@ -1,41 +1,30 @@
-// scripts/regenerate-last-20.mjs - Regenerates the last 20 changelog entries
-// with the enhanced pipeline: -U25 diffs, module headers, PR descriptions,
-// sequence window 25, domain lexicon, and anti-hallucination constraints.
+// scripts/regenerate-last-20.mjs - Regenerates the last N (default 20) changelog
+// entries through the same code path the daemon uses: gatherEntryContext,
+// summarizeEntry (grounding repair, optional verifier) and explainEntry. The
+// script used to carry its own copy of the worker body; it drifted, so now it
+// only selects targets, writes cache records and saves.
+//
+//   node scripts/regenerate-last-20.mjs [--count N] [--concurrency N]
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { existsSync } from 'node:fs'
 import { git, readJson, writeJson, writeText, log, pool, shortHash, eli5Source } from '../generator/lib/util.mjs'
+import { extractCleanDiff, discoverMonorepoArchitecture, formatArchitectureMap, EMPTY_TREE } from '../generator/lib/analyze.mjs'
 import {
-  extractCleanDiff,
-  extractFileHeaders,
-  findFileHistory,
-  extractFullOrOutlinedFiles,
-  extractSubsystemDocs,
-  discoverMonorepoArchitecture,
-  formatArchitectureMap,
-  EMPTY_TREE
-} from '../generator/lib/analyze.mjs'
-import {
-  buildPrompt,
-  buildEli5Prompt,
-  validateLlmOut,
-  normalizeEli5,
-  eli5Notes,
   findPrMeta,
   loadPrIndex,
   groupEntriesByDay,
   sequenceForEntry,
   bumpOnly,
-  collectReleaseContext,
-  formatReleaseContext,
+  getReleaseContextFor,
   cacheKey,
   eli5Key,
-  PROMPT_V,
-  ELI5_V,
   RELEASE_ROLLUP_V,
-  ELI5_ROLLUP_MAX_CHARS,
-  ELI5_MAX_CHARS,
-  callLlm
+  gatherEntryContext,
+  summarizeEntry,
+  explainEntry,
+  templateEli5,
+  ELI5_V
 } from '../generator/lib/llm.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -46,6 +35,11 @@ const DATA = resolve(ROOT, 'data')
 const CACHE = resolve(ROOT, '.cache')
 const REPO_DIR = resolve(CACHE, 'freebuff')
 
+function argNum (name, dflt) {
+  const at = process.argv.indexOf(name)
+  return at !== -1 && Number(process.argv[at + 1]) > 0 ? Number(process.argv[at + 1]) : dflt
+}
+
 async function baseShaFor (e) {
   if (e.prevSha) return e.prevSha
   const parent = (await git(['rev-parse', '--verify', '--quiet', `${e.sha}^`], REPO_DIR, { allowFail: true }))?.trim()
@@ -54,9 +48,9 @@ async function baseShaFor (e) {
 
 async function main () {
   const env = process.env
-  if (!env.LLM_API_KEY) {
-    throw new Error('LLM_API_KEY is required in .env')
-  }
+  if (!env.LLM_API_KEY) throw new Error('LLM_API_KEY is required in .env')
+  const count = argNum('--count', 20)
+  const concurrency = argNum('--concurrency', 3)
 
   log('Loading changelog data and PR index...')
   const doc = await readJson(`${DATA}/changelog.json`, null)
@@ -65,153 +59,76 @@ async function main () {
   const prIndex = await loadPrIndex(DATA)
   const byDayEntries = groupEntriesByDay(doc.entries)
   const archMap = formatArchitectureMap(await discoverMonorepoArchitecture(REPO_DIR))
-
   const posIndex = new Map(doc.entries.map((x, i) => [x.sha, i]))
   const ctxCache = new Map()
-  const releaseOf = (e) => {
-    if (!bumpOnly(e)) return null
-    let hit = ctxCache.get(e.sha)
-    if (!hit) {
-      const ctx = collectReleaseContext(doc.entries, e, { index: posIndex })
-      hit = { ctx, text: formatReleaseContext(ctx, e) }
-      ctxCache.set(e.sha, hit)
-    }
-    return hit.text ? hit : null
-  }
+  const releaseOf = (e) => getReleaseContextFor(doc.entries, e, posIndex, ctxCache)
 
-  // Select last 20 meaningful entries
-  const meaningful = doc.entries.filter(e => !e.noise)
-  const targets = meaningful.slice(-20)
-  log(`Selected ${targets.length} entries for regeneration (from ${targets[0].sha.slice(0, 8)} to ${targets[targets.length - 1].sha.slice(0, 8)})`)
+  const targets = doc.entries.filter(e => !e.noise).slice(-count)
+  log(`Selected ${targets.length} entries for regeneration (${targets[0].sha.slice(0, 8)} .. ${targets[targets.length - 1].sha.slice(0, 8)})`)
 
-  let completedCount = 0
-  let failedCount = 0
+  let completed = 0
+  let failed = 0
 
-  async function processEntry(e, index) {
+  async function processEntry (e, index) {
     const num = index + 1
     const short = e.sha.slice(0, 8)
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        log(`[${num}/${targets.length}] Preparing context for ${short} (${e.date.slice(0, 10)})...`)
         const base = await baseShaFor(e)
         let patch = await extractCleanDiff(REPO_DIR, base, e.sha, 250000, !e.testOnly, 25)
-        if (!patch.trim() && !e.testOnly) {
-          patch = await extractCleanDiff(REPO_DIR, base, e.sha, 250000, false, 25)
-        }
-        if (patch.trim()) {
-          await writeText(`${DATA}/diffs/${e.sha}.diff`, patch)
-        }
+        if (!patch.trim() && !e.testOnly) patch = await extractCleanDiff(REPO_DIR, base, e.sha, 250000, false, 25)
+        if (patch.trim()) await writeText(`${DATA}/diffs/${e.sha}.diff`, patch)
 
-        const files = [...(e.files?.modified || []), ...(e.files?.added || [])]
-        const fileHeaders = await extractFileHeaders(REPO_DIR, e.sha, files)
-        const fileHistory = findFileHistory(doc.entries, e, 10)
-        const subsystemDocs = await extractSubsystemDocs(REPO_DIR, e.sha, files)
-        const { fullFiles, exportOutlines } = await extractFullOrOutlinedFiles(REPO_DIR, e.sha, files)
-        const sequence = sequenceForEntry(byDayEntries, e, 25)
-        const prMeta = findPrMeta(e, prIndex)
         const hit = bumpOnly(e) ? releaseOf(e) : null
         const relText = hit?.text || ''
+        const sequence = sequenceForEntry(byDayEntries, e, 25)
+        const prMeta = findPrMeta(e, prIndex)
+        const context = await gatherEntryContext(e, patch, { repoDir: REPO_DIR, entries: doc.entries })
+        log(`[${num}/${targets.length}] ${short}: tier ${context.tier}, ${context.fileHeaders.length} headers, ${context.fileHistory.length} history, ${context.fullFiles.length} full files, ${context.exportOutlines.length} outlines, ${context.subsystemDocs.length} docs, diff ${patch.length} bytes, PR #${prMeta?.number || 'none'}`)
 
-        log(`[${num}/${targets.length}] ${short}: ${fileHeaders.length} headers, ${fileHistory.length} history, ${fullFiles.length} full files, ${exportOutlines.length} outlines, ${subsystemDocs.length} docs, diff ${patch.length} bytes, PR #${prMeta?.number || 'none'}`)
+        // 1. Technical summary
+        const { record } = await summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, context, env })
+        aiCache[cacheKey(e.sha, patch, relText, relText ? RELEASE_ROLLUP_V : 0)] = record
+        e.ai = { ...record }
 
-        // 1. Technical summary pass
-        const summaryPrompt = buildPrompt(e, patch, {
-          releaseCtx: relText,
-          sequence,
-          prMeta,
-          architectureMap: archMap,
-          fileHeaders,
-          fileHistory,
-          subsystemDocs,
-          fullFiles,
-          exportOutlines
-        })
-        log(`[${num}/${targets.length}] Calling LLM for summary: ${short}...`)
-        const rawSummary = await callLlm(summaryPrompt, env)
-        const cleanSummary = validateLlmOut(rawSummary, e.significance || 'minor')
-
-        // Attach to entry in-memory for ELI5 pass
-        const sKey = cacheKey(e.sha, patch, relText, relText ? RELEASE_ROLLUP_V : 0)
-        aiCache[sKey] = {
-          model: env.LLM_MODEL || 'gpt-4o-mini',
-          v: PROMPT_V,
-          title: cleanSummary.title,
-          summary: cleanSummary.summary,
-          significance: cleanSummary.significance,
-          ...(cleanSummary.evidence ? { evidence: cleanSummary.evidence } : {}),
-          ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}),
-          at: new Date().toISOString()
-        }
-        e.ai = { ...aiCache[sKey] }
-
-        // 2. Plain-English ELI5 pass
-        const notes = eli5Notes(e, patch)
-        const eli5Prompt = buildEli5Prompt(e, notes, {
-          patch,
-          siblings: (byDayEntries.get(e.day) || []).filter(t => t.sha !== e.sha).map(t => t.ai?.title || t.title).slice(0, 15),
-          diffBytes: 60000,
-          releaseCtx: relText,
-          prMeta,
-          sequence,
-          architectureMap: archMap,
-          fileHeaders,
-          fileHistory,
-          subsystemDocs
-        })
-        log(`[${num}/${targets.length}] Calling LLM for ELI5: ${short}...`)
-        const rawEli5 = await callLlm(
-          eli5Prompt,
-          env,
-          1,
-          (out) => normalizeEli5(out, relText ? ELI5_ROLLUP_MAX_CHARS : ELI5_MAX_CHARS)
-        )
-
+        // 2. Plain English (template rows need no call)
         const src = eli5Source(e)
-        const eKey = eli5Key(e.sha, src, relText, relText ? RELEASE_ROLLUP_V : 0)
-        aiCache[eKey] = {
-          model: env.LLM_MODEL || 'gpt-4o-mini',
-          v: ELI5_V,
-          text: rawEli5,
-          ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}),
-          at: new Date().toISOString()
-        }
-        e.eli5 = {
-          text: rawEli5,
-          model: env.LLM_MODEL || 'gpt-4o-mini',
-          v: ELI5_V,
-          src: shortHash(src),
-          ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}),
-          at: new Date().toISOString()
+        const tpl = !relText ? templateEli5(e) : null
+        if (tpl) {
+          e.eli5 = { text: tpl, model: 'template', v: ELI5_V, src: shortHash(src), at: new Date().toISOString() }
+        } else {
+          const { record: eRecord } = await explainEntry({
+            entry: e,
+            patch,
+            siblings: (byDayEntries.get(e.day) || []).filter(t => t.sha !== e.sha).map(t => t.ai?.title || t.title).slice(0, 15),
+            relText,
+            prMeta,
+            sequence,
+            archMap,
+            context,
+            env
+          })
+          aiCache[eli5Key(e.sha, src, relText, relText ? RELEASE_ROLLUP_V : 0)] = eRecord
+          e.eli5 = { ...eRecord, src: shortHash(src) }
         }
 
-        completedCount++
-        log(`✔ [${num}/${targets.length}] (${completedCount}/${targets.length}) ${short} done: "${e.ai.title}"`)
-
-        // Incremental save
+        completed++
+        log(`✔ [${num}/${targets.length}] ${short}: "${e.ai.title}"${record.ungrounded ? ` (ungrounded: ${record.ungrounded.join(', ')})` : ''}`)
         await writeJson(`${DATA}/ai-summaries.json`, aiCache)
         await writeJson(`${DATA}/changelog.json`, doc)
-        return { sha: e.sha, title: e.ai.title, eli5: e.eli5.text }
+        return
       } catch (err) {
-        log(`⚠ [${num}/${targets.length}] Attempt ${attempt} failed for ${short}: ${err.message}`)
-        if (attempt === 3) {
-          failedCount++
-          log(`✖ [${num}/${targets.length}] Giving up on ${short} after 3 attempts.`)
-          return null
-        }
+        log(`⚠ [${num}/${targets.length}] attempt ${attempt} failed for ${short}: ${err.message}`)
+        if (attempt === 3) { failed++; return }
         await new Promise(r => setTimeout(r, 4000 * attempt))
       }
     }
   }
 
-  // Run with concurrency of 3 to be gentle on the gateway tunnel
-  const concurrency = 3
-  const tasks = targets.map((e, idx) => () => processEntry(e, idx))
-  await pool(tasks, concurrency)
-
-  log(`Writing final data to disk...`)
+  await pool(targets.map((e, idx) => () => processEntry(e, idx)), concurrency)
   await writeJson(`${DATA}/ai-summaries.json`, aiCache)
   await writeJson(`${DATA}/changelog.json`, doc)
-  log(`Batch finished: ${completedCount} succeeded, ${failedCount} failed.`)
+  log(`Batch finished: ${completed} succeeded, ${failed} failed.`)
 }
 
 main().catch(err => {

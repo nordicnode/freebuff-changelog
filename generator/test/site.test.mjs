@@ -282,8 +282,10 @@ test('buildSite generates valid static site output', async () => {
     assert.ok(searchIdx.cats.includes('CLI'))
     assert.deepEqual(searchIdx.sigs, ['minor', 'notable', 'major'])
     assert.equal(searchIdx.ix.length, 3)
-    assert.equal(searchIdx.ix[0].length, 6, 'search index tuple includes ELI5 plain English text')
+    assert.ok(searchIdx.ix[0].length >= 6, 'search index tuple includes ELI5 plain English text')
     assert.ok(typeof searchIdx.ix[0][5] === 'string')
+    // e[6] is search-only text: touched paths and the evidence citation.
+    assert.ok(searchIdx.ix.some(r => typeof r[6] === 'string' && r[6].length), 'search index tuple carries paths/evidence for identifier search')
     const searchHtml = await readFile(join(tmpDist, 'search/index.html'), 'utf8')
     // The two things that made /search/ unusable on a phone, pinned:
     // min-width:0 because a flex item defaults to min-width:auto and a long
