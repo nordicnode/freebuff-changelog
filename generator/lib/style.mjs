@@ -1695,7 +1695,7 @@ details.more-rows[open]>summary{margin-bottom:6px}
 .pr-card-header{
   display:flex;
   justify-content:space-between;
-  font-size:.76rem;
+  font-size:.78rem;
   margin-bottom:4px;
 }
 .pr-status{
@@ -1720,15 +1720,21 @@ details.more-rows[open]>summary{margin-bottom:6px}
   border:1px solid var(--term-border);
 }
 .pr-title{
-  margin:0 0 4px;
-  font-size:.92rem;
+  margin:0 0 6px;
+  font-size:1.02rem;
   font-weight:700;
+  line-height:1.45;
 }
 .pr-title a{
   color:var(--txt);
+  text-decoration:none;
+}
+.pr-title a:hover{
+  color:var(--term-cyan);
+  text-decoration:underline;
 }
 .pr-meta{
-  font-size:.76rem;
+  font-size:.78rem;
   color:var(--txt-subtle);
   display:flex;
   gap:8px;
@@ -2609,9 +2615,8 @@ mark.search-match{
 .badge.human{color:var(--term-green,#3fb950);border-color:rgba(63,185,80,.45)}
 
 /* AI preview on an open PR card. */
-.pr-preview-ai{margin:6px 0 8px;padding:8px 10px;background:var(--eli5-bg);border-left:2px solid var(--eli5-rule);font-size:.84rem;line-height:1.5}
-.pr-preview-ai .eli5-label{display:block;margin-bottom:4px}
-.pr-preview-note{display:block;margin-top:4px;font-size:.72rem;color:var(--txt-subtle)}
+.pr-preview-ai{margin:10px 0 8px;padding:10px 14px;background:var(--eli5-bg);border-left:3px solid var(--term-amber);border-radius:0 3px 3px 0;font-size:.92rem;line-height:1.6;color:var(--txt)}
+.pr-preview-note{display:block;margin-top:6px;font-size:.76rem;color:var(--txt-subtle)}
 
 /* Weekly digest rows reuse the compact change rows. */
 .week-rows{margin:6px 0 14px}
