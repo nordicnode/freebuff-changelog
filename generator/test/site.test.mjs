@@ -472,9 +472,7 @@ test('buildSite generates valid static site output', async () => {
       .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length
     assert.ok(aboutWords < 700, `about page is ${aboutWords} words; keep it under 700`)
     assert.doesNotMatch(aboutBody, /&mdash;|\u2014/, 'about copy carries no em-dashes')
-    assert.match(aboutHtml, /14d Clones/)
-    assert.match(aboutHtml, /id="about-clones"/)
-    assert.match(aboutHtml, /id="about-cloners"/)
+    assert.match(aboutHtml, /class="footer-badges"/)
     assert.match(aboutHtml, /badge\/clones\.svg/)
     assert.match(aboutHtml, /badge\/cloners\.svg/)
 

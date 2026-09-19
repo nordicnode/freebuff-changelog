@@ -2289,6 +2289,19 @@ footer{
   gap:10px;
   flex-wrap:wrap;
 }
+.footer-badges{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+}
+.footer-badges a{
+  display:inline-flex;
+  line-height:1;
+}
+.footer-badges img{
+  display:block;
+  height:20px;
+}
 .footer-links a, .footer-feeds a, .footer-links button, .footer-shortcuts button{
   background:none;
   border:none;

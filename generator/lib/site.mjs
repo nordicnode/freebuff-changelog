@@ -76,6 +76,10 @@ ${body}
   <div class="footer-row">
     <div class="footer-desc">freebuff-changes <span class="term-sep">::</span> unofficial public snapshot mirror reconstructed from <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a></div>
     <div class="footer-links">
+      <span class="footer-badges">
+        <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener" title="14-day git clones"><img src="/badge/clones.svg" alt="14d clones" height="20"></a>
+        <a href="https://github.com/nordicnode/freebuff-changelog" target="_blank" rel="noopener" title="14-day unique cloners"><img src="/badge/cloners.svg" alt="14d cloners" height="20"></a>
+      </span>
       <a href="/about/">[about]</a>
       <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">[github]</a>
     </div>
@@ -2823,7 +2827,6 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         <dt>Code areas</dt><dd>${areaTotal.toLocaleString()}</dd><dd class="man-note">${areaLine}</dd>
         <dt>Significance</dt><dd></dd><dd class="man-note"><code>[MAJOR]</code> models &amp; code bumps &middot; <code>[NOTABLE]</code> user-visible &amp; bumps &middot; <code>[minor]</code> internal &middot; <code>[SECURITY]</code> trust/keys</dd>
         ${openPrs?.length ? `<dt>In-flight</dt><dd>${openPrs.length.toLocaleString()}</dd><dd class="man-note">Open PRs with diffstat, commits, comments, and preview</dd>` : ''}
-        <dt>14d Clones</dt><dd id="about-clones">${trafficCount.toLocaleString()}</dd><dd class="man-note"><span id="about-cloners">${trafficUniques.toLocaleString()}</span> unique cloners across the last 14 days</dd>
       </dl>
 
       <h4>WHERE TO GO</h4>
@@ -2869,24 +2872,11 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         <img src="/badge/models.svg" alt="Models">
         <img src="/badge/status.svg" alt="Status">
         <img src="/badge/changes.svg" alt="Changes">
-        <img src="/badge/clones.svg" alt="14d Clones">
-        <img src="/badge/cloners.svg" alt="14d Cloners">
       </div>
       <p style="font-size:.78rem;color:var(--txt-dim);margin-top:4px">Markdown: <code>[![Version](${SITE.url}/badge/version.svg)](${SITE.url})</code></p>
     </div>
   </div>
-</section>
-<script>
-(function(){
-  fetch('/api/traffic.json').then(function(r){return r.ok?r.json():null}).then(function(d){
-    if(!d)return;
-    var c=document.getElementById('about-clones');
-    var u=document.getElementById('about-cloners');
-    if(c&&typeof d.count==='number')c.textContent=d.count.toLocaleString();
-    if(u&&typeof d.uniques==='number')u.textContent=d.uniques.toLocaleString();
-  }).catch(function(){});
-})();
-</script>`
+</section>`
   }))
 
   // ----- open PRs page (community activity ahead of merges, with diff previews)
