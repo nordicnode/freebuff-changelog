@@ -811,6 +811,54 @@ nav.term-nav a.active{
   height:1px;
   background:var(--eli5-rule);
 }
+.facts-details{
+  margin:8px 0;
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  background:var(--code);
+  overflow:hidden;
+  font-size:.8rem;
+}
+.facts-toggle{
+  cursor:pointer;
+  padding:6px 10px;
+  color:var(--txt-dim);
+  list-style:none;
+  display:flex;
+  gap:6px;
+  align-items:center;
+  user-select:none;
+  font-weight:600;
+  font-size:.78rem;
+  background:var(--code);
+  transition:background .12s ease, color .12s ease;
+}
+.facts-toggle::-webkit-details-marker{display:none}
+.facts-toggle:hover{
+  color:var(--txt);
+  background:var(--panel-hover);
+}
+.facts-hint{
+  font-size:.74rem;
+  font-weight:400;
+  color:var(--txt-subtle);
+}
+.facts-details[open] .facts-toggle{
+  border-bottom:1px solid var(--term-border);
+}
+.facts-details[open] .facts-toggle .diff-arrow{
+  transform:rotate(90deg);
+  color:var(--txt);
+}
+.facts-body{
+  padding:8px 12px;
+  background:var(--panel);
+}
+.facts-body .facts{
+  margin:0;
+  padding-left:14px;
+  border-left:none;
+}
 .facts{
   margin:8px 0;
   padding-left:14px;
@@ -820,7 +868,8 @@ nav.term-nav a.active{
 .facts li{
   color:var(--txt-dim);
   font-size:.82rem;
-  margin:3px 0;
+  margin:4px 0;
+  line-height:1.5;
 }
 .facts li::before{
   content:"> ";
@@ -2552,6 +2601,7 @@ mark.search-match{
 /* In plain English mode, hide developer & technical mechanics */
 .reading-mode-plain .entry:has(.eli5) .summary,
 .reading-mode-plain .entry .tech-details,
+.reading-mode-plain .entry .facts-details,
 .reading-mode-plain .entry .facts,
 .reading-mode-plain .entry .files,
 .reading-mode-plain .entry .diff-viewer,

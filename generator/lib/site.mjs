@@ -931,7 +931,7 @@ ${migrationHtml(e)}
 ${structuredChips(e)}
 ${evidenceHtml(e)}
 ${shippedInHtml(e, opts.shipped)}
-${e.facts?.length ? `<ul class="facts">${e.facts.slice(0, 3).map(f => `<li>${miniMd(f)}</li>`).join('')}</ul>` : ''}
+${factsHtml(e)}
 ${fileChips(e)}
 ${diffViewer}
 ${relatedLine(e, relatedIdx)}
@@ -1023,6 +1023,22 @@ function evidenceHtml (e) {
     : ''
   const verify = e.ai?.verify === 'flagged' ? '<p class="evidence-flag">A second model still objected to claims in this summary after one repair.</p>' : ''
   return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${bad.length ? ` <span class="evidence-warn">(${bad.length} unverified name${bad.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}</div></details>`
+}
+
+// Implementation notes and comments extracted directly from the commit diff.
+// Collapsed by default: technical source notes for developers.
+function factsHtml (e) {
+  if (!e.facts?.length) return ''
+  return `<details class="facts-details">
+<summary class="facts-toggle" title="Toggle code comments & facts">
+  <span class="diff-arrow">&gt;</span>
+  <span>Code comments</span>
+  <span class="facts-hint">(from source diff)</span>
+</summary>
+<div class="facts-body">
+  <ul class="facts">${e.facts.map(f => `<li>${miniMd(f)}</li>`).join('')}</ul>
+</div>
+</details>`
 }
 
 // The numbers the prompt work is judged by, as a /stats/ card. Every figure is
