@@ -118,3 +118,465 @@ index 0000000000..c772a6adaf
 +import { useFreebuffSessionStore } from '../../state/freebuff-session-store'
 +
 +// Re-implement the helper to test it independently (avoids importing the
++// full use-freebuff-session module which has side effects and React deps).
++function getSessionBoundUserId(): string | null {
++  return useFreebuffSessionStore.getState().sessionBoundUserId
++}
++
++describe('getSessionBoundUserId', () => {
++  beforeEach(() => {
++    useFreebuffSessionStore.getState().setSessionBoundUserId(null)
++  })
++
++  it('returns null when no binding exists', () => {
++    expect(getSessionBoundUserId()).toBeNull()
++  })
++
++  it('returns the bound user id when set', () => {
++    useFreebuffSessionStore.getState().setSessionBoundUserId('user-abc')
++    expect(getSessionBoundUserId()).toBe('user-abc')
++  })
++
++  it('returns null after binding is cleared', () => {
++    useFreebuffSessionStore.getState().setSessionBoundUserId('user-abc')
++    useFreebuffSessionStore.getState().setSessionBoundUserId(null)
++    expect(getSessionBoundUserId()).toBeNull()
++  })
++})
+diff --git a/cli/src/hooks/use-auth-state.ts b/cli/src/hooks/use-auth-state.ts
+index 80819b587e..a454645719 100644
+--- a/cli/src/hooks/use-auth-state.ts
++++ b/cli/src/hooks/use-auth-state.ts
+@@ -2,12 +2,14 @@ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ import { useCallback, useEffect, useState } from 'react'
+ 
+ import { useAuthQuery, useLogoutMutation } from './use-auth-query'
++import { getSessionBoundUserId } from './use-freebuff-session'
+ import { useLoginStore } from '../state/login-store'
+ import { identifyUser, trackEvent } from '../utils/analytics'
+-import { getUserCredentials } from '../utils/auth'
++import { clearUserCredentials, getUserCredentials } from '../utils/auth'
+ import { resetCodebuffClient } from '../utils/codebuff-client'
+ import { IS_FREEBUFF } from '../utils/constants'
+-import { loggerContext } from '../utils/logger'
++import { logger, loggerContext } from '../utils/logger'
++import { clearSessionBinding } from '../utils/session-binding'
+ 
+ import type { MultilineInputHandle } from '../components/multiline-input'
+ import type { User } from '../utils/auth'
+@@ -91,9 +93,29 @@ export const useAuthState = ({
+     }
+   }, [authQuery.isSuccess, authQuery.isError, authQuery.data, user])
+ 
+-  // Handle successful login
++  // Handle successful login. Returns a rejection reason if the login was
++  // blocked (e.g. session bound to a different account), or null on success.
+   const handleLoginSuccess = useCallback(
+-    (loggedInUser: User) => {
++    (loggedInUser: User): string | null => {
++      // Prevent multi-account abuse: if a session is bound to a different user,
++      // reject the login and clear the just-saved credentials.
++      const boundUserId = getSessionBoundUserId()
++      if (boundUserId && loggedInUser.id !== boundUserId) {
++        logger.warn(
++          {
++            sessionBoundUserId: boundUserId,
++            attemptedUserId: loggedInUser.id,
++          },
++          '[auth] Login rejected: session bound to different user',
++        )
++        trackEvent(AnalyticsEvent.ACCOUNT_SWITCH_BLOCKED, {
++          sessionBoundUserId: boundUserId,
++          attemptedUserId: loggedInUser.id ?? 'unknown',
++        })
++        clearUserCredentials()
++        return 'This session is tied to another account. End the current session first, or log out with /logout --force.'
++      }
++
+       // Identify first (aliases the pre-login anonymous history to the real
+       // user id) so the login event below is attributed to the user.
+       if (loggedInUser.id && loggedInUser.email) {
+@@ -118,6 +140,7 @@ export const useAuthState = ({
+       setInputFocused(true)
+       setUser(loggedInUser)
+       setIsAuthenticated(true)
++      return null
+     },
+     [resetChatStore, resetLoginState, setInputFocused],
+   )
+diff --git a/cli/src/hooks/use-freebuff-session.ts b/cli/src/hooks/use-freebuff-session.ts
+index 448ca7b215..ef4eee469a 100644
+--- a/cli/src/hooks/use-freebuff-session.ts
++++ b/cli/src/hooks/use-freebuff-session.ts
+@@ -19,7 +19,7 @@ import {
+ } from '../state/freebuff-model-store'
+ import { useChatStore } from '../state/chat-store'
+ import { useFreebuffSessionStore } from '../state/freebuff-session-store'
+-import { getAuthTokenDetails } from '../utils/auth'
++import { getAuthTokenDetails, getUserCredentials } from '../utils/auth'
+ import { stopActiveRun } from '../utils/active-run'
+ import { IS_FREEBUFF } from '../utils/constants'
+ import {
+@@ -27,6 +27,11 @@ import {
+   recordFreebuffInstanceOwner,
+ } from '../utils/freebuff-instance-owner'
+ import { logger } from '../utils/logger'
++import {
++  clearSessionBinding,
++  persistSessionBinding,
++  readSessionBinding,
++} from '../utils/session-binding'
+ import { getSystemMessage } from '../utils/message-history'
+ import {
+   clearReferralCache,
+@@ -141,6 +146,13 @@ export function getFreebuffInstanceId(): string | undefined {
+   return 'instanceId' in current ? current.instanceId : undefined
+ }
+ 
++/** Read the user ID bound to the current session. Returns `null` when no
++ *  session is active or the session has no binding. Used by the logout
++ *  guard and login validation to enforce single-account-per-session. */
++export function getSessionBoundUserId(): string | null {
++  return useFreebuffSessionStore.getState().sessionBoundUserId
++}
++
+ /** True when the session represents a server-side slot the caller is
+  *  holding (active, or in the post-expiry grace window with a live
+  *  instance id). Chat requests are only admissible in these states — once
+@@ -416,6 +428,41 @@ export function useFreebuffSession(): UseFreebuffSessionResult {
+       return
+     }
+ 
++    // Startup guard: if a session is bound to a different user, end it
++    // immediately to prevent multi-account abuse on the same machine.
++    // Check both in-memory state and persisted binding (survives restarts).
++    const inMemoryBoundUserId = useFreebuffSessionStore.getState().sessionBoundUserId
++    const persistedBoundUserId = readSessionBinding()
++    const boundUserId = inMemoryBoundUserId ?? persistedBoundUserId
++    const currentUser = getUserCredentials()
++    if (boundUserId && currentUser?.id !== boundUserId) {
++      logger.warn(
++        {
++          sessionBoundUserId: boundUserId,
++          currentUserId: currentUser?.id,
++        },
++        '[freebuff-session] Session bound to different user; ending session',
++      )
++      useFreebuffSessionStore.getState().setSessionBoundUserId(null)
++      clearSessionBinding()
++      releaseFreebuffSlot().catch(() => {})
++      setSession({
++        status: 'ended',
++        accessTier: undefined,
++        rateLimitsByModel: undefined,
++        subscription: undefined,
++      })
++      return
++    }
++
++    // If we have a persisted binding but no in-memory state (e.g. after restart),
++    // restore the binding so the guard works on the next startup too.
++    if (persistedBoundUserId && !inMemoryBoundUserId) {
++      useFreebuffSessionStore
++        .getState()
++        .setSessionBoundUserId(persistedBoundUserId)
++    }
++
+     let cancelled = false
+     let abortController = new AbortController()
+     let timer: ReturnType<typeof setTimeout> | null = null
+@@ -443,6 +490,23 @@ export function useFreebuffSession(): UseFreebuffSessionResult {
+       }
+       if (next.status === 'active') {
+         recordFreebuffInstanceOwner(next.instanceId)
++        // Bind the session to the current user to prevent multi-account abuse.
++        // Persist to disk so the binding survives process restarts.
++        const credentials = getUserCredentials()
++        if (credentials?.id) {
++          useFreebuffSessionStore
++            .getState()
++            .setSessionBoundUserId(credentials.id)
++          persistSessionBinding(credentials.id)
++        }
++      } else if (
++        next.status === 'ended' ||
++        next.status === 'none' ||
++        next.status === 'superseded'
++      ) {
++        // Clear the binding when the session is no longer active.
++        useFreebuffSessionStore.getState().setSessionBoundUserId(null)
++        clearSessionBinding()
+       }
+       setSession(next)
+       setFailure(null)
+diff --git a/cli/src/state/__tests__/freebuff-session-store.test.ts b/cli/src/state/__tests__/freebuff-session-store.test.ts
+new file mode 100644
+index 0000000000..13dccf75ca
+--- /dev/null
++++ b/cli/src/state/__tests__/freebuff-session-store.test.ts
+@@ -0,0 +1,60 @@
++import { describe, it, expect, beforeEach } from 'bun:test'
++
++import { useFreebuffSessionStore } from '../freebuff-session-store'
++
++describe('FreebuffSessionStore — session binding', () => {
++  beforeEach(() => {
++    useFreebuffSessionStore.getState().setSession(null)
++    useFreebuffSessionStore.getState().setFailure(null)
++    useFreebuffSessionStore.getState().setSessionBoundUserId(null)
++  })
++
++  describe('sessionBoundUserId', () => {
++    it('should default to null', () => {
++      expect(useFreebuffSessionStore.getState().sessionBoundUserId).toBeNull()
++    })
++
++    it('should set the bound user id', () => {
++      useFreebuffSessionStore.getState().setSessionBoundUserId('user-123')
++
++      expect(useFreebuffSessionStore.getState().sessionBoundUserId).toBe(
++        'user-123',
++      )
++    })
++
++    it('should clear the bound user id', () => {
++      useFreebuffSessionStore.getState().setSessionBoundUserId('user-123')
++      useFreebuffSessionStore.getState().setSessionBoundUserId(null)
++
++      expect(useFreebuffSessionStore.getState().sessionBoundUserId).toBeNull()
++    })
++
++    it('should overwrite previous binding', () => {
++      useFreebuffSessionStore.getState().setSessionBoundUserId('user-123')
++      useFreebuffSessionStore.getState().setSessionBoundUserId('user-456')
++
++      expect(useFreebuffSessionStore.getState().sessionBoundUserId).toBe(
++        'user-456',
++      )
++    })
++  })
++
++  describe('setSession', () => {
++    it('should not affect sessionBoundUserId when setting session', () => {
++      useFreebuffSessionStore.getState().setSessionBoundUserId('user-123')
++
++      useFreebuffSessionStore.getState().setSession({
++        status: 'active',
++        instanceId: 'inst-1',
++        model: 'test-model',
++        expiresAt: Date.now() + 60_000,
++        remainingMs: 60_000,
++        accessTier: 'full',
++      })
++
++      expect(useFreebuffSessionStore.getState().sessionBoundUserId).toBe(
++        'user-123',
++      )
++    })
++  })
++})
+diff --git a/cli/src/state/freebuff-session-store.ts b/cli/src/state/freebuff-session-store.ts
+index e7d31bb716..3d4e2c57c6 100644
+--- a/cli/src/state/freebuff-session-store.ts
++++ b/cli/src/state/freebuff-session-store.ts
+@@ -40,14 +40,24 @@ export type FreebuffSessionFailure =
+ interface FreebuffSessionStore {
+   session: FreebuffSessionResponse | null
+   failure: FreebuffSessionFailure | null
++  /**
++   * The user ID that owns the current active session. Set when the session
++   * becomes `active`, cleared when the session ends. Used to prevent
++   * account-switching abuse — if a session is bound to user A, user B
++   * cannot log in on the same machine without ending the session first.
++   */
++  sessionBoundUserId: string | null
+ 
+   setSession: (session: FreebuffSessionResponse | null) => void
+   setFailure: (failure: FreebuffSessionFailure | null) => void
++  setSessionBoundUserId: (userId: string | null) => void
+ }
+ 
+ export const useFreebuffSessionStore = create<FreebuffSessionStore>((set) => ({
+   session: null,
+   failure: null,
++  sessionBoundUserId: null,
+   setSession: (session) => set({ session }),
+   setFailure: (failure) => set({ failure }),
++  setSessionBoundUserId: (userId) => set({ sessionBoundUserId: userId }),
+ }))
+diff --git a/cli/src/utils/__tests__/session-binding.test.ts b/cli/src/utils/__tests__/session-binding.test.ts
+new file mode 100644
+index 0000000000..0e2ad7623f
+--- /dev/null
++++ b/cli/src/utils/__tests__/session-binding.test.ts
+@@ -0,0 +1,87 @@
++import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
++import fs from 'fs'
++
++import { getConfigDir } from '../auth'
++import {
++  persistSessionBinding,
++  readSessionBinding,
++  clearSessionBinding,
++} from '../session-binding'
++
++const getBindingPath = () =>
++  require('path').join(getConfigDir(), 'session-binding.json')
++
++describe('session-binding persistence', () => {
++  const bindingPath = getBindingPath()
++
++  beforeEach(() => {
++    try {
++      fs.mkdirSync(getConfigDir(), { recursive: true })
++    } catch {
++      // ignore
++    }
++    try {
++      fs.unlinkSync(bindingPath)
++    } catch {
++      // ignore
++    }
++  })
++
++  afterEach(() => {
++    try {
++      fs.unlinkSync(bindingPath)
++    } catch {
++      // ignore
++    }
++  })
++
++  it('readSessionBinding returns null when no file exists', () => {
++    expect(readSessionBinding()).toBeNull()
++  })
++
++  it('persistSessionBinding writes a JSON file with userId', () => {
++    persistSessionBinding('user-abc')
++
++    const raw = fs.readFileSync(bindingPath, 'utf8')
++    const parsed = JSON.parse(raw)
++    expect(parsed.userId).toBe('user-abc')
++  })
++
++  it('readSessionBinding reads back the persisted userId', () => {
++    persistSessionBinding('user-abc')
++    expect(readSessionBinding()).toBe('user-abc')
++  })
++
++  it('persistSessionBinding overwrites previous binding', () => {
++    persistSessionBinding('user-abc')
++    persistSessionBinding('user-xyz')
++
++    expect(readSessionBinding()).toBe('user-xyz')
++  })
++
++  it('clearSessionBinding removes the file', () => {
++    persistSessionBinding('user-abc')
++    clearSessionBinding()
++
++    expect(fs.existsSync(bindingPath)).toBe(false)
++    expect(readSessionBinding()).toBeNull()
++  })
++
++  it('clearSessionBinding is idempotent', () => {
++    persistSessionBinding('user-abc')
++    clearSessionBinding()
++    clearSessionBinding() // second call should not throw
++
++    expect(readSessionBinding()).toBeNull()
++  })
++
++  it('readSessionBinding returns null for malformed JSON', () => {
++    fs.writeFileSync(bindingPath, 'not-json')
++    expect(readSessionBinding()).toBeNull()
++  })
++
++  it('readSessionBinding returns null when userId is missing', () => {
++    fs.writeFileSync(bindingPath, JSON.stringify({ other: 'data' }))
++    expect(readSessionBinding()).toBeNull()
++  })
++})
+diff --git a/cli/src/utils/session-binding.ts b/cli/src/utils/session-binding.ts
+new file mode 100644
+index 0000000000..3f6cb9123c
+--- /dev/null
++++ b/cli/src/utils/session-binding.ts
+@@ -0,0 +1,65 @@
++import fs from 'fs'
++import path from 'path'
++
++import { getConfigDir } from './auth'
++import { logger } from './logger'
++
++const SESSION_BINDING_FILE = 'session-binding.json'
++
++interface SessionBinding {
++  userId: string
++}
++
++const getBindingPath = (): string =>
++  path.join(getConfigDir(), SESSION_BINDING_FILE)
++
++/**
++ * Persist the session-bound user id to disk so it survives process restarts.
++ * Without this, a user could Ctrl-C and restart the CLI to clear the in-memory
++ * binding and switch accounts.
++ */
++export function persistSessionBinding(userId: string): void {
++  try {
++    fs.mkdirSync(getConfigDir(), { recursive: true })
++    fs.writeFileSync(
++      getBindingPath(),
++      JSON.stringify({ userId } satisfies SessionBinding, null, 2),
++    )
++  } catch (error) {
++    logger.debug(
++      { error: error instanceof Error ? error.message : String(error) },
++      '[session-binding] Failed to persist binding',
++    )
++  }
++}
++
++/**
++ * Read the persisted session-bound user id from disk. Returns null if no
++ * binding exists or the file is malformed.
++ */
++export function readSessionBinding(): string | null {
++  try {
++    const raw = fs.readFileSync(getBindingPath(), 'utf8')
++    const parsed = JSON.parse(raw) as Partial<SessionBinding>
++    if (typeof parsed.userId !== 'string') return null
++    return parsed.userId
++  } catch {
++    return null
++  }
++}
++
++/**
++ * Clear the persisted session binding from disk.
++ */
++export function clearSessionBinding(): void {
++  try {
++    if (fs.existsSync(getBindingPath())) {
++      fs.unlinkSync(getBindingPath())
++    }
++  } catch (error) {
++    logger.debug(
++      { error: error instanceof Error ? error.message : String(error) },
++      '[session-binding] Failed to clear binding',
++    )
++  }
++}
+diff --git a/common/src/constants/analytics-events.ts b/common/src/constants/analytics-events.ts
+index 3328003ec0..0cfa3ca2f4 100644
+--- a/common/src/constants/analytics-events.ts
++++ b/common/src/constants/analytics-events.ts
+@@ -39,6 +39,7 @@ export enum AnalyticsEvent {
+   LOGIN_FAILED = 'cli.login_failed',
+   LOGIN_TIMEOUT = 'cli.login_timeout',
+   LOGIN_ABORTED = 'cli.login_aborted',
++  ACCOUNT_SWITCH_BLOCKED = 'cli.account_switch_blocked',
+   SLASH_MENU_ACTIVATED = 'cli.slash_menu_activated',
+   SLASH_COMMAND_USED = 'cli.slash_command_used',
+   TERMINAL_BROKER_SPAWN_FAILED = 'cli.terminal_broker_spawn_failed',

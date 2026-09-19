@@ -118,3 +118,444 @@ index 7e23893249..a1bce8de90 100644
 +      aiMessageId: 'ai-1',
 +      timerController: createMockTimerController(),
 +      setMessages: (fn: any) => {},
++      streamRefs: createStreamController(),
++      onAbort: () => {
++        previousRunStateRef.current = snapshot
++      },
++      setStreamStatus: () => {},
++      setCanProcessQueue: () => {},
++      updateChainInProgress: () => {},
++      setIsRetrying: () => {},
++      setStreamingAgents: () => {},
++    })
++
++    abortController.abort()
++
++    // The continuation snapshot now carries the full history instead of
++    // null (which would make the SDK build a blank session and re-explore
++    // from scratch on the next prompt). The hook-level test in
++    // cli/src/hooks/__tests__/use-send-message.test.tsx asserts the same
++    // through the real createRunConfig/client.run path.
++    expect(previousRunStateRef.current).toBe(snapshot)
++    expect(
++      (previousRunStateRef.current!.sessionState as any).mainAgentState
++        .messageHistory,
++    ).toHaveLength(3)
++    expect(
++      (previousRunStateRef.current!.sessionState as any).mainAgentState
++        .messageHistory[2].toolName,
++    ).toBe('read_files')
++  })
++})
+diff --git a/cli/src/hooks/helpers/send-message.ts b/cli/src/hooks/helpers/send-message.ts
+index 361ada6859..e6749b81e1 100644
+--- a/cli/src/hooks/helpers/send-message.ts
++++ b/cli/src/hooks/helpers/send-message.ts
+@@ -272,6 +272,11 @@ export const setupStreamingContext = (params: {
+   setMessages: (updater: (messages: ChatMessage[]) => ChatMessage[]) => void
+   streamRefs: StreamController
+   abortController?: AbortController
++  /** Invoked synchronously at the top of the abort listener, before the
++   *  input lock is released. Lets the run owner checkpoint its latest SDK
++   *  snapshot so a follow-up message sent immediately after an interrupt
++   *  resumes from fresh state instead of stale or null continuation state. */
++  onAbort?: () => void
+   setStreamStatus: (status: StreamStatus) => void
+   setCanProcessQueue: (can: boolean) => void
+   isQueuePausedRef?: MutableRefObject<boolean>
+@@ -303,9 +308,19 @@ export const setupStreamingContext = (params: {
+   const abortController = params.abortController ?? new AbortController()
+ 
+   abortController.signal.addEventListener('abort', () => {
+-    // Abort means the user stopped streaming; update UI with an interruption notice.
+-    // Release the chain lock immediately so new messages can be sent directly instead
+-    // of being queued.
++    // Let the run owner checkpoint its latest SDK snapshot synchronously
++    // BEFORE the input lock below is released, so a follow-up message sent
++    // the moment the user hits Esc inherits the latest state instead of
++    // stale (or null) continuation state. Best-effort: an onAbort failure
++    // must never block interruption cleanup.
++    try {
++      params.onAbort?.()
++    } catch {
++      // Checkpoint callbacks are best-effort; never skip abort cleanup.
++    }
++    // Abort means the user stopped streaming; update UI with an interruption
++    // notice. Release the chain lock immediately so new messages can be sent
++    // directly instead of being queued.
+     streamRefs.setters.setWasAbortedByUser(true)
+     setIsRetrying(false)
+     timerController.stop('aborted')
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index 698859a44e..63d4155ad7 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -172,6 +172,11 @@ export const useSendMessage = ({
+   const previousRunStateRef = useRef<RunState | null>(
+     useChatStore.getState().runState,
+   )
++  // Incremented for every run that is admitted as a real SDK run. Late
++  // results from a superseded run (one replaced by a newer run after the
++  // input lock was released) must never adopt state, persist a checkpoint,
++  // or touch shared queue state over the run that replaced it.
++  const runGenerationRef = useRef(0)
+   // Memoize stream controller to maintain referential stability across renders
+   const streamRefsRef = useRef<ReturnType<
+     typeof createStreamController
+@@ -310,6 +315,23 @@ export const useSendMessage = ({
+       const abortController = new AbortController()
+       const runChatDir = resolveCurrentChatDir()
+       const runChatIsCurrent = () => resolveCurrentChatDir() === runChatDir
++      // Bump only after the run-start guard admits the message: a
++      // session-ended message that gets requeued must not supersede an
++      // active run.
++      const runGeneration = ++runGenerationRef.current
++      const runIsCurrent = () =>
++        runGenerationRef.current === runGeneration && runChatIsCurrent()
++      // Adopt a snapshot as the continuation state for the next message, in
++      // memory (ref) and React state. Skipped when the run has been
++      // superseded or the chat switched away, and for snapshots that carry
++      // no session state at all: adopting one would silently make the SDK
++      // start a blank session on the next prompt.
++      const syncRunState = (state: RunState) => {
++        if (!runIsCurrent()) return
++        if (!state.sessionState) return
++        previousRunStateRef.current = state
++        setRunState(state)
++      }
+       let latestRunStateSnapshot: RunState = previousRunStateRef.current ?? {
+         traceSessionId: randomUUID(),
+         output: {
+@@ -520,6 +542,14 @@ export const useSendMessage = ({
+         setMessages,
+         streamRefs,
+         abortController,
++        onAbort: () => {
++          // Sync before the abort listener releases the input lock, so a
++          // message sent the moment the user hits Esc resumes from the
++          // latest snapshot instead of stale (or null) state. The
++          // generation/chat guards in syncRunState keep this a no-op for
++          // superseded runs and context-changing stops.
++          syncRunState(latestRunStateSnapshot)
++        },
+         setStreamStatus,
+         setCanProcessQueue,
+         isQueuePausedRef,
+@@ -565,7 +595,7 @@ export const useSendMessage = ({
+         )
+ 
+         const eventHandlerState = createEventHandlerState({
+-          isActive: () => !abortController.signal.aborted && runChatIsCurrent(),
++          isActive: () => !abortController.signal.aborted && runIsCurrent(),
+           streamRefs,
+           setStreamingAgents,
+           setStreamStatus,
+@@ -625,7 +655,7 @@ export const useSendMessage = ({
+             // conversation, and checkpointing them into this run's directory
+             // would overwrite that chat's transcript with foreign (possibly
+             // empty) state — the chat would then be hidden from /history.
+-            if (abortController.signal.aborted || !runChatIsCurrent()) {
++            if (abortController.signal.aborted || !runIsCurrent()) {
+               return
+             }
+             previousRunStateRef.current = snapshot
+@@ -685,10 +715,9 @@ export const useSendMessage = ({
+         // context, and previousRunStateRef/setRunState would leak this run's
+         // agent state into the other chat. (A plain Esc interrupt keeps the
+         // same chat, so the interrupted turn is still saved as before.)
+-        if (!abortController.signal.aborted && runChatIsCurrent()) {
++        if (runIsCurrent()) {
+           // Finalize: persist state and mark complete
+-          previousRunStateRef.current = runState
+-          setRunState(runState)
++          syncRunState(runState)
+           setIsRetrying(false)
+ 
+           // Drop any queued/in-flight async checkpoint first so a stale write
+@@ -700,29 +729,31 @@ export const useSendMessage = ({
+           // traps is several times slower.
+           saveChatState(runState, useChatStore.getState().messages, runChatDir)
+         }
+-        handleRunCompletion({
+-          runState,
+-          actualCredits,
+-          agentMode,
+-          timerController,
+-          updater,
+-          aiMessageId,
+-          wasAbortedByUser: abortController.signal.aborted,
+-          hasReceivedContent: hasReceivedContentRef.current,
+-          setStreamStatus,
+-          setCanProcessQueue,
+-          updateChainInProgress,
+-          setHasReceivedPlanResponse,
+-          resumeQueue,
+-          isProcessingQueueRef,
+-          isQueuePausedRef,
+-        })
++        if (runIsCurrent()) {
++          handleRunCompletion({
++            runState,
++            actualCredits,
++            agentMode,
++            timerController,
++            updater,
++            aiMessageId,
++            wasAbortedByUser: abortController.signal.aborted,
++            hasReceivedContent: hasReceivedContentRef.current,
++            setStreamStatus,
++            setCanProcessQueue,
++            updateChainInProgress,
++            setHasReceivedPlanResponse,
++            resumeQueue,
++            isProcessingQueueRef,
++            isQueuePausedRef,
++          })
++        }
+       } catch (error) {
+         // If this run was aborted, the abort handler already handled cleanup.
+         // Don't run error handling to avoid interfering with any new run that
+         // may have started. Uses per-run abortController.signal (not shared
+         // streamRefs) so a newer run's reset() can't clear this flag.
+-        if (!abortController.signal.aborted) {
++        if (!abortController.signal.aborted && runIsCurrent()) {
+           handleRunError({
+             error,
+             timerController,
+@@ -735,20 +766,26 @@ export const useSendMessage = ({
+             isQueuePausedRef,
+             hasReceivedContent: hasReceivedContentRef.current,
+           })
++          // Keep the latest snapshot available to the next message in this
++          // process, not only on disk: without this, a failed or expired
++          // turn is followed by a run with stale (or null) history.
++          syncRunState(latestRunStateSnapshot)
+           // Persist the last checkpoint plus the error banner so a restart
+-          // after a failed run still shows this turn. Settle async checkpoints
+-          // first so a stale write can't clobber this one. Skipped after a
+-          // mid-run chat switch — the store's messages belong to the new chat.
+-          if (runChatIsCurrent()) {
+-            await settleCheckpointSave()
+-            saveChatState(
+-              latestRunStateSnapshot,
+-              useChatStore.getState().messages,
+-              runChatDir,
+-            )
+-          }
+-        } else {
++          // after a failed run still shows this turn. Settle async
++          // checkpoints first so a stale write can't clobber this one.
++          await settleCheckpointSave()
++          saveChatState(
++            latestRunStateSnapshot,
++            useChatStore.getState().messages,
++            runChatDir,
++          )
++        } else if (abortController.signal.aborted) {
+           logger.debug({ error }, '[send-message] Ignoring error after abort')
++        } else {
++          logger.debug(
++            { error },
++            '[send-message] Ignoring error after run superseded',
++          )
+         }
+       } finally {
+         // Close the steering mailbox. Anything the run never drained was
+@@ -792,7 +829,7 @@ export const useSendMessage = ({
+         // interfering with any new run that may have started after the abort.
+         // Uses per-run abortController.signal (not shared streamRefs) so a newer
+         // run's reset() can't clear this flag.
+-        if (!abortController.signal.aborted) {
++        if (!abortController.signal.aborted && runIsCurrent()) {
+           if (isChainInProgressRef.current) {
+             logger.warn(
+               {},
+diff --git a/cli/src/utils/__tests__/run-state-storage.test.ts b/cli/src/utils/__tests__/run-state-storage.test.ts
+index 5fa887cf41..cd46d01589 100644
+--- a/cli/src/utils/__tests__/run-state-storage.test.ts
++++ b/cli/src/utils/__tests__/run-state-storage.test.ts
+@@ -1,4 +1,12 @@
+-import { describe, test, expect, afterAll, beforeEach, afterEach, mock } from 'bun:test'
++import {
++  describe,
++  test,
++  expect,
++  afterAll,
++  beforeEach,
++  afterEach,
++  mock,
++} from 'bun:test'
+ import * as fs from 'fs'
+ import * as path from 'path'
+ import * as os from 'os'
+@@ -570,7 +578,12 @@ describe('live chat state provider', () => {
+ describe('atomic save and resilient load', () => {
+   const chatDir = path.join(TEST_ROOT, 'codebuff-test-resilient-chatdir')
+ 
+-  const runState = { output: { type: 'error', message: 'x' } } as RunState
++  const runState = {
++    output: { type: 'error', message: 'x' },
++    sessionState: {
++      mainAgentState: { messageHistory: [] },
++    } as any,
++  } as RunState
+   const messages: ChatMessage[] = [
+     {
+       id: 'msg-1',
+@@ -615,7 +628,9 @@ describe('atomic save and resilient load', () => {
+ 
+     expect(loaded).not.toBeNull()
+     expect(loaded!.messages[0].content).toBe('the prompt')
+-    expect(loaded!.runState.output.type).toBe('error')
++    // Torn run-state has no readable session state: no continuation state
++    // is adopted, but the transcript survives the load.
++    expect(loaded!.runState).toBeNull()
+   })
+ 
+   test('torn chat-messages.json still restores the run state', () => {
+@@ -626,7 +641,7 @@ describe('atomic save and resilient load', () => {
+ 
+     expect(loaded).not.toBeNull()
+     expect(loaded!.messages).toHaveLength(0)
+-    expect((loaded!.runState.output as any).message).toBe('x')
++    expect((loaded!.runState!.output as any).message).toBe('x')
+   })
+ 
+   test('returns null when both files are unreadable', () => {
+@@ -636,6 +651,50 @@ describe('atomic save and resilient load', () => {
+ 
+     expect(loadMostRecentChatState()).toBeNull()
+   })
++
++  test('a run-state without sessionState is not adopted as continuation state', () => {
++    // A crashed/aborted first turn can persist a shell run-state (trace id
++    // + error output, no session) before the SDK ever emitted a snapshot.
++    // On resume that shell must not become previousRun: it would make the
++    // SDK build a blank session and silently discard the conversation.
++    const shellRunState = {
++      traceSessionId: 'trace-shell',
++      output: {
++        type: 'error',
++        message: 'The session ended before this response completed.',
++      },
++    } as RunState
++    saveChatState(shellRunState, messages)
++
++    const loaded = loadMostRecentChatState()
++
++    expect(loaded).not.toBeNull()
++    expect(loaded!.runState).toBeNull()
++    expect(loaded!.messages[0].content).toBe('the prompt')
++  })
++
++  test('a run-state with sessionState is restored as continuation state', () => {
++    const fullRunState = {
++      traceSessionId: 'trace-full',
++      sessionState: {
++        mainAgentState: {
++          messageHistory: [
++            { role: 'user', content: [{ type: 'text', text: 'hi' }] },
++          ],
++        },
++      } as any,
++      output: { type: 'lastMessage' as const, value: [] },
++    } as unknown as RunState
++    saveChatState(fullRunState, messages)
++
++    const loaded = loadMostRecentChatState()
++
++    expect(loaded!.runState).not.toBeNull()
++    expect(loaded!.runState?.traceSessionId).toBe('trace-full')
++    expect(
++      (loaded!.runState!.sessionState as any).mainAgentState.messageHistory,
++    ).toHaveLength(1)
++  })
+ })
+ 
+ describe('scheduleCheckpointSave (async, coalescing)', () => {
+diff --git a/cli/src/utils/codebuff-client.ts b/cli/src/utils/codebuff-client.ts
+index 4f4ab61541..1fec566dbb 100644
+--- a/cli/src/utils/codebuff-client.ts
++++ b/cli/src/utils/codebuff-client.ts
+@@ -15,6 +15,18 @@ import type { ClientToolCall } from '@codebuff/common/tools/list'
+ 
+ let clientInstance: CodebuffClient | null = null
+ 
++// Test-only escape hatch: tests inject a controllable client factory instead
++// of constructing a real SDK client (see docs/testing.md: DI over module
++// mocking — mock.module leaks across bun test files).
++let clientFactoryOverride: (() => Promise<CodebuffClient | null>) | undefined
++
++export function setClientFactoryOverrideForTesting(
++  factory: (() => Promise<CodebuffClient | null>) | undefined,
++): void {
++  clientFactoryOverride = factory
++  clientInstance = null
++}
++
+ /**
+  * Recursively removes undefined values from an object to ensure clean JSON serialization.
+  * This prevents issues with APIs that don't accept explicit undefined values.
+@@ -48,6 +60,10 @@ export function resetCodebuffClient(): void {
+ 
+ export async function getCodebuffClient(): Promise<CodebuffClient | null> {
+   if (!clientInstance) {
++    if (clientFactoryOverride) {
++      clientInstance = await clientFactoryOverride()
++      return clientInstance
++    }
+     const { token: apiKey } = getAuthTokenDetails()
+ 
+     if (!apiKey) {
+diff --git a/cli/src/utils/run-state-storage.ts b/cli/src/utils/run-state-storage.ts
+index 698b503fbd..da6ae9a7ca 100644
+--- a/cli/src/utils/run-state-storage.ts
++++ b/cli/src/utils/run-state-storage.ts
+@@ -22,7 +22,10 @@ import type { RunState } from '@codebuff/sdk'
+ const RUN_STATE_FILENAME = 'run-state.json'
+ 
+ type SavedChatState = {
+-  runState: RunState
++  /** Continuation state for the next run. Null when nothing usable was
++   *  persisted (a run-state without sessionState is never adopted — see
++   *  loadMostRecentChatState). */
++  runState: RunState | null
+   messages: ChatMessage[]
+   chatId?: string
+ }
+@@ -534,6 +537,18 @@ export function loadMostRecentChatState(
+       )
+     }
+ 
++    // A run-state without sessionState is not continuation state: handing
++    // it to the SDK makes the next run build a blank session and silently
++    // discard the conversation (freebuff #1054). Treat it as unrestorable —
++    // the transcript still restores below.
++    if (runState && !runState.sessionState) {
++      logger.debug(
++        { runStatePath },
++        'Run state has no session state; restoring transcript without agent context',
++      )
++      runState = null
++    }
++
+     if (!runState && !messages) {
+       logger.debug(
+         { runStatePath, messagesPath },
+@@ -542,13 +557,9 @@ export function loadMostRecentChatState(
+       return null
+     }
+ 
+-    runState ??= {
+-      output: {
+-        type: 'error',
+-        message: 'Previous run state could not be restored.',
+-      },
+-    } as RunState
+-    runState.traceSessionId ??= randomUUID()
++    if (runState) {
++      runState.traceSessionId ??= randomUUID()
++    }
+     messages ??= []
+ 
+     const resolvedChatId = path.basename(chatDir)

@@ -118,3 +118,183 @@ index d0bd4fa48a..89709427f8 100644
 +      setProjectRoot(originalProjectRoot ?? originalCwd)
 +      __resetLocalAgentRegistryForTests()
 +      rmSync(tempDir, { recursive: true, force: true })
++    }
++  })
++
++  test('leaves the registry alone when reloadAgentRegistry is false', async () => {
++    const originalCwd = process.cwd()
++    const originalProjectRoot = tryGetProjectRoot()
++    const tempDir = mkdtempSync(path.join(os.tmpdir(), 'freebuff-override-'))
++    const launchDir = path.join(tempDir, 'launch')
++    const launchAgentsDir = path.join(launchDir, '.agents')
++    const projectDir = path.join(tempDir, 'project')
++    const agentsDir = path.join(projectDir, '.agents')
++
++    mkdirSync(launchAgentsDir, { recursive: true })
++    mkdirSync(agentsDir, { recursive: true })
++    writeFileSync(
++      path.join(launchAgentsDir, 'launch-agent.ts'),
++      `export default {
++        id: 'override-launch-agent',
++        displayName: 'Override Launch Agent',
++        model: 'anthropic/claude-sonnet-4',
++        instructions: 'Loaded from the launch project'
++      }`,
++    )
++    writeFileSync(
++      path.join(agentsDir, 'selected-agent.ts'),
++      `export default {
++        id: 'override-selected-agent',
++        displayName: 'Override Selected Agent',
++        model: 'anthropic/claude-sonnet-4',
++        instructions: 'Loaded from the selected project'
++      }`,
++    )
++
++    try {
++      process.chdir(launchDir)
++      setProjectRoot(launchDir)
++      __resetLocalAgentRegistryForTests()
++      await initializeAgentRegistry()
++
++      expect(
++        loadLocalAgents().find((agent) => agent.id === 'override-launch-agent'),
++      ).toBeDefined()
++
++      await activateProject(projectDir, { reloadAgentRegistry: false })
++
++      // The move still happens, only the registry is left as the caller found it,
++      // which is what an --agent override relies on
++      expect(process.cwd()).toBe(projectDir)
++      expect(getProjectRoot()).toBe(projectDir)
++
++      const localAgents = loadLocalAgents()
++      expect(
++        localAgents.find((agent) => agent.id === 'override-launch-agent'),
++      ).toBeDefined()
++      expect(
++        localAgents.find((agent) => agent.id === 'override-selected-agent'),
++      ).toBeUndefined()
++    } finally {
++      process.chdir(originalCwd)
++      setProjectRoot(originalProjectRoot ?? originalCwd)
++      __resetLocalAgentRegistryForTests()
++      rmSync(tempDir, { recursive: true, force: true })
++    }
++  })
+ })
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index cae4e380eb..9098b75fa7 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -28,17 +28,19 @@ import { loadPackageVersion, parseArgs } from './cli-args'
+ import { handlePublish } from './commands/publish'
+ import { runPlainLogin } from './login/plain-login'
+ import { initializeApp } from './init/init-app'
+-import { getProjectRoot, setProjectRoot } from './project-files'
++import { getProjectRoot } from './project-files'
+ import { trackEvent } from './utils/analytics'
+ import { getAuthToken, getAuthTokenDetails } from './utils/auth'
+-import { resetCodebuffClient } from './utils/codebuff-client'
+ import { setApiClientAuthToken } from './utils/codebuff-api'
+ import { IS_FREEBUFF } from './utils/constants'
+ import { initializeAgentRegistry } from './utils/local-agent-registry'
+ import { trimOversizedChatLogs } from './utils/chat-history'
+ import { clearLogFile, logger } from './utils/logger'
+ import { drainClientLogs } from './utils/log-shipper'
+-import { shouldShowProjectPicker } from './utils/project-picker'
++import {
++  activateProject,
++  shouldShowProjectPicker,
++} from './utils/project-picker'
+ import { saveRecentProject } from './utils/recent-projects'
+ import { startEngagementTracking } from './utils/engagement'
+ import {
+@@ -343,8 +345,9 @@ async function main(): Promise<void> {
+     // Callback for when user selects a new project from the picker
+     const handleProjectChange = React.useCallback(
+       async (newProjectPath: string) => {
+-        // Change process working directory
+-        process.chdir(newProjectPath)
++        await activateProject(newProjectPath, {
++          reloadAgentRegistry: !hasAgentOverride,
++        })
+ 
+         // Track directory change (avoid logging full paths for privacy)
+         const isGitRepo = fs.existsSync(path.join(newProjectPath, '.git'))
+@@ -354,10 +357,6 @@ async function main(): Promise<void> {
+           pathDepth,
+           isHomeDir: newProjectPath === os.homedir(),
+         })
+-        // Update the project root in the module state
+-        setProjectRoot(newProjectPath)
+-        // Reset client to ensure tools use the updated project root
+-        resetCodebuffClient()
+         // Save to recent projects list
+         saveRecentProject(newProjectPath)
+         // Update local state
+@@ -367,7 +366,7 @@ async function main(): Promise<void> {
+         // Hide the picker and show the chat
+         setShowProjectPickerScreen(false)
+       },
+-      [],
++      [hasAgentOverride],
+     )
+ 
+     return (
+diff --git a/cli/src/utils/local-agent-registry.ts b/cli/src/utils/local-agent-registry.ts
+index 1781e50db3..fec30fce46 100644
+--- a/cli/src/utils/local-agent-registry.ts
++++ b/cli/src/utils/local-agent-registry.ts
+@@ -89,6 +89,19 @@ export async function initializeAgentRegistry(): Promise<void> {
+   }
+ }
+ 
++/**
++ * Reload the local agent registry after the active project changes.
++ *
++ * The derived agent-list and directory caches depend on the current working
++ * directory, so they must be cleared before the registry is initialized for
++ * the new project.
++ */
++export async function reloadLocalAgentRegistry(): Promise<void> {
++  cachedAgentsByMode.clear()
++  cachedAgentsDir = null
++  await initializeAgentRegistry()
++}
++
+ /**
+  * Get default agent directories to scan.
+  * Matches the SDK's getDefaultAgentDirs() to ensure consistency.
+diff --git a/cli/src/utils/project-picker.ts b/cli/src/utils/project-picker.ts
+index 0fa732a6c4..7b9921c2d6 100644
+--- a/cli/src/utils/project-picker.ts
++++ b/cli/src/utils/project-picker.ts
+@@ -1,5 +1,27 @@
+ import path from 'path'
+ 
++import { setProjectRoot } from '../project-files'
++import { resetCodebuffClient } from './codebuff-client'
++import { reloadLocalAgentRegistry } from './local-agent-registry'
++
++interface ActivateProjectOptions {
++  reloadAgentRegistry?: boolean
++}
++
++export async function activateProject(
++  projectPath: string,
++  { reloadAgentRegistry = true }: ActivateProjectOptions = {},
++): Promise<void> {
++  process.chdir(projectPath)
++  setProjectRoot(projectPath)
++
++  if (reloadAgentRegistry) {
++    await reloadLocalAgentRegistry()
++  }
++
++  resetCodebuffClient()
++}
++
+ export function shouldShowProjectPicker(
+   startCwd: string,
+   homeDir: string,

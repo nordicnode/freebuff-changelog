@@ -118,3 +118,276 @@ index aeb0d60c04..fb75431132 100644
      const stopIndex = updateFunction.indexOf(
        'await stopRunningProcess(runningProcess)',
      )
+@@ -182,10 +184,120 @@ describe('shared release launcher safety', () => {
+     )
+ 
+     expect(stageIndex).toBeGreaterThan(-1)
+-    expect(stopIndex).toBeGreaterThan(stageIndex)
++    expect(waitIndex).toBeGreaterThan(stageIndex)
++    expect(stopIndex).toBeGreaterThan(waitIndex)
+     expect(installIndex).toBeGreaterThan(stopIndex)
+   })
+ 
++  test('waitForRunIdle resolves immediately when no activity marker exists', async () => {
++    const { waitForRunIdle, runActivityMarkerPath } = createLauncher({
++      packageName: 'test',
++      displayName: 'Test',
++    }).__testing
++    const pid = 999_999_001
++
++    rmSync(runActivityMarkerPath(pid), { force: true })
++
++    const start = Date.now()
++    await waitForRunIdle(pid, { maxWaitMs: 5_000, pollIntervalMs: 5_000 })
++
++    // No poll tick should have been needed at all.
++    expect(Date.now() - start).toBeLessThan(500)
++  })
++
++  test('waitForRunIdle waits while the run is active and returns once it clears', async () => {
++    const { waitForRunIdle, runActivityMarkerPath } = createLauncher({
++      packageName: 'test',
++      displayName: 'Test',
++    }).__testing
++    const pid = 999_999_002
++    const markerPath = runActivityMarkerPath(pid)
++
++    writeFileSync(markerPath, '')
++    setTimeout(() => rmSync(markerPath, { force: true }), 30)
++
++    try {
++      await waitForRunIdle(pid, { maxWaitMs: 2_000, pollIntervalMs: 10 })
++      expect(existsSync(markerPath)).toBe(false)
++    } finally {
++      rmSync(markerPath, { force: true })
++    }
++  })
++
++  test('waitForRunIdle gives up once maxWaitMs elapses, marker or not', async () => {
++    const { waitForRunIdle, runActivityMarkerPath } = createLauncher({
++      packageName: 'test',
++      displayName: 'Test',
++    }).__testing
++    const pid = 999_999_003
++    const markerPath = runActivityMarkerPath(pid)
++
++    // Never cleared during the wait: the bound must still return.
++    writeFileSync(markerPath, '')
++
++    try {
++      const start = Date.now()
++      await waitForRunIdle(pid, { maxWaitMs: 30, pollIntervalMs: 10 })
++      expect(Date.now() - start).toBeLessThan(1_000)
++      // The marker itself is untouched -- the wrapper gives up waiting, it
++      // doesn't force the run to look idle.
++      expect(existsSync(markerPath)).toBe(true)
++    } finally {
++      rmSync(markerPath, { force: true })
++    }
++  })
++
++  test('a spawned binary starts from a clean activity marker', () => {
++    const { clearStaleRunActivityMarker, runActivityMarkerPath } =
++      createLauncher({
++        packageName: 'test',
++        displayName: 'Test',
++      }).__testing
++    const pid = 999_999_004
++    const markerPath = runActivityMarkerPath(pid)
++
++    // A marker left by a process that died before it could clear its own --
++    // SIGKILL, a native crash -- outlives it in tmpdir. Reaching the same pid
++    // again would otherwise stall that run's updates for the full bound.
++    writeFileSync(markerPath, '')
++
++    try {
++      clearStaleRunActivityMarker(pid)
++      expect(existsSync(markerPath)).toBe(false)
++    } finally {
++      rmSync(markerPath, { force: true })
++    }
++  })
++
++  test('clearing a stale marker tolerates there being none', () => {
++    const { clearStaleRunActivityMarker, runActivityMarkerPath } =
++      createLauncher({
++        packageName: 'test',
++        displayName: 'Test',
++      }).__testing
++    const pid = 999_999_005
++
++    rmSync(runActivityMarkerPath(pid), { force: true })
++
++    expect(() => clearStaleRunActivityMarker(pid)).not.toThrow()
++  })
++
++  test('spawnInstalledBinary clears the stale marker once it has a pid', () => {
++    const source = readFileSync(launcherPath, 'utf8')
++    const spawnFunction = source.slice(
++      source.indexOf('function spawnInstalledBinary'),
++    )
++    const spawnIndex = spawnFunction.indexOf('child = spawn(CONFIG.binaryPath')
++    const clearIndex = spawnFunction.indexOf('clearStaleRunActivityMarker(')
++    const returnIndex = spawnFunction.indexOf('return child')
++
++    expect(spawnIndex).toBeGreaterThan(-1)
++    // The pid only exists after the spawn, and the marker must be gone before
++    // the caller can hand this child to checkForUpdates.
++    expect(clearIndex).toBeGreaterThan(spawnIndex)
++    expect(returnIndex).toBeGreaterThan(clearIndex)
++  })
++
+   test('requires the wrapper release only for missing or older binaries', () => {
+     const cases: Array<{
+       wrapperVersion: string
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index cae4e380eb..528bfcdead 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -45,6 +45,7 @@ import {
+   exitCliWithFatalError,
+   installProcessCleanupHandlers,
+ } from './utils/renderer-cleanup'
++import { startRunActivityMarker } from './utils/run-activity-marker'
+ import { startTerminalWatchdog } from './utils/terminal-watchdog'
+ import { installTerminalProtocolController } from './utils/terminal-protocol-controller'
+ import { initializeSkillRegistry } from './utils/skill-registry'
+@@ -401,6 +402,12 @@ async function main(): Promise<void> {
+   // modes; the clean-shutdown path (renderer-cleanup) disarms it.
+   startTerminalWatchdog()
+ 
++  // Lets the npm-wrapper launcher defer an auto-update restart until any
++  // in-progress turn finishes, instead of interrupting it. Started early so
++  // no isChainInProgress transition can slip by before the subscription
++  // exists.
++  startRunActivityMarker()
++
+   const renderer = await createCliRenderer({
+     backgroundColor: 'transparent',
+     exitOnCtrlC: false,
+diff --git a/cli/src/utils/__tests__/run-activity-marker.test.ts b/cli/src/utils/__tests__/run-activity-marker.test.ts
+new file mode 100644
+index 0000000000..538001c7e9
+--- /dev/null
++++ b/cli/src/utils/__tests__/run-activity-marker.test.ts
+@@ -0,0 +1,56 @@
++import { existsSync, rmSync } from 'fs'
++
++import { afterAll, beforeEach, describe, expect, test } from 'bun:test'
++
++import { useChatStore } from '../../state/chat-store'
++import {
++  runActivityMarkerPath,
++  startRunActivityMarker,
++} from '../run-activity-marker'
++
++describe('run-activity-marker', () => {
++  const markerPath = runActivityMarkerPath()
++
++  beforeEach(() => {
++    rmSync(markerPath, { force: true })
++    useChatStore.getState().setIsChainInProgress(false)
++  })
++
++  afterAll(() => {
++    rmSync(markerPath, { force: true })
++    useChatStore.getState().setIsChainInProgress(false)
++  })
++
++  test('writes the marker while a turn is in progress and removes it when idle', () => {
++    startRunActivityMarker()
++
++    expect(existsSync(markerPath)).toBe(false)
++
++    useChatStore.getState().setIsChainInProgress(true)
++    expect(existsSync(markerPath)).toBe(true)
++
++    useChatStore.getState().setIsChainInProgress(false)
++    expect(existsSync(markerPath)).toBe(false)
++  })
++
++  test('is a no-op when the value does not actually change', () => {
++    startRunActivityMarker()
++    useChatStore.getState().setIsChainInProgress(true)
++    rmSync(markerPath, { force: true })
++
++    // Re-affirming the same value must not recreate the marker: only a real
++    // active/idle transition should.
++    useChatStore.getState().setIsChainInProgress(true)
++    expect(existsSync(markerPath)).toBe(false)
++  })
++
++  test('registering more than once never stacks a duplicate exit handler', () => {
++    startRunActivityMarker()
++    const countAfterFirstStart = process.listenerCount('exit')
++
++    startRunActivityMarker()
++    startRunActivityMarker()
++
++    expect(process.listenerCount('exit')).toBe(countAfterFirstStart)
++  })
++})
+diff --git a/cli/src/utils/run-activity-marker.ts b/cli/src/utils/run-activity-marker.ts
+new file mode 100644
+index 0000000000..abf584ae53
+--- /dev/null
++++ b/cli/src/utils/run-activity-marker.ts
+@@ -0,0 +1,58 @@
++/**
++ * Cross-process "is a turn running" signal for the npm-wrapper launcher.
++ *
++ * The wrapper (release-core/launcher.js) checks for updates ~100ms after
++ * spawning this process and, on finding one, force-restarts it -- with no
++ * way to know whether the user is mid-turn, because it only has this
++ * process's exit event, not its React state. While this marker file exists,
++ * an agent turn is in progress; the wrapper waits for it to clear (bounded)
++ * before stopping the process for an update, instead of interrupting a
++ * turn that's still running.
++ *
++ * Named by this process's pid, which the wrapper already has from spawning
++ * it -- no handshake needed. Best-effort throughout: a failed write or
++ * remove just means the wrapper falls back to today's immediate-restart
++ * behavior for this session.
++ */
++import { rmSync, writeFileSync } from 'fs'
++import os from 'os'
++import path from 'path'
++
++import { useChatStore } from '../state/chat-store'
++
++export function runActivityMarkerPath(pid: number = process.pid): string {
++  return path.join(os.tmpdir(), `codebuff-run-active-${pid}`)
++}
++
++let started = false
++
++/** Call once, before the store can start toggling isChainInProgress. */
++export function startRunActivityMarker(): void {
++  if (started) return
++  started = true
++
++  const filePath = runActivityMarkerPath()
++
++  const clear = () => {
++    try {
++      rmSync(filePath, { force: true })
++    } catch {
++      // Best-effort; see module doc.
++    }
++  }
++
++  useChatStore.subscribe((state, prevState) => {
++    if (state.isChainInProgress === prevState.isChainInProgress) return
++    if (state.isChainInProgress) {
++      try {
++        writeFileSync(filePath, '', { flag: 'w' })
++      } catch {
++        // Best-effort; see module doc.
++      }
++    } else {
++      clear()
++    }
++  })
++
++  process.on('exit', clear)
++}

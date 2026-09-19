@@ -118,3 +118,193 @@ index d1f84a10cd..b8ccc835cd 100644
 +      const result = trimMessagesToFitTokenLimit({
 +        messages,
 +        systemTokens: 0,
++        maxTotalTokens: 60_000,
++        logger,
++      })
++
++      expect(result).toEqual(messages)
++    })
++
++    it('leaves pre-existing orphans in an already-malformed history untouched', () => {
++      // The tool result has no call anywhere in the input: trimming did not
++      // create this orphan, so this fix leaves it alone instead of silently
++      // rewriting histories it did not break. The trim is active here (the
++      // large user message is removed) — only calls removed BY the trim
++      // cause their results to be dropped.
++      const messages: Message[] = [
++        userMessage('x'.repeat(4000)),
++        assistantMessage('done'),
++        toolResultMessage('ghost', 'ok'),
++      ]
++
++      const result = trimMessagesToFitTokenLimit({
++        messages,
++        systemTokens: 0,
++        maxTotalTokens: 600,
++        logger,
++      })
++
++      const ghost = result.find(
++        (message) => message.role === 'tool' && message.toolCallId === 'ghost',
++      )
++      expect(ghost).toBeDefined()
++    })
++
++    it('drops only the orphaned results when one assistant message carries multiple tool calls', () => {
++      // Parallel tool calls: a single assistant message with calls c1 and c2.
++      // The trim removes the call message; the drop matches per toolCallId, so
++      // every result whose call was removed is dropped and nothing keyed to a
++      // surviving call is touched.
++      const messages: Message[] = [
++        userMessage('write two files'),
++        assistantMessage({
++          content: [
++            toolCallPart('c1', 'x'.repeat(3000)),
++            toolCallPart('c2', 'y'.repeat(3000)),
++          ],
++        }),
++        toolResultMessage('c1', 'ok1'),
++        userMessage({ content: 'steer', keepDuringTruncation: true }),
++        toolResultMessage('c2', 'ok2'),
++        assistantMessage('done'),
++      ]
++
++      const result = trimMessagesToFitTokenLimit({
++        messages,
++        systemTokens: 0,
++        maxTotalTokens: 600,
++        logger,
++      })
++
++      expectNoOrphanedToolResults(result)
++      // Neither orphaned result may survive in any form...
++      expect(
++        result.filter(
++          (message) =>
++            message.role === 'tool' &&
++            (message.toolCallId === 'c1' || message.toolCallId === 'c2'),
++        ),
++      ).toEqual([])
++      // ...while the kept steer message and the final reply still do.
++      expect(
++        result.some(
++          (message) =>
++            message.role === 'user' &&
++            message.content.some(
++              (part) => part.type === 'text' && part.text === 'steer',
++            ),
++        ),
++      ).toBe(true)
++      expect(
++        result.some(
++          (message) =>
++            message.role === 'assistant' &&
++            message.content.some(
++              (part) => part.type === 'text' && part.text === 'done',
++            ),
++        ),
++      ).toBe(true)
++    })
++
++    it('keeps every result of a multi-call assistant message that survives the trim', () => {
++      const messages: Message[] = [
++        userMessage('write two files'),
++        assistantMessage({
++          content: [toolCallPart('c1', 'ok'), toolCallPart('c2', 'ok')],
++        }),
++        toolResultMessage('c1', 'ok1'),
++        toolResultMessage('c2', 'ok2'),
++        assistantMessage('done'),
++      ]
++
++      // Generous budget: the multi-call message and both results survive.
++      const result = trimMessagesToFitTokenLimit({
++        messages,
++        systemTokens: 0,
++        maxTotalTokens: 60_000,
++        logger,
++      })
++
++      expect(result).toEqual(messages)
++    })
++
++    it('keeps the invariant across a sweep of budgets', () => {
++      const messages: Message[] = [
++        userMessage('please write the file'),
++        assistantMessage({
++          content: [toolCallPart('c1', 'x'.repeat(3000))],
++        }),
++        toolResultMessage('c1', 'ok'),
++        assistantMessage({
++          content: [toolCallPart('c2', 'y'.repeat(1500))],
++        }),
++        toolResultMessage('c2', 'ok'),
++        assistantMessage('done'),
++      ]
++
++      for (const maxTotalTokens of [200, 400, 800, 1600, 3200, 6400]) {
++        const result = trimMessagesToFitTokenLimit({
++          messages,
++          systemTokens: 0,
++          maxTotalTokens,
++          logger,
++        })
++        expectNoOrphanedToolResults(result)
++      }
++    })
++  })
+ })
+ 
+ describe('getPreviouslyReadFiles', () => {
+diff --git a/packages/agent-runtime/src/util/messages.ts b/packages/agent-runtime/src/util/messages.ts
+index 88192aa6d6..4369928558 100644
+--- a/packages/agent-runtime/src/util/messages.ts
++++ b/packages/agent-runtime/src/util/messages.ts
+@@ -229,6 +229,47 @@ export function trimMessagesToFitTokenLimit(params: {
+     }
+   }
+ 
++  // The removal run stops as soon as the token budget is met, which can land
++  // between an assistant tool-call and its result: the surviving tool message
++  // then reaches the provider without its call and is rejected with
++  // "tool_call_id does not exist", failing the whole step. Drop results whose
++  // call this trim removed — but only those, so orphans that were already in
++  // the input history pass through unchanged. This also overrides
++  // keepDuringTruncation on a tool result whose call was removed: keeping the
++  // pair together would exceed the budget and keeping the result alone would
++  // be rejected, so a result cannot outlive its call.
++  const inputCallIds = new Set<string>()
++  const survivingCallIds = new Set<string>()
++  const collectCallIds = (message: Message, into: Set<string>) => {
++    if (message.role !== 'assistant' || !Array.isArray(message.content)) {
++      return
++    }
++    for (const part of message.content) {
++      if (part.type === 'tool-call' && part.providerExecuted !== true) {
++        into.add(part.toolCallId)
++      }
++    }
++  }
++  for (const message of messages) {
++    collectCallIds(message, inputCallIds)
++  }
++  if (inputCallIds.size > 0) {
++    for (const message of filteredMessages) {
++      if (message === placeholder) continue
++      collectCallIds(message, survivingCallIds)
++    }
++    for (let i = filteredMessages.length - 1; i >= 0; i--) {
++      const message = filteredMessages[i]
++      if (message === placeholder || message.role !== 'tool') continue
++      if (
++        inputCallIds.has(message.toolCallId) &&
++        !survivingCallIds.has(message.toolCallId)
++      ) {
++        filteredMessages.splice(i, 1)
++      }
++    }
++  }
++
+   return filteredMessages.map((m) =>
+     m === placeholder ? replacementMessage : m,
+   )

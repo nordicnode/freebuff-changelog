@@ -118,3 +118,4536 @@ index eae39a46a4..963c96bec3 100644
 +
 +import type { EventHandlerState } from '../../utils/sdk-event-handlers'
 +import type { SkillDefinition } from '@codebuff/common/types/skill'
++import type { Logger } from '@codebuff/common/types/contracts/logger'
+ 
+ describe('isSensitiveFile', () => {
+   test.each([
+@@ -64,3 +72,65 @@ describe('isSensitiveFile', () => {
+     expect(isSensitiveFile(file)).toBe(expected)
+   })
+ })
++
++describe('createRunConfig', () => {
++  afterEach(() => {
++    __resetSkillRegistryForTests()
++  })
++
++  /** The parts of an event-handler state a run config creation touches
++   *  (the handlers themselves are never invoked in these tests). */
++  const eventHandlerState: EventHandlerState = {
++    streaming: {
++      streamRefs: undefined as never,
++      setStreamingAgents: () => {},
++      setStreamStatus: () => {},
++    },
++    message: {
++      aiMessageId: 'ai-1',
++      updater: undefined as never,
++      hasReceivedContentRef: { current: false },
++    },
++    subagents: {
++      addActiveSubagent: () => {},
++      removeActiveSubagent: () => {},
++    },
++    mode: { agentMode: 'DEFAULT', setHasReceivedPlanResponse: () => {} },
++    logger: {
++      info: () => {},
++      warn: () => {},
++      error: () => {},
++      debug: () => {},
++    } as Logger,
++    setIsRetrying: () => {},
++  }
++
++  test("every run hands the session the registry's skill cache", async () => {
++    /** Given the registry cache holds a skill (the way an installed
++     *  plugin's skill does after startup), when a run config is built
++     *  and its skill loader runs, the session's skills include that
++     *  skill — the SDK's own loader reads only project/home dirs, so
++     *  this loader is what carries plugin skills into the session. */
++    const seeded: SkillDefinition = {
++      name: 'gcloud-setup',
++      description: 'sets up gcloud',
++      content: '# gcloud setup',
++      filePath: '/skills/gcloud-setup/SKILL.md',
++    }
++    __setSkillsForTests({ 'gcloud-setup': seeded })
++
++    const config = createRunConfig({
++      logger: eventHandlerState.logger,
++      agent: 'base',
++      prompt: 'hello',
++      content: undefined,
++      previousRunState: null,
++      agentDefinitions: [],
++      eventHandlerState,
++      signal: new AbortController().signal,
++    })
++
++    const skills = await config.skillsLoader()
++    expect(skills['gcloud-setup']).toEqual(seeded)
++  })
++})
+diff --git a/cli/src/cli-args.ts b/cli/src/cli-args.ts
+index 6694401b75..03e73b0a40 100644
+--- a/cli/src/cli-args.ts
++++ b/cli/src/cli-args.ts
+@@ -62,8 +62,12 @@ export function parseArgs({
+         'Set the working directory (default: current directory)',
+       )
+       .addArgument(
+-        new Argument('[command]', 'Command to run').choices(['login']),
++        new Argument('[command]', 'Command to run').choices([
++          'login',
++          'plugin',
++        ]),
+       )
++      .allowExcessArguments(true)
+       .helpOption('-h, --help', 'Show this help message')
+   } else {
+     // Codebuff: full CLI with all options
+diff --git a/cli/src/commands/__tests__/plugin-install-command.test.ts b/cli/src/commands/__tests__/plugin-install-command.test.ts
+new file mode 100644
+index 0000000000..e1cdc42636
+--- /dev/null
++++ b/cli/src/commands/__tests__/plugin-install-command.test.ts
+@@ -0,0 +1,149 @@
++import path from 'node:path'
++
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import {
++  runPluginCommand,
++  runPluginInstallCommand,
++} from '../plugin-install-command'
++
++import {
++  cleanUpPluginTestDirs,
++  fetchReturning,
++  makeTarball,
++  makeTempDir,
++  MCP_JSON,
++  PLUGIN_JSON,
++  SKILL_MD,
++} from '../../__tests__/helpers/plugin-fixtures'
++
++afterEach(cleanUpPluginTestDirs)
++
++/**
++ * Runs the command and reports what a shell would see: the console output,
++ * and the status the process would end with. Both are restored afterwards,
++ * so no row inherits the previous row's capture or exit code. The status
++ * reset writes 0 rather than `undefined`, which bun keeps as the last value
++ * it was given.
++ */
++async function runCommand(run: () => Promise<void>) {
++  const lines: string[] = []
++  const originalLog = console.log
++  const previousExitCode = process.exitCode
++  let exitCode = 0
++  process.exitCode = 0
++  console.log = (...parts: unknown[]) => {
++    lines.push(parts.map(String).join(' '))
++  }
++
++  try {
++    await run()
++    exitCode = Number(process.exitCode ?? 0)
++  } finally {
++    console.log = originalLog
++    process.exitCode = previousExitCode ?? 0
++  }
++
++  return { output: lines.join('\n'), exitCode }
++}
++
++describe('the plugin command entry', () => {
++  /**
++   * Given a subcommand that is not `install`, when the command runs, it
++   * prints the usage line and exits nonzero.
++   */
++  test('an unknown subcommand prints usage and exits nonzero', async () => {
++    const { output, exitCode } = await runCommand(() =>
++      runPluginCommand(['update', 'https://github.com/google/skills']),
++    )
++
++    expect(output).toContain('Usage: freebuff plugin install <url>')
++    expect(exitCode).toBe(1)
++  })
++})
++
++describe('the plugin install command runner', () => {
++  /**
++   * Given an argument count that is not exactly one URL, when the
++   * command runs, it prints the usage line and exits nonzero before
++   * any install work begins.
++   */
++  test('not exactly one URL prints usage and exits nonzero', async () => {
++    const { output, exitCode } = await runCommand(() =>
++      runPluginInstallCommand([], {}),
++    )
++
++    expect(output).toContain('Usage: freebuff plugin install <url>')
++    expect(output).toContain('https://github.com/owner/repo')
++    expect(exitCode).toBe(1)
++  })
++
++  /**
++   * Given a valid tarball served by the injected fetch, when the command
++   * runs, it prints the success render — the check, name, version,
++   * source, counts, and the data dir — and exits zero.
++   */
++  test('a successful install prints the success render', async () => {
++    const pluginsRoot = makeTempDir('plugin-cmd-test-')
++    const blob = await makeTarball({
++      'skills-main/plugin.json': PLUGIN_JSON,
++      'skills-main/skills/gcloud/SKILL.md': SKILL_MD,
++      'skills-main/mcp.json': MCP_JSON,
++    })
++
++    const { output, exitCode } = await runCommand(() =>
++      runPluginInstallCommand(['https://github.com/google/skills'], {
++        fetchImpl: fetchReturning(blob),
++        pluginsRoot,
++      }),
++    )
++
++    expect(exitCode).toBe(0)
++    expect(output).toContain('✔')
++    expect(output).toContain('test-plugin 1.0.0')
++    expect(output).toContain('github.com/google/skills')
++    expect(output).toContain('skills 1 registered')
++    expect(output).toContain('mcp 1 server: test-server')
++    expect(output).toContain(path.join(pluginsRoot, '.data', 'test-plugin'))
++  })
++
++  /**
++   * Given a failing install (404), when the command runs, it prints the
++   * reason and exits nonzero.
++   */
++  test('a failed install prints the reason and exits nonzero', async () => {
++    const { output, exitCode } = await runCommand(() =>
++      runPluginInstallCommand(['https://github.com/google/skills'], {
++        fetchImpl: () =>
++          Promise.resolve(new Response('not found', { status: 404 })),
++        pluginsRoot: makeTempDir('plugin-cmd-test-'),
++      }),
++    )
++
++    expect(output).toContain('could not download')
++    expect(exitCode).toBe(1)
++  })
++
++  /**
++   * Given a plugin whose skill name collides with an existing skill,
++   * when the command runs, it prints the conflict and exits nonzero.
++   */
++  test('a name conflict prints the collision and exits nonzero', async () => {
++    const pluginsRoot = makeTempDir('plugin-cmd-test-')
++    const blob = await makeTarball({
++      'skills-main/plugin.json': PLUGIN_JSON,
++      'skills-main/skills/gcloud/SKILL.md': SKILL_MD,
++    })
++
++    const { output, exitCode } = await runCommand(() =>
++      runPluginInstallCommand(['https://github.com/google/skills'], {
++        fetchImpl: fetchReturning(blob),
++        pluginsRoot,
++        existingSkillNames: () => new Set(['gcloud']),
++      }),
++    )
++
++    expect(output).toContain('gcloud')
++    expect(exitCode).toBe(1)
++  })
++})
+diff --git a/cli/src/commands/__tests__/plugin-install.test.ts b/cli/src/commands/__tests__/plugin-install.test.ts
+new file mode 100644
+index 0000000000..ff8d583185
+--- /dev/null
++++ b/cli/src/commands/__tests__/plugin-install.test.ts
+@@ -0,0 +1,213 @@
++import { existsSync, readdirSync } from 'node:fs'
++import path from 'node:path'
++
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { handlePluginInstall } from '../plugin-install'
++
++import {
++  cleanUpPluginTestDirs,
++  expectInstallOk,
++  fetchReturning,
++  makeTarball,
++  makeTempDir,
++  MCP_JSON,
++  PLUGIN_JSON,
++  SKILL_MD,
++} from '../../__tests__/helpers/plugin-fixtures'
++
++import type { PluginInstallOptions } from '../plugin-install'
++
++afterEach(cleanUpPluginTestDirs)
++
++/**
++ * Installs the standard plugin — manifest, one skill, one server — into a
++ * fresh plugins root, so the success rows below each claim one observable
++ * of the same install.
++ */
++async function installStandardPlugin(pluginsRoot: string) {
++  const blob = await makeTarball({
++    'skills-main/plugin.json': PLUGIN_JSON,
++    'skills-main/skills/gcloud/SKILL.md': SKILL_MD,
++    'skills-main/mcp.json': MCP_JSON,
++  })
++
++  return handlePluginInstall('https://github.com/google/skills', {
++    fetchImpl: fetchReturning(blob),
++    pluginsRoot,
++    existingSkillNames: () => new Set(),
++    existingMcpServerNames: () => new Set(),
++  })
++}
++
++describe('plugin install', () => {
++  /**
++   * Given a fetched tarball carrying a valid plugin, when installed, the
++   * result carries what the render needs: the manifest's name and
++   * version, and the component counts.
++   */
++  test('the result reports the installed plugin', async () => {
++    const pluginsRoot = makeTempDir('plugin-install-test-')
++
++    const result = expectInstallOk(await installStandardPlugin(pluginsRoot))
++
++    expect(result.pluginName).toBe('test-plugin')
++    expect(result.version).toBe('1.0.0')
++    expect(result.skillsCount).toBe(1)
++    expect(result.mcpServers).toEqual(['test-server'])
++  })
++
++  /**
++   * Given the same install, when it succeeds, the plugin root lands under
++   * the plugins root named after the manifest and the client-managed data
++   * dir is provisioned — the one mkdir the load leaves to the installer.
++   */
++  test('the plugin root and its data dir land under the plugins root', async () => {
++    const pluginsRoot = makeTempDir('plugin-install-test-')
++
++    expectInstallOk(await installStandardPlugin(pluginsRoot))
++
++    const pluginRoot = path.join(pluginsRoot, 'test-plugin')
++
++    expect(existsSync(path.join(pluginRoot, 'plugin.json'))).toBe(true)
++    expect(existsSync(path.join(pluginsRoot, '.data', 'test-plugin'))).toBe(
++      true,
++    )
++  })
++
++  /**
++   * Given a 404 from the archive endpoint, when installed, the command
++   * fails with the reason and nothing is written under the plugins root.
++   */
++  test('a failed fetch aborts clean', async () => {
++    const pluginsRoot = makeTempDir('plugin-install-test-')
++    const fetchFailing: PluginInstallOptions['fetchImpl'] = () =>
++      Promise.resolve(new Response('not found', { status: 404 }))
++
++    const result = await handlePluginInstall(
++      'https://github.com/google/skills',
++      { fetchImpl: fetchFailing, pluginsRoot },
++    )
++
++    expect(result.success).toBe(false)
++    expect(result.error).toBeTruthy()
++    expect(readdirSync(pluginsRoot)).toEqual([])
++  })
++
++  /**
++   * Given a tarball whose subpath holds no plugin.json, when installed,
++   * the load fails — the manifest alone decides whether the plugin exists
++   * (§5.3) — and nothing is written.
++   */
++  test('a missing manifest aborts clean', async () => {
++    const pluginsRoot = makeTempDir('plugin-install-test-')
++    const blob = await makeTarball({
++      'skills-main/README.md': 'no plugin here',
++    })
++
++    const result = await handlePluginInstall(
++      'https://github.com/google/skills/tree/main/nowhere',
++      { fetchImpl: fetchReturning(blob), pluginsRoot },
++    )
++
++    expect(result.success).toBe(false)
++    expect(readdirSync(pluginsRoot)).toEqual([])
++  })
++
++  /**
++   * Given a tarball whose manifest is invalid, when installed, the load
++   * fails with the manifest reason and nothing is written.
++   */
++  test('an invalid manifest aborts clean', async () => {
++    const pluginsRoot = makeTempDir('plugin-install-test-')
++    const blob = await makeTarball({
++      'skills-main/plugin.json': '{"name": 42}',
++    })
++
++    const result = await handlePluginInstall(
++      'https://github.com/google/skills',
++      { fetchImpl: fetchReturning(blob), pluginsRoot },
++    )
++
++    expect(result.success).toBe(false)
++    expect(readdirSync(pluginsRoot)).toEqual([])
++  })
++
++  /**
++   * Given a plugin whose name is already installed, when installed, the
++   * conflict aborts before anything moves — install never shadows an
++   * existing install — and the existing install is untouched.
++   */
++  test('an already-installed name aborts clean', async () => {
++    const pluginsRoot = makeTempDir('plugin-install-test-')
++    const existing = path.join(pluginsRoot, 'test-plugin')
++    await Bun.write(path.join(existing, 'plugin.json'), PLUGIN_JSON)
++
++    const blob = await makeTarball({
++      'skills-main/plugin.json': PLUGIN_JSON,
++    })
++
++    const result = await handlePluginInstall(
++      'https://github.com/google/skills',
++      { fetchImpl: fetchReturning(blob), pluginsRoot },
++    )
++
++    expect(result.success).toBe(false)
++    expect(result.error).toContain('already installed')
++    expect(existsSync(path.join(existing, 'plugin.json'))).toBe(true)
++  })
++
++  /**
++   * Given a plugin whose skill name collides with a skill in the user's
++   * roots, when installed, the conflict aborts with the name and nothing
++   * is written.
++   */
++  test('a colliding skill name aborts clean', async () => {
++    const pluginsRoot = makeTempDir('plugin-install-test-')
++
++    const blob = await makeTarball({
++      'skills-main/plugin.json': PLUGIN_JSON,
++      'skills-main/skills/gcloud/SKILL.md': SKILL_MD,
++    })
++
++    const result = await handlePluginInstall(
++      'https://github.com/google/skills',
++      {
++        fetchImpl: fetchReturning(blob),
++        pluginsRoot,
++        existingSkillNames: () => new Set(['gcloud']),
++      },
++    )
++
++    expect(result.success).toBe(false)
++    expect(result.error).toContain('gcloud')
++    expect(existsSync(path.join(pluginsRoot, 'test-plugin'))).toBe(false)
++  })
++
++  /**
++   * Given a plugin whose server name collides with the user's mcp.json,
++   * when installed, the conflict aborts with the name and nothing is
++   * written.
++   */
++  test('a colliding MCP server name aborts clean', async () => {
++    const pluginsRoot = makeTempDir('plugin-install-test-')
++
++    const blob = await makeTarball({
++      'skills-main/plugin.json': PLUGIN_JSON,
++      'skills-main/mcp.json': MCP_JSON,
++    })
++
++    const result = await handlePluginInstall(
++      'https://github.com/google/skills',
++      {
++        fetchImpl: fetchReturning(blob),
++        pluginsRoot,
++        existingMcpServerNames: () => new Set(['test-server']),
++      },
++    )
++
++    expect(result.success).toBe(false)
++    expect(result.error).toContain('test-server')
++    expect(existsSync(path.join(pluginsRoot, 'test-plugin'))).toBe(false)
++  })
++})
+diff --git a/cli/src/commands/plugin-install-command.ts b/cli/src/commands/plugin-install-command.ts
+new file mode 100644
+index 0000000000..602e742887
+--- /dev/null
++++ b/cli/src/commands/plugin-install-command.ts
+@@ -0,0 +1,134 @@
++import { green, red, yellow } from 'picocolors'
++
++import {
++  handlePluginInstall,
++  type PluginInstallOptions,
++  type PluginInstallResult,
++} from './plugin-install'
++import { loadMCPConfigSync, loadSkillsSync } from '@codebuff/sdk'
++
++const USAGE = 'Usage: freebuff plugin install <url>'
++
++/** Shown under the usage line when the URL argument is missing or doubled. */
++const URL_EXAMPLE =
++  'Expected the plugin URL, e.g. https://github.com/owner/repo/path/to/plugin.'
++
++/**
++ * The names already present in the user's own skill and MCP roots — the
++ * same roots the session reads at startup, so install cannot disagree
++ * with the session about what a name conflict is.
++ */
++function userSkillNames(): Set<string> {
++  try {
++    return new Set(
++      Object.keys(
++        loadSkillsSync({
++          cwd: process.cwd(),
++          verbose: false,
++          includeHomeSkills: true,
++        }),
++      ),
++    )
++  } catch {
++    return new Set()
++  }
++}
++
++function userMcpServerNames(): Set<string> {
++  try {
++    return new Set(
++      Object.keys(loadMCPConfigSync({ verbose: false }).mcpServers),
++    )
++  } catch {
++    return new Set()
++  }
++}
++
++/**
++/**
++ * Prints the usage line — with `detail` under it when the caller has one —
++ * and exits nonzero: the answer to every mistake on this command line.
++ */
++function failWithUsage(detail?: string): void {
++  console.log(yellow(detail ? `${USAGE}\n\n${detail}` : USAGE))
++  process.exitCode = 1
++}
++
++/**
++ * The `freebuff plugin` command entry: everything after `plugin` on the
++ * command line. The only subcommand is `install`; anything else prints
++ * the usage line and exits nonzero.
++ */
++export async function runPluginCommand(rawArgs: string[]): Promise<void> {
++  if (rawArgs[0] !== 'install') {
++    failWithUsage()
++    return
++  }
++  await runPluginInstallCommand(rawArgs.slice(1))
++}
++
++/**
++ * Prints the success render: the check line naming the plugin, its version,
++ * and where it came from, then what was registered, the data dir, and any
++ * reports the load gathered.
++ */
++function renderInstalled(installed: PluginInstallResult, url: string): void {
++  console.log(
++    green(
++      `✔ ${installed.pluginName} ${installed.version} ← ${url.replace(/^https:\/\//, '')}`,
++    ),
++  )
++  console.log(green(`  skills ${installed.skillsCount} registered`))
++
++  const servers = installed.mcpServers ?? []
++  if (servers.length > 0) {
++    console.log(
++      green(
++        `  mcp ${servers.length} server${servers.length === 1 ? '' : 's'}: ${servers.join(', ')}`,
++      ),
++    )
++  }
++
++  if (installed.dataDir) {
++    console.log(green(`  data ${installed.dataDir} (created)`))
++  }
++
++  for (const report of installed.reports ?? []) {
++    console.log(yellow(`  ⚠ [${report.section}] ${report.message}`))
++  }
++}
++
++/**
++ * The `freebuff plugin install <url>` command: validates the arguments,
++ * runs the install pipeline with the user's real roots — the name sets
++ * the conflict check runs against come from the same skill and MCP roots
++ * the session reads — and prints the outcome. The URL comes from the
++ * dispatch site, which forwards everything after `install` on the
++ * command line.
++ */
++export async function runPluginInstallCommand(
++  args: string[],
++  options: PluginInstallOptions = {},
++): Promise<void> {
++  if (args.length !== 1) {
++    failWithUsage(URL_EXAMPLE)
++    return
++  }
++
++  const url = args[0]!
++
++  const result = await handlePluginInstall(url, {
++    ...options,
++    existingSkillNames: options.existingSkillNames ?? userSkillNames,
++    existingMcpServerNames:
++      options.existingMcpServerNames ?? userMcpServerNames,
++  })
++
++  if (!result.success) {
++    console.log(red(`✗ ${result.error ?? 'the install failed'}`))
++    process.exitCode = 1
++    return
++  }
++
++  renderInstalled(result, url)
++}
+diff --git a/cli/src/commands/plugin-install.ts b/cli/src/commands/plugin-install.ts
+new file mode 100644
+index 0000000000..23221227f4
+--- /dev/null
++++ b/cli/src/commands/plugin-install.ts
+@@ -0,0 +1,251 @@
++import {
++  cpSync,
++  existsSync,
++  mkdirSync,
++  mkdtempSync,
++  readdirSync,
++  rmSync,
++} from 'node:fs'
++import os from 'node:os'
++import path from 'node:path'
++
++import {
++  loadPlugin,
++  pluginDataDirFor,
++} from '@codebuff/common/plugins/load-plugin'
++import { getPluginsRoot } from '../utils/plugins-root'
++import { parsePluginSourceUrl } from '@codebuff/common/plugins/install-url'
++import { loadSkillsSync } from '@codebuff/sdk'
++
++import type { InstalledPlugin } from '@codebuff/common/plugins/load-plugin'
++import type { PluginSource } from '@codebuff/common/plugins/install-url'
++import type { PluginReport } from '@codebuff/common/plugins/report'
++
++/**
++ * The outcome of an install attempt. On success: the installed plugin's
++ * name, version, skill and MCP server names, data dir, and any reports
++ * gathered while loading (§5.2). On failure: `success: false` with the
++ * reason in `error`, and nothing written under the plugins root.
++ */
++export interface PluginInstallResult {
++  success: boolean
++  pluginName?: string
++  version?: string
++  skillsCount?: number
++  mcpServers?: string[]
++  dataDir?: string
++  reports?: PluginReport[]
++  error?: string
++}
++
++/**
++ * Per-seam overrides for the install pipeline, each optional:
++ *
++ * - `fetchImpl` fetches the plugin tarball; defaults to global `fetch`.
++ * - `pluginsRoot` is where the plugin directory is created; defaults to
++ *   `~/.agents/plugins`.
++ * - `existingSkillNames` / `existingMcpServerNames` are the names the
++ *   conflict check runs against; default to empty, so no name can clash.
++ *   Pass the names already present in the user's skill and MCP roots so a
++ *   clash aborts the install instead of registering a duplicate name.
++ */
++export interface PluginInstallOptions {
++  fetchImpl?: (url: string) => Promise<Response>
++  pluginsRoot?: string
++  existingSkillNames?: () => Set<string>
++  existingMcpServerNames?: () => Set<string>
++}
++
++/**
++ * Installs a plugin from a GitHub URL: parse the URL into repo
++ * coordinates, fetch the codeload tarball, extract only the plugin
++ * subdirectory, load its manifest — the manifest alone decides whether a
++ * plugin exists (§5.3) — check name conflicts against the user's roots,
++ * and only then move it into place and provision the data dir. Any
++ * failure removes the temp dir and writes nothing under the plugins root.
++ */
++export async function handlePluginInstall(
++  url: string,
++  options: PluginInstallOptions = {},
++): Promise<PluginInstallResult> {
++  const fetchImpl = options.fetchImpl ?? fetch
++  const pluginsRoot = options.pluginsRoot ?? getPluginsRoot()
++  const existingSkillNames =
++    options.existingSkillNames ?? (() => new Set<string>())
++  const existingMcpServerNames =
++    options.existingMcpServerNames ?? (() => new Set<string>())
++
++  const fail = (error: string): PluginInstallResult => ({
++    success: false,
++    error,
++  })
++
++  const parsed = parsePluginSourceUrl(url)
++  if (!parsed.ok) {
++    return fail(parsed.reason)
++  }
++
++  let tempDir: string | undefined
++  try {
++    tempDir = mkdtempSync(path.join(os.tmpdir(), 'freebuff-plugin-install-'))
++
++    const downloaded = await downloadPluginSource(fetchImpl, {
++      ...parsed.source,
++      tempDir,
++    })
++    if (!downloaded.ok) {
++      return fail(downloaded.reason)
++    }
++
++    const pluginRoot = downloaded.pluginRoot
++
++    const load = loadPlugin(pluginRoot, (skillsDir) =>
++      loadSkillsSync({ skillsPath: skillsDir }),
++    )
++    if (!load.ok) {
++      return fail(`invalid plugin: ${load.reason}`)
++    }
++
++    const name = load.plugin.manifest.name
++    const conflict = checkConflicts(load.plugin, {
++      existingSkillNames: existingSkillNames(),
++      existingMcpServerNames: existingMcpServerNames(),
++    })
++    if (conflict) {
++      return fail(conflict)
++    }
++
++    const destination = path.join(pluginsRoot, name)
++    if (existsSync(destination)) {
++      return fail(
++        `${name} is already installed at ${destination} — uninstall it first to reinstall`,
++      )
++    }
++
++    const dataDir = installPluginAt(load.plugin, pluginRoot, destination)
++
++    return {
++      success: true,
++      pluginName: name,
++      version: load.plugin.manifest.version,
++      skillsCount: Object.keys(load.plugin.skills).length,
++      mcpServers: Object.keys(load.plugin.mcpServers),
++      dataDir,
++      reports: load.reports,
++    }
++  } catch (error) {
++    return fail(error instanceof Error ? error.message : String(error))
++  } finally {
++    if (tempDir) {
++      rmSync(tempDir, { recursive: true, force: true })
++    }
++  }
++}
++
++/**
++ * Fetches the codeload tarball for the repo coordinates and extracts the
++ * requested subpath into the temp dir. The tarball's entries sit under a
++ * top-level `<repo>-<ref>/` directory; with a subpath, the plugin root is
++ * one deeper.
++ */
++async function downloadPluginSource(
++  fetchImpl: (url: string) => Promise<Response>,
++  source: PluginSource & { tempDir: string },
++): Promise<{ ok: true; pluginRoot: string } | { ok: false; reason: string }> {
++  const { owner, repo, ref, subpath, tempDir } = source
++
++  const archiveUrl = `https://codeload.github.com/${owner}/${repo}/tar.gz/${ref}`
++  const response = await fetchImpl(archiveUrl)
++  if (!response.ok) {
++    return {
++      ok: false,
++      reason: `could not download the plugin source (${response.status} from ${archiveUrl})`,
++    }
++  }
++
++  const archive = new Bun.Archive(await response.blob())
++  const glob = subpath ? [`*/${subpath}/**`, `*/${subpath}/*`] : undefined
++  const extractedCount = await archive.extract(tempDir, { glob })
++
++  const pluginRoot = findPluginRoot(tempDir, subpath)
++  if (!pluginRoot) {
++    return {
++      ok: false,
++      reason: `no plugin found at ${subpath ? `${subpath} in ` : ''}${owner}/${repo}${ref === 'HEAD' ? '' : `@${ref}`} (${extractedCount} entries extracted)`,
++    }
++  }
++
++  return { ok: true, pluginRoot }
++}
++
++/**
++ * Locates the extracted plugin root inside the temp dir: the single
++ * top-level `<repo>-<ref>/` directory, plus the subpath when one was
++ * requested. Returns null when the expected directory is missing.
++ */
++function findPluginRoot(
++  tempDir: string,
++  subpath: string | null,
++): string | null {
++  const topLevel = readdirSync(tempDir, { withFileTypes: true }).filter((e) =>
++    e.isDirectory(),
++  )
++  if (topLevel.length !== 1) return null
++  const repoDir = path.join(tempDir, topLevel[0]!.name)
++
++  if (!subpath) return repoDir
++
++  const pluginRoot = path.join(repoDir, ...subpath.split('/'))
++  return existsSync(pluginRoot) ? pluginRoot : null
++}
++
++/**
++ * Returns the skill and MCP server names that already exist in the given
++ * sets, or null when none do. The plugin's own name is checked separately
++ * by the caller, against the plugins root.
++ */
++function checkConflicts(
++  plugin: {
++    manifest: { name: string }
++    skills: Record<string, unknown>
++    mcpServers: Record<string, unknown>
++  },
++  existing: {
++    existingSkillNames: Set<string>
++    existingMcpServerNames: Set<string>
++  },
++): string | null {
++  const skillClash = Object.keys(plugin.skills).filter((n) =>
++    existing.existingSkillNames.has(n),
++  )
++  if (skillClash.length > 0) {
++    return `skill name${skillClash.length > 1 ? 's' : ''} already in use: ${skillClash.join(', ')}`
++  }
++
++  const serverClash = Object.keys(plugin.mcpServers).filter((n) =>
++    existing.existingMcpServerNames.has(n),
++  )
++  if (serverClash.length > 0) {
++    return `MCP server name${serverClash.length > 1 ? 's' : ''} already in use: ${serverClash.join(', ')}`
++  }
++
++  return null
++}
++
++/**
++ * Moves the loaded plugin into the plugins root under the manifest's name
++ * and provisions the client-managed data dir, returning its path — the one
++ * mkdir the load leaves to the installer (§9.1).
++ */
++function installPluginAt(
++  plugin: InstalledPlugin,
++  pluginRoot: string,
++  destination: string,
++): string {
++  cpSync(pluginRoot, destination, { recursive: true })
++
++  const dataDir = pluginDataDirFor(destination, plugin.manifest)
++  mkdirSync(dataDir, { recursive: true })
++
++  return dataDir
++}
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index cae4e380eb..94bff66b9e 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -25,6 +25,7 @@ import React from 'react'
+ 
+ import { App } from './app'
+ import { loadPackageVersion, parseArgs } from './cli-args'
++import { runPluginCommand } from './commands/plugin-install-command'
+ import { handlePublish } from './commands/publish'
+ import { runPlainLogin } from './login/plain-login'
+ import { initializeApp } from './init/init-app'
+@@ -229,6 +230,14 @@ async function main(): Promise<void> {
+     return
+   }
+ 
++  // Handle the plugin command before rendering the app
++  if (command === 'plugin') {
++    await runPluginCommand(
++      process.argv.slice(process.argv.indexOf('plugin') + 1),
++    )
++    return
++  }
++
+   // Show project picker only when user starts at the home directory or an ancestor
+   const projectRoot = getProjectRoot()
+   const homeDir = os.homedir()
+diff --git a/cli/src/utils/__tests__/child-process-probe.ts b/cli/src/utils/__tests__/child-process-probe.ts
+new file mode 100644
+index 0000000000..50b7db864c
+--- /dev/null
++++ b/cli/src/utils/__tests__/child-process-probe.ts
+@@ -0,0 +1,40 @@
++import { setProjectRoot } from '../../project-files'
++import { initializeSkillRegistry } from '../skill-registry'
++import { initializeAgentRegistry } from '../local-agent-registry'
++
++/**
++ * The child-process probe for the discovery tests: the test harness
++ * spawns this file as its own bun process, so the CLI's real startup
++ * sequence — the same `initializeSkillRegistry()` /
++ * `initializeAgentRegistry()` calls `index.tsx` makes before rendering —
++ * runs with the registries' module-level caches empty in that process.
++ * Prints one JSON line: the skill names and MCP servers those caches
++ * hold there.
++ */
++
++const projectDir = process.argv[2]
++if (!projectDir) {
++  console.error('usage: bun child-process-probe.ts <projectDir>')
++  process.exit(1)
++}
++setProjectRoot(projectDir)
++
++await initializeSkillRegistry()
++await initializeAgentRegistry()
++
++const { getLoadedSkills } = await import('../skill-registry')
++const { getLoadedMCPServers } = await import('../local-agent-registry')
++
++const report = {
++  skills: Object.keys(getLoadedSkills()).sort(),
++  servers: Object.fromEntries(
++    Object.entries(getLoadedMCPServers()).map(([name, config]) => [
++      name,
++      'url' in config
++        ? `${config.type} ${config.url}`
++        : `${config.type} ${config.command}`,
++    ]),
++  ),
++}
++
++console.log(JSON.stringify(report))
+diff --git a/cli/src/utils/__tests__/plugin-child-process.test.ts b/cli/src/utils/__tests__/plugin-child-process.test.ts
+new file mode 100644
+index 0000000000..ffd30ef498
+--- /dev/null
++++ b/cli/src/utils/__tests__/plugin-child-process.test.ts
+@@ -0,0 +1,171 @@
++import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
++import os from 'node:os'
++import path from 'node:path'
++
++import { afterEach, describe, expect, test } from 'bun:test'
++
++let tempDirs: string[] = []
++
++function makeTempDir(): string {
++  const dir = mkdtempSync(path.join(os.tmpdir(), 'plugin-child-process-test-'))
++  tempDirs.push(dir)
++  return dir
++}
++
++afterEach(() => {
++  for (const dir of tempDirs) {
++    try {
++      rmSync(dir, { recursive: true, force: true, maxRetries: 3 })
++    } catch {
++      // A spawned child can still hold a fixture dir on Windows; the OS
++      // reclaims it and the next run uses a fresh mkdtemp anyway.
++    }
++  }
++  tempDirs = []
++})
++
++const PLUGIN_JSON = JSON.stringify({
++  $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json',
++  name: 'test-plugin',
++  version: '1.0.0',
++  description: 'a test plugin',
++})
++
++const SKILL_MD = (description: string) =>
++  [
++    '---',
++    `name: ${description}`,
++    `description: ${description}`,
++    '---',
++    '',
++    'Skill body.',
++    '',
++  ].join('\n')
++
++/** A fixture project: one skill in the project's own .agents/skills. */
++function makeProjectDir(): string {
++  const projectDir = makeTempDir()
++  const skillDir = path.join(projectDir, '.agents', 'skills', 'project-skill')
++  mkdirSync(skillDir, { recursive: true })
++  writeFileSync(path.join(skillDir, 'SKILL.md'), SKILL_MD('project-skill'))
++  return projectDir
++}
++
++/** A fixture plugins root holding one installed plugin: 2 skills, 1 server. */
++function makePluginsRoot(): string {
++  const pluginsRoot = makeTempDir()
++  const pluginDir = path.join(pluginsRoot, 'test-plugin')
++  const skillsDir = path.join(pluginDir, 'skills')
++  mkdirSync(path.join(skillsDir, 'gcloud'), { recursive: true })
++  mkdirSync(path.join(skillsDir, 'second-skill'), { recursive: true })
++  writeFileSync(path.join(pluginDir, 'plugin.json'), PLUGIN_JSON)
++  writeFileSync(path.join(skillsDir, 'gcloud', 'SKILL.md'), SKILL_MD('gcloud'))
++  writeFileSync(
++    path.join(skillsDir, 'second-skill', 'SKILL.md'),
++    SKILL_MD('second-skill'),
++  )
++  writeFileSync(
++    path.join(pluginDir, 'mcp.json'),
++    JSON.stringify({
++      $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
++      mcpServers: {
++        'test-server': {
++          type: 'streamable-http',
++          url: 'https://example.com/mcp',
++        },
++      },
++    }),
++  )
++  return pluginsRoot
++}
++
++/**
++ * Spawns the probe as a separate bun child process — a new process, so
++ * the registries' module-level caches start empty there — runs the real
++ * registry startup against the fixture roots, and returns what those
++ * caches hold in that process.
++ */
++async function probeFreshProcess(
++  projectDir: string,
++  pluginsRoot: string | null,
++): Promise<{ skills: string[]; servers: Record<string, string> }> {
++  const homeFixture = makeTempDir()
++  const env: Record<string, string> = {}
++  for (const [key, value] of Object.entries(process.env)) {
++    if (typeof value === 'string') env[key] = value
++  }
++  env.HOME = homeFixture
++  env.USERPROFILE = homeFixture
++  env.FREEBUFF_CONFIG_DIR = homeFixture
++  delete env.FREEBUFF_PLUGINS_ROOT
++  if (pluginsRoot) {
++    env.FREEBUFF_PLUGINS_ROOT = pluginsRoot
++  }
++
++  const probePath = path.join(import.meta.dir, 'child-process-probe.ts')
++  const child = Bun.spawn([process.execPath, probePath, projectDir], {
++    cwd: projectDir,
++    env,
++    stdout: 'pipe',
++    stderr: 'pipe',
++  })
++  const [stdout, exitCode] = await Promise.all([
++    new Response(child.stdout).text(),
++    child.exited,
++  ])
++  child.kill()
++
++  if (exitCode !== 0) {
++    const stderr = await new Response(child.stderr).text()
++    throw new Error(`probe failed (${exitCode}):\n${stderr}`)
++  }
++  const lastLine = stdout.trim().split('\n').at(-1) ?? ''
++  return JSON.parse(lastLine) as {
++    skills: string[]
++    servers: Record<string, string>
++  }
++}
++
++describe('a separate bun process discovers what install wrote', () => {
++  /**
++   * Given a fixture project skill and an installed plugin (2 skills, 1
++   * server), when a separate bun process runs the real registry startup
++   * with empty caches, its caches hold both the project's own skill and
++   * the plugin's skills, and the plugin's server sits in its server map
++   * in the freebuff shape — discovery needs no in-process refresh.
++   */
++  test(
++    'plugin skills and server join the child process caches',
++    async () => {
++      const projectDir = makeProjectDir()
++      const pluginsRoot = makePluginsRoot()
++
++      const report = await probeFreshProcess(projectDir, pluginsRoot)
++
++      expect(report.skills).toContain('project-skill')
++      expect(report.skills).toContain('gcloud')
++      expect(report.skills).toContain('second-skill')
++      expect(report.servers['test-server']).toBe('http https://example.com/mcp')
++    },
++    { timeout: 30_000 },
++  )
++
++  /**
++   * Given a machine with no plugins root at all, when a separate bun
++   * process runs the real registry startup, it starts clean — the
++   * project's own skill is there, no plugin-shaped anything is, and
++   * nothing throws.
++   */
++  test(
++    'a machine with no plugins root starts clean',
++    async () => {
++      const projectDir = makeProjectDir()
++
++      const report = await probeFreshProcess(projectDir, null)
++
++      expect(report.skills).toEqual(['project-skill'])
++      expect(report.servers).toEqual({})
++    },
++    { timeout: 30_000 },
++  )
++})
+diff --git a/cli/src/utils/__tests__/plugin-mcp-registry.test.ts b/cli/src/utils/__tests__/plugin-mcp-registry.test.ts
+new file mode 100644
+index 0000000000..6fe5ae1eb7
+--- /dev/null
++++ b/cli/src/utils/__tests__/plugin-mcp-registry.test.ts
+@@ -0,0 +1,99 @@
++import { mkdirSync, writeFileSync } from 'node:fs'
++import path from 'node:path'
++
++import { afterEach, describe, expect, test } from 'bun:test'
++import { mcpConfigSchema } from '@codebuff/common/types/mcp'
++
++import { pluginMcpServers } from '../plugin-discovery'
++
++import {
++  cleanUpPluginTestDirs,
++  makeTempDir,
++  PLUGIN_JSON,
++  SKILL_MD,
++} from '../../__tests__/helpers/plugin-fixtures'
++
++afterEach(cleanUpPluginTestDirs)
++
++/**
++ * Writes one plugin root: manifest, one skill directory, and the given
++ * MCP server declarations — a complete plugin, so a row can also show
++ * that loading its MCP servers never reaches for its skills (§7.2
++ * declares none; the skills walk is a different composition).
++ */
++function writePluginRoot(pluginDir: string, mcpServers: object): void {
++  mkdirSync(path.join(pluginDir, 'skills', 'gcloud'), { recursive: true })
++  writeFileSync(path.join(pluginDir, 'skills', 'gcloud', 'SKILL.md'), SKILL_MD)
++  writeFileSync(path.join(pluginDir, 'plugin.json'), PLUGIN_JSON)
++  writeFileSync(
++    path.join(pluginDir, 'mcp.json'),
++    JSON.stringify({
++      $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
++      mcpServers,
++    }),
++  )
++}
++
++describe('plugin MCP servers for the session server map', () => {
++  /**
++   * Given an installed plugin declaring a spec streamable-http server —
++   * a complete plugin, skills/ included — when the plugin half of the
++   * server map loads, the server comes back under its own name in the
++   * freebuff shape the session's server schema accepts, with the
++   * plugin-only fields gone and the skill side untouched.
++   */
++  test("an agent plugin's MCP server arrives in the freebuff shape", () => {
++    const pluginsRoot = makeTempDir('plugin-mcp-test-')
++    writePluginRoot(pluginsRoot + '/test-plugin', {
++      'developer-knowledge': {
++        type: 'streamable-http',
++        url: 'https://example.com/mcp',
++      },
++    })
++
++    const servers = pluginMcpServers({ pluginsRoot })
++
++    const parsed = mcpConfigSchema.safeParse(servers['developer-knowledge'])
++    expect(parsed.success).toBe(true)
++    expect(servers['developer-knowledge']).toEqual({
++      type: 'http',
++      url: 'https://example.com/mcp',
++      params: {},
++      headers: {},
++    })
++  })
++
++  /**
++   * Given two installed plugins each declaring a server, when the plugin
++   * half of the server map loads, both come back in one map.
++   */
++  test('servers from several plugins merge into one map', () => {
++    const pluginsRoot = makeTempDir('plugin-mcp-test-')
++    writePluginRoot(pluginsRoot + '/plugin-a', {
++      'server-a': { type: 'streamable-http', url: 'https://a.example/mcp' },
++    })
++    writePluginRoot(pluginsRoot + '/plugin-b', {
++      'server-b': {
++        type: 'streamable-http',
++        url: 'https://b.example/mcp',
++      },
++    })
++
++    const servers = pluginMcpServers({ pluginsRoot })
++
++    expect(Object.keys(servers).sort()).toEqual(['server-a', 'server-b'])
++  })
++
++  /**
++   * Given no plugins root at all (a fresh machine), when the plugin half
++   * of the server map loads, the result is empty — absence contributes
++   * nothing.
++   */
++  test('a missing plugins root contributes nothing', () => {
++    const servers = pluginMcpServers({
++      pluginsRoot: path.join(makeTempDir('plugin-mcp-test-'), 'does-not-exist'),
++    })
++
++    expect(servers).toEqual({})
++  })
++})
+diff --git a/cli/src/utils/__tests__/plugin-skill-registry.test.ts b/cli/src/utils/__tests__/plugin-skill-registry.test.ts
+new file mode 100644
+index 0000000000..a0fc35c908
+--- /dev/null
++++ b/cli/src/utils/__tests__/plugin-skill-registry.test.ts
+@@ -0,0 +1,118 @@
++import { mkdirSync, writeFileSync } from 'node:fs'
++import path from 'node:path'
++
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { pluginSkills } from '../plugin-discovery'
++
++import {
++  cleanUpPluginTestDirs,
++  makeTempDir,
++  PLUGIN_JSON,
++  SKILL_MD,
++} from '../../__tests__/helpers/plugin-fixtures'
++
++import type { SkillsMap } from '@codebuff/common/types/skill'
++
++afterEach(cleanUpPluginTestDirs)
++
++/**
++ * Writes one plugin root: manifest plus a single skill directory. The
++ * manifest name defaults to `test-plugin`; pass another to distinguish
++ * two roots in one plugins dir.
++ */
++function writePluginRoot(pluginDir: string, name = 'test-plugin'): void {
++  mkdirSync(path.join(pluginDir, 'skills', 'gcloud'), { recursive: true })
++  writeFileSync(
++    path.join(pluginDir, 'plugin.json'),
++    PLUGIN_JSON.replace('"test-plugin"', `"${name}"`),
++  )
++  writeFileSync(path.join(pluginDir, 'skills', 'gcloud', 'SKILL.md'), SKILL_MD)
++}
++
++/** The SDK's own shape, so the fake reader answers with real definitions. */
++function skillNamed(name: string, fromDir: string): SkillsMap {
++  return {
++    [name]: {
++      name,
++      description: `A plugin skill. (${fromDir})`,
++      content: SKILL_MD,
++      filePath: path.join(fromDir, name, 'SKILL.md'),
++    },
++  }
++}
++
++describe('plugin skills for the session registry', () => {
++  /**
++   * Given an installed plugin under the plugins root, when the plugin
++   * half of the registry loads, the plugin's skills come back and the
++   * reader was handed exactly `<pluginRoot>/skills` — the read-in-place
++   * seam, with the reader injected so no test touches the real home.
++   */
++  test('a plugin skill comes back via its skills dir', () => {
++    const pluginsRoot = makeTempDir('plugin-registry-test-')
++    writePluginRoot(path.join(pluginsRoot, 'test-plugin'))
++
++    const readDirs: string[] = []
++    const readSkillsDir = (skillsPath: string): SkillsMap => {
++      readDirs.push(skillsPath)
++      return skillNamed('gcloud', skillsPath)
++    }
++
++    const skills = pluginSkills({ readSkillsDir, pluginsRoot })
++
++    expect(readDirs).toEqual([path.join(pluginsRoot, 'test-plugin', 'skills')])
++    expect(skills['gcloud']?.description).toContain('A plugin skill')
++  })
++
++  /**
++   * Given no plugins root at all (a fresh machine), when the plugin half
++   * of the registry loads, the result is empty — absence contributes
++   * nothing. The reader throws if the walk ever calls it.
++   */
++  test('a missing plugins root contributes nothing', () => {
++    const readSkillsDir = (_skillsPath: string): SkillsMap => {
++      throw new Error('the walk must not reach for skills without a root')
++    }
++
++    const skills = pluginSkills({
++      readSkillsDir,
++      pluginsRoot: path.join(
++        makeTempDir('plugin-registry-test-'),
++        'does-not-exist',
++      ),
++    })
++
++    expect(skills).toEqual({})
++  })
++
++  /**
++   * Given a plugins root holding `.data` (client-managed state, here
++   * misused by parking a *valid* plugin directly inside it) plus a
++   * directory without a manifest and one with an invalid manifest, when
++   * the walk runs, none of them are read and the valid neighbor still
++   * loads (§5.3: the manifest decides existence).
++   */
++  test('non-plugin and invalid entries contribute nothing', () => {
++    const pluginsRoot = makeTempDir('plugin-registry-test-')
++    writePluginRoot(path.join(pluginsRoot, 'test-plugin'))
++    writePluginRoot(path.join(pluginsRoot, '.data'), 'decoy-plugin')
++    mkdirSync(path.join(pluginsRoot, 'not-a-plugin'), { recursive: true })
++    mkdirSync(path.join(pluginsRoot, 'broken'), { recursive: true })
++    writeFileSync(
++      path.join(pluginsRoot, 'broken', 'plugin.json'),
++      '{"name": 42}',
++    )
++
++    const readDirs: string[] = []
++    const readSkillsDir = (skillsPath: string): SkillsMap => {
++      readDirs.push(skillsPath)
++      return {}
++    }
++
++    const skills = pluginSkills({ readSkillsDir, pluginsRoot })
++
++    expect(readDirs).toEqual([path.join(pluginsRoot, 'test-plugin', 'skills')])
++    expect(skills).toEqual({})
++  })
++})
+diff --git a/cli/src/utils/create-run-config.ts b/cli/src/utils/create-run-config.ts
+index 1374b2ef64..ec838990ce 100644
+--- a/cli/src/utils/create-run-config.ts
++++ b/cli/src/utils/create-run-config.ts
+@@ -7,6 +7,7 @@ import {
+   createEventHandler,
+   createStreamChunkHandler,
+ } from './sdk-event-handlers'
++import { getLoadedSkills } from './skill-registry'
+ 
+ import type { EventHandlerState } from './sdk-event-handlers'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+@@ -115,6 +116,11 @@ export const createRunConfig = (params: CreateRunConfigParams) => {
+     content,
+     previousRun: previousRunState ?? undefined,
+     agentDefinitions,
++    // The SDK's own loader reads only project/home skill dirs. The registry
++    // cache is the CLI's single merged source (project + home + installed
++    // plugins), so handing it to the run keeps the model's skill list
++    // identical to the slash-command list built from the same cache.
++    skillsLoader: async () => getLoadedSkills(),
+     maxAgentSteps: MAX_AGENT_STEPS_DEFAULT,
+     handleStreamChunk: createStreamChunkHandler(eventHandlerState),
+     handleEvent: createEventHandler(eventHandlerState),
+diff --git a/cli/src/utils/local-agent-registry.ts b/cli/src/utils/local-agent-registry.ts
+index 1781e50db3..d82e920bf4 100644
+--- a/cli/src/utils/local-agent-registry.ts
++++ b/cli/src/utils/local-agent-registry.ts
+@@ -11,6 +11,7 @@ import {
+ import type { MCPConfig } from '@codebuff/common/types/mcp'
+ 
+ import { getSelectedFreebuffModel } from '../state/freebuff-model-store'
++import { pluginMcpServers } from './plugin-discovery'
+ import { getProjectRoot } from '../project-files'
+ import { IS_FREEBUFF, type AgentMode } from './constants'
+ import { getAgentIdForMode } from './freebuff-agent-selection'
+@@ -87,6 +88,12 @@ export async function initializeAgentRegistry(): Promise<void> {
+     logger.warn({ error }, 'Failed to load MCP config from .agents directories')
+     mcpServersCache = {}
+   }
++  // An agent plugin's MCP servers join the user's own mcp.json servers,
++  // plugin-last: a plugin server wins over a same-name server the user
++  // adds to their own mcp.json after install (install's conflict check
++  // only saw names at install time). Which side should win is an open
++  // product decision left to the maintainers.
++  Object.assign(mcpServersCache, pluginMcpServers())
+ }
+ 
+ /**
+diff --git a/cli/src/utils/plugin-discovery.ts b/cli/src/utils/plugin-discovery.ts
+new file mode 100644
+index 0000000000..2c44750497
+--- /dev/null
++++ b/cli/src/utils/plugin-discovery.ts
+@@ -0,0 +1,95 @@
++import { readdirSync } from 'node:fs'
++
++import type { Dirent } from 'node:fs'
++import path from 'node:path'
++
++import { loadSkillsSync } from '@codebuff/sdk'
++
++import { loadManifest } from '@codebuff/common/plugins/load-plugin-manifest'
++import { loadPluginSkills } from '@codebuff/common/plugins/skills'
++import { loadPluginMCP } from '@codebuff/common/plugins/mcp-config'
++
++import { getPluginsRoot } from './plugins-root'
++
++import type { MCPConfig } from '@codebuff/common/types/mcp'
++import type { SkillsMap } from '@codebuff/common/types/skill'
++
++/**
++ * Reads one skills directory into the SDK's skill shape.
++ */
++export type ReadSkillsDir = (skillsDir: string) => SkillsMap
++
++/** Test overrides; production runs the SDK reader over the real root. */
++export interface PluginSkillsOptions {
++  readSkillsDir?: ReadSkillsDir
++  pluginsRoot?: string
++}
++
++/**
++ * The plugin directories directly under the root, name order. A missing
++ * or unreadable root is no plugins (a fresh machine, not an error).
++ */
++function installedPluginRoots(pluginsRoot: string): string[] {
++  let entries: Dirent[]
++  try {
++    entries = readdirSync(pluginsRoot, { withFileTypes: true })
++  } catch {
++    return []
++  }
++  return entries
++    .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
++    .sort((a, b) => a.name.localeCompare(b.name))
++    .map((entry) => path.join(pluginsRoot, entry.name))
++}
++
++/**
++ * Skills from every installed plugin, for the registry to assign over its
++ * cache. The join is plugin-last: a plugin skill wins a same-name skill
++ * added to the user's roots after install — the precedence question
++ * recorded for the maintainers.
++ */
++export function pluginSkills(options: PluginSkillsOptions = {}): SkillsMap {
++  const readSkillsDir = options.readSkillsDir ?? sdkReadSkillsDir
++
++  const skills = installedPluginRoots(
++    options.pluginsRoot ?? getPluginsRoot(),
++  ).map((root) => {
++    if (!loadManifest(root).ok) return {}
++    const result = loadPluginSkills(root, readSkillsDir)
++    return result.ok ? result.skills : {}
++  })
++
++  return Object.assign({}, ...skills)
++}
++
++/**
++ * The production reader: the SDK's sync loader pointed at one directory.
++ */
++const sdkReadSkillsDir = (skillsPath: string): SkillsMap =>
++  loadSkillsSync({ skillsPath, verbose: false })
++
++/** Test override for the plugins root; production reads the real one. */
++export interface PluginMcpOptions {
++  pluginsRoot?: string
++}
++
++/**
++ * MCP servers from every installed plugin, for the registry to assign
++ * over its cache. The join is plugin-last: a plugin server wins a
++ * same-name server added to the user's own mcp.json after install (the
++ * same precedence question). The configs are freebuff shapes, so the
++ * session cannot tell a plugin server from one the user wrote.
++ */
++export function pluginMcpServers(
++  options: PluginMcpOptions = {},
++): Record<string, MCPConfig> {
++  const servers = installedPluginRoots(
++    options.pluginsRoot ?? getPluginsRoot(),
++  ).map((root) => {
++    if (!loadManifest(root).ok) return {}
++    const result = loadPluginMCP(root)
++    return result.ok ? result.servers : {}
++  })
++
++  return Object.assign({}, ...servers)
++}
+diff --git a/cli/src/utils/plugins-root.ts b/cli/src/utils/plugins-root.ts
+new file mode 100644
+index 0000000000..c09070750d
+--- /dev/null
++++ b/cli/src/utils/plugins-root.ts
+@@ -0,0 +1,23 @@
++import os from 'node:os'
++import path from 'node:path'
++
++/**
++ * The plugins root: `FREEBUFF_PLUGINS_ROOT` when set, else
++ * `~/.agents/plugins` — beside the `~/.agents/skills` and
++ * `~/.agents/mcp.json` roots the session already reads (§9.1's example
++ * layout). The override must be absolute so installs cannot land relative
++ * to whatever directory the CLI starts in; tests use it to stay out of the
++ * real home.
++ */
++export function getPluginsRoot(): string {
++  const configured = process.env.FREEBUFF_PLUGINS_ROOT
++  if (configured) {
++    if (!path.isAbsolute(configured)) {
++      throw new Error(
++        'FREEBUFF_PLUGINS_ROOT must be an absolute path so plugin installs cannot land relative to the current project.',
++      )
++    }
++    return configured
++  }
++  return path.join(os.homedir(), '.agents', 'plugins')
++}
+diff --git a/cli/src/utils/skill-registry.ts b/cli/src/utils/skill-registry.ts
+index 79942f4e99..e33a83f90c 100644
+--- a/cli/src/utils/skill-registry.ts
++++ b/cli/src/utils/skill-registry.ts
+@@ -1,6 +1,7 @@
+ import { loadSkills as sdkLoadSkills } from '@codebuff/sdk'
+ 
+ import { getProjectRoot } from '../project-files'
++import { pluginSkills } from './plugin-discovery'
+ import { logger } from './logger'
+ 
+ import type { SkillDefinition, SkillsMap } from '@codebuff/common/types/skill'
+@@ -14,10 +15,12 @@ let skillsCache: SkillsMap = {}
+ /**
+  * Initialize the skill registry by loading skills via the SDK.
+  * This must be called at CLI startup.
+- * 
++ *
+  * Skills are loaded from:
+  * - ~/.agents/skills/ (global)
+  * - {projectRoot}/.agents/skills/ (project, overrides global)
++ * - {pluginsRoot}/<plugin>/skills/ for every installed plugin (see
++ *   ./plugin-discovery, which owns the plugin half of this merge)
+  */
+ export async function initializeSkillRegistry(): Promise<void> {
+   const cwd = getProjectRoot() || process.cwd()
+@@ -39,6 +42,7 @@ export async function initializeSkillRegistry(): Promise<void> {
+     logger.warn({ error }, 'Failed to load skills')
+     skillsCache = {}
+   }
++  Object.assign(skillsCache, pluginSkills())
+ }
+ 
+ // ============================================================================
+@@ -82,7 +86,10 @@ export function getLoadedSkillsMessage(): string | null {
+ 
+   const header = `Loaded ${skills.length} skill${skills.length === 1 ? '' : 's'}`
+   const skillList = skills
+-    .map((skill) => `  - ${skill.name}: ${skill.description.slice(0, 60)}${skill.description.length > 60 ? '...' : ''}`)
++    .map(
++      (skill) =>
++        `  - ${skill.name}: ${skill.description.slice(0, 60)}${skill.description.length > 60 ? '...' : ''}`,
++    )
+     .join('\n')
+ 
+   return `${header}\n${skillList}`
+diff --git a/common/src/mcp/__tests__/mapping-contract-server.ts b/common/src/mcp/__tests__/mapping-contract-server.ts
+new file mode 100644
+index 0000000000..9fbff91371
+--- /dev/null
++++ b/common/src/mcp/__tests__/mapping-contract-server.ts
+@@ -0,0 +1,18 @@
++
++import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
++import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
++
++const server = new McpServer({ name: 'mapping-contract-server', version: '1.0.0' })
++
++server.registerTool('get_text_resource', { inputSchema: {} }, async () => ({
++  content: [{
++    type: 'resource',
++    resource: {
++      uri: 'file:///notes.txt',
++      mimeType: 'text/plain',
++      text: 'Resource 1: This is a plain text resource.',
++    },
++  }],
++}))
++
++await server.connect(new StdioServerTransport())
+diff --git a/common/src/plugins/__tests__/containment.test.ts b/common/src/plugins/__tests__/containment.test.ts
+new file mode 100644
+index 0000000000..b84bd4c7a6
+--- /dev/null
++++ b/common/src/plugins/__tests__/containment.test.ts
+@@ -0,0 +1,46 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { loadManifest } from '../load-plugin-manifest'
++
++import {
++  expectManifestOk,
++  expectManifestRejected,
++  makeEscapingManifestRoot,
++  makeReparsePointRoot,
++  MINIMAL_NAME,
++} from './fixtures/manifest'
++import { cleanUpPluginFixtures } from './fixtures/temp-roots'
++
++afterEach(cleanUpPluginFixtures)
++
++describe('containment (spec §4.1.1)', () => {
++  /**
++   * Given a plugin root whose plugin.json is a reparse point resolving to a
++   * valid manifest outside the root, when loaded, the plugin is rejected
++   * before that manifest is read — §4.1.1 rejects the plugin itself when its
++   * manifest escapes, and resolving the paths must not fall back on how the
++   * root happens to be spelled.
++   */
++  test('a plugin.json resolving outside the root is rejected', () => {
++    const root = makeEscapingManifestRoot()
++
++    const result = loadManifest(root)
++
++    expectManifestRejected(result, 'outside the plugin root')
++  })
++
++  /**
++   * Given a plugin root reached through a reparse point with its manifest
++   * inside the resolved root, when loaded, the plugin loads — §4.1.1 permits
++   * reparse points that resolve within the root, so the root is resolved
++   * before the comparison rather than refused for being one.
++   */
++  test('a root reached through a reparse point still loads', () => {
++    const root = makeReparsePointRoot()
++
++    const result = loadManifest(root)
++
++    const { manifest } = expectManifestOk(result)
++    expect(manifest.name).toBe(MINIMAL_NAME)
++  })
++})
+diff --git a/common/src/plugins/__tests__/extensions.test.ts b/common/src/plugins/__tests__/extensions.test.ts
+new file mode 100644
+index 0000000000..f17fc35414
+--- /dev/null
++++ b/common/src/plugins/__tests__/extensions.test.ts
+@@ -0,0 +1,61 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { loadManifest } from '../load-plugin-manifest'
++
++import {
++  expectManifestOk,
++  expectReportAbout,
++  makeManifestRoot,
++} from './fixtures/manifest'
++import { cleanUpPluginFixtures } from './fixtures/temp-roots'
++
++afterEach(cleanUpPluginFixtures)
++
++describe('extensions field (spec §8.1)', () => {
++  /**
++   * Given a manifest without extensions, when loaded, the manifest
++   * carries no extensions value and no report is emitted (§8.1: the
++   * field is optional).
++   */
++  test('absent extensions loads with no value and no reports', () => {
++    const root = makeManifestRoot()
++
++    const result = loadManifest(root)
++
++    const { manifest, reports } = expectManifestOk(result)
++    expect(manifest.extensions).toBeUndefined()
++    expect(reports).toHaveLength(0)
++  })
++
++  /**
++   * Given a manifest whose extensions is an object of namespace entries
++   * (the §8.1 example), when loaded, the object reaches the manifest
++   * unchanged and no report is emitted about its contents (§8.1).
++   */
++  test('extensions object is carried onto the manifest unchanged, with no reports', () => {
++    const extensions = { 'com.example.client': { setting: true } }
++    const root = makeManifestRoot({ extensions })
++
++    const result = loadManifest(root)
++
++    const { manifest, reports } = expectManifestOk(result)
++    expect(manifest.extensions).toEqual(extensions)
++    expect(reports).toHaveLength(0)
++  })
++
++  /**
++   * Given a manifest whose extensions is a string, when loaded, the
++   * plugin still loads (§8.1: MUST continue), a report names extensions,
++   * and the manifest carries no extensions value.
++   */
++  test('non-object extensions is reported and ignored', () => {
++    const root = makeManifestRoot({ extensions: 'nope' })
++
++    const result = loadManifest(root)
++
++    const { manifest, reports } = expectManifestOk(result)
++    expect(manifest.extensions).toBeUndefined()
++    expect(reports).toHaveLength(1)
++    expectReportAbout(reports, '§8.1', 'extensions')
++  })
++})
+diff --git a/common/src/plugins/__tests__/fixtures/load-plugin.ts b/common/src/plugins/__tests__/fixtures/load-plugin.ts
+new file mode 100644
+index 0000000000..a4c95fe631
+--- /dev/null
++++ b/common/src/plugins/__tests__/fixtures/load-plugin.ts
+@@ -0,0 +1,38 @@
++import { expect } from 'bun:test'
++
++import type { LoadPluginResult } from '../../load-plugin'
++
++/**
++ * The composition fixtures: the result pair for the plugin-level load. The
++ * component-level pairs live beside their own components (`manifest.ts`,
++ * `skills.ts`, `mcp.ts`); this one sits above them, as the composition does.
++ */
++
++/**
++ * Asserts the load succeeded, failing with the composer's reason otherwise,
++ * and returns the result so tests assert on the plugin and its reports,
++ * never on the result's shape.
++ *
++ * Rejection rows use expectPluginRejected rather than negating this one: a
++ * rejection is not the boolean complement of success — "not ok" also covers
++ * a crash — and the rejection helper additionally asserts the reason names
++ * the cause under test.
++ */
++export function expectPluginOk(result: LoadPluginResult) {
++  expect(result.ok).toBe(true)
++  if (!result.ok) throw new Error(`expected ok, got: ${result.reason}`)
++  return result
++}
++
++/**
++ * Asserts the load failed and that the composer's reason names the cause
++ * given by `blame`, so a failure for the wrong cause still fails the test.
++ * Returns the rejection, so a row that also asserts on the reports it
++ * carries does not need its own narrowing branch.
++ */
++export function expectPluginRejected(result: LoadPluginResult, blame: string) {
++  expect(result.ok).toBe(false)
++  if (result.ok) throw new Error(`expected rejection blaming ${blame}, got ok`)
++  expect(result.reason).toContain(blame)
++  return result
++}
+diff --git a/common/src/plugins/__tests__/fixtures/manifest.ts b/common/src/plugins/__tests__/fixtures/manifest.ts
+new file mode 100644
+index 0000000000..6a618f2298
+--- /dev/null
++++ b/common/src/plugins/__tests__/fixtures/manifest.ts
+@@ -0,0 +1,212 @@
++import path from 'node:path'
++
++import { writeFileSync } from 'node:fs'
++
++import { expect } from 'bun:test'
++
++import { linkJunction, makeOutsideDir, makeTempDir } from './temp-roots'
++
++import type { LoadManifestResult } from '../../load-plugin-manifest'
++import type { PluginReport } from '../../report'
++
++/**
++ * The manifest-component fixtures: §5 constants, manifest-root builders
++ * (including the §4.1.1 escape arrangements), and the load-result assertion
++ * helpers. Skill fixtures live in `skills.ts`, the shared machinery in
++ * `temp-roots.ts`.
++ */
++
++/** The $schema id every valid 1.0.0 manifest must carry (spec §5.2). */
++export const CANONICAL_SCHEMA =
++  'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json'
++
++/** A canonical-looking schema id for a spec version this client cannot load. */
++export const UNSUPPORTED_SCHEMA =
++  'https://agent-plugins.org/schemas/2.0.0/plugin.schema.json'
++
++/** The §5.5 name of the §5.2 minimal-manifest example, used across the tests. */
++export const MINIMAL_NAME = 'minimal-plugin'
++
++/** Longest allowed plugin name — 64 is the inclusive upper edge (spec §5.5). */
++export const MAX_NAME_LENGTH = 64
++
++/**
++ * §5.4 metadata that is correct in JSON type but invalid by content — freebuff
++ * carries it without judging Semantic Versioning, URLs, or SPDX identifiers.
++ */
++export const CONTENT_INVALID_METADATA = {
++  version: 'banana',
++  description: 'A plugin that does nothing yet',
++  homepage: 'not a url',
++  repository: 'also not a url',
++  license: 'nope',
++}
++
++/** The §5.4 author object, carrying every field §5.4 permits. */
++export const AUTHOR = {
++  name: 'Google LLC',
++  email: 'author@example.com',
++  url: 'https://cloud.google.com',
++}
++
++/** The same author plus a field §5.4 does not permit. */
++export const AUTHOR_WITH_FOREIGN_FIELD = {
++  name: 'Google LLC',
++  twitter: '@google',
++}
++
++/** The same author with a name whose JSON type is wrong, not its content. */
++export const AUTHOR_WITH_NON_STRING_NAME = { name: 42 }
++
++/** An author of the wrong JSON type — §5.4 declares an object. */
++export const NON_OBJECT_AUTHOR = 'Google LLC'
++
++/** A §5.4 keywords list as the spec declares it. */
++export const KEYWORDS = ['google-cloud', 'gcloud']
++
++/** The same keywords list with one element that is not a string. */
++export const KEYWORDS_WITH_NON_STRING_ENTRY = ['google-cloud', 7]
++
++/** Manifest text that is not JSON at all (§5.2: the manifest MUST be JSON). */
++export const NON_JSON_TEXT = 'this is not JSON'
++
++/**
++ * Manifest text that parses as JSON but whose top level is an array — the
++ * non-object a `typeof` check alone would wave through (§5.2 requires an
++ * object).
++ */
++export const TOP_LEVEL_ARRAY_JSON = '[]'
++
++/**
++ * Manifest text whose top level is a string primitive — rejected by the type
++ * clause of the object rule (§5.2 requires an object).
++ */
++export const TOP_LEVEL_STRING_JSON = '"just a string"'
++
++/**
++ * Manifest text whose top level is null — JSON-valid, and the case `typeof`
++ * alone reports as an object, so this row also pins that reading it cannot
++ * crash.
++ */
++export const TOP_LEVEL_NULL_JSON = 'null'
++
++/** A plugin root whose plugin.json holds exactly the given manifest text. */
++export function makePluginRoot(manifestJson: string): string {
++  const root = makeTempDir('freebuff-plugin-')
++  writeFileSync(path.join(root, 'plugin.json'), manifestJson, 'utf8')
++  return root
++}
++
++/** A plugin root that carries no plugin.json at all (§5.1). */
++export function makeRootWithoutManifest(): string {
++  return makeTempDir('freebuff-plugin-')
++}
++
++/**
++ * A plugin root whose manifest carries the required fields plus the given
++ * extras, so a test body states only the field it is about.
++ */
++export function makeManifestRoot(
++  extraFields: Record<string, unknown> = {},
++): string {
++  return makePluginRoot(minimalManifestJson(extraFields))
++}
++
++/**
++ * A plugin root whose `plugin.json` is a reparse point resolving to a valid
++ * manifest outside the root — §4.1.1 rejects the plugin itself when its
++ * manifest escapes.
++ */
++export function makeEscapingManifestRoot(): string {
++  const root = makeTempDir('freebuff-plugin-')
++  const outside = makeOutsideDir(root)
++  writeFileSync(
++    path.join(outside, 'plugin.json'),
++    minimalManifestJson(),
++    'utf8',
++  )
++  // The junction sits at plugin.json and resolves to the outside directory:
++  // a junction pointing at a FILE is created but then dangles (every stat on
++  // it throws ENOENT), so the manifest would be unreadable rather than
++  // escaping — the fixture must make containment, not readability, fail.
++  linkJunction(path.join(root, 'plugin.json'), outside)
++  return root
++}
++
++/**
++ * A plugin root reached through a reparse point, with its manifest inside the
++ * resolved root — the arrangement §4.1.1 permits, and the one a check that
++ * resolved only the manifest would reject. That is the everyday case on a
++ * platform whose temp directory is itself a symlink.
++ */
++export function makeReparsePointRoot(): string {
++  const target = makePluginRoot(minimalManifestJson())
++  const root = path.join(makeTempDir('freebuff-plugin-link-'), 'root')
++  linkJunction(root, target)
++  return root
++}
++
++/** The §5.2 minimal manifest as JSON text, with the given fields added. */
++function minimalManifestJson(
++  extraFields: Record<string, unknown> = {},
++): string {
++  return JSON.stringify({
++    $schema: CANONICAL_SCHEMA,
++    name: MINIMAL_NAME,
++    ...extraFields,
++  })
++}
++
++/**
++ * Asserts the load succeeded, failing with the loader's reason otherwise,
++ * and returns the manifest so tests assert on plugin values, never on the
++ * result's shape.
++ *
++ * Rejection rows use expectManifestRejected rather than negating this one:
++ * a rejection is not the boolean complement of success — "not ok" also
++ * covers a crash, which the loader never does — and the rejection helper
++ * additionally asserts the reason blames the field under test.
++ */
++export function expectManifestOk(result: LoadManifestResult) {
++  expect(result.ok).toBe(true)
++  if (!result.ok) throw new Error(`expected ok, got: ${result.reason}`)
++  return result
++}
++
++/**
++ * Asserts the plugin does not exist (the fatal branch) and that the loader's
++ * reason names the cause given by `blame` — a field for field rules, the
++ * refused shape or manifest text for the §5.2 structural rules — so a
++ * rejection for the wrong cause still fails the test. Returns the rejection,
++ * so a row that also asserts on the reports it carries does not need its own
++ * narrowing branch.
++ */
++export function expectManifestRejected(
++  result: LoadManifestResult,
++  blame: string,
++): Extract<LoadManifestResult, { ok: false }> {
++  expect(result.ok).toBe(false)
++  if (result.ok) throw new Error(`expected rejection blaming ${blame}, got ok`)
++  expect(result.reason).toContain(blame)
++  return result
++}
++
++/**
++ * Asserts one report about `field` under `section` exists and returns it,
++ * so a row claims the report's presence and adds field-specific claims
++ * without reaching into report indices the spec never ordered.
++ */
++export function expectReportAbout(
++  reports: PluginReport[],
++  section: string,
++  field: string,
++): PluginReport {
++  const report = reports.find(
++    (candidate) =>
++      candidate.section === section && candidate.message.includes(field),
++  )
++  expect(report).toBeDefined()
++  if (!report)
++    throw new Error(`expected a ${section} report naming ${field}, got none`)
++  return report
++}
+diff --git a/common/src/plugins/__tests__/fixtures/mcp.ts b/common/src/plugins/__tests__/fixtures/mcp.ts
+new file mode 100644
+index 0000000000..6e443c104b
+--- /dev/null
++++ b/common/src/plugins/__tests__/fixtures/mcp.ts
+@@ -0,0 +1,179 @@
++import path from 'node:path'
++
++import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
++
++import { expect } from 'bun:test'
++
++import { linkJunction, makeOutsideDir } from './temp-roots'
++import { makeManifestRoot } from './manifest'
++
++import type { PluginReport } from '../../report'
++import type { LoadMCPResult } from '../../mcp-config'
++import type { MCPConfig } from '../../../types/mcp'
++
++/**
++ * The MCP-component fixtures. The plugin spec ships no reference
++ * implementation to test against, so the file text below is taken from a
++ * real plugin published in the wild — google/skills' google-cloud-developer
++ * plugin v1.1.2 (https://github.com/google/skills/tree/main/plugins/cloud/google-cloud-developer)
++ * — used only to the extent it agrees with spec §7.2. Its deviations are
++ * the point of some rows: the decoys are files Google ships for *other*
++ * clients' benefit, and the spec is silent on them, so the tests pin what
++ * §7.2 requires of our client when it meets them.
++ *
++ * Root builders, the load-result assertion helpers, and the shared temp
++ * machinery (in `temp-roots.ts`) live here too.
++ */
++
++/**
++ * The real bundle's mcp.json text (google-cloud-developer v1.1.2), which
++ * agrees with §7.2/§7.2.1 and is therefore usable as conforming input.
++ */
++export const REAL_BUNDLE_MCP_JSON = `{
++  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
++  "mcpServers": {
++    "developer-knowledge": {
++      "type": "streamable-http",
++      "url": "https://developerknowledge.googleapis.com/mcp"
++    }
++  }
++}`
++
++/**
++ * mcp_config.json, from the same real bundle: the Gemini CLI extension
++ * shape (`serverUrl` + `authProviderType`) living beside mcp.json. The spec
++ * says nothing about it — Google ships it for another client — and §7.2 is
++ * exactly the rule that decides the question: only mcp.json is the MCP
++ * configuration path, alternative core paths MUST NOT be loaded.
++ */
++export const REAL_BUNDLE_MCP_CONFIG_JSON = `{
++  "mcpServers": {
++    "developer-knowledge": {
++      "serverUrl": "https://developerknowledge.googleapis.com/mcp",
++      "authProviderType": "google_credentials"
++    }
++  }
++}`
++
++/** An mcp.json whose JSON is not valid at all. */
++export const INVALID_JSON_TEXT = '{ "mcpServers": '
++
++/**
++ * An mcp.json whose server entries are one freebuff-refused entry (url of
++ * the wrong JSON type) and one valid stdio sibling — the §7.2.2 rule 3
++ * skip-and-report arrangement.
++ */
++export const MIXED_ENTRIES_JSON = `{
++  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
++  "mcpServers": {
++    "broken": { "type": "streamable-http", "url": 42 },
++    "working": { "type": "stdio", "command": "./bin/server" }
++  }
++}`
++
++/**
++ * An mcp.json with two conforming entries — the real bundle's remote one
++ * plus a stdio sibling — so a row can assert both arrive: the §7.2 file is
++ * a server-per-entry map, and a plugin carrying several MCP servers is
++ * supported.
++ */
++export const TWO_SERVERS_JSON = `{
++  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
++  "mcpServers": {
++    "developer-knowledge": {
++      "type": "streamable-http",
++      "url": "https://developerknowledge.googleapis.com/mcp"
++    },
++    "lint-runner": {
++      "type": "stdio",
++      "command": "./bin/lint-runner"
++    }
++  }
++}`
++
++/** An mcp.json targeting a spec version this client cannot load. */
++export const UNSUPPORTED_SCHEMA_MCP_JSON = REAL_BUNDLE_MCP_JSON.replace(
++  '/1.0.0/mcp.schema.json',
++  '/2.0.0/mcp.schema.json',
++)
++
++/**
++ * The freebuff config the adapter must produce for the real bundle's
++ * `developer-knowledge` entry — `streamable-http` mapped to `http` and the
++ * freebuff schema's own defaults filled, matching what the user's own
++ * `~/.agents/mcp.json` parses into.
++ */
++export const EXPECTED_DEVELOPER_KNOWLEDGE_CONFIG: MCPConfig = {
++  type: 'http',
++  url: 'https://developerknowledge.googleapis.com/mcp',
++  headers: {},
++  params: {},
++}
++
++/**
++ * The freebuff config the adapter must produce for `lint-runner` — the
++ * stdio variant of `TWO_SERVERS_JSON`, with the schema's own defaults
++ * filled (`args: []`, `env: {}`).
++ */
++export const EXPECTED_LINT_RUNNER_CONFIG: MCPConfig = {
++  type: 'stdio',
++  command: './bin/lint-runner',
++  args: [],
++  env: {},
++}
++
++/**
++ * A plugin root whose mcp.json holds exactly the given text, with decoy
++ * files present — the arrangement of the real bundle, so a test can show
++ * neither decoy is read.
++ */
++export function makeMCPRoot(mcpJsonText = REAL_BUNDLE_MCP_JSON): string {
++  const root = makeManifestRoot()
++  writeFileSync(path.join(root, 'mcp.json'), mcpJsonText, 'utf8')
++  return root
++}
++
++/** A plugin root whose mcp.json is a directory, not a regular file. */
++export function makeRootWithMCPDir(): string {
++  const root = makeManifestRoot()
++  mkdirSync(path.join(root, 'mcp.json'))
++  return root
++}
++
++/**
++ * A plugin root whose mcp.json is a reparse point resolving outside the
++ * plugin root — §4.1.1's boundary for the MCP component location.
++ */
++export function makeEscapingMCPRoot(): string {
++  const root = makeMCPRoot()
++  const outside = makeOutsideDir(root)
++  writeFileSync(path.join(outside, 'mcp.json'), REAL_BUNDLE_MCP_JSON, 'utf8')
++  rmSync(path.join(root, 'mcp.json'))
++  linkJunction(path.join(root, 'mcp.json'), outside)
++  return root
++}
++
++/**
++ * Asserts the MCP load succeeded and returns the server map, so
++ * tests assert on configs, never on the result's shape.
++ */
++export function expectMCPOk(result: LoadMCPResult) {
++  expect(result.ok).toBe(true)
++  if (!result.ok) throw new Error(`expected ok, got: ${result.reason}`)
++  return result.servers
++}
++
++/**
++ * Asserts the MCP component was invalidated (not the plugin) and returns
++ * the reports, so a row that also asserts on them does not need its own
++ * narrowing branch. `blame` must name the § or cause the refusal cites.
++ */
++export function expectMCPInvalid(
++  result: LoadMCPResult,
++  blame: string,
++): PluginReport[] {
++  expect(result.ok).toBe(false)
++  if (result.ok) throw new Error(`expected component invalid, got ok`)
++  expect(result.reason).toContain(blame)
++  return result.reports
++}
+diff --git a/common/src/plugins/__tests__/fixtures/skills.ts b/common/src/plugins/__tests__/fixtures/skills.ts
+new file mode 100644
+index 0000000000..ad8ddf5c8f
+--- /dev/null
++++ b/common/src/plugins/__tests__/fixtures/skills.ts
+@@ -0,0 +1,136 @@
++import path from 'node:path'
++
++import { mkdirSync, writeFileSync } from 'node:fs'
++
++import { expect } from 'bun:test'
++
++import { SKILL_FILE_NAME, SKILLS_DIR_NAME } from '../../../constants/skills'
++
++import { makeManifestRoot } from './manifest'
++import { linkJunction, makeOutsideDir } from './temp-roots'
++
++import type { LoadSkillsResult } from '../../skills'
++import type { PluginReport } from '../../report'
++
++/**
++ * The skills-component fixtures: skill-directory builders and the
++ * §4.1.1 escape arrangements specific to the skills walk. The shared
++ * machinery lives in `temp-roots.ts`, the manifest fixtures in
++ * `manifest.ts`, and the layering follows the production graph
++ * (core ← manifest ← skills).
++ */
++
++/** A skill directory name the reader accepts. */
++export const SKILL_NAME = 'gcloud'
++
++/** A second skill directory name, so sibling rows can be asserted. */
++export const OTHER_SKILL_NAME = 'finding-google-skills'
++
++/**
++ * A plugin root with a valid manifest and no `skills/` directory — the
++ * absence §6.2 forbids treating as an error (a plugin may ship no skills).
++ */
++export function makeRootWithoutSkills(): string {
++  return makeManifestRoot()
++}
++
++/**
++ * A plugin root whose `skills/` holds one valid skill — a directory
++ * named for the skill, containing a SKILL.md whose frontmatter name matches
++ * the directory.
++ */
++export function makeRootWithSkill(skillName = SKILL_NAME): string {
++  const root = makeManifestRoot()
++  writeSkillDir(root, skillName)
++  return root
++}
++
++/**
++ * A plugin root whose `skills/` itself is a reparse point resolving to a
++ * skills directory outside the plugin root — §4.1.1's second boundary, where
++ * the fixed component location escapes.
++ */
++export function makeEscapingSkillsRoot(): string {
++  const root = makeManifestRoot()
++  const outside = makeOutsideDir(root)
++  writeSkillDir(outside, SKILL_NAME)
++  linkJunction(
++    path.join(root, SKILLS_DIR_NAME),
++    path.join(outside, SKILLS_DIR_NAME),
++  )
++  return root
++}
++
++/**
++ * A plugin root where one skill resolves outside the plugin root — §4.1.1's
++ * third boundary. Windows junctions cannot point at a file (probed: the
++ * junction is created but every stat/read on it then throws ENOENT), so the
++ * skill *directory* is the reparse point and the SKILL.md inside its target
++ * is a real file — which is what makes the escape dangerous: the reader
++ * would load that skill from outside the root without this walk. A sibling
++ * valid skill is present, so a test can show the escape costs one skill,
++ * not the component.
++ */
++export function makeEscapingSkillRoot(): string {
++  const root = makeManifestRoot()
++  writeSkillDir(root, SKILL_NAME)
++  const outside = makeOutsideDir(root)
++  writeSkillDir(outside, OTHER_SKILL_NAME)
++  linkJunction(
++    path.join(root, SKILLS_DIR_NAME, OTHER_SKILL_NAME),
++    path.join(outside, SKILLS_DIR_NAME, OTHER_SKILL_NAME),
++  )
++  return root
++}
++
++/** The SKILL.md text for a skill named `skillName` that the reader accepts. */
++function skillFileContent(skillName: string): string {
++  return [
++    '---',
++    `name: ${skillName}`,
++    'description: A skill fixture for the plugin loader tests.',
++    '---',
++    '',
++    'Body of the fixture skill.',
++  ].join('\n')
++}
++
++/**
++ * Writes one skill directory under `<root>/skills` — the directory named for
++ * the skill, holding a SKILL.md whose frontmatter name matches it.
++ */
++function writeSkillDir(root: string, skillName: string): void {
++  const skillDir = path.join(root, SKILLS_DIR_NAME, skillName)
++  mkdirSync(skillDir, { recursive: true })
++  writeFileSync(
++    path.join(skillDir, SKILL_FILE_NAME),
++    skillFileContent(skillName),
++    'utf8',
++  )
++}
++
++/**
++ * Asserts the skills load succeeded and returns the skill map, so tests
++ * assert on skill values, never on the result's shape.
++ */
++export function expectSkillsOk(result: LoadSkillsResult) {
++  expect(result.ok).toBe(true)
++  if (!result.ok) throw new Error(`expected ok, got: ${result.reason}`)
++  return result.skills
++}
++
++/**
++ * Asserts the skills component type was invalidated and returns the reports,
++ * so a row that also asserts on them does not need its own narrowing branch.
++ * `blame` must name the § the invalidation cites, so an invalidation for the
++ * wrong cause still fails the test.
++ */
++export function expectSkillsComponentInvalid(
++  result: LoadSkillsResult,
++  blame: string,
++): PluginReport[] {
++  expect(result.ok).toBe(false)
++  if (result.ok) throw new Error(`expected component invalid, got ok`)
++  expect(result.reason).toContain(blame)
++  return result.reports
++}
+diff --git a/common/src/plugins/__tests__/fixtures/temp-roots.ts b/common/src/plugins/__tests__/fixtures/temp-roots.ts
+new file mode 100644
+index 0000000000..76d5fd2094
+--- /dev/null
++++ b/common/src/plugins/__tests__/fixtures/temp-roots.ts
+@@ -0,0 +1,66 @@
++import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import path from 'node:path'
++
++import { spyOn } from 'bun:test'
++
++/**
++ * The fixture machinery every plugin-component test shares: temp-root
++ * registration and cleanup, the network watcher, and the reparse-point
++ * primitives the §4.1.1 escape fixtures compose. Component fixtures live
++ * beside their tests (`manifest.ts`, `skills.ts`) and import from here.
++ */
++
++/** Temp directories created by the running test, removed when it finishes. */
++const tempDirs: string[] = []
++
++/** Spies created by the running test, restored when it finishes. */
++const testSpies: ReturnType<typeof spyOn>[] = []
++
++/**
++ * Discards everything the running test created — spies first, then the temp
++ * directories — so no fixture state crosses into the next test and nothing
++ * survives the run. Tests register it once with `afterEach`.
++ */
++export function cleanUpPluginFixtures(): void {
++  for (const spy of testSpies.splice(0)) spy.mockRestore()
++  for (const dir of tempDirs.splice(0))
++    rmSync(dir, { recursive: true, force: true })
++}
++
++/**
++ * Watches the network for the running test and returns the watcher, so a load
++ * that retrieves the schema it names fails an assertion on that spy (spec §5.2
++ * MUST NOT retrieve a schema while loading a plugin).
++ */
++export function watchNetworkAccess(): ReturnType<typeof spyOn> {
++  const spy = spyOn(globalThis, 'fetch')
++  testSpies.push(spy)
++  return spy
++}
++
++/** A registered temp directory the running test may fill. */
++export function makeTempDir(prefix: string): string {
++  const dir = mkdtempSync(path.join(tmpdir(), prefix))
++  tempDirs.push(dir)
++  return dir
++}
++
++/**
++ * The sibling directory a §4.1.1 escape fixture builds its target contents
++ * in, registered for cleanup. Named as a lexical extension of the plugin
++ * root on purpose: a comparison that stopped at a path prefix would admit
++ * it, so the escape fixtures test filesystem-resolved containment, not
++ * spelling (§4.1.1).
++ */
++export function makeOutsideDir(root: string): string {
++  const outside = `${root}-outside`
++  tempDirs.push(outside)
++  mkdirSync(outside, { recursive: true })
++  return outside
++}
++
++/** A junction at `linkPath` resolving to `targetPath` — no privilege needed. */
++export function linkJunction(linkPath: string, targetPath: string): void {
++  symlinkSync(targetPath, linkPath, 'junction')
++}
+diff --git a/common/src/plugins/__tests__/install-url.test.ts b/common/src/plugins/__tests__/install-url.test.ts
+new file mode 100644
+index 0000000000..73d1ecfea6
+--- /dev/null
++++ b/common/src/plugins/__tests__/install-url.test.ts
+@@ -0,0 +1,80 @@
++import { describe, expect, test } from 'bun:test'
++
++import { parsePluginSourceUrl } from '../install-url'
++
++import type { ParsePluginSourceResult } from '../install-url'
++
++/**
++ * Asserts the parse succeeded, failing with the parser's reason otherwise,
++ * and returns the source so tests assert on the coordinates, never on the
++ * result's shape.
++ */
++function expectSourceOk(result: ParsePluginSourceResult) {
++  expect(result.ok).toBe(true)
++  if (!result.ok) throw new Error(`expected ok, got: ${result.reason}`)
++  return result.source
++}
++
++describe('plugin install URL parse', () => {
++  /**
++   * Given a GitHub URL in one of the accepted forms, when parsed, it
++   * yields the repo coordinates the tarball fetch needs: owner, repo,
++   * ref (default HEAD), and the plugin's subpath inside the repo.
++   */
++  test.each([
++    {
++      form: 'repo root',
++      url: 'https://github.com/google/skills',
++      want: { owner: 'google', repo: 'skills', ref: 'HEAD', subpath: null },
++    },
++    {
++      form: 'trailing .git',
++      url: 'https://github.com/google/skills.git',
++      want: { owner: 'google', repo: 'skills', ref: 'HEAD', subpath: null },
++    },
++    {
++      form: 'tree ref with subpath',
++      url: 'https://github.com/google/skills/tree/main/plugins/cloud/google-cloud-developer',
++      want: {
++        owner: 'google',
++        repo: 'skills',
++        ref: 'main',
++        subpath: 'plugins/cloud/google-cloud-developer',
++      },
++    },
++    {
++      form: 'tree ref without subpath',
++      url: 'https://github.com/google/skills/tree/v1.1.2',
++      want: { owner: 'google', repo: 'skills', ref: 'v1.1.2', subpath: null },
++    },
++    {
++      form: 'plain subpath',
++      url: 'https://github.com/google/skills/plugins/cloud/google-cloud-developer',
++      want: {
++        owner: 'google',
++        repo: 'skills',
++        ref: 'HEAD',
++        subpath: 'plugins/cloud/google-cloud-developer',
++      },
++    },
++  ])('$form → $want.repo @ $want.ref', ({ url, want }) => {
++    const source = expectSourceOk(parsePluginSourceUrl(url))
++
++    expect(source).toEqual(want)
++  })
++
++  /**
++   * Given a URL that is not an https GitHub remote — another host, or an
++   * ssh form — when parsed, it is rejected with the reason naming what is
++   * unsupported, before any network work happens.
++   */
++  test.each([
++    { case: 'another host', url: 'https://gitlab.com/google/skills' },
++    { case: 'ssh remote', url: 'git@github.com:google/skills.git' },
++    { case: 'no repo', url: 'https://github.com/google' },
++  ])('$case → rejected', ({ url }) => {
++    const result = parsePluginSourceUrl(url)
++
++    expect(result.ok).toBe(false)
++  })
++})
+diff --git a/common/src/plugins/__tests__/load-plugin-manifest.test.ts b/common/src/plugins/__tests__/load-plugin-manifest.test.ts
+new file mode 100644
+index 0000000000..b2aa07836d
+--- /dev/null
++++ b/common/src/plugins/__tests__/load-plugin-manifest.test.ts
+@@ -0,0 +1,118 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { loadManifest } from '../load-plugin-manifest'
++
++import {
++  CANONICAL_SCHEMA,
++  expectManifestOk,
++  expectManifestRejected,
++  makePluginRoot,
++  makeRootWithoutManifest,
++  MINIMAL_NAME,
++  NON_JSON_TEXT,
++} from './fixtures/manifest'
++import { cleanUpPluginFixtures } from './fixtures/temp-roots'
++
++afterEach(cleanUpPluginFixtures)
++
++describe('loadManifest', () => {
++  /**
++   * Given the manifest of the spec's own §5.2 example, when loaded, the
++   * plugin loads carrying that name and no report is emitted.
++   */
++  test('minimal valid manifest (spec 1.0.0 §5.2 example) → ok with no reports', () => {
++    const root = makePluginRoot(
++      JSON.stringify({ $schema: CANONICAL_SCHEMA, name: MINIMAL_NAME }),
++    )
++
++    const result = loadManifest(root)
++
++    const { manifest, reports } = expectManifestOk(result)
++    expect(manifest.name).toBe(MINIMAL_NAME)
++    expect(reports).toHaveLength(0)
++  })
++
++  /**
++   * Given a plugin.json that is not valid JSON, when loaded, the plugin is
++   * rejected with a reason saying the manifest is not valid JSON (§5.2: the
++   * manifest MUST be JSON).
++   */
++  test('a plugin.json that is not valid JSON is rejected', () => {
++    const root = makePluginRoot(NON_JSON_TEXT)
++
++    const result = loadManifest(root)
++
++    expectManifestRejected(result, 'not valid JSON')
++  })
++
++  /**
++   * Given a plugin root with no plugin.json, when loaded, the plugin is
++   * rejected with a reason naming the missing manifest (§5.1: clients MUST
++   * check for a manifest at plugin.json) and no report, since a report
++   * describes a manifest that was read. A path that is present but resolves
++   * nowhere — a dangling reparse point — yields no readable manifest either
++   * and reaches the same refusal.
++   */
++  test('a root without plugin.json is rejected, naming the missing manifest', () => {
++    const root = makeRootWithoutManifest()
++
++    const result = loadManifest(root)
++
++    const rejection = expectManifestRejected(result, 'no plugin.json')
++    expect(rejection.reports).toHaveLength(0)
++  })
++
++  describe('required fields (spec §5.3)', () => {
++    /**
++     * Given a manifest without $schema, when loaded, the plugin is rejected
++     * with the reason naming $schema.
++     */
++    test('a manifest without $schema is rejected, naming $schema', () => {
++      const root = makePluginRoot(JSON.stringify({ name: MINIMAL_NAME }))
++
++      const result = loadManifest(root)
++
++      expectManifestRejected(result, '$schema')
++    })
++
++    /**
++     * Given a manifest without name, when loaded, the plugin is rejected
++     * with the reason naming name.
++     */
++    test('a manifest without name is rejected, naming name', () => {
++      const root = makePluginRoot(JSON.stringify({ $schema: CANONICAL_SCHEMA }))
++
++      const result = loadManifest(root)
++
++      expectManifestRejected(result, 'name')
++    })
++
++    /**
++     * Given a manifest whose name is not a string, when loaded, the plugin
++     * is rejected with the reason naming name.
++     */
++    test('a manifest with a non-string name is rejected, naming name', () => {
++      const root = makePluginRoot(
++        JSON.stringify({ $schema: CANONICAL_SCHEMA, name: 42 }),
++      )
++
++      const result = loadManifest(root)
++
++      expectManifestRejected(result, 'name')
++    })
++
++    /**
++     * Given a manifest whose $schema is not a string, when loaded, the
++     * plugin is rejected with the reason naming $schema.
++     */
++    test('a manifest with a non-string $schema is rejected, naming $schema', () => {
++      const root = makePluginRoot(
++        JSON.stringify({ $schema: null, name: MINIMAL_NAME }),
++      )
++
++      const result = loadManifest(root)
++
++      expectManifestRejected(result, '$schema')
++    })
++  })
++})
+diff --git a/common/src/plugins/__tests__/load-plugin.test.ts b/common/src/plugins/__tests__/load-plugin.test.ts
+new file mode 100644
+index 0000000000..39d27bf6a8
+--- /dev/null
++++ b/common/src/plugins/__tests__/load-plugin.test.ts
+@@ -0,0 +1,75 @@
++import path from 'node:path'
++
++import { rmSync, writeFileSync } from 'node:fs'
++
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { loadPlugin } from '../load-plugin'
++
++import { expectPluginOk, expectPluginRejected } from './fixtures/load-plugin'
++import { INVALID_JSON_TEXT, makeMCPRoot } from './fixtures/mcp'
++import { MINIMAL_NAME } from './fixtures/manifest'
++import { SKILL_NAME, makeRootWithSkill } from './fixtures/skills'
++import { cleanUpPluginFixtures } from './fixtures/temp-roots'
++
++// The real reader, imported by file so the barrel (and its tree-sitter
++// wasm) stays out — the same care `parse-skill.ts` documents. Test-only:
++// the production graph gains no common → sdk edge, because `loadPlugin`
++// takes the reader as a parameter; the session wiring passes the SDK's.
++import { loadSkillsSync } from '../../../../sdk/src/skills/load-skills'
++
++afterEach(cleanUpPluginFixtures)
++
++const readSkills = (dir: string) => loadSkillsSync({ skillsPath: dir })
++
++describe('loadPlugin composition', () => {
++  /**
++   * Given a root carrying all three components, when loaded, the entity
++   * carries the manifest, the loaded skills and servers, and the
++   * client-managed data dir path the §9.1 `.data` rule fixes — computed,
++   * not created: provisioning is the install's one mkdir.
++   */
++  test('composes manifest, skills, and MCP into the entity', () => {
++    const root = makeRootWithSkill()
++    writeFileSync(path.join(root, 'mcp.json'), INVALID_JSON_TEXT, 'utf8')
++
++    const result = expectPluginOk(loadPlugin(root, readSkills))
++
++    expect(result.plugin.manifest.name).toBe(MINIMAL_NAME)
++    expect(Object.keys(result.plugin.skills)).toEqual([SKILL_NAME])
++    expect(result.plugin.mcpServers).toEqual({})
++    expect(result.plugin.dataDir).toBe(
++      path.join(path.dirname(root), '.data', MINIMAL_NAME),
++    )
++    expect(
++      result.reports.some((r) => r.message.includes('not valid JSON')),
++    ).toBe(true)
++  })
++
++  /**
++   * Given a root whose manifest fails, when loaded, the load itself
++   * fails — the manifest alone decides whether the plugin exists (§5.3)
++   * — and the failure is the manifest's, with no component work done.
++   */
++  test('a manifest failure is the load failure', () => {
++    const root = makeRootWithSkill()
++    rmSync(path.join(root, 'plugin.json'))
++
++    expectPluginRejected(loadPlugin(root, readSkills), 'plugin.json')
++  })
++
++  /**
++   * Given a root with a valid manifest and a broken mcp.json, when
++   * loaded, the plugin still loads with empty servers and the refusal
++   * reported — component outcomes never fail the plugin (§7.2.2).
++   */
++  test('a refused component rides as reports while the plugin loads', () => {
++    const root = makeMCPRoot(INVALID_JSON_TEXT)
++
++    const result = expectPluginOk(loadPlugin(root, readSkills))
++
++    expect(result.plugin.mcpServers).toEqual({})
++    expect(result.reports).toHaveLength(1)
++    expect(result.reports[0]?.section).toBe('§7.2')
++  })
++})
+diff --git a/common/src/plugins/__tests__/mcp-config.test.ts b/common/src/plugins/__tests__/mcp-config.test.ts
+new file mode 100644
+index 0000000000..82682a7b02
+--- /dev/null
++++ b/common/src/plugins/__tests__/mcp-config.test.ts
+@@ -0,0 +1,163 @@
++import { writeFileSync } from 'node:fs'
++import path from 'node:path'
++
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { loadPluginMCP } from '../mcp-config'
++
++import {
++  EXPECTED_DEVELOPER_KNOWLEDGE_CONFIG,
++  EXPECTED_LINT_RUNNER_CONFIG,
++  INVALID_JSON_TEXT,
++  MIXED_ENTRIES_JSON,
++  REAL_BUNDLE_MCP_CONFIG_JSON,
++  REAL_BUNDLE_MCP_JSON,
++  TWO_SERVERS_JSON,
++  UNSUPPORTED_SCHEMA_MCP_JSON,
++  expectMCPInvalid,
++  expectMCPOk,
++  makeEscapingMCPRoot,
++  makeMCPRoot,
++  makeRootWithMCPDir,
++} from './fixtures/mcp'
++
++import { expectManifestOk, makeManifestRoot } from './fixtures/manifest'
++import { cleanUpPluginFixtures } from './fixtures/temp-roots'
++
++afterEach(cleanUpPluginFixtures)
++
++describe('mcp component (spec §7.2)', () => {
++  /**
++   * Given a plugin root with no mcp.json, when loaded, MCP contributes no
++   * servers and no error (§6.2: an absent fixed location is not an error),
++   * and the same holds when mcp.json exists but is a directory rather than
++   * a regular file — wrong kind, not absence, but the component result
++   * the session needs is identical.
++   */
++  test('missing mcp.json is not an error', () => {
++    const root = makeManifestRoot()
++
++    const result = loadPluginMCP(root)
++
++    const servers = expectMCPOk(result)
++    expect(servers).toEqual({})
++    expect(result.reports).toEqual([])
++  })
++
++  /**
++   * Given an mcp.json that is a directory, when loaded, the component
++   * yields no servers without an error and without reading anything —
++   * §6.2 treats the wrong filesystem kind as component-invalid; the walk
++   * answers it with an empty set so the plugin still loads.
++   */
++  test('a directory at mcp.json yields no servers', () => {
++    const root = makeRootWithMCPDir()
++
++    const result = loadPluginMCP(root)
++
++    const servers = expectMCPOk(result)
++    expect(servers).toEqual({})
++  })
++
++  /**
++   * Given an mcp.json that is a reparse point resolving outside the plugin
++   * root, when loaded, MCP is refused under §4.1.1 — this component has
++   * its own read path, so its containment wiring is proved here rather
++   * than inherited from the manifest's.
++   */
++  test('an mcp.json resolving outside the root is refused', () => {
++    const root = makeEscapingMCPRoot()
++
++    const result = loadPluginMCP(root)
++
++    expectMCPInvalid(result, '§4.1.1')
++  })
++
++  /**
++   * Given an mcp.json that is not valid JSON, when loaded, MCP is disabled
++   * for the plugin with a report while skills still load — §7.2.2 rules 2.
++   */
++  test('mcp.json that is not valid JSON disables MCP with a report', () => {
++    const root = makeMCPRoot(INVALID_JSON_TEXT)
++
++    const result = loadPluginMCP(root)
++
++    const reports = expectMCPInvalid(result, 'not valid JSON')
++    expect(reports).toHaveLength(1)
++    expect(reports[0]?.severity).toBe('warning')
++  })
++
++  /**
++   * Given an mcp.json targeting a spec version the client cannot load,
++   * when loaded, MCP is disabled with a report — §7.2.2 rule 2, the
++   * unsupported-$schema branch of the readability failures.
++   */
++  test('an unrecognized $schema disables MCP with a report', () => {
++    const root = makeMCPRoot(UNSUPPORTED_SCHEMA_MCP_JSON)
++
++    const result = loadPluginMCP(root)
++
++    expectMCPInvalid(result, '$schema')
++  })
++
++  /**
++   * Given two server entries where one does not satisfy the freebuff
++   * server shape, when loaded, the refused one is skipped with a report and
++   * sibling loads — §7.2.2 rule 3, the skip-and-report invariant the scope
++   * cut relies on for its mitigation.
++   */
++  test('one refused entry is skipped and its sibling loads', () => {
++    const root = makeMCPRoot(MIXED_ENTRIES_JSON)
++
++    const result = loadPluginMCP(root)
++
++    const servers = expectMCPOk(result)
++    expect(Object.keys(servers)).toEqual(['working'])
++    expect(result.reports).toHaveLength(1)
++    expect(result.reports[0]?.message).toContain('broken')
++  })
++
++  /**
++   * Given an mcp.json with two conforming entries — one remote, one stdio
++   * — when loaded, both arrive mapped and no report is written: §7.2's
++   * `mcpServers` is a map, so a plugin carrying several MCP servers is the
++   * bare-bones contract, not an edge case.
++   */
++  test('two conforming entries both load', () => {
++    const root = makeMCPRoot(TWO_SERVERS_JSON)
++
++    const result = loadPluginMCP(root)
++
++    const servers = expectMCPOk(result)
++    expect(servers).toEqual({
++      'developer-knowledge': EXPECTED_DEVELOPER_KNOWLEDGE_CONFIG,
++      'lint-runner': EXPECTED_LINT_RUNNER_CONFIG,
++    })
++    expect(result.reports).toEqual([])
++  })
++
++  /**
++   * Given the real bundle's root — mcp.json present alongside
++   * mcp_config.json (the Gemini CLI extension shape, which the spec says
++   * nothing about; Google ships it for another client) — when loaded,
++   * exactly one server arrives and no report mentions either decoy: only
++   * mcp.json is the MCP configuration path (§7.2), so a foreign plugin's
++   * extra files are invisible, not noise.
++   */
++  test('only mcp.json loads and the decoys stay invisible', () => {
++    const root = makeMCPRoot()
++    writeFileSync(
++      path.join(root, 'mcp_config.json'),
++      REAL_BUNDLE_MCP_CONFIG_JSON,
++      'utf8',
++    )
++
++    const result = loadPluginMCP(root)
++
++    const servers = expectMCPOk(result)
++    expect(servers).toEqual({
++      'developer-knowledge': EXPECTED_DEVELOPER_KNOWLEDGE_CONFIG,
++    })
++    expect(result.reports).toEqual([])
++  })
++})
+diff --git a/common/src/plugins/__tests__/metadata.test.ts b/common/src/plugins/__tests__/metadata.test.ts
+new file mode 100644
+index 0000000000..93d21851e7
+--- /dev/null
++++ b/common/src/plugins/__tests__/metadata.test.ts
+@@ -0,0 +1,116 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { loadManifest } from '../load-plugin-manifest'
++
++import {
++  AUTHOR,
++  AUTHOR_WITH_FOREIGN_FIELD,
++  AUTHOR_WITH_NON_STRING_NAME,
++  CONTENT_INVALID_METADATA,
++  expectManifestOk,
++  expectManifestRejected,
++  KEYWORDS,
++  KEYWORDS_WITH_NON_STRING_ENTRY,
++  makeManifestRoot,
++  NON_OBJECT_AUTHOR,
++} from './fixtures/manifest'
++import { cleanUpPluginFixtures } from './fixtures/temp-roots'
++
++afterEach(cleanUpPluginFixtures)
++
++describe('metadata fields (spec §5.4)', () => {
++  /**
++   * Given a manifest whose metadata is correct in JSON type but invalid by
++   * content, when loaded, the plugin loads, every value reaches the manifest
++   * verbatim, and no report is emitted (§5.4 MUST NOT reject on the content
++   * of version, homepage, repository, or license).
++   */
++  test('content-invalid metadata is carried verbatim, with no reports', () => {
++    const root = makeManifestRoot(CONTENT_INVALID_METADATA)
++
++    const result = loadManifest(root)
++
++    const { manifest, reports } = expectManifestOk(result)
++    expect(manifest).toMatchObject(CONTENT_INVALID_METADATA)
++    expect(reports).toHaveLength(0)
++  })
++
++  /**
++   * Given a manifest whose version is not a string, when loaded, the plugin
++   * is rejected — metadata is validated by JSON type (§5.4), and a type
++   * mismatch is fatal (§5.2).
++   */
++  test('a metadata field with the wrong JSON type is rejected', () => {
++    const root = makeManifestRoot({ version: 42 })
++
++    const result = loadManifest(root)
++
++    expectManifestRejected(result, 'version')
++  })
++
++  /**
++   * Given a manifest carrying the author object and the keywords list, when
++   * loaded, both reach the manifest with the values the author wrote.
++   */
++  test('a valid author and keywords are carried verbatim', () => {
++    const root = makeManifestRoot({ author: AUTHOR, keywords: KEYWORDS })
++
++    const result = loadManifest(root)
++
++    const { manifest } = expectManifestOk(result)
++    expect(manifest.author).toEqual(AUTHOR)
++    expect(manifest.keywords).toEqual(KEYWORDS)
++  })
++
++  /**
++   * Given a manifest whose author carries a field outside name, email, and
++   * url, when loaded, the plugin is rejected — §5.4 permits no other author
++   * field.
++   */
++  test('an author field outside name, email, and url is rejected', () => {
++    const root = makeManifestRoot({ author: AUTHOR_WITH_FOREIGN_FIELD })
++
++    const result = loadManifest(root)
++
++    expectManifestRejected(result, 'author')
++  })
++
++  /**
++   * Given a manifest whose author carries a non-string value, when loaded,
++   * the plugin is rejected — every author field holds a string (§5.4).
++   */
++  test('an author value that is not a string is rejected', () => {
++    const root = makeManifestRoot({ author: AUTHOR_WITH_NON_STRING_NAME })
++
++    const result = loadManifest(root)
++
++    expectManifestRejected(result, 'author')
++  })
++
++  /**
++   * Given a manifest whose author is not an object, when loaded, the plugin
++   * is rejected — §5.4 declares author an object.
++   */
++  test('a non-object author is rejected', () => {
++    const root = makeManifestRoot({ author: NON_OBJECT_AUTHOR })
++
++    const result = loadManifest(root)
++
++    expectManifestRejected(result, 'author')
++  })
++
++  /**
++   * Given a manifest whose keywords list holds a non-string element, when
++   * loaded, the plugin is rejected — §5.4 declares keywords a string[], and
++   * §5.2 makes a field that does not match its declared type fatal.
++   */
++  test('keywords holding a non-string element is rejected', () => {
++    const root = makeManifestRoot({
++      keywords: KEYWORDS_WITH_NON_STRING_ENTRY,
++    })
++
++    const result = loadManifest(root)
++
++    expectManifestRejected(result, 'keywords')
++  })
++})
+diff --git a/common/src/plugins/__tests__/plugin-name.test.ts b/common/src/plugins/__tests__/plugin-name.test.ts
+new file mode 100644
+index 0000000000..2c8753e777
+--- /dev/null
++++ b/common/src/plugins/__tests__/plugin-name.test.ts
+@@ -0,0 +1,60 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { loadManifest } from '../load-plugin-manifest'
++
++import {
++  CANONICAL_SCHEMA,
++  expectManifestOk,
++  expectManifestRejected,
++  makePluginRoot,
++  MAX_NAME_LENGTH,
++} from './fixtures/manifest'
++import { cleanUpPluginFixtures } from './fixtures/temp-roots'
++
++afterEach(cleanUpPluginFixtures)
++
++describe('plugin name (spec §5.5)', () => {
++  /**
++   * Given each name the §5.5 constraints accept, when loaded, the plugin
++   * loads carrying that name — including the 64-character inclusive edge.
++   */
++  test.each([
++    ['my-plugin', 'spec valid list'],
++    ['acme.tools', 'spec valid list'],
++    ['lint3r', 'spec valid list'],
++    ['a', 'spec valid list'],
++    ['a'.repeat(MAX_NAME_LENGTH), '64 chars — inclusive edge (derived)'],
++  ])('name %j → ok (%s)', (name) => {
++    const root = makePluginRoot(
++      JSON.stringify({ $schema: CANONICAL_SCHEMA, name }),
++    )
++
++    const result = loadManifest(root)
++
++    const { manifest } = expectManifestOk(result)
++    expect(manifest.name).toBe(name)
++  })
++
++  /**
++   * Given each name that breaks a §5.5 constraint — the spec's own invalid
++   * list plus the two edges derived from it — when loaded, the plugin is
++   * rejected with a reason naming `name`.
++   */
++  test.each([
++    ['My-Plugin', 'uppercase (spec invalid list)'],
++    ['-start', 'leading hyphen (spec invalid list)'],
++    ['has--double', 'consecutive hyphens (spec invalid list)'],
++    ['too.many..dots', 'consecutive periods (spec invalid list)'],
++    ['', 'empty (spec invalid list)'],
++    ['end-', 'trailing hyphen (derived from start/end rule)'],
++    ['a'.repeat(MAX_NAME_LENGTH + 1), '65 chars — one past the edge (derived)'],
++  ])('name %j → rejected (%s)', (name) => {
++    const root = makePluginRoot(
++      JSON.stringify({ $schema: CANONICAL_SCHEMA, name }),
++    )
++
++    const result = loadManifest(root)
++
++    expectManifestRejected(result, 'name')
++  })
++})
+diff --git a/common/src/plugins/__tests__/schema-version.test.ts b/common/src/plugins/__tests__/schema-version.test.ts
+new file mode 100644
+index 0000000000..710b4adc2d
+--- /dev/null
++++ b/common/src/plugins/__tests__/schema-version.test.ts
+@@ -0,0 +1,50 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { loadManifest } from '../load-plugin-manifest'
++
++import {
++  expectManifestRejected,
++  makePluginRoot,
++  MINIMAL_NAME,
++  UNSUPPORTED_SCHEMA,
++} from './fixtures/manifest'
++import {
++  cleanUpPluginFixtures,
++  watchNetworkAccess,
++} from './fixtures/temp-roots'
++
++afterEach(cleanUpPluginFixtures)
++
++describe('schema version selection (spec §5.2)', () => {
++  /**
++   * Given a manifest declaring a specification version this client does not
++   * support, when loaded, the plugin is rejected and the reason names the
++   * version it declared (§5.2 SHOULD report the unsupported version).
++   */
++  test('an unsupported version is rejected, naming the version it declared', () => {
++    const root = makePluginRoot(
++      JSON.stringify({ $schema: UNSUPPORTED_SCHEMA, name: MINIMAL_NAME }),
++    )
++
++    const result = loadManifest(root)
++
++    expectManifestRejected(result, UNSUPPORTED_SCHEMA)
++  })
++
++  /**
++   * Given a client loading a plugin, when the manifest is read, nothing
++   * reaches for the network to fetch the schema it names (§5.2 MUST NOT
++   * retrieve a schema while loading a plugin).
++   */
++  test('loading a plugin does not retrieve the declared schema', () => {
++    const fetchSpy = watchNetworkAccess()
++
++    const root = makePluginRoot(
++      JSON.stringify({ $schema: UNSUPPORTED_SCHEMA, name: MINIMAL_NAME }),
++    )
++
++    loadManifest(root)
++
++    expect(fetchSpy).not.toHaveBeenCalled()
++  })
++})
+diff --git a/common/src/plugins/__tests__/skills.test.ts b/common/src/plugins/__tests__/skills.test.ts
+new file mode 100644
+index 0000000000..f1b71bc285
+--- /dev/null
++++ b/common/src/plugins/__tests__/skills.test.ts
+@@ -0,0 +1,95 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++
++// The real reader, imported by file so the barrel (and its tree-sitter wasm)
++// stays out — the same care `parse-skill.ts` documents. Test-only: the
++// production graph gains no common → sdk edge, because the walk takes the
++// reader as a parameter; the session wiring passes the SDK's.
++import { loadSkillsSync } from '../../../../sdk/src/skills/load-skills'
++
++import { loadPluginSkills } from '../skills'
++
++import {
++  SKILL_NAME,
++  OTHER_SKILL_NAME,
++  expectSkillsComponentInvalid,
++  expectSkillsOk,
++  makeEscapingSkillRoot,
++  makeEscapingSkillsRoot,
++  makeRootWithoutSkills,
++  makeRootWithSkill,
++} from './fixtures/skills'
++
++import { cleanUpPluginFixtures } from './fixtures/temp-roots'
++
++/** The reader production will pass: exactly one skills directory, no roots. */
++const readSkillsDir = (skillsDir: string) =>
++  loadSkillsSync({ skillsPath: skillsDir })
++
++afterEach(cleanUpPluginFixtures)
++
++describe('skills component (spec §6.2, §7.1)', () => {
++  /**
++   * Given a plugin root with no `skills/` directory, when loaded, the skills
++   * component contributes zero skills and no error — §6.2 forbids treating a
++   * fixed location's absence as an error, and the containment predicate this
++   * walk runs on the directory throws on a missing path, so the load must
++   * survive it.
++   */
++  test('missing skills/ is not an error', () => {
++    const root = makeRootWithoutSkills()
++
++    const result = loadPluginSkills(root, readSkillsDir)
++
++    const skills = expectSkillsOk(result)
++    expect(skills).toEqual({})
++  })
++
++  /**
++   * Given a plugin root whose `skills/` itself resolves outside the plugin
++   * root, when loaded, the component type is invalid and other components
++   * are unaffected — §4.1.1 boundary 2 via §6.2, and §4.1.1 compares
++   * filesystem-resolved paths, not their spelling.
++   */
++  test('a skills/ resolving outside the root invalidates the component', () => {
++    const root = makeEscapingSkillsRoot()
++
++    const result = loadPluginSkills(root, readSkillsDir)
++
++    const reports = expectSkillsComponentInvalid(result, '§4.1.1')
++    expect(reports).toHaveLength(1)
++    expect(reports[0]?.severity).toBe('error')
++  })
++
++  /**
++   * Given a plugin root where one discovered `SKILL.md` resolves outside the
++   * plugin root, when loaded, that skill is skipped and nothing else is —
++   * §4.1.1 boundary 3 via §7.1, so the escape costs one skill, not the
++   * component.
++   */
++  test('a SKILL.md resolving outside the root skips that skill only', () => {
++    const root = makeEscapingSkillRoot()
++
++    const result = loadPluginSkills(root, readSkillsDir)
++
++    const skills = expectSkillsOk(result)
++    expect(Object.keys(skills)).toEqual([SKILL_NAME])
++    expect(skills[SKILL_NAME]?.name).toBe(SKILL_NAME)
++    expect(result.reports).toHaveLength(1)
++    expect(result.reports[0]?.section).toBe('§4.1.1')
++  })
++
++  /**
++   * Given a plugin root whose `skills/` holds one valid skill, when loaded,
++   * the reader's answer is carried and nothing is reported — the happy path
++   * the component walk must not distort.
++   */
++  test('a valid skill loads through the reader', () => {
++    const root = makeRootWithSkill(OTHER_SKILL_NAME)
++
++    const result = loadPluginSkills(root, readSkillsDir)
++
++    const skills = expectSkillsOk(result)
++    expect(Object.keys(skills)).toEqual([OTHER_SKILL_NAME])
++    expect(result.reports).toEqual([])
++  })
++})
+diff --git a/common/src/plugins/__tests__/top-level-fields.test.ts b/common/src/plugins/__tests__/top-level-fields.test.ts
+new file mode 100644
+index 0000000000..76d01f0176
+--- /dev/null
++++ b/common/src/plugins/__tests__/top-level-fields.test.ts
+@@ -0,0 +1,111 @@
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { loadManifest } from '../load-plugin-manifest'
++
++import {
++  CANONICAL_SCHEMA,
++  expectManifestOk,
++  expectManifestRejected,
++  expectReportAbout,
++  makeManifestRoot,
++  makePluginRoot,
++  TOP_LEVEL_ARRAY_JSON,
++  TOP_LEVEL_NULL_JSON,
++  TOP_LEVEL_STRING_JSON,
++} from './fixtures/manifest'
++import { cleanUpPluginFixtures } from './fixtures/temp-roots'
++
++afterEach(cleanUpPluginFixtures)
++
++describe('top-level fields (spec §5.2)', () => {
++  /**
++   * Given a plugin.json whose top level is an array, when loaded, the plugin
++   * is rejected — §5.2 requires a top-level object, and an array is the
++   * non-object a `typeof` check alone would accept.
++   */
++  test('a top-level array is rejected', () => {
++    const root = makePluginRoot(TOP_LEVEL_ARRAY_JSON)
++
++    const result = loadManifest(root)
++
++    expectManifestRejected(result, 'top-level object')
++  })
++
++  /**
++   * Given a plugin.json whose top level is a string primitive, when loaded,
++   * the plugin is rejected — §5.2 requires a top-level object.
++   */
++  test('a top-level primitive is rejected', () => {
++    const root = makePluginRoot(TOP_LEVEL_STRING_JSON)
++
++    const result = loadManifest(root)
++
++    expectManifestRejected(result, 'top-level object')
++  })
++
++  /**
++   * Given a plugin.json whose top level is null, when loaded, the plugin is
++   * rejected rather than crashing on a value `typeof` calls an object (§5.2
++   * requires a top-level object).
++   */
++  test('a top-level null is rejected', () => {
++    const root = makePluginRoot(TOP_LEVEL_NULL_JSON)
++
++    const result = loadManifest(root)
++
++    expectManifestRejected(result, 'top-level object')
++  })
++
++  /**
++   * Given a valid manifest carrying one unknown top-level field, when
++   * loaded, the plugin still loads (§5.2 MUST continue), a report names
++   * the field, and the field is not carried onto the parsed manifest
++   * (§5.2 MUST NOT assign semantics).
++   */
++  test('one unknown field is reported and ignored, plugin still loads', () => {
++    const root = makeManifestRoot({ bogus: 1 })
++
++    const result = loadManifest(root)
++
++    const { manifest, reports } = expectManifestOk(result)
++    expect(manifest).not.toHaveProperty('bogus')
++    expect(reports).toHaveLength(1)
++    expectReportAbout(reports, '§5.2', 'bogus')
++  })
++
++  /**
++   * Given a valid manifest carrying two unknown top-level fields, when
++   * loaded, one report names each field (§5.2 "report ... each unknown
++   * field") — the spec orders the fields, not the reports, so the row
++   * claims presence per field rather than report positions.
++   */
++  test('each unknown field gets its own report', () => {
++    const root = makeManifestRoot({ bogus: 1, wat: 'x' })
++
++    const result = loadManifest(root)
++
++    const { reports } = expectManifestOk(result)
++    expect(reports).toHaveLength(2)
++    expectReportAbout(reports, '§5.2', 'bogus')
++    expectReportAbout(reports, '§5.2', 'wat')
++  })
++
++  /**
++   * Given a manifest with an unknown field and a fatal violation (name
++   * missing), when loaded, the plugin is rejected (§5.3 fatality wins)
++   * and the unknown-field report is still included in the rejection
++   * result (§5.2 report requirement is not conditioned on the plugin
++   * loading).
++   */
++  test('unknown-field report is included in a fatal rejection', () => {
++    const root = makePluginRoot(
++      JSON.stringify({ $schema: CANONICAL_SCHEMA, bogus: 1 }),
++    )
++
++    const result = loadManifest(root)
++
++    const rejection = expectManifestRejected(result, 'name')
++    expect(rejection.reports).toHaveLength(1)
++    expect(rejection.reports[0].message).toContain('bogus')
++  })
++})
+diff --git a/common/src/plugins/containment.ts b/common/src/plugins/containment.ts
+new file mode 100644
+index 0000000000..2ecb0cc240
+--- /dev/null
++++ b/common/src/plugins/containment.ts
+@@ -0,0 +1,17 @@
++import { realpathSync } from 'node:fs'
++
++import { isPathInside } from '../util/path'
++
++/**
++ * Whether `target` resolves inside `root` (§4.1.1: a path supplied by the
++ * plugin package must remain within the filesystem-resolved plugin root).
++ *
++ * Both sides are resolved before the comparison, so a root or a file reached
++ * through a symlink, junction, or reparse point is judged by where it points
++ * rather than how it is spelled — §4.1.1 permits the ones that land inside
++ * the root and rejects the rest. Throws when either path does not exist,
++ * which leaves callers to map that onto their own missing-file rule.
++ */
++export function resolvesWithinRoot(root: string, target: string): boolean {
++  return isPathInside(realpathSync(root), realpathSync(target))
++}
+diff --git a/common/src/plugins/install-url.ts b/common/src/plugins/install-url.ts
+new file mode 100644
+index 0000000000..866ee41865
+--- /dev/null
++++ b/common/src/plugins/install-url.ts
+@@ -0,0 +1,93 @@
++import type { PluginReport } from './report'
++
++/**
++ * Where a plugin install fetches from: the GitHub repo coordinates and
++ * the plugin's subpath inside it, derived from the install URL.
++ * `ref` defaults to `HEAD`, which codeload resolves to the default
++ * branch; no commit sha is available without the REST API (rate limits),
++ * so sha pinning stays future work.
++ */
++export interface PluginSource {
++  owner: string
++  repo: string
++  ref: string
++  /** Path segments of the plugin directory inside the repo, or null. */
++  subpath: string | null
++}
++
++export type ParsePluginSourceResult =
++  | { ok: true; source: PluginSource }
++  | { ok: false; reason: string; reports: PluginReport[] }
++
++/**
++ * Parses a plugin install URL into fetch coordinates, purely — no
++ * network, no git. Accepts the https GitHub forms: repo root, trailing
++ * `.git`, `tree/<ref>` with or without a subpath, and a plain subpath.
++ * Anything that is not an https github.com repo URL is rejected with the
++ * reason, so the install aborts before fetching.
++ */
++export function parsePluginSourceUrl(url: string): ParsePluginSourceResult {
++  // The ssh scp-like form (git@host:owner/repo) is not a URL at all —
++  // construct it inside the guard so it is answered as a rejection.
++  let parsed: URL
++  try {
++    parsed = new URL(url)
++  } catch {
++    return rejected(`unsupported plugin source: ${url} is not a URL`)
++  }
++
++  if (parsed.protocol !== 'https:' || parsed.hostname !== 'github.com') {
++    return rejected(
++      `unsupported plugin source: only https://github.com URLs are supported (got ${parsed.protocol}//${parsed.hostname})`,
++    )
++  }
++
++  const segments = parsed.pathname.split('/').filter((s) => s.length > 0)
++  if (segments.length < 2) {
++    return rejected('the URL does not name a repository (owner/repo required)')
++  }
++
++  return parseRepoPath(segments)
++}
++
++/**
++ * Splits the path after the host into fetch coordinates: `tree/<ref>` is
++ * GitHub's ref-qualified browse form and needs a ref; every other segment
++ * sequence is a plain subpath under the default branch. The trailing
++ * `.git` is a remote convention, not part of the name.
++ */
++function parseRepoPath(segments: string[]): ParsePluginSourceResult {
++  const [owner, repoRaw, ...rest] = segments
++  const repo = repoRaw.replace(/\.git$/, '')
++
++  if (rest[0] === 'tree') {
++    if (rest.length < 2) {
++      return rejected(
++        'the URL names a branch but not which one (tree/<ref> required)',
++      )
++    }
++    return {
++      ok: true,
++      source: {
++        owner,
++        repo,
++        ref: rest[1] ?? '',
++        subpath: rest.length > 2 ? rest.slice(2).join('/') : null,
++      },
++    }
++  }
++
++  return {
++    ok: true,
++    source: {
++      owner,
++      repo,
++      ref: 'HEAD',
++      subpath: rest.length > 0 ? rest.join('/') : null,
++    },
++  }
++}
++
++function rejected(reason: string): ParsePluginSourceResult {
++  return { ok: false, reason, reports: [] }
++}
+diff --git a/common/src/plugins/json-value.ts b/common/src/plugins/json-value.ts
+new file mode 100644
+index 0000000000..46f74e8d6f
+--- /dev/null
++++ b/common/src/plugins/json-value.ts
+@@ -0,0 +1,15 @@
++/**
++ * JSON value predicates the plugin component rules share. Nothing here knows
++ * about plugins: a rule that needs to ask "is this a JSON object?" should not
++ * have to import the rules of an unrelated component to find out.
++ */
++
++/**
++ * True for a JSON object: not a primitive, not null, not an array. The null
++ * check is required because `typeof null === 'object'`.
++ */
++export function isPlainObject(
++  value: unknown,
++): value is Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value)
++}
+diff --git a/common/src/plugins/load-plugin-manifest.ts b/common/src/plugins/load-plugin-manifest.ts
+new file mode 100644
+index 0000000000..3e997d050c
+--- /dev/null
++++ b/common/src/plugins/load-plugin-manifest.ts
+@@ -0,0 +1,123 @@
++import { readFileSync } from 'node:fs'
++import path from 'node:path'
++
++import { resolvesWithinRoot } from './containment'
++import { validateExtensions } from './manifest/extensions'
++import { readMetadata } from './manifest/metadata'
++import { readPluginName } from './manifest/plugin-name'
++import { readSchemaVersion } from './manifest/schema-version'
++import {
++  reportUnknownFields,
++  requireTopLevelObject,
++} from './manifest/top-level-fields'
++
++import type { PluginManifest } from './manifest/plugin-manifest'
++import type { PluginReport } from './report'
++
++/**
++ * Reads and validates `plugin.json` for Agent Plugins v1.0.0 — the load use
++ * case of the manifest component. An invalid manifest means the plugin does
++ * not exist, and nothing else may be discovered or executed (spec §5.3).
++ *
++ * This module owns the §5.2 fatality order: which rule runs when, and that
++ * only an unknown top-level field or a non-object `extensions` keeps the load
++ * going. The rules themselves live one section per module in `manifest/`, and
++ * the contract they share lives in `manifest/plugin-manifest.ts`.
++ *
++ * Spec: github.com/agentplugins/agent-plugins-spec/blob/main/spec/1.0.0.md
++ */
++
++/**
++ * Either a valid manifest with any spec-mandated reports, or the reason the
++ * plugin does not exist (spec §5.3). Reports are present in both branches,
++ * so callers can render them whichever way the load went.
++ */
++export type LoadManifestResult =
++  | { ok: true; manifest: PluginManifest; reports: PluginReport[] }
++  | { ok: false; reason: string; reports: PluginReport[] }
++
++/**
++ * Loads and validates the manifest at `root/plugin.json`. Per spec §5.3, the
++ * manifest alone decides whether the plugin exists: an invalid one means the
++ * plugin does not exist, so this is the only step whose failure stops
++ * discovery entirely.
++ * Failures and spec-mandated reports are returned in the result:
++ * `ok: false` with a reason, or `ok: true` with reports to render.
++ *
++ * The two non-fatal §5.2 violations are collected before the fatal rules run,
++ * because the spec requires them reported even when the manifest they sit on
++ * is otherwise rejected.
++ */
++export function loadManifest(root: string): LoadManifestResult {
++  const file = readPluginJson(root)
++  if (!file.ok) return { ok: false, reason: file.reason, reports: [] }
++
++  const json = parsePluginJson(file.raw)
++  if (!json.ok) return { ok: false, reason: json.reason, reports: [] }
++
++  const topLevel = requireTopLevelObject(json.parsed)
++  if (!topLevel.ok) return { ok: false, reason: topLevel.reason, reports: [] }
++
++  const extensions = validateExtensions(topLevel.fields)
++  const reports = [
++    ...reportUnknownFields(topLevel.fields),
++    ...extensions.reports,
++  ]
++
++  const schema = readSchemaVersion(topLevel.fields)
++  if (!schema.ok) return { ok: false, reason: schema.reason, reports }
++
++  const name = readPluginName(topLevel.fields)
++  if (!name.ok) return { ok: false, reason: name.reason, reports }
++
++  const metadata = readMetadata(topLevel.fields)
++  if (!metadata.ok) return { ok: false, reason: metadata.reason, reports }
++
++  return {
++    ok: true,
++    manifest: {
++      $schema: schema.schema,
++      name: name.name,
++      ...metadata.values,
++      ...(extensions.extensions && { extensions: extensions.extensions }),
++    },
++    reports,
++  }
++}
++
++/**
++ * Reads the manifest text at `<root>/plugin.json`, or the reason it cannot be
++ * used: no manifest there (§5.1), or one resolving outside the plugin root,
++ * which §4.1.1's first failure boundary rejects outright. Containment is
++ * settled here, before the read, so the later components inherit it instead
++ * of each repeating the check.
++ */
++function readPluginJson(
++  root: string,
++): { ok: true; raw: string } | { ok: false; reason: string } {
++  const file = path.join(root, 'plugin.json')
++
++  try {
++    if (!resolvesWithinRoot(root, file)) {
++      return {
++        ok: false,
++        reason: 'plugin.json resolves outside the plugin root (§4.1.1)',
++      }
++    }
++
++    return { ok: true, raw: readFileSync(file, 'utf8') }
++  } catch {
++    return { ok: false, reason: 'no plugin.json at the plugin root (§5.1)' }
++  }
++}
++
++/** Parses the manifest text, or the §5.2 refusal when it is not JSON. */
++function parsePluginJson(
++  raw: string,
++): { ok: true; parsed: unknown } | { ok: false; reason: string } {
++  try {
++    return { ok: true, parsed: JSON.parse(raw) }
++  } catch {
++    return { ok: false, reason: 'plugin.json is not valid JSON (§5.2)' }
++  }
++}
+diff --git a/common/src/plugins/load-plugin.ts b/common/src/plugins/load-plugin.ts
+new file mode 100644
+index 0000000000..e777ad3ae2
+--- /dev/null
++++ b/common/src/plugins/load-plugin.ts
+@@ -0,0 +1,90 @@
++import path from 'node:path'
++
++import { loadManifest } from './load-plugin-manifest'
++import { loadPluginMCP } from './mcp-config'
++import { loadPluginSkills } from './skills'
++
++import type { SkillsMap } from '../types/skill'
++import type { MCPConfig } from '../types/mcp'
++import type { PluginManifest } from './manifest/plugin-manifest'
++import type { PluginReport } from './report'
++
++/**
++ * The installed-plugin entity: the manifest the plugin declares, the
++ * component contents the client loaded from the plugin root, and the
++ * client-managed data directory (spec §9.1 leaves the data location to
++ * the client).
++ */
++export interface InstalledPlugin {
++  manifest: PluginManifest
++  /** Absolute path of the installed plugin root on disk. */
++  root: string
++  /** Absolute path of the client-managed data directory. */
++  dataDir: string
++  skills: SkillsMap
++  mcpServers: Record<string, MCPConfig>
++}
++
++/**
++ * The composition failure: the manifest is the plugin's only mandatory
++ * component, so a plugin that fails to load is one whose manifest failed.
++ * Component reports ride along even on success (§7.2.2: a refused MCP
++ * entry or an invalid skill never fails the plugin).
++ */
++export type LoadPluginResult =
++  | { ok: true; plugin: InstalledPlugin; reports: PluginReport[] }
++  | { ok: false; reason: string; reports: PluginReport[] }
++
++/**
++ * The data-directory layout: `<pluginsRoot>/.data/<plugin-name>`. The dot
++ * is deliberate — §5.5 requires plugin names to start alphanumeric, so
++ * `.data` can never collide with a plugin root, whereas a literal `data/`
++ * could be a plugin named "data" (§9.1 leaves the location to the client).
++ */
++export function pluginDataDirFor(
++  root: string,
++  manifest: PluginManifest,
++): string {
++  return path.join(path.dirname(root), '.data', manifest.name)
++}
++
++/**
++ * Loads one plugin from an on-disk root: the manifest first — its failure
++ * is the load's failure — then the components, whose refusals are
++ * collected rather than fatal (§7.2.2). Pure with respect to the root:
++ * nothing is created or written; provisioning the data directory is the
++ * installer's one mkdir. The skill reader is injected because `common`
++ * cannot import the SDK — the CLI passes its own
++ * `loadSkills({ skillsPath })` here, the same reader it uses for the
++ * user's roots.
++ */
++export function loadPlugin(
++  root: string,
++  readSkillsDir: (skillsDir: string) => SkillsMap,
++): LoadPluginResult {
++  const manifestResult = loadManifest(root)
++  if (!manifestResult.ok) {
++    return {
++      ok: false,
++      reason: manifestResult.reason,
++      reports: manifestResult.reports,
++    }
++  }
++
++  const skillsResult = loadPluginSkills(root, readSkillsDir)
++  const mcpResult = loadPluginMCP(root)
++
++  const reports = [...skillsResult.reports, ...mcpResult.reports]
++
++  return {
++    ok: true,
++    plugin: {
++      manifest: manifestResult.manifest,
++      root,
++      dataDir: pluginDataDirFor(root, manifestResult.manifest),
++      skills: skillsResult.ok ? skillsResult.skills : {},
++      mcpServers: mcpResult.ok ? mcpResult.servers : {},
++    },
++    reports,
++  }
++}
+diff --git a/common/src/plugins/manifest/extensions.ts b/common/src/plugins/manifest/extensions.ts
+new file mode 100644
+index 0000000000..3b10f108e2
+--- /dev/null
++++ b/common/src/plugins/manifest/extensions.ts
+@@ -0,0 +1,32 @@
++import { isPlainObject } from '../json-value'
++
++import type { PluginReport } from '../report'
++
++/**
++ * A non-object extensions value is a non-fatal §8.1 violation: report, ignore,
++ * continue loading. Namespace values are not validated: freebuff implements no
++ * extension namespaces (§8.1).
++ */
++export function validateExtensions(fields: Record<string, unknown>): {
++  reports: PluginReport[]
++  extensions: Record<string, unknown> | undefined
++} {
++  const value = fields.extensions
++  if (value === undefined) return { reports: [], extensions: undefined }
++
++  if (!isPlainObject(value)) {
++    return {
++      reports: [
++        {
++          severity: 'warning',
++          section: '§8.1',
++          message:
++            'manifest.extensions must be an object of namespace entries; value ignored',
++        },
++      ],
++      extensions: undefined,
++    }
++  }
++
++  return { reports: [], extensions: value }
++}
+diff --git a/common/src/plugins/manifest/metadata.ts b/common/src/plugins/manifest/metadata.ts
+new file mode 100644
+index 0000000000..9c1e875fd6
+--- /dev/null
++++ b/common/src/plugins/manifest/metadata.ts
+@@ -0,0 +1,168 @@
++import { isPlainObject } from '../json-value'
++
++import type { PluginAuthor, PluginManifest } from './plugin-manifest'
++
++/** The §5.4 metadata fields whose JSON type is a string, in spec order. */
++const STRING_METADATA_FIELDS = [
++  'version',
++  'description',
++  'homepage',
++  'repository',
++  'license',
++] as const
++
++/** One field name from the §5.4 string metadata table. */
++type StringMetadataField = (typeof STRING_METADATA_FIELDS)[number]
++
++/** The §5.4 author object fields, in spec order. */
++const AUTHOR_FIELDS = ['name', 'email', 'url'] as const
++
++/** One field name from the §5.4 author object. */
++type AuthorField = (typeof AUTHOR_FIELDS)[number]
++
++/** The metadata values a manifest carries, keyed as the manifest keys them. */
++export type ManifestMetadata = Pick<
++  PluginManifest,
++  | 'version'
++  | 'description'
++  | 'author'
++  | 'homepage'
++  | 'repository'
++  | 'license'
++  | 'keywords'
++>
++
++/**
++ * Reads every §5.4 metadata field the manifest carries: the strings, the
++ * author object, and the keywords list.
++ *
++ * Values are taken as declared — their JSON type is checked, never their
++ * content (§5.4) — so `version` is not judged as Semantic Versioning and
++ * `homepage`, `repository`, `author.url`, `author.email`, and `license` are
++ * not judged as URLs, addresses, or SPDX identifiers. The two fields §5.4
++ * constrains structurally, `author` (closed to name, email, and url, each a
++ * string) and `keywords` (a `string[]`), reject the manifest when they break
++ * that structure, because §5.2 makes a permitted field that does not match
++ * its declared type fatal.
++ */
++export function readMetadata(
++  fields: Record<string, unknown>,
++): { ok: true; values: ManifestMetadata } | { ok: false; reason: string } {
++  const strings = readStringMetadata(fields)
++  if (!strings.ok) return strings
++
++  const author = readAuthor(fields.author)
++  if (!author.ok) return author
++
++  const keywords = readKeywords(fields.keywords)
++  if (!keywords.ok) return keywords
++
++  return {
++    ok: true,
++    values: {
++      ...strings.values,
++      ...(author.author && { author: author.author }),
++      ...(keywords.keywords && { keywords: keywords.keywords }),
++    },
++  }
++}
++
++/**
++ * Reads the §5.4 metadata strings the manifest carries. A field that is
++ * present must be a string — metadata is validated by JSON type and nothing
++ * else, so a value is never judged for Semantic Versioning, URL, or SPDX
++ * validity. The offending field is found first, leaving the values to be
++ * projected rather than accumulated in place.
++ */
++function readStringMetadata(
++  fields: Record<string, unknown>,
++):
++  | { ok: true; values: Partial<Record<StringMetadataField, string>> }
++  | { ok: false; reason: string } {
++  const mistyped = STRING_METADATA_FIELDS.find(
++    (field) => fields[field] !== undefined && typeof fields[field] !== 'string',
++  )
++  if (mistyped) {
++    return { ok: false, reason: `manifest.${mistyped} must be a string (§5.4)` }
++  }
++
++  return {
++    ok: true,
++    values: STRING_METADATA_FIELDS.reduce<
++      Partial<Record<StringMetadataField, string>>
++    >(
++      (values, field) =>
++        typeof fields[field] === 'string'
++          ? { ...values, [field]: fields[field] }
++          : values,
++      {},
++    ),
++  }
++}
++
++/**
++ * Reads the §5.4 author object, the one metadata field §5.4 constrains
++ * beyond JSON type: only name, email, and url, each a string. The first
++ * entry that breaks either constraint decides the reason, so a rejection
++ * blames the field the author wrote first, and the permitted values are
++ * projected afterwards.
++ */
++function readAuthor(
++  value: unknown,
++): { ok: true; author?: PluginAuthor } | { ok: false; reason: string } {
++  if (value === undefined) return { ok: true }
++  if (!isPlainObject(value)) {
++    return { ok: false, reason: 'manifest.author must be an object (§5.4)' }
++  }
++
++  const offending = Object.entries(value).find(
++    ([field, entry]) => !isAuthorField(field) || typeof entry !== 'string',
++  )
++  if (offending) {
++    const [field] = offending
++    return {
++      ok: false,
++      reason: isAuthorField(field)
++        ? `manifest.author.${field} must be a string (§5.4)`
++        : `manifest.author has an unknown field "${field}" (§5.4)`,
++    }
++  }
++
++  return {
++    ok: true,
++    author: AUTHOR_FIELDS.reduce<PluginAuthor>(
++      (author, field) =>
++        typeof value[field] === 'string'
++          ? { ...author, [field]: value[field] }
++          : author,
++      {},
++    ),
++  }
++}
++
++/**
++ * Reads the §5.4 keywords list. §5.4 declares it `string[]` and §5.2 makes a
++ * permitted field that does not match its declared type fatal, so a
++ * non-string element rejects the plugin — the permissive §5.4 sentence
++ * forbids judging content, never types.
++ */
++function readKeywords(
++  value: unknown,
++): { ok: true; keywords?: string[] } | { ok: false; reason: string } {
++  if (value === undefined) return { ok: true }
++  if (
++    !Array.isArray(value) ||
++    !value.every((entry) => typeof entry === 'string')
++  ) {
++    return {
++      ok: false,
++      reason: 'manifest.keywords must be an array of strings (§5.4)',
++    }
++  }
++  return { ok: true, keywords: value }
++}
++
++/** True when `field` is one of the three names §5.4 permits in author. */
++function isAuthorField(field: string): field is AuthorField {
++  return AUTHOR_FIELDS.some((known) => known === field)
++}
+diff --git a/common/src/plugins/manifest/plugin-manifest.ts b/common/src/plugins/manifest/plugin-manifest.ts
+new file mode 100644
+index 0000000000..a47186ea6d
+--- /dev/null
++++ b/common/src/plugins/manifest/plugin-manifest.ts
+@@ -0,0 +1,43 @@
++/**
++ * The manifest contract for Agent Plugins v1.0.0 (spec §5): the value the
++ * field rules accept and the loader returns.
++ *
++ * These types are the leaf of the manifest graph — every rule module imports
++ * them and none of them imports another — because every other component in
++ * the subsystem may need to name a manifest without adopting its rules.
++ */
++
++/**
++ * The §5.4 author object. Every field is optional, but the object is closed:
++ * a fourth field, or a value that is not a string, invalidates the manifest.
++ * That is the one §5.4 constraint stricter than the JSON-type rule.
++ */
++export interface PluginAuthor {
++  name?: string
++  email?: string
++  url?: string
++}
++
++/**
++ * The parsed manifest (spec §5). An invalid manifest means the plugin does
++ * not exist — no components may be discovered or executed (§5.3). Metadata
++ * values are carried as the author declared them: their JSON type is
++ * checked, never their content (§5.4).
++ */
++export interface PluginManifest {
++  $schema: string
++  name: string
++  /**
++   * Client extension data (§8.1): carried verbatim when present and
++   * object-shaped; freebuff reads no namespace values. Undefined when
++   * absent or when a non-object value was reported and ignored.
++   */
++  extensions?: Record<string, unknown>
++  version?: string
++  description?: string
++  author?: PluginAuthor
++  homepage?: string
++  repository?: string
++  license?: string
++  keywords?: string[]
++}
+diff --git a/common/src/plugins/manifest/plugin-name.ts b/common/src/plugins/manifest/plugin-name.ts
+new file mode 100644
+index 0000000000..44535e5c19
+--- /dev/null
++++ b/common/src/plugins/manifest/plugin-name.ts
+@@ -0,0 +1,45 @@
++/** Inclusive upper edge for plugin names (spec §5.5 Length). */
++const PLUGIN_NAME_MAX_LENGTH = 64
++
++/**
++ * Plugin names: 1–64 characters of `a-z`, `0-9`, `-`, `.`; must start and
++ * end alphanumeric; no consecutive hyphens or periods (spec §5.5).
++ * Fragment map: the two lookaheads ban `--`/`..`; the first class requires
++ * an alphanumeric start; the optional tail requires an alphanumeric end.
++ */
++const PLUGIN_NAME_PATTERN =
++  /^(?!.*--)(?!.*\.\.)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/
++
++/**
++ * Reads the plugin name. A name that is not a string cannot satisfy the §5.5
++ * constraints at all (§5.3 requires the field); a string that leaves the
++ * pattern or the length cap is the §5.5 violation itself.
++ */
++export function readPluginName(
++  fields: Record<string, unknown>,
++): { ok: true; name: string } | { ok: false; reason: string } {
++  const value = fields.name
++  if (typeof value !== 'string') {
++    return { ok: false, reason: 'manifest.name must be a string (§5.3)' }
++  }
++
++  if (!isValidPluginName(value)) {
++    return {
++      ok: false,
++      reason:
++        'manifest.name violates the §5.5 name constraints ' +
++        '(1-64 chars of a-z, 0-9, "-", "."; starts and ends alphanumeric; no "--" or "..")',
++    }
++  }
++
++  return { ok: true, name: value }
++}
++
++/**
++ * True when the name satisfies every §5.5 rule: the pattern covers
++ * charset, alphanumeric ends, and the no-consecutive-repeats rule; the length
++ * cap is checked separately as the inclusive upper edge.
++ */
++function isValidPluginName(name: string): boolean {
++  return PLUGIN_NAME_PATTERN.test(name) && name.length <= PLUGIN_NAME_MAX_LENGTH
++}
+diff --git a/common/src/plugins/manifest/schema-version.ts b/common/src/plugins/manifest/schema-version.ts
+new file mode 100644
+index 0000000000..59e01fe595
+--- /dev/null
++++ b/common/src/plugins/manifest/schema-version.ts
+@@ -0,0 +1,31 @@
++/** The canonical manifest `$schema` id for Agent Plugins v1.0.0 (spec §5.2). */
++const PLUGIN_MANIFEST_SCHEMA_ID =
++  'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json'
++
++/**
++ * Reads the specification version the manifest declares. A `$schema` that is
++ * not a string cannot name a supported version (§5.3 requires the field);
++ * one that names anything but the canonical 1.0.0 id is a version this client
++ * does not support, and §5.2 requires reporting the version it declared
++ * rather than refusing without naming it.
++ *
++ * This module is everything a new supported version touches: the id above,
++ * the selection below, and their tests.
++ */
++export function readSchemaVersion(
++  fields: Record<string, unknown>,
++): { ok: true; schema: string } | { ok: false; reason: string } {
++  const value = fields.$schema
++  if (typeof value !== 'string') {
++    return { ok: false, reason: 'manifest.$schema must be a string (§5.3)' }
++  }
++
++  if (value !== PLUGIN_MANIFEST_SCHEMA_ID) {
++    return {
++      ok: false,
++      reason: `unsupported manifest $schema "${value}" (§5.2)`,
++    }
++  }
++
++  return { ok: true, schema: value }
++}
+diff --git a/common/src/plugins/manifest/top-level-fields.ts b/common/src/plugins/manifest/top-level-fields.ts
+new file mode 100644
+index 0000000000..f0d0fd2df8
+--- /dev/null
++++ b/common/src/plugins/manifest/top-level-fields.ts
+@@ -0,0 +1,67 @@
++import { isPlainObject } from '../json-value'
++
++import type { PluginReport } from '../report'
++
++/**
++ * The closed §5.2 top-level set — the only fields a conforming manifest may
++ * carry. Keys outside it are reported, and are not copied onto the parsed
++ * manifest (§5.2).
++ */
++const MANIFEST_FIELDS = new Set([
++  '$schema',
++  'name',
++  'version',
++  'description',
++  'author',
++  'homepage',
++  'repository',
++  'license',
++  'keywords',
++  'extensions',
++])
++
++/**
++ * Requires the parsed manifest to be a JSON object (§5.2: "The manifest MUST
++ * be JSON and MUST contain a top-level object"). An array or a primitive is
++ * fatal — the plugin does not exist — and there are no fields to read from
++ * it.
++ *
++ * Couldn't find a definition of "object" in the spec, so assume the JSON
++ * object of RFC 8259 — the structured type whose members carry names. An
++ * array holds its members by position instead, and §5.2's rules are written
++ * about named fields.
++ */
++export function requireTopLevelObject(
++  parsed: unknown,
++):
++  | { ok: true; fields: Record<string, unknown> }
++  | { ok: false; reason: string } {
++  if (!isPlainObject(parsed)) {
++    return {
++      ok: false,
++      reason: 'plugin.json must contain a top-level object (§5.2)',
++    }
++  }
++
++  return { ok: true, fields: parsed }
++}
++
++/**
++ * Unknown top-level fields are a non-fatal §5.2 violation: one report per
++ * field, and the manifest still loads when otherwise valid. The caller must
++ * return these reports even when it also rejects the manifest — the spec's
++ * report requirement applies whenever a manifest is examined, not only when
++ * a plugin loads.
++ */
++export function reportUnknownFields(
++  fields: Record<string, unknown>,
++): PluginReport[] {
++  const unknown = Object.keys(fields).filter(
++    (field) => !MANIFEST_FIELDS.has(field),
++  )
++  return unknown.map((field) => ({
++    severity: 'warning',
++    section: '§5.2',
++    message: `unknown top-level field "${field}" ignored`,
++  }))
++}
+diff --git a/common/src/plugins/mcp-config.ts b/common/src/plugins/mcp-config.ts
+new file mode 100644
+index 0000000000..835df9dea6
+--- /dev/null
++++ b/common/src/plugins/mcp-config.ts
+@@ -0,0 +1,251 @@
++import { realpathSync, readFileSync, statSync } from 'node:fs'
++import path from 'node:path'
++
++import { mcpConfigSchema } from '../types/mcp'
++import { isPathInside } from '../util/path'
++import { z } from 'zod/v4'
++
++import type { MCPConfig } from '../types/mcp'
++import type { PluginReport } from './report'
++
++/**
++ * Loads the MCP component of one plugin (spec §7.2): reads `mcp.json` at
++ * the plugin root, adapts each server entry onto freebuff's own `MCPConfig`
++ * shape, and never touches any alternative path — §7.2 fixes the MCP
++ * configuration path at `mcp.json`, so decoy files that merely resemble it
++ * are invisible to this walk.
++ *
++ * Server *shape* is validated by the schemas in `common/src/types/mcp.ts`,
++ * never re-declared here; this module owns only the spec-to-freebuff
++ * mapping and the §-cited reporting. Where the spec asks for more than
++ * those shapes can express — per-entry `cwd` rules (§7.2.1), the remote
++ * URL and header constraints (§7.2.1), the §9.2 reserved env names — the
++ * freebuff schema is the arbiter, and the gap is recorded for the
++ * maintainers rather than re-implemented beside it.
++ *
++ * Spec: github.com/agentplugins/agent-plugins-spec/blob/main/spec/1.0.0.md
++ */
++
++/** The canonical $schema id of a 1.0.0 MCP configuration (spec §7.2.1). */
++const MCP_SCHEMA_1_0_0 =
++  'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json'
++
++/**
++ * The spec file's wrapper, distinct from freebuff's `mcpConfigSchema`: the
++ * spec's `$schema` key is not part of the freebuff shape, so it is parsed
++ * here for version selection and then dropped, never carried onto a
++ * server.
++ */
++const specFileSchema = z.object({
++  $schema: z.string(),
++  mcpServers: z.record(z.string(), z.unknown()),
++})
++
++/**
++ * Either the plugin's servers as freebuff configs with any reports, or MCP
++ * disabled for this plugin with the reason and a report — a component
++ * result, never fatal to the plugin or its other components (§7.2.2).
++ */
++export type LoadMCPResult =
++  | { ok: true; servers: Record<string, MCPConfig>; reports: PluginReport[] }
++  | { ok: false; reason: string; reports: PluginReport[] }
++
++/**
++ * The remote transport mapping, grounded on the constructors in
++ * `common/src/mcp/client.ts` rather than on label similarity: freebuff's
++ * `'http'` builds `StreamableHTTPClientTransport` (§7.2.1: "streamable-http
++ * selects the current MCP Streamable HTTP transport") and freebuff's `'sse'`
++ * builds `SSEClientTransport` ("the deprecated HTTP+SSE transport"). The
++ * label match is checked against those constructors, not the strings.
++ */
++const REMOTE_TYPES: Record<string, 'http' | 'sse'> = {
++  'streamable-http': 'http',
++  sse: 'sse',
++}
++
++/**
++ * Loads `<root>/mcp.json` and returns its servers as freebuff configs.
++ * Absence and a wrong-kind `mcp.json` are answered with an empty set and
++ * no error (§6.2); an unreadable or unrecognizable file disables MCP for
++ * the plugin with a report (§7.2.2 rule 2); a server entry the freebuff
++ * schema refuses is skipped with a report while its siblings load
++ * (§7.2.2 rule 3). An `mcp.json` resolving outside the plugin root is
++ * refused under §4.1.1.
++ */
++export function loadPluginMCP(root: string): LoadMCPResult {
++  const read = readMCPJson(root)
++  if (!read.ok) {
++    if (read.absent) return { ok: true, servers: {}, reports: [] }
++    return {
++      ok: false,
++      reason: read.reason,
++      reports: [
++        { severity: read.severity, section: '§7.2', message: read.reason },
++      ],
++    }
++  }
++
++  let parsedJson: unknown
++  try {
++    parsedJson = JSON.parse(read.text)
++  } catch {
++    return disabled('mcp.json is not valid JSON (§7.2.2)')
++  }
++  const file = specFileSchema.safeParse(parsedJson)
++  if (!file.success) {
++    return disabled('mcp.json does not satisfy the §7.2.1 file shape')
++  }
++
++  const $schema = file.data.$schema
++  if ($schema !== MCP_SCHEMA_1_0_0) {
++    return disabled(`mcp.json targets an unsupported $schema ${$schema}`)
++  }
++
++  const { servers, reports } = Object.entries(file.data.mcpServers).reduce<{
++    servers: Record<string, MCPConfig>
++    reports: PluginReport[]
++  }>(
++    (acc, [name, raw]) => {
++      const mapped = toFreebuffConfig(raw)
++      if (mapped.ok) {
++        return { ...acc, servers: { ...acc.servers, [name]: mapped.config } }
++      }
++      return {
++        ...acc,
++        reports: [
++          ...acc.reports,
++          {
++            severity: 'warning',
++            section: '§7.2.2',
++            message: `skipped MCP server "${name}": ${mapped.reason}`,
++          },
++        ],
++      }
++    },
++    { servers: {}, reports: [] },
++  )
++
++  return { ok: true, servers, reports }
++}
++
++/**
++ * Reads the `mcp.json` text. §4.1.1 is settled on the resolved path before
++ * the filesystem kind is classified: a reparse point resolving outside the
++ * plugin root is a containment refusal (error report), while an absent or
++ * wrong-kind location is a §6.2 absence answered with an empty set and no
++ * report (nothing was read to report about).
++ */
++function readMCPJson(root: string):
++  | { ok: true; text: string }
++  | {
++      ok: false
++      absent: boolean
++      reason: string
++      severity: 'error' | 'warning'
++    } {
++  const file = path.join(root, 'mcp.json')
++
++  let resolved: string
++  try {
++    // Follows reparse points, and throws when nothing is there — which is
++    // the §6.2 absence, not an error.
++    resolved = realpathSync(file)
++  } catch {
++    return {
++      ok: false,
++      absent: true,
++      reason: 'no mcp.json at the plugin root',
++      severity: 'warning',
++    }
++  }
++
++  if (!isPathInside(realpathSync(root), resolved)) {
++    return {
++      ok: false,
++      absent: false,
++      reason: 'mcp.json resolves outside the plugin root (§4.1.1)',
++      severity: 'error',
++    }
++  }
++
++  if (!statSync(resolved).isFile()) {
++    return {
++      ok: false,
++      absent: true,
++      reason: 'mcp.json is not a regular file (§6.2)',
++      severity: 'warning',
++    }
++  }
++
++  try {
++    return { ok: true, text: readFileSync(resolved, 'utf8') }
++  } catch {
++    return {
++      ok: false,
++      absent: false,
++      reason: 'mcp.json could not be read (§4.1.1)',
++      severity: 'error',
++    }
++  }
++}
++
++/**
++ * Maps one spec server entry onto a freebuff config, or returns the reason
++ * the freebuff schema refuses it. The mapping itself is the two remote
++ * transport labels; every other field check is the freebuff schema's, so a
++ * field the freebuff shapes do not carry (the spec's per-entry `cwd`, for
++ * one) reaches here only to be refused by them.
++ */
++function toFreebuffConfig(
++  raw: unknown,
++): { ok: true; config: MCPConfig } | { ok: false; reason: string } {
++  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
++    return { ok: false, reason: 'server entry is not an object (§7.2.1)' }
++  }
++
++  const type = (raw as { type?: unknown }).type
++  if (type === 'stdio') {
++    return applyFreebuffSchema(raw)
++  }
++
++  const remoteType = REMOTE_TYPES[typeof type === 'string' ? type : '']
++  if (remoteType === undefined) {
++    return { ok: false, reason: `unknown type ${JSON.stringify(type)}` }
++  }
++
++  return applyFreebuffSchema({ ...raw, type: remoteType })
++}
++
++/**
++ * Runs the freebuff schema over a mapped entry: a refused entry never
++ * reaches the server map, and an accepted one comes out exactly as the
++ * freebuff schema emits it — defaults filled (`headers: {}`, `params: {}`)
++ * — so a plugin-provided server is indistinguishable from one the user
++ * wrote in `~/.agents/mcp.json` themselves.
++ */
++function applyFreebuffSchema(
++  mapped: unknown,
++): { ok: true; config: MCPConfig } | { ok: false; reason: string } {
++  const parsed = mcpConfigSchema.safeParse(mapped)
++  if (!parsed.success) {
++    const issue = parsed.error.issues[0]
++    return {
++      ok: false,
++      reason: `${issue?.path.join('.') || 'entry'}: ${issue?.message || 'does not satisfy the freebuff MCP schema'}`,
++    }
++  }
++  return { ok: true, config: parsed.data }
++}
++
++/** MCP-disabled-with-report, the §7.2.2 rule 2 outcome. */
++function disabled(reason: string): LoadMCPResult {
++  return {
++    ok: false,
++    reason,
++    reports: [refusedReport(reason)],
++  }
++}
++
++function refusedReport(reason: string): PluginReport {
++  return { severity: 'warning', section: '§7.2', message: reason }
++}
+diff --git a/common/src/plugins/report.ts b/common/src/plugins/report.ts
+new file mode 100644
+index 0000000000..97bcec97ae
+--- /dev/null
++++ b/common/src/plugins/report.ts
+@@ -0,0 +1,17 @@
++/**
++ * Reports for Agent Plugins v1.0.0: the findings freebuff surfaces about a
++ * plugin, returned as values rather than written to a console.
++ *
++ * Spec: github.com/agentplugins/agent-plugins-spec/blob/main/spec/1.0.0.md
++ */
++
++/**
++ * One finding about a plugin: how serious it is, which spec section it comes
++ * from (for example `§5.2`), and what to tell the user. Every component
++ * produces them — a rejected manifest, a skipped skill, a disabled MCP server.
++ */
++export interface PluginReport {
++  severity: 'error' | 'warning'
++  section: string
++  message: string
++}
+diff --git a/common/src/plugins/skills.ts b/common/src/plugins/skills.ts
+new file mode 100644
+index 0000000000..08336be3fc
+--- /dev/null
++++ b/common/src/plugins/skills.ts
+@@ -0,0 +1,148 @@
++import { readdirSync, statSync } from 'node:fs'
++import path from 'node:path'
++
++import { SKILL_FILE_NAME, SKILLS_DIR_NAME } from '../constants/skills'
++
++import { resolvesWithinRoot } from './containment'
++
++import type { SkillsMap } from '../types/skill'
++import type { PluginReport } from './report'
++
++/**
++ * Loads the skills component of one plugin (spec §7.1) under the containment
++ * rule of §4.1.1: the component's fixed location and every discovered
++ * `SKILL.md` must resolve within the filesystem-resolved plugin root.
++ *
++ * The reading itself is delegated to `readSkillsDir` — the SDK's `loadSkills`
++ * in production — so what makes a skill valid is decided in exactly one place.
++ * This walk contributes only what the reader cannot: §4.1.1 containment, and
++ * the reports for what it refuses. A location the reader finds silent
++ * (absent, wrong kind, one refused document) stays silent here too; recording
++ * those is a deferred duty (§7.1 SHOULD report), not this walk's.
++ *
++ * Spec: github.com/agentplugins/agent-plugins-spec/blob/main/spec/1.0.0.md
++ */
++
++/**
++ * Either the skills the reader accepted with any §4.1.1 reports, or the
++ * component type invalidated by an escaping location (§6.2). The plugin
++ * itself stays loadable in both branches, so there is no fatal branch here.
++ */
++export type LoadSkillsResult =
++  | { ok: true; skills: SkillsMap; reports: PluginReport[] }
++  | { ok: false; reason: string; reports: PluginReport[] }
++
++/**
++ * Loads `<root>/skills` through `readSkillsDir`, refusing what §4.1.1
++ * forbids: a component location resolving outside the root invalidates the
++ * component type (§6.2), and a discovered `SKILL.md` resolving outside the
++ * root skips that one skill (§7.1) while its siblings load.
++ *
++ * A refused skill is excluded from the reader's answer by directory name,
++ * which is the key the reader itself uses: it pins a skill's name to its
++ * directory, so a document whose name disagrees is refused by the reader
++ * before it ever reaches this walk.
++ */
++export function loadPluginSkills(
++  root: string,
++  readSkillsDir: (skillsDir: string) => SkillsMap,
++): LoadSkillsResult {
++  const skillsDir = path.join(root, SKILLS_DIR_NAME)
++
++  const location = resolveComponentLocation(root, skillsDir)
++  if (!location.ok) {
++    return { ok: false, reason: location.reason, reports: [location.report] }
++  }
++
++  const escaping = discoverSkillCandidates(location.skillsDir).filter(
++    (candidate) => !resolvesWithin(root, candidate.skillFile),
++  )
++
++  const skills = readSkillsDir(location.skillsDir)
++  const skipped = new Set(escaping.map(({ dir }) => path.basename(dir)))
++  const surviving = Object.fromEntries(
++    Object.entries(skills).filter(([name]) => !skipped.has(name)),
++  )
++
++  return {
++    ok: true,
++    skills: surviving,
++    reports: escaping.map(({ dir }) => ({
++      severity: 'warning',
++      section: '§4.1.1',
++      message: `skipped skill "${path.basename(dir)}": SKILL.md resolves outside the plugin root`,
++    })),
++  }
++}
++
++/**
++ * The component location's §4.1.1 status: usable when it is absent (§6.2 —
++ * a plugin may ship no skills, and the reader answers the absence with an
++ * empty set) or present within the root, invalid when it escapes.
++ */
++function resolveComponentLocation(
++  root: string,
++  skillsDir: string,
++):
++  | { ok: true; skillsDir: string }
++  | { ok: false; reason: string; report: PluginReport } {
++  try {
++    if (resolvesWithinRoot(root, skillsDir)) return { ok: true, skillsDir }
++  } catch {
++    return { ok: true, skillsDir }
++  }
++  return {
++    ok: false,
++    reason: 'skills/ resolves outside the plugin root (§4.1.1)',
++    report: {
++      severity: 'error',
++      section: '§4.1.1',
++      message: 'the skills directory resolves outside the plugin root',
++    },
++  }
++}
++
++/**
++ * The `<skillsDir>/*` entries the reader would treat as skill candidates —
++ * a directory holding a `SKILL.md` — as containment targets. Discovery here
++ * never decides validity; a document the reader would refuse simply never
++ * becomes a target, and an unreadable location yields none.
++ */
++function discoverSkillCandidates(
++  skillsDir: string,
++): { dir: string; skillFile: string }[] {
++  let entries: string[]
++  try {
++    entries = readdirSync(skillsDir)
++  } catch {
++    return []
++  }
++
++  const candidates: { dir: string; skillFile: string }[] = []
++  for (const entry of entries) {
++    const dir = path.join(skillsDir, entry)
++    const skillFile = path.join(dir, SKILL_FILE_NAME)
++    try {
++      // stat (not readdir's dirent) matches the reader: it follows reparse
++      // points, so a linked skill directory is a candidate like any other.
++      if (!statSync(dir).isDirectory()) continue
++      statSync(skillFile)
++    } catch {
++      continue
++    }
++    candidates.push({ dir, skillFile })
++  }
++  return candidates
++}
++
++/**
++ * §4.1.1 for one discovered file: inside the root, or not provably so (a
++ * path that resolves nowhere cannot be shown to stay inside).
++ */
++function resolvesWithin(root: string, file: string): boolean {
++  try {
++    return resolvesWithinRoot(root, file)
++  } catch {
++    return false
++  }
++}
+diff --git a/test/setup-scm-loader.ts b/test/setup-scm-loader.ts
+new file mode 100644
+index 0000000000..4fc905b068
+--- /dev/null
++++ b/test/setup-scm-loader.ts
+@@ -0,0 +1,14 @@
++// Required for cli unit tests: cli/bunfig.toml preloads this file, and
++// without it `bun test` in cli/ fails on every file importing the
++// @codebuff/sdk barrel, whose code-map imports *.scm query files bun has
++// no loader for. Each file becomes a JS module default-exporting its text,
++// which is how languages.ts consumes it.
++Bun.plugin({
++  name: 'setup-scm-loader',
++  setup(build) {
++    build.onLoad({ filter: /\.scm$/ }, async (args) => ({
++      contents: `export default ${JSON.stringify(await Bun.file(args.path).text())}`,
++      loader: 'js',
++    }))
++  },
++})

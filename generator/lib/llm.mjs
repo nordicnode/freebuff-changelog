@@ -520,6 +520,27 @@ export function shortError (err) {
   return msg.split('\n')[0].slice(0, 120)
 }
 
+// Rate limiting state: tracks timestamps of requests to enforce RPM budget.
+const llmRequestTimestamps = []
+
+export async function waitForLlmRpmSlot (env) {
+  const rpm = Number(env?.CHANGELOG_LLM_RPM || 60)
+  if (!rpm || rpm <= 0) return
+  const windowMs = 60000
+  while (true) {
+    const now = Date.now()
+    while (llmRequestTimestamps.length && llmRequestTimestamps[0] <= now - windowMs) {
+      llmRequestTimestamps.shift()
+    }
+    if (llmRequestTimestamps.length < rpm) {
+      llmRequestTimestamps.push(now)
+      return
+    }
+    const waitMs = Math.max(50, (llmRequestTimestamps[0] + windowMs) - now + 10)
+    await new Promise(r => setTimeout(r, waitMs))
+  }
+}
+
 // `validate` is a parameter because the ELI5 pass speaks to the same gateway
 // with a different shape: the repair retry has to check the replacement against
 // the schema that was asked for, not the summary one.
@@ -531,6 +552,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
   // retain the historical timeout instead of aborting immediately or overflowing.
   const timeoutMs = Number.isInteger(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 2147483647
     ? configuredTimeout : 60000
+  await waitForLlmRpmSlot(env)
   const res = await fetch(`${base.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -546,9 +568,11 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     signal: AbortSignal.timeout(timeoutMs)
   })
   if (res.status === 429 && attempt <= 3) {
-    // Honor Retry-After; fall back to exponential backoff.
-    const waitMs = Number(res.headers.get('retry-after')) * 1000 || 1000 * 2 ** attempt
-    log(`LLM rate-limited (429): waiting ${(waitMs / 1000).toFixed(0)}s before retry ${attempt}/3`)
+    // Honor Retry-After; fall back to exponential backoff with jitter.
+    const retryAfter = Number(res.headers.get('retry-after')) * 1000
+    const jitter = Math.floor(Math.random() * 1000)
+    const waitMs = retryAfter || (2000 * 2 ** (attempt - 1) + jitter)
+    log(`LLM rate-limited (429): waiting ${(waitMs / 1000).toFixed(1)}s before retry ${attempt}/3`)
     await new Promise(r => setTimeout(r, Math.min(waitMs, 30000)))
     return callLlm(prompt, env, attempt + 1, validate)
   }
@@ -1286,7 +1310,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   const cache = await readJson(cachePath, {})
   const rawLimit = env.CHANGELOG_LLM_LIMIT ? Number(env.CHANGELOG_LLM_LIMIT) : 60
   const limit = rawLimit > 0 ? rawLimit : Infinity
-  const concurrency = Number(env.CHANGELOG_LLM_CONCURRENCY || 5)
+  const concurrency = Number(env.CHANGELOG_LLM_CONCURRENCY || 2)
   const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
   const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
   const priority = options.priorityShas instanceof Set ? options.priorityShas : new Set(options.priorityShas || [])
@@ -1819,7 +1843,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   // budget, without touching the pass that costs real diff tokens.
   const rawEli5Limit = env.CHANGELOG_ELI5_LIMIT || env.CHANGELOG_LLM_LIMIT
   const limit = rawEli5Limit && Number(rawEli5Limit) <= 0 ? Infinity : Number(rawEli5Limit || 20)
-  const concurrency = Number(env.CHANGELOG_ELI5_CONCURRENCY || env.CHANGELOG_LLM_CONCURRENCY || 5)
+  const concurrency = Number(env.CHANGELOG_ELI5_CONCURRENCY || env.CHANGELOG_LLM_CONCURRENCY || 2)
   const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
   const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
   const priority = options.priorityShas instanceof Set ? options.priorityShas : new Set(options.priorityShas || [])
@@ -2076,7 +2100,7 @@ export function buildPrPrompt (pr, diff, ctx = {}) {
   return [
     'You write one-paragraph previews of OPEN pull requests for Freebuff, a free AI coding agent. The reader is a developer following the project. The change has NOT shipped: write in the present tense about what the PR proposes, never as if it landed.',
     'Rules: use ONLY the PR title, description, labels, commit subjects and the diff below. Never invent file names, features or motives.',
-    'Title: plain text, max 70 chars, no markdown, no trailing period, no PR number. Summary: 2-3 sentences of technical prose, backticks allowed for identifiers that appear in the material.',
+    'Title: plain text, max 70 chars, no markdown, no trailing period, no PR number, no raw camelCase or snake_case code identifiers (describe in plain English words). Summary: 2-3 sentences of technical prose, backticks allowed for identifiers that appear in the material.',
     '- Punctuation: Never use em-dashes.',
     '',
     ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP,

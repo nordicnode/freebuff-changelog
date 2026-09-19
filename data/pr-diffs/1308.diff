@@ -118,3 +118,430 @@ index 0000000000..380688885b
 +    'repick',
 +  )
 +  expect(calls.released).toEqual([])
++  expect(calls.notices).toEqual([])
++})
++
++test('a row belonging to another model is never deleted and explains the revert', async () => {
++  const { calls, deps } = takeoverHarness(heldActive('other/vendor-model'))
++
++  expect(await runModelLockedTakeover(PICKED_MODEL, LOCKED_MODEL, deps)).toBe(
++    'revert',
++  )
++  expect(calls.released).toEqual([])
++  expect(calls.notices).toEqual([FAILED_END_EXACT])
++})
++
++test('a row under a status the lock cannot attribute explains rather than being deleted', async () => {
++  const { calls, deps } = takeoverHarness({ status: 'superseded' })
++
++  expect(await runModelLockedTakeover(PICKED_MODEL, LOCKED_MODEL, deps)).toBe(
++    'revert',
++  )
++  expect(calls.reads).toBe(1)
++  expect(calls.released).toEqual([])
++  expect(calls.notices).toEqual([FAILED_END_EXACT])
++})
++
++test('a read that throws explains instead of reverting in silence', async () => {
++  const { calls, deps } = takeoverHarness(new Error('offline'))
++
++  expect(await runModelLockedTakeover(PICKED_MODEL, LOCKED_MODEL, deps)).toBe(
++    'revert',
++  )
++  expect(calls.released).toEqual([])
++  expect(calls.notices).toEqual([FAILED_END_EXACT])
++})
++
++test('a refused delete explains and does not re-POST the pick', async () => {
++  const { calls, deps } = takeoverHarness(heldActive(LOCKED_MODEL), {
++    deleteRefused: true,
++  })
++
++  expect(await runModelLockedTakeover(PICKED_MODEL, LOCKED_MODEL, deps)).toBe(
++    'revert',
++  )
++  expect(calls.notices).toEqual([FAILED_END_EXACT])
++})
++
++test('a tick that lost the loop mid-read deletes nothing and says nothing', async () => {
++  const { calls, deps } = takeoverHarness(heldActive(LOCKED_MODEL), {
++    isStale: () => true,
++  })
++
++  expect(await runModelLockedTakeover(PICKED_MODEL, LOCKED_MODEL, deps)).toBe(
++    'stale',
++  )
++  expect(calls.reads).toBe(1)
++  expect(calls.released).toEqual([])
++  expect(calls.notices).toEqual([])
++})
++
++test('a background rejoin hitting the lock reverts in silence, without reading the server', async () => {
++  const { calls, deps } = takeoverHarness(heldActive(LOCKED_MODEL))
++
++  expect(await runModelLockedTakeover(null, LOCKED_MODEL, deps)).toBe('revert')
++  expect(calls.reads).toBe(0)
++  expect(calls.released).toEqual([])
++  expect(calls.notices).toEqual([])
++})
++
++test('a pick naming the locked model itself takes over nothing', async () => {
++  const { calls, deps } = takeoverHarness(heldActive(LOCKED_MODEL))
++
++  expect(await runModelLockedTakeover(LOCKED_MODEL, LOCKED_MODEL, deps)).toBe(
++    'revert',
++  )
++  expect(calls.reads).toBe(0)
++  expect(calls.notices).toEqual([])
++})
++
++test('the explicit-pick marker annotates exactly one response', () => {
++  takeFreebuffExplicitPick()
++  noteFreebuffExplicitPick(PICKED_MODEL)
++  expect(takeFreebuffExplicitPick()).toBe(PICKED_MODEL)
++  expect(takeFreebuffExplicitPick()).toBeNull()
++})
++
++test('a lock that races back after the retry reverts instead of looping', async () => {
++  // Driven by the real marker: the tick reads it through
++  // `takeFreebuffExplicitPick`, so the re-POST a retry produces arrives with
++  // nothing left to take over.
++  takeFreebuffExplicitPick()
++  noteFreebuffExplicitPick(PICKED_MODEL)
++  const { calls, deps } = takeoverHarness({ status: 'none' })
++  const outcomes: ModelLockedTakeoverOutcome[] = []
++  for (let round = 0; round < 5; round += 1) {
++    const outcome = await runModelLockedTakeover(
++      takeFreebuffExplicitPick(),
++      LOCKED_MODEL,
++      deps,
++    )
++    outcomes.push(outcome)
++    if (outcome === 'revert') break
++  }
++
++  expect(outcomes).toEqual(['repick', 'revert'])
++  expect(calls.reads).toBe(1)
++  expect(calls.notices).toEqual([])
++})
+diff --git a/cli/src/hooks/use-freebuff-session.ts b/cli/src/hooks/use-freebuff-session.ts
+index ab8b2ea7db..124991d7d6 100644
+--- a/cli/src/hooks/use-freebuff-session.ts
++++ b/cli/src/hooks/use-freebuff-session.ts
+@@ -42,6 +42,7 @@ import {
+   holdsLiveFreebuffSlot,
+   isFreebuffSessionTimeoutError,
+   mergeCompactActiveSession,
++  planModelLockedSwitch,
+ } from '../utils/freebuff-session-api'
+ import {
+   failedPollDelayMs,
+@@ -53,6 +54,7 @@ import type { FreebuffSessionResponse } from '../types/freebuff-session'
+ import type {
+   FreebuffCountryBlockReason,
+   FreebuffIpPrivacySignal,
++  FreebuffSessionServerResponse,
+ } from '@codebuff/common/types/freebuff-session'
+ 
+ const POLL_INTERVAL_ACTIVE_MS = 30_000
+@@ -135,6 +137,21 @@ let controller: PollController | null = null
+  */
+ let pendingExplicitPickModel: string | null = null
+ 
++/** Record that the next server response answers a deliberate user pick. */
++export function noteFreebuffExplicitPick(model: string): void {
++  pendingExplicitPickModel = model
++}
++
++/** Read and clear the marker. Consume-once is what bounds a `model_locked`
++ *  takeover to a single retry: the re-POST it triggers arrives with nothing
++ *  left to annotate, so a lock that races back takes the revert branch instead
++ *  of taking the slot over again (#1298). */
++export function takeFreebuffExplicitPick(): string | null {
++  const picked = pendingExplicitPickModel
++  pendingExplicitPickModel = null
++  return picked
++}
++
+ /** Read the current instance id for outgoing chat requests. Defined via
+  *  `holdsLiveFreebuffSlot` so the two can't drift: an id exists exactly while
+  *  we hold a live slot (active, or `ended` inside the server-side grace
+@@ -338,7 +355,7 @@ export function startFreebuffSession(model: string): Promise<void> {
+   const resolved = resolveFreebuffModelPickForSession(model, current)
+   // Remember that the next POST is a deliberate pick, so a `model_locked`
+   // rejection explains itself in chat instead of reverting silently.
+-  pendingExplicitPickModel = resolved
++  noteFreebuffExplicitPick(resolved)
+   useFreebuffModelStore.getState().setSelectedModel(resolved)
+   saveFreebuffModelPreference(resolved)
+   return restartFreebuffSession('rejoin')
+@@ -409,6 +426,78 @@ export function markFreebuffSessionEnded(): void {
+   })
+ }
+ 
++/** Everything the `model_locked` branch needs from the poll loop, passed in so
++ *  the branch can be exercised without mounting the hook. */
++export interface ModelLockedTakeoverDeps {
++  /** The follow-up GET that reads the row holding the lock. */
++  fetchHeld: () => Promise<FreebuffSessionServerResponse>
++  /** DELETE the row the planner said to release. */
++  releaseSlot: (held: FreebuffSessionServerResponse) => Promise<unknown>
++  /** Append a system message to the chat. */
++  notify: (message: string) => void
++  /** True once this tick's response is no longer actionable. */
++  isStale: () => boolean
++}
++
++export type ModelLockedTakeoverOutcome = 'repick' | 'revert' | 'stale'
++
++/** Act on a `model_locked` response for a deliberate pick: take the held row
++ *  over, or give up and revert the local selection. Returns 'repick' when the
++ *  lock is clear (we released the row, or the GET found nothing left to
++ *  release), 'revert' when the pick cannot be honored, and 'stale' when the
++ *  tick lost ownership mid-flight and must neither act nor reschedule.
++ *
++ *  `explicitPickModel` is the marker as the tick consumed it: null on a
++ *  background rejoin, and null on the re-POST a retry produced, which is what
++ *  bounds the retry to one round (#1298). The "ending it failed" notice fires
++ *  only after a read or delete was genuinely attempted — that false report was
++ *  the bug. */
++export async function runModelLockedTakeover(
++  explicitPickModel: string | null,
++  lockedModel: string,
++  deps: ModelLockedTakeoverDeps,
++): Promise<ModelLockedTakeoverOutcome> {
++  if (!explicitPickModel || explicitPickModel === lockedModel) return 'revert'
++  const labels = {
++    current: getFreebuffModel(lockedModel).displayName,
++    requested: getFreebuffModel(explicitPickModel).displayName,
++  }
++  let released = false
++  let lockRaced = false
++  try {
++    const held = await deps.fetchHeld()
++    if (!deps.isStale()) {
++      const action = planModelLockedSwitch(held, lockedModel)
++      if (action === 'release') {
++        await deps.releaseSlot(held)
++        released = true
++      } else if (action === 'retry') {
++        lockRaced = true
++      }
++    }
++  } catch {
++    // Reading or deleting the held row failed — fall through to the
++    // revert-with-explanation path below rather than stranding the user
++    // mid-switch.
++  }
++  if (deps.isStale()) return 'stale'
++  if (released) {
++    deps.notify(
++      `Ended your previous session on ${labels.current} and switched to ${labels.requested}.`,
++    )
++    return 'repick'
++  }
++  if (lockRaced) {
++    // The GET found no row left to release: the lock raced and released
++    // itself. Re-POST rather than reporting an end that was never needed.
++    return 'repick'
++  }
++  deps.notify(
++    `You're already in an active session on ${labels.current}, and ending it failed, so the switch to ${labels.requested} was not applied. Run /end-session, then pick ${labels.requested}. (Sessions end on their own after 1 hour.)`,
++  )
++  return 'revert'
++}
++
+ interface UseFreebuffSessionResult {
+   session: FreebuffSessionResponse | null
+   failure: ReturnType<typeof useFreebuffSessionStore.getState>['failure']
+@@ -570,8 +659,7 @@ export function useFreebuffSession(): UseFreebuffSessionResult {
+ 
+         // Consume the explicit-pick marker: it annotates exactly the first
+         // response after a user pick, whatever that response turns out to be.
+-        const explicitPickModel = pendingExplicitPickModel
+-        pendingExplicitPickModel = null
++        const explicitPickModel = takeFreebuffExplicitPick()
+ 
+         // The session is model-locked server-side: an active session on
+         // another model rejects the switch. Two cases:
+@@ -588,58 +676,33 @@ export function useFreebuffSession(): UseFreebuffSessionResult {
+         //     (2026-07-30): sessions live 1h even when idle, so users
+         //     constantly pick a model while a row is still active.
+         if (next.status === 'model_locked') {
+-          if (explicitPickModel && explicitPickModel !== next.currentModel) {
+-            const current = getFreebuffModel(next.currentModel).displayName
+-            const requested = getFreebuffModel(explicitPickModel).displayName
+-            let released = false
+-            try {
+-              const held = await callFreebuffSession('GET', token, {
+-                signal: fetchController.signal,
+-              })
+-              if (
+-                !cancelled &&
+-                !fetchController.signal.aborted &&
+-                generation === restartGeneration &&
+-                held.status === 'active' &&
+-                held.model === next.currentModel
+-              ) {
+-                await useFreebuffSessionStore
++          const outcome = await runModelLockedTakeover(
++            explicitPickModel,
++            next.currentModel,
++            {
++              fetchHeld: () =>
++                callFreebuffSession('GET', token, {
++                  signal: fetchController.signal,
++                }),
++              releaseSlot: (held) =>
++                useFreebuffSessionStore
+                   .getState()
+-                  .releaseSlot(held, fetchController.signal)
+-                released = true
+-              }
+-            } catch {
+-              // DELETE failed — fall through to the revert-with-explanation
+-              // path below rather than stranding the user mid-switch.
+-            }
+-            if (
+-              cancelled ||
+-              fetchController.signal.aborted ||
+-              generation !== restartGeneration
+-            ) {
+-              return
+-            }
+-            if (released) {
+-              useChatStore
+-                .getState()
+-                .setMessages((prev) => [
+-                  ...prev,
+-                  getSystemMessage(
+-                    `Ended your previous session on ${current} and switched to ${requested}.`,
+-                  ),
+-                ])
+-              nextMethod = 'POST'
+-              schedule(0)
+-              return
+-            }
+-            useChatStore
+-              .getState()
+-              .setMessages((prev) => [
+-                ...prev,
+-                getSystemMessage(
+-                  `You're already in an active session on ${current}, and ending it failed, so the switch to ${requested} was not applied. Run /end-session, then pick ${requested}. (Sessions end on their own after 1 hour.)`,
+-                ),
+-              ])
++                  .releaseSlot(held, fetchController.signal),
++              notify: (message) =>
++                useChatStore
++                  .getState()
++                  .setMessages((prev) => [...prev, getSystemMessage(message)]),
++              isStale: () =>
++                cancelled ||
++                fetchController.signal.aborted ||
++                generation !== restartGeneration,
++            },
++          )
++          if (outcome === 'stale') return
++          if (outcome === 'repick') {
++            nextMethod = 'POST'
++            schedule(0)
++            return
+           }
+           useFreebuffModelStore.getState().setSelectedModel(next.currentModel)
+           schedule(0)
+diff --git a/cli/src/utils/__tests__/freebuff-session-api.test.ts b/cli/src/utils/__tests__/freebuff-session-api.test.ts
+index c3e1d18aab..183b7f97d8 100644
+--- a/cli/src/utils/__tests__/freebuff-session-api.test.ts
++++ b/cli/src/utils/__tests__/freebuff-session-api.test.ts
+@@ -10,8 +10,11 @@ import {
+   classifyFreebuffSessionRequestFailure,
+   FreebuffSessionRequestError,
+   mergeCompactActiveSession,
++  planModelLockedSwitch,
+ } from '../freebuff-session-api'
+ 
++import type { FreebuffSessionServerResponse } from '@codebuff/common/types/freebuff-session'
++
+ let fetchSpy: ReturnType<typeof spyOn> | undefined
+ 
+ afterEach(() => {
+@@ -230,3 +233,45 @@ test('DELETE sends the held instance and preserves the server refund receipt', a
+     'held-cli',
+   )
+ })
++
++const heldActive = (model: string): FreebuffSessionServerResponse => ({
++  status: 'active',
++  accessTier: 'full',
++  instanceId: 'inst-held',
++  model,
++  admittedAt: '2026-09-09T00:00:00.000Z',
++  expiresAt: '2026-09-09T01:00:00.000Z',
++  remainingMs: 60_000,
++})
++
++test('a deliberate pick releases the row that holds the lock', () => {
++  expect(planModelLockedSwitch(heldActive('x/mimo'), 'x/mimo')).toBe('release')
++})
++
++test('an ended row still inside the grace window is released (#1298)', () => {
++  expect(
++    planModelLockedSwitch(
++      { status: 'ended', instanceId: 'inst-held' },
++      'x/mimo',
++    ),
++  ).toBe('release')
++})
++
++test('an ended row past grace means nothing to end: retry the pick', () => {
++  expect(planModelLockedSwitch({ status: 'ended' }, 'x/mimo')).toBe('retry')
++})
++
++test('a swept row means nothing to end: retry the pick', () => {
++  expect(planModelLockedSwitch({ status: 'none' }, 'x/mimo')).toBe('retry')
++})
++
++test('a different model than the lock named is never deleted', () => {
++  expect(planModelLockedSwitch(heldActive('x/other'), 'x/mimo')).toBe('explain')
++})
++
++test('no readable row explains instead of claiming a failed end', () => {
++  expect(planModelLockedSwitch(undefined, 'x/mimo')).toBe('explain')
++  expect(planModelLockedSwitch({ status: 'superseded' }, 'x/mimo')).toBe(
++    'explain',
++  )
++})
+diff --git a/cli/src/utils/freebuff-session-api.ts b/cli/src/utils/freebuff-session-api.ts
+index 7c32853088..8a4e47a167 100644
+--- a/cli/src/utils/freebuff-session-api.ts
++++ b/cli/src/utils/freebuff-session-api.ts
+@@ -227,3 +227,29 @@ export function holdsLiveFreebuffSlot(
+     (current.status === 'ended' && Boolean(current.instanceId))
+   )
+ }
++
++/** What the `model_locked` takeover should do with the row a follow-up GET
++ *  returned. One function asks this so "we tried to end it and failed" stays
++ *  distinguishable from "there was nothing to end":
++ *   - 'release': the row still holds a slot — active on the locked model, or
++ *     `ended` inside the grace window (the stale row from a crashed CLI; its
++ *     DELETE replays the refund receipt idempotently via the instance id).
++ *   - 'retry': no row is left to release (#1298: the lock raced and released
++ *     itself) — re-POST instead of reporting a failed end.
++ *   - 'explain': anything we cannot attribute to this lock, including a row
++ *     that arrived under an unexpected status — never delete it blindly.
++ */
++export type ModelLockedSwitchAction = 'release' | 'retry' | 'explain'
++
++export function planModelLockedSwitch(
++  held: FreebuffSessionServerResponse | undefined,
++  lockedModel: string,
++): ModelLockedSwitchAction {
++  if (!held) return 'explain'
++  if (held.status === 'none') return 'retry'
++  if (held.status === 'ended') {
++    return held.instanceId ? 'release' : 'retry'
++  }
++  if (held.status === 'active' && held.model === lockedModel) return 'release'
++  return 'explain'
++}

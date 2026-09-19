@@ -118,3 +118,196 @@ index 7ea7854e84..9fc4ba160a 100644
 -   * that merely mentions the tag. The runtime additionally requires the header
 -   * its own envelope always carries. This matters more here because the
 -   * cache-expiry trigger compacts on ordinary idle turns.
++   * Former divergence #2, closed. The pruner used to treat any user message
++   * containing `<conversation_summary>` as a memory artifact — dropping it
++   * from the history and re-parsing it as entries, which silently ate a user
++   * message that merely mentions the tag, and (as findLast picks the LAST
++   * match) let a quoting message steal the real summary's identity and erase
++   * the older memory. Both implementations now recognize summaries by the
++   * CONVERSATION_SUMMARY tag they stamp, with a legacy full-envelope fallback
++   * that a bare tag mention does not satisfy.
+    */
+-  it('keeps a user message that only mentions the tag, where the pruner eats it', () => {
++  it('keeps a user message that only mentions the tag, in both implementations', () => {
+     const history: Message[] = [
+       user('why does it emit <conversation_summary> around the memory?'),
+       assistant('because the model needs a delimiter'),
+@@ -412,7 +414,7 @@ describe('context-pruner parity', () => {
+     const prunerMemory = textOfFirst(runPruner(history))
+ 
+     expect(runtimeMemory).toContain('why does it emit')
+-    expect(prunerMemory).not.toContain('why does it emit')
++    expect(prunerMemory).toContain('why does it emit')
+   })
+ 
+   it('matches the pruner when a budget evicts old entries', () => {
+diff --git a/packages/agent-runtime/src/__tests__/main-prompt.test.ts b/packages/agent-runtime/src/__tests__/main-prompt.test.ts
+index 841c5953a0..3028c69201 100644
+--- a/packages/agent-runtime/src/__tests__/main-prompt.test.ts
++++ b/packages/agent-runtime/src/__tests__/main-prompt.test.ts
+@@ -445,4 +445,101 @@ describe('mainPrompt', () => {
+ 
+     expect(output.type).toBeDefined() // Output should exist even for empty response
+   })
++
++  it('does not replace the history with an empty summary on /compact', async () => {
++    // A silent empty stop yields no recovery chunk, so an unguarded /compact
++    // replacement would collapse the whole history into one summary message
++    // carrying nothing — every earlier turn gone from the model's context.
++    mockAgentStream([])
++
++    const sessionState = getInitialSessionState(mockFileContext)
++    sessionState.mainAgentState.messageHistory = [
++      {
++        role: 'user' as const,
++        content: [{ type: 'text' as const, text: 'earlier turn: fix the login bug' }],
++        sentAt: 1,
++      },
++      {
++        role: 'assistant' as const,
++        content: [{ type: 'text' as const, text: 'fixed it' }],
++        sentAt: 2,
++      },
++    ]
++    const action = {
++      type: 'prompt' as const,
++      prompt: '/compact',
++      sessionState,
++      fingerprintId: 'test',
++      costMode: 'normal' as const,
++      promptId: 'test',
++      toolResults: [],
++    }
++
++    const { sessionState: newSessionState } = await mainPrompt({
++      ...mainPromptBaseParams,
++      action,
++      localAgentTemplates: mockLocalAgentTemplates,
++    })
++
++    // The history survives: no empty summary message, earlier turns intact.
++    const history = newSessionState.mainAgentState.messageHistory
++    expect(
++      history.some((m) => textOfHistoryMessage(m).includes('The following is a summary')),
++    ).toBe(false)
++    expect(
++      history.some((m) => textOfHistoryMessage(m).includes('earlier turn: fix the login bug')),
++    ).toBe(true)
++  })
++
++  it('still replaces the history on /compact when the model produced a summary', async () => {
++    mockAgentStream([{ type: 'text', text: 'Summary: the user asked to fix the login bug, which was fixed.' }])
++
++    const sessionState = getInitialSessionState(mockFileContext)
++    sessionState.mainAgentState.messageHistory = [
++      {
++        role: 'user' as const,
++        content: [{ type: 'text' as const, text: 'earlier turn: fix the login bug' }],
++        sentAt: 1,
++      },
++      {
++        role: 'assistant' as const,
++        content: [{ type: 'text' as const, text: 'fixed it' }],
++        sentAt: 2,
++      },
++    ]
++    const action = {
++      type: 'prompt' as const,
++      prompt: '/compact',
++      sessionState,
++      fingerprintId: 'test',
++      costMode: 'normal' as const,
++      promptId: 'test',
++      toolResults: [],
++    }
++
++    const { sessionState: newSessionState } = await mainPrompt({
++      ...mainPromptBaseParams,
++      action,
++      localAgentTemplates: mockLocalAgentTemplates,
++    })
++
++    const history = newSessionState.mainAgentState.messageHistory
++    expect(history).toHaveLength(1)
++    expect(textOfHistoryMessage(history[0])).toContain(
++      'Summary: the user asked to fix the login bug',
++    )
++  })
+ })
++
++function textOfHistoryMessage(message: { content: unknown }): string {
++  const content = message.content as unknown
++  if (typeof content === 'string') return content
++  if (Array.isArray(content)) {
++    return content
++      .map((part: { type?: string; text?: string }) =>
++        part.type === 'text' && typeof part.text === 'string' ? part.text : '',
++      )
++      .join('\n')
++  }
++  return ''
++}
+diff --git a/packages/agent-runtime/src/compact-history.ts b/packages/agent-runtime/src/compact-history.ts
+index cbf5d8ac56..601b4f4119 100644
+--- a/packages/agent-runtime/src/compact-history.ts
++++ b/packages/agent-runtime/src/compact-history.ts
+@@ -366,25 +366,41 @@ const SCAFFOLDING_TAGS = [
+   'SUBAGENT_SPAWN',
+ ]
+ 
++/** Message tag stamped on the summary message this module (and the inlined
++ *  copy in agents/context-pruner.ts) produces, so the next compaction finds
++ *  the real memory artifact by provenance instead of by content. Identity by
++ *  content is unsafe: a USER message that quotes the summary markers — asking
++ *  about this very mechanism, pasting an old summary back — used to be taken
++ *  for the real one. The `findLast` then picked the quote, the actual summary
++ *  was dropped with the rest of the history, and every earlier turn vanished
++ *  from the model's context at the next compaction. */
++export const CONVERSATION_SUMMARY_TAG = 'CONVERSATION_SUMMARY'
++
+ /**
+  * Recognizes a memory artifact this module (or the context-pruner) produced.
+  *
+- * Both markers are required, and that is the point. A summary is dropped from
+- * the history and re-parsed into entries, so anything mistaken for one is
+- * silently eaten — and the bare `<conversation_summary>` tag is a string a user
+- * can easily send, most obviously when asking about this very code. Requiring
+- * the header too means only text that reproduces our envelope qualifies.
++ * The tag is the identity: only messages this pass itself produced carry it,
++ * and a user message can never gain it by content alone. The envelope check
++ * below is a legacy fallback only — summaries written before the tag existed
++ * carry no marker, so re-summarizing them (which preserves their text as an
++ * entry, nested once) beats losing them. It requires the FULL envelope
++ * including `<historical_memory>`: a user message that merely quotes the tag
++ * and the header must not qualify.
+  *
+- * The context-pruner matches on the tag alone. That is a deliberate divergence
+- * (see the parity test): it matters much more here, because the cache-expiry
+- * trigger compacts on ordinary idle turns rather than only near the context
+- * limit, so a user message can meet a compaction pass within minutes.
++ * The context-pruner matches on the tag alone in its pre-tag copy. That is a
++ * deliberate divergence to port (see the parity test): a bare
++ * `<conversation_summary>` in a user message is easy to send, most obviously
++ * when asking about this very code.
+  */
+ function isConversationSummary(message: Message): boolean {
+   if (message.role !== 'user') return false
++  if (message.tags?.includes(CONVERSATION_SUMMARY_TAG)) return true
+   const text = getTextContent(message)
+   return (
+-    text.includes('<conversation_summary>') && text.includes(SUMMARY_HEADER)
++    text.includes('<conversation_summary>') &&
++    text.includes('</conversation_summary>') &&
++    text.includes(SUMMARY_HEADER) &&
++    text.includes('<historical_memory>')
+   )
+ }
+ 
+@@ -743,6 +759,7 @@ ${SUMMARY_DISCLAIMER}`,
+     role: 'user',
+     content: [textPart, ...imageParts],
+     sentAt,
++    tags: [CONVERSATION_SUMMARY_TAG],
+   }
+ }
+ 

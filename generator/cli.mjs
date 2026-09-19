@@ -439,7 +439,10 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
     // never pruned, because decoration is always the thing that runs out.
     const partial = refused || used >= PR_CALL_BUDGET || !complete
     const hasChanges = !prsEqual(cached, list, total, complete, partial)
-    if (hasChanges || force || !cached?.fetchedAt) {
+    // If data changed, or force is set, or fetchedAt is older than 60m: refresh fetchedAt on disk
+    // so the site doesn't falsely warn that the sync has stalled when the upstream repo is quiet.
+    const staleDiskCheck = cached?.fetchedAt ? (Date.now() - (Date.parse(cached.fetchedAt) || 0) > 60 * 60000) : true
+    if (hasChanges || force || staleDiskCheck) {
       const nowIso = new Date().toISOString()
       lastDiskFetchedMap.set(dataDir, nowIso)
       lastCheckTimeMap.set(dataDir, Date.now())
