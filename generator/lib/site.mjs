@@ -2219,7 +2219,6 @@ ${archiveScript}`
   }), 8)
   if (weeks.length) {
     const totalReleases = weeks.reduce((sum, w) => sum + w.releases.length, 0)
-    const latestWeek = weeks[0]
 
     const formatWeekRange = (monday, sunday) => {
       const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -2240,139 +2239,100 @@ ${archiveScript}`
       weeksByYear.get(year).push(w)
     }
 
-    const heroReleases = latestWeek.releases.map(r => {
-      const v = r.version || r.freebuffVersion
-      return v ? `<a class="week-ver-chip" href="/release/${esc(v)}/" title="Release ${esc(v)}">v${esc(v)}</a>` : ''
-    }).filter(Boolean).join(' ')
-
-    const heroHighlights = latestWeek.top.slice(0, 3).map(e => {
-      const t = e.ai?.title || e.title
-      return `<li><a href="/day/${esc(e.day)}/#${esc(e.sha.slice(0, 12))}">${esc(t)}</a></li>`
-    }).join('')
-
-    const heroCard = `
-<div class="week-hero">
-  <div class="week-hero-top">
-    <span class="week-hero-tag">CURRENT WEEK</span>
-    <span class="week-hero-dates">${formatWeekRange(latestWeek.monday, latestWeek.sunday)}</span>
-  </div>
-  <h2 class="week-hero-title"><a href="${weekHref(latestWeek)}">WEEK ${esc(latestWeek.key)}</a></h2>
-  <div class="week-badges">
-    ${latestWeek.releases.length ? `<span class="badge ver">${latestWeek.releases.length} release${latestWeek.releases.length === 1 ? '' : 's'}</span>` : ''}
-    ${latestWeek.models.length ? `<span class="badge model">${latestWeek.models.length} model change${latestWeek.models.length === 1 ? '' : 's'}</span>` : ''}
-    ${latestWeek.security.length ? `<span class="badge sec">${latestWeek.security.length} security</span>` : ''}
-    <span class="badge not">${latestWeek.counts.changes} changes &middot; ${latestWeek.dayCount} days</span>
-  </div>
-  ${heroReleases ? `<div class="week-hero-releases"><span class="releases-label">Shipped:</span> ${heroReleases}</div>` : ''}
-  ${heroHighlights ? `<ul class="week-hero-highlights">${heroHighlights}</ul>` : ''}
-  <div class="week-hero-actions">
-    <a class="week-hero-btn" href="${weekHref(latestWeek)}">Read Week ${esc(latestWeek.key)} Digest &rarr;</a>
-    <button class="meta-link dc-copy" type="button" data-dc="${esc(`**FREEBUFF weekly** · ${latestWeek.key}\n${weeklyText(latestWeek, SITE.url)}`.slice(0, 1990))}" title="Copy this digest as Discord-formatted text">copy discord</button>
-  </div>
-</div>`
-
-    const weekCard = (w) => {
-      const vers = w.releases.map(r => r.version || r.freebuffVersion).filter(Boolean)
-      const verPills = vers.map(v => `<a class="week-ver-chip" href="/release/${esc(v)}/" title="Release ${esc(v)}">v${esc(v)}</a>`).join(' ')
+    const weekRow = (w) => {
       const range = formatWeekRange(w.monday, w.sunday)
-      const topTitles = w.top.slice(0, 2).map(e => e.ai?.title || e.title).filter(Boolean)
-      const headline = topTitles.length ? topTitles.join(' · ') : weeklyHeadline(w)
-      const searchTerms = [w.key, range, ...vers, ...topTitles, weeklyHeadline(w)].join(' ').toLowerCase()
+      const vers = w.releases.map(r => r.version || r.freebuffVersion).filter(Boolean)
+      const relBadges = vers.map(v => `<a class="badge ver" href="/release/${esc(v)}/" title="Release ${esc(v)}">v${esc(v)}</a>`).join(' ')
+      const topItem = w.top[0] ? (w.top[0].ai?.title || w.top[0].title) : ''
+      const sumText = topItem ? `${topItem} &middot; ${weeklyHeadline(w)}` : weeklyHeadline(w)
 
-      return `
-<div class="week-card" data-search="${esc(searchTerms)}">
-  <div class="week-card-date">
-    <a class="week-card-key" href="${weekHref(w)}">${esc(w.key)}</a>
-    <span class="week-card-span">${esc(range)}</span>
+      return `<div class="crow" id="${esc(w.key)}">
+  <span class="crow-time">${esc(w.key.slice(5))}</span>
+  <a class="crow-title" href="${weekHref(w)}"><b>${esc(w.key)}</b> &middot; ${esc(range)}</a>
+  ${relBadges}
+  ${w.models.length ? `<span class="badge model" title="${w.models.length} model catalog change${w.models.length === 1 ? '' : 's'}">models</span>` : ''}
+  ${w.security.length ? `<span class="badge sec" title="${w.security.length} security-relevant change${w.security.length === 1 ? '' : 's'}">sec</span>` : ''}
+  <div class="meta-links">
+    <a class="meta-link" href="${weekHref(w)}">[digest]</a>
+    <button class="meta-link dc-copy" type="button" data-dc="${esc(`**FREEBUFF weekly** · ${w.key}\n${weeklyText(w, SITE.url)}`.slice(0, 1990))}" title="Copy this digest as Discord-formatted text">discord</button>
   </div>
-  <div class="week-card-main">
-    <div class="week-badges">
-      ${w.releases.length ? `<span class="badge ver">${w.releases.length} release${w.releases.length === 1 ? '' : 's'}</span>` : ''}
-      ${w.models.length ? `<span class="badge model">${w.models.length} model${w.models.length === 1 ? '' : 's'}</span>` : ''}
-      ${w.security.length ? `<span class="badge sec">${w.security.length} sec</span>` : ''}
-      <span class="badge not">${w.counts.changes} changes</span>
-    </div>
-    ${verPills ? `<div class="week-card-releases">${verPills}</div>` : ''}
-    <div class="week-card-headline" title="${esc(headline)}">${esc(headline)}</div>
-  </div>
-  <div class="week-card-action">
-    <a class="week-open-link" href="${weekHref(w)}">digest &rarr;</a>
-    <button class="meta-link dc-copy" type="button" data-dc="${esc(`**FREEBUFF weekly** · ${w.key}\n${weeklyText(w, SITE.url)}`.slice(0, 1990))}" title="Copy Discord markdown">discord</button>
-  </div>
+  <span class="crow-sum">${esc(sumText)}</span>
 </div>`
     }
 
-    const yearPills = `
-<div class="week-year-pills">
-  <span class="year-pills-label">ARCHIVE:</span>
-  ${[...weeksByYear.entries()].map(([yr, yrWeeks]) => `
-    <a href="#year-${esc(yr)}" class="year-pill">${esc(yr)} <span class="chip-n">${yrWeeks.length}</span></a>
-  `).join('')}
-</div>`
-
-    const filterBar = `
-<div class="week-filter-wrap">
-  <input type="search" id="week-filter" class="week-search-input" placeholder="Filter weeks by version, date, or topic (e.g. '0.0.178', 'models', 'security')…" aria-label="Filter weekly digests" />
-  <span class="week-filter-count" id="week-filter-count"></span>
-</div>`
-
-    const yearSections = [...weeksByYear.entries()].map(([yr, yrWeeks]) => {
+    const yearSections = [...weeksByYear.entries()].map(([yr, yrWeeks], i) => {
       const yrReleases = yrWeeks.reduce((s, w) => s + w.releases.length, 0)
       const yrChanges = yrWeeks.reduce((s, w) => s + w.counts.changes, 0)
-      return `
-<section class="year-section" id="year-${esc(yr)}">
-  <div class="section-hdr">
-    <h2>${esc(yr)} ARCHIVE (${yrWeeks.length} WEEKS &middot; ${yrReleases} RELEASES &middot; ${yrChanges.toLocaleString()} CHANGES)</h2>
-    <a href="#top" class="back-to-top">[&uarr; top]</a>
-  </div>
-  <div class="week-grid">
-    ${yrWeeks.map(weekCard).join('\n')}
-  </div>
-</section>`
+      const open = i === 0 ? ' open' : ''
+      return `<div class="wyear-group" data-year="${esc(yr)}">
+  <h3 class="archive-year">${esc(yr)}</h3>
+  <details class="amonth"${open} id="week-year-${esc(yr)}">
+    <summary>
+      <span class="am-name">${esc(yr)} Weekly Rollups</span>
+      <span class="am-meta">${yrWeeks.length} weeks &middot; ${yrReleases} releases &middot; ${yrChanges.toLocaleString()} changes</span>
+    </summary>
+    <div class="am-body">
+      <section class="week-rows">
+        ${yrWeeks.map(weekRow).join('\n')}
+      </section>
+    </div>
+  </details>
+</div>`
     }).join('\n')
 
-    const filterScript = `
-<script>
+    const weekTabsScript = `<script>
 (function () {
-  var input = document.getElementById('week-filter');
-  var countEl = document.getElementById('week-filter-count');
-  if (!input) return;
-  var cards = [].slice.call(document.querySelectorAll('.week-card'));
-  var sections = [].slice.call(document.querySelectorAll('.year-section'));
-  input.addEventListener('input', function () {
-    var q = input.value.trim().toLowerCase();
-    var visible = 0;
-    cards.forEach(function (card) {
-      var text = (card.getAttribute('data-search') || card.textContent || '').toLowerCase();
-      var match = !q || text.indexOf(q) !== -1;
-      card.hidden = !match;
-      if (match) visible++;
-    });
-    sections.forEach(function (sec) {
-      var hasVisible = sec.querySelectorAll('.week-card:not([hidden])').length > 0;
-      sec.hidden = !hasVisible;
-    });
-    if (countEl) {
-      countEl.textContent = q ? (visible + ' of ' + cards.length + ' weeks') : '';
+  var tabs = document.getElementById('week-tabs');
+  if (!tabs) return;
+  var groups = [].slice.call(document.querySelectorAll('.wyear-group'));
+  tabs.addEventListener('click', function (ev) {
+    var b = ev.target.closest ? ev.target.closest('.atab') : null;
+    if (b) {
+      var yr = b.getAttribute('data-year');
+      [].slice.call(tabs.querySelectorAll('.atab')).forEach(function (btn) {
+        var on = btn === b;
+        btn.classList.toggle('active', on);
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+      });
+      groups.forEach(function (g) {
+        var match = yr === 'all' || g.getAttribute('data-year') === yr;
+        g.hidden = !match;
+        if (match && yr !== 'all') {
+          var d = g.querySelector('details.amonth');
+          if (d) d.open = true;
+        }
+      });
+      return;
     }
+    var f = ev.target.closest ? ev.target.closest('[data-fold]') : null;
+    if (!f) return;
+    var open = f.getAttribute('data-fold') === 'open';
+    groups.forEach(function (g) {
+      if (!g.hidden) {
+        var d = g.querySelector('details.amonth');
+        if (d) d.open = open;
+      }
+    });
   });
 })();
 </script>`
 
-    const body = `<section class="hero" id="top">
+    const body = `<section class="hero">
   <div class="term-box">
     <div class="term-box-hdr">
-      <span class="term-box-title">WEEKLY_DIGESTS :: high-level rollups</span>
+      <span class="term-box-title">WEEKLY_DIGESTS :: calendar rollups</span>
       <span>${weeks.length} weeks &middot; ${totalReleases} releases &middot; <a href="/feed-weekly.xml">[rss]</a></span>
     </div>
-    <p class="list-note">High-level weekly rollups synthesizing releases, model catalog shifts, security updates, and notable architectural work. Select a week to read its digest or copy a Markdown summary formatted for Discord.</p>
+    <nav class="archive-tabs" id="week-tabs" aria-label="Filter weekly digests by year">
+      <button type="button" class="atab active" data-year="all" aria-pressed="true">ALL WEEKS<span class="chip-n">${weeks.length}</span></button>
+      ${[...weeksByYear.entries()].map(([yr, yrWeeks]) => `<button type="button" class="atab" data-year="${esc(yr)}" aria-pressed="false">${esc(yr)}<span class="chip-n">${yrWeeks.length}</span></button>`).join('')}
+      <span class="atab-fold"><button type="button" data-fold="open">[expand years]</button><button type="button" data-fold="close">[collapse]</button></span>
+    </nav>
   </div>
 </section>
-${heroCard}
-${yearPills}
-${filterBar}
+<p class="list-note">Every week rolled up into releases, model catalog shifts, security updates, and top architectural work. Open a year to view its weekly digests or copy a Markdown summary for Discord.</p>
 ${yearSections}
-${filterScript}`
+${weekTabsScript}`
 
     await write(dist, 'week/index.html', layout({
       title: 'Weekly digests', path: '/week/',
