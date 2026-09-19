@@ -2619,7 +2619,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       </div>
 
       <h4>LIMITS &amp; FRESHNESS</h4>
-      <p>Snapshots squash history, so intra-snapshot commit ordering is approximate. AI text describes only diff evidence. Upstream sync polls every 30 seconds and redeploys to Cloudflare within ~2 minutes of landing.</p>
+      <p>Snapshots squash history, so intra-snapshot commit ordering is approximate. AI text describes only diff evidence. Upstream sync polls every ~2-3 minutes in the cloud and redeploys to Cloudflare within ~3 minutes of landing.</p>
 
       <h4>STATUS BADGES</h4>
       <p>Embed dynamic SVG status badges in your README or docs:</p>
