@@ -233,6 +233,9 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /<details class="schips-details"/)
     assert.match(indexHtml, /class="schips-toggle"/)
     assert.match(indexHtml, /Structured facts/)
+    assert.match(indexHtml, /<details class="files-details"/)
+    assert.match(indexHtml, /class="files-toggle"/)
+    assert.match(indexHtml, /File changes/)
     // Diffs lazy-load on toggle: no pre-rendered diff markup in pages
     assert.doesNotMatch(indexHtml, /<pre class="diff-pre">/)
     assert.doesNotMatch(indexHtml, /<div class="diff-line/)

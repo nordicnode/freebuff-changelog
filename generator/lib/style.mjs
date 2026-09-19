@@ -877,6 +877,52 @@ nav.term-nav a.active{
   font-weight:700;
 }
 
+.files-details{
+  margin:8px 0;
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  background:var(--code);
+  overflow:hidden;
+  font-size:.8rem;
+}
+.files-toggle{
+  cursor:pointer;
+  padding:6px 10px;
+  color:var(--txt-dim);
+  list-style:none;
+  display:flex;
+  gap:6px;
+  align-items:center;
+  user-select:none;
+  font-weight:600;
+  font-size:.78rem;
+  background:var(--code);
+  transition:background .12s ease, color .12s ease;
+}
+.files-toggle::-webkit-details-marker{display:none}
+.files-toggle:hover{
+  color:var(--txt);
+  background:var(--panel-hover);
+}
+.files-hint{
+  font-size:.74rem;
+  font-weight:400;
+  color:var(--txt-subtle);
+}
+.files-details[open] .files-toggle{
+  border-bottom:1px solid var(--term-border);
+}
+.files-details[open] .files-toggle .diff-arrow{
+  transform:rotate(90deg);
+  color:var(--txt);
+}
+.files-body{
+  padding:8px 12px;
+  background:var(--panel);
+}
+.files-body .files{
+  margin:0;
+}
 .files{
   margin:8px 0 0;
   display:flex;
@@ -2604,6 +2650,7 @@ mark.search-match{
 .reading-mode-plain .entry .facts-details,
 .reading-mode-plain .entry .unknowns-details,
 .reading-mode-plain .entry .schips-details,
+.reading-mode-plain .entry .files-details,
 .reading-mode-plain .entry .facts,
 .reading-mode-plain .entry .files,
 .reading-mode-plain .entry .diff-viewer,
@@ -2894,7 +2941,7 @@ mark.search-match{
 .badge.brk{color:var(--term-red,#f85149);border-color:rgba(248,81,73,.55);font-weight:600}
 .badge.lowc{color:var(--txt-subtle);border-style:dashed}
 .meta-link.report{color:var(--txt-subtle)}
-.reading-mode-plain .schips,.reading-mode-plain .schips-details,.reading-mode-plain .tests-assert,.reading-mode-plain .unknowns,.reading-mode-plain .unknowns-details{display:none}
+.reading-mode-plain .schips,.reading-mode-plain .schips-details,.reading-mode-plain .tests-assert,.reading-mode-plain .unknowns,.reading-mode-plain .unknowns-details,.reading-mode-plain .files-details{display:none}
 
 /* Quality card notes and audience split colours. */
 .stat-note{font-size:.7rem;color:var(--txt-subtle);white-space:nowrap}

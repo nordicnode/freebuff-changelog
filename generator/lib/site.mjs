@@ -773,6 +773,7 @@ function shortPath (p) {
 }
 
 function fileChips (e) {
+  if (!e?.files) return ''
   const chips = []
   const totalListed = (e.files.added?.length || 0) + (e.files.removed?.length || 0) + (e.files.modified?.length || 0)
   const shownAdded = (e.files.added || []).slice(0, 3), shownRemoved = (e.files.removed || []).slice(0, 3)
@@ -784,7 +785,21 @@ function fileChips (e) {
   const shown = shownAdded.length + shownRemoved.length + shownModified.length
   const extra = Math.max(totalListed - shown, (e.files.meaningful || 0) - shown)
   if (extra > 0) chips.push(`<span class="fchip more">+${extra} more</span>`)
-  return chips.length ? `<div class="files">${chips.join('')}</div>` : ''
+  if (!chips.length) return ''
+
+  const totalFiles = e.files.total || totalListed || chips.length
+  const hint = `(${totalFiles} file${totalFiles === 1 ? '' : 's'})`
+
+  return `<details class="files-details">
+<summary class="files-toggle" title="Toggle changed files">
+  <span class="diff-arrow">&gt;</span>
+  <span>File changes</span>
+  <span class="files-hint">${esc(hint)}</span>
+</summary>
+<div class="files-body">
+  <div class="files">${chips.join('')}</div>
+</div>
+</details>`
 }
 
 // Related entries: same category, newest first, excluding self. Precomputed
