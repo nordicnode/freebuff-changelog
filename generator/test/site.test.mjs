@@ -215,11 +215,14 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /href="\/in-flight\/"/)
     assert.match(indexHtml, /class="diff-viewer" data-sha=/)
     assert.match(indexHtml, /View inline diff/)
-    // The plain-English line renders directly under the technical summary, and is
+    // The plain-English line renders directly above the collapsed technical summary, and is
     // spelled out for readers who have never seen the term "ELI5".
     assert.match(indexHtml, /<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH<\/span>A newer AI model is now available/)
-    assert.ok(indexHtml.indexOf('class="eli5"') > indexHtml.indexOf('AI summarized diff'),
-      'the ELI5 line sits after the technical summary it explains')
+    assert.ok(indexHtml.indexOf('class="eli5"') < indexHtml.indexOf('AI summarized diff'),
+      'the ELI5 line sits before the technical summary')
+    assert.match(indexHtml, /<details class="tech-details"/)
+    assert.match(indexHtml, /class="tech-toggle"/)
+    assert.match(indexHtml, /Technical explanation/)
     // Diffs lazy-load on toggle: no pre-rendered diff markup in pages
     assert.doesNotMatch(indexHtml, /<pre class="diff-pre">/)
     assert.doesNotMatch(indexHtml, /<div class="diff-line/)

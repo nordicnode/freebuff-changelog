@@ -889,6 +889,27 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
 <div class="diff-body"><span class="diff-loading">Loading diff…</span></div>
 </details>`
   }
+
+  const summaryText = e.ai?.summary || e.summary
+  const changes = changesHtml(e)
+  let techHtml = ''
+  if (summaryText || changes) {
+    const inner = (summaryText ? `<div class="summary">${miniMd(summaryText)}</div>` : '') + changes
+    if (e.eli5?.text) {
+      techHtml = `<details class="tech-details">
+<summary class="tech-toggle" title="Toggle technical explanation">
+  <span class="diff-arrow">&gt;</span>
+  <span>Technical explanation</span>
+</summary>
+<div class="tech-body">
+  ${inner}
+</div>
+</details>`
+    } else {
+      techHtml = inner
+    }
+  }
+
   // data-cat / data-churn are what the front-page filter toggles: every row the
   // index renders is a row the reader can filter, with no second request.
   return `<details class="entry ${e.significance}" id="${anchor}" data-cat="${esc(categorySlug(e.category))}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
@@ -904,9 +925,8 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
 </summary>
 <div class="entry-body">
 ${modelDiffLine(e)}
-<div class="summary">${miniMd(e.ai?.summary || e.summary)}</div>
 ${e.eli5?.text ? `<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH</span>${esc(e.eli5.text)}</p>` : ''}
-${changesHtml(e)}
+${techHtml}
 ${migrationHtml(e)}
 ${structuredChips(e)}
 ${evidenceHtml(e)}
