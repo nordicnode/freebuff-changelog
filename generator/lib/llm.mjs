@@ -669,7 +669,8 @@ export function ungroundedIdentifiers (text, corpus) {
   if (!corpus) return []
   const hay = String(corpus)
   const out = []
-  for (const m of String(text || '').matchAll(/`([^`\n]{2,80})`/g)) {
+  const clean = String(text || '').replace(/```[^`\n]*```/g, ' ').replace(/```/g, ' ')
+  for (const m of clean.matchAll(/`([^`\n]{1,80})`/g)) {
     const raw = m[1].trim()
     if (!raw || GROUNDING_PLACEHOLDER_RE.test(raw)) continue
     if (/^v?\d+(?:\.\d+)*[a-z0-9-]*$/i.test(raw)) continue
@@ -691,7 +692,7 @@ export function ungroundedIdentifiers (text, corpus) {
   }
   // Paths outside backticks: `evidence` names files in prose, and a path the
   // file list does not contain is the most checkable claim there is.
-  for (const m of String(text || '').replace(/`[^`\n]*`/g, ' ').matchAll(/(?<![\w/.])((?:[\w.-]+\/)+[\w.-]+\.(?:tsx?|jsx?|mjs|cjs|json|md|ya?ml|py|go|rs|sql|css|sh))(?![\w/])/g)) {
+  for (const m of clean.replace(/`[^`\n]*`/g, ' ').matchAll(/(?<![\w/.])((?:[\w.-]+\/)+[\w.-]+\.(?:tsx?|jsx?|mjs|cjs|json|md|ya?ml|py|go|rs|sql|css|sh))(?![\w/])/g)) {
     const p = m[1]
     if (hay.includes(p)) continue
     const tail = p.split('/').pop()

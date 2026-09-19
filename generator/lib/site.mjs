@@ -880,7 +880,7 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
     <span class="commit-ref">commit <a href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${anchor}</a></span>
     <span class="entry-utc">${esc(time)} UTC</span>
     <div class="badges">${badges(e)}</div>
-    <a class="permalink" href="/c/${anchor}" title="Permalink: this change alone" aria-label="Permalink" onclick="event.stopPropagation()">#</a>
+    <a class="permalink" href="/c/${anchor}" title="Permalink: this change alone" aria-label="Permalink" onclick="event.stopPropagation()">[permalink]</a>
   </div>
   <h3 class="entry-title">${title}</h3>
 </summary>
@@ -984,7 +984,7 @@ function evidenceHtml (e) {
     ? `<p class="evidence-flag">Not found in the diff or source context: ${bad.map(x => `<code>${esc(x)}</code>`).join(', ')}. Treat these names as unverified.</p>`
     : ''
   const verify = e.ai?.verify === 'flagged' ? '<p class="evidence-flag">A second model still objected to claims in this summary after one repair.</p>' : ''
-  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> Evidence${bad.length ? ` <span class="evidence-warn">(${bad.length} unverified name${bad.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}</div></details>`
+  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${bad.length ? ` <span class="evidence-warn">(${bad.length} unverified name${bad.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}</div></details>`
 }
 
 // The numbers the prompt work is judged by, as a /stats/ card. Every figure is

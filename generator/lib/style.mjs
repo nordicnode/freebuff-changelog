@@ -477,19 +477,23 @@ nav.term-nav a.active{
 .permalink{
   opacity:0;
   margin-left:auto;
-  color:var(--txt-dim);
-  font-size:.85em;
-  padding:4px 8px;
-  min-height:24px;
+  color:var(--txt-subtle);
+  font-size:.75rem;
+  letter-spacing:.02em;
+  padding:2px 6px;
+  min-height:22px;
   display:inline-flex;
   align-items:center;
   text-decoration:none;
+  transition:opacity .12s ease, color .12s ease;
 }
-.entry:hover .permalink{
+.entry:hover .permalink,
+.entry:focus-within .permalink{
   opacity:1;
 }
 .permalink:hover{
   color:var(--term-cyan);
+  text-decoration:underline;
 }
 
 .entry h3.entry-title,.entry h3{
@@ -2591,16 +2595,59 @@ mark.search-match{
 .reading-mode-plain .story-lead{display:block !important}
 
 /* Evidence: the model's citation, collapsed under the summary. */
-.evidence{margin:8px 0 0;font-size:.8rem}
-.evidence-toggle{cursor:pointer;color:var(--txt-dim);list-style:none;display:flex;gap:6px;align-items:center;user-select:none}
+.evidence{
+  margin:10px 0 6px;
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  background:var(--code);
+  overflow:hidden;
+  font-size:.8rem;
+}
+.evidence-toggle{
+  cursor:pointer;
+  padding:6px 10px;
+  color:var(--txt-dim);
+  list-style:none;
+  display:flex;
+  gap:6px;
+  align-items:center;
+  user-select:none;
+  font-weight:600;
+  font-size:.78rem;
+  background:var(--code);
+  transition:background .12s ease, color .12s ease;
+}
 .evidence-toggle::-webkit-details-marker{display:none}
-.evidence-toggle:hover{color:var(--term-cyan)}
-.evidence[open] .evidence-toggle .diff-arrow{transform:rotate(90deg)}
-.evidence-warn{color:var(--term-yellow,#d29922)}
-.evidence-body{margin:6px 0 0 14px;padding:6px 10px;border-left:2px solid var(--border,#30363d);color:var(--txt-dim);line-height:1.5}
+.evidence-toggle:hover{
+  color:var(--txt);
+  background:var(--panel-hover);
+}
+.evidence-hint{
+  font-size:.74rem;
+  font-weight:400;
+  color:var(--txt-subtle);
+}
+.evidence[open] .evidence-toggle{
+  border-bottom:1px solid var(--term-border);
+}
+.evidence[open] .evidence-toggle .diff-arrow{
+  transform:rotate(90deg);
+  color:var(--txt);
+}
+.evidence-warn{
+  color:var(--term-yellow,#d29922);
+  font-weight:700;
+}
+.evidence-body{
+  padding:8px 12px;
+  background:var(--panel);
+  color:var(--txt-dim);
+  line-height:1.55;
+}
 .evidence-body p{margin:0 0 4px}
+.evidence-body p:last-child{margin-bottom:0}
 .evidence-body code{font-size:.78rem}
-.evidence-flag{color:var(--term-yellow,#d29922)}
+.evidence-flag{color:var(--term-yellow,#d29922);margin-top:6px;font-size:.78rem}
 .reading-mode-plain .evidence{display:none}
 
 /* Which release first carried this commit. */
