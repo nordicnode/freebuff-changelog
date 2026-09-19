@@ -1,0 +1,716 @@
+diff --git a/cli/scripts/smoke-binary.ts b/cli/scripts/smoke-binary.ts
+index 7255fdb1f..1dec97199 100644
+--- a/cli/scripts/smoke-binary.ts
++++ b/cli/scripts/smoke-binary.ts
+@@ -1,54 +1,62 @@
+ #!/usr/bin/env bun
+ /**
+  * Long-running smoke test for a compiled CLI binary.
+  *
+  * `--version` and `--help` exit via commander synchronously, before async
+  * startup failures (e.g. the unhandled rejection from Parser.init when the
+  * tree-sitter wasm load fails) get a chance to fire. This script spawns the
+  * binary, lets it run for a few seconds, then kills it and asserts the TUI
+  * actually rendered a known boot screen.
+  *
+  * The positive check matters more than the negative one: a "did the boot
+  * screen appear" assertion catches *any* startup failure — known fatals,
+  * novel error messages, silent crashes, hangs, segfaults that produce no
+  * output. Negative pattern matches are kept only for clearer diagnostics
+  * when a known regression recurs.
+  *
+  * Designed to run on every supported platform (Linux, macOS, Windows) without
+- * extra deps. The binary doesn't need a TTY: OpenTUI emits ANSI escapes to
+- * stdout regardless, and the static text we look for renders contiguously.
++ * third-party deps. The binary doesn't need a TTY: OpenTUI emits ANSI escapes
++ * to stdout regardless, and the static text we look for renders contiguously.
++ *
++ * It also proves the binary ignores dotenv files in the working directory
++ * (see --no-compile-autoload-dotenv in build-binary.ts): `--smoke-api-url`
++ * must print the same backend URL from a directory full of steering `.env*`
++ * files as from an empty one.
+  *
+  * Usage:
+  *   bun cli/scripts/smoke-binary.ts <path-to-binary> [seconds]
+  *
+- * Exits 0 if a boot signal is detected and no fatal markers are present, 1
+- * otherwise.
++ * Exits 0 if every stage passes, 1 otherwise.
+  */
+ 
+ import { spawn } from 'child_process'
+-import { existsSync } from 'fs'
++import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
++import { tmpdir } from 'os'
++import { join, resolve as resolvePath } from 'path'
++
++import { RUNTIME_APP_URL_ENV_VARS } from '@codebuff/common/util/runtime-app-url'
+ 
+ // Any one of these strings appearing in stdout/stderr proves the binary
+ // reached its post-init UI: React tree mounted, OpenTUI rendered, async
+ // wasm init survived. Strings are static text from rendered components
+ // (not shimmer / animated) so they survive ANSI styling as contiguous
+ // substrings. Cover the multiple boot states the binary might land on:
+ //
+ //   - "will run commands on your behalf" — codebuff/freebuff main surface
+ //     header (authed + session ready)
+ //   - "Press ENTER to login" / "Open this URL" — login modal (no cached
+ //     creds — typical CI smoke)
+ //   - "Pick a model to start" — freebuff model-picker landing screen
+ //   - "Free mode isn't available" — freebuff country-block screen (CI
+ //     runners with anonymized-network egress like GitHub Actions land here)
+ //   - "Enter a coding task" — chat input prompt
+ //   - OpenTUI terminal handshakes such as alternate-screen / Kitty keyboard
+ //     protocol enablement. On Windows GitHub Actions, the compiled binary can
+ //     emit the OpenTUI setup escape stream but not flush static React text
+ //     before the smoke timeout; that still proves the renderer reached the
+ //     post-init terminal surface. Tree-sitter is checked separately above, and
+ //     fatal markers below still fail the smoke if async startup breaks later.
+ const BOOT_SIGNAL_PATTERNS = [
+   /will run commands on your behalf/,
+   /Pick a model to start/,
+   /Free mode isn't available/,
+@@ -76,195 +84,315 @@ const FATAL_PATTERNS = [
+   /Unhandled rejection:/i,
+   /Uncaught exception:/i,
+   /Internal error: tree-sitter\.wasm not found/i,
+   /UnhandledPromiseRejection/i,
+   /Cannot find module/i,
+ ] as const
+ 
+ // Long enough that an unhandled rejection from the eager Parser.init has
+ // time to surface through the renderer-cleanup handler — that path is
+ // what tripped freebuff 0.0.62 in the wild while a 5s window let CI pass.
+ // Async wasm rejections can fire >5s after spawn (after React mounts and
+ // the renderer is up).
+ const DEFAULT_RUN_SECONDS = 10
+ 
+ // Windows GitHub Actions runners intermittently hang the binary's startup
+ // *before any output* — the renderer never reaches its first write, so the
+ // run captures 0 bytes and trips the boot-signal gate. Healthy runs stream
+ // ~17KB (alt-screen escapes + the login screen) within the window. This is a
+ // runner-side flake, not a product regression: the same binary boots on the
+ // next attempt. Retry the boot attempt a few times so a single transient
+ // hang doesn't fail the build. Regression detection is preserved — a known
+ // fatal marker fails immediately (no retry), and a genuine boot failure
+ // still fails after exhausting every attempt.
+ const MAX_BOOT_ATTEMPTS = 3
+ 
+-function runTreeSitterSmoke(binary: string): Promise<void> {
++// Upper bound for the one-shot probes (--smoke-tree-sitter, --smoke-api-url),
++// which exit within seconds on a healthy runner. Without it a binary that
++// never exits stalls the release job until the workflow timeout.
++const PROBE_TIMEOUT_MS = 60_000
++
++// Hosts the dotenv-isolation probes point at. `.invalid` is reserved
++// (RFC 2606), so even a regression cannot reach a real server from CI.
++const DOTENV_STEER_URL = 'https://dotenv-steer.invalid'
++const ENV_OVERRIDE_URL = 'https://env-override.invalid'
++// The files bun's dotenv autoload reads with NODE_ENV unset, as on CI runners
++// (measured on bun 1.3.14; the .env.production* pair is not among them).
++const DOTENV_FILENAMES = [
++  '.env',
++  '.env.development',
++  '.env.development.local',
++  '.env.local',
++]
++// Printed by the --smoke-api-url handler in cli/src/index.tsx.
++const API_URL_MARKER = /^api-url smoke: (\S+)$/m
++
++/** A stage that ran and judged the binary wrong — exit 1, not 2. */
++class SmokeFailure extends Error {
++  constructor(
++    message: string,
++    readonly captured?: string,
++  ) {
++    super(message)
++  }
++}
++
++type Capture = {
++  captured: string
++  exitCode: number | null
++  /** The binary was still running at `timeoutMs` and was SIGKILLed. */
++  timedOut: boolean
++}
++
++/**
++ * Spawn the binary, collect stdout+stderr, and SIGKILL it if it is still
++ * running after `timeoutMs`. SIGKILL is the only signal that's portable across
++ * Linux/macOS/Windows here; SIGTERM may be ignored by the renderer on some
++ * platforms. `env` replaces the inherited environment when given.
++ */
++function spawnAndCapture(
++  binary: string,
++  args: string[],
++  options: { timeoutMs: number; cwd?: string; env?: NodeJS.ProcessEnv },
++): Promise<Capture> {
+   return new Promise((resolve, reject) => {
+-    const proc = spawn(binary, ['--smoke-tree-sitter'], {
++    const proc = spawn(binary, args, {
++      cwd: options.cwd,
+       stdio: ['ignore', 'pipe', 'pipe'],
+-      env: { ...process.env, NO_COLOR: '1', TERM: 'dumb' },
++      env: { ...(options.env ?? process.env), NO_COLOR: '1', TERM: 'dumb' },
+     })
+ 
+     let captured = ''
+     const append = (chunk: Buffer): void => {
+       captured += chunk.toString('utf8')
+     }
+     proc.stdout?.on('data', append)
+     proc.stderr?.on('data', append)
+ 
+-    proc.once('error', reject)
+-    proc.once('exit', (code) => {
+-      if (code === 0 && /tree-sitter smoke ok/.test(captured)) {
+-        resolve()
+-        return
+-      }
+-
+-      reject(
+-        new Error(
+-          `tree-sitter smoke failed with exit code ${code}\n${captured.slice(
+-            0,
+-            8 * 1024,
+-          )}`,
+-        ),
+-      )
++    let timedOut = false
++    const killTimer = setTimeout(() => {
++      timedOut = true
++      proc.kill('SIGKILL')
++    }, options.timeoutMs)
++
++    proc.once('error', (err) => {
++      clearTimeout(killTimer)
++      reject(err)
++    })
++    proc.once('exit', (exitCode) => {
++      clearTimeout(killTimer)
++      resolve({ captured, exitCode, timedOut })
+     })
+   })
+ }
+ 
++async function runTreeSitterSmoke(binary: string): Promise<void> {
++  const { captured, exitCode, timedOut } = await spawnAndCapture(
++    binary,
++    ['--smoke-tree-sitter'],
++    { timeoutMs: PROBE_TIMEOUT_MS },
++  )
++  if (timedOut) {
++    throw new SmokeFailure(
++      `--smoke-tree-sitter still running after ${PROBE_TIMEOUT_MS / 1000}s.`,
++      captured,
++    )
++  }
++  if (exitCode !== 0 || !/tree-sitter smoke ok/.test(captured)) {
++    throw new SmokeFailure(`tree-sitter smoke exited ${exitCode}.`, captured)
++  }
++}
++
++/**
++ * Ask the binary which backend URL the SDK resolved. The runner's own
++ * environment may carry the override variables (the build step exports
++ * NEXT_PUBLIC_* for inlining), and a real variable beats a dotenv file, so
++ * they are stripped unless `override` supplies one — otherwise the steered
++ * run would pass for the wrong reason.
++ */
++async function probeApiUrl(
++  binary: string,
++  cwd: string,
++  override?: string,
++): Promise<string> {
++  const env: NodeJS.ProcessEnv = { ...process.env }
++  for (const key of RUNTIME_APP_URL_ENV_VARS) delete env[key]
++  if (override !== undefined) env.NEXT_PUBLIC_CODEBUFF_APP_URL = override
++
++  const { captured, exitCode, timedOut } = await spawnAndCapture(
++    binary,
++    ['--smoke-api-url'],
++    { timeoutMs: PROBE_TIMEOUT_MS, cwd, env },
++  )
++  if (timedOut) {
++    throw new SmokeFailure(
++      `--smoke-api-url still running after ${PROBE_TIMEOUT_MS / 1000}s (cwd ${cwd}).`,
++      captured,
++    )
++  }
++  const url = API_URL_MARKER.exec(captured)?.[1]
++  if (exitCode !== 0 || !url) {
++    throw new SmokeFailure(
++      `--smoke-api-url exited ${exitCode} without printing a URL (cwd ${cwd}).`,
++      captured,
++    )
++  }
++  return url
++}
++
++async function runDotenvIsolationSmoke(binary: string): Promise<void> {
++  const cleanDir = mkdtempSync(join(tmpdir(), 'smoke-binary-clean-'))
++  const steerDir = mkdtempSync(join(tmpdir(), 'smoke-binary-dotenv-'))
++  try {
++    const steer = RUNTIME_APP_URL_ENV_VARS.map(
++      (key) => `${key}=${DOTENV_STEER_URL}\n`,
++    ).join('')
++    for (const name of DOTENV_FILENAMES)
++      writeFileSync(join(steerDir, name), steer)
++
++    const baseline = await probeApiUrl(binary, cleanDir)
++    const steered = await probeApiUrl(binary, steerDir)
++    if (steered !== baseline) {
++      throw new SmokeFailure(
++        `dotenv files in the working directory changed the API URL: ` +
++          `${baseline} (clean dir) vs ${steered} (dir with .env*). ` +
++          `build-binary.ts must pass --no-compile-autoload-dotenv.`,
++      )
++    }
++
++    // Positive control: a real environment variable must still be honoured,
++    // so the equality above is evidence of isolation rather than of a probe
++    // that ignores env.
++    const overridden = await probeApiUrl(binary, cleanDir, ENV_OVERRIDE_URL)
++    if (overridden !== ENV_OVERRIDE_URL) {
++      throw new SmokeFailure(
++        `NEXT_PUBLIC_CODEBUFF_APP_URL in the environment was not honoured: ` +
++          `printed ${overridden}, expected ${ENV_OVERRIDE_URL}.`,
++      )
++    }
++  } finally {
++    rmSync(cleanDir, { recursive: true, force: true })
++    rmSync(steerDir, { recursive: true, force: true })
++  }
++}
++
+ type AttemptOutcome =
+   | { kind: 'boot'; pattern: RegExp; bytes: number; exitCode: number | null }
+-  | { kind: 'fatal'; pattern: RegExp; captured: string; exitCode: number | null }
++  | {
++      kind: 'fatal'
++      pattern: RegExp
++      captured: string
++      exitCode: number | null
++    }
+   | { kind: 'no-signal'; captured: string; exitCode: number | null }
+ 
+ /**
+  * Spawn the binary, let it run for the full window (so *late* async startup
+  * failures still have time to surface through the renderer-cleanup handler),
+- * then classify the captured output.
++ * then classify the captured output. Here the kill at the end of the window
++ * is the expected exit, not a failure.
+  */
+-function runBootAttempt(
++async function runBootAttempt(
+   binary: string,
+   runSeconds: number,
+ ): Promise<AttemptOutcome> {
+-  return new Promise((resolve) => {
+-    const proc = spawn(binary, [], {
+-      stdio: ['ignore', 'pipe', 'pipe'],
+-      env: { ...process.env, NO_COLOR: '1', TERM: 'dumb' },
+-    })
++  const { captured, exitCode } = await spawnAndCapture(binary, [], {
++    timeoutMs: runSeconds * 1_000,
++  })
+ 
+-    let captured = ''
+-    const append = (chunk: Buffer): void => {
+-      captured += chunk.toString('utf8')
++  // Negative gate first: a known fatal marker gives us a more specific
++  // error message than "no boot signal found" would.
++  for (const pattern of FATAL_PATTERNS) {
++    if (pattern.test(captured)) {
++      return { kind: 'fatal', pattern, captured, exitCode }
+     }
+-    proc.stdout?.on('data', append)
+-    proc.stderr?.on('data', append)
+-
+-    let exitCode: number | null = null
+-    const exited = new Promise<void>((resolveExit) => {
+-      proc.once('exit', (code) => {
+-        exitCode = code
+-        resolveExit()
+-      })
+-    })
+-
+-    const killTimer = setTimeout(() => {
+-      // SIGKILL is the only signal that's portable across Linux/macOS/Windows
+-      // here; SIGTERM may be ignored by the renderer on some platforms.
+-      proc.kill('SIGKILL')
+-    }, runSeconds * 1_000)
++  }
+ 
+-    void exited.then(() => {
+-      clearTimeout(killTimer)
++  // Positive gate: the binary must have rendered a known boot screen.
++  const matched = BOOT_SIGNAL_PATTERNS.find((p) => p.test(captured))
++  if (matched) {
++    return { kind: 'boot', pattern: matched, bytes: captured.length, exitCode }
++  }
+ 
+-      // Negative gate first: a known fatal marker gives us a more specific
+-      // error message than "no boot signal found" would.
+-      for (const pattern of FATAL_PATTERNS) {
+-        if (pattern.test(captured)) {
+-          resolve({ kind: 'fatal', pattern, captured, exitCode })
+-          return
+-        }
+-      }
+-
+-      // Positive gate: the binary must have rendered a known boot screen.
+-      const matched = BOOT_SIGNAL_PATTERNS.find((p) => p.test(captured))
+-      if (matched) {
+-        resolve({ kind: 'boot', pattern: matched, bytes: captured.length, exitCode })
+-        return
+-      }
+-
+-      resolve({ kind: 'no-signal', captured, exitCode })
+-    })
+-  })
++  return { kind: 'no-signal', captured, exitCode }
+ }
+ 
+ async function main(): Promise<void> {
+-  const binary = process.argv[2]
++  const binaryArg = process.argv[2]
+   const runSeconds = Number(process.argv[3] ?? DEFAULT_RUN_SECONDS)
+ 
+-  if (!binary) {
++  if (!binaryArg) {
+     console.error('Usage: bun smoke-binary.ts <path-to-binary> [seconds]')
+     process.exit(2)
+   }
+-  if (!existsSync(binary)) {
+-    console.error(`smoke-binary: binary not found: ${binary}`)
++  if (!existsSync(binaryArg)) {
++    console.error(`smoke-binary: binary not found: ${binaryArg}`)
+     process.exit(2)
+   }
+   if (!Number.isFinite(runSeconds) || runSeconds <= 0) {
+     console.error(`smoke-binary: bad seconds arg: ${process.argv[3]}`)
+     process.exit(2)
+   }
++  // CI passes `./freebuff`; the dotenv probes run from other directories.
++  const binary = resolvePath(binaryArg)
+ 
+-  console.log(`smoke-binary: spawning ${binary} for ${runSeconds}s…`)
++  console.log(`smoke-binary: spawning ${binaryArg} for ${runSeconds}s…`)
+ 
+   await runTreeSitterSmoke(binary)
+   console.log('smoke-binary: tree-sitter init OK.')
+ 
++  await runDotenvIsolationSmoke(binary)
++  console.log('smoke-binary: working-directory dotenv files ignored OK.')
++
+   let lastNoSignal: Extract<AttemptOutcome, { kind: 'no-signal' }> | null = null
+ 
+   for (let attempt = 1; attempt <= MAX_BOOT_ATTEMPTS; attempt++) {
+     console.log(
+       `smoke-binary: boot attempt ${attempt}/${MAX_BOOT_ATTEMPTS} (running ${runSeconds}s)…`,
+     )
+     const outcome = await runBootAttempt(binary, runSeconds)
+ 
+     if (outcome.kind === 'boot') {
+       console.log(
+         `smoke-binary: OK (matched ${outcome.pattern}, exit code ${outcome.exitCode}, ${outcome.bytes} bytes captured, attempt ${attempt}/${MAX_BOOT_ATTEMPTS}).`,
+       )
+       return
+     }
+ 
+     if (outcome.kind === 'fatal') {
+       // Deterministic crash — a known fatal marker is a real regression, not a
+       // flaky hang, so fail immediately without burning the remaining retries.
+-      console.error(
+-        `smoke-binary: FAIL — output matched ${outcome.pattern} (exit code ${outcome.exitCode}).`,
++      throw new SmokeFailure(
++        `output matched ${outcome.pattern} (exit code ${outcome.exitCode}).`,
++        outcome.captured,
+       )
+-      console.error('--- captured output (truncated to 8KB) ---')
+-      console.error(outcome.captured.slice(0, 8 * 1024))
+-      process.exit(1)
+     }
+ 
+     // no-signal: the binary produced no recognizable boot screen. This is the
+     // transient-Windows-hang shape; retry before giving up.
+     lastNoSignal = outcome
+     console.error(
+       `smoke-binary: attempt ${attempt}/${MAX_BOOT_ATTEMPTS} produced no boot signal ` +
+         `(${outcome.captured.length} bytes, exit code ${outcome.exitCode})` +
+         (attempt < MAX_BOOT_ATTEMPTS ? '; retrying…' : '.'),
+     )
+   }
+ 
+-  console.error(
+-    `smoke-binary: FAIL — binary never reached a known boot screen across ` +
+-      `${MAX_BOOT_ATTEMPTS} attempts — checked ${BOOT_SIGNAL_PATTERNS.length} patterns ` +
+-      `(exit code ${lastNoSignal?.exitCode ?? null}).`,
++  throw new SmokeFailure(
++    `binary never reached a known boot screen across ${MAX_BOOT_ATTEMPTS} attempts — ` +
++      `checked ${BOOT_SIGNAL_PATTERNS.length} patterns (exit code ${lastNoSignal?.exitCode ?? null}).`,
++    lastNoSignal?.captured ?? '',
+   )
+-  console.error('--- captured output from last attempt (truncated to 8KB) ---')
+-  console.error((lastNoSignal?.captured ?? '').slice(0, 8 * 1024))
+-  process.exit(1)
+ }
+ 
+ main().catch((err: unknown) => {
++  if (err instanceof SmokeFailure) {
++    console.error(`smoke-binary: FAIL — ${err.message}`)
++    if (err.captured !== undefined) {
++      console.error('--- captured output (truncated to 8KB) ---')
++      console.error(err.captured.slice(0, 8 * 1024))
++    }
++    process.exit(1)
++  }
+   console.error('smoke-binary: unexpected error:', err)
+   process.exit(2)
+ })
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index e149dc8ec..1d43c0390 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -1,41 +1,41 @@
+ #!/usr/bin/env bun
+ 
+ // Embed tree-sitter.wasm into the bun-compile binary at a bunfs path the runtime
+ // can find. Without this, web-tree-sitter resolves the wasm via require.resolve,
+ // which (since 0.25.10's split exports map) returns the build-time absolute path
+ // of tree-sitter.cjs and fails on user machines. Must run before the SDK / code-map
+ // import chain triggers Parser.init.
+ import './pre-init/tree-sitter-wasm'
+ 
+ import fs from 'fs'
+ import os from 'os'
+ import path from 'path'
+ 
+ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ import { getProjectFileTree } from '@codebuff/common/project-file-tree'
+-import { getDefaultAgentDirs } from '@codebuff/sdk'
++import { getDefaultAgentDirs, getWebsiteUrl } from '@codebuff/sdk'
+ import { createCliRenderer } from '@opentui/core'
+ import { createRoot } from '@opentui/react'
+ import {
+   QueryClient,
+   QueryClientProvider,
+   focusManager,
+ } from '@tanstack/react-query'
+ import { cyan, green, red, yellow } from 'picocolors'
+ import React from 'react'
+ 
+ import { App } from './app'
+ import { loadPackageVersion, parseArgs } from './cli-args'
+ import { handlePublish } from './commands/publish'
+ import { runPlainLogin } from './login/plain-login'
+ import { initializeApp } from './init/init-app'
+ import { getProjectRoot, setProjectRoot } from './project-files'
+ import { trackEvent } from './utils/analytics'
+ import {
+   getTrustStorePath,
+   isTruthyOptIn,
+   promptForAgentDirTrust,
+   resolveTrustedAgentDirs,
+ } from './utils/agent-dir-trust'
+ import { getAuthToken, getAuthTokenDetails } from './utils/auth'
+ import { resetCodebuffClient } from './utils/codebuff-client'
+@@ -145,50 +145,60 @@ async function main(): Promise<void> {
+         // Marker grepped by cli/scripts/smoke-binary.ts — keep this exact text.
+         console.log(
+           `tree-sitter smoke ok (wasmBinary, ${effectiveBinary.byteLength} bytes)`,
+         )
+       } else if (effectivePath) {
+         await Parser.init({
+           locateFile: (name: string) =>
+             name === 'tree-sitter.wasm' ? effectivePath! : name,
+         })
+         console.log(`tree-sitter smoke ok (locateFile, path=${effectivePath})`)
+       } else {
+         console.error(
+           'tree-sitter smoke FAIL: no wasm available — pre-init published ' +
+             'nothing and the sibling-of-execPath fallback also missed. See ' +
+             'the diag above for paths.',
+         )
+         process.exit(1)
+       }
+       process.exit(0)
+     } catch (err) {
+       console.error('tree-sitter smoke FAIL:', err)
+       process.exit(1)
+     }
+   }
+ 
++  // CI gate: `<binary> --smoke-api-url` prints the backend URL the SDK resolved
++  // and exits, so cli/scripts/smoke-binary.ts can prove dotenv files in the CWD
++  // cannot steer it (see --no-compile-autoload-dotenv in build-binary.ts). Must
++  // precede commander.parse(), which rejects unknown flags.
++  if (process.argv.includes('--smoke-api-url')) {
++    // Marker parsed by cli/scripts/smoke-binary.ts — keep this exact prefix.
++    console.log(`api-url smoke: ${getWebsiteUrl()}`)
++    process.exit(0)
++  }
++
+   // Native-Windows release gate. The external harness starts the packaged
+   // binary inside winpty so this exercises a real console, OpenTUI renderer,
+   // console-free broker, Git Bash child, and SDK process lifecycle.
+   // Keep this before commander.parse(), which intentionally knows nothing
+   // about internal smoke-only flags.
+   const terminalBrokerSmokeIndex = process.argv.indexOf(
+     '--smoke-terminal-broker',
+   )
+   const endOfOptionsIndex = process.argv.indexOf('--')
+   const isTerminalBrokerSmoke =
+     terminalBrokerSmokeIndex !== -1 &&
+     (endOfOptionsIndex === -1 || terminalBrokerSmokeIndex < endOfOptionsIndex)
+   if (isTerminalBrokerSmoke) {
+     const resultPath = process.argv[terminalBrokerSmokeIndex + 1]
+     const exchangeDir = process.argv[terminalBrokerSmokeIndex + 2]
+     if (!resultPath || !exchangeDir) {
+       console.error(
+         'terminal broker smoke requires <result-path> <exchange-dir>',
+       )
+       process.exit(2)
+     }
+     const { runPackagedTerminalBrokerSmoke } =
+       await import('./smoke/terminal-command-broker')
+     const exitCode = await runPackagedTerminalBrokerSmoke({
+       resultPath,
+diff --git a/common/src/util/runtime-app-url.ts b/common/src/util/runtime-app-url.ts
+index b008a464f..0fa0640af 100644
+--- a/common/src/util/runtime-app-url.ts
++++ b/common/src/util/runtime-app-url.ts
+@@ -1,41 +1,50 @@
+ /**
+  * The rule for a RUNTIME override of the Codebuff app URL (`CODEBUFF_APP_URL`
+  * / `NEXT_PUBLIC_CODEBUFF_APP_URL` read from `process.env` after the build).
+  *
+  * Every SDK call that carries the user's bearer token — model completions,
+  * `/me`, agent runs, the registry, composio — is addressed to this URL, so a
+  * process that can set one env var for the CLI (a directory's `.envrc`, a
+  * shared machine, CI) could point the whole credential-bearing plane, over
+  * plain `http:`, at a host of its choosing. The override exists for remote
+  * hosts that bundle the SDK with a dev URL inlined; those are https. The only
+  * legitimate http case is a developer's own stack on the loopback interface.
+  *
+  * Pure and dependency-free so the SDK and Freebuff Desktop (whose `hosts.ts`
+  * reads the same variable at module load on a repo launch) apply one rule.
+  */
+ 
++/**
++ * The variables, in precedence order, through which a runtime may override the
++ * app URL. Shared so the SDK resolver and the release smoke test agree.
++ */
++export const RUNTIME_APP_URL_ENV_VARS = [
++  'NEXT_PUBLIC_CODEBUFF_APP_URL',
++  'CODEBUFF_APP_URL',
++] as const
++
+ const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1'])
+ 
+ /**
+  * `true` for `https:` on any host, and for `http:` only on `localhost`,
+  * `127.0.0.1`, `[::1]` or a `*.localhost` name. Anything else — plain http to
+  * a remote host, another scheme, or a value that does not parse — is refused
+  * and the caller keeps its bundled URL.
+  */
+ export function isAllowedRuntimeAppUrl(value: string): boolean {
+   let url: URL
+   try {
+     url = new URL(value)
+   } catch {
+     return false
+   }
+   if (url.protocol === 'https:') return true
+   if (url.protocol !== 'http:') return false
+   // WHATWG URL keeps the brackets on an IPv6 literal (`[::1]`).
+   const hostname = url.hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1')
+   return LOOPBACK_HOSTNAMES.has(hostname) || hostname.endsWith('.localhost')
+ }
+ 
+ /**
+  * `protocol//host` of a rejected value for a warning line — never the full
+  * URL, which may carry a path or query the operator did not mean to log.
+diff --git a/sdk/src/env.ts b/sdk/src/env.ts
+index 679afd888..a5d097745 100644
+--- a/sdk/src/env.ts
++++ b/sdk/src/env.ts
+@@ -1,76 +1,72 @@
+ /**
+  * SDK environment helper for dependency injection.
+  *
+  * This module provides SDK-specific env helpers that extend the base
+  * process env with SDK-specific vars for binary paths and WASM.
+  */
+ 
+ import { BYOK_OPENROUTER_ENV_VAR } from '@codebuff/common/constants/byok'
+ import { API_KEY_ENV_VAR } from '@codebuff/common/constants/paths'
+ import { getBaseEnv } from '@codebuff/common/env-process'
+ import {
++  RUNTIME_APP_URL_ENV_VARS,
+   describeRuntimeAppUrlOrigin,
+   isAllowedRuntimeAppUrl,
+ } from '@codebuff/common/util/runtime-app-url'
+ 
+ import { TRUSTED_AGENT_PUBLISHERS_ENV_VAR } from './agent-publisher-trust'
+ 
+ import type { SdkEnv } from './types/env'
+ 
+ export { isAllowedRuntimeAppUrl }
+ 
+ /**
+  * Get SDK environment values.
+  * Composes from getBaseEnv() + SDK-specific vars.
+  */
+ export const getSdkEnv = (): SdkEnv => ({
+   ...getBaseEnv(),
+ 
+   // SDK-specific paths
+   CODEBUFF_RG_PATH: process.env.CODEBUFF_RG_PATH,
+   CODEBUFF_WASM_DIR: process.env.CODEBUFF_WASM_DIR,
+ 
+   // Registry publishers whose executable (handleSteps) agents may run
+   CODEBUFF_TRUSTED_AGENT_PUBLISHERS: process.env.CODEBUFF_TRUSTED_AGENT_PUBLISHERS,
+ 
+   // Build flags
+   VERBOSE: process.env.VERBOSE,
+   OVERRIDE_TARGET: process.env.OVERRIDE_TARGET,
+   OVERRIDE_PLATFORM: process.env.OVERRIDE_PLATFORM,
+   OVERRIDE_ARCH: process.env.OVERRIDE_ARCH,
+ })
+ 
+ export const getCodebuffApiKeyFromEnv = (): string | undefined => {
+   return process.env[API_KEY_ENV_VAR]
+ }
+ 
+-const RUNTIME_APP_URL_ENV_VARS = [
+-  'NEXT_PUBLIC_CODEBUFF_APP_URL',
+-  'CODEBUFF_APP_URL',
+-] as const
+-
+ /**
+  * Rejected overrides already warned about, keyed by variable and origin, so a
+  * bad value produces one line per process rather than one per API call. There
+  * is no SDK-wide logger at this layer (the run logger is created per run), so
+  * this goes to `console.warn`.
+  */
+ const warnedRuntimeAppUrlOverrides = new Set<string>()
+ 
+ const warnRejectedRuntimeAppUrl = (variable: string, value: string): void => {
+   const origin = describeRuntimeAppUrlOrigin(value)
+   const key = `${variable}=${origin}`
+   if (warnedRuntimeAppUrlOverrides.has(key)) return
+   warnedRuntimeAppUrlOverrides.add(key)
+   console.warn(
+     `[codebuff] Ignoring ${variable} (${origin}): the runtime app URL must be https, or http on localhost. Using the bundled URL instead.`,
+   )
+ }
+ 
+ /**
+  * Raw comma-separated list of registry publishers whose agents may run
+  * executable `handleSteps` on this machine. See ./agent-publisher-trust.ts.
+  */
+ export const getTrustedAgentPublishersFromEnv = (): string | undefined => {
+   return process.env[TRUSTED_AGENT_PUBLISHERS_ENV_VAR]
+ }
