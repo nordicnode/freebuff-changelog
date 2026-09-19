@@ -539,9 +539,8 @@ test('buildSite generates valid static site output', async () => {
     // survive real newlines and markdown punctuation on its way back out of the parser.
     const dcAttr = /data-dc="([^"]*)"/.exec(dayHtml2)?.[1]
     assert.ok(dcAttr, 'the card ships a discord payload')
-    assert.ok(dcAttr.includes('\n\n'), 'blank lines survive the attribute')
-    assert.ok(dcAttr.startsWith('**FREEBUFF** · `'), 'it opens with the header line')
-    assert.ok(dcAttr.includes('**Details**'), 'and closes with the aligned details block')
+    assert.ok(dcAttr.startsWith('### '), 'it opens with the title heading')
+    assert.ok(!dcAttr.includes('**Details**'), 'and omits verbose details block')
     assert.ok(!/https?:\/\//.test(dcAttr), 'it carries no links at all')
     assert.match(dayHtml2, /class="day-jump"/)
     assert.match(dayHtml2, /data-mode="split"/)
@@ -978,29 +977,31 @@ const dcEntry = () => ({
   files: { total: 3 }, stats: { additions: 12, deletions: 4 }, version: '1.0.598'
 })
 
-test('discordText: organized for Discord -- labelled quote, one sentence per line, an aligned details block', () => {
+test('discordText: organized for Discord -- title, date, and plain English summary', () => {
   const t = discordText(dcEntry())
   assert.ok(t.length <= 2000)
-  assert.ok(t.startsWith('**FREEBUFF** · `Model Catalog` · Sep 13, 2026 · **MAJOR**'), 'header line')
   assert.match(t, /^### Muse Spark 1\.3 ships$/m, 'a heading, not a plain line')
-  assert.match(t, /^> \*\*In plain English\*\*\n> The free model was replaced with a newer one\.$/m, 'the ELI5 line, labelled and quoted')
-  assert.ok(!/https?:\/\//.test(t), 'the paste carries no links at all')
-  assert.ok(t.includes('muse\\_spark\\_1\\_2'), 'stray underscores are escaped: Discord reads them as italics')
-  assert.ok(t.includes('`muse_spark_1_3`'), 'but not inside a code span, where they are already literal')
-  assert.ok(t.includes('**backend**'), 'a balanced pair still renders as bold')
-  const stray = discordText({ ...dcEntry(), facts: ['Five products.** No subscription needed.'] })
-  assert.ok(stray.includes('- Five products. No subscription needed.'), 'a stray ** is dropped, not escaped: escaping still prints the debris')
-  assert.match(t, /\*\*Model catalog\*\*\n- `−` ~~Muse Spark 1\.2~~\n- `\+` \*\*Muse Spark 1\.3\*\*/, 'retired struck, new bold, each on its own line')
-  assert.match(t, /\*\*Highlights\*\*\n- Adds \/new \/command/)
-  const block = /```([^`]*)```/.exec(t)[1].trim().split('\n')
-  assert.match(block[0], /^commit\s+a{12}$/, 'the commit is the first row')
-  assert.equal(new Set(block.map(l => l.match(/^\S+\s+/)[0].length)).size, 1, 'every value starts in the same column')
-  for (const row of [/^churn\s+\+12 \/ −4$/, /^files\s+3$/, /^release\s+v1\.0\.598$/, /^pull\s+#12$/, /^author\s+Ada$/]) {
-    assert.ok(block.some(l => row.test(l)), `details block is missing ${row}`)
-  }
+  assert.match(t, /^Sep 13, 2026$/m, 'human-formatted date')
+  assert.ok(t.includes('The free model was replaced with a newer one.'), 'plain English summary')
+  const formatted = discordText({
+    ...dcEntry(),
+    eli5: { text: 'Swaps muse_spark_1_2 for `muse_spark_1_3` in **backend**.' }
+  })
+  assert.ok(formatted.includes('muse\\_spark\\_1\\_2'), 'stray underscores are escaped: Discord reads them as italics')
+  assert.ok(formatted.includes('`muse_spark_1_3`'), 'but not inside a code span, where they are already literal')
+  assert.ok(formatted.includes('**backend**'), 'a balanced pair still renders as bold')
+  assert.ok(!t.includes('**Details**'), 'no details section header')
+  assert.ok(!t.includes('```'), 'no details codeblock')
+  assert.ok(!t.includes('**Model catalog**'), 'no model catalog section')
+  assert.ok(!t.includes('**Highlights**'), 'no developer highlights')
+  assert.ok(!t.includes('**Evidence**'), 'no evidence section')
   assert.ok(!t.includes('**Links**'), 'no links section')
-  // Seventeen summaries mention an endpoint as the subject of the commit. The words
-  // are the content; only the reachability has to go.
+
+  // Stray asterisks
+  const stray = discordText({ ...dcEntry(), eli5: { text: 'Five products.** No subscription needed.' } })
+  assert.ok(stray.includes('Five products. No subscription needed.'), 'a stray ** is dropped, not escaped: escaping still prints the debris')
+
+  // Bare URLs and code spans
   const ZW = String.fromCharCode(0x200b)
   const urls = discordText({
     ...dcEntry(), facts: [], modelChanges: null, eli5: null,
@@ -1011,53 +1012,43 @@ test('discordText: organized for Discord -- labelled quote, one sentence per lin
   assert.ok(urls.includes(`https:${ZW}//example.com`), 'and it is still readable as text')
   assert.ok(urls.includes('Docs at the registry.'), 'a markdown link collapses to its label')
   assert.ok(!/https?:\/\//.test(urls.replace(/`[^`]*`/g, '')), 'with code spans removed, not one URL is linkifiable')
-  // The quote is a separate push, so it is easy to forget it needs the same care.
+
   const quoted = discordText({ ...dcEntry(), facts: [], modelChanges: null, eli5: { text: "It hides 'http://x' now. It reads agent_config better." } })
   assert.ok(quoted.includes(`hides 'http:${ZW}//x'`), 'the plain-English line is escaped like everything else')
   assert.ok(quoted.includes('agent\\_config'), 'including its underscores')
-  // Prompt-text commits quote Discord fences verbatim, and an opened fence swallows
-  // the rest of the message. Ours is the only one that survives into the paste.
+
   const fenced = discordText({ ...dcEntry(), facts: [], modelChanges: null, ai: { title: 'Use ``` tags', summary: 'Say ``` to fence it.' } })
-  assert.equal(fenced.split('```').length - 1, 2, 'exactly one fence pair: the details block')
   assert.ok(fenced.includes('\\`'.repeat(3)), 'the data backticks arrive escaped, so they render as text')
-  const prose = discordText({
-    ...dcEntry(), facts: [], modelChanges: null,
-    ai: { title: 'T', summary: 'First thing happened. It touched `a_b`. Third part done.' }
-  })
-  assert.ok(prose.includes('First thing happened.\nIt touched `a_b`.\nThird part done.'), 'a paragraph becomes one sentence per line')
 })
 
-test('discordText: the plain-English quote is never clipped', () => {
+test('discordText: the plain-English summary is not prematurely clipped', () => {
   const full = 'People filling out the welcome questions see fewer choices now. The how-you-heard list no longer offers Reddit or GitHub. Any old picks for those now count as something else, and the system recounts past answers under the new lists.'
   const t = discordText({ ...dcEntry(), facts: [], modelChanges: null, ai: { title: 'T', summary: 'Short summary.' }, eli5: { text: full } })
-  assert.ok(t.includes(full.split('. ')[0]), 'quote head present')
-  assert.ok(t.includes('recounts past answers'), 'quote tail present: no 300-char clip')
-  assert.ok(!t.includes('…') || t.indexOf('…') > t.indexOf('recounts past answers'), 'no ellipsis inside the quote')
+  assert.ok(t.includes(full.split('. ')[0]), 'head present')
+  assert.ok(t.includes('recounts past answers'), 'tail present: no 300-char clip')
+  assert.ok(!t.includes('…') || t.indexOf('…') > t.indexOf('recounts past answers'), 'no ellipsis inside when within limit')
 })
 
-test('discordText: a monster entry still fits the 2000-char cap, giving up detail in reverse order', () => {
-  const e = { ...dcEntry(), eli5: { text: 'long. '.repeat(120) }, facts: ['keep me'], ai: { title: 'T', summary: 'word '.repeat(1200) } }
+test('discordText: a monster entry still fits the 2000-char cap, clipping summary if needed', () => {
+  const e = { ...dcEntry(), eli5: { text: 'long. '.repeat(1200) } }
   const t = discordText(e)
   assert.ok(t.length <= 2000, `${t.length} chars exceeds the Discord limit and the paste would be rejected`)
-  assert.ok(!t.includes('keep me'), 'the highlights list goes first')
-  assert.ok(t.includes('```'), 'the details block survives')
-  assert.ok(t.includes('**In plain English**'), 'and so does the plain-English quote')
-  assert.ok(t.includes('word word'), 'the summary keeps its head and loses its tail')
-  assert.ok(t.includes('long. long.'), 'the quote keeps its head too, clipped only as a last resort')
+  assert.ok(t.includes('long. long.'), 'the summary keeps its head, clipped to fit')
+  assert.ok(!t.includes('```'), 'no code blocks')
 })
 
-test('discordText: plainOnly omits codeblock diffs and produces clean plain announcement', () => {
+test('discordText: plainOnly / simplified output produces clean plain announcement and falls back to summary', () => {
   const e = dcEntry()
   const plain = discordText(e, { plainOnly: true })
   assert.match(plain, /^### Muse Spark 1\.3 ships$/m)
-  assert.ok(plain.includes('Sep 13, 2026 · 10:00 UTC'), 'plain Discord text includes formatted date and time')
-  assert.match(plain, /^> \*\*In plain English\*\*\n> The free model was replaced with a newer one\.$/m)
+  assert.ok(plain.includes('Sep 13, 2026'), 'plain Discord text includes formatted date')
+  assert.ok(plain.includes('The free model was replaced with a newer one.'))
   assert.ok(!plain.includes('```'), 'no details codeblock')
   assert.ok(!plain.includes('**Details**'), 'no details section header')
   assert.ok(!plain.includes('**Highlights**'), 'no developer highlights')
 
-  // When entry has no ELI5, plainOnly falls back cleanly to summary
-  const noEli5 = { ...e, eli5: null }
+  // When entry has no ELI5, falls back cleanly to summary
+  const noEli5 = { ...e, eli5: null, ai: { title: 'Muse Spark 1.3 ships', summary: 'Swaps muse_spark_1_2 for 1.3.' } }
   const plainFallback = discordText(noEli5, { plainOnly: true })
   assert.ok(!plainFallback.includes('```'))
   assert.ok(plainFallback.includes('Swaps muse\\_spark\\_1\\_2'))

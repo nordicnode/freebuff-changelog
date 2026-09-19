@@ -973,7 +973,6 @@ ${storyNoteHtml(opts.storyNotes)}
   <span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i> &middot; ${e.files.total} file${e.files.total === 1 ? '' : 's'}</span>
   <div class="meta-links">
     <button class="meta-link dc-copy" type="button" data-dc="${esc(discordText(e, { storyNotes: opts.storyNotes }))}" title="Copy this entry as Discord-formatted text (c)">discord</button>
-    ${e.eli5?.text ? `<button class="meta-link eli5-copy" type="button" data-eli5="${esc(discordText(e, { plainOnly: true, storyNotes: opts.storyNotes }))}" title="Copy plain-English update formatted for Discord">plain english</button>` : ''}
     ${e.sourceSha ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" rel="noopener" target="_blank">snapshot</a>` : ''}
     ${e.pr ? `<a class="meta-link" href="${esc(e.prUrl || '')}" rel="noopener" target="_blank">PR #${e.pr}</a>` : ''}
     ${e.compareUrl ? `<a class="meta-link" href="${esc(e.compareUrl)}" rel="noopener" target="_blank">compare</a>` : e.url ? `<a class="meta-link" href="${esc(e.url)}" rel="noopener" target="_blank">commit</a>` : ''}
@@ -1238,79 +1237,25 @@ function dcSentences (text) {
   return String(text).split(/(?<=[.!?])\s+(?=[A-Z(`_$\d])/).map(s => s.trim()).filter(Boolean)
 }
 
-// The one place Discord gives you columns. Values here are hex, digits and names,
-// so no backtick or fence can arrive from the data.
-function dcDetails (e) {
-  const rows = [['commit', e.sha.slice(0, 12)]]
-  if (e.sourceSha) rows.push(['snapshot', String(e.sourceSha).slice(0, 12)])
-  rows.push(['churn', `+${e.stats?.additions ?? 0} / −${e.stats?.deletions ?? 0}`])
-  rows.push(['files', String(e.files?.total ?? 0)])
-  if (e.version) rows.push(['release', `v${e.version}`])
-  if (e.pr) rows.push(['pull', `#${e.pr}`])
-  if (e.author) rows.push(['author', e.author])
-  const w = Math.max(...rows.map(r => r[0].length))
-  // Values are hex, digits and names, but a backtick in any of them would close the
-  // fence early and turn the rest of the message into code.
-  return rows.map(r => `${r[0].padEnd(w)}  ${String(r[1]).replace(/`/g, '')}`).join('\n')
-}
-
 export function discordText (e, opts = {}) {
-  const plainOnly = Boolean(opts.plainOnly)
   const title = e.ai?.title || e.title || deriveTitleSafe(e)
-  const sum = String(e.ai?.summary || e.summary || '').replace(/\s+/g, ' ').trim()
-  const sig = e.significance === 'noise' ? 'churn' : e.significance
-  const time = (e.date && e.date.includes('T')) ? e.date.slice(11, 16) : ''
-  const dateStr = (plainOnly && time) ? `${fmtDateHuman(e.day)} · ${time} UTC` : fmtDateHuman(e.day)
-  const head = ['**FREEBUFF**', `\`${e.category || 'Change'}\``, dateStr]
-  if (sig && sig !== 'minor') head.push(`**${sig.toUpperCase()}**`)
-  const parts = [head.join(' · '), `### ${dcEsc(title)}`]
-  // Every line of a quote needs its own `>`: a wrapped continuation is fine, but a
-  // hard newline without it would drop out of the quote and lose the rule.
+  const dateStr = fmtDateHuman(e.day || e.date)
+  const plain = String(e.eli5?.text || e.ai?.summary || e.summary || '').replace(/\s+/g, ' ').trim()
+
+  const parts = [`### ${dcEsc(title)}\n${dateStr}`]
   if (opts.storyNotes?.length) {
     parts.push(`> **Related access context**\n> ${opts.storyNotes.map(n => dcEsc(clipText(n.text, 600))).join('\n> ')}`)
   }
-  let eli5Idx = -1, eli5Full = ''
-  if (e.eli5?.text) {
-    eli5Full = String(e.eli5.text).replace(/\s+/g, ' ').trim()
-    eli5Idx = parts.length
-    parts.push(`> **In plain English**\n> ${dcSentences(eli5Full).map(dcEsc).join('\n> ')}`)
+  if (plain) {
+    parts.push(dcEsc(plain))
   }
-  let sumIdx = -1
-  if (!plainOnly && sum) { sumIdx = parts.length; parts.push(dcSentences(sum).map(dcEsc).join('\n')) }
-  // The citation travels with the claim; it is the first thing dropped when the
-  // message is over the cap.
-  let evIdx = -1
-  if (!plainOnly && e.ai?.evidence) { evIdx = parts.length; parts.push(`**Evidence**\n${dcEsc(clipText(String(e.ai.evidence).replace(/\s+/g, ' ').trim(), 300))}`) }
-  const added = e.modelChanges?.added || [], removed = e.modelChanges?.removed || []
-  if (added.length || removed.length) {
-    const rows = [...removed.map(m => `- \`−\` ~~${dcEsc(m)}~~`), ...added.map(m => `- \`+\` **${dcEsc(m)}**`)]
-    parts.push(`**Model catalog**\n${rows.join('\n')}`)
-  }
-  let factsIdx = -1
-  if (!plainOnly) {
-    const facts = (e.facts || []).slice(0, 3).map(f => `- ${dcEsc(clipText(f, 160))}`)
-    if (facts.length) { factsIdx = parts.length; parts.push(`**Highlights**\n${facts.join('\n')}`) }
-    parts.push(`**Details**\n\`\`\`\n${dcDetails(e)}\n\`\`\``)
-  } else if (!e.eli5?.text && sum) {
-    sumIdx = parts.length
-    parts.push(dcSentences(sum).map(dcEsc).join('\n'))
-  }
+
   let text = parts.join('\n\n')
-  // Give up detail in reverse order of value: the evidence line, the highlights
-  // list, then the tail of the summary, then the tail of the quote. The header
-  // and details are what identify the change, so they are never cut; the quote
-  // keeps its head.
-  if (text.length > DC_LIMIT && evIdx >= 0) { parts.splice(evIdx, 1); if (sumIdx > evIdx) sumIdx--; if (eli5Idx > evIdx) eli5Idx--; if (factsIdx > evIdx) factsIdx--; text = parts.join('\n\n') }
-  if (text.length > DC_LIMIT && factsIdx >= 0) { parts.splice(factsIdx, 1); if (sumIdx > factsIdx) sumIdx--; if (eli5Idx > factsIdx) eli5Idx--; text = parts.join('\n\n') }
-  if (text.length > DC_LIMIT && sumIdx >= 0) {
-    const room = DC_LIMIT - (text.length - parts[sumIdx].length) - 8
-    parts[sumIdx] = dcEsc(clipText(sum, Math.max(0, room)))
-    text = parts.join('\n\n')
-  }
-  if (text.length > DC_LIMIT && eli5Idx >= 0) {
-    const room = DC_LIMIT - (text.length - parts[eli5Idx].length) - 8
-    const clipped = clipText(eli5Full, Math.max(0, room))
-    parts[eli5Idx] = `> **In plain English**\n> ${dcSentences(clipped).map(dcEsc).join('\n> ')}`
+  if (text.length > DC_LIMIT && plain) {
+    const overhead = text.length - plain.length
+    const room = DC_LIMIT - overhead - 4
+    const clipped = clipText(plain, Math.max(0, room))
+    parts[parts.length - 1] = dcEsc(clipped)
     text = parts.join('\n\n')
   }
   return text.length > DC_LIMIT ? text.slice(0, DC_LIMIT - 1) + '…' : text
