@@ -1564,8 +1564,9 @@ button.meta-link.dc-ok{
   border-radius:2px;
   padding:3px 10px;
   cursor:pointer;
+  text-decoration:none;
 }
-.atab:hover{color:var(--txt);border-color:var(--term-border-strong)}
+.atab:hover{color:var(--txt);border-color:var(--term-border-strong);text-decoration:none}
 .atab:focus-visible{outline:1px solid var(--term-cyan);outline-offset:1px}
 .atab.active{color:var(--txt);border-color:var(--term-cyan);background:var(--cyan-tint-bg)}
 .atab-fold{margin-left:auto;display:flex;gap:6px}
@@ -2667,7 +2668,8 @@ mark.search-match{
 
 /* Weekly digest rows reuse the compact change rows. */
 .week-rows{margin:6px 0 14px}
-.week-rows .crow .model-swap{display:inline-flex;gap:6px;flex-wrap:wrap}
+.week-rows .crow .model-swap{flex:1 0 100%;padding-left:42px;display:inline-flex;gap:6px;flex-wrap:wrap;margin-top:2px}
+.week-rows .crow .model-snap{flex:1 0 100%;margin-left:42px;margin-top:4px}
 
 /* v9: structured-fact chips, per-topic changes, action / unknowns lines. */
 .schips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0}

@@ -628,6 +628,12 @@ test('buildSite generates valid static site output', async () => {
     assert.match(weekIndex, /id="week-tabs"/, 'week index carries year archive tabs')
     assert.match(weekIndex, /class="wyear-group"/, 'week index groups weeks by year accordion')
     assert.match(weekIndex, /class="crow"/, 'week index renders standard compact change rows')
+
+    const weekDetail = await readFile(join(tmpDist, 'week/2026-W37/index.html'), 'utf8')
+    assert.match(weekDetail, /WEEKLY_DIGEST :: 2026-W37/, 'week page carries terminal hero header')
+    assert.match(weekDetail, /class="archive-tabs"/, 'week page carries section quick-jump tabs')
+    assert.match(weekDetail, /id="all-changes"/, 'week page folds full commit log in details')
+    assert.match(weekDetail, /class="crow"/, 'week page renders compact change rows')
     // /c/<sha> is the date-free permalink. A day URL is a function of a timestamp
     // that has already moved once, so shared links need an address that encodes no
     // date -- and one page plus a lookup table, because ~9,500 static redirect

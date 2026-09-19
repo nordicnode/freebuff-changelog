@@ -2195,42 +2195,162 @@ ${archiveScript}`
   // exists the moment the week has its first commit and never waits on a model.
   const weeks = buildWeeklyDigests(entries)
   const weekHref = (w) => `/week/${w.key}/`
-  const weekRow = (e) => changeRow(e)
-  const weekSection = (title, list) => list.length ? `<div class="section-hdr"><h2>${title} (${list.length})</h2></div><section class="week-rows">${list.map(weekRow).join('\n')}</section>` : ''
+
+  const formatWeekRange = (monday, sunday) => {
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    const [y1, m1, d1] = monday.split('-')
+    const [y2, m2, d2] = sunday.split('-')
+    if (y1 === y2 && m1 === m2) {
+      return `${months[Number(m1) - 1]} ${Number(d1)} – ${Number(d2)}, ${y1}`
+    } else if (y1 === y2) {
+      return `${months[Number(m1) - 1]} ${Number(d1)} – ${months[Number(m2) - 1]} ${Number(d2)}, ${y1}`
+    }
+    return `${months[Number(m1) - 1]} ${Number(d1)}, ${y1} – ${months[Number(m2) - 1]} ${Number(d2)}, ${y2}`
+  }
+
+  const weekChangeRow = (e) => {
+    const anchor = e.sha.slice(0, 12)
+    const title = e.ai?.title || e.title || deriveTitleSafe(e)
+    const sum = e.ai?.summary || e.summary || ''
+    const vers = e.version || e.freebuffVersion
+    const relBadge = vers ? `<a class="badge ver" href="/release/${esc(vers)}/" title="Release ${esc(vers)}">v${esc(vers)}</a>` : ''
+    const isMaj = (e.ai?.significance || e.significance) === 'major'
+    const majBadge = isMaj ? `<span class="badge maj">[MAJOR]</span>` : ''
+    const isSec = isSecurityEntry(e)
+    const secBadge = isSec ? `<span class="badge sec" title="Security-relevant change">sec</span>` : ''
+    const catSlug = categorySlug(e.category)
+    const catBadge = e.category && !['Other', 'unknown'].includes(e.category)
+      ? `<a class="badge cat" href="/changes/${esc(catSlug)}/">${esc(e.category.toUpperCase())}</a>`
+      : ''
+
+    return `<div class="crow${e.noise ? ' crow-noise' : ''}" id="${anchor}">
+  <span class="crow-time" title="${esc(e.date ? e.date.slice(0, 10) + ' ' + e.date.slice(11, 16) + ' UTC' : '')}">${esc(e.day ? e.day.slice(5) : '')}</span>
+  <a class="crow-ref" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" target="_blank" rel="noopener">${anchor}</a>
+  <a class="crow-title" href="/day/${e.day}/#${anchor}">${esc(clipText(title, 110))}</a>
+  ${relBadge}
+  ${majBadge}
+  ${secBadge}
+  ${catBadge}
+  <div class="meta-links">
+    <a class="meta-link" href="/day/${e.day}/#${anchor}">[entry]</a>
+    ${vers ? `<a class="meta-link" href="/release/${esc(vers)}/">[release]</a>` : ''}
+  </div>
+  ${sum ? `<span class="crow-sum">${esc(clipText(sum, 150))}</span>` : ''}
+</div>`
+  }
+
+  const weekModelRow = (e) => {
+    const anchor = e.sha.slice(0, 12)
+    const title = e.ai?.title || e.title || deriveTitleSafe(e)
+    return `<div class="crow" id="${anchor}">
+  <span class="crow-time" title="${esc(e.date ? e.date.slice(0, 10) + ' ' + e.date.slice(11, 16) + ' UTC' : '')}">${esc(e.day ? e.day.slice(5) : '')}</span>
+  <a class="crow-ref" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" target="_blank" rel="noopener">${anchor}</a>
+  <a class="crow-title" href="/day/${e.day}/#${anchor}">${esc(clipText(title, 110))}</a>
+  <span class="badge model" title="Model catalog change">models</span>
+  <div class="meta-links">
+    <a class="meta-link" href="/day/${e.day}/#${anchor}">[entry]</a>
+    <a class="meta-link" href="/models/">[catalog]</a>
+  </div>
+  ${modelDiffLine(e)}
+</div>`
+  }
+
+  const weekSection = (id, title, list) => list.length
+    ? `<div class="section-hdr"><h2 id="${id}">${title} (${list.length})</h2></div><section class="week-rows">${list.map(weekChangeRow).join('\n')}</section>`
+    : ''
+
   await pool(weeks.map((w, i) => async () => {
     const newer = i > 0 ? weeks[i - 1] : null
     const older = i < weeks.length - 1 ? weeks[i + 1] : null
-    const pager = `<div class="pager">${older ? `<a href="${weekHref(older)}" rel="prev">&larr; ${esc(older.key)}</a>` : '<span class="pager-disabled">&larr;</span>'}<span class="pager-page">WEEK ${esc(w.key)} &middot; ${esc(weekLabel(w))}</span>${newer ? `<a href="${weekHref(newer)}" rel="next">${esc(newer.key)} &rarr;</a>` : '<a href="/">[latest day]</a>'}</div>`
-    const modelLines = w.models.map(e => `<div class="crow"><span class="crow-time">${esc(e.day.slice(5))}</span>${modelDiffLine(e)}</div>`).join('')
-    const body = `<section class="hero"><div class="term-box term-box-slim"><div class="term-box-hdr"><span class="term-box-title">WEEKLY_DIGEST :: ${esc(w.key)}</span><span>${esc(weekLabel(w))}</span></div>` +
-      `<p class="list-note">${esc(weeklyHeadline(w))}. <a href="/feed-weekly.xml">[rss]</a> <button class="meta-link dc-copy" type="button" data-dc="${esc(`**FREEBUFF weekly** · ${w.key}\n${weeklyText(w, SITE.url)}`.slice(0, 1990))}" title="Copy this digest as Discord-formatted text">discord</button></p></div></section>` +
+    const range = formatWeekRange(w.monday, w.sunday)
+
+    const pager = `<div class="pager">` +
+      (older ? `<a href="${weekHref(older)}" rel="prev">&larr; ${esc(older.key)}</a>` : '<span class="pager-disabled">&larr;</span>') +
+      `<span class="pager-page">WEEK ${esc(w.key)} &middot; ${esc(range)}</span>` +
+      (newer ? `<a href="${weekHref(newer)}" rel="next">${esc(newer.key)} &rarr;</a>` : '<span class="pager-disabled">&rarr;</span>') +
+      `</div>`
+
+    const tabs = []
+    if (w.releases.length) tabs.push(`<a class="atab" href="#releases">RELEASES (${w.releases.length})</a>`)
+    if (w.models.length) tabs.push(`<a class="atab" href="#models">MODELS (${w.models.length})</a>`)
+    if (w.top.length) tabs.push(`<a class="atab" href="#notable">NOTABLE (${w.top.length})</a>`)
+    if (w.security.length) tabs.push(`<a class="atab" href="#security">SECURITY (${w.security.length})</a>`)
+    tabs.push(`<a class="atab" href="#all-changes">ALL CHANGES (${w.counts.changes})</a>`)
+
+    const hero = `<section class="hero">
+  <div class="term-box">
+    <div class="term-box-hdr">
+      <span class="term-box-title">WEEKLY_DIGEST :: ${esc(w.key)}</span>
+      <span>${esc(range)}</span>
+    </div>
+    <p style="margin:6px 0 12px;font-size:.84rem;color:var(--txt-dim)">
+      ${esc(weeklyHeadline(w))}.
+    </p>
+    <div class="archive-tabs" role="tablist" aria-label="Digest sections">
+      ${tabs.join('\n      ')}
+    </div>
+    <div class="term-footer-bar">
+      <span>${w.dayCount} active day${w.dayCount === 1 ? '' : 's'} (${esc(w.monday)} &rarr; ${esc(w.sunday)})</span>
+      <span class="meta-links">
+        <a class="meta-link" href="/feed-weekly.xml">[rss]</a>
+        <button class="meta-link dc-copy" type="button" data-dc="${esc(`**FREEBUFF weekly** · ${w.key}\n${weeklyText(w, SITE.url)}`.slice(0, 1990))}" title="Copy this digest as Discord-formatted text">discord</button>
+        <a class="meta-link" href="/week/">[all weeks]</a>
+      </span>
+    </div>
+  </div>
+</section>`
+
+    const modelSec = w.models.length
+      ? `<div class="section-hdr"><h2 id="models">MODEL CATALOG (${w.models.length})</h2></div><section class="week-rows">${w.models.map(weekModelRow).join('\n')}</section>`
+      : ''
+
+    const allChangesSec = `<div class="section-hdr"><h2 id="all-changes-hdr">COMPLETE LOG</h2></div>
+<details class="more-rows" id="all-changes">
+  <summary>[ all ${w.counts.changes} changes this week &middot; expand full log ]</summary>
+  <section class="week-rows">
+    ${w.entries.map(weekChangeRow).join('\n')}
+  </section>
+</details>`
+
+    const bottomNav = `<p style="margin-top:24px;font-size:.82rem"><a href="/week/">&larr; [all weekly rollups]</a> &middot; <a href="/">[latest day]</a></p>`
+
+    const weekDetailScript = `<script>
+(function () {
+  function fromHash () {
+    var h = (location.hash || '').slice(1);
+    if (!h) return;
+    var d = document.getElementById(h);
+    if (d) {
+      if (d.tagName === 'DETAILS') d.open = true;
+      var p = d.closest ? d.closest('details') : null;
+      if (p) p.open = true;
+      try { d.scrollIntoView({ block: 'start' }); } catch (e) {}
+    }
+  }
+  document.addEventListener('DOMContentLoaded', fromHash);
+  window.addEventListener('hashchange', fromHash);
+})();
+</script>`
+
+    const body = hero +
       pager +
-      weekSection('RELEASES', w.releases) +
-      (w.models.length ? `<div class="section-hdr"><h2>MODEL CATALOG (${w.models.length})</h2></div><section class="week-rows">${modelLines}</section>` : '') +
-      weekSection('NOTABLE WORK', w.top) +
-      (w.security.length ? weekSection('SECURITY-RELEVANT', w.security.slice(0, 12)) : '') +
-      `<details class="more-rows"><summary>[ all ${w.counts.changes} changes this week ]</summary>${w.entries.map(changeRow).join('\n')}</details>` +
-      pager
+      weekSection('releases', 'RELEASES', w.releases) +
+      modelSec +
+      weekSection('notable', 'NOTABLE WORK', w.top) +
+      (w.security.length ? weekSection('security', 'SECURITY-RELEVANT', w.security.slice(0, 12)) : '') +
+      allChangesSec +
+      pager +
+      bottomNav +
+      weekDetailScript
+
     await write(dist, `week/${w.key}/index.html`, layout({
       title: `Week ${w.key}`, path: weekHref(w),
-      desc: `Freebuff changes ${weekLabel(w)}: ${weeklyHeadline(w)}.`,
+      desc: `Freebuff changes for ${range}: ${weeklyHeadline(w)}.`,
       body
     }))
   }), 8)
   if (weeks.length) {
     const totalReleases = weeks.reduce((sum, w) => sum + w.releases.length, 0)
-
-    const formatWeekRange = (monday, sunday) => {
-      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-      const [y1, m1, d1] = monday.split('-')
-      const [y2, m2, d2] = sunday.split('-')
-      if (y1 === y2 && m1 === m2) {
-        return `${months[Number(m1) - 1]} ${Number(d1)} – ${Number(d2)}, ${y1}`
-      } else if (y1 === y2) {
-        return `${months[Number(m1) - 1]} ${Number(d1)} – ${months[Number(m2) - 1]} ${Number(d2)}, ${y1}`
-      }
-      return `${months[Number(m1) - 1]} ${Number(d1)}, ${y1} – ${months[Number(m2) - 1]} ${Number(d2)}, ${y2}`
-    }
 
     const weeksByYear = new Map()
     for (const w of weeks) {
