@@ -1010,21 +1010,50 @@ function unknownsHtml (e) {
 
 // Chips for the mechanically extracted facts: values that moved, new settings,
 // new flags, exports, and the titles of new tests.
+// Collapsed by default.
 function structuredChips (e) {
   const s = e.structured
   const a = e.ai || {}
   const chips = []
-  for (const c of (s?.constants || []).slice(0, 4)) chips.push(`<span class="schip const" title="${esc(`${c.name}: ${c.from} -> ${c.to}`)}"><b>${esc(c.name)}</b> ${esc(c.from.length > 18 ? c.from.slice(0, 15) + '…' : c.from)} &rarr; ${esc(c.to.length > 18 ? c.to.slice(0, 15) + '…' : c.to)}</span>`)
+  const types = []
+
+  const consts = (s?.constants || []).slice(0, 4)
+  for (const c of consts) chips.push(`<span class="schip const" title="${esc(`${c.name}: ${c.from} -> ${c.to}`)}"><b>${esc(c.name)}</b> ${esc(c.from.length > 18 ? c.from.slice(0, 15) + '…' : c.from)} &rarr; ${esc(c.to.length > 18 ? c.to.slice(0, 15) + '…' : c.to)}</span>`)
+  if (consts.length) types.push('constants')
+
   const envs = [...new Set([...(a.newEnvVars || []), ...(s?.envVars || [])])].slice(0, 4)
   for (const v of envs) chips.push(`<span class="schip env" title="Environment variable newly read">ENV ${esc(v)}</span>`)
+  if (envs.length) types.push('env vars')
+
   const flags = [...new Set([...(a.newFlags || []), ...(s?.flags || [])])].slice(0, 4)
   for (const f of flags) chips.push(`<span class="schip flag" title="Command-line flag introduced">${esc(f)}</span>`)
-  for (const x of (s?.exportsAdded || []).slice(0, 3)) chips.push(`<span class="schip exp" title="Export added">+${esc(x)}</span>`)
-  for (const x of (s?.exportsRemoved || []).slice(0, 2)) chips.push(`<span class="schip exp del" title="Export removed">&minus;${esc(x)}</span>`)
+  if (flags.length) types.push('flags')
+
+  const expAdd = (s?.exportsAdded || []).slice(0, 3)
+  for (const x of expAdd) chips.push(`<span class="schip exp" title="Export added">+${esc(x)}</span>`)
+  const expDel = (s?.exportsRemoved || []).slice(0, 2)
+  for (const x of expDel) chips.push(`<span class="schip exp del" title="Export removed">&minus;${esc(x)}</span>`)
+  if (expAdd.length || expDel.length) types.push('exports')
+
   const tests = (s?.testNames || []).slice(0, 3)
+  if (tests.length) types.push('tests')
   const testHtml = tests.length ? `<details class="tests-assert"><summary>Behavior asserted by ${s.testNames.length} new test${s.testNames.length === 1 ? '' : 's'}</summary><ul>${s.testNames.slice(0, 8).map(t => `<li>${esc(t)}</li>`).join('')}</ul></details>` : ''
+
   if (!chips.length && !testHtml) return ''
-  return `${chips.length ? `<div class="schips">${chips.join('')}</div>` : ''}${testHtml}`
+
+  const hint = types.length ? `(${types.join(', ')})` : '(env vars, exports)'
+
+  return `<details class="schips-details">
+<summary class="schips-toggle" title="Toggle environment variables, exports and flags">
+  <span class="diff-arrow">&gt;</span>
+  <span>Structured facts</span>
+  <span class="schips-hint">${esc(hint)}</span>
+</summary>
+<div class="schips-body">
+  ${chips.length ? `<div class="schips">${chips.join('')}</div>` : ''}
+  ${testHtml}
+</div>
+</details>`
 }
 
 // The model's own citation of what in the diff supports the summary, plus any

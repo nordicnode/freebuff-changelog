@@ -153,6 +153,7 @@ test('buildSite generates valid static site output', async () => {
           summary: 'Model catalog: Muse Spark 1.3 replaced Muse Spark 1.2 in the free model lineup.',
           title: 'Muse Spark 1.3 replaces Muse Spark 1.2 in the free model lineup',
           ai: { title: 'Muse Spark 1.3 replaces Muse Spark 1.2', summary: 'AI summarized diff', unknowns: 'The diff does not show the backend API endpoints.', model: 'mock-model' },
+          structured: { envVars: ['FREEBUFF_TEST_ENV'], exportsAdded: ['testSymbol'], constants: [], flags: [], exportsRemoved: [], testNames: [] },
           eli5: { text: 'A newer AI model is now available in the free list, replacing the older one.', v: 1, src: 'aaaaaaaaaaaa' },
           category: 'Model Catalog',
           significance: 'major',
@@ -229,6 +230,9 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /<details class="unknowns-details"/)
     assert.match(indexHtml, /class="unknowns-toggle"/)
     assert.match(indexHtml, /Not in the diff/)
+    assert.match(indexHtml, /<details class="schips-details"/)
+    assert.match(indexHtml, /class="schips-toggle"/)
+    assert.match(indexHtml, /Structured facts/)
     // Diffs lazy-load on toggle: no pre-rendered diff markup in pages
     assert.doesNotMatch(indexHtml, /<pre class="diff-pre">/)
     assert.doesNotMatch(indexHtml, /<div class="diff-line/)

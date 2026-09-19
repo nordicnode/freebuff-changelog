@@ -2603,6 +2603,7 @@ mark.search-match{
 .reading-mode-plain .entry .tech-details,
 .reading-mode-plain .entry .facts-details,
 .reading-mode-plain .entry .unknowns-details,
+.reading-mode-plain .entry .schips-details,
 .reading-mode-plain .entry .facts,
 .reading-mode-plain .entry .files,
 .reading-mode-plain .entry .diff-viewer,
@@ -2772,6 +2773,52 @@ mark.search-match{
 .week-rows .crow .model-snap{flex:1 0 100%;margin-left:42px;margin-top:4px}
 
 /* v9: structured-fact chips, per-topic changes, action / unknowns lines. */
+.schips-details{
+  margin:8px 0;
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  background:var(--code);
+  overflow:hidden;
+  font-size:.8rem;
+}
+.schips-toggle{
+  cursor:pointer;
+  padding:6px 10px;
+  color:var(--txt-dim);
+  list-style:none;
+  display:flex;
+  gap:6px;
+  align-items:center;
+  user-select:none;
+  font-weight:600;
+  font-size:.78rem;
+  background:var(--code);
+  transition:background .12s ease, color .12s ease;
+}
+.schips-toggle::-webkit-details-marker{display:none}
+.schips-toggle:hover{
+  color:var(--txt);
+  background:var(--panel-hover);
+}
+.schips-hint{
+  font-size:.74rem;
+  font-weight:400;
+  color:var(--txt-subtle);
+}
+.schips-details[open] .schips-toggle{
+  border-bottom:1px solid var(--term-border);
+}
+.schips-details[open] .schips-toggle .diff-arrow{
+  transform:rotate(90deg);
+  color:var(--txt);
+}
+.schips-body{
+  padding:8px 12px;
+  background:var(--panel);
+}
+.schips-body .schips{
+  margin:0;
+}
 .schips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0}
 .schip{font-size:.72rem;padding:2px 7px;border:1px solid var(--border,#30363d);border-radius:3px;color:var(--txt-dim);white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
 .schip.const{border-color:rgba(210,153,34,.45)}
@@ -2847,7 +2894,7 @@ mark.search-match{
 .badge.brk{color:var(--term-red,#f85149);border-color:rgba(248,81,73,.55);font-weight:600}
 .badge.lowc{color:var(--txt-subtle);border-style:dashed}
 .meta-link.report{color:var(--txt-subtle)}
-.reading-mode-plain .schips,.reading-mode-plain .tests-assert,.reading-mode-plain .unknowns,.reading-mode-plain .unknowns-details{display:none}
+.reading-mode-plain .schips,.reading-mode-plain .schips-details,.reading-mode-plain .tests-assert,.reading-mode-plain .unknowns,.reading-mode-plain .unknowns-details{display:none}
 
 /* Quality card notes and audience split colours. */
 .stat-note{font-size:.7rem;color:var(--txt-subtle);white-space:nowrap}
