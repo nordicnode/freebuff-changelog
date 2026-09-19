@@ -930,6 +930,7 @@ ${techHtml}
 ${migrationHtml(e)}
 ${structuredChips(e)}
 ${evidenceHtml(e)}
+${unknownsHtml(e)}
 ${shippedInHtml(e, opts.shipped)}
 ${factsHtml(e)}
 ${fileChips(e)}
@@ -983,13 +984,28 @@ function changesHtml (e) {
   return `<ul class="changes">${list.map(c => `<li>${c.area ? `<span class="changes-area">${esc(c.area)}</span> ` : ''}${miniMd(c.what)}${c.files?.length ? ` <span class="changes-files">${c.files.slice(0, 3).map(f => `<code title="${esc(f)}">${esc(shortPath(f))}</code>`).join(' ')}</span>` : ''}</li>`).join('')}</ul>`
 }
 
-// What a user or operator has to do, and what the diff does not show.
+// What a user or operator has to do (breaking changes / required actions).
 function migrationHtml (e) {
   const a = e.ai || {}
-  const parts = []
-  if (a.migration) parts.push(`<p class="migration"><span class="migration-lbl">ACTION</span>${esc(a.migration)}</p>`)
-  if (a.unknowns) parts.push(`<p class="unknowns"><span class="unknowns-lbl">NOT IN THE DIFF</span>${esc(a.unknowns)}</p>`)
-  return parts.join('\n')
+  if (!a.migration) return ''
+  return `<p class="migration"><span class="migration-lbl">ACTION</span>${esc(a.migration)}</p>`
+}
+
+// What the diff does not show (unshown callers, backend implementations, blind spots).
+// Collapsed by default.
+function unknownsHtml (e) {
+  const a = e.ai || {}
+  if (!a.unknowns) return ''
+  return `<details class="unknowns-details">
+<summary class="unknowns-toggle" title="Toggle what is not in the diff">
+  <span class="diff-arrow">&gt;</span>
+  <span>Not in the diff</span>
+  <span class="unknowns-hint">(unshown context)</span>
+</summary>
+<div class="unknowns-body">
+  <p class="unknowns">${miniMd(a.unknowns)}</p>
+</div>
+</details>`
 }
 
 // Chips for the mechanically extracted facts: values that moved, new settings,
