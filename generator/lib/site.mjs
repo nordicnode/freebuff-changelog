@@ -2785,7 +2785,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     <a href="${esc(p.url)}" target="_blank" rel="noopener">#${p.number}</a>
   </div>
   <h3 class="pr-title"><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a></h3>
-  ${p.ai?.summary ? `<div class="pr-preview-ai"><span class="eli5-label">WHAT IT PROPOSES</span>${p.ai.title && p.ai.title !== p.title ? `<b>${esc(p.ai.title)}.</b> ` : ''}${esc(p.ai.summary)}${p.ai.audience && AUDIENCE_DESC[p.ai.audience] ? ` <span class="badge aud" title="${esc(AUDIENCE_DESC[p.ai.audience])}">[${esc(p.ai.audience.toUpperCase())}]</span>` : ''}<span class="pr-preview-note">AI preview from the description and diff; not shipped yet.${p.ai.stale ? ' Written for an earlier revision of this PR.' : ''}</span></div>` : ''}
+  ${p.ai?.summary ? `<div class="pr-preview-ai"><span class="eli5-label">WHAT IT PROPOSES</span>${esc(p.ai.summary)}${p.ai.audience && AUDIENCE_DESC[p.ai.audience] ? ` <span class="badge aud" title="${esc(AUDIENCE_DESC[p.ai.audience])}">[${esc(p.ai.audience.toUpperCase())}]</span>` : ''}<span class="pr-preview-note">AI preview from the description and diff; not shipped yet.${p.ai.stale ? ' Written for an earlier revision of this PR.' : ''}</span></div>` : ''}
   <div class="pr-meta">
     <span>#${p.number} by ${esc(p.author || 'contributor')}</span>
     <span>&middot;</span>
