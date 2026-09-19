@@ -461,6 +461,72 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
   }
 }
 
+export async function fetchTrafficClones ({
+  fetchImpl = globalThis.fetch,
+  dataDir = DATA,
+  repo = process.env.CHANGELOG_REPO || 'nordicnode/freebuff-changelog',
+  force = false
+} = {}) {
+  // Traffic metrics update periodically on GitHub's backend; a 60-minute cadence
+  // keeps figures fresh while conserving API quota.
+  const TRAFFIC_REFRESH_MIN = Number(process.env.CHANGELOG_TRAFFIC_REFRESH_MIN) || 60
+  const trafficPath = resolve(dataDir, 'traffic.json')
+  const cached = await readJson(trafficPath, null)
+
+  const cachedFetched = cached?.fetchedAt ? Date.parse(cached.fetchedAt) : 0
+  const age = cachedFetched ? Date.now() - cachedFetched : Infinity
+  if (!force && cached && cached.count != null && age < TRAFFIC_REFRESH_MIN * 60000) {
+    return cached
+  }
+
+  const token = process.env.CHANGELOG_GITHUB_TOKEN || process.env.GITHUB_TOKEN
+  const headers = {
+    'user-agent': 'freebuff-changelog',
+    accept: 'application/vnd.github+json'
+  }
+  if (token) headers.authorization = `Bearer ${token}`
+
+  try {
+    const url = `https://api.github.com/repos/${repo}/traffic/clones`
+    const res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(15000) })
+    if (!res.ok) {
+      if (res.status === 403 || res.status === 404) {
+        log(`traffic clones (${repo}): HTTP ${res.status}${token ? '' : ' (no token set)'}${cached ? ': keeping cached traffic' : ''}`)
+      }
+      return cached
+    }
+    const data = await res.json()
+    if (typeof data?.count !== 'number') {
+      return cached
+    }
+
+    // Merge daily breakdown history so days rolling off the 14-day window are preserved
+    const existingClones = Array.isArray(cached?.clones) ? cached.clones : []
+    const cloneMap = new Map(existingClones.map(c => [c.timestamp, c]))
+    for (const c of (data.clones || [])) {
+      if (c?.timestamp) cloneMap.set(c.timestamp, c)
+    }
+    const mergedClones = [...cloneMap.values()].sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+
+    const record = {
+      count: data.count,
+      uniques: data.uniques ?? 0,
+      clones: mergedClones,
+      fetchedAt: new Date().toISOString()
+    }
+
+    const countChanged = cached?.count !== record.count || cached?.uniques !== record.uniques
+    if (countChanged || force || age >= TRAFFIC_REFRESH_MIN * 60000) {
+      await writeJson(trafficPath, record)
+      log(`traffic clones: ${record.count} clones (${record.uniques} unique) over 14 days`)
+    }
+    return record
+  } catch (err) {
+    log(`traffic clones fetch failed: ${String(err?.message || err).slice(0, 120)}`)
+    return cached
+  }
+}
+
 function decorate (e) {
   // Upstream commits carry the author's offset (`-08:00`); the day pages, the
   // release windows and every sort key off the string, so the zone has to go
@@ -674,6 +740,7 @@ async function generateOnce (argv) {
 
   const prs = await fetchOpenPrs()
   await prunePrDiffs(prs || [], await readJson(`${DATA}/open-prs.json`, null))
+  await fetchTrafficClones()
   // Previews for open PRs: same summary ask on the stored preview diff, a few
   // per run (CHANGELOG_PR_LLM_LIMIT), cached by number + diff hash.
   if (prs?.length && llmConfigured()) {
@@ -917,7 +984,7 @@ async function catchUpOnce (argv) {
     }
   }
 
-  // 1.5. Refresh open PRs even when git main is quiet, so newly opened, updated,
+  // 1.5. Refresh open PRs and traffic clones even when git main is quiet, so newly opened, updated,
   //      or merged PRs appear on /in-flight/ quickly rather than waiting up to
   //      45m for the next commit-sync cycle.
   let didPrSync = false
@@ -926,8 +993,11 @@ async function catchUpOnce (argv) {
     const prs = await fetchOpenPrs()
     if (prs) {
       await prunePrDiffs(prs, prevPrs)
-      didPrSync = Boolean(await dirtyData())
     }
+    await fetchTrafficClones()
+    didPrSync = Boolean(await dirtyData())
+  } else {
+    await fetchTrafficClones()
   }
 
   // 2. Snapshot *after* the sync — generate rewrote changelog.json, so a copy
@@ -1097,6 +1167,7 @@ async function cmdBuild () {
   // what dist/ actually holds.
   const keepDiff = diffShipFilter(changelog.entries, process.env)
   if (keepDiff) for (const e of changelog.entries) if (e.hasDiff && !keepDiff(e)) e.hasDiff = false
+  const traffic = await readJson(`${DATA}/traffic.json`, null)
   // dist/ is a pure build output, regenerated in full from data/ every run, so it
   // is cleared first. Without this, any URL the generator stops emitting keeps
   // shipping the markup of the build that made it -- today that would be a
@@ -1106,7 +1177,7 @@ async function cmdBuild () {
   await mkdir(dist, { recursive: true })
   // The timeline paginates one day per page: `/` is the newest day, every older
   // day is its own /day/<date>/ page.
-  await buildSite({ changelog, openPrs: prs, prMeta, dist })
+  await buildSite({ changelog, openPrs: prs, prMeta, traffic, dist })
 
   // data/diffs is 106 MB of a 352 MB dist. Two opt-in trims: skip the churn
   // rows' lockfile diffs (CHANGELOG_DIST_SKIP_CHURN_DIFFS=1) and/or ship only
@@ -1240,12 +1311,14 @@ if (IS_MAIN) {
   else if (cmd === 'eval') await cmdEval(rest)
   else if (cmd === 'normalize-dates') await cmdNormalizeDates(rest)
   else if (cmd === 'broadcast') await cmdBroadcast(rest)
+  else if (cmd === 'fetch-traffic') await fetchTrafficClones({ force: true })
   else if (cmd === 'build') await cmdBuild()
   else if (cmd === 'preview') await cmdPreview(Number(rest[0]) || 8788)
   else {
     console.log(`usage:
   node generator/cli.mjs generate [--full]        # analyze upstream freebuff (full rescan)
   node generator/cli.mjs catch-up [--push]        # sync-if-due + one LLM backfill batch
+  node generator/cli.mjs fetch-traffic            # fetch latest 14d clone traffic from GitHub API
   node generator/cli.mjs backfill [--push]        # continuous sync + backfill loop (the daemon)
   node generator/cli.mjs watch [--push]           # alias for backfill
   node generator/cli.mjs push-data [--message M]  # commit+push data/ with the shared race handling

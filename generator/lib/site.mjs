@@ -1325,7 +1325,9 @@ export function formatCommentHtml (text) {
 
 async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, '')}/${p}`, html) }
 
-export async function buildSite ({ changelog, openPrs, dist, prMeta = {} }) {
+export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null }) {
+  const trafficCount = traffic?.count ?? 0
+  const trafficUniques = traffic?.uniques ?? 0
   const entries = [...changelog.entries].reverse() // newest first
   const byDay = groupByDay(entries)
   // "Related" is a reading aid for real changes: churn rows must neither appear
@@ -2821,6 +2823,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         <dt>Code areas</dt><dd>${areaTotal.toLocaleString()}</dd><dd class="man-note">${areaLine}</dd>
         <dt>Significance</dt><dd></dd><dd class="man-note"><code>[MAJOR]</code> models &amp; code bumps &middot; <code>[NOTABLE]</code> user-visible &amp; bumps &middot; <code>[minor]</code> internal &middot; <code>[SECURITY]</code> trust/keys</dd>
         ${openPrs?.length ? `<dt>In-flight</dt><dd>${openPrs.length.toLocaleString()}</dd><dd class="man-note">Open PRs with diffstat, commits, comments, and preview</dd>` : ''}
+        <dt>14d Clones</dt><dd id="about-clones">${trafficCount.toLocaleString()}</dd><dd class="man-note"><span id="about-cloners">${trafficUniques.toLocaleString()}</span> unique cloners across the last 14 days</dd>
       </dl>
 
       <h4>WHERE TO GO</h4>
@@ -2866,11 +2869,24 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         <img src="/badge/models.svg" alt="Models">
         <img src="/badge/status.svg" alt="Status">
         <img src="/badge/changes.svg" alt="Changes">
+        <img src="/badge/clones.svg" alt="14d Clones">
+        <img src="/badge/cloners.svg" alt="14d Cloners">
       </div>
       <p style="font-size:.78rem;color:var(--txt-dim);margin-top:4px">Markdown: <code>[![Version](${SITE.url}/badge/version.svg)](${SITE.url})</code></p>
     </div>
   </div>
-</section>`
+</section>
+<script>
+(function(){
+  fetch('/api/traffic.json').then(function(r){return r.ok?r.json():null}).then(function(d){
+    if(!d)return;
+    var c=document.getElementById('about-clones');
+    var u=document.getElementById('about-cloners');
+    if(c&&typeof d.count==='number')c.textContent=d.count.toLocaleString();
+    if(u&&typeof d.uniques==='number')u.textContent=d.uniques.toLocaleString();
+  }).catch(function(){});
+})();
+</script>`
   }))
 
   // ----- open PRs page (community activity ahead of merges, with diff previews)
@@ -3254,6 +3270,16 @@ ${inFlightScript}`
   await write(dist, 'badge/models.svg', renderBadgeSvg('free models', `${modelLive.length} active`, '#2ea043'))
   await write(dist, 'badge/status.svg', renderBadgeSvg('changelog', isFresh ? 'fresh' : 'stale', isFresh ? '#2ea043' : '#d29922'))
   await write(dist, 'badge/changes.svg', renderBadgeSvg('tracked changes', `${meaningful.length.toLocaleString()}`, '#8250df'))
+  const fmtTraffic = (n) => n >= 10000 ? `${(n / 1000).toFixed(1)}k` : (n >= 1000 ? `${(n / 1000).toFixed(2)}k` : `${n}`)
+  await write(dist, 'badge/clones.svg', renderBadgeSvg('14d clones', fmtTraffic(trafficCount), '#0969da'))
+  await write(dist, 'badge/cloners.svg', renderBadgeSvg('14d cloners', fmtTraffic(trafficUniques), '#2ea043'))
+
+  await write(dist, 'api/traffic.json', JSON.stringify({
+    count: trafficCount,
+    uniques: trafficUniques,
+    clones: traffic?.clones || [],
+    fetchedAt: traffic?.fetchedAt || null
+  }))
 
   await write(dist, 'api/entries.json', JSON.stringify({ generatedAt: generated, head: changelog.headSha, total: entries.length, changes: meaningful.length, churn: churnCount, latest: meaningful.slice(0, 60) }))
   await write(dist, 'api/status.json', JSON.stringify({
@@ -3265,6 +3291,7 @@ ${inFlightScript}`
     days: byDay.length,
     releases: vers.length,
     models: { changes: modelEntries.length, live: modelLive.length },
+    traffic: { count: trafficCount, uniques: trafficUniques },
     openPrs: openPrs?.length || 0,
     openPrsTotal: prMeta.total || openPrs?.length || 0,
     openPrsCheckedMinAgo: prMeta.ageMin ?? null

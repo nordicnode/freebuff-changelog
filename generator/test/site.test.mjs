@@ -472,6 +472,11 @@ test('buildSite generates valid static site output', async () => {
       .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length
     assert.ok(aboutWords < 700, `about page is ${aboutWords} words; keep it under 700`)
     assert.doesNotMatch(aboutBody, /&mdash;|\u2014/, 'about copy carries no em-dashes')
+    assert.match(aboutHtml, /14d Clones/)
+    assert.match(aboutHtml, /id="about-clones"/)
+    assert.match(aboutHtml, /id="about-cloners"/)
+    assert.match(aboutHtml, /badge\/clones\.svg/)
+    assert.match(aboutHtml, /badge\/cloners\.svg/)
 
     // Verify models page: lineup, retired, history rows, nav
     const modelsHtml = await readFile(join(tmpDist, 'models/index.html'), 'utf8')
@@ -1214,10 +1219,14 @@ test('site build generates dynamic SVG status badges and reading progress bar', 
   const modelsBadge = await readFile(join(dist, 'badge/models.svg'), 'utf8')
   const statusBadge = await readFile(join(dist, 'badge/status.svg'), 'utf8')
   const changesBadge = await readFile(join(dist, 'badge/changes.svg'), 'utf8')
+  const clonesBadge = await readFile(join(dist, 'badge/clones.svg'), 'utf8')
+  const clonersBadge = await readFile(join(dist, 'badge/cloners.svg'), 'utf8')
   assert.match(verBadge, /v1\.0\.99/)
   assert.match(modelsBadge, /free models/)
   assert.match(statusBadge, /changelog/)
   assert.match(changesBadge, /tracked changes/)
+  assert.match(clonesBadge, /14d clones/)
+  assert.match(clonersBadge, /14d cloners/)
 
   const indexHtml = await readFile(join(dist, 'index.html'), 'utf8')
   assert.match(indexHtml, /<div id="reading-progress" aria-hidden="true"><\/div>/)
