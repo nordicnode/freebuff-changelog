@@ -62,6 +62,7 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
   </div>
   <nav class="term-nav">
     <a href="/about/" class="${path === '/about/' ? 'active' : ''}">/about</a>
+    <a href="/week/" class="${path.startsWith('/week') ? 'active' : ''}">/weekly</a>
     <a href="/models/" class="${path.startsWith('/models/') ? 'active' : ''}">/models</a>
     <a href="/stats/" class="${path.startsWith('/stats/') ? 'active' : ''}">/stats</a>
     <a href="/archive/" class="${path.startsWith('/archive/') ? 'active' : ''}">/archive</a>
@@ -83,6 +84,7 @@ ${body}
     <div class="footer-feeds">
       <span class="footer-label">feeds:</span>
       <a href="/feed.xml">[all rss]</a>
+      <a href="/feed-weekly.xml">[weekly rss]</a>
       <a href="/feed-models.xml">[models rss]</a>
       <a href="/feed-releases.xml">[releases rss]</a>
     </div>
@@ -2222,6 +2224,7 @@ ${archiveScript}`
       body: `<section class="hero"><div class="term-box term-box-slim"><div class="term-box-hdr"><span class="term-box-title">WEEKLY_DIGESTS</span><span>${weeks.length} weeks &middot; <a href="/feed-weekly.xml">[rss]</a></span></div></div></section>` +
         `<section class="week-rows">${weeks.map(w => `<div class="crow"><span class="crow-time">${esc(w.key)}</span><a class="crow-title" href="${weekHref(w)}">${esc(weekLabel(w))}</a><span class="crow-sum">${esc(weeklyHeadline(w))}</span></div>`).join('')}</section>`
     }))
+    await write(dist, 'weekly/index.html', `<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=/week/"><link rel="canonical" href="${SITE.url}/week/"><title>Redirecting to /week/…</title></head><body><script>location.replace('/week/')</script><p><a href="/week/">Redirecting to /week/…</a></p></body></html>\n`)
   }
 
   // ----- stats (headline figures first, then the charts that explain them)
@@ -3129,6 +3132,8 @@ ctx.hidden = false
   // live instead of on the 404. Workers evaluates these in order, most specific
   // first; `*` matches any characters, and the splat is deliberately discarded.
   await write(dist, '_redirects', [
+    '/weekly /week/ 301',
+    '/weekly/ /week/ 301',
     '/changes/ /archive/ 301',
     '/watch /models/ 301',
     '/watch/ /models/ 301',
