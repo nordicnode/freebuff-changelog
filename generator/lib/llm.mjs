@@ -2066,7 +2066,7 @@ export function isSecurityEntry (e) {
 // Cached in data/pr-summaries.json by number + diff hash + PR_PROMPT_V; a PR
 // whose preview changes re-summarizes once, a steady list costs nothing.
 
-export const PR_PROMPT_V = 1
+export const PR_PROMPT_V = 2
 
 export function prSummaryKey (pr, diff) {
   return `${pr.number}:v${PR_PROMPT_V}:${shortHash(diff || '')}`
@@ -2075,7 +2075,7 @@ export function prSummaryKey (pr, diff) {
 export function buildPrPrompt (pr, diff, ctx = {}) {
   return [
     'You write one-paragraph previews of OPEN pull requests for Freebuff, a free AI coding agent. The reader is a developer following the project. The change has NOT shipped: write in the present tense about what the PR proposes, never as if it landed.',
-    'Rules: use ONLY the PR title, description, labels, commit subjects and the diff preview below (the preview is truncated to its first lines; say "the preview shows" rather than claiming completeness). Never invent file names, features or motives.',
+    'Rules: use ONLY the PR title, description, labels, commit subjects and the diff below. Never invent file names, features or motives.',
     'Title: plain text, max 70 chars, no markdown, no trailing period, no PR number. Summary: 2-3 sentences of technical prose, backticks allowed for identifiers that appear in the material.',
     '- Punctuation: Never use em-dashes.',
     '',
@@ -2093,9 +2093,9 @@ export function buildPrPrompt (pr, diff, ctx = {}) {
     (pr.commitsList || []).length ? `Commits: ${(pr.commitsList || []).slice(0, 12).map(c => c.message || '').filter(Boolean).join(' | ')}` : '',
     pr.additions != null ? `Stats: +${pr.additions} / -${pr.deletions ?? '?'} across ${pr.files ?? '?'} files` : '',
     '',
-    'Diff preview (first lines only):',
+    'Diff:',
     '```diff',
-    budgetPatch(diff || '', 60000, 20000),
+    budgetPatch(diff || '', 500000, 150000),
     '```'
   ].filter(Boolean).join('\n')
 }

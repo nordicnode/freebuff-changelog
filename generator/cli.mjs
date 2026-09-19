@@ -327,16 +327,16 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
         return accept ? await r.text() : await r.json()
       } catch { return null }
     }
-    // Inline diff preview (first ~120 lines): persisted in data/pr-diffs/,
-    // served from /pr-diffs/<n>.diff. A missing file degrades to a GitHub link,
-    // and PRs already on disk are skipped -- so a steady list costs nothing.
+    // Inline diff preview: persisted in data/pr-diffs/, served from
+    // /pr-diffs/<n>.diff. A missing file degrades to a GitHub link, and PRs
+    // already on disk are skipped -- so a steady list costs nothing.
     const { mkdir: mk, writeFile: wf } = await import('node:fs/promises')
     await mk(resolve(dataDir, 'pr-diffs'), { recursive: true })
     const previewPath = (n) => resolve(dataDir, `pr-diffs/${n}.diff`)
     await pool(list.filter(p => !p.hasDiff || p.stalePreview || !existsSync(previewPath(p.number))).map(p => async () => {
       const diff = await ghGet(`/repos/CodebuffAI/freebuff/pulls/${p.number}`, 'application/vnd.github.diff')
       if (typeof diff === 'string' && diff.startsWith('diff --git')) {
-        await wf(previewPath(p.number), diff.split('\n').slice(0, 120).join('\n'))
+        await wf(previewPath(p.number), diff)
         p.hasDiff = true
         delete p.stalePreview
       }
