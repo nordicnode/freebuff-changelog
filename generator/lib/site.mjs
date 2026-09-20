@@ -2876,16 +2876,16 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       <ul class="man-ul">
         <li><strong>Deterministic first.</strong> Model tables and slash-command registries are set-differenced directly from git trees; version bumps come from <code>package.json</code>. Timestamps normalize to UTC.</li>
         <li><strong>Monorepo architecture mapping.</strong> Code changes are contextualized across subsystems (<code>cli/</code>, <code>packages/agent-runtime/</code>, <code>common/</code>, <code>desktop/web/</code>, <code>sdk/</code>, <code>docs/</code>) to pinpoint exact runtime layers.</li>
-        <li><strong>Deep context &amp; PR intent.</strong> Up to 500KB of clean source diffs, PR motivation and discussion metadata from GitHub, same-day commit sequence ordering, and developer code comments feed a 270K context window.</li>
+        <li><strong>Deep context &amp; PR intent.</strong> Up to 500KB of clean source diffs, PR motivation and discussion metadata from GitHub, same-day commit sequence ordering, and developer code comments feed a 270K context window. Larger diffs are read in per-file chapters and fused into the entry; PRs matched by touched files pass a relevance check before their description is used.</li>
         <li><strong>Anti-hallucination guardians.</strong> Commits affecting only test suites, mocks, or documentation are isolated by strict classification rules, barring the AI from claiming unverified runtime features or speedups.</li>
-        <li><strong>Evidence citations &amp; grounding gates.</strong> The model must cite exact diff hunks and functions. Backticked identifiers are verified against the repository corpus; unverified names are flagged or rejected. Constants (<code>old -&gt; new</code>), env vars, flags, and test assertions are extracted deterministically.</li>
+        <li><strong>Evidence citations &amp; grounding gates.</strong> The model must cite exact diff hunks and functions. Identifiers, backticked or bare setting names, versions, and flags, are verified against the repository corpus; unverified names are flagged or rejected, and plain-English lines are grounded the same way. A second pass fact-checks each claim against the diff and forces a rewrite; entries that still fail are labeled. Constants (<code>old -&gt; new</code>), env vars, flags, and test assertions are extracted deterministically.</li>
         <li><strong>Deterministic cache &amp; linked proof.</strong> Technical summaries and ELI5 takeaways are hashed by commit SHA, diff content, and prompt version. Every card links to the commit SHA, compare URL, and on-demand diff.</li>
       </ul>
 
       <h4>USER-FACING HIGHLIGHTS</h4>
       <ul class="man-ul">
         <li><strong>ELI5 plain-English takeaways.</strong> A structured 3-pillar breakdown (Core Change, Who It Affects, Everyday Impact) beneath each technical summary explains changes without programming jargon.</li>
-        <li><strong>Release roll-ups.</strong> Version bump rows synthesize all predecessor features, model additions, and commands in that release window instead of reporting a bare version label change.</li>
+        <li><strong>Release roll-ups.</strong> Version bump rows synthesize all predecessor features, model additions, and commands in that release window instead of reporting a bare version label change. Window members with unverified names or flagged claims are marked and hedged rather than stated as fact.</li>
         <li><strong>Weekly digests &amp; shipped-in tracking.</strong> <code>/week/</code> rolls up releases, catalog moves, and top work per week. Every card links to the first release that shipped the commit.</li>
         <li><strong>Related changes &amp; story linking.</strong> Same-day and same-topic commits are clustered automatically into coherent development narratives.</li>
       </ul>
