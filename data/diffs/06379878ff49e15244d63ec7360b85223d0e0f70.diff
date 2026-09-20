@@ -1,0 +1,289 @@
+diff --git a/sdk/src/__tests__/truncate-run-state.test.ts b/sdk/src/__tests__/truncate-run-state.test.ts
+new file mode 100644
+index 000000000..19abc444b
+--- /dev/null
++++ b/sdk/src/__tests__/truncate-run-state.test.ts
+@@ -0,0 +1,121 @@
++import { getInitialSessionState } from '@codebuff/common/types/session-state'
++import { getStubProjectFileContext } from '@codebuff/common/util/file'
++import { describe, expect, test } from 'bun:test'
++
++import { truncateRunStateAtUserTurn } from '../compact-run-state'
++
++import type { RunState } from '../run-state'
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++
++const user = (text: string): Message => ({
++  role: 'user',
++  tags: ['USER_PROMPT'],
++  content: [{ type: 'text', text }],
++})
++const assistant = (text: string): Message => ({
++  role: 'assistant',
++  content: [{ type: 'text', text }],
++  sentAt: Date.now(),
++})
++
++function runStateWith(messageHistory: Message[]): RunState {
++  const sessionState = getInitialSessionState(getStubProjectFileContext())
++  sessionState.mainAgentState.messageHistory = messageHistory
++  return { sessionState } as RunState
++}
++
++const texts = (state: RunState | null) =>
++  (state?.sessionState?.mainAgentState?.messageHistory ?? []).map((m) =>
++    m.content
++      .map((p) => ('text' in p ? p.text : ''))
++      .join('')
++      .trim(),
++  )
++
++/** Three user turns, each answered. Editing the Nth must keep the first N. */
++const threeTurns = () => [
++  user('one'),
++  assistant('answered one'),
++  user('two'),
++  assistant('answered two'),
++  user('three'),
++  assistant('answered three'),
++]
++
++describe('truncateRunStateAtUserTurn', () => {
++  test('editing the second message keeps the first turn and its answer', () => {
++    // The bug this exists for: Desktop cleared the whole state here, so the
++    // user kept seeing turn one on screen while the model had never seen it.
++    const next = truncateRunStateAtUserTurn({
++      runState: runStateWith(threeTurns()),
++      keepUserTurns: 1,
++    })
++    expect(texts(next)).toEqual(['one', 'answered one'])
++  })
++
++  test('editing the third keeps both earlier turns', () => {
++    const next = truncateRunStateAtUserTurn({
++      runState: runStateWith(threeTurns()),
++      keepUserTurns: 2,
++    })
++    expect(texts(next)).toEqual(['one', 'answered one', 'two', 'answered two'])
++  })
++
++  test('never leaves a message the edit removed', () => {
++    const next = truncateRunStateAtUserTurn({
++      runState: runStateWith(threeTurns()),
++      keepUserTurns: 1,
++    })
++    // Remembering deleted turns is the opposite failure and is worse than
++    // forgetting: the model would act on text the user cannot see.
++    expect(texts(next)).not.toContain('two')
++    expect(texts(next)).not.toContain('three')
++  })
++
++  test('editing the first message answers null, which means clear', () => {
++    // Nothing survives, so there is no truncated state to write; the caller
++    // clears, which is what it already did.
++    expect(
++      truncateRunStateAtUserTurn({
++        runState: runStateWith(threeTurns()),
++        keepUserTurns: 0,
++      }),
++    ).toBeNull()
++  })
++
++  test('answers null rather than guessing when the history is short', () => {
++    // The host's user rows and this history are two representations that a
++    // host may have desynchronised. Fall back to clearing instead of cutting
++    // at the wrong place — a state that disagrees with the transcript is worse
++    // than amnesia.
++    expect(
++      truncateRunStateAtUserTurn({
++        runState: runStateWith([user('one'), assistant('answered one')]),
++        keepUserTurns: 3,
++      }),
++    ).toBeNull()
++  })
++
++  test('leaves the original state untouched', () => {
++    const original = threeTurns()
++    const state = runStateWith(original)
++    truncateRunStateAtUserTurn({ runState: state, keepUserTurns: 1 })
++    expect(state.sessionState?.mainAgentState?.messageHistory).toHaveLength(6)
++    expect(original).toHaveLength(6)
++  })
++
++  test('tolerates empty and missing history', () => {
++    expect(
++      truncateRunStateAtUserTurn({
++        runState: runStateWith([]),
++        keepUserTurns: 1,
++      }),
++    ).toBeNull()
++    expect(
++      truncateRunStateAtUserTurn({
++        runState: {} as RunState,
++        keepUserTurns: 1,
++      }),
++    ).toBeNull()
++  })
++})
+diff --git a/sdk/src/compact-run-state.ts b/sdk/src/compact-run-state.ts
+index 4a0527123..b85f0c5fc 100644
+--- a/sdk/src/compact-run-state.ts
++++ b/sdk/src/compact-run-state.ts
+@@ -65,25 +65,97 @@ export function compactRunState(params: {
+   // this is 0 and the budget is simply the whole window — the pass still runs,
+   // it just has slightly more room than the next turn will.
+   const fixedTokenCount =
+     countTokens(agentState.systemPrompt ?? '') +
+     countTokensJson(agentState.toolDefinitions ?? {})
+ 
+   const compacted = compactHistoryNow({
+     messages: previousHistory,
+     maxContextLength,
+     fixedTokenCount,
+     ...(logger ? { logger } : {}),
+     ...(agentState.runId ? { runId: agentState.runId } : {}),
+   })
+   if (!compacted) return null
+ 
+   const next = cloneSessionState(sessionState, logger)
+   next.mainAgentState.messageHistory = compacted.messages
+   next.mainAgentState.contextTokenCount =
+     countTokensMessages(compacted.messages) + fixedTokenCount
+   return {
+     runState: { ...runState, sessionState: next },
+     previousTokens: compacted.previousTokens + fixedTokenCount,
+     nextTokens: next.mainAgentState.contextTokenCount,
+   }
+ }
++
++/**
++ * Cut a stored run's history back to the point a user edit rewinds to.
++ *
++ * ## Why this exists
++ *
++ * A host that lets someone edit an earlier message has two representations of
++ * the same conversation: the transcript it shows, and the `RunState` the model
++ * actually resumes from. Deleting from the transcript alone leaves the model
++ * remembering turns the user can no longer see. Clearing the state instead —
++ * which is what Freebuff Desktop did until 2026-09-19 — leaves the transcript
++ * intact and the model with no memory of any of it, so editing the third
++ * message of a long thread made the assistant behave as though the
++ * conversation had just started. That is the bug this closes; the two
++ * representations have to be cut at the same place.
++ *
++ * ## The boundary
++ *
++ * `keepUserTurns` is how many user turns survive the rewind — for an edit of
++ * the message at 0-based ordinal N, exactly N. History is kept up to, and not
++ * including, the (N+1)-th user message, so the assistant and tool messages
++ * belonging to the preserved turns come with them and everything the edit
++ * removed goes.
++ *
++ * ## Why it can answer null
++ *
++ * The mapping between a host's user rows and user messages in `messageHistory`
++ * is an assumption, not a guarantee: a host may inject prompts of its own, and
++ * an older state may predate whatever it is being matched against. So this
++ * counts rather than trusts, and when the history does not contain enough user
++ * messages to place the cut it returns null instead of guessing. A caller that
++ * gets null should fall back to clearing the state — amnesia is a bad outcome,
++ * but a state that silently disagrees with the transcript is a worse one.
++ *
++ * `keepUserTurns: 0` also answers null: nothing survives, which is the
++ * clearing case and not something to express as an empty history.
++ */
++export function truncateRunStateAtUserTurn(params: {
++  runState: RunState
++  keepUserTurns: number
++}): RunState | null {
++  const { runState, keepUserTurns } = params
++  if (!Number.isInteger(keepUserTurns) || keepUserTurns <= 0) return null
++  const sessionState = runState.sessionState
++  const agentState = sessionState?.mainAgentState
++  if (!sessionState || !agentState) return null
++  const history = agentState.messageHistory
++  if (!history?.length) return null
++
++  let seen = 0
++  let cutAt = -1
++  for (let i = 0; i < history.length; i++) {
++    if (history[i]?.role !== 'user') continue
++    seen++
++    if (seen === keepUserTurns + 1) {
++      cutAt = i
++      break
++    }
++  }
++  // Fewer user messages than the transcript claims: the two representations
++  // are not aligned, so there is no boundary this can honestly place.
++  if (cutAt === -1) return null
++
++  const next = cloneSessionState(sessionState)
++  next.mainAgentState.messageHistory = history.slice(0, cutAt)
++  // The count is advisory and rebuilt on the next turn; leaving a stale, larger
++  // number would make the next request think it has less room than it does.
++  next.mainAgentState.contextTokenCount = countTokensMessages(
++    next.mainAgentState.messageHistory,
++  )
++  return { ...runState, sessionState: next }
++}
+diff --git a/sdk/src/index.ts b/sdk/src/index.ts
+index b67ab390f..284610f20 100644
+--- a/sdk/src/index.ts
++++ b/sdk/src/index.ts
+@@ -14,51 +14,54 @@ export { run, STATE_SNAPSHOT_INTERRUPTION_MESSAGE } from './run'
+ export { getFiles } from './tools/read-files'
+ export type { FileFilter, FileFilterResult } from './tools/read-files'
+ export type {
+   CodebuffClientOptions,
+   OverrideToolHandlers,
+   RunOptions,
+   MessageContent,
+   TextContent,
+   ImageContent,
+ } from './run'
+ export type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+ export { buildUserMessageContent } from '@codebuff/agent-runtime/util/messages'
+ // Agent type exports
+ export type { AgentDefinition } from '@codebuff/common/templates/initial-agents-dir/types/agent-definition'
+ export type { ToolName } from '@codebuff/common/tools/constants'
+ 
+ export type {
+   ClientToolCall,
+   ClientToolName,
+   CodebuffToolOutput,
+ } from '@codebuff/common/tools/list'
+ export * from './client'
+ export * from './custom-tool'
+ export * from './native/ripgrep'
+ export * from './run-state'
+-export { compactRunState } from './compact-run-state'
++export {
++  compactRunState,
++  truncateRunStateAtUserTurn,
++} from './compact-run-state'
+ export type { CompactedRunState } from './compact-run-state'
+ export { ToolHelpers } from './tools'
+ export * from './constants'
+ export { isAllowedRuntimeAppUrl } from './env'
+ 
+ export { getUserInfoFromApiKey } from './impl/database'
+ export {
+   ALWAYS_TRUSTED_AGENT_PUBLISHERS,
+   TRUSTED_AGENT_PUBLISHERS_ENV_VAR,
+   UntrustedAgentPublisherError,
+   isUntrustedAgentPublisherError,
+ } from './agent-publisher-trust'
+ export * from './credentials'
+ export * from './byok'
+ export {
+   getDefaultAgentDirs,
+   listLocalAgentFiles,
+   loadLocalAgents,
+ } from './agents/load-agents'
+ export {
+   MCP_CONFIG_FILE_NAME,
+   loadMCPConfig,
+   loadMCPConfigSync,
+   mcpFileSchema,
+ } from './agents/load-mcp-config'
