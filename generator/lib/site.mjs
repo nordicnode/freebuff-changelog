@@ -525,9 +525,15 @@ document.addEventListener('toggle', async (ev) => {
     renderDiff(body, text, label, viewUrl);
   } catch (err) {
     const ghUrl = el.dataset.gh || (sha ? 'https://github.com/CodebuffAI/freebuff/commit/' + sha : '');
-    body.innerHTML = '<div class="diff-notice">Full diff not cached locally. ' + (ghUrl ? '<a href="' + ghUrl + '" target="_blank" rel="noopener">View on GitHub &rarr;</a>' : 'View the PR on GitHub for the full diff.') + '</div>';
+    body.innerHTML = '<div class="diff-notice">Full diff not cached locally. ' + (ghUrl ? '<a href="' + htmlEsc(ghUrl) + '" target="_blank" rel="noopener">View on GitHub &rarr;</a>' : 'View the PR on GitHub for the full diff.') + '</div>';
   }
 }, true);
+
+function htmlEsc(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
 
 function renderDiff(container, text, label, ghUrl, mode) {
   mode = mode || 'unified';
@@ -550,10 +556,10 @@ function renderDiff(container, text, label, ghUrl, mode) {
   let filesJump = '';
   if (files.length > 1) {
     filesJump = '<select class="diff-file-jump" aria-label="Jump to file"><option value="">' + files.length + ' files changed…</option>' +
-      files.map((f, i) => '<option value="' + i + '">' + f.file + '</option>').join('') +
+      files.map((f, i) => '<option value="' + i + '">' + htmlEsc(f.file) + '</option>').join('') +
       '</select>';
   }
-  toolbar.innerHTML = '<span class="diff-toolbar-title">$ git diff ' + label.slice(0, 12) + '^!</span>' + filesJump;
+  toolbar.innerHTML = '<span class="diff-toolbar-title">$ git diff ' + htmlEsc(label.slice(0, 12)) + '^!</span>' + filesJump;
 
   const actions = document.createElement('div');
   actions.className = 'diff-toolbar-actions';
@@ -1989,6 +1995,11 @@ ${rows.map(e => {
     });
   });
 
+  // Titles and model names originate upstream (commit subjects, model tables,
+  // LLM summaries). Escaping the less-than character to its backslash-u JS
+  // string escape stops a closing-script sequence inside a title from
+  // terminating this script element during HTML parsing; the value still
+  // decodes back to the real character at runtime.
   var snapshots = ${JSON.stringify(dateSnapshots.map(s => ({
     date: s.date,
     sha: s.sha,
@@ -1996,11 +2007,17 @@ ${rows.map(e => {
     added: s.added,
     removed: s.removed,
     active: s.active
-  })))};
+  }))).replace(/</g, '\\u003c')};
   var slider = document.getElementById('matrix-slider');
   var dateDisplay = document.getElementById('matrix-selected-date');
   var countDisplay = document.getElementById('matrix-active-count');
   var eventDisplay = document.getElementById('matrix-selected-event');
+
+  function htmlEsc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
 
   function updateScrubber(idx) {
     var snap = snapshots[idx];
@@ -2009,10 +2026,10 @@ ${rows.map(e => {
     if (countDisplay) countDisplay.textContent = snap.active.length + ' models active';
     if (eventDisplay) {
       var diffs = [];
-      if (snap.added && snap.added.length) diffs.push('<span class="modelplus">+' + snap.added.join(', ') + '</span>');
-      if (snap.removed && snap.removed.length) diffs.push('<span class="modelminus">&minus;' + snap.removed.join(', ') + '</span>');
+      if (snap.added && snap.added.length) diffs.push('<span class="modelplus">+' + htmlEsc(snap.added.join(', ')) + '</span>');
+      if (snap.removed && snap.removed.length) diffs.push('<span class="modelminus">&minus;' + htmlEsc(snap.removed.join(', ')) + '</span>');
       var diffStr = diffs.length ? ' (' + diffs.join(' ') + ')' : '';
-      eventDisplay.innerHTML = '<span style="color:var(--txt-subtle)">EVENT:</span> <a href="/day/' + snap.date + '/#' + snap.sha + '">' + (snap.title || snap.date) + '</a>' + diffStr;
+      eventDisplay.innerHTML = '<span style="color:var(--txt-subtle)">EVENT:</span> <a href="/day/' + htmlEsc(snap.date) + '/#' + htmlEsc(snap.sha) + '">' + htmlEsc(snap.title || snap.date) + '</a>' + diffStr;
     }
     matrixRows.forEach(function(mr){
       var modelName = mr.querySelector('.mt-model-name')?.textContent?.trim() || '';

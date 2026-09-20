@@ -1401,3 +1401,98 @@ test('fileChips: renders source files, test files, churned files, and renames wi
 })
 
 
+
+// Upstream-authored strings (commit subjects, model tables) and LLM summaries
+// reach the client via the embedded models-page snapshots JSON and via raw
+// diff file paths in the diff viewer. Neither context is escaped by the
+// server templates, so a `</script>` sequence in an entry title used to break
+// out of the inline script, and file names flowed straight into innerHTML.
+test('hostile titles and model names cannot break out of the embedded snapshots script', async () => {
+  const hostile = '</script><img src=x onerror=alert(1)>'
+  const changelog = {
+    version: 1,
+    repo: 'https://github.com/CodebuffAI/freebuff',
+    generatedAt: '2026-09-19T12:00:00Z',
+    headSha: '1111222233334444555566667777888899990000',
+    counts: { entries: 1 },
+    entries: [{
+      kind: 'community',
+      sha: 'bbbb111122223333444455556666777788889999',
+      url: 'https://github.com/CodebuffAI/freebuff/commit/bbbb1111',
+      date: '2026-09-19T10:00:00Z',
+      author: 'dev',
+      messageTitle: hostile,
+      title: hostile,
+      summary: hostile,
+      ai: { title: hostile, summary: hostile },
+      areas: ['models'],
+      category: 'models',
+      significance: 'major',
+      day: '2026-09-19',
+      month: '2026-09',
+      hasDiff: false,
+      facts: [],
+      modelChanges: { added: [hostile], removed: [], changed: [] },
+      cmdChanges: null,
+      files: { total: 0, meaningful: 0, rawMeaningful: 0, testOnly: false, added: [], removed: [], renamed: [], modified: [] },
+      stats: { additions: 1, deletions: 0 }
+    }]
+  }
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-xss-'))
+  try {
+    await buildSite({ changelog, openPrs: [], dist })
+    const html = await readFile(join(dist, 'models/index.html'), 'utf8')
+    const line = html.split('\n').find(l => l.trim().startsWith('var snapshots ='))
+    assert.ok(line, 'models page embeds the snapshots array')
+    // No raw `<` may survive into the inline script: every one must have been
+    // rewritten to the \u003c JS string escape (6 literal chars in the file).
+    assert.ok(!line.includes('<'), 'embedded JSON carries no raw < that could close the script tag')
+    assert.ok(line.includes('\\u003c/script>'), 'the hostile sequence survives as data, not markup')
+  } finally {
+    await rm(dist, { recursive: true, force: true })
+  }
+})
+
+test('diff viewer escapes file paths and labels before innerHTML', async () => {
+  const changelog = {
+    version: 1,
+    repo: 'https://github.com/CodebuffAI/freebuff',
+    generatedAt: '2026-09-19T12:00:00Z',
+    headSha: '1111222233334444555566667777888899990000',
+    counts: { entries: 1 },
+    entries: [{
+      kind: 'community',
+      sha: 'cccc111122223333444455556666777788889999',
+      url: 'https://github.com/CodebuffAI/freebuff/commit/cccc1111',
+      date: '2026-09-19T10:00:00Z',
+      author: 'dev',
+      messageTitle: 'safe entry',
+      title: 'safe entry',
+      summary: 'safe entry',
+      areas: ['CLI'],
+      category: 'CLI',
+      significance: 'minor',
+      day: '2026-09-19',
+      month: '2026-09',
+      hasDiff: true,
+      facts: [],
+      modelChanges: null,
+      cmdChanges: null,
+      files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: ['src/a.ts'], removed: [], renamed: [], modified: [] },
+      stats: { additions: 1, deletions: 0 }
+    }]
+  }
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-xss2-'))
+  try {
+    await buildSite({ changelog, openPrs: [], dist })
+    const html = await readFile(join(dist, 'index.html'), 'utf8')
+    // The shared client-side script defines the escape helper once per page and
+    // every concatenated fragment that can carry upstream text goes through it.
+    assert.match(html, /function htmlEsc\(s\)/)
+    assert.match(html, /htmlEsc\(f\.file\)/, 'diff file names are escaped before the option HTML')
+    assert.match(html, /htmlEsc\(label\.slice\(0, 12\)\)/, 'the toolbar label is escaped')
+    assert.match(html, /htmlEsc\(ghUrl\)/, 'the GitHub link href is escaped in the error path')
+  } finally {
+    await rm(dist, { recursive: true, force: true })
+  }
+})
