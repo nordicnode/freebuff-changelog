@@ -1,0 +1,140 @@
+name: history-compaction
+
+# Unbounded-growth maintenance for a repo whose entire history is derived bot
+# data (~15 MiB of pack churn per day at the current sync cadence, from
+# rewrites of data/changelog.json + appends to data/diffs/). GitHub warns at
+# 1 GiB and clone performance degrades well before that, so this workflow
+# periodically squashes main back to a SINGLE commit whose tree is
+# byte-for-byte the current one: the site, the data and every file path are
+# unchanged -- only the (machine-generated) commit history is discarded.
+#
+# Safety model:
+#   - Gate: compact only when `gh api repos/.../.size` (KiB) crosses the
+#     threshold AND the history is longer than a freshly-squashed repo would
+#     allow, so a scheduled run right after a compaction is a free no-op.
+#   - The sync relay is disabled first and drained, so no writer is mid-rebase
+#     while main's root changes. A concurrent deploy is harmless (same tree,
+#     shallow checkout).
+#   - The squash is verified by comparing the new commit's tree hash against
+#     the old HEAD's; on any mismatch the push never happens.
+#   - The relay is re-enabled even when compaction itself fails.
+#   - The force-push uses the workflow's own GITHUB_TOKEN, which deliberately
+#     does NOT start a deploy (nothing about the content changed).
+#
+# Requires: main UNPROTECTED (or allowing force-push for Actions). Humans with
+# older clones must re-anchor after a compaction (see README).
+
+on:
+  schedule:
+    # Weekly check; the size gate keeps it a no-op until history actually hurts.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      force:
+        type: boolean
+        default: false
+        description: Compact regardless of the size gate
+      size_threshold_mib:
+        type: string
+        default: '300'
+        description: Repo size (MiB) above which a scheduled run compacts
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: history-compaction
+  cancel-in-progress: false
+
+jobs:
+  compact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      FORCE: ${{ inputs.force }}
+      SIZE_THRESHOLD_MIB: ${{ inputs.size_threshold_mib || '300' }}
+    steps:
+      - name: Decide whether to compact
+        id: gate
+        run: |
+          SIZE_KIB=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .size)
+          SIZE_MIB=$((SIZE_KIB / 1024))
+          # Probe for a 500th commit: anything below that is a freshly-squashed
+          # or too-young history (~2 days of bot commits at current cadence).
+          DEEP=$(gh api "repos/${GITHUB_REPOSITORY}/commits?per_page=1&page=500" --jq 'length' 2>/dev/null || echo 1)
+          echo "repo size ~${SIZE_MIB} MiB (threshold ${SIZE_THRESHOLD_MIB}); history $([ "$DEEP" = "1" ] && echo longer || echo short)"
+          if [ "$FORCE" = "true" ]; then
+            echo "forced via dispatch"
+            echo "compact=true" >> "$GITHUB_OUTPUT"
+          elif [ "$DEEP" != "1" ]; then
+            echo "compact=false" >> "$GITHUB_OUTPUT"
+          elif [ "$SIZE_MIB" -ge "$SIZE_THRESHOLD_MIB" ]; then
+            echo "compact=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "below threshold"
+            echo "compact=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pause and drain the sync relay
+        id: pause
+        if: steps.gate.outputs.compact == 'true'
+        run: |
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/workflows/changelog-sync.yml/disable_workflow"
+          echo "changelog-sync disabled: waiting for in-flight/queued runs to drain…"
+          # A sync run lasts at most ~13 min (12m watch + overhead); bail loudly
+          # rather than rewrite history under a live writer. Any trigger counts
+          # here (watchdog schedule, relay dispatch, push), not just dispatch.
+          for i in $(seq 1 72); do
+            ACTIVE=$(gh run list --workflow changelog-sync.yml --json status --jq '[.[] | select(.status != "completed")] | length' 2>/dev/null || echo "?")
+            echo "drain check ${i}/72: ${ACTIVE} changelog-sync run(s) not completed"
+            [ "$ACTIVE" = "0" ] && exit 0
+            sleep 20
+          done
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/workflows/changelog-sync.yml/enable_workflow"
+          echo "::error::changelog-sync did not drain in ~24 min; refusing to rewrite history under a live writer. Relay re-enabled."
+          exit 1
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.compact == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: Squash main to one commit (tree-verified) and force-push
+        if: steps.gate.outputs.compact == 'true'
+        run: |
+          set -e
+          git config --global user.name "changelog-bot"
+          git config --global user.email "changelog-bot@users.noreply.github.com"
+          DEFAULT=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)
+          case "$DEFAULT" in main|master) ;; *) echo "::error::unexpected default branch"; exit 1 ;; esac
+          OLD=$(git rev-parse "origin/$DEFAULT")
+          OLD_TREE=$(git rev-parse "$OLD^{tree}")
+          # Pin the orphan branch to origin's exact tip, not the checkout HEAD,
+          # so a push that lands between steps can only be caught below.
+          git checkout --orphan "compact-$GITHUB_RUN_NUMBER" "$OLD"
+          git add -A
+          git commit -m "chore: history compaction (squashed $(git rev-list --count "$OLD") derived-data commits; content unchanged)"
+          # --orphan stages everything against an unborn HEAD, so `status` is
+          # never clean at this point; content truth is the tree hash, with a
+          # full diff as the belt to those braces.
+          NEW_TREE=$(git rev-parse 'HEAD^{tree}')
+          if [ "$NEW_TREE" != "$OLD_TREE" ]; then
+            echo "::error::tree hash changed ($OLD_TREE -> $NEW_TREE); aborting without pushing"
+            exit 1
+          fi
+          git diff --quiet "$OLD" HEAD || { echo "::error::content differs from $OLD; aborting"; exit 1; }
+          git push --force "origin" "HEAD:refs/heads/$DEFAULT"
+          echo "main squashed to $(git rev-parse --short HEAD); tree $NEW_TREE unchanged."
+
+      - name: Resume the sync relay
+        if: always() && steps.pause.outcome == 'success'
+        env:
+          COMPACT: ${{ steps.gate.outputs.compact }}
+        run: |
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/workflows/changelog-sync.yml/enable_workflow"
+          if [ "$COMPACT" = "true" ]; then
+            gh workflow run changelog-sync.yml || echo "::warning::relay dispatch failed; the watchdog schedule restarts it within 10 min"
+          fi
+          echo "changelog-sync re-enabled."
