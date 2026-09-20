@@ -1284,10 +1284,11 @@ test('models page includes interactive lineup matrix and date scrubber', async (
   }
   await buildSite({ changelog, openPrs: [], dist })
   const modelsHtml = await readFile(join(dist, 'models/index.html'), 'utf8')
-  assert.match(modelsHtml, /class="model-matrix-wrap"/)
+  assert.match(modelsHtml, /class="models-panel"/, 'timeline lives inside a bordered panel')
   assert.match(modelsHtml, /id="matrix-slider"/)
   assert.match(modelsHtml, /CATALOG DATE SCRUBBER/)
   assert.match(modelsHtml, /class="model-matrix-table"/)
+  assert.match(modelsHtml, /class="model-timeline-item mt-grid"/, 'timeline rows use the aligned grid layout')
   assert.match(modelsHtml, /SuperModel 1\.0/)
   assert.match(modelsHtml, /data-filter="all"/)
   assert.match(modelsHtml, /data-filter="live"/)

@@ -705,6 +705,11 @@ nav.term-nav a.active{
 .stat-share{margin-left:7px;opacity:.65}
 .stat-delta{margin-left:6px}
 .stat-trend{grid-area:trend;display:flex;justify-content:flex-end;min-width:0}
+/* The full-width quality card has horizontal room the base grid never budgeted
+   for, so its caption column takes the slack and notes like
+   "enrich-all --rewrite-stale" sit on their own line instead of overflowing
+   left over the numeric value. */
+.quality-card .stat-row{grid-template-columns:minmax(0,1.15fr) minmax(48px,1.6fr) auto minmax(0,1.5fr)}
 .stat-trend .spark{margin:0;width:100%;max-width:112px}
 .cad-spark{margin:0 0 10px}
 /* The svg carries an intrinsic width, so max-width:100% only caps it, the cadence
@@ -1262,6 +1267,15 @@ button.meta-link.dc-ok{
   overflow-wrap:anywhere;
 }
 
+.models-panel{
+  background:var(--panel);
+  border:1px solid var(--term-border);
+  border-radius:3px;
+  padding:14px 16px;
+  margin:0 0 24px;
+}
+.models-panel .term-box-hdr{margin-bottom:12px}
+.mt-panel-range{font-size:.74rem;color:var(--txt-subtle);font-family:monospace}
 .model-matrix-wrap{
   margin:14px 0 16px;
   overflow-x:hidden;
@@ -1270,9 +1284,11 @@ button.meta-link.dc-ok{
   display:flex;
   flex-direction:column;
   gap:8px;
-  margin-top:12px;
-  padding-top:12px;
-  border-top:1px solid var(--term-border);
+  margin:0 0 14px;
+  padding:10px 12px;
+  background:var(--code);
+  border:1px solid var(--term-border);
+  border-radius:3px;
 }
 .matrix-scrubber-hdr{
   display:flex;
@@ -1349,61 +1365,54 @@ button.meta-link.dc-ok{
   box-sizing:border-box;
 }
 .mt-axis-hdr{
-  display:flex;
-  justify-content:space-between;
-  align-items:baseline;
-  font-size:.68rem;
+  font-size:.66rem;
   font-family:monospace;
   color:var(--txt-subtle);
-  padding:2px 4px 6px;
+  letter-spacing:.04em;
+  padding:0 12px 6px;
   border-bottom:1px solid var(--term-border);
-  margin-bottom:2px;
+  margin-bottom:8px;
 }
-.mt-axis-title{
-  letter-spacing:.05em;
-  font-weight:700;
+.mt-axis-corner{color:var(--txt-subtle)}
+.mt-axis-right{text-align:right}
+.mt-axis-ticks{
+  display:flex;
+  justify-content:space-between;
   color:var(--txt-dim);
-}
-.mt-axis-label{
-  color:var(--txt-subtle);
 }
 .model-timeline-item{
   background:var(--code);
   border:1px solid var(--term-border);
-  border-left:3px solid transparent;
-  border-radius:2px;
-  padding:5px 8px;
-  display:flex;
-  flex-direction:column;
-  gap:4px;
-  transition:border-color .15s, background .15s, opacity .15s;
+  border-radius:3px;
+  padding:8px 12px;
+  row-gap:6px;
+  transition:background .15s, border-color .15s, opacity .15s;
   box-sizing:border-box;
   width:100%;
 }
+.model-timeline-item[data-status="live"]{border-left:3px solid var(--term-green)}
+.model-timeline-item[data-status="retired"]{border-left:3px solid var(--term-border-strong)}
 .model-timeline-item:hover{
   border-color:var(--term-border-strong);
 }
 .model-timeline-item.active-at-date{
-  border-color:var(--term-cyan);
-  border-left:3px solid var(--term-cyan);
-  background:rgba(88,166,255,0.06);
-  opacity:1;
+  background:var(--cyan-tint-bg);
 }
 .model-timeline-item.inactive-at-date{
-  border-left:3px solid transparent;
-  opacity:0.45;
+  opacity:0.55;
 }
-.mt-item-main{
-  display:flex;
-  justify-content:space-between;
+.mt-grid{
+  display:grid;
+  grid-template-columns:230px minmax(0,1fr) 150px;
+  gap:14px;
   align-items:center;
-  flex-wrap:wrap;
-  gap:6px;
 }
-.mt-item-left{
+.model-timeline-item > .mt-milestones-details{grid-column:1/-1}
+.mt-cell-name{
   display:flex;
   align-items:center;
   gap:8px;
+  min-width:0;
 }
 .model-status-tag{
   font-family:monospace;
@@ -1437,11 +1446,13 @@ button.meta-link.dc-ok{
   color:var(--term-cyan);
   text-decoration:underline;
 }
-.mt-item-right{
+.mt-cell-bar{min-width:0}
+.mt-cell-meta{
   display:flex;
   align-items:center;
+  justify-content:flex-end;
   gap:8px;
-  margin-left:auto;
+  flex-wrap:wrap;
 }
 .mt-lifespan{
   color:var(--txt-subtle);
@@ -1460,17 +1471,19 @@ button.meta-link.dc-ok{
 .mt-bar-track{
   position:relative;
   width:100%;
-  height:5px;
-  background:rgba(255,255,255,0.03);
-  border:1px solid rgba(255,255,255,0.08);
-  border-radius:2px;
+  height:9px;
+  background-color:rgba(255,255,255,0.03);
+  background-image:linear-gradient(90deg,var(--term-border) 1px,transparent 1px);
+  background-size:25% 100%;
+  border:1px solid var(--term-border);
+  border-radius:3px;
   overflow:hidden;
 }
 .mt-bar-segment{
   position:absolute;
-  top:0;
-  bottom:0;
-  border-radius:1px;
+  top:1px;
+  bottom:1px;
+  border-radius:2px;
 }
 .mt-bar-segment.live{
   background:var(--term-green);
@@ -1544,6 +1557,11 @@ button.meta-link.dc-ok{
 .mt-milestone .snap-cells{
   color:var(--txt-subtle);
   font-size:.68rem;
+}
+@media (max-width:640px){
+  .mt-grid{grid-template-columns:1fr;gap:6px}
+  .mt-cell-meta{justify-content:flex-start}
+  .mt-axis-hdr{display:none}
 }
 
 .search-input-row{
@@ -3000,7 +3018,7 @@ mark.search-match{
 .reading-mode-plain .schips,.reading-mode-plain .schips-details,.reading-mode-plain .tests-assert,.reading-mode-plain .unknowns,.reading-mode-plain .unknowns-details,.reading-mode-plain .files-details{display:none}
 
 /* Quality card notes and audience split colours. */
-.stat-note{font-size:.7rem;color:var(--txt-subtle);white-space:nowrap}
+.stat-note{font-size:.7rem;color:var(--txt-subtle);white-space:normal;text-align:right;line-height:1.25;overflow-wrap:anywhere;word-break:break-word}
 .sig-seg.aud-end-users{background:var(--term-cyan)}
 .sig-seg.aud-advertisers{background:var(--term-yellow,#d29922)}
 .sig-seg.aud-operators{background:var(--term-purple,#a371f7)}

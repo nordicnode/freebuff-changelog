@@ -1156,7 +1156,7 @@ function qualityCard (q, card, bar, share) {
   return card('SUMMARY QUALITY', `${q.summarized.toLocaleString()} AI summaries &middot; ${q.explained.toLocaleString()} plain-English lines &middot; ${Object.entries(q.models).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([m, n]) => `${esc(m)} ${n.toLocaleString()}`).join(', ')}`,
     rows.map(([lbl, n, of, note]) => bar(lbl, n, max, { pct: share(n, of || 1), trend: note ? `<span class="stat-note">${esc(note)}</span>` : '' })).join('') +
     `<div class="stat-card-hdr" style="margin-top:10px"><h3>AUDIENCE</h3><span class="stat-card-note">${q.audienceUnset.toLocaleString()} unclassified</span></div>` + audHtml,
-    'stat-span')
+    'stat-span quality-card')
 }
 
 // Which release first included this commit, per version track. `shipped` is the
@@ -1804,6 +1804,17 @@ ${rows.map(e => {
   const minTime = minDate ? new Date(minDate).getTime() : 0
   const maxTime = maxDate ? new Date(maxDate).getTime() : 0
   const totalTime = Math.max(1, maxTime - minTime)
+  // Evenly spaced date ticks (0/25/50/75/100%) that share the bars' time scale,
+  // so the axis labels line up with the gridlines drawn behind every lifespan bar.
+  const axisTicks = (() => {
+    if (!minDate || !maxDate) return []
+    const count = 5
+    const out = []
+    for (let i = 0; i < count; i++) {
+      out.push(new Date(minTime + (totalTime * i) / (count - 1)).toISOString().slice(0, 10))
+    }
+    return out
+  })()
 
   const modelTimelineData = allModels.map(m => {
     const isLive = modelLive.includes(m)
@@ -1873,10 +1884,10 @@ ${rows.map(e => {
     }
   })
 
-  const matrixAxisHeader = `<div class="mt-axis-hdr">
-    <span class="mt-axis-label">${esc(minDate)}</span>
-    <span class="mt-axis-title">FREE MODEL LIFESPAN TIMELINE</span>
-    <span class="mt-axis-label">${esc(maxDate)} (latest)</span>
+  const matrixAxisHeader = `<div class="mt-axis-hdr mt-grid">
+    <span class="mt-axis-corner">MODEL</span>
+    <div class="mt-axis-ticks">${axisTicks.map(d => `<span>${esc(d)}</span>`).join('')}</div>
+    <span class="mt-axis-corner mt-axis-right">LIFESPAN</span>
   </div>`
 
   // Model timeline items: tightened, high-density, zero horizontal scroll
@@ -1894,18 +1905,16 @@ ${rows.map(e => {
       </div>`
     ).join('')
 
-    return `<div class="matrix-row model-timeline-item" data-model="${esc(d.model.toLowerCase())}" data-status="${d.isLive ? 'live' : 'retired'}">
-      <div class="mt-item-main">
-        <div class="mt-item-left">
-          <span class="model-status-tag ${d.isLive ? 'live' : 'retired'}">[${d.isLive ? 'LIVE' : 'RETIRED'}]</span>
-          <a href="/models/${modelSlug(d.model)}/" class="mt-model-name">${esc(d.model)}</a>
-        </div>
-        <div class="mt-item-right">
-          <span class="mt-lifespan">${d.lifespanText}</span>
-          <span class="mt-days-pill">${d.totalDays}d active</span>
-        </div>
+    return `<div class="model-timeline-item mt-grid" data-model="${esc(d.model.toLowerCase())}" data-status="${d.isLive ? 'live' : 'retired'}">
+      <div class="mt-cell-name">
+        <span class="model-status-tag ${d.isLive ? 'live' : 'retired'}">${d.isLive ? 'LIVE' : 'RETIRED'}</span>
+        <a href="/models/${modelSlug(d.model)}/" class="mt-model-name">${esc(d.model)}</a>
       </div>
-      <div class="mt-bar-track">${segmentsHtml}</div>
+      <div class="mt-cell-bar"><div class="mt-bar-track">${segmentsHtml}</div></div>
+      <div class="mt-cell-meta">
+        <span class="mt-lifespan">${d.lifespanText}</span>
+        <span class="mt-days-pill">${d.totalDays}d</span>
+      </div>
       ${d.milestones.length ? `<details class="mt-milestones-details">
         <summary class="mt-milestones-summary">
           <span class="diff-arrow">&gt;</span>
@@ -1938,23 +1947,27 @@ ${rows.map(e => {
         <button type="button" class="model-filter-btn" data-filter="retired">[Retired (${modelRetired.length})]</button>
       </div>
     </div>
-    <div class="matrix-scrubber-box">
-      <div class="matrix-scrubber-hdr">
-        <div><strong>CATALOG DATE SCRUBBER:</strong> <span id="matrix-selected-date" class="matrix-date-display">${dateSnapshots.at(-1)?.date || ''}</span></div>
-        <div id="matrix-active-count" class="matrix-active-count">${modelLive.length} models active</div>
-      </div>
-      <input type="range" id="matrix-slider" class="matrix-slider" min="0" max="${Math.max(0, dateSnapshots.length - 1)}" value="${Math.max(0, dateSnapshots.length - 1)}">
-      <div id="matrix-selected-event" class="matrix-selected-event"></div>
-    </div>
     <p style="margin:10px 0 0;font-size:.78rem;color:var(--txt-dim)">SUBSCRIBE: <a href="/feed-models.xml">[models rss]</a> &middot; <a href="/feed.xml">[all changes]</a></p>
   </div>
 </section>
-<div class="model-matrix-wrap">
+<section class="models-panel">
+  <div class="term-box-hdr">
+    <span class="term-box-title">Free model lifespan timeline</span>
+    <span class="mt-panel-range">${esc(minDate)} &rarr; ${esc(maxDate)}</span>
+  </div>
+  <div class="matrix-scrubber-box">
+    <div class="matrix-scrubber-hdr">
+      <div><strong>CATALOG DATE SCRUBBER:</strong> <span id="matrix-selected-date" class="matrix-date-display">${dateSnapshots.at(-1)?.date || ''}</span></div>
+      <div id="matrix-active-count" class="matrix-active-count">${modelLive.length} models active</div>
+    </div>
+    <input type="range" id="matrix-slider" class="matrix-slider" min="0" max="${Math.max(0, dateSnapshots.length - 1)}" value="${Math.max(0, dateSnapshots.length - 1)}">
+    <div id="matrix-selected-event" class="matrix-selected-event"></div>
+  </div>
   <div class="model-matrix-table">
     ${matrixAxisHeader}
     ${matrixRows}
   </div>
-</div>
+</section>
 <details class="more-rows">
   <summary>[ View chronological transition stream (${modelChrono.length} changes) ]</summary>
   <div class="section-hdr" style="margin-top:12px">
