@@ -889,6 +889,31 @@ export function ungroundedIdentifiers (text, corpus) {
   return out
 }
 
+// Backticks are for identifiers, paths, flags and commands. Models under
+// repair pressure sometimes backtick plain English instead (`, which slices`,
+// `alongside`), and the grounding check then records junk "unverified names"
+// on the card. A span is prose when it holds no identifier shape at all:
+// multi-word spans need two plain-lowercase words to qualify (so a command
+// line like `codebuff --agent x` survives), single words must be long enough
+// that short handles like `cli` or `sdk` never trip it.
+export function backtickedProse (text) {
+  const out = []
+  const clean = String(text || '').replace(/```[^`\n]*```/g, ' ').replace(/```/g, ' ')
+  const isPlain = (w) => /^[a-z]{2,}$/.test(w.replace(/^[('"[{<]+|[)'"\]}>,.;:!?]+$/g, ''))
+  for (const m of clean.matchAll(/`([^`\n]{1,80})`/g)) {
+    const raw = m[1]
+    if (!raw || GROUNDING_PLACEHOLDER_RE.test(raw)) continue
+    if (/^v?\d+(?:\.\d+)*[a-z0-9-]*$/i.test(raw.trim())) continue
+    const words = raw.split(/\s+/).filter(Boolean)
+    if (words.length > 1) {
+      if (words.filter(isPlain).length >= 2 && !out.includes(raw)) out.push(raw)
+    } else if (/^[a-z]{8,}$/.test(words[0] || '')) {
+      if (!out.includes(raw)) out.push(raw)
+    }
+  }
+  return out
+}
+
 const CONFIDENCES = ['high', 'medium', 'low']
 
 function cleanList (v, max = 12, itemMax = 80) {
@@ -916,9 +941,26 @@ export function validateLlmOut (out, fallbackSig = 'minor', opts = {}) {
   if (NOACTION_RE.test(rawSummary)) {
     throw new Error('LLM summary contains no-action boilerplate')
   }
-  const summary = cleanText(rawSummary, 2000, true)
+  const rawEvidencePre = out.evidence && typeof out.evidence === 'string' ? out.evidence.trim() : ''
+  // Backticks around plain English (`, which slices`, `alongside`) are a
+  // formatting error, not a grounding verdict: the strict pass asks for a
+  // repair naming identifiers only, while a stubborn second attempt gets its
+  // stray backticks stripped so the card never shows junk "unverified names".
+  const proseSpans = backtickedProse(`${rawSummary} ${rawEvidencePre}`)
+  let fixedSummary = rawSummary
+  let fixedEvidence = rawEvidencePre
+  if (proseSpans.length) {
+    if (opts.onUngrounded === 'throw') {
+      throw new Error(`LLM output uses backticks around plain English, not identifiers (backticks are for identifiers, paths, flags and commands only): ${proseSpans.slice(0, 4).join(' | ')}`)
+    }
+    for (const span of proseSpans) {
+      fixedSummary = fixedSummary.split(`\`${span}\``).join(span)
+      fixedEvidence = fixedEvidence.split(`\`${span}\``).join(span)
+    }
+  }
+  const summary = cleanText(fixedSummary, 2000, true)
   const significance = ['minor', 'notable', 'major'].includes(out.significance) ? out.significance : fallbackSig
-  const rawEvidence = out.evidence && typeof out.evidence === 'string' ? out.evidence.trim() : ''
+  const rawEvidence = fixedEvidence
   const evidence = rawEvidence ? cleanText(rawEvidence, 1500, true) : ''
   const rawAudience = String(out.audience || '').trim().toLowerCase().replace(/[\s_]+/g, '-').replace(/^end-?users?$|^users?$|^developers?$/, 'end-users').replace(/^advertisers?$|^sponsors?$/, 'advertisers').replace(/^operators?$/, 'operators').replace(/^maintainers?$|^internal$/, 'maintainers')
   const audience = AUDIENCES.includes(rawAudience) ? rawAudience : undefined

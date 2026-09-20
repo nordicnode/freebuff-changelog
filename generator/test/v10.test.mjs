@@ -7,7 +7,7 @@ import {
   buildChunkPrompt, validateChunkOut, buildFusePrompt, summarizeChunked,
   MAP_REDUCE_THRESHOLD_BYTES, MAP_REDUCE_CHUNK_BYTES, MAP_REDUCE_MAX_CHUNKS,
   shouldVerify, validateVerifyOut, buildVerifyPrompt,
-  ungroundedIdentifiers, validateGroundedEli5,
+  ungroundedIdentifiers, validateGroundedEli5, backtickedProse, validateLlmOut,
   PR_MATCH_STOPLIST_RE, matchPrByPaths, buildPrRelevancePrompt,
   validatePrRelevanceOut, checkPrRelevance,
   collectReleaseContext, formatReleaseContext
@@ -153,6 +153,25 @@ test('validateGroundedEli5: leaks park, clean lines pass', () => {
   )
   const ok = validateGroundedEli5({ eli5: 'A new helper is now available when you code.' }, 800, { corpus })
   assert.match(ok, /helper/)
+})
+
+test('backtickedProse: plain English in backticks is a formatting error, identifiers survive', () => {
+  assert.deepEqual(backtickedProse('Slices `, which slices` history'), [', which slices'])
+  assert.deepEqual(backtickedProse('Rebuilt `from the sliced history; re-exported from` the index'), ['from the sliced history; re-exported from'])
+  assert.deepEqual(backtickedProse('Kept `alongside` the old one'), ['alongside'])
+  assert.deepEqual(backtickedProse('Uses `truncateRunStateAtUserTurn` in `sdk/src/a.ts` with `--trust-agent-dirs`'), [])
+  assert.deepEqual(backtickedProse('Runs `codebuff --agent x` nightly'), [], 'command lines are legitimate')
+  assert.deepEqual(backtickedProse('Touches `cli` and `sdk` helpers'), [], 'short handles never trip it')
+  assert.deepEqual(backtickedProse('No ticks here'), [])
+})
+
+test('validateLlmOut: prose backticks repair on strict, strip on lenient', () => {
+  const out = { title: 'SDK helper added', summary: 'Slices `, which slices` the history kept `alongside` the old state.' }
+  assert.throws(() => validateLlmOut(out, 'minor', { corpus: 'sdk/src/a.ts', onUngrounded: 'throw' }), /backticks around plain English/)
+  const stripped = validateLlmOut(out, 'minor', { corpus: 'sdk/src/a.ts', onUngrounded: 'flag' })
+  assert.doesNotMatch(stripped.summary, /`/)
+  assert.match(stripped.summary, /which slices/)
+  assert.equal(stripped.ungrounded, undefined, 'no junk unverified names recorded')
 })
 
 test('PR stop-list: generic-only overlap is not a match', () => {
