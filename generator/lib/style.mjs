@@ -2143,24 +2143,55 @@ details.more-rows[open]>summary{margin-bottom:6px}
   line-height:1.55;
 }
 .man-body h4{
-  margin:16px 0 6px;
+  margin:16px 0 8px;
+  padding-top:10px;
+  border-top:1px solid var(--term-border);
   color:var(--term-amber);
   font-size:.88rem;
   font-weight:700;
   letter-spacing:.04em;
   text-transform:uppercase;
 }
-.man-body h4:first-child{
+.man-body > h4:first-child{
   margin-top:2px;
+  padding-top:0;
+  border-top:0;
+}
+/* The lower half is a section grid, so the compact blocks read as columns of a
+   manual instead of one ribbon of mixed lists. One column on narrow screens. */
+.man-cols{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
+  gap:4px 28px;
+  align-items:start;
+}
+.man-sec{
+  min-width:0;
+}
+.man-badges{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin:6px 0 0;
+}
+.man-badges img{
+  height:20px;
+  display:block;
+}
+.man-snippet{
+  font-size:.78rem;
+  color:var(--txt-dim);
+  margin:6px 0 0;
+  overflow-wrap:anywhere;
 }
 .man-ul{
-  margin:0 0 12px;
-  padding-left:18px;
-  font-size:.88rem;
-  line-height:1.55;
+  margin:0 0 4px;
+  padding-left:16px;
+  font-size:.86rem;
+  line-height:1.5;
 }
 .man-ul li{
-  margin:0 0 6px;
+  margin:0 0 5px;
   color:var(--txt-dim);
 }
 .man-ul li strong{
@@ -2168,7 +2199,9 @@ details.more-rows[open]>summary{margin-bottom:6px}
 }
 .man-dl{
   display:grid;
-  grid-template-columns:auto auto minmax(0,1fr);
+  /* A fixed floor under the count column keeps the numbers in a straight column
+     instead of stepping with the widest value on the page. */
+  grid-template-columns:auto minmax(3.5rem,auto) minmax(0,1fr);
   gap:4px 14px;
   margin:0 0 12px;
   font-size:.86rem;
@@ -2191,6 +2224,8 @@ details.more-rows[open]>summary{margin-bottom:6px}
   color:var(--txt-dim);
   font-weight:400;
   text-align:left;
+  overflow-wrap:anywhere;
+  text-wrap:pretty;
 }
 @media (max-width:600px){
   .man-dl{

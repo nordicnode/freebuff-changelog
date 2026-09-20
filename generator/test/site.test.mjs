@@ -749,6 +749,11 @@ test('about page stays under its word cap at production size', async (t) => {
   await buildSite({ changelog, openPrs, dist })
   const aboutHtml = await readFile(join(dist, 'about/index.html'), 'utf8')
   const aboutBody = aboutHtml.split('man-body">')[1].split('</section>')[0]
+  // The slice above ends at the first </section>, so a nested <section> inside the
+  // body would silently shrink the thing being measured. Fail loudly instead: the
+  // last heading and the closing snippet both have to be in the slice.
+  assert.ok(aboutBody.includes('LIMITS') && aboutBody.includes('Markdown:'),
+    'the measured body spans the whole about page, not a nested section')
   const aboutWords = aboutBody
     .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length
   assert.ok(aboutWords < 800, `about page is ${aboutWords} words at production size; keep it under 800`)

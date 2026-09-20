@@ -2858,7 +2858,13 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   const aboutSpecial = new Set(['Model Catalog', 'Commands'])
   const areaCats = [...cats.entries()].filter(([c]) => !aboutSpecial.has(c)).sort((a, b) => b[1] - a[1])
   const areaTotal = areaCats.reduce((s, [, n]) => s + n, 0)
-  const areaLine = areaCats.map(([c, n]) => `${esc(c)} ${n.toLocaleString()}`).join(' &middot; ')
+  // The note column holds a line of text, not a directory. Listing all nine areas
+  // made a 180-character note that wrapped to three lines and set the row height
+  // for the whole table; the top four keep the numbers honest and the rest sit one
+  // click away behind the category index.
+  const AREA_NOTE_MAX = 4
+  const areaLine = areaCats.slice(0, AREA_NOTE_MAX).map(([c, n]) => `${esc(c)} ${n.toLocaleString()}`).join(' &middot; ') +
+    (areaCats.length > AREA_NOTE_MAX ? ` &middot; <a href="/archive/#categories">+${areaCats.length - AREA_NOTE_MAX} more</a>` : '')
   await write(dist, 'about/index.html', layout({
     title: 'About', path: '/about/',
     body: `<section class="hero">
@@ -2885,55 +2891,63 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
         <dt>Releases</dt><dd>${vers.length.toLocaleString()}</dd><dd class="man-note">Version bumps, each page listing every commit in range</dd>
         <dt>Commands</dt><dd>${(cats.get('Commands') || 0).toLocaleString()}</dd><dd class="man-note">Slash commands added, renamed, or retired</dd>
         <dt>Code areas</dt><dd>${areaTotal.toLocaleString()}</dd><dd class="man-note">${areaLine}</dd>
-        <dt>Significance</dt><dd></dd><dd class="man-note"><code>[MAJOR]</code> models &amp; code bumps &middot; <code>[NOTABLE]</code> user-visible &amp; bumps &middot; <code>[minor]</code> internal &middot; <code>[SECURITY]</code> trust/keys</dd>
+        <dt>Significance</dt><dd></dd><dd class="man-note"><code>[MAJOR]</code> models &amp; code &middot; <code>[NOTABLE]</code> user-visible &middot; <code>[minor]</code> internal &middot; <code>[SECURITY]</code> trust/keys</dd>
         ${openPrs?.length ? `<dt>In-flight</dt><dd>${openPrs.length.toLocaleString()}</dd><dd class="man-note">Open PRs with diffstat, commits, comments, and preview</dd>` : ''}
       </dl>
 
-      <h4>WHERE TO GO</h4>
-      <div class="man-routes">
-        <span><a href="/">/</a> newest day</span>
-        <span><code>/day/&lt;date&gt;/</code> single day</span>
-        <span><a href="/week/">/week/</a> weekly digests</span>
-        <span><a href="/models/">/models/</a> catalog timeline</span>
-        <span><a href="/archive/">/archive/</a> history</span>
-        <span><a href="/search/">/search/</a> search index</span>
-        <span><a href="/stats/">/stats/</a> telemetry &amp; quality</span>
-        ${openPrs?.length ? '<span><a href="/in-flight/">/in-flight/</a> open PRs</span>' : ''}
-      </div>
+      <div class="man-cols">
+        <div class="man-sec">
+          <h4>WHERE TO GO</h4>
+          <div class="man-routes">
+            <span><a href="/">/</a> newest day</span>
+            <span><code>/day/&lt;date&gt;/</code> single day</span>
+            <span><a href="/week/">/week/</a> weekly digests</span>
+            <span><a href="/models/">/models/</a> catalog timeline</span>
+            <span><a href="/archive/">/archive/</a> history</span>
+            <span><a href="/search/">/search/</a> search index</span>
+            <span><a href="/stats/">/stats/</a> telemetry &amp; quality</span>
+            ${openPrs?.length ? '<span><a href="/in-flight/">/in-flight/</a> open PRs</span>' : ''}
+          </div>
+        </div>
 
-      <h4>FEEDS + DISCORD</h4>
-      <p>Keep your community or team updated via native Discord webhooks, one-click copy, or feeds:</p>
-      <ul class="man-ul">
-        <li><strong>Automated Webhook Dispatcher:</strong> Run <code>npm run broadcast -- --webhook &lt;url&gt;</code> to post new commits. Formats quotes, summaries, and stats, tracking <code>lastBroadcastSha</code> in <code>data/state.json</code> so entries never repeat. Supports <code>--limit &lt;n&gt;</code> and <code>--dry-run</code>.</li>
-        <li><strong>One-Click Discord Copy:</strong> Click <code>[copy discord]</code> on any entry (or press <kbd>c</kbd>) for paste-ready Discord markdown.</li>
-        <li><strong>Feeds:</strong> <a href="/feed.xml">all changes</a> &middot; <a href="/feed-major.xml">major</a> &middot; <a href="/feed-security.xml">security</a> &middot; <a href="/feed-weekly.xml">weekly</a> &middot; <a href="/feed-models.xml">models</a> &middot; <a href="/feed-releases.xml">releases</a> &middot; <a href="/feed.json">JSON</a>. For Discord RSS bots, use <code>/feed add &lt;url&gt;</code>.</li>
-      </ul>
+        <div class="man-sec">
+          <h4>KEYBOARD SHORTCUTS</h4>
+          <p>Single-key shortcuts for rapid navigation. Press <kbd>?</kbd> anywhere, or click <button type="button" class="theme-btn" data-kb-modal style="display:inline;color:var(--term-cyan);padding:0">[shortcuts: ?]</button> to toggle the cheat sheet.</p>
+          <div class="man-routes">
+            <span><kbd>j</kbd> / <kbd>k</kbd> next / prev entry</span>
+            <span><kbd>o</kbd> / <kbd>Enter</kbd> expand / collapse</span>
+            <span><kbd>d</kbd> toggle diff</span>
+            <span><kbd>c</kbd> copy Discord text</span>
+            <span><kbd>n</kbd> / <kbd>p</kbd> next / prev day</span>
+            <span><kbd>/</kbd> focus search</span>
+            <span><kbd>?</kbd> cheat-sheet</span>
+            <span><kbd>Esc</kbd> close / blur</span>
+          </div>
+        </div>
 
-      <h4>KEYBOARD SHORTCUTS</h4>
-      <p>Single-key shortcuts for rapid navigation. Press <kbd>?</kbd> anywhere or click <button type="button" class="theme-btn" data-kb-modal style="display:inline;color:var(--term-cyan);padding:0">[shortcuts: ?]</button> to toggle the cheat sheet.</p>
-      <div class="man-routes">
-        <span><kbd>j</kbd> / <kbd>k</kbd> next / prev entry</span>
-        <span><kbd>o</kbd> / <kbd>Enter</kbd> expand / collapse</span>
-        <span><kbd>d</kbd> toggle diff</span>
-        <span><kbd>c</kbd> copy Discord text</span>
-        <span><kbd>n</kbd> / <kbd>p</kbd> next / prev day</span>
-        <span><kbd>/</kbd> focus search</span>
-        <span><kbd>?</kbd> cheat-sheet</span>
-        <span><kbd>Esc</kbd> close / blur</span>
+        <div class="man-sec">
+          <h4>FEEDS + DISCORD</h4>
+          <ul class="man-ul">
+            <li><strong>Feeds:</strong> <a href="/feed.xml">all changes</a> &middot; <a href="/feed-major.xml">major</a> &middot; <a href="/feed-security.xml">security</a> &middot; <a href="/feed-weekly.xml">weekly</a> &middot; <a href="/feed-models.xml">models</a> &middot; <a href="/feed-releases.xml">releases</a> &middot; <a href="/feed.json">JSON</a>. For Discord RSS bots, <code>/feed add &lt;url&gt;</code>.</li>
+            <li><strong>Copy for Discord:</strong> <code>[copy discord]</code> on any entry, or press <kbd>c</kbd>, for paste-ready markdown.</li>
+            <li><strong>Webhook broadcast:</strong> <code>npm run broadcast -- --webhook &lt;url&gt;</code> posts new commits and records <code>lastBroadcastSha</code>, so nothing repeats (<code>--limit</code>, <code>--dry-run</code>).</li>
+          </ul>
+        </div>
+
+        <div class="man-sec">
+          <h4>STATUS BADGES</h4>
+          <div class="man-badges">
+            <img src="/badge/version.svg" alt="Version">
+            <img src="/badge/models.svg" alt="Models">
+            <img src="/badge/status.svg" alt="Status">
+            <img src="/badge/changes.svg" alt="Changes">
+          </div>
+          <p class="man-snippet">Markdown: <code>[![Version](${SITE.url}/badge/version.svg)](${SITE.url})</code></p>
+        </div>
       </div>
 
       <h4>LIMITS &amp; FRESHNESS</h4>
       <p>Snapshots squash history, so intra-snapshot ordering is approximate. Summaries and plain-English lines are AI-generated: the passes above reduce errors but do not eliminate them, so grounded identifiers are the parts to lean on and the prose is a guide. Where a row is unverified or was rewritten, the card says so. Upstream is polled every 30s by a continuous relay; the site is rebuilt and redeployed on each data update, with a scheduled deploy as a backstop.</p>
-
-      <h4>STATUS BADGES</h4>
-      <p>Embed dynamic SVG status badges in your README or docs:</p>
-      <div style="display:flex;flex-wrap:wrap;gap:8px;margin:8px 0">
-        <img src="/badge/version.svg" alt="Version">
-        <img src="/badge/models.svg" alt="Models">
-        <img src="/badge/status.svg" alt="Status">
-        <img src="/badge/changes.svg" alt="Changes">
-      </div>
-      <p style="font-size:.78rem;color:var(--txt-dim);margin-top:4px">Markdown: <code>[![Version](${SITE.url}/badge/version.svg)](${SITE.url})</code></p>
     </div>
   </div>
 </section>`
