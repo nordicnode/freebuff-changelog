@@ -170,6 +170,65 @@ export function budgetPatch (patch, maxBytes = 500000, perFile = 120000) {
   return out.join('')
 }
 
+// ---------------------------------------------------------------------------
+// Map-reduce for large diffs.
+//
+// A 500 KB single prompt on a 270K-context model leaves no room for source
+// context and still truncates the tail. Past MAP_REDUCE_THRESHOLD_BYTES the
+// diff is split by file into ~MAP_REDUCE_CHUNK_BYTES groups (at most
+// MAP_REDUCE_MAX_CHUNKS map calls + 1 fuse call); each chunk gets a focused
+// summary call, then a fuse call writes the entry from the chunk drafts.
+// Disable with CHANGELOG_LLM_MAPREDUCE=0. Map calls run sequentially so the
+// RPM budget and the enrich worker pool are never burst.
+export const MAP_REDUCE_THRESHOLD_BYTES = 150000
+export const MAP_REDUCE_CHUNK_BYTES = 100000
+export const MAP_REDUCE_MAX_CHUNKS = 6
+
+export function splitPatchByFile (patch) {
+  return String(patch || '').split(/(?=^diff --git )/m)
+    .filter(s => s.trim())
+    .map(text => {
+      const head = text.split('\n', 1)[0] || ''
+      const m = /^diff --git a\/(\S+) b\/(\S+)/.exec(head)
+      return { path: m ? m[2] : head.slice(0, 80), text }
+    })
+}
+
+export function chunkPatchGroups (patch, { targetBytes = MAP_REDUCE_CHUNK_BYTES, maxChunks = MAP_REDUCE_MAX_CHUNKS } = {}) {
+  const files = splitPatchByFile(patch)
+  if (!files.length) return []
+  // One giant file must not starve the rest: cap each file at the chunk
+  // budget (marked, so the fuse prompt knows it is partial).
+  const capped = files.map(f => f.text.length > targetBytes
+    ? { ...f, text: f.text.slice(0, targetBytes) + '\n…[file truncated]…\n' }
+    : f)
+  const chunks = []
+  let cur = []
+  let used = 0
+  for (const f of capped) {
+    if (cur.length && used + f.text.length > targetBytes) { chunks.push(cur); cur = []; used = 0 }
+    cur.push(f); used += f.text.length
+  }
+  if (cur.length) chunks.push(cur)
+  // Bound the map-call count: merge the smallest neighbor pair until within
+  // budget. The fuse prompt (grounded on the full diff) is the accuracy
+  // floor, not the chunking.
+  const bytes = (g) => g.reduce((n, f) => n + f.text.length, 0)
+  while (chunks.length > maxChunks) {
+    let bi = 0
+    for (let i = 1; i < chunks.length; i++) {
+      if (bytes(chunks[i - 1]) + bytes(chunks[i]) < bytes(chunks[bi]) + bytes(chunks[(bi + 1) % chunks.length])) bi = i - 1
+    }
+    chunks.splice(bi, 2, [...chunks[bi], ...chunks[bi + 1]])
+  }
+  return chunks.map(group => group.map(f => f.text).join(''))
+}
+
+export function needsChunking (entry, patch, env = process.env) {
+  if (env.CHANGELOG_LLM_MAPREDUCE === '0') return false
+  return String(patch || '').length > (Number(env.CHANGELOG_LLM_MAPREDUCE_THRESHOLD) || MAP_REDUCE_THRESHOLD_BYTES)
+}
+
 // A snapshot that touches several areas or many files is several changes; one
 // paragraph drops some of them. Such rows are asked for a per-topic list too.
 export const MULTI_TOPIC_MIN_FILES = 8
@@ -387,6 +446,112 @@ export function buildPrompt (entry, patch, ctx = {}) {
   return lines.filter(Boolean).join('\n')
 }
 
+// One map step: summarize a single chunk of a large diff. Shape-checked only,
+// never identifier-grounded against the chunk: a cross-file rename ("moved X
+// from a.ts to b.ts") names files that live in other chunks, so grounding
+// happens once at the fuse step against the full diff.
+export function buildChunkPrompt (entry, chunkPatch, { index = 0, total = 1, files = [] } = {}) {
+  return [
+    `You summarize part ${index + 1} of ${total} of a large Freebuff commit diff for Freebuff, a free AI coding agent. Your reader is a TECHNICAL user.`,
+    'Rules: use ONLY facts from the diff chunk below. Never invent file names, features, or versions.',
+    'Output a JSON object: {"evidence": "<1 sentence citing the exact file, function, or hunk in THIS chunk>", "summary": "<2-3 sentences: what this chunk changes and the mechanism>", "changes": [{"area": "<package or surface>", "what": "<one sentence>", "files": [<paths from the chunk file list>]}]}.',
+    `Chunk files: ${files.join(', ') || '-'}`,
+    `Commit: ${(entry.sha || '').slice(0, 8)} ${(entry.summary || entry.title || '').slice(0, 200)}`,
+    '',
+    'Diff chunk:',
+    '```diff',
+    chunkPatch,
+    '```'
+  ].filter(Boolean).join('\n')
+}
+
+export function validateChunkOut (out) {
+  if (!out || typeof out !== 'object') throw new Error('chunk output not an object')
+  const summary = cleanText(String(out.summary || '').trim(), 1500, true)
+  if (!summary) throw new Error('chunk output missing summary')
+  const evidence = typeof out.evidence === 'string' && out.evidence.trim() ? cleanText(out.evidence, 800, true) : ''
+  const changes = Array.isArray(out.changes)
+    ? out.changes.filter(c => c && typeof c === 'object' && c.what).map(c => ({
+      area: String(c.area || '').trim().slice(0, 60),
+      what: cleanText(String(c.what), 300, true),
+      files: cleanList(c.files, 8, 200)
+    })).filter(c => c.what).slice(0, 6)
+    : []
+  return { summary, ...(evidence ? { evidence } : {}), ...(changes.length ? { changes } : {}) }
+}
+
+// The reduce step: write the entry from untrusted chunk drafts. Every name the
+// fuse emits must appear in the file list, facts, catalog notes or the drafts
+// themselves; the drafts point at what matters but may misname it.
+export function buildFusePrompt (entry, drafts, ctx = {}) {
+  const lines = [
+    'You write changelog entries for Freebuff, a free AI coding agent. Your reader is a TECHNICAL user: a developer who uses Freebuff daily and reads diffs.',
+    'This commit was too large for one read, so per-chunk drafts below describe each part. The drafts are UNTRUSTED working notes: they point at what matters but may overstate, misname, or duplicate. Ground every claim in the file list, facts, and catalog notes below; every identifier, path, flag or command you place in backticks must appear verbatim in those lists or the drafts. Never invent file names, features, or versions.',
+    'Title: plain text, max 70 chars, no backticks, no markdown, no trailing period. Lead with the concrete change (model name, command with leading slash, version, subsystem). Translate code identifiers into plain words (split snake_case/camelCase/CONSTANT_CASE, drop glued version suffixes); never emit a raw glued identifier as a title word.',
+    'Summary guidelines (2-4 sentences of fluid technical prose, backticks allowed for identifiers):',
+    '- State WHAT changed and the mechanism precisely: names, versions, commands, flags, files. Lead with the functional change, then the technical mechanism.',
+    '- State WHY it happened if grounded in notes or PR context. If reason is not visible, describe the mechanism - never invent motives.',
+    '- DETAIL: include one concrete technical fact. Never paste raw diff lines. Never write "Nothing to do" or no-action boilerplate.',
+    '- Punctuation: Never use em-dashes; use commas, parentheses, or hyphens instead.',
+    '',
+    ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP,
+    '',
+    FREEBUFF_DOMAIN_LEXICON,
+    '',
+    'Output format: First, identify and cite the concrete evidence (file, function, or chunk) in "evidence", then produce title and summary.',
+    `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, or chunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "${entry.significance || 'minor'}", "audience": "<one of: ${AUDIENCES.join(' | ')}>", "userVisible": <true if a user of the CLI, web app, desktop app or SDK can observe the change without reading code, else false>, "breaking": <true only if existing behavior, config, an API or a command stops working as before>, "migration": "<what a user or operator must do because of this change, or null>", "newEnvVars": [<environment variables introduced, verbatim, or empty>], "newFlags": [<CLI flags introduced, verbatim with leading dashes, or empty>], "confidence": "<high | medium | low: how well the drafts and notes support the summary>", "unknowns": "<one sentence naming what the drafts do not show (the motive, the consumer of a new constant, the rollout), or null>", "changes": [{"area": "<package or surface>", "what": "<one sentence>", "files": [<paths from the file list>]}]}.`,
+    'A chunked commit is several changes: fill "changes" with one item per distinct change (2-6 items), each grounded in the files it names; the prose summary then leads with the most user-relevant one and says how many others there are.',
+    'Fields: "migration" and "unknowns" are null when there is nothing honest to say; never fill them with reassurance. "confidence" is low when the drafts disagree, the change is mostly configuration whose consumer is not visible, or the motive is guessed.',
+    `Significance (deterministic default "${entry.significance || 'minor'}"): keep it unless the drafts clearly contradict it.`,
+    'major = new feature, model added/removed, security, breaking. notable = user-visible behavior/UI change, new file, API change. minor = internal, refactor, types, comments, deps.',
+    `Audience: who this change is for. ${AUDIENCES.map(a => `${a} = ${AUDIENCE_DESC[a]}`).join('; ')}. Pick the narrowest group whose experience or configuration actually changes; a constant nobody reads yet, a test, or a refactor is maintainers.`,
+    '',
+    `Date: ${entry.date}`,
+    `Category: ${entry.category || (entry.areas || []).join(', ')}`,
+    `Areas: ${(entry.areas || []).join(', ')}`,
+    `Commit nature: ${entry.commitNature || commitNatureOf(entry)}`,
+    `Stats: +${entry.stats?.additions ?? '?'} / -${entry.stats?.deletions ?? '?'}`
+  ]
+  if (ctx.prMeta?.number) {
+    lines.push(`Related PR #${ctx.prMeta.number}: ${ctx.prMeta.title || ''}${ctx.prMeta.matched === 'files' ? ' (matched by touched files; treat as likely, not certain)' : ''}`)
+    if (ctx.prMeta.body) lines.push(`PR description: ${truncateWords(ctx.prMeta.body, 800)}`)
+  }
+  if (ctx.glossary) lines.push('', ctx.glossary)
+  if (entry.modelChanges) {
+    lines.push(`Model catalog: +${entry.modelChanges.added.join(', ')} -${entry.modelChanges.removed.join(', ')}`)
+  }
+  if (entry.cmdChanges) lines.push(`Slash commands: +${(entry.cmdChanges.added || []).join(', ')} -${(entry.cmdChanges.removed || []).join(', ')}`)
+  if (entry.version || entry.freebuffVersion) lines.push(`Version bump: ${entry.version || entry.freebuffVersion}`)
+  if (ctx.releaseCtx) lines.push('', ctx.releaseCtx, '')
+  const added = entry.files?.added || []
+  const modified = entry.files?.modified || []
+  const removed = entry.files?.removed || []
+  if (added.length) lines.push(`Added files: ${added.slice(0, 30).join(', ')}`)
+  if (modified.length) lines.push(`Modified files: ${modified.slice(0, 30).join(', ')}`)
+  if (removed.length) lines.push(`Removed files: ${removed.slice(0, 30).join(', ')}`)
+  const facts = (entry.facts || []).slice(0, 8)
+  if (facts.length) lines.push(`Key facts: ${facts.map(f => `- ${f}`).join(' ')}`)
+  const structured = ctx.structured || entry.structured
+  if (hasStructuredFacts(structured)) lines.push(...formatStructuredFacts(structured))
+  if (ctx.fileHeaders && ctx.fileHeaders.length) {
+    lines.push('Module & File Purpose (ground-truth documentation from touched files):')
+    for (const h of ctx.fileHeaders) {
+      lines.push(`- File \`${h.path}\`:`)
+      lines.push('```')
+      lines.push(h.header)
+      lines.push('```')
+    }
+  }
+  lines.push('', 'Per-chunk drafts (untrusted notes; verify every name against the lists above):')
+  for (const d of drafts) {
+    lines.push(`--- Chunk ${(d.index ?? 0) + 1}/${drafts.length} (files: ${(d.files || []).join(', ') || '-'})`)
+    if (d.evidence) lines.push(`Evidence: ${d.evidence}`)
+    lines.push(`Summary: ${d.summary}`)
+    for (const c of d.changes || []) lines.push(`- Change [${c.area || '?'}]: ${c.what}`)
+  }
+  return lines.filter(Boolean).join('\n')
+}
+
 export function sanitizeJsonText (str) {
   let inString = false
   let escaped = false
@@ -561,7 +726,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     },
     body: JSON.stringify({
       model,
-      temperature: 0.1,
+      temperature: 0,
       response_format: { type: 'json_object' },
       messages: [{ role: 'user', content: prompt }]
     }),
@@ -698,6 +863,28 @@ export function ungroundedIdentifiers (text, corpus) {
     const tail = p.split('/').pop()
     if (tail && hay.includes(`/${tail}`)) continue
     if (!out.includes(p)) out.push(p)
+  }
+  // Bare identifiers outside backticks: the model is told to use backticks for
+  // identifiers, but prose still leaks names ("raised FREEBUFF_X from 300 to
+  // 500", "shipped in 0.0.178", "pass --trust-agent-dirs"). A CONSTANT_CASE
+  // name with an underscore, a dotted version, or a --flag that the corpus
+  // never mentions is invented. URLs are stripped first so link targets never
+  // count as claims.
+  const prose = clean.replace(/`[^`\n]*`/g, ' ').replace(/https?:\/\/\S+/gi, ' ')
+  for (const m of prose.matchAll(/\b([A-Z][A-Z0-9]*_[A-Z0-9_]+)\b/g)) {
+    const name = m[1]
+    if (name.length < 4 || out.includes(name)) continue
+    if (!hay.includes(name)) out.push(name)
+  }
+  for (const m of prose.matchAll(/(?<![\w.])(v?\d+\.\d+\.\d+(?:-[\w.]+)?)\b/g)) {
+    const v = m[1]
+    if (out.includes(v)) continue
+    if (!hay.includes(v)) out.push(v)
+  }
+  for (const m of prose.matchAll(/(?<![\w-])(--?[a-z][\w-]*)/g)) {
+    const f = m[1]
+    if (f.length < 3 || out.includes(f)) continue
+    if (!hay.includes(f)) out.push(f)
   }
   return out
 }
@@ -870,7 +1057,13 @@ function releaseItemText (e, maxSummary = RELEASE_CTX_SUMMARY_CHARS) {
   const head = `${(e?.date || '').slice(0, 10)} ${title}`.trim()
   const tail = summary && summary !== title ? `: ${truncateWords(summary, maxSummary)}` : ''
   const tag = sig && sig !== 'noise' ? ` [${sig}]` : ''
-  return `${head}${tail}${tag}`.trim()
+  // A member whose own summary carries unverified names or a review flag must
+  // not launder them into the roll-up as fact: mark it so the roll-up hedges.
+  const cautions = []
+  if (e?.ai?.ungrounded?.length) cautions.push(`unverified identifiers: ${e.ai.ungrounded.slice(0, 3).join(', ')}`)
+  if (e?.ai?.verify === 'flagged') cautions.push('review flagged its claims')
+  const caution = cautions.length ? ` [caution: ${cautions.join('; ')}]` : ''
+  return `${head}${tail}${tag}${caution}`.trim()
 }
 
 export function collectReleaseContext (entries, bump, opts = {}) {
@@ -938,6 +1131,9 @@ export function formatReleaseContext (ctx, bump) {
   const since = ctx.prevVersion ? ` since ${ctx.prevVersion}` : ''
   const head = `Updates included in this release${v ? ` (${v}${since})` : since}:`
   const lines = (ctx.items || []).map(it => `- ${it.text}`)
+  if ((ctx.items || []).some(it => /\[caution:/.test(it.text || ''))) {
+    lines.push('- Note: items marked [caution] carry names the diff did not confirm or a review flag on their claims. Lead with verified items; state caution-marked specifics hedged ("reportedly", "listed as") or omit them.')
+  }
   if (ctx.truncated) lines.push(`- ...[earlier changes truncated; newest ${(ctx.items || []).length} shown]...`)
   const net = ctx.net || {}
   const netLines = []
@@ -1070,6 +1266,61 @@ export function findPrMeta (e, prIndex) {
   }
 }
 
+// A file-set match is a guess, and a wrong PR lends the summary a false
+// motive. This gate asks the model whether the PR description actually
+// explains the diff; only file-matched PRs are gated (exact number/sha
+// matches are trusted). One cheap call, skipped with CHANGELOG_PR_GATE=0.
+// Network or parse failures fail open (keep the PR); only an explicit
+// relevant:false drops it.
+export function buildPrRelevancePrompt (e, patch, prMeta) {
+  return [
+    'You decide whether a GitHub pull request likely produced a squashed snapshot commit. Answer from the evidence only: shared file names alone are not enough if the PR description is about something else.',
+    'Output a JSON object: {"relevant": true|false, "reason": "<one sentence>", "quote": "<one diff line or PR phrase that links them, or empty>"}.',
+    '',
+    `Snapshot files: ${[...(e.files?.added || []), ...(e.files?.modified || []), ...(e.files?.removed || [])].join(', ') || '-'}`,
+    `PR #${prMeta.number}: ${prMeta.title || ''}`,
+    prMeta.body ? `PR description: ${truncateWords(prMeta.body, 800)}` : '',
+    `Snapshot summary: ${e.summary || e.title || ''}`,
+    '',
+    'Diff (excerpt):',
+    '```diff',
+    budgetPatch(patch, 60000, 20000),
+    '```'
+  ].filter(Boolean).join('\n')
+}
+
+export function validatePrRelevanceOut (out) {
+  if (!out || typeof out !== 'object') throw new Error('relevance output not an object')
+  if (typeof out.relevant !== 'boolean') throw new Error('relevance output missing relevant')
+  return {
+    relevant: out.relevant,
+    ...(typeof out.reason === 'string' && out.reason.trim() ? { reason: cleanText(out.reason, 200) } : {}),
+    ...(typeof out.quote === 'string' && out.quote.trim() ? { quote: cleanText(out.quote, 200) } : {})
+  }
+}
+
+export async function checkPrRelevance (e, patch, prMeta, env = process.env) {
+  if (!prMeta || prMeta.matched !== 'files') return prMeta
+  if (env.CHANGELOG_PR_GATE === '0') return prMeta
+  try {
+    const verdict = await callLlm(
+      buildPrRelevancePrompt(e, patch, prMeta),
+      { ...env, LLM_MODEL: env.LLM_MODEL || 'gpt-4o-mini' },
+      1, validatePrRelevanceOut
+    )
+    if (!verdict.relevant) {
+      log(`PR gate dropped #${prMeta.number} for ${String(e.sha || '').slice(0, 8)}: ${verdict.reason || 'description does not explain the diff'}`)
+      return null
+    }
+    return prMeta
+  } catch (err) {
+    // Fail open: a gateway blip or a malformed verdict must never drop
+    // context the prompt would otherwise have had.
+    log(`PR gate unavailable for ${String(e.sha || '').slice(0, 8)}: ${shortError(err)}`)
+    return prMeta
+  }
+}
+
 // A sync commit is a squash, so no PR commit sha ever matches it. The PR that
 // produced it can still be recognised by the files it touched: the stored
 // preview names the first files of the PR diff, and a snapshot that edits every
@@ -1079,15 +1330,20 @@ export const PR_MATCH_MIN_SHARED = 2
 export const PR_MATCH_MIN_COVERAGE = 0.6
 export const PR_MATCH_WINDOW_DAYS = 14
 
+// Basenames too generic to identify a PR: lockfiles, manifests, READMEs and
+// barrel files ride along in half the snapshots, so a "match" on only those
+// lends the summary a false motive. Filtered from both sides before counting.
+export const PR_MATCH_STOPLIST_RE = /(?:^|\/)(?:index\.[jt]sx?|constants?\.ts|config\.ts|env-schema\.ts|package\.json|README(?:\.[a-z-]+)?\.md|CHANGELOG(?:\.[a-z-]+)?\.md|LICENSE(?:\.[a-z-]+)?)$/i
+
 export function matchPrByPaths (e, prIndex) {
   const prs = prIndex?.prsByNum ? [...prIndex.prsByNum.values()] : []
   if (!prs.length) return null
-  const mine = new Set([...(e.files?.added || []), ...(e.files?.modified || []), ...(e.files?.removed || []), ...(e.files?.tests || [])])
+  const mine = new Set([...(e.files?.added || []), ...(e.files?.modified || []), ...(e.files?.removed || []), ...(e.files?.tests || [])].filter(p => p && !PR_MATCH_STOPLIST_RE.test(p)))
   if (mine.size < PR_MATCH_MIN_SHARED) return null
   const when = Date.parse(e.date || '') || 0
   let best = null
   for (const pr of prs) {
-    const paths = (pr.paths || []).filter(Boolean)
+    const paths = (pr.paths || []).filter(p => p && !PR_MATCH_STOPLIST_RE.test(p))
     if (paths.length < PR_MATCH_MIN_SHARED) continue
     const stamp = Date.parse(pr.updated || pr.closedSeenAt || '') || 0
     if (when && stamp && Math.abs(when - stamp) > PR_MATCH_WINDOW_DAYS * 86400000) continue
@@ -1185,23 +1441,37 @@ export async function gatherEntryContext (e, patch, { repoDir = null, entries = 
 }
 
 // ---------------------------------------------------------------------------
-// Optional second-model verifier (CHANGELOG_LLM_VERIFY=1, LLM_VERIFY_MODEL).
+// Second-model verifier. A cheap model is shown the diff and the finished
+// summary and asked for claims the diff does not support, one object per
+// factual claim so the repair pass knows exactly which sentence to fix. If it
+// names any, the summary pass gets one repair with the objections. The
+// verdict is advisory: a summary that still fails is stored with
+// `verify: 'flagged'` rather than dropped.
 //
-// Only for major/notable rows, where an invented claim costs the most: a cheap
-// model is shown the diff and the finished summary and asked for claims the
-// diff does not support. If it names any, the summary pass gets one repair
-// with the objections. The verifier's verdict is advisory: a summary that
-// still fails is stored with `verify: 'flagged'` rather than dropped.
+// Budget: CHANGELOG_LLM_VERIFY=0 disables; =all verifies every row; =1 or
+// unset verifies the rows where an invented claim costs the most
+// (major/notable, multi-topic, or already carrying ungrounded names).
+// LLM_VERIFY_MODEL optionally routes the check to a different model.
 
 export function verifyConfigured (env = process.env) {
-  return env.CHANGELOG_LLM_VERIFY === '1'
+  return env.CHANGELOG_LLM_VERIFY !== '0'
+}
+
+export function shouldVerify (e, clean, env = process.env) {
+  if (env.CHANGELOG_LLM_VERIFY === '0') return false
+  if (String(env.CHANGELOG_LLM_VERIFY || '').toLowerCase() === 'all') return true
+  const sig = clean?.significance || e?.significance || 'minor'
+  if (sig === 'major' || sig === 'notable') return true
+  if (isMultiTopic(e)) return true
+  if (clean?.ungrounded?.length) return true
+  return false
 }
 
 export function buildVerifyPrompt (entry, patch, clean) {
   return [
-    'You are checking a changelog entry against the diff it describes. List every claim in the title, summary or evidence that the diff (plus the file list and notes) does NOT support: invented file or function names, behavior the diff does not implement, motives, performance or user-impact claims with no basis, or the wrong audience.',
+    'You are checking a changelog entry against the diff it describes. Check EVERY sentence of the title, summary and evidence: for each factual claim (a file or function name, a behavior the diff implements, a motive, a performance or user-impact claim, the audience), decide whether the diff (plus the file list and notes) supports it.',
     'Be strict about facts and lenient about wording. Do not object to plain-language paraphrase of code that is present.',
-    'Output a JSON object: {"supported": true|false, "issues": ["<one unsupported claim per string, quoting the words used>"]}. An empty issues list means supported.',
+    'Output a JSON object: {"supported": true|false, "issues": ["<one unsupported claim per string, quoting the words used>"], "claims": [{"quote": "<exact words from the entry>", "supported": true|false, "reason": "<why, in a few words>"}]}. An empty issues list with every claim supported means supported.',
     '',
     `Files added: ${(entry.files?.added || []).join(', ') || '-'}`,
     `Files modified: ${(entry.files?.modified || []).join(', ') || '-'}`,
@@ -1215,7 +1485,7 @@ export function buildVerifyPrompt (entry, patch, clean) {
     '',
     'Diff:',
     '```diff',
-    budgetPatch(patch, 120000, 40000),
+    budgetPatch(patch, 250000, 60000),
     '```'
   ].filter(Boolean).join('\n')
 }
@@ -1223,8 +1493,13 @@ export function buildVerifyPrompt (entry, patch, clean) {
 export function validateVerifyOut (out) {
   if (!out || typeof out !== 'object') throw new Error('verifier output not an object')
   const issues = Array.isArray(out.issues) ? out.issues.map(s => cleanText(String(s), 300)).filter(Boolean).slice(0, 8) : []
+  const claims = Array.isArray(out.claims) ? out.claims.filter(c => c && typeof c === 'object').map(c => ({
+    quote: cleanText(String(c.quote || ''), 300),
+    supported: c.supported === true,
+    ...(c.reason ? { reason: cleanText(String(c.reason), 150) } : {})
+  })).filter(c => c.quote).slice(0, 12) : []
   const supported = out.supported === true || (out.supported == null && !issues.length)
-  return { supported: supported && !issues.length, issues }
+  return { supported: supported && !issues.length && claims.every(c => c.supported), issues, ...(claims.length ? { claims } : {}) }
 }
 
 export async function verifySummary (entry, patch, clean, env) {
@@ -1232,15 +1507,40 @@ export async function verifySummary (entry, patch, clean, env) {
   return callLlm(buildVerifyPrompt(entry, patch, clean), venv, 1, validateVerifyOut)
 }
 
+// Map-reduce orchestration: one focused call per chunk (sequential, to respect
+// the RPM budget), then a fuse call validated against the FULL diff corpus so
+// the final entry is grounded no matter which chunk a name came from.
+export async function summarizeChunked (e, patch, { promptCtx = {}, corpus = '', sig = 'minor', env = process.env } = {}) {
+  const chunks = chunkPatchGroups(patch)
+  const drafts = []
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = budgetPatch(chunks[i], MAP_REDUCE_CHUNK_BYTES, MAP_REDUCE_CHUNK_BYTES)
+    const files = diffPaths(chunks[i])
+    const out = await callLlm(buildChunkPrompt(e, chunk, { index: i, total: chunks.length, files }), env, 1, validateChunkOut)
+    drafts.push({ index: i, files, ...out })
+    log(`LLM chunk ${i + 1}/${chunks.length} for ${String(e.sha || '').slice(0, 8)} (${(files[0] || 'single-file').split('/').pop()}${files.length > 1 ? ` +${files.length - 1} more` : ''})`)
+  }
+  const fuse = buildFusePrompt(e, drafts, promptCtx)
+  const clean = await callLlm(fuse, env, 1, summaryValidator(sig, corpus))
+  return { clean, fuse }
+}
+
 // One entry, start to finish: prompt, call, grounding repair, optional
 // verification, and the record both the cache and the entry receive.
 export async function summarizeEntry ({ entry: e, patch, relText = '', sequence = null, prMeta = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env }) {
   // Tiered routing: the rows a reader opens go to LLM_MODEL_MAJOR when set.
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
+  // File-set PR matches are guesses: gate them before they enter the prompt.
+  // The gate fails open internally, so a gateway blip never drops context;
+  // only an explicit relevant:false removes it.
+  let prMetaEff = prMeta
+  if (prMeta?.matched === 'files' && baseEnv.CHANGELOG_PR_GATE !== '0') {
+    prMetaEff = await checkPrRelevance(e, patch, prMeta, baseEnv)
+  }
   const promptCtx = {
     releaseCtx: relText,
     sequence,
-    prMeta,
+    prMeta: prMetaEff,
     architectureMap: archMap || FREEBUFF_ARCHITECTURE_MAP,
     glossary,
     structured: context.structured,
@@ -1253,14 +1553,31 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
   const prompt = buildPrompt(e, patch, promptCtx)
   const corpus = groundingCorpus(e, patch, promptCtx)
   const sig = e.significance || 'minor'
-  let clean = await callLlm(prompt, env, 1, summaryValidator(sig, corpus))
+  let clean
+  // The verifier repair re-sends the ask it corrects: the single prompt, or
+  // the fuse prompt for chunked rows (re-sending the single prompt would
+  // truncate away the chunks the draft was fused from).
+  let repairPrompt = prompt
+  if (needsChunking(e, patch, baseEnv)) {
+    log(`LLM map-reduce for ${String(e.sha || '').slice(0, 8)} (${String(patch || '').length} bytes)`)
+    const reduced = await summarizeChunked(e, patch, { promptCtx, corpus, sig, env })
+    clean = reduced.clean
+    repairPrompt = reduced.fuse
+  } else {
+    clean = await callLlm(prompt, env, 1, summaryValidator(sig, corpus))
+  }
   let verify
-  if (verifyConfigured(env) && (clean.significance === 'major' || clean.significance === 'notable')) {
+  if (shouldVerify(e, clean, env)) {
     try {
       const verdict = await verifySummary(e, patch, clean, env)
-      if (!verdict.supported && verdict.issues.length) {
-        log(`LLM verifier objected for ${e.sha.slice(0, 8)}: ${verdict.issues[0].slice(0, 100)}`)
-        const repaired = await callLlm(`${prompt}\n\nA reviewer checked your previous answer against the diff and found these unsupported claims:\n${verdict.issues.map(i => `- ${i}`).join('\n')}\nRewrite the entry so every claim is supported by the diff. Reply with ONLY the JSON object.`, env, 1, summaryValidator(sig, corpus))
+      const badClaims = (verdict.claims || []).filter(c => !c.supported)
+      if (!verdict.supported && (verdict.issues.length || badClaims.length)) {
+        const objections = [
+          ...verdict.issues.map(i => `- ${i}`),
+          ...badClaims.map(c => `- Unsupported claim: "${c.quote}"${c.reason ? ` (${c.reason})` : ''}`)
+        ].join('\n')
+        log(`LLM verifier objected for ${e.sha.slice(0, 8)}: ${(verdict.issues[0] || badClaims[0]?.quote || '').slice(0, 100)}`)
+        const repaired = await callLlm(`${repairPrompt}\n\nA reviewer checked your previous answer against the diff and found these unsupported claims:\n${objections}\nRewrite the entry so every claim is supported by the diff. Reply with ONLY the JSON object.`, env, 1, summaryValidator(sig, corpus))
         const recheck = await verifySummary(e, patch, repaired, env).catch(() => null)
         clean = repaired
         verify = recheck && recheck.supported ? 'passed' : 'flagged'
@@ -1287,7 +1604,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     ...(clean.confidence ? { confidence: clean.confidence } : {}),
     ...(clean.unknowns ? { unknowns: clean.unknowns } : {}),
     ...(clean.changes ? { changes: clean.changes } : {}),
-    ...(prMeta?.number ? { pr: prMeta.number, ...(prMeta.matched === 'files' ? { prMatched: 'files', prConfidence: prMeta.confidence } : {}) } : {}),
+    ...(prMetaEff?.number ? { pr: prMetaEff.number, ...(prMetaEff.matched === 'files' ? { prMatched: 'files', prConfidence: prMetaEff.confidence } : {}) } : {}),
     ...(clean.ungrounded ? { ungrounded: clean.ungrounded } : {}),
     ...(verify ? { verify } : {}),
     ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}),
@@ -1731,6 +2048,20 @@ Rules:
 Reply with JSON only: {"eli5": "..."}`
 }
 
+// ELI5 grounding: the plain-English pass must not leak identifiers, versions,
+// flags or paths that the diff and evidence never showed. Unlike the summary
+// pass (strict once, then flag-and-store), a stubborn second leak parks the
+// row: a non-programmer cannot spot an unverified name, so no line beats a
+// wrong line.
+export function validateGroundedEli5 (out, maxChars, { allow = '', corpus = '' } = {}) {
+  const text = normalizeEli5(out, maxChars, { allow })
+  if (corpus) {
+    const bad = ungroundedIdentifiers(text, corpus)
+    if (bad.length) throw new Error(`ELI5 names identifiers not present in the diff or evidence: ${bad.slice(0, 6).join(', ')}`)
+  }
+  return text
+}
+
 // Non-answers worth parking: a whole reply that is "N/A", or one that opens with
 // a refusal. Checked at the start of the sentence so a real explanation that
 // happens to contain "cannot" is not thrown away.
@@ -2014,6 +2345,16 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
 // mined from, which the pass has already paid for either way.
 export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, siblings = [], diffBytes = 60000, relText = '', prMeta = null, sequence = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env }) {
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
+  const maxChars = relText ? ELI5_ROLLUP_MAX_CHARS : ELI5_MAX_CHARS
+  const allow = `${relText} ${e.ai?.summary || ''} ${(e.facts || []).join(' ')}`
+  const corpus = groundingCorpus(e, patch, {
+    structured: context.structured,
+    prMeta,
+    releaseCtx: relText,
+    fileHeaders: context.fileHeaders,
+    fileHistory: context.fileHistory,
+    subsystemDocs: context.subsystemDocs
+  })
   const text = await callLlm(buildEli5Prompt(e, eli5Notes(e, notesPatch), {
     patch,
     siblings,
@@ -2027,7 +2368,7 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     fileHeaders: context.fileHeaders,
     fileHistory: context.fileHistory,
     subsystemDocs: context.subsystemDocs
-  }), env, 1, (out) => normalizeEli5(out, relText ? ELI5_ROLLUP_MAX_CHARS : ELI5_MAX_CHARS, { allow: `${relText} ${e.ai?.summary || ''} ${(e.facts || []).join(' ')}` }))
+  }), env, 1, (out) => validateGroundedEli5(out, maxChars, { allow, corpus }))
   const record = {
     model: env.LLM_MODEL || 'gpt-4o-mini',
     v: ELI5_V,

@@ -10,7 +10,12 @@
 // v9: structured facts (constants old->new, env vars, flags, exports, test
 // titles), PR review threads, glossary, per-topic `changes` for multi-area
 // snapshots, and the userVisible/breaking/migration/confidence/unknowns fields.
-export const PROMPT_V = 9
+// v10: map-reduce for large diffs (per-chunk drafts + fuse, validated against
+// the full diff), per-claim verifier verdicts, grounding v2 (bare
+// CONSTANT_CASE names, versions and --flags, plus ELI5 grounding),
+// temperature 0, PR file-match stop-list + relevance gate, and [caution]
+// marking for unverified release-window members.
+export const PROMPT_V = 10
 
 // v7: commit nature always supplied, audience handed over, no "you (the
 // person...)" asides, template lines for test-only and docs-only rows.

@@ -1045,8 +1045,8 @@ test('enrichEli5: writes the line, caches it by the summary, asks once', async (
   }
 })
 
-test('versions bumped for structured facts + PR threads + glossary overhaul', () => {
-  assert.equal(PROMPT_V, 9, 'PROMPT_V bumped to 9')
+test('versions bumped for map-reduce + per-claim verifier + grounding v2 + PR gate', () => {
+  assert.equal(PROMPT_V, 10, 'PROMPT_V bumped to 10')
   assert.equal(ELI5_V, 7, 'ELI5_V bumped to 7')
 })
 

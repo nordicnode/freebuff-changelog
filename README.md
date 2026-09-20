@@ -34,7 +34,7 @@ node generator/cli.mjs eval --seed 40 && node generator/cli.mjs eval --judge   #
 1. **Fetch & Diff**: Pulls upstream snapshots and diffs parent commits to isolate individual changes.
 2. **Deterministic Extraction**: Extracts model lineup changes (README tables), version bumps (`package.json`), slash commands, and developer comments.
 3. **Classification**: Categorizes by area and significance. Churn commits (lockfiles, assets) are dimmed in the UI rather than dropped.
-4. **AI Enrichment (Optional)**: Adds technical summaries and ELI5 plain-English explanations, cached by SHA and diff hash. Every summary carries an **evidence** citation, an **audience** (`end-users`, `advertisers`, `operators`, `maintainers`) and passes an **identifier-grounding check**: backticked names that do not appear in the diff or source context trigger one repair pass and are otherwise recorded as `ungrounded` and shown as unverified. Source context is tiered by diff size (a one-line change does not get four full files). Test-only and docs-only rows get a fixed plain-English line without an API call.
+4. **AI Enrichment (Optional)**: Adds technical summaries and ELI5 plain-English explanations, cached by SHA and diff hash. Every summary carries an **evidence** citation, an **audience** (`end-users`, `advertisers`, `operators`, `maintainers`) and passes an **identifier-grounding check**: backticked names plus bare `CONSTANT_CASE` names, versions and `--flags` that do not appear in the diff or source context trigger one repair pass and are otherwise recorded as `ungrounded` and shown as unverified (the ELI5 line is grounded the same way and parks instead of storing a leak). PRs matched by touched files pass an LLM relevance gate before their description enters the prompt. Source context is tiered by diff size (a one-line change does not get four full files). Test-only and docs-only rows get a fixed plain-English line without an API call.
 5. **Static Generation**: Builds zero-JS, pre-rendered HTML/CSS to `dist/` with instant revalidation.
 
 ### What the model is given
@@ -44,7 +44,7 @@ node generator/cli.mjs eval --seed 40 && node generator/cli.mjs eval --judge   #
 - **Glossary** (`data/glossary.json`): plain-English meanings for internal terms, injected into both passes. `glossary --discover` adds candidate terms from upstream docs headings (empty definitions are never injected).
 - **Multi-topic snapshots** (≥2 areas or ≥8 files) are asked for a per-topic `changes` list in addition to the prose summary.
 - **Structured output**: `userVisible`, `breaking`, `migration`, `newEnvVars`, `newFlags`, `confidence`, `unknowns`. Lists are grounded like identifiers; `[BREAKING]` and `[LOW CONFIDENCE]` badges, an ACTION line and a NOT IN THE DIFF line render from them.
-- **Diff ordering**: when the diff exceeds the budget, source files go first, then docs/config, then tests, then snapshots and generated files (smaller first within a tier).
+- **Diff ordering**: when the diff exceeds the budget, source files go first, then docs/config, then tests, then snapshots and generated files (smaller first within a tier). Diffs over ~150KB skip truncation entirely: per-chunk drafts are fused into the entry (map-reduce, `CHANGELOG_LLM_MAPREDUCE=0` disables).
 - **Tiered models**: set `LLM_MODEL_MAJOR` to route major/notable rows, catalog and command changes, security-relevant rows, release roll-ups and multi-topic snapshots to a stronger model while `minor` stays on `LLM_MODEL`.
 
 ### Quality controls
@@ -55,7 +55,7 @@ node generator/cli.mjs eval --seed 40 && node generator/cli.mjs eval --judge   #
 
 - **Prompt versions**: `PROMPT_V` / `ELI5_V` / `RELEASE_ROLLUP_V` in `generator/lib/llm.mjs`. Bumping one re-summarizes affected rows once. Rows on an older prompt are left alone by the hourly sync; `enrich-all --rewrite-stale` refreshes them, heaviest first.
 - **Anti-marketing**: release roll-ups and single rows are rejected (and repaired) when they contain hype ("smarter", "faster", "seamless", "together, these changes make...").
-- **Second-model verifier** (optional): `CHANGELOG_LLM_VERIFY=1` asks `LLM_VERIFY_MODEL` to list claims the diff does not support for `major`/`notable` rows; one repair, then the row is stored with `verify: passed|flagged`.
+- **Second-model verifier** (on by default): `LLM_VERIFY_MODEL` checks per-claim support for major/notable, multi-topic and ungrounded rows (`CHANGELOG_LLM_VERIFY=all` checks every row, `0` disables); one repair, then the row is stored with `verify: passed|flagged`.
 - **Human overrides**: `data/overrides.json` (`{ "<sha or 12-char prefix>": { "title", "summary", "eli5", "significance", "evidence", "audience", "note" } }`) is applied at build time on every surface and survives re-summarization. Overridden rows show an `[EDITED]` badge.
 - **/stats/ quality panel**: prompt-version coverage, evidence coverage, unverified identifiers, hype and preamble counts, audience split. Recomputed every build.
 - **Deterministic weight**: a bump-only row is now `notable` (was `major`); `major` is reserved for model catalog changes and bumps that also ship code. Every weight carries a `significanceReason` shown in the badge tooltip. Stored rows keep their old weight until `repair-entries` is run once.
@@ -88,7 +88,9 @@ Set via environment variables:
 | `CHANGELOG_ELI5` | `1` | Enable plain-English explanations |
 | `CHANGELOG_ELI5_TEMPLATES` | `1` | Fixed plain-English line for test-only/docs-only rows (no API call); `0` sends them to the model |
 | `CHANGELOG_LLM_REWRITE_STALE` | `0` | `1` re-queues rows summarized under an older prompt (same as `enrich-all --rewrite-stale`) |
-| `CHANGELOG_LLM_VERIFY` | `0` | `1` runs the second-model verifier on major/notable summaries |
+| `CHANGELOG_LLM_VERIFY` | `1` | Verifier for summaries: `1` (default) checks major/notable, multi-topic and ungrounded rows; `all` checks every row; `0` disables |
+| `CHANGELOG_LLM_MAPREDUCE` | `1` | `0` disables map-reduce (per-chunk drafts + fuse) for diffs over ~150KB (`CHANGELOG_LLM_MAPREDUCE_THRESHOLD`) |
+| `CHANGELOG_PR_GATE` | `1` | `0` keeps file-set-matched PR context without the LLM relevance check |
 | `LLM_VERIFY_MODEL` | `LLM_MODEL` | Model for the verifier pass |
 | `LLM_MODEL_MAJOR` | — | Stronger model for heavy rows (major/notable, catalog, security, roll-ups, multi-topic) |
 | `LLM_JUDGE_MODEL` | `LLM_VERIFY_MODEL` | Model for `eval --judge` |
