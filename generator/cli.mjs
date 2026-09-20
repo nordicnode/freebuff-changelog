@@ -900,7 +900,7 @@ export async function commitAndPushData ({ message, overrides = {}, attempts = 3
     // HEAD:<branch>, not <branch>: the workflow runner can be on a detached
     // HEAD, where `push origin main` would silently push an older local ref.
     if ((await git(['push', 'origin', `HEAD:${branch}`], root, { allowFail: true })) !== null) {
-      log(`pushed data to origin/${branch}: Cloudflare redeploys on that push.`)
+      log(`pushed data to origin/${branch}: the deploy workflow builds and uploads (Cloudflare-side builds stay off).`)
       return true
     }
     if (attempt === attempts) break

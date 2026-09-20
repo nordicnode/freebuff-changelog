@@ -103,7 +103,8 @@ Set via environment variables:
 
 ## Deployment
 
-Deploy `dist/` to **Cloudflare Pages**:
-- **Build command**: `node generator/cli.mjs build`
-- **Output directory**: `dist`
+Deploy `dist/` to **Cloudflare Workers** (static assets, no server code: badges are pre-rendered SVGs) **without Cloudflare-side builds**:
+
+- Cloudflare dashboard: Workers & Pages -> `freebuff-changelog` -> Settings -> Builds -> disconnect git / disable automatic builds. The daemon pushes data every few minutes and every push would otherwise bill a Workers Build.
+- `.github/workflows/deploy.yml` builds `dist/` on GitHub Actions (free for this public repo) and uploads it with `wrangler deploy`, a direct asset upload that consumes zero build minutes. Needs repo secret `CLOUDFLARE_API_TOKEN` (Workers Scripts: Edit) and variable `CLOUDFLARE_ACCOUNT_ID`. Without the token the workflow still smoke-checks the build and skips the upload.
 - Run continuous updates via `npm run backfill --push` (systemd). The GitHub Actions workflow (`.github/workflows/changelog-sync.yml`) is a **backstop only**: scheduled runs drift by hours and it defaults to `CHANGELOG_LLM_LIMIT=10`, so nothing should depend on it for freshness or for working through the summary backlog.
