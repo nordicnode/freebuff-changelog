@@ -1372,7 +1372,7 @@ if (IS_MAIN) {
   node generator/cli.mjs repair-entries [--push]   # recompute commitNature / significance / security tag on stored rows (no text touched)
   node generator/cli.mjs prune-cache [--push]      # drop ai-summaries.json keys from retired prompt versions
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
-  node generator/cli.mjs eval [--seed N] [--limit N] [--judge]  # summary-quality evaluation against data/eval/golden.json
+  node generator/cli.mjs eval [--seed N] [--limit N] [--no-judge]  # summary-quality evaluation against data/eval/golden.json (LLM judge on by default)
   node generator/cli.mjs normalize-dates [--push]  # one-off: rewrite stored timestamps to UTC and fix the day/month keys
   node generator/cli.mjs broadcast [--webhook URL] [--limit N] [--dry-run]  # broadcast latest commits to Discord
   node generator/cli.mjs build                    # render static site → dist/
@@ -1516,7 +1516,10 @@ async function cmdEval (argv) {
     getPatch: llmPatchFor,
     getFullPatch: fullPatchFor,
     limit: lim !== -1 ? Number(argv[lim + 1]) || 0 : 0,
-    judge: argv.includes('--judge')
+    // The judge is the only independent quality axis the harness has (the
+    // grounding rate measures the pipeline's own checker), so it runs by
+    // default; --no-judge opts out for a cheap pass.
+    judge: !argv.includes('--no-judge')
   })
   console.log(formatEvalReport(report))
 }

@@ -232,16 +232,18 @@ test('rememberClosedPrs keeps review comments and preview paths; diffPaths parse
 test('eval: why detection, must-mention, row scoring, aggregation, judge validation, report', () => {
   assert.equal(whyVisible('Raised the cap because the trial filled in an hour.'), true)
   assert.equal(whyVisible('Raised the cap to 500.'), false)
-  const e = { sha: sha('a'), files: { added: ['a.ts'], modified: [] }, version: '1.0.5', structured: extractStructuredFacts(PATCH), eli5: { text: 'Plain.' } }
+  const e = { sha: sha('a'), files: { added: ['src/a.ts'], modified: [] }, version: '1.0.5', structured: extractStructuredFacts(PATCH), eli5: { text: 'Plain.' } }
   assert.deepEqual(mustMentionFor(e).slice(0, 2), ['1.0.5', 'FREEBUFF_LIMITED_OFFER_MAX_SESSIONS'])
   const golden = { verified: true, audience: 'end-users', significance: 'notable', mustMention: ['1.0.5', 'FREEBUFF_LIMITED_OFFER_MAX_SESSIONS'] }
-  const good = scoreRow(e, { title: 'Cap raised to 500 in 1.0.5', summary: 'FREEBUFF_LIMITED_OFFER_MAX_SESSIONS moves from 300 to 500 because the trial filled.', evidence: 'a.ts', audience: 'end-users', significance: 'notable' }, golden)
+  const good = scoreRow(e, { title: 'Cap raised to 500 in 1.0.5', summary: 'FREEBUFF_LIMITED_OFFER_MAX_SESSIONS moves from 300 to 500 because the trial filled.', evidence: 'src/a.ts', audience: 'end-users', significance: 'notable' }, golden)
   assert.equal(good.grounded, true)
   assert.equal(good.pathGrounded, true)
   assert.equal(good.why, true)
   assert.equal(good.mustMention, 1)
   assert.equal(good.audienceAgree, true)
   assert.equal(good.structuredCited, true)
+  const noEv = scoreRow(e, { title: 'T', summary: 'S.' }, golden)
+  assert.equal(noEv.pathGrounded, null, 'a row citing no paths skipped the check, it did not pass it')
   const bad = scoreRow(e, { title: 'x', summary: 'This makes Freebuff smarter.', evidence: 'web/src/other.tsx', audience: 'advertisers', significance: 'minor', ungrounded: ['zz'] }, golden)
   assert.equal(bad.grounded, false)
   assert.equal(bad.pathGrounded, false)
@@ -252,6 +254,8 @@ test('eval: why detection, must-mention, row scoring, aggregation, judge validat
   assert.equal(agg.grounded, 0.5)
   assert.equal(agg.whyRate, 0.5)
   assert.equal(agg.mustMention, 0.5)
+  assert.equal(agg.counts.grounded, 2)
+  assert.equal(agg.counts.pathGrounded, 2, 'the null row is out of the denominator, not counted as a pass')
   assert.deepEqual(validateJudgeOut({ faithfulness: 5, completeness: '4', clarity: 3.6, issues: ['x'] }), { faithfulness: 5, completeness: 4, clarity: 4, issues: ['x'] })
   assert.throws(() => validateJudgeOut({ faithfulness: 9 }), /missing scores/)
   const report = { promptV: PROMPT_V, model: 'm', golden: { total: 2, verified: 1, evaluated: 2, failed: 0 }, metrics: agg, rows: [good, bad], previous: { promptV: PROMPT_V - 1, at: 'then', metrics: { ...agg, grounded: 1 } } }

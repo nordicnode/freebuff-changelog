@@ -15,14 +15,28 @@
 // CONSTANT_CASE names, versions and --flags, plus ELI5 grounding),
 // temperature 0, PR file-match stop-list + relevance gate, and [caution]
 // marking for unverified release-window members.
-export const PROMPT_V = 10
+// v11: audit hardening. Placeholder GOOD example (the old one demonstrated
+// the exact runtime-consequence extrapolation its own rules forbid); open
+// significance schema (the embedded default made the model echo it, so the
+// field judged nothing); chunk prompts carry the lexicon and structured
+// facts, the fuse carries a per-file diff digest; the grounding corpus now
+// includes the same-day sequence and lineage text it showed the model and
+// excludes [caution] release lines it told the model to distrust; matching
+// is word-bounded, camel/Pascal prose names and bare numbers are checked,
+// and an ungrounded row can no longer self-rate confidence high; structured
+// facts re-extract from the full stored diff and env vars/flags/test titles
+// already present at the base rev are pruned (moved code is not new input);
+// rows carrying ungrounded names never enter a release roll-up window.
+export const PROMPT_V = 11
 
 // v7: commit nature always supplied, audience handed over, no "you (the
 // person...)" asides, template lines for test-only and docs-only rows.
 export const ELI5_V = 7
 
 // v8: the roll-up ask gained the anti-marketing rules the per-commit pass has.
-export const RELEASE_ROLLUP_V = 8
+// v9: ungrounded members are dropped from the window entirely instead of
+// traveling as [caution] text (their names still entered the ground corpus).
+export const RELEASE_ROLLUP_V = 9
 
 export function cacheKeyVersion (key) {
   const m = /:(eli5:)?v(\d+):/.exec(String(key))

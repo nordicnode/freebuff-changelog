@@ -880,7 +880,7 @@ export async function analyzeSyncCommit (repoDir, commit, prevSha, repoMeta) {
       if (cc.added.length || cc.removed.length) cmdChanges = cc
     }
     facts.push(...extractCommentFacts(patch))
-    const structured = extractStructuredFacts(patch)
+    const structured = await pruneKnownInputs(repoDir, prevSha, extractStructuredFacts(patch))
     if (hasStructuredFacts(structured)) entryStructured = structured
   }
 
@@ -1022,8 +1022,10 @@ export function extractCommentFacts (patch) {
 export const STRUCTURED_LIMITS = { constants: 12, envVars: 12, flags: 12, exportsAdded: 16, exportsRemoved: 16, testNames: 14 }
 
 const CONST_LINE_RE = /^([+-])\s*(?:export\s+)?(?:const|let|var)\s+([A-Z][A-Z0-9_]{2,})(?:\s*:\s*[^=]+)?\s*=\s*(.+?)\s*;?\s*$/
-const ENV_RE = /process\.env\.([A-Z][A-Z0-9_]{2,})|env\(['"`]([A-Z][A-Z0-9_]{2,})['"`]\)|\benv\.([A-Z][A-Z0-9_]{3,})\b/g
-const FLAG_RE = /['"`](--[a-z][a-z0-9-]{1,40})(?:[=\s<\[][^'"`]*)?['"`]/g
+const ENV_RE = /process\.env\.([A-Z][A-Z0-9_]{2,})|env\(['"`]([A-Z][A-Z0-9_]{2,})['"`]\)|\benv\.([A-Z][A-Z0-9_]{2,})\b/g
+// Only the opening quote is required: template literals and `--flag=...`
+// values never close with a quote adjacent to the flag name.
+const FLAG_RE = /['"`](--[a-z][a-z0-9-]{1,40})\b/g
 const EXPORT_RE = /^([+-])\s*export\s+(?:default\s+)?(?:async\s+)?(?:function\*?|const|let|var|class|type|interface|enum)\s+([A-Za-z_$][\w$]*)/
 const TEST_NAME_RE = /^\+\s*(?:it|test|describe)(?:\.(?:only|skip|each\([^)]*\)))?\s*\(\s*(['"`])((?:(?!\1).){8,140})\1/
 
@@ -1106,6 +1108,37 @@ export function extractStructuredFacts (patch) {
 
 export function hasStructuredFacts (s) {
   return !!s && Object.values(s).some(v => Array.isArray(v) && v.length)
+}
+
+// "Newly read" and "newly introduced" are diff-local claims: the before side
+// of a patch only shows the hunks that moved, so an env var already read in
+// forty untouched places looks brand new when its call site is relocated, and
+// a renamed test title was always there in the file's older copy. Checking
+// each candidate against the base tree settles it; `git grep` exits non-zero
+// when the name is genuinely absent, and allowFail turns that (or a broken
+// rev) into "not found", so a failed lookup keeps the claim rather than
+// silently dropping a real fact. Bounded checks keep one enrich pass cheap.
+export async function pruneKnownInputs (repoDir, base, structured, { maxChecks = 24 } = {}) {
+  if (!repoDir || !base || !hasStructuredFacts(structured)) return structured
+  let checks = maxChecks
+  const knownAt = async (needle) => {
+    if (checks-- <= 0) return false
+    // `-e` names the pattern explicitly: a flag like `--old-flag` would
+    // otherwise be parsed as another git option instead of the search term.
+    const hit = await git(['grep', '-l', '-F', '-e', needle, base, '--'], repoDir, { allowFail: true })
+    return hit != null && hit.trim() !== ''
+  }
+  const prune = async (list) => {
+    const keep = []
+    for (const item of list) if (!(await knownAt(item))) keep.push(item)
+    return keep
+  }
+  return {
+    ...structured,
+    envVars: await prune(structured.envVars || []),
+    flags: await prune(structured.flags || []),
+    testNames: await prune(structured.testNames || [])
+  }
 }
 
 // Prompt lines. Each list is labelled with what the model may conclude from it.

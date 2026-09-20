@@ -2,35 +2,45 @@
 //
 // Every prompt change so far was judged by eye. This makes it measurable:
 //   1. `eval --seed N` writes data/eval/golden.json from recent major/notable
-//      rows. Labels (audience, significance, must-mention identifiers, a
-//      one-line reference summary) start as the current AI output and are
-//      marked `verified: false` until a human checks them.
+//      rows. Audience, significance and the must-mention identifiers start as
+//      the current mechanical/AI values; the reference summary is left EMPTY
+//      on purpose: a reference seeded from the AI output being graded would
+//      score imitation, not accuracy. Rows stay `verified: false` until a
+//      human writes the reference and confirms the labels.
 //   2. `eval` re-summarizes every golden row on the current prompt into a
 //      scratch cache (never data/ai-summaries.json), scores the output, and
 //      writes data/eval/results/<PROMPT_V>-<stamp>.json.
 //   3. The report compares the run with the previous one, so a regression in
 //      grounding rate, WHY rate or hype shows up as a number, not a feeling.
 //
-// Metrics (all 0..1 unless noted):
-//   grounded        share of rows with no unverified identifier
+// Metrics (all 0..1 unless noted, each with the count of rows it actually
+// scored - a metric measured on 1 row of 40 must not read like a trend):
+//   grounded        share of rows with no unverified identifier (as recorded
+//                   by the pipeline's own checker; the judge axis below is the
+//                   independent measure)
 //   pathGrounded    share of rows whose evidence names only listed files
+//                   (rows citing no path are not counted)
 //   whyRate         share of summaries with a visible cause clause
-//   hypeFree        share of rows whose summary and ELI5 carry no hype word
+//   hypeFree        share of this run's titles and summaries free of hype
+//                   words (the stored ELI5 belongs to another pass and
+//                   version, so it is no longer scored here)
 //   audienceAgree   share matching the golden audience (verified rows only)
 //   sigAgree        share matching the golden significance (verified rows only)
 //   mustMention     share of golden "must mention" identifiers present
+//                   (coverage only: it never rewards naming the wrong things)
 //   titleLenOk      share of titles <= 70 chars
 //   structuredUsed  share of rows with structured facts that cite at least one
-//   judge (1..5)    optional LLM-as-judge rubric: faithfulness, completeness, clarity
+//   judge (1..5)    LLM-as-judge rubric, on by default: faithfulness,
+//                   completeness, clarity (--no-judge opts out)
 import { mkdir, readdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { readJson, writeJson, log, pool } from './util.mjs'
 import {
   summarizeEntry, gatherEntryContext, findPrMeta, loadPrIndex, groupEntriesByDay, sequenceForEntry,
-  getReleaseContextFor, bumpOnly, callLlm, cleanText, ELI5_HYPE_ROLLUP_RE, WHY_RE,
+  getReleaseContextFor, bumpOnly, callLlm, cleanText, budgetPatch, ELI5_HYPE_ROLLUP_RE, WHY_RE,
   PROMPT_V, RELEASE_ROLLUP_V, formatGlossary, loadGlossary, structuredFactsCited
 } from './llm.mjs'
-import { hasStructuredFacts } from './analyze.mjs'
+import { hasStructuredFacts, formatStructuredFacts } from './analyze.mjs'
 
 export { WHY_RE }
 
@@ -72,7 +82,10 @@ export async function seedGolden (entries, dataDir, { count = 40 } = {}) {
     day: e.day,
     category: e.category,
     verified: false,
-    reference: { title: e.ai.title, summary: e.ai.summary },
+    // The AI title carries over as a review aid, but the reference summary
+    // starts empty: grading a new summary against the old AI output of the
+    // same pipeline measures imitation. A human writes it before verifying.
+    reference: { title: e.ai.title, summary: '' },
     audience: e.ai.audience || null,
     significance: e.ai.significance || e.significance,
     mustMention: mustMentionFor(e),
@@ -88,10 +101,14 @@ export function scoreRow (e, record, golden, corpusText = '') {
   const text = `${record.title || ''} ${summary} ${record.evidence || ''}`
   const files = [...(e.files?.added || []), ...(e.files?.modified || []), ...(e.files?.removed || []), ...(e.files?.tests || [])]
   const evidencePaths = [...(record.evidence || '').matchAll(/(?:[\w.-]+\/)+[\w.-]+\.(?:tsx?|jsx?|mjs|json|md|ya?ml)/g)].map(m => m[0])
-  const pathGrounded = evidencePaths.every(p => files.some(f => f.endsWith(p) || p.endsWith(f)))
+  // A row that cites no path has not passed this check, it skipped it: null
+  // keeps it out of the rate instead of inflating it with vacuous truth.
+  const pathGrounded = evidencePaths.length ? evidencePaths.every(p => files.some(f => f.endsWith(p) || p.endsWith(f))) : null
   const must = golden?.mustMention || []
   const mentioned = must.filter(m => text.includes(m)).length
-  const hype = ELI5_HYPE_ROLLUP_RE.test(summary) || ELI5_HYPE_ROLLUP_RE.test(e.eli5?.text || '')
+  // Score what this run wrote. The stored ELI5 belongs to another prompt
+  // version and another pass; grading it here mixed two pipelines' records.
+  const hype = ELI5_HYPE_ROLLUP_RE.test(record.title || '') || ELI5_HYPE_ROLLUP_RE.test(summary)
   const structuredCited = hasStructuredFacts(e.structured) ? structuredFactsCited(e.structured, text) : null
   return {
     sha: e.sha,
@@ -119,10 +136,12 @@ export function buildJudgePrompt (e, patch, record, golden) {
     'faithfulness: every claim is supported by the diff, file list and notes (5 = fully; 1 = invented claims).',
     'completeness: the summary covers the substantive changes in the diff (5 = nothing important missing).',
     'clarity: a developer reading only the title and summary understands what changed and why it matters.',
+    'Judge precision, not polish: a summary that names many things but states one wrong number, direction, or motive is unfaithful; a summary that states only the file names is incomplete.',
     'Output JSON: {"faithfulness": n, "completeness": n, "clarity": n, "issues": ["<short>"]}.',
     '',
     `Files: ${[...(e.files?.added || []), ...(e.files?.modified || []), ...(e.files?.removed || [])].join(', ')}`,
     golden?.verified && golden.reference?.summary ? `Human reference summary: ${golden.reference.summary}` : '',
+    ...(hasStructuredFacts(e.structured) ? formatStructuredFacts(e.structured) : []),
     '',
     `Title: ${record.title}`,
     `Summary: ${record.summary}`,
@@ -130,7 +149,10 @@ export function buildJudgePrompt (e, patch, record, golden) {
     '',
     'Diff:',
     '```diff',
-    String(patch || '').slice(0, 80000),
+    // The same prioritized budget the summarizer got: a flat head-slice cut
+    // everything after the first files, so on big diffs the judge was grading
+    // an entry against less of the change than the entry itself saw.
+    budgetPatch(patch, 250000, 60000),
     '```'
   ].filter(Boolean).join('\n')
 }
@@ -151,6 +173,11 @@ function rate (xs) {
   const v = xs.filter(x => typeof x === 'boolean')
   return v.length ? v.filter(Boolean).length / v.length : null
 }
+// Denominators: rate() and mean() skip the rows they cannot score, so a bare
+// average hides how few rows it rests on. Report it: must-mention measured on
+// one row of forty is not a trend.
+const boolN = (xs) => xs.filter(x => typeof x === 'boolean').length
+const numN = (xs) => xs.filter(x => typeof x === 'number' && Number.isFinite(x)).length
 
 export function aggregate (rows) {
   return {
@@ -171,11 +198,26 @@ export function aggregate (rows) {
       faithfulness: mean(rows.map(r => r.judge?.faithfulness)),
       completeness: mean(rows.map(r => r.judge?.completeness)),
       clarity: mean(rows.map(r => r.judge?.clarity))
+    },
+    counts: {
+      grounded: boolN(rows.map(r => r.grounded)),
+      pathGrounded: boolN(rows.map(r => r.pathGrounded)),
+      whyRate: boolN(rows.map(r => r.why)),
+      hypeFree: boolN(rows.map(r => r.hypeFree)),
+      titleLenOk: boolN(rows.map(r => r.titleLenOk)),
+      audienceAgree: boolN(rows.map(r => r.audienceAgree)),
+      sigAgree: boolN(rows.map(r => r.sigAgree)),
+      mustMention: numN(rows.map(r => r.mustMention)),
+      structuredUsed: boolN(rows.map(r => r.structuredCited)),
+      withEvidence: boolN(rows.map(r => r.hasEvidence)),
+      withUnknowns: boolN(rows.map(r => r.hasUnknowns)),
+      lowConfidence: rows.filter(r => r.confidence).length,
+      judge: numN(rows.map(r => r.judge?.faithfulness))
     }
   }
 }
 
-export async function runEval (entries, dataDir, env, { repoDir = null, getPatch, getFullPatch = null, limit = 0, judge = false, concurrency = 3 } = {}) {
+export async function runEval (entries, dataDir, env, { repoDir = null, getPatch, getFullPatch = null, limit = 0, judge = true, concurrency = 3 } = {}) {
   const golden = await readJson(`${dataDir}/eval/golden.json`, null)
   if (!golden?.rows?.length) throw new Error('data/eval/golden.json missing or empty: run `eval --seed 40` first')
   const bySha = new Map(entries.map(e => [e.sha, e]))
@@ -248,33 +290,37 @@ const num = (v) => (v == null ? '  -' : v.toFixed(2))
 
 export function formatEvalReport (r) {
   const p = r.previous?.metrics
-  const line = (label, cur, prev, fmt = pct) => {
+  const c = r.metrics.counts || {}
+  // n= shows only when a metric scored fewer rows than the run: a rate over
+  // 1 of 40 rows reads exactly like a rate over 40 unless you say otherwise.
+  const line = (label, cur, prev, fmt = pct, n = null) => {
     const d = cur != null && prev != null ? cur - prev : null
     const delta = d == null ? '' : `  (${d >= 0 ? '+' : ''}${fmt === pct ? `${Math.round(d * 100)}pt` : d.toFixed(2)})`
-    return `  ${label.padEnd(20)} ${fmt(cur)}${p ? `   prev ${fmt(prev)}${delta}` : ''}`
+    const part = n != null && n !== r.metrics.n ? `  n=${n}` : ''
+    return `  ${label.padEnd(20)} ${fmt(cur)}${p ? `   prev ${fmt(prev)}${delta}` : ''}${part}`
   }
   const m = r.metrics
   const out = [
     `[eval] prompt v${r.promptV} · model ${r.model}${r.modelMajor ? ` (+${r.modelMajor} for heavy rows)` : ''} · ${r.golden.evaluated}/${r.golden.total} rows (${r.golden.verified} human-verified, ${r.golden.failed} failed)`,
     r.previous ? `       compared with prompt v${r.previous.promptV} run at ${r.previous.at}` : '       no previous run to compare with',
-    line('grounded', m.grounded, p?.grounded),
-    line('path grounded', m.pathGrounded, p?.pathGrounded),
-    line('why visible', m.whyRate, p?.whyRate),
-    line('hype free', m.hypeFree, p?.hypeFree),
-    line('title <= 70', m.titleLenOk, p?.titleLenOk),
-    line('with evidence', m.withEvidence, p?.withEvidence),
-    line('with unknowns', m.withUnknowns, p?.withUnknowns),
-    line('low confidence', m.lowConfidence, p?.lowConfidence),
-    line('structured cited', m.structuredUsed, p?.structuredUsed),
-    line('must-mention', m.mustMention, p?.mustMention),
-    line('audience agree*', m.audienceAgree, p?.audienceAgree),
-    line('significance agree*', m.sigAgree, p?.sigAgree)
+    line('grounded', m.grounded, p?.grounded, pct, c.grounded),
+    line('path grounded', m.pathGrounded, p?.pathGrounded, pct, c.pathGrounded),
+    line('why visible', m.whyRate, p?.whyRate, pct, c.whyRate),
+    line('hype free', m.hypeFree, p?.hypeFree, pct, c.hypeFree),
+    line('title <= 70', m.titleLenOk, p?.titleLenOk, pct, c.titleLenOk),
+    line('with evidence', m.withEvidence, p?.withEvidence, pct, c.withEvidence),
+    line('with unknowns', m.withUnknowns, p?.withUnknowns, pct, c.withUnknowns),
+    line('low confidence', m.lowConfidence, p?.lowConfidence, pct, c.lowConfidence),
+    line('structured cited', m.structuredUsed, p?.structuredUsed, pct, c.structuredUsed),
+    line('must-mention', m.mustMention, p?.mustMention, pct, c.mustMention),
+    line('audience agree*', m.audienceAgree, p?.audienceAgree, pct, c.audienceAgree),
+    line('significance agree*', m.sigAgree, p?.sigAgree, pct, c.sigAgree)
   ]
   if (m.judge.faithfulness != null) {
-    out.push(line('judge faithfulness', m.judge.faithfulness, p?.judge?.faithfulness, num), line('judge completeness', m.judge.completeness, p?.judge?.completeness, num), line('judge clarity', m.judge.clarity, p?.judge?.clarity, num))
+    out.push(line('judge faithfulness', m.judge.faithfulness, p?.judge?.faithfulness, num, c.judge), line('judge completeness', m.judge.completeness, p?.judge?.completeness, num, c.judge), line('judge clarity', m.judge.clarity, p?.judge?.clarity, num, c.judge))
   }
   out.push('  * verified golden rows only')
-  const bad = r.rows.filter(x => !x.failed && (!x.grounded || !x.hypeFree || !x.pathGrounded)).slice(0, 10)
+  const bad = r.rows.filter(x => !x.failed && (!x.grounded || !x.hypeFree || x.pathGrounded === false)).slice(0, 10)
   if (bad.length) {
     out.push('  rows to look at:')
     for (const x of bad) out.push(`    ${x.sha.slice(0, 8)}${x.ungrounded?.length ? ` ungrounded: ${x.ungrounded.slice(0, 3).join(', ')}` : ''}${!x.pathGrounded ? ' evidence names an unlisted path' : ''}${!x.hypeFree ? ' hype' : ''}`)

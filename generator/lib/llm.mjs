@@ -42,6 +42,7 @@ import {
   hasStructuredFacts,
   formatStructuredFacts,
   structuredFactsText,
+  pruneKnownInputs,
   prioritizeDiffParts,
   securityHint
 } from './analyze.mjs'
@@ -325,14 +326,16 @@ export function buildPrompt (entry, patch, ctx = {}) {
     '- Audience Precision: Distinguish strictly between end-user developers (CLI/Web assistant users), advertisers/sponsors (ad campaigns & placements), and internal maintainers. Never attribute advertiser settings or internal tooling to regular users.',
     '',
     'Output format: First, identify and cite the concrete evidence in the diff (function name, file, or hunk) in "evidence", then produce title and summary.',
-    `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, flag, or diff hunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "${entry.significance || 'minor'}", "audience": "<one of: ${AUDIENCES.join(' | ')}>", "userVisible": <true if a user of the CLI, web app, desktop app or SDK can observe the change without reading code, else false>, "breaking": <true only if existing behavior, config, an API or a command stops working as before>, "migration": "<what a user or operator must do because of this change, or null>", "newEnvVars": [<environment variables introduced, verbatim, or empty>], "newFlags": [<CLI flags introduced, verbatim with leading dashes, or empty>], "confidence": "<high | medium | low: how well the diff and notes support the summary>", "unknowns": "<one sentence naming what the diff does not show (the motive, the consumer of a new constant, the rollout), or null>"${multi ? ', "changes": [{"area": "<package or surface>", "what": "<one sentence>", "files": [<paths from the file list>]}]' : ''}}.`,
+    `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, flag, or diff hunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "<major | notable | minor>", "audience": "<one of: ${AUDIENCES.join(' | ')}>", "userVisible": <true if a user of the CLI, web app, desktop app or SDK can observe the change without reading code, else false>, "breaking": <true only if existing behavior, config, an API or a command stops working as before>, "migration": "<what a user or operator must do because of this change, or null>", "newEnvVars": [<environment variables introduced, verbatim, or empty>], "newFlags": [<CLI flags introduced, verbatim with leading dashes, or empty>], "confidence": "<high | medium | low: how well the diff and notes support the summary>", "unknowns": "<one sentence naming what the diff does not show (the motive, the consumer of a new constant, the rollout), or null>"${multi ? ', "changes": [{"area": "<package or surface>", "what": "<one sentence>", "files": [<paths from the file list>]}]' : ''}}.`,
     multi ? `This snapshot spans several areas or ${MULTI_TOPIC_MIN_FILES}+ files: it is several changes. Fill "changes" with one item per distinct change (2-6 items), each grounded in the files it names; the prose summary then leads with the most user-relevant one and says how many others there are.` : '',
     'Fields: "migration" and "unknowns" are null when there is nothing honest to say; never fill them with reassurance. "confidence" is low when the diff is truncated, the change is mostly configuration whose consumer is not visible, or the motive is guessed.',
-    `Significance (deterministic default "${entry.significance || 'minor'}"): keep it unless the diff clearly contradicts it.`,
+    `Significance: judge it from the diff against the scale below. The deterministic default "${entry.significance || 'minor'}" is only a file-shape heuristic, not the answer; change it whenever the diff plainly implies a different tier.`,
     'major = new feature, model added/removed, security, breaking. notable = user-visible behavior/UI change, new file, API change. minor = internal, refactor, types, comments, deps.',
     `Audience: who this change is for. ${AUDIENCES.map(a => `${a} = ${AUDIENCE_DESC[a]}`).join('; ')}. Pick the narrowest group whose experience or configuration actually changes; a constant nobody reads yet, a test, or a refactor is maintainers.`,
     '',
-    'GOOD (technical, precise, no boilerplate): "Muse Spark 1.2 replaces 1.3 in the free model picker after 1.3 began returning upstream 404 model_not_found errors. Saved 1.2 preferences migrate to 1.3 on load; existing live sessions keep running. Covers Web, CLI, and Desktop via FREEBUFF_MODELS plus README tables; 1.2 keeps its fast all-round row."',
+    'GOOD (technical, precise, no boilerplate) examples. Angle-bracket spans stand for values copied verbatim from THIS diff and notes: never emit a span literally and never reuse any name from these examples, only the pattern:',
+    '- "<Model X> replaces <Model Y> in the free model picker, per the comment beside <Model Y>\'s removal that cites its upstream deprecation." WHAT + mechanism, plus a WHY quoted from the diff.',
+    '- "`<flag-or-const>` in `<package path>` now gates `<behavior>`; it defaults to `<literal value>` and nothing reads it outside `<file>` yet." One concrete DETAIL, every name from the file list, no invented runtime or session consequences.',
     '',
     `Date: ${entry.date}`,
     `Category: ${entry.category || (entry.areas || []).join(', ')}`,
@@ -446,14 +449,58 @@ export function buildPrompt (entry, patch, ctx = {}) {
   return lines.filter(Boolean).join('\n')
 }
 
+// A per-file digest of the whole diff: line counts plus a few representative
+// added lines per file. The fuse step must not re-read the diff (that is what
+// chunking avoided), but with nothing but the drafts it can only redistribute
+// the chunks' possible misreadings. The digest gives it the shape of every
+// file so it can spot a draft that missed a whole file and check a draft that
+// overstates one, at a fraction of the diff's bytes.
+export function buildDiffDigest (patch, { maxBytes = 12000, sampleLines = 4 } = {}) {
+  const files = splitPatchByFile(patch)
+  const rows = []
+  let used = 0
+  for (const f of files) {
+    let adds = 0
+    let dels = 0
+    const sample = []
+    for (const line of f.text.split('\n')) {
+      if (line.startsWith('+++') || line.startsWith('---')) continue
+      if (line[0] === '+') {
+        adds++
+        const t = line.slice(1).trim()
+        if (sample.length < sampleLines && t.length >= 12 && !/^import\b/.test(t)) sample.push(t.slice(0, 120))
+      } else if (line[0] === '-') dels++
+    }
+    const row = `- ${f.path} (+${adds}/-${dels})${sample.length ? ` | added lines include: ${sample.join(' ; ')}` : ''}`
+    if (used + row.length > maxBytes) {
+      rows.push(`- ...digest truncated; ${files.length - rows.length} more files in the diff...`)
+      break
+    }
+    used += row.length
+    rows.push(row)
+  }
+  return rows.join('\n')
+}
+
 // One map step: summarize a single chunk of a large diff. Shape-checked only,
 // never identifier-grounded against the chunk: a cross-file rename ("moved X
 // from a.ts to b.ts") names files that live in other chunks, so grounding
-// happens once at the fuse step against the full diff.
-export function buildChunkPrompt (entry, chunkPatch, { index = 0, total = 1, files = [] } = {}) {
+// happens once at the fuse step against the full diff. The lexicon and the
+// structured facts do ride along though: a chunk reader that cannot tell an
+// advertiser constant from a developer quota mislabels the audience, and the
+// fuse cannot re-verify prose that was wrong on arrival.
+export function buildChunkPrompt (entry, chunkPatch, { index = 0, total = 1, files = [], structured = null } = {}) {
   return [
     `You summarize part ${index + 1} of ${total} of a large Freebuff commit diff for Freebuff, a free AI coding agent. Your reader is a TECHNICAL user.`,
     'Rules: use ONLY facts from the diff chunk below. Never invent file names, features, or versions.',
+    'Every identifier, path, flag or command you place in backticks must appear verbatim in the chunk or the lists below.',
+    '',
+    FREEBUFF_ARCHITECTURE_MAP,
+    '',
+    FREEBUFF_DOMAIN_LEXICON,
+    '',
+    ...(hasStructuredFacts(structured) ? formatStructuredFacts(structured) : []),
+    '',
     'Output a JSON object: {"evidence": "<1 sentence citing the exact file, function, or hunk in THIS chunk>", "summary": "<2-3 sentences: what this chunk changes and the mechanism>", "changes": [{"area": "<package or surface>", "what": "<one sentence>", "files": [<paths from the chunk file list>]}]}.',
     `Chunk files: ${files.join(', ') || '-'}`,
     `Commit: ${(entry.sha || '').slice(0, 8)} ${(entry.summary || entry.title || '').slice(0, 200)}`,
@@ -483,7 +530,7 @@ export function validateChunkOut (out) {
 // The reduce step: write the entry from untrusted chunk drafts. Every name the
 // fuse emits must appear in the file list, facts, catalog notes or the drafts
 // themselves; the drafts point at what matters but may misname it.
-export function buildFusePrompt (entry, drafts, ctx = {}) {
+export function buildFusePrompt (entry, drafts, ctx = {}, digest = '') {
   const lines = [
     'You write changelog entries for Freebuff, a free AI coding agent. Your reader is a TECHNICAL user: a developer who uses Freebuff daily and reads diffs.',
     'This commit was too large for one read, so per-chunk drafts below describe each part. The drafts are UNTRUSTED working notes: they point at what matters but may overstate, misname, or duplicate. Ground every claim in the file list, facts, and catalog notes below; every identifier, path, flag or command you place in backticks must appear verbatim in those lists or the drafts. Never invent file names, features, or versions.',
@@ -499,10 +546,10 @@ export function buildFusePrompt (entry, drafts, ctx = {}) {
     FREEBUFF_DOMAIN_LEXICON,
     '',
     'Output format: First, identify and cite the concrete evidence (file, function, or chunk) in "evidence", then produce title and summary.',
-    `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, or chunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "${entry.significance || 'minor'}", "audience": "<one of: ${AUDIENCES.join(' | ')}>", "userVisible": <true if a user of the CLI, web app, desktop app or SDK can observe the change without reading code, else false>, "breaking": <true only if existing behavior, config, an API or a command stops working as before>, "migration": "<what a user or operator must do because of this change, or null>", "newEnvVars": [<environment variables introduced, verbatim, or empty>], "newFlags": [<CLI flags introduced, verbatim with leading dashes, or empty>], "confidence": "<high | medium | low: how well the drafts and notes support the summary>", "unknowns": "<one sentence naming what the drafts do not show (the motive, the consumer of a new constant, the rollout), or null>", "changes": [{"area": "<package or surface>", "what": "<one sentence>", "files": [<paths from the file list>]}]}.`,
+    `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, or chunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "<major | notable | minor>", "audience": "<one of: ${AUDIENCES.join(' | ')}>", "userVisible": <true if a user of the CLI, web app, desktop app or SDK can observe the change without reading code, else false>, "breaking": <true only if existing behavior, config, an API or a command stops working as before>, "migration": "<what a user or operator must do because of this change, or null>", "newEnvVars": [<environment variables introduced, verbatim, or empty>], "newFlags": [<CLI flags introduced, verbatim with leading dashes, or empty>], "confidence": "<high | medium | low: how well the drafts and notes support the summary>", "unknowns": "<one sentence naming what the drafts do not show (the motive, the consumer of a new constant, the rollout), or null>", "changes": [{"area": "<package or surface>", "what": "<one sentence>", "files": [<paths from the file list>]}]}.`,
     'A chunked commit is several changes: fill "changes" with one item per distinct change (2-6 items), each grounded in the files it names; the prose summary then leads with the most user-relevant one and says how many others there are.',
     'Fields: "migration" and "unknowns" are null when there is nothing honest to say; never fill them with reassurance. "confidence" is low when the drafts disagree, the change is mostly configuration whose consumer is not visible, or the motive is guessed.',
-    `Significance (deterministic default "${entry.significance || 'minor'}"): keep it unless the drafts clearly contradict it.`,
+    `Significance: judge it from the drafts and the digest against the scale below. The deterministic default "${entry.significance || 'minor'}" is only a file-shape heuristic, not the answer; change it whenever the material plainly implies a different tier.`,
     'major = new feature, model added/removed, security, breaking. notable = user-visible behavior/UI change, new file, API change. minor = internal, refactor, types, comments, deps.',
     `Audience: who this change is for. ${AUDIENCES.map(a => `${a} = ${AUDIENCE_DESC[a]}`).join('; ')}. Pick the narrowest group whose experience or configuration actually changes; a constant nobody reads yet, a test, or a refactor is maintainers.`,
     '',
@@ -548,6 +595,10 @@ export function buildFusePrompt (entry, drafts, ctx = {}) {
     if (d.evidence) lines.push(`Evidence: ${d.evidence}`)
     lines.push(`Summary: ${d.summary}`)
     for (const c of d.changes || []) lines.push(`- Change [${c.area || '?'}]: ${c.what}`)
+  }
+  if (digest) {
+    lines.push('', 'File-level digest of the whole diff (line counts and a few added lines per file). Use it to check the drafts: a file with real additions that no draft mentions is a missing "changes" item, a draft that overstates what its file adds gets trimmed back to the digest, and where drafts disagree the digest decides. Describe what a line shows; do not quote digest lines as prose.')
+    lines.push(digest)
   }
   return lines.filter(Boolean).join('\n')
 }
@@ -756,8 +807,10 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
   } catch (err) {
     if (attempt > 2) throw err
     log(`LLM response body contained no valid message: requesting repair ${attempt}/2`)
-    const fixed = await callLlm(`${prompt}\n\nPrevious response was empty or malformed: ${rawText.slice(0, 300)}\nReply with ONLY the JSON object.`, env, attempt + 1, validate)
-    return validate(fixed)
+    // The recursive call already validates its own output; re-validating the
+    // validated result here would consume a second vote from stateful
+    // validators (summaryValidator's strict-then-flag allowance) for nothing.
+    return callLlm(`${prompt}\n\nPrevious response was empty or malformed: ${rawText.slice(0, 300)}\nReply with ONLY the JSON object.`, env, attempt + 1, validate)
   }
   try {
     const parsed = parseLlmJson(text)
@@ -768,8 +821,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     // boilerplate failure is not a JSON problem, and a model told "invalid JSON"
     // will not fix a misspelled identifier.
     log(`LLM output invalid (${err.message}): requesting repair ${attempt}/2`)
-    const fixed = await callLlm(`${prompt}\n\nPrevious output was rejected: ${String(err.message).slice(0, 400)}\nPrevious output: ${String(text).slice(0, 500)}\nFix exactly that problem without new analysis. Reply with ONLY the corrected JSON object.`, env, attempt + 1, validate)
-    return validate(fixed)
+    return callLlm(`${prompt}\n\nPrevious output was rejected: ${String(err.message).slice(0, 400)}\nPrevious output: ${String(text).slice(0, 500)}\nFix exactly that problem without new analysis. Reply with ONLY the corrected JSON object.`, env, attempt + 1, validate)
   }
 }
 
@@ -821,8 +873,18 @@ export function groundingCorpus (entry, patch, ctx = {}) {
   for (const d of ctx.subsystemDocs || []) parts.push(d.path, d.content)
   for (const o of ctx.exportOutlines || []) parts.push(o.path, o.outline)
   for (const s of ctx.fullFiles || []) parts.push(s.path, s.content)
-  for (const h of ctx.fileHistory || []) parts.push(...(h.overlap || []))
-  if (ctx.releaseCtx) parts.push(ctx.releaseCtx)
+  for (const h of ctx.fileHistory || []) parts.push(...(h.overlap || []), h.title || '', h.summary || '')
+  // Whatever the prompt shows must be checkable: the sequence and lineage
+  // blocks are in the prompt (the model is told to ground itself in them), so
+  // a name copied faithfully from a sibling's title is not "invented".
+  if (ctx.sequence) {
+    for (const s of [...(ctx.sequence.earlier || []), ...(ctx.sequence.later || [])]) parts.push(s.title || '', s.summary || '')
+  }
+  // The release window enters the corpus minus its [caution] lines: the
+  // prompt instructs the model to hedge or omit those, so waiving their
+  // names would let an earlier ungrounded claim launder itself into the
+  // roll-up through the very text that marked it unverified.
+  if (ctx.releaseCtx) parts.push(String(ctx.releaseCtx).split('\n').filter(l => !/\[caution/.test(l)).join('\n'))
   return parts.filter(Boolean).join('\n')
 }
 
@@ -859,6 +921,13 @@ export function nestedObjectPaths (text) {
   return out
 }
 
+// camelCase/PascalCase names in plain prose are matched case-insensitively as
+// a fallback: a model writing "DeepSeek" from a diff that only carries
+// FREEBUFF_DEEPSEEK_* would otherwise be flagged for a name the commit does
+// contain. Brands and coding terms that English borrows never count as claims.
+const PROSE_NAME_RE = /^(?:[A-Z][a-z0-9]+(?:[A-Z][a-zA-Z0-9]*)+|[a-z]+[A-Z][a-zA-Z0-9]+)$/
+const PROSE_NAME_ALLOW = new Set(['javascript', 'typescript', 'camelcase', 'pascalcase', 'snakecase', 'iphone', 'ipad', 'youtube', 'github', 'gitlab', 'openai', 'chatgpt', 'tiktok', 'instagram', 'facebook', 'whatsapp', 'paypal', 'mysql', 'postgresql', 'mongodb', 'pytorch', 'freebsd'])
+
 // The backticked tokens in a text that the corpus cannot vouch for. A token
 // with spaces (a command line, a quoted phrase) is judged word by word: it is
 // grounded when every word that looks like a name is present. Placeholders
@@ -870,6 +939,15 @@ export function ungroundedIdentifiers (text, corpus) {
   const clean = String(text || '').replace(/```[^`\n]*```/g, ' ').replace(/```/g, ' ')
   let nested = null
   const nestedPaths = () => (nested ??= nestedObjectPaths(hay))
+  // A corpus hit must be a whole token. Plain substring matching let a
+  // truncated prefix of a real name (`CODEBUFF_MO` for `CODEBUFF_MODELS`)
+  // pass as grounded, which is exactly the typo class this check exists for.
+  const corpusHas = (tok) => {
+    if (!tok) return false
+    if (tok.length < 3) return true // short handles are not claims worth a regex
+    if (!hay.includes(tok)) return false
+    return new RegExp(`(?<![\\w.])${tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w])`).test(hay)
+  }
   // A dotted name is grounded by the object literal that nests it. The claim
   // may also add a leading segment a reader can infer (`payload.page.url` for
   // a source that writes `page.url`), but every segment it drops has to be one
@@ -886,7 +964,10 @@ export function ungroundedIdentifiers (text, corpus) {
     if (!raw || GROUNDING_PLACEHOLDER_RE.test(raw)) continue
     if (/^v?\d+(?:\.\d+)*[a-z0-9-]*$/i.test(raw)) continue
     const words = raw.split(/\s+/)
-      .map(w => w.replace(/^[('"[{<]+|[)'"\]}>,.;:]+$/g, '').replace(/\(\)$/, ''))
+      // `foo()` first, then stray edge punctuation: trimming ")" before "("
+      // used to leave "foo(" - a shape no corpus contains - and every
+      // backticked call was reported as invented.
+      .map(w => w.replace(/\(\)$/, '').replace(/^[('"[{<]+|[)'"\]}>,.;:]+$/g, ''))
       // `<publisher>/<id>@<version>` is a placeholder too, just a composite one.
       .filter(w => w.length >= 3 && /[a-z]/i.test(w) && !GROUNDING_PLACEHOLDER_RE.test(w) && !/<[^>]+>/.test(w))
     if (!words.length) continue
@@ -895,9 +976,9 @@ export function ungroundedIdentifiers (text, corpus) {
     const present = (w) => {
       const bare = w.replace(/\/$/, '').replace(/=.*$/, '')
       if (!bare || bare.length < 3) return true
-      if (hay.includes(bare)) return true
+      if (corpusHas(bare)) return true
       const tail = bare.split(/[./]/).filter(Boolean).pop()
-      if (tail && tail.length >= 4 && tail !== bare && hay.includes(tail)) return true
+      if (tail && tail.length >= 4 && tail !== bare && corpusHas(tail)) return true
       return dottedGrounded(bare)
     }
     if (!words.every(present) && !out.includes(raw)) out.push(raw)
@@ -906,9 +987,9 @@ export function ungroundedIdentifiers (text, corpus) {
   // file list does not contain is the most checkable claim there is.
   for (const m of clean.replace(/`[^`\n]*`/g, ' ').matchAll(/(?<![\w/.])((?:[\w.-]+\/)+[\w.-]+\.(?:tsx?|jsx?|mjs|cjs|json|md|ya?ml|py|go|rs|sql|css|sh))(?![\w/])/g)) {
     const p = m[1]
-    if (hay.includes(p)) continue
+    if (corpusHas(p)) continue
     const tail = p.split('/').pop()
-    if (tail && hay.includes(`/${tail}`)) continue
+    if (tail && corpusHas(tail)) continue
     if (!out.includes(p)) out.push(p)
   }
   // Bare identifiers outside backticks: the model is told to use backticks for
@@ -921,17 +1002,58 @@ export function ungroundedIdentifiers (text, corpus) {
   for (const m of prose.matchAll(/\b([A-Z][A-Z0-9]*_[A-Z0-9_]+)\b/g)) {
     const name = m[1]
     if (name.length < 4 || out.includes(name)) continue
-    if (!hay.includes(name)) out.push(name)
+    if (!corpusHas(name)) out.push(name)
   }
   for (const m of prose.matchAll(/(?<![\w.])(v?\d+\.\d+\.\d+(?:-[\w.]+)?)\b/g)) {
     const v = m[1]
     if (out.includes(v)) continue
-    if (!hay.includes(v)) out.push(v)
+    if (!corpusHas(v)) out.push(v)
+  }
+  // Two-segment versions only count when written model-style with a name or
+  // dash in front (`GPT-4.1`); a bare `4.1` in prose is too often a rating,
+  // a ratio, or a piecewise part of a longer number the pass above skipped.
+  for (const m of prose.matchAll(/(?<![\w.])([A-Za-z][-\w]*-v?\d+\.\d+(?:\.\d+)?)(?![\w.])/g)) {
+    const v = m[1]
+    if (out.includes(v)) continue
+    if (!corpusHas(v)) out.push(v)
   }
   for (const m of prose.matchAll(/(?<![\w-])(--?[a-z][\w-]*)/g)) {
     const f = m[1]
     if (f.length < 3 || out.includes(f)) continue
-    if (!hay.includes(f)) out.push(f)
+    if (!corpusHas(f)) out.push(f)
+  }
+  // camelCase/PascalCase names leak into prose too ("the OffPeakEngine now
+  // caps it"): the shape no English word uses. Brands and established proper
+  // nouns are exempted by allowlist, and short forms (iOS, DoS) by length.
+  let hayLower = null
+  const corpusHasName = (tok) => {
+    if (corpusHas(tok)) return true
+    const low = (hayLower ??= hay.toLowerCase())
+    const t = tok.toLowerCase()
+    if (!low.includes(t)) return false
+    return new RegExp(`(?<![a-zA-Z0-9.])${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-zA-Z0-9])`).test(low)
+  }
+  for (const m of prose.matchAll(/\b[A-Za-z]{6,}\b/g)) {
+    const name = m[0]
+    if (!PROSE_NAME_RE.test(name)) continue
+    if (out.includes(name)) continue
+    if (PROSE_NAME_ALLOW.has(name.toLowerCase())) continue
+    if (!corpusHasName(name)) out.push(name)
+  }
+  // Numbers are claims: the pipeline hands the model the literal old -> new
+  // values of every changed constant, and a summary that rounds, swaps, or
+  // invents one is the most checkable error there is. Integers of two digits
+  // or more must appear in the corpus; years are exempt (dates travel freely),
+  // number segments inside versions were checked by the passes above, and
+  // digit separators (`12_500`, `12,500`) in the corpus count as the number.
+  let hayDigits = null
+  const numericHit = (n) => corpusHas(n) ||
+    new RegExp(`(?<![\\w.])${n}(?![\\w])`).test((hayDigits ??= hay.replace(/[,_]/g, '')))
+  for (const m of prose.matchAll(/(?<![\w.])(\d{2,})(?!\w)/g)) {
+    const n = m[1]
+    if (n.length === 4 && +n >= 1900 && +n <= 2100) continue
+    if (out.includes(n)) continue
+    if (!numericHit(n)) out.push(n)
   }
   return out
 }
@@ -1017,7 +1139,7 @@ export function validateLlmOut (out, fallbackSig = 'minor', opts = {}) {
   const newFlags = cleanList(out.newFlags).map(s => s.startsWith('-') ? s : `--${s}`).filter(s => /^--?[a-z][\w-]*$/i.test(s))
   const migration = typeof out.migration === 'string' && out.migration.trim() && !/^(?:none|null|n\/a|no(?:ne)? (?:needed|required)\.?)$/i.test(out.migration.trim()) ? cleanText(out.migration, 400, true) : ''
   const unknowns = typeof out.unknowns === 'string' && out.unknowns.trim() && !/^(?:none|null|n\/a|nothing)\.?$/i.test(out.unknowns.trim()) ? cleanText(out.unknowns, 300, true) : ''
-  const confidence = CONFIDENCES.includes(String(out.confidence || '').toLowerCase()) ? String(out.confidence).toLowerCase() : undefined
+  const rawConfidence = CONFIDENCES.includes(String(out.confidence || '').toLowerCase()) ? String(out.confidence).toLowerCase() : undefined
   const userVisible = typeof out.userVisible === 'boolean' ? out.userVisible : undefined
   const breaking = out.breaking === true
   const changes = Array.isArray(out.changes)
@@ -1036,6 +1158,10 @@ export function validateLlmOut (out, fallbackSig = 'minor', opts = {}) {
   if (ungrounded.length && opts.onUngrounded === 'throw') {
     throw new Error(`LLM output names identifiers not present in the diff or source context: ${ungrounded.slice(0, 6).join(', ')}`)
   }
+  // A row that still ships names the corpus cannot vouch for cannot rate
+  // itself high: that self-report would sit next to its own unverified
+  // badges. One notch down, never up.
+  const confidence = ungrounded.length && rawConfidence === 'high' ? 'medium' : rawConfidence
   return {
     title,
     summary,
@@ -1146,17 +1272,17 @@ function releaseItemText (e, maxSummary = RELEASE_CTX_SUMMARY_CHARS) {
   const head = `${(e?.date || '').slice(0, 10)} ${title}`.trim()
   const tail = summary && summary !== title ? `: ${truncateWords(summary, maxSummary)}` : ''
   const tag = sig && sig !== 'noise' ? ` [${sig}]` : ''
-  // A member whose own summary carries unverified names or a review flag must
-  // not launder them into the roll-up as fact: mark it so the roll-up hedges.
+  // The prose of a row whose grounding check flagged unverified names never
+  // enters a window at all (collectReleaseContext drops it); the only caution
+  // left to carry is the semantic one a second reader raised.
   const cautions = []
-  if (e?.ai?.ungrounded?.length) cautions.push(`unverified identifiers: ${e.ai.ungrounded.slice(0, 3).join(', ')}`)
   if (e?.ai?.verify === 'flagged') cautions.push('review flagged its claims')
   const caution = cautions.length ? ` [caution: ${cautions.join('; ')}]` : ''
   return `${head}${tail}${tag}${caution}`.trim()
 }
 
 export function collectReleaseContext (entries, bump, opts = {}) {
-  const out = { items: [], prevVersion: null, truncated: false, net: { modelsIn: [], modelsOut: [], commandsIn: [], commandsOut: [] } }
+  const out = { items: [], prevVersion: null, truncated: false, dropped: 0, net: { modelsIn: [], modelsOut: [], commandsIn: [], commandsOut: [] } }
   if (!Array.isArray(entries) || !bump) return out
   const maxItems = opts.maxItems ?? RELEASE_CTX_MAX_ITEMS
   const maxChars = opts.maxChars ?? RELEASE_CTX_MAX_CHARS
@@ -1193,6 +1319,12 @@ export function collectReleaseContext (entries, bump, opts = {}) {
       for (const c of adds) if (!rems.includes(c)) events.push({ kind: 'cmd', name: c, dir: 1 })
       for (const c of rems) if (!adds.includes(c)) events.push({ kind: 'cmd', name: c, dir: -1 })
     }
+    // An ungrounded summary is not allowed to launder itself into a roll-up
+    // as fact: the row drops out of the window entirely (a [caution] marker
+    // still put its names in the grounding corpus, which waived the very
+    // check that raised them). Its catalog events stay: those come from git,
+    // not from the model.
+    if (e.ai?.ungrounded?.length) { out.dropped++; continue }
     if (picked.length >= maxItems || used + text.length + 1 > maxChars) {
       out.truncated = true
       break
@@ -1221,9 +1353,10 @@ export function formatReleaseContext (ctx, bump) {
   const head = `Updates included in this release${v ? ` (${v}${since})` : since}:`
   const lines = (ctx.items || []).map(it => `- ${it.text}`)
   if ((ctx.items || []).some(it => /\[caution:/.test(it.text || ''))) {
-    lines.push('- Note: items marked [caution] carry names the diff did not confirm or a review flag on their claims. Lead with verified items; state caution-marked specifics hedged ("reportedly", "listed as") or omit them.')
+    lines.push('- Note: items marked [caution] carry a review flag on their claims. Lead with verified items; state caution-marked specifics hedged ("reportedly", "listed as") or omit them.')
   }
   if (ctx.truncated) lines.push(`- ...[earlier changes truncated; newest ${(ctx.items || []).length} shown]...`)
+  if (ctx.dropped) lines.push(`- ${ctx.dropped} other change${ctx.dropped === 1 ? ' was' : 's were'} left out of this list because an automated name check could not verify its summary; do not describe what the list omits.`)
   const net = ctx.net || {}
   const netLines = []
   if (net.modelsIn.length || net.modelsOut.length) {
@@ -1514,7 +1647,17 @@ export async function gatherEntryContext (e, patch, { repoDir = null, entries = 
   const tier = contextTier(patch, files)
   // Structured facts come from the *full* stored diff when available: the
   // prompt patch has test hunks stripped, and the test titles are the point.
-  const structured = hasStructuredFacts(e.structured) ? e.structured : extractStructuredFacts(fullPatch || patch)
+  // A row that stored facts from the narrow analyze-stage window (top six
+  // scored files, 24 KB, tests excluded by design) must not block the richer
+  // extraction forever, so compare and keep the fuller set. Then drop
+  // "newly read" env/flag/test claims that already exist at the base rev:
+  // moved code is not a new input, and the model is told to copy these
+  // verbatim, so a wrong one here becomes a wrong changelog fact.
+  const factCount = (s) => (s ? Object.values(s).reduce((n, v) => n + (Array.isArray(v) ? v.length : 0), 0) : -1)
+  let structured = e.structured
+  const freshFacts = extractStructuredFacts(fullPatch || patch)
+  if (factCount(freshFacts) > factCount(structured)) structured = freshFacts
+  structured = await pruneKnownInputs(repoDir, e.prevSha || null, structured)
   const out = { tier, structured, fileHeaders: [], fileHistory: [], subsystemDocs: [], fullFiles: [], exportOutlines: [] }
   if (entries) out.fileHistory = findFileHistory(entries, e, 10)
   if (!repoDir || !files.length) return out
@@ -1605,11 +1748,11 @@ export async function summarizeChunked (e, patch, { promptCtx = {}, corpus = '',
   for (let i = 0; i < chunks.length; i++) {
     const chunk = budgetPatch(chunks[i], MAP_REDUCE_CHUNK_BYTES, MAP_REDUCE_CHUNK_BYTES)
     const files = diffPaths(chunks[i])
-    const out = await callLlm(buildChunkPrompt(e, chunk, { index: i, total: chunks.length, files }), env, 1, validateChunkOut)
+    const out = await callLlm(buildChunkPrompt(e, chunk, { index: i, total: chunks.length, files, structured: promptCtx.structured }), env, 1, validateChunkOut)
     drafts.push({ index: i, files, ...out })
     log(`LLM chunk ${i + 1}/${chunks.length} for ${String(e.sha || '').slice(0, 8)} (${(files[0] || 'single-file').split('/').pop()}${files.length > 1 ? ` +${files.length - 1} more` : ''})`)
   }
-  const fuse = buildFusePrompt(e, drafts, promptCtx)
+  const fuse = buildFusePrompt(e, drafts, promptCtx, buildDiffDigest(patch))
   const clean = await callLlm(fuse, env, 1, summaryValidator(sig, corpus))
   return { clean, fuse }
 }

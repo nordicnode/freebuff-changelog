@@ -135,14 +135,25 @@ test('validateVerifyOut: per-claim verdicts fail closed', () => {
   assert.match(prompt, /"claims":/)
 })
 
-test('grounding v2: bare constants, versions and flags are checked; URLs ignored', () => {
+test('grounding v2: bare constants, versions, flags and numbers are checked; URLs ignored', () => {
   const corpus = 'ALPHA in sdk/src/a.ts\nshipped 0.0.178\n--trust-agent-dirs flag'
-  assert.deepEqual(ungroundedIdentifiers('Raised FREEBUFF_X from 300 to 500.', corpus), ['FREEBUFF_X'])
+  // Numbers are claims too: the structured facts hand the model the literal
+  // old -> new values, and a rounded or swapped one is the error a reader
+  // checks first.
+  assert.deepEqual(ungroundedIdentifiers('Raised FREEBUFF_X from 300 to 500.', corpus), ['FREEBUFF_X', '300', '500'])
   assert.deepEqual(ungroundedIdentifiers('Shipped in 0.0.179 today.', corpus), ['0.0.179'])
   assert.deepEqual(ungroundedIdentifiers('Pass --invented-flag to enable.', corpus), ['--invented-flag'])
   assert.deepEqual(ungroundedIdentifiers('Raised ALPHA, shipped 0.0.178 with --trust-agent-dirs.', corpus), [])
   assert.deepEqual(ungroundedIdentifiers('See https://github.com/x/y/blob/main/docs/a.md for context.', 'nothing'), [])
   assert.deepEqual(ungroundedIdentifiers('The CLI is fast and the API works.', corpus), [], 'ordinary prose never flags')
+  // Word-bounded: a truncated prefix of a real name is exactly the typo class.
+  assert.deepEqual(ungroundedIdentifiers('Reads CODEBUFF_MO instead.', 'reads CODEBUFF_MODELS daily'), ['CODEBUFF_MO'])
+  assert.deepEqual(ungroundedIdentifiers('Reads CODEBUFF_MODELS instead.', 'reads CODEBUFF_MODELS daily'), [])
+  // camelCase/PascalCase leak through prose; brands and case-variant embeds
+  // inside constants do not get flagged.
+  assert.deepEqual(ungroundedIdentifiers('The OffPeakPricingEngine now gates it.', corpus), ['OffPeakPricingEngine'])
+  assert.deepEqual(ungroundedIdentifiers('TikTok ships the pixel.', corpus), [], 'allowlisted brand')
+  assert.deepEqual(ungroundedIdentifiers('DeepSeek joins the picker.', 'FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID listed'), [], 'case-insensitive hit inside a constant')
 })
 
 test('validateGroundedEli5: leaks park, clean lines pass', () => {
@@ -207,11 +218,16 @@ test('PR relevance gate: shape-checked; failures fail open', async () => {
   }
 })
 
-test('release caution: unverified members are marked, verified stay clean', () => {
+test('release window: ungrounded members drop out, review-flagged members hedge', () => {
   const bump = { sha: sha('f'), date: '2026-09-18T10:00:00Z', version: '1.0.5', files: { modified: ['package.json'] } }
   const bad = {
     sha: sha('e'), date: '2026-09-17T10:00:00Z', version: null,
-    ai: { title: 'Shiny thing', summary: 'Adds `INVENTED_X`.', significance: 'notable', ungrounded: ['INVENTED_X'], verify: 'flagged' },
+    ai: { title: 'Shiny thing', summary: 'Adds `INVENTED_X`.', significance: 'notable', ungrounded: ['INVENTED_X'] },
+    files: {}
+  }
+  const flagged = {
+    sha: sha('c'), date: '2026-09-17T09:30:00Z', version: null,
+    ai: { title: 'Retry hardening', summary: 'Retries streamed calls.', significance: 'minor', verify: 'flagged' },
     files: {}
   }
   const good = {
@@ -219,10 +235,13 @@ test('release caution: unverified members are marked, verified stay clean', () =
     ai: { title: 'Solid fix', summary: 'Fixes retry.', significance: 'minor' },
     files: {}
   }
-  const ctx = collectReleaseContext([bad, good, bump], bump)
+  const ctx = collectReleaseContext([bad, flagged, good, bump], bump)
   const text = formatReleaseContext(ctx, bump)
-  assert.match(text, /\[caution: unverified identifiers: INVENTED_X; review flagged its claims\]/)
+  assert.doesNotMatch(text, /INVENTED_X/, 'an ungrounded summary never enters the window')
+  assert.match(text, /1 other change was left out/, 'the roll-up is told the window is incomplete')
+  assert.match(text, /\[caution: review flagged its claims\]/)
   assert.match(text, /hedged/, 'the roll-up is told how to handle marked items')
+  assert.match(text, /Solid fix/)
   const cleanCtx = collectReleaseContext([good, bump], bump)
-  assert.doesNotMatch(formatReleaseContext(cleanCtx, bump), /caution/)
+  assert.doesNotMatch(formatReleaseContext(cleanCtx, bump), /caution|left out/)
 })
