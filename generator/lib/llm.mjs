@@ -826,6 +826,39 @@ export function groundingCorpus (entry, patch, ctx = {}) {
   return parts.filter(Boolean).join('\n')
 }
 
+// Dotted names the corpus only spells as object literals. A diff that writes
+// `page: { url: page }` never contains the string `page.url`, so the literal
+// check below reported it as invented even though the property chain is right
+// there for a reader (and for the model that copied it). Walking brace depth
+// and key tokens recovers those chains, and only those: the claim has to match
+// a path the source actually nests, so a short tail found loose elsewhere in
+// the corpus (`url:` in an unrelated literal) still cannot ground a made-up
+// path. Longer chains also contribute their own suffixes, since a reader can
+// name the inner part of a path directly.
+export function nestedObjectPaths (text) {
+  const out = new Set()
+  const stack = []
+  let pending = null
+  for (const m of String(text || '').matchAll(/([{}])|([A-Za-z_$][\w$]*)\s*:|([,;])/g)) {
+    if (m[1] === '{') {
+      // The key standing just before a brace is the one that names the literal
+      // it opens; array elements and anonymous blocks contribute no segment.
+      stack.push(pending ?? '')
+      pending = null
+    } else if (m[1] === '}') {
+      stack.pop()
+      pending = null
+    } else if (m[2]) {
+      pending = m[2]
+      const segs = [...stack, m[2]].filter(Boolean)
+      for (let i = 0; i <= segs.length - 2; i++) out.add(segs.slice(i).join('.'))
+    } else {
+      pending = null
+    }
+  }
+  return out
+}
+
 // The backticked tokens in a text that the corpus cannot vouch for. A token
 // with spaces (a command line, a quoted phrase) is judged word by word: it is
 // grounded when every word that looks like a name is present. Placeholders
@@ -835,6 +868,19 @@ export function ungroundedIdentifiers (text, corpus) {
   const hay = String(corpus)
   const out = []
   const clean = String(text || '').replace(/```[^`\n]*```/g, ' ').replace(/```/g, ' ')
+  let nested = null
+  const nestedPaths = () => (nested ??= nestedObjectPaths(hay))
+  // A dotted name is grounded by the object literal that nests it. The claim
+  // may also add a leading segment a reader can infer (`payload.page.url` for
+  // a source that writes `page.url`), but every segment it drops has to be one
+  // the corpus really nests.
+  const dottedGrounded = (bare) => {
+    if (!bare.includes('.')) return false
+    const chains = nestedPaths()
+    if (chains.has(bare)) return true
+    for (const p of chains) if (bare.endsWith(`.${p}`)) return true
+    return false
+  }
   for (const m of clean.matchAll(/`([^`\n]{1,80})`/g)) {
     const raw = m[1].trim()
     if (!raw || GROUNDING_PLACEHOLDER_RE.test(raw)) continue
@@ -851,7 +897,8 @@ export function ungroundedIdentifiers (text, corpus) {
       if (!bare || bare.length < 3) return true
       if (hay.includes(bare)) return true
       const tail = bare.split(/[./]/).filter(Boolean).pop()
-      return !!(tail && tail.length >= 4 && tail !== bare && hay.includes(tail))
+      if (tail && tail.length >= 4 && tail !== bare && hay.includes(tail)) return true
+      return dottedGrounded(bare)
     }
     if (!words.every(present) && !out.includes(raw)) out.push(raw)
   }

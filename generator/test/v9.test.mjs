@@ -5,7 +5,7 @@ import {
   extractCommentFacts, diffPartPriority, prioritizeDiffParts
 } from '../lib/analyze.mjs'
 import {
-  validateLlmOut, ungroundedIdentifiers, groundingCorpus, buildPrompt, buildEli5Prompt, isMultiTopic, gaveUp,
+  validateLlmOut, ungroundedIdentifiers, nestedObjectPaths, groundingCorpus, buildPrompt, buildEli5Prompt, isMultiTopic, gaveUp,
   wantsStrongModel, modelFor, formatGlossary, matchPrByPaths, findPrMeta, rememberClosedPrs, diffPaths,
   budgetPatch, structuredFactsCited, PROMPT_V
 } from '../lib/llm.mjs'
@@ -90,6 +90,21 @@ test('gaveUp only judges sync rows; hype regex is a stateless predicate', () => 
 
 test('ungroundedIdentifiers: a path inside a URL is not a claimed file', () => {
   assert.deepEqual(ungroundedIdentifiers('See https://github.com/x/y/blob/main/docs/a.md for context.', 'nothing'), [])
+})
+
+test('ungroundedIdentifiers: a dotted name is grounded by the object literal that nests it', () => {
+  // The shape this comes from: `page.url` is a real property chain the diff
+  // writes as `page: { url: page }`, so the dotted string never appears in the
+  // corpus verbatim even though the model copied the source faithfully.
+  const patch = '+            page: { url: page },\n-            page: { url: `https://freebuff.com${signupPath}` },\nconst signupPath = "/signup"'
+  assert.deepEqual(ungroundedIdentifiers('TikTok is told the activation happened on `page.url`.', patch), [], 'nested keys spell out page.url')
+  assert.deepEqual(ungroundedIdentifiers('Posts `payload.page.url` as the page.', patch), [], 'a leading segment a reader can infer is tolerated')
+  assert.deepEqual(ungroundedIdentifiers('Sends `page.token`.', patch), ['page.token'], 'a path the source does not nest stays flagged')
+  const loose = 'const page = 1\nconst o = { url: "x" }'
+  assert.deepEqual(ungroundedIdentifiers('Reads `page.url`.', loose), ['page.url'], 'a short tail loose in an unrelated literal cannot ground a made-up path')
+  assert.deepEqual([...nestedObjectPaths('page: { user: { id: 1 } }')].sort(), ['page.user', 'page.user.id', 'user.id'])
+  assert.deepEqual([...nestedObjectPaths('rows: [ { name: "x" } ]')], ['rows.name'], 'array elements add no segment of their own')
+  assert.deepEqual([...nestedObjectPaths('const o = { url: "x" }')], [], 'an unwrapped literal has no chain')
 })
 
 test('extractCommentFacts: keeps 20-char sentences and JSDoc tags', () => {
