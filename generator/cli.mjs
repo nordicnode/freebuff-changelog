@@ -1088,7 +1088,7 @@ async function catchUpOnce (argv) {
   }
 }
 
-export async function cmdWatch (argv) {
+export async function cmdWatch (argv, { cycle = cmdCatchUp } = {}) {
   let intervalSec = 60
   const idx = argv.indexOf('--interval')
   if (idx !== -1 && argv[idx + 1]) {
@@ -1121,7 +1121,7 @@ export async function cmdWatch (argv) {
   log(`starting backfill loop (running every ${intervalSec}s${maxDurationMs < Infinity ? `, max duration ${durVal}` : ''})… Press Ctrl+C to stop.`)
   while (!stopped) {
     try {
-      await cmdCatchUp(argv)
+      await cycle(argv)
     } catch (err) {
       log(`backfill loop iteration error: ${err.message}`)
     }

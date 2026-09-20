@@ -199,10 +199,16 @@ test('conflicting push recovery never discards unrelated uncommitted work', asyn
   assert.equal(landed.entries.find(e => e.sha === 'a').ai?.title, 'Adds gemini-3', 'this cycle still lands its work')
 })
 
+// The loop's timing is what this test covers; the cycle itself is cmdCatchUp's
+// problem. Running the real one would sync the actual repo, hit the GitHub API
+// and rewrite data/ from the test suite -- a watch test must never mutate the
+// tree it lives in.
 test('cmdWatch respects --duration and exits cleanly', async () => {
+  let cycles = 0
   const t0 = Date.now()
-  await cmdWatch(['--duration', '50ms', '--interval', '1'])
+  await cmdWatch(['--duration', '50ms', '--interval', '1'], { cycle: async () => { cycles++ } })
   const elapsed = Date.now() - t0
+  assert.ok(cycles >= 1, 'ran at least one cycle before checking the deadline')
   assert.ok(elapsed >= 40, 'ran for at least the specified duration')
   assert.ok(elapsed < 10000, 'exited promptly after duration expired')
 })
