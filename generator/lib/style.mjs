@@ -1567,9 +1567,12 @@ button.meta-link.dc-ok{
   border:none;
   color:var(--txt);
   font-family:inherit;
-  /* 1rem = the 13.5px base, i.e. exactly the size of the "$ grep -i" prompt
-     beside it; the old font:inherit looked oversized next to .72rem text. */
-  font-size:1rem;
+  /* The site's text runs .72-.82rem. An input left to inherit (or set to 1rem)
+     took the 13.5px root instead, which made the query box the largest type on
+     the page. Match the .82rem of the models-page filter, and keep
+     .search-prompt with it so the row still reads as one size. The 16px in the
+     phone block below stays: it is the iOS no-zoom-on-focus floor. */
+  font-size:.82rem;
   line-height:1.45;
   padding:1px 0;
   outline:none;
@@ -1581,6 +1584,7 @@ button.meta-link.dc-ok{
 .search-prompt{
   color:var(--term-green);
   font-weight:700;
+  font-size:.82rem;
   white-space:nowrap;
 }
 .search-hint{

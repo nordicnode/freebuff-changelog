@@ -308,6 +308,11 @@ test('buildSite generates valid static site output', async () => {
     // placeholder is *content* (the row grew past the box); text-size-adjust
     // because mobile browsers inflate type they judge small, and the base is 13.5px.
     assert.match(searchHtml, /#q\{[^}]*min-width:0/, 'the query input must shrink below its placeholder')
+    // The input inherited the 13.5px root (1rem) while the site's text runs
+    // .72-.82rem, so it was the largest type on the page. Pin it to the .82rem
+    // used by the models-page filter, and the prompt beside it with it.
+    assert.match(searchHtml, /#q\{[^}]*font-size:\.82rem/, 'the query input matches the site text scale')
+    assert.match(searchHtml, /\.search-prompt\{[^}]*font-size:\.82rem/, 'the prompt beside it matches too')
     assert.match(searchHtml, /-webkit-text-size-adjust:100%/, 'no font boosting over the sheet')
     assert.match(searchHtml, /@media \(max-width:600px\)/, 'form controls go to 16px on phones so iOS does not zoom on focus')
     assert.doesNotMatch(searchHtml, /placeholder="regex/, 'the matcher is word-substring AND, not regex')
