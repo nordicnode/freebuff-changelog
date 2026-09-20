@@ -1135,9 +1135,10 @@ export async function cmdWatch (argv) {
 
     if (exitOnQueued) {
       try {
-        const queuedCount = Number(execSync('gh run list --workflow changelog-sync.yml --status queued --json databaseId -q length 2>/dev/null', { encoding: 'utf8' }).trim()) || 0
+        const cmd = 'gh run list --workflow changelog-sync.yml --json databaseId,status --jq \'[.[] | select(.status == "queued" or .status == "pending" or .status == "waiting")] | length\''
+        const queuedCount = Number(execSync(cmd, { encoding: 'utf8' }).trim()) || 0
         if (queuedCount > 0) {
-          log(`[watch] detected ${queuedCount} queued workflow run(s): yielding to incoming runner.`)
+          log(`[watch] detected ${queuedCount} incoming workflow run(s) (status queued/pending): yielding to incoming runner.`)
           break
         }
       } catch (_) {}
