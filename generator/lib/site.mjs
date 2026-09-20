@@ -135,7 +135,7 @@ function updateSyncAge() {
   const ageMin = Math.max(0, Math.floor((Date.now() - Date.parse(el.dataset.generated)) / 60000));
   // Two budgets, not a magic number: one overdue pass just means a sync is in
   // flight, which is normal. Two missed passes means the loop is not running.
-  const budgetMin = Number(el.dataset.budgetMin) || 45;
+  const budgetMin = Number(el.dataset.budgetMin) || 5;
   const fresh = ageMin < budgetMin * 2;
   el.textContent = el.textContent.replace(/\\s*\\[.*\\]$/, '') + (fresh ? ' [fresh]' : ' [stale ' + ageMin + 'm]');
   el.style.color = fresh ? 'var(--term-green)' : 'var(--term-amber)';

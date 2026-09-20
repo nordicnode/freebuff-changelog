@@ -8,6 +8,7 @@ import { mkdir, readFile, rm, cp } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { execSync } from 'node:child_process'
 import { git, readJson, writeJson, writeText, log, ymd, toUtc, normalizeDate, pruneDiffs, pool, withLock } from './lib/util.mjs'
 import { capturePendingWrites, persistMerged, mergeOpenPrs } from './lib/mergedata.mjs'
 import {
@@ -1087,7 +1088,7 @@ async function catchUpOnce (argv) {
   }
 }
 
-async function cmdWatch (argv) {
+export async function cmdWatch (argv) {
   let intervalSec = 60
   const idx = argv.indexOf('--interval')
   if (idx !== -1 && argv[idx + 1]) {
@@ -1096,12 +1097,28 @@ async function cmdWatch (argv) {
     intervalSec = Number(process.env.WATCH_INTERVAL) || 60
   }
 
+  let maxDurationMs = Infinity
+  const durIdx = argv.indexOf('--duration')
+  const durVal = durIdx !== -1 ? argv[durIdx + 1] : process.env.WATCH_DURATION
+  if (durVal) {
+    const match = String(durVal).match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$/i)
+    if (match) {
+      const num = Number(match[1])
+      const unit = (match[2] || 's').toLowerCase()
+      const multiplier = unit === 'h' ? 3600000 : (unit === 'm' ? 60000 : (unit === 'ms' ? 1 : 1000))
+      maxDurationMs = num * multiplier
+    }
+  }
+
+  const exitOnQueued = argv.includes('--exit-on-queued') || process.env.WATCH_EXIT_ON_QUEUED === '1'
+
   let stopped = false
   const stop = () => { stopped = true }
   process.once('SIGINT', stop)
   process.once('SIGTERM', stop)
 
-  log(`starting backfill loop (running every ${intervalSec}s)… Press Ctrl+C to stop.`)
+  const startTime = Date.now()
+  log(`starting backfill loop (running every ${intervalSec}s${maxDurationMs < Infinity ? `, max duration ${durVal}` : ''})… Press Ctrl+C to stop.`)
   while (!stopped) {
     try {
       await cmdCatchUp(argv)
@@ -1109,8 +1126,37 @@ async function cmdWatch (argv) {
       log(`backfill loop iteration error: ${err.message}`)
     }
     if (stopped) break
-    log(`sleeping ${intervalSec}s before next cycle…`)
-    await new Promise(r => setTimeout(r, intervalSec * 1000))
+
+    const elapsed = Date.now() - startTime
+    if (elapsed >= maxDurationMs) {
+      log(`duration limit reached (${durVal}): exiting backfill loop cleanly.`)
+      break
+    }
+
+    if (exitOnQueued) {
+      try {
+        const queuedCount = Number(execSync('gh run list --workflow changelog-sync.yml --status queued --json databaseId -q length 2>/dev/null', { encoding: 'utf8' }).trim()) || 0
+        if (queuedCount > 0) {
+          log(`[watch] detected ${queuedCount} queued workflow run(s): yielding to incoming runner.`)
+          break
+        }
+      } catch (_) {}
+    }
+
+    const remainingMs = maxDurationMs - (Date.now() - startTime)
+    if (remainingMs <= 0) {
+      log(`duration limit reached (${durVal}): exiting backfill loop cleanly.`)
+      break
+    }
+    const sleepSec = Math.min(intervalSec, Math.max(1, Math.ceil(remainingMs / 1000)))
+
+    log(`sleeping ${sleepSec}s before next cycle…`)
+    await new Promise(r => setTimeout(r, sleepSec * 1000))
+
+    if (Date.now() - startTime >= maxDurationMs) {
+      log(`duration limit reached (${durVal}): exiting backfill loop cleanly.`)
+      break
+    }
   }
   log('backfill loop stopped.')
 }
@@ -1318,9 +1364,8 @@ if (IS_MAIN) {
     console.log(`usage:
   node generator/cli.mjs generate [--full]        # analyze upstream freebuff (full rescan)
   node generator/cli.mjs catch-up [--push]        # sync-if-due + one LLM backfill batch
-  node generator/cli.mjs fetch-traffic            # fetch latest 14d clone traffic from GitHub API
-  node generator/cli.mjs backfill [--push]        # continuous sync + backfill loop (the daemon)
-  node generator/cli.mjs watch [--push]           # alias for backfill
+  node generator/cli.mjs backfill [--push] [--interval S] [--duration D]  # continuous sync & backfill loop
+  node generator/cli.mjs watch [--push] [--interval S] [--duration D]     # alias for backfill
   node generator/cli.mjs push-data [--message M]  # commit+push data/ with the shared race handling
   node generator/cli.mjs enrich-all [--batch N] [--push] [--rewrite-stale]  # one pass toward a diff + summary + ELI5 for every entry (0 = everything left); --rewrite-stale also refreshes rows on an older prompt, major first
   node generator/cli.mjs repair-entries [--push]   # recompute commitNature / significance / security tag on stored rows (no text touched)

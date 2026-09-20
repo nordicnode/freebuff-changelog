@@ -14,7 +14,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { commitAndPushData, refreshDiffFlags } from '../cli.mjs'
+import { commitAndPushData, refreshDiffFlags, cmdWatch } from '../cli.mjs'
 import { pruneDiffs } from '../lib/util.mjs'
 import { mergeChangelog } from '../lib/mergedata.mjs'
 
@@ -198,3 +198,12 @@ test('conflicting push recovery never discards unrelated uncommitted work', asyn
   assert.equal(landed.headSha, 'hA', 'and origin stays authoritative for headSha through the recovery')
   assert.equal(landed.entries.find(e => e.sha === 'a').ai?.title, 'Adds gemini-3', 'this cycle still lands its work')
 })
+
+test('cmdWatch respects --duration and exits cleanly', async () => {
+  const t0 = Date.now()
+  await cmdWatch(['--duration', '50ms', '--interval', '1'])
+  const elapsed = Date.now() - t0
+  assert.ok(elapsed >= 40, 'ran for at least the specified duration')
+  assert.ok(elapsed < 10000, 'exited promptly after duration expired')
+})
+

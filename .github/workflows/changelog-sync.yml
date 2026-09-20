@@ -1,15 +1,13 @@
 name: changelog-sync
-# Backstop for the sync. The long-running local daemon (systemd
-# freebuff-backfill.service) is the primary sync owner and advances
-# headSha/generatedAt itself; this schedule only covers the case where that box
-# is down. Scheduled runs drift badly in practice (observed: 00:33, 05:35,
-# 11:21 for an `0 * * * *` cron), so nothing may depend on it for freshness.
-# Cloudflare Workers (git-integrated) rebuilds on the push; a no-op build is
-# skipped because the commit step makes no commit when data/ is unchanged.
+
+# 24/7 continuous relay synchronization pipeline.
+# Runs continuously via self-perpetuating workflow relay, polling upstream every 30s
+# to ensure the site is updated within 30-60s of upstream changes and never exceeds 10m freshness.
+# A backup schedule (every 10 minutes) serves as an automated watchdog / safety net.
 on:
   schedule:
-    # Offset by 2 minutes from 0/5/10/etc. to avoid GitHub Actions scheduler congestion & delays
-    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 * * * *'
+    # Watchdog schedule: restarts the relay chain if a runner is ever terminated or network drops
+    - cron: '3,13,23,33,43,53 * * * *'
   workflow_dispatch: {}
   push:
     branches: [main, master]
@@ -17,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: changelog-sync
@@ -25,11 +24,11 @@ concurrency:
 jobs:
   analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -48,14 +47,16 @@ jobs:
           restore-keys: |
             freebuff-git-${{ runner.os }}-
 
-      - name: Analyze upstream freebuff
+      - name: Configure git bot identity
+        run: |
+          git config --global user.name "changelog-bot"
+          git config --global user.email "changelog-bot@users.noreply.github.com"
+
+      - name: Run continuous sync & backfill
+        id: sync_loop
         env:
-          # The built-in token is scoped to THIS repo, so it cannot read
-          # CodebuffAI/freebuff's pull requests -- /in-flight/ would fall back to
-          # the 60-calls/hour anonymous ceiling and show a truncated list. Set a
-          # repo secret (any name, CHANGELOG_GITHUB_TOKEN is what this looks for)
-          # with read access to upstream; unset is fine, just slower.
           GITHUB_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
           SITE_URL: ${{ vars.SITE_URL || 'https://freebuff-changelog.nordicnode.workers.dev' }}
           CHANGELOG_LLM: ${{ vars.CHANGELOG_LLM || '1' }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -64,43 +65,27 @@ jobs:
           CHANGELOG_LLM_LIMIT: ${{ vars.CHANGELOG_LLM_LIMIT || '10' }}
           CHANGELOG_LLM_CONCURRENCY: ${{ vars.CHANGELOG_LLM_CONCURRENCY || '2' }}
           CHANGELOG_LLM_RPM: ${{ vars.CHANGELOG_LLM_RPM || '60' }}
-        run: node generator/cli.mjs generate
+          CHANGELOG_SYNC_STALE_MIN: '5'
+          CHANGELOG_PR_REFRESH_MIN: '2'
+          WATCH_INTERVAL: '30'
+          WATCH_DURATION: '12m'
+          WATCH_EXIT_ON_QUEUED: '1'
+        run: node generator/cli.mjs watch --push --interval 30 --duration 12m --exit-on-queued
 
-      - name: Commit & push data (only if changed)
-        # Same code path the daemon uses: it merges into origin's data instead
-        # of overwriting it, so a concurrent daemon push can never be reverted
-        # and a conflicted rebase can never strand this run's commit.
+      - name: Dispatch next relay cycle
+        if: always() && (steps.sync_loop.outcome == 'success' || steps.sync_loop.outcome == 'skipped')
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN }}
         run: |
-          git config user.name "changelog-bot"
-          git config user.email "changelog-bot@users.noreply.github.com"
-          node generator/cli.mjs push-data --message "data: update changelog ($(date -u '+%Y-%m-%d %H:%M') UTC)"
-
-      - name: Mid-cycle wait (2.5 minutes)
-        if: github.event_name == 'schedule'
-        run: sleep 150
-
-      - name: Analyze upstream freebuff (pass 2)
-        if: github.event_name == 'schedule'
-        env:
-          GITHUB_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
-          SITE_URL: ${{ vars.SITE_URL || 'https://freebuff-changelog.nordicnode.workers.dev' }}
-          CHANGELOG_LLM: ${{ vars.CHANGELOG_LLM || '1' }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          LLM_API_BASE: ${{ secrets.LLM_API_BASE || vars.LLM_API_BASE }}
-          LLM_MODEL: ${{ secrets.LLM_MODEL || vars.LLM_MODEL }}
-          CHANGELOG_LLM_LIMIT: ${{ vars.CHANGELOG_LLM_LIMIT || '10' }}
-          CHANGELOG_LLM_CONCURRENCY: ${{ vars.CHANGELOG_LLM_CONCURRENCY || '2' }}
-          CHANGELOG_LLM_RPM: ${{ vars.CHANGELOG_LLM_RPM || '60' }}
-        run: node generator/cli.mjs generate
-
-      - name: Commit & push data (pass 2, only if changed)
-        if: github.event_name == 'schedule'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config user.name "changelog-bot"
-          git config user.email "changelog-bot@users.noreply.github.com"
-          node generator/cli.mjs push-data --message "data: update changelog ($(date -u '+%Y-%m-%d %H:%M') UTC)"
+          if [ -z "$GH_TOKEN" ]; then
+            echo "CHANGELOG_GITHUB_TOKEN not configured; relying on watchdog schedule."
+            exit 0
+          fi
+          QUEUED_COUNT=$(gh run list --workflow changelog-sync.yml --status queued --json databaseId -q 'length' 2>/dev/null || echo "0")
+          if [ "$QUEUED_COUNT" -eq 0 ]; then
+            echo "Dispatching next relay run to maintain 24/7 continuous synchronization..."
+            gh workflow run changelog-sync.yml
+          else
+            echo "A workflow run is already queued ($QUEUED_COUNT pending). Skipping duplicate dispatch."
+          fi
 

@@ -7,7 +7,7 @@
 // LLM summaries can push commits forever while the site keeps reporting a
 // timestamp from hours ago. This module is the decision the loop applies each
 // cycle; it is pure so the two triggers can be tested without git or network.
-export const DEFAULT_SYNC_STALE_MIN = 45
+export const DEFAULT_SYNC_STALE_MIN = 5
 
 export function syncStaleMs (env = process.env) {
   return (Number(env.CHANGELOG_SYNC_STALE_MIN || DEFAULT_SYNC_STALE_MIN) || DEFAULT_SYNC_STALE_MIN) * 60000
