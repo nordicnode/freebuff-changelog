@@ -473,21 +473,18 @@ test('buildSite generates valid static site output', async () => {
     // Verify about page covers method, categories, limits
     const aboutHtml = await readFile(join(tmpDist, 'about/index.html'), 'utf8')
     assert.match(aboutHtml, /HOW IT WORKS/)
-    assert.match(aboutHtml, /Deterministic first/)
-    assert.match(aboutHtml, /ACCURACY &amp; ANALYSIS PIPELINE/)
+    assert.match(aboutHtml, /extracted without a model/)
+    assert.match(aboutHtml, /ANALYSIS PIPELINE/)
     assert.match(aboutHtml, /ELI5 plain-English/)
     assert.match(aboutHtml, /LIMITS/)
     assert.match(aboutHtml, /Model Catalog/)
     assert.match(aboutHtml, /FEEDS \+ DISCORD/)
     assert.match(aboutHtml, /class="man-dl"/, 'what is tracked is a list of surfaces, not a paragraph')
     assert.match(aboutHtml, /class="man-routes"/)
-    // The page explains itself; it is not allowed to become a manual again. It ran
-    // to 2,300 words of prose before being cut back to the chase.
-    const aboutBody = aboutHtml.split('man-body">')[1].split('</section>')[0]
-    const aboutWords = aboutBody
-      .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length
-    assert.ok(aboutWords < 800, `about page is ${aboutWords} words; keep it under 800 (accuracy of the pipeline description takes priority over brevity)`)
-    assert.doesNotMatch(aboutBody, /&mdash;|\u2014/, 'about copy carries no em-dashes')
+    // The page explains itself; it is not allowed to become a manual again. The
+    // word cap is checked in the production-size test below instead of here: this
+    // fixture has four entries and three categories, so it under-measures the
+    // deployed page (which is the whole point of the cap).
     assert.match(aboutHtml, /class="footer-traffic"/)
     assert.match(aboutHtml, /id="footer-clones"/)
     assert.match(aboutHtml, /id="footer-cloners"/)
@@ -733,6 +730,29 @@ test('buildSite generates valid static site output', async () => {
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }
+})
+
+// The about page's word cap is only meaningful at the size it is deployed. The
+// body is prose plus counts, and the "Code areas" line grows a word per category
+// that really exists (plus the open-PR row), so the four-entry fixture above
+// measured ~790 words while the live page ran to 806. Build from the committed
+// data/ the deployed site is built from, not from dist/, which `npm test` does
+// not produce.
+test('about page stays under its word cap at production size', async (t) => {
+  const changelog = JSON.parse(await readFile(new URL('../../data/changelog.json', import.meta.url), 'utf8'))
+  assert.ok(changelog?.entries?.length, 'data/changelog.json is committed and non-empty')
+  let prsRaw = []
+  try { prsRaw = JSON.parse(await readFile(new URL('../../data/open-prs.json', import.meta.url), 'utf8')) } catch {}
+  const openPrs = Array.isArray(prsRaw) ? prsRaw : (prsRaw?.prs || [])
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-about-'))
+  t.after(async () => { await rm(dist, { recursive: true, force: true }) })
+  await buildSite({ changelog, openPrs, dist })
+  const aboutHtml = await readFile(join(dist, 'about/index.html'), 'utf8')
+  const aboutBody = aboutHtml.split('man-body">')[1].split('</section>')[0]
+  const aboutWords = aboutBody
+    .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length
+  assert.ok(aboutWords < 800, `about page is ${aboutWords} words at production size; keep it under 800`)
+  assert.doesNotMatch(aboutBody, /&mdash;|\u2014/, 'about copy carries no em-dashes')
 })
 
 test('inline scripts: template escaping preserves regex backslashes', async () => {
