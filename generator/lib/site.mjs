@@ -2628,7 +2628,7 @@ ${weekTabsScript}`
       + `<div class="stat-figures">`
       + figure('CHANGES', meaningful.length.toLocaleString(), `of ${entries.length.toLocaleString()} commits &middot; ${churnCount.toLocaleString()} churn rows excluded`)
       + figure('MEDIAN / DAY', String(medianDay), `${activeDays} days with commits${busiestDay ? ` &middot; ${busiestDay[1]} on the busiest, ${esc(fmtDateHuman(busiestDay[0]))}` : ''}`)
-      + figure('RELEASES', String(releases.length), `${trim1((releases.length / spanMonths).toFixed(1))} releases a month across ${spanMonths} months`)
+      + figure('RELEASES', String(vers.length), `${trim1((vers.length / spanMonths).toFixed(1))} releases a month across ${spanMonths} months`)
       + figure('LINES MOVED', `<span class="pos">+${kfmt(totalAdd)}</span><span class="neg"> &minus;${kfmt(totalDel)}</span>`, `net ${totalAdd >= totalDel ? '+' : '&minus;'}${kfmt(Math.abs(totalAdd - totalDel))} over ${spanDays.toLocaleString()} days`)
       + figure('MAJOR', sigRows[0][1].toLocaleString(), `${share(sigRows[0][1], sigTotal)}% of changes &middot; ${sigRows[1][1].toLocaleString()} notable`)
       + figure('CATEGORIES', String(cats.size), statCats.length ? `led by ${esc(statCats[0][0])} at ${share(statCats[0][1], sigTotal)}%` : '')
