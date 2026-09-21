@@ -4,7 +4,7 @@
 import { writeText, writeBinary } from './util.mjs'
 import { escapeHtml as esc, fmtDateHuman, pool } from './util.mjs'
 import { CSS } from './style.mjs'
-import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, ogCardSvg } from './feed.mjs'
+import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
 import { buildStoryIndex, dayStories, dayStoryLead } from './story.mjs'
 import { computeShippedIn, isSecurityEntry, PROMPT_V, ELI5_V, AUDIENCE_DESC } from './llm.mjs'
@@ -30,8 +30,50 @@ function miniMd (text) {
 
 export const fmtTraffic = (n) => n >= 10000 ? `${(n / 1000).toFixed(1)}k` : (n >= 1000 ? `${(n / 1000).toFixed(2)}k` : `${n}`)
 let activeTraffic = { count: 0, uniques: 0 }
+// Set once per build in buildSite(): the /in-flight/ page is only generated when
+// there are open PRs, so the top-nav link is gated on the same condition to avoid
+// a 404 when the list is empty.
+let hasInFlight = false
 
-function layout ({ title, path, body, desc, noindex, ogImage, wide }) {
+// schema.org JSON-LD for the <head>. Escapes "<" so a title or URL carrying a
+// closing-script sequence cannot terminate the script element during parsing.
+function ldScript (obj) {
+  return JSON.stringify(obj).replace(/</g, '\\u003c')
+}
+
+// A day's real changes as a schema.org ItemList of BlogPostings, so search
+// engines can render the day as a list of dated entries rather than one blob.
+function dayItemListLd (d) {
+  const items = d.entries.filter(e => !e.noise).slice(0, 60).map((e, i) => ({
+    '@type': 'ListItem',
+    position: i + 1,
+    url: `${SITE.url}/day/${e.day}/#${e.sha.slice(0, 12)}`,
+    name: e.ai?.title || e.title || ''
+  }))
+  return {
+    '@context': 'https://schema.org',
+    '@type': 'ItemList',
+    name: `Freebuff changes on ${d.day}`,
+    itemListElement: items
+  }
+}
+
+// A version-bump page as SoftwareSourceCode so the release reads as a dated,
+// versioned artifact tied back to the upstream repository.
+function releaseLd (rel) {
+  return {
+    '@context': 'https://schema.org',
+    '@type': 'SoftwareSourceCode',
+    name: `Freebuff ${rel.version}`,
+    version: rel.version,
+    codeRepository: 'https://github.com/CodebuffAI/freebuff',
+    url: `${SITE.url}/release/${encodeURIComponent(rel.version)}/`,
+    datePublished: String(rel.date || '').slice(0, 10),
+    programmingLanguage: 'TypeScript'
+  }
+}
+
+function layout ({ title, path, body, desc, noindex, ogImage, wide, ld }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
 <script>(function(){try{var t=localStorage.getItem('fbTheme');if(t){document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='light'?'#f6f8fa':(t==='amber'?'#120d04':(t==='green'?'#051207':'#0d1117'));}if(localStorage.getItem('fbPlainMode')==='1'){document.documentElement.classList.add('reading-mode-plain');}}catch(_){}})();</script>
@@ -43,9 +85,11 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
 <link rel="canonical" href="${abs(path)}">
 <meta property="og:title" content="${esc(title)} · ${SITE.name}">
 <meta property="og:description" content="${esc(desc || SITE.desc)}">
-<meta property="og:image" content="${abs(ogImage || '/favicon.svg')}">
+<meta property="og:image" content="${abs(ogImage || '/og/default.png')}">
+<meta property="og:image:alt" content="${esc(title)} \u00b7 ${SITE.name}">
 <meta name="twitter:card" content="summary_large_image">
 <meta property="og:type" content="website"><meta property="og:url" content="${abs(path)}">
+${ld ? `<script type="application/ld+json">${ldScript(ld)}</script>` : ''}
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (all changes)" href="${SITE.url}/feed.xml">
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (major + notable)" href="${SITE.url}/feed-major.xml">
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (models only)" href="${SITE.url}/feed-models.xml">
@@ -55,7 +99,7 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="apple-touch-icon" href="/icon-192.png">
 <style>${CSS}</style>
-</head><body${wide ? ' class="page-wide"' : ''}><div id="reading-progress" aria-hidden="true"></div><main>
+</head><body${wide ? ' class="page-wide"' : ''}><div id="reading-progress" aria-hidden="true"></div><a class="skip-link" href="#main">Skip to content</a><main id="main">
 <header class="top">
   <div class="brand">
     <a class="logo" href="/">
@@ -63,14 +107,14 @@ ${noindex ? '<meta name="robots" content="noindex">' : ''}
       <span>${SITE.name}</span>
     </a>
   </div>
-  <nav class="term-nav">
+  <nav class="term-nav" aria-label="Primary">
     <a href="/about/" class="${path === '/about/' ? 'active' : ''}">/about</a>
     <a href="/week/" class="${path.startsWith('/week') ? 'active' : ''}">/weekly</a>
     <a href="/models/" class="${path.startsWith('/models/') ? 'active' : ''}">/models</a>
     <a href="/stats/" class="${path.startsWith('/stats/') ? 'active' : ''}">/stats</a>
     <a href="/archive/" class="${path.startsWith('/archive/') ? 'active' : ''}">/archive</a>
     <a href="/search/" class="${path.startsWith('/search/') ? 'active' : ''}">/search</a>
-    <a href="/in-flight/" class="${path.startsWith('/in-flight/') ? 'active' : ''}">/in-flight</a>
+    ${hasInFlight ? `<a href="/in-flight/" class="${path.startsWith('/in-flight/') ? 'active' : ''}">/in-flight</a>` : ''}
     <a href="/feed.xml" class="nav-feed">/rss</a>
   </nav>
 </header>
@@ -102,18 +146,18 @@ ${body}
     </div>
     <div class="footer-theme">
       <span class="footer-label">theme:</span>
-      <button type="button" class="theme-btn active" data-theme-val="dark">[dark]</button>
-      <button type="button" class="theme-btn" data-theme-val="amber">[amber]</button>
-      <button type="button" class="theme-btn" data-theme-val="green">[green]</button>
-      <button type="button" class="theme-btn" data-theme-val="light">[light]</button>
+      <button type="button" class="theme-btn active" data-theme-val="dark" aria-pressed="true">[dark]</button>
+      <button type="button" class="theme-btn" data-theme-val="amber" aria-pressed="false">[amber]</button>
+      <button type="button" class="theme-btn" data-theme-val="green" aria-pressed="false">[green]</button>
+      <button type="button" class="theme-btn" data-theme-val="light" aria-pressed="false">[light]</button>
     </div>
   </div>
 </footer>
-<div id="kb-modal" class="kb-modal" hidden onclick="if(event.target===this)this.hidden=true">
+<div id="kb-modal" class="kb-modal" role="dialog" aria-modal="true" aria-labelledby="kb-title" hidden onclick="if(event.target===this)setKbModal(false)">
   <div class="kb-dialog">
     <div class="kb-header">
-      <span>KEYBOARD SHORTCUTS</span>
-      <button type="button" class="kb-close" onclick="document.getElementById('kb-modal').hidden=true">[esc]</button>
+      <span id="kb-title">KEYBOARD SHORTCUTS</span>
+      <button type="button" class="kb-close" aria-label="Close dialog" onclick="setKbModal(false)">[esc]</button>
     </div>
     <div class="kb-grid">
       <div><span class="kb-key">j</span> / <span class="kb-key">k</span></div><div>Next / prev entry</div>
@@ -258,7 +302,7 @@ document.addEventListener('keydown', (e) => {
 
   if (e.key === 'Escape') {
     const modal = document.getElementById('kb-modal');
-    if (modal && !modal.hidden) { modal.hidden = true; return; }
+    if (modal && !modal.hidden) { setKbModal(false); return; }
     if (isInput) { document.activeElement.blur(); return; }
   }
 
@@ -268,7 +312,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === '?') {
     e.preventDefault();
     const modal = document.getElementById('kb-modal');
-    if (modal) modal.hidden = !modal.hidden;
+    if (modal) setKbModal(modal.hidden);
     return;
   }
 
@@ -350,7 +394,7 @@ document.addEventListener('click', (ev) => {
   const btn = ev.target.closest ? ev.target.closest('[data-kb-modal]') : null;
   if (!btn) return;
   const modal = document.getElementById('kb-modal');
-  if (modal) modal.hidden = !modal.hidden;
+  if (modal) setKbModal(modal.hidden);
 });
 
 // Bulk expand/collapse for timeline
@@ -414,17 +458,37 @@ document.addEventListener('click', (ev) => {
     tc.content = colors[val] || '#0d1117';
   }
   document.querySelectorAll('[data-theme-val]').forEach(b => {
-    b.classList.toggle('active', b.getAttribute('data-theme-val') === val);
+    const on = b.getAttribute('data-theme-val') === val;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
   });
 });
 
 function syncThemeButtons() {
   const cur = document.documentElement.getAttribute('data-theme') || 'dark';
   document.querySelectorAll('[data-theme-val]').forEach(b => {
-    b.classList.toggle('active', b.getAttribute('data-theme-val') === cur);
+    const on = b.getAttribute('data-theme-val') === cur;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
   });
 }
 window.addEventListener('DOMContentLoaded', syncThemeButtons);
+
+// Single source of truth for the shortcuts dialog so every open/close path
+// (the ? key, the [?] button, backdrop click, [esc]) manages focus the same way:
+// move focus into the dialog on open, back to the trigger on close.
+function setKbModal (show) {
+  const modal = document.getElementById('kb-modal');
+  if (!modal || modal.hidden === !show) return;
+  modal.hidden = !show;
+  if (show) {
+    const close = modal.querySelector('.kb-close');
+    if (close) close.focus();
+  } else {
+    const trigger = document.querySelector('[data-kb-modal]');
+    if (trigger) trigger.focus();
+  }
+}
 
 // Delegated, not wired per element: the /c/ page imports its card from another
 // document after load, so a listener attached at build time would not exist on it.
@@ -1099,12 +1163,16 @@ function structuredChips (e) {
 function evidenceHtml (e) {
   const ev = e.ai?.evidence
   const bad = e.ai?.ungrounded || []
-  if (!ev && !bad.length) return ''
-  const flag = bad.length
-    ? `<p class="evidence-flag">Not found in the diff or source context: ${bad.map(x => `<code>${esc(x)}</code>`).join(', ')}. Treat these names as unverified.</p>`
+  // Bare integers (a computed count or sum) are recorded as ungrounded too, but
+  // they read as noise in a "names" badge; the /stats/ metric still counts them.
+  // Dotted version strings are kept -- a wrong version is a real, checkable claim.
+  const badNames = bad.filter(x => !/^\d+$/.test(String(x)))
+  if (!ev && !badNames.length) return ''
+  const flag = badNames.length
+    ? `<p class="evidence-flag">Not found in the diff or source context: ${badNames.map(x => `<code>${esc(x)}</code>`).join(', ')}. Treat these names as unverified.</p>`
     : ''
   const verify = e.ai?.verify === 'flagged' ? '<p class="evidence-flag">A second model still objected to claims in this summary after one repair.</p>' : ''
-  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${bad.length ? ` <span class="evidence-warn">(${bad.length} unverified name${bad.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}</div></details>`
+  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${badNames.length ? ` <span class="evidence-warn">(${badNames.length} unverified name${badNames.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}</div></details>`
 }
 
 // Implementation notes and comments extracted directly from the commit diff.
@@ -1141,7 +1209,7 @@ function qualityCard (q, card, bar, share) {
     ['marked breaking', q.breaking, q.summarized, ''],
     ['low self-confidence', q.lowConfidence, q.summarized, `${q.withUnknowns} name what the diff omits`],
     ['"scope limited to" boilerplate', q.scopeBoilerplate, q.summarized, 'v5 prompt artifact'],
-    ['plain-English current', q.eli5Current, q.explained, `v${ELI5_V} · ${q.eli5Template} templated`],
+    ['plain-English current', q.eli5Current, q.explained, `v${ELI5_V} · ${q.eli5Template} auto-templated (test/docs-only)`],
     ['plain-English preambles', q.eli5Preamble, q.explained, '"Behind the scenes..."'],
     ['plain-English hype words', q.eli5Hype, q.explained, '"smarter", "faster"...'],
     ['plain-English identifiers', q.eli5Identifiers, q.explained, 'camelCase / snake_case / .ts'],
@@ -1409,6 +1477,7 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
   const trafficCount = traffic?.count ?? 0
   const trafficUniques = traffic?.uniques ?? 0
   activeTraffic = { count: trafficCount, uniques: trafficUniques }
+  hasInFlight = !!(openPrs && openPrs.length)
   const entries = [...changelog.entries].reverse() // newest first
   const byDay = groupByDay(entries)
   // "Related" is a reading aid for real changes: churn rows must neither appear
@@ -1703,7 +1772,7 @@ ${rows.map(e => {
     const real = d.entries.filter(e => !e.noise).length
     const body = renderTimelineDay(d, i) + filterScript
     if (i === 0) {
-      await write(dist, 'index.html', layout({ title: 'Home', path: '/', desc: SITE.desc, body }))
+      await write(dist, 'index.html', layout({ title: 'Home', path: '/', desc: SITE.desc, ld: dayItemListLd(d), body }))
     }
     // Every day has a /day/<date>/ page, the newest one included. That URL is not
     // a copy for convenience: entry permalinks -- the archive rows, the category
@@ -1715,6 +1784,7 @@ ${rows.map(e => {
       path: `/day/${d.day}/`,
       desc: `${real.toLocaleString()} Freebuff change${real === 1 ? '' : 's'} pushed on ${d.day}.`,
       ogImage: `/og/${d.day}.svg`,
+      ld: dayItemListLd(d),
       body
     }))
     const ogTitles = d.entries.slice(0, 3).map(e => e.ai?.title || e.title || '')
@@ -1754,6 +1824,7 @@ ${rows.map(e => {
     await write(dist, `release/${rel.version}/index.html`, layout({
       title: `Release ${rel.version}`, path: `/release/${rel.version}/`,
       desc: `Freebuff v${rel.version}: ${mine.length} changes since the previous release.`,
+      ld: releaseLd(rel),
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(rel.version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Freebuff v${esc(rel.version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p><div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button type="button" class="btn-copy-relnotes" onclick="navigator.clipboard.writeText(document.getElementById('relnotes-md').value).then(()=>{const b=this;b.textContent='[copied: paste into GitHub release]';setTimeout(()=>b.textContent='[copy release notes]',3000)})">[copy release notes]</button><textarea id="relnotes-md" hidden style="display:none">${esc(relNotesMd)}</textarea></div></div></section>` +
         relPager +
         `<section class="day">${[rel, ...relHead].map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx, cardOpts(e))).join('\n')}${relTailRows}</section>` +
@@ -3343,6 +3414,9 @@ ${inFlightScript}`
   await write(dist, 'favicon.svg', FAVICON_SVG)
   await writeBinary(`${dist.replace(/\/$/, '')}/icon-192.png`, generateIconPng(192))
   await writeBinary(`${dist.replace(/\/$/, '')}/icon-512.png`, generateIconPng(512))
+  // Site-wide social card: a PNG (not SVG) so Discord/Twitter/Facebook render it
+  // for pages without a dedicated day/category card.
+  await writeBinary(`${dist.replace(/\/$/, '')}/og/default.png`, generateOgPng())
   await write(dist, 'manifest.webmanifest', JSON.stringify({
     name: SITE.name,
     short_name: 'FreebuffLog',

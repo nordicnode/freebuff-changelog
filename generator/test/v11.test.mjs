@@ -23,6 +23,11 @@ test('grounding: backticked calls and separator-formatted numbers are not typos'
   assert.deepEqual(ungroundedIdentifiers('Billed at 12500.', 'price_cents = 12_500'), [])
   assert.deepEqual(ungroundedIdentifiers('Billed at 12500.', 'price_cents = 12_501'), ['12500'], 'a different number is still a wrong number')
   assert.deepEqual(ungroundedIdentifiers('Adds `runMissingSmoke()`.', 'nothing here'), ['runMissingSmoke()'])
+  // A computed percentage is a derived share, not a copied literal, so it must
+  // not be flagged even though the corpus never spells the number out.
+  assert.deepEqual(ungroundedIdentifiers('Internal work is 51% of the total.', 'nothing here'), [], 'a percentage is not an invented number')
+  assert.deepEqual(ungroundedIdentifiers('Raised the cap to 50 %.', 'nothing here'), [], 'percentage with a space is exempt too')
+  assert.deepEqual(ungroundedIdentifiers('Raised the cap to 500.', 'nothing here'), ['500'], 'a bare number is still checked')
 })
 
 test('pruneKnownInputs: names that exist at the base rev are not new inputs; lookups fail open', async (t) => {

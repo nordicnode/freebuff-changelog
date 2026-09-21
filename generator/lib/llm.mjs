@@ -1052,6 +1052,10 @@ export function ungroundedIdentifiers (text, corpus) {
   for (const m of prose.matchAll(/(?<![\w.])(\d{2,})(?!\w)/g)) {
     const n = m[1]
     if (n.length === 4 && +n >= 1900 && +n <= 2100) continue
+    // A computed percentage ("51%", "50 %") is a derived share, not a literal
+    // the model copied from the diff: the corpus spells the ratio out nowhere, so
+    // flagging it is a false positive on an otherwise-correct summary.
+    if (/^\s*%/.test(prose.slice(m.index + m[0].length))) continue
     if (out.includes(n)) continue
     if (!numericHit(n)) out.push(n)
   }

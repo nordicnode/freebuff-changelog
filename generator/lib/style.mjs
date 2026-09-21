@@ -168,6 +168,8 @@ main{
   margin:0 auto;
   padding:0 20px 80px;
 }
+.skip-link{position:absolute;left:8px;top:-48px;z-index:100;background:var(--panel);color:var(--txt);border:1px solid var(--term-border-strong);border-radius:3px;padding:8px 12px;font-size:.82rem;text-decoration:none;transition:top .12s}
+.skip-link:focus{top:8px}
 a{
   color:var(--txt);
   text-decoration:underline;
@@ -675,7 +677,7 @@ nav.term-nav a.active{
 .stat-figure-lbl{font-size:.66rem;letter-spacing:.07em;color:var(--txt-subtle)}
 .stat-figure-val{font-size:1.45rem;line-height:1.2;font-weight:600;color:var(--txt);font-variant-numeric:tabular-nums}
 .stat-figure-note{font-size:.68rem;color:var(--txt-subtle);line-height:1.4}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;margin:12px 0}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr));gap:12px;margin:12px 0}
 .stat-card{background:var(--panel);border:1px solid var(--term-border);border-radius:3px;padding:12px 14px 14px}
 .stat-span{grid-column:1/-1}
 .stat-card-hdr{display:flex;align-items:baseline;justify-content:space-between;gap:12px;border-bottom:1px solid var(--term-border);padding-bottom:7px;margin-bottom:10px}
@@ -702,7 +704,7 @@ nav.term-nav a.active{
 .stat-num i{font-style:normal}
 .stat-num .pos,.stat-figure-val .pos{color:var(--term-green)}
 .stat-num .neg,.stat-figure-val .neg{color:var(--term-red)}
-.stat-share{margin-left:7px;opacity:.65}
+.stat-share{margin-left:7px;opacity:.8}
 .stat-delta{margin-left:6px}
 .stat-trend{grid-area:trend;display:flex;justify-content:flex-end;min-width:0}
 /* The full-width quality card has horizontal room the base grid never budgeted
@@ -2680,7 +2682,7 @@ mark.search-match{
   align-items:center;
   gap:8px;
   flex:1;
-  min-width:240px;
+  min-width:min(240px,100%);
 }
 .model-search-prompt{
   color:var(--term-cyan);
@@ -2689,7 +2691,7 @@ mark.search-match{
 }
 .model-search-input{
   flex:1;
-  max-width:320px;
+  max-width:min(320px,100%);
   background:var(--code);
   border:1px solid var(--term-border);
   color:var(--txt);

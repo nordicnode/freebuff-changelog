@@ -1,5 +1,6 @@
 // generator/lib/feed.mjs - RSS feeds (XML render + XSL stylesheet), favicons.
 // Pure render helpers; buildSite() in site.mjs passes entries and writes output.
+import { deflateSync } from 'node:zlib'
 import { escapeHtml as esc } from './util.mjs'
 
 export function generateFaviconIco () {
@@ -80,6 +81,41 @@ export function ogCardSvg (dayLabel, titles, stats) {
     + `<text x="48" y="128" font-family="monospace" font-size="28" fill="#9aa4ae">${esc(dayLabel)} · ${esc(stats)}</text>`
     + rows + `</svg>`
 }
+// Minimal PNG encoder: RGBA `raw` (width*height*4) -> a valid PNG buffer using
+// zlib "stored" (uncompressed) blocks. Shared by the favicon icons and the OG
+// social card, so a bitmap can be emitted with zero image dependencies.
+function encodePng (width, height, raw) {
+  const crcTable = (() => {
+    const t = new Int32Array(256)
+    for (let n = 0; n < 256; n++) {
+      let c = n
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 8
+      t[n] = c
+    }
+    return t
+  })()
+  const crc = (buf) => {
+    let c = 0xffffffff
+    for (const b of buf) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8)
+    return (c ^ 0xffffffff) >>> 0
+  }
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(data.length)
+    const body = Buffer.concat([Buffer.from(type, 'ascii'), data])
+    const cs = Buffer.alloc(4); cs.writeUInt32BE(crc(body))
+    return Buffer.concat([len, body, cs])
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(width, 0); ihdr.writeUInt32BE(height, 4)
+  ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0
+  const rows = []
+  for (let y = 0; y < height; y++) rows.push(Buffer.concat([Buffer.from([0]), raw.subarray(y * width * 4, (y + 1) * width * 4)]))
+  // node:zlib emits a spec-compliant IDAT (zlib header + deflate + adler), so a
+  // flat-colour tile compresses to a few KB instead of raw RGBA megabytes.
+  const idat = deflateSync(Buffer.concat(rows))
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', idat), chunk('IEND', Buffer.alloc(0))])
+}
+
 // Same >_ mark as the favicon at 192 and 512 for the PWA manifest.
 export function generateIconPng (size = 192) {
   const px = (x, y) => {
@@ -141,6 +177,38 @@ export function generateIconPng (size = 192) {
   })()
   const idat = Buffer.concat([zlib, adler])
   return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', idat), chunk('IEND', Buffer.alloc(0))])
+}
+
+// 1200x630 social card as PNG. Discord, Twitter/X and Facebook do not render an
+// SVG og:image, so the site-wide default has to be a bitmap. Text rasterization
+// is out of scope for a zero-dependency build, so this is a branded tile: the >_
+// prompt mark and a few dim "change rows" on the dark terminal palette.
+export function generateOgPng () {
+  const W = 1200, H = 630
+  const raw = Buffer.alloc(W * H * 4)
+  const put = (x, y, r, g, b) => { const o = (y * W + x) * 4; raw[o] = r; raw[o + 1] = g; raw[o + 2] = b; raw[o + 3] = 255 }
+  const band = 150
+  const t = 26, gx = 110, gy = 360
+  const rowsArr = [[460, 1120, 300], [460, 1040, 370], [460, 900, 440]]
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      let r = 0x0d, g = 0x11, b = 0x17
+      if (y < band) { r = 0x16; g = 0x1b; b = 0x22 }
+      else if (y < band + 4) { r = 0x58; g = 0xa6; b = 0xff } // cyan accent under the band
+      if (x >= gx && x <= gx + 120) {
+        const p = (x - gx) / 120
+        const ycTop = (gy - 90) + 90 * p
+        const ycBot = (gy + 90) - 90 * p
+        if (Math.abs(y - ycTop) < t || Math.abs(y - ycBot) < t) { r = 0x58; g = 0xa6; b = 0xff }
+      }
+      if (x >= gx + 150 && x <= gx + 300 && y >= gy + 55 && y < gy + 55 + t) { r = 0x58; g = 0xa6; b = 0xff }
+      for (const [x0, x1, by] of rowsArr) {
+        if (x >= x0 && x <= x1 && y >= by && y < by + 26) { r = 0x30; g = 0x36; b = 0x3d }
+      }
+      put(x, y, r, g, b)
+    }
+  }
+  return encodePng(W, H, raw)
 }
 
 export const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="4" fill="#0d1117"/><text x="5" y="22" font-family="monospace" font-weight="bold" font-size="20" fill="#58a6ff">&gt;_</text></svg>`

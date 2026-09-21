@@ -1304,6 +1304,55 @@ test('models page includes interactive lineup matrix and date scrubber', async (
   assert.match(modelsHtml, /<div class="footer-shortcuts">[\s\S]*?<button[^>]*data-kb-modal[^>]*>\[\?\]<\/button>/, 'footer has single dedicated shortcuts [?] button')
 })
 
+test('layout gates the in-flight nav, uses a PNG og:image, and emits JSON-LD + a11y hooks', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-seo-a11y-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const entry = {
+    kind: 'community', sha: 'cccc33334444555566667777888899990000aaaa', date: '2026-09-12T10:00:00Z',
+    day: '2026-09-12', author: 'dev', areas: ['CLI'], category: 'CLI', significance: 'notable',
+    title: 'Add feature', summary: 'A feature.', stats: { additions: 10, deletions: 2 },
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: ['a.ts'], removed: [], renamed: [], modified: [] }
+  }
+  const release = {
+    kind: 'release', sha: 'dddd4444555566667777888899990000aaaabbbb', date: '2026-09-13T10:00:00Z',
+    day: '2026-09-13', author: 'dev', areas: ['CLI'], category: 'Releases', significance: 'major',
+    version: '0.0.200', title: 'Release 0.0.200', summary: 'Version bump.', stats: { additions: 1, deletions: 1 },
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['package.json'] }
+  }
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-15T00:00:00Z',
+    headSha: 'a'.repeat(40), counts: { entries: 2 }, entries: [entry, release]
+  }
+  const prs = [{ number: 7, title: 'Open PR', author: 'x', created: '2026-09-01T00:00:00Z', labels: [] }]
+
+  await buildSite({ changelog, openPrs: prs, prMeta: { total: 1, ageMin: 5 }, dist })
+  const home = await readFile(join(dist, 'index.html'), 'utf8')
+  assert.match(home, /href="\/in-flight\/"/, 'nav shows /in-flight when PRs are open')
+  assert.match(home, /property="og:image" content="https?:\/\/[^"]+\/og\/default\.png"/, 'default og:image is the PNG card')
+  assert.match(home, /<script type="application\/ld\+json">[\s\S]*"ItemList"/, 'home carries an ItemList JSON-LD')
+  assert.match(home, /class="skip-link" href="#main"/, 'skip-to-content link present')
+  assert.match(home, /<main id="main">/, 'main has the id the skip link targets')
+  assert.match(home, /<nav class="term-nav" aria-label="Primary">/, 'nav is labelled')
+  assert.match(home, /role="dialog" aria-modal="true" aria-labelledby="kb-title"/, 'shortcuts modal is a labelled dialog')
+  assert.match(home, /data-theme-val="dark" aria-pressed="true"/, 'active theme button exposes aria-pressed')
+
+  const day = await readFile(join(dist, 'day/2026-09-13/index.html'), 'utf8')
+  assert.match(day, /<script type="application\/ld\+json">[\s\S]*"ItemList"/, 'day page carries an ItemList JSON-LD')
+
+  const rel = await readFile(join(dist, 'release/0.0.200/index.html'), 'utf8')
+  assert.match(rel, /<script type="application\/ld\+json">[\s\S]*"SoftwareSourceCode"[\s\S]*"version":"0\.0\.200"/, 'release page carries SoftwareSourceCode')
+
+  const ogPng = await readFile(join(dist, 'og/default.png'))
+  assert.ok(ogPng.length > 100 && ogPng[0] === 0x89 && ogPng[1] === 0x50, 'og/default.png is a real PNG')
+
+  // With no open PRs the /in-flight/ page is not generated, so the nav must not link it.
+  const dist2 = await mkdtemp(join(tmpdir(), 'fbweb-seo-a11y-empty-'))
+  t.after(() => rm(dist2, { recursive: true, force: true }))
+  await buildSite({ changelog, openPrs: [], prMeta: {}, dist: dist2 })
+  const home2 = await readFile(join(dist2, 'index.html'), 'utf8')
+  assert.doesNotMatch(home2, /href="\/in-flight\/"/, 'nav hides /in-flight when there are no open PRs')
+})
+
 test('in-flight page paginates open PRs into pages of 25 with keyboard and pill navigation', async (t) => {
   const dist = await mkdtemp(join(tmpdir(), 'fbweb-inflight-pager-'))
   t.after(() => rm(dist, { recursive: true, force: true }))
