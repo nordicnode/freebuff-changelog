@@ -1,6 +1,10 @@
 // generator/lib/style.mjs - site stylesheet (single CSS source).
 export const CSS = `
 *,*::before,*::after{box-sizing:border-box}
+/* One focus ring for everything interactive that has no bespoke one (chips,
+   archive tabs and the skip link keep theirs). Without this, theme buttons,
+   diff-mode buttons, copy buttons and summaries were keyboard-invisible. */
+a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,summary:focus-visible{outline:1px solid var(--term-cyan);outline-offset:1px}
 :root, [data-theme="dark"]{
   color-scheme:dark;
   --bg:#0d1117;
@@ -583,6 +587,11 @@ nav.term-nav a.active{
 .chip-n{margin-left:5px;font-size:.68rem;color:var(--txt-subtle)}
 .chip-churn{border-style:dashed}
 .chip-churn.active{border-color:var(--term-amber);background:var(--amber-tint-bg)}
+/* Month nav on the /changes/ pages: same chip dialect, but links. */
+.browse-months{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 4px}
+.bmonth{display:inline-flex;align-items:center;font:inherit;font-size:.72rem;color:var(--txt-subtle);background:transparent;border:1px solid var(--term-border);border-radius:2px;padding:2px 8px;text-decoration:none}
+.bmonth:hover{color:var(--txt);border-color:var(--term-border-strong)}
+.bmonth.active{color:var(--txt);border-color:var(--term-cyan);background:var(--cyan-tint-bg)}
 .filter-note{margin:0 0 10px;font-size:.8rem;color:var(--txt-subtle);text-align:center}
 .filter-note b{color:var(--txt-dim)}
 .filter-note em{font-style:normal;color:var(--term-amber)}
@@ -3028,4 +3037,11 @@ mark.search-match{
 
 /* Ensure meta-links in compact change rows align to the right */
 .crow .meta-links{margin-left:auto;font-size:.74rem}
+
+/* Honour the OS motion preference the same way the scripted scrolls do
+   (scrollToEl checks matchMedia): smooth scroller and every hover/expand
+   transition collapse to nothing for readers who asked for reduced motion. */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important;scroll-behavior:auto !important}
+}
 `

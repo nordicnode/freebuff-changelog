@@ -14,7 +14,7 @@
 //   LLM_MODEL                  default github:gpt-4o-mini
 //   LLM_TIMEOUT_MS            per-request timeout including body reads (default 60000)
 //   CHANGELOG_LLM_LIMIT        max commits summarized per run (default 60; 0 = no cap)
-//   CHANGELOG_LLM_CONCURRENCY  parallel API calls (default 5)
+//   CHANGELOG_LLM_CONCURRENCY  parallel API calls (default 2)
 //   CHANGELOG_ELI5_LIMIT       plain-English pass budget (defaults to the above)
 //   CHANGELOG_ELI5_DIFF=0      explain from the summary only, skip the diff
 //   CHANGELOG_ELI5_DIFF_BYTES  diff budget sent to the plain-English pass (6000)
@@ -1401,7 +1401,15 @@ export async function loadPrIndex (dataDir) {
   // Open first, so a live PR wins over a stale memory of it.
   for (const pr of [...(prsData.prs || []), ...(merged.prs || [])]) {
     if (pr.number && prsByNum.has(pr.number)) continue
-    if (pr.number) prsByNum.set(pr.number, pr)
+    if (pr.number) {
+      // The list endpoint never carries the PR's file list, and only
+      // rememberClosedPrs() fills `paths` for closed ones -- without this the
+      // file-match path was structurally dead for every still-open PR. The
+      // stored preview diff is already on disk for anything decoration
+      // fetched, so read the paths back off it.
+      if (!pr.paths?.length && pr.number) pr.paths = await pathsFromStoredDiff(dataDir, pr.number)
+      prsByNum.set(pr.number, pr)
+    }
     for (const c of (pr.commitsList || [])) {
       if (c.sha) {
         prsBySha.set(c.sha.toLowerCase(), pr)
@@ -1410,6 +1418,14 @@ export async function loadPrIndex (dataDir) {
     }
   }
   return { prsByNum, prsBySha }
+}
+
+async function pathsFromStoredDiff (dataDir, number) {
+  const { existsSync } = await import('node:fs')
+  const { readFile } = await import('node:fs/promises')
+  const p = `${dataDir}/pr-diffs/${number}.diff`
+  if (!existsSync(p)) return []
+  try { return diffPaths(await readFile(p, 'utf8')).slice(0, 40) } catch { return [] }
 }
 
 // PRs that were open at the last fetch and are not now: keep what the summary
@@ -1967,7 +1983,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         e.ai = { ...record }
         apiCalls++
         cacheModified = true
-        log(`LLM summarized ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})${record.ungrounded ? ` [ungrounded: ${record.ungrounded.slice(0, 3).join(', ')}]` : ''}`)
+        log(`LLM summarized ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})${record.pr ? ` [PR #${record.pr}${record.prMatched === 'files' ? ` by files, ${Math.round((record.prConfidence || 0) * 100)}%` : ''}]` : ''}${record.ungrounded ? ` [ungrounded: ${record.ungrounded.slice(0, 3).join(', ')}]` : ''}`)
       } catch (err) {
         log(`LLM failed for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
         const transient = isTransientError(err)

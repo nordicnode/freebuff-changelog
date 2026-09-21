@@ -173,6 +173,48 @@ ${body}
 </div>
 </main>
 <script>
+// One motion preference for every scripted scroll: the pages jump around with
+// smooth scrolling, and a reader who asked their OS for reduced motion should
+// not be nauseated by j/k navigation or a search selection.
+var REDUCE_MOTION = false;
+try { REDUCE_MOTION = !!(window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (_) {}
+function scrollToEl (el, block) {
+  if (!el) return;
+  try { el.scrollIntoView({ behavior: REDUCE_MOTION ? 'auto' : 'smooth', block: block || 'nearest' }); }
+  catch (_) { try { el.scrollIntoView(); } catch (__) {} }
+}
+
+// The JUMP select ships with only its first screen of days server-side (~42 KB
+// of option markup was riding on every one of the 731 day pages); the full list
+// hydrates from /api/days.json the first time a reader opens it. No-JS keeps
+// the recent dates, which is the range anyone reaches for by default.
+(function setupDayJump () {
+  var sel = document.querySelector('.day-jump select');
+  if (!sel || sel.dataset.hydrated === '1') return;
+  function hydrate () {
+    if (sel.dataset.hydrated === '1') return;
+    sel.dataset.hydrated = '1';
+    fetch('/api/days.json').then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (days) {
+      var frag = document.createDocumentFragment();
+      days.forEach(function (d) {
+        var o = document.createElement('option');
+        o.value = '/day/' + d[0] + '/';
+        o.textContent = d[2] + ' (' + d[1] + ')';
+        frag.appendChild(o);
+      });
+      var keep = sel.value;
+      sel.innerHTML = '<option value="">--pick a date--</option>';
+      sel.appendChild(frag);
+      if (keep) sel.value = keep;
+    }).catch(function () { sel.dataset.hydrated = ''; });
+  }
+  sel.addEventListener('focus', hydrate);
+  sel.addEventListener('mousedown', hydrate);
+})();
+
 function updateSyncAge() {
   const el = document.querySelector('.sync-age');
   if (!el || !el.dataset.generated) return;
@@ -276,7 +318,7 @@ function openHashTarget() {
   }
   if (target && target.tagName === 'DETAILS' && target.classList.contains('entry')) {
     target.open = true;
-    try { target.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (_) {}
+    scrollToEl(target, 'start');
   }
 }
 window.addEventListener('DOMContentLoaded', openHashTarget);
@@ -293,7 +335,7 @@ function setActiveEntry(idx) {
   if (idx >= entries.length) idx = entries.length - 1;
   activeEntryIdx = idx;
   entries.forEach((e, i) => e.classList.toggle('kb-active', i === idx));
-  entries[idx].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  scrollToEl(entries[idx], 'nearest');
 }
 
 document.addEventListener('keydown', (e) => {
@@ -306,7 +348,26 @@ document.addEventListener('keydown', (e) => {
     if (isInput) { document.activeElement.blur(); return; }
   }
 
+  // With the shortcuts dialog open, Tab walks the dialog only -- focus must not
+  // leak to the page behind an aria-modal="true" box.
+  if (e.key === 'Tab') {
+    const modal = document.getElementById('kb-modal');
+    if (modal && !modal.hidden) {
+      const items = modal.querySelectorAll('button, a[href]');
+      if (items.length) {
+        const first = items[0], last = items[items.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+      return;
+    }
+  }
+
   if (isInput) return;
+  // Enter and Space belong to whatever control has focus: a keyboard reader who
+  // used j/k once and then Tabs to a link must be able to activate that link
+  // without the marked entry toggling in the same keystroke.
+  if ((tag === 'A' || tag === 'BUTTON' || tag === 'SUMMARY') && (e.key === 'Enter' || e.key === ' ')) return;
   if (e.ctrlKey || e.metaKey || e.altKey) return;
 
   if (e.key === '?') {
@@ -417,9 +478,15 @@ function applyReadingMode (isPlain) {
     btn.classList.toggle('active', isPlain);
   });
   if (isPlain) {
-    document.querySelectorAll('section.day details.entry:not([hidden])').forEach(e => {
-      if (e.querySelector('.eli5')) e.open = true;
-    });
+    // Open in frame-batched groups: setting .open on two hundred <details> in
+    // one task laid out the whole day at once and hung the tab for a visible
+    // beat on large days.
+    var toOpen = [].slice.call(document.querySelectorAll('section.day details.entry:not([hidden])')).filter(function (x) { return x.querySelector('.eli5'); });
+    (function openBatch (i) {
+      var n = 0;
+      for (; i < toOpen.length && n < 25; i++, n++) toOpen[i].open = true;
+      if (i < toOpen.length) (window.requestAnimationFrame || function (f) { setTimeout(f, 0); })(function () { openBatch(i); });
+    })(0);
   }
 }
 
@@ -542,11 +609,14 @@ function legacyCopy (text) {
 function copyDiff(btn) {
   const body = btn.closest('.diff-body');
   const pre = body ? body.querySelector('.diff-pre') : null;
-  if (!pre) return;
-  const text = pre.innerText;
-  navigator.clipboard.writeText(text).then(() => {
+  // The split view renders a table, not a <pre>: fall back to the raw diff the
+  // renderer kept on the body. And route through copyText(), the one clipboard
+  // helper with a legacy fallback -- every other copy path has it; this was not.
+  const text = pre ? pre.innerText : (body && body.dataset.raw) || '';
+  if (!text) return;
+  copyText(text).then((ok) => {
     const orig = btn.innerText;
-    btn.innerText = '[copied!]';
+    btn.innerText = ok ? '[copied!]' : '[copy blocked]';
     setTimeout(() => { btn.innerText = orig; }, 1800);
   });
 }
@@ -589,7 +659,15 @@ document.addEventListener('toggle', async (ev) => {
     renderDiff(body, text, label, viewUrl);
   } catch (err) {
     const ghUrl = el.dataset.gh || (sha ? 'https://github.com/CodebuffAI/freebuff/commit/' + sha : '');
-    body.innerHTML = '<div class="diff-notice">Full diff not cached locally. ' + (ghUrl ? '<a href="' + htmlEsc(ghUrl) + '" target="_blank" rel="noopener">View on GitHub &rarr;</a>' : 'View the PR on GitHub for the full diff.') + '</div>';
+    // Say which failure this was: a 404 means the file is genuinely not shipped,
+    // anything else is a hiccup that a re-toggle can recover. Claiming "not
+    // cached locally" over a dropped connection sent readers to GitHub for a
+    // diff that was sitting right there.
+    const missing = /HTTP 404/.test(String((err && err.message) || ''));
+    const lead = missing
+      ? 'Full diff not cached locally. '
+      : 'Could not load the stored diff right now (the file is on the site, this is a fetch failure). Close and reopen this block to retry. ';
+    body.innerHTML = '<div class="diff-notice">' + lead + (ghUrl ? '<a href="' + htmlEsc(ghUrl) + '" target="_blank" rel="noopener">View on GitHub &rarr;</a>' : 'View the PR on GitHub for the full diff.') + '</div>';
   }
 }, true);
 
@@ -772,7 +850,7 @@ function renderDiff(container, text, label, ghUrl, mode) {
       const idx = e.target.value;
       if (idx !== '') {
         const target = pre.querySelector('#diff-f-' + idx);
-        if (target) target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        if (target) scrollToEl(target, 'nearest');
       }
     };
   }
@@ -1227,6 +1305,34 @@ function qualityCard (q, card, bar, share) {
     'stat-span quality-card')
 }
 
+// The latest committed golden-set eval run, shown beside the quality card.
+// The harness had been silent for months -- results only live in
+// data/eval/results/ once somebody runs `eval`, and without the numbers on
+// this page a regression looks exactly like a quiet week. When there is no
+// committed run, the card says so rather than disappearing.
+function evalCard (r, card, q, overridesDoc) {
+  const ovlKeys = Object.keys(overridesDoc || {}).length
+  const row = (lbl, html, note) => `<div class="stat-row"><span class="stat-lbl">${esc(lbl)}</span><span class="stat-track"></span><span class="stat-num">${html}</span><span class="stat-trend">${note ? `<span class="stat-note">${esc(note)}</span>` : ''}</span></div>`
+  if (!r?.metrics) {
+    return card('GOLDEN-SET EVAL', 'harness status',
+      row('latest run', '<span class="stat-note">none committed</span>', 'run cli.mjs eval or the weekly eval workflow') +
+      row('human corrections', String(q.overridden), `${ovlKeys} key${ovlKeys === 1 ? '' : 's'} in data/overrides.json`))
+  }
+  const m = r.metrics, c = m.counts || {}
+  const pc = (v, n) => v == null ? '<span class="stat-note">not scored</span>' : `${Math.round(v * 100)}%${n != null && n !== m.n ? ` <i class="stat-share">n=${n}</i>` : ''}`
+  const j2 = (v) => v == null ? '-' : v.toFixed(2)
+  return card('GOLDEN-SET EVAL', `prompt v${r.promptV} · ${String(r.at || '').slice(0, 10)} · ${m.n} rows (${r.golden?.verified ?? 0} human-verified)`,
+    row('grounded', pc(m.grounded, c.grounded), 'no unverified identifiers') +
+    row('cause visible', pc(m.whyRate, c.whyRate), 'summary states why') +
+    row('hype free', pc(m.hypeFree, c.hypeFree)) +
+    row('must-mention', m.mustMention == null ? '<span class="stat-note">not scored</span>' : `${Math.round(m.mustMention * 100)}%`, c.mustMention != null && c.mustMention !== m.n ? `n=${c.mustMention}` : '') +
+    (m.judge?.faithfulness != null
+      ? row('judge f/c/cl', `${j2(m.judge.faithfulness)} / ${j2(m.judge.completeness)} / ${j2(m.judge.clarity)}`, c.judge != null && c.judge !== m.n ? `n=${c.judge}` : '')
+      : row('judge', '<span class="stat-note">not run</span>', 'eval without --no-judge')) +
+    row('previous run', r.previous ? `${String(r.previous.at || '').slice(0, 10)} (v${r.previous.promptV})` : '<span class="stat-note">first committed run</span>') +
+    row('human corrections', String(q.overridden), `${ovlKeys} key${ovlKeys === 1 ? '' : 's'} in data/overrides.json`))
+}
+
 // Which release first included this commit, per version track. `shipped` is the
 // Map computeShippedIn() builds once per build.
 function shippedInHtml (e, shipped) {
@@ -1473,7 +1579,7 @@ export function formatCommentHtml (text) {
 
 async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, '')}/${p}`, html) }
 
-export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null }) {
+export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, evalResult = null, overridesDoc = null }) {
   const trafficCount = traffic?.count ?? 0
   const trafficUniques = traffic?.uniques ?? 0
   activeTraffic = { count: trafficCount, uniques: trafficUniques }
@@ -1528,10 +1634,12 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
   // screen, the URL, the pager and a shared link can never drift apart.
   const pageCount = byDay.length
   const timelineHref = (i) => (i === 0 ? '/' : `/day/${byDay[i].day}/`)
-  const dayOptions = byDay.map(d => `<option value="/day/${d.day}/">${esc(fmtDateHuman(d.day))} (${d.entries.filter(e => !e.noise).length})</option>`).join('')
-  // One select per page, not two: 721 options is ~42 KB of markup, and the second
-  // copy used to be 55% of the front page's bytes. The bottom bar points at the
-  // top one instead, which also says where the control is.
+  // One select per page, not two (the duplicate once cost 55% of the front
+  // page), and only the first 45 days in the markup (731 options was ~42 KB of
+  // every day page). setupDayJump() in the shell hydrates the full list from
+  // /api/days.json on first open; the server-rendered head keeps no-JS usable
+  // for the range anyone reaches for by default.
+  const dayOptions = byDay.slice(0, 45).map(d => `<option value="/day/${d.day}/">${esc(fmtDateHuman(d.day))} (${d.entries.filter(e => !e.noise).length})</option>`).join('')
   const dayJump = (current, withId) => `<form class="day-jump"${withId ? ' id="day-jump"' : ''} action="/day/${current}/" method="get" onsubmit="location.href=this.d.value;return false"><label>JUMP:<select name="d" onchange="if(this.value)location.href=this.value"><option value="">--pick a date--</option>${dayOptions}</select></label></form>`
   const jumpLink = '<a href="#day-jump">[jump to a date &uarr;]</a>'
 
@@ -1789,6 +1897,13 @@ ${rows.map(e => {
     }))
     const ogTitles = d.entries.slice(0, 3).map(e => e.ai?.title || e.title || '')
     await write(dist, `og/${d.day}.svg`, ogCardSvg(fmtDateHuman(d.day), ogTitles, `${real} changes`))
+    // The permalink resolver reads one card out of this array instead of
+    // downloading the whole day page for it: /c/<sha> used to move ~500 KB to
+    // show 2 KB. Same renderer as the day page (one source of markup), one
+    // entry per day file, ordered newest-first like the page itself.
+    await write(dist, `entry-frags/${d.day}.json`, JSON.stringify(
+      d.entries.map(e => [e.sha.slice(0, 12), entryCard(e, false, relatedIdx, cardOpts(e))])
+    ))
   })
   await pool(timelineTasks, 16)
 
@@ -2172,16 +2287,32 @@ ${rows.map(e => {
     }))
   }), 8)
 
-  // ----- all-time category lists: /changes/<slug>/; the category tiles live on /archive/
+  // ----- all-time category lists: /changes/<slug>/ plus one page per month
   // The front page renders ~90 real changes, so its chips can only ever narrow
   // that window. These pages are the other half of the question -- "every CLI
   // change, all time" -- and being static they are crawlable, linkable and
   // shareable, which a client-side toggle on the front page can never be.
+  // "All time" used to mean one file per category, and Internal made that a
+  // 2.3 MB page: completeness must not cost first paint, so the list splits by
+  // month. The index page carries the newest month, the month nav is server-
+  // rendered, and every row is still two clicks from the category front door.
+  const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  const monthNameOf = (m) => `${MONTH_NAMES[Number(m.slice(5, 7)) - 1]} ${m.slice(0, 4)}`
+  const browseMonthUrls = []
   const browseTasks = browseList.map(b => async () => {
     const list = b.list // already newest-first, same order as the timeline
-    const days = groupByDay(list)
     const unit = b.churn ? 'churn' : 'change'
-    const body = `<section class="hero">
+    const days = groupByDay(list)
+    const byMonth = new Map()
+    for (const e of list) {
+      const m = e.day.slice(0, 7)
+      if (!byMonth.has(m)) byMonth.set(m, [])
+      byMonth.get(m).push(e)
+    }
+    const months = [...byMonth.keys()].sort().reverse()
+    const pageHref = (m) => m === months[0] ? `/changes/${b.slug}/` : `/changes/${b.slug}/${m}/`
+    const rssLink = b.churn || ['major', 'models', 'releases', 'security', 'weekly'].includes(b.slug) ? '' : `<a href="/feed-${esc(b.slug)}.xml">[ rss for ${esc(b.label)} ]</a> `
+    const hero = (month) => `<section class="hero">
   <div class="term-box term-box-slim">
     <div class="term-box-hdr">
       <span class="term-box-title">${b.churn ? 'CHURN_LOG' : 'CATEGORY_LOG'} :: ${esc(b.label)}</span>
@@ -2189,21 +2320,36 @@ ${rows.map(e => {
     </div>
     <div class="term-footer-bar">
       <span>${days.length} days &middot; ${esc(list.at(-1).day)} &rarr; ${esc(list[0].day)}</span>
-      <span>${b.churn || ['major', 'models', 'releases', 'security', 'weekly'].includes(b.slug) ? '' : `<a href="/feed-${esc(b.slug)}.xml">[ rss for ${esc(b.label)} ]</a> `}<a href="/archive/#categories">[ all categories ]</a></span>
+      <span>${rssLink}<a href="/archive/#categories">[ all categories ]</a></span>
     </div>
   </div>
 </section>
-` + days.map(d => `<section class="day">
+<nav class="browse-months" aria-label="Months of ${esc(b.label)}">${months.map(m => `<a class="bmonth${m === month ? ' active' : ''}" href="${pageHref(m)}"${m === month ? ' aria-current="true"' : ''}>${esc(monthNameOf(m))}<span class="chip-n">${byMonth.get(m).length}</span></a>`).join('')}</nav>
+<p class="list-note">Showing ${esc(monthNameOf(month))}: ${byMonth.get(month).length.toLocaleString()} ${unit}${byMonth.get(month).length === 1 ? '' : 's'} of ${b.list.length.toLocaleString()} all-time. Every other month is one click above.</p>
+`
+    const rowsFor = (monthList) => groupByDay(monthList).map(d => `<section class="day">
   <div class="day-line"><h2><time datetime="${d.day}">[ ${esc(fmtDateHuman(d.day))} ]</time></h2><span class="day-count">${d.entries.length} ${unit}${d.entries.length === 1 ? '' : 's'}</span></div>
 ${d.entries.map(changeRow).join('\n')}
-</section>`).join('\n') + `
-<div class="pager"><a href="/archive/#categories">[ all categories ]</a><a href="/">[ back to the timeline ]</a></div>`
-    await write(dist, `changes/${b.slug}/index.html`, layout({
-      title: `${b.label} · all time`, path: `/changes/${b.slug}/`,
-      desc: `All ${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : b.label + ' changes'} recorded from Freebuff's public snapshots, newest first.`,
-      ogImage: `/og/category-${b.slug}.svg`,
-      body
-    }))
+</section>`).join('\n')
+    const pagerFor = (pi) => {
+      const newer = pi > 0 ? months[pi - 1] : null
+      const older = pi + 1 < months.length ? months[pi + 1] : null
+      return `<div class="pager">${newer ? `<a href="${pageHref(newer)}" rel="prev">&larr; ${esc(monthNameOf(newer))}</a>` : '<span></span>'}<span class="pager-page">${esc(monthNameOf(months[pi]))} &middot; month ${pi + 1} of ${months.length}</span>${older ? `<a href="${pageHref(older)}" rel="next">${esc(monthNameOf(older))} &rarr;</a>` : '<span></span>'}</div>
+<a href="/archive/#categories">[ all categories ]</a>`
+    }
+    for (let pi = 0; pi < months.length; pi++) {
+      const m = months[pi]
+      const path = pi === 0 ? `changes/${b.slug}/index.html` : `changes/${b.slug}/${m}/index.html`
+      const urlPath = pageHref(m)
+      browseMonthUrls.push(urlPath)
+      await write(dist, path, layout({
+        title: pi === 0 ? `${b.label} · all time` : `${b.label} · ${monthNameOf(m)}`,
+        path: urlPath,
+        desc: `All ${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : b.label + ' changes'} recorded from Freebuff's public snapshots, newest first. This page: ${monthNameOf(m)}.`,
+        ...(pi === 0 ? { ogImage: `/og/category-${b.slug}.svg` } : {}),
+        body: hero(m) + rowsFor(byMonth.get(m)) + pagerFor(pi)
+      }))
+    }
     await write(dist, `og/category-${b.slug}.svg`, ogCardSvg(b.label,
       list.slice(0, 3).map(e => e.ai?.title || e.title || ''),
       `${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : 'changes'} all time`))
@@ -2740,6 +2886,7 @@ ${weekTabsScript}`
       + card('MOST-CHANGED MODELS', modelTotal ? `${modelTotal} catalog moves across ${modelCounts.size} models` : 'no catalog moves recorded', modelRows2.map(([m, n]) => bar(m, n, modelMax, { href: `/models/${modelSlug(m)}/`, pct: share(n, modelTotal) })).join(''))
       + card('WHAT COUNTED', `${sigTotal.toLocaleString()} changes split by weight`, `<div class="sig-split">${sigRows.map(([s, n]) => `<span class="sig-seg sig-${s}" style="width:${share(n, sigTotal)}%" title="${s}: ${n.toLocaleString()}"></span>`).join('')}</div>` + sigRows.map(([s, n]) => bar(s.toUpperCase(), n, sigMax, { pct: share(n, sigTotal), cls: 'sig-' + s })).join(''), 'stat-span')
       + qualityCard(summaryQuality(entries), card, bar, share)
+      + evalCard(evalResult, card, summaryQuality(entries), overridesDoc)
       + card('SHIPPING CADENCE (LAST 12 MO)', `${monthRows.length} of ${byMonth.size} months &middot; peak ${monthMax.toLocaleString()} changes`, `<div class="cad-spark">${cadenceSpark}</div>` + monthRows.map(([m, n], i) => {
         const prev = i ? monthRows[i - 1][1] : 0
         const d = prev ? Math.round((n - prev) / prev * 100) : null
@@ -2761,10 +2908,10 @@ ${weekTabsScript}`
       SEARCH_SIGS.indexOf(e.significance)
     ]
     if (e.eli5?.text) row.push(e.eli5.text.slice(0, 160))
-    // e[6]: search-only text (never rendered): touched paths + the evidence
-    // citation, so `agent-dir-trust` or `checkRemoteAgentTemplateTrust` finds
-    // the row even when the title says it in plain words.
-    const extra = [...(e.files?.added || []), ...(e.files?.modified || []), e.ai?.evidence || ''].filter(Boolean).join(' ').slice(0, 400)
+    // e[6]: search-only text (never rendered): touched paths, the technical
+    // summary and the evidence citation. A phrase that appears only in the
+    // summary -- the densest text a row owns -- used to be unsearchable.
+    const extra = [...(e.files?.added || []), ...(e.files?.modified || []), (e.ai?.summary || '').slice(0, 240), e.ai?.evidence || ''].filter(Boolean).join(' ').slice(0, 520)
     if (extra) { if (row.length < 6) row.push(''); row.push(extra) }
     return row
   })
@@ -2807,12 +2954,12 @@ ${weekTabsScript}`
           <option value="notable">notable + major</option>
         </select>
       </label>
-      <span id="match-count" style="font-size:.76rem;color:var(--txt-subtle);margin-left:auto;align-self:center"></span>
+      <span id="match-count" role="status" aria-live="polite" style="font-size:.76rem;color:var(--txt-subtle);margin-left:auto;align-self:center"></span>
     </div>
   </div>
 </section>
 
-<div id="hits"></div>
+<div id="hits" aria-label="search results"></div>
 
 <script>
 fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
@@ -2843,7 +2990,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     if (newIdx >= articles.length) newIdx = articles.length - 1;
     selectedHitIdx = newIdx;
     articles.forEach((a, i) => a.classList.toggle('search-hit-active', i === selectedHitIdx));
-    articles[selectedHitIdx].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    scrollToEl(articles[selectedHitIdx], 'nearest');
   };
 
   q.addEventListener('keydown', (e) => {
@@ -2914,7 +3061,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   };
 
   q.addEventListener('input', () => {
-    chips.forEach(c => c.classList.remove('active'));
+    syncChips();
     clearTimeout(t);
     t = setTimeout(go, 90);
   });
@@ -2935,18 +3082,16 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
   const initialCat = params.get('cat') || '', initialSig = params.get('sig') || '';
   if (fcat && initialCat && [...fcat.options].some(o => o.value === initialCat)) fcat.value = initialCat;
   if (fsig && initialSig && [...fsig.options].some(o => o.value === initialSig)) fsig.value = initialSig;
-  if (initialQ) {
-    q.value = initialQ;
-    chips.forEach(c => {
-      if (c.dataset.filter && initialQ.toLowerCase().includes(c.dataset.filter.toLowerCase())) c.classList.add('active');
-      else if (!c.dataset.filter && !initialQ) c.classList.add('active');
-      else c.classList.remove('active');
-    });
-  }
-  if (initialQ || initialCat || initialSig) {
-    chips.forEach(c => c.classList.remove('active'));
-    go();
-  }
+  if (initialQ) q.value = initialQ;
+  // A chip is active when its term is the whole current query, and --all is
+  // active when there is no query. Deep links used to strip every chip of its
+  // active state, leaving the flag row lying about what is on screen.
+  const syncChips = () => chips.forEach(c => {
+    const f = c.dataset.filter || '';
+    c.classList.toggle('active', f ? q.value.trim().toLowerCase() === f.toLowerCase() : !q.value.trim());
+  });
+  syncChips();
+  if (initialQ || initialCat || initialSig) go();
 });
 </script>`
   }))
@@ -3354,6 +3499,7 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     </p>
     ${prMeta.total > openPrs.length ? `<p style="margin:6px 0 0;font-size:.8rem;color:var(--term-amber)">Upstream reports ${prMeta.total} open pull requests; ${prMeta.total - openPrs.length} ${prMeta.total - openPrs.length === 1 ? 'is' : 'are'} not listed yet. The fetch came back short of the count GitHub gives, and every sync run retries it until the list is whole.</p>` : ''}
     ${prMeta.ageMin > 90 ? `<p style="margin:6px 0 0;font-size:.8rem;color:var(--term-amber)">Last successful check was ${prMeta.ageMin >= 60 ? `${Math.round(prMeta.ageMin / 60)} h` : `${prMeta.ageMin} min`} ago -- the sync has not reached GitHub since. A healthy run refreshes this list every few minutes.</p>` : ''}
+    ${mergedPrs?.prs?.length ? `<p style="margin:6px 0 0;font-size:.76rem;color:var(--txt-subtle)">Closed-PR memory: ${mergedPrs.prs.length} recently-closed PR${mergedPrs.prs.length === 1 ? '' : 's'} kept${mergedPrs.updatedAt ? ` (updated ${esc(String(mergedPrs.updatedAt).slice(0, 16).replace('T', ' '))} UTC)` : ''} -- what lets a sync commit that lands after its merge still be matched back to its PR.</p>` : ''}
     ${tagFiltersHtml}
     ${totalPages > 1 ? `<p style="margin:8px 0 0;font-size:.76rem;color:var(--txt-subtle)">Showing <b id="pr-filter-count">${pagePrs.length}</b> of ${pagePrs.length} PRs on this page (PRs ${startIdx + 1}&ndash;${endIdx} of ${openPrs.length} total &middot; page ${pageNum} of ${totalPages}) &middot; press <kbd>n</kbd> / <kbd>p</kbd> to paginate</p>` : ''}
   </div>
@@ -3449,6 +3595,9 @@ ${inFlightScript}`
   }))
 
   await write(dist, 'api/entries.json', JSON.stringify({ generatedAt: generated, head: changelog.headSha, total: entries.length, changes: meaningful.length, churn: churnCount, latest: meaningful.slice(0, 60) }))
+  // The full day list behind the JUMP select: every day page ships only its
+  // first 45 options in markup, and setupDayJump() hydrates the rest from here.
+  await write(dist, 'api/days.json', JSON.stringify(byDay.map(d => [d.day, d.entries.filter(e => !e.noise).length, fmtDateHuman(d.day)])))
   await write(dist, 'api/status.json', JSON.stringify({
     generatedAt: generated,
     headSha: changelog.headSha,
@@ -3512,17 +3661,20 @@ ${inFlightScript}`
 : keys.find(function (k) { return k.indexOf(want) === 0 || want.indexOf(k) === 0 })
 if (!key) { fail('No changelog entry records ' + want + '. It may predate the archive. <a href="/search/">[ search ]</a>'); return }
 var day = map[key]
-return fetch('/day/' + day + '/').then(function (r) {
+// One card out of the day's fragment file, not the whole day page: a shared
+// permalink used to download ~500 KB to show 2 KB. The markup is the day
+// page's own entryCard output, so there is still exactly one renderer -- the
+// diff toggle keeps working because its listener is delegated on document.
+return fetch('/entry-frags/' + day + '.json').then(function (r) {
 if (!r.ok) throw new Error('HTTP ' + r.status)
-return r.text()
-}).then(function (html) {
-var doc = new DOMParser().parseFromString(html, 'text/html')
-var card = doc.getElementById(key)
-if (!card) throw new Error('entry is not on its day page')
-var rows = [].slice.call(doc.querySelectorAll('section.day details.entry'))
-var i = rows.indexOf(card)
-var older = i >= 0 && i < rows.length - 1 ? rows[i + 1] : null
-var newer = i > 0 ? rows[i - 1] : null
+return r.json()
+}).then(function (rows) {
+var i = -1
+for (var k = 0; k < rows.length; k++) { if (rows[k][0] === key) { i = k; break } }
+if (i === -1) throw new Error('entry is not in its day fragment')
+var doc = new DOMParser().parseFromString('<!doctype html><html><body>' + rows[i][1], 'text/html')
+var card = doc.body.firstElementChild
+if (!card) throw new Error('fragment held no card')
 var title = (card.querySelector('h3') || {}).textContent || key
 document.title = title + ' \u00b7 Unofficial Freebuff Changelog'
 var canon = document.createElement('link')
@@ -3530,14 +3682,16 @@ canon.rel = 'canonical'
 canon.href = location.origin + '/day/' + day + '/'
 document.head.appendChild(canon)
 hdr.textContent = 'CHANGE :: ' + key
-when.textContent = day + ' \u00b7 day ' + (i + 1) + ' of ' + rows.length
+when.textContent = day + ' \u00b7 entry ' + (i + 1) + ' of ' + rows.length + ' that day'
 status.innerHTML = '<a href="/day/' + day + '/#' + key + '">[' + rows.length + ' changes that day]</a>'
 card.open = true
 card.hidden = false
 slot.appendChild(document.importNode(card, true))
-ctx.innerHTML = (older ? '<a href="/c/' + older.id + '">&larr; older change</a>' : '<span></span>') +
+var older = i + 1 < rows.length ? rows[i + 1][0] : null
+var newer = i > 0 ? rows[i - 1][0] : null
+ctx.innerHTML = (older ? '<a href="/c/' + older + '">&larr; older change</a>' : '<span></span>') +
 '<a href="/day/' + day + '/">' + day + '</a>' +
-(newer ? '<a href="/c/' + newer.id + '">newer change &rarr;</a>' : '<span></span>')
+(newer ? '<a href="/c/' + newer + '">newer change &rarr;</a>' : '<span></span>')
 ctx.hidden = false
 })
 }).catch(function (err) { fail('Could not load this change (' + err.message + '). <a href="/archive/">[ archive ]</a>') })
@@ -3550,7 +3704,7 @@ ctx.hidden = false
   const dayUrls = byDay.map(d => `/day/${d.day}/`)
   const relUrls = vers.map(v => `/release/${v.version}/`)
   const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`)]
-  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/week/', ...weeks.slice(0, 52).map(w => `/week/${w.key}/`), ...browseList.map(b => `/changes/${b.slug}/`), ...(openPrs?.length ? ['/in-flight/'] : [])]
+  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/week/', ...weeks.slice(0, 52).map(w => `/week/${w.key}/`), ...browseMonthUrls, ...(openPrs?.length ? ['/in-flight/'] : [])]
   await write(dist, 'sitemap-days.xml', urlset(dayUrls))
   await write(dist, 'sitemap-releases.xml', urlset(relUrls))
   await write(dist, 'sitemap-models.xml', urlset(modelUrls))

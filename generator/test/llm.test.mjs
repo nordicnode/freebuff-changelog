@@ -1146,10 +1146,19 @@ test('loadPrIndex & findPrMeta: matches PR by number, commit sha, or commit mess
     ]
   }
   await writeFile(join(dir, 'open-prs.json'), JSON.stringify(fakePrs))
+  // Open PRs carry no file list from the GitHub endpoint; loadPrIndex must
+  // backfill `paths` from the stored preview diff, or matchPrByPaths is
+  // structurally dead for every PR that is still open.
+  const { mkdir } = await import('node:fs/promises')
+  await mkdir(join(dir, 'pr-diffs'), { recursive: true })
+  await writeFile(join(dir, 'pr-diffs', '1377.diff'),
+    'diff --git a/cli/src/system.ts b/cli/src/system.ts\n--- a/cli/src/system.ts\n+++ b/cli/src/system.ts\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/cli/src/cpu.ts b/cli/src/cpu.ts\n--- a/cli/src/cpu.ts\n+++ b/cli/src/cpu.ts\n@@ -1 +1 @@\n-x\n+y\n')
 
   const index = await loadPrIndex(dir)
   assert.ok(index.prsByNum.has(1377))
   assert.ok(index.prsBySha.has('31878f417c'))
+  assert.deepEqual(index.prsByNum.get(1377).paths, ['cli/src/system.ts', 'cli/src/cpu.ts'], 'paths backfilled from the stored preview')
+  assert.deepEqual(index.prsByNum.get(1372).paths, [], 'no stored preview means no paths, not a crash')
 
   // Match by e.pr
   const byPr = findPrMeta({ pr: 1377 }, index)

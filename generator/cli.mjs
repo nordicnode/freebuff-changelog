@@ -1185,9 +1185,15 @@ async function cmdBuild () {
   // Human corrections win over everything the model wrote, on every surface
   // (cards, feeds, Discord copy, search), and survive re-summarization because
   // they are applied at render time from their own file.
-  const overrides = await readJson(`${DATA}/overrides.json`, {})
-  const overridden = applyOverrides(changelog.entries, overrides)
+  const overrides = await readJson(`${DATA}/overrides.json`, null)
+  const overridden = applyOverrides(changelog.entries, overrides || {})
   if (overridden) log(`applied ${overridden} human override${overridden === 1 ? '' : 's'} from data/overrides.json`)
+  // The closed-PR memory and the latest golden-set eval ride along to the
+  // renderer: /in-flight/ says how much closure memory backs PR matching, and
+  // /stats/ shows the eval numbers instead of letting the harness stay silent.
+  const mergedPrsDoc = await readJson(`${DATA}/merged-prs.json`, null)
+  const { latestResult } = await import('./lib/eval.mjs')
+  const evalResult = await latestResult(`${DATA}/eval/results`)
   const prsRaw = await readJson(`${DATA}/open-prs.json`, [])
   const prs = Array.isArray(prsRaw) ? prsRaw : (prsRaw?.prs || [])
   const prSummaries = await readJson(`${DATA}/pr-summaries.json`, {})
@@ -1224,7 +1230,7 @@ async function cmdBuild () {
   await mkdir(dist, { recursive: true })
   // The timeline paginates one day per page: `/` is the newest day, every older
   // day is its own /day/<date>/ page.
-  await buildSite({ changelog, openPrs: prs, prMeta, traffic, dist })
+  await buildSite({ changelog, openPrs: prs, prMeta, traffic, dist, mergedPrs: mergedPrsDoc, evalResult, overridesDoc: overrides })
 
   // data/diffs is 106 MB of a 352 MB dist. Two opt-in trims: skip the churn
   // rows' lockfile diffs (CHANGELOG_DIST_SKIP_CHURN_DIFFS=1) and/or ship only

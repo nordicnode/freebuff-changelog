@@ -611,6 +611,8 @@ test('buildSite generates valid static site output', async () => {
     // lists, compact rows, one click from the full body. A chip that says "27
     // here" needs somewhere that can answer "1,413 exist".
     const cliPage = await readFile(join(tmpDist, 'changes/cli/index.html'), 'utf8')
+    assert.match(cliPage, /class="browse-months"/, 'the month nav is server-rendered')
+    assert.match(cliPage, /Showing Sep 2026:/, 'the page says which month it holds')
     assert.match(cliPage, /<div class="crow" id="dddd11112222"/)
     assert.match(cliPage, /href="\/day\/2026-09-13\/#dddd11112222"/, 'compact row links to the full body')
     assert.match(cliPage, /href="https:\/\/github\.com\/CodebuffAI\/freebuff\/commit\/dddd/)
@@ -662,6 +664,22 @@ test('buildSite generates valid static site output', async () => {
     assert.deepEqual(Object.keys(shaDay).sort(), mockChangelog.entries.map(e => e.sha.slice(0, 12)).sort(),
       'every entry is resolvable by its anchor')
     assert.equal(shaDay[mockChangelog.entries[0].sha.slice(0, 12)], mockChangelog.entries[0].day)
+    // /c/<sha> resolves through a per-day fragment file, not the whole day page:
+    // showing one card used to download ~500 KB of markup around it. The cards
+    // are the day page's own entryCard output, so there is still one renderer.
+    const frag = JSON.parse(await readFile(join(tmpDist, 'entry-frags/2026-09-13.json'), 'utf8'))
+    assert.ok(Array.isArray(frag) && frag.every(r => Array.isArray(r) && r.length === 2), 'fragment is [anchor, card markup] pairs')
+    const fragCard = frag.find(r => r[0] === 'dddd11112222')
+    assert.ok(fragCard && /<details class="entry/.test(fragCard[1]), 'the fragment carries the day page\'s own card markup')
+    // The full day list behind the JUMP select (pages ship only their first 45).
+    const daysApi = JSON.parse(await readFile(join(tmpDist, 'api/days.json'), 'utf8'))
+    assert.deepEqual(daysApi.map(d => d[0]), ['2026-09-13', '2026-09-12'], 'days.json is newest-first')
+    assert.equal(daysApi[0][1], 2, 'per-day counts exclude churn')
+    assert.match(indexHtml, /setupDayJump/, 'the shell hydrates the select on open')
+    // Keyboard & motion pins on the shell script.
+    assert.match(indexHtml, /tag === 'A' \|\| tag === 'BUTTON' \|\| tag === 'SUMMARY'/, 'Enter/Space stay with the focused control instead of toggling the marked entry')
+    assert.match(indexHtml, /prefers-reduced-motion: reduce/, 'scripted scrolls honor the motion preference')
+    assert.match(indexHtml, /if \(e\.key === 'Tab'\)/, 'the shortcuts dialog traps Tab while open')
     assert.match(redirectsTxt, /^\/c\/\* \/permalink 200$/m, 'the resolver answers every /c/ address')
     assert.deepEqual(redirectLoops(redirectsTxt), [], 'no rule may reach itself: Cloudflare fails the deploy on one')
     // A rewrite at a `.html` asset is answered with a 307 to the extensionless
