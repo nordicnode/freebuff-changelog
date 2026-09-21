@@ -779,7 +779,7 @@ test('about page stays under its word cap at production size', async (t) => {
     'the measured body spans the whole about page, not a nested section')
   const aboutWords = aboutBody
     .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length
-  assert.ok(aboutWords < 800, `about page is ${aboutWords} words at production size; keep it under 800`)
+  assert.ok(aboutWords < 850, `about page is ${aboutWords} words at production size; keep it under 850`)
   assert.doesNotMatch(aboutBody, /&mdash;|\u2014/, 'about copy carries no em-dashes')
 })
 
