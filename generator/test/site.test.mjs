@@ -303,21 +303,18 @@ test('buildSite generates valid static site output', async () => {
     // e[6] is search-only text: touched paths and the evidence citation.
     assert.ok(searchIdx.ix.some(r => typeof r[6] === 'string' && r[6].length), 'search index tuple carries paths/evidence for identifier search')
     const searchHtml = await readFile(join(tmpDist, 'search/index.html'), 'utf8')
-    // The stylesheet is now one external file (no longer inlined into every
-    // page), so these responsive-pinning checks read styles.css directly.
-    const stylesCss = await readFile(join(tmpDist, 'styles.css'), 'utf8')
     // The two things that made /search/ unusable on a phone, pinned:
     // min-width:0 because a flex item defaults to min-width:auto and a long
     // placeholder is *content* (the row grew past the box); text-size-adjust
     // because mobile browsers inflate type they judge small, and the base is 13.5px.
-    assert.match(stylesCss, /#q\{[^}]*min-width:0/, 'the query input must shrink below its placeholder')
+    assert.match(searchHtml, /#q\{[^}]*min-width:0/, 'the query input must shrink below its placeholder')
     // The input inherited the 13.5px root (1rem) while the site's text runs
     // .72-.82rem, so it was the largest type on the page. Pin it to the .82rem
     // used by the models-page filter, and the prompt beside it with it.
-    assert.match(stylesCss, /#q\{[^}]*font-size:\.82rem/, 'the query input matches the site text scale')
-    assert.match(stylesCss, /\.search-prompt\{[^}]*font-size:\.82rem/, 'the prompt beside it matches too')
-    assert.match(stylesCss, /-webkit-text-size-adjust:100%/, 'no font boosting over the sheet')
-    assert.match(stylesCss, /@media \(max-width:600px\)/, 'form controls go to 16px on phones so iOS does not zoom on focus')
+    assert.match(searchHtml, /#q\{[^}]*font-size:\.82rem/, 'the query input matches the site text scale')
+    assert.match(searchHtml, /\.search-prompt\{[^}]*font-size:\.82rem/, 'the prompt beside it matches too')
+    assert.match(searchHtml, /-webkit-text-size-adjust:100%/, 'no font boosting over the sheet')
+    assert.match(searchHtml, /@media \(max-width:600px\)/, 'form controls go to 16px on phones so iOS does not zoom on focus')
     assert.doesNotMatch(searchHtml, /placeholder="regex/, 'the matcher is word-substring AND, not regex')
     // 360px viewport - 40 main padding - 34 box - 18 row - 6 gap - 86 for the
     // "$ grep -i" prompt = 180px of input, and a 16px monospace advance is 9.6px.
@@ -521,7 +518,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(statsHtml, /class="spark"/)
     // The spark svg carries an intrinsic width, so max-width alone leaves the
     // cadence line at 300px inside a card three times as wide.
-    assert.match(stylesCss, /\.cad-spark \.spark\{[^}]*width:100%/, 'the cadence line stretches to its card')
+    assert.match(statsHtml, /\.cad-spark \.spark\{[^}]*width:100%/, 'the cadence line stretches to its card')
     assert.match(statsHtml, /12-MO TREND/)
     // The page opens with the numbers, not with forty bars, and shares the
     // standard layout measure with the rest of the site.
@@ -599,7 +596,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /classList\.contains\('entry'\)/)
     // The guard is load-bearing for the no-JS default: the hidden attribute only
     // wins if no display rule outranks it.
-    assert.match(stylesCss, /\[hidden\]\{display:none!important\}/)
+    assert.match(indexHtml, /\[hidden\]\{display:none!important\}/)
     // A day page is the same timeline read one day at a time, so it filters the
     // same way: bar present, churn listed but hidden in markup. Nothing
     // disappears -- the day heading still counts the churn row, and one click on
