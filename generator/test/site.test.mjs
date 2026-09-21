@@ -796,7 +796,7 @@ test('about page stays under its word cap at production size', async (t) => {
   // The slice above ends at the first </section>, so a nested <section> inside the
   // body would silently shrink the thing being measured. Fail loudly instead: the
   // last heading and the closing snippet both have to be in the slice.
-  assert.ok(aboutBody.includes('LIMITS') && aboutBody.includes('Markdown:'),
+  assert.ok(aboutBody.includes('LIMITS') && aboutBody.includes('STATUS BADGES'),
     'the measured body spans the whole about page, not a nested section')
   const aboutWords = aboutBody
     .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length

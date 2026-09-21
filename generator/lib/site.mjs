@@ -3215,7 +3215,6 @@ loadIndex().then(({ cats, sigs, ix })=>{
           <h4>FEEDS + DISCORD</h4>
           <ul class="man-ul">
             <li><strong>Feeds:</strong> <a href="/feed.xml">all changes</a> &middot; <a href="/feed-major.xml">major</a> &middot; <a href="/feed-security.xml">security</a> &middot; <a href="/feed-weekly.xml">weekly</a> &middot; <a href="/feed-models.xml">models</a> &middot; <a href="/feed-releases.xml">releases</a> &middot; <a href="/feed.json">JSON</a>. For Discord RSS bots, <code>/feed add &lt;url&gt;</code>.</li>
-            <li><strong>Copy for Discord:</strong> <code>[copy discord]</code> on any entry, or press <kbd>c</kbd>, for paste-ready markdown.</li>
             <li><strong>Webhook broadcast:</strong> <code>npm run broadcast -- --webhook &lt;url&gt;</code> posts new commits and records <code>lastBroadcastSha</code>, so nothing repeats (<code>--limit</code>, <code>--dry-run</code>).</li>
           </ul>
         </div>
@@ -3228,7 +3227,6 @@ loadIndex().then(({ cats, sigs, ix })=>{
             <img src="/badge/status.svg" alt="Status">
             <img src="/badge/changes.svg" alt="Changes">
           </div>
-          <p class="man-snippet">Markdown: <code>[![Version](${SITE.url}/badge/version.svg)](${SITE.url})</code></p>
         </div>
       </div>
 

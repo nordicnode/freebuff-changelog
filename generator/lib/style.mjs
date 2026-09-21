@@ -2192,12 +2192,6 @@ details.more-rows[open]>summary{margin-bottom:6px}
   height:20px;
   display:block;
 }
-.man-snippet{
-  font-size:.78rem;
-  color:var(--txt-dim);
-  margin:6px 0 0;
-  overflow-wrap:anywhere;
-}
 .man-ul{
   margin:0 0 4px;
   padding-left:16px;
