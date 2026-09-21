@@ -76,6 +76,7 @@ function releaseLd (rel) {
 function layout ({ title, path, body, desc, noindex, ogImage, wide, ld }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
+<link rel="stylesheet" href="/styles.css">
 <script>(function(){try{var t=localStorage.getItem('fbTheme');if(t){document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='light'?'#f6f8fa':(t==='amber'?'#120d04':(t==='green'?'#051207':'#0d1117'));}if(localStorage.getItem('fbPlainMode')==='1'){document.documentElement.classList.add('reading-mode-plain');}}catch(_){}})();</script>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#0d1117">
@@ -98,7 +99,6 @@ ${ld ? `<script type="application/ld+json">${ldScript(ld)}</script>` : ''}
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="apple-touch-icon" href="/icon-192.png">
-<link rel="stylesheet" href="/styles.css">
 </head><body${wide ? ' class="page-wide"' : ''}><div id="reading-progress" aria-hidden="true"></div><a class="skip-link" href="#main">Skip to content</a><main id="main">
 <header class="top">
   <div class="brand">
@@ -184,6 +184,26 @@ function scrollToEl (el, block) {
   catch (_) { try { el.scrollIntoView(); } catch (__) {} }
 }
 
+// The stylesheet is a separate render-blocking file now (no longer inlined), so
+// until it loads the document has no styles. A script that forces a synchronous
+// layout during that window makes Firefox paint the unstyled state first -- the
+// jarring flash-of-unstyled-content -- which is exactly what measuring scroll
+// height or scrolling to a #hash on load can do. Gate those first measurements
+// on the stylesheet actually being applied; when it is already loaded (cached or
+// fast) the callback runs synchronously, so nothing regresses.
+function whenStylesReady (fn) {
+  var links = [].slice.call(document.querySelectorAll('link[rel="stylesheet"]'));
+  var pending = links.filter(function (l) { return !l.sheet; });
+  if (!pending.length) { fn(); return; }
+  var done = false, left = pending.length;
+  var finish = function () { if (done) return; done = true; fn(); };
+  pending.forEach(function (l) {
+    l.addEventListener('load', function () { if (--left <= 0) finish(); });
+    l.addEventListener('error', function () { if (--left <= 0) finish(); });
+  });
+  window.addEventListener('load', finish);
+}
+
 // The JUMP select ships with only its first screen of days server-side (~42 KB
 // of option markup was riding on every one of the 731 day pages); the full list
 // hydrates from /api/days.json the first time a reader opens it. No-JS keeps
@@ -237,7 +257,7 @@ updateSyncAge();
     bar.style.width = pct + '%';
   }
   window.addEventListener('scroll', onScroll, { passive: true });
-  onScroll();
+  whenStylesReady(onScroll);
 })();
 
 // Automatically pick up new entries when they land without requiring manual refresh.
@@ -321,7 +341,7 @@ function openHashTarget() {
     scrollToEl(target, 'start');
   }
 }
-window.addEventListener('DOMContentLoaded', openHashTarget);
+window.addEventListener('DOMContentLoaded', function () { whenStylesReady(openHashTarget); });
 window.addEventListener('hashchange', openHashTarget);
 
 let activeEntryIdx = -1;
