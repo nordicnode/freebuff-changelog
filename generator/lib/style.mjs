@@ -104,38 +104,7 @@ a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,su
   --mark-bg:rgba(51,255,102,0.22);
 }
 
-[data-theme="light"]{
-  color-scheme:light;
-  --bg:#f6f8fa;
-  --panel:#ffffff;
-  --panel-hover:#f0f2f5;
-  --term-border:#d0d7de;
-  --term-border-strong:#afb8c1;
-  
-  --txt:#111827;
-  --txt-dim:#374151;
-  --txt-subtle:#4b5563;
-  
-  --term-green:#166534;
-  --term-red:#b91c1c;
-  --term-amber:#854d0e;
-  --term-cyan:#0366d6;
-  
-  --code:#eaecf0;
 
-  --cyan-tint-bg:rgba(3,102,214,0.06);
-  --cyan-tint-border:rgba(3,102,214,0.35);
-  --amber-tint-bg:rgba(133,77,14,0.06);
-  --amber-tint-border:rgba(133,77,14,0.4);
-  --green-tint-bg:rgba(22,101,52,0.06);
-  --red-tint-bg:rgba(185,28,28,0.06);
-  --diff-add-bg:rgba(22,101,52,0.06);
-  --diff-del-bg:rgba(185,28,28,0.06);
-  --diff-hunk-bg:rgba(3,102,214,0.06);
-  --eli5-bg:rgba(133,77,14,.06);
-  --eli5-rule:rgba(133,77,14,.2);
-  --mark-bg:rgba(9,105,218,0.15);
-}
 
 html{
   font:13.5px/1.55 ui-monospace,"SF Mono","Cascadia Mono","JetBrains Mono",Menlo,Monaco,Consolas,monospace;

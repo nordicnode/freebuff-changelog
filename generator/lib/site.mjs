@@ -76,7 +76,7 @@ function releaseLd (rel) {
 function layout ({ title, path, body, desc, noindex, ogImage, wide, ld }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
-<script>(function(){try{var t=localStorage.getItem('fbTheme');if(t){document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='light'?'#f6f8fa':(t==='amber'?'#120d04':(t==='green'?'#051207':'#0d1117'));}if(localStorage.getItem('fbPlainMode')==='1'){document.documentElement.classList.add('reading-mode-plain');}}catch(_){}})();</script>
+<script>(function(){try{var t=localStorage.getItem('fbTheme');if(t){document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='amber'?'#120d04':(t==='green'?'#051207':'#0d1117');}if(localStorage.getItem('fbPlainMode')==='1'){document.documentElement.classList.add('reading-mode-plain');}}catch(_){}})();</script>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#0d1117">
 <title>${esc(title)} · ${SITE.name}</title>
@@ -149,7 +149,6 @@ ${body}
       <button type="button" class="theme-btn active" data-theme-val="dark" aria-pressed="true">[dark]</button>
       <button type="button" class="theme-btn" data-theme-val="amber" aria-pressed="false">[amber]</button>
       <button type="button" class="theme-btn" data-theme-val="green" aria-pressed="false">[green]</button>
-      <button type="button" class="theme-btn" data-theme-val="light" aria-pressed="false">[light]</button>
     </div>
   </div>
 </footer>
@@ -521,7 +520,7 @@ document.addEventListener('click', (ev) => {
   try { localStorage.setItem('fbTheme', val); } catch (_) {}
   const tc = document.querySelector('meta[name="theme-color"]');
   if (tc) {
-    const colors = { dark: '#0d1117', amber: '#120d04', green: '#051207', light: '#f6f8fa' };
+    const colors = { dark: '#0d1117', amber: '#120d04', green: '#051207' };
     tc.content = colors[val] || '#0d1117';
   }
   document.querySelectorAll('[data-theme-val]').forEach(b => {
