@@ -1684,9 +1684,7 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
 
     const statusRow = `<div class="timeline-status-bar">
     <div class="timeline-freshness">${freshness}</div>
-    <div class="timeline-stats">${latest
-    ? `${meaningful.length.toLocaleString()} changes${churnNote}`
-    : `${real} change${real === 1 ? '' : 's'}${churn ? ` <span class="status-sep" aria-hidden="true">&middot;</span> <span class="stats-churn">${churn} churn</span>` : ''}`}</div>
+    ${latest ? '' : `<div class="timeline-stats">${real} change${real === 1 ? '' : 's'}${churn ? ` <span class="status-sep" aria-hidden="true">&middot;</span> <span class="stats-churn">${churn} churn</span>` : ''}</div>`}
     <div class="timeline-bulk-toggle">
       <button type="button" class="timeline-bulk-btn" data-bulk="expand">[expand all]</button>
       <button type="button" class="timeline-bulk-btn" data-bulk="collapse">[collapse all]</button>

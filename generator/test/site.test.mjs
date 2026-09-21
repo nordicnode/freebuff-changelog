@@ -578,7 +578,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /Dependency lockfile updated/)
     assert.match(indexHtml, /\[Churn\]/)
     assert.match(indexHtml, /<span class="day-churn">\+1 churn<\/span>/)
-    assert.match(indexHtml, /3 changes <span class="status-sep"[^>]*>&middot;<\/span> <span class="stats-churn">1 churn<\/span>/, 'hero counts changes and churn separately')
+    assert.doesNotMatch(indexHtml, /class="timeline-stats"/, 'the front page omits the all-time stats line; the day heading already counts today')
     const churnStart = indexHtml.indexOf('id="eeee11112222"')
     const churnNextRow = indexHtml.indexOf('<details class="entry ', churnStart + 30)
     const churnRow = indexHtml.slice(churnStart, churnNextRow === -1 ? churnStart + 4000 : churnNextRow)
