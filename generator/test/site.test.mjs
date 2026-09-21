@@ -511,6 +511,12 @@ test('buildSite generates valid static site output', async () => {
     // word cap is checked in the production-size test below instead of here: this
     // fixture has four entries and three categories, so it under-measures the
     // deployed page (which is the whole point of the cap).
+    // Freebuff Desktop is not in the public mirror, so the page has to name that
+    // blind spot where it defines its own scope, and must not imply elsewhere that
+    // a desktop/ tree is being mapped.
+    assert.match(aboutHtml, /Freebuff Desktop is not open[- ]sourced/i,
+      'the scope paragraph says plainly that Desktop is closed source')
+    assert.doesNotMatch(aboutHtml, /desktop\/web/, 'no desktop/ path exists in the public repo')
     assert.match(aboutHtml, /class="footer-traffic"/)
     assert.match(aboutHtml, /id="footer-clones"/)
     assert.match(aboutHtml, /id="footer-cloners"/)

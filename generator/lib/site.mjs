@@ -3141,6 +3141,12 @@ loadIndex().then(({ cats, sigs, ix })=>{
   // The page names the four surfaces that have their own pages and lumps the rest
   // into one line built from the categories that actually exist, so a new category
   // is never left unlisted by a rewrite of this copy.
+  // Freebuff Desktop ships closed, and the sentence saying so sits in the opening
+  // paragraph rather than LIMITS: a reader who lands on a quiet stretch of desktop
+  // releases needs to arrive at "this mirror cannot see that app" before concluding
+  // nothing changed. The pipeline note below therefore lists no desktop path, even
+  // though summaries mention Desktop daily; the shared code they come from lives in
+  // common/ and the packages, not in a desktop/ tree.
   const aboutSpecial = new Set(['Model Catalog', 'Commands'])
   const areaCats = [...cats.entries()].filter(([c]) => !aboutSpecial.has(c)).sort((a, b) => b[1] - a[1])
   const areaTotal = areaCats.reduce((s, [, n]) => s + n, 0)
@@ -3161,10 +3167,10 @@ loadIndex().then(({ cats, sigs, ix })=>{
     </div>
     <div class="man-body">
       <h4>WHAT IS THIS?</h4>
-      <p>Commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, rebuilt from public git diffs. Upstream ships through snapshot merges with blank messages, so this mirror diffs each snapshot to extract model swaps, version bumps, slash commands, and file churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} commits, updated whenever upstream moves.</p>
+      <p>Commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, rebuilt from public git diffs. Upstream ships through snapshot merges with blank messages, so this mirror diffs each snapshot to extract model swaps, version bumps, slash commands, and file churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} commits, updated whenever upstream moves. Coverage follows that repository: Freebuff Desktop is not open sourced, so desktop-only changes are generally not picked up here; only the shared code that also affects it shows up.</p>
 
       <h4>HOW IT WORKS: ANALYSIS PIPELINE</h4>
-      <p>Mechanical facts are extracted without a model. Model tables and slash-command registries are set-differenced straight from the git trees, version bumps come from <code>package.json</code>, and timestamps are normalized to UTC, so those facts are computed, not paraphrased. Code changes are then mapped onto the monorepo layout (<code>cli/</code>, <code>packages/agent-runtime/</code>, <code>common/</code>, <code>desktop/web/</code>, <code>sdk/</code>, <code>docs/</code>) to name the changed layer.</p>
+      <p>Mechanical facts are extracted without a model. Model tables and slash-command registries are set-differenced straight from the git trees, version bumps come from <code>package.json</code>, and timestamps are normalized to UTC, so those facts are computed, not paraphrased. Code changes are then mapped onto the monorepo layout (<code>cli/</code>, <code>packages/agent-runtime/</code>, <code>common/</code>, <code>sdk/</code>, <code>docs/</code>) to name the changed layer.</p>
       <p>The summaries are model output, and the goal is to make them traceable, not to claim they are perfect. What the model gets is bounded and checkable: the clean source diff with lockfiles and pure test hunks stripped (over ~150 KB it is split into per-file drafts and fused), the computed facts above, the developers' own code comments, and, when a PR can be matched by touched files and passes a relevance check, its description and review discussion. Rows whose only changes are tests, mocks, or docs are detected mechanically and given a fixed plain-English line with no API call.</p>
       <p>Every identifier a summary uses (backticked names, bare <code>CONSTANT_CASE</code> settings, camelCase and PascalCase names, versions, <code>--flags</code>, and numbers) is checked against the diff and source corpus as a whole word, so a truncated prefix of a real name fails too. A name that cannot be found gets one repair pass and, if still missing, is recorded as ungrounded and shown as unverified; such a row also cannot rate confidence high. Major, notable and multi-topic rows, plus any row with an ungrounded name, then get a second-model fact-check: unsupported claims trigger one rewrite, and a row that still fails is stored with a visible <code>flagged</code> label rather than hidden. Each summary cites the diff it came from, summaries are cached by commit SHA, diff content and prompt version, and every card links to the commit, compare view and inline diff.</p>
 
