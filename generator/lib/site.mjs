@@ -1581,6 +1581,10 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
   const meaningful = entries.filter(e => !e.noise)
   const churnCount = entries.length - meaningful.length
   const churnNote = churnCount ? ` &middot; ${churnCount.toLocaleString()} churn` : ''
+  // Human phrasings for the churn kinds `analyze.mjs` stamps on a row. Used only
+  // to explain a day that holds nothing but churn (see `renderTimelineDay`), so
+  // the notice names what actually landed there rather than a generic guess.
+  const churnLabels = { lockfile: 'dependency lockfiles', assets: 'icon and image assets', merge: 'empty merges', other: 'non-source files' }
   // All-time browse index, computed up front because the front-page chips need
   // each category's *total* next to its count in this window. "CLI 27" on a page
   // holding 91 changes is a fact about this page, not about CLI: 1,413 CLI
@@ -1715,12 +1719,21 @@ ${[
     // One row starts open: the day's newest *visible* entry. Churn is hidden by
     // default, so the flag passes to the first row a reader can actually see
     // rather than being spent on something off-screen.
+    // A day that holds only churn shows nothing but its date at the default
+    // filter, which reads as a broken page. Name what landed so the emptiness is
+    // explained, and point at the control that reveals it. Server-rendered, so it
+    // is there with scripting off; the filter script hides it once rows show.
+    const churnKinds = [...new Set(rows.filter(e => e.noise).map(e => churnLabels[e.churn]).filter(Boolean))]
+    const churnDesc = churnKinds.length ? churnKinds.join(', ') : 'dependency lockfiles, icon sets, empty merges'
+    const churnOnlyNotice = (real === 0 && churn > 0)
+      ? `\n<p class="day-churn-only">Only churn was recorded this day &mdash; ${churn} commit${churn === 1 ? '' : 's'} (${esc(churnDesc)}), nothing that changes the product. Use the <strong>churn</strong> filter above to see them.</p>`
+      : ''
     let notYetOpen = true
     const dayHtml = `<section class="day" id="${day.day}">
 <div class="day-line">
   <h2><time datetime="${day.day}">[ ${esc(fmtDateHuman(day.day))} ]</time></h2>
   <span class="day-count">${real} change${real === 1 ? '' : 's'}${churn ? ` <span class="day-churn">+${churn} churn</span>` : ''}</span>
-</div>
+</div>${churnOnlyNotice}
 ${dayStories(storyIdx, day.day).map(cluster => dayLeadHtml([cluster])).join('')}
 ${rows.map(e => {
       const open = notYetOpen && !e.noise
@@ -1771,7 +1784,10 @@ ${rows.map(e => {
       r.hidden = !want;
     });
     days.forEach(function (d) {
-      d.hidden = !d.querySelector('details.entry:not([hidden])');
+      // A churn-only day keeps its section visible even while every row is
+      // hidden, because then the .day-churn-only notice is the only thing the
+      // reader has to read; hiding the section would hide the explanation too.
+      d.hidden = !d.querySelector('details.entry:not([hidden])') && !d.querySelector('.day-churn-only');
     });
     // A #sha link must land on something the reader can see, even when the
     // filter would have hidden that row: revealing one entry (and its day) beats
@@ -1786,6 +1802,13 @@ ${rows.map(e => {
       }
     }
     var shown = rows.filter(function (r) { return !r.hidden }).length;
+    // The notice only makes sense while the day is otherwise blank. Once the
+    // reader reveals the churn (or a #sha link lands on a row), it would just
+    // restate what is on screen, so it hides itself.
+    [].forEach.call(document.querySelectorAll('.day-churn-only'), function (note) {
+      var d = note.closest ? note.closest('section.day') : null;
+      note.hidden = !!(d && d.querySelector('details.entry:not([hidden])'));
+    });
     // The note line answers the question a chip count raises: 27 rows here, but
     // how many CLI changes exist at all? That number is not on this page, so it
     // is stated as an all-time figure and linked to the page where it is.

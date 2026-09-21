@@ -553,6 +553,18 @@ nav.term-nav a.active{
   font-weight:400;
   margin-left:6px;
 }
+/* Shown on a day whose rows are all hidden churn, in place of an empty
+   timeline. Dim and small so it reads as a note, not a headline. */
+.day-churn-only{
+  margin:2px 0 14px;
+  color:var(--txt-subtle);
+  font-size:.82rem;
+  font-style:italic;
+}
+.day-churn-only strong{
+  color:var(--txt-dim);
+  font-style:normal;
+}
 /* Filtering is a visibility toggle, so the hidden attribute has to beat whatever
    display rule a row class grows later. One guard here is cheaper than auditing
    every rule that touches .entry, and it keeps the server default (churn hidden)
