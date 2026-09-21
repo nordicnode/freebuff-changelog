@@ -1,9 +1,11 @@
 name: changelog-sync
 
 # 24/7 continuous relay synchronization pipeline.
-# Runs continuously via self-perpetuating workflow relay, polling upstream every 30s
-# to ensure the site is updated within 30-60s of upstream changes and never exceeds 10m freshness.
-# A backup schedule (every 10 minutes) serves as an automated watchdog / safety net.
+# Runs continuously via self-perpetuating workflow relay, polling upstream every 30s.
+# The poll bound is 30s; end-to-end (generate -> push -> deploy.yml build/upload)
+# lands a change on the site in a few minutes, and the 10m freshness ceiling below
+# is the hard guarantee. A backup schedule (every 10 minutes) serves as an
+# automated watchdog / safety net if the relay chain ever dies.
 #
 # The 10m claim is enforced, not aspirational: the sync loop fails its run once
 # its errors stretch over the freshness budget, the next cycle is dispatched
@@ -79,17 +81,24 @@ jobs:
       # Authenticate the pushes with CHANGELOG_GITHUB_TOKEN instead, but only
       # after proving that token may write, so a token without Contents: write
       # falls back to the checkout credentials instead of breaking the sync.
+      # The token needs Actions: read+write as well: `gh run list` gates the
+      # queued-run checks here and in cli.mjs' --exit-on-queued, and this token
+      # dispatches the next relay cycle. A Contents-only PAT passes the probe
+      # below and still downgrades the relay to watchdog cadence.
       - name: Authenticate data pushes so they trigger deploy.yml
+        id: push_auth
         env:
           PUSH_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN }}
         run: |
           if [ -z "$PUSH_TOKEN" ]; then
             echo "::warning::CHANGELOG_GITHUB_TOKEN is not set: data pushes keep using the default GITHUB_TOKEN, which cannot trigger deploy.yml. The site will refresh only on deploy.yml's schedule."
+            echo "fallback=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           can_push="$(GH_TOKEN="$PUSH_TOKEN" gh api "repos/${GITHUB_REPOSITORY}" --jq '.permissions.push' 2>/dev/null || echo false)"
           if [ "$can_push" != "true" ]; then
             echo "::warning::CHANGELOG_GITHUB_TOKEN cannot push to ${GITHUB_REPOSITORY}: keeping the checkout credentials. The site will refresh only on deploy.yml's schedule."
+            echo "fallback=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # checkout stores the default token under this exact key, and its
@@ -97,6 +106,7 @@ jobs:
           # URL, so replace it rather than setting URL credentials.
           git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)"
           echo "Data pushes now authenticate with CHANGELOG_GITHUB_TOKEN: each data commit starts a deploy."
+          echo "fallback=false" >> "$GITHUB_OUTPUT"
 
       - name: Run continuous sync & backfill
         id: sync_loop
@@ -139,14 +149,33 @@ jobs:
             echo "CHANGELOG_GITHUB_TOKEN not configured; relying on watchdog schedule."
             exit 0
           fi
-          QUEUED_COUNT=$(gh run list --workflow changelog-sync.yml --json databaseId,status --jq '[.[] | select(.status == "queued" or .status == "pending" or .status == "waiting")] | length' 2>/dev/null || echo "0")
+          QUEUED_COUNT=$(gh run list --workflow changelog-sync.yml --json databaseId,status --jq '[.[] | select(.status == "requested" or .status == "queued" or .status == "pending" or .status == "waiting")] | length' 2>/dev/null || echo "0")
           if [ "$QUEUED_COUNT" -eq 0 ]; then
             echo "Dispatching next relay run to maintain 24/7 continuous synchronization..."
-            # A dispatch failure must not kill the chain: the next relay run
-            # would simply never start, downgrading the site to watchdog-cadence
-            # refreshes (10 min) without anyone noticing. Warn loudly instead.
-            gh workflow run changelog-sync.yml || echo "::warning::relay dispatch failed: the watchdog schedule restarts the chain within ~10 min"
+            # A failed dispatch breaks the chain until the watchdog's next
+            # tick, and a PAT missing Actions scope fails it the same way on
+            # every single run -- silently, if it stays a warning. The auth
+            # step catches an absent token; this catches a scoped-wrong one:
+            # red, within one cycle, the relay cannot degrade quietly.
+            if ! gh workflow run changelog-sync.yml; then
+              echo "::error::relay dispatch failed: the chain drops to watchdog cadence (<=10 min) until it recovers."
+              exit 1
+            fi
           else
             echo "A workflow run is already queued ($QUEUED_COUNT pending). Skipping duplicate dispatch."
           fi
+
+      # The end-of-run bill, placed after the dispatch so the chain is handed
+      # off before this job turns red. A push-auth fallback means data commits
+      # land with the default GITHUB_TOKEN: deploy.yml's push trigger is dead,
+      # the sync loop still runs green (generatedAt advances,
+      # the freshness gate measures data age at build time), and the site
+      # quietly drops to deploy.yml's 30-minute schedule. The one failure
+      # signal the old design emitted was a workflow warning nobody watches:
+      # PAT expiry has to be red, not yellow.
+      - name: Fail on silent push-auth degradation
+        if: always() && steps.push_auth.outputs.fallback == 'true' && steps.sync_loop.outcome != 'cancelled'
+        run: |
+          echo "::error::CHANGELOG_GITHUB_TOKEN is missing or cannot push: data commits no longer trigger deploy.yml. Restore the token (Contents: write + Actions: read/write) -- until then the site refreshes only on deploy.yml's 30-minute schedule."
+          exit 1
 

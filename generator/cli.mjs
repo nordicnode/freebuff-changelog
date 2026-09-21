@@ -890,11 +890,21 @@ export async function commitAndPushData ({ message, overrides = {}, attempts = 3
   await persistMerged(pending)
 
   if (!await dirtyData(root)) {
-    log('data is already up to date: nothing to push.')
-    return false
+    // A clean worktree is not an up-to-date one: after three failed push
+    // attempts the cycle before, this cycle's data sits in an unpushed local
+    // commit, and the old early return left it stranded until something else
+    // made data/ dirty again (up to a full stale-budget of readers served the
+    // previous state). Nothing dirty and nothing ahead really is the quiet
+    // cycle; a clean tree ahead of origin just needs the push retried.
+    if (!await aheadOfOrigin(branch, root)) {
+      log('data is already up to date: nothing to push.')
+      return false
+    }
+    log('worktree clean but local commits are unpushed: retrying the push.')
+  } else {
+    await git(['add', 'data'], root)
+    await git(['commit', '-m', message], root)
   }
-  await git(['add', 'data'], root)
-  await git(['commit', '-m', message], root)
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     // HEAD:<branch>, not <branch>: the workflow runner can be on a detached
@@ -1199,10 +1209,13 @@ export async function cmdWatch (argv, { cycle = cmdCatchUp, errorBudget } = {}) 
 
     if (exitOnQueued) {
       try {
-        const cmd = 'gh run list --workflow changelog-sync.yml --json databaseId,status --jq \'[.[] | select(.status == "queued" or .status == "pending" or .status == "waiting")] | length\''
+        // `requested` is the transient status before `queued`; skipping the
+        // count once a dispatched run is still landing is what lets a
+        // duplicate through, so count it while it is too early to see.
+        const cmd = 'gh run list --workflow changelog-sync.yml --json databaseId,status --jq \'[.[] | select(.status == "requested" or .status == "queued" or .status == "pending" or .status == "waiting")] | length\''
         const queuedCount = Number(execSync(cmd, { encoding: 'utf8' }).trim()) || 0
         if (queuedCount > 0) {
-          log(`[watch] detected ${queuedCount} incoming workflow run(s) (status queued/pending): yielding to incoming runner.`)
+          log(`[watch] detected ${queuedCount} incoming workflow run(s) (status requested/queued/pending): yielding to incoming runner.`)
           break
         }
       } catch (_) {}

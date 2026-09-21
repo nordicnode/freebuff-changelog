@@ -33,7 +33,11 @@ export function syncReason ({
   if (lastSha !== head) return `upstream advanced ${String(lastSha).slice(0, 8)} -> ${String(head).slice(0, 8)}`
   const then = Date.parse(generatedAt || '') || 0
   if (!then) return 'last sync timestamp unreadable'
+  // Compare raw ms, not floored minutes: floor-then-`>` meant the floor fired
+  // only past 6m on a 5m budget, and that extra minute-plus (poll + generate +
+  // deploy) came straight out of the 2x budget the site's "[stale]" badge and
+  // deploy.yml's freshness gate measure against.
   const ageMin = Math.floor((now - then) / 60000)
-  if (ageMin > staleMs / 60000) return `last sync ${ageMin}m ago exceeded ${Math.round(staleMs / 60000)}m budget`
+  if (now - then >= staleMs) return `last sync ${ageMin}m ago exceeded ${Math.round(staleMs / 60000)}m budget`
   return ''
 }

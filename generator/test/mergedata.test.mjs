@@ -175,6 +175,20 @@ test('syncReason stays silent when the data is fresh and upstream is idle', () =
   assert.equal(syncReason({ head: null, lastSha: 'abc', generatedAt: '2026-09-14T01:00:00Z', now }), '')
 })
 
+// The floor is compared in raw ms against the budget: floored-minute math made
+// a 5m budget fire no earlier than 6m01s, and that minute-plus of extra age
+// came straight out of the 2x budget the site badge and deploy.yml's freshness
+// gate measure generatedAt against.
+test('syncReason fires exactly on the stale budget', () => {
+  const now = Date.parse('2026-09-14T14:30:00Z')
+  assert.equal(syncReason({
+    head: 'abc', lastSha: 'abc', generatedAt: '2026-09-14T14:25:01Z', now, staleMs: 5 * 60000
+  }), '', '4m59s on a 5m budget is still fresh')
+  assert.match(syncReason({
+    head: 'abc', lastSha: 'abc', generatedAt: '2026-09-14T14:25:00Z', now, staleMs: 5 * 60000
+  }), /last sync 5m ago exceeded 5m budget/)
+})
+
 test('syncReason resyncs on an unreadable timestamp or missing state', () => {
   const now = Date.parse('2026-09-14T14:29:00Z')
   assert.match(syncReason({ head: 'abc', lastSha: null, generatedAt: 'x', now }), /no prior sync/)

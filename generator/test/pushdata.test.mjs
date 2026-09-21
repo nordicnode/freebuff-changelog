@@ -108,6 +108,27 @@ test('a quiet cycle with no data change pushes nothing', async () => {
   assert.equal(pushed, false)
 })
 
+// A cycle whose push exhausted its retries leaves the data committed locally
+// and nothing dirty on disk. The old clean-tree early return skipped exactly
+// that state, so the commit stranded until something else dirtied data/; the
+// next quiet cycle must retry the push instead.
+test('a clean worktree ahead of origin re-pushes the stranded commit', async () => {
+  const { remote, clone } = await fixture()
+  const daemon = await clone('stranded')
+  await writeFile(`${daemon}/data/changelog.json`, JSON.stringify(doc('2026-09-14T15:00:00.000Z', 'h9', [entry('a'), entry('b')]), null, 2) + '\n')
+  git(daemon, 'add', 'data')
+  git(daemon, 'commit', '-qm', 'data: stranded by a failed push')
+  const disk = JSON.parse(await readFile(`${daemon}/data/changelog.json`, 'utf8'))
+  const pushed = await commitAndPushData({
+    root: daemon,
+    dataDir: `${daemon}/data`,
+    message: 'data: update changelog',
+    overrides: { [`${daemon}/data/changelog.json`]: disk }
+  })
+  assert.equal(readOriginDoc(remote).headSha, 'h9', 'the stranded commit reaches origin on the next cycle')
+  assert.equal(pushed, true, 'the retry published data, even though nothing new was committed')
+})
+
 test('mergeChangelog alone still agrees with what the race converges to', () => {
   const ours = doc('2026-09-14T11:21:46.000Z', 'h1', [entry('a', { v: 5, title: 'A', summary: 's' }), entry('b')])
   const origin = doc('2026-09-14T14:30:00.000Z', 'h2', [entry('a'), entry('b'), entry('c')])
