@@ -98,7 +98,7 @@ ${ld ? `<script type="application/ld+json">${ldScript(ld)}</script>` : ''}
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="apple-touch-icon" href="/icon-192.png">
-<style>${CSS}</style>
+<link rel="stylesheet" href="/styles.css">
 </head><body${wide ? ' class="page-wide"' : ''}><div id="reading-progress" aria-hidden="true"></div><a class="skip-link" href="#main">Skip to content</a><main id="main">
 <header class="top">
   <div class="brand">
@@ -728,6 +728,9 @@ function renderDiff(container, text, label, ghUrl, mode) {
   if (mode === 'split') {
     const table = document.createElement('table');
     table.className = 'diff-split';
+    // Native <table> has no accessible name; label the two columns so a
+    // screen-reader reading a side-by-side diff knows left is removed / right is added.
+    table.setAttribute('aria-label', 'Side-by-side diff: removed lines on the left, added lines on the right');
     const addCell = (tr, cls, txt) => {
       const td = document.createElement('td');
       td.className = 'diff-cell ' + cls;
@@ -1305,34 +1308,6 @@ function qualityCard (q, card, bar, share) {
     'stat-span quality-card')
 }
 
-// The latest committed golden-set eval run, shown beside the quality card.
-// The harness had been silent for months -- results only live in
-// data/eval/results/ once somebody runs `eval`, and without the numbers on
-// this page a regression looks exactly like a quiet week. When there is no
-// committed run, the card says so rather than disappearing.
-function evalCard (r, card, q, overridesDoc) {
-  const ovlKeys = Object.keys(overridesDoc || {}).length
-  const row = (lbl, html, note) => `<div class="stat-row"><span class="stat-lbl">${esc(lbl)}</span><span class="stat-track"></span><span class="stat-num">${html}</span><span class="stat-trend">${note ? `<span class="stat-note">${esc(note)}</span>` : ''}</span></div>`
-  if (!r?.metrics) {
-    return card('GOLDEN-SET EVAL', 'harness status',
-      row('latest run', '<span class="stat-note">none committed</span>', 'run cli.mjs eval or the weekly eval workflow') +
-      row('human corrections', String(q.overridden), `${ovlKeys} key${ovlKeys === 1 ? '' : 's'} in data/overrides.json`))
-  }
-  const m = r.metrics, c = m.counts || {}
-  const pc = (v, n) => v == null ? '<span class="stat-note">not scored</span>' : `${Math.round(v * 100)}%${n != null && n !== m.n ? ` <i class="stat-share">n=${n}</i>` : ''}`
-  const j2 = (v) => v == null ? '-' : v.toFixed(2)
-  return card('GOLDEN-SET EVAL', `prompt v${r.promptV} · ${String(r.at || '').slice(0, 10)} · ${m.n} rows (${r.golden?.verified ?? 0} human-verified)`,
-    row('grounded', pc(m.grounded, c.grounded), 'no unverified identifiers') +
-    row('cause visible', pc(m.whyRate, c.whyRate), 'summary states why') +
-    row('hype free', pc(m.hypeFree, c.hypeFree)) +
-    row('must-mention', m.mustMention == null ? '<span class="stat-note">not scored</span>' : `${Math.round(m.mustMention * 100)}%`, c.mustMention != null && c.mustMention !== m.n ? `n=${c.mustMention}` : '') +
-    (m.judge?.faithfulness != null
-      ? row('judge f/c/cl', `${j2(m.judge.faithfulness)} / ${j2(m.judge.completeness)} / ${j2(m.judge.clarity)}`, c.judge != null && c.judge !== m.n ? `n=${c.judge}` : '')
-      : row('judge', '<span class="stat-note">not run</span>', 'eval without --no-judge')) +
-    row('previous run', r.previous ? `${String(r.previous.at || '').slice(0, 10)} (v${r.previous.promptV})` : '<span class="stat-note">first committed run</span>') +
-    row('human corrections', String(q.overridden), `${ovlKeys} key${ovlKeys === 1 ? '' : 's'} in data/overrides.json`))
-}
-
 // Which release first included this commit, per version track. `shipped` is the
 // Map computeShippedIn() builds once per build.
 function shippedInHtml (e, shipped) {
@@ -1579,7 +1554,7 @@ export function formatCommentHtml (text) {
 
 async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, '')}/${p}`, html) }
 
-export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, evalResult = null, overridesDoc = null }) {
+export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, overridesDoc = null }) {
   const trafficCount = traffic?.count ?? 0
   const trafficUniques = traffic?.uniques ?? 0
   activeTraffic = { count: trafficCount, uniques: trafficUniques }
@@ -2886,7 +2861,6 @@ ${weekTabsScript}`
       + card('MOST-CHANGED MODELS', modelTotal ? `${modelTotal} catalog moves across ${modelCounts.size} models` : 'no catalog moves recorded', modelRows2.map(([m, n]) => bar(m, n, modelMax, { href: `/models/${modelSlug(m)}/`, pct: share(n, modelTotal) })).join(''))
       + card('WHAT COUNTED', `${sigTotal.toLocaleString()} changes split by weight`, `<div class="sig-split">${sigRows.map(([s, n]) => `<span class="sig-seg sig-${s}" style="width:${share(n, sigTotal)}%" title="${s}: ${n.toLocaleString()}"></span>`).join('')}</div>` + sigRows.map(([s, n]) => bar(s.toUpperCase(), n, sigMax, { pct: share(n, sigTotal), cls: 'sig-' + s })).join(''), 'stat-span')
       + qualityCard(summaryQuality(entries), card, bar, share)
-      + evalCard(evalResult, card, summaryQuality(entries), overridesDoc)
       + card('SHIPPING CADENCE (LAST 12 MO)', `${monthRows.length} of ${byMonth.size} months &middot; peak ${monthMax.toLocaleString()} changes`, `<div class="cad-spark">${cadenceSpark}</div>` + monthRows.map(([m, n], i) => {
         const prev = i ? monthRows[i - 1][1] : 0
         const d = prev ? Math.round((n - prev) / prev * 100) : null
@@ -2959,7 +2933,7 @@ ${weekTabsScript}`
   </div>
 </section>
 
-<div id="hits" aria-label="search results"></div>
+<div id="hits" role="region" aria-label="Search results" tabindex="-1"></div>
 
 <script>
 fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
@@ -2990,7 +2964,12 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
     if (newIdx >= articles.length) newIdx = articles.length - 1;
     selectedHitIdx = newIdx;
     articles.forEach((a, i) => a.classList.toggle('search-hit-active', i === selectedHitIdx));
-    scrollToEl(articles[selectedHitIdx], 'nearest');
+    const sel = articles[selectedHitIdx];
+    scrollToEl(sel, 'nearest');
+    // Move focus into the result so keyboard and screen-reader users follow the
+    // selection instead of tabbing all the way from the search box.
+    const selLink = sel.querySelector('h3 a');
+    if (selLink && selLink.focus) selLink.focus({ preventScroll: true });
   };
 
   q.addEventListener('keydown', (e) => {
@@ -3011,6 +2990,11 @@ fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
       if (selectedHitIdx >= 0 && selectedHitIdx < articles.length) {
         const link = articles[selectedHitIdx].querySelector('h3 a');
         if (link) { e.preventDefault(); window.location.href = link.href; }
+      } else if (articles.length) {
+        // Enter with results but no explicit selection: drop the reader into the
+        // first hit rather than leaving focus parked in the input.
+        e.preventDefault();
+        updateHitSelection(0);
       }
     }
   });
@@ -3556,6 +3540,11 @@ ${inFlightScript}`
   const mainJsonItems = entries.filter(e => !e.noise).slice(0, 60).map(e => jsonItem(SITE.url, e, titleOf, storyIdx.notes.get(e.sha)))
   await write(dist, 'feed.json', feedJson(SITE.url, generated, SITE.name, SITE.desc, 'feed.json', mainJsonItems))
   await write(dist, 'feed.xsl', FEED_XSL)
+  // One external stylesheet instead of ~72 KB inlined into every page. The
+  // site-wide no-cache policy still governs it (a deploy can never be hidden
+  // behind a stale TTL), but the browser now reuses a single cached file across
+  // navigation rather than re-embedding the CSS in all ~1,660 HTML documents.
+  await write(dist, 'styles.css', CSS)
   await writeBinary(`${dist.replace(/\/$/, '')}/favicon.ico`, generateFaviconIco())
   await write(dist, 'favicon.svg', FAVICON_SVG)
   await writeBinary(`${dist.replace(/\/$/, '')}/icon-192.png`, generateIconPng(192))
@@ -3748,6 +3737,8 @@ ctx.hidden = false
   Content-Type: image/png
 /manifest.webmanifest
   Content-Type: application/manifest+json
+/styles.css
+  Content-Type: text/css; charset=utf-8
 /og/*
   Content-Type: image/svg+xml
 /feed.xsl

@@ -67,6 +67,20 @@ export const AUDIENCE_DESC = {
   maintainers: 'the Freebuff engineering team only (tests, refactors, tooling, docs, internal types)'
 }
 
+// Prompt rules shared verbatim by the single-shot (buildPrompt) and the fused
+// (buildFusePrompt) technical passes. These were two hand-typed copies, so a
+// future prompt bump tightening one was easy to forget in the other. Only the
+// byte-identical lines live here; the lines that genuinely differ (the fuse
+// treats chunk drafts as untrusted, the single pass cites the diff directly)
+// stay written inline at each call site. Emitting them from constants changes
+// no prompt text, so this refactor needs no PROMPT_V bump.
+export const TITLE_RULE = 'Title: plain text, max 70 chars, no backticks, no markdown, no trailing period. Lead with the concrete change (model name, command with leading slash, version, subsystem). Translate code identifiers into plain words (split snake_case/camelCase/CONSTANT_CASE, drop glued version suffixes); never emit a raw glued identifier as a title word.'
+export const SUMMARY_GUIDE_HEADER = 'Summary guidelines (2-4 sentences of fluid technical prose, backticks allowed for identifiers):'
+export const WHAT_CHANGED_RULE = '- State WHAT changed and the mechanism precisely: names, versions, commands, flags, files. Lead with the functional change, then the technical mechanism.'
+export const PUNCTUATION_RULE = '- Punctuation: Never use em-dashes; use commas, parentheses, or hyphens instead.'
+export const SIGNIFICANCE_SCALE = 'major = new feature, model added/removed, security, breaking. notable = user-visible behavior/UI change, new file, API change. minor = internal, refactor, types, comments, deps.'
+export const AUDIENCE_RULE = `Audience: who this change is for. ${AUDIENCES.map(a => `${a} = ${AUDIENCE_DESC[a]}`).join('; ')}. Pick the narrowest group whose experience or configuration actually changes; a constant nobody reads yet, a test, or a refactor is maintainers.`
+
 export const FREEBUFF_ARCHITECTURE_MAP = formatArchitectureMap(MONOREPO_COMPONENTS)
 
 export const FREEBUFF_DOMAIN_LEXICON = `Freebuff Subsystem Disambiguation & Domain Lexicon:
@@ -308,13 +322,13 @@ export function buildPrompt (entry, patch, ctx = {}) {
   const lines = [
     'You write changelog entries for Freebuff, a free AI coding agent. Your reader is a TECHNICAL user: a developer who uses Freebuff daily and reads diffs.',
     'Rules: use ONLY facts from the diff, the commit metadata, and the analysis notes below. Never invent file names, features, or versions.',
-    'Title: plain text, max 70 chars, no backticks, no markdown, no trailing period. Lead with the concrete change (model name, command with leading slash, version, subsystem). Translate code identifiers into plain words (split snake_case/camelCase/CONSTANT_CASE, drop glued version suffixes); never emit a raw glued identifier as a title word.',
-    'Summary guidelines (2-4 sentences of fluid technical prose, backticks allowed for identifiers):',
-    '- State WHAT changed and the mechanism precisely: names, versions, commands, flags, files. Lead with the functional change, then the technical mechanism.',
+    TITLE_RULE,
+    SUMMARY_GUIDE_HEADER,
+    WHAT_CHANGED_RULE,
     '- State WHY it happened if grounded in notes/diff/PR context (root cause, upstream failure, deprecation). If reason is not visible, describe the mechanism - never invent motives.',
     '- Ground the change in the Freebuff Monorepo Architecture below. Name the affected package or surface naturally without repetitive template phrases like "Scope limited to...".',
     '- DETAIL: include one concrete technical fact (migration behavior, trait change, alias, flag, or constraint). Never paste raw diff lines. Never write "Nothing to do" or no-action boilerplate.',
-    '- Punctuation: Never use em-dashes; use commas, parentheses, or hyphens instead.',
+    PUNCTUATION_RULE,
     '- Identifiers: every identifier, path, flag or command you place in backticks must appear verbatim in the diff, the file list, or the source context below. Copy them character for character; never reconstruct or abbreviate a name from memory.',
     '',
     ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP,
@@ -330,8 +344,8 @@ export function buildPrompt (entry, patch, ctx = {}) {
     multi ? `This snapshot spans several areas or ${MULTI_TOPIC_MIN_FILES}+ files: it is several changes. Fill "changes" with one item per distinct change (2-6 items), each grounded in the files it names; the prose summary then leads with the most user-relevant one and says how many others there are.` : '',
     'Fields: "migration" and "unknowns" are null when there is nothing honest to say; never fill them with reassurance. "confidence" is low when the diff is truncated, the change is mostly configuration whose consumer is not visible, or the motive is guessed.',
     `Significance: judge it from the diff against the scale below. The deterministic default "${entry.significance || 'minor'}" is only a file-shape heuristic, not the answer; change it whenever the diff plainly implies a different tier.`,
-    'major = new feature, model added/removed, security, breaking. notable = user-visible behavior/UI change, new file, API change. minor = internal, refactor, types, comments, deps.',
-    `Audience: who this change is for. ${AUDIENCES.map(a => `${a} = ${AUDIENCE_DESC[a]}`).join('; ')}. Pick the narrowest group whose experience or configuration actually changes; a constant nobody reads yet, a test, or a refactor is maintainers.`,
+    SIGNIFICANCE_SCALE,
+    AUDIENCE_RULE,
     '',
     'GOOD (technical, precise, no boilerplate) examples. Angle-bracket spans stand for values copied verbatim from THIS diff and notes: never emit a span literally and never reuse any name from these examples, only the pattern:',
     '- "<Model X> replaces <Model Y> in the free model picker, per the comment beside <Model Y>\'s removal that cites its upstream deprecation." WHAT + mechanism, plus a WHY quoted from the diff.',
@@ -534,12 +548,12 @@ export function buildFusePrompt (entry, drafts, ctx = {}, digest = '') {
   const lines = [
     'You write changelog entries for Freebuff, a free AI coding agent. Your reader is a TECHNICAL user: a developer who uses Freebuff daily and reads diffs.',
     'This commit was too large for one read, so per-chunk drafts below describe each part. The drafts are UNTRUSTED working notes: they point at what matters but may overstate, misname, or duplicate. Ground every claim in the file list, facts, and catalog notes below; every identifier, path, flag or command you place in backticks must appear verbatim in those lists or the drafts. Never invent file names, features, or versions.',
-    'Title: plain text, max 70 chars, no backticks, no markdown, no trailing period. Lead with the concrete change (model name, command with leading slash, version, subsystem). Translate code identifiers into plain words (split snake_case/camelCase/CONSTANT_CASE, drop glued version suffixes); never emit a raw glued identifier as a title word.',
-    'Summary guidelines (2-4 sentences of fluid technical prose, backticks allowed for identifiers):',
-    '- State WHAT changed and the mechanism precisely: names, versions, commands, flags, files. Lead with the functional change, then the technical mechanism.',
+    TITLE_RULE,
+    SUMMARY_GUIDE_HEADER,
+    WHAT_CHANGED_RULE,
     '- State WHY it happened if grounded in notes or PR context. If reason is not visible, describe the mechanism - never invent motives.',
     '- DETAIL: include one concrete technical fact. Never paste raw diff lines. Never write "Nothing to do" or no-action boilerplate.',
-    '- Punctuation: Never use em-dashes; use commas, parentheses, or hyphens instead.',
+    PUNCTUATION_RULE,
     '',
     ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP,
     '',
@@ -550,8 +564,8 @@ export function buildFusePrompt (entry, drafts, ctx = {}, digest = '') {
     'A chunked commit is several changes: fill "changes" with one item per distinct change (2-6 items), each grounded in the files it names; the prose summary then leads with the most user-relevant one and says how many others there are.',
     'Fields: "migration" and "unknowns" are null when there is nothing honest to say; never fill them with reassurance. "confidence" is low when the drafts disagree, the change is mostly configuration whose consumer is not visible, or the motive is guessed.',
     `Significance: judge it from the drafts and the digest against the scale below. The deterministic default "${entry.significance || 'minor'}" is only a file-shape heuristic, not the answer; change it whenever the material plainly implies a different tier.`,
-    'major = new feature, model added/removed, security, breaking. notable = user-visible behavior/UI change, new file, API change. minor = internal, refactor, types, comments, deps.',
-    `Audience: who this change is for. ${AUDIENCES.map(a => `${a} = ${AUDIENCE_DESC[a]}`).join('; ')}. Pick the narrowest group whose experience or configuration actually changes; a constant nobody reads yet, a test, or a refactor is maintainers.`,
+    SIGNIFICANCE_SCALE,
+    AUDIENCE_RULE,
     '',
     `Date: ${entry.date}`,
     `Category: ${entry.category || (entry.areas || []).join(', ')}`,

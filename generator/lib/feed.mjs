@@ -135,48 +135,10 @@ export function generateIconPng (size = 192) {
       else { raw[o++] = 0x0d; raw[o++] = 0x11; raw[o++] = 0x17; raw[o++] = 0xff }
     }
   }
-  const crcTable = (() => {
-    const t = new Int32Array(256)
-    for (let n = 0; n < 256; n++) {
-      let c = n
-      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-      t[n] = c
-    }
-    return t
-  })()
-  const crc = (buf) => {
-    let c = 0xffffffff
-    for (const b of buf) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8)
-    return (c ^ 0xffffffff) >>> 0
-  }
-  const chunk = (type, data) => {
-    const len = Buffer.alloc(4); len.writeUInt32BE(data.length)
-    const body = Buffer.concat([Buffer.from(type, 'ascii'), data])
-    const cs = Buffer.alloc(4); cs.writeUInt32BE(crc(body))
-    return Buffer.concat([len, body, cs])
-  }
-  const ihdr = Buffer.alloc(13)
-  ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4)
-  ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0
-  // Raw rows with filter byte 0; zlib stored blocks (no compression).
-  const rows = []
-  for (let y = 0; y < size; y++) rows.push(Buffer.concat([Buffer.from([0]), raw.subarray(y * size * 4, (y + 1) * size * 4)]))
-  const rawData = Buffer.concat(rows)
-  const blocks = []
-  for (let i = 0; i < rawData.length; i += 65535) {
-    const slice = rawData.subarray(i, Math.min(i + 65535, rawData.length))
-    const last = i + 65535 >= rawData.length ? 1 : 0
-    const hdr = Buffer.from([last, slice.length & 0xff, (slice.length >>> 8) & 0xff, (~slice.length) & 0xff, ((~slice.length) >>> 8) & 0xff])
-    blocks.push(Buffer.concat([hdr, slice]))
-  }
-  const zlib = Buffer.concat([Buffer.from([0x78, 0x01]), ...blocks])
-  const adler = (() => {
-    let a = 1, b = 0
-    for (const byte of rawData) { a = (a + byte) % 65521; b = (b + a) % 65521 }
-    const out = Buffer.alloc(4); out.writeUInt32BE(((b << 16) | a) >>> 0); return out
-  })()
-  const idat = Buffer.concat([zlib, adler])
-  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', idat), chunk('IEND', Buffer.alloc(0))])
+  // Reuse the shared deflate-backed encoder (the one generateOgPng uses). The
+  // old hand-rolled "stored blocks" path here never compressed, so a flat-color
+  // 512px icon shipped at ~1 MB of raw RGBA instead of a few KB.
+  return encodePng(size, size, raw)
 }
 
 // 1200x630 social card as PNG. Discord, Twitter/X and Facebook do not render an
