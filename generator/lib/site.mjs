@@ -1703,7 +1703,7 @@ ${[
       chipHtml('churn', 'churn', churn, false, ' chip-churn')
     ].join('\n')}
     </nav>
-    <p class="filter-note" data-hub="/archive/#categories" data-all="${meaningful.length}" data-cats="${catLists.size}">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? '(' + churn + ' churn hidden)' : '(no churn that day)'}</em> &middot; <span id="filter-all">${meaningful.length.toLocaleString()} changes all-time across ${catLists.size} categories <a href="/archive/#categories">browse every change by category</a></span></p>
+    <p class="filter-note" data-hub="/archive/#categories">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? '(' + churn + ' churn hidden)' : '(no churn that day)'}</em> &middot; <span id="filter-all"><a href="/archive/#categories">browse all changes by category</a></span></p>
   </div>`
 
     const hero = `
@@ -1767,8 +1767,6 @@ ${rows.map(e => {
   var noteWrap = document.querySelector('.filter-note');
   var allEl = document.getElementById('filter-all');
   var HUB = (noteWrap && noteWrap.getAttribute('data-hub')) || '/archive/#categories';
-  var ALL_TOTAL = Number(noteWrap && noteWrap.getAttribute('data-all')) || 0;
-  var CAT_COUNT = Number(noteWrap && noteWrap.getAttribute('data-cats')) || 0;
   function chipFor(slug) { return bar.querySelector('.chip[data-filter="' + slug + '"]') }
   var state = { cats: [], churn: false };
   try {
@@ -1830,8 +1828,7 @@ ${rows.map(e => {
         text(num(sum) + ' changes across those ' + active.length + ' categories all-time ');
         link('browse by category', HUB);
       } else {
-        text(num(ALL_TOTAL) + ' changes all-time across ' + CAT_COUNT + ' categories ');
-        link('browse by category', HUB);
+        link('browse all changes by category', HUB);
       }
       if (state.churn && totalOf('churn')) {
         text(' \u00b7 ');

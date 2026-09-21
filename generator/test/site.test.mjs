@@ -601,8 +601,8 @@ test('buildSite generates valid static site output', async () => {
     // and where to find it: a bare "27" for CLI reads as "that is all there is".
     assert.match(indexHtml, /data-filter="cli" data-label="CLI" data-total="2" data-href="\/changes\/cli\/"/)
     assert.match(indexHtml, /data-filter="churn" data-label="churn" data-total="1" data-href="\/changes\/churn\/"/)
-    assert.match(indexHtml, /id="filter-all">3 changes all-time across 2 categories <a href="\/archive\/#categories"/,
-      'the note line states the all-time total next to the page count')
+    assert.match(indexHtml, /id="filter-all"><a href="\/archive\/#categories">browse all changes by category<\/a><\/span>/,
+      'the note line links to the category hub without restating the all-time total')
     assert.equal(rowTags(indexHtml).filter(t => t.includes('data-churn="1"')).length, 1)
     assert.ok(rowTags(indexHtml).every(t => t.includes('data-cat="')), 'every row is filterable by category')
     assert.equal(rowTags(indexHtml).filter(t => !isHidden(t)).length, 2, 'one day per page: two changes, its churn row hidden')
