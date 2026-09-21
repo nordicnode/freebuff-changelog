@@ -2,7 +2,7 @@
 // fully static, subdued/monochrome developer terminal site (system monospace,
 // authentic CLI/git-log presentation, dark theme, zero emojis, calm palette).
 import { writeText, writeBinary } from './util.mjs'
-import { escapeHtml as esc, fmtDateHuman, pool } from './util.mjs'
+import { escapeHtml as esc, fmtDateHuman, pool, shortHash } from './util.mjs'
 import { CSS } from './style.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
@@ -2912,7 +2912,13 @@ ${weekTabsScript}`
     if (extra) { if (row.length < 6) row.push(''); row.push(extra) }
     return row
   })
-  await write(dist, 'search-index.json', JSON.stringify({ cats: SEARCH_CATS, sigs: SEARCH_SIGS, ix: idxJson }))
+  // The payload ships as one file today (multi-MB once summaries land). The
+  // search page caches it in IndexedDB keyed by this content hash, so a repeat
+  // visit on the same build skips the fetch and the main-thread parse; a
+  // rebuild changes the hash baked into the (no-cache revalidated) page, which
+  // invalidates the cache -- no TTL directives anywhere.
+  const ixText = JSON.stringify({ cats: SEARCH_CATS, sigs: SEARCH_SIGS, ix: idxJson })
+  await write(dist, 'search-index.json', ixText)
   await write(dist, 'search/index.html', layout({
     title: 'Search', path: '/search/',
     body: `<section class="hero">
@@ -2959,7 +2965,39 @@ ${weekTabsScript}`
 <div id="hits" role="region" aria-label="Search results" tabindex="-1"></div>
 
 <script>
-fetch('/search-index.json').then(r=>r.json()).then(({ cats, sigs, ix })=>{
+// Versioned client cache for the index (see the build note): the parsed rows
+// live in IndexedDB keyed by this build's content hash, so repeat visits skip
+// the multi-MB fetch and parse. A new deploy ships a new hash inside this
+// no-cache-revalidated document, which invalidates the stored copy. Every
+// IndexedDB step is best-effort: private mode or a blocked open falls back to
+// the plain fetch path, matching the site's silent-degradation convention.
+const IX_V = '${shortHash(ixText)}';
+const ixOpen = () => new Promise((res, rej) => {
+  let req;
+  try { req = indexedDB.open('fb-search', 1); } catch (e) { return rej(e); }
+  req.onupgradeneeded = () => { req.result.createObjectStore('ix'); };
+  req.onsuccess = () => res(req.result);
+  req.onerror = () => rej(req.error);
+});
+const ixGet = (db) => new Promise((res, rej) => {
+  const g = db.transaction('ix').objectStore('ix').get('current');
+  g.onsuccess = () => res(g.result);
+  g.onerror = () => rej(g.error);
+});
+const loadIndex = async () => {
+  try {
+    const rec = await ixGet(await ixOpen());
+    if (rec && rec.v === IX_V) return rec;
+  } catch (_) {}
+  const r = await fetch('/search-index.json');
+  const { cats, sigs, ix } = await r.json();
+  try {
+    const db = await ixOpen();
+    db.transaction('ix', 'readwrite').objectStore('ix').put({ v: IX_V, cats, sigs, ix }, 'current');
+  } catch (_) {}
+  return { cats, sigs, ix };
+};
+loadIndex().then(({ cats, sigs, ix })=>{
   let t;
   let selectedHitIdx = -1;
   const q = document.getElementById('q'), h = document.getElementById('hits'), cnt = document.getElementById('match-count');
@@ -3755,8 +3793,10 @@ ctx.hidden = false
   Content-Type: image/png
 /manifest.webmanifest
   Content-Type: application/manifest+json
-/og/*
+/og/*.svg
   Content-Type: image/svg+xml
+/og/*.png
+  Content-Type: image/png
 /feed.xsl
   Content-Type: text/xsl; charset=utf-8
 /permalink

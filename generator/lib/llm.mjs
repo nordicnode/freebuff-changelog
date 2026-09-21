@@ -1214,6 +1214,12 @@ export function isGatewayError (err) {
 export function isTransientError (err) {
   if (isGatewayError(err)) return true
   const msg = String(err?.message || err || '')
+  // 429 (rate limit) and 408 (request timeout) are retry-soon conditions. Once
+  // callLlm's in-call retries are exhausted they must land on the short
+  // transient cooldown, not the 1-hour permanent one: under a throttled key the
+  // limit resets in minutes, and parking every queued entry for an hour stalls
+  // the whole backfill run after run.
+  if (/HTTP 4(29|08)\b/i.test(msg)) return true
   if (/HTTP 4\d\d/i.test(msg)) return false
   // A malformed JSON token, truncated response, or bad escape character from
   // the model is non-deterministic and should retry on the short cooldown (5 min)

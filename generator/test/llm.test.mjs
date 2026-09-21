@@ -23,7 +23,13 @@ test('isTransientError: 5xx gateway family, network faults transient', () => {
   assert.ok(isTransientError(new Error('ECONNRESET')))
   assert.ok(isTransientError(new Error('The operation was aborted due to timeout')))
   assert.ok(!isTransientError(new Error('LLM HTTP 400: bad request')))
-  assert.ok(!isTransientError(new Error('LLM HTTP 429: too many')))
+  assert.ok(!isTransientError(new Error('LLM HTTP 401: unauthorized')))
+  assert.ok(!isTransientError(new Error('LLM HTTP 403: forbidden')))
+  assert.ok(!isTransientError(new Error('LLM HTTP 404: not found')))
+  // 429/408 are retry-soon conditions: an exhausted in-call retry must still
+  // land on the short transient cooldown, not park the entry for an hour.
+  assert.ok(isTransientError(new Error('LLM HTTP 429: too many')))
+  assert.ok(isTransientError(new Error('LLM HTTP 408: request timeout')))
   // Anchored: a payload that merely contains gateway-looking digits is not one.
   assert.ok(!isTransientError(new Error('LLM HTTP 400: {"upstream":"502 seen at proxy"}')))
 })

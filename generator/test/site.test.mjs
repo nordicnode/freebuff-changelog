@@ -5,6 +5,7 @@ import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { buildSite, modelTimeline, modelSlug, scoreHit, discordText, renderBadgeSvg, generateReleaseNotesMarkdown, entryCard } from '../lib/site.mjs'
+import { shortHash } from '../lib/util.mjs'
 import { feedItem, jsonItem } from '../lib/feed.mjs'
 import { syncStaleMs } from '../lib/sync.mjs'
 
@@ -303,6 +304,19 @@ test('buildSite generates valid static site output', async () => {
     // e[6] is search-only text: touched paths and the evidence citation.
     assert.ok(searchIdx.ix.some(r => typeof r[6] === 'string' && r[6].length), 'search index tuple carries paths/evidence for identifier search')
     const searchHtml = await readFile(join(tmpDist, 'search/index.html'), 'utf8')
+    // Versioned client cache for the multi-MB index: the version baked into the
+    // page must match the shipped index bytes, so repeat visits skip the fetch
+    // and the main-thread parse, and any rebuild invalidates the stored copy
+    // (the document itself stays no-cache revalidated -- no TTL directives).
+    const searchRaw = await readFile(join(tmpDist, 'search-index.json'), 'utf8')
+    assert.ok(searchHtml.includes(`const IX_V = '${shortHash(searchRaw)}';`), 'page carries the version matching the shipped index')
+    assert.match(searchHtml, /indexedDB\.open\('fb-search'/, 'index is cached in IndexedDB')
+    assert.ok(searchHtml.includes('loadIndex().then('), 'search boots through the cached loader, not a bare fetch chain')
+    // The script is emitted from inside a generator template literal, where an
+    // escaping slip ships a dead page silently: parse what actually shipped.
+    const ixScript = [...searchHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]).find(s => s.includes('IX_V'))
+    assert.ok(ixScript, 'search page carries the index loader script')
+    new Function(ixScript)
     // The two things that made /search/ unusable on a phone, pinned:
     // min-width:0 because a flex item defaults to min-width:auto and a long
     // placeholder is *content* (the row grew past the box); text-size-adjust
@@ -367,7 +381,8 @@ test('buildSite generates valid static site output', async () => {
     const rules = parseHeaderRules(headerText)
     for (const url of ['/', '/index.html', '/about/', '/day/2026-09-13/', '/release/1.0.100/',
       '/api/entries.json', '/api/status.json', '/search-index.json', '/feed.json', '/feed.xml',
-      '/diffs/aaa.diff', '/pr-diffs/999.diff', '/models/', '/og/day-2026-09-13.svg', '/sitemap.xml']) {
+      '/diffs/aaa.diff', '/pr-diffs/999.diff', '/models/', '/og/day-2026-09-13.svg',
+      '/og/2026-09-13.svg', '/og/category-cli.svg', '/og/default.png', '/sitemap.xml']) {
       assert.deepEqual(duplicatedHeaders(rules, url), [], `overlapping _headers rules for ${url}`)
     }
     assert.equal(ruleFor(rules, '/*').headers['cache-control'], 'no-cache')
@@ -375,6 +390,12 @@ test('buildSite generates valid static site output', async () => {
     assert.equal(ruleFor(rules, '/diffs/*').headers['content-type'], 'text/plain; charset=utf-8')
     assert.equal(ruleFor(rules, '/*.json').headers['access-control-allow-origin'], '*')
     assert.equal(rules.filter(r => r.path === '/feed.json').length, 1, 'single /feed.json rule')
+    // Social cards keep their real type: a blanket /og/* once labeled the PNG
+    // default card as SVG, and nosniff forbade correcting it -- broken previews
+    // on every page without a dedicated day/category card.
+    assert.equal(rules.filter(r => r.path === '/og/*').length, 0, 'no blanket /og/* content-type rule')
+    assert.equal(ruleFor(rules, '/og/*.svg').headers['content-type'], 'image/svg+xml')
+    assert.equal(ruleFor(rules, '/og/*.png').headers['content-type'], 'image/png')
 
     // The header widget must key off the budget, and a backgrounded tab must not
     // sit on an old stamp forever once the loop has moved on.
