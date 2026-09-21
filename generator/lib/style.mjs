@@ -2396,14 +2396,32 @@ span.pager-num.active{
   border-top:1px dotted var(--term-border);
 }
 .timeline-freshness{
+  display:flex;
+  align-items:center;
+  gap:6px;
   color:var(--txt-subtle);
 }
 .timeline-freshness a{
   color:var(--txt-dim);
 }
 .timeline-stats{
+  display:flex;
+  align-items:center;
+  gap:4px;
   color:var(--txt-subtle);
 }
+.status-sep{color:var(--term-border-strong);font-style:normal}
+.settled-badge{
+  display:inline-block;
+  padding:1px 7px;
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  font-size:.72rem;
+  color:var(--txt-subtle);
+  letter-spacing:.06em;
+  white-space:nowrap;
+}
+.stats-churn{color:var(--txt-subtle)}
 .timeline-filter-row{
   display:flex;
   align-items:center;

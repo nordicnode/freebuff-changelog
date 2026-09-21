@@ -578,7 +578,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(indexHtml, /Dependency lockfile updated/)
     assert.match(indexHtml, /\[Churn\]/)
     assert.match(indexHtml, /<span class="day-churn">\+1 churn<\/span>/)
-    assert.match(indexHtml, /3 changes &middot; 1 churn/, 'hero counts changes and churn separately')
+    assert.match(indexHtml, /3 changes <span class="status-sep"[^>]*>&middot;<\/span> <span class="stats-churn">1 churn<\/span>/, 'hero counts changes and churn separately')
     const churnStart = indexHtml.indexOf('id="eeee11112222"')
     const churnNextRow = indexHtml.indexOf('<details class="entry ', churnStart + 30)
     const churnRow = indexHtml.slice(churnStart, churnNextRow === -1 ? churnStart + 4000 : churnNextRow)
@@ -932,7 +932,7 @@ test('the timeline paginates one day per page and keeps every entry reachable', 
     // old day would yank the page out from under them.
     assert.match(latest, /class="sync-age"/)
     assert.match(d12, /class="sync-age"/)
-    assert.match(d11, /THIS DAY IS SETTLED HISTORY/)
+    assert.match(d11, /class="settled-badge">SETTLED HISTORY</)
     assert.doesNotMatch(d11, /class="sync-val"|class="sync-age"|data-generated=/)
     assert.match(d11, /DATA AS OF \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/)
 

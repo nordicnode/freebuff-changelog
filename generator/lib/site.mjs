@@ -1579,7 +1579,7 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
   // are listed so nothing is hidden, but they must not inflate the headline.
   const meaningful = entries.filter(e => !e.noise)
   const churnCount = entries.length - meaningful.length
-  const churnNote = churnCount ? ` &middot; ${churnCount.toLocaleString()} churn` : ''
+  const churnNote = churnCount ? ` <span class="status-sep" aria-hidden="true">&middot;</span> <span class="stats-churn">${churnCount.toLocaleString()} churn</span>` : ''
   // Human phrasings for the churn kinds `analyze.mjs` stamps on a row. Used only
   // to explain a day that holds nothing but churn (see `renderTimelineDay`), so
   // the notice names what actually landed there rather than a generic guess.
@@ -1660,7 +1660,8 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
     const freshness = latest
       ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}" data-head="${esc(changelog.headSha || '')}" data-changes="${meaningful.length}">${esc(fmtDateHuman(generated))} UTC</span></span>`
       : `<span>DATA AS OF ${esc(String(generated).slice(0, 16).replace('T', ' '))} UTC</span>
-      <span>THIS DAY IS SETTLED HISTORY</span>`
+      <span class="status-sep" aria-hidden="true">&middot;</span>
+      <span class="settled-badge">SETTLED HISTORY</span>`
 
     const catCounts = new Map()
     for (const e of rows) {
@@ -1685,7 +1686,7 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
     <div class="timeline-freshness">${freshness}</div>
     <div class="timeline-stats">${latest
     ? `${meaningful.length.toLocaleString()} changes${churnNote}`
-    : `${real} change${real === 1 ? '' : 's'} that day${churn ? ` + ${churn} churn` : ''}`}</div>
+    : `${real} change${real === 1 ? '' : 's'}${churn ? ` <span class="status-sep" aria-hidden="true">&middot;</span> <span class="stats-churn">${churn} churn</span>` : ''}`}</div>
     <div class="timeline-bulk-toggle">
       <button type="button" class="timeline-bulk-btn" data-bulk="expand">[expand all]</button>
       <button type="button" class="timeline-bulk-btn" data-bulk="collapse">[collapse all]</button>
