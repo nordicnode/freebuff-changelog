@@ -143,9 +143,19 @@ export async function pool (tasks, n = 8) {
  * fresh mtime, and an mtime window meant the daemon logged "another run holds
  * the lock" for half an hour after every restart while publishing nothing. A
  * live owner still waits, because a long LLM batch legitimately holds it.
+ *
+ * The parent directory is created first, and the lock itself still with a
+ * *non-recursive* mkdir so EEXIST keeps meaning "someone else holds it". That
+ * ordering is the whole bug: the lock lives under `.cache/`, which only the
+ * clone inside the critical section creates, so in a fresh worktree the mkdir
+ * failed with ENOENT, anything but EEXIST is rethrown, and the 24/7 loop spent
+ * its entire budget erroring before it could clone the directory that would
+ * have fixed it -- a deadlock that repaired itself never, and logged nothing.
  */
 export async function withLock (lockDir, fn, { retries = 2 } = {}) {
   const { mkdir, rm, readFile, writeFile } = await import('node:fs/promises')
+  const { dirname } = await import('node:path')
+  await mkdir(dirname(lockDir), { recursive: true })
   let acquired = false
   for (let attempt = 0; attempt <= retries && !acquired; attempt++) {
     try {

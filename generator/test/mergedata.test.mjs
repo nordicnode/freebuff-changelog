@@ -8,6 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mergeChangelog, mergeAiCache, mergeSyncState, mergeOpenPrs, capturePendingWrites, persistMerged } from '../lib/mergedata.mjs'
@@ -217,6 +218,29 @@ test('withLock releases on throw and takes over a lock whose owner is gone', asy
   const busy = await withLock(lockDir, async () => 'ran while someone else held it')
   assert.equal(busy.acquired, false, 'a live owner keeps the lock')
   assert.equal(busy.result, undefined)
+})
+
+// The lock lives in `.cache/generator.lock`, and `.cache/` is created by the
+// upstream clone that runs *inside* the critical section. In a workspace with no
+// `.cache/` yet -- a fresh CI runner whose cache read missed -- the non-recursive
+// mkdir failed with ENOENT, `err.code !== 'EEXIST'` rethrew it, and every cycle
+// of the 24/7 relay died before it could clone the directory that would have
+// fixed it: an outage that could not heal itself and never left more evidence
+// than a log line, while the deployed site went stale.
+test('withLock creates its own parent directory in a fresh worktree', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'fb-lock-parent-'))
+  const lockDir = join(dir, '.cache', 'generator.lock')
+  const first = await withLock(lockDir, async () => 'ran')
+  assert.equal(first.acquired, true, 'a missing parent dir must not block the lock')
+  assert.equal(first.result, 'ran')
+  assert.equal(existsSync(lockDir), false, 'and it is still cleaned up after the run')
+
+  // Contention must still be contention: creating the parent recursively may
+  // not turn a held lock into a second winner.
+  await mkdir(lockDir, { recursive: true })
+  await writeFile(join(lockDir, 'owner'), `1 ${new Date().toISOString()}\n`)
+  const blocked = await withLock(lockDir, async () => 'ran while a live owner held it')
+  assert.equal(blocked.acquired, false, 'a live owner still wins, parent dir or not')
 })
 
 // The plain-English line is produced by the writer that holds the summary, which

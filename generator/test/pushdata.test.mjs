@@ -14,7 +14,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { commitAndPushData, refreshDiffFlags, cmdWatch } from '../cli.mjs'
+import { commitAndPushData, refreshDiffFlags, cmdWatch, cmdFreshness } from '../cli.mjs'
 import { pruneDiffs } from '../lib/util.mjs'
 import { mergeChangelog } from '../lib/mergedata.mjs'
 
@@ -211,5 +211,61 @@ test('cmdWatch respects --duration and exits cleanly', async () => {
   assert.ok(cycles >= 1, 'ran at least one cycle before checking the deadline')
   assert.ok(elapsed >= 40, 'ran for at least the specified duration')
   assert.ok(elapsed < 10000, 'exited promptly after duration expired')
+})
+
+// A throwing cycle means the loop is failing at its only job -- keeping the
+// site fresh. It used to be a log line and a green exit: a relay run that spent
+// all twelve minutes erroring on a lock directory it could not create pushed
+// nothing, deploy.yml published the frozen data, and the sole witness was the
+// "[stale 16m]" badge readers saw. CI must never be quieter than the site.
+test('cmdWatch aborts and fails the run while cycles keep throwing', async () => {
+  let cycles = 0
+  await assert.rejects(
+    () => cmdWatch(['--duration', '30s', '--interval', '1'], {
+      cycle: async () => { cycles++; throw new Error('ENOENT: no such file or directory, mkdir .cache/generator.lock') },
+      errorBudget: 3
+    }),
+    /3 consecutive cycle failures.*generator\.lock/,
+    'the failure is named, not swallowed'
+  )
+  assert.equal(cycles, 3, 'gives up at the ceiling instead of spending the whole duration')
+})
+
+// A skipped cycle is the loop idling while a peer run publishes; that is the
+// design working, not an outage, so it must not trip the failure path.
+test('cmdWatch stays green while a peer holds the worktree lock', async () => {
+  let cycles = 0
+  await cmdWatch(['--duration', '50ms', '--interval', '1'], {
+    errorBudget: 1,
+    cycle: async () => { cycles++; return { acquired: false } }
+  })
+  assert.ok(cycles >= 1, 'kept cycling while another run owns the lock')
+})
+
+test('cmdFreshness fails CI on data the site would render as [stale]', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'fb-fresh-'))
+  await mkdir(`${dir}/data`, { recursive: true })
+  const now = Date.parse('2026-09-21T02:00:00Z')
+  const env = { CHANGELOG_SYNC_STALE_MIN: '5' }
+  const write = async (generatedAt) => {
+    await writeFile(`${dir}/data/changelog.json`, JSON.stringify({
+      version: 1, generatedAt, headSha: 'f90826a1a1a31a278487ed877685e96afa106519', entries: []
+    }))
+  }
+
+  // The badge's own rule: one overdue pass is a sync in flight, two is broken.
+  await write('2026-09-21T01:55:00Z')
+  assert.equal((await cmdFreshness([], { dataDir: `${dir}/data`, now, env })).ok, true, '5m old is fresh')
+
+  await write('2026-09-21T01:47:41Z')
+  await assert.rejects(() => cmdFreshness([], { dataDir: `${dir}/data`, now, env }),
+    /generated 12m ago/, '12m old is the outage the reader already saw')
+
+  // --max-age-min lets a caller state its own tolerance.
+  assert.equal((await cmdFreshness(['--max-age-min', '60'], { dataDir: `${dir}/data`, now, env })).ok, true)
+
+  await write('not a timestamp')
+  await assert.rejects(() => cmdFreshness([], { dataDir: `${dir}/data`, now, env }),
+    /no readable generatedAt/, 'an unparseable stamp is never "fresh"')
 })
 

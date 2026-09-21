@@ -947,9 +947,46 @@ async function cmdPushData (argv) {
   await commitAndPushData({ message })
 }
 
+/**
+ * Freshness gate for CI: fail when data/changelog.json is older than the site
+ * is willing to call fresh.
+ *
+ * The reader-facing badge computes "[stale Nm]" from `generatedAt`, which only
+ * the analyze pass moves; deploy.yml happily built and uploaded whatever was on
+ * disk. So a dead sync loop showed up as a stale badge on the site and as
+ * nothing at all in the Actions UI. This is the check that closes that gap --
+ * the same threshold as the badge, asserted before a reader has to find it.
+ */
+export async function cmdFreshness (argv = [], { dataDir = DATA, now = Date.now(), env = process.env } = {}) {
+  const at = argv.indexOf('--max-age-min')
+  const budgetMin = Math.round(syncStaleMs(env) / 60000)
+  const limitMin = at !== -1 ? Number(argv[at + 1]) || 0 : budgetMin * 2
+  const doc = await readJson(`${dataDir}/changelog.json`, null)
+  const then = Date.parse(doc?.generatedAt || '') || 0
+  const ageMin = then ? Math.max(0, Math.floor((now - then) / 60000)) : null
+  const ok = then !== 0 && ageMin < limitMin
+  const summary = !then
+    ? `data/changelog.json has no readable generatedAt: the sync loop has never completed an analyze pass into this branch`
+    : `data/changelog.json was generated ${ageMin}m ago (head ${String(doc.headSha || '?').slice(0, 10)}); the site renders "[stale]" past ${limitMin}m`
+
+  if (env.GITHUB_ACTIONS === 'true') {
+    console.log(ok ? `::notice::${summary}` : `::error::${summary}`)
+  }
+  if (env.GITHUB_STEP_SUMMARY) {
+    const { appendFile } = await import('node:fs/promises')
+    await appendFile(env.GITHUB_STEP_SUMMARY, `### Changelog freshness\n\n${ok ? '✅' : '❌'} ${summary}\n`).catch(() => {})
+  }
+  log(`[freshness] ${summary}`)
+  if (!ok) throw new Error(`[freshness] ${summary}`)
+  return { ok, ageMin, limitMin }
+}
+
 async function cmdCatchUp (argv) {
   const { acquired } = await withLock(LOCK, () => catchUpOnce(argv))
   if (!acquired) log('another generate/backfill run holds the worktree lock: skipping this cycle')
+  // The loop reads this to tell "a peer holds the lock" (healthy, the site is
+  // being kept fresh by someone) apart from "this cycle did nothing" (broken).
+  return { acquired: Boolean(acquired) }
 }
 
 async function catchUpOnce (argv) {
@@ -1088,7 +1125,7 @@ async function catchUpOnce (argv) {
   }
 }
 
-export async function cmdWatch (argv, { cycle = cmdCatchUp } = {}) {
+export async function cmdWatch (argv, { cycle = cmdCatchUp, errorBudget } = {}) {
   let intervalSec = 60
   const idx = argv.indexOf('--interval')
   if (idx !== -1 && argv[idx + 1]) {
@@ -1118,14 +1155,41 @@ export async function cmdWatch (argv, { cycle = cmdCatchUp } = {}) {
   process.once('SIGTERM', stop)
 
   const startTime = Date.now()
+  // A cycle that throws means the loop is failing at its one job -- keeping the
+  // site fresh -- and it used to be log-only: a 12-minute run of nothing but
+  // `ENOENT ... generator.lock` still exited 0, so deploy.yml published the
+  // last good data and the Actions UI showed green while readers saw
+  // "[stale 16m]". CI must never be quieter about staleness than the site is,
+  // so failures are counted and turned into a failed run.
+  let cyclesOk = 0
+  let consecutiveErrors = 0
+  let lastError = null
+  // Give up once errors have stretched over the loop's own freshness budget
+  // rather than the full duration: an abort retries in the next relay run
+  // instead of burning 12 minutes of a runner to publish nothing.
+  const errorCeil = errorBudget ?? Math.max(3, Math.ceil(syncStaleMs() / 1000 / intervalSec))
   log(`starting backfill loop (running every ${intervalSec}s${maxDurationMs < Infinity ? `, max duration ${durVal}` : ''})… Press Ctrl+C to stop.`)
   while (!stopped) {
     try {
-      await cycle(argv)
+      const outcome = await cycle(argv)
+      if (outcome && outcome.acquired === false) {
+        // A peer run holds the worktree lock: idle, but healthy.
+        consecutiveErrors = 0
+      } else {
+        cyclesOk++
+        consecutiveErrors = 0
+        lastError = null
+      }
     } catch (err) {
-      log(`backfill loop iteration error: ${err.message}`)
+      consecutiveErrors++
+      lastError = err
+      log(`backfill loop iteration error (${consecutiveErrors}/${errorCeil} since the last good cycle): ${err.message}`)
     }
     if (stopped) break
+
+    if (consecutiveErrors >= errorCeil) {
+      throw new Error(`backfill loop aborted after ${consecutiveErrors} consecutive cycle failures: ${lastError?.message || 'unknown error'}`)
+    }
 
     const elapsed = Date.now() - startTime
     if (elapsed >= maxDurationMs) {
@@ -1158,6 +1222,11 @@ export async function cmdWatch (argv, { cycle = cmdCatchUp } = {}) {
       log(`duration limit reached (${durVal}): exiting backfill loop cleanly.`)
       break
     }
+  }
+  // A short run can hit its duration limit before the error ceiling does: still
+  // no excuse for a green pass over data that never moved.
+  if (!stopped && !cyclesOk && lastError) {
+    throw new Error(`backfill loop published nothing in ${consecutiveErrors} cycle(s): ${lastError.message}`)
   }
   log('backfill loop stopped.')
 }
@@ -1357,6 +1426,7 @@ if (IS_MAIN) {
   else if (cmd === 'catch-up') await cmdCatchUp(rest)
   else if (cmd === 'watch' || cmd === 'backfill') await cmdWatch(rest)
   else if (cmd === 'push-data') await cmdPushData(rest)
+  else if (cmd === 'freshness') await cmdFreshness(rest)
   else if (cmd === 'enrich-all') await cmdEnrichAll(rest)
   else if (cmd === 'repair-entries') await cmdRepairEntries(rest)
   else if (cmd === 'prune-cache') await cmdPruneCache(rest)
@@ -1374,6 +1444,7 @@ if (IS_MAIN) {
   node generator/cli.mjs backfill [--push] [--interval S] [--duration D]  # continuous sync & backfill loop
   node generator/cli.mjs watch [--push] [--interval S] [--duration D]     # alias for backfill
   node generator/cli.mjs push-data [--message M]  # commit+push data/ with the shared race handling
+  node generator/cli.mjs freshness [--max-age-min N]  # CI gate: fail if data/changelog.json is staler than the site's own [stale] threshold (2x the sync budget)
   node generator/cli.mjs enrich-all [--batch N] [--push] [--rewrite-stale]  # one pass toward a diff + summary + ELI5 for every entry (0 = everything left); --rewrite-stale also refreshes rows on an older prompt, major first
   node generator/cli.mjs repair-entries [--push]   # recompute commitNature / significance / security tag on stored rows (no text touched)
   node generator/cli.mjs prune-cache [--push]      # drop ai-summaries.json keys from retired prompt versions
