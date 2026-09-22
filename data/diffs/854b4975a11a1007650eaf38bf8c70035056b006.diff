@@ -1,0 +1,760 @@
+diff --git a/packages/agent-runtime/src/__tests__/run-agent-step-tools.test.ts b/packages/agent-runtime/src/__tests__/run-agent-step-tools.test.ts
+index ebe1804dc..b85630265 100644
+--- a/packages/agent-runtime/src/__tests__/run-agent-step-tools.test.ts
++++ b/packages/agent-runtime/src/__tests__/run-agent-step-tools.test.ts
+@@ -1,48 +1,52 @@
+ import * as analytics from '@codebuff/common/analytics'
+ import { TEST_USER_ID } from '@codebuff/common/old-constants'
+ import { TEST_AGENT_RUNTIME_IMPL } from '@codebuff/common/testing/impl/agent-runtime'
+ import {
+   createMockDbOperations,
+   setupDbSpies,
+ } from '@codebuff/common/testing/mocks/database'
+ import { getInitialSessionState } from '@codebuff/common/types/session-state'
+ import { promptSuccess } from '@codebuff/common/util/error'
+ import { assistantMessage, userMessage } from '@codebuff/common/util/messages'
+ import {
+   afterAll,
+   afterEach,
+   beforeEach,
+   describe,
+   expect,
+   it,
+   mock,
+   spyOn,
+ } from 'bun:test'
+ 
+ import { runAgentStep } from '../run-agent-step'
+ import { clearAgentGeneratorCache } from '../run-programmatic-step'
++import {
++  FOLLOWUP_SUGGESTION_LIMIT_TAG,
++  MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE,
++} from '../tools/stream-parser'
+ import { createToolCallChunk } from './test-utils'
+ 
+ import type { AgentTemplate } from '../templates/types'
+ import type { DbSpies } from '@codebuff/common/testing/mocks/database'
+ import type {
+   AgentRuntimeDeps,
+   AgentRuntimeScopedDeps,
+ } from '@codebuff/common/types/contracts/agent-runtime'
+ import type { ParamsExcluding } from '@codebuff/common/types/function-params'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ import type { ProjectFileContext } from '@codebuff/common/util/file'
+ 
+ describe('runAgentStep - set_output tool', () => {
+   let testAgent: AgentTemplate
+   let agentRuntimeImpl: AgentRuntimeDeps & AgentRuntimeScopedDeps
+   let runAgentStepBaseParams: ParamsExcluding<
+     typeof runAgentStep,
+     | 'agentType'
+     | 'prompt'
+     | 'localAgentTemplates'
+     | 'agentState'
+     | 'agentTemplate'
+   >
+   let dbSpies: DbSpies
+ 
+@@ -327,50 +331,152 @@ describe('runAgentStep - set_output tool', () => {
+     const sessionState = getInitialSessionState(fileContextWithSuggest)
+     runAgentStepBaseParams.promptAiSdkStream = async function* () {
+       yield createToolCallChunk('suggest_prompts', {
+         response: 'Finished.',
+         prompts: [{ prompt: 'Add tests' }],
+       })
+       return promptSuccess('mock-message-id')
+     }
+     runAgentStepBaseParams.requestToolCall = async () => ({
+       output: [{ type: 'json', value: { ok: true } }],
+     })
+ 
+     const result = await runAgentStep({
+       ...runAgentStepBaseParams,
+       agentType: suggestAgent.id,
+       localAgentTemplates: { [suggestAgent.id]: suggestAgent },
+       agentTemplate: suggestAgent,
+       agentState: sessionState.mainAgentState,
+       fileContext: fileContextWithSuggest,
+       prompt: 'Finish the task',
+     })
+ 
+     expect(result.shouldEndTurn).toBe(true)
+   })
+ 
++  describe('follow-up suggestion cap', () => {
++    const suggestAgent = (): AgentTemplate => ({
++      ...testAgent,
++      id: 'suggest-cap-agent',
++      toolNames: ['suggest_prompts', 'read_files', 'end_turn'],
++    })
++    const fileContextWithSuggest = (): ProjectFileContext => ({
++      ...mockFileContext,
++      customToolDefinitions: {
++        suggest_prompts: {
++          inputSchema: {
++            type: 'object',
++            properties: { prompts: { type: 'array' } },
++            required: ['prompts'],
++          },
++          description: 'Suggest follow-up prompts',
++          endsAgentStep: false,
++        },
++      },
++    })
++
++    /** A response that calls suggest_prompts `calls` times, then writes text.
++     *  Records how far it was read and the signal its request was given. */
++    const runawayStream = (calls: number) => {
++      const seen = { pulled: 0, finished: false, signal: undefined as AbortSignal | undefined }
++      const promptAiSdkStream = async function* (params: { signal: AbortSignal }) {
++        seen.signal = params.signal
++        for (let i = 0; i < calls; i++) {
++          seen.pulled++
++          yield createToolCallChunk('suggest_prompts', {
++            prompts: [{ prompt: `Idea ${i}` }],
++          })
++        }
++        yield { type: 'text' as const, text: 'Done.' }
++        seen.finished = true
++        return promptSuccess('mock-message-id')
++      }
++      return { seen, promptAiSdkStream }
++    }
++
++    const run = async (calls: number) => {
++      const { seen, promptAiSdkStream } = runawayStream(calls)
++      runAgentStepBaseParams.promptAiSdkStream = promptAiSdkStream as any
++      const executed: string[] = []
++      runAgentStepBaseParams.requestToolCall = async ({ toolName }) => {
++        executed.push(toolName)
++        return { output: [{ type: 'json', value: { ok: true } }] }
++      }
++      const runSignal = new AbortController().signal
++      const agent = suggestAgent()
++      const fileContext = fileContextWithSuggest()
++      const result = await runAgentStep({
++        ...runAgentStepBaseParams,
++        signal: runSignal,
++        agentType: agent.id,
++        localAgentTemplates: { [agent.id]: agent },
++        agentTemplate: agent,
++        agentState: getInitialSessionState(fileContext).mainAgentState,
++        fileContext,
++        prompt: 'Finish the task',
++      })
++      return { result, seen, executed, runSignal }
++    }
++
++    const limitNotes = (messages: Message[]) =>
++      messages.filter((m) => m.tags?.includes(FOLLOWUP_SUGGESTION_LIMIT_TAG))
++
++    it('executes up to the cap without cutting the response', async () => {
++      const { result, seen, executed } = await run(
++        MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE,
++      )
++
++      expect(executed).toHaveLength(MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE)
++      expect(seen.finished).toBe(true)
++      expect(seen.signal?.aborted).toBe(false)
++      expect(limitNotes(result.agentState.messageHistory)).toHaveLength(0)
++      expect(result.shouldEndTurn).toBe(true)
++    })
++
++    it('stops a runaway response at the cap and cancels its request, not the run', async () => {
++      const { result, seen, executed, runSignal } = await run(500)
++
++      // Only the first MAX calls ran (and so rendered); the rest were never read.
++      expect(executed).toHaveLength(MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE)
++      expect(seen.pulled).toBe(MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE + 1)
++      expect(seen.finished).toBe(false)
++      expect(seen.signal?.aborted).toBe(true)
++      expect(runSignal.aborted).toBe(false)
++
++      const history = result.agentState.messageHistory
++      expect(limitNotes(history)).toHaveLength(1)
++      const toolCalls = history.flatMap((m) =>
++        m.role === 'assistant' && Array.isArray(m.content)
++          ? m.content.filter((part) => part.type === 'tool-call')
++          : [],
++      )
++      expect(toolCalls).toHaveLength(MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE)
++      // Suggestions never force another step, so the cut response ends the turn.
++      expect(result.shouldEndTurn).toBe(true)
++    })
++  })
++
+   it('should handle handleSteps with one tool call and STEP_ALL', async () => {
+     // Create a mock agent template with handleSteps
+     const mockAgentTemplate: AgentTemplate = {
+       id: 'test-handlesteps-agent',
+       displayName: 'Test HandleSteps Agent',
+       spawnerPrompt: 'Testing handleSteps functionality',
+       model: 'claude-3-5-sonnet-20241022',
+       inputSchema: {},
+       outputMode: 'structured_output' as const,
+       includeMessageHistory: true,
+       inheritParentSystemPrompt: false,
+       mcpServers: {},
+       toolNames: ['read_files', 'end_turn'],
+       spawnableAgents: [],
+       systemPrompt: 'Test system prompt',
+       instructionsPrompt: 'Test instructions prompt',
+       stepPrompt: 'Test agent step prompt',
+       handleSteps: function* ({ agentState, prompt, params }) {
+         // Yield one tool call
+         yield {
+           toolName: 'read_files',
+           input: { paths: ['src/test.ts'] },
+         }
+         // Then yield STEP_ALL to continue processing
+         yield 'STEP_ALL'
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 7d2083dbb..9d020cc77 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -194,50 +194,51 @@ export const runAgentStep = async (
+     agentState: AgentState
+     localAgentTemplates: Record<string, AgentTemplate>
+ 
+     prompt: string | undefined
+     spawnParams: Record<string, any> | undefined
+     system: string
+     n?: number
+ 
+     trackEvent: TrackEventFn
+     promptAiSdk: PromptAiSdkFn
+     traceWriter?: TraceWriter
+     onAgentUsageReceived?: (usage: AgentUsageData) => void
+     onAgentUsageIncomplete?: () => void
+     onCompaction?: (data: ContextCompactionData) => void
+   } & ParamsExcluding<
+     typeof processStream,
+     | 'agentContext'
+     | 'agentState'
+     | 'agentStepId'
+     | 'agentTemplate'
+     | 'fullResponse'
+     | 'messages'
+     | 'onCostCalculated'
+     | 'repoId'
+     | 'stream'
++    | 'stopStream'
+   > &
+     ParamsExcluding<
+       typeof getAgentStreamFromTemplate,
+       | 'agentId'
+       | 'includeCacheControl'
+       | 'messages'
+       | 'onCostCalculated'
+       | 'template'
+     > &
+     ParamsExcluding<typeof getAgentTemplate, 'agentId'> &
+     ParamsExcluding<
+       typeof getAgentPrompt,
+       'agentTemplate' | 'promptType' | 'agentState' | 'agentTemplates'
+     > &
+     ParamsExcluding<
+       typeof getMCPToolData,
+       'toolNames' | 'mcpServers' | 'writeTo'
+     > &
+     ParamsExcluding<
+       PromptAiSdkFn,
+       'messages' | 'model' | 'onCostCalculated' | 'n'
+     >,
+ ): Promise<{
+   agentState: AgentState
+   fullResponse: string
+@@ -495,92 +496,98 @@ export const runAgentStep = async (
+           )
+         }
+         // If it parsed but isn't an array, treat as single response
+         nResponses = [responsesString]
+       }
+     } catch (e) {
+       if (params.n > 1) {
+         throw e
+       }
+       // If parsing fails, treat as single raw response (common for n=1)
+       nResponses = [responsesString]
+     }
+ 
+     return {
+       agentState,
+       fullResponse: responsesString,
+       shouldEndTurn: false,
+       messageId: null,
+       nResponses,
+     }
+   }
+ 
+   let fullResponse = ''
+   const toolResults: ToolMessage[] = []
+ 
++  // Lets processStream cancel this step's request without cancelling the run
++  // (a runaway response it has decided to stop reading).
++  const streamStop = new AbortController()
++
+   // Raw stream from AI SDK
+   const stream = getAgentStreamFromTemplate({
+     ...params,
++    signal: AbortSignal.any([params.signal, streamStop.signal]),
+     agentId: agentState.parentId ? agentState.agentId : undefined,
+     costMode: params.costMode,
+     cacheDebugCorrelation: cacheDebugCorrelation
+       ? serializeCacheDebugCorrelation(cacheDebugCorrelation)
+       : undefined,
+     includeCacheControl: supportsCacheControl(agentTemplate.model),
+     messages: [systemMessage(system), ...agentState.messageHistory],
+     onCacheDebugProviderRequestBuilt,
+     onCacheDebugUsageReceived,
+     onUsageReceived: params.onAgentUsageReceived
+       ? (usage: ModelUsageData) =>
+           params.onAgentUsageReceived?.({
+             ...usage,
+             isRoot: !agentState.parentId,
+             agentId: agentState.agentId,
+           })
+       : undefined,
+     onUsageIncomplete: params.onAgentUsageIncomplete,
+     template: agentTemplate,
+     onCostCalculated,
+   })
+ 
+   const {
+     fullResponse: fullResponseAfterStream,
+     hadToolCallError,
+     messageId,
+     toolCalls,
+     toolResults: newToolResults,
+   } = await processStream({
+     ...params,
+     agentContext,
+     agentState,
+     agentStepId,
+     agentTemplate,
+     fullResponse,
+     messages: agentState.messageHistory,
+     repoId,
+     stream,
+     onCostCalculated,
++    stopStream: () => streamStop.abort(),
+   })
+ 
+   toolResults.push(...newToolResults)
+ 
+   fullResponse = fullResponseAfterStream
+ 
+   // A successful no-op is not progress. GLM can keep emitting the same to-do
+   // list (even while acknowledging the loop in prose) until the general step
+   // budget is exhausted. Give it a chance to recover, then fail explicitly.
+   if (
+     !hadToolCallError &&
+     toolCalls.length > 0 &&
+     toolCalls.every((call) => call.toolName === 'write_todos')
+   ) {
+     const consecutive = trailingIdenticalTodoCalls(agentState.messageHistory)
+     if (consecutive >= TODO_LOOP_STOP_THRESHOLD) {
+       throw new TodoLoopError()
+     }
+     if (consecutive >= TODO_LOOP_RECOVERY_THRESHOLD) {
+       agentState.messageHistory.push(
+         userMessage({
+           content: withSystemTags(TODO_LOOP_RECOVERY_MESSAGE),
+           tags: [TODO_LOOP_RECOVERY_TAG],
+         }),
+       )
+diff --git a/packages/agent-runtime/src/tools/stream-parser.ts b/packages/agent-runtime/src/tools/stream-parser.ts
+index edd0e60bd..0a04a5c7a 100644
+--- a/packages/agent-runtime/src/tools/stream-parser.ts
++++ b/packages/agent-runtime/src/tools/stream-parser.ts
+@@ -38,50 +38,68 @@ import type {
+ } from '@codebuff/common/types/messages/codebuff-message'
+ import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+ import type { Subgoal } from '@codebuff/common/types/session-state'
+ import type { ProjectFileContext } from '@codebuff/common/util/file'
+ 
+ /** History tags for the notes appended when a step's stream ends without a
+  *  usable response and the loop auto-retries (see
+  *  sdk/src/impl/stream-interruption.ts for detection): the connection was cut
+  *  mid-response, or the model ended after reasoning without an answer. */
+ export const STREAM_INTERRUPTED_TAG = 'STREAM_INTERRUPTED'
+ export const OUTPUT_LIMIT_TAG = 'OUTPUT_LIMIT'
+ 
+ /** How many back-to-back recovery retries (nothing but the model's partial
+  *  output between them, interruption and reasoning-only combined) run before
+  *  the turn fails loudly. One covers the deploy/network blip or one-off
+  *  thinking overrun this retry exists for; a run of them means every attempt
+  *  is failing the same way. */
+ export const MAX_CONSECUTIVE_STREAM_RECOVERIES = 3
+ 
+ export const REPEATED_STREAM_INTERRUPTIONS_MESSAGE =
+   'The connection kept dropping mid-response after several retries. Please check your network connection and try again.'
+ 
+ export const REPEATED_OUTPUT_LIMIT_MESSAGE =
+   'The model kept ending after reasoning without producing a response. Try a simpler request or a different model.'
+ 
++/**
++ * Follow-up suggestion tools render a clickable card per call and do nothing
++ * else, so a model that degenerates into repeating one inside a single
++ * response has no natural brake: every call streams, executes and renders
++ * before the model ever sees a result. Seen 2026-09-22 on Freebuff Desktop
++ * (MiMo v2.5): a single response streamed suggest_prompts calls for 3.5
++ * minutes (the turn logged 90 tool calls) until the user pressed Stop. The
++ * guidance asks for two to four, one per call, so this cap leaves generous
++ * headroom for legitimate use.
++ */
++export const FOLLOWUP_SUGGESTION_TOOL_NAMES: ReadonlySet<string> = new Set([
++  'suggest_prompts',
++  'suggest_followups',
++])
++export const MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE = 8
++export const FOLLOWUP_SUGGESTION_LIMIT_TAG = 'FOLLOWUP_SUGGESTION_LIMIT'
++export const FOLLOWUP_SUGGESTION_LIMIT_MESSAGE = `Your previous response was cut off because it called a follow-up suggestion tool more than ${MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE} times. The first ${MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE} suggestions were shown to the user. Do not suggest more follow-ups this turn.`
++
+ const RECOVERY_BY_SOURCE: Record<
+   StreamRecoverySource,
+   { tag: string; giveUpMessage: string }
+ > = {
+   'stream-interrupted': {
+     tag: STREAM_INTERRUPTED_TAG,
+     giveUpMessage: REPEATED_STREAM_INTERRUPTIONS_MESSAGE,
+   },
+   'output-limit': {
+     tag: OUTPUT_LIMIT_TAG,
+     giveUpMessage: REPEATED_OUTPUT_LIMIT_MESSAGE,
+   },
+ }
+ 
+ // Map (not a plain object) so an arbitrary message tag like 'constructor'
+ // can't match via the prototype chain.
+ const SOURCE_BY_RECOVERY_TAG: ReadonlyMap<string, StreamRecoverySource> =
+   new Map(
+     Object.entries(RECOVERY_BY_SOURCE).map(([source, recovery]) => [
+       recovery.tag,
+       source as StreamRecoverySource,
+     ]),
+   )
+ 
+ export interface TrailingStreamRecoveryStreak {
+@@ -116,172 +134,201 @@ export function trailingStreamRecoveryStreak(
+     const tag = message.tags?.find((t) => SOURCE_BY_RECOVERY_TAG.has(t))
+     if (!tag) break
+     if (count === 0) lastSource = SOURCE_BY_RECOVERY_TAG.get(tag)
+     count++
+   }
+   return { count, lastSource }
+ }
+ 
+ export async function processStream(
+   params: {
+     agentContext: Record<string, Subgoal>
+     agentTemplate: AgentTemplate
+     ancestorRunIds: string[]
+     fileContext: ProjectFileContext
+     fingerprintId: string
+     fullResponse: string
+     logger: Logger
+     messages: Message[]
+     repoId: string | undefined
+     runId: string
+     signal: AbortSignal
+     userId: string | undefined
+ 
+     onCostCalculated: (credits: number) => Promise<void>
+     onResponseChunk: (chunk: string | PrintModeEvent) => void
++    /** Cancels this step's model request (not the run). Called when the
++     *  response is cut short by the follow-up suggestion cap. */
++    stopStream?: () => void
+   } & Omit<
+     ExecuteToolCallParams<any>,
+     | 'currentAssistantMessages'
+     | 'fileProcessingState'
+     | 'fromHandleSteps'
+     | 'fullResponse'
+     | 'input'
+     | 'previousToolCallFinished'
+     | 'state'
+     | 'toolCallId'
+     | 'toolCalls'
+     | 'toolCallsToAddToMessageHistory'
+     | 'toolName'
+     | 'toolResults'
+     | 'toolResultsToAddToMessageHistory'
+   > &
+     ParamsExcluding<
+       typeof processStreamWithTools,
+       | 'processors'
+       | 'defaultProcessor'
+       | 'executeXmlToolCall'
+     >,
+ ) {
+   const {
+     agentState,
+     agentTemplate,
+     ancestorRunIds,
+     fileContext,
+     fullResponse,
+     logger,
+     onCostCalculated,
+     onResponseChunk,
+     runId,
+     signal,
++    stopStream,
+     userId,
+   } = params
+   const fullResponseChunks: string[] = [fullResponse]
+ 
+   // === LEAKED-REASONING SPLIT ===
+   // Reasoning that a lane failed to put in its native field arrives here as
+   // ordinary text, tags and all. Reclassify it before it reaches a surface, so
+   // the thinking box is the only place a chain of thought is ever rendered.
+   // See util/think-tag-stream.ts for the three shapes and why the implicit-open
+   // rule is armed from the history rather than from a model id.
+   const thinkTagStream = new ThinkTagStream({
+     implicitOpen: historyLeaksThinkTags(agentState.messageHistory),
+   })
+   const emitThinkSegments = (segments: ThinkStreamSegment[]): void => {
+     for (const segment of segments) {
+       if (segment.type === 'text') {
+         onResponseChunk(segment.text)
+       } else {
+         onResponseChunk({
+           type: 'reasoning_delta',
+           text: segment.text,
+           ancestorRunIds,
+           runId,
+           agentId: agentState.agentId,
+         })
+       }
+     }
+   }
+ 
+   // === MUTABLE STATE ===
+   const toolResults: ToolMessage[] = []
+   const toolResultsToAddToMessageHistory: ToolMessage[] = []
+   const toolCalls: (CodebuffToolCall | CustomToolCall)[] = []
+   const toolCallsToAddToMessageHistory: (CodebuffToolCall | CustomToolCall)[] = []
+   const assistantMessages: Message[] = []
+   // Inline agents replace the parent's history with their result. Track which
+   // current-step messages they inherited so finalization does not append them
+   // a second time. Object identity is local to this stream and never serialized.
+   const claimedByInlineAgent = new Set<Message>()
+   let hadToolCallError = false
+   let sawStreamRecovery = false
++  let followupSuggestionCalls = 0
++  let followupSuggestionLimitHit = false
+   const errorMessages: Message[] = []
+   let resolveStreamDonePromise!: () => void
+   const streamDonePromise = new Promise<void>((resolve) => {
+     resolveStreamDonePromise = resolve
+   })
+   let previousToolCallFinished = streamDonePromise
+ 
+   const fileProcessingState: FileProcessingState = {
+     promisesByPath: {},
+     allPromises: [],
+     fileChangeErrors: [],
+     fileChanges: [],
+     firstFileProcessed: false,
+   }
+ 
+   // === RESPONSE HANDLER ===
+   // Creates a response handler that captures tool events into assistantMessages.
+   // When isXmlMode=true, also captures tool_result events for interleaved ordering.
+   function createResponseHandler() {
+     return (chunk: string | PrintModeEvent) => {
+       if (typeof chunk !== 'string') {
+         if (chunk.type === 'error') {
+           hadToolCallError = true
+           errorMessages.push(
+             userMessage({
+               content: withSystemTags(
+                 `Error during tool call: ${chunk.message}. Please check the tool name and arguments and try again.`,
+               ),
+               tags: ['TOOL_CALL_ERROR'],
+             }),
+           )
+         }
+       }
+       return onResponseChunk(chunk)
+     }
+   }
+ 
+   // === TOOL EXECUTION ===
+   // Unified callback factory for both native and custom tools.
+   function createToolExecutionCallback(toolName: string, isXmlMode: boolean) {
+     const responseHandler = createResponseHandler()
+     return {
+       onTagStart: () => { },
+       onTagEnd: async (_: string, input: Record<string, string>) => {
+-        if (signal.aborted) {
++        if (signal.aborted || followupSuggestionLimitHit) {
+           return
+         }
++        if (FOLLOWUP_SUGGESTION_TOOL_NAMES.has(toolName)) {
++          followupSuggestionCalls++
++          if (
++            followupSuggestionCalls > MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE
++          ) {
++            // Neither executed nor surfaced, so no card renders for it; the
++            // consumption loop sees the flag and stops reading the response.
++            followupSuggestionLimitHit = true
++            logger.warn(
++              {
++                metric: 'followup_suggestion_limit_hit',
++                toolName,
++                limit: MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE,
++                model: agentTemplate.model,
++                agentId: agentTemplate.id,
++                userId,
++                runId,
++              },
++              'Response repeated a follow-up suggestion tool past the cap; cutting it off',
++            )
++            return
++          }
++        }
+         const toolCallId = generateCompactId()
+         const isNativeTool = toolNames.includes(toolName as ToolName)
+ 
+         // Check if this is an agent tool call that should be transformed to spawn_agents
+         const transformed = !isNativeTool
+           ? tryTransformAgentToolCall({
+             toolName,
+             input,
+             spawnableAgents: agentTemplate.spawnableAgents,
+           })
+           : null
+         const isSpawnCall =
+           Boolean(transformed) ||
+           toolName === 'spawn_agents' ||
+           toolName === 'spawn_agent_inline'
+         const currentAssistantMessages = isSpawnCall
+           ? assistantMessages.filter(
+               (message) => !claimedByInlineAgent.has(message),
+             )
+           : []
+         const parsedInlineCall =
+           toolName === 'spawn_agent_inline'
+             ? parseRawToolCall({
+                 rawToolCall: { toolName, toolCallId, input },
+               })
+@@ -411,50 +458,56 @@ export async function processStream(
+         )
+       }
+       return onResponseChunk(chunk)
+     },
+     // Execute XML-parsed tool calls immediately during streaming
+     executeXmlToolCall: async ({ toolName, input }) => {
+       if (signal.aborted) {
+         return
+       }
+       const callback = createToolExecutionCallback(toolName, true)
+       await callback.onTagEnd(toolName, input as Record<string, string>)
+     },
+   })
+ 
+   // === STREAM CONSUMPTION LOOP ===
+   let messageId: string | null = null
+ 
+   // Wrap in try/finally so that the finalization (message history update) always
+   // runs even when the stream throws an AbortError mid-iteration.
+   try {
+     while (true) {
+       if (signal.aborted) {
+         break
+       }
+       const { value: chunk, done } = await streamWithTags.next()
++      if (followupSuggestionLimitHit && !done) {
++        // Stop reading the runaway response and cancel the request behind it;
++        // the rest of this step (tool completion, history) proceeds normally.
++        stopStream?.()
++        break
++      }
+       if (done) {
+         // Handle PromptResult: extract value if success, null if aborted
+         if (chunk && typeof chunk === 'object' && 'aborted' in chunk) {
+           messageId = chunk.aborted ? null : chunk.value
+         } else {
+           messageId = chunk
+         }
+         break
+       }
+ 
+       if (chunk.type === 'reasoning') {
+         if (
+           INCLUDE_REASONING_IN_MESSAGE_HISTORY &&
+           (chunk.text || chunk.providerOptions)
+         ) {
+           const last = assistantMessages[assistantMessages.length - 1]
+           const lastPart =
+             last?.role === 'assistant' && Array.isArray(last.content)
+               ? last.content[last.content.length - 1]
+               : undefined
+           if (
+             lastPart &&
+             lastPart.type === 'reasoning' &&
+             !claimedByInlineAgent.has(last)
+           ) {
+@@ -531,50 +584,61 @@ export async function processStream(
+             userMessage({
+               content: withSystemTags(chunk.message),
+               tags: [recovery.tag],
+             }),
+           )
+         } else {
+           hadToolCallError = true
+           errorMessages.push(
+             userMessage({
+               content: withSystemTags(
+                 `Error during tool call: ${chunk.message}. Please check the tool name and arguments and try again.`,
+               ),
+               tags: ['TOOL_CALL_ERROR'],
+             }),
+           )
+         }
+       } else if (chunk.type === 'tool-call') {
+       } else {
+         chunk satisfies never
+         throw new Error(
+           `Unhandled chunk type: ${(chunk as { type: unknown }).type}`,
+         )
+       }
+     }
+ 
++    if (followupSuggestionLimitHit) {
++      // Not a tool error: it must not force another step, since a response of
++      // nothing but suggestions should still end the turn.
++      errorMessages.push(
++        userMessage({
++          content: withSystemTags(FOLLOWUP_SUGGESTION_LIMIT_MESSAGE),
++          tags: [FOLLOWUP_SUGGESTION_LIMIT_TAG],
++        }),
++      )
++    }
++
+     // The step's content is complete: release anything the split still holds,
+     // before the tool-completion await below, so a released head keeps its
+     // place ahead of this step's tool events. `flush` is idempotent, so the
+     // safety-net call in `finally` is a no-op on this path.
+     emitThinkSegments(thinkTagStream.flush())
+ 
+     // Retry-outcome signal: this step streamed to completion (no new
+     // recovery, no user abort) while the history tail still carries a
+     // recovery streak — meaning the forced-step retry rescued the turn.
+     // Checked before finalization appends this step's messages, so the count
+     // is the streak being recovered from.
+     if (!sawStreamRecovery && !signal.aborted) {
+       const { count: recoveredFrom, lastSource } = trailingStreamRecoveryStreak(
+         agentState.messageHistory,
+       )
+       if (recoveredFrom > 0) {
+         logger.info(
+           {
+             // See common/src/util/axiom-only-log.ts: without axiomEvent,
+             // info-level fields below ship to Axiom as a shape summary, not
+             // real values.
+             axiomEvent: STREAM_RECOVERY_EVENT,
+             metric: 'stream_recovery_rescued',
+             // The kind resolved by this step specifically; a streak can mix
+             // both kinds, so this is the last note before the success, not
