@@ -1713,3 +1713,53 @@ test('diff viewer escapes file paths and labels before innerHTML', async () => {
     await rm(dist, { recursive: true, force: true })
   }
 })
+
+// Every version badge used to link /release/<v>/ unconditionally, but only the
+// cli/release line gets a page: a freebuff/cli/release bump stores
+// `freebuffVersion` and deliberately writes none (VERSION_TRACKS in
+// analyze.mjs), so eleven 0.0.x links across the week pages and the model
+// lineage were 404s. The link is optional; the version is not.
+test('no release link points at a version the build never writes', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-relpage-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const bump = (sha, date, extra) => ({
+    kind: 'sync', sha, date, day: date.slice(0, 10), month: date.slice(0, 7), author: 'dev',
+    areas: ['CLI'], category: 'CLI', significance: 'minor', summary: 'A bump.', title: 'A bump.',
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/release/package.json'] },
+    stats: { additions: 1, deletions: 1 }, ...extra
+  })
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-20T00:00:00Z',
+    headSha: 'a'.repeat(40), counts: { entries: 2 },
+    entries: [
+      bump('aaaa111122223333444455556666777788889999', '2026-09-19T10:00:00Z', { version: '1.0.688', title: 'CLI 1.0.688' }),
+      bump('bbbb111122223333444455556666777788889999', '2026-09-18T10:00:00Z', { freebuffVersion: '0.0.188', versionTrack: 'freebuff-cli', title: 'Freebuff CLI 0.0.188' })
+    ]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+
+  const pages = []
+  const walk = async (dir) => {
+    for (const d of await readdir(dir, { withFileTypes: true })) {
+      const p = join(dir, d.name)
+      if (d.isDirectory()) await walk(p)
+      else if (d.name.endsWith('.html')) pages.push(p)
+    }
+  }
+  await walk(dist)
+
+  const linked = new Map()
+  let mentions188 = 0
+  for (const page of pages) {
+    const html = await readFile(page, 'utf8')
+    if (html.includes('v0.0.188')) mentions188++
+    for (const m of html.matchAll(/href="\/release\/([^"/]+)\//g)) {
+      const v = decodeURIComponent(m[1])
+      if (!linked.has(v)) linked.set(v, await readFile(join(dist, 'release', v, 'index.html'), 'utf8').then(() => true, () => false))
+      if (!(await linked.get(v))) assert.fail(`${page} links /release/${v}/ but no page was written for it`)
+    }
+  }
+  assert.ok(linked.has('1.0.688'), 'a version that does have a page is still linked')
+  assert.ok(!linked.has('0.0.188'), 'the 0.0.x line gets no release link')
+  assert.ok(mentions188 > 0, 'and the version is still shown, just without the dead link')
+})

@@ -1935,6 +1935,23 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
   const cardOpts = (e, extra = {}) => ({ storyNotes: storyIdx.notes.get(e.sha), shipped, ...extra })
   const modelEntries = entries.filter(e => e.modelChanges)
   const releases = entries.filter(e => e.version)
+  // A version badge links only when a page was actually written for it. The
+  // 0.0.x freebuff-cli line stores `freebuffVersion` and deliberately gets no
+  // release page (see VERSION_TRACKS in analyze.mjs), so anchoring one of those
+  // is a guaranteed 404 -- eleven were reachable from the week pages and the
+  // model lineage. The version is the fact worth keeping; the dead link is not.
+  const releasePages = new Set(releases.map(r => r.version))
+  const releaseHref = (v) => (releasePages.has(v) ? `/release/${esc(v)}/` : null)
+  const verBadge = (v, title) => {
+    const href = releaseHref(v)
+    return href
+      ? `<a class="badge ver" href="${href}" title="${esc(title || `Release ${v}`)}">v${esc(v)}</a>`
+      : `<span class="badge ver" title="${esc(`Freebuff CLI ${v}: the 0.0.x line has no release page`)}">v${esc(v)}</span>`
+  }
+  const verLink = (v) => {
+    const href = releaseHref(v)
+    return href ? `<a href="${href}">v${esc(v)}</a>` : `v${esc(v)}`
+  }
   const first = entries.at(-1), last = entries[0]
   const generated = changelog.generatedAt
   const scannedCount = changelog.counts?.commitsScanned || entries.length
@@ -2745,7 +2762,7 @@ ${([...familyOf.entries()].filter(([, ms]) => ms.length > 1).length) ? `<details
       const firstRel = hit?.['codebuff-cli']?.version || hit?.['freebuff-cli']?.version || ''
       return `<div class="model-row"><span class="model-row-date">${esc(firstAddDay.get(m) || '')}</span>`
         + `<span class="model-row-title"><a href="/models/${modelSlug(m)}/">${esc(m)}</a>${liveSet.has(m) ? ' <span class="model-status-tag live">LIVE</span>' : ' <span class="model-status-tag retired">RETIRED</span>'}</span>`
-        + `<span class="model-row-change">${firstRel ? `first shipped in <a href="/release/${esc(firstRel)}/">v${esc(firstRel)}</a>` : ''}</span></div>`
+        + `<span class="model-row-change">${firstRel ? `first shipped in ${verLink(firstRel)}` : ''}</span></div>`
     }).join('')
     await write(dist, `models/lineage/${categorySlug(fam)}/index.html`, layout({
       title: `${fam} lineage`, path: `/models/lineage/${categorySlug(fam)}/`,
@@ -3013,7 +3030,7 @@ ${archiveScript}`
     const title = e.ai?.title || e.title || deriveTitleSafe(e)
     const sum = e.ai?.summary || e.summary || ''
     const vers = e.version || e.freebuffVersion
-    const relBadge = vers ? `<a class="badge ver" href="/release/${esc(vers)}/" title="Release ${esc(vers)}">v${esc(vers)}</a>` : ''
+    const relBadge = vers ? verBadge(vers) : ''
     const isMaj = (e.ai?.significance || e.significance) === 'major'
     const majBadge = isMaj ? `<span class="badge maj">[MAJOR]</span>` : ''
     const isSec = isSecurityEntry(e)
@@ -3033,7 +3050,7 @@ ${archiveScript}`
   ${catBadge}
   <div class="meta-links">
     <a class="meta-link" href="/day/${e.day}/#${anchor}">[entry]</a>
-    ${vers ? `<a class="meta-link" href="/release/${esc(vers)}/">[release]</a>` : ''}
+    ${vers && releaseHref(vers) ? `<a class="meta-link" href="${releaseHref(vers)}">[release]</a>` : ''}
   </div>
   ${sum ? `<span class="crow-sum">${esc(clipText(sum, 150))}</span>` : ''}
 </div>`
@@ -3162,7 +3179,7 @@ ${archiveScript}`
     const weekRow = (w) => {
       const range = formatWeekRange(w.monday, w.sunday)
       const vers = w.releases.map(r => r.version || r.freebuffVersion).filter(Boolean)
-      const relBadges = vers.map(v => `<a class="badge ver" href="/release/${esc(v)}/" title="Release ${esc(v)}">v${esc(v)}</a>`).join(' ')
+      const relBadges = vers.map(verBadge).join(' ')
       const topItem = w.top[0] ? (w.top[0].ai?.title || w.top[0].title) : ''
       const sumText = topItem ? `${topItem} &middot; ${weeklyHeadline(w)}` : weeklyHeadline(w)
 
