@@ -745,6 +745,14 @@ test('buildSite generates valid static site output', async () => {
     // must actually link both assets.
     assert.match(indexHtml, /<link rel="stylesheet" href="\/assets\/site-[0-9a-f]{10}\.css">/, 'styles are a shared asset, not inline')
     assert.match(indexHtml, /<script src="\/assets\/site-[0-9a-f]{10}\.js"><\/script>/, 'and so is the shell script')
+    // The shell tag is behind the whole body, so the head has to point at the
+    // same URL: the parser-blocking script then starts its fetch during the
+    // parse instead of after the last byte, and consumes that response. Two
+    // different URLs here would mean two downloads of the same 29 KB.
+    const preload = indexHtml.match(/<link rel="preload" as="script" href="([^"]+)">/)
+    assert.ok(preload, 'the shell is preloaded from the head')
+    assert.ok(indexHtml.indexOf(preload[1]) < indexHtml.indexOf('</head>'), 'the hint is inside the head, where it is seen early')
+    assert.ok(indexHtml.includes(`<script src="${preload[1]}"></script>`), 'the preloaded URL is the one the script tag consumes')
     const { readdir } = await import('node:fs/promises')
     const shellJs = await readFile(join(tmpDist, 'assets', (await readdir(join(tmpDist, 'assets'))).find(n => n.endsWith('.js'))), 'utf8')
     assert.match(shellJs, /setupDayJump/, 'the shell hydrates the select on open')
@@ -1446,6 +1454,13 @@ test('site build generates dynamic SVG status badges and reading progress bar', 
   const indexHtml = await readFile(join(dist, 'index.html'), 'utf8')
   assert.match(indexHtml, /<div id="reading-progress" aria-hidden="true"><\/div>/)
   assert.match(indexHtml + await shellOf(dist), /setupReadingProgress/)
+  // The bar is the shell's one layout-forcing read (scrollHeight), so it must
+  // not measure while the document is still loading: at width 0 it has nothing
+  // to show, and forcing layout there is what a browser reports as a page whose
+  // stylesheet may not be applied yet.
+  const shellSrc = indexHtml + await shellOf(dist)
+  assert.match(shellSrc, /addEventListener\('load', onScroll\)/, 'the first measure waits for the load event')
+  assert.match(shellSrc, /addEventListener\('pageshow', onScroll\)/, 'and a back-forward restore repaints it')
 })
 
 test('models page includes interactive lineup matrix and date scrubber', async (t) => {

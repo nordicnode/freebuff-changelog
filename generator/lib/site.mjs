@@ -78,6 +78,7 @@ function layout ({ title, path, body, desc, noindex, ogImage, wide, ld }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
 <script>(function(){try{var t=localStorage.getItem('fbTheme');if(!t){t=(window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches)?'light':'dark';}document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='amber'?'#120d04':(t==='green'?'#051207':(t==='light'?'#f6f8fa':'#0d1117'));if(localStorage.getItem('fbPlainMode')==='1'){document.documentElement.classList.add('reading-mode-plain');}}catch(_){}})();</script>
+${SHELL_PRELOAD}
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#0d1117">
 <title>${esc(title)} · ${SITE.name}</title>
@@ -277,7 +278,13 @@ updateSyncAge();
     bar.style.width = pct + '%';
   }
   window.addEventListener('scroll', onScroll, { passive: true });
-  onScroll();
+  // Measuring scrollHeight forces a synchronous layout, and at this point the
+  // document is still loading (the stylesheet may not even be applied yet), so
+  // the only two moments that need a measurement are the ones where a position
+  // has to be reflected: the load finishing, and a back-forward restore. An
+  // unscrolled page needs no first paint -- the bar is 0 wide by definition.
+  window.addEventListener('load', onScroll);
+  window.addEventListener('pageshow', onScroll);
 })();
 
 // A way home on the long pages (release windows, category lists): appears
@@ -953,6 +960,13 @@ function renderDiff(container, text, label, ghUrl, mode) {
 const SHELL_JS_NAME = `site-${createHash('sha256').update(SHELL_JS).digest('hex').slice(0, 10)}.js`
 const CSS_NAME = `site-${createHash('sha256').update(CSS).digest('hex').slice(0, 10)}.css`
 const SHELL_TAG = `<script src="/assets/${SHELL_JS_NAME}"></script>`
+// The shell tag sits at the end of the body, i.e. behind up to ~300 KB of HTML,
+// so without a hint its fetch only starts once the whole document has arrived
+// -- and because it is parser-blocking, every page then waited that round trip
+// (plus a revalidation, under the site-wide no-cache policy) before wiring up.
+// Preloading the identical URL from the head starts it during the parse and the
+// script tag consumes that response instead of fetching twice.
+const SHELL_PRELOAD = `<link rel="preload" as="script" href="/assets/${SHELL_JS_NAME}">`
 const CSS_TAG = `<link rel="stylesheet" href="/assets/${CSS_NAME}">`
 
 function badges (e) {
