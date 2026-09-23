@@ -76,7 +76,7 @@ function releaseLd (rel) {
 function layout ({ title, path, body, desc, noindex, ogImage, wide, ld }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
-<script>(function(){try{var t=localStorage.getItem('fbTheme');if(t){document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='amber'?'#120d04':(t==='green'?'#051207':'#0d1117');}if(localStorage.getItem('fbPlainMode')==='1'){document.documentElement.classList.add('reading-mode-plain');}}catch(_){}})();</script>
+<script>(function(){try{var t=localStorage.getItem('fbTheme');if(!t){t=(window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches)?'light':'dark';}document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='amber'?'#120d04':(t==='green'?'#051207':(t==='light'?'#f6f8fa':'#0d1117'));if(localStorage.getItem('fbPlainMode')==='1'){document.documentElement.classList.add('reading-mode-plain');}}catch(_){}})();</script>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#0d1117">
 <title>${esc(title)} · ${SITE.name}</title>
@@ -126,7 +126,7 @@ ${body}
     <div class="footer-links">
       <a href="/about/">[about]</a>
       <a href="/range/">[date ranges]</a>
-      <a href="/api/entries.json">[api]</a>
+      <a href="/api/">[api]</a>
       <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">[github]</a>
     </div>
   </div>
@@ -150,6 +150,7 @@ ${body}
     </div>
     <div class="footer-theme">
       <span class="footer-label">theme:</span>
+      <button type="button" class="theme-btn" data-theme-val="light" aria-pressed="false">[light]</button>
       <button type="button" class="theme-btn active" data-theme-val="dark" aria-pressed="true">[dark]</button>
       <button type="button" class="theme-btn" data-theme-val="amber" aria-pressed="false">[amber]</button>
       <button type="button" class="theme-btn" data-theme-val="green" aria-pressed="false">[green]</button>
@@ -232,6 +233,56 @@ function updateSyncAge() {
 }
 updateSyncAge();
 
+// The homepage sync widget makes the 30s relay visible: "last sync" ticks from
+// the build stamp and the dot follows the same fresh/stale budget as the footer
+// badge, while "next poll" counts down to autoUpdate's next /api/status.json
+// check and resets whenever that check reports in via fbSyncPaint(). Only the
+// front page polls, so everywhere else the poller line stays hidden rather than
+// counting down to a check that will never come.
+(function setupSyncWidget() {
+  var w = document.getElementById('sync-widget');
+  if (!w) return;
+  var generated = Date.parse(w.getAttribute('data-generated')) || Date.now();
+  var budgetMs = (Number(w.getAttribute('data-budget-min')) || 5) * 60000;
+  var polling = location.pathname === '/' || location.pathname === '/index.html';
+  var lastCheck = Date.now();
+  var upd = w.querySelector('.sw-updated');
+  var nxt = w.querySelector('.sw-next');
+  if (polling) [].forEach.call(w.querySelectorAll('.sw-poll'), function (el) { el.hidden = false; });
+  function ago(ms) {
+    var s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60) return s + 's ago';
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + 'm ago';
+    return Math.floor(m / 60) + 'h ago';
+  }
+  function tick() {
+    var now = Date.now();
+    if (upd) upd.textContent = ago(now - generated);
+    w.classList.toggle('sw-stale', (now - generated) > budgetMs * 2);
+    if (nxt && polling) {
+      var left = 30 - Math.floor((now - lastCheck) / 1000);
+      nxt.textContent = left > 0 ? 'in ' + left + 's' : 'due';
+    }
+  }
+  window.fbSyncPaint = function (data, changed) {
+    lastCheck = Date.now();
+    var c = w.querySelector('.sw-counts');
+    if (c && data) {
+      var bits = [];
+      if (typeof data.changes === 'number') bits.push(data.changes.toLocaleString() + ' changes');
+      if (typeof data.days === 'number') bits.push(data.days.toLocaleString() + ' days');
+      if (data.releases) bits.push(data.releases.toLocaleString() + ' releases');
+      if (data.openPrs) bits.push(data.openPrs.toLocaleString() + ' open PRs');
+      if (bits.length) c.textContent = bits.join(' \u00b7 ');
+    }
+    if (changed) { var p = w.querySelector('.sw-pending'); if (p) p.hidden = false; }
+    tick();
+  };
+  setInterval(tick, 1000);
+  tick();
+})();
+
 (function setupReadingProgress() {
   var bar = document.getElementById('reading-progress');
   if (!bar) return;
@@ -302,6 +353,7 @@ updateSyncAge();
         if (fu && typeof data.traffic.uniques === 'number') fu.textContent = fmt(data.traffic.uniques);
       }
 
+      if (window.fbSyncPaint) window.fbSyncPaint(data, headChanged || changesChanged || genChanged);
       if (headChanged || changesChanged || genChanged) {
         updatePending = true;
         if (!tryReload()) {
@@ -542,7 +594,7 @@ document.addEventListener('click', (ev) => {
   try { localStorage.setItem('fbTheme', val); } catch (_) {}
   const tc = document.querySelector('meta[name="theme-color"]');
   if (tc) {
-    const colors = { dark: '#0d1117', amber: '#120d04', green: '#051207' };
+    const colors = { light: '#f6f8fa', dark: '#0d1117', amber: '#120d04', green: '#051207' };
     tc.content = colors[val] || '#0d1117';
   }
   document.querySelectorAll('[data-theme-val]').forEach(b => {
@@ -601,6 +653,19 @@ document.addEventListener('click', (ev) => {
   copyText(btn.dataset.eli5 || '').then((ok) => {
     const orig = btn.textContent;
     btn.textContent = ok ? '[copied plain english]' : '[copy blocked]';
+    btn.classList.toggle('dc-ok', ok);
+    setTimeout(() => { btn.textContent = orig; btn.classList.remove('dc-ok'); }, 2400);
+  });
+});
+
+document.addEventListener('click', (ev) => {
+  const btn = ev.target.closest ? ev.target.closest('.copy-link') : null;
+  if (!btn) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  copyText(btn.dataset.link || '').then((ok) => {
+    const orig = btn.textContent;
+    btn.textContent = ok ? '[link copied]' : '[copy blocked]';
     btn.classList.toggle('dc-ok', ok);
     setTimeout(() => { btn.textContent = orig; btn.classList.remove('dc-ok'); }, 2400);
   });
@@ -1162,6 +1227,7 @@ ${storyNoteHtml(opts.storyNotes)}
   <span class="diffstat"><b>+${e.stats.additions}</b> / <i>−${e.stats.deletions}</i> &middot; ${e.files.total} file${e.files.total === 1 ? '' : 's'}</span>
   <div class="meta-links">
     <button class="meta-link dc-copy" type="button" data-dc="${esc(discordText(e, { storyNotes: opts.storyNotes }))}" title="Copy this entry as Discord-formatted text (c)">discord</button>
+    <button class="meta-link copy-link" type="button" data-link="${esc(`${SITE.url}/day/${e.day}/#${anchor}`)}" title="Copy a stable link to this entry">link</button>
     ${e.sourceSha ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" rel="noopener" target="_blank">snapshot</a>` : ''}
     ${e.pr ? `<a class="meta-link" href="${esc(e.prUrl || '')}" rel="noopener" target="_blank">PR #${e.pr}</a>` : ''}
     ${e.compareUrl ? `<a class="meta-link" href="${esc(e.compareUrl)}" rel="noopener" target="_blank">compare</a>` : e.url ? `<a class="meta-link" href="${esc(e.url)}" rel="noopener" target="_blank">commit</a>` : ''}
@@ -1478,6 +1544,48 @@ export function impactAllows (rowSig, filterSig) {
   if (!filterSig) return true
   return (IMPACT_RANK[rowSig] ?? 0) >= (IMPACT_RANK[filterSig] ?? 0)
 }
+
+// Search query grammar, parsed identically by this function (unit-tested) and
+// the /search/ page's client mirror. Everyday typing keeps working exactly as
+// it always did (words are substrings); the syntax layers on top:
+//   cat:cli sig:>=notable aud:end-users   field filters (sig takes >= <= > < =)
+//   is:release|breaking|security|model|pr|edited|eli5|unverified
+//   "page url"                            phrase (matches as a substring)
+//   -chore                                exclude matches
+// Unknown `key:` forms fall through as plain words, so pasted identifiers and
+// file paths are never eaten by the parser.
+export function parseQuery (input) {
+  const words = [], phrases = [], neg = []
+  const filters = {}
+  const tokens = String(input || '').match(/-?(?:"[^"]*"|\S+)/g) || []
+  for (let tok of tokens) {
+    let banned = false
+    if (tok.startsWith('-') && tok.length > 1) { banned = true; tok = tok.slice(1) }
+    if (tok.startsWith('"')) {
+      const phrase = tok.replace(/"/g, '').trim().toLowerCase()
+      if (phrase) (banned ? neg : phrases).push(phrase)
+      continue
+    }
+    const m = /^([a-z]+):(.+)$/i.exec(tok)
+    if (m) {
+      const key = m[1].toLowerCase(), val = m[2].toLowerCase()
+      if (!banned && key === 'cat' && val) { filters.cat = val; continue }
+      if (!banned && key === 'aud' && val) { filters.aud = val; continue }
+      if (!banned && key === 'sig' && val) {
+        const c = /^(>=|<=|>|<|=)?([a-z]+)$/.exec(val)
+        if (c && IMPACT_RANK[c[2]] !== undefined) { filters.sig = { op: c[1] || '=', value: c[2] }; continue }
+      }
+      if (!banned && key === 'is' && val) { (filters.is || (filters.is = [])).push(val); continue }
+    }
+    // Not a recognized form: an ordinary word (identifiers, paths, versions).
+    if (tok) (banned ? neg : words).push(tok.toLowerCase())
+  }
+  return { words, phrases, neg, filters }
+}
+
+// The bits a search row carries in e[6] (see the index build). Kept next to
+// the parser so the grammar and its vocabulary cannot drift apart.
+export const SEARCH_FLAGS = { release: 1, breaking: 2, security: 4, model: 8, pr: 16, edited: 32, unverified: 64 }
 
 /**
  * Render Shields-style SVG status badge.
@@ -2005,11 +2113,30 @@ ${[
     <p class="filter-note" data-hub="/archive/#categories">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? '(' + churn + ' churn hidden)' : '(no churn that day)'}</em> &middot; <span id="filter-all"><a href="/archive/#categories">browse all changes by category</a></span></p>
   </div>`
 
+    const relCount = new Set(releases.map(r => r.version)).size
+    const syncCounts = [
+      `${meaningful.length.toLocaleString()} changes`,
+      `${byDay.length.toLocaleString()} days`,
+      relCount ? `${relCount.toLocaleString()} releases` : '',
+      openPrs?.length ? `${openPrs.length.toLocaleString()} open PRs` : ''
+    ].filter(Boolean).join(' \u00b7 ')
+    // The relay made visible (newest day only; older days are settled history):
+    // server-rendered absolute stamp + counts, then the shell ticker ages it and
+    // autoUpdate's /api/status.json poll repaints it every 30s.
+    const syncWidget = latest ? `<div class="sync-widget" id="sync-widget" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}">
+  <span class="sw-dot" aria-hidden="true"></span>
+  <span class="sw-item">last sync <b class="sw-updated">${esc(fmtDateHuman(generated))} UTC</b></span>
+  <span class="sw-item sw-poll" hidden>next poll <b class="sw-next">in 30s</b></span>
+  <span class="sw-pending" hidden>[update ready]</span>
+  <span class="sw-counts">${esc(syncCounts)}</span>
+  <a class="sw-api" href="/api/status.json">status.json</a>
+</div>` : ''
     const hero = `
 <section class="hero timeline-hero">
   <div class="term-box term-box-slim timeline-control">
     ${topPager}
     ${statusRow}
+    ${syncWidget}
     ${filterRow}
     ${latest ? '' : `<p class="timeline-settled-note">Reconstructed public snapshot commits pushed to CodebuffAI/freebuff on this date.</p>`}
   </div>
@@ -3261,7 +3388,13 @@ ${weekTabsScript}`
   // e[5] audience code, e[6] flags (bit 1 = version/release bump).
   const idxJson = entries.filter(e => !e.noise).map(e => {
     let flags = 0
-    if (e.version || e.freebuffVersion) flags |= 1
+    if (e.version || e.freebuffVersion) flags |= SEARCH_FLAGS.release
+    if (e.ai?.breaking) flags |= SEARCH_FLAGS.breaking
+    if (isSecurityEntry(e)) flags |= SEARCH_FLAGS.security
+    if (e.modelChanges) flags |= SEARCH_FLAGS.model
+    if (e.pr || e.ai?.pr) flags |= SEARCH_FLAGS.pr
+    if (e.overridden) flags |= SEARCH_FLAGS.edited
+    if (e.ai?.ungrounded?.length) flags |= SEARCH_FLAGS.unverified
     return [
       e.day,
       (e.ai?.title || e.title || deriveTitleSafe(e)).slice(0, 90),
@@ -3308,6 +3441,7 @@ ${weekTabsScript}`
       <button class="filter-chip" data-cat="Commands" title="Category filter: commands">--commands</button>
       <button class="filter-chip" data-q="prompt" title="Quick query: prompt work">--prompt</button>
       <button class="filter-chip" data-q="desktop" title="Quick query: desktop app">--desktop</button>
+      <button class="filter-chip" data-q="is:release" title="Quick query: every version release">--v</button>
     </div>
     <div class="filter-row">
       <label class="filter-sel-lbl">CATEGORY:
@@ -3333,6 +3467,15 @@ ${weekTabsScript}`
       <label class="filter-sel-lbl"><input type="checkbox" id="frel"> releases only</label>
       <span id="match-count" role="status" aria-live="polite" style="font-size:.76rem;color:var(--txt-subtle);margin-left:auto;align-self:center"></span>
     </div>
+    <details class="search-help">
+      <summary>query syntax &mdash; everything the box understands</summary>
+      <div class="search-help-body">
+        plain words match like they always did. On top of that:<br>
+        <code>cat:cli</code> category &middot; <code>sig:&gt;=notable</code> impact (<code>&gt;= &lt;= &gt; &lt; =</code>) &middot; <code>aud:end-users</code> audience &middot; <code>&quot;page url&quot;</code> exact phrase &middot; <code>-chore</code> exclude<br>
+        <code>is:release</code> <code>is:breaking</code> <code>is:security</code> <code>is:model</code> <code>is:pr</code> <code>is:edited</code> <code>is:eli5</code> <code>is:unverified</code><br>
+        Combine freely: <code>cat:cli sig:&gt;=notable is:breaking -tests</code>. The URL follows your search, so any view is shareable.
+      </div>
+    </details>
   </div>
 </section>
 
@@ -3380,6 +3523,55 @@ const loadIndex = async () => {
   // IMPACT is a minimum, not an equality: "notable + major" keeps the major
   // rows. Mirrors impactAllows() in site.mjs (pinned by unit tests).
   const SRANK = { minor: 0, notable: 1, major: 2 };
+  // Mirrors parseQuery() in generator/lib/site.mjs -- the unit-tested copy.
+  // Everyday typing is unchanged (words are substrings); the syntax layers on:
+  // cat:cli sig:>=notable aud:end-users is:breaking "page url" -chore
+  function parseQ (input) {
+    var words = [], phrases = [], neg = [], filters = {};
+    var tokens = String(input || '').match(/-?(?:"[^"]*"|\\S+)/g) || [];
+    for (var i = 0; i < tokens.length; i++) {
+      var tok = tokens[i], banned = false;
+      if (tok.charAt(0) === '-' && tok.length > 1) { banned = true; tok = tok.slice(1); }
+      if (tok.charAt(0) === '"') {
+        var phrase = tok.replace(/"/g, '').trim().toLowerCase();
+        if (phrase) (banned ? neg : phrases).push(phrase);
+        continue;
+      }
+      var m = /^([a-z]+):(.+)$/i.exec(tok);
+      if (m) {
+        var key = m[1].toLowerCase(), val = m[2].toLowerCase();
+        if (!banned && key === 'cat' && val) { filters.cat = val; continue; }
+        if (!banned && key === 'aud' && val) { filters.aud = val; continue; }
+        if (!banned && key === 'sig' && val) {
+          var c = /^(>=|<=|>|<|=)?([a-z]+)$/.exec(val);
+          if (c && SRANK[c[2]] !== undefined) { filters.sig = { op: c[1] || '=', value: c[2] }; continue; }
+        }
+        if (!banned && key === 'is' && val) { (filters.is || (filters.is = [])).push(val); continue; }
+      }
+      if (tok) (banned ? neg : words).push(tok.toLowerCase());
+    }
+    return { words: words, phrases: phrases, neg: neg, filters: filters };
+  }
+  // Mirrors SEARCH_FLAGS in generator/lib/site.mjs (the e[6] bitmask).
+  var SFLAG = { release: 1, breaking: 2, security: 4, model: 8, pr: 16, edited: 32, unverified: 64 };
+  function sigOp (rowSig, op, want) {
+    var r = SRANK[rowSig] || 0, x = SRANK[want];
+    return op === '>=' ? r >= x : op === '<=' ? r <= x : op === '>' ? r > x : op === '<' ? r < x : r === x;
+  }
+  // A search is a link: the address bar follows the controls so any result
+  // view can be shared or bookmarked (typed syntax travels inside ?q=).
+  function syncUrl () {
+    try {
+      var u = new URLSearchParams();
+      if (q.value.trim()) u.set('q', q.value.trim());
+      if (fcat && fcat.value) u.set('cat', fcat.value);
+      if (fsig && fsig.value) u.set('sig', fsig.value);
+      if (faud && faud.value) u.set('aud', faud.value);
+      if (frel && frel.checked) u.set('releases', '1');
+      var qs = u.toString();
+      history.replaceState(null, '', location.pathname + (qs ? '?' + qs : ''));
+    } catch (_) {}
+  }
   const esc = s => String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 
   const highlight = (title, words) => {
@@ -3437,22 +3629,41 @@ const loadIndex = async () => {
     }
   });
 
+  const emptyHint = '<div class="search-empty"><p>$ No matches found for pattern.</p>' +
+    '<p style="font-size:.78rem;color:var(--txt-subtle);margin:8px 0">Try one of these:</p>' +
+    '<p><button type="button" class="filter-chip" data-ex="is:release">is:release</button> ' +
+    '<button type="button" class="filter-chip" data-ex="sig:>=notable">sig:&gt;=notable</button> ' +
+    '<button type="button" class="filter-chip" data-ex="cat:cli is:breaking">cat:cli is:breaking</button> ' +
+    '<button type="button" class="filter-chip" data-ex="aud:end-users">aud:end-users</button></p></div>';
   const go = () => {
     selectedHitIdx = -1;
-    const v = q.value.trim().toLowerCase();
+    const p = parseQ(q.value);
     const cat = fcat ? fcat.value : '', sig = fsig ? fsig.value : '';
-    const aud = faud ? faud.value : '', relOnly = !!(frel && frel.checked);
-    const w = v.split(/\\s+/).filter(Boolean);
-    if (!w.length && !cat && !sig && !aud && !relOnly) { h.innerHTML = ''; cnt.textContent = ''; return; }
+    const audSel = faud ? faud.value : '', relOnly = !!(frel && frel.checked);
+    const w = p.words, phrases = p.phrases, neg = p.neg, f = p.filters, isList = f.is || [];
+    if (!w.length && !phrases.length && !cat && !sig && !audSel && !relOnly && !Object.keys(f).length) {
+      h.innerHTML = ''; cnt.textContent = ''; syncUrl(); return;
+    }
     const scored = [];
     for (const e of ix) {
       const c = cats[e[2]] || '', a = sigs[e[4]] || '', au = (typeof e[5] === 'number' && e[5] >= 0) ? (auds[e[5]] || '') : '';
+      const bits = e[6] || 0;
       if (cat && c !== cat) continue;
+      if (f.cat && c.toLowerCase() !== f.cat) continue;
       if (sig && (SRANK[a] || 0) < (SRANK[sig] || 0)) continue;
-      if (aud === 'unset') { if (au) continue; } else if (aud && au !== aud) continue;
-      if (relOnly && !(e[6] & 1)) continue;
-      if (!w.length) { scored.push([0, e[0], e]); continue; }
+      if (f.sig && !sigOp(a, f.sig.op, f.sig.value)) continue;
+      if (audSel === 'unset') { if (au) continue; } else if (audSel && au !== audSel) continue;
+      if (f.aud && (f.aud === 'unset' ? !!au : au !== f.aud)) continue;
+      if (relOnly && !(bits & SFLAG.release)) continue;
+      let isOk = true;
+      for (const need of isList) {
+        if (need === 'eli5') { if (!e[7]) { isOk = false; break; } continue; }
+        const bit = SFLAG[need];
+        if (bit === undefined || !(bits & bit)) { isOk = false; break; }
+      }
+      if (!isOk) continue;
       const t = e[1].toLowerCase(), cl = c.toLowerCase(), el = (e[7] || '').toLowerCase(), ex = (e[8] || '').toLowerCase();
+      const all = t + ' ' + el + ' ' + cl + ' ' + ex;
       let s = 0, ok = true;
       for (const x of w) {
         if (t.includes(x)) s += x.length > 4 ? 4 : 3;
@@ -3462,6 +3673,9 @@ const loadIndex = async () => {
         else { ok = false; break; }
       }
       if (!ok) continue;
+      for (const ph of phrases) { if (!all.includes(ph)) { ok = false; break; } s += 4; }
+      if (!ok) continue;
+      if (neg.some(x => all.includes(x))) continue;
       if (a === 'major') s += 2; else if (a === 'notable') s += 1;
       scored.push([s, e[0], e]);
     }
@@ -3474,18 +3688,30 @@ const loadIndex = async () => {
       const a = sigs[e[4]] || '', c = cats[e[2]] || '', au = (typeof e[5] === 'number' && e[5] >= 0) ? (auds[e[5]] || '') : '';
       const sigTag = a === 'major' ? '<span class="badge maj">[MAJOR]</span>' : (a === 'notable' ? '<span class="badge not">[NOTABLE]</span>' : '');
       const audTag = au ? '<span class="badge aud" title="Who this change is for">[' + esc(au.toUpperCase()) + ']</span>' : '';
-      const relTag = (e[6] & 1) ? '<span class="badge ver">[RELEASE]</span>' : '';
+      const relTag = (e[6] & SFLAG.release) ? '<span class="badge ver">[RELEASE]</span>' : '';
+      const brkTag = (e[6] & SFLAG.breaking) ? '<span class="badge brk">[BREAKING]</span>' : '';
+      const secTag = (e[6] & SFLAG.security) ? '<span class="badge sec">[SECURITY]</span>' : '';
       const eli5Snippet = e[7] ? '<p class="search-eli5"><span class="search-eli5-lbl">PLAIN ENGLISH:</span> ' + highlight(e[7], w) + '</p>' : '';
       return '<article class="entry ' + a + '"><div class="entry-meta-top">' +
         '<span class="commit-ref">commit ' + esc(e[3]) + '</span>' +
         '<span class="entry-utc">' + esc(e[0]) + '</span>' +
-        '<div class="badges"><span class="badge cat">[' + esc(c) + ']</span>' + sigTag + audTag + relTag + '</div>' +
+        '<div class="badges"><span class="badge cat">[' + esc(c) + ']</span>' + sigTag + audTag + relTag + brkTag + secTag + '</div>' +
         '</div>' +
         '<h3><a href="' + u + '">' + highlight(e[1], w) + '</a></h3>' +
         eli5Snippet +
         '</article>';
-    }).join('') || '<p style="color:var(--txt-subtle);margin:20px 0">$ No matches found for pattern.</p>';
+    }).join('') || emptyHint;
+    syncUrl();
   };
+
+  // Empty-state examples are buttons that run the query they advertise.
+  h.addEventListener('click', (ev) => {
+    const b = ev.target.closest ? ev.target.closest('[data-ex]') : null;
+    if (!b) return;
+    q.value = b.dataset.ex;
+    syncChips();
+    go();
+  });
 
   q.addEventListener('input', () => {
     syncChips();
@@ -3627,10 +3853,14 @@ const loadIndex = async () => {
       <h4>HOW IT WORKS: ANALYSIS PIPELINE</h4>
       <p>Mechanical facts are extracted without a model. Model tables and slash-command registries are set-differenced straight from the git trees, version bumps come from <code>package.json</code>, and timestamps are normalized to UTC, so those facts are computed, not paraphrased. Code changes are then mapped onto the monorepo layout (<code>cli/</code>, <code>packages/agent-runtime/</code>, <code>common/</code>, <code>sdk/</code>, <code>docs/</code>) to name the changed layer.</p>
       <p>The summaries are model output, and the goal is to make them traceable, not to claim they are perfect. What the model gets is bounded and checkable: the clean source diff with lockfiles and pure test hunks stripped (over ~150 KB it is split into per-file drafts and fused), the computed facts above, the developers' own code comments, and, when a PR can be matched by touched files and passes a relevance check, its description and review discussion. Rows whose only changes are tests, mocks, or docs are detected mechanically and given a fixed plain-English line with no API call.</p>
-      <p>Every identifier a summary uses (backticked names, bare <code>CONSTANT_CASE</code> settings, camelCase and PascalCase names, versions, <code>--flags</code>, and numbers) is checked against the diff and source corpus as a whole word, so a truncated prefix of a real name fails too. A name that cannot be found gets one repair pass and, if still missing, is recorded as ungrounded and shown as unverified; such a row also cannot rate confidence high. Major, notable and multi-topic rows, plus any row with an ungrounded name, then get a second-model fact-check: unsupported claims trigger one rewrite, and a row that still fails is stored with a visible <code>flagged</code> label rather than hidden. Each summary cites the diff it came from, summaries are cached by commit SHA, diff content and prompt version, and every card links to the commit, compare view and inline diff.</p>
+      <p>Every identifier a summary uses (backticked names, bare <code>CONSTANT_CASE</code> settings, camelCase and PascalCase names, versions, <code>--flags</code>, and numbers) is checked against the diff and source corpus as a whole word, so a truncated prefix of a real name fails too. A name that cannot be found gets one repair pass and, if still missing, is recorded as ungrounded and shown as unverified; such a row also cannot rate confidence high. Value direction is checked without a model at all: a constant that moved from A to B but is written as B to A is caught deterministically. Major, notable and multi-topic rows, plus any row with an ungrounded name, then get a second-model fact-check that answers claim by claim with quotes and reasons. Names that appear only in a sibling commit's title from the same day must be explicitly attributed; one commit may not borrow another's work. Unsupported claims trigger one rewrite, a row that still fails is stored with a visible <code>flagged</code> label rather than hidden, breaking or migration claims get one independent second read and are demoted to unknowns when it does not confirm them, and a row still shipping ungrounded names, backwards values or flagged claims gets one rewrite on the stronger model, kept only when it is strictly cleaner. Each summary cites the diff it came from, summaries are cached by commit SHA, diff content and prompt version, and every card links to the commit, compare view and inline diff.</p>
 
       <h4>USER-FACING HIGHLIGHTS</h4>
       <p>Every entry opens with its ELI5 plain-English takeaway, fixed in shape: what changed, who it affects, what you notice day to day, no jargon. The technical explanation, holding the full summary, sits collapsed beneath it, then chips of the structured facts computed from the diff (constant old to new values, new env vars, flags, exports, new test titles), an Evidence section citing the diff lines behind the summary's names, and a collapsed note for what the diff cannot show. Version bumps roll up everything that shipped in their release window instead of reporting a bare label change; a row whose own summary carries unverified names is left out of the window entirely, and review-flagged items are marked and hedged rather than stated as fact. The <code>/week/</code> pages digest each week into releases, catalog moves, and the heaviest work; cards name the first release that shipped each commit; same-day, same-topic commits are clustered into development narratives.</p>
+      <p>Every card carries an audience chip (clicking it opens that audience's feed subscription), a <code>link</code> button that copies a stable <code>/c/&lt;sha&gt;</code> permalink, and Related links picked by time proximity so an old row never points at the far future. Model pages say where each model first shipped and group its versions into lineage. The site follows your OS light-or-dark preference and remembers a manual choice.</p>
+
+      <h4>SEARCH</h4>
+      <p>Plain words match like they always did. On top of them the query box reads field syntax: <code>cat:cli</code> for a category, <code>sig:&gt;=notable</code> for an impact floor, <code>aud:end-users</code> for an audience, <code>is:release</code> <code>is:breaking</code> <code>is:security</code> and friends for flags, <code>&quot;exact phrase&quot;</code> for a phrase, and <code>-word</code> to exclude. Every search is a link: the address bar follows the box and the filters, so any result view can be shared or bookmarked as is, and the help panel under the box lists the full grammar.</p>
 
       <h4>WHAT WE TRACK</h4>
       <dl class="man-dl">
@@ -3648,11 +3878,15 @@ const loadIndex = async () => {
           <div class="man-routes">
             <span><a href="/">/</a> newest day</span>
             <span><code>/day/&lt;date&gt;/</code> single day</span>
+            <span><code>/from/&lt;date&gt;/to/&lt;date&gt;/</code> any day range</span>
             <span><a href="/week/">/week/</a> weekly digests</span>
-            <span><a href="/models/">/models/</a> catalog timeline</span>
+            <span><a href="/models/">/models/</a> catalog + lineage</span>
             <span><a href="/archive/">/archive/</a> history</span>
             <span><a href="/search/">/search/</a> search index</span>
             <span><a href="/stats/">/stats/</a> telemetry &amp; quality</span>
+            <span><code>/c/&lt;sha&gt;</code> one-entry permalink</span>
+            <span><a href="/subscribe/">/subscribe/</a> feed picker + OPML</span>
+            <span><a href="/api/">/api/</a> machine API</span>
             ${openPrs?.length ? '<span><a href="/in-flight/">/in-flight/</a> open PRs</span>' : ''}
           </div>
         </div>
@@ -3675,7 +3909,9 @@ const loadIndex = async () => {
         <div class="man-sec">
           <h4>FEEDS + DISCORD</h4>
           <ul class="man-ul">
-            <li><strong>Feeds:</strong> <a href="/feed.xml">all changes</a> &middot; <a href="/feed-major.xml">major</a> &middot; <a href="/feed-security.xml">security</a> &middot; <a href="/feed-weekly.xml">weekly</a> &middot; <a href="/feed-models.xml">models</a> &middot; <a href="/feed-releases.xml">releases</a> &middot; <a href="/feed.json">JSON</a>. For Discord RSS bots, <code>/feed add &lt;url&gt;</code>.</li>
+            <li><strong>Feeds:</strong> <a href="/feed.xml">all changes</a> &middot; <a href="/feed-major.xml">major</a> &middot; <a href="/feed-security.xml">security</a> &middot; <a href="/feed-weekly.xml">weekly</a> &middot; <a href="/feed-models.xml">models</a> &middot; <a href="/feed-releases.xml">releases</a> &middot; <a href="/feed.json">JSON</a>, plus one feed per audience. For Discord RSS bots, <code>/feed add &lt;url&gt;</code>.</li>
+            <li><strong>Subscribe:</strong> <a href="/subscribe/">/subscribe/</a> builds a personal OPML bundle of just the feeds you check, ready for any reader, and <a href="/feeds.opml">feeds.opml</a> is the everything bundle.</li>
+            <li><strong>Release notes as markdown:</strong> any release page answers <code>?format=md</code> (or <code>notes.md</code>) with clean <code>text/markdown</code>, ready to paste into a GitHub release.</li>
             <li><strong>Webhook broadcast:</strong> <code>npm run broadcast -- --webhook &lt;url&gt;</code> posts new commits and records <code>lastBroadcastSha</code>, so nothing repeats (<code>--limit</code>, <code>--dry-run</code>).</li>
           </ul>
         </div>
@@ -3692,7 +3928,7 @@ const loadIndex = async () => {
       </div>
 
       <h4>LIMITS &amp; FRESHNESS</h4>
-      <p>Snapshots squash history, so intra-snapshot ordering is approximate. Summaries and plain-English lines are AI-generated: the passes above reduce errors but do not eliminate them, so grounded identifiers are the parts to lean on and the prose is a guide. Where a row is unverified or was rewritten, the card says so. Upstream is polled every 30s by a continuous relay; the site is rebuilt and redeployed on each data update, with a scheduled deploy as a backstop.</p>
+      <p>Snapshots squash history, so intra-snapshot ordering is approximate. Summaries and plain-English lines are AI-generated: the passes above reduce errors but do not eliminate them, so grounded identifiers are the parts to lean on and the prose is a guide. Where a row is unverified or was rewritten, the card says so. Upstream is polled every 30s by a continuous relay; the site is rebuilt and redeployed on each data update, with a scheduled deploy as a backstop. Found a wrong row? <code>npm run override &lt;sha&gt;</code> drafts a human override for it, and overridden rows are marked edited.</p>
     </div>
   </div>
 </section>`
@@ -4138,6 +4374,33 @@ ${inFlightScript}`
   }))
 
   await write(dist, 'api/entries.json', JSON.stringify({ generatedAt: generated, head: changelog.headSha, total: entries.length, changes: meaningful.length, churn: churnCount, latest: meaningful.slice(0, 60) }))
+  await write(dist, 'api/index.html', layout({
+    title: 'API manual', path: '/api/',
+    body: `<section class="hero">
+  <div class="term-box">
+    <div class="term-box-hdr"><span class="term-box-title">MANUAL :: API</span></div>
+    <p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Machine-readable twins of everything on this site. CORS-open, ETag-revalidated, safe to poll. Examples use a 4-40 char sha prefix.</p>
+  </div>
+</section>
+<section style="margin-top:22px">
+  <h2 style="font-size:.78rem;color:var(--term-green);letter-spacing:.08em;margin:0 0 8px">ENDPOINTS</h2>
+  <div class="term-box"><div class="term-box-body" style="padding:10px 12px">
+    <p class="t"><b>GET /api/entry/&lt;sha&gt;.json</b> &mdash; one entry: facts, numbers, breaks, notes, model, attribution.</p>
+    <p class="t"><b>GET /api/records/&lt;day&gt;.json</b> &mdash; one day\u2019s full entry records (the shards behind the entry API).</p>
+    <p class="t"><b>GET <a href="/api/entries.json">/api/entries.json</a></b> &mdash; the newest 60 changes, full records.</p>
+    <p class="t"><b>GET <a href="/api/days.json">/api/days.json</a></b> &mdash; [day, change count, label] index for every snapshot.</p>
+    <p class="t"><b>GET <a href="/api/status.json">/api/status.json</a></b> &mdash; build stamp: head sha, counts, freshness (what the new-changes banner polls).</p>
+    <p class="t"><b>GET <a href="/api/traffic.json">/api/traffic.json</a></b> &mdash; 14-day GitHub clone counts.</p>
+    <p class="t"><b>GET <a href="/api/sha-day.json">/api/sha-day.json</a></b> &mdash; short sha &rarr; day lookup.</p>
+    <p class="t"><b>GET /release/&lt;v&gt;/?format=md</b> (or /release/&lt;v&gt;/notes.md) &mdash; release notes as text/markdown.</p>
+    <p class="t"><b>GET /c/&lt;sha&gt;</b> &mdash; canonical permalink for one entry (HTML, same record underneath).</p>
+  </div></div>
+  <h2 style="font-size:.78rem;color:var(--term-green);letter-spacing:.08em;margin:18px 0 8px">EXAMPLE</h2>
+  <div class="term-box"><div class="term-box-body" style="padding:10px 12px">
+    <p class="t"><code>curl -s ${SITE.url}/api/entry/${(changelog.headSha || '').slice(0, 8)}.json | jq .</code></p>
+  </div></div>
+</section>`
+  }))
   // The full day list behind the JUMP select: every day page ships only its
   // first 45 options in markup, and setupDayJump() hydrates the rest from here.
   await write(dist, 'api/days.json', JSON.stringify(byDay.map(d => [d.day, d.entries.filter(e => !e.noise).length, fmtDateHuman(d.day)])))
@@ -4248,7 +4511,7 @@ ctx.hidden = false
   const relUrls = vers.map(v => `/release/${v.version}/`)
   const lineageUrls = [...familyOf.entries()].filter(([, ms]) => ms.length > 1).map(([fam]) => `/models/lineage/${categorySlug(fam)}/`)
   const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`), ...lineageUrls]
-  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/week/', '/subscribe/', '/range/', '/in-flight/', ...weeks.slice(0, 52).map(w => `/week/${w.key}/`), ...browseMonthUrls]
+  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/week/', '/subscribe/', '/range/', '/api/', '/in-flight/', ...weeks.slice(0, 52).map(w => `/week/${w.key}/`), ...browseMonthUrls]
   await write(dist, 'sitemap-days.xml', urlset(dayUrls))
   await write(dist, 'sitemap-releases.xml', urlset(relUrls))
   await write(dist, 'sitemap-models.xml', urlset(modelUrls))
@@ -4328,6 +4591,12 @@ ctx.hidden = false
   Content-Type: application/rss+xml; charset=utf-8
   Access-Control-Allow-Origin: *
 `)
-  await write(dist, '404.html', layout({ title: 'Not found', path: '/404', noindex: true, body: '<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title" id="range-hdr">ERROR :: 404 NOT FOUND</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)" id="range-status">No commit or snapshot shipped at this path. <a href="/">&larr; [back to index]</a></p></div></section><div id="range-days"></div><script src="/range.js"></script>' }))
+  await write(dist, '404.html', layout({ title: 'Not found', path: '/404', noindex: true, body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title" id="range-hdr">ERROR :: 404 NOT FOUND</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)" id="range-status">No commit or snapshot shipped at this path. <a href="/">&larr; [back to index]</a></p>
+      <form action="/search/" method="get" style="margin-top:10px;display:flex;gap:8px;max-width:420px">
+        <input name="q" type="search" placeholder="search the changelog&hellip;" aria-label="Search the changelog" style="flex:1;padding:6px 8px;background:var(--bg);color:var(--txt);border:1px solid var(--border);font-family:inherit">
+        <button type="submit" class="theme-btn">[search]</button>
+      </form>
+      <p style="margin:10px 0 0;font-size:.74rem;color:var(--txt-dim)">Looking for a commit? try <a href="/c/">/c/&lt;sha&gt;</a> &middot; everything else lives at <a href="/man/routes/">[routes]</a></p>
+    </div></div></section><div id="range-days"></div><script src="/range.js"></script>` }))
   return { entries: entries.length, days: byDay.length, releases: vers.length }
 }

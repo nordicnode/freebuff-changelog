@@ -809,12 +809,13 @@ test('buildSite generates valid static site output', async () => {
   }
 })
 
-// The about page's word cap is only meaningful at the size it is deployed. The
-// body is prose plus counts, and the "Code areas" line grows a word per category
-// that really exists (plus the open-PR row), so the four-entry fixture above
-// measured ~790 words while the live page ran to 806. Build from the committed
-// data/ the deployed site is built from, not from dist/, which `npm test` does
-// not produce.
+// The about page's word cap keeps the page skimmable now that it is the full
+// manual (pipeline, search grammar, API, feeds), so it is set to 1250 with
+// headroom rather than squeezed to the current copy. The cap is only meaningful
+// at the size it is deployed: the body is prose plus counts, and the "Code
+// areas" line grows a word per category that really exists (plus the open-PR
+// row). Build from the committed data/ the deployed site is built from, not
+// from dist/, which `npm test` does not produce.
 test('about page stays under its word cap at production size', async (t) => {
   const changelog = JSON.parse(await readFile(new URL('../../data/changelog.json', import.meta.url), 'utf8'))
   assert.ok(changelog?.entries?.length, 'data/changelog.json is committed and non-empty')
@@ -833,7 +834,7 @@ test('about page stays under its word cap at production size', async (t) => {
     'the measured body spans the whole about page, not a nested section')
   const aboutWords = aboutBody
     .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length
-  assert.ok(aboutWords < 850, `about page is ${aboutWords} words at production size; keep it under 850`)
+  assert.ok(aboutWords < 1250, `about page is ${aboutWords} words at production size; keep it under 1250`)
   assert.doesNotMatch(aboutBody, /&mdash;|\u2014/, 'about copy carries no em-dashes')
 })
 
@@ -868,7 +869,44 @@ test('inline scripts: template escaping preserves regex backslashes', async () =
       if (f !== 'search/index.html') assert.match(html, /split\(\/\\r\?\\n\/\)/)
     }
     const searchHtml = await readFile(join(tmpDist, 'search/index.html'), 'utf8')
-    assert.match(searchHtml, /split\(\/\\s\+\//)
+    // Backslash-regex canary: the query tokenizer's \S is the fragile bit now
+    // (it once shipped as |S+ when a template literal ate the backslash).
+    assert.match(searchHtml, /\|\\S\+\)\/g/)
+  } finally {
+    await rm(tmpDist, { recursive: true, force: true })
+  }
+})
+
+test('homepage ships the sync-status widget, newest day only', async () => {
+  const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-test-sw-'))
+  try {
+    const entry = (sha, day) => ({
+      kind: 'sync', sha,
+      url: `https://github.com/CodebuffAI/freebuff/commit/${sha}`,
+      date: `${day}T10:00:00Z`, areas: ['CLI'], modelChanges: null, cmdChanges: null,
+      files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/x.ts'] },
+      stats: { additions: 1, deletions: 0 }, facts: [], summary: 'Minor CLI tweak.', title: 'Minor CLI tweak.',
+      category: 'CLI', significance: 'minor', day, month: day.slice(0, 7)
+    })
+    const mockChangelog = {
+      version: 1, repo: 'https://github.com/CodebuffAI/freebuff', generatedAt: '2026-09-13T12:00:00Z',
+      headSha: '1111222233334444555566667777888899990000',
+      counts: { commitsScanned: 2, entries: 2, syncEra: 2, community: 0 },
+      // data/changelog.json is oldest-first (sortEntries order); buildSite
+      // reverses it to newest-first, so the fixture must match that order.
+      entries: [entry('cccc111122223333444455556666777788889999', '2026-09-12'), entry('bbbb111122223333444455556666777788889999', '2026-09-13')]
+    }
+    await buildSite({ changelog: mockChangelog, openPrs: [], dist: tmpDist })
+    const index = await readFile(join(tmpDist, 'index.html'), 'utf8')
+    const newest = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
+    const older = await readFile(join(tmpDist, 'day/2026-09-12/index.html'), 'utf8')
+    for (const [name, html] of [['/', index], ['/day/2026-09-13/', newest]]) {
+      assert.ok(html.includes('id="sync-widget"'), `${name} carries the sync widget (the newest day is live, read from either URL)`)
+      assert.ok(html.includes('href="/api/status.json"'), `${name} widget links its data source`)
+      assert.match(html, /last sync <b class="sw-updated">/, `${name} shows the build stamp without scripting`)
+    }
+    assert.ok(!older.includes('id="sync-widget"'), 'settled days stay settled: no widget on older day pages')
+    assert.ok(index.includes('fbSyncPaint'), 'the widget is wired to the /api/status.json poll (update-ready chip, count refresh)')
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }

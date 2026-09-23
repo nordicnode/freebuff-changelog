@@ -104,6 +104,46 @@ a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,su
   --mark-bg:rgba(51,255,102,0.22);
 }
 
+/* Light theme: same layout and terminal voice, daylight palette. The default
+   follows the OS preference (see the head script in site.mjs); the footer
+   button stores an explicit choice. */
+[data-theme="light"]{
+  color-scheme:light;
+  --bg:#f6f8fa;
+  --panel:#ffffff;
+  --panel-hover:#eef1f5;
+  --term-border:#d0d7de;
+  --term-border-strong:#8c959f;
+
+  --txt:#1f2328;
+  --txt-dim:#3d444d;
+  --txt-subtle:#656d76;
+
+  --term-green:#1a7f37;
+  --term-red:#cf222e;
+  --term-amber:#9a6700;
+  --term-cyan:#0969da;
+  /* Used with hardcoded fallbacks elsewhere (warnings, env chips, ACTION
+     lines); the dark fallbacks are too pale for a white background. */
+  --term-yellow:#9a6700;
+  --term-purple:#8250df;
+
+  --code:#eef1f4;
+
+  --cyan-tint-bg:rgba(9,105,218,0.08);
+  --cyan-tint-border:rgba(9,105,218,0.4);
+  --amber-tint-bg:rgba(154,103,0,0.1);
+  --amber-tint-border:rgba(154,103,0,0.45);
+  --green-tint-bg:rgba(26,127,55,0.08);
+  --red-tint-bg:rgba(207,34,46,0.06);
+  --diff-add-bg:rgba(26,127,55,0.07);
+  --diff-del-bg:rgba(207,34,46,0.05);
+  --diff-hunk-bg:rgba(9,105,218,0.06);
+  --eli5-bg:rgba(154,103,0,0.07);
+  --eli5-rule:rgba(154,103,0,0.3);
+  --mark-bg:rgba(9,105,218,0.18);
+}
+
 
 
 html{
@@ -3058,6 +3098,14 @@ mark.search-match{
 a.badge{text-decoration:none}
 a.badge:hover{text-decoration:none;color:var(--term-cyan)}
 
+/* Search syntax help and the guided empty state. */
+.search-help{margin-top:10px;font-size:.76rem;color:var(--txt-subtle)}
+.search-help summary{cursor:pointer;color:var(--txt-dim)}
+.search-help-body{margin-top:8px;line-height:1.9;color:var(--txt-subtle)}
+.search-help-body code{font-size:.74rem}
+.search-empty{margin:20px 0}
+.search-empty p{margin:4px 0}
+
 /* /subscribe/: the feed checklist and the generated OPML. */
 .sub-groups{margin-top:8px}
 .sub-group{margin-top:18px}
@@ -3068,6 +3116,19 @@ a.badge:hover{text-decoration:none;color:var(--term-cyan)}
 .sub-path{font-size:.72rem;color:var(--txt-subtle);justify-self:end}
 .sub-desc{grid-column:2 / span 2;font-size:.74rem;color:var(--txt-subtle)}
 @media (max-width:640px){.sub-row{grid-template-columns:auto 1fr}.sub-path{justify-self:start;grid-column:2}.sub-desc{grid-column:2}}
+
+/* The homepage sync widget: the relay made visible. The dot breathes while the
+   data is inside the freshness budget the [fresh]/[stale] badge uses, and holds
+   amber past it; the row wraps like the status bar above it on narrow screens. */
+.sync-widget{display:flex;flex-wrap:wrap;align-items:center;gap:2px 10px;padding:4px 0 6px;font-size:.75rem;color:var(--txt-subtle);border-top:1px dotted var(--term-border)}
+.sw-dot{width:8px;height:8px;border-radius:50%;background:var(--term-green);box-shadow:0 0 6px var(--term-green);animation:sw-breathe 2.4s ease-in-out infinite}
+.sync-widget.sw-stale .sw-dot{background:var(--term-amber);box-shadow:0 0 6px var(--term-amber);animation:none}
+@keyframes sw-breathe{0%,100%{opacity:1}50%{opacity:.3}}
+.sw-item b{color:var(--txt);font-variant-numeric:tabular-nums}
+.sw-pending{color:var(--term-amber)}
+.sw-counts{margin-left:auto;color:var(--txt-subtle)}
+.sw-api{color:var(--txt-subtle);text-decoration:underline dotted;text-underline-offset:2px}
+.sw-api:hover{color:var(--term-cyan)}
 
 /* Honour the OS motion preference the same way the scripted scrolls do
    (scrollToEl checks matchMedia): smooth scroller and every hover/expand
