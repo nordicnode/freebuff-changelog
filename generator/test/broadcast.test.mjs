@@ -100,6 +100,46 @@ test('cmdBroadcast: ignores churn/noise commits', async (t) => {
   assert.equal(state.lastBroadcastSha, '222222222222')
 })
 
+test('cmdBroadcast: walks oldest-first changelog.json from the newest end (sortEntries order)', async (t) => {
+  // Regression: data/changelog.json is stored OLDEST-first (entries[0] is the
+  // first commit ever). The old walk took slice(0, limit) of the raw order, so
+  // a fresh run broadcast 2024 commits and pinned lastBroadcastSha to the
+  // list's head -- after which every run logged "no new commits" while new
+  // work piled up at the other end. Fixtures here are in PRODUCTION order.
+  const dir = await tmpData(t)
+  await writeFile(join(dir, 'changelog.json'), JSON.stringify({
+    entries: [mockCommit('111111111111', 'OLDEST 2024 commit'), mockCommit('222222222222', 'Middle commit'), mockCommit('333333333333', 'NEWEST commit')]
+  }))
+  await writeFile(join(dir, 'state.json'), JSON.stringify({ lastSha: '333333333333', runs: 1 }))
+
+  const calls = []
+  const fetchImpl = async (url, opts) => {
+    calls.push({ body: JSON.parse(opts.body) })
+    return { ok: true, status: 204 }
+  }
+
+  // First run: the newest two, oldest of them first (chronological send order).
+  const res = await cmdBroadcast(['--webhook', 'https://discord.com/api/webhooks/test', '--limit', '2'], { fetchImpl, dataDir: dir })
+  assert.equal(res.count, 2)
+  assert.match(calls[0].body.content, /Middle commit/)
+  assert.match(calls[1].body.content, /NEWEST commit/)
+  assert.ok(!calls.some(c => c.body.content.includes('OLDEST 2024 commit')), 'the ancient head of the list is never broadcast')
+
+  const state = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
+  assert.equal(state.lastBroadcastSha, '333333333333', 'watermark ends on the NEWEST commit')
+
+  // Second run: a commit lands at the newest end and is picked up.
+  await writeFile(join(dir, 'changelog.json'), JSON.stringify({
+    entries: [mockCommit('111111111111', 'OLDEST 2024 commit'), mockCommit('222222222222', 'Middle commit'), mockCommit('333333333333', 'NEWEST commit'), mockCommit('444444444444', 'Brand new commit')]
+  }))
+  calls.length = 0
+  const res2 = await cmdBroadcast(['--webhook', 'https://discord.com/api/webhooks/test'], { fetchImpl, dataDir: dir })
+  assert.equal(res2.count, 1)
+  assert.match(calls[0].body.content, /Brand new commit/)
+  const state2 = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'))
+  assert.equal(state2.lastBroadcastSha, '444444444444', 'the watermark keeps moving instead of going silent')
+})
+
 test('cmdBroadcast: supports --plain / --eli5 flag to broadcast plain English announcements', async (t) => {
   const dir = await tmpData(t)
   await writeFile(join(dir, 'changelog.json'), JSON.stringify({

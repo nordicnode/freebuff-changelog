@@ -57,10 +57,13 @@ export function mustMentionFor (e) {
   for (const c of e.cmdChanges?.removed || []) out.add(c)
   if (e.version) out.add(e.version)
   if (e.freebuffVersion) out.add(e.freebuffVersion)
-  for (const c of (e.structured?.constants || []).slice(0, 3)) out.add(c.name)
-  for (const v of (e.structured?.envVars || []).slice(0, 3)) out.add(v)
-  for (const f of (e.structured?.flags || []).slice(0, 3)) out.add(f)
-  return [...out].slice(0, 8)
+  // Strings only: an undefined name would poison mustMention with the value
+  // undefined, and text.includes(undefined) then searches the literal word
+  // "undefined" -- scoring "mentioned" for prose that merely says undefined.
+  for (const c of (e.structured?.constants || []).slice(0, 3)) if (c && typeof c.name === 'string' && c.name) out.add(c.name)
+  for (const v of (e.structured?.envVars || []).slice(0, 3)) if (typeof v === 'string' && v) out.add(v)
+  for (const f of (e.structured?.flags || []).slice(0, 3)) if (typeof f === 'string' && f) out.add(f)
+  return [...out].filter(x => typeof x === 'string' && x.length >= 2).slice(0, 8)
 }
 
 export async function seedGolden (entries, dataDir, { count = 40 } = {}) {
@@ -119,8 +122,13 @@ export function scoreRow (e, record, golden, corpusText = '') {
     hypeFree: !hype,
     titleLen: (record.title || '').length,
     titleLenOk: (record.title || '').length <= 70,
-    audienceAgree: golden?.verified && golden.audience ? record.audience === golden.audience : null,
-    sigAgree: golden?.verified && golden.significance ? record.significance === golden.significance : null,
+    // Labels score whether or not a human has verified them: a seeded label is
+    // still a fixed target, so prompt-to-prompt regression is visible before
+    // verification. The row carries `verified` so the report can separate
+    // human-confirmed agreement from seeded-label stability.
+    verified: !!golden?.verified,
+    audienceAgree: golden?.audience ? record.audience === golden.audience : null,
+    sigAgree: golden?.significance ? record.significance === golden.significance : null,
     mustMention: must.length ? mentioned / must.length : null,
     structuredCited,
     confidence: record.confidence || null,
@@ -182,13 +190,16 @@ const numN = (xs) => xs.filter(x => typeof x === 'number' && Number.isFinite(x))
 export function aggregate (rows) {
   return {
     n: rows.length,
+    verifiedN: rows.filter(r => r.verified).length,
     grounded: rate(rows.map(r => r.grounded)),
     pathGrounded: rate(rows.map(r => r.pathGrounded)),
     whyRate: rate(rows.map(r => r.why)),
     hypeFree: rate(rows.map(r => r.hypeFree)),
     titleLenOk: rate(rows.map(r => r.titleLenOk)),
     audienceAgree: rate(rows.map(r => r.audienceAgree)),
+    audienceAgreeVerified: rate(rows.map(r => r.verified ? r.audienceAgree : null)),
     sigAgree: rate(rows.map(r => r.sigAgree)),
+    sigAgreeVerified: rate(rows.map(r => r.verified ? r.sigAgree : null)),
     mustMention: mean(rows.map(r => r.mustMention)),
     structuredUsed: rate(rows.map(r => r.structuredCited)),
     withEvidence: rate(rows.map(r => r.hasEvidence)),
@@ -313,13 +324,13 @@ export function formatEvalReport (r) {
     line('low confidence', m.lowConfidence, p?.lowConfidence, pct, c.lowConfidence),
     line('structured cited', m.structuredUsed, p?.structuredUsed, pct, c.structuredUsed),
     line('must-mention', m.mustMention, p?.mustMention, pct, c.mustMention),
-    line('audience agree*', m.audienceAgree, p?.audienceAgree, pct, c.audienceAgree),
-    line('significance agree*', m.sigAgree, p?.sigAgree, pct, c.sigAgree)
+    line(`audience agree${m.verifiedN ? ` (${m.verifiedN}v)` : '*'}`, m.audienceAgree, p?.audienceAgree, pct, c.audienceAgree),
+    line(`significance agree${m.verifiedN ? ` (${m.verifiedN}v)` : '*'}`, m.sigAgree, p?.sigAgree, pct, c.sigAgree)
   ]
   if (m.judge.faithfulness != null) {
     out.push(line('judge faithfulness', m.judge.faithfulness, p?.judge?.faithfulness, num, c.judge), line('judge completeness', m.judge.completeness, p?.judge?.completeness, num, c.judge), line('judge clarity', m.judge.clarity, p?.judge?.clarity, num, c.judge))
   }
-  out.push('  * verified golden rows only')
+  out.push(`  * golden labels; ${m.verifiedN} of ${r.metrics.n} rows human-verified (v), the rest scored against seeded labels for regression`)
   const bad = r.rows.filter(x => !x.failed && (!x.grounded || !x.hypeFree || x.pathGrounded === false)).slice(0, 10)
   if (bad.length) {
     out.push('  rows to look at:')

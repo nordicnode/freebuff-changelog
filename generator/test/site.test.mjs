@@ -299,10 +299,16 @@ test('buildSite generates valid static site output', async () => {
     assert.ok(searchIdx.cats.includes('CLI'))
     assert.deepEqual(searchIdx.sigs, ['minor', 'notable', 'major'])
     assert.equal(searchIdx.ix.length, 3)
-    assert.ok(searchIdx.ix[0].length >= 6, 'search index tuple includes ELI5 plain English text')
-    assert.ok(typeof searchIdx.ix[0][5] === 'string')
-    // e[6] is search-only text: touched paths and the evidence citation.
-    assert.ok(searchIdx.ix.some(r => typeof r[6] === 'string' && r[6].length), 'search index tuple carries paths/evidence for identifier search')
+    // Fixed-width tuple: [day, title, cat, sha, sig, aud, flags, eli5, extra].
+    // The old shape made eli5/extra optional slots, so fields shifted when one
+    // was missing.
+    assert.ok(searchIdx.ix.every(r => r.length === 9), 'every search tuple has all nine fields')
+    assert.ok(typeof searchIdx.ix[0][7] === 'string', 'e[7] is the ELI5 plain English text')
+    assert.equal(typeof searchIdx.ix[0][5], 'number', 'e[5] is the audience code')
+    assert.equal(typeof searchIdx.ix[0][6], 'number', 'e[6] is the release/breaking flags bitmask')
+    // e[8] is search-only text: touched paths, evidence and version strings.
+    assert.ok(searchIdx.ix.some(r => typeof r[8] === 'string' && r[8].length), 'search index tuple carries paths/evidence for identifier search')
+    assert.ok(Array.isArray(searchIdx.auds) && searchIdx.auds.length === 4, 'audience codebook rides along')
     const searchHtml = await readFile(join(tmpDist, 'search/index.html'), 'utf8')
     // Versioned client cache for the multi-MB index: the version baked into the
     // page must match the shipped index bytes, so repeat visits skip the fetch
@@ -1495,8 +1501,11 @@ test('in-flight page paginates open PRs into pages of 25 with keyboard and pill 
   assert.match(page1, /Community contribution #1<\/a>/)
   assert.match(page1, /Community contribution #25<\/a>/)
   assert.doesNotMatch(page1, /Community contribution #26<\/a>/)
-  assert.match(page1, /<a href="\/in-flight\/page\/2\/" rel="next">older PRs &rarr;<\/a>/)
-  assert.match(page1, /<span class="pager-disabled">&larr; newer PRs<\/span>/)
+  // rel convention is site-wide: rel="prev" is the OLDER page, rel="next" the
+  // newer one (the p/n shortcuts follow these rels). This family used to map
+  // them the other way round, so p went backwards here and forward elsewhere.
+  assert.match(page1, /<a href="\/in-flight\/page\/2\/" rel="prev">&larr; older PRs<\/a>/)
+  assert.match(page1, /<span class="pager-disabled">newer PRs &rarr;<\/span>/)
   assert.match(page1, /<span class="pager-num active">\[1\]<\/span>/)
   assert.match(page1, /<a href="\/in-flight\/page\/2\/" class="pager-num">\[2\]<\/a>/)
   assert.match(page1, /<a href="\/in-flight\/page\/3\/" class="pager-num">\[3\]<\/a>/)
@@ -1512,8 +1521,8 @@ test('in-flight page paginates open PRs into pages of 25 with keyboard and pill 
   assert.match(page2, /Community contribution #26<\/a>/)
   assert.match(page2, /Community contribution #50<\/a>/)
   assert.doesNotMatch(page2, /Community contribution #51<\/a>/)
-  assert.match(page2, /<a href="\/in-flight\/" rel="prev">&larr; newer PRs<\/a>/)
-  assert.match(page2, /<a href="\/in-flight\/page\/3\/" rel="next">older PRs &rarr;<\/a>/)
+  assert.match(page2, /<a href="\/in-flight\/" rel="next">newer PRs &rarr;<\/a>/)
+  assert.match(page2, /<a href="\/in-flight\/page\/3\/" rel="prev">&larr; older PRs<\/a>/)
   assert.match(page2, /<a href="\/in-flight\/" class="pager-num">\[1\]<\/a>/)
   assert.match(page2, /<span class="pager-num active">\[2\]<\/span>/)
 
@@ -1522,8 +1531,8 @@ test('in-flight page paginates open PRs into pages of 25 with keyboard and pill 
   assert.match(page3, /Showing <b id="pr-filter-count">15<\/b> of 15 PRs on this page \(PRs 51&ndash;65 of 65 total &middot; page 3 of 3\)/)
   assert.match(page3, /Community contribution #51<\/a>/)
   assert.match(page3, /Community contribution #65<\/a>/)
-  assert.match(page3, /<a href="\/in-flight\/page\/2\/" rel="prev">&larr; newer PRs<\/a>/)
-  assert.match(page3, /<span class="pager-disabled">older PRs &rarr;<\/span>/)
+  assert.match(page3, /<a href="\/in-flight\/page\/2\/" rel="next">newer PRs &rarr;<\/a>/)
+  assert.match(page3, /<span class="pager-disabled">&larr; older PRs<\/span>/)
   assert.match(page3, /<span class="pager-num active">\[3\]<\/span>/)
 
   // Verify n / p keyboard script has no flawed first-child / last-child fallbacks

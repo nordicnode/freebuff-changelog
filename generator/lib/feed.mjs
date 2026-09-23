@@ -364,6 +364,32 @@ export function feedJson (siteUrl, generated, title, desc, feedPath, items) {
   })
 }
 
+// OPML 2.0 subscription bundle: every feed the site writes, grouped. Feed
+// readers import this and get the whole catalog; the /subscribe/ page builds a
+// reader-specific subset in the browser from the same list.
+export function feedsOpml (siteUrl, feeds) {
+  const groups = new Map()
+  for (const f of feeds) {
+    if (!groups.has(f.group)) groups.set(f.group, [])
+    groups.get(f.group).push(f)
+  }
+  const outlines = [...groups.entries()].map(([g, list]) =>
+    `    <outline text="${esc(g)}" title="${esc(g)}">`
+    + list.map(f => `<outline type="rss" text="${esc(f.title)}" title="${esc(f.title)}" xmlUrl="${esc(`${siteUrl}${f.path}`)}" htmlUrl="${esc(`${siteUrl}/`)}"${f.desc ? ` description="${esc(f.desc)}"` : ''}/>`).join('')
+    + `</outline>`
+  ).join('\n')
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<opml version="2.0">
+  <head><title>Unofficial Freebuff Changelog</title><dateCreated>${new Date().toUTCString()}</dateCreated></head>
+  <body>
+    <outline text="freebuff-changes" title="freebuff-changes">
+${outlines}
+    </outline>
+  </body>
+</opml>
+`
+}
+
 export function jsonItem (siteUrl, e, titleOf, storyNotes = []) {
   const title = titleOf(e)
   const summary = String(e.ai?.summary || e.summary || '').replace(/[*`#]/g, '').trim()

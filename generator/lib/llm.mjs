@@ -165,6 +165,10 @@ export function cleanText (s, maxLen = 2000, isSentence = false) {
 // Per-file budget: split on file boundaries, cap each file, keep order.
 // Defaults allow up to 500 KB (optimized for 270K+ context windows).
 export function budgetPatch (patch, maxBytes = 500000, perFile = 120000) {
+  // Coerce first: an unreadable diff arrives as undefined from a failed git
+  // read, and `patch.length` below threw on it (the String() guard covered
+  // only the split path).
+  patch = String(patch ?? '')
   const raw = String(patch || '').split(/(?=^diff --git )/m)
   if (raw.length <= 1) {
     return patch.length > maxBytes
@@ -259,6 +263,7 @@ export function structuredFactsCited (structured, text) {
   const hay = String(text || '')
   const items = [
     ...(structured.constants || []).map(c => c.name),
+    ...(structured.constantsIntroduced || []).map(c => c.name),
     ...(structured.envVars || []), ...(structured.flags || []),
     ...(structured.exportsAdded || []), ...(structured.exportsRemoved || [])
   ]
@@ -343,13 +348,15 @@ export function buildPrompt (entry, patch, ctx = {}) {
     `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, flag, or diff hunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "<major | notable | minor>", "audience": "<one of: ${AUDIENCES.join(' | ')}>", "userVisible": <true if a user of the CLI, web app, desktop app or SDK can observe the change without reading code, else false>, "breaking": <true only if existing behavior, config, an API or a command stops working as before>, "migration": "<what a user or operator must do because of this change, or null>", "newEnvVars": [<environment variables introduced, verbatim, or empty>], "newFlags": [<CLI flags introduced, verbatim with leading dashes, or empty>], "confidence": "<high | medium | low: how well the diff and notes support the summary>", "unknowns": "<one sentence naming what the diff does not show (the motive, the consumer of a new constant, the rollout), or null>"${multi ? ', "changes": [{"area": "<package or surface>", "what": "<one sentence>", "files": [<paths from the file list>]}]' : ''}}.`,
     multi ? `This snapshot spans several areas or ${MULTI_TOPIC_MIN_FILES}+ files: it is several changes. Fill "changes" with one item per distinct change (2-6 items), each grounded in the files it names; the prose summary then leads with the most user-relevant one and says how many others there are.` : '',
     'Fields: "migration" and "unknowns" are null when there is nothing honest to say; never fill them with reassurance. "confidence" is low when the diff is truncated, the change is mostly configuration whose consumer is not visible, or the motive is guessed.',
-    `Significance: judge it from the diff against the scale below. The deterministic default "${entry.significance || 'minor'}" is only a file-shape heuristic, not the answer; change it whenever the diff plainly implies a different tier.`,
+    `Significance: judge it from the diff against the scale below. The deterministic default "${entry.significance || 'minor'}" is only a file-shape heuristic, not the answer: change it only when the diff plainly implies a different tier, and when the evidence is mixed, keep the deterministic tier -- a tie is not a reason to move it.`,
     SIGNIFICANCE_SCALE,
     AUDIENCE_RULE,
     '',
     'GOOD (technical, precise, no boilerplate) examples. Angle-bracket spans stand for values copied verbatim from THIS diff and notes: never emit a span literally and never reuse any name from these examples, only the pattern:',
     '- "<Model X> replaces <Model Y> in the free model picker, per the comment beside <Model Y>\'s removal that cites its upstream deprecation." WHAT + mechanism, plus a WHY quoted from the diff.',
     '- "`<flag-or-const>` in `<package path>` now gates `<behavior>`; it defaults to `<literal value>` and nothing reads it outside `<file>` yet." One concrete DETAIL, every name from the file list, no invented runtime or session consequences.',
+    '- Significance calibration, keep-the-tier side: a row that only edits `<const>` from `<old value>` to `<new value>` with no new reader stays at the deterministic tier (usually minor): a literal moved, no behavior shipped.',
+    '- Significance calibration, move-the-tier side: the same constant edit sitting beside new code that enforces it is a behavior change and belongs in notable or major -- move the tier only with that kind of evidence in the diff.',
     '',
     `Date: ${entry.date}`,
     `Category: ${entry.category || (entry.areas || []).join(', ')}`,
@@ -469,7 +476,7 @@ export function buildPrompt (entry, patch, ctx = {}) {
 // the chunks' possible misreadings. The digest gives it the shape of every
 // file so it can spot a draft that missed a whole file and check a draft that
 // overstates one, at a fraction of the diff's bytes.
-export function buildDiffDigest (patch, { maxBytes = 12000, sampleLines = 4 } = {}) {
+export function buildDiffDigest (patch, { maxBytes = 12000, sampleLines = 4, sampleRemoved = 2 } = {}) {
   const files = splitPatchByFile(patch)
   const rows = []
   let used = 0
@@ -477,15 +484,23 @@ export function buildDiffDigest (patch, { maxBytes = 12000, sampleLines = 4 } = 
     let adds = 0
     let dels = 0
     const sample = []
+    const sampleDel = []
     for (const line of f.text.split('\n')) {
       if (line.startsWith('+++') || line.startsWith('---')) continue
       if (line[0] === '+') {
         adds++
         const t = line.slice(1).trim()
         if (sample.length < sampleLines && t.length >= 12 && !/^import\b/.test(t)) sample.push(t.slice(0, 120))
-      } else if (line[0] === '-') dels++
+      } else if (line[0] === '-') {
+        dels++
+        // Removed lines carry what stopped working -- deletions are half of
+        // every rename and retirement, and the digest used to show a
+        // deletion-heavy file as `+0/-400` with no shape at all.
+        const t = line.slice(1).trim()
+        if (sampleDel.length < sampleRemoved && t.length >= 12 && !/^import\b/.test(t)) sampleDel.push(t.slice(0, 120))
+      }
     }
-    const row = `- ${f.path} (+${adds}/-${dels})${sample.length ? ` | added lines include: ${sample.join(' ; ')}` : ''}`
+    const row = `- ${f.path} (+${adds}/-${dels})${sample.length ? ` | added lines include: ${sample.join(' ; ')}` : ''}${sampleDel.length ? ` | removed lines include: ${sampleDel.join(' ; ')}` : ''}`
     if (used + row.length > maxBytes) {
       rows.push(`- ...digest truncated; ${files.length - rows.length} more files in the diff...`)
       break
@@ -753,6 +768,12 @@ export function shortError (err) {
 // Rate limiting state: tracks timestamps of requests to enforce RPM budget.
 const llmRequestTimestamps = []
 
+// Strict JSON mode (`response_format: json_object`) is a nicety, not a
+// requirement: some OpenAI-compatible gateways 400 on the field itself. One
+// probe decides it for the rest of the process instead of parking every queued
+// entry on the 1-hour "permanent error" cooldown for a gateway preference.
+let responseFormatSupported = true
+
 export async function waitForLlmRpmSlot (env) {
   const rpm = Number(env?.CHANGELOG_LLM_RPM || 60)
   if (!rpm || rpm <= 0) return
@@ -771,10 +792,17 @@ export async function waitForLlmRpmSlot (env) {
   }
 }
 
+// How many summaries may be in flight at once. waitForLlmRpmSlot is the real
+// throughput bound (CHANGELOG_LLM_RPM per minute); 2-3 in flight just hides
+// network latency between calls. Default 2, opt up to 6.
+export function llmConcurrency (env) {
+  return Math.max(1, Math.min(6, Number(env?.CHANGELOG_LLM_CONCURRENCY || 2) || 2))
+}
+
 // `validate` is a parameter because the ELI5 pass speaks to the same gateway
 // with a different shape: the repair retry has to check the replacement against
 // the schema that was asked for, not the summary one.
-export async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut) {
+export async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut, opts = {}) {
   const base = env.LLM_API_BASE || 'https://api.openai.com/v1'
   const model = env.LLM_MODEL || 'gpt-4o-mini'
   const configuredTimeout = Number(env.LLM_TIMEOUT_MS)
@@ -783,35 +811,55 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
   const timeoutMs = Number.isInteger(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 2147483647
     ? configuredTimeout : 60000
   await waitForLlmRpmSlot(env)
+  const body = {
+    model,
+    // 0 for every production ask (reproducibility). The self-consistency
+    // probe is the one caller that warms it, on purpose.
+    temperature: opts.temperature ?? 0,
+    messages: [{ role: 'user', content: prompt }]
+  }
+  if (responseFormatSupported) body.response_format = { type: 'json_object' }
   const res = await fetch(`${base.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       authorization: `Bearer ${env.LLM_API_KEY}`
     },
-    body: JSON.stringify({
-      model,
-      temperature: 0,
-      response_format: { type: 'json_object' },
-      messages: [{ role: 'user', content: prompt }]
-    }),
+    body: JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs)
   })
+  if (res.status === 400 && responseFormatSupported && attempt <= 2) {
+    const bodyText = await res.text().catch(() => '')
+    if (/response[_ -]?format|json_object|json mode/i.test(bodyText)) {
+      responseFormatSupported = false
+      log('LLM gateway rejected response_format: retrying without strict JSON mode (sticky for this process)')
+      return callLlm(prompt, env, attempt + 1, validate, opts)
+    }
+    throw new Error(shortError(`LLM HTTP 400: ${bodyText.slice(0, 120)}`))
+  }
   if (res.status === 429 && attempt <= 3) {
     // Honor Retry-After; fall back to exponential backoff with jitter.
     const retryAfter = Number(res.headers.get('retry-after')) * 1000
     const jitter = Math.floor(Math.random() * 1000)
     const waitMs = retryAfter || (2000 * 2 ** (attempt - 1) + jitter)
+    // A gateway that asks for a longer pause than an in-call wait should
+    // absorb gets it through the short transient cooldown instead: clamping
+    // the wait to 30s used to retry early three times, burn the entry's
+    // attempts, and park it on the 1-hour cooldown for what was a 2-minute
+    // throttle.
+    if (waitMs > 60000) {
+      throw new Error(`LLM HTTP 429: retry-after ${Math.round(waitMs / 1000)}s exceeds the in-call wait budget`)
+    }
     log(`LLM rate-limited (429): waiting ${(waitMs / 1000).toFixed(1)}s before retry ${attempt}/3`)
-    await new Promise(r => setTimeout(r, Math.min(waitMs, 30000)))
-    return callLlm(prompt, env, attempt + 1, validate)
+    await new Promise(r => setTimeout(r, waitMs))
+    return callLlm(prompt, env, attempt + 1, validate, opts)
   }
   // 5xx gateways (tunnel 503s/522s included): retry with backoff up to 3 attempts.
   if (res.status >= 500 && res.status <= 599 && attempt <= 3) {
     const waitMs = 2000 * 2 ** (attempt - 1)
     log(`LLM HTTP ${res.status} gateway blip: waiting ${(waitMs / 1000).toFixed(1)}s before retry ${attempt}/3`)
     await new Promise(r => setTimeout(r, waitMs))
-    return callLlm(prompt, env, attempt + 1, validate)
+    return callLlm(prompt, env, attempt + 1, validate, opts)
   }
   if (!res.ok) throw new Error(shortError(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`))
   const rawText = await res.text()
@@ -824,7 +872,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     // The recursive call already validates its own output; re-validating the
     // validated result here would consume a second vote from stateful
     // validators (summaryValidator's strict-then-flag allowance) for nothing.
-    return callLlm(`${prompt}\n\nPrevious response was empty or malformed: ${rawText.slice(0, 300)}\nReply with ONLY the JSON object.`, env, attempt + 1, validate)
+    return callLlm(`${prompt}\n\nPrevious response was empty or malformed: ${rawText.slice(0, 300)}\nReply with ONLY the JSON object.`, env, attempt + 1, validate, opts)
   }
   try {
     const parsed = parseLlmJson(text)
@@ -835,7 +883,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     // boilerplate failure is not a JSON problem, and a model told "invalid JSON"
     // will not fix a misspelled identifier.
     log(`LLM output invalid (${err.message}): requesting repair ${attempt}/2`)
-    return callLlm(`${prompt}\n\nPrevious output was rejected: ${String(err.message).slice(0, 400)}\nPrevious output: ${String(text).slice(0, 500)}\nFix exactly that problem without new analysis. Reply with ONLY the corrected JSON object.`, env, attempt + 1, validate)
+    return callLlm(`${prompt}\n\nPrevious output was rejected: ${String(err.message).slice(0, 400)}\nPrevious output: ${String(text).slice(0, 500)}\nFix exactly that problem without new analysis. Reply with ONLY the corrected JSON object.`, env, attempt + 1, validate, opts)
   }
 }
 
@@ -1070,8 +1118,33 @@ export function ungroundedIdentifiers (text, corpus) {
     // the model copied from the diff: the corpus spells the ratio out nowhere, so
     // flagging it is a false positive on an otherwise-correct summary.
     if (/^\s*%/.test(prose.slice(m.index + m[0].length))) continue
+    // A hedged figure ("about 500 files", "roughly 40 callers", "over 200
+    // tests") is an estimate derived from the diff, not a copied literal --
+    // the same class of claim as a percentage, with the same false-positive
+    // cost. An unhedged number remains fully checked.
+    if (/(?:about|roughly|nearly|almost|around|approximately|over|under|up to|some|~)\s*$/i.test(prose.slice(Math.max(0, m.index - 14), m.index))) continue
     if (out.includes(n)) continue
     if (!numericHit(n)) out.push(n)
+  }
+  return out
+}
+
+// A constant change stated backwards ("raised from 500 to 300" where the diff
+// says 300 -> 500, or `500 -> 300` arrows). The grounding check confirms the
+// values are *present*; this checks the *direction*, which is the error class a
+// reader cannot spot without opening the diff. Deterministic, no model call.
+export function reversedValueClaims (text, structured) {
+  const out = []
+  const hayNorm = String(text || '').replace(/[,_]/g, '')
+  const strip = (v) => String(v ?? '').replace(/^[\s'"`]+|[\s'"`]+$/g, '').replace(/[,_]/g, '').trim()
+  const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  for (const c of structured?.constants || []) {
+    const from = strip(c.from), to = strip(c.to)
+    if (!from || !to || from === to) continue
+    const F = escRe(from), T = escRe(to)
+    const reversedPhrase = new RegExp(`\\bfrom\\s+${T}\\s+to\\s+${F}(?![\\w.])`, 'i')
+    const reversedArrow = new RegExp(`(?<![\\w.])${T}\\s*(?:->|→|to)\\s*${F}(?![\\w.])`)
+    if (reversedPhrase.test(hayNorm) || reversedArrow.test(hayNorm)) out.push(`${c.name} (${c.from} -> ${c.to})`)
   }
   return out
 }
@@ -1176,10 +1249,17 @@ export function validateLlmOut (out, fallbackSig = 'minor', opts = {}) {
   if (ungrounded.length && opts.onUngrounded === 'throw') {
     throw new Error(`LLM output names identifiers not present in the diff or source context: ${ungrounded.slice(0, 6).join(', ')}`)
   }
+  // Direction check on the old -> new values the prompt handed over verbatim:
+  // "from 500 to 300" where the diff says 300 -> 500 passes grounding (both
+  // values are present) and is exactly the error a reader cannot spot.
+  const valueErrors = opts.structured ? reversedValueClaims(`${summary} ${evidence}`, opts.structured) : []
+  if (valueErrors.length && opts.onUngrounded === 'throw') {
+    throw new Error(`LLM output states a constant change backwards (diff says from -> to): ${valueErrors.slice(0, 3).join(', ')}`)
+  }
   // A row that still ships names the corpus cannot vouch for cannot rate
   // itself high: that self-report would sit next to its own unverified
-  // badges. One notch down, never up.
-  const confidence = ungrounded.length && rawConfidence === 'high' ? 'medium' : rawConfidence
+  // badges. One notch down, never up. Same for a backwards value.
+  const confidence = (ungrounded.length || valueErrors.length) && rawConfidence === 'high' ? 'medium' : rawConfidence
   return {
     title,
     summary,
@@ -1194,16 +1274,17 @@ export function validateLlmOut (out, fallbackSig = 'minor', opts = {}) {
     ...(confidence ? { confidence } : {}),
     ...(unknowns ? { unknowns } : {}),
     ...(changes.length ? { changes } : {}),
-    ...(ungrounded.length ? { ungrounded: ungrounded.slice(0, 12) } : {})
+    ...(ungrounded.length ? { ungrounded: ungrounded.slice(0, 12) } : {}),
+    ...(valueErrors.length ? { valueErrors: valueErrors.slice(0, 4) } : {})
   }
 }
 
 // The validator the summary pass hands callLlm: strict once (so the repair pass
 // is asked to fix the names), lenient after (so a stubborn model still yields
 // an entry, flagged). `corpus` is what the prompt showed the model.
-export function summaryValidator (fallbackSig, corpus) {
+export function summaryValidator (fallbackSig, corpus, structured = null) {
   let strictLeft = corpus ? 1 : 0
-  return (out) => validateLlmOut(out, fallbackSig, { corpus, onUngrounded: strictLeft-- > 0 ? 'throw' : 'flag' })
+  return (out) => validateLlmOut(out, fallbackSig, { corpus, structured, onUngrounded: strictLeft-- > 0 ? 'throw' : 'flag' })
 }
 
 export function isGatewayError (err) {
@@ -1601,18 +1682,25 @@ export function matchPrByPaths (e, prIndex) {
   const prs = prIndex?.prsByNum ? [...prIndex.prsByNum.values()] : []
   if (!prs.length) return null
   const mine = new Set([...(e.files?.added || []), ...(e.files?.modified || []), ...(e.files?.removed || []), ...(e.files?.tests || [])].filter(p => p && !PR_MATCH_STOPLIST_RE.test(p)))
-  if (mine.size < PR_MATCH_MIN_SHARED) return null
+  if (!mine.size) return null
   const when = Date.parse(e.date || '') || 0
   let best = null
   for (const pr of prs) {
     const paths = (pr.paths || []).filter(p => p && !PR_MATCH_STOPLIST_RE.test(p))
-    if (paths.length < PR_MATCH_MIN_SHARED) continue
+    // One shared file is normally nothing (two PRs both touch one helper), but
+    // when both sides ARE exactly that one distinctive file -- a 1-file PR
+    // landing as a 1-file snapshot -- full coverage is as identifying as three
+    // of three. So the two-file floor drops only on both-single, full-coverage
+    // matches; the stoplist has already removed generic basenames.
+    const bothSingle = paths.length === 1 && mine.size === 1
+    const minShared = bothSingle ? 1 : PR_MATCH_MIN_SHARED
+    if (paths.length < minShared) continue
     const stamp = Date.parse(pr.updated || pr.closedSeenAt || '') || 0
     if (when && stamp && Math.abs(when - stamp) > PR_MATCH_WINDOW_DAYS * 86400000) continue
     const shared = paths.filter(p => mine.has(p)).length
-    if (shared < PR_MATCH_MIN_SHARED) continue
+    if (shared < minShared) continue
     const coverage = shared / paths.length
-    if (coverage < PR_MATCH_MIN_COVERAGE) continue
+    if (coverage < (bothSingle ? 1 : PR_MATCH_MIN_COVERAGE)) continue
     // Confidence: coverage of the PR's known files, tempered by how much of the
     // snapshot the PR explains.
     const confidence = Math.round(100 * (coverage * 0.7 + (shared / mine.size) * 0.3)) / 100
@@ -1663,6 +1751,26 @@ export function sequenceForEntry (byDay, e, maxEach = 25) {
   const later = list.slice(idx + 1).slice(0, maxEach).map(item)
   if (!earlier.length && !later.length) return null
   return { earlier, later }
+}
+
+// Identifiers the prompt showed the model ONLY through the same-day sequence
+// block. A name copied faithfully from a sibling's title passes the grounding
+// check by design -- but a claim about THIS commit that leans on one of those
+// names is the sneakiest misattribution class left, so the verifier gets the
+// list and is told to demand explicit sibling attribution.
+export function sequenceOnlyNames (sequence, corpusWithoutSequence) {
+  const seqText = [...(sequence?.earlier || []), ...(sequence?.later || [])]
+    .map(s => `${s.title || ''} ${s.summary || ''}`).join(' ')
+  if (!seqText.trim()) return []
+  const rest = String(corpusWithoutSequence || '')
+  const out = []
+  const re = /`([^`\n]{2,60})`|\b([A-Z][A-Z0-9]*_[A-Z0-9_]+)\b|\b([a-z]+[A-Z][A-Za-z0-9]+|[A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]+)+)\b|\b(--?[a-z][\w-]*)\b/g
+  for (const m of seqText.matchAll(re)) {
+    const name = (m[1] || m[2] || m[3] || m[4] || '').trim()
+    if (!name || name.length < 4 || out.includes(name)) continue
+    if (!rest.includes(name)) out.push(name)
+  }
+  return out.slice(0, 12)
 }
 
 // ---------------------------------------------------------------------------
@@ -1739,7 +1847,7 @@ export function shouldVerify (e, clean, env = process.env) {
   return false
 }
 
-export function buildVerifyPrompt (entry, patch, clean) {
+export function buildVerifyPrompt (entry, patch, clean, cautionNames = []) {
   return [
     'You are checking a changelog entry against the diff it describes. Check EVERY sentence of the title, summary and evidence: for each factual claim (a file or function name, a behavior the diff implements, a motive, a performance or user-impact claim, the audience), decide whether the diff (plus the file list and notes) supports it.',
     'Be strict about facts and lenient about wording. Do not object to plain-language paraphrase of code that is present.',
@@ -1754,6 +1862,7 @@ export function buildVerifyPrompt (entry, patch, clean) {
     `Summary: ${clean.summary}`,
     clean.evidence ? `Evidence: ${clean.evidence}` : '',
     clean.audience ? `Audience: ${clean.audience}` : '',
+    ...(cautionNames.length ? ['', `Names that appear ONLY in a same-day sibling commit's title or summary (not in this diff, file list or notes): ${cautionNames.join(', ')}. A claim about THIS commit that relies on one of these names must explicitly attribute it to the sibling commit; a claim that borrows one silently is unsupported.`] : []),
     '',
     'Diff:',
     '```diff',
@@ -1774,9 +1883,9 @@ export function validateVerifyOut (out) {
   return { supported: supported && !issues.length && claims.every(c => c.supported), issues, ...(claims.length ? { claims } : {}) }
 }
 
-export async function verifySummary (entry, patch, clean, env) {
+export async function verifySummary (entry, patch, clean, env, cautionNames = []) {
   const venv = { ...env, LLM_MODEL: env.LLM_VERIFY_MODEL || env.LLM_MODEL }
-  return callLlm(buildVerifyPrompt(entry, patch, clean), venv, 1, validateVerifyOut)
+  return callLlm(buildVerifyPrompt(entry, patch, clean, cautionNames), venv, 1, validateVerifyOut)
 }
 
 // Map-reduce orchestration: one focused call per chunk (sequential, to respect
@@ -1784,16 +1893,19 @@ export async function verifySummary (entry, patch, clean, env) {
 // the final entry is grounded no matter which chunk a name came from.
 export async function summarizeChunked (e, patch, { promptCtx = {}, corpus = '', sig = 'minor', env = process.env } = {}) {
   const chunks = chunkPatchGroups(patch)
-  const drafts = []
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = budgetPatch(chunks[i], MAP_REDUCE_CHUNK_BYTES, MAP_REDUCE_CHUNK_BYTES)
-    const files = diffPaths(chunks[i])
-    const out = await callLlm(buildChunkPrompt(e, chunk, { index: i, total: chunks.length, files, structured: promptCtx.structured }), env, 1, validateChunkOut)
-    drafts.push({ index: i, files, ...out })
+  // Two map calls in flight, not one: the RPM limiter is the real bound, so
+  // wall-clock drops without another request leaving early. pool preserves
+  // ORDER (drafts[i] is chunk i), so the fusion prompt's section order still
+  // mirrors the diff.
+  const drafts = await pool(chunks.map((chunk, i) => async () => {
+    const part = budgetPatch(chunk, MAP_REDUCE_CHUNK_BYTES, MAP_REDUCE_CHUNK_BYTES)
+    const files = diffPaths(chunk)
+    const out = await callLlm(buildChunkPrompt(e, part, { index: i, total: chunks.length, files, structured: promptCtx.structured }), env, 1, validateChunkOut)
     log(`LLM chunk ${i + 1}/${chunks.length} for ${String(e.sha || '').slice(0, 8)} (${(files[0] || 'single-file').split('/').pop()}${files.length > 1 ? ` +${files.length - 1} more` : ''})`)
-  }
+    return { index: i, files, ...out }
+  }), 2)
   const fuse = buildFusePrompt(e, drafts, promptCtx, buildDiffDigest(patch))
-  const clean = await callLlm(fuse, env, 1, summaryValidator(sig, corpus))
+  const clean = await callLlm(fuse, env, 1, summaryValidator(sig, corpus, promptCtx.structured || e.structured))
   return { clean, fuse }
 }
 
@@ -1836,23 +1948,34 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     clean = reduced.clean
     repairPrompt = reduced.fuse
   } else {
-    clean = await callLlm(prompt, env, 1, summaryValidator(sig, corpus))
+    clean = await callLlm(prompt, env, 1, summaryValidator(sig, corpus, promptCtx.structured))
   }
+  // Names the model saw ONLY through the same-day sequence block: a claim
+  // leaning on one of them must attribute it to the sibling commit.
+  const cautionNames = sequenceOnlyNames(sequence, groundingCorpus(e, patch, { ...promptCtx, sequence: null }))
+  const structured = promptCtx.structured
   let verify
+  let verifyClaims
+  const objectionsTo = (verdict) => [
+    ...(verdict.issues || []).map(i => `- ${i}`),
+    ...(verdict.claims || []).filter(c => !c.supported).map(c => `- Unsupported claim: "${c.quote}"${c.reason ? ` (${c.reason})` : ''}`)
+  ]
+  const claimsOf = (verdict) => [
+    ...(verdict.issues || []).slice(0, 3).map(i => ({ claim: i })),
+    ...(verdict.claims || []).filter(c => !c.supported).slice(0, 3).map(c => ({ claim: c.quote, ...(c.reason ? { reason: c.reason } : {}) }))
+  ].slice(0, 5)
   if (shouldVerify(e, clean, env)) {
     try {
-      const verdict = await verifySummary(e, patch, clean, env)
+      const verdict = await verifySummary(e, patch, clean, env, cautionNames)
       const badClaims = (verdict.claims || []).filter(c => !c.supported)
       if (!verdict.supported && (verdict.issues.length || badClaims.length)) {
-        const objections = [
-          ...verdict.issues.map(i => `- ${i}`),
-          ...badClaims.map(c => `- Unsupported claim: "${c.quote}"${c.reason ? ` (${c.reason})` : ''}`)
-        ].join('\n')
+        const objections = objectionsTo(verdict).join('\n')
         log(`LLM verifier objected for ${e.sha.slice(0, 8)}: ${(verdict.issues[0] || badClaims[0]?.quote || '').slice(0, 100)}`)
-        const repaired = await callLlm(`${repairPrompt}\n\nA reviewer checked your previous answer against the diff and found these unsupported claims:\n${objections}\nRewrite the entry so every claim is supported by the diff. Reply with ONLY the JSON object.`, env, 1, summaryValidator(sig, corpus))
-        const recheck = await verifySummary(e, patch, repaired, env).catch(() => null)
+        const repaired = await callLlm(`${repairPrompt}\n\nA reviewer checked your previous answer against the diff and found these unsupported claims:\n${objections}\nRewrite the entry so every claim is supported by the diff. Reply with ONLY the JSON object.`, env, 1, summaryValidator(sig, corpus, structured))
+        const recheck = await verifySummary(e, patch, repaired, env, cautionNames).catch(() => null)
         clean = repaired
         verify = recheck && recheck.supported ? 'passed' : 'flagged'
+        if (verify === 'flagged') verifyClaims = claimsOf(recheck || verdict)
       } else {
         verify = 'passed'
       }
@@ -1860,8 +1983,68 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
       log(`LLM verifier unavailable for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
     }
   }
+  // Escalation: an entry that still ships ungrounded names, wrong-direction
+  // values or a flagged verdict gets ONE rewrite on the strong model before
+  // shipping dirty. A better model seeing the same prompt usually resolves
+  // what a repair loop could not; the rewrite is kept only when it is
+  // strictly cleaner. Skipped with CHANGELOG_LLM_ESCALATE=0.
+  let escalated = false
+  let outEnv = env
+  const dirt = (out, verdict) => (out.ungrounded?.length || 0) + (out.valueErrors?.length || 0) + (verdict && !verdict.supported ? 1 : 0)
+  if (baseEnv.LLM_MODEL_MAJOR && env.LLM_MODEL !== baseEnv.LLM_MODEL_MAJOR && baseEnv.CHANGELOG_LLM_ESCALATE !== '0') {
+    let current = dirt(clean, verify === 'flagged' ? { supported: false } : null)
+    if (current > 0) {
+      try {
+        const strongEnv = { ...baseEnv, LLM_MODEL: baseEnv.LLM_MODEL_MAJOR }
+        const strong = await callLlm(repairPrompt, strongEnv, 1, summaryValidator(sig, corpus, structured))
+        const recheck = await verifySummary(e, patch, strong, strongEnv, cautionNames).catch(() => null)
+        const strongDirt = dirt(strong, recheck)
+        if (strongDirt < current) {
+          log(`LLM escalated ${e.sha.slice(0, 8)} to ${baseEnv.LLM_MODEL_MAJOR}: ${current - strongDirt} fewer objections`)
+          clean = strong
+          outEnv = strongEnv
+          escalated = true
+          if (recheck) {
+            verify = recheck.supported ? 'passed' : 'flagged'
+            verifyClaims = recheck.supported ? undefined : claimsOf(recheck)
+          }
+        }
+      } catch (err) {
+        log(`LLM escalation unavailable for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
+      }
+    }
+  }
+  // Self-check: breaking-change and migration claims are the loudest text an
+  // entry can emit and the easiest to hallucinate from a renamed function. A
+  // second independent read answers only those two fields; a claim the same
+  // model cannot reproduce from the diff is demoted to unknowns. This is
+  // consistency-as-verification (one-sided): a passed probe is not proof, but
+  // a failed one reliably catches single-read fabrications.
+  let selfCheck
+  if ((clean.breaking || clean.migration) && baseEnv.CHANGELOG_LLM_SELFCHECK !== '0') {
+    try {
+      const probe = await callLlm(repairPrompt, outEnv, 1, (out) => ({
+        breaking: out?.breaking === true,
+        migration: typeof out?.migration === 'string' && out.migration.trim() ? out.migration.trim() : ''
+      }), { temperature: 0.3 })
+      const demoted = []
+      if (clean.breaking && !probe.breaking) {
+        delete clean.breaking
+        demoted.push('breaking')
+      }
+      if (clean.migration && !probe.migration) {
+        delete clean.migration
+        clean.unknowns = [clean.unknowns, 'A second read of the same diff did not confirm that a migration step is required.'].filter(Boolean).join(' ')
+        demoted.push('migration')
+      }
+      selfCheck = demoted.length ? 'demoted' : 'passed'
+      if (demoted.length) log(`LLM self-check demoted unconfirmed ${demoted.join('+')} claim for ${e.sha.slice(0, 8)}`)
+    } catch (err) {
+      log(`LLM self-check unavailable for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
+    }
+  }
   const record = {
-    model: env.LLM_MODEL || 'gpt-4o-mini',
+    model: outEnv.LLM_MODEL || 'gpt-4o-mini',
     v: PROMPT_V,
     title: clean.title,
     summary: clean.summary,
@@ -1878,7 +2061,11 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     ...(clean.changes ? { changes: clean.changes } : {}),
     ...(prMetaEff?.number ? { pr: prMetaEff.number, ...(prMetaEff.matched === 'files' ? { prMatched: 'files', prConfidence: prMetaEff.confidence } : {}) } : {}),
     ...(clean.ungrounded ? { ungrounded: clean.ungrounded } : {}),
+    ...(clean.valueErrors ? { valueErrors: clean.valueErrors } : {}),
     ...(verify ? { verify } : {}),
+    ...(verify === 'flagged' && verifyClaims?.length ? { verifyClaims } : {}),
+    ...(escalated ? { escalated: true } : {}),
+    ...(selfCheck ? { selfCheck } : {}),
     ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}),
     at: new Date().toISOString()
   }
@@ -1900,7 +2087,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   const cache = await readJson(cachePath, {})
   const rawLimit = env.CHANGELOG_LLM_LIMIT ? Number(env.CHANGELOG_LLM_LIMIT) : 60
   const limit = rawLimit > 0 ? rawLimit : Infinity
-  const concurrency = Number(env.CHANGELOG_LLM_CONCURRENCY || 2)
+  const concurrency = llmConcurrency(env)
   const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
   const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
   const priority = options.priorityShas instanceof Set ? options.priorityShas : new Set(options.priorityShas || [])
@@ -1935,7 +2122,10 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         if (r) return r
       }
     }
-    return prio(a) - prio(b) || (a.date < b.date ? 1 : -1)
+    // Deterministic order: Array.sort is stable in node, but equal-date rows
+    // (a busy day's snapshots) have equal prio AND date; sha breaks the tie so
+    // two runs summarize the same rows in the same order under a shared limit.
+    return prio(a) - prio(b) || (a.date < b.date ? 1 : a.date > b.date ? -1 : (a.sha < b.sha ? 1 : -1))
   })
 
   // A row whose AI title is the mechanical label was never really summarized:
@@ -1995,7 +2185,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       const { entry: e, patch, key, relText = '', sequence = null, prMeta = null } = queue[idx]
       try {
         const fullPatch = getFullPatch ? await getFullPatch(e).catch(() => '') : ''
-        const context = queue[idx].context || await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, fullPatch })
+        const context = queue[idx].context || (queue[idx].context = await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, fullPatch }))
         if (hasStructuredFacts(context.structured) && !hasStructuredFacts(e.structured)) e.structured = context.structured
         const { record } = await summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env })
         gatewayFails = 0
@@ -2447,7 +2637,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   // budget, without touching the pass that costs real diff tokens.
   const rawEli5Limit = env.CHANGELOG_ELI5_LIMIT || env.CHANGELOG_LLM_LIMIT
   const limit = rawEli5Limit && Number(rawEli5Limit) <= 0 ? Infinity : Number(rawEli5Limit || 20)
-  const concurrency = Number(env.CHANGELOG_ELI5_CONCURRENCY || env.CHANGELOG_LLM_CONCURRENCY || 2)
+  const concurrency = Number(env.CHANGELOG_ELI5_CONCURRENCY || 0) || llmConcurrency(env)
   const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
   const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
   const priority = options.priorityShas instanceof Set ? options.priorityShas : new Set(options.priorityShas || [])
@@ -2510,7 +2700,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     return true
   })
   if (templated) log(`ELI5 wrote ${templated} template line${templated === 1 ? '' : 's'} for test-only/docs-only rows (no API calls)`)
-  pending.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : -1))
+  pending.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : a.date > b.date ? -1 : (a.sha < b.sha ? 1 : -1)))
   // Same bound as the summary pass: choosing this run's dozen entries must not
   // mean hashing the whole backlog.
   const candidates = pending.slice(0, Number.isFinite(limit) ? Math.max(limit * 4, limit + 5) : 2000)
@@ -2553,7 +2743,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
       try {
         const patch = await eli5Patch(e, wantDiff || !e.facts?.length ? getPatch : null)
         const fullPatch = typeof options.getFullPatch === 'function' ? await options.getFullPatch(e).catch(() => '') : ''
-        const context = queue[idx].context || await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, withSource: false, fullPatch })
+        const context = queue[idx].context || (queue[idx].context = await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, withSource: false, fullPatch }))
         if (hasStructuredFacts(context.structured) && !hasStructuredFacts(e.structured)) e.structured = context.structured
         const { record } = await explainEntry({
           entry: e,
@@ -2750,6 +2940,7 @@ export async function enrichOpenPrs (prs, dataDir, env = process.env, options = 
   const getDiff = typeof options.getDiff === 'function' ? options.getDiff : async () => ''
   const archMap = options.architectureMap || FREEBUFF_ARCHITECTURE_MAP
   const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
+  const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
   let calls = 0
   let modified = false
   // Newest activity first: the PR someone is pushing to today is the one a
@@ -2761,7 +2952,9 @@ export async function enrichOpenPrs (prs, dataDir, env = process.env, options = 
     const key = prSummaryKey(pr, diff)
     const cached = cache[key]
     if (cached && !cached.error) { pr.ai = { ...cached }; continue }
-    if (cached?.error && Date.now() - (Date.parse(cached.at || '') || 0) < errorCooldownMs) continue
+    // Gateway blips come back sooner than true failures -- a preview one
+    // timeout away from working should not go dark for an hour.
+    if (cached?.error && Date.now() - (Date.parse(cached.at || '') || 0) < (cached.transient ? transientRetryMs : errorCooldownMs)) continue
     if (!diff && !pr.body && !(pr.commitsList || []).length) continue
     queue.push({ pr, diff, key })
     if (queue.length >= limit) break
@@ -2786,7 +2979,7 @@ export async function enrichOpenPrs (prs, dataDir, env = process.env, options = 
       log(`LLM previewed PR #${pr.number} (${calls}/${queue.length})`)
     } catch (err) {
       log(`LLM PR preview failed for #${pr.number}: ${shortError(err)}`)
-      cache[key] = { error: shortError(err).slice(0, 200), at: new Date().toISOString() }
+      cache[key] = { error: shortError(err).slice(0, 200), ...(isTransientError(err) ? { transient: true } : {}), at: new Date().toISOString() }
       modified = true
       if (isGatewayError(err)) break
     }

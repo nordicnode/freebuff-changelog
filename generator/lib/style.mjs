@@ -3048,6 +3048,27 @@ mark.search-match{
 /* Ensure meta-links in compact change rows align to the right */
 .crow .meta-links{margin-left:auto;font-size:.74rem}
 
+/* Back-to-top for the long pages (release windows, category lists). Hidden
+   until a reader is a screen deep; the script toggles [hidden]. */
+.to-top{position:fixed;right:18px;bottom:18px;z-index:90;background:var(--panel);color:var(--txt-dim);border:1px solid var(--term-border-strong);border-radius:3px;padding:8px 12px;font:inherit;font-size:.78rem;cursor:pointer}
+.to-top:hover{color:var(--txt);border-color:var(--term-cyan)}
+.to-top[hidden]{display:none}
+
+/* Badges that link to a browse page keep the badge look, without the underline. */
+a.badge{text-decoration:none}
+a.badge:hover{text-decoration:none;color:var(--term-cyan)}
+
+/* /subscribe/: the feed checklist and the generated OPML. */
+.sub-groups{margin-top:8px}
+.sub-group{margin-top:18px}
+.sub-group-hdr{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--term-border);padding-bottom:6px;margin-bottom:8px;font-size:.8rem;color:var(--txt-dim)}
+.sub-row{display:grid;grid-template-columns:auto 1fr auto;gap:4px 12px;align-items:baseline;padding:7px 10px;border:1px solid transparent;border-radius:3px;cursor:pointer}
+.sub-row:hover{background:var(--panel);border-color:var(--term-border)}
+.sub-title{font-size:.86rem;color:var(--txt)}
+.sub-path{font-size:.72rem;color:var(--txt-subtle);justify-self:end}
+.sub-desc{grid-column:2 / span 2;font-size:.74rem;color:var(--txt-subtle)}
+@media (max-width:640px){.sub-row{grid-template-columns:auto 1fr}.sub-path{justify-self:start;grid-column:2}.sub-desc{grid-column:2}}
+
 /* Honour the OS motion preference the same way the scripted scrolls do
    (scrollToEl checks matchMedia): smooth scroller and every hover/expand
    transition collapse to nothing for readers who asked for reduced motion. */

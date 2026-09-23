@@ -540,7 +540,6 @@ export function isBumpEntry (e) {
   // release manifest is a bump by shape. meaningful<=1 keeps mixed rows
   // (manifest riding along with real work, e.g. a4b3d0fa mean=3) out of the
   // boundary set -- they are window *content*, not its edge.
-  if (e.version || e.freebuffVersion) return false
   // NOTE: stats.additions counts the whole snapshot including lockfile churn
   // (1.0.688 itself is +47/-55), so shape comes from the file lists only.
   const mods = [...(e.files?.added || []), ...(e.files?.modified || [])]
@@ -969,6 +968,12 @@ export function extractCommentFacts (patch) {
   const contextFacts = []
   let buf = []
   let isAddedBlock = false
+  // Docs prose is not a code comment. In a .md diff a markdown bullet (`*
+  // Staff accounts only.`) and a heading (`# Guide`) match the comment markers
+  // below and were fed to the model as "comments the developers wrote beside
+  // this code" -- misattributing documentation as developer intent. Doc files
+  // contribute nothing here; their text is already in the diff itself.
+  let isDocFile = false
 
   const flush = () => {
     if (!buf.length) return
@@ -994,6 +999,12 @@ export function extractCommentFacts (patch) {
   }
 
   for (const line of patch.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      flush()
+      isDocFile = DOC_FILE_RE.test(line.split(' b/').pop() || '')
+      continue
+    }
+    if (isDocFile) continue
     const m = /^([+ -])\s*(?:\/\/|\/\*+|\*+|#(?!!))\s?(.*)$/.exec(line)
     if (!m) { flush(); continue }
     if (m[1] === '-') { flush(); continue }
@@ -1019,7 +1030,7 @@ export function extractCommentFacts (patch) {
 // were previously stripped from the prompt along with the test hunks.
 // Every item is also added to the grounding corpus and shown as a chip.
 
-export const STRUCTURED_LIMITS = { constants: 12, envVars: 12, flags: 12, exportsAdded: 16, exportsRemoved: 16, testNames: 14 }
+export const STRUCTURED_LIMITS = { constants: 12, constantsIntroduced: 8, envVars: 12, flags: 12, exportsAdded: 16, exportsRemoved: 16, testNames: 14 }
 
 const CONST_LINE_RE = /^([+-])\s*(?:export\s+)?(?:const|let|var)\s+([A-Z][A-Z0-9_]{2,})(?:\s*:\s*[^=]+)?\s*=\s*(.+?)\s*;?\s*$/
 const ENV_RE = /process\.env\.([A-Z][A-Z0-9_]{2,})|env\(['"`]([A-Z][A-Z0-9_]{2,})['"`]\)|\benv\.([A-Z][A-Z0-9_]{2,})\b/g
@@ -1046,7 +1057,7 @@ const DOC_FILE_RE = /\.(?:mdx?|txt|rst)$/i
 const SUBPROCESS_LINE_RE = /\b(?:git|spawn(?:Sync)?|exec(?:Sync|File|FileSync)?|execa|run|\$)\s*\(|\[\s*['"`](?:git|npm|bun|npx|pnpm|yarn|docker|node)['"`]/
 
 export function extractStructuredFacts (patch) {
-  const out = { constants: [], envVars: [], flags: [], exportsAdded: [], exportsRemoved: [], testNames: [] }
+  const out = { constants: [], constantsIntroduced: [], envVars: [], flags: [], exportsAdded: [], exportsRemoved: [], testNames: [] }
   if (!patch) return out
   const removedConst = new Map()
   const addedConst = new Map()
@@ -1095,6 +1106,11 @@ export function extractStructuredFacts (patch) {
   for (const [name, to] of addedConst) {
     const from = removedConst.get(name)
     if (from != null && from !== to) out.constants.push({ name, from, to })
+    // A brand-new CONSTANT_CASE definition is the other checkable half of
+    // "describe only what literal value changed": the prompt previously only
+    // received old -> new pairs, so a newly defined limit arrived with no
+    // literal attached and the model free-associated one.
+    else if (from == null) out.constantsIntroduced.push({ name, to })
   }
   // Reads that exist on the removed side too are moved code, not new inputs.
   out.envVars = [...envSeen].filter(n => !envBefore.has(n))
@@ -1133,8 +1149,17 @@ export async function pruneKnownInputs (repoDir, base, structured, { maxChecks =
     for (const item of list) if (!(await knownAt(item))) keep.push(item)
     return keep
   }
+  const pruneNamed = async (list) => {
+    const keep = []
+    for (const item of list) if (!(await knownAt(item?.name || item))) keep.push(item)
+    return keep
+  }
   return {
     ...structured,
+    // A "new" constant whose name already exists at the base rev is moved code
+    // too. Value-changed pairs are never pruned: those names are old by
+    // definition and the grep would eat every real change.
+    constantsIntroduced: await pruneNamed(structured.constantsIntroduced || []),
     envVars: await prune(structured.envVars || []),
     flags: await prune(structured.flags || []),
     testNames: await prune(structured.testNames || [])
@@ -1146,6 +1171,7 @@ export function formatStructuredFacts (s) {
   if (!hasStructuredFacts(s)) return []
   const lines = ['Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):']
   if (s.constants.length) lines.push(`- Constants whose value changed: ${s.constants.map(c => `${c.name}: ${c.from} -> ${c.to}`).join(' ; ')}`)
+  if (s.constantsIntroduced?.length) lines.push(`- Constants newly defined: ${s.constantsIntroduced.map(c => `${c.name} = ${c.to}`).join(' ; ')} (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)`)
   if (s.envVars.length) lines.push(`- Environment variables newly read: ${s.envVars.join(', ')}`)
   if (s.flags.length) lines.push(`- Command-line flags newly introduced: ${s.flags.join(', ')}`)
   if (s.exportsAdded.length) lines.push(`- Exports added: ${s.exportsAdded.join(', ')}`)
@@ -1159,6 +1185,7 @@ export function structuredFactsText (s) {
   if (!hasStructuredFacts(s)) return ''
   return [
     ...s.constants.flatMap(c => [c.name, c.from, c.to]),
+    ...(s.constantsIntroduced || []).flatMap(c => [c.name, c.to]),
     ...s.envVars, ...s.flags, ...s.exportsAdded, ...s.exportsRemoved, ...s.testNames
   ].join('\n')
 }

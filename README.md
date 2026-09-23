@@ -28,6 +28,7 @@ node generator/cli.mjs prune-cache [--push]                     # drop ai-summar
 node generator/cli.mjs glossary [--discover]                    # plain-English term definitions injected into prompts
 node generator/cli.mjs freshness                                # CI gate: fail if data/changelog.json is older than the site's own [stale] threshold
 node generator/cli.mjs eval --seed 40 && node generator/cli.mjs eval   # summary-quality evaluation (LLM judge on by default, --no-judge opts out)
+node generator/cli.mjs override <sha>                             # print a ready-to-edit correction draft; add --title/--summary/--eli5/... to write it, --clear to drop it
 ```
 
 ## How It Works
@@ -56,17 +57,21 @@ node generator/cli.mjs eval --seed 40 && node generator/cli.mjs eval   # summary
 
 - **Prompt versions**: `PROMPT_V` / `ELI5_V` / `RELEASE_ROLLUP_V` in `generator/lib/llm.mjs`. Bumping one re-summarizes affected rows once. Rows on an older prompt are left alone by the hourly sync; `enrich-all --rewrite-stale` refreshes them, heaviest first.
 - **Anti-marketing**: release roll-ups and single rows are rejected (and repaired) when they contain hype ("smarter", "faster", "seamless", "together, these changes make...").
-- **Second-model verifier** (on by default): `LLM_VERIFY_MODEL` checks per-claim support for major/notable, multi-topic and ungrounded rows (`CHANGELOG_LLM_VERIFY=all` checks every row, `0` disables); one repair, then the row is stored with `verify: passed|flagged`.
-- **Human overrides**: `data/overrides.json` (`{ "<sha or 12-char prefix>": { "title", "summary", "eli5", "significance", "evidence", "audience", "note" } }`) is applied at build time on every surface and survives re-summarization. Overridden rows show an `[EDITED]` badge.
+- **Second-model verifier** (on by default): `LLM_VERIFY_MODEL` checks per-claim support for major/notable, multi-topic and ungrounded rows (`CHANGELOG_LLM_VERIFY=all` checks every row, `0` disables); one repair, then the row is stored with `verify: passed|flagged`, with the outstanding objections kept as `verifyClaims` (a reader can see which sentence a reviewer flagged). Names the prompt showed only through a same-day sibling's title are handed to the verifier as attribution cautions, so a claim that silently borrows a sibling's motive is an objection, not a paraphrase. Constant changes are direction-checked deterministically (`from -> to` stated backwards is a `valueErrors` repair), and a row that still ships dirty gets one rewrite on `LLM_MODEL_MAJOR` before it goes out (`CHANGELOG_LLM_ESCALATE=0` disables).
+- **Breaking-claim self-check**: `breaking` and `migration` claims are the loudest text an entry can emit, so a second independent read answers only those two fields; a claim the same model cannot reproduce from the same diff is demoted to `unknowns` (`CHANGELOG_LLM_SELFCHECK=0` disables). Consistency is one-sided evidence: a passed probe is not proof, but a failed one reliably catches single-read fabrications.
+- **Human overrides**: `data/overrides.json` (`{ "<sha or 12-char prefix>": { "title", "summary", "eli5", "significance", "evidence", "audience", "note" } }`) is applied at build time on every surface and survives re-summarization. `override <sha>` authors one: run it bare for a draft pre-filled with the current rendered values, then with `--title`/`--summary`/... to write, `--clear` to drop. Overridden rows show an `[EDITED]` badge.
 - **/stats/ quality panel**: prompt-version coverage, evidence coverage, unverified identifiers, hype and preamble counts, audience split. Recomputed every build.
 - **Deterministic weight**: a bump-only row is now `notable` (was `major`); `major` is reserved for model catalog changes and bumps that also ship code. Every weight carries a `significanceReason` shown in the badge tooltip. Stored rows keep their old weight until `repair-entries` is run once.
 
 ## Site & Feeds
 
-- **Timeline**: Daily changelog views (`/day/YYYY-MM-DD/`), releases (`/release/1.0.NNN/`), model tracker (`/models/`), and live metrics (`/stats/`).
-- **Feeds**: `/feed.xml` (all changes), `/feed-major.xml` (major only), `/feed-models.xml`, `/feed-releases.xml`, `/feed-security.xml` (trust, checksums, credentials, privacy), `/feed-weekly.xml` (one item a week), `/feed-<category>.xml` (e.g. `/feed-cli.xml`, `/feed-sdk.xml`), `/feed.json` (JSON Feed 1.1).
+- **Timeline**: Daily changelog views (`/day/YYYY-MM-DD/`), releases (`/release/1.0.NNN/`), model tracker (`/models/`), and live metrics (`/stats/`). The front-page filter narrows by area, impact and audience; `/search/` filters by category, impact range ("notable + major" is inclusive), audience and releases. Badge tags link to the complete `/changes/<slice>/` list behind them.
+- **Feeds**: `/feed.xml` (all changes), `/feed-major.xml` (major only), `/feed-models.xml`, `/feed-releases.xml`, `/feed-security.xml` (trust, checksums, credentials, privacy), `/feed-weekly.xml` (one item a week), `/feed-<category>.xml` (e.g. `/feed-cli.xml`, `/feed-sdk.xml`), `/feed-audience-<audience>.xml` (who the change is for), `/feed.json` (JSON Feed 1.1). Every feed the site writes is bundled in `/feeds.opml`, and `/subscribe/` is "everything I care about": check what you follow and take the selection as a personal OPML (or copy the feed URLs).
+- **API**: `/api/entry/<sha>[.json]` serves one entry's machine-readable record (title, summary, plain English, significance, audience, files, stats, release it shipped in, links), `/api/entries.json` the newest 60, `/api/days.json` the day index, `/api/status.json` the build stamp. Records are sharded per day under `api/records/` and sliced by `worker.js` (or `npm run preview` locally), because per-entry files would blow the Workers asset cap.
+- **Date ranges**: `/from/<date>/to/<date>/` renders every change between two dates on one shareable page (assembled client-side from the day cards); `/range/` is the pick-the-dates front door.
+- **Release notes as markdown**: every release page carries `notes.md` (plain GitHub-release markdown) and `?format=md` serves it as `text/markdown` for tools and feeds.
 - **Weekly digests**: `/week/YYYY-Www/` lists a week's releases, model catalog moves, security-relevant rows and the heaviest work, with one-click Discord copy. Deterministic, no LLM.
-- **Shipped in**: every card names the first release (per version track) that carried the commit, derived from the bump rows at build time.
+- **Shipped in**: every card names the first release (per version track) that carried the commit, derived from the bump rows at build time. Model pages say **first shipped in** which release introduced the model, and link its **lineage**: the family's generation chain (`DeepSeek V4 Pro 07/31 -> DeepSeek V4 Pro -> ...`, grouped deterministically from the catalog names, with `/models/lineage/<family>/` pages listing every generation).
 - **Evidence**: each AI summary has a collapsed *Evidence* block citing the diff, plus any identifiers the grounding check could not verify. Evidence and file paths are searchable on `/search/`.
 - **In-flight previews**: open PRs on `/in-flight/` carry an AI preview ("what it proposes") written from the description and the stored diff preview, a few per run (`CHANGELOG_PR_LLM_LIMIT`). Merged PRs are remembered in `data/merged-prs.json` so the sync commit that lands them still gets its PR context.
 - **Discord**: Every entry includes one-click Discord markdown copy (≤ 2,000 chars). Feeds support MonitoRSS and webhooks natively.
@@ -98,6 +103,9 @@ Set via environment variables:
 | `CHANGELOG_ISSUES_URL` | this repo's `issues/new` | Base URL for the per-card report link |
 | `CHANGELOG_PR_LLM` | `1` | AI previews for open PRs (`0` disables) |
 | `CHANGELOG_PR_LLM_LIMIT` | `5` | Open-PR previews per run |
+| `CHANGELOG_LLM_ESCALATE` | `1` | One rewrite of a still-dirty entry on `LLM_MODEL_MAJOR` before it ships (`0` disables) |
+| `CHANGELOG_LLM_SELFCHECK` | `1` | Second read demotes unconfirmed `breaking`/`migration` claims (`0` disables) |
+| `CHANGELOG_LLM_CONCURRENCY` | `2` | Summaries in flight (the RPM limiter stays the real bound; up to 6) |
 | `CHANGELOG_DIST_SKIP_CHURN_DIFFS` | `0` | `1` leaves lockfile-only diffs out of `dist/` (cards fall back to the GitHub link) |
 | `CHANGELOG_DIST_DIFF_MONTHS` | all | Ship only the last N months of stored diffs to `dist/` |
 | `SITE_URL` | — | Base URL for RSS and sitemaps |
@@ -105,8 +113,9 @@ Set via environment variables:
 
 ## Deployment
 
-Deploy `dist/` to **Cloudflare Workers** (static assets, no server code: badges are pre-rendered SVGs) **without Cloudflare-side builds**:
+Deploy `dist/` to **Cloudflare Workers** (static assets plus one thin route script: badges are pre-rendered SVGs) **without Cloudflare-side builds**:
 
+- `worker.js` (wired through `main` in `wrangler.json`, `run_worker_first`) answers only the routes a static file cannot vary per request -- `/api/entry/<sha>.json` and `/release/<v>/?format=md` -- and falls through to the asset server (which still applies `_redirects`/`_headers`) for everything else. `npm run preview` serves the same routes locally through the shared `dynamicRoute()` handler in `generator/cli.mjs`, so preview and deploy cannot drift.
 - Cloudflare dashboard: Workers & Pages -> `freebuff-changelog` -> Settings -> Builds -> disconnect git / disable automatic builds. The daemon pushes data every few minutes and every push would otherwise bill a Workers Build.
 - `.github/workflows/deploy.yml` builds `dist/` on GitHub Actions (free for this public repo) and uploads it with `wrangler deploy`, a direct asset upload that consumes zero build minutes. Needs repo secret `CLOUDFLARE_API_TOKEN` (Workers Scripts: Edit) and variable `CLOUDFLARE_ACCOUNT_ID`. Without the token the workflow still smoke-checks the build and skips the upload. It rebuilds on every push to `data/`, so those pushes must be made with a token that can start workflows: GitHub never starts a run for a push made with the default `GITHUB_TOKEN`, and `changelog-sync.yml` therefore pushes with `CHANGELOG_GITHUB_TOKEN` (Contents: write) after verifying it can write, falling back to the 30-minute schedule otherwise. Do not add a second `workflow_run` trigger for the sync: it fires on every completed cycle, and the shared `cancel-in-progress` concurrency would cancel the in-flight push deploy each time.
 - Continuous updates run entirely on GitHub Actions: `.github/workflows/changelog-sync.yml` is a self-perpetuating relay that polls upstream every 30s in ~12-minute cycles, pushes `data/`, and dispatches the next run. `npm run backfill --push` runs the identical loop locally, but nothing depends on it. The relay dispatch runs on `if: always()`: a failed cycle is exactly when a retry is needed, and gating the next run on the last one's success turned one bad cycle into a silent outage down to the watchdog's 10-minute cadence.

@@ -4,10 +4,10 @@
 import { writeText, writeBinary } from './util.mjs'
 import { escapeHtml as esc, fmtDateHuman, pool, shortHash } from './util.mjs'
 import { CSS } from './style.mjs'
-import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg } from './feed.mjs'
+import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg, feedsOpml } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
 import { buildStoryIndex, dayStories, dayStoryLead } from './story.mjs'
-import { computeShippedIn, isSecurityEntry, PROMPT_V, ELI5_V, AUDIENCE_DESC } from './llm.mjs'
+import { computeShippedIn, isSecurityEntry, PROMPT_V, ELI5_V, AUDIENCE_DESC, AUDIENCES } from './llm.mjs'
 import { buildWeeklyDigests, weeklyFeedItem, weeklyHeadline, weekLabel, weeklyText, summaryQuality } from './digest.mjs'
 
 const SITE = {
@@ -95,6 +95,7 @@ ${ld ? `<script type="application/ld+json">${ldScript(ld)}</script>` : ''}
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (models only)" href="${SITE.url}/feed-models.xml">
 <link rel="alternate" type="application/rss+xml" title="${SITE.name} (releases only)" href="${SITE.url}/feed-releases.xml">
 <link rel="alternate" type="application/feed+json" title="${SITE.name} (JSON)" href="${SITE.url}/feed.json">
+<link rel="outline" type="text/x-opml" title="${SITE.name} (all feeds, OPML)" href="${SITE.url}/feeds.opml">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="apple-touch-icon" href="/icon-192.png">
@@ -124,6 +125,8 @@ ${body}
     <div class="footer-desc">freebuff-changes <span class="term-sep">::</span> unofficial public snapshot mirror reconstructed from <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a></div>
     <div class="footer-links">
       <a href="/about/">[about]</a>
+      <a href="/range/">[date ranges]</a>
+      <a href="/api/entries.json">[api]</a>
       <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">[github]</a>
     </div>
   </div>
@@ -134,6 +137,7 @@ ${body}
       <a href="/feed-weekly.xml">[weekly rss]</a>
       <a href="/feed-models.xml">[models rss]</a>
       <a href="/feed-releases.xml">[releases rss]</a>
+      <a href="/subscribe/">[subscribe to all]</a>
     </div>
     <div class="footer-traffic">
       <span class="footer-label">traffic:</span>
@@ -152,6 +156,7 @@ ${body}
     </div>
   </div>
 </footer>
+<button id="to-top" class="to-top" type="button" hidden aria-label="Back to top">[^ top]</button>
 <div id="kb-modal" class="kb-modal" role="dialog" aria-modal="true" aria-labelledby="kb-title" hidden onclick="if(event.target===this)setKbModal(false)">
   <div class="kb-dialog">
     <div class="kb-header">
@@ -236,6 +241,23 @@ updateSyncAge();
     bar.style.width = pct + '%';
   }
   window.addEventListener('scroll', onScroll, { passive: true });
+  onScroll();
+})();
+
+// A way home on the long pages (release windows, category lists): appears
+// past one screen, scrolls with the shared motion preference.
+(function setupToTop () {
+  var btn = document.getElementById('to-top');
+  if (!btn) return;
+  function onScroll () {
+    var show = window.scrollY > 600;
+    if (btn.hidden === show) btn.hidden = !show;
+  }
+  window.addEventListener('scroll', onScroll, { passive: true });
+  btn.addEventListener('click', function () {
+    try { window.scrollTo({ top: 0, behavior: REDUCE_MOTION ? 'auto' : 'smooth' }); }
+    catch (_) { window.scrollTo(0, 0); }
+  });
   onScroll();
 })();
 
@@ -872,17 +894,22 @@ function badges (e) {
     ? `AI weighted this ${e.ai.significance}; deterministic rule said ${e.significance}${e.significanceReason ? ` (${e.significanceReason})` : ''}`
     : (e.significanceReason || '')
   const tip = why ? ` title="${esc(why)}"` : ''
-  if (e.significance === 'major') b.push(`<span class="badge maj"${tip}>[MAJOR]</span>`)
-  else if (e.significance === 'notable') b.push(`<span class="badge not"${tip}>[NOTABLE]</span>`)
-  if (e.modelChanges) b.push('<span class="badge model">[MODEL]</span>')
+  // A badge that names a browsable slice links to that slice: the impact and
+  // category badges used to be inert text while /changes/<slug>/ held exactly
+  // the list a reader clicking them wants. Each row's own significance/category
+  // page exists by construction (the row is in it).
+  const stop = ' onclick="event.stopPropagation()"'
+  if (e.significance === 'major') b.push(`<a class="badge maj" href="/changes/major/"${stop}${tip}>[MAJOR]</a>`)
+  else if (e.significance === 'notable') b.push(`<a class="badge not" href="/changes/notable/"${stop}${tip}>[NOTABLE]</a>`)
+  if (e.modelChanges) b.push(`<a class="badge model" href="/models/"${stop}>[MODEL]</a>`)
   if (isSecurityEntry(e)) b.push('<span class="badge sec" title="Security-relevant: trust gates, credentials, checksums, permissions or sandboxing">[SECURITY]</span>')
   if (e.ai?.breaking) b.push('<span class="badge brk" title="The technical pass marked this as changing existing behavior, config, an API or a command">[BREAKING]</span>')
   if (e.ai?.confidence === 'low') b.push('<span class="badge lowc" title="The model rated its own confidence low: the diff is truncated, the consumer of a change is not visible, or the motive is guessed">[LOW CONFIDENCE]</span>')
-  if (e.ai?.audience && AUDIENCE_DESC[e.ai.audience]) b.push(`<span class="badge aud" title="Who this change is for: ${esc(AUDIENCE_DESC[e.ai.audience])}">[${esc(e.ai.audience.toUpperCase())}]</span>`)
+  if (e.ai?.audience && AUDIENCE_DESC[e.ai.audience]) b.push(`<a class="badge aud" href="/subscribe/#aud-${esc(e.ai.audience)}"${stop} title="Who this change is for: ${esc(AUDIENCE_DESC[e.ai.audience])} · subscribe to this audience">[${esc(e.ai.audience.toUpperCase())}]</a>`)
   if (e.overridden) b.push('<span class="badge human" title="This entry was corrected by a human editor (data/overrides.json)">[EDITED]</span>')
-  if (e.version) b.push(`<a class="badge ver" href="/release/${e.version}/" onclick="event.stopPropagation()">[v${e.version}]</a>`)
+  if (e.version) b.push(`<a class="badge ver" href="/release/${e.version}/"${stop}>[v${e.version}]</a>`)
   if (e.kind === 'community' && e.pr) b.push(`<span class="badge">[PR #${e.pr}]</span>`)
-  b.push(`<span class="badge cat">[${esc(e.category)}]</span>`)
+  b.push(`<a class="badge cat" href="/changes/${esc(categorySlug(e.category))}/"${stop}>[${esc(e.category)}]</a>`)
   return b.join('')
 }
 
@@ -969,8 +996,12 @@ function fileChips (e) {
 </details>`
 }
 
-// Related entries: same category, newest first, excluding self. Precomputed
-// per build into a lookup so cards render without scanning 7k entries.
+// Related entries: same category, nearest first, excluding self. Precomputed
+// per build into a lookup so cards render without scanning 10k entries.
+// "Nearest" by position in the timeline, not "newest": the old slice(0, n)
+// took the category's newest rows regardless of where the row sat, so a 2024
+// entry's RELATED line pointed at 2026. Each row now gets its closest
+// neighbours, alternating both sides so "related" reads as before-and-after.
 export function buildRelatedIndex (entries, n = 3) {
   const byCat = new Map()
   for (const e of entries) {
@@ -978,8 +1009,15 @@ export function buildRelatedIndex (entries, n = 3) {
     byCat.get(e.category).push(e)
   }
   const idx = new Map()
-  for (const e of entries) {
-    idx.set(e.sha, (byCat.get(e.category) || []).filter(x => x.sha !== e.sha).slice(0, n))
+  for (const list of byCat.values()) {
+    for (let i = 0; i < list.length; i++) {
+      const near = []
+      for (let d = 1; near.length < n && d < list.length; d++) {
+        if (i - d >= 0) near.push(list[i - d])
+        if (near.length < n && i + d < list.length) near.push(list[i + d])
+      }
+      idx.set(list[i].sha, near)
+    }
   }
   return idx
 }
@@ -1095,7 +1133,7 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
   // data-cat / data-sig / data-churn are what the front-page filter toggles: every
   // row the index renders is a row the reader can narrow by area or impact, with no
   // second request.
-  return `<details class="entry ${e.significance}" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(e.significance || '')}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
+  return `<details class="entry ${e.significance}" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(e.significance || '')}" data-aud="${esc(e.ai?.audience || '')}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
 <summary class="entry-summary">
   <div class="entry-meta-top">
     <span class="entry-arrow">&gt;</span>
@@ -1322,15 +1360,16 @@ function shippedInHtml (e, shipped) {
 }
 
 // Discord's markdown is a small dialect: **bold**, ### headings, > quotes, `- `
-// lists and ``` fenced blocks. No tables, and no alignment outside a code block --
-// which is why the figures go into a fenced block: monospace columns are the only
-// tidy table Discord has, and inside one nothing needs escaping at all.
+// lists and ``` fenced blocks. No tables, and no alignment outside a code block.
+// It also does not hard-wrap, so one long paragraph arrives as an unreadable wall.
 //
-// It also does not hard-wrap, so a four-sentence summary arrives as one unreadable
-// wall. Hence the layout: header, headline, the plain-English line as a quote, the
-// summary one sentence per line, model changes, highlights, and an aligned details
-// block. No links of any kind -- the commit is identified by its SHA, and the
-// message has to stand on its own wherever it lands.
+// The message is deliberately minimal: a `### title` header with the date, an
+// optional related-context quote block, and one plain-English paragraph (the
+// plain-English line, falling back to the summary). Earlier revisions also sent
+// per-sentence summary lines, a model-change list and a fenced details block;
+// the broadcast tests pin this shape, because an announcement has to read as
+// one message wherever it lands. No links of any kind -- the commit is
+// identified by its SHA, and the message stands on its own.
 const DC_LIMIT = 2000
 
 // Zero-width space. Invisible in the paste, fatal to Discord's URL matcher, so a
@@ -1386,12 +1425,6 @@ function dcEsc (s) {
   }).join('')
 }
 
-// Sentence boundaries, so each can go on its own line. The lookahead keeps a
-// decimal (`+1.5`) and an initial (`v1. e.g.`) from splitting mid-thought.
-function dcSentences (text) {
-  return String(text).split(/(?<=[.!?])\s+(?=[A-Z(`_$\d])/).map(s => s.trim()).filter(Boolean)
-}
-
 export function discordText (e, opts = {}) {
   const title = e.ai?.title || e.title || deriveTitleSafe(e)
   const dateStr = fmtDateHuman(e.day || e.date)
@@ -1422,7 +1455,10 @@ export function scoreHit (title, cat, sig, day, words, eli5 = '', extra = '') {
   const t = title.toLowerCase(), c = cat.toLowerCase(), el = (eli5 || '').toLowerCase(), ex = (extra || '').toLowerCase()
   let s = 0
   for (const w of words) {
-    if (t.includes(w)) s += w.length > 4 ? 3 : 2
+    // Weights mirror the client matcher in the /search/ page exactly (title
+    // 4/3 by length, plain-English 2, category/extra 1): the two used to drift,
+    // so a row could rank differently here than in the browser.
+    if (t.includes(w)) s += w.length > 4 ? 4 : 3
     else if (el.includes(w)) s += 2
     else if (c.includes(w)) s += 1
     // File paths and the evidence citation: what a developer searches by.
@@ -1432,6 +1468,15 @@ export function scoreHit (title, cat, sig, day, words, eli5 = '', extra = '') {
   if (sig === 'major') s += 2
   else if (sig === 'notable') s += 1
   return s
+}
+
+// Impact filtering is a minimum, not an equality: the "notable + major" filter
+// used to be `a !== sig`, so choosing it silently dropped every major row. The
+// client matcher mirrors this rank rule.
+export const IMPACT_RANK = { minor: 0, notable: 1, major: 2 }
+export function impactAllows (rowSig, filterSig) {
+  if (!filterSig) return true
+  return (IMPACT_RANK[rowSig] ?? 0) >= (IMPACT_RANK[filterSig] ?? 0)
 }
 
 /**
@@ -1514,6 +1559,23 @@ export function generateReleaseNotesMarkdown (rel, commits = []) {
   return lines.join('\n')
 }
 
+// Catalog names follow "<line> <version>[ <variant>][ MM/DD]": "DeepSeek V4
+// Pro 07/31", "DeepSeek V4 Pro" and "DeepSeek V4 Flash" are three generations
+// of one line. Stripping the trailing date, variant and version tokens gives
+// the family key used for the lineage chain. Deterministic and best-effort
+// (no model writes it), and every member is shown, so a wrong grouping is
+// visible and fixable rather than hidden.
+const MODEL_TRAILER_WORDS = /^(flash|pro|mini|plus|lite|thinking|nano|micro|ultra|max|luna|chat|instruct)$/i
+export function modelFamily (name) {
+  const tokens = String(name || '').trim().split(/\s+/).filter(Boolean)
+  while (tokens.length > 1) {
+    const last = tokens[tokens.length - 1]
+    if (/^\d{2}\/\d{2}$/.test(last) || /^(?:v)?\d+(?:\.\d+)*$/i.test(last) || MODEL_TRAILER_WORDS.test(last)) tokens.pop()
+    else break
+  }
+  return tokens.join(' ') || String(name || '').trim()
+}
+
 export function modelSlug (name) {
   const base = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'model'
   return base
@@ -1553,6 +1615,196 @@ export function formatCommentHtml (text) {
 }
 
 async function write (dist, p, html) { await writeText(`${dist.replace(/\/$/, '')}/${p}`, html) }
+
+// The machine-readable record behind /api/entry/<sha>.json: what the cards
+// show, minus HTML. Written sharded by day (api/records/<day>.json) so one
+// entry can be served without 10k per-entry files (the Workers asset cap) or a
+// multi-megabyte monolith.
+export function entryRecord (e, shipped = null) {
+  const hit = (shipped && typeof shipped.get === 'function' ? shipped.get(e.sha) : null) || null
+  return {
+    sha: e.sha,
+    short: e.sha.slice(0, 12),
+    day: e.day,
+    date: e.date,
+    title: e.ai?.title || e.title || '',
+    ...((e.ai?.summary || e.summary) ? { summary: e.ai?.summary || e.summary } : {}),
+    ...(e.eli5?.text ? { plainEnglish: e.eli5.text } : {}),
+    ...(e.ai?.evidence ? { evidence: e.ai.evidence } : {}),
+    significance: e.significance || 'minor',
+    ...(e.ai?.audience ? { audience: e.ai.audience } : {}),
+    category: e.category,
+    kind: e.kind || 'sync',
+    noise: !!e.noise,
+    ...(e.ai?.breaking ? { breaking: true } : {}),
+    ...(e.ai?.migration ? { migration: e.ai.migration } : {}),
+    ...(e.ai?.confidence ? { confidence: e.ai.confidence } : {}),
+    ...(e.ai?.unknowns ? { unknowns: e.ai.unknowns } : {}),
+    ...(e.ai?.changes?.length ? { changes: e.ai.changes } : {}),
+    ...(e.ai?.ungrounded?.length ? { unverifiedNames: e.ai.ungrounded } : {}),
+    ...(e.version ? { version: e.version } : {}),
+    ...(e.freebuffVersion ? { freebuffVersion: e.freebuffVersion } : {}),
+    ...(e.pr ? { pr: e.pr, ...(e.prUrl ? { prUrl: e.prUrl } : {}) } : {}),
+    ...(hit ? { shippedIn: Object.fromEntries(Object.entries(hit).map(([track, v]) => [track, v.version])) } : {}),
+    ...(e.overridden ? { overridden: true } : {}),
+    stats: e.stats,
+    files: e.files,
+    urls: {
+      site: `${SITE.url}/day/${e.day}/#${e.sha.slice(0, 12)}`,
+      permalink: `${SITE.url}/c/${e.sha.slice(0, 12)}`,
+      commit: `https://github.com/CodebuffAI/freebuff/commit/${e.sha}`
+    }
+  }
+}
+
+// /subscribe/: every feed the site writes, in one checkable list. The OPML is
+// assembled in the browser from the checked rows (and feeds.opml always has
+// all of them), because "everything I care about" is a per-reader list.
+function subscribePage (feedCatalog) {
+  const groups = [
+    ['core', 'CORE FEEDS'],
+    ['areas', 'BY AREA'],
+    ['audiences', 'BY AUDIENCE']
+  ]
+  const rows = (g) => feedCatalog.filter(f => f.group === g).map(f => {
+    const aud = f.group === 'audiences' ? ` id="aud-${esc(f.path.replace('/feed-audience-', '').replace('.xml', ''))}"` : ''
+    return `<label class="sub-row"${aud}><input type="checkbox" class="sub-check" data-path="${esc(f.path)}" data-title="${esc(f.title)}" data-desc="${esc(f.desc || '')}" checked>
+  <span class="sub-title">${esc(f.title.replace(`${SITE.name}: `, ''))}</span>
+  <code class="sub-path">${esc(f.path)}</code>
+  <span class="sub-desc">${esc(f.desc || '')}</span></label>`
+  }).join('')
+  const groupHtml = groups.map(([g, label]) => {
+    const n = feedCatalog.filter(f => f.group === g).length
+    if (!n) return ''
+    return `<div class="sub-group"><div class="sub-group-hdr"><span>${label} (${n})</span><span><button type="button" class="theme-btn" data-sub-group="${g}" data-sub-on="1">[all]</button> <button type="button" class="theme-btn" data-sub-group="${g}" data-sub-on="0">[none]</button></span></div>${rows(g)}</div>`
+  }).join('')
+  return `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">SUBSCRIBE :: everything I care about</span><span id="sub-count">${feedCatalog.length} feeds selected</span></div>
+<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Check what you follow, then take the selection as an OPML bundle into any feed reader &mdash; or grab the full bundle (<a href="/feeds.opml">[feeds.opml]</a>, ${feedCatalog.length} feeds). Every feed carries the newest 26&ndash;60 items; nothing is ever deleted from the source history.</p>
+</div></section>
+<div class="sub-groups">${groupHtml}</div>
+<div class="term-box" style="margin-top:18px">
+  <div class="term-box-hdr"><span class="term-box-title">YOUR OPML</span>
+    <span><button type="button" class="theme-btn" id="sub-download">[download .opml]</button> <button type="button" class="theme-btn" id="sub-copy">[copy feed urls]</button></span>
+  </div>
+  <textarea id="sub-opml" readonly spellcheck="false" style="width:100%;min-height:180px;background:var(--bg);color:var(--txt);border:1px solid var(--border);font-size:.74rem;padding:10px"></textarea>
+</div>
+<script>
+(function () {
+  var checks = [].slice.call(document.querySelectorAll('.sub-check'));
+  if (!checks.length) return;
+  var KEY = 'fbSubs';
+  var esc = function (s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;').replace(/>/g, '&gt;'); };
+  function selected () { return checks.filter(function (c) { return c.checked; }); }
+  function render () {
+    var sel = selected();
+    var items = sel.map(function (c) {
+      return '    <outline type="rss" text="' + esc(c.dataset.title) + '" title="' + esc(c.dataset.title) + '" xmlUrl="' + esc(location.origin + c.dataset.path) + '" htmlUrl="' + esc(location.origin + '/') + '" description="' + esc(c.dataset.desc) + '"/>';
+    }).join('\n');
+    var doc = '<?xml version="1.0" encoding="UTF-8"?>\n<opml version="2.0">\n  <head><title>Unofficial Freebuff Changelog</title></head>\n  <body>\n    <outline text="freebuff-changes" title="freebuff-changes">\n' + items + '\n    </outline>\n  </body>\n</opml>\n';
+    document.getElementById('sub-opml').value = doc;
+    document.getElementById('sub-count').textContent = sel.length + ' of ' + checks.length + ' feeds selected';
+    try { localStorage.setItem(KEY, JSON.stringify(sel.map(function (c) { return c.dataset.path; }))); } catch (e) {}
+  }
+  try {
+    var keep = JSON.parse(localStorage.getItem(KEY) || 'null');
+    if (keep && keep.length !== undefined) checks.forEach(function (c) { c.checked = keep.indexOf(c.dataset.path) !== -1; });
+  } catch (e) {}
+  checks.forEach(function (c) { c.addEventListener('change', render); });
+  document.querySelectorAll('[data-sub-group]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var g = btn.getAttribute('data-sub-group'), on = btn.getAttribute('data-sub-on') === '1';
+      checks.forEach(function (c) {
+        if (c.closest('.sub-group') === btn.closest('.sub-group')) c.checked = on;
+      });
+      render();
+    });
+  });
+  document.getElementById('sub-download').addEventListener('click', function () {
+    var blob = new Blob([document.getElementById('sub-opml').value], { type: 'text/x-opml' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'freebuff-changes.opml';
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+  });
+  document.getElementById('sub-copy').addEventListener('click', function () {
+    var btn = this;
+    navigator.clipboard.writeText(selected().map(function (c) { return location.origin + c.dataset.path; }).join('\n')).then(function () {
+      btn.textContent = '[copied]';
+      setTimeout(function () { btn.textContent = '[copy feed urls]'; }, 2500);
+    });
+  });
+  render();
+})();
+</script>`
+}
+
+// The client-side range renderer, shipped as /range.js and included by the
+// /from/<d>/to/<d>/ shell (and by 404.html for hosts without _redirects).
+// It assembles entry cards out of /entry-frags/<day>.json -- the same markup
+// the day pages ship, so there is still one renderer on the site.
+const RANGE_JS = `(function () {
+  var m = /^\\/from\\/(\\d{4}-\\d{2}-\\d{2})\\/to\\/(\\d{4}-\\d{2}-\\d{2})\\/?$/.exec(location.pathname);
+  if (!m) return;
+  var from = m[1], to = m[2], swapped = false;
+  if (from > to) { var x = from; from = to; to = x; swapped = true; }
+  var hdr = document.getElementById('range-hdr');
+  var status = document.getElementById('range-status');
+  var countEl = document.getElementById('range-count');
+  var slot = document.getElementById('range-days');
+  if (!slot) return;
+  function say(msg) { if (status) status.innerHTML = msg; }
+  if (hdr) hdr.textContent = 'RANGE :: ' + from + ' -> ' + to;
+  document.title = 'Changes ' + from + ' to ' + to + ' \\u00b7 Unofficial Freebuff Changelog';
+  if (swapped) say('Dates were given newest-first and were swapped. <a href="/range/">[pick another range]</a>');
+  fetch('/api/days.json').then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(function (days) {
+    var want = days.filter(function (d) { return d[0] >= from && d[0] <= to && d[1] > 0; });
+    if (!want.length) { say('No entries recorded between ' + from + ' and ' + to + '. <a href="/range/">[pick another range]</a>'); return; }
+    var CAP = 400;
+    var used = want.slice(0, CAP);
+    var total = used.reduce(function (n, d) { return n + d[1]; }, 0);
+    if (countEl) countEl.textContent = total + ' changes \\u00b7 ' + used.length + ' days';
+    if (!status || true) {
+      say((want.length > CAP ? 'Showing the newest ' + CAP + ' of ' + want.length + ' days in range. ' : '') + 'Assembled client-side from the day pages. <a href="/range/">[pick another range]</a>');
+    }
+    var queue = used.slice();
+    var out = document.createDocumentFragment();
+    function next () {
+      if (!queue.length) return;
+      var d = queue.shift();
+      return fetch('/entry-frags/' + d[0] + '.json').then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      }).then(function (rows) {
+        var sec = document.createElement('section');
+        sec.className = 'day';
+        sec.id = d[0];
+        var head = document.createElement('div');
+        head.className = 'day-line';
+        head.innerHTML = '<h2><time datetime="' + d[0] + '">[ ' + d[2] + ' ]</time></h2><span class="day-count">' + d[1] + ' change' + (d[1] === 1 ? '' : 's') + '</span>';
+        sec.appendChild(head);
+        rows.forEach(function (row) {
+          var doc = new DOMParser().parseFromString('<!doctype html><html><body>' + row[1], 'text/html');
+          var card = doc.body.firstElementChild;
+          if (card) sec.appendChild(document.importNode(card, true));
+        });
+        out.appendChild(sec);
+        return next();
+      });
+    }
+    // Sequential fetches: entry-frags files are small, and a burst of 400
+    // requests from one tab is rude to the edge cache.
+    next().then(function () { slot.appendChild(out); }).catch(function (err) {
+      say('Could not load the range (' + err.message + '). <a href="/archive/">[ archive ]</a>');
+    });
+  }).catch(function (err) {
+    say('Could not load the day index (' + err.message + '). <a href="/archive/">[ archive ]</a>');
+  });
+})();
+`
 
 export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, overridesDoc = null }) {
   const trafficCount = traffic?.count ?? 0
@@ -1595,6 +1847,13 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
     if (e.noise) continue
     if (!catLists.has(e.category)) catLists.set(e.category, [])
     catLists.get(e.category).push(e)
+  }
+  // All-time audience counts, so the page-scoped audience options can say
+  // "12 here, 41 all-time" the way the category options do.
+  const audTotals = new Map()
+  for (const e of meaningful) {
+    const a = e.ai?.audience
+    if (a && AUDIENCE_DESC[a]) audTotals.set(a, (audTotals.get(a) || 0) + 1)
   }
   const churnList = entries.filter(e => e.noise)
   const browseList = [...catLists.entries()].map(([label, list]) => ({ label, slug: categorySlug(label), list, churn: false }))
@@ -1695,6 +1954,16 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
     const sigList = IMPACT_LEVELS
       .filter(([sig]) => sigCounts.get(sig))
       .map(([sig, label]) => ({ slug: sig, label, n: sigCounts.get(sig) }))
+    // Audience is the third axis: who the change is for. Same page-scoped
+    // counts as areas and impact; the value is namespaced (`aud:`) so the
+    // script can tell it from a category slug.
+    const audCounts = new Map()
+    for (const e of rows) {
+      const a = e.ai?.audience
+      if (e.noise || !a || !AUDIENCE_DESC[a]) continue
+      audCounts.set(a, (audCounts.get(a) || 0) + 1)
+    }
+    const audList = [...audCounts.entries()].sort((a, b) => b[1] - a[1]).map(([slug, n]) => ({ slug, label: slug, n, total: audTotals.get(slug) || 0 }))
 
     const topPager = `<div class="pager pager-timeline pager-timeline-top">
     <div class="timeline-nav-group">
@@ -1725,7 +1994,8 @@ ${[
       `      <optgroup label="by area">`,
       ...chipList.map(c => optHtml(c.slug, c.label, c.n)),
       `      </optgroup>`,
-      ...(sigList.length ? [`      <optgroup label="by impact">`, ...sigList.map(c => optHtml(c.slug, c.label, c.n)), `      </optgroup>`] : [])
+      ...(sigList.length ? [`      <optgroup label="by impact">`, ...sigList.map(c => optHtml(c.slug, c.label, c.n)), `      </optgroup>`] : []),
+      ...(audList.length ? [`      <optgroup label="by audience">`, ...audList.map(a => `      <option value="aud:${esc(a.slug)}" data-label="${esc(a.label)}" data-total="${a.total}" data-href="/search/?aud=${encodeURIComponent(a.slug)}">${esc(a.label)} (${a.n})</option>`), `      </optgroup>`] : [])
     ].join('\n')}
       </select>
       <button type="button" class="chip chip-churn" id="churn-toggle" data-total="${churnTotal}" data-href="/changes/churn/" aria-pressed="false">churn<span class="chip-n">${churn.toLocaleString()}</span></button>
@@ -1810,6 +2080,7 @@ ${rows.map(e => {
       if (r.hasAttribute('data-churn')) want = state.churn;
       else if (f === '*') want = true;
       else if (SIG[f]) want = r.getAttribute('data-sig') === f;
+      else if (f.indexOf('aud:') === 0) want = r.getAttribute('data-aud') === f.slice(4);
       else want = r.getAttribute('data-cat') === f;
       r.hidden = !want;
     });
@@ -1943,11 +2214,15 @@ ${rows.map(e => {
       (nextRel ? `<a href="/release/${nextRel.version}/" rel="next">v${esc(nextRel.version)} &rarr;</a>` : '<span class="pager-disabled">&rarr;</span>') +
       `</div>`
     const relNotesMd = generateReleaseNotesMarkdown(rel, mineSorted)
+    // The markdown is a real file too: `?format=md` on the page URL serves it
+    // with a text/markdown content type (worker.js / preview), and anything
+    // that just wants the notes can fetch notes.md directly.
+    await write(dist, `release/${rel.version}/notes.md`, relNotesMd)
     await write(dist, `release/${rel.version}/index.html`, layout({
       title: `Release ${rel.version}`, path: `/release/${rel.version}/`,
       desc: `Freebuff v${rel.version}: ${mine.length} changes since the previous release.`,
       ld: releaseLd(rel),
-      body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(rel.version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Freebuff v${esc(rel.version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p><div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button type="button" class="btn-copy-relnotes" onclick="navigator.clipboard.writeText(document.getElementById('relnotes-md').value).then(()=>{const b=this;b.textContent='[copied: paste into GitHub release]';setTimeout(()=>b.textContent='[copy release notes]',3000)})">[copy release notes]</button><textarea id="relnotes-md" hidden style="display:none">${esc(relNotesMd)}</textarea></div></div></section>` +
+      body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(rel.version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Freebuff v${esc(rel.version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p><div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button type="button" class="btn-copy-relnotes" onclick="navigator.clipboard.writeText(document.getElementById('relnotes-md').value).then(()=>{const b=this;b.textContent='[copied: paste into GitHub release]';setTimeout(()=>b.textContent='[copy release notes]',3000)})">[copy release notes]</button><a class="meta-link" href="/release/${esc(rel.version)}/notes.md" title="Release notes as plain markdown">[notes.md]</a><a class="meta-link" href="?format=md" title="Same notes served as text/markdown for tools and feeds">[?format=md]</a><textarea id="relnotes-md" hidden style="display:none">${esc(relNotesMd)}</textarea></div></div></section>` +
         relPager +
         `<section class="day">${[rel, ...relHead].map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx, cardOpts(e))).join('\n')}${relTailRows}</section>` +
         relPager +
@@ -1977,6 +2252,29 @@ ${rows.map(e => {
   // Replay model history chronologically to compute exact lineups at every transition
   const sortedModelEntries = [...modelEntries].sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0)
   const allModels = [...new Set([...modelLive, ...modelRetired])].sort()
+  // First catalog sighting of every model name (added or removed), for the
+  // lineage chains: generations of a family are ordered by when each appeared.
+  const firstAddDay = new Map()
+  for (const e of [...sortedModelEntries].reverse()) {
+    for (const m of (e.modelChanges?.added || [])) if (!firstAddDay.has(m)) firstAddDay.set(m, e.day)
+    for (const m of (e.modelChanges?.removed || [])) if (!firstAddDay.has(m)) firstAddDay.set(m, e.day)
+  }
+  // One lineage chain per family (see modelFamily): a deterministic,
+  // best-effort grouping with every member shown, so a wrong grouping is
+  // visible rather than hidden. Families of one are omitted as noise.
+  const familyOf = new Map()
+  for (const m of allModels) {
+    const fam = modelFamily(m)
+    if (!familyOf.has(fam)) familyOf.set(fam, [])
+    familyOf.get(fam).push(m)
+  }
+  const familyOrder = (ms) => [...ms].sort((a, b) => {
+    const da = firstAddDay.get(a) || '', db = firstAddDay.get(b) || ''
+    return da < db ? -1 : da > db ? 1 : (a < b ? -1 : 1)
+  })
+  const lineageChainHtml = (fam, current = null) => familyOrder(familyOf.get(fam) || []).map(m =>
+    m === current ? `<b>${esc(m)}</b>` : `<a href="/models/${modelSlug(m)}/">${esc(m)}</a>`
+  ).join(' <span class="swap-arrow">&rarr;</span> ')
   const dateSnapshots = []
   const currentLineup = new Set()
   for (const e of sortedModelEntries) {
@@ -2161,6 +2459,10 @@ ${rows.map(e => {
     ${matrixRows}
   </div>
 </section>
+${([...familyOf.entries()].filter(([, ms]) => ms.length > 1).length) ? `<details class="more-rows">
+  <summary>[ View lineage: ${[...familyOf.entries()].filter(([, ms]) => ms.length > 1).length} model families ]</summary>
+  <div class="model-history">${[...familyOf.entries()].filter(([, ms]) => ms.length > 1).map(([fam]) => `<div class="model-row"><span class="model-row-title"><a href="/models/lineage/${esc(categorySlug(fam))}/">${esc(fam)}</a></span><span class="model-row-change">${lineageChainHtml(fam)}</span></div>`).join('')}</div>
+</details>` : ''}
 <details class="more-rows">
   <summary>[ View chronological transition stream (${modelChrono.length} changes) ]</summary>
   <div class="section-hdr" style="margin-top:12px">
@@ -2277,6 +2579,20 @@ ${rows.map(e => {
     const status = liveSet.has(name) ? 'LIVE' : 'RETIRED'
     const firstSeen = events[events.length - 1].e.day
     const lastSeen = events[0].e.day
+    // FIRST SHIPPED IN: the release window that first carried the commit that
+    // added this model (computeShippedIn walks the bumps in hand).
+    const addEvent = [...events].reverse().find(x => x.kind === 'added')
+    const shipHit = addEvent ? shipped.get(addEvent.e.sha) : null
+    const shipParts = []
+    if (shipHit?.['codebuff-cli']) shipParts.push(`<a href="/release/${esc(shipHit['codebuff-cli'].version)}/">CLI ${esc(shipHit['codebuff-cli'].version)}</a>`)
+    if (shipHit?.['freebuff-cli']) shipParts.push(`Freebuff CLI ${esc(shipHit['freebuff-cli'].version)}`)
+    const firstShippedHtml = `<p class="shipped-in"><span class="shipped-lbl">FIRST SHIPPED IN</span> ${shipParts.length ? shipParts.join(' <span class="model-sep">&middot;</span> ') : `landed ${esc(firstSeen)} (no release window in this data)`}</p>`
+    // LINEAGE: this model's place in its family's generation chain.
+    const fam = modelFamily(name)
+    const kin = familyOf.get(fam) || []
+    const lineageHtml = kin.length > 1
+      ? `<p class="shipped-in"><span class="shipped-lbl">LINEAGE</span> ${lineageChainHtml(fam, name)} <a class="meta-link" href="/models/lineage/${esc(categorySlug(fam))}/">[family page]</a></p>`
+      : ''
     const rows = events.map(({ e, kind }) => {
       const row = e.modelChanges?.tables?.[name]
       const cells = row ? (row.after || row.before) : null
@@ -2289,8 +2605,33 @@ ${rows.map(e => {
       title: name, path: `/models/${slug}/`,
       desc: `${name} is ${status.toLowerCase()} in the Freebuff free picker: ${events.length} catalog events, ${firstSeen} to ${lastSeen}.`,
       body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">MODEL :: ${esc(name)}</span><span class="${status === 'LIVE' ? 'modelplus' : 'modelminus'}">[${status}]</span></div>`
-        + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">${events.length} catalog event${events.length === 1 ? '' : 's'} &middot; ${esc(firstSeen)} &rarr; ${esc(lastSeen)} &middot; <a href="/models/">[all models]</a></p></div></section>`
+        + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">${events.length} catalog event${events.length === 1 ? '' : 's'} &middot; ${esc(firstSeen)} &rarr; ${esc(lastSeen)} &middot; <a href="/models/">[all models]</a></p>`
+        + firstShippedHtml + lineageHtml + `</div></section>`
         + `<div class="section-hdr"><h2>HISTORY (${events.length})</h2></div><div class="model-history">${rows}</div>`
+    }))
+  }), 8)
+
+  // ----- model lineage pages: one per family with more than one generation,
+  // the chain in first-seen order, each member with its first sighting and
+  // first shipped release. The grouping heuristic is modelFamily(); every
+  // member is listed on the page, so a misgrouping is one look away from a fix.
+  await pool([...familyOf.entries()].filter(([, ms]) => ms.length > 1).map(([fam, ms]) => async () => {
+    const chain = lineageChainHtml(fam)
+    const rows = familyOrder(ms).map(m => {
+      const evs = byModel.get(m) || []
+      const addEvent2 = [...evs].reverse().find(x => x.kind === 'added')
+      const hit = addEvent2 ? shipped.get(addEvent2.e.sha) : null
+      const firstRel = hit?.['codebuff-cli']?.version || hit?.['freebuff-cli']?.version || ''
+      return `<div class="model-row"><span class="model-row-date">${esc(firstAddDay.get(m) || '')}</span>`
+        + `<span class="model-row-title"><a href="/models/${modelSlug(m)}/">${esc(m)}</a>${liveSet.has(m) ? ' <span class="model-status-tag live">LIVE</span>' : ' <span class="model-status-tag retired">RETIRED</span>'}</span>`
+        + `<span class="model-row-change">${firstRel ? `first shipped in <a href="/release/${esc(firstRel)}/">v${esc(firstRel)}</a>` : ''}</span></div>`
+    }).join('')
+    await write(dist, `models/lineage/${categorySlug(fam)}/index.html`, layout({
+      title: `${fam} lineage`, path: `/models/lineage/${categorySlug(fam)}/`,
+      desc: `Every ${fam} generation in the Freebuff free picker, oldest first: ${ms.join(', ')}.`,
+      body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">LINEAGE :: ${esc(fam)}</span><span>${ms.length} generations</span></div>`
+        + `<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">${chain} &middot; <a href="/models/">[all models]</a></p></div></section>`
+        + `<div class="section-hdr"><h2>GENERATIONS (${ms.length})</h2></div><div class="model-history">${rows}</div>`
     }))
   }), 8)
 
@@ -2341,7 +2682,11 @@ ${d.entries.map(changeRow).join('\n')}
     const pagerFor = (pi) => {
       const newer = pi > 0 ? months[pi - 1] : null
       const older = pi + 1 < months.length ? months[pi + 1] : null
-      return `<div class="pager">${newer ? `<a href="${pageHref(newer)}" rel="prev">&larr; ${esc(monthNameOf(newer))}</a>` : '<span></span>'}<span class="pager-page">${esc(monthNameOf(months[pi]))} &middot; month ${pi + 1} of ${months.length}</span>${older ? `<a href="${pageHref(older)}" rel="next">${esc(monthNameOf(older))} &rarr;</a>` : '<span></span>'}</div>
+      // rel="prev" is the OLDER page and rel="next" the newer one, on every
+      // pager on the site (day, week, release, month, in-flight): the keyboard
+      // shortcuts p/n follow these rels, and this family used to map them the
+      // other way round, so p went backwards here and forwards everywhere else.
+      return `<div class="pager">${older ? `<a href="${pageHref(older)}" rel="prev">&larr; ${esc(monthNameOf(older))}</a>` : '<span></span>'}<span class="pager-page">${esc(monthNameOf(months[pi]))} &middot; month ${pi + 1} of ${months.length}</span>${newer ? `<a href="${pageHref(newer)}" rel="next">${esc(monthNameOf(newer))} &rarr;</a>` : '<span></span>'}</div>
 <a href="/archive/#categories">[ all categories ]</a>`
     }
     for (let pi = 0; pi < months.length; pi++) {
@@ -2908,28 +3253,35 @@ ${weekTabsScript}`
   // c/s/a as small ints keep the 7k-entry payload lean for Workers egress.
   const SEARCH_CATS = [...new Set(entries.filter(e => !e.noise).map(e => e.category))].sort()
   const SEARCH_SIGS = ['minor', 'notable', 'major']
+  // Fixed-width rows (9 fields), one schema for every entry: the old shape
+  // made eli5/extra optional slots, so an entry with evidence but no
+  // plain-English line shifted fields. Filters ride along in the same ints:
+  // e[5] audience code, e[6] flags (bit 1 = version/release bump).
   const idxJson = entries.filter(e => !e.noise).map(e => {
-    const row = [
+    let flags = 0
+    if (e.version || e.freebuffVersion) flags |= 1
+    return [
       e.day,
       (e.ai?.title || e.title || deriveTitleSafe(e)).slice(0, 90),
       SEARCH_CATS.indexOf(e.category),
       e.sha.slice(0, 12),
-      SEARCH_SIGS.indexOf(e.significance)
+      SEARCH_SIGS.indexOf(e.significance),
+      AUDIENCES.indexOf(e.ai?.audience || ''),
+      flags,
+      (e.eli5?.text || '').slice(0, 160),
+      // Search-only text (never rendered): touched paths, the technical
+      // summary, the evidence citation and the version strings. A phrase that
+      // appears only in the summary -- the densest text a row owns -- used to
+      // be unsearchable, and "1.4.2" missed every release row.
+      [...(e.files?.added || []), ...(e.files?.modified || []), (e.ai?.summary || '').slice(0, 240), e.ai?.evidence || '', e.version || '', e.freebuffVersion || ''].filter(Boolean).join(' ').slice(0, 520)
     ]
-    if (e.eli5?.text) row.push(e.eli5.text.slice(0, 160))
-    // e[6]: search-only text (never rendered): touched paths, the technical
-    // summary and the evidence citation. A phrase that appears only in the
-    // summary -- the densest text a row owns -- used to be unsearchable.
-    const extra = [...(e.files?.added || []), ...(e.files?.modified || []), (e.ai?.summary || '').slice(0, 240), e.ai?.evidence || ''].filter(Boolean).join(' ').slice(0, 520)
-    if (extra) { if (row.length < 6) row.push(''); row.push(extra) }
-    return row
   })
   // The payload ships as one file today (multi-MB once summaries land). The
   // search page caches it in IndexedDB keyed by this content hash, so a repeat
   // visit on the same build skips the fetch and the main-thread parse; a
   // rebuild changes the hash baked into the (no-cache revalidated) page, which
   // invalidates the cache -- no TTL directives anywhere.
-  const ixText = JSON.stringify({ cats: SEARCH_CATS, sigs: SEARCH_SIGS, ix: idxJson })
+  const ixText = JSON.stringify({ cats: SEARCH_CATS, sigs: SEARCH_SIGS, auds: AUDIENCES, ix: idxJson })
   await write(dist, 'search-index.json', ixText)
   await write(dist, 'search/index.html', layout({
     title: 'Search', path: '/search/',
@@ -2945,15 +3297,15 @@ ${weekTabsScript}`
       <span class="search-hint">[press / to focus]</span>
     </div>
     <div class="filter-chips">
-      <span class="filter-lbl">FLAGS:</span>
-      <button class="filter-chip active" data-filter="">--all</button>
-      <button class="filter-chip" data-filter="model">--models</button>
-      <button class="filter-chip" data-filter="major">--major</button>
-      <button class="filter-chip" data-filter="release">--releases</button>
-      <button class="filter-chip" data-filter="CLI">--cli</button>
-      <button class="filter-chip" data-filter="prompt">--prompt</button>
-      <button class="filter-chip" data-filter="command">--commands</button>
-      <button class="filter-chip" data-filter="desktop">--desktop</button>
+      <span class="filter-lbl" title="Quick searches: each chip sets the matching filter below (or the query where no filter exists)">QUICK:</span>
+      <button class="filter-chip active" data-filter="" title="Clear every filter and the query">--all</button>
+      <button class="filter-chip" data-cat="Model Catalog" title="Category filter: model catalog changes">--models</button>
+      <button class="filter-chip" data-sig="major" title="Impact filter: major only">--major</button>
+      <button class="filter-chip" data-flags="1" title="Release filter: version bumps">--releases</button>
+      <button class="filter-chip" data-cat="CLI" title="Category filter: CLI">--cli</button>
+      <button class="filter-chip" data-cat="Commands" title="Category filter: commands">--commands</button>
+      <button class="filter-chip" data-q="prompt" title="Quick query: prompt work">--prompt</button>
+      <button class="filter-chip" data-q="desktop" title="Quick query: desktop app">--desktop</button>
     </div>
     <div class="filter-row">
       <label class="filter-sel-lbl">CATEGORY:
@@ -2969,6 +3321,14 @@ ${weekTabsScript}`
           <option value="notable">notable + major</option>
         </select>
       </label>
+      <label class="filter-sel-lbl">AUDIENCE:
+        <select id="faud">
+          <option value="">--any audience</option>
+          ${AUDIENCES.map(a => `<option value="${esc(a)}">${esc(a)}</option>`).join('')}
+          <option value="unset">--not yet classified</option>
+        </select>
+      </label>
+      <label class="filter-sel-lbl"><input type="checkbox" id="frel"> releases only</label>
       <span id="match-count" role="status" aria-live="polite" style="font-size:.76rem;color:var(--txt-subtle);margin-left:auto;align-self:center"></span>
     </div>
   </div>
@@ -3001,20 +3361,23 @@ const loadIndex = async () => {
     const rec = await ixGet(await ixOpen());
     if (rec && rec.v === IX_V) return rec;
   } catch (_) {}
-  const r = await fetch('/search-index.json');
-  const { cats, sigs, ix } = await r.json();
-  try {
-    const db = await ixOpen();
-    db.transaction('ix', 'readwrite').objectStore('ix').put({ v: IX_V, cats, sigs, ix }, 'current');
-  } catch (_) {}
-  return { cats, sigs, ix };
-};
-loadIndex().then(({ cats, sigs, ix })=>{
+  const r = await fetch('/search-index.json');    const { cats, sigs, auds, ix } = await r.json();
+    try {
+      const db = await ixOpen();
+      db.transaction('ix', 'readwrite').objectStore('ix').put({ v: IX_V, cats, sigs, auds, ix }, 'current');
+    } catch (_) {}
+    return { cats, sigs, auds, ix };
+  };
+  loadIndex().then(({ cats, sigs, auds, ix })=>{
   let t;
   let selectedHitIdx = -1;
   const q = document.getElementById('q'), h = document.getElementById('hits'), cnt = document.getElementById('match-count');
   const chips = document.querySelectorAll('.filter-chip');
   const fcat = document.getElementById('fcat'), fsig = document.getElementById('fsig');
+  const faud = document.getElementById('faud'), frel = document.getElementById('frel');
+  // IMPACT is a minimum, not an equality: "notable + major" keeps the major
+  // rows. Mirrors impactAllows() in site.mjs (pinned by unit tests).
+  const SRANK = { minor: 0, notable: 1, major: 2 };
   const esc = s => String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
 
   const highlight = (title, words) => {
@@ -3076,15 +3439,18 @@ loadIndex().then(({ cats, sigs, ix })=>{
     selectedHitIdx = -1;
     const v = q.value.trim().toLowerCase();
     const cat = fcat ? fcat.value : '', sig = fsig ? fsig.value : '';
+    const aud = faud ? faud.value : '', relOnly = !!(frel && frel.checked);
     const w = v.split(/\\s+/).filter(Boolean);
-    if (!w.length && !cat && !sig) { h.innerHTML = ''; cnt.textContent = ''; return; }
+    if (!w.length && !cat && !sig && !aud && !relOnly) { h.innerHTML = ''; cnt.textContent = ''; return; }
     const scored = [];
     for (const e of ix) {
-      const c = cats[e[2]] || '', a = sigs[e[4]] || '';
+      const c = cats[e[2]] || '', a = sigs[e[4]] || '', au = (typeof e[5] === 'number' && e[5] >= 0) ? (auds[e[5]] || '') : '';
       if (cat && c !== cat) continue;
-      if (sig && a !== sig) continue;
+      if (sig && (SRANK[a] || 0) < (SRANK[sig] || 0)) continue;
+      if (aud === 'unset') { if (au) continue; } else if (aud && au !== aud) continue;
+      if (relOnly && !(e[6] & 1)) continue;
       if (!w.length) { scored.push([0, e[0], e]); continue; }
-      const t = e[1].toLowerCase(), cl = c.toLowerCase(), el = (e[5] || '').toLowerCase(), ex = (e[6] || '').toLowerCase();
+      const t = e[1].toLowerCase(), cl = c.toLowerCase(), el = (e[7] || '').toLowerCase(), ex = (e[8] || '').toLowerCase();
       let s = 0, ok = true;
       for (const x of w) {
         if (t.includes(x)) s += x.length > 4 ? 4 : 3;
@@ -3103,13 +3469,15 @@ loadIndex().then(({ cats, sigs, ix })=>{
     cnt.textContent = hits.length ? ('MATCHES: ' + hits.length + (hits.length === 200 ? '+ (capped at 200)' : '')) : 'MATCHES: 0';
     h.innerHTML = hits.map(e => {
       const u = '/day/' + e[0] + '/#' + e[3];
-      const a = sigs[e[4]] || '', c = cats[e[2]] || '';
+      const a = sigs[e[4]] || '', c = cats[e[2]] || '', au = (typeof e[5] === 'number' && e[5] >= 0) ? (auds[e[5]] || '') : '';
       const sigTag = a === 'major' ? '<span class="badge maj">[MAJOR]</span>' : (a === 'notable' ? '<span class="badge not">[NOTABLE]</span>' : '');
-      const eli5Snippet = e[5] ? '<p class="search-eli5"><span class="search-eli5-lbl">PLAIN ENGLISH:</span> ' + highlight(e[5], w) + '</p>' : '';
+      const audTag = au ? '<span class="badge aud" title="Who this change is for">[' + esc(au.toUpperCase()) + ']</span>' : '';
+      const relTag = (e[6] & 1) ? '<span class="badge ver">[RELEASE]</span>' : '';
+      const eli5Snippet = e[7] ? '<p class="search-eli5"><span class="search-eli5-lbl">PLAIN ENGLISH:</span> ' + highlight(e[7], w) + '</p>' : '';
       return '<article class="entry ' + a + '"><div class="entry-meta-top">' +
         '<span class="commit-ref">commit ' + esc(e[3]) + '</span>' +
         '<span class="entry-utc">' + esc(e[0]) + '</span>' +
-        '<div class="badges"><span class="badge cat">[' + esc(c) + ']</span>' + sigTag + '</div>' +
+        '<div class="badges"><span class="badge cat">[' + esc(c) + ']</span>' + sigTag + audTag + relTag + '</div>' +
         '</div>' +
         '<h3><a href="' + u + '">' + highlight(e[1], w) + '</a></h3>' +
         eli5Snippet +
@@ -3122,33 +3490,49 @@ loadIndex().then(({ cats, sigs, ix })=>{
     clearTimeout(t);
     t = setTimeout(go, 90);
   });
-  if (fcat) fcat.addEventListener('change', go);
-  if (fsig) fsig.addEventListener('change', go);
+  if (fcat) fcat.addEventListener('change', function () { syncChips(); go(); });
+  if (fsig) fsig.addEventListener('change', function () { syncChips(); go(); });
+  if (faud) faud.addEventListener('change', function () { syncChips(); go(); });
+  if (frel) frel.addEventListener('change', function () { syncChips(); go(); });
 
+  // A chip is a preset, not a text hack: it sets the matching control (the
+  // query only where no control exists, e.g. --prompt). --major used to stuff
+  // the word "major" into the query box and return near-nothing.
   chips.forEach(chip => {
     chip.addEventListener('click', () => {
-      chips.forEach(c => c.classList.remove('active'));
-      chip.classList.add('active');
-      q.value = chip.dataset.filter || '';
+      q.value = chip.dataset.q || chip.dataset.filter || '';
+      if (fcat) fcat.value = chip.dataset.cat || '';
+      if (fsig) fsig.value = chip.dataset.sig || '';
+      if (faud) faud.value = chip.dataset.aud || '';
+      if (frel) frel.checked = chip.dataset.flags === '1';
+      syncChips();
       go();
     });
   });
 
   const params = new URLSearchParams(window.location.search);
   const initialQ = params.get('q') || (window.location.hash.startsWith('#q=') ? decodeURIComponent(window.location.hash.slice(3)) : '');
-  const initialCat = params.get('cat') || '', initialSig = params.get('sig') || '';
+  const initialCat = params.get('cat') || '', initialSig = params.get('sig') || '', initialAud = params.get('aud') || '';
   if (fcat && initialCat && [...fcat.options].some(o => o.value === initialCat)) fcat.value = initialCat;
   if (fsig && initialSig && [...fsig.options].some(o => o.value === initialSig)) fsig.value = initialSig;
+  if (faud && initialAud && [...faud.options].some(o => o.value === initialAud)) faud.value = initialAud;
+  if (frel && params.get('releases') === '1') frel.checked = true;
   if (initialQ) q.value = initialQ;
-  // A chip is active when its term is the whole current query, and --all is
-  // active when there is no query. Deep links used to strip every chip of its
-  // active state, leaving the flag row lying about what is on screen.
+  // A chip is active when the controls hold exactly its preset, and --all when
+  // nothing is set. Deep links used to strip every chip of its active state,
+  // leaving the quick row lying about what is on screen.
+  const clear = () => !q.value.trim() && !(fcat && fcat.value) && !(fsig && fsig.value) && !(faud && faud.value) && !(frel && frel.checked);
   const syncChips = () => chips.forEach(c => {
-    const f = c.dataset.filter || '';
-    c.classList.toggle('active', f ? q.value.trim().toLowerCase() === f.toLowerCase() : !q.value.trim());
+    const bare = !q.value.trim() && !(faud && faud.value);
+    const on = c.dataset.cat ? (fcat && fcat.value === c.dataset.cat && bare && !fsig.value && !(frel && frel.checked))
+      : c.dataset.sig ? (fsig && fsig.value === c.dataset.sig && bare && !fcat.value && !(frel && frel.checked))
+      : c.dataset.flags ? (frel && frel.checked && bare && !fcat.value && !fsig.value)
+      : c.dataset.q ? (q.value.trim().toLowerCase() === c.dataset.q.toLowerCase() && !(fcat && fcat.value) && !fsig.value && !(frel && frel.checked) && !(faud && faud.value))
+      : clear();
+    c.classList.toggle('active', !!on);
   });
   syncChips();
-  if (initialQ || initialCat || initialSig) go();
+  if (initialQ || initialCat || initialSig || initialAud || (frel && frel.checked)) go();
 });
 </script>`
   }))
@@ -3174,6 +3558,58 @@ loadIndex().then(({ cats, sigs, ix })=>{
   const AREA_NOTE_MAX = 4
   const areaLine = areaCats.slice(0, AREA_NOTE_MAX).map(([c, n]) => `${esc(c)} ${n.toLocaleString()}`).join(' &middot; ') +
     (areaCats.length > AREA_NOTE_MAX ? ` &middot; <a href="/archive/#categories">+${areaCats.length - AREA_NOTE_MAX} more</a>` : '')
+  // ----- per-day machine records behind /api/entry/<sha>.json. Sharded by day
+  // (one file per day, not per entry) because 10k per-entry files would blow
+  // the Workers asset cap; worker.js and `preview` slice one record out.
+  await pool(byDay.map(d => async () => {
+    await write(dist, `api/records/${d.day}.json`, JSON.stringify({
+      day: d.day,
+      generatedAt: generated,
+      records: d.entries.map(e => entryRecord(e, shipped))
+    }))
+  }), 16)
+
+  // ----- day-range view: /from/<date>/to/<date>/ is rewritten to this shell
+  // (see _redirects) and rendered from /entry-frags/ by range.js in the
+  // browser. /range/ is the pick-the-dates front door.
+  // Named `range-view`, not `range`: the /range/ picker owns that directory,
+  // and an extensionless file cannot share a path with a directory.
+  await write(dist, 'range-view', layout({
+    title: 'Date range', path: '/from/', noindex: true,
+    desc: 'Every Freebuff change between two dates.',
+    body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title" id="range-hdr">RANGE :: resolving&hellip;</span><span id="range-count"></span></div>
+<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)" id="range-status">Loading the entries between these dates&hellip; <a href="/range/">[pick another range]</a></p>
+<noscript><p style="margin:8px 0 0;font-size:.8rem">Range pages need JavaScript to assemble. <a href="/archive/">[ archive ]</a> and <a href="/search/">[ search ]</a> work without it.</p></noscript>
+</div></section>
+<div id="range-days"></div><script src="/range.js"></script>`
+  }))
+  await write(dist, 'range/index.html', layout({
+    title: 'Date range', path: '/range/',
+    desc: 'Pick two dates and read every Freebuff change between them.',
+    body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RANGE :: /from/&lt;date&gt;/to/&lt;date&gt;/</span></div>
+<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Every change between two dates on one page &mdash; shareable, no account, no query strings. <a href="/archive/">[full archive]</a></p>
+<div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+  <label style="font-size:.78rem">FROM <input type="date" id="range-from" min="${esc(byDay.at(-1)?.day || '')}" max="${esc(byDay[0]?.day || '')}" value="${esc(byDay[Math.min(byDay.length - 1, 6)]?.day || '')}"></label>
+  <label style="font-size:.78rem">TO <input type="date" id="range-to" min="${esc(byDay.at(-1)?.day || '')}" max="${esc(byDay[0]?.day || '')}" value="${esc(byDay[0]?.day || '')}"></label>
+  <button type="button" class="btn-copy-relnotes" id="range-go">[go]</button>
+  <span style="font-size:.72rem;color:var(--txt-subtle)">${byDay.length} days indexed &middot; ${esc(byDay.at(-1)?.day || '')} &rarr; ${esc(byDay[0]?.day || '')}</span>
+</div>
+</div></section>
+<script>
+(function () {
+  var go = document.getElementById('range-go');
+  if (!go) return;
+  go.addEventListener('click', function () {
+    var f = document.getElementById('range-from').value, t = document.getElementById('range-to').value;
+    if (!f || !t) return;
+    if (f > t) { var x = f; f = t; t = x; }
+    location.href = '/from/' + f + '/to/' + t + '/';
+  });
+})();
+</script>`
+  }))
+  await write(dist, 'range.js', RANGE_JS)
+
   await write(dist, 'about/index.html', layout({
     title: 'About', path: '/about/',
     body: `<section class="hero">
@@ -3440,16 +3876,19 @@ loadIndex().then(({ cats, sigs, ix })=>{
         }
       }
 
+      // Same rel convention as every other pager: rel="prev" is the older
+      // page (higher page number here), rel="next" the newer one. The keys
+      // p/n follow these rels site-wide.
       return `<nav class="pager pager-timeline ${isTop ? 'pager-timeline-top' : ''}" aria-label="In-flight pagination page ${currentPage}">
   <div>
-    ${prevUrl ? `<a href="${prevUrl}" rel="prev">&larr; newer PRs</a>` : '<span class="pager-disabled">&larr; newer PRs</span>'}
+    ${nextUrl ? `<a href="${nextUrl}" rel="prev">&larr; older PRs</a>` : '<span class="pager-disabled">&larr; older PRs</span>'}
   </div>
   <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
     <span class="pager-page">page ${currentPage} of ${totalPages}</span>
     ${pageNums.join(' ')}
   </div>
   <div>
-    ${nextUrl ? `<a href="${nextUrl}" rel="next">older PRs &rarr;</a>` : '<span class="pager-disabled">older PRs &rarr;</span>'}
+    ${prevUrl ? `<a href="${prevUrl}" rel="next">newer PRs &rarr;</a>` : '<span class="pager-disabled">newer PRs &rarr;</span>'}
   </div>
 </nav>`
     }
@@ -3589,6 +4028,19 @@ ${inFlightScript}`
         }))
       }
     }
+  } else {
+    // A permanent URL deserves a permanent answer: with no open PRs the page
+    // used to stop existing, so every feed item, bookmark and OPML entry that
+    // pointed here 404ed the moment the queue drained. The stub is honest
+    // about the empty queue; the nav link stays hidden (nothing to browse).
+    await write(dist, 'in-flight/index.html', layout({
+      title: 'In-flight', path: '/in-flight/',
+      desc: 'Open community pull requests awaiting merge or snapshot sync in CodebuffAI/freebuff.',
+      body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">IN_FLIGHT :: open pull requests</span><span>0 open</span></div>
+<p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Nothing is awaiting merge right now: every community pull request has landed or closed. The queue refills as new PRs open upstream.</p>
+<p style="margin:8px 0 0;font-size:.78rem"><a href="/">[latest changes]</a> &middot; <a href="/archive/">[archive]</a></p>
+</div></section>`
+    }))
   }
 
   // ----- feeds: main (all changes), major+notable, models-only, releases-only
@@ -3612,11 +4064,39 @@ ${inFlightScript}`
     if (b.churn || b.impact || RESERVED_FEEDS.has(b.slug)) continue
     await write(dist, `feed-${b.slug}.xml`, feedXml(SITE.url, SITE.name, SITE.desc, generated, `feed-${b.slug}.xml`, `${SITE.name}: ${b.label}`, `Changes in the ${b.label} area of Freebuff.`, b.list.slice(0, 60).map(rssItem).join('')))
   }
+  // One feed per audience: "what changes for advertisers" is a subscription
+  // question, and only a feed answers it going forward.
+  const audienceFeeds = []
+  for (const a of AUDIENCES) {
+    const list = meaningful.filter(e => e.ai?.audience === a)
+    if (!list.length) continue
+    audienceFeeds.push(a)
+    await write(dist, `feed-audience-${a}.xml`, feedXml(SITE.url, SITE.name, SITE.desc, generated, `feed-audience-${a}.xml`, `${SITE.name}: ${a}`, `Changes aimed at ${AUDIENCE_DESC[a] || a}.`, list.slice(0, 60).map(rssItem).join('')))
+  }
   // Weekly digest feed: one item per ISO week, built from the digest pages.
   await write(dist, 'feed-weekly.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed-weekly.xml', `${SITE.name}: weekly digest`, 'One item a week: releases, model changes and the notable work that landed.', weeks.slice(0, 26).map(w => weeklyFeedItem(SITE.url, w)).join('')))
   const mainJsonItems = entries.filter(e => !e.noise).slice(0, 60).map(e => jsonItem(SITE.url, e, titleOf, storyIdx.notes.get(e.sha)))
   await write(dist, 'feed.json', feedJson(SITE.url, generated, SITE.name, SITE.desc, 'feed.json', mainJsonItems))
   await write(dist, 'feed.xsl', FEED_XSL)
+
+  // ----- every feed in one catalog: the OPML bundle and the /subscribe/ page
+  // are both generated from this list, so a new feed cannot ship unlisted.
+  const feedCatalog = [
+    { title: `${SITE.name}: all changes`, path: '/feed.xml', group: 'core', desc: 'Every real change as it lands (60 newest).' },
+    { title: `${SITE.name}: weekly digest`, path: '/feed-weekly.xml', group: 'core', desc: 'One item a week: releases, models, the notable work.' },
+    { title: `${SITE.name}: major + notable`, path: '/feed-major.xml', group: 'core', desc: 'The two loudest impact levels only.' },
+    { title: `${SITE.name}: models`, path: '/feed-models.xml', group: 'core', desc: 'Model catalog additions, retirements and swaps.' },
+    { title: `${SITE.name}: releases`, path: '/feed-releases.xml', group: 'core', desc: 'Version bumps: Freebuff CLI and core packages.' },
+    { title: `${SITE.name}: security`, path: '/feed-security.xml', group: 'core', desc: 'Trust gates, credentials, checksums, permissions.' },
+    ...browseList.filter(b => !b.churn && !b.impact && !RESERVED_FEEDS.has(b.slug)).map(b => ({ title: `${SITE.name}: ${b.label}`, path: `/feed-${b.slug}.xml`, group: 'areas', desc: `Changes in the ${b.label} area of Freebuff.` })),
+    ...audienceFeeds.map(a => ({ title: `${SITE.name}: ${a}`, path: `/feed-audience-${a}.xml`, group: 'audiences', desc: `Changes aimed at ${AUDIENCE_DESC[a] || a}.` }))
+  ]
+  await write(dist, 'feeds.opml', feedsOpml(SITE.url, feedCatalog))
+  await write(dist, 'subscribe/index.html', layout({
+    title: 'Subscribe', path: '/subscribe/',
+    desc: 'Every RSS feed this site writes, in one checkable list: pick what you care about and take the OPML with you.',
+    body: subscribePage(feedCatalog)
+  }))
   await writeBinary(`${dist.replace(/\/$/, '')}/favicon.ico`, generateFaviconIco())
   await write(dist, 'favicon.svg', FAVICON_SVG)
   await writeBinary(`${dist.replace(/\/$/, '')}/icon-192.png`, generateIconPng(192))
@@ -3764,8 +4244,9 @@ ctx.hidden = false
   const urlset = (urls) => `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.map(u => `<url><loc>${SITE.url}${u}</loc></url>`).join('')}</urlset>`
   const dayUrls = byDay.map(d => `/day/${d.day}/`)
   const relUrls = vers.map(v => `/release/${v.version}/`)
-  const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`)]
-  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/week/', ...weeks.slice(0, 52).map(w => `/week/${w.key}/`), ...browseMonthUrls, ...(openPrs?.length ? ['/in-flight/'] : [])]
+  const lineageUrls = [...familyOf.entries()].filter(([, ms]) => ms.length > 1).map(([fam]) => `/models/lineage/${categorySlug(fam)}/`)
+  const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`), ...lineageUrls]
+  const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/week/', '/subscribe/', '/range/', '/in-flight/', ...weeks.slice(0, 52).map(w => `/week/${w.key}/`), ...browseMonthUrls]
   await write(dist, 'sitemap-days.xml', urlset(dayUrls))
   await write(dist, 'sitemap-releases.xml', urlset(relUrls))
   await write(dist, 'sitemap-models.xml', urlset(modelUrls))
@@ -3783,6 +4264,9 @@ ctx.hidden = false
     '/watch/ /models/ 301',
     '/models/*/feed.xml /feed-models.xml 301',
     '/models/*/feed /feed-models.xml 301',
+    // Day-range view: the shell reads its dates from the path it was asked
+    // for (same trick as /c/* above); the target cannot reach itself.
+    '/from/* /range-view 200',
     // A rewrite, not a redirect: the resolver reads the SHA off the path it was
     // asked for, so the address a person shared stays in the URL bar. The target
     // is outside the pattern and carries no extension (see above).
@@ -3829,6 +4313,12 @@ ctx.hidden = false
   Access-Control-Allow-Origin: *
 /feed.json
   Content-Type: application/feed+json; charset=utf-8
+/range-view
+  Content-Type: text/html; charset=utf-8
+/*.opml
+  Content-Type: text/x-opml; charset=utf-8
+/*.md
+  Content-Type: text/markdown; charset=utf-8
 /feed.xml
   Content-Type: application/rss+xml; charset=utf-8
   Access-Control-Allow-Origin: *
@@ -3836,6 +4326,6 @@ ctx.hidden = false
   Content-Type: application/rss+xml; charset=utf-8
   Access-Control-Allow-Origin: *
 `)
-  await write(dist, '404.html', layout({ title: 'Not found', path: '/404', noindex: true, body: '<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">ERROR :: 404 NOT FOUND</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">No commit or snapshot shipped at this path. <a href="/">&larr; [back to index]</a></p></div></section>' }))
+  await write(dist, '404.html', layout({ title: 'Not found', path: '/404', noindex: true, body: '<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title" id="range-hdr">ERROR :: 404 NOT FOUND</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)" id="range-status">No commit or snapshot shipped at this path. <a href="/">&larr; [back to index]</a></p></div></section><div id="range-days"></div><script src="/range.js"></script>' }))
   return { entries: entries.length, days: byDay.length, releases: vers.length }
 }

@@ -1383,12 +1383,98 @@ export function applyOverrides (entries, overrides) {
   return n
 }
 
+// The fields data/overrides.json accepts. `note` is the reviewer's own "why"
+// and never renders; everything else replaces what the model wrote.
+const OVERRIDE_FIELDS = ['title', 'summary', 'eli5', 'significance', 'audience', 'evidence', 'note']
+
+/**
+ * Author a human correction into data/overrides.json.
+ *
+ *   override <sha>                          print a ready-to-edit draft (current values filled in)
+ *   override <sha> --title ... [--note ...] merge given fields into the override
+ *   override <sha> --clear                  remove this entry's override
+ *   override --list                         show every override on file
+ *
+ * The scaffold-first shape is the point: a correction starts from what is
+ * actually rendered today (AI title, summary, plain-English line), so the
+ * editor changes the wrong sentence instead of re-typing the whole entry from
+ * the diff. Run `npm run build` (or let the sync do it) to republish.
+ */
+export async function cmdOverride (argv = [], { dataDir = DATA } = {}) {
+  const path = `${dataDir}/overrides.json`
+  const overrides = (await readJson(path, null)) || {}
+
+  if (argv.includes('--list')) {
+    const keys = Object.keys(overrides).filter(k => /^[0-9a-f]{7,40}$/i.test(k))
+    for (const k of keys) console.log(`${k}  ${(overrides[k].note || overrides[k].title || '').slice(0, 70)}`)
+    if (!keys.length) console.log('no overrides on file')
+    return { ok: true, count: keys.length }
+  }
+
+  const want = (argv[0] || '').toLowerCase()
+  if (!/^[0-9a-f]{7,40}$/.test(want)) {
+    console.error('usage: override <sha-prefix> [--title T] [--summary S] [--eli5 E] [--significance major|notable|minor] [--audience A] [--evidence V] [--note N] [--clear|--list]')
+    return { ok: false, error: 'missing_sha' }
+  }
+
+  const doc = await readJson(`${dataDir}/changelog.json`, null)
+  const entry = doc?.entries?.find(e => e.sha.startsWith(want)) || null
+  if (!entry) console.error(`warning: no entry matches ${want} in data/changelog.json; writing the override anyway (it will apply when the commit appears)`)
+  const key = entry ? entry.sha : want
+
+  if (argv.includes('--clear')) {
+    delete overrides[key]
+    delete overrides[want]
+    await writeJson(path, overrides)
+    log(`override cleared for ${key.slice(0, 12)}`)
+    return { ok: true, cleared: key }
+  }
+
+  // What is rendered today, so the draft starts editable rather than empty.
+  const current = {
+    title: entry?.ai?.title || entry?.title || '',
+    summary: entry?.ai?.summary || entry?.summary || '',
+    eli5: entry?.eli5?.text || '',
+    significance: entry?.significance || 'minor',
+    audience: entry?.ai?.audience || '',
+    evidence: entry?.ai?.evidence || '',
+    note: ''
+  }
+  const given = {}
+  for (let i = 0; i < argv.length; i++) {
+    const f = OVERRIDE_FIELDS.find(x => `--${x}` === argv[i])
+    if (f && argv[i + 1] !== undefined) { given[f] = argv[i + 1]; i++ }
+  }
+
+  if (!Object.keys(given).length) {
+    console.log(`# Draft override for ${key.slice(0, 12)}${entry ? ` (${entry.day} · ${entry.category})` : ''}.`)
+    console.log('# Edit the values below, then rerun as: override ' + want + ' --title "…" [--summary "…"] [--eli5 "…"] [--note "why"]')
+    console.log(JSON.stringify({ [key]: current }, null, 2))
+    return { ok: true, draft: { [key]: current } }
+  }
+
+  const merged = { ...(overrides[key] || {}), ...given }
+  overrides[key] = merged
+  await writeJson(path, overrides)
+  log(`override ${Object.keys(given).join(', ')} written for ${key.slice(0, 12)}: run \`npm run build\` (or the next sync) to republish`)
+  return { ok: true, key, override: merged }
+}
+
 async function cmdPreview (port = 8788) {
   const { createServer } = await import('node:http')
   const { resolve: r, join } = await import('node:path')
   const dist = resolve(ROOT, 'dist')
   createServer(async (req, res) => {
-    let p = decodeURIComponent(req.url.split('?')[0])
+    const url = new URL(req.url, 'http://localhost')
+    let p = decodeURIComponent(url.pathname)
+    // The three dynamic routes worker.js answers in production, so a local
+    // preview behaves like the deployed site instead of 404ing them.
+    const served = await dynamicRoute(dist, p, url.searchParams)
+    if (served) {
+      res.writeHead(served.status, served.headers)
+      res.end(served.body)
+      return
+    }
     if (p.endsWith('/')) p += 'index.html'
     let f = r(dist, '.' + p)
     if (!f.startsWith(dist)) { res.writeHead(403); res.end(); return }
@@ -1412,11 +1498,61 @@ async function cmdPreview (port = 8788) {
   }).listen(port, () => log(`preview: http://localhost:${port}`))
 }
 
+// The dynamic routes that need one line of compute on top of the static dist/:
+// /api/entry/<sha>.json (one entry record), /release/<v>/?format=md (release
+// notes as markdown) and /from/<d>/to/<d>/ (the range shell, which is also
+// written as the `range` asset with a _redirects rewrite in production).
+// Shared shape with worker.js so preview and deploy cannot drift.
+export async function dynamicRoute (dist, pathname, searchParams) {
+  const json = (obj, status = 200) => ({
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' },
+    body: JSON.stringify(obj)
+  })
+  const text = (body, type, status = 200) => ({ status, headers: { 'content-type': type }, body })
+  try {
+    const em = /^\/api\/entry\/([0-9a-f]{4,40})(?:\.json)?\/?$/i.exec(pathname)
+    if (em) {
+      const record = await findEntryRecord(dist, em[1].toLowerCase())
+      return record ? json(record) : json({ error: `no changelog entry records ${em[1]}` }, 404)
+    }
+    if (searchParams?.get('format') === 'md') {
+      const rm = /^\/release\/([^/]+)\/?$/.exec(pathname)
+      if (rm) {
+        const md = await readFile(resolve(dist, 'release', decodeURIComponent(rm[1]), 'notes.md'), 'utf8')
+        return text(md, 'text/markdown; charset=utf-8')
+      }
+    }
+    const fm = /^\/from\/(\d{4}-\d{2}-\d{2})\/to\/(\d{4}-\d{2}-\d{2})\/?$/.exec(pathname)
+    if (fm) return text(await readFile(resolve(dist, 'range-view')), 'text/html; charset=utf-8')
+  } catch (err) {
+    if (err?.code === 'ENOENT') return json({ error: 'not found' }, 404)
+    return json({ error: String(err?.message || err) }, 500)
+  }
+  return null
+}
+
+// Resolve a commit prefix to its entry record via the same two-shard lookup
+// worker.js uses: api/sha-day.json maps short sha -> day, and api/records/<day>.json
+// holds that day's full records.
+async function findEntryRecord (dist, want) {
+  const map = JSON.parse(await readFile(resolve(dist, 'api/sha-day.json'), 'utf8'))
+  const key = Object.prototype.hasOwnProperty.call(map, want)
+    ? want
+    : Object.keys(map).find(k => k.startsWith(want) || want.startsWith(k))
+  if (!key) return null
+  const day = map[key]
+  const shard = JSON.parse(await readFile(resolve(dist, 'api/records', `${day}.json`), 'utf8'))
+  return (shard.records || []).find(x => x.sha.startsWith(key) || key.startsWith(x.sha)) || null
+}
+
 function MIME (f) {
   if (f.endsWith('.html')) return 'text/html; charset=utf-8'
   if (f.endsWith('.json')) return 'application/json; charset=utf-8'
   if (f.endsWith('.diff')) return 'text/plain; charset=utf-8'
   if (f.endsWith('.xml')) return 'application/rss+xml; charset=utf-8'
+  if (f.endsWith('.opml')) return 'text/x-opml; charset=utf-8'
+  if (f.endsWith('.md')) return 'text/markdown; charset=utf-8'
   if (f.endsWith('.xsl')) return 'text/xsl; charset=utf-8'
   if (f.endsWith('.css')) return 'text/css'
   if (f.endsWith('.svg')) return 'image/svg+xml'
@@ -1444,6 +1580,7 @@ if (IS_MAIN) {
   else if (cmd === 'eval') await cmdEval(rest)
   else if (cmd === 'normalize-dates') await cmdNormalizeDates(rest)
   else if (cmd === 'broadcast') await cmdBroadcast(rest)
+  else if (cmd === 'override') await cmdOverride(rest)
   else if (cmd === 'fetch-traffic') await fetchTrafficClones({ force: true })
   else if (cmd === 'build') await cmdBuild()
   else if (cmd === 'preview') await cmdPreview(Number(rest[0]) || 8788)
@@ -1462,6 +1599,7 @@ if (IS_MAIN) {
   node generator/cli.mjs eval [--seed N] [--limit N] [--no-judge]  # summary-quality evaluation against data/eval/golden.json (LLM judge on by default)
   node generator/cli.mjs normalize-dates [--push]  # one-off: rewrite stored timestamps to UTC and fix the day/month keys
   node generator/cli.mjs broadcast [--webhook URL] [--limit N] [--dry-run]  # broadcast latest commits to Discord
+  node generator/cli.mjs override <sha> [--title T] [--summary S] [--eli5 E] [--significance S] [--audience A] [--evidence V] [--note N] [--clear|--list]  # author a human correction into data/overrides.json
   node generator/cli.mjs build                    # render static site → dist/
   node generator/cli.mjs preview [port]           # local preview of dist/`)
     process.exit(cmd ? 1 : 0)
@@ -1694,17 +1832,28 @@ export async function cmdBroadcast (argv = [], { fetchImpl = globalThis.fetch, d
   const state = (await readJson(statePath, null)) || {}
   const lastBroadcast = state.lastBroadcastSha
 
-  // Candidates: meaningful commits only
-  const meaningful = doc.entries.filter(e => !e.noise)
+  // Candidates: meaningful commits only. data/changelog.json is stored
+  // OLDEST-first (sortEntries), but every walk below wants newest-first before
+  // reversing into send order -- so the list is sorted explicitly instead of
+  // trusted. Walking the raw order used to broadcast the OLDEST entries first,
+  // then pin lastBroadcastSha to the list's head and log "no new commits"
+  // forever while new work piled up at the other end.
+  const meaningful = doc.entries
+    .filter(e => !e.noise)
+    .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : (a.sha < b.sha ? 1 : -1)))
   let pending = []
 
   if (force || !lastBroadcast) {
+    // The newest `limit`, sent in the order they landed (oldest of them first).
     pending = meaningful.slice(0, limit).reverse()
   } else {
     const idx = meaningful.findIndex(e => e.sha === lastBroadcast)
     if (idx === -1) {
+      // A watermark this history does not hold (rescan, re-dated rows):
+      // continue from the newest single commit rather than replaying history.
       pending = meaningful.slice(0, 1)
     } else if (idx > 0) {
+      // Everything newer than the watermark, oldest of them first.
       pending = meaningful.slice(0, idx).reverse().slice(0, limit)
     }
   }
