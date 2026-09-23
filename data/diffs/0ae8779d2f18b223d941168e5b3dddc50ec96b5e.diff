@@ -1,0 +1,1792 @@
+diff --git a/common/src/__tests__/foreign-client-shipped-agents.test.ts b/common/src/__tests__/foreign-client-shipped-agents.test.ts
+deleted file mode 100644
+index c9e9bfe86..000000000
+--- a/common/src/__tests__/foreign-client-shipped-agents.test.ts
++++ /dev/null
+@@ -1,241 +0,0 @@
+-import { readdirSync, readFileSync, statSync } from 'node:fs'
+-import { join, relative } from 'node:path'
+-
+-import { describe, expect, test } from 'bun:test'
+-
+-import { wireTools } from './foreign-client-wire-tools'
+-import {
+-  detectForeignFreebuffClient,
+-  FREEBUFF_CUSTOM_TOOL_NAMES,
+-} from '../constants/foreign-client-signals'
+-import { FREEBUFF_ROOT_AGENT_IDS } from '../constants/free-agents'
+-
+-/**
+- * Nothing we ship may be mistaken for a third-party client.
+- *
+- * The downgrade now runs unconditionally with no flag to disable it, so a
+- * freebuff agent the detector flags is served a different model in production
+- * with no way to switch it off short of a revert and redeploy. This has already
+- * happened twice, both silently:
+- *
+- *  - `researcher-web` offers `['web_search', 'read_url']` and was flagged on
+- *    100% of its 334,042 requests from 4,821 users over 30 days.
+- *  - `freebuff-desktop-autorun` offers only the custom tool `decide`, so it had
+- *    no signature tool at all — 2,904 requests from 41 users.
+- *
+- * Both were found by querying production, which is the wrong place to find
+- * them. This scans the source instead, so the next one fails CI.
+- *
+- * Reading source with a regex is crude, and the real hazard is that it quietly
+- * stops matching and the test passes on an empty set — hence the floor below
+- * and the named spot checks.
+- */
+-
+-const REPO_ROOT = join(import.meta.dir, '..', '..', '..')
+-
+-/** Where agent definitions live. */
+-const SEARCH_ROOTS = [
+-  'agents',
+-  '.agents',
+-  'freebuff',
+-  'freebuff-desktop/src',
+-  'web/src',
+-  'common/src',
+-  'sdk/src',
+-  'cli/src',
+-]
+-
+-/**
+- * Definitions that cannot reach the downgrade, with the property that makes
+- * that true. `mustContain` is the load-bearing part: if the reason stops
+- * holding, this fails rather than the exclusion silently outliving it.
+- */
+-const EXCLUDED: Array<{ path: string; mustContain: string; why: string }> = [
+-  {
+-    path: 'freebuff/e2e/agent/freebuff-tester.ts',
+-    mustContain: "model: 'anthropic/claude-sonnet-4.5'",
+-    why:
+-      'e2e harness pinned to a paid Anthropic model. The downgrade only runs ' +
+-      'on free-mode requests, and a free-mode request for a non-free model is ' +
+-      'rejected by isFreeModeAllowedAgentModel long before the detector. It ' +
+-      'also had 0 production requests over 30 days. If it ever moves to a ' +
+-      'free model this exclusion stops applying and the test says so.',
+-  },
+-]
+-
+-/**
+- * The regex only sees literal names. A declaration built at runtime is invisible
+- * to it, which is precisely how `decide` slipped through — so custom tools are
+- * asserted separately below rather than assumed covered here.
+- */
+-const TOOL_NAMES_DECLARATION = /toolNames:\s*\[([^\]]*)\]/g
+-const QUOTED_NAME = /'([^']+)'|"([^"]+)"/g
+-
+-/** Below this, assume the scan broke rather than that we deleted 20 agents. */
+-const MINIMUM_DECLARATIONS = 25
+-
+-type Declaration = { file: string; names: string[]; ids: string[] }
+-
+-function collectSourceFiles(): string[] {
+-  const files: string[] = []
+-  const walk = (dir: string) => {
+-    let entries: string[]
+-    try {
+-      entries = readdirSync(dir)
+-    } catch {
+-      return
+-    }
+-    for (const entry of entries) {
+-      if (entry === 'node_modules' || entry === '.next' || entry === 'dist') {
+-        continue
+-      }
+-      const path = join(dir, entry)
+-      if (statSync(path).isDirectory()) {
+-        walk(path)
+-        continue
+-      }
+-      // Test files carry deliberately-foreign fixtures; they are not shipped.
+-      if (
+-        path.endsWith('.ts') &&
+-        !path.includes('__tests__') &&
+-        !path.endsWith('.test.ts')
+-      ) {
+-        files.push(path)
+-      }
+-    }
+-  }
+-  for (const root of SEARCH_ROOTS) walk(join(REPO_ROOT, root))
+-  return files
+-}
+-
+-function collectDeclarations(): Declaration[] {
+-  const excluded = new Set(EXCLUDED.map((entry) => entry.path))
+-  const declarations: Declaration[] = []
+-  for (const file of collectSourceFiles()) {
+-    const relativePath = relative(REPO_ROOT, file)
+-    if (excluded.has(relativePath)) continue
+-    const source = readFileSync(file, 'utf8')
+-    const ids = [...source.matchAll(/\bid:\s*'([^']+)'/g)].map((m) => m[1]!)
+-    for (const match of source.matchAll(TOOL_NAMES_DECLARATION)) {
+-      const names = [...match[1]!.matchAll(QUOTED_NAME)].map(
+-        (name) => name[1] ?? name[2]!,
+-      )
+-      // Empty declarations are kept, not filtered. `toolNames: []` on a ROOT is
+-      // precisely what the root test below must catch, and dropping it here
+-      // made that test vacuous — a root with an empty toolset simply vanished
+-      // from the scan and the assertion passed over nothing.
+-      declarations.push({ file: relativePath, names, ids })
+-    }
+-  }
+-  return declarations
+-}
+-
+-const DECLARATIONS = collectDeclarations()
+-
+-/** Wire-shaped, so the schema check sees what production sees: a name in
+- *  `toolParams` carries our real parameters, anything else a generic schema.
+- *  A declaration whose only signature tools are zero-parameter (`end_turn`,
+- *  `task_completed`) fails below by design — those never count, see
+- *  `isGenuineSignatureTool`. */
+-const asToolSchemas = (names: readonly string[]) => wireTools(...names)
+-
+-describe('no shipped freebuff agent is flagged as a foreign client', () => {
+-  test('the scan actually found our agents', () => {
+-    // Guards the failure mode where a reformat stops the regex matching and
+-    // every assertion below passes over an empty set.
+-    expect(DECLARATIONS.length).toBeGreaterThanOrEqual(MINIMUM_DECLARATIONS)
+-  })
+-
+-  test.each(DECLARATIONS.map((d): [string, Declaration] => [d.file, d]))(
+-    '%s',
+-    (_file, declaration) => {
+-      const verdict = detectForeignFreebuffClient({
+-        tools: asToolSchemas(declaration.names),
+-      })
+-      // Surface the toolset in the failure, since the fix is almost always
+-      // "this agent's tools are all generic — give it a distinctive one, or
+-      // add the missing name back to the signature".
+-      expect({
+-        file: declaration.file,
+-        names: declaration.names,
+-        signal: verdict.signal,
+-      }).toEqual({
+-        file: declaration.file,
+-        names: declaration.names,
+-        signal: null,
+-      })
+-    },
+-  )
+-
+-  test.each([
+-    ['researcher-web', 'agents/researcher/researcher-web.ts'],
+-    ['desktop mission', 'freebuff-desktop/src/server/services/mission.ts'],
+-    ['glob-matcher', 'agents/file-explorer/glob-matcher.ts'],
+-  ])(
+-    'still covers %s, which the scan must not silently drop',
+-    (_name, path) => {
+-      // The first two are the agents this test exists because of. The third has
+-      // exactly one signature tool (`glob` is generic, `set_output` is not), so
+-      // it is the closest thing we ship to the failure mode.
+-      expect(DECLARATIONS.some((d) => d.file === path)).toBe(true)
+-    },
+-  )
+-
+-  test('every root agent we ship declares tools', () => {
+-    // `root_agent_no_tools` downgrades any ROOT agent request that offers no
+-    // tools, on the grounds that our roots are agentic by definition. A root
+-    // shipped with an empty toolset would therefore have every one of its
+-    // requests downgraded in production, with no flag to turn it off.
+-    const roots = new Set<string>(FREEBUFF_ROOT_AGENT_IDS)
+-    const shippedRoots = DECLARATIONS.filter((d) =>
+-      d.ids.some((id) => roots.has(id)),
+-    )
+-    // The scan must actually be finding roots, or this passes vacuously.
+-    expect(shippedRoots.length).toBeGreaterThan(0)
+-    // Name the offending file in the failure, since "a root declares no tools"
+-    // is useless without knowing which one.
+-    expect(
+-      shippedRoots
+-        .filter((d) => d.names.length === 0)
+-        .map((d) => `${d.file} (${d.ids.join(', ')})`),
+-    ).toEqual([])
+-  })
+-
+-  test.each([...FREEBUFF_CUSTOM_TOOL_NAMES])(
+-    'custom tool %s clears on its own',
+-    (name) => {
+-      // Custom tools are registered at runtime through customToolDefinitions,
+-      // so the source scan cannot see them. An agent offering one and nothing
+-      // else — which is exactly what desktop autorun does — has no signature
+-      // tool unless it is enumerated.
+-      expect(
+-        detectForeignFreebuffClient({ tools: asToolSchemas([name]) }).signal,
+-      ).toBeNull()
+-    },
+-  )
+-
+-  test('custom tools appended to a real toolset stay cleared', () => {
+-    // How the chat surface composes: base-chat's tools plus per-turn image and
+-    // document tools (freebuff/web/src/server/chat/agent.ts). The additions are
+-    // caller-named and arbitrary, so this must not depend on recognising them.
+-    expect(
+-      detectForeignFreebuffClient({
+-        tools: asToolSchemas([
+-          'spawn_agents',
+-          'gravity_index',
+-          'render_ui',
+-          'suggest_followups',
+-          'read_attached_image_abc123',
+-          'read_attached_doc_def456',
+-        ]),
+-      }).signal,
+-    ).toBeNull()
+-  })
+-
+-  test.each(EXCLUDED)('exclusion of $path still holds', (entry) => {
+-    // An exclusion outliving its reason is how a real false positive gets
+-    // waved through, so the reason is asserted rather than just written down.
+-    const source = readFileSync(join(REPO_ROOT, entry.path), 'utf8')
+-    expect(source).toContain(entry.mustContain)
+-  })
+-})
+diff --git a/common/src/__tests__/foreign-client-signals.test.ts b/common/src/__tests__/foreign-client-signals.test.ts
+deleted file mode 100644
+index 9f62d1352..000000000
+--- a/common/src/__tests__/foreign-client-signals.test.ts
++++ /dev/null
+@@ -1,715 +0,0 @@
+-import { describe, expect, test } from 'bun:test'
+-import z from 'zod/v4'
+-
+-import {
+-  CLAUDE_CODE_TOOLS,
+-  PROXY_HOLLOW_END_TURN,
+-  stubTool,
+-  wireTool,
+-  wireTools,
+-} from './foreign-client-wire-tools'
+-import {
+-  canonicalToolParameterKeys,
+-  detectForeignFreebuffClient,
+-  ENFORCED_SIGNALS,
+-  findForeignHarnessPromptMarker,
+-  FOREIGN_HARNESS_TOOL_NAMES,
+-  FREEBUFF_CUSTOM_TOOL_NAMES,
+-  FREEBUFF_DOWNGRADE_MODEL_ID,
+-  FREEBUFF_SIGNATURE_TOOL_NAMES,
+-  GENERIC_TOOL_NAMES,
+-  isGenuineSignatureTool,
+-  listUnrecognisedToolNames,
+-  resolveForeignClientDowngrade,
+-} from '../constants/foreign-client-signals'
+-import { toolNames } from '../tools/constants'
+-import { toolParams } from '../tools/list'
+-import { readFilesDisplayVariants } from '../tools/params/tool/read-files'
+-
+-/** Wire-shaped tools: our names carry our schema, everything else a generic
+- *  one. See foreign-client-wire-tools.ts. */
+-const tools = wireTools
+-
+-/** Toolsets observed on real freebuff traffic over 24h of DeepSeek V4 Flash. */
+-const FREEBUFF_TOOLSETS = [
+-  // CLI / desktop root agent
+-  tools(
+-    'ask_user',
+-    'basher',
+-    'browser_use',
+-    'code_reviewer_deepseek_flash',
+-    'code_searcher',
+-    'context_pruner',
+-    'file_picker',
+-    'glob',
+-    'gravity_index',
+-    'list_directory',
+-    'read_files',
+-    'read_subtree',
+-  ),
+-  // desktop thread agent
+-  tools(
+-    'basher',
+-    'browser_check',
+-    'code_reviewer_deepseek_flash',
+-    'code_searcher',
+-    'context_pruner',
+-    'end_turn',
+-    'file_picker',
+-    'glob',
+-    'list_directory',
+-    'preview_click',
+-    'preview_evaluate',
+-  ),
+-  // chat surface
+-  tools(
+-    'context_pruner',
+-    'gravity_index',
+-    'render_ui',
+-    'researcher_web',
+-    'spawn_agents',
+-    'suggest_followups',
+-    'thinker_gemini',
+-  ),
+-  // helper agent
+-  tools('add_message', 'read_files', 'run_terminal_command', 'set_output'),
+-]
+-
+-/** Toolsets observed proxying our free endpoint, by harness. */
+-const FOREIGN_TOOLSETS: Array<[string, ReturnType<typeof tools>]> = [
+-  ['claude-code', tools('Bash', 'Edit', 'Glob', 'Grep', 'Read', 'Write')],
+-  [
+-    'opencode',
+-    tools(
+-      'ask',
+-      'bash',
+-      'edit',
+-      'eval',
+-      'glob',
+-      'grep',
+-      'hub',
+-      'read',
+-      'task',
+-      'todo',
+-      'web_search',
+-      'write',
+-    ),
+-  ],
+-  [
+-    'cline',
+-    tools(
+-      'list_files',
+-      'read_file',
+-      'replace_in_file',
+-      'search_files',
+-      'write_file',
+-    ),
+-  ],
+-  [
+-    'novel-farm',
+-    tools(
+-      'check_consistency',
+-      'commit_chapter',
+-      'draft_chapter',
+-      'edit_chapter',
+-      'novel_context',
+-      'plan_chapter',
+-      'read_chapter',
+-    ),
+-  ],
+-  [
+-    'pentest-harness',
+-    tools(
+-      'analyze_target_graph',
+-      'delegate_task',
+-      'edit_source_code',
+-      'execute_command',
+-      'install_tool',
+-      'python_execute',
+-      'read_file',
+-    ),
+-  ],
+-]
+-
+-describe('detectForeignFreebuffClient', () => {
+-  test('the signature is every non-generic tool we define', () => {
+-    // Derived, not hand-listed: a tool added to `toolNames` joins the signature
+-    // automatically. That is the rot that flagged researcher-web — a
+-    // hand-picked list simply never grew to cover it.
+-    const known = new Set<string>(toolNames)
+-    for (const name of known) {
+-      expect(FREEBUFF_SIGNATURE_TOOL_NAMES.has(name)).toBe(
+-        !GENERIC_TOOL_NAMES.has(name),
+-      )
+-    }
+-    // Every generic name must be one we actually define, or it is dead weight.
+-    for (const name of GENERIC_TOOL_NAMES) {
+-      expect(known.has(name)).toBe(true)
+-    }
+-    expect(FREEBUFF_SIGNATURE_TOOL_NAMES.size).toBeGreaterThan(20)
+-  })
+-
+-  test('clears real freebuff toolsets', () => {
+-    for (const toolset of FREEBUFF_TOOLSETS) {
+-      expect(detectForeignFreebuffClient({ tools: toolset }).signal).toBeNull()
+-    }
+-  })
+-
+-  test.each(FOREIGN_TOOLSETS)('flags %s', (_name, toolset) => {
+-    // Which enforced signal fires depends on whether the harness's own names
+-    // are on the harness list (Claude Code, OpenClaw's `delegate_task`) or it
+-    // is caught by having no genuine tool of ours; both downgrade.
+-    const { signal } = detectForeignFreebuffClient({ tools: toolset })
+-    expect(signal).not.toBeNull()
+-    expect(ENFORCED_SIGNALS.has(signal!)).toBe(true)
+-  })
+-
+-  test('sharing a few generic names does not launder a foreign harness', () => {
+-    // opencode sends `glob` and `web_search`, which we define — but both are
+-    // generic, so neither is in the signature and the overlap buys it nothing.
+-    expect(
+-      detectForeignFreebuffClient({
+-        tools: tools('glob', 'web_search', 'bash', 'edit', 'write'),
+-      }).signal,
+-    ).toBe('foreign_toolset')
+-  })
+-
+-  test('a toolset of only generic names is foreign', () => {
+-    // Measured over 30 days: 406 users on spoofed `base2-free-*` agent ids send
+-    // a bare `web_search` and nothing else. No agent we ship has a toolset of
+-    // only generic names — every single-tool agent of ours uses a distinctive
+-    // one (`run_terminal_command`, `spawn_agents`, `read_docs`, `set_output`).
+-    expect(
+-      detectForeignFreebuffClient({ tools: tools('web_search') }).signal,
+-    ).toBe('foreign_toolset')
+-    expect(
+-      detectForeignFreebuffClient({ tools: tools('glob', 'web_search') })
+-        .signal,
+-    ).toBe('foreign_toolset')
+-  })
+-
+-  test('our toolset wins over sampling params', () => {
+-    // 16 users in one day sent our tools AND set params. Downgrading them is
+-    // the false positive this ordering exists to prevent.
+-    expect(
+-      detectForeignFreebuffClient({
+-        tools: tools('ask_user', 'read_files'),
+-        temperature: 0.3,
+-        max_tokens: 32000,
+-      }).signal,
+-    ).toBeNull()
+-  })
+-
+-  test('flags sampling params only when no tools are offered', () => {
+-    expect(detectForeignFreebuffClient({ temperature: 0.7 }).signal).toBe(
+-      'sampling_params',
+-    )
+-    expect(detectForeignFreebuffClient({ top_p: 0.9 }).signal).toBe(
+-      'sampling_params',
+-    )
+-    expect(detectForeignFreebuffClient({ max_tokens: 4096 }).signal).toBe(
+-      'sampling_params',
+-    )
+-    expect(
+-      detectForeignFreebuffClient({ max_completion_tokens: 4096 }).signal,
+-    ).toBe('sampling_params')
+-  })
+-
+-  test('clears a tool-free request that leaves sampling params unset', () => {
+-    // Our helper agents (chat titles, compaction) send no tools at all.
+-    expect(detectForeignFreebuffClient({}).signal).toBeNull()
+-    expect(detectForeignFreebuffClient({ tools: [] }).signal).toBeNull()
+-  })
+-
+-  test('explicit nulls are not treated as set', () => {
+-    // Regression: this test used to pass `undefined` while claiming to cover
+-    // `null`, so it passed against a detector that flagged every explicit
+-    // null. A client that serializes its whole body sends `temperature: null`
+-    // rather than omitting the key, and that is unset.
+-    for (const body of [
+-      { temperature: null },
+-      { top_p: null },
+-      { max_tokens: null },
+-      { max_completion_tokens: null },
+-      { temperature: null, top_p: null, max_tokens: null },
+-    ]) {
+-      expect(detectForeignFreebuffClient(body as never).signal).toBeNull()
+-    }
+-    expect(
+-      detectForeignFreebuffClient({
+-        temperature: undefined,
+-        top_p: undefined,
+-        max_tokens: undefined,
+-      }).signal,
+-    ).toBeNull()
+-  })
+-
+-  test('zero is a real choice and stays flagged', () => {
+-    // `!= null` must not swallow falsy-but-set values.
+-    expect(detectForeignFreebuffClient({ temperature: 0 }).signal).toBe(
+-      'sampling_params',
+-    )
+-    expect(detectForeignFreebuffClient({ top_p: 0 }).signal).toBe(
+-      'sampling_params',
+-    )
+-  })
+-
+-  test('tolerates malformed tool entries without throwing', () => {
+-    for (const tools of [
+-      null,
+-      undefined,
+-      'nope',
+-      [],
+-      [null],
+-      [{}],
+-      [{ function: {} }],
+-    ]) {
+-      expect(() =>
+-        detectForeignFreebuffClient({ tools } as never),
+-      ).not.toThrow()
+-    }
+-    // Tools present but unparseable read as "no tools offered", so the request
+-    // falls through to the param check rather than being flagged on a name
+-    // list we could not actually read.
+-    expect(detectForeignFreebuffClient({ tools: [{}] }).signal).toBeNull()
+-  })
+-
+-  test('truncates caller-controlled tool names before they reach logs', () => {
+-    const verdict = detectForeignFreebuffClient({
+-      tools: [{ type: 'function', function: { name: 'x'.repeat(5000) } }],
+-    })
+-    expect(verdict.signal).toBe('foreign_toolset')
+-    expect(verdict.sampleToolNames[0]!.length).toBeLessThanOrEqual(64)
+-  })
+-
+-  describe('a signature tool must carry our schema, not only our name', () => {
+-    // Read from the public resale proxies on 2026-09-17: freebuff2api and its
+-    // forks, trefeon/freebuff-proxy, 9router's freebuff executor. Every one of
+-    // them cleared the name-only rule by appending the same hollow `end_turn`
+-    // to the real harness's toolset — the laundering vector the abuse doc had
+-    // named as "the obvious evasion once enforcement is noticed".
+-    test('a hollow end_turn does not launder Claude Code', () => {
+-      const verdict = detectForeignFreebuffClient({
+-        tools: [...CLAUDE_CODE_TOOLS, PROXY_HOLLOW_END_TURN],
+-      })
+-      // Claude Code's own names now settle it first; the hollow list still
+-      // records the stub for the log line.
+-      expect(verdict.signal).toBe('foreign_tool_names')
+-      expect(verdict.hollowToolNames).toEqual(['end_turn'])
+-      expect(
+-        resolveForeignClientDowngrade({
+-          body: {
+-            model: 'deepseek/deepseek-v4-flash',
+-            tools: [...CLAUDE_CODE_TOOLS, PROXY_HOLLOW_END_TURN],
+-          },
+-        })?.downgradeTo,
+-      ).toBe(FREEBUFF_DOWNGRADE_MODEL_ID)
+-    })
+-
+-    test('a hollow end_turn does not launder a bare completion proxy', () => {
+-      // The other shape the same proxies produce: no harness tools at all,
+-      // just the injected definition.
+-      expect(
+-        detectForeignFreebuffClient({ tools: [PROXY_HOLLOW_END_TURN] }).signal,
+-      ).toBe('foreign_toolset')
+-    })
+-
+-    test('our name over a foreign schema is not ours', () => {
+-      // trefeon/freebuff-proxy's "tool-name tolerance": Claude Code's `Read`
+-      // is relabelled `read_files` on the way up and back on the way down,
+-      // with the client's own parameter schema forwarded untouched. The model
+-      // is still asked for `file_path`, which we never defined.
+-      const relabelled = [
+-        stubTool('read_files', schema('file_path', 'offset', 'limit')),
+-        stubTool(
+-          'str_replace',
+-          schema('file_path', 'old_string', 'new_string'),
+-        ),
+-        stubTool(
+-          'run_terminal_command',
+-          schema('command', 'timeout', 'description'),
+-        ),
+-        stubTool('code_search', schema('pattern', 'path', 'output_mode')),
+-        stubTool('list_directory', schema('path', 'ignore')),
+-      ]
+-      const verdict = detectForeignFreebuffClient({ tools: relabelled })
+-      expect(verdict.signal).toBe('foreign_toolset')
+-      expect(verdict.hollowToolNames).toEqual([
+-        'read_files',
+-        'str_replace',
+-        'run_terminal_command',
+-        'code_search',
+-        'list_directory',
+-      ])
+-    })
+-
+-    test('our name with no schema at all is not ours', () => {
+-      // Every client we ship serialises a schema for every tool, so a missing
+-      // `parameters` under one of our names is not a version skew, it is a
+-      // name copied without the thing that makes it a tool.
+-      expect(
+-        detectForeignFreebuffClient({
+-          tools: [stubTool('read_files'), stubTool('spawn_agents')],
+-        }).signal,
+-      ).toBe('foreign_toolset')
+-      expect(
+-        detectForeignFreebuffClient({
+-          tools: [stubTool('read_files', { type: 'object', properties: {} })],
+-        }).signal,
+-      ).toBe('foreign_toolset')
+-    })
+-
+-    test('every parameterised tool we define is genuine as we ship it', () => {
+-      for (const name of Object.keys(toolParams)) {
+-        const keys = canonicalToolParameterKeys(name)
+-        expect(keys).not.toBeNull()
+-        if (keys!.size === 0) continue
+-        expect({
+-          name,
+-          genuine: isGenuineSignatureTool(offered(name)),
+-        }).toEqual({ name, genuine: !GENERIC_TOOL_NAMES.has(name) })
+-      }
+-    })
+-
+-    test('the windowed read_files variant clears', () => {
+-      // Web and Cloud serve the windowed schema (line ranges inside `paths`);
+-      // CLI and Desktop the legacy one. Same top-level names, so both clear.
+-      const windowed = stubTool(
+-        'read_files',
+-        z.toJSONSchema(readFilesDisplayVariants.windowed.inputSchema, {
+-          io: 'input',
+-        }),
+-      )
+-      expect(isGenuineSignatureTool(offered(windowed))).toBe(true)
+-      expect(
+-        detectForeignFreebuffClient({ tools: [windowed] }).signal,
+-      ).toBeNull()
+-    })
+-
+-    test('a client one release behind an added optional field clears', () => {
+-      // A subset of our names is still ours: the server deploys before the
+-      // clients, so an older binary lacking a field we just added must not
+-      // read as foreign.
+-      expect(
+-        detectForeignFreebuffClient({
+-          tools: [stubTool('run_terminal_command', schema('command', 'cwd'))],
+-        }).signal,
+-      ).toBeNull()
+-    })
+-
+-    test('zero-parameter tools never count on their own', () => {
+-      // `end_turn` and `task_completed` have nothing structural to verify — a
+-      // copied name over `{}` is byte-identical to the real definition — so
+-      // they contribute nothing, in either direction. Every agent we ship
+-      // carries a parameterised signature tool beside them (the shipped-agents
+-      // test asserts it), so this costs our own traffic nothing.
+-      expect(
+-        detectForeignFreebuffClient({ tools: tools('end_turn') }).signal,
+-      ).toBe('foreign_toolset')
+-      expect(
+-        detectForeignFreebuffClient({
+-          tools: tools('end_turn', 'task_completed'),
+-        }).signal,
+-      ).toBe('foreign_toolset')
+-      expect(
+-        detectForeignFreebuffClient({ tools: tools('end_turn', 'read_files') })
+-          .signal,
+-      ).toBeNull()
+-      // Our own hollow-by-nature tools are not reported as laundering either.
+-      expect(
+-        detectForeignFreebuffClient({ tools: tools('end_turn', 'read_files') })
+-          .hollowToolNames,
+-      ).toEqual([])
+-    })
+-
+-    test('a custom tool is still taken at its name', () => {
+-      // `decide` has no schema in toolParams to check against.
+-      expect(
+-        detectForeignFreebuffClient({ tools: [stubTool('decide')] }).signal,
+-      ).toBeNull()
+-    })
+-
+-    test('genuine toolsets report no hollow names', () => {
+-      for (const toolset of FREEBUFF_TOOLSETS) {
+-        expect(
+-          detectForeignFreebuffClient({ tools: toolset }).hollowToolNames,
+-        ).toEqual([])
+-      }
+-    })
+-
+-    test('MCP tools beside our real tools still clear', () => {
+-      // The reason the rule is "at least one genuine" and not "all ours": a CLI
+-      // user can attach any MCP server to a base agent.
+-      expect(
+-        detectForeignFreebuffClient({
+-          tools: [
+-            ...tools('read_files', 'run_terminal_command', 'str_replace'),
+-            stubTool('ghidra__decompile_function', schema('address')),
+-            stubTool('ghidra__list_functions', schema('offset', 'limit')),
+-          ],
+-        }).signal,
+-      ).toBeNull()
+-    })
+-  })
+-
+-  test('reports bounded evidence for the log line', () => {
+-    const verdict = detectForeignFreebuffClient({
+-      tools: tools('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j'),
+-    })
+-    expect(verdict.toolCount).toBe(10)
+-    expect(verdict.sampleToolNames).toHaveLength(8)
+-  })
+-
+-  test.each([
+-    ['researcher-web', ['web_search', 'read_url']],
+-    ['researcher-docs', ['read_docs']],
+-    ['freebuff-desktop-autorun', ['decide']],
+-    ['basher', ['run_terminal_command']],
+-    ['file-picker', ['spawn_agents']],
+-  ])('clears our own %s toolset', (_agent, names) => {
+-    // Backtested over 30 days against the signature alone: researcher-web was
+-    // flagged on 100% of 334,042 requests from 4,821 users, autorun on 100% of
+-    // 2,904 from 41. `web_search` cannot join the signature (opencode ships
+-    // it), so these clear by the every-tool-is-ours rule instead.
+-    expect(
+-      detectForeignFreebuffClient({ tools: tools(...names) }).signal,
+-    ).toBeNull()
+-  })
+-
+-  test('a harness tool name is foreign even beside our genuine tools', () => {
+-    // This test used to assert the opposite — that one borrowed distinctive
+-    // name clears an otherwise foreign toolset — as a known cost of `some`
+-    // semantics. 2026-09-18: a proxy appended our REAL definitions to Claude
+-    // Code's toolset and cleared the schema rule the morning after it
+-    // shipped. `some` still holds for names we cannot classify (MCP, local
+-    // agents); it no longer holds for a name only a harness we do not ship
+-    // uses.
+-    const verdict = detectForeignFreebuffClient({
+-      tools: [
+-        ...tools('read_files', 'run_terminal_command'),
+-        ...CLAUDE_CODE_TOOLS,
+-      ],
+-    })
+-    expect(verdict.signal).toBe('foreign_tool_names')
+-    expect(verdict.hollowToolNames).toEqual([])
+-    expect(
+-      resolveForeignClientDowngrade({
+-        body: {
+-          model: 'deepseek/deepseek-v4-flash',
+-          tools: [...tools('read_files'), stubTool('Bash', schema('command'))],
+-        },
+-      })?.downgradeTo,
+-    ).toBe(FREEBUFF_DOWNGRADE_MODEL_ID)
+-  })
+-
+-  test('the harness list never names a tool any of our surfaces registers', () => {
+-    for (const name of FOREIGN_HARNESS_TOOL_NAMES) {
+-      expect(FREEBUFF_SIGNATURE_TOOL_NAMES.has(name)).toBe(false)
+-      expect(GENERIC_TOOL_NAMES.has(name)).toBe(false)
+-      expect(
+-        (FREEBUFF_CUSTOM_TOOL_NAMES as readonly string[]).includes(name),
+-      ).toBe(false)
+-      // Desktop THREAD_TOOL_SPECS and Web image/document tools, by name.
+-      expect([
+-        'suggest_prompts',
+-        'ask_questions',
+-        'exit_plan',
+-        'request_elevation',
+-        'read_thread_context',
+-        'register_preview',
+-        'preview_snapshot',
+-        'preview_screenshot',
+-        'preview_click',
+-        'preview_type',
+-        'preview_navigate',
+-        'inspect_image',
+-        'search_files',
+-        'read_file_lines',
+-      ]).not.toContain(name)
+-    }
+-    // Our names and MCP names never look like harness names.
+-    for (const name of toolNames) {
+-      expect(FOREIGN_HARNESS_TOOL_NAMES.has(name)).toBe(false)
+-    }
+-  })
+-
+-  test('a harness identity in a system message is foreign', () => {
+-    const claudeCodePrompt =
+-      'You are Buffy, the strategic coding assistant.\n\n' +
+-      "You are Claude Code, Anthropic's official CLI for Claude."
+-    expect(
+-      detectForeignFreebuffClient({
+-        tools: tools('read_files', 'run_terminal_command'),
+-        messages: [{ role: 'system', content: claudeCodePrompt }],
+-      }).signal,
+-    ).toBe('foreign_system_prompt')
+-    // Any system message, not only the first, and content-part arrays too.
+-    expect(
+-      detectForeignFreebuffClient({
+-        messages: [
+-          {
+-            role: 'system',
+-            content: 'You are Buffy, the strategic coding assistant.',
+-          },
+-          {
+-            role: 'system',
+-            content: [
+-              {
+-                type: 'text',
+-                text: 'x-anthropic-billing-header: cc_version=2.1.0; cc_entrypoint=cli',
+-              },
+-            ],
+-          },
+-        ],
+-      }).signal,
+-    ).toBe('foreign_system_prompt')
+-    expect(
+-      findForeignHarnessPromptMarker([
+-        { role: 'system', content: claudeCodePrompt },
+-      ]),
+-    ).toBe('You are Claude Code')
+-  })
+-
+-  test('a harness identity in a USER message is not', () => {
+-    // A Freebuff user pasting a Claude Code transcript into a chat must never
+-    // be downgraded, let alone permanently flagged. Only system-role text
+-    // counts, and that text is client-authored.
+-    expect(
+-      detectForeignFreebuffClient({
+-        tools: tools('read_files'),
+-        messages: [
+-          {
+-            role: 'system',
+-            content: 'You are Buffy, the strategic coding assistant.',
+-          },
+-          {
+-            role: 'user',
+-            content:
+-              'why does it say "You are Claude Code, Anthropic\'s official CLI" here?',
+-          },
+-        ],
+-      }).signal,
+-    ).toBeNull()
+-  })
+-
+-  test('reports unrecognised names for the observe-only line', () => {
+-    const verdict = detectForeignFreebuffClient({
+-      tools: [
+-        ...tools('read_files', 'file_picker'),
+-        stubTool('ghidra__decompile', schema('address')),
+-        stubTool('my_local_agent', schema('prompt')),
+-      ],
+-    })
+-    expect(verdict.signal).toBeNull()
+-    // `file_picker` is an agent-as-tool name the server cannot enumerate, so
+-    // it is reported too — which is why nothing enforces on this list.
+-    expect(verdict.unrecognisedToolNames).toEqual([
+-      'file_picker',
+-      'my_local_agent',
+-    ])
+-    expect(listUnrecognisedToolNames(CLAUDE_CODE_TOOLS)).toEqual([])
+-  })
+-
+-  test('a root agent offering no tools is a bare completion proxy', () => {
+-    // Our roots always ship their toolset — that is what makes them agentic.
+-    // Measured over 7 days with assistant-response rows excluded, the desktop
+-    // roots send zero tool-free requests (0 of 683,151 for -v3, 0 of 294,823
+-    // for -worktree) and the CLI roots 0.30%/2.81%. All 18 users sampled across
+-    // that tail were non-coding automation.
+-    expect(detectForeignFreebuffClient({}, true).signal).toBe(
+-      'root_agent_no_tools',
+-    )
+-    // Sampling params do not change the verdict for a root.
+-    expect(detectForeignFreebuffClient({ temperature: 0.7 }, true).signal).toBe(
+-      'root_agent_no_tools',
+-    )
+-  })
+-
+-  test('a root agent sending our tools is still ours', () => {
+-    // Evading root_agent_no_tools means sending our toolset, at which point the
+-    // toolset check applies instead — the same convergent property.
+-    expect(
+-      detectForeignFreebuffClient({ tools: tools('ask_user') }, true).signal,
+-    ).toBeNull()
+-    expect(
+-      detectForeignFreebuffClient({ tools: tools('Bash', 'Edit') }, true)
+-        .signal,
+-    ).toBe('foreign_tool_names')
+-  })
+-
+-  test('a tool-free SUBagent is untouched', () => {
+-    // Our helper agents (chat titles, compaction, researcher-docs) legitimately
+-    // send no tools; only ROOT agents are agentic by definition. Defaulting
+-    // isRootAgent to false keeps every non-root caller on the old behaviour.
+-    expect(detectForeignFreebuffClient({}).signal).toBeNull()
+-    expect(detectForeignFreebuffClient({}, false).signal).toBeNull()
+-  })
+-
+-  test('downgrade target is the free OpenRouter variant', () => {
+-    expect(FREEBUFF_DOWNGRADE_MODEL_ID).toBe('inclusionai/ling-3.0-tiny:free')
+-    expect(FREEBUFF_DOWNGRADE_MODEL_ID.endsWith(':free')).toBe(true)
+-  })
+-})
+-
+-describe('resolveForeignClientDowngrade', () => {
+-  const foreign = { tools: tools('Bash', 'Edit') }
+-  const params = { max_completion_tokens: 977_725 }
+-  const ours = { tools: tools('ask_user', 'read_files') }
+-
+-  test('always downgrades a foreign toolset', () => {
+-    // Third-party clients are a terms violation: Freebuff funds free inference
+-    // with ads only our own clients render, so a proxied request takes the
+-    // cost and returns none of the revenue. There is no mode in which this is
+-    // served what it asked for.
+-    expect(resolveForeignClientDowngrade({ body: foreign })!.downgradeTo).toBe(
+-      FREEBUFF_DOWNGRADE_MODEL_ID,
+-    )
+-  })
+-
+-  test('reports but never acts on a tool-free root agent', () => {
+-    // Deliberately report-only. The 30-day backtest found 3,729 users who mix
+-    // tool-free root requests into real agentic traffic, 999 of whose sessions
+-    // contain both — enforcing per-request swaps the model mid-session for real
+-    // coding runs. Only 417 users are pure proxies, and no run-length threshold
+-    // separates them (the MIXED cohort holds the longest tool-free run, 11,094,
+-    // vs 2,153 for the proxies). Flipping this to enforce needs an
+-    // account-level verdict, not a change here.
+-    const d = resolveForeignClientDowngrade({ body: {}, isRootAgent: true })!
+-    expect(d.signal).toBe('root_agent_no_tools')
+-    expect(d.downgradeTo).toBeNull()
+-  })
+-
+-  test('leaves a tool-free non-root request alone', () => {
+-    expect(resolveForeignClientDowngrade({ body: {} })).toBeNull()
+-  })
+-
+-  test('reports but never acts on the sampling-param signal', () => {
+-    const decision = resolveForeignClientDowngrade({ body: params })!
+-    expect(decision.signal).toBe('sampling_params')
+-    expect(decision.downgradeTo).toBeNull()
+-  })
+-
+-  test('a freebuff toolset is never reported', () => {
+-    expect(resolveForeignClientDowngrade({ body: ours })).toBeNull()
+-  })
+-
+-  test('does not re-downgrade a request already on the downgrade model', () => {
+-    const decision = resolveForeignClientDowngrade({
+-      body: { ...foreign, model: FREEBUFF_DOWNGRADE_MODEL_ID },
+-    })!
+-    expect(ENFORCED_SIGNALS.has(decision.signal)).toBe(true)
+-    expect(decision.downgradeTo).toBeNull()
+-  })
+-})
+-
+-function schema(...keys: string[]) {
+-  return {
+-    type: 'object',
+-    properties: Object.fromEntries(keys.map((k) => [k, { type: 'string' }])),
+-  }
+-}
+-
+-function offered(tool: string | ReturnType<typeof wireTool>) {
+-  const t = typeof tool === 'string' ? wireTool(tool) : tool
+-  return { name: t.function.name, parameters: t.function.parameters }
+-}
+diff --git a/common/src/__tests__/foreign-client-wire-tools.ts b/common/src/__tests__/foreign-client-wire-tools.ts
+deleted file mode 100644
+index 427a84dc3..000000000
+--- a/common/src/__tests__/foreign-client-wire-tools.ts
++++ /dev/null
+@@ -1,117 +0,0 @@
+-import z from 'zod/v4'
+-
+-import { toolParams } from '../tools/list'
+-
+-/**
+- * Test fixtures shaped like the `tools` array our clients actually put on the
+- * wire, so the detector's schema check sees what production sees.
+- *
+- * `wireTool(name)` serialises the Zod schema in `toolParams` the way the AI
+- * SDK does (`z.toJSONSchema`, forwarded verbatim as `function.parameters`).
+- * A name outside `toolParams` — a spawnable agent exposed as a tool, a custom
+- * tool registered at runtime — gets a generic non-empty object schema, which
+- * is what those carry in production. `stubTool` is the other side: a bare
+- * name, optionally over an arbitrary schema, for foreign harnesses and for the
+- * hollow definitions the resale proxies inject.
+- */
+-export type WireTool = {
+-  type: 'function'
+-  function: { name: string; description?: string; parameters?: unknown }
+-}
+-
+-export function wireTool(name: string): WireTool {
+-  const params = (
+-    toolParams as Record<
+-      string,
+-      { inputSchema?: z.ZodType; description?: string } | undefined
+-    >
+-  )[name]
+-  if (params?.inputSchema) {
+-    const parameters = z.toJSONSchema(params.inputSchema, { io: 'input' })
+-    return {
+-      type: 'function',
+-      function: { name, description: params.description, parameters },
+-    }
+-  }
+-  return {
+-    type: 'function',
+-    function: {
+-      name,
+-      description: `Spawn the ${name} agent`,
+-      parameters: {
+-        type: 'object',
+-        properties: { prompt: { type: 'string' } },
+-      },
+-    },
+-  }
+-}
+-
+-export function wireTools(...names: string[]): WireTool[] {
+-  return names.map(wireTool)
+-}
+-
+-export function stubTool(
+-  name: string,
+-  parameters?: unknown,
+-  description?: string,
+-): WireTool {
+-  return {
+-    type: 'function',
+-    function: {
+-      name,
+-      ...(description !== undefined && { description }),
+-      ...(parameters !== undefined && { parameters }),
+-    },
+-  }
+-}
+-
+-export function stubTools(...names: string[]): WireTool[] {
+-  return names.map((name) =>
+-    stubTool(name, {
+-      type: 'object',
+-      properties: { input: { type: 'string' } },
+-    }),
+-  )
+-}
+-
+-/**
+- * The exact definition every public resale proxy appends to a foreign
+- * toolset (freebuff2api and forks, trefeon/freebuff-proxy, 9router's freebuff
+- * executor, all read 2026-09-17). Kept byte-for-byte so a regression here is a
+- * regression against the real thing.
+- */
+-export const PROXY_HOLLOW_END_TURN: WireTool = {
+-  type: 'function',
+-  function: {
+-    name: 'end_turn',
+-    description: 'Signal the end of the current task.',
+-    parameters: { type: 'object', properties: {} },
+-  },
+-}
+-
+-/** Claude Code's core toolset as it reaches us through an Anthropic→OpenAI
+- *  bridge, with each tool's real parameter names. */
+-export const CLAUDE_CODE_TOOLS: WireTool[] = [
+-  stubTool('Agent', obj('description', 'prompt', 'subagent_type')),
+-  stubTool('AskUserQuestion', obj('questions')),
+-  stubTool(
+-    'Bash',
+-    obj('command', 'timeout', 'description', 'run_in_background'),
+-  ),
+-  stubTool('Edit', obj('file_path', 'old_string', 'new_string', 'replace_all')),
+-  stubTool('Glob', obj('pattern', 'path')),
+-  stubTool('Grep', obj('pattern', 'path', 'glob', 'output_mode')),
+-  stubTool('Read', obj('file_path', 'offset', 'limit')),
+-  stubTool('Write', obj('file_path', 'content')),
+-  stubTool('WebFetch', obj('url', 'prompt')),
+-  stubTool('WebSearch', obj('query', 'allowed_domains')),
+-  stubTool('TodoWrite', obj('todos')),
+-  stubTool('Skill', obj('skill', 'args')),
+-]
+-
+-function obj(...keys: string[]) {
+-  return {
+-    type: 'object',
+-    properties: Object.fromEntries(keys.map((k) => [k, { type: 'string' }])),
+-  }
+-}
+diff --git a/common/src/constants/foreign-client-signals.ts b/common/src/constants/foreign-client-signals.ts
+deleted file mode 100644
+index 3cedbda88..000000000
+--- a/common/src/constants/foreign-client-signals.ts
++++ /dev/null
+@@ -1,662 +0,0 @@
+-import z from 'zod/v4'
+-
+-import { toolNames } from '../tools/constants'
+-import { toolParams } from '../tools/list'
+-
+-/**
+- * Where a free-mode request goes when it did not come from a freebuff client.
+- *
+- * OpenRouter's `:free` variant, so a downgraded request costs nothing upstream
+- * — which is the point. A caller proxying our free endpoint into their own
+- * harness is spending our inference budget; serving them a free model spends
+- * none of it. `getChatCompletionsProvider` has no branch for this slug and
+- * falls through to `openrouter`, so nothing else needs to know about it.
+- *
+- * Verified against the OpenRouter catalog on 2026-08-08: 262k context, $0
+- * prompt and completion, and `tools` + `tool_choice` in supported_parameters —
+- * so a downgraded tool-calling request degrades rather than hard-erroring.
+- */
+-export const FREEBUFF_DOWNGRADE_MODEL_ID = 'inclusionai/ling-3.0-tiny:free'
+-
+-/**
+- * Tool names we define that other agent harnesses also ship.
+- *
+- * Maintained as an EXCLUSION list, with the signature derived from it, because
+- * the inclusion list rotted: `researcher-web` offers exactly
+- * `['web_search', 'read_url']`, and a hand-picked signature that happened to
+- * omit both flagged 100% of its 334,042 requests from 4,821 users over 30 days.
+- * Any tool added to `toolNames` now joins the signature automatically, so the
+- * failure mode is a new *generic* name we forget to list here — which flags a
+- * third party we could already flag, rather than silently downgrading our own
+- * users.
+- *
+- * Each entry carries the third-party usage that justifies it, so this stays
+- * evidence rather than superstition.
+- */
+-export const GENERIC_TOOL_NAMES: ReadonlySet<string> = new Set([
+-  // Counts are distinct users, over 30 days, on requests carrying NO signature
+-  // tool at all — i.e. unambiguously third-party harnesses. Anything without
+-  // that evidence belongs in the signature: excluding a name we define costs us
+-  // nothing against proxies and risks flagging whichever agent of ours uses it
+-  // alone, which is exactly how researcher-web broke.
+-  'write_file', // 3,372 users (Cline)
+-  'web_search', // 3,273 users (opencode)
+-  'glob', // 2,691 users (opencode, Claude Code ships `Glob`)
+-  'skill', // 2,257 users
+-  'apply_patch', // 1,137 users (Codex)
+-])
+-
+-/**
+- * Tools our own surfaces define outside `toolNames`, via
+- * `customToolDefinitions`. Freebuff Desktop's autorun agent
+- * (freebuff-desktop/src/server/services/mission.ts) offers exactly `decide` and
+- * nothing else, so without this it had no signature tool at all and was flagged
+- * on 100% of its 2,904 requests from 41 users over 30 days.
+- */
+-export const FREEBUFF_CUSTOM_TOOL_NAMES = ['decide', 'complete_compaction'] as const
+-
+-/**
+- * Tool names that, on their own, mark a request as coming from one of our
+- * clients: everything we define that is not generic.
+- *
+- * The discriminator is the tool schema rather than the system prompt because
+- * the two are attacker-controlled in very different ways. A system prompt is
+- * free to copy — ours ships in the CLI and is recoverable from any response —
+- * so a prompt check is a speed bump. Tool schemas are not free to copy: a
+- * harness dispatches on the tool name the model returns, so sending ours means
+- * also executing ours and speaking our result format. Evading this check
+- * converges on behaving like a real client, which is the outcome we want.
+- *
+- * A NAME alone stopped being enough on 2026-09-17. Every public resale proxy
+- * (freebuff2api and its forks, freebuff-proxy, 9router) had adapted to the
+- * `some(signature)` rule the same way: append one hollow definition —
+- * `end_turn` with an empty schema and a one-line description we never shipped
+- * — to whatever toolset the real harness (Claude Code, Codex, Cline, opencode)
+- * sent, and let the model never call it. Names are strings; strings are free.
+- * So a signature tool now has to be GENUINE — see `isGenuineSignatureTool` —
+- * which means carrying the parameter schema we ship under that name.
+- */
+-export const FREEBUFF_SIGNATURE_TOOL_NAMES: ReadonlySet<string> = new Set([
+-  ...(toolNames as readonly string[]).filter(
+-    (name) => !GENERIC_TOOL_NAMES.has(name),
+-  ),
+-  ...FREEBUFF_CUSTOM_TOOL_NAMES,
+-])
+-
+-/**
+- * Tool names that belong to a harness we do not ship. Offering ANY of them
+- * marks the request foreign, whatever else it carries.
+- *
+- * Why this exists beside the schema rule: the schema rule says "at least one
+- * tool must be genuinely ours", which is what lets a CLI user attach MCP tools
+- * beside our own. But a proxy that appends our REAL definitions to Claude
+- * Code's toolset satisfies it too — and 2026-09-18, the morning after the
+- * schema rule shipped, a Discord user was still running Claude Code on the
+- * free lane. Nothing we ship offers `Bash` or `AskUserQuestion`; our names
+- * are snake_case, MCP tools carry `server__tool`, and agent-as-tool names are
+- * lowercase agent ids. So a PascalCase Claude Code core tool, or one of the
+- * distinctive Codex / OpenClaw / opencode names below, is a third-party client
+- * with no laundering left to do.
+- *
+- * Evidence rule, same as GENERIC_TOOL_NAMES: every name here was read off
+- * DOWNGRADED traffic in Axiom (`freebuff_foreign_client_detected`,
+- * `sampleToolNames`) on 2026-09-17/18, and none collides with a name any of
+- * our surfaces registers (`toolNames`, `FREEBUFF_CUSTOM_TOOL_NAMES`, Desktop's
+- * THREAD_TOOL_SPECS, Web's image/document tools). Generic lowercase names a
+- * user's local agent could plausibly take (`clarify`, `question`,
+- * `update_plan`, Cline's `read_file` / `search_files` — Web registers a
+- * `search_files`) are deliberately NOT here; those harnesses are caught by
+- * the schema rule instead.
+- */
+-export const FOREIGN_HARNESS_TOOL_NAMES: ReadonlySet<string> = new Set([
+-  // Claude Code core tools (216 users / 2,932 requests in one 6h window)
+-  'Agent',
+-  'AskUserQuestion',
+-  'Bash',
+-  'BashOutput',
+-  'KillShell',
+-  'Edit',
+-  'MultiEdit',
+-  'Write',
+-  'Read',
+-  'Glob',
+-  'Grep',
+-  'NotebookEdit',
+-  'WebFetch',
+-  'WebSearch',
+-  'TodoWrite',
+-  'Task',
+-  'Skill',
+-  'SlashCommand',
+-  'EnterPlanMode',
+-  'ExitPlanMode',
+-  'EnterWorktree',
+-  'ExitWorktree',
+-  'ToolSearch',
+-  'CronCreate',
+-  'CronDelete',
+-  'CronList',
+-  'CronUpdate',
+-  'SendMessage',
+-  'ListAgents',
+-  'TaskStop',
+-  'TaskOutput',
+-  'Monitor',
+-  'ScheduleWakeup',
+-  'DesignSync',
+-  'Artifact',
+-  // Cursor
+-  'AskQuestion',
+-  'ReadLints',
+-  'StrReplace',
+-  'Shell',
+-  'Delete',
+-  // Codex
+-  'exec_command',
+-  'write_stdin',
+-  'request_user_input',
+-  // OpenClaw
+-  'browser_exec',
+-  'delegate_task',
+-  'computer_use',
+-  // opencode
+-  'todowrite',
+-  'todoread',
+-  'webfetch',
+-])
+-
+-/**
+- * Phrases a third-party harness writes into its SYSTEM prompt and none of
+- * ours ever does. Checked across every system-role message, not only the
+- * first: the root-prompt gate already forces our canonical opening to
+- * position 0, so a proxy appends the harness prompt after it or as a second
+- * system message. Only system-role text is read — a user pasting a Claude
+- * Code transcript into a Freebuff chat must never trip this.
+- *
+- * Claude Code's prompt opens "You are Claude Code, Anthropic's official CLI
+- * for Claude" and leaks its billing header (`cc_version=…; cc_entrypoint=…`),
+- * both documented in docs/freebuff-abuse-detection.md. A string check is a
+- * speed bump on its own — the proxy can strip the sentence — but stripping it
+- * costs the harness its identity and instructions, and this layer sits behind
+- * the two structural ones.
+- */
+-export const FOREIGN_HARNESS_PROMPT_MARKERS: readonly string[] = [
+-  'You are Claude Code',
+-  "Anthropic's official CLI",
+-  'cc_version=',
+-  'cc_entrypoint=',
+-]
+-
+-export type ForeignClientSignal =
+-  | 'foreign_toolset'
+-  | 'foreign_tool_names'
+-  | 'foreign_system_prompt'
+-  | 'root_agent_no_tools'
+-  | 'sampling_params'
+-
+-export type ForeignClientVerdict = {
+-  /** Null when the request looks like it came from one of our clients. */
+-  signal: ForeignClientSignal | null
+-  toolCount: number
+-  /** A few offered tool names, for the log line. Bounded so logs stay small. */
+-  sampleToolNames: string[]
+-  /**
+-   * Offered tools that carry one of our signature NAMES but not our schema —
+-   * the laundering shape. Bounded like `sampleToolNames`. Logged so the next
+-   * adaptation (a proxy copying a real schema) is visible as a change in what
+-   * these look like, not only as a drop in the enforcement count.
+-   */
+-  hollowToolNames: string[]
+-  /**
+-   * Offered names that are neither ours, nor MCP-namespaced (`server__tool`),
+-   * nor on the foreign-harness list — bounded sample, observe-only. This is
+-   * the visibility the 2026-09-18 report lacked: a request that clears every
+-   * enforced rule is not logged anywhere, so the next laundering shape is
+-   * invisible until a user announces it. Local `.agents/` ids land here too,
+-   * which is why nothing enforces on it.
+-   */
+-  unrecognisedToolNames: string[]
+-}
+-
+-type InspectableRequest = {
+-  tools?: unknown
+-  messages?: unknown
+-  temperature?: unknown
+-  top_p?: unknown
+-  max_tokens?: unknown
+-  max_completion_tokens?: unknown
+-}
+-
+-/** Longest tool name kept for the log line. Names are caller-controlled, so an
+- *  untruncated one is a log-flood vector; nothing legitimate is near this. */
+-const MAX_LOGGED_TOOL_NAME_LENGTH = 64
+-
+-type OfferedTool = {
+-  name: string
+-  parameters: unknown
+-  description?: unknown
+-}
+-
+-function readOfferedTools(tools: unknown): OfferedTool[] {
+-  if (!Array.isArray(tools)) return []
+-  const offered: OfferedTool[] = []
+-  for (const tool of tools) {
+-    if (typeof tool !== 'object' || tool === null) continue
+-    const fn = (
+-      tool as {
+-        function?: {
+-          name?: unknown
+-          parameters?: unknown
+-          description?: unknown
+-        }
+-      }
+-    ).function
+-    if (typeof fn?.name !== 'string') continue
+-    offered.push({
+-      name: fn.name,
+-      parameters: fn.parameters,
+-      description: fn.description,
+-    })
+-  }
+-  return offered
+-}
+-
+-/**
+- * Top-level property names of a JSON-Schema-shaped object, or null when the
+- * value is not an object schema at all (absent, a string, an array …).
+- *
+- * Reads `properties` and, for a top-level union or intersection, the
+- * `properties` of every branch — the shape `z.toJSONSchema` produces for the
+- * schemas in `toolParams`, and the shape the AI SDK forwards verbatim as
+- * `function.parameters` (`@ai-sdk/openai-compatible` `prepareTools`).
+- */
+-function schemaPropertyKeys(schema: unknown): Set<string> | null {
+-  if (typeof schema !== 'object' || schema === null || Array.isArray(schema)) {
+-    return null
+-  }
+-  const keys = new Set<string>()
+-  const record = schema as Record<string, unknown>
+-  const properties = record.properties
+-  if (typeof properties === 'object' && properties !== null) {
+-    for (const key of Object.keys(properties)) keys.add(key)
+-  }
+-  for (const combinator of ['anyOf', 'oneOf', 'allOf']) {
+-    const branches = record[combinator]
+-    if (!Array.isArray(branches)) continue
+-    for (const branch of branches) {
+-      for (const key of schemaPropertyKeys(branch) ?? []) keys.add(key)
+-    }
+-  }
+-  return keys
+-}
+-
+-/**
+- * The top-level parameter names we ship for a tool in `toolParams`, or null
+- * for a name we do not define there (custom tools, agent-as-tool names).
+- *
+- * Computed from the same Zod schema every client serializes onto the wire, so
+- * it cannot drift from what our clients send. Top-level names only: the
+- * windowed and legacy `read_files` variants differ INSIDE `paths`, and a
+- * client one release behind may lack a newly added optional field, so the
+- * comparison below is "a subset of ours", never equality. Memoised because
+- * `z.toJSONSchema` runs per tool per request otherwise.
+- */
+-const canonicalKeysByTool = new Map<string, ReadonlySet<string> | null>()
+-export function canonicalToolParameterKeys(
+-  name: string,
+-): ReadonlySet<string> | null {
+-  const cached = canonicalKeysByTool.get(name)
+-  if (cached !== undefined) return cached
+-  const params = (toolParams as Record<string, { inputSchema?: unknown }>)[name]
+-  let keys: ReadonlySet<string> | null = null
+-  if (params?.inputSchema) {
+-    try {
+-      keys = schemaPropertyKeys(
+-        z.toJSONSchema(params.inputSchema as z.ZodType, { io: 'input' }),
+-      )
+-    } catch {
+-      keys = null
+-    }
+-  }
+-  canonicalKeysByTool.set(name, keys)
+-  return keys
+-}
+-
+-/**
+- * Whether an offered tool is one of ours in substance, not only in name.
+- *
+- * Three cases:
+- *
+- *  - A custom tool (`FREEBUFF_CUSTOM_TOOL_NAMES`) has no schema in `toolParams`
+- *    to check against, so its name is taken at face value, as before.
+- *  - A tool we define with parameters is genuine when it carries a NON-EMPTY
+- *    schema whose top-level names are a subset of ours. A subset, so a client a
+- *    release behind an added optional field still clears; non-empty, so a bare
+- *    `{}` under one of our names does not. This is what a renamed foreign tool
+- *    fails: Claude Code's `Read` relabelled `read_files` still asks for
+- *    `file_path`/`offset`/`limit`, not `paths`.
+- *  - A tool we define WITHOUT parameters (`end_turn`, `task_completed`) never
+- *    counts. There is nothing structural to verify — a copied name plus `{}`
+- *    is byte-identical to the real thing — and the alternative, comparing the
+- *    description string, is a check every client one release behind a wording
+- *    edit would fail. Every root and subagent we ship carries a parameterised
+- *    signature tool as well, and the shipped-agents CI test asserts it.
+- */
+-export function isGenuineSignatureTool(tool: OfferedTool): boolean {
+-  if (!FREEBUFF_SIGNATURE_TOOL_NAMES.has(tool.name)) return false
+-  if ((FREEBUFF_CUSTOM_TOOL_NAMES as readonly string[]).includes(tool.name)) {
+-    return true
+-  }
+-  const ours = canonicalToolParameterKeys(tool.name)
+-  if (!ours || ours.size === 0) return false
+-  const theirs = schemaPropertyKeys(tool.parameters)
+-  if (!theirs || theirs.size === 0) return false
+-  for (const key of theirs) {
+-    if (!ours.has(key)) return false
+-  }
+-  return true
+-}
+-
+-/**
+- * Whether an offered tool wears one of our signature names without being
+- * ours — the laundering shape, for the log line. Never decides anything.
+- *
+- * For a parameterised tool this is simply "not genuine". For a
+- * zero-parameter tool, which `isGenuineSignatureTool` cannot vouch for either
+- * way, the DESCRIPTION is compared instead: that is the one field the hollow
+- * `end_turn` the proxies inject gets wrong ("Signal the end of the current
+- * task." against the paragraph we ship), and because this only feeds a log,
+- * a client one release behind a wording edit costs a misleading log line, not
+- * a downgrade. Which is exactly why the same comparison is not enforced.
+- */
+-export function isHollowSignatureTool(tool: OfferedTool): boolean {
+-  if (!FREEBUFF_SIGNATURE_TOOL_NAMES.has(tool.name)) return false
+-  if ((FREEBUFF_CUSTOM_TOOL_NAMES as readonly string[]).includes(tool.name)) {
+-    return false
+-  }
+-  const ours = canonicalToolParameterKeys(tool.name)
+-  if (!ours) return false
+-  if (ours.size > 0) return !isGenuineSignatureTool(tool)
+-  const shipped = (toolParams as Record<string, { description?: unknown }>)[
+-    tool.name
+-  ]?.description
+-  return (
+-    typeof shipped !== 'string' ||
+-    typeof tool.description !== 'string' ||
+-    tool.description.trim() !== shipped.trim()
+-  )
+-}
+-
+-function systemMessageTexts(messages: unknown): string[] {
+-  if (!Array.isArray(messages)) return []
+-  const texts: string[] = []
+-  for (const message of messages) {
+-    if (typeof message !== 'object' || message === null) continue
+-    const { role, content } = message as { role?: unknown; content?: unknown }
+-    if (role !== 'system') continue
+-    if (typeof content === 'string') texts.push(content)
+-    else if (Array.isArray(content)) {
+-      for (const part of content) {
+-        const text =
+-          typeof part === 'object' && part !== null
+-            ? (part as { text?: unknown }).text
+-            : undefined
+-        if (typeof text === 'string') texts.push(text)
+-      }
+-    }
+-  }
+-  return texts
+-}
+-
+-/** The first foreign-harness marker found in any system-role message, or
+- *  null. Exported for the route's log line. */
+-export function findForeignHarnessPromptMarker(
+-  messages: unknown,
+-): string | null {
+-  for (const text of systemMessageTexts(messages)) {
+-    for (const marker of FOREIGN_HARNESS_PROMPT_MARKERS) {
+-      if (text.includes(marker)) return marker
+-    }
+-  }
+-  return null
+-}
+-
+-const KNOWN_TOOL_NAMES: ReadonlySet<string> = new Set([
+-  ...(toolNames as readonly string[]),
+-  ...FREEBUFF_CUSTOM_TOOL_NAMES,
+-])
+-
+-/** Bounded sample of offered names that are neither ours, MCP-namespaced nor
+- *  on the harness list. For the route's observe-only line on requests that
+- *  CLEAR every enforced rule, which are otherwise never logged. */
+-export function listUnrecognisedToolNames(tools: unknown): string[] {
+-  return readOfferedTools(tools)
+-    .filter((tool) => isUnrecognisedToolName(tool.name))
+-    .slice(0, 8)
+-    .map((tool) => tool.name.slice(0, MAX_LOGGED_TOOL_NAME_LENGTH))
+-}
+-
+-function isUnrecognisedToolName(name: string): boolean {
+-  return (
+-    !KNOWN_TOOL_NAMES.has(name) &&
+-    !FOREIGN_HARNESS_TOOL_NAMES.has(name) &&
+-    !name.includes('__')
+-  )
+-}
+-
+-/**
+- * Whether a free-mode request came from something other than a freebuff client.
+- *
+- * Three signals, checked in a deliberate order:
+- *
+- *  0. The request offers a tool by a name only a third-party harness uses
+- *     (`FOREIGN_HARNESS_TOOL_NAMES`), or a system message carries a harness
+- *     identity (`FOREIGN_HARNESS_PROMPT_MARKERS`). Either is foreign no
+- *     matter what else the request carries — including our own genuine
+- *     tools, which is precisely the laundering these two exist to stop.
+- *  1. The request offers tools and not one of them is GENUINELY ours — our
+- *     name over our parameter schema (`isGenuineSignatureTool`). Measured over
+- *     24h of DeepSeek V4 Flash traffic before the schema requirement: 557
+- *     users / 75,741 requests; by 2026-09-17 the name-only rule enforced on
+- *     ~816 requests/day from 71 users while the resale proxies passed it with
+- *     a hollow `end_turn`.
+- *  2. The request offers NO tools and the agent is one of our roots, which are
+- *     agentic by definition — a caller using a root agent id as a bare
+- *     completion endpoint. Reported only; never enforced.
+- *  3. The request offers no tools and sets `temperature`, `top_p` or
+- *     `max_tokens`. Our clients leave all three unset on 99.2% of requests.
+- *     Reported only; never enforced.
+- *
+- * Signal 1 wins outright when it clears the request, and that ordering is the
+- * whole safety story rather than a detail: 16 users in the same window send our
+- * toolset *and* set sampling params (2,673 requests). Checking params first, or
+- * checking them independently, would downgrade those users. Anyone sending our
+- * tools is one of ours no matter what else the body says.
+- */
+-export function detectForeignFreebuffClient(
+-  body: InspectableRequest,
+-  /** The resolved agent id, when the caller has it. Root agents are agentic by
+-   *  definition, so one that offers no tools is not being driven by our client
+-   *  — see `root_agent_no_tools` below. */
+-  isRootAgent = false,
+-): ForeignClientVerdict {
+-  const offered = readOfferedTools(body.tools)
+-  const sampleToolNames = offered
+-    .slice(0, 8)
+-    .map((tool) => tool.name.slice(0, MAX_LOGGED_TOOL_NAME_LENGTH))
+-  const unrecognisedToolNames = listUnrecognisedToolNames(body.tools)
+-  // Our name, not our schema. Empty on every request our clients send and on
+-  // every unadapted foreign harness; populated exactly by the laundering shape.
+-  const hollowToolNames = offered
+-    .filter(isHollowSignatureTool)
+-    .slice(0, 8)
+-    .map((tool) => tool.name.slice(0, MAX_LOGGED_TOOL_NAME_LENGTH))
+-
+-  const evidence = {
+-    toolCount: offered.length,
+-    sampleToolNames,
+-    hollowToolNames,
+-    unrecognisedToolNames,
+-  }
+-
+-  // A harness's own tool name or identity settles it before the signature is
+-  // consulted: appending our genuine definitions to Claude Code's toolset must
+-  // not launder it.
+-  if (offered.some((tool) => FOREIGN_HARNESS_TOOL_NAMES.has(tool.name))) {
+-    return { signal: 'foreign_tool_names', ...evidence }
+-  }
+-  if (findForeignHarnessPromptMarker(body.messages) !== null) {
+-    return { signal: 'foreign_system_prompt', ...evidence }
+-  }
+-
+-  if (offered.length > 0) {
+-    const hasSignatureTool = offered.some(isGenuineSignatureTool)
+-    return {
+-      signal: hasSignatureTool ? null : 'foreign_toolset',
+-      ...evidence,
+-    }
+-  }
+-
+-  // A ROOT agent that offers no tools at all. Our roots always ship their
+-  // toolset — the CI guard in foreign-client-shipped-agents.test.ts enforces
+-  // that — so on its face this is a caller driving one of our root agent ids as
+-  // a bare completion endpoint.
+-  //
+-  // An early hand-sample of 18 such users came back 18-for-18 non-coding
+-  // automation — Shopee customer-service bots, Solana memecoin traders, RAG
+-  // rephrasers, benchmark probes. DO NOT cite that as evidence for enforcing.
+-  // It was drawn from a tail of roughly 5,000 users and the cohort analysis
+-  // below shows it was not representative: 90% of the accounts the signal names
+-  // also do real agentic work. An 18-for-18 result from an unrepresentative
+-  // frame is what a biased sample looks like, not a strong one.
+-  //
+-  // REPORTED, NEVER ENFORCED, per the full 30-day backtest. Counting only root
+-  // agents and excluding the paired
+-  // assistant-response rows (they carry no tools by design and are half of all
+-  // rows — miss that and every agent reads ~50% tool-free):
+-  //
+-  //   base2-free-deepseek           4.46%  215,777 reqs   2,672 users
+-  //   base2-free-deepseek-flash     0.296% 103,726 reqs   2,281 users
+-  //   base2-free                    0.90%      222 reqs      15 users
+-  //   freebuff-desktop-thread-local 0.018%   2,400 reqs      11 users
+-  //
+-  // Only 417 of those users are 100% tool-free — actual bare-completion
+-  // proxies. The other 3,729 mix tool-free requests into heavy real agentic
+-  // traffic (bucket at <10% tool-free: 1,658 users over 1.25M requests), and
+-  // 7,379 of their tool-free requests land INSIDE 999 sessions that also make
+-  // tool-bearing root calls. Enforcing per-request would swap the model
+-  // mid-session for real coding runs.
+-  //
+-  // Nor does run length separate the two: the longest consecutive tool-free run
+-  // belongs to the MIXED cohort (11,094) and exceeds the pure proxies' longest
+-  // (2,153), with 334 mixed users exceeding 50. There is no per-request
+-  // threshold, so enforcement needs an account-level verdict this function
+-  // cannot see. Note also that these requests all already reproduce our
+-  // canonical root system prompt at position 0 — `requestHasFreebuffSystemMarker`
+-  // rejects root requests that do not — so the prompt is not a discriminator
+-  // either.
+-  if (isRootAgent) {
+-    return { signal: 'root_agent_no_tools', ...evidence }
+-  }
+-
+-  // Only reached when no tools were offered at all, so this can never override
+-  // the carve-out above.
+-  //
+-  // `!= null` deliberately, not `!== undefined`: a client that serializes its
+-  // whole request sends `"temperature": null` rather than omitting the key, and
+-  // that is unset, not a choice. Treating it as set downgraded every such
+-  // caller. This matches how the rest of the request path already reads these
+-  // fields — see `applyOpenRouterDefaultMaxTokens`, which gates on
+-  // `body.max_tokens != null` for the same reason.
+-  const setsSamplingParams =
+-    body.temperature != null ||
+-    body.top_p != null ||
+-    body.max_tokens != null ||
+-    body.max_completion_tokens != null
+-  return { signal: setsSamplingParams ? 'sampling_params' : null, ...evidence }
+-}
+-
+-/**
+- * Whether a toolset an OLDER build flagged `foreign_toolset` would clear on
+- * this one, judged from the stored names alone.
+- *
+- * Names are all a `ban_event` row keeps, so only a custom tool can vouch for a
+- * row: `isGenuineSignatureTool` takes those at face value, while every other
+- * signature tool needs a schema the row never recorded. A harness name still
+- * convicts. Pass the FULL toolset — a truncated sample may hide the names that
+- * flagged it.
+- *
+- * Exists because of 2026-09-23: `complete_compaction` joined
+- * `FREEBUFF_CUSTOM_TOOL_NAMES` in the same commit that shipped it, the runtime
+- * reached users before the detector did, and the sweep banned 62 real
+- * accounts on the observe rows the stale detector wrote in between.
+- */
+-export function isNowRecognisedToolset(names: readonly string[]): boolean {
+-  return (
+-    names.some((name) =>
+-      (FREEBUFF_CUSTOM_TOOL_NAMES as readonly string[]).includes(name),
+-    ) && !names.some((name) => FOREIGN_HARNESS_TOOL_NAMES.has(name))
+-  )
+-}
+-
+-/** The signals that change what is served. The other two are measurements. */
+-export const ENFORCED_SIGNALS: ReadonlySet<ForeignClientSignal> =
+-  new Set<ForeignClientSignal>([
+-    'foreign_toolset',
+-    'foreign_tool_names',
+-    'foreign_system_prompt',
+-  ])
+-
+-export type ForeignClientDecision = ForeignClientVerdict & {
+-  signal: ForeignClientSignal
+-  /** The model to serve instead, or null to serve what was requested. */
+-  downgradeTo: string | null
+-}
+-
+-/**
+- * Detect, then decide whether the signal changes what is served.
+- *
+- * `foreign_toolset`, `foreign_tool_names` and `foreign_system_prompt`
+- * downgrade. Using a third-party client against this
+- * endpoint is a terms violation, not a grey area: Freebuff funds free
+- * inference with ads that only our own clients render, so a proxied request
+- * takes the cost and returns none of the revenue.
+- *
+- * The other two are reported but never enforced, both because they fire on our
+- * own traffic:
+- *
+- *  - `sampling_params` — 568 requests / 13 users on
+- *    `code-reviewer-deepseek-flash` in a 24h sample, plus the CLI's own
+- *    free-mode shape, which sends `max_completion_tokens` with no tools. It
+- *    now only reports NON-root agents: `root_agent_no_tools` is checked first,
+- *    so the 8,884 requests / 395 users this used to cite on
+- *    `base2-free-deepseek-flash` classify under that signal instead. Neither
+- *    enforces, so the reclassification changes measurement, not behavior.
+- *  - `root_agent_no_tools` — 3,729 users who also do real agentic work, 999 of
+- *    whose sessions mix it with tool-bearing root calls. See the backtest in
+- *    `detectForeignFreebuffClient`. Catching the 417 genuine proxies inside
+- *    that population needs an account-level verdict, not a per-request one.
+- *
+- * They stay as measurements, which is what makes the account-level rule
+- * buildable later without guessing at its blast radius.
+- */
+-export function resolveForeignClientDowngrade(params: {
+-  body: InspectableRequest & { model?: unknown }
+-  isRootAgent?: boolean
+-}): ForeignClientDecision | null {
+-  const { body, isRootAgent = false } = params
+-  const verdict = detectForeignFreebuffClient(body, isRootAgent)
+-  if (!verdict.signal) return null
+-
+-  return {
+-    ...verdict,
+-    signal: verdict.signal,
+-    // Never downgrade something already on the downgrade model: that would be
+-    // a no-op write that still reads as an enforcement in the logs.
+-    downgradeTo:
+-      ENFORCED_SIGNALS.has(verdict.signal) &&
+-      body.model !== FREEBUFF_DOWNGRADE_MODEL_ID
+-        ? FREEBUFF_DOWNGRADE_MODEL_ID
+-        : null,
+-  }
+-}
+diff --git a/packages/agent-runtime/src/__tests__/compaction-tools-foreign-client.test.ts b/packages/agent-runtime/src/__tests__/compaction-tools-foreign-client.test.ts
+deleted file mode 100644
+index f05c6a7c1..000000000
+--- a/packages/agent-runtime/src/__tests__/compaction-tools-foreign-client.test.ts
++++ /dev/null
+@@ -1,27 +0,0 @@
+-import { describe, expect, test } from 'bun:test'
+-import { detectForeignFreebuffClient } from '@codebuff/common/constants/foreign-client-signals'
+-import z from 'zod/v4'
+-
+-import { compactionTools } from '../model-compaction'
+-
+-/**
+- * Runtime toolsets are invisible to the source scan in
+- * common/src/__tests__/foreign-client-shipped-agents.test.ts, which only reads
+- * `toolNames: [...]` literals. During compaction the runtime offers ONLY
+- * `compactionTools`; on 2026-09-23 a detector that did not know it flagged
+- * every compaction request and 62 real accounts were banned.
+- */
+-describe('compaction requests are not flagged as a foreign client', () => {
+-  test('the compaction toolset clears on its own', () => {
+-    const tools = Object.entries(compactionTools).map(([name, t]) => ({
+-      type: 'function' as const,
+-      function: {
+-        name,
+-        description: t.description,
+-        parameters: z.toJSONSchema(t.inputSchema as z.ZodType, { io: 'input' }),
+-      },
+-    }))
+-    expect(tools.length).toBeGreaterThan(0)
+-    expect(detectForeignFreebuffClient({ tools }).signal).toBeNull()
+-  })
+-})
