@@ -738,6 +738,8 @@ async function generateOnce (argv) {
     [`${DATA}/changelog.json`]: changelog,
     [`${DATA}/state.json`]: { lastSha: head, runs: (state.runs || 0) + 1, updatedAt: changelog.generatedAt }
   }))
+  // Derived fields land with the analyze output too, not only at publish time.
+  await repairDerivedFields(DATA)
 
   const prs = await fetchOpenPrs()
   await prunePrDiffs(prs || [], await readJson(`${DATA}/open-prs.json`, null))
@@ -881,6 +883,26 @@ async function realignOrigin (branch) {
  * every subsequent cycle. Here: origin is never discarded, this cycle's work is
  * re-merged onto it, and each retry starts from a clean tree.
  */
+// A publish must never revert derived fields. repair-entries is deterministic
+// (stored diffs only, never the API) and idempotent -- a few checks on rows that
+// are already current, real work only for new ones -- so the merged document is
+// repaired after every write here. Without it, a writer publishing an older
+// snapshot quietly strips the structured facts / significance / security tags a
+// corpus-wide `repair-entries` run added; the backfill is only as safe as the
+// last writer.
+async function repairDerivedFields (dataDir) {
+  const file = `${dataDir}/changelog.json`
+  const doc = await readJson(file, null)
+  if (!doc || !Array.isArray(doc.entries)) return 0
+  const diffDir = resolve(dataDir, 'diffs')
+  const n = repairEntries(doc.entries, { diffDir }) + refreshDiffFlags(doc.entries, diffDir)
+  if (n) {
+    await writeJson(file, doc)
+    log(`[repair] refreshed derived fields on ${n} row(s) before publish`)
+  }
+  return n
+}
+
 export async function commitAndPushData ({ message, overrides = {}, attempts = 3, root = ROOT, dataDir = DATA } = {}) {
   const branch = await currentBranch(root)
   // Where this cycle's derived files live, relative to the worktree: the only
@@ -888,6 +910,7 @@ export async function commitAndPushData ({ message, overrides = {}, attempts = 3
   const dataRel = relative(root, resolve(dataDir)) || 'data'
   const pending = await capturePendingWrites(dataDir, overrides)
   await persistMerged(pending)
+  await repairDerivedFields(dataDir)
 
   if (!await dirtyData(root)) {
     // A clean worktree is not an up-to-date one: after three failed push
@@ -933,6 +956,7 @@ export async function commitAndPushData ({ message, overrides = {}, attempts = 3
       await git(['reset', '--mixed', `origin/${branch}`], root, { allowFail: true })
       await git(['checkout', `origin/${branch}`, '--', dataRel], root, { allowFail: true })
       await persistMerged(pending)
+      await repairDerivedFields(dataDir)
       log('rebase conflicted: re-applied this cycle onto origin')
       if (await dirtyData(root)) {
         await git(['add', 'data'], root)
@@ -1555,6 +1579,7 @@ function MIME (f) {
   if (f.endsWith('.md')) return 'text/markdown; charset=utf-8'
   if (f.endsWith('.xsl')) return 'text/xsl; charset=utf-8'
   if (f.endsWith('.css')) return 'text/css'
+  if (f.endsWith('.js')) return 'text/javascript; charset=utf-8'
   if (f.endsWith('.svg')) return 'image/svg+xml'
   if (f.endsWith('.ico')) return 'image/x-icon'
   return 'application/octet-stream'
