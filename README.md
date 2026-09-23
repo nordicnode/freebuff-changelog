@@ -1,9 +1,9 @@
 # Freebuff Changelog
 
-[![Version](https://changelog.freebuff.dev/badge/version.svg)](https://changelog.freebuff.dev)
-[![Models](https://changelog.freebuff.dev/badge/models.svg)](https://changelog.freebuff.dev/models/)
-[![Status](https://changelog.freebuff.dev/badge/status.svg)](https://changelog.freebuff.dev)
-[![Changes](https://changelog.freebuff.dev/badge/changes.svg)](https://changelog.freebuff.dev/archive/)
+[![Version](https://freebuff-changelog.nordicnode.workers.dev/badge/version.svg)](https://freebuff-changelog.nordicnode.workers.dev)
+[![Models](https://freebuff-changelog.nordicnode.workers.dev/badge/models.svg)](https://freebuff-changelog.nordicnode.workers.dev/models/)
+[![Status](https://freebuff-changelog.nordicnode.workers.dev/badge/status.svg)](https://freebuff-changelog.nordicnode.workers.dev)
+[![Changes](https://freebuff-changelog.nordicnode.workers.dev/badge/changes.svg)](https://freebuff-changelog.nordicnode.workers.dev/archive/)
 
 Unofficial changelog generator and static site for [CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff).
 

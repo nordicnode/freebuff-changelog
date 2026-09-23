@@ -19,14 +19,30 @@ const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'acces
 
 export default {
   async fetch (request, env) {
+    // Nothing may escape as a Worker-level throw: `run_worker_first` routes
+    // EVERY request through here, so one uncaught TypeError answers the whole
+    // zone -- static files included -- with Cloudflare's 1101 page. This exact
+    // shape shipped once (assets binding missing -> env.ASSETS.fetch on
+    // undefined); the catch below and fetchAsset() make that class of slip a
+    // readable 500 on one route instead of a site-wide outage.
     try {
       const handled = await handle(request, env)
       if (handled) return handled
+      return await fetchAsset(env, request)
     } catch (err) {
       return new Response(JSON.stringify({ error: String(err?.message || err) }), { status: 500, headers: JSON_HEADERS })
     }
-    return env.ASSETS.fetch(request)
   }
+}
+
+// The binding exists only because wrangler.json sets `assets.binding`; without
+// it env.ASSETS is undefined and a passthrough fetch would throw into a
+// zone-wide 1101. Answer for the mistake instead.
+function fetchAsset (env, request) {
+  if (!env || !env.ASSETS || typeof env.ASSETS.fetch !== 'function') {
+    return json({ error: 'assets binding missing: wrangler.json must set assets.binding = "ASSETS"' }, 500)
+  }
+  return env.ASSETS.fetch(request)
 }
 
 async function handle (request, env) {
@@ -65,6 +81,7 @@ function json (obj, status) {
 }
 
 async function assetText (env, request, path) {
+  if (!env || !env.ASSETS || typeof env.ASSETS.fetch !== 'function') return null
   const res = await env.ASSETS.fetch(new Request(new URL(path, request.url), { method: 'GET' }))
   return res.ok ? res.text() : null
 }

@@ -112,6 +112,19 @@ test('worker: /api/entry/<sha>.json serves one record and 404s unknown shas', as
   assert.equal(miss.status, 404)
 })
 
+test('worker: a missing assets binding is a readable 500, never a thrown exception', async () => {
+  // The gap that shipped a zone-wide 1101: wrangler.json lacked assets.binding,
+  // so env.ASSETS was undefined and the passthrough fetch threw on EVERY
+  // request (static files included, because run_worker_first routes all of
+  // them through here). An uncaught throw is the worst possible answer.
+  await assert.doesNotReject(() => worker.fetch(new Request('https://x.test/'), {}))
+  const res = await worker.fetch(new Request('https://x.test/'), {})
+  assert.equal(res.status, 500)
+  assert.match(await res.text(), /assets binding missing/)
+  const entry = await worker.fetch(new Request('https://x.test/api/entry/deadbeef.json'), {})
+  assert.equal(entry.status, 404, 'entry lookups degrade to 404 without the binding')
+})
+
 test('worker: ?format=md answers text/markdown, /from/<d>/to/<d>/ answers the shell, the rest falls through', async () => {
   const env = fakeEnv({
     '/release/1.2.3/notes.md': '# Freebuff v1.2.3\n',
