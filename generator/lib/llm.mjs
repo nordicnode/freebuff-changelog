@@ -1838,9 +1838,11 @@ export async function gatherEntryContext (e, patch, { repoDir = null, entries = 
 // verdict is advisory: a summary that still fails is stored with
 // `verify: 'flagged'` rather than dropped.
 //
-// Budget: CHANGELOG_LLM_VERIFY=0 disables; =all verifies every row; =1 or
-// unset verifies the rows where an invented claim costs the most
-// (major/notable, multi-topic, or already carrying ungrounded names).
+// Budget: CHANGELOG_LLM_VERIFY=0 disables; =1 checks only the rows where an
+// invented claim costs the most (major/notable, multi-topic, or already
+// carrying ungrounded names); the default and =all check every row (only
+// newly summarized rows ever reach the verifier, so this is a per-run cost,
+// never a backlog sweep).
 // LLM_VERIFY_MODEL optionally routes the check to a different model.
 
 export function verifyConfigured (env = process.env) {
@@ -1848,13 +1850,19 @@ export function verifyConfigured (env = process.env) {
 }
 
 export function shouldVerify (e, clean, env = process.env) {
-  if (env.CHANGELOG_LLM_VERIFY === '0') return false
-  if (String(env.CHANGELOG_LLM_VERIFY || '').toLowerCase() === 'all') return true
-  const sig = clean?.significance || e?.significance || 'minor'
-  if (sig === 'major' || sig === 'notable') return true
-  if (isMultiTopic(e)) return true
-  if (clean?.ungrounded?.length) return true
-  return false
+  const mode = String(env.CHANGELOG_LLM_VERIFY || '').toLowerCase()
+  if (mode === '0') return false
+  // =1 is the old selective budget: only the rows where an invented claim
+  // costs the most. The default, like =all, checks every row -- the
+  // verify-what-ships posture for the handful of new rows each run brings.
+  if (mode === '1') {
+    const sig = clean?.significance || e?.significance || 'minor'
+    if (sig === 'major' || sig === 'notable') return true
+    if (isMultiTopic(e)) return true
+    if (clean?.ungrounded?.length) return true
+    return false
+  }
+  return true
 }
 
 export function buildVerifyPrompt (entry, patch, clean, cautionNames = []) {

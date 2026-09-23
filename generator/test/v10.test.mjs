@@ -110,12 +110,13 @@ test('summarizeChunked: maps chunks then fuses, validated on the full corpus', a
   }
 })
 
-test('shouldVerify: on for what costs most, off with =0, =all covers all', () => {
+test('shouldVerify: every row by default, =1 keeps the selective budget, =0 off', () => {
   const major = { significance: 'major', files: {} }
   const minor = { significance: 'minor', files: {} }
   const cleanMinor = { significance: 'minor' }
   assert.equal(shouldVerify(major, { significance: 'major' }, {}), true, 'major verifies by default')
-  assert.equal(shouldVerify(minor, cleanMinor, {}), false, 'clean minor skips by default')
+  assert.equal(shouldVerify(minor, cleanMinor, {}), true, 'every row verifies by default now')
+  assert.equal(shouldVerify(minor, cleanMinor, { CHANGELOG_LLM_VERIFY: '1' }), false, '=1 keeps the selective budget')
   assert.equal(shouldVerify(minor, cleanMinor, { CHANGELOG_LLM_VERIFY: 'all' }), true)
   assert.equal(shouldVerify(major, { significance: 'major' }, { CHANGELOG_LLM_VERIFY: '0' }), false)
   assert.equal(shouldVerify({ areas: ['CLI', 'SDK'], files: {} }, { significance: 'minor' }, {}), true, 'multi-topic verifies')
