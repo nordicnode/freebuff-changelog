@@ -9,6 +9,16 @@ import { shortHash } from '../lib/util.mjs'
 import { feedItem, jsonItem } from '../lib/feed.mjs'
 import { syncStaleMs } from '../lib/sync.mjs'
 
+// The shared shell and stylesheet ship as content-hashed assets instead of an
+// inline <style>+<script> per page, so script and CSS pins match the page plus
+// its shared assets -- exactly what a reader's browser runs.
+async function shellOf (dist) {
+  const names = await readdir(join(dist, 'assets')).catch(() => [])
+  let out = ''
+  for (const n of names) out += await readFile(join(dist, 'assets', n), 'utf8')
+  return out
+}
+
 // _headers rules cannot override each other on Cloudflare: every rule whose
 // pattern matches a URL is applied, and a header name set twice is *joined* with
 // a comma. A multi-valued Access-Control-Allow-Origin is invalid, so browsers
@@ -246,12 +256,12 @@ test('buildSite generates valid static site output', async () => {
     // No countdown on the page: the loop re-analyzes the moment upstream moves, so
     // "sync due in 34m" described a schedule that never existed. The age badge and
     // its budget stay.
-    assert.doesNotMatch(indexHtml, /class="sync-val"|SYNC DUE|updateSyncTimer/)
+    assert.doesNotMatch(indexHtml + await shellOf(tmpDist), /class="sync-val"|SYNC DUE|updateSyncTimer/)
     // The age badge must key off the sync budget, not the wall-clock hour: the
     // backfill loop owns freshness now, so "next :00" would be fiction.
     assert.match(indexHtml, new RegExp('data-budget-min="' + Math.round(syncStaleMs({}) / 60000) + '"'))
-    assert.doesNotMatch(indexHtml, /setUTCHours/)
-    assert.match(indexHtml, /dataset\.budgetMin/)
+    assert.doesNotMatch(indexHtml + await shellOf(tmpDist), /setUTCHours/)
+    assert.match(indexHtml + await shellOf(tmpDist), /dataset\.budgetMin/)
     assert.match(indexHtml, /<h2><time datetime="2026-09-13">\[ Sep 13, 2026 \]<\/time><\/h2>/)
     assert.doesNotMatch(indexHtml, /== \[ Sep 13, 2026 \] ==/)
 
@@ -328,14 +338,14 @@ test('buildSite generates valid static site output', async () => {
     // min-width:0 because a flex item defaults to min-width:auto and a long
     // placeholder is *content* (the row grew past the box); text-size-adjust
     // because mobile browsers inflate type they judge small, and the base is 13.5px.
-    assert.match(searchHtml, /#q\{[^}]*min-width:0/, 'the query input must shrink below its placeholder')
+    assert.match(searchHtml + await shellOf(tmpDist), /#q\{[^}]*min-width:0/, 'the query input must shrink below its placeholder')
     // The input inherited the 13.5px root (1rem) while the site's text runs
     // .72-.82rem, so it was the largest type on the page. Pin it to the .82rem
     // used by the models-page filter, and the prompt beside it with it.
-    assert.match(searchHtml, /#q\{[^}]*font-size:\.82rem/, 'the query input matches the site text scale')
-    assert.match(searchHtml, /\.search-prompt\{[^}]*font-size:\.82rem/, 'the prompt beside it matches too')
-    assert.match(searchHtml, /-webkit-text-size-adjust:100%/, 'no font boosting over the sheet')
-    assert.match(searchHtml, /@media \(max-width:600px\)/, 'form controls go to 16px on phones so iOS does not zoom on focus')
+    assert.match(searchHtml + await shellOf(tmpDist), /#q\{[^}]*font-size:\.82rem/, 'the query input matches the site text scale')
+    assert.match(searchHtml + await shellOf(tmpDist), /\.search-prompt\{[^}]*font-size:\.82rem/, 'the prompt beside it matches too')
+    assert.match(searchHtml + await shellOf(tmpDist), /-webkit-text-size-adjust:100%/, 'no font boosting over the sheet')
+    assert.match(searchHtml + await shellOf(tmpDist), /@media \(max-width:600px\)/, 'form controls go to 16px on phones so iOS does not zoom on focus')
     assert.doesNotMatch(searchHtml, /placeholder="regex/, 'the matcher is word-substring AND, not regex')
     // 360px viewport - 40 main padding - 34 box - 18 row - 6 gap - 86 for the
     // "$ grep -i" prompt = 180px of input, and a 16px monospace advance is 9.6px.
@@ -406,13 +416,13 @@ test('buildSite generates valid static site output', async () => {
 
     // The header widget must key off the budget, and a backgrounded tab must not
     // sit on an old stamp forever once the loop has moved on.
-    assert.match(indexHtml, /budgetMin \* 2/)
-    assert.match(indexHtml, /fbReload:/)
-    assert.match(indexHtml, /visibilitychange/)
+    assert.match(indexHtml + await shellOf(tmpDist), /budgetMin \* 2/)
+    assert.match(indexHtml + await shellOf(tmpDist), /fbReload:/)
+    assert.match(indexHtml + await shellOf(tmpDist), /visibilitychange/)
     assert.match(indexHtml, /data-head=/, 'sync-age includes commit head sha')
-    assert.match(indexHtml, /\/api\/status\.json/, 'client auto-updater polls status API')
-    assert.match(indexHtml, /fbPlainMode/, 'layout head and client scripts persist plain English mode')
-    assert.match(indexHtml, /reading-mode-plain/, 'reading-mode-plain is supported in layout scripts')
+    assert.match(indexHtml + await shellOf(tmpDist), /\/api\/status\.json/, 'client auto-updater polls status API')
+    assert.match(indexHtml + await shellOf(tmpDist), /fbPlainMode/, 'layout head and client scripts persist plain English mode')
+    assert.match(indexHtml + await shellOf(tmpDist), /reading-mode-plain/, 'reading-mode-plain is supported in layout scripts')
     // Full changelog.json no longer ships to dist (6.9MB dead payload)
     await assert.rejects(readFile(join(tmpDist, 'changelog.json'), 'utf8'))
 
@@ -552,7 +562,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(statsHtml, /class="spark"/)
     // The spark svg carries an intrinsic width, so max-width alone leaves the
     // cadence line at 300px inside a card three times as wide.
-    assert.match(statsHtml, /\.cad-spark \.spark\{[^}]*width:100%/, 'the cadence line stretches to its card')
+    assert.match(statsHtml + await shellOf(tmpDist), /\.cad-spark \.spark\{[^}]*width:100%/, 'the cadence line stretches to its card')
     assert.match(statsHtml, /12-MO TREND/)
     // The page opens with the numbers, not with forty bars, and shares the
     // standard layout measure with the rest of the site.
@@ -631,15 +641,15 @@ test('buildSite generates valid static site output', async () => {
     // Progressive enhancement only: guarded on the bar existing, keeps its state
     // across the auto-reload, and hides a day whose rows all filtered out instead
     // of leaving a stray date header.
-    assert.match(indexHtml, /getElementById\('filters'\)/)
-    assert.match(indexHtml, /fbIndexFilter/)
+    assert.match(indexHtml + await shellOf(tmpDist), /getElementById\('filters'\)/)
+    assert.match(indexHtml + await shellOf(tmpDist), /fbIndexFilter/)
     assert.match(indexHtml, /details\.entry:not\(\[hidden\]\)/, 'empty day sections collapse with their rows')
     // A #sha permalink into a filtered-out row must still land somewhere visible.
     assert.match(indexHtml, /location\.hash/)
     assert.match(indexHtml, /classList\.contains\('entry'\)/)
     // The guard is load-bearing for the no-JS default: the hidden attribute only
     // wins if no display rule outranks it.
-    assert.match(indexHtml, /\[hidden\]\{display:none!important\}/)
+    assert.match(indexHtml + await shellOf(tmpDist), /\[hidden\]\{display:none!important\}/)
     // A day page is the same timeline read one day at a time, so it filters the
     // same way: dropdown present, churn listed but hidden in markup.
     assert.match(dayHtml2, /id="filters"/)
@@ -647,7 +657,7 @@ test('buildSite generates valid static site output', async () => {
     assert.equal(rowTags(dayHtml2).filter(t => t.includes('data-churn="1"')).length, 1, 'the churn row is still listed on its day page')
     assert.ok(rowTags(dayHtml2).find(t => t.includes('data-churn="1"')).includes(' hidden'), 'hidden by default here too')
     assert.match(dayHtml2, /<span class="day-churn">\+1 churn<\/span>/)
-    assert.match(dayHtml2, /fbIndexFilter/)
+    assert.match(dayHtml2 + await shellOf(tmpDist), /fbIndexFilter/)
 
     // /changes/<category>/ is the all-time half of the filter question: complete
     // lists, compact rows, one click from the full body. A chip that says "27
@@ -730,11 +740,18 @@ test('buildSite generates valid static site output', async () => {
     const daysApi = JSON.parse(await readFile(join(tmpDist, 'api/days.json'), 'utf8'))
     assert.deepEqual(daysApi.map(d => d[0]), ['2026-09-13', '2026-09-12'], 'days.json is newest-first')
     assert.equal(daysApi[0][1], 2, 'per-day counts exclude churn')
-    assert.match(indexHtml, /setupDayJump/, 'the shell hydrates the select on open')
+    // The shell ships as one content-hashed shared asset instead of inline
+    // script, so its pins are checked against the emitted file -- and the page
+    // must actually link both assets.
+    assert.match(indexHtml, /<link rel="stylesheet" href="\/assets\/site-[0-9a-f]{10}\.css">/, 'styles are a shared asset, not inline')
+    assert.match(indexHtml, /<script src="\/assets\/site-[0-9a-f]{10}\.js"><\/script>/, 'and so is the shell script')
+    const { readdir } = await import('node:fs/promises')
+    const shellJs = await readFile(join(tmpDist, 'assets', (await readdir(join(tmpDist, 'assets'))).find(n => n.endsWith('.js'))), 'utf8')
+    assert.match(shellJs, /setupDayJump/, 'the shell hydrates the select on open')
     // Keyboard & motion pins on the shell script.
-    assert.match(indexHtml, /tag === 'A' \|\| tag === 'BUTTON' \|\| tag === 'SUMMARY'/, 'Enter/Space stay with the focused control instead of toggling the marked entry')
-    assert.match(indexHtml, /prefers-reduced-motion: reduce/, 'scripted scrolls honor the motion preference')
-    assert.match(indexHtml, /if \(e\.key === 'Tab'\)/, 'the shortcuts dialog traps Tab while open')
+    assert.match(shellJs, /tag === 'A' \|\| tag === 'BUTTON' \|\| tag === 'SUMMARY'/, 'Enter/Space stay with the focused control instead of toggling the marked entry')
+    assert.match(shellJs, /prefers-reduced-motion: reduce/, 'scripted scrolls honor the motion preference')
+    assert.match(shellJs, /if \(e\.key === 'Tab'\)/, 'the shortcuts dialog traps Tab while open')
     assert.match(redirectsTxt, /^\/c\/\* \/permalink 200$/m, 'the resolver answers every /c/ address')
     assert.deepEqual(redirectLoops(redirectsTxt), [], 'no rule may reach itself: Cloudflare fails the deploy on one')
     // A rewrite at a `.html` asset is answered with a 307 to the extensionless
@@ -842,7 +859,7 @@ test('about page stays under its word cap at production size', async (t) => {
 test('inline scripts: template escaping preserves regex backslashes', async () => {
   const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-test-js-'))
   try {
-    const { writeFile: wf } = await import('node:fs/promises')
+    const { writeFile: wf, readdir } = await import('node:fs/promises')
     const mockChangelog = {
       version: 1, repo: 'https://github.com/CodebuffAI/freebuff', generatedAt: '2026-09-13T12:00:00Z',
       headSha: '1111222233334444555566667777888899990000',
@@ -866,9 +883,14 @@ test('inline scripts: template escaping preserves regex backslashes', async () =
         await wf(join(tmpDist, 'inline-check.mjs'), js)
         execFileSync('node', ['--check', join(tmpDist, 'inline-check.mjs')])
       }
-      // Backslash regexes survived template escaping intact
-      if (f !== 'search/index.html') assert.match(html, /split\(\/\\r\?\\n\/\)/)
     }
+    // The hoisted shell keeps the backslash-regex canary (a template literal
+    // once ate the backslash and shipped it broken), and the shipped file must
+    // parse.
+    const shellJs = await readFile(join(tmpDist, 'assets', (await readdir(join(tmpDist, 'assets'))).find(n => n.endsWith('.js'))), 'utf8')
+    assert.match(shellJs, /split\(\/\\r\?\\n\/\)/)
+    await wf(join(tmpDist, 'shell-check.mjs'), shellJs)
+    execFileSync('node', ['--check', join(tmpDist, 'shell-check.mjs')])
     const searchHtml = await readFile(join(tmpDist, 'search/index.html'), 'utf8')
     // Backslash-regex canary: the query tokenizer's \S is the fragile bit now
     // (it once shipped as |S+ when a template literal ate the backslash).
@@ -907,7 +929,7 @@ test('homepage ships the sync-status widget, newest day only', async () => {
       assert.match(html, /last sync <b class="sw-updated">/, `${name} shows the build stamp without scripting`)
     }
     assert.ok(!older.includes('id="sync-widget"'), 'settled days stay settled: no widget on older day pages')
-    assert.ok(index.includes('fbSyncPaint'), 'the widget is wired to the /api/status.json poll (update-ready chip)')
+    assert.ok((index + await shellOf(tmpDist)).includes('fbSyncPaint'), 'the widget is wired to the /api/status.json poll (update-ready chip)')
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }
@@ -1423,7 +1445,7 @@ test('site build generates dynamic SVG status badges and reading progress bar', 
 
   const indexHtml = await readFile(join(dist, 'index.html'), 'utf8')
   assert.match(indexHtml, /<div id="reading-progress" aria-hidden="true"><\/div>/)
-  assert.match(indexHtml, /setupReadingProgress/)
+  assert.match(indexHtml + await shellOf(dist), /setupReadingProgress/)
 })
 
 test('models page includes interactive lineup matrix and date scrubber', async (t) => {
@@ -1577,9 +1599,9 @@ test('in-flight page paginates open PRs into pages of 25 with keyboard and pill 
   assert.match(page3, /<span class="pager-num active">\[3\]<\/span>/)
 
   // Verify n / p keyboard script has no flawed first-child / last-child fallbacks
-  assert.match(page1, /\.pager a\[rel=/, 'script strictly targets rel pager links')
-  assert.doesNotMatch(page1, /\.pager a:(?:first|last)-child/, 'no broken first-child/last-child fallbacks that bounce pages')
-  assert.match(page1, /ctrlKey \|\| e\.metaKey \|\| e\.altKey/, 'modifier keys like Cmd+P / Ctrl+P are protected')
+  assert.match(page1 + await shellOf(dist), /\.pager a\[rel=/, 'script strictly targets rel pager links')
+  assert.doesNotMatch(page1 + await shellOf(dist), /\.pager a:(?:first|last)-child/, 'no broken first-child/last-child fallbacks that bounce pages')
+  assert.match(page1 + await shellOf(dist), /ctrlKey \|\| e\.metaKey \|\| e\.altKey/, 'modifier keys like Cmd+P / Ctrl+P are protected')
 })
 
 test('fileChips: renders source files, test files, churned files, and renames with exact count match', () => {
@@ -1699,10 +1721,10 @@ test('diff viewer escapes file paths and labels before innerHTML', async () => {
     const html = await readFile(join(dist, 'index.html'), 'utf8')
     // The shared client-side script defines the escape helper once per page and
     // every concatenated fragment that can carry upstream text goes through it.
-    assert.match(html, /function htmlEsc\(s\)/)
-    assert.match(html, /htmlEsc\(f\.file\)/, 'diff file names are escaped before the option HTML')
-    assert.match(html, /htmlEsc\(label\.slice\(0, 12\)\)/, 'the toolbar label is escaped')
-    assert.match(html, /htmlEsc\(ghUrl\)/, 'the GitHub link href is escaped in the error path')
+    assert.match(html + await shellOf(dist), /function htmlEsc\(s\)/)
+    assert.match(html + await shellOf(dist), /htmlEsc\(f\.file\)/, 'diff file names are escaped before the option HTML')
+    assert.match(html + await shellOf(dist), /htmlEsc\(label\.slice\(0, 12\)\)/, 'the toolbar label is escaped')
+    assert.match(html + await shellOf(dist), /htmlEsc\(ghUrl\)/, 'the GitHub link href is escaped in the error path')
   } finally {
     await rm(dist, { recursive: true, force: true })
   }

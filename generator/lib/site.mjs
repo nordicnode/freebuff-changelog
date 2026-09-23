@@ -3,6 +3,7 @@
 // authentic CLI/git-log presentation, dark theme, zero emojis, calm palette).
 import { writeText, writeBinary } from './util.mjs'
 import { escapeHtml as esc, fmtDateHuman, pool, shortHash } from './util.mjs'
+import { createHash } from 'node:crypto'
 import { CSS } from './style.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg, feedsOpml } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
@@ -99,7 +100,7 @@ ${ld ? `<script type="application/ld+json">${ldScript(ld)}</script>` : ''}
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="apple-touch-icon" href="/icon-192.png">
-<style>${CSS}</style>
+${CSS_TAG}
 </head><body${wide ? ' class="page-wide"' : ''}><div id="reading-progress" aria-hidden="true"></div><a class="skip-link" href="#main">Skip to content</a><main id="main">
 <header class="top">
   <div class="brand">
@@ -176,7 +177,11 @@ ${body}
   </div>
 </div>
 </main>
-<script>
+${SHELL_TAG}
+</body></html>`
+}
+
+const SHELL_JS = `
 // One motion preference for every scripted scroll: the pages jump around with
 // smooth scrolling, and a reader who asked their OS for reduced motion should
 // not be nauseated by j/k navigation or a search selection.
@@ -937,9 +942,18 @@ function renderDiff(container, text, label, ghUrl, mode) {
   container.innerHTML = '';
   container.appendChild(frag);
 }
-</script>
-</body></html>`
-}
+`
+
+// The shell and the stylesheet travel as two content-hashed shared assets
+// instead of ~90KB of inline <style>+<script> per page: one download per deploy
+// per browser, then cheap 304 revalidations (the site-wide no-cache policy
+// stays), and every page is ~40% lighter. Content hashes keep the URLs stable
+// until the code actually moves. Declared after SHELL_JS because the hash
+// reads it; layout() only touches these at call time.
+const SHELL_JS_NAME = `site-${createHash('sha256').update(SHELL_JS).digest('hex').slice(0, 10)}.js`
+const CSS_NAME = `site-${createHash('sha256').update(CSS).digest('hex').slice(0, 10)}.css`
+const SHELL_TAG = `<script src="/assets/${SHELL_JS_NAME}"></script>`
+const CSS_TAG = `<link rel="stylesheet" href="/assets/${CSS_NAME}">`
 
 function badges (e) {
   const b = []
@@ -4526,6 +4540,9 @@ ctx.hidden = false
   // header: _headers does not override, it *merges*, so two rules matching the
   // same URL join their values with a comma (browsers reject a multi-valued
   // ACAO, so CORS for JSON lives in exactly one rule).
+  // The two shared assets the layout links (names content-hashed above).
+  await write(dist, `assets/${CSS_NAME}`, CSS)
+  await write(dist, `assets/${SHELL_JS_NAME}`, SHELL_JS)
   await write(dist, '_headers', `/*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
