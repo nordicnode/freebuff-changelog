@@ -382,7 +382,7 @@ export function feedsOpml (siteUrl, feeds) {
 <opml version="2.0">
   <head><title>Unofficial Freebuff Changelog</title><dateCreated>${new Date().toUTCString()}</dateCreated></head>
   <body>
-    <outline text="freebuff-changes" title="freebuff-changes">
+    <outline text="Unofficial Freebuff Changelog" title="Unofficial Freebuff Changelog">
 ${outlines}
     </outline>
   </body>

@@ -106,22 +106,34 @@ export function cacheKey (sha, patch, releaseCtx = '', rollupV = 0) {
 
 export const DANGLING_CONNECTOR_RE = /(?:\s+|^)(?:and|or|in|to|the|with|for|of|from|by|as|at|is|are|a|an)\s*$/i
 
+// A cut that lands after a conjunction + quantifier ("...to listed IDs or all")
+// leaves a tail no reader parses as complete: the quantifier phrase goes with
+// the connector it rides on.
+export const DANGLING_QUANTIFIER_RE = /(?:\s+|^)(?:and|or)\s+(?:all|any|both|each|every|more|other)\s*$/i
+
+const tailPunct = (s) => String(s || '').replace(/[.,;:!?]+$/, '')
+
+export function hasDanglingTail (s) {
+  const t = tailPunct(s)
+  return DANGLING_CONNECTOR_RE.test(t) || DANGLING_QUANTIFIER_RE.test(t)
+}
+
+// Strip trailing punctuation plus dangling connectors/quantifiers until stable.
+export function trimDangling (s) {
+  let res = String(s || '').trim()
+  while (hasDanglingTail(res)) {
+    res = tailPunct(res).replace(DANGLING_QUANTIFIER_RE, '').replace(DANGLING_CONNECTOR_RE, '').trim()
+  }
+  return res
+}
+
 // Word-boundary cut: never slice mid-word or mid-token, and never leave dangling prepositions/conjunctions.
 export function truncateWords (s, n) {
   s = String(s || '').trim()
-  if (s.length <= n) {
-    let res = s
-    while (DANGLING_CONNECTOR_RE.test(res.replace(/[.,;:!?]+$/, ''))) {
-      res = res.replace(/[.,;:!?]+$/, '').replace(DANGLING_CONNECTOR_RE, '').trim()
-    }
-    return res.replace(/[,;:]+$/, '').trim()
-  }
+  if (s.length <= n) return trimDangling(s).replace(/[,;:]+$/, '').trim()
   const cut = s.lastIndexOf(' ', n)
-  let res = (cut > n * 0.5 ? s.slice(0, cut) : s.slice(0, n)).trim()
-  while (DANGLING_CONNECTOR_RE.test(res.replace(/[.,;:!?]+$/, ''))) {
-    res = res.replace(/[.,;:!?]+$/, '').replace(DANGLING_CONNECTOR_RE, '').trim()
-  }
-  return res.replace(/[,;:]+$/, '').trim()
+  const res = (cut > n * 0.5 ? s.slice(0, cut) : s.slice(0, n)).trim()
+  return trimDangling(res).replace(/[,;:]+$/, '').trim()
 }
 
 // Clean sentence-preserving text truncation: never truncates valid text under maxLen,
@@ -130,11 +142,8 @@ export function cleanText (s, maxLen = 2000, isSentence = false) {
   s = String(s || '').replace(/[\u2014\u2013—–]|&mdash;|&ndash;/g, ' - ').replace(/[ ]{2,}/g, ' ').trim()
   if (!s) return ''
   if (s.length <= maxLen) {
-    if (isSentence && DANGLING_CONNECTOR_RE.test(s.replace(/[.,;:!?]+$/, ''))) {
-      let text = s
-      while (DANGLING_CONNECTOR_RE.test(text.replace(/[.,;:!?]+$/, ''))) {
-        text = text.replace(/[.,;:!?]+$/, '').replace(DANGLING_CONNECTOR_RE, '').trim()
-      }
+    if (isSentence && hasDanglingTail(s)) {
+      const text = trimDangling(s)
       if (!/[.!?]$/.test(text)) text += '.'
       return text
     }
@@ -152,10 +161,7 @@ export function cleanText (s, maxLen = 2000, isSentence = false) {
     }
   }
   let cut = s.lastIndexOf(' ', maxLen)
-  let text = (cut > maxLen * 0.4 ? s.slice(0, cut) : s.slice(0, maxLen)).trim()
-  while (DANGLING_CONNECTOR_RE.test(text.replace(/[.,;:!?]+$/, ''))) {
-    text = text.replace(/[.,;:!?]+$/, '').replace(DANGLING_CONNECTOR_RE, '').trim()
-  }
+  let text = trimDangling((cut > maxLen * 0.4 ? s.slice(0, cut) : s.slice(0, maxLen)).trim())
   if (isSentence && !/[.!?]$/.test(text)) {
     text += '.'
   }
@@ -345,7 +351,7 @@ export function buildPrompt (entry, patch, ctx = {}) {
     '- Audience Precision: Distinguish strictly between end-user developers (CLI/Web assistant users), advertisers/sponsors (ad campaigns & placements), and internal maintainers. Never attribute advertiser settings or internal tooling to regular users.',
     '',
     'Output format: First, identify and cite the concrete evidence in the diff (function name, file, or hunk) in "evidence", then produce title and summary.',
-    `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, flag, or diff hunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "<major | notable | minor>", "audience": "<one of: ${AUDIENCES.join(' | ')}>", "userVisible": <true if a user of the CLI, web app, desktop app or SDK can observe the change without reading code, else false>, "breaking": <true only if existing behavior, config, an API or a command stops working as before>, "migration": "<what a user or operator must do because of this change, or null>", "newEnvVars": [<environment variables introduced, verbatim, or empty>], "newFlags": [<CLI flags introduced, verbatim with leading dashes, or empty>], "confidence": "<high | medium | low: how well the diff and notes support the summary>", "unknowns": "<one sentence naming what the diff does not show (the motive, the consumer of a new constant, the rollout), or null>"${multi ? ', "changes": [{"area": "<package or surface>", "what": "<one sentence>", "files": [<paths from the file list>]}]' : ''}}.`,
+    `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, flag, or diff hunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "<major | notable | minor>", "audience": "<one of: ${AUDIENCES.join(' | ')}>", "userVisible": <true if a user of the CLI, web app, desktop app or SDK can observe the change without reading code, else false>, "breaking": <true only if existing behavior, config, an API or a command stops working as before>, "migration": "<one full sentence, starting with a capital letter, naming who must do what because of this change (for example If you use X, you must Y), or null>", "newEnvVars": [<environment variables introduced, verbatim, or empty>], "newFlags": [<CLI flags introduced, verbatim with leading dashes, or empty>], "confidence": "<high | medium | low: how well the diff and notes support the summary>", "unknowns": "<one sentence naming what the diff does not show (the motive, the consumer of a new constant, the rollout), or null>"${multi ? ', "changes": [{"area": "<package or surface>", "what": "<one sentence>", "files": [<paths from the file list>]}]' : ''}}.`,
     multi ? `This snapshot spans several areas or ${MULTI_TOPIC_MIN_FILES}+ files: it is several changes. Fill "changes" with one item per distinct change (2-6 items), each grounded in the files it names; the prose summary then leads with the most user-relevant one and says how many others there are.` : '',
     'Fields: "migration" and "unknowns" are null when there is nothing honest to say; never fill them with reassurance. "confidence" is low when the diff is truncated, the change is mostly configuration whose consumer is not visible, or the motive is guessed.',
     `Significance: judge it from the diff against the scale below. The deterministic default "${entry.significance || 'minor'}" is only a file-shape heuristic, not the answer: change it only when the diff plainly implies a different tier, and when the evidence is mixed, keep the deterministic tier -- a tie is not a reason to move it.`,
@@ -575,7 +581,7 @@ export function buildFusePrompt (entry, drafts, ctx = {}, digest = '') {
     FREEBUFF_DOMAIN_LEXICON,
     '',
     'Output format: First, identify and cite the concrete evidence (file, function, or chunk) in "evidence", then produce title and summary.',
-    `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, or chunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "<major | notable | minor>", "audience": "<one of: ${AUDIENCES.join(' | ')}>", "userVisible": <true if a user of the CLI, web app, desktop app or SDK can observe the change without reading code, else false>, "breaking": <true only if existing behavior, config, an API or a command stops working as before>, "migration": "<what a user or operator must do because of this change, or null>", "newEnvVars": [<environment variables introduced, verbatim, or empty>], "newFlags": [<CLI flags introduced, verbatim with leading dashes, or empty>], "confidence": "<high | medium | low: how well the drafts and notes support the summary>", "unknowns": "<one sentence naming what the drafts do not show (the motive, the consumer of a new constant, the rollout), or null>", "changes": [{"area": "<package or surface>", "what": "<one sentence>", "files": [<paths from the file list>]}]}.`,
+    `Output a JSON object: {"evidence": "<1-2 sentences citing exact file, function, or chunk>", "title": "<plain title>", "summary": "<2-4 sentence summary>", "significance": "<major | notable | minor>", "audience": "<one of: ${AUDIENCES.join(' | ')}>", "userVisible": <true if a user of the CLI, web app, desktop app or SDK can observe the change without reading code, else false>, "breaking": <true only if existing behavior, config, an API or a command stops working as before>, "migration": "<one full sentence, starting with a capital letter, naming who must do what because of this change (for example If you use X, you must Y), or null>", "newEnvVars": [<environment variables introduced, verbatim, or empty>], "newFlags": [<CLI flags introduced, verbatim with leading dashes, or empty>], "confidence": "<high | medium | low: how well the drafts and notes support the summary>", "unknowns": "<one sentence naming what the drafts do not show (the motive, the consumer of a new constant, the rollout), or null>", "changes": [{"area": "<package or surface>", "what": "<one sentence>", "files": [<paths from the file list>]}]}.`,
     'A chunked commit is several changes: fill "changes" with one item per distinct change (2-6 items), each grounded in the files it names; the prose summary then leads with the most user-relevant one and says how many others there are.',
     'Fields: "migration" and "unknowns" are null when there is nothing honest to say; never fill them with reassurance. "confidence" is low when the drafts disagree, the change is mostly configuration whose consumer is not visible, or the motive is guessed.',
     `Significance: judge it from the drafts and the digest against the scale below. The deterministic default "${entry.significance || 'minor'}" is only a file-shape heuristic, not the answer; change it whenever the material plainly implies a different tier.`,
@@ -1191,9 +1197,9 @@ export function validateLlmOut (out, fallbackSig = 'minor', opts = {}) {
   if (rawWords.some(w => w.length >= 18 || CAMEL_IDENT_RE.test(w) || SNAKE_IDENT_RE.test(w))) {
     throw new Error('LLM title contains raw identifier')
   }
-  // 110 is what changeRow() clips at: a title the validator accepts must be a
-  // title the index can show whole.
-  let title = truncateWords(rawTitle.replace(/[\u2014\u2013—–]|&mdash;|&ndash;/g, ' - ').replace(/[`*#_[\]]/g, ' ').replace(/\s+/g, ' '), 110)
+  // TITLE_RULE promises max 70 chars; enforce it here so the prompt and the
+  // gate agree. The index clips at 110, so a validated title shows whole there.
+  let title = truncateWords(rawTitle.replace(/[\u2014\u2013—–]|&mdash;|&ndash;/g, ' - ').replace(/[`*#_[\]]/g, ' ').replace(/\s+/g, ' '), 70)
   title = title.replace(/[.!?:;]+$/, '').trim()
   if (title) title = title.charAt(0).toUpperCase() + title.slice(1)
   const rawSummary = String(out.summary || '').trim()
@@ -1228,7 +1234,11 @@ export function validateLlmOut (out, fallbackSig = 'minor', opts = {}) {
   // the corpus never mentions is invented.
   const newEnvVars = cleanList(out.newEnvVars).filter(s => /^[A-Z][A-Z0-9_]{2,}$/.test(s))
   const newFlags = cleanList(out.newFlags).map(s => s.startsWith('-') ? s : `--${s}`).filter(s => /^--?[a-z][\w-]*$/i.test(s))
-  const migration = typeof out.migration === 'string' && out.migration.trim() && !/^(?:none|null|n\/a|no(?:ne)? (?:needed|required)\.?)$/i.test(out.migration.trim()) ? cleanText(out.migration, 400, true) : ''
+  let migration = typeof out.migration === 'string' && out.migration.trim() && !/^(?:none|null|n\/a|no(?:ne)? (?:needed|required)\.?)$/i.test(out.migration.trim()) ? cleanText(out.migration, 400, true) : ''
+  // The ACTION line reads as an instruction card: normalize to a full sentence
+  // that starts with a capital letter (the prompt asks for a named actor; this
+  // catches the bare imperatives small models slip in).
+  if (migration) migration = migration.charAt(0).toUpperCase() + migration.slice(1)
   const unknowns = typeof out.unknowns === 'string' && out.unknowns.trim() && !/^(?:none|null|n\/a|nothing)\.?$/i.test(out.unknowns.trim()) ? cleanText(out.unknowns, 300, true) : ''
   const rawConfidence = CONFIDENCES.includes(String(out.confidence || '').toLowerCase()) ? String(out.confidence).toLowerCase() : undefined
   const userVisible = typeof out.userVisible === 'boolean' ? out.userVisible : undefined

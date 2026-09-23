@@ -116,13 +116,12 @@ ${ld ? `<script type="application/ld+json">${ldScript(ld)}</script>` : ''}
     <a href="/archive/" class="${path.startsWith('/archive/') ? 'active' : ''}">/archive</a>
     <a href="/search/" class="${path.startsWith('/search/') ? 'active' : ''}">/search</a>
     ${hasInFlight ? `<a href="/in-flight/" class="${path.startsWith('/in-flight/') ? 'active' : ''}">/in-flight</a>` : ''}
-    <a href="/feed.xml" class="nav-feed">/rss</a>
   </nav>
 </header>
 ${body}
 <footer>
   <div class="footer-row">
-    <div class="footer-desc">freebuff-changes <span class="term-sep">::</span> unofficial public snapshot mirror reconstructed from <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a></div>
+    <div class="footer-desc">${SITE.name} <span class="term-sep">::</span> unofficial public snapshot mirror reconstructed from <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a></div>
     <div class="footer-links">
       <a href="/about/">[about]</a>
       <a href="/range/">[date ranges]</a>
@@ -235,20 +234,15 @@ updateSyncAge();
 
 // The homepage sync widget makes the 30s relay visible: "last sync" ticks from
 // the build stamp and the dot follows the same fresh/stale budget as the footer
-// badge, while "next poll" counts down to autoUpdate's next /api/status.json
-// check and resets whenever that check reports in via fbSyncPaint(). Only the
-// front page polls, so everywhere else the poller line stays hidden rather than
-// counting down to a check that will never come.
+// badge, while autoUpdate's /api/status.json poll flips [update ready] when a
+// newer build lands. The counts and the raw status link that used to ride here
+// sit behind the one [status] link (/stats/ page, /api/status.json raw).
 (function setupSyncWidget() {
   var w = document.getElementById('sync-widget');
   if (!w) return;
   var generated = Date.parse(w.getAttribute('data-generated')) || Date.now();
   var budgetMs = (Number(w.getAttribute('data-budget-min')) || 5) * 60000;
-  var polling = location.pathname === '/' || location.pathname === '/index.html';
-  var lastCheck = Date.now();
   var upd = w.querySelector('.sw-updated');
-  var nxt = w.querySelector('.sw-next');
-  if (polling) [].forEach.call(w.querySelectorAll('.sw-poll'), function (el) { el.hidden = false; });
   function ago(ms) {
     var s = Math.max(0, Math.floor(ms / 1000));
     if (s < 60) return s + 's ago';
@@ -260,22 +254,8 @@ updateSyncAge();
     var now = Date.now();
     if (upd) upd.textContent = ago(now - generated);
     w.classList.toggle('sw-stale', (now - generated) > budgetMs * 2);
-    if (nxt && polling) {
-      var left = 30 - Math.floor((now - lastCheck) / 1000);
-      nxt.textContent = left > 0 ? 'in ' + left + 's' : 'due';
-    }
   }
   window.fbSyncPaint = function (data, changed) {
-    lastCheck = Date.now();
-    var c = w.querySelector('.sw-counts');
-    if (c && data) {
-      var bits = [];
-      if (typeof data.changes === 'number') bits.push(data.changes.toLocaleString() + ' changes');
-      if (typeof data.days === 'number') bits.push(data.days.toLocaleString() + ' days');
-      if (data.releases) bits.push(data.releases.toLocaleString() + ' releases');
-      if (data.openPrs) bits.push(data.openPrs.toLocaleString() + ' open PRs');
-      if (bits.length) c.textContent = bits.join(' \u00b7 ');
-    }
     if (changed) { var p = w.querySelector('.sw-pending'); if (p) p.hidden = false; }
     tick();
   };
@@ -1810,7 +1790,7 @@ function subscribePage (feedCatalog) {
     var items = sel.map(function (c) {
       return '    <outline type="rss" text="' + esc(c.dataset.title) + '" title="' + esc(c.dataset.title) + '" xmlUrl="' + esc(location.origin + c.dataset.path) + '" htmlUrl="' + esc(location.origin + '/') + '" description="' + esc(c.dataset.desc) + '"/>';
     }).join('\n');
-    var doc = '<?xml version="1.0" encoding="UTF-8"?>\n<opml version="2.0">\n  <head><title>Unofficial Freebuff Changelog</title></head>\n  <body>\n    <outline text="freebuff-changes" title="freebuff-changes">\n' + items + '\n    </outline>\n  </body>\n</opml>\n';
+    var doc = '<?xml version="1.0" encoding="UTF-8"?>\n<opml version="2.0">\n  <head><title>Unofficial Freebuff Changelog</title></head>\n  <body>\n    <outline text="Unofficial Freebuff Changelog" title="Unofficial Freebuff Changelog">\n' + items + '\n    </outline>\n  </body>\n</opml>\n';
     document.getElementById('sub-opml').value = doc;
     document.getElementById('sub-count').textContent = sel.length + ' of ' + checks.length + ' feeds selected';
     try { localStorage.setItem(KEY, JSON.stringify(sel.map(function (c) { return c.dataset.path; }))); } catch (e) {}
@@ -1833,7 +1813,7 @@ function subscribePage (feedCatalog) {
     var blob = new Blob([document.getElementById('sub-opml').value], { type: 'text/x-opml' });
     var a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'freebuff-changes.opml';
+    a.download = 'unofficial-freebuff-changelog.opml';
     a.click();
     setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
   });
@@ -2110,26 +2090,18 @@ ${[
       </select>
       <button type="button" class="chip chip-churn" id="churn-toggle" data-total="${churnTotal}" data-href="/changes/churn/" aria-pressed="false">churn<span class="chip-n">${churn.toLocaleString()}</span></button>
     </div>
-    <p class="filter-note" data-hub="/archive/#categories">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? '(' + churn + ' churn hidden)' : '(no churn that day)'}</em> &middot; <span id="filter-all"><a href="/archive/#categories">browse all changes by category</a></span></p>
+    <p class="filter-note" data-hub="/archive/#categories">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page &middot; <span id="filter-all"><a href="/archive/#categories">browse all changes by category</a></span></p>
   </div>`
 
-    const relCount = new Set(releases.map(r => r.version)).size
-    const syncCounts = [
-      `${meaningful.length.toLocaleString()} changes`,
-      `${byDay.length.toLocaleString()} days`,
-      relCount ? `${relCount.toLocaleString()} releases` : '',
-      openPrs?.length ? `${openPrs.length.toLocaleString()} open PRs` : ''
-    ].filter(Boolean).join(' \u00b7 ')
     // The relay made visible (newest day only; older days are settled history):
-    // server-rendered absolute stamp + counts, then the shell ticker ages it and
-    // autoUpdate's /api/status.json poll repaints it every 30s.
+    // one freshness line the shell ticker ages; the telemetry counts and the
+    // raw build status ride behind the single [status] link (/stats/ and
+    // /api/status.json, one click away).
     const syncWidget = latest ? `<div class="sync-widget" id="sync-widget" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}">
   <span class="sw-dot" aria-hidden="true"></span>
   <span class="sw-item">last sync <b class="sw-updated">${esc(fmtDateHuman(generated))} UTC</b></span>
-  <span class="sw-item sw-poll" hidden>next poll <b class="sw-next">in 30s</b></span>
   <span class="sw-pending" hidden>[update ready]</span>
-  <span class="sw-counts">${esc(syncCounts)}</span>
-  <a class="sw-api" href="/api/status.json">status.json</a>
+  <a class="sw-api" href="/stats/" title="Telemetry on /stats/ (raw build status: /api/status.json)">[status]</a>
 </div>` : ''
     const hero = `
 <section class="hero timeline-hero">
@@ -3441,7 +3413,6 @@ ${weekTabsScript}`
       <button class="filter-chip" data-cat="Commands" title="Category filter: commands">--commands</button>
       <button class="filter-chip" data-q="prompt" title="Quick query: prompt work">--prompt</button>
       <button class="filter-chip" data-q="desktop" title="Quick query: desktop app">--desktop</button>
-      <button class="filter-chip" data-q="is:release" title="Quick query: every version release">--v</button>
     </div>
     <div class="filter-row">
       <label class="filter-sel-lbl">CATEGORY:

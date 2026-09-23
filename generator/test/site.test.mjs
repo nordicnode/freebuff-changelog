@@ -902,11 +902,11 @@ test('homepage ships the sync-status widget, newest day only', async () => {
     const older = await readFile(join(tmpDist, 'day/2026-09-12/index.html'), 'utf8')
     for (const [name, html] of [['/', index], ['/day/2026-09-13/', newest]]) {
       assert.ok(html.includes('id="sync-widget"'), `${name} carries the sync widget (the newest day is live, read from either URL)`)
-      assert.ok(html.includes('href="/api/status.json"'), `${name} widget links its data source`)
+      assert.ok(html.includes('class="sw-api" href="/stats/"'), `${name} widget links the telemetry page (raw status: /api/status.json)`)
       assert.match(html, /last sync <b class="sw-updated">/, `${name} shows the build stamp without scripting`)
     }
     assert.ok(!older.includes('id="sync-widget"'), 'settled days stay settled: no widget on older day pages')
-    assert.ok(index.includes('fbSyncPaint'), 'the widget is wired to the /api/status.json poll (update-ready chip, count refresh)')
+    assert.ok(index.includes('fbSyncPaint'), 'the widget is wired to the /api/status.json poll (update-ready chip)')
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }
@@ -1039,7 +1039,7 @@ test('the timeline paginates one day per page and keeps every entry reachable', 
     assert.match(latest, /<option value="\*" data-label="recent" data-total="4"[^>]*selected>recent \(1\)<\/option>/)
     assert.match(d11, /<option value="\*" data-label="this day"[^>]*>this day \(2\)<\/option>/, 'a day page names the reset for what it counts')
     assert.match(d11, /<option value="cli" data-label="CLI" data-total="4"[^>]*>CLI \(2\)<\/option>/)
-    assert.match(d11, /showing <b id="filter-count">2<\/b> of 2 rows on this page <em>\(no churn that day\)/)
+    assert.match(d11, /showing <b id="filter-count">2<\/b> of 2 rows on this page/)
     assert.match(d10, /showing <b id="filter-count">1<\/b> of 1 rows on this page/)
 
     // Churn is listed everywhere and shown by default nowhere: in the markup,
@@ -1047,8 +1047,10 @@ test('the timeline paginates one day per page and keeps every entry reachable', 
     assert.ok(tags(d12).find(t => t.includes('data-churn="1"')).includes(' hidden'))
     assert.match(d12, /<span class="day-churn">\+1 churn<\/span>/)
     assert.match(d12, /id="churn-toggle"[^>]*data-total="1"[^>]*>churn<span class="chip-n">1<\/span>/)
-    // The count is the point of the note: "3 of 9" begs "where are the other 6?"
-    assert.match(d12, /showing <b id="filter-count">1<\/b> of 2 rows on this page <em>\(1 churn hidden\)<\/em>/, 'the parenthetical accounts for the hidden rows by number')
+    // The day heading accounts for the hidden rows by number (+1 churn); the
+    // note itself only reports what the filter is showing.
+    assert.match(d12, /showing <b id="filter-count">1<\/b> of 2 rows on this page/, 'the note reports the filtered rows')
+    assert.doesNotMatch(d12, /1 churn hidden/, 'the churn accounting lives in the day heading, not the note')
     assert.equal(tags(d11).filter(t => t.includes('data-churn')).length, 0, 'that day had no churn')
     // Selection is per page but shares one memory, so walking back keeps what the
     // reader picked instead of snapping to the default.

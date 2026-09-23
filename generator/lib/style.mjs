@@ -268,8 +268,16 @@ nav.term-nav a.active{
   background:var(--cyan-tint-bg);
   text-decoration:none;
 }
-.nav-feed{
-  color:var(--txt-dim)!important;
+/* One row at phone widths: the link bar wraps into two ragged rows around
+   430px, so it becomes a single horizontally scrollable strip instead. */
+@media (max-width:480px){
+  nav.term-nav{
+    flex-wrap:nowrap;
+    overflow-x:auto;
+    scrollbar-width:none;
+  }
+  nav.term-nav::-webkit-scrollbar{display:none}
+  nav.term-nav a, nav.term-nav button{white-space:nowrap}
 }
 
 .hero{
@@ -3126,7 +3134,6 @@ a.badge:hover{text-decoration:none;color:var(--term-cyan)}
 @keyframes sw-breathe{0%,100%{opacity:1}50%{opacity:.3}}
 .sw-item b{color:var(--txt);font-variant-numeric:tabular-nums}
 .sw-pending{color:var(--term-amber)}
-.sw-counts{margin-left:auto;color:var(--txt-subtle)}
 .sw-api{color:var(--txt-subtle);text-decoration:underline dotted;text-underline-offset:2px}
 .sw-api:hover{color:var(--term-cyan)}
 
