@@ -472,6 +472,13 @@ document.addEventListener('keydown', (e) => {
       const dv = entries[activeEntryIdx].querySelector('.diff-viewer');
       if (dv) {
         e.preventDefault();
+        // The diff lives inside the power-user section: opening it reveals the
+        // whole details chain so the toggle lands where the reader is looking.
+        if (!dv.open) {
+          for (let d = dv.parentElement; d; d = d.parentElement) {
+            if (d.tagName === 'DETAILS') d.open = true;
+          }
+        }
         dv.open = !dv.open;
       }
     }
@@ -519,6 +526,9 @@ document.addEventListener('click', (ev) => {
   const open = action === 'expand';
   document.querySelectorAll('section.day details.entry:not([hidden])').forEach(e => {
     e.open = open;
+    // [expand all] is the power-user move: it opens the folded technical
+    // section too (and collapse-all folds it back).
+    e.querySelectorAll('details.power-details').forEach(p => { p.open = open; });
   });
 });
 
@@ -1157,42 +1167,42 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
 
   const summaryText = e.ai?.summary || e.summary
   const changes = changesHtml(e)
-  let techHtml = ''
-  if (summaryText || changes) {
-    const inner = (summaryText ? `<div class="summary">${miniMd(summaryText)}</div>` : '') + changes
-    if (e.eli5?.text) {
-      techHtml = `<details class="tech-details">
-<summary class="tech-toggle" title="Toggle technical explanation">
+  const summaryHtml = (summaryText ? `<div class="summary">${miniMd(summaryText)}</div>` : '') + changes
+  // A row with no plain-English line keeps its summary visible as the lead;
+  // when the plain-English line exists the summary joins the power section.
+  const leadHtml = e.eli5?.text ? '' : summaryHtml
+  // One power-user fold: everything under the plain-English line lives behind
+  // a single "Technical details" toggle (technical summary, ACTION, structured
+  // facts, evidence, "not in the diff", shipped-in, code comments, file list,
+  // inline diff, related entries, story notes and the action links), so the
+  // casual view is title + plain English while the full record stays one
+  // click away.
+  const powerStart = `<details class="tech-details power-details">
+<summary class="tech-toggle power-toggle" title="Toggle technical details: summary, actions, structured facts, evidence, diff and links">
   <span class="diff-arrow">&gt;</span>
-  <span>Technical explanation</span>
+  <span>Technical details</span>
+  <span class="power-hint">+${e.stats.additions} / −${e.stats.deletions} &middot; ${e.files.total} file${e.files.total === 1 ? '' : 's'}</span>
 </summary>
-<div class="tech-body">
-  ${inner}
-</div>
+<div class="tech-body power-body">`
+  const powerEnd = `</div>
 </details>`
-    } else {
-      techHtml = inner
-    }
-  }
 
   // data-cat / data-sig / data-churn are what the front-page filter toggles: every
   // row the index renders is a row the reader can narrow by area or impact, with no
   // second request.
   return `<details class="entry ${e.significance}" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(e.significance || '')}" data-aud="${esc(e.ai?.audience || '')}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
 <summary class="entry-summary">
-  <div class="entry-meta-top">
-    <span class="entry-arrow">&gt;</span>
-    <span class="commit-ref">commit <a href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${anchor}</a></span>
-    <span class="entry-utc">${esc(time)} UTC</span>
-    <div class="badges">${badges(e)}</div>
-    <a class="permalink" href="/c/${anchor}" title="Permalink: this change alone" aria-label="Permalink" onclick="event.stopPropagation()">[permalink]</a>
-  </div>
+  <span class="entry-arrow">&gt;</span>
+  <span class="entry-utc" title="${esc(time)} UTC">${esc(time)}</span>
   <h3 class="entry-title">${title}</h3>
+  <div class="badges">${badges(e)}</div>
 </summary>
 <div class="entry-body">
 ${modelDiffLine(e)}
 ${e.eli5?.text ? `<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH</span>${esc(e.eli5.text)}</p>` : ''}
-${techHtml}
+${leadHtml}
+${powerStart}
+${e.eli5?.text ? summaryHtml : ''}
 ${migrationHtml(e)}
 ${structuredChips(e)}
 ${evidenceHtml(e)}
@@ -1208,13 +1218,15 @@ ${storyNoteHtml(opts.storyNotes)}
   <div class="meta-links">
     <button class="meta-link dc-copy" type="button" data-dc="${esc(discordText(e, { storyNotes: opts.storyNotes }))}" title="Copy this entry as Discord-formatted text (c)">discord</button>
     <button class="meta-link copy-link" type="button" data-link="${esc(`${SITE.url}/day/${e.day}/#${anchor}`)}" title="Copy a stable link to this entry">link</button>
-    ${e.sourceSha ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" rel="noopener" target="_blank">snapshot</a>` : ''}
+    <a class="permalink" href="/c/${anchor}" title="Permalink: this change alone">[permalink]</a>
+    <a class="meta-link" href="https://github.com/CodebuffAI/freebuff/commit/${e.sha}" rel="noopener" target="_blank" title="${e.sourceSha ? 'Public snapshot commit on GitHub' : 'Commit on GitHub'}">commit ${anchor}</a>
     ${e.pr ? `<a class="meta-link" href="${esc(e.prUrl || '')}" rel="noopener" target="_blank">PR #${e.pr}</a>` : ''}
-    ${e.compareUrl ? `<a class="meta-link" href="${esc(e.compareUrl)}" rel="noopener" target="_blank">compare</a>` : e.url ? `<a class="meta-link" href="${esc(e.url)}" rel="noopener" target="_blank">commit</a>` : ''}
+    ${e.compareUrl ? `<a class="meta-link" href="${esc(e.compareUrl)}" rel="noopener" target="_blank">compare</a>` : ''}
     ${e.ai?.pr && e.kind === 'sync' ? `<a class="meta-link" href="https://github.com/CodebuffAI/freebuff/pull/${Number(e.ai.pr)}" rel="noopener" target="_blank" title="${e.ai.prMatched === 'files' ? `Matched to this snapshot by its touched files (${Math.round((e.ai.prConfidence || 0) * 100)}% confidence)` : 'Pull request this change came from'}">PR #${Number(e.ai.pr)}${e.ai.prMatched === 'files' ? '?' : ''}</a>` : ''}
     <a class="meta-link report" href="${esc(reportIssueUrl(e))}" rel="noopener" target="_blank" title="Something wrong in this entry? Open a prefilled issue; fixes land in data/overrides.json">report</a>
   </div>
 </div>
+${powerEnd}
 </div>
 </details>`
 }
@@ -3663,12 +3675,11 @@ const loadIndex = async () => {
       const brkTag = (e[6] & SFLAG.breaking) ? '<span class="badge brk">[BREAKING]</span>' : '';
       const secTag = (e[6] & SFLAG.security) ? '<span class="badge sec">[SECURITY]</span>' : '';
       const eli5Snippet = e[7] ? '<p class="search-eli5"><span class="search-eli5-lbl">PLAIN ENGLISH:</span> ' + highlight(e[7], w) + '</p>' : '';
-      return '<article class="entry ' + a + '"><div class="entry-meta-top">' +
-        '<span class="commit-ref">commit ' + esc(e[3]) + '</span>' +
-        '<span class="entry-utc">' + esc(e[0]) + '</span>' +
+      return '<article class="entry ' + a + '"><div class="entry-row">' +
+        '<span class="entry-utc" title="commit ' + esc(e[3]) + ' \u00b7 ' + esc(e[0]) + ' UTC">' + esc(e[0]) + '</span>' +
+        '<h3 class="entry-title"><a href="' + u + '">' + highlight(e[1], w) + '</a></h3>' +
         '<div class="badges"><span class="badge cat">[' + esc(c) + ']</span>' + sigTag + audTag + relTag + brkTag + secTag + '</div>' +
         '</div>' +
-        '<h3><a href="' + u + '">' + highlight(e[1], w) + '</a></h3>' +
         eli5Snippet +
         '</article>';
     }).join('') || emptyHint;

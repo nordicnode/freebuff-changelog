@@ -221,10 +221,11 @@ test('buildSite generates valid static site output', async () => {
     // spelled out for readers who have never seen the term "ELI5".
     assert.match(indexHtml, /<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH<\/span>A newer AI model is now available/)
     assert.ok(indexHtml.indexOf('class="eli5"') < indexHtml.indexOf('AI summarized diff'),
-      'the ELI5 line sits before the technical summary')
-    assert.match(indexHtml, /<details class="tech-details"/)
-    assert.match(indexHtml, /class="tech-toggle"/)
-    assert.match(indexHtml, /Technical explanation/)
+      'the ELI5 line sits before the technical summary (folded into the power section)')
+    // Everything below the plain-English line folds into one power-user section.
+    assert.match(indexHtml, /<details class="tech-details power-details"/)
+    assert.match(indexHtml, /class="tech-toggle power-toggle"/)
+    assert.match(indexHtml, /Technical details/)
     assert.match(indexHtml, /<details class="facts-details"/)
     assert.match(indexHtml, /class="facts-toggle"/)
     assert.match(indexHtml, /Code comments/)

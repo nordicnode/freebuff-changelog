@@ -381,7 +381,7 @@ nav.term-nav a.active{
   border:1px solid var(--term-border);
   border-left:3px solid var(--term-border);
   border-radius:2px;
-  margin:10px 0;
+  margin:6px 0;
   transition:border-color .12s ease;
   overflow:hidden;
 }
@@ -395,12 +395,18 @@ nav.term-nav a.active{
   border-left-color:var(--term-border-strong);
 }
 
+/* One shared compact row vocabulary for entry summaries and search hits. */
+.entry-summary,.entry-row{
+  padding:7px 12px;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+}
 .entry-summary{
   list-style:none;
   cursor:pointer;
-  padding:12px 14px;
   user-select:none;
-  display:block;
   outline:none;
 }
 .entry-summary::-webkit-details-marker{
@@ -413,15 +419,6 @@ nav.term-nav a.active{
   background:var(--panel-hover);
 }
 
-.entry-meta-top{
-  display:flex;
-  align-items:center;
-  gap:8px;
-  font-size:.78rem;
-  color:var(--txt-subtle);
-  margin-bottom:6px;
-  flex-wrap:wrap;
-}
 .entry-arrow{
   display:inline-block;
   font-size:.8rem;
@@ -438,34 +435,26 @@ nav.term-nav a.active{
 .entry-summary:hover .entry-arrow{
   color:var(--txt);
 }
-.commit-ref{
-  color:var(--txt-subtle);
-  font-weight:600;
-}
-.commit-ref a{
-  color:var(--term-cyan);
-  text-decoration:none;
-}
-.commit-ref a:hover{
-  color:var(--txt);
-  text-decoration:underline;
-}
 .entry-utc{
   color:var(--txt-subtle);
+  font-size:.72rem;
+  font-variant-numeric:tabular-nums;
+  white-space:nowrap;
 }
 .badges{
   display:inline-flex;
-  gap:8px;
+  gap:5px;
   flex-wrap:wrap;
   align-items:center;
+  margin-left:auto;
 }
 .badge{
   display:inline-flex;
   align-items:center;
-  min-height:24px;
-  font-size:.7rem;
+  min-height:20px;
+  font-size:.66rem;
   font-weight:600;
-  padding:4px 9px;
+  padding:1px 6px;
   border-radius:2px;
   background:transparent;
   border:1px solid var(--term-border);
@@ -497,22 +486,12 @@ nav.term-nav a.active{
 .badge.cat{
   color:var(--txt-subtle);
 }
+/* In the action row now (not a hover-reveal in the summary), so it looks and
+   behaves like the other meta links. */
 .permalink{
-  opacity:0;
-  margin-left:auto;
   color:var(--txt-subtle);
-  font-size:.75rem;
   letter-spacing:.02em;
-  padding:2px 6px;
-  min-height:22px;
-  display:inline-flex;
-  align-items:center;
-  text-decoration:none;
-  transition:opacity .12s ease, color .12s ease;
-}
-.entry:hover .permalink,
-.entry:focus-within .permalink{
-  opacity:1;
+  text-decoration:underline dotted;
 }
 .permalink:hover{
   color:var(--term-cyan);
@@ -521,9 +500,11 @@ nav.term-nav a.active{
 
 .entry h3.entry-title,.entry h3{
   margin:0;
-  font-size:1.02rem;
+  flex:1 1 220px;
+  min-width:0;
+  font-size:.95rem;
   font-weight:700;
-  line-height:1.45;
+  line-height:1.4;
   color:var(--txt);
   transition:color .12s ease;
 }
@@ -549,7 +530,7 @@ nav.term-nav a.active{
   opacity:.92;
 }
 .entry.noise .entry-summary{
-  padding:8px 14px;
+  padding:5px 12px;
 }
 .entry.noise .entry-title{
   font-size:.86rem;
@@ -650,7 +631,7 @@ nav.term-nav a.active{
 .spark{display:block;margin:4px 0 8px;max-width:100%;height:auto}
 
 .entry-body{
-  padding:12px 16px 14px;
+  padding:10px 14px 12px;
   border-top:1px solid var(--term-border);
 }
 
@@ -897,10 +878,14 @@ nav.term-nav a.active{
   color:var(--txt);
   background:var(--panel-hover);
 }
-.facts-hint{
+.facts-hint,
+.power-hint{
   font-size:.74rem;
   font-weight:400;
   color:var(--txt-subtle);
+}
+.power-hint{
+  margin-left:auto;
 }
 .facts-details[open] .facts-toggle{
   border-bottom:1px solid var(--term-border);
