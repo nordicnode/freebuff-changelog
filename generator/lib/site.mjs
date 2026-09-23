@@ -1092,9 +1092,10 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
     }
   }
 
-  // data-cat / data-churn are what the front-page filter toggles: every row the
-  // index renders is a row the reader can filter, with no second request.
-  return `<details class="entry ${e.significance}" id="${anchor}" data-cat="${esc(categorySlug(e.category))}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
+  // data-cat / data-sig / data-churn are what the front-page filter toggles: every
+  // row the index renders is a row the reader can narrow by area or impact, with no
+  // second request.
+  return `<details class="entry ${e.significance}" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(e.significance || '')}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
 <summary class="entry-summary">
   <div class="entry-meta-top">
     <span class="entry-arrow">&gt;</span>
@@ -1599,6 +1600,15 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
   const browseList = [...catLists.entries()].map(([label, list]) => ({ label, slug: categorySlug(label), list, churn: false }))
   if (churnList.length) browseList.push({ label: 'Churn', slug: 'churn', list: churnList, churn: true })
   browseList.sort((a, b) => b.list.length - a.list.length || a.label.localeCompare(b.label))
+  // Impact levels are a second, orthogonal axis (significance, not code area), but
+  // they are browsable the same way: a complete /changes/<sig>/ list and a tile on
+  // the hub. Flagging them `impact` keeps them out of the category counts (About,
+  // stats) and the per-area RSS feeds while reusing the one browse-page renderer.
+  const IMPACT_LEVELS = [['major', 'Major'], ['notable', 'Notable'], ['minor', 'Minor']]
+  for (const [sig, label] of IMPACT_LEVELS) {
+    const list = entries.filter(e => !e.noise && e.significance === sig)
+    if (list.length) browseList.push({ label, slug: sig, list, impact: true })
+  }
   const browseBySlug = new Map(browseList.map(b => [b.slug, b]))
   // How long the data is allowed to sit before the sync loop re-analyzes. The
   // [fresh]/[stale] badge has to be stated in these terms: it used to tick to the
@@ -1621,12 +1631,14 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
   const dayJump = (current, withId) => `<form class="day-jump"${withId ? ' id="day-jump"' : ''} action="/day/${current}/" method="get" onsubmit="location.href=this.d.value;return false"><label>JUMP:<select name="d" onchange="if(this.value)location.href=this.value"><option value="">--pick a date--</option>${dayOptions}</select></label></form>`
   const jumpLink = '<a href="#day-jump">[jump to a date &uarr;]</a>'
 
-  // Chips are per page: each one counts the rows it can actually hide *here*.
-  const chipHtml = (slug, label, n, active, extraClass) => {
+  // Dropdown options are per page: each counts the rows it can actually hide
+  // *here*, and carries the all-time figure and where to find it. A bare "1" for
+  // CLI reads as "that is all there is"; the total and href say otherwise.
+  const optHtml = (slug, label, n) => {
     const b = browseBySlug.get(slug)
     const total = b ? b.list.length : meaningful.length
     const href = b ? `/changes/${b.slug}/` : '/archive/#categories'
-    return `  <button type="button" class="chip${active ? ' active' : ''}${extraClass}" data-filter="${esc(slug)}" data-label="${esc(label)}" data-total="${total}" data-href="${esc(href)}" aria-pressed="${active ? 'true' : 'false'}">${esc(label)}<span class="chip-n">${n.toLocaleString()}</span></button>`
+    return `      <option value="${esc(slug)}" data-label="${esc(label)}" data-total="${total}" data-href="${esc(href)}">${esc(label)} (${n.toLocaleString()})</option>`
   }
 
   // Walking the timeline is walking dates: older to the left (the site's existing
@@ -1672,6 +1684,17 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
       if (!catCounts.has(slug)) catCounts.set(slug, cur)
     }
     const chipList = [...catCounts.values()].sort((a, b) => b.n - a.n || a.label.localeCompare(b.label))
+    // Impact counts for this page, same page-scoped rule as the area chips: only
+    // the levels actually present here get an option, so no selection can empty the
+    // page down to nothing on an axis with no rows today.
+    const sigCounts = new Map()
+    for (const e of rows) {
+      if (e.noise || !e.significance) continue
+      sigCounts.set(e.significance, (sigCounts.get(e.significance) || 0) + 1)
+    }
+    const sigList = IMPACT_LEVELS
+      .filter(([sig]) => sigCounts.get(sig))
+      .map(([sig, label]) => ({ slug: sig, label, n: sigCounts.get(sig) }))
 
     const topPager = `<div class="pager pager-timeline pager-timeline-top">
     <div class="timeline-nav-group">
@@ -1692,15 +1715,21 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
     </div>
   </div>`
 
+    const churnTotal = churnList.length
     const filterRow = `<div class="timeline-filter-row">
-    <nav class="filterbar" id="filters" aria-label="Filter the rows on this page by category">
-      <span class="filter-label">FILTER:</span>
+    <div class="filterbar" id="filters">
+      <label class="filter-label" for="filter-select">FILTER:</label>
+      <select id="filter-select" aria-label="Filter the rows on this page by area or impact">
 ${[
-      chipHtml('*', latest ? 'recent' : 'this day', real, true, ''),
-      ...chipList.map(c => chipHtml(c.slug, c.label, c.n, false, '')),
-      chipHtml('churn', 'churn', churn, false, ' chip-churn')
+      `      <option value="*" data-label="${esc(latest ? 'recent' : 'this day')}" data-total="${meaningful.length}" data-href="/archive/#categories" selected>${esc(latest ? 'recent' : 'this day')} (${real.toLocaleString()})</option>`,
+      `      <optgroup label="by area">`,
+      ...chipList.map(c => optHtml(c.slug, c.label, c.n)),
+      `      </optgroup>`,
+      ...(sigList.length ? [`      <optgroup label="by impact">`, ...sigList.map(c => optHtml(c.slug, c.label, c.n)), `      </optgroup>`] : [])
     ].join('\n')}
-    </nav>
+      </select>
+      <button type="button" class="chip chip-churn" id="churn-toggle" data-total="${churnTotal}" data-href="/changes/churn/" aria-pressed="false">churn<span class="chip-n">${churn.toLocaleString()}</span></button>
+    </div>
     <p class="filter-note" data-hub="/archive/#categories">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page <em>${churn ? '(' + churn + ' churn hidden)' : '(no churn that day)'}</em> &middot; <span id="filter-all"><a href="/archive/#categories">browse all changes by category</a></span></p>
   </div>`
 
@@ -1742,22 +1771,21 @@ ${rows.map(e => {
     return hero + dayHtml + pagePager(i)
   }
 
-  // Front-page filters. Every row the timeline can show is already in the DOM,
-  // so a filter is a visibility toggle rather than a request. Churn starts
-  // hidden *in the markup* (not by script), so a reader with JS off gets the
-  // quiet timeline -- the default was asked for, and defaults belong on the
-  // server. Chips only name categories actually present on the page, so no chip
-  // can filter a page down to nothing by accident, and the `recent` chip on
-  // every page is the way back out of a selection that has no rows here.
-  // Progressive enhancement only: no-JS readers see the server default (real
-  // changes, no churn). Category labels live in data-* so the toggle never has
-  // to parse markup, and a day whose rows are all filtered out is hidden with
-  // them rather than leaving a stray date header behind.
+  // Front-page filter. Every row the timeline can show is already in the DOM, so a
+  // filter is a visibility toggle rather than a request. Churn starts hidden *in
+  // the markup* (not by script), so a reader with JS off gets the quiet timeline --
+  // defaults belong on the server. The dropdown picks one area or one impact level
+  // at a time (plus the `recent` reset that names the whole day); churn is an
+  // independent toggle so it composes with either. Labels and all-time figures live
+  // in data-* so the script never parses markup, and a day whose rows are all
+  // filtered out is hidden with them rather than leaving a stray date header.
   const filterScript = `<script>
 (function () {
-  var bar = document.getElementById('filters');
-  if (!bar) return;
+  var wrap = document.getElementById('filters');
+  if (!wrap) return;
   var KEY = 'fbIndexFilter';
+  var sel = document.getElementById('filter-select');
+  var churnBtn = document.getElementById('churn-toggle');
   var rows = [].slice.call(document.querySelectorAll('details.entry'));
   var days = [].slice.call(document.querySelectorAll('section.day'));
   var countEl = document.getElementById('filter-count');
@@ -1765,18 +1793,24 @@ ${rows.map(e => {
   var noteWrap = document.querySelector('.filter-note');
   var allEl = document.getElementById('filter-all');
   var HUB = (noteWrap && noteWrap.getAttribute('data-hub')) || '/archive/#categories';
-  function chipFor(slug) { return bar.querySelector('.chip[data-filter="' + slug + '"]') }
-  var state = { cats: [], churn: false };
+  var SIG = { major: 1, notable: 1, minor: 1 };
+  function optFor(v) { return sel ? sel.querySelector('option[value="' + v + '"]') : null }
+  var state = { filter: '*', churn: false };
   try {
     var stored = JSON.parse(localStorage.getItem(KEY) || 'null');
-    if (stored && Object.prototype.toString.call(stored.cats) === '[object Array]') state = { cats: stored.cats, churn: !!stored.churn };
+    if (stored && typeof stored.filter === 'string') state = { filter: stored.filter, churn: !!stored.churn };
   } catch (e) {}
 
   function apply(save) {
-    var active = state.cats;
+    var f = state.filter;
+    if (f !== '*' && !optFor(f)) f = '*';
+    var o = f === '*' ? null : optFor(f);
     rows.forEach(function (r) {
-      var isChurn = r.hasAttribute('data-churn');
-      var want = isChurn ? state.churn : (!active.length || active.indexOf(r.getAttribute('data-cat')) !== -1);
+      var want;
+      if (r.hasAttribute('data-churn')) want = state.churn;
+      else if (f === '*') want = true;
+      else if (SIG[f]) want = r.getAttribute('data-sig') === f;
+      else want = r.getAttribute('data-cat') === f;
       r.hidden = !want;
     });
     days.forEach(function (d) {
@@ -1805,63 +1839,43 @@ ${rows.map(e => {
       var d = note.closest ? note.closest('section.day') : null;
       note.hidden = !!(d && d.querySelector('details.entry:not([hidden])'));
     });
-    // The note line answers the question a chip count raises: 27 rows here, but
-    // how many CLI changes exist at all? That number is not on this page, so it
-    // is stated as an all-time figure and linked to the page where it is.
+    // The note line answers the question a page count raises: N rows here, but how
+    // many of this area/impact exist at all? That figure is not on this page, so it
+    // is stated as an all-time number and linked to the page where it lives.
     if (allEl) {
       while (allEl.firstChild) allEl.removeChild(allEl.firstChild);
       var text = function (t) { allEl.appendChild(document.createTextNode(t)) };
       var link = function (t, href) { var a = document.createElement('a'); a.href = href; a.textContent = t; allEl.appendChild(a) };
       var num = function (v) { return Number(v || 0).toLocaleString() };
-      var totalOf = function (slug) { var c = chipFor(slug); return c ? Number(c.getAttribute('data-total') || 0) : 0 };
-      if (active.length === 1) {
-        var c = chipFor(active[0]);
-        if (c) {
-          text(num(c.getAttribute('data-total')) + ' ' + c.getAttribute('data-label') + ' changes all-time ');
-          link('see every one', c.getAttribute('data-href'));
-        }
-      } else if (active.length > 1) {
-        var sum = 0;
-        active.forEach(function (s) { sum += totalOf(s) });
-        text(num(sum) + ' changes across those ' + active.length + ' categories all-time ');
-        link('browse by category', HUB);
+      if (o) {
+        text(num(o.getAttribute('data-total')) + ' ' + o.getAttribute('data-label') + ' changes all-time ');
+        link('see every one', o.getAttribute('data-href'));
       } else {
         link('browse all changes by category', HUB);
       }
-      if (state.churn && totalOf('churn')) {
+      if (state.churn && churnBtn && Number(churnBtn.getAttribute('data-total') || 0)) {
         text(' \u00b7 ');
-        link(num(totalOf('churn')) + ' churn', chipFor('churn').getAttribute('data-href'));
+        link(num(churnBtn.getAttribute('data-total')) + ' churn', churnBtn.getAttribute('data-href'));
       }
     }
-    [].forEach.call(bar.querySelectorAll('.chip'), function (c) {
-      var f = c.getAttribute('data-filter');
-      var on = f === '*' ? !active.length && !state.churn : f === 'churn' ? state.churn : active.indexOf(f) !== -1;
-      c.classList.toggle('active', on);
-      c.setAttribute('aria-pressed', on ? 'true' : 'false');
-    });
+    if (sel) sel.value = f;
+    if (churnBtn) {
+      churnBtn.classList.toggle('active', state.churn);
+      churnBtn.setAttribute('aria-pressed', state.churn ? 'true' : 'false');
+    }
     if (countEl) countEl.textContent = shown;
     if (noteEl) {
       var churnRows = rows.filter(function (r) { return r.hasAttribute('data-churn') }).length;
       var bits = [];
-      if (active.length) bits.push(active.length === 1 ? active[0].replace(/-/g, ' ') : active.length + ' categories');
+      if (o) bits.push(o.getAttribute('data-label').toLowerCase());
       bits.push(!churnRows ? 'no churn that day' : churnRows + ' churn ' + (state.churn ? 'shown' : 'hidden'));
       noteEl.textContent = '(' + bits.join(' \u00b7 ') + ')';
     }
     if (save) { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {} }
   }
 
-  bar.addEventListener('click', function (ev) {
-    var chip = ev.target.closest ? ev.target.closest('.chip') : null;
-    if (!chip) return;
-    var f = chip.getAttribute('data-filter');
-    if (f === '*') { state.cats = []; state.churn = false; }
-    else if (f === 'churn') { state.churn = !state.churn; }
-    else {
-      var i = state.cats.indexOf(f);
-      if (i === -1) state.cats.push(f); else state.cats.splice(i, 1);
-    }
-    apply(true);
-  });
+  if (sel) sel.addEventListener('change', function () { state.filter = sel.value || '*'; apply(true); });
+  if (churnBtn) churnBtn.addEventListener('click', function () { state.churn = !state.churn; apply(true); });
   apply(false);
 })();
 </script>`
@@ -2304,11 +2318,11 @@ ${rows.map(e => {
     }
     const months = [...byMonth.keys()].sort().reverse()
     const pageHref = (m) => m === months[0] ? `/changes/${b.slug}/` : `/changes/${b.slug}/${m}/`
-    const rssLink = b.churn || ['major', 'models', 'releases', 'security', 'weekly'].includes(b.slug) ? '' : `<a href="/feed-${esc(b.slug)}.xml">[ rss for ${esc(b.label)} ]</a> `
+    const rssLink = b.churn || b.impact || ['major', 'models', 'releases', 'security', 'weekly'].includes(b.slug) ? '' : `<a href="/feed-${esc(b.slug)}.xml">[ rss for ${esc(b.label)} ]</a> `
     const hero = (month) => `<section class="hero">
   <div class="term-box term-box-slim">
     <div class="term-box-hdr">
-      <span class="term-box-title">${b.churn ? 'CHURN_LOG' : 'CATEGORY_LOG'} :: ${esc(b.label)}</span>
+      <span class="term-box-title">${b.churn ? 'CHURN_LOG' : b.impact ? 'IMPACT_LOG' : 'CATEGORY_LOG'} :: ${esc(b.label)}</span>
       <span>${b.list.length.toLocaleString()} ${b.churn ? 'commits' : 'changes'}</span>
     </div>
     <div class="term-footer-bar">
@@ -2354,8 +2368,10 @@ ${d.entries.map(changeRow).join('\n')}
   // taxonomy copy, these tiles) now derive from the same lists the /changes/
   // pages render, so a number can never disagree with the list behind it.
   const cats = new Map([...catLists.entries()].map(([c, list]) => [c, list.length]))
-  const catTiles = browseList.map(b =>
-    `<a class="tile" href="/changes/${b.slug}/"><b>${esc(b.label)}</b><span>${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : 'changes'}</span></a>`).join('')
+  const tileHtml = (b) => `<a class="tile${b.impact ? ' tile-impact' : ''}" href="/changes/${b.slug}/"><b>${esc(b.label)}</b><span>${b.list.length.toLocaleString()} ${b.churn ? 'churn commits' : 'changes'}</span></a>`
+  const catTiles = browseList.filter(b => !b.impact).map(tileHtml).join('')
+  const impactBrowse = browseList.filter(b => b.impact)
+  const impactTiles = impactBrowse.map(tileHtml).join('')
 
   // The archive is a directory of ~720 days and ~645 releases. Flat, that is
   // 1,366 links on one page: a reader looking for August 2025 had to walk past
@@ -2500,9 +2516,10 @@ ${d.entries.map(changeRow).join('\n')}
   ${relSections}
 </div>
 <div class="aview" data-view="cats" id="categories">
-  <p class="list-note">Every change of one category, all time -- the complete list behind the front page's chips.</p>
+  <p class="list-note">Every change of one kind, all time -- the complete list behind the front page's filter. Browse by code area or by impact.</p>
   <div class="section-hdr"><h2>CATEGORIES (${cats.size})</h2></div>
   <div class="grid">${catTiles}</div>
+  ${impactTiles ? `<div class="section-hdr"><h2>BY IMPACT (${impactBrowse.length})</h2></div>\n  <div class="grid">${impactTiles}</div>` : ''}
 </div>
 ${archiveScript}`
   }))
@@ -3592,7 +3609,7 @@ ${inFlightScript}`
   // just that surface. Linked from each /changes/<slug>/ page.
   const RESERVED_FEEDS = new Set(['major', 'models', 'releases', 'security', 'weekly'])
   for (const b of browseList) {
-    if (b.churn || RESERVED_FEEDS.has(b.slug)) continue
+    if (b.churn || b.impact || RESERVED_FEEDS.has(b.slug)) continue
     await write(dist, `feed-${b.slug}.xml`, feedXml(SITE.url, SITE.name, SITE.desc, generated, `feed-${b.slug}.xml`, `${SITE.name}: ${b.label}`, `Changes in the ${b.label} area of Freebuff.`, b.list.slice(0, 60).map(rssItem).join('')))
   }
   // Weekly digest feed: one item per ISO week, built from the digest pages.

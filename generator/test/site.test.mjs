@@ -597,24 +597,33 @@ test('buildSite generates valid static site output', async () => {
     // chip that reveals it. Nothing is removed from the document either way --
     // Filtering costs no request, and every day page carries the same bar and the
     // same server-side default.
-    assert.match(indexHtml, /<nav class="filterbar" id="filters"/)
-    assert.match(indexHtml, /data-filter="\*" data-label="recent"[^>]*aria-pressed="true">recent<span class="chip-n">2<\/span>/,
-      'the reset chip counts this day, not the database')
-    assert.match(indexHtml, /data-filter="cli"/)
-    assert.match(indexHtml, /data-filter="model-catalog"/)
-    assert.match(indexHtml, /data-filter="churn"[^>]*aria-pressed="false">churn<span class="chip-n">1<\/span>/)
-    // Chip counts are page-scoped, so every chip also carries the all-time figure
-    // and where to find it: a bare "27" for CLI reads as "that is all there is".
-    assert.match(indexHtml, /data-filter="cli" data-label="CLI" data-total="2" data-href="\/changes\/cli\/"/)
-    assert.match(indexHtml, /data-filter="churn" data-label="churn" data-total="1" data-href="\/changes\/churn\/"/)
+    // Front-page filter: one single-select dropdown (an "by area" group of the
+    // categories present on the page plus an "by impact" group of significance
+    // levels) and an independent churn toggle. Every row is filterable in place
+    // via data-cat / data-sig, and churn is hidden in the markup so the default
+    // holds without scripting.
+    assert.match(indexHtml, /<select id="filter-select"/, 'the filter is a dropdown, not a chip row')
+    assert.match(indexHtml, /<option value="\*" data-label="recent"[^>]*selected>recent \(2\)<\/option>/,
+      'the reset option counts this day, not the database')
+    assert.match(indexHtml, /<optgroup label="by area">/)
+    assert.match(indexHtml, /<optgroup label="by impact">/)
+    // Page-scoped counts, but each option also carries the all-time figure and
+    // where to find it: a bare "1" for CLI reads as "that is all there is".
+    assert.match(indexHtml, /<option value="cli" data-label="CLI" data-total="2" data-href="\/changes\/cli\/">CLI \(1\)<\/option>/)
+    assert.match(indexHtml, /<option value="model-catalog" data-label="Model Catalog" data-total="1" data-href="\/changes\/model-catalog\/">Model Catalog \(1\)<\/option>/)
+    assert.match(indexHtml, /<option value="major" data-label="Major" data-total="2" data-href="\/changes\/major\/">Major \(1\)<\/option>/)
+    assert.match(indexHtml, /<option value="minor" data-label="Minor" data-total="1" data-href="\/changes\/minor\/">Minor \(1\)<\/option>/)
+    assert.match(indexHtml, /id="churn-toggle"[^>]*data-total="1"[^>]*data-href="\/changes\/churn\/"[^>]*>churn<span class="chip-n">1<\/span>/,
+      'churn stays an independent toggle, not a dropdown option')
     assert.match(indexHtml, /id="filter-all"><a href="\/archive\/#categories">browse all changes by category<\/a><\/span>/,
       'the note line links to the category hub without restating the all-time total')
     assert.equal(rowTags(indexHtml).filter(t => t.includes('data-churn="1"')).length, 1)
     assert.ok(rowTags(indexHtml).every(t => t.includes('data-cat="')), 'every row is filterable by category')
+    assert.ok(rowTags(indexHtml).every(t => t.includes('data-sig="')), 'every row is filterable by impact')
     assert.equal(rowTags(indexHtml).filter(t => !isHidden(t)).length, 2, 'one day per page: two changes, its churn row hidden')
-    // The toggle is progressive enhancement: guarded on the bar existing, keeps
-    // its state across the auto-reload, and hides a day whose rows all filtered
-    // out instead of leaving a stray date header.
+    // Progressive enhancement only: guarded on the bar existing, keeps its state
+    // across the auto-reload, and hides a day whose rows all filtered out instead
+    // of leaving a stray date header.
     assert.match(indexHtml, /getElementById\('filters'\)/)
     assert.match(indexHtml, /fbIndexFilter/)
     assert.match(indexHtml, /details\.entry:not\(\[hidden\]\)/, 'empty day sections collapse with their rows')
@@ -625,10 +634,9 @@ test('buildSite generates valid static site output', async () => {
     // wins if no display rule outranks it.
     assert.match(indexHtml, /\[hidden\]\{display:none!important\}/)
     // A day page is the same timeline read one day at a time, so it filters the
-    // same way: bar present, churn listed but hidden in markup. Nothing
-    // disappears -- the day heading still counts the churn row, and one click on
-    // the churn chip shows it.
+    // same way: dropdown present, churn listed but hidden in markup.
     assert.match(dayHtml2, /id="filters"/)
+    assert.match(dayHtml2, /<select id="filter-select"/)
     assert.equal(rowTags(dayHtml2).filter(t => t.includes('data-churn="1"')).length, 1, 'the churn row is still listed on its day page')
     assert.ok(rowTags(dayHtml2).find(t => t.includes('data-churn="1"')).includes(' hidden'), 'hidden by default here too')
     assert.match(dayHtml2, /<span class="day-churn">\+1 churn<\/span>/)
@@ -651,16 +659,29 @@ test('buildSite generates valid static site output', async () => {
     const churnPage = await readFile(join(tmpDist, 'changes/churn/index.html'), 'utf8')
     assert.match(churnPage, /CHURN_LOG :: Churn/)
     assert.match(churnPage, /<div class="crow crow-noise" id="eeee11112222"/, 'churn is listed, not hidden, once asked for')
+    // Impact views are real /changes/ pages too: complete, month-split, and titled
+    // as an impact log rather than pretending to be a code area.
+    const majorPage = await readFile(join(tmpDist, 'changes/major/index.html'), 'utf8')
+    assert.match(majorPage, /IMPACT_LOG :: Major/)
+    assert.match(majorPage, /2 changes/)
+    assert.doesNotMatch(majorPage, /\[ rss for Major \]/, 'impact pages carry no rss link; feeds stay area-only')
+    await assert.rejects(readFile(join(tmpDist, 'feed-minor.xml'), 'utf8'), 'no feed is generated for an impact view')
+    await assert.rejects(readFile(join(tmpDist, 'feed-notable.xml'), 'utf8'), 'an empty impact level gets no page and no feed')
+    await assert.rejects(readFile(join(tmpDist, 'changes/notable/index.html'), 'utf8'), 'notable has no rows in this fixture, so no page')
     await readFile(join(tmpDist, 'og/category-cli.svg'), 'utf8')
     assert.match(sitemapPages, /\/changes\/cli\//)
     assert.match(sitemapPages, /\/changes\/churn\//)
+    assert.match(sitemapPages, /\/changes\/major\//, 'impact pages are crawlable like any category page')
     // Archive tiles used to send a category click to a text search; they now
-    // point at the complete list.
+    // point at the complete list, and impact levels sit in their own group.
     const archivePage = await readFile(join(tmpDist, 'archive/index.html'), 'utf8')
-    assert.equal((archivePage.match(/class="tile"/g) || []).length, 3, 'archive carries the category tiles plus churn')
+    assert.equal((archivePage.match(/class="tile"/g) || []).length, 3, 'area tiles unchanged (CLI, Model Catalog, Churn)')
     assert.match(archivePage, /href="\/changes\/cli\/"><b>CLI<\/b><span>2 changes<\/span>/)
     assert.match(archivePage, /href="\/changes\/churn\/"><b>Churn<\/b><span>1 churn commits<\/span>/)
     assert.match(archivePage, /href="\/changes\/cli\/"/)
+    assert.match(archivePage, /BY IMPACT/, 'the hub gains a separate impact group')
+    assert.match(archivePage, /class="tile tile-impact" href="\/changes\/major\/"><b>Major<\/b><span>2 changes<\/span>/)
+    assert.match(archivePage, /class="tile tile-impact" href="\/changes\/minor\/"><b>Minor<\/b><span>1 changes<\/span>/)
     assert.doesNotMatch(archivePage, /href="\/search\/\?q=CLI"/, 'no category tile masquerading as a search')
     assert.doesNotMatch(indexHtml, /href="\/changes\/"[^>]*>\/changes</, 'nav no longer offers the removed hub')
     assert.match(indexHtml, /href="\/archive\/"[^>]*>\/archive</, 'nav offers the archive')
@@ -970,10 +991,10 @@ test('the timeline paginates one day per page and keeps every entry reachable', 
       assert.equal(tags(h).filter(t => / open>$/.test(t)).length, 1)
     }
 
-    // Chips count the day. The all-time figure beside them does not move.
-    assert.match(latest, /data-filter="\*"[^>]*data-total="4"[^>]*>recent<span class="chip-n">1<\/span>/)
-    assert.match(d11, /data-filter="\*"[^>]*>this day<span class="chip-n">2<\/span>/, 'a day page names the reset for what it counts')
-    assert.match(d11, /data-filter="cli"[^>]*data-total="4"/)
+    // The dropdown counts the day; the all-time figure beside it does not move.
+    assert.match(latest, /<option value="\*" data-label="recent" data-total="4"[^>]*selected>recent \(1\)<\/option>/)
+    assert.match(d11, /<option value="\*" data-label="this day"[^>]*>this day \(2\)<\/option>/, 'a day page names the reset for what it counts')
+    assert.match(d11, /<option value="cli" data-label="CLI" data-total="4"[^>]*>CLI \(2\)<\/option>/)
     assert.match(d11, /showing <b id="filter-count">2<\/b> of 2 rows on this page <em>\(no churn that day\)/)
     assert.match(d10, /showing <b id="filter-count">1<\/b> of 1 rows on this page/)
 
@@ -981,7 +1002,7 @@ test('the timeline paginates one day per page and keeps every entry reachable', 
     // hidden by the server, counted in the heading, one click from view.
     assert.ok(tags(d12).find(t => t.includes('data-churn="1"')).includes(' hidden'))
     assert.match(d12, /<span class="day-churn">\+1 churn<\/span>/)
-    assert.match(d12, /data-filter="churn"[^>]*>churn<span class="chip-n">1<\/span>/)
+    assert.match(d12, /id="churn-toggle"[^>]*data-total="1"[^>]*>churn<span class="chip-n">1<\/span>/)
     // The count is the point of the note: "3 of 9" begs "where are the other 6?"
     assert.match(d12, /showing <b id="filter-count">1<\/b> of 2 rows on this page <em>\(1 churn hidden\)<\/em>/, 'the parenthetical accounts for the hidden rows by number')
     assert.equal(tags(d11).filter(t => t.includes('data-churn')).length, 0, 'that day had no churn')

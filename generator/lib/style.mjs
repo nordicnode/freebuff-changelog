@@ -568,6 +568,20 @@ nav.term-nav a.active{
 .chip-n{margin-left:5px;font-size:.68rem;color:var(--txt-subtle)}
 .chip-churn{border-style:dashed}
 .chip-churn.active{border-color:var(--term-amber);background:var(--amber-tint-bg)}
+/* The front-page filter is one dropdown (area + impact) plus a churn toggle. */
+#filter-select{
+  background:var(--panel);
+  border:1px solid var(--term-border);
+  color:var(--txt-dim);
+  padding:2px 6px;
+  border-radius:2px;
+  font-family:inherit;
+  font-size:.82rem;
+  max-width:min(60vw,320px);
+}
+#filter-select:hover{border-color:var(--term-border-strong);color:var(--txt)}
+#filter-select optgroup{font-style:normal;color:var(--txt-subtle)}
+#filter-select option{background:var(--panel);color:var(--txt)}
 /* Month nav on the /changes/ pages: same chip dialect, but links. */
 .browse-months{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 4px}
 .bmonth{display:inline-flex;align-items:center;font:inherit;font-size:.72rem;color:var(--txt-subtle);background:transparent;border:1px solid var(--term-border);border-radius:2px;padding:2px 8px;text-decoration:none}
@@ -1707,6 +1721,9 @@ button.meta-link.dc-ok{
   font-size:.72rem;
   color:var(--txt-dim);
 }
+/* Impact tiles are a different axis (significance, not code area); a left accent
+   keeps them visually grouped under BY IMPACT without a second card style. */
+.tile-impact{border-left:2px solid var(--term-amber)}
 
 .section-hdr{
   border-bottom:1px solid var(--term-border);
