@@ -1,0 +1,406 @@
+diff --git a/common/src/constants/freebuff-desktop-sessions.ts b/common/src/constants/freebuff-desktop-sessions.ts
+index 75e96e8ec..ab58ee702 100644
+--- a/common/src/constants/freebuff-desktop-sessions.ts
++++ b/common/src/constants/freebuff-desktop-sessions.ts
+@@ -60,28 +60,33 @@ export function getFreebuffDesktopConcurrency(
+   }
+   return accessTier === 'limited' && !hasPaidPlan ? 'slot-bound' : 'multi-tab'
+ }
+ 
+ export function occupiesFreebuffDesktopSlot(
+   model: string,
+   accessTier: FreebuffAccessTier | null | undefined,
+   hasPaidPlan = false,
+ ): boolean {
+   return (
+     getFreebuffDesktopConcurrency(model, accessTier, hasPaidPlan) ===
+     'slot-bound'
+   )
+ }
+ 
+ /** Idle time after which Desktop ends a hosted session and frees its slot. */
+ export const FREEBUFF_DESKTOP_IDLE_RELEASE_MS = 15 * 60 * 1000
+ 
+ /** Pins an end/refund request to one window of a stable Desktop tab. */
+ export const FREEBUFF_DESKTOP_ADMITTED_AT_HEADER =
+   'x-freebuff-desktop-admitted-at'
+ 
+ /** Client-persisted identity for a possibly unacknowledged Desktop POST. */
+ export const FREEBUFF_DESKTOP_ATTEMPT_HEADER = 'x-freebuff-desktop-attempt-id'
+ 
++/** Renew this tab's live paid hour in place: charge its price again, restart
++ *  its hour and pacing counter. The value is a client UUID that makes retries
++ *  charge once. */
++export const FREEBUFF_SESSION_RENEWAL_HEADER = 'x-freebuff-session-renewal-id'
++
+ /** Versioned opt-in: instance ids become single-use execution claims. */
+ export const FREEBUFF_PURCHASE_CONTINUITY_HEADER =
+   'x-freebuff-purchase-continuity'
+diff --git a/common/src/util/freebuff-session-slowed.ts b/common/src/util/freebuff-session-slowed.ts
+new file mode 100644
+index 000000000..e482bfeb5
+--- /dev/null
++++ b/common/src/util/freebuff-session-slowed.ts
+@@ -0,0 +1,34 @@
++/**
++ * The completions route's word that a free-mode session is being paced past its
++ * target: an SSE comment ending each step once the session's settled spend has
++ * crossed it, giving the NEXT step's pause before that pause starts. The server
++ * writes it and the SDK reads it through here.
++ */
++export interface FreebuffSessionSlowed {
++  instanceId: string
++  delayMs: number
++}
++
++/** An SSE comment, so clients that do not look for it ignore it. */
++const NOTICE_PREFIX = ': freebuff-session-slowed '
++
++export function sessionSlowedNotice(slowed: FreebuffSessionSlowed): string {
++  return `${NOTICE_PREFIX}${JSON.stringify(slowed)}\n\n`
++}
++
++/** One SSE line; anything but a well-formed notice is null. */
++export function parseSessionSlowedNotice(
++  line: string,
++): FreebuffSessionSlowed | null {
++  if (!line.startsWith(NOTICE_PREFIX)) return null
++  try {
++    const { instanceId, delayMs } = JSON.parse(line.slice(NOTICE_PREFIX.length))
++    return typeof instanceId === 'string' &&
++      typeof delayMs === 'number' &&
++      delayMs > 0
++      ? { instanceId, delayMs }
++      : null
++  } catch {
++    return null
++  }
++}
+diff --git a/sdk/src/impl/__tests__/session-slowed-listener.test.ts b/sdk/src/impl/__tests__/session-slowed-listener.test.ts
+new file mode 100644
+index 000000000..fee94fa53
+--- /dev/null
++++ b/sdk/src/impl/__tests__/session-slowed-listener.test.ts
+@@ -0,0 +1,46 @@
++/** The step that spends a session past its target ends with a notice of the
++ * next step's pause; hosts learn it before that pause starts. */
++import { sessionSlowedNotice } from '@codebuff/common/util/freebuff-session-slowed'
++import { streamText } from 'ai'
++import { afterEach, expect, test } from 'bun:test'
++
++import {
++  getModelForRequest,
++  setFreeModeSessionSlowedListener,
++  type FreeModeSessionSlowed,
++} from '../model-provider'
++
++const originalFetch = globalThis.fetch
++
++afterEach(() => {
++  globalThis.fetch = originalFetch
++  setFreeModeSessionSlowedListener(null)
++})
++
++test('the step that crosses the target announces the next pause at its end', async () => {
++  const chunk = {
++    id: 'c',
++    object: 'chat.completion.chunk',
++    created: 0,
++    model: 'z-ai/glm-5.3-flash',
++    choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }],
++  }
++  globalThis.fetch = (async () =>
++    new Response(
++      `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n` +
++        `: freebuff-session-slowed {malformed\n\n` +
++        sessionSlowedNotice({ instanceId: 'tab', delayMs: 15_000 }),
++      { headers: { 'content-type': 'text/event-stream' } },
++    )) as unknown as typeof fetch
++  const seen: FreeModeSessionSlowed[] = []
++  setFreeModeSessionSlowedListener((slowed) => seen.push(slowed))
++  const before = Date.now()
++  const result = streamText({
++    model: getModelForRequest({ apiKey: 'k', model: 'z-ai/glm-5.3-flash' }),
++    messages: [{ role: 'user', content: 'hi' }],
++  })
++  // The answer is untouched, and the notice has been seen by the time it ends.
++  expect(await result.text).toBe('ok')
++  expect(seen).toMatchObject([{ instanceId: 'tab', delayMs: 15_000 }])
++  expect(seen[0]!.sentAt).toBeGreaterThanOrEqual(before)
++})
+diff --git a/sdk/src/impl/model-provider.ts b/sdk/src/impl/model-provider.ts
+index b241907f4..b0ee4e60f 100644
+--- a/sdk/src/impl/model-provider.ts
++++ b/sdk/src/impl/model-provider.ts
+@@ -1,38 +1,42 @@
+ /**
+  * Builds the language model every request runs on: the Codebuff backend,
+  * which forwards to OpenRouter.
+  */
+ 
+ import path from 'path'
+ 
+ import { BYOK_OPENROUTER_HEADER } from '@codebuff/common/constants/byok'
+ import {
+   FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+   FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+ } from '@codebuff/common/constants/freebuff-errors'
+ import { FREEBUFF_ACTING_USER_HEADER } from '@codebuff/common/constants/freebuff-models'
++import {
++  parseSessionSlowedNotice,
++  type FreebuffSessionSlowed,
++} from '@codebuff/common/util/freebuff-session-slowed'
+ import { isTransientNetworkError } from '@codebuff/common/util/error'
+ import {
+   OpenAICompatibleChatLanguageModel,
+   VERSION,
+ } from '@codebuff/llm-providers/openai-compatible'
+ import { APICallError } from 'ai'
+ 
+ import { byokRequestTransform } from './byok-request'
+ import { getWebsiteUrl } from '../constants'
+ import { getByokOpenrouterApiKeyFromEnv } from '../env'
+ import { byokCompletionUrl } from '../byok'
+ import type { ResolvedByokConnection } from '../byok'
+ 
+ import type { LanguageModel } from 'ai'
+ 
+ /**
+  * Parameters for requesting a model.
+  */
+ export interface ModelRequestParams {
+   /** Codebuff API key for backend authentication */
+   apiKey: string
+   /** Model ID (OpenRouter format, e.g., "anthropic/claude-sonnet-4") */
+   model: string
+   /** End user represented by a trusted service-account request. */
+   userId?: string
+@@ -69,50 +73,110 @@ export function setFreeModeCapacityDeferralListener(
+ }
+ 
+ function notifyCapacityDeferralFromResponse(response: Response): void {
+   if (response.status !== 429 || !freeModeCapacityDeferralListener) return
+   // Clone so the AI SDK still reads the original body for its own error
+   // handling/retry. Both the parse and the listener are best-effort: a
+   // malformed body or throwing listener must never break the request path.
+   void response
+     .clone()
+     .json()
+     .then((body: unknown) => {
+       const error =
+         body && typeof body === 'object' ? (body as any).error : undefined
+       if (error !== 'free_mode_capacity_deferred') return
+       const retryAfterHeader = Number(response.headers.get('retry-after'))
+       freeModeCapacityDeferralListener?.({
+         retryAfterSeconds:
+           Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+             ? retryAfterHeader
+             : 10,
+       })
+     })
+     .catch(() => {})
+ }
+ 
++/**
++ * A free-mode session the backend is pacing past its target, announced at the
++ * end of a step (freebuff-session-slowed.ts) so hosts can label the next pause
++ * and offer a renewal. `instanceId` names the session (a Desktop tab), since the
++ * listener is process-wide. `sentAt` (epoch ms) lets a host ignore a step sent
++ * before it renewed that session, which was paced on the old counter.
++ */
++export type FreeModeSessionSlowed = FreebuffSessionSlowed & { sentAt: number }
++
++let freeModeSessionSlowedListener:
++  | ((slowed: FreeModeSessionSlowed) => void)
++  | null = null
++
++export function setFreeModeSessionSlowedListener(
++  listener: ((slowed: FreeModeSessionSlowed) => void) | null,
++): void {
++  freeModeSessionSlowedListener = listener
++}
++
++/** Reports the slowed notice an SSE body carries, returning the response with
++ * its body observed. Untouched unless a host is listening. */
++function observeSessionSlowed(response: Response, sentAt: number): Response {
++  const listener = freeModeSessionSlowedListener
++  if (
++    !listener ||
++    !response.ok ||
++    !response.body ||
++    !response.headers.get('content-type')?.includes('text/event-stream')
++  )
++    return response
++  const reader = response.body.getReader()
++  const decoder = new TextDecoder()
++  let partial = ''
++  const body = new ReadableStream<Uint8Array>({
++    async pull(controller) {
++      const { done, value } = await reader.read()
++      if (done) return controller.close()
++      controller.enqueue(value)
++      const lines = (partial + decoder.decode(value, { stream: true })).split(
++        '\n',
++      )
++      partial = lines.pop() ?? ''
++      for (const line of lines) {
++        const slowed = parseSessionSlowedNotice(line)
++        try {
++          if (slowed) listener({ ...slowed, sentAt })
++        } catch {
++          // A throwing listener must never break the stream it observes.
++        }
++      }
++    },
++    cancel: (reason) => reader.cancel(reason),
++  })
++  return new Response(body, {
++    status: response.status,
++    statusText: response.statusText,
++    headers: response.headers,
++  })
++}
++
+ function requestUrlOf(input: Parameters<typeof globalThis.fetch>[0]): string {
+   return typeof input === 'string'
+     ? input
+     : input instanceof URL
+       ? input.toString()
+       : input.url
+ }
+ 
+ /** Preserve streaming while removing a credential even when it crosses chunks. */
+ export function redactProviderStream(
+   body: ReadableStream<Uint8Array> | null,
+   secret: string,
+ ): ReadableStream<Uint8Array> | null {
+   if (!body || !secret) return body
+   const decoder = new TextDecoder()
+   const encoder = new TextEncoder()
+   let pending = ''
+   const retain = Math.max(0, secret.length - 1)
+   const redact = (text: string) => text.split(secret).join('[redacted]')
+   const transformed = body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+     transform(chunk, controller) {
+       pending += decoder.decode(chunk, { stream: true })
+       let boundary = Math.max(0, pending.length - retain)
+       // Do not emit the prefix of a complete secret just because its suffix
+       // happens to be in the retained tail. Extend the safe boundary through
+@@ -200,55 +264,56 @@ async function throwIfTurnSpendCapped(
+         : FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+     url,
+     requestBodyValues: {},
+     statusCode: response.status,
+     responseBody: text,
+     isRetryable: false,
+   })
+ }
+ 
+ /**
+  * Wrap global fetch so transient connection failures (socket closed/reset,
+  * connection refused) are rethrown as retryable APICallErrors, and a capped
+  * turn's 429 as a non-retryable one (see throwIfTurnSpendCapped).
+  *
+  * Bun's fetch throws these as plain Errors ("The socket connection was closed
+  * unexpectedly...", code ECONNRESET/ConnectionClosed), which the AI SDK does
+  * not recognize as retryable — it only auto-retries APICallError with
+  * isRetryable=true. Marking them retryable lets streamText's built-in
+  * exponential backoff (default 2 retries) absorb brief server/network blips
+  * instead of failing the whole agent run.
+  */
+ function fetchWithRetryableNetworkErrors(
+   ...args: Parameters<typeof globalThis.fetch>
+ ): ReturnType<typeof globalThis.fetch> {
+   const url = requestUrlOf(args[0])
++  const sentAt = Date.now()
+   return globalThis.fetch(...args).then(
+     async (response) => {
+       notifyCapacityDeferralFromResponse(response)
+       await throwIfTurnSpendCapped(response, url)
+-      return response
++      return observeSessionSlowed(response, sentAt)
+     },
+     (error: unknown) => {
+       if (isTransientNetworkError(error)) {
+         throw new APICallError({
+           message: error instanceof Error ? error.message : String(error),
+           cause: error,
+           url,
+           requestBodyValues: {},
+           isRetryable: true,
+         })
+       }
+       throw error
+     },
+   )
+ }
+ 
+ /**
+  * Get the model for a request: one that routes through the Codebuff backend,
+  * which forwards to OpenRouter.
+  */
+ export function getModelForRequest({
+   apiKey,
+   model,
+   userId,
+   byok,
+diff --git a/sdk/src/index.ts b/sdk/src/index.ts
+index 284610f20..d512d0abb 100644
+--- a/sdk/src/index.ts
++++ b/sdk/src/index.ts
+@@ -63,51 +63,54 @@ export {
+   MCP_CONFIG_FILE_NAME,
+   loadMCPConfig,
+   loadMCPConfigSync,
+   mcpFileSchema,
+ } from './agents/load-mcp-config'
+ export {
+   loadSkills,
+   loadSkillsSync,
+   parseSkillFileContent,
+ } from './skills/load-skills'
+ export { formatAvailableSkillsXml } from '@codebuff/common/util/skills'
+ export type { LoadSkillsOptions } from './skills/load-skills'
+ export type { SkillDefinition, SkillsMap } from '@codebuff/common/types/skill'
+ export type {
+   LoadedAgents,
+   LoadedAgentDefinition,
+   LoadLocalAgentsResult,
+   AgentValidationError,
+ } from './agents/load-agents'
+ export type { MCPFileConfig, LoadedMCPConfig } from './agents/load-mcp-config'
+ 
+ export { validateAgents } from './validate-agents'
+ export type { ValidationResult, ValidateAgentsOptions } from './validate-agents'
+ 
+ // Free-mode capacity deferral notifications (server-side tier shedding)
+-export { setFreeModeCapacityDeferralListener } from './impl/model-provider'
++export {
++  setFreeModeCapacityDeferralListener,
++  setFreeModeSessionSlowedListener,
++} from './impl/model-provider'
+ export type { FreeModeCapacityDeferral } from './impl/model-provider'
+ 
+ // Error utilities
+ export {
+   isRetryableStatusCode,
+   getErrorStatusCode,
+   sanitizeErrorMessage,
+   RETRYABLE_STATUS_CODES,
+   createHttpError,
+   createAuthError,
+   createForbiddenError,
+   createPaymentRequiredError,
+   createServerError,
+   createNetworkError,
+ } from './error-utils'
+ export type { HttpError } from './error-utils'
+ 
+ // Retry configuration constants
+ export {
+   MAX_RETRIES_PER_MESSAGE,
+   RETRY_BACKOFF_BASE_DELAY_MS,
+   RETRY_BACKOFF_MAX_DELAY_MS,
+   RECONNECTION_MESSAGE_DURATION_MS,
+   RECONNECTION_RETRY_DELAY_MS,
+ } from './retry-config'
