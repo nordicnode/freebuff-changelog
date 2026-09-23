@@ -3,7 +3,6 @@
 // authentic CLI/git-log presentation, dark theme, zero emojis, calm palette).
 import { writeText, writeBinary } from './util.mjs'
 import { escapeHtml as esc, fmtDateHuman, pool, shortHash } from './util.mjs'
-import { createHash } from 'node:crypto'
 import { CSS } from './style.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg, feedsOpml } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
@@ -78,7 +77,6 @@ function layout ({ title, path, body, desc, noindex, ogImage, wide, ld }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
 <script>(function(){try{var t=localStorage.getItem('fbTheme');if(!t){t=(window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches)?'light':'dark';}document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='amber'?'#120d04':(t==='green'?'#051207':(t==='light'?'#f6f8fa':'#0d1117'));if(localStorage.getItem('fbPlainMode')==='1'){document.documentElement.classList.add('reading-mode-plain');}}catch(_){}})();</script>
-${SHELL_PRELOAD}
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#0d1117">
 <title>${esc(title)} · ${SITE.name}</title>
@@ -101,7 +99,7 @@ ${ld ? `<script type="application/ld+json">${ldScript(ld)}</script>` : ''}
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="apple-touch-icon" href="/icon-192.png">
-${CSS_TAG}
+<style>${CSS}</style>
 </head><body${wide ? ' class="page-wide"' : ''}><div id="reading-progress" aria-hidden="true"></div><a class="skip-link" href="#main">Skip to content</a><main id="main">
 <header class="top">
   <div class="brand">
@@ -178,11 +176,7 @@ ${body}
   </div>
 </div>
 </main>
-${SHELL_TAG}
-</body></html>`
-}
-
-const SHELL_JS = `
+<script>
 // One motion preference for every scripted scroll: the pages jump around with
 // smooth scrolling, and a reader who asked their OS for reduced motion should
 // not be nauseated by j/k navigation or a search selection.
@@ -279,10 +273,12 @@ updateSyncAge();
   }
   window.addEventListener('scroll', onScroll, { passive: true });
   // Measuring scrollHeight forces a synchronous layout, and at this point the
-  // document is still loading (the stylesheet may not even be applied yet), so
-  // the only two moments that need a measurement are the ones where a position
-  // has to be reflected: the load finishing, and a back-forward restore. An
-  // unscrolled page needs no first paint -- the bar is 0 wide by definition.
+  // document is still loading (stylesheets and images may not be applied yet),
+  // which is the state browsers report as "layout was forced before the page
+  // was fully loaded". The only two moments that need a measurement are the ones
+  // where a scroll position has to be reflected: the load finishing, and a
+  // back-forward restore. An unscrolled page needs no first paint at all -- the
+  // bar is 0 wide by definition.
   window.addEventListener('load', onScroll);
   window.addEventListener('pageshow', onScroll);
 })();
@@ -949,25 +945,9 @@ function renderDiff(container, text, label, ghUrl, mode) {
   container.innerHTML = '';
   container.appendChild(frag);
 }
-`
-
-// The shell and the stylesheet travel as two content-hashed shared assets
-// instead of ~90KB of inline <style>+<script> per page: one download per deploy
-// per browser, then cheap 304 revalidations (the site-wide no-cache policy
-// stays), and every page is ~40% lighter. Content hashes keep the URLs stable
-// until the code actually moves. Declared after SHELL_JS because the hash
-// reads it; layout() only touches these at call time.
-const SHELL_JS_NAME = `site-${createHash('sha256').update(SHELL_JS).digest('hex').slice(0, 10)}.js`
-const CSS_NAME = `site-${createHash('sha256').update(CSS).digest('hex').slice(0, 10)}.css`
-const SHELL_TAG = `<script src="/assets/${SHELL_JS_NAME}"></script>`
-// The shell tag sits at the end of the body, i.e. behind up to ~300 KB of HTML,
-// so without a hint its fetch only starts once the whole document has arrived
-// -- and because it is parser-blocking, every page then waited that round trip
-// (plus a revalidation, under the site-wide no-cache policy) before wiring up.
-// Preloading the identical URL from the head starts it during the parse and the
-// script tag consumes that response instead of fetching twice.
-const SHELL_PRELOAD = `<link rel="preload" as="script" href="/assets/${SHELL_JS_NAME}">`
-const CSS_TAG = `<link rel="stylesheet" href="/assets/${CSS_NAME}">`
+</script>
+</body></html>`
+}
 
 function badges (e) {
   const b = []
@@ -4554,9 +4534,6 @@ ctx.hidden = false
   // header: _headers does not override, it *merges*, so two rules matching the
   // same URL join their values with a comma (browsers reject a multi-valued
   // ACAO, so CORS for JSON lives in exactly one rule).
-  // The two shared assets the layout links (names content-hashed above).
-  await write(dist, `assets/${CSS_NAME}`, CSS)
-  await write(dist, `assets/${SHELL_JS_NAME}`, SHELL_JS)
   await write(dist, '_headers', `/*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
