@@ -1553,7 +1553,9 @@ export function diffPaths (diff) {
 }
 
 function trimComments (list, max = 8) {
-  return (list || []).filter(c => c && c.body).slice(0, max).map(c => ({
+  // Guard against non-array input (null, undefined, or malformed data)
+  const safeList = Array.isArray(list) ? list : []
+  return safeList.filter(c => c && c.body).slice(0, max).map(c => ({
     author: c.author || '', body: String(c.body).slice(0, 600), ...(c.path ? { path: c.path } : {}), ...(c.line ? { line: c.line } : {}), ...(c.isReview ? { isReview: true } : {})
   }))
 }
@@ -1573,7 +1575,7 @@ export function rememberClosedPrs (prevPrs, currentPrs, mergedDoc = { prs: [] },
       body: p.body || '',
       labels: (p.labels || []).map(l => typeof l === 'string' ? l : l?.name).filter(Boolean),
       commitsList: (p.commitsList || []).map(c => ({ sha: c.sha, message: c.message })).filter(c => c.sha),
-      comments: trimComments(p.commentsList),
+      comments: trimComments(Array.isArray(p.commentsList) ? p.commentsList : (Array.isArray(p.comments) ? p.comments : [])),
       paths: paths.slice(0, 40),
       updated: p.updated || '',
       closedSeenAt: now
@@ -1614,7 +1616,7 @@ export function findPrMeta (e, prIndex) {
     author: pr.author,
     body: pr.body || '',
     labels: (pr.labels || []).map(l => typeof l === 'string' ? l : l.name).filter(Boolean),
-    comments: trimComments(pr.comments || pr.commentsList),
+    comments: trimComments(Array.isArray(pr.commentsList) ? pr.commentsList : (Array.isArray(pr.comments) ? pr.comments : [])),
     ...(matched ? { matched: 'files', confidence: matched.confidence } : {})
   }
 }

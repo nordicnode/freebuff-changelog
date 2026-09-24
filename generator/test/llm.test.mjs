@@ -1245,6 +1245,69 @@ test('findPrMeta: preserves PR description body', () => {
   assert.equal(meta?.body, 'Implements advertiser campaign budget caps.')
 })
 
+test('findPrMeta: safely extracts comments when comments is numeric count and commentsList is array', () => {
+  const prIndex = {
+    prsByNum: new Map([
+      [1234, {
+        number: 1234,
+        title: 'Fix issue',
+        author: 'alice',
+        comments: 2,
+        commentsList: [
+          { author: 'bob', body: 'LGTM' },
+          { author: 'carol', body: 'Please fix typo' }
+        ]
+      }]
+    ]),
+    prsBySha: new Map()
+  }
+  const entry = { pr: 1234, sha: 'abc1234' }
+  const meta = findPrMeta(entry, prIndex)
+  assert.equal(meta?.number, 1234)
+  assert.equal(meta?.comments?.length, 2)
+  assert.equal(meta?.comments[0].author, 'bob')
+  assert.equal(meta?.comments[0].body, 'LGTM')
+})
+
+test('findPrMeta: handles comments as an array when commentsList is missing', () => {
+  const prIndex = {
+    prsByNum: new Map([
+      [1234, {
+        number: 1234,
+        title: 'Fix issue',
+        author: 'alice',
+        comments: [
+          { author: 'bob', body: 'LGTM' }
+        ]
+      }]
+    ]),
+    prsBySha: new Map()
+  }
+  const entry = { pr: 1234, sha: 'abc1234' }
+  const meta = findPrMeta(entry, prIndex)
+  assert.equal(meta?.number, 1234)
+  assert.equal(meta?.comments?.length, 1)
+  assert.equal(meta?.comments[0].author, 'bob')
+})
+
+test('findPrMeta: handles numeric comments with missing commentsList without crashing', () => {
+  const prIndex = {
+    prsByNum: new Map([
+      [1234, {
+        number: 1234,
+        title: 'Fix issue',
+        author: 'alice',
+        comments: 5
+      }]
+    ]),
+    prsBySha: new Map()
+  }
+  const entry = { pr: 1234, sha: 'abc1234' }
+  const meta = findPrMeta(entry, prIndex)
+  assert.equal(meta?.number, 1234)
+  assert.deepEqual(meta?.comments, [])
+})
+
 test('buildPrompt & buildEli5Prompt: formats fileHeaders and PR body into context', () => {
   const entry = {
     sha: '71b2827c5f1d55176b4a03edc8b254f7bbca0c9d',
