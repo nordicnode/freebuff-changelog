@@ -1,0 +1,218 @@
+diff --git a/sdk/src/__tests__/run-state-git-changes.test.ts b/sdk/src/__tests__/run-state-git-changes.test.ts
+index f26a098c7..96c3b0664 100644
+--- a/sdk/src/__tests__/run-state-git-changes.test.ts
++++ b/sdk/src/__tests__/run-state-git-changes.test.ts
+@@ -27,50 +27,79 @@ function fakeProc(stdout: string, chunkSize = 1_000_000) {
+     return true
+   }
+   setImmediate(() => {
+     for (let i = 0; i < stdout.length; i += chunkSize) {
+       if (killed) return
+       proc.stdout.emit('data', Buffer.from(stdout.slice(i, i + chunkSize)))
+     }
+     if (!killed) proc.emit('close', 0)
+   })
+   return proc
+ }
+ 
+ function makeLogger(events: Array<{ data: unknown; msg?: string }>): Logger {
+   const record = (data: unknown, msg?: string) => events.push({ data, msg })
+   return { debug: record, info: record, warn: record, error: record }
+ }
+ 
+ function makeSpawn(outputs: Record<string, string>): CodebuffSpawn {
+   return ((command: string, args?: readonly string[]) => {
+     const key = [command, ...(args ?? [])].join(' ')
+     return fakeProc(outputs[key] ?? '')
+   }) as CodebuffSpawn
+ }
+ 
+ describe('getGitChanges', () => {
++  it('survives a spawn that throws synchronously (Windows .cmd git shim)', async () => {
++    // Real failing input from a Windows Desktop user whose git is a .cmd shim:
++    // spawn refuses the `%` in --format before any process exists.
++    const outputs: Record<string, string> = {
++      'git rev-parse --abbrev-ref HEAD': 'main\n',
++      'git rev-list --count HEAD': '3\n',
++    }
++    const spawn = ((command: string, args?: readonly string[]) => {
++      const arg = (args ?? []).find((a) => /[%^&|<>]/.test(a))
++      if (arg !== undefined) {
++        const error = new TypeError(
++          `The argument 'args[3]' contains a cmd.exe special character and cannot be safely passed to a .bat/.cmd file. Received "${arg}"`,
++        ) as TypeError & { code?: string }
++        error.code = 'ERR_INVALID_ARG_VALUE'
++        throw error
++      }
++      if (command === 'gh') throw new Error('spawn gh ENOENT')
++      return fakeProc(outputs[[command, ...(args ?? [])].join(' ')] ?? '')
++    }) as CodebuffSpawn
++
++    const result = await getGitChanges({
++      cwd: '/repo',
++      spawn,
++      logger: makeLogger([]),
++    })
++    expect(result.gitAvailable).toBe(true)
++    expect(result.branch).toBe('main')
++  })
++
+   it('summarizes repository scale and all kinds of changed paths', async () => {
+     const events: Array<{ data: unknown; msg?: string }> = []
+     const result = await getGitChanges({
+       cwd: '/repo',
+       spawn: makeSpawn({
+         'git rev-parse --abbrev-ref HEAD': 'main\n',
+         'git diff --name-only --': 'src/b.ts\nsrc/a.ts\n',
+         'git diff --cached --name-only --': 'src/a.ts\nsrc/c.ts\n',
+         'git ls-files --others --exclude-standard': 'src/new.ts\n',
+         'git rev-list --count HEAD': '1234\n',
+         'git log --use-mailmap --format=%aN%x09%aE%x09%cs%x09%s HEAD': [
+           'Ada Lovelace\tada@example.com\t2020-01-01\tFix engine (#101)',
+           'A. Lovelace\tada@example.com\t2020-02-01\tFollow up (#101)',
+           'Grace Hopper\tgrace@example.com\t2020-03-01\tMerge pull request #102 from grace/feature',
+           'github-actions[bot]\t41898282+github-actions[bot]@users.noreply.github.com\t2020-04-01\tRelease',
+           'GitHub Actions\tgithub-actions[bot]@users.noreply.github.com\t2020-05-01\tRelease follow-up',
+           'Renovate Bot\trenovate@whitesourcesoftware.com\t2020-06-01\tBump deps (pull request #103)',
+         ].join('\n'),
+         'git rev-parse --is-shallow-repository': 'false\n',
+         'gh repo view --json visibility --jq .visibility': 'PRIVATE\n',
+       }),
+       logger: makeLogger(events),
+       fileCount: 87,
+       testFileCount: 12,
+     })
+diff --git a/sdk/src/run-state.ts b/sdk/src/run-state.ts
+index c812115ba..766b4543f 100644
+--- a/sdk/src/run-state.ts
++++ b/sdk/src/run-state.ts
+@@ -526,101 +526,120 @@ export async function getGitChanges(params: {
+   fileCount?: number
+   fileCountIsLowerBound?: boolean
+   testFileCount?: number
+ }> {
+   const {
+     cwd,
+     spawn,
+     logger,
+     fileCount,
+     fileCountIsLowerBound,
+     testFileCount,
+   } = params
+ 
+   const stdoutOf =
+     (command: string) =>
+     ({ stdout, truncated }: { stdout: string; truncated: boolean }) => {
+       if (truncated) {
+         logger.info?.(
+           { command, chars: stdout.length },
+           'Git command output truncated at cap',
+         )
+       }
+       return stdout
+     }
+ 
++  // spawn can THROW rather than emit 'error': on Windows, when `git` resolves
++  // to a .cmd/.bat shim, any argument carrying a cmd.exe special character
++  // (the `%` in the history --format) is refused synchronously. That throw
++  // skipped every .catch below and failed the whole turn, on every prompt.
++  // The error listener must attach in the same tick as spawn (hence the
++  // callback, not a promise of the child): a child that fails to start emits
++  // 'error' on the next tick, and with no listener yet that is an unhandled
++  // error event.
++  const spawnSafely = <T>(
++    command: string,
++    args: string[],
++    consume: (child: ReturnType<typeof spawn>) => Promise<T>,
++  ): Promise<T> => {
++    try {
++      return consume(spawn(command, args, { cwd }))
++    } catch (error) {
++      return Promise.reject(error)
++    }
++  }
++
+   const gitOutput = (
+     args: string[],
+     label: string,
+     maxOutputChars = MAX_SUBPROCESS_OUTPUT_CHARS,
+   ) =>
+-    childProcessToPromise(spawn('git', args, { cwd }), maxOutputChars)
++    spawnSafely('git', args, (child) =>
++      childProcessToPromise(child, maxOutputChars),
++    )
+       .then((result) => ({
+         stdout: stdoutOf(label)(result),
+         truncated: result.truncated,
+       }))
+       .catch((error) => {
+         logger.debug?.({ error }, `Failed to get ${label}`)
+         return undefined
+       })
+ 
+   const branch = gitOutput(['rev-parse', '--abbrev-ref', 'HEAD'], 'git branch')
+   const unstagedFiles = gitOutput(
+     ['diff', '--name-only', '--'],
+     'git unstaged file names',
+     MAX_GIT_PATH_OUTPUT_CHARS,
+   )
+   const stagedFiles = gitOutput(
+     ['diff', '--cached', '--name-only', '--'],
+     'git staged file names',
+     MAX_GIT_PATH_OUTPUT_CHARS,
+   )
+   const untrackedFiles = gitOutput(
+     ['ls-files', '--others', '--exclude-standard'],
+     'git untracked file names',
+     MAX_GIT_PATH_OUTPUT_CHARS,
+   )
+   const commitCount = gitOutput(
+     ['rev-list', '--count', 'HEAD'],
+     'git commit count',
+   )
+   const history = gitOutput(
+     ['log', '--use-mailmap', '--format=%aN%x09%aE%x09%cs%x09%s', 'HEAD'],
+     'git history summary',
+   )
+   const historyIsShallow = gitOutput(
+     ['rev-parse', '--is-shallow-repository'],
+     'git shallow status',
+   )
+-  const visibility = childProcessToPromise(
+-    spawn(
+-      'gh',
+-      ['repo', 'view', '--json', 'visibility', '--jq', '.visibility'],
+-      { cwd },
+-    ),
+-    1_000,
+-    REPOSITORY_VISIBILITY_TIMEOUT_MS,
++  const visibility = spawnSafely(
++    'gh',
++    ['repo', 'view', '--json', 'visibility', '--jq', '.visibility'],
++    (child) =>
++      childProcessToPromise(child, 1_000, REPOSITORY_VISIBILITY_TIMEOUT_MS),
+   ).catch((error) => {
+     logger.debug?.({ error }, 'Failed to get repository visibility')
+     return undefined
+   })
+ 
+   const pathResults = await Promise.all([
+     unstagedFiles,
+     stagedFiles,
+     untrackedFiles,
+   ])
+   const changedPaths = Array.from(
+     new Set(
+       pathResults.flatMap((result) => {
+         if (!result) return []
+         return getCompleteOutput(result)
+           .split('\n')
+           .map((line) => line.trim())
+           .filter((line) => line.length > 0)
+       }),
+     ),
+   ).sort()
+   const gitAvailable = pathResults.some((result) => result !== undefined)
+   const pathOutputTruncated = pathResults.some((result) => result?.truncated)
+ 
+   const parseCount = (value: string | undefined): number | undefined => {
