@@ -1,0 +1,2564 @@
+diff --git a/cli/src/__tests__/helpers/terminal-watchdog-fixture.ts b/cli/src/__tests__/helpers/terminal-watchdog-fixture.ts
+index 0ef6781cb..3f4432012 100644
+--- a/cli/src/__tests__/helpers/terminal-watchdog-fixture.ts
++++ b/cli/src/__tests__/helpers/terminal-watchdog-fixture.ts
+@@ -1,75 +1,100 @@
+ /**
+  * Fixture process for terminal-watchdog.test.ts.
+  *
+  * Usage: bun terminal-watchdog-fixture.ts <mode> <ttyPath>
+  * - mode "hang":  start the watchdog and stay alive until killed by the test.
+  * - mode "clean": start the watchdog, then stop it and exit (clean shutdown).
+  * - mode "spawn-failure": report a watchdog startup failure and exit.
++ * - mode "reused-pid" (Windows): start the watchdog with a creation time that
++ *   does not match this process — what a reused pid looks like from the
++ *   watchdog's side — and exit 0 only once it has fired WHILE this process is
++ *   still alive, i.e. it refused to wait on a process that is not its owner.
+  *
+  * Prints "ready" once the watchdog is armed. On Windows, arming is asynchronous
+  * (a PowerShell bootstrap has to launch the real watchdog outside Bun's
+  * kill-on-close job object), so we wait for the `<ttyPath>.armed` marker before
+  * printing "ready" — killing earlier would take the bootstrap down before the
+  * watchdog exists.
+  */
+-import { existsSync, writeFileSync } from 'fs'
++import { existsSync, readFileSync, writeFileSync } from 'fs'
+ 
+ import {
+   getTerminalWatchdogDiagnostics,
+   startTerminalWatchdog,
+   stopTerminalWatchdog,
+ } from '../../utils/terminal-watchdog'
+ 
+ const [mode, ttyPath] = process.argv.slice(2)
+ 
+ if (!mode || !ttyPath) {
+   console.error(
+-    'usage: terminal-watchdog-fixture.ts <hang|clean|spawn-failure> <ttyPath>',
++    'usage: terminal-watchdog-fixture.ts <hang|clean|spawn-failure|reused-pid> <ttyPath>',
+   )
+   process.exit(2)
+ }
+ 
+ async function waitForArmed(): Promise<void> {
+   if (process.platform !== 'win32') return
+   // An explicit opt-out is the one path where no armed marker is expected.
+   if (!getTerminalWatchdogDiagnostics().armed) return
+   // Deliberately shorter than the test's own ready budget, so a runner too slow
+   // to boot PowerShell fails here — with a message — instead of surfacing later
+   // as an unexplained empty write. Sized for several fixtures arming at once.
+   const deadline = Date.now() + 40_000
+   while (Date.now() < deadline) {
+     if (existsSync(`${ttyPath}.armed`)) return
+     await new Promise((r) => setTimeout(r, 50))
+   }
+   console.error(`watchdog never armed within 40s (marker: ${ttyPath}.armed)`)
+   process.exit(3)
+ }
+ 
+ if (mode === 'spawn-failure') {
+   const failure = await new Promise<unknown>((resolve) => {
+     startTerminalWatchdog({
+       ttyPath,
+       reportFailure: resolve,
+       windowsPowerShellPath: `${ttyPath}.missing.exe`,
+     })
+     setTimeout(() => {
+       console.error('watchdog failure was not reported')
+       process.exit(4)
+     }, 10_000)
+   })
+   writeFileSync(ttyPath, JSON.stringify(failure))
+   process.exit(0)
+ }
+ 
++if (mode === 'reused-pid') {
++  startTerminalWatchdog({ ttyPath, windowsOwnerStartOverride: '1' })
++  await waitForArmed()
++  const deadline = Date.now() + 40_000
++  while (Date.now() < deadline) {
++    let written = ''
++    try {
++      written = readFileSync(ttyPath, 'utf8')
++    } catch {
++      // Not written yet.
++    }
++    if (written) {
++      console.log('ready')
++      process.exit(0)
++    }
++    await new Promise((r) => setTimeout(r, 50))
++  }
++  console.error('watchdog kept waiting on a process that is not its owner')
++  process.exit(5)
++}
++
+ startTerminalWatchdog({ ttyPath })
+ 
+ if (mode === 'clean') {
+   await waitForArmed()
+   stopTerminalWatchdog()
+   console.log('ready')
+   process.exit(0)
+ }
+ 
+ await waitForArmed()
+ console.log('ready')
+ setInterval(() => {}, 1_000)
+diff --git a/cli/src/__tests__/terminal-watchdog.test.ts b/cli/src/__tests__/terminal-watchdog.test.ts
+index 3e8751805..cfad250af 100644
+--- a/cli/src/__tests__/terminal-watchdog.test.ts
++++ b/cli/src/__tests__/terminal-watchdog.test.ts
+@@ -20,93 +20,103 @@ afterAll(() => {
+ })
+ 
+ // Every fixture is spawned at once and killed at once, so these are one shared
+ // budget for the whole file instead of a per-test cost. Windows pays for two
+ // PowerShell hops (bootstrap + out-of-job watchdog) on a runner that is often
+ // busy scanning them, hence the wide margin there.
+ //
+ // Ready is longer than the fixture's own arm deadline on purpose, so the
+ // fixture is what reports a failure to arm (it names the marker it waited on);
+ // this is only the backstop for a fixture that never speaks at all.
+ const READY_TIMEOUT_MS = IS_WINDOWS ? 60_000 : 15_000
+ const WRITE_TIMEOUT_MS = IS_WINDOWS ? 45_000 : 15_000
+ const DISARM_TIMEOUT_MS = 10_000
+ // "close" waits on the stdio pipes as well as the exit; this bounds that wait.
+ const DRAIN_TIMEOUT_MS = 2_000
+ // Ceiling on the settle described in beforeAll, so one slow control write can't
+ // stretch the run.
+ const MAX_SETTLE_MS = 5_000
+ // Must exceed the sum of the waits above: a hook that times out takes the whole
+ // describe down as one "(unnamed)" failure and stops the rest of the file from
+ // running, which reads as deleted tests to scripts/ci/test-with-guard.ts.
+ const SETUP_TIMEOUT_MS = IS_WINDOWS ? 150_000 : 60_000
+ 
+ type Scenario = {
+   key: string
+-  mode: 'hang' | 'clean' | 'spawn-failure'
++  mode: 'hang' | 'clean' | 'spawn-failure' | 'reused-pid'
+   env?: Record<string, string>
+   /** "hang" fixtures wait to be SIGKILLed; the others exit on their own. */
+   kill: boolean
+   /** Whether an armed watchdog should write the reset payload after death. */
+   expectWrite: boolean
+ }
+ 
+ const OPT_OUT_VALUES = ['1', 'true', 'TRUE']
+ 
+ // POSIX uses a detached sh blocking on pipe EOF. Windows uses a PowerShell
+-// grandchild (outside Bun's kill-on-close job object) blocking on Wait-Process.
++// grandchild (outside Bun's kill-on-close job object) blocking on its owner's
++// process handle (identity-checked by creation time).
+ // Both then write the reset sequences to ttyPath.
+ const SCENARIOS: Scenario[] = [
+   { key: 'unclean', mode: 'hang', kill: true, expectWrite: true },
+   // The Windows arm path spawns a PowerShell bootstrap that Start-Process's a
+   // second, longer-lived PowerShell — a shape EDR/AV scores as malicious. The
+   // opt-out lets an affected user keep running the CLI at the cost of the
+   // after-exit terminal repair, so "no watchdog at all" has to actually hold.
+   ...OPT_OUT_VALUES.map((value): Scenario => ({
+     key: `optout-${value}`,
+     mode: 'hang',
+     env: { CODEBUFF_NO_TERMINAL_WATCHDOG: value },
+     kill: true,
+     expectWrite: false,
+   })),
+   {
+     key: 'optout-noise',
+     mode: 'hang',
+     env: { CODEBUFF_NO_TERMINAL_WATCHDOG: '0' },
+     kill: true,
+     expectWrite: true,
+   },
+   { key: 'clean', mode: 'clean', kill: false, expectWrite: false },
+   // The PowerShell spawn-failure path only exists on Windows.
+   ...(IS_WINDOWS
+     ? [
+         {
+           key: 'spawn-failure',
+           mode: 'spawn-failure' as const,
+           kill: false,
+           expectWrite: false,
+         },
++        // The pid-reuse leak: a watchdog armed after its owner died used to
++        // wait on whichever process inherited the pid, for as long as that
++        // process lived. It must now fire at once instead.
++        {
++          key: 'reused-pid',
++          mode: 'reused-pid' as const,
++          kill: false,
++          expectWrite: true,
++        },
+       ]
+     : []),
+ ]
+ 
+ type Run = {
+   scenario: Scenario
+   child: ChildProcess
+   pid: number | undefined
+   ttyPath: string
+   ready: boolean
+   stderr: string
+   exitCode: number | null
+   signal: NodeJS.Signals | null
+   /** Snapshotted once, after the barriers in beforeAll. */
+   content: string
+   disarmFiles: string[]
+   readyPromise: Promise<void>
+   closePromise: Promise<void>
+ }
+ 
+ function readTty(ttyPath: string): string {
+   try {
+     return readFileSync(ttyPath, 'utf8')
+   } catch {
+     return ''
+@@ -351,38 +361,49 @@ describe('terminal watchdog (fixture processes)', () => {
+ 
+   test.each(OPT_OUT_VALUES)(
+     'never arms when CODEBUFF_NO_TERMINAL_WATCHDOG=%s',
+     (value) => {
+       const run = runFor(`optout-${value}`)
+       expect(run.ready).toBe(true)
+       expect(run.content).toBe('')
+       expect(run.disarmFiles).toEqual([])
+     },
+   )
+ 
+   test('still arms when the opt-out is set to an unrelated value', () => {
+     expect(runFor('optout-noise').ready).toBe(true)
+     expect(runFor('optout-noise').content).toBe(TERMINAL_RESET_SEQUENCES)
+   })
+ 
+   test('stays silent when the process shuts down cleanly', () => {
+     const run = runFor('clean')
+     expect(run.exitCode).toBe(0)
+     expect(run.content).toBe('')
+     // The watchdog consumes (deletes) the disarm file when it wakes, so clean
+     // exits must not litter the temp dir.
+     expect(run.disarmFiles).toEqual([])
+   })
+ 
++  test.skipIf(!IS_WINDOWS)(
++    'never waits on a process whose creation time is not its owner',
++    () => {
++      const run = runFor('reused-pid')
++      // The fixture exits 0 only after seeing the reset while it was alive.
++      expect(run.exitCode).toBe(0)
++      expect(run.content).toBe(TERMINAL_RESET_SEQUENCES)
++      expect(run.disarmFiles).toEqual([])
++    },
++  )
++
+   test.skipIf(!IS_WINDOWS)(
+     'reports a bounded failure when PowerShell cannot spawn',
+     () => {
+       const run = runFor('spawn-failure')
+       expect(run.exitCode).toBe(0)
+       expect(JSON.parse(run.content)).toEqual({
+         stage: 'spawn',
+         failureCode: 'enoent',
+       })
+       expect(run.disarmFiles).toEqual([])
+     },
+   )
+ })
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index 1d43c0390..13fb08979 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -31,50 +31,51 @@ import { runPlainLogin } from './login/plain-login'
+ import { initializeApp } from './init/init-app'
+ import { getProjectRoot, setProjectRoot } from './project-files'
+ import { trackEvent } from './utils/analytics'
+ import {
+   getTrustStorePath,
+   isTruthyOptIn,
+   promptForAgentDirTrust,
+   resolveTrustedAgentDirs,
+ } from './utils/agent-dir-trust'
+ import { getAuthToken, getAuthTokenDetails } from './utils/auth'
+ import { resetCodebuffClient } from './utils/codebuff-client'
+ import { setApiClientAuthToken } from './utils/codebuff-api'
+ import { IS_FREEBUFF } from './utils/constants'
+ import { getCliEnv } from './utils/env'
+ import { initializeAgentRegistry } from './utils/local-agent-registry'
+ import { trimOversizedChatLogs } from './utils/chat-history'
+ import { clearLogFile, logger } from './utils/logger'
+ import { drainClientLogs } from './utils/log-shipper'
+ import { shouldShowProjectPicker } from './utils/project-picker'
+ import { saveRecentProject } from './utils/recent-projects'
+ import { startEngagementTracking } from './utils/engagement'
+ import {
+   exitCliWithFatalError,
+   installProcessCleanupHandlers,
+ } from './utils/renderer-cleanup'
++import { startWindowsMachineProcessCensus } from './utils/helper-process-telemetry'
+ import { startTerminalWatchdog } from './utils/terminal-watchdog'
+ import { installTerminalProtocolController } from './utils/terminal-protocol-controller'
+ import { initializeSkillRegistry } from './utils/skill-registry'
+ import { detectTerminalTheme } from './utils/terminal-color-detection'
+ import { setOscDetectedTheme } from './utils/theme-system'
+ 
+ import type { FileTreeNode } from '@codebuff/common/util/file'
+ 
+ // Configure TanStack Query's focusManager for terminal environments
+ // This is required because there's no browser visibility API in terminal apps
+ // Without this, refetchInterval won't work because TanStack Query thinks the app is "unfocused"
+ focusManager.setEventListener(() => {
+   // No-op: no event listeners in CLI environment (no window focus/visibility events)
+   return () => {}
+ })
+ focusManager.setFocused(true)
+ 
+ function createQueryClient(): QueryClient {
+   return new QueryClient({
+     defaultOptions: {
+       queries: {
+         staleTime: 5 * 60 * 1000, // 5 minutes - auth tokens don't change frequently
+         gcTime: 10 * 60 * 1000, // 10 minutes - keep cached data a bit longer
+         retry: false, // Don't retry failed auth queries automatically
+         refetchOnWindowFocus: false, // CLI doesn't have window focus
+@@ -418,50 +419,54 @@ async function main(): Promise<void> {
+         hasInvalidCredentials={hasInvalidCredentials}
+         fileTree={fileTree}
+         continueChat={continueChat}
+         continueChatId={continueId ?? undefined}
+         initialMode={initialMode}
+         showProjectPicker={showProjectPickerScreen}
+         onProjectChange={handleProjectChange}
+       />
+     )
+   }
+ 
+   // Install early error handlers BEFORE renderer creation.
+   // If the renderer crashes during init, these ensure the error is visible
+   // by exiting the alternate screen buffer before printing the error.
+   const earlyFatalHandler = (error: unknown) =>
+     exitCliWithFatalError('Fatal error during startup', error)
+   process.on('uncaughtException', earlyFatalHandler)
+   process.on('unhandledRejection', earlyFatalHandler)
+ 
+   // Last line of defense for uncatchable deaths (SIGKILL, native crashes,
+   // kill sweeps that also take out the npm wrapper): a detached process
+   // (sh on POSIX, PowerShell on Windows) that resets the terminal when this
+   // process disappears. Started before the renderer begins enabling terminal
+   // modes; the clean-shutdown path (renderer-cleanup) disarms it.
+   startTerminalWatchdog()
++  // Windows only: count powershell/conhost/bash/cmd machine-wide every ten
++  // minutes and report a flood (cli.helper_process_flood) — the symptom users
++  // see in Task Manager, which nothing server-side can observe.
++  startWindowsMachineProcessCensus()
+ 
+   const renderer = await createCliRenderer({
+     backgroundColor: 'transparent',
+     exitOnCtrlC: false,
+     screenMode: 'alternate-screen',
+   })
+ 
+   // Install the renderer-aware handlers before removing the startup safety net
+   // so an installation failure still restores the terminal and reports itself.
+   installProcessCleanupHandlers(renderer)
+   const terminalProtocols = installTerminalProtocolController(renderer, {
+     onError: (error) =>
+       logger.debug(error, 'Terminal protocol transition failed'),
+   })
+   renderer.once('destroy', () => terminalProtocols.dispose())
+   process.removeListener('uncaughtException', earlyFatalHandler)
+   process.removeListener('unhandledRejection', earlyFatalHandler)
+ 
+   // Start the engaged-time heartbeat only once the interactive TUI is actually
+   // live — reaching renderer creation means this is a real session (the
+   // login/publish/smoke-test commands all exit earlier). Freebuff-only, matching
+   // the MESSAGE_SENT DAU signal. Stopped in exitCliCleanly().
+   if (IS_FREEBUFF) {
+     startEngagementTracking()
+   }
+diff --git a/cli/src/utils/__tests__/terminal-watchdog-windows.test.ts b/cli/src/utils/__tests__/terminal-watchdog-windows.test.ts
+new file mode 100644
+index 000000000..4483c9e3f
+--- /dev/null
++++ b/cli/src/utils/__tests__/terminal-watchdog-windows.test.ts
+@@ -0,0 +1,272 @@
++import path from 'path'
++
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
++import { describe, expect, test } from 'bun:test'
++
++import {
++  admitWindowsWatchdog,
++  buildWindowsWatchdogScripts,
++  inspectWindowsWatchdogMarkers,
++  MAX_CONCURRENT_WINDOWS_WATCHDOGS,
++  windowsWatchdogPidPath,
++} from '../terminal-watchdog'
++
++import type { WindowsWatchdogInspection } from '../terminal-watchdog'
++
++const TMP = 'C:\\Temp'
++const DISARM = `${TMP}\\codebuff-watchdog-disarm-4242-abc123`
++
++function scripts(overrides: { ownerStartOverride?: string } = {}) {
++  return buildWindowsWatchdogScripts({
++    ownerPid: 4242,
++    disarmPath: DISARM,
++    armedPath: `${DISARM}.armed`,
++    powershell:
++      'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
++    ...overrides,
++  })
++}
++
++describe('Windows watchdog scripts', () => {
++  test('the watchdog script keeps the no-double-quote invariant', () => {
++    // It rides inside the one double-quoted region of Start-Process's
++    // argument string; a `"` would split it into separate arguments.
++    expect(scripts().watchdogScript).not.toContain('"')
++  })
++
++  test('waits only on a process whose pid AND creation time are its owner', () => {
++    const { watchdogScript } = scripts()
++    expect(watchdogScript).toContain('Get-Process -Id 4242')
++    expect(watchdogScript).toContain(
++      '$o.StartTime.ToFileTimeUtc() - __FREEBUFF_OWNER_START__',
++    )
++    // The only wait is on the identity-checked handle...
++    expect(watchdogScript).toContain('if ($w) { try { $w.WaitForExit() }')
++    // ...never on a bare pid, which a reused pid would satisfy.
++    expect(watchdogScript).not.toContain('Wait-Process')
++  })
++
++  test('announces armed only after the owner is resolved, and records both pids', () => {
++    const { watchdogScript } = scripts()
++    const resolved = watchdogScript.indexOf('Get-Process -Id 4242')
++    const pidFile = watchdogScript.indexOf(windowsWatchdogPidPath(DISARM))
++    const armed = watchdogScript.indexOf(`${DISARM}.armed`)
++    const wait = watchdogScript.indexOf('WaitForExit')
++    expect(resolved).toBeGreaterThanOrEqual(0)
++    expect(resolved).toBeLessThan(pidFile)
++    expect(pidFile).toBeLessThan(armed)
++    expect(armed).toBeLessThan(wait)
++    expect(watchdogScript).toContain("[string]$PID + ' 4242'")
++    // The pid file goes away with the watchdog, which is what makes a surviving
++    // one mean "still running".
++    expect(watchdogScript.trimEnd()).toEndWith(
++      `Remove-Item -LiteralPath '${windowsWatchdogPidPath(DISARM)}' -Force -ErrorAction SilentlyContinue`,
++    )
++  })
++
++  test('the bootstrap reads the owner creation time and substitutes it', () => {
++    const { bootstrapScript } = scripts()
++    expect(bootstrapScript).toStartWith(
++      '$t = (Get-Process -Id 4242 -ErrorAction Stop).StartTime.ToFileTimeUtc(); ',
++    )
++    expect(bootstrapScript).toContain(
++      ".Replace('__FREEBUFF_OWNER_START__', [string]$t)",
++    )
++  })
++
++  test('a test override can only ever inject digits', () => {
++    expect(scripts({ ownerStartOverride: '1' }).bootstrapScript).toStartWith(
++      '$t = 1; ',
++    )
++    expect(
++      scripts({ ownerStartOverride: "1; Remove-Item 'x'" }).bootstrapScript,
++    ).toStartWith('$t = 0; ')
++  })
++})
++
++type FakeFile = { content?: string; ageMs?: number }
++
++function fakeTmp(files: Record<string, FakeFile>, alive: number[]) {
++  const removed: string[] = []
++  const deps = {
++    dir: TMP,
++    selfPid: 1,
++    listDir: () => Object.keys(files),
++    readFile: (file: string) => {
++      const entry = files[path.basename(file)]
++      if (entry?.content === undefined) throw new Error('ENOENT')
++      return entry.content
++    },
++    ageMs: (file: string) => files[path.basename(file)]?.ageMs ?? 0,
++    remove: (file: string) => {
++      removed.push(path.basename(file))
++    },
++    isAlive: (pid: number) => alive.includes(pid),
++  }
++  return { deps, removed }
++}
++
++describe('inspectWindowsWatchdogMarkers', () => {
++  const HOUR = 60 * 60 * 1000
++
++  test('a pid file whose owner died but whose watchdog runs is an orphan', () => {
++    const { deps, removed } = fakeTmp(
++      {
++        'codebuff-watchdog-disarm-100-aaa.pid': { content: '900 100' },
++        'codebuff-watchdog-disarm-100-aaa.armed': { content: 'armed' },
++      },
++      [900],
++    )
++    expect(inspectWindowsWatchdogMarkers(deps)).toEqual({
++      active: 0,
++      orphaned: 1,
++      legacyStale: 0,
++      swept: 0,
++    })
++    expect(removed).toEqual([])
++  })
++
++  test('a live owner means a concurrent session, not a leak', () => {
++    const { deps } = fakeTmp(
++      { 'codebuff-watchdog-disarm-200-bbb.pid': { content: '901 200' } },
++      [200, 901],
++    )
++    expect(inspectWindowsWatchdogMarkers(deps).active).toBe(1)
++  })
++
++  test('files of a watchdog that is provably gone are swept', () => {
++    const { deps, removed } = fakeTmp(
++      {
++        'codebuff-watchdog-disarm-300-ccc.pid': { content: '902 300' },
++        'codebuff-watchdog-disarm-300-ccc.armed': { content: 'armed' },
++      },
++      [],
++    )
++    const result = inspectWindowsWatchdogMarkers(deps)
++    expect(result.orphaned).toBe(0)
++    expect(result.legacyStale).toBe(0)
++    expect(removed.sort()).toEqual([
++      'codebuff-watchdog-disarm-300-ccc.armed',
++      'codebuff-watchdog-disarm-300-ccc.pid',
++    ])
++  })
++
++  test('an older-format marker with a dead owner is counted once, then swept', () => {
++    const { deps, removed } = fakeTmp(
++      { 'codebuff-watchdog-disarm-400-ddd.armed': { content: 'armed' } },
++      [],
++    )
++    expect(inspectWindowsWatchdogMarkers(deps).legacyStale).toBe(1)
++    expect(removed).toEqual(['codebuff-watchdog-disarm-400-ddd.armed'])
++  })
++
++  test('only disarm files an hour past a dead owner are swept', () => {
++    const { deps, removed } = fakeTmp(
++      {
++        'codebuff-watchdog-disarm-500-eee': { ageMs: 2 * HOUR },
++        'codebuff-watchdog-disarm-501-fff': { ageMs: 60_000 },
++        'codebuff-watchdog-disarm-502-ggg': { ageMs: 2 * HOUR },
++        'unrelated-file.armed': {},
++      },
++      [502],
++    )
++    inspectWindowsWatchdogMarkers(deps)
++    expect(removed).toEqual(['codebuff-watchdog-disarm-500-eee'])
++  })
++
++  test("this process's own files are never judged", () => {
++    const { deps, removed } = fakeTmp(
++      { 'codebuff-watchdog-disarm-1-hhh.pid': { content: '903 1' } },
++      [903],
++    )
++    expect(inspectWindowsWatchdogMarkers(deps)).toEqual({
++      active: 0,
++      orphaned: 0,
++      legacyStale: 0,
++      swept: 0,
++    })
++    expect(removed).toEqual([])
++  })
++
++  test('an unreadable temp dir yields nothing rather than throwing', () => {
++    expect(
++      inspectWindowsWatchdogMarkers({
++        listDir: () => {
++          throw new Error('EACCES')
++        },
++      }),
++    ).toEqual({ active: 0, orphaned: 0, legacyStale: 0, swept: 0 })
++  })
++})
++
++describe('admitWindowsWatchdog', () => {
++  const inspection =
++    (
++      overrides: Partial<WindowsWatchdogInspection>,
++    ): (() => WindowsWatchdogInspection) =>
++    () => ({ active: 0, orphaned: 0, legacyStale: 0, swept: 0, ...overrides })
++
++  test('a clean machine arms and reports nothing', () => {
++    const reports: unknown[] = []
++    expect(
++      admitWindowsWatchdog(inspection({ active: 2 }), (...args) => {
++        reports.push(args)
++      }),
++    ).toBe(true)
++    expect(reports).toEqual([])
++  })
++
++  test('leaked watchdogs are reported as outliving their parent', () => {
++    const reports: unknown[] = []
++    expect(
++      admitWindowsWatchdog(
++        inspection({ orphaned: 2, legacyStale: 1, active: 1 }),
++        (...args) => {
++          reports.push(args)
++        },
++      ),
++    ).toBe(true)
++    expect(reports).toEqual([
++      [
++        AnalyticsEvent.CLI_HELPER_OUTLIVED_PARENT,
++        { kind: 'terminal_watchdog', count: 2, legacyStale: 1, active: 1 },
++      ],
++    ])
++  })
++
++  test('a machine at the cap gets no new watchdog', () => {
++    const reports: Array<[string, Record<string, unknown>]> = []
++    expect(
++      admitWindowsWatchdog(
++        inspection({
++          active: MAX_CONCURRENT_WINDOWS_WATCHDOGS - 1,
++          orphaned: 1,
++        }),
++        (event, data) => {
++          reports.push([event, data])
++        },
++      ),
++    ).toBe(false)
++    expect(reports.map(([event]) => event)).toEqual([
++      AnalyticsEvent.CLI_HELPER_OUTLIVED_PARENT,
++      AnalyticsEvent.CLI_HELPER_PROCESS_FLOOD,
++    ])
++    expect(reports[1]![1]).toMatchObject({
++      kind: 'terminal_watchdog',
++      scope: 'machine',
++      live: MAX_CONCURRENT_WINDOWS_WATCHDOGS,
++      skipped: true,
++    })
++  })
++
++  test('an inspection that throws never blocks arming', () => {
++    expect(
++      admitWindowsWatchdog(
++        () => {
++          throw new Error('boom')
++        },
++        () => {},
++      ),
++    ).toBe(true)
++  })
++})
+diff --git a/cli/src/utils/clipboard.ts b/cli/src/utils/clipboard.ts
+index 8682e7fa3..a8fc45ffa 100644
+--- a/cli/src/utils/clipboard.ts
++++ b/cli/src/utils/clipboard.ts
+@@ -1,31 +1,32 @@
+ import { spawn } from 'child_process'
+ import { closeSync, openSync, writeSync } from 'fs'
+ 
+ import type { ChildProcess } from 'child_process'
+ 
+ import { getCliEnv } from './env'
++import { trackHelperProcess } from './helper-process-telemetry'
+ import { logger } from './logger'
+ 
+ // Global renderer reference for clipboard operations.
+ // Registered once by the useClipboard hook so all callers of
+ // copyTextToClipboard automatically benefit from renderer-based
+ // OSC 52 without threading the renderer through every call site.
+ let registeredRenderer: Record<string, unknown> | null = null
+ 
+ export function registerClipboardRenderer(
+   renderer: Record<string, unknown>,
+ ): void {
+   registeredRenderer = renderer
+ }
+ 
+ export function unregisterClipboardRenderer(): void {
+   registeredRenderer = null
+ }
+ 
+ type ClipboardListener = (message: string | null) => void
+ 
+ let currentMessage: string | null = null
+ const listeners = new Set<ClipboardListener>()
+ let clearTimer: ReturnType<typeof setTimeout> | null = null
+ 
+ interface ShowMessageOptions {
+@@ -240,50 +241,51 @@ function throwIfClipboardAborted(signal?: AbortSignal): void {
+   if (!signal?.aborted) return
+   if (signal.reason instanceof Error) throw signal.reason
+   throw new DOMException('The clipboard operation was aborted', 'AbortError')
+ }
+ 
+ function killClipboardTool(child: ChildProcess): void {
+   try {
+     child.kill('SIGKILL')
+   } catch {
+     // The process may already have exited between an error and cleanup.
+   }
+ }
+ 
+ function writeToClipboardTool(
+   command: string,
+   args: string[],
+   text: string,
+   signal?: AbortSignal,
+ ): Promise<boolean> {
+   return new Promise((resolve) => {
+     let child: ChildProcess
+     try {
+       child = spawn(command, args, {
+         stdio: ['pipe', 'ignore', 'ignore'],
+       })
++      trackHelperProcess('clipboard', child)
+     } catch {
+       resolve(false)
+       return
+     }
+ 
+     let settled = false
+     let timeout: ReturnType<typeof setTimeout> | null = null
+     const finish = (copied: boolean) => {
+       if (settled) return
+       settled = true
+       if (timeout) clearTimeout(timeout)
+       signal?.removeEventListener('abort', handleAbort)
+       resolve(copied)
+     }
+     const handleAbort = () => {
+       killClipboardTool(child)
+       finish(false)
+     }
+ 
+     child.once('error', () => finish(false))
+     child.once('close', (code) => finish(code === 0))
+     child.stdin?.once('error', () => {
+       killClipboardTool(child)
+       finish(false)
+     })
+diff --git a/cli/src/utils/helper-process-telemetry.ts b/cli/src/utils/helper-process-telemetry.ts
+new file mode 100644
+index 000000000..cfd29d4f0
+--- /dev/null
++++ b/cli/src/utils/helper-process-telemetry.ts
+@@ -0,0 +1,80 @@
++/**
++ * The CLI's helper-process census: counts the children it spawns by kind and,
++ * on Windows, how many powershell / conhost / bash / cmd processes the whole
++ * machine is carrying. Either crossing its threshold emits
++ * `cli.helper_process_flood` (rate-limited per kind) through the same
++ * PostHog + Axiom path as the Windows terminal-health events, so a flood on a
++ * user's machine is finally visible in `scripts/logs/alert-helper-process-flood.ts`.
++ *
++ * See common/src/util/helper-process-census.ts for the model and the privacy
++ * envelope (counts only).
++ */
++import { execFile } from 'child_process'
++
++import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
++import {
++  HelperProcessCensus,
++  startMachineProcessCensus,
++} from '@codebuff/common/util/helper-process-census'
++
++import { reportCliProcessHealth } from './windows-terminal-health'
++
++import type {
++  HelperProcessFloodReport,
++  HelperProcessKind,
++  TrackableProcess,
++} from '@codebuff/common/util/helper-process-census'
++
++let census: HelperProcessCensus | null = null
++let machineCensus: { stop: () => void } | null = null
++
++function reportFlood(report: HelperProcessFloodReport): void {
++  reportCliProcessHealth(AnalyticsEvent.CLI_HELPER_PROCESS_FLOOD, report)
++}
++
++export function getHelperProcessCensus(): HelperProcessCensus {
++  return (census ??= new HelperProcessCensus({ report: reportFlood }))
++}
++
++/** Count `child` as a live helper of `kind` until it exits. Never throws. */
++export function trackHelperProcess(
++  kind: HelperProcessKind,
++  child: TrackableProcess | null | undefined,
++): void {
++  getHelperProcessCensus().track(kind, child)
++}
++
++/** Read-only counts for local diagnostics. */
++export function getHelperProcessSnapshot() {
++  return census?.snapshot() ?? {}
++}
++
++/** `tasklist` stdout, bounded in time and size. */
++export function listWindowsProcesses(): Promise<string> {
++  return new Promise((resolve, reject) => {
++    execFile(
++      'tasklist',
++      ['/FO', 'CSV', '/NH'],
++      { windowsHide: true, timeout: 20_000, maxBuffer: 8 * 1024 * 1024 },
++      (error, stdout) => (error ? reject(error) : resolve(String(stdout))),
++    )
++  })
++}
++
++/**
++ * Start the Windows machine census (no-op elsewhere, and idempotent). One
++ * `tasklist` a few minutes after launch, then every ten minutes, never two at
++ * once, on an unref'd timer so it can never hold the CLI open.
++ */
++export function startWindowsMachineProcessCensus(): void {
++  if (process.platform !== 'win32' || machineCensus) return
++  machineCensus = startMachineProcessCensus({
++    census: getHelperProcessCensus(),
++    listProcesses: listWindowsProcesses,
++  })
++}
++
++export function stopWindowsMachineProcessCensus(): void {
++  machineCensus?.stop()
++  machineCensus = null
++}
+diff --git a/cli/src/utils/renderer-cleanup.ts b/cli/src/utils/renderer-cleanup.ts
+index 757480f57..78627e025 100644
+--- a/cli/src/utils/renderer-cleanup.ts
++++ b/cli/src/utils/renderer-cleanup.ts
+@@ -1,57 +1,61 @@
+ import { execFile } from 'child_process'
+ 
+ import { resetTerminalTitle } from './terminal-title'
+ import { stopActiveRun } from './active-run'
+ import { getCliEnv } from './env'
+ import { exitCliCleanly, registerExitCleanup } from './exit-cleanly'
++import { trackHelperProcess } from './helper-process-telemetry'
+ import { flushLiveChatState } from './run-state-storage'
+ import { reportFatalErrorSync, writeTerminalControlSync } from './terminal-io'
+ import { TERMINAL_RESET_SEQUENCES } from './terminal-reset-sequences'
+ import { stopTerminalWatchdog } from './terminal-watchdog'
+ 
+ import type { CliRenderer } from '@opentui/core'
+ 
+ let renderer: CliRenderer | null = null
+ let handlersInstalled = false
+ let cleanupStarted = false
+ 
+ function isProcessRunning(pid: number, onResult: (running: boolean) => void) {
+   if (process.platform === 'win32') {
+-    execFile(
++    const probe = execFile(
+       'tasklist',
+       ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'],
+-      { windowsHide: true },
++      // Bounded: a probe hung on a saturated machine would otherwise stall the
++      // (non-overlapping) monitor forever, silently ending launcher watching.
++      { windowsHide: true, timeout: 15_000 },
+       (error, stdout) => {
+         // A failed probe should never terminate a healthy CLI.
+         if (error) {
+           onResult(true)
+           return
+         }
+         onResult(new RegExp(`(?:^|\\D)${pid}(?:\\D|$)`).test(stdout))
+       },
+     )
++    trackHelperProcess('launcher_probe', probe)
+     return
+   }
+ 
+   try {
+     process.kill(pid, 0)
+     onResult(true)
+   } catch (error) {
+     onResult((error as NodeJS.ErrnoException).code === 'EPERM')
+   }
+ }
+ 
+ /**
+  * Reset terminal state by writing escape sequences to the controlling terminal.
+  * This is called after renderer.destroy() so buffered renderer output cannot
+  * land on the restored main screen after the reset.
+  *
+  * This is especially important on Windows where signals like SIGTERM and SIGHUP
+  * don't work, so we rely on the 'exit' event which is guaranteed to run.
+  */
+ function resetTerminalState(): boolean {
+   try {
+     if (process.stdin.isTTY && process.stdin.setRawMode) {
+       process.stdin.setRawMode(false)
+     }
+   } catch {
+diff --git a/cli/src/utils/terminal-command-broker.ts b/cli/src/utils/terminal-command-broker.ts
+index 628620f6a..8e53e6149 100644
+--- a/cli/src/utils/terminal-command-broker.ts
++++ b/cli/src/utils/terminal-command-broker.ts
+@@ -1,39 +1,40 @@
+ import { spawn, spawnSync } from 'child_process'
+ import { readFileSync, rmSync, writeFileSync } from 'fs'
+ import os from 'os'
+ import path from 'path'
+ 
+ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ import type {
+   TerminalCommandBroker,
+   TerminalCommandProcess,
+   TerminalCommandSpawnRequest,
+ } from '@codebuff/sdk'
+ import type { ChildProcess } from 'child_process'
+ 
+ import { getCliEnv, getSystemProcessEnv } from './env'
++import { trackHelperProcess } from './helper-process-telemetry'
+ import { reportWindowsTerminalFailure } from './windows-terminal-health'
+ 
+ export const TERMINAL_COMMAND_BROKER_FLAG = '--terminal-command-broker'
+ const TERMINAL_COMMAND_BROKER_ENV = 'CODEBUFF_TERMINAL_COMMAND_BROKER'
+ const TERMINAL_COMMAND_BROKER_PROTOCOL_ENV =
+   'CODEBUFF_TERMINAL_COMMAND_BROKER_PROTOCOL'
+ 
+ const MAX_REQUEST_BYTES = 4 * 1024 * 1024
+ const MAX_PROTOCOL_BYTES = 64 * 1024
+ const PROTOCOL_FILE_PREFIX = 'freebuff-terminal-command-broker-'
+ const TERMINAL_COMMAND_BROKER_RECOVERY = 'Restart Freebuff and try again.'
+ 
+ export type TerminalBrokerFailureStage = 'spawn' | 'stdio' | 'completion'
+ export type TerminalBrokerFailureCode =
+   | 'failed_to_connect'
+   | 'enoent'
+   | 'eacces'
+   | 'eperm'
+   | 'epipe'
+   | 'invalid_response'
+   | 'protocol_missing'
+   | 'response_too_large'
+   | 'unknown'
+ 
+ export type TerminalBrokerFailureTelemetry = {
+@@ -381,50 +382,51 @@ export function createTerminalCommandBroker({
+         const { executable, args } = invocation()
+         child = spawn(executable, args, {
+           env: {
+             ...getSystemProcessEnv(),
+             [TERMINAL_COMMAND_BROKER_ENV]: '1',
+             [TERMINAL_COMMAND_BROKER_PROTOCOL_ENV]: protocolPath,
+           },
+           // Do not add custom fd 3/4 pipes here. On Windows, Bun establishes
+           // each pipe through node:net and can reject that handshake outside
+           // ChildProcess's error event, crashing the CLI as an unhandled
+           // rejection. Standard stdin/stdout/stderr are sufficient: the spawn
+           // request uses stdin and the result uses the one-shot protocol file.
+           stdio: ['pipe', 'pipe', 'pipe'],
+           detached: true,
+           windowsHide: true,
+         })
+       } catch (error) {
+         report('spawn', error)
+         removeProtocolFile(protocolPath)
+         throw brokerFailure(error)
+       }
+       // Bun can return a child with null pipes for ENOENT, then emit the spawn
+       // error asynchronously. Always observe it, including the synchronous
+       // validation-failure path below, so a missing helper cannot crash the CLI.
+       child.once('error', () => {})
++      trackHelperProcess('terminal_command', child)
+       if (!child.stdin || !child.stdout || !child.stderr) {
+         terminate(child, 'SIGKILL')
+         removeProtocolFile(protocolPath)
+         const error = new Error('could not open terminal command broker pipes')
+         report('stdio', error)
+         throw brokerFailure(error)
+       }
+ 
+       // Cancellation can close the broker while this small request is still
+       // flushing. The process completion path reports real startup failures;
+       // keep a late EPIPE from becoming an unrelated uncaught exception.
+       child.stdin.on('error', () => {})
+       child.stdin.end(JSON.stringify(request))
+ 
+       const closed = new Promise<void>((resolve, reject) => {
+         child.once('error', reject)
+         child.once('close', () => resolve())
+       })
+       const completion = closed
+         .then(() => {
+           let payload: Buffer
+           try {
+             payload = readFileSync(protocolPath)
+           } catch (error) {
+             if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+diff --git a/cli/src/utils/terminal-watchdog.ts b/cli/src/utils/terminal-watchdog.ts
+index bc2a43556..f85b80223 100644
+--- a/cli/src/utils/terminal-watchdog.ts
++++ b/cli/src/utils/terminal-watchdog.ts
+@@ -11,75 +11,105 @@
+  * - We spawn a detached `/bin/sh` whose stdin is a pipe from this process.
+  *   `sh` isn't named node/bun/codebuff/freebuff, so process-name kill sweeps
+  *   miss it, and `detached` puts it in its own session so process-group kills
+  *   miss it too.
+  * - The watchdog blocks on `cat` until the pipe hits EOF — which only happens
+  *   when this process is gone, however it died — then writes the reset
+  *   sequences to its stdout, which is a dup of our stdout (the terminal).
+  *   It must NOT open /dev/tty: being in its own session it has no controlling
+  *   terminal, so that open fails with ENXIO. Writing to an inherited tty fd
+  *   needs no controlling terminal.
+  * - On clean shutdown the CLI first writes reset bytes synchronously to the
+  *   controlling terminal, then SIGKILLs the watchdog. If that direct write
+  *   fails, the watchdog remains armed and repairs the terminal after exit.
+  *
+  * Windows (closes the codebuff#843 after-exit gap, where the hosting
+  * terminal keeps sending mouse/focus VT input that the shell echoes as
+  * `^[[<35;12;7M` gibberish):
+  * - Bun/libuv put direct children in a kill-on-job-close job object, so a
+  *   plain child — detached or not — is terminated the moment we die
+  *   (oven-sh/bun#31603) and can never fire. Grandchildren of job members are
+  *   NOT added to the job (silent-breakaway semantics), so we launch a
+  *   short-lived PowerShell bootstrap (in the job; its death doesn't matter)
+  *   that uses Start-Process -NoNewWindow to spawn the real watchdog outside
+  *   the job, attached to our console.
+  * - The pipe/EOF trick can't cross the bootstrap hop, so the watchdog
+- *   detects our death with `Wait-Process -Id <our pid>` instead, then writes
++ *   detects our death by waiting on our process handle instead, then writes
+  *   the reset sequences to its console stdout (ConPTY forwards the disable
+  *   sequences to the hosting terminal).
++ * - A pid is NOT an identity on Windows. The grandchild starts hundreds of ms
++ *   (on a loaded machine, tens of seconds — `arming/timeout` fired ~3.9k times
++ *   in the week to 2026-09-23) after we asked for it, and a CLI can die inside
++ *   that window: the npm launcher TerminateProcess'es the running binary to
++ *   apply an update seconds after launch. A watchdog that then waited on "our"
++ *   pid waited on whatever process Windows handed that pid to next, for as
++ *   long as THAT process lived. So the bootstrap — a member of our
++ *   kill-on-close job, so it only runs while we are provably alive — reads our
++ *   creation time and hands it to the grandchild, which waits only on a
++ *   process with that pid AND that creation time. Anything else means we are
++ *   already gone.
++ * - Each watchdog keeps `<disarm path>.pid` (`<its pid> <our pid>`) for
++ *   exactly as long as it runs. The next launch reads those files: a watchdog
++ *   still running after its owner died is reported as
++ *   `cli.helper_outlived_parent`, and a machine already carrying
++ *   MAX_CONCURRENT_WINDOWS_WATCHDOGS of them gets no new one — a cap on the
++ *   one long-lived PowerShell this CLI owns.
+  * - We hold no handle to the grandchild, so clean shutdown can't kill it.
+  *   After a confirmed synchronous reset, stopTerminalWatchdog() drops a disarm
+- *   file; the watchdog checks it after Wait-Process and exits silently.
++ *   file; the watchdog checks it after its wait and exits silently.
+  * - Windows PowerShell 5.1 always exists and is invoked by absolute path.
+  *   Scripts are passed as plain -Command text so the command lines stay
+  *   human-readable in process listings (encoded PowerShell spawned by a CLI
+  *   is a classic EDR/AV malware heuristic). They are deliberately built
+  *   without double quotes, which makes that quoting-safe — see
+  *   spawnWindowsWatchdog.
+  * - Arming takes a few hundred ms (PowerShell boot); deaths inside that
+  *   window fall back to the pre-existing behavior (npm wrapper or nothing).
+  */
+ import { spawn } from 'child_process'
+-import { closeSync, existsSync, openSync, rmSync, writeFileSync } from 'fs'
++import {
++  closeSync,
++  existsSync,
++  openSync,
++  readdirSync,
++  readFileSync,
++  rmSync,
++  statSync,
++  writeFileSync,
++} from 'fs'
+ import os from 'os'
+ import path from 'path'
+ 
+ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ 
+ import { TERMINAL_RESET_SEQUENCES } from './terminal-reset-sequences'
+ import { getCliEnv } from './env'
+-import { reportWindowsTerminalFailure } from './windows-terminal-health'
++import { trackHelperProcess } from './helper-process-telemetry'
++import {
++  reportCliProcessHealth,
++  reportWindowsTerminalFailure,
++} from './windows-terminal-health'
+ 
+ import type { ChildProcess } from 'child_process'
+ 
+ let watchdog: ChildProcess | null = null
+ let disarmFilePath: string | null = null
+ let armedFilePath: string | null = null
+ let armMonitor: ReturnType<typeof setTimeout> | null = null
+ 
+ const WINDOWS_ARM_TIMEOUT_MS = 10_000
+ 
+ export type TerminalWatchdogFailure = {
+   stage: 'spawn' | 'bootstrap' | 'arming'
+   failureCode:
+     | 'enoent'
+     | 'eacces'
+     | 'eperm'
+     | 'exit_nonzero'
+     | 'terminated'
+     | 'timeout'
+     | 'unknown'
+ }
+ 
+ export function classifyTerminalWatchdogSpawnFailure(
+   error: unknown,
+ ): TerminalWatchdogFailure['failureCode'] {
+@@ -122,204 +152,468 @@ export function getTerminalWatchdogDiagnostics() {
+     pid: !external && childIsRunning ? watchdog?.pid : undefined,
+   }
+ }
+ 
+ /** Reset payload with ESC as printf-compatible octal escapes. */
+ function printfPayload(): string {
+   return TERMINAL_RESET_SEQUENCES.replace(/\x1b/g, '\\033')
+ }
+ 
+ function spawnPosixWatchdog(overrideFd: number | null): ChildProcess {
+   // `cat` holds until our death closes the pipe; the reset then goes to the
+   // watchdog's stdout (see stdio below). The payload contains no quotes, so
+   // embedding it in single quotes is safe.
+   const script = `cat >/dev/null 2>&1; printf '${printfPayload()}'`
+   return spawn('/bin/sh', ['-c', script, 'terminal-reset-watchdog'], {
+     detached: true,
+     stdio: ['pipe', overrideFd ?? 'inherit', 'ignore'],
+   })
+ }
+ 
+ /** Single-quote a string for PowerShell (only ' needs escaping, by doubling). */
+ function psQuote(value: string): string {
+   return `'${value.replace(/'/g, "''")}'`
+ }
+ 
+-function spawnWindowsWatchdog(options: {
++/**
++ * Placeholder the bootstrap replaces with the owner's creation time (a Windows
++ * FILETIME) before launching the grandchild. Only digits ever replace it.
++ */
++const OWNER_START_TOKEN = '__FREEBUFF_OWNER_START__'
++
++/** Two reads of one creation time agree exactly; 1ms of slack absorbs rounding. */
++const OWNER_START_TOLERANCE_TICKS = 10_000
++
++export function windowsPowerShellPath(): string {
++  // Windows PowerShell 5.1 ships with every supported Windows; use the
++  // absolute path so a broken PATH can't take out the safety net.
++  return path.join(
++    getCliEnv().SystemRoot ?? 'C:\\Windows',
++    'System32',
++    'WindowsPowerShell',
++    'v1.0',
++    'powershell.exe',
++  )
++}
++
++/**
++ * The two Windows scripts, pure so their invariants are testable on any OS:
++ * the watchdog script contains no `"` (see the quoting note below), waits only
++ * on a process whose pid AND creation time match its owner, and records both
++ * pids in a pid file that lives exactly as long as it does.
++ */
++export function buildWindowsWatchdogScripts(options: {
++  ownerPid: number
+   ttyPath?: string
+   disarmPath: string
+   armedPath: string
+-  powershellPath?: string
+-}): ChildProcess {
++  powershell: string
++  /**
++   * Test-only: hand the grandchild this creation time instead of the owner's
++   * real one — exactly what a reused pid looks like from the watchdog's side.
++   */
++  ownerStartOverride?: string
++}): { bootstrapScript: string; watchdogScript: string } {
++  const { ownerPid } = options
+   // The payload rides as a numeric byte array, which keeps the script free of
+   // double quotes and string interpolation (the no-`"` invariant the quoting
+   // below relies on) and avoids any Console.Out encoding translation, so the
+   // reset payload arrives byte-exact.
+   const payloadBytes = Array.from(
+     Buffer.from(TERMINAL_RESET_SEQUENCES, 'ascii'),
+   ).join(',')
+   // Tests observe a file instead of the console; production writes to the
+   // watchdog's stdout, which is the console (Start-Process -NoNewWindow
+   // without redirection leaves the grandchild on our console's handles).
+   const writeResets = options.ttyPath
+     ? `[System.IO.File]::WriteAllBytes(${psQuote(options.ttyPath)}, $b)`
+     : '$s=[Console]::OpenStandardOutput(); $s.Write($b, 0, $b.Length); $s.Flush()'
+-  // The marker lets tests wait out the bootstrap hop and lets production
+-  // report a bounded arming timeout without inspecting PowerShell output.
+-  const armedMarker = `[System.IO.File]::WriteAllText(${psQuote(options.armedPath)}, 'armed'); `
++  // Resolve the owner BEFORE announcing "armed", so the marker means "waiting
++  // on the right process, or already sure it is gone" — never "about to wait
++  // on whatever holds this pid now". The armed marker lets tests wait out the
++  // bootstrap hop and production report a bounded arming timeout (the owner
++  // deletes it once it has looked). The pid file is the watchdog's alone: it
++  // lives exactly as long as the watchdog, so the next launch can recognise
++  // one that outlived its owner.
++  const pidPath = windowsWatchdogPidPath(options.disarmPath)
+   const watchdogScript =
+-    armedMarker +
+-    `try { Wait-Process -Id ${process.pid} -ErrorAction Stop } catch {}; ` +
++    `$w = $null; ` +
++    `try { $o = Get-Process -Id ${ownerPid} -ErrorAction Stop; ` +
++    `if ([Math]::Abs($o.StartTime.ToFileTimeUtc() - ${OWNER_START_TOKEN}) -le ${OWNER_START_TOLERANCE_TICKS}) { $w = $o } } catch {}; ` +
++    `[System.IO.File]::WriteAllText(${psQuote(pidPath)}, [string]$PID + ' ${ownerPid}'); ` +
++    `[System.IO.File]::WriteAllText(${psQuote(options.armedPath)}, 'armed'); ` +
++    `if ($w) { try { $w.WaitForExit() } catch {} }; ` +
+     `if (Test-Path -LiteralPath ${psQuote(options.disarmPath)}) { ` +
+     `Remove-Item -LiteralPath ${psQuote(options.disarmPath)} -Force -ErrorAction SilentlyContinue ` +
+     `} else { ` +
+     `$b=[byte[]](${payloadBytes}); ` +
+     `${writeResets} }; ` +
+-    `Remove-Item -LiteralPath ${psQuote(options.armedPath)} -Force -ErrorAction SilentlyContinue`
+-
+-  // Windows PowerShell 5.1 ships with every supported Windows; use the
+-  // absolute path so a broken PATH can't take out the safety net.
+-  const powershell =
+-    options.powershellPath ??
+-    path.join(
+-      getCliEnv().SystemRoot ?? 'C:\\Windows',
+-      'System32',
+-      'WindowsPowerShell',
+-      'v1.0',
+-      'powershell.exe',
+-    )
++    `Remove-Item -LiteralPath ${psQuote(options.armedPath)} -Force -ErrorAction SilentlyContinue; ` +
++    `Remove-Item -LiteralPath ${psQuote(pidPath)} -Force -ErrorAction SilentlyContinue`
+ 
+   // Plain -Command (not -EncodedCommand) so the command lines are auditable
+   // in process listings — encoded PowerShell trips EDR/AV heuristics. This is
+   // quoting-safe because the watchdog script contains no `"` (paths are
+   // single-quoted, the payload is numeric): it survives as the one
+   // double-quoted region of the grandchild's argument string, which
+   // Start-Process passes verbatim (single pre-built -ArgumentList string). On
+   // the bootstrap's own command line those `"` are escaped as \" by spawn,
+   // which powershell.exe's argv tokenizer unescapes.
+   const watchdogArgs = `-NoProfile -NonInteractive -Command "${watchdogScript}"`
++  // The bootstrap is a member of our kill-on-close job, so while it runs we
++  // are alive and this read names US. If we are already gone it throws, the
++  // bootstrap exits non-zero, and no grandchild is started at all.
++  const ownerStart =
++    options.ownerStartOverride !== undefined
++      ? String(Math.trunc(Number(options.ownerStartOverride)) || 0)
++      : `(Get-Process -Id ${ownerPid} -ErrorAction Stop).StartTime.ToFileTimeUtc()`
+   const bootstrapScript =
+-    `Start-Process -FilePath ${psQuote(powershell)} ` +
+-    `-ArgumentList ${psQuote(watchdogArgs)} -NoNewWindow`
++    `$t = ${ownerStart}; ` +
++    `Start-Process -FilePath ${psQuote(options.powershell)} ` +
++    `-ArgumentList (${psQuote(watchdogArgs)}.Replace('${OWNER_START_TOKEN}', [string]$t)) -NoNewWindow`
++  return { bootstrapScript, watchdogScript }
++}
++
++function spawnWindowsWatchdog(options: {
++  ttyPath?: string
++  disarmPath: string
++  armedPath: string
++  powershellPath?: string
++  ownerStartOverride?: string
++}): ChildProcess {
++  const powershell = options.powershellPath ?? windowsPowerShellPath()
++  const { bootstrapScript } = buildWindowsWatchdogScripts({
++    ownerPid: process.pid,
++    ttyPath: options.ttyPath,
++    disarmPath: options.disarmPath,
++    armedPath: options.armedPath,
++    powershell,
++    ownerStartOverride: options.ownerStartOverride,
++  })
+ 
+   return spawn(
+     powershell,
+     ['-NoProfile', '-NonInteractive', '-Command', bootstrapScript],
+     {
+       stdio: ['ignore', 'ignore', 'ignore'],
+     },
+   )
+ }
+ 
++// ------------------------------------------------ leaked-watchdog inspection
++
++const WATCHDOG_FILE_PREFIX = 'codebuff-watchdog-disarm-'
++const PID_FILE_PATTERN = /^codebuff-watchdog-disarm-(\d+)-[a-z0-9]+\.pid$/
++const ARMED_MARKER_PATTERN = /^codebuff-watchdog-disarm-(\d+)-[a-z0-9]+\.armed$/
++const DISARM_FILE_PATTERN = /^codebuff-watchdog-disarm-(\d+)-[a-z0-9]+$/
++
++/** The file a watchdog keeps for exactly as long as it runs. */
++export function windowsWatchdogPidPath(disarmPath: string): string {
++  return `${disarmPath}.pid`
++}
++
++/**
++ * More watchdogs than this on one machine means they are not being reaped —
++ * nobody runs this many CLI sessions at once — so a new launch adds none.
++ */
++export const MAX_CONCURRENT_WINDOWS_WATCHDOGS = 8
++
++/** A leftover disarm file is only swept once it is clearly not in flight. */
++const STALE_DISARM_AGE_MS = 60 * 60 * 1000
++
++export type WindowsWatchdogInspection = {
++  /** Watchdogs whose owner is still running (concurrent CLI sessions). */
++  active: number
++  /** Watchdogs still running after their owner died. */
++  orphaned: number
++  /**
++   * Armed markers left by a watchdog that predates the pid file, whose owner
++   * died before its own 10s arming check could delete the marker — the exact
++   * window a reused pid could strand that watchdog. It may be leaked or may
++   * have been killed; nothing here can tell which, so these are reported
++   * separately and never counted as orphans.
++   */
++  legacyStale: number
++  /** Leftover files this inspection deleted. */
++  swept: number
++}
++
++function processIsAlive(pid: number): boolean {
++  try {
++    process.kill(pid, 0)
++    return true
++  } catch (error) {
++    return (error as NodeJS.ErrnoException).code === 'EPERM'
++  }
++}
++
++/**
++ * Classify every watchdog file in the temp directory. A watchdog deletes its
++ * pid file when it exits, so a pid file whose owner is dead but whose watchdog
++ * pid is alive is a watchdog that outlived its parent. Files whose watchdog is
++ * provably gone, and disarm files nothing will ever consume, are swept. Every
++ * dependency is injectable so this runs in tests on any OS.
++ */
++export function inspectWindowsWatchdogMarkers(
++  deps: {
++    dir?: string
++    listDir?: (dir: string) => string[]
++    readFile?: (file: string) => string
++    ageMs?: (file: string) => number
++    remove?: (file: string) => void
++    isAlive?: (pid: number) => boolean
++    selfPid?: number
++  } = {},
++): WindowsWatchdogInspection {
++  const dir = deps.dir ?? os.tmpdir()
++  const listDir = deps.listDir ?? ((d: string) => readdirSync(d))
++  const readFile = deps.readFile ?? ((f: string) => readFileSync(f, 'utf8'))
++  const ageMs = deps.ageMs ?? ((f: string) => Date.now() - statSync(f).mtimeMs)
++  const remove = deps.remove ?? ((f: string) => rmSync(f, { force: true }))
++  const isAlive = deps.isAlive ?? processIsAlive
++  const selfPid = deps.selfPid ?? process.pid
++  const result: WindowsWatchdogInspection = {
++    active: 0,
++    orphaned: 0,
++    legacyStale: 0,
++    swept: 0,
++  }
++
++  let names: string[]
++  try {
++    names = listDir(dir).filter((name) => name.startsWith(WATCHDOG_FILE_PREFIX))
++  } catch {
++    return result
++  }
++  const present = new Set(names)
++  const sweep = (file: string) => {
++    try {
++      remove(file)
++      result.swept++
++    } catch {
++      // A file another process still holds is simply left for next time.
++    }
++  }
++  const sweepIfOlder = (file: string, minAgeMs: number) => {
++    try {
++      if (ageMs(file) > minAgeMs) sweep(file)
++    } catch {
++      // Unreadable age: leave it for the next launch.
++    }
++  }
++
++  for (const name of names) {
++    const file = path.join(dir, name)
++
++    const pidFile = PID_FILE_PATTERN.exec(name)
++    if (pidFile) {
++      const ownerPid = Number(pidFile[1])
++      if (ownerPid === selfPid) continue
++      if (isAlive(ownerPid)) {
++        result.active++
++        continue
++      }
++      let watchdogPid = NaN
++      try {
++        watchdogPid = Number(/^(\d+) /.exec(readFile(file).trim())?.[1])
++      } catch {
++        continue
++      }
++      if (Number.isInteger(watchdogPid) && isAlive(watchdogPid)) {
++        result.orphaned++
++      } else {
++        sweep(file)
++        const armedFile = file.replace(/\.pid$/, '.armed')
++        if (present.has(path.basename(armedFile))) sweep(armedFile)
++      }
++      continue
++    }
++
++    const armed = ARMED_MARKER_PATTERN.exec(name)
++    if (armed) {
++      const ownerPid = Number(armed[1])
++      if (ownerPid === selfPid || isAlive(ownerPid)) continue
++      // A current watchdog's marker is judged through its pid file above.
++      if (present.has(name.replace(/\.armed$/, '.pid'))) continue
++      // Counted once, then removed: the report is the whole value of it, and a
++      // still-running watchdog's own final Remove-Item tolerates it missing.
++      result.legacyStale++
++      sweep(file)
++      continue
++    }
++
++    const disarm = DISARM_FILE_PATTERN.exec(name)
++    if (disarm) {
++      // Written at a clean exit for a watchdog to consume. One still here an
++      // hour after its owner died belongs to a watchdog that never ran.
++      const ownerPid = Number(disarm[1])
++      if (ownerPid === selfPid || isAlive(ownerPid)) continue
++      sweepIfOlder(file, STALE_DISARM_AGE_MS)
++    }
++  }
++  return result
++}
++
++/**
++ * Inspect before arming: report leaked watchdogs, and refuse to add another
++ * when the machine already carries too many. Returns whether to arm.
++ */
++export function admitWindowsWatchdog(
++  inspect: () => WindowsWatchdogInspection = inspectWindowsWatchdogMarkers,
++  report: typeof reportCliProcessHealth = reportCliProcessHealth,
++): boolean {
++  let inspection: WindowsWatchdogInspection
++  try {
++    inspection = inspect()
++  } catch {
++    return true
++  }
++  if (inspection.orphaned > 0 || inspection.legacyStale > 0) {
++    report(AnalyticsEvent.CLI_HELPER_OUTLIVED_PARENT, {
++      kind: 'terminal_watchdog',
++      count: inspection.orphaned,
++      legacyStale: inspection.legacyStale,
++      active: inspection.active,
++    })
++  }
++  const live = inspection.active + inspection.orphaned
++  if (live < MAX_CONCURRENT_WINDOWS_WATCHDOGS) return true
++  report(AnalyticsEvent.CLI_HELPER_PROCESS_FLOOD, {
++    kind: 'terminal_watchdog',
++    scope: 'machine',
++    live,
++    threshold: MAX_CONCURRENT_WINDOWS_WATCHDOGS,
++    skipped: true,
++  })
++  return false
++}
++
+ const isTruthy = (value: string | undefined): boolean =>
+   value === '1' || value?.toLowerCase() === 'true'
+ 
+ /**
+  * Start the watchdog. Call once, before the TUI renderer starts enabling
+  * terminal modes. No-op when stdout isn't a TTY (unless an explicit ttyPath
+  * is injected, e.g. in tests), or if already started.
+  *
+  * Also a no-op when CODEBUFF_NO_TERMINAL_WATCHDOG is set. This remains an
+  * explicit escape hatch for Windows endpoint-security policies that reject the
+  * out-of-job PowerShell grandchild used by the recovery path.
+  *
+  * @param options.ttyPath - Override the reset target (POSIX: the watchdog's
+  *   stdout is pointed at this file; Windows: the watchdog writes the payload
+  *   to this file and drops a `<ttyPath>.armed` marker once running). Tests
+  *   inject a regular file here to observe what gets written.
+  */
+ export function startTerminalWatchdog(options?: {
+   ttyPath?: string
+   reportFailure?: (failure: TerminalWatchdogFailure) => void
+   /** Test-only override for exercising Windows spawn failures. */
+   windowsPowerShellPath?: string
++  /** Test-only: see buildWindowsWatchdogScripts. */
++  windowsOwnerStartOverride?: string
++  /**
++   * Test-only: replaces the temp-dir marker inspection. Without it, runs with
++   * an injected ttyPath skip the inspection (their markers live beside the
++   * tty file, not in the temp dir it reads).
++   */
++  inspectWindowsWatchdogs?: () => WindowsWatchdogInspection
+ }): void {
+   if (watchdog) return
+   const env = getCliEnv()
+   if (isTruthy(env.CODEBUFF_NO_TERMINAL_WATCHDOG)) return
+   if (!options?.ttyPath && !process.stdout.isTTY) return
+ 
+   const reportFailure = options?.reportFailure ?? reportTerminalWatchdogFailure
+   let overrideFd: number | null = null
+   try {
+     let child: ChildProcess
+     if (process.platform === 'win32') {
++      const inspect =
++        options?.inspectWindowsWatchdogs ??
++        (options?.ttyPath ? undefined : inspectWindowsWatchdogMarkers)
++      if (inspect && !admitWindowsWatchdog(inspect)) return
+       const disarmPath = path.join(
+         os.tmpdir(),
+         `codebuff-watchdog-disarm-${process.pid}-${Math.random().toString(36).slice(2)}`,
+       )
+       const armedPath = options?.ttyPath
+         ? `${options.ttyPath}.armed`
+         : `${disarmPath}.armed`
+       child = spawnWindowsWatchdog({
+         ttyPath: options?.ttyPath,
+         disarmPath,
+         armedPath,
+         powershellPath: options?.windowsPowerShellPath,
++        ownerStartOverride: options?.windowsOwnerStartOverride,
+       })
+       disarmFilePath = disarmPath
+       if (!options?.ttyPath) {
+         armedFilePath = armedPath
+       }
+     } else {
+       if (options?.ttyPath) {
+         overrideFd = openSync(options.ttyPath, 'w')
+       }
+       child = spawnPosixWatchdog(overrideFd)
+     }
+     let failureReported = false
+     const reportOnce = (failure: TerminalWatchdogFailure) => {
+       if (failureReported) return
+       failureReported = true
+       reportFailure(failure)
+     }
+     const fail = (failure: TerminalWatchdogFailure) => {
+       if (failureReported || watchdog !== child) return
+       watchdog = null
+       disarmFilePath = null
+       clearArmMonitor()
+       reportOnce(failure)
+     }
+     child.on('error', (error) => {
+       fail({
+         stage: 'spawn',
+         failureCode: classifyTerminalWatchdogSpawnFailure(error),
+       })
+     })
+     if (process.platform === 'win32') {
+       child.on('exit', (code, signal) => {
+         if (code === 0 || watchdog !== child) return
+         fail({
+           stage: 'bootstrap',
+           failureCode: signal ? 'terminated' : 'exit_nonzero',
+         })
+       })
+     }
+     // Don't let the watchdog (or our write end of its pipe) hold the event
+     // loop open — the CLI must still be able to exit naturally. stdin is a
+     // Socket at runtime; its unref isn't in the Writable type.
+     child.unref()
++    // POSIX: the watchdog itself, alive for our whole life. Windows: only the
++    // short-lived bootstrap. Either way more than a couple live at once is a
++    // leak, and the census reports it.
++    trackHelperProcess('terminal_watchdog', child)
+     child.stdin?.on('error', () => {})
+     ;(child.stdin as { unref?: () => void } | null)?.unref?.()
+     watchdog = child
+     if (armedFilePath) {
+       const expectedMarker = armedFilePath
+       armMonitor = setTimeout(() => {
+         if (watchdog !== child) return
+         const armed = existsSync(expectedMarker)
+         clearArmMonitor()
+         if (!armed) {
+           reportOnce({ stage: 'arming', failureCode: 'timeout' })
+         }
+       }, WINDOWS_ARM_TIMEOUT_MS)
+       ;(armMonitor as { unref?: () => void }).unref?.()
+     }
+   } catch (error) {
+     disarmFilePath = null
+     clearArmMonitor()
+     if (process.platform === 'win32') {
+       reportFailure({
+         stage: 'spawn',
+         failureCode: classifyTerminalWatchdogSpawnFailure(error),
+       })
+     }
+     // Best-effort: no watchdog is the pre-existing behavior.
+diff --git a/cli/src/utils/windows-terminal-health.ts b/cli/src/utils/windows-terminal-health.ts
+index 6c76d6120..1fae8c86b 100644
+--- a/cli/src/utils/windows-terminal-health.ts
++++ b/cli/src/utils/windows-terminal-health.ts
+@@ -1,81 +1,86 @@
+ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ 
+ import { getCliEnv } from './env'
+ 
+ import type { LogRecordInput } from '@codebuff/common/schemas/logs'
+ 
+ type WindowsTerminalFailureEvent =
+   | AnalyticsEvent.TERMINAL_BROKER_SPAWN_FAILED
+   | AnalyticsEvent.TERMINAL_WATCHDOG_FAILED
+ 
++type CliHealthEvent =
++  | WindowsTerminalFailureEvent
++  | AnalyticsEvent.CLI_HELPER_PROCESS_FLOOD
++  | AnalyticsEvent.CLI_HELPER_OUTLIVED_PARENT
++
+ export type WindowsTerminalFailure = {
+   stage: 'spawn' | 'stdio' | 'completion' | 'bootstrap' | 'arming'
+   failureCode:
+     | 'failed_to_connect'
+     | 'enoent'
+     | 'eacces'
+     | 'eperm'
+     | 'epipe'
+     | 'invalid_response'
+     | 'protocol_missing'
+     | 'response_too_large'
+     | 'exit_nonzero'
+     | 'terminated'
+     | 'timeout'
+     | 'unknown'
+ }
+ 
+ type WindowsTerminalFailureProperties = WindowsTerminalFailure & {
+   version: string
+   platform: 'win32'
+ }
+ 
+ export type WindowsTerminalHealthDeliveryDeps = {
+   trackEvent?: (
+-    event: WindowsTerminalFailureEvent,
+-    properties: WindowsTerminalFailureProperties,
++    event: CliHealthEvent,
++    properties: Record<string, unknown>,
+   ) => boolean | void
+   getAnonymousId: () => string
+   enqueueClientLog: (record: LogRecordInput) => void
+   drainClientLogs: () => Promise<void>
+ }
+ 
+ export function sanitizeWindowsCliVersion(version: string): string {
+   return /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,31}$/.test(version)
+     ? version
+     : 'unknown'
+ }
+ 
+ /**
+  * Preserve the normal PostHog + Axiom mirror path when analytics is available.
+  * If analytics was not initialized, queue the same bounded event directly in
+  * the Axiom shipper before draining it.
+  */
+ export async function deliverWindowsTerminalFailure(
+-  event: WindowsTerminalFailureEvent,
+-  properties: WindowsTerminalFailureProperties,
++  event: CliHealthEvent,
++  properties: Record<string, unknown>,
+   deps: WindowsTerminalHealthDeliveryDeps,
+ ): Promise<void> {
+   let queuedByAnalytics = false
+   if (deps.trackEvent) {
+     try {
+       queuedByAnalytics = deps.trackEvent(event, properties) !== false
+     } catch {
+       // Analytics initialization is best-effort; Axiom delivery is independent.
+     }
+   }
+ 
+   if (!queuedByAnalytics) {
+     try {
+       deps.enqueueClientLog({
+         level: 'info',
+         event,
+         message: event,
+         client_session_id: deps.getAnonymousId(),
+         data: properties,
+       })
+     } catch {
+       // Terminal-health reporting must never affect terminal behavior.
+     }
+   }
+ 
+@@ -83,42 +88,77 @@ export async function deliverWindowsTerminalFailure(
+     await deps.drainClientLogs()
+   } catch {
+     // The shipper is best-effort and owns retry/drop behavior.
+   }
+ }
+ 
+ /**
+  * Emit a bounded Windows terminal-health failure and start its Axiom mirror
+  * immediately. Both terminal components use this path so their platform gate,
+  * version handling, privacy envelope, and delivery behavior cannot drift.
+  */
+ export function reportWindowsTerminalFailure(
+   event: WindowsTerminalFailureEvent,
+   failure: WindowsTerminalFailure,
+ ): void {
+   const env = getCliEnv()
+   if (process.platform !== 'win32' || env.FREEBUFF_MODE !== 'true') return
+ 
+   const properties: WindowsTerminalFailureProperties = {
+     version: sanitizeWindowsCliVersion(env.CODEBUFF_CLI_VERSION ?? ''),
+     platform: 'win32',
+     stage: failure.stage,
+     failureCode: failure.failureCode,
+   }
+ 
++  deliverCliHealthEvent(event, properties)
++}
++
++/**
++ * Lazily load the telemetry stack and deliver one bounded health event through
++ * the PostHog + Axiom mirror (or straight to the Axiom shipper when analytics
++ * is unavailable), draining the shipper immediately. Never throws, never
++ * blocks the caller.
++ */
++function deliverCliHealthEvent(
++  event: CliHealthEvent,
++  properties: Record<string, unknown>,
++): void {
+   void Promise.all([
+     import('./analytics').catch(() => null),
+     import('./anonymous-id'),
+     import('./log-shipper'),
+   ])
+     .then(([analytics, { getOrCreatePersistentAnonymousId }, logShipper]) => {
+       return deliverWindowsTerminalFailure(event, properties, {
+         trackEvent: analytics?.trackEvent,
+         getAnonymousId: getOrCreatePersistentAnonymousId,
+         enqueueClientLog: logShipper.enqueueClientLog,
+         drainClientLogs: logShipper.drainClientLogs,
+       })
+     })
+     .catch(() => {
+       // Telemetry is best-effort and must never affect terminal behavior.
+     })
+ }
++
++/**
++ * Report a client-side helper-process anomaly (see
++ * common/src/util/helper-process-census.ts). Every platform, both products:
++ * a process flood is invisible server-side wherever it happens. The payload is
++ * counts and fixed labels only; version and platform are added here.
++ */
++export function reportCliProcessHealth(
++  event:
++    | AnalyticsEvent.CLI_HELPER_PROCESS_FLOOD
++    | AnalyticsEvent.CLI_HELPER_OUTLIVED_PARENT,
++  data: Record<string, string | number | boolean | undefined>,
++): void {
++  const env = getCliEnv()
++  deliverCliHealthEvent(event, {
++    ...data,
++    version: sanitizeWindowsCliVersion(env.CODEBUFF_CLI_VERSION ?? ''),
++    platform: process.platform,
++    arch: process.arch,
++    freebuff: env.FREEBUFF_MODE === 'true',
++  })
++}
+diff --git a/common/src/constants/analytics-events.ts b/common/src/constants/analytics-events.ts
+index ed3df5d37..6dfab0dd2 100644
+--- a/common/src/constants/analytics-events.ts
++++ b/common/src/constants/analytics-events.ts
+@@ -24,50 +24,62 @@ export enum AnalyticsEvent {
+   // otherwise). Because interval = 1 minute, a raw event COUNT equals minutes
+   // spent: sum per product = Total count broken down by `surface`; average per
+   // user = "Average count per user" broken down by `surface`. See
+   // common/src/util/engagement-tracker.ts.
+   PRODUCT_ACTIVE_MINUTE = 'product_active_minute',
+ 
+   // CLI
+   APP_LAUNCHED = 'cli.app_launched',
+   FINGERPRINT_GENERATED = 'cli.fingerprint_generated',
+   CHANGE_DIRECTORY = 'cli.change_directory',
+   INVALID_COMMAND = 'cli.invalid_command',
+   KNOWLEDGE_FILE_UPDATED = 'cli.knowledge_file_updated',
+   LOGIN = 'cli.login',
+   // Login funnel — the path between launch and a successful `cli.login`.
+   // Emitted from login-flow.ts (the chokepoint both the modal and the
+   // `login` command share); all tagged with `via` (modal | plain_command).
+   LOGIN_STARTED = 'cli.login_started',
+   LOGIN_FAILED = 'cli.login_failed',
+   LOGIN_TIMEOUT = 'cli.login_timeout',
+   LOGIN_ABORTED = 'cli.login_aborted',
+   SLASH_MENU_ACTIVATED = 'cli.slash_menu_activated',
+   SLASH_COMMAND_USED = 'cli.slash_command_used',
+   TERMINAL_BROKER_SPAWN_FAILED = 'cli.terminal_broker_spawn_failed',
+   TERMINAL_WATCHDOG_FAILED = 'cli.terminal_watchdog_failed',
+   TERMINAL_COMMAND_COMPLETED = 'cli.terminal_command_completed',
++  // Client-side process floods, which nothing server-side can see (the
++  // 2026-09-23 "conhost and powershell flood" report). HELPER_PROCESS_FLOOD
++  // fires when the live count of one KIND of helper crosses its threshold —
++  // `scope: 'owned'` counts children this process spawned and still holds;
++  // `scope: 'machine'` is a Windows-only count of powershell/conhost/bash
++  // processes on the whole machine, the symptom users actually see.
++  // HELPER_OUTLIVED_PARENT fires when a helper is found still running after the
++  // process that spawned it is gone (a leaked terminal watchdog). Counts only —
++  // never command lines, paths or process names beyond a fixed allowlist.
++  // Rate-limited per kind at the emit site; see common/src/util/helper-process-census.ts.
++  CLI_HELPER_PROCESS_FLOOD = 'cli.helper_process_flood',
++  CLI_HELPER_OUTLIVED_PARENT = 'cli.helper_outlived_parent',
+   UPDATE_CODEBUFF_FAILED = 'cli.update_codebuff_failed',
+   FEEDBACK_BUTTON_HOVERED = 'cli.feedback_button_hovered',
+   FOLLOWUP_CLICKED = 'cli.followup_clicked',
+   SUGGESTED_PROMPT_SHOWN = 'cli.suggested_prompt_shown',
+   SUGGESTED_PROMPT_CLICKED = 'cli.suggested_prompt_clicked',
+   // Sampled per eligible transcript slot; use response_id to recover the
+   // response-length distribution without ingesting every user's full stream.
+   CLI_INLINE_AD_SLOT_ELIGIBLE = 'cli.inline_ad_slot_eligible',
+   // Backend
+   CREDIT_GRANT = 'backend.credit_grant',
+   CREDIT_CONSUMED = 'backend.credit_consumed',
+   MALFORMED_TOOL_CALL_JSON = 'backend.malformed_tool_call_json',
+   UNKNOWN_TOOL_CALL = 'backend.unknown_tool_call',
+ 
+   // Backend - Database Operations
+   ADVISORY_LOCK_CONTENTION = 'backend.advisory_lock_contention',
+   TRANSACTION_RETRY_THRESHOLD_EXCEEDED = 'backend.transaction_retry_threshold_exceeded',
+ 
+   // Backend - Subscription
+   SUBSCRIPTION_CREATED = 'backend.subscription_created',
+   SUBSCRIPTION_CANCELED = 'backend.subscription_canceled',
+   SUBSCRIPTION_PAYMENT_FAILED = 'backend.subscription_payment_failed',
+   SUBSCRIPTION_BLOCK_CREATED = 'backend.subscription_block_created',
+   SUBSCRIPTION_BLOCK_LIMIT_HIT = 'backend.subscription_block_limit_hit',
+   SUBSCRIPTION_WEEKLY_LIMIT_HIT = 'backend.subscription_weekly_limit_hit',
+@@ -474,29 +486,31 @@ export enum AnalyticsEvent {
+   // configured window. Telemetry ONLY — the turn is not aborted. Join to
+   // desktop.turn_completed to tell a recovered long-silent tool call from a
+   // real hang, i.e. whether an *acting* watchdog is worth building.
+   DESKTOP_TURN_STALLED = 'desktop.turn_stalled',
+   // A turn that went quiet because it is PARKED on a background command, not
+   // because anything is wrong. Verified against the real Claude Code CLI: a
+   // background Bash wait emits no stream messages whatsoever for its entire
+   // duration, so the stall detector cannot tell it apart from a hang by
+   // listening. This event is what the detector reports instead, so a long wait
+   // is still counted — and stays out of desktop.turn_stalled, which is meant to
+   // mean "unexplained silence".
+   DESKTOP_TURN_BACKGROUND_WAIT = 'desktop.turn_background_wait',
+   // Saturation of the orchestrator's single event loop, one line per minute per
+   // running app. That process serves the renderer bundle, every SSE stream, all
+   // git work, agent turns, terminals and preview drives, so a stall anywhere
+   // reads to the user as the whole app hanging. The same numbers ride on
+   // `desktop.turn_completed`, which is what separates "the backend queued my
+   // turn" from "my own orchestrator was pinned" — the question the 2026-07
+   // "opening a new tab is incredibly slow" report could not be answered from
+   // server-side timings alone.
+   DESKTOP_EVENT_LOOP_HEALTH = 'desktop.event_loop_health',
+   // Background lifecycle outcomes. Counts are bucketed and conflict changes
+   // emit only on transitions, so periodic scans do not create cardinality or volume churn.
+   DESKTOP_THREADS_AUTO_ARCHIVED = 'desktop.threads_auto_archived',
+   DESKTOP_DELIVERY_CONFLICT_CHANGED = 'desktop.delivery_conflict_changed',
++  // Desktop sibling of CLI_HELPER_PROCESS_FLOOD (same payload, same census).
++  DESKTOP_HELPER_PROCESS_FLOOD = 'desktop.helper_process_flood',
+ 
+   // Common
+   FLUSH_FAILED = 'common.flush_failed',
+ }
+diff --git a/common/src/util/__tests__/helper-process-census.test.ts b/common/src/util/__tests__/helper-process-census.test.ts
+new file mode 100644
+index 000000000..2deee64a9
+--- /dev/null
++++ b/common/src/util/__tests__/helper-process-census.test.ts
+@@ -0,0 +1,228 @@
++import { EventEmitter } from 'events'
++
++import { describe, expect, test } from 'bun:test'
++
++import {
++  HelperProcessCensus,
++  parseTasklistCsv,
++  startMachineProcessCensus,
++  summarizeMachineProcesses,
++  type HelperProcessFloodReport,
++} from '../helper-process-census'
++
++function censusWithClock(options: { cooldownMs?: number } = {}) {
++  let now = 0
++  const reports: HelperProcessFloodReport[] = []
++  const census = new HelperProcessCensus({
++    report: (report) => reports.push(report),
++    cooldownMs: options.cooldownMs ?? 1_000,
++    now: () => now,
++  })
++  return {
++    census,
++    reports,
++    advance: (ms: number) => {
++      now += ms
++    },
++  }
++}
++
++describe('HelperProcessCensus (owned)', () => {
++  test('reports once when a kind crosses its threshold, then rate-limits', () => {
++    const { census, reports, advance } = censusWithClock()
++    const releases = Array.from({ length: 3 }, () =>
++      census.acquire('terminal_watchdog'),
++    )
++    expect(reports).toEqual([])
++    releases.push(census.acquire('terminal_watchdog'))
++    expect(reports).toEqual([
++      { kind: 'terminal_watchdog', scope: 'owned', live: 4, threshold: 3 },
++    ])
++    releases.push(census.acquire('terminal_watchdog'))
++    expect(reports).toHaveLength(1)
++    advance(1_000)
++    releases.push(census.acquire('terminal_watchdog'))
++    expect(reports).toHaveLength(2)
++    expect(reports[1]!.live).toBe(6)
++  })
++
++  test('release is idempotent and never drives a count negative', () => {
++    const { census } = censusWithClock()
++    const release = census.acquire('clipboard')
++    release()
++    release()
++    expect(census.count('clipboard')).toBe(0)
++    expect(census.snapshot()).toEqual({})
++  })
++
++  test('tracks a ChildProcess-like handle until exit or error', () => {
++    const { census } = censusWithClock()
++    const exits = new EventEmitter()
++    const fails = new EventEmitter()
++    census.track('terminal_command', exits as never)
++    census.track('terminal_command', fails as never)
++    expect(census.count('terminal_command')).toBe(2)
++    exits.emit('exit', 0)
++    fails.emit('error', new Error('spawn ENOENT'))
++    // A process that errors and then exits is released exactly once.
++    fails.emit('exit', 1)
++    expect(census.count('terminal_command')).toBe(0)
++  })
++
++  test('tracks a Bun Subprocess-like handle until `exited` settles', async () => {
++    const { census } = censusWithClock()
++    let resolve!: () => void
++    census.track('shell', { exited: new Promise<void>((r) => (resolve = r)) })
++    expect(census.count('shell')).toBe(1)
++    resolve()
++    await Promise.resolve()
++    await Promise.resolve()
++    expect(census.count('shell')).toBe(0)
++  })
++
++  test('a gauge reading reports like a tracked count, on the same cooldown', () => {
++    const { census, reports } = censusWithClock()
++    expect(census.observeOwned('shell', 16)).toBe(false)
++    expect(census.observeOwned('shell', 17)).toBe(true)
++    expect(census.observeOwned('shell', 30)).toBe(false)
++    for (let i = 0; i < 17; i++) census.acquire('shell')
++    expect(reports).toEqual([
++      { kind: 'shell', scope: 'owned', live: 17, threshold: 16 },
++    ])
++  })
++
++  test('a report callback that throws cannot break process handling', () => {
++    const census = new HelperProcessCensus({
++      report: () => {
++        throw new Error('analytics down')
++      },
++      ownedThresholds: { clipboard: 0 },
++    })
++    expect(() => census.acquire('clipboard')).not.toThrow()
++  })
++})
++
++// Real `tasklist /FO CSV /NH` shapes: English thousands separators, a German
++// locale's dots, a French locale's narrow no-break spaces and "Ko".
++const TASKLIST = [
++  '"System Idle Process","0","Services","0","8 K"',
++  '"powershell.exe","4120","Console","1","912,344 K"',
++  '"powershell.exe","5532","Console","1","85.432 K"',
++  '"pwsh.exe","6100","Console","1","70 000 Ko"',
++  '"conhost.exe","4124","Console","1","1,712 K"',
++  '"conhost.exe","5536","Console","1","1,700 K"',
++  '"bash.exe","7000","Console","1","9,000 K"',
++  '"freebuff.exe","8000","Console","1","300,000 K"',
++  '"Image Name","PID","Session Name","Session#","Mem Usage"',
++  '',
++].join('\r\n')
++
++describe('machine census', () => {
++  test('parses localized tasklist output and ignores a stray header', () => {
++    const rows = parseTasklistCsv(TASKLIST)
++    expect(rows).toHaveLength(8)
++    expect(rows[1]).toEqual({ image: 'powershell.exe', memoryKb: 912_344 })
++    expect(rows[2]).toEqual({ image: 'powershell.exe', memoryKb: 85_432 })
++    expect(rows[3]).toEqual({ image: 'pwsh.exe', memoryKb: 70_000 })
++  })
++
++  test('summarizes only allowlisted images, pwsh counted as powershell', () => {
++    const summary = summarizeMachineProcesses(parseTasklistCsv(TASKLIST))
++    expect(summary.total).toBe(8)
++    expect(summary.kinds.powershell).toEqual({
++      count: 3,
++      totalMemoryMb: Math.round((912_344 + 85_432 + 70_000) / 1024),
++      maxMemoryMb: Math.round(912_344 / 1024),
++    })
++    expect(summary.kinds.conhost?.count).toBe(2)
++    expect(summary.kinds.bash?.count).toBe(1)
++    expect(Object.keys(summary.kinds).sort()).toEqual([
++      'bash',
++      'conhost',
++      'powershell',
++    ])
++  })
++
++  test('reports a machine kind above its threshold with memory, rate-limited', () => {
++    const { census, reports, advance } = censusWithClock()
++    const summary = summarizeMachineProcesses(parseTasklistCsv(TASKLIST))
++    const thresholds = { powershell: 2, conhost: 60, bash: 40, cmd: 40 }
++    census.observeMachine(summary, thresholds)
++    census.observeMachine(summary, thresholds)
++    expect(reports).toEqual([
++      {
++        kind: 'powershell',
++        scope: 'machine',
++        live: 3,
++        threshold: 2,
++        totalMemoryMb: Math.round((912_344 + 85_432 + 70_000) / 1024),
++        maxMemoryMb: Math.round(912_344 / 1024),
++        machineProcesses: 8,
++      },
++    ])
++    advance(1_000)
++    census.observeMachine(summary, thresholds)
++    expect(reports).toHaveLength(2)
++  })
++
++  test('a machine report does not consume the owned cooldown for the same word', () => {
++    const { census, reports } = censusWithClock()
++    census.observeMachine({
++      total: 1,
++      kinds: { bash: { count: 50, totalMemoryMb: 1, maxMemoryMb: 1 } },
++    })
++    for (let i = 0; i < 17; i++) census.acquire('shell')
++    expect(reports.map((r) => `${r.scope}:${r.kind}`)).toEqual([
++      'machine:bash',
++      'owned:shell',
++    ])
++  })
++
++  test('never overlaps listings and reschedules only after one settles', async () => {
++    const { census } = censusWithClock()
++    const timers: Array<() => void> = []
++    let listings = 0
++    let finish!: (stdout: string) => void
++    const poller = startMachineProcessCensus({
++      census,
++      listProcesses: () => {
++        listings++
++        return new Promise<string>((resolve) => (finish = resolve))
++      },
++      setTimeoutFn: (fn) => {
++        timers.push(fn)
++        return timers.length
++      },
++      clearTimeoutFn: () => {},
++    })
++    expect(timers).toHaveLength(1)
++    timers.shift()!()
++    // A second trigger while the first listing hangs joins it instead.
++    const joined = poller.runOnce()
++    expect(listings).toBe(1)
++    expect(timers).toHaveLength(0)
++    finish(TASKLIST)
++    await joined
++    await Promise.resolve()
++    await Promise.resolve()
++    expect(timers).toHaveLength(1)
++    poller.stop()
++  })
++
++  test('a failing listing reports nothing and keeps polling', async () => {
++    const { census, reports } = censusWithClock()
++    const timers: Array<() => void> = []
++    const poller = startMachineProcessCensus({
++      census,
++      listProcesses: () => Promise.reject(new Error('tasklist missing')),
++      setTimeoutFn: (fn) => {
++        timers.push(fn)
++        return timers.length
++      },
++      clearTimeoutFn: () => {},
++    })
++    expect(await poller.runOnce()).toEqual([])
++    expect(reports).toEqual([])
++    poller.stop()
++  })
++})
+diff --git a/common/src/util/analytics-sampling.ts b/common/src/util/analytics-sampling.ts
+index 7bc09407e..9942a48ee 100644
+--- a/common/src/util/analytics-sampling.ts
++++ b/common/src/util/analytics-sampling.ts
+@@ -40,50 +40,55 @@ const ALWAYS_TRACK_EVENTS = new Set<AnalyticsEvent>([
+   AnalyticsEvent.DESKTOP_PROJECT_OPENED,
+   AnalyticsEvent.DESKTOP_TURN_COMPLETED,
+   // Low-volume recovery funnel. Sampling any stage independently would make
+   // creation-to-success and repeated-failure rates impossible to measure.
+   AnalyticsEvent.DESKTOP_FAILED_TURN_RECOVERY,
+   // Rare reliability signal — every stalled turn must be counted, never sampled.
+   AnalyticsEvent.DESKTOP_TURN_STALLED,
+   // Its counterpart (an explained silence). Same reasoning: rare, and only
+   // useful if every one is counted.
+   AnalyticsEvent.DESKTOP_TURN_BACKGROUND_WAIT,
+   // Feature adoption is measured as UNIQUE USERS per feature. At desktop's
+   // ~1-2k DAU a 1% sample would leave a feature used by 2% of users with
+   // roughly zero sampled users — the number is unrecoverable from a sample, so
+   // this one is never sampled. Volume is controlled at the emit site instead
+   // (intent-only actions + per-session dedupe), not by throwing away users.
+   AnalyticsEvent.DESKTOP_FEATURE_USED,
+   AnalyticsEvent.DESKTOP_HARNESS_CHANGED,
+   AnalyticsEvent.DESKTOP_MODEL_CHANGED,
+   AnalyticsEvent.DESKTOP_SKILL_RUN,
+   AnalyticsEvent.DESKTOP_CODEX_RESOLUTION,
+   // Rare operational signal. Sampling would make per-version failure rates
+   // misleading precisely when a Windows-only regression affects few installs.
+   AnalyticsEvent.TERMINAL_BROKER_SPAWN_FAILED,
+   AnalyticsEvent.TERMINAL_WATCHDOG_FAILED,
+   AnalyticsEvent.TERMINAL_COMMAND_COMPLETED,
++  // Rare by construction (rate-limited per kind per install) and only useful
++  // if every affected install is counted.
++  AnalyticsEvent.CLI_HELPER_PROCESS_FLOOD,
++  AnalyticsEvent.CLI_HELPER_OUTLIVED_PARENT,
++  AnalyticsEvent.DESKTOP_HELPER_PROCESS_FLOOD,
+   AnalyticsEvent.UPDATE_CODEBUFF_FAILED,
+ ])
+ 
+ type AnalyticsProperties = Record<string, unknown> | undefined
+ 
+ function getStringProperty(
+   properties: AnalyticsProperties,
+   key: string,
+ ): string | undefined {
+   const value = properties?.[key]
+   return typeof value === 'string' && value.trim() ? value : undefined
+ }
+ 
+ function getPropertyUserId(
+   properties: AnalyticsProperties,
+ ): string | undefined {
+   const direct =
+     getStringProperty(properties, 'userId') ??
+     getStringProperty(properties, 'user_id') ??
+     getStringProperty(properties, 'distinct_id')
+   if (direct) {
+     return direct
+   }
+ 
+   const user = properties?.user
+diff --git a/common/src/util/helper-process-census.ts b/common/src/util/helper-process-census.ts
+new file mode 100644
+index 000000000..e149df66b
+--- /dev/null
++++ b/common/src/util/helper-process-census.ts
+@@ -0,0 +1,390 @@
++/**
++ * Live-count telemetry for the helper processes a client spawns.
++ *
++ * WHY THIS EXISTS. On 2026-09-23 a Windows user reported "conhost and
++ * powershell flood from freebuff — it's been happening for so long": ~50
++ * `conhost.exe` and many `powershell.exe` at 800–960 MB each, the machine at
++ * 98% RAM. Nothing server-side can see a client-side process flood, and nothing
++ * client-side was counting, so "so long" was weeks of a problem no dashboard
++ * could show. This module is the count.
++ *
++ * TWO SCOPES, because they answer different questions:
++ *
++ *   owned    children THIS process spawned and still holds a handle to, by
++ *            kind. A flood here is our bug, full stop — a helper we start and
++ *            never reap, or a poll that overlaps itself.
++ *   machine  (Windows only) every powershell / conhost / bash / cmd process on
++ *            the machine, from one `tasklist` every few minutes. This is the
++ *            symptom the user actually sees in Task Manager, and it is the only
++ *            way to see helpers that escaped us: a grandchild outside our job
++ *            object, a watchdog waiting on a reused pid, a shell a command left
++ *            behind. It cannot attribute a process to us — it is a smoke alarm,
++ *            not a fingerprint — so it is reported as its own scope.
++ *
++ * PRIVACY: counts and memory totals only. Never a command line, path, pid or
++ * any process name outside the fixed allowlist below.
++ *
++ * VOLUME: at most one report per (scope, kind) per cooldown (30 min default),
++ * and only above a threshold, so a healthy install emits nothing at all.
++ */
++
++export type HelperProcessKind =
++  /** CLI: the Windows PowerShell bootstrap that launches the terminal watchdog. */
++  | 'terminal_watchdog'
++  /** A terminal-tool command (broker or direct shell). */
++  | 'terminal_command'
++  /** Clipboard helper (clip.exe, pbcopy, xclip, ...). */
++  | 'clipboard'
++  /** CLI: the `tasklist` probe watching the npm launcher. */
++  | 'launcher_probe'
++  /** Desktop: an interactive terminal-panel shell. */
++  | 'shell'
++  /** Desktop: a harness CLI process (codex app-server, ...). */
++  | 'harness'
++  /** Desktop: a UAC-elevated command. */
++  | 'elevation'
++
++export type MachineProcessKind = 'powershell' | 'conhost' | 'bash' | 'cmd'
++
++export type HelperProcessFloodReport = {
++  kind: HelperProcessKind | MachineProcessKind
++  scope: 'owned' | 'machine'
++  /** Live processes of this kind when the threshold was crossed. */
++  live: number
++  threshold: number
++  /** Machine scope only: summed and largest working set of this kind, in MB. */
++  totalMemoryMb?: number
++  maxMemoryMb?: number
++  /** Machine scope only: every process on the machine, for scale. */
++  machineProcesses?: number
++}
++
++export const DEFAULT_OWNED_THRESHOLD = 10
++export const DEFAULT_REPORT_COOLDOWN_MS = 30 * 60 * 1000
++
++/**
++ * Per-kind owned thresholds. A handful of terminal commands in flight is normal
++ * for a busy agent; ten live clipboard helpers never is.
++ */
++export const DEFAULT_OWNED_THRESHOLDS: Partial<
++  Record<HelperProcessKind, number>
++> = {
++  terminal_watchdog: 3,
++  clipboard: 3,
++  launcher_probe: 3,
++  elevation: 3,
++  harness: 12,
++  terminal_command: 12,
++  shell: 16,
++}
++
++/**
++ * Machine-wide counts that are already abnormal. A developer with a few
++ * terminal tabs sits far below these; the reported flood was ~50 conhosts.
++ */
++export const DEFAULT_MACHINE_THRESHOLDS: Record<MachineProcessKind, number> = {
++  powershell: 15,
++  conhost: 60,
++  bash: 40,
++  cmd: 40,
++}
++
++/** Something whose exit can be observed: a node ChildProcess or a Bun Subprocess. */
++export type TrackableProcess =
++  | {
++      once(
++        event: 'exit' | 'error',
++        listener: (...args: unknown[]) => void,
++      ): unknown
++    }
++  | { exited: Promise<unknown> }
++
++export type HelperProcessCensusOptions = {
++  report: (report: HelperProcessFloodReport) => void
++  ownedThresholds?: Partial<Record<HelperProcessKind, number>>
++  defaultOwnedThreshold?: number
++  cooldownMs?: number
++  now?: () => number
++}
++
++export class HelperProcessCensus {
++  private readonly liveByKind = new Map<HelperProcessKind, number>()
++  private readonly lastReportAt = new Map<string, number>()
++  private readonly now: () => number
++
++  constructor(private readonly options: HelperProcessCensusOptions) {
++    this.now = options.now ?? Date.now
++  }
++
++  /**
++   * Count one live helper of `kind` until the returned release is called.
++   * Release is idempotent, so wiring it to several exit paths is safe.
++   */
++  acquire(kind: HelperProcessKind): () => void {
++    const live = (this.liveByKind.get(kind) ?? 0) + 1
++    this.liveByKind.set(kind, live)
++    const threshold = this.ownedThreshold(kind)
++    if (live > threshold) {
++      this.maybeReport({ kind, scope: 'owned', live, threshold })
++    }
++    let released = false
++    return () => {
++      if (released) return
++      released = true
++      const next = (this.liveByKind.get(kind) ?? 1) - 1
++      if (next <= 0) this.liveByKind.delete(kind)
++      else this.liveByKind.set(kind, next)
++    }
++  }
++
++  /** Count `child` until it exits (or fails to start). Never throws. */
++  track(
++    kind: HelperProcessKind,
++    child: TrackableProcess | null | undefined,
++  ): void {
++    if (!child) return
++    try {
++      const release = this.acquire(kind)
++      if ('exited' in child && child.exited instanceof Promise) {
++        child.exited.then(release, release)
++        return
++      }
++      if ('once' in child && typeof child.once === 'function') {
++        child.once('exit', release)
++        child.once('error', release)
++        return
++      }
++      release()
++    } catch {
++      // Telemetry must never affect process handling.
++    }
++  }
++
++  /**
++   * Gauge form of `acquire`, for owners that already keep their own set of
++   * live processes (a session map, the SDK's in-flight commands): feed the
++   * current size, and it is reported like a tracked count would be.
++   */
++  observeOwned(kind: HelperProcessKind, live: number): boolean {
++    const threshold = this.ownedThreshold(kind)
++    if (!(live > threshold)) return false
++    return this.maybeReport({ kind, scope: 'owned', live, threshold })
++  }
++
++  count(kind: HelperProcessKind): number {
++    return this.liveByKind.get(kind) ?? 0
++  }
++
++  snapshot(): Partial<Record<HelperProcessKind, number>> {
++    return Object.fromEntries(this.liveByKind)
++  }
++
++  /** Feed one machine-wide census; reports each kind above its threshold. */
++  observeMachine(
++    summary: MachineProcessSummary,
++    thresholds: Record<MachineProcessKind, number> = DEFAULT_MACHINE_THRESHOLDS,
++  ): HelperProcessFloodReport[] {
++    const reported: HelperProcessFloodReport[] = []
++    for (const kind of Object.keys(thresholds) as MachineProcessKind[]) {
++      const stats = summary.kinds[kind]
++      const threshold = thresholds[kind]
++      if (!stats || stats.count <= threshold) continue
++      const report: HelperProcessFloodReport = {
++        kind,
++        scope: 'machine',
++        live: stats.count,
++        threshold,
++        totalMemoryMb: stats.totalMemoryMb,
++        maxMemoryMb: stats.maxMemoryMb,
++        machineProcesses: summary.total,
++      }
++      if (this.maybeReport(report)) reported.push(report)
++    }
++    return reported
++  }
++
++  private ownedThreshold(kind: HelperProcessKind): number {
++    return (
++      this.options.ownedThresholds?.[kind] ??
++      DEFAULT_OWNED_THRESHOLDS[kind] ??
++      this.options.defaultOwnedThreshold ??
++      DEFAULT_OWNED_THRESHOLD
++    )
++  }
++
++  private maybeReport(report: HelperProcessFloodReport): boolean {
++    const key = `${report.scope}:${report.kind}`
++    const now = this.now()
++    const last = this.lastReportAt.get(key)
++    const cooldown = this.options.cooldownMs ?? DEFAULT_REPORT_COOLDOWN_MS
++    if (last !== undefined && now - last < cooldown) return false
++    this.lastReportAt.set(key, now)
++    try {
++      this.options.report(report)
++    } catch {
++      // Telemetry must never affect process handling.
++    }
++    return true
++  }
++}
++
++// ---------------------------------------------------------------- machine census
++
++/** Image names we count, lowercased. Everything else is only a total. */
++export const MACHINE_PROCESS_IMAGES: Readonly<
++  Record<string, MachineProcessKind>
++> = {
++  'powershell.exe': 'powershell',
++  'pwsh.exe': 'powershell',
++  'conhost.exe': 'conhost',
++  'bash.exe': 'bash',
++  'cmd.exe': 'cmd',
++}
++
++export type MachineProcessStats = {
++  count: number
++  totalMemoryMb: number
++  maxMemoryMb: number
++}
++
++export type MachineProcessSummary = {
++  total: number
++  kinds: Partial<Record<MachineProcessKind, MachineProcessStats>>
++}
++
++/** Split one CSV line of quoted fields (`"a","b,c","d"`). */
++function csvFields(line: string): string[] {
++  const fields: string[] = []
++  const pattern = /"((?:[^"]|"")*)"/g
++  let match: RegExpExecArray | null
++  while ((match = pattern.exec(line)) !== null) {
++    fields.push(match[1]!.replace(/""/g, '"'))
++  }
++  return fields
++}
++
++/**
++ * Parse `tasklist /FO CSV /NH`. Columns are image, pid, session name,
++ * session #, memory — the memory text is localized ("85,432 K", "85.432 K",
++ * "85 432 Ko"), so only its digits are read. Header-less on purpose (/NH), but a
++ * stray header line parses as a non-numeric pid and is dropped.
++ */
++export function parseTasklistCsv(
++  stdout: string,
++): Array<{ image: string; memoryKb: number }> {
++  const rows: Array<{ image: string; memoryKb: number }> = []
++  for (const line of stdout.split(/\r?\n/)) {
++    const fields = csvFields(line)
++    if (fields.length < 5) continue
++    if (!/^\d+$/.test(fields[1]!.trim())) continue
++    const digits = fields[fields.length - 1]!.replace(/\D/g, '')
++    rows.push({
++      image: fields[0]!.trim().toLowerCase(),
++      memoryKb: digits ? Number(digits) : 0,
++    })
++  }
++  return rows
++}
++
++export function summarizeMachineProcesses(
++  rows: ReadonlyArray<{ image: string; memoryKb: number }>,
++): MachineProcessSummary {
++  const kinds: Partial<Record<MachineProcessKind, MachineProcessStats>> = {}
++  for (const row of rows) {
++    const kind = MACHINE_PROCESS_IMAGES[row.image]
++    if (!kind) continue
++    const stats = (kinds[kind] ??= {
++      count: 0,
++      totalMemoryMb: 0,
++      maxMemoryMb: 0,
++    })
++    const mb = row.memoryKb / 1024
++    stats.count++
++    stats.totalMemoryMb += mb
++    stats.maxMemoryMb = Math.max(stats.maxMemoryMb, mb)
++  }
++  for (const stats of Object.values(kinds)) {
++    stats.totalMemoryMb = Math.round(stats.totalMemoryMb)
++    stats.maxMemoryMb = Math.round(stats.maxMemoryMb)
++  }
++  return { total: rows.length, kinds }
++}
++
++export type MachineProcessCensusOptions = {
++  census: HelperProcessCensus
++  /** `tasklist /FO CSV /NH` stdout. Rejections are swallowed. */
++  listProcesses: () => Promise<string>
++  intervalMs?: number
++  initialDelayMs?: number
++  thresholds?: Record<MachineProcessKind, number>
++  setTimeoutFn?: (fn: () => void, ms: number) => unknown
++  clearTimeoutFn?: (handle: unknown) => void
++}
++
++export const DEFAULT_MACHINE_CENSUS_INTERVAL_MS = 10 * 60 * 1000
++export const DEFAULT_MACHINE_CENSUS_INITIAL_DELAY_MS = 2 * 60 * 1000
++
++/**
++ * Poll the machine-wide census. One listing at a time: the next poll is only
++ * scheduled once the previous one settled, so a `tasklist` that hangs on a
++ * machine at 98% RAM cannot stack up copies of itself — which would be this
++ * telemetry reproducing the very flood it exists to detect.
++ */
++export function startMachineProcessCensus(
++  options: MachineProcessCensusOptions,
++): {
++  stop: () => void
++  runOnce: () => Promise<HelperProcessFloodReport[]>
++} {
++  const setTimer =
++    options.setTimeoutFn ??
++    ((fn: () => void, ms: number) => {
++      const handle = setTimeout(fn, ms)
++      ;(handle as { unref?: () => void }).unref?.()
++      return handle
++    })
++  const clearTimer =
++    options.clearTimeoutFn ??
++    ((handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>))
++  let stopped = false
++  let timer: unknown = null
++  let inFlight: Promise<HelperProcessFloodReport[]> | null = null
++
++  const runOnce = (): Promise<HelperProcessFloodReport[]> => {
++    if (inFlight) return inFlight
++    inFlight = (async () => {
++      try {
++        const stdout = await options.listProcesses()
++        return options.census.observeMachine(
++          summarizeMachineProcesses(parseTasklistCsv(stdout)),
++          options.thresholds,
++        )
++      } catch {
++        return []
++      } finally {
++        inFlight = null
++      }
++    })()
++    return inFlight
++  }
++
++  const schedule = (ms: number) => {
++    if (stopped) return
++    timer = setTimer(() => {
++      timer = null
++      void runOnce().finally(() =>
++        schedule(options.intervalMs ?? DEFAULT_MACHINE_CENSUS_INTERVAL_MS),
++      )
++    }, ms)
++  }
++  schedule(options.initialDelayMs ?? DEFAULT_MACHINE_CENSUS_INITIAL_DELAY_MS)
++
++  return {
++    stop: () => {
++      stopped = true
++      if (timer !== null) clearTimer(timer)
++      timer = null
++    },
++    runOnce,
++  }
++}
