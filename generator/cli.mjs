@@ -1276,15 +1276,20 @@ async function cmdBuild () {
   const aiCache = await readJson(`${DATA}/ai-summaries.json`, {})
   if (Object.keys(aiCache).length) {
     const aiBySha = new Map()
+    const eli5BySha = new Map()
     for (const [key, val] of Object.entries(aiCache)) {
-      if (val && !val.error && val.title) {
+      if (val && !val.error) {
         const sha = key.split(':')[0]
-        aiBySha.set(sha, val)
+        if (val.title) aiBySha.set(sha, val)
+        if (val.text && key.includes(':eli5:')) eli5BySha.set(sha, val)
       }
     }
     for (const e of changelog.entries) {
       if (!e.ai && aiBySha.has(e.sha)) {
         e.ai = aiBySha.get(e.sha)
+      }
+      if (!e.eli5 && eli5BySha.has(e.sha)) {
+        e.eli5 = eli5BySha.get(e.sha)
       }
     }
   }

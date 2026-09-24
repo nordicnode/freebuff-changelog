@@ -1189,13 +1189,22 @@ function cleanList (v, max = 12, itemMax = 80) {
 
 export function validateLlmOut (out, fallbackSig = 'minor', opts = {}) {
   if (!out || typeof out !== 'object') throw new Error('LLM output not an object')
-  const rawTitle = String(out.title || '').trim()
+  let rawTitle = String(out.title || '').trim()
   if (!rawTitle) throw new Error('LLM output missing title')
   // Raw code identifiers read as noise in a human title (advertiserreasonredaction202609v3, useSuggestionEngine, stop_response).
   // Real English words this long or with internal camel/snake case are vanishingly rare; the repair pass rewords the few.
-  const rawWords = rawTitle.replace(/[`*#]/g, ' ').split(/\s+/).filter(Boolean)
-  if (rawWords.some(w => w.length >= 18 || CAMEL_IDENT_RE.test(w) || SNAKE_IDENT_RE.test(w))) {
-    throw new Error('LLM title contains raw identifier')
+  let rawWords = rawTitle.replace(/[`*#]/g, ' ').split(/\s+/).filter(Boolean)
+  let badWords = rawWords.filter(w => w.length >= 18 || CAMEL_IDENT_RE.test(w) || SNAKE_IDENT_RE.test(w))
+  if (badWords.length > 0) {
+    if (opts.onUngrounded === 'flag') {
+      // Lenient pass: translate snake_case and camelCase identifiers to plain words rather than failing the whole entry
+      rawTitle = rawTitle.replace(/([a-z0-9])_([a-z0-9])/gi, '$1 $2').replace(/([a-z])([A-Z])/g, '$1 $2')
+      rawWords = rawTitle.replace(/[`*#]/g, ' ').split(/\s+/).filter(Boolean)
+      badWords = rawWords.filter(w => w.length >= 18)
+    }
+    if (badWords.length > 0) {
+      throw new Error(`LLM title contains raw identifier: ${badWords.map(w => JSON.stringify(w)).join(', ')} (translate into plain English words with spaces, no snake_case or camelCase)`)
+    }
   }
   // TITLE_RULE promises max 70 chars; enforce it here so the prompt and the
   // gate agree. The index clips at 110, so a validated title shows whole there.

@@ -908,7 +908,16 @@ test('validateLlmOut: rejects raw glued identifiers in the title', () => {
   assert.throws(() => validateLlmOut({ title: 'advertiserreasonredaction202609v3 adds semantic refusal codes', summary: 'Did stuff.' }, 'minor'), /raw identifier/)
   assert.throws(() => validateLlmOut({ title: 'Add searchmanifoldmarkets tool for queries', summary: 'Did stuff.' }, 'minor'), /raw identifier/)
   assert.throws(() => validateLlmOut({ title: 'Add useSuggestionEngine hook for completions', summary: 'Did stuff.' }, 'minor'), /raw identifier/)
-  assert.throws(() => validateLlmOut({ title: 'Handle stop_response event from server', summary: 'Did stuff.' }, 'minor'), /raw identifier/)
+  let err
+  try {
+    validateLlmOut({ title: 'Handle stop_response event from server', summary: 'Did stuff.' }, 'minor')
+  } catch (e) {
+    err = e
+  }
+  assert.ok(err && /raw identifier/.test(err.message))
+  assert.ok(err.message.includes('"stop_response"'), 'names the offending identifier')
+  const lenient = validateLlmOut({ title: 'Handle stop_response event from server', summary: 'Did stuff.' }, 'minor', { onUngrounded: 'flag' })
+  assert.equal(lenient.title, 'Handle stop response event from server')
   const out = validateLlmOut({ title: 'Ad Reason Redaction v3 adds semantic refusal codes', summary: 'Did stuff.' }, 'minor')
   assert.equal(out.title, 'Ad Reason Redaction v3 adds semantic refusal codes')
 })
