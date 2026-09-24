@@ -1,0 +1,153 @@
+diff --git a/sdk/CHANGELOG.md b/sdk/CHANGELOG.md
+index 263e99fe09..6698a71f5b 100644
+--- a/sdk/CHANGELOG.md
++++ b/sdk/CHANGELOG.md
+@@ -4,6 +4,8 @@ All notable changes to the @codebuff/sdk package will be documented in this file
+ 
+ ## [Unreleased]
+ 
++- Added `sdk/examples/telegram-bot.ts`, a self-hosted Telegram bridge: point a bot token and API key at a project directory and chat with an agent remotely (per-chat sessions, `/new` to reset). See `sdk/README.md`.
++
+ - `run()` now returns promptly when its `signal` aborts during the user lookup or agent-run registration that precede the first model request. Those requests had no signal and retried through a backoff, so a socket that never answered held the run for the whole retry budget; they now end on abort and the run resolves with `Run cancelled by user.`
+ 
+ - Dropped `knowledge.md` from the knowledge-file priority list; the SDK now picks up `AGENTS.md` then `CLAUDE.md` (per directory, and `~/.AGENTS.md`/`~/.CLAUDE.md` in the home directory). Existing `knowledge.md` files are no longer read. The `PRIMARY_KNOWLEDGE_FILE_NAME` export was removed with it; use `KNOWLEDGE_FILE_NAMES[0]`.
+diff --git a/sdk/README.md b/sdk/README.md
+index e9a26e214f..4e03caff14 100644
+--- a/sdk/README.md
++++ b/sdk/README.md
+@@ -273,6 +273,20 @@ The `RunState` object contains:
+ - `sessionState`: Internal state to be passed to the next run
+ - `output`: The agent's output (text, error, or other types)
+ 
++## Example 3: Telegram bridge
++
++Run a Telegram bot that talks to an agent in a project directory, so you can
++prompt it remotely from your phone (no website needed). Each chat keeps its
++own session; `/new` starts a fresh one. Self-hosted: the bot polls Telegram
++and runs the agent wherever you start it.
++
++```bash
++TELEGRAM_BOT_TOKEN=... CODEBUFF_API_KEY=... bun sdk/examples/telegram-bot.ts
++```
++
++Optional env: `FREEBUFF_AGENT` (agent id, default `codebuff/base@0.0.16`) and
++`FREEBUFF_WORKDIR` (directory the agent operates on, default `process.cwd()`).
++
+ ## License
+ 
+ MIT
+diff --git a/sdk/examples/telegram-bot.ts b/sdk/examples/telegram-bot.ts
+new file mode 100644
+index 0000000000..4545644d89
+--- /dev/null
++++ b/sdk/examples/telegram-bot.ts
+@@ -0,0 +1,109 @@
++import { CodebuffClient } from '@codebuff/sdk'
++
++// Telegram bridge for the Codebuff/Freebuff agent (freebuff issue #1426).
++//
++// Runs a Telegram bot that forwards each message to an agent run and replies
++// with the agent's text output. Sessions are kept per chat: a follow-up
++// message continues the previous run unless you send /new.
++//
++// Self-hosted: you run it next to the codebase you want the agent to work on.
++//
++// Required env:
++//   TELEGRAM_BOT_TOKEN - token from @BotFather
++//   CODEBUFF_API_KEY   - key from https://www.codebuff.com/api-keys
++// Optional env:
++//   FREEBUFF_AGENT   - agent id to run (default 'codebuff/base@0.0.16'; any
++//                      agent from the store works, e.g. a free agent id)
++//   FREEBUFF_WORKDIR - directory the agent operates on (default process.cwd())
++//
++// Run: bun sdk/examples/telegram-bot.ts
++
++const AGENT = process.env.FREEBUFF_AGENT ?? 'codebuff/base@0.0.16'
++const CWD = process.env.FREEBUFF_WORKDIR ?? process.cwd()
++
++type RunState = Awaited<ReturnType<CodebuffClient['run']>>
++
++type TelegramUpdate = {
++  update_id: number
++  message?: {
++    chat: { id: number; type: string }
++    text?: string
++  }
++}
++
++async function tg(method: string, body?: Record<string, unknown>) {
++  const res = await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/${method}`, {
++    method: 'POST',
++    headers: { 'content-type': 'application/json' },
++    body: body === undefined ? undefined : JSON.stringify(body),
++  })
++  const json = (await res.json()) as { ok: boolean; result?: unknown; description?: string }
++  if (!json.ok) throw new Error(`Telegram ${method} failed: ${json.description}`)
++  return json.result
++}
++
++function sendMessage(chatId: number, text: string) {
++  return tg('sendMessage', { chat_id: chatId, text: text.slice(0, 4096) })
++}
++
++async function main() {
++  if (!process.env.TELEGRAM_BOT_TOKEN) throw new Error('Set TELEGRAM_BOT_TOKEN')
++  if (!process.env.CODEBUFF_API_KEY) throw new Error('Set CODEBUFF_API_KEY')
++
++  const client = new CodebuffClient({ apiKey: process.env.CODEBUFF_API_KEY, cwd: CWD })
++  const previousRuns = new Map<number, RunState>()
++  // One run at a time per chat; later messages queue behind the active run.
++  const queues = new Map<number, Promise<void>>()
++  let offset = 0
++
++  console.log(`Telegram bridge listening (agent: ${AGENT}, cwd: ${CWD})`)
++
++  while (true) {
++    const updates = (await tg('getUpdates', { offset, timeout: 30 })) as TelegramUpdate[]
++    for (const update of updates) {
++      offset = update.update_id + 1
++      const message = update.message
++      const text = message?.text
++      if (!message || !text) continue
++      if (message.chat.type !== 'private') continue // DM-only for now
++      const chatId = message.chat.id
++
++      if (text === '/start') {
++        await sendMessage(chatId, "Send me a task and I'll run it with the agent. Use /new to start a fresh session.")
++        continue
++      }
++      if (text === '/new') {
++        previousRuns.delete(chatId)
++        await sendMessage(chatId, 'Started a new session.')
++        continue
++      }
++
++      const previous = previousRuns.get(chatId)
++      const runChat = async () => {
++        try {
++          const runState = await client.run({
++            agent: AGENT,
++            prompt: text,
++            previousRun: previous,
++            handleEvent: async (event) => {
++              if (event.type === 'text') await sendMessage(chatId, event.text)
++              if (event.type === 'error' && !event.source) {
++                await sendMessage(chatId, `Error: ${event.message}`)
++              }
++            },
++          })
++          previousRuns.set(chatId, runState)
++          if (runState.output.type === 'error') {
++            await sendMessage(chatId, `Run failed: ${runState.output.message}`)
++          }
++        } catch (error) {
++          await sendMessage(chatId, `Run failed: ${(error as Error).message}`)
++        }
++      }
++      const tail = queues.get(chatId) ?? Promise.resolve()
++      queues.set(chatId, tail.then(runChat, runChat))
++    }
++  }
++}
++
++main()
