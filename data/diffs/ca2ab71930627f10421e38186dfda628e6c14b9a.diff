@@ -1,0 +1,420 @@
+diff --git a/common/src/util/file.ts b/common/src/util/file.ts
+index 1f4c95739..4934a6b76 100644
+--- a/common/src/util/file.ts
++++ b/common/src/util/file.ts
+@@ -27,50 +27,54 @@ export interface DirectoryNode extends FileTreeNode {
+ }
+ 
+ export interface FileNode extends FileTreeNode {
+   type: 'file'
+   lastReadTime: number
+ }
+ 
+ export const FileVersionSchema = z.object({
+   path: z.string(),
+   content: z.string(),
+ })
+ 
+ export type FileVersion = z.infer<typeof FileVersionSchema>
+ 
+ export const customToolDefinitionsSchema = z
+   .record(
+     z.string(),
+     z.object({
+       // inputSchema can be a Zod schema (from MCP tools) or a JSON Schema object
+       // (from SDK custom tools that have been serialized). The agent-runtime
+       // converts JSON schemas to Zod using ensureZodSchema() before use.
+       inputSchema: z.custom<z.ZodType | Record<string, unknown>>(),
+       endsAgentStep: z.boolean().optional().default(false),
+       description: z.string().optional(),
+       exampleInputs: z.record(z.string(), z.any()).array().optional(),
++      /** Set only when an MCP tool's exposed name had to be sanitized: the
++       *  server key and tool name to call, which can no longer be recovered
++       *  by splitting the exposed name. */
++      mcpOrigin: z.object({ server: z.string(), tool: z.string() }).optional(),
+     }),
+   )
+   .default(() => ({}))
+ export type CustomToolDefinitions = NonNullable<
+   z.input<typeof customToolDefinitionsSchema>
+ >
+ 
+ export const ProjectFileContextSchema = z.object({
+   projectRoot: z.string(),
+   cwd: z.string(),
+   fileTree: z.array(z.custom<FileTreeNode>()),
+   fileTokenScores: z.record(z.string(), z.record(z.string(), z.number())),
+   tokenCallers: z
+     .record(z.string(), z.record(z.string(), z.array(z.string())))
+     .optional(),
+   knowledgeFiles: z.record(z.string(), z.string()),
+   userKnowledgeFiles: z.record(z.string(), z.string()).optional(),
+   agentTemplates: z.record(z.string(), z.any()).default(() => ({})),
+   customToolDefinitions: customToolDefinitionsSchema,
+   skills: z.record(z.string(), z.any()).optional(),
+   includeHomeSkills: z.boolean().optional(),
+   gitChanges: z.object({
+     gitAvailable: z.boolean().optional(),
+     branch: z.string().optional(),
+     changedFiles: z.array(z.string()).optional(),
+diff --git a/packages/agent-runtime/src/__tests__/mcp-tool-names.test.ts b/packages/agent-runtime/src/__tests__/mcp-tool-names.test.ts
+new file mode 100644
+index 000000000..3f4b89a0e
+--- /dev/null
++++ b/packages/agent-runtime/src/__tests__/mcp-tool-names.test.ts
+@@ -0,0 +1,69 @@
++import { describe, expect, it } from 'bun:test'
++
++import { getMCPToolData, mcpExposedToolName } from '../mcp'
++
++const PROVIDER_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/
++
++const schema = { type: 'object', properties: {} }
++
++async function exposedFor(
++  servers: Record<string, string[]>,
++): Promise<Record<string, { mcpOrigin?: { server: string; tool: string } }>> {
++  const mcpServers = Object.fromEntries(
++    Object.keys(servers).map((name) => [name, { command: name } as any]),
++  )
++  return (await getMCPToolData({
++    toolNames: [],
++    mcpServers,
++    requestMcpToolData: async ({ mcpConfig }) =>
++      servers[(mcpConfig as { command: string }).command].map((name) => ({
++        name,
++        description: name,
++        inputSchema: schema,
++      })),
++  })) as any
++}
++
++describe('MCP tool names reaching the provider', () => {
++  it('leaves an already-valid name byte-identical, with no origin', async () => {
++    const defs = await exposedFor({ supabase: ['list_tables'] })
++    expect(Object.keys(defs)).toEqual(['supabase__list_tables'])
++    expect(defs['supabase__list_tables'].mcpOrigin).toBeUndefined()
++  })
++
++  // The real failure: "Invalid 'tools[89].name': string does not match
++  // pattern ... '^[a-zA-Z0-9_-]+$'" failed every turn for that user.
++  it.each([
++    ['a dotted server key', 'github.com', 'create_issue'],
++    ['a spaced server key', 'my server', 'search'],
++    ['a dotted tool name', 'files', 'fs.read_file'],
++    ['a slash in the tool name', 'docs', 'pages/get'],
++    ['a colon in the tool name', 'db', 'query:run'],
++  ])(
++    'sanitizes %s and keeps the original for execution',
++    async (_l, server, tool) => {
++      const defs = await exposedFor({ [server]: [tool] })
++      const [exposed] = Object.keys(defs)
++      expect(exposed).toMatch(PROVIDER_PATTERN)
++      expect(defs[exposed].mcpOrigin).toEqual({ server, tool })
++    },
++  )
++
++  it('keeps an over-long invalid name within 64 characters, stably', () => {
++    const tool = `very.long.${'x'.repeat(120)}`
++    const a = mcpExposedToolName('srv', tool)
++    expect(a).toMatch(PROVIDER_PATTERN)
++    expect(mcpExposedToolName('srv', tool)).toBe(a)
++  })
++
++  it('keeps two originals that sanitize alike both callable', async () => {
++    const defs = await exposedFor({ files: ['a.b', 'a b'] })
++    const names = Object.keys(defs)
++    expect(new Set(names).size).toBe(2)
++    for (const name of names) expect(name).toMatch(PROVIDER_PATTERN)
++    expect(names.map((n) => defs[n].mcpOrigin?.tool).sort()).toEqual([
++      'a b',
++      'a.b',
++    ])
++  })
++})
+diff --git a/packages/agent-runtime/src/mcp.ts b/packages/agent-runtime/src/mcp.ts
+index a7390f219..39e051fa8 100644
+--- a/packages/agent-runtime/src/mcp.ts
++++ b/packages/agent-runtime/src/mcp.ts
+@@ -1,80 +1,117 @@
++import { createHash } from 'crypto'
++
+ import { getErrorObject } from '@codebuff/common/util/error'
+ import { convertJsonSchemaToZod } from 'zod-from-json-schema'
+ 
+ import { MCP_TOOL_SEPARATOR } from './mcp-constants'
+ 
+ import type { AgentTemplate } from './templates/types'
+ import type { RequestMcpToolDataFn } from '@codebuff/common/types/contracts/client'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { OptionalFields } from '@codebuff/common/types/function-params'
+ import type {
+   CustomToolDefinitions,
+   ProjectFileContext,
+ } from '@codebuff/common/util/file'
+ 
++/** What every provider accepts; OpenAI-compatible APIs also cap it at 64. */
++const VALID_TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/
++/** Names already valid up to this length are left byte-identical. */
++const LEGACY_VALID_TOOL_NAME = /^[a-zA-Z0-9_-]{1,128}$/
++
++/**
++ * The tool name the model sees for one MCP tool.
++ *
++ * `server__tool` exactly as before whenever that is already a legal name, so
++ * nothing changes for the common case (no prompt-cache churn). A server key or
++ * tool name carrying anything else (`.`, a space, `/`, `:`) used to produce a
++ * name every provider rejects — "Invalid 'tools[89].name': string does not
++ * match pattern" — failing the whole turn, every turn, for that user. Those are
++ * sanitized, truncated with a stable hash when too long, and the caller records
++ * the original server/tool on the definition (`mcpOrigin`) for execution.
++ */
++export function mcpExposedToolName(server: string, tool: string): string {
++  const raw = server + MCP_TOOL_SEPARATOR + tool
++  if (LEGACY_VALID_TOOL_NAME.test(raw)) return raw
++  const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, '_')
++  if (VALID_TOOL_NAME.test(cleaned)) return cleaned
++  const hash = createHash('sha256').update(raw).digest('hex').slice(0, 8)
++  return `${cleaned.slice(0, 55)}_${hash}`
++}
++
+ export async function getMCPToolData(
+   params: OptionalFields<
+     {
+       toolNames: AgentTemplate['toolNames']
+       mcpServers: AgentTemplate['mcpServers']
+       writeTo: ProjectFileContext['customToolDefinitions']
+       requestMcpToolData: RequestMcpToolDataFn
+       logger?: Logger
+     },
+     'writeTo'
+   >,
+ ): Promise<CustomToolDefinitions> {
+   const withDefaults = { writeTo: {}, ...params }
+   const { toolNames, mcpServers, writeTo, requestMcpToolData, logger } =
+     withDefaults
+ 
+   // User-facing toolNames use '/' as separator (e.g., 'supabase/list_tables')
+   // but internally we use MCP_TOOL_SEPARATOR ('__') for LLM API compatibility
+   const USER_INPUT_SEPARATOR = '/'
+   const requestedToolsByMcp: Record<string, string[] | undefined> = {}
+   for (const t of toolNames) {
+     if (!t.includes(USER_INPUT_SEPARATOR)) {
+       continue
+     }
+     const [mcpName, ...remaining] = t.split(USER_INPUT_SEPARATOR)
+     const toolName = remaining.join(USER_INPUT_SEPARATOR)
+     if (!requestedToolsByMcp[mcpName]) {
+       requestedToolsByMcp[mcpName] = []
+     }
+     requestedToolsByMcp[mcpName].push(toolName)
+   }
+ 
+   const promises: Promise<any>[] = []
+   for (const [mcpName, mcpConfig] of Object.entries(mcpServers)) {
+     promises.push(
+       (async () => {
+         try {
+           const mcpData = await requestMcpToolData({
+             mcpConfig,
+             toolNames: requestedToolsByMcp[mcpName] ?? null,
+           })
+ 
+           for (const { name, description, inputSchema } of mcpData) {
+-            writeTo[mcpName + MCP_TOOL_SEPARATOR + name] = {
++            const raw = mcpName + MCP_TOOL_SEPARATOR + name
++            let exposed = mcpExposedToolName(mcpName, name)
++            if (exposed !== raw && exposed in writeTo) {
++              // Two originals sanitized to the same name: keep both callable.
++              const hash = createHash('sha256').update(raw).digest('hex')
++              exposed = `${exposed.slice(0, 55)}_${hash.slice(0, 8)}`
++            }
++            writeTo[exposed] = {
+               inputSchema: convertJsonSchemaToZod(inputSchema as any) as any,
+               endsAgentStep: true,
+               description,
++              ...(exposed !== raw && {
++                mcpOrigin: { server: mcpName, tool: name },
++              }),
+             }
+           }
+         } catch (error) {
+           // A failed MCP server (e.g. a stdio server that can't be spawned)
+           // should disable just its own tools, not abort the whole turn. The
+           // error from the client carries the actionable detail (command +
+           // captured stderr).
+           logger?.warn(
+             { error: getErrorObject(error), mcpServer: mcpName },
+             `Failed to load tools from MCP server "${mcpName}"; its tools will be unavailable for this step.`,
+           )
+         }
+       })(),
+     )
+   }
+   await Promise.all(promises)
+ 
+   return writeTo
+ }
+diff --git a/packages/agent-runtime/src/tools/tool-executor.ts b/packages/agent-runtime/src/tools/tool-executor.ts
+index 589b61924..cc04df06d 100644
+--- a/packages/agent-runtime/src/tools/tool-executor.ts
++++ b/packages/agent-runtime/src/tools/tool-executor.ts
+@@ -651,136 +651,136 @@ export function parseRawCustomToolCall(params: {
+ 
+ export async function executeCustomToolCall(
+   params: ExecuteToolCallParams<string>,
+ ): Promise<void> {
+   const {
+     toolName,
+     input,
+     autoInsertEndStepParam = false,
+     excludeToolFromMessageHistory = false,
+     fromHandleSteps = false,
+ 
+     agentState,
+     agentTemplate,
+     fileContext,
+     logger,
+     onResponseChunk,
+     previousToolCallFinished,
+     requestToolCall,
+     toolCallId,
+     toolCalls,
+     toolCallsToAddToMessageHistory,
+     toolResults,
+     toolResultsToAddToMessageHistory,
+     userInputId,
+   } = params
++  const customToolDefs = await getMCPToolData({
++    ...params,
++    toolNames: agentTemplate.toolNames,
++    mcpServers: agentTemplate.mcpServers,
++    writeTo: cloneDeep(fileContext.customToolDefinitions),
++  })
++  // A sanitized MCP name carries its real server/tool; otherwise the legacy
++  // `server__tool` split still applies.
++  const mcpTarget = (
++    name: string,
++  ): { server: string; tool: string } | undefined => {
++    const origin = customToolDefs[name]?.mcpOrigin
++    if (origin) return origin
++    if (!name.includes(MCP_TOOL_SEPARATOR)) return undefined
++    const [server, ...rest] = name.split(MCP_TOOL_SEPARATOR)
++    return { server, tool: rest.join(MCP_TOOL_SEPARATOR) }
++  }
+   const toolCall: CustomToolCall | ToolCallError = parseRawCustomToolCall({
+-    customToolDefs: await getMCPToolData({
+-      ...params,
+-      toolNames: agentTemplate.toolNames,
+-      mcpServers: agentTemplate.mcpServers,
+-      writeTo: cloneDeep(fileContext.customToolDefinitions),
+-    }),
++    customToolDefs,
+     rawToolCall: {
+       toolName,
+       toolCallId: toolCallId ?? generateCompactId(),
+       input,
+     },
+     autoInsertEndStepParam,
+   })
+ 
+   // Filter out restricted tools - emit error instead of tool call/result
+   // This prevents the CLI from showing tool calls that the agent doesn't have permission to use
+   if (
+     toolCall.toolName &&
+     !(agentTemplate.toolNames as string[]).includes(toolCall.toolName) &&
+     !fromHandleSteps &&
+-    !(
+-      toolCall.toolName.includes(MCP_TOOL_SEPARATOR) &&
+-      toolCall.toolName.split(MCP_TOOL_SEPARATOR)[0] in agentTemplate.mcpServers
+-    )
++    !((mcpTarget(toolCall.toolName)?.server ?? '') in agentTemplate.mcpServers)
+   ) {
+     // Emit an error event instead of tool call/result pair
+     // The stream parser will convert this to a user message for proper API compliance
+     onResponseChunk({
+       type: 'error',
+       message: `Tool \`${toolName}\` is not currently available. Make sure to only use tools listed in the system instructions.`,
+     })
+     return previousToolCallFinished
+   }
+ 
+   if ('error' in toolCall) {
+     const formattedInput = formatValueForError(input)
+     onResponseChunk({
+       type: 'error',
+       message: `${toolCall.error}\n\nOriginal tool call input:\n${formattedInput}`,
+     })
+     logger.debug(
+       { toolCall, error: toolCall.error },
+       `${toolName} error: ${toolCall.error}`,
+     )
+     return previousToolCallFinished
+   }
+ 
+   // Only emit tool_call event after permission check passes
+   onResponseChunk({
+     type: 'tool_call',
+     toolCallId: toolCall.toolCallId,
+     toolName,
+     input: toolCall.input,
+     // Only include agentId for subagents (agents with a parent)
+     ...(agentState?.parentId && { agentId: agentState.agentId }),
+     // Include includeToolCall flag if explicitly set to false
+     ...(excludeToolFromMessageHistory && { includeToolCall: false }),
+   })
+ 
+   toolCalls.push(toolCall)
+   if (!excludeToolFromMessageHistory) {
+     toolCallsToAddToMessageHistory.push(toolCall)
+   }
+ 
+   return previousToolCallFinished
+     .then(async () => {
+       if (params.signal.aborted) {
+         return null
+       }
+ 
+-      const toolName = toolCall.toolName.includes(MCP_TOOL_SEPARATOR)
+-        ? toolCall.toolName
+-            .split(MCP_TOOL_SEPARATOR)
+-            .slice(1)
+-            .join(MCP_TOOL_SEPARATOR)
+-        : toolCall.toolName
++      const target = mcpTarget(toolCall.toolName)
+       const clientToolResult = await requestToolCall({
+         userInputId,
+-        toolName,
++        toolName: target ? target.tool : toolCall.toolName,
+         input: toolCall.input,
+-        mcpConfig: toolCall.toolName.includes(MCP_TOOL_SEPARATOR)
+-          ? agentTemplate.mcpServers[
+-              toolCall.toolName.split(MCP_TOOL_SEPARATOR)[0]
+-            ]
+-          : undefined,
++        mcpConfig: target ? agentTemplate.mcpServers[target.server] : undefined,
+       })
+       return clientToolResult.output satisfies ToolResultOutput[]
+     })
+     .then((result) => {
+       if (!result) {
+         return
+       }
+       const toolResult = {
+         role: 'tool',
+         toolName,
+         toolCallId: toolCall.toolCallId,
+         content: result,
+       } satisfies ToolMessage
+       logger.debug(
+         { input, toolResult },
+         `${toolName} custom tool call & result (${toolResult.toolCallId})`,
+       )
+       onResponseChunk({
+         type: 'tool_result',
+         toolName: toolResult.toolName,
+         toolCallId: toolResult.toolCallId,
+         output: toolResult.content,
+       })
+ 
+       toolResults.push(toolResult)
