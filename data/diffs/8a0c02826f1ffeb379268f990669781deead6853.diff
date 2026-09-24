@@ -1,0 +1,1153 @@
+diff --git a/sdk/src/__tests__/sponsored-sandbox.test.ts b/sdk/src/__tests__/sponsored-sandbox.test.ts
+index 2cc1ffefb..2b065800f 100644
+--- a/sdk/src/__tests__/sponsored-sandbox.test.ts
++++ b/sdk/src/__tests__/sponsored-sandbox.test.ts
+@@ -1,43 +1,46 @@
+ import { describe, expect, it } from 'bun:test'
+ import { spawnSync } from 'child_process'
+ import fs from 'fs'
+ import os from 'os'
+ import path from 'path'
+ 
+ import {
+   scrubSponsoredLocalEnv,
+   sponsoredLocalContainment,
+ } from '@codebuff/common/ads/sponsored-local-execution'
+ 
+ import {
+   assertSponsoredCommandCwd,
+   assertSponsoredReadPath,
+   assertSponsoredWritePath,
+   createSponsoredCodeSearchBroker,
+   createSponsoredTerminalBroker,
++  findXcodeDeveloperGit,
++  linkDeveloperShims,
+   sponsoredCodeSearchFlagsRefusal,
++  sponsoredMacGitPath,
+   sponsoredMacProfile,
+ } from '../tools/sponsored-sandbox'
+ import { codeSearch, parseCodeSearchFlags } from '../tools/code-search'
+ import { sponsoredContainmentTestGate } from '../../test/sponsored-containment-gate'
+ 
+ /**
+  * COD-336's two acceptance tests, at the layer that actually holds them.
+  *
+  * Acceptance 3 asks for "a local run cannot write outside its worktree VIA THE
+  * SHELL, not only via the write tools", and acceptance 4 for "the advertiser
+  * procedure cannot read the user's environment". Both are properties of the
+  * broker, so both are asserted by running a REAL command through it rather
+  * than by inspecting the arguments it would have used — an argument list is a
+  * thing that can be right while the sandbox is not applied at all, which is
+  * exactly how the macOS profile stayed broken for months.
+  */
+ 
+ /**
+  * Skip, or in CI on Linux FAIL, when no OS sandbox can be started here. The
+  * rule and the reason live in `sdk/test/sponsored-containment-gate.ts`.
+  */
+ const CONTAINMENT_USABLE = sponsoredContainmentTestGate()
+ const containedIt = it.skipIf(!CONTAINMENT_USABLE)
+ 
+ function workspace(): { root: string; runtime: string; parent: string } {
+@@ -824,56 +827,57 @@ function desktopLayout(): {
+     resolve(
+       spawnSync(
+         'git',
+         ['-C', worktree, 'rev-parse', '--path-format=absolute', flag],
+         { encoding: 'utf8' },
+       ).stdout.trim(),
+     )
+   return {
+     project,
+     worktree: resolve(worktree),
+     runtime: resolve(runtime),
+     parent,
+     branch,
+     linkedWorktree: {
+       commonDir: ask('--git-common-dir'),
+       gitDir: ask('--git-dir'),
+       branchNamespace: 'freebuff',
+     },
+   }
+ }
+ 
+ async function runInSandbox(
+   options: Parameters<typeof createSponsoredTerminalBroker>[0],
+   cwd: string,
+   script: string,
++  pathValue: string | undefined = POLLUTED_ENV.PATH,
+ ): Promise<{ exitCode: number | null; out: string; err: string }> {
+   const handle = createSponsoredTerminalBroker(options).start({
+     executable: 'bash',
+     args: ['-c', script],
+     cwd,
+-    env: POLLUTED_ENV as NodeJS.ProcessEnv,
++    env: { ...POLLUTED_ENV, PATH: pathValue } as NodeJS.ProcessEnv,
+   })
+   const stdout = drain(handle.stdout)
+   const stderr = drain(handle.stderr)
+   const exitCode = await handle.completion
+   const [out, err] = await Promise.all([stdout, stderr])
+   return { exitCode, out, err }
+ }
+ 
+ const COMMIT_SCRIPT = [
+   'set -e',
+   'echo sponsored-change > CHANGED.md',
+   'git status --porcelain',
+   'git add CHANGED.md',
+   'git -c user.email=sponsored@example.invalid -c user.name="Sponsored Run" commit -q -m "sponsored change" --no-verify',
+   'git log --oneline -1 --format=%s',
+ ].join('\n')
+ 
+ describe('sponsored git in the layout Desktop actually creates', () => {
+   containedIt(
+     "commits in a linked worktree, and the commit lands in the user's repository",
+     async () => {
+       const layout = desktopLayout()
+       try {
+         const { exitCode, out, err } = await runInSandbox(
+           {
+@@ -1124,50 +1128,439 @@ describe('sponsored git in the layout Desktop actually creates', () => {
+         expect(out).toContain('sponsored change')
+         const tip = spawnSync(
+           'git',
+           ['-C', layout.project, 'log', '--oneline', '-1', layout.branch],
+           { encoding: 'utf8' },
+         )
+         expect(tip.stdout).toContain('sponsored change')
+         // The packed table itself was not rewritten by the run.
+         expect(
+           fs.readFileSync(path.join(common, 'packed-refs'), 'utf8'),
+         ).toContain('refs/heads/main')
+         // The Linux arm materialised the run's own branch as a loose ref
+         // before the spawn (its packed entry stays and is shadowed); on macOS
+         // git wrote the loose ref itself. Either way the user's git resolves
+         // it to the sponsored commit, which the `log` above proved.
+         expect(
+           fs.existsSync(path.join(common, 'refs', 'heads', layout.branch)),
+         ).toBe(true)
+       } finally {
+         fs.rmSync(layout.parent, { recursive: true, force: true })
+       }
+     },
+   )
+ })
+ 
++// ------------------------------------------ git on macOS: the xcode-select shim
++
++/**
++ * A fake host for the resolver: `files` maps each executable PATH candidate
++ * to its realpath; anything absent is not an executable file.
++ */
++function gitHost(
++  files: Record<string, string>,
++  developerGit: string | null = null,
++) {
++  const calls = { developerGit: 0 }
++  const reals = new Map(Object.entries(files))
++  if (developerGit) reals.set(developerGit, developerGit)
++  return {
++    calls,
++    dependencies: {
++      isExecutableFile: (pathname: string) => reals.has(pathname),
++      realpath: (pathname: string) => reals.get(pathname) ?? null,
++      developerGit: () => {
++        calls.developerGit++
++        return developerGit
++      },
++    },
++  }
++}
++
++const CLT_GIT = '/Library/Developer/CommandLineTools/usr/bin/git'
++const CLT_BIN = '/Library/Developer/CommandLineTools/usr/bin'
++const KEG_GIT = '/opt/homebrew/Cellar/git/2.50.1/bin/git'
++const KEG_BIN = '/opt/homebrew/Cellar/git/2.50.1/bin'
++/**
++ * What launchd hands a Finder-launched Desktop. The login-shell repair
++ * APPENDS to it, so `/usr/bin` -- and its xcode-select `git` -- stays first.
++ */
++const FINDER_PATH = '/usr/bin:/bin:/usr/sbin:/sbin'
++
++describe('which git a contained macOS shell runs', () => {
++  it('a Finder-launched PATH gets the developer git ahead of the shim', () => {
++    const host = gitHost(
++      { '/usr/bin/git': '/usr/bin/git', '/opt/homebrew/bin/git': KEG_GIT },
++      CLT_GIT,
++    )
++    expect(
++      sponsoredMacGitPath(
++        `${FINDER_PATH}:/opt/homebrew/bin`,
++        host.dependencies,
++      ),
++    ).toBe(`${CLT_BIN}:${FINDER_PATH}:/opt/homebrew/bin`)
++  })
++
++  it("keeps the orchestrator's own git, through its symlink, from a directory the sandbox cannot read", () => {
++    // The agentic:e2e shape: its shim dir lives under the temp dir, which the
++    // profile does not make readable, so bash inside the run skipped it and
++    // found `/usr/bin/git`.
++    const shims = '/private/var/folders/xx/T/agentic-e2e-1/shims'
++    const host = gitHost(
++      { [`${shims}/git`]: KEG_GIT, '/usr/bin/git': '/usr/bin/git' },
++      CLT_GIT,
++    )
++    expect(
++      sponsoredMacGitPath(`/gh/bin:${shims}:${FINDER_PATH}`, host.dependencies),
++    ).toBe(`/gh/bin:${KEG_BIN}:${shims}:${FINDER_PATH}`)
++    // xcrun is not asked at all when the first git is not the shim.
++    expect(host.calls.developerGit).toBe(0)
++  })
++
++  it('leaves PATH alone when the first git already lives where it is found', () => {
++    const host = gitHost(
++      { '/opt/local/bin/git': '/opt/local/bin/git' },
++      CLT_GIT,
++    )
++    const value = `/opt/local/bin:${FINDER_PATH}`
++    expect(sponsoredMacGitPath(value, host.dependencies)).toBe(value)
++  })
++
++  it('never chooses a git the profile does not already read', () => {
++    // One under HOME, and a full Xcode under /Applications: both outside the
++    // read set, so both are passed over rather than granted. The readable one
++    // still goes AHEAD of the shim, or the shim would win inside the run.
++    const host = gitHost(
++      {
++        '/Users/u/.local/bin/git': '/Users/u/.local/bin/git',
++        '/usr/bin/git': '/usr/bin/git',
++        '/opt/homebrew/bin/git': KEG_GIT,
++      },
++      '/Applications/Xcode.app/Contents/Developer/usr/bin/git',
++    )
++    expect(
++      sponsoredMacGitPath(
++        `/Users/u/.local/bin:${FINDER_PATH}:/opt/homebrew/bin`,
++        host.dependencies,
++      ),
++    ).toBe(`${KEG_BIN}:/Users/u/.local/bin:${FINDER_PATH}:/opt/homebrew/bin`)
++  })
++
++  it('with no readable git anywhere, changes nothing and throws nothing', () => {
++    // A Mac with no developer tools: only the shim, and nothing behind it.
++    const host = gitHost({ '/usr/bin/git': '/usr/bin/git' }, null)
++    expect(sponsoredMacGitPath(FINDER_PATH, host.dependencies)).toBe(
++      FINDER_PATH,
++    )
++    expect(host.calls.developerGit).toBe(1)
++    expect(sponsoredMacGitPath(undefined, host.dependencies)).toBeUndefined()
++    expect(sponsoredMacGitPath('', host.dependencies)).toBe('')
++    // A developer "git" that is itself the shim, or relative, is no answer.
++    for (const answer of ['/usr/bin/git', 'usr/bin/git']) {
++      const odd = gitHost({ '/usr/bin/git': '/usr/bin/git' }, answer)
++      expect(sponsoredMacGitPath(FINDER_PATH, odd.dependencies)).toBe(
++        FINDER_PATH,
++      )
++    }
++  })
++
++  it('never resolves a relative PATH entry', () => {
++    // Inside the run a relative entry is relative to the worktree, which the
++    // advertiser's procedure writes.
++    const host = gitHost(
++      {
++        'node_modules/.bin/git': '/opt/planted/git',
++        '/usr/bin/git': '/usr/bin/git',
++      },
++      CLT_GIT,
++    )
++    expect(
++      sponsoredMacGitPath(
++        `node_modules/.bin:${FINDER_PATH}`,
++        host.dependencies,
++      ),
++    ).toBe(`node_modules/.bin:${CLT_BIN}:${FINDER_PATH}`)
++  })
++
++  it('reads the developer directory from its link, spawning nothing', () => {
++    const CLT = '/Library/Developer/CommandLineTools'
++    const installed = (pathname: string) => pathname === CLT_GIT
++    // No link: no developer tools, and nothing that could request an install.
++    expect(
++      findXcodeDeveloperGit({ readlink: () => null, isExecutableFile: installed }),
++    ).toBeNull()
++    // The macOS 26 link names the Command Line Tools; the older one is a fallback.
++    expect(
++      findXcodeDeveloperGit({
++        readlink: (link) => (link === '/var/select/developer_dir' ? CLT : null),
++        isExecutableFile: installed,
++      }),
++    ).toBe(CLT_GIT)
++    expect(
++      findXcodeDeveloperGit({
++        readlink: (link) => (link === '/var/db/xcode_select_link' ? CLT : null),
++        isExecutableFile: installed,
++      }),
++    ).toBe(CLT_GIT)
++    // A link naming a directory that no longer has git is no answer.
++    expect(
++      findXcodeDeveloperGit({ readlink: () => CLT, isExecutableFile: () => false }),
++    ).toBeNull()
++  })
++
++  it('puts stand-ins for every /usr/bin shim right before /usr/bin, whichever git wins', () => {
++    const SHIMS = '/Users/u/.freebuff/sponsored-runtime/r/developer-shims'
++    const shims = () => SHIMS
++    // Finder PATH: the stand-ins (their `git` is the developer git) win, and
++    // the whole Command Line Tools bin is never put on PATH.
++    const finder = gitHost({ '/usr/bin/git': '/usr/bin/git' }, CLT_GIT)
++    expect(
++      sponsoredMacGitPath(FINDER_PATH, { ...finder.dependencies, developerShims: shims }),
++    ).toBe(`${SHIMS}:${FINDER_PATH}`)
++    // Homebrew git first: git stays Homebrew's, and `python3`/`make` in
++    // /usr/bin still get their stand-ins.
++    const brew = gitHost(
++      { '/opt/homebrew/bin/git': KEG_GIT, '/usr/bin/git': '/usr/bin/git' },
++      CLT_GIT,
++    )
++    expect(
++      sponsoredMacGitPath(`/opt/homebrew/bin:${FINDER_PATH}`, {
++        ...brew.dependencies,
++        developerShims: shims,
++      }),
++    ).toBe(`${KEG_BIN}:/opt/homebrew/bin:${SHIMS}:${FINDER_PATH}`)
++    // No /usr/bin on PATH: nothing to stand in for, and nothing is asked.
++    let asked = 0
++    const none = gitHost({ '/opt/local/bin/git': '/opt/local/bin/git' }, CLT_GIT)
++    expect(
++      sponsoredMacGitPath('/opt/local/bin:/bin', {
++        ...none.dependencies,
++        developerShims: () => {
++          asked++
++          return SHIMS
++        },
++      }),
++    ).toBe('/opt/local/bin:/bin')
++    expect(asked).toBe(0)
++  })
++
++  it('stands in only for the names /usr/bin already provides', () => {
++    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'dev-shims-')))
++    try {
++      // Stand-in developer and shim directories; the developer one must sit
++      // under a tree the profile reads, so it is checked through a real path.
++      const shimDir = path.join(root, 'usr-bin')
++      fs.mkdirSync(shimDir)
++      for (const name of ['git', 'python3', 'ls']) fs.writeFileSync(path.join(shimDir, name), '')
++      const dir = path.join(root, 'developer-shims')
++      // Outside every readable root (a temp dir): refused, nothing created.
++      const developerBin = path.join(root, 'clt-bin')
++      fs.mkdirSync(developerBin)
++      for (const name of ['git', 'python3', 'clang-format']) {
++        fs.writeFileSync(path.join(developerBin, name), '#!/bin/sh\n', { mode: 0o755 })
++      }
++      expect(
++        linkDeveloperShims({ dir, developerGit: path.join(developerBin, 'git'), shimDir }),
++      ).toBeNull()
++      expect(linkDeveloperShims({ dir, developerGit: null, shimDir })).toBeNull()
++      expect(fs.existsSync(dir)).toBe(false)
++      // The real Command Line Tools, where this Mac has them.
++      const clt = findXcodeDeveloperGit()
++      if (process.platform !== 'darwin' || !clt?.startsWith('/Library/')) return
++      expect(linkDeveloperShims({ dir, developerGit: clt, shimDir })).toBe(dir)
++      const linked = fs.readdirSync(dir).sort()
++      // Only names both hold: `ls` has no developer twin, and CLT-only names
++      // are never made visible.
++      expect(linked).toEqual(['git', 'python3'].filter((n) => fs.existsSync(path.join(path.dirname(clt), n))))
++      // An exec by absolute path, not a link: git finds its install from it.
++      expect(fs.lstatSync(path.join(dir, 'git')).isSymbolicLink()).toBe(false)
++      expect(fs.readFileSync(path.join(dir, 'git'), 'utf8')).toBe(
++        `#!/bin/sh\nexec '${path.join(path.dirname(fs.realpathSync(clt)), 'git')}' "$@"\n`,
++      )
++      // Recreated from scratch: a planted entry does not survive.
++      fs.writeFileSync(path.join(dir, 'planted'), '')
++      linkDeveloperShims({ dir, developerGit: clt, shimDir })
++      expect(fs.existsSync(path.join(dir, 'planted'))).toBe(false)
++    } finally {
++      fs.rmSync(root, { recursive: true, force: true })
++    }
++  })
++})
++
++/**
++ * The developer directory's git on THIS Mac, when the profile can read it.
++ * Where it cannot (a full Xcode under /Applications and nothing else), the
++ * resolver deliberately does not help, so these tests have nothing to prove.
++ */
++const HOST_DEVELOPER_GIT =
++  process.platform === 'darwin' ? findXcodeDeveloperGit() : null
++const shimIt = it.skipIf(
++  !CONTAINMENT_USABLE ||
++    process.platform !== 'darwin' ||
++    !HOST_DEVELOPER_GIT?.startsWith('/Library/'),
++)
++
++/** Every string the shim, or xcrun behind it, prints when it runs in the sandbox. */
++function expectNoShim(err: string): void {
++  expect(err).not.toContain('xcode-select')
++  expect(err).not.toContain('requesting install')
++  expect(err).not.toContain('xcrun')
++  expect(err).not.toContain('Operation not permitted')
++}
++
++describe('sponsored git on the PATH a Finder-launched Desktop hands the run', () => {
++  shimIt(
++    'runs a real git, and commits, with /usr/bin first on PATH',
++    async () => {
++      const { root, runtime, parent } = workspace()
++      try {
++        const { exitCode, out, err } = await runInSandbox(
++          { workspaceRoot: root, runtimeDir: runtime },
++          root,
++          [
++            'set -e',
++            'command -v git',
++            // Where git thinks it is installed: Apple's git derives it from the
++            // path it was started by, and a wrong answer falls back to
++            // /Applications/Xcode.app, which the profile cannot read.
++            'git --exec-path',
++            // Not only git: every other /usr/bin shim runs through a stand-in.
++            'make --version > /dev/null',
++            'git init -q .',
++            'echo sponsored-change > CHANGED.md',
++            'git add CHANGED.md',
++            'git -c user.email=sponsored@example.invalid -c user.name="Sponsored Run" commit -q -m "sponsored change" --no-verify',
++            'git log --oneline -1 --format=%s',
++          ].join('\n'),
++          FINDER_PATH,
++        )
++        expectNoShim(err)
++        expect(exitCode).toBe(0)
++        // Found through the per-run stand-in for the shim, which starts the
++        // developer git by its own path, so git finds its own install.
++        const [found, execPath] = out.split('\n')
++        expect(found).toBe(path.join(runtime, 'developer-shims', 'git'))
++        expect(execPath).toBe(
++          path.join(
++            path.dirname(path.dirname(fs.realpathSync(HOST_DEVELOPER_GIT!))),
++            'libexec',
++            'git-core',
++          ),
++        )
++        expect(out).toContain('sponsored change')
++      } finally {
++        fs.rmSync(parent, { recursive: true, force: true })
++      }
++    },
++  )
++
++  shimIt(
++    "commits in a linked worktree, and it lands in the user's repository",
++    async () => {
++      const layout = desktopLayout()
++      try {
++        const { exitCode, out, err } = await runInSandbox(
++          {
++            workspaceRoot: layout.worktree,
++            runtimeDir: layout.runtime,
++            linkedWorktree: layout.linkedWorktree,
++          },
++          layout.worktree,
++          COMMIT_SCRIPT,
++          FINDER_PATH,
++        )
++        expectNoShim(err)
++        expect(exitCode).toBe(0)
++        expect(out).toContain('sponsored change')
++        const tip = spawnSync(
++          'git',
++          ['-C', layout.project, 'log', '--oneline', '-1', layout.branch],
++          { encoding: 'utf8' },
++        )
++        expect(tip.stdout).toContain('sponsored change')
++      } finally {
++        fs.rmSync(layout.parent, { recursive: true, force: true })
++      }
++    },
++  )
++
++  shimIt(
++    "runs the orchestrator's git even when its PATH entry is unreadable inside the sandbox",
++    async () => {
++      // agentic:e2e's shape: a shim dir under the temp dir, symlinking the
++      // host's git. The sandbox cannot `stat` it, so before the fix the run
++      // got `/usr/bin/git` instead.
++      // The host's own git when it is a readable, non-shim one (Homebrew, on
++      // a developer Mac), so the assertion can tell "followed the symlink"
++      // from "fell through to the developer git"; else the developer git.
++      const hostFirst = spawnSync('bash', ['-c', 'command -v git'], {
++        encoding: 'utf8',
++      }).stdout.trim()
++      const hostReal = hostFirst ? fs.realpathSync(hostFirst) : ''
++      const target = /^\/(opt|usr\/local)\//.test(hostReal)
++        ? hostReal
++        : fs.realpathSync(HOST_DEVELOPER_GIT!)
++      const { root, runtime, parent } = workspace()
++      const shims = path.join(parent, 'shims')
++      fs.mkdirSync(shims)
++      fs.symlinkSync(target, path.join(shims, 'git'))
++      try {
++        const { exitCode, out, err } = await runInSandbox(
++          { workspaceRoot: root, runtimeDir: runtime },
++          root,
++          [
++            'set -e',
++            'command -v git',
++            'git --version',
++            'git init -q .',
++            'echo x > A.md',
++            'git add A.md',
++            'git -c user.email=s@example.invalid -c user.name=S commit -q -m c --no-verify',
++          ].join('\n'),
++          `${shims}:${FINDER_PATH}`,
++        )
++        expectNoShim(err)
++        expect(exitCode).toBe(0)
++        const [resolved, version] = out.split('\n')
++        expect(resolved).toBe(target)
++        expect(version).toBe(
++          spawnSync(target, ['--version'], { encoding: 'utf8' }).stdout.trim(),
++        )
++      } finally {
++        fs.rmSync(parent, { recursive: true, force: true })
++      }
++    },
++  )
++
++  it('is a PATH change, not a grant: the profile never names the data link', () => {
++    const profile = sponsoredMacProfile(['/tmp/w', '/tmp/r'], [])
++    expect(profile).not.toContain('developer_dir')
++    expect(profile).not.toContain('xcode_select_link')
++    expect(profile).not.toContain('/Applications')
++  })
++})
++
+ // ------------------------------------------- /bin/sh's selector, and its noise
+ 
+ describe('the shell selector is readable, and nothing around it is', () => {
+   containedIt('a plain command prints nothing on stderr', async () => {
+     // `/bin/sh` reads `/private/var/select/sh` at startup. Ungranted, that emits
+     //   Error opening /private/var/select/sh: Operation not permitted
+     // on stderr BEFORE the command runs -- and in a sponsored run stderr is tool
+     // output, so every single command handed the model a fake error. Driven
+     // through `sh` on purpose: `bash` never reads the selector and would pass
+     // whether or not the grant exists.
+     const { root, runtime, parent } = workspace()
+     try {
+       const handle = createSponsoredTerminalBroker({
+         workspaceRoot: root,
+         runtimeDir: runtime,
+       }).start({
+         executable: 'sh',
+         args: ['-c', 'echo ok'],
+         cwd: root,
+         env: process.env,
+       })
+       const stdout = drain(handle.stdout)
+       const stderr = drain(handle.stderr)
+       await handle.completion
+       const [out, err] = await Promise.all([stdout, stderr])
+@@ -1178,48 +1571,54 @@ describe('the shell selector is readable, and nothing around it is', () => {
+       fs.rmSync(parent, { recursive: true, force: true })
+     }
+   })
+ 
+   containedIt(
+     'grants the one link and not the directory it sits in',
+     async () => {
+       // The grant must stay a readlink on one symlink whose target is already
+       // readable through `(subpath "/bin")`. If it ever becomes a subpath of
+       // `/var/select` or of `/private/var`, these stop failing.
+       const { root, runtime, parent } = workspace()
+       try {
+         const handle = createSponsoredTerminalBroker({
+           workspaceRoot: root,
+           runtimeDir: runtime,
+         }).start({
+           executable: 'bash',
+           args: [
+             '-c',
+             [
+               'ls /var >/dev/null 2>&1 || echo "var:denied"',
+               'ls /private/var >/dev/null 2>&1 || echo "private-var:denied"',
+               'ls /var/select >/dev/null 2>&1 || echo "select:denied"',
+               'cat /var/run/resolv.conf >/dev/null 2>&1 || echo "resolv:denied"',
+               'cat /var/select/developer_dir >/dev/null 2>&1 || echo "xcode:denied"',
++              // `cat` fails on the directory the link names whether or not the
++              // link is readable; `readlink` is the call the shim makes, and it
++              // stays refused -- git works through `sponsoredMacGitPath`, not
++              // through a grant here.
++              'readlink /var/select/developer_dir >/dev/null 2>&1 || echo "xcode-link:denied"',
+             ].join('\n'),
+           ],
+           cwd: root,
+           env: process.env,
+         })
+         const stdout = drain(handle.stdout)
+         await handle.completion
+         const out = await stdout
+         for (const marker of [
+           'var:denied',
+           'private-var:denied',
+           'select:denied',
+           'resolv:denied',
+           'xcode:denied',
++          'xcode-link:denied',
+         ]) {
+           expect(out).toContain(marker)
+         }
+       } finally {
+         fs.rmSync(parent, { recursive: true, force: true })
+       }
+     },
+   )
+ })
+diff --git a/sdk/src/tools/sponsored-sandbox.ts b/sdk/src/tools/sponsored-sandbox.ts
+index e91a304dd..6e0ce234e 100644
+--- a/sdk/src/tools/sponsored-sandbox.ts
++++ b/sdk/src/tools/sponsored-sandbox.ts
+@@ -829,52 +829,52 @@ function canonicalFile(target: string): string {
+  * abort actually requires.
+  */
+ function traversableAncestors(targets: string[]): string[] {
+   const ancestors = new Set(['/'])
+   for (const target of targets) {
+     let current = path.dirname(target)
+     while (current !== path.dirname(current)) {
+       ancestors.add(current)
+       current = path.dirname(current)
+     }
+   }
+   return [...ancestors]
+ }
+ 
+ /**
+  * The device nodes a normal toolchain must be able to WRITE, and nothing more.
+  *
+  * `/dev` is in the readable set, and readable is not enough: every git binary
+  * opens `/dev/null` for reading AND writing at startup, so with `file-write*`
+  * granted only to the worktree and the runtime directory, `git --version`
+  * itself dies with
+  *
+  *   fatal: could not open '/dev/null' for reading and writing: Operation not permitted
+  *
+  * That is machine-independent — reproduced on Homebrew git 2.55.0, so it is
+- * not the `/var/select/developer_dir` Xcode-shim failure §9 already describes
+- * — and it put `committed`, `landed` and the pull request out of reach on
++ * not the xcode-select shim failure {@link sponsoredMacGitPath} closes — and
++ * it put `committed`, `landed` and the pull request out of reach on
+  * every Mac. Nothing caught it, because a shell redirect into the worktree,
+  * which is what the acceptance tests run, needs no device node.
+  *
+  * NOT `(subpath "/dev")`. `/dev` holds `bpf*` (packet capture), `disk*` (the
+  * raw block devices) and `auditpipe`; unix permissions are what keep those out
+  * of reach, and a blanket write grant would leave nothing else in the way the
+  * day one of them is group-writable. Each entry below was MEASURED to be
+  * needed, and the candidates that were measured and are NOT needed are listed
+  * with their reasons so the next person does not re-derive them.
+  *
+  * Measured on macOS 26.5 (Darwin 25.5) by ablation: grant the candidate set,
+  * run a real `git init` / `add` / `commit` / `log` through the shipped broker,
+  * then drop one node at a time and see what breaks.
+  *
+  *  - `/dev/null` — REQUIRED. Dropping it is the blocker above.
+  *  - `/dev/fd` — GRANTED as a subpath, and the only subpath here.
+  *    `/dev/stdout` and `/dev/stderr` are SYMLINKS to `/dev/fd/1` and
+  *    `/dev/fd/2`, and seatbelt matches the path the kernel resolves, so a
+  *    `(literal "/dev/stdout")` grant is inert: measured, with `/dev/null`,
+  *    `/dev/stdout` and `/dev/stderr` all granted as literals, `echo hi >
+  *    /dev/stdout` is still `Operation not permitted`, and it succeeds the
+  *    moment `/dev/fd` is granted instead. `> /dev/stderr` and `tee
+  *    /dev/stderr` are ordinary shell-script spellings; a build that uses one
+  *    should not die inside a sponsored run.
+  *
+@@ -934,58 +934,346 @@ const SPONSORED_RESOLVER_READ_LITERALS: readonly string[] = ['/var']
+ /**
+  * macOS's shell selector, which `/bin/sh` reads at startup.
+  *
+  * NOISE, not containment — and noise is not free here. Without this literal
+  * EVERY command in a sponsored run prints
+  *
+  *     Error opening /private/var/select/sh: Operation not permitted
+  *
+  * on stderr before doing anything, and that stderr is tool output: it reaches
+  * the MODEL, on every command, in a run whose whole premise is a bounded change
+  * an advertiser wrote. A constant fake error in front of every result is how a
+  * run learns to read past its own errors. Measured on macOS 26.5 against the
+  * shipped profile: `/bin/sh -c 'echo hi'` emits it, `/bin/bash -c 'echo hi'`
+  * does not — so it is `/bin/sh` resolving which shell to be, not the command.
+  *
+  * The same shape as the `/var` literal above, a readlink-only grant on a
+  * symlink, and it discloses NOTHING new: `/private/var/select/sh` resolves to
+  * `/bin/bash`, which `(subpath "/bin")` already makes readable. Measured with
+  * it in place, `ls /var`, `ls /private/var`, `ls /var/select` and `cat
+  * /var/run/resolv.conf` are all still `Operation not permitted`.
+  *
+  * Chosen over filtering the line out of stderr, which would have been the other
+  * way to silence it: a broker that edits a run's error output is a broker that
+  * can hide a real one.
+  *
+- * NOT the Xcode shim. `/var/select/developer_dir` is a different file and a
+- * different failure — a Mac with no full Xcode cannot run `/usr/bin/git` under
+- * this profile at all — and it is deliberately still not granted.
++ * NOT the Xcode shim. `/var/select/developer_dir`, beside it, is what
++ * `/usr/bin/git` reads, and it is still not granted: git works here because
++ * {@link sponsoredMacGitPath} hands the run a real git that never reads it.
+  */
+ const SPONSORED_SHELL_SELECT_READ_LITERALS: readonly string[] = [
+   '/private/var/select/sh',
+ ]
+ 
++/**
++ * The system trees the macOS profile makes readable, ahead of the run's own
++ * roots. Named so {@link sponsoredMacGitPath} asks "can the sandbox run this
++ * binary?" of the SAME list the profile grants, rather than of a copy.
++ */
++const SPONSORED_MAC_SYSTEM_READ_SUBPATHS: readonly string[] = [
++  '/System',
++  '/usr',
++  '/bin',
++  '/sbin',
++  '/Library',
++  '/opt',
++  '/etc',
++  '/private/etc',
++  '/private/var/db',
++  '/dev',
++]
++
++/** Apple's `/usr/bin/git`: an xcode-select shim, not git. */
++const XCODE_SELECT_GIT_SHIM = '/usr/bin/git'
++
++/** Where the xcode-select shims live: `git`, `python3`, `make`, `clang`, ... */
++const XCODE_SELECT_SHIM_DIR = '/usr/bin'
++
++/**
++ * Where xcode-select records the active developer directory: the link macOS
++ * 26 reads, then the older one. Read HERE, outside the sandbox, where both are
++ * readable; the developer directory's git is `<dir>/usr/bin/git` for the
++ * Command Line Tools and for a full Xcode alike.
++ */
++const XCODE_SELECT_DEVELOPER_DIR_LINKS: readonly string[] = [
++  '/var/select/developer_dir',
++  '/var/db/xcode_select_link',
++]
++
++export interface SponsoredMacGitDependencies {
++  /** A regular file this process may execute, following symlinks. */
++  isExecutableFile: (pathname: string) => boolean
++  /** The canonical path, or null when it does not resolve. */
++  realpath: (pathname: string) => string | null
++  /**
++   * The active developer directory's git, asked OUTSIDE the sandbox, or null
++   * when there are no developer tools. Called at most once per resolution,
++   * and only when the shim is what PATH would run.
++   */
++  developerGit: () => string | null
++  /**
++   * A directory the sandbox reads holding a stand-in, for every xcode-select
++   * shim in `/usr/bin`, that execs the binary that shim runs ({@link linkDeveloperShims}),
++   * or null. Asked only when PATH has `/usr/bin`.
++   */
++  developerShims?: () => string | null
++}
++
++function underSystemReadRoot(target: string): boolean {
++  return SPONSORED_MAC_SYSTEM_READ_SUBPATHS.some((root) =>
++    target.startsWith(`${root}/`),
++  )
++}
++
++/**
++ * The PATH a contained macOS shell runs with: the caller's, with the directory
++ * of a REAL git put ahead of the first entry that holds any git.
++ *
++ * ## Why git needed resolving at all
++ *
++ * `/usr/bin/git` is not git. It is Apple's xcode-select shim: it reads the
++ * active developer directory from the `/var/select/developer_dir` link and
++ * execs the git inside it. The profile does not grant that link, so under the
++ * sandbox the shim dies before git starts —
++ *
++ *     xcode-select: error: unable to read data link at '/var/select/developer_dir', expected symbolic link (Operation not permitted)
++ *     xcode-select: note: No developer tools were found, requesting install.
++ *
++ * — and the second line is not only text: it opens macOS's "Install Command
++ * Line Developer Tools" dialog on the user's screen, from inside a sponsored
++ * run, on a Mac that has them installed. Measured on macOS 26.4.1 with only
++ * the Command Line Tools, through this broker.
++ *
++ * And the shim is what a sponsored shell found. `runTerminalCommand` hands the
++ * broker the orchestrator's own PATH, and the scrub keeps it verbatim. A
++ * Finder-launched Desktop starts from launchd's `/usr/bin:/bin:/usr/sbin:/sbin`,
++ * and its login-shell repair (`freebuff-desktop/electron/shell-path.cjs`)
++ * APPENDS, so `/usr/bin` precedes Homebrew and `git` is the shim. Where another
++ * git does come first the sandbox may still not see it: an entry outside the
++ * readable set (anything under HOME, or the temp dir) fails `stat` with
++ * `Operation not permitted` inside the profile, and bash moves on to
++ * `/usr/bin`. Either way `git commit` failed and the run ended "finished
++ * without committing anything".
++ *
++ * ## What this does instead
++ *
++ * Resolves git HERE, unsandboxed, and changes what the NAME means rather than
++ * what the sandbox may read:
++ *
++ *  0. right before `/usr/bin`, put stand-ins for its shims
++ *     ({@link linkDeveloperShims}): each execs the binary it would run, so
++ *     `python3`, `make` and `clang` work too, whichever git wins below;
++ *  1. walk PATH the way the orchestrator's own shell does; the first `git`,
++ *     through its symlinks, is the git the user's own commands run;
++ *  2. if that is the shim, ask the developer directory for its git
++ *     ({@link findXcodeDeveloperGit}, which reads the link) — outside the
++ *     sandbox the link reads fine;
++ *  3. keep it only if it is under a tree the profile ALREADY reads (the
++ *     Command Line Tools live under `/Library`, Homebrew under `/opt`),
++ *     otherwise keep walking. A git under HOME, or a full Xcode under
++ *     `/Applications`, is passed over, never granted;
++ *  4. put its directory ahead of the first PATH entry holding any git, so
++ *     neither the shim nor an unreadable entry can win inside the run.
++ *
++ * The profile is unchanged by this: no read grant, no write grant, no new
++ * environment variable. PATH is not a boundary — the run can already exec
++ * any binary the profile reads — so choosing which one `git` names moves
++ * nothing the sandbox decides. A grant on the data link was measured and
++ * rejected; `docs/freebuff-sponsored-local-execution.md` §9 has why.
++ *
++ * What else moves, measured on the Command Line Tools: the stand-ins re-resolve
++ * the 77 names both directories hold, and every one of them is an
++ * xcode-select shim in `/usr/bin`, so each now runs the binary its shim would
++ * have run. The 66 names only the Command Line Tools ship (`swift-*`,
++ * `llvm-*`, `clang-format`, …) are NOT linked, so none of them shadows a copy
++ * later on PATH. For Homebrew the inserted directory is the keg's own `bin`,
++ * which holds git's family and nothing else.
++ *
++ * No readable real git anywhere leaves PATH exactly as it was, so the run
++ * fails the way it did before, and its commit error reaches
++ * `diagnostic_reason`. Linux never comes here: `/usr/bin/git` is git there.
++ */
++export function sponsoredMacGitPath(
++  pathValue: string | undefined,
++  dependencies: SponsoredMacGitDependencies,
++): string | undefined {
++  if (!pathValue) return pathValue
++  let entries = pathValue.split(':')
++  // Every shim, not only `git`: `python3`, `make` and `clang` in `/usr/bin`
++  // fail the same way inside the run (and request the same install), and
++  // stand-ins for exactly those names, right where they were, resolve them
++  // without making any name visible that `/usr/bin` did not already provide.
++  const shimAt = entries.indexOf(XCODE_SELECT_SHIM_DIR)
++  const shims = shimAt === -1 ? null : (dependencies.developerShims?.() ?? null)
++  if (shims) entries = [...entries.slice(0, shimAt), shims, ...entries.slice(shimAt)]
++  let developerGit: string | null | undefined
++  const resolveDeveloperGit = (): string | null => {
++    if (developerGit !== undefined) return developerGit
++    const found = dependencies.developerGit()
++    developerGit =
++      found && path.isAbsolute(found) && dependencies.isExecutableFile(found)
++        ? dependencies.realpath(found)
++        : null
++    return developerGit
++  }
++  let firstGit = -1
++  for (let index = 0; index < entries.length; index++) {
++    const entry = entries[index]!
++    // A relative entry is relative to the cwd, which inside the run is the
++    // advertiser-writable worktree. Never resolved, so never chosen.
++    if (!path.isAbsolute(entry)) continue
++    // Nothing ahead of the stand-ins held a git the sandbox can run, and
++    // theirs is the developer git.
++    if (entry === shims) return entries.join(':')
++    const candidate = path.join(entry, 'git')
++    if (!dependencies.isExecutableFile(candidate)) continue
++    if (firstGit === -1) firstGit = index
++    let real = dependencies.realpath(candidate)
++    if (real === XCODE_SELECT_GIT_SHIM) real = resolveDeveloperGit()
++    if (!real || real === XCODE_SELECT_GIT_SHIM || !underSystemReadRoot(real)) {
++      continue
++    }
++    const binDir = path.dirname(real)
++    if (entries[firstGit] === binDir) return entries.join(':')
++    return [
++      ...entries.slice(0, firstGit),
++      binDir,
++      ...entries.slice(firstGit),
++    ].join(':')
++  }
++  return entries.join(':')
++}
++
++/**
++ * Fill `dir` with a stand-in, for every name both `/usr/bin` and the developer
++ * directory's `bin` hold, that execs the developer binary: on the Command Line
++ * Tools every such `/usr/bin` name is an xcode-select shim (77 of them,
++ * measured on macOS 26.4.1), so each stand-in runs the binary its shim would
++ * have run. Names only the developer directory ships are NOT added, so nothing
++ * new becomes visible on PATH.
++ *
++ * A two-line `exec` script and not a symlink: Apple's git finds its own
++ * install (`libexec/git-core`, `share/git-core`) from the path it was started
++ * by, and started through a link in `dir` it cannot, falls back to
++ * `/Applications/Xcode.app/Contents/Developer/usr`, and there `git init` dies
++ * reading a gitconfig the profile denies (measured on a macOS 15 runner with
++ * Xcode installed and the Command Line Tools selected). `exec` by absolute
++ * path hands every tool its real path, as the shim's own exec does.
++ *
++ * Recreated from scratch on every call: `dir` is inside the run's writable
++ * runtime directory. Only a developer directory the profile already reads
++ * qualifies (a full Xcode under /Applications does not); otherwise null.
++ */
++export function linkDeveloperShims(options: {
++  dir: string
++  developerGit: string | null
++  shimDir?: string
++}): string | null {
++  const shimDir = options.shimDir ?? XCODE_SELECT_SHIM_DIR
++  if (!options.developerGit) return null
++  let developerBin: string
++  try {
++    developerBin = path.dirname(fs.realpathSync(options.developerGit))
++  } catch {
++    return null
++  }
++  if (!underSystemReadRoot(developerBin)) return null
++  try {
++    const shims = new Set(fs.readdirSync(shimDir))
++    fs.rmSync(options.dir, { recursive: true, force: true })
++    fs.mkdirSync(options.dir, { recursive: true })
++    for (const name of fs.readdirSync(developerBin)) {
++      if (!shims.has(name)) continue
++      const target = path.join(developerBin, name)
++      if (!isExecutableFile(target)) continue
++      fs.writeFileSync(
++        path.join(options.dir, name),
++        `#!/bin/sh\nexec '${target.replaceAll("'", `'\\''`)}' "$@"\n`,
++        { mode: 0o755 },
++      )
++    }
++    return options.dir
++  } catch {
++    return null
++  }
++}
++
++/**
++ * The active developer directory's git, read outside the sandbox.
++ *
++ * The same answer the shim itself reaches -- the developer directory the link
++ * names, then its `usr/bin/git` -- without spawning anything: no `xcrun` to
++ * block the orchestrator, and on a Mac with no developer tools nothing that
++ * could request an install (the dialog above). Never throws; a null only
++ * means "no better git than before".
++ */
++export function findXcodeDeveloperGit(
++  dependencies: {
++    readlink: (pathname: string) => string | null
++    isExecutableFile: (pathname: string) => boolean
++  } = { readlink: readDeveloperDirLink, isExecutableFile },
++): string | null {
++  for (const link of XCODE_SELECT_DEVELOPER_DIR_LINKS) {
++    const developerDir = dependencies.readlink(link)
++    if (!developerDir || !path.isAbsolute(developerDir)) continue
++    const git = path.join(developerDir, 'usr', 'bin', 'git')
++    return dependencies.isExecutableFile(git) ? git : null
++  }
++  return null
++}
++
++function readDeveloperDirLink(link: string): string | null {
++  try {
++    return path.resolve(path.dirname(link), fs.readlinkSync(link))
++  } catch {
++    return null
++  }
++}
++
++function isExecutableFile(pathname: string): boolean {
++  try {
++    if (!fs.statSync(pathname).isFile()) return false
++    fs.accessSync(pathname, fs.constants.X_OK)
++    return true
++  } catch {
++    return false
++  }
++}
++
++/** The host side of {@link sponsoredMacGitPath}, as the broker uses it. */
++const SPONSORED_MAC_GIT_HOST: SponsoredMacGitDependencies = {
++  isExecutableFile,
++  realpath: (pathname) => {
++    try {
++      return fs.realpathSync(pathname)
++    } catch {
++      return null
++    }
++  },
++  developerGit: () => findXcodeDeveloperGit(),
++}
++
+ /**
+  * What a linked worktree's git needs from the USER'S REAL `.git`, and nothing more.
+  *
+  * ## Why this is an enumeration and not `<project>/.git`
+  *
+  * Granting write to the common dir would hand an advertiser-authored run
+  * `.git/hooks/*` — arbitrary code execution as the user on their next git
+  * operation, in a directory that never appears in the pull request they review
+  * — and `.git/config`, which is arbitrary command execution through
+  * `core.pager`, `core.editor`, `diff.external`, `core.fsmonitor` and aliases,
+  * every one of them fired by the ORCHESTRATOR's own unsandboxed `git -C
+  * <worktree>` calls. That is a worse hole than the one it fixes.
+  *
+  * So: READ the common dir, WRITE four subtrees and one lock file. Measured on
+  * macOS 26.5 (Darwin 25.5) against a real `<project>/.git` with its refs
+  * PACKED (`git pack-refs --all`), which is the harder and more realistic case:
+  *
+  *  - `worktrees/<name>` — this worktree's own admin dir: `index`, `HEAD`,
+  *    `index.lock`, `COMMIT_EDITMSG`, `logs/HEAD`. REQUIRED; it is where the
+  *    commit is actually assembled. Scoped to THIS worktree's directory, not to
+  *    `worktrees/`, so one sponsored run cannot reach another's index.
+  *  - `objects` — the new commit, tree and blob objects. REQUIRED, and the one
+  *    grant here that is genuinely wide; see the honest limit below.
+  *  - `refs/heads/<branchNamespace>` — the branch tip. Scoped to the app's own
+  *    namespace, so `refs/heads/main` is NOT writable: measured, `echo x >
+@@ -1058,60 +1346,51 @@ export function sponsoredLinkedWorktreeGrants(
+ /**
+  * The paths under a common dir that must NEVER be writable, whatever else is.
+  *
+  * Exported so the test asserts the SAME list the reasoning above names, rather
+  * than a list a test author remembered. It is not consulted when building the
+  * profile — the grant is an allowlist and these are simply absent from it —
+  * which is the point: this is the invariant, not the mechanism.
+  */
+ export const SPONSORED_GIT_FORBIDDEN_WRITES: readonly string[] = [
+   'hooks',
+   'config',
+   'config.worktree',
+   'info',
+   'packed-refs',
+ ]
+ 
+ export function sponsoredMacProfile(
+   writeRoots: string[],
+   additionalReadRoots: string[],
+   writeLiterals: string[] = [],
+ ): string {
+   const q = JSON.stringify
+   const writable = writeRoots.map(canonicalRoot)
+   const extraRoots = additionalReadRoots.map(canonicalRoot)
+   const readable = [
+-    '/System',
+-    '/usr',
+-    '/bin',
+-    '/sbin',
+-    '/Library',
+-    '/opt',
+-    '/etc',
+-    '/private/etc',
+-    '/private/var/db',
+-    '/dev',
++    ...SPONSORED_MAC_SYSTEM_READ_SUBPATHS,
+     ...writable,
+     ...extraRoots,
+   ]
+   // Both spellings of each root contribute ancestors: the child still reaches
+   // its workspace through the symlinked path it was handed.
+   const traversable = traversableAncestors([
+     ...readable,
+     ...writeRoots,
+     ...additionalReadRoots,
+   ])
+   return [
+     '(version 1)',
+     '(deny default)',
+     // NARROWER THAN `(allow process*)`, which is what this was. `process*`
+     // also grants `process-info*`, and the run has no business inspecting
+     // anything but itself.
+     //
+     // Measured on macOS 26.5, because seatbelt vocabulary is not something to
+     // reason about from the manual:
+     //
+     //  - a blanket `(deny process-info*)` KILLS THE PROCESS at start. dyld
+     //    needs process-info on self, so the deny must carry
+     //    `(target others)` and the allow must carry `(target self)`.
+     //  - the deny does NOT currently stop `proc_listpids`/`proc_pidpath`
+     //    against another process — enumeration and executable paths are still
+@@ -1402,54 +1681,76 @@ function spawnLinux(
+ }
+ 
+ /**
+  * The broker a sponsored local run passes to `runTerminalCommand`.
+  *
+  * Note what it does to the env it is handed: it DISCARDS it and builds its
+  * own. `runTerminalCommand` merges `getSystemProcessEnv()` into every request
+  * before it reaches a broker, so a caller that only passed a scrubbed `env`
+  * would still hand the child the user's whole environment. Scrubbing here, at
+  * the last point before the spawn, is what makes that impossible to get wrong
+  * from the outside.
+  */
+ export function createSponsoredTerminalBroker(
+   options: SponsoredSandboxOptions,
+ ): TerminalCommandBroker {
+   const workspaceRoot = path.resolve(options.workspaceRoot)
+   const runtimeDir = path.resolve(options.runtimeDir)
+   const additionalReadRoots = (options.additionalReadRoots ?? []).map((item) =>
+     path.resolve(item),
+   )
+   const platform = options.platform ?? process.platform
+   const linkedWorktree = options.linkedWorktree
+   const scrubEnv = options.scrubEnv ?? scrubSponsoredLocalEnv
+   const home = path.join(runtimeDir, 'home')
+   const tmp = path.join(runtimeDir, 'tmp')
++  // macOS only: which git the run's `git` names, resolved once per PATH so
++  // the unsandboxed `xcrun` is asked at most once per broker. See
++  // `sponsoredMacGitPath`.
++  const macRunPaths = new Map<string, string | undefined>()
++  const macGitHost: SponsoredMacGitDependencies = {
++    ...SPONSORED_MAC_GIT_HOST,
++    developerShims: () =>
++      linkDeveloperShims({
++        dir: path.join(runtimeDir, 'developer-shims'),
++        developerGit: findXcodeDeveloperGit(),
++      }),
++  }
++  const macRunPath = (value: string | undefined): string | undefined => {
++    if (value === undefined) return value
++    if (!macRunPaths.has(value)) {
++      macRunPaths.set(value, sponsoredMacGitPath(value, macGitHost))
++    }
++    return macRunPaths.get(value)
++  }
+ 
+   return {
+     start(request) {
+       assertSponsoredCommandCwd(workspaceRoot, request.cwd)
+       fs.mkdirSync(home, { recursive: true })
+       fs.mkdirSync(tmp, { recursive: true })
+       const env = scrubEnv(request.env, { home, tmp }) as NodeJS.ProcessEnv
++      if (platform === 'darwin' && env.PATH !== undefined) {
++        env.PATH = macRunPath(env.PATH)
++      }
+       // The linked worktree's grant, or nothing at all for a workspace that is
+       // its own repository. Computed per start rather than once in the closure
+       // because `packed-refs.lock` is canonicalised against a directory that
+       // has to exist, and the worktree is created before the first command but
+       // not necessarily before the broker.
+       const git = linkedWorktree
+         ? sponsoredLinkedWorktreeGrants(linkedWorktree)
+         : { readSubpaths: [], writeSubpaths: [], writeLiterals: [] }
+       const writeRoots = [workspaceRoot, runtimeDir, ...git.writeSubpaths]
+       const readRoots = [...additionalReadRoots, ...git.readSubpaths]
+       if (platform === 'darwin') {
+         return spawnMac(request, writeRoots, env, readRoots, git.writeLiterals)
+       }
+       if (platform === 'linux') {
+         return spawnLinux(request, writeRoots, env, readRoots, linkedWorktree)
+       }
+       throw new Error(
+         `A sponsored run cannot be contained on ${platform}, so it will not be started.`,
+       )
+     },
+   }
+ }
