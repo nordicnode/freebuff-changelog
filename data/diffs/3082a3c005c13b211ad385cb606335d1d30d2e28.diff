@@ -1,0 +1,1039 @@
+diff --git a/cli/release-core/launcher.js b/cli/release-core/launcher.js
+index fff0aec79..c8a1351ae 100644
+--- a/cli/release-core/launcher.js
++++ b/cli/release-core/launcher.js
+@@ -117,50 +117,53 @@ async function verifyFileSha256(filePath, expectedSha256) {
+ /**
+  * The checksum map published for a release, or null when the document does
+  * not carry one. Values are validated on use, not here.
+  */
+ function readBinaryChecksums(packageData) {
+   const checksums = packageData?.binaryChecksums
+   return checksums && typeof checksums === 'object' && !Array.isArray(checksums)
+     ? checksums
+     : null
+ }
+ 
+ function createLauncher(productConfig) {
+   const {
+     packageName,
+     displayName,
+     wrapperVersion = null,
+     // The `binaryChecksums` field of the wrapper's own package.json: sha256 per
+     // target for the archives of the release that shares its version. Reaches
+     // the launcher through npm, which is a separate trust root from the
+     // download origin.
+     binaryChecksums: ownBinaryChecksums = null,
+     includeTreeSitterWasm = true,
+     startupBanner = [],
+     telemetryEvent = 'cli.update_codebuff_failed',
+     telemetryProperties = {},
++    // Freebuff sessions remain open between turns. The launcher cannot know
++    // when a restart is safe, so keep the process alive until the user exits.
++    deferUpdatesUntilExit = false,
+     tempDownloadDirName = `.${packageName}-download-temp`,
+     // Tests only. os.homedir() ignores $HOME under `bun test`, so pointing HOME
+     // at a temp dir is not enough to keep a test off the real ~/.config.
+     configDir: configDirOverride = null,
+   } = productConfig
+ 
+   /**
+    * Terminal escape sequences to reset terminal state after the child process exits.
+    * When the binary is SIGKILL'd, it can't clean up its own terminal state.
+    * The wrapper (this process) survives and must reset these modes.
+    */
+   const EXIT_ALTERNATE_SCREEN_SEQUENCE = '\x1b[?1049l'
+   const SAFE_TERMINAL_RESET_SEQUENCES =
+     '\x1b[?1000l' + // Disable X10 mouse mode
+     '\x1b[?1002l' + // Disable button event mouse mode
+     '\x1b[?1003l' + // Disable any-event mouse mode (all motion)
+     '\x1b[?1006l' + // Disable SGR extended mouse mode
+     '\x1b[?1004l' + // Disable focus reporting
+     '\x1b[?2004l' + // Disable bracketed paste mode
+     '\x1b[<u' + // Pop kitty keyboard protocol flags
+     '\x1b[>4;0m' + // Reset modifyOtherKeys
+     '\x1b[?25h' // Show cursor
+ 
+   const FULL_TERMINAL_RESET_SEQUENCES =
+     EXIT_ALTERNATE_SCREEN_SEQUENCE + SAFE_TERMINAL_RESET_SEQUENCES
+@@ -245,59 +248,67 @@ function createLauncher(productConfig) {
+    * perfectly capable machine to the slower build.
+    */
+   function isStartupCpuFeatureCrash(code, signal, msAlive) {
+     return (
+       process.platform === 'win32' &&
+       getUnsignedExitCode(code) === 0xc0000409 &&
+       !signal &&
+       typeof msAlive === 'number' &&
+       msAlive < STARTUP_CRASH_WINDOW_MS
+     )
+   }
+ 
+   function createConfig(packageName) {
+     const homeDir = os.homedir()
+     const configDir =
+       configDirOverride || path.join(homeDir, '.config', 'manicode')
+     const binaryName =
+       process.platform === 'win32' ? `${packageName}.exe` : packageName
+ 
+     return {
+       homeDir,
+       configDir,
+       binaryName,
+       binaryPath: path.join(configDir, binaryName),
+       metadataPath: path.join(configDir, `${packageName}-metadata.json`),
+-      tempDownloadDir: path.join(configDir, tempDownloadDirName),
++      // A deferred download may wait here for an hour. Another invocation
++      // must not replace its staged binary (or delete it while downloading).
++      tempDownloadDir: path.join(
++        configDir,
++        deferUpdatesUntilExit
++          ? `${tempDownloadDirName}-${process.pid}`
++          : tempDownloadDirName,
++      ),
+       userAgent: `${packageName}-cli`,
+       requestTimeout: 20000,
+       downloadRequestTimeout: 120000,
+       downloadMaxAttempts: 3,
+     }
+   }
+ 
+   const CONFIG = createConfig(packageName)
++  const pendingUpdates = new WeakMap()
+   const { downloadFile, httpGet, withRetries } = createReleaseHttpClient({
+     env: process.env,
+     userAgent: CONFIG.userAgent,
+     requestTimeout: CONFIG.requestTimeout,
+   })
+ 
+   function getPostHogConfig() {
+     const apiKey =
+       process.env.CODEBUFF_POSTHOG_API_KEY ||
+       process.env.NEXT_PUBLIC_POSTHOG_API_KEY
+     const host =
+       process.env.CODEBUFF_POSTHOG_HOST ||
+       process.env.NEXT_PUBLIC_POSTHOG_HOST_URL
+ 
+     if (!apiKey || !host) {
+       return null
+     }
+ 
+     return { apiKey, host }
+   }
+ 
+   /**
+    * Track update failure event to PostHog.
+    * Fire-and-forget - errors are silently ignored.
+    */
+@@ -1063,100 +1074,105 @@ function createLauncher(productConfig) {
+ 
+     replacements.push({ backupPath, targetPath })
+   }
+ 
+   function rollbackReplacements(replacements) {
+     for (const { backupPath, targetPath } of replacements.reverse()) {
+       removeFileIfPresent(targetPath)
+       if (backupPath && fs.existsSync(backupPath)) {
+         fs.renameSync(backupPath, targetPath)
+       }
+     }
+   }
+ 
+   function commitReplacements(replacements) {
+     for (const { backupPath } of replacements) {
+       if (!backupPath) continue
+       try {
+         removeFileIfPresent(backupPath)
+       } catch {
+         // The replacement is already committed. A stale backup is safer than
+         // rolling back a working install because cleanup failed.
+       }
+     }
+   }
+ 
+-  function installStagedBinary({ tempBinaryPath, version, targetKey }) {
++  function installStagedBinary(
++    { tempBinaryPath, version, targetKey },
++    { quiet = false } = {},
++  ) {
+     const replacements = []
+     const metadataTempPath = `${CONFIG.metadataPath}.new.${process.pid}`
+ 
+     try {
+       fs.writeFileSync(
+         metadataTempPath,
+         JSON.stringify({ version, target: targetKey }, null, 2),
+       )
+       replaceFileWithRollback(tempBinaryPath, CONFIG.binaryPath, replacements)
+ 
+       // Move tree-sitter.wasm next to the binary if the tarball included
+       // it. The CLI binary loads this at startup; embedding it inside the
+       // binary itself was unreliable on Windows (bun --compile asset
+       // bundling silently dropped or unbound it across several attempts),
+       // so we ship it as a sibling file instead. Older artifacts that
+       // pre-date this change won't have the wasm and will still install —
+       // they'll just hit the same crash they had before, which is fine.
+       if (includeTreeSitterWasm) {
+         const tempWasmPath = path.join(
+           CONFIG.tempDownloadDir,
+           'tree-sitter.wasm',
+         )
+         if (fs.existsSync(tempWasmPath)) {
+           const targetWasmPath = path.join(
+             path.dirname(CONFIG.binaryPath),
+             'tree-sitter.wasm',
+           )
+           replaceFileWithRollback(tempWasmPath, targetWasmPath, replacements)
+         }
+       }
+ 
+       replaceFileWithRollback(
+         metadataTempPath,
+         CONFIG.metadataPath,
+         replacements,
+       )
+       commitReplacements(replacements)
+     } catch (error) {
+       rollbackReplacements(replacements)
+       throw error
+     } finally {
+       removeFileIfPresent(metadataTempPath)
+       if (fs.existsSync(CONFIG.tempDownloadDir)) {
+         fs.rmSync(CONFIG.tempDownloadDir, { recursive: true })
+       }
+     }
+ 
+-    term.clearLine()
+-    console.log(`Download complete! Starting ${displayName}...`)
++    if (!quiet) {
++      term.clearLine()
++      console.log(`Download complete! Starting ${displayName}...`)
++    }
+   }
+ 
+   async function downloadBinary(
+     version,
+     targetKey = getDownloadTargetKey(),
+     options = {},
+   ) {
+     const stagedBinary = await stageBinary(version, targetKey, options)
+     installStagedBinary(stagedBinary)
+   }
+ 
+   function getRequiredWrapperVersion(currentVersion) {
+     if (
+       !wrapperVersion ||
+       (currentVersion !== null &&
+         compareVersions(currentVersion, wrapperVersion) >= 0)
+     ) {
+       return null
+     }
+     return wrapperVersion
+   }
+ 
+   async function ensureBinaryReady() {
+     const currentVersion = getCurrentVersion()
+     const requiredWrapperVersion = getRequiredWrapperVersion(currentVersion)
+@@ -1218,123 +1234,172 @@ function createLauncher(productConfig) {
+       }
+       const fail = (error) => {
+         cleanup()
+         reject(error)
+       }
+ 
+       runningProcess.once('exit', handleExit)
+       forceKillTimer = setTimeout(() => {
+         forceKillTimeout = setTimeout(() => {
+           fail(new Error(`${packageName} did not exit after SIGKILL`))
+         }, 1000)
+         try {
+           runningProcess.kill('SIGKILL')
+         } catch (error) {
+           fail(error)
+         }
+       }, 5000)
+       try {
+         runningProcess.kill('SIGTERM')
+       } catch (error) {
+         fail(error)
+       }
+     })
+   }
+ 
+-  async function checkForUpdates(runningProcess, exitListener) {
++  async function checkForUpdates(
++    runningProcess,
++    exitListener,
++    fetchLatestRelease = getLatestRelease,
++  ) {
+     // main() schedules this 100ms after launch, so the binary it was handed can
+     // already be dead — a startup crash that handed off to the baseline
+     // fallback, most of all. Updating around a corpse would race that
+     // relaunch's download for the shared temp directory (prepareTempDownloadDir
+     // rmSyncs it) and then spend six seconds SIGKILLing a process that has
+     // already exited.
+     if (
+       runningProcess.exitCode !== null ||
+       runningProcess.signalCode !== null
+     ) {
+       return
+     }
+ 
+     let stoppedForUpdate = false
+ 
+     try {
+       const currentVersion = getCurrentVersion()
+ 
+-      const latestRelease = await getLatestRelease()
++      const latestRelease = await fetchLatestRelease()
+       const latestVersion = latestRelease?.version ?? null
+       if (!latestVersion) return
++      if (
++        runningProcess.exitCode !== null ||
++        runningProcess.signalCode !== null
++      )
++        return
+ 
+       if (
+         // Download new version if current version is unknown or outdated.
+         currentVersion === null ||
+         compareVersions(currentVersion, latestVersion) < 0
+       ) {
+         const stagedBinary = await stageBinary(
+           latestVersion,
+           getDownloadTargetKey(),
+           { quiet: true, binaryChecksums: latestRelease.binaryChecksums },
+         )
+ 
++        if (deferUpdatesUntilExit) {
++          // No signals, terminal output, or binary/WASM replacement while the
++          // CLI owns the session. Even an idle model picker can admit a session
++          // while the download is in flight. A download that loses the race
++          // with exit must not install into a fallback child's running files.
++          if (
++            runningProcess.exitCode === null &&
++            runningProcess.signalCode === null
++          )
++            pendingUpdates.set(runningProcess, stagedBinary)
++          return
++        }
++
+         term.clearLine()
+ 
+         runningProcess.removeListener('exit', exitListener)
+         try {
+           await stopRunningProcess(runningProcess)
+         } catch (error) {
+           runningProcess.on('exit', exitListener)
+           throw error
+         }
+         stoppedForUpdate = true
+ 
+         resetTerminal({ exitAlternateScreen: true })
+         console.log(`Update available: ${currentVersion} → ${latestVersion}`)
+ 
+         installStagedBinary(stagedBinary)
+ 
+         const newChild = spawnInstalledBinary({ detached: false })
+         attachExitHandler(newChild)
+ 
+         return new Promise(() => {})
+       }
+     } catch (error) {
+       if (stoppedForUpdate && fs.existsSync(CONFIG.binaryPath)) {
+         console.error(
+           `Update failed; restarting ${packageName} ${getCurrentVersion()}.`,
+         )
+         const child = spawnInstalledBinary({ detached: false })
+         attachExitHandler(child)
+         return new Promise(() => {})
+       }
+       try {
+         fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
+       } catch {
+         // Best effort after a failed background update.
+       }
+       // A staging failure leaves the current process and binary untouched.
+     }
+   }
+ 
++  function installPendingUpdate(child) {
++    const staged = pendingUpdates.get(child)
++    pendingUpdates.delete(child)
++    if (!staged) return
++
++    try {
++      // A second launcher may have installed a newer release while this
++      // session was open. Never roll its installation back on our exit.
++      const currentVersion = getCurrentVersion()
++      if (
++        currentVersion &&
++        compareVersions(currentVersion, staged.version) >= 0
++      ) {
++        fs.rmSync(CONFIG.tempDownloadDir, { recursive: true, force: true })
++        return
++      }
++      installStagedBinary(staged, { quiet: true })
++      console.log(
++        `Updated ${displayName} to ${staged.version}. Ready for your next launch.`,
++      )
++    } catch (error) {
++      // Installation rolls back on failure. Updating must not change the
++      // user's exit code or resurrect a CLI they just closed.
++      console.error(`Could not install ${displayName} update: ${error.message}`)
++    }
++  }
++
+   /**
+    * Make captured output safe to print back to the terminal.
+    *
+    * The tail is replayed *after* resetTerminal() has put the terminal back in
+    * order, so it must not be able to undo that: a stray \x1b[?1049h or
+    * \x1b[?1003h in what the binary printed would re-enter the alternate screen
+    * or re-enable mouse reporting, hiding the very report it is part of. Strip
+    * the escapes and keep the words.
+    */
+   function sanitizeForReplay(text) {
+     if (!text) return ''
+     return (
+       text
+         .replace(/\r\n?/g, '\n')
+         // CSI sequences — the ones that actually change terminal state.
+         .replace(/\x1b\[[0-9;:?<>=]*[ -/]*[@-~]/g, '')
+         // Everything else: strip the control bytes and keep the text. An OSC
+         // or a lone escape loses its introducer and degrades to inert
+         // characters, which is all a crash report needs it to be.
+         .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+         .replace(/\s+$/, '')
+     )
+   }
+ 
+   function printCrashDiagnostics(code, signal, context = {}) {
+@@ -1671,50 +1736,51 @@ function createLauncher(productConfig) {
+ 
+   function attachExitHandler(child, allowBaselineFallback = true) {
+     const exitListener = async (code, signal) => {
+       // A child we never watched (only reachable from a test) reports no age
+       // rather than a suspiciously young one: absent evidence must not be read
+       // as a startup crash and trigger a download.
+       const msAlive = child.launch ? child.launch.msAlive() : Infinity
+ 
+       let stderrTail = ''
+       if (child.launch && (isWindowsNativeCrashCode(code) || signal)) {
+         await child.launch.drained()
+         stderrTail = child.launch.stderrTail()
+       }
+ 
+       if (
+         allowBaselineFallback &&
+         (await tryFallbackToBaseline(code, signal, msAlive))
+       ) {
+         return
+       }
+ 
+       resetTerminal({
+         exitAlternateScreen: shouldExitAlternateScreen(code, signal),
+       })
+       printCrashDiagnostics(code, signal, { msAlive, stderrTail })
++      installPendingUpdate(child)
+       process.exit(signal ? 1 : code || 0)
+     }
+ 
+     child.on('exit', exitListener)
+     return exitListener
+   }
+ 
+   async function main() {
+     for (const line of startupBanner) {
+       console.log(line)
+     }
+     if (startupBanner.length > 0) console.log('')
+ 
+     await ensureBinaryReady()
+ 
+     const child = spawnInstalledBinary()
+     const exitListener = attachExitHandler(child)
+ 
+     setTimeout(() => {
+       checkForUpdates(child, exitListener)
+     }, 100)
+   }
+ 
+   return {
+     config: productConfig,
+diff --git a/cli/scripts/test-published-self-update.ts b/cli/scripts/test-published-self-update.ts
+index f256ebf35..4578e039a 100644
+--- a/cli/scripts/test-published-self-update.ts
++++ b/cli/scripts/test-published-self-update.ts
+@@ -125,94 +125,187 @@ async function main() {
+   if (!response.ok) {
+     throw new Error(
+       `Failed to download old release asset: HTTP ${response.status}`,
+     )
+   }
+   await Bun.write(archivePath, await response.arrayBuffer())
+   // Git Bash puts its GNU tar first on PATH and interprets `C:\...` as an
+   // obsolete remote-tape address. Use Windows' native bsdtar explicitly.
+   run(tarCommand, ['-xzf', archivePath, '-C', configDir])
+   if (!existsSync(binaryPath)) {
+     throw new Error(`Old release archive did not contain ${binaryName}`)
+   }
+   if (process.platform !== 'win32') chmodSync(binaryPath, 0o755)
+ 
+   writeFileSync(
+     metadataPath,
+     JSON.stringify({ version: fromVersion, target }, null, 2),
+   )
+   const oldVersionOutput = run(binaryPath, ['--version'])
+   if (!oldVersionOutput.includes(fromVersion)) {
+     throw new Error(`Seeded binary is not ${fromVersion}: ${oldVersionOutput}`)
+   }
+ 
+   console.log(`Launching ${fromVersion} and waiting for ${toVersion}...`)
+   const launcherPath = join(packageDir, 'index.js')
+-  const launcher = spawn(nodeCommand, [launcherPath], {
+-    cwd: projectDir,
+-    env: testEnv,
+-    stdio: ['ignore', 'pipe', 'pipe'],
+-  })
++  // For deferred wrappers, drive the same lifecycle as main() but await the
++  // background check so we know the download is ready before requesting exit.
++  // Historical wrappers still exercise their immediate-relaunch path.
++  const launcher = spawn(
++    nodeCommand,
++    [
++      '-e',
++      `
++    const fs = require('fs')
++    const path = require('path')
++    const launcher = require(process.argv[1])
++    async function run() {
++      if (!launcher.config.deferUpdatesUntilExit) return launcher.main()
++      const t = launcher.__testing
++      await t.ensureBinaryReady()
++      const child = t.spawnInstalledBinary()
++      const exitListener = t.attachExitHandler(child)
++      process.on('message', (message) => {
++        if (message === 'finish-session') child.kill('SIGTERM')
++      })
++      await t.checkForUpdates(child, exitListener)
++      if (!fs.existsSync(path.join(t.CONFIG.tempDownloadDir, t.CONFIG.binaryName))) {
++        throw new Error('No verified update was staged')
++      }
++      if (child.exitCode !== null || child.signalCode !== null) {
++        throw new Error('The running CLI exited during its update download')
++      }
++      process.send({ type: 'update-staged' })
++    }
++    run().catch((error) => { console.error(error); process.exit(1) })
++  `,
++      launcherPath,
++    ],
++    {
++      cwd: projectDir,
++      env: testEnv,
++      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
++    },
++  )
+   launcherProcess = launcher
++  let deferredUpdateReady = false
++  launcher.on('message', (message) => {
++    if ((message as { type?: string })?.type === 'update-staged')
++      deferredUpdateReady = true
++  })
++  const launcherExited = new Promise<number | null>((resolve) =>
++    launcher.once('close', resolve),
++  )
+   let output = ''
+   const append = (chunk: Buffer) => {
+     output = (output + chunk.toString('utf8')).slice(-2_000_000)
+   }
+-  launcher.stdout.on('data', append)
+-  launcher.stderr.on('data', append)
++  launcher.stdout!.on('data', append)
++  launcher.stderr!.on('data', append)
+ 
+   const deadline = Date.now() + 6 * 60_000
+-  while (Date.now() < deadline && readInstalledVersion() !== toVersion) {
++  while (
++    Date.now() < deadline &&
++    readInstalledVersion() !== toVersion &&
++    !deferredUpdateReady
++  ) {
+     if (launcher.exitCode !== null) {
+       throw new Error(
+         `Launcher exited before updating (code ${launcher.exitCode})\n${output.slice(-16_000)}`,
+       )
+     }
+     await Bun.sleep(1_000)
+   }
+ 
++  if (deferredUpdateReady) {
++    if (readInstalledVersion() !== fromVersion) {
++      throw new Error(
++        'Update replaced the installed binary before the session exited',
++      )
++    }
++    console.log(
++      'Update staged; ending the CLI session to allow installation...',
++    )
++    launcher.send('finish-session')
++    let timer: ReturnType<typeof setTimeout> | undefined
++    try {
++      const exitCode = await Promise.race([
++        launcherExited,
++        new Promise<never>((_, reject) => {
++          timer = setTimeout(
++            () =>
++              reject(new Error('CLI did not exit after the deferred update')),
++            15_000,
++          )
++        }),
++      ])
++      // Windows terminates the child directly for SIGTERM; POSIX runs the
++      // CLI's clean-exit handler. Both must retain the original exit result.
++      const expectedExitCode = process.platform === 'win32' ? 1 : 0
++      if (exitCode !== expectedExitCode)
++        throw new Error(`CLI exited with ${exitCode}\n${output.slice(-16_000)}`)
++    } finally {
++      clearTimeout(timer)
++    }
++    if (
++      !output.includes(
++        `Updated Freebuff to ${toVersion}. Ready for your next launch.`,
++      )
++    ) {
++      throw new Error(
++        `Missing deferred-install message\n${output.slice(-16_000)}`,
++      )
++    }
++  }
++
+   if (readInstalledVersion() !== toVersion) {
+     throw new Error(`Timed out waiting for self-update to ${toVersion}`)
+   }
+ 
+-  await Bun.sleep(3_000)
+-  if (launcher.exitCode !== null) {
+-    throw new Error(
+-      `Launcher exited after installing ${toVersion} (code ${launcher.exitCode})\n${output.slice(-16_000)}`,
+-    )
+-  }
+-  if (!output.includes('Update available:')) {
+-    throw new Error(`Missing update handoff message\n${output.slice(-16_000)}`)
+-  }
+-  if (!output.includes('Download complete! Starting Freebuff')) {
+-    throw new Error(
+-      `Missing successful relaunch message\n${output.slice(-16_000)}`,
+-    )
++  if (!deferredUpdateReady) {
++    await Bun.sleep(3_000)
++    if (launcher.exitCode !== null) {
++      throw new Error(
++        `Launcher exited after installing ${toVersion} (code ${launcher.exitCode})\n${output.slice(-16_000)}`,
++      )
++    }
++    if (!output.includes('Update available:')) {
++      throw new Error(
++        `Missing update handoff message\n${output.slice(-16_000)}`,
++      )
++    }
++    if (!output.includes('Download complete! Starting Freebuff')) {
++      throw new Error(
++        `Missing successful relaunch message\n${output.slice(-16_000)}`,
++      )
++    }
+   }
+ 
+   const newVersionOutput = run(binaryPath, ['--version'])
+   if (!newVersionOutput.includes(toVersion)) {
+     throw new Error(`Installed binary is not ${toVersion}: ${newVersionOutput}`)
+   }
+   const treeSitterOutput = run(binaryPath, ['--smoke-tree-sitter'])
+   if (!treeSitterOutput.includes('tree-sitter smoke ok')) {
+     throw new Error(`Tree-sitter smoke failed: ${treeSitterOutput}`)
+   }
+ 
+   console.log(
+     `Self-update OK: npm launcher ${fromVersion}, ${target} binary ${fromVersion} -> ${toVersion}`,
+   )
+-  stopProcessTree(launcher.pid!)
+-  await Bun.sleep(1_000)
++  if (launcher.exitCode === null) {
++    stopProcessTree(launcher.pid!)
++    await Bun.sleep(1_000)
++  }
+ }
+ 
+ main()
+   .catch((error) => {
+     console.error(error instanceof Error ? error.stack : error)
+     process.exitCode = 1
+   })
+   .finally(() => {
+     if (launcherProcess?.pid && launcherProcess.exitCode === null) {
+       stopProcessTree(launcherProcess.pid)
+     }
+     rmSync(testRoot, { recursive: true, force: true })
+   })
+diff --git a/cli/src/__tests__/release/deferred-update.test.ts b/cli/src/__tests__/release/deferred-update.test.ts
+new file mode 100644
+index 000000000..426fe2335
+--- /dev/null
++++ b/cli/src/__tests__/release/deferred-update.test.ts
+@@ -0,0 +1,258 @@
++import { describe, expect, test } from 'bun:test'
++import { createHash } from 'node:crypto'
++import { EventEmitter } from 'node:events'
++import {
++  existsSync,
++  mkdirSync,
++  mkdtempSync,
++  readFileSync,
++  rmSync,
++  writeFileSync,
++} from 'node:fs'
++import { createServer } from 'node:http'
++import { createRequire } from 'node:module'
++import type { AddressInfo } from 'node:net'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++
++const require = createRequire(import.meta.url)
++const { createLauncher } = require('../../../release-core/launcher.js')
++const tar = require('tar') as typeof import('tar')
++
++class RunningCli extends EventEmitter {
++  exitCode: number | null = null
++  signalCode: NodeJS.Signals | null = null
++  signals: string[] = []
++
++  kill(signal: string) {
++    this.signals.push(signal)
++    throw new Error('An update must not stop the running CLI')
++  }
++}
++
++async function withFixture(
++  run: (fixture: {
++    child: RunningCli
++    config: {
++      binaryPath: string
++      metadataPath: string
++      tempDownloadDir: string
++    }
++    check: (checksum?: string) => Promise<void>
++    finish: (code?: number) => Promise<void>
++    exits: number[]
++    output: string[]
++    errors: string[]
++    setInstalled: (version: string) => void
++    pauseDownload: () => { started: Promise<void>; resume: () => void }
++  }) => Promise<void>,
++) {
++  const root = mkdtempSync(join(tmpdir(), 'freebuff-deferred-update-'))
++  const configDir = join(root, 'config')
++  const archiveDir = join(root, 'archive')
++  mkdirSync(configDir)
++  mkdirSync(archiveDir)
++  const binaryName = process.platform === 'win32' ? 'freebuff.exe' : 'freebuff'
++  const target = `${process.platform}-${process.arch}`
++  writeFileSync(join(archiveDir, binaryName), 'new binary')
++  writeFileSync(join(archiveDir, 'tree-sitter.wasm'), 'new wasm')
++  const archivePath = join(root, 'release.tar.gz')
++  await tar.c({ cwd: archiveDir, file: archivePath, gzip: true }, [
++    binaryName,
++    'tree-sitter.wasm',
++  ])
++  const archive = readFileSync(archivePath)
++  const checksum = createHash('sha256').update(archive).digest('hex')
++  let downloadGate = Promise.resolve()
++  let downloadStarted = () => {}
++  const server = createServer(async (_request, response) => {
++    downloadStarted()
++    await downloadGate
++    response.writeHead(200, { 'content-length': archive.length })
++    response.end(archive)
++  })
++  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
++  const originalEnv = {
++    app: process.env.NEXT_PUBLIC_CODEBUFF_APP_URL,
++    proxy: process.env.NO_PROXY,
++    target: process.env.FREEBUFF_BINARY_TARGET,
++  }
++  process.env.NEXT_PUBLIC_CODEBUFF_APP_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
++  process.env.NO_PROXY = '127.0.0.1'
++  process.env.FREEBUFF_BINARY_TARGET = target
++  const output: string[] = []
++  const errors: string[] = []
++  const exits: number[] = []
++  const originals = {
++    log: console.log,
++    error: console.error,
++    exit: process.exit,
++  }
++  console.log = (...args) => output.push(args.join(' '))
++  console.error = (...args) => errors.push(args.join(' '))
++  process.exit = ((code: number) => {
++    exits.push(code)
++  }) as typeof process.exit
++
++  try {
++    const launcher = createLauncher({
++      packageName: 'freebuff',
++      displayName: 'Freebuff',
++      configDir,
++      deferUpdatesUntilExit: true,
++    }).__testing
++    const config = launcher.CONFIG
++    const setInstalled = (version: string) => {
++      writeFileSync(config.binaryPath, `binary ${version}`)
++      writeFileSync(config.metadataPath, JSON.stringify({ version, target }))
++      writeFileSync(join(configDir, 'tree-sitter.wasm'), `wasm ${version}`)
++    }
++    setInstalled('1.0.0')
++    const child = new RunningCli()
++    const exitListener = launcher.attachExitHandler(child)
++    await run({
++      child,
++      config,
++      check: (digest = checksum) =>
++        launcher.checkForUpdates(child, exitListener, async () => ({
++          version: '2.0.0',
++          binaryChecksums: { [target]: digest },
++        })),
++      finish: async (code = 0) => {
++        child.exitCode = code
++        await exitListener(code, null)
++      },
++      exits,
++      output,
++      errors,
++      setInstalled,
++      pauseDownload: () => {
++        let resume = () => {}
++        const started = new Promise<void>((resolve) => {
++          downloadStarted = resolve
++        })
++        downloadGate = new Promise<void>((resolve) => {
++          resume = resolve
++        })
++        return { started, resume }
++      },
++    })
++  } finally {
++    console.log = originals.log
++    console.error = originals.error
++    process.exit = originals.exit
++    for (const [key, value] of Object.entries({
++      NEXT_PUBLIC_CODEBUFF_APP_URL: originalEnv.app,
++      NO_PROXY: originalEnv.proxy,
++      FREEBUFF_BINARY_TARGET: originalEnv.target,
++    })) {
++      if (value === undefined) delete process.env[key]
++      else process.env[key] = value
++    }
++    server.closeAllConnections()
++    await new Promise<void>((resolve) => server.close(() => resolve()))
++    rmSync(root, { recursive: true, force: true })
++  }
++}
++
++describe('Freebuff updates wait for exit', () => {
++  test('a ready update leaves the process and its binary/WASM untouched until exit', async () => {
++    await withFixture(
++      async ({ child, config, check, finish, exits, output }) => {
++        await check()
++        expect(child.signals).toEqual([])
++        expect(child.listenerCount('exit')).toBe(1)
++        expect(exits).toEqual([])
++        expect(output).toEqual([])
++        expect(readFileSync(config.binaryPath, 'utf8')).toBe('binary 1.0.0')
++        expect(
++          readFileSync(
++            join(config.binaryPath, '..', 'tree-sitter.wasm'),
++            'utf8',
++          ),
++        ).toBe('wasm 1.0.0')
++        expect(existsSync(config.tempDownloadDir)).toBe(true)
++
++        await finish()
++        expect(exits).toEqual([0])
++        expect(child.signals).toEqual([])
++        expect(readFileSync(config.binaryPath, 'utf8')).toBe('new binary')
++        expect(
++          readFileSync(
++            join(config.binaryPath, '..', 'tree-sitter.wasm'),
++            'utf8',
++          ),
++        ).toBe('new wasm')
++        expect(
++          JSON.parse(readFileSync(config.metadataPath, 'utf8')).version,
++        ).toBe('2.0.0')
++        expect(existsSync(config.tempDownloadDir)).toBe(false)
++        expect(output).toEqual([
++          'Updated Freebuff to 2.0.0. Ready for your next launch.',
++        ])
++      },
++    )
++  })
++
++  test('does not downgrade a release installed by another invocation', async () => {
++    await withFixture(
++      async ({ config, check, finish, setInstalled, output, exits }) => {
++        await check()
++        setInstalled('3.0.0')
++        await finish()
++        expect(readFileSync(config.binaryPath, 'utf8')).toBe('binary 3.0.0')
++        expect(existsSync(config.tempDownloadDir)).toBe(false)
++        expect(output).toEqual([])
++        expect(exits).toEqual([0])
++      },
++    )
++  })
++
++  test('a failed installation keeps the old binary and preserves the exit code', async () => {
++    await withFixture(async ({ config, check, finish, errors, exits }) => {
++      await check()
++      rmSync(config.tempDownloadDir, { recursive: true })
++      await finish(7)
++      expect(readFileSync(config.binaryPath, 'utf8')).toBe('binary 1.0.0')
++      expect(
++        JSON.parse(readFileSync(config.metadataPath, 'utf8')).version,
++      ).toBe('1.0.0')
++      expect(exits).toEqual([7])
++      expect(errors.join('\n')).toContain('Could not install Freebuff update')
++    })
++  })
++
++  test('a checksum failure never interrupts the process or installs on exit', async () => {
++    await withFixture(
++      async ({ child, config, check, finish, exits, output }) => {
++        await check('0'.repeat(64))
++        expect(child.signals).toEqual([])
++        expect(exits).toEqual([])
++        await finish()
++        expect(readFileSync(config.binaryPath, 'utf8')).toBe('binary 1.0.0')
++        expect(output).toEqual([])
++        expect(exits).toEqual([0])
++      },
++    )
++  })
++
++  test('exit does not wait for an unfinished download or install it later', async () => {
++    await withFixture(
++      async ({ child, config, check, finish, exits, pauseDownload }) => {
++        const gate = pauseDownload()
++        const updating = check()
++        await gate.started
++        try {
++          await finish()
++          expect(exits).toEqual([0])
++        } finally {
++          gate.resume()
++          await updating
++        }
++        expect(child.signals).toEqual([])
++        expect(readFileSync(config.binaryPath, 'utf8')).toBe('binary 1.0.0')
++        expect(exits).toEqual([0])
++      },
++    )
++  })
++})
+diff --git a/cli/src/__tests__/release/wrapper-safety.test.ts b/cli/src/__tests__/release/wrapper-safety.test.ts
+index 70f623302..26ac6f906 100644
+--- a/cli/src/__tests__/release/wrapper-safety.test.ts
++++ b/cli/src/__tests__/release/wrapper-safety.test.ts
+@@ -66,50 +66,51 @@ const wrappers = [
+     directory: 'cli/release',
+     expectedConfig: {
+       packageName: 'codebuff',
+       displayName: 'Codebuff',
+       tempDownloadDirName: '.download-temp',
+     },
+   },
+   {
+     name: 'codecane',
+     directory: 'cli/release-staging',
+     expectedConfig: {
+       packageName: 'codecane',
+       displayName: 'Codecane',
+       includeTreeSitterWasm: false,
+       telemetryProperties: { isStaging: true },
+       tempDownloadDirName: '.download-temp-staging',
+     },
+   },
+   {
+     name: 'freebuff',
+     directory: 'freebuff/cli/release',
+     expectedConfig: {
+       packageName: 'freebuff',
+       displayName: 'Freebuff',
+       telemetryEvent: 'cli.update_freebuff_failed',
++      deferUpdatesUntilExit: true,
+     },
+   },
+ ]
+ 
+ for (const wrapper of wrappers) {
+   describe(`${wrapper.name} release wrapper`, () => {
+     test('contains only product configuration and package loading', () => {
+       const wrapperModule = require(
+         join(repoRoot, wrapper.directory, 'index.js'),
+       )
+       expect(wrapperModule.config).toMatchObject(wrapper.expectedConfig)
+       const packageJson = JSON.parse(
+         readFileSync(join(repoRoot, wrapper.directory, 'package.json'), 'utf8'),
+       )
+       expect(wrapperModule.config.wrapperVersion).toBe(packageJson.version)
+     })
+ 
+     test('has package-only lifecycle scripts', () => {
+       const packageJson = JSON.parse(
+         readFileSync(join(repoRoot, wrapper.directory, 'package.json'), 'utf8'),
+       )
+       expect(packageJson.scripts?.preinstall).toBeUndefined()
+       expect(packageJson.scripts?.install).toBeUndefined()
+       expect(packageJson.scripts?.postinstall).toBeUndefined()
+       expect(packageJson.scripts?.preuninstall).toBeUndefined()
+diff --git a/freebuff/cli/release/index.js b/freebuff/cli/release/index.js
+index 41c6a6b88..3ff20107d 100644
+--- a/freebuff/cli/release/index.js
++++ b/freebuff/cli/release/index.js
+@@ -7,35 +7,36 @@ const packagedLauncherPath = path.join(__dirname, 'launcher.js')
+ const sourceLauncherPath = path.join(
+   __dirname,
+   '..',
+   '..',
+   '..',
+   'cli',
+   'release-core',
+   'launcher.js',
+ )
+ // Published packages must not let an unrelated sibling path shadow their
+ // bundled launcher. Source checkouts only fall back when that copy is absent.
+ const { createLauncher } = require(
+   fs.existsSync(packagedLauncherPath)
+     ? packagedLauncherPath
+     : sourceLauncherPath,
+ )
+ 
+ const packageJson = require('./package.json')
+ 
+ const launcher = createLauncher({
+   packageName: 'freebuff',
+   displayName: 'Freebuff',
+   wrapperVersion: packageJson.version,
+   binaryChecksums: packageJson.binaryChecksums ?? null,
+   telemetryEvent: 'cli.update_freebuff_failed',
++  deferUpdatesUntilExit: true,
+ })
+ 
+ module.exports = launcher
+ 
+ if (require.main === module) {
+   launcher.main().catch((error) => {
+     console.error('❌ Unexpected error:', error.message)
+     process.exit(1)
+   })
+ }
