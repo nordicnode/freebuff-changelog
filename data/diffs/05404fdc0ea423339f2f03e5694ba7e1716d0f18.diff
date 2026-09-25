@@ -1,0 +1,550 @@
+diff --git a/cli/src/utils/__tests__/sponsored-run.test.ts b/cli/src/utils/__tests__/sponsored-run.test.ts
+index af2b709a4..6eb9e2cf0 100644
+--- a/cli/src/utils/__tests__/sponsored-run.test.ts
++++ b/cli/src/utils/__tests__/sponsored-run.test.ts
+@@ -400,50 +400,76 @@ describe('the turn', () => {
+     const f = fakes()
+     const { consent } = await acceptThrough(f)
+     if (!consent.ok) throw new Error('refused')
+     expect(f.reported).toHaveLength(0)
+     await f.service.startTurn()
+     expect(f.reported).toEqual([
+       {
+         state: 'running',
+         reportId: `running:${consent.runId}`,
+         runId: consent.runId,
+       },
+     ])
+     expect(f.service.state.phase).toBe('running')
+   })
+ 
+   test('an expired grant starts nothing and fails the run', async () => {
+     const f = fakes()
+     await acceptThrough(f)
+     f.advance(3_600_001)
+     expect(await f.service.startTurn()).toBeNull()
+     await settle()
+     expect(f.reported.map((r) => r.state)).toEqual(['failed'])
+     expect(f.service.state.phase).toBe('failed')
+   })
+ 
++  test('a grant with a start deadline still starts after a long wait (COD-665)', async () => {
++    // What the server issues now: 24h to start, an hour once running. The
++    // conversation was busy for three hours; the run still gets its turn.
++    const f = fakes({
++      accept: async (proposalId, token, binding) => {
++        const result = await fakes().deps.accept(proposalId, token, binding)
++        if (!result.ok || !result.accept.computeGrant) return result
++        const grant = result.accept.computeGrant
++        return {
++          ...result,
++          accept: {
++            ...result.accept,
++            computeGrant: {
++              ...grant,
++              expiresAtMs: grant.expiresAtMs + 23 * 3_600_000,
++            },
++          },
++        }
++      },
++    })
++    await acceptThrough(f)
++    f.advance(3 * 3_600_000)
++    expect(await f.service.startTurn()).not.toBeNull()
++    expect(f.service.state.phase).toBe('running')
++  })
++
+   test('nothing to start when nothing was accepted', async () => {
+     const f = fakes()
+     expect(await f.service.startTurn()).toBeNull()
+   })
+ 
+   test('a grant that expires mid-run aborts the turn, and the verdict says why', async () => {
+     const f = fakes()
+     await acceptThrough(f)
+     // Five milliseconds of grant left when the turn starts.
+     f.advance(3_600_000 - 5)
+     const plan = await f.service.startTurn()
+     if (!plan) throw new Error('expected a plan')
+     expect(plan.signal.aborted).toBe(false)
+     await new Promise((resolve) => setTimeout(resolve, 30))
+     expect(plan.signal.aborted).toBe(true)
+     expect(plan.signal.reason).toBe('grant-expired')
+     await f.service.settleTurn({ errorText: null, aborted: true })
+     await settle()
+     const failed = f.reported.at(-1)!
+     expect(failed.state).toBe('failed')
+     expect(failed.diagnosticReason).toContain('turn grant-expired')
+   })
+ 
+   test('Esc ends the turn as aborted: with no edits it FAILS as interrupted', async () => {
+     const f = fakes()
+diff --git a/cli/src/utils/sponsored-run.ts b/cli/src/utils/sponsored-run.ts
+index 53ea169c5..ea35eb2a2 100644
+--- a/cli/src/utils/sponsored-run.ts
++++ b/cli/src/utils/sponsored-run.ts
+@@ -116,50 +116,51 @@ import {
+ import { sponsoredRuntimeDir } from './sponsored-git'
+ import {
+   acceptSponsoredProposal,
+   previewSponsoredProposal,
+   reportSponsoredRunState,
+   sponsoredProcedureSha256,
+ } from './sponsored-proposal-api'
+ import { sponsoredProposalLocalTarget } from './sponsored-proposal-target'
+ import {
+   SponsoredEditRecorder,
+   SponsoredReceiptRefusal,
+   changedReceipts,
+   readSponsoredLedger,
+   sponsoredOutcomesFromReceipts,
+   sponsoredReceiptStore,
+   undoSponsoredReceipts,
+ } from './sponsored-receipts'
+ 
+ import type {
+   SponsoredAcceptPreview,
+   SponsoredCliExecutionSurface,
+   SponsoredProposal,
+   SponsoredStateUpdate,
+ } from './sponsored-proposal-api'
+ import type { SponsoredReceiptStore } from './sponsored-receipts'
++import { sponsoredComputeRunDeadlineMs } from '@codebuff/common/ads/sponsored-compute-contract'
+ import type { SponsoredComputeGrant } from '@codebuff/common/ads/sponsored-compute-contract'
+ import type { SponsoredLocalTarget } from '@codebuff/common/ads/sponsored-capability'
+ import type {
+   SponsoredLocalAvailability,
+   SponsoredLocalContainment,
+ } from '@codebuff/common/ads/sponsored-local-execution'
+ import type { FileReadWindow } from '@codebuff/common/types/contracts/client'
+ import type { AgentDefinition, OverrideToolHandlers } from '@codebuff/sdk'
+ 
+ /** How much of a turn's error text `diagnostic_reason` carries. */
+ export const SPONSORED_DIAGNOSTIC_CAUSE_LIMIT = 200
+ 
+ /**
+  * The turn's own error, rendered for `diagnostic_reason`.
+  *
+  * FIRST LINE ONLY, then capped. The two together are the leak control, not a
+  * formatting preference: an error's first line is a summary written to be read,
+  * while everything after it is a stack trace, a provider payload, or — for a
+  * failure raised while reading or writing a file — the surrounding content.
+  * `diagnostic_reason` is an operator's field, it is stored server-side, and it
+  * is not a place to spill a user's source.
+  */
+ export function diagnosticCause(errorText?: string | null): string {
+   const line = (errorText ?? '').split('\n')[0]!.trim()
+   if (!line) return ''
+@@ -836,53 +837,61 @@ export class SponsoredRun {
+       return null
+     }
+     const grant = active.computeGrant
+     if (
+       grant.proposalId !== active.proposalId ||
+       grant.runId !== active.runId ||
+       !/^[a-f0-9]{64}$/.test(grant.procedureSha256) ||
+       grant.procedureSha256 !== sponsoredProcedureSha256(active.procedure) ||
+       grant.expiresAtMs <= this.deps.now()
+     ) {
+       await this.settle({
+         errorText:
+           'The sponsored compute authorization is missing or expired. Nothing was started.',
+         aborted: false,
+       })
+       return null
+     }
+     const authToken = this.deps.getToken()
+     this.set({ phase: 'running' })
+     // `running` is reported when the TURN is about to start, not at the
+     // accept: between the two sits the wait for the conversation, and a card
+     // that said "running" through that wait is a card that lied.
+     if (authToken) await this.report(authToken, { state: 'running' })
+     // The grant stops paying at its expiry, and a run that outlives it would
+     // be billed to nobody. Aborted rather than left to fail request by request.
++    // Its HOUR starts now, not at Accept (COD-665): the grant arrives with only
++    // its start deadline, and the server brings it in to an hour from this
++    // turn's first call -- a moment after this, so the local cutoff is never
++    // the later of the two.
++    const runDeadlineMs = sponsoredComputeRunDeadlineMs(
++      grant.expiresAtMs,
++      this.deps.now(),
++    )
+     active.expiryTimer = setTimeout(
+       () => active.abort.abort('grant-expired'),
+-      Math.max(0, grant.expiresAtMs - this.deps.now()),
++      Math.max(0, runDeadlineMs - this.deps.now()),
+     )
+     active.expiryTimer.unref?.()
+     const context: SponsoredToolContext = {
+       workspaceRoot: this.projectRoot,
+       runtimeDir: sponsoredRuntimeDir(this.projectRoot, active.runId),
+       signal: active.abort.signal,
+       recorder: active.recorder,
+     }
+     const agentId = (this.deps.agentId ?? (() => getAgentIdForMode('LITE')))()
+     return {
+       runId: active.runId,
+       proposalId: active.proposalId,
+       advertiserName: active.advertiserName,
+       prompt: buildSponsoredPrompt(
+         active.procedure,
+         active.taskContext,
+         active.runtimeInputs,
+       ),
+       agent: sponsoredAgentDefinition({
+         agentId,
+         model: grant.modelId,
+         isFreebuff: IS_FREEBUFF,
+       }),
+       overrideTools: (this.deps.overrideTools ?? sponsoredOverrideTools)(
+         context,
+diff --git a/common/src/ads/sponsored-compute-contract.test.ts b/common/src/ads/sponsored-compute-contract.test.ts
+index 7b76c46a6..2f32bb95f 100644
+--- a/common/src/ads/sponsored-compute-contract.test.ts
++++ b/common/src/ads/sponsored-compute-contract.test.ts
+@@ -1,43 +1,88 @@
+ import { describe, expect, test } from 'bun:test'
+ import {
+   SPONSORED_ACCEPT_EXECUTION_SURFACE_PARAM,
++  SPONSORED_COMPUTE_RUN_WINDOW_MS,
++  SPONSORED_COMPUTE_START_DEADLINE_MS,
+   acceptClientSurfacePairsWithRow,
+   readSponsoredComputePolicy,
+   sponsoredAcceptSurfaceMatchesRow,
+   sponsoredComputeAdmitsCampaign,
++  sponsoredComputeRunDeadlineMs,
+   type SponsoredAcceptRequest,
+ } from './sponsored-compute-contract'
++import { SPONSORED_RUN_TOKEN_TTL_MS } from './sponsored-run-token'
+ import { FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID } from '../constants/freebuff-model-ids'
+ 
+ const enabled = {
+   FREEBUFF_SPONSORED_COMPUTE_ENABLED: 'true',
+   FREEBUFF_SPONSORED_COMPUTE_CAMPAIGN_IDS:
+     '32f72345-38e9-4c53-b66d-8898c3ea7d8d',
+   FREEBUFF_SPONSORED_COMPUTE_MODEL_ID: FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+ }
+ 
++describe('the run window opens when the run starts (COD-665)', () => {
++  const HOUR = 3_600_000
++  const acceptedAt = 1_000_000
++
++  test('the policy hour is the run window, and the start deadline is the run token', () => {
++    expect(readSponsoredComputePolicy(enabled)!.ttlMs).toBe(
++      SPONSORED_COMPUTE_RUN_WINDOW_MS,
++    )
++    expect(SPONSORED_COMPUTE_RUN_WINDOW_MS).toBe(HOUR)
++    expect(SPONSORED_COMPUTE_START_DEADLINE_MS).toBe(SPONSORED_RUN_TOKEN_TTL_MS)
++  })
++
++  test('a late start gets its full hour from the start', () => {
++    const startDeadline = acceptedAt + SPONSORED_COMPUTE_START_DEADLINE_MS
++    expect(
++      sponsoredComputeRunDeadlineMs(startDeadline, acceptedAt + 3 * HOUR),
++    ).toBe(acceptedAt + 4 * HOUR)
++  })
++
++  test('never past the grant: a start near the deadline, or an Accept-anchored grant', () => {
++    const startDeadline = acceptedAt + SPONSORED_COMPUTE_START_DEADLINE_MS
++    expect(
++      sponsoredComputeRunDeadlineMs(startDeadline, startDeadline - 60_000),
++    ).toBe(startDeadline)
++    const legacy = acceptedAt + HOUR
++    expect(
++      sponsoredComputeRunDeadlineMs(legacy, acceptedAt + 10 * 60_000),
++    ).toBe(legacy)
++  })
++
++  test('applying it again later never extends it', () => {
++    const first = sponsoredComputeRunDeadlineMs(
++      acceptedAt + SPONSORED_COMPUTE_START_DEADLINE_MS,
++      acceptedAt + HOUR,
++    )
++    expect(
++      sponsoredComputeRunDeadlineMs(first, acceptedAt + HOUR + 50 * 60_000),
++    ).toBe(first)
++  })
++})
++
+ describe('sponsored compute admission policy', () => {
+   test('missing configuration never enables sponsored execution', () => {
+     expect(readSponsoredComputePolicy({})).toBeNull()
+     for (const key of Object.keys(enabled)) {
+       expect(
+         readSponsoredComputePolicy({ ...enabled, [key]: undefined }),
+       ).toBeNull()
+     }
+     expect(
+       readSponsoredComputePolicy({
+         ...enabled,
+         FREEBUFF_SPONSORED_COMPUTE_ENABLED: '1',
+       }),
+     ).toBeNull()
+     expect(
+       readSponsoredComputePolicy({
+         ...enabled,
+         FREEBUFF_SPONSORED_COMPUTE_MODEL_ID: 'unsupported/model',
+       }),
+     ).toBeNull()
+   })
+   test('invalid allowlists are refused as a whole', () => {
+     for (const ids of [
+       '',
+       '*,' + enabled.FREEBUFF_SPONSORED_COMPUTE_CAMPAIGN_IDS,
+@@ -106,51 +151,53 @@ describe('sponsored compute admission policy', () => {
+     ).toBe(false)
+   })
+   test('* admits every campaign, so review alone decides', () => {
+     for (const value of ['*', ' * ']) {
+       const policy = readSponsoredComputePolicy({
+         ...enabled,
+         FREEBUFF_SPONSORED_COMPUTE_CAMPAIGN_IDS: value,
+       })!
+       expect(policy.campaigns).toEqual({ kind: 'all' })
+       expect(
+         sponsoredComputeAdmitsCampaign(
+           policy,
+           'bc458fc3-6f78-4e7e-9754-c17f451723aa',
+         ),
+       ).toBe(true)
+       // A malformed id is still not a campaign.
+       expect(sponsoredComputeAdmitsCampaign(policy, 'not-a-campaign')).toBe(
+         false,
+       )
+     }
+   })
+ })
+ 
+ describe('the funded Accept request pairs the client with the row (COD-642)', () => {
+   test('the client surface and its query parameter share one name', () => {
+-    expect(SPONSORED_ACCEPT_EXECUTION_SURFACE_PARAM).toBe('clientExecutionSurface')
++    expect(SPONSORED_ACCEPT_EXECUTION_SURFACE_PARAM).toBe(
++      'clientExecutionSurface',
++    )
+     const request: SponsoredAcceptRequest = {
+       surface: 'desktop',
+       runId: '32f72345-38e9-4c53-b66d-8898c3ea7d8d',
+       procedureSha256: 'a'.repeat(64),
+       clientExecutionSurface: 'desktop_windows',
+     }
+     expect(Object.keys(request)).toContain(
+       SPONSORED_ACCEPT_EXECUTION_SURFACE_PARAM,
+     )
+   })
+ 
+   test('a row minted for another machine is refused; an unrecorded one is not', () => {
+     expect(
+       sponsoredAcceptSurfaceMatchesRow('desktop_windows', 'desktop_windows'),
+     ).toBe(true)
+     // The case the pairing exists for: a Windows client charged for a run
+     // minted for a Mac, which it cannot execute, and the reverse.
+     expect(
+       sponsoredAcceptSurfaceMatchesRow('desktop_windows', 'desktop_macos'),
+     ).toBe(false)
+     expect(
+       sponsoredAcceptSurfaceMatchesRow('desktop_macos', 'desktop_windows'),
+     ).toBe(false)
+     expect(sponsoredAcceptSurfaceMatchesRow('desktop_linux', 'cli_linux')).toBe(
+       false,
+diff --git a/common/src/ads/sponsored-compute-contract.ts b/common/src/ads/sponsored-compute-contract.ts
+index bb6b4197a..91fe04d1b 100644
+--- a/common/src/ads/sponsored-compute-contract.ts
++++ b/common/src/ads/sponsored-compute-contract.ts
+@@ -1,26 +1,27 @@
+ import { FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID } from '../constants/freebuff-model-ids'
++import { SPONSORED_RUN_TOKEN_TTL_MS } from './sponsored-run-token'
+ 
+ import type {
+   SponsoredExecutionSurface,
+   SponsoredLocalTarget,
+ } from './sponsored-capability'
+ import type {
+   SPONSORED_WINDOWS_EXECUTION_SURFACE,
+   SponsoredExecutionContainment,
+ } from './sponsored-windows'
+ import type { SPONSORED_IN_PLACE_VERSION } from './sponsored-in-place'
+ 
+ /**
+  * The funded Accept request, `POST /api/v1/ads/proposal/{id}/accept`, as the
+  * accepting surface sends it and the route reads it.
+  */
+ export type SponsoredAcceptRequest = {
+   /** Which kind of client accepts: `desktop` or `cli`. */
+   surface: 'desktop' | 'cli'
+   /** The run id the surface minted before consent. */
+   runId: string
+   /** The hash of the exact procedure the user consented to. */
+   procedureSha256: string
+   target?: SponsoredLocalTarget
+   /**
+    * The ACCEPTING CLIENT's own execution surface (COD-642): `desktop_windows`
+@@ -70,84 +71,139 @@ export function sponsoredAcceptSurfaceMatchesRow(
+  *
+  *  - Absent (a client older than the field, and the CLI, which never sends
+  *    it): any row it could accept before COD-642, and NEVER a
+  *    `desktop_windows` row, whose only legitimate client sends it.
+  *  - `desktop_windows`: only a `desktop_windows` row. An unrecorded row is
+  *    never one, so it is refused too.
+  *  - Anything else: exactly the row's own surface when the row recorded one
+  *    ({@link sponsoredAcceptSurfaceMatchesRow}).
+  *
+  * Linux (COD-655) needs no arm of its own: it follows macOS. `desktop_linux`
+  * pairs only with a `desktop_linux` row, a macOS or Windows client is refused
+  * on one, and an absent field is admitted exactly as it is on a macOS row,
+  * since released Linux builds already run sponsored work under bubblewrap.
+  */
+ export function acceptClientSurfacePairsWithRow(
+   clientSurface: SponsoredExecutionSurface | null | undefined,
+   rowSurface: string | null | undefined,
+ ): boolean {
+   const windows = 'desktop_windows' satisfies SponsoredExecutionSurface
+   if (clientSurface === undefined || clientSurface === null)
+     return rowSurface !== windows
+   if (clientSurface === windows && rowSurface !== windows) return false
+   return sponsoredAcceptSurfaceMatchesRow(clientSurface, rowSurface)
+ }
+ 
++/**
++ * How long a grant keeps spending once its run has STARTED (COD-665).
++ *
++ * The window opens at the run's first reserved call on the server, and at the
++ * turn taking the grant on Desktop -- never at Accept. An in-place run is a
++ * turn queued BEHIND whatever the user already had running, and a clock that
++ * started at Accept spent the wait: of 150 traced runs, 10 never started (the
++ * grant was dead by the time their turn came up), 2 were cut off mid-run, and
++ * ~30% of the runs that did finish had waited more than ten minutes first.
++ * Accept is still the one charge; only the compute window moved.
++ */
++export const SPONSORED_COMPUTE_RUN_WINDOW_MS = 60 * 60_000
++
++/**
++ * How long an accepted grant may wait for its run to start: the hard end of
++ * every grant, measured from Accept, so one whose turn never comes still dies.
++ *
++ * The run token's lifetime, on purpose. A run that starts later than this
++ * could not report its own verdict, so a grant that outlived the token would
++ * fund work nobody can close out.
++ */
++export const SPONSORED_COMPUTE_START_DEADLINE_MS = SPONSORED_RUN_TOKEN_TTL_MS
++
++/**
++ * The deadline a grant has once its run starts at `startedAtMs`: the run
++ * window from then, never past the grant's own expiry.
++ *
++ * A minimum, so it is safe to apply on EVERY call and not only the first: a
++ * later start can never push the deadline out, and the first one fixes it.
++ * The same rule on both sides, which is what keeps Desktop's local cutoff at
++ * or before the server's -- Desktop applies it when the turn takes the grant,
++ * a moment before that turn's first call reaches the server. A grant issued
++ * before COD-665 already expires an hour after Accept, and this leaves it so.
++ */
++export function sponsoredComputeRunDeadlineMs(
++  grantExpiresAtMs: number,
++  startedAtMs: number,
++): number {
++  return Math.min(
++    grantExpiresAtMs,
++    startedAtMs + SPONSORED_COMPUTE_RUN_WINDOW_MS,
++  )
++}
++
+ /** Public response shape. The bearer belongs in host memory, never a thread. */
+ export type SponsoredComputeGrant = Readonly<{
+   token: string
+   proposalId: string
+   runId: string
+   procedureSha256: string
+   modelId: string
++  /**
++   * When the grant stops spending. Issued as Accept +
++   * {@link SPONSORED_COMPUTE_START_DEADLINE_MS}, and brought in to the run's
++   * start + {@link SPONSORED_COMPUTE_RUN_WINDOW_MS} once it starts (see
++   * {@link sponsoredComputeRunDeadlineMs}). A replayed Accept after the start
++   * answers the brought-in value.
++   */
+   expiresAtMs: number
+   allowanceUsdMicros: number
+   /**
+    * Present ONLY on a grant for a Windows offer (COD-642), and then both are:
+    * the surface the server granted and the containment that applies — the
+    * floor, not an OS sandbox. A client selects its floor-only broker only
+    * when it runs on Windows AND this grant names `desktop_windows`; never as
+    * a fallback. Absent means the client's own OS sandbox (macOS/Linux).
+    */
+   executionSurface?: typeof SPONSORED_WINDOWS_EXECUTION_SURFACE
+   containment?: SponsoredExecutionContainment
+ }>
+ 
+ /**
+  * Which campaigns the sponsored runtime may execute. `all` admits every
+  * campaign; each consumer still requires the campaign's own reviewed procedure,
+  * so approval is what makes a campaign runnable. `listed` is the scalpel.
+  */
+ export type SponsoredComputeCampaigns =
+   | Readonly<{ kind: 'all' }>
+   | Readonly<{ kind: 'listed'; ids: readonly string[] }>
+ 
+ export type SponsoredComputePolicy = Readonly<{
+   modelId: string
+   campaigns: SponsoredComputeCampaigns
+   allowanceUsdMicros: number
+   acceptancePriceCents: number
++  /**
++   * The grant's life once its run has started
++   * ({@link SPONSORED_COMPUTE_RUN_WINDOW_MS}); not measured from Accept.
++   */
+   ttlMs: number
+ }>
+ 
+ export type SponsoredComputePolicyEnv = {
+   FREEBUFF_SPONSORED_COMPUTE_ENABLED?: string
+   FREEBUFF_SPONSORED_COMPUTE_CAMPAIGN_IDS?: string
+   FREEBUFF_SPONSORED_COMPUTE_MODEL_ID?: string
+   FREEBUFF_SPONSORED_COMPUTE_ACCEPTANCE_PRICE_CENTS?: string
+ }
+ 
+ const UUID =
+   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+ 
+ /** Absent preserves the existing paid contract; malformed prices close admission. */
+ export function sponsoredComputeAcceptancePriceCents(
+   raw?: string,
+ ): number | null {
+   if (raw === undefined) return 200
+   if (!/^[1-9][0-9]*$/.test(raw)) return null
+   const cents = Number(raw)
+   return Number.isSafeInteger(cents) ? cents : null
+ }
+ 
+ /** The value of `FREEBUFF_SPONSORED_COMPUTE_CAMPAIGN_IDS` that admits every campaign. */
+ export const SPONSORED_COMPUTE_ALL_CAMPAIGNS = '*'
+@@ -186,28 +242,28 @@ export function readSponsoredComputePolicy(
+ ): SponsoredComputePolicy | null {
+   if (env.FREEBUFF_SPONSORED_COMPUTE_ENABLED !== 'true') return null
+   const acceptancePriceCents = sponsoredComputeAcceptancePriceCents(
+     env.FREEBUFF_SPONSORED_COMPUTE_ACCEPTANCE_PRICE_CENTS,
+   )
+   const modelId = env.FREEBUFF_SPONSORED_COMPUTE_MODEL_ID?.trim()
+   const campaigns = parseSponsoredComputeCampaigns(
+     env.FREEBUFF_SPONSORED_COMPUTE_CAMPAIGN_IDS,
+   )
+   if (
+     acceptancePriceCents === null ||
+     !modelId ||
+     modelId !== FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID ||
+     modelId.length > 128 ||
+     !/^[a-zA-Z0-9._:/-]+$/.test(modelId) ||
+     !campaigns
+   )
+     return null
+   return Object.freeze({
+     modelId,
+     campaigns,
+     // The configured acceptance fee is the only commercial charge. Compute is an
+     // internal, bounded cost of fulfilling that offer, capped here at $0.50.
+     allowanceUsdMicros: 500_000,
+     acceptancePriceCents,
+-    ttlMs: 60 * 60_000,
++    ttlMs: SPONSORED_COMPUTE_RUN_WINDOW_MS,
+   })
+ }
