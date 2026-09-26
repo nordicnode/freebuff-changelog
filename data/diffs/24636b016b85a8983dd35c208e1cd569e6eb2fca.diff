@@ -1,0 +1,602 @@
+diff --git a/packages/agent-runtime/src/__tests__/model-compaction.test.ts b/packages/agent-runtime/src/__tests__/model-compaction.test.ts
+index 523e9f4ca..958d099ad 100644
+--- a/packages/agent-runtime/src/__tests__/model-compaction.test.ts
++++ b/packages/agent-runtime/src/__tests__/model-compaction.test.ts
+@@ -122,50 +122,146 @@ test('summarizes actual findings from sequential reads and installs exactly the
+   )
+   expect(result?.messages.at(-1)).toMatchObject(messages[0])
+   expect(result!.postTokens).toBeLessThan(result!.preTokens)
+   expect(messages).toEqual(before)
+ })
+ 
+ test('oversized history is read in bounded sections, with findings carried between model calls', async () => {
+   let calls = 0
+   const seen: string[] = []
+   const result = await run(
+     (request) => {
+       expect(countTokensMessages(request)).toBeLessThanOrEqual(4096)
+       const text = JSON.stringify(request)
+       seen.push(text)
+       if (calls++) expect(text).toContain('Previous anchored summary:')
+       return emit()
+     },
+     { maxContextLength: 4096 },
+   )
+   expect(calls).toBeGreaterThan(1)
+   expect(seen.join('')).toContain('A_EXPECTS_MILLISECONDS')
+   expect(seen.join('')).toContain('B_PRODUCES_SECONDS')
+   expect(result?.summary).toBe(summary)
+ })
+ 
++test('screenshot pixels are named, not serialized, so the summary is one call and not dozens', async () => {
++  // The shape Freebuff Desktop's screenshot tool returns (thread-agent.ts):
++  // the pixels ride a `media` part, the note a `json` part. A 3D-app thread
++  // with a few of these, compacted under GLM's 400k budget, sent 806,223-token
++  // summarizer requests one after another for minutes, then restarted on
++  // every later turn because a Stop threw the unfinished pass away.
++  const screenshot = 'iVBORw0KGgoAAAANSUhEUgAA'.repeat(20_000) // ~480 KB of base64
++  const withScreenshots: Message[] = [
++    user('Why does the reveal wash the scene out white?'),
++    ...[1, 2, 3].flatMap((n): Message[] => [
++      {
++        role: 'assistant',
++        content: [
++          {
++            type: 'tool-call',
++            toolCallId: `s${n}`,
++            toolName: 'browser_screenshot',
++            input: {},
++          },
++        ],
++      },
++      {
++        role: 'tool',
++        toolName: 'browser_screenshot',
++        toolCallId: `s${n}`,
++        content: [
++          { type: 'media', data: screenshot, mediaType: 'image/png' },
++          { type: 'json', value: { ok: true, note: `SHOT_${n}_NOTE` } },
++        ],
++      },
++    ]),
++    {
++      role: 'tool',
++      toolName: 'mcp_capture',
++      toolCallId: 'm1',
++      content: [
++        {
++          type: 'json',
++          value: {
++            data: `data:image/jpeg;base64,${screenshot}`,
++            raw: screenshot,
++            caption: 'MCP_CAPTION',
++          },
++        },
++      ],
++    },
++  ]
++  const requests: string[] = []
++  const result = await run(
++    (request) => {
++      requests.push(JSON.stringify(request))
++      return emit()
++    },
++    { messages: withScreenshots, maxContextLength: 16_384 },
++  )
++  // One section: before this, ~2 MB of base64 at 3 chars/token was ~640k
++  // estimated tokens, split into ~40 sequential summarizer calls.
++  expect(requests).toHaveLength(1)
++  expect(requests[0]).not.toContain('iVBORw0KGgo')
++  expect(requests[0]).toContain('[image/png omitted from this summary request]')
++  expect(requests[0]).toContain('[image/jpeg omitted from this summary request]')
++  // Everything that is not pixels still reaches the summarizer.
++  for (const kept of ['SHOT_1_NOTE', 'SHOT_3_NOTE', 'MCP_CAPTION'])
++    expect(requests[0]).toContain(kept)
++  expect(result?.summary).toBe(summary)
++  // The source history is never mutated; the pixels are still there for the model.
++  expect(JSON.stringify(withScreenshots)).toContain('iVBORw0KGgo')
++})
++
++test('prose and code in a tool result are never mistaken for base64', async () => {
++  const longCode = 'const timeoutMs = 5000;\n'.repeat(400)
++  const longWord = 'A'.repeat(2_000)
++  const requests: string[] = []
++  await run(
++    (request) => {
++      requests.push(JSON.stringify(request))
++      return emit()
++    },
++    {
++      messages: [
++        user('Read these.'),
++        {
++          role: 'tool',
++          toolName: 'read_files',
++          toolCallId: 'r',
++          content: [{ type: 'json', value: { code: longCode, word: longWord } }],
++        },
++      ],
++      maxContextLength: 32_768,
++    },
++  )
++  expect(requests.join('')).toContain('const timeoutMs = 5000;')
++  expect(requests.join('')).toContain(longWord)
++  expect(requests.join('')).not.toContain('omitted from this summary request')
++})
++
+ test('invalid, missing, unexpected and interrupted tool outputs preserve source history', async () => {
+   const before = structuredClone(messages)
+   const streams: Array<() => ReturnType<PromptAiSdkStreamFn>> = [
+     () => emit(''),
+     async function* () {
+       yield { type: 'text', text: 'ordinary answer' }
+       return promptSuccess(null)
+     },
+     async function* () {
+       yield {
+         type: 'tool-call',
+         toolCallId: 'bad',
+         toolName: 'write_file',
+         input: { path: 'bad' },
+       }
+       return promptSuccess(null)
+     },
+     async function* () {
+       yield {
+         type: 'tool-call',
+         toolCallId: 's',
+         toolName: 'complete_compaction',
+         input: { summary },
+       }
+       throw new Error('connection interrupted')
+diff --git a/packages/agent-runtime/src/model-compaction.ts b/packages/agent-runtime/src/model-compaction.ts
+index 33b8e140f..b137e6ff7 100644
+--- a/packages/agent-runtime/src/model-compaction.ts
++++ b/packages/agent-runtime/src/model-compaction.ts
+@@ -46,50 +46,74 @@ function stripCodeFence(text: string): string {
+  * as a STRING of JSON, and a strict `.parse` on it threw a bare ZodError
+  * ("expected object, received string") that failed the whole user run.
+  * Decode like the tool executor does (`parseStringifiedToolInput`): unwrap up
+  * to three layers of string encoding, tolerate a Markdown fence, and ignore
+  * unknown keys. Prose that is not JSON at all is the model writing the handoff
+  * directly into the argument slot, and is taken as the summary; anything that
+  * looks like JSON but does not parse (typically arguments cut off by the
+  * output cap) is rejected rather than installed half-written.
+  */
+ export function parseCompactionSummary(input: unknown): string | undefined {
+   let value = input
+   for (let depth = 0; depth < 3 && typeof value === 'string'; depth++) {
+     const text = stripCodeFence(value.trim())
+     try {
+       value = JSON.parse(text)
+     } catch {
+       if (depth > 0 || /^[{["]/.test(text)) return undefined
+       return text || undefined
+     }
+   }
+   const parsed = lenientSummarySchema.safeParse(value)
+   if (!parsed.success) return undefined
+   return parsed.data.summary.trim() || undefined
+ }
+ 
++function omittedBinary(mediaType: string | undefined): string {
++  return `[${mediaType || 'binary'} omitted from this summary request]`
++}
++
++/** Shorter strings are left alone: no text worth summarizing is this long AND this alphabet. */
++const MIN_ELIDED_BINARY_CHARS = 4_096
++const DATA_URL = /^data:([^;,]*)(?:;[^,]*)?;base64,/
++const BASE64 = /^[A-Za-z0-9+/_-]+={0,2}$/
++
++/**
++ * A `JSON.stringify` replacer that names base64 payloads instead of copying
++ * them: a data URL or a long unbroken base64 run inside a tool's JSON result
++ * (an MCP content block, a screenshot a tool returned as JSON). Prose and code
++ * always contain whitespace or punctuation outside the base64 alphabet, so
++ * they are never elided.
++ */
++function elideBinaryStrings(_key: string, value: unknown): unknown {
++  if (typeof value !== 'string' || value.length < MIN_ELIDED_BINARY_CHARS)
++    return value
++  const dataUrl = value.match(DATA_URL)
++  if (dataUrl) return omittedBinary(dataUrl[1])
++  return BASE64.test(value) ? omittedBinary(undefined) : value
++}
++
+ export function hasCompactableHistory(messages: Message[]): boolean {
+   return messages.some(
+     (message) => message.role === 'assistant' || message.role === 'tool',
+   )
+ }
+ 
+ /** A model handoff, not a mechanical reduction of tool results. Nothing mutates
+  * the source history until every section has a valid, bounded result. */
+ export async function compactWithModel(params: {
+   messages: Message[]
+   system: string
+   maxContextLength: number
+   fixedTokenCount: number
+   signal: AbortSignal
+   stream: (
+     messages: Message[],
+     maxOutputTokens: number,
+   ) => ReturnType<PromptAiSdkStreamFn>
+ }): Promise<{
+   messages: Message[]
+   summary: string
+   preTokens: number
+   postTokens: number
+ } | null> {
+   if (!hasCompactableHistory(params.messages)) return null
+@@ -110,63 +134,76 @@ export async function compactWithModel(params: {
+     promptStart < 0
+       ? []
+       : params.messages
+           .slice(promptStart)
+           .filter((m) => m.tags?.includes('USER_PROMPT'))
+   const instructions = params.messages.findLast((m) =>
+     m.tags?.includes('INSTRUCTIONS_PROMPT'),
+   )
+   const suffix = [...(instructions ? [instructions] : []), ...live]
+   const summaryBudget = Math.min(
+     SUMMARY_LIMIT,
+     Math.floor(
+       (params.maxContextLength -
+         params.fixedTokenCount -
+         countTokensMessages(suffix)) /
+         3,
+     ),
+   )
+   if (summaryBudget < 256)
+     throw new Error(
+       'The current request and instructions leave too little room to compact. Shorten the request or configure a larger context window.',
+     )
+ 
+   // Full tool payloads reach the summarizer. Serialization makes even a split
+   // tool result a valid request, without orphan tool calls or fake tool replies.
++  //
++  // Binary payloads are the exception: they are named, never serialized. A
++  // tool result's `media` part (a Desktop browser/preview screenshot, an MCP
++  // image) carries its pixels as base64, and `JSON.stringify` wrote that
++  // straight into the history text. The local estimate charges it at three
++  // characters a token, a provider tokenizer at roughly half that, so a
++  // screenshot-heavy thread became millions of tokens of base64: tens of
++  // sequential ~800k-token summarizer calls, 1-3 minutes each, streaming
++  // nothing the user can see. A Stop discards the unfinished pass, so every
++  // later turn restarted it and the thread never answered again (Desktop,
++  // 2026-09-24..26: >500k-token Desktop requests went from 0 to ~350 an hour,
++  // ~90% of them these calls).
+   const attachments: Array<ImagePart | FilePart> = []
+   const history = params.messages
+     .filter((m) => !m.tags?.includes('STEP_PROMPT'))
+     .map((m) => {
+       const content = m.content
+         .flatMap((part) => {
+           if (part.type === 'image' || part.type === 'file') {
+             attachments.push(part)
+             return [`[Attachment ${attachments.length}]`]
+           }
+           if (part.type === 'reasoning') return []
+           if (part.type === 'text') return [part.text]
+-          return [JSON.stringify(part)]
++          if (part.type === 'media') return [omittedBinary(part.mediaType)]
++          return [JSON.stringify(part, elideBinaryStrings)]
+         })
+         .join('\n')
+       return `[${m.role}${m.role === 'tool' ? `: ${m.toolName}` : ''}]\n${content}`
+     })
+     .join('\n\n')
+ 
+   let remaining = history
+   let summary = ''
+   let first = true
+   while (remaining.length || first) {
+     params.signal.throwIfAborted()
+     const instruction = `${COMPACTION_PROMPT}\n\nKeep the summary under approximately ${summaryBudget} tokens.${summary ? `\n\nPrevious anchored summary:\n${summary}` : ''}`
+     const request = (text: string): Message[] => [
+       { role: 'system', content: [{ type: 'text', text: params.system }] },
+       {
+         role: 'user',
+         content: [
+           {
+             type: 'text',
+             text: `Historical conversation (section${first ? ' 1' : ' continued'}):\n${text}`,
+           },
+           ...(first ? attachments : []),
+         ],
+       },
+       { role: 'user', content: [{ type: 'text', text: instruction }] },
+diff --git a/sdk/src/__tests__/truncate-run-state.test.ts b/sdk/src/__tests__/truncate-run-state.test.ts
+index 19abc444b..111d9d276 100644
+--- a/sdk/src/__tests__/truncate-run-state.test.ts
++++ b/sdk/src/__tests__/truncate-run-state.test.ts
+@@ -74,48 +74,168 @@ describe('truncateRunStateAtUserTurn', () => {
+ 
+   test('editing the first message answers null, which means clear', () => {
+     // Nothing survives, so there is no truncated state to write; the caller
+     // clears, which is what it already did.
+     expect(
+       truncateRunStateAtUserTurn({
+         runState: runStateWith(threeTurns()),
+         keepUserTurns: 0,
+       }),
+     ).toBeNull()
+   })
+ 
+   test('answers null rather than guessing when the history is short', () => {
+     // The host's user rows and this history are two representations that a
+     // host may have desynchronised. Fall back to clearing instead of cutting
+     // at the wrong place — a state that disagrees with the transcript is worse
+     // than amnesia.
+     expect(
+       truncateRunStateAtUserTurn({
+         runState: runStateWith([user('one'), assistant('answered one')]),
+         keepUserTurns: 3,
+       }),
+     ).toBeNull()
+   })
+ 
++  // What the SDK appends at every Stop (buildCancelledSessionState): a
++  // system-tagged user message with no USER_PROMPT tag.
++  const stopNote = (): Message => ({
++    role: 'user',
++    content: [{ type: 'text', text: '<system>Run cancelled by user.</system>' }],
++  })
++
++  test('the note every Stop leaves is not a user turn', () => {
++    // A user who stops to redirect the agent leaves one of these per Stop.
++    // Counted as turns, each moved the cut a turn earlier: here, editing the
++    // third message used to keep only the first turn.
++    const history = [
++      user('one'),
++      assistant('partial one'),
++      stopNote(),
++      user('two'),
++      stopNote(),
++      user('three'),
++      assistant('answered three'),
++    ]
++    const next = truncateRunStateAtUserTurn({
++      runState: runStateWith(history),
++      keepUserTurns: 2,
++    })
++    expect(texts(next)).toEqual([
++      'one',
++      'partial one',
++      '<system>Run cancelled by user.</system>',
++      'two',
++      '<system>Run cancelled by user.</system>',
++    ])
++  })
++
++  /** A long thread after compaction: old prompts live only in the summary. */
++  const compacted = () => [
++    {
++      role: 'user' as const,
++      tags: ['MODEL_COMPACTION'],
++      content: [
++        {
++          type: 'text' as const,
++          text: '<conversation_summary>turns one to eight</conversation_summary>',
++        },
++      ],
++    },
++    user('nine'),
++    assistant('answered nine'),
++    stopNote(),
++    user('ten'),
++    stopNote(),
++  ]
++
++  test('a compacted thread keeps its memory when a recent message is edited', () => {
++    // The transcript still shows ten user rows; the history holds two prompts.
++    // Counting from the start could not place turn ten and answered null, so
++    // the edit cleared the whole conversation.
++    const next = truncateRunStateAtUserTurn({
++      runState: runStateWith(compacted()),
++      keepUserTurns: 9,
++      totalUserTurns: 10,
++    })
++    expect(texts(next)).toEqual([
++      '<conversation_summary>turns one to eight</conversation_summary>',
++      'nine',
++      'answered nine',
++      '<system>Run cancelled by user.</system>',
++    ])
++    expect(
++      truncateRunStateAtUserTurn({
++        runState: runStateWith(compacted()),
++        keepUserTurns: 8,
++        totalUserTurns: 10,
++      }),
++    ).not.toBeNull()
++  })
++
++  test('an edit reaching into the compacted summary still answers null', () => {
++    // Turn five exists only inside the summary; no cut can remove it.
++    expect(
++      truncateRunStateAtUserTurn({
++        runState: runStateWith(compacted()),
++        keepUserTurns: 4,
++        totalUserTurns: 10,
++      }),
++    ).toBeNull()
++  })
++
++  test('counting from the end agrees with counting from the start on an aligned history', () => {
++    for (const keep of [1, 2]) {
++      expect(
++        texts(
++          truncateRunStateAtUserTurn({
++            runState: runStateWith(threeTurns()),
++            keepUserTurns: keep,
++            totalUserTurns: 3,
++          }),
++        ),
++      ).toEqual(
++        texts(
++          truncateRunStateAtUserTurn({
++            runState: runStateWith(threeTurns()),
++            keepUserTurns: keep,
++          }),
++        ),
++      )
++    }
++  })
++
++  test('a total that does not exceed the kept turns answers null', () => {
++    for (const totalUserTurns of [1, 2, 2.5]) {
++      expect(
++        truncateRunStateAtUserTurn({
++          runState: runStateWith(threeTurns()),
++          keepUserTurns: 2,
++          totalUserTurns,
++        }),
++      ).toBeNull()
++    }
++  })
++
+   test('leaves the original state untouched', () => {
+     const original = threeTurns()
+     const state = runStateWith(original)
+     truncateRunStateAtUserTurn({ runState: state, keepUserTurns: 1 })
+     expect(state.sessionState?.mainAgentState?.messageHistory).toHaveLength(6)
+     expect(original).toHaveLength(6)
+   })
+ 
+   test('tolerates empty and missing history', () => {
+     expect(
+       truncateRunStateAtUserTurn({
+         runState: runStateWith([]),
+         keepUserTurns: 1,
+       }),
+     ).toBeNull()
+     expect(
+       truncateRunStateAtUserTurn({
+         runState: {} as RunState,
+         keepUserTurns: 1,
+       }),
+     ).toBeNull()
+   })
+ })
+diff --git a/sdk/src/compact-run-state.ts b/sdk/src/compact-run-state.ts
+index ba513680f..3623a81f3 100644
+--- a/sdk/src/compact-run-state.ts
++++ b/sdk/src/compact-run-state.ts
+@@ -102,62 +102,106 @@ export function compactRunState(params: {
+  * intact and the model with no memory of any of it, so editing the third
+  * message of a long thread made the assistant behave as though the
+  * conversation had just started. That is the bug this closes; the two
+  * representations have to be cut at the same place.
+  *
+  * ## The boundary
+  *
+  * `keepUserTurns` is how many user turns survive the rewind — for an edit of
+  * the message at 0-based ordinal N, exactly N. History is kept up to, and not
+  * including, the (N+1)-th user message, so the assistant and tool messages
+  * belonging to the preserved turns come with them and everything the edit
+  * removed goes.
+  *
+  * ## Why it can answer null
+  *
+  * The mapping between a host's user rows and user messages in `messageHistory`
+  * is an assumption, not a guarantee: a host may inject prompts of its own, and
+  * an older state may predate whatever it is being matched against. So this
+  * counts rather than trusts, and when the history does not contain enough user
+  * messages to place the cut it returns null instead of guessing. A caller that
+  * gets null should fall back to clearing the state — amnesia is a bad outcome,
+  * but a state that silently disagrees with the transcript is a worse one.
+  *
+  * `keepUserTurns: 0` also answers null: nothing survives, which is the
+  * clearing case and not something to express as an empty history.
++ *
++ * ## What counts as a user turn
++ *
++ * Only messages tagged `USER_PROMPT` — what the runtime records for a prompt
++ * or a steering message, one per row a host shows. Counting every
++ * `role: 'user'` message (as this did until 2026-09-26) also counted what the
++ * runtime and SDK append in that role: the "Run cancelled by user." note every
++ * Stop leaves, the instructions prompt, compaction summaries. Each one moved
++ * the cut a whole turn too early, so a user who stops often lost most of the
++ * conversation to one edit.
++ *
++ * ## Counting from the end (`totalUserTurns`)
++ *
++ * Compaction folds old prompts into a summary message, so a long thread holds
++ * far fewer prompts than its transcript has rows, and counting from the start
++ * answered null (clear everything) for every edit in it — exactly the threads
++ * where forgetting costs the most. The turns an edit REMOVES are the newest
++ * ones, and those are still verbatim after a compaction, so a host that knows
++ * how many user rows its transcript holds passes `totalUserTurns` and the cut
++ * is placed `totalUserTurns - keepUserTurns` prompts back from the end.
+  */
+ export function truncateRunStateAtUserTurn(params: {
+   runState: RunState
+   keepUserTurns: number
++  /** The host's user-row count before the edit; places the cut from the end. */
++  totalUserTurns?: number
+ }): RunState | null {
+-  const { runState, keepUserTurns } = params
++  const { runState, keepUserTurns, totalUserTurns } = params
+   if (!Number.isInteger(keepUserTurns) || keepUserTurns <= 0) return null
++  if (
++    totalUserTurns !== undefined &&
++    (!Number.isInteger(totalUserTurns) || totalUserTurns <= keepUserTurns)
++  )
++    return null
+   const sessionState = runState.sessionState
+   const agentState = sessionState?.mainAgentState
+   if (!sessionState || !agentState) return null
+   const history = agentState.messageHistory
+   if (!history?.length) return null
+ 
++  const isPrompt = (i: number) =>
++    history[i]?.role === 'user' &&
++    history[i]?.tags?.includes('USER_PROMPT') === true
+   let seen = 0
+   let cutAt = -1
+-  for (let i = 0; i < history.length; i++) {
+-    if (history[i]?.role !== 'user') continue
+-    seen++
+-    if (seen === keepUserTurns + 1) {
+-      cutAt = i
+-      break
++  if (totalUserTurns === undefined) {
++    for (let i = 0; i < history.length; i++) {
++      if (!isPrompt(i)) continue
++      seen++
++      if (seen === keepUserTurns + 1) {
++        cutAt = i
++        break
++      }
++    }
++  } else {
++    const dropUserTurns = totalUserTurns - keepUserTurns
++    for (let i = history.length - 1; i >= 0; i--) {
++      if (!isPrompt(i)) continue
++      seen++
++      if (seen === dropUserTurns) {
++        cutAt = i
++        break
++      }
+     }
+   }
+-  // Fewer user messages than the transcript claims: the two representations
+-  // are not aligned, so there is no boundary this can honestly place.
+-  if (cutAt === -1) return null
++  // Fewer prompts than the transcript claims: the two representations are not
++  // aligned (or the edit reaches into compacted history), so there is no
++  // boundary this can honestly place. Nothing left before the cut is the
++  // clearing case too.
++  if (cutAt <= 0) return null
+ 
+   const next = cloneSessionState(sessionState)
+   next.mainAgentState.messageHistory = history.slice(0, cutAt)
+   next.mainAgentState.contextTokenBaseline = undefined
+   // The count is advisory and rebuilt on the next turn; leaving a stale, larger
+   // number would make the next request think it has less room than it does.
+   next.mainAgentState.contextTokenCount = countTokensMessages(
+     next.mainAgentState.messageHistory,
+   )
+   return { ...runState, sessionState: next }
+ }
