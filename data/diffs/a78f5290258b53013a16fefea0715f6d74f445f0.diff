@@ -1,0 +1,974 @@
+diff --git a/cli/src/hooks/__tests__/freebuff-legacy-relaunch.test.tsx b/cli/src/hooks/__tests__/freebuff-legacy-relaunch.test.tsx
+new file mode 100644
+index 000000000..8be935a2f
+--- /dev/null
++++ b/cli/src/hooks/__tests__/freebuff-legacy-relaunch.test.tsx
+@@ -0,0 +1,365 @@
++import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
++import { createHash, randomUUID } from 'node:crypto'
++import {
++  existsSync,
++  mkdtempSync,
++  readFileSync,
++  rmSync,
++  writeFileSync,
++} from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { createTestRenderer } from '@opentui/core/testing'
++import { createRoot, flushSync } from '@opentui/react'
++import React from 'react'
++import {
++  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
++  FREEBUFF_GLM_V53_FLASH_MODEL_ID,
++  FREEBUFF_MIMO_V25_MODEL_ID,
++} from '@codebuff/common/constants/freebuff-models'
++import * as auth from '../../utils/auth'
++import { useFreebuffSessionStore } from '../../state/freebuff-session-store'
++import { useFreebuffModelStore } from '../../state/freebuff-model-store'
++import * as cli from '../use-freebuff-session'
++
++// Prod, 2026-09-26 06:26-06:28Z: CLI 0.0.196 (legacy single-session protocol)
++// admitted GLM 5.3 Flash, an old npm launcher SIGTERMed it for an update, the
++// 0.0.196 binary kept its legacy hour for the relaunch (#4020), and the
++// relaunched 0.0.200 binary probed with a fresh `cli:` claim, saw `none`,
++// showed the picker and sold the same model again. These tests drive the real
++// hook against a server that implements both protocols.
++//
++// IS_FREEBUFF is a build-time constant: run in an isolated Freebuff process.
++if (process.env.CLI_LEGACY_RELAUNCH_TEST !== '1') {
++  test('legacy-hour adoption after a cross-protocol update restart (isolated Freebuff build)', async () => {
++    const child = Bun.spawn([process.execPath, 'test', import.meta.path], {
++      env: {
++        ...process.env,
++        FREEBUFF_MODE: 'true',
++        CLI_LEGACY_RELAUNCH_TEST: '1',
++      },
++      stdout: 'pipe',
++      stderr: 'pipe',
++    })
++    const [code, stdout, stderr] = await Promise.all([
++      child.exited,
++      new Response(child.stdout).text(),
++      new Response(child.stderr).text(),
++    ])
++    expect({ code, output: code ? stdout + stderr : '' }).toEqual({
++      code: 0,
++      output: '',
++    })
++  }, 30_000)
++} else {
++  type Row = {
++    status: 'active'
++    instanceId: string
++    model: string
++    admittedAt: string
++    expiresAt: string
++    remainingMs: number
++    accessTier: 'full'
++  }
++  type Request = {
++    method: string
++    multi: boolean
++    instanceId: string | null
++    token: string
++  }
++
++  const OWNER_FILE = 'freebuff-instance-owner.json'
++  let close: (() => void) | undefined
++  let fetchSpy: ReturnType<typeof spyOn>
++  let authSpy: ReturnType<typeof spyOn>
++  let configSpy: ReturnType<typeof spyOn>
++  let configDir: string
++  let unsubscribe: (() => void) | undefined
++  /** The single per-account legacy row, keyed by bearer token. */
++  const legacy = new Map<string, Row>()
++  /** Multi-session rows, keyed by `cli:` instance. */
++  const claims = new Map<string, Row>()
++  const requests: Request[] = []
++  const statuses: string[] = []
++  let purchases = 0
++  let failLegacyGet = false
++
++  const deadPid = () => Bun.spawnSync(['true']).pid
++  const ownerPath = () => join(configDir, OWNER_FILE)
++  const writeOwner = (owner: Record<string, unknown>) =>
++    writeFileSync(ownerPath(), JSON.stringify(owner))
++  const tokenKey = (token: string) =>
++    createHash('sha256').update(token).digest('hex')
++
++  function row(instanceId: string, model: string, expiresAt?: string): Row {
++    return {
++      status: 'active',
++      instanceId,
++      model,
++      accessTier: 'full',
++      admittedAt: new Date().toISOString(),
++      expiresAt: expiresAt ?? new Date(Date.now() + 3_000_000).toISOString(),
++      remainingMs: 3_000_000,
++    }
++  }
++
++  async function until(condition: () => boolean) {
++    const deadline = performance.now() + 3_000
++    while (!condition()) {
++      if (performance.now() > deadline) throw new Error('CLI did not settle')
++      await Bun.sleep(5)
++    }
++  }
++
++  beforeEach(() => {
++    legacy.clear()
++    claims.clear()
++    requests.length = 0
++    statuses.length = 0
++    purchases = 0
++    failLegacyGet = false
++    configDir = mkdtempSync(join(tmpdir(), 'cli-legacy-relaunch-'))
++    configSpy = spyOn(auth, 'getConfigDir').mockReturnValue(configDir)
++    authSpy = spyOn(auth, 'getAuthTokenDetails').mockReturnValue({
++      token: 'fixture',
++      source: 'environment',
++    })
++    // The user's saved preference differs from the model they paid for.
++    useFreebuffModelStore
++      .getState()
++      .setSelectedModel(FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID)
++    useFreebuffSessionStore.getState().setSession(null)
++    unsubscribe = useFreebuffSessionStore.subscribe((state) => {
++      if (state.session) statuses.push(state.session.status)
++    })
++    fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (
++      _input: RequestInfo | URL,
++      init?: RequestInit,
++    ) => {
++      const headers = new Headers(init?.headers)
++      const method = init?.method ?? 'GET'
++      const token = headers.get('authorization')!.replace('Bearer ', '')
++      const multi = headers.get('x-freebuff-multi-session') === '1'
++      const instanceId = headers.get('x-freebuff-instance-id')
++      requests.push({ method, multi, instanceId, token })
++      const model = headers.get('x-freebuff-model')!
++      if (!multi) {
++        const held = legacy.get(token)
++        if (method === 'GET') {
++          if (failLegacyGet) throw new TypeError('network down')
++          if (!held) return Response.json({ status: 'none' })
++          if (instanceId && instanceId !== held.instanceId)
++            return Response.json({ status: 'superseded' })
++          return Response.json(held)
++        }
++        if (method === 'DELETE') {
++          legacy.delete(token)
++          return Response.json({ status: 'ended' })
++        }
++        // requestSession: an active same-model row is rotated on the same
++        // expiry (a takeover, not an admission); anything else is a purchase.
++        if (held && held.model === model) {
++          const rotated = { ...held, instanceId: randomUUID() }
++          legacy.set(token, rotated)
++          return Response.json(rotated)
++        }
++        purchases++
++        const fresh = row(randomUUID(), model)
++        legacy.set(token, fresh)
++        return Response.json(fresh)
++      }
++      const id = instanceId!
++      if (method === 'GET')
++        return Response.json(claims.get(id) ?? { status: 'none' })
++      if (method === 'DELETE') {
++        claims.delete(id)
++        return Response.json({ status: 'ended', freebucksRefund: 0 })
++      }
++      if (!claims.has(id)) {
++        purchases++
++        claims.set(id, row(id, model))
++      }
++      return Response.json(claims.get(id))
++    }) as typeof fetch)
++  })
++
++  afterEach(async () => {
++    close?.()
++    close = undefined
++    await Bun.sleep(5)
++    unsubscribe?.()
++    fetchSpy.mockRestore()
++    authSpy.mockRestore()
++    configSpy.mockRestore()
++    useFreebuffSessionStore.getState().setSession(null)
++    useFreebuffSessionStore.getState().setFailure(null)
++    rmSync(configDir, { recursive: true, force: true })
++  })
++
++  async function mount(expectedStatus: 'none' | 'active') {
++    const setup = await createTestRenderer({ width: 30, height: 2 })
++    const root = createRoot(setup.renderer)
++    function Controller() {
++      cli.useFreebuffSession()
++      return null
++    }
++    close = () => {
++      flushSync(() => root.unmount())
++      setup.renderer.destroy()
++    }
++    flushSync(() => root.render(<Controller />))
++    await until(
++      () =>
++        useFreebuffSessionStore.getState().session?.status === expectedStatus,
++    )
++    // Let any follow-up tick land before asserting on the request log.
++    await Bun.sleep(30)
++  }
++
++  test('the relaunch resumes the legacy hour 0.0.196 kept: same session, no purchase, no picker', async () => {
++    const expiresAt = new Date(Date.now() + 2_900_000).toISOString()
++    legacy.set(
++      'fixture',
++      row('ea1559bb-legacy', FREEBUFF_GLM_V53_FLASH_MODEL_ID, expiresAt),
++    )
++    // Exactly what 0.0.196 writes: no token key.
++    writeOwner({ instanceId: 'ea1559bb-legacy', pid: deadPid() })
++
++    await mount('active')
++
++    expect(purchases).toBe(0)
++    // The picker (status none) was never shown.
++    expect(statuses).not.toContain('none')
++    const session = useFreebuffSessionStore.getState().session
++    expect(session).toMatchObject({
++      status: 'active',
++      model: FREEBUFF_GLM_V53_FLASH_MODEL_ID,
++      expiresAt,
++    })
++    // Same server session, rotated to this process.
++    const rotated = legacy.get('fixture')!.instanceId
++    expect(cli.getFreebuffInstanceId()).toBe(rotated)
++    expect(rotated).not.toBe('ea1559bb-legacy')
++    expect(requests.slice(0, 2)).toEqual([
++      {
++        method: 'GET',
++        multi: false,
++        instanceId: 'ea1559bb-legacy',
++        token: 'fixture',
++      },
++      { method: 'POST', multi: false, instanceId: null, token: 'fixture' },
++    ])
++    expect(requests.every((r) => !r.multi)).toBe(true)
++    expect(requests.some((r) => r.method === 'DELETE')).toBe(false)
++    // A later launch after THIS process dies may resume the same hour again,
++    // but never the retired instance.
++    const owner = JSON.parse(readFileSync(ownerPath(), 'utf8'))
++    expect(owner).toMatchObject({ instanceId: rotated, pid: process.pid })
++    expect(owner.tokenKey).toBe(tokenKey('fixture'))
++
++    // Ending it releases the legacy row; the next pick is an ordinary claim.
++    await cli.returnToFreebuffLanding()
++    expect(legacy.has('fixture')).toBe(false)
++    expect(requests.find((r) => r.method === 'DELETE')?.multi).toBe(false)
++    await cli.startFreebuffSession(FREEBUFF_MIMO_V25_MODEL_ID)
++    expect(cli.getFreebuffInstanceId()).toStartWith('cli:')
++    expect(requests.at(-1)).toMatchObject({ method: 'POST', multi: true })
++    expect(purchases).toBe(1)
++  })
++
++  test('a model switch leaves the adopted hour and buys on a cli: claim', async () => {
++    legacy.set('fixture', row('legacy-a', FREEBUFF_GLM_V53_FLASH_MODEL_ID))
++    writeOwner({ instanceId: 'legacy-a', pid: deadPid() })
++    await mount('active')
++    await cli.startFreebuffSession(FREEBUFF_MIMO_V25_MODEL_ID)
++    expect(legacy.has('fixture')).toBe(false)
++    expect(cli.getFreebuffInstanceId()).toStartWith('cli:')
++    expect(purchases).toBe(1)
++  })
++
++  test('re-syncing the adopted hour stays on it instead of buying a cli: claim', async () => {
++    legacy.set('fixture', row('legacy-sync', FREEBUFF_GLM_V53_FLASH_MODEL_ID))
++    writeOwner({ instanceId: 'legacy-sync', pid: deadPid() })
++    await mount('active')
++    // The chat gate's `waiting_room_queued` re-sync: no release, just rejoin.
++    await cli.refreshFreebuffSession()
++    expect(requests.at(-1)).toMatchObject({ method: 'POST', multi: false })
++    expect(useFreebuffSessionStore.getState().session?.status).toBe('active')
++    expect(requests.every((r) => !r.multi)).toBe(true)
++    expect(purchases).toBe(0)
++  })
++
++  test('a live owner keeps its hour: nothing is probed or adopted', async () => {
++    legacy.set('fixture', row('legacy-live', FREEBUFF_GLM_V53_FLASH_MODEL_ID))
++    writeOwner({ instanceId: 'legacy-live', pid: process.ppid })
++    await mount('none')
++    expect(requests.every((r) => r.multi)).toBe(true)
++    expect(legacy.get('fixture')?.instanceId).toBe('legacy-live')
++    expect(purchases).toBe(0)
++    expect(existsSync(ownerPath())).toBe(true)
++  })
++
++  test('an ended or expired legacy hour falls back to the picker and is forgotten', async () => {
++    writeOwner({ instanceId: 'legacy-gone', pid: deadPid() })
++    await mount('none')
++    expect(requests[0]).toMatchObject({
++      method: 'GET',
++      multi: false,
++      instanceId: 'legacy-gone',
++    })
++    expect(requests.slice(1).every((r) => r.multi)).toBe(true)
++    expect(purchases).toBe(0)
++    expect(existsSync(ownerPath())).toBe(false)
++  })
++
++  test("another account's record is never adopted", async () => {
++    // A record this binary wrote for a different login: not even probed.
++    legacy.set('fixture', row('legacy-mine', FREEBUFF_GLM_V53_FLASH_MODEL_ID))
++    writeOwner({
++      instanceId: 'legacy-mine',
++      pid: deadPid(),
++      tokenKey: tokenKey('someone-else'),
++    })
++    await mount('none')
++    expect(requests.every((r) => r.multi)).toBe(true)
++    expect(legacy.get('fixture')?.instanceId).toBe('legacy-mine')
++    close!()
++    close = undefined
++    useFreebuffSessionStore.getState().setSession(null)
++
++    // An unscoped 0.0.196 record: the authenticated GET says this account
++    // holds a different instance, so the superseded verdict is swallowed and
++    // the relaunch starts normally.
++    requests.length = 0
++    writeOwner({ instanceId: 'legacy-theirs', pid: deadPid() })
++    await mount('none')
++    expect(requests[0]).toMatchObject({
++      multi: false,
++      instanceId: 'legacy-theirs',
++    })
++    expect(requests.slice(1).every((r) => r.multi)).toBe(true)
++    expect(legacy.get('fixture')?.instanceId).toBe('legacy-mine')
++    expect(purchases).toBe(0)
++  })
++
++  test('an unanswered probe falls back to a fresh claim', async () => {
++    legacy.set('fixture', row('legacy-net', FREEBUFF_GLM_V53_FLASH_MODEL_ID))
++    writeOwner({ instanceId: 'legacy-net', pid: deadPid() })
++    failLegacyGet = true
++    await mount('none')
++    expect(useFreebuffSessionStore.getState().failure).toBeNull()
++    expect(requests.slice(1).every((r) => r.multi)).toBe(true)
++    expect(purchases).toBe(0)
++  })
++
++  test('a model the multi-session picker would not offer is never adopted', async () => {
++    // Limited-offer trials (and anything outside the CLI catalog) keep their
++    // own legacy path; adoption only ever carries an ordinary catalog model.
++    legacy.set('fixture', row('legacy-trial', 'vendor/not-in-the-cli-catalog'))
++    writeOwner({ instanceId: 'legacy-trial', pid: deadPid() })
++    await mount('none')
++    expect(requests.slice(1).every((r) => r.multi)).toBe(true)
++    expect(legacy.get('fixture')?.instanceId).toBe('legacy-trial')
++    expect(purchases).toBe(0)
++  })
++}
+diff --git a/cli/src/hooks/use-freebuff-session.ts b/cli/src/hooks/use-freebuff-session.ts
+index f58ccf4e1..fb9f36d7d 100644
+--- a/cli/src/hooks/use-freebuff-session.ts
++++ b/cli/src/hooks/use-freebuff-session.ts
+@@ -1,57 +1,60 @@
+ import { FIRST_TAB_DISCOUNT_CHANGED_MESSAGE } from '@codebuff/common/util/freebuff-first-tab-discount'
+ import { FreebuffPriceSelection } from '@codebuff/common/util/freebuff-price-selection'
+ import { freebucksOf } from '../utils/freebucks'
+ import type { FreebuffWalletSpendLimit } from '@codebuff/common/types/freebuff-session'
+ import { nextFreebucksPriceChange } from '@codebuff/common/util/freebuff-price-changes'
+ import {
+   FALLBACK_FREEBUFF_MODEL_ID,
+   freebuffWithdrawnModelMessage,
+   getFreebuffModel,
+   isFreebuffLimitedOfferModelId,
++  isFreebuffModelId,
+   resolveFreebuffModelForAccessTier,
+ } from '@codebuff/common/constants/freebuff-models'
+ import {
+   getLimitedModelOffers,
+   getRateLimitsByModel,
+   getReferralInfo,
+   getFreebucksInfo,
+   getSubscriptionInfo,
+ } from '@codebuff/common/types/freebuff-session'
+ import { useEffect } from 'react'
+ 
+ import { startNewChat } from '../project-files'
+ import {
+   getSelectedFreebuffModel,
+   useFreebuffModelStore,
+ } from '../state/freebuff-model-store'
+ import { useChatStore } from '../state/chat-store'
+ import { useFreebuffSessionStore } from '../state/freebuff-session-store'
+ import { getAuthTokenDetails } from '../utils/auth'
+ import { stopActiveRun } from '../utils/active-run'
+ import { IS_FREEBUFF } from '../utils/constants'
+ import {
++  deadLegacyFreebuffOwner,
++  forgetFreebuffInstanceOwner,
+   isFreebuffInstanceOwnedByDeadLocalProcess,
+   recordFreebuffInstanceOwner,
+ } from '../utils/freebuff-instance-owner'
+ import { logger } from '../utils/logger'
+ import {
+   consumeCrashedFreebuffSession,
+   consumeFreebuffSessionRelaunch,
+   forgetCrashRecordsFor,
+   forgetLiveFreebuffSession,
+   recordLiveFreebuffSession,
+ } from '../utils/freebuff-session-relaunch'
+ import {
+   freebuffCliAttemptId,
+   newFreebuffCliInstanceId,
+ } from '../utils/freebuff-session-identity'
+ import { getSystemMessage } from '../utils/message-history'
+ import {
+   clearReferralCache,
+   getCachedReferral,
+   rememberReferral,
+ } from '../utils/freebuff-referral-cache'
+ import {
+   callFreebuffSession,
+   classifyFreebuffSessionRequestFailure,
+   FreebuffSessionRequestError,
+@@ -546,162 +549,216 @@ export function useFreebuffSession({
+     let cancelled = false
+     let abortController = new AbortController()
+     let timer: ReturnType<typeof setTimeout> | null = null
+     let previousStatus: FreebuffSessionResponse['status'] | null = null
+     // A compact response for an unexpected session identity has no safe quota
+     // snapshot to retain, so force exactly one rich poll to restore it.
+     let needsFullActivePoll = false
+     let restartGeneration = 0
+     let consecutiveFailures = 0
+     // An update restart hands its claim over explicitly; a crash leaves only
+     // the dead process's record. Either way the hour already bought resumes.
+     const updateHandoff = consumeFreebuffSessionRelaunch(token)
+     if (updateHandoff) forgetCrashRecordsFor(updateHandoff.instanceId)
+     const relaunch = updateHandoff ?? consumeCrashedFreebuffSession(token)
+     if (relaunch) {
+       logger.info(
+         { model: relaunch.model, via: updateHandoff ? 'update' : 'crash' },
+         '[freebuff-session] resuming the hour a previous CLI left behind',
+       )
+     }
+     if (relaunch)
+       useFreebuffModelStore.getState().setSelectedModel(relaunch.model)
+     let claimId = relaunch?.instanceId ?? newFreebuffCliInstanceId()
+     let attemptedModel: string | undefined = relaunch?.model
+     let claimRetired = false
++    // Cross-protocol update restart: an old launcher replaced a pre-multi-
++    // session binary (0.0.196 and earlier), which kept its LEGACY hour for the
++    // relaunch but could leave no `cli:` handoff. The first tick probes that
++    // instance with a legacy GET; if this account holds it, active, the
++    // startup takeover below rotates it on the same expiry (no purchase) and
++    // the session stays legacy until a restart (end, rejoin, model switch)
++    // returns this process to ordinary `cli:` claims. Anything else falls back
++    // to the fresh-claim startup.
++    let legacyProbe: string | undefined = relaunch
++      ? undefined
++      : deadLegacyFreebuffOwner(token)
++    let legacyHour = false
+     // Method for the NEXT tick. GET is read-only; POST claims/rotates a seat.
+     // Startup is GET (probe before committing). After any POST completes we
+     // flip back to GET. refresh() sets it to 'POST' for explicit join/rejoin;
+     // the startup takeover branch does the same when the probe finds a seat.
+     let nextMethod: 'GET' | 'POST' = 'GET'
+ 
+     const apply = (next: FreebuffSessionResponse) => {
+       rememberReferral(next)
+       const selectedModel = getSelectedFreebuffModel()
+       const resolvedModel = resolveFreebuffModelSelectionForSession(
+         selectedModel,
+         next,
+       )
+       if (resolvedModel !== selectedModel) {
+         useFreebuffModelStore.getState().setSelectedModel(resolvedModel)
+       }
+       if (next.status === 'active' && !freebuffCliAttemptId(next.instanceId)) {
+-        recordFreebuffInstanceOwner(next.instanceId)
++        recordFreebuffInstanceOwner(next.instanceId, token)
+       }
+       if (next.status === 'active' && freebuffCliAttemptId(next.instanceId)) {
+         recordLiveFreebuffSession(next, token)
+       } else {
+         forgetLiveFreebuffSession()
+       }
+       // A refusal carries no `freebucks` block of its own, and the landing
+       // decides its wording by that block: without the carry, the monthly
+       // wall read "You've used 2500 of 2500 sessions this month" — the
+       // dollar allowance in cents, in the pool's shape, with the meter
+       // forgotten. The block we hold is still the account's.
+       if (
+         (next.status === 'rate_limited' || next.status === 'spend_limited') &&
+         getFreebucksInfo(next) === undefined
+       ) {
+         const carried = getFreebucksInfo(
+           useFreebuffSessionStore.getState().session,
+         )
+         setSession(
+           carried !== undefined ? { ...next, freebucks: carried } : next,
+         )
+       } else {
+         setSession(next)
+       }
+       setFailure(null)
+       previousStatus = next.status
+     }
+ 
+     const clearTimer = () => {
+       if (timer) {
+         clearTimeout(timer)
+         timer = null
+       }
+     }
+ 
+     const schedule = (ms: number) => {
+       if (cancelled) return
+       clearTimer()
+       timer = setTimeout(tick, ms)
+     }
+ 
+     const tick = async () => {
+       if (cancelled) return
+       const method = nextMethod
+       const model = getSelectedFreebuffModel()
+-      const multiSession = !isFreebuffLimitedOfferModelId(model)
+-      const instanceId = multiSession ? claimId : getFreebuffInstanceId()
++      const probingLegacy = legacyProbe
++      const multiSession =
++        probingLegacy === undefined &&
++        !legacyHour &&
++        !isFreebuffLimitedOfferModelId(model)
++      const instanceId = multiSession
++        ? claimId
++        : (probingLegacy ?? getFreebuffInstanceId())
+       const currentSession = useFreebuffSessionStore.getState().session
+       const takeoverInstanceId =
+         currentSession?.status === 'takeover_prompt'
+           ? currentSession.currentInstanceId
+           : undefined
+       const compact =
+         method === 'GET' && previousStatus === 'active' && !needsFullActivePoll
+       const fetchController = abortController
+       const generation = restartGeneration
+       try {
+         const price =
+           method === 'POST'
+             ? selectedPrice.capture(
+                 freebucksOf(useFreebuffSessionStore.getState().session)
+                   ?.firstTabDiscount?.available ?? false,
+                 token,
+               )
+             : selectedPrice.expectation
+         if (method === 'POST' && multiSession) {
+           attemptedModel = model
+           useFreebuffSessionStore
+             .getState()
+             .setPendingAdmission({ instanceId: claimId, token })
+         }
+         const next = await callFreebuffSession(method, token, {
+           signal: fetchController.signal,
+           instanceId,
+           multiSession,
+           takeoverInstanceId,
+           model,
+           compact,
+           firstTabDiscount: price?.firstTabDiscount,
+           walletSpendLimit:
+             pendingWalletConsent?.model === model &&
+             pendingWalletConsent.token === token &&
+             pendingWalletConsent.expiresAt > Date.now()
+               ? pendingWalletConsent.limit
+               : undefined,
+         })
+         if (
+           cancelled ||
+           fetchController.signal.aborted ||
+           generation !== restartGeneration
+         ) {
+           return
+         }
+         consecutiveFailures = 0
++        if (probingLegacy !== undefined) {
++          legacyProbe = undefined
++          const adoptable =
++            next.status === 'active' &&
++            next.instanceId === probingLegacy &&
++            isFreebuffModelId(next.model) &&
++            !isFreebuffLimitedOfferModelId(next.model)
++          if (!adoptable) {
++            // Not this account's live hour (ended, expired, superseded, or a
++            // trial the legacy path already owns): never show that verdict,
++            // just start the way this binary always has.
++            if (next.status !== 'active')
++              forgetFreebuffInstanceOwner(probingLegacy)
++            nextMethod = 'GET'
++            schedule(0)
++            return
++          }
++          logger.info(
++            { model: next.model },
++            '[freebuff-session] resuming the legacy hour a pre-multi-session CLI left behind',
++          )
++          legacyHour = true
++          // Falls through to the startup takeover branch below.
++        } else if (
++          legacyHour &&
++          method === 'POST' &&
++          previousStatus === null &&
++          next.status !== 'active'
++        ) {
++          // The adoption itself was refused. Never let a follow-up branch turn
++          // that into a purchase nobody picked: land on the picker instead.
++          legacyHour = false
++          nextMethod = 'GET'
++          schedule(0)
++          return
++        }
+         if (
+           method === 'GET' &&
+           previousStatus === null &&
+           relaunch &&
+           next.status === 'none'
+         ) {
+           // The preserved claim was released/expired while updating. A fresh
+           // user selection must use a fresh single-use identity.
+           claimRetired = true
+         }
+         if (
+           next.status === 'premium_slot_taken' ||
+           next.status === 'purchase_in_use' ||
+           next.status === 'purchase_capacity'
+         ) {
+           apply({
+             status: 'takeover_prompt',
+             model: next.requestedModel,
+             currentInstanceId: next.currentInstanceId,
+             message:
+               next.status === 'purchase_in_use'
+                 ? 'Your paid session is in use elsewhere. Take over to move it here and stop its current instance.'
+                 : next.status === 'purchase_capacity' &&
+                     next.slotLimit === 1 &&
+                     next.accessTier === 'limited'
+@@ -899,50 +956,58 @@ export function useFreebuffSession({
+         }
+ 
+         // Startup takeover: the initial probe GET saw we already hold a seat
+         // (from a prior CLI instance). Stop here and ask before POSTing to
+         // rotate our instance id; otherwise opening a second freebuff would
+         // immediately supersede the first one.
+         // `previousStatus === null` fences this to the very first tick only.
+         // Pin the selected model to whatever the server thinks we're on so
+         // an explicit takeover preserves our queue position instead of
+         // switching queues.
+         if (
+           !multiSession &&
+           method === 'GET' &&
+           previousStatus === null &&
+           next.status === 'active'
+         ) {
+           useFreebuffModelStore.getState().setSelectedModel(next.model)
+           // A fast restart after Ctrl+C can observe the old server row before
+           // best-effort DELETE lands. If the row belongs to a dead local
+           // process, silently do the same POST as the Take over button.
+           if (isFreebuffInstanceOwnedByDeadLocalProcess(next.instanceId)) {
+             nextMethod = 'POST'
+             schedule(0)
+             return
+           }
++          if (legacyHour) {
++            // The owner came back to life between the probe and here: never
++            // offer to take a live process's hour. Start fresh instead.
++            legacyHour = false
++            nextMethod = 'GET'
++            schedule(0)
++            return
++          }
+           apply({ status: 'takeover_prompt', model: next.model })
+           return
+         }
+ 
+         // Bell on admission: the user committed to a model on the landing
+         // screen (status 'none'), which POSTs and lands them straight on an
+         // active session (admission is immediate).
+         if (previousStatus === 'none' && next.status === 'active') {
+           playAdmissionSound()
+         }
+ 
+         // active|ended → none means we've passed the server's hard cutoff.
+         // Synthesize a no-instanceId ended state so the chat surface stays
+         // mounted with the Enter-to-rejoin banner instead of looping back
+         // through the landing screen. Carry forward whichever rate-limit
+         // snapshot we have — preferring the fresh `none` snapshot, falling
+         // back to whatever was on the prior active/ended row — so the
+         // banner's "N of M used today" line stays populated.
+         if (
+           (previousStatus === 'active' || previousStatus === 'ended') &&
+           next.status === 'none'
+         ) {
+           const current = useFreebuffSessionStore.getState().session
+           const rateLimitsByModel =
+             next.rateLimitsByModel ?? getRateLimitsByModel(current)
+@@ -974,100 +1039,121 @@ export function useFreebuffSession({
+           needsFullActivePoll = merged === null
+           apply(merged ?? next)
+         } else {
+           needsFullActivePoll = false
+           apply(next)
+         }
+         if (needsFullActivePoll) {
+           schedule(0)
+           return
+         }
+         const priceDelay =
+           nextFreebucksPriceChange(getFreebucksInfo(next)) - Date.now()
+         const delay = Math.min(
+           nextDelayMs(next) ?? Infinity,
+           Math.max(0, priceDelay),
+         )
+         if (Number.isFinite(delay)) schedule(delay)
+       } catch (err) {
+         if (
+           cancelled ||
+           fetchController.signal.aborted ||
+           generation !== restartGeneration
+         ) {
+           return
+         }
++        if (
++          probingLegacy !== undefined ||
++          (legacyHour && previousStatus === null)
++        ) {
++          // An unanswered adoption is ambiguous: fall back to a fresh claim.
++          legacyProbe = undefined
++          legacyHour = false
++          nextMethod = 'GET'
++          schedule(0)
++          return
++        }
+         const msg = err instanceof Error ? err.message : String(err)
+         consecutiveFailures++
+         const disposition = classifyFreebuffSessionRequestFailure(method, err)
+         const shouldRetry = disposition === 'retry'
+         const retryAfterMs =
+           err instanceof FreebuffSessionRequestError
+             ? err.retryAfterMs
+             : undefined
+         const delayMs = shouldRetry
+           ? failedPollDelayMs({
+               consecutiveFailures,
+               retryAfterMs,
+             })
+           : null
+         logger.warn(
+           { error: msg, method, consecutiveFailures, delayMs, shouldRetry },
+           shouldRetry
+             ? '[freebuff-session] fetch failed; backing off'
+             : '[freebuff-session] fetch failed; automatic retry stopped',
+         )
+         const retry =
+           delayMs === null
+             ? null
+             : {
+                 attempt: consecutiveFailures + 1,
+                 retryAtMs: Date.now() + delayMs,
+               }
+         const failure = {
+           message: msg,
+           retry,
+           outcomeUnknown: disposition === 'unknown',
+         }
+         if (err instanceof FreebuffSessionRequestError) {
+           setFailure({
+             ...failure,
+             type: 'http',
+             statusCode: err.statusCode,
+           })
+         } else if (isFreebuffSessionTimeoutError(err)) {
+           setFailure({ ...failure, type: 'timeout' })
+         } else {
+           setFailure({ ...failure, type: 'other' })
+         }
+         if (delayMs !== null) schedule(delayMs)
+       }
+     }
+ 
+     controller = {
+       restart: async (mode, rotateClaim = false) => {
+         const generation = ++restartGeneration
++        // An end, a switch or a rejoin after expiry leaves the adopted legacy
++        // hour behind (the caller released it if it was live), so the next
++        // admission is an ordinary `cli:` claim. Only a plain re-sync of the
++        // hour still held stays legacy: a `cli:` POST there would buy one.
++        legacyProbe = undefined
++        legacyHour =
++          legacyHour &&
++          mode === 'rejoin' &&
++          !rotateClaim &&
++          holdsLiveFreebuffSlot(useFreebuffSessionStore.getState().session)
+         clearTimer()
+         // Abort any in-flight fetch so it can't race us and overwrite state.
+         abortController.abort()
+         abortController = new AbortController()
+         // Cancel the exact prior attempt before replacing its identity, even
+         // if its POST response was lost. The server tombstones this attempt so
+         // a delayed admission cannot buy an orphaned hour after the DELETE.
+         if (
+           !rotateClaim &&
+           attemptedModel &&
+           (mode === 'landing' ||
+             useFreebuffSessionStore.getState().session?.status === 'ended' ||
+             attemptedModel !== getSelectedFreebuffModel())
+         ) {
+           try {
+             const ended = await callFreebuffSession('DELETE', token, {
+               instanceId: claimId,
+               signal: abortController.signal,
+             })
+             if (ended.status !== 'ended')
+               throw new Error('Could not confirm the previous session ended.')
+           } catch (error) {
+             if (cancelled || generation !== restartGeneration) return
+             setFailure({
+               type: 'other',
+diff --git a/cli/src/utils/freebuff-instance-owner.ts b/cli/src/utils/freebuff-instance-owner.ts
+index a15881e54..5791be223 100644
+--- a/cli/src/utils/freebuff-instance-owner.ts
++++ b/cli/src/utils/freebuff-instance-owner.ts
+@@ -1,66 +1,130 @@
++import { createHash } from 'crypto'
+ import fs from 'fs'
+ import path from 'path'
+ 
+ import { getConfigDir } from './auth'
++import { freebuffCliAttemptId } from './freebuff-session-identity'
++import { isProcessAlive } from './freebuff-session-relaunch'
+ import { logger } from './logger'
+ 
+ interface FreebuffInstanceOwner {
+   instanceId: string
+   pid: number
++  /** Absent in records written before 0.0.201 (e.g. 0.0.196). */
++  tokenKey?: string
+ }
+ 
++const tokenKey = (token: string) =>
++  createHash('sha256').update(token).digest('hex')
++
+ const OWNER_FILE = 'freebuff-instance-owner.json'
+ 
+ const getOwnerPath = (): string => path.join(getConfigDir(), OWNER_FILE)
+ 
+ function readOwner(): FreebuffInstanceOwner | null {
+   try {
+     const raw = fs.readFileSync(getOwnerPath(), 'utf8')
+     const parsed = JSON.parse(raw) as Partial<FreebuffInstanceOwner>
+     if (
+       typeof parsed.instanceId !== 'string' ||
+       typeof parsed.pid !== 'number'
+     ) {
+       return null
+     }
+     return {
+       instanceId: parsed.instanceId,
+       pid: parsed.pid,
++      ...(typeof parsed.tokenKey === 'string'
++        ? { tokenKey: parsed.tokenKey }
++        : {}),
+     }
+   } catch {
+     return null
+   }
+ }
+ 
+ function isProcessRunning(pid: number): boolean {
+   if (!Number.isInteger(pid) || pid <= 0) return false
+   try {
+     process.kill(pid, 0)
+     return true
+   } catch (error) {
+     return (error as NodeJS.ErrnoException).code === 'EPERM'
+   }
+ }
+ 
+-export function recordFreebuffInstanceOwner(instanceId: string): void {
++export function recordFreebuffInstanceOwner(
++  instanceId: string,
++  token?: string,
++): void {
+   try {
+     fs.mkdirSync(getConfigDir(), { recursive: true })
+     fs.writeFileSync(
+       getOwnerPath(),
+-      JSON.stringify({ instanceId, pid: process.pid }, null, 2),
++      JSON.stringify(
++        {
++          instanceId,
++          pid: process.pid,
++          ...(token ? { tokenKey: tokenKey(token) } : {}),
++        },
++        null,
++        2,
++      ),
+     )
+   } catch (error) {
+     logger.debug(
+       { error: error instanceof Error ? error.message : String(error) },
+       '[freebuff-session] Failed to record local owner',
+     )
+   }
+ }
+ 
+ export function isFreebuffInstanceOwnedByDeadLocalProcess(
+   instanceId: string,
+ ): boolean {
+   const owner = readOwner()
+   if (!owner || owner.instanceId !== instanceId) return false
+   return !isProcessRunning(owner.pid)
+ }
++
++/**
++ * The legacy (single-session) hour a dead local CLI left behind, if any.
++ *
++ * CLI 0.0.196 and earlier hold every session on the legacy protocol and record
++ * it here. When an old launcher's update restart replaces such a binary with a
++ * multi-session one, no `cli:` handoff or crash record exists, so without this
++ * the new binary would show the picker and sell a second hour while the first
++ * sits unused on the server. Only a candidate: the caller must still confirm
++ * with an authenticated legacy GET that this account holds exactly this
++ * instance, active.
++ *
++ * Refuses `cli:` ids (those resume through their own records), a live or
++ * unknowable owner (only ESRCH counts as dead), this process, and a record
++ * that names a different account.
++ */
++export function deadLegacyFreebuffOwner(token: string): string | undefined {
++  const owner = readOwner()
++  if (!owner || !owner.instanceId || freebuffCliAttemptId(owner.instanceId))
++    return undefined
++  if (owner.tokenKey !== undefined && owner.tokenKey !== tokenKey(token))
++    return undefined
++  if (
++    !Number.isInteger(owner.pid) ||
++    owner.pid <= 0 ||
++    owner.pid === process.pid ||
++    isProcessAlive(owner.pid)
++  )
++    return undefined
++  return owner.instanceId
++}
++
++/** The recorded hour is over (ended, expired, or not this account's): stop
++ *  offering it to later launches. Leaves a record naming anything else. */
++export function forgetFreebuffInstanceOwner(instanceId: string): void {
++  if (readOwner()?.instanceId !== instanceId) return
++  try {
++    fs.unlinkSync(getOwnerPath())
++  } catch {
++    // Already gone.
++  }
++}
