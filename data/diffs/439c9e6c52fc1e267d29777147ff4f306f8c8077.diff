@@ -1,0 +1,1541 @@
+diff --git a/cli/src/utils/byok.ts b/cli/src/utils/byok.ts
+index b38063eee..7e40b525d 100644
+--- a/cli/src/utils/byok.ts
++++ b/cli/src/utils/byok.ts
+@@ -1,27 +1,28 @@
+ import {
+   createBunByokConnectionStore,
++  withEffectiveByokLimits,
+ } from '@codebuff/sdk'
+ import { create } from 'zustand'
+ 
+ import { loadSettings, saveSettings } from './settings'
+ 
+ import type {
+   ByokConnection,
+   ByokConnectionStore,
+   ResolvedByokConnection,
+ } from '@codebuff/sdk'
+ 
+ type SelectedByokConnection =
+   Pick<ByokConnection, 'id' | 'revision'> &
+   Partial<Pick<ByokConnection, 'provider' | 'model'>>
+ 
+ let store: ByokConnectionStore | undefined
+ 
+ type ByokSelectionStore = {
+   selected: SelectedByokConnection | undefined
+   /**
+    * The user asked, from a Freebuff wall, to set up BYOK. `/byok` is a chat
+    * command, and a user whose Freebucks are spent never reaches the chat: the
+    * landing screen's refusal has no input. This opens the chat WITHOUT a
+    * Freebuff session so the command can run; nothing but slash commands can
+    * be sent until a connection is selected.
+@@ -91,50 +92,52 @@ export function saveSelectedByokConnection(
+       ? {
+           byokConnection: {
+             id: connection.id,
+             revision: connection.revision,
+             provider: connection.provider,
+             model: connection.model,
+           },
+         }
+       : { byokConnection: undefined },
+   )
+   // Selecting ends setup; turning BYOK off (or removing the selected
+   // connection) returns the user to the Freebuff landing screen.
+   closeByokSetup()
+   useByokSelectionStore.getState().setSelected(
+     connection
+       ? {
+           id: connection.id,
+           revision: connection.revision,
+           provider: connection.provider,
+           model: connection.model,
+         }
+       : undefined,
+   )
+ }
+ 
+-/** Resolve only at run start so the secret never reaches chat state or logs. */
++/** Resolve only at run start so the secret never reaches chat state or logs.
++ *  Untouched default limits become the provider-reported window (see
++ *  withEffectiveByokLimits), so a run does not compact every few tool calls. */
+ export async function resolveByokConnection(
+   selected: SelectedByokConnection,
+ ): Promise<ResolvedByokConnection> {
+-  return getCliByokStore().resolve(selected)
++  return withEffectiveByokLimits(await getCliByokStore().resolve(selected))
+ }
+ 
+ export function describeByokConnection(connection: Pick<ByokConnection, 'name' | 'provider' | 'model'>): string {
+   const provider = connection.provider === 'openrouter'
+     ? 'OpenRouter'
+     : 'OpenAI-compatible'
+   return `${connection.name} (${provider} · ${connection.model})`
+ }
+ 
+ export function isByokEnvironmentVariableName(value: string): boolean {
+   return /^[A-Z_][A-Z0-9_]*$/.test(value)
+ }
+ 
+ export function resetCliByokStoreForTests(): void {
+   store = undefined
+ }
+ 
+ export function setCliByokStoreForTests(value: ByokConnectionStore | undefined): void {
+   store = value
+ }
+diff --git a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+index a8de64f3f..6cae56ffb 100644
+--- a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+@@ -453,35 +453,99 @@ describe('compactContext in loopAgentSteps', () => {
+     expect(result.agentTemplate?.compactContext).toEqual({
+       cacheExpiryMs: 10 * MINUTE,
+       cacheExpiryMinTokens: 5,
+     })
+ 
+     // The boolean form and the opt-out both round-trip too.
+     expect(
+       validateSingleAgent({
+         template: { ...definition, compactContext: true },
+       }).agentTemplate?.compactContext,
+     ).toBe(true)
+     expect(
+       validateSingleAgent({
+         template: { ...definition, compactContext: { cacheExpiryMs: null } },
+       }).agentTemplate?.compactContext,
+     ).toEqual({ cacheExpiryMs: null })
+ 
+     // A typo in the option name is rejected rather than silently ignored.
+     expect(
+       validateSingleAgent({
+         template: { ...definition, compactContext: { cacheExpiry: 1000 } },
+       }).success,
+     ).toBe(false)
+   })
+ 
++  // Desktop BYOK, 2026-09-24..27 ("compacts every 3-5 turns"): a 32k-default
++  // connection's budget is 25,804 tokens and its threshold 20,643, while the
++  // prompt and tool catalog take ~15k. Compacting at the threshold landed
++  // right back under it, so the next read or two compacted again.
++  describe('a small window under a large fixed prompt', () => {
++    const smallWindow = {
++      ...baseTemplate,
++      systemPrompt: 'Follow the project conventions carefully. '.repeat(1_100),
++      compactContext: { maxContextLength: 25_804, cacheExpiryMs: null },
++    } as AgentTemplate
++    const withReads = (count: number): Message[] => {
++      const history: Message[] = [
++        { ...userMessage('review the files'), tags: ['USER_PROMPT'] },
++      ]
++      for (let i = 0; i < count; i++) {
++        history.push(
++          {
++            role: 'assistant',
++            content: [
++              {
++                type: 'tool-call',
++                toolCallId: `read-${i}`,
++                toolName: 'read_files',
++                input: { paths: [`file${i}.ts`] },
++              },
++            ],
++          },
++          {
++            role: 'tool',
++            toolName: 'read_files',
++            toolCallId: `read-${i}`,
++            content: [
++              {
++                type: 'json',
++                value: [
++                  { path: `file${i}.ts`, content: `READ ${i} BODY `.repeat(400) },
++                ],
++              },
++            ],
++          },
++        )
++      }
++      return history
++    }
++
++    it('keeps working past the threshold instead of compacting futilely', async () => {
++      // ~15k fixed + ~6k of reads: over the 20,643 threshold, under the budget.
++      const result = await runLoop(smallWindow, withReads(4))
++      expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(1)
++      const sent = JSON.stringify(seenMessages[0])
++      expect(sent.includes('<conversation_summary>')).toBe(false)
++      expect(sent.includes('READ 0 BODY')).toBe(true)
++      expect(result.output.type).not.toBe('error')
++    })
++
++    it('still compacts at the hard budget', async () => {
++      const result = await runLoop(smallWindow, withReads(8))
++      const sent = JSON.stringify(seenMessages[0])
++      expect(sent.includes('<conversation_summary>')).toBe(true)
++      expect(sent.includes('review the files')).toBe(true)
++      expect(result.output.type).not.toBe('error')
++    })
++  })
++
+   it('a null TTL opts out of the opportunistic trigger', async () => {
+     await runLoop(
+       { ...baseTemplate, compactContext: { cacheExpiryMs: null } },
+       idleHistory(600),
+     )
+     expect(seenMessages[0].map(textOf).join('\n')).not.toContain(
+       '<conversation_summary>',
+     )
+   })
+ })
+diff --git a/packages/agent-runtime/src/__tests__/model-compaction.test.ts b/packages/agent-runtime/src/__tests__/model-compaction.test.ts
+index 958d099ad..ee244435b 100644
+--- a/packages/agent-runtime/src/__tests__/model-compaction.test.ts
++++ b/packages/agent-runtime/src/__tests__/model-compaction.test.ts
+@@ -1,27 +1,29 @@
+ import { expect, test } from 'bun:test'
+ import {
++  automaticCompactionIsWorthwhile,
++  compactedContextCeiling,
+   compactWithModel,
+   compactWithModelOrFallback,
+   COMPACTION_TAG,
+   parseCompactionSummary,
+ } from '../model-compaction'
+ import { promptSuccess } from '@codebuff/common/util/error'
+ import { countTokensMessages } from '../util/token-counter'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ import type { PromptAiSdkStreamFn } from '@codebuff/common/types/contracts/llm'
+ 
+ const user = (text: string): Message => ({
+   role: 'user',
+   tags: ['USER_PROMPT'],
+   content: [{ type: 'text', text }],
+ })
+ const messages: Message[] = [
+   user('Compare the time units in a.ts and b.ts.'),
+   {
+     role: 'assistant',
+     content: [
+       {
+         type: 'tool-call',
+         toolCallId: 'a',
+         toolName: 'read_files',
+         input: { paths: ['a.ts'] },
+@@ -400,25 +402,79 @@ test('compactWithModelOrFallback falls back to mechanical compaction on any summ
+     axiomEvent: 'model_compaction.fallback',
+     fallback_applied: true,
+     fallback_failed: false,
+   })
+   expect(messages).toEqual(before)
+ })
+ 
+ test('compactWithModelOrFallback still propagates cancellation', async () => {
+   const controller = new AbortController()
+   await expect(
+     compactWithModelOrFallback({
+       messages,
+       system: 'You are a coding agent.',
+       maxContextLength: 16_384,
+       fixedTokenCount: 500,
+       signal: controller.signal,
+       logger: noopLogger,
+       stream: async function* () {
+         controller.abort()
+         yield { type: 'text', text: '' }
+         return promptSuccess(null)
+       },
+     }),
+   ).rejects.toThrow()
+ })
++
++// Desktop BYOK, 2026-09-24..27: a connection on the untouched 32k default
++// compacts at 80% of 90% of (32,768 - 4,096) = 20,643 tokens, and the Desktop
++// agent's prompt and tool catalog alone are ~15-20k. The best any compaction
++// can do there lands back near the threshold, so firing at it compacted every
++// few tool calls, each pass summarizing the previous summary.
++test('an automatic compaction that cannot clear its own threshold is not worthwhile', () => {
++  const byokDefault = { maxContextLength: 25_804, thresholdTokens: 20_643 }
++  expect(
++    automaticCompactionIsWorthwhile({ messages, ...byokDefault, fixedTokenCount: 16_000 }),
++  ).toBe(false)
++  // The same window with a small fixed prompt has room to work after a pass.
++  expect(
++    automaticCompactionIsWorthwhile({ messages, ...byokDefault, fixedTokenCount: 3_000 }),
++  ).toBe(true)
++  // Hosted budgets are unaffected: 400k budget, 320k threshold.
++  expect(
++    automaticCompactionIsWorthwhile({
++      messages,
++      maxContextLength: 400_000,
++      thresholdTokens: 320_000,
++      fixedTokenCount: 20_000,
++    }),
++  ).toBe(true)
++  // The ceiling is the fixed prefix, the verbatim live request and the summary budget.
++  const ceiling = compactedContextCeiling({ messages, maxContextLength: 400_000, fixedTokenCount: 20_000 })
++  expect(ceiling).toBe(20_000 + countTokensMessages([messages[0]]) + 6_000)
++})
++
++test('an automatic fallback aims below the trigger instead of refilling the whole budget', async () => {
++  const failing = async function* (): ReturnType<PromptAiSdkStreamFn> {
++    throw new Error('connection reset')
++  }
++  const params = {
++    messages,
++    system: 'You are a coding agent.',
++    maxContextLength: 16_384,
++    fixedTokenCount: 500,
++    signal: new AbortController().signal,
++    stream: failing,
++    logger: noopLogger,
++  }
++  const whole = await compactWithModelOrFallback(params)
++  const aimed = await compactWithModelOrFallback({ ...params, fallbackTargetTokens: 1_500 })
++  expect(whole?.fallback).toBe(true)
++  expect(aimed?.fallback).toBe(true)
++  expect(aimed!.postTokens).toBeLessThanOrEqual(1_500)
++  expect(aimed!.postTokens).toBeLessThan(whole!.postTokens)
++  expect(JSON.stringify(aimed!.messages)).toContain('Compare the time units in a.ts and b.ts.')
++  // A target that cannot hold the live request falls back to the whole budget
++  // rather than leaving the history uncompacted.
++  const tooSmall = await compactWithModelOrFallback({ ...params, fallbackTargetTokens: 400 })
++  expect(tooSmall?.postTokens).toBe(whole!.postTokens)
++})
+diff --git a/packages/agent-runtime/src/model-compaction.ts b/packages/agent-runtime/src/model-compaction.ts
+index b137e6ff7..70e466923 100644
+--- a/packages/agent-runtime/src/model-compaction.ts
++++ b/packages/agent-runtime/src/model-compaction.ts
+@@ -76,101 +76,160 @@ function omittedBinary(mediaType: string | undefined): string {
+ const MIN_ELIDED_BINARY_CHARS = 4_096
+ const DATA_URL = /^data:([^;,]*)(?:;[^,]*)?;base64,/
+ const BASE64 = /^[A-Za-z0-9+/_-]+={0,2}$/
+ 
+ /**
+  * A `JSON.stringify` replacer that names base64 payloads instead of copying
+  * them: a data URL or a long unbroken base64 run inside a tool's JSON result
+  * (an MCP content block, a screenshot a tool returned as JSON). Prose and code
+  * always contain whitespace or punctuation outside the base64 alphabet, so
+  * they are never elided.
+  */
+ function elideBinaryStrings(_key: string, value: unknown): unknown {
+   if (typeof value !== 'string' || value.length < MIN_ELIDED_BINARY_CHARS)
+     return value
+   const dataUrl = value.match(DATA_URL)
+   if (dataUrl) return omittedBinary(dataUrl[1])
+   return BASE64.test(value) ? omittedBinary(undefined) : value
+ }
+ 
+ export function hasCompactableHistory(messages: Message[]): boolean {
+   return messages.some(
+     (message) => message.role === 'assistant' || message.role === 'tool',
+   )
+ }
+ 
++/** The messages a model compaction keeps verbatim after its summary: the
++ *  latest instructions and the live user request (with its steering). */
++function compactionSuffix(messages: Message[]): Message[] {
++  const lastPrompt = messages.findLastIndex((m) =>
++    m.tags?.includes('USER_PROMPT'),
++  )
++  let promptStart = lastPrompt
++  while (
++    promptStart > 0 &&
++    messages[promptStart - 1].tags?.includes('USER_PROMPT')
++  )
++    promptStart--
++  const live =
++    promptStart < 0
++      ? []
++      : messages
++          .slice(promptStart)
++          .filter((m) => m.tags?.includes('USER_PROMPT'))
++  const instructions = messages.findLast((m) =>
++    m.tags?.includes('INSTRUCTIONS_PROMPT'),
++  )
++  return [...(instructions ? [instructions] : []), ...live]
++}
++
++function compactionSummaryBudget(params: {
++  maxContextLength: number
++  fixedTokenCount: number
++  suffixTokens: number
++}): number {
++  return Math.min(
++    SUMMARY_LIMIT,
++    Math.floor(
++      (params.maxContextLength - params.fixedTokenCount - params.suffixTokens) /
++        3,
++    ),
++  )
++}
++
++/**
++ * The share of the trigger threshold a compaction's result may occupy for the
++ * automatic trigger to be worth firing. Above it, the next tool result or two
++ * crosses the threshold again and the run compacts its own summary.
++ */
++export const COMPACTION_LOW_WATER = 0.85
++
++/**
++ * The largest context a model compaction can leave behind: the fixed prefix
++ * (system prompt, tool schemas), the live request it keeps verbatim, and the
++ * summary budget it asks for. None of it is compactable, so when this is not
++ * comfortably under the threshold, compacting at the threshold only buys a
++ * few thousand tokens before the next one: a 32k BYOK window with ~16k of
++ * Desktop tool schemas compacted every few tool calls, each pass summarizing
++ * the last summary.
++ */
++export function compactedContextCeiling(params: {
++  messages: Message[]
++  maxContextLength: number
++  fixedTokenCount: number
++}): number {
++  const suffixTokens = countTokensMessages(compactionSuffix(params.messages))
++  const summaryBudget = compactionSummaryBudget({ ...params, suffixTokens })
++  return params.fixedTokenCount + suffixTokens + Math.max(0, summaryBudget)
++}
++
++/**
++ * Whether an automatic compaction at `thresholdTokens` leaves real room to
++ * work in. When it cannot, the run keeps its history until the hard budget,
++ * where compaction is no longer optional.
++ */
++export function automaticCompactionIsWorthwhile(params: {
++  messages: Message[]
++  maxContextLength: number
++  thresholdTokens: number
++  fixedTokenCount: number
++}): boolean {
++  return (
++    compactedContextCeiling(params) <=
++    Math.floor(params.thresholdTokens * COMPACTION_LOW_WATER)
++  )
++}
++
+ /** A model handoff, not a mechanical reduction of tool results. Nothing mutates
+  * the source history until every section has a valid, bounded result. */
+ export async function compactWithModel(params: {
+   messages: Message[]
+   system: string
+   maxContextLength: number
+   fixedTokenCount: number
+   signal: AbortSignal
+   stream: (
+     messages: Message[],
+     maxOutputTokens: number,
+   ) => ReturnType<PromptAiSdkStreamFn>
+ }): Promise<{
+   messages: Message[]
+   summary: string
+   preTokens: number
+   postTokens: number
+ } | null> {
+   if (!hasCompactableHistory(params.messages)) return null
+   const preTokens =
+     countTokensMessages(params.messages) + params.fixedTokenCount
+   // A compact-only request never enters the history. Keep the actual current
+   // user request verbatim, including steering and attachments.
+-  const lastPrompt = params.messages.findLastIndex((m) =>
+-    m.tags?.includes('USER_PROMPT'),
+-  )
+-  let promptStart = lastPrompt
+-  while (
+-    promptStart > 0 &&
+-    params.messages[promptStart - 1].tags?.includes('USER_PROMPT')
+-  )
+-    promptStart--
+-  const live =
+-    promptStart < 0
+-      ? []
+-      : params.messages
+-          .slice(promptStart)
+-          .filter((m) => m.tags?.includes('USER_PROMPT'))
+-  const instructions = params.messages.findLast((m) =>
+-    m.tags?.includes('INSTRUCTIONS_PROMPT'),
+-  )
+-  const suffix = [...(instructions ? [instructions] : []), ...live]
+-  const summaryBudget = Math.min(
+-    SUMMARY_LIMIT,
+-    Math.floor(
+-      (params.maxContextLength -
+-        params.fixedTokenCount -
+-        countTokensMessages(suffix)) /
+-        3,
+-    ),
+-  )
++  const suffix = compactionSuffix(params.messages)
++  const summaryBudget = compactionSummaryBudget({
++    maxContextLength: params.maxContextLength,
++    fixedTokenCount: params.fixedTokenCount,
++    suffixTokens: countTokensMessages(suffix),
++  })
+   if (summaryBudget < 256)
+     throw new Error(
+       'The current request and instructions leave too little room to compact. Shorten the request or configure a larger context window.',
+     )
+ 
+   // Full tool payloads reach the summarizer. Serialization makes even a split
+   // tool result a valid request, without orphan tool calls or fake tool replies.
+   //
+   // Binary payloads are the exception: they are named, never serialized. A
+   // tool result's `media` part (a Desktop browser/preview screenshot, an MCP
+   // image) carries its pixels as base64, and `JSON.stringify` wrote that
+   // straight into the history text. The local estimate charges it at three
+   // characters a token, a provider tokenizer at roughly half that, so a
+   // screenshot-heavy thread became millions of tokens of base64: tens of
+   // sequential ~800k-token summarizer calls, 1-3 minutes each, streaming
+   // nothing the user can see. A Stop discards the unfinished pass, so every
+   // later turn restarted it and the thread never answered again (Desktop,
+   // 2026-09-24..26: >500k-token Desktop requests went from 0 to ~350 an hour,
+   // ~90% of them these calls).
+   const attachments: Array<ImagePart | FilePart> = []
+   const history = params.messages
+     .filter((m) => !m.tags?.includes('STEP_PROMPT'))
+     .map((m) => {
+       const content = m.content
+         .flatMap((part) => {
+@@ -297,74 +356,101 @@ function compactionErrorKind(error: unknown): string {
+   if (
+     message.includes('too little room') ||
+     message.includes('compaction context budget') ||
+     message.includes('No room for conversation history')
+   )
+     return 'budget'
+   return 'provider_error'
+ }
+ 
+ /**
+  * `compactWithModel`, but a compaction failure never fails the user's run.
+  *
+  * The model handoff is the preferred compaction, not the only one: when the
+  * summarizer errors, returns malformed arguments, or cannot be sized, the
+  * mechanical pass (`compactHistoryNow` — no model call) takes over, exactly
+  * as it ran before model compaction existed. If that also cannot shrink the
+  * history, the history is left untouched and the caller's over-budget guard
+  * decides. Only a cancellation propagates.
+  */
+ export async function compactWithModelOrFallback(
+   params: Parameters<typeof compactWithModel>[0] & {
+     logger: Logger
+     runId?: string
+     model?: string
+     trigger?: string
++    /**
++     * Where the mechanical fallback should aim, below `maxContextLength`. That
++     * pass fills whatever budget it is given, so aimed at the hard budget it
++     * lands above an automatic trigger's threshold and the very next step
++     * compacts again. Falls back to `maxContextLength` when the target is too
++     * small to hold the live request.
++     */
++    fallbackTargetTokens?: number
+   },
+ ): Promise<{
+   messages: Message[]
+   summary: string
+   preTokens: number
+   postTokens: number
+   fallback?: true
+ } | null> {
+-  const { logger, runId, model, trigger, ...modelParams } = params
++  const {
++    logger,
++    runId,
++    model,
++    trigger,
++    fallbackTargetTokens,
++    ...modelParams
++  } = params
+   try {
+     return await compactWithModel(modelParams)
+   } catch (error) {
+     if (params.signal.aborted || isAbortError(error)) throw error
+     const errorMessage = error instanceof Error ? error.message : String(error)
+     let fallback: ReturnType<typeof compactHistoryNow> = null
+     let fallbackError: string | undefined
+-    try {
+-      fallback = compactHistoryNow({
++    const mechanical = (maxContextLength: number) =>
++      compactHistoryNow({
+         messages: params.messages,
+-        maxContextLength: params.maxContextLength,
++        maxContextLength,
+         fixedTokenCount: params.fixedTokenCount,
+         logger,
+         runId,
+       })
++    try {
++      if (
++        fallbackTargetTokens !== undefined &&
++        fallbackTargetTokens < params.maxContextLength
++      ) {
++        try {
++          fallback = mechanical(fallbackTargetTokens)
++        } catch {
++          // The live request does not fit the target; use the whole budget.
++        }
++      }
++      fallback ??= mechanical(params.maxContextLength)
+     } catch (mechanicalError) {
+       fallbackError =
+         mechanicalError instanceof Error
+           ? mechanicalError.message
+           : String(mechanicalError)
+     }
+     try {
+       logger.warn(
+         {
+           axiomEvent: MODEL_COMPACTION_FALLBACK_EVENT,
+           agent_run_id: runId,
+           model,
+           trigger_reason: trigger,
+           error_kind: compactionErrorKind(error),
+           error_name: error instanceof Error ? error.name : typeof error,
+           fallback_applied: Boolean(fallback),
+           fallback_failed: fallbackError !== undefined,
+           // Not allowlisted for Axiom; local/debug logs only.
+           error: errorMessage,
+           ...(fallbackError ? { fallback_error: fallbackError } : {}),
+         },
+         fallback
+           ? 'Model compaction failed; used mechanical compaction'
+           : 'Model compaction failed; history left unchanged',
+       )
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 0916b2eb5..43953b63d 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -6,51 +6,57 @@ import {
+ } from '@codebuff/common/old-constants'
+ import { PROJECT_PROFILE_TOOL_NAME } from '@codebuff/common/constants/project-profile'
+ import { TOOLS_WHICH_WONT_FORCE_NEXT_STEP } from '@codebuff/common/tools/constants'
+ import { buildArray } from '@codebuff/common/util/array'
+ import {
+   AbortError,
+   FETCH_IDLE_TIMEOUT_USER_MESSAGE,
+   TRANSIENT_NETWORK_ERROR_USER_MESSAGE,
+   extractApiErrorDetails,
+   getErrorObject,
+   isAbortError,
+   isFetchIdleTimeoutError,
+   isTransientNetworkError,
+ } from '@codebuff/common/util/error'
+ import { serializeCacheDebugCorrelation } from '@codebuff/common/util/cache-debug'
+ import {
+   dropUnansweredToolCalls,
+   systemMessage,
+   userMessage,
+ } from '@codebuff/common/util/messages'
+ import { type ToolSet } from 'ai'
+ import { cloneDeep, mapValues } from 'lodash'
+ import z from 'zod/v4'
+ 
+ import { evaluateCompactionTrigger } from './compact-history'
+-import { compactWithModelOrFallback, compactionTools } from './model-compaction'
++import type { CompactionTrigger } from './compact-history'
++import {
++  automaticCompactionIsWorthwhile,
++  COMPACTION_LOW_WATER,
++  compactWithModelOrFallback,
++  compactionTools,
++} from './model-compaction'
+ import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+ import { getMCPToolData } from './mcp'
+ import {
+   runProjectProfileReport,
+   shouldOfferProjectProfileTool,
+ } from './project-profile'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+ import { isThinkOnlyResponse } from './util/think-tags'
+ import {
+   hasFileEditTool,
+   TODO_LOOP_RECOVERY_TAG,
+   TODO_LOOP_RECOVERY_THRESHOLD,
+   TODO_LOOP_STOP_THRESHOLD,
+   TodoLoopError,
+   todoLoopRecoveryMessage,
+   trailingIdenticalTodoCalls,
+ } from './util/todo-loop'
+ import {
+   clearProgrammaticRunState,
+   runProgrammaticStep,
+ } from './run-programmatic-step'
+ import {
+   additionalSystemPrompts,
+   isCompactCommandPrompt,
+ } from './system-prompt/prompts'
+@@ -1159,73 +1165,113 @@ export async function loopAgentSteps(
+ 
+       // Each completed response supplies the baseline. Only content added or
+       // removed since then (tools, steering, step scaffolding) is estimated.
+       currentAgentState.contextTokenCount = estimateContextTokens({
+         agentState: {
+           ...currentAgentState,
+           messageHistory: messagesWithStepPrompt,
+         },
+         model: agentTemplate.model,
+         systemPrompt: system,
+         toolsForTokenCount,
+       })
+ 
+       if (
+         (agentTemplate.compactContext && !shouldEndTurn) ||
+         manualCompaction
+       ) {
+         const policy =
+           typeof agentTemplate.compactContext === 'object'
+             ? agentTemplate.compactContext
+             : {}
+         const maxContextLength =
+           policy.maxContextLength ??
+           contextPrunerBudgetForModel(agentTemplate.model)
+         const thresholdTokens = modelCompactionThreshold(maxContextLength)
+-        const trigger = manualCompaction
++        let trigger: CompactionTrigger | 'manual' | null = manualCompaction
+           ? 'manual'
+           : evaluateCompactionTrigger({
+               ...policy,
+               messages: currentAgentState.messageHistory,
+               contextTokenCount: currentAgentState.contextTokenCount,
+               maxContextLength: thresholdTokens,
+             }).trigger
++        const fixedTokenCount = trigger
++          ? countTokens(system) +
++            countTokensJson(toolsForTokenCount) +
++            (stepPrompt
++              ? countTokensMessages([userMessage({ content: stepPrompt })])
++              : 0)
++          : 0
++        // The threshold is a convenience, the budget is not. When even a
++        // perfect compaction would land back near the threshold (a small
++        // BYOK window under a large fixed prompt and tool catalog), firing
++        // there compacts every few steps, each pass summarizing the last
++        // summary. Keep working until the hard budget instead.
++        if (
++          trigger &&
++          trigger !== 'manual' &&
++          currentAgentState.contextTokenCount <= maxContextLength &&
++          !automaticCompactionIsWorthwhile({
++            messages: currentAgentState.messageHistory,
++            maxContextLength,
++            thresholdTokens,
++            fixedTokenCount,
++          })
++        ) {
++          logger.debug(
++            {
++              agentType,
++              runId,
++              contextTokenCount: currentAgentState.contextTokenCount,
++              thresholdTokens,
++              maxContextLength,
++              fixedTokenCount,
++            },
++            'Deferred compaction to the hard budget: it could not clear the threshold',
++          )
++          trigger = null
++        }
+         if (trigger) {
+           const before = currentAgentState.directCreditsUsed
+           const started = Date.now()
+           // A compaction failure must never fail the turn: a summarizer error
+           // or malformed handoff falls back to the mechanical pass.
+           const compacted = await compactWithModelOrFallback({
+             messages: currentAgentState.messageHistory,
+             system,
+             maxContextLength,
+-            fixedTokenCount:
+-              countTokens(system) +
+-              countTokensJson(toolsForTokenCount) +
+-              (stepPrompt
+-                ? countTokensMessages([userMessage({ content: stepPrompt })])
+-                : 0),
++            fixedTokenCount,
++            // An automatic pass must leave the run under its own trigger, or
++            // the next step fires it again on the fallback's output.
++            ...(trigger === 'manual'
++              ? {}
++              : {
++                  fallbackTargetTokens: Math.floor(
++                    thresholdTokens * COMPACTION_LOW_WATER,
++                  ),
++                }),
+             signal,
+             logger,
+             runId,
+             model: agentTemplate.model,
+             trigger,
+             stream: (messages, maxOutputTokens) =>
+               getAgentStreamFromTemplate({
+                 ...params,
+                 agentId: agentType,
+                 template: agentTemplate,
+                 runId,
+                 messages,
+                 tools: compactionTools,
+                 toolChoice: 'required',
+                 maxOutputTokens,
+                 onCostCalculated: async (credits) => {
+                   currentAgentState.creditsUsed += credits
+                   currentAgentState.directCreditsUsed += credits
+                 },
+                 // Compaction usage is spend, not the next root request's context.
+                 onUsageReceived: (usage) =>
+                   params.onAgentUsageReceived?.({
+                     ...usage,
+                     isRoot: false,
+                     agentId: currentAgentState.agentId,
+@@ -1242,51 +1288,51 @@ export async function loopAgentSteps(
+             messageId: null,
+             status: 'completed',
+             startTime,
+           })
+           if (compacted) {
+             currentAgentState.messageHistory = compacted.messages
+             currentAgentState.contextTokenBaseline = undefined
+             currentAgentState.contextTokenCount = compacted.postTokens
+             if (!initialAgentState.parentId)
+               params.onCompaction?.({
+                 trigger,
+                 thresholdTokens,
+                 summary: compacted.summary,
+                 preTokens: compacted.preTokens,
+                 postTokens: compacted.postTokens,
+                 durationMs: Date.now() - started,
+               })
+           }
+           // A manual request is a maintenance operation, never a coding turn.
+           if (manualCompaction) break
+           if (
+             !compacted &&
+             currentAgentState.contextTokenCount > maxContextLength
+           ) {
+             throw new Error(
+-              'Compaction did not reduce the context enough. History has been preserved.',
++              `Compaction could not bring this conversation under the model's ${maxContextLength.toLocaleString('en-US')}-token context budget. History has been preserved. Start a new thread, or give a BYOK connection a larger context window if its model supports one.`,
+             )
+           }
+           totalSteps++
+         }
+       }
+ 
+       // 1. Run programmatic step first if it exists
+       let n: number | undefined = undefined
+ 
+       if (agentTemplate.handleSteps) {
+         const programmaticResult = await runProgrammaticStep({
+           ...params,
+ 
+           agentState: currentAgentState,
+           localAgentTemplates,
+           nResponses,
+           onCostCalculated: async (credits: number) => {
+             currentAgentState.creditsUsed += credits
+             currentAgentState.directCreditsUsed += credits
+           },
+           prompt: currentPrompt,
+           runId,
+           stepNumber: totalSteps,
+           stepsComplete: shouldEndTurn,
+           system,
+diff --git a/sdk/src/__tests__/byok-compaction.test.ts b/sdk/src/__tests__/byok-compaction.test.ts
+new file mode 100644
+index 000000000..4307c23f1
+--- /dev/null
++++ b/sdk/src/__tests__/byok-compaction.test.ts
+@@ -0,0 +1,164 @@
++/**
++ * Desktop feedback, 2026-09-24 and 09-27: "with BYOK the agent compacts every
++ * ~5 minutes", "keeps compressing context every 3-5 turns and produces
++ * nothing". A connection saved from the settings form without opening its
++ * Advanced section stores the pre-filled 32,768 / 4,096 limits, so a run
++ * compacted at 80% of 90% of (32,768 - 4,096) = 20,643 tokens, and a coding
++ * agent's system prompt and tool catalog alone are ~15-20k of that.
++ *
++ * This drives a real SDK run end to end against a scripted OpenAI-compatible
++ * provider whose model is in no catalog: a long read-heavy task, then counts
++ * how often the run stopped to compact.
++ */
++import { mkdtemp, writeFile } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import path from 'node:path'
++
++import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
++
++import {
++  BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW,
++  clearByokContextWindowCache,
++  createByokConnectionStore,
++  withEffectiveByokLimits,
++  type ByokConnection,
++  type ResolvedByokConnection,
++} from '../byok'
++import { CodebuffClient } from '../client'
++
++import type { AgentDefinition } from '@codebuff/common/templates/initial-agents-dir/types/agent-definition'
++
++const FILES = 12
++const BASE_URL = 'https://llm.example.com/v1'
++const MODEL = 'acme/coder-unlisted'
++
++/** ~15k estimated tokens: the order of the Desktop thread agent's system
++ *  prompt plus its tool catalog, which are outside the compactable history. */
++const agent: AgentDefinition = {
++  id: 'byok-long-task-agent',
++  displayName: 'BYOK long task',
++  model: 'ignored-by-byok',
++  toolNames: ['read_files'],
++  systemPrompt:
++    'Read every file the user names before answering. Follow the project conventions carefully. '.repeat(
++      500,
++    ),
++}
++
++function sse(body: unknown): Response {
++  return new Response(`data: ${JSON.stringify(body)}\n\ndata: [DONE]\n\n`, {
++    headers: { 'content-type': 'text/event-stream' },
++  })
++}
++
++function scriptedProvider(modelsBody: unknown) {
++  // `compactionRequests` counts provider calls: one pass can take several
++  // when the history is summarized in sections.
++  const counts = { work: 0, compactionRequests: 0, modelListings: 0 }
++  const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
++    const url = String(input)
++    if (url === `${BASE_URL}/models`) {
++      counts.modelListings++
++      return Response.json(modelsBody)
++    }
++    expect(url).toBe(`${BASE_URL}/chat/completions`)
++    const body = JSON.parse(String(init?.body))
++    if (body.tools?.some((t: any) => t.function.name === 'complete_compaction')) {
++      counts.compactionRequests++
++      return sse({
++        id: `compact-${counts.compactionRequests}`, object: 'chat.completion.chunk', created: 1, model: MODEL,
++        choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `c${counts.compactionRequests}`, type: 'function',
++          function: { name: 'complete_compaction', arguments: JSON.stringify({ summary: `Read files 1..${counts.work}; keep going.` }) } }] },
++          finish_reason: 'tool_calls' }],
++      })
++    }
++    counts.work++
++    if (counts.work <= FILES) {
++      return sse({
++        id: `work-${counts.work}`, object: 'chat.completion.chunk', created: 1, model: MODEL,
++        choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `read-${counts.work}`, type: 'function',
++          function: { name: 'read_files', arguments: JSON.stringify({ paths: [`file${counts.work}.ts`] }) } }] },
++          finish_reason: 'tool_calls' }],
++      })
++    }
++    return sse({
++      id: 'final', object: 'chat.completion.chunk', created: 1, model: MODEL,
++      choices: [{ index: 0, delta: { content: 'FINAL ANSWER: all twelve files reviewed.' }, finish_reason: 'stop' }],
++    })
++  }) as typeof fetch
++  return { counts, fetchImpl }
++}
++
++/** A connection exactly as the settings form saves it with Advanced untouched. */
++async function savedWithFormDefaults(): Promise<ResolvedByokConnection> {
++  let rows: ByokConnection[] = []
++  const secrets = new Map<string, string>()
++  const store = createByokConnectionStore({
++    metadataStore: {
++      get: async () => structuredClone(rows),
++      set: async (value) => { rows = structuredClone(value) },
++    },
++    secretStore: {
++      get: async (ref) => secrets.get(ref),
++      set: async (ref, value) => { secrets.set(ref, value) },
++      delete: async (ref) => { secrets.delete(ref) },
++    },
++  })
++  const created = await store.create({
++    name: 'Acme', provider: 'openai-compatible', baseUrl: BASE_URL, model: MODEL,
++    apiKey: 'acme-key', contextWindow: 32_768, maxOutputTokens: 4_096,
++  })
++  expect(created).toMatchObject({ contextWindow: 32_768, maxOutputTokens: 4_096 })
++  return store.resolve(created)
++}
++
++async function longTask(byok: ResolvedByokConnection, fetchImpl: typeof fetch) {
++  const cwd = await mkdtemp(path.join(tmpdir(), 'freebuff-byok-compaction-'))
++  for (let i = 1; i <= FILES; i++) {
++    // ~2k estimated tokens each: a modest source file.
++    await writeFile(path.join(cwd, `file${i}.ts`), `export const value${i} = ${i} // keep this line\n`.repeat(150))
++  }
++  globalThis.fetch = fetchImpl
++  const client = new CodebuffClient({ cwd, agentDefinitions: [agent], byok })
++  const passes: Array<{ trigger: string }> = []
++  const result = await client.run({
++    agent: agent.id,
++    prompt: `Review file1.ts through file${FILES}.ts.`,
++    onCompaction: (receipt) => passes.push(receipt),
++  })
++  return { result, passes }
++}
++
++describe('BYOK compaction on an unlisted model', () => {
++  const originalFetch = globalThis.fetch
++  beforeEach(() => clearByokContextWindowCache())
++  afterEach(() => { globalThis.fetch = originalFetch })
++
++  test('the untouched 32k default compacts over and over (the reported bug)', async () => {
++    const { counts, fetchImpl } = scriptedProvider({ data: [] })
++    const { result, passes } = await longTask(await savedWithFormDefaults(), fetchImpl)
++    // Pinned so the next test is known to exercise the real failure: twelve
++    // ordinary reads cost repeated compactions on the stored default (four
++    // before the runtime deferred futile threshold compactions, two after).
++    expect(passes.length).toBeGreaterThanOrEqual(2)
++    expect(passes.every((pass) => pass.trigger === 'context_limit')).toBe(true)
++    expect(counts.compactionRequests).toBeGreaterThanOrEqual(passes.length)
++    expect(result.output.type).not.toBe('error')
++  }, 60_000)
++
++  test('the effective window lets the same task run without compacting and still answer', async () => {
++    const { counts, fetchImpl } = scriptedProvider({ data: [{ id: 'someone/else', context_length: 8_192 }] })
++    const effective = await withEffectiveByokLimits(await savedWithFormDefaults(), { fetch: fetchImpl })
++    expect(effective.contextWindow).toBe(BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW)
++    expect(effective.apiKey).toBe('acme-key')
++    expect(Object.keys(effective)).not.toContain('apiKey')
++    expect(counts.modelListings).toBe(1)
++
++    const { result, passes } = await longTask(effective, fetchImpl)
++    expect(passes).toEqual([])
++    expect(counts.compactionRequests).toBe(0)
++    expect(counts.work).toBe(FILES + 1)
++    expect(result.output.type).not.toBe('error')
++    expect(JSON.stringify(result.output)).toContain('FINAL ANSWER: all twelve files reviewed.')
++  }, 60_000)
++})
+diff --git a/sdk/src/byok.test.ts b/sdk/src/byok.test.ts
+index 80c136496..c4af51479 100644
+--- a/sdk/src/byok.test.ts
++++ b/sdk/src/byok.test.ts
+@@ -1,36 +1,43 @@
+ import { afterEach, describe, expect, test } from 'bun:test'
+ import { promises as fs } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import path from 'node:path'
+ import {
+   createByokConnectionStore,
+   createBunByokConnectionStore,
+   createBunByokMetadataStore,
+   normalizeByokBaseUrl,
+   byokModelLimits,
+   byokCompletionUrl,
++  BYOK_DEFAULT_CONTEXT_WINDOW,
++  BYOK_DISCOVERED_CONTEXT_WINDOW_CAP,
++  BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW,
++  clearByokContextWindowCache,
++  contextWindowFromModelList,
++  withEffectiveByokLimits,
++  type ResolvedByokConnection,
+   type ByokConnection,
+   type ByokSecretStore,
+ } from './byok'
+ 
+ const directories: string[] = []
+ afterEach(async () => {
+   for (const dir of directories.splice(0))
+     await fs.rm(dir, { recursive: true, force: true })
+ })
+ const input = {
+   name: 'Fixture',
+   provider: 'openai-compatible' as const,
+   model: 'fixture-model',
+   baseUrl: 'http://127.0.0.1:9999/v1',
+   apiKey: 'canary-secret',
+ }
+ function secrets() {
+   const values = new Map<string, string>()
+   const store: ByokSecretStore = {
+     get: async (ref) => values.get(ref),
+     set: async (ref, value) => {
+       values.set(ref, value)
+     },
+     delete: async (ref) => {
+       values.delete(ref)
+@@ -253,50 +260,183 @@ describe('shared persistent BYOK store', () => {
+           input.apiKey,
+         ],
+       ])
+       expect((await store.resolve(added)).apiKey).toBe(input.apiKey)
+       await store.remove(added)
+     } finally {
+       ;(Bun as unknown as { secrets: unknown }).secrets = nativeSecrets
+     }
+   })
+ })
+ 
+ test('custom model limits reserve output and reject impossible capacities', () => {
+   expect(
+     byokModelLimits({ contextWindow: 8192, maxOutputTokens: 2048 }),
+   ).toEqual({
+     contextWindow: 8192,
+     maxOutputTokens: 2048,
+     maxContextLength: 5529,
+   })
+   expect(() =>
+     byokModelLimits({ contextWindow: 8192, maxOutputTokens: 8192 }),
+   ).toThrow()
+   expect(() => byokModelLimits({ contextWindow: NaN })).toThrow()
+ })
+ 
++describe('effective BYOK limits for a run', () => {
++  afterEach(() => clearByokContextWindowCache())
++  function resolved(
++    overrides: Partial<ByokConnection> = {},
++  ): ResolvedByokConnection {
++    const connection = {
++      id: '11111111-1111-4111-8111-111111111111',
++      revision: 1,
++      name: 'Fixture',
++      provider: 'openai-compatible' as const,
++      baseUrl: 'https://llm.example.com/v1',
++      model: 'acme/coder',
++      contextWindow: 32_768,
++      maxOutputTokens: 4_096,
++      credentialRef: 'connection:11111111-1111-4111-8111-111111111111:1',
++      createdAt: '2026-09-27T00:00:00.000Z',
++      updatedAt: '2026-09-27T00:00:00.000Z',
++      ...overrides,
++    }
++    const assertCurrent = async () => {}
++    Object.defineProperty(connection, 'apiKey', {
++      value: 'listing-secret',
++      enumerable: false,
++    })
++    Object.defineProperty(connection, 'assertCurrent', {
++      value: assertCurrent,
++      enumerable: false,
++    })
++    return Object.freeze(connection) as ResolvedByokConnection
++  }
++  function listing(body: unknown, status = 200) {
++    const calls: Array<{ url: string; auth: string | null }> = []
++    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
++      calls.push({
++        url: String(input),
++        auth: new Headers(init?.headers).get('authorization'),
++      })
++      return Response.json(body, { status })
++    }) as unknown as typeof fetch
++    return { calls, fetchImpl }
++  }
++
++  test('limits a user typed are kept and never trigger a lookup', async () => {
++    const { calls, fetchImpl } = listing({ data: [] })
++    const typed = resolved({ contextWindow: 102_400, maxOutputTokens: 8_192 })
++    expect(await withEffectiveByokLimits(typed, { fetch: fetchImpl })).toBe(typed)
++    // The window alone at the default still counts as a choice when the output limit moved.
++    const tuned = resolved({ maxOutputTokens: 2_048 })
++    expect(await withEffectiveByokLimits(tuned, { fetch: fetchImpl })).toBe(tuned)
++    expect(calls).toEqual([])
++  })
++
++  test('an untouched default takes the window the provider lists, keeping the credential hidden', async () => {
++    const { calls, fetchImpl } = listing({
++      data: [{ id: 'acme/coder', max_model_len: 65_536 }],
++    })
++    const connection = resolved()
++    const effective = await withEffectiveByokLimits(connection, { fetch: fetchImpl })
++    expect(effective).toMatchObject({ contextWindow: 65_536, maxOutputTokens: 4_096 })
++    expect(effective.apiKey).toBe('listing-secret')
++    expect(effective.assertCurrent).toBe(connection.assertCurrent)
++    expect(Object.keys(effective)).not.toContain('apiKey')
++    expect(JSON.stringify(effective)).not.toContain('listing-secret')
++    expect(Object.isFrozen(effective)).toBe(true)
++    expect(byokModelLimits(effective).maxContextLength).toBe(
++      Math.floor((65_536 - 4_096) * 0.9),
++    )
++    expect(calls).toEqual([
++      { url: 'https://llm.example.com/v1/models', auth: 'Bearer listing-secret' },
++    ])
++    // One listing per endpoint and model, not one per turn.
++    await withEffectiveByokLimits(connection, { fetch: fetchImpl })
++    expect(calls).toHaveLength(1)
++  })
++
++  test('OpenRouter is asked without the key, and a huge window is capped', async () => {
++    const { calls, fetchImpl } = listing({
++      data: [
++        { id: 'vendor/giant', context_length: 1_048_576 },
++        { id: 'vendor/small', context_length: 40_960 },
++      ],
++    })
++    const giant = await withEffectiveByokLimits(
++      resolved({ provider: 'openrouter', baseUrl: undefined, model: 'vendor/giant' }),
++      { fetch: fetchImpl },
++    )
++    expect(giant.contextWindow).toBe(BYOK_DISCOVERED_CONTEXT_WINDOW_CAP)
++    const free = await withEffectiveByokLimits(
++      resolved({ provider: 'openrouter', baseUrl: undefined, model: 'vendor/small:free' }),
++      { fetch: fetchImpl },
++    )
++    expect(free.contextWindow).toBe(40_960)
++    expect(calls[0]).toEqual({ url: 'https://openrouter.ai/api/v1/models', auth: null })
++  })
++
++  test('an unlisted remote model gets 128k; a local server keeps its configured default', async () => {
++    const miss = listing({ data: [{ id: 'someone/else', context_length: 8_192 }] })
++    expect(
++      (await withEffectiveByokLimits(resolved(), { fetch: miss.fetchImpl })).contextWindow,
++    ).toBe(BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW)
++    const local = resolved({ baseUrl: 'http://127.0.0.1:1234/v1' })
++    expect(await withEffectiveByokLimits(local, { fetch: miss.fetchImpl })).toBe(local)
++    expect(local.contextWindow).toBe(BYOK_DEFAULT_CONTEXT_WINDOW)
++  })
++
++  test('a failing or unreachable listing never fails the run', async () => {
++    const failed = listing({ error: 'nope' }, 500)
++    expect(
++      (await withEffectiveByokLimits(resolved(), { fetch: failed.fetchImpl })).contextWindow,
++    ).toBe(BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW)
++    clearByokContextWindowCache()
++    const offline = (async () => {
++      throw new TypeError('fetch failed')
++    }) as unknown as typeof fetch
++    expect(
++      (await withEffectiveByokLimits(resolved(), { fetch: offline })).contextWindow,
++    ).toBe(BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW)
++  })
++
++  test('reads the window fields common OpenAI-compatible listings use', () => {
++    expect(contextWindowFromModelList({ data: [{ id: 'm', context_window: 131_072 }] }, 'm')).toBe(131_072)
++    expect(contextWindowFromModelList([{ id: 'm', loaded_context_length: '16384' }], 'm')).toBe(16_384)
++    expect(
++      contextWindowFromModelList(
++        { data: [{ id: 'x', canonical_slug: 'm', top_provider: { context_length: 200_000 } }] },
++        'm',
++      ),
++    ).toBe(200_000)
++    expect(contextWindowFromModelList({ data: [{ id: 'm' }] }, 'm')).toBeUndefined()
++    expect(contextWindowFromModelList('not a listing', 'm')).toBeUndefined()
++  })
++})
++
+ test('failed key rotation leaves the old revision recoverable', async () => {
+   let rows: ByokConnection[] = []
+   const secret = secrets()
+   let failCleanup = true
+   const store = createByokConnectionStore({
+     metadataStore: {
+       get: async () => rows,
+       set: async (value) => {
+         rows = value
+       },
+     },
+     secretStore: {
+       ...secret.store,
+       delete: async (ref) => {
+         if (failCleanup && ref.endsWith(':1')) throw new Error('locked')
+         await secret.store.delete(ref)
+       },
+     },
+   })
+   const first = await store.create(input)
+   const resolved = await store.resolve(first)
+   await expect(
+     store.update({ ...first, patch: { apiKey: 'new-key' } }),
+   ).rejects.toThrow('unchanged')
+   expect((await store.resolve(first)).apiKey).toBe(input.apiKey)
+diff --git a/sdk/src/byok.ts b/sdk/src/byok.ts
+index ba77e094b..ee97019c2 100644
+--- a/sdk/src/byok.ts
++++ b/sdk/src/byok.ts
+@@ -122,76 +122,290 @@ export function byokCompletionUrl(
+   )
+ }
+ function parseConnections(value: unknown): ByokConnection[] {
+   const parsed = z.array(connectionSchema).safeParse(value)
+   if (!parsed.success)
+     throw new Error(
+       'BYOK connection metadata is corrupt; restore it before continuing',
+     )
+   if (new Set(parsed.data.map((item) => item.id)).size !== parsed.data.length) {
+     throw new Error('BYOK connection metadata contains duplicate connections')
+   }
+   for (const item of parsed.data) {
+     byokModelLimits(item)
+     normalizeByokBaseUrl(item.provider, item.baseUrl)
+     if (
+       !envReference.test(item.credentialRef) &&
+       !item.credentialRef.startsWith(`connection:${item.id}:`)
+     ) {
+       throw new Error(
+         'BYOK credential reference belongs to a different connection',
+       )
+     }
+   }
+   return parsed.data
+ }
++/**
++ * The limits a connection gets when nobody chose any. The Desktop settings
++ * form pre-fills exactly this pair, and the store persists it, so a stored
++ * 32,768 / 4,096 almost always means "not configured" rather than a decision.
++ */
++export const BYOK_DEFAULT_CONTEXT_WINDOW = 32_768
++export const BYOK_DEFAULT_MAX_OUTPUT_TOKENS = 4_096
++/** A remote endpoint that does not report its model's window. */
++export const BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW = 131_072
++/**
++ * The most an automatically-chosen window may be: the hosted budget's order of
++ * magnitude, since every token of a BYOK request is billed to the user's key.
++ * A user who wants more types it into the connection.
++ */
++export const BYOK_DISCOVERED_CONTEXT_WINDOW_CAP = 400_000
++
+ export function byokModelLimits(connection: {
+   contextWindow?: number
+   maxOutputTokens?: number
+ }) {
+-  const contextWindow = connection.contextWindow ?? 32768
++  const contextWindow = connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW
+   const maxOutputTokens =
+-    connection.maxOutputTokens ?? Math.min(4096, Math.floor(contextWindow / 4))
++    connection.maxOutputTokens ??
++    Math.min(BYOK_DEFAULT_MAX_OUTPUT_TOKENS, Math.floor(contextWindow / 4))
+   if (
+     !Number.isInteger(contextWindow) ||
+     contextWindow < 4096 ||
+     contextWindow > 2_000_000 ||
+     !Number.isInteger(maxOutputTokens) ||
+     maxOutputTokens < 1 ||
+     maxOutputTokens >= contextWindow
+   ) {
+     throw new Error(
+       'Choose a context limit of 4096–2000000 tokens and a smaller positive output limit',
+     )
+   }
+   return {
+     contextWindow,
+     maxOutputTokens,
+     maxContextLength: Math.floor((contextWindow - maxOutputTokens) * 0.9),
+   }
+ }
+ 
++/** True when the connection carries the untouched default limits (see above). */
++export function hasDefaultByokLimits(connection: {
++  contextWindow?: number
++  maxOutputTokens?: number
++}): boolean {
++  return (
++    (connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW) ===
++      BYOK_DEFAULT_CONTEXT_WINDOW &&
++    (connection.maxOutputTokens ?? BYOK_DEFAULT_MAX_OUTPUT_TOKENS) ===
++      BYOK_DEFAULT_MAX_OUTPUT_TOKENS
++  )
++}
++
++function isLoopbackByokEndpoint(
++  connection: Pick<ByokConnection, 'provider' | 'baseUrl'>,
++): boolean {
++  if (connection.provider !== 'openai-compatible') return false
++  try {
++    const { hostname } = new URL(
++      normalizeByokBaseUrl(connection.provider, connection.baseUrl),
++    )
++    return ['localhost', '127.0.0.1', '[::1]'].includes(hostname)
++  } catch {
++    return false
++  }
++}
++
++/** Fields OpenAI-compatible `/models` listings use for a model's window:
++ *  OpenRouter/Together (`context_length`), Groq (`context_window`), vLLM
++ *  (`max_model_len`), LM Studio (`loaded_context_length`), and others. */
++const CONTEXT_WINDOW_FIELDS = [
++  'context_length',
++  'context_window',
++  'max_model_len',
++  'max_context_length',
++  'loaded_context_length',
++] as const
++
++function positiveInteger(value: unknown): number | undefined {
++  const number = typeof value === 'string' ? Number(value) : value
++  return typeof number === 'number' && Number.isInteger(number) && number > 0
++    ? number
++    : undefined
++}
++
++/** The window a `/models` listing reports for `model`, or undefined. */
++export function contextWindowFromModelList(
++  body: unknown,
++  model: string,
++): number | undefined {
++  const list = Array.isArray(body)
++    ? body
++    : body && typeof body === 'object' && Array.isArray((body as any).data)
++      ? ((body as any).data as unknown[])
++      : []
++  const entries = list.filter(
++    (entry): entry is Record<string, unknown> =>
++      !!entry && typeof entry === 'object',
++  )
++  // OpenRouter variants (`vendor/model:free`) fall back to the base model.
++  const candidates = [model, model.replace(/:[^/:]+$/, '')]
++  for (const id of candidates) {
++    const entry = entries.find(
++      (item) => item.id === id || item.canonical_slug === id,
++    )
++    if (!entry) continue
++    const topProvider =
++      entry.top_provider && typeof entry.top_provider === 'object'
++        ? (entry.top_provider as Record<string, unknown>)
++        : {}
++    for (const value of [
++      ...CONTEXT_WINDOW_FIELDS.map((field) => entry[field]),
++      topProvider.context_length,
++    ]) {
++      const window = positiveInteger(value)
++      if (window !== undefined) return window
++    }
++  }
++  return undefined
++}
++
++const discoveredWindows = new Map<
++  string,
++  { expiresAt: number; window: Promise<number | undefined> }
++>()
++const DISCOVERY_HIT_TTL_MS = 6 * 60 * 60 * 1000
++const DISCOVERY_MISS_TTL_MS = 10 * 60 * 1000
++const DISCOVERY_TIMEOUT_MS = 4_000
++
++/** Test seam: forget every cached discovery. */
++export function clearByokContextWindowCache(): void {
++  discoveredWindows.clear()
++}
++
++/**
++ * Ask the provider's `/models` listing how large this model's window is.
++ * Best effort: never throws, and a miss is remembered briefly so a provider
++ * without the field is not asked on every turn. The listing is what the
++ * connection check already calls; OpenRouter's is public, so the key is sent
++ * only to an OpenAI-compatible endpoint that needs it.
++ */
++export async function discoverByokContextWindow(
++  connection: Pick<
++    ResolvedByokConnection,
++    'provider' | 'baseUrl' | 'model' | 'apiKey'
++  >,
++  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
++): Promise<number | undefined> {
++  let base: string
++  try {
++    base = normalizeByokBaseUrl(connection.provider, connection.baseUrl)
++  } catch {
++    return undefined
++  }
++  const key = `${base}\n${connection.model}`
++  const now = Date.now()
++  const cached = discoveredWindows.get(key)
++  if (cached && cached.expiresAt > now) return cached.window
++  const window = (async () => {
++    try {
++      const response = await fetchImpl(`${base}/models`, {
++        headers:
++          connection.provider === 'openrouter'
++            ? {}
++            : { Authorization: `Bearer ${connection.apiKey}` },
++        redirect: 'error',
++        signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
++      })
++      if (!response.ok) {
++        await response.body?.cancel()
++        return undefined
++      }
++      return contextWindowFromModelList(await response.json(), connection.model)
++    } catch {
++      return undefined
++    }
++  })()
++  discoveredWindows.set(key, { expiresAt: now + DISCOVERY_HIT_TTL_MS, window })
++  const result = await window
++  if (result === undefined)
++    discoveredWindows.set(key, {
++      expiresAt: now + DISCOVERY_MISS_TTL_MS,
++      window,
++    })
++  return result
++}
++
++/**
++ * The connection a run should use: identical, unless its limits are the
++ * untouched defaults. Those are a 32,768-token guess, and for a coding agent
++ * whose tool schemas and prompt alone are ~15-20k tokens, compacting at 80% of
++ * 90% of (32,768 - 4,096) leaves a few thousand tokens of conversation: every
++ * few tool calls the run compacted, and the summary itself sat above the line
++ * (Desktop feedback 2026-09-24 and 09-27, "compacts every 3-5 turns").
++ *
++ * The provider's own number wins when its `/models` listing reports one
++ * (capped at BYOK_DISCOVERED_CONTEXT_WINDOW_CAP). Otherwise a remote endpoint
++ * gets 128k, which nearly every hosted coding model supports, and a loopback
++ * server keeps the configured default, because a local server's window is
++ * whatever it was launched with. Limits a user actually typed are never
++ * replaced. The credential stays non-enumerable on the copy.
++ */
++export async function withEffectiveByokLimits(
++  connection: ResolvedByokConnection,
++  options: { fetch?: typeof globalThis.fetch } = {},
++): Promise<ResolvedByokConnection> {
++  if (!hasDefaultByokLimits(connection)) return connection
++  const discovered = await discoverByokContextWindow(connection, options.fetch)
++  const contextWindow =
++    // A window must exceed the output limit (byokModelLimits' own rule).
++    discovered !== undefined && discovered > BYOK_DEFAULT_MAX_OUTPUT_TOKENS
++      ? Math.min(discovered, BYOK_DISCOVERED_CONTEXT_WINDOW_CAP)
++      : isLoopbackByokEndpoint(connection)
++        ? BYOK_DEFAULT_CONTEXT_WINDOW
++        : BYOK_UNKNOWN_REMOTE_CONTEXT_WINDOW
++  if (
++    contextWindow === (connection.contextWindow ?? BYOK_DEFAULT_CONTEXT_WINDOW)
++  )
++    return connection
++  const effective = {
++    ...connection,
++    contextWindow,
++    maxOutputTokens:
++      connection.maxOutputTokens ?? BYOK_DEFAULT_MAX_OUTPUT_TOKENS,
++  } as ResolvedByokConnection
++  Object.defineProperty(effective, 'apiKey', {
++    value: connection.apiKey,
++    enumerable: false,
++  })
++  if (connection.assertCurrent)
++    Object.defineProperty(effective, 'assertCurrent', {
++      value: connection.assertCurrent,
++      enumerable: false,
++    })
++  return Object.freeze(effective)
++}
++
+ function cleanInput(input: ByokConnectionInput) {
+   const limits = byokModelLimits(input)
+   const name = text.safeParse(input.name),
+     model = text.safeParse(input.model)
+   if (!name.success || !model.success)
+     throw new Error('Connection name and model must contain 1–256 characters')
+   const baseUrl = normalizeByokBaseUrl(input.provider, input.baseUrl)
+   if (
+     input.apiKey !== undefined &&
+     (!input.apiKey.trim() ||
+       /[\r\n]/.test(input.apiKey) ||
+       input.apiKey.length > 4096)
+   ) {
+     throw new Error(
+       'Enter a non-empty API key without line breaks (maximum 4096 characters)',
+     )
+   }
+   if (
+     input.credentialRef !== undefined &&
+     !envReference.test(input.credentialRef)
+   ) {
+     throw new Error(
+       'Only explicit env:VARIABLE credential references may be supplied',
+     )
+   }
