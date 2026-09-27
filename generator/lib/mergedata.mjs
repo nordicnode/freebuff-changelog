@@ -244,7 +244,18 @@ const MERGERS = {
   'changelog.json': mergeChangelog,
   'ai-summaries.json': mergeAiCache,
   'state.json': mergeSyncState,
-  'open-prs.json': mergeOpenPrs
+  'open-prs.json': mergeOpenPrs,
+  // Without this entry the snapshot won outright, and howto.json has no merger
+  // to lose to. capturePendingWrites reads the file at the start of a cycle and
+  // persistMerged writes that snapshot back just before the push, so any cycle
+  // that began before someone else's answers landed put its stale copy over
+  // them: a backfill run captured 54 answers, the guide's own generation pushed
+  // 178, and the backfill committed 54 back. The answers were gone from main,
+  // and the page served 54 with no sign that 124 more existed.
+  //
+  // The other four files were protected from exactly this by their mergers; the
+  // guide was in the capture list without one, which is the bug.
+  'howto.json': mergeAnswerCache
 }
 
 /**

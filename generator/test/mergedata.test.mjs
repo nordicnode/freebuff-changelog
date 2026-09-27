@@ -127,6 +127,43 @@ test('persistMerged re-reads disk and cannot revert a newer analyze result', asy
   assert.ok(result.entries[0].ai, 'this cycle summary survived')
 })
 
+test('persistMerged cannot let a stale snapshot delete newer how-to answers', async () => {
+  // The real loss: a backfill cycle captured 54 answers at its start, the
+  // guide's own generation pushed 178 in the meantime, and the cycle's commit
+  // put its 54-record snapshot back over them. howto.json was in the capture
+  // list with no merger, so the snapshot won outright and 124 answers vanished
+  // from main with nothing recording that they had existed.
+  const DATA = await mkdtemp(join(tmpdir(), 'fb-howto-merge-'))
+  const path = `${DATA}/howto.json`
+  const answer = (q, at, extra = {}) => ({ q, v: 2, at, covered: true, answer: `answer for ${q}`, used: [], ...extra })
+
+  // What this process captured at the start of its cycle.
+  const snapshot = { k1: answer('how do I export?', '2026-09-27T10:00:00Z') }
+  // What landed on disk while it worked: the same answer, plus 123 more.
+  const onDisk = { k1: answer('how do I export?', '2026-09-27T10:00:00Z') }
+  for (let i = 0; i < 123; i++) onDisk[`n${i}`] = answer(`how do I do thing ${i}?`, '2026-09-27T11:00:00Z')
+  await writeJson(path, onDisk)
+
+  await persistMerged({ [path]: snapshot })
+  const merged = JSON.parse(await readFile(path, 'utf8'))
+  assert.equal(Object.keys(merged).length, 124, `the newer answers survive the stale snapshot, got ${Object.keys(merged).length}`)
+  assert.ok(merged.k1, 'and the shared answer is still there')
+  for (let i = 0; i < 123; i++) assert.ok(merged[`n${i}`], `n${i} survived`)
+})
+
+test('persistMerged keeps a newer answer when a stale snapshot holds the same key', async () => {
+  // Same key, two writes: the stale side must not win on a tie of union order.
+  const DATA = await mkdtemp(join(tmpdir(), 'fb-howto-key-'))
+  const path = `${DATA}/howto.json`
+  const stale = { k: { q: 'how do I export?', v: 1, at: '2026-09-27T09:00:00Z', covered: false, answer: 'no answer', used: [] } }
+  const fresh = { k: { q: 'how do I export?', v: 2, at: '2026-09-27T12:00:00Z', covered: true, answer: 'type /export', used: ['cli/x.ts'] } }
+  await writeJson(path, fresh)
+  await persistMerged({ [path]: stale })
+  const merged = JSON.parse(await readFile(path, 'utf8'))
+  assert.equal(merged.k.answer, 'type /export', 'the answered version wins over the decline')
+  assert.equal(merged.k.covered, true)
+})
+
 test('capturePendingWrites + persistMerged are a no-op on an empty data dir', async () => {
   const DATA = await mkdtemp(join(tmpdir(), 'fb-empty-'))
   const pending = await capturePendingWrites(DATA)
