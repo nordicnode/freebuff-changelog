@@ -153,7 +153,13 @@ const UNITS = new Set(['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'e
 
 function wordNumber (phrase) {
   const parts = phrase.toLowerCase().split(/[\s-]+/).filter(Boolean)
-  if (!parts.length || parts.some(p => !(p in NUMBER_WORDS))) return null
+  // Object.hasOwn, never `in`. A plain-object literal inherits from
+  // Object.prototype, so `in` said yes to "constructor", "toString" and
+  // "valueOf" and wordNumber returned the *function* instead of a number --
+  // which then failed every comparison in the caller and was reported as an
+  // ungrounded number, throwing away a correct answer that happened to say
+  // "the constructor". Every other word was fine.
+  if (!parts.length || parts.some(p => !Object.hasOwn(NUMBER_WORDS, p))) return null
   if (parts.length === 1) return NUMBER_WORDS[parts[0]]
   // "forty-one" is the case this exists for: a compound of a ten and a unit.
   if (parts.length === 2 && TENS.has(parts[0]) && UNITS.has(parts[1])) {

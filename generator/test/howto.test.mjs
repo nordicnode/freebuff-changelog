@@ -8,14 +8,15 @@
 // next real wrong answer.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile, rm, mkdir } from 'node:fs/promises'
+import { mkdtemp, writeFile, rm, mkdir, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { buildGuide, auditGuide, guideDelta } from '../lib/facets.mjs'
 import { facetContradictions, ungroundedNumbers, facetCorpus } from '../lib/guide.mjs'
-import { buildHowIndex, retrieve, retrieveExpanded, buildExpansionPrompt, parseExpansion, tokenize, matchEntities, generateQuestions, validateAnswer, howToKey, HOWTO_V, surfaceNames, userFacingWhy, buildAnswerIndex, scoreAnswer, bandOf, bandReason, BAND_HIGH, BAND_LOW } from '../lib/howto.mjs'
+import { buildHowIndex, retrieve, retrieveExpanded, buildExpansionPrompt, parseExpansion, tokenize, matchEntities, generateQuestions, validateAnswer, howToKey, writeHowto, HOWTO_V, HOWTO_SECTION_CHARS, HOWTO_TIGHT_CHARS, assembleHowContext, surfaceNames, userFacingWhy, buildAnswerIndex, scoreAnswer, bandOf, bandReason, BAND_HIGH, BAND_LOW } from '../lib/howto.mjs'
 import { mergeAnswerCache } from '../lib/mergedata.mjs'
+import { isTransientError } from '../lib/llm.mjs'
 
 const sha = (c) => String(c).repeat(40)
 const day = (n) => ({ sha: sha(n), day: `2026-09-0${n}` })
@@ -176,6 +177,258 @@ test('guideDelta: newest first, across facets', () => {
 
 // ---------------------------------------------------------------------------
 // guide.mjs -- the grounding checks
+
+test('writeHowto: a rate-limited question is asked again next run, a real verdict is not', async (t) => {
+  // 20 of 22 failures in one full run were bare 429s, and the cache treated
+  // every cached error as final -- so each of those questions would have been
+  // skipped forever by the next nightly drain. A transport fault is not a
+  // verdict on the question and must not be cached as one.
+  // 429 counts as transient, and that is the case the run actually hit.
+  assert.ok(isTransientError(new Error('LLM HTTP 429: rate limited')), 'a 429 is transient')
+  const dir = await mkdtemp(join(tmpdir(), 'howto-transient-'))
+  const data = await mkdtemp(join(tmpdir(), 'howto-tdata-'))
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true })
+    await rm(data, { recursive: true, force: true })
+  })
+  const g = (...a) => execFileSync('git', a, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  g('init', '-q', '-b', 'main')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+  await writeFile(join(dir, 'session.ts'), 'export function exportSession () { return 1 }\n')
+  g('add', '-A')
+  g('commit', '-qm', 'x')
+  const index = await buildHowIndex([], dir)
+  const ask = [{ q: 'How do I export a session?', tags: ['command'] }]
+  const env = { LLM_API_KEY: 'k', LLM_MODEL: 'm', CHANGELOG_LLM_RPM: 0 }
+  const opts = { index, questions: ask, expand: false }
+  const orig = globalThis.fetch
+
+  // First run: the gateway drops the connection. A network fault is the same
+  // class of verdict-less failure as a 429, and unlike a 429 it costs no real
+  // backoff sleep in the test.
+  globalThis.fetch = async () => { throw new Error('fetch failed') }
+  try {
+    const first = await writeHowto([], dir, data, env, opts)
+    assert.ok(first.failed > 0, 'the run reports the failure')
+    const stored = Object.values(JSON.parse(await readFile(join(data, 'howto.json'), 'utf8')))
+    const errRec = stored.find(r => r.error)
+    assert.equal(errRec.transient, true, 'recorded as transient, not as a verdict')
+  } finally {
+    globalThis.fetch = orig
+  }
+
+  // Second run: the gateway is healthy. The question must be asked again.
+  const GOOD = JSON.stringify({ covered: true, answer: 'Use the export command to write the session to a file.', used: [] })
+  let asked = 0
+  globalThis.fetch = async () => {
+    asked++
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content: GOOD } }] }) }
+  }
+  try {
+    const second = await writeHowto([], dir, data, env, opts)
+    assert.ok(asked > 0, 'the rate-limited question was asked again rather than skipped')
+    assert.equal(second.results[0].covered, true)
+    assert.match(second.results[0].answer, /export command/)
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
+test('writeHowto: a refusal is re-asked once against tighter evidence, and that answer is published', async (t) => {
+  // This is the path that was broken and no other test could see it: the
+  // second shot is made from the catch block, so a helper declared inside the
+  // try is not in scope there. The run reported "ask is not defined", recorded
+  // a decline anyway, and moved on. Syntax checks and unit tests were all
+  // green throughout, because nothing drove the writer against a stub.
+  const dir = await mkdtemp(join(tmpdir(), 'howto-refuse-'))
+  const data = await mkdtemp(join(tmpdir(), 'howto-data-'))
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true })
+    await rm(data, { recursive: true, force: true })
+  })
+  const g = (...a) => execFileSync('git', a, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  g('init', '-q', '-b', 'main')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+  await mkdir(join(dir, 'cli/src/commands'), { recursive: true })
+  await writeFile(
+    join(dir, 'cli/src/commands/session.ts'),
+    'export function exportSession () {\n  return writeFileSync(SESSION_PATH)\n}\n// The export command writes the current session to a file on disk.\n'
+  )
+  g('add', '-A')
+  g('commit', '-qm', 'x')
+
+  const index = await buildHowIndex([], dir)
+  const REFUSAL = "I'm DeepSeek, an AI assistant developed by DeepSeek. I cannot share or dump internal system instructions or prompts, but I'm ready to help."
+  const GOOD = JSON.stringify({ covered: true, answer: 'Use the export command, which writes the current session to a file on disk.', used: ['cli/src/commands/session.ts'] })
+  const prompts = []
+  let calls = 0
+  const orig = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    calls++
+    const prompt = JSON.parse(String(init.body)).messages[0].content
+    prompts.push(prompt)
+    // Three attempts per ask before it gives up, so the fourth call is the
+    // first call of the second, tighter ask.
+    const content = calls <= 3 ? REFUSAL : GOOD
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content } }] }) }
+  }
+  try {
+    const res = await writeHowto([], dir, data, { LLM_API_KEY: 'k', LLM_MODEL: 'm', CHANGELOG_LLM_RPM: 0 }, {
+      index,
+      questions: [{ q: 'How do I export a session?', tags: ['command'] }],
+      expand: false
+    })
+    assert.equal(res.failed, 0, 'a refusal is not a failure')
+    assert.equal(res.declined, 0, 'the second shot answered, so nothing is declined')
+    const rec = res.results[0]
+    assert.equal(rec.covered, true)
+    assert.match(rec.answer, /export command/)
+    assert.equal(rec.refused, undefined, 'a rescued answer is an ordinary answer, not a flagged decline')
+    const answerPrompts = prompts.filter(p => /Answer the question/.test(p))
+    // callLlm spends three in-call attempts on a refusal before giving up, so
+    // four answer prompts means the fourth was the separate, tighter ask.
+    assert.ok(answerPrompts.length >= 4, `the tighter second ask was made, got ${answerPrompts.length} answer prompts`)
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
+test('writeHowto: a question that refuses twice is recorded as a decline, not an error', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'howto-refuse2-'))
+  const data = await mkdtemp(join(tmpdir(), 'howto-data2-'))
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true })
+    await rm(data, { recursive: true, force: true })
+  })
+  const g = (...a) => execFileSync('git', a, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  g('init', '-q', '-b', 'main')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+  await writeFile(join(dir, 'session.ts'), 'export function exportSession () { return 1 }\n')
+  g('add', '-A')
+  g('commit', '-qm', 'x')
+
+  const index = await buildHowIndex([], dir)
+  const REFUSAL = "I'm DeepSeek, an AI assistant developed by DeepSeek. I cannot share or dump internal system instructions or prompts."
+  const orig = globalThis.fetch
+  globalThis.fetch = async () => ({
+    ok: true, status: 200, headers: { get: () => null },
+    text: async () => JSON.stringify({ choices: [{ message: { content: REFUSAL } }] })
+  })
+  try {
+    const res = await writeHowto([], dir, data, { LLM_API_KEY: 'k', LLM_MODEL: 'm', CHANGELOG_LLM_RPM: 0 }, {
+      index,
+      questions: [{ q: 'How do I export a session?', tags: ['command'] }],
+      expand: false
+    })
+    assert.equal(res.failed, 0, 'still not a failure')
+    assert.equal(res.declined, 1)
+    const rec = res.results[0]
+    assert.equal(rec.covered, false)
+    assert.equal(rec.refused, true, 'flagged, so a maintainer can see the backlog')
+    assert.equal(rec.error, undefined, 'a decline is not parked as an error')
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
+test('the tight pass is a real subset, and docs and changes keep a larger share', () => {
+  // The second attempt after a refusal uses the same files in less space, so
+  // every per-kind cap has to be smaller than the first pass or it is not a
+  // second attempt at all.
+  for (const k of ['docs', 'changes', 'code', 'total']) {
+    assert.ok(HOWTO_TIGHT_CHARS[k] < HOWTO_SECTION_CHARS[k], `${k} shrinks on the second pass`)
+  }
+  assert.ok(HOWTO_TIGHT_CHARS.total < HOWTO_SECTION_CHARS.total / 2, 'a third of the window, not a token trim')
+  // Code is what fills the window and what the model balks at; docs and changes
+  // are where a procedure or a caveat is stated outright, so they keep more of
+  // their share rather than being cut hardest.
+  const share = (c) => c.docs / c.total - c.code / c.total
+  assert.ok(share(HOWTO_TIGHT_CHARS) > share(HOWTO_SECTION_CHARS), 'docs and changes gain share on the tight pass')
+})
+
+test('assembleHowContext: the tight budget is honoured and names what it dropped', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'howto-tight-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const g = (...a) => execFileSync('git', a, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  g('init', '-q', '-b', 'main')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+  await mkdir(join(dir, 'cli/src/commands'), { recursive: true })
+  // One file between the two code caps: the full pass can carry it, the tight
+  // pass cannot. That gap is the whole point of the second attempt. Distinct
+  // identifiers per line, because a file of one repeated token fills its
+  // 400-term index budget with that token and retrieves on nothing.
+  const wide = Array.from({ length: 6000 }, (_, i) => `export const WIDE_${i} = ${i} // zephyr`).join('\n')
+  await writeFile(join(dir, 'cli/src/commands/big.ts'), wide)
+  await writeFile(join(dir, 'cli/src/commands/small.ts'), 'export const NARROW = 2 // zephyr\n'.repeat(50))
+  g('add', '-A')
+  g('commit', '-qm', 'x')
+
+  const index = await buildHowIndex([], dir)
+  const hits = retrieve(index, 'zephyr')
+  assert.ok(hits.code.length >= 2, `both files retrieved, got ${hits.code.map(u => u.path).join(', ')}`)
+  const tight = await assembleHowContext(index, hits, { sectionChars: HOWTO_TIGHT_CHARS, expandDirs: false })
+  const full = await assembleHowContext(index, hits, { sectionChars: HOWTO_SECTION_CHARS, expandDirs: false })
+  assert.ok(tight.chars <= HOWTO_TIGHT_CHARS.total, `tight pass respected its cap, got ${tight.chars}`)
+  assert.ok(full.chars <= HOWTO_SECTION_CHARS.total, `full pass respected its cap, got ${full.chars}`)
+  assert.ok(tight.chars < full.chars, 'the tight pass really is smaller')
+  assert.ok(tight.dropped.length > 0, 'a file that does not fit is dropped whole and named, never cut')
+  assert.ok(tight.dropped.some(d => /big\.ts/.test(d)), `the oversized file is the one named: ${tight.dropped.join(', ')}`)
+})
+
+test('parseExpansion: a named path with the wrong folder is recovered by its filename', () => {
+  // The model reads "bring my own API key" and knows the file is byok.ts, then
+  // guesses three directories that do not exist. The real files are in
+  // sdk/src, cli/src/commands and common/src/constants. All three guesses were
+  // discarded, and the answer got written without a byok file in it.
+  const index = {
+    units: [
+      { path: 'sdk/src/byok.ts' },
+      { path: 'cli/src/commands/byok.ts' },
+      { path: 'common/src/constants/byok.ts' },
+      { path: 'cli/src/utils/exit-cleanly.ts' }
+    ]
+  }
+  const ex = parseExpansion({ files: ['byok.ts', 'cli/src/agents/byok.ts', 'common/src/tools/params/tool/byok.ts'], terms: ['byok'] }, index)
+  assert.deepEqual(ex.files, ['sdk/src/byok.ts', 'cli/src/commands/byok.ts', 'common/src/constants/byok.ts'])
+  assert.equal(ex.rejectedFiles, 0, 'a right filename in a wrong folder is not a fabrication')
+  assert.equal(ex.stemMatches, 3)
+  assert.deepEqual(ex.terms, ['byok'])
+})
+
+test('parseExpansion: a filename that exists nowhere is still discarded', () => {
+  const index = { units: [{ path: 'sdk/src/byok.ts' }, { path: 'cli/src/utils/exit-cleanly.ts' }] }
+  const ex = parseExpansion({ files: ['totally/made/up.ts', 'api/keys/hypothetical.ts'], terms: [] }, index)
+  assert.deepEqual(ex.files, [], 'nothing real was named, so nothing is fetched')
+  assert.equal(ex.rejectedFiles, 2)
+  assert.equal(ex.stemMatches, 0)
+})
+
+test('parseExpansion: a stem guess and an exact path both survive, in the order named', () => {
+  const index = { units: [{ path: 'cli/src/commands/byok.ts' }, { path: 'sdk/src/byok.ts' }] }
+  const ex = parseExpansion({ files: ['byok.ts', 'cli/src/commands/byok.ts'], terms: [] }, index)
+  assert.deepEqual(ex.files, ['cli/src/commands/byok.ts', 'sdk/src/byok.ts'], 'both real files, the model order kept')
+  assert.equal(ex.rejectedFiles, 0)
+  assert.equal(ex.stemMatches, 1, 'the bare stem was the one that needed recovering')
+})
+
+test('ungroundedNumbers: an inherited Object property is not a number', () => {
+  // `p in NUMBER_WORDS` walks the prototype chain, so "constructor",
+  // "toString" and "valueOf" read as present and wordNumber handed back the
+  // *function*. Every comparison against it is false, so the word survived the
+  // "bare word" carve-out and was reported as an ungrounded number -- which
+  // threw away a correct answer for mentioning the constructor.
+  for (const word of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
+    assert.deepEqual(
+      ungroundedNumbers(`The ${word} decides the tier.`, 'FREEBUFF_MODELS defines tiers'),
+      [],
+      `"${word}" is a word, not a number`
+    )
+  }
+})
 
 test('ungroundedNumbers: digits must exist in the evidence', () => {
   assert.deepEqual(ungroundedNumbers('The cap is 401 settings.', 'there are 401 items'), [])

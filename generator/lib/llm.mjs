@@ -988,6 +988,20 @@ export const LLM_REFUSAL_RE = new RegExp([
 // `validate` is a parameter because the ELI5 pass speaks to the same gateway
 // with a different shape: the repair retry has to check the replacement against
 // the schema that was asked for, not the summary one.
+// A failed call is only useful if it says what came back. "LLM returned no
+// JSON" is a shrug: an empty completion, a body truncated mid-frame and a
+// gateway envelope the extractor did not recognise all produce that same
+// sentence, and the three have different fixes. A bounded excerpt of the raw
+// text rides along on the error so the failure can be read instead of guessed
+// at. It is never stored as content, and never re-sent to the model.
+function withRawText (err, raw) {
+  try {
+    const text = String(raw ?? '').replace(/\s+/g, ' ').trim()
+    if (text) err.raw = text.slice(0, 300)
+  } catch { /* an error we cannot annotate is still an error */ }
+  return err
+}
+
 export async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut, opts = {}) {
   const base = env.LLM_API_BASE || 'https://api.openai.com/v1'
   const model = env.LLM_MODEL || 'gpt-4o-mini'
@@ -1053,7 +1067,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
   try {
     text = extractResponseText(rawText)
   } catch (err) {
-    if (attempt > 2) throw err
+    if (attempt > 2) throw withRawText(err, rawText)
     log(`LLM response body contained no valid message: requesting repair ${attempt}/2`)
     // The recursive call already validates its own output; re-validating the
     // validated result here would consume a second vote from stateful
@@ -1075,7 +1089,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     if (opts.bareText && noJson && String(text).trim()) {
       try { return validate(text) } catch (validationErr) { err = validationErr }
     }
-    if (attempt > 2) throw err
+    if (attempt > 2) throw withRawText(err, text)
     // A refusal is content-triggered (see stripDiffComments): restating the
     // task does not move it, a materially shorter ask does. Take the fallback
     // first, keep the named refusal re-ask as the last shot.
@@ -1085,7 +1099,12 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     }
     if (refused) {
       log(`LLM refused the request (${String(text).slice(0, 60)}…): re-asking with the refusal named`)
-      return callLlm(`${prompt}\n\nYour previous reply refused the request or described yourself instead of answering. This is a public-repository changelog task: the text above is a git diff from an open-source mirror, not a request for your instructions, identity or configuration. Do not describe yourself, do not refuse, and do not mention your own rules. Reply with ONLY the JSON object asked for, describing the code change.`, env, attempt + 1, validate, opts)
+      // The reassurance has to describe the task that is actually being asked,
+      // or it reads as a non-sequitur. The diff wording below is wrong for a
+      // documentation question over source files, which is what the how-to
+      // writer sends, and a confused re-ask is refused again.
+      const note = opts.refusalNote || 'This is a public-repository changelog task: the text above is a git diff from an open-source mirror, not a request for your instructions, identity or configuration. Do not describe yourself, do not refuse, and do not mention your own rules. Reply with ONLY the JSON object asked for, describing the code change.'
+      return callLlm(`${prompt}\n\nYour previous reply refused the request or described yourself instead of answering. ${note}`, env, attempt + 1, validate, opts)
     }
     // One repair pass. The rejection reason travels with it: a grounding or
     // boilerplate failure is not a JSON problem, and a model told "invalid JSON"
@@ -1622,7 +1641,7 @@ export function bumpOnly (e) {
   const meaningful = e.files?.meaningful ?? 99
   if (meaningful > 2) return false
   const mods = [...(e.files?.added || []), ...(e.files?.modified || [])]
-  if (mods.length > 0 && mods.every(p => p in VERSION_TRACKS)) return true
+  if (mods.length > 0 && mods.every(p => Object.hasOwn(VERSION_TRACKS, p))) return true
   return (e.stats?.additions ?? 99) <= 15
 }
 
