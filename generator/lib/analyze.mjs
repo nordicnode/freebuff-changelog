@@ -127,7 +127,7 @@ async function diffText (repoDir, range, pathspecs, maxBytes, contextLines = 25)
 
 // Clean unified diff of a commit for in-browser inspection, excluding lockfiles.
 // With excludeTests, pure test files drop out too (matches what the LLM prompt claims).
-export async function extractCleanDiff (repoDir, base, head, maxBytes = 250000, excludeTests = false, contextLines = 25) {
+export async function extractCleanDiff (repoDir, base, head, maxBytes = 600000, excludeTests = false, contextLines = 25) {
   // `base...head` needs two commits; the empty tree is neither, so a root commit
   // diffs against it directly.
   const range = base === EMPTY_TREE ? [EMPTY_TREE, head] : [`${base}...${head}`]
@@ -164,7 +164,7 @@ export function clearShowCache () { SHOW_CACHE.clear() }
  * Extract leading module-level documentation comments or headers from touched files.
  * Provides ground-truth architectural purpose directly to the LLM to prevent hallucinations.
  */
-export async function extractFileHeaders (repoDir, ref, files, maxFiles = 6, maxLinesPerFile = 40) {
+export async function extractFileHeaders (repoDir, ref, files, maxFiles = 12, maxLinesPerFile = 60) {
   if (!repoDir || !ref || !files || !files.length) return []
   const targets = files
     .map(f => (typeof f === 'string' ? f : f?.path || ''))
@@ -227,7 +227,7 @@ export async function extractFileHeaders (repoDir, ref, files, maxFiles = 6, max
  * Longitudinal commit lineage: finds up to `maxEntries` previous commits that modified
  * any of the same files as `targetEntry`, establishing how the subsystem evolved.
  */
-export function findFileHistory (entries, targetEntry, maxEntries = 10) {
+export function findFileHistory (entries, targetEntry, maxEntries = 20) {
   if (!entries || !targetEntry) return []
   const targetFiles = new Set(
     [...(targetEntry.files?.modified || []), ...(targetEntry.files?.added || [])]
@@ -273,7 +273,7 @@ export function findFileHistory (entries, targetEntry, maxEntries = 10) {
  * For small/focused modules (<= 250 lines), injects the complete source file.
  * For larger modules (> 250 lines), extracts the public exported interface outline.
  */
-export async function extractFullOrOutlinedFiles (repoDir, ref, files, maxLines = 250, maxFiles = 4) {
+export async function extractFullOrOutlinedFiles (repoDir, ref, files, maxLines = 700, maxFiles = 8) {
   if (!repoDir || !ref || !files || !files.length) return { fullFiles: [], exportOutlines: [] }
   const targets = files
     .map(f => (typeof f === 'string' ? f : f?.path || ''))
@@ -293,7 +293,7 @@ export async function extractFullOrOutlinedFiles (repoDir, ref, files, maxLines 
       } else {
         const exports = lines
           .filter(l => /^\s*export\s+(const|function|type|interface|class|enum|let|var|async\s+function|default)\s+/.test(l))
-          .slice(0, 30)
+          .slice(0, 60)
         if (exports.length) {
           exportOutlines.push({ path, outline: exports.join('\n').trim(), totalLines: lines.length })
         }
@@ -308,7 +308,7 @@ export async function extractFullOrOutlinedFiles (repoDir, ref, files, maxLines 
 /**
  * Finds the nearest parent directory README or architecture guide for touched files.
  */
-export async function extractSubsystemDocs (repoDir, ref, files, maxDocs = 2) {
+export async function extractSubsystemDocs (repoDir, ref, files, maxDocs = 4) {
   if (!repoDir || !ref || !files || !files.length) return []
   const targets = files
     .map(f => (typeof f === 'string' ? f : f?.path || ''))
@@ -328,7 +328,7 @@ export async function extractSubsystemDocs (repoDir, ref, files, maxDocs = 2) {
       try {
         const content = await showCached(repoDir, ref, candidate)
         if (content) {
-          const overview = content.split('\n').slice(0, 35).join('\n').trim()
+          const overview = content.split('\n').slice(0, 80).join('\n').trim()
           docs.push({ path: candidate, content: overview })
           break
         }

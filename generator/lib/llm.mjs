@@ -17,7 +17,13 @@
 //   CHANGELOG_LLM_CONCURRENCY  parallel API calls (default 2)
 //   CHANGELOG_ELI5_LIMIT       plain-English pass budget (defaults to the above)
 //   CHANGELOG_ELI5_DIFF=0      explain from the summary only, skip the diff
-//   CHANGELOG_ELI5_DIFF_BYTES  diff budget sent to the plain-English pass (6000)
+//   CHANGELOG_ELI5_DIFF_BYTES  operator cap on the diff sent to the plain-English
+//                              pass; unset means "all of it that fits the window"
+//   CHANGELOG_LLM_MAX_DIFF_BYTES  the same, for the summary and verifier prompts
+//   CHANGELOG_LLM_CONTEXT_TOKENS  the model's window (default 270000). Every
+//                              prompt takes the diff last, out of what the
+//                              context sections leave, so a small row sends its
+//                              whole diff and a huge one still cannot overflow.
 //   CHANGELOG_LLM_CHURN=1      also summarize lockfile/icon-only rows, from their
 //                              raw diff (~1,900 extra calls)
 //   CHANGELOG_LLM_ERROR_COOLDOWN_MS  retry failed entries after this (default 3600000)
@@ -196,18 +202,93 @@ export function budgetPatch (patch, maxBytes = 500000, perFile = 120000) {
 }
 
 // ---------------------------------------------------------------------------
+// The context window: measured, not guessed.
+//
+// The gateway reported 3.60 chars/token on real changelog prompts, and prefill
+// latency was flat from 21k to 73k tokens (8.3s vs 5.8s), so feeding it more
+// is neither slow nor less reliable. The one real risk is overflowing the
+// window, which fails the request outright and parks the row for the full
+// error cooldown. So the window is configured once, here, and every prompt
+// builder gives the diff whatever room the rest of the prompt leaves -- rather
+// than a fixed cap that has to be guessed low enough for the worst row and so
+// is really a cap on the *best* row too. That is the whole change: an ordinary
+// 3 KB row now sends all of it instead of a per-file slice of it.
+export const LLM_CONTEXT_TOKENS = Number(process.env.CHANGELOG_LLM_CONTEXT_TOKENS || 270000)
+// 3.2 against the 3.6 measured: a prompt that fits at 3.2 fits at 3.6.
+export const LLM_CHARS_PER_TOKEN = Number(process.env.CHANGELOG_LLM_CHARS_PER_TOKEN || 3.2)
+export const LLM_CONTEXT_CHARS = Math.floor(LLM_CONTEXT_TOKENS * LLM_CHARS_PER_TOKEN)
+// A floor so a row whose context sections alone fill the window still sends
+// real diff hunks: a cut diff grounds a row, an absent one leaves nothing to
+// ground it against.
+export const LLM_MIN_DIFF_ROOM = 20000
+const TRUNC_NOTICE = '\n…[diff truncated: the context window filled up; full diff on GitHub]…\n'
+
+// What is left for the diff once the rest of the prompt is paid for, honoring
+// an operator cap where one is set (CHANGELOG_LLM_MAX_DIFF_BYTES and friends).
+export function diffRoom (fixedChars, cap = Infinity) {
+  const room = Math.max(LLM_MIN_DIFF_ROOM, LLM_CONTEXT_CHARS - fixedChars)
+  return Math.max(2000, Math.min(Number.isFinite(cap) && cap > 0 ? cap : Infinity, room))
+}
+
+// Per-file share of the diff budget. A generated or vendored file must not eat
+// the whole room on its own; three files is the point of the division.
+export function perFileRoom (room) {
+  return Math.max(20000, Math.round(room / 3))
+}
+
+// Ceilings on what the *context* sections may claim. The window is generous
+// but a single snapshot can touch hundreds of files, and 40 of them at 700
+// lines each would leave the diff nothing. The diff is asked for what is left
+// afterwards, so this ordering is what protects the ground truth: a row whose
+// diff is enormous loses context, never hunks.
+export const CONTEXT_SECTION_CHARS = {
+  fullFiles: 200000,
+  exportOutlines: 50000,
+  fileHeaders: 50000,
+  subsystemDocs: 25000,
+  fileHistory: 30000
+}
+
+// Keep whole entries, in the order given, up to a section's share. Dropping a
+// whole file beats a half one: the model reads a function cut off mid-body as
+// the whole function.
+export function capSection (items, key, sizeOf, { limit = CONTEXT_SECTION_CHARS[key] } = {}) {
+  const kept = []
+  let used = 0
+  for (const it of items || []) {
+    const n = typeof sizeOf === 'function' ? sizeOf(it) : String(it ?? '').length
+    if (used + n > limit) break
+    kept.push(it)
+    used += n
+  }
+  return kept
+}
+
+// The safety net for the room arithmetic above. Both prompts put the diff last,
+// which is what makes this harmless: if a context section ever outgrows its
+// share, what gets cut is diff hunks, and a row with a cut diff is far better
+// off than a request the window rejects.
+export function fitToWindow (prompt, limit = LLM_CONTEXT_CHARS) {
+  if (prompt.length <= limit) return prompt
+  log(`prompt of ${prompt.length} chars exceeds the ${limit}-char context window; trimming the diff tail`)
+  return prompt.slice(0, Math.max(0, limit - TRUNC_NOTICE.length)) + TRUNC_NOTICE
+}
+
+// ---------------------------------------------------------------------------
 // Map-reduce for large diffs.
 //
-// A 500 KB single prompt on a 270K-context model leaves no room for source
-// context and still truncates the tail. Past MAP_REDUCE_THRESHOLD_BYTES the
-// diff is split by file into ~MAP_REDUCE_CHUNK_BYTES groups (at most
-// MAP_REDUCE_MAX_CHUNKS map calls + 1 fuse call); each chunk gets a focused
-// summary call, then a fuse call writes the entry from the chunk drafts.
-// Disable with CHANGELOG_LLM_MAPREDUCE=0. Map calls run sequentially so the
-// RPM budget and the enrich worker pool are never burst.
-export const MAP_REDUCE_THRESHOLD_BYTES = 150000
-export const MAP_REDUCE_CHUNK_BYTES = 100000
-export const MAP_REDUCE_MAX_CHUNKS = 6
+// Chunking is the lossy path: the fuse call writes the entry from drafts, so
+// anything a draft misreads survives into it, and the grounding check at the
+// fuse step is the only thing standing behind the result. It now sits above the
+// largest diff ever stored (250 KB) by a wide margin, so in practice only a
+// snapshot the diff store has never held engages it; a 270K window is ~864K
+// chars, enough for a 600 KB diff whole plus source context, and the threshold
+// keeps the last 200 KB of that range on the cheap path rather than the prompt
+// assembly path. Disable with CHANGELOG_LLM_MAPREDUCE=0. Map calls run
+// sequentially so the RPM budget and the enrich worker pool are never burst.
+export const MAP_REDUCE_THRESHOLD_BYTES = 400000
+export const MAP_REDUCE_CHUNK_BYTES = 250000
+export const MAP_REDUCE_MAX_CHUNKS = 8
 
 export function splitPatchByFile (patch) {
   return String(patch || '').split(/(?=^diff --git )/m)
@@ -509,7 +590,7 @@ export function buildPrompt (entry, patch, ctx = {}) {
     }
   }
   if (ctx.fileHistory && ctx.fileHistory.length) {
-    lines.push('Recent commit lineage for touched files (last up to 10 changes to these files):')
+    lines.push('Recent commit lineage for touched files (the last changes to these files):')
     for (const h of ctx.fileHistory) {
       lines.push(`- [${h.sha}] (${h.date}) touched ${h.overlap.join(', ')}: ${h.title}`)
       if (h.summary) lines.push(`  Context: ${truncateWords(h.summary, 250)}`)
@@ -533,9 +614,14 @@ export function buildPrompt (entry, patch, ctx = {}) {
       lines.push('```')
     }
   }
-  const maxDiff = Number(process.env.CHANGELOG_LLM_MAX_DIFF_BYTES) || 500000
-  lines.push('', 'Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):', '```diff', budgetPatch(patch, maxDiff, Math.max(100000, Math.round(maxDiff / 4))), '```')
-  return lines.filter(Boolean).join('\n')
+  // The diff is taken last, out of what the window has left. A fixed cap had to
+  // be guessed low enough for the largest row, which is really a cap on every
+  // row; this way an ordinary 3 KB diff goes out whole and a 600 KB one still
+  // cannot push the request past the window.
+  const body = lines.filter(Boolean).join('\n')
+  const room = diffRoom(body.length, Number(process.env.CHANGELOG_LLM_MAX_DIFF_BYTES) || Infinity)
+  lines.push('', 'Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):', '```diff', budgetPatch(patch, room, perFileRoom(room)), '```')
+  return fitToWindow(lines.filter(Boolean).join('\n'))
 }
 
 // A per-file digest of the whole diff: line counts plus a few representative
@@ -1957,6 +2043,16 @@ export function sequenceOnlyNames (sequence, corpusWithoutSequence) {
 
 export const CONTEXT_SMALL_DIFF_BYTES = 2000
 
+// How much of the surrounding code and history each pass gets to read. These
+// were sized for a much smaller window and were the binding constraint on
+// accuracy, not the diff: a row with a 3 KB diff was being told about a 4-file,
+// 250-line, 5-entry picture of a codebase the model can now read most of.
+export const FILE_HISTORY_MAX = 20
+export const FILE_HEADER_MAX_FILES = 12
+export const SUBSYSTEM_DOC_MAX = 4
+export const FULL_FILE_MAX_LINES = 700
+export const FULL_FILE_MAX_FILES = 8
+
 export function contextTier (patch, files = []) {
   const bytes = String(patch || '').length
   if (bytes < CONTEXT_SMALL_DIFF_BYTES && files.length <= 1) return 'small'
@@ -1980,15 +2076,25 @@ export async function gatherEntryContext (e, patch, { repoDir = null, entries = 
   if (factCount(freshFacts) > factCount(structured)) structured = freshFacts
   structured = await pruneKnownInputs(repoDir, e.prevSha || null, structured)
   const out = { tier, structured, fileHeaders: [], fileHistory: [], subsystemDocs: [], fullFiles: [], exportOutlines: [] }
-  if (entries) out.fileHistory = findFileHistory(entries, e, 10)
+  if (entries) {
+    out.fileHistory = capSection(findFileHistory(entries, e, FILE_HISTORY_MAX), 'fileHistory',
+      h => `${h.title || ''}${h.summary || ''}${(h.overlap || []).join(' ')}`.length)
+  }
   if (!repoDir || !files.length) return out
-  out.fileHeaders = await extractFileHeaders(repoDir, e.sha, files)
-  if (tier === 'small') return out
-  out.subsystemDocs = await extractSubsystemDocs(repoDir, e.sha, files)
+  out.fileHeaders = capSection(await extractFileHeaders(repoDir, e.sha, files, FILE_HEADER_MAX_FILES), 'fileHeaders',
+    h => String(h.header || '').length)
+  out.subsystemDocs = capSection(await extractSubsystemDocs(repoDir, e.sha, files, SUBSYSTEM_DOC_MAX), 'subsystemDocs',
+    d => String(d.content || '').length)
   if (withSource) {
-    const res = await extractFullOrOutlinedFiles(repoDir, e.sha, files)
-    out.fullFiles = res.fullFiles
-    out.exportOutlines = res.exportOutlines
+    // The small tier used to stop here, on the reasoning that a one-line
+    // constant edit needs no surrounding module. It is the opposite case: the
+    // diff is one line, so the file is the *only* thing that says what the
+    // constant controls and who reads it. It gets a smaller share, not none.
+    const res = tier === 'small'
+      ? await extractFullOrOutlinedFiles(repoDir, e.sha, files, 400, 4)
+      : await extractFullOrOutlinedFiles(repoDir, e.sha, files, FULL_FILE_MAX_LINES, FULL_FILE_MAX_FILES)
+    out.fullFiles = capSection(res.fullFiles, 'fullFiles', f => String(f.content || '').length)
+    out.exportOutlines = capSection(res.exportOutlines, 'exportOutlines', o => String(o.outline || '').length)
   }
   return out
 }
@@ -2029,7 +2135,7 @@ export function shouldVerify (e, clean, env = process.env) {
 }
 
 export function buildVerifyPrompt (entry, patch, clean, cautionNames = []) {
-  return [
+  const lines = [
     'You are checking a changelog entry against the diff it describes. Check EVERY sentence of the title, summary and evidence: for each factual claim (a file or function name, a behavior the diff implements, a motive, a performance or user-impact claim, the audience), decide whether the diff (plus the file list and notes) supports it.',
     'Be strict about facts and lenient about wording. Do not object to plain-language paraphrase of code that is present.',
     'Output a JSON object: {"supported": true|false, "issues": ["<one unsupported claim per string, quoting the words used>"], "claims": [{"quote": "<exact words from the entry>", "supported": true|false, "reason": "<why, in a few words>"}]}. An empty issues list with every claim supported means supported.',
@@ -2045,11 +2151,13 @@ export function buildVerifyPrompt (entry, patch, clean, cautionNames = []) {
     clean.audience ? `Audience: ${clean.audience}` : '',
     ...(cautionNames.length ? ['', `Names that appear ONLY in a same-day sibling commit's title or summary (not in this diff, file list or notes): ${cautionNames.join(', ')}. A claim about THIS commit that relies on one of these names must explicitly attribute it to the sibling commit; a claim that borrows one silently is unsupported.`] : []),
     '',
-    'Diff:',
-    '```diff',
-    budgetPatch(patch, 250000, 60000),
-    '```'
-  ].filter(Boolean).join('\n')
+    'Diff:'
+  ]
+  // Same rule as the asks: the verifier has to see the hunks the writer saw,
+  // or it "verifies" a summary against a diff the summary was not written from.
+  const body = lines.filter(Boolean).join('\n')
+  const room = diffRoom(body.length)
+  return fitToWindow([body, '```diff', budgetPatch(patch, room, perFileRoom(room)), '```'].filter(Boolean).join('\n'))
 }
 
 export function validateVerifyOut (out) {
@@ -2358,7 +2466,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       e.ai = { ...cached, ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}) }
       continue
     }
-    const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 25)
+    const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 40)
     const sequence = sequenceForEntry(byDayEntries, e, seqWindow)
     const prMeta = findPrMeta(e, prIndex)
     queue.push({ entry: e, patch, key, relText, sequence, prMeta })
@@ -2526,10 +2634,13 @@ export function eli5Done (e, releaseCtx = '', rollupV = 0) {
 }
 
 export function buildEli5Prompt (e, notes = [], ctx = {}) {
-  const { patch = '', siblings = [], diffBytes = 60000, releaseCtx = '', prMeta = null, sequence = null } = ctx
+  const { patch = '', siblings = [], diffBytes = Infinity, releaseCtx = '', prMeta = null, sequence = null } = ctx
 
   if (releaseCtx) {
-    return `Explain what shipped in this software release to a reader who is not a programmer and will not look at the code. This is a RELEASE ROLL-UP summarizing the capabilities, models, security protections, and improvements bundled into this version.
+    // Same window ceiling as the per-change ask. A roll-up carries the release
+    // window (up to RELEASE_CTX_MAX_CHARS) instead of a diff, so it is the one
+    // path that can fill the window on its own.
+    return fitToWindow(`Explain what shipped in this software release to a reader who is not a programmer and will not look at the code. This is a RELEASE ROLL-UP summarizing the capabilities, models, security protections, and improvements bundled into this version.
 
 ${ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP}
 
@@ -2563,7 +2674,7 @@ Rules:
 - Punctuation: Never use em-dashes; use commas, parentheses, or hyphens instead.
 - Jump straight into what shipped. Never start with conversational preambles ("In this release...", "Behind the scenes...", "What you would notice..."). Lead directly with the concrete capabilities or theme.
 
-Reply with JSON only: {"eli5": "..."}`
+Reply with JSON only: {"eli5": "..."}`)
   }
 
   const evidence = []
@@ -2652,7 +2763,13 @@ Reply with JSON only: {"eli5": "..."}`
     evidence.push(`Module purpose from touched files:\n${fhText}`)
   }
   if (ctx.fileHistory && ctx.fileHistory.length) {
-    const hist = ctx.fileHistory.slice(0, 5).map(h => `${h.date} [${h.sha}]: ${h.title}`).join(' ; ')
+    // All of them, each with a sentence of what it actually did. The pass used
+    // to ask the gatherer for ten lineage entries and then print five titles,
+    // which left the "why is this file shaped like this" question -- the one
+    // that catches a regression being fixed on purpose -- unanswerable.
+    const hist = ctx.fileHistory
+      .map(h => `${h.date} [${h.sha}] ${h.title}${h.summary ? ` (${firstSentence(h.summary)})` : ''}`)
+      .join(' ; ')
     evidence.push(`Recent changes to these files: ${hist}`)
   }
   if (ctx.subsystemDocs && ctx.subsystemDocs.length) {
@@ -2662,10 +2779,16 @@ Reply with JSON only: {"eli5": "..."}`
   const noteBlock = notes.length
     ? `\nComments the developers wrote beside this code. Read them: they say who this is for and what it does today, which the constant names do not.\n${notes.map(n => `- ${n}`).join('\n')}\n`
     : ''
-  const diffBlock = patch
-    ? `\nThe change itself. Lockfiles and test-only hunks are already stripped; the full diff is on GitHub.\n\`\`\`diff\n${budgetPatch(patch, diffBytes, Math.max(10000, Math.round(diffBytes / 4)))}\n\`\`\`\n`
+  // The body of the modules the change lands in. This is what the pass could
+  // not name before: a one-line hunk plus a file header says a constant moved,
+  // and only the module says who reads it, what guards it and what it feeds.
+  const outlineBlock = ctx.exportOutlines && ctx.exportOutlines.length
+    ? `\nExported surface of the larger touched files (what the module offers, and what the change sits inside):\n${ctx.exportOutlines.map(o => `- ${o.path} (${o.totalLines} lines):\n${o.outline}`).join('\n')}\n`
     : ''
-  return `Explain one software change to a reader who is not a programmer and will not look at the code.
+  const sourceBlock = ctx.fullFiles && ctx.fullFiles.length
+    ? `\nComplete source of the smaller touched files (for module context):\n${ctx.fullFiles.map(f => `- ${f.path} (${f.lines} lines):\n\`\`\`\n${f.content}\n\`\`\``).join('\n')}\n`
+    : ''
+  const build = (diffText) => `Explain one software change to a reader who is not a programmer and will not look at the code.
 
 ${ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP}
 
@@ -2677,7 +2800,7 @@ Weight the tooling gave it: ${e.significance || 'minor'}
 Title: ${e.ai?.title || e.title || ''}
 Technical summary: ${e.ai?.summary || e.summary || ''}
 ${evidence.length ? `\nEvidence. Use it; do not repeat it back verbatim.\n${evidence.map(x => `- ${x}`).join('\n')}\n` : ''}
-${noteBlock}${diffBlock}
+${noteBlock}${outlineBlock}${sourceBlock}${diffText ? `\nThe change itself. Lockfiles and test-only hunks are already stripped; the full diff is on GitHub.\n\`\`\`diff\n${diffText}\n\`\`\`\n` : ''}
   Write 2-4 sentences of plain English structured around three pillars:
   1. Core Change: What actually changed in plain words (lead with concrete action or outcome).
   2. Who It Affects: Specify the exact audience (e.g. users on free tiers, teams deploying self-hosted, developers editing config), or state clearly if it is internal.
@@ -2705,6 +2828,12 @@ Rules:
 - ${releaseCtx ? 'A release roll-up may run longer: stop after up to 8 sentences. Lead with a strong user-facing headline summarizing the main theme of what shipped before listing key highlights.' : 'Stop after 2-4 sentences.'} Include an effective date only when the evidence supplies it and it clarifies the change; never recite day counts or archive calendars.
 
 Reply with JSON only: {"eli5": "..."}`
+  // Room is measured, not assumed: the diff is the last block in the prompt,
+  // so building the prompt without it says exactly how much is left for it.
+  // The old fixed cap had to be low enough for the largest row, which is a cap
+  // on every row -- it was cutting single files in half on a 3 KB diff.
+  const room = diffRoom(build('').length, diffBytes)
+  return fitToWindow(build(budgetPatch(patch, room, perFileRoom(room))))
 }
 
 // ELI5 grounding: the plain-English pass must not leak identifiers, versions,
@@ -2879,7 +3008,9 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   // and the pass already paid for the git work to mine comments out of it.
   const getPatch = typeof options.getPatch === 'function' ? options.getPatch : null
   const wantDiff = env.CHANGELOG_ELI5_DIFF !== '0'
-  const diffBytes = Number(env.CHANGELOG_ELI5_DIFF_BYTES || 60000)
+  // An operator cap, not the working default: with no cap the prompt takes the
+  // whole diff, bounded only by what the context window has room for.
+  const diffBytes = Number(env.CHANGELOG_ELI5_DIFF_BYTES) || Infinity
   const prIndex = options.prIndex || await loadPrIndex(dataDir)
   const byDayEntries = groupEntriesByDay(entries)
   const archMap = options.architectureMap || (options.repoDir ? formatArchitectureMap(await discoverMonorepoArchitecture(options.repoDir)) : FREEBUFF_ARCHITECTURE_MAP)
@@ -2956,7 +3087,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
       e.eli5 = { text: cached.text, model: cached.model, v: cached.v, src: shortHash(src), ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}), at: cached.at }
       continue
     }
-    const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 25)
+    const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 40)
     const sequence = sequenceForEntry(byDayEntries, e, seqWindow)
     const prMeta = findPrMeta(e, prIndex)
     queue.push({ entry: e, src, key, relText, sequence, prMeta })
@@ -2976,7 +3107,9 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
       try {
         const patch = await eli5Patch(e, wantDiff || !e.facts?.length ? getPatch : null)
         const fullPatch = typeof options.getFullPatch === 'function' ? await options.getFullPatch(e).catch(() => '') : ''
-        const context = queue[idx].context || (queue[idx].context = await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, withSource: false, fullPatch }))
+        // Source context on: the plain-English line is where a module's own
+        // vocabulary matters most, and it was the one pass running without it.
+        const context = queue[idx].context || (queue[idx].context = await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, withSource: true, fullPatch }))
         if (hasStructuredFacts(context.structured) && !hasStructuredFacts(e.structured)) e.structured = context.structured
         const { record } = await explainEntry({
           entry: e,
@@ -3038,7 +3171,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
 // One plain-English line, start to finish. `patch` is what the model is shown
 // (may be '' when CHANGELOG_ELI5_DIFF=0); `notesPatch` is what the comments are
 // mined from, which the pass has already paid for either way.
-export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, siblings = [], diffBytes = 60000, relText = '', prMeta = null, sequence = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env }) {
+export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, siblings = [], diffBytes = Infinity, relText = '', prMeta = null, sequence = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env }) {
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
   const maxChars = relText ? ELI5_ROLLUP_MAX_CHARS : ELI5_MAX_CHARS
   const allow = `${relText} ${e.ai?.summary || ''} ${(e.facts || []).join(' ')}`
@@ -3048,7 +3181,12 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     releaseCtx: relText,
     fileHeaders: context.fileHeaders,
     fileHistory: context.fileHistory,
-    subsystemDocs: context.subsystemDocs
+    subsystemDocs: context.subsystemDocs,
+    // The source the prompt now shows has to be checkable too, or a line that
+    // names a function honestly from the module it was shown gets parked as an
+    // invented identifier.
+    exportOutlines: context.exportOutlines,
+    fullFiles: context.fullFiles
   })
   const promptCtx = {
     patch,
@@ -3062,7 +3200,9 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     structured: context.structured,
     fileHeaders: context.fileHeaders,
     fileHistory: context.fileHistory,
-    subsystemDocs: context.subsystemDocs
+    subsystemDocs: context.subsystemDocs,
+    exportOutlines: context.exportOutlines,
+    fullFiles: context.fullFiles
   }
   // Shorter ask for a gateway that answers the full one with a refusal or
   // prose (see stripDiffComments). The grounding corpus above keeps the whole

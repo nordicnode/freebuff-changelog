@@ -617,28 +617,40 @@ test('extractFullOrOutlinedFiles: splits files by line count into full source vs
   const smallLines = Array.from({ length: 30 }, (_, i) => `// line ${i + 1}`).join('\n')
   await writeFile(join(dir, 'common', 'src', 'small.ts'), smallLines)
 
-  // 2. Large file (260 lines) with exports
+  // 2. Mid file (300 lines): under the 700-line ceiling, so it is injected whole.
+  // Under the old 250-line cap this degraded to a bare export list, which is
+  // what left the model guessing what the function bodies do.
+  const midLines = [
+    'export function computeScore(x: number): number { return x * 2; }',
+    ...Array.from({ length: 299 }, (_, i) => `const internalVar${i} = ${i};`)
+  ].join('\n')
+  await writeFile(join(dir, 'common', 'src', 'mid.ts'), midLines)
+
+  // 3. Large file (720 lines) with exports
   const largeLines = [
     'export const DEFAULT_BUDGET = 500;',
     'export function computeScore(x: number): number { return x * 2; }',
     'export type Mode = "strict" | "loose";',
-    ...Array.from({ length: 257 }, (_, i) => `const internalVar${i} = ${i};`)
+    ...Array.from({ length: 717 }, (_, i) => `const internalVar${i} = ${i};`)
   ].join('\n')
   await writeFile(join(dir, 'common', 'src', 'large.ts'), largeLines)
 
   g('add', '.')
   g('commit', '-q', '-m', 'feat: add small and large files')
 
-  const res = await extractFullOrOutlinedFiles(dir, 'HEAD', ['common/src/small.ts', 'common/src/large.ts'])
+  const res = await extractFullOrOutlinedFiles(dir, 'HEAD', ['common/src/small.ts', 'common/src/mid.ts', 'common/src/large.ts'])
 
-  assert.equal(res.fullFiles.length, 1)
+  assert.equal(res.fullFiles.length, 2)
   assert.equal(res.fullFiles[0].path, 'common/src/small.ts')
   assert.equal(res.fullFiles[0].lines, 30)
   assert.equal(res.fullFiles[0].content, smallLines)
+  assert.equal(res.fullFiles[1].path, 'common/src/mid.ts')
+  assert.equal(res.fullFiles[1].lines, 300)
+  assert.equal(res.fullFiles[1].content, midLines)
 
   assert.equal(res.exportOutlines.length, 1)
   assert.equal(res.exportOutlines[0].path, 'common/src/large.ts')
-  assert.equal(res.exportOutlines[0].totalLines, 260)
+  assert.equal(res.exportOutlines[0].totalLines, 720)
   assert.ok(res.exportOutlines[0].outline.includes('export const DEFAULT_BUDGET'))
   assert.ok(res.exportOutlines[0].outline.includes('export function computeScore'))
   assert.ok(res.exportOutlines[0].outline.includes('export type Mode'))

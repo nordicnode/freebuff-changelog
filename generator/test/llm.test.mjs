@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, buildVerifyPrompt } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -1437,7 +1437,7 @@ test('buildPrompt & buildEli5Prompt: formats fileHistory, fullFiles, exportOutli
     subsystemDocs
   })
 
-  assert.ok(prompt.includes('Recent commit lineage for touched files (last up to 10 changes to these files):'))
+  assert.ok(prompt.includes('Recent commit lineage for touched files (the last changes to these files):'))
   assert.ok(prompt.includes('[11111111] (2026-09-17) touched common/src/ads/ranking.ts: Initial ad ranking stub'))
   assert.ok(prompt.includes('Added baseline ranking interface'))
 
@@ -1460,7 +1460,7 @@ test('buildPrompt & buildEli5Prompt: formats fileHistory, fullFiles, exportOutli
     patch
   })
 
-  assert.ok(eli5Prompt.includes('Recent changes to these files: 2026-09-17 [11111111]: Initial ad ranking stub'))
+  assert.ok(eli5Prompt.includes('Recent changes to these files: 2026-09-17 [11111111] Initial ad ranking stub (Added baseline ranking interface)'))
   assert.ok(eli5Prompt.includes('Subsystem guide: common/src/ads/README.md: # Ads Subsystem'))
 })
 
@@ -1496,3 +1496,128 @@ test('buildEli5Prompt: roll-up mode commands description of what was added and f
 
 
 
+
+// ---------------------------------------------------------------------------
+// The context window. The point of the budget is that an ordinary row sends
+// everything it has; the point of the arithmetic is that nothing sends more
+// than the window holds. Both are asserted here, because the failure mode is
+// silent: a truncated diff ships a confidently wrong summary, and an
+// overflowing request parks the row for an hour with no line at all.
+
+test('the context window is sized from the measured chars/token, not a guess', () => {
+  // 3.60 chars/token was reported by the gateway on real prompts; 3.2 is the
+  // conservative divisor, so a prompt that fits here fits there.
+  assert.equal(LLM_CONTEXT_TOKENS, 270000)
+  assert.equal(LLM_CONTEXT_CHARS, Math.floor(LLM_CONTEXT_TOKENS * 3.2))
+  assert.ok(LLM_CONTEXT_CHARS > 864000 * 0.99 && LLM_CONTEXT_CHARS <= 864000)
+})
+
+test('diffRoom: the diff gets what the rest of the prompt leaves, and never less than the floor', () => {
+  // A small prompt leaves room for everything.
+  assert.equal(diffRoom(9000), LLM_CONTEXT_CHARS - 9000)
+  // An operator cap still wins, so the knob keeps working.
+  assert.equal(diffRoom(9000, 50000), 50000)
+  // A prompt that has eaten the window still sends real hunks: a cut diff
+  // grounds a row, an absent one leaves nothing to ground it against.
+  assert.equal(diffRoom(LLM_CONTEXT_CHARS * 2), LLM_MIN_DIFF_ROOM)
+  // A nonsense cap is ignored rather than silently zeroing the diff.
+  assert.equal(diffRoom(9000, 0), LLM_CONTEXT_CHARS - 9000)
+  assert.equal(diffRoom(9000, -5), LLM_CONTEXT_CHARS - 9000)
+  // A generated file may not eat the whole room alone.
+  assert.ok(perFileRoom(LLM_CONTEXT_CHARS) * 3 >= LLM_CONTEXT_CHARS - 1)
+  assert.ok(perFileRoom(30000) >= 20000)
+})
+
+test('fitToWindow: trims the tail only when over, and only the tail', () => {
+  const fits = 'a'.repeat(1000)
+  assert.equal(fitToWindow(fits, 2000), fits)
+  const over = 'HEAD' + 'b'.repeat(5000)
+  const trimmed = fitToWindow(over, 2000)
+  assert.ok(trimmed.length <= 2000, 'never returns something the window cannot hold')
+  assert.ok(trimmed.startsWith('HEAD'), 'the instructions survive: only the diff tail is cut')
+  assert.match(trimmed, /context window filled up/)
+})
+
+test('capSection: keeps whole entries in priority order, never a half one', () => {
+  const items = [{ n: 40 }, { n: 40 }, { n: 40 }, { n: 40 }]
+  const kept = capSection(items, 'fileHistory', i => i.n, { limit: 100 })
+  assert.equal(kept.length, 2)
+  assert.deepEqual(kept, items.slice(0, 2))
+  assert.deepEqual(capSection([], 'fileHeaders', i => i.n), [])
+  // A first entry larger than the whole section is still kept: dropping the
+  // only file would leave the prompt claiming a module it never showed.
+  assert.equal(capSection([{ n: 500 }], 'fileHeaders', i => i.n, { limit: 100 }).length, 0)
+})
+
+test('context sections together cannot starve the diff of the window', () => {
+  // The invariant the room arithmetic rests on: with every section at its cap
+  // and the instructions paid for, a full stored diff still has somewhere to go.
+  const sections = Object.values(CONTEXT_SECTION_CHARS).reduce((a, b) => a + b, 0)
+  const instructions = 60000 // measured: the fixed ask plus evidence
+  assert.ok(sections + instructions + LLM_MIN_DIFF_ROOM < LLM_CONTEXT_CHARS,
+    `sections=${sections} + instructions=${instructions} must leave diff room inside ${LLM_CONTEXT_CHARS}`)
+})
+
+test('an ordinary row now sends its whole diff, source, and lineage', () => {
+  // The regression this replaces: a 3 KB diff on a 40 KB file was cut at 15 KB
+  // per file, and the plain-English pass was given no source at all.
+  const entry = {
+    sha: 'ab'.repeat(20),
+    date: '2026-09-18T00:00:00Z',
+    category: 'Common',
+    summary: 'Raise the ad ranking cap',
+    files: { modified: ['common/src/ads/ranking.ts'] }
+  }
+  const bigFile = Array.from({ length: 1000 }, (_, i) => `+const line${i} = ${i};`).join('\n')
+  const patch = `diff --git a/common/src/ads/ranking.ts b/common/src/ads/ranking.ts\n--- a/common/src/ads/ranking.ts\n+++ b/common/src/ads/ranking.ts\n${bigFile}\n`
+  assert.ok(patch.length > 20000, `fixture is over the old 15 KB per-file cap: ${patch.length}`)
+  assert.ok(!buildEli5Prompt(entry, [], { patch }).includes('[file truncated]'))
+  assert.ok(buildEli5Prompt(entry, [], { patch }).includes('+const line999 = 999;'))
+
+  // And the source the pass used to be denied, with its lineage, is in it.
+  const withCtx = buildEli5Prompt(entry, ['the cap the sponsor buys'], {
+    patch,
+    fullFiles: [{ path: 'common/src/ads/ranking.ts', lines: 900, content: 'export function rank() {}' }],
+    exportOutlines: [{ path: 'common/src/ads/plan.ts', totalLines: 1200, outline: 'export const PLAN = 1' }],
+    fileHistory: Array.from({ length: 20 }, (_, i) => ({ sha: `${i}`.repeat(8), date: '2026-09-17', overlap: ['common/src/ads/ranking.ts'], title: `Change ${i}`, summary: `Did thing ${i}.` }))
+  })
+  assert.ok(withCtx.includes('Complete source of the smaller touched files'), 'source context reaches the plain-English pass')
+  assert.ok(withCtx.includes('export function rank() {}'))
+  assert.ok(withCtx.includes('Exported surface of the larger touched files'))
+  assert.ok(withCtx.includes('export const PLAN = 1'))
+  assert.ok(withCtx.includes('Did thing 0.') && withCtx.includes('Did thing 19.'), 'all twenty lineage entries, not five titles')
+  assert.ok(withCtx.includes('the cap the sponsor buys'))
+})
+
+test('no prompt the pipeline can build overflows the window', () => {
+  const entry = {
+    sha: 'cd'.repeat(20),
+    date: '2026-09-18T00:00:00Z',
+    category: 'Common',
+    summary: 'A very large change',
+    files: { modified: ['a.ts'], added: Array.from({ length: 20 }, (_, i) => `f${i}.ts`) }
+  }
+  // A snapshot far larger than any the diff store holds: 40 files, each well
+  // past the per-file share, with every context section pinned to its cap.
+  const huge = Array.from({ length: 40 }, (_, f) => {
+    const lines = Array.from({ length: 4000 }, (_, i) => `+const f${f}_line${i} = ${i};`).join('\n')
+    return `diff --git a/f${f}.ts b/f${f}.ts\n--- a/f${f}.ts\n+++ b/f${f}.ts\n${lines}\n`
+  }).join('')
+  const ctx = {
+    patch: huge,
+    sequence: null,
+    fileHeaders: Array.from({ length: 12 }, (_, i) => ({ path: `f${i}.ts`, header: 'h'.repeat(5000) })),
+    subsystemDocs: Array.from({ length: 4 }, (_, i) => ({ path: `README${i}.md`, content: 'd'.repeat(8000) })),
+    fullFiles: Array.from({ length: 8 }, (_, i) => ({ path: `f${i}.ts`, lines: 700, content: 'c'.repeat(30000) })),
+    exportOutlines: Array.from({ length: 8 }, (_, i) => ({ path: `f${i}.ts`, totalLines: 900, outline: 'o'.repeat(8000) })),
+    fileHistory: Array.from({ length: 20 }, (_, i) => ({ date: '2026-09-17', sha: `${i}`.repeat(8), overlap: [`f${i}.ts`], title: 't'.repeat(200), summary: 's'.repeat(1500) }))
+  }
+  for (const [name, prompt] of [
+    ['eli5', buildEli5Prompt(entry, Array.from({ length: 8 }, (_, i) => `note ${i} `.repeat(400)), ctx)],
+    ['summary', buildPrompt(entry, huge, ctx)],
+    ['verifier', buildVerifyPrompt(entry, huge, { title: 't', summary: 's', evidence: 'e', audience: 'end-users' })]
+  ]) {
+    assert.ok(prompt.length <= LLM_CONTEXT_CHARS, `${name} prompt is ${prompt.length} chars, window is ${LLM_CONTEXT_CHARS}`)
+    assert.ok(/^(Explain one software change|You write changelog entries|You are checking)/.test(prompt), `${name} kept its instructions`)
+  }
+})

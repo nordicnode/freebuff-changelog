@@ -6,6 +6,7 @@ import {
   splitPatchByFile, chunkPatchGroups, needsChunking,
   buildChunkPrompt, validateChunkOut, buildFusePrompt, summarizeChunked,
   MAP_REDUCE_THRESHOLD_BYTES, MAP_REDUCE_CHUNK_BYTES, MAP_REDUCE_MAX_CHUNKS,
+  LLM_CONTEXT_CHARS,
   shouldVerify, validateVerifyOut, buildVerifyPrompt,
   ungroundedIdentifiers, validateGroundedEli5, backtickedProse, validateLlmOut,
   PR_MATCH_STOPLIST_RE, matchPrByPaths, buildPrRelevancePrompt,
@@ -40,7 +41,13 @@ test('needsChunking: threshold with opt-out', () => {
   assert.equal(needsChunking({}, 'x'.repeat(MAP_REDUCE_THRESHOLD_BYTES + 1), {}), true)
   assert.equal(needsChunking({}, 'small', {}), false)
   assert.equal(needsChunking({}, 'x'.repeat(MAP_REDUCE_THRESHOLD_BYTES + 1), { CHANGELOG_LLM_MAPREDUCE: '0' }), false)
-  assert.ok(MAP_REDUCE_CHUNK_BYTES <= 100000 && MAP_REDUCE_MAX_CHUNKS <= 6, 'map-reduce stays inside the 270K window')
+  // Chunking is the lossy path -- the fuse writes the entry from drafts, so a
+  // draft's misreading survives into the result. It therefore stays above every
+  // stored diff (they cap at 600 KB but the largest ever written was 250 KB),
+  // and one chunk has to fit the window on its own.
+  assert.ok(MAP_REDUCE_THRESHOLD_BYTES > 250000, 'chunking stays dormant for any stored diff')
+  assert.ok(MAP_REDUCE_CHUNK_BYTES < LLM_CONTEXT_CHARS, 'a single map call fits the context window')
+  assert.ok(MAP_REDUCE_MAX_CHUNKS >= 4, 'a huge diff is still covered, in a bounded number of map calls')
 })
 
 test('validateChunkOut: shape-checked, grounding deferred to the fuse', () => {

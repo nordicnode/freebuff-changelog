@@ -51,13 +51,13 @@ async function llmPatchFor (e) {
   // except for test-only commits, where the tests *are* the change. Excluding
   // them there handed the queue an empty patch, so those rows could never be
   // summarized and the backlog counter never reached zero.
-  const clean = await extractCleanDiff(REPO_DIR, base, e.sha, 250000, !e.testOnly)
+  const clean = await extractCleanDiff(REPO_DIR, base, e.sha, 600000, !e.testOnly)
   if (clean.trim()) return clean
   // Stale entries built before testOnly existed (or with narrower TEST_RE)
   // carry no flag, so the exclusion above empties their patch. Retry without
   // the test exclusion before giving up; churn rows stay empty either way.
   if (!e.testOnly) {
-    const incl = await extractCleanDiff(REPO_DIR, base, e.sha, 250000, false)
+    const incl = await extractCleanDiff(REPO_DIR, base, e.sha, 600000, false)
     if (incl.trim()) return incl
   }
   // A churn row's entire change IS the lockfile, so the clean form is empty by
