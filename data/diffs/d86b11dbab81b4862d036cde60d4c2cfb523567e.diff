@@ -1,0 +1,357 @@
+diff --git a/cli/src/utils/__tests__/fingerprint-cpu-info.test.ts b/cli/src/utils/__tests__/fingerprint-cpu-info.test.ts
+new file mode 100644
+index 000000000..a8d755a9f
+--- /dev/null
++++ b/cli/src/utils/__tests__/fingerprint-cpu-info.test.ts
+@@ -0,0 +1,144 @@
++import { describe, expect, test } from 'bun:test'
++
++import { canReadCpuDetails, getSystemInfo } from '../fingerprint'
++
++import type { CpuInfo } from 'node:os'
++
++// CodebuffAI/freebuff#1374: under proot-distro (Termux) /proc/stat is a
++// hardcoded 8-core file while /proc/cpuinfo is live, so on a 9-core phone
++// Bun's native CPU read throws `Failed to get CPU information` every time.
++const CPU_ERROR = 'Failed to get CPU information'
++
++/**
++ * Mirrors Bun's lazy `os.cpus()`: the array itself (and its length) is fine,
++ * the throw only happens on the first `.model`/`.speed`/`.times` access.
++ */
++function skewedCpus(count = 9): CpuInfo[] {
++  return Array.from({ length: count }, () => {
++    const fail = (): never => {
++      throw new Error(CPU_ERROR)
++    }
++    return {
++      get model() {
++        return fail()
++      },
++      get speed() {
++        return fail()
++      },
++      get times() {
++        return fail()
++      },
++    } as unknown as CpuInfo
++  })
++}
++
++function healthyCpus(count = 4): CpuInfo[] {
++  return Array.from({ length: count }, () => ({
++    model: 'Cortex-X3',
++    speed: 2900,
++    times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 },
++  }))
++}
++
++/**
++ * Fake systeminformation whose `cpu()` behaves like the real Linux path in
++ * systeminformation 5.33 (lib/cpu.js): it reads `os.cpus()[0].model` inside
++ * `process.nextTick`, where a throw bypasses every caller try/catch.
++ */
++function fakeSystemInformation(readCpus: () => CpuInfo[]) {
++  const calls = { cpu: 0 }
++  const si = {
++    system: async () => ({
++      manufacturer: 'Google',
++      model: 'Pixel 8 Pro',
++      serial: 'SN',
++      uuid: 'UUID',
++    }),
++    osInfo: async () => ({
++      platform: 'linux',
++      distro: 'Debian',
++      arch: 'arm64',
++      hostname: 'localhost',
++    }),
++    cpu: () => {
++      calls.cpu++
++      return new Promise((resolve) => {
++        process.nextTick(() => {
++          const model = readCpus()[0]!.model
++          resolve({
++            manufacturer: 'ARM',
++            brand: model,
++            cores: readCpus().length,
++            physicalCores: readCpus().length,
++          })
++        })
++      })
++    },
++  }
++  return { si: si as never, calls }
++}
++
++describe('canReadCpuDetails', () => {
++  test('false when reading CPU details throws', () => {
++    expect(canReadCpuDetails(skewedCpus)).toBe(false)
++  })
++
++  test('false when os.cpus() itself throws', () => {
++    expect(
++      canReadCpuDetails(() => {
++        throw new Error(CPU_ERROR)
++      }),
++    ).toBe(false)
++  })
++
++  test('true on a healthy machine and on the real runtime', () => {
++    expect(canReadCpuDetails(healthyCpus)).toBe(true)
++    expect(canReadCpuDetails()).toBe(true)
++  })
++})
++
++describe('getSystemInfo with skewed /proc (#1374)', () => {
++  test('skips systeminformation.cpu() and keeps the rest of the fingerprint', async () => {
++    const { si, calls } = fakeSystemInformation(skewedCpus)
++
++    const info = await getSystemInfo({ load: async () => si, readCpus: skewedCpus })
++
++    // Calling cpu() would throw inside process.nextTick and kill the process.
++    expect(calls.cpu).toBe(0)
++    expect(info.cpu).toEqual({
++      manufacturer: '',
++      brand: '',
++      cores: 9,
++      physicalCores: 0,
++    })
++    expect(info.system.model).toBe('Pixel 8 Pro')
++    expect(info.os.distro).toBe('Debian')
++  })
++
++  test('falls back to availableParallelism when os.cpus() itself throws', async () => {
++    const throwingCpus = (): CpuInfo[] => {
++      throw new Error(CPU_ERROR)
++    }
++    const { si, calls } = fakeSystemInformation(throwingCpus)
++
++    const info = await getSystemInfo({ load: async () => si, readCpus: throwingCpus })
++
++    expect(calls.cpu).toBe(0)
++    expect(info.cpu.cores).toBeGreaterThan(0)
++    expect(info.system.model).toBe('Pixel 8 Pro')
++  })
++
++  test('still uses systeminformation.cpu() when CPU details are readable', async () => {
++    const { si, calls } = fakeSystemInformation(healthyCpus)
++
++    const info = await getSystemInfo({ load: async () => si, readCpus: healthyCpus })
++
++    expect(calls.cpu).toBe(1)
++    expect(info.cpu).toEqual({
++      manufacturer: 'ARM',
++      brand: 'Cortex-X3',
++      cores: 4,
++      physicalCores: 4,
++    })
++  })
++})
+diff --git a/cli/src/utils/fingerprint.ts b/cli/src/utils/fingerprint.ts
+index 22e974fdd..a409e0646 100644
+--- a/cli/src/utils/fingerprint.ts
++++ b/cli/src/utils/fingerprint.ts
+@@ -1,73 +1,142 @@
+ /**
+  * Enhanced fingerprinting for CLI authentication.
+  *
+  * Uses hardware-based identifiers to create deterministic fingerprints,
+  * making it harder for users to game the system by creating multiple accounts.
+  *
+  * Falls back to legacy random fingerprints if enhanced fingerprinting fails.
+  */
+ 
+ import { createHash, randomBytes } from 'node:crypto'
+-import { cpus, networkInterfaces } from 'node:os'
++import { availableParallelism, cpus, networkInterfaces } from 'node:os'
+ 
+ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ 
+ import { trackEvent } from './analytics'
+ import { detectShell } from './detect-shell'
+ import { logger } from './logger'
+ 
++import type { CpuInfo } from 'node:os'
++
+ // Lazy imports for optional dependencies
+ let machineIdModule: typeof import('node-machine-id') | null = null
+ let systeminformationModule: typeof import('systeminformation') | null = null
+ 
+ async function getMachineId(): Promise<string> {
+   if (!machineIdModule) {
+     machineIdModule = await import('node-machine-id')
+   }
+   const id = await machineIdModule.machineId()
+   // Validate that we got a real machine ID, not an empty or placeholder value.
+   // Throwing here triggers the legacy fallback in calculateFingerprint().
+   if (!id || id === 'unknown' || id.length < 8) {
+     throw new Error('Invalid machine ID returned')
+   }
+   return id
+ }
+ 
+-async function getSystemInfo(): Promise<{
++type SystemInformation = Pick<
++  typeof import('systeminformation'),
++  'system' | 'cpu' | 'osInfo'
++>
++
++async function loadSystemInformation(): Promise<SystemInformation> {
++  if (!systeminformationModule) {
++    systeminformationModule = await import('systeminformation')
++  }
++  return systeminformationModule
++}
++
++/**
++ * Whether per-CPU details (model, speed, times) can be read without throwing.
++ *
++ * Bun's `os.cpus()` is lazy: it returns `hostCpuCount` placeholder objects and
++ * only runs the native read on first access to `.model`/`.speed`/`.times`. On
++ * Linux that native read throws `Failed to get CPU information` when
++ * /proc/stat and /proc/cpuinfo list different CPU counts. proot-distro (Termux)
++ * binds a hardcoded 8-core /proc/stat over the real one, so on a 9-core phone
++ * the mismatch is permanent (CodebuffAI/freebuff#1374).
++ *
++ * systeminformation's `cpu()` reads `os.cpus()[0].model` inside a
++ * `process.nextTick` callback, where no caller try/catch can reach it: the
++ * throw escapes to the process-level handler and kills the CLI. So probe the
++ * same read synchronously here, and skip `cpu()` when it throws.
++ */
++export function canReadCpuDetails(readCpus: () => CpuInfo[] = cpus): boolean {
++  try {
++    void readCpus()[0]?.model
++    return true
++  } catch {
++    return false
++  }
++}
++
++/** Logical CPU count that never throws; 0 when no source works. */
++function safeCpuCount(readCpus: () => CpuInfo[]): number {
++  try {
++    return readCpus().length
++  } catch {
++    try {
++      return availableParallelism()
++    } catch {
++      return 0
++    }
++  }
++}
++
++export async function getSystemInfo({
++  load = loadSystemInformation,
++  readCpus = cpus,
++}: {
++  load?: () => Promise<SystemInformation>
++  readCpus?: () => CpuInfo[]
++} = {}): Promise<{
+   system: { manufacturer: string; model: string; serial: string; uuid: string }
+   cpu: { manufacturer: string; brand: string; cores: number; physicalCores: number }
+   os: { platform: string; distro: string; arch: string; hostname: string }
+ }> {
+   try {
+-    if (!systeminformationModule) {
+-      systeminformationModule = await import('systeminformation')
++    const si = await load()
++    const cpuReadable = canReadCpuDetails(readCpus)
++    if (!cpuReadable) {
++      logger.warn(
++        { fingerprintType: 'cpu_info_unavailable' },
++        'CPU details unreadable (os.cpus() throws); fingerprinting without them',
++      )
+     }
+     const [systemInfo, cpuInfo, osInfo] = await Promise.all([
+-      systeminformationModule.system(),
+-      systeminformationModule.cpu(),
+-      systeminformationModule.osInfo(),
++      si.system(),
++      cpuReadable
++        ? si.cpu()
++        : Promise.resolve({
++            manufacturer: '',
++            brand: '',
++            cores: safeCpuCount(readCpus),
++            physicalCores: 0,
++          }),
++      si.osInfo(),
+     ])
+     return {
+       system: {
+         manufacturer: systemInfo.manufacturer,
+         model: systemInfo.model,
+         serial: systemInfo.serial,
+         uuid: systemInfo.uuid,
+       },
+       cpu: {
+         manufacturer: cpuInfo.manufacturer,
+         brand: cpuInfo.brand,
+         cores: cpuInfo.cores,
+         physicalCores: cpuInfo.physicalCores,
+       },
+       os: {
+         platform: osInfo.platform,
+         distro: osInfo.distro,
+         arch: osInfo.arch,
+         hostname: osInfo.hostname,
+       },
+     }
+   } catch {
+     return {
+       system: { manufacturer: '', model: '', serial: '', uuid: '' },
+       cpu: { manufacturer: '', brand: '', cores: 0, physicalCores: 0 },
+@@ -88,51 +157,51 @@ async function calculateEnhancedFingerprint(): Promise<string> {
+   const [sysInfo, shell, networkInfo] = await Promise.all([
+     getSystemInfo(),
+     Promise.resolve(detectShell()),
+     Promise.resolve(networkInterfaces()),
+   ])
+ 
+   // Extract MAC addresses for additional uniqueness
+   const macAddresses = Object.values(networkInfo)
+     .flat()
+     .filter(
+       (iface) =>
+         iface && !iface.internal && iface.mac && iface.mac !== '00:00:00:00:00:00',
+     )
+     .map((iface) => iface!.mac)
+     .sort()
+ 
+   const fingerprintInfo = {
+     system: sysInfo.system,
+     cpu: sysInfo.cpu,
+     os: sysInfo.os,
+     runtime: {
+       nodeVersion: process.version,
+       platform: process.platform,
+       arch: process.arch,
+       shell,
+-      cpuCount: cpus().length,
++      cpuCount: safeCpuCount(cpus),
+     },
+     network: {
+       macAddresses,
+       interfaceCount: Object.keys(networkInfo).length,
+     },
+     machineId: machineIdValue,
+     fingerprintVersion: '2.0',
+   }
+ 
+   const fingerprintString = JSON.stringify(fingerprintInfo)
+   const fingerprintHash = createHash('sha256')
+     .update(fingerprintString)
+     .digest('base64url')
+ 
+   return `enhanced-${fingerprintHash}`
+ }
+ 
+ /**
+  * Generates a legacy fingerprint with a random suffix.
+  * Used as a fallback when enhanced fingerprinting fails.
+  */
+ function calculateLegacyFingerprint(): string {
+   const randomSuffix = randomBytes(6).toString('base64url').substring(0, 8)
+   return `codebuff-cli-${randomSuffix}`
+ }
