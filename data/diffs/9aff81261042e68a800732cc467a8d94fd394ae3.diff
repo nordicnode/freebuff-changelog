@@ -1,0 +1,139 @@
+diff --git a/common/src/util/__tests__/log-data.test.ts b/common/src/util/__tests__/log-data.test.ts
+new file mode 100644
+index 000000000..c76a4034b
+--- /dev/null
++++ b/common/src/util/__tests__/log-data.test.ts
+@@ -0,0 +1,46 @@
++import { describe, expect, test } from 'bun:test'
++
++import { serializeLogData } from '../log-data'
++
++const parse = (data: unknown) => JSON.parse(serializeLogData(data)!)
++
++describe('serializeLogData', () => {
++  // JSON.stringify(new Error('x')) is '{}': the reason never reached Axiom.
++  test('an error keeps its name and message', () => {
++    const row = parse({ error: new TypeError('fetch failed') })
++    expect(row.error.name).toBe('TypeError')
++    expect(row.error.message).toBe('fetch failed')
++    expect(typeof row.error.stack).toBe('string')
++  })
++
++  test('keeps the fields a library adds, and walks the cause', () => {
++    const cause = Object.assign(new Error('canceling statement'), {
++      code: '57014',
++    })
++    const error = Object.assign(new Error('Failed query', { cause }), {
++      query: 'select 1',
++    })
++    const row = parse({ error })
++    expect(row.error.query).toBe('select 1')
++    expect(row.error.cause.message).toBe('canceling statement')
++    expect(row.error.cause.code).toBe('57014')
++  })
++
++  test('trims a long stack', () => {
++    const error = new Error('deep')
++    error.stack = `Error: deep\n${'    at frame (file.ts:1:1)\n'.repeat(500)}`
++    expect(parse({ error }).error.stack.length).toBeLessThanOrEqual(2_000)
++  })
++
++  test('plain payloads are unchanged', () => {
++    expect(serializeLogData({ a: 1, b: 'two' })).toBe('{"a":1,"b":"two"}')
++    expect(serializeLogData('text')).toBe('text')
++    expect(serializeLogData(null)).toBeNull()
++  })
++
++  test('a circular error does not throw', () => {
++    const error = new Error('loop') as Error & { self?: unknown }
++    error.self = error
++    expect(parse({ error }).error.message).toBe('loop')
++  })
++})
+diff --git a/common/src/util/log-data.ts b/common/src/util/log-data.ts
+index 7314d8907..c1d573517 100644
+--- a/common/src/util/log-data.ts
++++ b/common/src/util/log-data.ts
+@@ -1,57 +1,82 @@
+ import { MAX_LOG_DATA_BYTES } from '../schemas/logs'
+ 
+ import type { LogLevel } from '../types/contracts/logs'
+ 
+ /**
+  * Shared pieces of the Axiom log-row pipeline used by every producer that
+  * ingests rows — the long-lived sink (packages/logging/src/sink.ts) and the
+  * Convex direct-ingest helper (freebuff/web/convex/lib/axiom_log.ts). Living
+  * here keeps the serialized `data` contract and level ordering identical
+  * across producers, so APL queries behave the same regardless of which
+  * service emitted a row. Deliberately light on imports (the schemas module
+  * pulls only zod) so it stays safe for the Convex bundle.
+  */
+ 
+ /** Numeric severity order for LogLevel, used for min-level gating. */
+ export const LOG_LEVEL_ORDER: Record<LogLevel, number> = {
+   debug: 10,
+   info: 20,
+   warn: 30,
+   error: 40,
+   fatal: 50,
+ }
+ 
++/** Stack traces cost ingest on every error row; the top frames carry it. */
++const MAX_ERROR_STACK_CHARS = 2_000
++
++/**
++ * An Error as plain JSON. `name`, `message` and `stack` are non-enumerable, so
++ * `JSON.stringify(error)` is `{}`: every `logger.error({ error }, ...)` whose
++ * error reached this serializer arrived in Axiom with no reason attached (on
++ * 2026-09-27, 119 error/warn rows a day on freebuff-web alone, and the
++ * Imprezia ingest's refusals for nine days). Enumerable fields a library adds
++ * (`code`, `status`, a driver's `query`) are kept, and `cause` is walked by the
++ * same replacer.
++ */
++function errorToJson(error: Error): Record<string, unknown> {
++  return {
++    ...error,
++    name: error.name,
++    message: error.message,
++    ...(error.stack
++      ? { stack: error.stack.slice(0, MAX_ERROR_STACK_CHARS) }
++      : {}),
++    ...(error.cause !== undefined ? { cause: error.cause } : {}),
++  }
++}
++
+ /**
+  * Serialize a log payload to a single string field, tolerating circular refs
+  * and capping size. The cap applies to ALL sources so a large `data` payload
+  * can't inflate Axiom ingest cost. The truncated form is still valid JSON so
+  * query scripts can `parse_json(data)`.
+  */
+ export function serializeLogData(data: unknown): string | null {
+   if (data == null) return null
+   let serialized: string
+   if (typeof data === 'string') {
+     serialized = data
+   } else {
+     try {
+       const seen = new WeakSet()
+       serialized = JSON.stringify(data, (_k, v) => {
+         if (typeof v === 'object' && v !== null) {
+           if (seen.has(v)) return '[Circular]'
+           seen.add(v)
++          if (v instanceof Error) return errorToJson(v)
+         }
+         return v
+       })
+     } catch {
+       return null
+     }
+   }
+   if (serialized.length > MAX_LOG_DATA_BYTES) {
+     return JSON.stringify({
+       _truncated: true,
+       original_bytes: serialized.length,
+       preview: serialized.slice(0, MAX_LOG_DATA_BYTES),
+     })
+   }
+   return serialized
+ }
