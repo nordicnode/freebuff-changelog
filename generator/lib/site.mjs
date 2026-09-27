@@ -2573,20 +2573,50 @@ ${rows.map(e => {
     .filter(e => e && !e.noise)
     .map(e => `${e.ai?.title || e.title || ''} ${e.ai?.summary || ''}`)
   const howIndex = buildAnswerIndex(howList, { background: howBackground })
+  // Every answer has to land in exactly one of these. A tag that matches no
+  // group is not a cosmetic problem: the grouped sections are the only thing
+  // that ever puts an `.how-item` in the DOM, and the search box works by
+  // filtering those elements -- so an unmatched answer is invisible to browse
+  // *and* to search while still being stored, paid for, and served in the
+  // API. Eight of the ten seed questions were in that state, "How do I switch
+  // to a different AI model?" and the BYOK one among them, because the
+  // question set tags them install/update, byok/config, agents/skills,
+  // headless/ci and so on while these matchers looked for a different
+  // vocabulary entirely. Two lists that had to agree, and nothing making them.
+  //
+  // The tag list below now covers what generateQuestions emits, and the
+  // catch-all at the end makes this fail open rather than closed: a new tag
+  // nobody wired up shows its question in "More", which someone will notice,
+  // instead of dropping the answer silently, which nobody did.
+  const hasAny = (a, tags) => (a.tags || []).some(t => tags.includes(t))
+  const isSite = (a) => (a.tags || []).includes('site')
   const howGroups = [
-    { id: 'start', label: 'Getting started', match: (a) => (a.tags || []).includes('start') },
-    { id: 'commands', label: 'Commands', match: (a) => (a.tags || []).some(t => t === 'command' || t.startsWith('/')) && !(a.tags || []).includes('site') },
-    { id: 'models', label: 'Models and how to choose', match: (a) => (a.tags || []).includes('model') && !(a.tags || []).includes('site') },
-    { id: 'breaking', label: 'What changed and what to do', match: (a) => (a.tags || []).includes('breaking') },
-    { id: 'settings', label: 'Settings and flags', match: (a) => (a.tags || []).includes('setting') },
-    { id: 'site', label: 'Using this site', match: (a) => (a.tags || []).includes('site') },
-    { id: 'asked', label: 'Asked and answered', match: (a) => (a.tags || []).includes('ask') }
+    { id: 'start', label: 'Getting started', match: (a) => !isSite(a) && hasAny(a, ['start', 'install', 'update', 'repo', 'project', 'headless', 'ci']) },
+    { id: 'commands', label: 'Commands', match: (a) => !isSite(a) && ((a.tags || []).some(t => t === 'command' || t.startsWith('/'))) },
+    { id: 'models', label: 'Models and how to choose', match: (a) => !isSite(a) && hasAny(a, ['model', 'models', 'picker', 'compare']) },
+    { id: 'agents', label: 'Agents, skills and prompts', match: (a) => !isSite(a) && hasAny(a, ['agents', 'skills', 'prompt']) },
+    { id: 'keys', label: 'Keys, usage and limits', match: (a) => !isSite(a) && hasAny(a, ['byok', 'config', 'limits', 'quota', 'usage']) },
+    { id: 'breaking', label: 'What changed and what to do', match: (a) => !isSite(a) && hasAny(a, ['breaking']) },
+    { id: 'settings', label: 'Settings and flags', match: (a) => !isSite(a) && hasAny(a, ['setting']) },
+    { id: 'site', label: 'Using this site', match: isSite },
+    { id: 'asked', label: 'Asked and answered', match: (a) => hasAny(a, ['ask']) },
+    // Cannot be reached while the matchers above cover the vocabulary, and that
+    // is the point: if one of them ever stops covering it, the answer surfaces
+    // here instead of vanishing.
+    { id: 'more', label: 'More questions', match: () => true }
   ]
   const howSeen = new Set()
+  // Which groups actually produced a section, so the jump nav can link only to
+  // those. Built from howGroups it linked to every one of them, including the
+  // catch-all, which renders nothing at all until a tag somewhere goes
+  // unwired -- a nav of dead anchors is how a reader learns to distrust the
+  // rest of them.
+  const howRendered = []
   const howSection = (g) => {
     const items = howList.filter(a => g.match(a) && !howSeen.has(a.q))
     if (!items.length) return ''
     items.forEach(a => howSeen.add(a.q))
+    howRendered.push(g)
     return `<section class="mt-slot" id="${g.id}">
   <h2 class="mt-h">${esc(g.label)}<span class="mt-count">${items.length}</span></h2>
   ${items.map(a => {
@@ -2596,12 +2626,14 @@ ${rows.map(e => {
         ...(ev.changes || []).slice(0, 3).map(c => `<a class="how-src" href="/day/${esc(c.day || '')}/#${esc(c.sha)}" title="${esc(c.title || '')}">${esc(c.sha)}</a>`)
       ].join('')
       return `<details class="how-item" data-qid="${esc(a.q)}" data-idx="${esc((a.tags || []).join(' '))}">
-    <summary><span class="how-q">${esc(a.q)}</span>${a.covered === false ? '<span class="how-flag">not covered by the evidence</span>' : ''}</summary>
+    <summary><span class="how-q">${esc(a.q)}</span>${a.covered === false ? `<span class="how-flag">${a.refused ? 'no answer written yet' : 'not covered by the evidence'}</span>` : ''}</summary>
     <div class="how-a"><p>${esc(a.answer)}</p>${srcs ? `<p class="how-ev">read from ${srcs}</p>` : ''}</div>
   </details>`
     }).join('\n  ')}
 </section>`
   }
+  // Sections first: the nav below links to what these produced.
+  const howSections = howGroups.map(howSection).filter(Boolean)
   const howBody = [
     `<section class="hero">
   <div class="term-box">
@@ -2622,10 +2654,10 @@ ${rows.map(e => {
       <button type="submit" class="how-ask-btn">Write this into the guide</button>
       <span class="how-ask-note">It joins the queue the guide is written from. A scheduled run reads the code and the change history, and the answer appears here &mdash; usually within a few minutes, and permanently for everyone after that.</span>
     </form>
-    <p class="how-meta">${howGroups.map((g) => `<a class="how-jump" href="#${g.id}">${esc(g.label)}</a>`).join(' &middot; ')}</p>
+    <p class="how-meta">${howRendered.map((g) => `<a class="how-jump" href="#${g.id}">${esc(g.label)}</a>`).join(' &middot; ')}</p>
   </div>
 </section>`,
-    howGroups.map(howSection).join('\n'),
+    howSections.join('\n'),
     `<script>
 (function () {
   var IDX = ${JSON.stringify(howIndex)};
@@ -2646,7 +2678,16 @@ ${rows.map(e => {
   var STOP = {a:1,an:1,the:1,is:1,are:1,was:1,were:1,be:1,do:1,does:1,did:1,i:1,me:1,my:1,we:1,our:1,you:1,your:1,it:1,its:1,this:1,that:1,these:1,those:1,of:1,to:1,in:1,on:1,at:1,for:1,with:1,and:1,or:1,but:1,if:1,then:1,than:1,so:1,as:1,by:1,from:1,up:1,out:1,about:1,into:1,over:1,after:1,can:1,could:1,should:1,would:1,will:1,shall:1,may:1,might:1,must:1,how:1,what:1,which:1,when:1,where:1,why:1,there:1,here:1,get:1,got:1,use:1,using:1,used:1};
   function terms (text) {
     var s = String(text || '').toLowerCase(), out = {}, m;
-    var re = /[a-z][a-z0-9_]{1,}|\/[a-z][a-z0-9-]*/g;
+    // The slash-command branch is written as a character class, [/], and not
+    // with an escaped slash. This line lives inside a template literal, where a
+    // backslash before a slash is not an escape: it collapses to a bare slash,
+    // leaving an unescaped slash directly after the alternation bar -- which
+    // ends the regex early and makes browsers reject the whole script with
+    // "expected expression, got ']'". A slash inside a class needs no escaping
+    // and survives the literal intact. (Kept out of this comment on purpose: a
+    // canary in the test suite greps the emitted page for that broken shape, and
+    // a comment reproducing it here would trip the very check that guards it.)
+    var re = /[a-z][a-z0-9_]{1,}|[/][a-z][a-z0-9-]*/g;
     while ((m = re.exec(s))) { if (m[0].length >= 3 && !STOP[m[0]]) out[m[0]] = 1; }
     return Object.keys(out);
   }
