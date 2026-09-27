@@ -884,8 +884,20 @@ export function llmConcurrency (env) {
 // refusal and restating the task is what actually recovers the call.
 // Both spellings matter: the gateway answers "I'm DeepSeek, an AI assistant..."
 // and "I am GPT-5.6 Luna, ...", and a pattern that only knows the contraction
-// lets the second one through (72c6c8f8 shipped it, from Sep 2025).
-export const LLM_REFUSAL_RE = /i'?m\s+(?:just\s+)?(?:an?\s+)?(?:ai|assistant|language model|deepseek|claude|gpt)\b|\bi\s+am\s+(?:an?\s+)?(?:ai|assistant|language model|deepseek|claude|gpt)\b|\bi\s+am\s+(?-i:[A-Z])[\w.-]*,?\s+an?\s+(?:ai|assistant|language model)\b|i\s+(?:cannot|can'?t|won'?t|will not)\s+(?:share|reveal|dump|disclose|provide|help|assist|comply)\b|cannot\s+(?:share|reveal|dump|disclose)\b|internal (?:system )?(?:instructions|prompt)|my (?:system|internal) (?:prompt|instructions)|as an ai (?:language )?model\b/i
+// lets the second one through (72c6c8f8 shipped it, from Sep 2025). The model
+// or vendor noun is what identifies these -- never a bare "I am", so a real
+// line that opens "I am the assistant, ..." still passes. (No `(?-i:...)`:
+// that modifier is a V8 flag feature and CI's node 22 rejects the file.)
+const AI_SELF = '(?:ai|assistant|language model|deepseek|claude|gpt|qwen|gemini|openai|anthropic)'
+export const LLM_REFUSAL_RE = new RegExp([
+  `i'?m\\s+(?:just\\s+)?(?:an?\\s+)?${AI_SELF}\\b`,
+  `i\\s+am\\s+(?:an?\\s+)?${AI_SELF}\\b`,
+  `i\\s+(?:cannot|can'?t|won'?t|will not)\\s+(?:share|reveal|dump|disclose|provide|help|assist|comply)\\b`,
+  'cannot\\s+(?:share|reveal|dump|disclose)\\b',
+  'internal (?:system )?(?:instructions|prompt)',
+  'my (?:system|internal) (?:prompt|instructions)',
+  'as an ai (?:language )?model\\b'
+].join('|'), 'i')
 
 // `validate` is a parameter because the ELI5 pass speaks to the same gateway
 // with a different shape: the repair retry has to check the replacement against
@@ -2726,7 +2738,14 @@ const ELI5_JUNK = /^(n\/?a|none|not applicable|no comment|unknown)[.!]?$/i
 // assistant… I cannot share or dump internal system instructions"). The second
 // shape is what a comment-heavy diff provokes, and it must never ship as the
 // plain-English line.
-const ELI5_REFUSAL = /^(i\s+ca(?:n'?t|nnot)|i(?:'m| am) unable|we\s+ca(?:n'?t|nnot)|unable to|sorry|as an ai|i'?m (just|only|an)|no information)\b|^i'?m\s+(?-i:[A-Z])[\w-]*,?\s+an?\s+(?:ai|assistant|language model)\b|^\s*i\s+am\s+(?-i:[A-Z])[\w.-]*(?:\s+v?[\d.]+)?\b[^.]{0,60}?\b(?:ai|assistant|language model|deepseek|claude|gpt|openai|anthropic)\b|\bi\s+don'?t know how to (?:respond|answer)\b|\b(?:share|reveal|dump|disclose)\b[^.]{0,40}\binternal (?:system )?(?:instructions|prompt)|^as an ai (?:language )?model\b/i
+const ELI5_REFUSAL = new RegExp([
+  "^(i\\s+ca(?:n'?t|nnot)|i(?:'m| am) unable|we\\s+ca(?:n'?t|nnot)|unable to|sorry|as an ai|i'?m (just|only|an)|no information)\\b",
+  `^i'?m\\s+[\\w-]*,?\\s+an?\\s+(?:ai|assistant|language model)\\b`,
+  `^\\s*i\\s+am\\s+(?:an?\\s+)?${AI_SELF}\\b`,
+  "i\\s+don'?t know how to (?:respond|answer)\\b",
+  "\\b(?:share|reveal|dump|disclose)\\b[^.]{0,40}\\binternal (?:system )?(?:instructions|prompt)",
+  '^as an ai (?:language )?model\\b'
+].join('|'), 'i')
 const ELI5_MEMORY = /\b(the latest [^.]{0,60} i know about|as of my (knowledge |training )?cutoff|my (knowledge|training)( data)? (cutoff|goes? |includes?|covers?)|i('?s| is) (knowledge|training)[^.]{0,40}cutoff)\b/i
 export { ELI5_MEMORY }
 
