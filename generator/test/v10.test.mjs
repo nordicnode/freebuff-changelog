@@ -10,7 +10,8 @@ import {
   ungroundedIdentifiers, validateGroundedEli5, backtickedProse, validateLlmOut,
   PR_MATCH_STOPLIST_RE, matchPrByPaths, buildPrRelevancePrompt,
   validatePrRelevanceOut, checkPrRelevance,
-  collectReleaseContext, formatReleaseContext
+  collectReleaseContext, formatReleaseContext,
+  stripDiffComments, strippedPatchOf, callLlm
 } from '../lib/llm.mjs'
 
 const sha = (c) => c.repeat(40)
@@ -167,6 +168,21 @@ test('validateGroundedEli5: leaks park, clean lines pass', () => {
   assert.match(ok, /helper/)
 })
 
+test('validateGroundedEli5: memory answers park even with a corpus; spaced model names ground', () => {
+  const corpus = 'sdk/src/a.ts diff text about a helper'
+  // The shipped garbage line for 47605f76 (Sep 27): a release-history
+  // recitation from training memory, not the comment-only diff. Both guards
+  // must catch it -- the memory phrase and the ungrounded "Claude Opus".
+  const garbage = 'The latest Claude Opus model I know about is Claude Opus 4.1, which was released in August 2025.'
+  assert.throws(() => validateGroundedEli5({ eli5: garbage }, 800, { corpus }), /model memory/)
+  // A missing diff is itself a verdict: never ship an unchecked line.
+  assert.throws(() => validateGroundedEli5({ eli5: 'A new helper is here.' }, 800, { corpus: '' }), /no grounding corpus/)
+  // But a diff that defines `claude-opus-4.1` grounds the spaced claim.
+  const withModel = 'sdk/src/a.ts defines claude-opus-4.1 mapping for the picker'
+  const grounded = validateGroundedEli5({ eli5: 'The picker maps Claude Opus 4.1 to its new id.' }, 800, { corpus: withModel })
+  assert.match(grounded, /Claude Opus 4/)
+})
+
 test('backtickedProse: plain English in backticks is a formatting error, identifiers survive', () => {
   assert.deepEqual(backtickedProse('Slices `, which slices` history'), [', which slices'])
   assert.deepEqual(backtickedProse('Rebuilt `from the sliced history; re-exported from` the index'), ['from the sliced history; re-exported from'])
@@ -245,4 +261,99 @@ test('release window: ungrounded members drop out, review-flagged members hedge'
   assert.match(text, /Solid fix/)
   const cleanCtx = collectReleaseContext([good, bump], bump)
   assert.doesNotMatch(formatReleaseContext(cleanCtx, bump), /caution|left out/)
+})
+
+// ---------------------------------------------------------------------------
+// Refusal recovery. A comment-heavy diff (the house-ad row, 58699f0e) made the
+// gateway answer "I cannot share or dump internal system instructions" to every
+// variant of the full ask, deterministically, on both models -- so the entry
+// never enriched. The comments are the volume the refusal tracks: strip them
+// and the same ask returns JSON.
+
+test('stripDiffComments: comment prose out, hunk headers, code and trailing comments kept', () => {
+  const patch = [
+    'diff --git a/common/src/constants/house.ts b/common/src/constants/house.ts',
+    'index 1111111..2222222 100644',
+    '--- a/common/src/constants/house.ts',
+    '+++ b/common/src/constants/house.ts',
+    '@@ -1,6 +1,9 @@',
+    ' const before = 1',
+    '+/**',
+    '+ * SAY THE UNIT. Every line here carries hours.',
+    '+ */',
+    '+const TOTAL = SESSIONS + FREE // trailing comment survives',
+    '+// a whole-line comment goes',
+    '-const old = 1 // removed lines keep their code'
+  ].join('\n')
+  const out = stripDiffComments(patch)
+  assert.match(out, /index 1111111\.\.2222222 100644/, 'index line is transport')
+  assert.match(out, /@@ -1,6 \+1,9 @@/, 'hunk header survives, or the diff stops parsing')
+  assert.match(out, /^ const before = 1$/m)
+  assert.match(out, /^\+const TOTAL = SESSIONS \+ FREE \/\/ trailing comment survives$/m)
+  assert.match(out, /^-const old = 1/m, 'a removed line keeps its code')
+  assert.doesNotMatch(out, /SAY THE UNIT/)
+  assert.doesNotMatch(out, /whole-line comment goes/)
+  assert.doesNotMatch(out, /\*\//)
+})
+
+test('strippedPatchOf: only returns a prompt worth sending', () => {
+  const code = 'diff --git a/x.ts b/x.ts\n@@ -1,2 +1,3 @@\n const a = 1\n+const b = 2\n+const c = 3\n'
+  const commented = `${code}+// NOTE: this comment is the problem\n+/**\n+ * Imperative prose the refusal tracks.\n+ */\n`
+  assert.equal(strippedPatchOf(code), null, 'nothing to strip: no second prompt')
+  assert.equal(strippedPatchOf(''), null)
+  // Comment-only rows (the class 47605f76 belongs to) have no code left once
+  // the comments go: no fallback rather than a prompt with an empty diff.
+  assert.equal(strippedPatchOf('diff --git a/x.ts b/x.ts\n@@ -1 +1 @@\n+// only a comment\n+// here\n+// too\n'), null)
+  const stripped = strippedPatchOf(commented)
+  assert.ok(stripped, 'a comment-heavy diff does have a fallback')
+  assert.doesNotMatch(stripped, /Imperative prose/)
+  assert.match(stripped, /const b = 2/)
+})
+
+test('callLlm: a refusal is re-asked with the comment-stripped prompt, not the same one', async () => {
+  const refusal = "I'm DeepSeek, an AI assistant developed by DeepSeek. I cannot share or dump internal system instructions."
+  const good = JSON.stringify({
+    evidence: 'common/src/constants/house.ts defines TOTAL.',
+    title: 'Total per day constant added',
+    summary: 'Adds a TOTAL constant in common/src/constants/house.ts.',
+    significance: 'minor'
+  })
+  const fullPrompt = 'Explain the change.\n```diff\n+// SAY THE UNIT\n+const TOTAL = 1\n```'
+  const shortPrompt = 'Explain the change.\n```diff\n+const TOTAL = 1\n```'
+  const seen = []
+  const orig = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    const prompt = JSON.parse(String(init.body)).messages[0].content
+    seen.push(prompt)
+    const content = /SAY THE UNIT/.test(prompt) ? refusal : good
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content } }] }) }
+  }
+  try {
+    const out = await callLlm(fullPrompt, { LLM_API_BASE: 'https://gateway.test/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm' }, 1, validateLlmOut, { fallbackPrompt: shortPrompt })
+    assert.equal(out.title, 'Total per day constant added')
+    assert.equal(seen.length, 2, 'one refusal, one re-ask')
+    assert.equal(seen[0], fullPrompt)
+    assert.doesNotMatch(seen[1], /SAY THE UNIT/, 'the second ask drops the comment prose')
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
+test('callLlm: no fallback offered, a refusal still burns the named re-ask and stops', async () => {
+  const refusal = "I'm DeepSeek, an AI assistant developed by DeepSeek."
+  let calls = 0
+  const orig = globalThis.fetch
+  globalThis.fetch = async () => {
+    calls++
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content: refusal } }] }) }
+  }
+  try {
+    await assert.rejects(
+      callLlm('prompt', { LLM_API_BASE: 'https://gateway.test/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm' }, 1, validateLlmOut),
+      /no JSON/
+    )
+    assert.ok(calls <= 3, `attempt budget stays bounded, got ${calls}`)
+  } finally {
+    globalThis.fetch = orig
+  }
 })

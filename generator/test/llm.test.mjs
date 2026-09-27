@@ -902,6 +902,16 @@ test('normalizeEli5: unwraps the reply, strips the echoed label, keeps it honest
   const cut = normalizeEli5({ eli5: 'word ' + 'many '.repeat(220) + 'tail' })
   assert.ok(cut.length <= 801, `capped, got ${cut.length}`)
   assert.ok(/word/.test(cut) && !/man$/.test(cut), 'cut on a word boundary')
+  // The three pillar headings the ask structures around are scaffolding: a
+  // model that echoes them ships the prompt's outline, not prose.
+  assert.equal(
+    normalizeEli5({ eli5: 'Core Change: Live today, the CLI reads the new setting. Who It Affects: Terminal users of the app. Everyday Impact: Nothing changes for you.' }),
+    'Live today, the CLI reads the new setting. Terminal users of the app. Nothing changes for you.'
+  )
+  // Only where a heading could stand: prose that mentions the phrase, or a
+  // sentence-cased variant, is real text and stays.
+  assert.equal(normalizeEli5({ eli5: 'You will see the everyday impact in the morning' }), 'You will see the everyday impact in the morning.')
+  assert.equal(normalizeEli5({ eli5: 'The setting moved. Who it affects: the same people.' }), 'The setting moved. Who it affects: the same people.')
 })
 
 test('validateLlmOut: rejects raw glued identifiers in the title', () => {
@@ -1121,7 +1131,9 @@ test('buildEli5Prompt: injects architecture map, PR motivation, sequence context
   assert.match(prompt, /cli\//)
   assert.match(prompt, /Developer intent \(PR #1374\): Add BYOK support/)
   assert.match(prompt, /Fixes #1374 for users with enterprise keys/)
-  assert.match(prompt, /Same-day commit sequence: Earlier: Earlier CLI work -> Current: New \/byok slash command -> Later: Later CLI work/)
+  // "Current:" reads as a turn boundary to the gateway's model and provokes a
+  // memory recitation or an empty completion instead of the JSON asked for.
+  assert.match(prompt, /Same-day commit sequence: Earlier: Earlier CLI work -> This commit: New \/byok slash command -> Later: Later CLI work/)
   assert.match(prompt, /diff --git a\/cli\/src\/byok\.ts/)
 })
 

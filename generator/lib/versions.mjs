@@ -31,6 +31,13 @@ export const PROMPT_V = 11
 
 // v7: commit nature always supplied, audience handed over, no "you (the
 // person...)" asides, template lines for test-only and docs-only rows.
+//
+// Held at v7 through the "This commit:" sequence fix on purpose. That change
+// removed a trigger ("Current:" read as a turn boundary) that made the pass
+// return a memory recitation or an empty completion -- a *failure*, so no line
+// was ever stored from it (checked across the corpus: zero memory/refusal
+// lines). Bumping would re-queue every stored line, ~1,000 rows at the sync's
+// 10-per-cycle ELI5 budget, to reproduce identical text.
 export const ELI5_V = 7
 
 // v8: the roll-up ask gained the anti-marketing rules the per-commit pass has.

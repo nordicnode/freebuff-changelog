@@ -327,6 +327,68 @@ function prDiscussionLines (prMeta, { maxComments = 6, maxChars = 400 } = {}) {
   return out
 }
 
+// Comment/JSDoc prose stripped out of a unified diff, used as a second ask
+// when the first one is refused or answered in prose.
+//
+// What is known, and how: the refusal is deterministic, not flaky. The same
+// prompt refused 6 times out of 6 at temperature 0, on deepseek-v4.1 AND
+// gpt-6-luna, with a different system_fingerprint each call (the gateway
+// routes every request to a different backend, and every one refuses). It
+// survives dropping response_format, raising temperature, reworded asks, and
+// a system message. With the comments stripped the same ask returns valid
+// JSON, reproducibly, on both models. The house-ad diff (58699f0e) is the
+// row that refuses: half its diff refuses, and either half alone does not.
+//
+// What is NOT known, deliberately: why. It is not the length (neutral filler
+// of the same size passes), not the ad copy alone (the same strings without
+// their surrounding code pass), and not the comment wording (swapping the
+// comments for equally long neutral English still refuses). So this is a
+// content-triggered refusal whose exact rule lives in the gateway's models,
+// not something this repo can state as fact. The strip is therefore only a
+// retry: it is tried after a refusal, never before, so every row that would
+// have answered the full prompt still does.
+// Hunk headers and file metadata are transport and are always kept.
+export function stripDiffComments (src) {
+  const out = []
+  let inBlock = false
+  for (const line of String(src ?? '').split('\n')) {
+    if (/^(diff --git|index |new file mode|deleted file mode|rename |similarity |Binary |--- |\+\+\+ |@@)/.test(line)) {
+      out.push(line)
+      continue
+    }
+    const body = /^[+\- ]/.test(line) ? line.slice(1) : line
+    if (inBlock) {
+      if (body.includes('*/')) inBlock = false
+      continue
+    }
+    const t = body.trimStart()
+    if (t.startsWith('/*')) {
+      if (!t.includes('*/')) inBlock = true
+      continue
+    }
+    if (t.startsWith('//') || t.startsWith('*')) continue
+    out.push(line)
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()
+}
+
+// The stripped prompt is worth building only when stripping actually left code
+// behind: a comment-only diff has nothing to summarize once the comments go.
+export function strippedPatchOf (patch) {
+  const src = String(patch ?? '')
+  const stripped = stripDiffComments(src)
+  const nonEmpty = (s) => s.split('\n').filter(l => l.trim()).length
+  if (nonEmpty(stripped) === nonEmpty(src)) return null
+  // The fallback is only worth sending when code survives the strip: a
+  // comment-only diff would arrive as a header with nothing under it, and the
+  // model would answer about an empty change (or refuse again).
+  const bodyLines = stripped.split('\n').filter(l => {
+    if (!l.trim()) return false
+    return !/^(diff --git|index |new file mode|deleted file mode|rename |similarity |Binary |--- |\+\+\+ |@@)/.test(l)
+  }).length
+  return bodyLines >= 3 ? stripped : null
+}
+
 export function buildPrompt (entry, patch, ctx = {}) {
   const nature = entry.commitNature || commitNatureOf(entry)
   const multi = isMultiTopic(entry)
@@ -726,6 +788,15 @@ export function parseLlmJson (text) {
 // Some OpenAI-compatible gateways answer /chat/completions with SSE chunk
 // frames (one JSON object per `data:` line) even when stream was not asked
 // for. Reassemble those into the message text; plain JSON bodies pass through.
+//
+// A few of those gateways also wrap the message in their own tags
+// (`<content>…</content>`, closing tag on its own line). The wrapper is
+// transport, not answer: left in place it sits after the JSON object's closing
+// brace and corrupts the text the validators see.
+export function stripGatewayWrapper (text) {
+  return String(text ?? '').replace(/<\/?content>/gi, '').trim()
+}
+
 export function extractResponseText (rawText) {
   const raw = String(rawText)
   const frames = raw.split('\n').filter(l => /^\s*data:\s*\{/.test(l))
@@ -740,14 +811,14 @@ export function extractResponseText (rawText) {
         if (typeof delta === 'string') text += delta
       } catch { /* skip malformed chunk lines */ }
     }
-    if (text) return text
+    if (text) return stripGatewayWrapper(text)
     // No deltas: a gateway may still have sent whole messages per frame.
     for (const line of frames) {
       const m = /^\s*data:\s*(\{.*\})\s*$/.exec(line)
       if (!m) continue
       try {
         const content = messageContent(JSON.parse(m[1]))
-        if (content) return content
+        if (content) return stripGatewayWrapper(content)
       } catch { /* keep looking */ }
     }
   }
@@ -758,7 +829,7 @@ export function extractResponseText (rawText) {
     throw new Error('LLM returned no JSON')
   }
   const content = messageContent(parsed)
-  if (content) return content
+  if (content) return stripGatewayWrapper(content)
   throw new Error('LLM returned no JSON')
 }
 
@@ -804,6 +875,14 @@ export async function waitForLlmRpmSlot (env) {
 export function llmConcurrency (env) {
   return Math.max(1, Math.min(6, Number(env?.CHANGELOG_LLM_CONCURRENCY || 2) || 2))
 }
+
+// A reply in prose where JSON was asked for is usually a refusal or a
+// self-description ("I'm DeepSeek, an AI assistant… I cannot share or dump
+// internal system instructions"), which source-heavy diffs provoke when their
+// comments contain imperatives. The model was never confused about JSON, so the
+// "your output was rejected" repair invites a second refusal; naming the
+// refusal and restating the task is what actually recovers the call.
+export const LLM_REFUSAL_RE = /i'?m\s+(?:just\s+)?(?:an?\s+)?(?:ai|assistant|language model|deepseek|claude|gpt)\b|i\s+(?:cannot|can'?t|won'?t|will not)\s+(?:share|reveal|dump|disclose|provide|help|assist|comply)\b|cannot\s+(?:share|reveal|dump|disclose)\b|internal (?:system )?(?:instructions|prompt)|my (?:system|internal) (?:prompt|instructions)|as an ai (?:language )?model\b/i
 
 // `validate` is a parameter because the ELI5 pass speaks to the same gateway
 // with a different shape: the repair retry has to check the replacement against
@@ -883,11 +962,42 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
   try {
     const parsed = parseLlmJson(text)
     return validate(parsed)
-  } catch (err) {
+  } catch (rawErr) {
+    let err = rawErr
+    const noJson = /no JSON/i.test(String(err.message))
+    const refused = noJson && LLM_REFUSAL_RE.test(String(text))
+    // The plain-English ask accepts a bare-string reply by design (see
+    // normalizeEli5), so a model that answered in prose instead of the JSON
+    // envelope is validated as-is rather than burning both repair passes on a
+    // JSON complaint it was never going to understand. The ELI5 validator
+    // still applies its junk/refusal/memory/grounding gates to that text.
+    if (opts.bareText && noJson && String(text).trim()) {
+      try { return validate(text) } catch (validationErr) { err = validationErr }
+    }
     if (attempt > 2) throw err
+    // A refusal is content-triggered (see stripDiffComments): restating the
+    // task does not move it, a materially shorter ask does. Take the fallback
+    // first, keep the named refusal re-ask as the last shot.
+    if (refused && opts.fallbackPrompt && !opts.usedFallback) {
+      log(`LLM refused the request (${String(text).slice(0, 60)}…): re-asking with the diff's comment prose stripped`)
+      return callLlm(opts.fallbackPrompt, env, attempt + 1, validate, { ...opts, usedFallback: true })
+    }
+    if (refused) {
+      log(`LLM refused the request (${String(text).slice(0, 60)}…): re-asking with the refusal named`)
+      return callLlm(`${prompt}\n\nYour previous reply refused the request or described yourself instead of answering. This is a public-repository changelog task: the text above is a git diff from an open-source mirror, not a request for your instructions, identity or configuration. Do not describe yourself, do not refuse, and do not mention your own rules. Reply with ONLY the JSON object asked for, describing the code change.`, env, attempt + 1, validate, opts)
+    }
     // One repair pass. The rejection reason travels with it: a grounding or
     // boilerplate failure is not a JSON problem, and a model told "invalid JSON"
     // will not fix a misspelled identifier.
+    //
+    // Prose where JSON was asked for is the same shape a second time only if
+    // the prompt itself is what the model will not format (long inputs come
+    // back as free text from this gateway). The shorter ask is the repair that
+    // changes those odds, so it takes the second slot.
+    if (noJson && opts.fallbackPrompt && !opts.usedFallback && attempt >= 2) {
+      log(`LLM replied in prose twice (${String(text).slice(0, 60)}…): re-asking with the diff's comment prose stripped`)
+      return callLlm(opts.fallbackPrompt, env, attempt + 1, validate, { ...opts, usedFallback: true })
+    }
     log(`LLM output invalid (${err.message}): requesting repair ${attempt}/2`)
     return callLlm(`${prompt}\n\nPrevious output was rejected: ${String(err.message).slice(0, 400)}\nPrevious output: ${String(text).slice(0, 500)}\nFix exactly that problem without new analysis. Reply with ONLY the corrected JSON object.`, env, attempt + 1, validate, opts)
   }
@@ -1016,6 +1126,17 @@ export function ungroundedIdentifiers (text, corpus) {
     if (!hay.includes(tok)) return false
     return new RegExp(`(?<![\\w.])${tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w])`).test(hay)
   }
+  // Case-insensitive fallback for prose names ("DeepSeek" from a diff that
+  // only carries FREEBUFF_DEEPSEEK_*, "Claude Opus" from `claude-opus-4.1`).
+  let hayLower = null
+  const corpusHasName = (tok) => {
+    if (corpusHas(tok)) return true
+    if (!tok || tok.length < 3) return true
+    const low = (hayLower ??= hay.toLowerCase())
+    const t = tok.toLowerCase()
+    if (!low.includes(t)) return false
+    return new RegExp(`(?<![a-z0-9.])${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z0-9])`).test(low)
+  }
   // A dotted name is grounded by the object literal that nests it. The claim
   // may also add a leading segment a reader can infer (`payload.page.url` for
   // a source that writes `page.url`), but every segment it drops has to be one
@@ -1077,30 +1198,46 @@ export function ungroundedIdentifiers (text, corpus) {
     if (out.includes(v)) continue
     if (!corpusHas(v)) out.push(v)
   }
-  // Two-segment versions only count when written model-style with a name or
-  // dash in front (`GPT-4.1`); a bare `4.1` in prose is too often a rating,
-  // a ratio, or a piecewise part of a longer number the pass above skipped.
+  // Dashed model-style versions (`GPT-4.1`): a dashed name may be grounded
+  // under its spaced spelling instead (`claude-opus-4.1` in the corpus for a
+  // `Claude Opus 4.1` claim).
   for (const m of prose.matchAll(/(?<![\w.])([A-Za-z][-\w]*-v?\d+\.\d+(?:\.\d+)?)(?![\w.])/g)) {
     const v = m[1]
     if (out.includes(v)) continue
-    if (!corpusHas(v)) out.push(v)
+    if (!corpusHas(v)) {
+      const spaced = v.replace(/-/g, ' ')
+      if (spaced !== v && corpusHasName(spaced)) continue
+      out.push(v)
+    }
   }
   for (const m of prose.matchAll(/(?<![\w-])(--?[a-z][\w-]*)/g)) {
     const f = m[1]
     if (f.length < 3 || out.includes(f)) continue
     if (!corpusHas(f)) out.push(f)
   }
+  // Space-separated model names (`Claude Opus 4.1`) are the same claim as the
+  // dashed form (`claude-opus-4.1`) with spaces instead of dashes: the leading
+  // name must appear in the corpus, under either spelling. That keeps
+  // "Opus 4.1" grounded for a diff that defines `claude-opus-4.1` while
+  // rejecting it for a diff that never mentions Opus at all. The version tail
+  // itself stays exempt; only the name it is attached to is checked.
+  // Capitalized words only: matching lowercase ("shipped in 0.0.179") would
+  // flag ordinary verb phrases as model names.
+  for (const m of prose.matchAll(/(?<![\w.])([A-Z][A-Za-z]* (?:[A-Z][A-Za-z]* )?v?\d+\.\d+(?:\.\d+)?)(?![\w.])/g)) {
+    const v = m[1]
+    if (out.includes(v)) continue
+    const namePart = v.replace(/\s+v?\d[\d.]*/, '').trim()
+    if (!namePart) continue
+    const words = namePart.split(/\s+/)
+    const lead = words.length > 1 ? words.slice(-2).join(' ') : words[0]
+    const dashed = (s) => s.replace(/\s+/g, '-')
+    if (!corpusHasName(namePart) && !corpusHasName(lead) &&
+        !corpusHasName(dashed(namePart)) && !corpusHasName(dashed(lead)) &&
+        !out.includes(lead)) out.push(lead)
+  }
   // camelCase/PascalCase names leak into prose too ("the OffPeakEngine now
   // caps it"): the shape no English word uses. Brands and established proper
   // nouns are exempted by allowlist, and short forms (iOS, DoS) by length.
-  let hayLower = null
-  const corpusHasName = (tok) => {
-    if (corpusHas(tok)) return true
-    const low = (hayLower ??= hay.toLowerCase())
-    const t = tok.toLowerCase()
-    if (!low.includes(t)) return false
-    return new RegExp(`(?<![a-zA-Z0-9.])${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-zA-Z0-9])`).test(low)
-  }
   for (const m of prose.matchAll(/\b[A-Za-z]{6,}\b/g)) {
     const name = m[0]
     if (!PROSE_NAME_RE.test(name)) continue
@@ -1914,7 +2051,13 @@ export function validateVerifyOut (out) {
 
 export async function verifySummary (entry, patch, clean, env, cautionNames = []) {
   const venv = { ...env, LLM_MODEL: env.LLM_VERIFY_MODEL || env.LLM_MODEL }
-  return callLlm(buildVerifyPrompt(entry, patch, clean, cautionNames), venv, 1, validateVerifyOut)
+  // The verifier reads the same diff the ask did, so a comment-heavy row
+  // refuses here too and the verdict silently goes missing (58699f0e logged
+  // "verifier unavailable" right after its summary recovered). Same fallback,
+  // offered only if the first read comes back refused or in prose.
+  const stripped = strippedPatchOf(patch)
+  const fallbackPrompt = stripped ? buildVerifyPrompt(entry, stripped, clean, cautionNames) : null
+  return callLlm(buildVerifyPrompt(entry, patch, clean, cautionNames), venv, 1, validateVerifyOut, { fallbackPrompt })
 }
 
 // Map-reduce orchestration: one focused call per chunk (sequential, to respect
@@ -1971,13 +2114,18 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
   // the fuse prompt for chunked rows (re-sending the single prompt would
   // truncate away the chunks the draft was fused from).
   let repairPrompt = prompt
+  // Shorter ask, same question: what callLlm falls back to when the gateway
+  // refuses or answers in prose. Not built for chunked rows, whose single-shot
+  // prompt is the thing chunking exists to avoid.
+  const strippedPatch = needsChunking(e, patch, baseEnv) ? null : strippedPatchOf(patch)
+  const fallbackPrompt = strippedPatch ? buildPrompt(e, strippedPatch, promptCtx) : null
   if (needsChunking(e, patch, baseEnv)) {
     log(`LLM map-reduce for ${String(e.sha || '').slice(0, 8)} (${String(patch || '').length} bytes)`)
     const reduced = await summarizeChunked(e, patch, { promptCtx, corpus, sig, env })
     clean = reduced.clean
     repairPrompt = reduced.fuse
   } else {
-    clean = await callLlm(prompt, env, 1, summaryValidator(sig, corpus, promptCtx.structured))
+    clean = await callLlm(prompt, env, 1, summaryValidator(sig, corpus, promptCtx.structured), { fallbackPrompt })
   }
   // Names the model saw ONLY through the same-day sequence block: a claim
   // leaning on one of them must attribute it to the sibling commit.
@@ -2000,7 +2148,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
       if (!verdict.supported && (verdict.issues.length || badClaims.length)) {
         const objections = objectionsTo(verdict).join('\n')
         log(`LLM verifier objected for ${e.sha.slice(0, 8)}: ${(verdict.issues[0] || badClaims[0]?.quote || '').slice(0, 100)}`)
-        const repaired = await callLlm(`${repairPrompt}\n\nA reviewer checked your previous answer against the diff and found these unsupported claims:\n${objections}\nRewrite the entry so every claim is supported by the diff. Reply with ONLY the JSON object.`, env, 1, summaryValidator(sig, corpus, structured))
+        const repaired = await callLlm(`${repairPrompt}\n\nA reviewer checked your previous answer against the diff and found these unsupported claims:\n${objections}\nRewrite the entry so every claim is supported by the diff. Reply with ONLY the JSON object.`, env, 1, summaryValidator(sig, corpus, structured), { fallbackPrompt })
         const recheck = await verifySummary(e, patch, repaired, env, cautionNames).catch(() => null)
         clean = repaired
         verify = recheck && recheck.supported ? 'passed' : 'flagged'
@@ -2025,7 +2173,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     if (current > 0) {
       try {
         const strongEnv = { ...baseEnv, LLM_MODEL: baseEnv.LLM_MODEL_MAJOR }
-        const strong = await callLlm(repairPrompt, strongEnv, 1, summaryValidator(sig, corpus, structured))
+        const strong = await callLlm(repairPrompt, strongEnv, 1, summaryValidator(sig, corpus, structured), { fallbackPrompt })
         const recheck = await verifySummary(e, patch, strong, strongEnv, cautionNames).catch(() => null)
         const strongDirt = dirt(strong, recheck)
         if (strongDirt < current) {
@@ -2055,7 +2203,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
       const probe = await callLlm(repairPrompt, outEnv, 1, (out) => ({
         breaking: out?.breaking === true,
         migration: typeof out?.migration === 'string' && out.migration.trim() ? out.migration.trim() : ''
-      }), { temperature: 0.3 })
+      }), { temperature: 0.3, fallbackPrompt })
       const demoted = []
       if (clean.breaking && !probe.breaking) {
         delete clean.breaking
@@ -2447,7 +2595,12 @@ Reply with JSON only: {"eli5": "..."}`
   if (sequence && (sequence.earlier?.length || sequence.later?.length)) {
     const seq = []
     for (const s of sequence.earlier || []) seq.push(`Earlier: ${s.title || s.summary || s.sha.slice(0, 8)}`)
-    seq.push(`Current: ${e.ai?.title || e.title || ''}`)
+    // "Current:" is a trap for the gateway's model: on a full-length prompt it
+    // reads the token as a turn boundary and answers a question about itself
+    // ("the latest X I know about…") or returns an empty completion instead of
+    // the JSON asked for -- deterministically, at temperature 0, for every row
+    // carrying this line. "This commit:" says the same thing and does not.
+    seq.push(`This commit: ${e.ai?.title || e.title || ''}`)
     for (const s of sequence.later || []) seq.push(`Later: ${s.title || s.summary || s.sha.slice(0, 8)}`)
     evidence.push(`Same-day commit sequence: ${seq.join(' -> ')}`)
   }
@@ -2546,18 +2699,33 @@ Reply with JSON only: {"eli5": "..."}`
 // wrong line.
 export function validateGroundedEli5 (out, maxChars, { allow = '', corpus = '' } = {}) {
   const text = normalizeEli5(out, maxChars, { allow })
-  if (corpus) {
-    const bad = ungroundedIdentifiers(text, corpus)
-    if (bad.length) throw new Error(`ELI5 names identifiers not present in the diff or evidence: ${bad.slice(0, 6).join(', ')}`)
-  }
+  // An empty corpus is itself a verdict: the ELI5 validator never runs bare.
+  // explainEntry always builds one from the diff, so '' means the diff was
+  // missing and any specific line the model wrote is unverifiable -- park it
+  // instead of shipping it unchecked. (The summary pass keeps the old
+  // fail-open behavior on purpose: ungroundedIdentifiers() with no corpus
+  // returns no verdict.)
+  if (!corpus) throw new Error('ELI5 has no grounding corpus (missing diff): parking the line')
+  const bad = ungroundedIdentifiers(text, corpus)
+  if (bad.length) throw new Error(`ELI5 names identifiers not present in the diff or evidence: ${bad.slice(0, 6).join(', ')}`)
   return text
 }
 
-// Non-answers worth parking: a whole reply that is "N/A", or one that opens with
-// a refusal. Checked at the start of the sentence so a real explanation that
-// happens to contain "cannot" is not thrown away.
+// Non-answers worth parking: a whole reply that is "N/A", one that opens with
+// a refusal, or one that answers from training memory instead of the diff
+// ("the latest X I know about", "as of my knowledge cutoff"). The memory
+// phrases park wherever they appear: none of them ever describes a diff.
+// The refusal check stays start-anchored so a real explanation that happens
+// to contain "cannot" is not thrown away.
 const ELI5_JUNK = /^(n\/?a|none|not applicable|no comment|unknown)[.!]?$/i
-const ELI5_REFUSAL = /^(i\s+ca(?:n'?t|nnot|'m unable)|we\s+ca(?:n'?t|nnot)|unable to|sorry|as an ai|i'?m (just|only|an)|no information)\b/i
+// A refusal is either an opening apology ("I can't…", "Sorry…") or a
+// self-description that answers a question nobody asked ("I'm DeepSeek, an AI
+// assistant… I cannot share or dump internal system instructions"). The second
+// shape is what a comment-heavy diff provokes, and it must never ship as the
+// plain-English line.
+const ELI5_REFUSAL = /^(i\s+ca(?:n'?t|nnot)|i(?:'m| am) unable|we\s+ca(?:n'?t|nnot)|unable to|sorry|as an ai|i'?m (just|only|an)|no information)\b|^i'?m\s+[A-Z][\w-]*,?\s+an?\s+(?:ai|assistant|language model)\b|\b(?:share|reveal|dump|disclose)\b[^.]{0,40}\binternal (?:system )?(?:instructions|prompt)|^as an ai (?:language )?model\b/i
+const ELI5_MEMORY = /\b(the latest [^.]{0,60} i know about|as of my (knowledge |training )?cutoff|my (knowledge|training)( data)? (cutoff|goes? |includes?|covers?)|i('?s| is) (knowledge|training)[^.]{0,40}cutoff)\b/i
+export { ELI5_MEMORY }
 
 // ELI5 length caps. The old single 800-char cap predates roll-ups: a release
 // window legitimately enumerates several shipped changes, so it piled against
@@ -2602,6 +2770,17 @@ export function normalizeEli5 (raw, maxChars = ELI5_MAX_CHARS, { allow = '' } = 
   let s = String(value ?? '').replace(/[\u2014\u2013—–]|&mdash;|&ndash;/g, ' - ').trim()
   // Models like to restate the label they were given.
   s = s.replace(/^(ELI5|In plain English|Plain english)\s*[:–-]\s*/i, '').trim()
+  // The ask structures the answer around three pillars, and a model that
+  // echoes the headings ships the prompt's outline instead of prose ("Core
+  // Change: Live today, … Who It Affects: People…"). Dropped only where a
+  // heading could stand: at the start of the line, or right after a full
+  // sentence -- prose that merely mentions "the everyday impact:" or a
+  // lowercase "Who it affects:" is left alone, and the sentence after the
+  // heading already starts capitalised.
+  const beforeLabels = s
+  s = s.replace(/^(?:Core Change|Who It Affects|Everyday Impact)\s*[:–-]\s*/, '')
+  s = s.replace(/(?<=\.)\s+(?:Core Change|Who It Affects|Everyday Impact)\s*[:–-]\s*/g, ' ')
+  if (s !== beforeLabels && s) s = s.charAt(0).toUpperCase() + s.slice(1)
   s = s.replace(/\s+/g, ' ').replace(/\s+([.,;:])/g, '$1').trim()
   // Strip prompt-echo openings
   const withoutEcho = s.replace(/^(?:if you looked(?: at [^,]+)?,?|what you would notice(?: is)?,?|behind the scenes,?|under the hood,?)\s*/i, '').trim()
@@ -2627,6 +2806,9 @@ export function normalizeEli5 (raw, maxChars = ELI5_MAX_CHARS, { allow = '' } = 
   // is for. A 25-character floor parked real answers as errors for an hour.
   if (s.length < 12 || ELI5_JUNK.test(s) || ELI5_REFUSAL.test(s)) {
     throw new Error(`eli5 not an answer: ${JSON.stringify(s).slice(0, 60)}`)
+  }
+  if (ELI5_MEMORY.test(s)) {
+    throw new Error(`eli5 answers from model memory instead of the diff: ${JSON.stringify(s).slice(0, 80)}`)
   }
   if (maxChars > ELI5_MAX_CHARS && /(?:simply bundles?|internal packaging marker|nothing breaks,? nothing changes|no action is required on your part|(?:workflow|project setup|outputs?)(?: [a-z,]+)* will not be (?:any )?different)/i.test(s)) {
     throw new Error(`eli5 roll-up contains no-action packaging boilerplate without describing features: ${JSON.stringify(s).slice(0, 80)}`)
@@ -2846,7 +3028,7 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     fileHistory: context.fileHistory,
     subsystemDocs: context.subsystemDocs
   })
-  const text = await callLlm(buildEli5Prompt(e, eli5Notes(e, notesPatch), {
+  const promptCtx = {
     patch,
     siblings,
     diffBytes,
@@ -2859,7 +3041,14 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     fileHeaders: context.fileHeaders,
     fileHistory: context.fileHistory,
     subsystemDocs: context.subsystemDocs
-  }), env, 1, (out) => validateGroundedEli5(out, maxChars, { allow, corpus }))
+  }
+  // Shorter ask for a gateway that answers the full one with a refusal or
+  // prose (see stripDiffComments). The grounding corpus above keeps the whole
+  // diff: the fallback shows the model less, never more, so everything it can
+  // still name stays checkable.
+  const strippedPatch = strippedPatchOf(patch)
+  const fallbackPrompt = strippedPatch ? buildEli5Prompt(e, eli5Notes(e, notesPatch), { ...promptCtx, patch: strippedPatch }) : null
+  const text = await callLlm(buildEli5Prompt(e, eli5Notes(e, notesPatch), promptCtx), env, 1, (out) => validateGroundedEli5(out, maxChars, { allow, corpus }), { bareText: true, fallbackPrompt })
   const record = {
     model: env.LLM_MODEL || 'gpt-4o-mini',
     v: ELI5_V,
