@@ -6,6 +6,7 @@ import { escapeHtml as esc, fmtDateHuman, pool, shortHash } from './util.mjs'
 import { CSS } from './style.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg, feedsOpml } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
+import { buildAnswerIndex, BAND_HIGH, BAND_LOW } from './howto.mjs'
 import { buildStoryIndex, dayStories, dayStoryLead } from './story.mjs'
 import { computeShippedIn, isSecurityEntry, PROMPT_V, ELI5_V, AUDIENCE_DESC, AUDIENCES } from './llm.mjs'
 import { buildWeeklyDigests, weeklyFeedItem, weeklyHeadline, weekLabel, weeklyText, summaryQuality } from './digest.mjs'
@@ -112,6 +113,7 @@ ${ld ? `<script type="application/ld+json">${ldScript(ld)}</script>` : ''}
     <a href="/about/" class="${path === '/about/' ? 'active' : ''}">/about</a>
     <a href="/week/" class="${path.startsWith('/week') ? 'active' : ''}">/weekly</a>
     <a href="/models/" class="${path.startsWith('/models/') ? 'active' : ''}">/models</a>
+    <a href="/how/" class="${path.startsWith('/how') ? 'active' : ''}">/how</a>
     <a href="/stats/" class="${path.startsWith('/stats/') ? 'active' : ''}">/stats</a>
     <a href="/archive/" class="${path.startsWith('/archive/') ? 'active' : ''}">/archive</a>
     <a href="/search/" class="${path.startsWith('/search/') ? 'active' : ''}">/search</a>
@@ -1916,7 +1918,7 @@ const RANGE_JS = `(function () {
 })();
 `
 
-export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, overridesDoc = null }) {
+export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, overridesDoc = null, howto = null }) {
   const trafficCount = traffic?.count ?? 0
   const trafficUniques = traffic?.uniques ?? 0
   activeTraffic = { count: trafficCount, uniques: trafficUniques }
@@ -2554,8 +2556,228 @@ ${rows.map(e => {
     </div>`
   }).join('')
 
-  await write(dist, 'models/index.html', layout({
-    title: 'Models', path: '/models/',
+  // -------------------------------------------------------------------------
+  // /how/ - "how do I...", answered from the product itself.
+  //
+  // Not a changelog view. Each answer was written by reading the code that
+  // implements the thing, the docs that describe it, and the changes that have
+  // been made to both, and every answer carries the files and commits it relied
+  // on. A question with no answer is shown as a question, not filled in: the
+  // alternative is a page that invents an answer for whatever someone typed.
+  const howList = [...(howto?.values() || [])].filter(a => a && a.answer && a.q)
+  // The background corpus for the answer index: one document per tracked change.
+  // Rarity has to be measured against the language this site is written in, not
+  // against 54 answers, or every ordinary word the guide happens not to use
+  // looks like a rare and highly informative term.
+  const howBackground = (changelog?.entries || [])
+    .filter(e => e && !e.noise)
+    .map(e => `${e.ai?.title || e.title || ''} ${e.ai?.summary || ''}`)
+  const howIndex = buildAnswerIndex(howList, { background: howBackground })
+  const howGroups = [
+    { id: 'start', label: 'Getting started', match: (a) => (a.tags || []).includes('start') },
+    { id: 'commands', label: 'Commands', match: (a) => (a.tags || []).some(t => t === 'command' || t.startsWith('/')) && !(a.tags || []).includes('site') },
+    { id: 'models', label: 'Models and how to choose', match: (a) => (a.tags || []).includes('model') && !(a.tags || []).includes('site') },
+    { id: 'breaking', label: 'What changed and what to do', match: (a) => (a.tags || []).includes('breaking') },
+    { id: 'settings', label: 'Settings and flags', match: (a) => (a.tags || []).includes('setting') },
+    { id: 'site', label: 'Using this site', match: (a) => (a.tags || []).includes('site') },
+    { id: 'asked', label: 'Asked and answered', match: (a) => (a.tags || []).includes('ask') }
+  ]
+  const howSeen = new Set()
+  const howSection = (g) => {
+    const items = howList.filter(a => g.match(a) && !howSeen.has(a.q))
+    if (!items.length) return ''
+    items.forEach(a => howSeen.add(a.q))
+    return `<section class="mt-slot" id="${g.id}">
+  <h2 class="mt-h">${esc(g.label)}<span class="mt-count">${items.length}</span></h2>
+  ${items.map(a => {
+      const ev = a.evidence || {}
+      const srcs = [
+        ...(ev.code || []).slice(0, 3).map(p => `<a class="how-src" href="https://github.com/CodebuffAI/freebuff" title="${esc(p)}">${esc(p.split('/').pop())}</a>`),
+        ...(ev.changes || []).slice(0, 3).map(c => `<a class="how-src" href="/day/${esc(c.day || '')}/#${esc(c.sha)}" title="${esc(c.title || '')}">${esc(c.sha)}</a>`)
+      ].join('')
+      return `<details class="how-item" data-qid="${esc(a.q)}" data-idx="${esc((a.tags || []).join(' '))}">
+    <summary><span class="how-q">${esc(a.q)}</span>${a.covered === false ? '<span class="how-flag">not covered by the evidence</span>' : ''}</summary>
+    <div class="how-a"><p>${esc(a.answer)}</p>${srcs ? `<p class="how-ev">read from ${srcs}</p>` : ''}</div>
+  </details>`
+    }).join('\n  ')}
+</section>`
+  }
+  const howBody = [
+    `<section class="hero">
+  <div class="term-box">
+    <div class="term-box-hdr">
+      <span class="term-box-title">How do I...</span>
+      <span>${howList.length} answered from the code and the change history</span>
+    </div>
+    <p class="how-intro">Every answer below was written by reading the code that implements the thing, the documentation that describes it, and the changes that have been made to both. Each one links the files and commits it used, so you can check it. Ask in your own words, or browse.</p>
+    <div class="model-search-row">
+      <div class="model-search-group">
+        <span class="model-search-prompt">$ grep how</span>
+        <input type="search" id="how-filter" class="model-search-input" placeholder="ask in your own words: stop it printing my key, why did my model vanish..." autocomplete="off">
+      </div>
+    </div>
+    <p class="how-verdict" id="how-verdict" hidden></p>
+    <form class="how-ask" id="how-ask" hidden>
+      <p class="how-ask-q" id="how-ask-q"></p>
+      <button type="submit" class="how-ask-btn">Write this into the guide</button>
+      <span class="how-ask-note">It joins the queue the guide is written from. A scheduled run reads the code and the change history, and the answer appears here &mdash; usually within a few minutes, and permanently for everyone after that.</span>
+    </form>
+    <p class="how-meta">${howGroups.map((g) => `<a class="how-jump" href="#${g.id}">${esc(g.label)}</a>`).join(' &middot; ')}</p>
+  </div>
+</section>`,
+    howGroups.map(howSection).join('\n'),
+    `<script>
+(function () {
+  var IDX = ${JSON.stringify(howIndex)};
+  var HIGH = ${BAND_HIGH}, LOW = ${BAND_LOW};
+  var input = document.getElementById('how-filter');
+  var verdict = document.getElementById('how-verdict');
+  var form = document.getElementById('how-ask');
+  var askQ = document.getElementById('how-ask-q');
+  var slots = [].slice.call(document.querySelectorAll('.mt-slot'));
+  var items = [].slice.call(document.querySelectorAll('.how-item'));
+  // The DOM order and the index order agree, so an index position is a DOM
+  // position. The build emits them together for exactly this reason.
+  var byQ = {};
+  items.forEach(function (el) { byQ[el.getAttribute('data-qid')] = el; });
+
+  // The same tokeniser the build uses. Kept to what a reader can type: words,
+  // slash commands, and SCREAMING_SNAKE names. Everything else is noise.
+  var STOP = {a:1,an:1,the:1,is:1,are:1,was:1,were:1,be:1,do:1,does:1,did:1,i:1,me:1,my:1,we:1,our:1,you:1,your:1,it:1,its:1,this:1,that:1,these:1,those:1,of:1,to:1,in:1,on:1,at:1,for:1,with:1,and:1,or:1,but:1,if:1,then:1,than:1,so:1,as:1,by:1,from:1,up:1,out:1,about:1,into:1,over:1,after:1,can:1,could:1,should:1,would:1,will:1,shall:1,may:1,might:1,must:1,how:1,what:1,which:1,when:1,where:1,why:1,there:1,here:1,get:1,got:1,use:1,using:1,used:1};
+  function terms (text) {
+    var s = String(text || '').toLowerCase(), out = {}, m;
+    var re = /[a-z][a-z0-9_]{1,}|\/[a-z][a-z0-9-]*/g;
+    while ((m = re.exec(s))) { if (m[0].length >= 3 && !STOP[m[0]]) out[m[0]] = 1; }
+    return Object.keys(out);
+  }
+  function idf (t) { return Math.log(1 + IDX.n / (1 + (IDX.df[t] || 0))); }
+
+  // Two numbers per answer. score ranks; conf decides. conf is the share of the
+  // question's idf mass the answer actually covers, so it means the same thing
+  // for "export" and for a twelve-word sentence. A term nothing in the guide
+  // has ever heard of still counts toward that mass, at full rarity, which is
+  // what makes an out-of-domain question fall out on its own.
+  function rank (q) {
+    var ts = terms(q), mass = 0, out = [];
+    for (var i = 0; i < ts.length; i++) mass += idf(ts[i]) * idf(ts[i]);
+    for (var j = 0; j < IDX.items.length; j++) {
+      var it = IDX.items[j], p = it.t, score = 0, hit = 0;
+      for (var k = 0; k < ts.length; k++) {
+        var w = p[ts[k]];
+        if (!w) continue;
+        score += w;
+        var d = idf(ts[k]);
+        hit += d * d;
+      }
+      if (score > 0) out.push({ q: it.q, score: score, conf: mass ? hit / mass : 0 });
+    }
+    out.sort(function (a, b) { return b.score - a.score; });
+    return out;
+  }
+
+  function show (list, open) {
+    var shown = 0;
+    items.forEach(function (el) {
+      var on = !list || list.indexOf(el) !== -1;
+      el.style.display = on ? '' : 'none';
+      if (on) { shown++; if (open) el.open = true; }
+    });
+    slots.forEach(function (s) {
+      var any = [].slice.call(s.querySelectorAll('.how-item')).some(function (i) { return i.style.display !== 'none'; });
+      s.style.display = any ? '' : 'none';
+    });
+    return shown;
+  }
+
+  var pending = '';
+  function apply () {
+    var q = input.value.trim();
+    if (q === pending) return;
+    pending = q;
+    if (!q) {
+      show(null, false);
+      verdict.hidden = true;
+      form.hidden = true;
+      return;
+    }
+    var ranked = rank(q);
+    var top = ranked[0];
+    var band = !top ? 'none' : (top.conf >= HIGH ? 'high' : (top.conf >= LOW ? 'partial' : 'none'));
+    // A partial band shows the closest answers AND says they are a guess. The
+    // alternative is to pick one of two bad options: a confident answer that may
+    // be wrong, or a refusal to try when the right answer is on the page.
+    var keep = band === 'none' ? [] : ranked.slice(0, band === 'partial' ? 3 : 12).map(function (r) { return byQ[r.q]; }).filter(Boolean);
+    show(keep, true);
+    if (band === 'none') {
+      verdict.hidden = false;
+      verdict.className = 'how-verdict is-none';
+      verdict.textContent = 'Nothing in the guide covers that yet. Ask it anyway and it gets written.';
+      form.hidden = false;
+      askQ.textContent = q;
+    } else if (band === 'partial') {
+      verdict.hidden = false;
+      verdict.className = 'how-verdict is-partial';
+      verdict.textContent = 'Closest answers, but none of them clearly covers that. If none of them helps, ask it below and it gets written.';
+      form.hidden = false;
+      askQ.textContent = q;
+    } else {
+      verdict.hidden = true;
+      form.hidden = true;
+    }
+  }
+
+  input.addEventListener('input', apply);
+  input.addEventListener('search', apply);
+  apply();
+
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var q = askQ.textContent.trim();
+    if (!q) return;
+    var btn = form.querySelector('.how-ask-btn');
+    btn.disabled = true;
+    btn.textContent = 'Sending...';
+    fetch('/api/how/ask', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ q: q })
+    }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        btn.disabled = false;
+        if (!res.ok) throw new Error(res.body && res.body.error || 'request failed');
+        btn.textContent = res.body.queued ? 'Queued' : 'Already queued';
+        verdict.hidden = false;
+        verdict.className = 'how-verdict is-ok';
+        verdict.textContent = res.body.queued
+          ? 'Queued. The guide answers questions like this on a schedule, so reload in a few minutes.'
+          : 'Someone already asked that. It is in the queue.';
+      })
+      .catch(function (e) {
+        btn.disabled = false;
+        btn.textContent = 'Write this into the guide';
+        verdict.hidden = false;
+        verdict.className = 'how-verdict is-none';
+        verdict.textContent = 'Could not send that (' + e.message + '). The queue is not reachable right now.';
+      });
+  });
+})();
+</script>`
+  ].join('\n')
+  await write(dist, 'how/index.html', layout({
+    title: 'How do I...',
+    path: '/how/',
+    desc: `${howList.length} questions about Freebuff answered from its own source, docs and change history, each with the files and commits behind it.`,
+    body: howBody
+  }))
+  // The answers as data, so anything else on the site (or a bot) can read them
+  // without scraping the page.
+  await write(dist, 'how/index.json', JSON.stringify({
+    asOf: howList[0]?.at || '',
+    count: howList.length,
+    answers: howList.map(a => ({ q: a.q, tags: a.tags || [], answer: a.answer, evidence: a.evidence || {}, at: a.at }))
+  }))
+
+  await write(dist, 'models/index.html', layout({    title: 'Models', path: '/models/',
     desc: `Free model catalog history: ${modelLive.length} live, ${modelRetired.length} retired across ${modelChrono.length} changes.`,
     body: `<section class="hero">
   <div class="term-box">

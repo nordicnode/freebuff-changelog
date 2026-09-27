@@ -18,6 +18,7 @@ import {
 import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, rewriteScopeOf, rewriteIsCurrent, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary } from './lib/llm.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
+import { loadHowto, writeHowto, generateQuestions, askQuestions, readableSettings } from './lib/howto.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 if (existsSync(resolve(ROOT, '.env')) && typeof process.loadEnvFile === 'function') {
@@ -1338,7 +1339,12 @@ async function cmdBuild () {
   await mkdir(dist, { recursive: true })
   // The timeline paginates one day per page: `/` is the newest day, every older
   // day is its own /day/<date>/ page.
-  await buildSite({ changelog, openPrs: prs, prMeta, traffic, dist, mergedPrs: mergedPrsDoc, overridesDoc: overrides })
+  // The how-to answers and the guide prose are caches the site build only
+  // reads. Loaded here rather than inside buildSite so the build stays a pure
+  // function of what it is handed, and so a missing file renders an empty page
+  // instead of throwing.
+  const howto = await loadHowto(DATA)
+  await buildSite({ changelog, openPrs: prs, prMeta, traffic, dist, mergedPrs: mergedPrsDoc, overridesDoc: overrides, howto })
 
   // data/diffs is 106 MB of a 352 MB dist. Two opt-in trims: skip the churn
   // rows' lockfile diffs (CHANGELOG_DIST_SKIP_CHURN_DIFFS=1) and/or ship only
@@ -1604,6 +1610,7 @@ if (IS_MAIN) {
   else if (cmd === 'push-data') await cmdPushData(rest)
   else if (cmd === 'freshness') await cmdFreshness(rest)
   else if (cmd === 'enrich-all') await cmdEnrichAll(rest)
+  else if (cmd === 'howto') await cmdHowTo(rest)
   else if (cmd === 'repair-entries') await cmdRepairEntries(rest)
   else if (cmd === 'prune-cache') await cmdPruneCache(rest)
   else if (cmd === 'glossary') await cmdGlossary(rest)
@@ -1622,7 +1629,7 @@ if (IS_MAIN) {
   node generator/cli.mjs watch [--push] [--interval S] [--duration D]     # alias for backfill
   node generator/cli.mjs push-data [--message M]  # commit+push data/ with the shared race handling
   node generator/cli.mjs freshness [--max-age-min N]  # CI gate: fail if data/changelog.json is staler than the site's own [stale] threshold (2x the sync budget)
-  node generator/cli.mjs enrich-all [--batch N] [--push] [--rewrite-stale]  # one pass toward a diff + summary + ELI5 for every entry (0 = everything left); --rewrite-stale also refreshes rows on an older prompt, major first. Narrow it with --rewrite-since N (days) and/or --rewrite-important; the union of both scopes re-queues
+  node generator/cli.mjs enrich-all [--batch N] [--push] [--rewrite-stale]  # one pass toward a diff + summary + ELI5 for every entry (0 = everything left); --rewrite-stale also refreshes rows on an older prompt, major first. Narrow it with --rewrite-since N (days) and/or --rewrite-important; the union of both scopes re-queues    node generator/cli.mjs howto [--limit N] [--tags a,b] [--max N] [--asks FILE] [--push]  # answer "how do I..." from the product's own code, docs and change history; cached on the evidence, so only questions whose sources moved are re-asked. --max caps calls per run, --asks FILE drains questions people asked through the site's ask box
   node generator/cli.mjs repair-entries [--push]   # recompute commitNature / significance / security tag on stored rows (no text touched)
   node generator/cli.mjs prune-cache [--push]      # drop ai-summaries.json keys from retired prompt versions
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
@@ -1715,6 +1722,71 @@ async function enrichAllPass (argv) {
 
   log(`[enrich-all] +${stored} diffs, +${calls} summaries, +${eli5} eli5 | left: ${left.diffs} diffs, ${left.summaries} summaries${scopeNote} (${left.stale} on an older prompt${rewriteStale ? '' : ', add --rewrite-stale to refresh'}), ${left.eli5} eli5`)
   return left
+}
+
+// Answer "how do I..." from the product itself.
+//
+// A separate command from enrich-all on purpose: the two have nothing to do with
+// each other's budget. Enrichment is per-commit and competes with staying
+// current; this is per-question, keyed on the evidence rather than on the clock,
+// so it does 90 calls once and then nothing until the code or the change history
+// actually moves. Putting it on the same knob would mean either starving the
+// relay or paying for the same answers every cycle.
+async function cmdHowTo (argv) {
+  const at = argv.indexOf('--limit')
+  const limit = at !== -1 ? Math.max(0, Number(argv[at + 1]) || 0) : 0
+  const tagAt = argv.indexOf('--tags')
+  const tags = tagAt !== -1 ? String(argv[tagAt + 1] || '').split(',').map(s => s.trim()).filter(Boolean) : null
+  // --max is the daily spend cap. It is a cap on CALLS, not a target: the pass
+  // stops early rather than overrunning, so a bad afternoon upstream costs one
+  // run's budget and not the week's.
+  const maxAt = argv.indexOf('--max')
+  const max = maxAt !== -1 ? Math.max(0, Number(argv[maxAt + 1]) || 0) : 0
+  const asksAt = argv.indexOf('--asks')
+  const asksFile = asksAt !== -1 ? argv[asksAt + 1] : null
+  const env = { ...process.env, CHANGELOG_LLM: '1' }
+  if (!llmConfigured(env)) { log('howto: LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required): nothing written'); return 0 }
+  const doc = await readJson(`${DATA}/changelog.json`, null)
+  if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
+  await ensureRepo()
+  // Which settings the product's own code reads. The config facet replays to 401
+  // "live" settings, but only 10 of its 182 flags appear anywhere in the source:
+  // the rest are CI workflow arguments a diff extractor saw once. Gating on the
+  // code is what keeps the settings section to things a reader could set.
+  const readable = await readableSettings(REPO_DIR)
+  log(`[howto] ${readable.size} settings are read by the product's own code`)
+  const seeded = generateQuestions(doc.entries, null, { readable })
+  // Asks from the public box join the same pass, at the FRONT: a question a
+  // reader actually typed outranks a question we thought of ourselves.
+  let questions = seeded
+  if (asksFile) {
+    const asks = await readJson(asksFile, [])
+    const known = [...(await loadHowto(DATA)).values()]
+    const extra = askQuestions(Array.isArray(asks) ? asks : asks.asks, known)
+    if (extra.length) {
+      log(`[howto] ${extra.length} asked question(s) from the queue`)
+      questions = [...extra, ...seeded]
+    }
+  }
+  const r = await writeHowto(doc.entries, REPO_DIR, DATA, env, {
+    limit: limit || (max || Infinity),
+    tags,
+    max,
+    retryErrors: true,
+    questions,
+    // Questions about this site are answered from this site's own source, not
+    // from the product's. The evidence for "what does the stale badge mean" is
+    // worker.js and site.mjs; the Freebuff clone has never heard of either.
+    siteRepoDir: ROOT,
+    readable
+  })
+  const total = r.results.length
+  const answered = r.results.filter(x => x.answer && x.covered !== false).length
+  log(`[howto] +${r.calls} answered (${r.declined} declined), ${r.reused} already current, ${r.failed} failed of ${total} questions`)
+  if (argv.includes('--push')) {
+    await commitAndPushData({ message: `data: how-to answers (${utcStamp()} UTC)` })
+  }
+  return r.calls
 }
 
 /**

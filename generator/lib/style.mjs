@@ -3122,6 +3122,44 @@ a.badge:hover{text-decoration:none;color:var(--term-cyan)}
 .sw-api{color:var(--txt-subtle);text-decoration:underline dotted;text-underline-offset:2px}
 .sw-api:hover{color:var(--term-cyan)}
 
+/* /how/ - the self-writing guide.
+   The first version shipped with no rules for any of these classes, which is
+   why the page read as a wall of unstyled triangles. */
+.how-intro{color:var(--txt-subtle);font-size:.86rem;line-height:1.5;margin:.55rem 0 .7rem;max-width:64ch}
+.how-meta{font-size:.78rem;color:var(--txt-subtle);margin:.5rem 0 0}
+.how-jump{color:var(--term-cyan);text-decoration:none;border-bottom:1px dotted currentColor}
+.how-jump:hover{border-bottom-style:solid}
+.mt-slot{margin:1.4rem 0 0}
+.mt-h{font-size:.82rem;letter-spacing:.12em;text-transform:uppercase;color:var(--txt-subtle);font-weight:600;margin:0 0 .5rem;display:flex;align-items:baseline;gap:.5rem}
+.mt-count{font-size:.68rem;letter-spacing:0;color:var(--term-amber);border:1px solid var(--term-border);border-radius:9px;padding:.05rem .4rem;font-variant-numeric:tabular-nums}
+.how-item{border-left:2px solid var(--term-border);padding:.1rem 0 .1rem .7rem;margin:.55rem 0}
+.how-item[open]{border-left-color:var(--term-cyan)}
+.how-item>summary{cursor:pointer;list-style:none;display:block}
+.how-item>summary::-webkit-details-marker{display:none}
+.how-item>summary::before{content:"\\25B8";color:var(--txt-subtle);font-size:.7rem;display:inline-block;width:1em}
+.how-item[open]>summary::before{content:"\\25BE"}
+.how-q{color:var(--txt);font-size:.92rem;line-height:1.35}
+.how-flag{font-size:.66rem;letter-spacing:.06em;text-transform:uppercase;color:var(--term-amber);border:1px solid var(--term-border);border-radius:3px;padding:0 .3rem;white-space:nowrap}
+.how-a{margin:.35rem 0 .1rem}
+.how-a p{margin:0 0 .3rem;font-size:.88rem;line-height:1.55;color:var(--txt-subtle)}
+.how-ev{font-size:.72rem;color:var(--txt-subtle);opacity:.8}
+.how-src{color:var(--term-cyan);text-decoration:none;border-bottom:1px dotted currentColor;font-family:var(--mono,monospace);margin-right:.3rem}
+.how-src:hover{border-bottom-style:solid}
+/* The verdict line is the part that makes this a guide rather than a search
+   box: it is the only place the page admits what it does not know. */
+.how-verdict{font-size:.82rem;line-height:1.45;margin:.5rem 0 0;padding:.45rem .6rem;border-left:2px solid var(--term-border);color:var(--txt-subtle)}
+.how-verdict.is-none{border-left-color:var(--term-amber)}
+.how-verdict.is-partial{border-left-color:var(--term-amber)}
+.how-verdict.is-ok{border-left-color:var(--term-green)}
+.how-ask{margin:.6rem 0 0;display:flex;flex-wrap:wrap;gap:.4rem .6rem;align-items:center}
+.how-ask[hidden]{display:none}
+.how-ask-q{width:100%;margin:0;font-size:.8rem;color:var(--txt);font-weight:600}
+.how-ask-btn{font:inherit;font-size:.78rem;cursor:pointer;padding:.25rem .7rem;border:1px solid var(--term-cyan);border-radius:3px;background:transparent;color:var(--term-cyan)}
+.how-ask-btn:hover{background:var(--term-cyan);color:var(--bg)}
+.how-ask-btn:disabled{opacity:.55;cursor:default}
+.how-ask-note{flex:1 1 22ch;font-size:.72rem;color:var(--txt-subtle);line-height:1.4}
+@media (max-width:560px){.how-ask-note{flex-basis:100%}}
+
 /* Honour the OS motion preference the same way the scripted scrolls do
    (scrollToEl checks matchMedia): smooth scroller and every hover/expand
    transition collapse to nothing for readers who asked for reduced motion. */

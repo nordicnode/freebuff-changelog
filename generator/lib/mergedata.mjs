@@ -130,6 +130,24 @@ function betterCacheEntry (x, y) {
   return (Date.parse(y?.at || '') || 0) > (Date.parse(x?.at || '') || 0) ? y : x
 }
 
+// Same conflict rule, NO version pruning. The guide and how-to caches key on
+// their own version and their own evidence hash, so they are not in the
+// summary cache's version space at all -- and running them through
+// mergeAiCache deleted them: `guide:models:abc:v1:def` parses as a v1 summary
+// key, v1 < PROMPT_V, and pruneStaleCache removed the entry on every write. A
+// cache that empties itself on the first merge is worse than no cache, because
+// it looks like it is working.
+export function mergeAnswerCache (ours, theirs) {
+  const a = ours || {}
+  const b = theirs || {}
+  const out = { ...a, ...b }
+  for (const key of Object.keys(out)) {
+    if (!a[key] || !b[key]) continue
+    out[key] = betterCacheEntry(a[key], b[key])
+  }
+  return out
+}
+
 /**
  * Merge-safe write for data/open-prs.json.
  *
@@ -212,7 +230,7 @@ export function mergeSyncState (ours, theirs) {
  */
 export async function capturePendingWrites (DATA, overrides = {}) {
   const onDisk = {}
-  for (const name of ['changelog.json', 'ai-summaries.json', 'state.json', 'open-prs.json']) {
+  for (const name of ['changelog.json', 'ai-summaries.json', 'state.json', 'open-prs.json', 'howto.json']) {
     const path = `${DATA}/${name}`
     // Only carry files that exist: a missing ai-summaries.json must not be
     // materialized as {} by an unrelated write, which would make a quiet

@@ -48,6 +48,10 @@ function fetchAsset (env, request) {
 async function handle (request, env) {
   const url = new URL(request.url)
 
+  if (url.pathname === '/api/how/ask') return handleHowAsk(request, env, url)
+  const howAdmin = /^\/api\/how\/(queue|ack)$/.exec(url.pathname)
+  if (howAdmin) return handleHowAdmin(request, env, url, howAdmin[1])
+
   const em = /^\/api\/entry\/([0-9a-f]{4,40})(?:\.json)?\/?$/i.exec(url.pathname)
   if (em) {
     const record = await findEntryRecord(env, request, em[1].toLowerCase())
@@ -86,11 +90,150 @@ async function assetText (env, request, path) {
   return res.ok ? res.text() : null
 }
 
+// ---------------------------------------------------------------------------
+// /api/how/ask - the ask box's queue.
+//
+// The important property here is what this endpoint CANNOT do. It enqueues and
+// nothing else: it never calls the model, never reads an API key, and never
+// spends anything. A public endpoint that can spend is a public endpoint that
+// gets run up a bill overnight by someone who found it, and the usual defenses
+// (rate limit, captcha) are all bypassable. An endpoint that can only append a
+// string to a list has a worst case that is a long queue, which the admin side
+// caps anyway.
+//
+// The writing happens in CI, on a schedule, with the key that CI already holds.
+// So the public surface is free and the expensive part is on a budget by
+// construction rather than by policy.
+
+// Where the queue lives. A KV namespace, not a Durable Object: the work is
+// append-and-drain, which is exactly what KV's eventual consistency tolerates.
+function askStore (env) {
+  return env && env.HOWTO_Q && typeof env.HOWTO_Q.get === 'function' ? env.HOWTO_Q : null
+}
+
+// How long a question is kept before it is considered abandoned. Long enough
+// for a slow week, short enough that the queue reflects what people are asking
+// now rather than what they asked in the spring.
+const ASK_TTL_S = 60 * 60 * 24 * 90
+// A hard ceiling on the backlog. Past this the guide is answering faster than
+// questions arrive, and the right answer to the newest one is "not yet" rather
+// than a silent drop nobody can see.
+const ASK_MAX = 400
+// Questions are free text from the internet. A short floor keeps "hi" out; a
+// long ceiling keeps a pasted file out.
+const ASK_MIN = 12
+const ASK_MAX_CHARS = 300
+
+// One canonical form per question, so "why did my model vanish?" and "why did
+// my model vanish" are one paid answer rather than two. The hash is the key
+// rather than the text, so the queue is a fixed size regardless of input.
+function askKey (q) {
+  const norm = String(q).toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()
+  return { norm, key: 'q:' + fnv(norm) }
+}
+
+function fnv (s) {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(36) + '-' + s.length.toString(36)
+}
+
+async function handleHowAsk (request, env, url) {
+  const kv = askStore(env)
+  if (!kv) {
+    return json({ error: 'ask queue not bound: wrangler.json must set kv_namespaces HOWTO_Q' }, 501)
+  }
+  if (request.method !== 'POST') {
+    return json({ error: 'POST a question as {"q": "..."}' }, 405)
+  }
+  let body
+  try {
+    body = await request.json()
+  } catch {
+    return json({ error: 'body must be JSON' }, 400)
+  }
+  // Required to be a string rather than coerced. String(['a','b']) is "a,b",
+  // String({}) is "[object Object]", and both are long enough to pass the
+  // length check and end up in the queue as a question nobody asked.
+  if (!body || typeof body.q !== 'string') return json({ error: 'body must be {"q": "your question"}' }, 400)
+  const q = body.q.replace(/\s+/g, ' ').trim()
+  if (q.length < ASK_MIN) return json({ error: `ask something a little longer than ${ASK_MIN} characters` }, 400)
+  if (q.length > ASK_MAX_CHARS) return json({ error: `questions are capped at ${ASK_MAX_CHARS} characters` }, 400)
+
+  const { norm, key } = askKey(q)
+  // Dedupe first: the same question arriving twice should be one answer, and
+  // the check is cheaper than the write and does not have to wait on it.
+  const seen = await kv.get(key, 'json')
+  if (seen) {
+    return json({ queued: false, known: true, q: norm, at: seen.at, reason: seen.reason || null })
+  }
+  // The index IS the queue, so the cap reads the index. The first version kept
+  // a separate q:count and enforced the cap against it, which is two values
+  // that can disagree -- and when they did, the queue filled past the cap with
+  // no complaint, because the counter was the one that had drifted.
+  const asks = await listAsks(kv)
+  if (asks.length >= ASK_MAX) {
+    return json({ queued: false, error: 'the queue is full; the guide is answering faster than questions arrive' }, 429)
+  }
+  // put is not atomic with the cap check, so a burst can overshoot ASK_MAX by a
+  // little. That is the intended failure: over-answering is recoverable,
+  // dropping someone's question is not.
+  const at = new Date().toISOString()
+  await kv.put(key, JSON.stringify({ q: norm, at }), { expirationTtl: ASK_TTL_S })
+  asks.push({ key, q: norm, at })
+  await kv.put('q:index', JSON.stringify(asks))
+  return json({ queued: true, q: norm })
+}
+
+// The whole queue, in insertion order. KV has no list operation, so the index
+// is maintained as a single JSON value. It is bounded by ASK_MAX, which is the
+// only reason a read-modify-write of a whole list is acceptable here.
+async function listAsks (kv) {
+  const idx = await kv.get('q:index', 'json')
+  return Array.isArray(idx) ? idx : []
+}
+
+// Admin side, used by CI. Bearer-token gated because it returns the queue: that
+// is the only sensitive thing here, and it is sensitive only in the sense that
+// it is everyone's questions.
+function isAdmin (request, env) {
+  const want = env && env.HOWTO_ADMIN_TOKEN
+  if (!want) return false
+  const got = (request.headers.get('authorization') || '').replace(/^Bearer\s+/i, '')
+  return got.length > 0 && got === want
+}
+
+async function handleHowAdmin (request, env, url, action) {
+  // Auth first, then the binding. A deployment with no token configured is shut,
+  // not open, and it should say "forbidden" rather than "no binding" -- the
+  // second implies the route works once someone adds a namespace, which is the
+  // wrong lesson to teach from a missing secret.
+  if (!isAdmin(request, env)) return json({ error: 'forbidden' }, 403)
+  const kv = askStore(env)
+  if (!kv) return json({ error: 'ask queue not bound' }, 501)
+  const asks = await listAsks(kv)
+  if (action === 'queue') return json({ asks })
+  if (action === 'ack') {
+    // Remove exactly what was answered, and only that. A drain that cleared the
+    // whole list would silently discard questions asked while it was running.
+    let body = []
+    try { body = await request.json() } catch { body = [] }
+    const done = new Set((body.keys || body || []).map(String))
+    const kept = asks.filter(a => !done.has(a.key))
+    for (const k of done) await kv.delete(k)
+    await kv.put('q:index', JSON.stringify(kept))
+    return json({ removed: done.size, left: kept.length })
+  }
+  return json({ error: 'unknown action' }, 404)
+}
+
 // The short-sha -> day map changes only by appends, and an isolate warmed
 // before a deploy would otherwise serve the old map forever, so the parsed map
 // is cached for a minute, not for the isolate's life.
 let shaDay = { map: null, at: 0 }
-
 async function findEntryRecord (env, request, want) {
   if (!shaDay.map || Date.now() - shaDay.at > 60000) {
     const text = await assetText(env, request, '/api/sha-day.json')

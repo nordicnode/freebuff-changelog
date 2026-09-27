@@ -1,0 +1,190 @@
+name: changelog-howto
+
+# Drains the "how do I..." ask queue and answers it, so the guide is written by
+# the questions people actually ask rather than by the ones we thought of.
+#
+# Why the queue is asynchronous: the public endpoint can only append a string to
+# a list. It never reaches a model, never reads a key, and never spends. The
+# spending happens here, on a budget, with the key CI already holds. A public
+# endpoint that can spend is a public endpoint that gets run up a bill overnight
+# by whoever finds it, and the usual defenses (rate limit, captcha) are all
+# bypassable; an endpoint that can only enqueue has a worst case that is a long
+# queue, which --max bounds anyway.
+#
+# Its own chain, like changelog-rewrite and for the same reason: this has no
+# business spending the relay's freshness budget. Separate concurrency group, so
+# it can never delay or cancel a sync cycle.
+#
+# The budget is --max CALLS per run, not questions examined. A question whose
+# evidence has not moved is reused for free, so a run spends its cap on the
+# questions that actually need writing rather than on re-checking old ones.
+on:
+  workflow_dispatch:
+    inputs:
+      max:
+        description: 'Max new answers per run (the daily spend cap)'
+        default: '25'
+        required: false
+      tags:
+        description: 'Only answer these tags (comma separated, empty = all)'
+        default: ''
+        required: false
+  schedule:
+    # Nightly. The guide is not a freshness surface, so an hour of latency on a
+    # new question costs nobody anything; a shorter interval would just be a
+    # more expensive way to check whether the queue is empty.
+    - cron: '37 4 * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: changelog-howto
+  cancel-in-progress: false
+
+jobs:
+  answer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The same gate the relay applies, before anything spends money. A syntax
+      # error here would otherwise show up as a pass that answered nothing.
+      - name: Syntax check
+        run: |
+          node --check worker.js
+          for f in generator/cli.mjs generator/lib/*.mjs; do node --check "$f"; done
+
+      - name: Tests
+        run: node --test "generator/test/*.test.mjs"
+
+      - name: Cache freebuff repository
+        uses: actions/cache@v4
+        with:
+          path: .cache/freebuff
+          key: freebuff-git-${{ runner.os }}-v1
+          restore-keys: |
+            freebuff-git-
+
+      - name: Configure git bot identity
+        run: |
+          git config --global user.name "changelog-bot"
+          git config --global user.email "changelog-bot@users.noreply.github.com"
+
+      # Same as the relay: a push made with the default GITHUB_TOKEN cannot
+      # start a deploy.yml run, so without this the new answers would sit
+      # unpublished until deploy.yml's own schedule.
+      - name: Authenticate data pushes so they trigger deploy.yml
+        env:
+          PUSH_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$PUSH_TOKEN" ]; then
+            echo "::warning::CHANGELOG_GITHUB_TOKEN is not set: data pushes keep using the default GITHUB_TOKEN, which cannot trigger deploy.yml. The answers are still written; the site refreshes on deploy.yml's schedule."
+            exit 0
+          fi
+          can_push="$(GH_TOKEN="$PUSH_TOKEN" gh api "repos/${GITHUB_REPOSITORY}" --jq '.permissions.push' 2>/dev/null || echo false)"
+          if [ "$can_push" != "true" ]; then
+            echo "::warning::CHANGELOG_GITHUB_TOKEN cannot push to ${GITHUB_REPOSITORY}: keeping the checkout credentials."
+            exit 0
+          fi
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)"
+
+      # The queue is only fetched when one is actually configured. Without the
+      # KV namespace the site still serves every pre-written answer; the ask box
+      # is the only thing that needs this, and it should degrade to "no queue"
+      # rather than failing the run.
+      - name: Fetch the ask queue
+        id: queue
+        env:
+          HOWTO_ADMIN_TOKEN: ${{ secrets.HOWTO_ADMIN_TOKEN }}
+        run: |
+          set -o pipefail
+          if [ -z "$HOWTO_ADMIN_TOKEN" ]; then
+            echo "::warning::HOWTO_ADMIN_TOKEN is not set: the ask queue is not reachable, so this run answers only the standing question set. The site is unaffected."
+            echo '{"asks":[]}' > asks.json
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          code="$(curl -sS -o asks.json -w '%{http_code}' \
+            -H "Authorization: Bearer $HOWTO_ADMIN_TOKEN" \
+            "${{ vars.SITE_ORIGIN || 'https://freebuff-changelog.nordicnode.workers.dev' }}/api/how/queue" || echo 000)"
+          if [ "$code" != "200" ]; then
+            echo "::warning::the ask queue returned HTTP $code; continuing with the standing question set only."
+            echo '{"asks":[]}' > asks.json
+          fi
+          count="$(node -e 'try{console.log((require("./asks.json").asks||[]).length)}catch(e){console.log(0)}')"
+          echo "queued questions: $count"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Answer the queue and refresh the standing set
+        id: pass
+        env:
+          GITHUB_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
+          CHANGELOG_LLM: ${{ vars.CHANGELOG_LLM || '1' }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_BASE: ${{ secrets.LLM_API_BASE || vars.LLM_API_BASE }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL || vars.LLM_MODEL }}
+          CHANGELOG_LLM_RPM: ${{ vars.CHOWTO_LLM_RPM || vars.CHANGELOG_LLM_RPM || '60' }}
+          # Not on the freshness path, so wall-clock is the only thing to
+          # protect; the RPM limiter still bounds the request rate.
+          CHANGELOG_LLM_CONCURRENCY: '4'
+        run: |
+          set -o pipefail
+          args=(howto --max "${{ inputs.max }}" --push)
+          if [ -n "${{ inputs.tags }}" ]; then args+=(--tags "${{ inputs.tags }}"); fi
+          # --asks is only added when there is something in it, so an empty
+          # queue does not silently replace the standing set with nothing.
+          if [ "${{ steps.queue.outputs.count }}" != "0" ]; then args+=(--asks asks.json); fi
+          node generator/cli.mjs "${args[@]}" 2>&1 | tee howto.log
+          status=${PIPESTATUS[0]}
+          grep -oE '\+[0-9]+ answered \([0-9]+ declined\), [0-9]+ already current, [0-9]+ failed of [0-9]+ questions' howto.log | tail -1 > summary.txt || true
+          cat summary.txt
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      # Ack only what the run actually answered. The endpoint takes the keys
+      # rather than clearing the list, because a drain that emptied the queue
+      # would throw away every question asked while it was running, and those
+      # askers would wait forever for an answer that was never written.
+      - name: Ack the answered questions
+        if: always() && steps.queue.outputs.count != '0'
+        env:
+          HOWTO_ADMIN_TOKEN: ${{ secrets.HOWTO_ADMIN_TOKEN }}
+        run: |
+          set -o pipefail
+          if [ -z "$HOWTO_ADMIN_TOKEN" ]; then
+            echo "HOWTO_ADMIN_TOKEN not set; the queue is left as-is and will be re-drained."
+            exit 0
+          fi
+          node -e '
+            // A key is acked only if the pass reported no error for it. An
+            // unanswered question stays queued, which costs one more attempt
+            // later; a wrongly-acked one costs the asker their answer forever.
+            const fs = require("fs")
+            const log = fs.readFileSync("howto.log", "utf8")
+            const failed = new Set()
+            for (const m of log.matchAll(/how-to could not answer "([^"]+)"/g)) failed.add(m[1])
+            const asks = (JSON.parse(fs.readFileSync("asks.json", "utf8")).asks) || []
+            const answered = asks.filter(a => !failed.has(a.q))
+            fs.writeFileSync("ack.json", JSON.stringify({ keys: answered.map(a => a.key) }))
+            console.log(`acking ${answered.length} of ${asks.length} (${failed.size} failed, left queued)`)
+            if (failed.size) console.log("  still queued: " + [...failed].map(s => s.slice(0, 60)).join("; "))
+          '
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $HOWTO_ADMIN_TOKEN" \
+            -H 'content-type: application/json' \
+            --data-binary @ack.json \
+            "${{ vars.SITE_ORIGIN || 'https://freebuff-changelog.nordicnode.workers.dev' }}/api/how/ack" || echo 000)"
+          if [ "$code" != "200" ]; then
+            echo "::warning::ack returned HTTP $code; the queue is unchanged and those questions will be answered again next run."
+          else
+            echo "queue acked"
+          fi
