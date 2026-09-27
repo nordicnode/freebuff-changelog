@@ -914,6 +914,29 @@ test('normalizeEli5: unwraps the reply, strips the echoed label, keeps it honest
   assert.equal(normalizeEli5({ eli5: 'The setting moved. Who it affects: the same people.' }), 'The setting moved. Who it affects: the same people.')
 })
 
+test('normalizeEli5: a self-description parks in both spellings, prose in both does not', () => {
+  // 72c6c8f8 shipped "I am DeepSeek, an AI assistant developed by DeepSeek"
+  // because only the contraction was matched. Both verbs, both noun forms.
+  for (const junk of [
+    "I'm DeepSeek V4.1, an AI assistant developed by DeepSeek. I don't know how to respond.",
+    'I am DeepSeek, an AI assistant developed by DeepSeek (深度求索).',
+    'I am GPT-5.6 Luna, developed by OpenAI. I do not disclose internal system instructions.',
+    'I am Claude, an AI assistant made by Anthropic.',
+    'I am Qwen, an AI assistant from Alibaba.'
+  ]) {
+    assert.throws(() => normalizeEli5({ eli5: junk }), /not an answer/, `should park: ${junk.slice(0, 40)}`)
+  }
+  // A real line that happens to start "I am ..." must survive: the model name
+  // is a proper noun, and the claim still has to name an AI or a vendor.
+  for (const real of [
+    'I am the assistant, and the terminal now builds its message settings once.',
+    'I am not sure what you mean, but the CLI now shows the real plan name.',
+    'Freebuff now shows the total daily allowance in the promotion.'
+  ]) {
+    assert.equal(normalizeEli5({ eli5: real }), real.replace(/[.]$/, '') + '.')
+  }
+})
+
 test('validateLlmOut: rejects raw glued identifiers in the title', () => {
   assert.throws(() => validateLlmOut({ title: 'advertiserreasonredaction202609v3 adds semantic refusal codes', summary: 'Did stuff.' }, 'minor'), /raw identifier/)
   assert.throws(() => validateLlmOut({ title: 'Add searchmanifoldmarkets tool for queries', summary: 'Did stuff.' }, 'minor'), /raw identifier/)
