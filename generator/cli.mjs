@@ -15,7 +15,7 @@ import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
   extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
-import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary } from './lib/llm.mjs'
+import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, rewriteScopeOf, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary } from './lib/llm.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
 
@@ -1622,7 +1622,7 @@ if (IS_MAIN) {
   node generator/cli.mjs watch [--push] [--interval S] [--duration D]     # alias for backfill
   node generator/cli.mjs push-data [--message M]  # commit+push data/ with the shared race handling
   node generator/cli.mjs freshness [--max-age-min N]  # CI gate: fail if data/changelog.json is staler than the site's own [stale] threshold (2x the sync budget)
-  node generator/cli.mjs enrich-all [--batch N] [--push] [--rewrite-stale]  # one pass toward a diff + summary + ELI5 for every entry (0 = everything left); --rewrite-stale also refreshes rows on an older prompt, major first
+  node generator/cli.mjs enrich-all [--batch N] [--push] [--rewrite-stale]  # one pass toward a diff + summary + ELI5 for every entry (0 = everything left); --rewrite-stale also refreshes rows on an older prompt, major first. Narrow it with --rewrite-since N (days) and/or --rewrite-important; the union of both scopes re-queues
   node generator/cli.mjs repair-entries [--push]   # recompute commitNature / significance / security tag on stored rows (no text touched)
   node generator/cli.mjs prune-cache [--push]      # drop ai-summaries.json keys from retired prompt versions
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
@@ -1660,6 +1660,22 @@ async function enrichAllPass (argv) {
   // row with no summary at all. Their ELI5 follows automatically, because a
   // fresh summary changes the hash the plain-English line is keyed on.
   const rewriteStale = argv.includes('--rewrite-stale')
+  // --rewrite-since N (days) and --rewrite-important narrow WHICH stale rows
+  // re-queue, as a union: the last N days, plus rows of any age carrying a
+  // reader-facing signal (a version, a model, a command, a security fix, a
+  // breaking change, or a multi-area change). A full rewrite is ~23,000 calls
+  // over ~7,700 rows and republishes every page; this is ~1,700 rows, the part
+  // a reader actually lands on. Rows outside the scope keep the text they
+  // have, which is the point -- it is opt-in, not a downgrade.
+  const sinceAt = argv.indexOf('--rewrite-since')
+  const rewriteDays = sinceAt !== -1 ? Math.max(0, Number(argv[sinceAt + 1]) || 0) : 0
+  const rewriteImportant = argv.includes('--rewrite-important')
+  const scopeNote = rewriteStale
+    ? (rewriteDays || rewriteImportant
+        ? ` (scoped: ${rewriteDays ? `last ${rewriteDays}d` : 'no date window'}${rewriteDays && rewriteImportant ? ' + ' : ''}${rewriteImportant ? 'version/model/command/security/breaking/multi-area' : ''})`
+        : ' (all rows)')
+    : ''
+  const rewriteScope = rewriteScopeOf({ days: rewriteDays, important: rewriteImportant })
   const env = { ...process.env, CHANGELOG_LLM_LIMIT: String(batch), CHANGELOG_ELI5_LIMIT: String(batch) }
   const doc = await readJson(`${DATA}/changelog.json`, null)
   if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
@@ -1672,11 +1688,15 @@ async function enrichAllPass (argv) {
   refreshDiffFlags(entries, diffDir)
 
   // 2. Summaries + plain-English lines, newest-first inside their own priorities.
-  const calls = llmConfigured(env) ? await enrichWithLlm(entries, llmPatchFor, DATA, env, { retryErrors: true, repoDir: REPO_DIR, rewriteStale, getFullPatch: fullPatchFor }) : 0
+  const calls = llmConfigured(env) ? await enrichWithLlm(entries, llmPatchFor, DATA, env, { retryErrors: true, repoDir: REPO_DIR, rewriteStale, rewriteScope, getFullPatch: fullPatchFor }) : 0
   const eli5 = llmConfigured(env) ? await enrichEli5(entries, DATA, env, { retryErrors: true, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR }) : 0
   if (!llmConfigured(env)) log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env): stored diffs only')
 
-  const isCurrent = (e) => e.ai?.title && ((rewriteStale || env.CHANGELOG_LLM_FORCE_REWRITE === '1') ? (e.ai?.v ?? 1) >= PROMPT_V : true)
+  // Mirrors the pass's own gate, scope included, so "left" means left to do in
+  // this run's scope and not "rows the site will never have current text for".
+  const isCurrent = (e) => e.ai?.title && ((rewriteStale || env.CHANGELOG_LLM_FORCE_REWRITE === '1')
+    ? ((e.ai?.v ?? 1) >= PROMPT_V || (rewriteScope ? rewriteScope(e) : true))
+    : true)
   const left = {
     diffs: entries.filter(e => !existsSync(resolve(diffDir, `${e.sha}.diff`))).length,
     summaries: entries.filter(e => !e.noise && !isCurrent(e)).length,
@@ -1691,7 +1711,7 @@ async function enrichAllPass (argv) {
     await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: doc }))
   }
 
-  log(`[enrich-all] +${stored} diffs, +${calls} summaries, +${eli5} eli5 | left: ${left.diffs} diffs, ${left.summaries} summaries (${left.stale} on an older prompt${rewriteStale ? '' : ', add --rewrite-stale to refresh'}), ${left.eli5} eli5`)
+  log(`[enrich-all] +${stored} diffs, +${calls} summaries, +${eli5} eli5 | left: ${left.diffs} diffs, ${left.summaries} summaries${scopeNote} (${left.stale} on an older prompt${rewriteStale ? '' : ', add --rewrite-stale to refresh'}), ${left.eli5} eli5`)
   return left
 }
 

@@ -2393,8 +2393,15 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   const priority = options.priorityShas instanceof Set ? options.priorityShas : new Set(options.priorityShas || [])
   // Stale rewrite: rows summarized under an older prompt version are queued
   // again, heaviest first. Default off so the hourly sync never spends its
-  // budget on history; `enrich-all --rewrite-stale` turns it on.
+  // budget on history; `enrich-all --rewrite-stale` turns it on. A scope
+  // narrows which stale rows count: a full rewrite is ~23,000 calls to replace
+  // text a reader may never open, while "the last N days plus every
+  // major/notable row" is the part that actually gets read, at a tenth of it.
+  // Out-of-scope rows stay current on purpose -- they keep the text they have.
   const rewriteStale = options.rewriteStale === true || env.CHANGELOG_LLM_REWRITE_STALE === '1' || env.CHANGELOG_LLM_FORCE_REWRITE === '1'
+  const rewriteScope = typeof options.rewriteScope === 'function' ? options.rewriteScope : null
+  // (built by rewriteScopeOf, below, so the scope and the gate that applies it
+  // are tested together rather than drifting apart in two files)
   let apiCalls = 0
   let cacheModified = false
 
@@ -2430,7 +2437,11 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
 
   // A row whose AI title is the mechanical label was never really summarized:
   // it re-queues regardless of mode (167 such rows at the time of writing).
-  const isCurrent = (e) => e.ai?.model && !gaveUp(e) && (rewriteStale ? (e.ai?.v ?? 1) >= PROMPT_V : true)
+  // Under a scope, a stale row outside it counts as current: it keeps the text
+  // it has and, just as importantly, costs nothing -- isCurrent rows are
+  // skipped before the candidate window is spent.
+  const isCurrent = (e) => e.ai?.model && !gaveUp(e)
+    && (rewriteStale ? ((e.ai?.v ?? 1) >= PROMPT_V || (rewriteScope ? rewriteScope(e) : true)) : true)
   const window = Number.isFinite(limit) ? Math.max(limit * 4, limit + 5) : 2000
   const candidates = []
   for (const e of queueable) {
@@ -2603,6 +2614,48 @@ export function eli5Key (sha, source, releaseCtx = '', rollupV = 0) {
 // never went through the model.
 export function eli5Eligible (e) {
   return !e.noise && !!e.ai?.title && !!e.ai?.summary && (e.ai?.v ?? 1) >= PROMPT_V
+}
+
+// Which stale rows a scoped rewrite is allowed to re-queue. `days` bounds by
+// recency and `important` keeps rows of any age that carry a signal a reader
+// actually navigates by: a model added or removed, a slash command, a security
+// fix, a breaking change, or a change spanning several areas of the product.
+// The two are a union, not an intersection, because a two-year-old breaking
+// change is exactly the row someone opens. Returns null when neither knob is
+// set, which the gate reads as "no scope: every stale row re-queues".
+//
+// Deliberately NOT `significance === 'major' || 'notable'`: the classifier
+// tags 29.6% of rows notable and 0.4% major, so that filter is "rewrite the
+// site" wearing a scope's clothes (2,925 rows against ~1,400 for this one).
+export function rewriteScopeOf ({ days = 0, important = false, now = Date.now() } = {}) {
+  const d = Math.max(0, Number(days) || 0)
+  if (!d && !important) return null
+  return (e) => {
+    if (important && isImportantRow(e)) return true
+    if (!d) return false
+    const t = Date.parse(e?.date || e?.day || '')
+    return Number.isFinite(t) && now - t <= d * 86400000
+  }
+}
+
+// The reader-facing signals above, in one place so the scope and anything that
+// later wants the same notion agree on it.
+//
+// Two plausible signals are left out, both because they measure the wrong
+// thing: a bare version-bump commit (658 of the stale rows are only that) is
+// the row the priority order already calls "a number went up" and sends last,
+// and the reader opens the changes the bump *shipped*, not the bump; and
+// isMultiTopic's "touched 8+ files" arm is a size proxy, so a wide internal
+// refactor scores as important while a focused feature does not. Multi-area
+// is kept because it says the change reached more than one part of the
+// product, which is the part a reader cares about.
+export function isImportantRow (e) {
+  if (!e) return false
+  if (e.security) return true
+  if (e.modelChanges) return true
+  if (e.cmdChanges?.added?.length || e.cmdChanges?.removed?.length) return true
+  if (e.ai?.breaking) return true
+  return (e.areas || []).filter(a => a && a !== 'Repo').length >= 2
 }
 
 export function aiDone (e, releaseCtx = '', rollupV = 0) {

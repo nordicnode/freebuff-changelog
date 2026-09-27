@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, buildVerifyPrompt } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, buildVerifyPrompt, rewriteScopeOf } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -1620,4 +1620,55 @@ test('no prompt the pipeline can build overflows the window', () => {
     assert.ok(prompt.length <= LLM_CONTEXT_CHARS, `${name} prompt is ${prompt.length} chars, window is ${LLM_CONTEXT_CHARS}`)
     assert.ok(/^(Explain one software change|You write changelog entries|You are checking)/.test(prompt), `${name} kept its instructions`)
   }
+})
+
+test('rewriteScopeOf: recency and reader-facing signals are a union, and neither means no scope', () => {
+  const now = Date.parse('2026-09-27T00:00:00Z')
+  const daysAgo = (n) => new Date(now - n * 86400000).toISOString()
+  const row = (over = {}) => ({ significance: 'minor', date: daysAgo(1), ...over })
+
+  // Neither knob set: null, which the gate reads as "every stale row".
+  assert.equal(rewriteScopeOf({}), null)
+  assert.equal(rewriteScopeOf({ days: 0, important: false }), null)
+  assert.equal(rewriteScopeOf({ days: 'nonsense' }), null)
+
+  const recent = rewriteScopeOf({ days: 90, now })
+  assert.equal(recent(row()), true, 'inside the window')
+  assert.equal(recent(row({ date: daysAgo(91) })), false, 'outside the window')
+  // An unparseable date must not throw and must not widen the scope.
+  assert.equal(recent(row({ date: 'not a date' })), false)
+  assert.equal(recent(row({ day: undefined, date: undefined })), false)
+  // `day` is the fallback the entries actually carry.
+  assert.equal(recent({ day: daysAgo(3) }), true)
+
+  // Importance is about the signals a reader navigates by, not the significance
+  // tag, which classifies 30% of rows as notable and so selects nothing.
+  const important = rewriteScopeOf({ important: true, now })
+  for (const sig of [
+    { security: 'ad injection' },
+    { modelChanges: { added: ['gpt-x'], removed: [] } },
+    { cmdChanges: { added: ['/thing'], removed: [] } },
+    { cmdChanges: { added: [], removed: ['/gone'] } },
+    { ai: { breaking: 'x' } },
+    { areas: ['CLI', 'SDK'] }
+  ]) {
+    assert.equal(important(row({ date: daysAgo(900), ...sig })), true,
+      `an old row with ${Object.keys(sig)[0]} is kept`)
+  }
+  assert.equal(important(row({ date: daysAgo(900) })), false, 'an old quiet row is not')
+  assert.equal(important(row({ date: daysAgo(900), areas: ['Repo'] })), false, 'one area is not multi-area')
+  // Deliberately NOT importance: a bare version-bump commit is the row the
+  // priority order already sends last, and a wide internal refactor is a size
+  // signal, not one a reader navigates by.
+  assert.equal(important(row({ date: daysAgo(900), version: '1.2.3' })), false, 'a bare bump is not important')
+  assert.equal(important(row({ date: daysAgo(900), freebuffVersion: '4.5.6' })), false)
+  assert.equal(important(row({ date: daysAgo(900), files: { meaningful: 12 } })), false, 'file count is a size proxy')
+  assert.equal(important(row({ date: daysAgo(900), significance: 'major' })), false, 'the tag selects nothing')
+
+  // The union: recent OR important, so a fresh quiet row still makes it in.
+  const both = rewriteScopeOf({ days: 90, important: true, now })
+  assert.equal(both(row()), true)
+  assert.equal(both(row({ date: daysAgo(900) })), false)
+  assert.equal(both(row({ date: daysAgo(900), areas: ['CLI', 'SDK'] })), true)
+  assert.equal(both(row({ date: daysAgo(91), modelChanges: { added: ['x'], removed: [] } })), true)
 })
