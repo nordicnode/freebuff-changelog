@@ -15,7 +15,7 @@ import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
   extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
-import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, rewriteScopeOf, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary } from './lib/llm.mjs'
+import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, rewriteScopeOf, rewriteIsCurrent, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary } from './lib/llm.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
 
@@ -1672,7 +1672,7 @@ async function enrichAllPass (argv) {
   const rewriteImportant = argv.includes('--rewrite-important')
   const scopeNote = rewriteStale
     ? (rewriteDays || rewriteImportant
-        ? ` (scoped: ${rewriteDays ? `last ${rewriteDays}d` : 'no date window'}${rewriteDays && rewriteImportant ? ' + ' : ''}${rewriteImportant ? 'version/model/command/security/breaking/multi-area' : ''})`
+        ? ` (scoped: ${rewriteDays ? `last ${rewriteDays}d` : 'no date window'}${rewriteDays && rewriteImportant ? ' + ' : ''}${rewriteImportant ? 'model/command/security/breaking/multi-area' : ''})`
         : ' (all rows)')
     : ''
   const rewriteScope = rewriteScopeOf({ days: rewriteDays, important: rewriteImportant })
@@ -1692,11 +1692,13 @@ async function enrichAllPass (argv) {
   const eli5 = llmConfigured(env) ? await enrichEli5(entries, DATA, env, { retryErrors: true, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR }) : 0
   if (!llmConfigured(env)) log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env): stored diffs only')
 
-  // Mirrors the pass's own gate, scope included, so "left" means left to do in
-  // this run's scope and not "rows the site will never have current text for".
-  const isCurrent = (e) => e.ai?.title && ((rewriteStale || env.CHANGELOG_LLM_FORCE_REWRITE === '1')
-    ? ((e.ai?.v ?? 1) >= PROMPT_V || (rewriteScope ? rewriteScope(e) : true))
-    : true)
+  // The same gate the pass uses, so "left" means left to do in this run's scope.
+  // It is imported rather than re-derived because a counter that disagrees with
+  // the queue reports either a rewrite that never stops or one that never ends.
+  const isCurrent = (e) => e.ai?.title && rewriteIsCurrent(e, {
+    rewriteStale: rewriteStale || env.CHANGELOG_LLM_FORCE_REWRITE === '1',
+    scope: rewriteScope
+  })
   const left = {
     diffs: entries.filter(e => !existsSync(resolve(diffDir, `${e.sha}.diff`))).length,
     summaries: entries.filter(e => !e.noise && !isCurrent(e)).length,

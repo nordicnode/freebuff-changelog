@@ -2437,11 +2437,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
 
   // A row whose AI title is the mechanical label was never really summarized:
   // it re-queues regardless of mode (167 such rows at the time of writing).
-  // Under a scope, a stale row outside it counts as current: it keeps the text
-  // it has and, just as importantly, costs nothing -- isCurrent rows are
-  // skipped before the candidate window is spent.
-  const isCurrent = (e) => e.ai?.model && !gaveUp(e)
-    && (rewriteStale ? ((e.ai?.v ?? 1) >= PROMPT_V || (rewriteScope ? rewriteScope(e) : true)) : true)
+  const isCurrent = (e) => e.ai?.model && !gaveUp(e) && rewriteIsCurrent(e, { rewriteStale, scope: rewriteScope })
   const window = Number.isFinite(limit) ? Math.max(limit * 4, limit + 5) : 2000
   const candidates = []
   for (const e of queueable) {
@@ -2656,6 +2652,25 @@ export function isImportantRow (e) {
   if (e.cmdChanges?.added?.length || e.cmdChanges?.removed?.length) return true
   if (e.ai?.breaking) return true
   return (e.areas || []).filter(a => a && a !== 'Repo').length >= 2
+}
+
+// Whether a rewrite pass should leave this row alone, given whether stale
+// rewrites are on and a scope. One function, because the pass and the reported
+// "left" count MUST agree: written twice, they disagreed and the scope silently
+// became a no-op -- the counter said 6,231 rows left while the queue went on to
+// rewrite all 7,720.
+//
+// The shape below is the only correct one, and both halves are load-bearing:
+//   * no scope  -> `!!scope` is false, so a stale row is NOT current and the
+//     full rewrite happens (an absent scope must mean "everything", or
+//     --rewrite-stale on its own would quietly do nothing).
+//   * scoped out -> `!scope(e)` is true, so a stale row IS current: it keeps
+//     its text and costs nothing. Getting this sign wrong is what made the
+//     first version of the scope a no-op.
+export function rewriteIsCurrent (e, { rewriteStale = false, scope = null } = {}) {
+  if (!rewriteStale) return true
+  if ((e?.ai?.v ?? 1) >= PROMPT_V) return true
+  return !!scope && !scope(e)
 }
 
 export function aiDone (e, releaseCtx = '', rollupV = 0) {

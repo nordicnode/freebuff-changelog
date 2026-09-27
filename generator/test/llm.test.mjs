@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, buildVerifyPrompt, rewriteScopeOf } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -1671,4 +1671,38 @@ test('rewriteScopeOf: recency and reader-facing signals are a union, and neither
   assert.equal(both(row({ date: daysAgo(900) })), false)
   assert.equal(both(row({ date: daysAgo(900), areas: ['CLI', 'SDK'] })), true)
   assert.equal(both(row({ date: daysAgo(91), modelChanges: { added: ['x'], removed: [] } })), true)
+})
+
+test('rewriteIsCurrent: a stale row outside the scope is current, inside it is not', () => {
+  // The direction is the whole feature and it inverted silently once. Written
+  // as `v >= PROMPT_V || scope(e)` instead of `|| !scope(e)`, a scoped rewrite
+  // reported 6,231 rows left while the queue went on to rewrite all 7,720 --
+  // the scope was a no-op wearing a scope's clothes.
+  const stale = { ai: { v: PROMPT_V - 1, title: 't', model: 'm' } }
+  const current = { ai: { v: PROMPT_V, title: 't', model: 'm' } }
+  const out = () => false
+  const inn = () => true
+
+  // Rewrites off: nothing is ever current-by-scope; the stale row re-queues.
+  assert.equal(rewriteIsCurrent(stale, { rewriteStale: false, scope: inn }), true, 'no rewrite means no staleness')
+  assert.equal(rewriteIsCurrent(current, { rewriteStale: false, scope: out }), true)
+
+  // Rewrites on, no scope: a stale row re-queues (this is the full rewrite).
+  assert.equal(rewriteIsCurrent(stale, { rewriteStale: true, scope: null }), false)
+  assert.equal(rewriteIsCurrent(current, { rewriteStale: true, scope: null }), true)
+
+  // Rewrites on, scoped: in-scope stale re-queues, out-of-scope stale does not.
+  assert.equal(rewriteIsCurrent(stale, { rewriteStale: true, scope: inn }), false, 'in scope, so rewrite it')
+  assert.equal(rewriteIsCurrent(stale, { rewriteStale: true, scope: out }), true, 'out of scope, so keep the text')
+  assert.equal(rewriteIsCurrent(current, { rewriteStale: true, scope: out }), true, 'a current row is current either way')
+
+  // End to end with the real scope, over rows shaped like real entries.
+  const now = Date.parse('2026-09-27T00:00:00Z')
+  const scope = rewriteScopeOf({ days: 90, important: true, now })
+  const freshQuiet = { ai: { v: PROMPT_V - 1, title: 't', model: 'm' }, date: new Date(now - 86400000).toISOString(), areas: ['CLI'] }
+  const oldQuiet = { ...freshQuiet, date: new Date(now - 400 * 86400000).toISOString() }
+  const oldImportant = { ...oldQuiet, areas: ['CLI', 'SDK'] }
+  assert.equal(rewriteIsCurrent(freshQuiet, { rewriteStale: true, scope }), false, 'a row from yesterday is in the date window')
+  assert.equal(rewriteIsCurrent(oldQuiet, { rewriteStale: true, scope }), true, 'old and unremarkable: out of scope')
+  assert.equal(rewriteIsCurrent(oldImportant, { rewriteStale: true, scope }), false, 'old but multi-area: in scope')
 })
