@@ -365,64 +365,25 @@ test('callLlm: no fallback offered, a refusal still burns the named re-ask and s
   }
 })
 
-test('callLlm: a long prompt answered in prose becomes a validated answer, not a lost question', async () => {
-  // This gateway returns free text instead of the JSON envelope when the input
-  // is very large, and the how-to questions most likely to be that large are
-  // the ones with the most evidence behind them. bareText takes the prose
-  // through the validator instead of throwing the question away.
-  const prose = 'Open the model picker and choose the row you want. FREEBUFF_MODELS in common/src/constants/freebuff-models.ts holds the list.'
-  const seen = []
+test('callLlm: a failure carries what the gateway actually returned', async () => {
+  // "LLM returned no JSON" is produced identically by an empty completion, a
+  // truncated body and an unrecognised envelope, and the three have different
+  // fixes. A bounded excerpt of the raw text rides along so the failure can be
+  // read instead of guessed at.
   const orig = globalThis.fetch
-  globalThis.fetch = async (url, init) => {
-    const prompt = JSON.parse(String(init.body)).messages[0].content
-    seen.push(prompt)
-    return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content: prose } }] }) }
-  }
-  const validate = (o) => {
-    const text = typeof o === 'string' ? o : String(o?.answer || '')
-    if (!text) throw new Error('answer is empty')
-    return { answer: text }
-  }
-  try {
-    const out = await callLlm('Answer from this evidence:\n' + 'x'.repeat(500000), { LLM_API_BASE: 'https://gateway.test/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm' }, 1, validate, { bareText: true })
-    assert.equal(out.answer, prose, 'the prose answer survives, gates included')
-    assert.equal(seen.length, 1, 'no repair pass burned: the shape was the only problem')
-  } finally {
-    globalThis.fetch = orig
-  }
-})
-
-test('callLlm: without bareText the same prose is still a failure', async () => {
-  const prose = 'Open the model picker and choose the row you want.'
-  const orig = globalThis.fetch
+  const body = 'upstream said: 503 service temporarily unavailable, retry later'
   globalThis.fetch = async () => ({
-    ok: true, status: 200, headers: { get: () => null },
-    text: async () => JSON.stringify({ choices: [{ message: { content: prose } }] })
+    ok: true, status: 200, headers: { get: () => null }, text: async () => body
   })
   try {
     await assert.rejects(
-      callLlm('prompt', { LLM_API_BASE: 'https://gateway.test/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm' }, 1, () => { throw new Error('never reached') }),
-      /no JSON/
+      () => callLlm('Answer please', { LLM_API_BASE: 'https://gateway.test/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm' }, 3, () => 'anything'),
+      (err) => {
+        assert.match(String(err.raw || ''), /service temporarily unavailable/, 'the raw body rides along on the error')
+        assert.ok(String(err.raw).length <= 300, 'and it is bounded, so it cannot become stored content')
+        return true
+      }
     )
-  } finally {
-    globalThis.fetch = orig
-  }
-})
-
-test('callLlm: a final failure carries the raw text it failed on', async () => {
-  // "LLM returned no JSON" cannot be acted on. An empty completion, a body cut
-  // off mid-frame and an unrecognised envelope all produce that same sentence
-  // and have three different fixes, so the excerpt travels with the error.
-  const junk = 'I think the answer is probably FREEBUFF_MODEL_ID, but I am not certain.'
-  const orig = globalThis.fetch
-  globalThis.fetch = async () => ({
-    ok: true, status: 200, headers: { get: () => null },
-    text: async () => JSON.stringify({ choices: [{ message: { content: junk } }] })
-  })
-  try {
-    const err = await callLlm('prompt', { LLM_API_BASE: 'https://gateway.test/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm' }, 3, () => { throw new Error('never reached') }).then(() => null, (e) => e)
-    assert.ok(err, 'the call fails')
-    assert.match(err.raw || '', /FREEBUFF_MODEL_ID/, 'the raw excerpt is attached')
   } finally {
     globalThis.fetch = orig
   }

@@ -1706,3 +1706,27 @@ test('rewriteIsCurrent: a stale row outside the scope is current, inside it is n
   assert.equal(rewriteIsCurrent(oldQuiet, { rewriteStale: true, scope }), true, 'old and unremarkable: out of scope')
   assert.equal(rewriteIsCurrent(oldImportant, { rewriteStale: true, scope }), false, 'old but multi-area: in scope')
 })
+
+// The prototype-chain bug: `p in obj` is true for every key inherited from
+// Object.prototype, so a filename that collides with one of those keys was read
+// as a version manifest rather than as a code change. Both call sites had it.
+test("bumpOnly and isBumpEntry: a filename that is an Object.prototype key is not a version track", async () => {
+  const { bumpOnly } = await import('../lib/llm.mjs')
+  const { isBumpEntry } = await import('../lib/analyze.mjs')
+  // Big additions, so the answer cannot come from the <=15 fallback: pre-fix
+  // this was classified as a version bump and used as a window boundary.
+  const bumped = eli5Entry({
+    sha: '3'.repeat(40),
+    stats: { additions: 400, deletions: 12 },
+    files: { total: 1, meaningful: 1, modified: ['constructor'] }
+  })
+  assert.equal(bumpOnly(bumped), false, "'constructor' is inherited, not a tracked release manifest")
+  assert.equal(isBumpEntry({ files: { meaningful: 1, modified: ['constructor'] } }), false, 'and not a bump by shape either')
+  // The real manifests still identify as bumps, so the fix did not narrow the
+  // thing it was protecting.
+  assert.equal(bumpOnly(eli5Entry({
+    sha: '4'.repeat(40),
+    stats: { additions: 400, deletions: 12 },
+    files: { total: 1, meaningful: 1, modified: ['freebuff/cli/release/package.json'] }
+  })), true, 'the actual release manifest is still a bump')
+})

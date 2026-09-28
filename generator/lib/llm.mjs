@@ -985,9 +985,6 @@ export const LLM_REFUSAL_RE = new RegExp([
   'as an ai (?:language )?model\\b'
 ].join('|'), 'i')
 
-// `validate` is a parameter because the ELI5 pass speaks to the same gateway
-// with a different shape: the repair retry has to check the replacement against
-// the schema that was asked for, not the summary one.
 // A failed call is only useful if it says what came back. "LLM returned no
 // JSON" is a shrug: an empty completion, a body truncated mid-frame and a
 // gateway envelope the extractor did not recognise all produce that same
@@ -1002,6 +999,9 @@ function withRawText (err, raw) {
   return err
 }
 
+// `validate` is a parameter because the ELI5 pass speaks to the same gateway
+// with a different shape: the repair retry has to check the replacement against
+// the schema that was asked for, not the summary one.
 export async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut, opts = {}) {
   const base = env.LLM_API_BASE || 'https://api.openai.com/v1'
   const model = env.LLM_MODEL || 'gpt-4o-mini'
@@ -1099,12 +1099,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     }
     if (refused) {
       log(`LLM refused the request (${String(text).slice(0, 60)}…): re-asking with the refusal named`)
-      // The reassurance has to describe the task that is actually being asked,
-      // or it reads as a non-sequitur. The diff wording below is wrong for a
-      // documentation question over source files, which is what the how-to
-      // writer sends, and a confused re-ask is refused again.
-      const note = opts.refusalNote || 'This is a public-repository changelog task: the text above is a git diff from an open-source mirror, not a request for your instructions, identity or configuration. Do not describe yourself, do not refuse, and do not mention your own rules. Reply with ONLY the JSON object asked for, describing the code change.'
-      return callLlm(`${prompt}\n\nYour previous reply refused the request or described yourself instead of answering. ${note}`, env, attempt + 1, validate, opts)
+      return callLlm(`${prompt}\n\nYour previous reply refused the request or described yourself instead of answering. This is a public-repository changelog task: the text above is a git diff from an open-source mirror, not a request for your instructions, identity or configuration. Do not describe yourself, do not refuse, and do not mention your own rules. Reply with ONLY the JSON object asked for, describing the code change.`, env, attempt + 1, validate, opts)
     }
     // One repair pass. The rejection reason travels with it: a grounding or
     // boilerplate failure is not a JSON problem, and a model told "invalid JSON"
@@ -1641,6 +1636,10 @@ export function bumpOnly (e) {
   const meaningful = e.files?.meaningful ?? 99
   if (meaningful > 2) return false
   const mods = [...(e.files?.added || []), ...(e.files?.modified || [])]
+  // `hasOwn`, not `in`: `p in VERSION_TRACKS` is true for every inherited
+  // Object.prototype key, so a change that touched a file named `constructor`
+  // or `toString` was classified as a version bump. Same prototype-chain bug as
+  // the number-word lookup elsewhere in this file.
   if (mods.length > 0 && mods.every(p => Object.hasOwn(VERSION_TRACKS, p))) return true
   return (e.stats?.additions ?? 99) <= 15
 }

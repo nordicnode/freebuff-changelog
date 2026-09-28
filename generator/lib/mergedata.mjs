@@ -130,24 +130,6 @@ function betterCacheEntry (x, y) {
   return (Date.parse(y?.at || '') || 0) > (Date.parse(x?.at || '') || 0) ? y : x
 }
 
-// Same conflict rule, NO version pruning. The guide and how-to caches key on
-// their own version and their own evidence hash, so they are not in the
-// summary cache's version space at all -- and running them through
-// mergeAiCache deleted them: `guide:models:abc:v1:def` parses as a v1 summary
-// key, v1 < PROMPT_V, and pruneStaleCache removed the entry on every write. A
-// cache that empties itself on the first merge is worse than no cache, because
-// it looks like it is working.
-export function mergeAnswerCache (ours, theirs) {
-  const a = ours || {}
-  const b = theirs || {}
-  const out = { ...a, ...b }
-  for (const key of Object.keys(out)) {
-    if (!a[key] || !b[key]) continue
-    out[key] = betterCacheEntry(a[key], b[key])
-  }
-  return out
-}
-
 /**
  * Merge-safe write for data/open-prs.json.
  *
@@ -230,7 +212,7 @@ export function mergeSyncState (ours, theirs) {
  */
 export async function capturePendingWrites (DATA, overrides = {}) {
   const onDisk = {}
-  for (const name of ['changelog.json', 'ai-summaries.json', 'state.json', 'open-prs.json', 'howto.json']) {
+  for (const name of ['changelog.json', 'ai-summaries.json', 'state.json', 'open-prs.json']) {
     const path = `${DATA}/${name}`
     // Only carry files that exist: a missing ai-summaries.json must not be
     // materialized as {} by an unrelated write, which would make a quiet
@@ -244,18 +226,7 @@ const MERGERS = {
   'changelog.json': mergeChangelog,
   'ai-summaries.json': mergeAiCache,
   'state.json': mergeSyncState,
-  'open-prs.json': mergeOpenPrs,
-  // Without this entry the snapshot won outright, and howto.json has no merger
-  // to lose to. capturePendingWrites reads the file at the start of a cycle and
-  // persistMerged writes that snapshot back just before the push, so any cycle
-  // that began before someone else's answers landed put its stale copy over
-  // them: a backfill run captured 54 answers, the guide's own generation pushed
-  // 178, and the backfill committed 54 back. The answers were gone from main,
-  // and the page served 54 with no sign that 124 more existed.
-  //
-  // The other four files were protected from exactly this by their mergers; the
-  // guide was in the capture list without one, which is the bug.
-  'howto.json': mergeAnswerCache
+  'open-prs.json': mergeOpenPrs
 }
 
 /**

@@ -544,7 +544,12 @@ export function isBumpEntry (e) {
   // (1.0.688 itself is +47/-55), so shape comes from the file lists only.
   const mods = [...(e.files?.added || []), ...(e.files?.modified || [])]
   if ((e.files?.meaningful ?? 99) > 1) return false
-  return mods.length === 1 && (mods[0] in VERSION_TRACKS)
+  // `hasOwn`, not `in`. `p in VERSION_TRACKS` is true for every key inherited
+  // from Object.prototype, so a versionless row whose single changed file was
+  // named `constructor` (or `toString`, or `valueOf`) was read as a release
+  // bump and used as a window boundary. Same prototype-chain mistake as the
+  // number-word lookup in llm.mjs.
+  return mods.length === 1 && Object.hasOwn(VERSION_TRACKS, mods[0])
 }
 
 export const TEST_RE = /(^|\/)(__tests__|tests?|fixtures?|mocks?)\/|\.(test|spec)\.[jt]sx?$/

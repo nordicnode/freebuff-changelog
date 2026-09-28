@@ -856,50 +856,9 @@ test('inline scripts: template escaping preserves regex backslashes', async () =
         category: 'CLI', significance: 'minor', day: '2026-09-13', month: '2026-09'
       }]
     }
-    // A how-to corpus, so the /how/ page renders its real search box rather
-    // than the empty state. That page shipped a dead script for its whole first
-    // life: its tokeniser matched slash commands with /\/ inside a template
-    // literal, where a backslash before a slash is not an escape and collapses
-    // to a bare slash, so the browser got /[a-z][a-z0-9_]{1,}|/[a-z]... and
-    // rejected it with "expected expression, got ']'". This test's own page list
-    // is what let it through: index, search and day were covered, /how/ was not.
-    // One entry per tag set the question generator actually emits, not a
-    // hand-picked pair. The eight that had no group -- install/update,
-    // byok/config, agents/skills, headless/ci, limits/quota, prompt,
-    // repo/project, models/picker -- were the eight flagship seed questions,
-    // and every one of them was stored, served, and invisible.
-    const corpus = [
-      ['How do I switch to a different AI model?', ['models', 'picker']],
-      ['How do I bring my own API key instead of using the bundled one?', ['byok', 'config']],
-      ['How do I run Freebuff in CI or non-interactively?', ['headless', 'ci']],
-      ['How do I give Freebuff a custom system prompt or instructions?', ['prompt']],
-      ['How do I connect it to a git repository or work on a codebase?', ['repo', 'project']],
-      ['How do I install or update it?', ['install', 'update']],
-      ['How do I see which model answered and how much of my usage is left?', ['limits', 'quota']],
-      ['How do I use skills or custom agents?', ['agents', 'skills']],
-      ['How do I save or export a conversation?', ['command', '/export']],
-      ['What does the stale badge mean?', ['site', 'freshness']],
-      ['Why is the site missing a day?', ['ask']]
-    ]
-    // Two declines, which render as questions with an honest label rather than
-    // being hidden: one the model refused, one the material genuinely could not
-    // answer. They are different states and read differently.
-    const refusedQ = 'How do I use a feature the material does not describe?'
-    const uncoveredQ = 'Is there a feature that does not exist yet?'
-    corpus.push([refusedQ, ['start']], [uncoveredQ, ['start']])
-    const howto = new Map(corpus.map(([q, tags], i) => [
-      'k' + i,
-      {
-        q, tags, used: [`f${i}.ts`],
-        evidence: { code: [`f${i}.ts`], docs: [], changes: [] }, chars: 100,
-        ...(q === refusedQ ? { covered: false, refused: true, answer: 'The guide has this question but no answer yet.' }
-          : q === uncoveredQ ? { covered: false, answer: 'The material does not describe this.' }
-            : { covered: true, answer: 'A concrete answer.' })
-      }
-    ]))
-    await buildSite({ changelog: mockChangelog, openPrs: [], dist: tmpDist, howto })
+    await buildSite({ changelog: mockChangelog, openPrs: [], dist: tmpDist })
     const { execFileSync } = await import('node:child_process')
-    for (const f of ['index.html', 'search/index.html', 'day/2026-09-13/index.html', 'how/index.html']) {
+    for (const f of ['index.html', 'search/index.html', 'day/2026-09-13/index.html']) {
       const html = await readFile(join(tmpDist, f), 'utf8')
       const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1])
       assert.ok(blocks.length > 0, `${f} has inline scripts`)
@@ -908,40 +867,12 @@ test('inline scripts: template escaping preserves regex backslashes', async () =
         execFileSync('node', ['--check', join(tmpDist, 'inline-check.mjs')])
       }
       // Backslash regexes survived template escaping intact
-      if (f !== 'search/index.html' && f !== 'how/index.html') assert.match(html, /split\(\/\\r\?\\n\/\)/)
+      if (f !== 'search/index.html') assert.match(html, /split\(\/\\r\?\\n\/\)/)
     }
     const searchHtml = await readFile(join(tmpDist, 'search/index.html'), 'utf8')
     // Backslash-regex canary: the query tokenizer's \S is the fragile bit now
     // (it once shipped as |S+ when a template literal ate the backslash).
     assert.match(searchHtml, /\|\\S\+\)\/g/)
-    const howHtml = await readFile(join(tmpDist, 'how/index.html'), 'utf8')
-    // The same class of bug, the how-to page's turn. Compared as strings: the
-    // broken form *is* a regex, so asserting on it with a regex needs exactly
-    // the escaping under test.
-    assert.ok(
-      howHtml.includes('/[a-z][a-z0-9_]{1,}|[/][a-z][a-z0-9-]*/g'),
-      'the slash-command branch ships intact, not as an unescaped alternation slash'
-    )
-    assert.ok(!howHtml.includes('}|/[a-z]'), 'a bare slash after the alternation bar must never ship')
-    // Nothing may be stored and then not shown. The grouped sections are the only
-    // thing that puts an item in the DOM, and search filters those elements, so
-    // an answer no group claims is invisible to browse and to search at once.
-    const rendered = (howHtml.match(/<details class="how-item"/g) || []).length
-    assert.equal(rendered, corpus.length, `every one of the ${corpus.length} answers renders, got ${rendered}`)
-    for (const [q] of corpus) assert.ok(howHtml.includes(q), `"${q}" is on the page`)
-    // A refusal is labelled as one: "not covered by the evidence" would be a lie
-    // for a question the model declined to answer rather than one the material
-    // could not answer.
-    assert.match(howHtml, /no answer written yet/)
-    assert.match(howHtml, /not covered by the evidence/, 'and a genuine no-evidence decline keeps its own wording')
-    // And the jump nav links only to sections that exist.
-    const anchors = [...howHtml.matchAll(/class="how-jump" href="#([a-z]+)"/g)].map((m) => m[1])
-    const sections = [...howHtml.matchAll(/<section class="mt-slot" id="([a-z]+)"/g)].map((m) => m[1])
-    assert.ok(anchors.length > 0, 'the jump nav has links')
-    assert.deepEqual(anchors.filter((a) => !sections.includes(a)), [], 'no jump link points at a section that is not on the page')
-    assert.deepEqual(sections.filter((s) => !anchors.includes(s)), [], 'and no section is unreachable from the nav')
-    // The catch-all is a safety net, so it stays unused while the tags are wired.
-    assert.ok(!sections.includes('more'), 'with every tag grouped, the catch-all group renders nothing')
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }
