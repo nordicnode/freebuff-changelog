@@ -1810,7 +1810,7 @@ test('stats: the golden-set eval card renders, and says so when no run exists', 
     },
     llmHealth: {
       days: {
-        '2026-09-27': { summarized: 40, flagged: 2 },
+        '2026-09-27': { summarized: 40, flagged: 2, verifierUnavailable: 2 },
         '2026-09-28': { summarized: 12, flagged: 1, deterministicErrors: 3 }
       }
     }
@@ -1821,6 +1821,7 @@ test('stats: the golden-set eval card renders, and says so when no run exists', 
   assert.doesNotMatch(html, /no traffic recorded/, 'a ledger replaces the empty state')
   assert.match(html, /ALERT/, 'a refusal-storm day is named on the card')
   assert.match(html, /refused\/memory/, 'and the failure shape is spelled out')
+  assert.match(html, /2 unverified/, 'rows the verifier could not check are named too')
   assert.match(html, /38\/40 rows/, 'the note says how many rows the run scored')
   assert.match(html, /95%/, 'the rate itself')
   assert.match(html, /vs v9: \+5pt/, 'and how it moved against the previous run')

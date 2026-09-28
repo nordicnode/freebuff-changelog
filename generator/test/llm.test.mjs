@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -297,8 +297,8 @@ test('healing: a shipped-with-objections row is re-asked and replaced only by a 
     let stored = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
     assert.equal(stored[key].title, 'Alpha gate added', 'the cleaner rewrite ships')
     assert.equal(stored[key].ungrounded, undefined)
-    assert.equal(stored[key].healTries, 1, 'the attempt is counted')
-    assert.ok(stored[key].healAt, 'and spaced')
+    assert.equal(stored[key].healTries, 0, 'a clean rewrite resets the try budget')
+    assert.ok(stored[key].healAt, 'the attempt is still spaced')
     assert.equal(entry.ai.title, 'Alpha gate added', 'the entry carries the healed record')
     // An equally dirty rewrite keeps the shipped text (and still counts a try).
     const dirty2 = { ...dirtyRec, title: 'Shipped again', ungrounded: ['FAKE_NAME'], verify: undefined, healTries: 0, at: '2020-01-01T00:00:00.000Z' }
@@ -332,6 +332,108 @@ test('assessLlmHealth: a refusal storm is an alert, objection-heavy days are a w
   assert.equal(assessLlmHealth({ summarized: 2, flagged: 1 }).level, 'ok', 'the objection rule needs a sample')
   assert.equal(assessLlmHealth({ summarized: 0, transientErrors: 2 }).level, 'watch', 'nothing landed while asks failed')
   assert.equal(assessLlmHealth({ summarized: 3, otherErrors: 10 }).level, 'watch', 'ten failed asks in a day')
+  assert.equal(assessLlmHealth({ summarized: 10, verifierUnavailable: 1 }).level, 'ok', 'one row without a verdict is noise')
+  assert.equal(assessLlmHealth({ summarized: 10, verifierUnavailable: 6 }).level, 'watch', 'more rows unverified than checked')
+  assert.equal(assessLlmHealth({ summarized: 100, verifierUnavailable: 10 }).level, 'watch', 'ten unverified rows is a verifier outage')
+})
+
+test('verifier unavailability: the row says so and the health ledger counts it', async (t) => {
+  const { mkdtemp, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-verif-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const sha = 'f'.repeat(40)
+  const patch = 'diff --git a/x b/x\n+export const ALPHA = 1\n'
+  const key = cacheKey(sha, patch)
+  const entry = { kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'Adds a gate.' }
+  // The writer answers; the cross-model verifier (gpt-6-luna) is down.
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', LLM_MODEL: 'deepseek-v4.1', CHANGELOG_LLM_LIMIT: '5' }
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (url, { body }) => {
+    const { model } = JSON.parse(String(body))
+    // 400, not 5xx: the 5xx path sleeps through real retry backoff, and this
+    // test is about the unavailability being recorded, not the retry ladder.
+    if (model !== 'deepseek-v4.1') return { status: 400, ok: false, headers: { get: () => null }, text: async () => 'verifier down' }
+    const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify({ evidence: 'x b/x holds it.', title: 'Alpha gate added', summary: 'Adds `ALPHA` in x b/x to prevent double-spends.', significance: 'minor', audience: 'end-users', confidence: 'high' }) } }] })
+    return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
+  }
+  try {
+    await enrichWithLlm([entry], async () => patch, dir, env, {})
+  } finally {
+    globalThis.fetch = origFetch
+  }
+  const stored = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+  assert.equal(stored[key].verify, 'unavailable', 'an unverifiable row is not indistinguishable from an unchecked one')
+  assert.equal(stored[key].verifyModel, 'gpt-6-luna', 'and it names the verifier that failed')
+  const health = JSON.parse(await readFile(join(dir, 'llm-health.json'), 'utf8'))
+  const day = Object.values(health.days)[0]
+  assert.equal(day.verifierUnavailable, 1, 'the ledger counts it for drift detection')
+  assert.equal(day.summarized, 1)
+})
+
+test('context fingerprint: late evidence is a reason to re-ask, bounded like any heal', () => {
+  const a = contextFingerprint({ number: 1, title: 'T' }, 'gloss')
+  assert.equal(a, contextFingerprint({ number: 1, title: 'T' }, 'gloss'), 'same context, same fingerprint')
+  assert.notEqual(a, contextFingerprint({ number: 1, title: 'T', comments: [{ body: 'x' }] }, 'gloss'), 'a review thread arriving changes it')
+  assert.notEqual(a, contextFingerprint({ number: 2, title: 'T' }, 'gloss'), 'so does the PR itself')
+  assert.notEqual(a, contextFingerprint({ number: 1, title: 'T' }, 'other gloss'), 'and a glossary update')
+  const clean = { title: 't', at: '2020-01-01T00:00:00.000Z', cf: 'one' }
+  assert.equal(healEligible(clean), false, 'a clean, current-context row is never re-asked')
+  assert.equal(healEligible(clean, { staleContext: true }), true, 'but stale context is a reason on its own')
+  assert.equal(healEligible({ ...clean, healTries: 2 }, { staleContext: true }), false, 'and the spend stays bounded')
+  assert.equal(healEligible({ ...clean, cf: undefined }, { staleContext: true }), false, 'legacy rows without a fingerprint are grandfathered')
+})
+
+test('context refresh: a row whose evidence arrived late is re-asked, and a dirtier rewrite never replaces it', async (t) => {
+  const { mkdtemp, writeFile, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-ctx-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const sha = 'e'.repeat(40)
+  const patch = 'diff --git a/x b/x\n+export const ALPHA = 1\n'
+  const key = cacheKey(sha, patch)
+  const entry = { kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'Adds a gate.' }
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0' }
+  const thinRec = {
+    model: 'deepseek-v4.1', v: PROMPT_V, at: '2020-01-01T00:00:00.000Z',
+    title: 'Thin summary', summary: 'Written before the review thread arrived.', significance: 'minor',
+    cf: 'stale-fingerprint'
+  }
+  await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: thinRec }))
+  const cleanPayload = {
+    evidence: 'x b/x holds it.', title: 'Alpha gate added',
+    summary: 'Adds `ALPHA` in x b/x to prevent double-spends.',
+    significance: 'minor', audience: 'end-users', confidence: 'high'
+  }
+  let mode = 'clean'
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async () => {
+    const payload = mode === 'clean' ? cleanPayload : { ...cleanPayload, summary: 'Reads `NOT_IN_DIFF` to prevent double-spends.' }
+    const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify(payload) } }] })
+    return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
+  }
+  try {
+    // The current fingerprint for a row with no PR and no glossary is stable;
+    // the fixture's is stale, which alone justifies one bounded re-ask.
+    await enrichWithLlm([entry], async () => patch, dir, env, {})
+    let stored = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    assert.equal(stored[key].title, 'Alpha gate added', 'the rewrite with the late context ships')
+    assert.equal(stored[key].cf, contextFingerprint(null, ''), 'and stamps the fingerprint it was written against')
+    assert.equal(stored[key].healTries, 0)
+    // A rewrite that is dirtier than the shipped text is rejected even though
+    // the context is stale: "better informed" never means "less accurate".
+    await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: thinRec }))
+    entry.ai = { ...thinRec }
+    mode = 'dirty'
+    await enrichWithLlm([entry], async () => patch, dir, env, {})
+    stored = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    assert.equal(stored[key].title, 'Thin summary', 'the dirtier rewrite does not replace shipped text')
+    assert.equal(stored[key].healTries, 1, 'the attempt is counted')
+  } finally {
+    globalThis.fetch = origFetch
+  }
 })
 
 test('drift ledger: runs accumulate per UTC day and the window stays bounded', async (t) => {

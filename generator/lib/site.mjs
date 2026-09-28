@@ -1356,7 +1356,11 @@ function evidenceHtml (e) {
   const flag = badNames.length
     ? `<p class="evidence-flag">Not found in the diff or source context: ${badNames.map(x => `<code>${esc(x)}</code>`).join(', ')}. Treat these names as unverified.</p>`
     : ''
-  const verify = e.ai?.verify === 'flagged' ? '<p class="evidence-flag">A second model still objected to claims in this summary after one repair.</p>' : ''
+  const verify = e.ai?.verify === 'flagged'
+    ? '<p class="evidence-flag">A second model still objected to claims in this summary after one repair.</p>'
+    : e.ai?.verify === 'unavailable'
+      ? '<p class="evidence-flag">The second-model check could not run for this row; its claims were not independently verified.</p>'
+      : ''
   return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${badNames.length ? ` <span class="evidence-warn">(${badNames.length} unverified name${badNames.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}</div></details>`
 }
 
@@ -1490,6 +1494,7 @@ function llmHealthCard (doc, card, bar) {
       Number(stats.flagged) ? `${stats.flagged} flagged` : '',
       Number(stats.ungrounded) ? `${stats.ungrounded} ungrounded` : '',
       Number(stats.whyMissing) ? `${stats.whyMissing} missing why` : '',
+      Number(stats.verifierUnavailable) ? `${stats.verifierUnavailable} unverified` : '',
       Number(stats.deterministicErrors) ? `${stats.deterministicErrors} refused/memory` : '',
       (Number(stats.transientErrors) || 0) + (Number(stats.otherErrors) || 0) ? `${(Number(stats.transientErrors) || 0) + (Number(stats.otherErrors) || 0)} failed` : ''
     ].filter(Boolean)

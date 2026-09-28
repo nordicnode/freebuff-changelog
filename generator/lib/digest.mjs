@@ -146,6 +146,7 @@ export function summaryQuality (entries) {
     ungrounded: withAi.filter(e => e.ai.ungrounded?.length).length,
     verified: withAi.filter(e => e.ai.verify === 'passed').length,
     verifyFlagged: withAi.filter(e => e.ai.verify === 'flagged').length,
+    verifyUnavailable: withAi.filter(e => e.ai.verify === 'unavailable').length,
     overridden: rows.filter(e => e.overridden).length,
     sigOverridden: withAi.filter(e => e.ai.significance && e.ai.significance !== e.significance).length,
     natureMissing: rows.filter(e => !e.commitNature).length,

@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { pruneKnownInputs, hasStructuredFacts } from '../lib/analyze.mjs'
 import {
-  buildDiffDigest, buildChunkPrompt, buildFusePrompt, groundingCorpus,
+  buildDiffDigest, buildChunkPrompt, buildFusePrompt, buildPrompt, groundingCorpus,
   ungroundedIdentifiers, validateLlmOut, gatherEntryContext, splitPatchByFile
 } from '../lib/llm.mjs'
 
@@ -145,6 +145,79 @@ test('groundingCorpus: everything the prompt shows is checkable, caution lines a
   assert.deepEqual(ungroundedIdentifiers('Follows `deadbeef1234`.', corpus), ['deadbeef1234'], 'a sha the prompt never showed is still an invention')
   assert.deepEqual(ungroundedIdentifiers('Follows `90462035737c`.', corpus), [], 'digit-leading hex reads as a version string and is exempt')
   assert.deepEqual(ungroundedIdentifiers('Landed after [abcd1234ffff9999eeee8888dddd7777cccc6666] on 2026-09-14.', corpus), [], 'a lineage sha and date copied from the prompt are grounded')
+})
+
+// The invariant behind four shipped bugs (PR number, review logins and line
+// numbers, sequence shas, lineage dates): a prompt that shows the model an
+// identifier the corpus cannot vouch for turns the model's faithful copy into
+// an "invented" claim. Each was caught by hand-auditing one prompt edit at a
+// time; this checks the property mechanically. Every data token the prompt
+// adds over the instruction skeleton must pass the REAL checker against the
+// REAL corpus -- if a future edit prints something new without grounding it,
+// this fails before a reader ever sees a false "unverified" badge. Prompts
+// that embed the text being validated (verify/fuse/eli5 output) are out of
+// scope on purpose: their claims are the product under test.
+test('prompt-coverage invariant: every data token buildPrompt prints is checkable in the corpus', () => {
+  const patch = [
+    'diff --git a/sdk/src/a.ts b/sdk/src/a.ts',
+    '-export const ALPHA_GATE = 300',
+    '+export const ALPHA_GATE = 500',
+    'diff --git a/sdk/src/a.test.ts b/sdk/src/a.test.ts',
+    "+  it('caps the run at 500', () => {})"
+  ].join('\n')
+  const entry = {
+    sha: sha('a'), date: '2026-09-28', day: '2026-09-28', category: 'SDK', significance: 'notable',
+    areas: ['SDK'], stats: { additions: 692, deletions: 12 },
+    summary: 'Raises FREEBUFF_GATE_MAX from 300 to 500 because the trial filled.',
+    messageTitle: 'feat: raise the gate', messageBody: 'The trial filled early.',
+    files: {
+      added: ['sdk/src/new.ts'], modified: ['sdk/src/a.ts'], removed: ['sdk/src/old.ts'],
+      renamed: [{ from: 'sdk/src/x.ts', to: 'sdk/src/y.ts' }], tests: ['sdk/src/a.test.ts'], churned: ['bun.lock']
+    },
+    facts: ['Alpha fact with 500 sessions.'],
+    modelChanges: {
+      added: ['Muse Spark 1.3'], removed: ['Muse Spark 1.2'],
+      tables: {
+        'Muse Spark 1.3': { after: ['Muse Spark 1.3', 'Paid plans', '1M context'] },
+        'Muse Spark 1.2': { before: ['Muse Spark 1.2', 'Full access'] }
+      }
+    },
+    cmdChanges: { added: ['/byok'], removed: ['/old'] },
+    version: '0.1.4',
+    structured: { constants: [{ name: 'FREEBUFF_GATE_MAX', from: '300', to: '500' }], envVars: [], flags: [], exportsAdded: [], exportsRemoved: [], testNames: ['caps the run at 500'] }
+  }
+  const ctx = {
+    glossary: 'Freebuff glossary (use these plain-English meanings; never redefine a term differently):\n- gate: a limit.',
+    prMeta: {
+      number: 1259, title: 'Raise the gate cap', body: 'The trial filled.', matched: 'files', confidence: 0.82,
+      comments: [{ author: 'reviewerLogin', body: 'Looks right.', path: 'sdk/src/a.ts', line: 42 }]
+    },
+    sequence: {
+      earlier: [{ sha: '90462035aaaa1111bbbb2222cccc3333dddd4444', title: 'Earlier sibling title', summary: 'Earlier sibling summary.' }],
+      later: [{ sha: '88887777bbbb2222cccc3333dddd4444eeee5555', title: 'Later sibling title', summary: 'Later sibling summary.', category: 'CLI' }]
+    },
+    fileHistory: [{ sha: 'abcd1234ffff9999eeee8888dddd7777cccc6666', date: '2026-09-14', overlap: ['sdk/src/a.ts'], title: 'Introduced RETRY_BUDGET', summary: 'Sets retry policy.' }],
+    consumers: [{ path: 'sdk/src/consumer.ts', excerpt: 'reads ALPHA_GATE' }],
+    changedTests: [{ path: 'sdk/src/a.test.ts', added: '+  it caps', titles: ['caps the run at 500'] }],
+    subsystemDocs: [{ path: 'docs/guide.md', content: 'How the gate works.' }],
+    exportOutlines: [{ path: 'sdk/src/a.ts', outline: 'export const ALPHA_GATE' }],
+    fullFiles: [{ path: 'sdk/src/small.ts', content: 'const gate = 1', lines: 1 }],
+    releaseCtx: '- 2026-09-10 Real item: shipped work.'
+  }
+  const corpus = groundingCorpus(entry, patch, ctx)
+  const prompt = buildPrompt(entry, patch, ctx)
+  // The fixture must really render every section, or the check below passes
+  // vacuously on a prompt that never showed the tokens at all.
+  for (const anchor of ['PR #1259', '@reviewerLogin', '[90462035]', 'abcd1234ffff9999', 'Model rows', 'Slash commands: +/byok', 'Version bump: 0.1.4', 'FREEBUFF_GATE_MAX', 'Earlier sibling title', 'Recent commit lineage']) {
+    assert.ok(prompt.includes(anchor), `fixture renders: ${anchor}`)
+  }
+  // The instruction skeleton is identical in both prompts, so its tokens (the
+  // lexicon, the architecture map, the examples) cancel out; what remains is
+  // exactly the data this row's prompt added over it.
+  const bare = buildPrompt({ files: {}, summary: '' }, patch, {})
+  const allowed = ungroundedIdentifiers(bare, corpus)
+  const bad = ungroundedIdentifiers(prompt, corpus).filter(t => !allowed.includes(t))
+  assert.deepEqual(bad, [], 'a token the prompt prints but the corpus cannot vouch for is the ba9141ce class')
 })
 
 test('validateLlmOut: an ungrounded row cannot self-rate confidence high', () => {
