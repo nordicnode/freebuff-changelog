@@ -1412,6 +1412,65 @@ function qualityCard (q, card, bar, share) {
     'stat-span quality-card')
 }
 
+// The golden-set eval, as a card. Rates are 0..1 (judge scores 1..5); every
+// row names the count it actually scored, because a rate over 3 rows must not
+// read like a rate over 40. An absent result renders an honest "no run yet"
+// rather than a missing card: the README promises this card, and the harness
+// writes its first result only once the workflow's push actually lands.
+function evalCard (r, card, bar) {
+  if (!r || !r.metrics) {
+    return card('GOLDEN-SET EVAL', 'no run yet',
+      '<p class="list-note">The golden-set harness re-summarizes a fixed set of real rows on the current prompt and scores grounding, cause visibility, hype and agreement with the human-verified labels (data/eval/golden.json). The weekly workflow writes results to data/eval/results/; this card fills in on the next deploy.</p>',
+      'stat-span eval-card')
+  }
+  const m = r.metrics
+  const c = m.counts || {}
+  const p = r.previous?.metrics || null
+  const rate = (v) => (v == null ? null : Math.round(v * 100))
+  // "+4pt" against the previous run: one number a prompt change can be
+  // judged by, instead of a fresh percentage with nothing to compare to.
+  const delta = (cur, prev, isPct = true) => {
+    if (cur == null || prev == null || !r.previous) return ''
+    const d = cur - prev
+    if (Math.abs(d) < (isPct ? 0.5 : 0.005)) return ''
+    // Plain '-' rather than an entity: the whole line goes through esc().
+    const txt = isPct ? `${d >= 0 ? '+' : '-'}${Math.abs(Math.round(d))}pt` : `${d >= 0 ? '+' : '-'}${Math.abs(d).toFixed(2)}`
+    return `vs v${r.previous.promptV}: ${txt}`
+  }
+  const row = (lbl, v, prev, { pct = true, of = null, note = '' } = {}) => {
+    if (v == null) return ''
+    const shown = pct ? `${v}%` : `${v.toFixed(2)} / 5`
+    const parts = [delta(v, prev, pct), of != null ? `n=${of}` : '', note].filter(Boolean)
+    return bar(lbl, pct ? v : Math.round(v / 5 * 100), 100, {
+      num: shown,
+      ...(parts.length ? { trend: `<span class="stat-note">${esc(parts.join(' \u00b7 '))}</span>` } : {})
+    })
+  }
+  const rows = [
+    row('grounded (no unverified names)', rate(m.grounded), rate(p?.grounded), { of: c.grounded }),
+    row('evidence paths all real', rate(m.pathGrounded), rate(p?.pathGrounded), { of: c.pathGrounded }),
+    row('cause visible (why)', rate(m.whyRate), rate(p?.whyRate), { of: c.whyRate }),
+    row('hype free', rate(m.hypeFree), rate(p?.hypeFree), { of: c.hypeFree }),
+    row('title <= 70 chars', rate(m.titleLenOk), rate(p?.titleLenOk), { of: c.titleLenOk }),
+    row('with evidence cited', rate(m.withEvidence), rate(p?.withEvidence), { of: c.withEvidence }),
+    row('with unknowns named', rate(m.withUnknowns), rate(p?.withUnknowns), { of: c.withUnknowns }),
+    row('structured facts cited', rate(m.structuredUsed), rate(p?.structuredUsed), { of: c.structuredUsed }),
+    row('must-mention identifiers', rate(m.mustMention), rate(p?.mustMention), { of: c.mustMention }),
+    row('audience matches golden', rate(m.audienceAgree), rate(p?.audienceAgree), { of: c.audienceAgree }),
+    row('weight matches golden', rate(m.sigAgree), rate(p?.sigAgree), { of: c.sigAgree }),
+    ...(m.judge?.faithfulness != null ? [
+      row('judge: faithful', m.judge.faithfulness, p?.judge?.faithfulness, { pct: false, of: c.judge }),
+      row('judge: complete', m.judge.completeness, p?.judge?.completeness, { pct: false, of: c.judge }),
+      row('judge: clear', m.judge.clarity, p?.judge?.clarity, { pct: false, of: c.judge })
+    ] : [])
+  ].filter(Boolean).join('')
+  const judgeNote = m.judge?.faithfulness != null ? ' &middot; judge 1-5' : ''
+  return card('GOLDEN-SET EVAL',
+    `${r.golden.evaluated}/${r.golden.total} rows &middot; ${r.golden.verified} human-verified &middot; prompt v${r.promptV} &middot; ${esc(r.model || 'model unset')}${r.modelMajor ? ` (+${esc(r.modelMajor)})` : ''} &middot; ${esc(String(r.at || '').slice(0, 10))}${judgeNote}`,
+    rows || '<p class="list-note">This run scored no rows.</p>',
+    'stat-span eval-card')
+}
+
 // Which release first included this commit, per version track. `shipped` is the
 // Map computeShippedIn() builds once per build.
 function shippedInHtml (e, shipped) {
@@ -1916,7 +1975,7 @@ const RANGE_JS = `(function () {
 })();
 `
 
-export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, overridesDoc = null }) {
+export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, overridesDoc = null, evalResult = null }) {
   const trafficCount = traffic?.count ?? 0
   const trafficUniques = traffic?.uniques ?? 0
   activeTraffic = { count: trafficCount, uniques: trafficUniques }
@@ -3379,6 +3438,7 @@ ${weekTabsScript}`
       + card('MOST-CHANGED MODELS', modelTotal ? `${modelTotal} catalog moves across ${modelCounts.size} models` : 'no catalog moves recorded', modelRows2.map(([m, n]) => bar(m, n, modelMax, { href: `/models/${modelSlug(m)}/`, pct: share(n, modelTotal) })).join(''))
       + card('WHAT COUNTED', `${sigTotal.toLocaleString()} changes split by weight`, `<div class="sig-split">${sigRows.map(([s, n]) => `<span class="sig-seg sig-${s}" style="width:${share(n, sigTotal)}%" title="${s}: ${n.toLocaleString()}"></span>`).join('')}</div>` + sigRows.map(([s, n]) => bar(s.toUpperCase(), n, sigMax, { pct: share(n, sigTotal), cls: 'sig-' + s })).join(''), 'stat-span')
       + qualityCard(summaryQuality(entries), card, bar, share)
+      + evalCard(evalResult, card, bar)
       + card('SHIPPING CADENCE (LAST 12 MO)', `${monthRows.length} of ${byMonth.size} months &middot; peak ${monthMax.toLocaleString()} changes`, `<div class="cad-spark">${cadenceSpark}</div>` + monthRows.map(([m, n], i) => {
         const prev = i ? monthRows[i - 1][1] : 0
         const d = prev ? Math.round((n - prev) / prev * 100) : null

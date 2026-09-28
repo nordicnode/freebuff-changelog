@@ -1763,3 +1763,56 @@ test('no release link points at a version the build never writes', async (t) => 
   assert.ok(!linked.has('0.0.188'), 'the 0.0.x line gets no release link')
   assert.ok(mentions188 > 0, 'and the version is still shown, just without the dead link')
 })
+
+test('stats: the golden-set eval card renders, and says so when no run exists', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-stats-eval-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-13T00:00:00Z',
+    headSha: 'a'.repeat(40), counts: { entries: 1 },
+    entries: [{
+      kind: 'community', sha: 'a'.repeat(40), date: '2026-09-13T00:00:00Z',
+      day: '2026-09-13', author: 'dev', areas: ['CLI'], category: 'CLI', significance: 'minor',
+      title: 'Fix', summary: 'Fix.', stats: { additions: 1, deletions: 0 },
+      files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: ['a.ts'], removed: [], renamed: [], modified: [] }
+    }]
+  }
+  // No committed eval result: the card exists and says so. The README has
+  // twice claimed a GOLDEN-SET EVAL card that did not exist.
+  await buildSite({ changelog, openPrs: [], dist })
+  const empty = await readFile(join(dist, 'stats/index.html'), 'utf8')
+  assert.match(empty, /GOLDEN-SET EVAL/)
+  assert.match(empty, /no run yet/)
+
+  const metrics = {
+    n: 38, verifiedN: 3, grounded: 0.95, pathGrounded: 0.8, whyRate: 0.7, hypeFree: 1,
+    titleLenOk: 1, withEvidence: 0.9, withUnknowns: 0.2, structuredUsed: 0.5,
+    mustMention: 0.85, audienceAgree: 0.6, sigAgree: 0.5,
+    judge: { faithfulness: 4.4, completeness: 4.1, clarity: 4.6 },
+    counts: {
+      grounded: 38, pathGrounded: 30, whyRate: 38, hypeFree: 38, titleLenOk: 38,
+      withEvidence: 38, withUnknowns: 38, structuredUsed: 20, mustMention: 30,
+      audienceAgree: 38, sigAgree: 38, judge: 38
+    }
+  }
+  await buildSite({
+    changelog, openPrs: [], dist,
+    evalResult: {
+      promptV: 11, model: 'deepseek-v4.1', modelMajor: '', at: '2026-09-22T09:41:28.770Z',
+      golden: { total: 40, verified: 3, evaluated: 38, failed: 2 },
+      metrics,
+      previous: {
+        promptV: 9, at: '2026-09-15T00:00:00Z', model: 'deepseek-v4.1',
+        metrics: { ...metrics, grounded: 0.9, judge: { faithfulness: 4.0, completeness: 4.0, clarity: 4.0 } }
+      }
+    }
+  })
+  const html = await readFile(join(dist, 'stats/index.html'), 'utf8')
+  assert.match(html, /GOLDEN-SET EVAL/)
+  assert.match(html, /38\/40 rows/, 'the note says how many rows the run scored')
+  assert.match(html, /95%/, 'the rate itself')
+  assert.match(html, /vs v9: \+5pt/, 'and how it moved against the previous run')
+  assert.match(html, /4\.40 \/ 5/, 'judge scores read on their own 1-5 scale')
+  assert.match(html, /n=38/, 'every rate names the rows it scored')
+  assert.doesNotMatch(html, /no run yet/, 'a run replaces the empty state')
+})

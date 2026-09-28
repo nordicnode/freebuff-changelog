@@ -104,7 +104,9 @@ Set via environment variables:
 | `CHANGELOG_PR_LLM` | `1` | AI previews for open PRs (`0` disables) |
 | `CHANGELOG_PR_LLM_LIMIT` | `5` | Open-PR previews per run |
 | `CHANGELOG_LLM_ESCALATE` | `1` | One rewrite of a still-dirty entry on `LLM_MODEL_MAJOR` before it ships (`0` disables) |
-| `CHANGELOG_LLM_SELFCHECK` | `1` | Second read demotes unconfirmed `breaking`/`migration` claims (`0` disables) |
+| `CHANGELOG_LLM_SELFCHECK` | `1` | Second read demotes unconfirmed `breaking`/`migration` claims (`0` disables); the check is a focused fact-check of the two claims against the diff, run at temperature 0 |
+| `CHANGELOG_LLM_MAX_ATTEMPTS` | `3` | Park a failing row for good after this many runs (the cooldown doubles each time: 1h → 2h → …); a refusal or memory answer, which is deterministic, after `2`. A prompt-version bump changes the cache key and releases the park |
+| `CHANGELOG_LLM_ERROR_COOLDOWN_MS` | `3600000` | First cooldown for a failed row (gateway blips use `CHANGELOG_LLM_TRANSIENT_RETRY_MS`, default `300000`, and never park) |
 | `CHANGELOG_LLM_CONCURRENCY` | `2` | Summaries in flight (the RPM limiter stays the real bound; up to 6) |
 | `CHANGELOG_DIST_SKIP_CHURN_DIFFS` | `0` | `1` leaves lockfile-only diffs out of `dist/` (cards fall back to the GitHub link) |
 | `CHANGELOG_DIST_DIFF_MONTHS` | all | Ship only the last N months of stored diffs to `dist/` |

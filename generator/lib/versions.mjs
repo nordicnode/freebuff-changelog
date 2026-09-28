@@ -53,7 +53,15 @@ export function cacheKeyVersion (key) {
 
 export function isStaleCacheKey (key, { promptV = PROMPT_V, eli5V = ELI5_V } = {}) {
   const kv = cacheKeyVersion(key)
-  if (!kv) return false
+  if (!kv) {
+    // A version-less `${sha}:${hash}` key predates versioned keys. Nothing
+    // reads it -- every reader builds a versioned key -- but because
+    // cacheKeyVersion returns null for it, it was classified "not stale" and
+    // rode along forever (880 of them in ai-summaries.json), making every
+    // inspection of the file overstate what is live. Prune those; leave keys
+    // that are not sha-shaped alone, since other caches reuse this pruner.
+    return /^[0-9a-f]{40}:/.test(String(key))
+  }
   return kv.kind === 'eli5' ? kv.v < eli5V : kv.v < promptV
 }
 

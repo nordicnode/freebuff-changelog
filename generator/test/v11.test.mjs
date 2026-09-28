@@ -167,3 +167,32 @@ test('gatherEntryContext: the fuller structured extraction wins, stored narrow f
   const ctx2 = await gatherEntryContext(e, '', {})
   assert.deepEqual(ctx2.structured.constants, [{ name: 'ALPHA', from: '0', to: '1' }])
 })
+
+// Every case here shipped a junk "unverified" badge on a correct row: the badge
+// demotes confidence high->medium, drops the row from release roll-up windows
+// and parks its plain-English line. All four were reproduced against published
+// entries before the checker was fixed.
+test('grounding false positives: header figures, case, hyphenated English, ordinals', () => {
+  const entry = {
+    title: 'x', summary: 'Analysis notes.', date: '2026-09-20T00:00:00Z', day: '2026-09-20',
+    areas: ['CLI'], category: 'Commands', significance: 'minor',
+    stats: { additions: 692, deletions: 0 },
+    files: { modified: ['cli/src/a.ts'] }
+  }
+  const corpus = groundingCorpus(entry, 'diff --git a/cli/src/a.ts b/cli/src/a.ts\n+x', {})
+  // The prompt prints `Stats: +692 / -0`, `Date:`, `Areas:`, `Category:` and
+  // `Commit nature:`; every line it shows has to be checkable here.
+  assert.ok(corpus.includes('692'), 'stats reach the corpus')
+  assert.ok(corpus.includes('2026-09-20'), 'the date does too')
+  assert.ok(corpus.includes('Commands'), 'so does the category')
+  assert.deepEqual(ungroundedIdentifiers('Touches 692 lines across the repo.', corpus), [], 'a cited figure from the header is not an invention')
+  // Case is not a claim: the corpus spells the tree `cli/`.
+  assert.deepEqual(ungroundedIdentifiers('The `CLI` now skips the gate.', corpus), [], 'a backticked case variant grounds')
+  // Hyphenated English glued to a backticked head, or an ordinal suffix: these
+  // were read as CLI flags by the prose flag arm.
+  assert.deepEqual(ungroundedIdentifiers('Uses `AsyncLocalStorage`-backed storage now.', 'const store = new AsyncLocalStorage()'), [])
+  assert.deepEqual(ungroundedIdentifiers('Adds a `runtime`-aware loader.', 'const runtime = 1'), [])
+  assert.deepEqual(ungroundedIdentifiers('Slices history up to the (N+1)-th user turn.', 'keepUserTurn exists'), [])
+  // ...while a real flag outside backticks is still checked.
+  assert.deepEqual(ungroundedIdentifiers('Pass --invented-flag to enable.', 'nothing here'), ['--invented-flag'])
+})

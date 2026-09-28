@@ -293,7 +293,15 @@ export async function latestResult (dir) {
   // names and newer padded ones compare correctly.
   const docs = (await Promise.all(files.map(f => readJson(`${dir}/${f}`, null)))).filter(Boolean)
   docs.sort((a, b) => String(a.at || '') < String(b.at || '') ? 1 : -1)
-  return docs[0] || null
+  const newest = docs[0] || null
+  // The stored file never carries its own `previous` (it is assigned after
+  // the write, for the CLI report), so a reader that wants the week-over-week
+  // delta -- the /stats/ card -- gets it from the run before this one.
+  const before = docs[1]
+  if (newest && before) {
+    newest.previous = { promptV: before.promptV, at: before.at, model: before.model, metrics: before.metrics }
+  }
+  return newest
 }
 
 const pct = (v) => (v == null ? '   -' : `${String(Math.round(v * 100)).padStart(3)}%`)

@@ -1112,7 +1112,12 @@ async function catchUpOnce (argv) {
       retryErrors: true,
       // This cycle's commits go first; the backlog can wait, the news cannot.
       priorityShas: new Set(freshShas.slice(-limit)),
-      repoDir: REPO_DIR
+      repoDir: REPO_DIR,
+      // The full stored diff, same as generate and enrich-all: without it a
+      // CI-sourced row never re-extracts structured facts from the whole diff
+      // and ships without the constants/env/flag/test-title evidence the
+      // other two paths hand the model.
+      getFullPatch: fullPatchFor
     })
     const remaining = queueable.filter(e => !isCurrent(e)).length
     log(`[backfill] enriched ${n} entries with LLM (${remaining} remaining)`)
@@ -1130,6 +1135,7 @@ async function catchUpOnce (argv) {
       retryErrors: true,
       priorityShas: new Set(freshShas.slice(-limit)),
       getPatch: llmPatchFor,
+      getFullPatch: fullPatchFor,
       repoDir: REPO_DIR
     })
     const eli5Remaining = countPendingEli5(entries)
@@ -1338,7 +1344,17 @@ async function cmdBuild () {
   await mkdir(dist, { recursive: true })
   // The timeline paginates one day per page: `/` is the newest day, every older
   // day is its own /day/<date>/ page.
-  await buildSite({ changelog, openPrs: prs, prMeta, traffic, dist, mergedPrs: mergedPrsDoc, overridesDoc: overrides })
+  // The golden-set card on /stats/: the newest committed eval result, with
+  // the run before it attached so the card can show a delta. Null until the
+  // weekly workflow lands its first result, which renders "no run yet".
+  let evalResult = null
+  try {
+    const { latestResult } = await import('./lib/eval.mjs')
+    evalResult = await latestResult(`${DATA}/eval/results`)
+  } catch (err) {
+    log(`[build] eval results unavailable: ${err.message}`)
+  }
+  await buildSite({ changelog, openPrs: prs, prMeta, traffic, dist, mergedPrs: mergedPrsDoc, overridesDoc: overrides, evalResult })
 
   // data/diffs is 106 MB of a 352 MB dist. Two opt-in trims: skip the churn
   // rows' lockfile diffs (CHANGELOG_DIST_SKIP_CHURN_DIFFS=1) and/or ship only

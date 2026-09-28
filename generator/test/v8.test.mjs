@@ -127,6 +127,22 @@ test('pruneStaleCache drops keys from retired prompt versions only', () => {
   assert.equal(cacheKeyVersion('nope'), null)
 })
 
+test('pruneStaleCache: version-less legacy keys are dead weight too', () => {
+  // Pre-versioning keys (`${sha}:${hash}`) have no `:vN:` segment, so
+  // cacheKeyVersion returns null for them and they were classified "not
+  // stale" forever -- 880 of them rode along in ai-summaries.json while every
+  // reader built versioned keys and never looked at them. Nothing that is not
+  // sha-shaped may be touched (other caches reuse this pruner).
+  const cache = {
+    [`${sha('a')}:84b0fad0bea8`]: { title: 'legacy summary' },
+    [`${sha('b')}:eli5:0af1d14a6263`]: { text: 'legacy line' },
+    [`${sha('c')}:v${PROMPT_V}:abc`]: { title: 'current' },
+    garbage: { x: 1 }
+  }
+  assert.equal(pruneStaleCache(cache), 2)
+  assert.deepEqual(Object.keys(cache).sort(), [`${sha('c')}:v${PROMPT_V}:abc`, 'garbage'].sort())
+})
+
 test('rewriteRank orders major before notable before minor; contextTier scales with the diff', () => {
   assert.ok(rewriteRank({ ai: { significance: 'major' } }) < rewriteRank({ significance: 'notable' }))
   assert.ok(rewriteRank({ significance: 'notable' }) < rewriteRank({}))

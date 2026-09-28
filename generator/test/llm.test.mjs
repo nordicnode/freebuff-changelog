@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, llmCallCount, buildSelfCheckPrompt, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -484,8 +484,13 @@ test('CHANGELOG_LLM_LIMIT=0 drops the call cap but keeps the git window', async 
     } finally { globalThis.fetch = orig }
     return patched.length
   }
-  assert.ok(await run('5') < 40, 'a capped pass does not touch the whole backlog')
   assert.equal(await run('0'), 40, 'limit 0 queues everything the window allows')
+  assert.ok(await run('5') < 40, 'a capped pass does not touch the whole backlog')
+  // The rows those runs parked on a failure are skipped before the diff work:
+  // the exact-key cooldown check used to run after the prefetch, so every
+  // cycle re-ran git for rows it was then going to skip anyway.
+  const afterFailures = await run('0')
+  assert.ok(afterFailures < 40, `rows parked on a recent failure are not diffed (${afterFailures}/40)`)
 })
 
 // ---------------------------------------------------------------------------
@@ -1842,4 +1847,476 @@ test("bumpOnly and isBumpEntry: a filename that is an Object.prototype key is no
     stats: { additions: 400, deletions: 12 },
     files: { total: 1, meaningful: 1, modified: ['freebuff/cli/release/package.json'] }
   })), true, 'the actual release manifest is still a bump')
+})
+
+// ---------------------------------------------------------------------------
+// Product-prompt redaction.
+//
+// freebuff's own agent definitions carry verbatim prompts, and embedded in the
+// changelog ask they make the gateway refuse as if asked to disclose its own
+// instructions (measured: failing rows are 58x more likely to touch
+// agents/base2/base2.ts than rows that summarize cleanly). The prompt text must
+// not reach the model; every fact a summary is grounded on must.
+
+const PROMPT_PATCH = [
+  'diff --git a/agents/base2/base2.ts b/agents/base2/base2.ts',
+  'index c021b722c..5a4fde163 100644',
+  '--- a/agents/base2/base2.ts',
+  '+++ b/agents/base2/base2.ts',
+  '@@ -1,2 +1,2 @@',
+  "-    systemPrompt: `You must spawn the code-reviewer agent before you finish. ${isFree ? 'Freebuff' : 'Codebuff'}`,",
+  "+    systemPrompt: `You must spawn the lean code-reviewer agent before you finish. ${isFreebuff ? 'Freebuff' : 'Codebuff'}`,",
+  '-    model: deepseekModels.deepseekV4Flash,',
+  '+    model: deepseekModels.deepseekV4FlashPlus,'
+].join('\n')
+
+test('redactProductPrompts: removes instruction prose from a template literal, keeps its interpolations', () => {
+  const out = redactProductPrompts(PROMPT_PATCH)
+  assert.ok(!out.includes('You must spawn'), 'the instruction prose is gone from both sides')
+  assert.ok(!out.includes('code-reviewer agent'), 'and so is the rest of the prompt sentence')
+  assert.ok(out.includes(PROMPT_REDACTION), 'the model is told text was withheld')
+  // The mechanic of the change survives: the variable that was renamed is code.
+  assert.match(out, /\$\{isFree \?/, 'the removed line keeps its interpolation')
+  assert.match(out, /\$\{isFreebuff \?/, 'the added line keeps its interpolation')
+})
+
+test('redactProductPrompts: a removed multi-line prompt does not swallow the added one', () => {
+  const patch = [
+    'diff --git a/agents/base2/base2.ts b/agents/base2/base2.ts',
+    '--- a/agents/base2/base2.ts',
+    '+++ b/agents/base2/base2.ts',
+    '@@ -1,2 +1,2 @@',
+    '-  systemPrompt: `You are Buffy. Add a new agent when the user asks for one.',
+    '+  systemPrompt: `You are Buffy. Spawn a new agent when the user asks for one.',
+    '   }'
+  ].join('\n')
+  const out = redactProductPrompts(patch)
+  assert.ok(!out.includes('You are Buffy'), 'both versions of the prompt are removed')
+  // Each side opens its own literal: the `-` line's backtick must not be read as
+  // closing the `+` line's, which is how an earlier version let the rewritten
+  // system prompt through verbatim.
+  assert.equal(out.split(PROMPT_REDACTION).length - 1, 2, 'one redaction per side')
+})
+
+test('redactProductPrompts: leaves ordinary code, identifiers and model ids untouched', () => {
+  const patch = [
+    'diff --git a/freebuff/cli/release/package.json b/freebuff/cli/release/package.json',
+    '--- a/freebuff/cli/release/package.json',
+    '+++ b/freebuff/cli/release/package.json',
+    '@@ -1,1 +1,1 @@',
+    '-  "version": "0.1.1",',
+    '+  "version": "0.1.2",'
+  ].join('\n')
+  assert.equal(redactProductPrompts(patch), patch, 'a version bump is not prompt text')
+  // A model-id change inside an agent definition is a fact, not prompt prose.
+  const modelSwap = [
+    'diff --git a/agents/types/agent-definition.ts b/agents/types/agent-definition.ts',
+    '--- a/agents/types/agent-definition.ts',
+    '+++ b/agents/types/agent-definition.ts',
+    '@@ -379,1 +379,2 @@',
+    "+  | 'anthropic/claude-opus-4.8'",
+    "   | 'anthropic/claude-sonnet-4.6'"
+  ].join('\n')
+  assert.equal(redactProductPrompts(modelSwap), modelSwap)
+})
+
+test('redactProductPrompts: is idempotent and keeps the diff structure', () => {
+  const once = redactProductPrompts(PROMPT_PATCH)
+  assert.equal(redactProductPrompts(once), once, 're-running changes nothing')
+  for (const line of once.split('\n')) {
+    if (/^(diff --git|index |--- |\+\+\+ |@@)/.test(line)) {
+      assert.ok(PROMPT_PATCH.includes(line), `structure line preserved: ${line.slice(0, 30)}`)
+    }
+  }
+})
+
+test('product prompt text never reaches the model, from any prompt builder', () => {
+  const entry = {
+    sha: 'a'.repeat(40),
+    date: '2026-09-27T10:00:00Z',
+    areas: ['Agents'],
+    category: 'Agents',
+    significance: 'notable',
+    stats: { additions: 5, deletions: 5 },
+    files: { added: [], modified: ['agents/base2/base2.ts'] },
+    summary: 'Agents update: base2.'
+  }
+  const prompts = {
+    buildPrompt: buildPrompt(entry, PROMPT_PATCH, {}),
+    buildChunkPrompt: buildChunkPrompt(entry, PROMPT_PATCH),
+    buildVerifyPrompt: buildVerifyPrompt(entry, PROMPT_PATCH, { title: 'T', summary: 'S.' }),
+    buildEli5Prompt: buildEli5Prompt(entry, ['The reviewer agent must always spawn first.'], { patch: PROMPT_PATCH })
+  }
+  for (const [name, text] of Object.entries(prompts)) {
+    assert.ok(!text.includes('You must spawn'), `${name}: the prompt text is withheld`)
+    assert.ok(!text.includes('The reviewer agent must always spawn'), `${name}: comment prose in instruction voice is withheld`)
+  }
+  // And the fenced section still carries the change itself.
+  assert.match(prompts.buildPrompt, /deepseekV4FlashPlus/, 'the code change still reaches the model')
+})
+
+test('product prompt text is redacted inside the evidence sections too', () => {
+  const entry = {
+    sha: 'b'.repeat(40),
+    date: '2026-09-27T10:00:00Z',
+    files: { added: [], modified: ['agents/base2/base2.ts'] },
+    summary: 'Agents update: base2.'
+  }
+  const prompt = buildPrompt(entry, 'diff --git a/x b/x\n+one\n+two\n+three', {
+    fullFiles: [{ path: 'agents/base2/base2.ts', lines: 3, content: "export const P = `You are Buffy, the strategic coding assistant.`" }],
+    consumers: [{ path: 'agents/run.ts', references: 1, excerpt: 'You must spawn the editor agent before you finish.' }]
+  })
+  assert.ok(!prompt.includes('You are Buffy'), 'full-file context is redacted')
+  assert.ok(!prompt.includes('You must spawn the editor agent'), 'consumer context is redacted')
+  assert.ok(prompt.includes('agents/base2/base2.ts'), 'the file path stays, so the change is still locatable')
+})
+
+test('product prompt text is redacted in every block of the plain-English ask', () => {
+  const entry = { sha: 'c'.repeat(40), date: '2026-09-27T10:00:00Z', areas: ['Agents'], summary: 'Agents update.' }
+  const prompt = buildEli5Prompt(entry, ['The reviewer agent must always spawn first.'], {
+    patch: 'diff --git a/x b/x\n+one\n+two\n',
+    fileHeaders: [{ path: 'agents/base2/base2.ts', header: 'You must spawn the editor agent before you finish.' }],
+    subsystemDocs: [{ path: 'agents/README.md', content: 'You must always read the docs first.' }],
+    exportOutlines: [{ path: 'agents/base2/base2.ts', totalLines: 9, outline: 'You are Buffy, the strategic coding assistant.' }],
+    fullFiles: [{ path: 'agents/base2/base2.ts', lines: 1, content: 'You are Buffy, the strategic coding assistant.' }]
+  })
+  // The plain-English ask builds its own evidence blocks rather than going
+  // through contextSectionLines, so each one has to be redacted on its own.
+  assert.ok(!prompt.includes('You must spawn the editor agent'), 'the file header is redacted')
+  assert.ok(!prompt.includes('You must always read the docs first'), 'the subsystem guide is redacted')
+  assert.ok(!prompt.includes('You are Buffy'), 'the outline and the full file are redacted')
+  assert.match(prompt, /agents\/base2\/base2\.ts/, 'the paths stay, so the change is still locatable')
+})
+
+test('the diff digest and the PR preview ask are redacted too', () => {
+  const patch = [
+    'diff --git a/agents/base2/base2.ts b/agents/base2/base2.ts',
+    '--- a/agents/base2/base2.ts',
+    '+++ b/agents/base2/base2.ts',
+    '@@ -1,1 +1,2 @@',
+    "+  systemPrompt: `You must spawn the editor agent before you finish.`"
+  ].join('\n')
+  const digest = buildDiffDigest(patch, {})
+  assert.ok(!digest.includes('You must spawn'), 'the digest quotes lines, so it is redacted')
+  assert.match(digest, /agents\/base2\/base2\.ts/, 'the file row and its counts survive')
+  const pr = buildPrPrompt({ number: 1, title: 'Adds a cap' }, patch, {})
+  assert.ok(!pr.includes('You must spawn'), 'the PR preview ask carries the same diff')
+})
+
+// ---------------------------------------------------------------------------
+// The retry ladder's second rung.
+//
+// A row whose evidence is a model catalog or an agent definition gets a model
+// that answers the material instead of summarizing the change, and no amount of
+// restating the task moves it. The rung that does move it drops the wide
+// repository-derived sections and keeps the diff, the metadata, the headers and
+// the structured facts. Both asks in the pipeline carry those sections, so both
+// asks need the rung.
+
+const LADDER_PATCH = [
+  'diff --git a/agents/base2/base2.ts b/agents/base2/base2.ts',
+  'index c021b722c..5a4fde163 100644',
+  '--- a/agents/base2/base2.ts',
+  '+++ b/agents/base2/base2.ts',
+  '@@ -1,2 +1,3 @@',
+  ' import { HANDLER } from "./beta"',
+  '+export const BETA_LIMIT = 3',
+  ' export const BETA_HANDLER = HANDLER'
+].join('\n')
+
+const LADDER_ENTRY = {
+  sha: 'e'.repeat(40),
+  date: '2026-09-27T10:00:00Z',
+  areas: ['Agents'],
+  category: 'Agents',
+  significance: 'notable',
+  stats: { additions: 3, deletions: 1 },
+  files: { added: [], modified: ['agents/base2/base2.ts'] },
+  summary: 'Agents update: base2.',
+  facts: ['The handler cap is three.'],
+  ai: { title: 'Cap added', summary: 'Adds a cap.' }
+}
+
+const LADDER_CONTEXT = {
+  fileHeaders: [{ path: 'agents/base2/base2.ts', header: 'Agent definitions for base2.' }],
+  fileHistory: [{ sha: 'a'.repeat(8), date: '2026-09-26', overlap: ['agents/base2/base2.ts'], title: 'Adds the handler cap.' }],
+  subsystemDocs: [{ path: 'agents/README.md', content: 'The base2 agent.' }],
+  exportOutlines: [{ path: 'agents/base2/base2.ts', totalLines: 3, outline: 'export const BETA_LIMIT' }],
+  fullFiles: [{ path: 'agents/base2/base2.ts', lines: 3, content: 'export const BETA_LIMIT = 3' }],
+  consumers: [{ path: 'agents/run.ts', references: 1, excerpt: 'import { BETA_LIMIT } from "./base2"' }],
+  changedTests: [{ path: 'agents/base2/base2.test.ts', titles: ['caps the handler'], added: 'expect(BETA_LIMIT).toBe(3)' }]
+}
+
+const LADDER_ENV = {
+  CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1',
+  LLM_MODEL: 'test-model', CHANGELOG_LLM_VERIFY: '0', CHANGELOG_LLM_SELFCHECK: '0'
+}
+
+const LADDER_SUMMARY = JSON.stringify({
+  evidence: 'agents/base2/base2.ts adds `BETA_LIMIT`.',
+  title: 'Handler cap added to base2',
+  summary: 'Adds `BETA_LIMIT` in agents/base2/base2.ts.',
+  significance: 'notable', audience: 'maintainers', confidence: 'high',
+  userVisible: false, migration: null, unknowns: null
+})
+
+// Every prompt the model sees is answered by `reply`, which is handed the
+// prompt text so a test can answer the full ask and the lean one differently.
+function answerWith (reply) {
+  const seen = []
+  const orig = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    const prompt = JSON.parse(String(init.body)).messages[0].content
+    seen.push(prompt)
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify({ choices: [{ message: { content: reply(prompt) } }] })
+    }
+  }
+  return { seen, restore: () => { globalThis.fetch = orig } }
+}
+
+test('leanPromptCtx: drops the wide sections and keeps the ground truth', () => {
+  const ctx = {
+    architectureMap: 'arch', glossary: 'gloss', releaseCtx: 'release', prMeta: { number: 1 },
+    sequence: { earlier: [] }, structured: { constants: [] }, fileHeaders: [{ path: 'a' }],
+    subsystemDocs: [{ path: 'd' }], fileHistory: [{ sha: 's' }], exportOutlines: [{ path: 'o' }],
+    fullFiles: [{ path: 'f' }], consumers: [{ path: 'c' }], changedTests: [{ path: 't' }]
+  }
+  const lean = leanPromptCtx(ctx)
+  for (const key of ['subsystemDocs', 'fileHistory', 'exportOutlines', 'fullFiles', 'consumers', 'changedTests']) {
+    assert.equal(key in lean, false, `${key} is dropped`)
+  }
+  for (const key of ['architectureMap', 'glossary', 'releaseCtx', 'prMeta', 'sequence', 'structured', 'fileHeaders']) {
+    assert.ok(key in lean, `${key} is kept`)
+  }
+  assert.ok(ctx.fullFiles.length, 'the caller\'s context is not mutated')
+})
+
+test('the summary ask drops the wide evidence before giving up on a row', async () => {
+  const wide = 'Complete Source of Modified Files'
+  let fullAsks = 0
+  const { seen, restore } = answerWith((prompt) => {
+    if (!prompt.includes(wide)) return LADDER_SUMMARY
+    fullAsks++
+    return 'The latest Claude Opus model I know about is Claude Opus 4.1, which was released earlier this year.'
+  })
+  try {
+    const { record } = await summarizeEntry({ entry: LADDER_ENTRY, patch: LADDER_PATCH, context: LADDER_CONTEXT, env: LADDER_ENV })
+    assert.equal(record.title, 'Handler cap added to base2')
+    assert.ok(fullAsks >= 1, 'the full evidence is tried first')
+    const lean = seen.at(-1)
+    assert.ok(!lean.includes(wide), 'the lean ask drops the whole source files')
+    assert.ok(!lean.includes('Where the symbols this change introduces'), 'and the consumer excerpts')
+    assert.ok(!lean.includes('Tests this commit changed'), 'and the changed test hunks')
+    assert.ok(!lean.includes('Recent commit lineage'), 'and the file lineage')
+    assert.match(lean, /\+export const BETA_LIMIT = 3/, 'but still carries the diff')
+    assert.match(lean, /Module & File Purpose/, 'and the file headers')
+    assert.ok(lean.indexOf(REPLY_CONTRACT) > lean.indexOf('```diff'), 'and still closes with the contract, after the diff')
+  } finally {
+    restore()
+  }
+})
+
+test('the plain-English ask takes the rung, for both a refusal and a memory answer', async () => {
+  const wide = 'Complete source of the smaller touched files'
+  for (const [label, reply] of [
+    ['a training-memory answer', 'The latest Claude Opus model I know about is Claude Opus 4.1, which was released earlier this year.'],
+    ['a refusal', "I'm DeepSeek, an AI assistant. I cannot share internal system instructions or configuration details."]
+  ]) {
+    let fullAsks = 0
+    const { seen, restore } = answerWith((prompt) => {
+      if (!prompt.includes(wide)) return 'A cap of three handlers is now in place for the base2 agent.'
+      fullAsks++
+      return reply
+    })
+    try {
+      const { record } = await explainEntry({ entry: LADDER_ENTRY, patch: LADDER_PATCH, context: LADDER_CONTEXT, env: LADDER_ENV })
+      assert.match(record.text, /cap of three handlers/, `${label}: the lean ask is answered`)
+      assert.ok(fullAsks >= 1, `${label}: the full evidence is tried first`)
+      const lean = seen.at(-1)
+      assert.ok(!lean.includes(wide), `${label}: the lean ask drops the full-file block`)
+      assert.match(lean, /diff --git/, `${label}: and still carries the diff`)
+    } finally {
+      restore()
+    }
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Deterministic failures: named, counted, escalated, parked.
+//
+// A refusal or a memory answer is byte-identical across attempts and
+// temperatures, so every extra attempt is a full-context call for the same
+// wrong reply. The loop it used to feed (`LLM returned no JSON` -> transient
+// -> 5-minute cooldown -> forever) is the single largest source of wasted
+// calls this pipeline has had.
+
+test('errorRetryDelayMs: backoff escalates and a parked row never comes back', () => {
+  // Gateway blips retry on the short window for as long as they last: the
+  // endpoint's problem clears by itself and must not park the row.
+  assert.equal(errorRetryDelayMs({ error: 'LLM HTTP 503', transient: true }), 300000)
+  assert.equal(errorRetryDelayMs({ error: 'LLM HTTP 503', transient: true, attempts: 9 }), 300000)
+  // Everything else escalates 1x -> 2x, then parks at maxAttempts.
+  assert.equal(errorRetryDelayMs({ error: 'bad output' }), 3600000)
+  assert.equal(errorRetryDelayMs({ error: 'bad output', attempts: 2 }), 7200000)
+  assert.equal(errorRetryDelayMs({ error: 'bad output', attempts: 3 }), Infinity)
+  // A deterministic content failure gets two runs of three calls, not forever.
+  assert.equal(errorRetryDelayMs({ error: 'memory', deterministic: true }), 3600000)
+  assert.equal(errorRetryDelayMs({ error: 'memory', deterministic: true, attempts: 2 }), Infinity)
+})
+
+test('pruneExpiredErrors: a parked stub is a record, not garbage', () => {
+  const now = Date.parse('2026-09-18T16:00:00.000Z')
+  const cache = {
+    // Doomed row, attempted twice, written 30 days ago: deleting it reverted
+    // the row to "no record" while the entry kept its old text, so the rewrite
+    // scope never converged and nothing could report it.
+    parked: { error: 'LLM answered from model memory', deterministic: true, attempts: 2, at: new Date(now - 30 * 86400000).toISOString() },
+    // Ordinary failure, expired: still pruned.
+    old: { error: 'bad output', at: new Date(now - 70 * 60000).toISOString() }
+  }
+  assert.equal(pruneExpiredErrors(cache, { now }), 1)
+  assert.ok(cache.parked, 'the parked stub survives')
+  assert.equal(cache.old, undefined)
+})
+
+test('isTransientError: a memory answer is not a flaky JSON frame', () => {
+  const det = new Error('LLM answered from model memory on every ask (deterministic content failure): LLM returned no JSON')
+  det.deterministic = true
+  assert.ok(!isTransientError(det), 'the named failure parks instead of retrying in 5 minutes')
+  assert.ok(!isTransientError(new Error('eli5 answers from model memory instead of the diff: "The latest Claude Opus..."')))
+  assert.ok(isTransientError(new Error('LLM returned no JSON')), 'a genuinely flaky frame still retries soon')
+})
+
+test('a memory answer costs two runs of three calls and then parks', async (t) => {
+  const { mkdtemp, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-park-'))
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
+  const sha = '9'.repeat(40)
+  const patch = 'diff --git a/x b/x\n+the cap is now three\n'
+  const entries = [{ kind: 'sync', sha, date: '2026-09-27T10:00:00Z', areas: ['Agents'], summary: 'Agents update: base2.' }]
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0', CHANGELOG_LLM_SELFCHECK: '0' }
+  let calls = 0
+  const orig = globalThis.fetch
+  globalThis.fetch = async () => {
+    calls++
+    return {
+      ok: true, status: 200, headers: { get: () => null },
+      text: async () => JSON.stringify({ choices: [{ message: { content: 'The latest Claude Opus model I know about is Claude Opus 4.1, which was released earlier this year.' } }] })
+    }
+  }
+  const stubOf = async () => {
+    const cached = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    return Object.values(cached).find(v => v && v.error)
+  }
+  const backdate = async (ms) => {
+    const cached = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    for (const v of Object.values(cached)) if (v?.error) v.at = new Date(Date.now() - ms).toISOString()
+    await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify(cached))
+  }
+  try {
+    // Run 1: the full ask, the lean rung and the stripped/repaired rung, then
+    // it stops -- and the cache says WHY it stopped.
+    await enrichWithLlm(entries, async () => patch, dir, env, { retryErrors: true })
+    assert.equal(calls, 3, 'three calls for the whole ladder, then a stop')
+    let stub = await stubOf()
+    assert.match(stub.error, /model memory/, 'the cache records the real cause, not "no JSON"')
+    assert.equal(stub.deterministic, true)
+    assert.equal(stub.attempts, 1)
+    assert.equal(stub.transient, undefined, 'not on the 5-minute retry loop')
+
+    // Run 2, after the first cooldown: one more run of three, counted.
+    await backdate(2 * 3600000)
+    await enrichWithLlm(entries, async () => patch, dir, env, { retryErrors: true })
+    assert.equal(calls, 6, 'exactly one more run')
+    stub = await stubOf()
+    assert.equal(stub.attempts, 2)
+
+    // Run 3: parked. Backdating the timestamp cannot buy another call.
+    await backdate(48 * 3600000)
+    await enrichWithLlm(entries, async () => patch, dir, env, { retryErrors: true })
+    assert.equal(calls, 6, 'a parked row never costs another call')
+    stub = await stubOf()
+    assert.equal(stub.attempts, 2, 'the parked record is still there to be reported')
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
+test('a gave-up row gets bounded fresh attempts, then the cache serves it', async (t) => {
+  const { mkdtemp, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-gaveup-'))
+  t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
+  const sha = '1'.repeat(40)
+  const patch = 'diff --git a/x b/x\n+line\n'
+  const key = cacheKey(sha, patch)
+  const entry = { kind: 'sync', sha, date: '2026-09-27T10:00:00Z', areas: ['CLI'], summary: 'CLI change.', title: 'Update the agent list' }
+  await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({
+    [key]: { title: 'Update the agent list', summary: 'Mechanical label.', model: 'm', v: PROMPT_V, at: new Date().toISOString() }
+  }))
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0', CHANGELOG_LLM_SELFCHECK: '0' }
+  // The model keeps answering with the mechanical label: the row really is
+  // gave-up, and it must still get its bounded retries (the old code queued
+  // it every run and then served the very record it meant to replace).
+  const { seen, restore } = answerWith(() => JSON.stringify({
+    title: 'Update the agent list', summary: 'Touches the agent list file.', significance: 'minor'
+  }))
+  try {
+    await enrichWithLlm([entry], async () => patch, dir, env, { retryErrors: true })
+    assert.equal(seen.length, 1, 'first fresh attempt')
+    let rec = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))[key]
+    assert.equal(rec.gaveTries, 1, 'the retry is counted')
+
+    await enrichWithLlm([entry], async () => patch, dir, env, { retryErrors: true })
+    assert.equal(seen.length, 2, `second fresh attempt (max ${GAVEUP_MAX_TRIES})`)
+    rec = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))[key]
+    assert.equal(rec.gaveTries, 2)
+
+    await enrichWithLlm([entry], async () => patch, dir, env, { retryErrors: true })
+    assert.equal(seen.length, 2, 'after the bound the cache serves the record: no more calls')
+  } finally {
+    restore()
+  }
+})
+
+test('ELI5 escalation: a row every rung failed on gets the strong model', async () => {
+  const minorEntry = { ...LADDER_ENTRY, significance: 'minor', ai: undefined }
+  const orig = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    const body = JSON.parse(String(init.body))
+    const content = body.model === 'strong-model'
+      ? 'A cap of three handlers is now in place for the base2 agent.'
+      : 'The latest Claude Opus model I know about is Claude Opus 4.1, which was released earlier this year.'
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content } }] }) }
+  }
+  try {
+    const { text, record } = await explainEntry({
+      entry: minorEntry, patch: LADDER_PATCH, context: LADDER_CONTEXT,
+      env: { ...LADDER_ENV, LLM_MODEL_MAJOR: 'strong-model' }
+    })
+    assert.match(text, /cap of three handlers/, 'the strong model answered')
+    assert.equal(record.model, 'strong-model', 'and the record says which model wrote it')
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
+test('self-check: the second read is a focused fact-check, not a re-generation', () => {
+  const p = buildSelfCheckPrompt({ title: 'Gate added', breaking: true, migration: 'Set FREEBUFF_X before upgrading.' }, 'diff --git a/x b/x\n+export const FREEBUFF_X = 1')
+  assert.match(p, /Claimed breaking change: yes/, 'the claim under test is named')
+  assert.match(p, /Claimed migration step: Set FREEBUFF_X before upgrading\./)
+  assert.match(p, /diff --git a\/x b\/x/, 'and the material to judge it from is the diff')
+  assert.match(p, /Output JSON/, 'the same validator shape as before')
+  assert.match(p, /unproven/, 'the judge is told to confirm only what is clearly there')
+  // The old probe re-sent repairPrompt: the whole prompt, wide sections and
+  // all, at temperature 0.3.
+  assert.doesNotMatch(p, /REPLY_CONTRACT/, 'the summary contract is not re-sent')
+  assert.equal(llmCallCount() >= 0, true, 'the call counter this measures with is exported')
 })
