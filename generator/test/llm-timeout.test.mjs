@@ -17,7 +17,7 @@ for (const pass of ['summary', 'eli5']) {
       assert.equal(init.signal, controller.signal)
       return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(
         pass === 'eli5' ? { eli5: 'The assistant supports another model.' }
-          : { title: 'Additional model supported', summary: 'The assistant supports another model.', significance: 'minor' }
+          : { title: 'Additional model supported', summary: 'The assistant supports another model so users can pick it.', significance: 'minor' }
       ) } }] }))
     })
     for (const value of [undefined, '300000', '0', '-1', 'nope', 'Infinity', '1.5', '2147483648']) {
@@ -26,7 +26,7 @@ for (const pass of ['summary', 'eli5']) {
         const entry = {
           sha: 'a'.repeat(40), kind: 'sync', date: '2026-09-17T00:00:00Z',
           day: '2026-09-17', areas: ['CLI'], category: 'CLI', significance: 'minor',
-          summary: 'The assistant supports another model.'
+          summary: 'The assistant supports another model so users can pick it.'
         }
         // The verifier pass is timed by the same clock but has its own tests
         // (v10); here the single-call timeout plumbing is the subject.

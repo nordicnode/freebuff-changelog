@@ -929,6 +929,7 @@ export function buildPrompt (entry, patch, ctx = {}) {
     SUMMARY_GUIDE_HEADER,
     WHAT_CHANGED_RULE,
     '- State WHY it happened if grounded in notes/diff/PR context (root cause, upstream failure, deprecation). If reason is not visible, describe the mechanism - never invent motives.',
+    '- The WHY is not optional: every summary carries one clause saying why the change exists -- a cause ("because ...", "due to ...", "after <upstream> failed"), a purpose ("so <subject> can ...", "prevents ...", "ensures ...", "allows ..."), or, when no reason is visible at all, the mechanism the change relies on. A summary that only says what changed is incomplete; an invented motive is a lie, so ground the clause in the diff, the notes or the PR text.',
     '- Ground the change in the Freebuff Monorepo Architecture below. Name the affected package or surface naturally without repetitive template phrases like "Scope limited to...".',
     '- DETAIL: include one concrete technical fact (migration behavior, trait change, alias, flag, or constraint). Never paste raw diff lines. Never write "Nothing to do" or no-action boilerplate.',
     PUNCTUATION_RULE,
@@ -952,6 +953,7 @@ export function buildPrompt (entry, patch, ctx = {}) {
     '',
     'GOOD (technical, precise, no boilerplate) examples. Angle-bracket spans stand for values copied verbatim from THIS diff and notes: never emit a span literally and never reuse any name from these examples, only the pattern:',
     '- "<Model X> replaces <Model Y> in the free model picker, per the comment beside <Model Y>\'s removal that cites its upstream deprecation." WHAT + mechanism, plus a WHY quoted from the diff.',
+    '- WHAT-only, rejected: "<Model X> added to the picker and <const> renamed." The same row with its why: "<Model X> replaces <Model Y> in the picker so saved picks keep working after <const> is renamed."',
     '- "`<flag-or-const>` in `<package path>` now gates `<behavior>`; it defaults to `<literal value>` and nothing reads it outside `<file>` yet." One concrete DETAIL, every name from the file list, no invented runtime or session consequences.',
     '- Significance calibration, keep-the-tier side: a row that only edits `<const>` from `<old value>` to `<new value>` with no new reader stays at the deterministic tier (usually minor): a literal moved, no behavior shipped.',
     '- Significance calibration, move-the-tier side: the same constant edit sitting beside new code that enforces it is a behavior change and belongs in notable or major -- move the tier only with that kind of evidence in the diff.',
@@ -1176,7 +1178,7 @@ export function buildFusePrompt (entry, drafts, ctx = {}, digest = '') {
     TITLE_RULE,
     SUMMARY_GUIDE_HEADER,
     WHAT_CHANGED_RULE,
-    '- State WHY it happened if grounded in notes or PR context. If reason is not visible, describe the mechanism - never invent motives.',
+    '- State WHY it happened if grounded in notes or PR context. If reason is not visible, describe the mechanism - never invent motives. The WHY clause is required in every summary: a cause, a purpose ("prevents", "allows", "so <subject> can"), or the mechanism -- a what-only summary is incomplete.',
     '- DETAIL: include one concrete technical fact. Never paste raw diff lines. Never write "Nothing to do" or no-action boilerplate.',
     PUNCTUATION_RULE,
     '',
@@ -2086,6 +2088,14 @@ export function validateLlmOut (out, fallbackSig = 'minor', opts = {}) {
     }
   }
   const summary = cleanText(fixedSummary, 2000, true)
+  // The WHY gate. The prompt demands a cause/purpose clause in every summary,
+  // but 87% of fresh v11 summaries shipped without one (first golden-set run:
+  // 5 of 40), so it is enforced like grounding: the strict pass names the
+  // problem so one repair pass adds the clause, and a stubborn second answer
+  // ships flagged (`whyMissing`) rather than being re-asked forever. Only the
+  // initial summarize ask passes requireWhy, so verifier and escalation calls
+  // never pay for it.
+  const whyMissing = Boolean(opts.requireWhy) && !WHY_RE.test(summary)
   const significance = ['minor', 'notable', 'major'].includes(out.significance) ? out.significance : fallbackSig
   const rawEvidence = fixedEvidence
   const evidence = rawEvidence ? cleanText(rawEvidence, 1500, true) : ''
@@ -2118,7 +2128,12 @@ export function validateLlmOut (out, fallbackSig = 'minor', opts = {}) {
     for (const v of newEnvVars) if (!hay.includes(v) && !ungrounded.includes(v)) ungrounded.push(v)
   }
   if (ungrounded.length && opts.onUngrounded === 'throw') {
-    throw new Error(`LLM output names identifiers not present in the diff or source context: ${ungrounded.slice(0, 6).join(', ')}`)
+    // One message for both problems when both are present: the repair pass is
+    // paid for once and told everything it has to fix.
+    throw new Error(`LLM output names identifiers not present in the diff or source context: ${ungrounded.slice(0, 6).join(', ')}${whyMissing ? '. It also states WHAT changed without WHY: add one grounded cause or purpose clause (because / due to / after <upstream> failed / so <subject> can / prevents / ensures / allows)' : ''}`)
+  }
+  if (whyMissing && opts.onUngrounded === 'throw') {
+    throw new Error('LLM summary states what changed but not why: add one clause saying why the change exists -- a cause (because / due to / after <upstream> failed), a purpose (so <subject> can / prevents / ensures / allows), or, when no reason is visible, the mechanism -- grounded in the diff, never an invented motive')
   }
   // Direction check on the old -> new values the prompt handed over verbatim:
   // "from 500 to 300" where the diff says 300 -> 500 passes grounding (both
@@ -2146,16 +2161,20 @@ export function validateLlmOut (out, fallbackSig = 'minor', opts = {}) {
     ...(unknowns ? { unknowns } : {}),
     ...(changes.length ? { changes } : {}),
     ...(ungrounded.length ? { ungrounded: ungrounded.slice(0, 12) } : {}),
-    ...(valueErrors.length ? { valueErrors: valueErrors.slice(0, 4) } : {})
+    ...(valueErrors.length ? { valueErrors: valueErrors.slice(0, 4) } : {}),
+    ...(whyMissing ? { whyMissing: true } : {})
   }
 }
 
 // The validator the summary pass hands callLlm: strict once (so the repair pass
 // is asked to fix the names), lenient after (so a stubborn model still yields
 // an entry, flagged). `corpus` is what the prompt showed the model.
-export function summaryValidator (fallbackSig, corpus, structured = null) {
+// `requireWhy` gates the cause/purpose clause on that same strict pass; it is
+// set only by the initial summarize ask, so the verifier, the escalation
+// rewrite and PR previews are never charged for it.
+export function summaryValidator (fallbackSig, corpus, structured = null, { requireWhy = false } = {}) {
   let strictLeft = corpus ? 1 : 0
-  return (out) => validateLlmOut(out, fallbackSig, { corpus, structured, onUngrounded: strictLeft-- > 0 ? 'throw' : 'flag' })
+  return (out) => validateLlmOut(out, fallbackSig, { corpus, structured, requireWhy, onUngrounded: strictLeft-- > 0 ? 'throw' : 'flag' })
 }
 
 export function isGatewayError (err) {
@@ -2870,7 +2889,7 @@ export async function summarizeChunked (e, patch, { promptCtx = {}, corpus = '',
     return { index: i, files, ...out }
   }), 2)
   const fuse = buildFusePrompt(e, drafts, promptCtx, buildDiffDigest(redactProductPrompts(patch)))
-  const clean = await callLlm(fuse, env, 1, summaryValidator(sig, corpus, promptCtx.structured || e.structured))
+  const clean = await callLlm(fuse, env, 1, summaryValidator(sig, corpus, promptCtx.structured || e.structured, { requireWhy: true }))
   return { clean, fuse }
 }
 
@@ -2967,7 +2986,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     repairPrompt = reduced.fuse
   } else {
     try {
-      clean = await callLlm(prompt, env, 1, summaryValidator(sig, corpus, promptCtx.structured), { fallbackPrompt, leanPrompt })
+      clean = await callLlm(prompt, env, 1, summaryValidator(sig, corpus, promptCtx.structured, { requireWhy: true }), { fallbackPrompt, leanPrompt })
     } catch (err) {
       // Every rung failed on the routed model. The escalation below already
       // relies on a better model resolving what a repair loop could not, but it
@@ -3103,6 +3122,9 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     ...(prMetaEff?.number ? { pr: prMetaEff.number, ...(prMetaEff.matched === 'files' ? { prMatched: 'files', prConfidence: prMetaEff.confidence } : {}) } : {}),
     ...(clean.ungrounded ? { ungrounded: clean.ungrounded } : {}),
     ...(clean.valueErrors ? { valueErrors: clean.valueErrors } : {}),
+    // The answer still carries no why clause after its one repair: recorded so
+    // the gap is countable in the cache instead of invisible in the text.
+    ...(clean.whyMissing ? { whyMissing: true } : {}),
     ...(verify ? { verify } : {}),
     ...(verify === 'flagged' && verifyClaims?.length ? { verifyClaims } : {}),
     ...(escalated ? { escalated: true } : {}),
@@ -3774,9 +3796,26 @@ export const ELI5_HYPE_RE = /\b(?:we(?:'re| are) excited|seamless(?:ly)?|game[- 
 // builds its own global copy for matchAll.
 export const ELI5_HYPE_ROLLUP_RE = new RegExp(`${ELI5_HYPE_RE.source}|\\b(?:smarter|faster|more (?:capable|powerful|reliable|robust|intelligent)|(?:significantly|dramatically|greatly) (?:improv|enhanc|boost)\\w*|enhanced experience)\\b`, 'i')
 
-// A visible cause clause. Shared by the eval harness and the /stats/ panel so
+// A visible cause OR purpose clause: the reader can see why the change exists,
+// not only what it did. Shared by the eval harness and the /stats/ panel so
 // the two never measure different things.
-export const WHY_RE = /\b(?:because|so that|after [^.]{3,80}\b(?:began|started|failed|returned|broke)|root cause|to prevent|to avoid|to stop|to fix|which caused|caused by|regression|was (?:failing|breaking|leaking)|no longer (?:fails|breaks|leaks))\b/i
+//
+// Shapes, each one an answer to "why?":
+//   cause     because, because of, due to, as a result of, in response to,
+//             prompted by, root cause, regression, caused by/which caused,
+//             after <X> began/failed/broke, was failing/breaking/leaking
+//   purpose   so that / so <subject> can, to prevent|avoid|keep|ensure|...,
+//             prevents/avoids/ensures/protects/guards/blocks, allows/lets/
+//             enables, which lets|allows|prevents...
+//   mechanism therefore, hence, so this
+//
+// The first version counted only the cause shapes and read 6.9% of production
+// summaries (13% of fresh v11 output) -- most summaries state a purpose with
+// "prevents" or "allows" rather than "because", so the metric was measuring
+// vocabulary, not whether a why is visible. Deliberately still NOT counted:
+// bare infinitives ("raised the cap to 500"), "makes X better", and any
+// what-only summary; the test suite pins those negatives.
+export const WHY_RE = /\b(?:because|because\ of|so that|after [^.]{3,80}\b(?:began|started|failed|returned|broke)|root cause|to prevent|to avoid|to stop|to fix|to keep|to make sure|to ensure|to reduce|to protect|to support|to allow|to enable|to simplify|which caused|caused by|regression|was (?:failing|breaking|leaking)|no longer (?:fails|breaks|leaks)|due\ to|owing\ to|as\ a\ result\ of|in\ response\ to|prompted\ by|so\ (?:that\ )?[a-z][\w-]*(?:\ [a-z][\w-]*){0,3}\ (?:can|could|would|will|no\ longer|never|gets?|stays?|keeps?)|which\ (?:lets?|allows?|enables?|prevents?|avoids?|keeps?|reduces)|allow(?:s|ing)?|enable(?:s|ing)?|prevent(?:s|ed|ing)?|avoid(?:s|d|ing)?|ensures?|guarantees?|protects?|guards?|blocks|therefore|hence|so\ this)\b/i
 
 // Cut to the last complete sentence that fits the budget. Scanning backwards
 // means an abbreviation earlier in the text ("3 a.m.") can never win the cut:

@@ -229,6 +229,21 @@ test('rememberClosedPrs keeps review comments and preview paths; diffPaths parse
   assert.equal(doc.prs[0].updated, '2026-09-17T00:00:00Z')
 })
 
+test('why detection counts purpose clauses too, and still rejects what-only prose', () => {
+  // Cause shapes (the original vocabulary).
+  assert.equal(whyVisible('Raised the cap because the trial filled in an hour.'), true)
+  assert.equal(whyVisible('Fixed the timeout due to an upstream deprecation.'), true)
+  // Purpose shapes: most summaries say what a change is FOR without "because".
+  assert.equal(whyVisible('Prevents double-spending by serializing quota resets.'), true)
+  assert.equal(whyVisible('Adds `compactRunState` so hosts can rewind a stored run.'), true)
+  assert.equal(whyVisible('The rename, which lets callers drop the old import.'), true)
+  assert.equal(whyVisible('Moves the check to keep saved picks working.'), true)
+  // Still negative: bare infinitives, praise, and plain what-only prose.
+  assert.equal(whyVisible('Raised the cap to 500.'), false)
+  assert.equal(whyVisible('This makes Freebuff smarter.'), false)
+  assert.equal(whyVisible('Extracted the picker into its own module and renamed the constant.'), false)
+})
+
 test('eval: why detection, must-mention, row scoring, aggregation, judge validation, report', () => {
   assert.equal(whyVisible('Raised the cap because the trial filled in an hour.'), true)
   assert.equal(whyVisible('Raised the cap to 500.'), false)

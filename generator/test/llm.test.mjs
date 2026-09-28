@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, llmCallCount, buildSelfCheckPrompt, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -2266,7 +2266,7 @@ test('a gave-up row gets bounded fresh attempts, then the cache serves it', asyn
   // gave-up, and it must still get its bounded retries (the old code queued
   // it every run and then served the very record it meant to replace).
   const { seen, restore } = answerWith(() => JSON.stringify({
-    title: 'Update the agent list', summary: 'Touches the agent list file.', significance: 'minor'
+    title: 'Update the agent list', summary: 'Touches the agent list file so the picker keeps its saved entries.', significance: 'minor'
   }))
   try {
     await enrichWithLlm([entry], async () => patch, dir, env, { retryErrors: true })
@@ -2319,4 +2319,46 @@ test('self-check: the second read is a focused fact-check, not a re-generation',
   // all, at temperature 0.3.
   assert.doesNotMatch(p, /REPLY_CONTRACT/, 'the summary contract is not re-sent')
   assert.equal(llmCallCount() >= 0, true, 'the call counter this measures with is exported')
+})
+
+test('the WHY gate: one repair names the missing clause, then the row ships flagged', () => {
+  const corpus = 'sdk/src/a.ts\nexport function compactRunState'
+  const whatOnly = { title: 'Run-state compaction added', summary: 'Adds `compactRunState` in sdk/src/a.ts and wires it into the SDK.' }
+
+  // Strict pass: named, so the repair pass has a fixable instruction.
+  const strict = summaryValidator('minor', corpus, null, { requireWhy: true })
+  assert.throws(() => strict(whatOnly), /what changed but not why/)
+  // Second pass: ships, flagged -- never an infinite repair loop over style.
+  const flagged = strict(whatOnly)
+  assert.equal(flagged.whyMissing, true, 'the gap is recorded on the entry')
+  assert.equal(flagged.title, 'Run-state compaction added')
+
+  // Both problems at once cost one repair with one message.
+  const both = summaryValidator('minor', corpus, null, { requireWhy: true })
+  assert.throws(
+    () => both({ title: 'X added', summary: 'Adds `notInTheCorpus` here.' }),
+    /not present in the diff[\s\S]*WHAT changed without WHY/
+  )
+
+  // A summary that says why passes the strict pass untouched.
+  const withWhy = summaryValidator('minor', corpus, null, { requireWhy: true })
+  const out = withWhy({ title: 'Run-state compaction added', summary: 'Adds `compactRunState` in sdk/src/a.ts so hosts can rewind a stored run.' })
+  assert.equal(out.whyMissing, undefined)
+
+  // Only the initial summarize ask opts in: the verifier, the escalation
+  // rewrite and PR previews must not pay for a clause they did not ask for.
+  const plain = summaryValidator('minor', corpus, null)
+  assert.equal(plain(whatOnly).whyMissing, undefined, 'no requireWhy, no gate')
+})
+
+test('buildPrompt demands the why clause, and shows what a what-only row looks like', () => {
+  const entry = {
+    date: '2026-09-13T10:00:00Z', areas: ['CLI'], category: 'CLI', significance: 'minor',
+    stats: { additions: 3, deletions: 1 }, files: { added: [], modified: ['cli/x.ts'] },
+    summary: 'CLI tweak.', title: 'CLI tweak.'
+  }
+  const prompt = buildPrompt(entry, 'diff --git a/cli/x.ts b/cli/x.ts\n+x')
+  assert.match(prompt, /WHY is not optional/, 'the requirement is stated, not implied')
+  assert.match(prompt, /only says what changed is incomplete/)
+  assert.match(prompt, /WHAT-only, rejected/, 'and the negative example is named as one')
 })
