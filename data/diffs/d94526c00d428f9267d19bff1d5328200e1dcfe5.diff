@@ -1,0 +1,415 @@
+diff --git a/common/src/types/contracts/steering.ts b/common/src/types/contracts/steering.ts
+new file mode 100644
+index 000000000..f89233655
+--- /dev/null
++++ b/common/src/types/contracts/steering.ts
+@@ -0,0 +1,11 @@
++import type { ImagePart, TextPart } from '../messages/content-part'
++
++/** A fresh user message delivered at a running agent's next step boundary. */
++export type SteeringMessage =
++  | string
++  | { prompt: string; content?: Array<TextPart | ImagePart> }
++
++/** Async hosts may load attachment bytes before handing the batch to the agent. */
++export type DrainSteeringMessages = () =>
++  | SteeringMessage[]
++  | Promise<SteeringMessage[]>
+diff --git a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+index 0c93a5f73..5e2b7cb57 100644
+--- a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
++++ b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+@@ -1556,50 +1556,86 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+         const socketError = new Error(
+           'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
+         ) as Error & { code: string }
+         socketError.code = 'ECONNRESET'
+         throw socketError
+       }
+ 
+       const result = await loopAgentSteps({
+         ...loopAgentStepsBaseParams,
+         agentType: 'test-agent',
+         localAgentTemplates,
+       })
+ 
+       expect(result.output.type).toBe('error')
+       if (result.output.type === 'error') {
+         expect(result.output.message).toContain('Connection interrupted')
+         expect(result.output.message).not.toContain('Agent run error:')
+         expect(result.output.message).not.toContain(
+           'pass `verbose: true` in the second argument to fetch()',
+         )
+       }
+     })
+   })
+ 
+   describe('steering (drainSteeringMessages)', () => {
++    it('awaits image-bearing steering and sends each message with its own images on the next model call', async () => {
++      const images = [
++        { type: 'image' as const, image: 'Zmlyc3Q=', mediaType: 'image/png' },
++        { type: 'image' as const, image: 'c2Vjb25k', mediaType: 'image/jpeg' },
++      ]
++      const seen: unknown[][] = []
++      let drained = false
++      const result = await loopAgentSteps({
++        ...loopAgentStepsBaseParams,
++        drainSteeringMessages: async () => {
++          await Promise.resolve()
++          if (drained) return []
++          drained = true
++          return ['Text correction', { prompt: 'Compare both images', content: images }, { prompt: '', content: [images[1]] }]
++        },
++        promptAiSdkStream: async function* ({ messages }) {
++          seen.push(structuredClone(messages))
++          yield createToolCallChunk('end_turn', {})
++          return promptSuccess(`step-${seen.length}`)
++        },
++      })
++      const expected = [
++        [{ type: 'text', text: 'Text correction' }],
++        [{ type: 'text', text: 'Compare both images' }, ...images],
++        [images[1]],
++      ]
++      expect(seen).toHaveLength(2)
++      for (const content of expected) {
++        expect(seen[0]).not.toContainEqual(expect.objectContaining({ role: 'user', content }))
++        expect(seen[1]).toContainEqual(expect.objectContaining({ role: 'user', content }))
++        expect(result.agentState.messageHistory).toContainEqual(expect.objectContaining({
++          role: 'user', content, tags: ['USER_PROMPT'], keepDuringTruncation: true,
++        }))
++      }
++    })
++
+     it('appends a steering message at the step boundary and continues the turn', async () => {
+       // The mock LLM ends the turn after one step. A steering message that arrives
+       // during that step should be appended to history and keep the turn going, so
+       // the agent runs a second step that can see (and act on) the new message.
+       const steerText = 'Also rename the variable to fooBar'
+       let drainCalls = 0
+       const drainSteeringMessages = () => {
+         drainCalls++
+         return drainCalls === 1 ? [steerText] : []
+       }
+ 
+       const result = await loopAgentSteps({
+         ...loopAgentStepsBaseParams,
+         agentType: 'test-agent',
+         drainSteeringMessages,
+       })
+ 
+       // Step 1 wanted to end the turn, but the steer kept it going → a 2nd step ran.
+       expect(llmCallCount).toBe(2)
+ 
+       // The steered text landed in history as a user message.
+       const steered = result.agentState.messageHistory.find(
+         (m) =>
+           m.role === 'user' && JSON.stringify(m.content).includes(steerText),
+       )
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 43953b63d..729a0f7ae 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -102,50 +102,51 @@ import type {
+   ContextCompactionData,
+   ModelUsageData,
+   PromptAiSdkFn,
+ } from '@codebuff/common/types/contracts/llm'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+ import type { ParamsExcluding } from '@codebuff/common/types/function-params'
+ import type {
+   Message,
+   ToolMessage,
+ } from '@codebuff/common/types/messages/codebuff-message'
+ import type {
+   TextPart,
+   ImagePart,
+ } from '@codebuff/common/types/messages/content-part'
+ import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+ import type {
+   AgentTemplateType,
+   AgentState,
+   AgentOutput,
+ } from '@codebuff/common/types/session-state'
+ import type {
+   CustomToolDefinitions,
+   ProjectFileContext,
+ } from '@codebuff/common/util/file'
++import type { DrainSteeringMessages } from '@codebuff/common/types/contracts/steering'
+ 
+ // Convert a tool's stored inputSchema into JSON Schema suitable for Anthropic's
+ // count_tokens API. Built-in and MCP tools store a Zod schema here; serializing
+ // it raw ships Zod internals (`def`/`shape`) instead of JSON Schema, so token
+ // counts are computed against garbage and any schema whose top-level isn't an
+ // object (e.g. a union → `anyOf`) arrives without `type`, which the API rejects
+ // with `tools.N.custom.input_schema.type: Field required`. We convert to JSON
+ // Schema and guarantee a top-level `type: 'object'`.
+ export function toTokenCountInputSchema(
+   inputSchema: unknown,
+ ): Record<string, unknown> | undefined {
+   if (inputSchema == null) return undefined
+ 
+   let jsonSchema: Record<string, unknown>
+   if (
+     typeof (inputSchema as { safeParse?: unknown }).safeParse === 'function'
+   ) {
+     try {
+       jsonSchema = z.toJSONSchema(inputSchema as z.ZodType, {
+         io: 'input',
+       }) as Record<string, unknown>
+     } catch {
+       jsonSchema = { type: 'object', properties: {} }
+     }
+   } else if (typeof inputSchema === 'object' && !Array.isArray(inputSchema)) {
+@@ -768,54 +769,54 @@ export const runAgentStep = async (
+  * run (not just at return time). Fields like `messageHistory`, `systemPrompt`,
+  * `toolDefinitions`, `creditsUsed`, and `output` are updated as work progresses
+  * so that callers holding a reference to the same object (e.g. the SDK's
+  * `sessionState.mainAgentState`) see in-progress work immediately — which
+  * matters when an error is thrown mid-run and the normal return path is
+  * skipped.
+  */
+ export async function loopAgentSteps(
+   params: {
+     addAgentStep: AddAgentStepFn
+     agentState: AgentState
+     agentType: string
+     clearUserPromptMessagesAfterResponse?: boolean
+     clientSessionId: string
+     content?: Array<TextPart | ImagePart>
+     costMode?: string
+     fileContext: ProjectFileContext
+     finishAgentRun: FinishAgentRunFn
+     localAgentTemplates: Record<string, AgentTemplate>
+     logger: Logger
+     parentSystemPrompt?: string
+     parentTools?: ToolSet
+     prompt: string | undefined
+     signal: AbortSignal
+     /** Optional steering hook. Drained at each step boundary (after a step's LLM
+-     * call + tools complete, before the next one). Any returned texts are appended
++     * call + tools complete, before the next one). Any returned messages are appended
+      * to the message history as user prompts and keep the turn going, letting a
+      * host "steer" a running agent without aborting or losing the current step. */
+-    drainSteeringMessages?: () => string[]
++    drainSteeringMessages?: DrainSteeringMessages
+     spawnParams: Record<string, any> | undefined
+     startAgentRun: StartAgentRunFn
+     userId: string | undefined
+     userInputId: string
+     agentTemplate?: AgentTemplate
+   } & ParamsExcluding<typeof additionalToolDefinitions, 'agentTemplate'> &
+     ParamsExcluding<
+       typeof runProgrammaticStep,
+       | 'agentState'
+       | 'onCostCalculated'
+       | 'prompt'
+       | 'runId'
+       | 'stepNumber'
+       | 'stepsComplete'
+       | 'system'
+       | 'template'
+       | 'toolCallParams'
+       | 'tools'
+     > &
+     ParamsExcluding<typeof getAgentTemplate, 'agentId'> &
+     ParamsExcluding<
+       typeof getAgentPrompt,
+       | 'agentTemplate'
+       | 'promptType'
+       | 'agentTemplates'
+@@ -1425,65 +1426,66 @@ export async function loopAgentSteps(
+           ...params,
+           agentRunId: newAgentState.runId,
+           stepNumber: totalSteps,
+           credits: newAgentState.directCreditsUsed - creditsBefore,
+           childRunIds: newAgentState.childRunIds.slice(childrenBefore),
+           messageId,
+           status: 'completed',
+           startTime,
+         })
+       } else {
+         logger.error('No runId found for agent state after finishing agent run')
+       }
+ 
+       Object.assign(initialAgentState, newAgentState)
+       currentAgentState = initialAgentState
+       shouldEndTurn = llmShouldEndTurn
+       nResponses = generatedResponses
+ 
+       currentPrompt = undefined
+       currentParams = undefined
+ 
+       // Steering: if the host fed user messages while this step ran, append them
+       // now (the step's LLM call + tools have completed, so history is in a clean
+       // state) and keep the turn going so the agent responds to them next step,
+       // rather than waiting for the whole turn to finish.
+-      const steered = params.drainSteeringMessages?.()
++      const steered = await params.drainSteeringMessages?.()
+       if (steered?.length) {
+-        assertUserContentSize(
+-          steered.map((text) => userMessage(text)),
+-          agentTemplate,
++        const messages = steered.map((message) =>
++          userMessage({
++            content:
++              typeof message === 'string'
++                ? buildUserMessageContent(message, undefined)
++                : buildUserMessageContent(message.prompt, undefined, message.content),
++            tags: ['USER_PROMPT'],
++            keepDuringTruncation: true,
++          }),
+         )
++        assertUserContentSize(messages, agentTemplate)
+         currentAgentState.messageHistory = [
+           ...currentAgentState.messageHistory,
+-          ...steered.map((text) =>
+-            userMessage({
+-              content: buildUserMessageContent(text, undefined, undefined),
+-              tags: ['USER_PROMPT'],
+-              keepDuringTruncation: true,
+-            }),
+-          ),
++          ...messages,
+         ]
+         shouldEndTurn = false
+       }
+     }
+ 
+     const projectProfileReport =
+       offersProjectProfile &&
+       !manualCompaction &&
+       params.getProjectProfile &&
+       params.reportProjectProfile
+         ? runProjectProfileReport({
+             history: dropUnansweredToolCalls(currentAgentState.messageHistory),
+             getProjectProfile: params.getProjectProfile,
+             reportProjectProfile: params.reportProjectProfile,
+             stream: (messages, reportSignal) =>
+               getAgentStreamFromTemplate({
+                 ...params,
+                 agentId: undefined,
+                 template: agentTemplate,
+                 runId,
+                 messages: [systemMessage(system), ...messages],
+                 tools,
+                 toolChoice: 'required',
+                 includeCacheControl: supportsCacheControl(agentTemplate.model),
+                 signal: reportSignal,
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 097e10112..6c319bcf3 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -51,50 +51,51 @@ import type { ComputedProjectIndex } from './run-state'
+ import { changeFile } from './tools/change-file'
+ import { applyPatchTool } from './tools/apply-patch'
+ import { codeSearch } from './tools/code-search'
+ import { glob } from './tools/glob'
+ import { listDirectory } from './tools/list-directory'
+ import { getProjectPathLookupKeys } from './tools/path-utils'
+ import { getFiles, getImageFile } from './tools/read-files'
+ import { readUrl } from './tools/read-url'
+ import { runTerminalCommand } from './tools/run-terminal-command'
+ import type { TerminalCommandBroker } from './tools/run-terminal-command'
+ 
+ import type { CustomToolDefinition } from './custom-tool'
+ import type { RunState } from './run-state'
+ import type { FileFilter } from './tools/read-files'
+ import type { ServerAction } from '@codebuff/common/actions'
+ import type { FileReadWindow } from '@codebuff/common/types/contracts/client'
+ import type { AgentDefinition } from '@codebuff/common/templates/initial-agents-dir/types/agent-definition'
+ import type { ToolName } from '@codebuff/common/tools/constants'
+ import type { PublishedClientToolName } from '@codebuff/common/tools/list'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type {
+   AgentUsageData,
+   ContextCompactionData,
+ } from '@codebuff/common/types/contracts/llm'
+ import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
++import type { DrainSteeringMessages } from '@codebuff/common/types/contracts/steering'
+ import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
+ import type {
+   Message,
+   ToolMessage,
+ } from '@codebuff/common/types/messages/codebuff-message'
+ import type { ToolResultOutput } from '@codebuff/common/types/messages/content-part'
+ import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+ import type { SessionState } from '@codebuff/common/types/session-state'
+ import type { SkillsMap } from '@codebuff/common/types/skill'
+ import type { Source } from '@codebuff/common/types/source'
+ import type { CodebuffSpawn } from '@codebuff/common/types/spawn'
+ 
+ /**
+  * Client-side replacements for the tools the SDK would otherwise execute
+  * itself, keyed by tool name. `read_files` is EXCLUDED from the mapped half
+  * and declared on its own because its signature differs: it answers a map of
+  * path to content rather than a tool-result array. As an intersection with the
+  * mapped half it was unsatisfiable — an implementation had to be assignable to
+  * both signatures at once — which is why callers cast to `never`.
+  */
+ export type OverrideToolHandlers = {
+   [K in Exclude<PublishedClientToolName, 'read_files'>]?: (
+     input: any,
+   ) => Promise<ToolResultOutput[]>
+ } & {
+@@ -234,55 +235,56 @@ export type ImageContent = {
+ 
+ export type TextContent = {
+   type: 'text'
+   text: string
+ }
+ 
+ export type MessageContent = TextContent | ImageContent
+ 
+ export type RunOptions = {
+   agent: string | AgentDefinition
+   prompt: string
+   /** End user represented by this run. Trusted service accounts may use this
+    *  to run on behalf of a signed-in user; ordinary API keys cannot delegate. */
+   userId?: string
+   /** Content array for multimodal messages (text + images) */
+   content?: MessageContent[]
+   params?: Record<string, any>
+   previousRun?: RunState
+   /** Explicitly resume this history on the selected inference source. Hosts must
+    * only enable this for a user-selected connection, never as an error fallback.
+    * The returned state and checkpoints pin the new source for subsequent runs. */
+   allowInferenceSourceChange?: boolean
+   extraToolResults?: ToolMessage[]
+   signal?: AbortSignal
+   /** Optional steering hook. Drained at each agent step boundary during the run;
+-   * any returned texts are appended to the conversation as user prompts (and keep
++   * any returned messages are appended to the conversation as user prompts (and keep
+    * the turn going) before the next LLM call. Lets a host inject messages into a
+    * running agent without aborting — i.e. "steer" it, as opposed to queuing a new
+-   * prompt for after the turn finishes. */
+-  drainSteeringMessages?: () => string[]
++   * prompt for after the turn finishes. Supports plain strings or { prompt, content }
++   * messages with images, and async attachment loading. */
++  drainSteeringMessages?: DrainSteeringMessages
+   costMode?: string
+   /** Extra key/values merged into each LLM request's `codebuff_metadata`.
+    *  Used by hosts (e.g. the CLI) to forward client-scoped identifiers like
+    *  `freebuff_instance_id` that server-side gates read from the request body. */
+   extraCodebuffMetadata?: Record<string, string>
+   /** Optional checkpoint hook. Called once when the run starts and then
+    * periodically while it is in flight, with a RunState snapshot that
+    * preserves all progress so far (the user's prompt plus any completed
+    * agent steps, ending with an interruption note). Hosts can persist these
+    * snapshots so that a killed process (closed terminal, crash) does not
+    * lose the in-flight turn. The final resolved RunState supersedes any
+    * snapshot; no snapshots are emitted after the run settles. */
+   onStateSnapshot?: (runState: RunState) => void
+   /** Provider-reported usage for each root-agent model request. */
+   onUsage?: (usage: AgentUsageData) => void
+   /** A model request ended before an exact provider usage receipt arrived. */
+   onUsageIncomplete?: () => void
+   /** Successful model-generated compaction, including the exact saved summary. */
+   onCompaction?: (data: ContextCompactionData) => void
+   /**
+    * The shell this run's terminal commands actually execute in, when the host's
+    * broker picks one other than the default (the sponsored Windows floor runs
+    * Windows PowerShell 5.1). Reported to the model as `systemInfo.shell`, so it
+    * writes commands for the shell that will run them. Unset keeps the default.
+    */
