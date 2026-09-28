@@ -164,6 +164,25 @@ export function clearShowCache () { SHOW_CACHE.clear() }
  * Extract leading module-level documentation comments or headers from touched files.
  * Provides ground-truth architectural purpose directly to the LLM to prevent hallucinations.
  */
+// Statements allowed above a module's doc comment: imports and the framework
+// directives that precede them. `'use client'` is a Next.js directive and this
+// repo has several.
+// `[^;]*\bfrom\b` was the first attempt and it missed the re-export block,
+// which this repo writes as `export {` with its members on the following lines:
+// the line has no `from` on it, so the whole file's header was skipped again.
+// What matters is not `from` but that the line opens a *statement*, so the test
+// is on the shape of the opener and the brace depth does the rest.
+const LEADING_TOLERATED_RE = /^(?:import\b|export\s*(?:\{|\*)|const\s+[^=]+=\s*require\(|["']use (?:client|server|strict)["'];?$)/
+
+const braceDelta = (line) => {
+  let d = 0
+  for (const ch of line) {
+    if (ch === '{') d++
+    else if (ch === '}') d--
+  }
+  return d
+}
+
 export async function extractFileHeaders (repoDir, ref, files, maxFiles = 12, maxLinesPerFile = 60) {
   if (!repoDir || !ref || !files || !files.length) return []
   const targets = files
@@ -185,10 +204,25 @@ export async function extractFileHeaders (repoDir, ref, files, maxFiles = 12, ma
       const commentLines = []
       let inBlock = false
       let seenComment = false
+      // A leading import was tolerated, but only a single-line one, and this is
+      // where the section died: the loop hit the first continuation line of
+      // `import {` (something like `  addDaysToYmd,`), matched no branch, and
+      // broke. Multi-line imports are the norm here, so the "ground-truth
+      // documentation" section came back empty for 19 of 20 sampled rows -- the
+      // model was told to ground itself in documentation it was never given.
+      //
+      // Brace depth is what makes the statement skippable: a line that opens
+      // more braces than it closes leaves the statement open, and it is done
+      // when the depth returns to zero.
+      let importDepth = 0
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i]
         const trimmed = line.trim()
         if (i === 0 && trimmed.startsWith('#!')) continue
+        if (importDepth > 0) {
+          importDepth += braceDelta(line)
+          continue
+        }
         if (!inBlock && (trimmed.startsWith('/**') || trimmed.startsWith('/*'))) {
           inBlock = true
           seenComment = true
@@ -205,9 +239,10 @@ export async function extractFileHeaders (repoDir, ref, files, maxFiles = 12, ma
           commentLines.push(line)
         } else if (trimmed === '') {
           if (seenComment) commentLines.push(line)
-        } else if (!seenComment && (trimmed.startsWith('import ') || trimmed.startsWith('} from ') || trimmed.startsWith('export *') || /^const .+ = require\(/.test(trimmed))) {
-          // Allow leading imports before top comment block
-          continue
+        } else if (!seenComment && LEADING_TOLERATED_RE.test(trimmed)) {
+          // Imports and directives may sit above the header; the header itself
+          // ends the scan.
+          importDepth = braceDelta(line)
         } else {
           break
         }
@@ -273,8 +308,20 @@ export function findFileHistory (entries, targetEntry, maxEntries = 20) {
  * For small/focused modules (<= 250 lines), injects the complete source file.
  * For larger modules (> 250 lines), extracts the public exported interface outline.
  */
-export async function extractFullOrOutlinedFiles (repoDir, ref, files, maxLines = 700, maxFiles = 8) {
+export async function extractFullOrOutlinedFiles (repoDir, ref, files, maxLines = 700, maxFiles = 8, { budget = 0 } = {}) {
   if (!repoDir || !ref || !files || !files.length) return { fullFiles: [], exportOutlines: [] }
+  // `budget` is the char allowance for whole files, derived from the free window
+  // by the caller. Zero keeps the old line-count-only behaviour for any caller
+  // that does not pass one.
+  //
+  // With a budget, the rule stops being "under 700 lines" and becomes "does it
+  // fit": a 1,200-line module sent whole is the difference between a summary
+  // that describes the module and one that describes its export list, and the
+  // old rule demoted it to a 60-line outline purely because of its size. A file
+  // taking more than half the budget still gets the outline, so one enormous
+  // file cannot own the whole section.
+  const wholeFileCap = budget > 0 ? Math.max(20000, Math.round(budget / 2)) : 0
+  let fullUsed = 0
   const targets = files
     .map(f => (typeof f === 'string' ? f : f?.path || ''))
     .filter(p => p && /\.(?:ts|tsx|js|mjs|cjs|py|go|rs|md)$/i.test(p) && !/(?:test|spec|__tests__)/i.test(p))
@@ -288,8 +335,11 @@ export async function extractFullOrOutlinedFiles (repoDir, ref, files, maxLines 
       const content = await showCached(repoDir, ref, path)
       if (!content) continue
       const lines = content.split('\n')
-      if (lines.length <= maxLines) {
+      const byLineCount = lines.length <= maxLines
+      const byBudget = budget > 0 && fullUsed + content.length <= budget && content.length <= wholeFileCap
+      if (byLineCount || byBudget) {
         fullFiles.push({ path, content: content.trim(), lines: lines.length })
+        fullUsed += content.length
       } else {
         const exports = lines
           .filter(l => /^\s*export\s+(const|function|type|interface|class|enum|let|var|async\s+function|default)\s+/.test(l))
@@ -303,6 +353,136 @@ export async function extractFullOrOutlinedFiles (repoDir, ref, files, maxLines 
     }
   }
   return { fullFiles, exportOutlines }
+}
+
+// ---------------------------------------------------------------------------
+// Who reads what the change introduced.
+//
+// This is the gap the prompt's own rules point at. It tells the model to state
+// why a change happened "if grounded" and never to invent a consumer, and its
+// output contract has a `confidence` field that is "low when the change is mostly
+// configuration whose consumer is not visible". That is a description of the
+// evidence being missing: a new constant with no reader in the prompt is exactly
+// the case the model is forbidden to resolve, and it is the most common shape in
+// this changelog (a constants edit with no wiring in the same commit).
+//
+// Measured across 25 rows: the median row has 6 other files referencing the
+// symbols it adds, about 59,681 chars of them, and 23 of the 25 rows have at
+// least one. The window has ~840,000 chars free.
+//
+// Everything here is read at the same revision as the change, so a reference is
+// a fact about that snapshot and not about today.
+const SYMBOL_STOP = new Set(['function', 'constructor', 'undefined', 'exports', 'require', 'process', 'console', 'string', 'number', 'boolean', 'object', 'promise', 'window', 'document', 'return', 'default'])
+
+// Names a change INTRODUCES outrank names a change merely mentions. A first
+// attempt took every long word on an added line and produced `import`,
+// `content`, `existing` -- the language's own vocabulary, which then matched
+// everything and named nothing. A definition is the change's own noun.
+const DEFINITION_RES = [
+  /(?:export\s+)?(?:declare\s+)?(?:const|let|var|function|class|interface|type|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)/g,
+  /\b([A-Z][A-Z0-9_]{4,})\b/g
+]
+
+export function introducedSymbols (patch, { max = 6, min = 6 } = {}) {
+  const scores = new Map()
+  const bump = (name, weight) => {
+    if (!name || name.length < min || SYMBOL_STOP.has(name.toLowerCase())) return
+    scores.set(name, (scores.get(name) || 0) + weight)
+  }
+  for (const m of String(patch || '').matchAll(/^\+(?!\+\+)[^\n]*$/gm)) {
+    const line = m[0].slice(1)
+    if (/^\s*(?:\/\/|\*)/.test(line)) continue
+    const defined = new Set()
+    for (const re of DEFINITION_RES) for (const d of line.matchAll(re)) defined.add(d[1])
+    for (const name of defined) bump(name, 3)
+    for (const id of line.matchAll(/\b([A-Za-z_$][A-Za-z0-9_$]*)\b/g)) bump(id[1], 1)
+  }
+  // Then by mention count: a name the change repeats is the one it is about.
+  return [...scores.entries()]
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+    .slice(0, max)
+    .map(([name]) => name)
+}
+
+/**
+ * Keep the candidates that name this change, and drop the ones that name the
+ * language. Document frequency is the test, and it is measured rather than
+ * guessed at with a stoplist that would need a new entry every time someone
+ * wrote `handleClick`.
+ */
+export async function distinctiveSymbols (repoDir, ref, candidates, { maxRefFiles = 25 } = {}) {
+  const probes = await Promise.all(candidates.map(async (sym) => {
+    const out = await git(['grep', '-l', '-w', sym, ref, '--', '*.ts', '*.tsx', '*.js', '*.mjs'], repoDir, { allowFail: true })
+    return { sym, files: String(out || '').split('\n').filter(Boolean) }
+  }))
+  return probes.filter(p => p.files.length > 0 && p.files.length <= maxRefFiles).map(p => p.sym)
+}
+
+// A few lines around each match, with an elision marker between gaps. Raw
+// source, because the model is told to copy identifiers character for character
+// and a reformatted excerpt is a place for a silent transcription error.
+function excerptAround (lines, lineNos, contextLines) {
+  const spans = []
+  for (const n of [...lineNos].sort((a, b) => a - b).slice(0, 3)) {
+    const start = Math.max(0, n - 1 - contextLines)
+    const end = Math.min(lines.length, n + contextLines)
+    if (spans.length && start <= spans[spans.length - 1].end) spans[spans.length - 1].end = end
+    else spans.push({ start, end })
+  }
+  if (!spans.length) return ''
+  return spans.map(s => lines.slice(s.start, s.end).join('\n').trim()).filter(Boolean).join('\n…\n')
+}
+
+/**
+ * Files that already read the symbols this change introduces, with the lines
+ * that do it. The answer to "what consumes this", which the prompt currently
+ * tells the model not to guess at.
+ */
+export async function extractConsumerContext (repoDir, ref, patch, changedFiles = [], {
+  maxSymbols = 6, maxFiles = 6, maxChars = 60000, contextLines = 12, maxRefFiles = 25
+} = {}) {
+  if (!repoDir || !ref) return []
+  const candidates = introducedSymbols(patch, { max: maxSymbols * 2 })
+  if (!candidates.length) return []
+  // Rarity first: a symbol living in three files names this change, one living
+  // in four hundred is a word the language uses. Measured against the revision,
+  // so it needs no hand-maintained stoplist.
+  const symbols = await distinctiveSymbols(repoDir, ref, candidates, { maxRefFiles: maxRefFiles })
+  if (!symbols.length) return []
+  const changed = new Set(changedFiles.map(p => (typeof p === 'string' ? p : p?.path || '')))
+  const out = await git(
+    ['grep', '-n', '-w', '-E', symbols.join('|'), ref, '--', '*.ts', '*.tsx', '*.js', '*.mjs'],
+    repoDir,
+    { allowFail: true }
+  )
+  const byPath = new Map()
+  for (const row of String(out || '').split('\n')) {
+    if (!row) continue
+    const parts = row.split(':')
+    if (parts.length < 4) continue
+    const lineNo = Number(parts[parts.length - 2])
+    const path = parts.slice(1, parts.length - 2).join(':')
+    if (!path || !Number.isFinite(lineNo) || changed.has(path)) continue
+    // A file that mentions the symbol once in a comment is weaker evidence than
+    // one that uses it throughout, so the count decides the ranking.
+    if (!byPath.has(path)) byPath.set(path, { path, lines: new Set() })
+    byPath.get(path).lines.add(lineNo)
+  }
+  const ranked = [...byPath.values()]
+    .sort((a, b) => b.lines.size - a.lines.size || (a.path < b.path ? -1 : 1))
+    .slice(0, maxFiles)
+  const consumers = []
+  let used = 0
+  for (const c of ranked) {
+    const body = await showCached(repoDir, ref, c.path)
+    if (!body) continue
+    const excerpt = excerptAround(body.split('\n'), c.lines, contextLines)
+    if (!excerpt) continue
+    if (used + excerpt.length > maxChars) break
+    used += excerpt.length
+    consumers.push({ path: c.path, references: c.lines.size, excerpt })
+  }
+  return consumers
 }
 
 /**

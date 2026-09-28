@@ -37,6 +37,7 @@ import {
   findFileHistory,
   extractFullOrOutlinedFiles,
   extractSubsystemDocs,
+  extractConsumerContext,
   isBumpEntry,
   versionTrackOf,
   VERSION_TRACKS,
@@ -217,6 +218,29 @@ export const LLM_CONTEXT_TOKENS = Number(process.env.CHANGELOG_LLM_CONTEXT_TOKEN
 // 3.2 against the 3.6 measured: a prompt that fits at 3.2 fits at 3.6.
 export const LLM_CHARS_PER_TOKEN = Number(process.env.CHANGELOG_LLM_CHARS_PER_TOKEN || 3.2)
 export const LLM_CONTEXT_CHARS = Math.floor(LLM_CONTEXT_TOKENS * LLM_CHARS_PER_TOKEN)
+// The window is prompt AND answer, and only the prompt was being counted.
+//
+// Nothing sets `max_tokens` on the request, so the completion length is the
+// gateway's business, and the ceiling above is the whole window: a prompt that
+// reached it would leave the answer no room at all. That has not bitten yet,
+// because measured prompts stay far below it (before the evidence sections were
+// widened, a median prompt was 26,287 chars of 864,000 and the largest 261,019;
+// after, the median is 43,431 and the largest 263,107), but the arithmetic still
+// said the prompt may take the entire window, and the code's own comment says an
+// overflow "fails the request outright". Reserving the answer's room makes the
+// ceiling the truth.
+//
+// Deliberately a reservation, not a `max_tokens`: bounding generation would
+// start truncating multi-topic summaries to fix a problem that reservation
+// solves without touching what the model may say.
+export const LLM_OUTPUT_TOKENS = Number(process.env.CHANGELOG_LLM_OUTPUT_TOKENS || 8000)
+export const LLM_OUTPUT_RESERVE_CHARS = Math.ceil(LLM_OUTPUT_TOKENS * LLM_CHARS_PER_TOKEN)
+export const LLM_PROMPT_CHARS = Math.max(0, LLM_CONTEXT_CHARS - LLM_OUTPUT_RESERVE_CHARS)
+// Measured on real rows: the rules, architecture map, domain lexicon, output
+// contract and worked examples come to 9,083 chars with no context sections and
+// 15,619 with them. Used to work out how much of the window the *evidence* may
+// have, since the preamble is paid before any of it.
+export const PROMPT_PREAMBLE_CHARS = 16000
 // A floor so a row whose context sections alone fill the window still sends
 // real diff hunks: a cut diff grounds a row, an absent one leaves nothing to
 // ground it against.
@@ -226,7 +250,7 @@ const TRUNC_NOTICE = '\n…[diff truncated: the context window filled up; full d
 // What is left for the diff once the rest of the prompt is paid for, honoring
 // an operator cap where one is set (CHANGELOG_LLM_MAX_DIFF_BYTES and friends).
 export function diffRoom (fixedChars, cap = Infinity) {
-  const room = Math.max(LLM_MIN_DIFF_ROOM, LLM_CONTEXT_CHARS - fixedChars)
+  const room = Math.max(LLM_MIN_DIFF_ROOM, LLM_PROMPT_CHARS - fixedChars)
   return Math.max(2000, Math.min(Number.isFinite(cap) && cap > 0 ? cap : Infinity, room))
 }
 
@@ -246,7 +270,47 @@ export const CONTEXT_SECTION_CHARS = {
   exportOutlines: 50000,
   fileHeaders: 50000,
   subsystemDocs: 25000,
-  fileHistory: 30000
+  fileHistory: 30000,
+  consumers: 120000
+}
+
+// How the evidence room is divided, as shares of what is actually free.
+//
+// The table above is now the FLOOR, not the ceiling. Measured before this
+// change, the fixed table was the whole story and the story was that the window
+// went unused: a median prompt was 26,287 chars of 864,000, so the context
+// sections together claimed 355,000 chars, used about 2,800 of it, and the
+// remaining ~800,000 was thrown away on every single row. Caps that are
+// absolutes cannot notice that.
+//
+// `fullFiles` takes half because a whole module is the single best answer to
+// "what does this code mean"; consumers take a fifth because the prompt's own
+// anti-extrapolation rule exists to stop the model guessing who reads a new
+// constant, and the references are the answer it is forbidden to guess.
+export const CONTEXT_BUDGET_SHARES = {
+  fullFiles: 0.5,
+  consumers: 0.2,
+  exportOutlines: 0.08,
+  fileHeaders: 0.08,
+  subsystemDocs: 0.07,
+  fileHistory: 0.07
+}
+
+/**
+ * What each evidence section may take, given this row's diff.
+ *
+ * The diff is subtracted first because the prompt is assembled context-first
+ * and the diff gets the remainder: reserving the patch here is what stops a
+ * wider context budget from eating the ground truth it is there to explain.
+ */
+export function contextBudgets (patchChars = 0) {
+  const patch = Math.min(Number(patchChars) || 0, LLM_PROMPT_CHARS / 2)
+  const free = Math.max(0, LLM_PROMPT_CHARS - PROMPT_PREAMBLE_CHARS - patch)
+  const out = {}
+  for (const [key, share] of Object.entries(CONTEXT_BUDGET_SHARES)) {
+    out[key] = Math.max(CONTEXT_SECTION_CHARS[key] || 0, Math.round(free * share))
+  }
+  return out
 }
 
 // Keep whole entries, in the order given, up to a section's share. Dropping a
@@ -268,7 +332,7 @@ export function capSection (items, key, sizeOf, { limit = CONTEXT_SECTION_CHARS[
 // which is what makes this harmless: if a context section ever outgrows its
 // share, what gets cut is diff hunks, and a row with a cut diff is far better
 // off than a request the window rejects.
-export function fitToWindow (prompt, limit = LLM_CONTEXT_CHARS) {
+export function fitToWindow (prompt, limit = LLM_PROMPT_CHARS) {
   if (prompt.length <= limit) return prompt
   log(`prompt of ${prompt.length} chars exceeds the ${limit}-char context window; trimming the diff tail`)
   return prompt.slice(0, Math.max(0, limit - TRUNC_NOTICE.length)) + TRUNC_NOTICE
@@ -330,9 +394,21 @@ export function chunkPatchGroups (patch, { targetBytes = MAP_REDUCE_CHUNK_BYTES,
   return chunks.map(group => group.map(f => f.text).join(''))
 }
 
+// Derived from the window, so the lossy path engages only when the diff truly
+// cannot go whole. The 400 KB constant predates the window arithmetic: measured,
+// no stored diff has ever reached it (the largest is 249,775 chars, and 0 of
+// 7,866 live rows trigger chunking), so the fuse path is exercised by unit tests
+// and never by production data. The constant stays as a floor, so this can only
+// ever send more whole and chunk less, never the reverse.
+export function mapReduceThreshold (env = process.env) {
+  const configured = Number(env.CHANGELOG_LLM_MAPREDUCE_THRESHOLD)
+  if (configured > 0) return configured
+  return Math.max(MAP_REDUCE_THRESHOLD_BYTES, LLM_PROMPT_CHARS - PROMPT_PREAMBLE_CHARS - 40000)
+}
+
 export function needsChunking (entry, patch, env = process.env) {
   if (env.CHANGELOG_LLM_MAPREDUCE === '0') return false
-  return String(patch || '').length > (Number(env.CHANGELOG_LLM_MAPREDUCE_THRESHOLD) || MAP_REDUCE_THRESHOLD_BYTES)
+  return String(patch || '').length > mapReduceThreshold(env)
 }
 
 // A snapshot that touches several areas or many files is several changes; one
@@ -470,6 +546,87 @@ export function strippedPatchOf (patch) {
   return bodyLines >= 3 ? stripped : null
 }
 
+// The source-context sections, rendered once and used by every prompt that
+// carries evidence.
+//
+// The fuse prompt used to render only the file headers, so the path taken by the
+// largest diffs -- the ones that engage map-reduce -- saw the drafts and the
+// headers but none of the modules they came from, which made the lossy path
+// lossier than the design intended for no reason beyond where the code lived.
+// One renderer means a section added for one prompt exists for both.
+function contextSectionLines (ctx) {
+  const lines = []
+  if (ctx.fileHeaders && ctx.fileHeaders.length) {
+    lines.push('Module & File Purpose (ground-truth documentation from touched files):')
+    for (const h of ctx.fileHeaders) {
+      lines.push(`- File \`${h.path}\`:`)
+      lines.push('```')
+      lines.push(h.header)
+      lines.push('```')
+    }
+  }
+  if (ctx.subsystemDocs && ctx.subsystemDocs.length) {
+    lines.push('Subsystem Architecture Documentation (from nearby package guides):')
+    for (const d of ctx.subsystemDocs) {
+      lines.push(`- From \`${d.path}\`:`)
+      lines.push('```markdown')
+      lines.push(d.content)
+      lines.push('```')
+    }
+  }
+  if (ctx.fileHistory && ctx.fileHistory.length) {
+    lines.push('Recent commit lineage for touched files (the last changes to these files):')
+    for (const h of ctx.fileHistory) {
+      lines.push(`- [${h.sha}] (${h.date}) touched ${h.overlap.join(', ')}: ${h.title}`)
+      if (h.summary) lines.push(`  Context: ${truncateWords(h.summary, 250)}`)
+    }
+  }
+  if (ctx.exportOutlines && ctx.exportOutlines.length) {
+    lines.push('Exported Interface & Symbol Outline (public contract for larger touched files):')
+    for (const o of ctx.exportOutlines) {
+      lines.push(`- File \`${o.path}\` (${o.totalLines} lines):`)
+      lines.push('```')
+      lines.push(o.outline)
+      lines.push('```')
+    }
+  }
+  if (ctx.fullFiles && ctx.fullFiles.length) {
+    lines.push('Complete Source of Modified Files (for complete module context):')
+    for (const f of ctx.fullFiles) {
+      lines.push(`- File \`${f.path}\` (${f.lines} lines):`)
+      lines.push('```')
+      lines.push(f.content)
+      lines.push('```')
+    }
+  }
+  // The consumer the rest of the prompt forbids guessing at. When this section
+  // is present the model can name who reads a new constant; when it is absent, a
+  // blank `unknowns` and `confidence: low` are the honest answers, and this is
+  // the section that decides which of the two it is.
+  if (ctx.consumers && ctx.consumers.length) {
+    lines.push('Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):')
+    for (const c of ctx.consumers) {
+      lines.push(`- File \`${c.path}\` (${c.references} matching line${c.references === 1 ? '' : 's'}):`)
+      lines.push('```')
+      lines.push(c.excerpt)
+      lines.push('```')
+    }
+  }
+  // Test hunks are omitted from the diff on purpose, which is right for a diff
+  // and was wrong for the prompt: an assertion is the most precise available
+  // statement of what a change is supposed to do.
+  if (ctx.changedTests && ctx.changedTests.length) {
+    lines.push('Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):')
+    for (const t of ctx.changedTests) {
+      lines.push(`- File \`${t.path}\`${t.titles.length ? `: ${t.titles.map(s => `"${s}"`).join('; ')}` : ''}`)
+      lines.push('```')
+      lines.push(t.added)
+      lines.push('```')
+    }
+  }
+  return lines
+}
+
 export function buildPrompt (entry, patch, ctx = {}) {
   const nature = entry.commitNature || commitNatureOf(entry)
   const multi = isMultiTopic(entry)
@@ -571,49 +728,7 @@ export function buildPrompt (entry, patch, ctx = {}) {
   if (facts.length) lines.push(`Key facts (ground the WHY and DETAIL sentences in these): ${facts.map(f => `- ${f}`).join(' ')}`)
   const structured = ctx.structured || entry.structured
   if (hasStructuredFacts(structured)) lines.push(...formatStructuredFacts(structured))
-  if (ctx.fileHeaders && ctx.fileHeaders.length) {
-    lines.push('Module & File Purpose (ground-truth documentation from touched files):')
-    for (const h of ctx.fileHeaders) {
-      lines.push(`- File \`${h.path}\`:`)
-      lines.push('```')
-      lines.push(h.header)
-      lines.push('```')
-    }
-  }
-  if (ctx.subsystemDocs && ctx.subsystemDocs.length) {
-    lines.push('Subsystem Architecture Documentation (from nearby package guides):')
-    for (const d of ctx.subsystemDocs) {
-      lines.push(`- From \`${d.path}\`:`)
-      lines.push('```markdown')
-      lines.push(d.content)
-      lines.push('```')
-    }
-  }
-  if (ctx.fileHistory && ctx.fileHistory.length) {
-    lines.push('Recent commit lineage for touched files (the last changes to these files):')
-    for (const h of ctx.fileHistory) {
-      lines.push(`- [${h.sha}] (${h.date}) touched ${h.overlap.join(', ')}: ${h.title}`)
-      if (h.summary) lines.push(`  Context: ${truncateWords(h.summary, 250)}`)
-    }
-  }
-  if (ctx.exportOutlines && ctx.exportOutlines.length) {
-    lines.push('Exported Interface & Symbol Outline (public contract for larger touched files):')
-    for (const o of ctx.exportOutlines) {
-      lines.push(`- File \`${o.path}\` (${o.totalLines} lines):`)
-      lines.push('```')
-      lines.push(o.outline)
-      lines.push('```')
-    }
-  }
-  if (ctx.fullFiles && ctx.fullFiles.length) {
-    lines.push('Complete Source of Modified Files (for complete module context):')
-    for (const f of ctx.fullFiles) {
-      lines.push(`- File \`${f.path}\` (${f.lines} lines):`)
-      lines.push('```')
-      lines.push(f.content)
-      lines.push('```')
-    }
-  }
+  lines.push(...contextSectionLines(ctx))
   // The diff is taken last, out of what the window has left. A fixed cap had to
   // be guessed low enough for the largest row, which is really a cap on every
   // row; this way an ordinary 3 KB diff goes out whole and a 600 KB one still
@@ -672,6 +787,41 @@ export function buildDiffDigest (patch, { maxBytes = 12000, sampleLines = 4, sam
 // structured facts do ride along though: a chunk reader that cannot tell an
 // advertiser constant from a developer quota mislabels the audience, and the
 // fuse cannot re-verify prose that was wrong on arrival.
+// The tests a commit changed, kept as evidence rather than dropped.
+//
+// The stored diff omits test hunks on purpose, which is right for a diff and was
+// wrong for the prompt: the assertion a change adds is the most precise
+// statement of what the change is supposed to do, and it is the one thing that
+// cannot be inferred from the source hunk beside it. Measured over 25 rows: 4
+// changed tests, about 5,320 chars per affected row, against a window with
+// roughly 840,000 chars free.
+//
+// Added lines only. A removed test says what stopped mattering, which is a
+// weaker claim than what now must hold, and it is the half that invites a
+// summary to narrate a deletion as a feature.
+export function extractChangedTests (patch, { maxFiles = 4, maxChars = 8000 } = {}) {
+  const out = []
+  let used = 0
+  for (const f of splitPatchByFile(patch)) {
+    if (!/(?:^|\/)(?:__tests__|tests?)\/|\.(?:test|spec)\.[jt]sx?$/.test(f.path)) continue
+    const added = f.text.split('\n')
+      .filter(l => l.startsWith('+') && !l.startsWith('+++'))
+      .map(l => l.slice(1))
+      .filter(l => l.trim())
+    if (!added.length) continue
+    const titles = added
+      .filter(l => /\b(?:it|test|describe)\s*\(/.test(l))
+      .map(l => (l.match(/['"`]([^'"`]{4,140})['"`]/) || [])[1])
+      .filter(Boolean)
+      .slice(0, 8)
+    const body = added.join('\n').slice(0, Math.max(400, Math.round(maxChars / maxFiles)))
+    if (used + body.length > maxChars) break
+    used += body.length
+    out.push({ path: f.path, titles, added: body })
+  }
+  return out
+}
+
 export function buildChunkPrompt (entry, chunkPatch, { index = 0, total = 1, files = [], structured = null } = {}) {
   return [
     `You summarize part ${index + 1} of ${total} of a large Freebuff commit diff for Freebuff, a free AI coding agent. Your reader is a TECHNICAL user.`,
@@ -763,15 +913,9 @@ export function buildFusePrompt (entry, drafts, ctx = {}, digest = '') {
   if (facts.length) lines.push(`Key facts: ${facts.map(f => `- ${f}`).join(' ')}`)
   const structured = ctx.structured || entry.structured
   if (hasStructuredFacts(structured)) lines.push(...formatStructuredFacts(structured))
-  if (ctx.fileHeaders && ctx.fileHeaders.length) {
-    lines.push('Module & File Purpose (ground-truth documentation from touched files):')
-    for (const h of ctx.fileHeaders) {
-      lines.push(`- File \`${h.path}\`:`)
-      lines.push('```')
-      lines.push(h.header)
-      lines.push('```')
-    }
-  }
+  // The same evidence the single-prompt path gets. Chunking exists to make a
+  // huge diff digestible, not to withhold the module it changed.
+  lines.push(...contextSectionLines(ctx))
   lines.push('', 'Per-chunk drafts (untrusted notes; verify every name against the lists above):')
   for (const d of drafts) {
     lines.push(`--- Chunk ${(d.index ?? 0) + 1}/${drafts.length} (files: ${(d.files || []).join(', ') || '-'})`)
@@ -1167,6 +1311,10 @@ export function groundingCorpus (entry, patch, ctx = {}) {
   for (const o of ctx.exportOutlines || []) parts.push(o.path, o.outline)
   for (const s of ctx.fullFiles || []) parts.push(s.path, s.content)
   for (const h of ctx.fileHistory || []) parts.push(...(h.overlap || []), h.title || '', h.summary || '')
+  // Every section the prompt shows has to be checkable here, or a name copied
+  // faithfully out of the consumer or test evidence is reported as invented.
+  for (const c of ctx.consumers || []) parts.push(c.path, c.excerpt)
+  for (const t of ctx.changedTests || []) parts.push(t.path, t.added, ...(t.titles || []))
   // Whatever the prompt shows must be checkable: the sequence and lineage
   // blocks are in the prompt (the model is told to ground itself in them), so
   // a name copied faithfully from a sibling's title is not "invented".
@@ -2093,15 +2241,25 @@ export async function gatherEntryContext (e, patch, { repoDir = null, entries = 
   const freshFacts = extractStructuredFacts(fullPatch || patch)
   if (factCount(freshFacts) > factCount(structured)) structured = freshFacts
   structured = await pruneKnownInputs(repoDir, e.prevSha || null, structured)
-  const out = { tier, structured, fileHeaders: [], fileHistory: [], subsystemDocs: [], fullFiles: [], exportOutlines: [] }
+  const out = { tier, structured, fileHeaders: [], fileHistory: [], subsystemDocs: [], fullFiles: [], exportOutlines: [], consumers: [], changedTests: [] }
+  // The evidence room is worked out from what the window actually has left,
+  // against this row's diff. The fixed table that used to sit here claimed
+  // 355,000 chars and the measured median use was about 2,800, because a cap
+  // that cannot see the free room cannot spend it.
+  const budgets = contextBudgets(String(patch || '').length)
+  const capped = (items, key, sizeOf) => capSection(items, key, sizeOf, { limit: budgets[key] })
   if (entries) {
-    out.fileHistory = capSection(findFileHistory(entries, e, FILE_HISTORY_MAX), 'fileHistory',
+    out.fileHistory = capped(findFileHistory(entries, e, FILE_HISTORY_MAX), 'fileHistory',
       h => `${h.title || ''}${h.summary || ''}${(h.overlap || []).join(' ')}`.length)
   }
+  // Tests this commit changed, from the full stored diff: the assertions are the
+  // clearest statement of what the change is supposed to do, and they were being
+  // dropped from the prompt along with every other test hunk.
+  out.changedTests = extractChangedTests(fullPatch || patch)
   if (!repoDir || !files.length) return out
-  out.fileHeaders = capSection(await extractFileHeaders(repoDir, e.sha, files, FILE_HEADER_MAX_FILES), 'fileHeaders',
+  out.fileHeaders = capped(await extractFileHeaders(repoDir, e.sha, files, FILE_HEADER_MAX_FILES), 'fileHeaders',
     h => String(h.header || '').length)
-  out.subsystemDocs = capSection(await extractSubsystemDocs(repoDir, e.sha, files, SUBSYSTEM_DOC_MAX), 'subsystemDocs',
+  out.subsystemDocs = capped(await extractSubsystemDocs(repoDir, e.sha, files, SUBSYSTEM_DOC_MAX), 'subsystemDocs',
     d => String(d.content || '').length)
   if (withSource) {
     // The small tier used to stop here, on the reasoning that a one-line
@@ -2109,10 +2267,14 @@ export async function gatherEntryContext (e, patch, { repoDir = null, entries = 
     // diff is one line, so the file is the *only* thing that says what the
     // constant controls and who reads it. It gets a smaller share, not none.
     const res = tier === 'small'
-      ? await extractFullOrOutlinedFiles(repoDir, e.sha, files, 400, 4)
-      : await extractFullOrOutlinedFiles(repoDir, e.sha, files, FULL_FILE_MAX_LINES, FULL_FILE_MAX_FILES)
-    out.fullFiles = capSection(res.fullFiles, 'fullFiles', f => String(f.content || '').length)
-    out.exportOutlines = capSection(res.exportOutlines, 'exportOutlines', o => String(o.outline || '').length)
+      ? await extractFullOrOutlinedFiles(repoDir, e.sha, files, 400, 4, { budget: budgets.fullFiles })
+      : await extractFullOrOutlinedFiles(repoDir, e.sha, files, FULL_FILE_MAX_LINES, FULL_FILE_MAX_FILES, { budget: budgets.fullFiles })
+    out.fullFiles = capped(res.fullFiles, 'fullFiles', f => String(f.content || '').length)
+    out.exportOutlines = capped(res.exportOutlines, 'exportOutlines', o => String(o.outline || '').length)
+    // Gathered for the small tier too, and especially for it: a bare constant
+    // edit with no reader in the diff is the exact case the prompt's own
+    // `unknowns` and `confidence: low` fields exist for.
+    out.consumers = await extractConsumerContext(repoDir, e.sha, fullPatch || patch, files, { maxChars: budgets.consumers })
   }
   return out
 }
@@ -2245,7 +2407,9 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     fileHistory: context.fileHistory,
     subsystemDocs: context.subsystemDocs,
     fullFiles: context.fullFiles,
-    exportOutlines: context.exportOutlines
+    exportOutlines: context.exportOutlines,
+    consumers: context.consumers,
+    changedTests: context.changedTests
   }
   const prompt = buildPrompt(e, patch, promptCtx)
   const corpus = groundingCorpus(e, patch, promptCtx)
@@ -3272,7 +3436,9 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     // names a function honestly from the module it was shown gets parked as an
     // invented identifier.
     exportOutlines: context.exportOutlines,
-    fullFiles: context.fullFiles
+    fullFiles: context.fullFiles,
+    consumers: context.consumers,
+    changedTests: context.changedTests
   })
   const promptCtx = {
     patch,
@@ -3288,7 +3454,9 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     fileHistory: context.fileHistory,
     subsystemDocs: context.subsystemDocs,
     exportOutlines: context.exportOutlines,
-    fullFiles: context.fullFiles
+    fullFiles: context.fullFiles,
+    consumers: context.consumers,
+    changedTests: context.changedTests
   }
   // Shorter ask for a gateway that answers the full one with a refusal or
   // prose (see stripDiffComments). The grounding corpus above keeps the whole

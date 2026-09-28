@@ -9,7 +9,8 @@ import {
   extractCommentFacts, extractCleanDiff, extractRawDiff, extractFileHeaders, EMPTY_TREE, parseMarkdownTables, catalogFromReadme,
   diffCatalogs, commitNatureOf, analyzeCommunityCommit, analyzeSyncCommit,
   MONOREPO_COMPONENTS, formatArchitectureMap, discoverMonorepoArchitecture,
-  findFileHistory, extractFullOrOutlinedFiles, extractSubsystemDocs
+  findFileHistory, extractFullOrOutlinedFiles, extractSubsystemDocs,
+  extractConsumerContext, introducedSymbols, distinctiveSymbols
 } from '../lib/analyze.mjs'
 import { toUtc, ymd } from '../lib/util.mjs'
 
@@ -683,6 +684,223 @@ test('extractSubsystemDocs: locates nearest parent README.md guide', async (t) =
   assert.equal(docs[0].path, 'packages/auth/README.md')
   assert.ok(docs[0].content.includes('# Auth Subsystem'))
   assert.ok(docs[0].content.includes('Provides JWT issuance'))
+})
+
+// The header scan used to tolerate a leading import only when the whole
+// statement sat on one line. Multi-line imports are the norm here (`import {`,
+// members, `} from '...'`), and a continuation line matched no branch of the
+// scan, so it broke before reaching the doc comment. Against a 12-file ceiling
+// the section came back empty for 19 of 20 sampled production rows -- the model
+// was told to ground itself in documentation it never received. A re-export
+// block (`export {`) is the same shape and was missed for the same reason.
+test('extractFileHeaders: multi-line imports and re-export blocks do not abort the scan', async (t) => {
+  const { mkdtemp, rm, mkdir, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { execFileSync } = await import('node:child_process')
+
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-hdr-leading-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const g = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' })
+  g('init', '-q')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+
+  await mkdir(join(dir, 'common', 'src'), { recursive: true })
+  // The regression: a doc comment that only becomes reachable if the import is
+  // skipped by brace depth rather than by a one-line regex.
+  await writeFile(join(dir, 'common', 'src', 'windows.ts'), [
+    'import {',
+    '  addDaysToYmd,',
+    '  ymd',
+    "} from './dates.js'",
+    '',
+    '/**',
+    ' * Scheduling helpers for campaign windows.',
+    ' * Bounds the review period an advertiser can request.',
+    ' */',
+    'export function planWindow() {}'
+  ].join('\n'))
+
+  // Same shape, different keyword: the re-export block the first fix missed.
+  await writeFile(join(dir, 'common', 'src', 'index.ts'), [
+    'export {',
+    '  planWindow',
+    "} from './windows.js'",
+    '',
+    '/**',
+    ' * Public entrypoints for campaign scheduling.',
+    ' */',
+    'export const SCHEDULE_API_VERSION = 1'
+  ].join('\n'))
+
+  // Only statements that open an import may be skipped: arbitrary leading code
+  // is not a license to keep looking, so this header must stay out.
+  await writeFile(join(dir, 'common', 'src', 'late.ts'), [
+    'const LOCAL_STATE = new Map()',
+    '',
+    '/** Documented far below real code. */',
+    'export const LATE = 1'
+  ].join('\n'))
+
+  g('add', '.')
+  g('commit', '-q', '-m', 'feat: scheduling helpers')
+
+  const headers = await extractFileHeaders(dir, 'HEAD', [
+    'common/src/windows.ts',
+    'common/src/index.ts',
+    'common/src/late.ts'
+  ])
+
+  const windows = headers.find(h => h.path === 'common/src/windows.ts')
+  assert.ok(windows, 'the doc comment below a multi-line import must be found')
+  assert.ok(windows.header.includes('Scheduling helpers for campaign windows'))
+  assert.ok(!windows.header.includes('addDaysToYmd'), 'import members are not the header')
+
+  const index = headers.find(h => h.path === 'common/src/index.ts')
+  assert.ok(index, 'the doc comment below a re-export block must be found')
+  assert.ok(index.header.includes('Public entrypoints for campaign scheduling'))
+
+  assert.equal(headers.find(h => h.path === 'common/src/late.ts'), undefined,
+    'leading code still ends the scan: only imports are skipped')
+})
+
+// The consumer section needs the change's own nouns, not the language's. A first
+// cut took every long word on an added line and surfaced `import`, `content`,
+// `existing` -- names that match every file and so identify none.
+test('introducedSymbols: definitions outrank mentions, and language vocabulary is dropped', () => {
+  const patch = [
+    "+import { addDaysToYmd } from './dates.js'",
+    '+export function computeScore(x: number): number {',
+    '+  const bounded = Math.max(0, x)',
+    '+  return addDaysToYmd(bounded) + computeScore(1)',
+    '+}',
+    '+// call computeScore again from the caller'
+  ].join('\n')
+  const syms = introducedSymbols(patch)
+
+  assert.ok(syms.includes('computeScore'), 'a definition the change owns must survive')
+  assert.ok(syms.indexOf('computeScore') < syms.indexOf('addDaysToYmd'),
+    'a defined name outranks a merely imported one')
+  assert.ok(!syms.includes('function'))
+  assert.ok(!syms.includes('return'))
+  assert.ok(!syms.includes('const'), 'short names never qualify')
+  assert.ok(syms.length <= 6, 'per-entry candidate budget is respected')
+})
+
+// Document frequency is the filter, and it is measured at the revision under
+// review rather than maintained as a stoplist that needs a new entry every time
+// somebody writes `handleClick`. 30 reference files means "the language", one
+// means "this change".
+test('distinctiveSymbols: keeps rare names and drops ones the codebase uses everywhere', async (t) => {
+  const { mkdtemp, rm, mkdir, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { execFileSync } = await import('node:child_process')
+
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-distinctive-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const g = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' })
+  g('init', '-q')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+
+  await mkdir(join(dir, 'packages', 'rare', 'src'), { recursive: true })
+  await writeFile(join(dir, 'packages', 'rare', 'src', 'rare.ts'),
+    'export const RARE_SYMBOL_THING = 1\nexport const COMMON_SYMBOL_NAME = 2\n')
+  for (let i = 0; i < 30; i++) {
+    await mkdir(join(dir, 'packages', 'common', 'src'), { recursive: true })
+    await writeFile(join(dir, 'packages', 'common', 'src', `f${i}.ts`), `export const use${i} = COMMON_SYMBOL_NAME\n`)
+  }
+  g('add', '.')
+  g('commit', '-q', '-m', 'feat: widely used constant plus a rare one')
+
+  const kept = await distinctiveSymbols(dir, 'HEAD', ['RARE_SYMBOL_THING', 'COMMON_SYMBOL_NAME'])
+  assert.deepEqual(kept, ['RARE_SYMBOL_THING'],
+    'a name in 30 files is the language; a name in one file is the change')
+  assert.deepEqual(await distinctiveSymbols(dir, 'HEAD', ['NOTHING_DEFINES_ME']), [])
+})
+
+// The prompt tells the model never to invent a consumer, and its `confidence`
+// field is defined as low "when the change is mostly configuration whose consumer
+// is not visible". That is a description of missing evidence, and it is the most
+// common shape in this changelog. The median row has six other files reading the
+// symbols it adds; this is how they reach the prompt.
+test('extractConsumerContext: returns readers with excerpts and excludes changed files', async (t) => {
+  const { mkdtemp, rm, mkdir, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { execFileSync } = await import('node:child_process')
+
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-consumers-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const g = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' })
+  g('init', '-q')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+
+  await mkdir(join(dir, 'src'), { recursive: true })
+  await writeFile(join(dir, 'src', 'consts.ts'), 'export const WIDGET_LIMIT = 5\n')
+  await writeFile(join(dir, 'src', 'consumer.ts'), [
+    "import { WIDGET_LIMIT } from './consts.js'",
+    '',
+    'export function overLimit(n: number): boolean {',
+    '  return n > WIDGET_LIMIT',
+    '}'
+  ].join('\n'))
+  g('add', '.')
+  g('commit', '-q', '-m', 'feat: widget cap')
+
+  const patch = '+export const WIDGET_LIMIT = 5\n'
+  const consumers = await extractConsumerContext(dir, 'HEAD', patch, ['src/consts.ts'])
+  assert.equal(consumers.length, 1)
+  assert.equal(consumers[0].path, 'src/consumer.ts')
+  assert.ok(consumers[0].references >= 1)
+  assert.ok(consumers[0].excerpt.includes('WIDGET_LIMIT'))
+
+  // The file that made the change is not its own consumer.
+  const selfOnly = await extractConsumerContext(dir, 'HEAD', patch, ['src/consts.ts', 'src/consumer.ts'])
+  assert.deepEqual(selfOnly, [])
+})
+
+// `budget` is the char allowance derived from the free window. Zero (the default)
+// keeps the line-count rule that every other caller relies on; a budget turns it
+// into "does the file fit", so a 1,200-line module can be sent whole instead of
+// being demoted to its export list purely for its size.
+test('extractFullOrOutlinedFiles: a budget sends oversized files whole without changing the default', async (t) => {
+  const { mkdtemp, rm, mkdir, writeFile } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { execFileSync } = await import('node:child_process')
+
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-full-outline-budget-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const g = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' })
+  g('init', '-q')
+  g('config', 'user.email', 't@example.com')
+  g('config', 'user.name', 'Test')
+
+  await mkdir(join(dir, 'common', 'src'), { recursive: true })
+  const lines = [
+    'export const DEFAULT_BUDGET = 500;',
+    'export function computeScore(x: number): number {',
+    '  return x * 2;',
+    '}',
+    ...Array.from({ length: 800 }, (_, i) => `const internalVar${i} = ${i};`)
+  ]
+  const source = lines.join('\n')
+  await writeFile(join(dir, 'common', 'src', 'large.ts'), source)
+  g('add', '.')
+  g('commit', '-q', '-m', 'feat: large module')
+
+  const withoutBudget = await extractFullOrOutlinedFiles(dir, 'HEAD', ['common/src/large.ts'])
+  assert.equal(withoutBudget.fullFiles.length, 0, 'no budget keeps the line-count rule')
+  assert.equal(withoutBudget.exportOutlines.length, 1)
+
+  const withBudget = await extractFullOrOutlinedFiles(dir, 'HEAD', ['common/src/large.ts'], 700, 8, { budget: 100000 })
+  assert.equal(withBudget.exportOutlines.length, 0)
+  assert.equal(withBudget.fullFiles.length, 1)
+  assert.equal(withBudget.fullFiles[0].content, source)
 })
 
 

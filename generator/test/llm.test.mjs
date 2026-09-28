@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -1464,6 +1464,86 @@ test('buildPrompt & buildEli5Prompt: formats fileHistory, fullFiles, exportOutli
   assert.ok(eli5Prompt.includes('Subsystem guide: common/src/ads/README.md: # Ads Subsystem'))
 })
 
+// The prompt's own rules forbid inventing a consumer and define `confidence: low`
+// as "the change is mostly configuration whose consumer is not visible" -- a
+// description of evidence the prompt never carried. A new constant with no
+// reader had no honest answer available, and a bare constant edit is the most
+// common shape in this changelog.
+test('buildPrompt: the consumer and changed-test sections reach the model, and are absent when empty', () => {
+  const entry = {
+    sha: 'a'.repeat(40),
+    date: '2026-09-18T00:00:00Z',
+    category: 'Common',
+    files: { modified: ['common/src/ads/campaigns.ts'] }
+  }
+  const patch = '+export const PLACEMENT_DAILY_CAP_DEFAULT_CENTS = 10000;'
+  const consumers = [{
+    path: 'common/src/ads/pricing.ts',
+    references: 3,
+    excerpt: 'if (cap > PLACEMENT_DAILY_CAP_DEFAULT_CENTS) cap = PLACEMENT_DAILY_CAP_DEFAULT_CENTS'
+  }]
+  const changedTests = [{
+    path: 'common/src/ads/campaigns.test.ts',
+    titles: ['caps the budget at ten thousand'],
+    added: 'expect(cap(999999)).toBe(10000)'
+  }]
+
+  const prompt = buildPrompt(entry, patch, { consumers, changedTests })
+  assert.ok(prompt.includes('Where the symbols this change introduces are used elsewhere'))
+  assert.ok(prompt.includes('File `common/src/ads/pricing.ts` (3 matching lines):'))
+  assert.ok(prompt.includes('PLACEMENT_DAILY_CAP_DEFAULT_CENTS'))
+  assert.ok(prompt.includes('Tests this commit changed'))
+  assert.ok(prompt.includes('File `common/src/ads/campaigns.test.ts`: "caps the budget at ten thousand"'))
+  assert.ok(prompt.includes('expect(cap(999999)).toBe(10000)'))
+
+  // A row with neither gets neither section: an empty header is a claim of
+  // evidence that is not there.
+  const bare = buildPrompt(entry, patch)
+  assert.ok(!bare.includes('Where the symbols this change introduces'))
+  assert.ok(!bare.includes('Tests this commit changed'))
+
+  // The fuse path renders the same evidence. Chunking exists to make a huge
+  // diff digestible; it used to withhold the module that diff changed.
+  const fuse = buildFusePrompt(entry, [{ index: 0, files: ['common/src/ads/campaigns.ts'], evidence: 'adds the cap', summary: 's' }], {
+    consumers,
+    changedTests,
+    fullFiles: [{ path: 'common/src/ads/campaigns.ts', lines: 3, content: 'export const PLACEMENT_DAILY_CAP_DEFAULT_CENTS = 10000;' }]
+  })
+  assert.ok(fuse.includes('Where the symbols this change introduces are used elsewhere'))
+  assert.ok(fuse.includes('Tests this commit changed'))
+  assert.ok(fuse.includes('Complete Source of Modified Files'))
+})
+
+// The diff handed to the model has test hunks stripped, which is right for a
+// diff and was wrong for the prompt: an assertion is the most precise available
+// statement of what a change is supposed to do, and 5,320 chars of them per
+// affected row were being thrown away.
+test('extractChangedTests: recovers test hunks and titles, never source hunks', () => {
+  const patch = [
+    'diff --git a/common/src/ads/campaigns.test.ts b/common/src/ads/campaigns.test.ts',
+    '@@ -1,3 +1,5 @@',
+    " import { cap } from './campaigns.js'",
+    "+describe('daily cap', () => {",
+    "+  it('caps the budget at ten thousand', () => {",
+    '+    expect(cap(999999)).toBe(10000)',
+    '+  })',
+    '+})',
+    'diff --git a/common/src/ads/campaigns.ts b/common/src/ads/campaigns.ts',
+    '@@ -1,2 +1,2 @@',
+    '-export const PLACEMENT_DAILY_CAP_DEFAULT_CENTS = 2500;',
+    '+export const PLACEMENT_DAILY_CAP_DEFAULT_CENTS = 10000;'
+  ].join('\n')
+  const tests = extractChangedTests(patch)
+  assert.equal(tests.length, 1)
+  assert.equal(tests[0].path, 'common/src/ads/campaigns.test.ts')
+  assert.deepEqual(tests[0].titles, ['daily cap', 'caps the budget at ten thousand'])
+  assert.ok(tests[0].added.includes('expect(cap(999999)).toBe(10000)'))
+  assert.ok(!tests[0].added.includes('PLACEMENT_DAILY_CAP_DEFAULT_CENTS'),
+    'a source hunk is not a test')
+
+  assert.deepEqual(extractChangedTests('diff --git a/x.ts b/x.ts\n+const x = 1\n'), [])
+})
+
 test('normalizeEli5: rejects no-action packaging boilerplate on roll-up rows', () => {
   const boilerplate1 = 'The developer tool was quietly updated to a new packaged version, which simply bundles together a collection of improvements that were already rolled out to users throughout the day - nothing breaks, nothing changes how you call it, and no action is required on your part.'
   assert.throws(() => normalizeEli5(boilerplate1, ELI5_ROLLUP_MAX_CHARS), /no-action packaging boilerplate/)
@@ -1514,18 +1594,51 @@ test('the context window is sized from the measured chars/token, not a guess', (
 
 test('diffRoom: the diff gets what the rest of the prompt leaves, and never less than the floor', () => {
   // A small prompt leaves room for everything.
-  assert.equal(diffRoom(9000), LLM_CONTEXT_CHARS - 9000)
+  assert.equal(diffRoom(9000), LLM_PROMPT_CHARS - 9000)
   // An operator cap still wins, so the knob keeps working.
   assert.equal(diffRoom(9000, 50000), 50000)
   // A prompt that has eaten the window still sends real hunks: a cut diff
   // grounds a row, an absent one leaves nothing to ground it against.
   assert.equal(diffRoom(LLM_CONTEXT_CHARS * 2), LLM_MIN_DIFF_ROOM)
   // A nonsense cap is ignored rather than silently zeroing the diff.
-  assert.equal(diffRoom(9000, 0), LLM_CONTEXT_CHARS - 9000)
-  assert.equal(diffRoom(9000, -5), LLM_CONTEXT_CHARS - 9000)
+  assert.equal(diffRoom(9000, 0), LLM_PROMPT_CHARS - 9000)
+  assert.equal(diffRoom(9000, -5), LLM_PROMPT_CHARS - 9000)
   // A generated file may not eat the whole room alone.
   assert.ok(perFileRoom(LLM_CONTEXT_CHARS) * 3 >= LLM_CONTEXT_CHARS - 1)
   assert.ok(perFileRoom(30000) >= 20000)
+})
+
+test('the window is prompt AND answer: the answer\u2019s room is reserved before the prompt is built', () => {
+  // Nothing sets max_tokens, so the completion length is the gateway's business
+  // and the ceiling used to be the whole window: a prompt that reached it left
+  // the answer no room at all. Reserving the room is what makes the arithmetic
+  // say what it claims.
+  assert.ok(LLM_OUTPUT_RESERVE_CHARS > 0)
+  assert.equal(LLM_PROMPT_CHARS, LLM_CONTEXT_CHARS - LLM_OUTPUT_RESERVE_CHARS)
+  assert.ok(LLM_PROMPT_CHARS < LLM_CONTEXT_CHARS, 'the prompt may never take the entire window')
+  assert.ok(LLM_PROMPT_CHARS > LLM_CONTEXT_CHARS * 0.9, 'and the reservation stays a slice, not a partition')
+  // fitToWindow defaults to the reserved ceiling, so every prompt honours it.
+  const huge = fitToWindow('x'.repeat(LLM_CONTEXT_CHARS + 10))
+  assert.ok(huge.length <= LLM_PROMPT_CHARS, 'and no builder can opt out by forgetting the limit')
+})
+
+test('contextBudgets: the evidence room comes from the free window, not a fixed table', () => {
+  // Measured before the evidence sections were widened, the fixed table was the
+  // whole story and the window went unused: a median prompt was 26,287 chars of
+  // 864,000, and the sections claimed 355,000 while using about 2,800. Caps that
+  // are absolutes cannot notice that, so the table is now the floor and the rest
+  // is a share of what is actually free.
+  const small = contextBudgets(3000)
+  const big = contextBudgets(300000)
+  for (const key of Object.keys(CONTEXT_BUDGET_SHARES)) {
+    assert.ok(small[key] >= CONTEXT_SECTION_CHARS[key], `${key} never falls below the old fixed ceiling`)
+    assert.ok(small[key] > CONTEXT_SECTION_CHARS[key], `${key} grows with the free window`)
+  }
+  // A bigger diff leaves less for context: the ground truth is paid first.
+  assert.ok(big.fullFiles < small.fullFiles)
+  // Whole files get half of it, because a module is the best answer to "what
+  // does this code mean".
+  assert.ok(small.fullFiles > small.consumers)
 })
 
 test('fitToWindow: trims the tail only when over, and only the tail', () => {

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import {
   splitPatchByFile, chunkPatchGroups, needsChunking,
   buildChunkPrompt, validateChunkOut, buildFusePrompt, summarizeChunked,
-  MAP_REDUCE_THRESHOLD_BYTES, MAP_REDUCE_CHUNK_BYTES, MAP_REDUCE_MAX_CHUNKS,
+  MAP_REDUCE_THRESHOLD_BYTES, MAP_REDUCE_CHUNK_BYTES, MAP_REDUCE_MAX_CHUNKS, mapReduceThreshold,
   LLM_CONTEXT_CHARS,
   shouldVerify, validateVerifyOut, buildVerifyPrompt,
   ungroundedIdentifiers, validateGroundedEli5, backtickedProse, validateLlmOut,
@@ -38,14 +38,22 @@ test('splitPatchByFile + chunkPatchGroups: groups by file, caps giants, bounds c
 })
 
 test('needsChunking: threshold with opt-out', () => {
-  assert.equal(needsChunking({}, 'x'.repeat(MAP_REDUCE_THRESHOLD_BYTES + 1), {}), true)
+  const threshold = mapReduceThreshold({})
+  assert.equal(needsChunking({}, 'x'.repeat(threshold + 1), {}), true)
   assert.equal(needsChunking({}, 'small', {}), false)
-  assert.equal(needsChunking({}, 'x'.repeat(MAP_REDUCE_THRESHOLD_BYTES + 1), { CHANGELOG_LLM_MAPREDUCE: '0' }), false)
+  assert.equal(needsChunking({}, 'x'.repeat(threshold + 1), { CHANGELOG_LLM_MAPREDUCE: '0' }), false)
+  // An explicit operator threshold still wins, so the knob keeps working.
+  assert.equal(mapReduceThreshold({ CHANGELOG_LLM_MAPREDUCE_THRESHOLD: '1000' }), 1000)
   // Chunking is the lossy path -- the fuse writes the entry from drafts, so a
   // draft's misreading survives into the result. It therefore stays above every
-  // stored diff (they cap at 600 KB but the largest ever written was 250 KB),
-  // and one chunk has to fit the window on its own.
-  assert.ok(MAP_REDUCE_THRESHOLD_BYTES > 250000, 'chunking stays dormant for any stored diff')
+  // stored diff (the largest ever written was 249,775 chars), and one chunk has
+  // to fit the window on its own.
+  assert.ok(threshold > 250000, 'chunking stays dormant for any stored diff')
+  // Derived from the window rather than the old fixed constant: a diff that fits
+  // the prompt whole is sent whole, and the constant survives only as a floor so
+  // this can never chunk MORE than it used to.
+  assert.ok(threshold >= MAP_REDUCE_THRESHOLD_BYTES, 'the floor holds')
+  assert.ok(threshold > MAP_REDUCE_THRESHOLD_BYTES, 'and the window, not the constant, is now the limit')
   assert.ok(MAP_REDUCE_CHUNK_BYTES < LLM_CONTEXT_CHARS, 'a single map call fits the context window')
   assert.ok(MAP_REDUCE_MAX_CHUNKS >= 4, 'a huge diff is still covered, in a bounded number of map calls')
 })
