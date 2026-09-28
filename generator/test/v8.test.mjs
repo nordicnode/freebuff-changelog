@@ -30,8 +30,14 @@ test('ungroundedIdentifiers: flags names absent from the corpus, tolerates paths
 
 test('groundingCorpus: includes files, facts, catalog rows, PR text and source context', () => {
   const e = { files: { added: ['a/b.ts'], modified: ['c.ts'], renamed: [{ from: 'x', to: 'y' }] }, facts: ['A fact.'], modelChanges: { added: ['GPT-9'], tables: { 'GPT-9': { after: ['GPT-9', 'Full access'] } } } }
-  const c = groundingCorpus(e, 'diff text', { prMeta: { title: 'PR title', body: 'PR body' }, fileHeaders: [{ path: 'h.ts', header: '// header' }], fullFiles: [{ path: 'f.ts', content: 'const inFull = 1' }] })
+  const c = groundingCorpus(e, 'diff text', { prMeta: { number: 1259, title: 'PR title', body: 'PR body' }, fileHeaders: [{ path: 'h.ts', header: '// header' }], fullFiles: [{ path: 'f.ts', content: 'const inFull = 1' }] })
   for (const s of ['a/b.ts', 'c.ts', 'y', 'A fact.', 'GPT-9', 'Full access', 'PR body', 'header', 'inFull', 'diff text']) assert.ok(c.includes(s), s)
+  // The prompt prints "Related PR #1259"; a summary citing 1259 copies its
+  // own prompt, so the number must ground or the numeric check reports the
+  // model's faithful copy as invented (ba9141ce, 2026-09-28).
+  assert.ok(c.includes('1259'), 'PR number grounds')
+  const withPr = groundingCorpus({ files: {} }, 'diff', { prMeta: { number: 1259, title: 'T' } })
+  assert.deepEqual(ungroundedIdentifiers('Ships in PR 1259.', withPr), [], 'PR number in prose is grounded')
 })
 
 test('validateLlmOut: audience normalized, grounding throws once then flags', () => {

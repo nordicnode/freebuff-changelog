@@ -1766,7 +1766,11 @@ export function groundingCorpus (entry, patch, ctx = {}) {
   }
   if (entry?.cmdChanges) parts.push(...(entry.cmdChanges.added || []), ...(entry.cmdChanges.removed || []))
   if (ctx.prMeta) {
-    parts.push(ctx.prMeta.title || '', ctx.prMeta.body || '')
+    // The number too: the prompt prints "Related PR #1259" (and the evidence
+    // line prints "PR #1259"), so a summary that faithfully cites 1259 is
+    // grounded -- without the digit string in the corpus the numeric check
+    // reported the model's own prompt copy as invented (ba9141ce, 2026-09-28).
+    parts.push(String(ctx.prMeta.number ?? ''), ctx.prMeta.title || '', ctx.prMeta.body || '')
     for (const c of ctx.prMeta.comments || []) parts.push(c.body || '', c.path || '')
   }
   parts.push(structuredFactsText(ctx.structured || entry?.structured))
