@@ -1771,7 +1771,10 @@ export function groundingCorpus (entry, patch, ctx = {}) {
     // grounded -- without the digit string in the corpus the numeric check
     // reported the model's own prompt copy as invented (ba9141ce, 2026-09-28).
     parts.push(String(ctx.prMeta.number ?? ''), ctx.prMeta.title || '', ctx.prMeta.body || '')
-    for (const c of ctx.prMeta.comments || []) parts.push(c.body || '', c.path || '')
+    // The review lines print `@login on path:line`, so a summary crediting a
+    // reviewer by the name the prompt showed is copying its own prompt: the
+    // login grounds the same way the number does.
+    for (const c of ctx.prMeta.comments || []) parts.push(c.author || '', c.body || '', c.path || '')
   }
   parts.push(structuredFactsText(ctx.structured || entry?.structured))
   if (ctx.glossary) parts.push(ctx.glossary)
@@ -1779,7 +1782,12 @@ export function groundingCorpus (entry, patch, ctx = {}) {
   for (const d of ctx.subsystemDocs || []) parts.push(d.path, d.content)
   for (const o of ctx.exportOutlines || []) parts.push(o.path, o.outline)
   for (const s of ctx.fullFiles || []) parts.push(s.path, s.content)
-  for (const h of ctx.fileHistory || []) parts.push(...(h.overlap || []), h.title || '', h.summary || '')
+  for (const h of ctx.fileHistory || []) {
+    // The lineage lines print `[sha] (date) touched ...: title` -- a summary
+    // citing the sha or the date is copying its own prompt, and the day digits
+    // run through the numeric arm.
+    parts.push(String(h.sha || ''), String(h.date || ''), ...(h.overlap || []), h.title || '', h.summary || '')
+  }
   // Every section the prompt shows has to be checkable here, or a name copied
   // faithfully out of the consumer or test evidence is reported as invented.
   for (const c of ctx.consumers || []) parts.push(c.path, c.excerpt)
@@ -1788,7 +1796,13 @@ export function groundingCorpus (entry, patch, ctx = {}) {
   // blocks are in the prompt (the model is told to ground itself in them), so
   // a name copied faithfully from a sibling's title is not "invented".
   if (ctx.sequence) {
-    for (const s of [...(ctx.sequence.earlier || []), ...(ctx.sequence.later || [])]) parts.push(s.title || '', s.summary || '')
+    // Short shas too: the sequence lines print `[9046203]` for every sibling
+    // and for the row itself, so a summary citing one is copying the prompt.
+    // Only the 8-char form the prompt shows is pushed, as its own token (a
+    // prefix of the full sha would fail the whole-token match); longer forms
+    // stay ungrounded on purpose -- the model was never shown those digits.
+    for (const s of [...(ctx.sequence.earlier || []), ...(ctx.sequence.later || [])]) parts.push(String(s.sha || '').slice(0, 8), s.title || '', s.summary || '', s.category || '')
+    parts.push(String(entry?.sha || '').slice(0, 8))
   }
   // The release window enters the corpus minus its [caution] lines: the
   // prompt instructs the model to hedge or omit those, so waiving their

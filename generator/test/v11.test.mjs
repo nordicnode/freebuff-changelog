@@ -120,15 +120,31 @@ test('buildFusePrompt: the digest lands after the drafts and never smuggles a ra
 })
 
 test('groundingCorpus: everything the prompt shows is checkable, caution lines are not', () => {
-  const corpus = groundingCorpus({ files: {} }, 'patch text', {
-    sequence: { earlier: [{ title: 'Wires the OFF_PEAK_GATE', summary: 'Reads siblingConst.' }], later: [] },
-    fileHistory: [{ sha: 'abcd1234', overlap: ['a.ts'], title: 'Introduced RETRY_BUDGET', summary: 'Sets retry policy.' }],
-    releaseCtx: '- 2026-09-10 Real item: verified work.\n- 2026-09-11 Cautioned item [caution: review flagged its claims]: cites INVENTED_NAME.'
+  const corpus = groundingCorpus({ sha: 'cafe0000aaaa1111bbbb2222cccc3333dddd4444', files: {} }, 'patch text', {
+    sequence: { earlier: [{ sha: '90462035aaaa', title: 'Wires the OFF_PEAK_GATE', summary: 'Reads siblingConst.' }], later: [] },
+    fileHistory: [{ sha: 'abcd1234ffff9999eeee8888dddd7777cccc6666', date: '2026-09-14', overlap: ['a.ts'], title: 'Introduced RETRY_BUDGET', summary: 'Sets retry policy.' }],
+    releaseCtx: '- 2026-09-10 Real item: verified work.\n- 2026-09-11 Cautioned item [caution: review flagged its claims]: cites INVENTED_NAME.',
+    prMeta: { number: 7, title: 'T', comments: [{ author: 'reviewerLogin', body: 'Looks right.', path: 'a.ts' }] }
   })
   assert.match(corpus, /OFF_PEAK_GATE/, 'a name copied from a sibling title is not invented')
   assert.match(corpus, /RETRY_BUDGET/, 'lineage titles ground too')
+  assert.match(corpus, /abcd1234ffff9999/, 'the lineage lines print the full sha, so it grounds')
+  assert.match(corpus, /2026-09-14/, 'and the date they print beside it')
   assert.match(corpus, /Real item/)
   assert.doesNotMatch(corpus, /INVENTED_NAME/, 'a caution-marked line cannot launder its names into the corpus')
+  // The sequence lines print `[9046203]` and the review lines print `@login`:
+  // citing either is a faithful copy of the prompt (ba9141ce's class), so the
+  // corpus has to vouch for every form the prompt shows.
+  assert.match(corpus, /90462035/, 'a sibling short sha grounds')
+  assert.match(corpus, /cafe0000/, "the row's own short sha grounds")
+  assert.match(corpus, /reviewerLogin/, 'a review author grounds')
+  // Bare digit runs are claims checked against the corpus (a sibling sha in
+  // brackets is exactly that), and a camelCase login leaks through the prose
+  // name arm; both were flagged as inventions before the corpus learned them.
+  assert.deepEqual(ungroundedIdentifiers('Follows [90462035]; @reviewerLogin signed off on `cafe0000`.', corpus), [], 'prompt-copied shas and logins are not inventions')
+  assert.deepEqual(ungroundedIdentifiers('Follows `deadbeef1234`.', corpus), ['deadbeef1234'], 'a sha the prompt never showed is still an invention')
+  assert.deepEqual(ungroundedIdentifiers('Follows `90462035737c`.', corpus), [], 'digit-leading hex reads as a version string and is exempt')
+  assert.deepEqual(ungroundedIdentifiers('Landed after [abcd1234ffff9999eeee8888dddd7777cccc6666] on 2026-09-14.', corpus), [], 'a lineage sha and date copied from the prompt are grounded')
 })
 
 test('validateLlmOut: an ungrounded row cannot self-rate confidence high', () => {
