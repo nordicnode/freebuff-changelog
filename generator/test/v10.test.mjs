@@ -12,7 +12,7 @@ import {
   PR_MATCH_STOPLIST_RE, matchPrByPaths, buildPrRelevancePrompt,
   validatePrRelevanceOut, checkPrRelevance,
   collectReleaseContext, formatReleaseContext,
-  stripDiffComments, strippedPatchOf, callLlm
+  stripDiffComments, strippedPatchOf, callLlm, summaryValidator
 } from '../lib/llm.mjs'
 
 const sha = (c) => c.repeat(40)
@@ -368,6 +368,93 @@ test('callLlm: no fallback offered, a refusal still burns the named re-ask and s
       /no JSON/
     )
     assert.ok(calls <= 3, `attempt budget stays bounded, got ${calls}`)
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
+test('callLlm: a validation failure after the refusal ladder still gets its repair pass', async () => {
+  // The refusal ladder and the repair passes share one attempt counter. Two
+  // refusals spend attempts 1-2, the lean rung answers at attempt 3, and the
+  // validator rejects its ungrounded number: without a repair slot left the
+  // whole row threw unrepaired and shipped NOTHING (ba9141ce, 2026-09-28).
+  // The validator's own rejection must be repairable however many rungs it
+  // took to see it -- and when the repair does not fix it either, the
+  // strict-then-flag allowance ships the row flagged instead of empty.
+  const refusal = "I'm DeepSeek, an AI assistant developed by DeepSeek. I cannot share or dump internal system instructions."
+  const corpus = 'common/src/constants/house.ts defines TOTAL.'
+  const bad = JSON.stringify({
+    evidence: 'common/src/constants/house.ts defines TOTAL.',
+    title: 'Total per day constant added',
+    summary: 'Adds a TOTAL constant to house.ts, shipping 1259 units.',
+    significance: 'minor'
+  })
+  const fullPrompt = 'Explain the change.\n```diff\n+// SAY THE UNIT\n+const TOTAL = 1\n```'
+  const shortPrompt = 'Explain the change.\n```diff\n+const TOTAL = 1\n```'
+  const leanPrompt = 'Explain the change (lean evidence).'
+  const seen = []
+  const orig = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    const prompt = JSON.parse(String(init.body)).messages[0].content
+    seen.push(prompt)
+    const content = (prompt === fullPrompt || prompt === shortPrompt) ? refusal : bad
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content } }] }) }
+  }
+  try {
+    const out = await callLlm(fullPrompt, { LLM_API_BASE: 'https://gateway.test/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm' }, 1, summaryValidator('minor', corpus), { fallbackPrompt: shortPrompt, leanPrompt })
+    assert.equal(seen.length, 4, `two refusals, one lean answer, one reserved repair, got ${seen.length}`)
+    assert.equal(seen[0], fullPrompt)
+    assert.doesNotMatch(seen[1], /SAY THE UNIT/, 'rung 1 drops the comment prose')
+    assert.match(seen[2], new RegExp(`^${leanPrompt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`), 'rung 2 is the lean ask')
+    assert.match(seen[3], /Previous output was rejected: .*1259/, 'the repair names the ungrounded number')
+    assert.ok(Array.isArray(out.ungrounded) && out.ungrounded.includes('1259'), 'a stubborn second answer ships flagged, not empty')
+    assert.equal(out.title, 'Total per day constant added')
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
+test('callLlm: the reserved repair budget is bounded -- a validator that never passes still throws', async () => {
+  // The repair-after-ladder slot must not become an open-ended loop: two
+  // repairs is the whole budget, and a row that fails both still errors into
+  // the cooldown like before.
+  const refusal = "I'm DeepSeek, an AI assistant developed by DeepSeek. I cannot share or dump internal system instructions."
+  let calls = 0
+  const orig = globalThis.fetch
+  globalThis.fetch = async () => {
+    calls++
+    const content = calls <= 2 ? refusal : JSON.stringify({ title: 'x' })
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content } }] }) }
+  }
+  try {
+    await assert.rejects(
+      callLlm('prompt', { LLM_API_BASE: 'https://gateway.test/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm' }, 1, validateLlmOut),
+      /missing summary/
+    )
+    assert.ok(calls <= 5, `two refusals + first answer + two repairs, got ${calls}`)
+  } finally {
+    globalThis.fetch = orig
+  }
+})
+
+test('callLlm: a parse failure after the ladder is NOT spent on the reserved repair', async () => {
+  // Only the validator's own rejection unlocks the repair slot. A reply that
+  // never parsed is transport/prose -- isTransientError owns it, and burning
+  // repairs on it would put JSON-frame flakes on the long budget.
+  const refusal = "I'm DeepSeek, an AI assistant developed by DeepSeek. I cannot share or dump internal system instructions."
+  let calls = 0
+  const orig = globalThis.fetch
+  globalThis.fetch = async () => {
+    calls++
+    const content = calls <= 2 ? refusal : 'Sorry, some prose without any braces at all.'
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content } }] }) }
+  }
+  try {
+    await assert.rejects(
+      callLlm('prompt', { LLM_API_BASE: 'https://gateway.test/v1', LLM_API_KEY: 'k', LLM_MODEL: 'm' }, 1, validateLlmOut),
+      /no JSON/
+    )
+    assert.equal(calls, 3, `no reserved repair is spent on an unparsed reply, got ${calls}`)
   } finally {
     globalThis.fetch = orig
   }

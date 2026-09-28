@@ -1594,8 +1594,15 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     // validators (summaryValidator's strict-then-flag allowance) for nothing.
     return callLlm(`${prompt}\n\nPrevious response was empty or malformed: ${rawText.slice(0, 300)}\nReply with ONLY the JSON object.`, env, attempt + 1, validate, opts)
   }
+  // Whether the reply reached the validator at all. A failure AFTER this
+  // point (schema, grounding, why, boilerplate) is a repairable rejection --
+  // the validator named the problem, and the repair pass shows the model its
+  // own rejected answer. A failure BEFORE it (no JSON, malformed frame) is
+  // transport or prose, which the rungs and the transient retry already own.
+  let validated = false
   try {
     const parsed = parseLlmJson(text)
+    validated = true
     return validate(parsed)
   } catch (rawErr) {
     let err = rawErr
@@ -1625,7 +1632,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     // JSON complaint it was never going to understand. The ELI5 validator
     // still applies its junk/refusal/memory/grounding gates to that text.
     if (opts.bareText && noJson && String(text).trim()) {
-      try { return validate(text) } catch (validationErr) { err = validationErr }
+      try { validated = true; return validate(text) } catch (validationErr) { err = validationErr }
     }
     if (attempt > 2) {
       // Content-deterministic failures name themselves: the cache and the log
@@ -1634,6 +1641,22 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
       // mistake it for a flaky JSON frame and re-queue it every 5 minutes.
       if (refused) throw deterministicError(err, 'refused the request', text)
       if (memoryAnswer) throw deterministicError(err, 'answered from model memory', text)
+      // The refusal ladder and the repair passes share this attempt counter,
+      // and the ladder spends it first: a row that refused twice before
+      // answering reached its first VALID reply at attempt 3 with no repair
+      // left, so one ungrounded number threw the whole row unrepaired -- an
+      // entry that should ship (flagged, after the validator's strict-then-
+      // flag allowance) stayed empty instead (seen on ba9141ce, 2026-09-28:
+      // refusals on the full and stripped prompts, then "1259" from the lean
+      // one). A reply the validator actually rejected is therefore repairable
+      // however many rungs it took to see it: the repair budget (opts.repairs,
+      // max 2) is counted separately from attempts, and only the validator's
+      // own rejection unlocks it -- parse/transport failures still throw here
+      // so the transient retry keeps owning them.
+      if (validated && (opts.repairs || 0) < 2) {
+        log(`LLM output rejected after the ask ladder spent the attempts (${err.message}): requesting repair ${(opts.repairs || 0) + 1}/2`)
+        return callLlm(repairAsk(prompt, err, text), env, attempt + 1, validate, { ...opts, repairs: (opts.repairs || 0) + 1 })
+      }
       throw withRawText(err, text)
     }
     // The next materially different ask. Two rungs, because the two failures
@@ -1681,9 +1704,16 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
         return callLlm(next.prompt, env, attempt + 1, validate, next.opts)
       }
     }
-    log(`LLM output invalid (${err.message}): requesting repair ${attempt}/2`)
-    return callLlm(`${prompt}\n\nPrevious output was rejected: ${String(err.message).slice(0, 400)}\nPrevious output: ${String(text).slice(0, 500)}\nFix exactly that problem without new analysis. Reply with ONLY the corrected JSON object.`, env, attempt + 1, validate, opts)
+    log(`LLM output invalid (${err.message}): requesting repair ${(opts.repairs || 0) + 1}/2`)
+    return callLlm(repairAsk(prompt, err, text), env, attempt + 1, validate, { ...opts, repairs: (opts.repairs || 0) + 1 })
   }
+}
+
+// The repair ask: the rejection reason travels with the previous answer, so
+// a grounding failure is fixed as a grounding failure and not re-analysed.
+// One shape for every caller; the attempt cap lives in callLlm.
+function repairAsk (prompt, err, text) {
+  return `${prompt}\n\nPrevious output was rejected: ${String(err.message).slice(0, 400)}\nPrevious output: ${String(text).slice(0, 500)}\nFix exactly that problem without new analysis. Reply with ONLY the corrected JSON object.`
 }
 
 // Schema gate: titles render via esc() so markdown would show literally;
