@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -238,6 +238,150 @@ test('error cooldown: old failures retry after cooldown', async (t) => {
   } finally {
     globalThis.fetch = origFetch
   }
+})
+
+test('heal policy: dirt counts every shipped objection, eligibility is bounded and cooled down', () => {
+  assert.equal(summaryDirt({ title: 't' }), 0, 'a clean row has no dirt')
+  assert.equal(summaryDirt({ ungrounded: ['A', 'B'], valueErrors: ['C'], whyMissing: true, verify: 'flagged' }), 5)
+  assert.equal(summaryDirt({ verify: 'passed' }), 0, 'a passed verdict is not dirt')
+  const dirty = { ungrounded: ['A'], at: '2020-01-01T00:00:00.000Z' }
+  assert.equal(healEligible(dirty), true, 'an old dirty row is eligible')
+  assert.equal(healEligible({ error: 'boom', ungrounded: ['A'] }), false, 'an error stub is the retry path, not the heal path')
+  assert.equal(healEligible({ title: 'clean' }), false, 'a clean row is never re-asked')
+  assert.equal(healEligible({ ...dirty, healTries: 2 }), false, 'the spend per row is bounded')
+  assert.equal(healEligible({ ...dirty, healAt: new Date().toISOString() }), false, 'a fresh attempt cools down')
+  assert.equal(healEligible({ ...dirty, healTries: 1, healAt: '2020-01-01T00:00:00.000Z' }), true, 'a cooled-down attempt is eligible again')
+})
+
+test('healing: a shipped-with-objections row is re-asked and replaced only by a cleaner rewrite', async (t) => {
+  const { mkdtemp, writeFile, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-heal-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const sha = 'c'.repeat(40)
+  const patch = 'diff --git a/sdk/src/a.ts b/sdk/src/a.ts\n+export const ALPHA = 1\n'
+  const key = cacheKey(sha, patch)
+  const entry = { kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['SDK'], summary: 'Adds a gate.' }
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0' }
+  const dirtyRec = {
+    model: 'deepseek-v4.1', v: PROMPT_V, at: '2020-01-01T00:00:00.000Z',
+    title: 'Shipped with objections', summary: 'Old text.', significance: 'minor',
+    ungrounded: ['FAKE_NAME', 'OTHER_FAKE'], verify: 'flagged'
+  }
+  await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: dirtyRec }))
+  const cleanPayload = {
+    evidence: 'sdk/src/a.ts holds the gate.',
+    title: 'Alpha gate added',
+    summary: 'Adds `ALPHA` in sdk/src/a.ts to prevent double-spends.',
+    significance: 'minor', audience: 'end-users', confidence: 'high'
+  }
+  let mode = 'clean'
+  let fetchCalls = 0
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (url, { body }) => {
+    fetchCalls++
+    const payload = mode === 'clean' ? cleanPayload : { ...cleanPayload, summary: 'Reads `NOT_IN_DIFF` to prevent double-spends.' }
+    const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify(payload) } }] })
+    return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
+  }
+  try {
+    // The disabled switch spends nothing.
+    const off = await enrichWithLlm([entry], async () => patch, dir, { ...env, CHANGELOG_LLM_HEAL: '0' }, {})
+    assert.equal(off, 0)
+    assert.equal(fetchCalls, 0, 'healing off: no calls')
+    // A strictly cleaner rewrite replaces the shipped text.
+    const n = await enrichWithLlm([entry], async () => patch, dir, env, {})
+    assert.equal(n, 1)
+    assert.ok(fetchCalls >= 1)
+    let stored = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    assert.equal(stored[key].title, 'Alpha gate added', 'the cleaner rewrite ships')
+    assert.equal(stored[key].ungrounded, undefined)
+    assert.equal(stored[key].healTries, 1, 'the attempt is counted')
+    assert.ok(stored[key].healAt, 'and spaced')
+    assert.equal(entry.ai.title, 'Alpha gate added', 'the entry carries the healed record')
+    // An equally dirty rewrite keeps the shipped text (and still counts a try).
+    const dirty2 = { ...dirtyRec, title: 'Shipped again', ungrounded: ['FAKE_NAME'], verify: undefined, healTries: 0, at: '2020-01-01T00:00:00.000Z' }
+    await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: dirty2 }))
+    entry.ai = { ...dirty2 }
+    mode = 'dirty'
+    await enrichWithLlm([entry], async () => patch, dir, env, {})
+    stored = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    assert.equal(stored[key].title, 'Shipped again', 'a rewrite that is not cleaner does not replace shipped text')
+    assert.deepEqual(stored[key].ungrounded, ['FAKE_NAME'], 'the shipped flags stay')
+    assert.equal(stored[key].healTries, 1, 'but the attempt is counted')
+    // At the try cap the row is left alone entirely.
+    const before = fetchCalls
+    await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: { ...dirty2, healTries: 2, healAt: '2020-01-01T00:00:00.000Z' } }))
+    await enrichWithLlm([entry], async () => patch, dir, env, {})
+    assert.equal(fetchCalls, before, 'a row at its heal cap costs nothing')
+  } finally {
+    globalThis.fetch = origFetch
+  }
+})
+
+test('assessLlmHealth: a refusal storm is an alert, objection-heavy days are a watch', () => {
+  assert.equal(assessLlmHealth({}).level, 'ok', 'a clean day is ok')
+  assert.equal(assessLlmHealth({ deterministicErrors: 1 }).level, 'watch', 'one isolated refusal is worth a look')
+  const storm = assessLlmHealth({ deterministicErrors: 3 })
+  assert.equal(storm.level, 'alert', 'the refusal-storm shape is named loudly')
+  assert.match(storm.reasons.join(' '), /refused or answered from memory/)
+  assert.equal(assessLlmHealth({ summarized: 10, flagged: 1 }).level, 'ok')
+  assert.equal(assessLlmHealth({ summarized: 10, flagged: 4, ungrounded: 3 }).level, 'watch', '7 of 10 rows shipped with objections')
+  assert.equal(assessLlmHealth({ summarized: 10, flagged: 6 }).level, 'watch', 'more objection rows than clean ones')
+  assert.equal(assessLlmHealth({ summarized: 2, flagged: 1 }).level, 'ok', 'the objection rule needs a sample')
+  assert.equal(assessLlmHealth({ summarized: 0, transientErrors: 2 }).level, 'watch', 'nothing landed while asks failed')
+  assert.equal(assessLlmHealth({ summarized: 3, otherErrors: 10 }).level, 'watch', 'ten failed asks in a day')
+})
+
+test('drift ledger: runs accumulate per UTC day and the window stays bounded', async (t) => {
+  const { mkdtemp, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-health-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const first = await recordLlmHealth(dir, { summarized: 2, flagged: 1 }, { now: new Date('2026-09-28T10:00:00Z') })
+  assert.equal(first.day, '2026-09-28')
+  assert.equal(first.stats.summarized, 2)
+  await recordLlmHealth(dir, { summarized: 3, deterministicErrors: 3 }, { now: new Date('2026-09-28T22:00:00Z') })
+  let doc = JSON.parse(await readFile(join(dir, 'llm-health.json'), 'utf8'))
+  assert.equal(doc.days['2026-09-28'].summarized, 5, 'two runs of one day share a bucket')
+  assert.equal(doc.days['2026-09-28'].flagged, 1)
+  assert.equal(assessLlmHealth(doc.days['2026-09-28']).level, 'alert', 'the merged day reads as the storm it became')
+  for (let i = 0; i < 25; i++) {
+    await recordLlmHealth(dir, { summarized: 1 }, { now: new Date(Date.parse('2026-09-28T10:00:00Z') + i * 86400000) })
+  }
+  doc = JSON.parse(await readFile(join(dir, 'llm-health.json'), 'utf8'))
+  assert.ok(Object.keys(doc.days).length <= 21, 'the ledger keeps a bounded window')
+  assert.equal(doc.days['2026-09-28'], undefined, 'oldest days fall out')
+})
+
+test('drift ledger: an enrich run records what its own calls proved', async (t) => {
+  const { mkdtemp, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-ledger-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const patch = 'diff --git a/x b/x\n+export const ALPHA = 1\n'
+  const ok = { kind: 'sync', sha: 'd'.repeat(40), date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'Adds a gate.' }
+  const failing = { ...ok, sha: 'e'.repeat(40) }
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0' }
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async () => {
+    const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify({ evidence: 'x b/x holds it.', title: 'Alpha gate added', summary: 'Adds `ALPHA` in x b/x to prevent double-spends.', significance: 'minor', audience: 'end-users', confidence: 'high' }) } }] })
+    return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
+  }
+  try {
+    await enrichWithLlm([ok], async () => patch, dir, env, {})
+    globalThis.fetch = origFetch // the second row's ask fails to connect
+    await enrichWithLlm([failing], async () => patch, dir, { ...env, LLM_API_BASE: 'http://127.0.0.1:1' }, {})
+  } finally {
+    globalThis.fetch = origFetch
+  }
+  const doc = JSON.parse(await readFile(join(dir, 'llm-health.json'), 'utf8'))
+  const day = Object.values(doc.days)[0]
+  assert.equal(day.summarized, 1, 'the row that landed is counted')
+  assert.equal(day.transientErrors, 1, 'and so is the ask that failed')
 })
 
 test('cacheKey: prompt version embedded so prompt edits invalidate', () => {

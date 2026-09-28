@@ -2304,6 +2304,92 @@ export function pruneExpiredErrors (cache, { errorCooldownMs = 3600000, transien
 }
 
 // ---------------------------------------------------------------------------
+// Healing rows that shipped with objections.
+//
+// A record that carries ungrounded names, value errors, a flagged verdict or a
+// missing why clause used to keep them forever: the cache serves any
+// current-version record, so the row was never a candidate again and nothing
+// ever asked a second time. This gives each dirty row a bounded number of
+// later re-asks (default 2, spaced by a cooldown), and a rewrite replaces the
+// shipped text only when it is strictly cleaner -- the same rule the strong-
+// model escalation uses, so healing can never make a row worse. A row that
+// stays dirty after its attempts keeps its text and its flags; it is healed
+// as far as the model takes it, which is honest, and countable via healTries.
+
+export function summaryDirt (rec) {
+  return (rec?.ungrounded?.length || 0) + (rec?.valueErrors?.length || 0) + (rec?.whyMissing ? 1 : 0) + (rec?.verify === 'flagged' ? 1 : 0)
+}
+
+export function healEligible (rec, { maxTries = 2, cooldownMs = 21600000, now = Date.now() } = {}) {
+  if (!rec || rec.error) return false
+  if (summaryDirt(rec) === 0) return false
+  if ((Number(rec.healTries) || 0) >= maxTries) return false
+  // Cooldown runs from the last heal attempt, or from the summary itself:
+  // a row that shipped dirty five minutes ago has already had its immediate
+  // repair shots (that is how it shipped dirty), so the retry waits for a
+  // different hour rather than spending a second round instantly.
+  const at = Date.parse(rec.healAt || rec.at || '') || 0
+  return now - at >= cooldownMs
+}
+
+// ---------------------------------------------------------------------------
+// LLM health ledger: drift detection from traffic that already happened.
+//
+// The refusal storm arrived silently -- the gateway's answers changed shape
+// and nothing said so until rows failed every cycle. This ledger records what
+// every sync's own calls already proved (rows landed, rows shipped with
+// objections, refusal-class failures) into data/llm-health.json, one bucket
+// per UTC day, and assesses each day for drift. Zero extra API calls: the
+// signal is the production traffic itself. Same-row quality drift (a model
+// getting subtly worse without failing) is the weekly golden-set eval's job;
+// this catches the collapse shapes within a day instead of within a week.
+
+export function assessLlmHealth (day = {}) {
+  const rows = Number(day.summarized) || 0
+  const deterministic = Number(day.deterministicErrors) || 0
+  const transient = Number(day.transientErrors) || 0
+  const other = Number(day.otherErrors) || 0
+  const dirty = (Number(day.flagged) || 0) + (Number(day.ungrounded) || 0) + (Number(day.whyMissing) || 0)
+  const reasons = []
+  let level = 'ok'
+  const raise = (l, r) => {
+    if (l === 'alert' || (l === 'watch' && level === 'ok')) level = l
+    reasons.push(r)
+  }
+  // The refusal-storm shape: several rows in one day that no ask could rescue.
+  // One isolated refusal is still worth a look (some rows provoke it by shape).
+  if (deterministic >= 3) raise('alert', `the gateway refused or answered from memory on ${deterministic} rows`)
+  else if (deterministic >= 1) raise('watch', `the gateway refused or answered from memory on ${deterministic} ${deterministic === 1 ? 'row' : 'rows'}`)
+  if (rows >= 5 && dirty / rows > 0.5) raise('watch', `${dirty} of ${rows} rows shipped with objections`)
+  if (rows === 0 && deterministic + transient + other > 0) raise('watch', `no rows landed while ${deterministic + transient + other} failed`)
+  if (transient + other >= 10) raise('watch', `${transient + other} failed asks`)
+  return { level, reasons }
+}
+
+// Accumulate one run's counters into the per-day bucket and write the ledger.
+// The window is bounded: this is drift signal, not a second changelog.
+export async function recordLlmHealth (dataDir, stats, { now = new Date(), keepDays = 21 } = {}) {
+  const path = `${dataDir}/llm-health.json`
+  const prev = await readJson(path, null)
+  const doc = prev && typeof prev === 'object' && prev.days && typeof prev.days === 'object'
+    ? prev
+    : { days: {} }
+  const day = now.toISOString().slice(0, 10)
+  const cur = doc.days[day] || {}
+  const merged = {}
+  for (const k of new Set([...Object.keys(cur), ...Object.keys(stats || {})])) {
+    const v = (Number(cur[k]) || 0) + (Number(stats?.[k]) || 0)
+    if (v) merged[k] = v
+  }
+  doc.days[day] = merged
+  doc.updatedAt = now.toISOString()
+  const days = Object.keys(doc.days).sort()
+  while (days.length > keepDays) delete doc.days[days.shift()]
+  await writeJson(path, doc)
+  return { day, stats: merged, assessment: assessLlmHealth(merged) }
+}
+
+// ---------------------------------------------------------------------------
 // Release-window context for version-bump rows.
 //
 // A bump row's own diff is one version string, so from its patch alone the
@@ -2849,7 +2935,20 @@ export async function gatherEntryContext (e, patch, { repoDir = null, entries = 
 // carrying ungrounded names); the default and =all check every row (only
 // newly summarized rows ever reach the verifier, so this is a per-run cost,
 // never a backlog sweep).
-// LLM_VERIFY_MODEL optionally routes the check to a different model.
+//
+// The check runs on a DIFFERENT model family from the writer: a verifier that
+// shares the writer's model shares its blind spots, so both passes agree on
+// the same wrong claim and the repair round never hears an objection (that is
+// how the ba9141ce-era rows carried correlated errors through recheck). The
+// default check model is gpt-6-luna against a deepseek writer; LLM_VERIFY_MODEL
+// overrides it, and the eval judge falls through the same ladder so scoring is
+// cross-model too. If the writer itself runs on gpt-6-luna there is no third
+// family to switch to and the check stays same-model -- named here rather than
+// pretended away.
+export const DEFAULT_VERIFY_MODEL = 'gpt-6-luna'
+export function verifyModelOf (env = process.env) {
+  return env.LLM_VERIFY_MODEL || DEFAULT_VERIFY_MODEL
+}
 
 export function verifyConfigured (env = process.env) {
   return env.CHANGELOG_LLM_VERIFY !== '0'
@@ -2910,7 +3009,7 @@ export function validateVerifyOut (out) {
 }
 
 export async function verifySummary (entry, patch, clean, env, cautionNames = []) {
-  const venv = { ...env, LLM_MODEL: env.LLM_VERIFY_MODEL || env.LLM_MODEL }
+  const venv = { ...env, LLM_MODEL: verifyModelOf(env) }
   // The verifier reads the same diff the ask did, so a comment-heavy row
   // refuses here too and the verdict silently goes missing (58699f0e logged
   // "verifier unavailable" right after its summary recovered). Same fallback,
@@ -3173,7 +3272,9 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     // The answer still carries no why clause after its one repair: recorded so
     // the gap is countable in the cache instead of invisible in the text.
     ...(clean.whyMissing ? { whyMissing: true } : {}),
-    ...(verify ? { verify } : {}),
+    // Which model did the checking: with the verifier cross-model by default,
+    // a record that claims "passed" has to say whose read passed it.
+    ...(verify ? { verify, verifyModel: verifyModelOf(env) } : {}),
     ...(verify === 'flagged' && verifyClaims?.length ? { verifyClaims } : {}),
     ...(escalated ? { escalated: true } : {}),
     ...(selfCheck ? { selfCheck } : {}),
@@ -3218,6 +3319,8 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   // are tested together rather than drifting apart in two files)
   let apiCalls = 0
   let cacheModified = false
+  // What this run's own calls proved, for the drift ledger (recordLlmHealth).
+  const health = { summarized: 0, healed: 0, flagged: 0, ungrounded: 0, whyMissing: 0, deterministicErrors: 0, transientErrors: 0, otherErrors: 0 }
 
   const posIndex = new Map(entries.map((x, i) => [x.sha, i]))
   const ctxCache = new Map()
@@ -3335,6 +3438,56 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     if (queue.length >= limit) break
   }
 
+  // Healing: rows that SHIPPED with objections get a bounded second look (see
+  // healEligible). Fresh rows keep their priority -- heal rows take only the
+  // leftover budget, so a backlog of dirty history can never starve today.
+  const healPerRun = env.CHANGELOG_LLM_HEAL === undefined ? 2 : Number(env.CHANGELOG_LLM_HEAL)
+  const healMaxTries = Number(env.CHANGELOG_LLM_HEAL_MAX_TRIES) > 0 ? Number(env.CHANGELOG_LLM_HEAL_MAX_TRIES) : 2
+  const healCooldownMs = Number(env.CHANGELOG_LLM_HEAL_COOLDOWN_MS) > 0 ? Number(env.CHANGELOG_LLM_HEAL_COOLDOWN_MS) : 21600000
+  const healBudget = Math.max(0, Math.min(Number(healPerRun) || 0, limit - queue.length))
+  if (healBudget > 0) {
+    const dirty = []
+    const seenSha = new Set()
+    for (const [k, rec] of Object.entries(cache)) {
+      const kv = cacheKeyVersion(k)
+      if (!kv || kv.kind === 'eli5' || kv.v !== PROMPT_V) continue
+      if (!healEligible(rec, { maxTries: healMaxTries, cooldownMs: healCooldownMs })) continue
+      const sha = String(k.split(':')[0])
+      if (seenSha.has(sha)) continue
+      const e = entries[posIndex.get(sha)]
+      if (!e || e.noise || gaveUp({ ...e, ai: rec })) continue
+      seenSha.add(sha)
+      dirty.push({ k, rec, e })
+    }
+    // Most-read rows first, then the ones that have waited longest.
+    dirty.sort((a, b) => rewriteRank({ ...a.e, ai: a.rec }) - rewriteRank({ ...b.e, ai: b.rec }) ||
+      ((Date.parse(a.rec.healAt || a.rec.at || '') || 0) - (Date.parse(b.rec.healAt || b.rec.at || '') || 0)))
+    // A couple of spares past the budget: a patch that no longer hashes to the
+    // record's key is skipped rather than spent.
+    const picked = dirty.slice(0, healBudget + 2)
+    const healPatches = await pool(picked.map(d => async () => {
+      try { return await getPatch(d.e) } catch { return '' }
+    }), 4)
+    let healed = 0
+    for (let i = 0; i < picked.length && healed < healBudget; i++) {
+      const d = picked[i]
+      const patch = healPatches[i]
+      if (!patch) continue
+      const hit = bumpOnly(d.e) ? releaseOf(d.e) : null
+      const relText = hit?.text || ''
+      const key = cacheKey(d.e.sha, patch, relText, relText ? RELEASE_ROLLUP_V : 0)
+      // Heal only a record the current patch still hashes to: a mismatch means
+      // the diff moved and the fresh path owns the row.
+      if (key !== d.k) continue
+      const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 40)
+      const sequence = sequenceForEntry(byDayEntries, d.e, seqWindow)
+      const prMeta = findPrMeta(d.e, prIndex)
+      queue.push({ entry: d.e, patch, key, relText, sequence, prMeta, heal: d.rec })
+      healed++
+    }
+    if (healed) log(`LLM healing ${healed} shipped-with-objections row(s) with leftover budget`)
+  }
+
   if (!queue.length) return 0
 
   let activeIndex = 0
@@ -3344,13 +3497,38 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     while (activeIndex < queue.length) {
       if (gatewayFails >= 3) break
       const idx = activeIndex++
-      const { entry: e, patch, key, relText = '', sequence = null, prMeta = null } = queue[idx]
+      const { entry: e, patch, key, relText = '', sequence = null, prMeta = null, heal = null } = queue[idx]
       try {
         const fullPatch = getFullPatch ? await getFullPatch(e).catch(() => '') : ''
         const context = queue[idx].context || (queue[idx].context = await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, fullPatch }))
         if (hasStructuredFacts(context.structured) && !hasStructuredFacts(e.structured)) e.structured = context.structured
         const { record } = await summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env })
         gatewayFails = 0
+        apiCalls++
+        cacheModified = true
+        const nowIso = new Date().toISOString()
+        if (heal) {
+          // The shipped text stays unless the rewrite is strictly cleaner (see
+          // healEligible): the worst a heal can do is cost its calls.
+          const tries = (Number(heal.healTries) || 0) + 1
+          const before = summaryDirt(heal)
+          const after = summaryDirt(record)
+          if (after < before) {
+            const merged = { ...record, healTries: tries, healAt: nowIso }
+            cache[key] = merged
+            e.ai = { ...merged }
+            health.healed++
+            log(`LLM healed ${e.sha.slice(0, 8)} (heal ${tries}/${healMaxTries}): ${before - after} fewer objection(s) [ungrounded: ${(record.ungrounded || []).slice(0, 3).join(', ') || 'none'}]`)
+          } else {
+            // Fresh `at`: the kept-text write is still a NEWER write, and
+            // mergeAiCache resolves concurrent copies of a key by `at` -- an
+            // unstamped record loses the merge to the copy on disk and the
+            // heal bookkeeping silently evaporates.
+            cache[key] = { ...heal, healTries: tries, healAt: nowIso, at: nowIso }
+            log(`LLM heal kept the shipped text for ${e.sha.slice(0, 8)} (heal ${tries}/${healMaxTries}): rewrite was not cleaner`)
+          }
+          continue
+        }
         // A re-summarized gave-up row counts its own retries, so the gate
         // above stops after GAVEUP_MAX_TRIES instead of forever.
         const prev = cache[key]
@@ -3359,11 +3537,34 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           : 0
         cache[key] = { ...record, ...(gaveTries ? { gaveTries } : {}) }
         e.ai = { ...record }
-        apiCalls++
-        cacheModified = true
+        health.summarized++
+        if (record.verify === 'flagged') health.flagged++
+        if (record.ungrounded?.length) health.ungrounded++
+        if (record.whyMissing) health.whyMissing++
         log(`LLM summarized ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})${record.pr ? ` [PR #${record.pr}${record.prMatched === 'files' ? ` by files, ${Math.round((record.prConfidence || 0) * 100)}%` : ''}]` : ''}${record.ungrounded ? ` [ungrounded: ${record.ungrounded.slice(0, 3).join(', ')}]` : ''}`)
       } catch (err) {
         log(`LLM failed for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
+        if (isDeterministicFailure(err)) health.deterministicErrors++
+        else if (isTransientError(err)) health.transientErrors++
+        else health.otherErrors++
+        if (heal) {
+          // A heal attempt must never destroy shipped content: a failure
+          // leaves the text alone. A transient one keeps the row eligible for
+          // the next run; a real one spends one of its bounded tries.
+          if (!isTransientError(err)) {
+            const nowIso = new Date().toISOString()
+            cache[key] = { ...heal, healTries: (Number(heal.healTries) || 0) + 1, healAt: nowIso, at: nowIso }
+            cacheModified = true
+          }
+          if (isGatewayError(err)) {
+            gatewayFails++
+            if (gatewayFails >= 3) {
+              log('LLM endpoint appears offline (3 consecutive gateway errors): skipping rest of queue this run')
+              break
+            }
+          }
+          continue
+        }
         const transient = isTransientError(err)
         const prev = cache[key]
         const attempts = (prev?.error ? Number(prev.attempts) || 1 : 0) + 1
@@ -3408,6 +3609,13 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   // Entries written and calls sent are different numbers: one entry can cost
   // a repair, a verifier, a re-check and a self-check. The return value stays
   // "entries" for every caller that counts rows; this is what the run spent.
+  // Drift detection: record what this run's calls proved (see
+  // recordLlmHealth). A non-ok day is logged loudly -- the refusal storm was
+  // silent for days; this is the sentence that would have said so.
+  if (Object.values(health).some(v => v > 0)) {
+    const { assessment } = await recordLlmHealth(dataDir, health)
+    if (assessment.level !== 'ok') log(`LLM health ${assessment.level}: ${assessment.reasons.join('; ')}`)
+  }
   const sent = llmCallCount() - callsAtStart
   if (apiCalls || sent) log(`LLM: ${apiCalls} ${apiCalls === 1 ? 'entry' : 'entries'} written in ${sent} API ${sent === 1 ? 'call' : 'calls'}`)
   return apiCalls

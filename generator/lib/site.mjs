@@ -7,7 +7,7 @@ import { CSS } from './style.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg, feedsOpml } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
 import { buildStoryIndex, dayStories, dayStoryLead } from './story.mjs'
-import { computeShippedIn, isSecurityEntry, PROMPT_V, ELI5_V, AUDIENCE_DESC, AUDIENCES } from './llm.mjs'
+import { computeShippedIn, isSecurityEntry, PROMPT_V, ELI5_V, AUDIENCE_DESC, AUDIENCES, assessLlmHealth } from './llm.mjs'
 import { buildWeeklyDigests, weeklyFeedItem, weeklyHeadline, weekLabel, weeklyText, summaryQuality } from './digest.mjs'
 
 const SITE = {
@@ -1471,6 +1471,40 @@ function evalCard (r, card, bar) {
     'stat-span eval-card')
 }
 
+// Drift detection, as a card: what the pipeline's own calls proved about the
+// gateway and the models, one bucket per UTC day (data/llm-health.json, see
+// recordLlmHealth in llm.mjs). The traffic is the measurement -- zero extra
+// API calls -- so a refusal storm or a collapse in output shape shows up here
+// within a day; the golden-set eval above covers same-row quality drift weekly.
+function llmHealthCard (doc, card, bar) {
+  const days = Object.keys(doc?.days || {}).sort().slice(-7)
+  const empty = '<p class="list-note">The summarizer records what its own calls proved -- rows summarized, rows shipped with objections, refusal-class failures -- into data/llm-health.json. This card turns WATCH when a day ships more objections than clean rows and ALERT when the gateway refuses or answers from memory three times in a day.</p>'
+  if (!days.length) return card('LLM HEALTH', 'no traffic recorded', empty, 'stat-span llm-health-card')
+  const assessed = days.map(d => ({ day: d, stats: doc.days[d] || {}, ...assessLlmHealth(doc.days[d]) }))
+  const worst = assessed.reduce((w, a) => (a.level === 'alert' || (a.level === 'watch' && w.level === 'ok') ? a : w), assessed[0])
+  const rowsMax = Math.max(1, ...assessed.map(a => Number(a.stats.summarized) || 0))
+  const rows = assessed.map(({ day, stats, level }) => {
+    const s = Number(stats.summarized) || 0
+    const parts = [
+      Number(stats.healed) ? `${stats.healed} healed` : '',
+      Number(stats.flagged) ? `${stats.flagged} flagged` : '',
+      Number(stats.ungrounded) ? `${stats.ungrounded} ungrounded` : '',
+      Number(stats.whyMissing) ? `${stats.whyMissing} missing why` : '',
+      Number(stats.deterministicErrors) ? `${stats.deterministicErrors} refused/memory` : '',
+      (Number(stats.transientErrors) || 0) + (Number(stats.otherErrors) || 0) ? `${(Number(stats.transientErrors) || 0) + (Number(stats.otherErrors) || 0)} failed` : ''
+    ].filter(Boolean)
+    const mark = level === 'ok' ? '' : ` <i class="stat-delta neg">${level === 'alert' ? 'ALERT' : 'WATCH'}</i>`
+    return bar(day.slice(5), s, rowsMax, {
+      num: `${s} ${s === 1 ? 'row' : 'rows'}`,
+      trend: `<span class="stat-note">${esc(parts.join(' \u00b7 ') || 'clean')}${mark}</span>`
+    })
+  }).join('')
+  const note = worst.level === 'ok'
+    ? `${days.length} days &middot; no drift`
+    : `${days.length} days &middot; <i class="stat-delta neg">${worst.level.toUpperCase()}</i> ${esc(worst.reasons.join('; '))}`
+  return card('LLM HEALTH', note, rows, 'stat-span llm-health-card')
+}
+
 // Which release first included this commit, per version track. `shipped` is the
 // Map computeShippedIn() builds once per build.
 function shippedInHtml (e, shipped) {
@@ -1975,7 +2009,7 @@ const RANGE_JS = `(function () {
 })();
 `
 
-export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, overridesDoc = null, evalResult = null }) {
+export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, overridesDoc = null, evalResult = null, llmHealth = null }) {
   const trafficCount = traffic?.count ?? 0
   const trafficUniques = traffic?.uniques ?? 0
   activeTraffic = { count: trafficCount, uniques: trafficUniques }
@@ -3439,6 +3473,7 @@ ${weekTabsScript}`
       + card('WHAT COUNTED', `${sigTotal.toLocaleString()} changes split by weight`, `<div class="sig-split">${sigRows.map(([s, n]) => `<span class="sig-seg sig-${s}" style="width:${share(n, sigTotal)}%" title="${s}: ${n.toLocaleString()}"></span>`).join('')}</div>` + sigRows.map(([s, n]) => bar(s.toUpperCase(), n, sigMax, { pct: share(n, sigTotal), cls: 'sig-' + s })).join(''), 'stat-span')
       + qualityCard(summaryQuality(entries), card, bar, share)
       + evalCard(evalResult, card, bar)
+      + llmHealthCard(llmHealth, card, bar)
       + card('SHIPPING CADENCE (LAST 12 MO)', `${monthRows.length} of ${byMonth.size} months &middot; peak ${monthMax.toLocaleString()} changes`, `<div class="cad-spark">${cadenceSpark}</div>` + monthRows.map(([m, n], i) => {
         const prev = i ? monthRows[i - 1][1] : 0
         const d = prev ? Math.round((n - prev) / prev * 100) : null

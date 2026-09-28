@@ -1354,7 +1354,10 @@ async function cmdBuild () {
   } catch (err) {
     log(`[build] eval results unavailable: ${err.message}`)
   }
-  await buildSite({ changelog, openPrs: prs, prMeta, traffic, dist, mergedPrs: mergedPrsDoc, overridesDoc: overrides, evalResult })
+  // The drift ledger (recordLlmHealth writes it every enrich run) feeds the
+  // LLM HEALTH card; absent until the first LLM run after it lands.
+  const llmHealth = await readJson(`${DATA}/llm-health.json`, null)
+  await buildSite({ changelog, openPrs: prs, prMeta, traffic, dist, mergedPrs: mergedPrsDoc, overridesDoc: overrides, evalResult, llmHealth })
 
   // data/diffs is 106 MB of a 352 MB dist. Two opt-in trims: skip the churn
   // rows' lockfile diffs (CHANGELOG_DIST_SKIP_CHURN_DIFFS=1) and/or ship only

@@ -38,7 +38,7 @@ import { readJson, writeJson, log, pool } from './util.mjs'
 import {
   summarizeEntry, gatherEntryContext, findPrMeta, loadPrIndex, groupEntriesByDay, sequenceForEntry,
   getReleaseContextFor, bumpOnly, callLlm, cleanText, budgetPatch, ELI5_HYPE_ROLLUP_RE, WHY_RE,
-  PROMPT_V, RELEASE_ROLLUP_V, formatGlossary, loadGlossary, structuredFactsCited
+  PROMPT_V, RELEASE_ROLLUP_V, formatGlossary, loadGlossary, structuredFactsCited, verifyModelOf
 } from './llm.mjs'
 import { hasStructuredFacts, formatStructuredFacts } from './analyze.mjs'
 
@@ -253,7 +253,9 @@ export async function runEval (entries, dataDir, env, { repoDir = null, getPatch
       const score = scoreRow(probe, record, g)
       if (judge) {
         try {
-          score.judge = await callLlm(buildJudgePrompt(e, patch, record, g), { ...env, LLM_MODEL: env.LLM_JUDGE_MODEL || env.LLM_VERIFY_MODEL || env.LLM_MODEL }, 1, validateJudgeOut)
+          // Cross-model, same ladder as the verifier: a judge that shares the
+          // writer's model grades its own blind spots.
+          score.judge = await callLlm(buildJudgePrompt(e, patch, record, g), { ...env, LLM_MODEL: env.LLM_JUDGE_MODEL || verifyModelOf(env) }, 1, validateJudgeOut)
         } catch (err) { log(`[eval] judge failed for ${e.sha.slice(0, 8)}: ${err.message}`) }
       }
       rows.push(score)

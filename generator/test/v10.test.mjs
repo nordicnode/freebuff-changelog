@@ -7,7 +7,7 @@ import {
   buildChunkPrompt, validateChunkOut, buildFusePrompt, summarizeChunked,
   MAP_REDUCE_THRESHOLD_BYTES, MAP_REDUCE_CHUNK_BYTES, MAP_REDUCE_MAX_CHUNKS, mapReduceThreshold,
   LLM_CONTEXT_CHARS,
-  shouldVerify, validateVerifyOut, buildVerifyPrompt,
+  shouldVerify, validateVerifyOut, buildVerifyPrompt, verifySummary, verifyModelOf, DEFAULT_VERIFY_MODEL,
   ungroundedIdentifiers, validateGroundedEli5, backtickedProse, validateLlmOut,
   PR_MATCH_STOPLIST_RE, matchPrByPaths, buildPrRelevancePrompt,
   validatePrRelevanceOut, checkPrRelevance,
@@ -150,6 +150,33 @@ test('validateVerifyOut: per-claim verdicts fail closed', () => {
   assert.throws(() => validateVerifyOut(null), /not an object/)
   const prompt = buildVerifyPrompt({ files: {} }, 'diff', { title: 'T', summary: 'S.' })
   assert.match(prompt, /"claims":/)
+})
+
+test('verifySummary: the check runs on a different model family than the writer', async () => {
+  assert.equal(verifyModelOf({}), DEFAULT_VERIFY_MODEL, 'gpt-6-luna is the default check model')
+  assert.equal(verifyModelOf({ LLM_MODEL: 'deepseek-v4.1' }), 'gpt-6-luna', 'the writer model does not become its own verifier')
+  assert.equal(verifyModelOf({ LLM_VERIFY_MODEL: 'other-model' }), 'other-model', 'an explicit LLM_VERIFY_MODEL wins')
+  const seen = []
+  const orig = globalThis.fetch
+  globalThis.fetch = async (url, { body }) => {
+    const parsed = JSON.parse(String(body))
+    seen.push({ url, model: parsed.model })
+    const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify({ supported: true, issues: [], claims: [] }) } }] })
+    return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
+  }
+  const entry = { files: { added: [], modified: ['sdk/src/a.ts'], removed: [] }, summary: 'Notes.' }
+  const clean = { title: 'T', summary: 'S.' }
+  const env = { LLM_API_BASE: 'http://gateway.test/v1', LLM_API_KEY: 'k', LLM_MODEL: 'deepseek-v4.1' }
+  try {
+    const verdict = await verifySummary(entry, 'diff --git a/sdk/src/a.ts b/sdk/src/a.ts\n+x', clean, env)
+    assert.equal(verdict.supported, true)
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0].model, 'gpt-6-luna', 'a deepseek writer is checked by gpt-6-luna')
+    await verifySummary(entry, 'diff', clean, { ...env, LLM_VERIFY_MODEL: 'other-model' })
+    assert.equal(seen[1].model, 'other-model', 'the override is honored on the wire')
+  } finally {
+    globalThis.fetch = orig
+  }
 })
 
 test('grounding v2: bare constants, versions, flags and numbers are checked; URLs ignored', () => {

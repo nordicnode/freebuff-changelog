@@ -1783,6 +1783,8 @@ test('stats: the golden-set eval card renders, and says so when no run exists', 
   const empty = await readFile(join(dist, 'stats/index.html'), 'utf8')
   assert.match(empty, /GOLDEN-SET EVAL/)
   assert.match(empty, /no run yet/)
+  assert.match(empty, /LLM HEALTH/, 'the drift card exists even with no ledger yet')
+  assert.match(empty, /no traffic recorded/)
 
   const metrics = {
     n: 38, verifiedN: 3, grounded: 0.95, pathGrounded: 0.8, whyRate: 0.7, hypeFree: 1,
@@ -1805,10 +1807,20 @@ test('stats: the golden-set eval card renders, and says so when no run exists', 
         promptV: 9, at: '2026-09-15T00:00:00Z', model: 'deepseek-v4.1',
         metrics: { ...metrics, grounded: 0.9, judge: { faithfulness: 4.0, completeness: 4.0, clarity: 4.0 } }
       }
+    },
+    llmHealth: {
+      days: {
+        '2026-09-27': { summarized: 40, flagged: 2 },
+        '2026-09-28': { summarized: 12, flagged: 1, deterministicErrors: 3 }
+      }
     }
   })
   const html = await readFile(join(dist, 'stats/index.html'), 'utf8')
   assert.match(html, /GOLDEN-SET EVAL/)
+  assert.match(html, /LLM HEALTH/)
+  assert.doesNotMatch(html, /no traffic recorded/, 'a ledger replaces the empty state')
+  assert.match(html, /ALERT/, 'a refusal-storm day is named on the card')
+  assert.match(html, /refused\/memory/, 'and the failure shape is spelled out')
   assert.match(html, /38\/40 rows/, 'the note says how many rows the run scored')
   assert.match(html, /95%/, 'the rate itself')
   assert.match(html, /vs v9: \+5pt/, 'and how it moved against the previous run')
