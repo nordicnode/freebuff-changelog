@@ -1,0 +1,1260 @@
+diff --git a/cli/release-core/launcher.js b/cli/release-core/launcher.js
+index 2f5ade932..7bb54123d 100644
+--- a/cli/release-core/launcher.js
++++ b/cli/release-core/launcher.js
+@@ -1,28 +1,28 @@
+ #!/usr/bin/env node
+ 
+-const { spawn } = require('child_process')
++const { execFileSync, spawn } = require('child_process')
+ const crypto = require('crypto')
+ const fs = require('fs')
+ const http = require('http')
+ const https = require('https')
+ const os = require('os')
+ const path = require('path')
+ const { pipeline } = require('stream/promises')
+ const zlib = require('zlib')
+ 
+ const tar = require('tar')
+ const { createReleaseHttpClient } = require('./http')
+ 
+ const DEFAULT_DOWNLOAD_ORIGIN = 'https://codebuff.com'
+ const NPM_REGISTRY_ORIGIN = 'https://registry.npmjs.org'
+ 
+ /**
+  * Every binary target a release ships, in the order the release workflow
+  * builds them. The launcher derives its download filename from these keys and
+  * `write-binary-checksums.js` stamps one sha256 per key into the published
+  * package.json, so the two lists must agree — a test pins that.
+  */
+ const PLATFORM_TARGET_KEYS = [
+   'linux-x64',
+   'linux-x64-baseline',
+   'linux-arm64',
+@@ -124,50 +124,53 @@ function readBinaryChecksums(packageData) {
+     ? checksums
+     : null
+ }
+ 
+ function createLauncher(productConfig) {
+   const {
+     packageName,
+     displayName,
+     wrapperVersion = null,
+     // The `binaryChecksums` field of the wrapper's own package.json: sha256 per
+     // target for the archives of the release that shares its version. Reaches
+     // the launcher through npm, which is a separate trust root from the
+     // download origin.
+     binaryChecksums: ownBinaryChecksums = null,
+     includeTreeSitterWasm = true,
+     startupBanner = [],
+     telemetryEvent = 'cli.update_codebuff_failed',
+     telemetryProperties = {},
+     // Freebuff sessions remain open between turns. The launcher cannot know
+     // when a restart is safe, so keep the process alive until the user exits.
+     deferUpdatesUntilExit = false,
+     tempDownloadDirName = `.${packageName}-download-temp`,
+     // Tests only. os.homedir() ignores $HOME under `bun test`, so pointing HOME
+     // at a temp dir is not enough to keep a test off the real ~/.config.
+     configDir: configDirOverride = null,
++    // Tests only: stands in for the OS AVX2 probe (/proc/cpuinfo, sysctl),
++    // returning true, false, or null for "could not tell".
++    cpuAvx2Probe: cpuAvx2ProbeOverride = null,
+   } = productConfig
+ 
+   /**
+    * Terminal escape sequences to reset terminal state after the child process exits.
+    * When the binary is SIGKILL'd, it can't clean up its own terminal state.
+    * The wrapper (this process) survives and must reset these modes.
+    */
+   const EXIT_ALTERNATE_SCREEN_SEQUENCE = '\x1b[?1049l'
+   const SAFE_TERMINAL_RESET_SEQUENCES =
+     '\x1b[?1000l' + // Disable X10 mouse mode
+     '\x1b[?1002l' + // Disable button event mouse mode
+     '\x1b[?1003l' + // Disable any-event mouse mode (all motion)
+     '\x1b[?1006l' + // Disable SGR extended mouse mode
+     '\x1b[?1004l' + // Disable focus reporting
+     '\x1b[?2004l' + // Disable bracketed paste mode
+     '\x1b[<u' + // Pop kitty keyboard protocol flags
+     '\x1b[>4;0m' + // Reset modifyOtherKeys
+     '\x1b[?25h' // Show cursor
+ 
+   const FULL_TERMINAL_RESET_SEQUENCES =
+     EXIT_ALTERNATE_SCREEN_SEQUENCE + SAFE_TERMINAL_RESET_SEQUENCES
+ 
+   function resetTerminal(options = {}) {
+     const { exitAlternateScreen = false } = options
+ 
+@@ -260,50 +263,63 @@ function createLauncher(productConfig) {
+   /**
+    * Bun's own crash report saying this CPU cannot run the optimized build.
+    *
+    * On Windows the exit code does not carry that. Bun's crash handler catches
+    * EXCEPTION_ILLEGAL_INSTRUCTION itself, prints a report, then leaves through
+    * Zig's std.posix.abort(), which on Windows is ExitProcess(3). So an AVX2
+    * build on a CPU without AVX2 exits with plain code 3, neither
+    * 0xC000001D nor 0xC0000409, and both checks above miss it. The Sept 27
+    * report (i3-2100, Bun 1.3.14) is exactly this:
+    *
+    *   CPU: sse42 avx
+    *   Features: no_avx2
+    *   panic: Illegal instruction at address 0x7FF61902F82C
+    *   panicked during a panic. Aborting.
+    *
+    * The report is in the stderr tail watchLaunch() keeps on Windows. Either line
+    * is proof, not a guess. `Features: no_avx2` is Bun's own CPUID answer, and a
+    * Bun "Illegal instruction" panic is the same Windows exception
+    * 0xC000001D reports, intercepted before it became the exit code. Only Bun's
+    * exact formats count, so ordinary output that mentions them does not.
+    */
+   const BUN_NO_AVX2_FEATURE = /^Features:[^\n]*\bno_avx2\b/m
+   const BUN_ILLEGAL_INSTRUCTION_PANIC =
+     /^panic(?:\([^)\n]*\))?: Illegal instruction at address 0x[0-9a-f]+/im
+ 
++  /**
++   * Bun's `CPU:` header line lists the features it detected (`CPU: sse42
++   * popcnt avx avx2`). avx2 in that list is Bun's own CPUID saying the CPU has
++   * it, so an illegal instruction on such a machine is not a missing AVX2.
++   */
++  const BUN_CPU_LINE = /^CPU:([^\n]*)$/m
++
++  function stderrReportsAvx2Present(stderrTail) {
++    if (!stderrTail) return false
++    const match = BUN_CPU_LINE.exec(sanitizeForReplay(stderrTail))
++    return Boolean(match && /(?:^|\s)avx2(?:\s|$)/i.test(match[1]))
++  }
++
+   function stderrReportsMissingCpuFeature(code, signal, stderrTail) {
+     if (!stderrTail || (code === 0 && !signal)) return false
+     const text = sanitizeForReplay(stderrTail)
+     return (
+       BUN_NO_AVX2_FEATURE.test(text) || BUN_ILLEGAL_INSTRUCTION_PANIC.test(text)
+     )
+   }
+ 
+   function createConfig(packageName) {
+     const homeDir = os.homedir()
+     const configDir =
+       configDirOverride || path.join(homeDir, '.config', 'manicode')
+     const binaryName =
+       process.platform === 'win32' ? `${packageName}.exe` : packageName
+ 
+     return {
+       homeDir,
+       configDir,
+       binaryName,
+       binaryPath: path.join(configDir, binaryName),
+       metadataPath: path.join(configDir, `${packageName}-metadata.json`),
+       // A deferred download may wait here for an hour. Another invocation
+       // must not replace its staged binary (or delete it while downloading).
+       tempDownloadDir: path.join(
+         configDir,
+@@ -420,136 +436,250 @@ function createLauncher(productConfig) {
+       process.stderr.write(text + '\n')
+     },
+   }
+ 
+   function getPlatformKey() {
+     return `${process.platform}-${process.arch}`
+   }
+ 
+   function getTargetOverride() {
+     const envNames = [
+       `${packageName.toUpperCase()}_BINARY_TARGET`,
+       'CODEBUFF_BINARY_TARGET',
+       'CLI_BINARY_TARGET',
+     ]
+ 
+     for (const envName of envNames) {
+       const target = process.env[envName]
+       if (target && PLATFORM_TARGETS[target]) {
+         return target
+       }
+     }
+ 
+     return null
+   }
+ 
+-  function linuxCpuHasAvx2() {
+-    try {
+-      return /\bavx2\b/i.test(fs.readFileSync('/proc/cpuinfo', 'utf8'))
+-    } catch {
+-      return true
++  /**
++   * `/proc/cpuinfo` answers for the kernel's view of the CPU: true or false
++   * from its `flags` lines, null when it has none to read.
++   */
++  function parseCpuinfoAvx2(text) {
++    if (typeof text !== 'string' || !/^flags\s*:/m.test(text)) return null
++    return /^flags\s*:.*\bavx2\b/m.test(text)
++  }
++
++  /** `sysctl -n hw.optional.avx2_0` prints 1 or 0 on an Intel Mac. */
++  function parseSysctlAvx2(output) {
++    const value = typeof output === 'string' ? output.trim() : ''
++    if (value === '1') return true
++    if (value === '0') return false
++    return null
++  }
++
++  // Where probeCpuAvx2() gets its answer, recorded as the evidence for a pin.
++  function cpuProbeSource() {
++    if (process.platform === 'linux') return 'cpuinfo'
++    if (process.platform === 'darwin') return 'sysctl'
++    return 'probe'
++  }
++
++  let _cpuProbeCache
++
++  /**
++   * Ask the OS whether this CPU has AVX2: true, false, or null for "could not
++   * tell". Linux reads /proc/cpuinfo. macOS asks sysctl, which costs a
++   * subprocess, so this runs only on the crash path, when re-checking an old
++   * pin, and when picking a download target for a baseline install, never on
++   * an ordinary launch. Windows has no probe: the one we had tripped Defender
++   * (see detectMachineHasAvx2), so there Bun's crash report is the evidence.
++   */
++  function probeCpuAvx2() {
++    if (_cpuProbeCache === undefined) {
++      _cpuProbeCache = cpuAvx2ProbeOverride
++        ? cpuAvx2ProbeOverride()
++        : probeCpuAvx2FromOs()
++    }
++    return _cpuProbeCache
++  }
++
++  function probeCpuAvx2FromOs() {
++    if (process.arch !== 'x64') return null
++    if (process.platform === 'linux') {
++      try {
++        return parseCpuinfoAvx2(fs.readFileSync('/proc/cpuinfo', 'utf8'))
++      } catch {
++        return null
++      }
++    }
++    if (process.platform === 'darwin') {
++      // x64 node on Apple Silicon runs under Rosetta, and sysctl (arm64 only)
++      // then describes the host, not what Rosetta emulates. No answer there.
++      if (/\bApple\b/.test(os.cpus()[0]?.model || '')) return null
++      try {
++        return parseSysctlAvx2(
++          execFileSync('/usr/sbin/sysctl', ['-n', 'hw.optional.avx2_0'], {
++            encoding: 'utf8',
++            stdio: ['ignore', 'pipe', 'ignore'],
++            timeout: 2000,
++          }),
++        )
++      } catch {
++        return null
++      }
+     }
++    return null
+   }
+ 
+   let _hasAvx2Cache
+ 
+   function machineHasAvx2() {
+     if (_hasAvx2Cache === undefined) {
+       _hasAvx2Cache = detectMachineHasAvx2()
+     }
+     return _hasAvx2Cache
+   }
+ 
+   function detectMachineHasAvx2() {
+     if (process.arch !== 'x64') {
+       return true
+     }
+ 
+-    // A recorded illegal-instruction crash outranks everything below it: the
+-    // binary actually failed on this machine, which beats any inference we
+-    // could make about the CPU.
+-    const recorded = readCachedAvx2()
+-    if (recorded !== null) {
+-      return recorded
++    // A recorded verdict outranks everything below it. Every record now names
++    // its evidence: Bun's crash report, the OS probe, or 'crash' for an
++    // illegal instruction nothing could explain.
++    //
++    // A record WITHOUT evidence was written by an older launcher, which pinned
++    // baseline on any SIGILL, including a bug on a CPU that has AVX2. Re-check
++    // those against the OS once: a CPU with AVX2 gets its record dropped and
++    // the optimized build back on the next update (see getDownloadTargetKey).
++    const record = readCpuFeatureRecord()
++    if (record && (record.avx2 || record.evidence)) {
++      return record.avx2
++    }
++    if (record) {
++      const probed = probeCpuAvx2()
++      if (probed !== true) {
++        writeCpuFeatureRecord(
++          false,
++          probed === false ? cpuProbeSource() : 'crash',
++        )
++        return false
++      }
++      clearCpuFeatureRecord()
+     }
+ 
+     // Linux can just ask, and a file read is cheap enough not to cache.
+     if (process.platform === 'linux') {
+-      return linuxCpuHasAvx2()
++      return probeCpuAvx2() ?? true
+     }
+ 
+     // Everything else assumes AVX2 — true of every x64 CPU since ~2013.
+     //
+     // Windows and macOS use the crash fallback rather than a subprocess probe.
+     // Windows has no /proc/cpuinfo equivalent we can read without
+     // spawning something, and the probe that used to fill the gap asked
+     // PowerShell to compile a C# stub and P/Invoke
+     // kernel32!IsProcessorFeaturePresent — accurate, but a textbook malware
+     // shape that Windows Defender flagged as a "Suspicious PowerShell command
+     // line" on real user machines. The illegal-instruction handler corrects us
+     // instead: tryFallbackToBaseline() calls recordMachineLacksAvx2(), so a
+     // machine without AVX2 pays exactly one failed launch and is answered by
+     // the cache read above from then on.
+     return true
+   }
+ 
+-  // Called from the illegal-instruction fallback. Persisting here is what keeps
+-  // the optimistic assumption above from costing more than a single crash — and
+-  // it is deliberately separate from the metadata target, so a lost or rewritten
+-  // metadata file can't resurrect the AVX2 build on a CPU that can't run it.
+-  function recordMachineLacksAvx2() {
++  /**
++   * Positive evidence that this CPU runs the optimized build: a recorded
++   * verdict with evidence, or the OS probe. The optimistic default does not
++   * count. This is what lets a baseline install move back to the optimized
++   * build; without evidence, baseline stays put.
++   */
++  function knownToHaveAvx2() {
++    if (!machineHasAvx2()) return false
++    const record = readCpuFeatureRecord()
++    if (record?.avx2 === true && record.evidence) return true
++    return probeCpuAvx2() === true
++  }
++
++  // Called from the illegal-instruction fallback, only when the CPU is shown
++  // to lack AVX2 or nothing can say either way (see tryFallbackToBaseline).
++  // Persisting here is what keeps the optimistic assumption above from costing
++  // more than a single crash — and it is deliberately separate from the
++  // metadata target, so a lost or rewritten metadata file can't resurrect the
++  // AVX2 build on a CPU that can't run it.
++  function recordMachineLacksAvx2(evidence = 'crash') {
+     _hasAvx2Cache = false
+-    writeCachedAvx2(false)
++    writeCpuFeatureRecord(false, evidence)
+   }
+ 
+   function getCpuFeatureCachePath() {
+     return path.join(CONFIG.configDir, 'cpu-features.json')
+   }
+ 
+-  function readCachedAvx2() {
++  /** `{ avx2, evidence }`; evidence is null on a record from an older launcher. */
++  function readCpuFeatureRecord() {
+     try {
+       const cache = JSON.parse(
+         fs.readFileSync(getCpuFeatureCachePath(), 'utf8'),
+       )
+-      return typeof cache.avx2 === 'boolean' ? cache.avx2 : null
++      if (typeof cache.avx2 !== 'boolean') return null
++      return {
++        avx2: cache.avx2,
++        evidence:
++          typeof cache.evidence === 'string' && cache.evidence
++            ? cache.evidence
++            : null,
++      }
+     } catch {
+       return null
+     }
+   }
+ 
+-  function writeCachedAvx2(value) {
++  function readCachedAvx2() {
++    return readCpuFeatureRecord()?.avx2 ?? null
++  }
++
++  function writeCpuFeatureRecord(value, evidence) {
+     try {
+       fs.mkdirSync(CONFIG.configDir, { recursive: true })
+       fs.writeFileSync(
+         getCpuFeatureCachePath(),
+-        JSON.stringify({ avx2: value }),
++        JSON.stringify({ avx2: value, evidence }),
+       )
+     } catch {
+       // Best effort; we'll just re-probe next launch.
+     }
+   }
+ 
++  function clearCpuFeatureRecord() {
++    try {
++      fs.unlinkSync(getCpuFeatureCachePath())
++    } catch {
++      // Already gone, or unwritable; either way nothing pins baseline now.
++    }
++  }
++
+   function getDefaultTargetKey() {
+     const override = getTargetOverride()
+     if (override) {
+       return override
+     }
+ 
+     const platformKey = getPlatformKey()
+     // Linux still detects up front (reading /proc/cpuinfo is free). Windows
+     // and macOS are optimistic-then-corrected; the old Windows PowerShell
+     // probe tripped Defender. See
+     // detectMachineHasAvx2() and tryFallbackToBaseline(). Once a machine has
+     // failed once, readCachedAvx2() answers here and baseline is chosen up front
+     // exactly as it used to be.
+     //
+     // This assumes every baseline target is gated on AVX2 specifically, which
+     // holds today (linux-x64, darwin-x64 and win32-x64 have baseline builds, all
+     // AVX2-gated). If a baseline build is ever added for a different reason, give
+     // BASELINE_FALLBACK_TARGETS a per-target capability and check that instead.
+     if (BASELINE_FALLBACK_TARGETS[platformKey] && !machineHasAvx2()) {
+       return BASELINE_FALLBACK_TARGETS[platformKey]
+     }
+ 
+     return platformKey
+   }
+ 
+@@ -558,50 +688,61 @@ function createLauncher(productConfig) {
+     // optimized binary still dies with SIGILL, fall back to baseline.
+     return BASELINE_FALLBACK_TARGETS[getPlatformKey()] || null
+   }
+ 
+   function isTargetAllowedForThisMachine(target) {
+     const override = getTargetOverride()
+     if (override) {
+       return target === override
+     }
+     // Check the baseline fallback first: it's always safe on its platform and
+     // avoids running CPU detection when a baseline binary is already installed.
+     return (
+       target === getBaselineFallbackTargetKey() ||
+       target === getDefaultTargetKey()
+     )
+   }
+ 
+   function getDownloadTargetKey() {
+     const override = getTargetOverride()
+     if (override) {
+       return override
+     }
+ 
+     const metadata = getCurrentMetadata()
+     if (metadata?.target && isTargetAllowedForThisMachine(metadata.target)) {
++      // An installed baseline keeps running (isTargetAllowedForThisMachine
++      // always allows it), but it is not a life sentence: once there is
++      // evidence the CPU has AVX2, the next download goes back to the optimized
++      // build. That is how a machine sent to baseline by a crash that was not a
++      // missing AVX2 re-probes on the next version.
++      if (
++        metadata.target === getBaselineFallbackTargetKey() &&
++        knownToHaveAvx2()
++      ) {
++        return getDefaultTargetKey()
++      }
+       return metadata.target
+     }
+ 
+     return getDefaultTargetKey()
+   }
+ 
+   /**
+    * One version document from the npm registry: `latest` or an exact version.
+    * Returns null when the registry cannot answer. The document is the source
+    * of the expected archive checksums for any release other than the
+    * wrapper's own, so it is fetched over TLS from the registry and never from
+    * the download origin.
+    */
+   async function fetchRegistryRelease(versionOrTag) {
+     try {
+       const res = await httpGet(
+         `${NPM_REGISTRY_ORIGIN}/${packageName}/${encodeURIComponent(versionOrTag)}`,
+       )
+ 
+       if (res.statusCode !== 200) {
+         res.resume()
+         return null
+       }
+ 
+       const body = await streamToString(res)
+@@ -1691,118 +1832,160 @@ function createLauncher(productConfig) {
+       msAlive: () => Date.now() - startedAt,
+       stderrTail: () =>
+         Buffer.concat(chunks).toString('utf8').slice(-STDERR_TAIL_BYTES),
+       // 'exit' can beat the last bytes through the pipe; 'close' is the event
+       // that means the stdio is drained too. The timeout is a bound on a stuck
+       // pipe and is deliberately NOT unref'd — an unref'd timer lets the
+       // process exit before it fires, which would swallow the crash report
+       // entirely. Already-drained streams resolve without waiting for it.
+       drained: () =>
+         child.stderr && !child.stderr.readableEnded
+           ? new Promise((resolve) => {
+               child.once('close', resolve)
+               child.stderr.once('end', resolve)
+               setTimeout(resolve, 250)
+             })
+           : Promise.resolve(),
+     }
+   }
+ 
+   async function tryFallbackToBaseline(code, signal, msAlive, stderrTail = '') {
+     // Three spellings of one failure, at two levels of certainty. SIGILL /
+     // STATUS_ILLEGAL_INSTRUCTION, or Bun's crash report naming the missing
+     // feature (see stderrReportsMissingCpuFeature), is proof this CPU cannot
+     // run this build; a Windows startup abort is a strong suspicion (see
+     // isStartupCpuFeatureCrash).
+-    const confirmed =
++    let confirmed =
+       isIllegalInstructionExit(code, signal) ||
+       stderrReportsMissingCpuFeature(code, signal, stderrTail)
+     if (!confirmed && !isStartupCpuFeatureCrash(code, signal, msAlive)) {
+       return false
+     }
+ 
+     const fallbackTarget = getBaselineFallbackTargetKey()
+     if (!fallbackTarget) {
+       return false
+     }
+ 
+     // An explicit target is the user's decision; don't download over it.
+     if (getTargetOverride()) {
+       return false
+     }
+ 
+     const metadata = getCurrentMetadata()
+     const currentTarget = metadata?.target || getDefaultTargetKey()
+     if (currentTarget === fallbackTarget) {
+       return false
+     }
+ 
+-    // Only a confirmed illegal instruction gets written down. Persisting it
+-    // before the download is what caps the cost at one crash: even if the
+-    // download or the relaunch fails, we never optimistically pick the AVX2
+-    // build again. A suspected crash records nothing — installing the baseline
+-    // already keeps this machine on it, so a guess that turns out to be wrong
+-    // costs the slower build instead of leaving cpu-features.json asserting a
+-    // CPU limitation we never observed.
+-    if (confirmed) {
+-      recordMachineLacksAvx2()
+-    }
++    // An illegal instruction proves the binary used an instruction this
++    // machine refused, not that the instruction was AVX2: a Bun or JIT bug
++    // raises SIGILL too. So ask for evidence before pinning baseline, which
++    // otherwise sticks for good.
++    //
++    // - The CPU lacks AVX2 (Bun's `Features: no_avx2`, or the OS probe):
++    //   record it. Persisting before the download is what caps the cost at
++    //   one crash: even if the download or the relaunch fails, we never
++    //   optimistically pick the AVX2 build again.
++    // - The CPU has AVX2 (the OS probe, or avx2 in Bun's `CPU:` line): this
++    //   crash is something else. Run baseline for now, since it may still
++    //   start, and record the evidence so the next update goes back to the
++    //   optimized build (getDownloadTargetKey). At worst one crash per release.
++    // - No evidence either way (Windows without Bun's report, an unreadable
++    //   /proc/cpuinfo, Rosetta): a confirmed crash is pinned as before.
++    // A suspected crash records nothing: installing the baseline already keeps
++    // this machine on it, and cpu-features.json should not assert a CPU
++    // limitation we never observed.
++    const verdict = crashAvx2Verdict(code, signal, stderrTail)
++    if (verdict.avx2 === true) {
++      writeCpuFeatureRecord(true, verdict.evidence)
++      confirmed = false
++    } else if (verdict.avx2 === false) {
++      recordMachineLacksAvx2(verdict.evidence)
++      confirmed = true
++    } else if (confirmed) {
++      recordMachineLacksAvx2('crash')
++    }
++    const cpuHasAvx2 = verdict.avx2 === true
+ 
+     let version = metadata?.version || null
+     let binaryChecksums = null
+     if (!version) {
+       const latest = await getLatestRelease()
+       version = latest?.version ?? null
+       binaryChecksums = latest?.binaryChecksums ?? null
+     }
+     if (!version) {
+       return false
+     }
+ 
+     resetTerminal({
+       exitAlternateScreen: shouldExitAlternateScreen(code, signal),
+     })
+     console.error('')
+     console.error(
+-      confirmed
+-        ? `${packageName} is switching to the older-CPU binary for this machine.`
+-        : `${packageName} crashed on startup; trying the older-CPU binary.`,
++      cpuHasAvx2
++        ? `${packageName} crashed, but this CPU supports AVX2; using the older-CPU binary until the next update.`
++        : confirmed
++          ? `${packageName} is switching to the older-CPU binary for this machine.`
++          : `${packageName} crashed on startup; trying the older-CPU binary.`,
+     )
+ 
+     try {
+       await downloadBinary(version, fallbackTarget, { binaryChecksums })
+     } catch (error) {
+       term.clearLine()
+       console.error(`Failed to download ${fallbackTarget}: ${error.message}`)
+       return false
+     }
+ 
+     const child = spawnInstalledBinary({ detached: false })
+     attachExitHandler(child, false)
+     return true
+   }
+ 
++  /**
++   * What the evidence says about AVX2 after a crash: `{ avx2, evidence }`,
++   * avx2 null when nothing can tell. Bun's own verdict that AVX2 is missing
++   * wins, then the OS probe, then avx2 in Bun's `CPU:` line.
++   */
++  function crashAvx2Verdict(code, signal, stderrTail) {
++    if (
++      stderrTail &&
++      !(code === 0 && !signal) &&
++      BUN_NO_AVX2_FEATURE.test(sanitizeForReplay(stderrTail))
++    ) {
++      return { avx2: false, evidence: 'bun-report' }
++    }
++    const probed = probeCpuAvx2()
++    if (probed !== null) return { avx2: probed, evidence: cpuProbeSource() }
++    if (stderrReportsAvx2Present(stderrTail)) {
++      return { avx2: true, evidence: 'bun-report' }
++    }
++    return { avx2: null, evidence: null }
++  }
++
+   function attachExitHandler(child, allowBaselineFallback = true) {
+     const exitListener = async (code, signal) => {
+       // A child we never watched (only reachable from a test) reports no age
+       // rather than a suspiciously young one: absent evidence must not be read
+       // as a startup crash and trigger a download.
+       const msAlive = child.launch ? child.launch.msAlive() : Infinity
+ 
+       // Any failed exit, not only a native crash code: a Bun crash on Windows
+       // usually exits with plain code 3, and the reason is only in its stderr
+       // (see stderrReportsMissingCpuFeature). Clean exits skip the wait.
+       let stderrTail = ''
+       if (child.launch && (code !== 0 || signal)) {
+         await child.launch.drained()
+         stderrTail = child.launch.stderrTail()
+       }
+ 
+       if (
+         allowBaselineFallback &&
+         (await tryFallbackToBaseline(code, signal, msAlive, stderrTail))
+       ) {
+         return
+       }
+ 
+       resetTerminal({
+         exitAlternateScreen: shouldExitAlternateScreen(code, signal),
+@@ -1821,50 +2004,55 @@ function createLauncher(productConfig) {
+       console.log(line)
+     }
+     if (startupBanner.length > 0) console.log('')
+ 
+     await ensureBinaryReady()
+ 
+     const child = spawnInstalledBinary()
+     const exitListener = attachExitHandler(child)
+ 
+     setTimeout(() => {
+       checkForUpdates(child, exitListener)
+     }, 100)
+   }
+ 
+   return {
+     config: productConfig,
+     main,
+     stopRunningProcess,
+     // Internals exposed for tests only. The AVX2 path is optimistic-then-
+     // corrected (see detectMachineHasAvx2), so the correction has to be
+     // exercised directly — there is no way to make a CI runner lack AVX2.
+     __testing: {
+       detectMachineHasAvx2,
+       recordMachineLacksAvx2,
+       readCachedAvx2,
++      readCpuFeatureRecord,
++      parseCpuinfoAvx2,
++      parseSysctlAvx2,
++      stderrReportsAvx2Present,
++      getDownloadTargetKey,
+       isIllegalInstructionExit,
+       isStartupCpuFeatureCrash,
+       stderrReportsMissingCpuFeature,
+       tryFallbackToBaseline,
+       printCrashDiagnostics,
+       checkForUpdates,
+       spawnInstalledBinary,
+       attachExitHandler,
+       getDefaultTargetKey,
+       getCpuFeatureCachePath,
+       getCurrentVersion,
+       getMetadataVersion,
+       getRequiredWrapperVersion,
+       ensureBinaryReady,
+       isTargetAllowedForThisMachine,
+       resolveBinaryChecksums,
+       getExpectedChecksum,
+       stageBinary,
+       isAllowedArchiveEntry,
+       PLATFORM_TARGETS,
+       CONFIG,
+     },
+   }
+ }
+ 
+diff --git a/cli/src/__tests__/launcher-avx2-fallback.test.ts b/cli/src/__tests__/launcher-avx2-fallback.test.ts
+index 108c847f6..d2bab6f53 100644
+--- a/cli/src/__tests__/launcher-avx2-fallback.test.ts
++++ b/cli/src/__tests__/launcher-avx2-fallback.test.ts
+@@ -38,64 +38,68 @@ import {
+   test,
+ } from 'bun:test'
+ 
+ import { ensureCliTestEnv } from './test-utils'
+ 
+ ensureCliTestEnv()
+ 
+ const { createLauncher } = require('../../release-core/launcher.js')
+ 
+ let tempConfigDir: string
+ let originalPlatform: PropertyDescriptor | undefined
+ let originalArch: PropertyDescriptor | undefined
+ 
+ /**
+  * configDir is injected rather than faked through $HOME: under `bun test`,
+  * os.homedir() ignores $HOME, so a test that only set HOME would silently read
+  * and WRITE the developer's real ~/.config/manicode/cpu-features.json.
+  *
+  * platform AND arch are both faked: the branch under test is win32-only, and
+  * detectMachineHasAvx2 returns early for any non-x64 arch — so on the arm64
+  * runners these tests would otherwise pass without executing a line of it.
+  */
+ function makeLauncher(
+   platform: NodeJS.Platform = 'win32',
+   arch: string = 'x64',
++  // What the OS says about AVX2 (/proc/cpuinfo, sysctl). "Could not tell" by
++  // default, so no test depends on the CPU of the machine running it.
++  cpuAvx2Probe: () => boolean | null = () => null,
+ ) {
+   Object.defineProperty(process, 'platform', {
+     value: platform,
+     configurable: true,
+   })
+   Object.defineProperty(process, 'arch', { value: arch, configurable: true })
+   return createLauncher({
+     packageName: 'freebuff',
+     configDir: tempConfigDir,
+     // The wrapper shares the installed version, so the archive checksums come
+     // from its own manifest — `releaseChecksums`, filled by the test — and
+     // never from a registry lookup.
+     wrapperVersion: '1.2.3',
+     binaryChecksums: releaseChecksums,
++    cpuAvx2Probe,
+   }).__testing
+ }
+ 
+ /** Poll until `done()`, so tests wait on the event rather than on a timer. */
+ async function waitFor(done: () => boolean, timeoutMs = 5000) {
+   const deadline = Date.now() + timeoutMs
+   while (!done()) {
+     if (Date.now() > deadline) throw new Error('timed out waiting')
+     await new Promise((resolve) => setTimeout(resolve, 10))
+   }
+ }
+ 
+ /**
+  * Everything the launcher says and every exit it attempts. Capturing exit
+  * matters beyond the assertions: a relaunched child's handler firing after a
+  * test would otherwise call the real process.exit and take the runner down.
+  */
+ const launcher = {
+   lines: [] as string[],
+   exitCodes: [] as (number | undefined)[],
+ }
+ let restoreLauncherCapture = () => {}
+ 
+ function captureLauncherOutput() {
+   const original = {
+@@ -133,51 +137,51 @@ function baselineTarball(script: string, binaryName: string) {
+  * fallback set `releaseTarball`; leaving it unset 404s, which the retry policy
+  * treats as final — so failure paths fail fast instead of backing off.
+  */
+ let releaseTarball: Buffer | null = null
+ /**
+  * What the wrapper's package.json says the baseline archive hashes to. A
+  * placeholder by default so a download is attempted (and 404s) as it always
+  * did; `serveBaselineTarball` replaces it with the real digest.
+  */
+ let releaseChecksums: Record<string, string> = {}
+ let releaseServer: ReturnType<typeof createServer>
+ 
+ function serveBaselineTarball(script: string, platform = 'win32') {
+   releaseTarball = baselineTarball(
+     script,
+     platform === 'win32' ? 'freebuff.exe' : 'freebuff',
+   )
+   releaseChecksums[`${platform}-x64-baseline`] = createHash('sha256')
+     .update(releaseTarball)
+     .digest('hex')
+ }
+ let restoreReleaseEnv = () => {}
+ 
+ beforeAll(async () => {
+   releaseServer = createServer((request, response) => {
+-    const wantsBaseline = ['win32', 'darwin'].some((platform) =>
++    const wantsBaseline = ['win32', 'darwin', 'linux'].some((platform) =>
+       request.url?.endsWith(`freebuff-${platform}-x64-baseline.tar.gz`),
+     )
+     if (releaseTarball && wantsBaseline) {
+       response.writeHead(200)
+       response.end(releaseTarball)
+     } else {
+       response.writeHead(404)
+       response.end('missing')
+     }
+   })
+   await new Promise<void>((resolve) =>
+     releaseServer.listen(0, '127.0.0.1', resolve),
+   )
+   const { port } = releaseServer.address() as AddressInfo
+   const original = {
+     app: process.env.NEXT_PUBLIC_CODEBUFF_APP_URL,
+     noProxy: process.env.NO_PROXY,
+   }
+   process.env.NEXT_PUBLIC_CODEBUFF_APP_URL = `http://127.0.0.1:${port}`
+   process.env.NO_PROXY = '127.0.0.1'
+   restoreReleaseEnv = () => {
+     if (original.app === undefined) {
+       delete process.env.NEXT_PUBLIC_CODEBUFF_APP_URL
+     } else {
+       process.env.NEXT_PUBLIC_CODEBUFF_APP_URL = original.app
+@@ -209,51 +213,51 @@ afterEach(() => {
+   if (originalArch) Object.defineProperty(process, 'arch', originalArch)
+   rmSync(tempConfigDir, { recursive: true, force: true })
+ })
+ 
+ describe('windows AVX2 detection', () => {
+   test('assumes AVX2 on a machine it knows nothing about', () => {
+     const t = makeLauncher()
+     // The point of the change: no probe, no subprocess, just an optimistic yes.
+     expect(t.detectMachineHasAvx2()).toBe(true)
+     expect(t.readCachedAvx2()).toBe(null)
+   })
+ 
+   test('picks the optimized target while the answer is unknown', () => {
+     const t = makeLauncher()
+     expect(t.getDefaultTargetKey()).toBe('win32-x64')
+   })
+ 
+   test('recording a failure flips the answer and persists it', () => {
+     const t = makeLauncher()
+     t.recordMachineLacksAvx2()
+ 
+     expect(t.detectMachineHasAvx2()).toBe(false)
+     expect(t.readCachedAvx2()).toBe(false)
+     expect(
+       JSON.parse(readFileSync(t.getCpuFeatureCachePath(), 'utf8')),
+-    ).toEqual({ avx2: false })
++    ).toEqual({ avx2: false, evidence: 'crash' })
+   })
+ 
+   test('a recorded failure selects baseline up front on the NEXT launch', () => {
+     const first = makeLauncher()
+     first.recordMachineLacksAvx2()
+ 
+     // A brand-new launcher over the same HOME — i.e. the next process.
+     const second = makeLauncher()
+     expect(second.detectMachineHasAvx2()).toBe(false)
+     expect(second.getDefaultTargetKey()).toBe('win32-x64-baseline')
+   })
+ 
+   test('a corrupt cache file is ignored rather than throwing', () => {
+     const t = makeLauncher()
+     const cachePath = t.getCpuFeatureCachePath()
+     mkdirSync(dirname(cachePath), { recursive: true })
+     writeFileSync(cachePath, 'not json{')
+ 
+     expect(t.readCachedAvx2()).toBe(null)
+     expect(t.detectMachineHasAvx2()).toBe(true)
+   })
+ 
+   test('a cache file without an avx2 boolean is ignored', () => {
+     const t = makeLauncher()
+     const cachePath = t.getCpuFeatureCachePath()
+@@ -882,25 +886,271 @@ describe("Bun's crash report on stderr", () => {
+     expect(output).toContain('exited immediately (code 3)')
+     expect(output).toContain('already the older-CPU (baseline) build')
+     expect(output).toContain(
+       'panic: Illegal instruction at address 0x7FF61902F82C',
+     )
+     expect(output).not.toContain('FREEBUFF_BINARY_TARGET=')
+   }, 20000)
+ })
+ 
+ describe('the background update check', () => {
+   test('stands down when the process it watches is already gone', async () => {
+     const t = makeLauncher()
+     // main() schedules this 100ms after launch, so a startup crash that handed
+     // off to the baseline fallback leaves it holding a corpse. Carrying on
+     // from there races that relaunch for the shared temp download directory,
+     // then burns six seconds SIGKILLing a process that already exited.
+     const settled = await Promise.race([
+       t
+         .checkForUpdates({ exitCode: 3, signalCode: null })
+         .then(() => 'stood down'),
+       new Promise((resolve) => setImmediate(() => resolve('kept going'))),
+     ])
+     expect(settled).toBe('stood down')
+   })
+ })
++
++/**
++ * A SIGILL proves an instruction was refused, not that it was AVX2: a Bun or
++ * JIT bug raises it too. Pinning baseline on any SIGILL stranded capable
++ * machines on the slower build for good, so a pin now needs evidence, and an
++ * old evidence-less pin is re-checked.
++ */
++describe('pinning baseline only on evidence', () => {
++  function installBinary(t: ReturnType<typeof makeLauncher>, target: string) {
++    writeFileSync(
++      t.CONFIG.metadataPath,
++      JSON.stringify({ version: '1.2.3', target }),
++    )
++    writeFileSync(t.CONFIG.binaryPath, 'pretend binary')
++  }
++
++  function writeRecord(t: ReturnType<typeof makeLauncher>, record: object) {
++    const cachePath = t.getCpuFeatureCachePath()
++    mkdirSync(dirname(cachePath), { recursive: true })
++    writeFileSync(cachePath, JSON.stringify(record))
++  }
++
++  test('reads avx2 from the flags lines of /proc/cpuinfo', () => {
++    const t = makeLauncher('linux')
++    const haswell =
++      'processor\t: 0\nflags\t\t: fpu sse4_2 avx avx2 bmi2\nbugs\t\t: spectre_v1\n'
++    const sandyBridge =
++      'processor\t: 0\nflags\t\t: fpu sse4_2 avx\nbugs\t\t: avx2_mentioned_elsewhere\n'
++    expect(t.parseCpuinfoAvx2(haswell)).toBe(true)
++    expect(t.parseCpuinfoAvx2(sandyBridge)).toBe(false)
++    // No flags line at all (a stripped container, a non-x86 kernel): unknown,
++    // not "no".
++    expect(t.parseCpuinfoAvx2('processor\t: 0\n')).toBe(null)
++    expect(t.parseCpuinfoAvx2('')).toBe(null)
++  })
++
++  test('reads hw.optional.avx2_0 from sysctl', () => {
++    const t = makeLauncher('darwin')
++    expect(t.parseSysctlAvx2('1\n')).toBe(true)
++    expect(t.parseSysctlAvx2('0\n')).toBe(false)
++    // Apple Silicon prints nothing for this oid.
++    expect(t.parseSysctlAvx2('')).toBe(null)
++    expect(t.parseSysctlAvx2('unknown oid')).toBe(null)
++  })
++
++  test('linux SIGILL on a CPU with avx2 does not pin baseline', async () => {
++    const t = makeLauncher('linux', 'x64', () => true)
++    installBinary(t, 'linux-x64')
++
++    // The download 404s; what matters is what was written on the way.
++    expect(await t.tryFallbackToBaseline(null, 'SIGILL', 40)).toBe(false)
++    expect(t.readCpuFeatureRecord()).toEqual({
++      avx2: true,
++      evidence: 'cpuinfo',
++    })
++    const next = makeLauncher('linux', 'x64', () => true)
++    expect(next.getDefaultTargetKey()).toBe('linux-x64')
++    expect(next.isTargetAllowedForThisMachine('linux-x64')).toBe(true)
++  })
++
++  test('linux SIGILL on a CPU without avx2 pins baseline, naming cpuinfo', async () => {
++    const t = makeLauncher('linux', 'x64', () => false)
++    installBinary(t, 'linux-x64')
++
++    expect(await t.tryFallbackToBaseline(null, 'SIGILL', 40)).toBe(false)
++    expect(t.readCpuFeatureRecord()).toEqual({
++      avx2: false,
++      evidence: 'cpuinfo',
++    })
++    expect(makeLauncher('linux').getDefaultTargetKey()).toBe(
++      'linux-x64-baseline',
++    )
++  })
++
++  test('macOS SIGILL on an Intel Mac with avx2 does not pin baseline', async () => {
++    const t = makeLauncher('darwin', 'x64', () => true)
++    installBinary(t, 'darwin-x64')
++
++    expect(await t.tryFallbackToBaseline(null, 'SIGILL', 40)).toBe(false)
++    expect(t.readCpuFeatureRecord()).toEqual({ avx2: true, evidence: 'sysctl' })
++    expect(makeLauncher('darwin').getDefaultTargetKey()).toBe('darwin-x64')
++  })
++
++  test('macOS SIGILL on an Intel Mac without avx2 pins baseline, naming sysctl', async () => {
++    const t = makeLauncher('darwin', 'x64', () => false)
++    installBinary(t, 'darwin-x64')
++
++    expect(await t.tryFallbackToBaseline(null, 'SIGILL', 40)).toBe(false)
++    expect(t.readCpuFeatureRecord()).toEqual({
++      avx2: false,
++      evidence: 'sysctl',
++    })
++    expect(makeLauncher('darwin').getDefaultTargetKey()).toBe(
++      'darwin-x64-baseline',
++    )
++  })
++
++  test('Apple Silicon never pins, whatever a probe would say', async () => {
++    const t = makeLauncher('darwin', 'arm64', () => false)
++    expect(await t.tryFallbackToBaseline(null, 'SIGILL', 40)).toBe(false)
++    expect(t.readCpuFeatureRecord()).toBe(null)
++    expect(t.detectMachineHasAvx2()).toBe(true)
++    expect(t.getDefaultTargetKey()).toBe('darwin-arm64')
++  })
++
++  test("Bun's no_avx2 outranks a probe that says avx2", async () => {
++    const t = makeLauncher('win32', 'x64', () => true)
++    installBinary(t, 'win32-x64')
++
++    expect(await t.tryFallbackToBaseline(3, null, 40, REPORTED_BUN_CRASH)).toBe(
++      false,
++    )
++    expect(t.readCpuFeatureRecord()).toEqual({
++      avx2: false,
++      evidence: 'bun-report',
++    })
++  })
++
++  test("windows illegal-instruction panic with avx2 in Bun's CPU line does not pin", async () => {
++    const t = makeLauncher()
++    installBinary(t, 'win32-x64')
++    const bugOnAvx2Cpu = [
++      'Bun v1.3.14 (0d9b296a) Windows x64',
++      'Windows v.win11_dt',
++      'CPU: sse42 popcnt avx avx2',
++      'Features: jsc spawn',
++      '',
++      'panic: Illegal instruction at address 0x7FF61902F82C',
++    ].join('\n')
++
++    expect(t.stderrReportsAvx2Present(bugOnAvx2Cpu)).toBe(true)
++    expect(t.stderrReportsAvx2Present(REPORTED_BUN_CRASH)).toBe(false)
++    expect(await t.tryFallbackToBaseline(3, null, 40, bugOnAvx2Cpu)).toBe(false)
++    expect(t.readCpuFeatureRecord()).toEqual({
++      avx2: true,
++      evidence: 'bun-report',
++    })
++    expect(makeLauncher().getDefaultTargetKey()).toBe('win32-x64')
++  })
++
++  test('with no evidence either way, a confirmed crash still pins', async () => {
++    // Windows without Bun's report, an unreadable /proc/cpuinfo, Rosetta.
++    const t = makeLauncher('linux', 'x64', () => null)
++    installBinary(t, 'linux-x64')
++
++    expect(await t.tryFallbackToBaseline(null, 'SIGILL', 40)).toBe(false)
++    expect(t.readCpuFeatureRecord()).toEqual({ avx2: false, evidence: 'crash' })
++  })
++
++  test('an old evidence-less pin on a CPU with avx2 is dropped', () => {
++    const t = makeLauncher('linux', 'x64', () => true)
++    // What every launcher before this fix wrote on any SIGILL.
++    writeRecord(t, { avx2: false })
++
++    expect(t.detectMachineHasAvx2()).toBe(true)
++    expect(t.readCpuFeatureRecord()).toBe(null)
++    expect(t.getDefaultTargetKey()).toBe('linux-x64')
++  })
++
++  test('an old evidence-less pin is kept, with evidence, when the probe agrees', () => {
++    const t = makeLauncher('darwin', 'x64', () => false)
++    writeRecord(t, { avx2: false })
++
++    expect(t.detectMachineHasAvx2()).toBe(false)
++    expect(t.readCpuFeatureRecord()).toEqual({
++      avx2: false,
++      evidence: 'sysctl',
++    })
++  })
++
++  test('an old evidence-less pin is kept when nothing can tell', () => {
++    const t = makeLauncher()
++    writeRecord(t, { avx2: false })
++
++    expect(t.detectMachineHasAvx2()).toBe(false)
++    // Rewritten so the next launch does not ask again.
++    expect(t.readCpuFeatureRecord()).toEqual({ avx2: false, evidence: 'crash' })
++    expect(t.getDefaultTargetKey()).toBe('win32-x64-baseline')
++  })
++
++  test('a pin with evidence is trusted without asking the OS again', () => {
++    let probes = 0
++    const t = makeLauncher('darwin', 'x64', () => {
++      probes++
++      return true
++    })
++    writeRecord(t, { avx2: false, evidence: 'bun-report' })
++
++    expect(t.detectMachineHasAvx2()).toBe(false)
++    expect(probes).toBe(0)
++  })
++
++  test('an installed baseline keeps running, and the next update is the AVX2 build', () => {
++    const t = makeLauncher('darwin', 'x64', () => true)
++    // A Mac an old launcher pinned after an unrelated SIGILL.
++    writeRecord(t, { avx2: false })
++    installBinary(t, 'darwin-x64-baseline')
++
++    // Not re-downloaded at launch: the baseline binary works, and a failed
++    // download here would leave the user with nothing to run.
++    expect(t.getCurrentVersion()).toBe('1.2.3')
++    // The next download (a release update) goes back to the optimized build.
++    expect(t.getDownloadTargetKey()).toBe('darwin-x64')
++  })
++
++  test('an installed baseline stays baseline without evidence of avx2', () => {
++    const t = makeLauncher('darwin', 'x64', () => null)
++    installBinary(t, 'darwin-x64-baseline')
++    // No record, no probe answer: the optimistic default is not evidence.
++    expect(t.getDownloadTargetKey()).toBe('darwin-x64-baseline')
++
++    const pinned = makeLauncher('linux', 'x64', () => true)
++    writeRecord(pinned, { avx2: false, evidence: 'bun-report' })
++    installBinary(pinned, 'linux-x64-baseline')
++    expect(pinned.getDownloadTargetKey()).toBe('linux-x64-baseline')
++  })
++
++  test('end to end: SIGILL on a CPU with avx2 runs baseline once, then updates back', async () => {
++    const t = makeLauncher('linux', 'x64', () => true)
++    const ranMarker = join(tempConfigDir, 'baseline-ran')
++    serveBaselineTarball(`echo ran > ${ranMarker}`, 'linux')
++    writeFileSync(t.CONFIG.binaryPath, '#!/bin/sh\nexit 3\n', { mode: 0o755 })
++    writeFileSync(
++      t.CONFIG.metadataPath,
++      JSON.stringify({ version: '1.2.3', target: 'linux-x64' }),
++    )
++
++    const child = t.spawnInstalledBinary()
++    await new Promise((resolve) => child.once('close', resolve))
++    await t.attachExitHandler(child)(null, 'SIGILL')
++    await waitFor(() => launcher.exitCodes.length > 0)
++
++    // Baseline got its one run.
++    expect(launcher.exitCodes).toEqual([0])
++    expect(existsSync(ranMarker)).toBe(true)
++    expect(launcher.lines.join('\n')).toContain(
++      'this CPU supports AVX2; using the older-CPU binary until the next update',
++    )
++    // But nothing pins it.
++    const next = makeLauncher('linux', 'x64', () => true)
++    expect(next.readCachedAvx2()).toBe(true)
++    expect(next.getDefaultTargetKey()).toBe('linux-x64')
++    expect(next.getCurrentVersion()).toBe('1.2.3')
++    expect(next.getDownloadTargetKey()).toBe('linux-x64')
++  }, 20000)
++})
+diff --git a/common/src/types/freebuff-session.ts b/common/src/types/freebuff-session.ts
+index 28da30b00..9a6d6f7db 100644
+--- a/common/src/types/freebuff-session.ts
++++ b/common/src/types/freebuff-session.ts
+@@ -769,52 +769,50 @@ export type FreebuffSpurStatus =
+ 
+ export type FreebuffScamalyticsStatus =
+   | 'not_checked'
+   | 'clean'
+   | 'suspicious'
+   | 'failed'
+   /** Deliberately not consulted — switched off, or balance exhausted and the
+    *  breaker is open. Same meaning and same reasoning as the Spur variant. */
+   | 'skipped'
+ 
+ export type FreebuffPrivacyDecision =
+   | 'allowed_clean'
+   | 'ipinfo_suspicious_spur_clean'
+   | 'corroborated_block'
+   | 'cloudflare_tor_block'
+   | 'spur_failed_limited'
+   /** ipinfo flagged the egress and no second opinion was obtainable at all —
+    *  every provider disabled, exhausted, or erroring. Carries the restricted
+    *  spend ceiling so a vendor outage cannot widen anyone's budget. */
+   | 'unverified_egress_limited'
+   | 'scamalytics_failed_limited'
+   | 'scamalytics_suspicious_limited'
+   /** Spur named the tunnel, or placed an ipinfo-named anonymizer in a
+    *  datacenter, and Scamalytics did not flag it. */
+   | 'spur_suspicious_limited'
+-  /** ipinfo flagged the IP and the device clock places the user in another
+-   *  country; no provider saw a direct line. */
+   | 'client_hints_limited'
+   | 'ipinfo_failed_limited'
+   | 'limited_other'
+ 
+ export type FreebuffPrivacyProviderDecision =
+   | 'not_checked'
+   | 'cloudflare_tor'
+   | 'ipinfo_clean'
+   | 'ipinfo_failed'
+   | 'ipinfo_only'
+   | 'spur_failed'
+   | 'scamalytics_failed'
+   | 'scamalytics_only'
+   | 'corroborated_soft'
+   | 'corroborated_hard'
+ 
+ export interface FreebuffLimitedModeReason {
+   /** Present for limited access so the model picker can explain why the
+    *  reduced model set is shown without re-running geo/IP logic locally. */
+   countryCode?: string | null
+   countryBlockReason?: FreebuffCountryBlockReason | null
+   ipPrivacySignals?: FreebuffIpPrivacySignal[] | null
+ }
+ 
+ /** Permission for one requested session: a wallet ceiling, or explicit consent
+diff --git a/freebuff/cli/release/package.json b/freebuff/cli/release/package.json
+index e0fcadd56..593fc91a0 100644
+--- a/freebuff/cli/release/package.json
++++ b/freebuff/cli/release/package.json
+@@ -1,28 +1,28 @@
+ {
+   "name": "freebuff",
+-  "version": "0.1.2",
++  "version": "0.1.3",
+   "description": "The world's strongest free coding agent",
+   "license": "MIT",
+   "bin": {
+     "freebuff": "index.js"
+   },
+   "scripts": {
+     "prepack": "node ../../../cli/release-core/prepare-package.js",
+     "postpack": "node ../../../cli/release-core/prepare-package.js --clean"
+   },
+   "files": [
+     "index.js",
+     "launcher.js",
+     "http.js",
+     "README.md"
+   ],
+   "os": [
+     "darwin",
+     "linux",
+     "win32"
+   ],
+   "cpu": [
+     "x64",
+     "arm64"
+   ],
+   "engines": {
