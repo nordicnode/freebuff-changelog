@@ -123,11 +123,17 @@ function entryScore (v) {
 }
 
 // A real summary always beats an error stub; otherwise the newer write wins.
+// Equal `at` stamps go to the incoming copy (y): ISO timestamps carry
+// milliseconds, two writes in the same millisecond are routine in one run
+// (a heal stamp landing on its own summarize's `at`), and the incoming copy
+// is the write that just happened. A strict `>` here silently discarded the
+// newer write on ties -- gaveTries/healTries bookkeeping evaporating between
+// two runs was exactly this.
 function betterCacheEntry (x, y) {
   const sx = entryScore(x)
   const sy = entryScore(y)
   if (sx !== sy) return sx > sy ? x : y
-  return (Date.parse(y?.at || '') || 0) > (Date.parse(x?.at || '') || 0) ? y : x
+  return (Date.parse(y?.at || '') || 0) >= (Date.parse(x?.at || '') || 0) ? y : x
 }
 
 /**
