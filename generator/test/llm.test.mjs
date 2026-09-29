@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -251,6 +251,90 @@ test('heal policy: dirt counts every shipped objection, eligibility is bounded a
   assert.equal(healEligible({ ...dirty, healTries: 2 }), false, 'the spend per row is bounded')
   assert.equal(healEligible({ ...dirty, healAt: new Date().toISOString() }), false, 'a fresh attempt cools down')
   assert.equal(healEligible({ ...dirty, healTries: 1, healAt: '2020-01-01T00:00:00.000Z' }), true, 'a cooled-down attempt is eligible again')
+})
+
+test('re-check policy: only rows that say they are unverified, bounded and cooled down', () => {
+  const unverified = { title: 'T', summary: 'S.', verify: 'unavailable', at: '2020-01-01T00:00:00.000Z' }
+  assert.equal(reverifyEligible(unverified), true, 'an old unverified row is eligible')
+  assert.equal(reverifyEligible({ ...unverified, verify: 'passed' }), false, 'a verdict is not re-checked')
+  assert.equal(reverifyEligible({ ...unverified, verify: 'flagged' }), false, 'an objection belongs to the heal pass, not the re-check')
+  assert.equal(reverifyEligible({ ...unverified, verify: undefined }), false, 'a legacy row that predates the verifier is not re-checked')
+  assert.equal(reverifyEligible({ ...unverified, error: 'boom' }), false, 'an error stub is the retry path')
+  assert.equal(reverifyEligible({ ...unverified, title: '' }), false, 'a record with no text of its own is not a shipped summary')
+  assert.equal(reverifyEligible({ ...unverified, verifyTries: 3 }), false, 'the spend per row is bounded')
+  assert.equal(reverifyEligible({ ...unverified, verifyAt: new Date().toISOString() }), false, 'a fresh attempt cools down')
+  assert.equal(reverifyEligible({ ...unverified, verifyTries: 1, verifyAt: '2020-01-01T00:00:00.000Z' }), true, 'a cooled-down attempt is eligible again')
+})
+
+test('re-check: a row that shipped with no verdict is checked later, and its text is never rewritten', async (t) => {
+  const { mkdtemp, writeFile, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-recheck-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const sha = 'd'.repeat(40)
+  const patch = 'diff --git a/sdk/src/b.ts b/sdk/src/b.ts\n+export const BETA = 1\n'
+  const key = cacheKey(sha, patch)
+  const entry = { kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['SDK'], summary: 'Adds a gate.' }
+  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5' }
+  const unverified = {
+    model: 'deepseek-v4.1', v: PROMPT_V, at: '2026-09-29T01:00:00.000Z',
+    title: 'Beta gate added', summary: 'Adds `BETA` in sdk/src/b.ts to prevent double-spends.',
+    significance: 'minor', audience: 'end-users', cf: 'deadbeef',
+    verify: 'unavailable', verifyModel: 'gpt-6-luna'
+  }
+  const seen = []
+  let verdictOut = { supported: true, issues: [], claims: [] }
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (url, { body }) => {
+    const parsed = JSON.parse(String(body))
+    seen.push({ model: parsed.model, prompt: String(parsed.messages?.[0]?.content || '') })
+    const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify(verdictOut) } }] })
+    return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
+  }
+  try {
+    // Inside the cooldown the row costs nothing.
+    await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: unverified }))
+    await enrichWithLlm([entry], async () => patch, dir, { ...env, CHANGELOG_LLM_REVERIFY_COOLDOWN_MS: String(6 * 60 * 60 * 1000), CHANGELOG_LLM_REVERIFY: '0' }, {})
+    assert.equal(seen.length, 0, 'the re-check budget is off by default only when asked')
+    // Eligible: the check runs on the verifier model and records a verdict --
+    // without touching the text the row already published.
+    await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: { ...unverified, verifyAt: '2020-01-01T00:00:00.000Z' } }))
+    const n = await enrichWithLlm([entry], async () => patch, dir, env, {})
+    assert.equal(n, 0, 'a re-check writes no new entry')
+    assert.equal(seen.length, 1, 'exactly one call: the check, not a rewrite')
+    assert.equal(seen[0].model, DEFAULT_VERIFY_MODEL, 'the check runs on the verify model')
+    assert.match(seen[0].prompt, /checking a changelog entry/, 'and it is the verifier ask')
+    let stored = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    assert.equal(stored[key].verify, 'passed', 'the missing verdict is recorded')
+    assert.equal(stored[key].verifyModel, DEFAULT_VERIFY_MODEL, 'by the model that supplied it')
+    assert.equal(stored[key].verifyTries, 1, 'the attempt is counted')
+    assert.equal(stored[key].title, 'Beta gate added', 'the shipped title is untouched')
+    assert.equal(stored[key].summary, unverified.summary, 'and so is the shipped summary')
+    assert.equal(stored[key].cf, 'deadbeef', 'the re-check is not a context refresh: the fingerprint stays as the writer left it')
+    assert.ok(stored[key].verifyAt, 'the attempt is spaced')
+    let health = JSON.parse(await readFile(join(dir, 'llm-health.json'), 'utf8'))
+    assert.equal(Object.values(health.days)[0].rechecked, 1, 'the ledger counts the re-check')
+    assert.equal(Object.values(health.days)[0].summarized, undefined, 'and does not pretend a row was written')
+    // An objection is recorded as flagged and its text is still untouched:
+    // the repair belongs to the heal pass, which owns rewriting shipped text.
+    verdictOut = { supported: false, issues: ['`BETA` is not in the diff'], claims: [] }
+    await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: { ...unverified, verifyAt: '2020-01-01T00:00:00.000Z' } }))
+    await enrichWithLlm([entry], async () => patch, dir, env, {})
+    stored = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    assert.equal(stored[key].verify, 'flagged', 'the objection stands as a flag')
+    assert.deepEqual(stored[key].verifyClaims, [{ claim: '`BETA` is not in the diff' }], 'with the claim the reviewer named')
+    assert.equal(stored[key].summary, unverified.summary, 'a re-check never rewrites shipped text')
+    health = JSON.parse(await readFile(join(dir, 'llm-health.json'), 'utf8'))
+    assert.equal(Object.values(health.days)[0].flagged, 1, 'and the ledger sees the objection')
+    // At the try cap the row is left alone entirely.
+    const before = seen.length
+    await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: { ...unverified, verifyTries: 3, verifyAt: '2020-01-01T00:00:00.000Z' } }))
+    await enrichWithLlm([entry], async () => patch, dir, env, {})
+    assert.equal(seen.length, before, 'a row at its re-check cap costs nothing')
+  } finally {
+    globalThis.fetch = origFetch
+  }
 })
 
 test('healing: a shipped-with-objections row is re-asked and replaced only by a cleaner rewrite', async (t) => {

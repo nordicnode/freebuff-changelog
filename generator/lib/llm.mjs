@@ -2329,6 +2329,23 @@ export function summaryDirt (rec) {
   return (rec?.ungrounded?.length || 0) + (rec?.valueErrors?.length || 0) + (rec?.whyMissing ? 1 : 0) + (rec?.verify === 'flagged' ? 1 : 0)
 }
 
+// A row that shipped WITHOUT a verdict is not a clean row: the verifier was
+// throttled (429), timed out, or answered with something unparseable, and the
+// check the row was owed never ran. Nothing in the pipeline ever asks again --
+// the cache serves a current-version record, so an `unavailable` row stayed
+// unverified for good, silently. This is the eligibility rule for the deferred
+// re-check: only rows that SAY they are unverified, bounded tries, cooldown
+// stamped on every attempt so a verifier outage cannot turn into a re-check
+// every cycle. The re-check itself is the cheap half of the pipeline: no
+// writer call, no rewrite -- the shipped text is read, never replaced.
+export function reverifyEligible (rec, { maxTries = 3, cooldownMs = 1800000, now = Date.now() } = {}) {
+  if (!rec || rec.error || rec.verify !== 'unavailable') return false
+  // A record with no text of its own is not a shipped summary to re-read.
+  if (!rec.title || !rec.summary) return false
+  if ((Number(rec.verifyTries) || 0) >= maxTries) return false
+  return now - (Date.parse(rec.verifyAt || rec.at || '') || 0) >= cooldownMs
+}
+
 // What the row's prompt shows that can arrive AFTER its summary ships: the
 // PR discussion thread and the glossary. A summary written before its review
 // thread existed is thin evidence, not wrong evidence, so a fingerprint
@@ -3105,6 +3122,29 @@ export function buildSelfCheckPrompt (clean, material) {
   ].join('\n')
 }
 
+// The prompt context for one entry, assembled from the gathered source
+// context. Shared by the summary ask and the deferred re-check, which needs the
+// same corpus to work out which sibling-only names to hand the verifier as
+// attribution cautions -- two copies of this mapping would drift apart and the
+// re-check would quietly check against different evidence than the writer saw.
+export function promptContextOf ({ relText = '', sequence = null, prMeta = null, archMap = null, glossary = '', context = {} } = {}) {
+  return {
+    releaseCtx: relText,
+    sequence,
+    prMeta,
+    architectureMap: archMap || FREEBUFF_ARCHITECTURE_MAP,
+    glossary,
+    structured: context.structured,
+    fileHeaders: context.fileHeaders,
+    fileHistory: context.fileHistory,
+    subsystemDocs: context.subsystemDocs,
+    fullFiles: context.fullFiles,
+    exportOutlines: context.exportOutlines,
+    consumers: context.consumers,
+    changedTests: context.changedTests
+  }
+}
+
 // One entry, start to finish: prompt, call, grounding repair, optional
 // verification, and the record both the cache and the entry receive.
 export async function summarizeEntry ({ entry: e, patch, relText = '', sequence = null, prMeta = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env }) {
@@ -3118,21 +3158,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
   if (prMeta?.matched === 'files' && baseEnv.CHANGELOG_PR_GATE !== '0') {
     prMetaEff = await checkPrRelevance(e, patch, prMeta, baseEnv)
   }
-  const promptCtx = {
-    releaseCtx: relText,
-    sequence,
-    prMeta: prMetaEff,
-    architectureMap: archMap || FREEBUFF_ARCHITECTURE_MAP,
-    glossary,
-    structured: context.structured,
-    fileHeaders: context.fileHeaders,
-    fileHistory: context.fileHistory,
-    subsystemDocs: context.subsystemDocs,
-    fullFiles: context.fullFiles,
-    exportOutlines: context.exportOutlines,
-    consumers: context.consumers,
-    changedTests: context.changedTests
-  }
+  const promptCtx = promptContextOf({ relText, sequence, prMeta: prMetaEff, archMap, glossary, context })
   const prompt = buildPrompt(e, patch, promptCtx)
   const corpus = groundingCorpus(e, patch, promptCtx)
   const sig = e.significance || 'minor'
@@ -3362,7 +3388,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   let apiCalls = 0
   let cacheModified = false
   // What this run's own calls proved, for the drift ledger (recordLlmHealth).
-  const health = { summarized: 0, healed: 0, flagged: 0, ungrounded: 0, whyMissing: 0, verifierUnavailable: 0, deterministicErrors: 0, transientErrors: 0, otherErrors: 0 }
+  const health = { summarized: 0, healed: 0, rechecked: 0, flagged: 0, ungrounded: 0, whyMissing: 0, verifierUnavailable: 0, deterministicErrors: 0, transientErrors: 0, otherErrors: 0 }
 
   const posIndex = new Map(entries.map((x, i) => [x.sha, i]))
   const ctxCache = new Map()
@@ -3487,9 +3513,12 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   const healMaxTries = Number(env.CHANGELOG_LLM_HEAL_MAX_TRIES) > 0 ? Number(env.CHANGELOG_LLM_HEAL_MAX_TRIES) : 2
   const healCooldownMs = Number(env.CHANGELOG_LLM_HEAL_COOLDOWN_MS) > 0 ? Number(env.CHANGELOG_LLM_HEAL_COOLDOWN_MS) : 21600000
   const healBudget = Math.max(0, Math.min(Number(healPerRun) || 0, limit - queue.length))
+  // Rows this run already owns (fresh in the queue, or picked by a pass
+  // below): no two passes may spend calls on the same row.
+  const ownedSha = new Set(queue.map(q => q.entry.sha))
   if (healBudget > 0) {
     const dirty = []
-    const seenSha = new Set()
+    const seenSha = ownedSha
     for (const [k, rec] of Object.entries(cache)) {
       const kv = cacheKeyVersion(k)
       if (!kv || kv.kind === 'eli5' || kv.v !== PROMPT_V) continue
@@ -3535,6 +3564,55 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     if (healed) log(`LLM healing ${healed} row(s) with leftover budget (objections to clear or context that arrived late)`)
   }
 
+  // Deferred re-check: rows that shipped with no verdict at all (see
+  // reverifyEligible). Left alone they stay unchecked forever, which is the
+  // one state the verify pass exists to prevent. Same leftover-budget rule as
+  // the heal pass, and the same claim on a row: never both.
+  const reverifyPerRun = env.CHANGELOG_LLM_REVERIFY === undefined ? 2 : Number(env.CHANGELOG_LLM_REVERIFY)
+  const reverifyMaxTries = Number(env.CHANGELOG_LLM_REVERIFY_MAX_TRIES) > 0 ? Number(env.CHANGELOG_LLM_REVERIFY_MAX_TRIES) : 3
+  const reverifyCooldownMs = Number(env.CHANGELOG_LLM_REVERIFY_COOLDOWN_MS) > 0 ? Number(env.CHANGELOG_LLM_REVERIFY_COOLDOWN_MS) : 1800000
+  const reverifyBudget = Math.max(0, Math.min(Number(reverifyPerRun) || 0, limit - queue.length))
+  if (reverifyBudget > 0) {
+    const unchecked = []
+    for (const [k, rec] of Object.entries(cache)) {
+      const kv = cacheKeyVersion(k)
+      if (!kv || kv.kind === 'eli5' || kv.v !== PROMPT_V) continue
+      const sha = String(k.split(':')[0])
+      if (ownedSha.has(sha)) continue
+      const e = entries[posIndex.get(sha)]
+      if (!e || e.noise || gaveUp({ ...e, ai: rec })) continue
+      if (!reverifyEligible(rec, { maxTries: reverifyMaxTries, cooldownMs: reverifyCooldownMs })) continue
+      // The budget can be turned off between a row shipping unverified and its
+      // re-check arriving; a disabled verifier must not be quietly re-run.
+      if (!shouldVerify(e, rec, env)) continue
+      ownedSha.add(sha)
+      unchecked.push({ k, rec, e })
+    }
+    unchecked.sort((a, b) => rewriteRank({ ...a.e, ai: a.rec }) - rewriteRank({ ...b.e, ai: b.rec }) ||
+      ((Date.parse(a.rec.verifyAt || a.rec.at || '') || 0) - (Date.parse(b.rec.verifyAt || b.rec.at || '') || 0)))
+    const pickedCheck = unchecked.slice(0, reverifyBudget + 2)
+    const checkPatches = await pool(pickedCheck.map(d => async () => {
+      try { return await getPatch(d.e) } catch { return '' }
+    }), 4)
+    let requeued = 0
+    for (let i = 0; i < pickedCheck.length && requeued < reverifyBudget; i++) {
+      const d = pickedCheck[i]
+      const patch = checkPatches[i]
+      if (!patch) continue
+      const hit = bumpOnly(d.e) ? releaseOf(d.e) : null
+      const relText = hit?.text || ''
+      const key = cacheKey(d.e.sha, patch, relText, relText ? RELEASE_ROLLUP_V : 0)
+      // Same guard as a heal: the re-check reads the diff this record was
+      // written from, or it is checking a claim against evidence that moved.
+      if (key !== d.k) continue
+      const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 40)
+      const prMeta = findPrMeta(d.e, prIndex)
+      queue.push({ entry: d.e, patch, key, relText, prMeta, sequence: sequenceForEntry(byDayEntries, d.e, seqWindow), reverify: d.rec })
+      requeued++
+    }
+    if (requeued) log(`LLM re-checking ${requeued} row(s) that shipped without a verifier verdict`)
+  }
+
   if (!queue.length) return 0
 
   let activeIndex = 0
@@ -3544,11 +3622,50 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     while (activeIndex < queue.length) {
       if (gatewayFails >= 3) break
       const idx = activeIndex++
-      const { entry: e, patch, key, relText = '', sequence = null, prMeta = null, cf = null, heal = null, staleContext = false } = queue[idx]
+      const { entry: e, patch, key, relText = '', sequence = null, prMeta = null, cf = null, heal = null, staleContext = false, reverify = null } = queue[idx]
       try {
         const fullPatch = getFullPatch ? await getFullPatch(e).catch(() => '') : ''
         const context = queue[idx].context || (queue[idx].context = await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, fullPatch }))
         if (hasStructuredFacts(context.structured) && !hasStructuredFacts(e.structured)) e.structured = context.structured
+        if (reverify) {
+          // The verdict the row was owed, and only the verdict: the shipped
+          // text is read, never rewritten, because an entry already published
+          // should not churn to gain a check. Passing clears the missing
+          // verdict; an objection marks the row `flagged`, which hands it to
+          // the heal pass on a later run instead of duplicating the repair
+          // logic here.
+          const promptCtx = promptContextOf({ relText, sequence, prMeta, archMap, glossary, context })
+          const cautionNames = sequenceOnlyNames(sequence, groundingCorpus(e, patch, { ...promptCtx, sequence: null }))
+          const described = { title: reverify.title, summary: reverify.summary, evidence: reverify.evidence, audience: reverify.audience }
+          const verdict = await verifySummary(e, patch, described, env, cautionNames)
+          const badClaims = (verdict.claims || []).filter(c => !c.supported)
+          const objected = !verdict.supported && (verdict.issues.length || badClaims.length)
+          const nowIso = new Date().toISOString()
+          const rechecked = {
+            ...reverify,
+            verify: objected ? 'flagged' : 'passed',
+            verifyModel: verifyModelOf(env),
+            verifyTries: (Number(reverify.verifyTries) || 0) + 1,
+            verifyAt: nowIso,
+            at: nowIso
+          }
+          if (objected) {
+            rechecked.verifyClaims = [
+              ...(verdict.issues || []).slice(0, 3).map(i => ({ claim: i })),
+              ...badClaims.slice(0, 3).map(c => ({ claim: c.quote, ...(c.reason ? { reason: c.reason } : {}) }))
+            ].slice(0, 5)
+          } else {
+            delete rechecked.verifyClaims
+          }
+          cache[key] = rechecked
+          e.ai = { ...rechecked }
+          gatewayFails = 0
+          cacheModified = true
+          health.rechecked++
+          if (objected) health.flagged++
+          log(`LLM re-checked ${e.sha.slice(0, 8)}: ${objected ? `the objection stands (${(verdict.issues[0] || badClaims[0]?.quote || '').slice(0, 90)})` : 'verdict now recorded'}`)
+          continue
+        }
         const { record } = await summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env })
         gatewayFails = 0
         apiCalls++
@@ -3601,6 +3718,23 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         if (isDeterministicFailure(err)) health.deterministicErrors++
         else if (isTransientError(err)) health.transientErrors++
         else health.otherErrors++
+        if (reverify) {
+          // Still no verdict, and the shipped text is untouched. One bounded
+          // try is spent and the cooldown is stamped even for a transient
+          // failure: a verifier that is down for an hour must not become a
+          // re-check every cycle.
+          const nowIso = new Date().toISOString()
+          cache[key] = { ...reverify, verifyTries: (Number(reverify.verifyTries) || 0) + 1, verifyAt: nowIso, at: nowIso }
+          cacheModified = true
+          if (isGatewayError(err)) {
+            gatewayFails++
+            if (gatewayFails >= 3) {
+              log('LLM endpoint appears offline (3 consecutive gateway errors): skipping rest of queue this run')
+              break
+            }
+          }
+          continue
+        }
         if (heal) {
           // A heal attempt must never destroy shipped content: a failure
           // leaves the text alone. A transient one keeps the row eligible for

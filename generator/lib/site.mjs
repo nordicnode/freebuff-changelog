@@ -1491,6 +1491,7 @@ function llmHealthCard (doc, card, bar) {
     const s = Number(stats.summarized) || 0
     const parts = [
       Number(stats.healed) ? `${stats.healed} healed` : '',
+      Number(stats.rechecked) ? `${stats.rechecked} re-checked` : '',
       Number(stats.flagged) ? `${stats.flagged} flagged` : '',
       Number(stats.ungrounded) ? `${stats.ungrounded} ungrounded` : '',
       Number(stats.whyMissing) ? `${stats.whyMissing} missing why` : '',
