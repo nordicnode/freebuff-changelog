@@ -153,11 +153,9 @@ test('validateVerifyOut: per-claim verdicts fail closed', () => {
   assert.match(prompt, /"claims":/)
 })
 
-test('verifySummary: the check model defaults to deepseek-v4.1 and honors LLM_VERIFY_MODEL', async () => {
-  assert.equal(verifyModelOf({}), DEFAULT_VERIFY_MODEL, 'deepseek-v4.1 is the default check model')
-  assert.equal(verifyModelOf({ LLM_MODEL: 'deepseek-v4.1' }), 'deepseek-v4.1', 'a deepseek writer is checked by the same default')
-  assert.equal(verifyModelOf({ LLM_MODEL: 'gpt-6-luna' }), DEFAULT_VERIFY_MODEL, 'a gpt-6-luna writer is checked cross-family by the default')
-  assert.equal(verifyModelOf({ LLM_VERIFY_MODEL: 'gpt-6-luna' }), 'gpt-6-luna', 'the cross-model escape hatch is the override')
+test('verifySummary: the check runs on a different model family than the writer', async () => {
+  assert.equal(verifyModelOf({}), DEFAULT_VERIFY_MODEL, 'gpt-6-luna is the default check model')
+  assert.equal(verifyModelOf({ LLM_MODEL: 'deepseek-v4.1' }), 'gpt-6-luna', 'the writer model does not become its own verifier')
   assert.equal(verifyModelOf({ LLM_VERIFY_MODEL: 'other-model' }), 'other-model', 'an explicit LLM_VERIFY_MODEL wins')
   const seen = []
   const orig = globalThis.fetch
@@ -174,7 +172,7 @@ test('verifySummary: the check model defaults to deepseek-v4.1 and honors LLM_VE
     const verdict = await verifySummary(entry, 'diff --git a/sdk/src/a.ts b/sdk/src/a.ts\n+x', clean, env)
     assert.equal(verdict.supported, true)
     assert.equal(seen.length, 1)
-    assert.equal(seen[0].model, DEFAULT_VERIFY_MODEL, 'the wire model is the verify default')
+    assert.equal(seen[0].model, 'gpt-6-luna', 'a deepseek writer is checked by gpt-6-luna')
     await verifySummary(entry, 'diff', clean, { ...env, LLM_VERIFY_MODEL: 'other-model' })
     assert.equal(seen[1].model, 'other-model', 'the override is honored on the wire')
   } finally {
