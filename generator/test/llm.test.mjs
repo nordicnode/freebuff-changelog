@@ -277,8 +277,16 @@ test('re-check: a row that shipped with no verdict is checked later, and its tex
   const key = cacheKey(sha, patch)
   const entry = { kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['SDK'], summary: 'Adds a gate.' }
   const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5' }
+  // Anchored to the clock, not a calendar date. This row models one that
+  // shipped moments ago, and the assertion below is that a freshly shipped
+  // unverified row costs nothing while the re-check budget is off. A fixed
+  // date rots: once its 6h heal cooldown elapsed, the heal pass claimed the
+  // row first -- its fingerprint can never match this test's empty PR
+  // context -- and spent a writer call plus repairs, so the pass this test
+  // exists to pin never ran. That turned the relay's test gate red and
+  // stalled every data commit; fixtures for "just shipped" must stay relative.
   const unverified = {
-    model: 'deepseek-v4.1', v: PROMPT_V, at: '2026-09-29T01:00:00.000Z',
+    model: 'deepseek-v4.1', v: PROMPT_V, at: new Date(Date.now() - 60_000).toISOString(),
     title: 'Beta gate added', summary: 'Adds `BETA` in sdk/src/b.ts to prevent double-spends.',
     significance: 'minor', audience: 'end-users', cf: 'deadbeef',
     verify: 'unavailable', verifyModel: 'gpt-6-luna'
