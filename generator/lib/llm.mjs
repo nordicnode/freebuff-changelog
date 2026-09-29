@@ -2972,16 +2972,19 @@ export async function gatherEntryContext (e, patch, { repoDir = null, entries = 
 // newly summarized rows ever reach the verifier, so this is a per-run cost,
 // never a backlog sweep).
 //
-// The check runs on a DIFFERENT model family from the writer: a verifier that
-// shares the writer's model shares its blind spots, so both passes agree on
-// the same wrong claim and the repair round never hears an objection (that is
-// how the ba9141ce-era rows carried correlated errors through recheck). The
-// default check model is gpt-6-luna against a deepseek writer; LLM_VERIFY_MODEL
-// overrides it, and the eval judge falls through the same ladder so scoring is
-// cross-model too. If the writer itself runs on gpt-6-luna there is no third
-// family to switch to and the check stays same-model -- named here rather than
-// pretended away.
-export const DEFAULT_VERIFY_MODEL = 'gpt-6-luna'
+// The default check model is the writer's own family (deepseek-v4.1), which is
+// a deliberate trade: one fewer provider in the loop and the cheapest check we
+// have. The cost is real and worth naming -- a verifier that shares the
+// writer's model shares its blind spots, so both passes can agree on the same
+// wrong claim and the repair round never hears an objection (that is how the
+// ba9141ce-era rows carried correlated errors through recheck). The catch is
+// the deterministic grounding + why validators, which do not depend on the
+// check model at all, and the heal ledger that re-examines shipped rows.
+// A cross-model check is one variable away: set LLM_VERIFY_MODEL to another
+// family (e.g. gpt-6-luna) and the check, plus the eval judge that falls
+// through the same ladder, moves to it with no code change. When the writer is
+// gpt-6-luna the default is cross-family in the other direction.
+export const DEFAULT_VERIFY_MODEL = 'deepseek-v4.1'
 export function verifyModelOf (env = process.env) {
   return env.LLM_VERIFY_MODEL || DEFAULT_VERIFY_MODEL
 }

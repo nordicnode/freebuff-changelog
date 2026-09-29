@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -347,14 +347,17 @@ test('verifier unavailability: the row says so and the health ledger counts it',
   const patch = 'diff --git a/x b/x\n+export const ALPHA = 1\n'
   const key = cacheKey(sha, patch)
   const entry = { kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'Adds a gate.' }
-  // The writer answers; the cross-model verifier (gpt-6-luna) is down.
+  // The writer answers; the verifier is down. The mock keys off the verify
+  // ask's opening line, not the model name, so it stays a verifier outage
+  // whichever model either pass happens to run on.
   const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', LLM_MODEL: 'deepseek-v4.1', CHANGELOG_LLM_LIMIT: '5' }
   const origFetch = globalThis.fetch
   globalThis.fetch = async (url, { body }) => {
-    const { model } = JSON.parse(String(body))
+    const { messages } = JSON.parse(String(body))
+    const prompt = String(messages?.[0]?.content || '')
     // 400, not 5xx: the 5xx path sleeps through real retry backoff, and this
     // test is about the unavailability being recorded, not the retry ladder.
-    if (model !== 'deepseek-v4.1') return { status: 400, ok: false, headers: { get: () => null }, text: async () => 'verifier down' }
+    if (prompt.startsWith('You are checking a changelog entry against the diff it describes.')) return { status: 400, ok: false, headers: { get: () => null }, text: async () => 'verifier down' }
     const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify({ evidence: 'x b/x holds it.', title: 'Alpha gate added', summary: 'Adds `ALPHA` in x b/x to prevent double-spends.', significance: 'minor', audience: 'end-users', confidence: 'high' }) } }] })
     return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
   }
@@ -365,7 +368,7 @@ test('verifier unavailability: the row says so and the health ledger counts it',
   }
   const stored = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
   assert.equal(stored[key].verify, 'unavailable', 'an unverifiable row is not indistinguishable from an unchecked one')
-  assert.equal(stored[key].verifyModel, 'gpt-6-luna', 'and it names the verifier that failed')
+  assert.equal(stored[key].verifyModel, DEFAULT_VERIFY_MODEL, 'and it names the verifier that failed')
   const health = JSON.parse(await readFile(join(dir, 'llm-health.json'), 'utf8'))
   const day = Object.values(health.days)[0]
   assert.equal(day.verifierUnavailable, 1, 'the ledger counts it for drift detection')
