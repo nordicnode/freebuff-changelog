@@ -1,0 +1,1077 @@
+diff --git a/packages/agent-runtime/src/__tests__/stream-parser-think-leak.test.ts b/packages/agent-runtime/src/__tests__/stream-parser-think-leak.test.ts
+index 7349a9f35..50f38be01 100644
+--- a/packages/agent-runtime/src/__tests__/stream-parser-think-leak.test.ts
++++ b/packages/agent-runtime/src/__tests__/stream-parser-think-leak.test.ts
+@@ -32,88 +32,90 @@ const testAgentTemplate: AgentTemplate = {
+   mcpServers: {},
+   toolNames: ['read_files', 'end_turn'],
+   spawnableAgents: [],
+   systemPrompt: 'Test system prompt',
+   instructionsPrompt: 'Test instructions',
+   stepPrompt: 'Test step prompt',
+ }
+ 
+ /** What a surface would render: streamed text, and the thinking box. */
+ interface Rendered {
+   text: string
+   reasoning: string
+   fullResponse: string
+ }
+ 
+ describe('processStream — leaked think tags', () => {
+   let agentRuntimeImpl: AgentRuntimeDeps & AgentRuntimeScopedDeps
+ 
+   beforeEach(() => {
+     agentRuntimeImpl = { ...TEST_AGENT_RUNTIME_IMPL, sendAction: () => {} }
+   })
+ 
+   async function render(
+     chunks: StreamChunk[],
+     priorHistory: Message[] = [],
++    finishReason: string | undefined = 'stop',
+   ): Promise<Rendered> {
+     async function* stream(): AsyncGenerator<
+       StreamChunk,
+       PromptResult<string | null>
+     > {
+       for (const chunk of chunks) yield chunk
+       return { aborted: false, value: 'msg-id' }
+     }
+ 
+     const sessionState = getInitialSessionState(mockFileContext)
+     const agentState = sessionState.mainAgentState
+     agentState.messageHistory = [...priorHistory]
+ 
+     let text = ''
+     let reasoning = ''
+     const result = await processStream({
+       ...agentRuntimeImpl,
+       agentContext: {},
+       agentState,
+       agentStepId: 'test-step-id',
+       agentTemplate: testAgentTemplate,
+       ancestorRunIds: [],
+       clientSessionId: 'test-session',
+       fileContext: mockFileContext,
+       fingerprintId: 'test-fingerprint',
+       fullResponse: '',
+       localAgentTemplates: { 'test-agent': testAgentTemplate },
+       messages: agentState.messageHistory,
+       prompt: 'test prompt',
+       repoId: undefined,
+       repoUrl: undefined,
+       runId: 'test-run-id',
+       signal: new AbortController().signal,
+       stream: stream(),
+       system: 'test system',
+       tools: {},
+       userId: 'test-user',
+       userInputId: 'test-input-id',
++      streamFinishReason: () => finishReason,
+       onCostCalculated: async () => {},
+       onResponseChunk: (chunk: string | PrintModeEvent) => {
+         if (typeof chunk === 'string') {
+           text += chunk
+         } else if (chunk.type === 'reasoning_delta') {
+           reasoning += chunk.text
+         }
+       },
+     })
+ 
+     return { text, reasoning, fullResponse: result.fullResponse }
+   }
+ 
+   const textChunks = (...texts: string[]): StreamChunk[] =>
+     texts.map((t) => ({ type: 'text' as const, text: t }))
+ 
+   const leakedAssistantTurn: Message[] = [
+     {
+       role: 'assistant',
+       content: [{ type: 'text', text: 'earlier thought</think>earlier answer' }],
+     } as Message,
+   ]
+ 
+   it('routes a paired block to the thinking box', async () => {
+     const { text, reasoning } = await render(
+@@ -147,26 +149,64 @@ describe('processStream — leaked think tags', () => {
+       textChunks('A clean answer this time.'),
+       leakedAssistantTurn,
+     )
+     expect(text).toBe('A clean answer this time.')
+     expect(reasoning).toBe('')
+   })
+ 
+   it('stands down when the lane does populate native reasoning', async () => {
+     const { text, reasoning } = await render(
+       [
+         { type: 'reasoning', text: 'native thought' },
+         ...textChunks('The answer.'),
+       ],
+       leakedAssistantTurn,
+     )
+     expect(reasoning).toBe('native thought')
+     expect(text).toBe('The answer.')
+   })
+ 
+   it('leaves fullResponse raw so the turn-end and arming signals survive', async () => {
+     // isThinkOnlyResponse reads fullResponse to keep a thinking-only step from
+     // ending the turn; historyLeaksThinkTags reads the history to arm the next.
+     const { fullResponse } = await render(textChunks('thought', '</think>done'))
+     expect(fullResponse).toBe('thought</think>done')
+   })
++
++  // CodebuffAI/freebuff#1155
++  it('shows an unclosed head block as the reply when the model ended the step', async () => {
++    const { text, reasoning, fullResponse } = await render(
++      textChunks('<think>', 'Here is the answer.'),
++    )
++    expect(reasoning).toBe('Here is the answer.')
++    expect(text).toBe('Here is the answer.')
++    expect(fullResponse).toBe('<think>Here is the answer.')
++  })
++
++  it('keeps an unclosed head block as a thought when the output limit cut it', async () => {
++    const { text, reasoning } = await render(
++      textChunks('<think>', 'still weighing the'),
++      [],
++      'length',
++    )
++    expect(reasoning).toBe('still weighing the')
++    expect(text).toBe('')
++  })
++
++  it('keeps an unclosed head block as a thought when the step called a tool', async () => {
++    // Not replying yet: the thought led to a tool call, and the turn goes on.
++    const { text, reasoning } = await render([
++      ...textChunks('<think>', 'end the turn now'),
++      { type: 'tool-call', toolCallId: 'c1', toolName: 'end_turn', input: {} },
++    ])
++    expect(reasoning).toBe('end the turn now')
++    expect(text).toBe('')
++  })
++
++  it('keeps a <think> quoted mid-answer in the reply', async () => {
++    const { text, reasoning } = await render(
++      textChunks('Wrap it in a ', '<think>', ' tag, then summarize.'),
++    )
++    expect(text).toBe('Wrap it in a <think> tag, then summarize.')
++    expect(reasoning).toBe('')
++  })
+ })
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 019bd1a19..552ed1611 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -505,95 +505,100 @@ export const runAgentStep = async (
+       agentState,
+       fullResponse: responsesString,
+       shouldEndTurn: false,
+       messageId: null,
+       nResponses,
+     }
+   }
+ 
+   let fullResponse = ''
+   const toolResults: ToolMessage[] = []
+ 
+   // Lets processStream cancel this step's request without cancelling the run
+   // (a runaway response it has decided to stop reading).
+   const streamStop = new AbortController()
+ 
+   // The parser appends model output AND tool results before returning. Only
+   // the former is covered by outputTokens. The persisted anchor is scalar;
+   // this request-local snapshot neither copies text nor tokenizes it.
+   const inputHistory = [...agentState.messageHistory]
+   const contextTools = toolsForContextEstimate(agentState.toolDefinitions)
+   const estimatedInputTokens =
+     countTokensMessages(inputHistory) +
+     countTokens(system) +
+     countTokensJson(contextTools)
+   let contextUsage: ModelUsageData | undefined
++  let finishReason: string | undefined
+ 
+   // Raw stream from AI SDK
+   const stream = getAgentStreamFromTemplate({
+     ...params,
+     signal: AbortSignal.any([params.signal, streamStop.signal]),
+     agentId: agentState.parentId ? agentState.agentId : undefined,
+     costMode: params.costMode,
+     cacheDebugCorrelation: cacheDebugCorrelation
+       ? serializeCacheDebugCorrelation(cacheDebugCorrelation)
+       : undefined,
+     includeCacheControl: supportsCacheControl(agentTemplate.model),
+     messages: [systemMessage(system), ...agentState.messageHistory],
+     onCacheDebugProviderRequestBuilt,
+     onCacheDebugUsageReceived,
+     onUsageReceived: (usage: ModelUsageData) => {
+       contextUsage = usage
+       params.onAgentUsageReceived?.({
+         ...usage,
+         isRoot: !agentState.parentId,
+         agentId: agentState.agentId,
+       })
+     },
+     onUsageIncomplete: params.onAgentUsageIncomplete,
++    onFinishReason: (reason) => {
++      finishReason = reason
++    },
+     template: agentTemplate,
+     onCostCalculated,
+   })
+ 
+   const {
+     fullResponse: fullResponseAfterStream,
+     hadToolCallError,
+     messageId,
+     toolCalls,
+     toolResults: newToolResults,
+   } = await processStream({
+     ...params,
+     agentContext,
+     agentState,
+     agentStepId,
+     agentTemplate,
+     fullResponse,
+     messages: agentState.messageHistory,
+     repoId,
+     stream,
+     onCostCalculated,
+     stopStream: () => streamStop.abort(),
++    streamFinishReason: () => finishReason,
+   }).finally(() => {
+     // Inline agents can replace history (set_messages). A receipt for the old
+     // request is not a baseline for a replacement summary.
+     if (
+       contextUsage &&
+       inputHistory.every((m, i) => agentState.messageHistory[i] === m)
+     ) {
+       recordContextUsage({
+         agentState,
+         model,
+         usage: contextUsage,
+         estimatedInputTokens,
+         estimatedOutputTokens: countTokensMessages(
+           agentState.messageHistory
+             .slice(inputHistory.length)
+             .filter((m) => m.role === 'assistant'),
+         ),
+       })
+     }
+     agentState.contextTokenCount = estimateContextTokens({
+       agentState,
+       model,
+       systemPrompt: system,
+       toolsForTokenCount: contextTools,
+     })
+diff --git a/packages/agent-runtime/src/tools/stream-parser.ts b/packages/agent-runtime/src/tools/stream-parser.ts
+index 0a04a5c7a..71edc1dbe 100644
+--- a/packages/agent-runtime/src/tools/stream-parser.ts
++++ b/packages/agent-runtime/src/tools/stream-parser.ts
+@@ -137,172 +137,179 @@ export function trailingStreamRecoveryStreak(
+     count++
+   }
+   return { count, lastSource }
+ }
+ 
+ export async function processStream(
+   params: {
+     agentContext: Record<string, Subgoal>
+     agentTemplate: AgentTemplate
+     ancestorRunIds: string[]
+     fileContext: ProjectFileContext
+     fingerprintId: string
+     fullResponse: string
+     logger: Logger
+     messages: Message[]
+     repoId: string | undefined
+     runId: string
+     signal: AbortSignal
+     userId: string | undefined
+ 
+     onCostCalculated: (credits: number) => Promise<void>
+     onResponseChunk: (chunk: string | PrintModeEvent) => void
+     /** Cancels this step's model request (not the run). Called when the
+      *  response is cut short by the follow-up suggestion cap. */
+     stopStream?: () => void
++    /** The finish reason the model's stream reported, once it has ended
++     *  (undefined when it never reported one). Tells the think-tag split
++     *  whether a still-open `<think>` was cut off or was the answer. */
++    streamFinishReason?: () => string | undefined
+   } & Omit<
+     ExecuteToolCallParams<any>,
+     | 'currentAssistantMessages'
+     | 'fileProcessingState'
+     | 'fromHandleSteps'
+     | 'fullResponse'
+     | 'input'
+     | 'previousToolCallFinished'
+     | 'state'
+     | 'toolCallId'
+     | 'toolCalls'
+     | 'toolCallsToAddToMessageHistory'
+     | 'toolName'
+     | 'toolResults'
+     | 'toolResultsToAddToMessageHistory'
+   > &
+     ParamsExcluding<
+       typeof processStreamWithTools,
+       | 'processors'
+       | 'defaultProcessor'
+       | 'executeXmlToolCall'
+     >,
+ ) {
+   const {
+     agentState,
+     agentTemplate,
+     ancestorRunIds,
+     fileContext,
+     fullResponse,
+     logger,
+     onCostCalculated,
+     onResponseChunk,
+     runId,
+     signal,
+     stopStream,
++    streamFinishReason,
+     userId,
+   } = params
+   const fullResponseChunks: string[] = [fullResponse]
+ 
+   // === LEAKED-REASONING SPLIT ===
+   // Reasoning that a lane failed to put in its native field arrives here as
+   // ordinary text, tags and all. Reclassify it before it reaches a surface, so
+   // the thinking box is the only place a chain of thought is ever rendered.
+   // See util/think-tag-stream.ts for the three shapes and why the implicit-open
+   // rule is armed from the history rather than from a model id.
+   const thinkTagStream = new ThinkTagStream({
+     implicitOpen: historyLeaksThinkTags(agentState.messageHistory),
+   })
+   const emitThinkSegments = (segments: ThinkStreamSegment[]): void => {
+     for (const segment of segments) {
+       if (segment.type === 'text') {
+         onResponseChunk(segment.text)
+       } else {
+         onResponseChunk({
+           type: 'reasoning_delta',
+           text: segment.text,
+           ancestorRunIds,
+           runId,
+           agentId: agentState.agentId,
+         })
+       }
+     }
+   }
+ 
+   // === MUTABLE STATE ===
+   const toolResults: ToolMessage[] = []
+   const toolResultsToAddToMessageHistory: ToolMessage[] = []
+   const toolCalls: (CodebuffToolCall | CustomToolCall)[] = []
+   const toolCallsToAddToMessageHistory: (CodebuffToolCall | CustomToolCall)[] = []
+   const assistantMessages: Message[] = []
+   // Inline agents replace the parent's history with their result. Track which
+   // current-step messages they inherited so finalization does not append them
+   // a second time. Object identity is local to this stream and never serialized.
+   const claimedByInlineAgent = new Set<Message>()
+   let hadToolCallError = false
+   let sawStreamRecovery = false
++  let sawToolCall = false
+   let followupSuggestionCalls = 0
+   let followupSuggestionLimitHit = false
+   const errorMessages: Message[] = []
+   let resolveStreamDonePromise!: () => void
+   const streamDonePromise = new Promise<void>((resolve) => {
+     resolveStreamDonePromise = resolve
+   })
+   let previousToolCallFinished = streamDonePromise
+ 
+   const fileProcessingState: FileProcessingState = {
+     promisesByPath: {},
+     allPromises: [],
+     fileChangeErrors: [],
+     fileChanges: [],
+     firstFileProcessed: false,
+   }
+ 
+   // === RESPONSE HANDLER ===
+   // Creates a response handler that captures tool events into assistantMessages.
+   // When isXmlMode=true, also captures tool_result events for interleaved ordering.
+   function createResponseHandler() {
+     return (chunk: string | PrintModeEvent) => {
+       if (typeof chunk !== 'string') {
+         if (chunk.type === 'error') {
+           hadToolCallError = true
+           errorMessages.push(
+             userMessage({
+               content: withSystemTags(
+                 `Error during tool call: ${chunk.message}. Please check the tool name and arguments and try again.`,
+               ),
+               tags: ['TOOL_CALL_ERROR'],
+             }),
+           )
+         }
+       }
+       return onResponseChunk(chunk)
+     }
+   }
+ 
+   // === TOOL EXECUTION ===
+   // Unified callback factory for both native and custom tools.
+   function createToolExecutionCallback(toolName: string, isXmlMode: boolean) {
+     const responseHandler = createResponseHandler()
+     return {
+       onTagStart: () => { },
+       onTagEnd: async (_: string, input: Record<string, string>) => {
++        sawToolCall = true
+         if (signal.aborted || followupSuggestionLimitHit) {
+           return
+         }
+         if (FOLLOWUP_SUGGESTION_TOOL_NAMES.has(toolName)) {
+           followupSuggestionCalls++
+           if (
+             followupSuggestionCalls > MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE
+           ) {
+             // Neither executed nor surfaced, so no card renders for it; the
+             // consumption loop sees the flag and stops reading the response.
+             followupSuggestionLimitHit = true
+             logger.warn(
+               {
+                 metric: 'followup_suggestion_limit_hit',
+                 toolName,
+                 limit: MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE,
+                 model: agentTemplate.model,
+                 agentId: agentTemplate.id,
+                 userId,
+                 runId,
+               },
+               'Response repeated a follow-up suggestion tool past the cap; cutting it off',
+             )
+             return
+           }
+@@ -599,51 +606,68 @@ export async function processStream(
+         }
+       } else if (chunk.type === 'tool-call') {
+       } else {
+         chunk satisfies never
+         throw new Error(
+           `Unhandled chunk type: ${(chunk as { type: unknown }).type}`,
+         )
+       }
+     }
+ 
+     if (followupSuggestionLimitHit) {
+       // Not a tool error: it must not force another step, since a response of
+       // nothing but suggestions should still end the turn.
+       errorMessages.push(
+         userMessage({
+           content: withSystemTags(FOLLOWUP_SUGGESTION_LIMIT_MESSAGE),
+           tags: [FOLLOWUP_SUGGESTION_LIMIT_TAG],
+         }),
+       )
+     }
+ 
+     // The step's content is complete: release anything the split still holds,
+     // before the tool-completion await below, so a released head keeps its
+     // place ahead of this step's tool events. `flush` is idempotent, so the
+     // safety-net call in `finally` is a no-op on this path.
+-    emitThinkSegments(thinkTagStream.flush())
++    //
++    // A `<think>` still open here was the reply if the model ended the step
++    // itself with nothing else to show, and a truncated thought if the step
++    // was cut off. A `length` finish after visible content raises no
++    // recovery, so it is checked here. A step that called a tool is not
++    // replying yet, so its open block stays a thought.
++    const finishReason = streamFinishReason?.()
++    emitThinkSegments(
++      thinkTagStream.flush({
++        stepCompleted:
++          !signal.aborted &&
++          !sawStreamRecovery &&
++          !sawToolCall &&
++          !followupSuggestionLimitHit &&
++          finishReason !== undefined &&
++          finishReason !== 'length',
++      }),
++    )
+ 
+     // Retry-outcome signal: this step streamed to completion (no new
+     // recovery, no user abort) while the history tail still carries a
+     // recovery streak — meaning the forced-step retry rescued the turn.
+     // Checked before finalization appends this step's messages, so the count
+     // is the streak being recovered from.
+     if (!sawStreamRecovery && !signal.aborted) {
+       const { count: recoveredFrom, lastSource } = trailingStreamRecoveryStreak(
+         agentState.messageHistory,
+       )
+       if (recoveredFrom > 0) {
+         logger.info(
+           {
+             // See common/src/util/axiom-only-log.ts: without axiomEvent,
+             // info-level fields below ship to Axiom as a shape summary, not
+             // real values.
+             axiomEvent: STREAM_RECOVERY_EVENT,
+             metric: 'stream_recovery_rescued',
+             // The kind resolved by this step specifically; a streak can mix
+             // both kinds, so this is the last note before the success, not
+             // necessarily every note in the streak.
+             source: lastSource,
+             model: agentTemplate.model,
+             agentId: agentTemplate.id,
+             userId,
+diff --git a/packages/agent-runtime/src/util/__tests__/think-tag-stream.test.ts b/packages/agent-runtime/src/util/__tests__/think-tag-stream.test.ts
+index 702f5fe3f..f45529ced 100644
+--- a/packages/agent-runtime/src/util/__tests__/think-tag-stream.test.ts
++++ b/packages/agent-runtime/src/util/__tests__/think-tag-stream.test.ts
+@@ -1,93 +1,191 @@
+ import { describe, expect, it } from 'bun:test'
+ 
+ import {
+   historyLeaksThinkTags,
+   IMPLICIT_OPEN_BUDGET_CHARS,
++  MID_PROSE_THINK_BUDGET_CHARS,
+   stripThinkScaffolding,
+   ThinkTagStream,
+ } from '../think-tag-stream'
+ 
+ import type { ThinkStreamSegment } from '../think-tag-stream'
+ 
+ /** Feed the deltas one at a time, then flush — the shape a real stream has. */
+ function run(
+   deltas: string[],
+-  options?: { implicitOpen?: boolean },
++  options?: { implicitOpen?: boolean; stepCompleted?: boolean },
+ ): ThinkStreamSegment[] {
+   const stream = new ThinkTagStream(options)
+   const out: ThinkStreamSegment[] = []
+   for (const delta of deltas) out.push(...stream.push(delta))
+-  out.push(...stream.flush())
++  out.push(...stream.flush({ stepCompleted: options?.stepCompleted }))
+   return out
+ }
+ 
+ const joined = (segments: ThinkStreamSegment[], type: 'text' | 'reasoning') =>
+   segments
+     .filter((s) => s.type === type)
+     .map((s) => s.text)
+     .join('')
+ 
+ /** Split into single characters — the worst case for tag detection. */
+ const chars = (text: string) => [...text]
+ 
+ describe('ThinkTagStream — paired tags', () => {
+   it('routes a paired block to reasoning and keeps the answer as text', () => {
+     const out = run(['<think>plan it</think>Here is the answer.'])
+     expect(out).toEqual([
+       { type: 'reasoning', text: 'plan it' },
+       { type: 'text', text: 'Here is the answer.' },
+     ])
+   })
+ 
+   it('never emits a tag as text, however the deltas are split', () => {
+     const out = run(chars('before<think>thought</think>after'))
+     expect(joined(out, 'text')).toBe('beforeafter')
+     expect(joined(out, 'reasoning')).toBe('thought')
+   })
+ 
+   it('holds a trailing partial tag rather than emitting it', () => {
+     const stream = new ThinkTagStream()
+     expect(stream.push('answer</thi')).toEqual([
+       { type: 'text', text: 'answer' },
+     ])
+     expect(stream.push('nk>tail')).toEqual([{ type: 'text', text: 'tail' }])
+   })
+ 
+   it('releases a partial tag that never completed as ordinary text', () => {
+     // Segments merge within one push, not across them — so compare the text.
+     expect(joined(run(['a < b']), 'text')).toBe('a < b')
+     expect(joined(run(['ends with <']), 'text')).toBe('ends with <')
+   })
+ 
+-  it('treats an unclosed open tag as reasoning through end of stream', () => {
+-    const out = run(['<think>truncated thou', 'ght'])
++  it('keeps an unclosed head block as reasoning when the step was cut off', () => {
++    // Output limit, abort or interrupted stream: a thought that ran out of room.
++    const out = run(['<think>truncated thou', 'ght'], { stepCompleted: false })
+     expect(joined(out, 'reasoning')).toBe('truncated thought')
+     expect(joined(out, 'text')).toBe('')
+   })
+ })
+ 
++// CodebuffAI/freebuff#1155: an explicit open tag used to send the rest of the
++// step to the thinking box, so a model that wrote the tag as prose, or never
++// closed it, showed the user an empty or cut-short reply.
++describe('ThinkTagStream — explicit open that may not be a thought', () => {
++  it('streams a proper head block live as reasoning, unchanged', () => {
++    // The reasoning-lane shape (DeepSeek/GLM/MiMo in content). Reasoning must
++    // reach the thinking box as it streams, not after the close.
++    const stream = new ThinkTagStream()
++    expect(stream.push('<think>Let me look')).toEqual([
++      { type: 'reasoning', text: 'Let me look' },
++    ])
++    expect(stream.push(' at the file.</think>\n\nThe bug is')).toEqual([
++      { type: 'reasoning', text: ' at the file.' },
++      { type: 'text', text: '\n\nThe bug is' },
++    ])
++    expect(stream.push(' on line 4.')).toEqual([
++      { type: 'text', text: ' on line 4.' },
++    ])
++    expect(stream.flush({ stepCompleted: true })).toEqual([])
++  })
++
++  it('treats leading whitespace as still the head of the step', () => {
++    const out = run(['\n\n<think>plan</think>answer'], { stepCompleted: true })
++    expect(joined(out, 'reasoning')).toBe('plan')
++    expect(joined(out, 'text')).toBe('\n\nanswer')
++  })
++
++  it('re-emits an unclosed head block as text when the model ended the step', () => {
++    const stream = new ThinkTagStream()
++    // Streams as reasoning while the close could still come...
++    expect(stream.push('<think>')).toEqual([])
++    expect(stream.push('Here is the answer you asked for.')).toEqual([
++      { type: 'reasoning', text: 'Here is the answer you asked for.' },
++    ])
++    // ...but the model stopped inside the block, so that was its reply.
++    expect(stream.flush({ stepCompleted: true })).toEqual([
++      { type: 'text', text: 'Here is the answer you asked for.' },
++    ])
++    // Idempotent: the safety-net flush does not emit it twice.
++    expect(stream.flush({ stepCompleted: true })).toEqual([])
++  })
++
++  it('holds a <think> quoted mid-answer and releases it verbatim as text', () => {
++    const out = run(
++      [
++        'Wrap the output in a ',
++        '<think>',
++        ' tag, then write the summary. Here is the rest of my answer.',
++      ],
++      { stepCompleted: true },
++    )
++    expect(joined(out, 'reasoning')).toBe('')
++    expect(joined(out, 'text')).toBe(
++      'Wrap the output in a <think> tag, then write the summary. Here is the rest of my answer.',
++    )
++  })
++
++  it('releases a mid-answer <think> even on a cut-off step', () => {
++    // Never a thought: nothing about a cut-off makes it one.
++    const out = run(['Use <think> here.'], { stepCompleted: false })
++    expect(joined(out, 'text')).toBe('Use <think> here.')
++  })
++
++  it('streams on as text once a mid-answer hold passes its budget', () => {
++    const stream = new ThinkTagStream()
++    expect(stream.push('Docs: <think>')).toEqual([
++      { type: 'text', text: 'Docs: ' },
++    ])
++    const long = 'x'.repeat(MID_PROSE_THINK_BUDGET_CHARS)
++    expect(stream.push(long)).toEqual([{ type: 'text', text: `<think>${long}` }])
++    expect(stream.push(' more')).toEqual([{ type: 'text', text: ' more' }])
++  })
++
++  it('still routes a mid-answer block to reasoning when its close arrives', () => {
++    const out = run(chars('before<think>thought</think>after'))
++    expect(joined(out, 'text')).toBe('beforeafter')
++    expect(joined(out, 'reasoning')).toBe('thought')
++  })
++
++  it('finds a close split across chunks, head or mid-answer', () => {
++    const head = run(['<think>plan it</thi', 'nk>The answer.'], {
++      stepCompleted: true,
++    })
++    expect(head).toEqual([
++      { type: 'reasoning', text: 'plan it' },
++      { type: 'text', text: 'The answer.' },
++    ])
++
++    const mid = run(['Answer. <think>aside</', 'think> Done.'], {
++      stepCompleted: true,
++    })
++    expect(joined(mid, 'reasoning')).toBe('aside')
++    expect(joined(mid, 'text')).toBe('Answer.  Done.')
++  })
++})
++
+ describe('ThinkTagStream — orphan close, not armed', () => {
+   // The default for every non-leaking model: the prose is not reclassified
+   // (it already streamed), but the bare marker must never reach a transcript.
+   it('strips the marker and keeps surrounding prose as text', () => {
+     const out = run(['Saw the anchor.</think>Now find the splitter.'])
+     expect(out).toEqual([
+       { type: 'text', text: 'Saw the anchor.Now find the splitter.' },
+     ])
+   })
+ 
+   it('strips a marker arriving on its own delta', () => {
+     const out = run(['done', '</think>', ' more'])
+     expect(joined(out, 'text')).toBe('done more')
+     expect(joined(out, 'reasoning')).toBe('')
+   })
+ })
+ 
+ describe('ThinkTagStream — orphan close, armed', () => {
+   it('reclassifies the head as reasoning once the marker lands', () => {
+     const out = run(
+       ['Ключевая зацепка: the bundle knows the type.', 'Do that.</think>Real answer.'],
+       { implicitOpen: true },
+     )
+     expect(out).toEqual([
+       {
+diff --git a/packages/agent-runtime/src/util/think-tag-stream.ts b/packages/agent-runtime/src/util/think-tag-stream.ts
+index 86b37af3d..81aa5c987 100644
+--- a/packages/agent-runtime/src/util/think-tag-stream.ts
++++ b/packages/agent-runtime/src/util/think-tag-stream.ts
+@@ -1,96 +1,127 @@
+ /**
+  * Split a model's *content* stream into visible text and reasoning, for the
+  * models that put their reasoning in `content` instead of `reasoning_content`.
+  *
+  * WHY THIS EXISTS. Reasoning reaches a client on exactly one path: a
+  * `reasoning_delta` chunk, which every surface renders in its own thinking
+  * box. That chunk is produced only from a provider's native reasoning field
+  * (`reasoning_content` / `reasoning` / Responses-API summaries — see
+  * openai-compatible-chat-language-model.ts). Nothing downstream ever inspects
+  * `content`, so when a lane serves a thinking model WITHOUT populating the
+  * native field, the whole chain of thought arrives as ordinary text and is
+  * rendered as prose — usually with a bare `</think>` sitting in the middle of
+  * it, because the chat template opened the block for the model and only the
+  * close is generated. That is the "thinking escapes the thinking box" report.
+  *
+  * The leak is a property of the LANE, not the model: the DeepSeek direct lane
+  * maps `reasoning_content` correctly, while the resold openai-compatible lanes
+  * behind the same model id may not. So this cannot be a per-model catalog flag;
+  * it has to be recognised from what actually arrives.
+  *
+  * THREE SHAPES, THREE RULES.
+  *
+  *  1. `<think>…</think>` — paired tags. Content between them is reasoning.
+  *     Unambiguous, free, always on.
+- *  2. A bare `<think>` that never closes (a truncated thought). Everything
+- *     after it is reasoning.
++ *  2. A bare `<think>` that never closes. At the head of the step it is a
++ *     thought and streams live as reasoning. If the model then ENDS the step
++ *     itself with the block still open, what it wrote there was its answer,
++ *     and flush re-emits it as text (see {@link ThinkStreamFlushOptions}).
++ *     Only a step that was cut off (output limit, abort, interrupted stream)
++ *     leaves it as a truncated thought. After visible text, `<think>` is far
++ *     more often prose, such as a doc or template quoting the tag. So that
++ *     block is held and becomes reasoning only if its close arrives, and is
++ *     otherwise released verbatim as text. Before CodebuffAI/freebuff#1155 an
++ *     open tag anywhere sent the rest of the step to the thinking box, and the
++ *     user saw an empty or cut-short reply.
+  *  3. An orphan `</think>` with no open tag — the DeepSeek shape above, where
+  *     the open tag was consumed by the chat template's prefill. The text
+  *     BEFORE it is reasoning, but by the time the marker arrives that text has
+  *     already streamed. Handled by {@link ThinkTagStreamOptions.implicitOpen},
+  *     which is armed only once this conversation has PROVEN the lane leaks
+  *     (see {@link historyLeaksThinkTags}) and holds the head of the step back
+  *     until the marker settles it. When the marker never comes the head is
+  *     released as text, so an answer is delayed but never swallowed.
+  *
+  * With `implicitOpen` off — the default, and every step of every model that
+  * does not leak — rule 3 degrades to stripping the marker: the prose before it
+  * still renders as prose, but a literal `</think>` never reaches a transcript.
+  */
+ 
+ const OPEN_TAG = '<think>'
+ const CLOSE_TAG = '</think>'
+ 
+ export type ThinkStreamSegment = {
+   type: 'text' | 'reasoning'
+   text: string
+ }
+ 
+ export interface ThinkTagStreamOptions {
+   /**
+    * Treat the stream as already inside a think block, so a first orphan
+    * `</think>` closes it and everything before it is reasoning.
+    *
+    * Provisional, not a promise: while it holds, content is BUFFERED rather
+    * than emitted, because the decision it is waiting on cannot be unmade once
+    * a chunk has been sent. {@link ThinkTagStream.disarmImplicitOpen} and
+    * {@link IMPLICIT_OPEN_BUDGET_CHARS} both give up on it and release the
+    * buffer as text.
+    */
+   implicitOpen?: boolean
+ }
+ 
+ /**
+  * How much leading content to hold while waiting for an orphan `</think>`.
+  *
+  * A leaked chain of thought runs well past this, so the cap is not there to
+  * fit one — it bounds the wrong case. If the marker has not arrived by here
+  * the step is answering, not thinking, and the buffer is released as text.
+  */
+ export const IMPLICIT_OPEN_BUDGET_CHARS = 4000
+ 
++/**
++ * How much content to hold after a `<think>` that follows visible text, while
++ * waiting for its close.
++ *
++ * Small on purpose: the user is watching an answer stream, and every held
++ * character is a stall. No lane is known to open a thought mid-answer, so past
++ * this the tag was prose and the hold is released as text.
++ */
++export const MID_PROSE_THINK_BUDGET_CHARS = 1000
++
++export interface ThinkStreamFlushOptions {
++  /**
++   * The model ended the step itself: it finished with a reason other than the
++   * output limit, and the stream was neither aborted nor interrupted.
++   *
++   * Only then is a head `<think>` that never closed re-emitted as text. A step
++   * that was cut off leaves it as reasoning, because there the open block
++   * really is a thought that ran out of room.
++   */
++  stepCompleted?: boolean
++}
++
+ /**
+  * Remove think scaffolding from a fragment, leaving everything else — including
+  * surrounding whitespace — exactly as it was.
+  *
+  * Distinct from `stripThinkTags`, which trims: that one answers "is this whole
+  * response nothing but scaffolding", while this one rewrites text that is still
+  * going to be displayed.
+  */
+ export function stripThinkScaffolding(text: string): string {
+   return text
+     .replace(/<think>[\s\S]*?<\/think>/g, '')
+     .replace(/<think>[\s\S]*$/g, '')
+     .split(CLOSE_TAG)
+     .join('')
+ }
+ 
+ /** Longest suffix of `text` that is a proper prefix of either tag — the part
+  *  that must be held back because the next chunk may complete it. `"…done<"`
+  *  and `"…done</thi"` are both a tag arriving one delta at a time. */
+ function partialTagSuffixLength(text: string): number {
+   const max = Math.min(text.length, CLOSE_TAG.length - 1)
+   for (let len = max; len > 0; len--) {
+     const suffix = text.slice(text.length - len)
+     if (OPEN_TAG.startsWith(suffix) || CLOSE_TAG.startsWith(suffix)) {
+       return len
+@@ -135,157 +166,217 @@ export function historyLeaksThinkTags(
+       // must not arm the next step against a model that never leaked.
+       const head = text.slice(0, IMPLICIT_OPEN_BUDGET_CHARS + CLOSE_TAG.length)
+       if (!head.includes(CLOSE_TAG)) continue
+       if (head.replace(/<think>[\s\S]*?<\/think>/g, '').includes(CLOSE_TAG)) {
+         return true
+       }
+     }
+   }
+   return false
+ }
+ 
+ /**
+  * Incremental classifier over one step's content stream.
+  *
+  * Feed it every text delta; it returns the segments that are safe to emit now.
+  * Adjacent segments of the same type are merged so a caller sends one event per
+  * delta in the common case. Call {@link flush} once the step's text is done.
+  */
+ export class ThinkTagStream {
+   /** Trailing bytes withheld because they may be the start of a tag. */
+   private partial = ''
+   /** Leading content withheld while `implicitOpen` is still undecided. */
+   private held = ''
+   private implicitOpen: boolean
+   private inThinkBlock: boolean
++  /**
++   * Which explicit `<think>` opened the current block: one at the head of the
++   * step (streamed as reasoning), or one after visible text (held until its
++   * close proves it). Null outside a block and inside an implicit one.
++   */
++  private explicitBlock: 'head' | 'midProse' | null = null
++  /** Copy of the open head block's reasoning, re-emitted as text if the model
++   *  ends the step without closing it. */
++  private headThought = ''
++  /** Raw content after a mid-prose `<think>`, not yet emitted as anything. */
++  private midProse = ''
++  /** Whether non-whitespace text has been emitted in this step. */
++  private sawText = false
+ 
+   constructor(options: ThinkTagStreamOptions = {}) {
+     this.implicitOpen = options.implicitOpen ?? false
+     this.inThinkBlock = this.implicitOpen
+   }
+ 
+   /**
+    * Give up on `implicitOpen` and release anything held as text.
+    *
+    * Called when the step turns out not to be leaking after all. The strongest
+    * such signal is a native reasoning chunk: a lane that populates
+    * `reasoning_content` is by definition not putting the thought in `content`,
+    * so whatever is in `content` is the answer.
+    */
+   disarmImplicitOpen(): ThinkStreamSegment[] {
+     if (!this.implicitOpen) return []
+     return this.abandonImplicitOpen()
+   }
+ 
+   push(chunk: string): ThinkStreamSegment[] {
+     if (!chunk) return []
+     const segments: ThinkStreamSegment[] = []
+     let buffer = this.partial + chunk
+     this.partial = ''
+ 
+     while (buffer.length > 0) {
+       if (this.inThinkBlock) {
+         const closeIdx = buffer.indexOf(CLOSE_TAG)
+         if (closeIdx === -1) break
+-        this.addReasoning(segments, buffer.slice(0, closeIdx))
++        const inside = buffer.slice(0, closeIdx)
+         buffer = buffer.slice(closeIdx + CLOSE_TAG.length)
++        if (this.explicitBlock === 'midProse') {
++          // The close proves the hold was a thought after all.
++          const held = (this.midProse + inside).split(OPEN_TAG).join('')
++          this.midProse = ''
++          if (held) push(segments, 'reasoning', held)
++        } else {
++          this.addReasoning(segments, inside)
++        }
+         this.inThinkBlock = false
++        this.explicitBlock = null
++        this.headThought = ''
+         // The close the implicit block was waiting for: everything held is
+         // confirmed reasoning. It can only happen once — a later orphan close
+         // is an ordinary stray marker and is stripped below.
+         this.confirmImplicitOpen(segments)
+         continue
+       }
+ 
+       const openIdx = buffer.indexOf(OPEN_TAG)
+       const closeIdx = buffer.indexOf(CLOSE_TAG)
+       if (openIdx === -1 && closeIdx === -1) break
+       if (openIdx !== -1 && (closeIdx === -1 || openIdx < closeIdx)) {
+         this.addText(segments, buffer.slice(0, openIdx))
+         buffer = buffer.slice(openIdx + OPEN_TAG.length)
+         this.inThinkBlock = true
++        this.explicitBlock = this.sawText ? 'midProse' : 'head'
+         continue
+       }
+       // Orphan close with nothing to close: drop the marker so it cannot reach
+       // a transcript as prose, and keep the text around it as text.
+       this.addText(segments, buffer.slice(0, closeIdx))
+       buffer = buffer.slice(closeIdx + CLOSE_TAG.length)
+     }
+ 
+     const hold = partialTagSuffixLength(buffer)
+     this.partial = buffer.slice(buffer.length - hold)
+     const rest = buffer.slice(0, buffer.length - hold)
+-    if (this.inThinkBlock) this.addReasoning(segments, rest)
++    if (this.inThinkBlock) this.addThinkContent(segments, rest)
+     else this.addText(segments, rest)
+     return segments
+   }
+ 
+   /** Emit everything withheld. A partial tag that never completed was always
+-   *  just text, and content held for an orphan close that never came is the
+-   *  answer — releasing both here is what makes the speculation lossless. */
+-  flush(): ThinkStreamSegment[] {
++   *  just text, and content held for a close that never came is the answer.
++   *  Releasing it here is what makes the speculation lossless. */
++  flush(options: ThinkStreamFlushOptions = {}): ThinkStreamSegment[] {
+     const segments: ThinkStreamSegment[] = []
+     const trailing = this.partial
+     this.partial = ''
+     if (trailing) {
+-      if (this.inThinkBlock) this.addReasoning(segments, trailing)
++      if (this.inThinkBlock) this.addThinkContent(segments, trailing)
+       else this.addText(segments, trailing)
+     }
+     if (this.implicitOpen) segments.push(...this.abandonImplicitOpen())
++    if (this.explicitBlock === 'midProse') this.releaseMidProse(segments)
++    if (this.explicitBlock === 'head' && options.stepCompleted) {
++      // The model stopped on its own inside the block, so it was answering
++      // there. The thinking box already shows this text; the reply needs it.
++      const answer = this.headThought
++      this.headThought = ''
++      this.explicitBlock = null
++      this.inThinkBlock = false
++      if (answer.trim()) this.addText(segments, answer)
++    }
+     return segments
+   }
+ 
++  /** Route content inside a block by the kind of block it is. */
++  private addThinkContent(segments: ThinkStreamSegment[], text: string): void {
++    if (this.explicitBlock !== 'midProse') {
++      this.addReasoning(segments, text)
++      return
++    }
++    this.midProse += text
++    if (this.midProse.length >= MID_PROSE_THINK_BUDGET_CHARS) {
++      this.releaseMidProse(segments)
++    }
++  }
++
++  /** No close is coming for a mid-prose open, so the tag was prose: emit it
++   *  and everything held after it verbatim. A later `</think>` is then an
++   *  orphan and is stripped, like any other. */
++  private releaseMidProse(segments: ThinkStreamSegment[]): void {
++    const held = this.midProse
++    this.midProse = ''
++    this.explicitBlock = null
++    this.inThinkBlock = false
++    this.addText(segments, OPEN_TAG + held)
++  }
++
+   /** The orphan close arrived: what was held was reasoning after all. */
+   private confirmImplicitOpen(segments: ThinkStreamSegment[]): void {
+     if (!this.implicitOpen) return
+     this.implicitOpen = false
+     const held = this.held
+     this.held = ''
+     if (held) push(segments, 'reasoning', held)
+   }
+ 
+   /** No close is coming: what was held was the answer. */
+   private abandonImplicitOpen(): ThinkStreamSegment[] {
+     this.implicitOpen = false
+     this.inThinkBlock = false
+     const held = this.held
+     this.held = ''
++    if (/\S/.test(held)) this.sawText = true
+     return held ? [{ type: 'text', text: held }] : []
+   }
+ 
+   private addReasoning(
+     segments: ThinkStreamSegment[],
+     text: string,
+   ): void {
+     // A nested/duplicated open tag inside a block is scaffolding, never thought.
+     const cleaned = text.split(OPEN_TAG).join('')
+     if (!cleaned) return
+     if (!this.implicitOpen) {
+       push(segments, 'reasoning', cleaned)
++      if (this.explicitBlock === 'head') this.headThought += cleaned
+       return
+     }
+     // Still undecided: this is reasoning only if an orphan close confirms it,
+     // so hold rather than send. Past the budget the step is answering, not
+     // thinking, and the hold is released as text.
+     this.held += cleaned
+     if (this.held.length >= IMPLICIT_OPEN_BUDGET_CHARS) {
+       segments.push(...this.abandonImplicitOpen())
+     }
+   }
+ 
+   private addText(segments: ThinkStreamSegment[], text: string): void {
+     if (!text) return
++    if (/\S/.test(text)) this.sawText = true
+     push(segments, 'text', text)
+   }
+ }
+ 
+ /** Append, merging into the tail when the type matches so a caller sends one
+  *  event per delta in the common case. */
+ function push(
+   segments: ThinkStreamSegment[],
+   type: ThinkStreamSegment['type'],
+   text: string,
+ ): void {
+   const last = segments[segments.length - 1]
+   if (last && last.type === type) last.text += text
+   else segments.push({ type, text })
+ }
