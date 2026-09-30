@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, chargeReverify, verifierUnanswered, VERIFY_POLICY_V } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, chargeReverify, verifierUnanswered, callLlm, VERIFY_POLICY_V } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -719,6 +719,57 @@ test('drift ledger: an enrich run records what its own calls proved', async (t) 
   const day = Object.values(doc.days)[0]
   assert.equal(day.summarized, 1, 'the row that landed is counted')
   assert.equal(day.transientErrors, 1, 'and so is the ask that failed')
+})
+
+test('callLlm: a 5xx that outlives the verbatim retries re-asks with the lean prompt', async () => {
+  // Two live rows sat ungenerated through an hour of gateway timeouts, spending
+  // four identical full-size calls every cycle: three verbatim retries inside
+  // the call, then the same prompt again next cycle. The lean ask (same diff and
+  // facts, wide repository sections dropped) already existed for replies that
+  // came back wrong; a reply that never came back never reached it.
+  const seen = []
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (url, { body }) => {
+    const prompt = JSON.parse(String(body)).messages.at(-1).content
+    seen.push(prompt)
+    return prompt === 'small ask'
+      ? { status: 200, ok: true, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content: JSON.stringify({ done: true }) } }] }) }
+      : { status: 504, ok: false, headers: { get: () => null }, text: async () => 'gateway timeout' }
+  }
+  try {
+    const env = { LLM_API_BASE: 'http://gateway.test/v1', LLM_API_KEY: 'k', CHANGELOG_LLM_RPM: '0' }
+    // Attempt 4 is where the verbatim retries are spent, so the rung is reached
+    // without paying the 2s/4s/8s backoffs in the test.
+    const out = await callLlm('full ask', env, 4, x => x, { leanPrompt: 'small ask' })
+    assert.deepEqual(out, { done: true }, 'the smaller ask is the one that answers')
+    assert.deepEqual(seen, ['full ask', 'small ask'], 'the full ask is not re-sent a fourth time')
+    seen.length = 0
+    await assert.rejects(() => callLlm('full ask', { ...env }, 4, x => x, { leanPrompt: 'small ask', usedLean: true }),
+      /HTTP 504/, 'a spent rung is not taken twice')
+    assert.deepEqual(seen, ['full ask'], 'and nothing else is tried in its place')
+  } finally {
+    globalThis.fetch = origFetch
+  }
+})
+
+test('callLlm: a dropped connection takes the lean rung rather than losing the row', async () => {
+  const seen = []
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (url, { body }) => {
+    const parsed = JSON.parse(String(body))
+    seen.push(parsed.messages.at(-1).content)
+    if (seen.length === 1) throw new Error('fetch failed')
+    return { status: 200, ok: true, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content: JSON.stringify({ done: true }) } }] }) }
+  }
+  try {
+    const env = { LLM_API_BASE: 'http://gateway.test/v1', LLM_API_KEY: 'k', CHANGELOG_LLM_RPM: '0' }
+    const out = await callLlm('full ask', env, 1, x => x, { leanPrompt: 'small ask' })
+    assert.deepEqual(out, { done: true })
+    assert.equal(seen.length, 2, 'one dropped call, one materially different retry')
+    assert.equal(seen[1], 'small ask')
+  } finally {
+    globalThis.fetch = origFetch
+  }
 })
 
 test('cacheKey: prompt version embedded so prompt edits invalidate', () => {

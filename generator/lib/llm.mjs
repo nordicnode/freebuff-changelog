@@ -1587,15 +1587,38 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
   opts.onDelivery?.(prompt)
   const request = { id: randomUUID(), stage: opts.stage || 'generation', model, promptHash: shortHash(prompt), startedAt: new Date(started).toISOString(), outcome: 'pending' }
   scope.requests.push(request)
-  const res = await fetch(`${base.replace(/\/$/, '')}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      authorization: `Bearer ${env.LLM_API_KEY}`
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(Math.max(1, Math.min(timeoutMs, deadlineRoom)))
-  }).catch(err => { request.outcome = 'transport-error'; request.durationMs = Date.now() - started; throw err })
+  // The only rung a transport failure can be fixed by. The rungs above answer
+  // replies that came back wrong; a gateway that 504s or times out answers
+  // nothing, and the full ask has already been re-sent verbatim (up to three
+  // times) byte for byte, so the one attempt that can still add information is
+  // a smaller question: the same diff and facts with the wide repository-derived
+  // sections dropped. Two live rows sat ungenerated through an hour of this,
+  // spending four identical full-size calls every cycle while smaller rows in
+  // the same cycles succeeded.
+  const transportRung = () => (!opts.usedLean && opts.leanPrompt)
+    ? { prompt: opts.leanPrompt, opts: { ...opts, usedLean: true }, how: 'the wide evidence sections dropped' }
+    : null
+  let res
+  try {
+    res = await fetch(`${base.replace(/\/$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${env.LLM_API_KEY}`
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(Math.max(1, Math.min(timeoutMs, deadlineRoom)))
+    })
+  } catch (err) {
+    request.outcome = 'transport-error'
+    request.durationMs = Date.now() - started
+    const rung = isGatewayError(err) ? transportRung() : null
+    if (rung) {
+      log(`LLM ${shortError(err)} on the full ask: re-asking with ${rung.how}`)
+      return callLlm(rung.prompt, env, attempt + 1, validate, rung.opts)
+    }
+    throw err
+  }
   request.status = res.status
   request.outcome = res.ok ? 'received' : 'http-error'
   request.durationMs = Date.now() - started
@@ -1631,6 +1654,15 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     log(`LLM HTTP ${res.status} gateway blip: waiting ${(waitMs / 1000).toFixed(1)}s before retry ${attempt}/3`)
     await boundedWait(waitMs, env)
     return callLlm(prompt, env, attempt + 1, validate, opts)
+  }
+  // Still 5xx after the verbatim retries: ask the smaller question once before
+  // giving the row back to the cycle. Same evidence, fewer sections.
+  if (res.status >= 500 && res.status <= 599) {
+    const rung = transportRung()
+    if (rung) {
+      log(`LLM HTTP ${res.status} survived 3 verbatim attempts: re-asking with ${rung.how}`)
+      return callLlm(rung.prompt, env, attempt + 1, validate, rung.opts)
+    }
   }
   if (!res.ok) throw new Error(shortError(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`))
   const rawText = await res.text().catch(err => { request.outcome = 'body-error'; request.durationMs = Date.now() - started; throw err })
