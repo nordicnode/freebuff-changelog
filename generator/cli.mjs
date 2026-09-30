@@ -1667,6 +1667,7 @@ if (IS_MAIN) {
   else if (cmd === 'enrich-all') await cmdEnrichAll(rest)
   else if (cmd === 'repair-entries') await cmdRepairEntries(rest)
   else if (cmd === 'retry-failed') await cmdRetryFailed(rest)
+  else if (cmd === 'regen-last') await cmdRegenLast(rest)
   else if (cmd === 'prune-cache') await cmdPruneCache(rest)
   else if (cmd === 'glossary') await cmdGlossary(rest)
   else if (cmd === 'eval') await cmdEval(rest)
@@ -1686,6 +1687,7 @@ if (IS_MAIN) {
   node generator/cli.mjs enrich-all              # disabled: no historical API spending
   node generator/cli.mjs repair-entries [--push]   # recompute commitNature / significance / security tag on stored rows (no text touched)
   node generator/cli.mjs retry-failed <sha>... [--admit] [--push]  # release named rows with no generation (clears stubs, re-asks, publishes; --admit decides a row that has neither admission nor an ask on record)
+  node generator/cli.mjs regen-last <N | sha...> [--push]  # regenerate the newest N (max 50) or named rows: fresh summaries, bounded and forward-only
   node generator/cli.mjs prune-cache [--push]      # drop ai-summaries.json keys from retired prompt versions
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
   node generator/cli.mjs eval [--seed N] [--limit N]  # offline stored-artifact audit, zero provider calls
@@ -1816,6 +1818,118 @@ async function cmdRetryFailed (argv) {
     // After the publish, on purpose: a refused name must not undo the releases
     // that did happen, but the run still has to end red so the refusal is seen.
     if (errors.length) throw new Error(`retry-failed: released ${picked.length}, refused ${errors.length}: ${errors.join('; ')}`)
+  })
+  if (!acquired) log('another generate/backfill run holds the worktree lock: retry shortly')
+}
+
+/**
+ * Regenerate the newest N entries (`regen-last 40`) or named rows
+ * (`regen-last <sha>...`): re-ask for a fresh summary on rows that already have
+ * one, plus first asks for rows that have none.
+ *
+ * The sanctioned replacement for the retired `scripts/regenerate-last-20.mjs`,
+ * which fails fast (R16: duplicate regeneration writers). It runs under the
+ * worktree lock and the relay's key, is bounded at 50 rows per run, and is
+ * scoped by `only` + a forced row set, so it is scoped to rows a human asked
+ * for or the newest N -- never to history. Rows outside the set are untouched,
+ * and a row inside it keeps its shipped text if the ask fails: a failure writes
+ * a stub, a stub loses the merge to a real summary, and `e.ai` is only ever
+ * replaced by a successful record.
+ *
+ * Admission: a row in the set either carries `enrichment.policy`, or carries a
+ * generation this pipeline wrote -- which is itself proof it was asked -- and is
+ * stamped admitted on the spot, because the writer's gate reads that field (and
+ * the changelog merge now unions it, so the stamp survives). A row with neither
+ * is refused and named: that would be backfill, which this command exists not
+ * to do.
+ */
+async function cmdRegenLast (argv) {
+  const push = argv.includes('--push')
+  const wants = argv.filter(a => !a.startsWith('--')).map(s => s.trim()).filter(Boolean)
+  if (!wants.length) throw new Error('usage: regen-last <N | sha...> [--push]  (N bounds a run at 50)')
+  const byCount = wants.length === 1 && /^\d+$/.test(wants[0])
+  const CAP = 50
+  const { acquired } = await withLock(LOCK, async () => {
+    const doc = await readJson(`${DATA}/changelog.json`, null)
+    if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
+    let targets
+    if (byCount) {
+      const n = Number(wants[0])
+      if (n < 1 || n > CAP) throw new Error(`regen-last bounds a run at ${CAP} rows (got ${n}): this refreshes the newest entries, it does not rewrite history`)
+      // Newest first; noise never reaches a model.
+      targets = [...doc.entries]
+        .filter(e => !e.noise)
+        .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : (a.sha < b.sha ? 1 : -1)))
+        .slice(0, n)
+    } else {
+      if (wants.length > CAP) throw new Error(`regen-last accepts at most ${CAP} names per run (got ${wants.length})`)
+      targets = []
+      for (const w of wants) {
+        const hits = doc.entries.filter(e => String(e.sha).startsWith(w))
+        if (!hits.length) throw new Error(`regen-last: no entry matches ${w}`)
+        if (hits.length > 1) throw new Error(`regen-last: ${w} matches ${hits.length} entries; use a longer prefix`)
+        targets.push(hits[0])
+      }
+    }
+    if (!llmConfigured()) throw new Error('regen-last needs the LLM configured (CHANGELOG_LLM=1 and LLM_API_KEY): dispatch it through the sync workflow, where the relay key lives')
+    const askable = []
+    const refused = []
+    for (const e of targets) {
+      if (e.enrichment?.policy === QUALITY_POLICY_V) { askable.push(e); continue }
+      if (e.ai?.title) {
+        // Text this pipeline already wrote is the proof it asked: admission is
+        // stamped rather than re-derived, so the writer's gate lets the row
+        // through and the merge keeps the stamp.
+        e.enrichment = { policy: QUALITY_POLICY_V, admittedAt: new Date().toISOString(), released: true }
+        askable.push(e)
+        continue
+      }
+      refused.push(`${e.sha.slice(0, 8)} has neither admission nor a generation: asking it would be backfill`)
+    }
+    for (const r of refused) log(`[regen] REFUSED: ${r}`)
+    if (!askable.length) throw new Error(`regen-last: nothing to regenerate${refused.length ? ` (${refused.join('; ')})` : ''}`)
+    const only = new Set(askable.map(e => e.sha))
+    log(`[regen] regenerating ${askable.length} row(s)${refused.length ? `, refusing ${refused.length}` : ''}: ${[...only].map(s => s.slice(0, 8)).join(', ')}`)
+    // The patch extractor reads the clone, and the clone is restored from an
+    // immutable cache baseline that only the sync loop fetches: fetch first or
+    // every patch comes back empty and the run silently asks nothing.
+    try { await ensureRepo() } catch (err) { log(`[regen] upstream fetch failed: ${err.message.slice(0, 120)}; extracting from the clone as it stands`) }
+    await backfillDiffs(askable, askable.length)
+    const startedAt = Date.now()
+    let written = 0
+    let asked = 0
+    // Its own bounded budget, not the cycle's: this is an operator run of up to
+    // 50 rows, so it gets six calls a row and six minutes, and stops there.
+    await withDeadline(360000, async () => {
+      const env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(askable.length + 1), LLM_DEADLINE_AT: String(deadlineAt()), LLM_CYCLE_BUDGET: { remaining: askable.length * 6 } }
+      const before = llmCallCount()
+      written = await enrichWithLlm(doc.entries, llmPatchFor, DATA, env, { force: only, only, priorityShas: only, retryErrors: true, repoDir: REPO_DIR, getFullPatch: fullPatchFor })
+      asked = llmCallCount() - before
+      // The plain-English line follows the summary: a rewritten summary whose
+      // claims changed re-queues its line through eli5Done on its own.
+      await enrichEli5(doc.entries, DATA, env, { only, priorityShas: only, retryErrors: true, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
+    })
+    // The "generate properly" half of the request: report the outcome per row,
+    // not just a count, so a run that quietly produced nothing cannot look done.
+    const fresh = askable.filter(e => e.ai?.at && Date.parse(e.ai.at) >= startedAt)
+    const noText = askable.filter(e => !e.ai?.title)
+    const flagged = askable.filter(e => e.ai?.verify === 'flagged')
+    const unavailable = askable.filter(e => e.ai?.verify === 'unavailable')
+    log(`[regen] ${fresh.length}/${askable.length} rows rewritten this run (writer reported ${written}, ${asked} call${asked === 1 ? '' : 's'})`)
+    log(`[regen] ${askable.length - noText.length}/${askable.length} now carry text`)
+    if (noText.length) log(`[regen] still without text: ${noText.map(e => e.sha.slice(0, 8)).join(', ')} (their failure stands; the relay keeps retrying them)`)
+    if (flagged.length) log(`[regen] verifier objected: ${flagged.map(e => e.sha.slice(0, 8)).join(', ')}`)
+    if (unavailable.length) log(`[regen] verdict could not run: ${unavailable.map(e => e.sha.slice(0, 8)).join(', ')}`)
+    if (push) {
+      await commitAndPushData({
+        message: `data: regenerate newest ${askable.length} entries (${utcStamp()} UTC)`,
+        overrides: { [`${DATA}/changelog.json`]: doc }
+      })
+    } else {
+      await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: doc }))
+      log('dry run: data written locally, not committed (pass --push)')
+    }
+    if (refused.length) throw new Error(`regen-last: regenerated ${askable.length}, refused ${refused.length}: ${refused.join('; ')}`)
   })
   if (!acquired) log('another generate/backfill run holds the worktree lock: retry shortly')
 }

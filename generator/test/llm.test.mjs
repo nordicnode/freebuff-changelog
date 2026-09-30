@@ -302,6 +302,61 @@ test('retry-failed release: admitted, generation-less rows only, and only failur
   assert.equal(noisy.skipped.length, 1)
 })
 
+test('force: a named row with current text is re-asked, rows outside the set keep theirs', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-force-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const patch = 'diff --git a/x b/x\n+export const ALPHA = 1\n'
+  const seed = (sha) => ({ kind: 'sync', sha, date: '2026-09-30T10:00:00Z', areas: ['CLI'], summary: 'Adds a gate.', ai: { model: 'test-model', v: PROMPT_V, title: 'Old title', summary: 'Old summary.', at: '2026-09-28T00:00:00.000Z' } })
+  const target = seed('1'.repeat(40))
+  const neighbour = seed('2'.repeat(40))
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0', CHANGELOG_LLM_HEAL: '0', CHANGELOG_LLM_REVERIFY: '0' }
+  const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify({ evidence: 'x b/x holds it.', title: 'Alpha gate added', summary: 'Adds `ALPHA` in x b/x.', significance: 'minor', audience: 'end-users', confidence: 'high' }) } }] })
+  const origFetch = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => { calls++; return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope } }
+  try {
+    // A row whose text is current costs nothing -- that is the gate that keeps
+    // the relay from re-asking yesterday's healthy rows forever.
+    const both = new Set([target.sha, neighbour.sha])
+    assert.equal(await enrichWithLlm([target, neighbour], async () => patch, dir, env, { only: both }), 0)
+    assert.equal(calls, 0, 'no force set, no call')
+    // Naming the row re-asks exactly it.
+    const force = new Set([target.sha])
+    const n = await enrichWithLlm([target, neighbour], async () => patch, dir, env, { force, only: both, priorityShas: force })
+    assert.equal(n, 1, 'the named row is rewritten')
+    assert.equal(target.ai.title, 'Alpha gate added')
+    assert.equal(neighbour.ai.title, 'Old title', 'the row outside the force set keeps its shipped text')
+  } finally {
+    globalThis.fetch = origFetch
+  }
+})
+
+test('force: a failed re-ask keeps the shipped text and the shipped record', async (t) => {
+  const { writeFile } = await import('node:fs/promises')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-force-fail-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const patch = 'diff --git a/x b/x\n+export const ALPHA = 1\n'
+  const sha = '3'.repeat(40)
+  const shipped = { model: 'test-model', v: PROMPT_V, title: 'Old title', summary: 'Old summary.', confidence: 'high', at: '2026-09-28T00:00:00.000Z' }
+  const entry = { kind: 'sync', sha, date: '2026-09-30T10:00:00Z', areas: ['CLI'], summary: 'Adds a gate.', ai: { ...shipped } }
+  // The shipped record, under the exact key this row will be asked with.
+  const key = cacheKey(sha, patch)
+  await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: { ...shipped } }))
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0', CHANGELOG_LLM_HEAL: '0', CHANGELOG_LLM_REVERIFY: '0' }
+  const origFetch = globalThis.fetch
+  // 200 with a body that is not JSON: the ask ladder spends its rungs and fails.
+  globalThis.fetch = async () => ({ status: 200, ok: true, headers: { get: () => null }, text: async () => 'this is not JSON' })
+  try {
+    const force = new Set([sha])
+    await enrichWithLlm([entry], async () => patch, dir, env, { force, only: force, priorityShas: force })
+  } finally {
+    globalThis.fetch = origFetch
+  }
+  assert.equal(entry.ai.title, 'Old title', 'a failed regeneration never replaces shipped text')
+  const cache = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+  assert.equal(cache[key]?.title, 'Old title', 'the shipped record survives: a stub loses the merge to a real summary')
+})
+
 test('retry-failed scope: a named release writes only the rows it names', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-only-'))
   t.after(async () => { await rm(dir, { recursive: true, force: true }) })

@@ -3792,6 +3792,14 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   // Out-of-scope rows stay current on purpose -- they keep the text they have.
   const rewriteStale = options.rewriteStale === true || env.CHANGELOG_LLM_REWRITE_STALE === '1' || env.CHANGELOG_LLM_FORCE_REWRITE === '1'
   const rewriteScope = typeof options.rewriteScope === 'function' ? options.rewriteScope : null
+  // A named regeneration (`regen-last`, dispatch input `regen`): the operator
+  // names rows and this run re-asks exactly those, whatever state they are in.
+  // It is a Set, not a mode, because the two failure modes of a rewrite are
+  // "rewrote everything" (no scope) and "quietly rewrote nothing" (a scope the
+  // gate disagreed with): a named set is checkable, bounded by however many rows
+  // a human passed, and unreachable from the schedule. A row outside the set is
+  // untouched, and a row inside it keeps its shipped text if the ask fails.
+  const force = options.force instanceof Set ? options.force : null
   // (built by rewriteScopeOf, below, so the scope and the gate that applies it
   // are tested together rather than drifting apart in two files)
   let apiCalls = 0
@@ -3832,6 +3840,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   // A row whose AI title is the mechanical label was never really summarized:
   // it re-queues regardless of mode (167 such rows at the time of writing).
   const isCurrent = (e) => {
+    if (force?.has(e.sha)) return false
     if (!e.ai?.model || gaveUp(e)) return false
     if (!rewriteIsCurrent(e, { rewriteStale, scope: rewriteScope })) return false
     const rel = bumpOnly(e) ? releaseOf(e)?.text : ''
@@ -3907,14 +3916,15 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     }
     const key = cacheKey(e.sha, patch, relText, relText ? RELEASE_ROLLUP_V : 0, identity)
     const cached = cache[key]
-    if (cached?.error) {
+    const forced = !!force?.has(e.sha)
+    if (cached?.error && !forced) {
       if (!options.retryErrors) continue
       const failedAt = Date.parse(cached.at || '') || 0
       const delay = errorRetryDelayMs(cached, retryOpts)
       if (delay === Infinity) continue // parked for good: no more calls on this key
       if (Date.now() - failedAt < delay) continue
     }
-    if (cached && !cached.error) {
+    if (cached && !cached.error && !forced) {
       // A gave-up record is the mechanical label, not a summary: serving it
       // from cache defeated the re-queue isCurrent exists for (the row was a
       // candidate every run and a cache hit every run -- zero calls, zero
@@ -3927,6 +3937,12 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         continue
       }
     }
+    // A forced row skips both gates above on purpose: its cooldown (an outage
+    // it happened to draw) and its cached text are exactly what the operator
+    // asked to replace. Losing is safe -- a failure writes a stub, and a stub
+    // loses the merge to a real summary, while `e.ai` is only ever replaced by
+    // a successful record -- so a failed regeneration costs a call and nothing
+    // else.
     queue.push({ entry: e, patch, key, relText, sequence, prMeta, context, cf: contextFingerprint(prMeta, glossary) })
     // Reserve one recovery slot when there is enough capacity. Sustained
     // fresh work must not indefinitely starve an admitted unchecked row.
