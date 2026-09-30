@@ -1899,8 +1899,13 @@ async function cmdRegenLast (argv) {
     let written = 0
     let asked = 0
     // Its own bounded budget, not the cycle's: this is an operator run of up to
-    // 50 rows, so it gets six calls a row and six minutes, and stops there.
-    await withDeadline(360000, async () => {
+    // 50 rows, so it gets six calls a row and a minute a row (six-minute floor,
+    // thirty-minute cap). Six minutes flat measured time, not work: a 40-row
+    // run under a flapping gateway wrote five rows and then expired with most
+    // of the set never asked. A row the deadline still reaches keeps its
+    // shipped text and is named in the report.
+    const budgetMs = Math.min(30 * 60000, Math.max(6 * 60000, askable.length * 60000))
+    await withDeadline(budgetMs, async () => {
       const env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(askable.length + 1), LLM_DEADLINE_AT: String(deadlineAt()), LLM_CYCLE_BUDGET: { remaining: askable.length * 6 } }
       const before = llmCallCount()
       written = await enrichWithLlm(doc.entries, llmPatchFor, DATA, env, { force: only, only, priorityShas: only, retryErrors: true, repoDir: REPO_DIR, getFullPatch: fullPatchFor })
