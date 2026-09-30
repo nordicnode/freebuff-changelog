@@ -2417,7 +2417,7 @@ export function summaryDirt (rec) {
 // stamped on every attempt so a verifier outage cannot turn into a re-check
 // every cycle. The re-check itself is the cheap half of the pipeline: no
 // writer call, no rewrite -- the shipped text is read, never replaced.
-export function reverifyEligible (rec, { maxTries = 3, cooldownMs = 1800000, now = Date.now(), reframed = false } = {}) {
+export function reverifyEligible (rec, { maxTries = 3, maxErrors = null, cooldownMs = 1800000, now = Date.now(), reframed = false } = {}) {
   if (!rec || rec.error) return false
   const status = qualityOf({ ai: rec }).verify
   // An objection stands until something new is brought to the check. A verdict
@@ -2429,7 +2429,39 @@ export function reverifyEligible (rec, { maxTries = 3, cooldownMs = 1800000, now
   // A record with no text of its own is not a shipped summary to re-read.
   if (!rec.title || !rec.summary) return false
   if ((Number(rec.verifyTries) || 0) >= maxTries) return false
+  // A call the endpoint never answered is not a verdict spent: the row is
+  // exactly as unverified as it was, and nothing was learned. Charging it to
+  // the same three-try budget froze rows mid-outage -- during the 2026-09-30
+  // 504 storm every re-check burned a try, so a row hit its cap after 90
+  // minutes of gateway errors and the fresh read it was owed could never
+  // happen. Those attempts get their own, much looser allowance; the cooldown
+  // still spaces them, so this is a bound, not a licence to hammer.
+  if ((Number(rec.verifyErrors) || 0) >= (maxErrors ?? maxTries * 4)) return false
   return now - (Date.parse(rec.verifyAt || rec.at || '') || 0) >= cooldownMs
+}
+
+// Book one deferred re-check attempt on a record. `answered` is whether the
+// verifier produced a verdict at all: a gateway 5xx, a timeout or a cycle
+// deadline that aborted the call produced none, and spending the row's verdict
+// budget on it would retire the chance to ask again without ever having asked.
+// `verifyAt` is stamped either way -- the cooldown is what keeps an outage from
+// becoming a re-check every cycle.
+export function chargeReverify (rec, { answered, now = Date.now() } = {}) {
+  const nowIso = new Date(now).toISOString()
+  return answered
+    ? { verifyTries: (Number(rec.verifyTries) || 0) + 1, verifyAt: nowIso }
+    : { verifyErrors: (Number(rec.verifyErrors) || 0) + 1, verifyAt: nowIso }
+}
+
+// Did this failure come back with nothing to judge? A 5xx/timeout/socket error
+// never reached a verdict, a throttled (429) or gateway-timed-out (408) response
+// never returned one either, and neither did a call the cycle deadline killed.
+// Everything else -- including a refusal, an answer from training memory, or a
+// reply the schema could not parse -- is the model answering badly, which is a
+// real attempt and is charged as one.
+export function verifierUnanswered (err) {
+  const msg = String(err?.message || err || '')
+  return isGatewayError(err) || /HTTP 4(29|08)\b/i.test(msg) || /deadline/i.test(msg)
 }
 
 // What the row's prompt shows that can arrive AFTER its summary ships: the
@@ -3802,6 +3834,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   // the heal pass, and the same claim on a row: never both.
   const reverifyPerRun = env.CHANGELOG_LLM_REVERIFY === undefined ? 2 : Number(env.CHANGELOG_LLM_REVERIFY)
   const reverifyMaxTries = Number(env.CHANGELOG_LLM_REVERIFY_MAX_TRIES) > 0 ? Number(env.CHANGELOG_LLM_REVERIFY_MAX_TRIES) : 3
+  const reverifyMaxErrors = Number(env.CHANGELOG_LLM_REVERIFY_MAX_ERRORS) > 0 ? Number(env.CHANGELOG_LLM_REVERIFY_MAX_ERRORS) : reverifyMaxTries * 4
   const reverifyCooldownMs = Number(env.CHANGELOG_LLM_REVERIFY_COOLDOWN_MS) > 0 ? Number(env.CHANGELOG_LLM_REVERIFY_COOLDOWN_MS) : 1800000
   const reverifyBudget = Math.max(0, Math.min(Number(reverifyPerRun) || 0, limit - queue.length))
   if (reverifyBudget > 0) {
@@ -3819,7 +3852,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       // stands under the framing that judged it. Everything else stays gated.
       const reframed = rec.verifyPolicy !== VERIFY_POLICY_V
       if (!reframed && !enrichmentEligible(e, env)) continue
-      if (!reverifyEligible(rec, { maxTries: reverifyMaxTries, cooldownMs: reverifyCooldownMs, reframed })) continue
+      if (!reverifyEligible(rec, { maxTries: reverifyMaxTries, maxErrors: reverifyMaxErrors, cooldownMs: reverifyCooldownMs, reframed })) continue
       // The budget can be turned off between a row shipping unverified and its
       // re-check arriving; a disabled verifier must not be quietly re-run.
       if (!shouldVerify(e, rec, env)) continue
@@ -3969,12 +4002,12 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         else if (isTransientError(err)) health.transientErrors++
         else health.otherErrors++
         if (reverify) {
-          // Still no verdict, and the shipped text is untouched. One bounded
-          // try is spent and the cooldown is stamped even for a transient
-          // failure: a verifier that is down for an hour must not become a
-          // re-check every cycle.
-          const nowIso = new Date().toISOString()
-          cache[key] = { ...reverify, verifyTries: (Number(reverify.verifyTries) || 0) + 1, verifyAt: nowIso, at: nowIso }
+          // Still no verdict, and the shipped text is untouched. The cooldown is
+          // stamped either way -- a verifier that is down for an hour must not
+          // become a re-check every cycle -- but a call that never came back
+          // spends the no-answer allowance, not the row's three verdict tries.
+          const charge = chargeReverify(reverify, { answered: !verifierUnanswered(err) })
+          cache[key] = { ...reverify, ...charge, at: charge.verifyAt }
           cacheModified = true
           if (isGatewayError(err)) {
             gatewayFails++
@@ -4674,7 +4707,10 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     const hit = bumpOnly(e) ? releaseOf(e) : null
     if (eli5Done(e, hit?.text || '', hit ? RELEASE_ROLLUP_V : 0)) {
       const plain = e.eli5
-      const pendingCheck = e.enrichment?.policy === QUALITY_POLICY_V && verifyConfigured(env) && ['unavailable', 'stale'].includes(qualityOf(e).plainVerify) && (Number(plain.verifyTries) || 0) < 3 && Date.now() - (Date.parse(plain.verifyAt || plain.at || '') || 0) >= 1800000
+      // The plain-English re-check obeys the same two budgets as the entry one:
+      // three answers that failed to settle it, and a looser twelve-call
+      // allowance for attempts the endpoint never answered (see reverifyEligible).
+      const pendingCheck = e.enrichment?.policy === QUALITY_POLICY_V && verifyConfigured(env) && ['unavailable', 'stale'].includes(qualityOf(e).plainVerify) && (Number(plain.verifyTries) || 0) < 3 && (Number(plain.verifyErrors) || 0) < 12 && Date.now() - (Date.parse(plain.verifyAt || plain.at || '') || 0) >= 1800000
       return pendingCheck
     }
     // Test-only and docs-only rows: written here, no model, no cache key.
@@ -4742,7 +4778,8 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
           const plain = queue[idx].reverify
           const material = plain.evidenceBundle?.material || [relText, redactProductPrompts(patch), ...contextSectionLines({ ...context, fileHistory: [] })].filter(Boolean).join('\n')
           const verdict = await verifySummary(e, material, { text: plain.text }, env).catch(() => null)
-          const checked = { ...plain, verify: verdict ? verdict.supported ? 'passed' : 'flagged' : 'unavailable', verifyTries: (Number(plain.verifyTries) || 0) + 1, verifyAt: new Date().toISOString(), at: new Date().toISOString() }
+          const charge = chargeReverify(plain, { answered: verdict !== null })
+          const checked = { ...plain, verify: verdict ? verdict.supported ? 'passed' : 'flagged' : 'unavailable', ...charge, at: charge.verifyAt }
           if (verdict?.supported) { checked.verifyHash = artifactHash(plain); delete checked.verifyClaims }
           else if (verdict) checked.verifyClaims = [...verdict.issues.map(claim => ({ claim })), ...verdict.claims.filter(c => !c.supported).map(c => ({ claim: c.quote, reason: c.reason }))]
           cache[key] = checked; e.eli5 = checked; cacheModified = true

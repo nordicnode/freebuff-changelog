@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, VERIFY_POLICY_V } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, chargeReverify, verifierUnanswered, VERIFY_POLICY_V } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -264,6 +264,31 @@ test('re-check policy: only rows that say they are unverified, bounded and coole
   assert.equal(reverifyEligible({ ...unverified, verifyTries: 3 }), false, 'the spend per row is bounded')
   assert.equal(reverifyEligible({ ...unverified, verifyAt: new Date().toISOString() }), false, 'a fresh attempt cools down')
   assert.equal(reverifyEligible({ ...unverified, verifyTries: 1, verifyAt: '2020-01-01T00:00:00.000Z' }), true, 'a cooled-down attempt is eligible again')
+  // Attempts the endpoint never answered are not verdicts spent: during a
+  // gateway outage every re-check used to burn one of the three tries, so a row
+  // hit its cap after 90 minutes of 504s and the fresh read it was owed -- the
+  // whole point of the framing refresh -- could never happen.
+  assert.equal(reverifyEligible({ ...unverified, verifyErrors: 11, verifyAt: '2020-01-01T00:00:00.000Z' }), true,
+    'no-answer attempts do not consume the verdict tries')
+  assert.equal(reverifyEligible({ ...unverified, verifyErrors: 12, verifyAt: '2020-01-01T00:00:00.000Z' }), false,
+    'but their own allowance is bounded too')
+  assert.equal(reverifyEligible({ ...unverified, verifyTries: 3, verifyErrors: 0, verifyAt: '2020-01-01T00:00:00.000Z' }), false,
+    'and an answered-but-unresolved row still parks at its try cap')
+})
+
+test('re-check accounting: an unanswered call spends a no-answer slot, not a verdict try', () => {
+  assert.equal(verifierUnanswered(new Error('LLM HTTP 504')), true, 'a gateway 5xx returned no verdict')
+  assert.equal(verifierUnanswered(new Error('The operation was aborted due to timeout')), true, 'a timeout returned no verdict')
+  assert.equal(verifierUnanswered(new Error('Generator cycle deadline exceeded')), true, 'a deadline killed the call before it answered')
+  assert.equal(verifierUnanswered(new Error('LLM HTTP 429')), true, 'a throttle returned no verdict')
+  assert.equal(verifierUnanswered(new Error('LLM returned no JSON')), false, 'a malformed answer is a real attempt')
+  assert.equal(verifierUnanswered(new Error('the model refused the request')), false, 'and so is a refusal')
+  const spaced = chargeReverify({}, { answered: false, now: Date.parse('2026-09-30T19:00:00Z') })
+  assert.equal(spaced.verifyTries, undefined, 'no verdict try is spent on a call that never answered')
+  assert.equal(spaced.verifyErrors, 1, 'the no-answer count moves instead')
+  assert.equal(spaced.verifyAt, '2026-09-30T19:00:00.000Z', 'and the cooldown is stamped, so the re-ask is spaced')
+  assert.deepEqual(chargeReverify({ verifyTries: 1, verifyErrors: 4 }, { answered: true, now: 0 }),
+    { verifyTries: 2, verifyAt: '1970-01-01T00:00:00.000Z' }, 'only an answered attempt counts as a verdict try')
 })
 
 test('re-check: a row that shipped with no verdict is checked later, and its text is never rewritten', async (t) => {
@@ -397,6 +422,58 @@ test('re-check: a verdict from older verifier framing is re-read once, and the t
     const after = fetchCalls
     await enrichWithLlm([entry], async () => patch, dir, env, {})
     assert.equal(fetchCalls, after, 'a re-read under the current framing is not repeated')
+  } finally {
+    globalThis.fetch = origFetch
+  }
+})
+
+test('re-check: a gateway outage spends no-answer slots, so the fresh read still arrives', async (t) => {
+  const { mkdtemp, writeFile, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-outage-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const sha = '7'.repeat(40)
+  const patch = 'diff --git a/cli/src/a.ts b/cli/src/a.ts\n+export const BETA = 1\n'
+  const key = cacheKey(sha, patch)
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_HEAL: '0' }
+  const oldFraming = {
+    model: 'deepseek-v4.1', v: PROMPT_V, at: '2020-01-01T00:00:00.000Z',
+    title: 'Gate added', summary: 'Adds `BETA` in cli/src/a.ts.', significance: 'minor',
+    verify: 'flagged', verifyClaims: [{ claim: 'an objection from the old framing' }]
+  }
+  const entry = { kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'Adds a gate.', significance: 'minor', ai: { ...oldFraming } }
+  const verdict = JSON.stringify({ choices: [{ message: { content: JSON.stringify({ supported: true, issues: [], claims: [{ quote: 'Gate added', supported: true }, { quote: 'Adds `BETA` in cli/src/a.ts.', supported: true }] }) } }] })
+  let calls = 0
+  let outage = true
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async () => {
+    calls++
+    return outage
+      ? { status: 504, ok: false, headers: { get: () => null }, text: async () => 'gateway timeout' }
+      : { status: 200, ok: true, headers: { get: () => null }, text: async () => verdict }
+  }
+  try {
+    await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: oldFraming }))
+    await enrichWithLlm([entry], async () => patch, dir, env, {})
+    const outageCalls = calls
+    assert.ok(outageCalls >= 1, 'the outage attempt happens (callLlm retries internally before it gives up)')
+    let stored = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    assert.equal(stored[key].verifyTries, undefined, 'and spends no verdict try')
+    assert.equal(stored[key].verifyErrors, 1, 'the no-answer count moves instead')
+    assert.ok(stored[key].verifyAt, 'the cooldown is stamped')
+    assert.equal(stored[key].verify, 'flagged', 'the recorded objection is untouched')
+    assert.equal(stored[key].verifyClaims.length, 1, 'and so are its claims')
+    // More failed attempts than the three-try verdict budget allows, and the
+    // cooldown elapsed: the row is still owed its fresh read under the framing
+    // that retired the objection. Charging outages to verifyTries parked it here.
+    await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: { ...stored[key], verifyErrors: 5, verifyAt: '2020-01-01T00:00:00.000Z' } }))
+    outage = false
+    await enrichWithLlm([entry], async () => patch, dir, env, {})
+    assert.equal(calls, outageCalls + 1, 'so the fresh read still arrives, on its own single call')
+    stored = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    assert.equal(stored[key].verify, 'passed', 'with the current framing\u2019s verdict')
+    assert.equal(stored[key].verifyPolicy, VERIFY_POLICY_V, 'stamped with that framing')
   } finally {
     globalThis.fetch = origFetch
   }
