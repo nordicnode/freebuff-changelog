@@ -44,7 +44,7 @@ diff --git a/cli/src/__tests__/limits.test.ts b/cli/src/__tests__/limits.test.ts
 
 test('extractStructuredFacts: constants old->new, env vars, flags, exports, test titles; test-file code ignored', () => {
   const s = extractStructuredFacts(PATCH)
-  assert.deepEqual(s.constants, [{ name: 'FREEBUFF_LIMITED_OFFER_MAX_SESSIONS', from: '300', to: '500' }])
+  assert.deepEqual(s.constants, [{ name: 'FREEBUFF_LIMITED_OFFER_MAX_SESSIONS', from: '300', to: '500', path: 'common/src/constants/limits.ts' }])
   assert.deepEqual(s.envVars, ['CODEBUFF_TRUSTED_AGENT_PUBLISHERS'], 'env read inside a test file is not a new input')
   assert.deepEqual(s.flags, ['--trust-agent-dirs'])
   assert.deepEqual(s.exportsAdded, ['newHelper'])
@@ -53,7 +53,7 @@ test('extractStructuredFacts: constants old->new, env vars, flags, exports, test
   assert.ok(hasStructuredFacts(s))
   assert.equal(hasStructuredFacts(extractStructuredFacts('')), false)
   const lines = formatStructuredFacts(s)
-  assert.match(lines.join('\n'), /FREEBUFF_LIMITED_OFFER_MAX_SESSIONS: 300 -> 500/)
+  assert.match(lines.join('\n'), /FREEBUFF_LIMITED_OFFER_MAX_SESSIONS.*300 -> 500/)
   assert.match(lines.join('\n'), /Behavior asserted by new tests/)
   assert.ok(structuredFactsText(s).includes('--trust-agent-dirs'))
   assert.equal(structuredFactsCited(s, 'raised FREEBUFF_LIMITED_OFFER_MAX_SESSIONS to 500'), true)
@@ -153,7 +153,7 @@ test('buildPrompt injects structured facts, PR review discussion and the glossar
   assert.match(p, /- limited offer: A capped free trial\./)
   const eli5 = buildEli5Prompt({ ...e, ai: { title: 't', summary: 's', migration: 'Set the new variable.', unknowns: 'Who reads the cap.', newEnvVars: ['CODEBUFF_X'] } }, [], { prMeta, glossary, structured: e.structured })
   assert.match(eli5, /Freebuff glossary/)
-  assert.match(eli5, /Migration the technical pass recorded/)
+  assert.doesNotMatch(eli5, /Migration the technical pass recorded/, 'unchecked actions are not inherited as support')
   assert.match(eli5, /do not fill this gap with a guess/)
   assert.match(eli5, /Values that changed: FREEBUFF_LIMITED_OFFER_MAX_SESSIONS 300 -> 500/)
   assert.match(eli5, /Review discussion:/)

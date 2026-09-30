@@ -42,8 +42,10 @@ function pickEli5 (ours, theirs, entry) {
   const ov = ours.v ?? 1
   const tv = theirs.v ?? 1
   if (ov !== tv) return ov > tv ? ours : theirs
-  // Equal standing: settle on the content, not on who won the merge.
-  return String(ours.src) <= String(theirs.src) ? ours : theirs
+  const oat = Date.parse(ours.at || '') || 0
+  const tat = Date.parse(theirs.at || '') || 0
+  if (oat !== tat) return oat > tat ? ours : theirs
+  return stableJson(ours) <= stableJson(theirs) ? ours : theirs
 }
 
 function stampOf (doc) {
@@ -60,35 +62,41 @@ export function mergeChangelog (ours, theirs) {
   if (!ours || !Array.isArray(ours.entries)) return theirs || ours
   if (!theirs || !Array.isArray(theirs.entries)) return ours || theirs
 
-  const [base, other] = stampOf(ours) >= stampOf(theirs) ? [ours, theirs] : [theirs, ours]
-  const entries = base.entries.slice()
+  const [base, other] = stampOf(ours) > stampOf(theirs) || (stampOf(ours) === stampOf(theirs) && stableJson(ours) >= stableJson(theirs)) ? [ours, theirs] : [theirs, ours]
+  const entries = base.entries.map(e => ({ ...e }))
   const bySha = new Map(entries.map(e => [e.sha, e]))
   let grafted = 0
 
   for (const e of other.entries) {
     const cur = bySha.get(e.sha)
     if (!cur) {
-      entries.push(e)
-      bySha.set(e.sha, e)
+      const copy = { ...e }
+      entries.push(copy)
+      bySha.set(e.sha, copy)
       continue
     }
     // Only reach into the base entry when we have a strictly better summary.
     const mine = usableAi(e)
     const theirsAi = usableAi(cur)
-    if (mine && (!theirsAi || (theirsAi.v ?? 1) < (mine.v ?? 1) || (!theirsAi.rollup && mine.rollup))) {
+    if (mine && pickAiRecord(mine, theirsAi) === mine) {
       cur.ai = mine
       grafted++
     }
     // ...and its plain-English line has to follow whatever summary ended up here.
     const kept = pickEli5(cur.eli5, e.eli5, cur)
     if (kept && kept !== cur.eli5) cur.eli5 = kept
+    // Never publish a plain-English line explaining a discarded summary.
+    if (cur.eli5?.src && cur.eli5.src !== shortHash(eli5Source(cur))) delete cur.eli5
   }
 
   // Every write passes through here, which makes this the place a stale in-memory
   // snapshot gets healed rather than re-published: an entry analyzed before the UTC
   // normalization still carries `-07:00`, and sortEntries -- plus every day page and
   // release window the site renders -- compares those strings.
-  for (const e of entries) normalizeDate(e)
+  for (const e of entries) {
+    normalizeDate(e)
+    if (e.eli5?.src && e.eli5.src !== shortHash(eli5Source(e))) delete e.eli5
+  }
 
   return {
     ...base,
@@ -106,7 +114,7 @@ export function mergeChangelog (ours, theirs) {
 // would otherwise be undone the moment origin's copy (still carrying them) is
 // unioned back in. Entries keep their own copy of every summary, so nothing on
 // the site depends on these keys.
-export function mergeAiCache (ours, theirs) {
+export function mergeAiCache (ours, theirs, { prune = true } = {}) {
   const a = ours || {}
   const b = theirs || {}
   const out = { ...a, ...b }
@@ -114,8 +122,24 @@ export function mergeAiCache (ours, theirs) {
     if (!a[key] || !b[key]) continue
     out[key] = betterCacheEntry(a[key], b[key])
   }
-  pruneStaleCache(out)
+  if (prune) pruneStaleCache(out)
   return out
+}
+
+function stableJson (value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(k => `${JSON.stringify(k)}:${stableJson(value[k])}`).join(',')}}`
+  return JSON.stringify(value)
+}
+
+export function pickAiRecord (x, y) {
+  if (!x || x.error || !(x.title || x.summary)) return y
+  if (!y || y.error || !(y.title || y.summary)) return x
+  if ((x.v ?? 1) !== (y.v ?? 1)) return (x.v ?? 1) > (y.v ?? 1) ? x : y
+  if ((x.rollup ?? 0) !== (y.rollup ?? 0)) return (x.rollup ?? 0) > (y.rollup ?? 0) ? x : y
+  const xt = Date.parse(x.at || '') || 0, yt = Date.parse(y.at || '') || 0
+  if (xt !== yt) return xt > yt ? x : y
+  return stableJson(x) >= stableJson(y) ? x : y
 }
 
 function entryScore (v) {
@@ -133,7 +157,12 @@ function betterCacheEntry (x, y) {
   const sx = entryScore(x)
   const sy = entryScore(y)
   if (sx !== sy) return sx > sy ? x : y
-  return (Date.parse(y?.at || '') || 0) >= (Date.parse(x?.at || '') || 0) ? y : x
+  const xt = Date.parse(x?.at || '') || 0, yt = Date.parse(y?.at || '') || 0
+  if (xt !== yt) return yt > xt ? y : x
+  const attemptsX = (Number(x?.attempts) || 0) + (Number(x?.healTries) || 0) + (Number(x?.verifyTries) || 0)
+  const attemptsY = (Number(y?.attempts) || 0) + (Number(y?.healTries) || 0) + (Number(y?.verifyTries) || 0)
+  if (attemptsX !== attemptsY) return attemptsX > attemptsY ? x : y
+  return stableJson(x) >= stableJson(y) ? x : y
 }
 
 /**
@@ -155,45 +184,50 @@ function betterCacheEntry (x, y) {
  */
 export function mergeOpenPrs (ours, theirs) {
   const norm = (v) => Array.isArray(v) ? { prs: v } : (v || {})
-  const a = norm(ours)
-  const b = norm(theirs)
+  const aa = norm(ours), bb = norm(theirs)
+  const at = Date.parse(aa.fetchedAt || '') || 0, bt = Date.parse(bb.fetchedAt || '') || 0
+  const [a, b] = at < bt || (at === bt && stableJson(aa) <= stableJson(bb)) ? [aa, bb] : [bb, aa]
+  // A newer complete snapshot is authoritative, including an empty open set.
+  const authoritative = Boolean(b.listComplete)
+  const live = new Set((b.prs || []).map(p => p.number))
   const byNum = new Map()
   // `theirs` is applied last, so a fresher record of the same PR wins -- except
   // where it simply knows less, which the per-field guard below protects.
   for (const p of [...(a.prs || []), ...(b.prs || [])]) {
-    if (!p || p.number == null) continue
+    if (!p || p.number == null || (authoritative && !live.has(p.number))) continue
     const prev = byNum.get(p.number)
     if (!prev) { byNum.set(p.number, { ...p }); continue }
+    const revisionChanged = prev.updated && p.updated && prev.updated !== p.updated
+    if (revisionChanged) { byNum.set(p.number, { ...p }); continue }
     const merged = { ...prev }
     for (const [k, v] of Object.entries(p)) {
       // A page-1 list row carries additions: null where a per-PR call filled it;
       // hasDiff is only ever set true. Never let a lesser record erase the better.
-      if (v == null || v === false) {
-        if (k === 'hasDiff' && v === false && prev.hasDiff === true) continue
+      if (v == null) {
         if (k === 'hasDiff') continue
         if (merged[k] == null) merged[k] = v
         continue
       }
-      if (Array.isArray(v) && v.length === 0 && Array.isArray(prev[k]) && prev[k].length > 0) {
-        continue
-      }
+      // A successfully fetched empty discussion/labels list is authoritative;
+      // failed fetches omit the field instead of inventing an empty success.
       merged[k] = v
     }
+    if (p.hasDiff === true && p.stalePreview !== true) delete merged.stalePreview
     byNum.set(p.number, merged)
   }
   const prs = [...byNum.values()]
-    .sort((x, y) => String(y.created || '').localeCompare(String(x.created || '')))
-  const total = Math.max(Number(a.total) || 0, Number(b.total) || 0, prs.length) || null
+    .sort((x, y) => String(y.created || '').localeCompare(String(x.created || '')) || Number(x.number) - Number(y.number))
+  const total = authoritative ? (b.total ?? prs.length) : (Math.max(Number(a.total) || 0, Number(b.total) || 0, prs.length) || null)
   const fetchedAt = (Date.parse(b.fetchedAt || '') || 0) > (Date.parse(a.fetchedAt || '') || 0)
     ? (b.fetchedAt || a.fetchedAt)
     : (a.fetchedAt || b.fetchedAt)
   // Still short of what GitHub reported? Then this is unfinished work, not a
   // smaller repo: partial keeps the cache hot so the next run chases the rest.
-  const partial = Boolean(a.partial || b.partial) || (total != null && prs.length < total)
+  const partial = (authoritative ? Boolean(b.partial) : Boolean(a.partial || b.partial)) || (total != null && prs.length < total)
   return {
     ...(fetchedAt ? { fetchedAt } : {}),
     ...(total != null ? { total } : {}),
-    listComplete: Boolean(a.listComplete && b.listComplete),
+    listComplete: authoritative,
     prs,
     ...(partial ? { partial: true } : {})
   }
@@ -218,7 +252,7 @@ export function mergeSyncState (ours, theirs) {
  */
 export async function capturePendingWrites (DATA, overrides = {}) {
   const onDisk = {}
-  for (const name of ['changelog.json', 'ai-summaries.json', 'state.json', 'open-prs.json']) {
+  for (const name of ['changelog.json', 'ai-summaries.json', 'state.json', 'open-prs.json', 'merged-prs.json', 'pr-summaries.json', 'llm-health.json']) {
     const path = `${DATA}/${name}`
     // Only carry files that exist: a missing ai-summaries.json must not be
     // materialized as {} by an unrelated write, which would make a quiet
@@ -228,11 +262,51 @@ export async function capturePendingWrites (DATA, overrides = {}) {
   return { ...onDisk, ...overrides }
 }
 
+export function mergeClosedPrs (a = {}, b = {}) {
+  a ||= {}; b ||= {}
+  const byNum = new Map()
+  for (const p of [...(a.prs || []), ...(b.prs || [])]) {
+    const old = byNum.get(p.number)
+    const stamp = value => String(value.closureCheckedAt || value.closedSeenAt || '')
+    if (!old || stamp(p) > stamp(old) || (stamp(p) === stamp(old) && stableJson(p) > stableJson(old))) byNum.set(p.number, p)
+  }
+  return { updatedAt: [a.updatedAt, b.updatedAt].filter(Boolean).sort().at(-1), prs: [...byNum.values()].sort((x, y) => String(x.closedSeenAt || '').localeCompare(String(y.closedSeenAt || ''))).slice(-2000) }
+}
+
+export function mergeHealth (a = {}, b = {}) {
+  a ||= {}; b ||= {}
+  const events = { ...(a.events || {}), ...(b.events || {}) }
+  const sum = doc => {
+    const days = {}
+    for (const { day, stats } of Object.values(doc.events || {})) {
+      days[day] ||= {}
+      for (const [k, v] of Object.entries(stats || {})) days[day][k] = (days[day][k] || 0) + (Number(v) || 0)
+    }
+    return days
+  }
+  const as = sum(a), bs = sum(b), days = sum({ events })
+  // Preserve pre-event counters as a baseline; only distinct event IDs add.
+  for (const day of new Set([...Object.keys(a.days || {}), ...Object.keys(b.days || {}), ...Object.keys(days)])) {
+    days[day] ||= {}
+    for (const k of new Set([...Object.keys(a.days?.[day] || {}), ...Object.keys(b.days?.[day] || {})])) {
+      const baseline = Math.max(0, (a.days?.[day]?.[k] || 0) - (as[day]?.[k] || 0), (b.days?.[day]?.[k] || 0) - (bs[day]?.[k] || 0))
+      days[day][k] = (days[day][k] || 0) + baseline
+    }
+  }
+  const keep = new Set(Object.keys(days).sort().slice(-21))
+  for (const day of Object.keys(days)) if (!keep.has(day)) delete days[day]
+  for (const [id, event] of Object.entries(events)) if (!keep.has(event.day)) delete events[id]
+  return { days, events, updatedAt: [a.updatedAt, b.updatedAt].filter(Boolean).sort().at(-1) }
+}
+
 const MERGERS = {
   'changelog.json': mergeChangelog,
   'ai-summaries.json': mergeAiCache,
   'state.json': mergeSyncState,
-  'open-prs.json': mergeOpenPrs
+  'open-prs.json': mergeOpenPrs,
+  'merged-prs.json': mergeClosedPrs,
+  'pr-summaries.json': (a, b) => mergeAiCache(a, b, { prune: false }),
+  'llm-health.json': mergeHealth
 }
 
 /**

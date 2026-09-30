@@ -157,10 +157,10 @@ test('rewriteRank orders major before notable before minor; contextTier scales w
   assert.equal(contextTier('a'.repeat(5000), ['one.ts']), 'full')
 })
 
-test('validateVerifyOut: empty issues means supported', () => {
-  assert.deepEqual(validateVerifyOut({ supported: true, issues: [] }), { supported: true, issues: [] })
-  assert.equal(validateVerifyOut({ supported: true, issues: ['claims X'] }).supported, false)
-  assert.equal(validateVerifyOut({ issues: [] }).supported, true)
+test('validateVerifyOut: incomplete coverage fails closed', () => {
+  assert.throws(() => validateVerifyOut({ supported: true, issues: [] }), /explicit verdict/)
+  assert.equal(validateVerifyOut({ supported: true, issues: ['claims X'], claims: [{ quote: 'X', supported: false }] }).supported, false)
+  assert.throws(() => validateVerifyOut({ issues: [] }), /explicit verdict/)
 })
 
 // ---------------------------------------------------------------------------

@@ -110,10 +110,10 @@ test('pruneExpiredErrors: prunes errors past cooldown, preserves active and vali
   }
 
   const pruned = pruneExpiredErrors(cache, { now })
-  assert.equal(pruned, 2)
-  assert.equal(cache.k1, undefined, 'k1 expired transient pruned')
+  assert.equal(pruned, 0)
+  assert.ok(cache.k1, 'cooled failures retain durable attempts')
   assert.ok(cache.k2, 'k2 active transient retained')
-  assert.equal(cache.k3, undefined, 'k3 expired permanent pruned')
+  assert.ok(cache.k3, 'cooled permanent failures retain durable attempts')
   assert.ok(cache.k4, 'k4 active permanent retained')
   assert.ok(cache.k5, 'k5 valid entry retained')
 })
@@ -147,9 +147,9 @@ test('extractResponseText: unwraps a { data: { choices } } envelope', async () =
 })
 
 test('llmConfigured: checks CHANGELOG_LLM and LLM_API_KEY from env', () => {
-  assert.equal(llmConfigured({ CHANGELOG_LLM: '1', LLM_API_KEY: 'test-key' }), true)
+  assert.equal(llmConfigured({ CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'test-key' }), true)
   assert.equal(llmConfigured({ CHANGELOG_LLM: '0', LLM_API_KEY: 'test-key' }), false)
-  assert.equal(llmConfigured({ CHANGELOG_LLM: '1', LLM_API_KEY: '' }), false)
+  assert.equal(llmConfigured({ CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: '' }), false)
   assert.equal(llmConfigured({}), false)
 })
 
@@ -204,7 +204,7 @@ test('error cooldown: recent failures are not retried', async (t) => {
   const key = cacheKey(sha, patch)
   await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: { error: 'LLM HTTP 429', at: new Date().toISOString() } }))
   const entries = [{ kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'CLI change.' }]
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'test-key', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'test-key', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
   let fetchCalls = 0
   const origFetch = globalThis.fetch
   globalThis.fetch = async (...args) => { fetchCalls++; return origFetch(...args) }
@@ -228,7 +228,7 @@ test('error cooldown: old failures retry after cooldown', async (t) => {
   const key = cacheKey(sha, patch)
   await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: { error: 'LLM HTTP 429', at: '2020-01-01T00:00:00.000Z' } }))
   const entries = [{ kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'CLI change.' }]
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'test-key', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'test-key', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
   let fetchCalls = 0
   const origFetch = globalThis.fetch
   globalThis.fetch = async (...args) => { fetchCalls++; return origFetch(...args) }
@@ -242,7 +242,7 @@ test('error cooldown: old failures retry after cooldown', async (t) => {
 
 test('heal policy: dirt counts every shipped objection, eligibility is bounded and cooled down', () => {
   assert.equal(summaryDirt({ title: 't' }), 0, 'a clean row has no dirt')
-  assert.equal(summaryDirt({ ungrounded: ['A', 'B'], valueErrors: ['C'], whyMissing: true, verify: 'flagged' }), 5)
+  assert.equal(summaryDirt({ ungrounded: ['A', 'B'], valueErrors: ['C'], whyMissing: true, verify: 'flagged' }), 4)
   assert.equal(summaryDirt({ verify: 'passed' }), 0, 'a passed verdict is not dirt')
   const dirty = { ungrounded: ['A'], at: '2020-01-01T00:00:00.000Z' }
   assert.equal(healEligible(dirty), true, 'an old dirty row is eligible')
@@ -276,7 +276,7 @@ test('re-check: a row that shipped with no verdict is checked later, and its tex
   const patch = 'diff --git a/sdk/src/b.ts b/sdk/src/b.ts\n+export const BETA = 1\n'
   const key = cacheKey(sha, patch)
   const entry = { kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['SDK'], summary: 'Adds a gate.' }
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5' }
   // Anchored to the clock, not a calendar date. This row models one that
   // shipped moments ago, and the assertion below is that a freshly shipped
   // unverified row costs nothing while the re-check budget is off. A fixed
@@ -292,11 +292,11 @@ test('re-check: a row that shipped with no verdict is checked later, and its tex
     verify: 'unavailable', verifyModel: 'gpt-6-luna'
   }
   const seen = []
-  let verdictOut = { supported: true, issues: [], claims: [] }
+  let verdictOut = { supported: true, issues: [], claims: [{ quote: 'Beta gate added', supported: true }, { quote: 'Adds `BETA` in sdk/src/b.ts to prevent double-spends.', supported: true }, { quote: 'end-users', supported: true }] }
   const origFetch = globalThis.fetch
   globalThis.fetch = async (url, { body }) => {
     const parsed = JSON.parse(String(body))
-    seen.push({ model: parsed.model, prompt: String(parsed.messages?.[0]?.content || '') })
+    seen.push({ model: parsed.model, prompt: String(parsed.messages?.at(-1)?.content || '') })
     const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify(verdictOut) } }] })
     return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
   }
@@ -323,7 +323,7 @@ test('re-check: a row that shipped with no verdict is checked later, and its tex
     assert.ok(stored[key].verifyAt, 'the attempt is spaced')
     let health = JSON.parse(await readFile(join(dir, 'llm-health.json'), 'utf8'))
     assert.equal(Object.values(health.days)[0].rechecked, 1, 'the ledger counts the re-check')
-    assert.equal(Object.values(health.days)[0].summarized, undefined, 'and does not pretend a row was written')
+    assert.equal(Object.values(health.days)[0].summarized, 0, 'and does not pretend a row was written')
     // An objection is recorded as flagged and its text is still untouched:
     // the repair belongs to the heal pass, which owns rewriting shipped text.
     verdictOut = { supported: false, issues: ['`BETA` is not in the diff'], claims: [] }
@@ -355,7 +355,7 @@ test('healing: a shipped-with-objections row is re-asked and replaced only by a 
   const patch = 'diff --git a/sdk/src/a.ts b/sdk/src/a.ts\n+export const ALPHA = 1\n'
   const key = cacheKey(sha, patch)
   const entry = { kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['SDK'], summary: 'Adds a gate.' }
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5' }
   const dirtyRec = {
     model: 'deepseek-v4.1', v: PROMPT_V, at: '2020-01-01T00:00:00.000Z',
     title: 'Shipped with objections', summary: 'Old text.', significance: 'minor',
@@ -373,7 +373,9 @@ test('healing: a shipped-with-objections row is re-asked and replaced only by a 
   const origFetch = globalThis.fetch
   globalThis.fetch = async (url, { body }) => {
     fetchCalls++
-    const payload = mode === 'clean' ? cleanPayload : { ...cleanPayload, summary: 'Reads `NOT_IN_DIFF` to prevent double-spends.' }
+    const writer = mode === 'clean' ? cleanPayload : { ...cleanPayload, summary: 'Reads `NOT_IN_DIFF` to prevent double-spends.' }
+    const prompt = JSON.parse(String(body)).messages.at(-1).content
+    const payload = /You are checking/.test(prompt) ? { supported: true, issues: [], claims: Object.values(writer).filter(v => typeof v === 'string').map(quote => ({ quote, supported: true })) } : writer
     const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify(payload) } }] })
     return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
   }
@@ -419,7 +421,7 @@ test('assessLlmHealth: a refusal storm is an alert, objection-heavy days are a w
   assert.equal(storm.level, 'alert', 'the refusal-storm shape is named loudly')
   assert.match(storm.reasons.join(' '), /refused or answered from memory/)
   assert.equal(assessLlmHealth({ summarized: 10, flagged: 1 }).level, 'ok')
-  assert.equal(assessLlmHealth({ summarized: 10, flagged: 4, ungrounded: 3 }).level, 'watch', '7 of 10 rows shipped with objections')
+  assert.equal(assessLlmHealth({ summarized: 10, flagged: 4, ungrounded: 3, dirtyRows: 7 }).level, 'watch', '7 of 10 rows shipped with objections')
   assert.equal(assessLlmHealth({ summarized: 10, flagged: 6 }).level, 'watch', 'more objection rows than clean ones')
   assert.equal(assessLlmHealth({ summarized: 2, flagged: 1 }).level, 'ok', 'the objection rule needs a sample')
   assert.equal(assessLlmHealth({ summarized: 0, transientErrors: 2 }).level, 'watch', 'nothing landed while asks failed')
@@ -442,11 +444,11 @@ test('verifier unavailability: the row says so and the health ledger counts it',
   // The writer answers; the verifier is down. The mock keys off the verify
   // ask's opening line, not the model name, so it stays a verifier outage
   // whichever model either pass happens to run on.
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', LLM_MODEL: 'deepseek-v4.1', CHANGELOG_LLM_LIMIT: '5' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', LLM_MODEL: 'deepseek-v4.1', CHANGELOG_LLM_LIMIT: '5' }
   const origFetch = globalThis.fetch
   globalThis.fetch = async (url, { body }) => {
     const { messages } = JSON.parse(String(body))
-    const prompt = String(messages?.[0]?.content || '')
+    const prompt = String(messages?.at(-1)?.content || '')
     // 400, not 5xx: the 5xx path sleeps through real retry backoff, and this
     // test is about the unavailability being recorded, not the retry ladder.
     if (prompt.startsWith('You are checking a changelog entry against the diff it describes.')) return { status: 400, ok: false, headers: { get: () => null }, text: async () => 'verifier down' }
@@ -490,7 +492,7 @@ test('context refresh: a row whose evidence arrived late is re-asked, and a dirt
   const patch = 'diff --git a/x b/x\n+export const ALPHA = 1\n'
   const key = cacheKey(sha, patch)
   const entry = { kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'Adds a gate.' }
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5' }
   const thinRec = {
     model: 'deepseek-v4.1', v: PROMPT_V, at: '2020-01-01T00:00:00.000Z',
     title: 'Thin summary', summary: 'Written before the review thread arrived.', significance: 'minor',
@@ -504,8 +506,10 @@ test('context refresh: a row whose evidence arrived late is re-asked, and a dirt
   }
   let mode = 'clean'
   const origFetch = globalThis.fetch
-  globalThis.fetch = async () => {
-    const payload = mode === 'clean' ? cleanPayload : { ...cleanPayload, summary: 'Reads `NOT_IN_DIFF` to prevent double-spends.' }
+  globalThis.fetch = async (url, { body }) => {
+    const writer = mode === 'clean' ? cleanPayload : { ...cleanPayload, summary: 'Reads `NOT_IN_DIFF` to prevent double-spends.' }
+    const prompt = JSON.parse(String(body)).messages.at(-1).content
+    const payload = /You are checking/.test(prompt) ? { supported: true, issues: [], claims: Object.values(writer).filter(v => typeof v === 'string').map(quote => ({ quote, supported: true })) } : writer
     const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify(payload) } }] })
     return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
   }
@@ -562,7 +566,7 @@ test('drift ledger: an enrich run records what its own calls proved', async (t) 
   const patch = 'diff --git a/x b/x\n+export const ALPHA = 1\n'
   const ok = { kind: 'sync', sha: 'd'.repeat(40), date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'Adds a gate.' }
   const failing = { ...ok, sha: 'e'.repeat(40) }
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0' }
   const origFetch = globalThis.fetch
   globalThis.fetch = async () => {
     const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify({ evidence: 'x b/x holds it.', title: 'Alpha gate added', summary: 'Adds `ALPHA` in x b/x to prevent double-spends.', significance: 'minor', audience: 'end-users', confidence: 'high' }) } }] })
@@ -698,7 +702,7 @@ test('transient failure: parked for a short retry window instead of re-hitting e
   const patch = 'diff --git a/z b/z\n+line\n'
   const key = cacheKey(sha, patch)
   const entries = [{ kind: 'sync', sha, date: '2026-09-14T10:00:00Z', areas: ['CLI'], summary: 'CLI change.' }]
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
   let calls = 0
   const orig = globalThis.fetch
   globalThis.fetch = async (...a) => { calls++; return orig(...a) }
@@ -734,7 +738,7 @@ test('transient failure: a one-shot run (no retryErrors) does not park the entry
   const sha = 'd'.repeat(40)
   const patch = 'diff --git a/w b/w\n+line\n'
   const entries = [{ kind: 'sync', sha, date: '2026-09-14T10:00:00Z', areas: ['CLI'], summary: 'CLI change.' }]
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
   await enrichWithLlm(entries, async () => patch, dir, env, {})
   const cached = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8').catch(() => '{}'))
   assert.equal(Object.keys(cached).length, 0, 'the daemon must stay free to retry what the workflow could not')
@@ -755,7 +759,7 @@ test('priorityShas: new commits jump the backlog and patch work stays bounded', 
   }))
   const fresh = { kind: 'sync', sha: freshSha, date: '2026-09-14T15:00:00Z', areas: ['CLI'], summary: 'Just landed.' }
   const entries = [...backlog, fresh]
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '2' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '2' }
   const patched = []
   const orig = globalThis.fetch
   globalThis.fetch = async (...a) => { await Promise.resolve(); return orig(...a) }
@@ -781,7 +785,7 @@ test('the summary queue covers every kind of entry, churn excepted', async (t) =
   const community = { kind: 'community', sha: 'c'.repeat(40), date: '2024-07-09T10:00:00Z', areas: ['CLI'], summary: 'Community commit.' }
   const sync = { kind: 'sync', sha: 'a'.repeat(40), date: '2026-09-14T10:00:00Z', areas: ['CLI'], summary: 'Sync commit.' }
   const churn = { kind: 'sync', sha: 'b'.repeat(40), noise: true, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'lockfile' }
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5' }
   const patched = []
   const orig = globalThis.fetch
   globalThis.fetch = async (...a) => { await Promise.resolve(); return orig(...a) }
@@ -797,7 +801,7 @@ test('CHANGELOG_LLM_CHURN=1 admits churn rows', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-churn-'))
   t.after(async () => { const { rm } = await import('node:fs/promises'); await rm(dir, { recursive: true, force: true }) })
   const churn = { kind: 'sync', sha: 'b'.repeat(40), noise: true, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'lockfile' }
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_CHURN: '1' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_CHURN: '1' }
   const patched = []
   const orig = globalThis.fetch
   globalThis.fetch = async (...a) => { await Promise.resolve(); return orig(...a) }
@@ -821,7 +825,7 @@ test('CHANGELOG_LLM_LIMIT=0 drops the call cap but keeps the git window', async 
     const patched = []
     globalThis.fetch = async (...a) => { await Promise.resolve(); return orig(...a) }
     try {
-      await enrichWithLlm(rows, async (e) => { patched.push(e.sha); return 'diff --git a/x b/x\n+new\n' }, dir, { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: limit }, { retryErrors: true })
+      await enrichWithLlm(rows, async (e) => { patched.push(e.sha); return 'diff --git a/x b/x\n+new\n' }, dir, { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: limit }, { retryErrors: true })
     } finally { globalThis.fetch = orig }
     return patched.length
   }
@@ -931,7 +935,7 @@ test('enrichEli5: a 5xx retry keeps the eli5 validator (not the summary schema)'
   }
   try {
     const e = eli5Entry()
-    assert.equal(await enrichEli5([e], dir, { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1', LLM_MODEL: 'm' }), 1)
+    assert.equal(await enrichEli5([e], dir, { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1', LLM_MODEL: 'm', CHANGELOG_LLM_VERIFY: '0' }), 1)
     assert.equal(calls, 2, 'the request was retried once')
     assert.match(e.eli5.text, /Access moved/, 'the retried response was validated as eli5, not rejected as missing a title')
   } finally {
@@ -945,7 +949,7 @@ test('release context: bump window stops at the same-track predecessor', async (
     sha, date: `${day}T12:00:00Z`, day, noise: false, significance: 'notable',
     stats: { additions: 50, deletions: 10 },
     files: { total: 2, meaningful: 1, added: [], modified: ['cli/src/x.ts'] },
-    title, ai: { model: 'm', v: PROMPT_V, title, summary: `${title} shipped.` }
+    title, ai: { verify: 'passed', model: 'm', v: PROMPT_V, title, summary: `${title} shipped.` }
   })
   const bump176 = eli5Entry({
     sha: '1'.repeat(40), date: '2026-09-17T19:08:31Z', day: '2026-09-17',
@@ -1019,7 +1023,7 @@ test('release context: skips noise, caps items and chars, prefers ai text', asyn
     sha, date: '2026-09-17T10:00:00Z', day: '2026-09-17', significance: 'minor',
     stats: { additions: 5, deletions: 5 },
     files: { total: 1, meaningful: 1, modified: ['cli/src/y.ts'] },
-    ai: { model: 'm', v: PROMPT_V, title: `Change ${sha.slice(0, 4)}`, summary: `Change ${sha.slice(0, 4)} landed.` },
+    ai: { verify: 'passed', model: 'm', v: PROMPT_V, title: `Change ${sha.slice(0, 4)}`, summary: `Change ${sha.slice(0, 4)} landed.` },
     ...over
   })
   const bump = eli5Entry({
@@ -1047,7 +1051,7 @@ test('release context: net effect folds catalog events so reversals lose', async
     sha, date: '2026-09-17T10:00:00Z', day: '2026-09-17', significance: 'minor',
     stats: { additions: 5, deletions: 5 },
     files: { total: 1, meaningful: 1, modified: ['cli/src/y.ts'] },
-    ai: { model: 'm', v: PROMPT_V, title: `Change ${sha.slice(0, 4)}`, summary: `Change ${sha.slice(0, 4)} landed.` },
+    ai: { verify: 'passed', model: 'm', v: PROMPT_V, title: `Change ${sha.slice(0, 4)}`, summary: `Change ${sha.slice(0, 4)} landed.` },
     ...over
   })
   const bump = eli5Entry({
@@ -1133,8 +1137,8 @@ test('enrichEli5: bump rows carry the release window and refresh when it fills i
   const dir = await mkdtemp(join(tmpdir(), 'fbweb-eli5-relctx-'))
   t.after(async () => { await rm(dir, { recursive: true, force: true }) })
   const env = {
-    CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1',
-    LLM_MODEL: 'test-model', CHANGELOG_ELI5_LIMIT: '5'
+    CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1',
+    LLM_MODEL: 'test-model', CHANGELOG_ELI5_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0'
   }
   const prompts = []
   const orig = globalThis.fetch
@@ -1146,7 +1150,7 @@ test('enrichEli5: bump rows carry the release window and refresh when it fills i
     }
   }
   try {
-    const featAi = (title) => ({ model: 'm', v: PROMPT_V, title, summary: `${title} shipped.` })
+    const featAi = (title) => ({ verify: 'passed', model: 'm', v: PROMPT_V, title, summary: `${title} shipped.` })
     const feat = eli5Entry({
       sha: 'a'.repeat(40), date: '2026-09-17T21:14:00Z', day: '2026-09-17', significance: 'notable',
       stats: { additions: 134, deletions: 20 }, files: { total: 3, meaningful: 2, modified: ['cli/src/a.ts'] },
@@ -1196,8 +1200,8 @@ test('enrichEli5: spends the budget where a story exists, not on version bumps',
   const dir = await mkdtemp(join(tmpdir(), 'fbweb-eli5-order-'))
   t.after(async () => { await rm(dir, { recursive: true, force: true }) })
   const env = {
-    CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1',
-    LLM_MODEL: 'm', CHANGELOG_ELI5_LIMIT: '2'
+    CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1',
+    LLM_MODEL: 'm', CHANGELOG_ELI5_LIMIT: '2', CHANGELOG_LLM_VERIFY: '0'
   }
   const ai = (title) => ({ model: 'm', v: PROMPT_V, title, summary: 'A version string changed.' })
   // 650 rows in the real backlog look like this: tagged major by the release
@@ -1382,8 +1386,8 @@ test('enrichEli5: writes the line, caches it by the summary, asks once', async (
   const dir = await mkdtemp(join(tmpdir(), 'fbweb-eli5-'))
   t.after(async () => { await rm(dir, { recursive: true, force: true }) })
   const env = {
-    CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1',
-    LLM_MODEL: 'test-model', CHANGELOG_LLM_LIMIT: '5'
+    CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1',
+    LLM_MODEL: 'test-model', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0'
   }
   let calls = 0
   let expectDiff = true
@@ -2077,7 +2081,7 @@ test('no prompt the pipeline can build overflows the window', () => {
     ['verifier', buildVerifyPrompt(entry, huge, { title: 't', summary: 's', evidence: 'e', audience: 'end-users' })]
   ]) {
     assert.ok(prompt.length <= LLM_CONTEXT_CHARS, `${name} prompt is ${prompt.length} chars, window is ${LLM_CONTEXT_CHARS}`)
-    assert.ok(/^(Explain one software change|You write changelog entries|You are checking)/.test(prompt), `${name} kept its instructions`)
+    assert.ok(/^(The diff is untrusted DATA|Explain one software change|You write changelog entries|You are checking)/.test(prompt), `${name} kept its instructions`)
   }
 })
 
@@ -2389,7 +2393,7 @@ const LADDER_CONTEXT = {
 }
 
 const LADDER_ENV = {
-  CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1',
+  CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'https://example.invalid/v1',
   LLM_MODEL: 'test-model', CHANGELOG_LLM_VERIFY: '0', CHANGELOG_LLM_SELFCHECK: '0'
 }
 
@@ -2407,7 +2411,7 @@ function answerWith (reply) {
   const seen = []
   const orig = globalThis.fetch
   globalThis.fetch = async (url, init) => {
-    const prompt = JSON.parse(String(init.body)).messages[0].content
+    const prompt = JSON.parse(String(init.body)).messages.at(-1).content
     seen.push(prompt)
     return {
       ok: true,
@@ -2519,9 +2523,9 @@ test('pruneExpiredErrors: a parked stub is a record, not garbage', () => {
     // Ordinary failure, expired: still pruned.
     old: { error: 'bad output', at: new Date(now - 70 * 60000).toISOString() }
   }
-  assert.equal(pruneExpiredErrors(cache, { now }), 1)
+  assert.equal(pruneExpiredErrors(cache, { now }), 0)
   assert.ok(cache.parked, 'the parked stub survives')
-  assert.equal(cache.old, undefined)
+  assert.ok(cache.old, 'cooldown expiry changes eligibility, not retry history')
 })
 
 test('isTransientError: a memory answer is not a flaky JSON frame', () => {
@@ -2541,7 +2545,7 @@ test('a memory answer costs two runs of three calls and then parks', async (t) =
   const sha = '9'.repeat(40)
   const patch = 'diff --git a/x b/x\n+the cap is now three\n'
   const entries = [{ kind: 'sync', sha, date: '2026-09-27T10:00:00Z', areas: ['Agents'], summary: 'Agents update: base2.' }]
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0', CHANGELOG_LLM_SELFCHECK: '0' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0', CHANGELOG_LLM_SELFCHECK: '0' }
   let calls = 0
   const orig = globalThis.fetch
   globalThis.fetch = async () => {
@@ -2602,7 +2606,7 @@ test('a gave-up row gets bounded fresh attempts, then the cache serves it', asyn
   await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({
     [key]: { title: 'Update the agent list', summary: 'Mechanical label.', model: 'm', v: PROMPT_V, at: new Date().toISOString() }
   }))
-  const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0', CHANGELOG_LLM_SELFCHECK: '0' }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://127.0.0.1:1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0', CHANGELOG_LLM_SELFCHECK: '0' }
   // The model keeps answering with the mechanical label: the row really is
   // gave-up, and it must still get its bounded retries (the old code queued
   // it every run and then served the very record it meant to replace).
@@ -2667,22 +2671,25 @@ test('the WHY gate: one repair names the missing clause, then the row ships flag
   const whatOnly = { title: 'Run-state compaction added', summary: 'Adds `compactRunState` in sdk/src/a.ts and wires it into the SDK.' }
 
   // Strict pass: named, so the repair pass has a fixable instruction.
-  const strict = summaryValidator('minor', corpus, null, { requireWhy: true })
+  const strict = summaryValidator('minor', corpus, null, { requireWhy: 'strict' })
   assert.throws(() => strict(whatOnly), /what changed but not why/)
   // Second pass: ships, flagged -- never an infinite repair loop over style.
   const flagged = strict(whatOnly)
   assert.equal(flagged.whyMissing, true, 'the gap is recorded on the entry')
   assert.equal(flagged.title, 'Run-state compaction added')
 
+  const honest = summaryValidator('minor', corpus, null, { requireWhy: true })(whatOnly)
+  assert.equal(honest.whyMissing, true, 'unknown motive does not incur a paid repair')
+
   // Both problems at once cost one repair with one message.
-  const both = summaryValidator('minor', corpus, null, { requireWhy: true })
+  const both = summaryValidator('minor', corpus, null, { requireWhy: 'strict' })
   assert.throws(
     () => both({ title: 'X added', summary: 'Adds `notInTheCorpus` here.' }),
     /not present in the diff[\s\S]*WHAT changed without WHY/
   )
 
   // A summary that says why passes the strict pass untouched.
-  const withWhy = summaryValidator('minor', corpus, null, { requireWhy: true })
+  const withWhy = summaryValidator('minor', corpus, null, { requireWhy: 'strict' })
   const out = withWhy({ title: 'Run-state compaction added', summary: 'Adds `compactRunState` in sdk/src/a.ts so hosts can rewind a stored run.' })
   assert.equal(out.whyMissing, undefined)
 
@@ -2692,14 +2699,14 @@ test('the WHY gate: one repair names the missing clause, then the row ships flag
   assert.equal(plain(whatOnly).whyMissing, undefined, 'no requireWhy, no gate')
 })
 
-test('buildPrompt demands the why clause, and shows what a what-only row looks like', () => {
+test('buildPrompt permits unknown motive instead of inventing a why clause', () => {
   const entry = {
     date: '2026-09-13T10:00:00Z', areas: ['CLI'], category: 'CLI', significance: 'minor',
     stats: { additions: 3, deletions: 1 }, files: { added: [], modified: ['cli/x.ts'] },
     summary: 'CLI tweak.', title: 'CLI tweak.'
   }
   const prompt = buildPrompt(entry, 'diff --git a/cli/x.ts b/cli/x.ts\n+x')
-  assert.match(prompt, /WHY is not optional/, 'the requirement is stated, not implied')
-  assert.match(prompt, /only says what changed is incomplete/)
-  assert.match(prompt, /WHAT-only, rejected/, 'and the negative example is named as one')
+  assert.match(prompt, /Unknown motive is acceptable/)
+  assert.match(prompt, /never invent motives/)
+  assert.doesNotMatch(prompt, /WHY is not optional|WHAT-only, rejected/)
 })

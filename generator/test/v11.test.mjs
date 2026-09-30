@@ -30,7 +30,7 @@ test('grounding: backticked calls and separator-formatted numbers are not typos'
   assert.deepEqual(ungroundedIdentifiers('Raised the cap to 500.', 'nothing here'), ['500'], 'a bare number is still checked')
 })
 
-test('pruneKnownInputs: names that exist at the base rev are not new inputs; lookups fail open', async (t) => {
+test('pruneKnownInputs: names that exist at the base rev are not new inputs; lookup failures do not prove novelty', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'fbweb-prune-'))
   t.after(async () => { await rm(dir, { recursive: true, force: true }) })
   const g = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
@@ -56,13 +56,13 @@ test('pruneKnownInputs: names that exist at the base rev are not new inputs; loo
   assert.deepEqual(out.testNames, ['asserts a brand new behavior'], 'a moved test title is not a new test')
   assert.deepEqual(out.constants, structured.constants, 'only the new-input lists are pruned')
 
-  // No repo, no base: unchanged (the eval path may lack a worktree).
-  assert.equal(await pruneKnownInputs(null, null, structured), structured)
-  assert.equal(await pruneKnownInputs(dir, null, structured), structured)
+  // Missing lookup evidence cannot authorize novelty.
+  assert.deepEqual((await pruneKnownInputs(null, null, structured)).envVars, [])
+  assert.deepEqual((await pruneKnownInputs(dir, null, structured)).flags, [])
   assert.equal(await pruneKnownInputs(dir, 'HEAD', null), null)
   // A broken rev fails open: git grep errors out and every claim survives.
   const broken = await pruneKnownInputs(dir, 'no-such-rev', structured)
-  assert.deepEqual(broken.envVars, structured.envVars)
+  assert.deepEqual(broken.envVars, [], 'an unreadable base is not evidence that an input is new')
 })
 
 test('buildDiffDigest: per-file line counts and sample added lines, byte-bounded', () => {
@@ -249,12 +249,13 @@ test('gatherEntryContext: the fuller structured extraction wins, stored narrow f
   }
   const ctx = await gatherEntryContext(e, promptPatch, { fullPatch })
   assert.ok(hasStructuredFacts(ctx.structured))
-  assert.deepEqual(ctx.structured.testNames, ['caps the run at the daily session ceiling'], 'test titles arrive from the full patch')
-  assert.deepEqual(ctx.structured.envVars, ['BRAND_NEW_VAR'])
-  assert.deepEqual(ctx.structured.constants, [{ name: 'ALPHA', from: '1', to: '2' }], 'the fuller extraction replaces the stored one')
+  assert.deepEqual(ctx.structured.testNames, [], 'without a base, novelty is unknown')
+  assert.equal(ctx.changedTests[0].titles[0], 'caps the run at the daily session ceiling', 'changed assertions remain evidence, not novelty claims')
+  assert.deepEqual(ctx.structured.envVars, [])
+  assert.deepEqual(ctx.structured.constants, [{ name: 'ALPHA', from: '1', to: '2', path: 'cli/src/a.ts' }], 'the fuller extraction replaces the stored one')
   // Nothing richer available (no diff text at all): the stored set is kept.
   const ctx2 = await gatherEntryContext(e, '', {})
-  assert.deepEqual(ctx2.structured.constants, [{ name: 'ALPHA', from: '0', to: '1' }])
+  assert.deepEqual(ctx2.structured.constants, [], 'authoritative extraction can remove stale facts')
 })
 
 // Every case here shipped a junk "unverified" badge on a correct row: the badge

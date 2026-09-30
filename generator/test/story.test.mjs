@@ -19,7 +19,9 @@ test('story note states the dated access loss beside the reassuring tiering line
   const grandfathering = entry('b', '01', 'Singapore and Israel subscribers who bought full-access plans before September 15 keep their full allowances.')
   const index = buildStoryIndex([tiering, grandfathering])
   const note = index.notes.get(tiering.sha)[0]
-  assert.equal(note.text, 'Singapore and Israel left full access on 2026-09-15. ' + grandfathering.eli5.text)
+  assert.ok(note.text.startsWith('Singapore and Israel left full access on 2026-09-15. '))
+  assert.ok(note.text.includes('[UNVERIFIED]'), 'related unchecked prose keeps its warning')
+  assert.ok(note.text.endsWith(grandfathering.eli5.text))
   assert.equal(note.sha, grandfathering.sha)
   assert.equal(buildStoryIndex([tiering]).notes.size, 0)
   assert.deepEqual(buildStoryIndex([grandfathering, tiering]).notes, index.notes)

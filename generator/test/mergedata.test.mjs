@@ -387,5 +387,6 @@ test('mergeChangelog is deterministic when two different ELI5 lines are equally 
   const b = { ...entry('a', '2026-09-14T10:00:00Z', ai), eli5: { text: 'two', v: 1, src: 'bbbbbbbbbbbb' } }
   const one = mergeChangelog(doc('2026-09-14T14:00:00.000Z', 'x', [a]), doc('2026-09-14T11:00:00.000Z', 'y', [b]))
   const two = mergeChangelog(doc('2026-09-14T11:00:00.000Z', 'y', [b]), doc('2026-09-14T14:00:00.000Z', 'x', [a]))
-  assert.equal(one.entries[0].eli5.src, two.entries[0].eli5.src, 'same answer whichever writer pushed first')
+  assert.equal(one.entries[0].eli5, undefined, 'stale explanations are discarded')
+  assert.equal(two.entries[0].eli5, undefined, 'same answer whichever writer pushed first')
 })

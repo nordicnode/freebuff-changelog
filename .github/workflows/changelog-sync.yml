@@ -1,17 +1,9 @@
 name: changelog-sync
 
-# 24/7 continuous relay synchronization pipeline.
-# Runs continuously via self-perpetuating workflow relay, polling upstream every 30s.
-# The poll bound is 30s; end-to-end (generate -> push -> deploy.yml build/upload)
-# lands a change on the site in a few minutes, and the 10m freshness ceiling below
-# is the hard guarantee. A backup schedule (every 10 minutes) serves as an
-# automated watchdog / safety net if the relay chain ever dies.
-#
-# The 10m claim is enforced, not aspirational: the sync loop fails its run once
-# its errors stretch over the freshness budget, the next cycle is dispatched
-# whatever this one did, and deploy.yml ends with `cli.mjs freshness` so a
-# deploy of stale data goes red. A silent stall used to look exactly like a
-# healthy loop -- green runs, no data commits, "[stale 16m]" on the site.
+# Continuous deterministic ingestion with bounded, forward-only enrichment.
+# 30s polling and a 10-minute watchdog are targets, not a delivery guarantee.
+# Full regressions promote runtime revisions separately; failed code cannot
+# replace the last known-good generator. Deployment probes the uploaded head.
 on:
   schedule:
     # Watchdog schedule: restarts the relay chain if a runner is ever terminated or network drops
@@ -42,10 +34,31 @@ jobs:
         with:
           node-version: 22
 
-      - name: Syntax check + tests
+      - name: Select last known-good generator
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for f in generator/cli.mjs generator/lib/*.mjs; do node --check "$f"; done
-          node --test "generator/test/*.test.mjs"
+          good=''
+          candidates="$(gh run list --workflow generator-check.yml --branch "$GITHUB_REF_NAME" --event push --status success --limit 50 --json headSha --jq '.[].headSha')"
+          for candidate in $candidates; do
+            # Old successful code can still lack the non-negotiable spending
+            # policy or workspace-root support. It is not an eligible fallback.
+            if git merge-base --is-ancestor "$candidate" HEAD &&
+               git show "$candidate:generator/lib/quality.mjs" 2>/dev/null | grep -q 'QUALITY_POLICY_V = 1' &&
+               git show "$candidate:generator/cli.mjs" 2>/dev/null | grep -q 'CHANGELOG_WORKSPACE_ROOT'; then
+              good="$candidate"
+              break
+            fi
+          done
+          if [ -z "$good" ]; then
+            echo "::error::No promoted generator exists. Run generator-check successfully before starting ingestion."
+            exit 1
+          fi
+          git cat-file -e "${good}^{commit}"
+          mkdir -p .cache/promoted-runtime
+          git archive "$good" generator | tar -x -C .cache/promoted-runtime
+          echo "Promoted generator: $good (data stays on current branch)"
+          for f in .cache/promoted-runtime/generator/cli.mjs .cache/promoted-runtime/generator/lib/*.mjs; do node --check "$f"; done
 
       - name: Cache freebuff repository
         uses: actions/cache@v4
@@ -54,8 +67,8 @@ jobs:
           # A static key, deliberately: the old key ended in github.run_id, so
           # every ~12-minute relay cycle missed on read and saved a brand-new
           # clone -- burning the 10 GB cache quota on hundreds of near-identical
-          # copies a week. With one key, a hit costs nothing and the post-job
-          # save only rewrites the cache when the clone actually changed.
+          # copies a week. Caches are immutable: restore the shared baseline
+          # and fetch upstream on every cycle; hits do not update that baseline.
           #
           # restore-keys is what makes renaming the primary key safe. Without
           # it, the rename was a guaranteed miss on the first run: a pristine
@@ -108,9 +121,10 @@ jobs:
           echo "Data pushes now authenticate with CHANGELOG_GITHUB_TOKEN: each data commit starts a deploy."
           echo "fallback=false" >> "$GITHUB_OUTPUT"
 
-      - name: Run continuous sync & backfill
+      - name: Run continuous sync and forward enrichment
         id: sync_loop
         env:
+          CHANGELOG_WORKSPACE_ROOT: ${{ github.workspace }}
           GITHUB_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
           SITE_URL: ${{ vars.SITE_URL || 'https://freebuff-changelog.nordicnode.workers.dev' }}
@@ -128,12 +142,14 @@ jobs:
           CHANGELOG_LLM_LIMIT: ${{ vars.CHANGELOG_LLM_LIMIT || '10' }}
           CHANGELOG_LLM_CONCURRENCY: ${{ vars.CHANGELOG_LLM_CONCURRENCY || '2' }}
           CHANGELOG_LLM_RPM: ${{ vars.CHANGELOG_LLM_RPM || '60' }}
+          CHANGELOG_LLM_NO_BACKFILL: '1'
+          CHANGELOG_LLM_MAX_CALLS_PER_ENTRY: '12'
           CHANGELOG_SYNC_STALE_MIN: '5'
           CHANGELOG_PR_REFRESH_MIN: '2'
           WATCH_INTERVAL: '30'
           WATCH_DURATION: '12m'
           WATCH_EXIT_ON_QUEUED: '1'
-        run: node generator/cli.mjs watch --push --interval 30 --duration 12m --exit-on-queued
+        run: node .cache/promoted-runtime/generator/cli.mjs watch --push --interval 30 --duration 12m --exit-on-queued
 
       # `if: always()`, on purpose. A failed sync used to stop the chain here:
       # the step is gated on the loop's success, so the relay died on the very

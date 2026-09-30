@@ -31,7 +31,8 @@ test('splitPatchByFile + chunkPatchGroups: groups by file, caps giants, bounds c
   // The giant file is capped at the chunk budget and marked.
   const chunks = chunkPatchGroups(patch, { targetBytes: 40000 })
   assert.ok(chunks.length >= 2)
-  assert.match(chunks.join('\n'), /\[file truncated\]/)
+  assert.doesNotMatch(chunks.join('\n'), /\[file truncated\]/)
+  assert.equal((chunks.join('').match(/\+x\n/g) || []).length, 30000, 'all giant-file lines survive')
   // Call count stays bounded no matter how many files land.
   const many = Array.from({ length: 20 }, (_, i) => filePatch(`sdk/src/f${i}.ts`, '+q\n')).join('')
   assert.ok(chunkPatchGroups(many, { targetBytes: 1000, maxChunks: 4 }).length <= 4)
@@ -95,7 +96,7 @@ test('summarizeChunked: maps chunks then fuses, validated on the full corpus', a
   const seen = []
   const orig = globalThis.fetch
   globalThis.fetch = async (url, { body }) => {
-    const prompt = JSON.parse(String(body)).messages[0].content
+    const prompt = JSON.parse(String(body)).messages.at(-1).content
     seen.push(prompt)
     const isChunk = /summarize part \d+ of \d+/.test(prompt)
     const payload = isChunk
@@ -146,7 +147,7 @@ test('validateVerifyOut: per-claim verdicts fail closed', () => {
   assert.equal(good.claims.length, 1)
   const bad = validateVerifyOut({ supported: true, issues: [], claims: [{ quote: 'Adds X.', supported: false, reason: 'not in diff' }] })
   assert.equal(bad.supported, false, 'an unsupported claim fails even with supported:true')
-  const legacy = validateVerifyOut({ supported: false, issues: ['invented name'] })
+  const legacy = validateVerifyOut({ supported: false, issues: ['invented name'], claims: [] })
   assert.equal(legacy.supported, false)
   assert.throws(() => validateVerifyOut(null), /not an object/)
   const prompt = buildVerifyPrompt({ files: {} }, 'diff', { title: 'T', summary: 'S.' })
@@ -164,7 +165,7 @@ test('verifySummary: the check model defaults to deepseek-v4.1 and honors LLM_VE
   globalThis.fetch = async (url, { body }) => {
     const parsed = JSON.parse(String(body))
     seen.push({ url, model: parsed.model })
-    const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify({ supported: true, issues: [], claims: [] }) } }] })
+    const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify({ supported: true, issues: [], claims: [{ quote: 'T', supported: true }, { quote: 'S.', supported: true }] }) } }] })
     return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
   }
   const entry = { files: { added: [], modified: ['sdk/src/a.ts'], removed: [] }, summary: 'Notes.' }
@@ -280,7 +281,7 @@ test('PR stop-list: generic-only overlap is not a match', () => {
   assert.ok(!PR_MATCH_STOPLIST_RE.test('sdk/src/trust.ts'), 'real sources are not')
 })
 
-test('PR relevance gate: shape-checked; failures fail open', async () => {
+test('PR relevance gate: shape-checked; failures fail closed', async () => {
   const e = { sha: sha('d'), summary: 'Change.', files: { added: ['sdk/src/a.ts'], modified: [] } }
   const prMeta = { number: 9, title: 'Unrelated docs', matched: 'files', confidence: 0.65 }
   const prompt = buildPrRelevancePrompt(e, 'diff', prMeta)
@@ -297,13 +298,13 @@ test('PR relevance gate: shape-checked; failures fail open', async () => {
     assert.equal(calls, 0)
     // A dead gateway fails open: the match is kept, never dropped on error.
     const kept = await checkPrRelevance(e, 'diff', prMeta, { LLM_API_BASE: 'http://127.0.0.1:1', LLM_API_KEY: 'k' })
-    assert.equal(kept, prMeta)
+    assert.equal(kept, null)
   } finally {
     globalThis.fetch = orig
   }
 })
 
-test('release window: ungrounded members drop out, review-flagged members hedge', () => {
+test('release window: ungrounded members drop out, review-flagged members are omitted', () => {
   const bump = { sha: sha('f'), date: '2026-09-18T10:00:00Z', version: '1.0.5', files: { modified: ['package.json'] } }
   const bad = {
     sha: sha('e'), date: '2026-09-17T10:00:00Z', version: null,
@@ -317,15 +318,14 @@ test('release window: ungrounded members drop out, review-flagged members hedge'
   }
   const good = {
     sha: sha('a'), date: '2026-09-17T09:00:00Z', version: null,
-    ai: { title: 'Solid fix', summary: 'Fixes retry.', significance: 'minor' },
+    ai: { title: 'Solid fix', summary: 'Fixes retry.', significance: 'minor', verify: 'passed' },
     files: {}
   }
   const ctx = collectReleaseContext([bad, flagged, good, bump], bump)
   const text = formatReleaseContext(ctx, bump)
   assert.doesNotMatch(text, /INVENTED_X/, 'an ungrounded summary never enters the window')
-  assert.match(text, /1 other change was left out/, 'the roll-up is told the window is incomplete')
-  assert.match(text, /\[caution: review flagged its claims\]/)
-  assert.match(text, /hedged/, 'the roll-up is told how to handle marked items')
+  assert.match(text, /2 other changes were left out/, 'the roll-up is told the window is incomplete')
+  assert.doesNotMatch(text, /Retry hardening/, 'known objections cannot become release evidence')
   assert.match(text, /Solid fix/)
   const cleanCtx = collectReleaseContext([good, bump], bump)
   assert.doesNotMatch(formatReleaseContext(cleanCtx, bump), /caution|left out/)
@@ -391,7 +391,7 @@ test('callLlm: a refusal is re-asked with the comment-stripped prompt, not the s
   const seen = []
   const orig = globalThis.fetch
   globalThis.fetch = async (url, init) => {
-    const prompt = JSON.parse(String(init.body)).messages[0].content
+    const prompt = JSON.parse(String(init.body)).messages.at(-1).content
     seen.push(prompt)
     const content = /SAY THE UNIT/.test(prompt) ? refusal : good
     return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content } }] }) }
@@ -448,7 +448,7 @@ test('callLlm: a validation failure after the refusal ladder still gets its repa
   const seen = []
   const orig = globalThis.fetch
   globalThis.fetch = async (url, init) => {
-    const prompt = JSON.parse(String(init.body)).messages[0].content
+    const prompt = JSON.parse(String(init.body)).messages.at(-1).content
     seen.push(prompt)
     const content = (prompt === fullPrompt || prompt === shortPrompt) ? refusal : bad
     return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content } }] }) }

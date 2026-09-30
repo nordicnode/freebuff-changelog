@@ -11,6 +11,8 @@
 //      rewrite summaries later (cached per commit, see generator/lib/llm.mjs).
 import { git, US, RS, toUtc } from './util.mjs'
 import { open, rm } from "node:fs/promises";
+import { createReadStream } from 'node:fs'
+import { createInterface } from 'node:readline'
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 
@@ -116,11 +118,41 @@ async function diffText (repoDir, range, pathspecs, maxBytes, contextLines = 25)
       fh = await open(tmp, 'r')
     } catch { return '' } // git wrote nothing at all: an empty diff
     try {
-      const buf = Buffer.allocUnsafe(maxBytes + 1)
-      const { bytesRead } = await fh.read(buf, 0, maxBytes + 1, 0)
-      if (bytesRead === 0) return ''
-      const over = bytesRead > maxBytes
-      return buf.subarray(0, over ? maxBytes : bytesRead).toString('utf8') + (over ? DIFF_TRUNCATED : '')
+      const size = (await fh.stat()).size
+      if (size <= maxBytes) return await fh.readFile('utf8')
+      // Inventory the complete streamed source before choosing what fits.
+      // Tail source files must not disappear behind an alphabetically early
+      // generated file. Memory stays bounded even for multi-megabyte hunks.
+      const parts = []
+      let text = '', bytes = 0, partial = false, sourceFiles = 0
+      const flush = () => {
+        if (text) parts.push(text + (partial ? DIFF_TRUNCATED : ''))
+        let retained = 0
+        const best = prioritizeDiffParts(parts).filter(part => { retained += Buffer.byteLength(part); return retained <= maxBytes * 2 })
+        parts.splice(0, parts.length, ...best)
+        text = ''; bytes = 0; partial = false
+      }
+      const lines = createInterface({ input: createReadStream(tmp), crlfDelay: Infinity })
+      for await (const line of lines) {
+        if (line.startsWith('diff --git ')) { flush(); sourceFiles++ }
+        const length = Buffer.byteLength(line + '\n')
+        if (bytes + length <= maxBytes) { text += line + '\n'; bytes += length } else partial = true
+        // Keep only the best bounded source candidates; all headers are still
+        // visited and counted. Sort smaller high-priority files first.
+        if (parts.length > 256) parts.splice(0, parts.length, ...prioritizeDiffParts(parts).slice(0, 128))
+      }
+      flush()
+      // Reserve the inventory/truncation notice inside the byte budget.
+      const notice = `\n[source inventory: ${size} bytes, ${sourceFiles} files; partial evidence]` + DIFF_TRUNCATED
+      let out = '', used = 0
+      for (const part of prioritizeDiffParts(parts)) {
+        const room = Math.max(0, maxBytes - Buffer.byteLength(notice)) - used
+        if (room <= 0) break
+        const buffer = Buffer.from(part)
+        out += buffer.subarray(0, room).toString('utf8')
+        used += Math.min(buffer.length, room)
+      }
+      return out + notice
     } finally { await fh.close() }
   } finally { await rm(tmp, { force: true }) }
 }
@@ -1255,9 +1287,11 @@ export function extractStructuredFacts (patch) {
   const tests = new Set()
   let inTestFile = false
   let inDocFile = false
+  let filePath = ''
   for (const line of patch.split('\n')) {
     if (line.startsWith('diff --git ')) {
       const path = line.split(' b/').pop() || ''
+      filePath = path
       inTestFile = TEST_RE.test(path)
       inDocFile = DOC_FILE_RE.test(path)
       continue
@@ -1266,9 +1300,9 @@ export function extractStructuredFacts (patch) {
     if (sign !== '+' && sign !== '-') continue
     if (line.startsWith('+++') || line.startsWith('---')) continue
     const c = CONST_LINE_RE.exec(line)
-    if (c && !inTestFile && !inDocFile && !isOpenerValue(c[3])) (c[1] === '-' ? removedConst : addedConst).set(c[2], trimValue(c[3]))
+    if (c && !inTestFile && !inDocFile && !isOpenerValue(c[3])) (c[1] === '-' ? removedConst : addedConst).set(`${filePath}\u0000${c[2]}`, trimValue(c[3]))
     const x = EXPORT_RE.exec(line)
-    if (x && !inTestFile && !inDocFile) (x[1] === '-' ? removedExports : addedExports).add(x[2])
+    if (x && !inTestFile && !inDocFile) (x[1] === '-' ? removedExports : addedExports).add(`${filePath}\u0000${x[2]}`)
     // Docs mentioning an existing variable or flag for the first time are not
     // introducing it; subprocess argument lists are another program's flags.
     if (!inTestFile && !inDocFile) {
@@ -1288,20 +1322,21 @@ export function extractStructuredFacts (patch) {
       if (t) tests.add(t[2].replace(/\s+/g, ' ').trim())
     }
   }
-  for (const [name, to] of addedConst) {
-    const from = removedConst.get(name)
-    if (from != null && from !== to) out.constants.push({ name, from, to })
+  for (const [key, to] of addedConst) {
+    const [path, name] = key.split('\u0000')
+    const from = removedConst.get(key)
+    if (from != null && from !== to) out.constants.push({ name, from, to, path })
     // A brand-new CONSTANT_CASE definition is the other checkable half of
     // "describe only what literal value changed": the prompt previously only
     // received old -> new pairs, so a newly defined limit arrived with no
     // literal attached and the model free-associated one.
-    else if (from == null) out.constantsIntroduced.push({ name, to })
+    else if (from == null) out.constantsIntroduced.push({ name, to, path })
   }
   // Reads that exist on the removed side too are moved code, not new inputs.
   out.envVars = [...envSeen].filter(n => !envBefore.has(n))
   out.flags = [...flagSeen].filter(f => !flagBefore.has(f))
-  out.exportsAdded = [...addedExports].filter(n => !removedExports.has(n))
-  out.exportsRemoved = [...removedExports].filter(n => !addedExports.has(n))
+  out.exportsAdded = [...new Set([...addedExports].filter(n => !removedExports.has(n)).map(n => n.split('\u0000')[1]))]
+  out.exportsRemoved = [...new Set([...removedExports].filter(n => !addedExports.has(n)).map(n => n.split('\u0000')[1]))]
   out.testNames = [...tests]
   for (const k of Object.keys(STRUCTURED_LIMITS)) out[k] = out[k].slice(0, STRUCTURED_LIMITS[k])
   return out
@@ -1320,23 +1355,26 @@ export function hasStructuredFacts (s) {
 // rev) into "not found", so a failed lookup keeps the claim rather than
 // silently dropping a real fact. Bounded checks keep one enrich pass cheap.
 export async function pruneKnownInputs (repoDir, base, structured, { maxChecks = 24 } = {}) {
-  if (!repoDir || !base || !hasStructuredFacts(structured)) return structured
+  if (!hasStructuredFacts(structured)) return structured
+  if (!repoDir || !base) return { ...structured, constantsIntroduced: [], envVars: [], flags: [], testNames: [] }
   let checks = maxChecks
   const knownAt = async (needle) => {
-    if (checks-- <= 0) return false
+    if (checks-- <= 0) return null
     // `-e` names the pattern explicitly: a flag like `--old-flag` would
     // otherwise be parsed as another git option instead of the search term.
-    const hit = await git(['grep', '-l', '-F', '-e', needle, base, '--'], repoDir, { allowFail: true })
-    return hit != null && hit.trim() !== ''
+    try {
+      const hit = await git(['grep', '-l', '-F', '-e', needle, base, '--'], repoDir)
+      return hit.trim() !== ''
+    } catch (err) { return err.code === 1 ? false : null }
   }
   const prune = async (list) => {
     const keep = []
-    for (const item of list) if (!(await knownAt(item))) keep.push(item)
+    for (const item of list) if ((await knownAt(item)) === false) keep.push(item)
     return keep
   }
   const pruneNamed = async (list) => {
     const keep = []
-    for (const item of list) if (!(await knownAt(item?.name || item))) keep.push(item)
+    for (const item of list) if ((await knownAt(item?.name || item)) === false) keep.push(item)
     return keep
   }
   return {
@@ -1355,7 +1393,7 @@ export async function pruneKnownInputs (repoDir, base, structured, { maxChecks =
 export function formatStructuredFacts (s) {
   if (!hasStructuredFacts(s)) return []
   const lines = ['Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):']
-  if (s.constants.length) lines.push(`- Constants whose value changed: ${s.constants.map(c => `${c.name}: ${c.from} -> ${c.to}`).join(' ; ')}`)
+  if (s.constants.length) lines.push(`- Constants whose value changed: ${s.constants.map(c => `${c.name}${c.path ? ` (${c.path})` : ''}: ${c.from} -> ${c.to}`).join(' ; ')}`)
   if (s.constantsIntroduced?.length) lines.push(`- Constants newly defined: ${s.constantsIntroduced.map(c => `${c.name} = ${c.to}`).join(' ; ')} (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)`)
   if (s.envVars.length) lines.push(`- Environment variables newly read: ${s.envVars.join(', ')}`)
   if (s.flags.length) lines.push(`- Command-line flags newly introduced: ${s.flags.join(', ')}`)
@@ -1554,6 +1592,7 @@ export async function analyzeCommunityCommit (repoDir, commit, prevSha, repoMeta
   const entry = {
     kind: 'community',
     sha: commit.sha,
+    prevSha: prevSha || EMPTY_TREE,
     url: `${repoMeta.repoUrl}/commit/${commit.sha}`,
     date: commit.date,
     author: commit.author,

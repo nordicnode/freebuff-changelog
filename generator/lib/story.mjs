@@ -9,6 +9,7 @@
 // the morning after the work it ships, so a bump row also joins the previous
 // day's clustering. Links and notes always point at a member's own day.
 import { isBumpEntry } from './analyze.mjs'
+import { qualityOf, qualityText } from './quality.mjs'
 
 function previousDay (day) {
   const d = new Date(`${day}T00:00:00Z`)
@@ -99,7 +100,8 @@ export function accessStory (s) {
 // Only explicit eligibility transitions qualify. Broad word co-occurrence (for
 // example "added" plus "full access") confuses housekeeping with policy changes.
 export function accessEvidence (e) {
-  const sources = [...(e?.facts || []), e?.ai?.summary, e?.eli5?.text].filter(Boolean)
+  const quality = qualityOf(e)
+  const sources = [...(e?.facts || []), ...(['passed', 'human-edited'].includes(quality.verify) ? [e?.ai?.summary] : []), ...(['passed', 'human-edited', 'deterministic'].includes(quality.plainVerify) ? [e?.eli5?.text] : [])].filter(Boolean)
   for (const source of sources) {
     for (const sentence of String(source).split(/(?<=[.!?])\s+/)) {
       const text = sentence.replace(/`/g, '').trim()
@@ -132,7 +134,7 @@ function describe (e) {
     title: entryTitle(e),
     paths: linkPaths(e),
     tokens: storyTokens(e),
-    line: flat(e.eli5?.text),
+    line: flat([qualityText(e), e.eli5?.text].filter(Boolean).join(' ')),
     access: isConsequential(e)
   }
 }

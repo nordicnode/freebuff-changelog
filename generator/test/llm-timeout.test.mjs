@@ -30,7 +30,7 @@ for (const pass of ['summary', 'eli5']) {
         }
         // The verifier pass is timed by the same clock but has its own tests
         // (v10); here the single-call timeout plumbing is the subject.
-        const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'test', LLM_API_BASE: 'https://example.invalid/v1', LLM_TIMEOUT_MS: value, CHANGELOG_LLM_VERIFY: '0' }
+        const env = { CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM: '1', LLM_API_KEY: 'test', LLM_API_BASE: 'https://example.invalid/v1', LLM_TIMEOUT_MS: value, CHANGELOG_LLM_VERIFY: '0' }
         if (pass === 'eli5') {
           entry.ai = { model: 'test', v: PROMPT_V, title: 'Additional model supported', summary: entry.summary }
           assert.equal(await enrichEli5([entry], dir, env), 1)

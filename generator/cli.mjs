@@ -9,17 +9,20 @@ import { existsSync, readFileSync } from 'node:fs'
 import { resolve, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execSync } from 'node:child_process'
-import { git, readJson, writeJson, writeText, log, ymd, toUtc, normalizeDate, pruneDiffs, pool, withLock } from './lib/util.mjs'
-import { capturePendingWrites, persistMerged, mergeOpenPrs } from './lib/mergedata.mjs'
+import { git, readJson, writeJson, writeText, log, ymd, toUtc, normalizeDate, pruneDiffs, pool, withLock, withDeadline, deadlineAt } from './lib/util.mjs'
+import { capturePendingWrites, persistMerged, mergeOpenPrs, pickAiRecord } from './lib/mergedata.mjs'
 import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
   extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
-import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, rewriteScopeOf, rewriteIsCurrent, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary } from './lib/llm.mjs'
+import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible } from './lib/llm.mjs'
+import { QUALITY_POLICY_V } from './lib/quality.mjs'
+import { shortHash, eli5Source } from './lib/util.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+// A promoted runtime may live under .cache while data/git stay in the checkout.
+const ROOT = process.env.CHANGELOG_WORKSPACE_ROOT ? resolve(process.env.CHANGELOG_WORKSPACE_ROOT) : resolve(dirname(fileURLToPath(import.meta.url)), '..')
 if (existsSync(resolve(ROOT, '.env')) && typeof process.loadEnvFile === 'function') {
   process.loadEnvFile(resolve(ROOT, '.env'))
 }
@@ -51,13 +54,13 @@ async function llmPatchFor (e) {
   // except for test-only commits, where the tests *are* the change. Excluding
   // them there handed the queue an empty patch, so those rows could never be
   // summarized and the backlog counter never reached zero.
-  const clean = await extractCleanDiff(REPO_DIR, base, e.sha, 600000, !e.testOnly)
+  const clean = await extractCleanDiff(REPO_DIR, base, e.sha, 8000000, !e.testOnly)
   if (clean.trim()) return clean
   // Stale entries built before testOnly existed (or with narrower TEST_RE)
   // carry no flag, so the exclusion above empties their patch. Retry without
   // the test exclusion before giving up; churn rows stay empty either way.
   if (!e.testOnly) {
-    const incl = await extractCleanDiff(REPO_DIR, base, e.sha, 600000, false)
+    const incl = await extractCleanDiff(REPO_DIR, base, e.sha, 8000000, false)
     if (incl.trim()) return incl
   }
   // A churn row's entire change IS the lockfile, so the clean form is empty by
@@ -74,8 +77,8 @@ async function llmPatchFor (e) {
 // toggle would fetch an empty file.
 async function storedDiffFor (e) {
   const base = await baseShaFor(e)
-  const clean = await extractCleanDiff(REPO_DIR, base, e.sha)
-  return clean.trim() ? clean : extractRawDiff(REPO_DIR, base, e.sha)
+  const clean = await extractCleanDiff(REPO_DIR, base, e.sha, 8000000)
+  return clean.trim() ? clean : extractRawDiff(REPO_DIR, base, e.sha, 8000000)
 }
 
 // The full stored diff (test hunks included), for the structured-facts
@@ -141,9 +144,10 @@ export function prsEqual (cachedDoc, newPrs, total, complete, partial) {
     if (o.number !== n.number || o.updated !== n.updated || o.title !== n.title ||
         o.draft !== n.draft || o.comments !== n.comments || o.reviewComments !== n.reviewComments ||
         o.additions !== n.additions || o.deletions !== n.deletions || o.files !== n.files ||
-        Boolean(o.hasDiff) !== Boolean(n.hasDiff) || o.reviewState !== n.reviewState) {
+        Boolean(o.hasDiff) !== Boolean(n.hasDiff) || Boolean(o.stalePreview) !== Boolean(n.stalePreview) || (o.body || '') !== (n.body || '') || o.reviewState !== n.reviewState) {
       return false
     }
+    if (JSON.stringify(o.enrichment || null) !== JSON.stringify(n.enrichment || null)) return false
     if (JSON.stringify(o.labels || []) !== JSON.stringify(n.labels || [])) return false
     if (JSON.stringify(o.commitsList || null) !== JSON.stringify(n.commitsList || null)) return false
     if (JSON.stringify(o.commentsList || null) !== JSON.stringify(n.commentsList || null)) return false
@@ -162,8 +166,9 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
   // silently, every run. So the decoration gets a budget, and the run stops
   // asking the moment the API says no. A token lifts the ceiling to 5,000/hour,
   // which is enough to finish a list of this size in one pass.
-  const PR_CALL_BUDGET = Number(process.env.CHANGELOG_PR_CALLS) ||
-    (process.env.GITHUB_TOKEN ? 500 : 25)
+  const PR_CALL_BUDGET = Math.min(40, Number(process.env.CHANGELOG_PR_CALLS) ||
+    (process.env.GITHUB_TOKEN ? 500 : 25))
+  const deadline = Math.min(deadlineAt(), Date.now() + 60000)
   // How old the stored list may get before the count on the page stops being
   // trusted. The watch loop wakes every 30s; a 2-minute cadence ensures new
   // PRs appear quickly without tripping rate limits.
@@ -174,14 +179,22 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
   const lastPage = (res) => Number(/[?&]page=(\d+)[^>]*>;\s*rel="last"/.exec(linkHeader(res))?.[1]) || null
   const headers = { 'user-agent': 'freebuff-changelog', accept: 'application/vnd.github+json' }
   if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`
-  const get = (url) => fetchImpl(url, { headers, signal: AbortSignal.timeout(15000) })
+  const get = (url) => {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) throw new Error('PR refresh deadline exceeded')
+    return fetchImpl(url, { headers, signal: AbortSignal.timeout(Math.min(15000, remaining)) })
+  }
   // GitHub's own count, from one `per_page=1` request: with one row per page the
   // `rel="last"` page number *is* the number of open PRs. Never derived from the
   // rows we happened to receive -- that is the arithmetic that reported 60.
   const probeTotal = async () => {
     try {
       const res = await get(`${LIST}?state=open&sort=created&direction=desc&per_page=1`)
-      return res.ok ? lastPage(res) : null
+      if (!res.ok) return null
+      const last = lastPage(res)
+      if (last != null) return last
+      const rows = await res.json()
+      return Array.isArray(rows) ? rows.length : null
     } catch (_) { return null }
   }
   try {
@@ -259,7 +272,7 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
     // merged/closed PRs drop off it. Short of that, the walk is a partial
     // sighting: union it over what is already known, so the count can move up
     // but never backwards because of a bad HTTP 500.
-    const complete = !stoppedEarly && prs.length > 0 && (total == null || prs.length >= total)
+    const complete = !stoppedEarly && (total == null || prs.length >= total)
     let list
     if (complete) {
       list = prs
@@ -279,19 +292,27 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
     // re-decorated, so a pushed update does not keep showing an old diff.
     for (const p of list) {
       const prev = prevByNum.get(p.number)
-      if (!prev) continue
-      if (prev.updated && p.updated && prev.updated !== p.updated) { p.stalePreview = true; continue }
+      if (!prev) {
+        if (cached?.fetchedAt) p.enrichment = { policy: QUALITY_POLICY_V, admittedAt: new Date().toISOString() }
+        continue
+      }
+      if (prev.enrichment) p.enrichment = prev.enrichment
+      if (prev.stalePreview) p.stalePreview = true
+      if (prev.updated && p.updated && prev.updated !== p.updated) {
+        p.enrichment = { policy: QUALITY_POLICY_V, admittedAt: new Date().toISOString() }
+        p.stalePreview = true
+        continue
+      }
       if (p.additions == null && prev.additions != null) {
         p.additions = prev.additions; p.deletions = prev.deletions; p.files = prev.files
       }
-      p.comments = prev.comments ?? p.comments
-      p.reviewComments = prev.reviewComments ?? p.reviewComments
+      const discussionChanged = (prev.comments ?? 0) !== p.comments || (prev.reviewComments ?? 0) !== p.reviewComments
+      if (discussionChanged) delete p.commentsList
       if (p.reviewState == null && prev.reviewState != null) p.reviewState = prev.reviewState
       if (!p.hasDiff && prev.hasDiff) p.hasDiff = true
       if ((!p.labels || p.labels.length === 0) && prev.labels?.length) p.labels = prev.labels
       if (!p.commitsList && prev.commitsList) p.commitsList = prev.commitsList
-      if (!p.commentsList && prev.commentsList) p.commentsList = prev.commentsList
-      if (!p.body && prev.body) p.body = prev.body
+      if (!discussionChanged && !p.commentsList && prev.commentsList) p.commentsList = prev.commentsList
     }
     // PRs that left the open list since the last complete fetch: remember them,
     // so the sync commit that lands them later still finds its PR context.
@@ -301,6 +322,8 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
       // The preview diff is read now, before prunePrDiffs deletes it: its file
       // paths are what lets a later sync commit be matched back to this PR.
       const pathsOf = (p) => { try { return diffPaths(readFileSync(resolve(dataDir, `pr-diffs/${p.number}.diff`), 'utf8')) } catch { return [] } }
+      // Disappearance proves closure, not merge. Unknown closures are retained
+      // for audit but excluded from shipped-intent matching until confirmed.
       const { doc: mergedDoc, added } = rememberClosedPrs(cachedPrs, list, await readJson(mergedPath, { prs: [] }), new Date().toISOString(), { pathsOf })
       if (added) {
         await writeJson(mergedPath, mergedDoc)
@@ -314,10 +337,10 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
     let used = 0
     let refused = false
     const ghGet = async (path, accept) => {
-      if (refused || used >= PR_CALL_BUDGET) return null
+      if (refused || used >= PR_CALL_BUDGET || Date.now() >= deadline) return null
       used++
       try {
-        const r = await fetchImpl(`https://api.github.com${path}`, { headers: { ...headers, ...(accept ? { accept } : {}) }, signal: AbortSignal.timeout(15000) })
+        const r = await fetchImpl(`https://api.github.com${path}`, { headers: { ...headers, ...(accept ? { accept } : {}) }, signal: AbortSignal.timeout(Math.max(1, Math.min(15000, deadline - Date.now()))) })
         if (!r.ok) {
           if (r.status === 403 || r.status === 429) {
             refused = true
@@ -328,6 +351,21 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
         return accept ? await r.text() : await r.json()
       } catch { return null }
     }
+    // Verify merge-vs-close with the same bounded GitHub budget. Older unknown
+    // closures are retried too, so one failed request cannot suppress recovery.
+    const closedPath = `${dataDir}/merged-prs.json`
+    const closedDoc = await readJson(closedPath, null)
+    let closedChanged = false
+    await pool((closedDoc?.prs || []).filter(p => p.closureState === 'unknown' || p.merged === undefined).slice(-10).map(p => async () => {
+      const full = await ghGet(`/repos/CodebuffAI/freebuff/pulls/${p.number}`)
+      if (full?.state === 'closed' && typeof full.merged === 'boolean') {
+        p.merged = full.merged
+        p.closureState = full.merged ? 'merged' : 'closed-unmerged'
+        p.closureCheckedAt = new Date().toISOString()
+        closedChanged = true
+      }
+    }), 2)
+    if (closedChanged) { closedDoc.updatedAt = new Date().toISOString(); await writeJson(closedPath, closedDoc) }
     // Inline diff preview: persisted in data/pr-diffs/, served from
     // /pr-diffs/<n>.diff. A missing file degrades to a GitHub link, and PRs
     // already on disk are skipped -- so a steady list costs nothing.
@@ -399,7 +437,7 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
         }
       }
       cList.sort((a, b) => a.created.localeCompare(b.created))
-      p.commentsList = cList
+      if (Array.isArray(issueComments) && (!(p.reviewComments > 0) || Array.isArray(reviewComments))) p.commentsList = cList
     }), 4)
     // Optional review state decoration (when explicitly requested, e.g. CHANGELOG_PR_REVIEWS=1)
     if (process.env.CHANGELOG_PR_REVIEWS === '1') {
@@ -421,13 +459,13 @@ export async function fetchOpenPrs ({ fetchImpl = globalThis.fetch, dataDir = DA
     }
     // Mark previews already on disk (skipped above, still viewable).
     for (const p of list) {
-      if (!p.hasDiff && existsSync(previewPath(p.number))) p.hasDiff = true
-      if (p.stalePreview) delete p.stalePreview
+      if (!p.stalePreview && !p.hasDiff && existsSync(previewPath(p.number))) p.hasDiff = true
+      // A failed revision refresh stays stale until a successful fetch.
     }
     // Say what is missing and why, in the same breath as the budget: a reader
     // of the log should not have to infer that 116 PRs and 25 calls do not
     // meet, or that the gap is being closed on purpose.
-    const noDiff = list.filter(p => !p.hasDiff).length
+    const noDiff = list.filter(p => !p.hasDiff || p.stalePreview).length
     const noStats = list.filter(p => p.additions == null).length
     if (noDiff || noStats) {
       log(`open PRs: ${list.length} listed${total != null ? ` of ${total} open` : ''}, ${used}/${PR_CALL_BUDGET} per-PR calls spent${refused ? ' (refused)' : ''}; ${noDiff} without a preview, ${noStats} without a diffstat -- the next run continues`)
@@ -489,7 +527,9 @@ export async function fetchTrafficClones ({
 
   try {
     const url = `https://api.github.com/repos/${repo}/traffic/clones`
-    const res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(15000) })
+    const remaining = deadlineAt() - Date.now()
+    if (remaining <= 0) return cached
+    const res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(Math.max(1, Math.min(15000, remaining))) })
     if (!res.ok) {
       if (res.status === 403 || res.status === 404) {
         log(`traffic clones (${repo}): HTTP ${res.status}${token ? '' : ' (no token set)'}${cached ? ': keeping cached traffic' : ''}`)
@@ -606,9 +646,13 @@ export function repairEntry (e, { diffText = null } = {}) {
   }
   // Structured facts from the stored diff, for rows analyzed before the
   // extractor existed (the prompt and the chips both read them).
-  if (diffText && !hasStructuredFacts(e.structured)) {
-    const s = extractStructuredFacts(diffText)
-    if (hasStructuredFacts(s)) { e.structured = s; changed = true }
+  if (diffText && !e.structuredSource?.noveltyChecked) {
+    const raw = extractStructuredFacts(diffText)
+    // Stored hunks alone do not prove novelty at the base revision.
+    const s = { ...raw, constantsIntroduced: [], envVars: [], flags: [], testNames: [] }
+    if (JSON.stringify(e.structured || null) !== JSON.stringify(s)) { e.structured = s; changed = true }
+    const source = { version: 1, base: e.prevSha || null, head: e.sha, hash: shortHash(diffText), noveltyChecked: false }
+    if (JSON.stringify(e.structuredSource || null) !== JSON.stringify(source)) { e.structuredSource = source; changed = true }
   }
   const testOnly = e.files.testOnly ?? ((e.files.meaningful === 0 && (e.files.rawMeaningful || 0) > 0) ||
     ([...(e.files.added || []), ...(e.files.removed || []), ...(e.files.modified || [])].length > 0 &&
@@ -629,7 +673,7 @@ export function repairEntries (entries, { diffDir = null } = {}) {
   let n = 0
   for (const e of entries || []) {
     let diffText = null
-    if (diffDir && !e.noise && !hasStructuredFacts(e.structured)) {
+    if (diffDir && !e.noise && !e.structuredSource?.noveltyChecked) {
       try { diffText = readFileSync(resolve(diffDir, `${e.sha}.diff`), 'utf8') } catch {}
     }
     if (repairEntry(e, { diffText })) n++
@@ -681,6 +725,9 @@ async function generateOnce (argv) {
       e = await analyzeCommunityCommit(REPO_DIR, c, c.parents[0] || null, META)
     }
     decorate(e)
+    // Only future incremental admissions may incur provider calls. A first
+    // scan or history rewrite is deterministic, never a paid backfill.
+    if (state.lastSha && isAncestor && !full) e.enrichment = { policy: QUALITY_POLICY_V, admittedAt: new Date().toISOString() }
     bySha.set(c.sha, e)
     newlyAddedEntries.push(e)
     added++
@@ -690,22 +737,8 @@ async function generateOnce (argv) {
   let entries = [...bySha.values()]
   entries.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.sha < b.sha ? -1 : 1))
 
-  // Hourly sync behavior: only generate diffs & summarize NEWLY added entries this run.
-  // Backfilling of historical/existing entries is handled by the 1-minute loop (npm run backfill / watch).
-  const toEnrich = (full || !state.lastSha) ? entries : newlyAddedEntries
-  if (toEnrich.length > 0) {
-    await backfillDiffs(toEnrich, toEnrich.length)
-    if (llmConfigured()) {
-      const n = await enrichWithLlm(toEnrich, llmPatchFor, DATA, process.env, { repoDir: REPO_DIR, getFullPatch: fullPatchFor })
-      log(`LLM enriched ${n} new entries`)
-    }
-  }
-  // ELI5 scans the whole entry set rather than only this run's additions: the
-  // summary it explains may have been written minutes ago by the other pass.
-  // This call is what makes a brand-new entry arrive with its plain-English line
-  // already attached instead of waiting for a backfill.
-  const eli5N = await enrichEli5(entries, DATA, process.env, { getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
-  if (eli5N) log(`ELI5 wrote ${eli5N} plain-English line${eli5N === 1 ? '' : 's'}`)
+  // Persist source progress before any optional network enrichment. The
+  // durable admission marker lets later bounded cycles resume new work.
 
   const prevScanned = existing.counts?.commitsScanned || 0
   const changelog = {
@@ -740,16 +773,15 @@ async function generateOnce (argv) {
   }))
   // Derived fields land with the analyze output too, not only at publish time.
   await repairDerivedFields(DATA)
+  if (argv.includes('--push')) await commitAndPushData({ message: `data: update changelog (${utcStamp()} UTC)` })
+  await backfillDiffs(newlyAddedEntries, newlyAddedEntries.length)
 
   const prs = await fetchOpenPrs()
   await prunePrDiffs(prs || [], await readJson(`${DATA}/open-prs.json`, null))
+  refreshDiffFlags(entries, resolve(DATA, 'diffs'))
+  await persistMerged({ [`${DATA}/changelog.json`]: changelog })
   await fetchTrafficClones()
-  // Previews for open PRs: same summary ask on the stored preview diff, a few
-  // per run (CHANGELOG_PR_LLM_LIMIT), cached by number + diff hash.
-  if (prs?.length && llmConfigured()) {
-    const n = await enrichOpenPrs(prs, DATA, process.env, { getDiff: (p) => readFile(resolve(DATA, `pr-diffs/${p.number}.diff`), 'utf8').catch(() => '') })
-    if (n) log(`LLM previewed ${n} open PR${n === 1 ? '' : 's'}`)
-  }
+  // PR previews run only in the bounded enrichment phase, never ingestion.
 
   log(`wrote ${entries.length} entries (${added} new this run)` + (prs ? `, ${prs.length} open PRs` : ''))
   // Newest last, matching analyze order: callers front-load these for
@@ -794,8 +826,10 @@ async function backfillDiffs (entries, max = Infinity) {
   let count = 0
   let empty = 0
   let failed = 0
+  let started = 0
   await pool(todo.map(e => async () => {
-    if (count >= max) return
+    if (started >= max || Date.now() >= deadlineAt()) return
+    started++
     // One unreadable commit must not end a run over thousands of them: this is
     // the pass that died on a single 67 MB diff.
     let diff = ''
@@ -1016,7 +1050,7 @@ export async function cmdFreshness (argv = [], { dataDir = DATA, now = Date.now(
 }
 
 async function cmdCatchUp (argv) {
-  const { acquired } = await withLock(LOCK, () => catchUpOnce(argv))
+  const { acquired } = await withLock(LOCK, () => withDeadline(240000, () => catchUpOnce(argv)))
   if (!acquired) log('another generate/backfill run holds the worktree lock: skipping this cycle')
   // The loop reads this to tell "a peer holds the lock" (healthy, the site is
   // being kept fresh by someone) apart from "this cycle did nothing" (broken).
@@ -1064,7 +1098,7 @@ async function catchUpOnce (argv) {
     const prevPrs = await readJson(`${DATA}/open-prs.json`, null)
     const prs = await fetchOpenPrs()
     if (prs) {
-      await prunePrDiffs(prs, prevPrs)
+      await prunePrDiffs(prs, await readJson(`${DATA}/open-prs.json`, null))
     }
     await fetchTrafficClones()
     didPrSync = Boolean(await dirtyData())
@@ -1091,10 +1125,10 @@ async function catchUpOnce (argv) {
     })
   }
 
-  const queueable = entries.filter(e => !e.noise)
+  const queueable = entries.filter(e => !e.noise && enrichmentEligible(e, { CHANGELOG_LLM_NO_BACKFILL: '1' }))
   const isCurrent = (e) => e.ai?.title && (process.env.CHANGELOG_LLM_FORCE_REWRITE === '1' ? (e.ai?.v ?? 1) >= PROMPT_V : true)
   const unsummarized = queueable.filter(e => !isCurrent(e))
-  log(`[backfill] ${queueable.length} total entries (${unsummarized.length} remaining to summarize)`)
+  log(`[enrichment] ${queueable.length} total entries (${unsummarized.length} remaining to summarize)`)
 
   let limit = Number(process.env.CHANGELOG_LLM_LIMIT || 5)
   const limitIdx = argv.indexOf('--limit')
@@ -1103,11 +1137,10 @@ async function catchUpOnce (argv) {
   }
 
   let didSummarize = false
-  if (!unsummarized.length) {
-    log('[backfill] all existing sync entries already have AI summaries!')
-  } else if (llmConfigured()) {
-    await backfillDiffs(entries, 1000)
-    const envWithLimit = { ...process.env, CHANGELOG_LLM_LIMIT: String(limit) }
+  const cycleEnv = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(limit), LLM_DEADLINE_AT: String(Math.min(deadlineAt(), Date.now() + 120000)), LLM_CYCLE_BUDGET: { remaining: 40 } }
+  if (llmConfigured()) {
+    await backfillDiffs(queueable, limit)
+    const envWithLimit = cycleEnv
     const n = await enrichWithLlm(entries, llmPatchFor, DATA, envWithLimit, {
       retryErrors: true,
       // This cycle's commits go first; the backlog can wait, the news cannot.
@@ -1120,7 +1153,7 @@ async function catchUpOnce (argv) {
       getFullPatch: fullPatchFor
     })
     const remaining = queueable.filter(e => !isCurrent(e)).length
-    log(`[backfill] enriched ${n} entries with LLM (${remaining} remaining)`)
+    log(`[enrichment] enriched ${n} entries with LLM (${remaining} remaining)`)
     didSummarize = remaining < unsummarized.length
   } else {
     log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env)')
@@ -1131,19 +1164,27 @@ async function catchUpOnce (argv) {
   // and the plain-English backlog would never move; and a commit summarized a
   // few lines above needs its line in the same cycle, not the next one.
   if (llmConfigured()) {
-    const eli5Written = await enrichEli5(entries, DATA, { ...process.env, CHANGELOG_LLM_LIMIT: String(limit) }, {
+    const eli5Written = await enrichEli5(entries, DATA, cycleEnv, {
       retryErrors: true,
       priorityShas: new Set(freshShas.slice(-limit)),
       getPatch: llmPatchFor,
       getFullPatch: fullPatchFor,
       repoDir: REPO_DIR
     })
-    const eli5Remaining = countPendingEli5(entries)
+    const eli5Remaining = countPendingEli5(queueable)
     if (eli5Written || eli5Remaining) {
-      log(`[backfill] ELI5 wrote ${eli5Written} entries (${eli5Remaining} remaining)`)
+      log(`[enrichment] ELI5 wrote ${eli5Written} entries (${eli5Remaining} remaining)`)
     }
     didSummarize = didSummarize || eli5Written > 0
+    const prDoc = await readJson(`${DATA}/open-prs.json`, null)
+    if (prDoc?.prs?.length && Date.now() < Number(cycleEnv.LLM_DEADLINE_AT)) {
+      const previews = await enrichOpenPrs(prDoc.prs, DATA, cycleEnv, { getDiff: p => readFile(resolve(DATA, `pr-diffs/${p.number}.diff`), 'utf8').catch(() => '') })
+      if (previews) { await persistMerged({ [`${DATA}/open-prs.json`]: prDoc }); didSummarize = true }
+    }
   }
+  // Checkpoint successes even without a publish; a deadline or push failure
+  // must not discard completed forward-only work.
+  await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: existing }))
 
   // 4. Publish again, this time with the summaries in. Still unconditional on
   //    --push rather than gated on didSummarize: an upstream-only move is
@@ -1151,7 +1192,7 @@ async function catchUpOnce (argv) {
   //    block the next cycle's rebase.
   if (argv.includes('--push')) {
     const commitMsg = didSummarize
-      ? `data: LLM backfill (${utcStamp()} UTC)`
+      ? `data: forward enrichment (${utcStamp()} UTC)`
       : (didSync
         ? `data: update changelog (${utcStamp()} UTC)`
         : (didPrSync ? `data: update open PRs (${utcStamp()} UTC)` : `data: update (${utcStamp()} UTC)`))
@@ -1286,17 +1327,18 @@ async function cmdBuild () {
     for (const [key, val] of Object.entries(aiCache)) {
       if (val && !val.error) {
         const sha = key.split(':')[0]
-        if (val.title) aiBySha.set(sha, val)
-        if (val.text && key.includes(':eli5:')) eli5BySha.set(sha, val)
+        if (val.title) aiBySha.set(sha, pickAiRecord(val, aiBySha.get(sha)))
+        if (val.text && key.includes(':eli5:')) {
+          const list = eli5BySha.get(sha) || []
+          list.push(val); eli5BySha.set(sha, list)
+        }
       }
     }
     for (const e of changelog.entries) {
-      if (!e.ai && aiBySha.has(e.sha)) {
-        e.ai = aiBySha.get(e.sha)
-      }
-      if (!e.eli5 && eli5BySha.has(e.sha)) {
-        e.eli5 = eli5BySha.get(e.sha)
-      }
+      if (aiBySha.has(e.sha)) e.ai = pickAiRecord(e.ai, aiBySha.get(e.sha))
+      const plain = (eli5BySha.get(e.sha) || []).filter(p => p.src === shortHash(eli5Source(e))).sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')) || JSON.stringify(b).localeCompare(JSON.stringify(a)))[0]
+      if (plain?.src === shortHash(eli5Source(e)) && (!e.eli5 || String(plain.at || '') > String(e.eli5.at || ''))) e.eli5 = plain
+      if (e.eli5?.src && e.eli5.src !== shortHash(eli5Source(e))) delete e.eli5
     }
   }
   // Human corrections win over everything the model wrote, on every surface
@@ -1636,16 +1678,15 @@ if (IS_MAIN) {
   else {
     console.log(`usage:
   node generator/cli.mjs generate [--full]        # analyze upstream freebuff (full rescan)
-  node generator/cli.mjs catch-up [--push]        # sync-if-due + one LLM backfill batch
-  node generator/cli.mjs backfill [--push] [--interval S] [--duration D]  # continuous sync & backfill loop
-  node generator/cli.mjs watch [--push] [--interval S] [--duration D]     # alias for backfill
+  node generator/cli.mjs catch-up [--push]        # publish deterministic changes, then bounded forward enrichment
+  node generator/cli.mjs watch [--push] [--interval S] [--duration D]  # continuous sync; historical enrichment disabled
   node generator/cli.mjs push-data [--message M]  # commit+push data/ with the shared race handling
   node generator/cli.mjs freshness [--max-age-min N]  # CI gate: fail if data/changelog.json is staler than the site's own [stale] threshold (2x the sync budget)
-  node generator/cli.mjs enrich-all [--batch N] [--push] [--rewrite-stale]  # one pass toward a diff + summary + ELI5 for every entry (0 = everything left); --rewrite-stale also refreshes rows on an older prompt, major first. Narrow it with --rewrite-since N (days) and/or --rewrite-important; the union of both scopes re-queues
+  node generator/cli.mjs enrich-all              # disabled: no historical API spending
   node generator/cli.mjs repair-entries [--push]   # recompute commitNature / significance / security tag on stored rows (no text touched)
   node generator/cli.mjs prune-cache [--push]      # drop ai-summaries.json keys from retired prompt versions
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
-  node generator/cli.mjs eval [--seed N] [--limit N] [--no-judge]  # summary-quality evaluation against data/eval/golden.json (LLM judge on by default)
+  node generator/cli.mjs eval [--seed N] [--limit N]  # offline stored-artifact audit, zero provider calls
   node generator/cli.mjs normalize-dates [--push]  # one-off: rewrite stored timestamps to UTC and fix the day/month keys
   node generator/cli.mjs broadcast [--webhook URL] [--limit N] [--dry-run]  # broadcast latest commits to Discord
   node generator/cli.mjs override <sha> [--title T] [--summary S] [--eli5 E] [--significance S] [--audience A] [--evidence V] [--note N] [--clear|--list]  # author a human correction into data/overrides.json
@@ -1654,87 +1695,11 @@ if (IS_MAIN) {
     process.exit(cmd ? 1 : 0)
   }
 }
-/**
- * One pass toward complete coverage: store every missing diff, then spend a
- * batch of API calls on technical summaries and plain-English lines, and publish.
- *
- * A *pass*, not a loop, on purpose: the run holds the worktree lock, and the
- * daemon needs that lock to publish fresh upstream commits. Looping this from
- * outside (`until` it reports nothing left) hands the daemon a window between
- * passes. Everything is resumable -- summaries are cached by sha + prompt
- * version + diff hash, and a diff already on disk is never regenerated.
- */
-async function cmdEnrichAll (argv) {
-  const { acquired } = await withLock(LOCK, () => enrichAllPass(argv))
-  if (!acquired) log('another generate/backfill run holds the worktree lock: retry this pass shortly')
+// Keep the retired command fail-fast for old automation; no duplicate writer.
+async function cmdEnrichAll () {
+  throw new Error('Historical enrichment is disabled: no backfill or paid regeneration is permitted.')
 }
 
-async function enrichAllPass (argv) {
-  // --batch 0 means "everything still missing", bounded per pass by the queue's
-  // own git-work window rather than by a call count.
-  const at = argv.indexOf('--batch')
-  const batch = at !== -1 ? Math.max(0, Number(argv[at + 1]) || 0) : 200
-  // --rewrite-stale: rows summarized under an older prompt version re-queue,
-  // major first, then notable, then minor (newest first within each), after any
-  // row with no summary at all. Their ELI5 follows automatically, because a
-  // fresh summary changes the hash the plain-English line is keyed on.
-  const rewriteStale = argv.includes('--rewrite-stale')
-  // --rewrite-since N (days) and --rewrite-important narrow WHICH stale rows
-  // re-queue, as a union: the last N days, plus rows of any age carrying a
-  // reader-facing signal (a version, a model, a command, a security fix, a
-  // breaking change, or a multi-area change). A full rewrite is ~23,000 calls
-  // over ~7,700 rows and republishes every page; this is ~1,700 rows, the part
-  // a reader actually lands on. Rows outside the scope keep the text they
-  // have, which is the point -- it is opt-in, not a downgrade.
-  const sinceAt = argv.indexOf('--rewrite-since')
-  const rewriteDays = sinceAt !== -1 ? Math.max(0, Number(argv[sinceAt + 1]) || 0) : 0
-  const rewriteImportant = argv.includes('--rewrite-important')
-  const scopeNote = rewriteStale
-    ? (rewriteDays || rewriteImportant
-        ? ` (scoped: ${rewriteDays ? `last ${rewriteDays}d` : 'no date window'}${rewriteDays && rewriteImportant ? ' + ' : ''}${rewriteImportant ? 'model/command/security/breaking/multi-area' : ''})`
-        : ' (all rows)')
-    : ''
-  const rewriteScope = rewriteScopeOf({ days: rewriteDays, important: rewriteImportant })
-  const env = { ...process.env, CHANGELOG_LLM_LIMIT: String(batch), CHANGELOG_ELI5_LIMIT: String(batch) }
-  const doc = await readJson(`${DATA}/changelog.json`, null)
-  if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
-  const entries = doc.entries
-  const diffDir = resolve(DATA, 'diffs')
-
-  // 1. Diffs: git work only, no API cost, and the LLM queue needs the patch.
-  await ensureRepo()
-  const stored = await backfillDiffs(entries, batch > 0 ? batch * 10 : Infinity)
-  refreshDiffFlags(entries, diffDir)
-
-  // 2. Summaries + plain-English lines, newest-first inside their own priorities.
-  const calls = llmConfigured(env) ? await enrichWithLlm(entries, llmPatchFor, DATA, env, { retryErrors: true, repoDir: REPO_DIR, rewriteStale, rewriteScope, getFullPatch: fullPatchFor }) : 0
-  const eli5 = llmConfigured(env) ? await enrichEli5(entries, DATA, env, { retryErrors: true, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR }) : 0
-  if (!llmConfigured(env)) log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env): stored diffs only')
-
-  // The same gate the pass uses, so "left" means left to do in this run's scope.
-  // It is imported rather than re-derived because a counter that disagrees with
-  // the queue reports either a rewrite that never stops or one that never ends.
-  const isCurrent = (e) => e.ai?.title && rewriteIsCurrent(e, {
-    rewriteStale: rewriteStale || env.CHANGELOG_LLM_FORCE_REWRITE === '1',
-    scope: rewriteScope
-  })
-  const left = {
-    diffs: entries.filter(e => !existsSync(resolve(diffDir, `${e.sha}.diff`))).length,
-    summaries: entries.filter(e => !e.noise && !isCurrent(e)).length,
-    stale: entries.filter(e => !e.noise && e.ai?.title && (e.ai?.v ?? 1) < PROMPT_V).length,
-    eli5: countPendingEli5(entries)
-  }
-
-  // 3. Publish, so a run of thousands of passes never loses work to a kill.
-  if (argv.includes('--push')) {
-    await commitAndPushData({ message: `data: coverage backfill (${utcStamp()} UTC)`, overrides: { [`${DATA}/changelog.json`]: doc } })
-  } else {
-    await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: doc }))
-  }
-
-  log(`[enrich-all] +${stored} diffs, +${calls} summaries, +${eli5} eli5 | left: ${left.diffs} diffs, ${left.summaries} summaries${scopeNote} (${left.stale} on an older prompt${rewriteStale ? '' : ', add --rewrite-stale to refresh'}), ${left.eli5} eli5`)
-  return left
-}
 
 /**
  * Repair stored rows: recompute commitNature, testOnly, significance (+reason)
@@ -1804,20 +1769,19 @@ async function cmdEval (argv) {
     log(`[eval] wrote ${res.count} golden rows to data/eval/golden.json (${res.kept} kept from the previous file); review the labels, then run eval`)
     return
   }
-  if (!llmConfigured()) throw new Error('eval needs CHANGELOG_LLM=1 and LLM_API_KEY')
-  await ensureRepo()
+  if (argv.includes('--judge') || argv.includes('--paid')) throw new Error('Paid historical evaluation is disabled by the no-backfill policy.')
   const lim = argv.indexOf('--limit')
   const report = await runEval(doc.entries, DATA, process.env, {
     repoDir: REPO_DIR,
     getPatch: llmPatchFor,
     getFullPatch: fullPatchFor,
     limit: lim !== -1 ? Number(argv[lim + 1]) || 0 : 0,
-    // The judge is the only independent quality axis the harness has (the
-    // grounding rate measures the pipeline's own checker), so it runs by
-    // default; --no-judge opts out for a cheap pass.
-    judge: !argv.includes('--no-judge')
+    // Stored-artifact audit only: no historical writer or judge expenditure.
+    judge: false,
+    offline: true
   })
   console.log(formatEvalReport(report))
+  if (!report.gate?.passed) throw new Error('Evaluation failed completion or factual-quality thresholds; the checkpoint contains all results.')
 }
 
 /**

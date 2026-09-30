@@ -197,6 +197,40 @@ test('a pushed PR gets its preview refetched, its stale diffstat dropped', async
   assert.match(await rf(join(dir, 'pr-diffs/1.diff'), 'utf8'), /\+new/, 'and the preview on disk is replaced')
 })
 
+test('a successful empty open set removes every cached PR', async t => {
+  const dir = await tmpData(t)
+  await writeFile(join(dir, 'open-prs.json'), JSON.stringify({ fetchedAt: '2020-01-01', total: 2, listComplete: true, prs: [{ number: 1 }, { number: 2 }] }))
+  const fetchImpl = async () => ({ ok: true, headers: { get: () => null }, json: async () => [] })
+  assert.deepEqual(await fetchOpenPrs({ fetchImpl, dataDir: dir, force: true }), [])
+  const doc = JSON.parse(await readFile(join(dir, 'open-prs.json'), 'utf8'))
+  assert.equal(doc.listComplete, true)
+  assert.equal(doc.total, 0)
+})
+
+test('failed revision refresh stays stale and retries on the next cycle', async t => {
+  const dir = await tmpData(t)
+  const { mkdir } = await import('node:fs/promises')
+  await mkdir(join(dir, 'pr-diffs'))
+  await writeFile(join(dir, 'pr-diffs/1.diff'), 'diff --git a/x b/x\n+old\n')
+  await writeFile(join(dir, 'open-prs.json'), JSON.stringify({ fetchedAt: '2020-01-01', total: 1, listComplete: true, prs: [{ number: 1, updated: '2020-01-01', hasDiff: true }] }))
+  let fail = true, diffCalls = 0
+  const fetchImpl = async (url, opts = {}) => {
+    if (new URL(url).pathname.endsWith('/pulls')) return { ok: true, headers: { get: () => null }, json: async () => [pr(1)] }
+    if (opts.headers.accept.includes('diff')) {
+      diffCalls++
+      return fail ? { ok: false, status: 500 } : { ok: true, text: async () => 'diff --git a/x b/x\n+new\n' }
+    }
+    return { ok: false, status: 500 }
+  }
+  const first = await fetchOpenPrs({ fetchImpl, dataDir: dir, force: true })
+  assert.equal(first[0].stalePreview, true)
+  fail = false
+  const second = await fetchOpenPrs({ fetchImpl, dataDir: dir, force: true })
+  assert.equal(second[0].stalePreview, undefined)
+  assert.equal(diffCalls, 2)
+  assert.match(await readFile(join(dir, 'pr-diffs/1.diff'), 'utf8'), /\+new/)
+})
+
 test('a later page failing keeps the pages already fetched', async (t) => {
   const dir = await tmpData(t)
   const { fetchImpl } = fakeGithub([100, 100], { failPage: 2 })
@@ -218,14 +252,15 @@ test('an immediate failure falls back to the cache', async (t) => {
 // Unauthenticated, GitHub allows 60 calls/hr and trips abuse detection long
 // before that, so the per-PR decoration runs on a budget and the list itself
 // (one call per page) is what must never be truncated.
-test('per-PR stats and diff previews are filled for every page', async (t) => {
+test('decoration resumes across cycles without truncating the open list', async (t) => {
   const dir = await tmpData(t)
   process.env.CHANGELOG_PR_CALLS = '500'
   t.after(() => { delete process.env.CHANGELOG_PR_CALLS })
   const { fetchImpl } = fakeGithub([100, 14], { stats: false })
-  const prs = await fetchOpenPrs({ fetchImpl, dataDir: dir })
+  let prs
+  for (let cycle = 0; cycle < 6; cycle++) prs = await fetchOpenPrs({ fetchImpl, dataDir: dir, force: true })
   assert.equal(prs.length, 114)
-  assert.ok(prs.every(p => p.additions === 7), 'the list endpoint omits stats, so each PR is asked for them')
+  assert.ok(prs.every(p => p.additions === 7), 'bounded cycles eventually fill every diffstat')
   assert.ok(prs.every(p => p.hasDiff), 'every PR, including the second page, got a preview')
   assert.match(await readFile(join(dir, 'pr-diffs/114.diff'), 'utf8'), /^diff --git.*\+line 114\s*$/s,
     'the newest-tail PR preview is on disk, not just the first 60')
@@ -244,17 +279,18 @@ test('the per-PR fan-out stays inside its budget and marks the list partial', as
   assert.equal(persisted.partial, true, 'a budgeted-out run is refreshed in minutes, not hours')
 })
 
-test('a token lifts the decoration budget to finish the list in one pass', async (t) => {
+test('authentication does not bypass the per-cycle decoration ceiling', async (t) => {
   const dir = await tmpData(t)
   process.env.GITHUB_TOKEN = 'ghp_test'
   t.after(() => { delete process.env.GITHUB_TOKEN })
   const { fetchImpl, calls } = fakeGithub([100, 14], { stats: false })
   const prs = await fetchOpenPrs({ fetchImpl, dataDir: dir })
   const perPr = calls.filter(c => /\/pulls\/\d+$/.test(new URL(c).pathname))
-  assert.equal(perPr.length, 228, '114 diffs + 114 stats, unthrottled: 5,000 calls/hr is the authenticated ceiling')
-  assert.ok(prs.every(p => p.hasDiff && p.additions === 7))
+  assert.equal(perPr.length, 40, 'a token cannot bypass the cycle budget')
+  assert.equal(prs.length, 114, 'the entire list still ships before decoration finishes')
   const persisted = JSON.parse(await readFile(join(dir, 'open-prs.json'), 'utf8'))
-  assert.ok(!persisted.partial, 'a finished list is not re-fetched for half an hour')
+  assert.equal(persisted.listComplete, true)
+  assert.equal(persisted.partial, true, 'unfinished decoration remains eligible for recovery')
 })
 
 test('a short page that still points at the next one is followed, not treated as the end', async (t) => {
@@ -269,7 +305,7 @@ test('a short page that still points at the next one is followed, not treated as
   assert.ok(calls.some(c => /[?&]page=2/.test(c)), 'the next link was followed even though page 1 was short')
   const persisted = JSON.parse(await readFile(join(dir, 'open-prs.json'), 'utf8'))
   assert.equal(persisted.total, 116)
-  assert.ok(!persisted.partial, 'and the run knows it finished')
+  assert.equal(persisted.listComplete, true, 'the list walk finished even though decoration is budgeted')
 })
 
 test('a truncated list never replaces a longer one, and the count cannot go backwards', async (t) => {

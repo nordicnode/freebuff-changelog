@@ -5,6 +5,7 @@
 // heaviest changes, in that order; the quality panel is the set of numbers the
 // prompt work is judged by (prompt-version coverage, unverified names,
 // marketing hits, audience split), so a regression shows up on the next deploy.
+import { qualityOf, qualityText } from './quality.mjs'
 import { escapeHtml as esc } from './util.mjs'
 import { PROMPT_V, ELI5_V, ELI5_HYPE_ROLLUP_RE, WHY_RE, AUDIENCES, isSecurityEntry } from './llm.mjs'
 
@@ -43,7 +44,7 @@ export function buildWeeklyDigests (entries, { topN = 12 } = {}) {
     w.entries.push(e)
     w.days.add(e.day)
     w.counts.changes++
-    const sig = e.ai?.significance || e.significance || 'minor'
+    const sig = e.significance || 'minor'
     if (w.counts[sig] != null) w.counts[sig]++
     if (e.version || e.freebuffVersion) w.releases.push(e)
     if (e.modelChanges) w.models.push(e)
@@ -55,7 +56,7 @@ export function buildWeeklyDigests (entries, { topN = 12 } = {}) {
     const bumpSet = new Set(w.releases.map(e => e.sha))
     w.top = w.entries
       .filter(e => !bumpSet.has(e.sha) && !e.modelChanges)
-      .sort((a, b) => (SIG_RANK[a.ai?.significance || a.significance] ?? 2) - (SIG_RANK[b.ai?.significance || b.significance] ?? 2) || (a.date < b.date ? 1 : -1))
+      .sort((a, b) => (SIG_RANK[a.significance] ?? 2) - (SIG_RANK[b.significance] ?? 2) || (a.date < b.date ? 1 : -1))
       .slice(0, topN)
     w.releases.sort((a, b) => (a.date < b.date ? -1 : 1))
     w.models.sort((a, b) => (a.date < b.date ? -1 : 1))
@@ -86,7 +87,7 @@ export function weeklyHeadline (w) {
 
 // Plain-text digest for feeds and Discord: sections with one line per entry.
 export function weeklyText (w, siteUrl = '') {
-  const line = (e) => `- ${(e.day || '').slice(5)} ${titleOf(e)}${siteUrl ? ` (${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)})` : ''}`
+  const line = (e) => `- ${(e.day || '').slice(5)} ${titleOf(e)}${qualityOf(e).uncertain ? ' [UNVERIFIED]' : ''}${siteUrl ? ` (${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)})` : ''}`
   const out = [weeklyHeadline(w) + '.']
   if (w.releases.length) out.push('', 'Releases:', ...w.releases.map(line))
   if (w.models.length) {
@@ -103,7 +104,7 @@ export function weeklyText (w, siteUrl = '') {
 export function weeklyFeedItem (siteUrl, w) {
   const url = `${siteUrl}/week/${w.key}/`
   const sections = []
-  const li = (e) => `<li><a href="${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}">${esc(e.day)}</a> ${esc(titleOf(e))}${e.eli5?.text ? `<br><small>${esc(e.eli5.text)}</small>` : ''}</li>`
+  const li = (e) => `<li><a href="${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}">${esc(e.day)}</a> ${esc(titleOf(e))}${e.eli5?.text ? `<br><small>${esc(e.eli5.text)}</small>` : ''}${qualityText(e) ? `<br><small>${esc(qualityText(e))}</small>` : ''}</li>`
   if (w.releases.length) sections.push(`<p><b>Releases</b></p><ul>${w.releases.map(li).join('')}</ul>`)
   if (w.models.length) sections.push(`<p><b>Model catalog</b></p><ul>${w.models.map(li).join('')}</ul>`)
   if (w.top.length) sections.push(`<p><b>Notable work</b></p><ul>${w.top.map(li).join('')}</ul>`)
@@ -144,7 +145,10 @@ export function summaryQuality (entries) {
     eli5Template: withEli5.filter(e => e.eli5.model === 'template').length,
     withEvidence: withAi.filter(e => e.ai.evidence).length,
     ungrounded: withAi.filter(e => e.ai.ungrounded?.length).length,
-    verified: withAi.filter(e => e.ai.verify === 'passed').length,
+    verified: withAi.filter(e => qualityOf(e).verify === 'passed').length,
+    policyCurrent: withAi.filter(e => e.ai.policy === 1).length,
+    plainVerified: withEli5.filter(e => ['passed', 'deterministic', 'human-edited'].includes(qualityOf(e).plainVerify)).length,
+    uncertain: rows.filter(e => qualityOf(e).uncertain).length,
     verifyFlagged: withAi.filter(e => e.ai.verify === 'flagged').length,
     verifyUnavailable: withAi.filter(e => e.ai.verify === 'unavailable').length,
     overridden: rows.filter(e => e.overridden).length,

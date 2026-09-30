@@ -20,7 +20,7 @@ name: deploy-site
 on:
   push:
     branches: [main, master]
-    paths: ['data/**', 'generator/**', 'scripts/**', 'wrangler.json', 'package.json']
+    paths: ['data/**', 'generator/**', 'scripts/**', 'wrangler.json', 'package.json', 'worker.js']
   # Note: a push made with the default GITHUB_TOKEN does not start workflow runs,
   # so this trigger only fires for data commits because changelog-sync.yml pushes
   # with CHANGELOG_GITHUB_TOKEN (see the auth step there). Do NOT also trigger
@@ -34,8 +34,7 @@ on:
 
 permissions:
   contents: read
-  # Only to read changelog-sync's state for the freshness gate below: a paused
-  # relay is a planned pause, not an outage.
+  # Read-only workflow diagnostics; disabling ingestion never exempts freshness.
   actions: read
 
 concurrency:
@@ -61,7 +60,7 @@ jobs:
           # git history. With ~15 MiB/day of history churn in this repo, a full
           # clone would make every one of the ~200 daily deploys slower than
           # the last; depth 1 pins checkout cost to the current tree only.
-          # (History size itself is bounded by history-compaction.yml.)
+          # History compaction is disabled; code history remains auditable.
           fetch-depth: 1
 
       - uses: actions/setup-node@v4
@@ -97,22 +96,37 @@ jobs:
       # every deploy of the frozen data was green, so the only witness was the
       # "[stale Nm]" badge readers see. Same threshold as that badge, asserted
       # here so CI fails first.
-      - name: Detect a planned relay pause
+      - name: Diagnose relay state
         id: relay
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # history-compaction.yml disables changelog-sync and drains it for up
-          # to ~24 minutes before force-pushing, so a stale `generatedAt` in that
-          # window is a deliberate pause, not a broken loop. Exempt exactly that
-          # case and nothing else: a *disabled* workflow is the one state no
-          # accidental stall can produce.
+          # A disabled relay is diagnostic only, never a freshness exemption.
           state="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/changelog-sync.yml" --jq .state 2>/dev/null || echo unknown)"
           echo "state=$state" >> "$GITHUB_OUTPUT"
           if [ "$state" = "disabled_manually" ]; then
-            echo "::warning::changelog-sync is disabled (planned pause: history compaction drains the relay): skipping the freshness gate this run"
+            echo "::warning::changelog-sync is disabled: freshness checks remain enforced; disabled does not mean healthy"
           fi
 
       - name: Freshness gate (fail if the deployed data is stale)
-        if: always() && steps.build.outcome == 'success' && steps.relay.outputs.state != 'disabled_manually'
+        if: always() && steps.build.outcome == 'success'
         run: node generator/cli.mjs freshness
+
+      - name: Verify uploaded head and upstream lag
+        if: steps.build.outcome == 'success' && env.CLOUDFLARE_API_TOKEN != ''
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          SITE_URL: ${{ vars.SITE_URL || 'https://freebuff-changelog.nordicnode.workers.dev' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export UPSTREAM_HEAD="$(gh api repos/CodebuffAI/freebuff/commits/main --jq .sha)"
+          node --input-type=module <<'NODE'
+          import { readFile } from 'node:fs/promises'
+          import { checkDeployedHead } from './generator/lib/sync.mjs'
+          const doc = JSON.parse(await readFile('data/changelog.json', 'utf8'))
+          await checkDeployedHead(process.env.SITE_URL, doc.headSha)
+          if (doc.headSha !== process.env.UPSTREAM_HEAD) {
+            console.log('::warning::Upstream advanced beyond the deployed head; waiting for the next ingestion/deploy cycle.')
+          }
+          console.log(`Uploaded head verified: ${doc.headSha}; upstream: ${process.env.UPSTREAM_HEAD}`)
+          NODE

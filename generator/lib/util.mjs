@@ -1,9 +1,14 @@
 // generator/lib/util.mjs - small shared helpers, zero dependencies.
 import { execFile } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { readFile, writeFile, mkdir, rename } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { readFile, writeFile, mkdir, rename, rm } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { promisify } from 'node:util'
+import { AsyncLocalStorage } from 'node:async_hooks'
+
+const cycleDeadline = new AsyncLocalStorage()
+export function deadlineAt () { return cycleDeadline.getStore() || Infinity }
+export function withDeadline (ms, work) { return cycleDeadline.run(Math.min(deadlineAt(), Date.now() + ms), work) }
 
 const execFileP = promisify(execFile)
 
@@ -27,14 +32,19 @@ export function shortHash (text) {
 // incoming ELI5 still matches the summary that survived the merge, and mergedata
 // must not import the module that imports it.
 export function eli5Source (e) {
-  return `${e.ai?.title || ''}\n${e.ai?.summary || ''}`
+  const text = `${e.ai?.title || ''}\n${e.ai?.summary || ''}`
+  if (!e.ai?.policy) return text // Historical keys are intentionally unchanged.
+  return text + '\n' + JSON.stringify(Object.fromEntries(['audience', 'userVisible', 'breaking', 'migration', 'newEnvVars', 'newFlags', 'unknowns', 'changes'].filter(k => e.ai[k] !== undefined).map(k => [k, e.ai[k]])))
 }
 
 export async function git (args, cwd, opts = {}) {
   try {
+    const remaining = deadlineAt() - Date.now()
+    if (remaining <= 0) throw new Error('Generator cycle deadline exceeded')
     const { stdout } = await execFileP('git', args, {
       cwd,
       maxBuffer: 64 * 1024 * 1024,
+      timeout: Math.max(1, Math.min(120000, remaining)),
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_LFS_SKIP_SMUDGE: '1' },
       ...opts
     })
@@ -62,14 +72,16 @@ export async function writeJson (path, value) {
 // (build, git add). A truncated read parses as nothing at all, so writes land
 // via a rename, which is atomic within a filesystem.
 async function writeAtomic (path, data) {
-  const tmp = `${path}.${process.pid}.tmp`
-  await writeFile(tmp, data)
-  await rename(tmp, path)
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    await writeFile(tmp, data)
+    await rename(tmp, path)
+  } finally { await rm(tmp, { force: true }) }
 }
 
 export async function writeText (path, text) {
   await mkdir(dirname(path), { recursive: true })
-  await writeFile(path, text)
+  await writeAtomic(path, text)
 }
 
 export async function writeBinary (path, buf) {
@@ -153,7 +165,7 @@ export async function pool (tasks, n = 8) {
  * have fixed it -- a deadlock that repaired itself never, and logged nothing.
  */
 export async function withLock (lockDir, fn, { retries = 2 } = {}) {
-  const { mkdir, rm, readFile, writeFile } = await import('node:fs/promises')
+  const { mkdir, rm, readFile, writeFile, stat } = await import('node:fs/promises')
   const { dirname } = await import('node:path')
   await mkdir(dirname(lockDir), { recursive: true })
   let acquired = false
@@ -173,6 +185,12 @@ export async function withLock (lockDir, fn, { retries = 2 } = {}) {
       if (heldHere.has(lockDir) || (pid && isPidAlive(pid) && pid !== process.pid)) {
         log(`lock ${lockDir} held by ${heldHere.has(lockDir) ? 'this run' : `live pid ${pid}`}: skipping`)
         break
+      }
+      // mkdir and owner-file creation are not atomic together. Never evict
+      // a peer in that small window (or a fresh orphan whose age is unknown).
+      if (!pid) {
+        const age = Date.now() - (await stat(lockDir).catch(() => ({ mtimeMs: Date.now() }))).mtimeMs
+        if (age < 30000) return { acquired: false }
       }
       log(pid
         ? `taking over lock ${lockDir}: owner pid ${pid} is gone`

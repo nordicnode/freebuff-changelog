@@ -41,6 +41,7 @@ import {
   PROMPT_V, RELEASE_ROLLUP_V, formatGlossary, loadGlossary, structuredFactsCited, verifyModelOf
 } from './llm.mjs'
 import { hasStructuredFacts, formatStructuredFacts } from './analyze.mjs'
+import { qualityOf } from './quality.mjs'
 
 export { WHY_RE }
 
@@ -228,11 +229,21 @@ export function aggregate (rows) {
   }
 }
 
-export async function runEval (entries, dataDir, env, { repoDir = null, getPatch, getFullPatch = null, limit = 0, judge = true, concurrency = 3 } = {}) {
+export async function runEval (entries, dataDir, env, { repoDir = null, getPatch, getFullPatch = null, limit = 0, judge = false, concurrency = 3, offline = true } = {}) {
   const golden = await readJson(`${dataDir}/eval/golden.json`, null)
   if (!golden?.rows?.length) throw new Error('data/eval/golden.json missing or empty: run `eval --seed 40` first')
   const bySha = new Map(entries.map(e => [e.sha, e]))
-  const targets = golden.rows.map(r => ({ golden: r, entry: bySha.get(r.sha) })).filter(t => t.entry).slice(0, limit > 0 ? limit : undefined)
+  const targets = golden.rows.slice(0, limit > 0 ? limit : undefined).map(r => ({ golden: r, entry: bySha.get(r.sha) }))
+  const at = new Date().toISOString()
+  const dir = `${dataDir}/eval/results`
+  await mkdir(dir, { recursive: true })
+  const checkpointPath = `${dir}/${String(PROMPT_V).padStart(3, '0')}-${at.replace(/[:.]/g, '-')}.json`
+  let checkpointWrite = Promise.resolve()
+  const checkpoint = () => {
+    const snapshot = { at, promptV: PROMPT_V, mode: offline ? 'offline-stored' : 'provider', status: 'partial', golden: { total: golden.rows.length, expected: targets.length, evaluated: rows.filter(r => !r.failed && !r.skipped).length, failed: rows.filter(r => r.failed).length, skipped: rows.filter(r => r.skipped).length }, rows: [...rows], outputs: { ...outputs } }
+    checkpointWrite = checkpointWrite.then(() => writeJson(checkpointPath, snapshot))
+    return checkpointWrite
+  }
   const prIndex = await loadPrIndex(dataDir)
   const byDay = groupEntriesByDay(entries)
   const posIndex = new Map(entries.map((x, i) => [x.sha, i]))
@@ -242,47 +253,56 @@ export async function runEval (entries, dataDir, env, { repoDir = null, getPatch
   const outputs = {}
   await pool(targets.map(({ golden: g, entry: e }) => async () => {
     try {
+      if (!e) { rows.push({ sha: g.sha, skipped: true, reason: 'missing entry' }); return }
+      if (offline) {
+        if (!e.ai?.title) { rows.push({ sha: e.sha, skipped: true, reason: 'no stored summary' }); return }
+        rows.push({ ...scoreRow(e, e.ai, g), verify: qualityOf(e).verify, plainVerify: qualityOf(e).plainVerify, uncertain: qualityOf(e).uncertain, valueErrors: e.ai.valueErrors || [] })
+        outputs[e.sha] = { ...e.ai, plainEnglish: e.eli5 || null }
+        return
+      }
       const patch = await getPatch(e)
-      if (!patch) { log(`[eval] ${e.sha.slice(0, 8)}: no patch, skipped`); return }
+      if (!patch) { rows.push({ sha: e.sha, skipped: true, reason: 'missing patch' }); return }
       const fullPatch = getFullPatch ? await getFullPatch(e).catch(() => '') : ''
       const hit = bumpOnly(e) ? getReleaseContextFor(entries, e, posIndex, ctxCache) : null
       const relText = hit?.text || ''
       const context = await gatherEntryContext(e, patch, { repoDir, entries, fullPatch })
       const probe = { ...e, structured: context.structured }
-      const { record } = await summarizeEntry({ entry: probe, patch, relText, sequence: sequenceForEntry(byDay, e, 25), prMeta: findPrMeta(e, prIndex), glossary, context, env })
+      const { record, evidence } = await summarizeEntry({ entry: probe, patch, relText, sequence: sequenceForEntry(byDay, e, 25), prMeta: findPrMeta(e, prIndex), glossary, context, env })
       const score = scoreRow(probe, record, g)
       if (judge) {
         try {
           // Cross-model, same ladder as the verifier: a judge that shares the
           // writer's model grades its own blind spots.
-          score.judge = await callLlm(buildJudgePrompt(e, patch, record, g), { ...env, LLM_MODEL: env.LLM_JUDGE_MODEL || verifyModelOf(env) }, 1, validateJudgeOut)
+          score.judge = await callLlm(buildJudgePrompt(probe, evidence || patch, record, g), { ...env, LLM_MODEL: env.LLM_JUDGE_MODEL || verifyModelOf(env) }, 1, validateJudgeOut)
         } catch (err) { log(`[eval] judge failed for ${e.sha.slice(0, 8)}: ${err.message}`) }
       }
       rows.push(score)
       outputs[e.sha] = record
       log(`[eval] ${e.sha.slice(0, 8)} grounded=${score.grounded} why=${score.why} hypeFree=${score.hypeFree}${score.judge ? ` judge=${score.judge.faithfulness}/${score.judge.completeness}/${score.judge.clarity}` : ''}`)
     } catch (err) {
-      log(`[eval] ${e.sha.slice(0, 8)} failed: ${err.message}`)
-      rows.push({ sha: e.sha, failed: true, error: String(err.message).slice(0, 200) })
-    }
+      log(`[eval] ${g.sha.slice(0, 8)} failed: ${err.message}`)
+      rows.push({ sha: g.sha, failed: true, error: String(err.message).slice(0, 200) })
+    } finally { await checkpoint() }
   }), concurrency)
-  const scored = rows.filter(r => !r.failed)
+  const scored = rows.filter(r => !r.failed && !r.skipped)
   const report = {
     promptV: PROMPT_V,
     rollupV: RELEASE_ROLLUP_V,
     model: env.LLM_MODEL || '',
     modelMajor: env.LLM_MODEL_MAJOR || '',
-    at: new Date().toISOString(),
-    golden: { total: golden.rows.length, verified: golden.rows.filter(r => r.verified).length, evaluated: scored.length, failed: rows.length - scored.length },
+    at,
+    mode: offline ? 'offline-stored' : 'provider',
+    status: 'complete',
+    golden: { total: golden.rows.length, expected: targets.length, verified: golden.rows.filter(r => r.verified).length, evaluated: scored.length, failed: rows.filter(r => r.failed).length, skipped: rows.filter(r => r.skipped).length },
+    gate: { passed: scored.length === targets.length && scored.length > 0 && scored.every(r => r.grounded && r.hypeFree && r.pathGrounded !== false && !r.valueErrors?.length && (offline ? !r.uncertain && r.verify === 'passed' && ['passed', 'deterministic'].includes(r.plainVerify) : true)), note: offline ? 'Stored-artifact audit, not a new semantic check or prompt comparison.' : 'Provider replay' },
     metrics: aggregate(scored),
     rows,
     outputs
   }
-  const dir = `${dataDir}/eval/results`
-  await mkdir(dir, { recursive: true })
+  await checkpointWrite
   const previous = await latestResult(dir)
   // Zero-padded so `010-…` sorts after `009-…` once the prompt reaches v10.
-  await writeJson(`${dir}/${String(PROMPT_V).padStart(3, '0')}-${report.at.replace(/[:.]/g, '-')}.json`, report)
+  await writeJson(checkpointPath, report)
   report.previous = previous ? { promptV: previous.promptV, at: previous.at, model: previous.model, metrics: previous.metrics } : null
   return report
 }
@@ -293,7 +313,7 @@ export async function latestResult (dir) {
   if (!files.length) return null
   // Newest by the run's own timestamp, not by filename, so older unpadded
   // names and newer padded ones compare correctly.
-  const docs = (await Promise.all(files.map(f => readJson(`${dir}/${f}`, null)))).filter(Boolean)
+  const docs = (await Promise.all(files.map(f => readJson(`${dir}/${f}`, null)))).filter(d => d?.metrics && d.status !== 'partial')
   docs.sort((a, b) => String(a.at || '') < String(b.at || '') ? 1 : -1)
   const newest = docs[0] || null
   // The stored file never carries its own `previous` (it is assigned after
@@ -341,7 +361,7 @@ export function formatEvalReport (r) {
     out.push(line('judge faithfulness', m.judge.faithfulness, p?.judge?.faithfulness, num, c.judge), line('judge completeness', m.judge.completeness, p?.judge?.completeness, num, c.judge), line('judge clarity', m.judge.clarity, p?.judge?.clarity, num, c.judge))
   }
   out.push(`  * golden labels; ${m.verifiedN} of ${r.metrics.n} rows human-verified (v), the rest scored against seeded labels for regression`)
-  const bad = r.rows.filter(x => !x.failed && (!x.grounded || !x.hypeFree || x.pathGrounded === false)).slice(0, 10)
+  const bad = r.rows.filter(x => !x.failed && !x.skipped && (!x.grounded || !x.hypeFree || x.pathGrounded === false)).slice(0, 10)
   if (bad.length) {
     out.push('  rows to look at:')
     for (const x of bad) out.push(`    ${x.sha.slice(0, 8)}${x.ungrounded?.length ? ` ungrounded: ${x.ungrounded.slice(0, 3).join(', ')}` : ''}${!x.pathGrounded ? ' evidence names an unlisted path' : ''}${!x.hypeFree ? ' hype' : ''}`)

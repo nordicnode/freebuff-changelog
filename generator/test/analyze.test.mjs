@@ -356,6 +356,24 @@ test('diff extraction: root commit, lockfile fallback, bounded output', async (t
   assert.match(capped, /diff truncated: view full diff on GitHub/, 'and it says so')
 })
 
+test('oversized extraction inventories tail source beyond 600k before budgeting', async t => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { execFileSync } = await import('node:child_process')
+  const dir = await mkdtemp(join(tmpdir(), 'fb-tail-diff-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const g = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  g('init', '-q', '-b', 'main'); g('config', 'user.email', 'test@example.invalid'); g('config', 'user.name', 'Test')
+  await writeFile(join(dir, 'a.snap'), Array.from({ length: 40000 }, () => 'snapshot padding padding padding').join('\n'))
+  await writeFile(join(dir, 'z.ts'), 'export const TAIL_SECURITY_GATE = true\n')
+  g('add', '.'); g('commit', '-qm', 'tail source')
+  const diff = await extractCleanDiff(dir, EMPTY_TREE, 'HEAD', 8000)
+  assert.match(diff, /TAIL_SECURITY_GATE/, 'a later source file survives the oversized earlier snapshot')
+  assert.match(diff, /source inventory: .*2 files/)
+  assert.ok(Buffer.byteLength(diff) <= 8000)
+})
+
 // Every comparison downstream is a string compare or a slice(0,10), and both
 // ignore a UTC offset: a commit at 17:25-08:00 is 01:25Z the next day, and it was
 // being filed under the author's local calendar day. listCommits normalizes at the

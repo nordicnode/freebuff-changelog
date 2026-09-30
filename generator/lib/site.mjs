@@ -3,6 +3,7 @@
 // authentic CLI/git-log presentation, dark theme, zero emojis, calm palette).
 import { writeText, writeBinary } from './util.mjs'
 import { escapeHtml as esc, fmtDateHuman, pool, shortHash } from './util.mjs'
+import { qualityOf, qualityText } from './quality.mjs'
 import { CSS } from './style.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg, feedsOpml } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
@@ -951,6 +952,8 @@ function renderDiff(container, text, label, ghUrl, mode) {
 
 function badges (e) {
   const b = []
+  const quality = qualityOf(e)
+  if (quality.uncertain) b.push(`<span class="badge lowc" title="${esc(quality.warnings.join(' '))}">[UNVERIFIED]</span>`)
   // The tooltip says what the rule saw (or that the model overrode it), so a
   // weight is a claim a reader can check rather than a colour.
   const why = e.ai?.significance && e.ai.significance !== e.significance
@@ -966,7 +969,7 @@ function badges (e) {
   else if (e.significance === 'notable') b.push(`<a class="badge not" href="/changes/notable/"${stop}${tip}>[NOTABLE]</a>`)
   if (e.modelChanges) b.push(`<a class="badge model" href="/models/"${stop}>[MODEL]</a>`)
   if (isSecurityEntry(e)) b.push('<span class="badge sec" title="Security-relevant: trust gates, credentials, checksums, permissions or sandboxing">[SECURITY]</span>')
-  if (e.ai?.breaking) b.push('<span class="badge brk" title="The technical pass marked this as changing existing behavior, config, an API or a command">[BREAKING]</span>')
+  if (e.ai?.breaking && ['passed', 'human-edited'].includes(quality.verify)) b.push('<span class="badge brk" title="The technical pass marked this as changing existing behavior, config, an API or a command">[BREAKING]</span>')
   if (e.ai?.confidence === 'low') b.push('<span class="badge lowc" title="The model rated its own confidence low: the diff is truncated, the consumer of a change is not visible, or the motive is guessed">[LOW CONFIDENCE]</span>')
   if (e.ai?.audience && AUDIENCE_DESC[e.ai.audience]) b.push(`<a class="badge aud" href="/subscribe/#aud-${esc(e.ai.audience)}"${stop} title="Who this change is for: ${esc(AUDIENCE_DESC[e.ai.audience])} · subscribe to this audience">[${esc(e.ai.audience.toUpperCase())}]</a>`)
   if (e.overridden) b.push('<span class="badge human" title="This entry was corrected by a human editor (data/overrides.json)">[EDITED]</span>')
@@ -1209,6 +1212,7 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
 ${modelDiffLine(e)}
 ${e.eli5?.text ? `<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH</span>${esc(e.eli5.text)}</p>` : ''}
 ${leadHtml}
+${qualityOf(e).uncertain ? `<aside class="evidence-flag" role="note"><strong>Unverified claims</strong><ul>${qualityOf(e).warnings.map(w => `<li>${esc(w)}</li>`).join('')}</ul></aside>` : ''}
 ${powerStart}
 ${e.eli5?.text ? summaryHtml : ''}
 ${migrationHtml(e)}
@@ -1274,7 +1278,8 @@ function changesHtml (e) {
 function migrationHtml (e) {
   const a = e.ai || {}
   if (!a.migration) return ''
-  return `<p class="migration"><span class="migration-lbl">ACTION</span>${esc(a.migration)}</p>`
+  const trusted = ['passed', 'human-edited'].includes(qualityOf(e).verify)
+  return `<p class="migration"><span class="migration-lbl">${trusted ? 'ACTION' : 'UNVERIFIED ACTION, DO NOT RELY ON THIS'}</span>${esc(a.migration)}</p>`
 }
 
 // What the diff does not show (unshown callers, backend implementations, blind spots).
@@ -1351,8 +1356,9 @@ function evidenceHtml (e) {
   // Bare integers (a computed count or sum) are recorded as ungrounded too, but
   // they read as noise in a "names" badge; the /stats/ metric still counts them.
   // Dotted version strings are kept -- a wrong version is a real, checkable claim.
-  const badNames = bad.filter(x => !/^\d+$/.test(String(x)))
-  if (!ev && !badNames.length) return ''
+  const badNames = bad
+  const quality = qualityOf(e)
+  if (!ev && !badNames.length && !quality.uncertain) return ''
   const flag = badNames.length
     ? `<p class="evidence-flag">Not found in the diff or source context: ${badNames.map(x => `<code>${esc(x)}</code>`).join(', ')}. Treat these names as unverified.</p>`
     : ''
@@ -1361,7 +1367,7 @@ function evidenceHtml (e) {
     : e.ai?.verify === 'unavailable'
       ? '<p class="evidence-flag">The verifier check could not run for this row, so its claims are unverified.</p>'
       : ''
-  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${badNames.length ? ` <span class="evidence-warn">(${badNames.length} unverified name${badNames.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}</div></details>`
+  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${badNames.length ? ` <span class="evidence-warn">(${badNames.length} unverified name${badNames.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}${quality.warnings.map(w => `<p class="evidence-flag">${esc(w)}</p>`).join('')}</div></details>`
 }
 
 // Implementation notes and comments extracted directly from the commit diff.
@@ -1385,8 +1391,11 @@ function factsHtml (e) {
 // next deploy rather than in a spot check.
 function qualityCard (q, card, bar, share) {
   const rows = [
-    ['on current prompt', q.onCurrentPrompt, q.summarized, `v${PROMPT_V}`],
-    ['on an older prompt', q.stalePrompt, q.summarized, 'enrich-all --rewrite-stale'],
+    ['on current prompt', q.onCurrentPrompt, q.summarized, `v${PROMPT_V}, not a factual-accuracy guarantee`],
+    ['current validation policy', q.policyCurrent, q.summarized, 'forward-only; history retained'],
+    ['plain-English fact-checked', q.plainVerified, q.explained, 'includes deterministic templates'],
+    ['rows with unresolved warnings', q.uncertain, q.changes, 'distinct rows, not claim counts'],
+    ['on an older prompt', q.stalePrompt, q.summarized, 'legacy text retained; no paid backfill'],
     ['with evidence cited', q.withEvidence, q.summarized, ''],
     ['unverified identifiers', q.ungrounded, q.summarized, 'names not found in the diff'],
     ['verifier check passed', q.verified, q.summarized, q.verifyFlagged ? `${q.verifyFlagged} flagged` : ''],
@@ -1424,7 +1433,7 @@ function qualityCard (q, card, bar, share) {
 function evalCard (r, card, bar) {
   if (!r || !r.metrics) {
     return card('GOLDEN-SET EVAL', 'no run yet',
-      '<p class="list-note">The golden-set harness re-summarizes a fixed set of real rows on the current prompt and scores grounding, cause visibility, hype and agreement with the human-verified labels (data/eval/golden.json). The weekly workflow writes results to data/eval/results/; this card fills in on the next deploy.</p>',
+      '<p class="list-note">The golden-set harness audits stored artifacts offline without provider calls and scores grounding, cause visibility, hype and agreement with the human-verified labels (data/eval/golden.json). The weekly workflow writes results to data/eval/results/; this card fills in on the next deploy.</p>',
       'stat-span eval-card')
   }
   const m = r.metrics
@@ -1470,7 +1479,7 @@ function evalCard (r, card, bar) {
   ].filter(Boolean).join('')
   const judgeNote = m.judge?.faithfulness != null ? ' &middot; judge 1-5' : ''
   return card('GOLDEN-SET EVAL',
-    `${r.golden.evaluated}/${r.golden.total} rows &middot; ${r.golden.verified} human-verified &middot; prompt v${r.promptV} &middot; ${esc(r.model || 'model unset')}${r.modelMajor ? ` (+${esc(r.modelMajor)})` : ''} &middot; ${esc(String(r.at || '').slice(0, 10))}${judgeNote}`,
+    `${r.mode === 'offline-stored' ? 'Offline stored-artifact audit (not a fresh semantic check) &middot; ' : ''}${r.golden.evaluated}/${r.golden.total} rows &middot; ${r.golden.verified} human-verified &middot; prompt v${r.promptV} &middot; ${esc(r.model || 'model unset')}${r.modelMajor ? ` (+${esc(r.modelMajor)})` : ''} &middot; ${esc(String(r.at || '').slice(0, 10))}${judgeNote}`,
     rows || '<p class="list-note">This run scored no rows.</p>',
     'stat-span eval-card')
 }
@@ -1596,6 +1605,8 @@ export function discordText (e, opts = {}) {
   const plain = String(e.eli5?.text || e.ai?.summary || e.summary || '').replace(/\s+/g, ' ').trim()
 
   const parts = [`### ${dcEsc(title)}\n${dateStr}`]
+  const warning = qualityText(e)
+  if (warning) parts.push(dcEsc(clipText(warning, 900)))
   if (opts.storyNotes?.length) {
     parts.push(`> **Related access context**\n> ${opts.storyNotes.map(n => dcEsc(clipText(n.text, 600))).join('\n> ')}`)
   }
@@ -1741,7 +1752,7 @@ export function generateReleaseNotesMarkdown (rel, commits = []) {
     const title = e.ai?.title || e.title || deriveTitleSafe(e)
     const commitUrl = `https://github.com/CodebuffAI/freebuff/commit/${e.sha}`
     const commitLink = `[\`${e.sha.slice(0, 7)}\`](${commitUrl})`
-    const bullet = `- **${title}** ${commitLink}`
+    const bullet = `- **${title}** ${commitLink}${qualityText(e) ? `\n  ${qualityText(e)}` : ''}`
 
     if (e.significance === 'major' || e.category === 'Feature') {
       features.push(bullet)
@@ -1845,9 +1856,10 @@ export function entryRecord (e, shipped = null) {
     category: e.category,
     kind: e.kind || 'sync',
     noise: !!e.noise,
-    ...(e.ai?.breaking ? { breaking: true } : {}),
-    ...(e.ai?.migration ? { migration: e.ai.migration } : {}),
-    ...(e.ai?.confidence ? { confidence: e.ai.confidence } : {}),
+    ...(e.ai?.breaking && ['passed', 'human-edited'].includes(qualityOf(e).verify) ? { breaking: true } : {}),
+    ...(e.ai?.migration ? { migration: e.ai.migration, migrationVerified: ['passed', 'human-edited'].includes(qualityOf(e).verify) } : {}),
+    ...(e.ai?.confidence ? { confidence: qualityOf(e).confidence } : {}),
+    quality: qualityOf(e),
     ...(e.ai?.unknowns ? { unknowns: e.ai.unknowns } : {}),
     ...(e.ai?.changes?.length ? { changes: e.ai.changes } : {}),
     ...(e.ai?.ungrounded?.length ? { unverifiedNames: e.ai.ungrounded } : {}),
@@ -3960,11 +3972,13 @@ const loadIndex = async () => {
 
       <h4>HOW IT WORKS: ANALYSIS PIPELINE</h4>
       <p>Mechanical facts are extracted without a model. Model tables and slash-command registries are set-differenced straight from the git trees, version bumps come from <code>package.json</code>, and timestamps are normalized to UTC, so those facts are computed, not paraphrased. Code changes are then mapped onto the monorepo layout (<code>cli/</code>, <code>packages/agent-runtime/</code>, <code>common/</code>, <code>sdk/</code>, <code>docs/</code>) to name the changed layer.</p>
-      <p>The summaries are model output, and the goal is to make them traceable, not to claim they are perfect. What the model gets is bounded and checkable: the clean source diff with lockfiles and pure test hunks stripped (over ~150 KB it is split into per-file drafts and fused), the computed facts above, the developers' own code comments, and, when a PR can be matched by touched files and passes a relevance check, its description and review discussion. Rows whose only changes are tests, mocks, or docs are detected mechanically and given a fixed plain-English line with no API call.</p>
-      <p>Every identifier a summary uses (backticked names, bare <code>CONSTANT_CASE</code> settings, camelCase and PascalCase names, versions, <code>--flags</code>, and numbers) is checked against the diff and source corpus as a whole word, so a truncated prefix of a real name fails too. A name that cannot be found gets one repair pass and, if still missing, is recorded as ungrounded and shown as unverified; such a row also cannot rate confidence high. Value direction is checked without a model at all: a constant that moved from A to B but is written as B to A is caught deterministically. Major, notable and multi-topic rows, plus any row with an ungrounded name, then get a verifier fact-check that answers claim by claim with quotes and reasons. Names that appear only in a sibling commit's title from the same day must be explicitly attributed; one commit may not borrow another's work. Unsupported claims trigger one rewrite, a row that still fails is stored with a visible <code>flagged</code> label rather than hidden, breaking or migration claims get one independent second read and are demoted to unknowns when it does not confirm them, and a row still shipping ungrounded names, backwards values or flagged claims gets one rewrite on the stronger model, kept only when it is strictly cleaner. Each summary cites the diff it came from, summaries are cached by commit SHA, diff content and prompt version, and every card links to the commit, compare view and inline diff.</p>
+      <p>The summaries are model output, and the goal is to make them traceable, not to claim they are perfect. What the model gets is bounded and checkable: the clean source diff with lockfiles and pure test hunks stripped (beyond the reserved 270k-token prompt budget it is split into file/hunk drafts and fused; partial evidence is disclosed), the computed facts above, the developers' own code comments, and, when a PR can be matched by touched files and passes a relevance check, its description and review discussion. Rows whose only changes are tests, mocks, or docs are detected mechanically and given a fixed plain-English line with no API call.</p>
+      <p>Every identifier a summary uses (backticked names, bare <code>CONSTANT_CASE</code> settings, camelCase and PascalCase names, versions, <code>--flags</code>, and numbers) is checked against the diff and source corpus as a whole word, so a truncated prefix of a real name fails too. A name that cannot be found gets one repair pass and, if still missing, is recorded as ungrounded and shown as unverified; such a row also cannot rate confidence high. Value direction is checked without a model at all: a constant that moved from A to B but is written as B to A is caught deterministically. Newly admitted entries and their plain-English text get a verifier fact-check that answers claim by claim with quotes and reasons. Names that appear only in a sibling commit's title from the same day must be explicitly attributed; one commit may not borrow another's work. Unsupported claims trigger one rewrite, a row that still fails is stored with a visible <code>flagged</code> label rather than hidden, breaking or migration claims get one independent second read and are demoted to unknowns when it does not confirm them, and a row still shipping ungrounded names, backwards values or flagged claims gets one rewrite on the stronger model, kept only when it is strictly cleaner. Each summary cites the diff it came from, new summaries are cached by commit SHA, diff content, delivered context, model and policy identity, and every card links to the commit, compare view and inline diff.</p>
+
+      <p><strong>Quality coverage is not text coverage.</strong> Older summaries are retained without paid backfill and may have no current fact-check. New verification is bound to the exact text; unavailable reviewers do not clear objections. Unverified warnings sit beside the lead and travel with exports. The existing models and fixed 270,000-token context contract are unchanged. A same-family model check is not a human audit. Unknown motives remain unknown rather than being invented.</p>
 
       <h4>USER-FACING HIGHLIGHTS</h4>
-      <p>Every entry opens with its ELI5 plain-English takeaway, fixed in shape: what changed, who it affects, what you notice day to day, no jargon. The technical explanation, holding the full summary, sits collapsed beneath it, then chips of the structured facts computed from the diff (constant old to new values, new env vars, flags, exports, new test titles), an Evidence section citing the diff lines behind the summary's names, and a collapsed note for what the diff cannot show. Version bumps roll up everything that shipped in their release window instead of reporting a bare label change; a row whose own summary carries unverified names is left out of the window entirely, and review-flagged items are marked and hedged rather than stated as fact. The <code>/week/</code> pages digest each week into releases, catalog moves, and the heaviest work; cards name the first release that shipped each commit; same-day, same-topic commits are clustered into development narratives.</p>
+      <p>Every entry opens with its ELI5 plain-English takeaway, fixed in shape: what changed, who it affects, what you notice day to day, no jargon. The technical explanation, holding the full summary, sits collapsed beneath it, then chips of the structured facts computed from the diff (constant old to new values, new env vars, flags, exports, new test titles), an Evidence section citing the diff lines behind the summary's names, and a collapsed note for what the diff cannot show. Version bumps roll up everything that shipped in their release window instead of reporting a bare label change; a row whose own summary carries unverified names is left out of the window entirely, and unchecked, review-flagged and value-error prose is omitted rather than reused as fact. The <code>/week/</code> pages digest each week into releases, catalog moves, and the heaviest work; cards name the first release that shipped each commit; same-day, same-topic commits are clustered into development narratives.</p>
       <p>Every card carries an audience chip (clicking it opens that audience's feed subscription), a <code>link</code> button that copies a stable <code>/c/&lt;sha&gt;</code> permalink, and Related links picked by time proximity so an old row never points at the far future. Model pages say where each model first shipped and group its versions into lineage. The site follows your OS light-or-dark preference and remembers a manual choice.</p>
 
       <h4>SEARCH</h4>
@@ -4192,7 +4206,7 @@ const loadIndex = async () => {
     <a href="${esc(p.url)}" target="_blank" rel="noopener">#${p.number}</a>
   </div>
   <h3 class="pr-title"><a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title)}</a></h3>
-  ${p.ai?.summary ? `<div class="pr-preview-ai"><span class="eli5-label">WHAT IT PROPOSES</span>${esc(p.ai.summary)}${p.ai.audience && AUDIENCE_DESC[p.ai.audience] ? ` <span class="badge aud" title="${esc(AUDIENCE_DESC[p.ai.audience])}">[${esc(p.ai.audience.toUpperCase())}]</span>` : ''}<span class="pr-preview-note">AI preview from the description and diff; not shipped yet.${p.ai.stale ? ' Written for an earlier revision of this PR.' : ''}</span></div>` : ''}
+  ${p.ai?.summary ? `<div class="pr-preview-ai"><span class="eli5-label">WHAT IT PROPOSES</span>${esc(p.ai.summary)}${p.ai.audience && AUDIENCE_DESC[p.ai.audience] ? ` <span class="badge aud" title="${esc(AUDIENCE_DESC[p.ai.audience])}">[${esc(p.ai.audience.toUpperCase())}]</span>` : ''}<span class="pr-preview-note">AI preview from the description and diff; not shipped yet.${p.ai.stale || p.stalePreview ? ' Written for an earlier revision of this PR.' : ''}${qualityOf({ ai: p.ai }).uncertain ? ` ${esc(qualityText({ ai: p.ai }))}` : ''}</span></div>` : ''}
   <div class="pr-meta">
     <span>#${p.number} by ${esc(p.author || 'contributor')}</span>
     <span>&middot;</span>

@@ -1,152 +1,15 @@
-name: changelog-rewrite
+name: historical-rewrite-disabled
 
-# Replaces the text of rows summarized under an older prompt, so they get the
-# wider context window the current prompt uses.
-#
-# Deliberately its own chain rather than part of changelog-sync. That pipeline
-# carries a hard 10-minute site-freshness guarantee, and a ~1,500-row rewrite
-# would spend its budget on history at the cost of today's commits. This has
-# its own concurrency group, so it can never delay or cancel a relay cycle, and
-# it stops by itself once the scope is empty -- nothing has to remember to turn
-# it off, and the last pass publishes no data and dispatches nothing.
-#
-# The scope itself (--rewrite-since / --rewrite-important) is why this is safe
-# to run unattended: rows outside it keep the text they have. A full rewrite is
-# ~23,000 calls over 7,720 rows; this is ~4,500 over ~1,500.
-#
-# Manual only. It never runs on push, so merging a change cannot start a
-# backfill by surprise.
 on:
-  workflow_dispatch:
-    inputs:
-      days:
-        description: 'Also rewrite rows from the last N days (0 = date window off)'
-        default: '90'
-        required: false
-      batch:
-        description: 'Rows per pass'
-        default: '40'
-        required: false
+  workflow_dispatch: {}
 
 permissions:
-  contents: write
-  actions: write
-
-concurrency:
-  group: changelog-rewrite
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  rewrite:
+  policy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      # Cheap, and it is the same gate the relay applies. A syntax error here
-      # would otherwise show up as a mysterious zero-row pass.
-      - name: Syntax check
-        run: for f in generator/cli.mjs generator/lib/*.mjs; do node --check "$f"; done
-
-      - name: Cache freebuff repository
-        uses: actions/cache@v4
-        with:
-          path: .cache/freebuff
-          key: freebuff-git-${{ runner.os }}-v1
-          restore-keys: |
-            freebuff-git-
-
-      - name: Configure git bot identity
-        run: |
-          git config --global user.name "changelog-bot"
-          git config --global user.email "changelog-bot@users.noreply.github.com"
-
-      # Same as the relay: a push made with the default GITHUB_TOKEN cannot
-      # start a deploy.yml run, so without this the rewritten rows would sit
-      # unpublished until deploy.yml's own 30-minute schedule.
-      - name: Authenticate data pushes so they trigger deploy.yml
-        env:
-          PUSH_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN }}
-        run: |
-          if [ -z "$PUSH_TOKEN" ]; then
-            echo "::warning::CHANGELOG_GITHUB_TOKEN is not set: data pushes keep using the default GITHUB_TOKEN, which cannot trigger deploy.yml. The rows are still written; the site refreshes on deploy.yml's schedule."
-            exit 0
-          fi
-          can_push="$(GH_TOKEN="$PUSH_TOKEN" gh api "repos/${GITHUB_REPOSITORY}" --jq '.permissions.push' 2>/dev/null || echo false)"
-          if [ "$can_push" != "true" ]; then
-            echo "::warning::CHANGELOG_GITHUB_TOKEN cannot push to ${GITHUB_REPOSITORY}: keeping the checkout credentials."
-            exit 0
-          fi
-          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)"
-
-      - name: Rewrite one pass
-        id: pass
-        env:
-          GITHUB_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
-          GH_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN || secrets.GITHUB_TOKEN }}
-          CHANGELOG_LLM: ${{ vars.CHANGELOG_LLM || '1' }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          LLM_API_BASE: ${{ secrets.LLM_API_BASE || vars.LLM_API_BASE }}
-          LLM_MODEL: ${{ secrets.LLM_MODEL || vars.LLM_MODEL }}
-          # Same escape hatch as the sync relay: the rewrite pass is where the
-          # doomed-row ladder actually fires, so it needs a stronger model to
-          # escalate to or every failure parks at the end of the rungs.
-          LLM_MODEL_MAJOR: ${{ secrets.LLM_MODEL_MAJOR || vars.LLM_MODEL_MAJOR }}
-          LLM_VERIFY_MODEL: ${{ secrets.LLM_VERIFY_MODEL || vars.LLM_VERIFY_MODEL }}
-          CHANGELOG_LLM_RPM: ${{ vars.CHANGELOG_LLM_RPM || '60' }}
-          # Higher than the relay's 2: this chain is not on the freshness path,
-          # so wall-clock is the only thing it has to protect. The RPM limiter
-          # above still bounds the request rate.
-          CHANGELOG_LLM_CONCURRENCY: '4'
-          CHANGELOG_ELI5_CONCURRENCY: '4'
-        run: |
-          set -o pipefail
-          node generator/cli.mjs enrich-all \
-            --rewrite-stale --rewrite-since "${{ inputs.days }}" --rewrite-important \
-            --batch "${{ inputs.batch }}" --push 2>&1 | tee rewrite.log
-          status=${PIPESTATUS[0]}
-          # Read the count and write the output BEFORE propagating the exit
-          # status. A pass that failed partway still rewrote the rows it
-          # finished, so the next pass has to know there is work left; exiting
-          # first would leave `left` unset and silently end the chain.
-          left="$(grep -oE 'left: [0-9]+ diffs, [0-9]+ summaries' rewrite.log | tail -1 | grep -oE '[0-9]+ summaries' | grep -oE '[0-9]+' || true)"
-          echo "rows still in scope: ${left:-unknown} (pass exit status: $status)"
-          echo "left=${left:-unknown}" >> "$GITHUB_OUTPUT"
-          exit "$status"
-
-      - name: Dispatch the next pass
-        # `always()`, like the relay's own hand-off: a pass that failed partway
-        # still made progress on the rows it finished, so the chain continues
-        # rather than stalling on one bad row. And the empty case is the stop
-        # condition -- `left` reaching 0 is what ends this, not a manual stop.
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.CHANGELOG_GITHUB_TOKEN }}
-          LEFT: ${{ steps.pass.outputs.left }}
-        run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "CHANGELOG_GITHUB_TOKEN not configured; stopping after this pass. Re-dispatch to continue."
-            exit 0
-          fi
-          if [ -z "$LEFT" ]; then
-            echo "::warning::the pass reported no row count (it failed before finishing); re-dispatching so the chain does not stall on one bad row."
-          elif [ "$LEFT" = "0" ]; then
-            echo "Scope is clear: every row in range is on the current prompt. Nothing left to rewrite."
-            exit 0
-          fi
-          QUEUED_COUNT=$(gh run list --workflow changelog-rewrite.yml --json databaseId,status --jq '[.[] | select(.status == "requested" or .status == "queued" or .status == "pending" or .status == "waiting")] | length' 2>/dev/null || echo "0")
-          if [ "$QUEUED_COUNT" -ne 0 ]; then
-            echo "A pass is already queued ($QUEUED_COUNT pending). Not dispatching a duplicate."
-            exit 0
-          fi
-          # Re-dispatch with the same inputs, so the chain keeps the scope it
-          # started with instead of silently widening to every stale row.
-          gh workflow run changelog-rewrite.yml \
-            -f days="${{ inputs.days }}" -f batch="${{ inputs.batch }}" \
-            || echo "::error::rewrite dispatch failed; re-dispatch manually to continue where it stopped."
+      - run: |
+          echo "Historical API regeneration is disabled. Existing text and overrides are retained."
+          echo "Only newly admitted incremental changes may enter the normal enrichment queue."
