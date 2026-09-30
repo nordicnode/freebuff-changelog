@@ -1,0 +1,1106 @@
+diff --git a/sdk/README.md b/sdk/README.md
+index e9a26e214f..8a14cd0c82 100644
+--- a/sdk/README.md
++++ b/sdk/README.md
+@@ -235,6 +235,98 @@ Each `LoadedAgentDefinition` extends `AgentDefinition` with:
+ 
+ Files ending in `.d.ts` or `.test.ts` are excluded.
+ 
++### `client.stream(options)`
++
++Starts an agent run and returns a `RunStream` that you can consume with `for await`.
++It accepts the same options as `client.run()`, plus `maxBufferedEvents`.
++
++```typescript
++import { CodebuffClient } from '@codebuff/sdk'
++
++const client = new CodebuffClient({ apiKey: process.env.CODEBUFF_API_KEY })
++const stream = client.stream({
++  agent: 'base',
++  prompt: 'Add unit tests for the calculator',
++})
++
++for await (const item of stream) {
++  if (item.type === 'chunk') {
++    if (typeof item.chunk === 'string') {
++      // Main agent text deltas.
++      process.stdout.write(item.chunk)
++    } else {
++      // Subagent and reasoning deltas include their agent ID.
++      console.log(item.chunk.type, item.chunk.agentId, item.chunk.chunk)
++    }
++  } else {
++    // Start/finish, tool calls/results, subagent lifecycle, and error events.
++    console.log(item.event)
++  }
++}
++
++const result = await stream.result
++if (result.output.type === 'error') {
++  console.error(result.output.message)
++} else {
++  // Continue with either run() or stream().
++  await client.run({
++    agent: 'base',
++    prompt: 'Review the tests',
++    previousRun: result,
++  })
++}
++```
++
++`RunStreamEvent` distinguishes `{ type: 'event', event: PrintModeEvent }` from
++`{ type: 'chunk', chunk: StreamChunk }`. Chunks include main agent text strings,
++`subagent_chunk` objects, and `reasoning_chunk` objects. Events are yielded in
++the order received from the runtime. Explicit `handleEvent` and
++`handleStreamChunk` callbacks still run alongside iteration; per-call callbacks
++replace client callbacks, as they do for `run()`.
++
++#### Cancellation and completion
++
++The run starts immediately, and the stream supports one consumer. Breaking out
++of the loop, calling `stream.abort(reason?)`, or aborting the supplied `signal`
++cancels the underlying run, discards unread events, and ends iteration.
++`stream.result` waits for the runtime to settle and returns its final `RunState`,
++including any partial progress retained by the runtime. A normally completed
++stream drains its buffered events before iteration ends.
++
++```typescript
++const controller = new AbortController()
++const stream = client.stream({
++  agent: 'base',
++  prompt: 'Review the codebase',
++  signal: controller.signal,
++})
++
++for await (const item of stream) {
++  if (item.type === 'event' && item.event.type === 'tool_call') {
++    // Stop before collecting more progress. This also cancels the run.
++    break
++  }
++}
++
++const partialRun = await stream.result
++// Alternatively, call controller.abort() or stream.abort() from your UI.
++```
++
++#### Buffer limits and errors
++
++Consume the stream while the run is active. It buffers at most **1,024 unread
++events/chunks** by default; set `maxBufferedEvents` to a positive safe integer to
++change that limit. If the buffer fills, the run is cancelled and both iteration
++and `stream.result` reject with `RunStreamBufferOverflowError`. Events are never
++silently dropped to make room.
++
++Unexpected execution exceptions and explicit callback failures also reject
++iteration and `stream.result`. Runtime error events remain event data, and an
++agent failure can resolve `stream.result` with `output.type === 'error'`, just
++like `run()`. Streaming skips the client's default throwing error-event handler;
++explicit handlers retain their behavior. Await `stream.result` even when you
++leave iteration early to wait for runtime cleanup.
++
+ ### `client.run(options)`
+ 
+ Runs a Codebuff agent with the specified options.
+diff --git a/sdk/src/__tests__/client-stream.test.ts b/sdk/src/__tests__/client-stream.test.ts
+new file mode 100644
+index 0000000000..51d7b41335
+--- /dev/null
++++ b/sdk/src/__tests__/client-stream.test.ts
+@@ -0,0 +1,256 @@
++import { describe, expect, test, mock } from 'bun:test'
++import { mkdtemp, rm } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import path from 'node:path'
++
++import { CodebuffClient } from '../client'
++
++import type { CodebuffClientOptions, RunOptions } from '../run'
++import type { RunState } from '../run-state'
++import type { RunStreamEvent } from '../stream'
++
++const state: RunState = {
++  traceSessionId: 'trace-client-stream',
++  output: { type: 'lastMessage', value: [] },
++}
++
++class HarnessClient extends CodebuffClient {
++  public calls: (RunOptions & CodebuffClientOptions)[] = []
++
++  constructor(
++    options: CodebuffClientOptions,
++    private execute: (
++      options: RunOptions & CodebuffClientOptions,
++    ) => Promise<RunState>,
++  ) {
++    super({ apiKey: 'test-key', ...options })
++  }
++
++  public override async run(options: RunOptions & CodebuffClientOptions) {
++    this.calls.push(options)
++    return this.execute(options)
++  }
++}
++
++const emit = async (options: RunOptions & CodebuffClientOptions) => {
++  await options.handleEvent?.({ type: 'start', messageHistoryLength: 0 })
++  await options.handleStreamChunk?.('Hello')
++  return state
++}
++
++async function collect(client: CodebuffClient) {
++  const stream = client.stream({ agent: 'base', prompt: 'Hello' })
++  const events: RunStreamEvent[] = []
++  for await (const event of stream) events.push(event)
++  await stream.result
++  return events
++}
++
++describe('CodebuffClient.stream', () => {
++  test('streams a real BYOK runtime response and preserves its inference pin', async () => {
++    const originalFetch = globalThis.fetch
++    const cwd = await mkdtemp(path.join(tmpdir(), 'codebuff-run-stream-'))
++    const fetchImpl = mock(async (input: Parameters<typeof fetch>[0]) => {
++      expect(String(input)).toBe('http://127.0.0.1:9876/v1/chat/completions')
++      const body = {
++        id: 'stream-test',
++        object: 'chat.completion.chunk',
++        created: 1,
++        model: 'scripted/model',
++        choices: [
++          {
++            index: 0,
++            delta: { role: 'assistant', content: 'Hello from BYOK.' },
++            finish_reason: 'stop',
++          },
++        ],
++      }
++      return new Response(`data: ${JSON.stringify(body)}\n\ndata: [DONE]\n\n`, {
++        headers: { 'content-type': 'text/event-stream' },
++      })
++    })
++    try {
++      globalThis.fetch = fetchImpl as unknown as typeof fetch
++      const client = new CodebuffClient({
++        cwd,
++        projectFiles: {},
++        knowledgeFiles: {},
++        agentDefinitions: [
++          {
++            id: 'stream-test',
++            displayName: 'Stream test',
++            model: 'ignored-by-byok',
++            toolNames: [],
++            systemPrompt: 'Say hello.',
++          },
++        ],
++        byok: {
++          id: 'stream-connection',
++          revision: 1,
++          name: 'stream test',
++          provider: 'openai-compatible',
++          baseUrl: 'http://127.0.0.1:9876/v1',
++          model: 'scripted/model',
++          apiKey: 'stream-test-key',
++          credentialRef: 'connection:stream-connection:1',
++          createdAt: '2026-01-01T00:00:00.000Z',
++          updatedAt: '2026-01-01T00:00:00.000Z',
++        },
++      })
++      const stream = client.stream({ agent: 'stream-test', prompt: 'Hello' })
++      const events: RunStreamEvent[] = []
++      for await (const event of stream) events.push(event)
++      const result = await stream.result
++      if (result.output.type === 'error') throw new Error(result.output.message)
++      expect(
++        events
++          .filter(
++            (item) => item.type === 'chunk' && typeof item.chunk === 'string',
++          )
++          .map((item) => (item.type === 'chunk' ? item.chunk : ''))
++          .join(''),
++      ).toContain('Hello from BYOK.')
++      expect(result.inference).toEqual({
++        source: 'byok',
++        connectionId: 'stream-connection',
++        revision: 1,
++        model: 'scripted/model',
++      })
++      expect(
++        result.sessionState?.mainAgentState.messageHistory.length,
++      ).toBeGreaterThan(0)
++      expect(fetchImpl).toHaveBeenCalledTimes(1)
++    } finally {
++      globalThis.fetch = originalFetch
++      await rm(cwd, { recursive: true, force: true })
++    }
++  })
++
++  test('inherits client configuration and explicit callbacks', async () => {
++    const handleEvent = mock(() => {})
++    const handleStreamChunk = mock(async () => {})
++    const client = new HarnessClient(
++      { cwd: '/project', maxAgentSteps: 4, handleEvent, handleStreamChunk },
++      emit,
++    )
++    expect((await collect(client)).length).toBe(2)
++    expect(client.calls).toHaveLength(1)
++    expect(client.calls[0].cwd).toBe('/project')
++    expect(client.calls[0].maxAgentSteps).toBe(4)
++    expect(handleEvent).toHaveBeenCalledTimes(1)
++    expect(handleStreamChunk).toHaveBeenCalledTimes(1)
++  })
++
++  test('per-call callbacks replace client callbacks', async () => {
++    const clientEvent = mock(() => {})
++    const clientChunk = mock(() => {})
++    const callEvent = mock(() => {})
++    const callChunk = mock(() => {})
++    const client = new HarnessClient(
++      { handleEvent: clientEvent, handleStreamChunk: clientChunk },
++      emit,
++    )
++    const stream = client.stream({
++      agent: 'base',
++      prompt: 'Hello',
++      handleEvent: callEvent,
++      handleStreamChunk: callChunk,
++      maxAgentSteps: 2,
++    })
++    for await (const _event of stream) {
++      /* consume */
++    }
++    await stream.result
++    expect(clientEvent).not.toHaveBeenCalled()
++    expect(clientChunk).not.toHaveBeenCalled()
++    expect(callEvent).toHaveBeenCalledTimes(1)
++    expect(callChunk).toHaveBeenCalledTimes(1)
++    expect(client.calls[0].maxAgentSteps).toBe(2)
++  })
++
++  test('yields error events without invoking the default throwing handler', async () => {
++    const client = new HarnessClient({}, async (options) => {
++      await options.handleEvent?.({ type: 'error', message: 'Agent failed' })
++      return { ...state, output: { type: 'error', message: 'Agent failed' } }
++    })
++    const stream = client.stream({ agent: 'base', prompt: 'Hello' })
++    const events: RunStreamEvent[] = []
++    for await (const event of stream) events.push(event)
++    expect(events).toEqual([
++      { type: 'event', event: { type: 'error', message: 'Agent failed' } },
++    ])
++    expect((await stream.result).output.type).toBe('error')
++    // Ordinary callback-based runs retain their established error behavior.
++    expect(() =>
++      client.options.handleEvent?.({ type: 'error', message: 'Agent failed' }),
++    ).toThrow('Received error')
++  })
++
++  test('preserves explicit throwing callbacks on streams', async () => {
++    const error = new Error('Explicit handler error')
++    const client = new HarnessClient(
++      {
++        handleEvent: () => {
++          throw error
++        },
++      },
++      emit,
++    )
++    const stream = client.stream({ agent: 'base', prompt: 'Hello' })
++    await expect(stream.result).rejects.toBe(error)
++  })
++
++  test('the stream result can continue a session through run()', async () => {
++    const client = new HarnessClient({}, emit)
++    const stream = client.stream({ agent: 'base', prompt: 'Hello' })
++    for await (const _event of stream) {
++      /* consume */
++    }
++    const previousRun = await stream.result
++    await client.run({ agent: 'base', prompt: 'Continue', previousRun })
++    expect(client.calls[1].previousRun).toBe(state)
++    expect(client.calls[1].prompt).toBe('Continue')
++  })
++
++  test('uses the real run cancellation path for a pre-aborted signal', async () => {
++    const client = new CodebuffClient({ apiKey: 'test-key' })
++    const controller = new AbortController()
++    controller.abort(new Error('Already cancelled'))
++    const stream = client.stream({
++      agent: 'base',
++      prompt: 'Hello',
++      previousRun: state,
++      signal: controller.signal,
++    })
++    const events: RunStreamEvent[] = []
++    for await (const event of stream) events.push(event)
++    expect(events).toEqual([])
++    const result = await stream.result
++    expect(result.traceSessionId).toBe(state.traceSessionId)
++    expect(result.output).toEqual({
++      type: 'error',
++      message: 'Already cancelled',
++    })
++  })
++
++  test('runs isolated streams with independent signals', async () => {
++    const inputs: (RunOptions & CodebuffClientOptions)[] = []
++    const client = new HarnessClient({}, async (options) => {
++      inputs.push(options)
++      await options.handleStreamChunk?.(options.prompt)
++      return state
++    })
++    const first = client.stream({ agent: 'base', prompt: 'First' })
++    const second = client.stream({ agent: 'base', prompt: 'Second' })
++    await Promise.all([first.result, second.result])
++    expect(inputs[0].signal).not.toBe(inputs[1].signal)
++    expect((await first[Symbol.asyncIterator]().next()).value).toEqual({
++      type: 'chunk',
++      chunk: 'First',
++    })
++    expect((await second[Symbol.asyncIterator]().next()).value).toEqual({
++      type: 'chunk',
++      chunk: 'Second',
++    })
++  })
++})
+diff --git a/sdk/src/__tests__/stream.test.ts b/sdk/src/__tests__/stream.test.ts
+new file mode 100644
+index 0000000000..49ca21b752
+--- /dev/null
++++ b/sdk/src/__tests__/stream.test.ts
+@@ -0,0 +1,451 @@
++import { describe, expect, test, mock } from 'bun:test'
++
++import { createRunStream, RunStreamBufferOverflowError } from '../stream'
++
++import type { CodebuffClientOptions, RunOptions } from '../run'
++import type { RunState } from '../run-state'
++import type { RunStream, RunStreamEvent } from '../stream'
++
++const state: RunState = {
++  traceSessionId: 'trace-stream',
++  output: { type: 'lastMessage', value: [] },
++}
++const options = { agent: 'base', prompt: 'Hello' }
++
++function deferred<T>() {
++  let resolve!: (value: T) => void
++  let reject!: (error: unknown) => void
++  const promise = new Promise<T>((res, rej) => {
++    resolve = res
++    reject = rej
++  })
++  return { promise, resolve, reject }
++}
++
++async function collect(stream: RunStream): Promise<RunStreamEvent[]> {
++  const events: RunStreamEvent[] = []
++  for await (const event of stream) events.push(event)
++  return events
++}
++
++function controlledRun() {
++  const started = deferred<RunOptions & CodebuffClientOptions>()
++  const completed = deferred<RunState>()
++  return {
++    started,
++    completed,
++    execute: (runOptions: RunOptions & CodebuffClientOptions) => {
++      started.resolve(runOptions)
++      return completed.promise
++    },
++  }
++}
++
++describe('run streams', () => {
++  test('delivers events and all chunk kinds in production order', async () => {
++    const subagent = {
++      type: 'subagent_chunk' as const,
++      agentId: 'child',
++      agentType: 'editor',
++      chunk: 'Editing',
++    }
++    const reasoning = {
++      type: 'reasoning_chunk' as const,
++      agentId: 'child',
++      ancestorRunIds: ['parent-run'],
++      chunk: 'Thinking',
++    }
++    const stream = createRunStream(options, async (run) => {
++      await run.handleEvent?.({ type: 'start', messageHistoryLength: 0 })
++      await run.handleStreamChunk?.('Hello')
++      await run.handleStreamChunk?.(subagent)
++      await run.handleStreamChunk?.(reasoning)
++      await run.handleEvent?.({ type: 'finish', totalCost: 0 })
++      return state
++    })
++
++    expect(await collect(stream)).toEqual([
++      { type: 'event', event: { type: 'start', messageHistoryLength: 0 } },
++      { type: 'chunk', chunk: 'Hello' },
++      { type: 'chunk', chunk: subagent },
++      { type: 'chunk', chunk: reasoning },
++      { type: 'event', event: { type: 'finish', totalCost: 0 } },
++    ])
++    expect(await stream.result).toBe(state)
++  })
++
++  test('drains buffered events after the producer has finished', async () => {
++    const stream = createRunStream(options, async (run) => {
++      await run.handleStreamChunk?.('one')
++      await run.handleStreamChunk?.('two')
++      return state
++    })
++    await stream.result
++    expect(await collect(stream)).toEqual([
++      { type: 'chunk', chunk: 'one' },
++      { type: 'chunk', chunk: 'two' },
++    ])
++  })
++
++  test('wakes concurrent pending reads in FIFO order', async () => {
++    const run = controlledRun()
++    const stream = createRunStream(options, run.execute)
++    const iterator = stream[Symbol.asyncIterator]()
++    const first = iterator.next()
++    const second = iterator.next()
++    const input = await run.started.promise
++    await input.handleStreamChunk?.('one')
++    await input.handleStreamChunk?.('two')
++    expect((await first).value).toEqual({ type: 'chunk', chunk: 'one' })
++    expect((await second).value).toEqual({ type: 'chunk', chunk: 'two' })
++    const end = iterator.next()
++    run.completed.resolve(state)
++    expect((await end).done).toBe(true)
++    await stream.result
++  })
++
++  test('completes an empty stream', async () => {
++    const stream = createRunStream(options, async () => state)
++    expect(await collect(stream)).toEqual([])
++    expect(await stream.result).toBe(state)
++  })
++
++  test('error events and error run states remain data', async () => {
++    const errorState: RunState = {
++      ...state,
++      output: { type: 'error', message: 'Agent failed' },
++    }
++    const stream = createRunStream(options, async (run) => {
++      await run.handleEvent?.({ type: 'error', message: 'Agent failed' })
++      return errorState
++    })
++    expect(await collect(stream)).toEqual([
++      { type: 'event', event: { type: 'error', message: 'Agent failed' } },
++    ])
++    expect(await stream.result).toBe(errorState)
++  })
++
++  test('passes run options through and consumes stream-only settings', async () => {
++    const execute = mock(
++      async (_run: RunOptions & CodebuffClientOptions) => state,
++    )
++    const stream = createRunStream(
++      {
++        ...options,
++        previousRun: state,
++        maxAgentSteps: 3,
++        maxBufferedEvents: 4,
++      },
++      execute,
++    )
++    await stream.result
++    expect(execute).toHaveBeenCalledTimes(1)
++    const input = execute.mock.calls[0][0]
++    expect(input.previousRun).toBe(state)
++    expect(input.maxAgentSteps).toBe(3)
++    expect(input.agent).toBe('base')
++    expect(input.prompt).toBe('Hello')
++    expect(input).not.toHaveProperty('maxBufferedEvents')
++  })
++
++  test('starts without waiting for an iterator to be created', async () => {
++    const execute = mock(async () => state)
++    const stream = createRunStream(options, execute)
++    expect(await stream.result).toBe(state)
++    expect(execute).toHaveBeenCalledTimes(1)
++  })
++
++  test('forwards callbacks exactly once while yielding their events', async () => {
++    const handleEvent = mock(async () => {})
++    const handleStreamChunk = mock(() => {})
++    const stream = createRunStream(
++      { ...options, handleEvent, handleStreamChunk },
++      async (run) => {
++        await run.handleEvent?.({ type: 'start', messageHistoryLength: 0 })
++        await run.handleStreamChunk?.('Hello')
++        return state
++      },
++    )
++    expect((await collect(stream)).length).toBe(2)
++    await stream.result
++    expect(handleEvent).toHaveBeenCalledTimes(1)
++    expect(handleStreamChunk).toHaveBeenCalledTimes(1)
++  })
++
++  test('waits for callbacks that the producer did not await', async () => {
++    const callback = deferred<void>()
++    const entered = deferred<void>()
++    let settled = false
++    const stream = createRunStream(
++      {
++        ...options,
++        handleStreamChunk: async () => {
++          entered.resolve()
++          await callback.promise
++        },
++      },
++      async (run) => {
++        void run.handleStreamChunk?.('Hello')
++        return state
++      },
++    )
++    void stream.result.then(() => {
++      settled = true
++    })
++    await entered.promise
++    await Promise.resolve()
++    expect(settled).toBe(false)
++    callback.resolve()
++    expect(await stream.result).toBe(state)
++    expect(settled).toBe(true)
++  })
++
++  test('aborting wakes readers, drops queued events, and preserves the run result', async () => {
++    const run = controlledRun()
++    const stream = createRunStream(options, run.execute)
++    const input = await run.started.promise
++    await input.handleStreamChunk?.('queued')
++    const reason = new Error('Stop now')
++    stream.abort(reason)
++    stream.abort(new Error('second abort'))
++    expect(input.signal?.aborted).toBe(true)
++    expect(input.signal?.reason).toBe(reason)
++    await input.handleStreamChunk?.('late')
++    expect(await collect(stream)).toEqual([])
++    run.completed.resolve(state)
++    expect(await stream.result).toBe(state)
++  })
++
++  test('breaking out of for await cancels the producer', async () => {
++    const run = controlledRun()
++    const stream = createRunStream(options, run.execute)
++    const consume = (async () => {
++      for await (const _event of stream) break
++    })()
++    const input = await run.started.promise
++    await input.handleStreamChunk?.('first')
++    await consume
++    expect(input.signal?.aborted).toBe(true)
++    run.completed.resolve(state)
++    expect(await stream.result).toBe(state)
++  })
++
++  test('aborting releases every pending reader', async () => {
++    const run = controlledRun()
++    const stream = createRunStream(options, run.execute)
++    const iterator = stream[Symbol.asyncIterator]()
++    const pending = [iterator.next(), iterator.next()]
++    await run.started.promise
++    stream.abort()
++    expect((await Promise.all(pending)).every((item) => item.done)).toBe(true)
++    run.completed.resolve(state)
++    await stream.result
++  })
++
++  test('forwards an external abort and its original reason', async () => {
++    const run = controlledRun()
++    const controller = new AbortController()
++    const stream = createRunStream(
++      { ...options, signal: controller.signal },
++      run.execute,
++    )
++    const input = await run.started.promise
++    const reason = new Error('External cancellation')
++    controller.abort(reason)
++    expect(input.signal?.aborted).toBe(true)
++    expect(input.signal?.reason).toBe(reason)
++    expect(await collect(stream)).toEqual([])
++    run.completed.resolve(state)
++    await stream.result
++  })
++
++  test('passes a pre-aborted signal to the run without yielding events', async () => {
++    const controller = new AbortController()
++    controller.abort('already cancelled')
++    const execute = mock(async (run: RunOptions & CodebuffClientOptions) => {
++      expect(run.signal?.aborted).toBe(true)
++      expect(run.signal?.reason).toBe('already cancelled')
++      await run.handleStreamChunk?.('late')
++      return state
++    })
++    const stream = createRunStream(
++      { ...options, signal: controller.signal },
++      execute,
++    )
++    expect(await collect(stream)).toEqual([])
++    expect(await stream.result).toBe(state)
++  })
++
++  test('detaches the external signal after completion', async () => {
++    const controller = new AbortController()
++    let input: (RunOptions & CodebuffClientOptions) | undefined
++    const stream = createRunStream(
++      { ...options, signal: controller.signal },
++      async (run) => {
++        input = run
++        return state
++      },
++    )
++    await stream.result
++    controller.abort()
++    expect(input?.signal?.aborted).toBe(false)
++  })
++
++  test('exposes executor failures to both pending readers and result', async () => {
++    const run = controlledRun()
++    const stream = createRunStream(options, run.execute)
++    const iterator = stream[Symbol.asyncIterator]()
++    const pending = iterator.next()
++    const error = new Error('Execution failed')
++    run.completed.reject(error)
++    await expect(pending).rejects.toBe(error)
++    await expect(stream.result).rejects.toBe(error)
++    await expect(iterator.next()).rejects.toBe(error)
++  })
++
++  test('handles synchronous executor exceptions', async () => {
++    const error = new Error('Setup failed')
++    const stream = createRunStream(options, () => {
++      throw error
++    })
++    await expect(collect(stream)).rejects.toBe(error)
++    await expect(stream.result).rejects.toBe(error)
++  })
++
++  test.each(['event', 'chunk'] as const)(
++    'cancels when a %s callback rejects',
++    async (kind) => {
++      const error = new Error('Handler failed')
++      let signal: AbortSignal | undefined
++      const fail = async () => {
++        throw error
++      }
++      const stream = createRunStream(
++        { ...options, handleEvent: fail, handleStreamChunk: fail },
++        async (run) => {
++          signal = run.signal
++          if (kind === 'event')
++            await run.handleEvent?.({ type: 'start', messageHistoryLength: 0 })
++          else await run.handleStreamChunk?.('Hello')
++          return state
++        },
++      )
++      await expect(collect(stream)).rejects.toBe(error)
++      await expect(stream.result).rejects.toBe(error)
++      expect(signal?.aborted).toBe(true)
++    },
++  )
++
++  test('treats a callback throwing undefined as a failure', async () => {
++    const stream = createRunStream(
++      {
++        ...options,
++        handleEvent: () => {
++          throw undefined
++        },
++      },
++      async (run) => {
++        await run.handleEvent?.({ type: 'start', messageHistoryLength: 0 })
++        return state
++      },
++    )
++    const errors: unknown[] = []
++    await collect(stream).catch((error) => {
++      errors.push(error)
++    })
++    await stream.result.catch((error) => {
++      errors.push(error)
++    })
++    expect(errors).toEqual([undefined, undefined])
++  })
++
++  test('cancels and reports buffer overflow without silently dropping events', async () => {
++    let signal: AbortSignal | undefined
++    const stream = createRunStream(
++      { ...options, maxBufferedEvents: 2 },
++      async (run) => {
++        signal = run.signal
++        await run.handleStreamChunk?.('one')
++        await run.handleStreamChunk?.('two')
++        await run.handleStreamChunk?.('three')
++        return state
++      },
++    )
++    await expect(stream.result).rejects.toBeInstanceOf(
++      RunStreamBufferOverflowError,
++    )
++    await expect(collect(stream)).rejects.toBeInstanceOf(
++      RunStreamBufferOverflowError,
++    )
++    expect(signal?.aborted).toBe(true)
++    expect(
++      (signal?.reason as RunStreamBufferOverflowError).maxBufferedEvents,
++    ).toBe(2)
++  })
++
++  test('uses a bounded default buffer', async () => {
++    const stream = createRunStream(options, async (run) => {
++      for (let i = 0; i <= 1_024; i++) await run.handleStreamChunk?.('delta')
++      return state
++    })
++    await expect(stream.result).rejects.toBeInstanceOf(
++      RunStreamBufferOverflowError,
++    )
++  })
++
++  test('consuming events frees buffer capacity', async () => {
++    const stream = createRunStream(
++      { ...options, maxBufferedEvents: 1 },
++      async (run) => {
++        for (let i = 0; i < 20; i++) await run.handleStreamChunk?.(`delta-${i}`)
++        return state
++      },
++    )
++    expect((await collect(stream)).length).toBe(20)
++    expect(await stream.result).toBe(state)
++  })
++
++  test.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])(
++    'rejects invalid buffer capacity %s before starting a run',
++    (maxBufferedEvents) => {
++      const execute = mock(async () => state)
++      expect(() =>
++        createRunStream({ ...options, maxBufferedEvents }, execute),
++      ).toThrow(RangeError)
++      expect(execute).not.toHaveBeenCalled()
++    },
++  )
++
++  test('rejects a second consumer', async () => {
++    const stream = createRunStream(options, async () => state)
++    stream[Symbol.asyncIterator]()
++    expect(() => stream[Symbol.asyncIterator]()).toThrow(
++      'only be consumed once',
++    )
++    await stream.result
++  })
++
++  test('iterator.throw cancels the run and propagates the consumer error', async () => {
++    const run = controlledRun()
++    const stream = createRunStream(options, run.execute)
++    const iterator = stream[Symbol.asyncIterator]()
++    const input = await run.started.promise
++    const error = new Error('Consumer failed')
++    await expect(iterator.throw!(error)).rejects.toBe(error)
++    expect(input.signal?.reason).toBe(error)
++    run.completed.resolve(state)
++    await stream.result
++  })
++
++  test('return closes an iterator even when completion left buffered events', async () => {
++    const stream = createRunStream(options, async (run) => {
++      await run.handleStreamChunk?.('queued')
++      return state
++    })
++    await stream.result
++    const iterator = stream[Symbol.asyncIterator]()
++    expect((await iterator.return!()).done).toBe(true)
++    expect((await iterator.next()).done).toBe(true)
++    expect(await stream.result).toBe(state)
++  })
++})
+diff --git a/sdk/src/client.ts b/sdk/src/client.ts
+index 2d0ea10064..43e159a8ac 100644
+--- a/sdk/src/client.ts
++++ b/sdk/src/client.ts
+@@ -4,9 +4,20 @@ import { getWebsiteUrl } from './constants'
+ import { getCodebuffApiKeyFromEnv } from './env'
+ import { run } from './run'
+ import { normalizeByokBaseUrl } from './byok'
++import { createRunStream } from './stream'
+ 
+ import type { RunOptions, CodebuffClientOptions } from './run'
+ import type { RunState } from './run-state'
++import type { RunStream, RunStreamOptions } from './stream'
++import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
++
++const defaultHandleEvent = (event: PrintModeEvent) => {
++  if (event.type === 'error') {
++    throw new Error(
++      `Received error: ${event.message}.\n\nProvide a handleEvent function to handle this error.`,
++    )
++  }
++}
+ 
+ export class CodebuffClient {
+   public options: CodebuffClientOptions & {
+@@ -23,13 +34,7 @@ export class CodebuffClient {
+     }
+ 
+     this.options = {
+-      handleEvent: (event) => {
+-        if (event.type === 'error') {
+-          throw new Error(
+-            `Received error: ${event.message}.\n\nProvide a handleEvent function to handle this error.`,
+-          )
+-        }
+-      },
++      handleEvent: defaultHandleEvent,
+       fingerprintId: `codebuff-sdk-${Math.random().toString(36).substring(2, 15)}`,
+       ...options,
+       // The direct runtime never sends this placeholder anywhere. It keeps the
+@@ -70,6 +75,31 @@ export class CodebuffClient {
+     })
+   }
+ 
++  /**
++   * Start a run and consume its events and deltas with `for await`.
++   *
++   * The stream starts immediately and has one consumer. Await `stream.result`
++   * for the final RunState, which can be passed to a subsequent run. Calling
++   * `stream.abort()`, aborting options.signal, or leaving the iteration early
++   * cancels the run and discards unread events. Explicit event/chunk callbacks
++   * still run; error events are yielded without the default throwing handler.
++   * A full buffer or a throwing callback cancels the run and rejects both the
++   * iterator and result. See maxBufferedEvents to configure the buffer limit.
++   */
++  public stream(options: RunStreamOptions): RunStream {
++    const mergedOptions = { ...this.options, ...options }
++    return createRunStream(
++      {
++        ...mergedOptions,
++        handleEvent:
++          mergedOptions.handleEvent === defaultHandleEvent
++            ? undefined
++            : mergedOptions.handleEvent,
++      },
++      (runOptions) => this.run(runOptions),
++    )
++  }
++
+   /**
+    * Check connection to the Codebuff backend by hitting the /healthz endpoint.
+    *
+diff --git a/sdk/src/index.ts b/sdk/src/index.ts
+index 3474847212..7a5d0fbb6b 100644
+--- a/sdk/src/index.ts
++++ b/sdk/src/index.ts
+@@ -33,6 +33,13 @@ export type {
+   CodebuffToolOutput,
+ } from '@codebuff/common/tools/list'
+ export * from './client'
++export { RunStreamBufferOverflowError } from './stream'
++export type {
++  RunStream,
++  RunStreamEvent,
++  RunStreamOptions,
++  StreamChunk,
++} from './stream'
+ export * from './custom-tool'
+ export * from './native/ripgrep'
+ export * from './run-state'
+diff --git a/sdk/src/stream.ts b/sdk/src/stream.ts
+new file mode 100644
+index 0000000000..210dc71e72
+--- /dev/null
++++ b/sdk/src/stream.ts
+@@ -0,0 +1,188 @@
++import type { CodebuffClientOptions, RunOptions } from './run'
++import type { RunState } from './run-state'
++import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
++
++/** Text, subagent, or reasoning deltas emitted during an agent run. */
++export type StreamChunk = Parameters<
++  NonNullable<CodebuffClientOptions['handleStreamChunk']>
++>[0]
++
++export type RunStreamEvent =
++  | { type: 'event'; event: PrintModeEvent }
++  | { type: 'chunk'; chunk: StreamChunk }
++
++export type RunStreamOptions = RunOptions &
++  CodebuffClientOptions & {
++    /** Maximum unread events, including chunks. Defaults to 1,024. */
++    maxBufferedEvents?: number
++  }
++
++export interface RunStream extends AsyncIterable<RunStreamEvent> {
++  /** Final run state, including partial progress after cancellation. */
++  readonly result: Promise<RunState>
++  /** Stop receiving events and cancel the underlying run. */
++  abort(reason?: unknown): void
++}
++
++/** A consumer failed to read events before the stream's buffer filled. */
++export class RunStreamBufferOverflowError extends Error {
++  constructor(public readonly maxBufferedEvents: number) {
++    super(
++      `Run stream exceeded ${maxBufferedEvents} unread events. Consume the stream as it runs or increase maxBufferedEvents.`,
++    )
++    this.name = 'RunStreamBufferOverflowError'
++  }
++}
++
++type RunExecutor = (
++  options: RunOptions & CodebuffClientOptions,
++) => Promise<RunState>
++
++/** @internal Injecting the executor lets lifecycle tests run without a backend. */
++export function createRunStream(
++  options: RunStreamOptions,
++  executeRun: RunExecutor,
++): RunStream {
++  const {
++    maxBufferedEvents = 1_024,
++    signal,
++    handleEvent,
++    handleStreamChunk,
++    ...runOptions
++  } = options
++
++  if (!Number.isSafeInteger(maxBufferedEvents) || maxBufferedEvents < 1) {
++    throw new RangeError('maxBufferedEvents must be a positive safe integer')
++  }
++
++  const controller = new AbortController()
++  const queue: RunStreamEvent[] = []
++  const readers: {
++    resolve: (result: IteratorResult<RunStreamEvent>) => void
++    reject: (error: unknown) => void
++  }[] = []
++  let closed = false
++  let claimed = false
++  let failure: { error: unknown } | undefined
++
++  const close = (discard: boolean) => {
++    closed = true
++    if (discard) queue.length = 0
++    for (const reader of readers.splice(0)) {
++      if (failure) reader.reject(failure.error)
++      else reader.resolve({ done: true, value: undefined })
++    }
++  }
++
++  const abort = (reason?: unknown) => {
++    const wasClosed = closed
++    close(true)
++    if (!wasClosed) controller.abort(reason)
++  }
++
++  const fail = (error: unknown) => {
++    if (closed) return
++    failure = { error }
++    close(true)
++    controller.abort(error)
++  }
++
++  const push = (event: RunStreamEvent) => {
++    if (closed) return
++    const reader = readers.shift()
++    if (reader) {
++      reader.resolve({ done: false, value: event })
++    } else if (queue.length < maxBufferedEvents) {
++      queue.push(event)
++    } else {
++      fail(new RunStreamBufferOverflowError(maxBufferedEvents))
++    }
++  }
++
++  // Some runtime producers do not await callback promises. Track callbacks so
++  // result cannot settle before a handler has finished or reported a failure.
++  const callbacks = new Set<Promise<void>>()
++  const deliver = (
++    event: RunStreamEvent,
++    callback: () => void | Promise<void>,
++  ) => {
++    if (closed) return Promise.resolve()
++    push(event)
++    if (closed) return Promise.resolve()
++    const pending = (async () => {
++      try {
++        await callback()
++      } catch (error) {
++        fail(error)
++      }
++    })()
++    callbacks.add(pending)
++    void pending.then(() => callbacks.delete(pending))
++    return pending
++  }
++
++  const onAbort = () => abort(signal?.reason)
++  if (signal?.aborted) onAbort()
++  else signal?.addEventListener('abort', onAbort, { once: true })
++
++  const result = Promise.resolve()
++    .then(() =>
++      executeRun({
++        ...runOptions,
++        signal: controller.signal,
++        handleEvent: (event) =>
++          deliver({ type: 'event', event }, () => handleEvent?.(event)),
++        handleStreamChunk: (chunk) =>
++          deliver({ type: 'chunk', chunk }, () => handleStreamChunk?.(chunk)),
++      }),
++    )
++    .then(async (state) => {
++      while (callbacks.size > 0) await Promise.all(callbacks)
++      if (failure) throw failure.error
++      return state
++    })
++    .catch((error: unknown) => {
++      fail(error)
++      throw error
++    })
++    .finally(() => {
++      signal?.removeEventListener('abort', onAbort)
++      close(false)
++    })
++
++  // Iteration also exposes failures. A caller that only consumes events should
++  // not receive an unhandled rejection for the separate result promise.
++  void result.catch(() => {})
++
++  return {
++    result,
++    abort,
++    [Symbol.asyncIterator]() {
++      if (claimed) throw new Error('A run stream can only be consumed once')
++      claimed = true
++      let ended = false
++      return {
++        next(): Promise<IteratorResult<RunStreamEvent>> {
++          if (ended) return Promise.resolve({ done: true, value: undefined })
++          if (failure) return Promise.reject(failure.error)
++          const event = queue.shift()
++          if (event) return Promise.resolve({ done: false, value: event })
++          if (closed) return Promise.resolve({ done: true, value: undefined })
++          return new Promise((resolve, reject) => {
++            readers.push({ resolve, reject })
++          })
++        },
++        return(): Promise<IteratorResult<RunStreamEvent>> {
++          ended = true
++          abort()
++          return Promise.resolve({ done: true, value: undefined })
++        },
++        throw(error?: unknown): Promise<IteratorResult<RunStreamEvent>> {
++          ended = true
++          abort(error)
++          return Promise.reject(error)
++        },
++      }
++    },
++  }
++}
