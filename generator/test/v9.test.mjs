@@ -92,6 +92,36 @@ test('ungroundedIdentifiers: a path inside a URL is not a claimed file', () => {
   assert.deepEqual(ungroundedIdentifiers('See https://github.com/x/y/blob/main/docs/a.md for context.', 'nothing'), [])
 })
 
+test('ungroundedIdentifiers: a member name after a dot is a mention, not an invention', () => {
+  // Reported live: `server.httpServer.listen(0)` and
+  // `loopAgentStepsBaseParams.promptAiSdkStream` were both called out as names
+  // "not found in the diff", because the whole-token rule treated the dot as a
+  // cut into a longer identifier. Member access is a boundary; a word character
+  // before the name still is not.
+  const patch = '+ calls `server.httpServer.listen(0)` itself.\n+ loopAgentStepsBaseParams.promptAiSdkStream = async function* () {}'
+  assert.deepEqual(ungroundedIdentifiers('Calls `httpServer` directly.', patch), [], 'the member after the dot is grounded')
+  assert.deepEqual(ungroundedIdentifiers('Overrides `promptAiSdkStream`.', patch), [], 'and so is the assigned member')
+  assert.deepEqual(ungroundedIdentifiers('Calls `httpServerTls` directly.', patch), ['httpServerTls'], 'a cut into a longer name is still caught')
+  assert.deepEqual(ungroundedIdentifiers('Reads `CODEBUFF_MO`.', 'reads CODEBUFF_MODELS daily'), ['CODEBUFF_MO'], 'so is a truncated prefix')
+  assert.deepEqual(ungroundedIdentifiers('Reads `FF_MODELS`.', 'const CODEBUFF_MODELS = 1'), ['FF_MODELS'], 'and a fragment starting mid-identifier')
+})
+
+test('ungroundedIdentifiers: a quoted regex fragment and an indexed name ground against the source that holds them', () => {
+  // Reported live from sdk/src/impl/model-provider.ts: the row quoted the diff
+  // faithfully and was still called out for inventing both names. `models?` is
+  // a regex fragment the source writes word-boundary-escaped (`/\bmodels?\b`),
+  // where the character before the name is the escape's own `b`, so the
+  // whole-token rule rejected a token that is present verbatim. `PATTERNS[1]`
+  // is the same name with a position attached, and no declaration ever spells
+  // the index, so the span itself could never match anything.
+  const patch = ' const PATTERNS: readonly RegExp[] = [\n   /"code"\\s*:\\s*"model_not_found"/i,\n-  /\\bmodels?\\b(?:(?![.!?]\\s)[^\\n]){0,80}?\\b(?:does not exist|not found)/i,\n+  /\\bmodels?\\b(?:[^\\n]){0,40}?\\b(?:does not exist|not found)/i,'
+  assert.deepEqual(ungroundedIdentifiers('It now demands `models?` as the subject.', patch), [], 'a pattern quoted from the regex is grounded')
+  assert.deepEqual(ungroundedIdentifiers('The regex at `PATTERNS[1]` was rewritten.', patch), [], 'a subscript is a position, not part of the name')
+  assert.deepEqual(ungroundedIdentifiers('The regex at `PATTERNS[1]` was rewritten.', 'const OTHER = []'), ['PATTERNS[1]'], 'the base name still has to exist')
+  assert.deepEqual(ungroundedIdentifiers('It now demands `models??`.', patch), ['models??'], 'a fragment the source does not contain is still an invention')
+  assert.deepEqual(ungroundedIdentifiers('Reads `CODEBUFF_MO`.', 'reads CODEBUFF_MODELS daily'), ['CODEBUFF_MO'], 'and a truncated identifier is still caught')
+})
+
 test('ungroundedIdentifiers: a dotted name is grounded by the object literal that nests it', () => {
   // The shape this comes from: `page.url` is a real property chain the diff
   // writes as `page: { url: page }`, so the dotted string never appears in the

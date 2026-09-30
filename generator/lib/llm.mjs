@@ -1947,14 +1947,20 @@ export function ungroundedIdentifiers (text, corpus) {
   const clean = String(text || '').replace(/```[^`\n]*```/g, ' ').replace(/```/g, ' ')
   let nested = null
   const nestedPaths = () => (nested ??= nestedObjectPaths(hay))
-  // A corpus hit must be a whole token. Plain substring matching let a
-  // truncated prefix of a real name (`CODEBUFF_MO` for `CODEBUFF_MODELS`)
-  // pass as grounded, which is exactly the typo class this check exists for.
+  // A corpus hit must be a whole token: a truncated prefix of a real name
+  // (`CODEBUFF_MO` for `CODEBUFF_MODELS`) must not pass as grounded, which is
+  // exactly the typo class this check exists for. A dot on the left is not a
+  // cut, though -- it is member access, and rejecting it reported names the
+  // diff spells out (`server.httpServer.listen(0)`, `params.promptAiSdkStream`)
+  // as invented, which is what "the model is naming things that are not there"
+  // looks like from the reader's side. The right-hand rule still rejects a cut
+  // into a longer name, and a word character on the left still rejects a
+  // fragment that starts mid-identifier.
   const corpusHas = (tok) => {
     if (!tok) return false
     if (tok.length < 3) return true // short handles are not claims worth a regex
     if (!hay.includes(tok)) return false
-    return new RegExp(`(?<![\\w.])${tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w])`).test(hay)
+    return new RegExp(`(?<![\\w])${tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w])`).test(hay)
   }
   // Case-insensitive fallback for prose names ("DeepSeek" from a diff that
   // only carries FREEBUFF_DEEPSEEK_*, "Claude Opus" from `claude-opus-4.1`).
@@ -1965,7 +1971,7 @@ export function ungroundedIdentifiers (text, corpus) {
     const low = (hayLower ??= hay.toLowerCase())
     const t = tok.toLowerCase()
     if (!low.includes(t)) return false
-    return new RegExp(`(?<![a-z0-9.])${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z0-9])`).test(low)
+    return new RegExp(`(?<![a-z0-9])${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z0-9])`).test(low)
   }
   // A dotted name is grounded by the object literal that nests it. The claim
   // may also add a leading segment a reader can infer (`payload.page.url` for
@@ -1983,10 +1989,15 @@ export function ungroundedIdentifiers (text, corpus) {
     if (!raw || GROUNDING_PLACEHOLDER_RE.test(raw)) continue
     if (/^v?\d+(?:\.\d+)*[a-z0-9-]*$/i.test(raw)) continue
     const words = raw.split(/\s+/)
-      // `foo()` first, then stray edge punctuation: trimming ")" before "("
-      // used to leave "foo(" - a shape no corpus contains - and every
-      // backticked call was reported as invented.
-      .map(w => w.replace(/\(\)$/, '').replace(/^[('"[{<]+|[)'"\]}>,.;:]+$/g, ''))
+      // `foo()` first, a subscript second, then stray edge punctuation:
+      // trimming ")" before "(" used to leave "foo(" - a shape no corpus
+      // contains - and every backticked call was reported as invented. The
+      // subscript has to go before the punctuation strip, which would eat the
+      // closing bracket and leave `PATTERNS[1` - a shape no source contains.
+      // `PATTERNS[1]` is a claim about PATTERNS with a position attached, and
+      // the position is not a name: `const PATTERNS = [` never spells the
+      // index, so the whole span could never be grounded.
+      .map(w => w.replace(/\(\)$/, '').replace(/\[[^\[\]]*\]$/, '').replace(/^[('"[{<]+|[)'"\]}>,.;:]+$/g, ''))
       // `<publisher>/<id>@<version>` is a placeholder too, just a composite one.
       .filter(w => w.length >= 3 && /[a-z]/i.test(w) && !GROUNDING_PLACEHOLDER_RE.test(w) && !/<[^>]+>/.test(w))
     if (!words.length) continue
@@ -1999,6 +2010,15 @@ export function ungroundedIdentifiers (text, corpus) {
     const present = (w) => {
       const bare = w.replace(/\/$/, '').replace(/=.*$/, '')
       if (!bare || bare.length < 3) return true
+      // A token carrying regex metacharacters is a code fragment the row is
+      // quoting, not an identifier it is naming: `models?` is the pattern in
+      // the diff, and the whole-token rule rejects it because the source
+      // writes it word-boundary-escaped (`/\bmodels?\b...`), where the
+      // character before the name is the escape's `b`. Verbatim presence is
+      // the right standard for a fragment, and it still catches an invented
+      // one. `.` and `-` stay out of the set so dotted paths and dashed model
+      // ids keep the whole-token rule.
+      if (/[?*+^$|()[\]{}\\]/.test(bare)) { if (hay.includes(bare)) return true }
       if (corpusHas(bare) || corpusHasName(bare)) return true
       const tail = bare.split(/[./]/).filter(Boolean).pop()
       if (tail && tail.length >= 4 && tail !== bare && corpusHas(tail)) return true
