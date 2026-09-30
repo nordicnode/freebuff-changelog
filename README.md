@@ -18,6 +18,7 @@ Build and tests do not call an LLM. CLI commands load local environment configur
 - `catch-up` and `watch` optionally enrich **newly admitted incremental entries** after deterministic publication. Admission is durable (`enrichment.policy`); initial scans and `--full` rescans do not admit historical entries. Existing legacy text and human overrides remain intact.
 - Production CLI cycles force the no-backfill policy. Summary, plain-English, and PR queues reject unadmitted history by default. The low-level test-fixture override is not a supported production regeneration command.
 - `enrich-all`, historical regeneration scripts, and the rewrite workflow are disabled. The old `backfill` name remains a compatibility alias for `watch`, **not permission to regenerate history**.
+- The one deliberate way back is `retry-failed <sha>...`, run only through the sync workflow's dispatch input (a workstation must not spend the relay's key): it releases **named** rows that have no generation — an admitted row, or one whose current-prompt failure stub proves the pipeline already asked it — clears their failure stubs, re-asks once, and publishes. It refuses noise, refuses any row with existing text, refuses a never-asked historical row, and accepts at most five names per run, so the spend is bounded by what a human types rather than by anything cached. A parked row that was never released still heals on the next prompt version.
 - Models are unchanged: existing `LLM_MODEL`, optional `LLM_MODEL_MAJOR`, and configured verifier routing are retained. The verifier default remains `deepseek-v4.1`. No new model is selected by this remediation.
 - The provider context contract is fixed at **270,000 tokens**, with 8,000 output tokens reserved and conservative character budgeting. Environment settings cannot silently increase the window. Character budgeting is an estimate, not an exact tokenizer.
 - A production cycle has a four-minute git/network deadline, a two-minute enrichment deadline within it, **40 total model requests**, and **12 requests per entry**. Retries, repairs, relevance gates, verification, and self-checks all consume this budget. Failed rows retain durable attempt counts and cooldowns.
@@ -31,6 +32,7 @@ node generator/cli.mjs watch [--push] --interval 30 --duration 12m
 node generator/cli.mjs freshness
 node generator/cli.mjs eval [--limit N]   # offline stored-artifact audit
 node generator/cli.mjs override <sha>    # inspect a human-correction draft
+node generator/cli.mjs retry-failed <sha>... [--push]  # bounded release of named rows with no generation (dispatch input on changelog-sync, not a local command)
 ```
 
 `--push` is consequential: it commits and pushes generated data. Broadcast sends external messages. Neither is required for build/test verification.

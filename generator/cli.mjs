@@ -15,7 +15,7 @@ import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
   extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
-import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible } from './lib/llm.mjs'
+import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows } from './lib/llm.mjs'
 import { QUALITY_POLICY_V } from './lib/quality.mjs'
 import { shortHash, eli5Source } from './lib/util.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
@@ -1666,6 +1666,7 @@ if (IS_MAIN) {
   else if (cmd === 'freshness') await cmdFreshness(rest)
   else if (cmd === 'enrich-all') await cmdEnrichAll(rest)
   else if (cmd === 'repair-entries') await cmdRepairEntries(rest)
+  else if (cmd === 'retry-failed') await cmdRetryFailed(rest)
   else if (cmd === 'prune-cache') await cmdPruneCache(rest)
   else if (cmd === 'glossary') await cmdGlossary(rest)
   else if (cmd === 'eval') await cmdEval(rest)
@@ -1684,6 +1685,7 @@ if (IS_MAIN) {
   node generator/cli.mjs freshness [--max-age-min N]  # CI gate: fail if data/changelog.json is staler than the site's own [stale] threshold (2x the sync budget)
   node generator/cli.mjs enrich-all              # disabled: no historical API spending
   node generator/cli.mjs repair-entries [--push]   # recompute commitNature / significance / security tag on stored rows (no text touched)
+  node generator/cli.mjs retry-failed <sha>... [--push]  # release named admitted rows with no generation (clears failure stubs, re-asks, publishes)
   node generator/cli.mjs prune-cache [--push]      # drop ai-summaries.json keys from retired prompt versions
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
   node generator/cli.mjs eval [--seed N] [--limit N]  # offline stored-artifact audit, zero provider calls
@@ -1719,6 +1721,67 @@ async function cmdRepairEntries (argv) {
       await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: doc }))
     }
     log(`[repair-entries] updated ${n} of ${doc.entries.length} rows`)
+  })
+  if (!acquired) log('another generate/backfill run holds the worktree lock: retry shortly')
+}
+
+/**
+ * Release named rows for one regeneration, then publish: the explicit way back
+ * for an admitted row the pipeline will never re-ask on its own (a failure stub
+ * parked before the classification was fixed, or a refusal recorded while the
+ * strong-model escape hatch was dead in CI). See releaseFailedRows for the
+ * guards that keep this from becoming a backfill tool.
+ *
+ * Run it where the relay runs, not on a workstation: the CLI auto-loads .env,
+ * so a local invocation spends real provider calls from this machine. The sync
+ * workflow dispatches it, with the promoted runtime and the relay's key.
+ *
+ * Release and regeneration happen in one process, which is what makes the fix
+ * survive a merge: the stubs are gone from the cache we write and the fresh
+ * record lands beside them, so the union mergeAiCache performs keeps the newer
+ * `at` instead of restoring the deleted keys.
+ */
+async function cmdRetryFailed (argv) {
+  const wants = argv.filter(a => !a.startsWith('--')).map(s => s.trim()).filter(Boolean)
+  if (!wants.length) throw new Error('usage: retry-failed <sha>... [--push]')
+  if (wants.length > 5) throw new Error(`retry-failed accepts at most 5 rows per run (got ${wants.length}): this is a release, not a backlog`)
+  const { acquired } = await withLock(LOCK, async () => {
+    const doc = await readJson(`${DATA}/changelog.json`, null)
+    if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
+    const cache = await readJson(`${DATA}/ai-summaries.json`, {})
+    const { picked, released, skipped, errors } = releaseFailedRows(doc.entries, cache, wants)
+    for (const line of skipped) log(`[retry-failed] ${line}`)
+    if (errors.length) throw new Error(`retry-failed: ${errors.join('; ')}`)
+    if (!picked.length) { log('[retry-failed] nothing to release'); return }
+    if (!llmConfigured()) throw new Error('retry-failed needs the LLM configured (CHANGELOG_LLM=1 and LLM_API_KEY): dispatch it through the sync workflow, where the relay key lives')
+    const shas = new Set(picked.map(e => e.sha))
+    log(`[retry-failed] releasing ${picked.length} row(s), ${released.length} failure stub${released.length === 1 ? '' : 's'} cleared: ${[...shas].map(s => s.slice(0, 8)).join(', ')}`)
+    // The deletion has to reach disk before the ask, for two reasons: the
+    // writer reads the cache from disk (our copy is invisible to its cooldown
+    // check), and persistMerged unions -- `mergeAiCache` restores any key disk
+    // still holds, so a purely in-memory release would be undone by our own
+    // write. Raw write, under the worktree lock, is the one form that sticks.
+    await writeJson(`${DATA}/ai-summaries.json`, cache)
+    await backfillDiffs(picked, picked.length)
+    let n = 0
+    await withDeadline(180000, async () => {
+      const env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(picked.length), LLM_DEADLINE_AT: String(deadlineAt()), LLM_CYCLE_BUDGET: { remaining: picked.length * 8 } }
+      n = await enrichWithLlm(doc.entries, llmPatchFor, DATA, env, { retryErrors: true, priorityShas: shas, only: shas, repoDir: REPO_DIR, getFullPatch: fullPatchFor })
+      if (n) await enrichEli5(doc.entries, DATA, env, { retryErrors: true, priorityShas: shas, only: shas, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
+    })
+    log(`[retry-failed] ${n} of ${picked.length} row(s) regenerated`)
+    if (!n) log('[retry-failed] the provider did not answer; the stubs are cleared, so the next relay cycle asks again')
+    if (argv.includes('--push')) {
+      await commitAndPushData({
+        message: `data: retry regeneration for ${[...shas].map(s => s.slice(0, 8)).join(', ')} (${utcStamp()} UTC)`,
+        overrides: { [`${DATA}/changelog.json`]: doc }
+      })
+    } else {
+      // Cache is already authoritative on disk; only the entry grafts are still
+      // in memory.
+      await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: doc }))
+      log('dry run: data written locally, not committed (pass --push)')
+    }
   })
   if (!acquired) log('another generate/backfill run holds the worktree lock: retry shortly')
 }

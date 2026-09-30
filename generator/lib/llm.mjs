@@ -3679,6 +3679,61 @@ export function enrichmentEligible (e, env = process.env) {
   return !noBackfill || e.enrichment?.policy === QUALITY_POLICY_V
 }
 
+/**
+ * Release named rows for one deliberate regeneration.
+ *
+ * A row can end up with no generation and no way back: a stub the provider (or
+ * our own cycle deadline, before that classification was fixed) recorded as a
+ * permanent failure, or a refusal the strong-model escape hatch never got to
+ * answer because it was dead in CI when the row was parked. Nothing in the
+ * pipeline un-parks one -- the prompt version, not a human, is what re-asks a
+ * row -- so there has to be an explicit way back.
+ *
+ * Deliberately not a backfill tool: every released row must not be noise and
+ * must have no generation to overwrite, and must be either admitted under the
+ * current policy (`enrichment.policy`, written only by forward enrichment) or
+ * already carrying a failure record under the current prompt version -- which
+ * only a row the pipeline actually asked can have, so a row that was never in
+ * scope stays out. Only cache records carrying `error` are deleted, so a
+ * summary that exists is never touched. The caller bounds how many rows may be
+ * named, which bounds the spend -- the cache is never a source of work here.
+ *
+ * Returns `{ picked, released, skipped, errors }`. A prefix that matches two
+ * rows, or a row that was never admitted, lands in `errors`: the caller refuses
+ * to run with any, rather than regenerating something the human did not name.
+ */
+export function releaseFailedRows (entries, cache, wants, { policy = QUALITY_POLICY_V } = {}) {
+  const picked = []
+  const released = []
+  const skipped = []
+  const errors = []
+  for (const raw of wants || []) {
+    const want = String(raw).trim()
+    if (!want) continue
+    const hits = (entries || []).filter(e => String(e?.sha || '').startsWith(want))
+    if (!hits.length) { errors.push(`no entry matches ${want}`); continue }
+    if (hits.length > 1) { errors.push(`${want} matches ${hits.length} entries; use a longer prefix`); continue }
+    const e = hits[0]
+    const short = String(e.sha).slice(0, 8)
+    if (e.noise) { errors.push(`${short} is a noise row and is never sent to the model`); continue }
+    if (e.ai?.title) { skipped.push(`${short} already has a generation: left alone`); continue }
+    const keys = Object.keys(cache || {}).filter(k => k.split(':')[0] === e.sha && cache[k]?.error)
+    // Admission can be missing from a row that was asked anyway (a lost record
+    // across merges), so proof of a prior ask under the current prompt version
+    // opens the same door: the pipeline has already spent on this row, which is
+    // the opposite of backfill. A never-asked historical row has neither.
+    const askedBefore = keys.some(k => k.includes(`:v${PROMPT_V}:`))
+    if (e.enrichment?.policy !== policy && !askedBefore) {
+      errors.push(`${short} was never admitted under policy ${policy} and has no current-prompt ask on record: releasing it would be backfill`)
+      continue
+    }
+    for (const k of keys) delete cache[k]
+    picked.push(e)
+    released.push(...keys)
+  }
+  return { picked, released, skipped, errors }
+}
+
 export async function enrichWithLlm (entries, getPatch, dataDir, env = process.env, options = {}) {
   if (!llmConfigured(env)) return 0
   const cachePath = `${dataDir}/ai-summaries.json`
@@ -3686,7 +3741,13 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   // Rows the writer queue may touch. A verdict recorded under older verifier
   // framing is handled by the re-check pass instead, which replaces no text, so
   // a cache of nothing but framed-out rows must not end the run before it runs.
-  const targets = entries.filter(e => enrichmentEligible(e, env))
+  // A named release (retry-failed) asks only for the rows it names: the full
+  // entry list still supplies release windows, sequence and glossary to those
+  // rows, but nothing outside the set may be written, healed or re-checked on
+  // this run's budget. Unscoped runs pass no set and behave as before.
+  const only = options.only instanceof Set ? options.only : null
+  const inScope = (e) => !only || !!e && only.has(e.sha)
+  const targets = entries.filter(e => enrichmentEligible(e, env) && inScope(e))
   const framedOut = Object.values(cache).some(rec => rec && !rec.error && rec.verifyPolicy !== VERIFY_POLICY_V &&
     ['flagged', 'stale', 'unavailable'].includes(qualityOf({ ai: rec }).verify))
   if (!targets.length && !framedOut) return 0
@@ -3803,7 +3864,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
 
   const recoveryPending = Object.entries(cache).some(([k, rec]) => {
     const e = entries[posIndex.get(k.split(':')[0])]
-    return e && enrichmentEligible(e, env) && !e.noise && (reverifyEligible(rec) || healEligible(rec))
+    return e && inScope(e) && enrichmentEligible(e, env) && !e.noise && (reverifyEligible(rec) || healEligible(rec))
   })
   const freshLimit = recoveryPending && Number.isFinite(limit) && limit > 1 ? limit - 1 : limit
   const queue = []
@@ -3874,7 +3935,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       const sha = String(k.split(':')[0])
       if (seenSha.has(sha)) continue
       const e = entries[posIndex.get(sha)]
-      if (!e || !enrichmentEligible(e, env) || e.noise || gaveUp({ ...e, ai: rec })) continue
+      if (!e || !inScope(e) || !enrichmentEligible(e, env) || e.noise || gaveUp({ ...e, ai: rec })) continue
       const prMeta = findPrMeta(e, prIndex)
       const cf = contextFingerprint(prMeta, glossary)
       const stale = !!rec.cf && rec.cf !== cf
@@ -3927,7 +3988,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       const sha = String(k.split(':')[0])
       if (ownedSha.has(sha)) continue
       const e = entries[posIndex.get(sha)]
-      if (!e || e.noise || gaveUp({ ...e, ai: rec })) continue
+      if (!e || !inScope(e) || e.noise || gaveUp({ ...e, ai: rec })) continue
       // A verdict recorded under older verifier framing is re-read even though the
       // no-backfill gate keeps its row out of the writer queue: this pass calls no
       // writer and replaces no text, it only re-asks whether the shipped text
@@ -4785,7 +4846,10 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   // since (predecessors summarized late) re-queues on its own.
   let templated = 0
   const useTemplates = env.CHANGELOG_ELI5_TEMPLATES !== '0'
-  const pending = entries.filter(e => enrichmentEligible(e, env)).filter(eli5Eligible).filter(e => {
+  // Same rule as the summary pass: a named release writes only the rows it
+  // names (the full list still supplies same-day titles and release windows).
+  const only = options.only instanceof Set ? options.only : null
+  const pending = entries.filter(e => enrichmentEligible(e, env) && (!only || only.has(e.sha))).filter(eli5Eligible).filter(e => {
     const hit = bumpOnly(e) ? releaseOf(e) : null
     if (eli5Done(e, hit?.text || '', hit ? RELEASE_ROLLUP_V : 0)) {
       const plain = e.eli5

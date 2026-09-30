@@ -1,9 +1,9 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, chargeReverify, callUnanswered, callLlm, VERIFY_POLICY_V } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, chargeReverify, callUnanswered, callLlm, VERIFY_POLICY_V, releaseFailedRows } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -238,6 +238,73 @@ test('error cooldown: old failures retry after cooldown', async (t) => {
   } finally {
     globalThis.fetch = origFetch
   }
+})
+
+test('retry-failed release: admitted, generation-less rows only, and only failure stubs go', () => {
+  const ok = (sha) => ({ sha, date: '2026-09-30T10:00:00Z', enrichment: { policy: 1 } })
+  const entries = [
+    ok('a'.repeat(40)),                                             // parked: two stubs, no text
+    { ...ok('b'.repeat(40)), ai: { title: 'Has one', summary: 's' } }, // has a generation
+    { sha: 'c'.repeat(40), date: '2026-09-30T10:00:00Z' },           // never admitted
+    { sha: 'd'.repeat(40), date: '2026-09-30T10:00:00Z', noise: true, enrichment: { policy: 1 } },
+    ok('e'.repeat(40)),                                             // admitted, no text, no stub
+    { sha: 'g'.repeat(40), date: '2026-09-29T10:00:00Z' },           // admission record lost, but asked under v11
+    { sha: 'h'.repeat(40), date: '2026-09-01T10:00:00Z' },           // never admitted, only a retired-version ask
+    ok('abc'.padEnd(40, '0')), ok('abc'.padEnd(40, '1'))            // ambiguous prefix
+  ]
+  const cache = {
+    [`${'a'.repeat(40)}:v${PROMPT_V}:k1`]: { error: 'LLM HTTP 504', at: '2026-09-30T10:00:00Z' },
+    [`${'a'.repeat(40)}:v${PROMPT_V}:k2`]: { error: 'cycle deadline exceeded', deterministic: true, at: '2026-09-30T11:00:00Z' },
+    [`${'b'.repeat(40)}:v${PROMPT_V}:k1`]: { title: 'Kept', summary: 'kept' },
+    [`${'e'.repeat(40)}:v${PROMPT_V}:k1`]: { title: 'Exists but no e.ai' },
+    [`${'g'.repeat(40)}:v${PROMPT_V}:k1`]: { error: 'LLM refused the request on every ask (deterministic content failure): LLM returned no JSON', deterministic: true, attempts: 2, at: '2026-09-29T21:09:47.761Z' },
+    [`${'g'.repeat(40)}:v10:k1`]: { error: 'retired-version stub of a released row', at: '2026-09-01T10:00:00Z' },
+    [`${'h'.repeat(40)}:v10:k1`]: { error: 'asked only under a retired prompt', at: '2026-09-01T10:00:00Z' }
+  }
+  const { picked, released, skipped, errors } = releaseFailedRows(entries, cache, ['a'.repeat(40), 'b'.repeat(40), 'c'.repeat(40), 'd'.repeat(40), 'e'.repeat(40), 'g'.repeat(40), 'h'.repeat(40), 'abc', 'ff'.repeat(20)])
+  assert.deepEqual(picked.map(e => e.sha), ['a'.repeat(40), 'e'.repeat(40), 'g'.repeat(40)], 'rows with no generation are released: admitted, and one whose admission was lost but was asked under the current prompt')
+  assert.equal(released.length, 4, 'a release clears every failure stub of the rows it names')
+  assert.ok(released.filter(k => k.startsWith('a'.repeat(40))).length === 2, 'the parked row’s two stubs are among them')
+  assert.ok(released.includes(`${'g'.repeat(40)}:v${PROMPT_V}:k1`), 'the prior-ask proof releases its row')
+  assert.equal(cache[`${'h'.repeat(40)}:v10:k1`].error, 'asked only under a retired prompt', 'a retired-version ask is not proof of a current-prompt ask, so that row stays out')
+  assert.ok(skipped.some(s => s.startsWith('b'.repeat(40).slice(0, 8))), 'a row with a generation is reported, not regenerated')
+  assert.equal(errors.length, 5, 'never-asked, noise, never-asked-under-current-prompt, ambiguous and unmatched each refuse')
+  assert.match(errors[0], /never admitted/)
+  assert.match(errors[1], /noise row/)
+  assert.match(errors[2], /no current-prompt ask on record/)
+  assert.match(errors[3], /matches 2 entries/)
+  assert.match(errors[4], /no entry matches/)
+  assert.equal(cache[`${'a'.repeat(40)}:v${PROMPT_V}:k1`], undefined, 'stubs are deleted in place so the re-ask is not cooled down')
+  assert.equal(cache[`${'b'.repeat(40)}:v${PROMPT_V}:k1`].title, 'Kept', 'an existing record is never deleted')
+  assert.equal(cache[`${'e'.repeat(40)}:v${PROMPT_V}:k1`].title, 'Exists but no e.ai', 'a non-error record is left alone')
+  const ambiguous = releaseFailedRows(entries, cache, ['abc'])
+  assert.equal(ambiguous.picked.length, 0)
+  assert.match(ambiguous.errors[0], /matches 2 entries/)
+})
+
+test('retry-failed scope: a named release writes only the rows it names', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-only-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const patch = 'diff --git a/x b/x\n+export const ALPHA = 1\n'
+  const wanted = { kind: 'sync', sha: '1'.repeat(40), date: '2026-09-30T10:00:00Z', areas: ['CLI'], summary: 'Adds a gate.', enrichment: { policy: 1 } }
+  const neighbour = { kind: 'sync', sha: '2'.repeat(40), date: '2026-09-29T10:00:00Z', areas: ['CLI'], summary: 'Something else.', enrichment: { policy: 1 } }
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_VERIFY: '0', CHANGELOG_LLM_HEAL: '0', CHANGELOG_LLM_REVERIFY: '0' }
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async () => {
+    const envelope = JSON.stringify({ choices: [{ message: { content: JSON.stringify({ evidence: 'x b/x holds it.', title: 'Alpha gate added', summary: 'Adds `ALPHA` in x b/x.', significance: 'minor', audience: 'end-users', confidence: 'high' }) } }] })
+    return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
+  }
+  try {
+    const n = await enrichWithLlm([wanted, neighbour], async () => patch, dir, env, { only: new Set([wanted.sha]) })
+    assert.equal(n, 1, 'the named row is written')
+    assert.equal(wanted.ai?.title, 'Alpha gate added')
+    assert.equal(neighbour.ai, undefined, 'the neighbour, though admitted, is untouched')
+  } finally {
+    globalThis.fetch = origFetch
+  }
+  const cache = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+  assert.ok(Object.keys(cache).some(k => k.startsWith('1'.repeat(40))), 'the named row is cached')
+  assert.ok(!Object.keys(cache).some(k => k.startsWith('2'.repeat(40))), 'and the neighbour never reached the provider')
 })
 
 test('heal policy: dirt counts every shipped objection, eligibility is bounded and cooled down', () => {
