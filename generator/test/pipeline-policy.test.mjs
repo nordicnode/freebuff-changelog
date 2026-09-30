@@ -8,7 +8,8 @@ import {
   summarizeEntry, explainEntry, deliveredEvidence, buildPrompt, cacheKey,
   contextFingerprint, callLlm, llmCallCount, PROMPT_V, DEFAULT_VERIFY_MODEL,
   LLM_CONTEXT_TOKENS, rememberClosedPrs, matchPrByPaths, prSummaryKey,
-  pruneExpiredErrors, gatherEntryContext
+  pruneExpiredErrors, gatherEntryContext, collectReleaseContext, formatReleaseContext,
+  buildVerifyPrompt
 } from '../lib/llm.mjs'
 import { artifactHash, qualityOf, qualityText, qualityNote, qualityStatus, dedupeClaims, QUALITY_POLICY_V } from '../lib/quality.mjs'
 import { mergeChangelog, mergeOpenPrs, mergeHealth, persistMerged } from '../lib/mergedata.mjs'
@@ -173,6 +174,58 @@ test('R6: overlapping objections collapse and long lists are cut to a readable b
   const body = html.slice(html.indexOf('<div class="evidence-body">'))
   assert.ok(body.includes('y'.repeat(300)), 'every objection is in the Evidence block, in full')
   assert.ok(body.includes('objection 5'), 'including the ones the card used to leave out')
+})
+
+test('R8: a release roll-up is checked against its window, not the bump diff', async t => {
+  const mk = (sha, over = {}) => ({
+    sha, date: '2026-09-30T00:00:00Z', day: '2026-09-30', kind: 'sync', significance: 'notable', category: 'CLI',
+    files: { total: 1, meaningful: 1, added: [], removed: [], modified: ['cli/src/utils/client-environment.ts'] },
+    stats: { additions: 4, deletions: 1 }, ...over
+  })
+  const member = mk('d'.repeat(40), { ai: { title: 'Ad metadata', summary: 'Ad and run requests now carry the terminal descriptor.', verify: 'passed' } })
+  const unchecked = mk('e'.repeat(40), { ai: { title: 'Unchecked history', summary: 'An older change with no verdict recorded.' } })
+  const flagged = mk('f'.repeat(40), { ai: { title: 'Flagged', summary: 'Its claims were objected to.', verify: 'flagged' } })
+  const bump = mk('a'.repeat(40), { version: '0.2.1', files: { total: 1, meaningful: 1, added: [], removed: [], modified: ['package.json'] }, stats: { additions: 1, deletions: 1 } })
+  const ctx = collectReleaseContext([member, unchecked, flagged, bump], bump)
+  const text = formatReleaseContext(ctx, bump)
+  // The window is the roll-up's evidence: a member that was never checked is
+  // history to describe, while one a check discredited stays out.
+  assert.ok(text.includes('Ad metadata'), 'a verified member is listed')
+  assert.ok(text.includes('Unchecked history'), 'never-checked history is not dropped from the window')
+  assert.ok(!text.includes('Flagged'), 'a discredited member is still excluded')
+  assert.equal(ctx.dropped, 1)
+  assert.ok(text.includes('client-environment.ts'), 'and each line names the files that change touched')
+
+  // A roll-up is framed as one, so the verifier is not asked to find shipped
+  // features inside a package.json hunk.
+  const patch = 'diff --git a/package.json b/package.json\n-  "version": "0.2.0"\n+  "version": "0.2.1"\n'
+  const clean = { title: 'Freebuff release 0.2.1', summary: 'This release adds ad metadata.' }
+  const rollupPrompt = buildVerifyPrompt(bump, text, clean, [], { rollup: true })
+  assert.match(rollupPrompt, /release roll-up/, 'the framing names the row kind')
+  assert.match(rollupPrompt, /Release window \(the changes this release shipped\)/)
+  assert.match(rollupPrompt, /Ad metadata/, 'the window is the evidence it checks against')
+  assert.ok(!/against the diff it describes/.test(rollupPrompt), 'and it is not told to judge the bump diff')
+  const plainPrompt = buildVerifyPrompt(bump, patch, clean)
+  assert.match(plainPrompt, /against the diff it describes/, 'ordinary rows keep the diff framing')
+  assert.ok(!/release roll-up/.test(plainPrompt))
+
+  // End to end: the verifier the writer actually calls sees that window.
+  const dir = await temp(t)
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const p = JSON.parse(init.body).messages.at(-1).content
+    if (/You are checking/.test(p)) {
+      seen.push(p)
+      // Cover every published sentence, or the verdict is incomplete and the row
+      // is flagged with a repair loop instead of passing once.
+      return response({ supported: true, issues: [], claims: [{ quote: 'Freebuff release 0.2.1', supported: true }, { quote: 'This release adds ad metadata.', supported: true }] })
+    }
+    return response({ title: 'Freebuff release 0.2.1', summary: 'This release adds ad metadata.', significance: 'major', confidence: 'high' })
+  })
+  await summarizeEntry({ entry: bump, patch, relText: text, env, dir })
+  assert.equal(seen.length, 1, 'the row was verified once')
+  assert.match(seen[0], /release roll-up/)
+  assert.match(seen[0], /Ad metadata/, 'the member list is in the verifier material')
 })
 
 test('R12/R20: instruction examples and rejected replies cannot authorize names', () => {
