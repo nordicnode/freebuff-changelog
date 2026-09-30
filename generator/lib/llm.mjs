@@ -3699,8 +3699,18 @@ export function enrichmentEligible (e, env = process.env) {
  * named, which bounds the spend -- the cache is never a source of work here.
  *
  * Returns `{ picked, released, skipped, errors }`. A prefix that matches two
- * rows, or a row that was never admitted, lands in `errors`: the caller refuses
- * to run with any, rather than regenerating something the human did not name.
+ * rows, or a row that has neither admission nor an ask on record, lands in
+ * `errors`: the caller reports those names rather than regenerating something
+ * the human did not name, but the rows that did pass are still released -- one
+ * stranded name must not hold the healthy ones hostage.
+ *
+ * `admit` is the single deliberate override, for the row that is neither: it
+ * exists because our own first release consumed the only proof (deleting the
+ * stub *was* the release), leaving a row that was genuinely asked and genuinely
+ * freed with nothing to show for it. It still refuses noise and any row that
+ * already has a generation, and the caller's cap on names still bounds the
+ * spend: it is an admission decided by a named, logged request, not something a
+ * scan can reach.
  *
  * A released row is also stamped admitted when its record was lost, because the
  * writer's own gate reads `enrichment.policy`: releasing a row and then having
@@ -3708,7 +3718,7 @@ export function enrichmentEligible (e, env = process.env) {
  * admission decision, durable and visible on the row, reachable only by naming
  * it -- never by a scan.
  */
-export function releaseFailedRows (entries, cache, wants, { policy = QUALITY_POLICY_V, now = Date.now() } = {}) {
+export function releaseFailedRows (entries, cache, wants, { policy = QUALITY_POLICY_V, now = Date.now(), admit = false } = {}) {
   const picked = []
   const released = []
   const skipped = []
@@ -3729,12 +3739,14 @@ export function releaseFailedRows (entries, cache, wants, { policy = QUALITY_POL
     // opens the same door: the pipeline has already spent on this row, which is
     // the opposite of backfill. A never-asked historical row has neither.
     const askedBefore = keys.some(k => k.includes(`:v${PROMPT_V}:`))
-    if (e.enrichment?.policy !== policy && !askedBefore) {
-      errors.push(`${short} was never admitted under policy ${policy} and has no current-prompt ask on record: releasing it would be backfill`)
+    if (e.enrichment?.policy !== policy && !askedBefore && !admit) {
+      errors.push(`${short} was never admitted under policy ${policy} and has no current-prompt ask on record: releasing it would be backfill (re-run with --admit to decide this row by name)`)
       continue
     }
     if (e.enrichment?.policy !== policy) {
-      e.enrichment = { policy, admittedAt: new Date(now).toISOString() }
+      // `released: true` is the audit trail: a row admitted here was admitted
+      // by a named request, not by being observed at the head.
+      e.enrichment = { policy, admittedAt: new Date(now).toISOString(), released: true }
     }
     for (const k of keys) delete cache[k]
     picked.push(e)

@@ -1685,7 +1685,7 @@ if (IS_MAIN) {
   node generator/cli.mjs freshness [--max-age-min N]  # CI gate: fail if data/changelog.json is staler than the site's own [stale] threshold (2x the sync budget)
   node generator/cli.mjs enrich-all              # disabled: no historical API spending
   node generator/cli.mjs repair-entries [--push]   # recompute commitNature / significance / security tag on stored rows (no text touched)
-  node generator/cli.mjs retry-failed <sha>... [--push]  # release named admitted rows with no generation (clears failure stubs, re-asks, publishes)
+  node generator/cli.mjs retry-failed <sha>... [--admit] [--push]  # release named rows with no generation (clears stubs, re-asks, publishes; --admit decides a row that has neither admission nor an ask on record)
   node generator/cli.mjs prune-cache [--push]      # drop ai-summaries.json keys from retired prompt versions
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
   node generator/cli.mjs eval [--seed N] [--limit N]  # offline stored-artifact audit, zero provider calls
@@ -1743,16 +1743,24 @@ async function cmdRepairEntries (argv) {
  */
 async function cmdRetryFailed (argv) {
   const wants = argv.filter(a => !a.startsWith('--')).map(s => s.trim()).filter(Boolean)
-  if (!wants.length) throw new Error('usage: retry-failed <sha>... [--push]')
+  const admit = argv.includes('--admit')
+  if (!wants.length) throw new Error('usage: retry-failed <sha>... [--admit] [--push]')
   if (wants.length > 5) throw new Error(`retry-failed accepts at most 5 rows per run (got ${wants.length}): this is a release, not a backlog`)
   const { acquired } = await withLock(LOCK, async () => {
     const doc = await readJson(`${DATA}/changelog.json`, null)
     if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
     const cache = await readJson(`${DATA}/ai-summaries.json`, {})
-    const { picked, released, skipped, errors } = releaseFailedRows(doc.entries, cache, wants)
+    const { picked, released, skipped, errors } = releaseFailedRows(doc.entries, cache, wants, { admit })
     for (const line of skipped) log(`[retry-failed] ${line}`)
-    if (errors.length) throw new Error(`retry-failed: ${errors.join('; ')}`)
-    if (!picked.length) { log('[retry-failed] nothing to release'); return }
+    // Reported, not fatal yet: the names that passed still get released. One
+    // refused name aborting the batch would leave healthy rows unregenerated
+    // behind it -- the batch fails at the end instead, loudly, after the work.
+    for (const err of errors) log(`[retry-failed] REFUSED: ${err}`)
+    if (!picked.length) {
+      if (errors.length) throw new Error(`retry-failed: ${errors.join('; ')}`)
+      log('[retry-failed] nothing to release')
+      return
+    }
     if (!llmConfigured()) throw new Error('retry-failed needs the LLM configured (CHANGELOG_LLM=1 and LLM_API_KEY): dispatch it through the sync workflow, where the relay key lives')
     const shas = new Set(picked.map(e => e.sha))
     log(`[retry-failed] releasing ${picked.length} row(s), ${released.length} failure stub${released.length === 1 ? '' : 's'} cleared: ${[...shas].map(s => s.slice(0, 8)).join(', ')}`)
@@ -1805,6 +1813,9 @@ async function cmdRetryFailed (argv) {
       await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: doc }))
       log('dry run: data written locally, not committed (pass --push)')
     }
+    // After the publish, on purpose: a refused name must not undo the releases
+    // that did happen, but the run still has to end red so the refusal is seen.
+    if (errors.length) throw new Error(`retry-failed: released ${picked.length}, refused ${errors.length}: ${errors.join('; ')}`)
   })
   if (!acquired) log('another generate/backfill run holds the worktree lock: retry shortly')
 }

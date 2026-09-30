@@ -263,7 +263,7 @@ test('retry-failed release: admitted, generation-less rows only, and only failur
   }
   const { picked, released, skipped, errors } = releaseFailedRows(entries, cache, ['a'.repeat(40), 'b'.repeat(40), 'c'.repeat(40), 'd'.repeat(40), 'e'.repeat(40), 'g'.repeat(40), 'h'.repeat(40), 'abc', 'ff'.repeat(20)], { now: new Date('2026-09-30T20:00:00Z') })
   assert.deepEqual(picked.map(e => e.sha), ['a'.repeat(40), 'e'.repeat(40), 'g'.repeat(40)], 'rows with no generation are released: admitted, and one whose admission was lost but was asked under the current prompt')
-  assert.deepEqual(entries[5].enrichment, { policy: 1, admittedAt: '2026-09-30T20:00:00.000Z' }, 'a released row is stamped admitted, or the writer\'s own gate would skip the row the release just freed')
+  assert.deepEqual(entries[5].enrichment, { policy: 1, admittedAt: '2026-09-30T20:00:00.000Z', released: true }, 'a released row is stamped admitted, or the writer\'s own gate would skip the row the release just freed')
   assert.deepEqual(entries[0].enrichment, { policy: 1 }, 'an admitted row keeps its own record')
   assert.equal(released.length, 4, 'a release clears every failure stub of the rows it names')
   assert.ok(released.filter(k => k.startsWith('a'.repeat(40))).length === 2, 'the parked row’s two stubs are among them')
@@ -282,6 +282,24 @@ test('retry-failed release: admitted, generation-less rows only, and only failur
   const ambiguous = releaseFailedRows(entries, cache, ['abc'])
   assert.equal(ambiguous.picked.length, 0)
   assert.match(ambiguous.errors[0], /matches 2 entries/)
+
+  // The row that is neither: no admission, and no ask on record because our
+  // own earlier release deleted the stub that was the proof. Refused by
+  // default; --admit is the named decision that admits it.
+  const stranded = { sha: '9'.repeat(40), date: '2026-09-29T20:08:35Z' }
+  const strandedCache = {}
+  const refused = releaseFailedRows([stranded], strandedCache, ['9'.repeat(40)], { now: new Date('2026-09-30T20:00:00Z') })
+  assert.equal(refused.picked.length, 0)
+  assert.match(refused.errors[0], /would be backfill/)
+  assert.match(refused.errors[0], /--admit/, 'the refusal names the way to decide it')
+  const admitted = releaseFailedRows([stranded], strandedCache, ['9'.repeat(40)], { now: new Date('2026-09-30T20:00:00Z'), admit: true })
+  assert.equal(admitted.picked.length, 1, 'a named --admit releases it')
+  assert.deepEqual(stranded.enrichment, { policy: 1, admittedAt: '2026-09-30T20:00:00.000Z', released: true })
+  // --admit widens one gate only: noise and existing text still refuse.
+  const noisy = releaseFailedRows([{ sha: '7'.repeat(40), date: '2026-09-29T20:08:35Z', noise: true }, { sha: '8'.repeat(40), date: '2026-09-29T20:08:35Z', ai: { title: 'Has one' } }], {}, ['7'.repeat(40), '8'.repeat(40)], { admit: true })
+  assert.equal(noisy.picked.length, 0)
+  assert.equal(noisy.errors.length, 1)
+  assert.equal(noisy.skipped.length, 1)
 })
 
 test('retry-failed scope: a named release writes only the rows it names', async (t) => {
