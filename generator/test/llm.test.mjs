@@ -261,8 +261,10 @@ test('retry-failed release: admitted, generation-less rows only, and only failur
     [`${'g'.repeat(40)}:v10:k1`]: { error: 'retired-version stub of a released row', at: '2026-09-01T10:00:00Z' },
     [`${'h'.repeat(40)}:v10:k1`]: { error: 'asked only under a retired prompt', at: '2026-09-01T10:00:00Z' }
   }
-  const { picked, released, skipped, errors } = releaseFailedRows(entries, cache, ['a'.repeat(40), 'b'.repeat(40), 'c'.repeat(40), 'd'.repeat(40), 'e'.repeat(40), 'g'.repeat(40), 'h'.repeat(40), 'abc', 'ff'.repeat(20)])
+  const { picked, released, skipped, errors } = releaseFailedRows(entries, cache, ['a'.repeat(40), 'b'.repeat(40), 'c'.repeat(40), 'd'.repeat(40), 'e'.repeat(40), 'g'.repeat(40), 'h'.repeat(40), 'abc', 'ff'.repeat(20)], { now: new Date('2026-09-30T20:00:00Z') })
   assert.deepEqual(picked.map(e => e.sha), ['a'.repeat(40), 'e'.repeat(40), 'g'.repeat(40)], 'rows with no generation are released: admitted, and one whose admission was lost but was asked under the current prompt')
+  assert.deepEqual(entries[5].enrichment, { policy: 1, admittedAt: '2026-09-30T20:00:00.000Z' }, 'a released row is stamped admitted, or the writer\'s own gate would skip the row the release just freed')
+  assert.deepEqual(entries[0].enrichment, { policy: 1 }, 'an admitted row keeps its own record')
   assert.equal(released.length, 4, 'a release clears every failure stub of the rows it names')
   assert.ok(released.filter(k => k.startsWith('a'.repeat(40))).length === 2, 'the parked row’s two stubs are among them')
   assert.ok(released.includes(`${'g'.repeat(40)}:v${PROMPT_V}:k1`), 'the prior-ask proof releases its row')

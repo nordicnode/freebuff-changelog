@@ -3701,8 +3701,14 @@ export function enrichmentEligible (e, env = process.env) {
  * Returns `{ picked, released, skipped, errors }`. A prefix that matches two
  * rows, or a row that was never admitted, lands in `errors`: the caller refuses
  * to run with any, rather than regenerating something the human did not name.
+ *
+ * A released row is also stamped admitted when its record was lost, because the
+ * writer's own gate reads `enrichment.policy`: releasing a row and then having
+ * the queue skip it would be a no-op dressed as a release. The stamp is the
+ * admission decision, durable and visible on the row, reachable only by naming
+ * it -- never by a scan.
  */
-export function releaseFailedRows (entries, cache, wants, { policy = QUALITY_POLICY_V } = {}) {
+export function releaseFailedRows (entries, cache, wants, { policy = QUALITY_POLICY_V, now = Date.now() } = {}) {
   const picked = []
   const released = []
   const skipped = []
@@ -3726,6 +3732,9 @@ export function releaseFailedRows (entries, cache, wants, { policy = QUALITY_POL
     if (e.enrichment?.policy !== policy && !askedBefore) {
       errors.push(`${short} was never admitted under policy ${policy} and has no current-prompt ask on record: releasing it would be backfill`)
       continue
+    }
+    if (e.enrichment?.policy !== policy) {
+      e.enrichment = { policy, admittedAt: new Date(now).toISOString() }
     }
     for (const k of keys) delete cache[k]
     picked.push(e)

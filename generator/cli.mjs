@@ -15,7 +15,7 @@ import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
   extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
-import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows } from './lib/llm.mjs'
+import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows } from './lib/llm.mjs'
 import { QUALITY_POLICY_V } from './lib/quality.mjs'
 import { shortHash, eli5Source } from './lib/util.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
@@ -1762,15 +1762,38 @@ async function cmdRetryFailed (argv) {
     // still holds, so a purely in-memory release would be undone by our own
     // write. Raw write, under the worktree lock, is the one form that sticks.
     await writeJson(`${DATA}/ai-summaries.json`, cache)
+    // The patch extractor reads the clone, and the clone is restored from an
+    // immutable cache baseline that only the sync loop ever fetches. Without
+    // this fetch the rows can be released, admitted and queued and still hand
+    // the writer an empty patch, which it skips without a call -- so the
+    // release reads as a provider silence it never was.
+    try { await ensureRepo() } catch (err) { log(`[retry-failed] upstream fetch failed: ${err.message.slice(0, 120)}; extracting from the clone as it stands`) }
     await backfillDiffs(picked, picked.length)
+    // Name any row whose patch cannot be extracted (absent from the clone, or a
+    // change that is pure lockfile) instead of letting the queue skip it
+    // silently: a release that asks nothing has to say why.
+    const askable = []
+    for (const e of picked) {
+      const patch = await llmPatchFor(e).catch(() => '')
+      if (patch) askable.push(e)
+      else log(`[retry-failed] ${e.sha.slice(0, 8)}: no extractable patch -- not asking`)
+    }
     let n = 0
-    await withDeadline(180000, async () => {
-      const env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(picked.length), LLM_DEADLINE_AT: String(deadlineAt()), LLM_CYCLE_BUDGET: { remaining: picked.length * 8 } }
-      n = await enrichWithLlm(doc.entries, llmPatchFor, DATA, env, { retryErrors: true, priorityShas: shas, only: shas, repoDir: REPO_DIR, getFullPatch: fullPatchFor })
-      if (n) await enrichEli5(doc.entries, DATA, env, { retryErrors: true, priorityShas: shas, only: shas, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
-    })
-    log(`[retry-failed] ${n} of ${picked.length} row(s) regenerated`)
-    if (!n) log('[retry-failed] the provider did not answer; the stubs are cleared, so the next relay cycle asks again')
+    let asked = 0
+    if (askable.length) {
+      const only = new Set(askable.map(e => e.sha))
+      await withDeadline(180000, async () => {
+        const env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(askable.length), LLM_DEADLINE_AT: String(deadlineAt()), LLM_CYCLE_BUDGET: { remaining: askable.length * 8 } }
+        const before = llmCallCount()
+        n = await enrichWithLlm(doc.entries, llmPatchFor, DATA, env, { retryErrors: true, priorityShas: only, only, repoDir: REPO_DIR, getFullPatch: fullPatchFor })
+        asked = llmCallCount() - before
+        if (n) await enrichEli5(doc.entries, DATA, env, { retryErrors: true, priorityShas: only, only, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
+      })
+      log(`[retry-failed] ${n} of ${askable.length} row(s) written after ${asked} call(s)`)
+      if (!n) log(asked ? '[retry-failed] the provider did not answer; the stubs are cleared, so the next relay cycle asks again' : '[retry-failed] no call was sent: nothing was eligible to ask')
+    } else {
+      log('[retry-failed] no row was askable; the release is still published so the next cycle can try')
+    }
     if (argv.includes('--push')) {
       await commitAndPushData({
         message: `data: retry regeneration for ${[...shas].map(s => s.slice(0, 8)).join(', ')} (${utcStamp()} UTC)`,
