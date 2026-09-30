@@ -63,6 +63,36 @@ test('mergeChangelog is commutative (commit order cannot lose data)', () => {
   assert.equal(norm(mergeChangelog(ours, disk)), norm(mergeChangelog(disk, ours)))
 })
 
+test('mergeChangelog never drops an admission record, whichever side wins', () => {
+  const admitted = { policy: 1, admittedAt: '2026-09-30T19:01:32.293Z', released: true }
+  // Equal generatedAt means the tiebreak is the lexicographic stableJson, and
+  // the added `enrichment` key sorts before the entry's later keys -- so the
+  // stamped copy is the SMALLER document and loses. That is the exact shape
+  // that stranded a released row: stamped, written, and unadmitted one write
+  // later, invisible to the writer's own gate.
+  const stamped = doc('2026-09-30T21:26:28.664Z', 'h', [{ ...entry('a', '2026-09-30T20:08:35Z'), enrichment: admitted }])
+  const bare = doc('2026-09-30T21:26:28.664Z', 'h', [entry('a', '2026-09-30T20:08:35Z')])
+  assert.deepEqual(mergeChangelog(stamped, bare).entries[0].enrichment, admitted, 'kept when we are base')
+  assert.deepEqual(mergeChangelog(bare, stamped).entries[0].enrichment, admitted, 'kept when disk is base')
+
+  // A genuinely newer document on the other side must not lose it either: the
+  // newer copy wins the scalars, not the admission.
+  const newer = doc('2026-09-30T22:00:00.000Z', 'h2', [entry('a', '2026-09-30T20:08:35Z')])
+  assert.deepEqual(mergeChangelog(stamped, newer).entries[0].enrichment, admitted)
+  assert.deepEqual(mergeChangelog(newer, stamped).entries[0].enrichment, admitted)
+
+  // Both admitted: the first admission is the truthful one, in both directions.
+  const earlier = { policy: 1, admittedAt: '2026-09-30T18:00:00.000Z' }
+  const later = { policy: 1, admittedAt: '2026-09-30T19:01:32.293Z' }
+  const x = doc('2026-09-30T21:00:00.000Z', 'h', [{ ...entry('a', 'd1'), enrichment: earlier }])
+  const y = doc('2026-09-30T22:00:00.000Z', 'h2', [{ ...entry('a', 'd1'), enrichment: later }])
+  assert.deepEqual(mergeChangelog(x, y).entries[0].enrichment, earlier)
+  assert.deepEqual(mergeChangelog(y, x).entries[0].enrichment, earlier)
+
+  // Unadmitted stays unadmitted: the union adds, it never invents.
+  assert.equal(mergeChangelog(bare, newer).entries[0].enrichment, undefined)
+})
+
 test('mergeChangelog prefers a higher prompt version, never an empty stub', () => {
   const ours = doc('2026-09-14T14:00:00.000Z', 'h2', [entry('a', 'd1', { v: 5, title: 'new', summary: 'new prompt' })])
   const disk = doc('2026-09-14T13:00:00.000Z', 'h1', [entry('a', 'd1', { v: 3, title: 'old', summary: 'old prompt' })])

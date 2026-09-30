@@ -82,6 +82,24 @@ export function mergeChangelog (ours, theirs) {
       cur.ai = mine
       grafted++
     }
+    // Admission is durable (README): written once, forward, by the pass that
+    // observed the row, and neither direction of this merge may drop it. `ai`
+    // and `eli5` are unioned above for exactly that reason; `enrichment` was
+    // not, so whichever document won the generatedAt/stableJson tiebreak set
+    // the admission for both -- a writer that stamped a released row lost it on
+    // its own next write (equal generatedAt, and the added key sorts before
+    // `files`, so the stamped copy was the lexicographically smaller one), and
+    // the row came back released but unadmitted, invisible to the writer's gate.
+    const otherAdmission = e.enrichment?.policy !== undefined ? e.enrichment : null
+    if (otherAdmission && cur.enrichment?.policy === undefined) {
+      cur.enrichment = otherAdmission
+    } else if (otherAdmission && cur.enrichment?.policy !== undefined) {
+      // Both admitted: the first admission is the truthful one, and a stable
+      // tiebreak keeps this commutative when the timestamps match.
+      const a = Date.parse(cur.enrichment.admittedAt || '') || Infinity
+      const b = Date.parse(otherAdmission.admittedAt || '') || Infinity
+      if (b < a || (b === a && stableJson(otherAdmission) > stableJson(cur.enrichment))) cur.enrichment = otherAdmission
+    }
     // ...and its plain-English line has to follow whatever summary ended up here.
     const kept = pickEli5(cur.eli5, e.eli5, cur)
     if (kept && kept !== cur.eli5) cur.eli5 = kept
