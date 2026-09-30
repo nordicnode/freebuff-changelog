@@ -1,0 +1,1375 @@
+diff --git a/cli/src/commands/__tests__/byok.test.ts b/cli/src/commands/__tests__/byok.test.ts
+index 51dc970e1..bd5516fbf 100644
+--- a/cli/src/commands/__tests__/byok.test.ts
++++ b/cli/src/commands/__tests__/byok.test.ts
+@@ -1,28 +1,34 @@
+-import { afterEach, describe, expect, mock, test } from 'bun:test'
++import fs from 'fs'
++import os from 'os'
++import path from 'path'
++
++import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test'
+ 
+ import { enterByokSetup, handleByokCommand } from '../byok'
++import * as auth from '../../utils/auth'
++import { loadSettings } from '../../utils/settings'
+ import { useChatStore } from '../../state/chat-store'
+ import {
+   isByokSetupOpen,
+   resetCliByokStoreForTests,
+   setCliByokStoreForTests,
+   useByokSelectionStore,
+ } from '../../utils/byok'
+ 
+ import type { RouterParams } from '../command-registry'
+ import type { ByokConnection, ByokConnectionStore } from '@codebuff/sdk'
+ 
+ const connection: ByokConnection = {
+   id: '3f5cd55a-eaca-48f5-bd24-ef37618f89a8',
+   revision: 1,
+   name: 'router',
+   provider: 'openrouter',
+   model: 'openai/gpt-5',
+   credentialRef: 'env:OPENROUTER_API_KEY',
+   contextWindow: 32768,
+   maxOutputTokens: 4096,
+   createdAt: '2026-09-10T00:00:00.000Z',
+   updatedAt: '2026-09-10T00:00:00.000Z',
+ }
+ 
+ const createParams = (inputValue: string) => {
+@@ -149,25 +155,54 @@ describe('/byok', () => {
+       baseUrl: 'https://ollama.com/v1',
+     }
+     const store = {
+       list: async () => [compatible],
+       validate: async () => ({ ok: true, connection: compatible }),
+     } as unknown as ByokConnectionStore
+     setCliByokStoreForTests(store)
+     const { params, messages } = createParams('/byok select "Ollama test 120B"')
+ 
+     await handleByokCommand(params, 'select "Ollama test 120B"')
+ 
+     expect(messages.join('\n')).toContain('Using Ollama test 120B')
+   })
+ 
+   test('rejects unmatched quoted names without touching the store', async () => {
+     const list = mock(async () => [])
+     setCliByokStoreForTests({ list } as unknown as ByokConnectionStore)
+     const { params, messages } = createParams('/byok select "Ollama test 120B')
+ 
+     await handleByokCommand(params, 'select "Ollama test 120B')
+ 
+     expect(messages.join('\n')).toContain('unmatched quote')
+     expect(list).not.toHaveBeenCalled()
+   })
+ })
++
++describe('/byok effort', () => {
++  test('persists a BYOK rung, reports it, and default clears it', async () => {
++    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freebuff-byok-effort-'))
++    const configDir = spyOn(auth, 'getConfigDir').mockReturnValue(dir)
++    try {
++      const high = createParams('/byok effort high')
++      await handleByokCommand(high.params, 'effort high')
++      expect(loadSettings().byokReasoningEffort).toBe('high')
++      expect(high.messages.join('\n')).toContain('high reasoning effort')
++
++      const shown = createParams('/byok effort')
++      await handleByokCommand(shown.params, 'effort')
++      expect(shown.messages.join('\n')).toContain('BYOK reasoning effort: high')
++
++      const bogus = createParams('/byok effort max')
++      await handleByokCommand(bogus.params, 'effort max')
++      expect(bogus.messages.join('\n')).toContain('Unknown effort: max')
++      expect(loadSettings().byokReasoningEffort).toBe('high')
++
++      const reset = createParams('/byok effort default')
++      await handleByokCommand(reset.params, 'effort default')
++      expect(loadSettings().byokReasoningEffort).toBeUndefined()
++    } finally {
++      configDir.mockRestore()
++      fs.rmSync(dir, { recursive: true, force: true })
++    }
++  })
++})
+diff --git a/cli/src/commands/byok.ts b/cli/src/commands/byok.ts
+index 164260249..d94859bd9 100644
+--- a/cli/src/commands/byok.ts
++++ b/cli/src/commands/byok.ts
+@@ -1,52 +1,59 @@
+ import { useChatStore } from '../state/chat-store'
+ import { getSystemMessage } from '../utils/message-history'
+ import { startNewChat } from '../project-files'
+ import { stopActiveRun } from '../utils/active-run'
+ import {
+   describeByokConnection,
+   getCliByokStore,
+   closeByokSetup,
+   isByokEnvironmentVariableName,
+   isByokSetupOpen,
+   openByokSetup,
+   saveSelectedByokConnection,
+   selectedByokConnection,
+ } from '../utils/byok'
+ 
++import {
++  BYOK_REASONING_EFFORTS,
++  isByokReasoningEffort,
++} from '@codebuff/common/constants/reasoning-effort'
++import { loadSettings, saveSettings } from '../utils/settings'
++
+ import type { ByokConnection, ByokProvider } from '@codebuff/sdk'
+ import type { RouterParams } from './command-registry'
+ 
+ export const BYOK_USAGE = [
+   'BYOK uses your provider account directly. Keys are read from an environment variable and never stored in Freebuff.',
+   'Use the environment-variable NAME only, for example OPENROUTER_API_KEY. Never paste an API key into this command.',
+   'Usage:',
+   '`/byok list`',
+   '`/byok add <name> <openrouter|openai-compatible> <model> <ENV_VAR> [base-url] [--context-window=N] [--max-output-tokens=N]`',
+   '`/byok update <name> <model> [base-url] [--context-window=N] [--max-output-tokens=N]`',
+   '`/byok validate <name>`',
+   '`/byok select <name>`',
++  '`/byok effort <default|low|medium|high>`',
+   '`/byok remove <name>`',
+   '`/byok off`',
+ ].join('\n')
+ 
+ /**
+  * Entry from a Freebuff wall (Freebucks spent, daily cap reached). Those
+  * screens have no input, so without this a user who ran out could never type
+  * `/byok` — the one route that does not need Freebucks at all.
+  */
+ export function enterByokSetup(): void {
+   useChatStore
+     .getState()
+     .setMessages((messages) => [
+       ...messages,
+       getSystemMessage(
+         [
+           'Set up your own provider key (BYOK). BYOK runs never spend Freebucks.',
+           '',
+           BYOK_USAGE,
+           '',
+           'Add a connection, then `/byok select <name>` to start. `/byok off` returns to Freebuff.',
+         ].join('\n'),
+       ),
+     ])
+   openByokSetup()
+@@ -320,46 +327,71 @@ export async function handleByokCommand(
+             ? `${describeByokConnection(connection)} has a verified credential. Model coding support remains unverified.`
+             : `${describeByokConnection(connection)} is reachable. Its model remains unqualified until it completes a coding run.`
+           : `${describeByokConnection(connection)} is unavailable: ${validation.message}`)
+         return
+       }
+       if (action === 'select') {
+         const validation = await byokStore.validate(connection)
+         if (!validation.ok) {
+           post(params, `${describeByokConnection(connection)} was not selected because it could not be validated: ${validation.message}`)
+           return
+         }
+         saveSelectedByokConnection(connection)
+         resetTranscriptForSourceChange(params)
+         post(params, `Using ${describeByokConnection(connection)} for new runs. Inference is direct, ad-free, and billed by your provider.`)
+         return
+       }
+       await byokStore.remove(connection)
+       if (selectedByokConnection()?.id === connection.id) {
+         saveSelectedByokConnection(undefined)
+         resetTranscriptForSourceChange(params)
+       }
+       post(params, `Removed ${connection.name}.`)
+       return
+     }
+ 
++    if (action === 'effort') {
++      const [value] = args
++      if (!value) {
++        const current = loadSettings().byokReasoningEffort
++        post(
++          params,
++          `BYOK reasoning effort: ${current ?? 'default (the provider decides)'}. Change it with /byok effort <default|${BYOK_REASONING_EFFORTS.join('|')}>.`,
++        )
++        return
++      }
++      if (value !== 'default' && !isByokReasoningEffort(value)) {
++        post(params, `Unknown effort: ${value}. Use default, ${BYOK_REASONING_EFFORTS.join(', ')}.`)
++        return
++      }
++      const effort = value === 'default' ? undefined : value
++      saveSettings({ byokReasoningEffort: effort })
++      post(
++        params,
++        effort
++          ? `BYOK runs now ask for ${effort} reasoning effort. A provider that rejects it is retried without it.`
++          : 'BYOK runs use the provider default reasoning effort.',
++      )
++      return
++    }
++
+     if (action === 'off') {
+       if (!selectedByokConnection() && isByokSetupOpen()) {
+         closeByokSetup()
+         post(params, 'BYOK setup closed.')
+         return
+       }
+       if (!selectedByokConnection()) {
+         post(params, 'BYOK is already off.')
+         return
+       }
+       saveSelectedByokConnection(undefined)
+       resetTranscriptForSourceChange(params)
+       post(params, 'BYOK is off. New runs use the Freebuff session you select.')
+       return
+     }
+ 
+     post(params, BYOK_USAGE)
+   } catch (error) {
+     post(params, error instanceof Error ? `BYOK error: ${error.message}` : 'BYOK error.')
+   }
+ }
+diff --git a/cli/src/utils/byok.ts b/cli/src/utils/byok.ts
+index 7e40b525d..3e11ce845 100644
+--- a/cli/src/utils/byok.ts
++++ b/cli/src/utils/byok.ts
+@@ -1,27 +1,28 @@
+ import {
+   createBunByokConnectionStore,
++  withByokReasoningEffort,
+   withEffectiveByokLimits,
+ } from '@codebuff/sdk'
+ import { create } from 'zustand'
+ 
+ import { loadSettings, saveSettings } from './settings'
+ 
+ import type {
+   ByokConnection,
+   ByokConnectionStore,
+   ResolvedByokConnection,
+ } from '@codebuff/sdk'
+ 
+ type SelectedByokConnection =
+   Pick<ByokConnection, 'id' | 'revision'> &
+   Partial<Pick<ByokConnection, 'provider' | 'model'>>
+ 
+ let store: ByokConnectionStore | undefined
+ 
+ type ByokSelectionStore = {
+   selected: SelectedByokConnection | undefined
+   /**
+    * The user asked, from a Freebuff wall, to set up BYOK. `/byok` is a chat
+    * command, and a user whose Freebucks are spent never reaches the chat: the
+    * landing screen's refusal has no input. This opens the chat WITHOUT a
+    * Freebuff session so the command can run; nothing but slash commands can
+@@ -94,50 +95,54 @@ export function saveSelectedByokConnection(
+             id: connection.id,
+             revision: connection.revision,
+             provider: connection.provider,
+             model: connection.model,
+           },
+         }
+       : { byokConnection: undefined },
+   )
+   // Selecting ends setup; turning BYOK off (or removing the selected
+   // connection) returns the user to the Freebuff landing screen.
+   closeByokSetup()
+   useByokSelectionStore.getState().setSelected(
+     connection
+       ? {
+           id: connection.id,
+           revision: connection.revision,
+           provider: connection.provider,
+           model: connection.model,
+         }
+       : undefined,
+   )
+ }
+ 
+ /** Resolve only at run start so the secret never reaches chat state or logs.
+  *  Untouched default limits become the provider-reported window (see
+- *  withEffectiveByokLimits), so a run does not compact every few tool calls. */
++ *  withEffectiveByokLimits), so a run does not compact every few tool calls.
++ *  The `/byok effort` pick rides along; none sends no reasoning field. */
+ export async function resolveByokConnection(
+   selected: SelectedByokConnection,
+ ): Promise<ResolvedByokConnection> {
+-  return withEffectiveByokLimits(await getCliByokStore().resolve(selected))
++  return withByokReasoningEffort(
++    await withEffectiveByokLimits(await getCliByokStore().resolve(selected)),
++    loadSettings().byokReasoningEffort,
++  )
+ }
+ 
+ export function describeByokConnection(connection: Pick<ByokConnection, 'name' | 'provider' | 'model'>): string {
+   const provider = connection.provider === 'openrouter'
+     ? 'OpenRouter'
+     : 'OpenAI-compatible'
+   return `${connection.name} (${provider} · ${connection.model})`
+ }
+ 
+ export function isByokEnvironmentVariableName(value: string): boolean {
+   return /^[A-Z_][A-Z0-9_]*$/.test(value)
+ }
+ 
+ export function resetCliByokStoreForTests(): void {
+   store = undefined
+ }
+ 
+ export function setCliByokStoreForTests(value: ByokConnectionStore | undefined): void {
+   store = value
+ }
+diff --git a/cli/src/utils/settings.ts b/cli/src/utils/settings.ts
+index a19e4bc6a..0cfe9a7b0 100644
+--- a/cli/src/utils/settings.ts
++++ b/cli/src/utils/settings.ts
+@@ -1,84 +1,93 @@
+ import fs from 'fs'
+ import path from 'path'
+ 
+ import {
+   DEFAULT_FREEBUFF_MODEL_ID,
+   FREEBUFF_MODELS,
+   PREVIOUS_DEFAULT_FREEBUFF_MODEL_ID,
+   getFreebuffModelEfforts,
+   isFreebuffModelId,
+   migrateSupersededFreebuffModelPreference,
+ } from '@codebuff/common/constants/freebuff-models'
+-import { isReasoningEffort } from '@codebuff/common/constants/reasoning-effort'
++import {
++  isByokReasoningEffort,
++  isReasoningEffort,
++} from '@codebuff/common/constants/reasoning-effort'
+ import {
+   migrateSavedDefaultModel,
+   type SavedModelStore,
+ } from '@codebuff/common/util/freebuff-default-model-migration'
+ 
+ import { getConfigDir } from './auth'
+ import { AGENT_MODES } from './constants'
+ import { logger } from './logger'
+ 
+ import type { AgentMode } from './constants'
+-import type { ReasoningEffort } from '@codebuff/common/constants/reasoning-effort'
++import type {
++  ByokReasoningEffort,
++  ReasoningEffort,
++} from '@codebuff/common/constants/reasoning-effort'
+ 
+ const DEFAULT_SETTINGS: Settings = {
+   mode: 'DEFAULT' as const,
+   adsEnabled: true,
+ }
+ 
+ // Note: The old FREE mode has been renamed back to LITE; migrate on load.
+ 
+ /**
+  * Settings schema - add new settings here as the product evolves
+  */
+ export interface Settings {
+   mode?: AgentMode
+   adsEnabled?: boolean
+   /** Last model the user picked in the freebuff model selector. Restored on
+    *  next freebuff launch so users land in the queue for their preferred
+    *  model without re-picking. Persisted as the canonical model id. */
+   freebuffModel?: string
+   /** Which default flip `freebuffModel` has been migrated through — see
+    *  FREEBUFF_DEFAULT_MODEL_MIGRATION_ID. */
+   freebuffModelDefaultMigration?: string
+   /** Reasoning effort the user picked per model, keyed by canonical model id.
+    *  Per-model rather than a single value because the ladders differ: DeepSeek
+    *  V4 offers low/high/max while Luna offers low..max, so one shared value
+    *  would silently become a different rung on every model switch. A model
+    *  absent from this map runs its catalog default, which is also what the
+    *  server does when the client sends nothing. */
+   freebuffReasoningEfforts?: Record<string, ReasoningEffort>
+   /** The run-scoped BYOK connection selected in this CLI. Credentials remain
+    * in the OS keychain or an explicitly named environment variable. */
+   byokConnection?: {
+     id: string
+     revision: number
+     provider?: 'openrouter' | 'openai-compatible'
+     model?: string
+   }
++  /** Reasoning effort for BYOK runs (`/byok effort`). Absent sends no
++   *  reasoning field, so the provider's own default applies. */
++  byokReasoningEffort?: ByokReasoningEffort
+   /** @deprecated Use server-side fallbackToALaCarte setting instead */
+   alwaysUseALaCarte?: boolean
+   /** @deprecated Use server-side fallbackToALaCarte setting instead */
+   fallbackToALaCarte?: boolean
+   /** Set once the user has submitted their first prompt. Used to gate the
+    *  first-time onboarding suggested prompts so they only show to brand-new
+    *  users and quietly retire afterwards. */
+   hasSubmittedFirstPrompt?: boolean
+   /** When the one-time Freebucks introduction was shown (ISO). Set the
+    *  moment it renders, not when it is dismissed, so "once" holds however
+    *  the launch ends. */
+   freebucksIntroSeenAt?: string
+ }
+ 
+ /**
+  * Get the settings file path
+  */
+ export const getSettingsPath = (): string => {
+   return path.join(getConfigDir(), 'settings.json')
+ }
+ 
+ /**
+  * Ensure the config directory exists, creating it if necessary
+  */
+ const ensureConfigDirExists = (): void => {
+@@ -183,50 +192,54 @@ const validateSettings = (parsed: unknown): Settings => {
+     }
+   }
+ 
+   const byokConnection = obj.byokConnection as Record<string, unknown> | null
+   if (
+     byokConnection &&
+     typeof byokConnection === 'object' &&
+     typeof byokConnection.id === 'string' &&
+     typeof byokConnection.revision === 'number' &&
+     Number.isSafeInteger(byokConnection.revision) &&
+     byokConnection.revision > 0
+   ) {
+     settings.byokConnection = {
+       id: byokConnection.id,
+       revision: byokConnection.revision,
+       ...(byokConnection.provider === 'openrouter' ||
+       byokConnection.provider === 'openai-compatible'
+         ? { provider: byokConnection.provider }
+         : {}),
+       ...(typeof byokConnection.model === 'string' && byokConnection.model
+         ? { model: byokConnection.model }
+         : {}),
+     }
+   }
+ 
++  if (isByokReasoningEffort(obj.byokReasoningEffort)) {
++    settings.byokReasoningEffort = obj.byokReasoningEffort
++  }
++
+   // Validate alwaysUseALaCarte (legacy)
+   if (typeof obj.alwaysUseALaCarte === 'boolean') {
+     settings.alwaysUseALaCarte = obj.alwaysUseALaCarte
+   }
+ 
+   // Validate fallbackToALaCarte (legacy)
+   if (typeof obj.fallbackToALaCarte === 'boolean') {
+     settings.fallbackToALaCarte = obj.fallbackToALaCarte
+   }
+ 
+   // Validate hasSubmittedFirstPrompt
+   if (typeof obj.hasSubmittedFirstPrompt === 'boolean') {
+     settings.hasSubmittedFirstPrompt = obj.hasSubmittedFirstPrompt
+   }
+ 
+   // The loader is an ALLOWLIST — a key not copied here is dropped on every
+   // load and silently rewritten on the next save. That is how the intro's
+   // "shown once" mark lasted exactly one launch (2026-09-05).
+   if (typeof obj.freebucksIntroSeenAt === 'string') {
+     settings.freebucksIntroSeenAt = obj.freebucksIntroSeenAt
+   }
+ 
+   return settings
+ }
+ 
+diff --git a/common/src/constants/reasoning-effort.ts b/common/src/constants/reasoning-effort.ts
+index 35e7f44c4..7a29d0932 100644
+--- a/common/src/constants/reasoning-effort.ts
++++ b/common/src/constants/reasoning-effort.ts
+@@ -55,25 +55,45 @@ export function reasoningEffortRank(value: unknown): number {
+  */
+ export function clampReasoningEffort(
+   requested: unknown,
+   allowed: readonly ReasoningEffort[],
+   fallback: ReasoningEffort,
+ ): ReasoningEffort {
+   if (allowed.length === 0) return fallback
+   if (!isReasoningEffort(requested)) return fallback
+ 
+   const wanted = reasoningEffortRank(requested)
+   let best: ReasoningEffort | undefined
+   for (const candidate of allowed) {
+     const rank = reasoningEffortRank(candidate)
+     if (rank > wanted) continue
+     if (best === undefined || rank > reasoningEffortRank(best)) best = candidate
+   }
+   if (best !== undefined) return best
+ 
+   // Everything on offer is above what was asked for: give the least of them.
+   return allowed.reduce((lowest, candidate) =>
+     reasoningEffortRank(candidate) < reasoningEffortRank(lowest)
+       ? candidate
+       : lowest,
+   )
+ }
++
++/**
++ * The rungs a BYOK (the user's own API key) connection can be asked for.
++ *
++ * Three, because they are the only words every provider shape BYOK reaches
++ * understands: OpenAI-compatible `reasoning_effort`, OpenRouter's
++ * `reasoning.effort`, Gemini's OpenAI-compatible `reasoning_effort`, and an
++ * Anthropic thinking budget per rung. There is deliberately no "default" rung
++ * here: a BYOK thread with no pick sends nothing, so the provider's own default
++ * applies — exactly the request BYOK sent before this setting existed.
++ */
++export const BYOK_REASONING_EFFORTS = ['low', 'medium', 'high'] as const
++
++export type ByokReasoningEffort = (typeof BYOK_REASONING_EFFORTS)[number]
++
++export function isByokReasoningEffort(
++  value: unknown,
++): value is ByokReasoningEffort {
++  return BYOK_REASONING_EFFORTS.includes(value as ByokReasoningEffort)
++}
+diff --git a/sdk/src/byok.ts b/sdk/src/byok.ts
+index ee97019c2..1979ae587 100644
+--- a/sdk/src/byok.ts
++++ b/sdk/src/byok.ts
+@@ -1,62 +1,70 @@
+ /** Machine-local connection metadata, separate from OS-protected credentials. */
+ import { promises as fs } from 'node:fs'
+ import { homedir } from 'node:os'
+ import path from 'node:path'
+ import { z } from 'zod/v4'
++import { isByokReasoningEffort } from '@codebuff/common/constants/reasoning-effort'
++import type { ByokReasoningEffort } from '@codebuff/common/constants/reasoning-effort'
+ import { getSystemProcessEnv } from './env'
+ 
+ export const BYOK_SECRET_SERVICE = 'com.freebuff.byok.v1'
+ const envReference = /^env:[A-Za-z_][A-Za-z0-9_]*$/
+ const ownedReference = /^connection:[a-f0-9-]+:[1-9][0-9]*$/
+ const text = z.string().trim().min(1).max(256)
+ const connectionSchema = z
+   .object({
+     id: z.uuid(),
+     revision: z.number().int().positive(),
+     name: text,
+     provider: z.enum(['openrouter', 'openai-compatible']),
+     model: text,
+     baseUrl: z.string().max(2048).optional(),
+     contextWindow: z.number().int().min(4096).max(2_000_000).optional(),
+     maxOutputTokens: z.number().int().min(1).max(1_000_000).optional(),
+     credentialRef: z
+       .string()
+       .refine(
+         (value) => envReference.test(value) || ownedReference.test(value),
+       ),
+     createdAt: z.iso.datetime(),
+     updatedAt: z.iso.datetime(),
+   })
+   .strict()
+ export type ByokConnection = z.infer<typeof connectionSchema>
+ export type ByokProvider = ByokConnection['provider']
+ /** Runtime-only. The built-in resolver makes apiKey non-enumerable. */
+ export type ResolvedByokConnection = ByokConnection & {
+   apiKey: string
+   /** Recheck revocation before every provider request; never serialized. */
+   assertCurrent?: () => Promise<void>
++  /**
++   * The run's reasoning effort, a per-task choice rather than connection
++   * metadata (so never stored). Absent sends no reasoning field at all, which
++   * is the provider's own default. See `withByokReasoningEffort`.
++   */
++  reasoningEffort?: ByokReasoningEffort
+ }
+ export type ByokSecretStore = {
+   get(reference: string): Promise<string | undefined>
+   set(reference: string, value: string): Promise<void>
+   delete(reference: string): Promise<void>
+ }
+ export type ByokMetadataStore = {
+   get(): Promise<ByokConnection[]>
+   set(connections: ByokConnection[]): Promise<void>
+   /** Must serialize read/modify/write across processes for persistent stores. */
+   withLock?<T>(operation: () => Promise<T>): Promise<T>
+ }
+ export type ByokConnectionInput = {
+   /** User-configured limits, not a claim of tested model capability. */
+   contextWindow?: number
+   maxOutputTokens?: number
+   name: string
+   provider: ByokProvider
+   model: string
+   baseUrl?: string
+   apiKey?: string
+   credentialRef?: string
+ }
+ export type ByokConnectionPatch = Partial<ByokConnectionInput>
+ export type ByokValidationResult =
+@@ -312,50 +320,89 @@ export async function discoverByokContextWindow(
+           connection.provider === 'openrouter'
+             ? {}
+             : { Authorization: `Bearer ${connection.apiKey}` },
+         redirect: 'error',
+         signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
+       })
+       if (!response.ok) {
+         await response.body?.cancel()
+         return undefined
+       }
+       return contextWindowFromModelList(await response.json(), connection.model)
+     } catch {
+       return undefined
+     }
+   })()
+   discoveredWindows.set(key, { expiresAt: now + DISCOVERY_HIT_TTL_MS, window })
+   const result = await window
+   if (result === undefined)
+     discoveredWindows.set(key, {
+       expiresAt: now + DISCOVERY_MISS_TTL_MS,
+       window,
+     })
+   return result
+ }
+ 
++/**
++ * The connection with a run's reasoning effort attached, or the connection
++ * itself when there is none to attach (anything that is not a BYOK rung means
++ * "the provider's default"). A copy, never a mutation: the resolved connection
++ * is frozen and shared. The credential and revocation check stay
++ * non-enumerable on the copy, exactly as the resolver made them.
++ */
++export function withByokReasoningEffort(
++  connection: ResolvedByokConnection,
++  effort: unknown,
++): ResolvedByokConnection {
++  if (!isByokReasoningEffort(effort)) {
++    if (connection.reasoningEffort === undefined) return connection
++    const { reasoningEffort: _dropped, ...rest } = connection
++    return copyRuntimeFields(rest as ResolvedByokConnection, connection)
++  }
++  if (connection.reasoningEffort === effort) return connection
++  return copyRuntimeFields(
++    { ...connection, reasoningEffort: effort } as ResolvedByokConnection,
++    connection,
++  )
++}
++
++function copyRuntimeFields(
++  target: ResolvedByokConnection,
++  source: ResolvedByokConnection,
++): ResolvedByokConnection {
++  Object.defineProperty(target, 'apiKey', {
++    value: source.apiKey,
++    enumerable: false,
++  })
++  if (source.assertCurrent)
++    Object.defineProperty(target, 'assertCurrent', {
++      value: source.assertCurrent,
++      enumerable: false,
++    })
++  return target
++}
++
+ /**
+  * The connection a run should use: identical, unless its limits are the
+  * untouched defaults. Those are a 32,768-token guess, and for a coding agent
+  * whose tool schemas and prompt alone are ~15-20k tokens, compacting at 80% of
+  * 90% of (32,768 - 4,096) leaves a few thousand tokens of conversation: every
+  * few tool calls the run compacted, and the summary itself sat above the line
+  * (Desktop feedback 2026-09-24 and 09-27, "compacts every 3-5 turns").
+  *
+  * The provider's own number wins when its `/models` listing reports one
+  * (capped at BYOK_DISCOVERED_CONTEXT_WINDOW_CAP). Otherwise a remote endpoint
+  * gets 128k, which nearly every hosted coding model supports, and a loopback
+  * server keeps the configured default, because a local server's window is
+  * whatever it was launched with. Limits a user actually typed are never
+  * replaced. The credential stays non-enumerable on the copy.
+  */
+ export async function withEffectiveByokLimits(
+   connection: ResolvedByokConnection,
+   options: { fetch?: typeof globalThis.fetch } = {},
+ ): Promise<ResolvedByokConnection> {
+   if (!hasDefaultByokLimits(connection)) return connection
+   const discovered = await discoverByokContextWindow(connection, options.fetch)
+   const contextWindow =
+     // A window must exceed the output limit (byokModelLimits' own rule).
+     discovered !== undefined && discovered > BYOK_DEFAULT_MAX_OUTPUT_TOKENS
+       ? Math.min(discovered, BYOK_DISCOVERED_CONTEXT_WINDOW_CAP)
+diff --git a/sdk/src/impl/__tests__/byok-reasoning-effort.test.ts b/sdk/src/impl/__tests__/byok-reasoning-effort.test.ts
+new file mode 100644
+index 000000000..04dc309be
+--- /dev/null
++++ b/sdk/src/impl/__tests__/byok-reasoning-effort.test.ts
+@@ -0,0 +1,292 @@
++/**
++ * A BYOK run's reasoning effort reaches the provider in that provider's own
++ * dialect, is absent unless picked, and never breaks a request: a 400 that
++ * names the field is retried once without it, and the connection stops asking.
++ */
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { withByokReasoningEffort } from '../../byok'
++import {
++  BYOK_ANTHROPIC_THINKING_BUDGETS,
++  clearByokReasoningRejections,
++} from '../byok-request'
++import { getModelForRequest } from '../model-provider'
++
++import type {
++  LanguageModelV2,
++  LanguageModelV2CallOptions,
++} from '@ai-sdk/provider'
++import type { ResolvedByokConnection } from '../../byok'
++
++const originalFetch = globalThis.fetch
++afterEach(() => {
++  globalThis.fetch = originalFetch
++  clearByokReasoningRejections()
++})
++
++function connection(
++  overrides: Partial<ResolvedByokConnection> = {},
++): ResolvedByokConnection {
++  const base = {
++    id: 'effort-connection',
++    revision: 1,
++    name: 'Effort test',
++    provider: 'openai-compatible' as const,
++    baseUrl: 'https://api.example.com/v1',
++    model: 'some-reasoning-model',
++    credentialRef: 'env:PROVIDER_KEY',
++    createdAt: 'x',
++    updatedAt: 'x',
++    ...overrides,
++  }
++  // The resolver makes the key non-enumerable; the effort copy must keep it.
++  Object.defineProperty(base, 'apiKey', {
++    value: 'provider-key-canary',
++    enumerable: false,
++  })
++  return base as ResolvedByokConnection
++}
++
++const options: LanguageModelV2CallOptions = {
++  prompt: [{ role: 'user', content: [{ type: 'text', text: 'Reply with OK.' }] }],
++  maxOutputTokens: 4096,
++  tools: [
++    { type: 'function', name: 'read_files', inputSchema: { type: 'object' } },
++  ],
++  toolChoice: { type: 'auto' },
++}
++
++const ok = () =>
++  Response.json({
++    choices: [{ message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }],
++  })
++
++/** Runs one generate call; `answer` decides each attempt's response. */
++async function send(
++  byok: ResolvedByokConnection,
++  answer: (attempt: number, body: Record<string, unknown>) => Response = ok,
++) {
++  const bodies: Array<Record<string, unknown>> = []
++  const headers: string[] = []
++  globalThis.fetch = (async (_input, init) => {
++    const body = JSON.parse(String(init?.body)) as Record<string, unknown>
++    bodies.push(body)
++    headers.push(new Headers(init?.headers).get('authorization') ?? '')
++    return answer(bodies.length, body)
++  }) as typeof fetch
++  const model = getModelForRequest({
++    apiKey: 'hosted-key-must-not-be-sent',
++    model: 'ignored',
++    byok,
++  }) as LanguageModelV2
++  let error: unknown
++  try {
++    const result = await model.doGenerate(options)
++    expect(result.content).toContainEqual({ type: 'text', text: 'OK' })
++  } catch (caught) {
++    error = caught
++  }
++  for (const header of headers) expect(header).toBe('Bearer provider-key-canary')
++  return { bodies, error }
++}
++
++describe('withByokReasoningEffort', () => {
++  test('attaches a BYOK rung on a copy that keeps the credential non-enumerable', () => {
++    const resolved = connection()
++    const high = withByokReasoningEffort(resolved, 'high')
++    expect(high).not.toBe(resolved)
++    expect(high.reasoningEffort).toBe('high')
++    expect(high.apiKey).toBe('provider-key-canary')
++    expect(Object.keys(high)).not.toContain('apiKey')
++    expect(resolved.reasoningEffort).toBeUndefined()
++  })
++
++  test.each([undefined, null, 'max', 'xhigh', 'minimal', 'default'])(
++    '%p means the provider default: the connection is returned untouched',
++    (effort) => {
++      const resolved = connection()
++      expect(withByokReasoningEffort(resolved, effort)).toBe(resolved)
++    },
++  )
++
++  test('clearing an attached effort removes it', () => {
++    const cleared = withByokReasoningEffort(
++      withByokReasoningEffort(connection(), 'low'),
++      null,
++    )
++    expect(cleared.reasoningEffort).toBeUndefined()
++    expect(cleared.apiKey).toBe('provider-key-canary')
++  })
++})
++
++describe('BYOK reasoning effort in the request body', () => {
++  test('unpicked sends no reasoning field for any dialect', async () => {
++    for (const overrides of [
++      {},
++      { provider: 'openrouter' as const, model: 'openai/gpt-5.4' },
++      { baseUrl: 'https://api.anthropic.com/v1', model: 'claude-sonnet-4-5' },
++      {
++        baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
++        model: 'gemini-2.5-pro',
++      },
++    ]) {
++      const { bodies } = await send(connection(overrides))
++      expect(bodies).toHaveLength(1)
++      expect(bodies[0]).not.toHaveProperty('reasoning_effort')
++      expect(bodies[0]).not.toHaveProperty('reasoning')
++      expect(bodies[0]).not.toHaveProperty('thinking')
++      expect(bodies[0]!.max_tokens).toBe(4096)
++    }
++  })
++
++  test('OpenAI-compatible: reasoning_effort', async () => {
++    const { bodies } = await send(
++      withByokReasoningEffort(connection(), 'medium'),
++    )
++    expect(bodies[0]!.reasoning_effort).toBe('medium')
++    expect(bodies[0]).not.toHaveProperty('reasoning')
++  })
++
++  test('Gemini OpenAI-compatible endpoint: reasoning_effort', async () => {
++    const { bodies } = await send(
++      withByokReasoningEffort(
++        connection({
++          baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
++          model: 'gemini-2.5-pro',
++        }),
++        'low',
++      ),
++    )
++    expect(bodies[0]!.reasoning_effort).toBe('low')
++  })
++
++  test('OpenRouter, native or saved as custom: reasoning.effort', async () => {
++    for (const overrides of [
++      { provider: 'openrouter' as const, model: 'anthropic/claude-sonnet-4.5' },
++      { baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-5.4' },
++    ]) {
++      const { bodies } = await send(
++        withByokReasoningEffort(connection(overrides), 'high'),
++      )
++      expect(bodies[0]!.reasoning).toEqual({ effort: 'high' })
++      expect(bodies[0]).not.toHaveProperty('reasoning_effort')
++    }
++  })
++
++  test('Anthropic: a thinking budget per rung, added on top of the output cap', async () => {
++    for (const effort of ['low', 'medium', 'high'] as const) {
++      const { bodies } = await send(
++        withByokReasoningEffort(
++          connection({
++            baseUrl: 'https://api.anthropic.com/v1',
++            model: 'claude-sonnet-4-5',
++          }),
++          effort,
++        ),
++      )
++      const budget = BYOK_ANTHROPIC_THINKING_BUDGETS[effort]
++      expect(budget).toBeGreaterThanOrEqual(1024)
++      expect(bodies[0]!.thinking).toEqual({
++        type: 'enabled',
++        budget_tokens: budget,
++      })
++      expect(bodies[0]!.max_tokens).toBe(4096 + budget)
++      expect(bodies[0]).not.toHaveProperty('reasoning_effort')
++    }
++  })
++
++  test('direct Luna keeps its tool-request reasoning_effort none', async () => {
++    const { bodies } = await send(
++      withByokReasoningEffort(
++        connection({ baseUrl: 'https://api.openai.com/v1', model: 'gpt-5.6-luna' }),
++        'high',
++      ),
++    )
++    expect(bodies[0]!.reasoning_effort).toBe('none')
++  })
++})
++
++describe('BYOK reasoning effort rejection fallback', () => {
++  const rejects = (message: string) => (attempt: number) =>
++    attempt === 1
++      ? Response.json({ error: { message } }, { status: 400 })
++      : ok()
++
++  test('a 400 naming reasoning_effort is retried once without it, and remembered', async () => {
++    const byok = withByokReasoningEffort(connection(), 'high')
++    const first = await send(
++      byok,
++      rejects("Unrecognized request argument supplied: reasoning_effort"),
++    )
++    expect(first.error).toBeUndefined()
++    expect(first.bodies).toHaveLength(2)
++    expect(first.bodies[0]!.reasoning_effort).toBe('high')
++    expect(first.bodies[1]).not.toHaveProperty('reasoning_effort')
++    // Everything else is the same request.
++    const { reasoning_effort: _dropped, ...rest } = first.bodies[0]!
++    expect(first.bodies[1]).toEqual(rest)
++
++    // The connection no longer asks, so the next request is a single attempt.
++    const next = await send(byok)
++    expect(next.bodies).toHaveLength(1)
++    expect(next.bodies[0]).not.toHaveProperty('reasoning_effort')
++
++    // A new revision (an edited connection) asks afresh.
++    const edited = await send(withByokReasoningEffort(connection({ revision: 2 }), 'high'))
++    expect(edited.bodies[0]!.reasoning_effort).toBe('high')
++  })
++
++  test('Anthropic: the retry drops thinking and restores the output cap', async () => {
++    const byok = withByokReasoningEffort(
++      connection({ baseUrl: 'https://api.anthropic.com/v1', model: 'claude-3-5-haiku' }),
++      'medium',
++    )
++    const { bodies, error } = await send(
++      byok,
++      rejects('thinking: Extra inputs are not permitted'),
++    )
++    expect(error).toBeUndefined()
++    expect(bodies).toHaveLength(2)
++    expect(bodies[1]).not.toHaveProperty('thinking')
++    expect(bodies[1]!.max_tokens).toBe(4096)
++  })
++
++  test('OpenRouter: the retry drops reasoning', async () => {
++    const { bodies, error } = await send(
++      withByokReasoningEffort(
++        connection({ provider: 'openrouter', model: 'meta-llama/llama-4' }),
++        'low',
++      ),
++      rejects('Reasoning is not supported for this model'),
++    )
++    expect(error).toBeUndefined()
++    expect(bodies).toHaveLength(2)
++    expect(bodies[1]).not.toHaveProperty('reasoning')
++  })
++
++  test('a 400 about something else is not retried and still fails with the sanitized message', async () => {
++    const { bodies, error } = await send(
++      withByokReasoningEffort(connection(), 'high'),
++      () => Response.json({ error: { message: 'messages: too long' } }, { status: 400 }),
++    )
++    expect(bodies).toHaveLength(1)
++    expect(String((error as Error)?.message)).toContain('HTTP 400')
++  })
++
++  test('without a picked effort a reasoning-shaped 400 is not retried', async () => {
++    const { bodies, error } = await send(connection(), () =>
++      Response.json({ error: { message: 'reasoning_effort is required' } }, { status: 400 }),
++    )
++    expect(bodies).toHaveLength(1)
++    expect(error).toBeDefined()
++  })
++
++  test('the retry is attempted once: a second rejection surfaces as the error', async () => {
++    const { bodies, error } = await send(
++      withByokReasoningEffort(connection(), 'low'),
++      () => Response.json({ error: { message: 'invalid reasoning_effort' } }, { status: 400 }),
++    )
++    expect(bodies).toHaveLength(2)
++    expect(String((error as Error)?.message)).toContain('HTTP 400')
++  })
++})
+diff --git a/sdk/src/impl/byok-request.ts b/sdk/src/impl/byok-request.ts
+index 07fd19e10..e570b631e 100644
+--- a/sdk/src/impl/byok-request.ts
++++ b/sdk/src/impl/byok-request.ts
+@@ -1,83 +1,243 @@
+ import { createHash } from 'node:crypto'
+ 
+ import { byokCompletionUrl } from '../byok'
+ 
+ import type { ResolvedByokConnection } from '../byok'
++import type { ByokReasoningEffort } from '@codebuff/common/constants/reasoning-effort'
++
++/**
++ * Which request field a connection's endpoint reads reasoning effort from.
++ * BYOK always speaks Chat Completions (`byokCompletionUrl`), so the Responses
++ * API's `reasoning.effort` never applies; what differs is the dialect:
++ *
++ * - `openrouter` — OpenRouter's normalized `reasoning: { effort }`.
++ * - `anthropic` — Anthropic's OpenAI-compatible endpoint takes the native
++ *   `thinking: { type: 'enabled', budget_tokens }`, not an effort word.
++ * - `openai` — everything else: OpenAI, Gemini's OpenAI-compatible endpoint
++ *   (which maps `reasoning_effort` onto its thinking budget), DeepSeek, xAI,
++ *   and local servers. A server that ignores the field is unaffected, and one
++ *   that rejects it is retried without it (`byokReasoningRetryBody`).
++ */
++export type ByokReasoningDialect = 'openrouter' | 'anthropic' | 'openai'
++
++export function byokReasoningDialect(
++  connection: Pick<ResolvedByokConnection, 'provider' | 'baseUrl'>,
++): ByokReasoningDialect {
++  const endpoint = byokCompletionUrl(connection)
++  if (endpoint.startsWith('https://openrouter.ai/')) return 'openrouter'
++  if (new URL(endpoint).hostname === 'api.anthropic.com') return 'anthropic'
++  return 'openai'
++}
++
++/**
++ * Anthropic's thinking budget per rung. The API minimum is 1,024. The budget is
++ * ADDED to `max_tokens` rather than carved out of it: Anthropic counts thinking
++ * against `max_tokens`, and a 4,096-token default output cap would otherwise
++ * leave the answer almost nothing.
++ */
++export const BYOK_ANTHROPIC_THINKING_BUDGETS: Record<
++  ByokReasoningEffort,
++  number
++> = { low: 2_048, medium: 8_192, high: 16_384 }
++
++/** Fallback answer room when a request somehow carries no output cap. */
++const ANTHROPIC_ANSWER_TOKENS = 4_096
++
++function applyReasoningEffort(
++  body: Record<string, unknown>,
++  dialect: ByokReasoningDialect,
++  effort: ByokReasoningEffort,
++): Record<string, unknown> {
++  if (dialect === 'openrouter') return { ...body, reasoning: { effort } }
++  if (dialect === 'anthropic') {
++    const budget = BYOK_ANTHROPIC_THINKING_BUDGETS[effort]
++    const answer =
++      typeof body.max_tokens === 'number'
++        ? body.max_tokens
++        : ANTHROPIC_ANSWER_TOKENS
++    return {
++      ...body,
++      max_tokens: answer + budget,
++      thinking: { type: 'enabled', budget_tokens: budget },
++    }
++  }
++  return { ...body, reasoning_effort: effort }
++}
++
++/**
++ * Reasoning-effort rejections, per connection revision, for this process. A
++ * provider or model that 400s on the field once is not asked with it again;
++ * editing the connection (a new revision, perhaps a new model) asks afresh.
++ */
++const reasoningRejected = new Set<string>()
++const rejectionKey = (connection: Pick<ResolvedByokConnection, 'id' | 'revision'>) =>
++  `${connection.id}:${connection.revision}`
++
++export function clearByokReasoningRejections(): void {
++  reasoningRejected.clear()
++}
++
++/** Error text that names the field we added, not merely any 400. */
++const REASONING_FIELD_PATTERNS: Record<ByokReasoningDialect, RegExp> = {
++  openrouter: /\breasoning\b|\beffort\b/i,
++  // Raising max_tokens for the budget can itself exceed a model's output cap.
++  anthropic: /\bthinking\b|budget_tokens|max_tokens/i,
++  // Not "thinking": DeepSeek's replay error says "thinking mode" about
++  // reasoning_content, which dropping the effort field would not fix.
++  openai: /reasoning_effort|\breasoning\b|\beffort\b/i,
++}
++
++/**
++ * When a 400/422 answered a request that carried the reasoning field this
++ * module added, and the error names that field, the same request body without
++ * it — else undefined. The rejection is remembered for the connection, so the
++ * retry and every later request skip the field. Parses the serialized body the
++ * AI SDK sent; anything unexpected there means "no retry", never a throw.
++ */
++export function byokReasoningRetryBody(
++  connection: ResolvedByokConnection,
++  requestBody: unknown,
++  status: number,
++  errorText: string,
++): string | undefined {
++  const effort = connection.reasoningEffort
++  if (!effort || (status !== 400 && status !== 422)) return undefined
++  if (typeof requestBody !== 'string') return undefined
++  const dialect = byokReasoningDialect(connection)
++  if (!REASONING_FIELD_PATTERNS[dialect].test(errorText.slice(0, 16_384)))
++    return undefined
++  let body: Record<string, unknown>
++  try {
++    const parsed: unknown = JSON.parse(requestBody)
++    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
++      return undefined
++    body = parsed as Record<string, unknown>
++  } catch {
++    return undefined
++  }
++  const stripped = stripReasoningEffort(body, dialect, effort)
++  if (!stripped) return undefined
++  reasoningRejected.add(rejectionKey(connection))
++  return JSON.stringify(stripped)
++}
++
++/** Undo `applyReasoningEffort`, or undefined when the body does not carry
++ *  exactly what it would have added (e.g. direct Luna's own `'none'`). */
++function stripReasoningEffort(
++  body: Record<string, unknown>,
++  dialect: ByokReasoningDialect,
++  effort: ByokReasoningEffort,
++): Record<string, unknown> | undefined {
++  if (dialect === 'openrouter') {
++    const reasoning = body.reasoning as { effort?: unknown } | undefined
++    if (reasoning?.effort !== effort) return undefined
++    const { reasoning: _reasoning, ...rest } = body
++    return rest
++  }
++  if (dialect === 'anthropic') {
++    const thinking = body.thinking as { budget_tokens?: unknown } | undefined
++    const budget = BYOK_ANTHROPIC_THINKING_BUDGETS[effort]
++    if (thinking?.budget_tokens !== budget) return undefined
++    const { thinking: _thinking, ...rest } = body
++    return typeof rest.max_tokens === 'number'
++      ? { ...rest, max_tokens: rest.max_tokens - budget }
++      : rest
++  }
++  if (body.reasoning_effort !== effort) return undefined
++  const { reasoning_effort: _effort, ...rest } = body
++  return rest
++}
+ 
+ /** Select by the actual endpoint, including connections saved as "custom". */
+ export function byokRequestTransform(connection: ResolvedByokConnection) {
+   const endpoint = byokCompletionUrl(connection)
+   const directLuna =
+     endpoint === 'https://api.openai.com/v1/chat/completions' &&
+     connection.model === 'gpt-5.6-luna'
+   const openRouterOpenAI =
+     endpoint === 'https://openrouter.ai/api/v1/chat/completions' &&
+     connection.model.startsWith('openai/')
+ 
+   // Standalone BYOK has no required Freebuff account. Attribute to the provider
+   // credential, not a connection UUID/revision that changes on re-creation.
+   // Domain separation keeps this fingerprint specific to this purpose; the key
+   // itself must never enter the request body or its diagnostic metadata.
+   const identifier = openRouterOpenAI
+     ? createHash('sha256')
+         .update('freebuff-byok:openrouter:user:')
+         .update(connection.apiKey)
+         .digest('hex')
+     : undefined
+ 
+   // DeepSeek's own API (and servers that proxy it) validate the thinking-mode
+   // tool loop: every assistant message with tool_calls after the LAST user
+   // message must carry a `reasoning_content` key, or the whole request 400s
+   // ("The `reasoning_content` in the thinking mode must be passed back to the
+   // API"). The hosted lane backfills it server-side
+   // (web/src/llm-api/deepseek-request-body.ts); a BYOK request never passes
+   // through there, so it failed on the first follow-up after a tool call.
+   // An empty string is accepted, and the key is harmless with thinking off.
+   const deepSeekReplay =
+     !endpoint.startsWith('https://openrouter.ai/') &&
+     (/deepseek/i.test(connection.model) ||
+       endpoint.startsWith('https://api.deepseek.com'))
+ 
++  const reasoningDialect = connection.reasoningEffort
++    ? byokReasoningDialect(connection)
++    : undefined
++
+   return (body: Record<string, unknown>): Record<string, unknown> => {
+     if (deepSeekReplay && Array.isArray(body.messages)) {
+       body = { ...body, messages: backfillDeepSeekReasoning(body.messages) }
+     }
++    // Checked per request, not per transform: a rejection learned mid-run
++    // applies to the run's next step too.
++    const effort =
++      reasoningDialect && !reasoningRejected.has(rejectionKey(connection))
++        ? connection.reasoningEffort
++        : undefined
+     if (directLuna) {
+       // Both fields were independently rejected by OpenAI in live probes.
+       // The SDK still handles its agent stop markers locally.
+       const { max_tokens, stop: _stop, ...rest } = body
+       return {
+         ...rest,
+         max_completion_tokens: max_tokens,
+         // Luna's Chat Completions API rejects function tools with its default
+-        // reasoning effort. Reasoning + tools requires the Responses API.
++        // reasoning effort. Reasoning + tools requires the Responses API, so
++        // a picked effort applies only to tool-free requests.
+         ...(Array.isArray(body.tools) && body.tools.length > 0
+           ? { reasoning_effort: 'none' }
+-          : {}),
++          : effort
++            ? { reasoning_effort: effort }
++            : {}),
+       }
+     }
++    if (effort && reasoningDialect) {
++      body = applyReasoningEffort(body, reasoningDialect, effort)
++    }
+     if (identifier) {
+       // Anonymous OpenAI traffic through OpenRouter can inherit a shared policy
+       // block. Match the hosted lane's two attribution fields, on every call.
+       return { ...body, user: identifier, safety_identifier: identifier }
+     }
+     return body
+   }
+ }
+ 
+ type WireMessage = {
+   role?: unknown
+   tool_calls?: unknown
+   reasoning_content?: unknown
+ }
+ 
+ /** `reasoning_content: ''` on each assistant tool-call message after the last
+  *  user message that lacks one. Never overwrites reasoning that is present. */
+ export function backfillDeepSeekReasoning(messages: unknown[]): unknown[] {
+   const lastUser = messages.findLastIndex(
+     (m) => (m as WireMessage | null)?.role === 'user',
+   )
+   return messages.map((raw, index) => {
+     const m = raw as WireMessage | null
+     if (
+       index > lastUser &&
+diff --git a/sdk/src/impl/model-provider.ts b/sdk/src/impl/model-provider.ts
+index 1358a2dce..d5472c3c0 100644
+--- a/sdk/src/impl/model-provider.ts
++++ b/sdk/src/impl/model-provider.ts
+@@ -1,46 +1,46 @@
+ /**
+  * Builds the language model every request runs on: the Codebuff backend,
+  * which forwards to OpenRouter.
+  */
+ 
+ import path from 'path'
+ 
+ import { BYOK_OPENROUTER_HEADER } from '@codebuff/common/constants/byok'
+ import {
+   FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+   FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+ } from '@codebuff/common/constants/freebuff-errors'
+ import { FREEBUFF_ACTING_USER_HEADER } from '@codebuff/common/constants/freebuff-models'
+ import { isTransientNetworkError } from '@codebuff/common/util/error'
+ import {
+   OpenAICompatibleChatLanguageModel,
+   VERSION,
+ } from '@codebuff/llm-providers/openai-compatible'
+ import { APICallError } from 'ai'
+ 
+-import { byokRequestTransform } from './byok-request'
++import { byokReasoningRetryBody, byokRequestTransform } from './byok-request'
+ import { getWebsiteUrl } from '../constants'
+ import { getByokOpenrouterApiKeyFromEnv } from '../env'
+ import { byokCompletionUrl } from '../byok'
+ import type { ResolvedByokConnection } from '../byok'
+ 
+ import type { LanguageModel } from 'ai'
+ 
+ /**
+  * Parameters for requesting a model.
+  */
+ export interface ModelRequestParams {
+   /** Codebuff API key for backend authentication */
+   apiKey: string
+   /** Model ID (OpenRouter format, e.g., "anthropic/claude-sonnet-4") */
+   model: string
+   /** End user represented by a trusted service-account request. */
+   userId?: string
+   /** Direct, run-scoped credential. Never stored on the model or in metadata. */
+   byok?: ResolvedByokConnection
+ }
+ 
+ // Usage accounting type for OpenRouter/Codebuff backend responses
+ type OpenRouterUsageAccounting = {
+   cost: number | null
+   costDetails: {
+@@ -290,60 +290,78 @@ function fetchWithRetryableNetworkErrors(
+ /**
+  * Get the model for a request: one that routes through the Codebuff backend,
+  * which forwards to OpenRouter.
+  */
+ export function getModelForRequest({
+   apiKey,
+   model,
+   userId,
+   byok,
+ }: ModelRequestParams): LanguageModel {
+   if (byok) {
+     return new OpenAICompatibleChatLanguageModel(byok.model, {
+       provider: 'byok',
+       transformRequestBody: byokRequestTransform(byok),
+       url: () => byokCompletionUrl(byok),
+       headers: () => ({
+         Authorization: `Bearer ${byok.apiKey}`,
+         'user-agent': `ai-sdk/openai-compatible/${VERSION}/freebuff-byok`,
+       }),
+       // Check the durable revision before every provider attempt. The AI SDK
+       // invokes this again on retries and later tool-loop steps, so removing
+       // or replacing a connection stops subsequent inference immediately.
+       fetch: (async (...args: Parameters<typeof globalThis.fetch>) => {
+         try {
+           await byok.assertCurrent?.()
+-          const response = await globalThis.fetch(
+-            args[0],
+-            { ...(args[1] ?? {}), redirect: 'error' },
+-          )
++          const send = (init: RequestInit | undefined) =>
++            globalThis.fetch(args[0], { ...(init ?? {}), redirect: 'error' })
++          let response = await send(args[1])
++          let errorText: string | undefined
++          if (response.status === 400 || response.status === 422) {
++            errorText = await response.text().catch(() => '')
++            // A provider or model that refuses the picked reasoning effort
++            // still answers the task: once, without the field, remembered
++            // for the connection so later steps do not ask again.
++            const retryBody = byokReasoningRetryBody(
++              byok,
++              args[1]?.body,
++              response.status,
++              errorText,
++            )
++            if (retryBody !== undefined) {
++              response = await send({ ...(args[1] ?? {}), body: retryBody })
++              errorText = undefined
++            }
++          }
+           if (!response.ok) {
+             const modelRejected =
+               response.status === 400 ||
+               response.status === 404 ||
+               response.status === 422
+-                ? isByokModelIdRejection(await response.text().catch(() => ''))
++                ? isByokModelIdRejection(
++                    errorText ?? (await response.text().catch(() => '')),
++                  )
+                 : false
+             return new Response(
+               JSON.stringify({
+                 error: {
+                   message: getByokProviderErrorMessage(response.status, {
+                     model: byok.model,
+                     modelRejected,
+                   }),
+                 },
+               }),
+               { status: response.status, headers: { 'content-type': 'application/json' } },
+             )
+           }
+           return new Response(redactProviderStream(response.body, byok.apiKey), {
+             status: response.status,
+             headers: {
+               'content-type': response.headers.get('content-type') ?? 'text/event-stream',
+             },
+           })
+         } catch {
+           throw new Error(BYOK_CONNECTION_FAILURE_MESSAGE)
+         }
+       }) as typeof globalThis.fetch,
+       includeUsage: true,
+       supportsStructuredOutputs: true,
