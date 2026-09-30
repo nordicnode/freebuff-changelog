@@ -969,7 +969,7 @@ function badges (e) {
   else if (e.significance === 'notable') b.push(`<a class="badge not" href="/changes/notable/"${stop}${tip}>[NOTABLE]</a>`)
   if (e.modelChanges) b.push(`<a class="badge model" href="/models/"${stop}>[MODEL]</a>`)
   if (isSecurityEntry(e)) b.push('<span class="badge sec" title="Security-relevant: trust gates, credentials, checksums, permissions or sandboxing">[SECURITY]</span>')
-  if (e.ai?.breaking && ['passed', 'human-edited'].includes(quality.verify)) b.push('<span class="badge brk" title="The technical pass marked this as changing existing behavior, config, an API or a command">[BREAKING]</span>')
+  if (e.ai?.breaking && !quality.demoteActions) b.push('<span class="badge brk" title="The technical pass marked this as changing existing behavior, config, an API or a command">[BREAKING]</span>')
   if (e.ai?.confidence === 'low') b.push('<span class="badge lowc" title="The model rated its own confidence low: the diff is truncated, the consumer of a change is not visible, or the motive is guessed">[LOW CONFIDENCE]</span>')
   if (e.ai?.audience && AUDIENCE_DESC[e.ai.audience]) b.push(`<a class="badge aud" href="/subscribe/#aud-${esc(e.ai.audience)}"${stop} title="Who this change is for: ${esc(AUDIENCE_DESC[e.ai.audience])} · subscribe to this audience">[${esc(e.ai.audience.toUpperCase())}]</a>`)
   if (e.overridden) b.push('<span class="badge human" title="This entry was corrected by a human editor (data/overrides.json)">[EDITED]</span>')
@@ -1278,7 +1278,10 @@ function changesHtml (e) {
 function migrationHtml (e) {
   const a = e.ai || {}
   if (!a.migration) return ''
-  const trusted = ['passed', 'human-edited'].includes(qualityOf(e).verify)
+  // Demoted only when a check contradicts the claim. Pre-policy rows keep the
+  // ACTION label they shipped with: we never checked them, so calling them
+  // unverified would be a new claim about old text, not a finding.
+  const trusted = !qualityOf(e).demoteActions
   return `<p class="migration"><span class="migration-lbl">${trusted ? 'ACTION' : 'UNVERIFIED ACTION, DO NOT RELY ON THIS'}</span>${esc(a.migration)}</p>`
 }
 
@@ -1358,7 +1361,7 @@ function evidenceHtml (e) {
   // Dotted version strings are kept -- a wrong version is a real, checkable claim.
   const badNames = bad
   const quality = qualityOf(e)
-  if (!ev && !badNames.length && !quality.uncertain) return ''
+  if (!ev && !badNames.length && !quality.uncertain && !quality.notes.length) return ''
   const flag = badNames.length
     ? `<p class="evidence-flag">Not found in the diff or source context: ${badNames.map(x => `<code>${esc(x)}</code>`).join(', ')}. Treat these names as unverified.</p>`
     : ''
@@ -1367,7 +1370,7 @@ function evidenceHtml (e) {
     : e.ai?.verify === 'unavailable'
       ? '<p class="evidence-flag">The verifier check could not run for this row, so its claims are unverified.</p>'
       : ''
-  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${badNames.length ? ` <span class="evidence-warn">(${badNames.length} unverified name${badNames.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}${quality.warnings.map(w => `<p class="evidence-flag">${esc(w)}</p>`).join('')}</div></details>`
+  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${badNames.length ? ` <span class="evidence-warn">(${badNames.length} unverified name${badNames.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}${quality.warnings.map(w => `<p class="evidence-flag">${esc(w)}</p>`).join('')}${quality.notes.map(n => `<p class="evidence-note">${esc(n)}</p>`).join('')}</div></details>`
 }
 
 // Implementation notes and comments extracted directly from the commit diff.
@@ -1394,7 +1397,8 @@ function qualityCard (q, card, bar, share) {
     ['on current prompt', q.onCurrentPrompt, q.summarized, `v${PROMPT_V}, not a factual-accuracy guarantee`],
     ['current validation policy', q.policyCurrent, q.summarized, 'forward-only; history retained'],
     ['plain-English fact-checked', q.plainVerified, q.explained, 'includes deterministic templates'],
-    ['rows with unresolved warnings', q.uncertain, q.changes, 'distinct rows, not claim counts'],
+    ['rows with unresolved warnings', q.uncertain, q.changes, 'a check ran and did not pass'],
+    ['pre-policy history', q.prePolicy, q.summarized, 'never checked; disclosed per row, not flagged'],
     ['on an older prompt', q.stalePrompt, q.summarized, 'legacy text retained; no paid backfill'],
     ['with evidence cited', q.withEvidence, q.summarized, ''],
     ['unverified identifiers', q.ungrounded, q.summarized, 'names not found in the diff'],
@@ -1856,7 +1860,10 @@ export function entryRecord (e, shipped = null) {
     category: e.category,
     kind: e.kind || 'sync',
     noise: !!e.noise,
-    ...(e.ai?.breaking && ['passed', 'human-edited'].includes(qualityOf(e).verify) ? { breaking: true } : {}),
+    // `breaking` travels with the card: shown unless a check demoted it. The
+    // machine-readable `migrationVerified` stays strict, so a consumer can tell
+    // a confirmed action from text that merely shipped.
+    ...(e.ai?.breaking && !qualityOf(e).demoteActions ? { breaking: true } : {}),
     ...(e.ai?.migration ? { migration: e.ai.migration, migrationVerified: ['passed', 'human-edited'].includes(qualityOf(e).verify) } : {}),
     ...(e.ai?.confidence ? { confidence: qualityOf(e).confidence } : {}),
     quality: qualityOf(e),
@@ -3968,21 +3975,21 @@ const loadIndex = async () => {
     </div>
     <div class="man-body">
       <h4>WHAT IS THIS?</h4>
-      <p>Commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, rebuilt from public git diffs. Upstream ships through snapshot merges with blank messages, so this mirror diffs each snapshot to extract model swaps, version bumps, slash commands, and file churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} commits, updated whenever upstream moves. Coverage follows that repository: Freebuff Desktop is not open sourced, so desktop-only changes are generally not picked up here; only the shared code that also affects it shows up.</p>
+      <p>Commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, rebuilt from public git diffs. Upstream ships through snapshot merges with blank messages, so this mirror diffs each snapshot to extract model swaps, version bumps, slash commands and file churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} commits, updated whenever upstream moves. Coverage follows that repository: Freebuff Desktop is not open sourced, so desktop-only changes are generally not picked up here; only shared code that also affects it shows up.</p>
 
       <h4>HOW IT WORKS: ANALYSIS PIPELINE</h4>
-      <p>Mechanical facts are extracted without a model. Model tables and slash-command registries are set-differenced straight from the git trees, version bumps come from <code>package.json</code>, and timestamps are normalized to UTC, so those facts are computed, not paraphrased. Code changes are then mapped onto the monorepo layout (<code>cli/</code>, <code>packages/agent-runtime/</code>, <code>common/</code>, <code>sdk/</code>, <code>docs/</code>) to name the changed layer.</p>
+      <p>Mechanical facts are extracted without a model. Model tables and slash-command registries are set-differenced from the git trees, version bumps come from <code>package.json</code>, and timestamps are normalized to UTC, so those facts are computed, not paraphrased. Code changes are then mapped onto the monorepo layout (<code>cli/</code>, <code>packages/agent-runtime/</code>, <code>common/</code>, <code>sdk/</code>, <code>docs/</code>) to name the changed layer.</p>
       <p>The summaries are model output, and the goal is to make them traceable, not to claim they are perfect. What the model gets is bounded and checkable: the clean source diff with lockfiles and pure test hunks stripped (beyond the reserved 270k-token prompt budget it is split into file/hunk drafts and fused; partial evidence is disclosed), the computed facts above, the developers' own code comments, and, when a PR can be matched by touched files and passes a relevance check, its description and review discussion. Rows whose only changes are tests, mocks, or docs are detected mechanically and given a fixed plain-English line with no API call.</p>
-      <p>Every identifier a summary uses (backticked names, bare <code>CONSTANT_CASE</code> settings, camelCase and PascalCase names, versions, <code>--flags</code>, and numbers) is checked against the diff and source corpus as a whole word, so a truncated prefix of a real name fails too. A name that cannot be found gets one repair pass and, if still missing, is recorded as ungrounded and shown as unverified; such a row also cannot rate confidence high. Value direction is checked without a model at all: a constant that moved from A to B but is written as B to A is caught deterministically. Newly admitted entries and their plain-English text get a verifier fact-check that answers claim by claim with quotes and reasons. Names that appear only in a sibling commit's title from the same day must be explicitly attributed; one commit may not borrow another's work. Unsupported claims trigger one rewrite, a row that still fails is stored with a visible <code>flagged</code> label rather than hidden, breaking or migration claims get one independent second read and are demoted to unknowns when it does not confirm them, and a row still shipping ungrounded names, backwards values or flagged claims gets one rewrite on the stronger model, kept only when it is strictly cleaner. Each summary cites the diff it came from, new summaries are cached by commit SHA, diff content, delivered context, model and policy identity, and every card links to the commit, compare view and inline diff.</p>
+      <p>Every identifier a summary uses (backticked names, <code>CONSTANT_CASE</code> settings, camelCase and PascalCase names, versions, <code>--flags</code>, numbers) is checked against the diff and corpus as a whole word, so a truncated prefix fails too. A name that cannot be found gets one repair pass and, if still missing, is recorded as ungrounded and shown as unverified; such a row also cannot rate confidence high. Value direction is checked without a model: a constant that moved A to B but is written B to A is caught deterministically. Newly admitted entries get a claim-by-claim verifier fact-check with quotes and reasons. Names from a same-day sibling commit's title must be attributed explicitly; one commit may not borrow another's work. Unsupported claims trigger one rewrite, a row that still fails is stored with a visible <code>flagged</code> label rather than hidden, breaking or migration claims get one independent second read and are demoted to unknowns when it does not confirm them, and a row still shipping ungrounded names, backwards values or flagged claims gets one rewrite on the stronger model, kept only when it is strictly cleaner. Each summary cites the diff it came from, new summaries are cached by commit SHA, diff content, delivered context, model and policy identity, and every card links to the commit, compare view and inline diff.</p>
 
-      <p><strong>Quality coverage is not text coverage.</strong> Older summaries are retained without paid backfill and may have no current fact-check. New verification is bound to the exact text; unavailable reviewers do not clear objections. Unverified warnings sit beside the lead and travel with exports. The existing models and fixed 270,000-token context contract are unchanged. A same-family model check is not a human audit. Unknown motives remain unknown rather than being invented.</p>
+      <p><strong>Quality coverage is not text coverage.</strong> Older summaries are retained without paid backfill and were never checked under the current policy, so they say that in their own Evidence block rather than carrying an unverified marker, which is reserved for text where a check ran and did not pass. New verification binds to the exact text; unavailable reviewers do not clear objections. Unverified warnings sit beside the lead and travel with exports. The models and the fixed 270,000-token context contract are unchanged. A same-family check is not a human audit; unknown motives stay unknown rather than being invented.</p>
 
       <h4>USER-FACING HIGHLIGHTS</h4>
       <p>Every entry opens with its ELI5 plain-English takeaway, fixed in shape: what changed, who it affects, what you notice day to day, no jargon. The technical explanation, holding the full summary, sits collapsed beneath it, then chips of the structured facts computed from the diff (constant old to new values, new env vars, flags, exports, new test titles), an Evidence section citing the diff lines behind the summary's names, and a collapsed note for what the diff cannot show. Version bumps roll up everything that shipped in their release window instead of reporting a bare label change; a row whose own summary carries unverified names is left out of the window entirely, and unchecked, review-flagged and value-error prose is omitted rather than reused as fact. The <code>/week/</code> pages digest each week into releases, catalog moves, and the heaviest work; cards name the first release that shipped each commit; same-day, same-topic commits are clustered into development narratives.</p>
       <p>Every card carries an audience chip (clicking it opens that audience's feed subscription), a <code>link</code> button that copies a stable <code>/c/&lt;sha&gt;</code> permalink, and Related links picked by time proximity so an old row never points at the far future. Model pages say where each model first shipped and group its versions into lineage. The site follows your OS light-or-dark preference and remembers a manual choice.</p>
 
       <h4>SEARCH</h4>
-      <p>Plain words match like they always did. On top of them the query box reads field syntax: <code>cat:cli</code> for a category, <code>sig:&gt;=notable</code> for an impact floor, <code>aud:end-users</code> for an audience, <code>is:release</code> <code>is:breaking</code> <code>is:security</code> and friends for flags, <code>&quot;exact phrase&quot;</code> for a phrase, and <code>-word</code> to exclude. Every search is a link: the address bar follows the box and the filters, so any result view can be shared or bookmarked as is, and the help panel under the box lists the full grammar.</p>
+      <p>Plain words match like they always did. On top of them the query box reads field syntax: <code>cat:cli</code> for a category, <code>sig:&gt;=notable</code> for an impact floor, <code>aud:end-users</code> for an audience, <code>is:release</code> <code>is:breaking</code> <code>is:security</code> and friends for flags, <code>&quot;exact phrase&quot;</code> for a phrase, and <code>-word</code> to exclude. Every search is a link: the address bar follows the box and the filters, so any result view can be shared, and the help panel lists the full grammar.</p>
 
       <h4>WHAT WE TRACK</h4>
       <dl class="man-dl">

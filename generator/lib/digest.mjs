@@ -148,6 +148,10 @@ export function summaryQuality (entries) {
     verified: withAi.filter(e => qualityOf(e).verify === 'passed').length,
     policyCurrent: withAi.filter(e => e.ai.policy === 1).length,
     plainVerified: withEli5.filter(e => ['passed', 'deterministic', 'human-edited'].includes(qualityOf(e).plainVerify)).length,
+    // Text that predates the policy is counted, not flagged: one number for the
+    // retained history is honest disclosure; a warning on every row is noise.
+    prePolicy: withAi.filter(e => qualityOf(e).verify === 'pre-policy').length,
+    plainPrePolicy: withEli5.filter(e => qualityOf(e).plainVerify === 'pre-policy').length,
     uncertain: rows.filter(e => qualityOf(e).uncertain).length,
     verifyFlagged: withAi.filter(e => e.ai.verify === 'flagged').length,
     verifyUnavailable: withAi.filter(e => e.ai.verify === 'unavailable').length,

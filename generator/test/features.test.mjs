@@ -54,7 +54,9 @@ test('entryRecord: the /api/entry shape carries what the cards show, minus HTML'
   const e = {
     sha: 'abcdef0123456789', day: '2026-09-12', date: '2026-09-12T10:00:00Z',
     category: 'CLI', significance: 'notable', title: 'Mechanical',
-    ai: { title: 'AI title', summary: 'AI summary', audience: 'end-users', evidence: 'x.ts hunk', breaking: true, confidence: 'high' },
+    // A row admitted under the current policy whose fact-check never ran: the
+    // breaking claim is unconfirmed, so it is not promoted and the row warns.
+    ai: { title: 'AI title', summary: 'AI summary', audience: 'end-users', evidence: 'x.ts hunk', breaking: true, confidence: 'high', policy: 1 },
     eli5: { text: 'Plain line.' },
     version: '1.2.3', pr: 42, stats: { additions: 3, deletions: 1 },
     files: { total: 1, added: ['cli.ts'], modified: [], removed: [] }
@@ -67,6 +69,14 @@ test('entryRecord: the /api/entry shape carries what the cards show, minus HTML'
   assert.equal(rec.breaking, undefined, 'unchecked breaking claims are not promoted as actionable')
   assert.equal(rec.quality.uncertain, true)
   assert.equal(rec.confidence, 'medium')
+  // Pre-policy history is the opposite case: nothing failed, so nothing is
+  // flagged, and the row keeps the breaking label it was stored with.
+  const legacy = entryRecord({ ...e, ai: { ...e.ai, policy: undefined }, eli5: { text: 'Plain line.' } })
+  assert.equal(legacy.breaking, true, 'a pre-policy breaking label is not retroactively removed')
+  assert.equal(legacy.quality.uncertain, false, 'never-checked history is not an unresolved warning')
+  assert.equal(legacy.quality.verify, 'pre-policy')
+  assert.ok(legacy.quality.notes.length, 'but it is disclosed')
+  assert.equal(legacy.quality.confidence, 'high')
   assert.equal(rec.pr, 42)
   assert.equal(rec.shippedIn['codebuff-cli'], '1.3.0')
   assert.match(rec.urls.site, /\/day\/2026-09-12\/#abcdef012345/)

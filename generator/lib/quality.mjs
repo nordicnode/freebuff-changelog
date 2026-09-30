@@ -21,34 +21,82 @@ export function evidenceManifest (entry, material, prompt, model) {
   }
 }
 
+// A stored artifact answers to the current policy when it carries the policy
+// stamp, an input manifest, or a verdict bound to an exact hash. Text older than
+// that was never checked under this policy at all -- which is a different fact
+// from "a check ran and did not pass", and must not be reported as a failure.
+export function isCurrentRecord (r = {}) {
+  return !!(r.policy === QUALITY_POLICY_V || r.manifest || r.verifyHash)
+}
+
+// The single place a stored verification field becomes a readable status.
+// Every verdict the pipeline can write ('passed', 'flagged', 'unavailable') is
+// returned as itself. A missing verdict on current-policy text is 'unchecked';
+// a missing verdict on pre-policy text is 'pre-policy', not a failure.
+export function qualityStatus (r = {}) {
+  if (r.verify === 'passed' && ((r.policy === QUALITY_POLICY_V && !r.verifyHash) || (r.verifyHash && r.verifyHash !== artifactHash(r)))) return 'stale'
+  if (r.verify !== undefined) return r.verify
+  return isCurrentRecord(r) ? 'unchecked' : 'pre-policy'
+}
+
+export const VERIFIED_STATUSES = ['passed', 'human-edited']
+export const PLAIN_VERIFIED_STATUSES = ['passed', 'deterministic', 'human-edited']
+
 export function qualityOf (e = {}) {
   const ai = e.ai || {}
   const plain = e.eli5 || {}
   const edited = e.overridden || ai.overridden
-  const statusOf = r => r.verify === 'passed' && ((r.policy === QUALITY_POLICY_V && !r.verifyHash) || (r.verifyHash && r.verifyHash !== artifactHash(r)))
-    ? 'stale' : (r.verify || 'unchecked')
+  const statusOf = qualityStatus
   const verify = edited ? 'human-edited' : statusOf(ai)
   const plainVerify = plain.model === 'template' ? 'deterministic' : plain.overridden ? 'human-edited' : statusOf(plain)
   const unverifiedNames = ai.ungrounded || []
   const valueErrors = ai.valueErrors || []
+  // Two levels, deliberately. `warnings` are problems a reader must not skim
+  // past: a check ran and did not pass, a name could not be grounded, a value is
+  // backwards. `notes` are the quieter disclosure that stored text predates the
+  // current policy. Treating the second as the first put an "unverified" box on
+  // every historical row, which spent the warning on the rows that were fine and
+  // left the ones that actually failed indistinguishable.
   const warnings = []
+  const notes = []
+  // An actionable claim (a migration step, a breaking change) is demoted only
+  // when something contradicts it: a recorded negative verdict, or a
+  // current-policy row whose check never ran. Pre-policy text is rendered as it
+  // was stored, with the note, rather than silently relabelled as a failure.
+  const demoteActions = ['flagged', 'stale', 'unavailable'].includes(verify) || (verify === 'unchecked' && isCurrentRecord(ai))
   if (ai.title && !edited) {
-    if (verify !== 'passed') warnings.push(verify === 'flagged' ? 'The verifier objected to claims in this entry.' : `Technical claims ${verify === 'unavailable' ? 'could not be verified' : 'have no current verification'}.`)
+    if (verify === 'flagged') warnings.push('The verifier objected to claims in this entry.')
+    else if (verify === 'stale') warnings.push('The stored verification no longer matches this text, so it is not current.')
+    else if (verify === 'unavailable') warnings.push('The verifier check could not run, so the technical claims are unverified.')
+    else if (verify === 'unchecked') warnings.push('Technical claims have no current verification.')
+    else if (verify === 'pre-policy') notes.push('This summary predates the current verification policy, so it has no fresh fact-check.')
     if (unverifiedNames.length) warnings.push(`Unverified names or numbers: ${unverifiedNames.join(', ')}.`)
     if (valueErrors.length) warnings.push(`Value errors: ${valueErrors.join('; ')}.`)
     for (const c of ai.verifyClaims || []) warnings.push(`${c.claim}${c.reason ? ` (${c.reason})` : ''}`)
     if (ai.manifest?.partial) warnings.push('Source evidence is partial; some changes may be omitted.')
   }
-  if (plain.text && !['passed', 'deterministic', 'human-edited'].includes(plainVerify)) {
-    warnings.push('The plain-English explanation has no successful current fact-check.')
+  if (plain.text && !PLAIN_VERIFIED_STATUSES.includes(plainVerify)) {
+    if (plainVerify === 'pre-policy') {
+      notes.push('This plain-English explanation predates the current verification policy, so it has no fresh fact-check.')
+    } else if (plainVerify === 'flagged') {
+      warnings.push('The fact-check objected to claims in the plain-English explanation.')
+    } else if (plainVerify === 'stale') {
+      warnings.push('The stored fact-check no longer matches this plain-English text, so it is not current.')
+    } else {
+      warnings.push('The plain-English explanation has no successful current fact-check.')
+    }
     for (const c of plain.verifyClaims || []) warnings.push(`${c.claim}${c.reason ? ` (${c.reason})` : ''}`)
   }
   if (plain.text && plain.manifest?.partial) warnings.push('The plain-English explanation uses partial evidence; some changes may be omitted.')
   const uncertain = warnings.length > 0
   const confidence = ai.manifest?.partial ? 'low' : ai.confidence === 'high' && uncertain ? 'medium' : ai.confidence
+  const plainNotes = notes.filter(n => /plain-English/.test(n))
   return {
-    verify, plainVerify, confidence, uncertain,
+    verify, plainVerify, confidence, uncertain, demoteActions,
+    prePolicy: verify === 'pre-policy' || plainVerify === 'pre-policy',
     warnings: [...new Set(warnings)],
+    notes: [...new Set(notes)],
+    ...(plainNotes.length ? { plainNotes } : {}),
     ...(ai.verifyModel ? { verifyModel: ai.verifyModel } : {}),
     ...(ai.verifyHash ? { verifyHash: ai.verifyHash } : {}),
     ...(ai.verifyClaims?.length ? { verifyClaims: ai.verifyClaims } : {}),
@@ -61,7 +109,15 @@ export function qualityOf (e = {}) {
   }
 }
 
+// The loud form: a marker that means "a check did not pass". Pre-policy text
+// carries no marker, because nothing about it failed.
 export function qualityText (e) {
   const q = qualityOf(e)
   return q.uncertain ? `[UNVERIFIED] ${q.warnings.join(' ')}` : ''
+}
+
+// The quiet form: history disclosure without an alarm. Used where a reader has
+// asked for this entry's provenance (its own Evidence block, the JSON API).
+export function qualityNote (e) {
+  return qualityOf(e).notes.join(' ')
 }

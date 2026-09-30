@@ -10,7 +10,7 @@ import {
   LLM_CONTEXT_TOKENS, rememberClosedPrs, matchPrByPaths, prSummaryKey,
   pruneExpiredErrors, gatherEntryContext
 } from '../lib/llm.mjs'
-import { artifactHash, qualityOf, qualityText, QUALITY_POLICY_V } from '../lib/quality.mjs'
+import { artifactHash, qualityOf, qualityText, qualityNote, qualityStatus, QUALITY_POLICY_V } from '../lib/quality.mjs'
 import { mergeChangelog, mergeOpenPrs, mergeHealth, persistMerged } from '../lib/mergedata.mjs'
 import { runEval, latestResult } from '../lib/eval.mjs'
 import { writeJson, withLock, withDeadline, git } from '../lib/util.mjs'
@@ -93,6 +93,40 @@ test('R6: exact-text stale verdicts and numeric objections survive exports', () 
   assert.ok(generateReleaseNotesMarkdown({ version: '1.0.1' }, [e]).includes('[UNVERIFIED]'))
   ai.ungrounded = ['999']; ai.valueErrors = ['LIMIT is reversed']; ai.verifyClaims = [{ claim: 'Exact objection' }]
   assert.match(qualityText(e), /999.*LIMIT.*Exact objection/)
+})
+
+test('R6/R19: never-checked history is disclosed quietly, a failed check is not', () => {
+  // The distinction that matters in public: 7,927 stored ELI5 lines predate the
+  // policy, and none of them ever recorded a verdict. Reporting that absence the
+  // same way as a failed check put an alarm on every historical row.
+  const legacy = { ai: { title: 'Old', summary: 'Old text.', confidence: 'high', migration: 'Update the config.' }, eli5: { text: 'Plain old line.', model: 'vyce/deepseek-v4.1' } }
+  const q = qualityOf(legacy)
+  assert.equal(q.verify, 'pre-policy')
+  assert.equal(q.plainVerify, 'pre-policy')
+  assert.equal(q.uncertain, false, 'nothing failed, so nothing is flagged')
+  assert.equal(q.demoteActions, false, 'and the shipped action label stays')
+  assert.match(qualityNote(legacy), /predates the current verification policy/)
+  assert.equal(qualityText(legacy), '', 'no [UNVERIFIED] marker for unchecked history')
+  assert.equal(entryRecord({ ...legacy, sha: 'a'.repeat(40) }).breaking, undefined, 'no breaking claim is present here')
+
+  // A current-policy row whose check never ran is a real gap.
+  const admitted = { ai: { policy: QUALITY_POLICY_V, manifest: { policy: QUALITY_POLICY_V }, title: 'New', summary: 'New text.', confidence: 'high', breaking: true } }
+  const qa = qualityOf(admitted)
+  assert.equal(qa.verify, 'unchecked')
+  assert.equal(qa.uncertain, true)
+  assert.equal(qa.demoteActions, true)
+  assert.equal(qa.confidence, 'medium', 'an unchecked high-confidence row is capped')
+  assert.match(qualityText(admitted), /no current verification/)
+
+  // A recorded negative verdict is loud whatever the policy version.
+  for (const [status, pattern] of [['flagged', /objected/], ['unavailable', /could not run/]]) {
+    const bad = { ai: { title: 'T', summary: 'S.', verify: status }, eli5: { text: 'P.', verify: status } }
+    assert.equal(qualityOf(bad).uncertain, true)
+    assert.equal(qualityOf(bad).demoteActions, true)
+    assert.match(qualityText(bad), pattern)
+  }
+  assert.equal(qualityStatus({ verify: 'passed', policy: QUALITY_POLICY_V }), 'stale', 'a passed verdict with no bound hash is not current')
+  assert.equal(qualityStatus({ verify: 'passed', verifyHash: 'deadbeef', title: 'T' }), 'stale', 'and a hash that no longer matches is stale')
 })
 
 test('R12/R20: instruction examples and rejected replies cannot authorize names', () => {

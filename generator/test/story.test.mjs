@@ -20,7 +20,9 @@ test('story note states the dated access loss beside the reassuring tiering line
   const index = buildStoryIndex([tiering, grandfathering])
   const note = index.notes.get(tiering.sha)[0]
   assert.ok(note.text.startsWith('Singapore and Israel left full access on 2026-09-15. '))
-  assert.ok(note.text.includes('[UNVERIFIED]'), 'related unchecked prose keeps its warning')
+  // Pre-policy prose is disclosed, not alarmed: the note carries the dated
+  // statement without stamping every historical row as failed.
+  assert.ok(!note.text.includes('[UNVERIFIED]'), 'pre-policy prose is not stamped as failed')
   assert.ok(note.text.endsWith(grandfathering.eli5.text))
   assert.equal(note.sha, grandfathering.sha)
   assert.equal(buildStoryIndex([tiering]).notes.size, 0)
