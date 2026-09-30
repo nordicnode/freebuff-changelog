@@ -2927,6 +2927,7 @@ mark.search-match{
 .evidence-flag{color:var(--term-yellow,#d29922);margin-top:6px;font-size:.78rem}
 /* Provenance, not a problem: text that predates the verification policy. */
 .evidence-note{color:var(--txt-dim);margin-top:6px;font-size:.76rem}
+.evidence-more{color:var(--txt-subtle);list-style:none;margin-left:-14px}
 .reading-mode-plain .evidence{display:none}
 
 /* Which release first carried this commit. */

@@ -953,7 +953,9 @@ function renderDiff(container, text, label, ghUrl, mode) {
 function badges (e) {
   const b = []
   const quality = qualityOf(e)
-  if (quality.uncertain) b.push(`<span class="badge lowc" title="${esc(quality.warnings.join(' '))}">[UNVERIFIED]</span>`)
+  // The tooltip summarizes: an objection list can run to a thousand characters,
+  // and a tooltip that long is a wall nobody reads. Full text is below.
+  if (quality.uncertain) b.push(`<span class="badge lowc" title="${esc(qualityText(e, { max: 260 }))}">[UNVERIFIED]</span>`)
   // The tooltip says what the rule saw (or that the model overrode it), so a
   // weight is a claim a reader can check rather than a colour.
   const why = e.ai?.significance && e.ai.significance !== e.significance
@@ -1212,7 +1214,7 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
 ${modelDiffLine(e)}
 ${e.eli5?.text ? `<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH</span>${esc(e.eli5.text)}</p>` : ''}
 ${leadHtml}
-${qualityOf(e).uncertain ? `<aside class="evidence-flag" role="note"><strong>Unverified claims</strong><ul>${qualityOf(e).warnings.map(w => `<li>${esc(w)}</li>`).join('')}</ul></aside>` : ''}
+${warningAside(e)}
 ${powerStart}
 ${e.eli5?.text ? summaryHtml : ''}
 ${migrationHtml(e)}
@@ -1272,6 +1274,20 @@ function changesHtml (e) {
   const list = e.ai?.changes
   if (!Array.isArray(list) || list.length < 2) return ''
   return `<ul class="changes">${list.map(c => `<li>${c.area ? `<span class="changes-area">${esc(c.area)}</span> ` : ''}${miniMd(c.what)}${c.files?.length ? ` <span class="changes-files">${c.files.slice(0, 3).map(f => `<code title="${esc(f)}">${esc(shortPath(f))}</code>`).join(' ')}</span>` : ''}</li>`).join('')}</ul>`
+}
+
+// The card-level warning box. It names the most useful objections and points at
+// the Evidence block for the rest, instead of printing the same full list twice
+// on one card (the verifier's issue text and its quoted claim often overlap).
+const ASIDE_MAX = 3
+const ASIDE_CHARS = 260
+function warningAside (e) {
+  const q = qualityOf(e)
+  if (!q.uncertain) return ''
+  const shown = q.warnings.slice(0, ASIDE_MAX).map(w => `<li>${esc(w.length > ASIDE_CHARS ? w.slice(0, ASIDE_CHARS).trimEnd() + '\u2026' : w)}</li>`).join('')
+  const rest = q.warnings.length - ASIDE_MAX
+  const more = rest > 0 ? `<li class="evidence-more">and ${rest} more objection${rest === 1 ? '' : 's'}, in full below</li>` : ''
+  return `<aside class="evidence-flag" role="note"><strong>Unverified claims</strong><ul>${shown}${more}</ul></aside>`
 }
 
 // What a user or operator has to do (breaking changes / required actions).

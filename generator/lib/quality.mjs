@@ -42,6 +42,32 @@ export function qualityStatus (r = {}) {
 export const VERIFIED_STATUSES = ['passed', 'human-edited']
 export const PLAIN_VERIFIED_STATUSES = ['passed', 'deterministic', 'human-edited']
 
+// The verifier can report the same objection twice: once as a free-text issue
+// and once as the quoted claim it refers to ("with ad-request update" inside a
+// sentence that already names it). A reader needs one of them, not both. When
+// two objections overlap, the fuller text is the one kept.
+const claimText = c => String(c?.claim || '').toLowerCase().replace(/[`"'\u201c\u201d]/g, '').replace(/\s+/g, ' ').trim()
+// A bare identifier or number is a legitimate objection of its own, and it is
+// trivially "contained" in any sentence that mentions it, so containment only
+// counts for a claim of at least two words that the other one clearly wraps.
+const contained = (t, u) => t === u || (t.split(' ').length >= 2 && u.includes(t) && u.length >= t.length * 1.5)
+
+export function dedupeClaims (claims = []) {
+  const out = []
+  for (const c of claims) {
+    const t = claimText(c)
+    if (!t) continue
+    const at = out.findIndex(o => {
+      const u = claimText(o)
+      return contained(t, u) || contained(u, t)
+    })
+    if (at === -1) { out.push(c); continue }
+    if (claimText(out[at]).length >= t.length) continue
+    out[at] = c
+  }
+  return out
+}
+
 export function qualityOf (e = {}) {
   const ai = e.ai || {}
   const plain = e.eli5 || {}
@@ -72,7 +98,7 @@ export function qualityOf (e = {}) {
     else if (verify === 'pre-policy') notes.push('This summary predates the current verification policy, so it has no fresh fact-check.')
     if (unverifiedNames.length) warnings.push(`Unverified names or numbers: ${unverifiedNames.join(', ')}.`)
     if (valueErrors.length) warnings.push(`Value errors: ${valueErrors.join('; ')}.`)
-    for (const c of ai.verifyClaims || []) warnings.push(`${c.claim}${c.reason ? ` (${c.reason})` : ''}`)
+    for (const c of dedupeClaims(ai.verifyClaims)) warnings.push(`${c.claim}${c.reason ? ` (${c.reason})` : ''}`)
     if (ai.manifest?.partial) warnings.push('Source evidence is partial; some changes may be omitted.')
   }
   if (plain.text && !PLAIN_VERIFIED_STATUSES.includes(plainVerify)) {
@@ -85,7 +111,7 @@ export function qualityOf (e = {}) {
     } else {
       warnings.push('The plain-English explanation has no successful current fact-check.')
     }
-    for (const c of plain.verifyClaims || []) warnings.push(`${c.claim}${c.reason ? ` (${c.reason})` : ''}`)
+    for (const c of dedupeClaims(plain.verifyClaims)) warnings.push(`${c.claim}${c.reason ? ` (${c.reason})` : ''}`)
   }
   if (plain.text && plain.manifest?.partial) warnings.push('The plain-English explanation uses partial evidence; some changes may be omitted.')
   const uncertain = warnings.length > 0
@@ -110,10 +136,24 @@ export function qualityOf (e = {}) {
 }
 
 // The loud form: a marker that means "a check did not pass". Pre-policy text
-// carries no marker, because nothing about it failed.
-export function qualityText (e) {
+// carries no marker, because nothing about it failed. Long objection lists are
+// cut to a character budget for the surfaces that have to stay scannable (the
+// badge tooltip, an RSS description, a Discord message); `qualityOf().warnings`
+// and the entry's own Evidence block keep every objection in full.
+export function qualityText (e, { max = 600 } = {}) {
   const q = qualityOf(e)
-  return q.uncertain ? `[UNVERIFIED] ${q.warnings.join(' ')}` : ''
+  if (!q.uncertain) return ''
+  const joined = q.warnings.join(' ')
+  if (joined.length <= max) return `[UNVERIFIED] ${joined}`
+  const kept = []
+  let used = 0
+  for (const w of q.warnings) {
+    if (kept.length && used + w.length > max) break
+    kept.push(w)
+    used += w.length + 1
+  }
+  const more = q.warnings.length - kept.length
+  return `[UNVERIFIED] ${kept.join(' ')}${more > 0 ? ` (+${more} more objection${more === 1 ? '' : 's'} on this entry)` : ''}`
 }
 
 // The quiet form: history disclosure without an alarm. Used where a reader has

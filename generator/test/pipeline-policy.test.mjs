@@ -10,12 +10,12 @@ import {
   LLM_CONTEXT_TOKENS, rememberClosedPrs, matchPrByPaths, prSummaryKey,
   pruneExpiredErrors, gatherEntryContext
 } from '../lib/llm.mjs'
-import { artifactHash, qualityOf, qualityText, qualityNote, qualityStatus, QUALITY_POLICY_V } from '../lib/quality.mjs'
+import { artifactHash, qualityOf, qualityText, qualityNote, qualityStatus, dedupeClaims, QUALITY_POLICY_V } from '../lib/quality.mjs'
 import { mergeChangelog, mergeOpenPrs, mergeHealth, persistMerged } from '../lib/mergedata.mjs'
 import { runEval, latestResult } from '../lib/eval.mjs'
 import { writeJson, withLock, withDeadline, git } from '../lib/util.mjs'
 import { checkDeployedHead } from '../lib/sync.mjs'
-import { entryRecord, discordText, generateReleaseNotesMarkdown } from '../lib/site.mjs'
+import { entryRecord, discordText, generateReleaseNotesMarkdown, buildSite } from '../lib/site.mjs'
 import { extractStructuredFacts } from '../lib/analyze.mjs'
 
 const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'offline-test', LLM_API_BASE: 'https://example.invalid/v1', LLM_MODEL: 'unchanged-model', CHANGELOG_LLM_RPM: '-1', CHANGELOG_LLM_ESCALATE: '0' }
@@ -127,6 +127,51 @@ test('R6/R19: never-checked history is disclosed quietly, a failed check is not'
   }
   assert.equal(qualityStatus({ verify: 'passed', policy: QUALITY_POLICY_V }), 'stale', 'a passed verdict with no bound hash is not current')
   assert.equal(qualityStatus({ verify: 'passed', verifyHash: 'deadbeef', title: 'T' }), 'stale', 'and a hash that no longer matches is stale')
+})
+
+test('R6: overlapping objections collapse and long lists are cut to a readable budget', async t => {
+  // The verifier reports the same objection as a sentence and again as the quote
+  // inside it, which printed a 1,140-character block twice on one card.
+  const claims = [
+    { claim: 'The title says the bump ships with ad-request update, which the diff does not show.' },
+    { claim: 'with ad-request update' },
+    { claim: 'The summary claims a publish step that the diff does not demonstrate.' },
+    { claim: 'The summary claims a publish step that the diff does not demonstrate, and names files the diff omits.' }
+  ]
+  const deduped = dedupeClaims(claims)
+  assert.equal(deduped.length, 3, 'the quoted duplicate is dropped, distinct objections stay')
+  assert.ok(!deduped.some(c => c.claim === 'with ad-request update'), 'the bare quote is the one removed')
+  assert.equal(dedupeClaims([{ claim: 'LIMIT' }, { claim: 'The LIMIT constant now defaults to two.' }]).length, 2,
+    'a bare identifier objection is not swallowed by a sentence that mentions it')
+
+  const many = { ai: { title: 'T', summary: 'S.', verify: 'flagged', verifyClaims: Array.from({ length: 6 }, (_, i) => ({ claim: ('objection ' + i + ' ') + 'x'.repeat(200) })) } }
+  const full = qualityOf(many).warnings.join(' ')
+  const shown = qualityText(many, { max: 600 })
+  assert.ok(shown.length < full.length, 'the export copy is shorter than the full objection list')
+  assert.ok(shown.includes('more objection'), 'and it says how many were left out')
+  assert.equal(qualityOf(many).warnings.length, 7, 'the full list stays available to readers who want it')
+
+  const doc = {
+    version: 1, repo: 'https://github.com/CodebuffAI/freebuff', generatedAt: '2026-09-30T00:00:00Z',
+    headSha: 'f'.repeat(40), counts: { commitsScanned: 1, entries: 1, syncEra: 1, community: 0 },
+    entries: [{
+      kind: 'sync', sha: 'c'.repeat(40), url: 'https://example.test/c', date: '2026-09-30T09:00:00Z',
+      areas: ['CLI'], modelChanges: null, cmdChanges: null, category: 'CLI', significance: 'minor',
+      files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/x.ts'] },
+      stats: { additions: 1, deletions: 0 }, facts: [], summary: 'Bump.', title: 'Bump.', day: '2026-09-30', month: '2026-09',
+      ai: { title: 'Bump.', summary: 'Bump.', verify: 'flagged', verifyClaims: Array.from({ length: 6 }, (_, i) => ({ claim: ('objection ' + i + ' ') + 'y'.repeat(300) })) },
+      eli5: { text: 'A plain line.' }
+    }]
+  }
+  const dist = await mkdtemp(join(tmpdir(), 'fb-card-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  await buildSite({ changelog: doc, openPrs: [], dist })
+  const html = await readFile(join(dist, 'day', '2026-09-30', 'index.html'), 'utf8')
+  const aside = html.slice(html.indexOf('Unverified claims'), html.indexOf('</aside>'))
+  assert.ok(aside.includes('and 4 more objections, in full below'), 'the card names a few and points at the rest')
+  assert.equal((aside.match(new RegExp('<li', 'g')) || []).length, 4, 'three objections plus the pointer')
+  assert.ok(aside.includes(String.fromCharCode(8230)), 'a long objection is truncated on the card')
+  assert.ok(html.includes('y'.repeat(300)), 'the full text is still on the page, in the Evidence block')
 })
 
 test('R12/R20: instruction examples and rejected replies cannot authorize names', () => {
