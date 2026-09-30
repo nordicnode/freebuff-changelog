@@ -106,6 +106,21 @@ test('ungroundedIdentifiers: a member name after a dot is a mention, not an inve
   assert.deepEqual(ungroundedIdentifiers('Reads `FF_MODELS`.', 'const CODEBUFF_MODELS = 1'), ['FF_MODELS'], 'and a fragment starting mid-identifier')
 })
 
+test('ungroundedIdentifiers: globs, calls and case-differing file names ground against the source', () => {
+  // Reported live, all three: `run-*.ts` is a pattern (nothing in a corpus reads
+  // `run-*`), `freebuffDesktopSessionLimits(hasPaidPlan)` is a callee with an
+  // argument (only an empty `()` was ever trimmed), and a repo file spelled
+  // `code-reviewer-deepseek.ts` is the file a row calls
+  // `code-reviewer-DeepSeek.ts`.
+  const patch = '+ // helpers live in run-heal.ts and run-backfill.ts\n+ gate(`code-reviewer-deepseek.ts`)\n+ freebuffDesktopSessionLimits(hasPaidPlan)\n+ spawnInstalledBinary()'
+  assert.deepEqual(ungroundedIdentifiers('Touches the `run-*.ts` helpers.', patch), [], 'a glob is grounded by its head')
+  assert.deepEqual(ungroundedIdentifiers('Gated by `freebuffDesktopSessionLimits(hasPaidPlan)`.', patch), [], 'a call is grounded by its callee')
+  assert.deepEqual(ungroundedIdentifiers('Edits `agents/code-reviewer-DeepSeek.ts`.', patch), [], 'a file name is not case in the claim')
+  assert.deepEqual(ungroundedIdentifiers('Touches the `zzz-*.ts` helpers.', patch), ['zzz-*.ts'], 'a glob the source does not contain is still an invention')
+  assert.deepEqual(ungroundedIdentifiers('Gated by `inventedFn(hasPaidPlan)`.', patch), ['inventedFn(hasPaidPlan)'], 'so is an invented callee')
+  assert.deepEqual(ungroundedIdentifiers('Edits `agents/nope-DeepSeek.ts`.', patch), ['agents/nope-DeepSeek.ts'], 'and an invented file')
+})
+
 test('ungroundedIdentifiers: a quoted regex fragment and an indexed name ground against the source that holds them', () => {
   // Reported live from sdk/src/impl/model-provider.ts: the row quoted the diff
   // faithfully and was still called out for inventing both names. `models?` is

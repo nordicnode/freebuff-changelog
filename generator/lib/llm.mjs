@@ -1989,15 +1989,18 @@ export function ungroundedIdentifiers (text, corpus) {
     if (!raw || GROUNDING_PLACEHOLDER_RE.test(raw)) continue
     if (/^v?\d+(?:\.\d+)*[a-z0-9-]*$/i.test(raw)) continue
     const words = raw.split(/\s+/)
-      // `foo()` first, a subscript second, then stray edge punctuation:
-      // trimming ")" before "(" used to leave "foo(" - a shape no corpus
-      // contains - and every backticked call was reported as invented. The
+      // A trailing call list goes first: a row naming
+      // `freebuffDesktopSessionLimits(hasPaidPlan)` is naming the function and
+      // passing it an argument, and only an empty `()` used to be trimmed. The
+      // callee still has to exist. Then a subscript, then stray edge
+      // punctuation: trimming ")" before "(" used to leave "foo(" - a shape no
+      // corpus contains - and every backticked call was reported as invented. The
       // subscript has to go before the punctuation strip, which would eat the
       // closing bracket and leave `PATTERNS[1` - a shape no source contains.
       // `PATTERNS[1]` is a claim about PATTERNS with a position attached, and
       // the position is not a name: `const PATTERNS = [` never spells the
       // index, so the whole span could never be grounded.
-      .map(w => w.replace(/\(\)$/, '').replace(/\[[^\[\]]*\]$/, '').replace(/^[('"[{<]+|[)'"\]}>,.;:]+$/g, ''))
+      .map(w => w.replace(/\([^()]*\)$/, '').replace(/\[[^\[\]]*\]$/, '').replace(/^[('"[{<]+|[)'"\]}>,.;:]+$/g, ''))
       // `<publisher>/<id>@<version>` is a placeholder too, just a composite one.
       .filter(w => w.length >= 3 && /[a-z]/i.test(w) && !GROUNDING_PLACEHOLDER_RE.test(w) && !/<[^>]+>/.test(w))
     if (!words.length) continue
@@ -2010,18 +2013,36 @@ export function ungroundedIdentifiers (text, corpus) {
     const present = (w) => {
       const bare = w.replace(/\/$/, '').replace(/=.*$/, '')
       if (!bare || bare.length < 3) return true
+      // A wildcard is a pattern, not a name: `run-*.ts` claims files shaped
+      // like that, and what a pattern needs from the corpus is its head. The
+      // whole-token rule cannot answer this one at all -- nothing in the
+      // corpus reads `run-*` -- so it was reporting every glob as an invented
+      // name. `.` and `-` stay out of the metacharacter set below so dotted
+      // paths and dashed model ids keep the whole-token rule.
+      if (/[*…]/.test(bare)) {
+        const head = bare.split(/[*…]/)[0]
+        if (head.length >= 3 && hay.includes(head)) return true
+      }
       // A token carrying regex metacharacters is a code fragment the row is
       // quoting, not an identifier it is naming: `models?` is the pattern in
       // the diff, and the whole-token rule rejects it because the source
       // writes it word-boundary-escaped (`/\bmodels?\b...`), where the
       // character before the name is the escape's `b`. Verbatim presence is
       // the right standard for a fragment, and it still catches an invented
-      // one. `.` and `-` stay out of the set so dotted paths and dashed model
-      // ids keep the whole-token rule.
+      // one.
       if (/[?*+^$|()[\]{}\\]/.test(bare)) { if (hay.includes(bare)) return true }
       if (corpusHas(bare) || corpusHasName(bare)) return true
+      // A claimed path may drop the directory the corpus lists, and a file name
+      // is spelled the way the filesystem has it: a row naming
+      // `agents/code-reviewer-DeepSeek.ts` for a repo file called
+      // `code-reviewer-deepseek.ts` is describing the right file, and the
+      // case-sensitive test called it invented. The last path segment keeps its
+      // extension (`split(/[./]/)` reads `.ts` as a segment of its own, which
+      // left the tail as `ts`).
+      const seg = bare.split('/').filter(Boolean).pop()
+      if (seg && seg !== bare && seg.length >= 4 && (corpusHas(seg) || corpusHasName(seg))) return true
       const tail = bare.split(/[./]/).filter(Boolean).pop()
-      if (tail && tail.length >= 4 && tail !== bare && corpusHas(tail)) return true
+      if (tail && tail.length >= 4 && tail !== bare && (corpusHas(tail) || corpusHasName(tail))) return true
       return dottedGrounded(bare)
     }
     if (!words.every(present) && !out.includes(raw)) out.push(raw)
@@ -2040,7 +2061,7 @@ export function ungroundedIdentifiers (text, corpus) {
     const p = m[1]
     if (corpusHas(p)) continue
     const tail = p.split('/').pop()
-    if (tail && corpusHas(tail)) continue
+    if (tail && (corpusHas(tail) || corpusHasName(tail))) continue
     if (!out.includes(p)) out.push(p)
   }
   // Bare identifiers outside backticks: the model is told to use backticks for
