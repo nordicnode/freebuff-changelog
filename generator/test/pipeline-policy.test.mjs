@@ -119,13 +119,24 @@ test('R6/R19: never-checked history is disclosed quietly, a failed check is not'
   assert.equal(qa.confidence, 'medium', 'an unchecked high-confidence row is capped')
   assert.match(qualityText(admitted), /no current verification/)
 
-  // A recorded negative verdict is loud whatever the policy version.
-  for (const [status, pattern] of [['flagged', /objected/], ['unavailable', /could not run/]]) {
-    const bad = { ai: { title: 'T', summary: 'S.', verify: status }, eli5: { text: 'P.', verify: status } }
-    assert.equal(qualityOf(bad).uncertain, true)
-    assert.equal(qualityOf(bad).demoteActions, true)
-    assert.match(qualityText(bad), pattern)
-  }
+  // A check that RAN and objected is loud whatever the policy version.
+  const flagged = { ai: { title: 'T', summary: 'S.', verify: 'flagged' }, eli5: { text: 'P.', verify: 'flagged' } }
+  assert.equal(qualityOf(flagged).uncertain, true)
+  assert.equal(qualityOf(flagged).demoteActions, true)
+  assert.match(qualityText(flagged), /objected/)
+
+  // A check that could NOT run notifies no one on the entry (removed by request:
+  // a provider outage had printed the notice on hundreds of healthy rows). The
+  // state itself is untouched -- the verdict stays readable for /stats/ and the
+  // JSON API, and actionable labels stay demoted while it cannot be confirmed.
+  const unavailable = { ai: { title: 'T', summary: 'S.', verify: 'unavailable' }, eli5: { text: 'P.', verify: 'unavailable' } }
+  const qu = qualityOf(unavailable)
+  assert.equal(qu.verify, 'unavailable', 'the verdict is still recorded')
+  assert.equal(qu.uncertain, false, 'but nothing on the entry is called into question')
+  assert.equal(qu.demoteActions, true, 'so ACTION/BREAKING labels stay demoted')
+  assert.equal(qualityText(unavailable), '', 'no [UNVERIFIED] marker and no notice')
+  assert.ok(!qu.warnings.some(w => /could not run|no successful current fact-check/.test(w)),
+    'the three removed sentences cannot come back through any status')
   assert.equal(qualityStatus({ verify: 'passed', policy: QUALITY_POLICY_V }), 'stale', 'a passed verdict with no bound hash is not current')
   assert.equal(qualityStatus({ verify: 'passed', verifyHash: 'deadbeef', title: 'T' }), 'stale', 'and a hash that no longer matches is stale')
 })

@@ -1617,6 +1617,36 @@ test('fileChips: renders source files, test files, churned files, and renames wi
   assert.doesNotMatch(html, /class="fchip more"/, 'all 5 files are shown, so no overflow chip is needed')
 })
 
+// Three notices were removed from entries on request (2026-09-30): a verifier
+// that could not run is not a statement about the text, and a provider outage
+// had printed "unverified" on hundreds of rows with nothing wrong with them.
+// The rendered card is where they used to appear, so that is where the removal
+// is locked in -- while the row that genuinely failed a check keeps its voice.
+test('an unavailable verifier check renders no notification on the entry', () => {
+  const base = {
+    sha: '1234567890abcdef1234567890abcdef12345678',
+    date: '2026-09-30T10:00:00Z',
+    day: '2026-09-30',
+    category: 'Core',
+    significance: 'notable',
+    stats: { additions: 10, deletions: 5 },
+    files: { total: 2, added: [], modified: ['src/app.ts'], tests: [], churned: [], removed: [], renamed: [] }
+  }
+  const unavailable = {
+    ...base,
+    ai: { title: 'Generated title', summary: 'Generated summary.', confidence: 'high', verify: 'unavailable', breaking: true },
+    eli5: { text: 'Plain-English line.', verify: 'unavailable' }
+  }
+  const html = entryCard(unavailable)
+  assert.doesNotMatch(html, /could not run/i, 'the technical notice stays removed')
+  assert.doesNotMatch(html, /no successful current fact-check/i, 'and so does the plain-English one')
+  assert.doesNotMatch(html, /UNVERIFIED/, 'nothing on the card is called into question')
+  assert.doesNotMatch(html, /\[BREAKING\]/, 'an actionable label is still demoted while the check cannot run')
+
+  const flagged = { ...base, ai: { ...unavailable.ai, verify: 'flagged' }, eli5: { ...unavailable.eli5, verify: 'flagged' } }
+  assert.match(entryCard(flagged), /objected/, 'a check that ran and objected still speaks')
+})
+
 
 
 // Upstream-authored strings (commit subjects, model tables) and LLM summaries
