@@ -1214,7 +1214,6 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
 ${modelDiffLine(e)}
 ${e.eli5?.text ? `<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH</span>${esc(e.eli5.text)}</p>` : ''}
 ${leadHtml}
-${warningAside(e)}
 ${powerStart}
 ${e.eli5?.text ? summaryHtml : ''}
 ${migrationHtml(e)}
@@ -1274,20 +1273,6 @@ function changesHtml (e) {
   const list = e.ai?.changes
   if (!Array.isArray(list) || list.length < 2) return ''
   return `<ul class="changes">${list.map(c => `<li>${c.area ? `<span class="changes-area">${esc(c.area)}</span> ` : ''}${miniMd(c.what)}${c.files?.length ? ` <span class="changes-files">${c.files.slice(0, 3).map(f => `<code title="${esc(f)}">${esc(shortPath(f))}</code>`).join(' ')}</span>` : ''}</li>`).join('')}</ul>`
-}
-
-// The card-level warning box. It names the most useful objections and points at
-// the Evidence block for the rest, instead of printing the same full list twice
-// on one card (the verifier's issue text and its quoted claim often overlap).
-const ASIDE_MAX = 3
-const ASIDE_CHARS = 260
-function warningAside (e) {
-  const q = qualityOf(e)
-  if (!q.uncertain) return ''
-  const shown = q.warnings.slice(0, ASIDE_MAX).map(w => `<li>${esc(w.length > ASIDE_CHARS ? w.slice(0, ASIDE_CHARS).trimEnd() + '\u2026' : w)}</li>`).join('')
-  const rest = q.warnings.length - ASIDE_MAX
-  const more = rest > 0 ? `<li class="evidence-more">and ${rest} more objection${rest === 1 ? '' : 's'}, in full below</li>` : ''
-  return `<aside class="evidence-flag" role="note"><strong>Unverified claims</strong><ul>${shown}${more}</ul></aside>`
 }
 
 // What a user or operator has to do (breaking changes / required actions).
@@ -1378,6 +1363,9 @@ function evidenceHtml (e) {
   const badNames = bad
   const quality = qualityOf(e)
   if (!ev && !badNames.length && !quality.uncertain && !quality.notes.length) return ''
+  // The objections live here, behind the toggle, with the diff citations they
+  // are about: the badge above is the signal, this is the proof. Printing the
+  // same list on the card as well doubled the text and buried the entry.
   const flag = badNames.length
     ? `<p class="evidence-flag">Not found in the diff or source context: ${badNames.map(x => `<code>${esc(x)}</code>`).join(', ')}. Treat these names as unverified.</p>`
     : ''
@@ -1386,7 +1374,7 @@ function evidenceHtml (e) {
     : e.ai?.verify === 'unavailable'
       ? '<p class="evidence-flag">The verifier check could not run for this row, so its claims are unverified.</p>'
       : ''
-  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${badNames.length ? ` <span class="evidence-warn">(${badNames.length} unverified name${badNames.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}${quality.warnings.map(w => `<p class="evidence-flag">${esc(w)}</p>`).join('')}${quality.notes.map(n => `<p class="evidence-note">${esc(n)}</p>`).join('')}</div></details>`
+  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${badNames.length ? ` <span class="evidence-warn">(${badNames.length} unverified name${badNames.length === 1 ? '' : 's'})</span>` : ''}${quality.uncertain ? ` <span class="evidence-warn">(${quality.warnings.length} objection${quality.warnings.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}${quality.warnings.map(w => `<p class="evidence-flag">${esc(w)}</p>`).join('')}${quality.notes.map(n => `<p class="evidence-note">${esc(n)}</p>`).join('')}</div></details>`
 }
 
 // Implementation notes and comments extracted directly from the commit diff.

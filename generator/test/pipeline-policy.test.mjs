@@ -167,11 +167,12 @@ test('R6: overlapping objections collapse and long lists are cut to a readable b
   t.after(() => rm(dist, { recursive: true, force: true }))
   await buildSite({ changelog: doc, openPrs: [], dist })
   const html = await readFile(join(dist, 'day', '2026-09-30', 'index.html'), 'utf8')
-  const aside = html.slice(html.indexOf('Unverified claims'), html.indexOf('</aside>'))
-  assert.ok(aside.includes('and 4 more objections, in full below'), 'the card names a few and points at the rest')
-  assert.equal((aside.match(new RegExp('<li', 'g')) || []).length, 4, 'three objections plus the pointer')
-  assert.ok(aside.includes(String.fromCharCode(8230)), 'a long objection is truncated on the card')
-  assert.ok(html.includes('y'.repeat(300)), 'the full text is still on the page, in the Evidence block')
+  assert.ok(!html.includes('Unverified claims'), 'objections are not printed above the fold')
+  assert.ok(html.includes('class="badge lowc"'), 'the badge still signals the entry to a reader')
+  assert.ok(html.includes('(7 objections)'), 'and the Evidence toggle says how many are behind it')
+  const body = html.slice(html.indexOf('<div class="evidence-body">'))
+  assert.ok(body.includes('y'.repeat(300)), 'every objection is in the Evidence block, in full')
+  assert.ok(body.includes('objection 5'), 'including the ones the card used to leave out')
 })
 
 test('R12/R20: instruction examples and rejected replies cannot authorize names', () => {
