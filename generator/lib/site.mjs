@@ -1369,13 +1369,11 @@ function evidenceHtml (e) {
   const flag = badNames.length
     ? `<p class="evidence-flag">Not found in the diff or source context: ${badNames.map(x => `<code>${esc(x)}</code>`).join(', ')}. Treat these names as unverified.</p>`
     : ''
-  // Only a check that RAN and objected speaks here. "Could not run" says nothing
-  // about the text and, during a provider outage, was printed on hundreds of
-  // healthy rows; the verdict itself stays on the record (qualityOf().verify,
-  // the demotion rule and /stats/ all still see it).
   const verify = e.ai?.verify === 'flagged'
     ? '<p class="evidence-flag">The verifier still objected to claims in this summary after one repair.</p>'
-    : ''
+    : e.ai?.verify === 'unavailable'
+      ? '<p class="evidence-flag">The verifier check could not run for this row, so its claims are unverified.</p>'
+      : ''
   return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${badNames.length ? ` <span class="evidence-warn">(${badNames.length} unverified name${badNames.length === 1 ? '' : 's'})</span>` : ''}${quality.uncertain ? ` <span class="evidence-warn">(${quality.warnings.length} objection${quality.warnings.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}${quality.warnings.map(w => `<p class="evidence-flag">${esc(w)}</p>`).join('')}${quality.notes.map(n => `<p class="evidence-note">${esc(n)}</p>`).join('')}</div></details>`
 }
 

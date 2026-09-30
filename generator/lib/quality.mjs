@@ -93,12 +93,7 @@ export function qualityOf (e = {}) {
   if (ai.title && !edited) {
     if (verify === 'flagged') warnings.push('The verifier objected to claims in this entry.')
     else if (verify === 'stale') warnings.push('The stored verification no longer matches this text, so it is not current.')
-    // A check that could not run raises no reader-facing notification (2026-09-30,
-    // by request): a provider outage marked a large number of healthy rows
-    // `unavailable`, so the notice read as a defect on rows with nothing wrong
-    // with their text. Nothing about the state is hidden elsewhere -- the
-    // recorded verdict, `demoteActions` (actions still demoted) and the /stats/
-    // coverage buckets all key off `verify`, not off this sentence.
+    else if (verify === 'unavailable') warnings.push('The verifier check could not run, so the technical claims are unverified.')
     else if (verify === 'unchecked') warnings.push('Technical claims have no current verification.')
     else if (verify === 'pre-policy') notes.push('This summary predates the current verification policy, so it has no fresh fact-check.')
     if (unverifiedNames.length) warnings.push(`Unverified names or numbers: ${unverifiedNames.join(', ')}.`)
@@ -113,10 +108,9 @@ export function qualityOf (e = {}) {
       warnings.push('The fact-check objected to claims in the plain-English explanation.')
     } else if (plainVerify === 'stale') {
       warnings.push('The stored fact-check no longer matches this plain-English text, so it is not current.')
+    } else {
+      warnings.push('The plain-English explanation has no successful current fact-check.')
     }
-    // `unavailable`/`unchecked` plain-English states notify no one, for the same
-    // reason the technical side above stays quiet. Recorded objections on the
-    // line itself (plain.verifyClaims) are still printed below.
     for (const c of dedupeClaims(plain.verifyClaims)) warnings.push(`${c.claim}${c.reason ? ` (${c.reason})` : ''}`)
   }
   if (plain.text && plain.manifest?.partial) warnings.push('The plain-English explanation uses partial evidence; some changes may be omitted.')
