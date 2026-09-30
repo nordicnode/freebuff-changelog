@@ -2436,6 +2436,13 @@ export function isTransientError (err) {
 export function errorRetryDelayMs (stub, { errorCooldownMs = 3600000, transientRetryMs = 300000, maxAttempts = 3 } = {}) {
   if (!stub || !stub.error) return 0
   if (stub.transient) return transientRetryMs
+  // Re-classified on read, not trusted from when it was written: a row parked by
+  // a failure that came back with nothing -- including one the stored flag says
+  // was a permanent failure, because the flag predates this rule -- gets the
+  // short cooldown instead of never being asked again. Re-reading is what
+  // releases a row killed by our own cycle deadline without editing the data by
+  // hand (the merge unions disk back in, so a hand-deleted stub returns).
+  if (callUnanswered(new Error(String(stub.error)))) return transientRetryMs
   const attempts = Math.max(1, Number(stub.attempts) || 1)
   const cap = stub.deterministic ? Math.min(maxAttempts, 2) : maxAttempts
   if (attempts >= cap) return Infinity
@@ -2527,14 +2534,16 @@ export function chargeReverify (rec, { answered, now = Date.now() } = {}) {
 }
 
 // Did this failure come back with nothing to judge? A 5xx/timeout/socket error
-// never reached a verdict, a throttled (429) or gateway-timed-out (408) response
-// never returned one either, and neither did a call the cycle deadline killed.
-// Everything else -- including a refusal, an answer from training memory, or a
-// reply the schema could not parse -- is the model answering badly, which is a
-// real attempt and is charged as one.
-export function verifierUnanswered (err) {
+// never reached an answer, a throttled (429) or gateway-timed-out (408)
+// response never returned one, and neither did a call our own cycle deadline or
+// request budget killed. Everything else -- a refusal, an answer from training
+// memory, a reply the schema could not parse, a 400 -- is the model answering
+// badly, which is a real attempt. Used for both verdict charging (the verifier)
+// and failure classification (the writer): a row whose call our own budget
+// interrupted is not doomed, it is interrupted.
+export function callUnanswered (err) {
   const msg = String(err?.message || err || '')
-  return isGatewayError(err) || /HTTP 4(29|08)\b/i.test(msg) || /deadline/i.test(msg)
+  return isGatewayError(err) || /HTTP 4(29|08)\b/i.test(msg) || /deadline|budget exceeded/i.test(msg)
 }
 
 // What the row's prompt shows that can arrive AFTER its summary ships: the
@@ -4079,7 +4088,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           // stamped either way -- a verifier that is down for an hour must not
           // become a re-check every cycle -- but a call that never came back
           // spends the no-answer allowance, not the row's three verdict tries.
-          const charge = chargeReverify(reverify, { answered: !verifierUnanswered(err) })
+          const charge = chargeReverify(reverify, { answered: !callUnanswered(err) })
           cache[key] = { ...reverify, ...charge, at: charge.verifyAt }
           cacheModified = true
           if (isGatewayError(err)) {
@@ -4095,7 +4104,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           // A heal attempt must never destroy shipped content: a failure
           // leaves the text alone. A transient one keeps the row eligible for
           // the next run; a real one spends one of its bounded tries.
-          if (!isTransientError(err)) {
+          if (!callUnanswered(err)) {
             const nowIso = new Date().toISOString()
             cache[key] = { ...heal, healTries: (Number(heal.healTries) || 0) + 1, healAt: nowIso, at: nowIso }
             cacheModified = true
@@ -4109,7 +4118,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           }
           continue
         }
-        const transient = isTransientError(err)
+        const transient = isTransientError(err) || callUnanswered(err)
         const prev = cache[key]
         const attempts = (prev?.error ? Number(prev.attempts) || 1 : 0) + 1
         const stub = (extra) => ({
@@ -4887,7 +4896,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
       } catch (err) {
         log(`ELI5 failed for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
         health.explanationFailures++
-        const transient = isTransientError(err)
+        const transient = isTransientError(err) || callUnanswered(err)
         const prev = cache[key]
         const attempts = (prev?.error ? Number(prev.attempts) || 1 : 0) + 1
         const stub = (extra) => ({
@@ -5212,7 +5221,7 @@ export async function enrichOpenPrs (prs, dataDir, env = process.env, options = 
       log(`LLM previewed PR #${pr.number} (${calls}/${queue.length})`)
     } catch (err) {
       log(`LLM PR preview failed for #${pr.number}: ${shortError(err)}`)
-      cache[key] = { error: shortError(err).slice(0, 200), attempts: (Number(cache[key]?.attempts) || 0) + 1, ...(isTransientError(err) ? { transient: true } : {}), at: new Date().toISOString() }
+      cache[key] = { error: shortError(err).slice(0, 200), attempts: (Number(cache[key]?.attempts) || 0) + 1, ...(isTransientError(err) || callUnanswered(err) ? { transient: true } : {}), at: new Date().toISOString() }
       modified = true
       if (isGatewayError(err)) break
     }

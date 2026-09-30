@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, chargeReverify, verifierUnanswered, callLlm, VERIFY_POLICY_V } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, chargeReverify, callUnanswered, callLlm, VERIFY_POLICY_V } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -277,18 +277,43 @@ test('re-check policy: only rows that say they are unverified, bounded and coole
 })
 
 test('re-check accounting: an unanswered call spends a no-answer slot, not a verdict try', () => {
-  assert.equal(verifierUnanswered(new Error('LLM HTTP 504')), true, 'a gateway 5xx returned no verdict')
-  assert.equal(verifierUnanswered(new Error('The operation was aborted due to timeout')), true, 'a timeout returned no verdict')
-  assert.equal(verifierUnanswered(new Error('Generator cycle deadline exceeded')), true, 'a deadline killed the call before it answered')
-  assert.equal(verifierUnanswered(new Error('LLM HTTP 429')), true, 'a throttle returned no verdict')
-  assert.equal(verifierUnanswered(new Error('LLM returned no JSON')), false, 'a malformed answer is a real attempt')
-  assert.equal(verifierUnanswered(new Error('the model refused the request')), false, 'and so is a refusal')
+  assert.equal(callUnanswered(new Error('LLM HTTP 504')), true, 'a gateway 5xx returned no verdict')
+  assert.equal(callUnanswered(new Error('The operation was aborted due to timeout')), true, 'a timeout returned no verdict')
+  assert.equal(callUnanswered(new Error('Generator cycle deadline exceeded')), true, 'a deadline killed the call before it answered')
+  assert.equal(callUnanswered(new Error('LLM cycle request budget exceeded')), true, 'and so did our own request budget')
+  assert.equal(callUnanswered(new Error('LLM HTTP 429')), true, 'a throttle returned no verdict')
+  assert.equal(callUnanswered(new Error('LLM returned no JSON')), false, 'a malformed answer is a real attempt')
+  assert.equal(callUnanswered(new Error('the model refused the request')), false, 'and so is a refusal')
   const spaced = chargeReverify({}, { answered: false, now: Date.parse('2026-09-30T19:00:00Z') })
   assert.equal(spaced.verifyTries, undefined, 'no verdict try is spent on a call that never answered')
   assert.equal(spaced.verifyErrors, 1, 'the no-answer count moves instead')
   assert.equal(spaced.verifyAt, '2026-09-30T19:00:00.000Z', 'and the cooldown is stamped, so the re-ask is spaced')
   assert.deepEqual(chargeReverify({ verifyTries: 1, verifyErrors: 4 }, { answered: true, now: 0 }),
     { verifyTries: 2, verifyAt: '1970-01-01T00:00:00.000Z' }, 'only an answered attempt counts as a verdict try')
+})
+
+test('retry cooldown: a failure our own budget caused is retried, not parked forever', () => {
+  // fc37ac10 (2026-09-30): four calls killed by the cycle deadline were stored
+  // with transient false, so errorRetryDelayMs returned Infinity and the row
+  // could never be regenerated even after the gateway recovered -- a row missing
+  // a generation for our own reason, silently, permanently. The classification
+  // is re-read from the stored message rather than trusted from when it was
+  // written, which is what releases such a row without editing the data by hand:
+  // the merge unions disk back in, so a hand-deleted stub returns.
+  const deadline = { error: 'LLM cycle deadline exceeded', attempts: 4, at: '2026-09-30T19:49:46.705Z' }
+  assert.equal(errorRetryDelayMs(deadline), 300000, 'an unanswered call gets the short cooldown however many times it happened')
+  assert.equal(errorRetryDelayMs({ error: 'LLM cycle request budget exceeded', attempts: 7 }), 300000,
+    'and so does one our own request budget cut short')
+  assert.equal(errorRetryDelayMs({ error: 'LLM HTTP 504', attempts: 9, transient: false }), 300000,
+    'including a stored flag that called a gateway timeout permanent')
+  assert.equal(errorRetryDelayMs({
+    error: 'LLM refused the request on every ask (deterministic content failure): LLM returned no JSON',
+    deterministic: true, attempts: 2
+  }), Infinity, 'a refusal on every rung is still parked for good')
+  assert.equal(errorRetryDelayMs({ error: 'LLM HTTP 400: bad request', attempts: 3 }), Infinity,
+    'a real permanent failure is still parked')
+  assert.equal(errorRetryDelayMs({ error: 'LLM HTTP 400: bad request', attempts: 1 }), 3600000,
+    'and the first one cools down for an hour')
 })
 
 test('re-check: a row that shipped with no verdict is checked later, and its text is never rewritten', async (t) => {
