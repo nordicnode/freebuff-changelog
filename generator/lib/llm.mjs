@@ -69,8 +69,8 @@ export function llmConfigured (env = process.env) {
 
 // Prompt versions live in versions.mjs (mergedata.mjs needs them without a
 // circular import); re-exported here as part of this module's contract.
-import { PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, cacheKeyVersion, pruneStaleCache } from './versions.mjs'
-export { PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, cacheKeyVersion, pruneStaleCache }
+import { PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, VERIFY_POLICY_V, cacheKeyVersion, pruneStaleCache } from './versions.mjs'
+export { PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, VERIFY_POLICY_V, cacheKeyVersion, pruneStaleCache }
 
 // Who a change is for. The technical pass classifies once; the plain-English
 // pass consumes the verdict instead of inferring it a second time from the
@@ -2417,8 +2417,15 @@ export function summaryDirt (rec) {
 // stamped on every attempt so a verifier outage cannot turn into a re-check
 // every cycle. The re-check itself is the cheap half of the pipeline: no
 // writer call, no rewrite -- the shipped text is read, never replaced.
-export function reverifyEligible (rec, { maxTries = 3, cooldownMs = 1800000, now = Date.now() } = {}) {
-  if (!rec || rec.error || !['unavailable', 'stale'].includes(qualityOf({ ai: rec }).verify)) return false
+export function reverifyEligible (rec, { maxTries = 3, cooldownMs = 1800000, now = Date.now(), reframed = false } = {}) {
+  if (!rec || rec.error) return false
+  const status = qualityOf({ ai: rec }).verify
+  // An objection stands until something new is brought to the check. A verdict
+  // recorded under older verifier framing is exactly that: the same text was
+  // judged against evidence the current check no longer uses, so it earns one
+  // fresh read. Once the verdict carries this policy, it is not re-read again.
+  const wanted = ['unavailable', 'stale'].includes(status) || (reframed && status === 'flagged')
+  if (!wanted) return false
   // A record with no text of its own is not a shipped summary to re-read.
   if (!rec.title || !rec.summary) return false
   if ((Number(rec.verifyTries) || 0) >= maxTries) return false
@@ -3530,7 +3537,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     ...(clean.whyMissing ? { whyMissing: true } : {}),
     // A passed record names the configured reviewer; same-family defaults
     // have correlated blind spots and are not independent human adjudication.
-    ...(verify ? { verify, verifyModel: verifyModelOf(env) } : {}),
+    ...(verify ? { verify, verifyPolicy: VERIFY_POLICY_V, verifyModel: verifyModelOf(env) } : {}),
     ...(verify === 'flagged' && verifyClaims?.length ? { verifyClaims } : {}),
     ...(escalated ? { escalated: true } : {}),
     ...(selfCheck ? { selfCheck } : {}),
@@ -3560,10 +3567,15 @@ export function enrichmentEligible (e, env = process.env) {
 
 export async function enrichWithLlm (entries, getPatch, dataDir, env = process.env, options = {}) {
   if (!llmConfigured(env)) return 0
-  const targets = entries.filter(e => enrichmentEligible(e, env))
-  if (!targets.length) return 0
   const cachePath = `${dataDir}/ai-summaries.json`
   const cache = await readJson(cachePath, {})
+  // Rows the writer queue may touch. A verdict recorded under older verifier
+  // framing is handled by the re-check pass instead, which replaces no text, so
+  // a cache of nothing but framed-out rows must not end the run before it runs.
+  const targets = entries.filter(e => enrichmentEligible(e, env))
+  const framedOut = Object.values(cache).some(rec => rec && !rec.error && rec.verifyPolicy !== VERIFY_POLICY_V &&
+    ['flagged', 'stale', 'unavailable'].includes(qualityOf({ ai: rec }).verify))
+  if (!targets.length && !framedOut) return 0
   const rawLimit = env.CHANGELOG_LLM_LIMIT ? Number(env.CHANGELOG_LLM_LIMIT) : 60
   const limit = rawLimit > 0 ? rawLimit : Infinity
   const concurrency = llmConcurrency(env)
@@ -3800,8 +3812,14 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       const sha = String(k.split(':')[0])
       if (ownedSha.has(sha)) continue
       const e = entries[posIndex.get(sha)]
-      if (!e || !enrichmentEligible(e, env) || e.noise || gaveUp({ ...e, ai: rec })) continue
-      if (!reverifyEligible(rec, { maxTries: reverifyMaxTries, cooldownMs: reverifyCooldownMs })) continue
+      if (!e || e.noise || gaveUp({ ...e, ai: rec })) continue
+      // A verdict recorded under older verifier framing is re-read even though the
+      // no-backfill gate keeps its row out of the writer queue: this pass calls no
+      // writer and replaces no text, it only re-asks whether the shipped text
+      // stands under the framing that judged it. Everything else stays gated.
+      const reframed = rec.verifyPolicy !== VERIFY_POLICY_V
+      if (!reframed && !enrichmentEligible(e, env)) continue
+      if (!reverifyEligible(rec, { maxTries: reverifyMaxTries, cooldownMs: reverifyCooldownMs, reframed })) continue
       // The budget can be turned off between a row shipping unverified and its
       // re-check arriving; a disabled verifier must not be quietly re-run.
       if (!shouldVerify(e, rec, env)) continue
@@ -3830,7 +3848,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       queue.push({ entry: d.e, patch, key: d.k, relText, prMeta, sequence: sequenceForEntry(byDayEntries, d.e, seqWindow), reverify: d.rec })
       requeued++
     }
-    if (requeued) log(`LLM re-checking ${requeued} row(s) that shipped without a verifier verdict`)
+    if (requeued) log(`LLM re-checking ${requeued} row(s) whose verdict is missing or was recorded under older verifier framing`)
   }
 
   if (!queue.length) return 0
@@ -3869,6 +3887,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           const rechecked = {
             ...reverify,
             verify: objected ? 'flagged' : 'passed',
+            verifyPolicy: VERIFY_POLICY_V,
             verifyHash: artifactHash(reverify),
             verifyModel: verifyModelOf(env),
             verifyTries: (Number(reverify.verifyTries) || 0) + 1,
@@ -4915,6 +4934,7 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     manifest,
     evidenceBundle: { material, hash: shortHash(material) },
     verify,
+    verifyPolicy: VERIFY_POLICY_V,
     verifyModel: verifyModelOf(env),
     ...(verifyClaims?.length ? { verifyClaims } : {}),
     ...(verify === 'passed' ? { verifyHash: artifactHash({ text }) } : {}),

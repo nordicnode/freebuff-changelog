@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, VERIFY_POLICY_V } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -345,6 +345,63 @@ test('re-check: a row that shipped with no verdict is checked later, and its tex
   }
 })
 
+test('re-check: a verdict from older verifier framing is re-read once, and the text is never touched', async (t) => {
+  const { mkdtemp, writeFile, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const dir = await mkdtemp(join(tmpdir(), 'fbweb-llm-reframe-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const sha = '9'.repeat(40)
+  const patch = 'diff --git a/cli/src/a.ts b/cli/src/a.ts\n+export const BETA = 1\n'
+  const key = cacheKey(sha, patch)
+  const env = { CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM: '1', LLM_API_KEY: 'k', LLM_API_BASE: 'http://gateway.test/v1', CHANGELOG_LLM_LIMIT: '5', CHANGELOG_LLM_HEAL: '0' }
+  // An objection recorded under the old framing: no verifyPolicy stamp. The row
+  // is historical, so the no-backfill gate would keep it out of the writer queue;
+  // the verdict refresh is allowed anyway because it replaces no text.
+  const framedOut = {
+    model: 'deepseek-v4.1', v: PROMPT_V, at: '2020-01-01T00:00:00.000Z',
+    title: 'Gate added', summary: 'Adds `BETA` in cli/src/a.ts.', significance: 'minor',
+    verify: 'flagged', verifyClaims: [{ claim: 'an objection from the old framing' }]
+  }
+  assert.equal(reverifyEligible(framedOut, { reframed: true }), true, 'older framing earns one fresh read')
+  assert.equal(reverifyEligible(framedOut, {}), false, 'but only the re-check pass, not the default rule')
+  // The caller derives `reframed` from the stamp, so a row already read under the
+  // current framing is never in scope (see the loop's verifyPolicy comparison).
+  assert.equal(reverifyEligible({ ...framedOut, verifyPolicy: VERIFY_POLICY_V }, { reframed: false }), false,
+    'a verdict from the current framing is not re-read')
+
+  const entry = { kind: 'sync', sha, date: '2026-09-13T10:00:00Z', areas: ['CLI'], summary: 'Adds a gate.', significance: 'minor', ai: { ...framedOut } }
+  await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({ [key]: framedOut }))
+  let fetchCalls = 0
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (url, { body }) => {
+    fetchCalls++
+    const prompt = JSON.parse(String(body)).messages.at(-1).content
+    if (!/You are checking/.test(prompt)) throw new Error('the re-check must not call the writer')
+    return {
+      status: 200, ok: true, headers: { get: () => null },
+      text: async () => JSON.stringify({ choices: [{ message: { content: JSON.stringify({ supported: true, issues: [], claims: [{ quote: 'Gate added', supported: true }, { quote: 'Adds `BETA` in cli/src/a.ts.', supported: true }] }) } }] })
+    }
+  }
+  try {
+    await enrichWithLlm([entry], async () => patch, dir, env, {})
+    assert.equal(fetchCalls, 1, 'exactly one check, no writer call')
+    let stored = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+    assert.equal(stored[key].title, framedOut.title, 'the shipped title is untouched')
+    assert.equal(stored[key].summary, framedOut.summary, 'and so is the shipped summary')
+    assert.equal(stored[key].verify, 'passed', 'the objection is replaced by the current verdict')
+    assert.equal(stored[key].verifyPolicy, VERIFY_POLICY_V, 'and stamped with the framing it was read under')
+    assert.equal(stored[key].verifyClaims, undefined, 'a cleared objection keeps no claims')
+    assert.equal(stored[key].verifyTries, 1)
+    // Stamped: a second pass costs nothing.
+    const after = fetchCalls
+    await enrichWithLlm([entry], async () => patch, dir, env, {})
+    assert.equal(fetchCalls, after, 'a re-read under the current framing is not repeated')
+  } finally {
+    globalThis.fetch = origFetch
+  }
+})
+
 test('healing: a shipped-with-objections row is re-asked and replaced only by a cleaner rewrite', async (t) => {
   const { mkdtemp, writeFile, readFile, rm } = await import('node:fs/promises')
   const { tmpdir } = await import('node:os')
@@ -380,8 +437,10 @@ test('healing: a shipped-with-objections row is re-asked and replaced only by a 
     return { status: 200, ok: true, headers: { get: () => null }, text: async () => envelope }
   }
   try {
-    // The disabled switch spends nothing.
-    const off = await enrichWithLlm([entry], async () => patch, dir, { ...env, CHANGELOG_LLM_HEAL: '0' }, {})
+    // The disabled switch spends nothing. The deferred re-check is a separate
+    // budget (and a flagged row now falls in its scope while its verdict
+    // predates the current verifier framing), so it is turned off here too.
+    const off = await enrichWithLlm([entry], async () => patch, dir, { ...env, CHANGELOG_LLM_HEAL: '0', CHANGELOG_LLM_REVERIFY: '0' }, {})
     assert.equal(off, 0)
     assert.equal(fetchCalls, 0, 'healing off: no calls')
     // A strictly cleaner rewrite replaces the shipped text.

@@ -45,6 +45,16 @@ export const ELI5_V = 7
 // traveling as [caution] text (their names still entered the ground corpus).
 export const RELEASE_ROLLUP_V = 9
 
+// The verifier's framing and evidence policy, separate from the writer's prompt
+// version because it changes what a verdict means without changing the text.
+// v1: a release roll-up is checked against its window (framed as a roll-up, with
+// each window line naming the files it touched) instead of against the bump's
+// own manifest diff, which can never contain what the release shipped. A stored
+// verdict from earlier framing says nothing about the text under this one, so
+// the re-check pass is allowed one fresh read of those rows -- verdict only,
+// never a rewrite.
+export const VERIFY_POLICY_V = 1
+
 export function cacheKeyVersion (key) {
   const m = /:(eli5:)?v(\d+):/.exec(String(key))
   if (!m) return null
