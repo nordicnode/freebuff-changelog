@@ -4352,7 +4352,7 @@ export function eli5Key (sha, source, releaseCtx = '', rollupV = 0, identity = n
 // explain, and community rows are titled straight from their commit message and
 // never went through the model.
 export function eli5Eligible (e) {
-  return !e.noise && !!e.ai?.title && !!e.ai?.summary && (e.ai?.v ?? 1) >= PROMPT_V
+  return !e.noise && !!e.ai?.title && !!e.ai?.summary
 }
 
 // Which stale rows a scoped rewrite is allowed to re-queue. `days` bounds by
