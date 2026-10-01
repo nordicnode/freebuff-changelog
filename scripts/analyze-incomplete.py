@@ -30,7 +30,7 @@ for entry in entries:
     ai = entry.get('ai')
     has_title = bool(ai and ai.get('title'))
     has_summary = bool(ai and ai.get('summary'))
-    has_eli5 = bool(ai and ai.get('eli5'))
+    has_eli5 = bool(entry.get('eli5') and entry['eli5'].get('text'))
     
     if not ai:
         categories['no_ai'] += 1
@@ -72,10 +72,11 @@ for item in title_sum_eli5_list[:10]:
     print(f"  • {item['sha']} - {item['title'][:80]}... ({item['date']})")
 
 print("\n✅ Sample complete entries:")
-completed = [e for e in entries if e.get('ai', {}).get('title') and e.get('ai', {}).get('summary') and e.get('ai', {}).get('eli5')][:2]
+completed = [e for e in entries if e.get('ai', {}).get('title') and e.get('ai', {}).get('summary') and e.get('eli5') and e.get('eli5', {}).get('text')][:2]
 if completed:
     for e in completed:
         print(f"  • {e['sha'][:12]}: {e['ai']['title']}")
+        print(f"    Eli5: {e['eli5']['text'][:100]}...")
 else:
     print("  None found!")
 
