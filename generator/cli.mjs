@@ -1143,9 +1143,16 @@ async function catchUpOnce (argv) {
   // take up to LLM_TIMEOUT_MS), and every starved row is stubbed as
   // "LLM cycle deadline exceeded" and re-queued next cycle. Scale both with
   // the entry limit so a row already queued is a row that gets asked.
+  //
+  // The budget object is per pass, not per cycle: the passes run one after the
+  // other, and a shared counter let the summary pass spend all 40 calls first,
+  // after which every ELI5 call threw "LLM cycle request budget exceeded" and
+  // the plain-English backlog never drained (14 stubs on 2026-09-30, 28 rows
+  // pending). A fresh pool per pass bounds each one without starving the next;
+  // the wall-clock deadline is still the shared ceiling that ends the cycle.
   const cycleBudgetMs = Math.min(deadlineAt(), Date.now() + Math.max(120000, limit * 60000))
-  const cycleCalls = Math.max(40, limit * 8)
-  const cycleEnv = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(limit), LLM_DEADLINE_AT: String(cycleBudgetMs), LLM_CYCLE_BUDGET: { remaining: cycleCalls } }
+  const cycleEnvBase = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(limit), LLM_DEADLINE_AT: String(cycleBudgetMs) }
+  const cycleEnv = { ...cycleEnvBase, LLM_CYCLE_BUDGET: { remaining: Math.max(40, limit * 8) } }
   if (llmConfigured()) {
     await backfillDiffs(queueable, limit)
     const envWithLimit = cycleEnv
@@ -1172,7 +1179,10 @@ async function catchUpOnce (argv) {
   // and the plain-English backlog would never move; and a commit summarized a
   // few lines above needs its line in the same cycle, not the next one.
   if (llmConfigured()) {
-    const eli5Written = await enrichEli5(entries, DATA, cycleEnv, {
+    // Its own budget pool: the summary/verifier pass above must not be able to
+    // spend the calls the plain-English drain needs (see cycleEnvBase above).
+    const eli5Env = { ...cycleEnvBase, LLM_CYCLE_BUDGET: { remaining: Math.max(20, limit * 4) } }
+    const eli5Written = await enrichEli5(entries, DATA, eli5Env, {
       retryErrors: true,
       priorityShas: new Set(freshShas.slice(-limit)),
       getPatch: llmPatchFor,
@@ -1185,8 +1195,11 @@ async function catchUpOnce (argv) {
     }
     didSummarize = didSummarize || eli5Written > 0
     const prDoc = await readJson(`${DATA}/open-prs.json`, null)
-    if (prDoc?.prs?.length && Date.now() < Number(cycleEnv.LLM_DEADLINE_AT)) {
-      const previews = await enrichOpenPrs(prDoc.prs, DATA, cycleEnv, { getDiff: p => readFile(resolve(DATA, `pr-diffs/${p.number}.diff`), 'utf8').catch(() => '') })
+    if (prDoc?.prs?.length && Date.now() < cycleBudgetMs) {
+      // Same reason: PR previews get their own small pool instead of whatever
+      // the two passes above happen to leave behind.
+      const prEnv = { ...cycleEnvBase, LLM_CYCLE_BUDGET: { remaining: Math.max(10, limit * 2) } }
+      const previews = await enrichOpenPrs(prDoc.prs, DATA, prEnv, { getDiff: p => readFile(resolve(DATA, `pr-diffs/${p.number}.diff`), 'utf8').catch(() => '') })
       if (previews) { await persistMerged({ [`${DATA}/open-prs.json`]: prDoc }); didSummarize = true }
     }
   }
