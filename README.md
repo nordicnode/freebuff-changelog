@@ -94,6 +94,7 @@ Human overrides in [data/overrides.json](data/overrides.json) take precedence at
 | `CHANGELOG_LLM=1` + `LLM_API_KEY` | Optional enrichment of admitted new work only |
 | `LLM_MODEL`, `LLM_MODEL_MAJOR`, `LLM_VERIFY_MODEL` | Existing model identities/routing; verifier default `deepseek-v4.1` |
 | `LLM_API_BASE` | Existing OpenAI-compatible provider; default `https://api.openai.com/v1` |
+| `LLM_BACKUP_API_BASE`, `LLM_BACKUP_API_KEY`, `LLM_BACKUP_MODEL` | Failover route: consulted once, only when the primary fails at the transport/gateway level (5xx, connection, response timeout, 408, exhausted 429 wait). Auth, content and validator failures stay on the primary so they surface there; `CHANGELOG_LLM_BACKUP=0` disables it. Shares the primary's entry cap, cycle budget and 60 RPM window |
 | `LLM_TIMEOUT_MS` | Default 60,000 ms, bounded further by remaining cycle time; includes body consumption |
 | `CHANGELOG_LLM_LIMIT`, `CHANGELOG_ELI5_LIMIT` | Entry limits; production defaults to a small bounded batch |
 | `CHANGELOG_LLM_CONCURRENCY`, `CHANGELOG_LLM_RPM` | Default two workers and 60 requests/minute; shared request ceiling still applies |

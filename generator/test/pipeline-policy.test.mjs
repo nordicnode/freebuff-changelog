@@ -10,7 +10,8 @@ import {
   LLM_CONTEXT_TOKENS, rememberClosedPrs, matchPrByPaths, prSummaryKey,
   pruneExpiredErrors, gatherEntryContext, collectReleaseContext, formatReleaseContext,
   buildVerifyPrompt, buildEli5Prompt, getReleaseContextFor, summaryValidator, releaseBoilerplate, RELEASE_ROLLUP_V, VERIFY_POLICY_V, eli5Key, eli5Source, ELI5_V, normalizeEli5, ELI5_ROLLUP_MAX_CHARS,
-  llmRpm, createLlmRateLimiter, resetLlmRateLimiterForTests, retryAfterMs, gatherReleaseEvidence
+  llmRpm, createLlmRateLimiter, resetLlmRateLimiterForTests, retryAfterMs, gatherReleaseEvidence,
+  backupEnvOf, isRouteFailure, servedModelOf
 } from '../lib/llm.mjs'
 import { artifactHash, qualityOf, qualityText, qualityNote, qualityStatus, dedupeClaims, generationState, QUALITY_POLICY_V } from '../lib/quality.mjs'
 import { mergeChangelog, mergeOpenPrs, mergeHealth, persistMerged } from '../lib/mergedata.mjs'
@@ -316,6 +317,83 @@ test('provider rate limit: startup handoffs and exhausted 429 responses pause la
   await assert.rejects(callLlm('writer', env, 4, x => x), /HTTP 429/)
   await assert.rejects(callLlm('reviewer', { ...env, LLM_DEADLINE_AT: Date.now() + 1000 }, 1, x => x), /deadline/)
   assert.equal(calls, 1, 'another stage respects the exhausted request’s provider-wide pause')
+})
+
+test('backup route helpers: configuration gate, route-failure classification, served model', () => {
+  assert.equal(backupEnvOf({}), null, 'no config means no failover')
+  assert.equal(backupEnvOf({ LLM_BACKUP_API_BASE: 'x', LLM_BACKUP_API_KEY: 'k', CHANGELOG_LLM_BACKUP: '0' }), null, 'opt-out wins')
+  const b = backupEnvOf({ LLM_API_BASE: 'p', LLM_API_KEY: 'pk', LLM_MODEL: 'm', LLM_BACKUP_API_BASE: 'x', LLM_BACKUP_API_KEY: 'k', LLM_BACKUP_MODEL: 'flash' })
+  assert.equal(b.LLM_API_BASE, 'x'); assert.equal(b.LLM_API_KEY, 'k'); assert.equal(b.LLM_MODEL, 'flash'); assert.equal(b.LLM_ROUTE, 'backup')
+  assert.equal(backupEnvOf({ LLM_BACKUP_API_BASE: 'x', LLM_BACKUP_API_KEY: 'k' }).LLM_MODEL, undefined, 'without a backup model the configured one rides along')
+  for (const msg of ['LLM HTTP 504: x', 'fetch failed', 'socket hang up', 'The operation was aborted due to timeout', 'LLM HTTP 429: retry-after 120s exceeds the in-call wait budget']) assert.equal(isRouteFailure(new Error(msg)), true, msg)
+  for (const msg of ['LLM HTTP 401: bad key', 'LLM HTTP 400: bad request', 'LLM output missing title', 'LLM returned no JSON', 'LLM cycle deadline exceeded', 'LLM entry request budget exceeded']) assert.equal(isRouteFailure(new Error(msg)), false, msg)
+  assert.equal(servedModelOf([{ stage: 'generation', model: 'flash', route: 'backup', outcome: 'validated' }], 'primary'), 'flash', 'the model that actually wrote wins')
+  assert.equal(servedModelOf([{ stage: 'generation', model: 'primary', outcome: 'validated' }, { stage: 'verification', model: 'flash', route: 'backup', outcome: 'validated' }], 'primary'), 'primary', 'a backup verifier never claims the writer')
+  assert.equal(servedModelOf([{ stage: 'generation', model: 'strong', outcome: 'validated' }], 'flash'), 'strong', 'the last successful write wins after escalation')
+  assert.equal(servedModelOf([], 'primary'), 'primary')
+})
+
+test('backup route: a primary gateway failure fails over once with the backup identity', async t => {
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const body = JSON.parse(String(init.body))
+    seen.push({ url: String(url), model: body.model, auth: init.headers.authorization })
+    if (String(url).includes('primary.test')) return new Response('gateway timeout', { status: 504 })
+    return response({ ok: true })
+  })
+  const be = { ...env, LLM_API_BASE: 'https://primary.test/v1', LLM_BACKUP_API_BASE: 'https://backup.test/v1', LLM_BACKUP_API_KEY: 'backup-key', LLM_BACKUP_MODEL: 'deepseek-v4.1-flash' }
+  const out = await callLlm('prompt', be, 4, x => x, { gatewayRetries: 0 })
+  assert.deepEqual(out, { ok: true })
+  assert.deepEqual(seen.map(s => s.url), ['https://primary.test/v1/chat/completions', 'https://backup.test/v1/chat/completions'])
+  assert.equal(seen[1].model, 'deepseek-v4.1-flash', 'the backup model serves the failover call')
+  assert.equal(seen[1].auth, 'Bearer backup-key', 'the backup key never mixes with the primary route')
+})
+
+test('backup route: auth failures stay on the primary; opt-out disables failover', async t => {
+  const seen = []
+  let status = 401
+  t.mock.method(globalThis, 'fetch', async url => { seen.push(String(url)); return new Response(status === 401 ? 'bad key' : 'gateway timeout', { status }) })
+  const be = { ...env, LLM_API_BASE: 'https://primary.test/v1', LLM_BACKUP_API_BASE: 'https://backup.test/v1', LLM_BACKUP_API_KEY: 'backup-key' }
+  await assert.rejects(callLlm('prompt', be, 1, x => x), /HTTP 401/)
+  assert.deepEqual(seen, ['https://primary.test/v1/chat/completions'], 'a broken key must surface on the route that owns it')
+  seen.length = 0
+  status = 504
+  await assert.rejects(callLlm('prompt', { ...be, CHANGELOG_LLM_BACKUP: '0' }, 4, x => x, { gatewayRetries: 0 }), /HTTP 504/)
+  assert.deepEqual(seen, ['https://primary.test/v1/chat/completions'], 'opt-out never reaches the backup')
+})
+
+test('backup route: never loops, and a double failure names both routes', async t => {
+  let primary = 0, backup = 0
+  t.mock.method(globalThis, 'fetch', async url => {
+    if (String(url).includes('primary.test')) { primary++; return new Response('x', { status: 504 }) }
+    backup++; return new Response('y', { status: 504 })
+  })
+  const be = { ...env, LLM_API_BASE: 'https://primary.test/v1', LLM_BACKUP_API_BASE: 'https://backup.test/v1', LLM_BACKUP_API_KEY: 'backup-key', LLM_BACKUP_MODEL: 'deepseek-v4.1-flash' }
+  await assert.rejects(callLlm('prompt', be, 4, x => x, { gatewayRetries: 0 }), /LLM HTTP 504; backup route: LLM HTTP 504/)
+  assert.equal(primary, 1, 'one primary ask')
+  assert.equal(backup, 1, 'exactly one failover, never a second')
+})
+
+test('backup route: provenance records which route served each request and the writing model', async t => {
+  const calls = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const u = String(url)
+    calls.push(u)
+    if (u.includes('primary.test')) throw new Error('fetch failed')
+    const p = JSON.parse(String(init.body)).messages.at(-1).content
+    if (/You are checking/.test(p)) return response({ supported: true, issues: [], claims: [
+      { quote: 'Limit capped', supported: true },
+      { quote: 'Caps the limit to prevent runaway requests.', supported: true }
+    ] })
+    return response({ title: 'Limit capped', summary: 'Caps the limit to prevent runaway requests.', significance: 'minor', confidence: 'high' })
+  })
+  const be = { ...env, LLM_API_BASE: 'https://primary.test/v1', LLM_BACKUP_API_BASE: 'https://backup.test/v1', LLM_BACKUP_API_KEY: 'backup-key', LLM_BACKUP_MODEL: 'deepseek-v4.1-flash' }
+  const { record } = await summarizeEntry({ entry: entry(), patch, env: be })
+  assert.equal(record.model, 'deepseek-v4.1-flash', 'the failover write is attributed to the model that wrote it')
+  assert.equal(record.verify, 'passed', 'the verifier failed over too')
+  assert.ok(record.requests.some(r => r.route === 'primary' && r.outcome === 'transport-error'), 'failed primary attempts stay visible')
+  assert.ok(record.requests.some(r => r.route === 'backup' && r.outcome === 'validated' && r.stage === 'verification'), 'the serving backup call is recorded')
+  assert.ok(calls.filter(u => u.includes('backup.test')).length >= 2, 'writer and verifier each failed over')
 })
 
 test('release regression: unchanged packaging fields cannot satisfy a functional roll-up', () => {

@@ -1579,6 +1579,47 @@ export function isDeterministicFailure (err) {
   return /model memory|training memory|knowledge cutoff|refused the request|self-description|internal system (?:instructions|prompt)/i.test(String(err?.message || err || ''))
 }
 
+// Backup route, used only when the PRIMARY route is what failed. Presence of
+// the three LLM_BACKUP_* values enables it; CHANGELOG_LLM_BACKUP=0 disables.
+// The backup gets the same prompt already reduced to whatever rung the primary
+// died on, its own model identity, and the same budgets: one entry cap, one
+// cycle budget, and the one rolling RPM window that now covers both routes.
+export function backupEnvOf (env = {}) {
+  if (env.CHANGELOG_LLM_BACKUP === '0') return null
+  if (!env.LLM_BACKUP_API_BASE || !env.LLM_BACKUP_API_KEY) return null
+  return {
+    ...env,
+    LLM_API_BASE: env.LLM_BACKUP_API_BASE,
+    LLM_API_KEY: env.LLM_BACKUP_API_KEY,
+    LLM_MODEL: env.LLM_BACKUP_MODEL || env.LLM_MODEL,
+    LLM_ROUTE: 'backup'
+  }
+}
+
+// Is this failure one a second route could fix? 5xx, connection faults,
+// response timeouts, 408 and an exhausted 429 wait say something about the
+// route. Content and configuration failures do not: a 400/401/403, a validator
+// rejection or a refusal would fail the same way on the backup, and a bad key
+// must surface on the route that owns it rather than be retried elsewhere.
+// Our own cycle guards (deadline, entry budget) are neither -- they interrupt
+// the run and say nothing about either route.
+export function isRouteFailure (err) {
+  const msg = String(err?.message || err || '')
+  if (/deadline|budget exceeded/i.test(msg)) return false
+  if (/HTTP (?:5\d\d|408|429)\b/.test(msg)) return true
+  return isGatewayError(err)
+}
+
+// Which model actually produced the stored text. A backup-route failover must
+// not be recorded as if the primary model answered. Verification requests are
+// excluded: `model` describes the writer, and the verifier's identity lives in
+// `verifyModel`.
+export function servedModelOf (requests = [], fallback = '') {
+  const writes = (requests || []).filter(r => r.stage !== 'verification')
+  const ok = writes.filter(r => r.outcome === 'validated' || r.outcome === 'received')
+  return (ok.at(-1) || writes.at(-1))?.model || fallback
+}
+
 // `validate` is a parameter because the ELI5 pass speaks to the same gateway
 // with a different shape: the repair retry has to check the replacement against
 // the schema that was asked for, not the summary one.
@@ -1619,7 +1660,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
   llmCallsSent++
   scope.calls++
   opts.onDelivery?.(prompt)
-  const request = { id: randomUUID(), stage: opts.stage || 'generation', model, promptHash: shortHash(prompt), startedAt: new Date(started).toISOString(), outcome: 'pending' }
+  const request = { id: randomUUID(), stage: opts.stage || 'generation', model, route: env.LLM_ROUTE === 'backup' ? 'backup' : 'primary', promptHash: shortHash(prompt), startedAt: new Date(started).toISOString(), outcome: 'pending' }
   scope.requests.push(request)
   // The only rung a transport failure can be fixed by. The rungs above answer
   // replies that came back wrong; a gateway that 504s or times out answers
@@ -1632,6 +1673,22 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
   const transportRung = () => (!opts.usedLean && opts.leanPrompt)
     ? { prompt: opts.leanPrompt, opts: { ...opts, usedLean: true }, how: 'the wide evidence sections dropped' }
     : null
+  // Fail over exactly once, and only when the ROUTE failed. The primary has
+  // already spent its verbatim retries and rungs by the time this is reached,
+  // so the backup receives the most economical surviving form of the ask.
+  const routeOrThrow = async (err) => {
+    const backup = backupEnvOf(env)
+    if (!backup || opts.usedBackup || !isRouteFailure(err)) throw err
+    log(`LLM primary route failed (${shortError(err)}): re-asking once on the backup route`)
+    try {
+      return await callLlm(prompt, backup, 1, validate, { ...opts, usedBackup: true })
+    } catch (backupErr) {
+      const combined = new Error(`${shortError(err)}; backup route: ${shortError(backupErr)}`)
+      if (backupErr.deterministic === true || err.deterministic === true) combined.deterministic = true
+      if (backupErr.raw) combined.raw = backupErr.raw
+      throw combined
+    }
+  }
   let res
   try {
     res = await fetch(`${base.replace(/\/$/, '')}/chat/completions`, {
@@ -1651,7 +1708,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
       log(`LLM ${shortError(err)} on the full ask: re-asking with ${rung.how}`)
       return callLlm(rung.prompt, env, attempt + 1, validate, rung.opts)
     }
-    throw err
+    return routeOrThrow(err)
   }
   request.status = res.status
   request.outcome = res.ok ? 'received' : 'http-error'
@@ -1678,7 +1735,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     // attempts, and park it on the 1-hour cooldown for what was a 2-minute
     // throttle.
     if (waitMs > 60000) {
-      throw new Error(`LLM HTTP 429: retry-after ${Math.round(waitMs / 1000)}s exceeds the in-call wait budget`)
+      return routeOrThrow(new Error(`LLM HTTP 429: retry-after ${Math.round(waitMs / 1000)}s exceeds the in-call wait budget`))
     }
     log(`LLM rate-limited (429): waiting ${(waitMs / 1000).toFixed(1)}s before retry ${attempt}/3`)
     await boundedWait(waitMs, env)
@@ -1700,7 +1757,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
       return callLlm(rung.prompt, env, attempt + 1, validate, rung.opts)
     }
   }
-  if (!res.ok) throw new Error(shortError(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`))
+  if (!res.ok) return routeOrThrow(new Error(shortError(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`)))
   const rawText = await res.text().catch(err => { request.outcome = 'body-error'; request.durationMs = Date.now() - started; throw err })
   request.durationMs = Date.now() - started
   try { const usage = JSON.parse(rawText)?.usage; if (usage) request.usage = usage } catch {}
@@ -3722,7 +3779,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     if (verify !== 'passed') { delete clean.breaking; delete clean.migration }
   }
   const record = {
-    model: outEnv.LLM_MODEL || 'gpt-4o-mini',
+    model: servedModelOf(requestScope.getStore().requests, outEnv.LLM_MODEL || 'gpt-4o-mini'),
     v: PROMPT_V,
     policy: QUALITY_POLICY_V,
     manifest,
@@ -5304,7 +5361,7 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
   }
   manifest.deliveredHash = shortHash(material)
   const record = {
-    model: outEnv.LLM_MODEL || 'gpt-4o-mini',
+    model: servedModelOf(requestScope.getStore().requests, outEnv.LLM_MODEL || 'gpt-4o-mini'),
     v: ELI5_V,
     policy: QUALITY_POLICY_V,
     manifest,
