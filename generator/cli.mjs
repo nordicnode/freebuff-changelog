@@ -1147,13 +1147,18 @@ async function catchUpOnce (argv) {
   // a fresh request pool and a reserved time slice -- with the cycle deadline
   // still the hard outer ceiling.
   const cycleCalls = Math.max(40, limit * 8)
-  const cycleBudgetMs = Math.min(deadlineAt(), Date.now() + Math.max(120000, limit * 60000))
+  const now = Date.now()
+  const cycleDeadline = Math.min(deadlineAt(), now + Math.max(120000, limit * 60000))
   const cycleEnvBase = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(limit) }
   if (llmConfigured()) {
     await backfillDiffs(queueable, limit)
+    // Reserve time for ELI5: at least 60s or 15s per entry in the limit
+    const eli5ReserveMs = Math.max(60000, limit * 15000)
+    // Summary deadline leaves guaranteed room for ELI5 before cycle end
+    const summaryDeadline = Math.max(now, cycleDeadline - eli5ReserveMs)
     const summaryEnv = {
       ...cycleEnvBase,
-      LLM_DEADLINE_AT: String(Math.min(cycleBudgetMs, Date.now() + Math.max(90000, limit * 45000))),
+      LLM_DEADLINE_AT: String(summaryDeadline),
       LLM_CYCLE_BUDGET: { remaining: cycleCalls }
     }
     const n = await enrichWithLlm(entries, llmPatchFor, DATA, summaryEnv, {
@@ -1179,9 +1184,8 @@ async function catchUpOnce (argv) {
   // and the plain-English backlog would never move; and a commit summarized a
   // few lines above needs its line in the same cycle, not the next one.
   if (llmConfigured()) {
-    // Its own request pool AND its own slice of the clock: whatever the
-    // summary pass spent cannot starve the plain-English drain (see above).
-    const eli5Deadline = Math.min(cycleBudgetMs, Date.now() + Math.max(90000, limit * 45000))
+    // Guaranteed time slice for ELI5: guarantee at least 50-60 seconds before cycle deadline
+    const eli5Deadline = Math.max(now, cycleDeadline - 10000)
     const eli5Env = {
       ...cycleEnvBase,
       LLM_DEADLINE_AT: String(eli5Deadline),
@@ -1200,12 +1204,12 @@ async function catchUpOnce (argv) {
     }
     didSummarize = didSummarize || eli5Written > 0
     const prDoc = await readJson(`${DATA}/open-prs.json`, null)
-    if (prDoc?.prs?.length && Date.now() < cycleBudgetMs) {
+    if (prDoc?.prs?.length && now < cycleDeadline) {
       // Same reason: PR previews get their own small pool and time slice
       // instead of whatever the two passes above happen to leave behind.
       const prEnv = {
         ...cycleEnvBase,
-        LLM_DEADLINE_AT: String(Math.min(cycleBudgetMs, Date.now() + Math.max(60000, limit * 30000))),
+        LLM_DEADLINE_AT: String(Math.min(cycleDeadline, now + Math.max(60000, limit * 30000))),
         LLM_CYCLE_BUDGET: { remaining: Math.max(10, limit * 2) }
       }
       const previews = await enrichOpenPrs(prDoc.prs, DATA, prEnv, { getDiff: p => readFile(resolve(DATA, `pr-diffs/${p.number}.diff`), 'utf8').catch(() => '') })
@@ -1359,14 +1363,20 @@ async function cmdBuild () {
         const sha = key.split(':')[0]
         if (val.title) aiBySha.set(sha, pickAiRecord(val, aiBySha.get(sha)))
         if (val.text && key.includes(':eli5:')) {
-          const list = eli5BySha.get(sha) || []
-          list.push(val); eli5BySha.set(sha, list)
+          // Extract source hash from cache key structure (<sha>:eli5:v7:<srcHash>)
+          // and attach it so we can filter by source when assigning to entries
+          const parts = key.split(':')
+          const srcFromKey = parts.length >= 4 ? parts[3] : null
+          const recordWithSrc = { ...val, src: srcFromKey }
+          if (!eli5BySha.has(sha) || (eli5BySha.get(sha).at || '') < (recordWithSrc.at || '')) {
+            eli5BySha.set(sha, recordWithSrc)
+          }
         }
       }
     }
     for (const e of changelog.entries) {
       if (aiBySha.has(e.sha)) e.ai = pickAiRecord(e.ai, aiBySha.get(e.sha))
-      const plain = (eli5BySha.get(e.sha) || []).filter(p => p.src === shortHash(eli5Source(e))).sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')) || JSON.stringify(b).localeCompare(JSON.stringify(a)))[0]
+      const plain = eli5BySha.get(e.sha)
       if (plain?.src === shortHash(eli5Source(e)) && (!e.eli5 || String(plain.at || '') > String(e.eli5.at || ''))) e.eli5 = plain
       if (e.eli5?.src && e.eli5.src !== shortHash(eli5Source(e))) delete e.eli5
     }
@@ -1928,23 +1938,25 @@ async function cmdRegenLast (argv) {
     const startedAt = Date.now()
     let written = 0
     let asked = 0
-    // Its own bounded budget, not the cycle's: this is an operator run of up to
-    // 50 rows, so it gets six calls a row and a minute a row (six-minute floor,
-    // thirty-minute cap). Six minutes flat measured time, not work: a 40-row
-    // run under a flapping gateway wrote five rows and then expired with most
-    // of the set never asked. A row the deadline still reaches keeps its
+    // Split the budget between summary and ELI5: 60% for technical summaries,
+    // 40% reserved for ELI5 so enrichWithLlm cannot exhaust the entire budget
+    // before enrichEli5 runs. A row the deadline still reaches keeps its
     // shipped text and is named in the report.
     const budgetMs = Math.min(30 * 60000, Math.max(6 * 60000, askable.length * 60000))
-    await withDeadline(budgetMs, async () => {
-      const env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(askable.length + 1), LLM_DEADLINE_AT: String(deadlineAt()), LLM_CYCLE_BUDGET: { remaining: askable.length * 6 } }
-      const before = llmCallCount()
+    const summaryBudgetMs = Math.floor(budgetMs * 0.6)
+    const eli5BudgetMs = Math.floor(budgetMs * 0.4)
+    const summaryDeadline = startedAt + summaryBudgetMs
+    const beforeSummary = llmCallCount()
+    await withDeadline(summaryBudgetMs, async () => {
+      const env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(askable.length + 1), LLM_DEADLINE_AT: String(summaryDeadline), LLM_CYCLE_BUDGET: { remaining: askable.length * 6 } }
       written = await enrichWithLlm(doc.entries, llmPatchFor, DATA, env, { force: only, only, priorityShas: only, retryErrors: true, repoDir: REPO_DIR, getFullPatch: fullPatchFor })
-      asked = llmCallCount() - before
-      // The plain-English line follows the summary: a rewritten summary whose
-      // claims changed re-queues its line through eli5Done on its own.
-      await enrichEli5(doc.entries, DATA, env, { only, priorityShas: only, retryErrors: true, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
-      asked = llmCallCount() - before
     })
+    // The plain-English line follows the summary: a rewritten summary whose
+    // claims changed re-queues its line through eli5Done on its own.
+    const eli5Deadline = startedAt + eli5BudgetMs
+    const eli5Env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(askable.length + 1), LLM_DEADLINE_AT: String(eli5Deadline), LLM_CYCLE_BUDGET: { remaining: Math.max(20, askable.length * 4) } }
+    await enrichEli5(doc.entries, DATA, eli5Env, { only, priorityShas: only, retryErrors: true, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
+    asked = llmCallCount() - beforeSummary
     // The "generate properly" half of the request: report the outcome per row,
     // not just a count, so a run that quietly produced nothing cannot look done.
     const fresh = askable.filter(e => e.ai?.at && Date.parse(e.ai.at) >= startedAt)
