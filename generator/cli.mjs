@@ -16,7 +16,7 @@ import {
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
   extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
 import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows } from './lib/llm.mjs'
-import { QUALITY_POLICY_V } from './lib/quality.mjs'
+import { QUALITY_POLICY_V, generationState } from './lib/quality.mjs'
 import { shortHash, eli5Source } from './lib/util.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
@@ -1943,6 +1943,7 @@ async function cmdRegenLast (argv) {
       // The plain-English line follows the summary: a rewritten summary whose
       // claims changed re-queues its line through eli5Done on its own.
       await enrichEli5(doc.entries, DATA, env, { only, priorityShas: only, retryErrors: true, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
+      asked = llmCallCount() - before
     })
     // The "generate properly" half of the request: report the outcome per row,
     // not just a count, so a run that quietly produced nothing cannot look done.
@@ -1951,7 +1952,13 @@ async function cmdRegenLast (argv) {
     const flagged = askable.filter(e => e.ai?.verify === 'flagged')
     const unavailable = askable.filter(e => e.ai?.verify === 'unavailable')
     log(`[regen] ${fresh.length}/${askable.length} rows rewritten this run (writer reported ${written}, ${asked} call${asked === 1 ? '' : 's'})`)
-    log(`[regen] ${askable.length - noText.length}/${askable.length} now carry text`)
+    log(`[regen] ${askable.length - noText.length}/${askable.length} now carry technical text (not a completion verdict)`)
+    const incomplete = askable.filter(e => generationState(e).status !== 'complete')
+    log(`[regen] ${askable.length - incomplete.length}/${askable.length} fully generated and reviewed`)
+    for (const e of askable) {
+      const state = generationState(e)
+      log(`[regen] ${e.sha.slice(0, 8)}: ${state.status}${state.missing.length ? ` (missing ${state.missing.join(', ')})` : ''}; summary=${e.ai?.verify || 'none'}, plain=${e.eli5?.verify || (e.eli5?.model === 'template' ? 'deterministic' : 'none')}`)
+    }
     if (noText.length) log(`[regen] still without text: ${noText.map(e => e.sha.slice(0, 8)).join(', ')} (their failure stands; the relay keeps retrying them)`)
     if (flagged.length) log(`[regen] verifier objected: ${flagged.map(e => e.sha.slice(0, 8)).join(', ')}`)
     if (unavailable.length) log(`[regen] verdict could not run: ${unavailable.map(e => e.sha.slice(0, 8)).join(', ')}`)
@@ -1965,6 +1972,7 @@ async function cmdRegenLast (argv) {
       log('dry run: data written locally, not committed (pass --push)')
     }
     if (refused.length) throw new Error(`regen-last: regenerated ${askable.length}, refused ${refused.length}: ${refused.join('; ')}`)
+    if (incomplete.length) throw new Error(`regen-last: bounded repair incomplete for ${incomplete.map(e => e.sha.slice(0, 8)).join(', ')}; partial results preserved, no completion claimed`)
   })
   if (!acquired) log('another generate/backfill run holds the worktree lock: retry shortly')
 }

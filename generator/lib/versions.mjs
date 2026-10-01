@@ -45,7 +45,9 @@ export const ELI5_V = 7
 // traveling as [caution] text (their names still entered the ground corpus).
 // v10: mixed code+version releases receive their window AND their own hunks;
 // a packaging-only response cannot satisfy a functional release summary.
-export const RELEASE_ROLLUP_V = 10
+// v11: member source hunks back sparse windows, packaging-field boilerplate
+// is rejected, and sparse evidence never demands invented user benefits.
+export const RELEASE_ROLLUP_V = 11
 
 // The verifier's framing and evidence policy, separate from the writer's prompt
 // version because it changes what a verdict means without changing the text.

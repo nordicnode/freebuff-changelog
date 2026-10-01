@@ -827,6 +827,7 @@ export function redactProductPrompts (source) {
 // One renderer means a section added for one prompt exists for both.
 function contextSectionLines (ctx) {
   const lines = []
+  if (ctx.releaseEvidence) lines.push(ctx.releaseEvidence)
   if (ctx.fileHeaders && ctx.fileHeaders.length) {
     lines.push('Module & File Purpose (ground-truth documentation from touched files):')
     for (const h of ctx.fileHeaders) {
@@ -1033,7 +1034,7 @@ export function buildPrompt (entry, patch, ctx = {}) {
   if (entry.version || entry.freebuffVersion) lines.push(`Version bump: ${entry.version || entry.freebuffVersion}`)
   if (ctx.releaseCtx) {
     lines.push('', ctx.releaseCtx, '')
-    lines.push('Release instructions: Describe the concrete changes in this release window AND this commit\'s own source hunks. Lead with the most important evidenced behavior, explain its conditions and affected audience, and cover distinct changes in the changes list. A generic version/manifest/packaging summary is not acceptable when functional evidence is available. Never turn an unchanged README, module inventory, or package file list into a list of newly shipped capabilities. Do not invent benefits or availability when the window is incomplete.')
+    lines.push('Release instructions: Describe the concrete changes in this release window AND this commit\'s own source hunks. Lead with the most important evidenced behavior, explain its conditions and affected audience, and cover distinct changes in the changes list. A generic version/manifest/packaging summary is not acceptable when functional evidence is available. File counts and paths establish scope only, not behavior or benefits; use the release member source evidence for mechanisms. If behavior is not established, state the evidence gap rather than guessing. Never turn an unchanged README, module inventory, or package file list into a list of newly shipped capabilities. Do not invent benefits or availability when the window is incomplete.')
   }
   const added = entry.files?.added || []
   const modified = entry.files?.modified || []
@@ -1047,7 +1048,7 @@ export function buildPrompt (entry, patch, ctx = {}) {
   if (facts.length) lines.push(`Key facts (ground the WHY and DETAIL sentences in these): ${facts.map(f => `- ${redactProductPrompts(f)}`).join(' ')}`)
   const structured = ctx.structured || entry.structured
   if (hasStructuredFacts(structured)) lines.push(...formatStructuredFacts(structured))
-  lines.push(...contextSectionLines(ctx))
+  lines.push(...contextSectionLines(ctx.releaseCtx && bumpOnly(entry) ? { releaseEvidence: ctx.releaseEvidence } : ctx))
   // The diff is taken last, out of what the window has left. A fixed cap had to
   // be guessed low enough for the largest row, which is really a cap on every
   // row; this way an ordinary 3 KB diff goes out whole and a 600 KB one still
@@ -1249,7 +1250,7 @@ export function buildFusePrompt (entry, drafts, ctx = {}, digest = '') {
   if (hasStructuredFacts(structured)) lines.push(...formatStructuredFacts(structured))
   // The same evidence the single-prompt path gets. Chunking exists to make a
   // huge diff digestible, not to withhold the module it changed.
-  lines.push(...contextSectionLines(ctx))
+  lines.push(...contextSectionLines(ctx.releaseCtx && bumpOnly(entry) ? { releaseEvidence: ctx.releaseEvidence } : ctx))
   lines.push('', 'Per-chunk drafts (untrusted notes; verify every name against the lists above):')
   for (const d of drafts) {
     lines.push(`--- Chunk ${(d.index ?? 0) + 1}/${drafts.length} (files: ${(d.files || []).join(', ') || '-'})`)
@@ -1406,8 +1407,53 @@ export function shortError (err) {
   return msg.split('\n')[0].slice(0, 120)
 }
 
-// Rate limiting state: tracks timestamps of requests to enforce RPM budget.
-const llmRequestTimestamps = []
+// One provider budget across models, stages and retries, never an entry budget.
+export const LLM_PROVIDER_RPM = 60
+export function llmRpm (env = {}) {
+  const configured = Number(env.CHANGELOG_LLM_RPM)
+  return Number.isFinite(configured) && configured > 0
+    ? Math.max(1, Math.min(LLM_PROVIDER_RPM, Math.floor(configured))) : LLM_PROVIDER_RPM
+}
+
+// Injectable clock/wait keeps rate-limit regressions offline and instantaneous.
+export function createLlmRateLimiter ({ now = Date.now, wait = boundedWait } = {}) {
+  const timestamps = []
+  let blockedUntil = 0
+  return {
+    deferUntil (at) { if (Number.isFinite(at)) blockedUntil = Math.max(blockedUntil, at) },
+    async reserve (env = {}) {
+      const rpm = llmRpm(env)
+      while (true) {
+        assertRequestBudget(env)
+        const at = now()
+        while (timestamps.length && timestamps[0] <= at - 60000) timestamps.shift()
+        const delay = Math.max(blockedUntil - at, timestamps.length >= rpm ? timestamps[0] + 60010 - at : 0)
+        if (delay <= 0) { timestamps.push(at); return at }
+        await wait(Math.max(10, delay), env)
+      }
+    }
+  }
+}
+let llmRateLimiter = createLlmRateLimiter()
+// Test isolation only: production call counters must never reset this budget.
+export function resetLlmRateLimiterForTests () { llmRateLimiter = createLlmRateLimiter() }
+
+export function retryAfterMs (value, now = Date.now()) {
+  if (value == null || !String(value).trim()) return 0
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000
+  const at = Date.parse(value)
+  return Number.isFinite(at) ? Math.max(0, at - now) : 0
+}
+let rpmWarmup = null
+async function waitForRpmWarmup (env) {
+  // Serialized CI jobs may use different runners/processes. A full quiet minute
+  // before each paid process protects the previous process's trailing window.
+  if (env.CHANGELOG_LLM_RPM_WARMUP === '1') {
+    rpmWarmup ||= Date.now() + 60010
+    if (Date.now() < rpmWarmup) await boundedWait(rpmWarmup - Date.now(), env)
+  }
+}
 
 // Every chat-completion request this process has actually sent. The queue's
 // return value counts *entries* written, which hides the repair, verifier,
@@ -1436,21 +1482,8 @@ async function boundedWait (ms, env) {
 }
 
 export async function waitForLlmRpmSlot (env) {
-  const rpm = Number(env?.CHANGELOG_LLM_RPM || 60)
-  if (!rpm || rpm <= 0) return
-  const windowMs = 60000
-  while (true) {
-    const now = Date.now()
-    while (llmRequestTimestamps.length && llmRequestTimestamps[0] <= now - windowMs) {
-      llmRequestTimestamps.shift()
-    }
-    if (llmRequestTimestamps.length < rpm) {
-      llmRequestTimestamps.push(now)
-      return
-    }
-    const waitMs = Math.max(50, (llmRequestTimestamps[0] + windowMs) - now + 10)
-    await boundedWait(waitMs, env)
-  }
+  await waitForRpmWarmup(env)
+  await llmRateLimiter.reserve(env)
 }
 
 // How many summaries may be in flight at once. waitForLlmRpmSlot is the real
@@ -1561,7 +1594,6 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
   // retain the historical timeout instead of aborting immediately or overflowing.
   const timeoutMs = Number.isInteger(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 2147483647
     ? configuredTimeout : 60000
-  await waitForLlmRpmSlot(env)
   const body = {
     model,
     // 0 for every production ask (reproducibility). The self-consistency
@@ -1574,6 +1606,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     max_tokens: LLM_OUTPUT_TOKENS
   }
   if (responseFormatSupported) body.response_format = { type: 'json_object' }
+  await waitForLlmRpmSlot(env)
   assertRequestBudget(env) // Recheck after awaiting the shared RPM slot.
   const scope = requestScope.getStore()
   const started = Date.now()
@@ -1632,11 +1665,13 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     }
     throw new Error(shortError(`LLM HTTP 400: ${bodyText.slice(0, 120)}`))
   }
+  const retryAfter = res.status === 429 ? retryAfterMs(res.headers.get('retry-after')) : 0
+  const throttleWait = res.status === 429 ? retryAfter || (2000 * 2 ** (Math.min(attempt, 3) - 1) + Math.floor(Math.random() * 1000)) : 0
+  // Even an exhausted retry defers every other worker and stage.
+  if (throttleWait) llmRateLimiter.deferUntil(Date.now() + throttleWait)
   if (res.status === 429 && attempt <= 3) {
-    // Honor Retry-After; fall back to exponential backoff with jitter.
-    const retryAfter = Number(res.headers.get('retry-after')) * 1000
-    const jitter = Math.floor(Math.random() * 1000)
-    const waitMs = retryAfter || (2000 * 2 ** (attempt - 1) + jitter)
+    // Honor both Retry-After formats; otherwise use backoff with jitter.
+    const waitMs = throttleWait
     // A gateway that asks for a longer pause than an in-call wait should
     // absorb gets it through the short transient cooldown instead: clamping
     // the wait to 30s used to retry early three times, burn the entry's
@@ -2396,7 +2431,7 @@ export function summaryValidator (fallbackSig, corpus, structured = null, { requ
 // not a legitimate feature summary that happens to mention its release version.
 export function releaseBoilerplate (summary = '') {
   const sentences = String(summary).split(/(?<=[.!?])\s+(?=[A-Z])/).filter(Boolean)
-  return sentences.length > 0 && sentences.every(s => /(?:version (?:field|literal|number)|(?:release|version) [\d.]+ (?:published|released)|(?:manifest|package metadata|binary distribution|version label)|^(?:New files|Removed files|Updated files):|(?:only|limited to|no other|no runtime).*(?:packaging|version|manifest|runtime|launcher))/i.test(s))
+  return sentences.length > 0 && sentences.every(s => /(?:version (?:field|literal|number)|(?:release|version) [\d.]+ (?:published|released)|(?:manifest|package metadata|binary distribution|version label)|packaging fields?|^(?:New files|Removed files|Updated files):|(?:only|limited to|no other|no runtime).*(?:packaging|version|manifest|runtime|launcher)|(?:bin|scripts|files|os|cpu|engines|prepack|postpack).*(?:unchanged|same as|remain the same))/i.test(s))
 }
 
 export function isGatewayError (err) {
@@ -2733,6 +2768,7 @@ function releaseItemText (e, maxSummary = RELEASE_CTX_SUMMARY_CHARS) {
   const sig = e?.ai?.significance || e?.significance || ''
   const head = `${(e?.date || '').slice(0, 10)} ${title}`.trim()
   const tail = summary && summary !== title ? `: ${truncateWords(summary, maxSummary)}` : ''
+  const scope = pendingReview || !e.ai?.summary ? ' [scope only; behavior requires source evidence]' : ''
   const tag = sig && sig !== 'noise' ? ` [${sig}]` : ''
   // Only a recorded verdict is a caution. Earlier rows were never checked, and
   // caution-marking all of them told the writer and the verifier to hedge or
@@ -2741,11 +2777,11 @@ function releaseItemText (e, maxSummary = RELEASE_CTX_SUMMARY_CHARS) {
   if (['flagged', 'stale'].includes(qualityOf(e).verify)) cautions.push('claims not verified')
   if (e?.ai?.valueErrors?.length) cautions.push('value check failed')
   const caution = cautions.length ? ` [caution: ${cautions.join('; ')}]` : ''
-  return `${head}${tail}${releaseItemFiles(e)}${tag}${caution}`.trim()
+  return `${head}${tail}${releaseItemFiles(e)}${tag}${caution}${scope}`.trim()
 }
 
 export function collectReleaseContext (entries, bump, opts = {}) {
-  const out = { items: [], prevVersion: null, truncated: false, dropped: 0, net: { modelsIn: [], modelsOut: [], commandsIn: [], commandsOut: [] } }
+  const out = { items: [], sources: [], prevVersion: null, truncated: false, dropped: 0, net: { modelsIn: [], modelsOut: [], commandsIn: [], commandsOut: [] } }
   if (!Array.isArray(entries) || !bump) return out
   const maxItems = opts.maxItems ?? RELEASE_CTX_MAX_ITEMS
   const maxChars = opts.maxChars ?? RELEASE_CTX_MAX_CHARS
@@ -2769,6 +2805,8 @@ export function collectReleaseContext (entries, bump, opts = {}) {
       continue
     }
     if (e.noise) continue
+    if (out.sources.length >= maxItems) { out.truncated = true; break }
+    out.sources.push({ sha: e.sha })
     const text = releaseItemText(e)
     if (!text) continue
     if (!e.ai?.title && !e.ai?.summary && (e.files?.meaningful ?? 1) <= 0) continue
@@ -2825,7 +2863,7 @@ export function formatReleaseContext (ctx, bump) {
     lines.push('- Note: items marked [caution] carry a review flag on their claims. Lead with verified items; state caution-marked specifics hedged ("reportedly", "listed as") or omit them.')
   }
   if (ctx.truncated) lines.push(`- ...[earlier changes truncated; newest ${(ctx.items || []).length} shown]...`)
-  if (ctx.dropped) lines.push(`- ${ctx.dropped} other change${ctx.dropped === 1 ? ' was' : 's were'} left out of this list because a check discredited its summary; do not describe what the list omits.`)
+  if (ctx.dropped) lines.push(`- ${ctx.dropped} other change${ctx.dropped === 1 ? ' was' : 's were'} left out of this list because a check discredited its summary. Use its source evidence if supplied, never its rejected prose; otherwise do not infer the omitted behavior.`)
   const net = ctx.net || {}
   const netLines = []
   if (net.modelsIn.length || net.modelsOut.length) {
@@ -2852,6 +2890,36 @@ export function getReleaseContextFor (entries, bump, posIndex, ctxCache) {
     if (ctxCache) ctxCache.set(bump.sha, hit)
   }
   return hit.text ? hit : null
+}
+
+// Sparse/unreviewed window prose cannot establish mechanisms. Supply stored
+// member hunks, not another model's guesses or unchanged package documentation.
+// No new provider calls and no history admission: this is evidence for one row.
+export async function gatherReleaseEvidence (hit, entries, getPatch, { maxChars = 120000 } = {}) {
+  const sources = hit?.ctx?.sources || hit?.ctx?.items || []
+  if (!sources.length || typeof getPatch !== 'function') return ''
+  const bySha = new Map(entries.map(e => [e.sha, e]))
+  const parts = ['Release member source evidence (source hunks, not inferred benefits):']
+  let used = parts[0].length
+  for (const item of sources) {
+    const member = bySha.get(item.sha)
+    const header = `\nMember ${item.sha} (${member?.title || 'source change'}):\n`
+    const patch = member ? await Promise.resolve().then(() => getPatch(member)).catch(() => '') : ''
+    const raw = redactProductPrompts(patch || '')
+    if (!raw) {
+      parts.push(`${header}[partial evidence: member source unavailable; do not infer its behavior]`)
+      used += header.length + 100
+      if (used >= maxChars) { parts.push('[partial evidence: remaining member source omitted]'); break }
+      continue
+    }
+    const room = maxChars - used - header.length - 100
+    if (room <= 0) { parts.push('[partial evidence: remaining member source omitted]'); break }
+    const text = budgetPatch(raw, room, room)
+    parts.push(`${header}\`\`\`diff\n${text}\n\`\`\``)
+    used += header.length + text.length + 14
+  }
+  if (hit.ctx.truncated) parts.push('[partial evidence: release membership window truncated]')
+  return parts.join('\n')
 }
 
 // Open PRs plus the ones that have left the open list: a sync commit lands
@@ -3440,7 +3508,8 @@ export function promptContextOf ({ relText = '', sequence = null, prMeta = null,
     fullFiles: context.fullFiles,
     exportOutlines: context.exportOutlines,
     consumers: context.consumers,
-    changedTests: context.changedTests
+    changedTests: context.changedTests,
+    releaseEvidence: context.releaseEvidence
   }
 }
 
@@ -3707,6 +3776,12 @@ export function rewriteRank (e) {
 }
 
 function inputIdentity (e, prMeta, glossary, env, relText = '') {
+  // Deliberately NOT hashed here: summaryValidator/releaseBoilerplate source.
+  // Putting validator code in this identity would mark every admitted row's
+  // manifest stale the moment a gate tightens, re-queueing the whole admitted
+  // backlog for paid rewrites of text that already passed. Gate changes that
+  // matter to a row class invalidate exactly that class through its own version
+  // (RELEASE_ROLLUP_V for release rows), not through a global identity reset.
   return shortHash(JSON.stringify({ base: e.prevSha || null, model: modelFor(e, env, relText) || 'gpt-4o-mini', provider: env.LLM_API_BASE || 'https://api.openai.com/v1', context: contextFingerprint(prMeta, glossary), policy: QUALITY_POLICY_V, writer: shortHash(buildPrompt.toString() + buildFusePrompt.toString() + contextSectionLines.toString()), validator: shortHash(validateLlmOut.toString() + buildVerifyPrompt.toString() + validateVerifyOut.toString()) }))
 }
 
@@ -3954,6 +4029,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     if (e.enrichment?.policy === QUALITY_POLICY_V) {
       const fullPatch = getFullPatch ? await getFullPatch(e).catch(() => '') : ''
       context = await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, fullPatch })
+      context.releaseEvidence = await gatherReleaseEvidence(hit, entries, getPatch)
       const prompt = buildPrompt(e, patch, promptContextOf({ relText, sequence, prMeta, archMap, glossary, context }))
       identity = { ...evidenceManifest(e, patch, prompt, modelFor(e, env, relText)), inputIdentity: inputIdentity(e, prMeta, glossary, env, relText), sourceContextHash: shortHash(JSON.stringify(context)) }
     }
@@ -4135,6 +4211,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       try {
         const fullPatch = getFullPatch ? await getFullPatch(e).catch(() => '') : ''
         const context = queue[idx].context || (queue[idx].context = await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, fullPatch }))
+        if (!reverify && relText && !context.releaseEvidence) context.releaseEvidence = await gatherReleaseEvidence(releaseOf(e), entries, getPatch)
         e.structured = context.structured
         if (reverify) {
           // The verdict the row was owed, and only the verdict: the shipped
@@ -4510,16 +4587,17 @@ ${ctx.glossary ? `\n${ctx.glossary}\n` : ''}
 Date: ${e.day || ''}
 Release: ${e.version || e.freebuffVersion || ''}
 Title: ${e.ai?.title || e.title || ''}
-Date: ${e.day || ''}
 Category: ${e.category || (e.areas || []).join(', ')}
 
 ${releaseCtx}
+
+${ctx.releaseEvidence || ''}
 
 ${!bumpOnly(e) && patch ? `This release commit also ships these source changes:\n\`\`\`diff\n${budgetPatch(redactProductPrompts(patch), diffRoom(releaseCtx.length + 40000), perFileRoom(diffRoom(releaseCtx.length + 40000)))}\n\`\`\`` : ''}
 ${!bumpOnly(e) ? contextSectionLines(ctx).join('\n') : ''}
 
 Your task:
-Write 3-6 sentences of plain English that tell the user WHAT WAS ADDED, CHANGED, AND IMPROVED in this release.
+Describe only what the release evidence establishes, in plain English. Aim for 3-6 sentences when there are enough supported changes; sparse evidence warrants a shorter explanation, never invented highlights.
 
 Structure:
 1. Lead / Core Additions: Announce the main features, model updates, and improvements that this release delivers.
@@ -4527,7 +4605,7 @@ Structure:
 3. Everyday Impact: Explain only the everyday effects the evidence establishes, including conditions and affected users. Tests show what is asserted, not proof of a deployed capability.
 
 Rules:
-- DO NOT write meta-boilerplate saying "this is just a packaging update", "this is an internal packaging marker", "simply bundles together a collection of improvements", "nothing breaks, nothing changes", "no action is required on your part", or "your workflow will not be any different". You MUST name and describe the actual features, model changes, and improvements that were added!
+- Do not replace evidenced changes with packaging boilerplate. Name only features or mechanisms demonstrated by member source hunks or reviewed window items. File counts, filenames and scope-only items do not establish behavior, improved reliability, consistent settings, or safety gains. If the evidence does not establish a behavior, say the available release evidence is incomplete; do not make up a benefit to fill the requested structure.
 - No marketing. Never call the release or the assistant "smarter", "faster", "more capable", "more powerful", "seamless", "robust", "supercharged" or "enhanced", and never claim speed, quality, savings or reliability gains unless an item in the list above states that exact gain. Describe what each item does; let the reader judge whether it is better.
 - Never invent a closing summary sentence ("Together, these changes make...") that generalizes beyond the items. If you need a last sentence, state the single most useful concrete effect.
 - Never define the reader in an aside: write "you", not "you (the person using the CLI)".
@@ -4766,7 +4844,7 @@ export const ELI5_HYPE_RE = /\b(?:we(?:'re| are) excited|seamless(?:ly)?|game[- 
 // No `g` flag on the exported constants: `.test()` on a global regex keeps
 // lastIndex between calls, and callers use these as predicates. normalizeEli5
 // builds its own global copy for matchAll.
-export const ELI5_HYPE_ROLLUP_RE = new RegExp(`${ELI5_HYPE_RE.source}|\\b(?:smarter|faster|more (?:capable|powerful|reliable|robust|intelligent)|(?:significantly|dramatically|greatly) (?:improv|enhanc|boost)\\w*|enhanced experience)\\b`, 'i')
+export const ELI5_HYPE_ROLLUP_RE = new RegExp(`${ELI5_HYPE_RE.source}|\\b(?:smarter|faster|more (?:capable|powerful|reliabl[ey]|robust|intelligent|consistent(?:ly)?)|(?:significantly|dramatically|greatly) (?:improv|enhanc|boost)\\w*|enhanced experience)\\b`, 'i')
 
 // A visible cause OR purpose clause: the reader can see why the change exists,
 // not only what it did. Shared by the eval harness and the /stats/ panel so
@@ -5018,6 +5096,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
         // Source context on: the plain-English line is where a module's own
         // vocabulary matters most, and it was the one pass running without it.
         const context = queue[idx].context || (queue[idx].context = await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, withSource: true, fullPatch }))
+        if (!queue[idx].reverify && relText) context.releaseEvidence = await gatherReleaseEvidence(releaseOf(e), entries, getPatch)
         e.structured = context.structured
         if (queue[idx].reverify) {
           const plain = queue[idx].reverify
@@ -5124,7 +5203,7 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
   if (e.ai && Object.hasOwn(e.ai, 'acceptedPr')) prMeta = e.ai.acceptedPr
   else if (prMeta?.matched === 'files') prMeta = await checkPrRelevance(e, patch, prMeta, env)
   const maxChars = relText ? ELI5_ROLLUP_MAX_CHARS : ELI5_MAX_CHARS
-  const allow = `${relText} ${e.ai?.summary || ''} ${(e.facts || []).join(' ')}`
+  const allow = `${relText} ${context.releaseEvidence || ''} ${(e.facts || []).join(' ')}`
   const corpus = groundingCorpus(e, patch, {
     structured: context.structured,
     prMeta,
@@ -5158,7 +5237,8 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     exportOutlines: context.exportOutlines,
     fullFiles: context.fullFiles,
     consumers: context.consumers,
-    changedTests: context.changedTests
+    changedTests: context.changedTests,
+    releaseEvidence: context.releaseEvidence
   }
   // Shorter ask for a gateway that answers the full one with a refusal or
   // prose (see stripDiffComments). The grounding corpus above keeps the whole

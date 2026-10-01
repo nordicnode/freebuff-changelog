@@ -1,4 +1,4 @@
-import test from 'node:test'
+import test, { beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -9,15 +9,18 @@ import {
   contextFingerprint, callLlm, llmCallCount, PROMPT_V, DEFAULT_VERIFY_MODEL,
   LLM_CONTEXT_TOKENS, rememberClosedPrs, matchPrByPaths, prSummaryKey,
   pruneExpiredErrors, gatherEntryContext, collectReleaseContext, formatReleaseContext,
-  buildVerifyPrompt, buildEli5Prompt, getReleaseContextFor, summaryValidator, releaseBoilerplate, RELEASE_ROLLUP_V, VERIFY_POLICY_V, eli5Key, eli5Source, ELI5_V
+  buildVerifyPrompt, buildEli5Prompt, getReleaseContextFor, summaryValidator, releaseBoilerplate, RELEASE_ROLLUP_V, VERIFY_POLICY_V, eli5Key, eli5Source, ELI5_V, normalizeEli5, ELI5_ROLLUP_MAX_CHARS,
+  llmRpm, createLlmRateLimiter, resetLlmRateLimiterForTests, retryAfterMs, gatherReleaseEvidence
 } from '../lib/llm.mjs'
-import { artifactHash, qualityOf, qualityText, qualityNote, qualityStatus, dedupeClaims, QUALITY_POLICY_V } from '../lib/quality.mjs'
+import { artifactHash, qualityOf, qualityText, qualityNote, qualityStatus, dedupeClaims, generationState, QUALITY_POLICY_V } from '../lib/quality.mjs'
 import { mergeChangelog, mergeOpenPrs, mergeHealth, persistMerged } from '../lib/mergedata.mjs'
 import { runEval, latestResult } from '../lib/eval.mjs'
 import { writeJson, withLock, withDeadline, git, shortHash } from '../lib/util.mjs'
 import { checkDeployedHead } from '../lib/sync.mjs'
 import { entryRecord, discordText, generateReleaseNotesMarkdown, buildSite, entryCard } from '../lib/site.mjs'
 import { extractStructuredFacts, deterministicSummary } from '../lib/analyze.mjs'
+
+beforeEach(() => resetLlmRateLimiterForTests())
 
 const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'offline-test', LLM_API_BASE: 'https://example.invalid/v1', LLM_MODEL: 'unchanged-model', CHANGELOG_LLM_RPM: '-1', CHANGELOG_LLM_ESCALATE: '0' }
 const entry = () => ({ sha: 'a'.repeat(40), prevSha: 'b'.repeat(40), kind: 'sync', date: '2026-09-30T00:00:00Z', day: '2026-09-30', summary: 'Internal limit changed.', title: 'Limit changed', significance: 'minor', files: { modified: ['a.ts'] } })
@@ -259,6 +262,116 @@ test('release quality: a functional release rejects packaging boilerplate withou
     assert.throws(() => validate({ title: 'Freebuff release', summary }), /Release summary/)
   }
   assert.doesNotThrow(() => validate({ title: 'Safer terminal output', summary: 'Terminal output now strips escape sequences before rendering.' }))
+})
+
+test('provider rate limit: invalid settings cannot disable or exceed the 60 RPM contract', () => {
+  for (const value of [undefined, '', '0', '-1', 'NaN', 'Infinity', '61', '1000']) assert.equal(llmRpm({ CHANGELOG_LLM_RPM: value }), 60)
+  assert.equal(llmRpm({ CHANGELOG_LLM_RPM: '30' }), 30)
+  assert.equal(llmRpm({ CHANGELOG_LLM_RPM: '1.5' }), 1)
+})
+
+test('provider rate limit: concurrent stages and retries share a rolling minute and throttle pause', async () => {
+  let now = 0
+  const waits = [], starts = []
+  const limiter = createLlmRateLimiter({ now: () => now, wait: async ms => { waits.push(ms); now += ms } })
+  await Promise.all(Array.from({ length: 121 }, async () => { starts.push(await limiter.reserve({ CHANGELOG_LLM_RPM: '999' })) }))
+  assert.deepEqual(waits, [60010, 60010])
+  starts.sort((a, b) => a - b)
+  for (let i = 0; i < starts.length; i++) assert.ok(starts.filter(at => at >= starts[i] && at < starts[i] + 60000).length <= 60)
+  assert.equal(now, 120020)
+  limiter.deferUntil(now + 120000)
+  await limiter.reserve()
+  assert.equal(waits.at(-1), 120000)
+  assert.equal(now, 240020, 'the pause applies to every worker, not only the 429 caller')
+})
+
+test('provider rate limit: expired deadlines do not acquire slots and HTTP-date Retry-After is honored', async () => {
+  const limiter = createLlmRateLimiter()
+  await assert.rejects(limiter.reserve({ LLM_DEADLINE_AT: Date.now() - 1 }), /deadline/)
+  const now = Date.parse('2026-10-01T12:00:00Z')
+  assert.equal(retryAfterMs('120', now), 120000)
+  assert.equal(retryAfterMs('Thu, 01 Oct 2026 12:02:00 GMT', now), 120000)
+  for (const value of [null, '', 'invalid', 'Thu, 01 Oct 2026 11:59:00 GMT']) assert.equal(retryAfterMs(value, now), 0)
+})
+
+test('provider rate limit: real request paths cannot give another stage or retry a fresh quota', async t => {
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return response({ ok: true }) })
+  const limited = { ...env, CHANGELOG_LLM_RPM: '1', LLM_DEADLINE_AT: Date.now() + 1000 }
+  await callLlm('writer', limited, 1, x => x)
+  for (const stage of ['verification', 'plain-English', 'map', 'fuse']) await assert.rejects(callLlm(stage, limited, 1, x => x, { stage }), /deadline/)
+  assert.equal(calls, 1)
+  resetLlmRateLimiterForTests()
+  calls = 0
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response('timeout', { status: 504 }) })
+  await assert.rejects(callLlm('writer', limited, 4, x => x, { leanPrompt: 'retry' }), /deadline/)
+  assert.equal(calls, 1, 'a retry must acquire a slot in the same rolling window')
+})
+
+test('provider rate limit: startup handoffs and exhausted 429 responses pause later calls', async t => {
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response('throttle', { status: 429, headers: { 'retry-after': '120' } }) })
+  await assert.rejects(callLlm('writer', { ...env, CHANGELOG_LLM_RPM_WARMUP: '1', LLM_DEADLINE_AT: Date.now() + 1000 }, 1, x => x), /deadline/)
+  assert.equal(calls, 0, 'the quiet handoff cannot be bypassed to fit a deadline')
+  await assert.rejects(callLlm('writer', env, 4, x => x), /HTTP 429/)
+  await assert.rejects(callLlm('reviewer', { ...env, LLM_DEADLINE_AT: Date.now() + 1000 }, 1, x => x), /deadline/)
+  assert.equal(calls, 1, 'another stage respects the exhausted request’s provider-wide pause')
+})
+
+test('release regression: unchanged packaging fields cannot satisfy a functional roll-up', () => {
+  const summary = 'The version literal in freebuff/cli/release/package.json moved from 0.2.10 to 0.2.11, marking publication of the Freebuff CLI 0.2.11 release line. All packaging fields (bin, scripts, files, os, cpu, engines, prepack/postpack) remain unchanged from the prior release.'
+  assert.equal(releaseBoilerplate(summary), true)
+  const validate = summaryValidator('notable', '', null, { release: true })
+  assert.throws(() => validate({ title: 'Freebuff release', summary }), /Release summary/)
+  assert.throws(() => validate({ title: 'Freebuff release', summary, changes: [{ area: 'packaging', what: 'All packaging fields remain unchanged.' }] }), /Release summary/)
+  assert.doesNotThrow(() => validate({ title: 'Deferred updates', summary: 'The launcher adopts staged updates left behind when a terminal closes.' }))
+})
+
+test('release regression: sparse scope does not authorize reliability or configuration promises', () => {
+  for (const text of ['The program now starts more reliably.', 'It picks up configuration values more consistently.']) {
+    assert.throws(() => normalizeEli5(text, ELI5_ROLLUP_MAX_CHARS, { allow: 'CLI changes across 4 files.' }), /marketing language/)
+  }
+  assert.equal(normalizeEli5('The program now starts more reliably.', ELI5_ROLLUP_MAX_CHARS, { allow: 'The program now starts more reliably.' }), 'The program now starts more reliably.')
+})
+
+test('release regression: both writers and reviewers receive member source, not unchanged package guides', async () => {
+  const member = { ...entry(), sha: 'c'.repeat(40), ai: { title: 'Unchecked launcher', summary: 'Guaranteed reliability.', verify: 'unavailable' }, files: { meaningful: 1, added: [], modified: ['cli/launcher.js'], removed: [], renamed: [] }, stats: { additions: 1, deletions: 1 } }
+  const bump = { ...entry(), freebuffVersion: '0.2.11', files: { meaningful: 1, modified: ['freebuff/cli/release/package.json'] }, stats: { additions: 1, deletions: 1 } }
+  const hit = getReleaseContextFor([member, bump], bump)
+  const memberPatch = 'diff --git a/cli/launcher.js b/cli/launcher.js\n+await adoptOrphanedStagedUpdates()\n'
+  const releaseEvidence = await gatherReleaseEvidence(hit, [member, bump], async () => memberPatch)
+  const context = { releaseEvidence, subsystemDocs: [{ path: 'README.md', content: 'Background claim: unlimited models.' }] }
+  for (const prompt of [buildPrompt(bump, patch, { ...context, releaseCtx: hit.text }), buildEli5Prompt(bump, [], { ...context, releaseCtx: hit.text })]) {
+    const material = deliveredEvidence(prompt)
+    assert.match(material, /adoptOrphanedStagedUpdates/)
+    assert.match(material, /scope only; behavior requires source evidence/)
+    assert.doesNotMatch(material, /Guaranteed reliability|unlimited models/)
+  }
+  assert.match(await gatherReleaseEvidence(hit, [member, bump], async () => ''), /partial evidence/)
+  assert.match(await gatherReleaseEvidence(hit, [member, bump], async () => memberPatch, { maxChars: 50 }), /partial evidence/)
+  const flagged = { ...member, ai: { ...member.ai, verify: 'flagged', summary: 'Rejected unlimited access claim.' } }
+  const flaggedHit = getReleaseContextFor([flagged, bump], bump)
+  assert.equal(flaggedHit.ctx.items.length, 0, 'rejected prose is excluded')
+  const source = await gatherReleaseEvidence(flaggedHit, [flagged, bump], async () => memberPatch)
+  assert.match(source, /adoptOrphanedStagedUpdates/, 'rejecting prose must not erase the underlying change')
+  assert.doesNotMatch(source, /Rejected unlimited access/)
+})
+
+test('completion: text, exact-text review and complete evidence are separate requirements', () => {
+  const e = entry()
+  assert.deepEqual(generationState(e), { status: 'missing', missing: ['summary', 'plain-English'] })
+  e.ai = { policy: 1, title: 'Limit changed', summary: 'The internal limit changed.', verify: 'unavailable' }
+  e.eli5 = { policy: 1, text: 'An internal limit changed.', verify: 'unavailable' }
+  assert.equal(generationState(e).status, 'review-pending')
+  e.ai.verify = e.eli5.verify = 'passed'
+  e.ai.verifyHash = artifactHash(e.ai); e.eli5.verifyHash = artifactHash(e.eli5)
+  assert.equal(generationState(e).status, 'complete')
+  e.ai.manifest = { partial: true }
+  assert.equal(generationState(e).status, 'needs-repair')
+  delete e.ai.manifest
+  e.eli5.text = 'Invented replacement.'
+  assert.equal(generationState(e).status, 'needs-repair', 'a stale plain-English verdict is not completion')
+  assert.equal(generationState({ ...e, noise: true }).status, 'not-required')
 })
 
 test('verification: a 504 takes one different framing, preserving all evidence and coverage', async t => {

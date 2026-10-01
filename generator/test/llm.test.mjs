@@ -1,8 +1,10 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
-import test from 'node:test'
+import test, { beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, chargeReverify, callUnanswered, callLlm, VERIFY_POLICY_V, releaseFailedRows } from '../lib/llm.mjs'
+import { resetLlmRateLimiterForTests } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
+beforeEach(() => resetLlmRateLimiterForTests())
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -2263,7 +2265,7 @@ test('normalizeEli5: rejects no-action packaging boilerplate on roll-up rows', (
   assert.equal(normalizeEli5(good, ELI5_ROLLUP_MAX_CHARS), good)
 })
 
-test('buildEli5Prompt: roll-up mode commands description of what was added and forbids meta packaging boilerplate', () => {
+test('buildEli5Prompt: roll-up mode requires evidenced changes without forcing invented highlights', () => {
   const bump = {
     sha: 'f61c4efa8a0d8fabb774756afdd610b7b7726010',
     day: '2026-09-18',
@@ -2276,8 +2278,9 @@ test('buildEli5Prompt: roll-up mode commands description of what was added and f
 
   assert.ok(prompt.includes('RELEASE ROLL-UP summarizing the capabilities, models, security protections, and improvements'))
   assert.ok(prompt.includes('Updates included in this release (0.0.178 since 0.0.177):'))
-  assert.ok(prompt.includes('DO NOT write meta-boilerplate saying "this is just a packaging update"'))
-  assert.ok(prompt.includes('Write 3-6 sentences of plain English that tell the user WHAT WAS ADDED, CHANGED, AND IMPROVED in this release.'))
+  assert.ok(prompt.includes('Do not replace evidenced changes with packaging boilerplate.'))
+  assert.ok(prompt.includes('sparse evidence warrants a shorter explanation, never invented highlights.'))
+  assert.ok(prompt.includes('File counts, filenames and scope-only items do not establish behavior'))
 })
 
 

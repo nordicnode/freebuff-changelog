@@ -68,6 +68,23 @@ export function dedupeClaims (claims = []) {
   return out
 }
 
+// Text presence is not completion: both artifacts need exact-text verdicts,
+// complete evidence, and no unresolved grounding/claim objections.
+export function generationState (e = {}) {
+  const ai = e.ai || {}, plain = e.eli5 || {}
+  const missing = []
+  if (!ai.title || !ai.summary) missing.push('summary')
+  if (!plain.text) missing.push('plain-English')
+  if (e.noise) return { status: 'not-required', missing: [] }
+  if (missing.length) return { status: 'missing', missing }
+  const edited = e.overridden || ai.overridden
+  const technical = edited ? 'human-edited' : qualityStatus(ai)
+  const explanation = plain.model === 'template' ? 'deterministic' : plain.overridden ? 'human-edited' : qualityStatus(plain)
+  if ((!edited && (ai.ungrounded?.length || ai.valueErrors?.length || ai.verifyClaims?.length || ai.manifest?.partial)) || (!plain.overridden && (plain.verifyClaims?.length || plain.manifest?.partial)) || ['flagged', 'stale'].includes(technical) || ['flagged', 'stale'].includes(explanation)) return { status: 'needs-repair', missing }
+  if (technical === 'pre-policy' || explanation === 'pre-policy') return { status: 'legacy-unreviewed', missing }
+  return { status: VERIFIED_STATUSES.includes(technical) && PLAIN_VERIFIED_STATUSES.includes(explanation) ? 'complete' : 'review-pending', missing }
+}
+
 export function qualityOf (e = {}) {
   const ai = e.ai || {}
   const plain = e.eli5 || {}
@@ -125,6 +142,7 @@ export function qualityOf (e = {}) {
   const plainNotes = notes.filter(n => /plain-English/.test(n))
   return {
     verify, plainVerify, confidence, uncertain, demoteActions,
+    generation: generationState(e),
     prePolicy: verify === 'pre-policy' || plainVerify === 'pre-policy',
     reviewPending: verify === 'unavailable' || plainVerify === 'unavailable',
     warnings: [...new Set(warnings)],
