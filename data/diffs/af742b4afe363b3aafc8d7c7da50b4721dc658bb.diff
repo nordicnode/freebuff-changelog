@@ -1,0 +1,984 @@
+diff --git a/sdk/CHANGELOG.md b/sdk/CHANGELOG.md
+index 1f01bfbd6..70ba9b800 100644
+--- a/sdk/CHANGELOG.md
++++ b/sdk/CHANGELOG.md
+@@ -1,31 +1,33 @@
+ # Changelog
+ 
+ All notable changes to the @codebuff/sdk package will be documented in this file.
+ 
+ ## [Unreleased]
+ 
++- **Security:** `read_url` now connects only to an address it has just validated. Resolution and the private/reserved-address check happen in the connection's own `lookup`, and the host is refused if any answer is blocked, so a hostname can no longer pass the check with one answer and connect with another. Every redirect hop is validated the same way. More non-routable ranges are refused: IPv4-compatible IPv6 (`::a.b.c.d`), 198.18.0.0/15, `fec0::/10` and `64:ff9b:1::/48`. The tool call passes only `url` and `max_chars` through to `readUrl`. Under Bun with a proxy variable set, Bun's `fetch` is still used so the proxy keeps working.
++
+ - **Security:** a runtime `NEXT_PUBLIC_CODEBUFF_APP_URL` / `CODEBUFF_APP_URL` override is honoured only for a `codebuff.com` / `freebuff.com` host (or a subdomain) over https, or a loopback host. Every request carrying your API key goes to that URL, so any other host now also needs `CODEBUFF_ALLOW_CUSTOM_APP_URL=1` in the environment; without it the override is ignored with a one-line warning and the bundled URL is used.
+ 
+ - **Security:** the published package no longer ships sourcemaps. They carried the full source of every bundled workspace module.
+ 
+ - Removed in an earlier unreleased change and noted here for 0.10.7 users: the `CODEBUFF_CLAUDE_OAUTH_TOKEN` environment variable (direct Claude OAuth routing) is gone; the SDK no longer reads it.
+ 
+ - `spawn_agents` results from `last_message` agents now arrive as plain text. Each result's `value` is the child's final answer (the text of its last turn, without reasoning or think tags) instead of `{ type: 'lastMessage', value: Message[] }`, and a child whose last turn has no text reports `{ type: 'error', message: 'No response from agent' }`. `handleSteps` code that walked the `lastMessage` message array must read the string instead. Structured-output results and the `output` returned by `run()` are unchanged.
+ 
+ - `run()` now returns promptly when its `signal` aborts during the user lookup or agent-run registration that precede the first model request. Those requests had no signal and retried through a backoff, so a socket that never answered held the run for the whole retry budget; they now end on abort and the run resolves with `Run cancelled by user.`
+ 
+ - Dropped `knowledge.md` from the knowledge-file priority list; the SDK now picks up `AGENTS.md` then `CLAUDE.md` (per directory, and `~/.AGENTS.md`/`~/.CLAUDE.md` in the home directory). Existing `knowledge.md` files are no longer read. The `PRIMARY_KNOWLEDGE_FILE_NAME` export was removed with it; use `KNOWLEDGE_FILE_NAMES[0]`.
+ 
+ ## [0.10.7]
+ 
+ - New code editing tool `apply_patch` which works well with Codex models (e.g. openai/gpt-5.3-codex)
+ - `write_file` is now a deterministic tool that creates or replaces the file. Previously, it also accepted edit snippet comments which could expand to keep a portion of the previous file, e.g. "// ... rest of the function ...". That behavior is removed to keep things simple. `str_replace` or `apply_patch` should be used if not overwriting the whole file.
+ 
+ ## [0.10.6]
+ 
+ Added `skillsDir` parameter to specify a directory to load skills from.
+ 
+ ## [0.10.5]
+ 
+ Fixed a bug with missing tool calls/results.
+ 
+diff --git a/sdk/src/__tests__/read-url-dns-pinning.test.ts b/sdk/src/__tests__/read-url-dns-pinning.test.ts
+new file mode 100644
+index 000000000..e7d06d034
+--- /dev/null
++++ b/sdk/src/__tests__/read-url-dns-pinning.test.ts
+@@ -0,0 +1,210 @@
++import http from 'node:http'
++import { gzipSync } from 'node:zlib'
++
++import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
++
++import { pinnedFetch } from '../tools/pinned-fetch'
++import { readUrl } from '../tools/read-url'
++import { isBlockedAddress } from '../tools/ssrf'
++
++import type { AddressInfo } from 'node:net'
++
++/**
++ * A local server stands in for an internal service. Every test asserts on
++ * `hits`: a refused fetch must never reach it.
++ */
++let server: http.Server
++let port = 0
++let hits: { path: string; host: string | undefined }[] = []
++
++beforeAll(async () => {
++  server = http.createServer((request, response) => {
++    hits.push({ path: request.url ?? '', host: request.headers.host })
++    if (request.url === '/redirect-internal') {
++      response.writeHead(302, {
++        location: `http://internal.example:${port}/secret`,
++      })
++      response.end()
++      return
++    }
++    if (request.url === '/gzip') {
++      response.writeHead(200, {
++        'content-type': 'text/plain',
++        'content-encoding': 'gzip',
++      })
++      response.end(gzipSync('compressed hello'))
++      return
++    }
++    response.writeHead(200, { 'content-type': 'text/plain' })
++    response.end('internal secret')
++  })
++  await new Promise<void>((resolve) =>
++    server.listen(0, '127.0.0.1', () => resolve()),
++  )
++  port = (server.address() as AddressInfo).port
++})
++
++afterAll(() => {
++  server.close()
++})
++
++/** A resolver that answers from a script, one answer list per call. */
++function flippingResolver(...answers: string[][]) {
++  const calls: string[] = []
++  const lookupHost = async (hostname: string) => {
++    calls.push(hostname)
++    return answers[Math.min(calls.length - 1, answers.length - 1)]!
++  }
++  return { lookupHost, calls }
++}
++
++const PUBLIC = '93.184.216.34'
++
++describe('readUrl pins the connection to the address it validated', () => {
++  it('refuses a name that answers public for the check and private for the connection', async () => {
++    hits = []
++    // `localhost` so that a transport resolving the name on its own (the old
++    // behaviour) really does reach the local server.
++    const { lookupHost, calls } = flippingResolver([PUBLIC], ['127.0.0.1'])
++    const result = await readUrl({
++      url: `http://localhost:${port}/secret`,
++      lookupHost,
++    })
++
++    expect(hits).toEqual([])
++    expect(result[0].value).toEqual({
++      url: `http://localhost:${port}/secret`,
++      errorMessage:
++        'Host "localhost" resolves to a private or reserved address (127.0.0.1)',
++    })
++    // Resolved by the check, and again by the connection through the same
++    // validating resolver.
++    expect(calls.length).toBeGreaterThanOrEqual(2)
++  })
++
++  it('refuses when any one answer is private, even beside a public one', async () => {
++    hits = []
++    const { lookupHost } = flippingResolver([PUBLIC], [PUBLIC, '10.0.0.7'])
++    const result = await readUrl({
++      url: `http://localhost:${port}/secret`,
++      lookupHost,
++    })
++    expect(hits).toEqual([])
++    expect(result[0].value).toMatchObject({
++      errorMessage: expect.stringContaining('(10.0.0.7)'),
++    })
++  })
++
++  for (const [label, address] of [
++    ['IPv4-mapped IPv6 loopback', '::ffff:127.0.0.1'],
++    ['cloud metadata', '169.254.169.254'],
++    ['CGNAT', '100.64.1.1'],
++    ['unique-local IPv6', 'fd00::1'],
++    ['RFC 1918', '192.168.1.10'],
++  ] as const) {
++    it(`refuses a connection-time answer in ${label}`, async () => {
++      hits = []
++      const { lookupHost } = flippingResolver([PUBLIC], [address])
++      const result = await readUrl({
++        url: `http://localhost:${port}/secret`,
++        lookupHost,
++      })
++      expect(hits).toEqual([])
++      expect(result[0].value).toMatchObject({
++        errorMessage: expect.stringContaining(`(${address})`),
++      })
++    })
++  }
++
++  it('re-validates every redirect hop', async () => {
++    hits = []
++    // Only 127.0.0.1 counts as "public" here; the redirect target's name
++    // answers 127.0.0.2, which the policy refuses.
++    const isBlocked = (ip: string) => ip !== '127.0.0.1'
++    const lookupHost = async (hostname: string) =>
++      hostname === 'internal.example' ? ['127.0.0.2'] : ['127.0.0.1']
++    const result = await readUrl({
++      url: `http://public.example:${port}/redirect-internal`,
++      lookupHost,
++      isBlocked,
++    })
++    expect(hits.map((hit) => hit.path)).toEqual(['/redirect-internal'])
++    expect(result[0].value).toMatchObject({
++      errorMessage: expect.stringContaining('(127.0.0.2)'),
++    })
++  })
++})
++
++describe('pinnedFetch', () => {
++  const allowLoopback = (ip: string) => ip !== '127.0.0.1'
++
++  it('connects to the validated address and keeps the hostname', async () => {
++    hits = []
++    const { lookupHost } = flippingResolver(['127.0.0.1'])
++    const response = await pinnedFetch(
++      `http://pinned.example:${port}/page?q=1`,
++      { lookupHost, isBlocked: allowLoopback },
++    )
++    expect(response.status).toBe(200)
++    expect(await response.text()).toBe('internal secret')
++    expect(hits).toEqual([
++      { path: '/page?q=1', host: `pinned.example:${port}` },
++    ])
++  })
++
++  it('refuses a refused answer at connect time, before any byte is sent', async () => {
++    hits = []
++    const { lookupHost } = flippingResolver(['10.9.9.9'])
++    await expect(
++      pinnedFetch(`http://pinned.example:${port}/`, {
++        lookupHost,
++        isBlocked: allowLoopback,
++      }),
++    ).rejects.toThrow('resolves to a private or reserved address (10.9.9.9)')
++    expect(hits).toEqual([])
++  })
++
++  it('decodes a compressed body like fetch does', async () => {
++    const { lookupHost } = flippingResolver(['127.0.0.1'])
++    const response = await pinnedFetch(`http://pinned.example:${port}/gzip`, {
++      lookupHost,
++      isBlocked: allowLoopback,
++    })
++    expect(await response.text()).toBe('compressed hello')
++    expect(response.headers.get('content-encoding')).toBeNull()
++  })
++
++  it('aborts on the signal', async () => {
++    const controller = new AbortController()
++    controller.abort()
++    await expect(
++      pinnedFetch(`http://pinned.example:${port}/`, {
++        signal: controller.signal,
++        isBlocked: allowLoopback,
++      }),
++    ).rejects.toMatchObject({ name: 'AbortError' })
++  })
++})
++
++describe('address policy', () => {
++  it('refuses the ranges ipaddr.js calls unicast but nothing public uses', () => {
++    for (const ip of [
++      '::7f00:1', // IPv4-compatible ::127.0.0.1
++      '::a9fe:a9fe', // IPv4-compatible ::169.254.169.254
++      '198.18.0.1',
++      'fec0::1',
++      '64:ff9b:1::1',
++    ]) {
++      expect({ ip, blocked: isBlockedAddress(ip) }).toEqual({
++        ip,
++        blocked: true,
++      })
++    }
++    for (const ip of ['8.8.8.8', '2606:4700:4700::1111', '1.1.1.1']) {
++      expect({ ip, blocked: isBlockedAddress(ip) }).toEqual({
++        ip,
++        blocked: false,
++      })
++    }
++  })
++})
+diff --git a/sdk/src/env.ts b/sdk/src/env.ts
+index 5d42e7c9c..8ea428fda 100644
+--- a/sdk/src/env.ts
++++ b/sdk/src/env.ts
+@@ -122,28 +122,41 @@ export const getTrustedAgentPublishersFromEnv = (): string | undefined => {
+  * anything else able to set one variable. A rejected value is ignored — the
+  * caller falls back to the bundled URL — and warned about once.
+  */
+ export const getRuntimeAppUrlFromEnv = (): string | undefined => {
+   for (const variable of RUNTIME_APP_URL_ENV_VARS) {
+     const value = process.env[variable]
+     if (value === undefined) continue
+     if (value.trim() === '') return undefined
+     if (!isAllowedRuntimeAppUrl(value)) {
+       warnRejectedRuntimeAppUrl(variable, value, 'transport')
+       return undefined
+     }
+     if (isFirstPartyRuntimeAppUrl(value) || isCustomRuntimeAppUrlAllowed()) {
+       return value
+     }
+     warnRejectedRuntimeAppUrl(variable, value, 'host')
+     return undefined
+   }
+   return undefined
+ }
+ 
+ export const getSystemProcessEnv = (): NodeJS.ProcessEnv => {
+   return process.env
+ }
+ 
++const PROXY_ENV_VARS = [
++  'HTTPS_PROXY',
++  'https_proxy',
++  'HTTP_PROXY',
++  'http_proxy',
++  'ALL_PROXY',
++  'all_proxy',
++] as const
++
++/** Whether an outbound HTTP proxy is configured for this process. */
++export const isHttpProxyConfiguredFromEnv = (): boolean =>
++  PROXY_ENV_VARS.some((name) => !!process.env[name])
++
+ export const getByokOpenrouterApiKeyFromEnv = (): string | undefined => {
+   return process.env[BYOK_OPENROUTER_ENV_VAR]
+ }
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 87ed030ab..f532ea37a 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -1331,54 +1331,54 @@ async function handleToolCall({
+     } else if (toolName === 'apply_patch') {
+       result = await applyPatchTool({
+         parameters: input,
+         cwd: requireCwd(cwd, toolName),
+         fs,
+       })
+     } else if (toolName === 'run_terminal_command') {
+       const resolvedCwd = requireCwd(cwd, 'run_terminal_command')
+       result = await runTerminalCommand({
+         ...input,
+         cwd: path.resolve(resolvedCwd, input.cwd ?? '.'),
+         env,
+         scrubEnvironmentKeys: byok
+           ? [
+               'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY',
+               ...(byok.credentialRef.startsWith('env:')
+                 ? [byok.credentialRef.slice(4)]
+                 : []),
+             ]
+           : undefined,
+         scrubEnvironmentValues: byok ? [byok.apiKey] : undefined,
+         signal,
+         terminalCommandBroker,
+       } as Parameters<typeof runTerminalCommand>[0])
+     } else if (toolName === 'read_url') {
+-      result = await readUrl({
+-        ...(input as Parameters<typeof readUrl>[0]),
+-        signal,
+-      })
++      // Only the tool's own parameters: the transport and SSRF options are
++      // the host's, never the tool call's.
++      const { url, max_chars } = input as { url: string; max_chars?: number }
++      result = await readUrl({ url, max_chars, signal })
+     } else if (toolName === 'code_search') {
+       result = await codeSearch({
+         projectPath: requireCwd(cwd, 'code_search'),
+         ...input,
+         signal,
+       } as Parameters<typeof codeSearch>[0])
+     } else if (toolName === 'list_directory') {
+       result = await listDirectory({
+         directoryPath: (input as { path: string }).path,
+         projectPath: requireCwd(cwd, 'list_directory'),
+         fs,
+       })
+     } else if (toolName === 'glob') {
+       const globInput = input as {
+         pattern: string
+         cwd?: string
+         max_results?: number
+       }
+       result = await glob({
+         pattern: globInput.pattern,
+         projectPath: requireCwd(cwd, 'glob'),
+         cwd: globInput.cwd,
+         maxResults: globInput.max_results,
+         fs,
+       })
+diff --git a/sdk/src/tools/pinned-fetch.ts b/sdk/src/tools/pinned-fetch.ts
+new file mode 100644
+index 000000000..334bc33e7
+--- /dev/null
++++ b/sdk/src/tools/pinned-fetch.ts
+@@ -0,0 +1,204 @@
++import http from 'node:http'
++import https from 'node:https'
++import net from 'node:net'
++import { pipeline, Readable } from 'node:stream'
++import zlib from 'node:zlib'
++
++import { resolveAllowedAddresses, unwrapHost } from './ssrf'
++
++import type { AddressPolicy, HostLookup } from './ssrf'
++import type { LookupAddress, LookupOptions } from 'node:dns'
++import type { IncomingMessage } from 'node:http'
++
++type LookupCallback = (
++  error: NodeJS.ErrnoException | null,
++  address: string | LookupAddress[],
++  family?: number,
++) => void
++
++/**
++ * A `lookup` for `net.connect` that resolves through `lookupHost`, refuses the
++ * host if ANY answer is blocked, and hands the connection only the addresses
++ * it just validated.
++ *
++ * This is what closes DNS rebinding: the address that is checked is the
++ * address that is connected to, in one resolution, instead of a check that
++ * resolves the name and a fetch that resolves it again on its own.
++ */
++export function validatingLookup(opts: {
++  lookupHost?: HostLookup
++  isBlocked?: AddressPolicy
++}) {
++  return (
++    hostname: string,
++    options: LookupOptions,
++    callback: LookupCallback,
++  ): void => {
++    resolveAllowedAddresses(hostname, opts).then(
++      (addresses) => {
++        const wanted =
++          options?.family === 4 || options?.family === 6 ? options.family : 0
++        const entries = addresses
++          .map((address) => ({ address, family: net.isIP(address) }))
++          .filter((entry) => entry.family !== 0)
++          .filter((entry) => wanted === 0 || entry.family === wanted)
++        if (entries.length === 0) {
++          const error: NodeJS.ErrnoException = new Error(
++            `Could not resolve host "${hostname}"`,
++          )
++          error.code = 'ENOTFOUND'
++          callback(error, '', 0)
++          return
++        }
++        if (options?.all) callback(null, entries)
++        else callback(null, entries[0]!.address, entries[0]!.family)
++      },
++      (error: unknown) =>
++        callback(
++          error instanceof Error ? error : new Error(String(error)),
++          '',
++          0,
++        ),
++    )
++  }
++}
++
++function abortError(): Error {
++  const error = new Error('The operation was aborted')
++  error.name = 'AbortError'
++  return error
++}
++
++const NULL_BODY_STATUSES = new Set([101, 204, 205, 304])
++
++/** The body, decompressed the way `fetch` would. */
++function decodedBody(response: IncomingMessage): Readable {
++  const encoding = String(response.headers['content-encoding'] ?? '')
++    .trim()
++    .toLowerCase()
++  const decoder =
++    encoding === 'gzip' || encoding === 'x-gzip'
++      ? zlib.createGunzip()
++      : encoding === 'deflate'
++        ? zlib.createInflate()
++        : encoding === 'br'
++          ? zlib.createBrotliDecompress()
++          : null
++  if (!decoder) return response
++  return pipeline(response, decoder, () => {}) as unknown as Readable
++}
++
++function toResponse(response: IncomingMessage): Response {
++  const status = response.statusCode ?? 0
++  if (status < 200 || status > 599) {
++    response.destroy()
++    throw new Error(`Unexpected HTTP status ${status}`)
++  }
++  const headers = new Headers()
++  const decoding = /^(x-gzip|gzip|deflate|br)$/i.test(
++    String(response.headers['content-encoding'] ?? '').trim(),
++  )
++  for (const [name, value] of Object.entries(response.headers)) {
++    if (value === undefined) continue
++    // The body handed on is decoded, so its encoding and length no longer apply.
++    if (decoding && (name === 'content-encoding' || name === 'content-length'))
++      continue
++    if (Array.isArray(value)) {
++      for (const item of value) headers.append(name, item)
++    } else {
++      headers.set(name, value)
++    }
++  }
++  if (NULL_BODY_STATUSES.has(status)) {
++    response.resume()
++    return new Response(null, {
++      status,
++      statusText: response.statusMessage,
++      headers,
++    })
++  }
++  const body = Readable.toWeb(decodedBody(response)) as unknown as BodyInit
++  return new Response(body, {
++    status,
++    statusText: response.statusMessage,
++    headers,
++  })
++}
++
++/**
++ * A GET whose connection is pinned to addresses validated against `isBlocked`
++ * (by default every private, reserved, link-local, loopback, CGNAT and
++ * unique-local range, IPv4 and IPv6, IPv4-mapped included).
++ *
++ * Same contract as `fetch(url, { redirect: 'manual' })`: a redirect comes back
++ * as the 3xx response, and the caller validates the next hop before calling
++ * again. Uses `node:http`/`node:https` rather than `fetch` because a
++ * `lookup` hook is the one place every runtime we ship on lets the caller
++ * choose the address a socket connects to; TLS still verifies the hostname.
++ */
++export function pinnedFetch(
++  url: string | URL,
++  init: {
++    headers?: Record<string, string>
++    signal?: AbortSignal
++    lookupHost?: HostLookup
++    isBlocked?: AddressPolicy
++  } = {},
++): Promise<Response> {
++  const target = typeof url === 'string' ? new URL(url) : url
++  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
++    return Promise.reject(
++      new Error('Only http:// and https:// URLs are supported'),
++    )
++  }
++  const signal = init.signal
++  if (signal?.aborted) return Promise.reject(abortError())
++
++  const transport = target.protocol === 'https:' ? https : http
++  return new Promise<Response>((resolve, reject) => {
++    const request = transport.request({
++      protocol: target.protocol,
++      hostname: unwrapHost(target.hostname),
++      port: target.port || undefined,
++      path: `${target.pathname}${target.search}`,
++      method: 'GET',
++      headers: {
++        ...init.headers,
++        'accept-encoding': 'gzip, deflate, br',
++      },
++      // No shared agent: a pooled socket could outlive the address it was
++      // validated for.
++      agent: false,
++      lookup: validatingLookup({
++        lookupHost: init.lookupHost,
++        isBlocked: init.isBlocked,
++      }),
++    })
++
++    let response: IncomingMessage | undefined
++    const onAbort = () => {
++      const error = abortError()
++      request.destroy(error)
++      response?.destroy(error)
++      reject(error)
++    }
++    signal?.addEventListener('abort', onAbort, { once: true })
++    const done = () => signal?.removeEventListener('abort', onAbort)
++
++    request.on('error', (error) => {
++      done()
++      reject(error)
++    })
++    request.on('response', (incoming) => {
++      response = incoming
++      incoming.on('close', done)
++      try {
++        resolve(toResponse(incoming))
++      } catch (error) {
++        done()
++        reject(error)
++      }
++    })
++    request.end()
++  })
++}
+diff --git a/sdk/src/tools/read-url.ts b/sdk/src/tools/read-url.ts
+index 7ed02bc59..cd09cd99b 100644
+--- a/sdk/src/tools/read-url.ts
++++ b/sdk/src/tools/read-url.ts
+@@ -1,26 +1,30 @@
+-import { assertUrlAllowed, type HostLookup } from './ssrf'
++import { isHttpProxyConfiguredFromEnv } from '../env'
++import { pinnedFetch } from './pinned-fetch'
++import { assertUrlAllowed } from './ssrf'
++
++import type { AddressPolicy, HostLookup } from './ssrf'
+ 
+ import type { CodebuffToolOutput } from '../../../common/src/tools/list'
+ 
+ const DEFAULT_MAX_CHARS = 20_000
+ const MAX_RESPONSE_BYTES = 2_000_000
+ const FETCH_TIMEOUT_MS = 20_000
+ const MAX_REDIRECTS = 5
+ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
+ const USER_AGENT =
+   'Mozilla/5.0 (compatible; CodebuffResearchBot/1.0; +https://codebuff.com)'
+ 
+ type ReadUrlOutput = CodebuffToolOutput<'read_url'>
+ type FetchLike = (
+   input: string | URL | Request,
+   init?: RequestInit,
+ ) => Promise<Response>
+ 
+ function errorResult(
+   url: string | undefined,
+   errorMessage: string,
+ ): ReadUrlOutput {
+   return [{ type: 'json', value: { ...(url ? { url } : {}), errorMessage } }]
+ }
+ 
+ function getHeader(headers: Headers, name: string): string | undefined {
+@@ -300,124 +304,164 @@ function extractTextByContentType(
+     lowerContentType.includes('application/rss+xml') ||
+     lowerContentType.includes('application/atom+xml')
+   ) {
+     return { text: normalizeText(body) }
+   }
+ 
+   return { text: normalizeText(body) }
+ }
+ 
+ function truncateText(
+   text: string,
+   maxChars: number,
+ ): {
+   text: string
+   truncated: boolean
+ } {
+   if (text.length <= maxChars) {
+     return { text, truncated: false }
+   }
+   return {
+     text: `${text.slice(0, maxChars).trimEnd()}\n\n[Content truncated]`,
+     truncated: true,
+   }
+ }
+ 
++/**
++ * The transport used when the caller supplies no `fetch`.
++ *
++ * Normally {@link pinnedFetch}: the connection goes only to addresses that
++ * were validated in the same resolution. Under Bun with a proxy configured,
++ * Bun's own `fetch` instead, because it honours the proxy variables and
++ * `node:http` there does not; the proxy, not this process, resolves the name.
++ */
++function defaultTransport(opts: {
++  lookupHost?: HostLookup
++  isBlocked?: AddressPolicy
++}): FetchLike {
++  const isBun = typeof process !== 'undefined' && !!process.versions?.bun
++  if (isBun && isHttpProxyConfiguredFromEnv()) {
++    return globalThis.fetch
++  }
++  return async (input, init) =>
++    pinnedFetch(String(input), {
++      headers: init?.headers as Record<string, string> | undefined,
++      signal: init?.signal ?? undefined,
++      ...opts,
++    })
++}
++
+ export async function readUrl({
+   url,
+   max_chars = DEFAULT_MAX_CHARS,
+-  fetch: fetchImpl = globalThis.fetch,
++  fetch: customFetch,
+   lookupHost,
+-  resolveDns = fetchImpl === globalThis.fetch,
++  isBlocked,
++  resolveDns = customFetch === undefined,
+   signal,
+ }: {
+   url: string
+   max_chars?: number
++  /**
++   * A replacement transport (tests). Without one, every connection is pinned
++   * to addresses validated at connect time (`pinned-fetch.ts`).
++   */
+   fetch?: FetchLike
+   /** Override hostname resolution (defaults to node:dns). */
+   lookupHost?: HostLookup
++  /** Override which addresses are refused (defaults to `isBlockedAddress`). */
++  isBlocked?: AddressPolicy
+   /**
+-   * Whether to DNS-resolve hostnames for SSRF checks. Defaults to true only
+-   * when using the real global fetch; a caller-supplied fetch (e.g. a test
+-   * stub) skips resolution but IP-literal hosts are still rejected.
++   * Whether to DNS-resolve hostnames for SSRF checks before each hop.
++   * Defaults to true unless the caller supplies its own fetch (e.g. a test
++   * stub); IP-literal hosts are rejected either way.
+    */
+   resolveDns?: boolean
+   /** External abort (e.g. user interrupt); cancels the fetch mid-flight. */
+   signal?: AbortSignal
+ }): Promise<ReadUrlOutput> {
++  const fetchImpl = customFetch ?? defaultTransport({ lookupHost, isBlocked })
+   if (signal?.aborted) {
+     return errorResult(url, 'Cancelled: the run was aborted by the user.')
+   }
+ 
+   let parsedUrl: URL
+   try {
+     parsedUrl = new URL(url)
+   } catch {
+     return errorResult(url, 'Invalid URL')
+   }
+ 
+   const controller = new AbortController()
+   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
+   const onExternalAbort = () => controller.abort()
+   signal?.addEventListener('abort', onExternalAbort, { once: true })
+ 
+   try {
+     // Follow redirects manually so every hop is re-validated against the SSRF
+     // policy — a public URL must not be able to 30x its way to an internal one.
+     let currentUrl = parsedUrl
+     let response: Response
+     for (let redirects = 0; ; redirects++) {
+       try {
+         // Refuses non-http(s) schemes and private/reserved addresses, literal
+-        // or resolved from the hostname, before each hop.
+-        await assertUrlAllowed(currentUrl, { lookupHost, resolveDns })
++        // or resolved from the hostname, before each hop. The default
++        // transport validates again when it connects, against the addresses
++        // it actually connects to.
++        await assertUrlAllowed(currentUrl, {
++          lookupHost,
++          resolveDns,
++          isBlocked,
++        })
+       } catch (error) {
+         return errorResult(
+           url,
+           error instanceof Error ? error.message : 'Blocked URL',
+         )
+       }
+ 
+       response = await fetchImpl(currentUrl.toString(), {
+         redirect: 'manual',
+         signal: controller.signal,
+         headers: {
+           accept:
+             'text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8',
+           'accept-language': 'en-US,en;q=0.9',
+           'user-agent': USER_AGENT,
+         },
+       })
+ 
+       if (!REDIRECT_STATUSES.has(response.status)) {
+         break
+       }
+ 
+       const location = getHeader(response.headers, 'location')
+       if (!location) {
+         break
+       }
++      // The redirect's own body is never read; release its connection.
++      await response.body?.cancel().catch(() => {})
+       if (redirects >= MAX_REDIRECTS) {
+         return errorResult(url, `Too many redirects (>${MAX_REDIRECTS})`)
+       }
+       try {
+         currentUrl = new URL(location, currentUrl)
+       } catch {
+         return errorResult(url, `Invalid redirect location: ${location}`)
+       }
+     }
+ 
+     if (!response.ok) {
+       return errorResult(
+         url,
+         `Failed to fetch URL: ${response.status} ${response.statusText}`,
+       )
+     }
+ 
+     const contentType = getHeader(response.headers, 'content-type') ?? ''
+     if (contentType && !isSupportedContentType(contentType)) {
+       return errorResult(
+         url,
+         `Unsupported content type: ${contentType || 'unknown'}`,
+       )
+     }
+ 
+diff --git a/sdk/src/tools/ssrf.ts b/sdk/src/tools/ssrf.ts
+index 2e65dbfb8..681e0ac14 100644
+--- a/sdk/src/tools/ssrf.ts
++++ b/sdk/src/tools/ssrf.ts
+@@ -1,120 +1,170 @@
+ import dns from 'node:dns'
+ import net from 'node:net'
+ import { promisify } from 'node:util'
+ 
+ import ipaddr from 'ipaddr.js'
+ 
+ /**
+  * Resolves a hostname to one or more IP addresses. Injectable so callers (and
+  * tests) can supply a deterministic resolver instead of hitting real DNS.
+  */
+ export type HostLookup = (hostname: string) => Promise<string[]>
+ 
++/** Whether an address may not be fetched. */
++export type AddressPolicy = (ip: string) => boolean
++
+ /** Error thrown when a URL is rejected for SSRF reasons. */
+ export class SsrfError extends Error {
+   constructor(message: string) {
+     super(message)
+     this.name = 'SsrfError'
+   }
+ }
+ 
+ const lookupAsync = promisify(dns.lookup)
+ 
+-const defaultLookup: HostLookup = async (hostname) => {
++export const defaultLookup: HostLookup = async (hostname) => {
+   const results = await lookupAsync(hostname, { all: true, verbatim: true })
+   return results.map((result) => result.address)
+ }
+ 
++/**
++ * Ranges that are not globally routable but that ipaddr.js classifies as
++ * `unicast`: IPv4-compatible IPv6 (`::a.b.c.d`, deprecated), benchmarking
++ * (198.18.0.0/15), site-local IPv6 (deprecated) and local-use NAT64.
++ */
++const EXTRA_BLOCKED_RANGES: ReadonlyArray<[ipaddr.IPv4 | ipaddr.IPv6, number]> =
++  [
++    ipaddr.parseCIDR('::/96'),
++    ipaddr.parseCIDR('198.18.0.0/15'),
++    ipaddr.parseCIDR('fec0::/10'),
++    ipaddr.parseCIDR('64:ff9b:1::/48'),
++  ]
++
+ /**
+  * Returns true if an IP address is anything other than a globally-routable
+  * public unicast address (i.e. loopback, private, link-local, unique-local,
+  * carrier-grade NAT, multicast, reserved, unspecified, etc.). Unparseable
+  * input is treated as blocked.
+  */
+ export function isBlockedAddress(ip: string): boolean {
+   let addr: ipaddr.IPv4 | ipaddr.IPv6
+   try {
+     addr = ipaddr.parse(ip)
+   } catch {
+     return true
+   }
+ 
+   // Normalize IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1) so they are
+   // classified by their embedded IPv4 range rather than as generic IPv6.
+   if (addr.kind() === 'ipv6') {
+     const v6 = addr as ipaddr.IPv6
+     if (v6.isIPv4MappedAddress()) {
+       addr = v6.toIPv4Address()
+     }
+   }
+ 
+-  return addr.range() !== 'unicast'
++  if (addr.range() !== 'unicast') return true
++  const parsed = addr
++  return EXTRA_BLOCKED_RANGES.some(([range, bits]) =>
++    range.kind() === 'ipv4'
++      ? parsed.kind() === 'ipv4' &&
++        (parsed as ipaddr.IPv4).match(range as ipaddr.IPv4, bits)
++      : parsed.kind() === 'ipv6' &&
++        (parsed as ipaddr.IPv6).match(range as ipaddr.IPv6, bits),
++  )
+ }
+ 
+ /**
+  * Strips IPv6 brackets that `URL.hostname` keeps (e.g. "[::1]" -> "::1").
+  */
+-function unwrapHost(hostname: string): string {
++export function unwrapHost(hostname: string): string {
+   if (hostname.startsWith('[') && hostname.endsWith(']')) {
+     return hostname.slice(1, -1)
+   }
+   return hostname
+ }
+ 
++/**
++ * Resolves `host` and returns its addresses only if EVERY one is allowed;
++ * otherwise throws an {@link SsrfError}. One blocked answer refuses the host,
++ * because a connection may use any of them.
++ */
++export async function resolveAllowedAddresses(
++  host: string,
++  opts: { lookupHost?: HostLookup; isBlocked?: AddressPolicy } = {},
++): Promise<string[]> {
++  const lookupHost = opts.lookupHost ?? defaultLookup
++  const isBlocked = opts.isBlocked ?? isBlockedAddress
++  let addresses: string[]
++  try {
++    addresses = await lookupHost(host)
++  } catch (error) {
++    throw new SsrfError(
++      `Could not resolve host "${host}": ${
++        error instanceof Error ? error.message : 'unknown error'
++      }`,
++    )
++  }
++
++  if (addresses.length === 0) {
++    throw new SsrfError(`Could not resolve host "${host}"`)
++  }
++
++  for (const ip of addresses) {
++    if (isBlocked(ip)) {
++      throw new SsrfError(
++        `Host "${host}" resolves to a private or reserved address (${ip})`,
++      )
++    }
++  }
++  return addresses
++}
++
+ /**
+  * Throws an {@link SsrfError} if the URL is not safe to fetch from the server:
+  * non-http(s) schemes, IP literals in a private/reserved range, or hostnames
+  * that resolve to such a range.
+  *
+  * IP literals are always checked synchronously (no DNS needed). Hostname
+  * resolution is performed via `lookupHost` unless `resolveDns` is false — this
+  * lets callers that supply their own `fetch` (e.g. unit tests with stubbed
+  * responses) skip the network lookup while still rejecting literal addresses.
++ *
++ * This check alone does not pin the address a later connection uses; the
++ * default `read_url` transport (`pinned-fetch.ts`) validates again at connect
++ * time and connects only to the addresses it validated.
+  */
+ export async function assertUrlAllowed(
+   url: URL,
+-  opts: { lookupHost?: HostLookup; resolveDns?: boolean } = {},
++  opts: {
++    lookupHost?: HostLookup
++    resolveDns?: boolean
++    isBlocked?: AddressPolicy
++  } = {},
+ ): Promise<void> {
+   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+     throw new SsrfError('Only http:// and https:// URLs are supported')
+   }
+ 
+   const host = unwrapHost(url.hostname)
++  const isBlocked = opts.isBlocked ?? isBlockedAddress
+ 
+   if (net.isIP(host) !== 0) {
+-    if (isBlockedAddress(host)) {
++    if (isBlocked(host)) {
+       throw new SsrfError(
+         `Refusing to fetch private or reserved address: ${host}`,
+       )
+     }
+     return
+   }
+ 
+   if (opts.resolveDns === false) {
+     return
+   }
+ 
+-  const lookupHost = opts.lookupHost ?? defaultLookup
+-  let addresses: string[]
+-  try {
+-    addresses = await lookupHost(host)
+-  } catch (error) {
+-    throw new SsrfError(
+-      `Could not resolve host "${host}": ${
+-        error instanceof Error ? error.message : 'unknown error'
+-      }`,
+-    )
+-  }
+-
+-  if (addresses.length === 0) {
+-    throw new SsrfError(`Could not resolve host "${host}"`)
+-  }
+-
+-  for (const ip of addresses) {
+-    if (isBlockedAddress(ip)) {
+-      throw new SsrfError(
+-        `Host "${host}" resolves to a private or reserved address (${ip})`,
+-      )
+-    }
+-  }
++  await resolveAllowedAddresses(host, {
++    lookupHost: opts.lookupHost,
++    isBlocked,
++  })
+ }
