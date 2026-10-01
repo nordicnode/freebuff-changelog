@@ -1137,7 +1137,15 @@ async function catchUpOnce (argv) {
   }
 
   let didSummarize = false
-  const cycleEnv = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(limit), LLM_DEADLINE_AT: String(Math.min(deadlineAt(), Date.now() + 120000)), LLM_CYCLE_BUDGET: { remaining: 40 } }
+  // The LLM batch shares one wall-clock deadline and one request budget across
+  // the summary, verifier, heal and re-check passes: a flat 120s window with a
+  // 40-call ceiling starves queued rows under a slow gateway (each attempt may
+  // take up to LLM_TIMEOUT_MS), and every starved row is stubbed as
+  // "LLM cycle deadline exceeded" and re-queued next cycle. Scale both with
+  // the entry limit so a row already queued is a row that gets asked.
+  const cycleBudgetMs = Math.min(deadlineAt(), Date.now() + Math.max(120000, limit * 60000))
+  const cycleCalls = Math.max(40, limit * 8)
+  const cycleEnv = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(limit), LLM_DEADLINE_AT: String(cycleBudgetMs), LLM_CYCLE_BUDGET: { remaining: cycleCalls } }
   if (llmConfigured()) {
     await backfillDiffs(queueable, limit)
     const envWithLimit = cycleEnv

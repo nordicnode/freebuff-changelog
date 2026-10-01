@@ -159,7 +159,7 @@ export function cleanText (s, maxLen = 2000, isSentence = false) {
   if (!s) return ''
   if (s.length <= maxLen) {
     if (isSentence && hasDanglingTail(s)) {
-      const text = trimDangling(s)
+      let text = trimDangling(s)
       if (!/[.!?]$/.test(text)) text += '.'
       return text
     }
@@ -2400,6 +2400,13 @@ export function isTransientError (err) {
   // full-context calls and failed identically forever.
   if (isDeterministicFailure(err)) return false
   if (isGatewayError(err)) return true
+  // Our own cycle guards interrupt the call, they do not judge it: a row cut
+  // off by the cycle deadline or the shared request budget is interrupted,
+  // not doomed, and must ride the short transient cooldown. This matches the
+  // write path (`callUnanswered`) and the retry gate (`errorRetryDelayMs`),
+  // which already treat these as transient -- the health ledger was the one
+  // place that counted them as permanent `otherErrors`.
+  if (/deadline|budget exceeded/i.test(msg)) return true
   // 429 (rate limit) and 408 (request timeout) are retry-soon conditions. Once
   // callLlm's in-call retries are exhausted they must land on the short
   // transient cooldown, not the 1-hour permanent one: under a throttled key the
