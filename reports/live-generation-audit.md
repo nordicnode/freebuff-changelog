@@ -83,6 +83,35 @@ All validated by `npm test`: 395 tests, 394 pass, 1 skip, 0 fail; every generato
 3. **Backup provider route** (`LLM_BACKUP_API_BASE` / `LLM_BACKUP_API_KEY` / `LLM_BACKUP_MODEL`, secrets set): `callLlm` fails over **once**, only for route failures (5xx, connection, response timeout, 408, exhausted 429) after the primary's retries and rungs are spent; auth/content/validator failures stay on the primary. Failover shares the entry cap, cycle budget and the single 60 RPM window, and each request record carries `route: primary|backup` with `record.model` naming the model that actually wrote the text. Endpoint verified live: HTTP 200 in 1.2 s on `deepseek-v4.1-flash`.
 4. **Completion is measurable** (`generationState()` in `quality.mjs`): an entry is `missing` / `review-pending` / `needs-repair` / `legacy-unreviewed` / `complete` only when both artifacts exist with exact-text passing verdicts, complete evidence and no unresolved objections. `regen-last` now prints per-row states and exits non-zero if any named row is not fully generated, so a partial batch can no longer report success.
 
+## Provider probe results (2026-10-01 16:4x UTC) and model switch
+
+Read-only live probes against the primary with the relay key (tiny 16-token asks, full-load real 22K-char diff at `max_tokens 8000`, and strict-JSON mode):
+
+| Probe | `deepseek-v4.1` | `gpt-6-luna` |
+|---|---|---|
+| Tiny ask | 2/2 OK (2.1–2.5 s) | 3/3 OK (1.4–3.4 s) |
+| Full-load diff | **1/2 → HTTP 504 at 12.2 s (Cloudflare page, exact production signature)** | 2/2 OK (5.2 s, 5.9 s) |
+| `response_format: json_object` | — | OK (one transient shared-key 429 while the relay was mid-cycle) |
+
+The stored ledger agrees: `deepseek-v4.1` 653 recorded calls = 205×200, 391×504, 57 transport errors; `gpt-6-luna` had zero recorded production requests. Conclusion: the 504s continue on real-size `deepseek-v4.1` requests and are at least partly backend-specific, not a whole-route outage (luna answered the identical prompt where deepseek failed).
+
+Operator decision: `LLM_MODEL` and `LLM_VERIFY_MODEL` secrets set to `gpt-6-luna` (local `.env` mirrored). Blast radius is small and bounded: only **135 rows are admitted** under policy 1 (Sep 29 → Oct 1), of which **82 have no summary at all** (filled as normal work) and ~53 get one identity-driven rewrite; the other ~7,800 non-noise rows are protected by no-backfill. The verifier switch invalidates no caches (`verifyModel` is not part of row identity) and makes the reviewer a different model family from the writer. The backup failover route stays armed for whole-route failure.
+
+## Main provider swap to crax.lol (2026-10-01 19:3x UTC)
+
+Operator directive: set the main provider to `https://gpt.crax.lol`, model `glm-5.3-flash`, after testing it read-only first. Probe results (16 bounded calls, relay key never printed):
+
+| Probe | Result |
+|---|---|
+| Base path | `/chat/completions` alone → **403**; the API lives under **`/v1`**, so `LLM_API_BASE=https://gpt.crax.lol/v1` |
+| Full-load 95K-char changelog ask ×3 (the shape that 504'd on the old provider) | **3/3 HTTP 200** at 19.6 s / 48.9 s / 28.9 s, strict JSON parsed by our production `extractResponseText`/`parseLlmJson`, summaries grounded in the diff |
+| Tiny asks ×6 | 0 failures after warm-up (4–15 s); one earlier transient `[Error: upstream timeout]` delivered as HTTP 200 content → caught by the existing no-JSON repair path |
+| `response_format: json_object` | honored; gateway answers SSE (`text/event-stream`) even without `stream: true`, which our parser already reassembles |
+| Model routing | unknown model → clean HTTP 400 `Unknown or unsupported model`; `glm-5.3-flash` is listed in `/v1/models` and routes (its echoed `model` field is their alias `x-preview-l`) |
+| 60 RPM | not load-tested (would spend relay budget); 4–49 s latencies never approach it |
+
+Secrets set (all three paid workflow steps plumb them): `LLM_API_BASE=https://gpt.crax.lol/v1`, `LLM_API_KEY` (crax key), `LLM_MODEL=glm-5.3-flash`, `LLM_VERIFY_MODEL=glm-5.3-flash` (operator chose the same model for the reviewer; the old `gpt-6-luna` is not served by this gateway, so leaving it would 400 every verification). Local `.env` mirrored. The `LLM_MODEL` change re-queues the admitted backlog under the new identity (expected and bounded by no-backfill); the verifier swap invalidates no caches. Backup route (logfare) stays armed. No code change was required — the swap is env-driven — so no commit accompanies it.
+
 ## Boundaries and next decision
 
 - No new regeneration batch has been dispatched in this phase; no commit, push or deploy has been made for the fixes above.
