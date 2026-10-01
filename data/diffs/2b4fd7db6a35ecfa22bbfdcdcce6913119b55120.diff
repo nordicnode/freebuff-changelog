@@ -1,0 +1,337 @@
+diff --git a/sdk/src/byok.test.ts b/sdk/src/byok.test.ts
+index f716be7ca..68043b07b 100644
+--- a/sdk/src/byok.test.ts
++++ b/sdk/src/byok.test.ts
+@@ -69,50 +69,146 @@ async function temporaryDirectory() {
+ describe('BYOK endpoint boundary', () => {
+   test('retains API base paths and normalizes trailing slash', () => {
+     expect(byokCompletionUrl({ provider: 'openrouter' })).toBe(
+       'https://openrouter.ai/api/v1/chat/completions',
+     )
+     expect(byokCompletionUrl(input)).toBe(
+       'http://127.0.0.1:9999/v1/chat/completions',
+     )
+     expect(
+       normalizeByokBaseUrl('openai-compatible', 'https://example.com/v1/'),
+     ).toBe('https://example.com/v1')
+   })
+   test.each([
+     'http://example.com/v1',
+     'file:///tmp/a',
+     'ftp://example.com',
+     'https://user:pass@example.com',
+     'https://example.com?api_key=secret',
+     'https://example.com/#key',
+     'not a URL',
+   ])('refuses unsafe endpoint %s', (url) => {
+     expect(() => normalizeByokBaseUrl('openai-compatible', url)).toThrow()
+   })
+ })
+ describe('BYOK connection lifecycle', () => {
++  test('adding models reuses the endpoint and key with independent limits and lifetimes', async () => {
++    const { store, rows } = fixture()
++    const original = await store.create({
++      ...input,
++      contextWindow: 64000,
++      maxOutputTokens: 8192,
++    })
++    const added = await store.addModel({
++      ...original,
++      model: {
++        name: 'Second model',
++        model: 'second-model',
++        contextWindow: 128000,
++        maxOutputTokens: 16000,
++      },
++    })
++    expect(added).toMatchObject({
++      provider: original.provider,
++      baseUrl: original.baseUrl,
++      model: 'second-model',
++      contextWindow: 128000,
++      maxOutputTokens: 16000,
++      revision: 1,
++    })
++    expect(added.id).not.toBe(original.id)
++    expect(added.credentialRef).not.toBe(original.credentialRef)
++    expect(await store.resolve(original)).toMatchObject({
++      revision: 1,
++      contextWindow: 64000,
++    })
++    expect((await store.resolve(added)).apiKey).toBe(input.apiKey)
++    expect(JSON.stringify(rows())).not.toContain(input.apiKey)
++    const changed = await store.update({
++      ...original,
++      patch: { apiKey: 'replacement' },
++    })
++    expect((await store.resolve(added)).apiKey).toBe(input.apiKey)
++    await expect(
++      store.addModel({ ...original, model: { name: 'Stale', model: 'stale' } }),
++    ).rejects.toThrow('changed')
++    await store.remove(changed)
++    expect((await store.resolve(added)).apiKey).toBe(input.apiKey)
++    await expect(
++      store.addModel({
++        ...changed,
++        model: { name: 'Missing', model: 'missing' },
++      }),
++    ).rejects.toThrow('removed')
++    await store.remove(added)
++    expect(await store.list()).toEqual([])
++  })
++  test('adding an environment-backed model preserves the reference and starts with its own default limits', async () => {
++    const { store, secret } = fixture()
++    const original = await store.create({
++      ...input,
++      apiKey: undefined,
++      credentialRef: 'env:PROVIDER_KEY',
++      contextWindow: 64000,
++    })
++    const added = await store.addModel({
++      ...original,
++      model: { name: 'Second', model: 'second' },
++    })
++    expect(added.credentialRef).toBe('env:PROVIDER_KEY')
++    expect(added.contextWindow).toBe(BYOK_DEFAULT_CONTEXT_WINDOW)
++    expect(secret.values.size).toBe(0)
++    secret.values.set('env:PROVIDER_KEY', 'environment-canary')
++    await store.remove(original)
++    expect((await store.resolve(added)).apiKey).toBe('environment-canary')
++  })
++  test('a failed model save cleans up its copied key and keeps the source usable', async () => {
++    let rows: ByokConnection[] = []
++    let failSave = false
++    const secret = secrets()
++    const store = createByokConnectionStore({
++      secretStore: secret.store,
++      metadataStore: {
++        get: async () => rows,
++        set: async (value) => {
++          if (failSave) throw new Error('disk full')
++          rows = value
++        },
++      },
++    })
++    const original = await store.create(input)
++    failSave = true
++    await expect(
++      store.addModel({
++        ...original,
++        model: { name: 'Second', model: 'second' },
++      }),
++    ).rejects.toThrow('disk full')
++    expect(await store.list()).toEqual([original])
++    expect([...secret.values.keys()]).toEqual([original.credentialRef])
++    expect((await store.resolve(original)).apiKey).toBe(input.apiKey)
++  })
+   test('keeps keys out of metadata and serialized resolved connections', async () => {
+     const { store, rows } = fixture()
+     const added = await store.create(input)
+     expect(JSON.stringify(rows())).not.toContain(input.apiKey)
+     const resolved = await store.resolve(added)
+     expect(resolved.apiKey).toBe(input.apiKey)
+     expect(JSON.stringify(resolved)).not.toContain(input.apiKey)
+     expect(Object.isFrozen(resolved)).toBe(true)
+   })
+   test('serializes concurrent mutations and invalidates stale revisions', async () => {
+     const { store } = fixture()
+     const created = await Promise.all(
+       Array.from({ length: 12 }, (_, i) =>
+         store.create({ ...input, name: `Connection ${i}` }),
+       ),
+     )
+     expect(await store.list()).toHaveLength(12)
+     const initial = created[0]!
+     const changed = await store.update({
+       ...initial,
+       patch: { apiKey: 'replacement-secret' },
+     })
+     expect(changed.revision).toBe(2)
+     await expect(store.resolve(initial)).rejects.toThrow('changed')
+     expect((await store.resolve(changed)).apiKey).toBe('replacement-secret')
+diff --git a/sdk/src/byok.ts b/sdk/src/byok.ts
+index eeab82f40..3cf16287f 100644
+--- a/sdk/src/byok.ts
++++ b/sdk/src/byok.ts
+@@ -68,50 +68,58 @@ export type ByokConnectionInput = {
+ }
+ export type ByokConnectionPatch = Partial<ByokConnectionInput>
+ export type ByokValidationResult =
+   | {
+       ok: true
+       connection: ByokConnection
+       /** The endpoint check's HTTP status. */
+       statusCode?: number
+       /**
+        * OpenAI-compatible only, when `/models` returned a list: whether the
+        * connection's model id is in it. A proxy may route ids it does not
+        * list, so false is a warning, not a failed check.
+        */
+       modelListed?: boolean
+       /** When the model is not listed: the ids the endpoint does list (capped). */
+       availableModels?: string[]
+     }
+   | {
+       ok: false
+       connection: ByokConnection
+       message: string
+       statusCode?: number
+     }
+ export type ByokConnectionStore = {
+   create(input: ByokConnectionInput): Promise<ByokConnection>
++  addModel(input: {
++    id: string
++    revision: number
++    model: Pick<
++      ByokConnectionInput,
++      'name' | 'model' | 'contextWindow' | 'maxOutputTokens'
++    >
++  }): Promise<ByokConnection>
+   list(): Promise<ByokConnection[]>
+   update(input: {
+     id: string
+     revision: number
+     patch: ByokConnectionPatch
+   }): Promise<ByokConnection>
+   remove(input: { id: string; revision: number }): Promise<void>
+   resolve(input: {
+     id: string
+     revision: number
+   }): Promise<ResolvedByokConnection>
+   validate(input: {
+     id: string
+     revision: number
+   }): Promise<ByokValidationResult>
+ }
+ 
+ /**
+  * The connection's credential could not be read. Its message is ours, names
+  * at most an environment-variable NAME, and never carries a key value, so a
+  * caller may show it as is.
+  */
+ export class ByokCredentialError extends Error {
+   override name = 'ByokCredentialError'
+ }
+@@ -682,78 +690,96 @@ export function createByokConnectionStore(params: {
+     if (/[\r\n]/.test(trimmed))
+       throw new ByokCredentialError(
+         variable
+           ? `${variable} contains a line break. Set it to the key alone and restart Freebuff from that terminal.`
+           : 'BYOK credential is unavailable or invalid',
+       )
+     return trimmed
+   }
+   async function writeSecret(reference: string, key: string) {
+     try {
+       await secretStore.set(reference, key.trim())
+     } catch {
+       throw new Error('Could not save the API key in OS credential storage')
+     }
+   }
+   async function eraseSecret(reference: string) {
+     if (envReference.test(reference)) return
+     try {
+       await secretStore.delete(reference)
+     } catch {
+       throw new Error(
+         'Could not remove the OS credential; unlock the store and retry',
+       )
+     }
+   }
++  // Called only under the metadata lock, including when copying a saved provider.
++  async function create(input: ByokConnectionInput) {
++    const fields = cleanInput(input)
++    if (!input.apiKey && !input.credentialRef)
++      throw new Error('An API key or environment reference is required')
++    const connections = await read()
++    const id = crypto.randomUUID(),
++      now = new Date().toISOString()
++    const credentialRef = input.credentialRef ?? `connection:${id}:1`
++    const connection = {
++      ...fields,
++      id,
++      revision: 1,
++      credentialRef,
++      createdAt: now,
++      updatedAt: now,
++    }
++    if (input.apiKey !== undefined)
++      await writeSecret(credentialRef, input.apiKey)
++    try {
++      await metadataStore.set([...connections, connection])
++    } catch (error) {
++      if (input.apiKey !== undefined)
++        await secretStore.delete(credentialRef).catch(() => {})
++      throw error
++    }
++    return { ...connection }
++  }
+   const store: ByokConnectionStore = {
+-    create: (input) =>
++    create: (input) => exclusive(() => create(input)),
++    addModel: ({ id, revision, model }) =>
+       exclusive(async () => {
+-        const fields = cleanInput(input)
+-        if (!input.apiKey && !input.credentialRef)
+-          throw new Error('An API key or environment reference is required')
+-        const connections = await read()
+-        const id = crypto.randomUUID(),
+-          now = new Date().toISOString()
+-        const credentialRef = input.credentialRef ?? `connection:${id}:1`
+-        const connection = {
+-          ...fields,
+-          id,
+-          revision: 1,
+-          credentialRef,
+-          createdAt: now,
+-          updatedAt: now,
+-        }
+-        if (input.apiKey !== undefined)
+-          await writeSecret(credentialRef, input.apiKey)
+-        try {
+-          await metadataStore.set([...connections, connection])
+-        } catch (error) {
+-          if (input.apiKey !== undefined)
+-            await secretStore.delete(credentialRef).catch(() => {})
+-          throw error
+-        }
+-        return { ...connection }
++        const { connection } = await lookup(id, revision)
++        return create({
++          name: model.name,
++          model: model.model,
++          contextWindow: model.contextWindow,
++          maxOutputTokens: model.maxOutputTokens,
++          provider: connection.provider,
++          baseUrl: connection.baseUrl,
++          // Each saved model owns its key, so rotation/removal cannot break siblings.
++          // Environment references remain references, never copied key values.
++          ...(envReference.test(connection.credentialRef)
++            ? { credentialRef: connection.credentialRef }
++            : { apiKey: await getSecret(connection.credentialRef) }),
++        })
+       }),
+     list: read,
+     update: ({ id, revision, patch }) =>
+       exclusive(async () => {
+         const { connection: existing, connections } = await lookup(id, revision)
+         const fields = cleanInput({
+           ...existing,
+           ...patch,
+           credentialRef: patch.credentialRef,
+           apiKey: patch.apiKey,
+         })
+         const changedEndpoint =
+           fields.baseUrl !==
+           normalizeByokBaseUrl(existing.provider, existing.baseUrl)
+         if (
+           (changedEndpoint || fields.provider !== existing.provider) &&
+           patch.apiKey === undefined &&
+           patch.credentialRef === undefined
+         ) {
+           throw new Error(
+             'Changing provider endpoints requires explicitly supplying the credential again',
+           )
+         }
+         const nextRevision = revision + 1
+         // New stored revision gets its own credential, so old reads cannot observe replacement keys.
