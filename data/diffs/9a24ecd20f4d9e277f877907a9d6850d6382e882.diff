@@ -1,0 +1,1168 @@
+diff --git a/common/src/ads/sponsored-command-refusals.test.ts b/common/src/ads/sponsored-command-refusals.test.ts
+index c2e212422..b1c510876 100644
+--- a/common/src/ads/sponsored-command-refusals.test.ts
++++ b/common/src/ads/sponsored-command-refusals.test.ts
+@@ -380,25 +380,91 @@ describe('the refusal tells the model to stop, not to route around it', () => {
+         'Do not try to reach the same result another way',
+       )
+       expect(message).toContain('Stop here and tell the user')
+     }
+     expect(sponsoredRefusedCommand('docker compose up -d', 'linux')).toEqual({
+       kind: 'container',
+       invocation: 'docker compose up',
+     })
+   })
+ 
+   it('ignores ordinary commands a procedure needs', () => {
+     expectAllowed([
+       'npm test',
+       'git status',
+       'ls -la',
+       'node scripts/setup.js',
+       'cat .env.example',
+       'npx tsc --noEmit',
+       'curl -s https://example.com',
+       'echo {} > config.json',
+       'find . -name "*.ts" -exec grep -l supabase {} \\;',
+       'npm test 2>&1 | tail -20',
+     ])
+   })
+ })
++
++describe('a line the walk cannot finish is refused, not allowed', () => {
++  const nest = (inner: string, levels: number, wrap: (s: string) => string) => {
++    let command = inner
++    for (let level = 0; level < levels; level++) command = wrap(command)
++    return command
++  }
++  const evalWrap = (s: string) => `eval ${s}`
++
++  it('refuses wrappers nested deeper than the walk reads', () => {
++    // Within the limit the inner command is still judged for what it is.
++    expect(kindOf(nest('docker compose up', 6, evalWrap))).toBe('container')
++    // Past it the line is refused rather than waved through unread, whatever
++    // is buried there.
++    expect(kindOf(nest('docker compose up', 7, evalWrap))).toBe('unverifiable')
++    expect(kindOf(nest('ls', 12, evalWrap))).toBe('unverifiable')
++    expect(kindOf(nest('wsl ls', 9, (s) => `npx ${s}`))).toBe('unverifiable')
++    expect(kindOf(nest('ls', 8, (s) => `sh -c ${s}`))).toBe('unverifiable')
++  })
++
++  it('does not refuse ordinary nesting', () => {
++    expectAllowed([
++      'bash -c "npm test"',
++      'sudo -u app env FOO=1 timeout 30 npx tsc --noEmit',
++      'npx dotenv -- bun run test',
++      'cmd /c "npm run build"',
++      nest('ls', 6, evalWrap),
++    ])
++    expectAllowed(['powershell -Command "npm test"'], 'win32')
++  })
++
++  it('refuses a PowerShell script file, whose commands are not on the line', () => {
++    for (const command of [
++      'powershell -File setup.ps1',
++      'pwsh -f .\\scripts\\reset.ps1',
++      'powershell.exe -NoProfile -ExecutionPolicy Bypass -File x.ps1',
++    ]) {
++      const refused = sponsoredRefusedCommand(command, 'win32')
++      expect({ command, kind: refused?.kind }).toEqual({
++        command,
++        kind: 'unverifiable',
++      })
++      expect(refused!.invocation).toMatch(/^(powershell|pwsh) -File$/)
++    }
++  })
++
++  it('refuses an -EncodedCommand that does not decode', () => {
++    expect(kindOf('powershell -EncodedCommand !!not-base64!!', 'win32')).toBe(
++      'unverifiable',
++    )
++  })
++
++  it('tells the model to run the commands directly, or stop and report', () => {
++    for (const command of [
++      'powershell -File setup.ps1',
++      nest('ls', 7, evalWrap),
++    ]) {
++      const refused = sponsoredRefusedCommand(command, 'win32')
++      expect(refused?.kind).toBe('unverifiable')
++      const message = sponsoredCommandRefusal(refused!)
++      expect(message).toStartWith('Refusing ')
++      expect(message).toContain('Run the commands it contains directly')
++      expect(message).toContain('tell the user')
++    }
++  })
++})
+diff --git a/common/src/ads/sponsored-command-refusals.ts b/common/src/ads/sponsored-command-refusals.ts
+index bacaa4837..c13e1dc93 100644
+--- a/common/src/ads/sponsored-command-refusals.ts
++++ b/common/src/ads/sponsored-command-refusals.ts
+@@ -1,58 +1,86 @@
+ /**
+  * Shell commands a sponsored run may not use, whatever the procedure says
+  * (COD-665, interim).
+  *
+  * Three classes, each drawn from a run that went past the intended boundary:
+  *
+  * - `wsl`: entering the Windows Subsystem for Linux, which is the user's own
+  *   Linux environment with its own home directory and credentials;
+  * - `database`: dropping, resetting, wiping, rolling back or force-seeding a
+  *   database, which may be one the user's main checkout (or production) uses;
+  * - `container`: building, starting, stopping, removing or pushing containers
+  *   and images, which may be the user's running services.
+  *
++ * The same walk answers two more kinds:
++ *
++ * - `git`: a git subcommand that moves history or configuration, judged only
++ *   when the caller asks for it (`sponsoredRefusedGitSubcommand`, in-place
++ *   runs);
++ * - `unverifiable`: a command line the walk could not finish reading —
++ *   wrappers nested deeper than it follows, or a form it does not read. It
++ *   FAILS CLOSED: what the walk did not read is what it cannot vouch for.
++ *
+  * Like the install refusal, these are sentences the MODEL reads, answered
+  * before the command reaches a shell.
+  */
+ 
+-export type SponsoredCommandRefusalKind = 'wsl' | 'database' | 'container'
++export type SponsoredCommandRefusalKind =
++  | 'wsl'
++  | 'database'
++  | 'container'
++  | 'git'
++  | 'unverifiable'
+ 
+ export type SponsoredRefusedCommand = {
+   kind: SponsoredCommandRefusalKind
+   /** The invocation named in the refusal, e.g. `docker compose up`. */
+   invocation: string
+ }
+ 
+ /**
+  * `quoted` is true when any part of the word was quoted; `literal` when every
+  * quoted part was single-quoted, so `$(…)` and backticks inside it are text.
+  */
+ type Token = { text: string; quoted: boolean; literal: boolean }
+ 
++/** How many wrappers deep the walk reads before it refuses the line. */
+ const MAX_DEPTH = 6
+ 
++/** What the walk judges besides the three COD-665 classes. */
++type Judge = {
++  /** Git subcommands to refuse; null when git is not being judged. */
++  git: ReadonlySet<string> | null
++}
++
++const COMMAND_CLASSES_ONLY: Judge = { git: null }
++
++const TOO_DEEP: SponsoredRefusedCommand = {
++  kind: 'unverifiable',
++  invocation: `a command line with wrappers nested more than ${MAX_DEPTH} deep`,
++}
++
+ // ------------------------------------------------------------------- lexing
+ 
+ /**
+  * Split a command line into simple commands, respecting quotes.
+  *
+  * `;`, `&`, `|`, parentheses, braces, backticks, `$(` and newlines end a
+  * command outside quotes; `&` inside a redirection (`2>&1`, `&>`) does not.
+  */
+ function lexCommandLine(command: string): Token[][] {
+   const segments: Token[][] = []
+   let current: Token[] = []
+   let text = ''
+   let quoted = false
+   let expands = false
+   let inToken = false
+   const endToken = () => {
+     if (inToken) current.push({ text, quoted, literal: quoted && !expands })
+     text = ''
+     quoted = false
+     expands = false
+     inToken = false
+   }
+   const endSegment = () => {
+     endToken()
+     if (current.length > 0) segments.push(current)
+@@ -740,56 +768,59 @@ function decodePowerShellCommand(encoded: string): string | null {
+   }
+ }
+ 
+ /**
+  * The index of the `--` that ends a wrapper's own options, or -1. Only options,
+  * their values and `VAR=x` may come before it: in
+  * `npm exec prisma migrate reset -- --force` the `--` belongs to prisma.
+  */
+ function wrapperDashDash(tokens: Token[], start: number): number {
+   for (let index = start; index < tokens.length; index++) {
+     const text = tokens[index]!.text
+     if (text === '--') return index
+     if (isFlag(text) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(text)) continue
+     const previous = index > start ? tokens[index - 1]!.text : ''
+     if (isFlag(previous) && !previous.includes('=')) continue
+     return -1
+   }
+   return -1
+ }
+ 
+ /** Analyse a command STRING handed to a wrapper: re-lex it if quoted. */
+ function analyzeRest(
+   rest: Token[],
+   platform: string,
+   depth: number,
++  judge: Judge,
+ ): SponsoredRefusedCommand | null {
+   // `sh -c -- "…"`: the `--` ends the shell's options.
+   if (rest[0]?.text === '--' && !rest[0].quoted) rest = rest.slice(1)
+   if (rest.length === 0) return null
+-  if (rest[0]!.quoted) return analyzeCommandLine(rest[0]!.text, platform, depth)
+-  return analyzeSegment(rest, platform, depth)
++  if (rest[0]!.quoted) {
++    return analyzeCommandLine(rest[0]!.text, platform, depth, judge)
++  }
++  return analyzeSegment(rest, platform, depth, judge)
+ }
+ 
+ /**
+  * The index of the command a segment runs, past `VAR=x` assignments and the
+  * wrappers that run the command after them (`sudo`, `env`, `npm exec` …).
+  */
+ function commandStart(tokens: Token[]): number {
+   let index = 0
+   while (index < tokens.length) {
+     const token = tokens[index]!
+     const name = commandName(token.text)
+     if (!token.quoted && /^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text)) {
+       index++
+       continue
+     }
+     const valueOptions = PREFIX_COMMANDS.get(name)
+     const second = tokens[index + 1]?.text.toLowerCase()
+     const twoWord = !!second && !!TWO_WORD_PREFIXES[name]?.has(second)
+     if (!valueOptions && !twoWord) break
+     index += twoWord ? 2 : 1
+     const dashDash = DASH_DASH_WRAPPERS.has(name)
+       ? wrapperDashDash(tokens, index)
+       : -1
+     if (dashDash >= 0) {
+       index = dashDash + 1
+@@ -819,212 +850,231 @@ function commandStart(tokens: Token[]): number {
+  */
+ function readsCommandsFromStdin(tokens: Token[]): boolean {
+   const start = commandStart(tokens)
+   const headToken = tokens[start]
+   if (!headToken) return false
+   const head = commandName(headToken.text)
+   const args = tokens.slice(start + 1)
+   if (POSIX_SHELLS.has(head)) {
+     if (args.some((t) => t.text === '-s' || t.text === '-')) return true
+     if (args.some((t) => /^-[A-Za-z]*c[A-Za-z]*$/.test(t.text))) return false
+     const script = args.find((t) => !isFlag(t.text))
+     return !script || script.text.startsWith('<')
+   }
+   if (head === 'cmd') return !args.some((t) => /^\/[ck]/i.test(t.text))
+   if (POWERSHELLS.has(head)) {
+     return args.length === 0 || args.some((t) => t.text === '-')
+   }
+   if (head === 'iex' || head === 'invoke-expression') return args.length === 0
+   return false
+ }
+ 
+ function analyzeSegment(
+   tokens: Token[],
+   platform: string,
+   depth: number,
++  judge: Judge,
+ ): SponsoredRefusedCommand | null {
+-  if (depth > MAX_DEPTH) return null
++  // Fails closed: a wrapper chain deeper than the walk reads is refused, not
++  // waved through unread.
++  if (depth > MAX_DEPTH) return tokens.length > 0 ? TOO_DEEP : null
+ 
+   // A double-quoted argument still runs `$(…)` and backticks inside it; a
+   // single-quoted one (`echo 'run \`docker compose up\`' >> README.md`) does
+   // not.
+   for (const token of tokens) {
+     if (!token.quoted || token.literal) continue
+     const nested = /\$\(|`/.exec(token.text)
+     if (nested) {
+       const found = analyzeCommandLine(
+         token.text.slice(nested.index + nested[0].length),
+         platform,
+         depth + 1,
++        judge,
+       )
+       if (found) return found
+     }
+   }
+ 
++  if (judge.git) {
++    const found = refusedGitInvocation(tokens, judge.git)
++    if (found) return found
++  }
++
+   const index = commandStart(tokens)
+   const headToken = tokens[index]
+   if (!headToken) return null
+   const head = commandName(headToken.text)
+   const args = tokens.slice(index + 1)
+ 
+   // A quoted command line where a program was expected: `npx -c "…"`,
+   // `npm exec -c "…"`, `& "docker compose up"`. A quoted path with a space in
+   // it (`"C:\Program Files\…\bash.exe"`) re-lexes to nothing and falls through.
+   if (headToken.quoted && /\s/.test(headToken.text.trim())) {
+-    const found = analyzeCommandLine(headToken.text, platform, depth + 1)
++    const found = analyzeCommandLine(headToken.text, platform, depth + 1, judge)
+     if (found) return found
+   }
+ 
+   // ---- wsl
+   if (
+     WSL_COMMANDS.has(head) ||
+     (platform === 'win32' && WSL_DISTRO_LAUNCHER.test(head)) ||
+     isWindowsWslBash(headToken.text, platform)
+   ) {
+     return { kind: 'wsl', invocation: head }
+   }
+ 
+   // ---- wrappers that run a command string
+   if (POSIX_SHELLS.has(head)) {
+     const flagIndex = args.findIndex(
+       (token) =>
+         token.text === '--command' ||
+         (/^-[A-Za-z]*c[A-Za-z]*$/.test(token.text) && !token.quoted),
+     )
+     return flagIndex < 0
+       ? null
+-      : analyzeRest(args.slice(flagIndex + 1), platform, depth + 1)
++      : analyzeRest(args.slice(flagIndex + 1), platform, depth + 1, judge)
+   }
+   if (head === 'cmd') {
+     const flagIndex = args.findIndex((token) => /^\/[ck]/i.test(token.text))
+     if (flagIndex < 0) return null
+     // `cmd /c"wsl ls"` reaches us as the one word `/cwsl ls`.
+     const attached = args[flagIndex]!.text.slice(2)
+     return attached
+       ? analyzeCommandLine(
+           [attached, ...args.slice(flagIndex + 1).map((t) => t.text)].join(' '),
+           platform,
+           depth + 1,
++          judge,
+         )
+-      : analyzeRest(args.slice(flagIndex + 1), platform, depth + 1)
++      : analyzeRest(args.slice(flagIndex + 1), platform, depth + 1, judge)
+   }
+   if (POWERSHELLS.has(head)) {
+     let flagIndex = 0
+     while (flagIndex < args.length) {
+       const text = args[flagIndex]!.text
+       // Windows PowerShell reads its first plain argument as the command.
+       if (!/^[-/]/.test(text) || args[flagIndex]!.quoted) {
+-        return analyzeRest(args.slice(flagIndex), platform, depth + 1)
++        return analyzeRest(args.slice(flagIndex), platform, depth + 1, judge)
+       }
+       const option = text.slice(1).toLowerCase()
+       if (option.length > 0 && 'command'.startsWith(option)) {
+-        return analyzeRest(args.slice(flagIndex + 1), platform, depth + 1)
++        return analyzeRest(
++          args.slice(flagIndex + 1),
++          platform,
++          depth + 1,
++          judge,
++        )
+       }
+       if (
+         option === 'ec' ||
+         (option.length > 0 && 'encodedcommand'.startsWith(option))
+       ) {
+         const decoded = decodePowerShellCommand(args[flagIndex + 1]?.text ?? '')
+         return decoded === null
+-          ? null
+-          : analyzeCommandLine(decoded, platform, depth + 1)
++          ? { kind: 'unverifiable', invocation: `${head} -EncodedCommand` }
++          : analyzeCommandLine(decoded, platform, depth + 1, judge)
++      }
++      // The commands a script file runs are not on the line to read.
++      if (option.length > 0 && 'file'.startsWith(option)) {
++        return { kind: 'unverifiable', invocation: `${head} -File` }
+       }
+-      if (option.length > 0 && 'file'.startsWith(option)) return null
+       flagIndex += POWERSHELL_VALUE_OPTIONS.has(option) ? 2 : 1
+     }
+     return null
+   }
+   if (head === 'iex' || head === 'invoke-expression' || head === 'eval') {
+     return analyzeCommandLine(
+       args.map((token) => token.text).join(' '),
+       platform,
+       depth + 1,
++      judge,
+     )
+   }
+   if (head === 'start' || head === 'start-process' || head === 'saps') {
+     const rest = args.filter(
+       (token) =>
+         !(token.quoted && token.text === '') &&
+         !/^(\/\w+|-(filepath|nonewwindow|wait|passthru|windowstyle|verb))$/i.test(
+           token.text,
+         ),
+     )
+-    return analyzeSegment(rest, platform, depth + 1)
++    return analyzeSegment(rest, platform, depth + 1, judge)
+   }
+   if (COMMAND_LIST_RUNNERS.has(head)) {
+     for (const token of args) {
+       const shorthand = /^(npm|pnpm|yarn|bun):(.+)$/i.exec(token.text)
+       const found = shorthand
+         ? refusedScript(`${shorthand[1]!.toLowerCase()} run`, shorthand[2]!, [])
+         : token.quoted
+-          ? analyzeCommandLine(token.text, platform, depth + 1)
++          ? analyzeCommandLine(token.text, platform, depth + 1, judge)
+           : null
+       if (found) return found
+     }
+     return null
+   }
+   if (TASK_RUNNERS.has(head)) {
+     // `turbo run db:reset`, `nx run api:db-reset`, `make db-reset`,
+     // `run-s db:reset build`: judged by the task NAME, like a package script.
+     for (const name of words(args, TASK_RUNNER_VALUE_OPTIONS)) {
+       if (name === 'run' || name.includes('=')) continue
+       const found = refusedScript(head, name, args)
+       if (found) return found
+     }
+     return null
+   }
+ 
+   // ---- package runners
+   if (PACKAGE_RUNNERS.has(head)) {
+     let start = 0
+     while (start < args.length && isFlag(args[start]!.text)) {
+       start += /^(-p|--package)$/.test(args[start]!.text) ? 2 : 1
+     }
+-    return analyzeSegment(args.slice(start), platform, depth + 1)
++    return analyzeSegment(args.slice(start), platform, depth + 1, judge)
+   }
+   if (SCRIPT_RUNNERS.has(head)) {
+     let start = nextWord(args, 0, SCRIPT_RUNNER_VALUE_OPTIONS)
+     const first = args[start]?.text.toLowerCase()
+     if (head === 'yarn' && first === 'workspace') {
+       // `yarn workspace <name> [run] <script>`
+       start = nextWord(args, start + 2, NO_OPTIONS)
+     }
+     if (
+       args[start]?.text.toLowerCase() === 'run' ||
+       args[start]?.text.toLowerCase() === 'run-script'
+     ) {
+       start = nextWord(args, start + 1, SCRIPT_RUNNER_VALUE_OPTIONS)
+     } else if (head === 'npm') {
+       return null
+     }
+     const target = args[start]
+     if (!target) return null
+     const targetArgs = args.slice(start + 1)
+     const found = refusedScript(`${head} run`, target.text, targetArgs)
+     if (found) return found
+     // `yarn prisma migrate reset`, `bun run drizzle-kit push`.
+-    return analyzeSegment([target, ...targetArgs], platform, depth + 1)
++    return analyzeSegment([target, ...targetArgs], platform, depth + 1, judge)
+   }
+ 
+   // ---- database
+   if (PYTHONS.test(head)) {
+     // `python -m django flush`, `python -m alembic downgrade base`.
+     const moduleFlag = args.findIndex((token) => token.text === '-m')
+     if (moduleFlag >= 0) {
+       const module = args[moduleFlag + 1]?.text.toLowerCase() ?? ''
+       const rule = DATABASE_RULES.get(
+         module === 'django' ? 'django-admin' : module,
+       )
+       const found = rule?.(args.slice(moduleFlag + 2)) ?? null
+       return found === null
+         ? null
+         : { kind: 'database', invocation: `python -m ${module} ${found}` }
+     }
+     const script = args.find((token) => !isFlag(token.text))
+     if (script && commandName(script.text) === 'manage.py') {
+       const found = DATABASE_RULES.get('manage.py')!(
+         args.slice(args.indexOf(script) + 1),
+       )
+       if (found !== null)
+         return { kind: 'database', invocation: `manage.py ${found}` }
+     }
+     return null
+@@ -1083,98 +1133,179 @@ function segmentRunsSqlClient(tokens: Token[]): string | null {
+  * Whether the text a SQL client on this line could receive — its arguments,
+  * a pipe into it, a heredoc — drops, truncates or empties something. Segments
+  * that only search text (`rg "drop table" …`) are left out.
+  */
+ function linePassesDestructiveSql(
+   command: string,
+   segments: Token[][],
+ ): boolean {
+   const sent = segments.filter((segment) => {
+     const head = segment[commandStart(segment)]
+     return !head || !TEXT_SEARCH_COMMANDS.has(commandName(head.text))
+   })
+   const joined = sent.map((segment) => segment.map((t) => t.text).join(' '))
+   if (DESTRUCTIVE_SQL.test(joined.join('\n'))) return true
+   // An unbounded DELETE is judged per quoted argument, and on the raw line
+   // with its newlines flattened so a heredoc's `WHERE` on the next line still
+   // bounds it.
+   return [
+     ...sent.flatMap((segment) =>
+       segment.filter((t) => t.quoted).map((t) => t.text),
+     ),
+     ...(sent.length === segments.length ? [command.replace(/\s+/g, ' ')] : []),
+   ].some((text) => UNBOUNDED_DELETE.test(text))
+ }
+ 
++// ---------------------------------------------------------------------- git
++
++/**
++ * Git's global options that take their value as the NEXT word
++ * (`git --git-dir <dir> commit`); the `--opt=value` spelling is one word.
++ */
++export const GIT_VALUE_OPTIONS: ReadonlySet<string> = new Set([
++  '-c',
++  '-C',
++  '--git-dir',
++  '--work-tree',
++  '--namespace',
++  '--super-prefix',
++  '--attr-source',
++  '--config-env',
++])
++
++/**
++ * The first refused subcommand of any `git` in this segment, wherever it sits
++ * in it (`time git commit`, `GIT_DIR=x git commit`), under any spelling of
++ * the executable (`git.exe`, `C:\Program Files\Git\cmd\git.exe`,
++ * `/usr/bin/git`) and past git's global options and their values.
++ */
++function refusedGitInvocation(
++  tokens: Token[],
++  refused: ReadonlySet<string>,
++): SponsoredRefusedCommand | null {
++  for (let start = 0; start < tokens.length; start++) {
++    if (commandName(tokens[start]!.text) !== 'git') continue
++    let index = start + 1
++    while (index < tokens.length) {
++      const text = tokens[index]!.text
++      if (GIT_VALUE_OPTIONS.has(text)) {
++        index += 2
++      } else if (text.startsWith('-')) {
++        index += 1
++      } else {
++        break
++      }
++    }
++    const subcommand = tokens[index]?.text.toLowerCase()
++    if (subcommand && refused.has(subcommand)) {
++      return { kind: 'git', invocation: `git ${subcommand}` }
++    }
++  }
++  return null
++}
++
++// ------------------------------------------------------------------ the walk
++
+ function analyzeCommandLine(
+   command: string,
+   platform: string,
+   depth: number,
++  judge: Judge,
+ ): SponsoredRefusedCommand | null {
+-  if (depth > MAX_DEPTH) return null
++  if (depth > MAX_DEPTH) return command.trim() ? TOO_DEEP : null
+   if (WSL_SHARE.test(command)) {
+     return { kind: 'wsl', invocation: '\\\\wsl$' }
+   }
+   const segments = lexCommandLine(command)
+   for (const segment of segments) {
+-    const found = analyzeSegment(segment, platform, depth)
++    const found = analyzeSegment(segment, platform, depth, judge)
+     if (found) return found
+   }
+   // `echo "docker compose up" | bash`, `bash <<< "…"`, `"wsl ls" | iex`: the
+   // text piped into an interpreter is a command line too.
+   if (segments.some(readsCommandsFromStdin)) {
+     for (const segment of segments) {
+       const start = commandStart(segment)
+       const texts = [
+         segment
+           .slice(start + 1)
+           .map((t) => t.text)
+           .join(' '),
+         ...segment
+           .filter((t) => t.quoted)
+           .map((t) => t.text.replace(/^<<</, '')),
+       ]
+       for (const text of texts) {
+-        const found = analyzeCommandLine(text, platform, depth + 1)
++        const found = analyzeCommandLine(text, platform, depth + 1, judge)
+         if (found) return found
+       }
+     }
+   }
+   // SQL can reach a client as an argument, on stdin through a pipe or from a
+   // heredoc, so a line that runs a SQL client is judged on the text around it.
+   if (linePassesDestructiveSql(command, segments)) {
+     for (const segment of segments) {
+       const client = segmentRunsSqlClient(segment)
+       if (client) return { kind: 'database', invocation: client }
+     }
+   }
+   return null
+ }
+ 
+ /**
+  * The refused command this command line runs, or null.
+  *
+  * `platform` is `process.platform` of the machine the command will run on;
+  * only the `bash` spelling of WSL depends on it.
+  */
+ export function sponsoredRefusedCommand(
+   command: string,
+   platform: string,
+ ): SponsoredRefusedCommand | null {
+-  return analyzeCommandLine(command, platform, 0)
++  return analyzeCommandLine(command, platform, 0, COMMAND_CLASSES_ONLY)
++}
++
++/**
++ * The first subcommand in `refused` that a `git` anywhere on this command line
++ * runs, read through the same wrappers as {@link sponsoredRefusedCommand}
++ * (`bash -c "git commit"`, `cmd /c git commit`, `$(git commit)` …), or null.
++ *
++ * A line the walk cannot finish is NOT answered here: it comes back from
++ * `sponsoredRefusedCommand` as `unverifiable`, and every caller asks both.
++ * Judged as on Linux, so a bare `bash -c "…"` is unwrapped rather than
++ * answered as WSL (which `sponsoredRefusedCommand` refuses on Windows anyway).
++ */
++export function sponsoredRefusedGitInvocation(
++  command: string,
++  refused: ReadonlySet<string>,
++): string | null {
++  const found = analyzeCommandLine(command, 'linux', 0, { git: refused })
++  return found?.kind === 'git' ? found.invocation.slice('git '.length) : null
+ }
+ 
+ const STOP_AND_REPORT =
+   'Do not try to reach the same result another way — not with a different command, script, shell, wrapper or path. Stop here and tell the user what the procedure needed this for, so they can decide whether to run it themselves.'
+ 
++export function sponsoredGitRefusal(subcommand: string): string {
++  return `Refusing \`git ${subcommand}\`: this sponsored task delivers its changes in the working copy, so it may not change the repository's history or configuration. Leave the edits uncommitted; the user reviews them and decides.`
++}
++
+ export function sponsoredCommandRefusal(
+   refused: SponsoredRefusedCommand,
+ ): string {
+   switch (refused.kind) {
+     case 'wsl':
+       return `Refusing \`${refused.invocation}\`: a sponsored task may not enter the Windows Subsystem for Linux. WSL is the user's own Linux environment, with its own home directory and credentials, outside this project. ${STOP_AND_REPORT}`
+     case 'database':
+       return `Refusing \`${refused.invocation}\`: a sponsored task may not drop, reset, wipe, roll back or force-seed a database. The database this project points at may be one the user's other checkouts, or production, rely on. ${STOP_AND_REPORT}`
+     case 'container':
+       return `Refusing \`${refused.invocation}\`: a sponsored task may not build, start, stop, restart, remove or push containers or images; they may be the user's running services, including production. Read-only commands such as \`docker ps\`, \`docker logs\` and \`docker compose config\` are allowed. ${STOP_AND_REPORT}`
++    case 'git':
++      return sponsoredGitRefusal(refused.invocation.replace(/^git /, ''))
++    case 'unverifiable':
++      return `Refusing ${
++        refused.invocation === TOO_DEEP.invocation
++          ? refused.invocation
++          : `\`${refused.invocation}\``
++      }: a sponsored task may only run commands that can be checked before they run, and this one cannot be. Run the commands it contains directly, one level deep, without the wrapper or script file. If the procedure cannot work that way, stop here and tell the user what it needed, so they can decide whether to run it themselves.`
+   }
+ }
+diff --git a/common/src/ads/sponsored-local-execution.test.ts b/common/src/ads/sponsored-local-execution.test.ts
+index ce7e70aa2..da4292fa2 100644
+--- a/common/src/ads/sponsored-local-execution.test.ts
++++ b/common/src/ads/sponsored-local-execution.test.ts
+@@ -2,50 +2,52 @@ import { describe, expect, it, test } from 'bun:test'
+ 
+ import {
+   SPONSORED_LOCAL_BRANCH_NAMESPACE,
+   SPONSORED_LOCAL_ENV_ALLOWLIST,
+   SPONSORED_LOCAL_FLOOR_GRANT,
+   SPONSORED_LOCAL_UNAVAILABLE_COPY,
+   SPONSORED_LOCAL_UNCONTAINED_GRANT,
+   SPONSORED_LOCAL_V1_GRANT,
+   SPONSORED_WINDOWS_ENV_ALLOWLIST,
+   commandInstallsDependencies,
+   evaluateSponsoredLocalToolCall,
+   looksLikeCredentialEnvVar,
+   scrubSponsoredLocalEnv,
+   scrubSponsoredWindowsEnv,
+   sponsoredComputeGrantNamesFloor,
+   sponsoredLocalAvailability,
+   sponsoredLocalBranchName,
+   sponsoredLocalContainment,
+   sponsoredLocalContainmentIsFloor,
+   sponsoredLocalContainmentMatchesGrant,
+   sponsoredLocalGrant,
+   sponsoredLocalGrantName,
+   sponsoredLocalSlug,
+   sponsoredLocalToolNames,
+   sponsoredLocalUnavailableReason,
++  sponsoredRefusedCommand,
++  sponsoredRefusedGitSubcommand,
+ } from './sponsored-local-execution'
+ 
+ describe('the local grant is its own constant (COD-336 acceptance 2)', () => {
+   it('grants the shell only where something can contain it', () => {
+     const contained = sponsoredLocalGrant(sponsoredLocalContainment('darwin'))
+     expect(contained.has('run_commands')).toBe(true)
+     expect(contained).toBe(SPONSORED_LOCAL_V1_GRANT)
+ 
+     // COD-642: Windows is the FLOOR arm now, not a refusal -- but the floor
+     // alone still earns no shell. Only a server grant naming the floor does
+     // (see "the Windows floor" below), so a Windows run with any other grant
+     // keeps exactly the uncontained grant this test always pinned.
+     const windows = sponsoredLocalGrant(sponsoredLocalContainment('win32'))
+     expect(windows.has('run_commands')).toBe(false)
+     expect(windows).toBe(SPONSORED_LOCAL_UNCONTAINED_GRANT)
+     // Denying the shell must not quietly deny the write tools with it: they
+     // are the whole reason the uncontained grant exists rather than being an
+     // empty set.
+     expect(windows.has('write_workspace')).toBe(true)
+     expect(windows.has('read_workspace')).toBe(true)
+   })
+ 
+   it('refuses the two capabilities local execution does not change the case for', () => {
+     for (const grant of [
+       SPONSORED_LOCAL_V1_GRANT,
+@@ -492,25 +494,105 @@ describe('the sponsored branch namespace', () => {
+ 
+   test('every branch it builds lives inside that namespace', () => {
+     for (const title of ['Sponsored: Acme Deploys', '', '  ---  ', 'ñ']) {
+       const branch = sponsoredLocalBranchName(title, 'run-1')
+       expect(branch.startsWith(`${SPONSORED_LOCAL_BRANCH_NAMESPACE}/`), title).toBe(
+         true,
+       )
+       expect(branch.endsWith('-run-1'), title).toBe(true)
+     }
+   })
+ 
+   test('the slug is ref-legal, capped, and never empty', () => {
+     // Never empty is the one that matters: `freebuff/-run-1` is a legal ref and
+     // an unreadable one, and a title of pure punctuation is a real advertiser
+     // name away.
+     expect(sponsoredLocalSlug('Sponsored: Acme Deploys')).toBe(
+       'sponsored-acme-deploys',
+     )
+     expect(sponsoredLocalSlug('   ---   ')).toBe('task')
+     expect(sponsoredLocalSlug('')).toBe('task')
+     expect(sponsoredLocalSlug('x'.repeat(120)).length).toBe(50)
+     expect(sponsoredLocalSlug('日本語')).toBe('task')
+     expect(sponsoredLocalSlug('A b/c')).toBe('a-b-c')
+   })
+ })
++
++describe('history-moving git is refused on an in-place run', () => {
++  const refusedOf = (command: string) => ({
++    command,
++    refused: sponsoredRefusedGitSubcommand(command),
++  })
++
++  it('refuses the plain spellings, as before', () => {
++    expect(sponsoredRefusedGitSubcommand('git commit -m "wip"')).toBe('commit')
++    expect(sponsoredRefusedGitSubcommand('git -C ../repo push')).toBe('push')
++    expect(sponsoredRefusedGitSubcommand('git -c user.name=x commit')).toBe(
++      'commit',
++    )
++    expect(
++      sponsoredRefusedGitSubcommand('npm test && git add -A && git commit -m x'),
++    ).toBe('commit')
++  })
++
++  it('refuses git.exe and a spelled-out path to git', () => {
++    expect(sponsoredRefusedGitSubcommand('git.exe commit -m x')).toBe('commit')
++    expect(sponsoredRefusedGitSubcommand('GIT.EXE reset --hard')).toBe('reset')
++    expect(
++      sponsoredRefusedGitSubcommand('C:\\Program Files\\Git\\cmd\\git.exe push'),
++    ).toBe('push')
++    expect(
++      sponsoredRefusedGitSubcommand(
++        '"C:\\Program Files\\Git\\cmd\\git.exe" checkout -- .',
++      ),
++    ).toBe('checkout')
++    expect(sponsoredRefusedGitSubcommand('/usr/bin/git stash')).toBe('stash')
++  })
++
++  it('does not read the value of --git-dir or --work-tree as the subcommand', () => {
++    expect(sponsoredRefusedGitSubcommand('git --git-dir .git commit -m x')).toBe(
++      'commit',
++    )
++    expect(
++      sponsoredRefusedGitSubcommand('git --git-dir=.git --work-tree . reset'),
++    ).toBe('reset')
++    expect(
++      sponsoredRefusedGitSubcommand('git --namespace ns update-ref HEAD x'),
++    ).toBe('update-ref')
++  })
++
++  it('reads git through the wrappers the command walk unwraps', () => {
++    for (const command of [
++      'bash -c "git commit -m wip"',
++      "sh -c 'git push'",
++      'cmd /c git checkout main',
++      'powershell -Command "git reset --hard"',
++      'echo "$(git stash)"',
++      'eval git clean -fdx',
++      'npx cross-env CI=1 git.exe commit -m x',
++    ]) {
++      expect(refusedOf(command)).toEqual({
++        command,
++        refused: expect.any(String),
++      })
++    }
++  })
++
++  it('allows the read-only git a procedure uses to understand the repository', () => {
++    for (const command of [
++      'git status',
++      'git diff --stat',
++      'git --git-dir .git log -5',
++      'git.exe rev-parse HEAD',
++      'bash -c "git ls-files"',
++      'grep -rn "git push" docs',
++    ]) {
++      expect(refusedOf(command)).toEqual({ command, refused: null })
++    }
++  })
++
++  it('answers a line too deep to read through sponsoredRefusedCommand', () => {
++    let command = 'git commit -m x'
++    for (let level = 0; level < 8; level++) command = `eval ${command}`
++    expect(sponsoredRefusedCommand(command, 'linux')?.kind).toBe('unverifiable')
++  })
++})
+diff --git a/common/src/ads/sponsored-local-execution.ts b/common/src/ads/sponsored-local-execution.ts
+index 8e402ccfd..0a77e475d 100644
+--- a/common/src/ads/sponsored-local-execution.ts
++++ b/common/src/ads/sponsored-local-execution.ts
+@@ -24,50 +24,54 @@
+  * makes `run_commands` grantable at all:
+  *
+  *   - the floor, every OS: the environment scrubbed to
+  *     {@link SPONSORED_LOCAL_ENV_ALLOWLIST}, `HOME`/`USERPROFILE` and `TMPDIR`
+  *     redirected into the run's own private directory, `GIT_ASKPASS=echo`,
+  *     `GIT_TERMINAL_PROMPT=0`, and cwd plus every write path bound to the
+  *     worktree with symlink resolution;
+  *   - macOS and Linux: an OS sandbox under that (`sandbox-exec`, bubblewrap);
+  *   - Windows (COD-642): the floor, when the server serves Windows at all.
+  *     It is its own arm ({@link SponsoredLocalFloorContainment}) with its own
+  *     grant ({@link SPONSORED_LOCAL_FLOOR_GRANT}) and its own environment
+  *     ({@link scrubSponsoredWindowsEnv}), so no caller confuses it with the
+  *     sandboxed arm.
+  *
+  * {@link sponsoredLocalGrant} is therefore a function of the containment that
+  * is actually available, never a bare constant read off the module.
+  */
+ 
+ import {
+   SPONSORED_CAPABILITIES,
+   evaluateSponsoredToolCallWithGrant,
+   sponsoredToolNamesWithGrant,
+   type SponsoredCapability,
+   type SponsoredToolDecision,
+ } from './sponsored-capabilities'
++import {
++  GIT_VALUE_OPTIONS,
++  sponsoredRefusedGitInvocation,
++} from './sponsored-command-refusals'
+ import {
+   SPONSORED_WINDOWS_CONTAINMENT,
+   SPONSORED_WINDOWS_EXECUTION_SURFACE,
+   type SponsoredExecutionContainment,
+ } from './sponsored-windows'
+ 
+ // --------------------------------------------------------------- containment
+ 
+ /**
+  * Why a local sponsored run cannot happen on this machine.
+  *
+  * Three of these are about CONTAINMENT and one is not. `no-consent-bridge`
+  * says the machine can contain the run perfectly well and there is nobody
+  * here to ask permission — a different fact, with a different fix, which is
+  * why it does not share `unsupported-platform`'s sentence.
+  */
+ export type SponsoredLocalUnavailableReason =
+   | 'windows-no-containment'
+   | 'bubblewrap-missing'
+   | 'unsupported-platform'
+   | 'no-consent-bridge'
+   | 'containment-probe-failed'
+   /** The offer was minted for another operating system than this one (COD-642). */
+   | 'offered-for-another-os'
+ 
+@@ -725,84 +729,95 @@ const SPONSORED_REFUSED_GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
+   'switch',
+   'restore',
+   'clean',
+   'stash',
+   'branch',
+   'tag',
+   'merge',
+   'rebase',
+   'cherry-pick',
+   'revert',
+   'apply',
+   'am',
+   'worktree',
+   'update-ref',
+   'gc',
+   'remote',
+   'config',
+   'init',
+   'clone',
+   'fetch',
+   'pull',
+   'submodule',
+   'filter-branch',
+ ])
+ 
++/**
++ * `git`, `git.exe`, `/usr/bin/git`, `C:\Program Files\Git\cmd\git.exe`.
++ */
++const GIT_EXECUTABLE = /(^|[\\/])git(\.(exe|cmd|bat|com))?$/i
++
+ /**
+  * The first subcommand of each `git` invocation in a command line, lowercased.
+  *
+- * Splits on the shell's own separators and skips `git`'s global options
+- * (`-C <dir>`, `-c k=v`, `--git-dir=…`), because the subcommand is what the
+- * refusal is about and `git -C x commit` is a commit.
++ * Splits on the shell's own separators and skips `git`'s global options and
++ * their values (`-C <dir>`, `-c k=v`, `--git-dir <dir>`, `--git-dir=…`),
++ * because the subcommand is what the refusal is about and `git -C x commit` is
++ * a commit. A flat scan: wrappers are read by the walk in
++ * `sponsored-command-refusals.ts`, and {@link sponsoredRefusedGitSubcommand}
++ * asks both.
+  */
+ export function sponsoredGitSubcommands(command: string): string[] {
+   const found: string[] = []
+   for (const segment of command.split(/[;&|\n]+/)) {
+     const tokens = segment.trim().split(/\s+/).filter(Boolean)
+-    const start = tokens.findIndex((token) => /(^|\/)git$/i.test(token))
++    const start = tokens.findIndex((token) => GIT_EXECUTABLE.test(token))
+     if (start < 0) continue
+     let index = start + 1
+     while (index < tokens.length) {
+       const token = tokens[index]!
+-      // `-C dir` and `-c k=v` take a following value; `--opt=value` does not.
+-      if (token === '-C' || token === '-c') {
++      if (GIT_VALUE_OPTIONS.has(token)) {
+         index += 2
+         continue
+       }
+       if (token.startsWith('-')) {
+         index += 1
+         continue
+       }
+       break
+     }
+     const subcommand = tokens[index]
+     if (subcommand) found.push(subcommand.toLowerCase())
+   }
+   return found
+ }
+ 
+-/** The refused subcommand this command line runs, or null. */
++/**
++ * The refused subcommand this command line runs, or null: the flat scan above,
++ * or a `git` reached through a wrapper (`bash -c "git commit"`,
++ * `cmd /c git commit`, `$(git commit)` …). A line too deeply nested to read
++ * is refused by `sponsoredRefusedCommand` as `unverifiable`, which every
++ * caller of this asks as well.
++ */
+ export function sponsoredRefusedGitSubcommand(command: string): string | null {
+   return (
+     sponsoredGitSubcommands(command).find((subcommand) =>
+       SPONSORED_REFUSED_GIT_SUBCOMMANDS.has(subcommand),
+-    ) ?? null
++    ) ??
++    sponsoredRefusedGitInvocation(command, SPONSORED_REFUSED_GIT_SUBCOMMANDS)
+   )
+ }
+ 
+-export function sponsoredGitRefusal(subcommand: string): string {
+-  return `Refusing \`git ${subcommand}\`: this sponsored task delivers its changes in the working copy, so it may not change the repository's history or configuration. Leave the edits uncommitted; the user reviews them and decides.`
+-}
+-
+ // --------------------------------------------------------- refused commands
+ 
+ // WSL, destructive database commands and container lifecycle commands
+ // (COD-665). Re-exported so every surface that runs a sponsored shell imports
+ // its refusals from one module.
+ export {
+   sponsoredCommandRefusal,
++  sponsoredGitRefusal,
+   sponsoredRefusedCommand,
+ } from './sponsored-command-refusals'
+ export type {
+   SponsoredCommandRefusalKind,
+   SponsoredRefusedCommand,
+ } from './sponsored-command-refusals'
+diff --git a/common/src/ads/sponsored-run-credentials.test.ts b/common/src/ads/sponsored-run-credentials.test.ts
+index 483d9daaa..958875fb8 100644
+--- a/common/src/ads/sponsored-run-credentials.test.ts
++++ b/common/src/ads/sponsored-run-credentials.test.ts
+@@ -1,29 +1,30 @@
+ import { describe, expect, test } from 'bun:test'
+ 
+ import { scrubSponsoredLocalEnv } from './sponsored-local-execution'
+ import {
++  SPONSORED_CREDENTIAL_TOO_DEEP,
+   SPONSORED_OUTPUT_TRUNCATION_TEXT,
+   SPONSORED_RUN_CREDENTIAL_MAX,
+   declaredRunCredentials,
+   isSponsoredCredentialEnvName,
+   normalizeRunCredentials,
+   parseRunCredentialDeclaration,
+   redactSponsoredCredentialDeep,
+   redactSponsoredCredentialText,
+   sponsoredCredentialGetUrl,
+   sponsoredCredentialValueProblem,
+   withSponsoredRunCredentialEnv,
+ } from './sponsored-run-credentials'
+ 
+ const SIEVE =
+   'requires-credential: env=SIEVE_API_KEY label="Sieve API key" get_url=https://sieve.example/keys'
+ 
+ describe('declaredRunCredentials', () => {
+   test('reads one declaration out of a procedure, beside other directives', () => {
+     const procedure = [
+       'Add the Sieve client.',
+       'outcomes: api_key_issued',
+       SIEVE,
+       'Then run one scrape.',
+     ].join('\n')
+     expect(declaredRunCredentials(procedure)).toEqual([
+@@ -390,26 +391,53 @@ describe('redaction', () => {
+     const result = [
+       {
+         type: 'json',
+         value: {
+           command: 'curl -H "Authorization: Bearer $SIEVE_API_KEY" https://api.sieve.example',
+           stdout: `token=${secret.value}`,
+           nested: { [secret.value]: [secret.value, 7, true, null] },
+           exitCode: 0,
+         },
+       },
+     ]
+     const out = redactSponsoredCredentialDeep(result, [secret])
+     const serialized = JSON.stringify(out)
+     expect(serialized).not.toContain(secret.value)
+     expect(serialized).toContain('$SIEVE_API_KEY')
+     expect(out[0]!.value.exitCode).toBe(0)
+     expect(out[0]!.value.nested['[redacted:SIEVE_API_KEY]']).toEqual([
+       '[redacted:SIEVE_API_KEY]',
+       7,
+       true,
+       null,
+     ])
+     // Not mutated.
+     expect(result[0]!.value.stdout).toContain(secret.value)
+   })
++
++  test('deep redaction does not stop silently past its depth limit', () => {
++    for (const levels of [33, 40, 200]) {
++      let nested: unknown = { stdout: `token=${secret.value}` }
++      for (let level = 0; level < levels; level++) {
++        nested = level % 2 === 0 ? [nested] : { inner: nested }
++      }
++      const serialized = JSON.stringify(
++        redactSponsoredCredentialDeep(nested, [secret]),
++      )
++      expect({ levels, leaked: serialized.includes(secret.value) }).toEqual({
++        levels,
++        leaked: false,
++      })
++      expect(serialized).toContain(SPONSORED_CREDENTIAL_TOO_DEEP)
++    }
++  })
++
++  test('a result within the depth limit is redacted in place, not replaced', () => {
++    let nested: unknown = `token=${secret.value}`
++    for (let level = 0; level < 30; level++) nested = [nested]
++    const serialized = JSON.stringify(
++      redactSponsoredCredentialDeep(nested, [secret]),
++    )
++    expect(serialized).toContain('token=[redacted:SIEVE_API_KEY]')
++    expect(serialized).not.toContain(SPONSORED_CREDENTIAL_TOO_DEEP)
++  })
+ })
+diff --git a/common/src/ads/sponsored-run-credentials.ts b/common/src/ads/sponsored-run-credentials.ts
+index 4d60e13c6..4ed94c085 100644
+--- a/common/src/ads/sponsored-run-credentials.ts
++++ b/common/src/ads/sponsored-run-credentials.ts
+@@ -499,50 +499,62 @@ export function redactSponsoredCredentialText(
+   )
+   if (usable.length === 0 || text.length === 0) return text
+   const prepared = prepare(usable)
+   // Odd indexes are the markers themselves (the split pattern captures).
+   const parts = text.split(CUT_MARKER_PATTERN)
+   const last = parts.length - 1
+   return parts
+     .map((part, index) => {
+       if (index % 2 === 1) return part
+       let out = redactWhole(part, prepared)
+       out = redactTrailingFragment(
+         out,
+         prepared,
+         index < last ? FRAGMENT_MIN : EDGE_FRAGMENT_MIN,
+       )
+       out = redactLeadingFragment(
+         out,
+         prepared,
+         index > 0 ? FRAGMENT_MIN : EDGE_FRAGMENT_MIN,
+       )
+       return out
+     })
+     .join('')
+ }
+ 
++/** How deep {@link redactSponsoredCredentialDeep} walks before it gives up. */
++const REDACT_MAX_DEPTH = 32
++
++/**
++ * What stands in for anything nested deeper than the walk reads. The walk
++ * does not stop silently there: an unread subtree could hold the value.
++ */
++export const SPONSORED_CREDENTIAL_TOO_DEEP =
++  '[redacted: nested too deeply to check]'
++
+ /**
+  * Every string inside a tool result (arrays, plain objects, nested) redacted.
+  * Object KEYS are redacted too: a JSON map keyed by an output line is still
+- * output. Anything that is not a string, array or plain object is returned as
+- * it is.
++ * output. An array or object nested deeper than the walk reads is replaced by
++ * {@link SPONSORED_CREDENTIAL_TOO_DEEP} whole. Anything else that is not a
++ * string, array or plain object is returned as it is.
+  */
+ export function redactSponsoredCredentialDeep<T>(
+   value: T,
+   secrets: readonly SponsoredRedactableSecret[],
+ ): T {
+   if (secrets.length === 0) return value
+   const walk = (node: unknown, depth: number): unknown => {
+     if (typeof node === 'string') return redactSponsoredCredentialText(node, secrets)
+-    if (depth > 32 || node === null || typeof node !== 'object') return node
++    if (node === null || typeof node !== 'object') return node
++    if (depth > REDACT_MAX_DEPTH) return SPONSORED_CREDENTIAL_TOO_DEEP
+     if (Array.isArray(node)) return node.map((item) => walk(item, depth + 1))
+     const proto = Object.getPrototypeOf(node)
+     if (proto !== Object.prototype && proto !== null) return node
+     const out: Record<string, unknown> = {}
+     for (const [key, item] of Object.entries(node as Record<string, unknown>)) {
+       out[redactSponsoredCredentialText(key, secrets)] = walk(item, depth + 1)
+     }
+     return out
+   }
+   return walk(value, 0) as T
+ }
