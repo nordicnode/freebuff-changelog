@@ -9,15 +9,15 @@ import {
   contextFingerprint, callLlm, llmCallCount, PROMPT_V, DEFAULT_VERIFY_MODEL,
   LLM_CONTEXT_TOKENS, rememberClosedPrs, matchPrByPaths, prSummaryKey,
   pruneExpiredErrors, gatherEntryContext, collectReleaseContext, formatReleaseContext,
-  buildVerifyPrompt
+  buildVerifyPrompt, buildEli5Prompt, getReleaseContextFor, summaryValidator, releaseBoilerplate, RELEASE_ROLLUP_V, VERIFY_POLICY_V, eli5Key, eli5Source, ELI5_V
 } from '../lib/llm.mjs'
 import { artifactHash, qualityOf, qualityText, qualityNote, qualityStatus, dedupeClaims, QUALITY_POLICY_V } from '../lib/quality.mjs'
 import { mergeChangelog, mergeOpenPrs, mergeHealth, persistMerged } from '../lib/mergedata.mjs'
 import { runEval, latestResult } from '../lib/eval.mjs'
-import { writeJson, withLock, withDeadline, git } from '../lib/util.mjs'
+import { writeJson, withLock, withDeadline, git, shortHash } from '../lib/util.mjs'
 import { checkDeployedHead } from '../lib/sync.mjs'
-import { entryRecord, discordText, generateReleaseNotesMarkdown, buildSite } from '../lib/site.mjs'
-import { extractStructuredFacts } from '../lib/analyze.mjs'
+import { entryRecord, discordText, generateReleaseNotesMarkdown, buildSite, entryCard } from '../lib/site.mjs'
+import { extractStructuredFacts, deterministicSummary } from '../lib/analyze.mjs'
 
 const env = { CHANGELOG_LLM: '1', LLM_API_KEY: 'offline-test', LLM_API_BASE: 'https://example.invalid/v1', LLM_MODEL: 'unchanged-model', CHANGELOG_LLM_RPM: '-1', CHANGELOG_LLM_ESCALATE: '0' }
 const entry = () => ({ sha: 'a'.repeat(40), prevSha: 'b'.repeat(40), kind: 'sync', date: '2026-09-30T00:00:00Z', day: '2026-09-30', summary: 'Internal limit changed.', title: 'Limit changed', significance: 'minor', files: { modified: ['a.ts'] } })
@@ -120,12 +120,20 @@ test('R6/R19: never-checked history is disclosed quietly, a failed check is not'
   assert.match(qualityText(admitted), /no current verification/)
 
   // A recorded negative verdict is loud whatever the policy version.
-  for (const [status, pattern] of [['flagged', /objected/], ['unavailable', /could not run/]]) {
+  for (const [status, pattern] of [['flagged', /objected/]]) {
     const bad = { ai: { title: 'T', summary: 'S.', verify: status }, eli5: { text: 'P.', verify: status } }
     assert.equal(qualityOf(bad).uncertain, true)
     assert.equal(qualityOf(bad).demoteActions, true)
     assert.match(qualityText(bad), pattern)
   }
+  const pending = { ai: { title: 'T', summary: 'S.', verify: 'unavailable', confidence: 'high', breaking: true }, eli5: { text: 'P.', verify: 'unavailable' } }
+  assert.equal(qualityOf(pending).uncertain, false, 'an outage is not a factual objection')
+  assert.equal(qualityOf(pending).demoteActions, true, 'pending review still cannot promote an action')
+  assert.equal(qualityOf(pending).confidence, 'medium')
+  assert.match(qualityNote(pending), /review.*pending/)
+  assert.equal(qualityText(pending), '')
+  pending.ai.ungrounded = ['INVENTED']
+  assert.match(qualityText(pending), /INVENTED/, 'real objections remain visible during an outage')
   assert.equal(qualityStatus({ verify: 'passed', policy: QUALITY_POLICY_V }), 'stale', 'a passed verdict with no bound hash is not current')
   assert.equal(qualityStatus({ verify: 'passed', verifyHash: 'deadbeef', title: 'T' }), 'stale', 'and a hash that no longer matches is stale')
 })
@@ -226,6 +234,138 @@ test('R8: a release roll-up is checked against its window, not the bump diff', a
   assert.equal(seen.length, 1, 'the row was verified once')
   assert.match(seen[0], /release roll-up/)
   assert.match(seen[0], /Ad metadata/, 'the member list is in the verifier material')
+})
+
+test('release quality: mixed releases carry their window and own hunks into both passes', () => {
+  const member = { ...entry(), sha: 'c'.repeat(40), title: 'Older change', summary: 'Earlier terminal behavior changed.' }
+  const bump = { ...entry(), freebuffVersion: '0.2.9', files: { meaningful: 17, added: [], removed: [], renamed: [], modified: ['freebuff/cli/release/package.json', 'a.ts'] }, stats: { additions: 1193, deletions: 105 }, structured: { testNames: ['strips terminal escape sequences from command output before it is drawn'] } }
+  const hit = getReleaseContextFor([member, bump], bump)
+  assert.match(hit.text, /Older change/)
+  const p = buildEli5Prompt(bump, [], { releaseCtx: hit.text, patch })
+  assert.match(p, /export const LIMIT = 2/)
+  const delivered = deliveredEvidence(p)
+  assert.match(delivered, /Older change/)
+  assert.match(delivered, /export const LIMIT = 2/, 'the roll-up checker must receive nonempty evidence')
+  const pure = { ...bump, files: { meaningful: 1, added: [], modified: ['freebuff/cli/release/package.json'] }, stats: { additions: 1, deletions: 1 } }
+  assert.match(deliveredEvidence(buildEli5Prompt(pure, [], { releaseCtx: hit.text })), /Older change/, 'a pure bump must not lose its window before the evidence boundary')
+  assert.match(deterministicSummary(bump), /Changed test assertions cover.*strips terminal escape/)
+  assert.match(deterministicSummary(bump), /not a live rollout confirmation/)
+})
+
+test('release quality: a functional release rejects packaging boilerplate without rejecting concrete changes', () => {
+  const validate = summaryValidator('major', '', null, { release: true })
+  for (const summary of ['Freebuff CLI release 0.2.9 published. New files: `sdk/src/tools/pinned-fetch.ts`.', 'The version field advanced from 0.2.8 to 0.2.9. No other runtime changes are visible.']) {
+    assert.equal(releaseBoilerplate(summary), true)
+    assert.throws(() => validate({ title: 'Freebuff release', summary }), /Release summary/)
+  }
+  assert.doesNotThrow(() => validate({ title: 'Safer terminal output', summary: 'Terminal output now strips escape sequences before rendering.' }))
+})
+
+test('verification: a 504 takes one different framing, preserving all evidence and coverage', async t => {
+  const clean = { title: 'Limit changed', summary: 'The limit changed.', audience: 'maintainers', userVisible: false }
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const p = JSON.parse(init.body).messages.at(-1).content
+    seen.push(p)
+    if (seen.length === 1) return new Response('gateway timeout', { status: 504 })
+    return response({ supported: true, issues: [], claims: [clean.title, clean.summary, clean.audience, 'userVisible: false'].map(quote => ({ quote, supported: true })) })
+  })
+  assert.equal((await verifySummary(entry(), patch, clean, env)).supported, true)
+  assert.equal(seen.length, 2)
+  assert.notEqual(seen[0], seen[1])
+  assert.ok(seen[1].length < seen[0].length)
+  assert.match(seen[1], /export const LIMIT = 2/)
+  assert.match(seen[1], /userVisible/)
+})
+
+test('verification: release context-key changes cannot strand the shipped artifact or resurrect old prose', async t => {
+  const dir = await temp(t)
+  const e = { ...entry(), freebuffVersion: '0.2.9', enrichment: { policy: 1 } }
+  const material = 'Updates included in this release: original source evidence\n' + patch
+  const record = { model: 'writer', v: PROMPT_V, policy: 1, title: 'Internal limit updated', summary: 'The limit changed.', verify: 'unavailable', verifyPolicy: VERIFY_POLICY_V, evidenceBundle: { material, hash: shortHash(material) }, rollup: RELEASE_ROLLUP_V - 1, at: '2020-01-01T00:00:00Z' }
+  e.ai = { ...record }
+  const oldKey = cacheKey(e.sha, patch, 'old release window', RELEASE_ROLLUP_V - 1)
+  const unrelated = { ...record, title: 'Discarded prose' }
+  await writeJson(join(dir, 'ai-summaries.json'), { [cacheKey(e.sha, patch, 'different window', 1)]: unrelated, [oldKey]: record })
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const p = JSON.parse(init.body).messages.at(-1).content
+    seen.push(p)
+    assert.match(p, /You are checking a release roll-up/)
+    assert.match(p, /original source evidence/)
+    assert.doesNotMatch(p, /Discarded prose/)
+    return response({ supported: true, issues: [], claims: [record.title, record.summary].map(quote => ({ quote, supported: true })) })
+  })
+  await enrichWithLlm([e], async () => patch, dir, { ...env, CHANGELOG_LLM_HEAL: '0', CHANGELOG_LLM_LIMIT: '2' })
+  assert.equal(seen.length, 1)
+  assert.equal(e.ai.title, record.title)
+  assert.equal(e.ai.verify, 'passed')
+})
+
+test('verification: corrupted original evidence cannot authorize a changed-key verdict', async t => {
+  const dir = await temp(t)
+  const e = { ...entry(), enrichment: { policy: 1 }, ai: { model: 'writer', v: PROMPT_V, title: 'Internal limit updated', summary: 'The limit changed.', verify: 'unavailable', verifyPolicy: VERIFY_POLICY_V, at: '2020-01-01T00:00:00Z', evidenceBundle: { material: patch, hash: 'corrupt' } } }
+  await writeJson(join(dir, 'ai-summaries.json'), { [cacheKey(e.sha, patch, 'old context', 1)]: e.ai })
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async () => { calls++; throw new Error('unexpected provider call') })
+  await enrichWithLlm([e], async () => patch, dir, { ...env, CHANGELOG_LLM_HEAL: '0' })
+  assert.equal(calls, 0)
+  assert.equal(e.ai.verify, 'unavailable')
+})
+
+test('reader disclosure: a pending check is one quiet note, not duplicated objections', () => {
+  const e = { ...entry(), files: { added: [], modified: ['a.ts'], removed: [], renamed: [], total: 1 }, stats: { additions: 1, deletions: 1 }, ai: { title: 'Internal limit updated', summary: 'The limit changed.', evidence: 'a.ts', verify: 'unavailable' } }
+  const html = entryCard(e)
+  assert.doesNotMatch(html, /verifier check could not run|claims are unverified|class="badge lowc"|objections/)
+  assert.equal((html.match(/Automated review is pending/g) || []).length, 1)
+  assert.equal(entryRecord(e).quality.reviewPending, true)
+  e.ai.verify = 'flagged'; e.ai.verifyClaims = [{ claim: 'Unsupported limit promise' }]
+  assert.match(entryCard(e), /Unsupported limit promise/)
+})
+
+test('release evidence: a verifier outage uses mechanical member facts, never unchecked AI prose', () => {
+  const member = { ...entry(), title: 'Source changed', summary: 'File updated.', files: { total: 1, meaningful: 1, added: [], modified: ['a.ts'], removed: [], renamed: [] }, stats: { additions: 1, deletions: 1 }, ai: { title: 'Unlimited access', summary: 'Everyone gets unlimited access.', verify: 'unavailable' } }
+  const bump = { ...entry(), sha: 'd'.repeat(40), freebuffVersion: '0.2.9' }
+  const ctx = collectReleaseContext([member, bump], bump)
+  const text = formatReleaseContext(ctx, bump)
+  assert.equal(ctx.dropped, 0)
+  assert.match(text, /Source changed/)
+  assert.doesNotMatch(text, /unlimited/i)
+})
+
+test('plain-English repair: replacement ships only after an exact-text passing check', async t => {
+  let checks = 0
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const p = JSON.parse(init.body).messages.at(-1).content
+    if (/You are checking/.test(p)) {
+      if (++checks === 1) return response({ supported: false, issues: ['Unlimited access is unsupported'], claims: [] })
+      return response({ supported: true, issues: [], claims: [{ quote: 'The internal limit changed.', supported: true }] })
+    }
+    return response({ eli5: /A reviewer found/.test(p) ? 'The internal limit changed.' : 'Everyone gets unlimited access.' })
+  })
+  const { record } = await explainEntry({ entry: entry(), patch, env })
+  assert.equal(record.text, 'The internal limit changed.')
+  assert.equal(record.verify, 'passed')
+  assert.equal(record.verifyHash, artifactHash({ text: record.text }))
+})
+
+test('plain-English retry: malformed answers spend verdict tries and a roll-up retains its framing', async t => {
+  const dir = await temp(t)
+  const e = { ...entry(), freebuffVersion: '0.2.9', enrichment: { policy: 1 }, ai: { model: 'writer', v: PROMPT_V, title: 'Internal limit updated', summary: 'The limit changed.' } }
+  const plain = { model: 'writer', v: ELI5_V, policy: 1, text: 'The internal limit changed.', verify: 'unavailable', rollup: RELEASE_ROLLUP_V, src: shortHash(eli5Source(e)), at: '2020-01-01T00:00:00Z', evidenceBundle: { material: patch, hash: shortHash(patch) } }
+  e.eli5 = plain
+  await writeJson(join(dir, 'ai-summaries.json'), { [eli5Key(e.sha, eli5Source(e))]: plain })
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    seen.push(JSON.parse(init.body).messages.at(-1).content)
+    return response({ supported: true })
+  })
+  await enrichEli5([e], dir, env, { getPatch: async () => patch })
+  assert.ok(seen.length > 0)
+  assert.ok(seen.every(p => /checking a release roll-up/.test(p)))
+  assert.equal(e.eli5.verifyTries, 1)
+  assert.equal(e.eli5.verifyErrors, undefined)
+  assert.match(e.eli5.verifyError, /verifier output/)
 })
 
 test('R12/R20: instruction examples and rejected replies cannot authorize names', () => {

@@ -79,8 +79,8 @@ export function qualityOf (e = {}) {
   const valueErrors = ai.valueErrors || []
   // Two levels, deliberately. `warnings` are problems a reader must not skim
   // past: a check ran and did not pass, a name could not be grounded, a value is
-  // backwards. `notes` are the quieter disclosure that stored text predates the
-  // current policy. Treating the second as the first put an "unverified" box on
+  // backwards. `notes` disclose pending automated review or pre-policy text
+  // without portraying a provider outage as an unsupported factual claim. Treating the second as the first put an "unverified" box on
   // every historical row, which spent the warning on the rows that were fine and
   // left the ones that actually failed indistinguishable.
   const warnings = []
@@ -93,7 +93,10 @@ export function qualityOf (e = {}) {
   if (ai.title && !edited) {
     if (verify === 'flagged') warnings.push('The verifier objected to claims in this entry.')
     else if (verify === 'stale') warnings.push('The stored verification no longer matches this text, so it is not current.')
-    else if (verify === 'unavailable') warnings.push('The verifier check could not run, so the technical claims are unverified.')
+    else if (verify === 'unavailable') {
+      notes.push('Automated review is pending; the source diff is available below.')
+      if (ai.verifyClaims?.length) warnings.push('Earlier factual objections remain unresolved.')
+    }
     else if (verify === 'unchecked') warnings.push('Technical claims have no current verification.')
     else if (verify === 'pre-policy') notes.push('This summary predates the current verification policy, so it has no fresh fact-check.')
     if (unverifiedNames.length) warnings.push(`Unverified names or numbers: ${unverifiedNames.join(', ')}.`)
@@ -108,6 +111,9 @@ export function qualityOf (e = {}) {
       warnings.push('The fact-check objected to claims in the plain-English explanation.')
     } else if (plainVerify === 'stale') {
       warnings.push('The stored fact-check no longer matches this plain-English text, so it is not current.')
+    } else if (plainVerify === 'unavailable') {
+      notes.push('Automated review of the plain-English explanation is pending.')
+      if (plain.verifyClaims?.length) warnings.push('Earlier plain-English factual objections remain unresolved.')
     } else {
       warnings.push('The plain-English explanation has no successful current fact-check.')
     }
@@ -115,11 +121,12 @@ export function qualityOf (e = {}) {
   }
   if (plain.text && plain.manifest?.partial) warnings.push('The plain-English explanation uses partial evidence; some changes may be omitted.')
   const uncertain = warnings.length > 0
-  const confidence = ai.manifest?.partial ? 'low' : ai.confidence === 'high' && uncertain ? 'medium' : ai.confidence
+  const confidence = ai.manifest?.partial ? 'low' : ai.confidence === 'high' && (uncertain || demoteActions) ? 'medium' : ai.confidence
   const plainNotes = notes.filter(n => /plain-English/.test(n))
   return {
     verify, plainVerify, confidence, uncertain, demoteActions,
     prePolicy: verify === 'pre-policy' || plainVerify === 'pre-policy',
+    reviewPending: verify === 'unavailable' || plainVerify === 'unavailable',
     warnings: [...new Set(warnings)],
     notes: [...new Set(notes)],
     ...(plainNotes.length ? { plainNotes } : {}),

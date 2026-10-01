@@ -43,7 +43,9 @@ export const ELI5_V = 7
 // v8: the roll-up ask gained the anti-marketing rules the per-commit pass has.
 // v9: ungrounded members are dropped from the window entirely instead of
 // traveling as [caution] text (their names still entered the ground corpus).
-export const RELEASE_ROLLUP_V = 9
+// v10: mixed code+version releases receive their window AND their own hunks;
+// a packaging-only response cannot satisfy a functional release summary.
+export const RELEASE_ROLLUP_V = 10
 
 // The verifier's framing and evidence policy, separate from the writer's prompt
 // version because it changes what a verdict means without changing the text.

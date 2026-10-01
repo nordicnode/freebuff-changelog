@@ -1480,6 +1480,15 @@ export function deterministicSummary (e) {
     if (e.cmdChanges.added.length) bits.push(`New slash commands: ${e.cmdChanges.added.map(c => '`' + c + '`').join(', ')}.`)
     if (e.cmdChanges.removed.length) bits.push(`Removed slash commands: ${e.cmdChanges.removed.map(c => '`' + c + '`').join(', ')}.`)
   }
+  if (isBumpEntry(e) && e.structured?.testNames?.length) {
+    // Assertion titles describe the code's contract, not proof of production
+    // availability. This is useful even before optional prose enrichment lands.
+    const candidates = e.structured.testNames.filter(t => !/\$\{|[\r\n]/.test(t) && /\s/.test(t))
+    // Sample across the list rather than letting the first suite hide every
+    // later topic (the affected release starts with ads and ends with safety).
+    const tests = candidates.length <= 6 ? candidates : Array.from({ length: 6 }, (_, i) => candidates[Math.round(i * (candidates.length - 1) / 5)])
+    if (tests.length) bits.push(`Changed test assertions cover: ${tests.map(t => `"${t}"`).join('; ')}. These are test expectations, not a live rollout confirmation.`)
+  }
   if (e.files.added.length) bits.push(`New files: ${e.files.added.slice(0, 4).map(p => '`' + p + '`').join(', ')}${e.files.added.length > 4 ? ` (+${e.files.added.length - 4} more)` : ''}.`)
   if (e.files.removed.length) bits.push(`Removed: ${e.files.removed.slice(0, 4).map(p => '`' + p + '`').join(', ')}${e.files.removed.length > 4 ? ` (+${e.files.removed.length - 4} more)` : ''}.`)
   if (e.files.renamed.length) bits.push(`Renamed ${e.files.renamed.length} file(s).`)

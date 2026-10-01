@@ -5,6 +5,7 @@ import { writeText, writeBinary } from './util.mjs'
 import { escapeHtml as esc, fmtDateHuman, pool, shortHash } from './util.mjs'
 import { qualityOf, qualityText } from './quality.mjs'
 import { CSS } from './style.mjs'
+import { deterministicSummary, isBumpEntry } from './analyze.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg, feedsOpml } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
 import { buildStoryIndex, dayStories, dayStoryLead } from './story.mjs'
@@ -1369,12 +1370,7 @@ function evidenceHtml (e) {
   const flag = badNames.length
     ? `<p class="evidence-flag">Not found in the diff or source context: ${badNames.map(x => `<code>${esc(x)}</code>`).join(', ')}. Treat these names as unverified.</p>`
     : ''
-  const verify = e.ai?.verify === 'flagged'
-    ? '<p class="evidence-flag">The verifier still objected to claims in this summary after one repair.</p>'
-    : e.ai?.verify === 'unavailable'
-      ? '<p class="evidence-flag">The verifier check could not run for this row, so its claims are unverified.</p>'
-      : ''
-  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${badNames.length ? ` <span class="evidence-warn">(${badNames.length} unverified name${badNames.length === 1 ? '' : 's'})</span>` : ''}${quality.uncertain ? ` <span class="evidence-warn">(${quality.warnings.length} objection${quality.warnings.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${verify}${quality.warnings.map(w => `<p class="evidence-flag">${esc(w)}</p>`).join('')}${quality.notes.map(n => `<p class="evidence-note">${esc(n)}</p>`).join('')}</div></details>`
+  return `<details class="evidence"><summary class="evidence-toggle"><span class="diff-arrow">&gt;</span> <span>Evidence</span> <span class="evidence-hint">(diff citations)</span>${badNames.length ? ` <span class="evidence-warn">(${badNames.length} unverified name${badNames.length === 1 ? '' : 's'})</span>` : ''}${quality.uncertain ? ` <span class="evidence-warn">(${quality.warnings.length} objection${quality.warnings.length === 1 ? '' : 's'})</span>` : ''}</summary><div class="evidence-body">${ev ? `<p>${miniMd(ev)}</p>` : ''}${flag}${quality.warnings.map(w => `<p class="evidence-flag">${esc(w)}</p>`).join('')}${quality.notes.map(n => `<p class="evidence-note">${esc(n)}</p>`).join('')}</div></details>`
 }
 
 // Implementation notes and comments extracted directly from the commit diff.
@@ -2043,7 +2039,12 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
   const trafficUniques = traffic?.uniques ?? 0
   activeTraffic = { count: trafficCount, uniques: trafficUniques }
   hasInFlight = !!(openPrs && openPrs.length)
-  const entries = [...changelog.entries].reverse() // newest first
+  // Read-only fallback: an unavailable writer must not leave a release with
+  // just a version label. Reuse mechanical facts without inventing runtime
+  // effects, and leave stored history and model provenance untouched.
+  const entries = changelog.entries.map(e => !e.ai?.summary && isBumpEntry(e) && e.structured?.testNames?.length
+    ? { ...e, summary: deterministicSummary(e) }
+    : e).reverse() // newest first
   const byDay = groupByDay(entries)
   // "Related" is a reading aid for real changes: churn rows must neither appear
   // in it nor link out of it.

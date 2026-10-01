@@ -412,8 +412,12 @@ test('re-check policy: only rows that say they are unverified, bounded and coole
   // whole point of the framing refresh -- could never happen.
   assert.equal(reverifyEligible({ ...unverified, verifyErrors: 11, verifyAt: '2020-01-01T00:00:00.000Z' }), true,
     'no-answer attempts do not consume the verdict tries')
-  assert.equal(reverifyEligible({ ...unverified, verifyErrors: 12, verifyAt: '2020-01-01T00:00:00.000Z' }), false,
-    'but their own allowance is bounded too')
+  assert.equal(reverifyEligible({ ...unverified, verifyErrors: 12, verifyAt: '2020-01-01T00:00:00.000Z' }), true,
+    'a prolonged outage must not permanently retire an unanswered review')
+  assert.equal(reverifyEligible({ ...unverified, verifyErrors: 12 }, { maxErrors: 12 }), false,
+    'an explicit operator error cap is still honored')
+  assert.equal(reverifyEligible({ ...unverified, verifyErrors: 12, verifyAt: new Date(Date.now() - 3600000).toISOString() }), false,
+    'repeated outages increase spacing, not spending')
   assert.equal(reverifyEligible({ ...unverified, verifyTries: 3, verifyErrors: 0, verifyAt: '2020-01-01T00:00:00.000Z' }), false,
     'and an answered-but-unresolved row still parks at its try cap')
 })
@@ -1211,12 +1215,12 @@ const eli5Entry = (over = {}) => ({
   ...over
 })
 
-test('eli5Eligible: only entries with a current technical summary', () => {
+test('eli5Eligible: entries with technical text; admission separately controls historical spending', () => {
   assert.equal(eli5Eligible(eli5Entry()), true)
   assert.equal(eli5Eligible(eli5Entry({ noise: true, churn: 'lockfile' })), false, 'churn has nothing to explain')
   assert.equal(eli5Eligible(eli5Entry({ ai: undefined })), false, 'community rows never went through the model')
-  assert.equal(eli5Eligible(eli5Entry({ ai: { v: PROMPT_V - 1, title: 't', summary: 's' } })), false,
-    'an entry that is about to be re-summarized waits for the newer summary')
+  assert.equal(eli5Eligible(eli5Entry({ ai: { v: PROMPT_V - 1, title: 't', summary: 's' } })), true,
+    'an older prompt is not permission to rewrite history; the forward admission gate owns spending')
 })
 
 test('eli5Done: pinned to the exact summary the line was written from', () => {
