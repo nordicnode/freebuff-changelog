@@ -1214,7 +1214,7 @@ async function catchUpOnce (argv) {
   }
   // Checkpoint successes even without a publish; a deadline or push failure
   // must not discard completed forward-only work.
-  await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: existing }))
+  await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: { ...existing, entries } }))
 
   // 4. Publish again, this time with the summaries in. Still unconditional on
   //    --push rather than gated on didSummarize: an upstream-only move is
