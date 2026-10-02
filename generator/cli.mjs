@@ -15,8 +15,8 @@ import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
   extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
-import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows } from './lib/llm.mjs'
-import { QUALITY_POLICY_V, generationState } from './lib/quality.mjs'
+import {  enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, verifyConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows } from './lib/llm.mjs'
+import { QUALITY_POLICY_V, generationState, regenUnfinished } from './lib/quality.mjs'
 import { shortHash, eli5Source } from './lib/util.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
@@ -2119,8 +2119,12 @@ async function cmdRegenLast (argv) {
     const unavailable = askable.filter(e => e.ai?.verify === 'unavailable')
     log(`[regen] ${fresh.length}/${askable.length} rows rewritten this run (writer reported ${written}, ${asked} call${asked === 1 ? '' : 's'})`)
     log(`[regen] ${askable.length - noText.length}/${askable.length} now carry technical text (not a completion verdict)`)
-    const incomplete = askable.filter(e => generationState(e).status !== 'complete')
-    log(`[regen] ${askable.length - incomplete.length}/${askable.length} fully generated and reviewed`)
+    // With the verifier disabled, a fresh row ends `review-pending` by design:
+    // counting that as an unfinished repair would fail every successful run and
+    // skip the sync loop behind it. Missing text and needs-repair still fail.
+    const verifyOn = verifyConfigured(process.env)
+    const incomplete = regenUnfinished(askable, { verify: verifyOn })
+    log(`[regen] ${askable.length - incomplete.length}/${askable.length} fully generated${verifyOn ? ' and reviewed' : ' (verifier off: no verdict requested)'}`)
     for (const e of askable) {
       const state = generationState(e)
       log(`[regen] ${e.sha.slice(0, 8)}: ${state.status}${state.missing.length ? ` (missing ${state.missing.join(', ')})` : ''}; summary=${e.ai?.verify || 'none'}, plain=${e.eli5?.verify || (e.eli5?.model === 'template' ? 'deterministic' : 'none')}`)

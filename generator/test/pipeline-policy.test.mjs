@@ -13,7 +13,7 @@ import {
   llmRpm, createLlmRateLimiter, resetLlmRateLimiterForTests, retryAfterMs, gatherReleaseEvidence,
   backupEnvOf, isRouteFailure, servedModelOf
 } from '../lib/llm.mjs'
-import { artifactHash, qualityOf, qualityText, qualityNote, qualityStatus, dedupeClaims, generationState, QUALITY_POLICY_V } from '../lib/quality.mjs'
+import { artifactHash, qualityOf, qualityText, qualityNote, qualityStatus, dedupeClaims, generationState, regenUnfinished, QUALITY_POLICY_V } from '../lib/quality.mjs'
 import { mergeChangelog, mergeOpenPrs, mergeHealth, persistMerged } from '../lib/mergedata.mjs'
 import { runEval, latestResult } from '../lib/eval.mjs'
 import { writeJson, withLock, withDeadline, git, shortHash } from '../lib/util.mjs'
@@ -454,6 +454,23 @@ test('completion: text, exact-text review and complete evidence are separate req
   e.eli5.text = 'Invented replacement.'
   assert.equal(generationState(e).status, 'needs-repair', 'a stale plain-English verdict is not completion')
   assert.equal(generationState({ ...e, noise: true }).status, 'not-required')
+})
+
+test('regeneration completion: a deliberately disabled verifier is not a failed repair', () => {
+  const fresh = {
+    ...entry(),
+    ai: { policy: QUALITY_POLICY_V, title: 'Limit changed', summary: 'The internal limit changed.', manifest: { policy: QUALITY_POLICY_V } },
+    eli5: { policy: QUALITY_POLICY_V, text: 'An internal limit changed.', manifest: { policy: QUALITY_POLICY_V } }
+  }
+  // Verifier off: no verdict was requested, so this is the finished state.
+  assert.equal(generationState(fresh).status, 'review-pending')
+  assert.deepEqual(regenUnfinished([fresh], { verify: false }), [])
+  // Verifier on: the same row still owes its exact-text read.
+  assert.deepEqual(regenUnfinished([fresh], { verify: true }), [fresh])
+  // Real defects fail the run either way.
+  const partialEvidence = { ...fresh, ai: { ...fresh.ai, manifest: { policy: QUALITY_POLICY_V, partial: true } } }
+  const noText = { ...fresh, ai: { ...fresh.ai, summary: '' } }
+  assert.deepEqual(regenUnfinished([partialEvidence, noText], { verify: false }), [partialEvidence, noText])
 })
 
 test('verification: a 504 takes one different framing, preserving all evidence and coverage', async t => {

@@ -66,10 +66,23 @@ export function dedupeClaims (claims = []) {
     out[at] = c
   }
   return out
+}// Rows a regeneration run could not finish. With the verifier on, that is
+// exactly `generationState(...) !== 'complete'`. With it deliberately off, text
+// that is otherwise clean is finished even though no verdict was requested: the
+// missing read is the policy, not a repair failure, so `review-pending` alone
+// must not fail the run (missing text and needs-repair still do).
+export function regenUnfinished (entries = [], { verify = true } = {}) {
+  return entries.filter(e => {
+    const state = generationState(e)
+    if (state.status === 'complete') return false
+    if (!verify && state.status === 'review-pending' && !state.missing.length) return false
+    return true
+  })
 }
 
 // Text presence is not completion: both artifacts need exact-text verdicts,
 // complete evidence, and no unresolved grounding/claim objections.
+
 export function generationState (e = {}) {
   const ai = e.ai || {}, plain = e.eli5 || {}
   const missing = []
