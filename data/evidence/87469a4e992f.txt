@@ -1,0 +1,1063 @@
+Date: 2026-10-01T01:43:44Z
+Category: CLI
+Areas: CLI
+Commit nature: production
+Stats: +118 / -7
+Analysis notes: CLI changes across 1 file(s) (+118/−7).
+Modified files: cli/src/utils/auth.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Distinct credentials read/parse failures already logged by this process. - Test-only: forget which credentials failures were already logged.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Constants newly defined: MAX_LOGGED_CREDENTIALS_FAILURES = 20 (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)
+- Exports added: resetCredentialsFailureLogForTests
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "the file 0.2.4 writes, read on every render" ; "signed in with the keychain token, for every token reader" ; "no keychain token this run: signed out quietly, nothing logged" ; "an unreadable file logs once per distinct failure, not once per read"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `cli/src/utils/auth.ts`:
+```
+// User schema
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `cli/README.md`:
+```markdown
+# @codebuff/cli
+
+A Terminal User Interface (TUI) package built with OpenTUI and React.
+
+## Installation
+
+```bash
+bun install
+```
+
+## Development
+
+Run the TUI in development mode:
+
+```bash
+bun run dev
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+bun test
+```
+
+### Interactive E2E Testing
+
+For testing interactive CLI features, install tmux:
+
+```bash
+# macOS
+brew install tmux
+
+# Ubuntu/Debian
+sudo apt-get install tmux
+
+# Windows (via WSL)
+wsl --install
+sudo apt-get install tmux
+```
+
+Then run the proof-of-concept:
+
+```bash
+bun run test:tmux-poc
+```
+
+[freebuff product prompt text omitted]
+
+```bash
+# ❌ Broken: tmux send-keys -t session "hello"
+# ✅ Works:  tmux send-keys -t session $'\e[200~hello\e[201~'
+```
+
+See [tmux.knowledge.md](tmux.knowledge.md) for comprehensive tmux documentation and [src/__tests__/README.md](src/__tests__/README.md) for testing documentation.
+
+## Build
+
+Build the package:
+
+```bash
+bun run build
+```
+
+## Run
+
+Run the built TUI:
+
+```bash
+bun run start
+```
+
+Or use the binary directly:
+
+```bash
+codebuff-tui
+```
+
+## Features
+```
+Complete Source of Modified Files (for complete module context):
+- File `cli/src/utils/auth.ts` (430 lines):
+```
+import fs from 'fs'
+import path from 'path'
+
+import { getCiEnv } from '@codebuff/common/env-ci'
+import { z } from 'zod'
+
+import {
+  getCachedKeychainToken,
+  resolveSecretStore,
+  setCachedKeychainToken,
+} from './auth-token-store'
+import { getApiClient, setApiClientAuthToken } from './codebuff-api'
+import { getConfigDir as getConfigDirBase } from './config-dir'
+import { IS_FREEBUFF } from './constants'
+import { logger } from './logger'
+
+import type { CiEnv } from '@codebuff/common/types/contracts/env'
+
+// User schema
+const userSchema = z.object({
+  id: z.string().optional(),
+  // The server's user record allows a null name (see `userSchema` in
+  // common/src/util/credentials.ts), and the login response is written to disk
+  // as-is. Requiring a string here made every launch fail to parse the file
+  // for those accounts, so they could never stay logged in.
+  name: z
+    .string()
+    .nullish()
+    .transform((name) => name ?? ''),
+  email: z.string(),
+  authToken: z.string(),
+  fingerprintId: z.string().optional(),
+  fingerprintHash: z.string().optional(),
+  credits: z.number().optional(),
+})
+
+export type User = z.infer<typeof userSchema>
+
+/** What the file may hold: the token itself, or a pointer to the keychain
+ *  (auth-token-store.ts). */
+const storedUserSchema = userSchema.extend({
+  authToken: z.string().optional(),
+  tokenStore: z.literal('keychain').optional(),
+})
+
+// Each profile is validated on its own (`storedUserSchema` in userFromJson):
+// a keychain-pointer profile has no `authToken`, which `userSchema` requires.
+const credentialsSchema = z.object({}).catchall(z.unknown())
+
+// Get the config directory path.
+// Re-exported as a wrapper (rather than a bare `export ... from`) so existing
+// tests can still `spyOn(authModule, 'getConfigDir')`.
+export const getConfigDir = (): string => getConfigDirBase()
+
+// Get the credentials file path
+export const getCredentialsPath = (): string => {
+  return path.join(getConfigDir(), 'credentials.json')
+}
+
+/** Owner read/write only: the file holds the bearer token for every API call. */
+const CREDENTIALS_FILE_MODE = 0o600
+/** Owner-only config dir, matching sdk/src/byok.ts and sponsored-run.ts. */
+const CONFIG_DIR_MODE = 0o700
+
+/**
+ * Best-effort: clamp the credentials file to owner read/write.
+ *
+ * `writeFileSync` only applies `mode` when it CREATES the file, so an install
+ * that already has a umask-wide `credentials.json` (e.g. `-rw-rw-r--`) keeps
+ * it across every rewrite. Called after each write and on read, so existing
+ * installs are healed on the next launch. Skipped on Windows, where POSIX
+ * mode bits do not apply and `chmod` can throw. Never throws: a failed chmod
+ * must not cost the user their login.
+ */
+const tightenCredentialsFileMode = (credentialsPath: string): void => {
+  if (process.platform === 'win32') return
+  try {
+    const mode = fs.statSync(credentialsPath).mode & 0o777
+    if (mode !== CREDENTIALS_FILE_MODE) {
+      fs.chmodSync(credentialsPath, CREDENTIALS_FILE_MODE)
+    }
+  } catch (error) {
+    logger.debug(
+      { error: error instanceof Error ? error.message : String(error) },
+      'Could not tighten credentials file permissions',
+    )
+  }
+}
+
+/**
+ * Distinct credentials read/parse failures already logged by this process.
+ *
+ * The credentials file is re-read on every render of the app shell
+ * (`useAuthQuery` / `useAuthState` call `getUserCredentials()` in the render
+ * body), so a file this process cannot parse used to log an error on every
+ * frame. On 2026-10-01 a pre-0.2.4 CLI left running beside a 0.2.4 one (which
+ * moved the token to the keychain) logged "Error parsing user JSON" ~11 times
+ * a second per user, 35k lines per 20 minutes. One line per distinct failure
+ * says everything; the rest is ingest cost. Bounded so a file that changes
+ * shape forever cannot grow it without limit.
+ */
+const loggedCredentialsFailures = new Set<string>()
+const MAX_LOGGED_CREDENTIALS_FAILURES = 20
+
+const logCredentialsFailureOnce = (
+  key: string,
+  data: Record<string, unknown>,
+  message: string,
+): void => {
+  if (loggedCredentialsFailures.has(key)) return
+  if (loggedCredentialsFailures.size >= MAX_LOGGED_CREDENTIALS_FAILURES) return
+  loggedCredentialsFailures.add(key)
+  logger.error(data, message)
+}
+
+/** Test-only: forget which credentials failures were already logged. */
+export const resetCredentialsFailureLogForTests = (): void => {
+  loggedCredentialsFailures.clear()
+}
+
+/**
+ * Parse user from JSON string
+ */
+const userFromJson = (
+  json: string,
+  profileName: string = 'default',
+): User | undefined => {
+  try {
+    const allCredentials = credentialsSchema.parse(JSON.parse(json))
+    const profile = allCredentials[profileName]
+    // Validate that the profile matches the user schema
+    const parsed = storedUserSchema.safeParse(profile)
+    if (!parsed.success) return undefined
+    const { tokenStore, ...stored } = parsed.data
+    // A keychain pointer resolves to the token loaded at startup; with none
+    // loaded (keychain unavailable this run) the user reads as signed out.
+    const authToken =
+      stored.authToken ??
+      (tokenStore === 'keychain' ? getCachedKeychainToken() : undefined)
+    return authToken ? { ...stored, authToken } : undefined
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    logCredentialsFailureOnce(
+      `parse:${profileName}:${errorMessage}`,
+      {
+        errorMessage,
+        errorStack: error instanceof Error ? error.stack : undefined,
+        profileName,
+      },
+      'Error parsing user JSON',
+    )
+    return
+  }
+}
+
+/**
+ * Get user credentials from file system
+ * @returns User object or null if not found/authenticated
+ */
+export const getUserCredentials = (): User | null => {
+  const credentialsPath = getCredentialsPath()
+
+  // Read user credentials directly from file
+  if (!fs.existsSync(credentialsPath)) {
+    return null
+  }
+
+  try {
+    tightenCredentialsFileMode(credentialsPath)
+    const credentialsFile = fs.readFileSync(credentialsPath, 'utf8')
+    const user = userFromJson(credentialsFile)
+    return user || null
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    logCredentialsFailureOnce(
+      `read:${message}`,
+      { error: message },
+      'Error reading credentials',
+    )
+    return null
+  }
+}
+
+export type AuthTokenSource = 'credentials' | 'environment' | null
+
+export interface AuthTokenDetails {
+  token?: string
+  source: AuthTokenSource
+}
+
+/**
+ * Resolve the auth token and track where it came from.
+ */
+export const getAuthTokenDetails = (
+  ciEnv: CiEnv = getCiEnv(),
+): AuthTokenDetails => {
+  const userCredentials = getUserCredentials()
+  if (userCredentials?.authToken) {
+    return { token: userCredentials.authToken, source: 'credentials' }
+  }
+
+  const envToken = ciEnv.CODEBUFF_API_KEY
+  if (envToken) {
+    return { token: envToken, source: 'environment' }
+  }
+
+  return { source: null }
+}
+
+/**
+ * Get the auth token from user credentials or environment variable
+ */
+export const getAuthToken = (): string | undefined => {
+  return getAuthTokenDetails().token
+}
+
+/**
+ * Check if the user has authentication credentials (but doesn't validate them)
+ */
+export const hasAuthCredentials = (): boolean => {
+  return !!getAuthTokenDetails().token
+}
+
+export interface AuthValidationResult {
+  authenticated: boolean
+  hasInvalidCredentials: boolean
+}
+
+/**
+ * Read existing credentials file, returns empty object if missing/invalid.
+ *
+ * Drops `chatgptOAuth`, which the removed ChatGPT integration wrote. Both
+ * callers spread this result straight back over the file, so the dead key —
+ * an OAuth access and refresh token for the user's ChatGPT account — is
+ * cleaned up the next time we write for any reason. Doing it here rather than
+ * in a startup pass means no extra write and no new race with login/logout;
+ * nothing reads the key anymore, and with /connect gone the user has no way
+ * to clear it themselves.
+ */
+const readCredentialsFile = (): Record<string, unknown> => {
+  const credentialsPath = getCredentialsPath()
+  if (!fs.existsSync(credentialsPath)) return {}
+  try {
+    const { chatgptOAuth: _removedIntegration, ...rest } = JSON.parse(
+      fs.readFileSync(credentialsPath, 'utf8'),
+    )
+    return rest
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Save user credentials to file system.
+ */
+export const saveUserCredentials = (user: User): void => {
+  const configDir = getConfigDir()
+  const credentialsPath = getCredentialsPath()
+
+  try {
+    if (!fs.existsSync(configDir)) {
+      fs.mkdirSync(configDir, { recursive: true, mode: CONFIG_DIR_MODE })
+    }
+
+    // The login response is cast to `User`, so `name` can be null at runtime.
+    const normalizedUser = { ...user, name: user.name ?? '' }
+    const updatedData = { ...readCredentialsFile(), default: normalizedUser }
+    fs.writeFileSync(credentialsPath, JSON.stringify(updatedData, null, 2), {
+      mode: CREDENTIALS_FILE_MODE,
+    })
+    tightenCredentialsFileMode(credentialsPath)
+    // The file holds the token until the keychain has it (never throws).
+    setCachedKeychainToken(normalizedUser.authToken)
+    void moveTokenToKeychain()
+  } catch (error) {
+    logger.error(
+      {
+        error: error instanceof Error ? error.message : String(error),
+      },
+      'Error saving credentials',
+    )
+    throw error
+  }
+}
+
+/**
+ * Clear user credentials from file system.
+ * Only removes the 'default' field, preserving other credentials.
+ */
+export const clearUserCredentials = (): void => {
+  const credentialsPath = getCredentialsPath()
+
+  try {
+    if (!fs.existsSync(credentialsPath)) return
+
+    const { default: _, ...rest } = readCredentialsFile()
+    setCachedKeychainToken(null)
+    const store = resolveSecretStore({
+      isFreebuff: IS_FREEBUFF,
+      credentialsPath,
+    })
+    if (store) {
+      void store.delete().catch((error) => {
+        logger.debug(
+          { error: error instanceof Error ? error.message : String(error) },
+          'Could not remove the keychain token',
+        )
+      })
+    }
+
+    if (Object.keys(rest).length === 0) {
+      fs.unlinkSync(credentialsPath)
+    } else {
+      fs.writeFileSync(credentialsPath, JSON.stringify(rest, null, 2), {
+        mode: CREDENTIALS_FILE_MODE,
+      })
+      tightenCredentialsFileMode(credentialsPath)
+    }
+  } catch (error) {
+    logger.error(
+      {
+        error: error instanceof Error ? error.message : String(error),
+      },
+      'Error clearing credentials',
+    )
+    throw error
+  }
+}
+
+/**
+ * Move the file's token into the keychain, once the keychain has proved it
+ * can hand it back. Leaves the file alone on any failure, and when the file
+ * changed meanwhile (a concurrent login). Never throws.
+ */
+export async function moveTokenToKeychain(): Promise<boolean> {
+  const credentialsPath = getCredentialsPath()
+  const store = resolveSecretStore({ isFreebuff: IS_FREEBUFF, credentialsPath })
+  if (!store) return false
+  try {
+    const before = readCredentialsFile()
+    const profile = storedUserSchema.safeParse(before.default)
+    const token = profile.success ? profile.data.authToken : undefined
+    if (!token) return false
+    await store.set(token)
+    if ((await store.get()) !== token) return false
+    const now = readCredentialsFile()
+    const current = storedUserSchema.safeParse(now.default)
+    if (!current.success || current.data.authToken !== token) return false
+    const { authToken: _moved, ...profileOnly } = current.data
+    fs.writeFileSync(
+      credentialsPath,
+      JSON.stringify(
+        { ...now, default: { ...profileOnly, tokenStore: 'keychain' } },
+        null,
+        2,
+      ),
+      { mode: CREDENTIALS_FILE_MODE },
+    )
+    tightenCredentialsFileMode(credentialsPath)
+    setCachedKeychainToken(token)
+    return true
+  } catch (error) {
+    logger.debug(
+      { error: error instanceof Error ? error.message : String(error) },
+      'Auth token stays in the credentials file (keychain unavailable)',
+    )
+    return false
+  }
+}
+
+/**
+ * Startup: load a keychain token into memory so the synchronous readers see
+ * it, or move a file token into the keychain. Must run before anything reads
+ * the credentials. Never throws.
+ */
+export async function loadStoredAuthToken(): Promise<void> {
+  const credentialsPath = getCredentialsPath()
+  const store = resolveSecretStore({ isFreebuff: IS_FREEBUFF, credentialsPath })
+  if (!store) return
+  const profile = storedUserSchema.safeParse(readCredentialsFile().default)
+  if (!profile.success) return
+  if (profile.data.authToken) {
+    await moveTokenToKeychain()
+    return
+  }
+  if (profile.data.tokenStore !== 'keychain') return
+  try {
+    setCachedKeychainToken((await store.get()) ?? null)
+  } catch (error) {
+    logger.warn(
+      { error: error instanceof Error ? error.message : String(error) },
+      'Could not read the auth token from the keychain',
+    )
+  }
+}
+
+export async function logoutUser(): Promise<boolean> {
+  try {
+    const user = getUserCredentials()
+    if (user?.authToken) {
+      setApiClientAuthToken(user.authToken)
+      const apiClient = getApiClient()
+      try {
+        const response = await apiClient.logout({
+          userId: user.id,
+          fingerprintId: user.fingerprintId,
+          fingerprintHash: user.fingerprintHash,
+        })
+        if (!response.ok) {
+          logger.error(
+            { status: response.status, error: response.error },
+            'Logout request failed',
+          )
+        }
+      } catch (err) {
+        logger.error(err, 'Logout request error')
+      }
+    }
+  } catch (error) {
+    logger.error(error, 'Unexpected error preparing logout')
+  }
+
+  try {
+    clearUserCredentials()
+  } catch (error) {
+    logger.debug({ error }, 'Failed to clear credentials during logout')
+  }
+  return true
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `cli/src/__tests__/integration/credentials-storage.test.ts` (50 matching lines):
+```
+import {
+  describe,
+  test,
+  expect,
+  beforeEach,
+  afterEach,
+  mock,
+  spyOn,
+} from 'bun:test'
+
+import { setProjectRoot } from '../../project-files'
+import * as authModule from '../../utils/auth'
+import { saveUserCredentials, getUserCredentials } from '../../utils/auth'
+
+import type { User } from '../../utils/auth'
+
+/**
+ * Integration tests for credential storage and retrieval
+ *
+ * These tests verify the complete flow of saving, loading, and managing
+ * user credentials on the file system. Credentials are stored in:
+ * - Dev: ~/.config/manicode-dev/credentials.json
+ * - Prod: ~/.config/manicode/credentials.json
+ *
+ * Tests ensure:
+…
+clearMockedModules()
+  })
+
+  describe('P0: File System Operations', () => {
+    test('should create config directory if it does not exist', () => {
+      // Ensure directory doesn't exist initially
+      if (fs.existsSync(tempConfigDir)) {
+        fs.rmSync(tempConfigDir, { recursive: true })
+      }
+      expect(fs.existsSync(tempConfigDir)).toBe(false)
+
+      // Call saveUserCredentials - should create directory
+      saveUserCredentials(TEST_USER)
+
+      // Verify directory was created
+      expect(fs.existsSync(tempConfigDir)).toBe(true)
+
+      // Verify it's a directory
+      const stats = fs.statSync(tempConfigDir)
+      expect(stats.isDirectory()).toBe(true)
+
+      // Verify credentials file was created in the directory
+      const credentialsPath = path.join(tempConfigDir, 'credentials.json')
+      expect(fs.existsSync(credentialsPath)).toBe(true)
+    })
+
+    test('should write credentials.json with correct JSON format', () => {
+      // Call saveUserCredentials
+      saveUserCredentials(TEST_USER)
+
+      // Read the credentials file
+      const credentialsPath = path.join(tempConfigDir, 'credentials.json')
+      const fileContent = fs.readFileSync(credentialsPath, 'utf8')
+
+      // Parse JSON
+      const parsed = JSON.parse(fileContent)
+
+      // Verify structure is { default: { ...user fields } }
+      expect(parsed).toHaveProperty('default')
+      expect(typeof parsed.default).toBe('object')
+```
+- File `cli/src/utils/__tests__/auth-keychain.test.ts` (39 matching lines):
+```
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+
+import { setProjectRoot } from '../../project-files'
+import * as authModule from '../auth'
+import {
+  clearUserCredentials,
+  getAuthToken,
+  getUserCredentials,
+  loadStoredAuthToken,
+  moveTokenToKeychain,
+  saveUserCredentials,
+} from '../auth'
+import { setSecretStoreForTests, type SecretStore } from '../auth-token-store'
+import { logger } from '../logger'
+
+import type { User } from '../auth'
+
+const TEST_USER: User = {
+  id: 'test-user-123',
+  name: 'Test User',
+…
+spyOn(authModule, 'getConfigDir').mockReturnValue(configDir)
+    spyOn(authModule, 'getCredentialsPath').mockReturnValue(credentialsPath)
+  })
+
+  afterEach(() => {
+    setSecretStoreForTests(undefined)
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  })
+
+  test('login moves the token out of the file; the profile stays readable', async () => {
+    const { store, peek } = memoryStore()
+    setSecretStoreForTests(store)
+    saveUserCredentials(TEST_USER)
+    await settle()
+
+    expect(peek()).toBe(TEST_USER.authToken)
+    const file = fileJson()
+    expect(file.default.authToken).toBeUndefined()
+    expect(file.default.tokenStore).toBe('keychain')
+    expect(file.default.email).toBe(TEST_USER.email)
+    expect(fs.readFileSync(credentialsPath, 'utf8')).not.toContain(
+      TEST_USER.authToken,
+    )
+    expect(getUserCredentials()?.authToken).toBe(TEST_USER.authToken)
+  })
+
+  test('a later launch loads the token from the keychain before anything reads it', async () => {
+    const { store } = memoryStore()
+```
+- File `sdk/src/__tests__/sponsored-rooted-filesystem.test.ts` (28 matching lines):
+```
+expect(sponsoredDirectoryPinning('win32')).toBe('lstat')
+    expect(sponsoredDirectoryPinning('freebsd')).toBeNull()
+  })
+
+  test('a file-only procedure succeeds without starting any process', async () => {
+    const broker = forbiddenBroker()
+    const rooted = createSponsoredRootedFileSystem({
+      workspaceRoot: root,
+      // Deprecated and ignored; passed here to prove it is never started.
+      processBroker: broker,
+    })
+    await rooted.mkdir(path.join(root, 'src', 'lib'), { recursive: true })
+    await rooted.writeFile(path.join(root, 'src', 'lib', 'a.ts'), 'one\n')
+    await rooted.writeFile(path.join(root, 'src', 'lib', 'a.ts'), 'two\n')
+    await rooted.writeFile(
+      path.join(root, 'src', 'b.ts'),
+      new TextEncoder().encode('bytes\n'),
+    )
+    expect(
+      await rooted.readFile(path.join(root, 'src', 'lib', 'a.ts'), 'utf8'),
+    ).toBe('two\n')
+    expect(
+      Buffer.from(
+        await rooted.readFile(path.join(root, 'src', 'b.ts')),
+      ).toString(),
+    ).toBe('bytes\n')
+    expect((await rooted.readdir(path.join(root, 'src'))).sort()).toEqual([
+```
+- File `cli/src/utils/__tests__/agent-dir-trust.test.ts` (15 matching lines):
+```
+fs.rmSync(tempDir, { recursive: true, force: true })
+  })
+
+  describe('inspectAgentDir', () => {
+    test('a missing directory needs no trust', () => {
+      const inventory = inspectAgentDir(repoAgents)
+      expect(inventory.needsTrust).toBe(false)
+      expect(inventory.agentFiles).toEqual([])
+      expect(inventory.mcpJson).toBeNull()
+    })
+
+    test('skills-only markdown needs no trust', () => {
+      writeFile(path.join(repoAgents, 'skills', 'deploy', 'SKILL.md'), '# x')
+      writeFile(path.join(repoAgents, 'README.md'), '# agents')
+      expect(inspectAgentDir(repoAgents).needsTrust).toBe(false)
+    })
+
+    test('type declarations and tests do not count as executable agents', () => {
+      writeFile(path.join(repoAgents, 'types', 'agent-definition.d.ts'), '')
+      writeFile(path.join(repoAgents, 'thing.test.ts'), '')
+      expect(inspectAgentDir(repoAgents).needsTrust).toBe(false)
+    })
+
+    test('lists executable agent files relative to the directory', () => {
+      writeFile(path.join(repoAgents, 'reviewer.ts'), AGENT_SOURCE)
+      writeFile(path.join(repoAgents, 'nested', 'helper.mjs'), AGENT_SOURCE)
+      writeFile(path.join(repoAgents, 'skills', 'x', 'SKILL.md'), '# x')
+      const inventory = inspectAgentDir(repoAgents)
+      expect(inventory.needsTrust).toBe(true)
+      expect(inventory.agentFiles).toEqual([
+        path.join('nested', 'helper.mjs'),
+```
+- File `cli/src/utils/__tests__/auth-credentials-file-mode.test.ts` (9 matching lines):
+```
+beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from 'bun:test'
+
+import { setProjectRoot } from '../../project-files'
+import * as authModule from '../auth'
+import {
+  clearUserCredentials,
+  getUserCredentials,
+  saveUserCredentials,
+} from '../auth'
+
+import type { User } from '../auth'
+
+/**
+ * `credentials.json` holds the bearer token for every API call. It must be
+ * owner-only on disk, and an install that already has a umask-wide file must
+ * be tightened the next time the CLI reads it. POSIX mode bits do not apply
+ * on Windows, so every assertion here is skipped there.
+ */
+…
+// A permissive umask so a bare write would come out group/other-readable;
+    // the explicit mode must win regardless of the process umask.
+    originalUmask = process.umask(0o002)
+  })
+
+  afterEach(() => {
+    process.umask(originalUmask)
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+    mock.restore()
+  })
+
+  test.skipIf(isWindows)('creates credentials.json owner-only (0600)', () => {
+    saveUserCredentials(TEST_USER)
+
+    expect(modeOf(credentialsPath)).toBe(0o600)
+  })
+
+  test.skipIf(isWindows)(
+    'creates the config directory owner-only (0700)',
+    () => {
+      saveUserCredentials(TEST_USER)
+
+      expect(modeOf(configDir)).toBe(0o700)
+    },
+  )
+
+  test.skipIf(isWindows)(
+    'tightens a pre-existing group/other-readable file on save',
+    () => {
+      fs.mkdirSync(configDir, { recursive: true })
+      fs.writeFileSync(credentialsPath, JSON.stringify({ other: 'kept' }), {
+        mode: 0o644,
+      })
+```
+- File `sdk/scripts/build.ts` (5 matching lines):
+```
+// Build script for @codebuff/sdk using Bun's bundler with dual package support
+// Creates ESM + CJS bundles with TypeScript declarations
+
+import { mkdir, cp, readFile, writeFile, rm } from 'fs/promises'
+import Module from 'module'
+import { delimiter, dirname, join, relative, resolve } from 'path'
+
+import { generateDtsBundle } from 'dts-bundle-generator'
+
+import { findWithheldSources, parseExportManifest } from './bundle-source-guard'
+
+const workspaceNodeModules = join(import.meta.dir, '..', 'node_modules')
+const existingNodePath = process.env.NODE_PATH ?? ''
+const nodePathEntries = existingNodePath
+  ? new Set(existingNodePath.split(delimiter))
+  : new Set<string>()
+…
+const cjsPath = 'dist/index.cjs'
+  const cjs = await readFile(cjsPath, 'utf8')
+  const cjsWithAiShim = cjs.replaceAll(
+    'require("ai")',
+    'require("./vendor/ai.cjs")',
+  )
+  if (cjsWithAiShim === cjs) {
+    throw new Error(
+      'CJS build did not contain the expected external AI SDK import',
+    )
+  }
+  await writeFile(cjsPath, cjsWithAiShim)
+
+  console.log('🔒 Checking bundled sources against the public export...')
+  await assertBundleSourcesArePublic([
+    'dist/index.mjs.map',
+    'dist/index.cjs.map',
+  ])
+
+  console.log(
+    '🩹 Patching broken export aliases (Bun bundler dedup workaround)...',
+  )
+  await fixBrokenExportAliases('dist/index.mjs')
+  await fixBrokenExportAliases('dist/index.cjs')
+…
+'@codebuff/agent-runtime',
+              '@codebuff/code-map',
+              '@codebuff/llm-providers',
+            ],
+          },
+        },
+      ],
+      {
+        preferredConfigPath: join(import.meta.dir, '..', 'tsconfig.build.json'),
+      },
+    )
+
+    await writeFile('dist/index.d.ts', bundle)
+    await fixDuplicateImports()
+    console.log('  ✓ Created bundled type definitions')
+  } catch (error) {
+    console.error('❌ TypeScript declaration bundling failed:', error.message)
+    process.exit(1)
+  }
+
+  console.log('📂 Copying WASM files for tree-sitter...')
+  await copyWasmFiles()
+
+  console.log('📂 Copying vendored ripgrep binaries...')
+  await copyRipgrepVendor()
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `cli/src/utils/__tests__/auth-keychain.test.ts`: "the file 0.2.4 writes, read on every render"; "signed in with the keychain token, for every token reader"; "no keychain token this run: signed out quietly, nothing logged"; "an unreadable file logs once per distinct failure, not once per read"
+```
+import { logger } from '../logger'
+  describe('the file 0.2.4 writes, read on every render', () => {
+    // Byte-for-byte the shape `moveTokenToKeychain` leaves on disk: the
+    // profile with `tokenStore: 'keychain'` and no `authToken`. Pre-0.2.4
+    // builds required `default.authToken` and threw a ZodError at
+    // ["default","authToken"] on every read of this file (2026-10-01).
+    const KEYCHAIN_FILE = JSON.stringify(
+      {
+        default: {
+          id: TEST_USER.id,
+          name: TEST_USER.name,
+          email: TEST_USER.email,
+          fingerprintId: 'enhanced-cli-fp',
+          fingerprintHash: 'fp-hash',
+          tokenStore: 'keychain',
+        },
+      },
+      null,
+      2,
+    )
+    const writeFile = (content: string) => {
+      fs.mkdirSync(path.dirname(credentialsPath), { recursive: true })
+      fs.writeFileSync(credentialsPath, content, { mode: 0o600 })
+    }
+    let errorSpy: ReturnType<typeof spyOn>
+    beforeEach(() => {
+      authModule.resetCredentialsFailureLogForTests()
+      errorSpy = spyOn(logger, 'error').mockImplementation(() => {})
+    })
+    afterEach(() => {
+      errorSpy.mockRestore()
+    })
+    test('signed in with the keychain token, for every token reader', async () => {
+      writeFile(KEYCHAIN_FILE)
+      const { store } = memoryStore()
+      await store.set(TEST_USER.authToken)
+      setSecretStoreForTests(store)
+      await loadStoredAuthToken()
+      for (let i = 0; i < 50; i++) {
+        expect(getUserCredentials()?.authToken).toBe(TEST_USER.authToken)
+        expect(getAuthToken()).toBe(TEST_USER.authToken)
+      }
+      expect(getUserCredentials()?.email).toBe(TEST_USER.email)
+      // Loading must not rewrite the pointer file.
+      expect(fs.readFileSync(credentialsPath, 'utf8')).toBe(KEYCHAIN_FILE)
+      expect(errorSpy).not.toHaveBeenCalled()
+    })
+    test('no keychain token this run: signed out quietly, nothing logged', () => {
+      writeFile(KEYCHAIN_FILE)
+      setSecretStoreForTests(null)
+      for
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/cli/src/utils/auth.ts b/cli/src/utils/auth.ts
+index 76d458e56..bb3bd90f6 100644
+--- a/cli/src/utils/auth.ts
++++ b/cli/src/utils/auth.ts
+@@ -65,105 +65,138 @@ const CONFIG_DIR_MODE = 0o700
+ /**
+  * Best-effort: clamp the credentials file to owner read/write.
+  *
+  * `writeFileSync` only applies `mode` when it CREATES the file, so an install
+  * that already has a umask-wide `credentials.json` (e.g. `-rw-rw-r--`) keeps
+  * it across every rewrite. Called after each write and on read, so existing
+  * installs are healed on the next launch. Skipped on Windows, where POSIX
+  * mode bits do not apply and `chmod` can throw. Never throws: a failed chmod
+  * must not cost the user their login.
+  */
+ const tightenCredentialsFileMode = (credentialsPath: string): void => {
+   if (process.platform === 'win32') return
+   try {
+     const mode = fs.statSync(credentialsPath).mode & 0o777
+     if (mode !== CREDENTIALS_FILE_MODE) {
+       fs.chmodSync(credentialsPath, CREDENTIALS_FILE_MODE)
+     }
+   } catch (error) {
+     logger.debug(
+       { error: error instanceof Error ? error.message : String(error) },
+       'Could not tighten credentials file permissions',
+     )
+   }
+ }
+ 
++/**
++ * Distinct credentials read/parse failures already logged by this process.
++ *
++ * The credentials file is re-read on every render of the app shell
++ * (`useAuthQuery` / `useAuthState` call `getUserCredentials()` in the render
++ * body), so a file this process cannot parse used to log an error on every
++ * frame. On 2026-10-01 a pre-0.2.4 CLI left running beside a 0.2.4 one (which
++ * moved the token to the keychain) logged "Error parsing user JSON" ~11 times
++ * a second per user, 35k lines per 20 minutes. One line per distinct failure
++ * says everything; the rest is ingest cost. Bounded so a file that changes
++ * shape forever cannot grow it without limit.
++ */
++const loggedCredentialsFailures = new Set<string>()
++const MAX_LOGGED_CREDENTIALS_FAILURES = 20
++
++const logCredentialsFailureOnce = (
++  key: string,
++  data: Record<string, unknown>,
++  message: string,
++): void => {
++  if (loggedCredentialsFailures.has(key)) return
++  if (loggedCredentialsFailures.size >= MAX_LOGGED_CREDENTIALS_FAILURES) return
++  loggedCredentialsFailures.add(key)
++  logger.error(data, message)
++}
++
++/** Test-only: forget which credentials failures were already logged. */
++export const resetCredentialsFailureLogForTests = (): void => {
++  loggedCredentialsFailures.clear()
++}
++
+ /**
+  * Parse user from JSON string
+  */
+ const userFromJson = (
+   json: string,
+   profileName: string = 'default',
+ ): User | undefined => {
+   try {
+     const allCredentials = credentialsSchema.parse(JSON.parse(json))
+     const profile = allCredentials[profileName]
+     // Validate that the profile matches the user schema
+     const parsed = storedUserSchema.safeParse(profile)
+     if (!parsed.success) return undefined
+     const { tokenStore, ...stored } = parsed.data
+     // A keychain pointer resolves to the token loaded at startup; with none
+     // loaded (keychain unavailable this run) the user reads as signed out.
+     const authToken =
+       stored.authToken ??
+       (tokenStore === 'keychain' ? getCachedKeychainToken() : undefined)
+     return authToken ? { ...stored, authToken } : undefined
+   } catch (error) {
+-    logger.error(
++    const errorMessage = error instanceof Error ? error.message : String(error)
++    logCredentialsFailureOnce(
++      `parse:${profileName}:${errorMessage}`,
+       {
+-        errorMessage: error instanceof Error ? error.message : String(error),
++        errorMessage,
+         errorStack: error instanceof Error ? error.stack : undefined,
+         profileName,
+       },
+       'Error parsing user JSON',
+     )
+     return
+   }
+ }
+ 
+ /**
+  * Get user credentials from file system
+  * @returns User object or null if not found/authenticated
+  */
+ export const getUserCredentials = (): User | null => {
+   const credentialsPath = getCredentialsPath()
+ 
+   // Read user credentials directly from file
+   if (!fs.existsSync(credentialsPath)) {
+     return null
+   }
+ 
+   try {
+     tightenCredentialsFileMode(credentialsPath)
+     const credentialsFile = fs.readFileSync(credentialsPath, 'utf8')
+     const user = userFromJson(credentialsFile)
+     return user || null
+   } catch (error) {
+-    logger.error(
+-      {
+-        error: error instanceof Error ? error.message : String(error),
+-      },
++    const message = error instanceof Error ? error.message : String(error)
++    logCredentialsFailureOnce(
++      `read:${message}`,
++      { error: message },
+       'Error reading credentials',
+     )
+     return null
+   }
+ }
+ 
+ export type AuthTokenSource = 'credentials' | 'environment' | null
+ 
+ export interface AuthTokenDetails {
+   token?: string
+   source: AuthTokenSource
+ }
+ 
+ /**
+  * Resolve the auth token and track where it came from.
+  */
+ export const getAuthTokenDetails = (
+   ciEnv: CiEnv = getCiEnv(),
+ ): AuthTokenDetails => {
+   const userCredentials = getUserCredentials()
+   if (userCredentials?.authToken) {
+     return { token: userCredentials.authToken, source: 'credentials' }
+   }
+ 
+   const envToken = ciEnv.CODEBUFF_API_KEY
+
+```

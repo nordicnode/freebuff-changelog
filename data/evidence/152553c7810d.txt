@@ -1,0 +1,297 @@
+Date: 2026-10-01T06:27:32Z
+Category: Agent Runtime
+Areas: Agent Runtime
+Commit nature: production
+Stats: +533 / -52
+Analysis notes: New files: `packages/agent-runtime/src/util/followup-todo-nudge.ts`.
+Added files: packages/agent-runtime/src/util/followup-todo-nudge.ts
+Modified files: packages/agent-runtime/src/run-agent-step.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Ending on followup cards while the agent's own to-do list is part done stops a task the user asked to have finished (CodebuffAI/freebuff#1434). Bounded per user prompt; see util/followup-todo-nudge.ts. An explicit task_completed/end_turn is left alone. - A turn that ends on suggest_followups while the agent's own to-do list is half done gets sent back to work. - The agent's to-do list is the one model-agnostic signal of whether the work it took on is finished, so the runtime checks it rather than a prompt line every model reads differently. - Called when a step is about to end the turn on suggest_followups. Returns undefined when the to-do list gives no reason to keep going. - The newest list older than the most recent nudge: what the model had when it was last told to continue.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Constants newly defined: FOLLOWUP_TODO_NUDGE_TAG = 'FOLLOWUP_TODO_NUDGE' ; MAX_FOLLOWUP_TODO_NUDGES = 3 ; MAX_LISTED_TODOS = 3 ; MAX_TODO_CHARS = 100 (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)
+- Exports added: FOLLOWUP_TODO_NUDGE_TAG, MAX_FOLLOWUP_TODO_NUDGES, FollowupTodoNudgeDecision, decideFollowupTodoNudge, followupTodoNudgeMessage
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "followup cards with unfinished to-dos" ; "continues a turn that stopped mid-list, then ends with cards once the list is done" ; "ends on cards when every to-do is done" ; "lets the model stop after one nudge when it makes no progress" ; "stops nudging after ${MAX_FOLLOWUP_TODO_NUDGES} times in one prompt" ; "ignores a part-done list from an earlier prompt" ; "decideFollowupTodoNudge" ; "nudges when the list written this prompt is part done" ; "uses the newest list in the prompt" ; "nudges again only after the list changed" ; "stops after ${MAX_FOLLOWUP_TODO_NUDGES} nudges in one prompt" ; "followupTodoNudgeMessage" ; "names up to three open items, truncated"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `packages/agent-runtime/src/util/followup-todo-nudge.ts`:
+```
+/**
+ * A turn that ends on suggest_followups while the agent's own to-do list is
+ * half done gets sent back to work.
+ *
+ * suggest_followups does not force another step, so a step whose only tool
+ * call is suggest_followups ends the turn. Models use that to stop mid-plan
+ * with a "Continue with the next step" card, and the user, often on a timed
+ * free session, has to come back and type "continue" (CodebuffAI/freebuff#1434).
+ * The agent's to-do list is the one model-agnostic signal of whether the work
+ * it took on is finished, so the runtime checks it rather than a prompt line
+ * every model reads differently.
+ *
+ * Deliberately narrow, because a wrong nudge spends a step and overrides a
+ * legitimate hand-back:
+ * - Only the list written during the current user prompt counts. A question
+ *   asked after an earlier, abandoned plan never resumes that plan.
+ * - The list must have at least one completed item. A list with none is a plan
+ *   being proposed ("here is how I'd do it, shall I start?"), not execution
+ *   interrupted part-way.
+ * - A repeat nudge needs progress: if the list is unchanged since the last
+ *   nudge, the model has already declined once (blocked, waiting on the user),
+ *   so the turn ends. At most MAX_FOLLOWUP_TODO_NUDGES per user prompt either
+ *   way.
+ */
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index f306386b4..a6686c057 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -21,50 +21,54 @@ import { serializeCacheDebugCorrelation } from '@codebuff/common/util/cache-debu
+ import {
+   dropUnansweredToolCalls,
+   systemMessage,
+   userMessage,
+ } from '@codebuff/common/util/messages'
+ import { type ToolSet } from 'ai'
+ import { cloneDeep, mapValues } from 'lodash'
+ import z from 'zod/v4'
+ 
+ import { evaluateCompactionTrigger } from './compact-history'
+ import type { CompactionTrigger } from './compact-history'
+ import {
+   automaticCompactionIsWorthwhile,
+   COMPACTION_LOW_WATER,
+   compactWithModelOrFallback,
+   compactionTools,
+ } from './model-compaction'
+ import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+ import { getMCPToolData } from './mcp'
+ import {
+   runProjectProfileReport,
+   shouldOfferProjectProfileTool,
+ } from './project-profile'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+ import { isThinkOnlyResponse } from './util/think-tags'
++import {
++  decideFollowupTodoNudge,
++  FOLLOWUP_TODO_NUDGE_TAG,
++} from './util/followup-todo-nudge'
+ import {
+   hasFileEditTool,
+   TODO_LOOP_RECOVERY_TAG,
+   TODO_LOOP_RECOVERY_THRESHOLD,
+   TODO_LOOP_STOP_THRESHOLD,
+   TodoLoopError,
+   todoLoopRecoveryMessage,
+   trailingIdenticalTodoCalls,
+ } from './util/todo-loop'
+ import {
+   clearProgrammaticRunState,
+   runProgrammaticStep,
+ } from './run-programmatic-step'
+ import {
+   additionalSystemPrompts,
+   isCompactCommandPrompt,
+ } from './system-prompt/prompts'
+ import { getAgentTemplate } from './templates/agent-registry'
+ import { buildAgentToolSet } from './templates/prompts'
+ import { getAgentPrompt } from './templates/strings'
+ import { getToolSet } from './tools/prompts'
+ import { processStream } from './tools/stream-parser'
+ import { getAgentOutput } from './util/agent-output'
+ import {
+   createCacheDebugSnapshot,
+@@ -667,50 +671,89 @@ export const runAgentStep = async (
+   )
+ 
+   const isThinkOnly = hasNoToolResults && isThinkOnlyResponse(fullResponse)
+ 
+   const requiresExplicitCompletion =
+     agentTemplate.toolNames.includes('task_completed')
+ 
+   let shouldEndTurn: boolean
+   if (requiresExplicitCompletion) {
+     shouldEndTurn = !hadToolCallError && hasTaskCompleted
+   } else {
+     shouldEndTurn =
+       !hadToolCallError &&
+       (hasTaskCompleted || (hasNoToolResults && !isThinkOnly))
+   }
+ 
++  if (
++    shouldEndTurn &&
++    !hasTaskCompleted &&
++    toolCalls.some((call) => call.toolName === 'suggest_followups')
++  ) {
++    const decision = decideFollowupTodoNudge(agentState.messageHistory)
++    if (decision) {
++      logger.info(
++        {
++          metric: 'followups_with_open_todos',
++          action: decision.action,
++          reason: decision.action === 'end' ? decision.reason : undefined,
++          openTodos: decision.openTodos.length,
++          nudgesSoFar: decision.nudgesSoFar,
++          model: agentTemplate.model,
++          agentId: agentTemplate.id,
++          userId,
++          runId: agentState.runId,
++        },
++        decision.action === 'nudge'
++          ? 'Turn ended on followups with unfinished to-dos; continuing'
++          : 'Turn ended on followups with unfinished to-dos; nudge limit reached',
++      )
++      if (decision.action === 'nudge') {
++        agentState.messageHistory.push(
++          userMessage({
++            content: withSystemTags(decision.message),
++            tags: [FOLLOWUP_TODO_NUDGE_TAG],
++          }),
++        )
++        shouldEndTurn = false
++      }
++    }
++  }
++
+   agentState = {
+     ...agentState,
+     stepsRemaining: agentState.stepsRemaining - 1,
+     agentContext,
+   }
+ 
+   params.traceWriter?.recordStep({
+     agentId: agentState.agentId,
+     agentType: String(agentType),
+     runId: agentState.runId,
+     userInputId,
+     step: iterationNum,
+     system,
+     messages: agentState.messageHistory,
+   })
+ 
+   logger.debug(
+     {
+       iteration: iterationNum,
+       agentId: agentState.agentId,
+       model,
+       prompt,
+       shouldEndTurn,
+       duration: Date.now() - startTime,
+diff --git a/packages/agent-runtime/src/util/followup-todo-nudge.ts b/packages/agent-runtime/src/util/followup-todo-nudge.ts
+new file mode 100644
+index 000000000..dbae2a9ef
+--- /dev/null
++++ b/packages/agent-runtime/src/util/followup-todo-nudge.ts
+@@ -0,0 +1,140 @@
++import { writeTodosParams } from '@codebuff/common/tools/params/tool/write-todos'
++
++import { todoListKey } from './todo-loop'
++
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++
++export const FOLLOWUP_TODO_NUDGE_TAG = 'FOLLOWUP_TODO_NUDGE'
++export const MAX_FOLLOWUP_TODO_NUDGES = 3
++
++const MAX_LISTED_TODOS = 3
++const MAX_TODO_CHARS = 100
++
++export type FollowupTodoNudgeDecision =
++  | {
++      action: 'nudge'
++      openTodos: string[]
++      nudgesSoFar: number
++      message: string
++    }
++  | {
++      action: 'end'
++      reason: 'cap' | 'no_progress'
++      openTodos: string[]
++      nudgesSoFar: number
++    }
++
++type Todo = { task: string; completed: boolean }
++
++export function decideFollowupTodoNudge(
++  messages: Message[],
++): FollowupTodoNudgeDecision | undefined {
++  const completedCalls = new Set<string>()
++  let latest: Todo[] | undefined
++  let latestKey: string | undefined
++  let nudges = 0
++  let keyAtLastNudge: string | undefined
++
++  for (let i = messages.length - 1; i >= 0; i--) {
++    const message = messages[i]!
++    if (message.role === 'user') {
++      if (message.tags?.includes('USER_PROMPT')) break
++      if (message.tags?.includes(FOLLOWUP_TODO_NUDGE_TAG)) nudges++
++      continue
++    }
++    if (message.role === 'tool') {
++      if (message.toolName === 'write_todos') {
++        completedCalls.add(message.toolCallId)
++      }
++      continue
++    }
++    if (message.role !== 'assistant' || !Array.isArray(message.content)) {
++      continue
++    }
++    for (let j = message.content.length - 1; j >= 0; j--) {
++      const part = message.content[j]!
++      if (
++        part.type !== 'tool-call' ||
++        part.toolName !== 'write_todos' ||
++        !completedCalls.has(part.toolCallId)
++      ) {
++        continue
++      }
++      const parsed = writeTodosParams.inputSchema.safeParse(part.input)
++      if (!parsed.success) continue
++      const key = todoListKey(part.input)
++      if (latest === undefined) {
++        latest = parsed.data.todos
++        latestKey = key
++      }
++      if (nudges > 0 && keyAtLastNudge === undefined) keyAtLastNudge = key
++    }
++  }
++
++  if (!latest) return undefined
++  const openTodos = latest.filter((todo) => !todo.completed).map((t) => t.task)
++  if (openTodos.length === 0) return undefined
++  if (!latest.some((todo) => todo.completed)) return undefined
++
++  if (nudges >= MAX_FOLLOWUP_TODO_NUDGES) {
++    return { action: 'end', reason: 'cap', openTodos, nudgesSoFar: nudges }
++  }
++  if (nudges > 0 && keyAtLastNudge === latestKey) {
++    return {
++      action: 'end',
++      reason: 'no_progress',
++      openTodos,
++      nudgesSoFar: nudges,
++    }
++  }
++  return {
++    action: 'nudge',
++    openTodos,
++    nudgesSoFar: nudges,
++    message: followupTodoNudgeMessage(openTodos),
++  }
++}
++
++export function followupTodoNudgeMessage(openTodos: string[]): string {
++  const listed = openTodos
++    .slice(0, MAX_LISTED_TODOS)
++    .map((task) =>
++      task.length > MAX_TODO_CHARS
++        ? `"${task.slice(0, MAX_TODO_CHARS - 1)}…"`
++        : `"${task}"`,
++    )
++  const more =
++    openTodos.length > MAX_LISTED_TODOS
++      ? ` and ${openTodos.length - MAX_LISTED_TODOS} more`
++      : ''
++  const count = `${openTodos.length} unfinished item${openTodos.length === 1 ? '' : 's'}`
++  return `[freebuff product prompt text omitted]${count}[freebuff product prompt text omitted]${listed.join(', ')}${more}[freebuff product prompt text omitted]`
++}
+```
