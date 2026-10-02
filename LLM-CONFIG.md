@@ -4,11 +4,11 @@
 
 | Setting | Value | Where |
 |---|---|---|
-| Provider base | `https://generativelanguage.googleapis.com/v1beta` | repository secret `LLM_API_BASE` (code/workflow literal floor stays `https://vyceai.com/v1`) |
-| Writer model | `gemini-3.6-flash` | repository secret `LLM_MODEL` |
-| Key ring | two Google keys, rotated one per call | repository secrets `LLM_API_KEYS` (comma-separated) and `LLM_API_KEY` (first key, single-key fallback) |
-| Backup route | `deepseek-v4.1` at `https://vyceai.com/v1` | `LLM_BACKUP_*` secrets, used once when the primary route itself fails |
-| Verifier model | `gemini-3.6-flash` | `CHANGELOG_LLM_VERIFY=0` disables the pass in the relay |
+| Provider base | `https://vyceai.com/v1` | repository secret `LLM_API_BASE`; the code/workflow literal is the same value |
+| Writer model | `deepseek-v4.1` | repository secret `LLM_MODEL` |
+| Key ring | supported but unused in CI | `LLM_API_KEYS` (comma-separated, rotated one per call). The Google keys are free tier — **20 requests/day per key** — so they sit on the backup route instead |
+| Backup route | `gemini-3.6-flash` at `https://generativelanguage.googleapis.com/v1beta` | `LLM_BACKUP_*` secrets, used once when the primary route itself fails. Free tier: a rescue for a few calls, not a workload |
+| Verifier model | `deepseek-v4.1` | `CHANGELOG_LLM_VERIFY=0` disables the pass in the relay, retry and regen steps |
 | Rate limit | 40 requests/minute | module cap (`LLM_PROVIDER_RPM`) and workflow default |
 | Streaming | on | `stream: true` on every request; `CHANGELOG_LLM_STREAM=0` disables |
 | Cycle paid window | 300,000 ms | `CHANGELOG_LLM_CYCLE_BUDGET_MS` |
@@ -27,12 +27,17 @@ the provider.
 Every paid run logs the identity it is using, once, with no secret in it:
 
 ```
-LLM provider: write gemini-3.6-flash @ https://generativelanguage.googleapis.com/v1beta, verify gemini-3.6-flash, backup deepseek-v4.1 @ https://vyceai.com/v1
+LLM provider: write deepseek-v4.1 @ https://vyceai.com/v1, verify deepseek-v4.1, backup gemini-3.6-flash @ https://generativelanguage.googleapis.com/v1beta
 ```
 
 With more than one key in `LLM_API_KEYS`, requests rotate through them one per
 call (round-robin) while the rolling 40 requests/minute window stays global:
-more keys share the load, they do not raise the cap.
+more keys share the load, they do not raise the cap. The key-ring code is in
+place for a paid multi-key provider; the Google keys measured here answered
+`429 Quota exceeded ... generate_content_free_tier_requests, limit: 20` — a
+daily allowance, not a per-minute one — so Google cannot be the primary until
+billing is enabled on those keys. VyceAI answered a 40 KB prompt in ~2.1s at
+the same time Google was refusing every call.
 
 ## Why the shape is what it is (measured 2026-10-02, not assumed)
 
