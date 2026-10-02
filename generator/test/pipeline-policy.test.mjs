@@ -137,14 +137,15 @@ test('R6/R19: never-checked history is disclosed quietly, a failed check is not'
   assert.equal(qualityText(legacy), '', 'no [UNVERIFIED] marker for unchecked history')
   assert.equal(entryRecord({ ...legacy, sha: 'a'.repeat(40) }).breaking, undefined, 'no breaking claim is present here')
 
-  // A current-policy row whose check never ran is a real gap.
+  // A current-policy row whose check never ran is not a factual objection: no
+  // check failed, so nothing is printed, while the action stays demoted.
   const admitted = { ai: { policy: QUALITY_POLICY_V, manifest: { policy: QUALITY_POLICY_V }, title: 'New', summary: 'New text.', confidence: 'high', breaking: true } }
   const qa = qualityOf(admitted)
   assert.equal(qa.verify, 'unchecked')
-  assert.equal(qa.uncertain, true)
-  assert.equal(qa.demoteActions, true)
+  assert.equal(qa.uncertain, false, 'a missing verdict prints no objection')
+  assert.equal(qa.demoteActions, true, 'but an unconfirmed action is still demoted')
   assert.equal(qa.confidence, 'medium', 'an unchecked high-confidence row is capped')
-  assert.match(qualityText(admitted), /no current verification/)
+  assert.equal(qualityText(admitted), '', 'and nothing is displayed for it')
 
   // A recorded negative verdict is loud whatever the policy version.
   for (const [status, pattern] of [['flagged', /objected/]]) {

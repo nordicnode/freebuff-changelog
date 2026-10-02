@@ -110,9 +110,10 @@ export function qualityOf (e = {}) {
   // Two levels, deliberately. `warnings` are problems a reader must not skim
   // past: a check ran and did not pass, a name could not be grounded, a value is
   // backwards. `notes` disclose pending automated review or pre-policy text
-  // without portraying a provider outage as an unsupported factual claim. Treating the second as the first put an "unverified" box on
-  // every historical row, which spent the warning on the rows that were fine and
-  // left the ones that actually failed indistinguishable.
+  // without portraying a provider outage as an unsupported factual claim. Neither
+  // covers a missing verdict: `unchecked` text (a deliberately disabled verifier)
+  // prints nothing on the row and stays visible only as the stored status, so the
+  // warning is spent only where a check actually failed.
   const warnings = []
   const notes = []
   // An actionable claim (a migration step, a breaking change) is demoted only
@@ -127,7 +128,6 @@ export function qualityOf (e = {}) {
       notes.push('Automated review is pending; the source diff is available below.')
       if (ai.verifyClaims?.length) warnings.push('Earlier factual objections remain unresolved.')
     }
-    else if (verify === 'unchecked') warnings.push('Technical claims have no current verification.')
     else if (verify === 'pre-policy') notes.push('This summary predates the current verification policy, so it has no fresh fact-check.')
     if (unverifiedNames.length) warnings.push(`Unverified names or numbers: ${unverifiedNames.join(', ')}.`)
     if (valueErrors.length) warnings.push(`Value errors: ${valueErrors.join('; ')}.`)
@@ -144,8 +144,6 @@ export function qualityOf (e = {}) {
     } else if (plainVerify === 'unavailable') {
       notes.push('Automated review of the plain-English explanation is pending.')
       if (plain.verifyClaims?.length) warnings.push('Earlier plain-English factual objections remain unresolved.')
-    } else {
-      warnings.push('The plain-English explanation has no successful current fact-check.')
     }
     for (const c of dedupeClaims(plain.verifyClaims)) warnings.push(`${c.claim}${c.reason ? ` (${c.reason})` : ''}`)
   }
