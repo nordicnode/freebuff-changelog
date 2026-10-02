@@ -19,6 +19,7 @@ import {  enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, l
 import { QUALITY_POLICY_V, generationState, regenUnfinished } from './lib/quality.mjs'
 import { shortHash, eli5Source } from './lib/util.mjs'
 import { spillEntryEvidence, spillEvidence } from './lib/evidence.mjs'
+import { changelogBytes, loadChangelog, saveChangelog } from './lib/changelog-store.mjs'
 import { SIZE_MAX_BYTES, SIZE_WARN_BYTES, findOverBudget, sizeText } from './lib/sizebudget.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
@@ -709,7 +710,7 @@ async function generateOnce (argv) {
     commits = await listCommits(REPO_DIR)
   }
 
-  const existing = await readJson(`${DATA}/changelog.json`, { version: 1, entries: [] })
+  const existing = (await loadChangelog(DATA)) || { version: 1, entries: [] }
   const bySha = new Map(existing.entries.map(e => [e.sha, e]))
   let added = 0, updated = 0
   const newlyAddedEntries = []
@@ -927,13 +928,14 @@ async function realignOrigin (branch) {
 // corpus-wide `repair-entries` run added; the backfill is only as safe as the
 // last writer.
 async function repairDerivedFields (dataDir) {
-  const file = `${dataDir}/changelog.json`
-  const doc = await readJson(file, null)
+  // Through the store: the entries live in day shards now (a legacy monolith
+  // still loads as itself), and only changed shards are rewritten.
+  const doc = await loadChangelog(dataDir)
   if (!doc || !Array.isArray(doc.entries)) return 0
   const diffDir = resolve(dataDir, 'diffs')
   const n = repairEntries(doc.entries, { diffDir }) + refreshDiffFlags(doc.entries, diffDir)
   if (n) {
-    await writeJson(file, doc)
+    await saveChangelog(dataDir, doc)
     log(`[repair] refreshed derived fields on ${n} row(s) before publish`)
   }
   return n
@@ -1193,7 +1195,7 @@ async function syncPhase (argv) {
 
   // 2. Snapshot *after* the sync — generate rewrote changelog.json, so a copy
   //    taken before it would be stale by write time.
-  const existing = await readJson(`${DATA}/changelog.json`, { version: 1, entries: [] })
+  const existing = (await loadChangelog(DATA)) || { version: 1, entries: [] }
 
   // 3. Publish new entries before the slow part. A commit that arrives at
   //    16:20 must be readable by ~16:22, not after this cycle's LLM batch
@@ -1498,7 +1500,7 @@ export async function cmdWatch (argv, { cycle = cmdCatchUp, errorBudget } = {}) 
 // ---------------------------------------------------------------------------
 
 async function cmdBuild () {
-  const changelog = await readJson(`${DATA}/changelog.json`, null)
+  const changelog = await loadChangelog(DATA)
   if (!changelog) throw new Error('data/changelog.json missing: run generate first')
   const aiCache = await readJson(`${DATA}/ai-summaries.json`, {})
   if (Object.keys(aiCache).length) {
@@ -1693,7 +1695,7 @@ export async function cmdOverride (argv = [], { dataDir = DATA } = {}) {
     return { ok: false, error: 'missing_sha' }
   }
 
-  const doc = await readJson(`${dataDir}/changelog.json`, null)
+  const doc = await loadChangelog(dataDir)
   const entry = doc?.entries?.find(e => e.sha.startsWith(want)) || null
   if (!entry) console.error(`warning: no entry matches ${want} in data/changelog.json; writing the override anyway (it will apply when the commit appears)`)
   const key = entry ? entry.sha : want
@@ -1902,7 +1904,7 @@ async function cmdEnrichAll () {
  */
 async function cmdRepairEntries (argv) {
   const { acquired } = await withLock(LOCK, async () => {
-    const doc = await readJson(`${DATA}/changelog.json`, null)
+    const doc = await loadChangelog(DATA)
     if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
     const n = repairEntries(doc.entries, { diffDir: resolve(DATA, 'diffs') })
     if (!n) { log('[repair-entries] every row already carries current derived fields'); return }
@@ -1939,7 +1941,7 @@ async function cmdRetryFailed (argv) {
   if (!wants.length) throw new Error('usage: retry-failed <sha>... [--admit] [--push]')
   if (wants.length > 5) throw new Error(`retry-failed accepts at most 5 rows per run (got ${wants.length}): this is a release, not a backlog`)
   const { acquired } = await withLock(LOCK, async () => {
-    const doc = await readJson(`${DATA}/changelog.json`, null)
+    const doc = await loadChangelog(DATA)
     if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
     const cache = await readJson(`${DATA}/ai-summaries.json`, {})
     const { picked, released, skipped, errors } = releaseFailedRows(doc.entries, cache, wants, { admit })
@@ -2057,7 +2059,7 @@ async function cmdRegenLast (argv) {
   const byCount = wants.length === 1 && /^\d+$/.test(wants[0])
   const CAP = 50
   const { acquired } = await withLock(LOCK, async () => {
-    const doc = await readJson(`${DATA}/changelog.json`, null)
+    const doc = await loadChangelog(DATA)
     if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
     let targets
     if (byCount) {
@@ -2207,7 +2209,7 @@ async function cmdGlossary (argv) {
  */
 async function cmdEval (argv) {
   const { seedGolden, runEval, formatEvalReport } = await import('./lib/eval.mjs')
-  const doc = await readJson(`${DATA}/changelog.json`, null)
+  const doc = await loadChangelog(DATA)
   if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
   const at = argv.indexOf('--seed')
   if (at !== -1) {
@@ -2296,9 +2298,9 @@ async function cmdCompactEvidence (argv) {
   const docPath = `${DATA}/changelog.json`
   const dryRun = argv.includes('--dry-run')
   const cache = await readJson(cachePath, {})
-  const doc = await readJson(docPath, null)
+  const doc = await loadChangelog(DATA)
   const beforeCache = existsSync(cachePath) ? statSync(cachePath).size : 0
-  const beforeDoc = existsSync(docPath) ? statSync(docPath).size : 0
+  const beforeDoc = await changelogBytes(DATA)
   const fromCache = await spillEvidence(DATA, cache, { dryRun })
   const fromEntries = doc ? await spillEntryEvidence(DATA, doc, { dryRun }) : { spilled: 0, bytes: 0 }
   const spilled = fromCache.spilled + fromEntries.spilled
@@ -2318,9 +2320,9 @@ async function cmdCompactEvidence (argv) {
     })
   } else {
     await writeJson(cachePath, cache)
-    if (doc) await writeJson(docPath, doc)
+    if (doc) await saveChangelog(DATA, doc)
   }
-  log(`[compact-evidence] moved ${spilled} bundle(s) (${sizeText(bytes)} of material) to data/evidence/: ai-summaries.json ${sizeText(beforeCache)} -> ${sizeText(statSync(cachePath).size)}, changelog.json ${sizeText(beforeDoc)} -> ${sizeText(statSync(docPath).size)}`)
+  log(`[compact-evidence] moved ${spilled} bundle(s) (${sizeText(bytes)} of material) to data/evidence/: ai-summaries.json ${sizeText(beforeCache)} -> ${sizeText(statSync(cachePath).size)}, changelog ${sizeText(beforeDoc)} -> ${sizeText(await changelogBytes(DATA))}`)
 }
 
 /**
@@ -2353,7 +2355,7 @@ async function cmdCheckSize () {
  */
 async function cmdNormalizeDates (argv) {
   const { acquired } = await withLock(LOCK, async () => {
-    const doc = await readJson(`${DATA}/changelog.json`, null)
+    const doc = await loadChangelog(DATA)
     if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
     let moved = 0
     for (const e of doc.entries) {
@@ -2392,7 +2394,7 @@ export async function cmdBroadcast (argv = [], { fetchImpl = globalThis.fetch, d
     return { ok: false, error: 'missing_webhook' }
   }
 
-  const doc = await readJson(`${dataDir}/changelog.json`, null)
+  const doc = await loadChangelog(dataDir)
   if (!doc?.entries?.length) {
     console.error('Error: changelog.json missing: run generate first.')
     if (IS_MAIN) process.exit(1)

@@ -12,6 +12,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { mergeChangelog, mergeAiCache, mergeSyncState, mergeOpenPrs, capturePendingWrites, persistMerged } from '../lib/mergedata.mjs'
+import { loadChangelog } from '../lib/changelog-store.mjs'
 import { syncReason, syncStaleMs, DEFAULT_SYNC_STALE_MIN } from '../lib/sync.mjs'
 import { withLock, writeJson, shortHash, eli5Source } from '../lib/util.mjs'
 
@@ -150,7 +151,7 @@ test('persistMerged re-reads disk and cannot revert a newer analyze result', asy
   ])
   await persistMerged(await capturePendingWrites(DATA, { [path]: inMemorySnapshot }))
 
-  const result = JSON.parse(await readFile(path, 'utf8'))
+  const result = await loadChangelog(DATA)
   assert.equal(result.headSha, '69030b56b3', 'newer head survived the stale write')
   assert.equal(result.generatedAt, '2026-09-14T14:30:00.000Z')
   assert.deepEqual(result.entries.map(e => e.sha), ['a', 'b'], 'entries from disk survived')
@@ -168,7 +169,9 @@ test('capturePendingWrites + persistMerged are a no-op on an empty data dir', as
   await persistMerged(await capturePendingWrites(DATA, {
     [`${DATA}/changelog.json`]: doc('2026-09-14T14:00:00.000Z', 'h', [entry('a', 'd1')])
   }))
-  assert.ok((await readdir(DATA)).includes('changelog.json'))
+  const files = await readdir(DATA)
+  assert.ok(files.includes('changelog.json'), 'the manifest exists')
+  assert.ok(files.includes('changelog'), 'and the entries live in day shards beside it')
 })
 
 test('syncStaleMs honours env and falls back on garbage', () => {

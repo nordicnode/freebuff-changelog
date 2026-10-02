@@ -4,7 +4,9 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { buildSite, modelTimeline, modelSlug, scoreHit, discordText, renderBadgeSvg, generateReleaseNotesMarkdown, entryCard } from '../lib/site.mjs'
+import { loadChangelog } from '../lib/changelog-store.mjs'
 import { shortHash } from '../lib/util.mjs'
 import { feedItem, jsonItem } from '../lib/feed.mjs'
 import { syncStaleMs } from '../lib/sync.mjs'
@@ -820,7 +822,9 @@ test('buildSite generates valid static site output', async () => {
 // Build from the committed data/ the deployed site is built from, not from
 // dist/, which `npm test` does not produce.
 test('about page stays under its word cap at production size', async (t) => {
-  const changelog = JSON.parse(await readFile(new URL('../../data/changelog.json', import.meta.url), 'utf8'))
+  // Through the store: the committed changelog is a manifest plus day shards
+  // (or a legacy monolith while one is still around).
+  const changelog = await loadChangelog(fileURLToPath(new URL('../../data', import.meta.url)))
   assert.ok(changelog?.entries?.length, 'data/changelog.json is committed and non-empty')
   let prsRaw = []
   try { prsRaw = JSON.parse(await readFile(new URL('../../data/open-prs.json', import.meta.url), 'utf8')) } catch {}

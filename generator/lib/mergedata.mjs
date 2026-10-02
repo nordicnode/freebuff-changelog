@@ -16,10 +16,11 @@ import { dirname } from 'node:path'
 import { readJson, writeJson, shortHash, eli5Source, normalizeDate } from './util.mjs'
 import { pruneStaleCache } from './versions.mjs'
 import { spillEntryEvidence, spillEvidence } from './evidence.mjs'
+import { loadChangelog, saveChangelog, sortEntries } from './changelog-store.mjs'
 
-export function sortEntries (entries) {
-  return entries.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.sha < b.sha ? -1 : 1))
-}
+// The changelog's canonical order lives in the store (it reassembles shards in
+// it); re-exported here because this module published it first.
+export { sortEntries }
 
 // A summary counts only if it carries content; error stubs never do.
 function usableAi (e) {
@@ -277,7 +278,10 @@ export async function capturePendingWrites (DATA, overrides = {}) {
     // Only carry files that exist: a missing ai-summaries.json must not be
     // materialized as {} by an unrelated write, which would make a quiet
     // cycle look like a change worth committing.
-    if (existsSync(path)) onDisk[path] = await readJson(path, null)
+    // changelog.json is a manifest once sharded -- its entries live in
+    // data/changelog/<day>.json, and only the store reassembles them (a legacy
+    // monolith still reads as itself through the same call).
+    if (existsSync(path)) onDisk[path] = name === 'changelog.json' ? await loadChangelog(DATA) : await readJson(path, null)
   }
   return { ...onDisk, ...overrides }
 }
@@ -320,7 +324,6 @@ export function mergeHealth (a = {}, b = {}) {
 }
 
 const MERGERS = {
-  'changelog.json': mergeChangelog,
   'ai-summaries.json': mergeAiCache,
   'state.json': mergeSyncState,
   'open-prs.json': mergeOpenPrs,
@@ -337,15 +340,25 @@ export async function persistMerged (pending) {
   for (const [path, ours] of Object.entries(pending)) {
     if (ours === null || ours === undefined) continue
     const name = path.split('/').pop()
+    // The changelog is a manifest plus one shard per day: re-read the shards,
+    // merge this cycle's entries into them, spill evidence, and write back only
+    // the shards whose bytes changed. A legacy monolith on disk reads through
+    // the same load and migrates on this save.
+    if (name === 'changelog.json') {
+      const dataDir = dirname(path)
+      const merged = mergeChangelog(ours, await loadChangelog(dataDir))
+      await spillEntryEvidence(dataDir, merged)
+      await saveChangelog(dataDir, merged)
+      continue
+    }
     const merger = MERGERS[name]
     const value = merger ? merger(ours, await readJson(path, null)) : ours
     // Evidence material lives in shard files, never in the tracked JSON. A
     // union merge can keep an origin record whose material is still inline, so
-    // every write re-spills before it lands: neither file can walk back to
-    // GitHub's 100 MiB push limit even during the transition. The spill mutates
-    // `value` in place (evidenceBundle -> { hash }).
+    // every write re-spills before it lands: no file can walk back to GitHub's
+    // 100 MiB push limit even during the transition. The spill mutates `value`
+    // in place (evidenceBundle -> { hash }).
     if (name === 'ai-summaries.json') await spillEvidence(dirname(path), value)
-    else if (name === 'changelog.json') await spillEntryEvidence(dirname(path), value)
     await writeJson(path, value)
   }
 }

@@ -17,6 +17,7 @@ import { execFileSync } from 'node:child_process'
 import { commitAndPushData, refreshDiffFlags, cmdWatch, cmdFreshness } from '../cli.mjs'
 import { pruneDiffs } from '../lib/util.mjs'
 import { mergeChangelog } from '../lib/mergedata.mjs'
+import { loadChangelog } from '../lib/changelog-store.mjs'
 
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
 
@@ -28,8 +29,22 @@ const writeDoc = async (dir, obj) => {
   await mkdir(`${dir}/data`, { recursive: true })
   await writeFile(`${dir}/data/changelog.json`, JSON.stringify(obj, null, 2) + '\n')
 }
-const readOriginDoc = (remote, branch = 'main') =>
-  JSON.parse(execFileSync('git', ['show', `${branch}:data/changelog.json`], { cwd: remote, encoding: 'utf8', maxBuffer: 1 << 26 }))
+// The committed changelog is a manifest plus day shards (or a legacy monolith
+// while one is still on disk), and a bare remote has no working tree to load
+// from -- so reassemble it straight out of git objects.
+const readOriginDoc = (remote, branch = 'main') => {
+  const show = path => execFileSync('git', ['show', `${branch}:${path}`], { cwd: remote, encoding: 'utf8', maxBuffer: 1 << 26 })
+  const manifest = JSON.parse(show('data/changelog.json'))
+  if (Array.isArray(manifest.entries)) return manifest
+  const names = execFileSync('git', ['ls-tree', '-r', '--name-only', branch, '--', 'data/changelog/'], { cwd: remote, encoding: 'utf8' })
+    .split('\n').filter(n => n.endsWith('.json')).sort()
+  const entries = []
+  for (const name of names) {
+    const shard = JSON.parse(show(name))
+    if (Array.isArray(shard.entries)) entries.push(...shard.entries)
+  }
+  return { ...manifest, entries }
+}
 
 async function fixture () {
   const base = await mkdtemp(join(tmpdir(), 'fb-push-'))
@@ -95,17 +110,33 @@ test('a late backfill push cannot revert a headSha the analyze pass already push
   assert.equal(git(daemon, 'status', '--porcelain').trim(), '', 'worktree left clean')
 })
 
-test('a quiet cycle with no data change pushes nothing', async () => {
-  const { clone } = await fixture()
+test('a quiet cycle migrates a legacy monolith once, then pushes nothing', async () => {
+  const { remote, clone } = await fixture()
   const daemon = await clone('quiet')
   const disk = JSON.parse(await readFile(`${daemon}/data/changelog.json`, 'utf8'))
-  const pushed = await commitAndPushData({
+  // The seed is a pre-shard monolith: the first cycle publishes the day-shard
+  // layout, which is real data work even though no entry changed.
+  const migrated = await commitAndPushData({
     root: daemon,
     dataDir: `${daemon}/data`,
     message: 'data: LLM backfill',
     overrides: { [`${daemon}/data/changelog.json`]: disk }
   })
-  assert.equal(pushed, false)
+  assert.equal(migrated, true, 'splitting the monolith is a commit')
+  const landed = readOriginDoc(remote)
+  assert.deepEqual(landed.entries.map(e => e.sha), ['a', 'b'], 'no entry was lost in the split')
+  const metaOnly = JSON.parse(execFileSync('git', ['show', 'main:data/changelog.json'], { cwd: remote, encoding: 'utf8' }))
+  assert.ok(!Array.isArray(metaOnly.entries), 'the manifest no longer carries entries')
+  assert.equal(metaOnly.layout, 'day-shards')
+
+  // Disk and origin are both sharded now, so a cycle with nothing new is silent.
+  const quiet = await commitAndPushData({
+    root: daemon,
+    dataDir: `${daemon}/data`,
+    message: 'data: LLM backfill',
+    overrides: { [`${daemon}/data/changelog.json`]: await loadChangelog(`${daemon}/data`) }
+  })
+  assert.equal(quiet, false, 'no change, no commit')
 })
 
 // A cycle whose push exhausted its retries leaves the data committed locally
