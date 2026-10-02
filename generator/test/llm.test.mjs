@@ -8,6 +8,7 @@ beforeEach(() => resetLlmRateLimiterForTests())
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { evidencePath } from '../lib/evidence.mjs'
 
 test('shortError: collapses HTML error pages to status line', () => {
   assert.equal(shortError(new Error('LLM HTTP 522: <!DOCTYPE html>\n<html>...')), 'LLM HTTP 522')
@@ -3067,6 +3068,25 @@ test('ELI5 escalation: a row every rung failed on gets the strong model', async 
     assert.equal(record.model, 'strong-model', 'and the record says which model wrote it')
   } finally {
     globalThis.fetch = orig
+  }
+})
+
+test('entry passes called outside a request scope still store their evidence shard', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'entry-evidence-'))
+  try {
+    const summary = answerWith(() => LADDER_SUMMARY)
+    let ai
+    try { ({ record: ai } = await summarizeEntry({ entry: LADDER_ENTRY, patch: LADDER_PATCH, context: LADDER_CONTEXT, env: LADDER_ENV, dataDir: dir })) } finally { summary.restore() }
+    const eli5 = answerWith(() => 'A cap of three handlers is now in place for the base2 agent.')
+    let plain
+    try { ({ record: plain } = await explainEntry({ entry: LADDER_ENTRY, patch: LADDER_PATCH, context: LADDER_CONTEXT, env: LADDER_ENV, dataDir: dir })) } finally { eli5.restore() }
+    for (const [label, record] of [['the summary pass', ai], ['the plain-English pass', plain]]) {
+      assert.ok(record.evidenceBundle?.hash, `${label} names its evidence hash`)
+      const material = await readFile(evidencePath(dir, record.evidenceBundle.hash), 'utf8')
+      assert.equal(shortHash(material), record.evidenceBundle.hash, `${label} stores the material the hash names, so a re-check can resolve it`)
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true })
   }
 })
 

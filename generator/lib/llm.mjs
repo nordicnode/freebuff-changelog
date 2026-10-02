@@ -3846,7 +3846,11 @@ export function promptContextOf ({ relText = '', sequence = null, prMeta = null,
 // One entry, start to finish: prompt, call, grounding repair, optional
 // verification, and the record both the cache and the entry receive.
 export async function summarizeEntry ({ entry: e, patch, relText = '', sequence = null, prMeta = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env, dataDir = null }) {
-  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv), () => summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env: baseEnv }))
+  // dataDir rides along: without it the recursive call stores a hash-only
+  // evidence bundle (storeEvidence treats a missing dir as a unit call) and
+  // the material is gone forever, which is how new rows accumulated dangling
+  // references while old ones resolved.
+  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv), () => summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env: baseEnv, dataDir }))
   const callsAt = requestScope.getStore().calls
   // Tiered routing: the rows a reader opens go to LLM_MODEL_MAJOR when set.
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
@@ -5543,7 +5547,10 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
 // (may be '' when CHANGELOG_ELI5_DIFF=0); `notesPatch` is what the comments are
 // mined from, which the pass has already paid for either way.
 export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, siblings = [], diffBytes = Infinity, relText = '', prMeta = null, sequence = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env, dataDir = null }) {
-  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv), () => explainEntry({ entry: e, patch, notesPatch, siblings, diffBytes, relText, prMeta, sequence, archMap, glossary, context, env: baseEnv }))
+  // Same as summarizeEntry: the guard must carry dataDir, or the plain-English
+  // pass -- which always calls in from outside a scope -- writes a bundle it
+  // can never resolve.
+  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv), () => explainEntry({ entry: e, patch, notesPatch, siblings, diffBytes, relText, prMeta, sequence, archMap, glossary, context, env: baseEnv, dataDir }))
   const callsAt = requestScope.getStore().calls
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
   // Reuse the technical pass's accepted PR. Never reattach a rejected match.
