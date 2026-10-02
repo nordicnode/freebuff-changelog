@@ -278,7 +278,7 @@ export function truncateWords (s, n) {
 // (/codebuff\.com\/usage/i) needs its backslash -- there it is the code, not an
 // escaping slip -- and a slash after a word character is exactly that shape.
 export function unescapeSlashLeak (s) {
-  return String(s ?? '').replace(/(?<![\w\\])\\(?=[/]\w)/g, '')
+  return String(s ?? '').replace(/(?<![\w\\])\\+\/(?=\w)/g, '/')
 }
 
 // Clean sentence-preserving text truncation: never truncates valid text under maxLen,

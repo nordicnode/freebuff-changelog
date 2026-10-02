@@ -1642,6 +1642,14 @@ test('a JSON-escaped slash leaks no backslash into prose', () => {
   const regex = 'matches CODEBUFF_OWN_CREDITS_ERROR_PATTERN (/codebuff\\.com\\/usage/i)'
   assert.equal(unescapeSlashLeak(regex), regex)
   assert.equal(unescapeSlashLeak('a\\/b stays escaped'), 'a\\/b stays escaped')
+  // The live a1750542 row carried TWO backslashes before its slash command:
+  // the same leak, escaped twice. The whole run before a token-leading slash
+  // goes, spelled out here through char codes so the test cannot double-escape
+  // itself into a green run that proves nothing.
+  const BS = String.fromCharCode(92)
+  assert.equal(unescapeSlashLeak(`press ${BS}${BS}/theme:toggle`), 'press /theme:toggle')
+  assert.equal(unescapeSlashLeak(`a run of four ${BS}${BS}${BS}${BS}/reasoning`), 'a run of four /reasoning')
+  assert.equal(unescapeSlashLeak(`${BS}${BS}/leading token`), '/leading token')
   // A bare trailing escape is not a slash command; leave it alone.
   assert.equal(unescapeSlashLeak('ends with \\/'), 'ends with \\/')
   // Both funnels every published field passes through repair it.
