@@ -955,7 +955,9 @@ function badges (e) {
   const b = []
   const quality = qualityOf(e)
   // Objections are not stamped on the card: they are listed in full in the
-  // entry's own Evidence block and JSON record.
+  // entry's own Evidence block and JSON record. A low self-rating is treated
+  // the same way: `confidence` stays a field in the JSON record and a /stats/
+  // metric, but the model grading its own diff is not a reader-facing badge.
   // The tooltip says what the rule saw (or that the model overrode it), so a
   // weight is a claim a reader can check rather than a colour.
   const why = e.ai?.significance && e.ai.significance !== e.significance
@@ -972,7 +974,6 @@ function badges (e) {
   if (e.modelChanges) b.push(`<a class="badge model" href="/models/"${stop}>[MODEL]</a>`)
   if (isSecurityEntry(e)) b.push('<span class="badge sec" title="Security-relevant: trust gates, credentials, checksums, permissions or sandboxing">[SECURITY]</span>')
   if (e.ai?.breaking && !quality.demoteActions) b.push('<span class="badge brk" title="The technical pass marked this as changing existing behavior, config, an API or a command">[BREAKING]</span>')
-  if (e.ai?.confidence === 'low') b.push('<span class="badge lowc" title="The model rated its own confidence low: the diff is truncated, the consumer of a change is not visible, or the motive is guessed">[LOW CONFIDENCE]</span>')
   if (e.ai?.audience && AUDIENCE_DESC[e.ai.audience]) b.push(`<a class="badge aud" href="/subscribe/#aud-${esc(e.ai.audience)}"${stop} title="Who this change is for: ${esc(AUDIENCE_DESC[e.ai.audience])} · subscribe to this audience">[${esc(e.ai.audience.toUpperCase())}]</a>`)
   if (e.overridden) b.push('<span class="badge human" title="This entry was corrected by a human editor (data/overrides.json)">[EDITED]</span>')
   if (e.version) b.push(`<a class="badge ver" href="/release/${e.version}/"${stop}>[v${e.version}]</a>`)

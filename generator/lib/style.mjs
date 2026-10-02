@@ -3069,7 +3069,6 @@ mark.search-match{
 }
 .unknowns-body code{font-size:.78rem}
 .badge.brk{color:var(--term-red,#f85149);border-color:rgba(248,81,73,.55);font-weight:600}
-.badge.lowc{color:var(--txt-subtle);border-style:dashed}
 .meta-link.report{color:var(--txt-subtle)}
 .reading-mode-plain .schips,.reading-mode-plain .schips-details,.reading-mode-plain .tests-assert,.reading-mode-plain .unknowns,.reading-mode-plain .unknowns-details,.reading-mode-plain .files-details{display:none}
 

@@ -196,7 +196,7 @@ test('R6: overlapping objections collapse and long lists are cut to a readable b
       areas: ['CLI'], modelChanges: null, cmdChanges: null, category: 'CLI', significance: 'minor',
       files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/x.ts'] },
       stats: { additions: 1, deletions: 0 }, facts: [], summary: 'Bump.', title: 'Bump.', day: '2026-09-30', month: '2026-09',
-      ai: { title: 'Bump.', summary: 'Bump.', verify: 'flagged', verifyClaims: Array.from({ length: 6 }, (_, i) => ({ claim: ('objection ' + i + ' ') + 'y'.repeat(300) })) },
+      ai: { title: 'Bump.', summary: 'Bump.', verify: 'flagged', confidence: 'low', verifyClaims: Array.from({ length: 6 }, (_, i) => ({ claim: ('objection ' + i + ' ') + 'y'.repeat(300) })) },
       eli5: { text: 'A plain line.' }
     }]
   }
@@ -205,7 +205,9 @@ test('R6: overlapping objections collapse and long lists are cut to a readable b
   await buildSite({ changelog: doc, openPrs: [], dist })
   const html = await readFile(join(dist, 'day', '2026-09-30', 'index.html'), 'utf8')
   assert.ok(!html.includes('[UNVERIFIED]'), 'no unverified marker is stamped on the card')
-  assert.ok(!html.includes('class="badge lowc"'), 'and the marker badge styling is not used for this row')
+  assert.ok(!html.includes('[LOW CONFIDENCE]'), 'and a low self-rating is not stamped either')
+  assert.ok(!html.includes('class="badge lowc"'), 'with no leftover styling for the removed badge')
+  assert.equal(entryRecord(doc.entries[0]).confidence, 'low', 'but the rating stays in the machine-readable record')
   assert.ok(html.includes('(7 objections)'), 'the Evidence toggle says how many objections sit behind it')
   const body = html.slice(html.indexOf('<div class="evidence-body">'))
   assert.ok(body.includes('y'.repeat(300)), 'every objection is in the Evidence block, in full')
@@ -552,7 +554,7 @@ test('verification: corrupted original evidence cannot authorize a changed-key v
 test('reader disclosure: a pending check is one quiet note, not duplicated objections', () => {
   const e = { ...entry(), files: { added: [], modified: ['a.ts'], removed: [], renamed: [], total: 1 }, stats: { additions: 1, deletions: 1 }, ai: { title: 'Internal limit updated', summary: 'The limit changed.', evidence: 'a.ts', verify: 'unavailable' } }
   const html = entryCard(e)
-  assert.doesNotMatch(html, /verifier check could not run|claims are unverified|class="badge lowc"|objections/)
+  assert.doesNotMatch(html, /verifier check could not run|claims are unverified|\[LOW CONFIDENCE\]|class="badge lowc"|objections/)
   assert.equal((html.match(/Automated review is pending/g) || []).length, 1)
   assert.equal(entryRecord(e).quality.reviewPending, true)
   e.ai.verify = 'flagged'; e.ai.verifyClaims = [{ claim: 'Unsupported limit promise' }]
