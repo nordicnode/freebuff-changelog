@@ -9,6 +9,8 @@
 // Config (env):
 //   CHANGELOG_LLM=1            enable
 //   LLM_API_KEY                bearer key
+//   LLM_API_KEYS               comma-separated bearer keys, rotated one per call
+//                              (each key its own quota; the RPM window stays global)
 //   LLM_API_BASE               default https://vyceai.com/v1 (any OpenAI-compatible
 //                              base works; the default is the project's provider)
 //   LLM_MODEL                  default deepseek-v4.1
@@ -70,7 +72,26 @@ import {
 } from './analyze.mjs'
 
 export function llmConfigured (env = process.env) {
-  return env.CHANGELOG_LLM === '1' && !!env.LLM_API_KEY
+  return env.CHANGELOG_LLM === '1' && !!(env.LLM_API_KEY || env.LLM_API_KEYS)
+}
+
+// Round-robin across bearer keys: one key per call, in order, so several keys
+// (each with its own quota) share the load under the one rolling RPM window
+// that covers the run. LLM_API_KEY stays the single-key form and the fallback.
+let llmKeyCursor = 0
+
+export function resetLlmKeyRotationForTests () { llmKeyCursor = 0 }
+
+export function llmKeysOf (env = process.env) {
+  const listed = String(env.LLM_API_KEYS || '').split(/[,\s]+/).map(s => s.trim()).filter(Boolean)
+  if (listed.length) return listed
+  return env.LLM_API_KEY ? [String(env.LLM_API_KEY).trim()] : []
+}
+
+export function nextLlmKey (env = process.env) {
+  const keys = llmKeysOf(env)
+  if (!keys.length) return ''
+  return keys[llmKeyCursor++ % keys.length]
 }
 
 // ---------------------------------------------------------------------------
@@ -91,7 +112,7 @@ export const DEFAULT_LLM_MODEL = 'deepseek-v4.1'
 // inferred from stored rows after the fact; a run now says it out loud.
 export function llmProviderBanner (env = process.env) {
   if (!llmConfigured(env)) {
-    const why = env.CHANGELOG_LLM === '1' ? 'LLM_API_KEY is not set' : 'CHANGELOG_LLM=1 is not set'
+    const why = env.CHANGELOG_LLM === '1' ? 'no LLM key is set (LLM_API_KEY or LLM_API_KEYS)' : 'CHANGELOG_LLM=1 is not set'
     return `LLM provider: disabled (${why}); deterministic summaries only`
   }
   const base = env.LLM_API_BASE || DEFAULT_LLM_API_BASE
@@ -1781,6 +1802,9 @@ export function backupEnvOf (env = {}) {
     ...env,
     LLM_API_BASE: env.LLM_BACKUP_API_BASE,
     LLM_API_KEY: env.LLM_BACKUP_API_KEY,
+    // The primary's key ring must not leak into the backup route: failover
+    // asks with the backup's own credential and nothing else.
+    LLM_API_KEYS: '',
     LLM_MODEL: env.LLM_BACKUP_MODEL || env.LLM_MODEL,
     LLM_ROUTE: 'backup'
   }
@@ -1899,7 +1923,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        authorization: `Bearer ${env.LLM_API_KEY}`
+        authorization: `Bearer ${nextLlmKey(env)}`
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(Math.max(1, Math.min(timeoutMs, callRoom)))

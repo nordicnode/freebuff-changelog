@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os'
 import {
   enrichWithLlm, cacheKey, callLlm, llmProviderBanner, planLlmPass, rowBudgetMs,
   eli5RowBudgetMs, errorRetryDelayMs, callUnanswered, isRouteFailure, isGatewayError,
-  extractResponseText, resetLlmStreamProbeForTests,
+  extractResponseText, resetLlmStreamProbeForTests, llmConfigured, llmKeysOf, nextLlmKey,
+  resetLlmKeyRotationForTests, backupEnvOf,
   DEFAULT_LLM_API_BASE, DEFAULT_LLM_MODEL, DEFAULT_ROW_BUDGET_MS, PROMPT_V
 } from '../lib/llm.mjs'
 import { summaryPassWindow } from '../cli.mjs'
@@ -28,7 +29,7 @@ const env = (extra = {}) => ({
 })
 const temp = async (t) => { const dir = await mkdtemp(join(tmpdir(), 'fb-budget-')); t.after(() => rm(dir, { recursive: true, force: true })); return dir }
 
-test.beforeEach(() => { resetLlmRateLimiterForTests(); resetLlmStreamProbeForTests() })
+test.beforeEach(() => { resetLlmRateLimiterForTests(); resetLlmStreamProbeForTests(); resetLlmKeyRotationForTests() })
 
 test('provider contract: the defaults are the project provider, and the banner names them without the key', () => {
   assert.equal(DEFAULT_LLM_API_BASE, 'https://vyceai.com/v1')
@@ -217,6 +218,38 @@ test('a gateway error delivered inside a 200 body is a transport failure, not a 
   assert.throws(() => extractResponseText('{"error":{"message":"The request timed out. Please try again.","code":"timeout"}}'), /gateway error in the response body/)
   // A normal body is untouched.
   assert.equal(extractResponseText(JSON.stringify({ choices: [{ message: { content: JSON.stringify(clean) } }] })), JSON.stringify(clean))
+})
+
+test('key ring: LLM_API_KEYS rotates one key per call and the backup route keeps its own', async (t) => {
+  assert.deepEqual(llmKeysOf({ LLM_API_KEYS: ' a , b ,, c ' }), ['a', 'b', 'c'])
+  assert.deepEqual(llmKeysOf({ LLM_API_KEY: 'solo' }), ['solo'])
+  assert.deepEqual(llmKeysOf({}), [])
+  assert.equal(llmConfigured({ CHANGELOG_LLM: '1', LLM_API_KEYS: 'a,b' }), true, 'a ring alone configures the provider')
+
+  const ring = { CHANGELOG_LLM: '1', LLM_API_KEYS: 'k1,k2', LLM_API_KEY: 'k1' }
+  assert.equal(nextLlmKey(ring), 'k1')
+  assert.equal(nextLlmKey(ring), 'k2')
+  assert.equal(nextLlmKey(ring), 'k1', 'the ring wraps')
+  assert.equal(nextLlmKey({ LLM_API_KEY: 'solo' }), 'solo', 'the single-key form is unchanged')
+
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    seen.push(init.headers.authorization)
+    const frames = [
+      'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+      `data: {"choices":[{"delta":{"content":${JSON.stringify(JSON.stringify(clean))}}}]}`,
+      'data: [DONE]'
+    ].join('\n\n')
+    return new Response(frames)
+  })
+  const wire = { ...ring, LLM_API_BASE: 'https://ring.test/v1', CHANGELOG_LLM_RPM: '-1', LLM_DEADLINE_AT: String(Date.now() + 30000) }
+  assert.equal((await callLlm('writer', wire, 1, x => x)).title, 'Alpha gate added')
+  assert.equal((await callLlm('writer', wire, 1, x => x)).title, 'Alpha gate added')
+  assert.deepEqual(seen, ['Bearer k1', 'Bearer k2'], 'calls alternate keys under one RPM window')
+
+  const backup = backupEnvOf({ ...ring, LLM_BACKUP_API_BASE: 'https://backup.test/v1', LLM_BACKUP_API_KEY: 'bk', LLM_BACKUP_MODEL: 'backup-model' })
+  assert.deepEqual(llmKeysOf(backup), ['bk'], 'the failover route carries only its own key')
+  assert.equal(backup.LLM_API_KEYS, '', 'the primary ring does not leak into the backup route')
 })
 
 test('cache identity is unchanged by the budget work: the same row still hashes the same key', () => {
