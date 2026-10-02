@@ -18,7 +18,7 @@ import {
 import {  enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, verifyConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows } from './lib/llm.mjs'
 import { QUALITY_POLICY_V, generationState, regenUnfinished } from './lib/quality.mjs'
 import { shortHash, eli5Source } from './lib/util.mjs'
-import { spillEntryEvidence, spillEvidence } from './lib/evidence.mjs'
+import { EVIDENCE_WIDTH_WARN, evidenceStats, gcEvidence, liveEvidenceHashes, spillEntryEvidence, spillEvidence } from './lib/evidence.mjs'
 import { changelogBytes, loadChangelog, saveChangelog } from './lib/changelog-store.mjs'
 import { SIZE_MAX_BYTES, SIZE_WARN_BYTES, findOverBudget, sizeText } from './lib/sizebudget.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
@@ -1364,6 +1364,15 @@ async function catchUpOnce (argv, budgets = {}) {
   // must not discard completed forward-only work.
   await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: { ...existing, entries } }))
 
+  // Evidence hygiene before the publish: persistMerged above just wrote every
+  // cache record and entry copy that can name a shard, so anything the store
+  // no longer references is a true orphan, and a legacy flat shard moves to
+  // its fan-out directory in the same commit. Deliberately under this cycle's
+  // lock (cmdCatchUp): a shard is written moments before the record naming it
+  // is persisted, and only the lock keeps that window from looking like
+  // garbage.
+  await gcEvidenceNow()
+
   // 4. Publish again, this time with the summaries in. Still unconditional on
   //    --push rather than gated on didSummarize: an upstream-only move is
   //    exactly the case that was stalling, and leftover uncommitted diffs would
@@ -1859,6 +1868,7 @@ if (IS_MAIN) {
   else if (cmd === 'regen-last') await cmdRegenLast(rest)
   else if (cmd === 'prune-cache') await cmdPruneCache(rest)
   else if (cmd === 'compact-evidence') await cmdCompactEvidence(rest)
+  else if (cmd === 'gc-evidence') await cmdGcEvidence(rest)
   else if (cmd === 'glossary') await cmdGlossary(rest)
   else if (cmd === 'eval') await cmdEval(rest)
   else if (cmd === 'normalize-dates') await cmdNormalizeDates(rest)
@@ -1880,6 +1890,7 @@ if (IS_MAIN) {
   node generator/cli.mjs regen-last <N | sha...> [--push]  # regenerate the newest N (max 50) or named rows: fresh summaries, bounded and forward-only
   node generator/cli.mjs prune-cache [--push]      # drop ai-summaries.json keys from retired prompt versions
   node generator/cli.mjs compact-evidence [--push] [--dry-run]  # move stored evidence material into data/evidence/ shards so the tracked JSON files stay small
+  node generator/cli.mjs gc-evidence [--push] [--dry-run]  # delete evidence shards no stored record references and fan flat shards out by hash prefix
   node generator/cli.mjs check-size              # CI gate: fail when a tracked file nears GitHub's 100 MiB push limit
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
   node generator/cli.mjs eval [--seed N] [--limit N]  # offline stored-artifact audit, zero provider calls
@@ -2326,6 +2337,75 @@ async function cmdCompactEvidence (argv) {
 }
 
 /**
+ * The relay's evidence hygiene, run inside catchUpOnce after every write. The
+ * live set is read back from disk on purpose: the in-memory changelog `ours`
+ * snapshot can be older than the merged one persistMerged just wrote, and a
+ * live set built from it would mark origin's newest shards as orphans.
+ */
+async function gcEvidenceNow () {
+  const cache = await readJson(`${DATA}/ai-summaries.json`, {})
+  const doc = await loadChangelog(DATA)
+  // Stand down, never guess: the changelog's entry copies can name shards the
+  // cache does not, so a live set built without it could delete evidence a
+  // record still points at. A cycle that cannot read its own changelog has
+  // bigger problems than directory width, and must still publish what it has.
+  if (!doc) {
+    log('[gc-evidence] skipped: data/changelog.json is unreadable, so the live set would be incomplete')
+    return { scanned: 0, kept: 0, orphans: 0, orphanBytes: 0, duplicates: 0, duplicateBytes: 0, moved: 0, movedBytes: 0, unrecognized: 0 }
+  }
+  // Hygiene is maintenance; a filesystem surprise in it must never cost the
+  // cycle its publish. Log and carry on -- the next cycle retries.
+  try {
+    const acc = await gcEvidence(DATA, liveEvidenceHashes(cache, doc))
+    if (acc.orphans || acc.duplicates || acc.moved) {
+      log(`[gc-evidence] removed ${acc.orphans} orphan shard(s) (${sizeText(acc.orphanBytes)})` +
+        `${acc.duplicates ? `, dropped ${acc.duplicates} duplicate(s) (${sizeText(acc.duplicateBytes)})` : ''}` +
+        `${acc.moved ? `, moved ${acc.moved} flat shard(s) into prefix dirs (${sizeText(acc.movedBytes)})` : ''}` +
+        `; ${acc.kept} live shard(s) kept`)
+    }
+    return acc
+  } catch (err) {
+    log(`[gc-evidence] skipped this cycle: ${err.message}`)
+    return { scanned: 0, kept: 0, orphans: 0, orphanBytes: 0, duplicates: 0, duplicateBytes: 0, moved: 0, movedBytes: 0, unrecognized: 0 }
+  }
+}
+
+/**
+ * Collect the evidence store by hand: the same walk the relay runs after
+ * every cycle (see gcEvidenceNow), with a report and --dry-run. --push must
+ * run where the relay runs: a stale local checkout computes a live set that
+ * predates origin, and publishing it would delete evidence the current
+ * records name.
+ */
+async function cmdGcEvidence (argv) {
+  const dryRun = argv.includes('--dry-run')
+  const { acquired, result: acc } = await withLock(LOCK, async () => {
+    const cache = await readJson(`${DATA}/ai-summaries.json`, {})
+    const doc = await loadChangelog(DATA)
+    // Never collect against a partial live set: the changelog's entry copies
+    // can name shards the cache does not.
+    if (!doc) throw new Error('gc-evidence needs data/changelog.json: its ai/eli5 copies name evidence shards the cache alone does not')
+    const stats = await gcEvidence(DATA, liveEvidenceHashes(cache, doc), { dryRun })
+    if (!dryRun && (stats.orphans || stats.duplicates || stats.moved) && argv.includes('--push')) {
+      await commitAndPushData({ message: `data: collect ${stats.orphans + stats.duplicates} unreferenced evidence shard(s) (${utcStamp()} UTC)` })
+    }
+    return stats
+  })
+  if (!acquired) {
+    log('another generate/backfill run holds the worktree lock: skipping evidence GC')
+    return
+  }
+  log(`[gc-evidence] ${acc.scanned} shard(s): ${acc.kept} kept, ${acc.orphans} orphan(s) removed (${sizeText(acc.orphanBytes)})` +
+    `${acc.duplicates ? `, ${acc.duplicates} duplicate(s) removed (${sizeText(acc.duplicateBytes)})` : ''}` +
+    `${acc.moved ? `, ${acc.moved} flat shard(s) moved into prefix dirs (${sizeText(acc.movedBytes)})` : ''}` +
+    `${acc.unrecognized ? `; ${acc.unrecognized} unrecognized file(s) left alone` : ''}`)
+  if (!acc.orphans && !acc.duplicates && !acc.moved) return
+  if (dryRun) log('[gc-evidence] dry run: nothing changed')
+  else if (argv.includes('--push')) log('[gc-evidence] collected changes pushed with the shared race handling')
+  else log('[gc-evidence] data written locally, not committed (pass --push)')
+}
+
+/**
  * The CI half of the size budget: the same check as the relay's pre-push
  * guard, visible in generator-check so a growing file fails a run long before
  * GitHub would reject a push.
@@ -2335,6 +2415,12 @@ async function cmdCheckSize () {
   const { over, near } = findOverBudget(files)
   for (const f of near) log(`[check-size] WARNING ${relative(ROOT, f.path)} is ${sizeText(f.bytes)} (warn at ${sizeText(SIZE_WARN_BYTES)})`)
   for (const f of over) log(`[check-size] FAIL ${relative(ROOT, f.path)} is ${sizeText(f.bytes)} (budget ${sizeText(SIZE_MAX_BYTES)})`)
+  const evidence = await evidenceStats(DATA)
+  log(`[check-size] evidence store: ${evidence.files} shard(s), widest directory ${evidence.widest} (${evidence.dirs} prefix dir(s))` +
+    `${evidence.flat ? `, ${evidence.flat} legacy flat shard(s) awaiting migration` : ''}`)
+  if (evidence.widest > EVIDENCE_WIDTH_WARN) {
+    log(`[check-size] WARNING evidence directory width ${evidence.widest} exceeds the ${EVIDENCE_WIDTH_WARN}-shard guidance; the hash fan-out is not keeping up`)
+  }
   const largest = [...files].sort((a, b) => b.bytes - a.bytes)[0]
   if (!over.length) {
     log(`[check-size] ${files.length} tracked files under data/: largest is ${largest ? `${relative(ROOT, largest.path)} at ${sizeText(largest.bytes)}` : 'none'}`)
