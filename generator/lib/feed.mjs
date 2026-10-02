@@ -1,6 +1,6 @@
 // generator/lib/feed.mjs - RSS feeds (XML render + XSL stylesheet), favicons.
 // Pure render helpers; buildSite() in site.mjs passes entries and writes output.
-import { qualityOf, qualityText } from './quality.mjs'
+import { qualityOf } from './quality.mjs'
 import { deflateSync } from 'node:zlib'
 import { escapeHtml as esc } from './util.mjs'
 
@@ -296,7 +296,7 @@ export function feedItem (siteUrl, e, titleOf, storyNotes = []) {
   // - Includes plain-English summary as a Discord-friendly blockquote when present.
   // - Full technical summary without harsh 300-char truncation.
   // - Clean bulleted highlights for quick scanning.
-  const descParts = [qualityText(e), ...storyNotes.map(n => `> **Related access context**\n> ${n.text}`)].filter(Boolean)
+  const descParts = [...storyNotes.map(n => `> **Related access context**\n> ${n.text}`)].filter(Boolean)
   if (eli5) descParts.push(`> **In plain English**\n> ${eli5}`)
   if (summary) descParts.push(summary)
   if (e.facts?.length) {
@@ -318,7 +318,6 @@ export function feedItem (siteUrl, e, titleOf, storyNotes = []) {
       + `</ul>`
     : ''
   const content = [
-    qualityText(e) ? `<p><b>${esc(qualityText(e))}</b></p>` : '',
     ...storyNotes.map(n => `<p><b>Related access context:</b> ${esc(n.text)} <a href="${siteUrl}/day/${n.day}/#${n.anchor}">Related entry</a></p>`),
     eli5 ? `<blockquote><p><b>In plain English:</b> ${esc(eli5)}</p></blockquote>` : '',
     summary ? `<p>${esc(summary)}</p>` : '',
@@ -399,7 +398,6 @@ export function jsonItem (siteUrl, e, titleOf, storyNotes = []) {
   const eli5 = e.eli5?.text ? String(e.eli5.text).replace(/[*`#]/g, '').trim() : ''
   const facts = (e.facts || []).slice(0, 5).map(f => `<li>${esc(String(f)).slice(0, 400)}</li>`).join('')
   const html = [
-    qualityText(e) ? `<p><b>${esc(qualityText(e))}</b></p>` : '',
     ...storyNotes.map(n => `<p><b>Related access context:</b> ${esc(n.text)} <a href="${siteUrl}/day/${n.day}/#${n.anchor}">Related entry</a></p>`),
     eli5 ? `<blockquote><p><b>In plain English:</b> ${esc(eli5)}</p></blockquote>` : '',
     summary ? `<p>${esc(summary)}</p>` : '',
@@ -412,7 +410,6 @@ export function jsonItem (siteUrl, e, titleOf, storyNotes = []) {
     url: `${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}`,
     title: `[${e.day}] ${title}`,
     summary: [
-      qualityText(e),
       ...storyNotes.map(n => `[Related access context] ${n.text}`),
       eli5 ? `[In plain English] ${eli5} · ${summary}` : summary
     ].filter(Boolean).join(' · '),

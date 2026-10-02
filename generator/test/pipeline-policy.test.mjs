@@ -108,15 +108,17 @@ test('verifier off: a fresh plain-English line carries no verdict, and no check 
   assert.equal(qualityOf({ eli5: record }).plainVerify, 'unchecked')
 })
 
-test('R6: exact-text stale verdicts and numeric objections survive exports', () => {
+test('R6: exact-text stale verdicts and numeric objections stay in provenance, not exports', () => {
   const ai = { policy: QUALITY_POLICY_V, title: 'Title', summary: 'Before.', confidence: 'high', verify: 'passed' }
   ai.verifyHash = artifactHash(ai)
   ai.summary = 'After.'
   const e = { ...entry(), ai, eli5: { text: 'Unchecked promise.', verify: 'flagged', verifyClaims: [{ claim: 'Unlimited access' }] } }
   assert.equal(qualityOf(e).verify, 'stale')
   assert.equal(entryRecord(e).confidence, 'medium')
-  assert.ok(discordText(e).includes('[UNVERIFIED]'))
-  assert.ok(generateReleaseNotesMarkdown({ version: '1.0.1' }, [e]).includes('[UNVERIFIED]'))
+  assert.ok(!discordText(e).includes('[UNVERIFIED]'), 'no marker travels in Discord copy')
+  assert.doesNotMatch(discordText(e), /objected|not current|no current verification/, 'and objections are not pasted into the announcement')
+  assert.ok(!generateReleaseNotesMarkdown({ version: '1.0.1' }, [e]).includes('[UNVERIFIED]'), 'release notes carry no marker')
+  assert.equal(entryRecord(e).quality.uncertain, true, 'the JSON record still carries the unresolved objection')
   ai.ungrounded = ['999']; ai.valueErrors = ['LIMIT is reversed']; ai.verifyClaims = [{ claim: 'Exact objection' }]
   assert.match(qualityText(e), /999.*LIMIT.*Exact objection/)
 })
@@ -201,9 +203,9 @@ test('R6: overlapping objections collapse and long lists are cut to a readable b
   t.after(() => rm(dist, { recursive: true, force: true }))
   await buildSite({ changelog: doc, openPrs: [], dist })
   const html = await readFile(join(dist, 'day', '2026-09-30', 'index.html'), 'utf8')
-  assert.ok(!html.includes('Unverified claims'), 'objections are not printed above the fold')
-  assert.ok(html.includes('class="badge lowc"'), 'the badge still signals the entry to a reader')
-  assert.ok(html.includes('(7 objections)'), 'and the Evidence toggle says how many are behind it')
+  assert.ok(!html.includes('[UNVERIFIED]'), 'no unverified marker is stamped on the card')
+  assert.ok(!html.includes('class="badge lowc"'), 'and the marker badge styling is not used for this row')
+  assert.ok(html.includes('(7 objections)'), 'the Evidence toggle says how many objections sit behind it')
   const body = html.slice(html.indexOf('<div class="evidence-body">'))
   assert.ok(body.includes('y'.repeat(300)), 'every objection is in the Evidence block, in full')
   assert.ok(body.includes('objection 5'), 'including the ones the card used to leave out')

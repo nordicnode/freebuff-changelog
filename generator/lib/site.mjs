@@ -954,9 +954,8 @@ function renderDiff(container, text, label, ghUrl, mode) {
 function badges (e) {
   const b = []
   const quality = qualityOf(e)
-  // The tooltip summarizes: an objection list can run to a thousand characters,
-  // and a tooltip that long is a wall nobody reads. Full text is below.
-  if (quality.uncertain) b.push(`<span class="badge lowc" title="${esc(qualityText(e, { max: 260 }))}">[UNVERIFIED]</span>`)
+  // Objections are not stamped on the card: they are listed in full in the
+  // entry's own Evidence block and JSON record.
   // The tooltip says what the rule saw (or that the model overrode it), so a
   // weight is a claim a reader can check rather than a colour.
   const why = e.ai?.significance && e.ai.significance !== e.significance
@@ -1284,7 +1283,7 @@ function migrationHtml (e) {
   // ACTION label they shipped with: we never checked them, so calling them
   // unverified would be a new claim about old text, not a finding.
   const trusted = !qualityOf(e).demoteActions
-  return `<p class="migration"><span class="migration-lbl">${trusted ? 'ACTION' : 'UNVERIFIED ACTION, DO NOT RELY ON THIS'}</span>${esc(a.migration)}</p>`
+  return `<p class="migration"><span class="migration-lbl">${trusted ? 'ACTION' : 'ACTION (NOT CONFIRMED BY REVIEW, DO NOT RELY ON THIS)'}</span>${esc(a.migration)}</p>`
 }
 
 // What the diff does not show (unshown callers, backend implementations, blind spots).
@@ -1609,8 +1608,6 @@ export function discordText (e, opts = {}) {
   const plain = String(e.eli5?.text || e.ai?.summary || e.summary || '').replace(/\s+/g, ' ').trim()
 
   const parts = [`### ${dcEsc(title)}\n${dateStr}`]
-  const warning = qualityText(e)
-  if (warning) parts.push(dcEsc(clipText(warning, 900)))
   if (opts.storyNotes?.length) {
     parts.push(`> **Related access context**\n> ${opts.storyNotes.map(n => dcEsc(clipText(n.text, 600))).join('\n> ')}`)
   }
@@ -1756,7 +1753,7 @@ export function generateReleaseNotesMarkdown (rel, commits = []) {
     const title = e.ai?.title || e.title || deriveTitleSafe(e)
     const commitUrl = `https://github.com/CodebuffAI/freebuff/commit/${e.sha}`
     const commitLink = `[\`${e.sha.slice(0, 7)}\`](${commitUrl})`
-    const bullet = `- **${title}** ${commitLink}${qualityText(e) ? `\n  ${qualityText(e)}` : ''}`
+    const bullet = `- **${title}** ${commitLink}`
 
     if (e.significance === 'major' || e.category === 'Feature') {
       features.push(bullet)
@@ -3987,7 +3984,7 @@ const loadIndex = async () => {
       <p>The summaries are model output, and the goal is to make them traceable, not to claim they are perfect. What the model gets is bounded and checkable: the clean source diff with lockfiles and pure test hunks stripped (beyond the reserved 270k-token prompt budget it is split into file/hunk drafts and fused; partial evidence is disclosed), the computed facts above, the developers' own code comments, and, when a PR can be matched by touched files and passes a relevance check, its description and review discussion. Rows whose only changes are tests, mocks, or docs are detected mechanically and given a fixed plain-English line with no API call.</p>
       <p>Every identifier a summary uses (backticked names, <code>CONSTANT_CASE</code> settings, camelCase and PascalCase names, versions, <code>--flags</code>, numbers) is checked against the diff and corpus as a whole word, so a truncated prefix fails too. A name that cannot be found gets one repair pass and, if still missing, is recorded as ungrounded and shown as unverified; such a row also cannot rate confidence high. Value direction is checked without a model: a constant that moved A to B but is written B to A is caught deterministically. Newly admitted entries get a claim-by-claim verifier fact-check with quotes and reasons. Names from a same-day sibling commit's title must be attributed explicitly; one commit may not borrow another's work. Unsupported claims trigger one rewrite, a row that still fails is stored with a visible <code>flagged</code> label rather than hidden, breaking or migration claims get one independent second read and are demoted to unknowns when it does not confirm them, and a row still shipping ungrounded names, backwards values or flagged claims gets one rewrite on the stronger model, kept only when it is strictly cleaner. Each summary cites the diff it came from, new summaries are cached by commit SHA, diff content, delivered context, model and policy identity, and every card links to the commit, compare view and inline diff.</p>
 
-      <p><strong>Quality coverage is not text coverage.</strong> Older summaries are retained without paid backfill and were never checked under the current policy, so they say that in their own Evidence block rather than carrying an unverified marker, which is reserved for text where a check ran and did not pass. New verification binds to the exact text; unavailable reviewers do not clear objections. Unverified warnings sit beside the lead and travel with exports. The models and the fixed 270,000-token context contract are unchanged. A same-family check is not a human audit; unknown motives stay unknown rather than being invented.</p>
+      <p><strong>Quality coverage is not text coverage.</strong> Older summaries are retained without paid backfill and were never checked under the current policy, so they say that in their own Evidence block. Objections and stored verdicts live in that block and in each entry's JSON record; they are not stamped onto cards or travel with exports. New verification binds to the exact text; unavailable reviewers do not clear objections. The models and the fixed 270,000-token context contract are unchanged. A same-family check is not a human audit; unknown motives stay unknown rather than being invented.</p>
 
       <h4>USER-FACING HIGHLIGHTS</h4>
       <p>Every entry opens with its ELI5 plain-English takeaway, fixed in shape: what changed, who it affects, what you notice day to day, no jargon. The technical explanation, holding the full summary, sits collapsed beneath it, then chips of the structured facts computed from the diff (constant old to new values, new env vars, flags, exports, new test titles), an Evidence section citing the diff lines behind the summary's names, and a collapsed note for what the diff cannot show. Version bumps roll up everything that shipped in their release window instead of reporting a bare label change; a row whose own summary carries unverified names is left out of the window entirely, and unchecked, review-flagged and value-error prose is omitted rather than reused as fact. The <code>/week/</code> pages digest each week into releases, catalog moves, and the heaviest work; cards name the first release that shipped each commit; same-day, same-topic commits are clustered into development narratives.</p>
@@ -4062,7 +4059,7 @@ const loadIndex = async () => {
       </div>
 
       <h4>LIMITS &amp; FRESHNESS</h4>
-      <p>Snapshots squash history, so intra-snapshot ordering is approximate. Summaries and plain-English lines are AI-generated: the passes above reduce errors but do not eliminate them, so grounded identifiers are the parts to lean on and the prose is a guide. Where a row is unverified or was rewritten, the card says so. Upstream is polled every 30s by a continuous relay; the site is rebuilt and redeployed on each data update, with a scheduled deploy as a backstop. Found a wrong row? <code>npm run override &lt;sha&gt;</code> drafts a human override for it, and overridden rows are marked edited.</p>
+      <p>Snapshots squash history, so intra-snapshot ordering is approximate. Summaries and plain-English lines are AI-generated: the passes above reduce errors but do not eliminate them, so grounded identifiers are the parts to lean on and the prose is a guide. Where a row was rewritten or a check recorded an objection, the entry's Evidence block says so. Upstream is polled every 30s by a continuous relay; the site is rebuilt and redeployed on each data update, with a scheduled deploy as a backstop. Found a wrong row? <code>npm run override &lt;sha&gt;</code> drafts a human override for it, and overridden rows are marked edited.</p>
     </div>
   </div>
 </section>`

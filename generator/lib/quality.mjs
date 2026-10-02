@@ -173,16 +173,16 @@ export function qualityOf (e = {}) {
   }
 }
 
-// The loud form: a marker that means "a check did not pass". Pre-policy text
-// carries no marker, because nothing about it failed. Long objection lists are
-// cut to a character budget for the surfaces that have to stay scannable (the
-// badge tooltip, an RSS description, a Discord message); `qualityOf().warnings`
-// and the entry's own Evidence block keep every objection in full.
+// The objection text, unmarked. Nothing stamps "[UNVERIFIED]" onto a row: a
+// stored objection is listed in the entry's own Evidence block and JSON record,
+// which is where a reader asks for provenance. Long lists are still cut to a
+// character budget for the compact callers (the PR-preview note, the story
+// index); `qualityOf().warnings` and the Evidence block keep every one in full.
 export function qualityText (e, { max = 600 } = {}) {
   const q = qualityOf(e)
   if (!q.uncertain) return ''
   const joined = q.warnings.join(' ')
-  if (joined.length <= max) return `[UNVERIFIED] ${joined}`
+  if (joined.length <= max) return joined
   const kept = []
   let used = 0
   for (const w of q.warnings) {
@@ -191,7 +191,7 @@ export function qualityText (e, { max = 600 } = {}) {
     used += w.length + 1
   }
   const more = q.warnings.length - kept.length
-  return `[UNVERIFIED] ${kept.join(' ')}${more > 0 ? ` (+${more} more objection${more === 1 ? '' : 's'} on this entry)` : ''}`
+  return `${kept.join(' ')}${more > 0 ? ` (+${more} more objection${more === 1 ? '' : 's'} on this entry)` : ''}`
 }
 
 // The quiet form: history disclosure without an alarm. Used where a reader has

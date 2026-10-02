@@ -5,7 +5,7 @@
 // heaviest changes, in that order; the quality panel is the set of numbers the
 // prompt work is judged by (prompt-version coverage, unverified names,
 // marketing hits, audience split), so a regression shows up on the next deploy.
-import { qualityOf, qualityText } from './quality.mjs'
+import { qualityOf } from './quality.mjs'
 import { escapeHtml as esc } from './util.mjs'
 import { PROMPT_V, ELI5_V, ELI5_HYPE_ROLLUP_RE, WHY_RE, AUDIENCES, isSecurityEntry } from './llm.mjs'
 
@@ -87,7 +87,7 @@ export function weeklyHeadline (w) {
 
 // Plain-text digest for feeds and Discord: sections with one line per entry.
 export function weeklyText (w, siteUrl = '') {
-  const line = (e) => `- ${(e.day || '').slice(5)} ${titleOf(e)}${qualityOf(e).uncertain ? ' [UNVERIFIED]' : ''}${siteUrl ? ` (${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)})` : ''}`
+  const line = (e) => `- ${(e.day || '').slice(5)} ${titleOf(e)}${siteUrl ? ` (${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)})` : ''}`
   const out = [weeklyHeadline(w) + '.']
   if (w.releases.length) out.push('', 'Releases:', ...w.releases.map(line))
   if (w.models.length) {
@@ -104,7 +104,7 @@ export function weeklyText (w, siteUrl = '') {
 export function weeklyFeedItem (siteUrl, w) {
   const url = `${siteUrl}/week/${w.key}/`
   const sections = []
-  const li = (e) => `<li><a href="${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}">${esc(e.day)}</a> ${esc(titleOf(e))}${e.eli5?.text ? `<br><small>${esc(e.eli5.text)}</small>` : ''}${qualityText(e) ? `<br><small>${esc(qualityText(e))}</small>` : ''}</li>`
+  const li = (e) => `<li><a href="${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}">${esc(e.day)}</a> ${esc(titleOf(e))}${e.eli5?.text ? `<br><small>${esc(e.eli5.text)}</small>` : ''}</li>`
   if (w.releases.length) sections.push(`<p><b>Releases</b></p><ul>${w.releases.map(li).join('')}</ul>`)
   if (w.models.length) sections.push(`<p><b>Model catalog</b></p><ul>${w.models.map(li).join('')}</ul>`)
   if (w.top.length) sections.push(`<p><b>Notable work</b></p><ul>${w.top.map(li).join('')}</ul>`)
