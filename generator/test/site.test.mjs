@@ -1124,6 +1124,46 @@ test('a churn-only day explains itself instead of showing an empty timeline', as
   }
 })
 
+test('a settled day shows its stored roll-up above the entries, escaped, and only when one exists', async () => {
+  const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-rollup-'))
+  try {
+    const row = (sha, date, ai) => ({
+      kind: 'sync', sha, url: `https://github.com/CodebuffAI/freebuff/commit/${sha}`,
+      date, day: date.slice(0, 10), month: date.slice(0, 7),
+      areas: ['Desktop'], category: 'Desktop', significance: 'notable', ai,
+      files: { total: 1, meaningful: 1, added: [], removed: [], modified: ['a.ts'] },
+      stats: { additions: 3, deletions: 1 },
+      title: 'Mechanical title', summary: 'Mechanical summary'
+    })
+    const entries = [
+      row('a'.repeat(40), '2026-09-13T10:00:00Z', { title: 'Picker fix', summary: 'The picker no longer opens behind the sidebar.', significance: 'notable' }),
+      row('b'.repeat(40), '2026-09-14T10:00:00Z', { title: 'Streak fix', summary: 'Streaks reset on the local day.', significance: 'minor' })
+    ]
+    const changelog = {
+      version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-14T12:00:00Z',
+      headSha: 'b'.repeat(40), counts: { entries: entries.length }, entries
+    }
+    await buildSite({
+      changelog, openPrs: [], dist: tmpDist,
+      rollups: { '2026-09-13': { day: '2026-09-13', v: 1, source: 'x', bullets: ['Fixed the project picker opening behind the sidebar.', 'Added <unsafe> & "quoted" text.'] } }
+    })
+
+    const older = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
+    assert.match(older, /class="day-rollup"/, 'the settled day renders the digest box')
+    assert.match(older, /DAY_ROLLUP :: Sep 13, 2026/)
+    assert.match(older, /Fixed the project picker opening behind the sidebar\./)
+    assert.match(older, /2 highlights/)
+    assert.match(older, /Added &lt;unsafe&gt; &amp; &quot;quoted&quot; text\./, 'stored bullets are escaped like every other text')
+
+    // The newest day is still in progress: no stored digest means no box, not
+    // an empty one.
+    const newest = await readFile(join(tmpDist, 'index.html'), 'utf8')
+    assert.doesNotMatch(newest, /class="day-rollup"/)
+  } finally {
+    await rm(tmpDist, { recursive: true, force: true })
+  }
+})
+
 // A release that shipped a month of work owns 1,000+ commits, and rendering every
 // one as a full entry card made /release/1.0.686/ a 2.6 MB page. The newest 40
 // stay full cards; the tail stays *on the page* -- the promise is a complete

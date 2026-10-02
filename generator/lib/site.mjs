@@ -2032,7 +2032,7 @@ const RANGE_JS = `(function () {
 })();
 `
 
-export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, overridesDoc = null, evalResult = null, llmHealth = null }) {
+export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, overridesDoc = null, evalResult = null, llmHealth = null, rollups = {} }) {
   const trafficCount = traffic?.count ?? 0
   const trafficUniques = traffic?.uniques ?? 0
   activeTraffic = { count: trafficCount, uniques: trafficUniques }
@@ -2271,6 +2271,20 @@ ${[
     ${latest ? '' : `<p class="timeline-settled-note">Reconstructed public snapshot commits pushed to CodebuffAI/freebuff on this date.</p>`}
   </div>
 </section>`
+    // The settled day's digest, written by the roll-up pass and read here
+    // as-is. A day still in progress has none: the box is simply absent rather
+    // than showing a partial list that will change by evening.
+    const dayRollup = rollups[day.day]
+    const rollupHtml = dayRollup?.bullets?.length
+      ? `
+<section class="day-rollup" aria-label="Day summary">
+<div class="day-rollup-hdr">
+  <span class="day-rollup-label">DAY_ROLLUP :: ${esc(fmtDateHuman(day.day))}</span>
+  <span class="day-rollup-count">${dayRollup.bullets.length} highlight${dayRollup.bullets.length === 1 ? '' : 's'}</span>
+</div>
+<ul>${dayRollup.bullets.map(b => `<li>${esc(b)}</li>`).join('')}</ul>
+</section>`
+      : ''
 
     // One row starts open: the day's newest *visible* entry. Churn is hidden by
     // default, so the flag passes to the first row a reader can actually see
@@ -2297,7 +2311,7 @@ ${rows.map(e => {
       return entryCard(e, open, relatedIdx, cardOpts(e, { hideChurn: true }))
     }).join('\n')}</section>`
 
-    return hero + dayHtml + pagePager(i)
+    return hero + rollupHtml + dayHtml + pagePager(i)
   }
 
   // Front-page filter. Every row the timeline can show is already in the DOM, so a

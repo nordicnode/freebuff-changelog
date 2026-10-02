@@ -15,11 +15,12 @@ import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
   extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
-import {  enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, verifyConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows } from './lib/llm.mjs'
+import {  enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, verifyConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows, shortError } from './lib/llm.mjs'
 import { QUALITY_POLICY_V, generationState, regenUnfinished } from './lib/quality.mjs'
 import { shortHash, eli5Source } from './lib/util.mjs'
 import { EVIDENCE_WIDTH_WARN, evidenceStats, gcEvidence, liveEvidenceHashes, spillEntryEvidence, spillEvidence } from './lib/evidence.mjs'
 import { changelogBytes, loadChangelog, saveChangelog } from './lib/changelog-store.mjs'
+import { generateRollup, loadRollups, rollupBacklog, rollupFingerprint, ROLLUP_V } from './lib/rollup.mjs'
 import { SIZE_MAX_BYTES, SIZE_WARN_BYTES, findOverBudget, sizeText } from './lib/sizebudget.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
@@ -1360,6 +1361,13 @@ async function catchUpOnce (argv, budgets = {}) {
       if (previews) { await persistMerged({ [`${DATA}/open-prs.json`]: prDoc }); didSummarize = true }
     }
   }
+  // Day roll-ups: a settled day's bullet digest, written the first cycle after
+  // its last row summarizes. Newest first and capped per cycle, so the recent
+  // pages fill before the backlog and these calls cannot crowd out the entry
+  // passes above. A failure is logged and retried next cycle: a missing digest
+  // must not block the push of the day it would have described.
+  didSummarize = didSummarize || (await writeSettledRollups(entries, { endsAt: enrichEndsAt })) > 0
+
   // Checkpoint successes even without a publish; a deadline or push failure
   // must not discard completed forward-only work.
   await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: { ...existing, entries } }))
@@ -1596,7 +1604,10 @@ async function cmdBuild () {
   // The drift ledger (recordLlmHealth writes it every enrich run) feeds the
   // LLM HEALTH card; absent until the first LLM run after it lands.
   const llmHealth = await readJson(`${DATA}/llm-health.json`, null)
-  await buildSite({ changelog, openPrs: prs, prMeta, traffic, dist, mergedPrs: mergedPrsDoc, overridesDoc: overrides, evalResult, llmHealth })
+  // The settled days' bullet digests, keyed by day: their pages render them
+  // above the entries. Absent until the roll-up pass has run once.
+  const rollups = await loadRollups(DATA)
+  await buildSite({ changelog, openPrs: prs, prMeta, traffic, dist, mergedPrs: mergedPrsDoc, overridesDoc: overrides, evalResult, llmHealth, rollups })
 
   // data/diffs is 106 MB of a 352 MB dist. Two opt-in trims: skip the churn
   // rows' lockfile diffs (CHANGELOG_DIST_SKIP_CHURN_DIFFS=1) and/or ship only
@@ -1869,6 +1880,7 @@ if (IS_MAIN) {
   else if (cmd === 'prune-cache') await cmdPruneCache(rest)
   else if (cmd === 'compact-evidence') await cmdCompactEvidence(rest)
   else if (cmd === 'gc-evidence') await cmdGcEvidence(rest)
+  else if (cmd === 'rollups') await cmdRollups(rest)
   else if (cmd === 'glossary') await cmdGlossary(rest)
   else if (cmd === 'eval') await cmdEval(rest)
   else if (cmd === 'normalize-dates') await cmdNormalizeDates(rest)
@@ -1891,6 +1903,7 @@ if (IS_MAIN) {
   node generator/cli.mjs prune-cache [--push]      # drop ai-summaries.json keys from retired prompt versions
   node generator/cli.mjs compact-evidence [--push] [--dry-run]  # move stored evidence material into data/evidence/ shards so the tracked JSON files stay small
   node generator/cli.mjs gc-evidence [--push] [--dry-run]  # delete evidence shards no stored record references and fan flat shards out by hash prefix
+  node generator/cli.mjs rollups [--backfill N] [--day YYYY-MM-DD] [--force] [--push]  # write the settled day's bullet digest shown at the top of its page
   node generator/cli.mjs check-size              # CI gate: fail when a tracked file nears GitHub's 100 MiB push limit
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
   node generator/cli.mjs eval [--seed N] [--limit N]  # offline stored-artifact audit, zero provider calls
@@ -2403,6 +2416,104 @@ async function cmdGcEvidence (argv) {
   if (dryRun) log('[gc-evidence] dry run: nothing changed')
   else if (argv.includes('--push')) log('[gc-evidence] collected changes pushed with the shared race handling')
   else log('[gc-evidence] data written locally, not committed (pass --push)')
+}
+
+// ---------------------------------------------------------------------------
+// Daily roll-ups: a settled day's changes as a short, user-facing bullet
+// digest, rendered at the top of that day's page. Catch-up writes them the
+// first cycle after the day's last row summarizes; the command below is the
+// report and the manual drain (used once to fill the recent window).
+
+async function writeRollupBatch (pending, { endsAt = Infinity, env = process.env } = {}) {
+  let written = 0
+  for (const { day, entries } of pending) {
+    if (Date.now() >= endsAt) break
+    try {
+      const rollup = await generateRollup(day, entries, { dataDir: DATA, env })
+      written++
+      log(`[rollup] ${day}: ${rollup.bullets.length} bullet(s) (${rollup.model || 'unknown model'})`)
+    } catch (err) {
+      log(`[rollup] ${day} failed: ${shortError(err)}`)
+    }
+  }
+  return written
+}
+
+// The in-cycle drain. Capped so a first deploy with a window of pending days
+// cannot turn one cycle into a spend binge; newest first, so today's readers
+// get their pages before the archive fills.
+async function writeSettledRollups (entries, { endsAt = Infinity } = {}) {
+  if (process.env.CHANGELOG_ROLLUP === '0' || !llmConfigured()) return 0
+  if (Date.now() >= endsAt) return 0
+  const limit = Math.max(0, Number(process.env.CHANGELOG_ROLLUP_LIMIT || 2))
+  if (!limit) return 0
+  const pending = rollupBacklog({ entries }, { rollups: await loadRollups(DATA), limit })
+  if (!pending.length) return 0
+  const env = Number.isFinite(endsAt) ? { ...process.env, LLM_DEADLINE_AT: String(endsAt) } : process.env
+  return await writeRollupBatch(pending, { endsAt, env })
+}
+
+/**
+ * Daily roll-ups: a settled day's changes as a short bullet digest, shown above
+ * the day's entries.
+ *   rollups                       list settled days with no current digest
+ *   rollups --backfill [N]        write the N newest pending digests (default 10)
+ *   rollups --day YYYY-MM-DD      write one day, settled or not
+ *   rollups --force               rewrite even when the stored digest is current
+ *   rollups --push                commit and push what was written
+ */
+async function cmdRollups (argv) {
+  const doc = await loadChangelog(DATA)
+  if (!doc?.entries?.length) throw new Error('data/changelog.json missing: run generate first')
+  const force = argv.includes('--force')
+  const dayIdx = argv.indexOf('--day')
+  const { acquired, result } = await withLock(LOCK, async () => {
+    const rollups = await loadRollups(DATA)
+    let pending
+    if (dayIdx !== -1) {
+      const day = argv[dayIdx + 1]
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day || '')) throw new Error('rollups --day needs a YYYY-MM-DD date')
+      const rows = doc.entries.filter(e => !e.noise && (e.day || String(e.date || '').slice(0, 10)) === day)
+      if (!rows.length) throw new Error(`no meaningful entries recorded on ${day}`)
+      const missing = rows.filter(e => !e.ai?.title || !e.ai?.summary).length
+      if (missing) throw new Error(`${day} still has ${missing} unsummarized row(s): wait for the enrichment drain`)
+      if (!force && rollups[day]?.v === ROLLUP_V && rollups[day]?.source === rollupFingerprint(day, rows)) {
+        log(`[rollups] ${day} is already current (${rollups[day].bullets.length} bullet(s)); pass --force to rewrite it`)
+        return { written: 0, pending: 0 }
+      }
+      pending = [{ day, entries: rows }]
+    } else {
+      const backfill = argv.indexOf('--backfill')
+      if (backfill === -1) {
+        pending = rollupBacklog(doc, { rollups })
+        const stale = pending.filter(p => rollups[p.day]).length
+        log(`[rollups] ${Object.keys(rollups).length} stored, ${pending.length} pending (${pending.length - stale} missing, ${stale} stale/older-version)`)
+        for (const p of pending.slice(0, 10)) log(`[rollups]   ${p.day} (${rollups[p.day] ? 'stale' : 'missing'})`)
+        if (pending.length > 10) log(`[rollups]   ... ${pending.length - 10} more`)
+        return { written: 0, pending: pending.length }
+      }
+      const amount = Math.max(1, Number(argv[backfill + 1]) || 10)
+      pending = rollupBacklog(doc, { rollups, limit: amount, force })
+      if (!pending.length) {
+        log('[rollups] every settled, digestible day is current')
+        return { written: 0, pending: 0 }
+      }
+      log(`[rollups] writing ${pending.length} digest(s), newest first${force ? ' (forced rewrite)' : ''}`)
+    }
+    const requested = pending.length
+    const written = await writeRollupBatch(pending)
+    if (written && argv.includes('--push')) {
+      await commitAndPushData({ message: `data: write ${written} day roll-up(s) (${utcStamp()} UTC)` })
+    } else if (written) {
+      log('[rollups] data written locally, not committed (pass --push)')
+    }
+    return { written, pending: requested - written }
+  })
+  if (!acquired) {
+    log('another generate/backfill run holds the worktree lock: skipping roll-ups')
+    return
+  }
+  if (result?.pending) log(`[rollups] ${result.pending} digest(s) still pending`)
 }
 
 /**

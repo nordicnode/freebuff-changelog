@@ -1855,6 +1855,16 @@ export function servedModelOf (requests = [], fallback = '') {
 // `validate` is a parameter because the ELI5 pass speaks to the same gateway
 // with a different shape: the repair retry has to check the replacement against
 // the schema that was asked for, not the summary one.
+// One scoped call from outside the entry pipeline (the daily roll-up). The
+// caller gets the validated answer and the request ledger, so a roll-up records
+// the model that actually served it and its call is budgeted like any row.
+export async function callScopedLlm (prompt, env = process.env, validate = validateLlmOut, opts = {}) {
+  return requestScope.run(newRequestScope(env), async () => {
+    const out = await callLlm(prompt, env, 1, validate, opts)
+    return { out, requests: requestScope.getStore().requests.slice() }
+  })
+}
+
 export async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut, opts = {}) {
   // Repair suffixes and fallback asks share the same provider window ceiling.
   prompt = fitToWindow(prompt)

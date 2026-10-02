@@ -354,6 +354,38 @@ nav.term-nav a.active{
   font-size:.76rem;
   color:var(--txt-subtle);
 }
+/* The settled day's digest: the day's changes in one user-facing bullet list,
+   above the full entries. A list, not prose, so it skims in seconds. */
+.day-rollup{
+  margin:18px 0 6px;
+  padding:10px 14px 12px;
+  border:1px solid var(--term-border);
+  border-left:3px solid var(--term-cyan);
+  background:var(--panel);
+  font-size:.82rem;
+  line-height:1.6;
+  color:var(--txt-dim);
+}
+.day-rollup-hdr{
+  display:flex;
+  align-items:baseline;
+  justify-content:space-between;
+  gap:8px;
+  margin-bottom:4px;
+}
+.day-rollup-label{
+  font-size:.68rem;
+  font-weight:700;
+  letter-spacing:.05em;
+  color:var(--term-cyan);
+}
+.day-rollup-count{
+  font-size:.7rem;
+  color:var(--txt-subtle);
+}
+.day-rollup ul{margin:0;padding-left:18px}
+.day-rollup li{margin:3px 0}
+.reading-mode-plain .day-rollup{display:block !important}
 /* Rows on /changes/<category>/: those pages are complete lists, and Internal
    alone runs to thousands of entries, so a row costs a line of metadata and one
    truncated summary -- the full body stays on the day page it links to. */
