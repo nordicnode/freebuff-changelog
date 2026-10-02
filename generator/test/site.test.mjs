@@ -811,12 +811,14 @@ test('buildSite generates valid static site output', async () => {
 })
 
 // The about page's word cap keeps the page skimmable now that it is the full
-// manual (pipeline, search grammar, API, feeds), so it is set to 1250 with
-// headroom rather than squeezed to the current copy. The cap is only meaningful
-// at the size it is deployed: the body is prose plus counts, and the "Code
-// areas" line grows a word per category that really exists (plus the open-PR
-// row). Build from the committed data/ the deployed site is built from, not
-// from dist/, which `npm test` does not produce.
+// manual (pipeline, models & review, search grammar, API, feeds). It was raised
+// from 1250 to 1500 when the page gained the model-route and
+// verification-disclosure sections: a cap the current copy already touches is a
+// squeeze, not a guard, so it keeps real headroom. The cap is only meaningful at
+// the size it is deployed: the body is prose plus counts, and the "Code areas"
+// line grows a word per category that really exists (plus the open-PR row).
+// Build from the committed data/ the deployed site is built from, not from
+// dist/, which `npm test` does not produce.
 test('about page stays under its word cap at production size', async (t) => {
   const changelog = JSON.parse(await readFile(new URL('../../data/changelog.json', import.meta.url), 'utf8'))
   assert.ok(changelog?.entries?.length, 'data/changelog.json is committed and non-empty')
@@ -835,7 +837,7 @@ test('about page stays under its word cap at production size', async (t) => {
     'the measured body spans the whole about page, not a nested section')
   const aboutWords = aboutBody
     .replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, 'x').replace(/\s+/g, ' ').trim().split(' ').length
-  assert.ok(aboutWords < 1250, `about page is ${aboutWords} words at production size; keep it under 1250`)
+  assert.ok(aboutWords < 1500, `about page is ${aboutWords} words at production size; keep it under 1500`)
   assert.doesNotMatch(aboutBody, /&mdash;|\u2014/, 'about copy carries no em-dashes')
 })
 
