@@ -87,6 +87,27 @@ test('R4: invented plain-English promises receive a semantic objection', async t
   assert.equal(record.verifyHash, undefined)
 })
 
+test('verifier off: a fresh plain-English line carries no verdict, and no check is sent', async t => {
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    calls++
+    const p = JSON.parse(init.body).messages.at(-1).content
+    if (/You are checking/.test(p)) throw new Error('the verifier must not be asked when it is disabled')
+    return response({ eli5: 'The internal limit was raised.' })
+  })
+  const off = { ...env, CHANGELOG_LLM_VERIFY: '0' }
+  const { record } = await explainEntry({ entry: entry(), patch, env: off })
+  assert.equal(calls, 1, 'only the writer was called')
+  // 'unavailable' means a check was attempted and the route failed; a disabled
+  // verifier owes no verdict, and stamping one polluted llm-health and told the
+  // site a review was pending when none was owed.
+  assert.equal(record.verify, undefined)
+  assert.equal(record.verifyModel, undefined)
+  assert.equal(record.verifyPolicy, undefined)
+  assert.equal(record.policy, QUALITY_POLICY_V, 'the record still answers to the current policy')
+  assert.equal(qualityOf({ eli5: record }).plainVerify, 'unchecked')
+})
+
 test('R6: exact-text stale verdicts and numeric objections survive exports', () => {
   const ai = { policy: QUALITY_POLICY_V, title: 'Title', summary: 'Before.', confidence: 'high', verify: 'passed' }
   ai.verifyHash = artifactHash(ai)

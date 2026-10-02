@@ -5614,7 +5614,8 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
   // Technical prose is context, not independent support for a user promise.
   let material = checkedCorpus.split('\n').filter(line => !/^(?:Technical summary:|Title:|- Migration the technical pass|- The technical pass)/.test(line)).join('\n')
   manifest.deliveredHash = shortHash(material)
-  if (verifyConfigured(env)) {
+  const verifyOn = verifyConfigured(env)
+  if (verifyOn) {
     try {
       const verdict = await verifySummary(e, material, { title: e.ai?.title || e.title, text }, env, [], { rollup: !!relText })
       verify = verdict.supported ? 'passed' : 'flagged'
@@ -5637,10 +5638,16 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     policy: QUALITY_POLICY_V,
     manifest,
     evidenceBundle: { material, hash: shortHash(material) },
-    verify,
-    verifyPolicy: VERIFY_POLICY_V,
-    ...(verifyError ? { verifyError } : {}),
-    verifyModel: verifyModelOf(env),
+    // A deliberately disabled verifier leaves NO verdict, exactly like the
+    // summary writer. Stamping 'unavailable' made every fresh line count as an
+    // outage in llm-health and told the site a check was pending when none was
+    // owed: 'unavailable' means a check was attempted and the route failed.
+    ...(verifyOn ? {
+      verify,
+      verifyPolicy: VERIFY_POLICY_V,
+      ...(verifyError ? { verifyError } : {}),
+      verifyModel: verifyModelOf(env)
+    } : {}),
     ...(verifyClaims?.length ? { verifyClaims } : {}),
     ...(verify === 'passed' ? { verifyHash: artifactHash({ text }) } : {}),
     requests: requestScope.getStore().requests.slice(),
