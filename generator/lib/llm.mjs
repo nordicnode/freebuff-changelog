@@ -1587,7 +1587,7 @@ export function createLlmRateLimiter ({ now = Date.now, wait = boundedWait } = {
 }
 let llmRateLimiter = createLlmRateLimiter()
 // Test isolation only: production call counters must never reset this budget.
-export function resetLlmRateLimiterForTests () { llmRateLimiter = createLlmRateLimiter() }
+export function resetLlmRateLimiterForTests () { llmRateLimiter = createLlmRateLimiter(); rpmWarmup = null }
 
 export function retryAfterMs (value, now = Date.now()) {
   if (value == null || !String(value).trim()) return 0

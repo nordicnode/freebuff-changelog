@@ -1942,6 +1942,12 @@ async function cmdRetryFailed (argv) {
       return
     }
     if (!llmConfigured()) throw new Error('retry-failed needs the LLM configured (CHANGELOG_LLM=1 and LLM_API_KEY): dispatch it through the sync workflow, where the relay key lives')
+    // The provider's quiet minute is a fixed cost of the process, and it is
+    // deliberately spent before any pass deadline is armed: the lazy bounded
+    // path at the first call charges it to that row's own clock, which killed
+    // named rows 9s in with "LLM entry time budget exceeded" before a call
+    // was ever sent. Same reason catchUpOnce warms first.
+    await warmLlmRpmWindow(process.env)
     const shas = new Set(picked.map(e => e.sha))
     log(`[retry-failed] releasing ${picked.length} row(s), ${released.length} failure stub${released.length === 1 ? '' : 's'} cleared: ${[...shas].map(s => s.slice(0, 8)).join(', ')}`)
     // The deletion has to reach disk before the ask, for two reasons: the
@@ -2061,6 +2067,11 @@ async function cmdRegenLast (argv) {
       }
     }
     if (!llmConfigured()) throw new Error('regen-last needs the LLM configured (CHANGELOG_LLM=1 and LLM_API_KEY): dispatch it through the sync workflow, where the relay key lives')
+    // Warm before the pass clocks exist, not inside the first row's 60s share:
+    // the bounded warmup path throws "entry time budget exceeded" when the wait
+    // outlives the row room, which is exactly what happened to the first named
+    // rows of a dispatched regeneration.
+    await warmLlmRpmWindow(process.env)
     const askable = []
     const refused = []
     for (const e of targets) {

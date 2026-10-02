@@ -252,6 +252,19 @@ test('key ring: LLM_API_KEYS rotates one key per call and the backup route keeps
   assert.equal(backup.LLM_API_KEYS, '', 'the primary ring does not leak into the backup route')
 })
 
+test('the quiet-minute warmup is a process cost, not a row cost: the bounded path refuses a wait that outlives the row clock', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => response(clean))
+  // The lazy path at the first call charges the 60s quiet window against the
+  // row's own share. With a 400ms row clock the wait cannot fit, so the call is
+  // refused before anything is sent -- the exact failure that killed named rows
+  // 9s into a dispatched regeneration. Paid passes warm with
+  // warmLlmRpmWindow() before arming any budget, which is the fix; this pins
+  // the failure mode so the two paths cannot be re-merged silently.
+  const e = env({ CHANGELOG_LLM_RPM_WARMUP: '1', CHANGELOG_LLM_ROW_BUDGET_MS: '400', LLM_DEADLINE_AT: String(Date.now() + 120000) })
+  await assert.rejects(callLlm('writer', e, 1, x => x), /entry time budget exceeded/)
+  assert.equal(callUnanswered(new Error('LLM entry time budget exceeded')), true, 'and stays retryable, never parked')
+})
+
 test('cache identity is unchanged by the budget work: the same row still hashes the same key', () => {
   // A guard rail, not a hope: nothing in this change may move stored identities.
   const e = row('3')
