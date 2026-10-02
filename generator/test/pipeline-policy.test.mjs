@@ -265,25 +265,29 @@ test('release quality: a functional release rejects packaging boilerplate withou
   assert.doesNotThrow(() => validate({ title: 'Safer terminal output', summary: 'Terminal output now strips escape sequences before rendering.' }))
 })
 
-test('provider rate limit: invalid settings cannot disable or exceed the 60 RPM contract', () => {
-  for (const value of [undefined, '', '0', '-1', 'NaN', 'Infinity', '61', '1000']) assert.equal(llmRpm({ CHANGELOG_LLM_RPM: value }), 60)
+test('provider rate limit: invalid settings cannot disable or exceed the provider RPM contract', () => {
+  // The cap is the project provider's account limit (VyceAI, 40 RPM). Whatever
+  // it is, no configuration may raise it, and none may disable it.
+  for (const value of [undefined, '', '0', '-1', 'NaN', 'Infinity', '41', '1000']) assert.equal(llmRpm({ CHANGELOG_LLM_RPM: value }), 40)
   assert.equal(llmRpm({ CHANGELOG_LLM_RPM: '30' }), 30)
   assert.equal(llmRpm({ CHANGELOG_LLM_RPM: '1.5' }), 1)
 })
 
 test('provider rate limit: concurrent stages and retries share a rolling minute and throttle pause', async () => {
+  const cap = llmRpm({}) // the provider contract, whatever it is
   let now = 0
   const waits = [], starts = []
   const limiter = createLlmRateLimiter({ now: () => now, wait: async ms => { waits.push(ms); now += ms } })
-  await Promise.all(Array.from({ length: 121 }, async () => { starts.push(await limiter.reserve({ CHANGELOG_LLM_RPM: '999' })) }))
-  assert.deepEqual(waits, [60010, 60010])
+  // One request past the cap: it cannot start in the same rolling minute.
+  await Promise.all(Array.from({ length: cap + 1 }, async () => { starts.push(await limiter.reserve({ CHANGELOG_LLM_RPM: '999' })) }))
+  assert.deepEqual(waits, [60010])
   starts.sort((a, b) => a - b)
-  for (let i = 0; i < starts.length; i++) assert.ok(starts.filter(at => at >= starts[i] && at < starts[i] + 60000).length <= 60)
-  assert.equal(now, 120020)
+  for (let i = 0; i < starts.length; i++) assert.ok(starts.filter(at => at >= starts[i] && at < starts[i] + 60000).length <= cap)
+  assert.equal(now, 60010)
   limiter.deferUntil(now + 120000)
   await limiter.reserve()
   assert.equal(waits.at(-1), 120000)
-  assert.equal(now, 240020, 'the pause applies to every worker, not only the 429 caller')
+  assert.equal(now, 180010, 'the pause applies to every worker, not only the 429 caller')
 })
 
 test('provider rate limit: expired deadlines do not acquire slots and HTTP-date Retry-After is honored', async () => {

@@ -8,11 +8,16 @@
 //
 // Config (env):
 //   CHANGELOG_LLM=1            enable
-//   LLM_API_KEY                bearer key (or GitHub Models PAT: ghp_...)
-//   LLM_API_BASE               default https://api.github.com (GitHub Models,
-//                              free tier; any OpenAI-compatible base works)
-//   LLM_MODEL                  default github:gpt-4o-mini
-//   LLM_TIMEOUT_MS            per-request timeout including body reads (default 60000)
+//   LLM_API_KEY                bearer key
+//   LLM_API_BASE               default https://vyceai.com/v1 (any OpenAI-compatible
+//                              base works; the default is the project's provider)
+//   LLM_MODEL                  default deepseek-v4.1
+//   LLM_TIMEOUT_MS            per-request timeout including body reads (default 60000).
+//                              Bounded further by the row budget and the pass deadline.
+//   CHANGELOG_LLM_ROW_BUDGET_MS  wall clock one row may spend on model calls
+//                              (default 60000). Bounds the repair/verifier ladder of a
+//                              single row so one slow row cannot eat the pass.
+//   CHANGELOG_ELI5_ROW_BUDGET_MS the same for the plain-English pass (default 45000)
 //   CHANGELOG_LLM_LIMIT        max commits summarized per run (default 60; 0 = no cap)
 //   CHANGELOG_LLM_CONCURRENCY  parallel API calls (default 2)
 //   CHANGELOG_ELI5_LIMIT       plain-English pass budget (defaults to the above)
@@ -66,6 +71,91 @@ import {
 
 export function llmConfigured (env = process.env) {
   return env.CHANGELOG_LLM === '1' && !!env.LLM_API_KEY
+}
+
+// ---------------------------------------------------------------------------
+// The provider contract: VyceAI, deepseek-v4.1.
+//
+// The provider is part of the data contract, not an interchangeable detail:
+// every stored row names the model that answered (`ai.model`, the request
+// records, `ai.manifest.model`), and a silent fallback to a different gateway
+// or a `gpt-4o-mini` placeholder does not degrade gracefully -- it writes a
+// different corpus. So the identity is written once, here, and a missing
+// LLM_API_BASE / LLM_MODEL / LLM_VERIFY_MODEL can no longer route the writer
+// somewhere else. Explicit env always wins; this is the floor, not a ceiling.
+export const DEFAULT_LLM_API_BASE = 'https://vyceai.com/v1'
+export const DEFAULT_LLM_MODEL = 'deepseek-v4.1'
+
+// What the pipeline is actually configured to talk to, in one line and without
+// the key. The absence of this line is why a provider swap could only be
+// inferred from stored rows after the fact; a run now says it out loud.
+export function llmProviderBanner (env = process.env) {
+  if (!llmConfigured(env)) {
+    const why = env.CHANGELOG_LLM === '1' ? 'LLM_API_KEY is not set' : 'CHANGELOG_LLM=1 is not set'
+    return `LLM provider: disabled (${why}); deterministic summaries only`
+  }
+  const base = env.LLM_API_BASE || DEFAULT_LLM_API_BASE
+  const model = env.LLM_MODEL || DEFAULT_LLM_MODEL
+  const verify = env.LLM_VERIFY_MODEL || DEFAULT_VERIFY_MODEL
+  const major = env.LLM_MODEL_MAJOR ? `, escalation ${env.LLM_MODEL_MAJOR}` : ''
+  const backup = env.LLM_BACKUP_API_BASE && env.LLM_BACKUP_API_KEY
+    ? `, backup ${env.LLM_BACKUP_MODEL || env.LLM_MODEL || DEFAULT_LLM_MODEL} @ ${env.LLM_BACKUP_API_BASE}`
+    : ''
+  return `LLM provider: write ${model} @ ${base}, verify ${verify}${major}${backup}`
+}
+
+// ---------------------------------------------------------------------------
+// Row budgets: the wall clock one row owns.
+//
+// The failure this exists for: a single row's repair ladder (verbatim retries,
+// the stripped ask, the lean ask, the verifier, the self-check) can be twelve
+// calls. With a generous LLM_TIMEOUT_MS a row could therefore spend an hour of
+// wall clock, and in a cycle whose window is measured in minutes the first row
+// of the queue took the whole window while the other nine rows died with "LLM
+// cycle deadline exceeded" and were never even asked. A row now owns a share of
+// wall clock instead: the ladder may spend its calls however it likes inside
+// that share, and when the share is gone the row is left for the next cycle
+// (classified as unanswered, so it keeps the short cooldown rather than being
+// parked). The pass-level planner below sizes the queue from the same number.
+export const DEFAULT_ROW_BUDGET_MS = 90000
+export const DEFAULT_ELI5_ROW_BUDGET_MS = 45000
+
+export function rowBudgetMs (env = process.env) {
+  const v = Number(env.CHANGELOG_LLM_ROW_BUDGET_MS)
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_ROW_BUDGET_MS
+}
+
+export function eli5RowBudgetMs (env = process.env) {
+  const v = Number(env.CHANGELOG_ELI5_ROW_BUDGET_MS)
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_ELI5_ROW_BUDGET_MS
+}
+
+/**
+ * How many rows a pass with this much wall clock can honestly finish.
+ *
+ * `workers` rows run at once, so a budget fits `floor(budget / rowBudget)`
+ * rounds of `workers` rows. Being wrong low costs throughput (the pass exits
+ * with time to spare); being wrong high is what produced a queue of ten rows
+ * that all died on the deadline without a single call -- so the plan ignores
+ * the tail and never rounds a round up.
+ */
+export function planLlmPass ({ budgetMs, limit = Infinity, concurrency = 2, rowBudgetMs: rowBudget = DEFAULT_ROW_BUDGET_MS } = {}) {
+  const budget = Math.max(0, Number(budgetMs) || 0)
+  const perRow = Math.max(15000, Number(rowBudget) || DEFAULT_ROW_BUDGET_MS)
+  const workers = Math.max(1, Math.min(6, Number(concurrency) || 1))
+  const cap = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Number(limit) : Infinity
+  const rounds = Math.floor(budget / perRow)
+  const rows = Math.max(0, Math.min(cap, rounds * workers))
+  return {
+    rows,
+    budgetMs: budget,
+    rowBudgetMs: perRow,
+    concurrency: workers,
+    usable: rows > 0,
+    reason: rows > 0
+      ? ''
+      : `a ${Math.round(budget / 1000)}s pass budget is less than one ${Math.round(perRow / 1000)}s row budget`
+  }
 }
 
 // Prompt versions live in versions.mjs (mergedata.mjs needs them without a
@@ -489,7 +579,7 @@ export function wantsStrongModel (e, relText = '') {
 export function modelFor (e, env = process.env, relText = '') {
   const strong = env.LLM_MODEL_MAJOR
   if (strong && wantsStrongModel(e, relText)) return strong
-  return env.LLM_MODEL || 'gpt-4o-mini'
+  return env.LLM_MODEL || DEFAULT_LLM_MODEL
 }
 
 // The strong model's environment for the escalation paths: null when none is
@@ -1362,6 +1452,31 @@ export function stripGatewayWrapper (text) {
   return String(text ?? '').replace(/<\/?content>/gi, '').trim()
 }
 
+// An error the gateway delivers inside a 200 response.
+//
+// Measured against the project's provider on 2026-10-02: when the upstream
+// answer takes longer than the gateway's own ~15-23s budget it does not always
+// answer 504 -- with `stream: true` it answers HTTP 200 and then a single frame
+// `{"error":{"message":"The request timed out. Please try again.","code":"timeout"}}`.
+// Read as a body, that is indistinguishable from an empty answer, so the row
+// took the "your reply was malformed" repair -- re-asking the same full ask,
+// which times out the same way -- and never reached the failover route, which is
+// the one place a different backend could answer. Two of three streamed probes
+// came back this way, so this is the common case, not an edge case.
+//
+// The message carries the gateway's own code, and deliberately contains
+// "timeout": isGatewayError/callUnanswered/isTransientError already classify
+// that as a transport failure with no answer, which is what it is.
+function gatewayErrorFrame (obj) {
+  const err = obj?.error ?? obj?.data?.error ?? (obj?.choices ? null : obj)
+  if (!err || typeof err !== 'object') return null
+  const message = String(err.message || err.msg || '').trim()
+  const code = String(err.code || err.type || '').trim()
+  if (!message && !code) return null
+  if (!/error|timeout|rate|quota|capacity|unavailable|overload/i.test(`${code} ${message}`)) return null
+  return new Error(`LLM gateway error in the response body${code ? ` (${code})` : ''}: ${message || code}`)
+}
+
 export function extractResponseText (rawText) {
   const raw = String(rawText)
   const frames = raw.split('\n').filter(l => /^\s*data:\s*\{/.test(l))
@@ -1372,9 +1487,14 @@ export function extractResponseText (rawText) {
       if (!m) continue
       try {
         const chunk = JSON.parse(m[1])
+        const frameErr = gatewayErrorFrame(chunk)
+        if (frameErr) throw frameErr
         const delta = chunk.choices?.[0]?.delta?.content ?? chunk.data?.choices?.[0]?.delta?.content
         if (typeof delta === 'string') text += delta
-      } catch { /* skip malformed chunk lines */ }
+      } catch (err) {
+        if (err instanceof Error && /^LLM gateway error in the response body/.test(err.message)) throw err
+        /* skip malformed chunk lines */
+      }
     }
     if (text) return stripGatewayWrapper(text)
     // No deltas: a gateway may still have sent whole messages per frame.
@@ -1393,6 +1513,8 @@ export function extractResponseText (rawText) {
   } catch {
     throw new Error('LLM returned no JSON')
   }
+  const bodyErr = gatewayErrorFrame(parsed)
+  if (bodyErr) throw bodyErr
   const content = messageContent(parsed)
   if (content) return stripGatewayWrapper(content)
   throw new Error('LLM returned no JSON')
@@ -1408,7 +1530,15 @@ export function shortError (err) {
 }
 
 // One provider budget across models, stages and retries, never an entry budget.
-export const LLM_PROVIDER_RPM = 60
+//
+// 40 is the project provider's own account limit (VyceAI). It used to be 60,
+// which the relay's workflow also configured by default, so every paid stage
+// asked for more than the plan allows: the gateway answers 429, the in-call
+// retries spend the row's budget on throttles, and rows go ungenerated for a
+// reason that has nothing to do with the model. Verification is the single
+// biggest consumer of these slots, which is why turning it off frees real
+// capacity for writing. A lower operator value still binds; a higher one cannot.
+export const LLM_PROVIDER_RPM = 40
 export function llmRpm (env = {}) {
   const configured = Number(env.CHANGELOG_LLM_RPM)
   return Number.isFinite(configured) && configured > 0
@@ -1446,6 +1576,20 @@ export function retryAfterMs (value, now = Date.now()) {
   return Number.isFinite(at) ? Math.max(0, at - now) : 0
 }
 let rpmWarmup = null
+// The warmup wait, deliberately not bounded by a pass deadline. It used to be
+// charged to whichever pass made the first call, and with a window smaller than
+// the wait (60s of quiet against a ~30s summary window) the wait did not delay
+// the pass -- it killed it, on every first cycle of every relay run, with "LLM
+// cycle deadline exceeded" on every queued row. A caller that can afford to
+// spend the wait before arming its budget calls this directly (see
+// warmLlmRpmWindow); the bounded path below stays for callers that cannot.
+export async function warmLlmRpmWindow (env = process.env) {
+  if (env.CHANGELOG_LLM_RPM_WARMUP !== '1') return
+  rpmWarmup ||= Date.now() + 60010
+  const waitMs = rpmWarmup - Date.now()
+  if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs))
+}
+
 async function waitForRpmWarmup (env) {
   // Serialized CI jobs may use different runners/processes. A full quiet minute
   // before each paid process protects the previous process's trailing window.
@@ -1469,15 +1613,61 @@ export function resetLlmCallCount () { llmCallsSent = 0 }
 // entry on the 1-hour "permanent error" cooldown for a gateway preference.
 let responseFormatSupported = true
 
+// Streaming, on by default, for the same reason it exists at all.
+//
+// Measured against the project's provider on 2026-10-02 with one real row's
+// exact production body (43,010 chars of prompt asking for a ~2.6 KB JSON
+// answer): the non-streaming call answered HTTP 504 "Gateway time-out" in
+// 11.4s, and the *same bytes* with `stream: true` answered HTTP 200 in 0.3s with
+// the complete answer. Neutral prompts of 300,000 chars answered in under 4s,
+// so it is not size and not the diff content -- the gateway's non-streaming path
+// gives the origin about twelve seconds and a changelog answer that needs longer
+// is cut off. That is the failure the corpus is full of: 134 stored HTTP 504
+// stubs, rows that could never be generated on the primary route however many
+// times they were re-sent verbatim, because every re-send asked the same
+// non-streaming question.
+//
+// The parser was already built for this: extractResponseText() concatenates
+// `data:` frames (that is why SSE handling is in the file at all). The field is
+// probed like response_format, so a gateway that rejects `stream` costs one 400
+// and then never sees it again this process.
+let streamSupported = true
+export function resetLlmStreamProbeForTests () { streamSupported = true }
+
+// One row's scope. Every entry point that can start a row opens its scope with
+// this, not with a bare counter: a scope without the row clock is how the first
+// version of the row budget silently did nothing -- summarizeEntry opened its
+// own `{ calls: 0, requests: [] }` before any call, and the clock set by
+// callLlm was never the clock the calls were charged to.
+function newRequestScope (env) {
+  return { calls: 0, requests: [], rowStartedAt: Date.now(), rowBudgetMs: rowBudgetMs(env) }
+}
+
+// A row's remaining share of wall clock, or Infinity when it is not on one.
+function entryRoomMs (scope) {
+  if (!scope?.rowStartedAt || !scope.rowBudgetMs) return Infinity
+  return scope.rowBudgetMs - (Date.now() - scope.rowStartedAt)
+}
+
+// The per-row clock. It stops a repair ladder from spending the pass: the calls
+// are already capped (CHANGELOG_LLM_MAX_CALLS_PER_ENTRY), but a cap on *calls*
+// says nothing about how long each one may take, and one 300s timeout plus one
+// 300s retry is the whole window. "LLM entry time budget exceeded" contains
+// "budget exceeded", so it is classified as an unanswered call -- the row keeps
+// the short cooldown and is asked again next cycle instead of being parked.
 function assertRequestBudget (env) {
   if (env.LLM_DEADLINE_AT && Date.now() >= Number(env.LLM_DEADLINE_AT)) throw new Error('LLM cycle deadline exceeded')
   const scope = requestScope.getStore()
-  if (scope && scope.calls >= (Number(env.CHANGELOG_LLM_MAX_CALLS_PER_ENTRY) || 12)) throw new Error('LLM entry request budget exceeded')
+  if (!scope) return
+  if (scope.calls >= (Number(env.CHANGELOG_LLM_MAX_CALLS_PER_ENTRY) || 12)) throw new Error('LLM entry request budget exceeded')
+  if (entryRoomMs(scope) <= 0) throw new Error('LLM entry time budget exceeded')
 }
 
 async function boundedWait (ms, env) {
   assertRequestBudget(env)
   if (env.LLM_DEADLINE_AT && Date.now() + ms >= Number(env.LLM_DEADLINE_AT)) throw new Error('LLM cycle deadline exceeded')
+  const room = entryRoomMs(requestScope.getStore())
+  if (Number.isFinite(room) && ms >= room) throw new Error('LLM entry time budget exceeded')
   await new Promise(r => setTimeout(r, ms))
 }
 
@@ -1626,10 +1816,15 @@ export function servedModelOf (requests = [], fallback = '') {
 export async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut, opts = {}) {
   // Repair suffixes and fallback asks share the same provider window ceiling.
   prompt = fitToWindow(prompt)
-  if (!requestScope.getStore()) return requestScope.run({ calls: 0, requests: [] }, () => callLlm(prompt, env, attempt, validate, opts))
+  // The scope is the row: it is created by the row's first call and carries the
+  // row's call budget and its share of wall clock, so every rung, repair,
+  // verifier and self-check that row makes is charged to the same row clock.
+  if (!requestScope.getStore()) {
+    return requestScope.run(newRequestScope(env), () => callLlm(prompt, env, attempt, validate, opts))
+  }
   assertRequestBudget(env)
-  const base = env.LLM_API_BASE || 'https://api.openai.com/v1'
-  const model = env.LLM_MODEL || 'gpt-4o-mini'
+  const base = env.LLM_API_BASE || DEFAULT_LLM_API_BASE
+  const model = env.LLM_MODEL || DEFAULT_LLM_MODEL
   const configuredTimeout = Number(env.LLM_TIMEOUT_MS)
   // Bound each attempt, including response-body/SSE consumption. Invalid values
   // retain the historical timeout instead of aborting immediately or overflowing.
@@ -1647,12 +1842,21 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     max_tokens: LLM_OUTPUT_TOKENS
   }
   if (responseFormatSupported) body.response_format = { type: 'json_object' }
+  if (streamSupported && env.CHANGELOG_LLM_STREAM !== '0') body.stream = true
   await waitForLlmRpmSlot(env)
   assertRequestBudget(env) // Recheck after awaiting the shared RPM slot.
   const scope = requestScope.getStore()
   const started = Date.now()
   const deadlineRoom = env.LLM_DEADLINE_AT ? Number(env.LLM_DEADLINE_AT) - started : timeoutMs
   if (deadlineRoom <= 0) throw new Error('LLM cycle deadline exceeded')
+  // The row's share bounds the attempt too. Without this, a 300s configured
+  // timeout on a row whose share of the pass is 60s aborts *at the pass
+  // deadline*: the call answers nothing, and the rows behind it in the queue
+  // are never reached. Cutting at the row's own boundary instead keeps the loss
+  // inside one row's budget, where the next cycle can retry it.
+  const rowRoom = entryRoomMs(scope)
+  if (rowRoom <= 0) throw new Error('LLM entry time budget exceeded')
+  const callRoom = Math.min(deadlineRoom, rowRoom)
   if (env.LLM_CYCLE_BUDGET) {
     if (env.LLM_CYCLE_BUDGET.remaining <= 0) throw new Error('LLM cycle request budget exceeded')
     env.LLM_CYCLE_BUDGET.remaining--
@@ -1698,7 +1902,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
         authorization: `Bearer ${env.LLM_API_KEY}`
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(Math.max(1, Math.min(timeoutMs, deadlineRoom)))
+      signal: AbortSignal.timeout(Math.max(1, Math.min(timeoutMs, callRoom)))
     })
   } catch (err) {
     request.outcome = 'transport-error'
@@ -1713,11 +1917,18 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
   request.status = res.status
   request.outcome = res.ok ? 'received' : 'http-error'
   request.durationMs = Date.now() - started
-  if (res.status === 400 && responseFormatSupported && attempt <= 2) {
+  if (res.status === 400 && attempt <= 2) {
     const bodyText = await res.text().catch(() => '')
-    if (/response[_ -]?format|json_object|json mode/i.test(bodyText)) {
+    if (responseFormatSupported && /response[_ -]?format|json_object|json mode/i.test(bodyText)) {
       responseFormatSupported = false
       log('LLM gateway rejected response_format: retrying without strict JSON mode (sticky for this process)')
+      return callLlm(prompt, env, attempt + 1, validate, opts)
+    }
+    // Same probe for streaming: a gateway that does not know the field says so
+    // in its 400, and one refusal is enough to stop asking.
+    if (streamSupported && env.CHANGELOG_LLM_STREAM !== '0' && /stream/i.test(bodyText)) {
+      streamSupported = false
+      log('LLM gateway rejected stream: retrying without streaming (sticky for this process)')
       return callLlm(prompt, env, attempt + 1, validate, opts)
     }
     throw new Error(shortError(`LLM HTTP 400: ${bodyText.slice(0, 120)}`))
@@ -1741,10 +1952,18 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     await boundedWait(waitMs, env)
     return callLlm(prompt, env, attempt + 1, validate, opts)
   }
-  // 5xx gateways (tunnel 503s/522s included): retry with backoff up to 3 attempts.
-  if (res.status >= 500 && res.status <= 599 && attempt <= (opts.gatewayRetries ?? 3)) {
+  // 5xx gateways (tunnel 503s/522s included): one verbatim retry, not three.
+  //
+  // Measured, not assumed: a 5xx from this provider costs 11-14s of wall clock
+  // (the origin timeout), so three verbatim retries plus their 2s/4s/8s backoff
+  // spent ~62s of a row's budget re-asking the *same bytes* -- and left nothing
+  // for the rung that could still change the answer (the lean ask) or for the
+  // failover route, both of which sit below this block. A 5xx that survives one
+  // verbatim retry is not a blip; the between-cycle retry (short cooldown, next
+  // relay cycle) is what covers genuine blips.
+  if (res.status >= 500 && res.status <= 599 && attempt <= (opts.gatewayRetries ?? 1)) {
     const waitMs = 2000 * 2 ** (attempt - 1)
-    log(`LLM HTTP ${res.status} gateway blip: waiting ${(waitMs / 1000).toFixed(1)}s before retry ${attempt}/3`)
+    log(`LLM HTTP ${res.status} gateway blip: waiting ${(waitMs / 1000).toFixed(1)}s before retry ${attempt}`)
     await boundedWait(waitMs, env)
     return callLlm(prompt, env, attempt + 1, validate, opts)
   }
@@ -1771,6 +1990,18 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     // the last attempt on "reply with ONLY the JSON" for a body that came
     // back empty the same way. Take the materially different ask when there
     // is one, and only re-ask verbatim when there is none.
+    // A gateway that answered 200 with an error frame returned no answer at
+    // all. It owes the row the *transport* ladder -- the lean ask, then the
+    // failover route -- not a repair prompt inviting it to fix an answer it
+    // never gave.
+    if (isGatewayError(err)) {
+      const transport = transportRung()
+      if (transport) {
+        log(`LLM ${shortError(err)}: re-asking with ${transport.how}`)
+        return callLlm(transport.prompt, env, attempt + 1, validate, transport.opts)
+      }
+      return routeOrThrow(withRawText(err, rawText))
+    }
     const rung = attempt >= 2 ? nextRung('prose', opts) : null
     if (rung) {
       log(`LLM response body contained no valid message twice: re-asking with ${rung.how}`)
@@ -3141,7 +3372,7 @@ export async function checkPrRelevance (e, patch, prMeta, env = process.env) {
   try {
     const verdict = await callLlm(
       buildPrRelevancePrompt(e, patch, prMeta),
-      { ...env, LLM_MODEL: env.LLM_MODEL || 'gpt-4o-mini' },
+      { ...env, LLM_MODEL: env.LLM_MODEL || DEFAULT_LLM_MODEL },
       1, validatePrRelevanceOut
     )
     if (!verdict.relevant) {
@@ -3462,7 +3693,7 @@ export function validateVerifyOut (out) {
 }
 
 export async function verifySummary (entry, patch, clean, env, cautionNames = [], opts = {}) {
-  if (!requestScope.getStore()) return requestScope.run({ calls: 0, requests: [] }, () => verifySummary(entry, patch, clean, env, cautionNames, opts))
+  if (!requestScope.getStore()) return requestScope.run(newRequestScope(env), () => verifySummary(entry, patch, clean, env, cautionNames, opts))
   const venv = { ...env, LLM_MODEL: verifyModelOf(env) }
   // The verifier reads the same diff the ask did, so a comment-heavy row
   // refuses here too and the verdict silently goes missing (58699f0e logged
@@ -3573,7 +3804,7 @@ export function promptContextOf ({ relText = '', sequence = null, prMeta = null,
 // One entry, start to finish: prompt, call, grounding repair, optional
 // verification, and the record both the cache and the entry receive.
 export async function summarizeEntry ({ entry: e, patch, relText = '', sequence = null, prMeta = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env }) {
-  if (!requestScope.getStore()) return requestScope.run({ calls: 0, requests: [] }, () => summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env: baseEnv }))
+  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv), () => summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env: baseEnv }))
   const callsAt = requestScope.getStore().calls
   // Tiered routing: the rows a reader opens go to LLM_MODEL_MAJOR when set.
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
@@ -3779,7 +4010,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     if (verify !== 'passed') { delete clean.breaking; delete clean.migration }
   }
   const record = {
-    model: servedModelOf(requestScope.getStore().requests, outEnv.LLM_MODEL || 'gpt-4o-mini'),
+    model: servedModelOf(requestScope.getStore().requests, outEnv.LLM_MODEL || DEFAULT_LLM_MODEL),
     v: PROMPT_V,
     policy: QUALITY_POLICY_V,
     manifest,
@@ -3839,7 +4070,7 @@ function inputIdentity (e, prMeta, glossary, env, relText = '') {
   // backlog for paid rewrites of text that already passed. Gate changes that
   // matter to a row class invalidate exactly that class through its own version
   // (RELEASE_ROLLUP_V for release rows), not through a global identity reset.
-  return shortHash(JSON.stringify({ base: e.prevSha || null, model: modelFor(e, env, relText) || 'gpt-4o-mini', provider: env.LLM_API_BASE || 'https://api.openai.com/v1', context: contextFingerprint(prMeta, glossary), policy: QUALITY_POLICY_V, writer: shortHash(buildPrompt.toString() + buildFusePrompt.toString() + contextSectionLines.toString()), validator: shortHash(validateLlmOut.toString() + buildVerifyPrompt.toString() + validateVerifyOut.toString()) }))
+  return shortHash(JSON.stringify({ base: e.prevSha || null, model: modelFor(e, env, relText) || DEFAULT_LLM_MODEL, provider: env.LLM_API_BASE || DEFAULT_LLM_API_BASE, context: contextFingerprint(prMeta, glossary), policy: QUALITY_POLICY_V, writer: shortHash(buildPrompt.toString() + buildFusePrompt.toString() + contextSectionLines.toString()), validator: shortHash(validateLlmOut.toString() + buildVerifyPrompt.toString() + validateVerifyOut.toString()) }))
 }
 
 export function enrichmentEligible (e, env = process.env) {
@@ -3936,6 +4167,14 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   // this run's budget. Unscoped runs pass no set and behave as before.
   const only = options.only instanceof Set ? options.only : null
   const inScope = (e) => !only || !!e && only.has(e.sha)
+  // A window that is already over is not a pass. Saying so is the difference
+  // between "the queue was empty" and "the clock was dead" -- and writing no
+  // failure stub is deliberate: the row was never asked, so it must not carry a
+  // cooldown for a call nobody sent.
+  if (env.LLM_DEADLINE_AT && Date.now() >= Number(env.LLM_DEADLINE_AT)) {
+    log('LLM summary pass skipped: the cycle deadline had already passed, so no row was asked')
+    return 0
+  }
   const targets = entries.filter(e => enrichmentEligible(e, env) && inScope(e))
   const framedOut = Object.values(cache).some(rec => rec && !rec.error && rec.verifyPolicy !== VERIFY_POLICY_V &&
     ['flagged', 'stale', 'unavailable'].includes(qualityOf({ ai: rec }).verify))
@@ -5018,6 +5257,14 @@ export function countPendingEli5 (entries) {
 
 export async function enrichEli5 (entries, dataDir, env = process.env, options = {}) {
   if (!llmConfigured(env) || env.CHANGELOG_ELI5 === '0') return 0
+  if (env.LLM_DEADLINE_AT && Date.now() >= Number(env.LLM_DEADLINE_AT)) {
+    log('ELI5 pass skipped: the cycle deadline had already passed, so no row was asked')
+    return 0
+  }
+  // The plain-English ask is a shorter question than the writer's, so it gets
+  // its own row budget; the generic one stays the writer's. Every call in this
+  // pass (including its repair and its verifier) is charged to this clock.
+  env = { ...env, CHANGELOG_LLM_ROW_BUDGET_MS: String(eli5RowBudgetMs(env)) }
   const cachePath = `${dataDir}/ai-summaries.json`
   const cache = await readJson(cachePath, {})
   // Separate knobs so the initial fill can be run down faster than the summary
@@ -5253,7 +5500,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
 // (may be '' when CHANGELOG_ELI5_DIFF=0); `notesPatch` is what the comments are
 // mined from, which the pass has already paid for either way.
 export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, siblings = [], diffBytes = Infinity, relText = '', prMeta = null, sequence = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env }) {
-  if (!requestScope.getStore()) return requestScope.run({ calls: 0, requests: [] }, () => explainEntry({ entry: e, patch, notesPatch, siblings, diffBytes, relText, prMeta, sequence, archMap, glossary, context, env: baseEnv }))
+  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv), () => explainEntry({ entry: e, patch, notesPatch, siblings, diffBytes, relText, prMeta, sequence, archMap, glossary, context, env: baseEnv }))
   const callsAt = requestScope.getStore().calls
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
   // Reuse the technical pass's accepted PR. Never reattach a rejected match.
@@ -5361,7 +5608,7 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
   }
   manifest.deliveredHash = shortHash(material)
   const record = {
-    model: servedModelOf(requestScope.getStore().requests, outEnv.LLM_MODEL || 'gpt-4o-mini'),
+    model: servedModelOf(requestScope.getStore().requests, outEnv.LLM_MODEL || DEFAULT_LLM_MODEL),
     v: ELI5_V,
     policy: QUALITY_POLICY_V,
     manifest,
@@ -5507,7 +5754,7 @@ export async function enrichOpenPrs (prs, dataDir, env = process.env, options = 
     try {
       const prompt = buildPrPrompt(pr, diff, { architectureMap: archMap })
       const material = deliveredEvidence(prompt)
-      const { clean, verdict, requests } = await requestScope.run({ calls: 0, requests: [] }, async () => {
+      const { clean, verdict, requests } = await requestScope.run(newRequestScope(env), async () => {
         const clean = await callLlm(prompt, env, 1, summaryValidator('minor', material), { stage: 'PR-preview' })
         const verdict = verifyConfigured(env) ? await verifySummary({ files: {}, summary: 'Open PR proposal, not shipped behavior.' }, material, clean, env).catch(() => null) : null
         return { clean, verdict, requests: requestScope.getStore().requests.slice() }
@@ -5515,7 +5762,7 @@ export async function enrichOpenPrs (prs, dataDir, env = process.env, options = 
       cache[key] = {
         ...clean,
         inputIdentity: shortHash(JSON.stringify({ model: env.LLM_MODEL, provider: env.LLM_API_BASE, policy: QUALITY_POLICY_V, prompt: buildPrPrompt.toString(), verifier: buildVerifyPrompt.toString() })),
-        model: env.LLM_MODEL || 'gpt-4o-mini',
+        model: env.LLM_MODEL || DEFAULT_LLM_MODEL,
         v: PR_PROMPT_V,
         policy: QUALITY_POLICY_V,
         manifest: evidenceManifest({ sha: `pr-${pr.number}`, prevSha: pr.updated }, diff, prompt, env.LLM_MODEL),

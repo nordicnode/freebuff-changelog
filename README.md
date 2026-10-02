@@ -22,7 +22,9 @@ Build and tests do not call an LLM. CLI commands load local environment configur
 - Refreshing recent text on request is the same bounded exception: `regen-last <N | sha...>` (dispatch input `regen`) re-asks for fresh summaries on the newest N rows, capped at 50 per run. Rows outside the set are untouched, a failed ask leaves the shipped text in place (a failure writes a stub, and a stub loses the merge to a real summary; `e.ai` is only ever replaced by a successful record), and a row in the set must be admitted or already carry a generation this pipeline wrote — a row with neither is refused and named, because that would be backfill. It runs under the worktree lock with its own six-calls-per-row budget scaled to the set (one minute per row, six-minute floor, thirty-minute cap), and is the sanctioned replacement for the retired `scripts/regenerate-last-20.mjs`, which still fails fast.
 - Models are unchanged: existing `LLM_MODEL`, optional `LLM_MODEL_MAJOR`, and configured verifier routing are retained. The verifier default remains `deepseek-v4.1`. No new model is selected by this remediation.
 - The provider context contract is fixed at **270,000 tokens**, with 8,000 output tokens reserved and conservative character budgeting. Environment settings cannot silently increase the window. Character budgeting is an estimate, not an exact tokenizer.
-- A production cycle has a four-minute git/network deadline, a two-minute enrichment deadline within it, **40 total model requests**, and **12 requests per entry**. Retries, repairs, relevance gates, verification, and self-checks all consume this budget. Failed rows retain durable attempt counts and cooldowns.
+- A production cycle has two clocks: a **four-minute git/network deadline** for the sync, PR refresh and first publish, and a separate **paid window** (default five minutes, never past the watch run's remaining time) for model work. The old design armed one clock at cycle start and subtracted an ELI5 reserve of `limit * 15s` from it, so the summary pass was routinely handed a deadline in the past: ten consecutive relay cycles wrote nothing and every queued row answered "LLM cycle deadline exceeded" without a call being sent (254 such stubs are in the cache). Each pass now arms its own deadline when it starts, and is planned down to the rows its window can actually finish.
+- A row owns **`CHANGELOG_LLM_ROW_BUDGET_MS`** of wall clock (default 90s) for all of its calls, and the pass plans its queue from the same number. A row that runs out is left for the next cycle with the short cooldown; a row can no longer spend the pass and leave the rows behind it unasked. Failed rows retain durable attempt counts and cooldowns.
+- The provider's account limit is **40 requests/minute**, shared by every stage, retry and route; the configured value can only be lower.
 
 Operator commands (not local validation commands):
 
@@ -92,14 +94,17 @@ Human overrides in [data/overrides.json](data/overrides.json) take precedence at
 | Setting | Contract |
 |---|---|
 | `CHANGELOG_LLM=1` + `LLM_API_KEY` | Optional enrichment of admitted new work only |
-| `LLM_MODEL`, `LLM_MODEL_MAJOR`, `LLM_VERIFY_MODEL` | Existing model identities/routing; verifier default `deepseek-v4.1` |
-| `LLM_API_BASE` | Existing OpenAI-compatible provider; default `https://api.openai.com/v1` |
+| `LLM_MODEL`, `LLM_MODEL_MAJOR`, `LLM_VERIFY_MODEL` | Model identities/routing; all default to `deepseek-v4.1` |
+| `LLM_API_BASE` | OpenAI-compatible provider; default `https://vyceai.com/v1` (the project provider). A missing setting can no longer route the writer elsewhere; the run logs the identity it is using |
+| `CHANGELOG_LLM_STREAM` | Requests stream by default (`stream: true`). Not a preference: the provider's non-streaming path times the origin out after ~12s and answers 504, while the same bytes streamed answer 200. `=0` disables, and a gateway that rejects the field is probed once and then never asked again |
+| `CHANGELOG_LLM_CYCLE_BUDGET_MS` | Wall clock one cycle may spend on model calls (default 300,000; further bounded by the watch run's remaining time) |
+| `CHANGELOG_LLM_ROW_BUDGET_MS`, `CHANGELOG_ELI5_ROW_BUDGET_MS` | Wall clock one row owns for all of its calls — writer, repairs, and any check (defaults 90,000 and 45,000). A row that runs out is left for the next cycle and keeps the short cooldown; it is never parked for our own budget |
+| `CHANGELOG_LLM_VERIFY` | `all` (default) checks every row; `1` selective; `0` disables the pass and cannot confer trust. The relay runs with `0` by operator decision (2026-10-02): a new row carries no verdict, says so, and never claims to be checked. Rows that already carry a verdict keep it |
 | `LLM_BACKUP_API_BASE`, `LLM_BACKUP_API_KEY`, `LLM_BACKUP_MODEL` | Failover route: consulted once, only when the primary fails at the transport/gateway level (5xx, connection, response timeout, 408, exhausted 429 wait). Auth, content and validator failures stay on the primary so they surface there; `CHANGELOG_LLM_BACKUP=0` disables it. Shares the primary's entry cap, cycle budget and 60 RPM window |
 | `LLM_TIMEOUT_MS` | Default 60,000 ms, bounded further by remaining cycle time; includes body consumption |
 | `CHANGELOG_LLM_LIMIT`, `CHANGELOG_ELI5_LIMIT` | Entry limits; production defaults to a small bounded batch |
-| `CHANGELOG_LLM_CONCURRENCY`, `CHANGELOG_LLM_RPM` | Default two workers and 60 requests/minute; shared request ceiling still applies |
+| `CHANGELOG_LLM_CONCURRENCY`, `CHANGELOG_LLM_RPM` | Default two workers and 40 requests/minute — the provider's own account limit. The configured value can only go lower, never above the contract |
 | `CHANGELOG_LLM_MAX_ATTEMPTS` | Default three lifetime failure attempts per input; deterministic refusal/memory failures park earlier |
-| `CHANGELOG_LLM_VERIFY` | All rows by default; `1` selective, `0` disables and cannot confer trust |
 | `CHANGELOG_PR_CALLS` | GitHub decoration ceiling capped at 40/cycle, even with authentication |
 | `CHANGELOG_SYNC_STALE_MIN` | Default five minutes; freshness gate fails at twice this age |
 | `SITE_URL` | Deployment/feed URL |

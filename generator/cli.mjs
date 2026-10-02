@@ -15,7 +15,7 @@ import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
   extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
-import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows } from './lib/llm.mjs'
+import { enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows } from './lib/llm.mjs'
 import { QUALITY_POLICY_V, generationState } from './lib/quality.mjs'
 import { shortHash, eli5Source } from './lib/util.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
@@ -1050,14 +1050,94 @@ export async function cmdFreshness (argv = [], { dataDir = DATA, now = Date.now(
 }
 
 async function cmdCatchUp (argv) {
-  const { acquired } = await withLock(LOCK, () => withDeadline(240000, () => catchUpOnce(argv)))
+  const budgets = cycleBudgets()
+  // Two phases, two clocks. The git/network phase keeps its own four-minute
+  // deadline (a hung fetch must not spend the cycle), and the paid phase gets
+  // its own window measured from when it actually starts -- see catchUpOnce.
+  // The outer deadline is only a backstop that contains both.
+  const outerMs = budgets.gitBudgetMs + Math.max(budgets.llmBudgetMs, 60000) + 30000
+  const { acquired } = await withLock(LOCK, () => withDeadline(outerMs, () => catchUpOnce(argv, budgets)))
   if (!acquired) log('another generate/backfill run holds the worktree lock: skipping this cycle')
   // The loop reads this to tell "a peer holds the lock" (healthy, the site is
   // being kept fresh by someone) apart from "this cycle did nothing" (broken).
   return { acquired: Boolean(acquired) }
 }
 
-async function catchUpOnce (argv) {
+const GIT_BUDGET_DEFAULT_MS = 240000
+const LLM_CYCLE_BUDGET_DEFAULT_MS = 300000
+
+// A configured duration, or the fallback when the value is absent or unusable.
+// `allowZero` is for the paid window, where 0 is a real answer: the watch run
+// has nothing left and this cycle must not start work it cannot finish.
+function durationMs (value, fallback, { allowZero = false } = {}) {
+  const n = Number(value)
+  if (Number.isFinite(n) && (n > 0 || (allowZero && n === 0))) return n
+  return fallback
+}
+// Below this there is not enough wall clock for even one row, so the paid
+// phases are skipped instead of being started on a window that cannot hold a
+// call. A skipped cycle is visible in the log and costs nothing.
+const MIN_ENRICH_MS = 45000
+
+/**
+ * How much wall clock this cycle may spend, per phase.
+ *
+ * The failure this replaces: every phase was scheduled against one 240s clock
+ * armed at cycle start. A sync that took 20-60s then left the summary pass a
+ * nominal ~60s window, of which the ELI5 reserve (limit * 15s = 150s for the
+ * CI's limit of 10) was subtracted first -- so `summaryDeadline` was routinely
+ * already in the past, and every queued row answered "LLM cycle deadline
+ * exceeded" without a single call being sent. Ten relay cycles in a row wrote
+ * nothing. The paid window is now sized from the operator's budget, capped by
+ * what is left of the watch run, and armed only when the paid phase begins.
+ */
+function cycleBudgets (env = process.env) {
+  const positive = (value, fallback) => {
+    const n = Number(value)
+    return Number.isFinite(n) && n > 0 ? n : fallback
+  }
+  const gitBudgetMs = positive(env.CHANGELOG_GIT_BUDGET_MS, GIT_BUDGET_DEFAULT_MS)
+  const configured = positive(env.CHANGELOG_LLM_CYCLE_BUDGET_MS, LLM_CYCLE_BUDGET_DEFAULT_MS)
+  // The watch loop publishes how long its run has left before each cycle: a
+  // 12-minute run whose first cycle spent 10 minutes would otherwise overrun
+  // its own duration limit and be killed with nothing published. A minute of
+  // the remainder stays unspent so the git phase of the next cycle always fits.
+  const remaining = positive(env.CHANGELOG_WATCH_REMAINING_MS, 0)
+  const llmBudgetMs = remaining > 0
+    ? Math.max(0, Math.min(configured, remaining - gitBudgetMs - 60000))
+    : configured
+  return { gitBudgetMs, llmBudgetMs }
+}
+
+/**
+ * How much of the paid window the summary pass may take, leaving the
+ * plain-English drain a slice of its own.
+ *
+ * The reserve is a *share* of the window as well as a per-row amount, which is
+ * the arithmetic fix that matters: the old reserve (`limit * 15s`, floored at
+ * 60s) was subtracted from a clock already spent by the sync phase, so the
+ * summary pass was routinely handed a window in the past. A share can never
+ * exceed the window it is taken from, so there is always a summary window --
+ * and a pass too short to hold a row says so instead of pretending.
+ */
+export function summaryPassWindow (startAt, endsAt, reserveFor, env = process.env) {
+  const total = Math.max(0, endsAt - startAt)
+  // No pending plain-English work means nothing to reserve: the summary pass
+  // takes the whole window. A reserve held against an empty queue is exactly
+  // how a cycle ends up under-using its budget by design.
+  if (!(Number(reserveFor) > 0)) return total
+  const perRow = Number(env.CHANGELOG_LLM_ELI5_RESERVE_PER_ROW_MS) > 0 ? Number(env.CHANGELOG_LLM_ELI5_RESERVE_PER_ROW_MS) : 10000
+  const reserve = Math.min(Math.max(45000, Number(reserveFor) * perRow), Math.round(total * 0.35))
+  return Math.max(0, total - reserve)
+}
+
+// Phase 1 of a cycle: the network and the clone.
+//
+// It gets its own clock (the documented four-minute git/network deadline) so a
+// hung fetch is bounded, and -- just as important -- so the paid phases that
+// follow can be armed with a deadline measured from when they start instead of
+// inheriting whatever this phase left of one clock armed at cycle start.
+async function syncPhase (argv) {
   const branch = await currentBranch()
 
   // 1. Sync unless the data is already fresh. This is the loop's primary job:
@@ -1109,11 +1189,6 @@ async function catchUpOnce (argv) {
   // 2. Snapshot *after* the sync — generate rewrote changelog.json, so a copy
   //    taken before it would be stale by write time.
   const existing = await readJson(`${DATA}/changelog.json`, { version: 1, entries: [] })
-  const entries = existing.entries || []
-  if (!entries.length) {
-    log('no entries after sync: nothing to backfill')
-    return
-  }
 
   // 3. Publish new entries before the slow part. A commit that arrives at
   //    16:20 must be readable by ~16:22, not after this cycle's LLM batch
@@ -1125,6 +1200,21 @@ async function catchUpOnce (argv) {
     })
   }
 
+  return { existing, freshShas, didSync, didPrSync }
+}
+
+async function catchUpOnce (argv, budgets = {}) {
+  const gitBudgetMs = durationMs(budgets.gitBudgetMs, GIT_BUDGET_DEFAULT_MS)
+  const llmBudgetMs = durationMs(budgets.llmBudgetMs, LLM_CYCLE_BUDGET_DEFAULT_MS, { allowZero: true })
+  // Phase 1 (sync, PR refresh, the first publish) under its own clock, then the
+  // paid phases under their own. Nothing below this line is charged to the git
+  // phase's clock.
+  const { existing, freshShas, didSync, didPrSync } = await withDeadline(gitBudgetMs, () => syncPhase(argv))
+  const entries = existing.entries || []
+  if (!entries.length) {
+    log('no entries after sync: nothing to backfill')
+    return
+  }
   const queueable = entries.filter(e => !e.noise && enrichmentEligible(e, { CHANGELOG_LLM_NO_BACKFILL: '1' }))
   const isCurrent = (e) => e.ai?.title && (process.env.CHANGELOG_LLM_FORCE_REWRITE === '1' ? (e.ai?.v ?? 1) >= PROMPT_V : true)
   const unsummarized = queueable.filter(e => !isCurrent(e))
@@ -1137,34 +1227,57 @@ async function catchUpOnce (argv) {
   }
 
   let didSummarize = false
-  // The LLM batch runs three passes back to back (summary+verify+heal+
-  // re-check, then the plain-English drain, then PR previews), and each needs
-  // a floor of the cycle's wall clock. They used to share one deadline and one
-  // request counter: the summary pass spent the whole window on failing asks
-  // under a slow gateway, after which ELI5 saw an expired deadline and exited
-  // without writing a line (the 28-row plain-English backlog) and got
-  // "LLM cycle request budget exceeded" on top of it. Both are now per pass --
-  // a fresh request pool and a reserved time slice -- with the cycle deadline
-  // still the hard outer ceiling.
-  const cycleCalls = Math.max(40, limit * 8)
+  // The paid phases run back to back (summary+verify+heal+re-check, then the
+  // plain-English drain, then PR previews), and each gets its own window -- but
+  // a window measured from *when that phase starts*, sized by the operator's
+  // cycle budget, and planned down to the number of rows it can actually
+  // finish. The old arithmetic armed one deadline at cycle start with
+  // `cycleDeadline - limit * 15s` reserved for ELI5: with the CI's limit of 10
+  // that reserve was 150s of a 240s clock, so once a sync had taken ~30s the
+  // summary deadline was ~60s out and a single 300s call could never answer.
+  // Every queued row then died with "LLM cycle deadline exceeded" before a call
+  // was even sent -- ten consecutive relay cycles, zero rows, and 254 such stubs
+  // in the cache.
   const now = Date.now()
-  const cycleDeadline = Math.min(deadlineAt(), now + Math.max(120000, limit * 60000))
-  const cycleEnvBase = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(limit) }
-  if (llmConfigured()) {
-    await backfillDiffs(queueable, limit)
-    // Reserve time for ELI5: at least 60s or 15s per entry in the limit
-    const eli5ReserveMs = Math.max(60000, limit * 15000)
-    // Summary deadline leaves guaranteed room for ELI5 before cycle end
-    const summaryDeadline = Math.max(now, cycleDeadline - eli5ReserveMs)
+  // The paid window: never past the watch run's own remaining time (a cycle
+  // that overruns its duration limit is killed with nothing published).
+  const enrichEndsAt = Math.min(deadlineAt(), now + Math.max(0, llmBudgetMs))
+  const cycleEnvBase = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1' }
+  if (llmConfigured()) log(llmProviderBanner())
+  if (llmConfigured() && llmBudgetMs >= MIN_ENRICH_MS) {
+    // The warmup is a fixed cost of the first paid call in a process (a quiet
+    // RPM window) and it is deliberately spent before any pass deadline is
+    // armed: charged to a pass it used to kill the pass outright.
+    await warmLlmRpmWindow(process.env)
+    const enrichStart = Date.now()
+    // Only reserve for the plain-English drain when it actually has work: the
+    // reserve is a share of one window, and holding it against an empty queue
+    // left the summary pass a third of the budget with nothing to spend it on.
+    const eli5Backlog = countPendingEli5(queueable)
+    const summaryWindow = summaryPassWindow(enrichStart, enrichEndsAt, eli5Backlog > 0 ? limit : 0)
+    const summaryPlan = planLlmPass({
+      budgetMs: summaryWindow,
+      limit,
+      concurrency: llmConcurrency(process.env),
+      rowBudgetMs: rowBudgetMs(process.env)
+    })
+    await backfillDiffs(queueable, Math.max(summaryPlan.rows, 1))
+    let n = 0
+    if (summaryPlan.usable) {
+      log(`[enrichment] summary pass: up to ${summaryPlan.rows} row(s) in ${Math.round(summaryWindow / 1000)}s (${Math.round(summaryPlan.rowBudgetMs / 1000)}s per row)`)
+    } else {
+      log(`[enrichment] summary pass skipped: ${summaryPlan.reason}`)
+    }
     const summaryEnv = {
       ...cycleEnvBase,
-      LLM_DEADLINE_AT: String(summaryDeadline),
-      LLM_CYCLE_BUDGET: { remaining: cycleCalls }
+      CHANGELOG_LLM_LIMIT: String(Math.max(summaryPlan.rows, 1)),
+      LLM_DEADLINE_AT: String(enrichStart + summaryWindow),
+      LLM_CYCLE_BUDGET: { remaining: Math.max(40, Math.max(summaryPlan.rows, 1) * 8) }
     }
-    const n = await enrichWithLlm(entries, llmPatchFor, DATA, summaryEnv, {
+    if (summaryPlan.usable) n = await enrichWithLlm(entries, llmPatchFor, DATA, summaryEnv, {
       retryErrors: true,
       // This cycle's commits go first; the backlog can wait, the news cannot.
-      priorityShas: new Set(freshShas.slice(-limit)),
+      priorityShas: new Set(freshShas.slice(-summaryPlan.rows)),
       repoDir: REPO_DIR,
       // The full stored diff, same as generate and enrich-all: without it a
       // CI-sourced row never re-extracts structured facts from the whole diff
@@ -1175,6 +1288,10 @@ async function catchUpOnce (argv) {
     const remaining = queueable.filter(e => !isCurrent(e)).length
     log(`[enrichment] enriched ${n} entries with LLM (${remaining} remaining)`)
     didSummarize = remaining < unsummarized.length
+  } else if (llmConfigured()) {
+    // Deliberately skipped, and said so: starting a pass on a window that
+    // cannot hold one call is what burned 254 deadline stubs.
+    log(`[enrichment] paid work skipped this cycle: ${Math.round(llmBudgetMs / 1000)}s of budget is under the ${Math.round(MIN_ENRICH_MS / 1000)}s floor`)
   } else {
     log('LLM not configured (CHANGELOG_LLM=1 and LLM_API_KEY required in .env)')
   }
@@ -1183,33 +1300,50 @@ async function catchUpOnce (argv) {
   // every summary already exists, so nothing below the first if would ever run
   // and the plain-English backlog would never move; and a commit summarized a
   // few lines above needs its line in the same cycle, not the next one.
-  if (llmConfigured()) {
-    // Guaranteed time slice for ELI5: guarantee at least 50-60 seconds before cycle deadline
-    const eli5Deadline = Math.max(now, cycleDeadline - 10000)
-    const eli5Env = {
-      ...cycleEnvBase,
-      LLM_DEADLINE_AT: String(eli5Deadline),
-      LLM_CYCLE_BUDGET: { remaining: Math.max(20, limit * 4) }
-    }
-    const eli5Written = await enrichEli5(entries, DATA, eli5Env, {
-      retryErrors: true,
-      priorityShas: new Set(freshShas.slice(-limit)),
-      getPatch: llmPatchFor,
-      getFullPatch: fullPatchFor,
-      repoDir: REPO_DIR
+  if (llmConfigured() && llmBudgetMs >= MIN_ENRICH_MS) {
+    // Whatever the summary pass left is the plain-English pass's slice, planned
+    // the same way. A summary written a few lines above gets its line in this
+    // same cycle, and a summary that could not be written does not consume a
+    // plain-English slot (eli5Eligible requires the summary).
+    const eli5Start = Date.now()
+    const eli5Window = Math.max(0, enrichEndsAt - eli5Start)
+    const eli5Plan = planLlmPass({
+      budgetMs: eli5Window,
+      limit: countPendingEli5(queueable),
+      concurrency: llmConcurrency(process.env),
+      rowBudgetMs: eli5RowBudgetMs(process.env)
     })
+    let eli5Written = 0
+    if (eli5Plan.usable) {
+      log(`[enrichment] plain-English pass: up to ${eli5Plan.rows} line(s) in ${Math.round(eli5Window / 1000)}s (${Math.round(eli5Plan.rowBudgetMs / 1000)}s per row)`)
+      eli5Written = await enrichEli5(entries, DATA, {
+        ...cycleEnvBase,
+        CHANGELOG_ELI5_LIMIT: String(eli5Plan.rows),
+        LLM_DEADLINE_AT: String(enrichEndsAt),
+        LLM_CYCLE_BUDGET: { remaining: Math.max(20, eli5Plan.rows * 4) }
+      }, {
+        retryErrors: true,
+        priorityShas: new Set(freshShas.slice(-Math.max(eli5Plan.rows, 1))),
+        getPatch: llmPatchFor,
+        getFullPatch: fullPatchFor,
+        repoDir: REPO_DIR
+      })
+    } else {
+      log(`[enrichment] plain-English pass skipped: ${eli5Plan.reason}`)
+    }
     const eli5Remaining = countPendingEli5(queueable)
     if (eli5Written || eli5Remaining) {
       log(`[enrichment] ELI5 wrote ${eli5Written} entries (${eli5Remaining} remaining)`)
     }
     didSummarize = didSummarize || eli5Written > 0
     const prDoc = await readJson(`${DATA}/open-prs.json`, null)
-    if (prDoc?.prs?.length && now < cycleDeadline) {
+    const prStart = Date.now()
+    if (prDoc?.prs?.length && prStart < enrichEndsAt) {
       // Same reason: PR previews get their own small pool and time slice
       // instead of whatever the two passes above happen to leave behind.
       const prEnv = {
         ...cycleEnvBase,
-        LLM_DEADLINE_AT: String(Math.min(cycleDeadline, now + Math.max(60000, limit * 30000))),
+        LLM_DEADLINE_AT: String(Math.min(enrichEndsAt, prStart + Math.max(60000, limit * 30000))),
         LLM_CYCLE_BUDGET: { remaining: Math.max(10, limit * 2) }
       }
       const previews = await enrichOpenPrs(prDoc.prs, DATA, prEnv, { getDiff: p => readFile(resolve(DATA, `pr-diffs/${p.number}.diff`), 'utf8').catch(() => '') })
@@ -1286,6 +1420,10 @@ export async function cmdWatch (argv, { cycle = cmdCatchUp, errorBudget } = {}) 
   log(`starting backfill loop (running every ${intervalSec}s${maxDurationMs < Infinity ? `, max duration ${durVal}` : ''})… Press Ctrl+C to stop.`)
   while (!stopped) {
     try {
+      // Publish what is left of the run before each cycle: a cycle that spent
+      // the whole watch duration on one paid window would be killed by the
+      // duration limit mid-enrichment, with its results never checkpointed.
+      process.env.CHANGELOG_WATCH_REMAINING_MS = String(Math.max(0, Math.round(maxDurationMs - (Date.now() - startTime))))
       const outcome = await cycle(argv)
       if (outcome && outcome.acquired === false) {
         // A peer run holds the worktree lock: idle, but healthy.
@@ -1833,7 +1971,18 @@ async function cmdRetryFailed (argv) {
     if (askable.length) {
       const only = new Set(askable.map(e => e.sha))
       await withDeadline(180000, async () => {
-        const env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(askable.length), LLM_DEADLINE_AT: String(deadlineAt()), LLM_CYCLE_BUDGET: { remaining: askable.length * 8 } }
+        // Named stragglers get an even share of the run's own window: enough
+        // for a real ask (45s floor), bounded so the first row cannot spend it
+        // all before the others are reached.
+        const env = {
+          ...process.env,
+          CHANGELOG_LLM_NO_BACKFILL: '1',
+          CHANGELOG_LLM_LIMIT: String(askable.length),
+          CHANGELOG_LLM_ROW_BUDGET_MS: String(Math.max(45000, Math.floor(180000 / Math.max(1, askable.length)))),
+          CHANGELOG_ELI5_ROW_BUDGET_MS: String(Math.max(30000, Math.floor(90000 / Math.max(1, askable.length)))),
+          LLM_DEADLINE_AT: String(deadlineAt()),
+          LLM_CYCLE_BUDGET: { remaining: askable.length * 8 }
+        }
         const before = llmCallCount()
         n = await enrichWithLlm(doc.entries, llmPatchFor, DATA, env, { retryErrors: true, priorityShas: only, only, repoDir: REPO_DIR, getFullPatch: fullPatchFor })
         asked = llmCallCount() - before
@@ -1946,15 +2095,20 @@ async function cmdRegenLast (argv) {
     const summaryBudgetMs = Math.floor(budgetMs * 0.6)
     const eli5BudgetMs = Math.floor(budgetMs * 0.4)
     const summaryDeadline = startedAt + summaryBudgetMs
+    // An even share of each half for each row, on top of the per-run split:
+    // one pathological row must not consume the summary half and leave the
+    // rest of the named set unanswered.
+    const rowShareMs = Math.max(60000, Math.floor(summaryBudgetMs / Math.max(1, askable.length)))
+    const eli5RowShareMs = Math.max(45000, Math.floor(eli5BudgetMs / Math.max(1, askable.length)))
     const beforeSummary = llmCallCount()
     await withDeadline(summaryBudgetMs, async () => {
-      const env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(askable.length + 1), LLM_DEADLINE_AT: String(summaryDeadline), LLM_CYCLE_BUDGET: { remaining: askable.length * 6 } }
+      const env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(askable.length + 1), CHANGELOG_LLM_ROW_BUDGET_MS: String(rowShareMs), LLM_DEADLINE_AT: String(summaryDeadline), LLM_CYCLE_BUDGET: { remaining: askable.length * 6 } }
       written = await enrichWithLlm(doc.entries, llmPatchFor, DATA, env, { force: only, only, priorityShas: only, retryErrors: true, repoDir: REPO_DIR, getFullPatch: fullPatchFor })
     })
     // The plain-English line follows the summary: a rewritten summary whose
     // claims changed re-queues its line through eli5Done on its own.
     const eli5Deadline = startedAt + eli5BudgetMs
-    const eli5Env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(askable.length + 1), LLM_DEADLINE_AT: String(eli5Deadline), LLM_CYCLE_BUDGET: { remaining: Math.max(20, askable.length * 4) } }
+    const eli5Env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(askable.length + 1), CHANGELOG_ELI5_ROW_BUDGET_MS: String(eli5RowShareMs), LLM_DEADLINE_AT: String(eli5Deadline), LLM_CYCLE_BUDGET: { remaining: Math.max(20, askable.length * 4) } }
     await enrichEli5(doc.entries, DATA, eli5Env, { only, priorityShas: only, retryErrors: true, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
     asked = llmCallCount() - beforeSummary
     // The "generate properly" half of the request: report the outcome per row,
