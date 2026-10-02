@@ -5,7 +5,7 @@
 //   node generator/cli.mjs build
 //   node generator/cli.mjs preview [port]
 import { mkdir, readFile, rm, cp } from 'node:fs/promises'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { resolve, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execSync } from 'node:child_process'
@@ -18,6 +18,8 @@ import {
 import {  enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, verifyConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows } from './lib/llm.mjs'
 import { QUALITY_POLICY_V, generationState, regenUnfinished } from './lib/quality.mjs'
 import { shortHash, eli5Source } from './lib/util.mjs'
+import { spillEntryEvidence, spillEvidence } from './lib/evidence.mjs'
+import { SIZE_MAX_BYTES, SIZE_WARN_BYTES, findOverBudget, sizeText } from './lib/sizebudget.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
 
@@ -945,6 +947,9 @@ export async function commitAndPushData ({ message, overrides = {}, attempts = 3
   const pending = await capturePendingWrites(dataDir, overrides)
   await persistMerged(pending)
   await repairDerivedFields(dataDir)
+  // The pre-push gate: a file GitHub would reject must fail here, where the
+  // message can name it, instead of at the remote where the whole push dies.
+  await assertDataSizeBudget(root, dataDir)
 
   if (!await dirtyData(root)) {
     // A clean worktree is not an up-to-date one: after three failed push
@@ -1204,6 +1209,9 @@ async function syncPhase (argv) {
 }
 
 async function catchUpOnce (argv, budgets = {}) {
+  // Fail before spending: an over-budget tracked file means this cycle cannot
+  // publish, so the paid phases must not run for a push that will be refused.
+  await assertDataSizeBudget(ROOT, DATA)
   const gitBudgetMs = durationMs(budgets.gitBudgetMs, GIT_BUDGET_DEFAULT_MS)
   const llmBudgetMs = durationMs(budgets.llmBudgetMs, LLM_CYCLE_BUDGET_DEFAULT_MS, { allowZero: true })
   // Phase 1 (sync, PR refresh, the first publish) under its own clock, then the
@@ -1842,11 +1850,13 @@ if (IS_MAIN) {
   else if (cmd === 'watch' || cmd === 'backfill') await cmdWatch(rest)
   else if (cmd === 'push-data') await cmdPushData(rest)
   else if (cmd === 'freshness') await cmdFreshness(rest)
+  else if (cmd === 'check-size') await cmdCheckSize(rest)
   else if (cmd === 'enrich-all') await cmdEnrichAll(rest)
   else if (cmd === 'repair-entries') await cmdRepairEntries(rest)
   else if (cmd === 'retry-failed') await cmdRetryFailed(rest)
   else if (cmd === 'regen-last') await cmdRegenLast(rest)
   else if (cmd === 'prune-cache') await cmdPruneCache(rest)
+  else if (cmd === 'compact-evidence') await cmdCompactEvidence(rest)
   else if (cmd === 'glossary') await cmdGlossary(rest)
   else if (cmd === 'eval') await cmdEval(rest)
   else if (cmd === 'normalize-dates') await cmdNormalizeDates(rest)
@@ -1867,6 +1877,8 @@ if (IS_MAIN) {
   node generator/cli.mjs retry-failed <sha>... [--admit] [--push]  # release named rows with no generation (clears stubs, re-asks, publishes; --admit decides a row that has neither admission nor an ask on record)
   node generator/cli.mjs regen-last <N | sha...> [--push]  # regenerate the newest N (max 50) or named rows: fresh summaries, bounded and forward-only
   node generator/cli.mjs prune-cache [--push]      # drop ai-summaries.json keys from retired prompt versions
+  node generator/cli.mjs compact-evidence [--push] [--dry-run]  # move stored evidence material into data/evidence/ shards so the tracked JSON files stay small
+  node generator/cli.mjs check-size              # CI gate: fail when a tracked file nears GitHub's 100 MiB push limit
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
   node generator/cli.mjs eval [--seed N] [--limit N]  # offline stored-artifact audit, zero provider calls
   node generator/cli.mjs normalize-dates [--push]  # one-off: rewrite stored timestamps to UTC and fix the day/month keys
@@ -2236,6 +2248,97 @@ async function cmdPruneCache (argv) {
     await writeJson(path, cache)
   }
   log(`[prune-cache] removed ${pruned} of ${before} keys (${Object.keys(cache).length} kept)`)
+}
+
+/**
+ * Every tracked file under data/, with its size. `-z` keeps unusual path bytes
+ * intact; ~10k stat() calls are cheap next to the git work around them.
+ */
+async function trackedDataFiles (root, dataDir) {
+  const rel = relative(root, resolve(dataDir)) || 'data'
+  const out = await git(['ls-files', '-z', '--', rel], root, { allowFail: true })
+  if (!out) return []
+  const files = []
+  for (const p of out.split('\0')) {
+    if (!p) continue
+    try { files.push({ path: resolve(root, p), bytes: statSync(resolve(root, p)).size }) } catch { /* staged but gone: nothing to weigh */ }
+  }
+  return files
+}
+
+/**
+ * The relay's pre-push gate: refuse to publish a tracked file GitHub would
+ * reject, with a message that names it. Checked before every commit
+ * (commitAndPushData) and before a cycle spends anything (catchUpOnce), so the
+ * failure is ours, early and actionable, instead of a remote "file too large"
+ * that kills the whole push.
+ */
+async function assertDataSizeBudget (root, dataDir) {
+  const { over } = findOverBudget(await trackedDataFiles(root, dataDir))
+  if (!over.length) return
+  const worst = over[0]
+  throw new Error(`${relative(root, worst.path)} is ${sizeText(worst.bytes)}, over the ${sizeText(SIZE_MAX_BYTES)} tracked-file budget (GitHub rejects pushes carrying a file over 100 MiB). Shard or trim it before the relay can publish again.`)
+}
+
+/**
+ * Move stored evidence material out of the tracked JSON files -- the
+ * ai-summaries cache records and the ai/eli5 copies on changelog entries --
+ * into data/evidence/<hash>.txt shards. A bundle keeps its hash, so a re-check
+ * still reads the exact evidence a verdict was recorded against; only the
+ * location changes. persistMerged runs the same spill on every write, so the
+ * relay compacts itself on its next cycle; this command is the explicit,
+ * auditable one, and --dry-run reports what it would move without touching
+ * anything. Run --push where the relay runs (the sync workflow): a local
+ * checkout's data may be stale, and a push built from it would publish that.
+ */
+async function cmdCompactEvidence (argv) {
+  const cachePath = `${DATA}/ai-summaries.json`
+  const docPath = `${DATA}/changelog.json`
+  const dryRun = argv.includes('--dry-run')
+  const cache = await readJson(cachePath, {})
+  const doc = await readJson(docPath, null)
+  const beforeCache = existsSync(cachePath) ? statSync(cachePath).size : 0
+  const beforeDoc = existsSync(docPath) ? statSync(docPath).size : 0
+  const fromCache = await spillEvidence(DATA, cache, { dryRun })
+  const fromEntries = doc ? await spillEntryEvidence(DATA, doc, { dryRun }) : { spilled: 0, bytes: 0 }
+  const spilled = fromCache.spilled + fromEntries.spilled
+  const bytes = fromCache.bytes + fromEntries.bytes
+  if (!spilled) {
+    log(`[compact-evidence] no inline material to move (${Object.keys(cache).length} cache records, ${doc?.entries?.length || 0} entries)`)
+    return
+  }
+  if (dryRun) {
+    log(`[compact-evidence] dry run: ${fromCache.spilled} cache record(s) + ${fromEntries.spilled} entry copy(ies), ${sizeText(bytes)} of material would move to data/evidence/`)
+    return
+  }
+  if (argv.includes('--push')) {
+    await commitAndPushData({
+      message: `data: move ${spilled} stored evidence bundle(s) into shard files (${utcStamp()} UTC)`,
+      overrides: { [cachePath]: cache, ...(doc ? { [docPath]: doc } : {}) }
+    })
+  } else {
+    await writeJson(cachePath, cache)
+    if (doc) await writeJson(docPath, doc)
+  }
+  log(`[compact-evidence] moved ${spilled} bundle(s) (${sizeText(bytes)} of material) to data/evidence/: ai-summaries.json ${sizeText(beforeCache)} -> ${sizeText(statSync(cachePath).size)}, changelog.json ${sizeText(beforeDoc)} -> ${sizeText(statSync(docPath).size)}`)
+}
+
+/**
+ * The CI half of the size budget: the same check as the relay's pre-push
+ * guard, visible in generator-check so a growing file fails a run long before
+ * GitHub would reject a push.
+ */
+async function cmdCheckSize () {
+  const files = await trackedDataFiles(ROOT, DATA)
+  const { over, near } = findOverBudget(files)
+  for (const f of near) log(`[check-size] WARNING ${relative(ROOT, f.path)} is ${sizeText(f.bytes)} (warn at ${sizeText(SIZE_WARN_BYTES)})`)
+  for (const f of over) log(`[check-size] FAIL ${relative(ROOT, f.path)} is ${sizeText(f.bytes)} (budget ${sizeText(SIZE_MAX_BYTES)})`)
+  const largest = [...files].sort((a, b) => b.bytes - a.bytes)[0]
+  if (!over.length) {
+    log(`[check-size] ${files.length} tracked files under data/: largest is ${largest ? `${relative(ROOT, largest.path)} at ${sizeText(largest.bytes)}` : 'none'}`)
+    return
+  }
+  process.exitCode = 1
 }
 /**
  * One-off repair of the stored history: rewrite every timestamp to UTC and

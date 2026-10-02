@@ -12,8 +12,10 @@
 // document as the base, and graft only *our* additions on top. Both files are
 // commutative under these rules, so commit order stops mattering.
 import { existsSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { readJson, writeJson, shortHash, eli5Source, normalizeDate } from './util.mjs'
 import { pruneStaleCache } from './versions.mjs'
+import { spillEntryEvidence, spillEvidence } from './evidence.mjs'
 
 export function sortEntries (entries) {
   return entries.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.sha < b.sha ? -1 : 1))
@@ -334,7 +336,16 @@ const MERGERS = {
 export async function persistMerged (pending) {
   for (const [path, ours] of Object.entries(pending)) {
     if (ours === null || ours === undefined) continue
-    const merger = MERGERS[path.split('/').pop()]
-    await writeJson(path, merger ? merger(ours, await readJson(path, null)) : ours)
+    const name = path.split('/').pop()
+    const merger = MERGERS[name]
+    const value = merger ? merger(ours, await readJson(path, null)) : ours
+    // Evidence material lives in shard files, never in the tracked JSON. A
+    // union merge can keep an origin record whose material is still inline, so
+    // every write re-spills before it lands: neither file can walk back to
+    // GitHub's 100 MiB push limit even during the transition. The spill mutates
+    // `value` in place (evidenceBundle -> { hash }).
+    if (name === 'ai-summaries.json') await spillEvidence(dirname(path), value)
+    else if (name === 'changelog.json') await spillEntryEvidence(dirname(path), value)
+    await writeJson(path, value)
   }
 }

@@ -46,6 +46,7 @@ import { mergeAiCache, mergeHealth } from './mergedata.mjs'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import { artifactHash, evidenceManifest, qualityOf, QUALITY_POLICY_V } from './quality.mjs'
+import { resolveEvidence, storeEvidence } from './evidence.mjs'
 const requestScope = new AsyncLocalStorage()
 import {
   extractCommentFacts,
@@ -3844,7 +3845,7 @@ export function promptContextOf ({ relText = '', sequence = null, prMeta = null,
 
 // One entry, start to finish: prompt, call, grounding repair, optional
 // verification, and the record both the cache and the entry receive.
-export async function summarizeEntry ({ entry: e, patch, relText = '', sequence = null, prMeta = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env }) {
+export async function summarizeEntry ({ entry: e, patch, relText = '', sequence = null, prMeta = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env, dataDir = null }) {
   if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv), () => summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env: baseEnv }))
   const callsAt = requestScope.getStore().calls
   // Tiered routing: the rows a reader opens go to LLM_MODEL_MAJOR when set.
@@ -4055,7 +4056,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     v: PROMPT_V,
     policy: QUALITY_POLICY_V,
     manifest,
-    evidenceBundle: { material: verifyMaterial, hash: shortHash(verifyMaterial) },
+    evidenceBundle: await storeEvidence(dataDir, verifyMaterial),
     ...(checkedHash ? { verifyHash: checkedHash } : {}),
     requests: requestScope.getStore().requests.slice(),
     acceptedPr: prMetaEff || null,
@@ -4519,7 +4520,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         // A changed release window is not a changed source diff. A bound bundle
         // lets us review the original artifact with its original evidence,
         // independent of today's context key. Never substitute current evidence.
-        const bundle = d.rec.evidenceBundle
+        const bundle = await resolveEvidence(dataDir, d.rec.evidenceBundle)
         const samePatch = d.k.startsWith(`${d.e.sha}:v${PROMPT_V}:${patchHash(patch)}`)
         if (!samePatch || !bundle?.material || bundle.hash !== shortHash(bundle.material)) continue
       }
@@ -4560,7 +4561,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           const promptCtx = promptContextOf({ relText, sequence, prMeta, archMap, glossary, context })
           const cautionNames = sequenceOnlyNames(sequence, groundingCorpus(e, patch, { ...promptCtx, sequence: null }))
           const described = reverify
-          const bundle = reverify.evidenceBundle
+          const bundle = await resolveEvidence(dataDir, reverify.evidenceBundle)
           if (bundle && (!bundle.material || bundle.hash !== shortHash(bundle.material))) throw new Error('Stored verification evidence hash mismatch')
           const material = bundle?.material || deliveredEvidence(buildPrompt(e, patch, promptCtx))
           const verdict = await verifySummary(e, material, described, env, cautionNames, { rollup: !!reverify.rollup })
@@ -4595,7 +4596,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           if (summaryDirt(rechecked)) health.dirtyRows++
           log(`LLM re-checked ${e.sha.slice(0, 8)}: ${objected ? `the objection stands (${(verdict.issues[0] || badClaims[0]?.quote || '').slice(0, 90)})` : 'verdict now recorded'}`)
           continue
-        }          const { record } = await summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env })
+        }          const { record } = await summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env, dataDir })
         gatewayFails = 0
         apiCalls++
         cacheModified = true
@@ -5445,7 +5446,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
         e.structured = context.structured
         if (queue[idx].reverify) {
           const plain = queue[idx].reverify
-          const bundle = plain.evidenceBundle
+          const bundle = await resolveEvidence(dataDir, plain.evidenceBundle)
           if (bundle && (!bundle.material || bundle.hash !== shortHash(bundle.material))) throw new Error('Stored plain-English evidence hash mismatch')
           const material = bundle?.material || [relText, redactProductPrompts(patch), ...contextSectionLines({ ...context, fileHistory: [] })].filter(Boolean).join('\n')
           let checkError
@@ -5473,7 +5474,8 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
           archMap,
           glossary,
           context,
-          env
+          env,
+          dataDir
         })
         gatewayFails = 0
         cache[key] = { ...record, src: shortHash(src) }
@@ -5540,7 +5542,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
 // One plain-English line, start to finish. `patch` is what the model is shown
 // (may be '' when CHANGELOG_ELI5_DIFF=0); `notesPatch` is what the comments are
 // mined from, which the pass has already paid for either way.
-export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, siblings = [], diffBytes = Infinity, relText = '', prMeta = null, sequence = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env }) {
+export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, siblings = [], diffBytes = Infinity, relText = '', prMeta = null, sequence = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env, dataDir = null }) {
   if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv), () => explainEntry({ entry: e, patch, notesPatch, siblings, diffBytes, relText, prMeta, sequence, archMap, glossary, context, env: baseEnv }))
   const callsAt = requestScope.getStore().calls
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
@@ -5654,7 +5656,7 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     v: ELI5_V,
     policy: QUALITY_POLICY_V,
     manifest,
-    evidenceBundle: { material, hash: shortHash(material) },
+    evidenceBundle: await storeEvidence(dataDir, material),
     // A deliberately disabled verifier leaves NO verdict, exactly like the
     // summary writer. Stamping 'unavailable' made every fresh line count as an
     // outage in llm-health and told the site a check was pending when none was
