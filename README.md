@@ -94,8 +94,9 @@ Human overrides in [data/overrides.json](data/overrides.json) take precedence at
 | Setting | Contract |
 |---|---|
 | `CHANGELOG_LLM=1` + `LLM_API_KEY` | Optional enrichment of admitted new work only |
-| `LLM_MODEL`, `LLM_MODEL_MAJOR`, `LLM_VERIFY_MODEL` | Model identities/routing; all default to `deepseek-v4.1` |
-| `LLM_API_BASE` | OpenAI-compatible provider; default `https://vyceai.com/v1` (the project provider). A missing setting can no longer route the writer elsewhere; the run logs the identity it is using |
+| `LLM_MODEL`, `LLM_MODEL_MAJOR`, `LLM_VERIFY_MODEL` | Model identities/routing; the configured writer is `gemini-3.6-flash` and the code literal floor stays `deepseek-v4.1` |
+| `LLM_API_BASE` | OpenAI-compatible provider; configured `https://generativelanguage.googleapis.com/v1beta`, literal floor `https://vyceai.com/v1`. A missing setting can no longer route the writer elsewhere; the run logs the identity it is using |
+| `LLM_API_KEYS` | Comma-separated bearer keys rotated one per call; the rolling RPM window stays global, so more keys share the load rather than raising the cap. `LLM_API_KEY` remains the single-key form |
 | `CHANGELOG_LLM_STREAM` | Requests stream by default (`stream: true`). Not a preference: the provider's non-streaming path times the origin out after ~12s and answers 504, while the same bytes streamed answer 200. `=0` disables, and a gateway that rejects the field is probed once and then never asked again |
 | `CHANGELOG_LLM_CYCLE_BUDGET_MS` | Wall clock one cycle may spend on model calls (default 300,000; further bounded by the watch run's remaining time) |
 | `CHANGELOG_LLM_ROW_BUDGET_MS`, `CHANGELOG_ELI5_ROW_BUDGET_MS` | Wall clock one row owns for all of its calls — writer, repairs, and any check (defaults 90,000 and 45,000). A row that runs out is left for the next cycle and keeps the short cooldown; it is never parked for our own budget |

@@ -4,17 +4,21 @@
 
 | Setting | Value | Where |
 |---|---|---|
-| Provider base | `https://vyceai.com/v1` | code default, workflow default, `.env` |
-| Writer model | `deepseek-v4.1` | code default, workflow default, `.env` |
-| Verifier model | `deepseek-v4.1` | code default (`CHANGELOG_LLM_VERIFY=0` disables the pass) |
+| Provider base | `https://generativelanguage.googleapis.com/v1beta` | repository secret `LLM_API_BASE` (code/workflow literal floor stays `https://vyceai.com/v1`) |
+| Writer model | `gemini-3.6-flash` | repository secret `LLM_MODEL` |
+| Key ring | two Google keys, rotated one per call | repository secrets `LLM_API_KEYS` (comma-separated) and `LLM_API_KEY` (first key, single-key fallback) |
+| Backup route | `deepseek-v4.1` at `https://vyceai.com/v1` | `LLM_BACKUP_*` secrets, used once when the primary route itself fails |
+| Verifier model | `gemini-3.6-flash` | `CHANGELOG_LLM_VERIFY=0` disables the pass in the relay |
 | Rate limit | 40 requests/minute | module cap (`LLM_PROVIDER_RPM`) and workflow default |
 | Streaming | on | `stream: true` on every request; `CHANGELOG_LLM_STREAM=0` disables |
 | Cycle paid window | 300,000 ms | `CHANGELOG_LLM_CYCLE_BUDGET_MS` |
 | Row budget | 90,000 ms (45,000 ms for plain-English) | `CHANGELOG_LLM_ROW_BUDGET_MS`, `CHANGELOG_ELI5_ROW_BUDGET_MS` |
 
 Repository settings (`nordicnode/freebuff-changelog`): secrets `LLM_API_KEY`,
-`LLM_API_BASE`, `LLM_MODEL`, `LLM_VERIFY_MODEL`, optional `LLM_MODEL_MAJOR` and
-`LLM_BACKUP_*`; variables `CHANGELOG_LLM`, `CHANGELOG_LLM_LIMIT`. **Set the values
+`LLM_API_KEYS`, `LLM_API_BASE`, `LLM_MODEL`, `LLM_VERIFY_MODEL`, optional
+`LLM_MODEL_MAJOR` and `LLM_BACKUP_*`; variables `CHANGELOG_LLM`,
+`CHANGELOG_LLM_LIMIT`. The operational identity lives here: the literals in the
+code and workflow are only the floor. **Set the values
 in repository settings, never in this file** — this repository is public, and an
 API key committed here is a key published to the world (and still readable in
 history after removal). A key that has ever been committed must be rotated at
@@ -23,8 +27,12 @@ the provider.
 Every paid run logs the identity it is using, once, with no secret in it:
 
 ```
-LLM provider: write deepseek-v4.1 @ https://vyceai.com/v1, verify deepseek-v4.1, backup deepseek-v4.1-flash @ https://vyceai.com/v1
+LLM provider: write gemini-3.6-flash @ https://generativelanguage.googleapis.com/v1beta, verify gemini-3.6-flash, backup deepseek-v4.1 @ https://vyceai.com/v1
 ```
+
+With more than one key in `LLM_API_KEYS`, requests rotate through them one per
+call (round-robin) while the rolling 40 requests/minute window stays global:
+more keys share the load, they do not raise the cap.
 
 ## Why the shape is what it is (measured 2026-10-02, not assumed)
 
