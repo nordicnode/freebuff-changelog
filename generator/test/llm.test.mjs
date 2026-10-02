@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test, { beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, chargeReverify, callUnanswered, callLlm, VERIFY_POLICY_V, releaseFailedRows } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, cleanText, unescapeSlashLeak, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, chargeReverify, callUnanswered, callLlm, VERIFY_POLICY_V, releaseFailedRows } from '../lib/llm.mjs'
 import { resetLlmRateLimiterForTests } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 beforeEach(() => resetLlmRateLimiterForTests())
@@ -1622,6 +1622,54 @@ test('normalizeEli5: unwraps the reply, strips the echoed label, keeps it honest
   // sentence-cased variant, is real text and stays.
   assert.equal(normalizeEli5({ eli5: 'You will see the everyday impact in the morning' }), 'You will see the everyday impact in the morning.')
   assert.equal(normalizeEli5({ eli5: 'The setting moved. Who it affects: the same people.' }), 'The setting moved. Who it affects: the same people.')
+})
+
+test('a JSON-escaped slash leaks no backslash into prose', () => {
+  // Measured on the live writer: deepseek-v4.1 double-escaped "/" inside its
+  // JSON reply on two plain-English rows, shipping \\/reasoning, \\/effort and
+  // \\/theme:toggle as if the backslash were part of the command. Nothing else
+  // in the pipeline notices a backslash before a slash: it is not an invented
+  // identifier, a hype word or a grounding miss.
+  assert.equal(
+    unescapeSlashLeak('A new \\/reasoning command, aliases \\/effort and \\/think, or switch with \\/model.'),
+    'A new /reasoning command, aliases /effort and /think, or switch with /model.'
+  )
+  assert.equal(unescapeSlashLeak('Press \\/theme:toggle at the prompt.'), 'Press /theme:toggle at the prompt.')
+  assert.equal(unescapeSlashLeak('\\/leading token'), '/leading token')
+  // A regex literal a summary quotes verbatim keeps its escape: there the
+  // backslash is the code, and it follows a word character, which is exactly
+  // the shape the repair leaves alone (06bf5c33 quotes this pattern).
+  const regex = 'matches CODEBUFF_OWN_CREDITS_ERROR_PATTERN (/codebuff\\.com\\/usage/i)'
+  assert.equal(unescapeSlashLeak(regex), regex)
+  assert.equal(unescapeSlashLeak('a\\/b stays escaped'), 'a\\/b stays escaped')
+  // A bare trailing escape is not a slash command; leave it alone.
+  assert.equal(unescapeSlashLeak('ends with \\/'), 'ends with \\/')
+  // Both funnels every published field passes through repair it.
+  assert.equal(cleanText('Use \\/reasoning to pick effort.'), 'Use /reasoning to pick effort.')
+  assert.equal(
+    normalizeEli5({ eli5: 'Use \\/reasoning to change effort; \\/effort is shorter.' }),
+    'Use /reasoning to change effort; /effort is shorter.'
+  )
+  const out = validateLlmOut({
+    title: 'Add \\/reasoning picker',
+    summary: 'The new \\/reasoning command opens an effort picker, with \\/effort as a shortcut.',
+    evidence: 'cli/src/data/slash-commands.ts registers \\/reasoning.',
+    changes: [{ area: 'Commands', what: 'Adds \\/reasoning to the registry.' }]
+  }, 'notable')
+  assert.equal(out.title, 'Add /reasoning picker')
+  assert.equal(out.summary, 'The new /reasoning command opens an effort picker, with /effort as a shortcut.')
+  assert.equal(out.evidence, 'cli/src/data/slash-commands.ts registers /reasoning.')
+  assert.equal(out.changes[0].what, 'Adds /reasoning to the registry.')
+})
+
+test('the plain-English ask does not solicit an availability claim', () => {
+  // "Say whether it is live today" made the model close with "it is live today
+  // in the current Freebuff CLI" on ~10% of lines: a rollout the diff cannot
+  // establish, read as ad copy. The rule keeps its real job -- do not call an
+  // unconsumed constant a feature -- without asking for the claim.
+  const prompt = buildEli5Prompt({ sha: 'a'.repeat(40), date: '2026-10-02T00:00:00Z', title: 't', stats: {} }, [], {})
+  assert.match(prompt, /- Availability: never claim the change is live/)
+  assert.doesNotMatch(prompt, /Say whether it is live today/)
 })
 
 test('normalizeEli5: a self-description parks in both spellings, prose in both does not', () => {
