@@ -60,6 +60,7 @@ test('R3: verifier requires audience and exact boolean field coverage', async t 
 })
 
 test('R2: unavailable repair cannot clear the original verifier objection', async t => {
+  const dir = await temp(t)
   let checks = 0
   t.mock.method(globalThis, 'fetch', async (url, init) => {
     const p = JSON.parse(init.body).messages.at(-1).content
@@ -69,7 +70,7 @@ test('R2: unavailable repair cannot clear the original verifier objection', asyn
     }
     return response({ title: /A reviewer/.test(p) ? 'Replacement title' : 'Limit changed', summary: 'The internal limit changed.', confidence: 'high' })
   })
-  const { record } = await summarizeEntry({ entry: entry(), patch, env })
+  const { record } = await summarizeEntry({ entry: entry(), patch, env, dataDir: dir })
   assert.equal(record.title, 'Limit changed')
   assert.equal(record.verify, 'flagged')
   assert.match(record.verifyClaims[0].claim, /Original claim/)
@@ -77,17 +78,19 @@ test('R2: unavailable repair cannot clear the original verifier objection', asyn
 })
 
 test('R4: invented plain-English promises receive a semantic objection', async t => {
+  const dir = await temp(t)
   t.mock.method(globalThis, 'fetch', async (url, init) => {
     const p = JSON.parse(init.body).messages.at(-1).content
     return response(/You are checking/.test(p) ? { supported: false, issues: ['Unlimited free access is not in the evidence.'], claims: [] } : { eli5: 'Everyone gets unlimited free access and guaranteed preservation of their work.' })
   })
-  const { record } = await explainEntry({ entry: entry(), patch, env })
+  const { record } = await explainEntry({ entry: entry(), patch, env, dataDir: dir })
   assert.equal(record.verify, 'flagged')
   assert.ok(qualityText({ eli5: record }).includes('Unlimited free access'))
   assert.equal(record.verifyHash, undefined)
 })
 
 test('verifier off: a fresh plain-English line carries no verdict, and no check is sent', async t => {
+  const dir = await temp(t)
   let calls = 0
   t.mock.method(globalThis, 'fetch', async (url, init) => {
     calls++
@@ -96,7 +99,7 @@ test('verifier off: a fresh plain-English line carries no verdict, and no check 
     return response({ eli5: 'The internal limit was raised.' })
   })
   const off = { ...env, CHANGELOG_LLM_VERIFY: '0' }
-  const { record } = await explainEntry({ entry: entry(), patch, env: off })
+  const { record } = await explainEntry({ entry: entry(), patch, env: off, dataDir: dir })
   assert.equal(calls, 1, 'only the writer was called')
   // 'unavailable' means a check was attempted and the route failed; a disabled
   // verifier owes no verdict, and stamping one polluted llm-health and told the
@@ -260,7 +263,7 @@ test('R8: a release roll-up is checked against its window, not the bump diff', a
     }
     return response({ title: 'Freebuff release 0.2.1', summary: 'This release adds ad metadata.', significance: 'major', confidence: 'high' })
   })
-  await summarizeEntry({ entry: bump, patch, relText: text, env, dir })
+  await summarizeEntry({ entry: bump, patch, relText: text, env, dataDir: dir })
   assert.equal(seen.length, 1, 'the row was verified once')
   assert.match(seen[0], /release roll-up/)
   assert.match(seen[0], /Ad metadata/, 'the member list is in the verifier material')
@@ -405,6 +408,7 @@ test('backup route: never loops, and a double failure names both routes', async 
 })
 
 test('backup route: provenance records which route served each request and the writing model', async t => {
+  const dir = await temp(t)
   const calls = []
   t.mock.method(globalThis, 'fetch', async (url, init) => {
     const u = String(url)
@@ -418,7 +422,7 @@ test('backup route: provenance records which route served each request and the w
     return response({ title: 'Limit capped', summary: 'Caps the limit to prevent runaway requests.', significance: 'minor', confidence: 'high' })
   })
   const be = { ...env, LLM_API_BASE: 'https://primary.test/v1', LLM_BACKUP_API_BASE: 'https://backup.test/v1', LLM_BACKUP_API_KEY: 'backup-key', LLM_BACKUP_MODEL: 'deepseek-v4.1-flash' }
-  const { record } = await summarizeEntry({ entry: entry(), patch, env: be })
+  const { record } = await summarizeEntry({ entry: entry(), patch, env: be, dataDir: dir })
   assert.equal(record.model, 'deepseek-v4.1-flash', 'the failover write is attributed to the model that wrote it')
   assert.equal(record.verify, 'passed', 'the verifier failed over too')
   assert.ok(record.requests.some(r => r.route === 'primary' && r.outcome === 'transport-error'), 'failed primary attempts stay visible')
@@ -572,6 +576,7 @@ test('release evidence: a verifier outage uses mechanical member facts, never un
 })
 
 test('plain-English repair: replacement ships only after an exact-text passing check', async t => {
+  const dir = await temp(t)
   let checks = 0
   t.mock.method(globalThis, 'fetch', async (url, init) => {
     const p = JSON.parse(init.body).messages.at(-1).content
@@ -581,7 +586,7 @@ test('plain-English repair: replacement ships only after an exact-text passing c
     }
     return response({ eli5: /A reviewer found/.test(p) ? 'The internal limit changed.' : 'Everyone gets unlimited access.' })
   })
-  const { record } = await explainEntry({ entry: entry(), patch, env })
+  const { record } = await explainEntry({ entry: entry(), patch, env, dataDir: dir })
   assert.equal(record.text, 'The internal limit changed.')
   assert.equal(record.verify, 'passed')
   assert.equal(record.verifyHash, artifactHash({ text: record.text }))

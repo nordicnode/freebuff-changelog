@@ -67,11 +67,19 @@ export function legacyEvidencePath (dataDir, hash) {
 // Persist material (if any) and return the bundle the record stores. Writing is
 // idempotent: equal material hashes to the same name, and an existing shard is
 // never rewritten.
+//
+// Material without a dataDir is a caller bug, not a mode: the returned hash
+// would name a shard nobody can resolve, and the material is unrecoverable the
+// moment this returns. That is how dangling references accumulated (one dropped
+// argument on the way down), so it throws instead of quietly storing nothing.
+// Empty material has no shard to write by definition, so it stays a hash-only
+// no-op either way.
 export async function storeEvidence (dataDir, material) {
   const hash = shortHash(material)
-  // No dataDir means a direct unit call (the writers' own tests): the bundle
-  // still carries its hash, there is just no shard to write.
-  if (dataDir && typeof material === 'string' && material.length) {
+  if (typeof material === 'string' && material.length) {
+    if (!dataDir) {
+      throw new Error('storeEvidence needs a dataDir to store evidence material: without one the returned hash names a shard that cannot be resolved, and the material is lost. Pass the data directory the record is stored under.')
+    }
     const path = evidencePath(dataDir, hash)
     // A legacy flat shard already holds these exact bytes, and writing the
     // fan-out copy too would double them until gcEvidence migrates the flat

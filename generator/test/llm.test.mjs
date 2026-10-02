@@ -2858,7 +2858,9 @@ test('leanPromptCtx: drops the wide sections and keeps the ground truth', () => 
   assert.ok(ctx.fullFiles.length, 'the caller\'s context is not mutated')
 })
 
-test('the summary ask drops the wide evidence before giving up on a row', async () => {
+test('the summary ask drops the wide evidence before giving up on a row', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'llm-ladder-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
   const wide = 'Complete Source of Modified Files'
   let fullAsks = 0
   const { seen, restore } = answerWith((prompt) => {
@@ -2867,7 +2869,7 @@ test('the summary ask drops the wide evidence before giving up on a row', async 
     return 'The latest Claude Opus model I know about is Claude Opus 4.1, which was released earlier this year.'
   })
   try {
-    const { record } = await summarizeEntry({ entry: LADDER_ENTRY, patch: LADDER_PATCH, context: LADDER_CONTEXT, env: LADDER_ENV })
+    const { record } = await summarizeEntry({ entry: LADDER_ENTRY, patch: LADDER_PATCH, context: LADDER_CONTEXT, env: LADDER_ENV, dataDir: dir })
     assert.equal(record.title, 'Handler cap added to base2')
     assert.ok(fullAsks >= 1, 'the full evidence is tried first')
     const lean = seen.at(-1)
@@ -2883,7 +2885,9 @@ test('the summary ask drops the wide evidence before giving up on a row', async 
   }
 })
 
-test('the plain-English ask takes the rung, for both a refusal and a memory answer', async () => {
+test('the plain-English ask takes the rung, for both a refusal and a memory answer', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'llm-ladder-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
   const wide = 'Complete source of the smaller touched files'
   for (const [label, reply] of [
     ['a training-memory answer', 'The latest Claude Opus model I know about is Claude Opus 4.1, which was released earlier this year.'],
@@ -2896,7 +2900,7 @@ test('the plain-English ask takes the rung, for both a refusal and a memory answ
       return reply
     })
     try {
-      const { record } = await explainEntry({ entry: LADDER_ENTRY, patch: LADDER_PATCH, context: LADDER_CONTEXT, env: LADDER_ENV })
+      const { record } = await explainEntry({ entry: LADDER_ENTRY, patch: LADDER_PATCH, context: LADDER_CONTEXT, env: LADDER_ENV, dataDir: dir })
       assert.match(record.text, /cap of three handlers/, `${label}: the lean ask is answered`)
       assert.ok(fullAsks >= 1, `${label}: the full evidence is tried first`)
       const lean = seen.at(-1)
@@ -3049,7 +3053,9 @@ test('a gave-up row gets bounded fresh attempts, then the cache serves it', asyn
   }
 })
 
-test('ELI5 escalation: a row every rung failed on gets the strong model', async () => {
+test('ELI5 escalation: a row every rung failed on gets the strong model', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'llm-ladder-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
   const minorEntry = { ...LADDER_ENTRY, significance: 'minor', ai: undefined }
   const orig = globalThis.fetch
   globalThis.fetch = async (url, init) => {
@@ -3062,7 +3068,8 @@ test('ELI5 escalation: a row every rung failed on gets the strong model', async 
   try {
     const { text, record } = await explainEntry({
       entry: minorEntry, patch: LADDER_PATCH, context: LADDER_CONTEXT,
-      env: { ...LADDER_ENV, LLM_MODEL_MAJOR: 'strong-model' }
+      env: { ...LADDER_ENV, LLM_MODEL_MAJOR: 'strong-model' },
+      dataDir: dir
     })
     assert.match(text, /cap of three handlers/, 'the strong model answered')
     assert.equal(record.model, 'strong-model', 'and the record says which model wrote it')

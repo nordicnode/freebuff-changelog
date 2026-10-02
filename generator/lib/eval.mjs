@@ -267,7 +267,7 @@ export async function runEval (entries, dataDir, env, { repoDir = null, getPatch
       const relText = hit?.text || ''
       const context = await gatherEntryContext(e, patch, { repoDir, entries, fullPatch })
       const probe = { ...e, structured: context.structured }
-      const { record, evidence } = await summarizeEntry({ entry: probe, patch, relText, sequence: sequenceForEntry(byDay, e, 25), prMeta: findPrMeta(e, prIndex), glossary, context, env })
+      const { record, evidence } = await summarizeEntry({ entry: probe, patch, relText, sequence: sequenceForEntry(byDay, e, 25), prMeta: findPrMeta(e, prIndex), glossary, context, env, dataDir })
       const score = scoreRow(probe, record, g)
       if (judge) {
         try {

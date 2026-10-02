@@ -47,6 +47,16 @@ test('storeEvidence never rewrites an existing shard, in either layout, and empt
   await assert.rejects(readFile(evidencePath(dir, shortHash('')), 'utf8'), 'empty material has no shard to read')
 }))
 
+test('storeEvidence throws when material has no dataDir to be stored in', async () => {
+  // A missing dataDir used to return a hash-only bundle: the hash named a
+  // shard that was never written, so the record could never resolve its
+  // evidence. A dropped argument is now a broken call, not a silent loss.
+  await assert.rejects(storeEvidence(null, MATERIAL), /needs a dataDir/)
+  await assert.rejects(storeEvidence(undefined, MATERIAL), /needs a dataDir/)
+  await assert.rejects(storeEvidence('', MATERIAL), /needs a dataDir/)
+  assert.deepEqual(await storeEvidence(null, ''), { hash: shortHash('') }, 'empty material has no shard to write, so it needs no directory')
+})
+
 test('resolveEvidence reads the shard back and keeps the stored hash', () => withDir(async dir => {
   const stored = await storeEvidence(dir, MATERIAL)
   const resolved = await resolveEvidence(dir, { ...stored })
