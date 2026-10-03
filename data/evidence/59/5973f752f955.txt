@@ -1,0 +1,835 @@
+Date: 2026-09-27T09:02:12Z
+Category: Agents
+Areas: Agents, Docs
+Commit nature: production
+Stats: +179 / -48
+Analysis notes: Agents, Docs changes across 3 file(s) (+179/−48).
+Modified files: agents/base-chat.ts, agents/researcher/researcher-web.ts, docs/testing.md
+Key facts (ground the WHY and DETAIL sentences in these): - Constants live inside handleSteps: it is serialized with toString() and re-evaluated standalone, so nothing outside this body is in scope. - Without this, every step ends the conversation on a raw tool result and the model is never asked for anything, so it ends the step after thinking — no text, no tool call — and the spawner gets a thinking trace instead of the summary.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Constants newly defined: MAX_RESEARCH_STEPS = 15 (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "researcher-web step budget" ; "a researcher that answers on its own is never interrupted" ; "a researcher that never answers is told to, then stopped" ; "survives serialization, as the runtime runs it"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `agents/base-chat.ts`:
+```
+/**
+ * Conversational agent behind freebuff.com/chat. Runs with no filesystem, but
+ * can spawn researcher-web to look things up on the live internet and call
+ * gravity_index to recommend third-party developer services. The chat server
+ * overrides `model` with the user's resolved chat selection on every request.
+ */
+```
+Complete Source of Modified Files (for complete module context):
+- File `agents/base-chat.ts` (148 lines):
+```
+import { FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID } from '@codebuff/common/constants/freebuff-models'
+
+import { publisher } from './constants'
+
+import type { SecretAgentDefinition } from './types/secret-agent-definition'
+
+/**
+ * Conversational agent behind freebuff.com/chat. Runs with no filesystem, but
+ * can spawn researcher-web to look things up on the live internet and call
+ * gravity_index to recommend third-party developer services. The chat server
+ * overrides `model` with the user's resolved chat selection on every request.
+ */
+const definition: SecretAgentDefinition = {
+  id: 'base-chat',
+  publisher,
+  model: FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+  displayName: 'Freebuff Chat',
+  spawnerPrompt: 'General-purpose chat assistant for freebuff.com/chat.',
+  inputSchema: {
+    prompt: {
+      type: 'string',
+      description: 'The user message to respond to.',
+    },
+  },
+  outputMode: 'last_message',
+  toolNames: [
+    'spawn_agents',
+    'gravity_index',
+    'render_ui',
+    'suggest_followups',
+  ],
+  spawnableAgents: ['researcher-web', 'thinker-gemini', 'context-pruner'],
+
+  systemPrompt: `[freebuff product prompt text omitted]`,
+  instructionsPrompt: `Be direct and helpful. Use markdown when it improves clarity (code blocks, lists, tables), and keep answers as short as they can be while fully answering the question.
+
+When the user is choosing a third-party developer service (database, auth, payments, hosting, email, monitoring, analytics, AI APIs, storage, CMS, search, etc.) or asks what provider to use for something, use the gravity_index tool instead of answering from memory: \`[freebuff product prompt text omitted]
+[freebuff product prompt text omitted],
+
+  handleSteps: function* ({ model, contextPruning }) {
+    // Constants live inside handleSteps because it is serialized with
+    // toString() and re-evaluated standalone — nothing outside this body,
+    // imports included, is in scope. CONTEXT_WINDOWS mirrors
+    // FREEBUFF_MODEL_CONTEXT_WINDOWS (common/src/constants/freebuff-models.ts);
+    // agents/__tests__/base-chat.test.ts fails if the two drift.
+
+    /** Hard context window (tokens) per backend model id. */
+    const CONTEXT_WINDOWS: Record<string, number> = {
+      'minimax/minimax-m3': 524_288,
+      'deepseek/deepseek-v4-flash': 1_048_576,
+      'deepseek/deepseek-v4-pro': 1_048_576,
+      // 1_050_000 per OpenRouter's endpoints API; entered low, so the 0.4
+      // budget below lands on exactly 400k. Without this Luna took
+      // DEFAULT_CONTEXT_WINDOW and got a 52k budget on a million-token model.
+      'openai/gpt-5.6-luna': 1_000_000,
+      // GPT-6 Luna publishes the same 1,050,000; entered low like its peers.
+      'openai/gpt-6-luna': 1_000_000,
+      'openai/gpt-5.6-luna-es': 372_000,
+      'meta/muse-spark-1.2-contributor': 1_000_000,
+      'google/gemini-3.8-flash': 1_000_000,
+      'meta/muse-spark-1.3-contributor': 1_000_000,
+      // Ox Alpha: 1,048,576 published, entered low for the same reason.
+      'stealth/ox-alpha': 1_000_000,
+      // GLM 5.3 Flash: 1,310,720 published, entered low for the same reason.
+      'z-ai/glm-5.3-flash': 1_000_000,
+      // Solar Pro 4: 524,288 published, entered low for the same reason.
+      'upstage/solar-pro4': 500_000,
+      // Solar Mini 4: the same 524,288 published.
+      'upstage/solar-mini4': 500_000,
+      // Space Bunny Alpha: 1,000,000 published.
+      'stealth/space-bunny-alpha': 1_000_000,
+    }
+
+    /** For any model not listed above. Assuming a window is smaller than it is
+     *  only prunes early; assuming it is larger wedges the thread forever, so
+     *  unmeasured models get a deliberately small one. */
+    const DEFAULT_CONTEXT_WINDOW = 131_072
+
+    /** Share of the window the conversation may occupy before we summarize.
+     *
+     *  This is deliberately low because contextTokenCount is NOT the provider's
+     *  count — it is a local estimate (GPT-4o tokenizer times a fixed fudge
+     *  factor) applied to models with their own tokenizers, and it can run well
+     *  under the real number. Measured against the threads that actually wedged
+     *  in prod: MiniMax charged 1.68–3.35 chars/token (median 2.60), while the
+     *  local estimator yields 1.95 (JSON) to 3.33 (English prose) on comparable
+     *  content. Worst case the estimate is ~half the provider's count, so a
+     *  budget above 0.5 would only trip after the request was already
+     *  rejectable — the exact failure this pruning exists to prevent. 0.4
+     *  leaves headroom for that skew plus the response, and still admits a very
+     *  long conversation (~200k estimated tokens on a 512k model). */
+    const CONTEXT_BUDGET_FRACTION = 0.4
+
+    /** The pruner also prunes on a prompt-cache miss, defaulting to a 5-minute
+     *  gap. Chat tabs idle for hours, so that would re-summarize a short
+     *  conversation after any coffee break — context loss for a product whose
+     *  job is remembering. Set high to leave the context limit as the only
+     *  trigger. */
+    const CACHE_EXPIRY_MS = 24 * 60 * 60 * 1000
+
+    /** DeepSeek Flash is the exception: its Luminal lane forgets the prefix
+     *  in ~15 minutes, so past that the compaction only shrinks a cold prefill
+     *  that was coming anyway. Gap and floor arrive via the runtime's
+     *  `contextPruning` (see common/src/constants/compaction-policy.ts). */
+    const compaction =
+      model === 'deepseek/deepseek-v4-flash' && contextPruning
+        ? {
+            cacheExpiryMs: contextPruning.cacheExpiryMs,
+            cacheExpiryMinTokens: contextPruning.cacheExpiryMinTokens,
+          }
+        : { cacheExpiryMs: CACHE_EXPIRY_MS }
+
+    // `model` is absent only when the generator is driven directly (tests) or
+    // by a runtime predating AgentStepContext.model.
+    const contextWindow = CONTEXT_WINDOWS[model ?? ''] ?? DEFAULT_CONTEXT_WINDOW
+    const maxContextLength = Math.floor(contextWindow * CONTEXT_BUDGET_FRACTION)
+
+    while (true) {
+      // Prune before every step, budgeted to the model this step will actually
+      // use. That ordering is what makes a mid-thread model switch survivable:
+      // a thread grown on a 512k model gets summarized down on the first step
+      // after switching to a 256k one, instead of being rejected forever.
+      yield {
+        toolName: 'spawn_agent_inline',
+        input: {
+          agent_type: 'context-pruner',
+          params: { maxContextLength, ...compaction },
+        },
+        includeToolCall: false,
+      } as any
+
+      const { stepsComplete } = yield 'STEP'
+      if (stepsComplete) break
+    }
+  },
+}
+
+export default definition
+```
+- File `agents/researcher/researcher-web.ts` (79 lines):
+```
+import { GEMINI_3_5_FLASH_LITE_MODEL_ID } from '@codebuff/common/constants/gemini'
+
+import { publisher } from '../constants'
+
+import type { SecretAgentDefinition } from '../types/secret-agent-definition'
+
+const definition: SecretAgentDefinition = {
+  id: 'researcher-web',
+  publisher,
+  model: GEMINI_3_5_FLASH_LITE_MODEL_ID,
+  displayName: 'Web Researcher',
+  spawnerPrompt: `Browses the web to find relevant information.`,
+  inputSchema: {
+    prompt: {
+      type: 'string',
+      description: 'A question you would like answered using web search',
+    },
+  },
+  outputMode: 'last_message',
+  includeMessageHistory: false,
+  toolNames: ['web_search', 'read_url'],
+  spawnableAgents: [],
+
+  systemPrompt: `[freebuff product prompt text omitted]`,
+  instructionsPrompt: `Provide comprehensive research on the user's prompt.
+
+Research iteratively, in multiple rounds:
+1. Start with 1-2 web_search calls. Inspect the titles, links, snippets, answer boxes, and related results.
+2. Call read_url on the most promising results, especially official or primary sources. Call read_url on several pages at once, in parallel.
+3. After reading, check what is still missing, uncertain, or worth verifying. Run follow-up searches with refined queries (using new terms you learned from the pages) and read more pages until the question is well covered from multiple sources.
+
+If read_url cannot handle a source, choose a different result or explain the limitation.
+
+Then, write a concise answer with key findings and cite the URLs of source pages you actually read for those findings. Include these source URLs in the final answer so the parent agent can pass them on to the user.
+
+[freebuff product prompt text omitted]
+
+You have a limited number of research steps. Be efficient: batch your read_url calls in parallel, and answer as soon as the question is well covered.
+`.trim(),
+  // Without this, every step ends the conversation on a raw tool result and
+  // the model is never asked for anything, so it ends the step after thinking
+  // — no text, no tool call — and the spawner gets a thinking trace instead of
+  // the summary.
+  stepPrompt: `Continue. Respond with either more tool calls or your final written answer.`,
+
+  // A spawned agent gets the runtime's default of 200 steps whatever its
+  // parent's maxAgentSteps is (spawn-agent-utils.ts), and nothing above ever
+  // stops a researcher that will not write its answer — the HARD RULE above
+  // keeps it searching whenever read_url fails. That is how five chat messages
+  // became 1,519 researcher calls in one hour on 2026-09-26. Measured over
+  // that day's 13,384 chat messages: a message that researched at all used 4
+  // researcher calls at the least, most often 6-10, and 16 at the median
+  // across ALL of its researchers — so 15 research steps plus one forced
+  // answer per researcher stops only the runaway ones.
+  handleSteps: function* () {
+    // Constants live inside handleSteps: it is serialized with toString() and
+    // re-evaluated standalone, so nothing outside this body is in scope.
+    const MAX_RESEARCH_STEPS = 15
+
+    for (let step = 0; step < MAX_RESEARCH_STEPS; step++) {
+      const { stepsComplete } = yield 'STEP'
+      if (stepsComplete) return
+    }
+
+    yield {
+      toolName: 'add_message',
+      input: {
+        role: 'user',
+        content:
+          '[freebuff product prompt text omitted]',
+      },
+      includeToolCall: false,
+    }
+    yield 'STEP'
+  },
+}
+
+export default definition
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `agents/__tests__/researcher-web.test.ts` (12 matching lines):
+```
+const agentState: AgentState = {
+  agentId: 'researcher-web-test',
+  runId: 'test-run',
+  parentId: undefined,
+  messageHistory: [],
+  output: undefined,
+  systemPrompt: '',
+  toolDefinitions: {},
+  contextTokenCount: 0,
+}
+
+/** Drives handleSteps the way the runtime does, answering each 'STEP' with
+ *  `stepsComplete` from `finishesAfter` and recording everything yielded. */
+function drive(finishesAfter: number | null) {
+  const generator = researcherWeb.handleSteps!({
+    agentState,
+    prompt: 'q',
+    logger: console as unknown as AgentStepContext['logger'],
+  })
+  const yielded: unknown[] = []
+  let steps = 0
+  let next = generator.next()
+  while (!next.done) {
+    yielded.push(next.value)
+    if (next.value === 'STEP') steps++
+    next = generator.next({
+      agentState,
+      toolResult: undefined,
+      stepsComplete: finishesAfter !== null && steps >= finishesAfter,
+    })
+  }
+  return { yielded, steps }
+}
+
+describe('researcher-web step budget', () => {
+  test('a researcher that answers on its own is never interrupted', () => {
+    const { yielded, steps } = drive(6)
+    expect(steps).toBe(6)
+    expect(yielded.every((v) => v === 'STEP')).toBe(true)
+  })
+
+  test('a researcher that never answers is told to, then stopped', () => {
+    const { yielded, steps } = drive(null)
+    // 15 research steps plus exactly one forced answer — not the runtime's
+```
+- File `packages/agent-runtime/src/__tests__/compact-history-now.test.ts` (11 matching lines):
+```
+// The forced pass. `maybeCompactHistory` answers "is this worth doing unasked";
+// `compactHistoryNow` is what a host calls when the user has already decided, so
+// what it pins is that the decision is the only thing removed — the protected
+// prefix, the fresh tool exchange and the budget are all still the shared ones —
+// plus the two answers a caller has to be able to tell apart: a reduction, and
+// nothing worth doing.
+
+import { describe, expect, it } from 'bun:test'
+
+import { compactHistoryNow, maybeCompactHistory } from '../compact-history'
+import { countTokensMessages } from '../util/token-counter'
+
+import type { JSONValue } from '@codebuff/common/types/json'
+…
+const contextTokenCount = countTokensMessages(messages)
+    // Well under the budget and the cache is warm: nothing to trigger on.
+    expect(
+      maybeCompactHistory({
+        messages,
+        contextTokenCount,
+        maxContextLength: 400_000,
+        cacheExpiryMs: null,
+      }),
+    ).toBeNull()
+
+    const forced = compactHistoryNow({ messages, maxContextLength: 400_000 })
+    expect(forced).not.toBeNull()
+    expect(forced!.nextTokens).toBeLessThan(forced!.previousTokens)
+    expect(countTokensMessages(forced!.messages)).toBe(forced!.nextTokens)
+    expect(JSON.stringify(forced!.messages)).not.toContain(
+      'export const upload',
+    )
+  })
+
+  it('keeps the last request live and the files it named in memory', () => {
+    const forced = compactHistoryNow({
+      messages: settledHistory(),
+      maxContextLength: 400_000,
+    })!
+    const live = forced.messages.filter((message) =>
+```
+- File `packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts` (3 matching lines):
+```
+...loopAgentStepsBaseParams,
+      agentType: 'test-agent',
+      localAgentTemplates,
+    })
+
+    console.log(`LLM calls made: ${llmCallCount}`)
+    console.log(`Step count: ${stepCount}`)
+
+    // CORRECT BEHAVIOR: After STEP, LLM should be called once
+    // The programmatic agent yields STEP, then LLM runs once and ends turn
+    expect(llmCallCount).toBe(1) // LLM called once after STEP
+
+    // The programmatic agent should have been called once (yielded STEP)
+    expect(stepCount).toBe(1)
+  })
+
+  it('should demonstrate correct behavior when programmatic agent completes without STEP', async () => {
+    // This test shows that when a programmatic agent doesn't yield STEP,
+    // it should complete without calling the LLM at all (since it ends with end_turn)
+
+    const mockGeneratorFunction = function* () {
+      yield { toolName: 'read_files', input: { paths: ['file1.txt'] } }
+      yield {
+        toolName: 'write_file',
+        input: { path: 'output.txt', content: 'test' },
+…
+// LLM always tries to end turn
+      yield { type: 'text' as const, text: 'LLM response\n\n' }
+      yield createToolCallChunk('end_turn', {})
+      return promptSuccess(`mock-message-id-${promptCallCount}`)
+    }
+
+    await loopAgentSteps({
+      ...loopAgentStepsBaseParams,
+      agentType: 'test-agent',
+      localAgentTemplates,
+    })
+
+    // Verify handleSteps ran 3 times (yielded STEP twice, then end_turn)
+    expect(programmaticStepCount).toBe(3)
+
+    // Verify LLM was called 2 times (once per STEP yield)
+    expect(llmStepCount).toBe(2)
+
+    // This confirms that even though LLM called end_turn every time,
+    // the loop continued because handleSteps kept yielding STEP before finally ending
+  })
+
+  it('should restart loop when agent finishes without setting required output', async () => {
+    // Test that when an agent has outputSchema but finishes without calling set_output,
+    // the loop restarts with a system message
+…
+source: 'stream-interrupted' as const,
+            message: 'The connection dropped while the response was streaming.',
+          }
+          return promptSuccess('interrupted-message-id')
+        }
+        yield { type: 'text' as const, text: 'complete answer' }
+        yield createToolCallChunk('end_turn', {})
+        return promptSuccess('complete-message-id')
+      }
+
+      const result = await loopAgentSteps(loopAgentStepsBaseParams)
+
+      // The interruption forced a second step (the retry), which completed.
+      expect(callCount).toBe(2)
+      expect(result.output?.type).not.toBe('error')
+
+      const notes = result.agentState.messageHistory.filter(
+        (m) => m.role === 'user' && m.tags?.includes(STREAM_INTERRUPTED_TAG),
+      )
+      expect(notes).toHaveLength(1)
+    })
+
+    it('gives up with a clear error when every attempt is interrupted', async () => {
+      let callCount = 0
+      loopAgentStepsBaseParams.promptAiSdkStream = async function* () {
+```
+- File `cli/src/hooks/use-freebuff-session.ts` (2 matching lines):
+```
+case 'purchase_capacity':
+      return null
+  }
+}
+
+// --- Poll-loop control surface ---------------------------------------------
+//
+// The hook below registers a controller object here on mount; module-level
+// imperative functions (restart / mark superseded / mark ended / etc.) talk
+// to it without going through React. Non-React callers (chat-completions
+// gate, exit paths) hit those functions directly.
+
+/** How the next tick should behave after a forced restart.
+ *   - 'rejoin'  → POST: claim/rotate a seat (used after explicit end-and-rejoin
+ *                 or when the chat gate kicks us back to the queue).
+ *   - 'landing' → GET: drop to the model-picker (status 'none') so the user
+ *                 reconfirms a model before rejoining. */
+type RestartMode = 'rejoin' | 'landing'
+
+interface PollController {
+  refreshMetadata: () => Promise<void>
+  /** Cancel the in-flight tick + timer and start a fresh one in `mode`. */
+  restart: (mode: RestartMode, rotateClaim?: boolean) => Promise<void>
+  apply: (next: FreebuffSessionResponse) => void
+  abort: () => void
+…
+}
+        if (rotateClaim || claimRetired) {
+          if (
+            useFreebuffSessionStore.getState().pendingAdmission?.instanceId ===
+            claimId
+          )
+            useFreebuffSessionStore.getState().setPendingAdmission(null)
+          claimId = newFreebuffCliInstanceId()
+          attemptedModel = undefined
+          claimRetired = false
+        }
+        // Reset previousStatus so the admission bell still fires after
+        // a forced restart, and so the active|ended → none synthesis below
+        // doesn't bounce a 'landing' restart straight back to 'ended'.
+        previousStatus = null
+        needsFullActivePoll = false
+        consecutiveFailures = 0
+        setFailure(null)
+        if (mode === 'landing') {
+          nextMethod = 'GET'
+          // Land on the picker immediately. We can't go through the normal
+          // tick/apply path because a server-side row that hasn't been
+          // swept yet would trip the startup-takeover branch into an
+          // auto-POST — the exact silent-rejoin this mode exists to
+          // prevent. But the picker still needs live quota snapshots, so kick
+```
+- File `common/src/ads/sponsored-command-refusals.ts` (2 matching lines):
+```
+const RAILS_DESTRUCTIVE =
+  /^db:(drop|reset|purge|setup|truncate_all|rollback|schema:load|migrate:reset|migrate:redo|seed:replant)(:|$)/
+
+const ARTISAN_DESTRUCTIVE = /^(migrate:(fresh|refresh|reset|rollback)|db:wipe)$/
+
+/** Keyed by `commandName` of the executable, after runners are unwrapped. */
+const DATABASE_RULES: ReadonlyMap<string, DatabaseRule> = new Map(
+  Object.entries<DatabaseRule>({
+    prisma: (args) => {
+      const [first, second] = words(args, PRISMA_VALUE_OPTIONS)
+      if (first === 'migrate' && second === 'reset') return 'migrate reset'
+      const forced = flags(args).find((flag) =>
+        /^--(force-reset|accept-data-loss)(=|$)/.test(flag),
+      )
+      return forced ? [first, second, forced].filter(Boolean).join(' ') : null
+    },
+    'drizzle-kit': firstWordIs(/^(push|drop)(:|$)/, DRIZZLE_VALUE_OPTIONS),
+    dropdb: () => '',
+    dropuser: () => '',
+    mysqladmin: anyWordIs(/^drop$/),
+    'redis-cli': anyWordIs(/^(flushall|flushdb)$/),
+    knex: anyWordIs(/^migrate:(rollback|down)$/),
+    sequelize: anyWordIs(/^db:(drop|migrate:undo(:all)?|seed:undo(:all)?)$/),
+    'sequelize-cli': anyWordIs(
+      /^db:(drop|migrate:undo(:all)?|seed:undo(:all)?)$/,
+    ),
+    rails: anyWordIs(RAILS_DESTRUCTIVE),
+    rake: anyWordIs(RAILS_DESTRUCTIVE),
+    artisan: (args) => {
+      const [first] = words(args)
+      if (!first) return null
+      if (ARTISAN_DESTRUCTIVE.test(first)) return first
+      const forced = flags(args).includes('--force')
+      return forced && /^(migrate|db:seed)(:|$)/.test(first)
+        ? `${first} --force`
+        : null
+    },
+    'manage.py': djangoRule,
+    'django-admin': djangoRule,
+    alembic: firstWordIs(/^downgrade$/, ALEMBIC_VALUE_OPTIONS),
+    mix: anyWordIs(/^ecto\.(drop|reset|rollback)$/),
+    typeorm: anyWordIs(/^(schema:drop|schema:sync|migration:revert)$/),
+    'typeorm-ts-node-commonjs': anyWordIs(
+      /^(schema:drop|schema:sync|migration:revert)$/,
+    ),
+```
+- File `packages/agent-runtime/src/__tests__/n-parameter.test.ts` (2 matching lines):
+```
+logger,
+          signal: new AbortController().signal,
+          tools: {},
+        })
+
+        expect(result.generateN).toBe(nValue)
+
+        // Clear the generator cache between iterations
+        clearAgentGeneratorCache({ logger })
+      }
+    })
+
+    it('should not set generateN when GENERATE_N is not yielded', async () => {
+      mockTemplate.handleSteps = function* () {
+        yield { toolName: 'read_files', input: { paths: ['test.txt'] } }
+        yield { toolName: 'write_file', input: { path: 'out.txt' } }
+        yield { toolName: 'end_turn', input: {} }
+      }
+
+      const result = await runProgrammaticStep({
+        ...agentRuntimeImpl,
+        runId: 'test-run-id',
+        ancestorRunIds: [],
+        repoId: undefined,
+        repoUrl: undefined,
+…
+// First GENERATE_N
+      const result1 = await runProgrammaticStep(mockParams)
+      expect(result1.generateN).toBe(2)
+
+      // Provide first batch of responses
+      const result2 = await runProgrammaticStep({
+        ...mockParams,
+        agentState: result1.agentState,
+        nResponses: ['A1', 'A2'],
+        stepNumber: 2,
+      })
+
+      // Second GENERATE_N should be yielded
+      expect(result2.generateN).toBe(3)
+
+      // Provide second batch of responses
+      const result3 = await runProgrammaticStep({
+        ...mockParams,
+        agentState: result2.agentState,
+        nResponses: ['B1', 'B2', 'B3'],
+        stepNumber: 3,
+      })
+
+      expect(allResponses).toEqual([
+        ['A1', 'A2'],
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `agents/__tests__/researcher-web.test.ts`: "researcher-web step budget"; "a researcher that answers on its own is never interrupted"; "a researcher that never answers is told to, then stopped"; "survives serialization, as the runtime runs it"
+```
+import { describe, expect, test } from 'bun:test'
+import researcherWeb from '../researcher/researcher-web'
+import type { AgentState, AgentStepContext } from '../types/agent-definition'
+const agentState: AgentState = {
+  agentId: 'researcher-web-test',
+  runId: 'test-run',
+  parentId: undefined,
+  messageHistory: [],
+  output: undefined,
+  systemPrompt: '',
+  toolDefinitions: {},
+  contextTokenCount: 0,
+}
+/** Drives handleSteps the way the runtime does, answering each 'STEP' with
+ *  `stepsComplete` from `finishesAfter` and recording everything yielded. */
+function drive(finishesAfter: number | null) {
+  const generator = researcherWeb.handleSteps!({
+    agentState,
+    prompt: 'q',
+    logger: console as unknown as AgentStepContext['logger'],
+  })
+  const yielded: unknown[] = []
+  let steps = 0
+  let next = generator.next()
+  while (!next.done) {
+    yielded.push(next.value)
+    if (next.value === 'STEP') steps++
+    next = generator.next({
+      agentState,
+      toolResult: undefined,
+      stepsComplete: finishesAfter !== null && steps >= finishesAfter,
+    })
+  }
+  return { yielded, steps }
+}
+describe('researcher-web step budget', () => {
+  test('a researcher that answers on its own is never interrupted', () => {
+    const { yielded, steps } = drive(6)
+    expect(steps).toBe(6)
+    expect(yielded.every((v) => v === 'STEP')).toBe(true)
+  })
+  test('a researcher that never answers is told to, then stopped', () => {
+    const { yielded, steps } = drive(null)
+    // 15 research steps plus exactly one forced answer — not the runtime's
+    // default of 200 for a spawned agent.
+    expect(steps).toBe(16)
+    const forced = yielded[yielded.length - 2] as {
+      toolName: string
+      input: { role: string; content: string }
+    }
+    expect(forced.toolName).toBe('add_message')
+    expect(forced.input.role).toBe('user')
+    expect(forced.input.content).toContain('[freebuff product prompt text omitted]')
+    expect(yielded[yielded.length - 1]).toBe('STEP')
+  })
+  test('survives ser
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/agents/base-chat.ts b/agents/base-chat.ts
+index 9b847d506..87592a0ea 100644
+--- a/agents/base-chat.ts
++++ b/agents/base-chat.ts
+@@ -14,51 +14,51 @@ const definition: SecretAgentDefinition = {
+   id: 'base-chat',
+   publisher,
+   model: FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+   displayName: 'Freebuff Chat',
+   spawnerPrompt: 'General-purpose chat assistant for freebuff.com/chat.',
+   inputSchema: {
+     prompt: {
+       type: 'string',
+       description: 'The user message to respond to.',
+     },
+   },
+   outputMode: 'last_message',
+   toolNames: [
+     'spawn_agents',
+     'gravity_index',
+     'render_ui',
+     'suggest_followups',
+   ],
+   spawnableAgents: ['researcher-web', 'thinker-gemini', 'context-pruner'],
+ 
+   systemPrompt: `[freebuff product prompt text omitted]`,
+   instructionsPrompt: `Be direct and helpful. Use markdown when it improves clarity (code blocks, lists, tables), and keep answers as short as they can be while fully answering the question.
+ 
+ When the user is choosing a third-party developer service (database, auth, payments, hosting, email, monitoring, analytics, AI APIs, storage, CMS, search, etc.) or asks what provider to use for something, use the gravity_index tool instead of answering from memory: \`[freebuff product prompt text omitted]
+-[freebuff product prompt text omitted]
++[freebuff product prompt text omitted]
+ 
+ Whenever a question needs real reasoning, spawn the thinker-gemini agent and let it do the thinking — do not reason it out yourself in your reply. This is your default for anything beyond a quick lookup: math or logic problems, puzzles, debugging, code design, architecture and trade-off decisions, planning, comparisons, "why/how" explanations, estimates, or any multi-step question. When in doubt, spawn the thinker. First gather any context you need (spawn researcher-web for current info, call gravity_index for service questions), then spawn the thinker. It sees the full conversation, including everything your tools returned, so give it a short, focused prompt naming the problem — don't repeat the gathered context. It is fine (often good) to spawn the thinker even when you think you know the answer; let it verify the reasoning. Wait for its conclusion, then write the final answer to the user in your own words. Skip the thinker only for trivial, purely factual, or conversational messages (greetings, simple definitions, quick lookups) where there is nothing to reason about.
+ 
+ [freebuff product prompt text omitted]
+ 
+ Never spawn the context-pruner agent: it is spawned automatically for you before each step.
+ 
+ End every response by calling the suggest_followups tool with exactly 3 followups the user is likely to want next — natural next questions, deeper dives, or related directions that build on what you just said. Make them specific to this conversation, not generic. For each followup give a short \`[freebuff product prompt text omitted]`,
+ 
+   handleSteps: function* ({ model, contextPruning }) {
+     // Constants live inside handleSteps because it is serialized with
+     // toString() and re-evaluated standalone — nothing outside this body,
+     // imports included, is in scope. CONTEXT_WINDOWS mirrors
+     // FREEBUFF_MODEL_CONTEXT_WINDOWS (common/src/constants/freebuff-models.ts);
+     // agents/__tests__/base-chat.test.ts fails if the two drift.
+ 
+     /** Hard context window (tokens) per backend model id. */
+     const CONTEXT_WINDOWS: Record<string, number> = {
+       'minimax/minimax-m3': 524_288,
+       'deepseek/deepseek-v4-flash': 1_048_576,
+       'deepseek/deepseek-v4-pro': 1_048_576,
+       // 1_050_000 per OpenRouter's endpoints API; entered low, so the 0.4
+       // budget below lands on exactly 400k. Without this Luna took
+       // DEFAULT_CONTEXT_WINDOW and got a 52k budget on a million-token model.
+       'openai/gpt-5.6-luna': 1_000_000,
+diff --git a/agents/researcher/researcher-web.ts b/agents/researcher/researcher-web.ts
+index b5fff2aaf..35d090215 100644
+--- a/agents/researcher/researcher-web.ts
++++ b/agents/researcher/researcher-web.ts
+@@ -11,35 +11,68 @@ const definition: SecretAgentDefinition = {
+   displayName: 'Web Researcher',
+   spawnerPrompt: `Browses the web to find relevant information.`,
+   inputSchema: {
+     prompt: {
+       type: 'string',
+       description: 'A question you would like answered using web search',
+     },
+   },
+   outputMode: 'last_message',
+   includeMessageHistory: false,
+   toolNames: ['web_search', 'read_url'],
+   spawnableAgents: [],
+ 
+   systemPrompt: `[freebuff product prompt text omitted]`,
+   instructionsPrompt: `Provide comprehensive research on the user's prompt.
+ 
+ Research iteratively, in multiple rounds:
+ 1. Start with 1-2 web_search calls. Inspect the titles, links, snippets, answer boxes, and related results.
+ 2. Call read_url on the most promising results, especially official or primary sources. Call read_url on several pages at once, in parallel.
+ 3. After reading, check what is still missing, uncertain, or worth verifying. Run follow-up searches with refined queries (using new terms you learned from the pages) and read more pages until the question is well covered from multiple sources.
+ 
+ If read_url cannot handle a source, choose a different result or explain the limitation.
+ 
+ Then, write a concise answer with key findings and cite the URLs of source pages you actually read for those findings. Include these source URLs in the final answer so the parent agent can pass them on to the user.
+ 
+-[freebuff product prompt text omitted]
++[freebuff product prompt text omitted]
++
++You have a limited number of research steps. Be efficient: batch your read_url calls in parallel, and answer as soon as the question is well covered.
+ `.trim(),
+   // Without this, every step ends the conversation on a raw tool result and
+   // the model is never asked for anything, so it ends the step after thinking
+   // — no text, no tool call — and the spawner gets a thinking trace instead of
+   // the summary.
+   stepPrompt: `Continue. Respond with either more tool calls or your final written answer.`,
++
++  // A spawned agent gets the runtime's default of 200 steps whatever its
++  // parent's maxAgentSteps is (spawn-agent-utils.ts), and nothing above ever
++  // stops a researcher that will not write its answer — the HARD RULE above
++  // keeps it searching whenever read_url fails. That is how five chat messages
++  // became 1,519 researcher calls in one hour on 2026-09-26. Measured over
++  // that day's 13,384 chat messages: a message that researched at all used 4
++  // researcher calls at the least, most often 6-10, and 16 at the median
++  // across ALL of its researchers — so 15 research steps plus one forced
++  // answer per researcher stops only the runaway ones.
++  handleSteps: function* () {
++    // Constants live inside handleSteps: it is serialized with toString() and
++    // re-evaluated standalone, so nothing outside this body is in scope.
++    const MAX_RESEARCH_STEPS = 15
++
++    for (let step = 0; step < MAX_RESEARCH_STEPS; step++) {
++      const { stepsComplete } = yield 'STEP'
++      if (stepsComplete) return
++    }
++
++    yield {
++      toolName: 'add_message',
++      input: {
++        role: 'user',
++        content:
++          '[freebuff product prompt text omitted]',
++      },
++      includeToolCall: false,
++    }
++    yield 'STEP'
++  },
+ }
+ 
+ export default definition
+diff --git a/docs/testing.md b/docs/testing.md
+index 364d1e542..729a04170 100644
+--- a/docs/testing.md
++++ b/docs/testing.md
+@@ -399,50 +399,65 @@ defect found by this harness on its first outing:
+ 1. **Shared state between concurrent runs.** `server.test.ts` spawned its
+    orchestrator on a hardcoded port *and probed that port for readiness*, so two
+    overlapping runs did not collide — they merged. The loser's server died with
+    `EADDRINUSE`, its readiness probe was answered by the winner's server, and
+    its tests then drove a foreign engine with a different `$HOME` and a
+    different open project. Two concurrent runs of that one file produced 6 and
+    19 failures scattered across unrelated assertions; alone it passes 49/49.
+    Spawn servers on port 0 and read back the port they actually got.
+ 
+ 2. **Waits that sample instead of listening.** A fixed count of 10ms polls is a
+    budget with no relationship to how long the work takes, and it pays a full
+    tick even when the work already finished. Await the signal the system already
+    emits (the engine's event bus, a process's own stdout), with a wall-clock
+    deadline that names what it was waiting for.
+ 
+ 3. **Timers and promises that outlive their test.** A 200ms debounced save in
+    the renderer store fired *inside a later test* that had swapped in its own
+    `fetch`, landing a stray request in that test's recorded calls. Which test
+    becomes the victim is decided by timing, so a loaded machine changes the
+    answer. Cancel pending background work between cases.
+ 
+ A fourth pattern worth naming: a test that races two real timers against each
+ other (a 20ms cadence against a 40ms window) has a 2x margin that starvation
+ erases. Inject the clock and advance it explicitly rather than sleeping.
+ 
++A variant of the second that no deadline fixes: **a wait that samples the
++middle of the work.** `engines.test.ts` polled for an idle tab's
++`node_modules` to vanish, then asserted that the tab's bootstrap marker was
++gone. The strip removes the marker in the continuation *after* its async
++`rm` resolves, though, so a 5ms poll that woke in the ~0.1ms between the two
++failed the test: 1.7% of runs on an idle laptop, 3.4% under load, and red on
++CI on 2026-09-26. Whatever you wait on has to be the last thing the work
++does. For backgrounded work, await the work itself; `EngineRegistry` exposes
++`backgroundSettled()` for exactly this.
++
++A flake that rare will not show up in a six-run full-suite hunt; this one
++never did. Narrow it to the test and multiply the samples instead:
++`bun test <file> -t '<name>' --rerun-each 300` reproduced it 5/300 in about
++a minute, and passing the same command as flake-hunt's `--cmd` adds the load.
++
+ One shape worth calling out separately, because no amount of isolating the test
+ fixes it: **a test whose subject is machine-global.** `orphan-reaper` kills any
+ process on the box stamped with a dead orchestrator — that is the feature — so
+ two copies of its real-process test reap each other's children, and the victim
+ fails on `Received: []` with its orphan already dead, for the module doing
+ exactly its job. Its temp dirs and pids were already unique; the shared state was
+ the process table itself. An atomic `mkdir` lock around the one section that
+ spawns stamped children serialises those runs against each other and costs
+ concurrency nowhere else.
+ 
+ **A fifth, and the reason some of these reports are unreadable rather than
+ merely red: a polling helper whose deadline is not shorter than the budget of
+ the test that called it.** Bun's default is 5s per test. A `waitFor` that gives
+ up after 10s (or exactly 5s) never gets to report anything — bun fails the test
+ at its own deadline first, moves on, and the helper's rejection surfaces later
+ with no test to attribute it to. It is printed as `unhandled error outside any
+ test` and counted *separately* from the failure that caused it, so one slow
+ shell shows up as two entries naming a file rather than one naming a case. Five
+ files had this inverted or equal (`terminal`, `loop-health`, `login`,
+ `orphan-reaper`, `smoke`). Rather than repeat the rule as a comment in each,
+ `test/support/budgets.ts` hands back the pair and refuses an inverted one at
+ import, so getting it wrong fails the file loudly instead of only when something
+ is slow enough for the difference to show:
+ 
+ ```ts
+
+```
