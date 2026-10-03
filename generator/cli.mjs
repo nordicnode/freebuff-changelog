@@ -1260,6 +1260,14 @@ async function catchUpOnce (argv, budgets = {}) {
     // RPM window) and it is deliberately spent before any pass deadline is
     // armed: charged to a pass it used to kill the pass outright.
     await warmLlmRpmWindow(process.env)
+    // Day roll-ups run first, on their own bounded slice. One digest a day is
+    // pending, and the entry passes below will consume every remaining second
+    // if allowed -- measured: the summary and plain-English drains filled whole
+    // cycles and the digest was never reached, a day after its day settled. The
+    // slice comes out of this cycle's paid window, so the entry passes simply
+    // get that much less on the one cycle a digest is due.
+    const rollupEndsAt = Math.min(enrichEndsAt, Date.now() + Math.max(0, Number(process.env.CHANGELOG_ROLLUP_BUDGET_MS || 90000)))
+    didSummarize = didSummarize || (await writeSettledRollups(entries, { endsAt: rollupEndsAt })) > 0
     const enrichStart = Date.now()
     // Only reserve for the plain-English drain when it actually has work: the
     // reserve is a share of one window, and holding it against an empty queue
@@ -1361,13 +1369,6 @@ async function catchUpOnce (argv, budgets = {}) {
       if (previews) { await persistMerged({ [`${DATA}/open-prs.json`]: prDoc }); didSummarize = true }
     }
   }
-  // Day roll-ups: a settled day's bullet digest, written the first cycle after
-  // its last row summarizes. Newest first and capped per cycle, so the recent
-  // pages fill before the backlog and these calls cannot crowd out the entry
-  // passes above. A failure is logged and retried next cycle: a missing digest
-  // must not block the push of the day it would have described.
-  didSummarize = didSummarize || (await writeSettledRollups(entries, { endsAt: enrichEndsAt })) > 0
-
   // Checkpoint successes even without a publish; a deadline or push failure
   // must not discard completed forward-only work.
   await persistMerged(await capturePendingWrites(DATA, { [`${DATA}/changelog.json`]: { ...existing, entries } }))
