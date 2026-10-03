@@ -5,9 +5,10 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
   enrichWithLlm, cacheKey, callLlm, llmProviderBanner, planLlmPass, rowBudgetMs,
-  eli5RowBudgetMs, errorRetryDelayMs, callUnanswered, isRouteFailure, isGatewayError,
+  eli5RowBudgetMs, errorRetryDelayMs, callUnanswered, isRouteFailure, isGatewayError, isTransientError,
   extractResponseText, resetLlmStreamProbeForTests, llmConfigured, llmKeysOf, nextLlmKey,
-  resetLlmKeyRotationForTests, backupEnvOf,
+  resetLlmKeyRotationForTests, backupEnvOf, createLlmRateLimiter, llmRpm, llmCapOf,
+  rollupLlmEnv, stageLlmEnv, ROLLUP_LLM_STAGE,
   DEFAULT_LLM_API_BASE, DEFAULT_LLM_MODEL, DEFAULT_ROW_BUDGET_MS, PROMPT_V
 } from '../lib/llm.mjs'
 import { summaryPassWindow } from '../cli.mjs'
@@ -214,6 +215,16 @@ test('a gateway error delivered inside a 200 body is a transport failure, not a 
   const err = (() => { try { extractResponseText(frame) } catch (e) { return e } })()
   assert.equal(isGatewayError(err), true, 'classified as transport, so the lean rung and the failover route own it')
   assert.equal(callUnanswered(err), true, 'no answer came back: it must not spend a content attempt')
+  // The gateway's own vocabulary. None of these words is in the transport
+  // pattern, and none of them is the model's answer: a provider outage must
+  // never look like a content failure (permanent cooldown, no failover).
+  for (const msg of ['Service temporarily unavailable', 'Provider overloaded. Please try again shortly.', 'Service temporarily at capacity']) {
+    const frameErr = new Error(`LLM gateway error in the response body (server_error): ${msg}`)
+    assert.equal(isGatewayError(frameErr), true, msg)
+    assert.equal(isTransientError(frameErr), true, msg)
+    assert.equal(callUnanswered(frameErr), true, msg)
+    assert.equal(isRouteFailure(frameErr), true, msg)
+  }
   // The same thing as a plain JSON body.
   assert.throws(() => extractResponseText('{"error":{"message":"The request timed out. Please try again.","code":"timeout"}}'), /gateway error in the response body/)
   // A normal body is untouched.
@@ -270,4 +281,109 @@ test('cache identity is unchanged by the budget work: the same row still hashes 
   const e = row('3')
   const key = cacheKey(e.sha, patch, '', 0)
   assert.equal(key, `${e.sha}:v${PROMPT_V}:${key.split(':')[2]}`)
+})
+
+// ---------------------------------------------------------------------------
+// The daily roll-up's own provider: a dedicated base, key and plan, with
+// nothing else routed through it.
+
+test('day roll-up route: enabled only by base+key, carrying its own plan and no primary credential', () => {
+  assert.equal(rollupLlmEnv({}), null, 'unconfigured, the roll-up stays on the primary route')
+  assert.equal(rollupLlmEnv({ CHANGELOG_ROLLUP_LLM_API_BASE: 'https://logfare.ai/v1' }), null, 'a base without a key does not enable it')
+  assert.equal(rollupLlmEnv({ CHANGELOG_ROLLUP_LLM_API_KEY: 'lfu_only' }), null, 'a key without a base does not enable it')
+
+  const stage = rollupLlmEnv({
+    ...env({ LLM_API_KEYS: 'ring1,ring2', LLM_BACKUP_API_BASE: 'https://backup.test/v1', LLM_BACKUP_API_KEY: 'bk', LLM_BACKUP_MODEL: 'gemini-3.6-flash' }),
+    CHANGELOG_ROLLUP_LLM_API_BASE: 'https://logfare.ai/v1',
+    CHANGELOG_ROLLUP_LLM_API_KEY: 'lfu_key',
+    CHANGELOG_ROLLUP_LLM_MODEL: 'deepseek-v4.1-flash'
+  })
+  assert.equal(stage.LLM_API_BASE, 'https://logfare.ai/v1')
+  assert.equal(stage.LLM_API_KEY, 'lfu_key')
+  assert.equal(stage.LLM_API_KEYS, '', 'the primary key ring stays on the primary provider')
+  assert.equal(stage.LLM_MODEL, 'deepseek-v4.1-flash')
+  assert.equal(stage.LLM_ROUTE, 'rollup', 'the request ledger can tell which route served a digest')
+  assert.equal(stage.CHANGELOG_LLM_BACKUP, '0', 'a dedicated route does not fail over to a different provider')
+  // The stated plan, as the enforced defaults.
+  assert.equal(stage.LLM_RPM, 20)
+  assert.equal(stage.LLM_MAX_PER_HOUR, 500)
+  assert.equal(stage.LLM_MAX_PER_DAY, 2500)
+  assert.equal(stage.LLM_MAX_CONCURRENT, 3)
+  assert.equal(llmRpm(stage), 20, 'bounded by its own rate, not by the 40 RPM contract')
+  assert.equal(ROLLUP_LLM_STAGE.rpm, 20)
+  assert.equal(ROLLUP_LLM_STAGE.concurrency, 3)
+
+  // Every plan number is overridable per value, and nonsense falls back.
+  const tuned = rollupLlmEnv({
+    CHANGELOG_ROLLUP_LLM_API_BASE: 'b', CHANGELOG_ROLLUP_LLM_API_KEY: 'k',
+    CHANGELOG_ROLLUP_LLM_RPM: '5', CHANGELOG_ROLLUP_LLM_MAX_CONCURRENT: '1', CHANGELOG_ROLLUP_LLM_MAX_PER_DAY: 'nope'
+  })
+  assert.equal(tuned.LLM_RPM, 5)
+  assert.equal(tuned.LLM_MAX_CONCURRENT, 1)
+  assert.equal(tuned.LLM_MAX_PER_DAY, 2500)
+  // The generic form works for any stage prefix.
+  assert.equal(stageLlmEnv({ FOO_API_BASE: 'x', FOO_API_KEY: 'y' }, { prefix: 'FOO', rpm: 7 }).LLM_RPM, 7)
+  assert.equal(stageLlmEnv({ FOO_API_BASE: 'x' }, { prefix: 'FOO' }), null)
+  assert.equal(stageLlmEnv({ FOO_API_BASE: 'x', FOO_API_KEY: 'y' }, {}), null, 'a stage without a prefix is nothing')
+})
+
+test('day roll-up route: the provider banner names it, without any key', () => {
+  const banner = llmProviderBanner({
+    CHANGELOG_LLM: '1', LLM_API_KEY: 'sk-secret', LLM_API_BASE: 'https://vyceai.com/v1', LLM_MODEL: 'deepseek-v4.1',
+    CHANGELOG_ROLLUP_LLM_API_BASE: 'https://logfare.ai/v1', CHANGELOG_ROLLUP_LLM_API_KEY: 'lfu-secret', CHANGELOG_ROLLUP_LLM_MODEL: 'deepseek-v4.1-flash'
+  })
+  assert.match(banner, /day roll-up deepseek-v4\.1-flash @ https:\/\/logfare\.ai\/v1/)
+  assert.doesNotMatch(banner, /lfu-secret|sk-secret/)
+  assert.equal(llmProviderBanner({ CHANGELOG_LLM: '1', LLM_API_KEY: 'sk' }).includes('day roll-up'), false, 'no clause when no stage provider is configured')
+})
+
+test('provider rate limit: a concurrency plan limit bounds how many requests are open at once', async t => {
+  let active = 0, peak = 0
+  t.mock.method(globalThis, 'fetch', async () => {
+    active++; peak = Math.max(peak, active)
+    await new Promise(r => setTimeout(r, 15))
+    active--
+    return response(clean)
+  })
+  const e = env({ LLM_API_BASE: 'https://conc.test/v1', LLM_MAX_CONCURRENT: '2' })
+  await Promise.all(Array.from({ length: 5 }, (_, i) => callLlm(`caller ${i}`, e, 1, x => x)))
+  assert.equal(peak, 2, 'never more than the plan allows, however many callers ask at once')
+  assert.equal(active, 0, 'every slot is released, including on the paths that fail')
+})
+
+test('a gateway that rejects structured outputs gets one retry without strict JSON mode', async t => {
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const body = JSON.parse(String(init.body))
+    seen.push(Boolean(body.response_format))
+    if (body.response_format) {
+      // The measured phrasing from an OpenAI-compatible gateway that bridges
+      // to a model without structured outputs. It never says "response_format",
+      // so matching only that word cost the call (and then both repairs).
+      return new Response('{"error":{"message":"model: some/ling-3.0-flash-vl does not support feature: structured-outputs"}}', { status: 400 })
+    }
+    return response(clean)
+  })
+  const e = env({ LLM_API_BASE: 'https://novita.test/v1' })
+  assert.equal((await callLlm('writer', e, 1, x => x)).title, 'Alpha gate added')
+  assert.deepEqual(seen, [true, false], 'one probe, then the answer without the field')
+})
+
+test('provider probes are per route: a gateway that rejects stream keeps its own verdict', async t => {
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const body = JSON.parse(String(init.body))
+    seen.push({ url: String(url), stream: body.stream, strict: !!body.response_format })
+    if (String(url).startsWith('https://picky.test')) return new Response('{"error":{"message":"streaming is not supported here"}}', { status: 400 })
+    return response(clean)
+  })
+  const picky = env({ LLM_API_BASE: 'https://picky.test/v1' })
+  await assert.rejects(callLlm('stage', picky, 1, x => x), /HTTP 400/)
+  assert.equal(seen.length, 2, 'one probe, one refusal, then it stops asking')
+  assert.equal(seen[0].stream, true)
+  assert.equal(seen[1].stream, undefined, 'this route stopped asking for streaming')
+
+  await callLlm('primary', env({ LLM_API_BASE: 'https://main.test/v1' }), 1, x => x)
+  assert.equal(seen.at(-1).stream, true, 'the other provider was never consulted about this')
+  assert.equal(seen.at(-1).strict, true, 'and strict JSON mode still stands where it works')
 })

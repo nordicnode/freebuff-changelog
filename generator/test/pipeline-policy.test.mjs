@@ -10,7 +10,7 @@ import {
   LLM_CONTEXT_TOKENS, rememberClosedPrs, matchPrByPaths, prSummaryKey,
   pruneExpiredErrors, gatherEntryContext, collectReleaseContext, formatReleaseContext,
   buildVerifyPrompt, buildEli5Prompt, getReleaseContextFor, summaryValidator, releaseBoilerplate, RELEASE_ROLLUP_V, VERIFY_POLICY_V, eli5Key, eli5Source, ELI5_V, normalizeEli5, ELI5_ROLLUP_MAX_CHARS,
-  llmRpm, createLlmRateLimiter, resetLlmRateLimiterForTests, retryAfterMs, gatherReleaseEvidence,
+  llmRpm, llmCapOf, createLlmRateLimiter, resetLlmRateLimiterForTests, retryAfterMs, gatherReleaseEvidence,
   backupEnvOf, isRouteFailure, servedModelOf
 } from '../lib/llm.mjs'
 import { artifactHash, qualityOf, qualityText, qualityNote, qualityStatus, dedupeClaims, generationState, regenUnfinished, QUALITY_POLICY_V } from '../lib/quality.mjs'
@@ -300,6 +300,60 @@ test('provider rate limit: invalid settings cannot disable or exceed the provide
   for (const value of [undefined, '', '0', '-1', 'NaN', 'Infinity', '41', '1000']) assert.equal(llmRpm({ CHANGELOG_LLM_RPM: value }), 40)
   assert.equal(llmRpm({ CHANGELOG_LLM_RPM: '30' }), 30)
   assert.equal(llmRpm({ CHANGELOG_LLM_RPM: '1.5' }), 1)
+})
+
+test('provider rate limit: a route that states its own rate is bounded by it, not by the 40 RPM contract', () => {
+  // A stage can be pointed at a different provider with a different plan (the
+  // daily roll-up runs on one at 20/minute). Its number is its ceiling: it must
+  // not read as VyceAI's 40, and VyceAI's ceiling must not be applied to it.
+  assert.equal(llmRpm({ LLM_RPM: '20', CHANGELOG_LLM_RPM: '40' }), 20)
+  assert.equal(llmRpm({ LLM_RPM: '90', CHANGELOG_LLM_RPM: '40' }), 90)
+  for (const value of ['', '0', '-1', 'NaN', 'Infinity']) {
+    assert.equal(llmRpm({ LLM_RPM: value, CHANGELOG_LLM_RPM: '40' }), 40, `an unusable ${JSON.stringify(value)} falls back to the contract`)
+  }
+  assert.equal(llmRpm({ LLM_RPM: '1.9' }), 1)
+  // The quota numbers beside it: unset or invalid means "no limit of that kind".
+  assert.equal(llmCapOf(undefined), Infinity)
+  assert.equal(llmCapOf(''), Infinity)
+  assert.equal(llmCapOf('0'), Infinity)
+  assert.equal(llmCapOf('-3'), Infinity)
+  assert.equal(llmCapOf('nope'), Infinity)
+  assert.equal(llmCapOf('2500'), 2500)
+})
+
+test('provider rate limit: hourly and daily quotas are rolling windows, and an exhausted one names its number', async () => {
+  let now = 0
+  const waits = []
+  const limiter = createLlmRateLimiter({ now: () => now, wait: async ms => { waits.push(ms); now += ms } })
+  const hour = { LLM_RPM: '60', LLM_MAX_PER_HOUR: '3' }
+  await limiter.reserve(hour); await limiter.reserve(hour); await limiter.reserve(hour)
+  assert.deepEqual(waits, [], 'three of three fit in the hour, so the minute window is not what binds')
+  now = 3300000 // 55 minutes in: the oldest request is about to age out of the hour
+  await limiter.reserve(hour)
+  assert.deepEqual(waits, [300010], 'it waited for the hour to roll, not for a fresh minute')
+
+  // A quota whose next slot is further away than any caller wants to sleep
+  // throws its own number instead of going quiet for the rest of the window.
+  const refuseToWait = async () => { throw new Error('a whole window is not a throttle') }
+  const exhausted = createLlmRateLimiter({ now: () => 0, wait: refuseToWait })
+  await exhausted.reserve({ LLM_MAX_PER_HOUR: '3' })
+  await exhausted.reserve({ LLM_MAX_PER_HOUR: '3' })
+  await exhausted.reserve({ LLM_MAX_PER_HOUR: '3' })
+  await assert.rejects(exhausted.reserve({ LLM_MAX_PER_HOUR: '3' }), /hourly budget exceeded \(3\/hour/)
+  const day = createLlmRateLimiter({ now: () => 0, wait: refuseToWait })
+  await day.reserve({ LLM_MAX_PER_DAY: '2' })
+  await day.reserve({ LLM_MAX_PER_DAY: '2' })
+  await assert.rejects(day.reserve({ LLM_MAX_PER_DAY: '2' }), /daily budget exceeded \(2\/day/)
+})
+
+test('provider rate limit: two base URLs are two providers and never spend one window', async t => {
+  t.mock.method(globalThis, 'fetch', async () => response({ ok: true }))
+  const a = { ...env, LLM_API_BASE: 'https://a.test/v1', CHANGELOG_LLM_RPM: '1' }
+  const b = { ...env, LLM_API_BASE: 'https://b.test/v1', CHANGELOG_LLM_RPM: '1' }
+  await callLlm('first on a', a, 1, x => x)
+  // a's minute is spent, but b has its own window.
+  await callLlm('first on b', b, 1, x => x)
+  await assert.rejects(callLlm('second on a', { ...a, LLM_DEADLINE_AT: Date.now() + 500 }, 1, x => x), /deadline/, 'and a\'s own window still holds its next call')
 })
 
 test('provider rate limit: concurrent stages and retries share a rolling minute and throttle pause', async () => {

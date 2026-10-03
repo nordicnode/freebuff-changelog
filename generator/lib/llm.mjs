@@ -22,6 +22,14 @@
 //   CHANGELOG_ELI5_ROW_BUDGET_MS the same for the plain-English pass (default 45000)
 //   CHANGELOG_LLM_LIMIT        max commits summarized per run (default 60; 0 = no cap)
 //   CHANGELOG_LLM_CONCURRENCY  parallel API calls (default 2)
+//   CHANGELOG_ROLLUP_LLM_API_BASE / _API_KEY / _MODEL
+//                              a dedicated provider for the daily roll-up only
+//                              (both base and key are required to enable it).
+//                              Its plan is stated with _RPM, _MAX_PER_HOUR,
+//                              _MAX_PER_DAY and _MAX_CONCURRENT, defaulting to
+//                              20/min, 500/hour, 2,500/day, 3 in flight, and it
+//                              gets its own rolling window, no failover, and
+//                              nothing else routed through it.
 //   CHANGELOG_ELI5_LIMIT       plain-English pass budget (defaults to the above)
 //   CHANGELOG_ELI5_DIFF=0      explain from the summary only, skip the diff
 //   CHANGELOG_ELI5_DIFF_BYTES  operator cap on the diff sent to the plain-English
@@ -123,7 +131,11 @@ export function llmProviderBanner (env = process.env) {
   const backup = env.LLM_BACKUP_API_BASE && env.LLM_BACKUP_API_KEY
     ? `, backup ${env.LLM_BACKUP_MODEL || env.LLM_MODEL || DEFAULT_LLM_MODEL} @ ${env.LLM_BACKUP_API_BASE}`
     : ''
-  return `LLM provider: write ${model} @ ${base}, verify ${verify}${major}${backup}`
+  // A stage with its own provider says so out loud: a run that quietly writes
+  // day digests somewhere else is exactly what could not be inferred before.
+  const stage = rollupLlmEnv(env)
+  const rollup = stage ? `, day roll-up ${stage.LLM_MODEL} @ ${stage.LLM_API_BASE}` : ''
+  return `LLM provider: write ${model} @ ${base}, verify ${verify}${major}${rollup}${backup}`
 }
 
 // ---------------------------------------------------------------------------
@@ -1579,33 +1591,116 @@ export function shortError (err) {
 // capacity for writing. A lower operator value still binds; a higher one cannot.
 export const LLM_PROVIDER_RPM = 40
 export function llmRpm (env = {}) {
+  // A route that names its own rate is bounded by that number instead: it is a
+  // different provider with a different plan (the daily roll-up can be pointed
+  // at one), and clamping it to *this* provider's ceiling would either throttle
+  // it wrongly or, worse, let a configured 20/min read as 40/min. Unset or
+  // invalid falls through to the contract below, which no configuration may
+  // raise.
+  const route = Number(env.LLM_RPM)
+  if (env.LLM_RPM != null && env.LLM_RPM !== '' && Number.isFinite(route) && route > 0) return Math.max(1, Math.floor(route))
   const configured = Number(env.CHANGELOG_LLM_RPM)
   return Number.isFinite(configured) && configured > 0
     ? Math.max(1, Math.min(LLM_PROVIDER_RPM, Math.floor(configured))) : LLM_PROVIDER_RPM
 }
 
+// The other three numbers a provider can state about itself: requests per
+// rolling hour, per rolling day, and in flight at once. Unset (or nonsense)
+// means no limit of that kind, so a route that only declares an RPM window
+// behaves exactly as it did before these existed.
+export function llmCapOf (value) {
+  const n = Number(value)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : Infinity
+}
+
+const MINUTE_MS = 60000
+const HOUR_MS = 3600000
+const DAY_MS = 86400000
+// A window wait longer than this is an exhausted quota, not a throttle: the
+// next slot only opens when a request made up to a day ago ages out of its
+// window. Sleeping that long is never what the caller wants (a bounded pass
+// would die on its deadline first, with a message that names the deadline
+// instead of the quota), so the budget throws its own number instead.
+const LONG_BUDGET_WAIT_MS = 10 * 60000
+
+// How long until one request inside the rolling `windowMs` falls out of it,
+// given that `cap` of them are in it now. Zero when the window still has room.
+// `timestamps` is ascending; the 10ms slack keeps the re-check on the far side
+// of the window edge rather than exactly on it.
+function windowWait (timestamps, at, cap, windowMs) {
+  if (!Number.isFinite(cap)) return 0
+  let i = 0
+  while (i < timestamps.length && timestamps[i] <= at - windowMs) i++
+  if (timestamps.length - i < cap) return 0
+  return timestamps[i] + windowMs + 10 - at
+}
+
 // Injectable clock/wait keeps rate-limit regressions offline and instantaneous.
 export function createLlmRateLimiter ({ now = Date.now, wait = boundedWait } = {}) {
+  // A day of timestamps: the RPM window needs a minute of them, the hourly and
+  // daily quotas need theirs, and one list serves all three.
   const timestamps = []
   let blockedUntil = 0
   return {
     deferUntil (at) { if (Number.isFinite(at)) blockedUntil = Math.max(blockedUntil, at) },
     async reserve (env = {}) {
       const rpm = llmRpm(env)
+      const perHour = llmCapOf(env.LLM_MAX_PER_HOUR)
+      const perDay = llmCapOf(env.LLM_MAX_PER_DAY)
       while (true) {
         assertRequestBudget(env)
         const at = now()
-        while (timestamps.length && timestamps[0] <= at - 60000) timestamps.shift()
-        const delay = Math.max(blockedUntil - at, timestamps.length >= rpm ? timestamps[0] + 60010 - at : 0)
+        while (timestamps.length && timestamps[0] <= at - DAY_MS) timestamps.shift()
+        const minuteWait = windowWait(timestamps, at, rpm, MINUTE_MS)
+        const hourWait = windowWait(timestamps, at, perHour, HOUR_MS)
+        const dayWait = windowWait(timestamps, at, perDay, DAY_MS)
+        if (hourWait > LONG_BUDGET_WAIT_MS) throw new Error(`LLM provider hourly budget exceeded (${perHour}/hour on this route); retry in ${Math.ceil(hourWait / 60000)}m`)
+        if (dayWait > LONG_BUDGET_WAIT_MS) throw new Error(`LLM provider daily budget exceeded (${perDay}/day on this route); retry in ${Math.ceil(dayWait / 60000)}m`)
+        const delay = Math.max(blockedUntil - at, minuteWait, hourWait, dayWait)
         if (delay <= 0) { timestamps.push(at); return at }
         await wait(Math.max(10, delay), env)
       }
     }
   }
 }
-let llmRateLimiter = createLlmRateLimiter()
+
+// One rolling window per provider, keyed by base URL. A stage can be pointed at
+// a second provider (the daily roll-up has its own base URL and its own plan),
+// and one shared window would let a roll-up call spend the entry pipeline's
+// quota -- and its 429 pause every other stage. Routes that share a base share a
+// budget, exactly as they did when there was only one.
+const providerLimiters = new Map()
+function rateLimiterFor (env = {}) {
+  const base = String(env.LLM_API_BASE || DEFAULT_LLM_API_BASE)
+  let limiter = providerLimiters.get(base)
+  if (!limiter) { limiter = createLlmRateLimiter(); providerLimiters.set(base, limiter) }
+  return limiter
+}
 // Test isolation only: production call counters must never reset this budget.
-export function resetLlmRateLimiterForTests () { llmRateLimiter = createLlmRateLimiter(); rpmWarmup = null }
+export function resetLlmRateLimiterForTests () { providerLimiters.clear(); providerSlots.clear(); rpmWarmup = null }
+
+// In-flight requests per provider: the RPM window bounds how many leave in a
+// minute, this bounds how many are open at the same moment, which is what a
+// "N concurrent requests" plan limit counts. A slot is held from just before
+// the request is issued until its response body has been read, so a streamed
+// answer keeps its slot while it is still arriving. A waiter polls inside its
+// own budgets: it throws with the caller's deadline rather than waiting past it.
+const providerSlots = new Map()
+function slotsFor (env = {}) {
+  const base = String(env.LLM_API_BASE || DEFAULT_LLM_API_BASE)
+  let slots = providerSlots.get(base)
+  if (!slots) { slots = { active: 0 }; providerSlots.set(base, slots) }
+  return slots
+}
+async function acquireProviderSlot (env) {
+  const max = llmCapOf(env.LLM_MAX_CONCURRENT)
+  if (!Number.isFinite(max)) return () => {}
+  const slots = slotsFor(env)
+  while (slots.active >= max) await boundedWait(25, env)
+  slots.active++
+  let released = false
+  return () => { if (!released) { released = true; slots.active-- } }
+}
 
 export function retryAfterMs (value, now = Date.now()) {
   if (value == null || !String(value).trim()) return 0
@@ -1650,7 +1745,13 @@ export function resetLlmCallCount () { llmCallsSent = 0 }
 // requirement: some OpenAI-compatible gateways 400 on the field itself. One
 // probe decides it for the rest of the process instead of parking every queued
 // entry on the 1-hour "permanent error" cooldown for a gateway preference.
-let responseFormatSupported = true
+//
+// The probe is per base URL: the verdict belongs to the gateway that gave it,
+// and a stage routed to a second provider must not have strict JSON mode
+// switched off for the primary because *its* gateway rejected the field.
+const responseFormatSupported = new Map()
+const routeKey = (env = {}) => String(env.LLM_API_BASE || DEFAULT_LLM_API_BASE)
+function responseFormatOk (env) { return responseFormatSupported.get(routeKey(env)) !== false }
 
 // Streaming, on by default, for the same reason it exists at all.
 //
@@ -1670,8 +1771,9 @@ let responseFormatSupported = true
 // `data:` frames (that is why SSE handling is in the file at all). The field is
 // probed like response_format, so a gateway that rejects `stream` costs one 400
 // and then never sees it again this process.
-let streamSupported = true
-export function resetLlmStreamProbeForTests () { streamSupported = true }
+const streamSupported = new Map()
+const streamOk = (env) => streamSupported.get(routeKey(env)) !== false
+export function resetLlmStreamProbeForTests () { streamSupported.clear(); responseFormatSupported.clear() }
 
 // One row's scope. Every entry point that can start a row opens its scope with
 // this, not with a bare counter: a scope without the row clock is how the first
@@ -1712,7 +1814,7 @@ async function boundedWait (ms, env) {
 
 export async function waitForLlmRpmSlot (env) {
   await waitForRpmWarmup(env)
-  await llmRateLimiter.reserve(env)
+  await rateLimiterFor(env).reserve(env)
 }
 
 // How many summaries may be in flight at once. waitForLlmRpmSlot is the real
@@ -1812,7 +1914,8 @@ export function isDeterministicFailure (err) {
 // the three LLM_BACKUP_* values enables it; CHANGELOG_LLM_BACKUP=0 disables.
 // The backup gets the same prompt already reduced to whatever rung the primary
 // died on, its own model identity, and the same budgets: one entry cap, one
-// cycle budget, and the one rolling RPM window that now covers both routes.
+// cycle budget, and its own rolling window, because a different base URL is a
+// different provider with a different plan (they no longer share one window).
 export function backupEnvOf (env = {}) {
   if (env.CHANGELOG_LLM_BACKUP === '0') return null
   if (!env.LLM_BACKUP_API_BASE || !env.LLM_BACKUP_API_KEY) return null
@@ -1826,6 +1929,67 @@ export function backupEnvOf (env = {}) {
     LLM_MODEL: env.LLM_BACKUP_MODEL || env.LLM_MODEL,
     LLM_ROUTE: 'backup'
   }
+}
+
+// A dedicated provider for one stage.
+//
+// The daily roll-up can be sent to a different gateway than the entry pipeline
+// -- a different model on a different plan -- without any other stage knowing:
+// the config is a prefix, not a new set of names. `<prefix>_API_BASE` and
+// `<prefix>_API_KEY` are what enable it; `<prefix>_MODEL`, `<prefix>_RPM`,
+// `<prefix>_MAX_PER_HOUR`, `<prefix>_MAX_PER_DAY` and `<prefix>_MAX_CONCURRENT`
+// state the plan and fall back to the stage's defaults. Only the stage that
+// names the prefix routes there: everything else keeps the primary route, its
+// key ring and its failover exactly as they were.
+export const ROLLUP_LLM_STAGE = {
+  prefix: 'CHANGELOG_ROLLUP_LLM',
+  route: 'rollup',
+  // The plan as it was given: 20 requests/minute, 500/hour, 2,500/day, 3 in
+  // flight. A roll-up spends one to three calls a day, so these never bind in
+  // normal operation -- they are here so a `rollups --backfill` burst meets our
+  // own arithmetic instead of the provider's error page, and so the limits are
+  // stated once where they are enforced rather than implied by hope.
+  rpm: 20,
+  perHour: 500,
+  perDay: 2500,
+  concurrency: 3
+}
+
+export function stageLlmEnv (env = process.env, stage = {}) {
+  const prefix = stage.prefix
+  if (!prefix) return null
+  const base = env[`${prefix}_API_BASE`]
+  const key = env[`${prefix}_API_KEY`]
+  if (!base || !key) return null
+  const plan = (name, fallback) => {
+    const raw = env[`${prefix}_${name}`]
+    if (raw == null || raw === '') return fallback
+    const n = Number(raw)
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
+  }
+  return {
+    ...env,
+    LLM_API_BASE: String(base),
+    LLM_API_KEY: String(key),
+    // The primary's key ring must not leave its provider: the stage asks with
+    // its own credential and nothing else, the way the backup route does.
+    LLM_API_KEYS: '',
+    LLM_MODEL: env[`${prefix}_MODEL`] || env.LLM_MODEL || DEFAULT_LLM_MODEL,
+    LLM_RPM: plan('RPM', stage.rpm),
+    LLM_MAX_PER_HOUR: plan('MAX_PER_HOUR', stage.perHour),
+    LLM_MAX_PER_DAY: plan('MAX_PER_DAY', stage.perDay),
+    LLM_MAX_CONCURRENT: plan('MAX_CONCURRENT', stage.concurrency),
+    // A dedicated route is an explicit operator choice, and a trial of one is
+    // also a measurement of it: a transport failure fails the call (the day
+    // retries next cycle) rather than quietly being written by the provider
+    // the stage was asked not to use.
+    CHANGELOG_LLM_BACKUP: '0',
+    LLM_ROUTE: stage.route || 'stage'
+  }
+}
+
+export function rollupLlmEnv (env = process.env) {
+  return stageLlmEnv(env, ROLLUP_LLM_STAGE)
 }
 
 // Is this failure one a second route could fix? 5xx, connection faults,
@@ -1893,8 +2057,8 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     ],
     max_tokens: LLM_OUTPUT_TOKENS
   }
-  if (responseFormatSupported) body.response_format = { type: 'json_object' }
-  if (streamSupported && env.CHANGELOG_LLM_STREAM !== '0') body.stream = true
+  if (responseFormatOk(env)) body.response_format = { type: 'json_object' }
+  if (streamOk(env) && env.CHANGELOG_LLM_STREAM !== '0') body.stream = true
   await waitForLlmRpmSlot(env)
   assertRequestBudget(env) // Recheck after awaiting the shared RPM slot.
   const scope = requestScope.getStore()
@@ -1916,7 +2080,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
   llmCallsSent++
   scope.calls++
   opts.onDelivery?.(prompt)
-  const request = { id: randomUUID(), stage: opts.stage || 'generation', model, route: env.LLM_ROUTE === 'backup' ? 'backup' : 'primary', promptHash: shortHash(prompt), startedAt: new Date(started).toISOString(), outcome: 'pending' }
+  const request = { id: randomUUID(), stage: opts.stage || 'generation', model, route: env.LLM_ROUTE || 'primary', promptHash: shortHash(prompt), startedAt: new Date(started).toISOString(), outcome: 'pending' }
   scope.requests.push(request)
   // The only rung a transport failure can be fixed by. The rungs above answer
   // replies that came back wrong; a gateway that 504s or times out answers
@@ -1946,6 +2110,10 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     }
   }
   let res
+  // The provider's in-flight slot spans the request and its body, so a route
+  // with a concurrency plan limit cannot open more connections at once than it
+  // promised. Every path out of the block below releases it exactly once.
+  const releaseSlot = await acquireProviderSlot(env)
   try {
     res = await fetch(`${base.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
@@ -1957,6 +2125,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
       signal: AbortSignal.timeout(Math.max(1, Math.min(timeoutMs, callRoom)))
     })
   } catch (err) {
+    releaseSlot()
     request.outcome = 'transport-error'
     request.durationMs = Date.now() - started
     const rung = isGatewayError(err) ? transportRung() : null
@@ -1968,27 +2137,43 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
   }
   request.status = res.status
   request.outcome = res.ok ? 'received' : 'http-error'
+  // Read the body once, while the slot is still held, because every branch
+  // below needs this text: the 400 probes read it, the error arms quote it, and
+  // the success arm parses it. One read also means a failed read is reported
+  // once instead of once per branch.
+  let rawText
+  try {
+    rawText = await res.text()
+  } catch (err) {
+    request.outcome = 'body-error'
+    request.durationMs = Date.now() - started
+    releaseSlot()
+    throw err
+  }
   request.durationMs = Date.now() - started
+  releaseSlot()
   if (res.status === 400 && attempt <= 2) {
-    const bodyText = await res.text().catch(() => '')
-    if (responseFormatSupported && /response[_ -]?format|json_object|json mode/i.test(bodyText)) {
-      responseFormatSupported = false
-      log('LLM gateway rejected response_format: retrying without strict JSON mode (sticky for this process)')
+    const bodyText = rawText
+    if (responseFormatOk(env) && /response[_ -]?format|json_object|json mode|structured[_ -]?outputs|json[_ -]?schema/i.test(bodyText)) {
+      responseFormatSupported.set(routeKey(env), false)
+      log('LLM gateway rejected response_format: retrying without strict JSON mode (sticky for this route)')
       return callLlm(prompt, env, attempt + 1, validate, opts)
     }
     // Same probe for streaming: a gateway that does not know the field says so
     // in its 400, and one refusal is enough to stop asking.
-    if (streamSupported && env.CHANGELOG_LLM_STREAM !== '0' && /stream/i.test(bodyText)) {
-      streamSupported = false
-      log('LLM gateway rejected stream: retrying without streaming (sticky for this process)')
+    if (streamOk(env) && env.CHANGELOG_LLM_STREAM !== '0' && /stream/i.test(bodyText)) {
+      streamSupported.set(routeKey(env), false)
+      log('LLM gateway rejected stream: retrying without streaming (sticky for this route)')
       return callLlm(prompt, env, attempt + 1, validate, opts)
     }
     throw new Error(shortError(`LLM HTTP 400: ${bodyText.slice(0, 120)}`))
   }
   const retryAfter = res.status === 429 ? retryAfterMs(res.headers.get('retry-after')) : 0
   const throttleWait = res.status === 429 ? retryAfter || (2000 * 2 ** (Math.min(attempt, 3) - 1) + Math.floor(Math.random() * 1000)) : 0
-  // Even an exhausted retry defers every other worker and stage.
-  if (throttleWait) llmRateLimiter.deferUntil(Date.now() + throttleWait)
+  // Even an exhausted retry defers every other worker and stage -- on this
+  // provider. A stage with its own route keeps its own pause, so one gateway's
+  // 429 cannot quiet a different provider's pass.
+  if (throttleWait) rateLimiterFor(env).deferUntil(Date.now() + throttleWait)
   if (res.status === 429 && attempt <= 3) {
     // Honor both Retry-After formats; otherwise use backoff with jitter.
     const waitMs = throttleWait
@@ -2028,9 +2213,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
       return callLlm(rung.prompt, env, attempt + 1, validate, rung.opts)
     }
   }
-  if (!res.ok) return routeOrThrow(new Error(shortError(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 120)}`)))
-  const rawText = await res.text().catch(err => { request.outcome = 'body-error'; request.durationMs = Date.now() - started; throw err })
-  request.durationMs = Date.now() - started
+  if (!res.ok) return routeOrThrow(new Error(shortError(`LLM HTTP ${res.status}: ${rawText.slice(0, 120)}`)))
   try { const usage = JSON.parse(rawText)?.usage; if (usage) request.usage = usage } catch {}
   let text = ''
   try {
@@ -2776,6 +2959,13 @@ export function releaseBoilerplate (summary = '') {
 
 export function isGatewayError (err) {
   const msg = String(err?.message || err || '')
+  // An error frame the gateway delivered *inside* a 200 is its failure, not the
+  // model's answer: "Service temporarily unavailable", "Provider overloaded",
+  // "at capacity" all arrive this way. Classifying them by the words the
+  // gateway happened to use left a server_error frame looking like a content
+  // failure -- parked on the permanent cooldown for a provider outage, with the
+  // lean rung and the failover route never consulted.
+  if (/LLM gateway error in the response body/i.test(msg)) return true
   return /fetch failed|ECONNREFUSED|ECONNRESET|ECONNABORTED|EPIPE|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|socket hang up|terminated|HTTP 5\d\d|timeout/i.test(msg)
 }
 
