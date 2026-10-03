@@ -362,7 +362,7 @@ nav.term-nav a.active{
   border:1px solid var(--term-border);
   border-left:3px solid var(--term-cyan);
   background:var(--panel);
-  font-size:.82rem;
+  font-size:.9rem;
   line-height:1.6;
   color:var(--txt-dim);
 }
@@ -374,13 +374,13 @@ nav.term-nav a.active{
   margin-bottom:4px;
 }
 .day-rollup-label{
-  font-size:.68rem;
+  font-size:.72rem;
   font-weight:700;
   letter-spacing:.05em;
   color:var(--term-cyan);
 }
 .day-rollup-count{
-  font-size:.7rem;
+  font-size:.74rem;
   color:var(--txt-subtle);
 }
 .day-rollup ul{margin:0;padding-left:18px}
