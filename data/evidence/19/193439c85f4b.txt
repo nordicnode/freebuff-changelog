@@ -1,0 +1,259 @@
+Date: 2026-09-25T10:37:18Z
+Category: CLI
+Areas: CLI
+Commit nature: production
+Stats: +153 / -2
+Analysis notes: New files: `cli/src/utils/launcher-update-restart.ts`.
+Added files: cli/src/utils/launcher-update-restart.ts
+Modified files: cli/src/state/freebuff-session-store.ts, cli/src/utils/renderer-cleanup.ts
+Key facts (ground the WHY and DETAIL sentences in these): - This process is being replaced by the launcher's update restart: keep the held slot instead of ending it on the way out. Every later `releaseSlot` is a no-op, which covers both exit paths — `exitCliCleanly` and the session hook's unmount cleanup that renderer teardown triggers. - Whether a SIGTERM is the npm launcher replacing this binary with an update. - (the launcher's kill is TerminateProcess), so neither reaches this. - SIGTERM - Default kill signal (e.g., `kill <pid>`), and the launcher's update restart. For the latter, keep the Freebuff session the user may have just paid for so the relaunched binary resumes it.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Exports added: isLauncherUpdateTermination
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "an update restart keeps the held slot on every exit path" ; "isLauncherUpdateTermination" ; "a SIGTERM while the live launcher is our parent is an update restart" ; "without a launcher (direct binary, dev) it is an ordinary kill" ; "an orphan whose launcher already died is not being restarted"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `cli/src/utils/launcher-update-restart.ts`:
+```
+/**
+ * Whether a SIGTERM is the npm launcher replacing this binary with an update.
+ *
+ * The launcher (`cli/release-core/launcher.js`) spawns the binary at once and
+ * checks for an update in the background. When the new build is staged it
+ * SIGTERMs the running binary, installs, and relaunches with the same argv —
+ * a median ~16s after a Freebuff user has already picked a model and paid for
+ * its hour. `stopRunningProcess` in `checkForUpdates` is the launcher's ONLY
+ * SIGTERM, and old launchers stay installed until the user reinstalls the npm
+ * package, so the binary has to recognise it without the launcher's help:
+ * the signal arrives while our parent is still the live launcher.
+ *
+ * A user's own `kill <pid>` of the binary matches too. That is harmless: the
+ * session is then left exactly as a crash leaves it, which the next launch
+ * takes over for free (see `isFreebuffInstanceOwnedByDeadLocalProcess`).
+ * Terminal close is SIGHUP, and Windows never runs a SIGTERM handler at all
+ * (the launcher's kill is TerminateProcess), so neither reaches this.
+ */
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/cli/src/state/freebuff-session-store.ts b/cli/src/state/freebuff-session-store.ts
+index e4125fe69..a64dfb0cd 100644
+--- a/cli/src/state/freebuff-session-store.ts
++++ b/cli/src/state/freebuff-session-store.ts
+@@ -31,85 +31,103 @@ export type FreebuffSessionFailure =
+   | (FreebuffSessionFailureBase & {
+       type: 'timeout' | 'other'
+     })
+ 
+ interface FreebuffSessionStore {
+   session: FreebuffSessionResponse | null
+   lastRefund: number | null
+   pendingRefund: { instanceId: string; token: string } | null
+   refreshRefund: () => Promise<void>
+   releaseSlot: (
+     session?: FreebuffSessionResponse,
+     signal?: AbortSignal,
+   ) => Promise<void>
++  keepSlotForRelaunch: () => void
++  slotKeptForRelaunch: boolean
+   failure: FreebuffSessionFailure | null
+ 
+   setSession: (session: FreebuffSessionResponse | null) => void
+   setFailure: (failure: FreebuffSessionFailure | null) => void
+ }
+ 
+ function instanceOf(
+   session: FreebuffSessionResponse | null | undefined,
+ ): string | undefined {
+   return session && 'instanceId' in session ? session.instanceId : undefined
+ }
+ 
+ export const useFreebuffSessionStore = create<FreebuffSessionStore>(
+   (set, get) => {
+     const releases = new Map<string, Promise<void>>()
+     return {
+       session: null,
+       lastRefund: null,
+       pendingRefund: null,
+       refreshRefund: async () => {
+         const pending = get().pendingRefund
+         if (!pending || getAuthTokenDetails().token !== pending.token) return
+         const receipt = await callFreebuffSession('DELETE', pending.token, {
+           instanceId: pending.instanceId,
+         })
+         if (
+           get().pendingRefund !== pending ||
+           getAuthTokenDetails().token !== pending.token
+         )
+           return
+         if (receipt.status === 'ended' && !receipt.freebucksRefundPending)
+           set({ lastRefund: receipt.freebucksRefund ?? 0, pendingRefund: null })
+       },
++      slotKeptForRelaunch: false,
++      keepSlotForRelaunch: () => set({ slotKeptForRelaunch: true }),
+       releaseSlot: (target = get().session ?? undefined, signal) => {
++        if (get().slotKeptForRelaunch) return Promise.resolve()
+         if (!holdsLiveFreebuffSlot(target ?? null)) return Promise.resolve()
+         const instanceId = instanceOf(target)
+         const { token } = getAuthTokenDetails()
+         if (!token || !instanceId) {
+           return Promise.reject(
+             new Error(
+               'Cannot end the session without authentication and its instance id.',
+             ),
+           )
+         }
+         const key = JSON.stringify([token, instanceId])
+         const existing = releases.get(key)
+         if (existing) return existing
+         const owner = get().session
+         const stillOwned = () =>
+           (get().session === owner ||
+             (instanceOf(owner) !== undefined &&
+               instanceOf(get().session) === instanceOf(owner))) &&
+           getAuthTokenDetails().token === token
+         const release = (async () => {
+           try {
+             const result = await callFreebuffSession('DELETE', token, {
+               instanceId,
+               signal,
+             })
+diff --git a/cli/src/utils/launcher-update-restart.ts b/cli/src/utils/launcher-update-restart.ts
+new file mode 100644
+index 000000000..b902f75a9
+--- /dev/null
++++ b/cli/src/utils/launcher-update-restart.ts
+@@ -0,0 +1,30 @@
++export function isLauncherUpdateTermination(params: {
++  launcherPid: number
++  parentPid: number
++  isProcessRunning: (pid: number) => boolean
++}): boolean {
++  const { launcherPid, parentPid } = params
++  if (!Number.isInteger(launcherPid) || launcherPid <= 0) return false
++  if (parentPid !== launcherPid) return false
++  return params.isProcessRunning(launcherPid)
++}
+diff --git a/cli/src/utils/renderer-cleanup.ts b/cli/src/utils/renderer-cleanup.ts
+index 78627e025..453481368 100644
+--- a/cli/src/utils/renderer-cleanup.ts
++++ b/cli/src/utils/renderer-cleanup.ts
+@@ -1,43 +1,57 @@
+ import { execFile } from 'child_process'
+ 
+ import { resetTerminalTitle } from './terminal-title'
+ import { stopActiveRun } from './active-run'
++import { IS_FREEBUFF } from './constants'
+ import { getCliEnv } from './env'
+ import { exitCliCleanly, registerExitCleanup } from './exit-cleanly'
++import { holdsLiveFreebuffSlot } from './freebuff-session-api'
++import { isLauncherUpdateTermination } from './launcher-update-restart'
++import { logger } from './logger'
+ import { trackHelperProcess } from './helper-process-telemetry'
+ import { flushLiveChatState } from './run-state-storage'
+ import { reportFatalErrorSync, writeTerminalControlSync } from './terminal-io'
+ import { TERMINAL_RESET_SEQUENCES } from './terminal-reset-sequences'
+ import { stopTerminalWatchdog } from './terminal-watchdog'
++import { useFreebuffSessionStore } from '../state/freebuff-session-store'
+ 
+ import type { CliRenderer } from '@opentui/core'
+ 
+ let renderer: CliRenderer | null = null
+ let handlersInstalled = false
+ let cleanupStarted = false
+ 
++function isProcessRunningSync(pid: number): boolean {
++  try {
++    process.kill(pid, 0)
++    return true
++  } catch (error) {
++    return (error as NodeJS.ErrnoException).code === 'EPERM'
++  }
++}
++
+ function isProcessRunning(pid: number, onResult: (running: boolean) => void) {
+   if (process.platform === 'win32') {
+     const probe = execFile(
+       'tasklist',
+       ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'],
+       { windowsHide: true, timeout: 15_000 },
+       (error, stdout) => {
+         if (error) {
+           onResult(true)
+           return
+         }
+         onResult(new RegExp(`(?:^|\\D)${pid}(?:\\D|$)`).test(stdout))
+       },
+     )
+     trackHelperProcess('launcher_probe', probe)
+     return
+   }
+ 
+   try {
+     process.kill(pid, 0)
+     onResult(true)
+   } catch (error) {
+@@ -179,52 +193,77 @@ export function installProcessCleanupHandlers(cliRenderer: CliRenderer): void {
+   }
+ 
+   const launcherPid = Number(getCliEnv().CODEBUFF_LAUNCHER_PID)
+   if (
+     Number.isInteger(launcherPid) &&
+     launcherPid > 0 &&
+     launcherPid !== process.pid
+   ) {
+     let launcherCheckInFlight = false
+     const launcherMonitor = setInterval(() => {
+       if (launcherCheckInFlight) return
+       launcherCheckInFlight = true
+       isProcessRunning(launcherPid, (running) => {
+         launcherCheckInFlight = false
+         if (running) return
+         clearInterval(launcherMonitor)
+         handleExitRequest()
+       })
+     }, 500)
+     launcherMonitor.unref()
+   }
+ 
+-  process.on('SIGTERM', handleExitRequest)
++  process.on('SIGTERM', () => {
++    if (
++      IS_FREEBUFF &&
++      process.platform !== 'win32' &&
++      isLauncherUpdateTermination({
++        launcherPid,
++        parentPid: process.ppid,
++        isProcessRunning: isProcessRunningSync,
++      })
++    ) {
++      const { session } = useFreebuffSessionStore.getState()
++      useFreebuffSessionStore.getState().keepSlotForRelaunch()
++      if (holdsLiveFreebuffSlot(session)) {
++        logger.info(
++          {
++            metric: 'freebuff_session_kept_for_update_restart',
++            model: session && 'model' in session ? session.model : undefined,
++          },
++          '[freebuff-session] launcher update restart; keeping the session for the relaunch',
++        )
++      }
++    }
++    handleExitRequest()
++  })
+ 
+   process.on('SIGHUP', handleExitRequest)
+ 
+   process.on('SIGINT', handleExitRequest)
+ 
+   process.on('beforeExit', () => {
+     cleanup()
+   })
+ 
+   process.on('exit', () => {
+     if (cleanup()) {
+       stopTerminalWatchdog()
+     }
+   })
+ 
+   process.on('uncaughtException', (error) => {
+     exitCliWithFatalError('Uncaught exception', error)
+```
