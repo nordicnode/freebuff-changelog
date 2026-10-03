@@ -2432,7 +2432,7 @@ async function writeRollupBatch (pending, { endsAt = Infinity, env = process.env
     try {
       const rollup = await generateRollup(day, entries, { dataDir: DATA, env })
       written++
-      log(`[rollup] ${day}: ${rollup.bullets.length} bullet(s) (${rollup.model || 'unknown model'})`)
+      log(`[rollup] ${day}: ${rollup.bullets.length} bullet(s) (${rollup.model || 'unknown model'} @ ${rollup.provider || 'unknown provider'})${rollup.dropped ? `, ${rollup.dropped} of the model's bullets dropped` : ''}`)
     } catch (err) {
       log(`[rollup] ${day} failed: ${shortError(err)}`)
     }
