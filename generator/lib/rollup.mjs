@@ -175,6 +175,26 @@ export function rollupBacklog (doc, { rollups = {}, now = Date.now(), limit = In
   return limit === Infinity ? pending : pending.slice(0, Math.max(0, limit))
 }
 
+/**
+ * The automatic pass's slice of the backlog: forward-only. It covers the
+ * frontier -- the days after the newest stored digest -- so a newly settled day
+ * is digested on its own and an outage window heals when the relay returns.
+ * Everything older is a historical window that only an explicit backfill should
+ * spend on; draining it automatically would turn "forward-only" into "the whole
+ * archive at two days per cycle". With nothing stored yet, the frontier is the
+ * newest settled day itself, so the first automatic digest starts the frontier
+ * instead of silently backfilling history.
+ */
+export function forwardRollupBacklog (doc, { rollups = {}, now = Date.now(), limit = Infinity } = {}) {
+  const pending = rollupBacklog(doc, { rollups, now })
+  if (!pending.length) return pending
+  const stored = Object.keys(rollups).filter(day => DAY_RE.test(day)).sort()
+  const out = stored.length
+    ? pending.filter(p => p.day > stored[stored.length - 1])
+    : pending.slice(0, 1)
+  return limit === Infinity ? out : out.slice(0, Math.max(0, limit))
+}
+
 export async function saveRollup (dataDir, rollup) {
   await writeJson(rollupPath(dataDir, rollup.day), rollup)
 }

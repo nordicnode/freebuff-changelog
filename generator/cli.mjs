@@ -20,7 +20,7 @@ import { QUALITY_POLICY_V, generationState, regenUnfinished } from './lib/qualit
 import { shortHash, eli5Source } from './lib/util.mjs'
 import { EVIDENCE_WIDTH_WARN, evidenceStats, gcEvidence, liveEvidenceHashes, spillEntryEvidence, spillEvidence } from './lib/evidence.mjs'
 import { changelogBytes, loadChangelog, saveChangelog } from './lib/changelog-store.mjs'
-import { generateRollup, loadRollups, rollupBacklog, rollupFingerprint, ROLLUP_V } from './lib/rollup.mjs'
+import { forwardRollupBacklog, generateRollup, loadRollups, rollupBacklog, rollupFingerprint, ROLLUP_V } from './lib/rollup.mjs'
 import { SIZE_MAX_BYTES, SIZE_WARN_BYTES, findOverBudget, sizeText } from './lib/sizebudget.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
@@ -2447,7 +2447,7 @@ async function writeSettledRollups (entries, { endsAt = Infinity } = {}) {
   if (Date.now() >= endsAt) return 0
   const limit = Math.max(0, Number(process.env.CHANGELOG_ROLLUP_LIMIT || 2))
   if (!limit) return 0
-  const pending = rollupBacklog({ entries }, { rollups: await loadRollups(DATA), limit })
+  const pending = forwardRollupBacklog({ entries }, { rollups: await loadRollups(DATA), limit })
   if (!pending.length) return 0
   const env = Number.isFinite(endsAt) ? { ...process.env, LLM_DEADLINE_AT: String(endsAt) } : process.env
   return await writeRollupBatch(pending, { endsAt, env })

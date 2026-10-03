@@ -5,8 +5,8 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  ROLLUP_SETTLE_GRACE_MS, ROLLUP_V, buildRollupPrompt, dayRollupReady, generateRollup,
-  loadRollups, rollupBacklog, rollupFingerprint, rollupInput, saveRollup, validateRollupOut
+  ROLLUP_SETTLE_GRACE_MS, ROLLUP_V, buildRollupPrompt, dayRollupReady, forwardRollupBacklog,
+  generateRollup, loadRollups, rollupBacklog, rollupFingerprint, rollupInput, saveRollup, validateRollupOut
 } from '../lib/rollup.mjs'
 import { shortHash } from '../lib/util.mjs'
 
@@ -123,6 +123,19 @@ test('rollupBacklog: settled days only, newest first, current digests skipped, a
   assert.equal(rollupBacklog(doc, { now, rollups: { [DAY]: { ...current[DAY], v: ROLLUP_V - 1 } } }).length, 1, 'an older prompt version re-queues')
   assert.equal(rollupBacklog(doc, { now, rollups: { [DAY]: { ...current[DAY], source: 'stale' } } }).length, 1, 'changed input re-queues')
   assert.equal(rollupBacklog(doc, { now, limit: 0 }).length, 0)
+})
+
+test('forwardRollupBacklog never drains history: it starts at the newest stored digest', () => {
+  const mk = (day, sha) => entry({ sha, day, date: `${day}T10:00:00Z` })
+  const doc = { entries: [mk('2026-09-01', '1'.repeat(40)), mk('2026-09-02', '2'.repeat(40)), mk('2026-09-03', '3'.repeat(40)), mk('2026-10-01', '4'.repeat(40))] }
+  const now = Date.parse('2026-10-03T00:00:00Z')
+  assert.deepEqual(forwardRollupBacklog(doc, { now }).map(p => p.day), ['2026-10-01'], 'with nothing stored, the newest settled day starts the frontier')
+
+  const rollups = { '2026-10-01': { v: ROLLUP_V, source: rollupFingerprint('2026-10-01', [entry({ sha: '4'.repeat(40), day: '2026-10-01', date: '2026-10-01T10:00:00Z' })]), bullets: ['Added a thing.'] } }
+  assert.deepEqual(forwardRollupBacklog(doc, { now, rollups }), [], 'older days wait for an explicit backfill')
+
+  const later = { entries: [...doc.entries, mk('2026-10-02', '5'.repeat(40))] }
+  assert.deepEqual(forwardRollupBacklog(later, { now: Date.parse('2026-10-04T00:00:00Z'), rollups }).map(p => p.day), ['2026-10-02'], 'a newly settled day joins the frontier')
 })
 
 test('saveRollup/loadRollups round-trip a day and ignore strangers in the directory', () => withDir(async dir => {
