@@ -11,22 +11,29 @@
 // could not be reviewed as one artifact.
 //
 // A day is settled when it is in the past; it is digestible when every
-// meaningful change carries a summary, or a day of grace has passed so a row
+// feature change carries a summary, or a day of grace has passed so a row
 // that will never summarize cannot hold the whole day's digest hostage. The
 // `source` fingerprint is the exact input the bullets were written from: a late
 // entry or a rewritten summary changes it, and the digest is regenerated from
 // the new day. Nothing here runs at build time -- the site renderer only reads
 // the stored file.
+//
+// The digest covers *feature* changes only. A release-bump row carries the
+// release roll-up ("Updated Freebuff CLI to 0.2.4, ..."), and its member changes
+// are their own entries, digested on their own days; letting bump rows into the
+// input produced page after page of version labels and buried the actual fixes.
+// Test-only rows are plumbing by the same reasoning.
 
 import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { readJson, shortHash, writeJson } from './util.mjs'
 import { callScopedLlm, cleanText, DEFAULT_LLM_MODEL, servedModelOf } from './llm.mjs'
+import { isBumpEntry } from './analyze.mjs'
 
 export const ROLLUP_DIR = 'rollups'
-export const ROLLUP_V = 1
-export const ROLLUP_MAX_BULLETS = 20
-export const ROLLUP_BULLET_CHARS = 160
+export const ROLLUP_V = 3
+export const ROLLUP_MAX_BULLETS = 24
+export const ROLLUP_BULLET_CHARS = 140
 // How long a settled day may wait for rows that have not summarized before the
 // digest goes out without them. Without a bound, one parked row (a provider
 // outage the pipeline gave up on) would keep the day's page digest-less
@@ -47,11 +54,34 @@ const BULLET_REJECT = [
   /(?:\/[\w.-]+){2,}/,
   /\b[\w.-]+\.(?:ts|tsx|js|mjs|cjs|json|md|css|html|yml|yaml)\b/i,
   /#\d+/,
-  /\b[0-9a-f]{7,40}\b/
+  /\b[0-9a-f]{7,40}\b/,
+  /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/, // CONSTANT_CASE
+  /\b[a-z][a-z0-9]*_[a-z0-9]+\b/, // snake_case
+  /\b\w+\(\)/ // function calls
 ]
+
+// camelCase words that are product names, not identifiers. Everything else in
+// that shape (freebucksTimeZoneHeaders, useGravityAd) is construction work the
+// prompt should have translated into what the thing does.
+const CAMEL_ALLOW = new Set(['ios', 'ipados', 'macos', 'iphone', 'ipad', 'ipod', 'ebay', 'youtube', 'whatsapp', 'linkedin', 'esim', 'xai'])
+const CAMEL_RE = /\b[a-z]+(?:[A-Z][a-zA-Z0-9]*)+\b/g
+
+function camelIdentifiers (text) {
+  const out = []
+  for (const m of String(text).matchAll(CAMEL_RE)) {
+    if (!CAMEL_ALLOW.has(m[0].toLowerCase())) out.push(m[0])
+  }
+  return out
+}
 
 function usableText (e) {
   return !!(e?.ai?.title && e.ai?.summary)
+}
+
+// What the digest may restate: a summarized feature change. Bump rows carry the
+// release text, not the day's features; test-only rows are plumbing.
+function digestible (e) {
+  return !e?.noise && !e?.testOnly && !isBumpEntry(e) && usableText(e)
 }
 
 function dayOf (e) {
@@ -73,7 +103,7 @@ function nowMs (now) {
 export function rollupInput (day, entries = []) {
   const lines = [`Day: ${day} (UTC)`]
   for (const e of entries) {
-    if (!usableText(e)) continue
+    if (!digestible(e)) continue
     const ai = e.ai
     const flags = [ai.significance, ai.audience, ai.userVisible === true ? 'user-visible' : null, ai.breaking ? 'breaking' : null].filter(Boolean)
     lines.push('', `- ${flags.length ? `[${flags.join(', ')}] ` : ''}${cleanText(ai.title, 140)}`)
@@ -89,16 +119,19 @@ export function rollupFingerprint (day, entries = []) {
 }
 
 export function buildRollupPrompt (day, input) {
-  return `You write the daily roll-up for a changelog site: a short bullet digest of one day's product changes, shown at the top of that day's page above the individual entries. For most readers it is the page; every word must be true to the verified material below.
+  return `You write the daily roll-up for a changelog site: the bullet list at the top of one day's page, above the individual entries. It is how most readers learn what shipped that day, so it must cover the day's features and changes completely enough that they do not have to open an entry. Every word must be true to the verified material below.
 
 Rules:
-- One bullet per change worth a reader's attention. Merge records that describe the same change. Skip internal refactors, test-only changes, dependency and lockfile churn, and anything a user would never notice.
-- Lead every bullet with a past-tense verb: Added, Fixed, Updated, Improved, Simplified, Prevented, Removed, Changed. Describe what the reader can do or see differently, not how it was implemented.
-- One sentence per bullet, at most ${ROLLUP_BULLET_CHARS} characters, ending with a period.
-- Plain text only: no markdown, no backticks, no file paths, no commit or PR references, no version numbers, no internal module names.
+- Cover the day. Write one bullet for every change that alters what a Freebuff user can do, see, or pay: features, fixes, behavior, models, prices, permissions, slash commands, limits. A busy day runs to a dozen bullets or more; do not compress several unrelated changes into one bullet and do not drop a change because it seems small.
+- Write about the change itself, never about the release that carried it. No version numbers, no release names, and no "the release".
+- A bullet belongs here only if a user could notice it. Verbs like Added a helper, Updated a schema, Logged, Gated, Rotated, Pinned, Scoped, Renamed and Refactored almost always mean construction work: leave those out, however notable the material calls them. Do not write about analytics or ad-serving internals (events, schemas, fields, experiment arms), database or BigQuery work, logging and error serializers, internal helpers, or a change you cannot describe without naming code.
+- If a bullet only makes sense to someone reading the code, it is not a feature: drop it.
+- Lead every bullet with a past-tense verb: Added, Fixed, Updated, Improved, Simplified, Prevented, Removed, Changed.
+- One idea per bullet, one sentence, at most ${ROLLUP_BULLET_CHARS} characters, ending with a period. Do not join two changes with "and": split them into separate bullets.
+- Plain text only: no markdown, no backticks, no file paths, no commit or PR references, no version numbers, no internal module or job names. Never write code identifiers (camelCase, snake_case or CONSTANT_CASE names), function names, flags, schema fields or event names. Translate them into what the thing does: say "the freebucks timezone header", not "freebucksTimeZoneHeaders".
 - Never use em dashes. Use commas, parentheses, or hyphens.
 - Order bullets by what a reader would care about most, not by the order below.
-- Write at least 1 and at most ${ROLLUP_MAX_BULLETS} bullets, and never more than the number of changes below.
+- At most ${ROLLUP_MAX_BULLETS} bullets, and never more than the number of changes below.
 - Use only facts, names, and numbers present in the material. If a detail is not there, leave it out. Do not add benefits, motivations, or availability the material does not state.
 
 Output JSON only, no prose and no code fences: {"bullets":["...","..."]}
@@ -120,8 +153,9 @@ export function validateRollupOut (out) {
     let b = cleanText(raw, ROLLUP_BULLET_CHARS + 80, true).replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').replace(/\s+/g, ' ').trim()
     if (!b) continue
     if (!/[.!?]$/.test(b)) b += '.'
-    if (b.length > ROLLUP_BULLET_CHARS + 60) continue
+    if (b.length > ROLLUP_BULLET_CHARS + 40) continue
     if (BULLET_REJECT.some(re => re.test(b))) continue
+    if (camelIdentifiers(b).length) continue
     // The same change restated twice reads as padding and ships even when both
     // records are real (a bump row and its member row). Punctuation differs
     // between restatements, so equality is on the normalized words.
@@ -135,14 +169,16 @@ export function validateRollupOut (out) {
   return { bullets }
 }
 
-// Whether a settled day can be digested now: at least one change has text, and
-// either every meaningful change does or the grace window has passed. Rows that
-// are still queued keep the digest from being written half-formed; rows that
+// Whether a settled day can be digested now: at least one feature change has
+// text, and either every feature change does or the grace window has passed.
+// Release bumps and test-only rows are not features and never hold the digest.
+// Rows that are still queued keep it from being written half-formed; rows that
 // are parked stop it from being written at all.
 export function dayRollupReady (day, entries = [], { now = Date.now() } = {}) {
-  const text = entries.filter(usableText)
+  const features = entries.filter(e => !e?.noise && !e?.testOnly && !isBumpEntry(e))
+  const text = features.filter(usableText)
   if (!text.length) return false
-  if (text.length === entries.length) return true
+  if (text.length === features.length) return true
   return nowMs(now) - dayEndMs(day) >= ROLLUP_SETTLE_GRACE_MS
 }
 
@@ -169,7 +205,7 @@ export function rollupBacklog (doc, { rollups = {}, now = Date.now(), limit = In
     const source = rollupFingerprint(day, entries)
     const current = rollups[day]
     if (!force && current?.v === ROLLUP_V && current.source === source && Array.isArray(current.bullets) && current.bullets.length) continue
-    pending.push({ day, entries: entries.filter(usableText), source })
+    pending.push({ day, entries: entries.filter(digestible), source })
   }
   pending.sort((a, b) => (a.day < b.day ? 1 : -1))
   return limit === Infinity ? pending : pending.slice(0, Math.max(0, limit))

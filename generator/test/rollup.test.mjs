@@ -70,11 +70,31 @@ test('rollupInput skips rows that have no summary yet, so a half-enriched day ca
   assert.match(input, /Mission mode/)
 })
 
+test('the digest material excludes release bumps and test-only rows, and a bump-only day has nothing to digest', () => {
+  const bump = entry({
+    sha: 'f'.repeat(40),
+    version: '1.2.3',
+    freebuffVersion: '1.2.3',
+    ai: { title: 'Freebuff CLI 1.2.3 release bump', summary: 'The manifest moved from 1.2.2 to 1.2.3 and carried three fixes.', significance: 'major' }
+  })
+  const testOnly = entry({ sha: 'e'.repeat(40), testOnly: true, ai: { title: 'Test coverage: a.ts', summary: 'Tests only, no shipped code.' } })
+  const input = rollupInput(DAY, [entry(), bump, testOnly])
+  assert.match(input, /Mission mode/)
+  assert.doesNotMatch(input, /1\.2\.3/, 'a release label is not a feature')
+  assert.doesNotMatch(input, /Test coverage/, 'test plumbing is not a feature')
+
+  const now = Date.parse('2026-10-10T00:00:00Z')
+  assert.equal(dayRollupReady(DAY, [bump, testOnly], { now }), false, 'a bump-only day has nothing a reader would digest')
+  assert.deepEqual(rollupBacklog({ entries: [bump, testOnly] }, { now }), [])
+})
+
 test('the prompt names the voice rules and embeds the day, and the fingerprint tracks the input', () => {
   const rows = [entry()]
   const input = rollupInput(DAY, rows)
   const prompt = buildRollupPrompt(DAY, input)
   assert.match(prompt, /past-tense verb/)
+  assert.match(prompt, /Cover the day/)
+  assert.match(prompt, /never about the release that carried it/)
   assert.match(prompt, /no markdown, no backticks, no file paths/)
   assert.match(prompt, /Never use em dashes/)
   assert.match(prompt, /only facts, names, and numbers present in the material/)
@@ -96,6 +116,12 @@ test('validateRollupOut cleans bullets and rejects prose, empty answers, and mac
   assert.deepEqual(validateRollupOut({ bullets: ['`code` names', 'Simplified the model picker tooltips'] }).bullets, ['Simplified the model picker tooltips.'])
   // A restated change, punctuation included, ships once.
   assert.deepEqual(validateRollupOut({ bullets: ['Added a first-tab discount.', 'Added a first tab discount!'] }).bullets, ['Added a first-tab discount.'])
+  // Code identifiers mean the bullet is construction work, not a feature.
+  assert.throws(() => validateRollupOut({ bullets: ['Fixed freebucksTimeZoneHeaders to take an injected zone.'] }), /no usable bullets/)
+  assert.throws(() => validateRollupOut({ bullets: ['Added ADS_IMPRESIA_FETCH_OUTCOMES handling.'] }), /no usable bullets/)
+  assert.throws(() => validateRollupOut({ bullets: ['Scoped the write_todos retry guard.'] }), /no usable bullets/)
+  // Product names in camel shape are prose, not identifiers.
+  assert.deepEqual(validateRollupOut({ bullets: ['Fixed the iOS app picker on macOS.'] }).bullets, ['Fixed the iOS app picker on macOS.'])
 })
 
 test('dayRollupReady waits for the enrichment drain, then goes ahead without parked rows after the grace window', () => {
