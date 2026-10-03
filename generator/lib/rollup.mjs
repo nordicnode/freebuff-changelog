@@ -114,6 +114,7 @@ ${input}
 export function validateRollupOut (out) {
   if (!out || typeof out !== 'object' || !Array.isArray(out.bullets)) throw new Error('rollup output missing a bullets array')
   const bullets = []
+  const seen = new Set()
   for (const raw of out.bullets) {
     if (typeof raw !== 'string') continue
     let b = cleanText(raw, ROLLUP_BULLET_CHARS + 80, true).replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').replace(/\s+/g, ' ').trim()
@@ -121,6 +122,12 @@ export function validateRollupOut (out) {
     if (!/[.!?]$/.test(b)) b += '.'
     if (b.length > ROLLUP_BULLET_CHARS + 60) continue
     if (BULLET_REJECT.some(re => re.test(b))) continue
+    // The same change restated twice reads as padding and ships even when both
+    // records are real (a bump row and its member row). Punctuation differs
+    // between restatements, so equality is on the normalized words.
+    const key = b.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+    if (seen.has(key)) continue
+    seen.add(key)
     bullets.push(b)
     if (bullets.length >= ROLLUP_MAX_BULLETS) break
   }

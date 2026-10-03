@@ -94,6 +94,8 @@ test('validateRollupOut cleans bullets and rejects prose, empty answers, and mac
   assert.throws(() => validateRollupOut('a prose answer'), /bullets array/)
   // A markdown-flavoured bullet is dropped; the usable ones survive.
   assert.deepEqual(validateRollupOut({ bullets: ['`code` names', 'Simplified the model picker tooltips'] }).bullets, ['Simplified the model picker tooltips.'])
+  // A restated change, punctuation included, ships once.
+  assert.deepEqual(validateRollupOut({ bullets: ['Added a first-tab discount.', 'Added a first tab discount!'] }).bullets, ['Added a first-tab discount.'])
 })
 
 test('dayRollupReady waits for the enrichment drain, then goes ahead without parked rows after the grace window', () => {
