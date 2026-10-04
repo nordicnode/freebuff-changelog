@@ -1,0 +1,1073 @@
+Date: 2026-10-04T01:23:16Z
+Category: CLI
+Areas: CLI
+Commit nature: production
+Stats: +132 / -52
+Analysis notes: CLI changes across 1 file(s) (+132/−52).
+Modified files: cli/src/utils/local-agent-registry.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Non-spawning workers also start with 'base'; keep their child list empty. - User agents can override bundled agents with the same ID.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "custom agents do not make bundled fast-mode workers fail validation"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `cli/src/utils/local-agent-registry.ts`:
+```
+// ============================================================================
+// Constants and types
+// ============================================================================
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `cli/README.md`:
+```markdown
+# @codebuff/cli
+
+A Terminal User Interface (TUI) package built with OpenTUI and React.
+
+## Installation
+
+```bash
+bun install
+```
+
+## Development
+
+Run the TUI in development mode:
+
+```bash
+bun run dev
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+bun test
+```
+
+### Interactive E2E Testing
+
+For testing interactive CLI features, install tmux:
+
+```bash
+# macOS
+brew install tmux
+
+# Ubuntu/Debian
+sudo apt-get install tmux
+
+# Windows (via WSL)
+wsl --install
+sudo apt-get install tmux
+```
+
+Then run the proof-of-concept:
+
+```bash
+bun run test:tmux-poc
+```
+
+[freebuff product prompt text omitted]
+
+```bash
+# ❌ Broken: tmux send-keys -t session "hello"
+# ✅ Works:  tmux send-keys -t session $'\e[200~hello\e[201~'
+```
+
+See [tmux.knowledge.md](tmux.knowledge.md) for comprehensive tmux documentation and [src/__tests__/README.md](src/__tests__/README.md) for testing documentation.
+
+## Build
+
+Build the package:
+
+```bash
+bun run build
+```
+
+## Run
+
+Run the built TUI:
+
+```bash
+bun run start
+```
+
+Or use the binary directly:
+
+```bash
+codebuff-tui
+```
+
+## Features
+```
+Complete Source of Modified Files (for complete module context):
+- File `cli/src/utils/local-agent-registry.ts` (497 lines):
+```
+import fs from 'fs'
+import path from 'path'
+
+import { pluralize } from '@codebuff/common/util/string'
+import {
+  getDefaultAgentDirs,
+  loadLocalAgents as sdkLoadLocalAgents,
+  loadMCPConfigSync,
+} from '@codebuff/sdk'
+
+import type { MCPConfig } from '@codebuff/common/types/mcp'
+
+import { getFreebuffModelDirectory } from '../state/freebuff-catalog-store'
+import { getSelectedFreebuffModel } from '../state/freebuff-model-store'
+import { getProjectRoot } from '../project-files'
+import { IS_FREEBUFF, type AgentMode } from './constants'
+import { getAgentIdForMode } from './freebuff-agent-selection'
+import { freebuffCatalogRootAgent } from './freebuff-catalog-agent'
+import { logger } from './logger'
+import * as bundledAgentsModule from '../agents/bundled-agents.generated'
+
+import type { AgentDefinition } from '@codebuff/common/templates/initial-agents-dir/types/agent-definition'
+
+// ============================================================================
+// Constants and types
+// ============================================================================
+
+const AGENTS_DIR_NAME = '.agents'
+
+export interface LocalAgentInfo {
+  id: string
+  displayName: string
+  filePath: string
+  /** True if this is a bundled Codebuff agent (not user-created) */
+  isBundled?: boolean
+}
+
+// ============================================================================
+// User agents cache (loaded via SDK at startup)
+// ============================================================================
+
+let userAgentsCache: Record<string, AgentDefinition> = {}
+// Map from agent ID to source file path (for UI "Open file" links)
+let userAgentFilePaths: Map<string, string> = new Map()
+// Cache for MCP servers loaded from mcp.json in .agents directories
+let mcpServersCache: Record<string, MCPConfig> = {}
+
+/**
+ * Initialize the agent registry by loading user agents via the SDK.
+ * This must be called at CLI startup before any sync agent loading functions.
+ *
+ * Agents are loaded from:
+ * - {cwd}/.agents (project)
+ * - {cwd}/../.agents (parent, e.g. monorepo root)
+ * - ~/.agents (global, user's home directory)
+ *
+ * Later directories take precedence, so project agents override global ones.
+ *
+ * @param options.agentDirs - The directories to load from. The CLI entry point
+ *   passes the set that survived the trust gate (`agent-dir-trust.ts`) so an
+ *   untrusted repository's agents and mcp.json are never imported; omitting it
+ *   loads every default directory.
+ */
+export async function initializeAgentRegistry({
+  agentDirs = getDefaultAgentDirs(),
+}: { agentDirs?: string[] } = {}): Promise<void> {
+  try {
+    userAgentsCache = await sdkLoadLocalAgents({ verbose: false, agentDirs })
+    // Build ID-to-filepath map by scanning the same agent directories
+    userAgentFilePaths = buildAgentFilePathMap(agentDirs)
+  } catch (error) {
+    // Fall back to empty cache if SDK loading fails, but log a warning
+    logger.warn(
+      { error },
+      'Failed to load user agents from .agents directories',
+    )
+    userAgentsCache = {}
+    userAgentFilePaths = new Map()
+  }
+
+  // Load MCP config from mcp.json files in the same .agents directories
+  try {
+    const mcpConfig = loadMCPConfigSync({
+      verbose: false,
+      configDirs: agentDirs,
+    })
+    mcpServersCache = mcpConfig.mcpServers
+    if (Object.keys(mcpServersCache).length > 0) {
+      logger.debug(
+        {
+          mcpServers: Object.keys(mcpServersCache),
+          source: mcpConfig._sourceFilePath,
+        },
+        '[agents] Loaded MCP servers from mcp.json',
+      )
+    }
+  } catch (error) {
+    logger.warn({ error }, 'Failed to load MCP config from .agents directories')
+    mcpServersCache = {}
+  }
+}
+
+/**
+ * Scan agent directories and build a map from agent ID to source file path.
+ * Uses regex to extract IDs from files without requiring module loading.
+ * Later directories in the list take precedence (can override earlier ones).
+ */
+const buildAgentFilePathMap = (agentsDirs: string[]): Map<string, string> => {
+  const idToPath = new Map<string, string>()
+  const idRegex = /id\s*:\s*['"`]([^'"`]+)['"`]/i
+
+  const scanDirectory = (dir: string): void => {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true })
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name)
+        if (entry.isDirectory() && !entry.name.startsWith('.')) {
+          scanDirectory(fullPath)
+          continue
+        }
+        if (
+          !entry.isFile() ||
+          !entry.name.endsWith('.ts') ||
+          entry.name.endsWith('.d.ts') ||
+          entry.name.endsWith('.test.ts')
+        ) {
+          continue
+        }
+        try {
+          const content = fs.readFileSync(fullPath, 'utf8')
+          const match = content.match(idRegex)
+          if (match?.[1]) {
+            idToPath.set(match[1], fullPath)
+          }
+        } catch {
+          // Skip files that can't be read
+        }
+      }
+    } catch {
+      // Skip directories that can't be read
+    }
+  }
+
+  // Scan all directories - later directories override earlier ones
+  for (const agentsDir of agentsDirs) {
+    scanDirectory(agentsDir)
+  }
+  return idToPath
+}
+
+/**
+ * Get user agents from the cache as LocalAgentInfo[]
+ */
+const getUserAgentsAsLocalInfo = (): LocalAgentInfo[] => {
+  return Object.values(userAgentsCache).map((def) => ({
+    id: def.id,
+    displayName: def.displayName || def.id,
+    filePath: userAgentFilePaths.get(def.id) || '',
+  }))
+}
+
+/**
+ * Get user agents from the cache as AgentDefinition[]
+ */
+const getUserAgentDefinitions = (): AgentDefinition[] => {
+  return Object.values(userAgentsCache) as AgentDefinition[]
+}
+
+// ============================================================================
+// Bundled agents loading (generated at build time by prebuild-agents.ts)
+// ============================================================================
+
+const getBundledAgents = (): Record<string, AgentDefinition> => {
+  return bundledAgentsModule.bundledAgents ?? {}
+}
+
+const getBundledAgentsAsLocalInfo = (): LocalAgentInfo[] => {
+  return bundledAgentsModule.getBundledAgentsAsLocalInfo?.() ?? []
+}
+
+// ============================================================================
+// Directory finding
+// ============================================================================
+
+let cachedAgentsDir: string | null = null
+
+export const findAgentsDirectory = (): string | null => {
+  if (cachedAgentsDir && fs.existsSync(cachedAgentsDir)) {
+    return cachedAgentsDir
+  }
+
+  const projectRoot = getProjectRoot() || process.cwd()
+  if (projectRoot) {
+    const rootCandidate = path.join(projectRoot, AGENTS_DIR_NAME)
+    if (
+      fs.existsSync(rootCandidate) &&
+      fs.statSync(rootCandidate).isDirectory()
+    ) {
+      cachedAgentsDir = rootCandidate
+      return cachedAgentsDir
+    }
+  }
+
+  let currentDir = process.cwd()
+  const filesystemRoot = path.parse(currentDir).root
+
+  while (true) {
+    const candidate = path.join(currentDir, AGENTS_DIR_NAME)
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      cachedAgentsDir = candidate
+      return cachedAgentsDir
+    }
+
+    if (currentDir === filesystemRoot) {
+      break
+    }
+
+    const parentDir = path.dirname(currentDir)
+    if (parentDir === currentDir) {
+      break
+    }
+
+    currentDir = parentDir
+  }
+
+  cachedAgentsDir = null
+  return null
+}
+
+// ============================================================================
+// Agent loading - LocalAgentInfo (lightweight, for UI/listing)
+// ============================================================================
+
+// Cache keyed by agent mode (or 'all' for no filtering)
+const cachedAgentsByMode: Map<string, LocalAgentInfo[]> = new Map()
+
+/**
+ * Load local agents for display in the '@' menu.
+ *
+ * @param currentAgentMode - If provided, filters bundled agents to only include
+ *   subagents of the current mode's agent (e.g., base2's spawnableAgents for DEFAULT mode).
+ *   User's local agents from .agents/ are always included regardless of mode.
+ */
+export const loadLocalAgents = (
+  currentAgentMode?: AgentMode,
+): LocalAgentInfo[] => {
+  const selectedFreebuffModel = IS_FREEBUFF ? getSelectedFreebuffModel() : null
+  const cacheKey = selectedFreebuffModel
+    ? `${currentAgentMode ?? 'all'}:${selectedFreebuffModel}`
+    : (currentAgentMode ?? 'all')
+  const cached = cachedAgentsByMode.get(cacheKey)
+  if (cached) {
+    return cached
+  }
+
+  // Get bundled agents - these are the default Codebuff agents
+  // compiled into the CLI binary at build time
+  const bundledAgentsInfo = getBundledAgentsAsLocalInfo()
+  const bundledAgents = getBundledAgents()
+
+  // Filter bundled agents to only include subagents of the current mode's agent
+  let filteredBundledAgents: LocalAgentInfo[]
+  if (currentAgentMode) {
+    const currentAgentId = getAgentIdForMode(currentAgentMode)
+    const currentAgentDef = bundledAgents[currentAgentId]
+      ? bundledAgents[currentAgentId]
+      : undefined
+    const spawnableAgentIds = new Set(currentAgentDef?.spawnableAgents ?? [])
+
+    // Only include bundled agents that are in the spawnableAgents list
+    filteredBundledAgents = bundledAgentsInfo.filter((agent) =>
+      spawnableAgentIds.has(agent.id),
+    )
+  } else {
+    filteredBundledAgents = bundledAgentsInfo
+  }
+
+  const results: LocalAgentInfo[] = [...filteredBundledAgents]
+  const includedIds = new Set(filteredBundledAgents.map((a) => a.id))
+
+  // Get user agents from the SDK-loaded cache
+  // User agents are always included (not filtered by mode) and can override bundled agents
+  const userAgents = getUserAgentsAsLocalInfo()
+
+  // Merge user agents - they override bundled agents with same ID
+  // and are always included regardless of mode filtering
+  for (const userAgent of userAgents) {
+    if (includedIds.has(userAgent.id)) {
+      // Replace bundled agent with user's version
+      const idx = results.findIndex((a) => a.id === userAgent.id)
+      if (idx !== -1) {
+        results[idx] = userAgent
+      }
+    } else {
+      results.push(userAgent)
+      includedIds.add(userAgent.id)
+    }
+  }
+
+  const sorted = results.sort((a, b) =>
+    a.displayName.localeCompare(b.displayName, 'en'),
+  )
+
+  cachedAgentsByMode.set(cacheKey, sorted)
+  return sorted
+}
+
+// ============================================================================
+// Agent loading - AgentDefinition (full definitions for runtime)
+// ============================================================================
+
+/**
+ * Load agent definitions from bundled agents and user's .agents directory.
+ * Bundled agents are compiled into the CLI binary at build time.
+ * User agents from .agents/ are loaded via SDK at startup and cached.
+ * User agents can override bundled agents with the same ID.
+ *
+ * Additionally, all user agent IDs are automatically added to the spawnableAgents
+ * of base agents that support spawning, so users can spawn their custom agents
+ * without needing to modify the base agent definition.
+ */
+export const loadAgentDefinitions = (): AgentDefinition[] => {
+  // Start with bundled agents - these are the default Codebuff agents
+  const bundledAgents = getBundledAgents()
+  const definitions: AgentDefinition[] = Object.values(bundledAgents).map(
+    (def) => ({ ...def }),
+  )
+  const bundledIds = new Set(Object.keys(bundledAgents))
+
+  // The catalog root (docs/freebuff-model-catalog.md) is not bundled: it is
+  // built from the selected catalog row, whose handle rotates, so it is
+  // rebuilt on every load and only exists while a catalog row is selected.
+  // Added before the merges below so it gets the same MCP servers and user
+  // agents as every bundled root.
+  const catalogRoot = IS_FREEBUFF ? selectedFreebuffCatalogRoot() : undefined
+  if (catalogRoot) definitions.push(catalogRoot)
+
+  // Get user agents from the SDK-loaded cache
+  const userAgentDefs = getUserAgentDefinitions()
+  const userAgentIds = userAgentDefs.map((def) => def.id)
+
+  for (const agentDef of userAgentDefs) {
+    // User agents override bundled agents with the same ID
+    if (bundledIds.has(agentDef.id)) {
+      const idx = definitions.findIndex((d) => d.id === agentDef.id)
+      if (idx !== -1) {
+        definitions[idx] = { ...agentDef }
+      }
+    } else {
+      definitions.push({ ...agentDef })
+    }
+  }
+
+  // Auto-add user agent IDs to spawnableAgents of base agents
+  // This allows users to spawn their custom agents without needing to
+  // explicitly add them to the base agent's spawnableAgents list
+  if (userAgentIds.length > 0) {
+    for (const def of definitions) {
+      // Non-spawning workers also start with 'base'; keep their child list empty.
+      if (
+        def.id.startsWith('base') &&
+        def.spawnableAgents &&
+        (def.toolNames?.includes('spawn_agents') ||
+          def.toolNames?.includes('spawn_agent_inline') ||
+          def.handleSteps)
+      ) {
+        const existingSpawnable = new Set(def.spawnableAgents)
+        for (const userAgentId of userAgentIds) {
+          if (!existingSpawnable.has(userAgentId)) {
+            def.spawnableAgents = [...def.spawnableAgents, userAgentId]
+          }
+        }
+      }
+    }
+  }
+
+  // Merge MCP servers from mcp.json into base agents
+  // This allows users to configure MCP tools that are available to the main agent
+  if (Object.keys(mcpServersCache).length > 0) {
+    for (const def of definitions) {
+      // Consider any agent with an ID starting with 'base' as a base agent
+      if (def.id.startsWith('base')) {
+        // Initialize mcpServers if not present
+        if (!def.mcpServers) {
+          def.mcpServers = {}
+        }
+        // Merge MCP servers (user config can override existing servers)
+        def.mcpServers = {
+          ...def.mcpServers,
+          ...mcpServersCache,
+        }
+      }
+    }
+  }
+
+  return definitions
+}
+
+/** The runtime root for the selected catalog row, when one is selected. */
+const selectedFreebuffCatalogRoot = (): AgentDefinition | undefined => {
+  const selection = getSelectedFreebuffModel()
+  const row = getFreebuffModelDirectory().row(selection)
+  if (!row || row.key !== selection) return undefined
+  return freebuffCatalogRootAgent(row) as unknown as AgentDefinition
+}
+
+// ============================================================================
+// UI/Display utilities
+// ============================================================================
+
+export const announceLoadedAgents = (): void => {
+  const agents = loadLocalAgents()
+  const agentsDir = findAgentsDirectory()
+
+  if (!agentsDir) {
+    logger.debug('[agents] No .agents directory found in this project.')
+    return
+  }
+
+  if (!agents.length) {
+    logger.debug({ agentsDir }, '[agents] No agent files found')
+    return
+  }
+
+  const agentIdentifiers = agents.map((agent) =>
+    agent.displayName && agent.displayName !== agent.id
+      ? `${agent.displayName} (${agent.id})`
+      : agent.displayName || agent.id,
+  )
+
+  logger.debug(
+    { agentsDir, agents: agentIdentifiers },
+    `[agents] Loaded ${pluralize(agents.length, 'local agent')}`,
+  )
+}
+
+export const getLoadedAgentsMessage = (): string | null => {
+  const agents = loadLocalAgents()
+  const agentsDir = findAgentsDirectory()
+
+  if (!agentsDir || !agents.length) {
+    return null
+  }
+
+  const agentCount = agents.length
+  const header = `Loaded ${pluralize(agentCount, 'local agent')} from ${agentsDir}`
+  const agentList = agents
+    .map((agent) => {
+      const identifier =
+        agent.displayName && agent.displayName !== agent.id
+          ? `${agent.displayName} (${agent.id})`
+          : agent.displayName || agent.id
+      return `  - ${identifier}`
+    })
+    .join('\n')
+
+  return `${header}\n${agentList}`
+}
+
+export const getLoadedAgentsData = (): {
+  agents: LocalAgentInfo[]
+  agentsDir: string
+} | null => {
+  const agents = loadLocalAgents()
+  const agentsDir = findAgentsDirectory()
+
+  if (!agentsDir || !agents.length) {
+    return null
+  }
+
+  return { agents, agentsDir }
+}
+
+// ============================================================================
+// Testing utilities
+// ============================================================================
+
+/**
+ * Clear cached agent listings. Intended for test scenarios that need to
+ * re-evaluate the filesystem state between cases.
+ */
+export const __resetLocalAgentRegistryForTests = (): void => {
+  cachedAgentsByMode.clear()
+  cachedAgentsDir = null
+  userAgentsCache = {}
+  userAgentFilePaths = new Map()
+  mcpServersCache = {}
+}
+
+/**
+ * Get the currently loaded MCP servers from mcp.json.
+ * Useful for debugging and displaying loaded MCP configuration.
+ */
+export const getLoadedMCPServers = (): Record<string, MCPConfig> => {
+  return { ...mcpServersCache }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `sdk/src/__tests__/load-agents.test.ts` (59 matching lines):
+```
+getDefaultAgentDirs,
+  listLocalAgentFiles,
+  loadLocalAgents,
+} from '../agents/load-agents'
+
+import type {
+  LoadedAgents,
+  LoadedAgentDefinition,
+  LoadLocalAgentsResult,
+  AgentValidationError,
+} from '../agents/load-agents'
+
+const MODEL_NAME = 'anthropic/claude-sonnet-4' as const
+
+/**
+ * Helper to write an agent file to the test directory.
+ * @param agentsDir - The agents directory path
+ * @param fileName - The file name (e.g., 'my-agent.ts')
+ * @param contents - The TypeScript/JavaScript content
+ */
+const writeAgentFile = (
+  agentsDir: string,
+  fileName: string,
+  contents: string,
+): void => {
+  writeFileSync(path.join(agentsDir, fileName), contents, 'utf8')
+}
+
+describe('loadLocalAgents', () => {
+  let tempDir: string
+  let agentsDir: string
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(path.join(os.tmpdir(), 'codebuff-sdk-load-agents-'))
+    agentsDir = path.join(tempDir, '.agents')
+  })
+
+  afterEach(() => {
+```
+- File `cli/src/__tests__/integration/local-agents.test.ts` (57 matching lines):
+```
+import { setProjectRoot, getProjectRoot } from '../../project-files'
+import {
+  loadAgentDefinitions,
+  loadLocalAgents,
+  initializeAgentRegistry,
+  findAgentsDirectory,
+  getLoadedAgentsData,
+  getLoadedAgentsMessage,
+  announceLoadedAgents,
+  __resetLocalAgentRegistryForTests,
+} from '../../utils/local-agent-registry'
+
+const MODEL_NAME = 'anthropic/claude-sonnet-4'
+
+const writeAgentFile = (
+  agentsDir: string,
+  fileName: string,
+  contents: string,
+) => writeFileSync(path.join(agentsDir, fileName), contents, 'utf8')
+
+describe('Local Agent Integration', () => {
+  let tempDir: string
+  let agentsDir: string
+  let originalCwd: string
+  let originalProjectRoot: string | undefined
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(path.join(os.tmpdir(), 'codebuff-agents-'))
+    originalCwd = process.cwd()
+    setProjectRoot(process.cwd())
+    originalProjectRoot = getProjectRoot()
+
+    process.chdir(tempDir)
+    setProjectRoot(tempDir)
+    __resetLocalAgentRegistryForTests()
+
+    agentsDir = path.join(tempDir, '.agents')
+  })
+
+  afterEach(() => {
+    process.chdir(originalCwd)
+    setProjectRoot(originalProjectRoot ?? originalCwd)
+    __resetLocalAgentRegistryForTests()
+    rmSync(tempDir, { recursive: true, force: true })
+    mock.restore()
+  })
+
+  test('handles missing .agents directory gracefully', async () => {
+    // Note: findAgentsDirectory may return a directory from a parent or home if they exist
+```
+- File `agents/__tests__/base3-fast.test.ts` (27 matching lines):
+```
+FREEBUFF_DEEPSEEK_V4_FLASH_FAST_MODEL_ID,
+  isFreebuffFastModeModel,
+} from '@codebuff/common/constants/freebuff-model-ids'
+import { describe, expect, test } from 'bun:test'
+
+import base3FreeDeepseekFlash from '../base3-free-deepseek-flash'
+import {
+  BASE3_FAST_GUIDANCE,
+  BASE3_FAST_SPAWNABLE_AGENTS,
+  BASE3_FAST_WORKER_ASSIGNMENT_OPENING,
+} from '../base3-fast'
+import base3FastFreeDeepseekFlash from '../base3-fast-free-deepseek-flash'
+import base3FastWorkerDeepseekFlash from '../base3-fast-worker-deepseek-flash'
+import { createBase3, createBase3CliRoot } from '../base3'
+
+/**
+ * The base3-fast harness (agents/base3-fast.ts): base3 plus a fan-out.
+ *
+ * What makes the fan-out affordable is a property of the WORKER definition —
+ * it inherits its root's prompt and history, so its request is a cache hit —
+ * and what makes it safe is a property of the ROOT prompt: the root verifies.
+ * These pin both, and the registrations a Freebuff root needs to run at all.
+ */
+describe('the base3-fast root', () => {
+  const root = base3FastFreeDeepseekFlash
+…
+`spawn one ${FREEBUFF_BASE3_FAST_WORKER_AGENT_ID} per slice`,
+      'Contract first',
+      'Assign, do not dictate',
+      BASE3_FAST_WORKER_ASSIGNMENT_OPENING,
+      'Every behaviour lands where it takes effect',
+      'Tests are part of the change',
+      'Match precedent, exactly',
+      'a value users already see',
+      "Never change an existing default's value",
+      'Never give two workers the same file',
+      // 3. one verification pass, by the root
+      'Verify once, yourself',
+      'after the last worker has returned and never before',
+      'one typecheck per touched package',
+      'never the whole repository',
+      'Formatting is not a check',
+      'cd <package> && bun run typecheck',
+      "`bun --cwd <package> run ...` prints Bun's usage text",
+      'never piped through head or tail',
+      'A check that passed is finished',
+      're-run a check only after you edited a file it covers',
+      'No builds, bundlers or ad-hoc scripts',
+      're-read the request once against git diff --stat',
+      'no default value or public signature may have changed',
+    ]) {
+      expect(prompt).toContain(phrase)
+    }
+    // Tried and removed: a searcher subagent, reconnaissance workers, a
+    // reviewer worker, a required format pass.
+    for (const phrase of [
+      'code-searcher',
+      'RECONNAISSANCE',
+      'REVIEWER',
+      'format pass',
+    ]) {
+      expect(prompt).not.toContain(phrase)
+    }
+  })
+})
+
+describe('the base3-fast worker', () => {
+```
+- File `agents/base3-fast.ts` (14 matching lines):
+```
+import { FREEBUFF_BASE3_FAST_WORKER_AGENT_ID } from '@codebuff/common/constants/free-agents'
+
+import { createBase3, createBase3CliRoot } from './base3'
+import { publisher } from './constants'
+
+import type { SecretAgentDefinition } from './types/secret-agent-definition'
+
+/**
+ * base3-fast: base3's loop with a fan-out on top.
+ *
+ * The root is a base3 CLI root plus `spawn_agents` and two things to spawn:
+ * `file-picker`, two or three at once on the first step, and the worker
+ * below, one per slice of the implementation. Every base3 lever stays as it
+ * is (`windowedFileReads`, mechanical compaction, no `instructionsPrompt`),
+ * and the root verifies the combined result itself.
+ *
+ * The worker runs the root's model with `inheritParentSystemPrompt` and
+ * `includeMessageHistory`, so the runtime sends it the root's system prompt,
+ * tool schemas and message history byte-for-byte with only the assignment
+ * appended (packages/agent-runtime/src/run-agent-step.ts). On a prefix-cached
+ * provider that request is a cache hit except its last few hundred tokens,
+ * which is what makes N workers affordable. It therefore has no
+ * `systemPrompt` and no `compactContext` of its own; either would diverge its
+ * prefix from the root's.
+ *
+ * A worker must be pinned to its root's model or the session gate rejects it
+ * mid-run, so the worker id names the model. Which models run this harness is
+ * FREEBUFF_FAST_MODE_MODEL_IDS (common/src/constants/freebuff-model-ids.ts).
+ */
+
+/** Everything the root may spawn: pickers for context, the worker for slices.
+ *  No code-searcher, researcher, reviewer or basher: the root carries
+ *  code_search, web_search/read_url and run_terminal_command itself and does
+ *  its own review. */
+export const BASE3_FAST_SPAWNABLE_AGENTS = [
+  'file-picker',
+  FREEBUFF_BASE3_FAST_WORKER_AGENT_ID,
+] as const
+```
+- File `sdk/src/__tests__/load-mcp-config.test.ts` (10 matching lines):
+```
+process.chdir(originalCwd)
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  })
+
+  it('should return empty config when no mcp.json exists in project dir', () => {
+    // No mcp.json in tempDir/.agents - should not find any project-specific servers
+    const result = loadMCPConfigSync({ verbose: false })
+    // Check that no server named 'testProjectServer' exists (which we'd create if one existed)
+    expect(result.mcpServers.testProjectServer).toBeUndefined()
+  })
+
+  it('should load mcp.json from .agents directory', () => {
+    const agentsDir = path.join(tempDir, '.agents')
+    fs.mkdirSync(agentsDir, { recursive: true })
+
+    const mcpConfig = {
+      mcpServers: {
+        testServer: {
+          command: 'node',
+          args: ['server.js'],
+        },
+      },
+    }
+    fs.writeFileSync(
+      path.join(agentsDir, 'mcp.json'),
+      JSON.stringify(mcpConfig, null, 2),
+    )
+
+    const result = loadMCPConfigSync({ verbose: false })
+    expect(result.mcpServers.testServer).toBeDefined()
+    const testServer = result.mcpServers.testServer
+    if (isStdioConfig(testServer)) {
+      expect(testServer.command).toBe('node')
+    }
+    // Verify a source path was recorded (don't check exact path due to temp dir variations)
+    expect(result._sourceFilePath).toContain('mcp.json')
+  })
+
+  it('should resolve environment variable references', () => {
+    const agentsDir = path.join(tempDir, '.agents')
+    fs.mkdirSync(agentsDir, { recursive: true })
+
+    // Set env var for test
+    process.env.TEST_MCP_API_KEY = 'resolved-api-key'
+
+    const mcpConfig = {
+      mcpServers: {
+        envServer: {
+          command: 'npx',
+          args: ['-y', 'my-mcp-server'],
+          env: {
+            API_KEY: '$TEST_MCP_API_KEY',
+```
+- File `common/src/constants/free-agents.ts` (5 matching lines):
+```
+* execution modes use distinct ids for trace and cache identity, while the
+ * unsuffixed id remains accepted for older Desktop clients.
+ */
+export const FREEBUFF_DESKTOP_THREAD_AGENT_IDS = [
+  FREEBUFF_DESKTOP_THREAD_AGENT_ID,
+  getFreebuffDesktopThreadAgentId('local'),
+  getFreebuffDesktopThreadAgentId('worktree'),
+  getFreebuffDesktopThreadAgentId('local', 'base3'),
+  getFreebuffDesktopThreadAgentId('worktree', 'base3'),
+] as const
+
+/**
+ * The base3-fast root and its worker subagent (agents/base3-fast.ts), one pair
+ * for the one model that runs fast mode today. The root is a base3 root with
+ * a fan-out: it spawns file-pickers in parallel, then
+ * splits the implementation across parallel workers that inherit its system
+ * prompt and history (so their requests are prompt-cache hits), and verifies
+ * the combined result itself. The worker is pinned to the same model as the
+ * root — it must be, or the session gate answers session_model_mismatch — and
+ * is allowlisted below like every other free-mode subagent.
+ */
+export const FREEBUFF_BASE3_FAST_AGENT_ID = 'base3-fast-free-deepseek-flash'
+export const FREEBUFF_BASE3_FAST_WORKER_AGENT_ID =
+  'base3-fast-worker-deepseek-flash'
+
+/**
+ * The Freebuff Web and Cloud roots that run the base3 single-loop harness
+ * (agents/base3.ts): no subagents, no reviewer, windowed file reads, mechanical
+ * compaction instead of a context-pruner spawn. One per selectable model,
+ * because a bundled agent's model comes from its definition, not the request.
+ *
+ * Separate ids rather than a flag on the `base2-free-*` roots, for the reason
+ * the desktop took a `-v3` suffix: spend and run counts split by `agent_id` in
+ * the DB, which is what makes a base2 vs base3 comparison possible. The base2
+ * roots stay registered either way — a session admitted under one keeps
+ * resolving, and the FREEBUFF_BASE3_HARNESS_DISABLED kill switch routes new
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `cli/src/__tests__/integration/local-agents.test.ts`: "custom agents do not make bundled fast-mode workers fail validation"
+```
+  test('custom agents do not make bundled fast-mode workers fail validation', async () => {
+    mkdirSync(agentsDir, { recursive: true })
+    writeAgentFile(
+      agentsDir,
+      'custom.ts',
+      `export default {
+        id: 'test-custom-agent',
+        displayName: 'Custom Agent',
+        model: '${MODEL_NAME}',
+        toolNames: [],
+      }`,
+    )
+    await initializeAgentRegistry({ agentDirs: [agentsDir] })
+    const definitions = loadAgentDefinitions()
+    for (const id of [
+      'base3-fast-worker-deepseek-flash',
+      'base3-fast-worker-deepseek-flash-evals',
+    ]) {
+      const worker = definitions.find((definition) => definition.id === id)
+      expect(worker).toBeDefined()
+      expect(worker!.spawnableAgents).toEqual([])
+      expect(worker!.toolNames).not.toContain('spawn_agents')
+    }
+    expect(
+      definitions.find(
+        (definition) => definition.id === 'base3-fast-free-deepseek-flash',
+      )?.spawnableAgents,
+    ).toContain('test-custom-agent')
+    const result = await validateAgents(definitions, { remote: false })
+    expect(result.validationErrors).toEqual([])
+    expect(result.success).toBe(true)
+  })
+  test.each([
+    ['spawn tool', "toolNames: ['spawn_agents']"],
+    ['inline spawn tool', "toolNames: ['spawn_agent_inline']"],
+    [
+      'programmatic spawning',
+      "toolNames: [], handleSteps: function* () { yield 'STEP' }",
+    ],
+  ])(
+    'preserves custom agent registration for base agents with %s',
+    async (_name, spawning) => {
+      mkdirSync(agentsDir, { recursive: true })
+      writeAgentFile(
+        agentsDir,
+        'base-custom.ts',
+        `export default {
+        id: 'base-test-custom',
+        displayName: 'Custom Base Agent',
+        model: '${MODEL_NAME}',
+        spawnableAgents: ['codebuff/file-picker@0.0.1'],
+        ${spawning},
+      }`,
+      )
+      await initializeAgentRegistry({ agentDirs: [agentsDir] })
+      const registered = () =>
+        loadAgentDefinitions().find(
+          (definition)
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/cli/src/utils/local-agent-registry.ts b/cli/src/utils/local-agent-registry.ts
+index c19d4dc52..ceac84900 100644
+--- a/cli/src/utils/local-agent-registry.ts
++++ b/cli/src/utils/local-agent-registry.ts
+@@ -294,92 +294,98 @@ export const loadLocalAgents = (
+     } else {
+       results.push(userAgent)
+       includedIds.add(userAgent.id)
+     }
+   }
+ 
+   const sorted = results.sort((a, b) =>
+     a.displayName.localeCompare(b.displayName, 'en'),
+   )
+ 
+   cachedAgentsByMode.set(cacheKey, sorted)
+   return sorted
+ }
+ 
+ // ============================================================================
+ // Agent loading - AgentDefinition (full definitions for runtime)
+ // ============================================================================
+ 
+ /**
+  * Load agent definitions from bundled agents and user's .agents directory.
+  * Bundled agents are compiled into the CLI binary at build time.
+  * User agents from .agents/ are loaded via SDK at startup and cached.
+  * User agents can override bundled agents with the same ID.
+  *
+  * Additionally, all user agent IDs are automatically added to the spawnableAgents
+- * of any base agent (agents with IDs starting with 'base'), so users can spawn
+- * their custom agents without needing to modify the base agent definition.
++ * of base agents that support spawning, so users can spawn their custom agents
++ * without needing to modify the base agent definition.
+  */
+ export const loadAgentDefinitions = (): AgentDefinition[] => {
+   // Start with bundled agents - these are the default Codebuff agents
+   const bundledAgents = getBundledAgents()
+   const definitions: AgentDefinition[] = Object.values(bundledAgents).map(
+     (def) => ({ ...def }),
+   )
+   const bundledIds = new Set(Object.keys(bundledAgents))
+ 
+   // The catalog root (docs/freebuff-model-catalog.md) is not bundled: it is
+   // built from the selected catalog row, whose handle rotates, so it is
+   // rebuilt on every load and only exists while a catalog row is selected.
+   // Added before the merges below so it gets the same MCP servers and user
+   // agents as every bundled root.
+   const catalogRoot = IS_FREEBUFF ? selectedFreebuffCatalogRoot() : undefined
+   if (catalogRoot) definitions.push(catalogRoot)
+ 
+   // Get user agents from the SDK-loaded cache
+   const userAgentDefs = getUserAgentDefinitions()
+   const userAgentIds = userAgentDefs.map((def) => def.id)
+ 
+   for (const agentDef of userAgentDefs) {
+     // User agents override bundled agents with the same ID
+     if (bundledIds.has(agentDef.id)) {
+       const idx = definitions.findIndex((d) => d.id === agentDef.id)
+       if (idx !== -1) {
+         definitions[idx] = { ...agentDef }
+       }
+     } else {
+       definitions.push({ ...agentDef })
+     }
+   }
+ 
+   // Auto-add user agent IDs to spawnableAgents of base agents
+   // This allows users to spawn their custom agents without needing to
+   // explicitly add them to the base agent's spawnableAgents list
+   if (userAgentIds.length > 0) {
+     for (const def of definitions) {
+-      // Consider any agent with an ID starting with 'base' as a base agent
+-      if (def.id.startsWith('base') && def.spawnableAgents) {
++      // Non-spawning workers also start with 'base'; keep their child list empty.
++      if (
++        def.id.startsWith('base') &&
++        def.spawnableAgents &&
++        (def.toolNames?.includes('spawn_agents') ||
++          def.toolNames?.includes('spawn_agent_inline') ||
++          def.handleSteps)
++      ) {
+         const existingSpawnable = new Set(def.spawnableAgents)
+         for (const userAgentId of userAgentIds) {
+           if (!existingSpawnable.has(userAgentId)) {
+             def.spawnableAgents = [...def.spawnableAgents, userAgentId]
+           }
+         }
+       }
+     }
+   }
+ 
+   // Merge MCP servers from mcp.json into base agents
+   // This allows users to configure MCP tools that are available to the main agent
+   if (Object.keys(mcpServersCache).length > 0) {
+     for (const def of definitions) {
+       // Consider any agent with an ID starting with 'base' as a base agent
+       if (def.id.startsWith('base')) {
+         // Initialize mcpServers if not present
+         if (!def.mcpServers) {
+           def.mcpServers = {}
+         }
+         // Merge MCP servers (user config can override existing servers)
+         def.mcpServers = {
+           ...def.mcpServers,
+           ...mcpServersCache,
+         }
+
+```
