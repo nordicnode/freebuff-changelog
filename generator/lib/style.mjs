@@ -3200,11 +3200,16 @@ a.badge:hover{text-decoration:none;color:var(--term-cyan)}
 }
 .ask-send:hover{filter:brightness(1.15)}
 .ask-send:disabled{opacity:.5;cursor:wait}
-.ask-out{
+.ask-out{display:flex;flex-direction:column;gap:.6em}
+.ask-out[hidden]{display:none}
+.ask-out:empty{display:none}
+.ask-turn{display:flex;flex-direction:column;gap:.3em}
+.ask-q{font-size:.8rem;color:var(--txt-subtle);white-space:pre-wrap}
+.ask-q::before{content:'> ';color:var(--term-cyan);font-weight:700}
+.ask-a{
   border:1px solid var(--term-border);border-left:3px solid var(--term-border);border-radius:0 2px 2px 0;background:var(--code);
   font-size:.88rem;line-height:1.55;padding:.55em .7em;white-space:pre-wrap;
 }
-.ask-out[hidden]{display:none}
 .ask-busy{border-left-color:var(--term-amber);color:var(--txt-dim)}
 .ask-ok{border-left-color:var(--term-green)}
 .ask-refused{border-left-color:var(--term-red);color:var(--txt-subtle)}

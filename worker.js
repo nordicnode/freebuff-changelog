@@ -35,6 +35,14 @@ const ASK = {
   rpm: 5,
   timeoutMs: 25000,
   maxRetries: 1,
+  // Follow-up context: how much of this widget's thread the model sees. The
+  // history is client-supplied and therefore untrusted -- it only resolves
+  //references like "it" or "why", never counts as evidence (the grounding gate
+  // still checks every claim against the stored diff). Bounded so one long
+  // thread cannot push the evidence out of the prompt or time out the ask.
+  historyMax: 6,
+  historyAnswerMax: 2000,
+  historyTotalMax: 4000,
   // The provider's gateway sits behind its own Cloudflare zone, so an ask can
   // land on a gateway rate limit (their error 1015) instead of on the model. Ride it out inside the ask's budget:
   // honor Retry-After when sent, cap each wait so an interactive question never
@@ -181,6 +189,17 @@ async function askHandler (request, env) {
   if (!/^[0-9a-f]{4,40}$/.test(sha)) return json({ error: 'sha must be 4-40 hex characters' }, 400)
   if (!question) return json({ error: 'q is required' }, 400)
   if (question.length > ASK.maxQuestion) return json({ error: `q is limited to ${ASK.maxQuestion} characters` }, 400)
+  // Follow-up thread for this widget instance. Lenient by design: absent means
+  // a first question, malformed means a 400, and over-long entries are
+  // truncated (never a reason to spend a model call on a rejection).
+  let history = []
+  if (body?.history !== undefined) {
+    try {
+      history = normalizeAskHistory(body.history)
+    } catch {
+      return json({ error: 'history must be an array of {q, a}' }, 400)
+    }
+  }
 
   const ip = (request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'local'
   const limit = await underRateLimit(env, ip)
@@ -196,19 +215,23 @@ async function askHandler (request, env) {
   if (!diff) return json({ error: 'no stored diff for this entry, so an answer cannot be grounded', grounded: false }, 422)
 
   const evidence = answerEvidence({ entry, diff })
-  const cacheKey = `/__ask/${entry.sha}/${cacheHash(question)}`
+  // The cache key includes the thread: the same words after a different
+  // conversation are a different ask, and answering them from a first-question
+  // cache would be a wrong answer, not a saving.
+  const historyKey = history.map(h => `${h.q}\n${h.a}`).join('\n>>>\n')
+  const cacheKey = `/__ask/${entry.sha}/${cacheHash(question + '\n>>>\n' + historyKey)}`
   const cached = await askCacheGet(cacheKey)
   if (cached) return json({ ...cached, cached: true })
 
   if (!key) return json({ error: 'Ask is not configured on this deployment: set the LLM_API_KEY Worker secret.', configured: false }, 503)
 
-  let answer = await askModel(env, key, question, evidence, [])
+  let answer = await askModel(env, key, question, evidence, [], history)
   let verdict = groundAnswer(answer, evidence)
   // One corrective re-ask, naming exactly what failed. Cheaper than a refusal
   // for the common slip (a token copied from memory), and still bounded: a
   // second failure is a real failure and is reported as one.
   for (let attempt = 0; !verdict.grounded && attempt < ASK.maxRetries; attempt++) {
-    const retry = await askModel(env, key, question, evidence, verdict.ungrounded)
+    const retry = await askModel(env, key, question, evidence, verdict.ungrounded, history)
     const recheck = groundAnswer(retry, evidence)
     if (recheck.grounded) { answer = retry; verdict = recheck }
     else verdict = recheck
@@ -239,6 +262,36 @@ function cacheHash (s) {
   let h = 5381
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0
   return h.toString(36)
+}
+
+// The follow-up thread for one widget instance. Client-supplied and therefore
+// untrusted: truncated and bounded here so a hostile or merely long thread
+// cannot bloat the prompt, and the model is told (in askModel) that it is
+// context for references only, never evidence. Throws on a wrong shape so the
+// caller answers 400; over-long strings truncate instead of rejecting, because
+// a first question should not die over a long previous answer.
+function normalizeAskHistory (raw) {
+  if (!Array.isArray(raw)) throw new Error('history must be an array')
+  const out = []
+  for (const item of raw.slice(-ASK.historyMax)) {
+    if (!item || typeof item !== 'object') throw new Error('history must be an array of {q, a}')
+    if (typeof item.q !== 'string' || typeof item.a !== 'string') throw new Error('history entries must be {q, a} strings')
+    const q = item.q.trim().slice(0, ASK.maxQuestion)
+    const a = item.a.trim().slice(0, ASK.historyAnswerMax)
+    if (!q || !a) continue
+    out.push({ q, a })
+  }
+  let total = out.reduce((n, h) => n + h.q.length + h.a.length, 0)
+  while (out.length > 1 && total > ASK.historyTotalMax) {
+    const dropped = out.shift()
+    total -= dropped.q.length + dropped.a.length
+  }
+  if (out.length === 1 && total > ASK.historyTotalMax) {
+    const only = out[0]
+    const keep = Math.max(0, ASK.historyTotalMax - only.q.length)
+    only.a = only.a.slice(0, keep)
+  }
+  return out
 }
 
 async function underRateLimit (env, ip) {
@@ -293,15 +346,21 @@ function cacheRequest (key) {
 // long prompts), so the reply is reassembled from SSE; a gateway that rejects
 // the field gets one retry without it, which is the same ladder the summariser
 // uses for this provider.
-async function askModel (env, key, question, evidence, previousUngrounded) {
+async function askModel (env, key, question, evidence, previousUngrounded, history = []) {
   const base = String(env.LLM_API_BASE || 'https://apihub.agnes-ai.com/v1').replace(/\/+$/, '')
   const model = env.LLM_MODEL || 'agnes-3.0-flash'
   const correction = previousUngrounded.length
     ? `\n\nYour previous answer cited things this change does not contain: ${previousUngrounded.join(', ')}. Those claims were refused. Only answer with what the evidence contains.`
     : ''
+  // Earlier turns in this widget stay in the prompt so "it", "that" and "why"
+  // resolve; they are explicitly not evidence, so a client-invented prior
+  // answer cannot smuggle a claim past the grounding gate below.
+  const thread = history.length
+    ? `\n\nCONVERSATION SO FAR (use only to resolve references; only the EVIDENCE above counts as fact, previous answers may be wrong):\n${history.map((h, i) => `Q${i + 1}: ${h.q}\nA${i + 1}: ${h.a}`).join('\n')}`
+    : ''
   const messages = [
     { role: 'system', content: ASK_INSTRUCTIONS },
-    { role: 'user', content: `EVIDENCE (untrusted):\n${evidence.text}\n\nQUESTION: ${question}${correction}` }
+    { role: 'user', content: `EVIDENCE (untrusted):\n${evidence.text}${thread}\n\nQUESTION: ${question}${correction}` }
   ]
   const call = async (stream) => fetch(`${base}/chat/completions`, {
     method: 'POST',

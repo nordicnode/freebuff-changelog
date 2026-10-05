@@ -802,49 +802,69 @@ document.addEventListener('submit', (ev) => {
   const send = box.querySelector('.ask-send');
   const q = input.value.trim();
   if (!q || send.disabled) return;
+  // One thread per widget instance, kept on the node so entry cards loaded
+  // later via /entry-frags/ start empty. Only grounded answers join it:
+  // refusals and errors are shown but never become "context" the model sees.
+  const thread = (box._askThread = box._askThread || []);
+  const history = thread.slice(-6);
   send.disabled = true;
   out.hidden = false;
-  out.className = 'ask-out ask-busy';
-  out.textContent = 'Reading the diff…';
+  out.className = 'ask-out';
+  const turn = document.createElement('div');
+  turn.className = 'ask-turn';
+  const qEl = document.createElement('div');
+  qEl.className = 'ask-q';
+  qEl.textContent = q;
+  const aEl = document.createElement('div');
+  aEl.className = 'ask-a ask-busy';
+  aEl.textContent = 'Reading the diff…';
+  turn.appendChild(qEl);
+  turn.appendChild(aEl);
+  out.appendChild(turn);
+  input.value = '';
+  input.placeholder = 'Follow up…';
   fetch('/api/ask', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ sha: box.dataset.sha, q: q })
+    body: JSON.stringify({ sha: box.dataset.sha, q: q, history: history })
   })
     .then(res => res.json().then(body => ({ status: res.status, body: body })))
     .then(r => {
       send.disabled = false;
       const b = r.body || {};
       if (r.status === 200 && b.answer) {
-        out.className = 'ask-out ask-ok';
-        out.textContent = b.answer;
+        aEl.className = 'ask-a ask-ok';
+        aEl.textContent = b.answer;
         const cites = (b.citations || []).map(c => c.file + (c.line ? ':' + c.line : ''));
         const note = document.createElement('div');
         note.className = 'ask-note';
         note.textContent = (b.cached ? 'cached · ' : '') + 'grounded in ' + String(b.sha || box.dataset.sha).slice(0, 12) + (cites.length ? ' · ' + cites.join(', ') : '');
-        out.appendChild(note);
+        aEl.appendChild(note);
+        thread.push({ q: q, a: b.answer });
+        if (thread.length > 6) thread.splice(0, thread.length - 6);
+        if (input) input.focus();
       } else if (r.status === 422) {
         // Refused by the grounding gate. Naming the claims is what makes the
         // refusal actionable instead of looking like a broken feature.
-        out.className = 'ask-out ask-refused';
-        out.textContent = 'Refused: that answer cited things this change does not contain'
+        aEl.className = 'ask-a ask-refused';
+        aEl.textContent = 'Refused: that answer cited things this change does not contain'
           + ((b.ungrounded && b.ungrounded.length) ? ' (' + b.ungrounded.join(', ') + ')' : '') + '. Ask differently?';
       } else if (r.status === 429) {
-        out.className = 'ask-out ask-busy';
-        out.textContent = 'Too many questions in the last minute. Try again in ' + (b.retryAfterSec || 60) + 's.';
+        aEl.className = 'ask-a ask-busy';
+        aEl.textContent = 'Too many questions in the last minute. Try again in ' + (b.retryAfterSec || 60) + 's.';
       } else if (r.status === 503) {
-        out.className = 'ask-out ask-refused';
-        out.textContent = 'Ask is not enabled on this deployment.';
+        aEl.className = 'ask-a ask-refused';
+        aEl.textContent = 'Ask is not enabled on this deployment.';
       } else {
-        out.className = 'ask-out ask-refused';
-        out.textContent = b.error || ('Ask failed (HTTP ' + r.status + ').');
+        aEl.className = 'ask-a ask-refused';
+        aEl.textContent = b.error || ('Ask failed (HTTP ' + r.status + ').');
       }
     })
     .catch(() => {
       send.disabled = false;
       out.hidden = false;
-      out.className = 'ask-out ask-refused';
-      out.textContent = 'Could not reach the server. Try again.';
+      aEl.className = 'ask-a ask-refused';
+      aEl.textContent = 'Could not reach the server. Try again.';
     });
 });
 
