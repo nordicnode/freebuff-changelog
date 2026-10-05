@@ -98,6 +98,24 @@ export function generationState (e = {}) {
   return { status: VERIFIED_STATUSES.includes(technical) && PLAIN_VERIFIED_STATUSES.includes(explanation) ? 'complete' : 'review-pending', missing }
 }
 
+// Text availability has its own clock, independent of source ingestion and
+// optional review. Historical rows outside durable admission never trigger it.
+export function generationHealth (entries = [], { now = Date.now(), maxAgeMs = 1800000 } = {}) {
+  const admitted = entries.filter(e => !e.noise && e.enrichment?.policy === QUALITY_POLICY_V)
+  const overdue = []
+  let missingSummary = 0, missingPlain = 0, needsRepair = 0, reviewPending = 0
+  for (const e of admitted) {
+    const state = generationState(e)
+    if (state.missing.includes('summary')) missingSummary++
+    if (state.missing.includes('plain-English')) missingPlain++
+    if (state.status === 'needs-repair') needsRepair++
+    if (state.status === 'review-pending') reviewPending++
+    const stamp = Date.parse(e.enrichment.admittedAt || '')
+    if (state.missing.length && (!Number.isFinite(stamp) || now - stamp >= maxAgeMs || stamp > now + 60000)) overdue.push({ sha: e.sha, missing: state.missing, admittedAt: e.enrichment.admittedAt || null })
+  }
+  return { admitted: admitted.length, missingSummary, missingPlain, needsRepair, reviewPending, overdue }
+}
+
 export function qualityOf (e = {}) {
   const ai = e.ai || {}
   const plain = e.eli5 || {}

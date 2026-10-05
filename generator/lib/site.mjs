@@ -3,7 +3,7 @@
 // authentic CLI/git-log presentation, dark theme, zero emojis, calm palette).
 import { writeText, writeBinary } from './util.mjs'
 import { escapeHtml as esc, fmtDateHuman, pool, shortHash } from './util.mjs'
-import { qualityOf, qualityText } from './quality.mjs'
+import { qualityOf, qualityText, generationHealth } from './quality.mjs'
 import { CSS } from './style.mjs'
 import { deterministicSummary, isBumpEntry } from './analyze.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg, feedsOpml } from './feed.mjs'
@@ -4566,7 +4566,8 @@ ${inFlightScript}`
     traffic: { count: trafficCount, uniques: trafficUniques },
     openPrs: openPrs?.length || 0,
     openPrsTotal: prMeta.total || openPrs?.length || 0,
-    openPrsCheckedMinAgo: prMeta.ageMin ?? null
+    openPrsCheckedMinAgo: prMeta.ageMin ?? null,
+    generation: generationHealth(entries)
   }))
 
   // ----- stable commit permalink: /c/<sha>

@@ -10,7 +10,7 @@
 export const DEFAULT_SYNC_STALE_MIN = 5
 
 // Validate the artifact readers actually receive, not just a local build stamp.
-export async function checkDeployedHead (siteUrl, expectedHead, { fetchImpl = globalThis.fetch, now = Date.now(), maxAgeMs = 600000 } = {}) {
+export async function checkDeployedHead (siteUrl, expectedHead, { fetchImpl = globalThis.fetch, now = Date.now(), maxAgeMs = 600000, minGeneratedAt = null } = {}) {
   const url = new URL('/api/status.json', siteUrl)
   url.searchParams.set('_', String(now))
   const response = await fetchImpl(url, { signal: AbortSignal.timeout(15000), headers: { 'cache-control': 'no-cache' } })
@@ -18,6 +18,7 @@ export async function checkDeployedHead (siteUrl, expectedHead, { fetchImpl = gl
   const status = await response.json()
   const stamp = Date.parse(status.generatedAt || '')
   if (!Number.isFinite(stamp) || now - stamp >= maxAgeMs || stamp > now + 60000) throw new Error('Deployed source-check timestamp is stale or invalid')
+  if (minGeneratedAt && (!Number.isFinite(Date.parse(minGeneratedAt)) || stamp < Date.parse(minGeneratedAt))) throw new Error('Deployed source-check timestamp is older than the uploaded artifact')
   if (!expectedHead || status.headSha !== expectedHead) throw new Error(`Deployed head ${status.headSha || 'missing'} differs from expected ${expectedHead || 'missing'}`)
   return { headSha: status.headSha, ageMs: Math.max(0, now - stamp) }
 }

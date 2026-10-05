@@ -1,17 +1,23 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises'
+import { spawnSync, execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
+import { loadChangelog } from '../lib/changelog-store.mjs'
 import {
   enrichWithLlm, cacheKey, callLlm, llmProviderBanner, planLlmPass, rowBudgetMs,
   eli5RowBudgetMs, errorRetryDelayMs, callUnanswered, isRouteFailure, isGatewayError, isTransientError,
   extractResponseText, resetLlmStreamProbeForTests, llmConfigured, llmKeysOf, nextLlmKey,
   resetLlmKeyRotationForTests, backupEnvOf, createLlmRateLimiter, llmRpm, llmCapOf,
   rollupLlmEnv, stageLlmEnv, ROLLUP_LLM_STAGE,
-  DEFAULT_LLM_API_BASE, DEFAULT_LLM_MODEL, DEFAULT_ROW_BUDGET_MS, PROMPT_V
+  DEFAULT_LLM_API_BASE, DEFAULT_LLM_MODEL, DEFAULT_ROW_BUDGET_MS, PROMPT_V,
+  enrichEli5, enrichOpenPrs, summaryBacklog, validateLlmConfig, llmCallCount, llmRouteIdentity, ELI5_V
 } from '../lib/llm.mjs'
-import { summaryPassWindow } from '../cli.mjs'
+import { summaryPassWindow, regenerationEli5Deadline, cmdGenerationHealth, cmdWatch } from '../cli.mjs'
+import { generationHealth } from '../lib/quality.mjs'
+import { checkDeployedHead } from '../lib/sync.mjs'
 import { resetLlmRateLimiterForTests } from '../lib/llm.mjs'
 
 const patch = 'diff --git a/a.ts b/a.ts\n+export const ALPHA = 1\n'
@@ -41,6 +47,225 @@ test('provider contract: the defaults are the project provider, and the banner n
   assert.match(banner, /write agnes-3\.0-flash @ https:\/\/apihub\.agnes-ai\.com\/v1/)
   assert.match(banner, /verify agnes-3\.0-flash/)
   assert.doesNotMatch(banner, /sk-secret-value/, 'the banner is safe to log')
+})
+
+test('configuration faults fail once without spending slots, reading patches or poisoning rows', async t => {
+  const dir = await temp(t)
+  let calls = 0, reads = 0
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return response(clean) })
+  for (const extra of [{ LLM_API_BASE: '-' }, { LLM_API_BASE: 'file:///tmp/key' }, { LLM_API_BASE: 'https://user:secret@example.invalid/v1' }, { LLM_API_BASE: 'https://example.invalid/v1?key=secret' }, { LLM_API_BASE: 'https://example.invalid/v1/chat/completions' }, { LLM_MODEL: '-' }, { LLM_BACKUP_API_BASE: 'https://backup.invalid/v1' }, { CHANGELOG_ROLLUP_LLM_API_KEY: 'secret' }]) {
+    const bad = env(extra)
+    assert.throws(() => validateLlmConfig(bad), /LLM configuration:/)
+    const before = llmCallCount()
+    await assert.rejects(enrichWithLlm([row('1')], async () => { reads++; return patch }, dir, bad), /LLM configuration:/)
+    assert.equal(llmCallCount(), before)
+  }
+  await assert.rejects(callLlm('prompt', env({ LLM_API_BASE: '-' })), /absolute HTTP/)
+  assert.equal(calls, 0)
+  assert.equal(reads, 0)
+  await assert.rejects(readFile(join(dir, 'ai-summaries.json')), /ENOENT/)
+  validateLlmConfig(env())
+})
+
+test('auth failure is a configuration fault, not a parked row; watch fails immediately', async t => {
+  const dir = await temp(t)
+  t.mock.method(globalThis, 'fetch', async () => new Response('private auth detail', { status: 401 }))
+  await assert.rejects(enrichWithLlm([row('1')], async () => patch, dir, env(), { retryErrors: true }), /configuration: primary authentication failed/)
+  await assert.rejects(readFile(join(dir, 'ai-summaries.json')), /ENOENT/)
+  let cycles = 0
+  await assert.rejects(cmdWatch(['--duration', '1s'], { cycle: async () => { cycles++; validateLlmConfig(env({ LLM_API_BASE: '-' })) } }), /configuration:/)
+  assert.equal(cycles, 1)
+})
+
+test('old-route parked failures and explanation failures cannot veto the writer', async t => {
+  const dir = await temp(t)
+  const e = row('1')
+  const oldKey = cacheKey(e.sha, patch, '', 0, { model: 'old', provider: 'https://old.invalid/v1' })
+  await writeFile(join(dir, 'ai-summaries.json'), JSON.stringify({
+    [oldKey]: { error: 'LLM answered from model memory', deterministic: true, attempts: 2, at: new Date().toISOString() },
+    [`${e.sha}:eli5:v${ELI5_V}:old`]: { error: 'LLM refused the request', deterministic: true, attempts: 2, at: new Date().toISOString() }
+  }))
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return response(clean) })
+  assert.equal(await enrichWithLlm([e], async () => patch, dir, env({ LLM_MODEL: 'agnes-3.0-flash' }), { retryErrors: true }), 1)
+  assert.equal(e.ai.model, 'agnes-3.0-flash')
+  assert.equal(calls, 1)
+})
+
+test('same-identity cooldown avoids patch work, but explicit force bypasses it', async t => {
+  const dir = await temp(t)
+  const e = row('1')
+  let reads = 0, calls = 0, good = false
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return good ? response(clean) : response({ title: '' }) })
+  const read = async () => { reads++; return patch }
+  await enrichWithLlm([e], read, dir, env(), { retryErrors: true })
+  const cache = JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))
+  const stub = Object.values(cache).find(r => r.error)
+  assert.ok(stub.inputIdentity)
+  assert.equal(stub.routeIdentity, llmRouteIdentity(env()))
+  const before = { reads, calls }
+  await enrichWithLlm([e], read, dir, env(), { retryErrors: true })
+  assert.deepEqual({ reads, calls }, before, 'cooling requests cost no diff work or calls')
+  const backlog = await summaryBacklog([e], dir, env())
+  assert.equal(backlog.cooling, 1)
+  assert.equal(backlog.eligible, 0)
+  good = true
+  assert.equal(await enrichWithLlm([e], read, dir, env(), { force: new Set([e.sha]), only: new Set([e.sha]), retryErrors: true }), 1)
+  assert.equal((await summaryBacklog([e], dir, env())).pending.length, 0)
+})
+
+test('provider and backup changes release old-route cooldowns without resetting same-route retries', async t => {
+  const dir = await temp(t)
+  const e = row('1')
+  t.mock.method(globalThis, 'fetch', async () => response({ title: '' }))
+  await enrichWithLlm([e], async () => patch, dir, env(), { retryErrors: true })
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return response(clean) })
+  const changed = env({ LLM_BACKUP_API_BASE: 'https://backup.invalid/v1', LLM_BACKUP_API_KEY: 'backup', LLM_BACKUP_MODEL: 'different' })
+  assert.equal((await summaryBacklog([e], dir, changed)).eligible, 1)
+  assert.equal(await enrichWithLlm([e], async () => patch, dir, changed, { retryErrors: true }), 1)
+  assert.equal(calls, 1)
+})
+
+test('parked probes stay bounded and transient outages never become permanent parks', () => {
+  const deterministic = { error: 'LLM answered from model memory', deterministic: true, attempts: 20 }
+  assert.equal(errorRetryDelayMs(deterministic), Infinity)
+  assert.equal(errorRetryDelayMs(deterministic, { parkedRetryMs: 86400000 }), 86400000)
+  assert.equal(errorRetryDelayMs({ error: 'LLM HTTP 504', transient: true, attempts: 100 }, { parkedRetryMs: 86400000 }), 300000)
+  assert.equal(errorRetryDelayMs({ error: 'Failed to parse URL from -/chat/completions', attempts: 100 }), 300000)
+})
+
+test('third-attempt gateway error envelope still reaches the backup route', async t => {
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async url => {
+    seen.push(String(url))
+    return String(url).includes('backup.invalid') ? response({ ok: true }) : new Response('data: {"error":{"code":"timeout","message":"The request timed out"}}\n\n')
+  })
+  const cfg = env({ LLM_BACKUP_API_BASE: 'https://backup.invalid/v1', LLM_BACKUP_API_KEY: 'backup' })
+  assert.deepEqual(await callLlm('prompt', cfg, 3, x => x, { usedLean: true }), { ok: true })
+  assert.equal(seen.length, 2)
+})
+
+test('memory answer followed by backup timeout is transient, not deterministic parking', async t => {
+  t.mock.method(globalThis, 'fetch', async url => String(url).includes('backup.invalid') ? new Response('data: {"error":{"code":"timeout","message":"The request timed out"}}\n\n') : response({ text: 'The latest model I know about is from my knowledge cutoff.' }))
+  const cfg = env({ LLM_BACKUP_API_BASE: 'https://backup.invalid/v1', LLM_BACKUP_API_KEY: 'backup' })
+  await assert.rejects(callLlm('prompt', cfg, 3, () => { throw new Error('answered from model memory') }, { usedLean: true }), err => {
+    assert.equal(isTransientError(err), true)
+    assert.equal(callUnanswered(err), true)
+    assert.notEqual(err.deterministic, true)
+    return true
+  })
+})
+
+test('healing with verification off improves unchecked text without clearing recorded objections', async t => {
+  for (const verify of ['unchecked', 'flagged']) {
+    const dir = await temp(t), e = row('1')
+    t.mock.method(globalThis, 'fetch', async () => response(clean))
+    await enrichWithLlm([e], async () => patch, dir, env())
+    const cachePath = join(dir, 'ai-summaries.json')
+    const cache = JSON.parse(await readFile(cachePath, 'utf8'))
+    const key = Object.keys(cache).find(k => cache[k].title)
+    const record = { ...cache[key], ungrounded: ['INVENTED'], at: '2020-01-01T00:00:00Z', ...(verify === 'flagged' ? { verify: 'flagged', verifyClaims: [{ claim: 'An unsupported claim remains' }] } : {}) }
+    e.ai = { ...record }
+    await writeFile(cachePath, JSON.stringify({ [key]: record }))
+    await enrichWithLlm([e], async () => patch, dir, env({ CHANGELOG_LLM_HEAL: '1' }))
+    const updated = JSON.parse(await readFile(cachePath, 'utf8'))[key]
+    if (verify === 'unchecked') {
+      assert.equal(e.ai.ungrounded, undefined)
+      assert.equal(updated.verify, undefined, 'no fake passing verdict')
+    } else {
+      assert.equal(updated.verify, 'flagged')
+      assert.equal(updated.verifyClaims[0].claim, 'An unsupported claim remains')
+    }
+  }
+})
+
+test('PR previews retry a changed provider and retain transient retry eligibility', async t => {
+  const dir = await temp(t)
+  const pr = { number: 1, title: 'Alpha added', body: 'Adds ALPHA.', enrichment: { policy: 1 } }
+  t.mock.method(globalThis, 'fetch', async () => response({ title: '' }))
+  await enrichOpenPrs([pr], dir, env(), { getDiff: async () => patch })
+  const old = JSON.parse(await readFile(join(dir, 'pr-summaries.json'), 'utf8'))
+  assert.ok(Object.values(old)[0].inputIdentity)
+  t.mock.method(globalThis, 'fetch', async () => response(clean))
+  assert.equal(await enrichOpenPrs([pr], dir, env({ LLM_MODEL: 'agnes-3.0-flash' }), { getDiff: async () => patch }), 1)
+  assert.equal(pr.ai.verify, undefined, 'verification off is not a provider outage')
+})
+
+test('regeneration gives explanations their own post-summary window under the total deadline', () => {
+  const started = 1000000, total = 360000, plain = 144000
+  assert.equal(regenerationEli5Deadline(started, total, plain, started + 216000), started + 360000)
+  assert.equal(regenerationEli5Deadline(started, total, plain, started + 180000) - (started + 180000), plain)
+  assert.equal(regenerationEli5Deadline(started, total, plain, started + total), started + total)
+})
+
+test('generation health gates overdue admitted text, not intentional unchecked text or historical gaps', async t => {
+  const dir = await temp(t), now = Date.parse('2026-10-05T12:00:00Z')
+  const ready = row('1', { enrichment: { policy: 1, admittedAt: '2026-10-05T10:00:00Z' }, ai: { title: 'Alpha added', summary: 'Adds Alpha.', policy: 1 }, eli5: { text: 'Alpha is present.', policy: 1 } })
+  const recent = row('2', { enrichment: { policy: 1, admittedAt: '2026-10-05T11:59:00Z' } })
+  const old = row('3', { enrichment: undefined })
+  const overdue = row('4', { enrichment: { policy: 1, admittedAt: '2026-10-05T11:00:00Z' } })
+  const rows = [ready, recent, old, overdue]
+  const h = generationHealth(rows, { now })
+  assert.equal(h.admitted, 3)
+  assert.equal(h.reviewPending, 1)
+  assert.deepEqual(h.overdue.map(e => e.sha), [overdue.sha])
+  await writeFile(join(dir, 'changelog.json'), JSON.stringify({ entries: rows }))
+  await assert.rejects(cmdGenerationHealth([], { dataDir: dir, now, env: {} }), /44444444/)
+  await writeFile(join(dir, 'changelog.json'), JSON.stringify({ entries: [ready, recent, old] }))
+  assert.equal((await cmdGenerationHealth([], { dataDir: dir, now, env: {} })).overdue.length, 0)
+})
+
+test('served probe refuses an old deploy even when the upstream head did not move', async () => {
+  const now = Date.parse('2026-10-05T12:00:00Z')
+  const fetchImpl = async () => new Response(JSON.stringify({ headSha: 'head', generatedAt: '2026-10-05T11:58:00Z' }))
+  await assert.rejects(checkDeployedHead('https://site.invalid', 'head', { now, fetchImpl, minGeneratedAt: '2026-10-05T11:59:00Z' }), /older than the uploaded/)
+})
+
+test('forced explanation generation bypasses a current cached explanation without touching neighbors', async t => {
+  const dir = await temp(t), e = row('1')
+  e.ai = { ...clean, model: 'test', v: PROMPT_V }
+  let calls = 0
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return response({ eli5: 'The internal setting changed.' }) })
+  assert.equal(await enrichEli5([e], dir, env(), { getPatch: async () => patch }), 1)
+  const before = calls
+  assert.equal(await enrichEli5([e], dir, env(), { getPatch: async () => patch }), 0)
+  assert.equal(calls, before)
+  assert.equal(await enrichEli5([e], dir, env(), { force: new Set([e.sha]), only: new Set([e.sha]), getPatch: async () => patch }), 1)
+  assert.equal(calls, before + 1)
+})
+
+test('CLI regen-last writes both artifacts even when the writer consumes over 40% of the budget', async t => {
+  const root = await temp(t), source = join(root, 'source')
+  await mkdir(source)
+  const git = (...args) => execFileSync('git', args, { cwd: source, encoding: 'utf8' }).trim()
+  git('init', '-q', '-b', 'main'); git('config', 'user.email', 'test@example.com'); git('config', 'user.name', 'test')
+  await writeFile(join(source, 'a.ts'), 'export const ALPHA = 0\n')
+  git('add', 'a.ts'); git('commit', '-qm', 'base')
+  const base = git('rev-parse', 'HEAD')
+  await writeFile(join(source, 'a.ts'), 'export const ALPHA = 1\n')
+  git('add', 'a.ts'); git('commit', '-qm', 'alpha')
+  const sha = git('rev-parse', 'HEAD')
+  const e = row('1', { sha, prevSha: base, enrichment: { policy: 1, admittedAt: '2026-10-05T00:00:00Z' } })
+  await mkdir(join(root, 'data'))
+  await writeFile(join(root, 'data/changelog.json'), JSON.stringify({ generatedAt: new Date().toISOString(), headSha: sha, entries: [e] }))
+  const preload = join(root, 'offline-provider.mjs')
+  // Advance the clock after the successful writer reply, not real wall time:
+  // this is the production deadline shape without waiting three minutes.
+  await writeFile(preload, `let offset=0; const clock=Date.now; Date.now=()=>clock()+offset;
+    globalThis.fetch=async (url,init)=>{const p=JSON.parse(init.body).messages.at(-1).content;
+    const plain=/Reply with JSON only:.*eli5|"eli5":/.test(p); if(!plain)offset+=180000;
+    const out=plain?{eli5:'The internal setting changed.'}:${JSON.stringify(clean)};
+    return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify(out)}}]}));};`)
+  const cli = fileURLToPath(new URL('../cli.mjs', import.meta.url))
+  const result = spawnSync(process.execPath, ['--import', preload, cli, 'regen-last', sha], {
+    env: { ...process.env, ...env({ CHANGELOG_WORKSPACE_ROOT: root, FREEBUFF_REPO: source, CHANGELOG_LLM_RPM_WARMUP: '0', LLM_API_KEYS: '', LLM_BACKUP_API_BASE: '', LLM_BACKUP_API_KEY: '', LLM_MODEL_MAJOR: '' }) }, encoding: 'utf8', timeout: 20000
+  })
+  assert.equal(result.status, 0, result.stdout + result.stderr)
+  assert.match(result.stdout, /1\/1 rows rewritten/)
+  const saved = await loadChangelog(join(root, 'data'))
+  assert.equal(saved.entries[0].ai.title, clean.title)
+  assert.equal(saved.entries[0].eli5.text, 'The internal setting changed.')
 })
 
 test('row budgets: configured values are honored, invalid ones fall back', () => {

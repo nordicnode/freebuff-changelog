@@ -1,0 +1,155 @@
+# LLM pipeline audit — 2026-10-05
+
+## Scope and conclusion
+
+Read-only investigation of recent generator/workflow commits, GitHub Actions logs, committed caches/day shards, the deployed website/API, and the supplied [Agnes documentation](https://www.agnes-ai.com/en/docs/agnes-30-flash). No provider requests, workflow dispatches, secret changes, deployments, commits, or pushes were made.
+
+**There are separate configuration, retry/scheduling, and observability failures. A successful sync/deploy does not establish successful LLM generation.** The Agnes defaults match the documented API; the first promoted provider-switch run received an invalid override. Old error stubs then obstruct recovery even when provider identity changes. Named regeneration also has an incorrectly anchored plain-English deadline.
+
+Workspace code examined: `b092e52c`. Remote data sampled at `ff13e689` (16:48 UTC). Live API last checked at **16:58:41 UTC**; the status endpoint reported at 16:58:27 UTC: `generatedAt=2026-10-05T16:53:33.170Z` and upstream head `5d02de3e8d4e79daafd09162f66356696ce4d15a`, matching GitHub upstream. Thus ingestion was current at the final check; the missing generation was not.
+
+## Reader-visible impact
+
+Confirmed through the public `/api/entry/<sha>.json` interface, not just stored data:
+
+| Entry | Date | Missing |
+|---|---|---|
+| [0f35bd7a — Agents update: base2-free-mimo](https://freebuff-changelog.nordicnode.workers.dev/c/0f35bd7aa3a4) | Oct 5 | Summary and plain-English explanation |
+| [5d02de3e — Freebuff CLI 0.2.16](https://freebuff-changelog.nordicnode.workers.dev/c/5d02de3e8d4e) | Oct 5 | Summary and plain-English explanation |
+| [38d5cf2d — Shared/Core update: llm](https://freebuff-changelog.nordicnode.workers.dev/c/38d5cf2d883a) | Sep 29 | Summary and plain-English explanation |
+| [e4a960f7 — Database alert threshold / CLI 0.1.0](https://freebuff-changelog.nordicnode.workers.dev/c/e4a960f781ae) | Sep 27 | Plain-English explanation at 16:57; appeared by 16:58, but `needs-repair` remains (partial evidence) |
+
+The workspace snapshot contains 8,054 non-noise entries and 201 admitted to automatic enrichment. Among those admitted rows, 198 have summaries, 197 have plain-English text, 30 report `needs-repair`, and 167 report `review-pending`. Review-pending is not equivalent to a failed generation: verification is deliberately disabled for current production calls, and these totals also include earlier pending verdicts.
+
+There are **677 non-noise rows without plain-English text**, but **673 are outside automatic admission**. The default forward-only policy will not repair that historical gap. Increasing the automatic limit does not change admission.
+
+## Findings
+
+### 1. Provider switch initially used an invalid configured base URL — confirmed production failure
+
+Commit `b092e52c` sets correct defaults:
+
+- Base: `https://apihub.agnes-ai.com/v1`
+- Model: `agnes-3.0-flash`
+- Request endpoint: `/chat/completions` appended to the base
+
+However, workflow secrets/variables take precedence over those defaults. [Run 37342686893](https://github.com/nordicnode/freebuff-changelog/actions/runs/37342686893) selected **b092e52c** at 16:45:03 UTC, then logged URL parsing failures for summaries, ELI5, and PR previews. The persisted cache reveals the exact failed URL: **`-/chat/completions`**. This is a local request-construction/configuration error, not an Agnes HTTP outage.
+
+That run logged 36 URL errors across all stages and wrote zero summaries/ELI5 lines. At the sampled remote revision, the shared summary cache retained 15 summary error stubs and one ELI5 error stub from this incident. The counter labels them API calls, although URL parsing happens before an HTTP request can reach the provider.
+
+GitHub secret metadata shows `LLM_API_BASE`, `LLM_API_KEY`, and `LLM_MODEL` updated around **16:47 UTC**, followed by a new run at 16:48:44. That may be a configuration correction already in progress; metadata cannot reveal or validate the current secret values. The replacement run was still running at the final check, and GitHub refused its unfinished logs. A new `data: forward enrichment` commit (`f11af8f7`, 16:56:53 UTC) was deployed, and by 16:58:41 UTC the live `e4a960f7` record carried an Agnes plain-English manifest and no missing text. That is evidence of at least one successful Agnes generation after the restart. Its quality still says `needs-repair` because summary and plain-English evidence are marked partial; the other three rows still lack both texts. Do not treat the malformed base as confirmed current configuration, or claim full recovery.
+
+**Recommendation:** validate effective route URLs and model settings once before building paid queues. Reject malformed primary/backup/stage configuration as a process/configuration fault, not as a permanent failure on each row. Perform one bounded provider contract test after validation, before attempting a backlog.
+
+### 2. Retry prefilter ignores provider/input identity and explicit force — reproduced offline
+
+[generator/lib/llm.mjs:4536–4567](../generator/lib/llm.mjs#L4536-L4567) builds `coolingShas` using SHA plus current prompt version. It does not compare the provider/model identity carried by the current ask. The candidate loop skips these SHAs **before** computing the exact content-addressed cache key.
+
+Consequences:
+
+- A refusal recorded on the old provider blocks a materially different ask on Agnes until its old cooldown expires, or forever if parked.
+- Both summary and ELI5 current-version failures participate in the SHA-wide prefilter.
+- `force` makes `isCurrent` false, but does not bypass `coolingShas`. A named `regen-last` can therefore ask nothing despite the later exact-key gate explicitly allowing forced rows.
+- The claim in `b092e52c`'s commit message that admitted backlog requeues under the new model is not reliable for error-only rows.
+
+At 16:12 UTC, the three missing-summary rows each received an attempt-1 deterministic error. Each gets a one-hour cooldown, explaining the later logs: **“3 remaining: 0 eligible, 3 cooling, 0 parked”** even after the provider switch. These particular failures were not yet permanently parked in the sampled state.
+
+Offline mocked-interface reproduction using a parked old-provider stub:
+
+| Scenario | Rows written | Patch reads | Fetch calls |
+|---|---:|---:|---:|
+| New Agnes provider/model identity | 0 | 0 | 0 |
+| Explicit `force` + named `only` scope | 0 | 0 | 0 |
+
+No real provider was contacted. Results are saved in [reproductions.json](../.cache/pipeline-audit/reproductions.json).
+
+**Recommendation:** make retry eligibility agree with the actual request identity, and honor explicit force before the cheap prefilter. Maintain bounds and forward-only admission; do not clear the whole cache or reset attempts on every run.
+
+### 3. Named regeneration's ELI5 deadline is earlier than its summary deadline — confirmed code defect
+
+[generator/cli.mjs:2199–2220](../generator/cli.mjs#L2199-L2220) allocates 60% of a run to summaries and 40% to ELI5, but computes both deadlines from the same original `startedAt`:
+
+- Summary: `startedAt + summaryBudgetMs`
+- ELI5: `startedAt + eli5BudgetMs`
+
+For the six-minute minimum run, summary has 216 seconds, while the ELI5 deadline is only 144 seconds after the original start. If the writer consumes its allowed window, ELI5 begins **72 seconds after its own deadline** and immediately skips. It does not receive the reserved 144 seconds.
+
+**Recommendation:** give ELI5 a real post-summary window, bounded by the total run budget, and add an end-to-end named-regeneration test where summary consumes more than 40% of the total budget.
+
+### 4. Earlier upstream/provider failures were real, and failover fixes did not replay failed asks
+
+[Oct 1 run 36942882212](https://github.com/nordicnode/freebuff-changelog/actions/runs/36942882212) includes HTTP 503/504, transport timeouts, and cycle-deadline cuts. Across three summary passes it wrote **one summary in 33 counted calls**; explanation passes wrote 14 lines in 107 calls. This aligns with the high transient-error event counts in [data/llm-health.json](../data/llm-health.json), but those daily totals are event counts, not unique affected rows.
+
+[Oct 5 retry run 37338160921](https://github.com/nordicnode/freebuff-changelog/actions/runs/37338160921) explicitly released `0f35bd7a`, `5d02de3e`, and `38d5cf2d`, then wrote **0 of 3 summaries in 9 calls**. Replies included “The latest Claude Opus model I know about…” and “I'm DeepSeek…”, rather than source-diff JSON.
+
+The fix sequence matters:
+
+- `ef725acf`: route classification plus more selective relay yielding.
+- `09e1f6be`: refusal failover, shorter warmup, concurrency 3.
+- `49416c34`: raise RPM ceiling.
+- `45295881`: actually consult backup before throwing the attempt-3 deterministic failure.
+- `b092e52c`: switch default provider/model/context.
+
+The original failover classifications were insufficient because the deterministic branch threw before reaching route failover. `45295881` addresses that path, but old failure stubs are not automatically replayed by code changes alone. The successful 16:28–16:40 relay run repeatedly wrote zero rows because all three were cooling.
+
+**Recommendation:** after configuration and retry-gate repair, recover only the named affected rows using bounded operator scope. Include ELI5-only failures; `retry-failed` skips rows that already have a summary, so it cannot by itself repair `e4a960f7`.
+
+### 5. Successful workflows and backlog counters hide failed/stale generation
+
+- Catch-up counts a row current mostly by `ai.title`, while the writer checks model/input identity and release context. The provider-switch run logged “3 remaining” while also attempting rewrites of rows with existing summaries. This underreports actual generation work and identity-stale text.
+- Generation errors are caught and stored; deterministic ingestion can keep publishing and the workflow can stay green over zero LLM progress.
+- [generator/cli.mjs:2094](../generator/cli.mjs#L2094) says failure stubs are cleared and the next relay cycle asks again even though the failed retry just wrote fresh stubs with a one-hour cooldown. The observed next cycle made no asks.
+- The deploy “Verify uploaded head” step reads the checkout manifest and upstream SHA; it does **not** fetch the served website. Its name overstates what it validates.
+- The default heal path requires a replacement verdict of `passed` ([llm.mjs:4844](../generator/lib/llm.mjs#L4844)), while production verification is disabled. That path cannot accept an otherwise cleaner unchecked rewrite. A named forced rewrite is a separate path.
+
+**Recommendation:** separate ingestion freshness, actual served-deployment freshness, generation completeness, generation identity freshness, and review state. Report oldest missing admitted row, actual eligible queue, route/configuration failures, and writes versus requests sent. A persistent configuration failure or sustained generation starvation should produce an explicit failing health signal without withholding deterministic updates.
+
+## Staleness assessment
+
+Staleness was real earlier: [deploy run 37337455987](https://github.com/nordicnode/freebuff-changelog/actions/runs/37337455987) failed at 16:01 UTC because the data manifest was **35 minutes old**. Sync logs also reported a 34-minute last-sync age before republishing.
+
+At the final live check, the served manifest was approximately 3.5 minutes old and matched upstream head. This investigation does **not** establish that the former relay issue was solely phantom queued runs; the latest commit documents that diagnosis, but actual cancellations, setup delays, and handoffs are also visible. The observed green workflow does not mean the missing summaries recovered.
+
+## Agnes contract check
+
+The supplied authoritative documentation confirms:
+
+- `POST https://apihub.agnes-ai.com/v1/chat/completions`
+- Bearer authentication, `messages`, `temperature`, `max_tokens`, and `stream`
+- `agnes-3.0-flash`, 512K context, 65,536 maximum output tokens
+- OpenAI-compatible `choices[].message.content`
+
+The ordinary request shape and streaming setting match. `response_format` is not listed on this page; the existing per-route compatibility probe handles an explicit unsupported-field response, but that is not proof this feature is supported. Account RPM/availability are entitlement-specific: the current 60-RPM ceiling is inherited from the previous provider, not documented as Agnes's account allowance. These are follow-up contract checks, **not demonstrated causes of the URL failure**.
+
+## Recovery priority
+
+1. Validate the effective primary/backup/stage configurations and confirm the 16:47 secret correction using a bounded real integration test.
+2. Repair identity-aware retry/force gating and the named-run ELI5 deadline, with regressions covering the offline reproductions above.
+3. Regenerate the three named missing-summary rows, preserving shipped text on failure. Reassess the newly recovered `e4a960f7` partial-evidence quality separately. Do not run a broad historical rewrite.
+4. Add separate generation/served-freshness health checks and accurate queue counters.
+5. Decide explicitly whether the 673 historical explanations outside admission should be backfilled; current automatic policy forbids it.
+
+## Verification and limitations
+
+- Public homepage, `/api/status.json`, daily records, and all four affected `/api/entry/` records checked in the browser.
+- Offline retry reproduction confirmed zero asks under both provider change and explicit force.
+- Existing relevant offline suites: **67/67 passed**, zero skipped. Passing existing tests do not cover the newly demonstrated defects. [Test output](../.cache/pipeline-audit/offline-tests.log).
+- No source-code repair was made in this investigative task; only this report and ignored diagnostic artifacts were created.
+- Current secret values are unreadable; only names/update metadata were inspected. The newest in-progress run's logs were unavailable. One successful post-restart Agnes explanation is evidenced by the live API manifest; the three missing summaries remain unrecovered.
+
+## Remediation (subsequent implementation)
+
+The findings above describe the original read-only audit. The follow-up implementation repairs:
+
+- Identity-aware summary cooldowns (separate from explanation failures), explicit force for both artifacts, and shared identity-current backlog counters. New failures carry input/route/release identity; older stubs are handled at the exact-key gate rather than vetoing new routes.
+- Provider URL/model/key preflight and process-level authentication errors. Configuration faults create no row failure stub, stop additional queued asks, and fail the watcher immediately after deterministic publication.
+- Correct post-summary explanation deadlines in named regeneration, with an end-to-end offline CLI test advancing the writer clock past 40% of the total budget.
+- Gateway-body failover after the attempt cap; a backup outage following a refusal remains transient rather than permanently parking the row.
+- PR retry identity, transient retries, actual served-model provenance, and no unavailable verdict when verification is disabled.
+- Opt-in daily re-probes for repeatedly failing rows in the relay, retaining attempt counts and all row/cycle/rate limits. No automatic historical backfill is introduced.
+- Independent `generation-health` CLI/workflow gates after publishing and generation health in `/api/status.json`. Historical non-admitted gaps and intentional unchecked text do not trip the gate; overdue admitted missing text does.
+- A served-website head/timestamp probe, including unchanged upstream-head redeploys, and bounded asset-propagation retries.
+- Relay queue inspection corrected to use supported `gh --jq` syntax without silently turning API errors into an empty queue. A failed named repair no longer suppresses deterministic sync.
+- Unchecked-text healing can accept a strictly cleaner replacement without inventing a verdict; recorded factual objections require a real passing check to clear.
+
+Verification includes the full offline suite on Node 26 and CI's Node 22, the opt-in real-fetch 65-second response regression, Actionlint validation, and browser inspection of the new local status/entry API. The generation-health CLI intentionally reports failure against the existing three overdue rows until production recovery writes their text. No historical content or production secrets were edited.

@@ -15,8 +15,8 @@ import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
   extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
-import {  enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, verifyConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows, shortError, errorRetryDelayMs, cacheKeyVersion } from './lib/llm.mjs'
-import { QUALITY_POLICY_V, generationState, regenUnfinished } from './lib/quality.mjs'
+import {  enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, verifyConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows, shortError, errorRetryDelayMs, cacheKeyVersion, validateLlmConfig, isLlmConfigError, summaryBacklog } from './lib/llm.mjs'
+import { QUALITY_POLICY_V, generationState, regenUnfinished, generationHealth } from './lib/quality.mjs'
 import { shortHash, eli5Source } from './lib/util.mjs'
 import { EVIDENCE_WIDTH_WARN, evidenceStats, gcEvidence, liveEvidenceHashes, spillEntryEvidence, spillEvidence } from './lib/evidence.mjs'
 import { changelogBytes, loadChangelog, saveChangelog } from './lib/changelog-store.mjs'
@@ -1227,38 +1227,13 @@ async function catchUpOnce (argv, budgets = {}) {
     return
   }
   const queueable = entries.filter(e => !e.noise && enrichmentEligible(e, { CHANGELOG_LLM_NO_BACKFILL: '1' }))
-  const isCurrent = (e) => e.ai?.title && (process.env.CHANGELOG_LLM_FORCE_REWRITE === '1' ? (e.ai?.v ?? 1) >= PROMPT_V : true)
-  const unsummarized = queueable.filter(e => !isCurrent(e))
-  // Name the wait, not just the count: "3 remaining" with no attempts looks
-  // stuck, when two rows are cooling until their retry window and one is
-  // parked for a named release. Read from the same cache the queue gates on.
-  {
-    const cache = await readJson(`${DATA}/ai-summaries.json`, {})
-    const cdMs = Number(process.env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
-    const trMs = Number(process.env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
-    const maxA = Number(process.env.CHANGELOG_LLM_MAX_ATTEMPTS) > 0 ? Number(process.env.CHANGELOG_LLM_MAX_ATTEMPTS) : 3
-    let cooling = 0, parked = 0
-    for (const e of unsummarized) {
-      const recs = Object.entries(cache)
-        .filter(([k, v]) => {
-          if (k.split(':')[0] !== e.sha || !v?.error) return false
-          const kv = cacheKeyVersion(k)
-          return kv && kv.kind !== 'eli5' && kv.v === PROMPT_V
-        })
-        .map(([, v]) => v)
-      if (!recs.length) continue
-      if (recs.some(r => !r.error)) continue
-      const states = recs.map(r => errorRetryDelayMs(r, { errorCooldownMs: cdMs, transientRetryMs: trMs, maxAttempts: maxA }))
-      if (states.every(s => s === Infinity)) { parked++; continue }
-      const ready = recs.some(r => {
-        const d = errorRetryDelayMs(r, { errorCooldownMs: cdMs, transientRetryMs: trMs, maxAttempts: maxA })
-        return d !== Infinity && Date.now() - (Date.parse(r.at || '') || 0) >= d
-      })
-      if (!ready) cooling++
-    }
-    const eligible = unsummarized.length - cooling - parked
-    log(`[enrichment] ${queueable.length} total entries (${unsummarized.length} remaining to summarize: ${eligible} eligible, ${cooling} cooling, ${parked} parked)`)
-  }
+  // Ingestion has already published. Fail bad paid configuration now, once,
+  // without poisoning each row's cache or holding deterministic news hostage.
+  validateLlmConfig(process.env)
+  const backlog = await summaryBacklog(entries, DATA)
+  const unsummarized = backlog.pending
+  log(`[enrichment] ${queueable.length} admitted entries (${unsummarized.length} pending current summaries: ${backlog.eligible} eligible, ${backlog.cooling} cooling, ${backlog.parked} parked)`)
+
 
   let limit = Number(process.env.CHANGELOG_LLM_LIMIT || 5)
   const limitIdx = argv.indexOf('--limit')
@@ -1296,7 +1271,8 @@ async function catchUpOnce (argv, budgets = {}) {
     // slice comes out of this cycle's paid window, so the entry passes simply
     // get that much less on the one cycle a digest is due.
     const rollupEndsAt = Math.min(enrichEndsAt, Date.now() + Math.max(0, Number(process.env.CHANGELOG_ROLLUP_BUDGET_MS || 90000)))
-    didSummarize = didSummarize || (await writeSettledRollups(entries, { endsAt: rollupEndsAt })) > 0
+    const rollupsWritten = await writeSettledRollups(entries, { endsAt: rollupEndsAt })
+    didSummarize = didSummarize || rollupsWritten > 0
     const enrichStart = Date.now()
     // Only reserve for the plain-English drain when it actually has work: the
     // reserve is a share of one window, and holding it against an empty queue
@@ -1333,9 +1309,9 @@ async function catchUpOnce (argv, budgets = {}) {
       // other two passes hand the model.
       getFullPatch: fullPatchFor
     })
-    const remaining = queueable.filter(e => !isCurrent(e)).length
-    log(`[enrichment] enriched ${n} entries with LLM (${remaining} remaining)`)
-    didSummarize = remaining < unsummarized.length
+    const remaining = (await summaryBacklog(entries, DATA)).pending.length
+    log(`[enrichment] enriched ${n} entries with LLM (${remaining} pending current summaries)`)
+    didSummarize = didSummarize || n > 0
   } else if (llmConfigured()) {
     // Deliberately skipped, and said so: starting a pass on a window that
     // cannot hold one call is what burned 254 deadline stubs.
@@ -1507,6 +1483,9 @@ export async function cmdWatch (argv, { cycle = cmdCatchUp, errorBudget } = {}) 
         lastError = null
       }
     } catch (err) {
+      // A configuration error cannot recover by asking another row. The
+      // deterministic phase has already published; end red and hand off.
+      if (isLlmConfigError(err)) throw err
       consecutiveErrors++
       lastError = err
       log(`backfill loop iteration error (${consecutiveErrors}/${errorCeil} since the last good cycle): ${err.message}`)
@@ -1930,6 +1909,7 @@ if (IS_MAIN) {
   else if (cmd === 'watch' || cmd === 'backfill') await cmdWatch(rest)
   else if (cmd === 'push-data') await cmdPushData(rest)
   else if (cmd === 'freshness') await cmdFreshness(rest)
+  else if (cmd === 'generation-health') await cmdGenerationHealth(rest)
   else if (cmd === 'check-size') await cmdCheckSize(rest)
   else if (cmd === 'enrich-all') await cmdEnrichAll(rest)
   else if (cmd === 'repair-entries') await cmdRepairEntries(rest)
@@ -1962,6 +1942,7 @@ if (IS_MAIN) {
   node generator/cli.mjs compact-evidence [--push] [--dry-run]  # move stored evidence material into data/evidence/ shards so the tracked JSON files stay small
   node generator/cli.mjs gc-evidence [--push] [--dry-run]  # delete evidence shards no stored record references and fan flat shards out by hash prefix
   node generator/cli.mjs rollups [--backfill N] [--day YYYY-MM-DD] [--force] [--push]  # write the settled day's bullet digest shown at the top of its page
+  node generator/cli.mjs generation-health       # offline gate: fail on overdue missing admitted text, independent of ingestion freshness
   node generator/cli.mjs check-size              # CI gate: fail when a tracked file nears GitHub's 100 MiB push limit
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
   node generator/cli.mjs eval [--seed N] [--limit N]  # offline stored-artifact audit, zero provider calls
@@ -2037,6 +2018,7 @@ async function cmdRetryFailed (argv) {
       log('[retry-failed] nothing to release')
       return
     }
+    validateLlmConfig(process.env)
     if (!llmConfigured()) throw new Error('retry-failed needs the LLM configured (CHANGELOG_LLM=1 and LLM_API_KEY): dispatch it through the sync workflow, where the relay key lives')
     // The provider's quiet minute is a fixed cost of the process, and it is
     // deliberately spent before any pass deadline is armed: the lazy bounded
@@ -2091,7 +2073,7 @@ async function cmdRetryFailed (argv) {
         if (n) await enrichEli5(doc.entries, DATA, env, { retryErrors: true, priorityShas: only, only, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
       })
       log(`[retry-failed] ${n} of ${askable.length} row(s) written after ${asked} call(s)`)
-      if (!n) log(asked ? '[retry-failed] the provider did not answer; the stubs are cleared, so the next relay cycle asks again' : '[retry-failed] no call was sent: nothing was eligible to ask')
+      if (!n) log(asked ? '[retry-failed] no summary was written; new failure records retain their retry cooldowns' : '[retry-failed] no call was sent: nothing was eligible to ask')
     } else {
       log('[retry-failed] no row was askable; the release is still published so the next cycle can try')
     }
@@ -2109,6 +2091,8 @@ async function cmdRetryFailed (argv) {
     // After the publish, on purpose: a refused name must not undo the releases
     // that did happen, but the run still has to end red so the refusal is seen.
     if (errors.length) throw new Error(`retry-failed: released ${picked.length}, refused ${errors.length}: ${errors.join('; ')}`)
+    const missing = picked.filter(e => generationState(e).missing.length)
+    if (missing.length) throw new Error(`retry-failed: generation still missing for ${missing.map(e => e.sha.slice(0, 8)).join(', ')}; partial results preserved and cooldowns retained`)
   })
   if (!acquired) log('another generate/backfill run holds the worktree lock: retry shortly')
 }
@@ -2134,6 +2118,22 @@ async function cmdRetryFailed (argv) {
  * is refused and named: that would be backfill, which this command exists not
  * to do.
  */
+// The explanation share begins after summaries, never at the run's start.
+// Unused writer time stays bounded by the original total deadline.
+export function regenerationEli5Deadline (startedAt, budgetMs, eli5BudgetMs, now = Date.now()) {
+  return Math.min(startedAt + budgetMs, now + eli5BudgetMs)
+}
+
+export async function cmdGenerationHealth (argv = [], { dataDir = DATA, now = Date.now(), env = process.env } = {}) {
+  const doc = await loadChangelog(dataDir)
+  if (!doc) throw new Error('generation-health: changelog is missing')
+  const budget = Number(env.CHANGELOG_GENERATION_STALE_MIN) > 0 ? Number(env.CHANGELOG_GENERATION_STALE_MIN) * 60000 : 1800000
+  const health = generationHealth(doc.entries, { now, maxAgeMs: budget })
+  log(`[generation-health] ${health.admitted} admitted; ${health.missingSummary} missing summaries, ${health.missingPlain} missing explanations, ${health.needsRepair} need repair, ${health.overdue.length} overdue`)
+  if (health.overdue.length) throw new Error(`generation-health: missing text exceeded ${Math.round(budget / 60000)}m admission budget: ${health.overdue.map(e => `${e.sha.slice(0, 8)} (${e.missing.join(', ')})`).join('; ')}`)
+  return health
+}
+
 async function cmdRegenLast (argv) {
   const push = argv.includes('--push')
   const wants = argv.filter(a => !a.startsWith('--')).map(s => s.trim()).filter(Boolean)
@@ -2162,6 +2162,7 @@ async function cmdRegenLast (argv) {
         targets.push(hits[0])
       }
     }
+    validateLlmConfig(process.env)
     if (!llmConfigured()) throw new Error('regen-last needs the LLM configured (CHANGELOG_LLM=1 and LLM_API_KEY): dispatch it through the sync workflow, where the relay key lives')
     // Warm before the pass clocks exist, not inside the first row's 60s share:
     // the bounded warmup path throws "entry time budget exceeded" when the wait
@@ -2214,13 +2215,14 @@ async function cmdRegenLast (argv) {
     })
     // The plain-English line follows the summary: a rewritten summary whose
     // claims changed re-queues its line through eli5Done on its own.
-    const eli5Deadline = startedAt + eli5BudgetMs
+    const eli5Deadline = regenerationEli5Deadline(startedAt, budgetMs, eli5BudgetMs)
     const eli5Env = { ...process.env, CHANGELOG_LLM_NO_BACKFILL: '1', CHANGELOG_LLM_LIMIT: String(askable.length + 1), CHANGELOG_ELI5_ROW_BUDGET_MS: String(eli5RowShareMs), LLM_DEADLINE_AT: String(eli5Deadline), LLM_CYCLE_BUDGET: { remaining: Math.max(20, askable.length * 4) } }
-    await enrichEli5(doc.entries, DATA, eli5Env, { only, priorityShas: only, retryErrors: true, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
+    await enrichEli5(doc.entries, DATA, eli5Env, { force: only, only, priorityShas: only, retryErrors: true, getPatch: llmPatchFor, getFullPatch: fullPatchFor, repoDir: REPO_DIR })
     asked = llmCallCount() - beforeSummary
     // The "generate properly" half of the request: report the outcome per row,
     // not just a count, so a run that quietly produced nothing cannot look done.
     const fresh = askable.filter(e => e.ai?.at && Date.parse(e.ai.at) >= startedAt)
+    const notRewritten = askable.filter(e => !fresh.includes(e))
     const noText = askable.filter(e => !e.ai?.title)
     const flagged = askable.filter(e => e.ai?.verify === 'flagged')
     const unavailable = askable.filter(e => e.ai?.verify === 'unavailable')
@@ -2249,6 +2251,7 @@ async function cmdRegenLast (argv) {
       log('dry run: data written locally, not committed (pass --push)')
     }
     if (refused.length) throw new Error(`regen-last: regenerated ${askable.length}, refused ${refused.length}: ${refused.join('; ')}`)
+    if (notRewritten.length) throw new Error(`regen-last: writer did not refresh ${notRewritten.map(e => e.sha.slice(0, 8)).join(', ')}; shipped text preserved`)
     if (incomplete.length) throw new Error(`regen-last: bounded repair incomplete for ${incomplete.map(e => e.sha.slice(0, 8)).join(', ')}; partial results preserved, no completion claimed`)
   })
   if (!acquired) log('another generate/backfill run holds the worktree lock: retry shortly')
@@ -2491,6 +2494,7 @@ async function writeRollupBatch (pending, { endsAt = Infinity, env = process.env
       written++
       log(`[rollup] ${day}: ${rollup.bullets.length} bullet(s) (${rollup.model || 'unknown model'} @ ${rollup.provider || 'unknown provider'})${rollup.dropped ? `, ${rollup.dropped} of the model's bullets dropped` : ''}`)
     } catch (err) {
+      if (isLlmConfigError(err)) throw err
       log(`[rollup] ${day} failed: ${shortError(err)}`)
     }
   }

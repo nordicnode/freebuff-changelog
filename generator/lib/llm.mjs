@@ -116,6 +116,45 @@ export function nextLlmKey (env = process.env) {
 export const DEFAULT_LLM_API_BASE = 'https://apihub.agnes-ai.com/v1'
 export const DEFAULT_LLM_MODEL = 'agnes-3.0-flash'
 
+// Configuration faults belong to the process, never to individual rows. Keep
+// values out of errors: route URLs can contain credentials and CI masks them.
+function llmConfigError (message) {
+  return Object.assign(new Error(`LLM configuration: ${message}`), { configuration: true })
+}
+
+export function isLlmConfigError (err) {
+  return err?.configuration === true || /LLM configuration:|Failed to parse URL|Invalid URL|LLM HTTP (?:401|403)\b/i.test(String(err?.message || err || ''))
+}
+
+function validateRoute (env, label = 'primary') {
+  const base = env.LLM_API_BASE || DEFAULT_LLM_API_BASE
+  let url
+  try { url = new URL(base) } catch { throw llmConfigError(`${label} API base must be an absolute HTTP(S) URL`) }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || String(base).trim() !== base || /\/chat\/completions\/?$/.test(url.pathname)) {
+    throw llmConfigError(`${label} API base must be an HTTP(S) base without credentials, query, fragment, or chat/completions suffix`)
+  }
+  const model = env.LLM_MODEL || DEFAULT_LLM_MODEL
+  if (!String(model).trim() || model === '-' || String(model).trim() !== model) throw llmConfigError(`${label} model must be a non-placeholder model name`)
+  if (!llmKeysOf(env).length) throw llmConfigError(`${label} API key is missing`)
+}
+
+export function validateLlmConfig (env = process.env) {
+  if (env.CHANGELOG_LLM !== '1') return
+  validateRoute(env, env.LLM_ROUTE || 'primary')
+  if (env.CHANGELOG_LLM_BACKUP !== '0') {
+    if (!!env.LLM_BACKUP_API_BASE !== !!env.LLM_BACKUP_API_KEY) throw llmConfigError('backup needs both API base and API key')
+    const backup = backupEnvOf(env)
+    if (backup) validateRoute(backup, 'backup')
+  }
+  if (!!env.CHANGELOG_ROLLUP_LLM_API_BASE !== !!env.CHANGELOG_ROLLUP_LLM_API_KEY) throw llmConfigError('day roll-up needs both API base and API key')
+  const rollup = rollupLlmEnv(env)
+  if (rollup) validateRoute(rollup, 'day roll-up')
+}
+
+export function llmRouteIdentity (env = {}) {
+  return shortHash(JSON.stringify({ provider: env.LLM_API_BASE || DEFAULT_LLM_API_BASE, model: env.LLM_MODEL || DEFAULT_LLM_MODEL, backup: backupEnvOf(env) && { provider: env.LLM_BACKUP_API_BASE, model: env.LLM_BACKUP_MODEL || env.LLM_MODEL || DEFAULT_LLM_MODEL } }))
+}
+
 // What the pipeline is actually configured to talk to, in one line and without
 // the key. The absence of this line is why a provider swap could only be
 // inferred from stored rows after the fact; a run now says it out loud.
@@ -2039,6 +2078,7 @@ export async function callScopedLlm (prompt, env = process.env, validate = valid
 }
 
 export async function callLlm (prompt, env, attempt = 1, validate = validateLlmOut, opts = {}) {
+  validateRoute(env, env.LLM_ROUTE || 'primary')
   // Repair suffixes and fallback asks share the same provider window ceiling.
   prompt = fitToWindow(prompt)
   // The scope is the row: it is created by the row's first call and carries the
@@ -2112,8 +2152,10 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     try {
       return await callLlm(prompt, backup, 1, validate, { ...opts, usedBackup: true })
     } catch (backupErr) {
+      if (isLlmConfigError(backupErr)) throw backupErr
       const combined = new Error(`${shortError(err)}; backup route: ${shortError(backupErr)}`)
-      if (backupErr.deterministic === true || err.deterministic === true) combined.deterministic = true
+      if (callUnanswered(backupErr)) combined.transient = true
+      else if (backupErr.deterministic === true || err.deterministic === true) combined.deterministic = true
       if (backupErr.raw) combined.raw = backupErr.raw
       throw combined
     }
@@ -2157,7 +2199,7 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
     request.outcome = 'body-error'
     request.durationMs = Date.now() - started
     releaseSlot()
-    throw err
+    return routeOrThrow(err)
   }
   request.durationMs = Date.now() - started
   releaseSlot()
@@ -2222,13 +2264,16 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
       return callLlm(rung.prompt, env, attempt + 1, validate, rung.opts)
     }
   }
+  if (res.status === 401 || res.status === 403) throw llmConfigError(`${env.LLM_ROUTE || 'primary'} authentication failed (LLM HTTP ${res.status})`)
   if (!res.ok) return routeOrThrow(new Error(shortError(`LLM HTTP ${res.status}: ${rawText.slice(0, 120)}`)))
   try { const usage = JSON.parse(rawText)?.usage; if (usage) request.usage = usage } catch {}
   let text = ''
   try {
     text = extractResponseText(rawText)
   } catch (err) {
-    if (attempt > 2) throw withRawText(err, rawText)
+    // Gateway envelopes remain route failures even after the ask ladder used
+    // its attempts. Never strand failover behind the generic parse-error cap.
+    if (attempt > 2 && !isGatewayError(err)) throw withRawText(err, rawText)
     // An empty or malformed body twice in a row is a problem with THIS ask,
     // not with the gateway's mood: the third identical re-ask used to burn
     // the last attempt on "reply with ONLY the JSON" for a body that came
@@ -2317,8 +2362,12 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
           try {
             return await callLlm(prompt, backup, 1, validate, { ...opts, usedBackup: true });
           } catch (backupErr) {
-            const combined = new Error(`${what} on both routes (primary: ${shortError(err)}; backup: ${shortError(backupErr)})`);
-            combined.deterministic = true;
+            if (isLlmConfigError(backupErr)) throw backupErr;
+            const combined = new Error(`${what} on primary route; backup route: ${shortError(backupErr)}`);
+            // A backup outage is not a second deterministic answer. Retain its
+            // short retry window instead of parking the row for that outage.
+            if (!callUnanswered(backupErr)) combined.deterministic = true;
+            else combined.transient = true;
             if (backupErr.raw) combined.raw = backupErr.raw;
             else if (text) combined.raw = String(text).replace(/\s+/g, ' ').trim().slice(0, 300);
             throw combined;
@@ -3006,6 +3055,7 @@ export function isTransientError (err) {
   // error's clothes -- `LLM returned no JSON` -- match the JSON arm below, and
   // land on the 5-minute retry cooldown, where each retry cost three more
   // full-context calls and failed identically forever.
+  if (err?.transient === true) return true
   if (isDeterministicFailure(err)) return false
   if (isGatewayError(err)) return true
   // Our own cycle guards interrupt the call, they do not judge it: a row cut
@@ -3042,15 +3092,15 @@ export function isTransientError (err) {
 //     repeat of a deterministic failure says more than the first one;
 //   * at `maxAttempts` the row parks for good (Infinity): a doomed v11
 //     rewrite is retried no more. A prompt-version bump changes the cache key,
-//     which is the only thing that would change the answer, so the park is
-//     released by the thing that could actually fix it.
+//     which changes the answer. The relay additionally opts into one bounded
+//     daily probe, because a provider can recover without a prompt rollout.
 //
 // `deterministic` stubs (refusals / memory answers, named by callLlm) get a
 // shorter leash: two runs of three calls each is already a generous budget
 // for a reply measured byte-identical across attempts and temperatures.
-export function errorRetryDelayMs (stub, { errorCooldownMs = 3600000, transientRetryMs = 300000, maxAttempts = 3 } = {}) {
+export function errorRetryDelayMs (stub, { errorCooldownMs = 3600000, transientRetryMs = 300000, maxAttempts = 3, parkedRetryMs = Infinity } = {}) {
   if (!stub || !stub.error) return 0
-  if (stub.transient) return transientRetryMs
+  if (stub.transient || isLlmConfigError(new Error(stub.error))) return transientRetryMs
   // Re-classified on read, not trusted from when it was written: a row parked by
   // a failure that came back with nothing -- including one the stored flag says
   // was a permanent failure, because the flag predates this rule -- gets the
@@ -3060,7 +3110,7 @@ export function errorRetryDelayMs (stub, { errorCooldownMs = 3600000, transientR
   if (callUnanswered(new Error(String(stub.error)))) return transientRetryMs
   const attempts = Math.max(1, Number(stub.attempts) || 1)
   const cap = stub.deterministic ? Math.min(maxAttempts, 2) : maxAttempts
-  if (attempts >= cap) return Infinity
+  if (attempts >= cap) return Math.max(errorCooldownMs, parkedRetryMs)
   const growth = Math.min(2 ** (attempts - 1), 24)
   return errorCooldownMs * growth
 }
@@ -3163,7 +3213,7 @@ export function chargeReverify (rec, { answered, now = Date.now() } = {}) {
 // interrupted is not doomed, it is interrupted.
 export function callUnanswered (err) {
   const msg = String(err?.message || err || '')
-  return isGatewayError(err) || /HTTP 4(29|08)\b/i.test(msg) || /deadline|budget exceeded/i.test(msg)
+  return err?.transient === true || isGatewayError(err) || /HTTP 4(29|08)\b/i.test(msg) || /deadline|budget exceeded/i.test(msg)
 }
 
 // What the row's prompt shows that can arrive AFTER its summary ships: the
@@ -4347,6 +4397,46 @@ function inputIdentity (e, prMeta, glossary, env, relText = '') {
   return shortHash(JSON.stringify({ base: e.prevSha || null, model: modelFor(e, env, relText) || DEFAULT_LLM_MODEL, provider: env.LLM_API_BASE || DEFAULT_LLM_API_BASE, context: contextFingerprint(prMeta, glossary), policy: QUALITY_POLICY_V, writer: shortHash(buildPrompt.toString() + buildFusePrompt.toString() + contextSectionLines.toString()), validator: shortHash(validateLlmOut.toString() + buildVerifyPrompt.toString() + validateVerifyOut.toString()) }))
 }
 
+// Shared by the writer and its counters: title presence alone is not current.
+export function summaryCurrent (e, env = {}, { prMeta = null, glossary = '', releaseCtx = '', rewriteStale = false, scope = null } = {}) {
+  if (!e?.ai?.title || !e.ai.summary || !e.ai.model || gaveUp(e)) return false
+  if (!rewriteIsCurrent(e, { rewriteStale, scope })) return false
+  if (e.enrichment?.policy === QUALITY_POLICY_V && e.ai.manifest?.inputIdentity !== inputIdentity(e, prMeta, glossary, env, releaseCtx)) return false
+  return !releaseCtx || !e.ai.policy || aiDone(e, releaseCtx, RELEASE_ROLLUP_V)
+}
+
+export async function summaryBacklog (entries, dataDir, env = process.env) {
+  const cache = await readJson(`${dataDir}/ai-summaries.json`, {})
+  const prIndex = await loadPrIndex(dataDir)
+  const glossary = formatGlossary(await loadGlossary(dataDir))
+  const posIndex = new Map(entries.map((e, i) => [e.sha, i]))
+  const contexts = new Map()
+  const bySha = new Map()
+  for (const [key, rec] of Object.entries(cache)) {
+    const v = cacheKeyVersion(key)
+    if (v?.kind !== 'summary' || v.v !== PROMPT_V) continue
+    const sha = key.split(':')[0]
+    if (!bySha.has(sha)) bySha.set(sha, [])
+    bySha.get(sha).push(rec)
+  }
+  const pending = []
+  let cooling = 0, parked = 0
+  for (const e of entries) {
+    if (e.noise || !enrichmentEligible(e, env)) continue
+    const releaseCtx = getReleaseContextFor(entries, e, posIndex, contexts)?.text || ''
+    const prMeta = findPrMeta(e, prIndex)
+    if (summaryCurrent(e, env, { prMeta, glossary, releaseCtx, rewriteStale: env.CHANGELOG_LLM_FORCE_REWRITE === '1' })) continue
+    pending.push(e)
+    const identity = inputIdentity(e, prMeta, glossary, env, releaseCtx)
+    const recs = (bySha.get(e.sha) || []).filter(r => r?.inputIdentity === identity && r.routeIdentity === llmRouteIdentity(env) && r.releaseHash === shortHash(releaseCtx))
+    if (!recs.length || recs.some(r => !r.error)) continue
+    const delays = recs.map(r => errorRetryDelayMs(r, { errorCooldownMs: Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS) || 3600000, transientRetryMs: Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS) || 300000, maxAttempts: Number(env.CHANGELOG_LLM_MAX_ATTEMPTS) || 3, parkedRetryMs: Number(env.CHANGELOG_LLM_PARK_RETRY_MS) > 0 ? Number(env.CHANGELOG_LLM_PARK_RETRY_MS) : Infinity }))
+    if (delays.every(d => d === Infinity)) parked++
+    else if (recs.every((r, i) => Date.now() - (Date.parse(r.at || '') || 0) < delays[i])) cooling++
+  }
+  return { pending, eligible: pending.length - cooling - parked, cooling, parked }
+}
+
 export function enrichmentEligible (e, env = process.env) {
   const noBackfill = env.CHANGELOG_LLM_NO_BACKFILL !== '0'
   return !noBackfill || e.enrichment?.policy === QUALITY_POLICY_V
@@ -4429,6 +4519,7 @@ export function releaseFailedRows (entries, cache, wants, { policy = QUALITY_POL
 }
 
 export async function enrichWithLlm (entries, getPatch, dataDir, env = process.env, options = {}) {
+  validateLlmConfig(env)
   if (!llmConfigured(env)) return 0
   const cachePath = `${dataDir}/ai-summaries.json`
   const cache = await readJson(cachePath, {})
@@ -4459,7 +4550,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
   const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
   const maxAttempts = Number(env.CHANGELOG_LLM_MAX_ATTEMPTS) > 0 ? Number(env.CHANGELOG_LLM_MAX_ATTEMPTS) : 3
-  const retryOpts = { errorCooldownMs, transientRetryMs, maxAttempts }
+  const retryOpts = { errorCooldownMs, transientRetryMs, maxAttempts, parkedRetryMs: Number(env.CHANGELOG_LLM_PARK_RETRY_MS) > 0 ? Number(env.CHANGELOG_LLM_PARK_RETRY_MS) : Infinity }
   const callsAtStart = llmCallCount()
   const priority = options.priorityShas instanceof Set ? options.priorityShas : new Set(options.priorityShas || [])
   const prIndex = options.prIndex || await loadPrIndex(dataDir)
@@ -4504,13 +4595,11 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   // Fresh rows (no summary at all) always go before stale ones: a reader is
   // better served by a first summary of yesterday than a second of 2024.
   queueable.sort((a, b) => {
-    if (rewriteStale) {
-      const fa = a.ai?.title ? 1 : 0, fb = b.ai?.title ? 1 : 0
-      if (fa !== fb) return fa - fb
-      if (fa) {
-        const r = rewriteRank(a) - rewriteRank(b)
-        if (r) return r
-      }
+    const fa = a.ai?.title && a.ai?.summary ? 1 : 0, fb = b.ai?.title && b.ai?.summary ? 1 : 0
+    if (fa !== fb) return fa - fb
+    if (rewriteStale && fa) {
+      const r = rewriteRank(a) - rewriteRank(b)
+      if (r) return r
     }
     // Deterministic order: Array.sort is stable in node, but equal-date rows
     // (a busy day's snapshots) have equal prio AND date; sha breaks the tie so
@@ -4518,21 +4607,10 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     return prio(a) - prio(b) || (a.date < b.date ? 1 : a.date > b.date ? -1 : (a.sha < b.sha ? 1 : -1))
   })
 
-  // A row whose AI title is the mechanical label was never really summarized:
-  // it re-queues regardless of mode (167 such rows at the time of writing).
-  const isCurrent = (e) => {
-    if (force?.has(e.sha)) return false
-    if (!e.ai?.model || gaveUp(e)) return false
-    if (!rewriteIsCurrent(e, { rewriteStale, scope: rewriteScope })) return false
-    const rel = releaseOf(e)?.text || ''
-    if (e.enrichment?.policy === QUALITY_POLICY_V && e.ai.manifest?.inputIdentity !== inputIdentity(e, findPrMeta(e, prIndex), glossary, env, rel)) return false
-    return !rel || !e.ai.policy || aiDone(e, rel, RELEASE_ROLLUP_V)
-  }
-  // Rows whose only current-version records are error stubs still inside their
-  // retry window are settled before any git work: the exact-key check below
-  // would skip them anyway, but only after the patch prefetch had already
-  // paid for limit*4 candidate diffs (pool of 8 git calls per 30s cycle).
-  // Conservative on purpose: one good record for the sha and it prefetches.
+  const isCurrent = (e) => !force?.has(e.sha) && summaryCurrent(e, env, { prMeta: findPrMeta(e, prIndex), glossary, releaseCtx: releaseOf(e)?.text || '', rewriteStale, scope: rewriteScope })
+  // Only failures for this writer/input/route may avoid git work. Legacy
+  // stubs without identity are resolved at the exact-key gate, not allowed to
+  // veto a different provider, an explanation, or an explicit forced ask.
   const coolingShas = new Set()
   {
     const bySha = new Map()
@@ -4540,8 +4618,10 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       const kv = cacheKeyVersion(k)
       // Stale-version keys are dead weight, not verdicts: they say nothing
       // about the current ask and must not hold a row back from it.
-      if (!kv || (kv.kind === 'eli5' ? kv.v !== ELI5_V : kv.v !== PROMPT_V)) continue
+      if (!kv || kv.kind !== 'summary' || kv.v !== PROMPT_V) continue
       const sha = k.split(':')[0]
+      const e = entries[posIndex.get(sha)]
+      if (!e || !v?.inputIdentity || v.inputIdentity !== inputIdentity(e, findPrMeta(e, prIndex), glossary, env, releaseOf(e)?.text || '') || v.routeIdentity !== llmRouteIdentity(env) || v.releaseHash !== shortHash(releaseOf(e)?.text || '')) continue
       if (!bySha.has(sha)) bySha.set(sha, [])
       bySha.get(sha).push(v)
     }
@@ -4564,7 +4644,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     // the same row for an expensive writer round. Explicit regeneration wins.
     if (!force?.has(e.sha) && e.ai && shouldVerify(e, e.ai, env) && reverifyEligible(e.ai, { reframed: e.ai.verifyPolicy !== VERIFY_POLICY_V })) continue
     if (isCurrent(e)) continue
-    if (coolingShas.has(e.sha)) continue
+    if (!force?.has(e.sha) && coolingShas.has(e.sha)) continue
     candidates.push(e)
     if (candidates.length >= window) break
   }
@@ -4606,7 +4686,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     const key = cacheKey(e.sha, patch, relText, relText ? RELEASE_ROLLUP_V : 0, identity)
     const cached = cache[key]
     const forced = !!force?.has(e.sha)
-    if (cached?.error && !forced) {
+    if (cached?.error && !forced && (!cached.routeIdentity || cached.routeIdentity === llmRouteIdentity(env))) {
       if (!options.retryErrors) continue
       const failedAt = Date.parse(cached.at || '') || 0
       const delay = errorRetryDelayMs(cached, retryOpts)
@@ -4632,7 +4712,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     // loses the merge to a real summary, while `e.ai` is only ever replaced by
     // a successful record -- so a failed regeneration costs a call and nothing
     // else.
-    queue.push({ entry: e, patch, key, relText, sequence, prMeta, context, cf: contextFingerprint(prMeta, glossary) })
+    queue.push({ entry: e, patch, key, relText, sequence, prMeta, context, inputIdentity: inputIdentity(e, prMeta, glossary, env, relText), cf: contextFingerprint(prMeta, glossary) })
     // Reserve one recovery slot when there is enough capacity. Sustained
     // fresh work must not indefinitely starve an admitted unchecked row.
     if (queue.length >= freshLimit) break
@@ -4772,10 +4852,11 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
 
   let activeIndex = 0
   let gatewayFails = 0
+  let configurationError
 
   async function worker () {
     while (activeIndex < queue.length) {
-      if (gatewayFails >= 3 || (env.LLM_DEADLINE_AT && Date.now() >= Number(env.LLM_DEADLINE_AT))) break
+      if (configurationError || gatewayFails >= 3 || (env.LLM_DEADLINE_AT && Date.now() >= Number(env.LLM_DEADLINE_AT))) break
       const idx = activeIndex++
       const { entry: e, patch, key, relText = '', sequence = null, prMeta = null, cf = null, heal = null, staleContext = false, reverify = null } = queue[idx]
       try {
@@ -4841,7 +4922,11 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           const tries = (Number(heal.healTries) || 0) + 1
           const before = summaryDirt(heal)
           const after = summaryDirt(record)
-          const better = qualityOf({ ai: record }).verify === 'passed' && (staleContext ? after <= before : after < before)
+          // Verification stays off by policy, not by silently pretending the
+          // rewrite passed. Known objections may only clear after a real read.
+          const checked = qualityOf({ ai: record }).verify === 'passed'
+          const noPriorVerdict = !['passed', 'flagged', 'stale'].includes(qualityOf({ ai: heal }).verify) && !heal.verifyClaims?.length
+          const better = (checked || (!verifyConfigured(env) && noPriorVerdict)) && (staleContext ? after <= before : after < before)
           if (better) {
             // A clean rewrite resets the try budget: the bound exists for
             // rows that keep shipping problems, not to freeze healthy ones
@@ -4880,6 +4965,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         if (record.whyMissing) health.whyMissing++
         log(`LLM summarized ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})${record.pr ? ` [PR #${record.pr}${record.prMatched === 'files' ? ` by files, ${Math.round((record.prConfidence || 0) * 100)}%` : ''}]` : ''}${record.ungrounded ? ` [ungrounded: ${record.ungrounded.slice(0, 3).join(', ')}]` : ''}`)
       } catch (err) {
+        if (isLlmConfigError(err)) { configurationError = err; throw err }
         log(`LLM failed for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
         if (isDeterministicFailure(err)) health.deterministicErrors++
         else if (isTransientError(err)) health.transientErrors++
@@ -4922,9 +5008,11 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         }
         const transient = isTransientError(err) || callUnanswered(err)
         const prev = cache[key]
-        const attempts = (prev?.error ? Number(prev.attempts) || 1 : 0) + 1
+        const attempts = (prev?.error && (!prev.routeIdentity || prev.routeIdentity === llmRouteIdentity(env)) ? Number(prev.attempts) || 1 : 0) + 1
         const stub = (extra) => ({
           error: shortError(err).slice(0, 200),
+          routeIdentity: llmRouteIdentity(env),
+          ...(queue[idx].inputIdentity ? { inputIdentity: queue[idx].inputIdentity, releaseHash: shortHash(relText) } : {}),
           ...extra,
           ...(typeof err?.raw === 'string' && err.raw.trim() ? { raw: err.raw.replace(/\s+/g, ' ').trim().slice(0, 300) } : {}),
           attempts,
@@ -4954,7 +5042,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   }
 
   const poolSize = Math.min(concurrency, queue.length)
-  await Promise.all(Array.from({ length: poolSize }, () => worker()))
+  const workers = await Promise.allSettled(Array.from({ length: poolSize }, () => worker()))
 
   if (cacheModified) {
     const merged = mergeAiCache(await readJson(cachePath, {}), cache)
@@ -4974,6 +5062,8 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
   }
   const sent = llmCallCount() - callsAtStart
   if (apiCalls || sent) log(`LLM: ${apiCalls} ${apiCalls === 1 ? 'entry' : 'entries'} written in ${sent} API ${sent === 1 ? 'call' : 'calls'}`)
+  const failed = workers.find(w => w.status === 'rejected')
+  if (failed) throw failed.reason
   return apiCalls
 }
 
@@ -5531,6 +5621,7 @@ export function countPendingEli5 (entries) {
 }
 
 export async function enrichEli5 (entries, dataDir, env = process.env, options = {}) {
+  validateLlmConfig(env)
   if (!llmConfigured(env) || env.CHANGELOG_ELI5 === '0') return 0
   if (env.LLM_DEADLINE_AT && Date.now() >= Number(env.LLM_DEADLINE_AT)) {
     log('ELI5 pass skipped: the cycle deadline had already passed, so no row was asked')
@@ -5550,7 +5641,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   const errorCooldownMs = Number(env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
   const transientRetryMs = Number(env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
   const maxAttempts = Number(env.CHANGELOG_LLM_MAX_ATTEMPTS) > 0 ? Number(env.CHANGELOG_LLM_MAX_ATTEMPTS) : 3
-  const retryOpts = { errorCooldownMs, transientRetryMs, maxAttempts }
+  const retryOpts = { errorCooldownMs, transientRetryMs, maxAttempts, parkedRetryMs: Number(env.CHANGELOG_LLM_PARK_RETRY_MS) > 0 ? Number(env.CHANGELOG_LLM_PARK_RETRY_MS) : Infinity }
   const callsAtStart = llmCallCount()
   const priority = options.priorityShas instanceof Set ? options.priorityShas : new Set(options.priorityShas || [])
   // The patch reader the summary pass uses. The plain-English line reads the same
@@ -5606,6 +5697,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   // names (the full list still supplies same-day titles and release windows).
   const only = options.only instanceof Set ? options.only : null
   const pending = entries.filter(e => enrichmentEligible(e, env) && (!only || only.has(e.sha))).filter(eli5Eligible).filter(e => {
+    if (options.force?.has(e.sha)) return true
     const hit = releaseOf(e)
     if (eli5Done(e, hit?.text || '', hit ? RELEASE_ROLLUP_V : 0)) {
       const plain = e.eli5
@@ -5638,14 +5730,14 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     const identity = e.enrichment?.policy === QUALITY_POLICY_V ? { technical: e.ai?.manifest, model: modelFor(e, env, relText), provider: env.LLM_API_BASE, context: contextFingerprint(findPrMeta(e, prIndex), glossary), prompt: shortHash(buildEli5Prompt.toString()), policy: QUALITY_POLICY_V } : null
     const key = eli5Key(e.sha, src, relText, relText ? RELEASE_ROLLUP_V : 0, identity)
     const cached = cache[key]
-    if (cached?.error) {
+    if (cached?.error && !options.force?.has(e.sha) && (!cached.routeIdentity || cached.routeIdentity === llmRouteIdentity(env))) {
       if (!options.retryErrors) continue
       const failedAt = Date.parse(cached.at || '') || 0
       const delay = errorRetryDelayMs(cached, retryOpts)
       if (delay === Infinity) continue // parked for good
       if (Date.now() - failedAt < delay) continue
     }
-    if (cached && !cached.error && !(e.enrichment?.policy === QUALITY_POLICY_V && ['unavailable', 'stale'].includes(qualityOf({ eli5: cached }).plainVerify))) {
+    if (cached && !cached.error && !options.force?.has(e.sha) && !(e.enrichment?.policy === QUALITY_POLICY_V && ['unavailable', 'stale'].includes(qualityOf({ eli5: cached }).plainVerify))) {
       // A cache hit costs nothing but still has to land on the entry, or the
       // site renders no ELI5 line for it.
       e.eli5 = { ...cached, src: shortHash(src), ...(relText ? { ctx: shortHash(relText), rollup: RELEASE_ROLLUP_V } : {}), at: cached.at }
@@ -5654,7 +5746,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     const seqWindow = Number(env.CHANGELOG_SEQUENCE_WINDOW || 40)
     const sequence = sequenceForEntry(byDayEntries, e, seqWindow)
     const prMeta = findPrMeta(e, prIndex)
-    const reverify = e.enrichment?.policy === QUALITY_POLICY_V && verifyConfigured(env) && eli5Done(e, relText, relText ? RELEASE_ROLLUP_V : 0) && ['unavailable', 'stale'].includes(qualityOf(e).plainVerify) ? e.eli5 : null
+    const reverify = !options.force?.has(e.sha) && e.enrichment?.policy === QUALITY_POLICY_V && verifyConfigured(env) && eli5Done(e, relText, relText ? RELEASE_ROLLUP_V : 0) && ['unavailable', 'stale'].includes(qualityOf(e).plainVerify) ? e.eli5 : null
     queue.push({ entry: e, src, key, relText, sequence, prMeta, reverify })
     if (queue.length >= limit) break
   }
@@ -5663,10 +5755,11 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
 
   let activeIndex = 0
   let gatewayFails = 0
+  let configurationError
 
   async function worker () {
     while (activeIndex < queue.length) {
-      if (gatewayFails >= 3 || (env.LLM_DEADLINE_AT && Date.now() >= Number(env.LLM_DEADLINE_AT))) break
+      if (configurationError || gatewayFails >= 3 || (env.LLM_DEADLINE_AT && Date.now() >= Number(env.LLM_DEADLINE_AT))) break
       const idx = activeIndex++
       const { entry: e, src, key, relText = '', sequence = null, prMeta = null } = queue[idx]
       try {
@@ -5720,13 +5813,16 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
         cacheModified = true
         log(`ELI5 wrote ${e.sha.slice(0, 8)} (${apiCalls}/${queue.length})`)
       } catch (err) {
+        if (isLlmConfigError(err)) { configurationError = err; throw err }
         log(`ELI5 failed for ${e.sha.slice(0, 8)}: ${shortError(err)}`)
         health.explanationFailures++
         const transient = isTransientError(err) || callUnanswered(err)
         const prev = cache[key]
-        const attempts = (prev?.error ? Number(prev.attempts) || 1 : 0) + 1
+        const attempts = (prev?.error && (!prev.routeIdentity || prev.routeIdentity === llmRouteIdentity(env)) ? Number(prev.attempts) || 1 : 0) + 1
         const stub = (extra) => ({
           error: shortError(err).slice(0, 200),
+          routeIdentity: llmRouteIdentity(env),
+          ...(queue[idx].inputIdentity ? { inputIdentity: queue[idx].inputIdentity, releaseHash: shortHash(relText) } : {}),
           ...extra,
           ...(typeof err?.raw === 'string' && err.raw.trim() ? { raw: err.raw.replace(/\s+/g, ' ').trim().slice(0, 300) } : {}),
           attempts,
@@ -5756,7 +5852,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   }
 
   const poolSize = Math.min(concurrency, queue.length)
-  await Promise.all(Array.from({ length: poolSize }, () => worker()))
+  const workers = await Promise.allSettled(Array.from({ length: poolSize }, () => worker()))
 
   if (cacheModified) {
     const merged = mergeAiCache(await readJson(cachePath, {}), cache)
@@ -5769,6 +5865,8 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   // "entries" for every caller that counts rows; this is what the run spent.
   const sent = llmCallCount() - callsAtStart
   if (apiCalls || sent) log(`ELI5: ${apiCalls} ${apiCalls === 1 ? 'line' : 'lines'} written in ${sent} API ${sent === 1 ? 'call' : 'calls'}`)
+  const failed = workers.find(w => w.status === 'rejected')
+  if (failed) throw failed.reason
   if (apiCalls || sent) await recordLlmHealth(dataDir, { ...health, explanationCalls: sent })
   return apiCalls + templated
 }
@@ -6006,6 +6104,7 @@ export function buildPrPrompt (pr, diff, ctx = {}) {
 }
 
 export async function enrichOpenPrs (prs, dataDir, env = process.env, options = {}) {
+  validateLlmConfig(env)
   if (!llmConfigured(env) || env.CHANGELOG_PR_LLM === '0') return 0
   const list = Array.isArray(prs) ? prs.filter(p => p && p.number) : []
   if (!list.length) return 0
@@ -6031,12 +6130,13 @@ export async function enrichOpenPrs (prs, dataDir, env = process.env, options = 
     if (cached && !cached.error && (!pr.enrichment || cached.inputIdentity === input)) { pr.ai = { ...cached }; continue }
     // Gateway blips come back sooner than true failures -- a preview one
     // timeout away from working should not go dark for an hour.
-    if (cached?.error && ((Number(cached.attempts) || 1) >= 3 || Date.now() - (Date.parse(cached.at || '') || 0) < (cached.transient ? transientRetryMs : errorCooldownMs))) continue
+    if (cached?.error && cached.inputIdentity === input && cached.routeIdentity === llmRouteIdentity(env) && Date.now() - (Date.parse(cached.at || '') || 0) < errorRetryDelayMs(cached, { errorCooldownMs, transientRetryMs, parkedRetryMs: Number(env.CHANGELOG_LLM_PARK_RETRY_MS) > 0 ? Number(env.CHANGELOG_LLM_PARK_RETRY_MS) : Infinity })) continue
     if (!diff && !pr.body && !(pr.commitsList || []).length) continue
-    queue.push({ pr, diff, key })
+    queue.push({ pr, diff, key, input })
     if (queue.length >= limit) break
   }
-  for (const { pr, diff, key } of queue) {
+  let configurationError
+  for (const { pr, diff, key, input } of queue) {
     if (env.LLM_DEADLINE_AT && Date.now() >= Number(env.LLM_DEADLINE_AT)) break
     try {
       const prompt = buildPrPrompt(pr, diff, { architectureMap: archMap })
@@ -6049,11 +6149,11 @@ export async function enrichOpenPrs (prs, dataDir, env = process.env, options = 
       cache[key] = {
         ...clean,
         inputIdentity: shortHash(JSON.stringify({ model: env.LLM_MODEL, provider: env.LLM_API_BASE, policy: QUALITY_POLICY_V, prompt: buildPrPrompt.toString(), verifier: buildVerifyPrompt.toString() })),
-        model: env.LLM_MODEL || DEFAULT_LLM_MODEL,
+        model: servedModelOf(requests, env.LLM_MODEL || DEFAULT_LLM_MODEL),
         v: PR_PROMPT_V,
         policy: QUALITY_POLICY_V,
         manifest: evidenceManifest({ sha: `pr-${pr.number}`, prevSha: pr.updated }, diff, prompt, env.LLM_MODEL),
-        verify: verdict ? verdict.supported ? 'passed' : 'flagged' : 'unavailable',
+        ...(verifyConfigured(env) ? { verify: verdict ? verdict.supported ? 'passed' : 'flagged' : 'unavailable' } : {}),
         ...(verdict?.supported ? { verifyHash: artifactHash(clean) } : {}),
         ...(verdict && !verdict.supported ? { verifyClaims: [...verdict.issues.map(claim => ({ claim })), ...verdict.claims.filter(c => !c.supported).map(c => ({ claim: c.quote, reason: c.reason }))] } : {}),
         requests,
@@ -6069,8 +6169,10 @@ export async function enrichOpenPrs (prs, dataDir, env = process.env, options = 
       modified = true
       log(`LLM previewed PR #${pr.number} (${calls}/${queue.length})`)
     } catch (err) {
+      if (isLlmConfigError(err)) { configurationError = err; break }
       log(`LLM PR preview failed for #${pr.number}: ${shortError(err)}`)
-      cache[key] = { error: shortError(err).slice(0, 200), attempts: (Number(cache[key]?.attempts) || 0) + 1, ...(isTransientError(err) || callUnanswered(err) ? { transient: true } : {}), at: new Date().toISOString() }
+      const prev = cache[key]
+      cache[key] = { error: shortError(err).slice(0, 200), inputIdentity: input, routeIdentity: llmRouteIdentity(env), attempts: (prev?.inputIdentity === input && prev?.routeIdentity === llmRouteIdentity(env) ? Number(prev.attempts) || 0 : 0) + 1, ...(isTransientError(err) || callUnanswered(err) ? { transient: true } : {}), at: new Date().toISOString() }
       modified = true
       if (isGatewayError(err)) break
     }
@@ -6081,6 +6183,7 @@ export async function enrichOpenPrs (prs, dataDir, env = process.env, options = 
     for (const k of Object.keys(cache)) if (!live.has(k.split(':')[0])) delete cache[k]
     await writeJson(cachePath, cache)
   }
+  if (configurationError) throw configurationError
   return calls
 }
 

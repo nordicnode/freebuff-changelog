@@ -41,6 +41,8 @@ test('ELI5 accepts a response delayed beyond 60 seconds', {
   }
   const start = performance.now()
   const count = await enrichEli5([entry], dir, {
+    CHANGELOG_LLM_NO_BACKFILL: '0', CHANGELOG_LLM_VERIFY: '0',
+    CHANGELOG_ELI5_ROW_BUDGET_MS: '75000',
     CHANGELOG_LLM: '1', LLM_API_KEY: 'test', LLM_MODEL: 'slow-mock',
     LLM_API_BASE: `http://127.0.0.1:${server.address().port}/v1`, LLM_TIMEOUT_MS: '300000'
   })

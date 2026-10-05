@@ -18,7 +18,8 @@ Build and tests never call an LLM.
 node generator/cli.mjs generate [--full] [--push]   # fetch upstream, deterministic changes only
 node generator/cli.mjs catch-up [--push]            # sync plus bounded enrichment of newly admitted rows
 node generator/cli.mjs watch [--push]               # long-running catch-up loop
-node generator/cli.mjs freshness                    # data staleness check
+node generator/cli.mjs freshness                    # ingestion staleness check
+node generator/cli.mjs generation-health            # overdue admitted text (offline, 30m budget)
 node generator/cli.mjs eval [--limit N]             # offline stored-artifact audit
 node generator/cli.mjs override <sha>               # draft a human correction
 ```
@@ -32,7 +33,7 @@ node generator/cli.mjs override <sha>               # draft a human correction
 - **Trust boundary.** Source hunks, PR text and older summaries are untrusted data in a separate message; PR matches fail closed. A recorded verdict binds to the exact published text, and editing checked text invalidates it.
 - **Disclosure.** Objections and stored verdicts live in each entry's Evidence block and in the API `quality` record. A provider outage gets a quiet *automated review is pending* note, pre-policy text says it was never checked, and a missing verdict prints nothing and stays visible only as its status. No `[UNVERIFIED]` marker is stamped anywhere, and objection text does not travel with feeds, digests, Discord copy or release notes.
 - **Verification is off by operator decision (2026-10-02).** New rows carry no verdict and never claim to be checked; existing verdicts are kept, unconfirmed breaking/migration steps stay demoted, and confidence stays capped. When enabled, the verifier does an exact-text, claim-by-claim second read and owes one bounded re-read after an outage.
-- **Limits.** Fixed 270,000-token context contract, streaming requests (the non-streaming path times out), a 60 requests/minute account ceiling, and per-cycle and per-row wall-clock budgets.
+- **Limits.** Fixed 512,000-token context contract, streaming requests (the non-streaming path times out), a 60 requests/minute account ceiling, and per-cycle and per-row wall-clock budgets.
 
 ## Configuration
 
@@ -41,9 +42,11 @@ node generator/cli.mjs override <sha>               # draft a human correction
 | `CHANGELOG_LLM=1` + `LLM_API_KEY` | Enables enrichment of admitted new rows |
 | `LLM_API_BASE`, `LLM_MODEL` | Writer route and model (`https://apihub.agnes-ai.com/v1`, `agnes-3.0-flash`) |
 | `LLM_VERIFY_MODEL` | Verifier model (`agnes-3.0-flash`); a same-family check is not a human audit |
-| `LLM_BACKUP_API_BASE`, `LLM_BACKUP_API_KEY`, `LLM_BACKUP_MODEL` | One failover read (Google `gemini-3.6-flash`) on gateway/transport failures only |
+| `LLM_BACKUP_API_BASE`, `LLM_BACKUP_API_KEY`, `LLM_BACKUP_MODEL` | Failover to the configured backup on gateway/transport failures, refusals, or model-memory answers |
 | `CHANGELOG_LLM_VERIFY` | `all` (default), `1` selective, `0` off; the relay runs `0` |
-| `CHANGELOG_LLM_RPM` | Requests/minute ceiling (default 60; can only go lower) |
+| `CHANGELOG_LLM_RPM` | Requests/minute ceiling (default 60; can only go lower); set to your Agnes account entitlement |
+| `CHANGELOG_LLM_PARK_RETRY_MS` | Re-probe repeatedly failing rows at a bounded interval (relay: once daily; unset: parked until input/provider changes) |
+| `CHANGELOG_GENERATION_STALE_MIN` | Independent missing-text health budget from durable admission (default 30 minutes) |
 | `CHANGELOG_LLM_CYCLE_BUDGET_MS` | Model-call wall clock per cycle (default 300,000) |
 | `CHANGELOG_LLM_ROW_BUDGET_MS`, `CHANGELOG_ELI5_ROW_BUDGET_MS` | Wall clock one row may spend (defaults 90,000 / 45,000) |
 | `CHANGELOG_LLM_LIMIT`, `CHANGELOG_ELI5_LIMIT` | Per-cycle row limits |
@@ -51,7 +54,7 @@ node generator/cli.mjs override <sha>               # draft a human correction
 | `CHANGELOG_SYNC_STALE_MIN` | Freshness budget (default 5 minutes; the gate fails at twice this) |
 | `SITE_URL` | Deployment and feed URL |
 
-CLI commands load local environment configuration (`.env`). No setting can raise the token window or the account's RPM ceiling.
+CLI commands load local environment configuration (`.env`). No setting can raise the token window or the configured RPM ceiling. Agnes rate limits are account-specific; 60 is the inherited safety cap, not a claimed Agnes entitlement. Invalid URLs and authentication failures fail the paid process without creating row failure stubs; deterministic updates publish first.
 
 ## Data and outputs
 
@@ -62,7 +65,9 @@ CLI commands load local environment configuration (`.env`). No setting can raise
 
 - [generator-check](.github/workflows/generator-check.yml) runs syntax, build and the offline test suite on code changes.
 - [changelog-sync](.github/workflows/changelog-sync.yml) polls upstream every ~30s under a ten-minute watchdog, publishes deterministic data first, then spends a bounded paid window. It runs the latest push-tested compatible generator against current data; bootstrap needs one green generator-check.
-- [deploy](.github/workflows/deploy.yml) builds and uploads static assets, then verifies the served head and freshness.
+- [deploy](.github/workflows/deploy.yml) builds and uploads static assets, then probes the served head and timestamp with bounded propagation retries.
+- Sync and deploy run an independent generation-completeness gate after publishing. `/api/status.json` exposes admitted missing-summary/explanation counts, overdue SHAs, repair needs, and pending reviews. Intentionally unchecked text and historical rows outside admission are not missing-generation failures.
+- Provider/input changes release obsolete cooldowns; explicit named regeneration bypasses current cooldowns for both artifacts. Same-input attempts survive retries, and the relay re-probes repeatedly failing rows at most daily under the existing spending limits.
 - History compaction is a read-only size audit; no force pushes or orphan branches.
 
 Details live in `generator/lib/`, `generator/test/` and `.github/workflows/`.

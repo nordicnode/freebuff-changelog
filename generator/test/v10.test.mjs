@@ -116,7 +116,7 @@ test('summarizeChunked: maps chunks then fuses, validated on the full corpus', a
   }
   try {
     const { clean, fuse } = await summarizeChunked(entry, patch, {
-      promptCtx: { structured: entry.structured }, corpus: patch, sig: 'notable', env: {}
+      promptCtx: { structured: entry.structured }, corpus: patch, sig: 'notable', env: { LLM_API_KEY: 'offline-test', LLM_API_BASE: 'https://example.invalid/v1' }
     })
     assert.ok(seen.length >= 2, `expected map + fuse calls, got ${seen.length}`)
     assert.match(fuse, /UNTRUSTED/)
