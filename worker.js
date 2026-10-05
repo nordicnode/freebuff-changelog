@@ -35,9 +35,8 @@ const ASK = {
   rpm: 5,
   timeoutMs: 25000,
   maxRetries: 1,
-  // The provider's gateway sits behind its own Cloudflare zone and the relay
-  // shares this account, so an ask can land on a gateway rate limit (their
-  // error 1015) instead of on the model. Ride it out inside the ask's budget:
+  // The provider's gateway sits behind its own Cloudflare zone, so an ask can
+  // land on a gateway rate limit (their error 1015) instead of on the model. Ride it out inside the ask's budget:
   // honor Retry-After when sent, cap each wait so an interactive question never
   // parks on someone else's window, and bound the ladder.
   rateRetries: 2,
