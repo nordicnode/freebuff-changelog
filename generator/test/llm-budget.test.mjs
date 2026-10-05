@@ -309,7 +309,7 @@ test('day roll-up route: enabled only by base+key, carrying its own plan and no 
   assert.equal(stage.LLM_MAX_PER_HOUR, 500)
   assert.equal(stage.LLM_MAX_PER_DAY, 2500)
   assert.equal(stage.LLM_MAX_CONCURRENT, 3)
-  assert.equal(llmRpm(stage), 20, 'bounded by its own rate, not by the 40 RPM contract')
+  assert.equal(llmRpm(stage), 20, 'bounded by its own rate, not by the 60 RPM contract')
   assert.equal(ROLLUP_LLM_STAGE.rpm, 20)
   assert.equal(ROLLUP_LLM_STAGE.concurrency, 3)
 

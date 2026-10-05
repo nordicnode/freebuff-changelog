@@ -295,21 +295,21 @@ test('release quality: a functional release rejects packaging boilerplate withou
 })
 
 test('provider rate limit: invalid settings cannot disable or exceed the provider RPM contract', () => {
-  // The cap is the project provider's account limit (VyceAI, 40 RPM). Whatever
+  // The cap is the project provider's account limit (VyceAI, 60 RPM). Whatever
   // it is, no configuration may raise it, and none may disable it.
-  for (const value of [undefined, '', '0', '-1', 'NaN', 'Infinity', '41', '1000']) assert.equal(llmRpm({ CHANGELOG_LLM_RPM: value }), 40)
+  for (const value of [undefined, '', '0', '-1', 'NaN', 'Infinity', '61', '1000']) assert.equal(llmRpm({ CHANGELOG_LLM_RPM: value }), 60)
   assert.equal(llmRpm({ CHANGELOG_LLM_RPM: '30' }), 30)
   assert.equal(llmRpm({ CHANGELOG_LLM_RPM: '1.5' }), 1)
 })
 
-test('provider rate limit: a route that states its own rate is bounded by it, not by the 40 RPM contract', () => {
+test('provider rate limit: a route that states its own rate is bounded by it, not by the 60 RPM contract', () => {
   // A stage can be pointed at a different provider with a different plan (the
   // daily roll-up runs on one at 20/minute). Its number is its ceiling: it must
-  // not read as VyceAI's 40, and VyceAI's ceiling must not be applied to it.
-  assert.equal(llmRpm({ LLM_RPM: '20', CHANGELOG_LLM_RPM: '40' }), 20)
-  assert.equal(llmRpm({ LLM_RPM: '90', CHANGELOG_LLM_RPM: '40' }), 90)
+  // not read as VyceAI's 60, and VyceAI's ceiling must not be applied to it.
+  assert.equal(llmRpm({ LLM_RPM: '20', CHANGELOG_LLM_RPM: '60' }), 20)
+  assert.equal(llmRpm({ LLM_RPM: '90', CHANGELOG_LLM_RPM: '60' }), 90)
   for (const value of ['', '0', '-1', 'NaN', 'Infinity']) {
-    assert.equal(llmRpm({ LLM_RPM: value, CHANGELOG_LLM_RPM: '40' }), 40, `an unusable ${JSON.stringify(value)} falls back to the contract`)
+    assert.equal(llmRpm({ LLM_RPM: value, CHANGELOG_LLM_RPM: '60' }), 60, `an unusable ${JSON.stringify(value)} falls back to the contract`)
   }
   assert.equal(llmRpm({ LLM_RPM: '1.9' }), 1)
   // The quota numbers beside it: unset or invalid means "no limit of that kind".

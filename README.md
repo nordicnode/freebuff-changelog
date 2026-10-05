@@ -32,7 +32,7 @@ node generator/cli.mjs override <sha>               # draft a human correction
 - **Trust boundary.** Source hunks, PR text and older summaries are untrusted data in a separate message; PR matches fail closed. A recorded verdict binds to the exact published text, and editing checked text invalidates it.
 - **Disclosure.** Objections and stored verdicts live in each entry's Evidence block and in the API `quality` record. A provider outage gets a quiet *automated review is pending* note, pre-policy text says it was never checked, and a missing verdict prints nothing and stays visible only as its status. No `[UNVERIFIED]` marker is stamped anywhere, and objection text does not travel with feeds, digests, Discord copy or release notes.
 - **Verification is off by operator decision (2026-10-02).** New rows carry no verdict and never claim to be checked; existing verdicts are kept, unconfirmed breaking/migration steps stay demoted, and confidence stays capped. When enabled, the verifier does an exact-text, claim-by-claim second read and owes one bounded re-read after an outage.
-- **Limits.** Fixed 270,000-token context contract, streaming requests (the non-streaming path times out), a 40 requests/minute account ceiling, and per-cycle and per-row wall-clock budgets.
+- **Limits.** Fixed 270,000-token context contract, streaming requests (the non-streaming path times out), a 60 requests/minute account ceiling, and per-cycle and per-row wall-clock budgets.
 
 ## Configuration
 
@@ -43,7 +43,7 @@ node generator/cli.mjs override <sha>               # draft a human correction
 | `LLM_VERIFY_MODEL` | Verifier model (`deepseek-v4.1`); a same-family check is not a human audit |
 | `LLM_BACKUP_API_BASE`, `LLM_BACKUP_API_KEY`, `LLM_BACKUP_MODEL` | One failover read (Google `gemini-3.6-flash`) on gateway/transport failures only |
 | `CHANGELOG_LLM_VERIFY` | `all` (default), `1` selective, `0` off; the relay runs `0` |
-| `CHANGELOG_LLM_RPM` | Requests/minute ceiling (default 40; can only go lower) |
+| `CHANGELOG_LLM_RPM` | Requests/minute ceiling (default 60; can only go lower) |
 | `CHANGELOG_LLM_CYCLE_BUDGET_MS` | Model-call wall clock per cycle (default 300,000) |
 | `CHANGELOG_LLM_ROW_BUDGET_MS`, `CHANGELOG_ELI5_ROW_BUDGET_MS` | Wall clock one row may spend (defaults 90,000 / 45,000) |
 | `CHANGELOG_LLM_LIMIT`, `CHANGELOG_ELI5_LIMIT` | Per-cycle row limits |

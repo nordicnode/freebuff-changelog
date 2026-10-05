@@ -1582,19 +1582,16 @@ export function shortError (err) {
 
 // One provider budget across models, stages and retries, never an entry budget.
 //
-// 40 is the project provider's own account limit (VyceAI). It used to be 60,
-// which the relay's workflow also configured by default, so every paid stage
-// asked for more than the plan allows: the gateway answers 429, the in-call
-// retries spend the row's budget on throttles, and rows go ungenerated for a
-// reason that has nothing to do with the model. Verification is the single
-// biggest consumer of these slots, which is why turning it off frees real
-// capacity for writing. A lower operator value still binds; a higher one cannot.
-export const LLM_PROVIDER_RPM = 40
+// 60 is the project provider's own account limit (VyceAI). A lower operator
+// value still binds; a higher one cannot. Verification is the single biggest
+// consumer of these slots, which is why turning it off frees real capacity
+// for writing.
+export const LLM_PROVIDER_RPM = 60
 export function llmRpm (env = {}) {
   // A route that names its own rate is bounded by that number instead: it is a
   // different provider with a different plan (the daily roll-up can be pointed
   // at one), and clamping it to *this* provider's ceiling would either throttle
-  // it wrongly or, worse, let a configured 20/min read as 40/min. Unset or
+  // it wrongly or, worse, let a configured 20/min read as 60/min. Unset or
   // invalid falls through to the contract below, which no configuration may
   // raise.
   const route = Number(env.LLM_RPM)
