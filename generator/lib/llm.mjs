@@ -1994,14 +1994,19 @@ export function rollupLlmEnv (env = process.env) {
 
 // Is this failure one a second route could fix? 5xx, connection faults,
 // response timeouts, 408 and an exhausted 429 wait say something about the
-// route. Content and configuration failures do not: a 400/401/403, a validator
-// rejection or a refusal would fail the same way on the backup, and a bad key
-// must surface on the route that owns it rather than be retried elsewhere.
+// route. A model answering from its own training memory is also route-specific:
+// a different family (different cutoff, different memorized models) may answer
+// the same diff cleanly, while re-asking the same family returns the same
+// byte-identical memory answer. Refusals stay on the primary: the prompt
+// trigger (instruction-like product text) fails the same way on any family,
+// and a bad key must surface on the route that owns it rather than be retried
+// elsewhere.
 // Our own cycle guards (deadline, entry budget) are neither -- they interrupt
 // the run and say nothing about either route.
 export function isRouteFailure (err) {
   const msg = String(err?.message || err || '')
   if (/deadline|budget exceeded/i.test(msg)) return false
+  if (/answered from model memory/i.test(msg)) return true
   if (/HTTP (?:5\d\d|408|429)\b/.test(msg)) return true
   return isGatewayError(err)
 }

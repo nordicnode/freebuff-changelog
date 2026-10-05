@@ -1402,6 +1402,21 @@ async function catchUpOnce (argv, budgets = {}) {
   }
 }
 
+// Which queued runs should make this runner yield? Only runs created after
+// this runner started: a stale `queued` left behind by a cancelled run, or a
+// transient API ghost, must not end a healthy 12-minute run after one cycle.
+// Pure for tests: `runs` are `{ status, createdAt }`, `startTime` is ms.
+export function incomingQueuedRuns (runs = [], startTime = 0) {
+  const wanted = new Set(['requested', 'queued', 'pending', 'waiting'])
+  let n = 0
+  for (const r of runs || []) {
+    if (!r || !wanted.has(r.status)) continue
+    const created = Date.parse(r.createdAt || '') || 0
+    if (created > startTime) n++
+  }
+  return n
+}
+
 export async function cmdWatch (argv, { cycle = cmdCatchUp, errorBudget } = {}) {
   let intervalSec = 60
   const idx = argv.indexOf('--interval')
@@ -1441,6 +1456,7 @@ export async function cmdWatch (argv, { cycle = cmdCatchUp, errorBudget } = {}) 
   let cyclesOk = 0
   let consecutiveErrors = 0
   let lastError = null
+  let queuedStrikes = 0
   // Give up once errors have stretched over the loop's own freshness budget
   // rather than the full duration: an abort retries in the next relay run
   // instead of burning 12 minutes of a runner to publish nothing.
@@ -1483,11 +1499,23 @@ export async function cmdWatch (argv, { cycle = cmdCatchUp, errorBudget } = {}) 
         // `requested` is the transient status before `queued`; skipping the
         // count once a dispatched run is still landing is what lets a
         // duplicate through, so count it while it is too early to see.
-        const cmd = 'gh run list --workflow changelog-sync.yml --json databaseId,status --jq \'[.[] | select(.status == "requested" or .status == "queued" or .status == "pending" or .status == "waiting")] | length\''
-        const queuedCount = Number(execSync(cmd, { encoding: 'utf8' }).trim()) || 0
+        // Only runs created after this runner started count: a stale queued
+        // entry (or a transient API ghost) must not end a healthy run after
+        // one cycle and break the relay chain behind it. Debounced: a single
+        // sighting is logged but the run continues; two in a row yields.
+        const out = execSync('gh run list --workflow changelog-sync.yml --json databaseId,status,createdAt', { encoding: 'utf8' })
+        let runs = []
+        try { runs = JSON.parse(out || '[]') } catch { runs = [] }
+        const queuedCount = incomingQueuedRuns(runs, startTime)
         if (queuedCount > 0) {
-          log(`[watch] detected ${queuedCount} incoming workflow run(s) (status requested/queued/pending): yielding to incoming runner.`)
-          break
+          if (cyclesOk >= 2 && queuedStrikes >= 1) {
+            log(`[watch] detected ${queuedCount} incoming workflow run(s) (created after this runner started): yielding to incoming runner.`)
+            break
+          }
+          queuedStrikes++
+          log(`[watch] saw ${queuedCount} incoming workflow run(s); continuing this run (strike ${queuedStrikes}/2, ${cyclesOk} cycle(s) done).`)
+        } else {
+          queuedStrikes = 0
         }
       } catch (_) {}
     }

@@ -14,7 +14,7 @@ import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { commitAndPushData, refreshDiffFlags, cmdWatch, cmdFreshness } from '../cli.mjs'
+import { commitAndPushData, refreshDiffFlags, cmdWatch, cmdFreshness, incomingQueuedRuns } from '../cli.mjs'
 import { pruneDiffs } from '../lib/util.mjs'
 import { mergeChangelog } from '../lib/mergedata.mjs'
 import { loadChangelog } from '../lib/changelog-store.mjs'
@@ -319,5 +319,25 @@ test('cmdFreshness fails CI on data the site would render as [stale]', async () 
   await write('not a timestamp')
   await assert.rejects(() => cmdFreshness([], { dataDir: `${dir}/data`, now, env }),
     /no readable generatedAt/, 'an unparseable stamp is never "fresh"')
+})
+
+test('incomingQueuedRuns counts only runs created after this runner started', () => {
+  const start = Date.parse('2026-10-05T15:30:00Z')
+  assert.equal(incomingQueuedRuns([], start), 0, 'no runs, no yield')
+  assert.equal(incomingQueuedRuns([
+    { status: 'queued', createdAt: '2026-10-05T15:31:00Z' }
+  ], start), 1, 'a run created after start is incoming')
+  assert.equal(incomingQueuedRuns([
+    { status: 'queued', createdAt: '2026-10-05T15:29:00Z' }
+  ], start), 0, 'a stale queued entry from before start is not incoming')
+  assert.equal(incomingQueuedRuns([
+    { status: 'completed', createdAt: '2026-10-05T15:31:00Z' },
+    { status: 'in_progress', createdAt: '2026-10-05T15:31:00Z' }
+  ], start), 0, 'completed and in-progress never yield')
+  assert.equal(incomingQueuedRuns([
+    { status: 'waiting', createdAt: '2026-10-05T15:31:00Z' },
+    { status: 'requested', createdAt: '2026-10-05T15:31:00Z' },
+    { status: 'pending', createdAt: '2026-10-05T15:29:00Z' }
+  ], start), 2, 'waiting/requested count, stale pending does not')
 })
 
