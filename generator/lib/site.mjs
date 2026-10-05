@@ -302,10 +302,19 @@ updateSyncAge();
   onScroll();
 })();
 
-// Automatically pick up new entries when they land without requiring manual refresh.
-// Polls /api/status.json every 30s or on tab return. If a new commit or entry is detected:
-// - If reader is near the top and not typing, reloads seamlessly.
-// - If reader is scrolled deep down reading, reloads once they scroll back up or switch tabs.
+// Keep the page's own numbers current without ever taking the page away from
+// the reader. Polls /api/status.json every 30s or on tab return and paints in
+// place: the traffic counters, the sync widget's age and stale state, and the
+// [update ready] chip when head/changes/generatedAt have moved.
+//
+// This used to reload the whole page the moment new data landed -- near the top
+// immediately, otherwise on the next scroll-up or tab return. It was the wrong
+// trade: the relay publishes every minute or two, so the chip was almost always
+// armed, and an unconditional reload on focus threw away whatever the reader was
+// doing. It was reported for the Ask box, where a rendered answer vanished
+// seconds later, but the same applied to a long comment thread or a half-filled
+// form. Freshness stays visible in the widget; refreshing is the reader's
+// decision.
 (function autoUpdate() {
   const path = location.pathname;
   if (path !== '/' && path !== '/index.html') return;
@@ -314,17 +323,6 @@ updateSyncAge();
   const initialGenerated = el.dataset.generated;
   const initialHead = el.dataset.head || '';
   const initialChanges = el.dataset.changes || '';
-  const flag = 'fbReload:' + initialGenerated;
-
-  let updatePending = false;
-
-  function tryReload() {
-    const isTyping = document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA');
-    if (isTyping) return false;
-    if (window.scrollY > 300) return false;
-    location.reload();
-    return true;
-  }
 
   async function check() {
     try {
@@ -344,27 +342,15 @@ updateSyncAge();
       }
 
       if (window.fbSyncPaint) window.fbSyncPaint(data, headChanged || changesChanged || genChanged);
-      if (headChanged || changesChanged || genChanged) {
-        updatePending = true;
-        if (!tryReload()) {
-          window.addEventListener('scroll', function onScrollUp() {
-            if (tryReload()) window.removeEventListener('scroll', onScrollUp);
-          }, { passive: true });
-        }
-      }
     } catch (_) {}
   }
 
   setInterval(check, 30000);
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) return;
-    if (updatePending) { location.reload(); return; }
     check();
   });
-  window.addEventListener('focus', () => {
-    if (updatePending) { location.reload(); return; }
-    check();
-  });
+  window.addEventListener('focus', check);
 })();
 
 function openHashTarget() {
@@ -2294,9 +2280,8 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
     // The footer on `/` is a live claim: HEAD and how old the data is.
     // Every other day is settled, so it states the stamp it was built from and
     // deliberately carries no `.sync-age`/`data-generated` hook -- that is the
-    // element the shell's aging and reload-when-behind logic looks for, and an
-    // auto-refresh while someone reads July 2024 would yank the page out from
-    // under them.
+    // element the shell's aging and status poll looks for, and it only runs on
+    // `/`; an update chip while someone reads July 2024 would be noise.
     const freshness = latest
       ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}" data-head="${esc(changelog.headSha || '')}" data-changes="${meaningful.length}">${esc(fmtDateHuman(generated))} UTC</span></span>`
       : `<span>DATA AS OF ${esc(String(generated).slice(0, 16).replace('T', ' '))} UTC</span>

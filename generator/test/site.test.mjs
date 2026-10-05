@@ -407,9 +407,11 @@ test('buildSite generates valid static site output', async () => {
     assert.equal(ruleFor(rules, '/og/*.png').headers['content-type'], 'image/png')
 
     // The header widget must key off the budget, and a backgrounded tab must not
-    // sit on an old stamp forever once the loop has moved on.
+    // sit on an old stamp forever once the loop has moved on -- so the poll
+    // repaints in place. It must never reload: the reader's scroll position,
+    // open diff, and half-finished Ask-the-AI question all live in this document.
     assert.match(indexHtml, /budgetMin \* 2/)
-    assert.match(indexHtml, /fbReload:/)
+    assert.doesNotMatch(indexHtml, /location\.reload\(/, 'the homepage never reloads itself')
     assert.match(indexHtml, /visibilitychange/)
     assert.match(indexHtml, /data-head=/, 'sync-age includes commit head sha')
     assert.match(indexHtml, /\/api\/status\.json/, 'client auto-updater polls status API')
@@ -631,7 +633,7 @@ test('buildSite generates valid static site output', async () => {
     assert.ok(rowTags(indexHtml).every(t => t.includes('data-sig="')), 'every row is filterable by impact')
     assert.equal(rowTags(indexHtml).filter(t => !isHidden(t)).length, 2, 'one day per page: two changes, its churn row hidden')
     // Progressive enhancement only: guarded on the bar existing, keeps its state
-    // across the auto-reload, and hides a day whose rows all filtered out instead
+    // for the session, and hides a day whose rows all filtered out instead
     // of leaving a stray date header.
     assert.match(indexHtml, /getElementById\('filters'\)/)
     assert.match(indexHtml, /fbIndexFilter/)
@@ -872,6 +874,12 @@ test('inline scripts: template escaping preserves regex backslashes', async () =
         await wf(join(tmpDist, 'inline-check.mjs'), js)
         execFileSync('node', ['--check', join(tmpDist, 'inline-check.mjs')])
       }
+      // The page never takes itself away from the reader. The status poll used to
+      // reload the moment new data landed (and unconditionally on tab return),
+      // which discarded whatever was in flight -- reported against Ask-the-AI,
+      // where an answer vanished seconds after it rendered. Freshness is shown
+      // by the sync widget's [update ready] chip instead.
+      assert.doesNotMatch(html, /location\.reload\(/, `${f} never reloads itself`)
       // Backslash regexes survived template escaping intact
       if (f !== 'search/index.html') assert.match(html, /split\(\/\\r\?\\n\/\)/)
     }
