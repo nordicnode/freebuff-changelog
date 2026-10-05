@@ -15,7 +15,7 @@ import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
   extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
-import {  enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, verifyConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows, shortError, errorRetryDelayMs } from './lib/llm.mjs'
+import {  enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, verifyConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows, shortError, errorRetryDelayMs, cacheKeyVersion } from './lib/llm.mjs'
 import { QUALITY_POLICY_V, generationState, regenUnfinished } from './lib/quality.mjs'
 import { shortHash, eli5Source } from './lib/util.mjs'
 import { EVIDENCE_WIDTH_WARN, evidenceStats, gcEvidence, liveEvidenceHashes, spillEntryEvidence, spillEvidence } from './lib/evidence.mjs'
@@ -1240,7 +1240,11 @@ async function catchUpOnce (argv, budgets = {}) {
     let cooling = 0, parked = 0
     for (const e of unsummarized) {
       const recs = Object.entries(cache)
-        .filter(([k, v]) => k.split(':')[0] === e.sha && v?.error && (v?.v ?? 1) >= 1)
+        .filter(([k, v]) => {
+          if (k.split(':')[0] !== e.sha || !v?.error) return false
+          const kv = cacheKeyVersion(k)
+          return kv && kv.kind !== 'eli5' && kv.v === PROMPT_V
+        })
         .map(([, v]) => v)
       if (!recs.length) continue
       if (recs.some(r => !r.error)) continue
