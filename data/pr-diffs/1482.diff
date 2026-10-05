@@ -13800,10 +13800,10 @@ index 0000000000..dddbc853e5
 +}))
 diff --git a/Apps/agent-voice/worker/README.md b/Apps/agent-voice/worker/README.md
 new file mode 100644
-index 0000000000..895a06652b
+index 0000000000..5f6e4920e1
 --- /dev/null
 +++ b/Apps/agent-voice/worker/README.md
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,143 @@
 +# License worker
 +
 +Cloudflare Worker + KV that turns a paid Paddle transaction into a signed
@@ -13828,6 +13828,34 @@ index 0000000000..895a06652b
 +
 +Status codes the app understands: `400` malformed code, `403/404` unknown
 +purchase, `409` device cap, `410` revoked, `429` rate limited.
++
++## Signature verification
++
++Paddle sends only two relevant headers, and the contract is easy to get wrong:
++
++```
++Paddle-Signature: ts=<unix seconds>;h1=<hex digest>
++
++h1 = HMAC-SHA256(secret, `<ts>:` + <raw request body>)
++```
++
++Consequences the worker honours:
++
++- The **timestamp** is part of the signed bytes, not just the body — signing
++  the body alone, or the event type plus the body, produces a digest Paddle
++  never sends.
++- There is **no event-type header**. `event_type` is a field in the payload, so
++  it can only be read _after_ the signature verifies.
++- The body must be read as raw bytes and verified before any parsing or
++  re-serialising; whitespace changes the digest.
++- `h1` is compared in constant time, and `ts` must be within
++  `SIGNATURE_TOLERANCE_SECONDS` (5 minutes) of now to blunt replay. Paddle's
++  own SDKs use 5 seconds; the wider window buys delivery headroom because every
++  action here is idempotent.
++
++Reference: <https://developer.paddle.com/webhooks/signature-verification>.
++Verified against Paddle's own webhook simulator, which is how the original
++`eventType:body` implementation was caught.
 +
 +## Deploy
 +
@@ -13921,10 +13949,10 @@ index 0000000000..895a06652b
 +a body edited after signing) and rate limiting.
 diff --git a/Apps/agent-voice/worker/src/index.ts b/Apps/agent-voice/worker/src/index.ts
 new file mode 100644
-index 0000000000..8a6adfc27d
+index 0000000000..91964ba6dc
 --- /dev/null
 +++ b/Apps/agent-voice/worker/src/index.ts
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,249 @@
 +/** Cloudflare Worker: the license backend.
 + *
 + * Routes:
@@ -13947,6 +13975,8 @@ index 0000000000..8a6adfc27d
 +  isTransactionId,
 +  licenseCodeFromEvent,
 +  parseSignatureHeader,
++  signaturesMatch,
++  timestampIsFresh,
 +  type PaddleWebhookPayload,
 +} from './paddle'
 +import {
@@ -14114,27 +14144,43 @@ index 0000000000..8a6adfc27d
 +}
 +
 +async function webhook(request: Request, env: Env): Promise<Response> {
++  // Signature verification runs over the *raw* bytes, before any parsing.
 +  const body = await request.text()
-+  const eventType = request.headers.get('Paddle-Event-Type') ?? ''
 +  const signature = request.headers.get('Paddle-Signature') ?? ''
 +  const parsed = parseSignatureHeader(signature)
 +
-+  if (!eventType) return fail('missing Paddle-Event-Type', 400)
 +  if (!parsed) return fail('missing or malformed Paddle-Signature', 401)
 +  if (!env.PADDLE_WEBHOOK_SECRET) {
 +    return fail('webhook secret is not configured', 500)
 +  }
++
++  const nowSeconds = Math.floor(Date.now() / 1000)
++  if (!timestampIsFresh(parsed.ts, nowSeconds)) {
++    return fail('signature timestamp outside the accepted window', 401)
++  }
 +  const expected = await expectedSignature(
-+    eventType,
++    parsed.ts,
 +    body,
 +    env.PADDLE_WEBHOOK_SECRET,
 +  )
-+  if (expected !== parsed.h1) return fail('signature mismatch', 401)
++  if (!signaturesMatch(expected, parsed.h1)) {
++    return fail('signature mismatch', 401)
++  }
++
++  // Verified — only now is the payload safe to parse.
++  let payload: PaddleWebhookPayload
++  try {
++    payload = (JSON.parse(body) as PaddleWebhookPayload) ?? {}
++  } catch {
++    return fail('invalid JSON body', 400)
++  }
++  // Paddle sends no event-type header; `event_type` is a payload field.
++  const eventType = payload.event_type ?? ''
++  if (!eventType) return fail('missing event_type', 400)
 +
 +  const action = actionForEvent(eventType)
 +  if (action === 'ignore') return json({ ok: true, action, handled: false })
 +
-+  const payload = (JSON.parse(body) as PaddleWebhookPayload) ?? {}
 +  // `adjustment.created` covers refunds, chargebacks *and* harmless credits, so
 +  // the action decides whether the license actually goes away.
 +  if (action === 'revoke' && !adjustmentRevokes(payload.data?.action)) {
@@ -14144,7 +14190,6 @@ index 0000000000..8a6adfc27d
 +  const licenseCode = licenseCodeFromEvent(payload)
 +  if (!licenseCode) return json({ ok: true, action, handled: false })
 +
-+  const nowSeconds = Math.floor(Date.now() / 1000)
 +  const ids = idsFromEvent(payload)
 +  if (action === 'activate') {
 +    await activateLicense(env.LICENSES, licenseCode, nowSeconds, ids)
@@ -14159,14 +14204,20 @@ index 0000000000..8a6adfc27d
 +} satisfies ExportedHandler<Env>
 diff --git a/Apps/agent-voice/worker/src/paddle.ts b/Apps/agent-voice/worker/src/paddle.ts
 new file mode 100644
-index 0000000000..51970491aa
+index 0000000000..85d729a096
 --- /dev/null
 +++ b/Apps/agent-voice/worker/src/paddle.ts
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,177 @@
 +/** Paddle webhook verification and event handling.
 + *
 + * Paddle signs each webhook with HMAC-SHA256 over
-+ * `"<Paddle-Event-Type>:<body>"` and sends the digest in `Paddle-Signature`.
++ * `"<unix timestamp>:<raw request body>"` and sends
++ * `Paddle-Signature: ts=<unix>;h1=<hex digest>`. The raw body must be
++ * verified *before* parsing it, and any whitespace change breaks the
++ * signature. See https://developer.paddle.com/webhooks/signature-verification
++ *
++ * Paddle does not send an event-type header: the event type is a field inside
++ * the payload (`event_type`), so it can only be read after the body verifies.
 + */
 +
 +export interface PaddleSignatureHeader {
@@ -14191,8 +14242,13 @@ index 0000000000..51970491aa
 +    .join('')
 +}
 +
++/** The exact bytes Paddle signs: `<timestamp>:<raw body>`. */
++export function signingPayload(timestamp: string, body: string): string {
++  return `${timestamp}:${body}`
++}
++
 +export async function expectedSignature(
-+  eventType: string,
++  timestamp: string,
 +  body: string,
 +  secret: string,
 +): Promise<string> {
@@ -14206,9 +14262,42 @@ index 0000000000..51970491aa
 +  const mac = await crypto.subtle.sign(
 +    'HMAC',
 +    key,
-+    new TextEncoder().encode(`${eventType}:${body}`) as BufferSource,
++    new TextEncoder().encode(signingPayload(timestamp, body)) as BufferSource,
 +  )
 +  return toHex(mac)
++}
++
++/**
++ * Timing-safe equality for two hex digests. `crypto.subtle.verify` would be
++ * the usual choice, but it needs the algorithm and key again here; a fixed
++ * comparison of equal-length hex is sufficient and avoids leaking early.
++ */
++export function signaturesMatch(a: string, b: string): boolean {
++  if (a.length !== b.length) return false
++  let diff = 0
++  for (let i = 0; i < a.length; i += 1) {
++    diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
++  }
++  return diff === 0
++}
++
++/**
++ * Reject a signature whose timestamp is too far from now.
++ *
++ * Paddle's own SDKs use five seconds. Deliveries are retried with a fresh
++ * timestamp and every action here is idempotent, so this is a replay
++ * *guard* rather than a correctness guarantee — hence a generous window.
++ */
++export const SIGNATURE_TOLERANCE_SECONDS = 300
++
++export function timestampIsFresh(
++  timestamp: string,
++  nowSeconds: number,
++  toleranceSeconds = SIGNATURE_TOLERANCE_SECONDS,
++): boolean {
++  const parsed = Number.parseInt(timestamp, 10)
++  if (!Number.isFinite(parsed)) return false
++  return Math.abs(nowSeconds - parsed) <= toleranceSeconds
 +}
 +
 +export type LicenseAction = 'activate' | 'revoke' | 'ignore'
@@ -14609,10 +14698,10 @@ index 0000000000..de39be898c
 +}
 diff --git a/Apps/agent-voice/worker/test/index.test.ts b/Apps/agent-voice/worker/test/index.test.ts
 new file mode 100644
-index 0000000000..65c56d6b74
+index 0000000000..7095c6f705
 --- /dev/null
 +++ b/Apps/agent-voice/worker/test/index.test.ts
-@@ -0,0 +1,369 @@
+@@ -0,0 +1,428 @@
 +import { beforeEach, describe, expect, test } from 'bun:test'
 +import { handleRequest, type Env } from '../src/index'
 +import { expectedSignature } from '../src/paddle'
@@ -14628,6 +14717,8 @@ index 0000000000..65c56d6b74
 +const TXN = 'txn_01m45q62gzqns1n98dwp38038q'
 +const TXN_OTHER = 'txn_01m45q62gzqns1n98dwp38038z'
 +const TXN_REFUNDED = 'txn_01m45q62gzqns1n98dwp38039y'
++/** A transaction the worker has never seen, used to prove a webhook mints it. */
++const TXN_UNKNOWN = 'txn_01m45q62gzqns1n98dwp38037r'
 +
 +let kv: MemoryKV
 +let env: Env
@@ -14663,18 +14754,20 @@ index 0000000000..65c56d6b74
 +
 +async function signedWebhook(
 +  eventType: string,
-+  payload: unknown,
++  data: unknown,
 +  secret = WEBHOOK_SECRET,
++  options: { timestamp?: number } = {},
 +): Promise<Response> {
-+  const body = JSON.stringify(payload)
-+  const h1 = await expectedSignature(eventType, body, secret)
++  const body = JSON.stringify({ event_type: eventType, data })
++  const ts = options.timestamp ?? Math.floor(Date.now() / 1000)
++  const h1 = await expectedSignature(String(ts), body, secret)
 +  return handleRequest(
 +    new Request('https://license.test/webhook', {
 +      method: 'POST',
 +      headers: {
 +        'content-type': 'application/json',
-+        'Paddle-Event-Type': eventType,
-+        'Paddle-Signature': `ts=1700000000;h1=${h1}`,
++        // Paddle sends no event-type header — the event type is in the body.
++        'Paddle-Signature': `ts=${ts};h1=${h1}`,
 +      },
 +      body,
 +    }),
@@ -14843,8 +14936,8 @@ index 0000000000..65c56d6b74
 +describe('webhook', () => {
 +  test('activates a license on a completed transaction', async () => {
 +    const res = await signedWebhook('transaction.completed', {
-+      event_type: 'transaction.completed',
-+      data: { id: TXN, status: 'completed' },
++      id: TXN,
++      status: 'completed',
 +    })
 +    expect(res.status).toBe(200)
 +    expect(await json(res)).toEqual({
@@ -14859,18 +14952,31 @@ index 0000000000..65c56d6b74
 +    ).toBe(TXN)
 +  })
 +
++  test('reads the event type from the payload, not a header', async () => {
++    // Paddle sends no Paddle-Event-Type header; this request must not send one
++    // either, and it still has to be routed correctly.
++    expect((await activate(TXN_UNKNOWN, 'device-1')).status).toBe(404)
++    const res = await signedWebhook('transaction.completed', {
++      id: TXN_UNKNOWN,
++      status: 'completed',
++    })
++    expect(await json(res)).toEqual({
++      ok: true,
++      action: 'activate',
++      handled: true,
++    })
++    expect((await activate(TXN_UNKNOWN, 'device-1')).status).toBe(200)
++  })
++
 +  test('a refund adjustment revokes the license and frees every device', async () => {
 +    await activateLicense(kv, TXN, 1)
 +    await activate(TXN, 'device-1')
 +    await activate(TXN, 'device-2')
 +
 +    const res = await signedWebhook('adjustment.created', {
-+      event_type: 'adjustment.created',
-+      data: {
-+        id: 'adj_01m45q62gzqns1n98dwp38038q',
-+        action: 'refund',
-+        transaction_id: TXN,
-+      },
++      id: 'adj_01m45q62gzqns1n98dwp38038q',
++      action: 'refund',
++      transaction_id: TXN,
 +    })
 +    expect((await json(res)).action).toBe('revoke')
 +    const revoked = await activate(TXN, 'device-3')
@@ -14881,8 +14987,9 @@ index 0000000000..65c56d6b74
 +  test('a chargeback adjustment revokes too', async () => {
 +    await activateLicense(kv, TXN, 1)
 +    const res = await signedWebhook('adjustment.created', {
-+      event_type: 'adjustment.created',
-+      data: { id: 'adj_1', action: 'chargeback', transaction_id: TXN },
++      id: 'adj_1',
++      action: 'chargeback',
++      transaction_id: TXN,
 +    })
 +    expect((await json(res)).handled).toBe(true)
 +    expect((await activate(TXN, 'device-1')).status).toBe(410)
@@ -14892,8 +14999,9 @@ index 0000000000..65c56d6b74
 +    for (const action of ['credit', 'chargeback_warning']) {
 +      await activateLicense(kv, TXN, 1)
 +      const res = await signedWebhook('adjustment.created', {
-+        event_type: 'adjustment.created',
-+        data: { id: 'adj_1', action, transaction_id: TXN },
++        id: 'adj_1',
++        action,
++        transaction_id: TXN,
 +      })
 +      expect(await json(res)).toEqual({
 +        ok: true,
@@ -14905,10 +15013,7 @@ index 0000000000..65c56d6b74
 +  })
 +
 +  test('ignores events with no transaction or no interest', async () => {
-+    const noData = await signedWebhook('subscription.created', {
-+      event_type: 'subscription.created',
-+      data: {},
-+    })
++    const noData = await signedWebhook('subscription.created', {})
 +    expect(await json(noData)).toEqual({
 +      ok: true,
 +      action: 'ignore',
@@ -14916,8 +15021,7 @@ index 0000000000..65c56d6b74
 +    })
 +    // An activation with a non-transaction id must not mint a license.
 +    const junk = await signedWebhook('transaction.completed', {
-+      event_type: 'transaction.completed',
-+      data: { id: 'che_01m45q62gzqns1n98dwp38038q' },
++      id: 'che_01m45q62gzqns1n98dwp38038q',
 +    })
 +    expect((await json(junk)).handled).toBe(false)
 +    expect(await kv.get('license:che_01m45q62gzqns1n98dwp38038q')).toBeNull()
@@ -14926,7 +15030,7 @@ index 0000000000..65c56d6b74
 +  test('rejects a forged or mismatched signature', async () => {
 +    const forged = await signedWebhook(
 +      'transaction.completed',
-+      { data: { id: TXN } },
++      { id: TXN },
 +      'whsec_wrong',
 +    )
 +    expect(forged.status).toBe(401)
@@ -14935,7 +15039,6 @@ index 0000000000..65c56d6b74
 +    const unsigned = await handleRequest(
 +      new Request('https://license.test/webhook', {
 +        method: 'POST',
-+        headers: { 'Paddle-Event-Type': 'transaction.completed' },
 +        body: '{}',
 +      }),
 +      env,
@@ -14944,37 +15047,82 @@ index 0000000000..65c56d6b74
 +  })
 +
 +  test('rejects a body edited after signing', async () => {
-+    const body = JSON.stringify({ data: { id: TXN } })
-+    const h1 = await expectedSignature(
-+      'transaction.completed',
-+      body,
-+      WEBHOOK_SECRET,
-+    )
++    const ts = Math.floor(Date.now() / 1000)
++    const original = JSON.stringify({
++      event_type: 'transaction.completed',
++      data: { id: TXN },
++    })
++    const h1 = await expectedSignature(String(ts), original, WEBHOOK_SECRET)
 +    const res = await handleRequest(
 +      new Request('https://license.test/webhook', {
 +        method: 'POST',
-+        headers: {
-+          'Paddle-Event-Type': 'transaction.completed',
-+          'Paddle-Signature': `ts=1;h1=${h1}`,
-+        },
++        headers: { 'Paddle-Signature': `ts=${ts};h1=${h1}` },
 +        body: JSON.stringify({
-+          data: { id: 'txn_01m45q62gzqns1n98dwp38038z' },
++          event_type: 'transaction.completed',
++          data: { id: TXN_UNKNOWN },
 +        }),
 +      }),
 +      env,
 +    )
 +    expect(res.status).toBe(401)
++    expect((await json(res)).error).toContain('signature mismatch')
++  })
++
++  test('rejects a stale timestamp to blunt replay', async () => {
++    const stale = Math.floor(Date.now() / 1000) - 4000
++    const res = await signedWebhook(
++      'transaction.completed',
++      { id: TXN },
++      WEBHOOK_SECRET,
++      { timestamp: stale },
++    )
++    expect(res.status).toBe(401)
++    expect((await json(res)).error).toContain('timestamp')
++    expect(await kv.get(`license:${TXN}`)).toBeNull()
++  })
++
++  test('rejects a timestamp that is not a number', async () => {
++    const body = JSON.stringify({
++      event_type: 'transaction.completed',
++      data: { id: TXN },
++    })
++    const h1 = await expectedSignature('nope', body, WEBHOOK_SECRET)
++    const res = await handleRequest(
++      new Request('https://license.test/webhook', {
++        method: 'POST',
++        headers: { 'Paddle-Signature': `ts=nope;h1=${h1}` },
++        body,
++      }),
++      env,
++    )
++    expect(res.status).toBe(401)
++    expect((await json(res)).error).toContain('timestamp')
++  })
++
++  test('rejects a payload with no event type', async () => {
++    const ts = Math.floor(Date.now() / 1000)
++    const body = JSON.stringify({ data: { id: TXN } })
++    const h1 = await expectedSignature(String(ts), body, WEBHOOK_SECRET)
++    const res = await handleRequest(
++      new Request('https://license.test/webhook', {
++        method: 'POST',
++        headers: { 'Paddle-Signature': `ts=${ts};h1=${h1}` },
++        body,
++      }),
++      env,
++    )
++    expect(res.status).toBe(400)
++    expect((await json(res)).error).toContain('event_type')
++    expect(await kv.get(`license:${TXN}`)).toBeNull()
 +  })
 +
 +  test('fails closed when no webhook secret is configured', async () => {
 +    const noSecretEnv = { ...env, PADDLE_WEBHOOK_SECRET: '' }
++    const ts = Math.floor(Date.now() / 1000)
 +    const res = await handleRequest(
 +      new Request('https://license.test/webhook', {
 +        method: 'POST',
-+        headers: {
-+          'Paddle-Event-Type': 'transaction.completed',
-+          'Paddle-Signature': 'ts=1;h1=deadbeef',
-+        },
++        headers: { 'Paddle-Signature': `ts=${ts};h1=deadbeef` },
 +        body: '{}',
 +      }),
 +      noSecretEnv,
@@ -15039,12 +15187,13 @@ index 0000000000..a73dafd57e
 +}
 diff --git a/Apps/agent-voice/worker/test/paddle.test.ts b/Apps/agent-voice/worker/test/paddle.test.ts
 new file mode 100644
-index 0000000000..e380e767e8
+index 0000000000..d4e94c7cd9
 --- /dev/null
 +++ b/Apps/agent-voice/worker/test/paddle.test.ts
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,203 @@
 +import { describe, expect, test } from 'bun:test'
 +import {
++  SIGNATURE_TOLERANCE_SECONDS,
 +  actionForEvent,
 +  adjustmentRevokes,
 +  expectedSignature,
@@ -15052,6 +15201,9 @@ index 0000000000..e380e767e8
 +  isTransactionId,
 +  licenseCodeFromEvent,
 +  parseSignatureHeader,
++  signaturesMatch,
++  signingPayload,
++  timestampIsFresh,
 +  type PaddleWebhookPayload,
 +} from '../src/paddle'
 +
@@ -15075,37 +15227,59 @@ index 0000000000..e380e767e8
 +})
 +
 +describe('expectedSignature', () => {
-+  test('is deterministic and body/event dependent', async () => {
-+    const a = await expectedSignature(
-+      'transaction.completed',
-+      '{"a":1}',
-+      SECRET,
-+    )
-+    const b = await expectedSignature(
-+      'transaction.completed',
-+      '{"a":1}',
-+      SECRET,
-+    )
-+    const otherEvent = await expectedSignature(
-+      'adjustment.created',
-+      '{"a":1}',
-+      SECRET,
-+    )
-+    const otherBody = await expectedSignature(
-+      'transaction.completed',
-+      '{"a":2}',
-+      SECRET,
-+    )
++  test('signs `<timestamp>:<raw body>` exactly as Paddle documents', async () => {
++    const a = await expectedSignature('1700000000', '{"a":1}', SECRET)
++    const b = await expectedSignature('1700000000', '{"a":1}', SECRET)
++    const otherTs = await expectedSignature('1700000001', '{"a":1}', SECRET)
++    const otherBody = await expectedSignature('1700000000', '{"a":2}', SECRET)
 +    const otherSecret = await expectedSignature(
-+      'transaction.completed',
++      '1700000000',
 +      '{"a":1}',
 +      'other',
 +    )
 +    expect(a).toBe(b)
-+    expect(a).not.toBe(otherEvent)
++    expect(a).not.toBe(otherTs)
 +    expect(a).not.toBe(otherBody)
 +    expect(a).not.toBe(otherSecret)
 +    expect(a).toMatch(/^[0-9a-f]{64}$/)
++  })
++
++  test('the signed payload is the timestamp, a colon and the raw body', () => {
++    expect(signingPayload('1700000000', '{"a":1}')).toBe('1700000000:{"a":1}')
++    // Any whitespace change must therefore change the signature.
++    expect(signingPayload('1', '{ "a": 1 }')).not.toBe(
++      signingPayload('1', '{"a":1}'),
++    )
++  })
++})
++
++describe('signaturesMatch', () => {
++  test('compares equal-length digests without leaking length', () => {
++    expect(signaturesMatch('abc123', 'abc123')).toBe(true)
++    expect(signaturesMatch('abc123', 'abc124')).toBe(false)
++    expect(signaturesMatch('abc', 'abcd')).toBe(false)
++    expect(signaturesMatch('', '')).toBe(true)
++  })
++})
++
++describe('timestampIsFresh', () => {
++  test('accepts a timestamp inside the tolerance', () => {
++    const now = 1_700_000_000
++    expect(timestampIsFresh('1700000000', now)).toBe(true)
++    expect(timestampIsFresh('1700000299', now)).toBe(true)
++    expect(timestampIsFresh('1699999701', now)).toBe(true)
++    expect(timestampIsFresh('1700000301', now)).toBe(false)
++    expect(timestampIsFresh('1699999699', now)).toBe(false)
++  })
++
++  test('rejects garbage', () => {
++    expect(timestampIsFresh('', 1_700_000_000)).toBe(false)
++    expect(timestampIsFresh('nope', 1_700_000_000)).toBe(false)
++    expect(timestampIsFresh('1700000000', 1_700_000_000, 0)).toBe(true)
++  })
++
++  test('tolerance is a documented non-zero window', () => {
++    expect(SIGNATURE_TOLERANCE_SECONDS).toBeGreaterThan(0)
 +  })
 +})
 +
