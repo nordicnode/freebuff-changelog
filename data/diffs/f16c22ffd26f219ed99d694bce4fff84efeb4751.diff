@@ -1,0 +1,445 @@
+diff --git a/sdk/src/impl/__tests__/provider-error-recovery.test.ts b/sdk/src/impl/__tests__/provider-error-recovery.test.ts
+index 6cf965a87..fd40e7270 100644
+--- a/sdk/src/impl/__tests__/provider-error-recovery.test.ts
++++ b/sdk/src/impl/__tests__/provider-error-recovery.test.ts
+@@ -218,51 +218,51 @@ describe('classifyProviderErrorRecovery on real wire shapes', () => {
+       responsesError('Responses API error', null),
+     ],
+     [
+       'a bare message with no type or status',
+       { error: { message: 'stream aborted' } },
+     ],
+   ] as const)('keeps %s fatal', async (_label, event) => {
+     const error = await errorPartFor(event)
+     expect(APICallError.isInstance(error)).toBe(true)
+     expect(classifyProviderErrorRecovery({ aborted: false, error })).toBeNull()
+   })
+ })
+ 
+ describe('classifyProviderErrorRecovery on constructed errors', () => {
+   const apiError = (
+     fields: Partial<ConstructorParameters<typeof APICallError>[0]>,
+   ) =>
+     new APICallError({
+       message: 'Too Many Requests',
+       url: 'http://x',
+       requestBodyValues: {},
+       ...fields,
+     })
+ 
+   it('respects an explicit non-retryable verdict (the turn spend breaker)', () => {
+-    // model-provider.ts throwIfTurnSpendCapped: a 429 that retrying cannot fix.
++    // model-provider.ts FINAL_REFUSALS: a 429 that retrying cannot fix.
+     const error = apiError({
+       statusCode: 429,
+       isRetryable: false,
+       responseBody: JSON.stringify({ error: 'turn_spend_limit' }),
+     })
+     expect(classifyProviderErrorRecovery({ aborted: false, error })).toBeNull()
+   })
+ 
+   it('leaves a failed response the AI SDK already retried alone', () => {
+     const lastError = apiError({ statusCode: 503 })
+     const error = new RetryError({
+       message: 'Failed after 4 attempts',
+       reason: 'maxRetriesExceeded',
+       errors: [lastError, lastError, lastError, lastError],
+     })
+     expect(classifyProviderErrorRecovery({ aborted: false, error })).toBeNull()
+   })
+ 
+   it('ignores anything that is not an API call error', () => {
+     expect(
+       classifyProviderErrorRecovery({
+         aborted: false,
+         error: new Error('Upstream provider error (502): Bad gateway'),
+       }),
+     ).toBeNull()
+diff --git a/sdk/src/impl/__tests__/session-superseded-no-retry.test.ts b/sdk/src/impl/__tests__/session-superseded-no-retry.test.ts
+new file mode 100644
+index 000000000..64b97f997
+--- /dev/null
++++ b/sdk/src/impl/__tests__/session-superseded-no-retry.test.ts
+@@ -0,0 +1,118 @@
++/**
++ * The server answers HTTP 409 `{ error: 'session_superseded' }` when a start
++ * was refunded (or the session was taken over). The row is gone, so every
++ * retry gets the same answer. The AI SDK retries any 409 four times with
++ * backoff, which added ~14s before the user saw the card telling them to start
++ * a new session. The SDK must refuse it once and keep the server's copy.
++ */
++import { extractApiErrorDetails } from '@codebuff/common/util/error'
++import { APICallError, streamText } from 'ai'
++import { afterEach, describe, expect, test } from 'bun:test'
++
++import { getModelForRequest } from '../model-provider'
++
++const originalFetch = globalThis.fetch
++
++afterEach(() => {
++  globalThis.fetch = originalFetch
++})
++
++const REFUNDED = {
++  error: 'session_superseded',
++  message:
++    'This model purchase was refunded. Start a new session to try again.',
++}
++
++function serve(
++  status: number,
++  body: Record<string, unknown> | string,
++): { calls: () => number } {
++  let calls = 0
++  globalThis.fetch = (async () => {
++    calls += 1
++    return new Response(
++      typeof body === 'string' ? body : JSON.stringify(body),
++      { status, headers: { 'content-type': 'application/json' } },
++    )
++  }) as unknown as typeof fetch
++  return { calls: () => calls }
++}
++
++/** Runs one completion and returns whatever it failed with. */
++async function failureOf(maxRetries: number): Promise<unknown> {
++  const result = streamText({
++    model: getModelForRequest({ apiKey: 'k', model: 'openai/gpt-5.6-luna' }),
++    messages: [{ role: 'user', content: 'hi' }],
++    maxRetries,
++  })
++  let error: unknown
++  try {
++    for await (const part of result.stream) {
++      if (part.type === 'error') error = (part as { error: unknown }).error
++    }
++  } catch (thrown) {
++    error ??= thrown
++  }
++  await Promise.resolve(result.text).catch((thrown: unknown) => {
++    error ??= thrown
++  })
++  return error
++}
++
++describe('a refunded or superseded start (409 session_superseded)', () => {
++  test('is refused once, not retried, and keeps the server copy and code', async () => {
++    const server = serve(409, REFUNDED)
++
++    const error = await failureOf(3)
++
++    expect(server.calls()).toBe(1)
++    expect(APICallError.isInstance(error)).toBe(true)
++    const apiError = error as APICallError
++    expect(apiError.isRetryable).toBe(false)
++    expect(apiError.statusCode).toBe(409)
++    expect(apiError.message).toBe(REFUNDED.message)
++    // What every client classifies on: the CLI's superseded screen and
++    // Desktop's session-ended state both key on this code.
++    expect(extractApiErrorDetails(error)).toMatchObject({
++      statusCode: 409,
++      errorCode: 'session_superseded',
++      message: REFUNDED.message,
++    })
++  })
++
++  test('falls back to its own copy when the body has no message', async () => {
++    serve(409, { error: 'session_superseded' })
++
++    const error = (await failureOf(3)) as APICallError
++
++    expect(error.isRetryable).toBe(false)
++    expect(error.message).toContain('Start a new session')
++  })
++
++  test('any other 409 is still retried', async () => {
++    const server = serve(409, {
++      error: 'session_limit_reached',
++      message: 'too many tabs',
++    })
++
++    await failureOf(1)
++
++    expect(server.calls()).toBe(2)
++  }, 15_000)
++
++  test('a 409 whose body is not JSON is still retried', async () => {
++    const server = serve(409, 'Conflict')
++
++    await failureOf(1)
++
++    expect(server.calls()).toBe(2)
++  }, 15_000)
++
++  test('session_superseded under any other status is not treated as final', async () => {
++    const server = serve(503, REFUNDED)
++
++    await failureOf(1)
++
++    expect(server.calls()).toBe(2)
++  }, 15_000)
++})
+diff --git a/sdk/src/impl/model-provider.ts b/sdk/src/impl/model-provider.ts
+index 720c683ef..f112f6923 100644
+--- a/sdk/src/impl/model-provider.ts
++++ b/sdk/src/impl/model-provider.ts
+@@ -1,38 +1,39 @@
+ /**
+  * Builds the language model every request runs on: the Codebuff backend,
+  * which forwards to OpenRouter.
+  */
+ 
+ import path from 'path'
+ 
+ import { BYOK_OPENROUTER_HEADER } from '@codebuff/common/constants/byok'
+ import {
+   FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+   FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+ } from '@codebuff/common/constants/freebuff-errors'
+ import { FREEBUFF_ACTING_USER_HEADER } from '@codebuff/common/constants/freebuff-models'
++import { FREEBUFF_GATE_CODES } from '@codebuff/common/types/freebuff-session'
+ import { isAbortError, isFetchIdleTimeoutError, isTransientNetworkError } from '@codebuff/common/util/error'
+ import {
+   OpenAICompatibleChatLanguageModel,
+   VERSION,
+ } from '@codebuff/llm-providers/openai-compatible'
+ import { APICallError } from 'ai'
+ 
+ import { byokReasoningRetryBody, byokRequestTransform } from './byok-request'
+ import { getWebsiteUrl } from '../constants'
+ import { getByokOpenrouterApiKeyFromEnv } from '../env'
+ import { ByokConnectionStateError, byokCompletionUrl, byokCredentialVariable } from '../byok'
+ import type { ResolvedByokConnection } from '../byok'
+ 
+ import type { LanguageModel } from 'ai'
+ 
+ /**
+  * Parameters for requesting a model.
+  */
+ export interface ModelRequestParams {
+   /** Codebuff API key for backend authentication */
+   apiKey: string
+   /** Model ID (OpenRouter format, e.g., "anthropic/claude-sonnet-4") */
+   model: string
+   /** End user represented by a trusted service-account request. */
+   userId?: string
+@@ -233,110 +234,143 @@ export function getByokProviderErrorMessage(
+     const model = (detail.model ?? '').slice(0, MAX_MODEL_ID_IN_MESSAGE)
+     const named = model ? ` "${model}"` : ''
+     return `BYOK provider does not recognise the model ID${named} (HTTP ${status}). Use the exact model name from the provider's API model list and retry.`
+   }
+   if (status === 401)
+     return detail.credentialVariable
+       ? `BYOK provider rejected the API key in ${detail.credentialVariable} (HTTP 401). ${detail.credentialVariable} is set in this Freebuff process; check that it holds the key this endpoint expects, then restart Freebuff from that terminal.`
+       : 'BYOK provider rejected the API key (HTTP 401). Check or replace the key.'
+   if (status === 403)
+     return 'BYOK API key cannot access this model or account (HTTP 403). Choose an allowed model or use another key.'
+   if (status === 402)
+     return 'BYOK provider account needs credits or a supported plan (HTTP 402). Add provider credit or choose another model.'
+   if (status === 404)
+     return 'BYOK provider could not find this model or endpoint (HTTP 404). Check the model ID and provider URL.'
+   if (status === 429)
+     return 'BYOK provider rate limit reached (HTTP 429). Wait, then retry the task.'
+   if (status >= 500)
+     return `BYOK provider is temporarily unavailable (HTTP ${status}). Retry the task later.`
+   return `BYOK provider request failed (HTTP ${status}). Check the provider settings and retry.`
+ }
+ 
+ export const BYOK_CONNECTION_FAILURE_MESSAGE =
+   'Could not connect to the BYOK provider. Check the provider URL and network connection, then retry.'
+ 
+ /**
+- * The per-turn spend breaker (HTTP 429, body `{ error: 'turn_spend_limit',
+- * message }`) is final for THIS turn: its spend only grows, so the same run
+- * id is refused again on every retry. Left to the AI SDK, which treats every
+- * 429 as retryable, a capped turn asked four times over ~14s and then failed
+- * as "Failed after 4 attempts. Last error: Too Many Requests" — which every
+- * client read as an ordinary rate limit and answered with "wait a moment or
+- * switch models", neither of which helps. Throwing a NON-retryable
+- * APICallError stops the retry loop on the first refusal, and carrying the
+- * body lets the runtime's error parser hand the server's own copy (and the
+- * `turn_spend_limit` code) to the client unchanged.
++ * Refusals the server makes on purpose and repeats IDENTICALLY on a retry,
++ * each identified by its status AND its `error` code — never the status alone,
++ * since 409 and 429 are also ordinary, retryable answers.
++ *
++ * Left to the AI SDK, which treats every 409 and 429 as retryable, each of
++ * these was asked four times with backoff (~14s) and then failed as "Failed
++ * after 4 attempts. Last error: …". Throwing a NON-retryable APICallError
++ * stops the retry loop on the first refusal, and carrying the body lets the
++ * runtime's error parser hand the server's own copy and code to the client
++ * unchanged.
++ *
++ * - `turn_spend_limit` (429): the per-turn spend breaker is final for THIS
++ *   turn — its spend only grows, so the same run id is refused every time.
++ *   Clients read the retried failure as an ordinary rate limit and answered
++ *   it with "wait a moment or switch models", neither of which helps.
++ * - `session_superseded` (409): the start was refunded (the Desktop purchase
++ *   claim, or a refund that closed admission) or the session was taken over
++ *   by another instance. The row is gone, so every retry gets the same 409;
++ *   the user waited ~14s for the card that tells them to start a new session
++ *   (5,392 runs / 2,230 users in the 72h to 2026-10-05).
+  */
+-async function throwIfTurnSpendCapped(
++const FINAL_REFUSALS: readonly {
++  status: number
++  error: string
++  /** Used only when the body carries no `message` of its own. */
++  fallbackMessage: string
++}[] = [
++  {
++    status: 429,
++    error: FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
++    fallbackMessage: FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
++  },
++  {
++    status: FREEBUFF_GATE_CODES.session_superseded.status,
++    error: 'session_superseded',
++    fallbackMessage:
++      'This Freebuff session has ended. Start a new session to try again.',
++  },
++]
++
++async function throwIfFinalRefusal(
+   response: Response,
+   url: string,
+ ): Promise<void> {
+-  if (response.status !== 429) return
++  // Only a status some refusal uses is worth reading the body for.
++  if (!FINAL_REFUSALS.some((r) => r.status === response.status)) return
+   const text = await response
+     .clone()
+     .text()
+     .catch(() => '')
+   let body: { error?: unknown; message?: unknown } | null = null
+   try {
+     body = JSON.parse(text)
+   } catch {
+     return
+   }
+-  if (body?.error !== FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE) return
++  const refusal = FINAL_REFUSALS.find(
++    (r) => r.status === response.status && r.error === body?.error,
++  )
++  if (!refusal) return
+   throw new APICallError({
+     message:
+-      typeof body.message === 'string' && body.message
++      typeof body?.message === 'string' && body.message
+         ? body.message
+-        : FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
++        : refusal.fallbackMessage,
+     url,
+     requestBodyValues: {},
+     statusCode: response.status,
+     responseBody: text,
+     isRetryable: false,
+   })
+ }
+ 
+ /**
+  * Wrap global fetch so transient connection failures (socket closed/reset,
+- * connection refused) are rethrown as retryable APICallErrors, and a capped
+- * turn's 429 as a non-retryable one (see throwIfTurnSpendCapped).
++ * connection refused) are rethrown as retryable APICallErrors, and the
++ * server's final refusals as non-retryable ones (see FINAL_REFUSALS).
+  *
+  * Bun's fetch throws these as plain Errors ("The socket connection was closed
+  * unexpectedly...", code ECONNRESET/ConnectionClosed), which the AI SDK does
+  * not recognize as retryable — it only auto-retries APICallError with
+  * isRetryable=true. Marking them retryable lets streamText's built-in
+  * exponential backoff (default 2 retries) absorb brief server/network blips
+  * instead of failing the whole agent run.
+  */
+ function fetchWithRetryableNetworkErrors(
+   ...args: Parameters<typeof globalThis.fetch>
+ ): ReturnType<typeof globalThis.fetch> {
+   const url = requestUrlOf(args[0])
+   return globalThis.fetch(...args).then(
+     async (response) => {
+       notifyCapacityDeferralFromResponse(response)
+-      await throwIfTurnSpendCapped(response, url)
++      await throwIfFinalRefusal(response, url)
+       return response
+     },
+     (error: unknown) => {
+       if (isTransientNetworkError(error)) {
+         throw new APICallError({
+           message: error instanceof Error ? error.message : String(error),
+           cause: error,
+           url,
+           requestBodyValues: {},
+           isRetryable: true,
+         })
+       }
+       throw error
+     },
+   )
+ }
+ 
+ function plainHeaders(headers: HeadersInit | undefined): Record<string, string> {
+   if (!headers) return {}
+   if (headers instanceof Headers) {
+     const out: Record<string, string> = {}
+     headers.forEach((value, key) => {
+       out[key] = value
+     })
+     return out
+diff --git a/sdk/src/impl/stream-interruption.ts b/sdk/src/impl/stream-interruption.ts
+index 23240087e..add0d29b1 100644
+--- a/sdk/src/impl/stream-interruption.ts
++++ b/sdk/src/impl/stream-interruption.ts
+@@ -227,51 +227,52 @@ function retryAfterMsOf(
+  * mid-stream `{error: {code: 502, ...}}`), or the server's own in-band
+  * upstream failure (see UPSTREAM_ERROR_TYPE).
+  *
+  * These used to be thrown straight out and end the run, while the same outage
+  * showing up as a severed body got a continuation step instead, so "the
+  * provider said it failed" was fatal and "the connection died" was not, which
+  * is backwards for a flaky endpoint. Both now take the same capped retry
+  * path; the note and the give-up error say it was the provider, not the
+  * user's network.
+  *
+  * Deliberately NOT retried: anything refused on purpose. That is every other
+  * 4xx, such as 400 (context too long, content policy), 401, 402, 403 and the
+  * session/admission refusals (409, 428), plus an error explicitly marked
+  * non-retryable (the per-turn spend breaker's 429), and in-band errors that
+  * carry neither a status nor a known retryable code. A failed HTTP response
+  * the AI SDK already retried arrives wrapped in a RetryError, not a bare
+  * APICallError, so this never stacks a second retry loop on top of it.
+  */
+ export function classifyProviderErrorRecovery(params: {
+   aborted: boolean
+   error: unknown
+ }): StreamEndRecovery | null {
+   const { aborted, error } = params
+   if (aborted || !APICallError.isInstance(error)) return null
+   // An error built with a status carries an explicit retry verdict
+-  // (throwIfTurnSpendCapped marks its 429 non-retryable); respect it.
++  // (FINAL_REFUSALS in model-provider.ts: the spend breaker's 429, a
++  // refunded or superseded start's 409); respect it.
+   if (error.statusCode !== undefined && !error.isRetryable) return null
+ 
+   const body = parseErrorBody(error.responseBody)
+   const isUpstreamError = body?.type === UPSTREAM_ERROR_TYPE
+   const statusInMessage = isUpstreamError
+     ? UPSTREAM_STATUS_IN_MESSAGE.exec(error.message)?.[1]
+     : undefined
+   const statusCode =
+     error.statusCode ??
+     (statusInMessage !== undefined ? Number(statusInMessage) : undefined)
+   const code = typeof body?.code === 'string' ? body.code : undefined
+ 
+   let rateLimited: boolean
+   if (statusCode !== undefined) {
+     if (!isRetryableStatus(statusCode)) return null
+     rateLimited = statusCode === 429
+   } else if (code !== undefined && RETRYABLE_ERROR_CODES.has(code)) {
+     rateLimited = code === 'rate_limit_exceeded'
+   } else if (isUpstreamError) {
+     // The server lost the upstream without a status (a connect failure or
+     // timeout on its side): the same class as a 502.
+     rateLimited = false
+   } else {
+     return null
+   }
