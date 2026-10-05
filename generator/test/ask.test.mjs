@@ -132,6 +132,8 @@ test('ASK_INSTRUCTIONS: the contract the prompt promises is the one the gate enf
   assert.match(ASK_INSTRUCTIONS, /\[path\/to\/file\.ext\]/)
   assert.match(ASK_INSTRUCTIONS, /untrusted/i)
   assert.match(ASK_INSTRUCTIONS, /does not contain the answer/i, 'and says what to do when it does not know')
+  assert.match(ASK_INSTRUCTIONS, /plain English/i, 'answers default to non-technical language')
+  assert.match(ASK_INSTRUCTIONS, /no technical jargon/i, 'rather than leading with identifiers')
 })
 
 // --- /api/ask ------------------------------------------------------------------
