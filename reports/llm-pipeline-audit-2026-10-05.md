@@ -230,3 +230,31 @@ prompt change) creates a set of rows that are "missing plain-English" until the 
 up, and the 30-minute gate budget is shorter than that catch-up when many rows change at once.
 The relay now closes that gap in the same cycle for the rows it rewrites, but a large bulk rewrite
 can still expose rows for one cycle. Both workflows report it honestly; neither is silent about it.
+
+## Fourth finding: the gate charged the admission clock for a gap that had just opened (2026-10-05 21:1x UTC)
+
+`generationHealth` gave every admitted row a 30-minute budget measured from
+`enrichment.admittedAt`, then failed the run if required text was still missing. Admission dates the
+*requirement*, but not each gap inside it. A summary rewrite changes `eli5Source(e)`, and the merge
+deletes the line that explained the old text rather than publish a line about a summary it no
+longer describes, so a row admitted days ago can lose its plain-English line on this cycle's write.
+Charged the admission clock, that row was overdue the instant the rewrite landed, before the
+same-cycle plain-English pass could possibly have answered.
+
+The live example, measured on the row that was still red: `95ecda2e` was admitted
+`2026-10-05T08:17:52Z` and its summary was rewritten `20:01:55Z`, so the old clock reported a
+four-day-old gap the moment the new one appeared. The fix computes `missingSince` from when the
+requirement arose: admission for a missing summary, and `max(admittedAt, ai.at)` for a missing
+plain-English line, since `ai.at` is when the current title and summary were written and therefore
+the earliest moment the line explaining them could be absent. Deletion happens at or after that
+write, so the value is deliberately the earlier, more forgiving end of the window. The budget still
+fails a row whose text has genuinely been absent for 30 minutes; it no longer fails one that just
+lost it. `--report` and the hard gate read the same numbers, and the row list now carries
+`missingSince` so an overdue row reports its own age rather than its admission date.
+
+This is what made the failure look constant rather than periodic: any batch of summary re-asks
+turned the gate red immediately and stayed red until the explanation drain caught up, with no cycle
+in between that could have gone green. Regression test: a row admitted four days ago whose summary
+was rewritten two minutes ago is not overdue and still counts as `missingPlain: 1`; the same row
+with a summary written at admission is overdue, and it becomes overdue again once the grace
+elapses.

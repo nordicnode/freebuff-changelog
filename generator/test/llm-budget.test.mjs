@@ -223,6 +223,23 @@ test('generation health gates overdue admitted text, not intentional unchecked t
   assert.equal((await cmdGenerationHealth([], { dataDir: dir, now, env: {} })).overdue.length, 0)
 })
 
+test('a rewritten summary restarts its line clock; the admission clock cannot make it instantly overdue', async t => {
+  const dir = await temp(t), now = Date.parse('2026-10-05T12:00:00Z')
+  // Admitted 4 days ago, so the admission clock alone calls it overdue...
+  const admission = { policy: 1, admittedAt: '2026-10-01T08:00:00Z' }
+  // ...and its summary was rewritten 2 minutes ago, which is what deleted the
+  // plain-English line. The relay has had those 2 minutes, not 4 days.
+  const rewritten = row('5', { enrichment: admission, ai: { title: 'Beta added', summary: 'Adds Beta.', policy: 1, at: '2026-10-05T11:58:00Z' } })
+  assert.deepEqual(generationHealth([rewritten], { now }).overdue, [])
+  assert.equal(generationHealth([rewritten], { now }).missingPlain, 1)
+  // The same row with a summary written long ago is a real gap and stays red.
+  const stalled = row('6', { enrichment: admission, ai: { title: 'Gamma added', summary: 'Adds Gamma.', policy: 1, at: '2026-10-01T08:00:00Z' } })
+  assert.deepEqual(generationHealth([stalled], { now }).overdue.map(e => e.sha), [stalled.sha])
+  assert.equal(generationHealth([stalled], { now }).overdue[0].missingSince, '2026-10-01T08:00:00.000Z')
+  // Once the grace elapses the rewritten row is overdue like any other.
+  assert.deepEqual(generationHealth([rewritten], { now: now + 30 * 60000 }).overdue.map(e => e.sha), [rewritten.sha])
+})
+
 test('prompt size is bound by the row clock, not only by the model window', () => {
   // The measurement this exists for: a real production call carrying 828,311
   // chars answered in 63,439 ms (13,056 chars/second), and the plain-English

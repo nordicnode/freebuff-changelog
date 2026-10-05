@@ -2146,7 +2146,9 @@ export async function cmdGenerationHealth (argv = [], { dataDir = DATA, now = Da
   const health = generationHealth(doc.entries, { now, maxAgeMs: budget })
   log(`[generation-health] ${health.admitted} admitted; ${health.missingSummary} missing summaries, ${health.missingPlain} missing explanations, ${health.needsRepair} need repair, ${health.overdue.length} overdue`)
   if (health.overdue.length) {
-    const detail = `generation-health: missing text exceeded ${Math.round(budget / 60000)}m admission budget: ${health.overdue.map(e => `${e.sha.slice(0, 8)} (${e.missing.join(', ')})`).join('; ')}`
+    // The clock runs from when the text went missing, so the age is reported
+    // that way: a row can be admitted days ago and still be inside its budget.
+    const detail = `generation-health: required text missing past the ${Math.round(budget / 60000)}m budget: ${health.overdue.map(e => { const since = Date.parse(e.missingSince || '') ; return `${e.sha.slice(0, 8)} (${e.missing.join(', ')}${Number.isFinite(since) ? `, missing ${Math.round((now - since) / 60000)}m` : ''})` }).join('; ')}`
     if (argv.includes('--report')) {
       // ::warning:: on its own line, unprefixed: GitHub only parses its workflow
       // commands at the start of a line.

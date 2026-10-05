@@ -98,6 +98,29 @@ export function generationState (e = {}) {
   return { status: VERIFIED_STATUSES.includes(technical) && PLAIN_VERIFIED_STATUSES.includes(explanation) ? 'complete' : 'review-pending', missing }
 }
 
+// When the required text could first have been missing, which is what the
+// budget below is a budget for.
+//
+// Admission dates the *requirement*; it does not date every gap in it. A
+// summary rewrite changes `eli5Source(e)`, and the merge deletes the line that
+// explained the old text rather than publish a line about a summary it no
+// longer describes. So a row admitted yesterday can lose its plain-English
+// line on this cycle's write, and its line's clock starts at that write, not at
+// admission: the relay has had no time at all to answer a question that only
+// just came into being. Charging the admission clock made such a row overdue
+// the instant the rewrite landed, which is how a batch of summary re-asks could
+// turn the gate red before the same cycle's plain-English pass had a chance to
+// run -- red with nothing wrong and no cycle that could have fixed it.
+function missingSince (e, state) {
+  const admittedAt = Date.parse(e.enrichment?.admittedAt || '')
+  if (state.missing.includes('summary')) return admittedAt
+  // Plain-English only, so a summary exists: `ai.at` is when the current title
+  // and summary were written, and therefore the earliest moment the line that
+  // explains them could be absent. Deletion happens at or after that write, so
+  // this is deliberately the earlier, more forgiving end of the window.
+  return Math.max(admittedAt, Date.parse(e.ai?.at || '') || -Infinity)
+}
+
 // Text availability has its own clock, independent of source ingestion and
 // optional review. Historical rows outside durable admission never trigger it.
 export function generationHealth (entries = [], { now = Date.now(), maxAgeMs = 1800000 } = {}) {
@@ -111,7 +134,10 @@ export function generationHealth (entries = [], { now = Date.now(), maxAgeMs = 1
     if (state.status === 'needs-repair') needsRepair++
     if (state.status === 'review-pending') reviewPending++
     const stamp = Date.parse(e.enrichment.admittedAt || '')
-    if (state.missing.length && (!Number.isFinite(stamp) || now - stamp >= maxAgeMs || stamp > now + 60000)) overdue.push({ sha: e.sha, missing: state.missing, admittedAt: e.enrichment.admittedAt || null })
+    const since = missingSince(e, state)
+    if (state.missing.length && (!Number.isFinite(stamp) || !Number.isFinite(since) || now - since >= maxAgeMs || stamp > now + 60000)) {
+      overdue.push({ sha: e.sha, missing: state.missing, admittedAt: e.enrichment.admittedAt || null, missingSince: Number.isFinite(since) ? new Date(since).toISOString() : null })
+    }
   }
   return { admitted: admitted.length, missingSummary, missingPlain, needsRepair, reviewPending, overdue }
 }
