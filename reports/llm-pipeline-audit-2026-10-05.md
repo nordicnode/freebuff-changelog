@@ -153,3 +153,54 @@ The findings above describe the original read-only audit. The follow-up implemen
 - Unchecked-text healing can accept a strictly cleaner replacement without inventing a verdict; recorded factual objections require a real passing check to clear.
 
 Verification includes the full offline suite on Node 26 and CI's Node 22, the opt-in real-fetch 65-second response regression, Actionlint validation, and browser inspection of the new local status/entry API. The generation-health CLI intentionally reports failure against the existing three overdue rows until production recovery writes their text. No historical content or production secrets were edited.
+
+## Second remediation: the oversized row that could never be asked (2026-10-05 19:xx UTC)
+
+The first remediation's gate did its job and then kept firing: both `changelog-sync` and
+`deploy-site` failed their generation-completeness step on every run, naming the same single
+admitted row, `d71a831b` (release 0.2.8), which had no plain-English line. Its stubs read
+`LLM entry time budget exceeded`, `attempts` climbing, `transient: true` -- a row that kept
+being asked and never answered.
+
+The cause was arithmetic, and it was permanent:
+
+| measurement | value | source |
+|---|---|---|
+| `data/diffs/d71a831b….diff` | 836,045 chars (486 additions, 10,542 deletions) | the stored diff |
+| plain-English prompt built from it | **842,051 chars** | `buildEli5Prompt`, replayed offline |
+| one real production call with 828,311 chars | **63,439 ms** (`validated`, `agnes-3.0-flash`) | `data/ai-summaries.json`, request ledger |
+| prefill throughput that implies | 13,056 chars/second | 828,311 / 63.4 s |
+| plain-English row clock | 45,000 ms | `CHANGELOG_ELI5_ROW_BUDGET_MS` |
+
+A prompt that needs 63 seconds to prefill cannot be paid for by a 45-second clock. Every cycle
+aborted the request mid-flight, the ladder retried into a spent clock, and the row was written
+back as unanswered -- forever, because nothing about the row changes. The `deploy-site` gate then
+reported it again on every data push (~200/day) even though the deploy itself had succeeded and
+the workflow could neither write text nor dispatch a cycle.
+
+Repairs:
+
+- **Prompts are sized against the row's clock, not only the model's window.** `diffRoom` now takes
+  the row budget and caps the diff at `clock x CHANGELOG_LLM_PREFILL_CHARS_PER_SEC (12,000, measured
+  13,056) x CHANGELOG_LLM_PROMPT_CLOCK_SHARE (0.5)`, minus whatever the fixed sections already cost.
+  The half is deliberate: the rest pays for the answer, the in-row RPM wait and one retry. Ordinary
+  rows are untouched (half of 90 s is 540,000 chars; only one row in this repo exceeds even the 45 s
+  figure), and the floor keeps real hunks in every prompt. Applied to the summary ask, the
+  plain-English ask (per-change and roll-up), the verifier and the re-check.
+- **Result on the stuck row**: plain-English 842,051 -> **236,917 chars** (~20 s at the conservative
+  rate, inside 45 s); summary 849,175 -> **540,178 chars** (~45 s, inside 90 s).
+- **One hard gate, in the workflow that owns generation.** `changelog-sync` still fails on overdue
+  admitted text and still dispatches the healing cycle. `deploy-site` now runs
+  `generation-health --report`: identical numbers, identical row list, a `::warning::` annotation,
+  exit 0. A missing `data/changelog.json` still fails there, and a stalled relay still fails the
+  freshness gate, so the advisory step removes noise, not signal.
+
+Verification: two regression tests fail on the pre-fix code and pass after it (the prompt-clock
+ceiling and the plain-English row clock), the full offline suite passes on Node 26 (496 tests,
+495 pass, 1 opt-in skip) and on Node 22, and the CLI's two strengths were run against live data
+(`--report` exits 0 and warns with the row list; the default still exits 1).
+
+Still open, unchanged and intentional: ~30 `needs-repair` rows with partial evidence or recorded
+objections, the historical explanation gaps outside durable admission (no backfill), provider 429/504
+bursts, and the ~160 admitted rows whose summary identity is stale under the current provider and
+are being re-asked in bounded batches.

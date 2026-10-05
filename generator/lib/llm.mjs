@@ -17,9 +17,22 @@
 //   LLM_TIMEOUT_MS            per-request timeout including body reads (default 60000).
 //                              Bounded further by the row budget and the pass deadline.
 //   CHANGELOG_LLM_ROW_BUDGET_MS  wall clock one row may spend on model calls
-//                              (default 60000). Bounds the repair/verifier ladder of a
-//                              single row so one slow row cannot eat the pass.
-//   CHANGELOG_ELI5_ROW_BUDGET_MS the same for the plain-English pass (default 45000)
+//                              (default 90000). Bounds the repair/verifier ladder of a
+//                              single row so one slow row cannot eat the pass, and
+//                              sizes the prompt that row is asked (below).
+//   CHANGELOG_ELI5_ROW_BUDGET_MS the same for the plain-English pass (default
+//                              45000), and it is what the plain-English row's
+//                              own model calls are charged to -- not only the
+//                              pass plan that counts rows from it.
+//   CHANGELOG_LLM_PREFILL_CHARS_PER_SEC  prompt chars one second of a row's clock
+//                              can pay to prefill (default 12000; measured
+//                              13,056 on this provider). See the prompt clock
+//                              below: a prompt bigger than half the row's clock
+//                              can prefill is cut to fit, so no row is ever
+//                              asked a question its own budget cannot pay for.
+//   CHANGELOG_LLM_PROMPT_CLOCK_SHARE  how much of that clock the prompt may own
+//                              (default 0.5; the rest pays the answer and the
+//                              retry ladder).
 //   CHANGELOG_LLM_LIMIT        max commits summarized per run (default 60; 0 = no cap)
 //   CHANGELOG_LLM_CONCURRENCY  parallel API calls (default 2)
 //   CHANGELOG_ROLLUP_LLM_API_BASE / _API_KEY / _MODEL
@@ -33,7 +46,8 @@
 //   CHANGELOG_ELI5_LIMIT       plain-English pass budget (defaults to the above)
 //   CHANGELOG_ELI5_DIFF=0      explain from the summary only, skip the diff
 //   CHANGELOG_ELI5_DIFF_BYTES  operator cap on the diff sent to the plain-English
-//                              pass; unset means "all of it that fits the window"
+//                              pass; unset means "all of it that fits the window
+//                              and the row's clock"
 //   CHANGELOG_LLM_MAX_DIFF_BYTES  the same, for the summary and verifier prompts
 //   CHANGELOG_LLM_CONTEXT_TOKENS  the model's window (default 512000). Every
 //                              prompt takes the diff last, out of what the
@@ -437,10 +451,59 @@ export const PROMPT_PREAMBLE_CHARS = 16000
 export const LLM_MIN_DIFF_ROOM = 20000
 const TRUNC_NOTICE = '\n…[diff truncated: the context window filled up; full diff on GitHub]…\n'
 
+// ---------------------------------------------------------------------------
+// The prompt clock: the other ceiling on a prompt, and the one that was missing.
+//
+// The window above says how big a prompt the model will *accept*. It says
+// nothing about how long the row has to *pay* for it, and the row's own clock
+// (CHANGELOG_LLM_ROW_BUDGET_MS, CHANGELOG_ELI5_ROW_BUDGET_MS) is what kills the
+// call: a prefill that outlives the row's share aborts the request, the ladder
+// retries into a clock that is already spent, and the row dies with "LLM entry
+// time budget exceeded" -- every cycle, forever, because nothing about it
+// changes. That is not hypothetical. The largest row in this repo
+// (d71a831b, an 837 KB diff) built an 842,051-char plain-English prompt, and a
+// real production call with 828,311 chars on this provider took 63,439 ms to
+// answer: 13,056 chars/second of prefill, against a 45s plain-English clock.
+// The row could not be explained by construction, and it kept the deploy and
+// relay health gates red for four days while every mechanism meant to heal it
+// ran to completion.
+//
+// So a prompt is now sized against the clock that will cut it, not only against
+// the window: the diff gets what is left after the fixed sections, out of
+// (row clock) x (chars per second) x (share). Ordinary rows are untouched --
+// half a 90s clock is 540,000 chars and only one row in this repo exceeds even
+// the 45s plain-English figure (270,000) -- and the rows that are touched are
+// exactly the ones that could never be asked at all.
+//
+// The share is deliberately half, not all: the rest pays for the answer, the
+// RPM/429 wait that happens inside the row clock, and one retry. A prompt sized
+// against the whole clock has no room for the answer it asks for.
+//
+// Measured at module load like the other provider constants, and overridable:
+// the number is this provider's, and a slower route is a one-variable change
+// rather than a prompt-size migration.
+export const LLM_PREFILL_CHARS_PER_SEC = Number(process.env.CHANGELOG_LLM_PREFILL_CHARS_PER_SEC || 12000)
+export const LLM_PROMPT_CLOCK_SHARE = Number(process.env.CHANGELOG_LLM_PROMPT_CLOCK_SHARE || 0.5)
+
+// How many prompt chars a row with this much wall clock can honestly prefill.
+// Infinity (no clock known) leaves the window as the only ceiling, which is how
+// every caller that has no row budget behaves -- the old behavior, kept.
+export function promptCharsForClock (clockMs, { charsPerSec = LLM_PREFILL_CHARS_PER_SEC, share = LLM_PROMPT_CLOCK_SHARE } = {}) {
+  const ms = Number(clockMs)
+  if (!Number.isFinite(ms)) return Infinity
+  const rate = Number.isFinite(charsPerSec) && charsPerSec > 0 ? charsPerSec : LLM_PREFILL_CHARS_PER_SEC
+  const fraction = Number.isFinite(share) && share > 0 ? Math.min(1, share) : LLM_PROMPT_CLOCK_SHARE
+  if (ms <= 0) return LLM_MIN_DIFF_ROOM
+  return Math.max(LLM_MIN_DIFF_ROOM, Math.floor((ms / 1000) * rate * fraction))
+}
+
 // What is left for the diff once the rest of the prompt is paid for, honoring
-// an operator cap where one is set (CHANGELOG_LLM_MAX_DIFF_BYTES and friends).
-export function diffRoom (fixedChars, cap = Infinity) {
-  const room = Math.max(LLM_MIN_DIFF_ROOM, LLM_PROMPT_CHARS - fixedChars)
+// an operator cap where one is set (CHANGELOG_LLM_MAX_DIFF_BYTES and friends)
+// and the row's own clock where the caller knows it (`clockMs`).
+export function diffRoom (fixedChars, cap = Infinity, clockMs = Infinity) {
+  const windowRoom = Math.max(LLM_MIN_DIFF_ROOM, LLM_PROMPT_CHARS - fixedChars)
+  const clockRoom = Math.max(LLM_MIN_DIFF_ROOM, promptCharsForClock(clockMs) - fixedChars)
+  const room = Math.min(windowRoom, clockRoom)
   return Math.max(2000, Math.min(Number.isFinite(cap) && cap > 0 ? cap : Infinity, room))
 }
 
@@ -1237,7 +1300,7 @@ export function buildPrompt (entry, patch, ctx = {}) {
   // The contract is charged to the body, so the room left for the diff is what
   // survives after everything the prompt must carry -- including the closing
   // line the model reads last.
-  const room = diffRoom(body.length + REPLY_CONTRACT.length + 2, Number(process.env.CHANGELOG_LLM_MAX_DIFF_BYTES) || Infinity)
+  const room = diffRoom(body.length + REPLY_CONTRACT.length + 2, Number(process.env.CHANGELOG_LLM_MAX_DIFF_BYTES) || Infinity, ctx.rowBudgetMs)
   lines.push('', 'Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):', '```diff', budgetPatch(redactProductPrompts(patch), room, perFileRoom(room)), '```', '', REPLY_CONTRACT)
   return fitToWindow(lines.filter(Boolean).join('\n'))
 }
@@ -1824,8 +1887,14 @@ export function resetLlmStreamProbeForTests () { streamSupported.clear(); respon
 // version of the row budget silently did nothing -- summarizeEntry opened its
 // own `{ calls: 0, requests: [] }` before any call, and the clock set by
 // callLlm was never the clock the calls were charged to.
-function newRequestScope (env) {
-  return { calls: 0, requests: [], rowStartedAt: Date.now(), rowBudgetMs: rowBudgetMs(env) }
+// `budget` is the row's own clock. enrichEli5 remaps its own knob
+// (CHANGELOG_ELI5_ROW_BUDGET_MS) onto the generic one for the pass, and stating
+// it here as well keeps the plain-English row charged to the plain-English
+// clock for any caller that reaches explainEntry directly. The number matters
+// twice now: it is the clock the row's calls are cut by, and the budget the
+// prompt is sized from (see LLM_PREFILL_CHARS_PER_SEC).
+function newRequestScope (env, budget = rowBudgetMs(env)) {
+  return { calls: 0, requests: [], rowStartedAt: Date.now(), rowBudgetMs: budget }
 }
 
 // A row's remaining share of wall clock, or Infinity when it is not on one.
@@ -3991,7 +4060,9 @@ export function buildVerifyPrompt (entry, patch, clean, cautionNames = [], opts 
   // Same rule as the asks: the verifier has to see the hunks the writer saw,
   // or it "verifies" a summary against a diff the summary was not written from.
   const body = lines.filter(line => line && (!opts.compact || !/^(?:Files (?:added|modified|removed):|Analysis notes:|Title:|Summary:|Evidence:|Audience:)/.test(line))).join('\n')
-  const room = diffRoom(body.length)
+  // Same clock as the ask it checks: the verifier has to be able to pay for the
+  // hunks it reads, or its verdict goes missing on the biggest rows.
+  const room = diffRoom(body.length, Infinity, opts.rowBudgetMs)
   return fitToWindow([body, '```diff', budgetPatch(redactProductPrompts(patch), room, perFileRoom(room)), '```'].filter(Boolean).join('\n'))
 }
 
@@ -4015,12 +4086,15 @@ export function validateVerifyOut (out) {
 export async function verifySummary (entry, patch, clean, env, cautionNames = [], opts = {}) {
   if (!requestScope.getStore()) return requestScope.run(newRequestScope(env), () => verifySummary(entry, patch, clean, env, cautionNames, opts))
   const venv = { ...env, LLM_MODEL: verifyModelOf(env) }
+  // The verdict is charged to the same row clock the ask was, so the prompt it
+  // reads is sized from that clock too.
+  const vopts = { rowBudgetMs: rowBudgetMs(venv), ...opts }
   // The verifier reads the same diff the ask did, so a comment-heavy row
   // refuses here too and the verdict silently goes missing (58699f0e logged
   // "verifier unavailable" right after its summary recovered). Same fallback,
   // offered only if the first read comes back refused or in prose.
   const stripped = strippedPatchOf(patch)
-  const fallbackPrompt = stripped ? buildVerifyPrompt(entry, stripped, clean, cautionNames, opts) : null
+  const fallbackPrompt = stripped ? buildVerifyPrompt(entry, stripped, clean, cautionNames, vopts) : null
   const validate = out => {
     const verdict = validateVerifyOut(out)
     if (!verdict.supported) return verdict
@@ -4041,8 +4115,8 @@ export async function verifySummary (entry, patch, clean, env, cautionNames = []
   // Gateway failures used to resend identical verification bytes four times.
   // One smaller framing keeps ALL evidence and claim coverage; an outage then
   // returns to the durable queue instead of consuming the whole cycle.
-  const leanPrompt = buildVerifyPrompt(entry, patch, clean, cautionNames, { ...opts, compact: true })
-  return callLlm(buildVerifyPrompt(entry, patch, clean, cautionNames, opts), venv, 1, validate, { fallbackPrompt, leanPrompt, gatewayRetries: 0, stage: 'verification' })
+  const leanPrompt = buildVerifyPrompt(entry, patch, clean, cautionNames, { ...vopts, compact: true })
+  return callLlm(buildVerifyPrompt(entry, patch, clean, cautionNames, vopts), venv, 1, validate, { fallbackPrompt, leanPrompt, gatewayRetries: 0, stage: 'verification' })
 }
 
 // Map-reduce orchestration: one focused call per chunk (sequential, to respect
@@ -4102,11 +4176,15 @@ export function buildSelfCheckPrompt (clean, material) {
 // same corpus to work out which sibling-only names to hand the verifier as
 // attribution cautions -- two copies of this mapping would drift apart and the
 // re-check would quietly check against different evidence than the writer saw.
-export function promptContextOf ({ relText = '', sequence = null, prMeta = null, archMap = null, glossary = '', context = {} } = {}) {
+export function promptContextOf ({ relText = '', sequence = null, prMeta = null, archMap = null, glossary = '', context = {}, rowBudgetMs = Infinity } = {}) {
   return {
     releaseCtx: relText,
     sequence,
     prMeta,
+    // The row's clock, so the summary ask is sized to the budget that will cut
+    // it. Callers pass the same number the row is charged, or the prompt and
+    // the clock disagree again.
+    rowBudgetMs,
     architectureMap: archMap || FREEBUFF_ARCHITECTURE_MAP,
     glossary,
     structured: context.structured,
@@ -4138,7 +4216,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
   if (prMeta?.matched === 'files' && baseEnv.CHANGELOG_PR_GATE !== '0') {
     prMetaEff = await checkPrRelevance(e, patch, prMeta, baseEnv)
   }
-  const promptCtx = promptContextOf({ relText, sequence, prMeta: prMetaEff, archMap, glossary, context })
+  const promptCtx = promptContextOf({ relText, sequence, prMeta: prMetaEff, archMap, glossary, context, rowBudgetMs: rowBudgetMs(baseEnv) })
   const prompt = buildPrompt(e, patch, promptCtx)
   // Validate against delivered/redacted material, never unseen full context.
   let corpus = deliveredEvidence(prompt)
@@ -4680,7 +4758,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
       const fullPatch = getFullPatch ? await getFullPatch(e).catch(() => '') : ''
       context = await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, fullPatch })
       context.releaseEvidence = await gatherReleaseEvidence(hit, entries, getPatch)
-      const prompt = buildPrompt(e, patch, promptContextOf({ relText, sequence, prMeta, archMap, glossary, context }))
+      const prompt = buildPrompt(e, patch, promptContextOf({ relText, sequence, prMeta, archMap, glossary, context, rowBudgetMs: rowBudgetMs(env) }))
       identity = { ...evidenceManifest(e, patch, prompt, modelFor(e, env, relText)), inputIdentity: inputIdentity(e, prMeta, glossary, env, relText), sourceContextHash: shortHash(JSON.stringify(context)) }
     }
     const key = cacheKey(e.sha, patch, relText, relText ? RELEASE_ROLLUP_V : 0, identity)
@@ -4871,7 +4949,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           // verdict; an objection marks the row `flagged`, which hands it to
           // the heal pass on a later run instead of duplicating the repair
           // logic here.
-          const promptCtx = promptContextOf({ relText, sequence, prMeta, archMap, glossary, context })
+          const promptCtx = promptContextOf({ relText, sequence, prMeta, archMap, glossary, context, rowBudgetMs: rowBudgetMs(env) })
           const cautionNames = sequenceOnlyNames(sequence, groundingCorpus(e, patch, { ...promptCtx, sequence: null }))
           const described = reverify
           const bundle = await resolveEvidence(dataDir, reverify.evidenceBundle)
@@ -5233,12 +5311,14 @@ export function eli5Done (e, releaseCtx = '', rollupV = 0) {
 }
 
 export function buildEli5Prompt (e, notes = [], ctx = {}) {
-  const { patch = '', siblings = [], diffBytes = Infinity, releaseCtx = '', prMeta = null, sequence = null } = ctx
+  const { patch = '', siblings = [], diffBytes = Infinity, releaseCtx = '', prMeta = null, sequence = null, rowBudgetMs: clockMs = Infinity } = ctx
 
   if (releaseCtx) {
     // Same window ceiling as the per-change ask. A roll-up carries the release
     // window (up to RELEASE_CTX_MAX_CHARS) instead of a diff, so it is the one
     // path that can fill the window on its own.
+    // The release window is the fixed part here, and it is capped at
+    // RELEASE_CTX_MAX_CHARS: the clock still bounds what the diff may add.
     return fitToWindow(`${UNTRUSTED_DATA_RULE}\nExplain what shipped in this software release to a reader who is not a programmer and will not look at the code. This is a RELEASE ROLL-UP summarizing the capabilities, models, security protections, and improvements bundled into this version.
 
 ${ctx.architectureMap || FREEBUFF_ARCHITECTURE_MAP}
@@ -5254,7 +5334,7 @@ ${releaseCtx}
 
 ${ctx.releaseEvidence || ''}
 
-${!bumpOnly(e) && patch ? `This release commit also ships these source changes:\n\`\`\`diff\n${budgetPatch(redactProductPrompts(patch), diffRoom(releaseCtx.length + 40000), perFileRoom(diffRoom(releaseCtx.length + 40000)))}\n\`\`\`` : ''}
+${!bumpOnly(e) && patch ? `This release commit also ships these source changes:\n\`\`\`diff\n${budgetPatch(redactProductPrompts(patch), diffRoom(releaseCtx.length + 40000, Infinity, clockMs), perFileRoom(diffRoom(releaseCtx.length + 40000, Infinity, clockMs)))}\n\`\`\`` : ''}
 ${!bumpOnly(e) ? contextSectionLines(ctx).join('\n') : ''}
 
 Your task:
@@ -5444,7 +5524,7 @@ Reply with JSON only: {"eli5": "..."}`
   // so building the prompt without it says exactly how much is left for it.
   // The old fixed cap had to be low enough for the largest row, which is a cap
   // on every row -- it was cutting single files in half on a 3 KB diff.
-  const room = diffRoom(build('').length, diffBytes)
+  const room = diffRoom(build('').length, diffBytes, clockMs)
   return fitToWindow(build(budgetPatch(redactProductPrompts(patch), room, perFileRoom(room))))
 }
 
@@ -5881,9 +5961,14 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
   // Same as summarizeEntry: the guard must carry dataDir, or the plain-English
   // pass -- which always calls in from outside a scope -- writes a bundle it
   // can never resolve.
-  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv), () => explainEntry({ entry: e, patch, notesPatch, siblings, diffBytes, relText, prMeta, sequence, archMap, glossary, context, env: baseEnv, dataDir }))
+  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv, eli5RowBudgetMs(baseEnv)), () => explainEntry({ entry: e, patch, notesPatch, siblings, diffBytes, relText, prMeta, sequence, archMap, glossary, context, env: baseEnv, dataDir }))
   const callsAt = requestScope.getStore().calls
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
+  // The diff the plain-English ask may carry is capped by this row's own clock,
+  // not only by the window: see LLM_PREFILL_CHARS_PER_SEC. Sized from the
+  // configured share rather than the clock's remainder so the prompt (and the
+  // manifest hash recorded for it) is the same on every run of the same row.
+  const clockMs = eli5RowBudgetMs(baseEnv)
   // Reuse the technical pass's accepted PR. Never reattach a rejected match.
   if (e.ai && Object.hasOwn(e.ai, 'acceptedPr')) prMeta = e.ai.acceptedPr
   else if (prMeta?.matched === 'files') prMeta = await checkPrRelevance(e, patch, prMeta, env)
@@ -5910,6 +5995,7 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     patch,
     siblings,
     diffBytes,
+    rowBudgetMs: clockMs,
     releaseCtx: relText,
     prMeta,
     sequence,

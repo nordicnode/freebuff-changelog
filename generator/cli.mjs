@@ -1943,6 +1943,7 @@ if (IS_MAIN) {
   node generator/cli.mjs gc-evidence [--push] [--dry-run]  # delete evidence shards no stored record references and fan flat shards out by hash prefix
   node generator/cli.mjs rollups [--backfill N] [--day YYYY-MM-DD] [--force] [--push]  # write the settled day's bullet digest shown at the top of its page
   node generator/cli.mjs generation-health       # offline gate: fail on overdue missing admitted text, independent of ingestion freshness
+  node generator/cli.mjs generation-health --report  # the same reading as a warning, for the workflow that only publishes
   node generator/cli.mjs check-size              # CI gate: fail when a tracked file nears GitHub's 100 MiB push limit
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
   node generator/cli.mjs eval [--seed N] [--limit N]  # offline stored-artifact audit, zero provider calls
@@ -2124,13 +2125,36 @@ export function regenerationEli5Deadline (startedAt, budgetMs, eli5BudgetMs, now
   return Math.min(startedAt + budgetMs, now + eli5BudgetMs)
 }
 
+/**
+ * The overdue-text verdict on admitted rows, in two strengths.
+ *
+ * The default is the hard gate, and it belongs to the workflow that owns
+ * generation: changelog-sync runs the passes, so its run goes red, names the
+ * rows, and dispatches the next cycle that will heal them.
+ *
+ * `--report` is the same reading without the throw, for the workflow that only
+ * publishes: deploy-site cannot write a summary and cannot dispatch a cycle, so
+ * a red run there would say "the deploy failed" about an upload that succeeded
+ * and a backlog the relay is already working. It still says the same numbers,
+ * and warns with the same row list. A changelog that is missing stays an error
+ * either way: that is a real deploy fault, not lag.
+ */
 export async function cmdGenerationHealth (argv = [], { dataDir = DATA, now = Date.now(), env = process.env } = {}) {
   const doc = await loadChangelog(dataDir)
   if (!doc) throw new Error('generation-health: changelog is missing')
   const budget = Number(env.CHANGELOG_GENERATION_STALE_MIN) > 0 ? Number(env.CHANGELOG_GENERATION_STALE_MIN) * 60000 : 1800000
   const health = generationHealth(doc.entries, { now, maxAgeMs: budget })
   log(`[generation-health] ${health.admitted} admitted; ${health.missingSummary} missing summaries, ${health.missingPlain} missing explanations, ${health.needsRepair} need repair, ${health.overdue.length} overdue`)
-  if (health.overdue.length) throw new Error(`generation-health: missing text exceeded ${Math.round(budget / 60000)}m admission budget: ${health.overdue.map(e => `${e.sha.slice(0, 8)} (${e.missing.join(', ')})`).join('; ')}`)
+  if (health.overdue.length) {
+    const detail = `generation-health: missing text exceeded ${Math.round(budget / 60000)}m admission budget: ${health.overdue.map(e => `${e.sha.slice(0, 8)} (${e.missing.join(', ')})`).join('; ')}`
+    if (argv.includes('--report')) {
+      // ::warning:: on its own line, unprefixed: GitHub only parses its workflow
+      // commands at the start of a line.
+      console.log(`::warning::${detail} -- the relay holds the hard gate (changelog-sync) and keeps retrying these rows.`)
+      return health
+    }
+    throw new Error(detail)
+  }
   return health
 }
 

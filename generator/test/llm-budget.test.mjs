@@ -13,7 +13,9 @@ import {
   resetLlmKeyRotationForTests, backupEnvOf, createLlmRateLimiter, llmRpm, llmCapOf,
   rollupLlmEnv, stageLlmEnv, ROLLUP_LLM_STAGE,
   DEFAULT_LLM_API_BASE, DEFAULT_LLM_MODEL, DEFAULT_ROW_BUDGET_MS, PROMPT_V,
-  enrichEli5, enrichOpenPrs, summaryBacklog, validateLlmConfig, llmCallCount, llmRouteIdentity, ELI5_V
+  enrichEli5, enrichOpenPrs, summaryBacklog, validateLlmConfig, llmCallCount, llmRouteIdentity, ELI5_V,
+  buildEli5Prompt, diffRoom, promptCharsForClock, LLM_PREFILL_CHARS_PER_SEC,
+  LLM_PROMPT_CLOCK_SHARE, LLM_PROMPT_CHARS, LLM_MIN_DIFF_ROOM
 } from '../lib/llm.mjs'
 import { summaryPassWindow, regenerationEli5Deadline, cmdGenerationHealth, cmdWatch } from '../cli.mjs'
 import { generationHealth } from '../lib/quality.mjs'
@@ -212,8 +214,83 @@ test('generation health gates overdue admitted text, not intentional unchecked t
   assert.deepEqual(h.overdue.map(e => e.sha), [overdue.sha])
   await writeFile(join(dir, 'changelog.json'), JSON.stringify({ entries: rows }))
   await assert.rejects(cmdGenerationHealth([], { dataDir: dir, now, env: {} }), /44444444/)
+  // --report is the same reading without the throw, for the workflow that only
+  // publishes (deploy-site): it cannot write text or dispatch a cycle, so the
+  // relay keeps the hard verdict. It must still return the row list.
+  const reported = await cmdGenerationHealth(['--report'], { dataDir: dir, now, env: {} })
+  assert.deepEqual(reported.overdue.map(e => e.sha), [overdue.sha])
   await writeFile(join(dir, 'changelog.json'), JSON.stringify({ entries: [ready, recent, old] }))
   assert.equal((await cmdGenerationHealth([], { dataDir: dir, now, env: {} })).overdue.length, 0)
+})
+
+test('prompt size is bound by the row clock, not only by the model window', () => {
+  // The measurement this exists for: a real production call carrying 828,311
+  // chars answered in 63,439 ms (13,056 chars/second), and the plain-English
+  // clock is 45s. A prompt is sized from half the clock, so the biggest row in
+  // the repo cannot be asked a question its own budget cannot prefill.
+  const share = LLM_PROMPT_CLOCK_SHARE
+  assert.equal(promptCharsForClock(45000), Math.max(LLM_MIN_DIFF_ROOM, Math.floor(45 * LLM_PREFILL_CHARS_PER_SEC * share)))
+  assert.equal(promptCharsForClock(90000), 2 * promptCharsForClock(45000))
+  // No clock known: the window stays the only ceiling (the old behavior).
+  assert.equal(promptCharsForClock(undefined), Infinity)
+  assert.equal(diffRoom(9000, Infinity, Infinity), LLM_PROMPT_CHARS - 9000)
+  assert.equal(diffRoom(9000, Infinity), LLM_PROMPT_CHARS - 9000)
+  // A clock: the diff gets what is left of it, not what is left of the window.
+  assert.equal(diffRoom(9000, Infinity, 45000), promptCharsForClock(45000) - 9000)
+  assert.equal(diffRoom(9000, Infinity, 90000), promptCharsForClock(90000) - 9000)
+  // Either ceiling can win, and the floor survives both.
+  assert.equal(diffRoom(LLM_PROMPT_CHARS + 1000, Infinity, 45000), LLM_MIN_DIFF_ROOM)
+  assert.equal(diffRoom(9000, 50000, 45000), 50000)
+  assert.equal(diffRoom(9000, 5000, 45000), 5000)
+  assert.equal(diffRoom(9000, Infinity, 0), LLM_MIN_DIFF_ROOM)
+})
+
+test('a plain-English row is never asked a prompt its own clock cannot prefill', async t => {
+  const dir = await temp(t)
+  const e = row('1', { ai: { ...clean, model: 'test', v: PROMPT_V } })
+  // ~1.2 MB across three files: the shape of the row that stayed unexplained.
+  const huge = [1, 2, 3].map(n => `diff --git a/big${n}.ts b/big${n}.ts\n` + '+export const BIG = 1\n'.repeat(20000)).join('')
+  const clockMs = 45000
+  const ceiling = promptCharsForClock(clockMs)
+  const bounded = buildEli5Prompt(e, [], { patch: huge, rowBudgetMs: clockMs, diffBytes: Infinity })
+  assert.ok(bounded.length <= ceiling + 20000, `prompt is ${bounded.length} chars against a ${ceiling}-char clock ceiling`)
+  const unbounded = buildEli5Prompt(e, [], { patch: huge, diffBytes: Infinity })
+  assert.ok(unbounded.length > bounded.length * 3, 'without a clock the same row carries the whole diff')
+  let sent = 0
+  t.mock.method(globalThis, 'fetch', async (url, init) => { sent = String(init.body).length; return response({ eli5: 'The gate reads a flag before it acts.' }) })
+  assert.equal(await enrichEli5([e], dir, env({ CHANGELOG_ELI5_ROW_BUDGET_MS: String(clockMs) }), { retryErrors: true, getPatch: async () => huge }), 1)
+  assert.ok(sent <= ceiling + 20000, `the call sent ${sent} chars, the row clock allows ${ceiling}`)
+  assert.equal(e.eli5.text, 'The gate reads a flag before it acts.')
+})
+
+test('the plain-English pass charges its rows to CHANGELOG_ELI5_ROW_BUDGET_MS, not the summary budget', async t => {
+  const dir = await temp(t)
+  const text = { eli5: 'The gate reads a flag before it acts.' }
+  let calls = 0
+  // A model that answers in 1.2s. Against a 150ms plain-English clock that is
+  // eight times too slow, and the only question is which clock cut it.
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    calls++
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve(response(text)), 1200)
+      init.signal.addEventListener('abort', () => { clearTimeout(timer); reject(Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })) })
+    })
+  })
+  // The plain-English clock owns the row (enrichEli5 remaps its knob onto the
+  // generic one, and explainEntry charges the scope to it directly), so a share
+  // too small for the call leaves the row for the next cycle instead of
+  // spending it. This is the 45s clock that the 842,051-char prompt
+  // overran on every cycle.
+  const e = row('1', { ai: { ...clean, model: 'test', v: PROMPT_V } })
+  assert.equal(await enrichEli5([e], dir, env({ CHANGELOG_ELI5_ROW_BUDGET_MS: '150' }), { retryErrors: true, getPatch: async () => patch }), 0)
+  assert.ok(calls >= 1, 'the call was attempted and then cut, not skipped')
+  assert.equal(e.eli5, undefined)
+  assert.match(Object.values(JSON.parse(await readFile(join(dir, 'ai-summaries.json'), 'utf8'))).find(r => r.error).error, /budget exceeded|aborted/)
+  // The summary budget is not the plain-English clock: the same row shape, under
+  // a summary clock of the same 150ms, is answered on the default 45s share.
+  const other = row('2', { ai: { ...clean, model: 'test', v: PROMPT_V } })
+  assert.equal(await enrichEli5([other], dir, env({ CHANGELOG_LLM_ROW_BUDGET_MS: '150' }), { retryErrors: true, getPatch: async () => patch }), 1)
+  assert.equal(other.eli5.text, text.eli5)
 })
 
 test('served probe refuses an old deploy even when the upstream head did not move', async () => {
