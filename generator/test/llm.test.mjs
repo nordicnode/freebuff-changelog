@@ -2355,9 +2355,9 @@ test('buildEli5Prompt: roll-up mode requires evidenced changes without forcing i
 test('the context window is sized from the measured chars/token, not a guess', () => {
   // 3.60 chars/token was reported by the gateway on real prompts; 3.2 is the
   // conservative divisor, so a prompt that fits here fits there.
-  assert.equal(LLM_CONTEXT_TOKENS, 270000)
+  assert.equal(LLM_CONTEXT_TOKENS, 512000)
   assert.equal(LLM_CONTEXT_CHARS, Math.floor(LLM_CONTEXT_TOKENS * 3.2))
-  assert.ok(LLM_CONTEXT_CHARS > 864000 * 0.99 && LLM_CONTEXT_CHARS <= 864000)
+  assert.ok(LLM_CONTEXT_CHARS > 1638400 * 0.99 && LLM_CONTEXT_CHARS <= 1638400)
 })
 
 test('diffRoom: the diff gets what the rest of the prompt leaves, and never less than the floor', () => {

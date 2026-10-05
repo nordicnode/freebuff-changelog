@@ -39,8 +39,8 @@ test('R19: default historical summary, ELI5 and PR queues spend zero provider ca
   assert.equal(await enrichOpenPrs([{ number: 1, body: 'Historical' }], dir, env, { getDiff: async () => { reads++; return patch } }), 0)
   assert.equal(calls, 0)
   assert.equal(reads, 0)
-  assert.equal(LLM_CONTEXT_TOKENS, 270000)
-  assert.equal(DEFAULT_VERIFY_MODEL, 'deepseek-v4.1')
+  assert.equal(LLM_CONTEXT_TOKENS, 512000)
+  assert.equal(DEFAULT_VERIFY_MODEL, 'agnes-3.0-flash')
 })
 
 test('R1: malformed verdicts fail closed and negative-empty stays negative', () => {

@@ -154,9 +154,9 @@ test('validateVerifyOut: per-claim verdicts fail closed', () => {
   assert.match(prompt, /"claims":/)
 })
 
-test('verifySummary: the check model defaults to deepseek-v4.1 and honors LLM_VERIFY_MODEL', async () => {
-  assert.equal(verifyModelOf({}), DEFAULT_VERIFY_MODEL, 'deepseek-v4.1 is the default check model')
-  assert.equal(verifyModelOf({ LLM_MODEL: 'deepseek-v4.1' }), 'deepseek-v4.1', 'a deepseek writer is checked by the same default')
+test('verifySummary: the check model defaults to agnes-3.0-flash and honors LLM_VERIFY_MODEL', async () => {
+  assert.equal(verifyModelOf({}), DEFAULT_VERIFY_MODEL, 'agnes-3.0-flash is the default check model')
+  assert.equal(verifyModelOf({ LLM_MODEL: 'agnes-3.0-flash' }), 'agnes-3.0-flash', 'an agnes writer is checked by the same default')
   assert.equal(verifyModelOf({ LLM_MODEL: 'gpt-6-luna' }), DEFAULT_VERIFY_MODEL, 'a gpt-6-luna writer is checked cross-family by the default')
   assert.equal(verifyModelOf({ LLM_VERIFY_MODEL: 'gpt-6-luna' }), 'gpt-6-luna', 'the cross-model escape hatch is the override')
   assert.equal(verifyModelOf({ LLM_VERIFY_MODEL: 'other-model' }), 'other-model', 'an explicit LLM_VERIFY_MODEL wins')

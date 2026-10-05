@@ -39,8 +39,8 @@ node generator/cli.mjs override <sha>               # draft a human correction
 | Setting | Essential contract |
 |---|---|
 | `CHANGELOG_LLM=1` + `LLM_API_KEY` | Enables enrichment of admitted new rows |
-| `LLM_API_BASE`, `LLM_MODEL` | Writer route and model (`https://vyceai.com/v1`, `deepseek-v4.1`) |
-| `LLM_VERIFY_MODEL` | Verifier model (`deepseek-v4.1`); a same-family check is not a human audit |
+| `LLM_API_BASE`, `LLM_MODEL` | Writer route and model (`https://apihub.agnes-ai.com/v1`, `agnes-3.0-flash`) |
+| `LLM_VERIFY_MODEL` | Verifier model (`agnes-3.0-flash`); a same-family check is not a human audit |
 | `LLM_BACKUP_API_BASE`, `LLM_BACKUP_API_KEY`, `LLM_BACKUP_MODEL` | One failover read (Google `gemini-3.6-flash`) on gateway/transport failures only |
 | `CHANGELOG_LLM_VERIFY` | `all` (default), `1` selective, `0` off; the relay runs `0` |
 | `CHANGELOG_LLM_RPM` | Requests/minute ceiling (default 60; can only go lower) |

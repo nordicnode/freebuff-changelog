@@ -11,9 +11,9 @@
 //   LLM_API_KEY                bearer key
 //   LLM_API_KEYS               comma-separated bearer keys, rotated one per call
 //                              (each key its own quota; the RPM window stays global)
-//   LLM_API_BASE               default https://vyceai.com/v1 (any OpenAI-compatible
+//   LLM_API_BASE               default https://apihub.agnes-ai.com/v1 (any OpenAI-compatible
 //                              base works; the default is the project's provider)
-//   LLM_MODEL                  default deepseek-v4.1
+//   LLM_MODEL                  default agnes-3.0-flash
 //   LLM_TIMEOUT_MS            per-request timeout including body reads (default 60000).
 //                              Bounded further by the row budget and the pass deadline.
 //   CHANGELOG_LLM_ROW_BUDGET_MS  wall clock one row may spend on model calls
@@ -35,7 +35,7 @@
 //   CHANGELOG_ELI5_DIFF_BYTES  operator cap on the diff sent to the plain-English
 //                              pass; unset means "all of it that fits the window"
 //   CHANGELOG_LLM_MAX_DIFF_BYTES  the same, for the summary and verifier prompts
-//   CHANGELOG_LLM_CONTEXT_TOKENS  the model's window (default 270000). Every
+//   CHANGELOG_LLM_CONTEXT_TOKENS  the model's window (default 512000). Every
 //                              prompt takes the diff last, out of what the
 //                              context sections leave, so a small row sends its
 //                              whole diff and a huge one still cannot overflow.
@@ -104,17 +104,17 @@ export function nextLlmKey (env = process.env) {
 }
 
 // ---------------------------------------------------------------------------
-// The provider contract: VyceAI, deepseek-v4.1.
+// The provider contract: Agnes AI, agnes-3.0-flash.
 //
 // The provider is part of the data contract, not an interchangeable detail:
 // every stored row names the model that answered (`ai.model`, the request
 // records, `ai.manifest.model`), and a silent fallback to a different gateway
-// or a `gpt-4o-mini` placeholder does not degrade gracefully -- it writes a
+// or a placeholder model does not degrade gracefully -- it writes a
 // different corpus. So the identity is written once, here, and a missing
 // LLM_API_BASE / LLM_MODEL / LLM_VERIFY_MODEL can no longer route the writer
 // somewhere else. Explicit env always wins; this is the floor, not a ceiling.
-export const DEFAULT_LLM_API_BASE = 'https://vyceai.com/v1'
-export const DEFAULT_LLM_MODEL = 'deepseek-v4.1'
+export const DEFAULT_LLM_API_BASE = 'https://apihub.agnes-ai.com/v1'
+export const DEFAULT_LLM_MODEL = 'agnes-3.0-flash'
 
 // What the pipeline is actually configured to talk to, in one line and without
 // the key. The absence of this line is why a provider swap could only be
@@ -327,7 +327,7 @@ export function cleanText (s, maxLen = 2000, isSentence = false) {
 }
 
 // Per-file budget: split on file boundaries, cap each file, keep order.
-// Defaults allow up to 500 KB (optimized for 270K+ context windows).
+// Defaults allow up to 500 KB (optimized for 512K+ context windows).
 export function budgetPatch (patch, maxBytes = 500000, perFile = 120000) {
   // Coerce first: an unreadable diff arrives as undefined from a failed git
   // read, and `patch.length` below threw on it (the String() guard covered
@@ -365,7 +365,7 @@ export function budgetPatch (patch, maxBytes = 500000, perFile = 120000) {
 // than a fixed cap that has to be guessed low enough for the worst row and so
 // is really a cap on the *best* row too. That is the whole change: an ordinary
 // 3 KB row now sends all of it instead of a per-file slice of it.
-export const LLM_CONTEXT_TOKENS = 270000 // Provider contract; never silently expand beyond 270k.
+export const LLM_CONTEXT_TOKENS = 512000 // Provider contract; never silently expand beyond 512k.
 // 3.2 against the 3.6 measured: a prompt that fits at 3.2 fits at 3.6.
 export const LLM_CHARS_PER_TOKEN = Number(process.env.CHANGELOG_LLM_CHARS_PER_TOKEN || 3.2)
 export const LLM_CONTEXT_CHARS = Math.floor(LLM_CONTEXT_TOKENS * LLM_CHARS_PER_TOKEN)
@@ -499,8 +499,8 @@ export function fitToWindow (prompt, limit = LLM_PROMPT_CHARS) {
 // anything a draft misreads survives into it, and the grounding check at the
 // fuse step is the only thing standing behind the result. It now sits above the
 // largest diff ever stored (250 KB) by a wide margin, so in practice only a
-// snapshot the diff store has never held engages it; a 270K window is ~864K
-// chars, enough for a 600 KB diff whole plus source context, and the threshold
+// snapshot the diff store has never held engages it; a 512K window is ~1.6M
+// chars, enough for even the largest stored diff whole plus source context, and the threshold
 // keeps the last 200 KB of that range on the cheap path rather than the prompt
 // assembly path. Disable with CHANGELOG_LLM_MAPREDUCE=0. Map calls run
 // sequentially so the RPM budget and the enrich worker pool are never burst.
@@ -1582,10 +1582,11 @@ export function shortError (err) {
 
 // One provider budget across models, stages and retries, never an entry budget.
 //
-// 60 is the project provider's own account limit (VyceAI). A lower operator
-// value still binds; a higher one cannot. Verification is the single biggest
-// consumer of these slots, which is why turning it off frees real capacity
-// for writing.
+// 60 is the primary route's account ceiling, preserved from the previous
+// provider until Agnes AI publishes otherwise (429s in the logs are the
+// signal to lower it). Verification is the single biggest consumer of these
+// slots, which is why turning it off frees real capacity for writing.
+// A lower operator value still binds; a higher one cannot.
 export const LLM_PROVIDER_RPM = 60
 export function llmRpm (env = {}) {
   // A route that names its own rate is bounded by that number instead: it is a
@@ -3862,7 +3863,7 @@ export async function gatherEntryContext (e, patch, { repoDir = null, entries = 
 // newly summarized rows ever reach the verifier, so this is a per-run cost,
 // never a backlog sweep).
 //
-// The default check model is the writer's own family (deepseek-v4.1), which is
+// The default check model is the writer's own family (agnes-3.0-flash), which is
 // a deliberate trade: one fewer provider in the loop and the cheapest check we
 // have. The cost is real and worth naming -- a verifier that shares the
 // writer's model shares its blind spots, so both passes can agree on the same
@@ -3871,10 +3872,9 @@ export async function gatherEntryContext (e, patch, { repoDir = null, entries = 
 // the deterministic grounding + why validators, which do not depend on the
 // check model at all, and the heal ledger that re-examines shipped rows.
 // A cross-model check is one variable away: set LLM_VERIFY_MODEL to another
-// family (e.g. gpt-6-luna) and the check, plus the eval judge that falls
-// through the same ladder, moves to it with no code change. When the writer is
-// gpt-6-luna the default is cross-family in the other direction.
-export const DEFAULT_VERIFY_MODEL = 'deepseek-v4.1'
+// family and the check, plus the eval judge that falls
+// through the same ladder, moves to it with no code change.
+export const DEFAULT_VERIFY_MODEL = 'agnes-3.0-flash'
 export function verifyModelOf (env = process.env) {
   return env.LLM_VERIFY_MODEL || DEFAULT_VERIFY_MODEL
 }

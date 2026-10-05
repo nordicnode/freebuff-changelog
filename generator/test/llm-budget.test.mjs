@@ -33,13 +33,13 @@ const temp = async (t) => { const dir = await mkdtemp(join(tmpdir(), 'fb-budget-
 test.beforeEach(() => { resetLlmRateLimiterForTests(); resetLlmStreamProbeForTests(); resetLlmKeyRotationForTests() })
 
 test('provider contract: the defaults are the project provider, and the banner names them without the key', () => {
-  assert.equal(DEFAULT_LLM_API_BASE, 'https://vyceai.com/v1')
-  assert.equal(DEFAULT_LLM_MODEL, 'deepseek-v4.1')
+  assert.equal(DEFAULT_LLM_API_BASE, 'https://apihub.agnes-ai.com/v1')
+  assert.equal(DEFAULT_LLM_MODEL, 'agnes-3.0-flash')
   const off = llmProviderBanner({})
   assert.match(off, /disabled/)
-  const banner = llmProviderBanner({ CHANGELOG_LLM: '1', LLM_API_KEY: 'sk-secret-value', LLM_API_BASE: 'https://vyceai.com/v1', LLM_MODEL: 'deepseek-v4.1', LLM_VERIFY_MODEL: 'deepseek-v4.1' })
-  assert.match(banner, /write deepseek-v4\.1 @ https:\/\/vyceai\.com\/v1/)
-  assert.match(banner, /verify deepseek-v4\.1/)
+  const banner = llmProviderBanner({ CHANGELOG_LLM: '1', LLM_API_KEY: 'sk-secret-value', LLM_API_BASE: 'https://apihub.agnes-ai.com/v1', LLM_MODEL: 'agnes-3.0-flash', LLM_VERIFY_MODEL: 'agnes-3.0-flash' })
+  assert.match(banner, /write agnes-3\.0-flash @ https:\/\/apihub\.agnes-ai\.com\/v1/)
+  assert.match(banner, /verify agnes-3\.0-flash/)
   assert.doesNotMatch(banner, /sk-secret-value/, 'the banner is safe to log')
 })
 
