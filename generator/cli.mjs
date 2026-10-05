@@ -1802,7 +1802,33 @@ async function cmdPreview (port = 8788) {
   createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost')
     let p = decodeURIComponent(url.pathname)
-    // The three dynamic routes worker.js answers in production, so a local
+    // "Ask the AI" answers through worker.js itself, not a second
+    // implementation: the grounding gate, rate limit and cache are the feature,
+    // and a preview that reimplemented them would quietly disagree with what
+    // ships. The only thing supplied here is an ASSETS binding that reads the
+    // local dist/ instead of Cloudflare's.
+    if (p === '/api/ask') {
+      const chunks = []
+      for await (const c of req) chunks.push(c)
+      const { default: worker } = await import('../worker.js')
+      const out = await worker.fetch(new Request(`http://localhost${req.url}`, {
+        method: req.method,
+        headers: req.headers,
+        body: req.method === 'POST' ? Buffer.concat(chunks).toString('utf8') : undefined
+      }), {
+        ...process.env,
+        ASSETS: {
+          fetch: async (a) => {
+            const file = resolve(dist, '.' + new URL(a.url).pathname)
+            try { return new Response(await readFile(file), { status: 200 }) } catch { return new Response('not found', { status: 404 }) }
+          }
+        }
+      })
+      res.writeHead(out.status, Object.fromEntries(out.headers.entries()))
+      res.end(await out.text())
+      return
+    }
+    // The other dynamic routes worker.js answers in production, so a local
     // preview behaves like the deployed site instead of 404ing them.
     const served = await dynamicRoute(dist, p, url.searchParams)
     if (served) {

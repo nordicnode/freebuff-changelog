@@ -56,8 +56,19 @@ node generator/cli.mjs override <sha>               # draft a human correction
 | `CHANGELOG_LLM_STREAM` | Streams by default; `=0` disables |
 | `CHANGELOG_SYNC_STALE_MIN` | Freshness budget (default 5 minutes; the gate fails at twice this) |
 | `SITE_URL` | Deployment and feed URL |
+| `LLM_API_KEY` (Worker secret), `ANSWER_RPM` | Ask-the-AI at the edge: the credential, and asks per IP per minute (default 5). Both are Worker-side, not relay-side |
 
 CLI commands load local environment configuration (`.env`). No setting can raise the token window or the configured RPM ceiling. Agnes rate limits are account-specific; 60 is the inherited safety cap, not a claimed Agnes entitlement. Invalid URLs and authentication failures fail the paid process without creating row failure stubs; deterministic updates publish first.
+
+## Ask the AI
+
+Every row that ships a diff offers **Ask the AI about this change**. Answers are generated at the edge by `POST /api/ask` in [worker.js](worker.js) and are **hard-gated** before a reader sees them: [generator/lib/grounding.mjs](generator/lib/grounding.mjs) checks each claim against the entry's stored diff, where backticked and code-like identifiers must occur in the evidence as whole tokens (never as a cut of a longer name), `[file]` citations must name a file this entry touched, and `[file:LINE]` must fall inside a hunk. A failing claim earns one corrective re-ask that names exactly what failed; a second failure is refused with `422` and the offending claims, and the text is never returned. Rows with no stored diff do not offer the button, because nothing could ground an answer, and a question the change cannot support is answered "the change does not show that" rather than with the model's general knowledge of the codebase.
+
+Setup, once:
+1. Cloudflare dashboard → Workers & Pages → freebuff-changelog → Settings → Variables and Secrets → add the secret `LLM_API_KEY` (the relay's provider is fine).
+2. Optional: `ANSWER_RPM` (asks per IP per minute, default 5), `LLM_API_BASE`, `LLM_MODEL`.
+
+Without the secret, `GET /api/ask` reports `configured: false`, the control disables itself with a note, and no other route changes. Identical asks are answered from cache (the Cache API where it exists, isolate memory otherwise), so a repeated question costs nothing. The rate limit is per-isolate and therefore best effort: an anti-accident limiter rather than a billing firewall, so lower `ANSWER_RPM` if abuse ever shows up. `npm run preview` serves this route through the same `worker.js`, so local preview exercises the real gate rather than a reimplementation.
 
 ## Data and outputs
 

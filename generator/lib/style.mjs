@@ -3161,4 +3161,40 @@ a.badge:hover{text-decoration:none;color:var(--term-cyan)}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important;scroll-behavior:auto !important}
 }
+/* Ask the AI. Sits above the collapsed technical details because it is reader-
+   facing like the plain-English line, and dressed like the other controls so it
+   does not read as a third-party widget. The [hidden] overrides are required:
+   an author display rule beats the UA sheet's [hidden]{display:none}, so
+   without them the panel would render open on every row. */
+.ask-ai{margin:.7em 0 .3em}
+.ask-open{
+  background:none;border:1px solid var(--term-border);border-radius:3px;
+  color:var(--term-cyan);cursor:pointer;font:inherit;font-size:.76rem;
+  padding:.25em .6em;
+}
+.ask-open:hover{border-color:var(--term-cyan);background:var(--cyan-tint-bg)}
+.ask-body{display:flex;flex-direction:column;gap:.45em;margin-top:.5em}
+.ask-body[hidden]{display:none}
+.ask-form{display:flex;gap:.4em;flex-wrap:wrap}
+.ask-input{
+  flex:1 1 16em;min-width:0;background:var(--panel);
+  border:1px solid var(--term-border);border-radius:3px;color:var(--txt);
+  font:inherit;font-size:.85rem;padding:.4em .55em;
+}
+.ask-input:focus{outline:none;border-color:var(--term-cyan)}
+.ask-send{
+  background:var(--panel);border:1px solid var(--term-border);border-radius:3px;
+  color:var(--txt-subtle);cursor:pointer;font:inherit;font-size:.8rem;padding:.4em .85em;
+}
+.ask-send:hover{color:var(--term-cyan);border-color:var(--term-cyan)}
+.ask-send:disabled{opacity:.5;cursor:wait}
+.ask-out{
+  border-left:3px solid var(--term-border);background:var(--panel);
+  font-size:.88rem;line-height:1.55;padding:.55em .7em;white-space:pre-wrap;
+}
+.ask-out[hidden]{display:none}
+.ask-busy{border-left-color:var(--term-amber);color:var(--txt-dim)}
+.ask-ok{border-left-color:var(--term-green)}
+.ask-refused{border-left-color:var(--term-red);color:var(--txt-subtle)}
+.ask-note{margin-top:.5em;font-size:.72rem;color:var(--txt-subtle);white-space:normal}
 `

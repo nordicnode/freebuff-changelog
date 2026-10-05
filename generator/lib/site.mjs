@@ -757,6 +757,107 @@ document.addEventListener('toggle', async (ev) => {
   }
 }, true);
 
+// --- Ask the AI ---------------------------------------------------------------
+// Delegated, because entry cards arrive from /entry-frags/ after this script
+// runs: a listener bound to the buttons at load time would never see them.
+// Every string from the model is written with textContent, never innerHTML --
+// an answer is untrusted output, and a page that html-injected it would turn a
+// grounded-answer endpoint into an injection endpoint.
+document.addEventListener('click', (ev) => {
+  const open = ev.target.closest ? ev.target.closest('.ask-open') : null;
+  if (!open) return;
+  const box = open.closest('.ask-ai');
+  const body = box && box.querySelector('.ask-body');
+  if (!body) return;
+  const showing = !body.hidden;
+  body.hidden = showing;
+  open.setAttribute('aria-expanded', showing ? 'false' : 'true');
+  if (!showing) {
+    const input = box.querySelector('.ask-input');
+    if (input) input.focus();
+    probeAskCapability(box);
+  }
+});
+
+// One capability probe per page. If the deployment has no model credential the
+// control says so up front, instead of letting a reader type a question and
+// then read "not enabled". A failed probe changes nothing: the submit path
+// still reports the real status, and a flaky check must not disable a feature
+// that works.
+let askConfigured = null;
+function probeAskCapability (box) {
+  if (askConfigured === false) { applyAskCapability(box); return; }
+  if (askConfigured !== null) return;
+  askConfigured = 'pending';
+  fetch('/api/ask').then(r => r.json()).then(info => {
+    askConfigured = !(info && info.configured === false);
+    if (askConfigured === false) document.querySelectorAll('.ask-ai').forEach(applyAskCapability);
+  }).catch(() => { askConfigured = null; });
+}
+function applyAskCapability (box) {
+  const b = box && box.querySelector('.ask-open');
+  if (!b) return;
+  b.disabled = true;
+  b.textContent = 'Ask the AI (not enabled here)';
+  b.title = 'This deployment has no model credential set.';
+}
+
+document.addEventListener('submit', (ev) => {
+  const form = ev.target.closest ? ev.target.closest('.ask-form') : null;
+  if (!form) return;
+  ev.preventDefault();
+  const box = form.closest('.ask-ai');
+  const out = box.querySelector('.ask-out');
+  const input = box.querySelector('.ask-input');
+  const send = box.querySelector('.ask-send');
+  const q = input.value.trim();
+  if (!q || send.disabled) return;
+  send.disabled = true;
+  out.hidden = false;
+  out.className = 'ask-out ask-busy';
+  out.textContent = 'Reading the diff…';
+  fetch('/api/ask', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sha: box.dataset.sha, q: q })
+  })
+    .then(res => res.json().then(body => ({ status: res.status, body: body })))
+    .then(r => {
+      send.disabled = false;
+      const b = r.body || {};
+      if (r.status === 200 && b.answer) {
+        out.className = 'ask-out ask-ok';
+        out.textContent = b.answer;
+        const cites = (b.citations || []).map(c => c.file + (c.line ? ':' + c.line : ''));
+        const note = document.createElement('div');
+        note.className = 'ask-note';
+        note.textContent = (b.cached ? 'cached · ' : '') + 'grounded in ' + String(b.sha || box.dataset.sha).slice(0, 12) + (cites.length ? ' · ' + cites.join(', ') : '');
+        out.appendChild(note);
+      } else if (r.status === 422) {
+        // Refused by the grounding gate. Naming the claims is what makes the
+        // refusal actionable instead of looking like a broken feature.
+        out.className = 'ask-out ask-refused';
+        out.textContent = 'Refused: that answer cited things this change does not contain'
+          + ((b.ungrounded && b.ungrounded.length) ? ' (' + b.ungrounded.join(', ') + ')' : '') + '. Ask differently?';
+      } else if (r.status === 429) {
+        out.className = 'ask-out ask-busy';
+        out.textContent = 'Too many questions in the last minute. Try again in ' + (b.retryAfterSec || 60) + 's.';
+      } else if (r.status === 503) {
+        out.className = 'ask-out ask-refused';
+        out.textContent = 'Ask is not enabled on this deployment.';
+      } else {
+        out.className = 'ask-out ask-refused';
+        out.textContent = b.error || ('Ask failed (HTTP ' + r.status + ').');
+      }
+    })
+    .catch(() => {
+      send.disabled = false;
+      out.hidden = false;
+      out.className = 'ask-out ask-refused';
+      out.textContent = 'Could not reach the server. Try again.';
+    });
+});
+
 function htmlEsc(s) {
   return String(s).replace(/[&<>"']/g, function (c) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -1215,6 +1316,7 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
 ${modelDiffLine(e)}
 ${e.eli5?.text ? `<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH</span>${esc(e.eli5.text)}</p>` : ''}
 ${leadHtml}
+${askHtml(e)}
 ${powerStart}
 ${e.eli5?.text ? summaryHtml : ''}
 ${migrationHtml(e)}
@@ -1243,6 +1345,25 @@ ${storyNoteHtml(opts.storyNotes)}
 ${powerEnd}
 </div>
 </details>`
+}
+
+// "Ask the AI" on one entry. Shown only when the row actually ships a diff:
+// the whole point of the feature is that the answer is checked against the
+// stored diff, and a row with no diff has nothing to check it against -- the
+// route answers 422 there, so offering the button would only advertise a
+// feature that cannot work for that row.
+function askHtml (e) {
+  if (!e.hasDiff) return ''
+  return `<div class="ask-ai" data-sha="${esc(e.sha)}">
+<button class="ask-open" type="button" aria-expanded="false">Ask the AI about this change</button>
+<div class="ask-body" hidden>
+  <form class="ask-form" autocomplete="off">
+    <input class="ask-input" type="text" maxlength="400" placeholder="What does this change actually do?" aria-label="Ask the AI about this change">
+    <button class="ask-send" type="submit">ask</button>
+  </form>
+  <div class="ask-out" role="status" aria-live="polite" hidden></div>
+</div>
+</div>`
 }
 
 function deriveTitleSafe (e) {
