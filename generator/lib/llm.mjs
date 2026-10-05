@@ -5717,7 +5717,10 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     return true
   })
   if (templated) log(`ELI5 wrote ${templated} template line${templated === 1 ? '' : 's'} for test-only/docs-only rows (no API calls)`)
-  pending.sort((a, b) => prio(a) - prio(b) || (a.date < b.date ? 1 : a.date > b.date ? -1 : (a.sha < b.sha ? 1 : -1)))
+  // First explanations outrank optional rewrites/rechecks, even when a stale
+  // release has a higher category priority. Preserve the bounded pass for rows
+  // readers cannot yet read, just as the technical writer does.
+  pending.sort((a, b) => Number(!!a.eli5?.text) - Number(!!b.eli5?.text) || prio(a) - prio(b) || (a.date < b.date ? 1 : a.date > b.date ? -1 : (a.sha < b.sha ? 1 : -1)))
   // Same bound as the summary pass: choosing this run's dozen entries must not
   // mean hashing the whole backlog.
   const candidates = pending.slice(0, Number.isFinite(limit) ? Math.max(limit * 4, limit + 5) : 2000)

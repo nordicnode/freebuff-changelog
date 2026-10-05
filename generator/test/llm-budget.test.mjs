@@ -235,6 +235,19 @@ test('forced explanation generation bypasses a current cached explanation withou
   assert.equal(calls, before + 1)
 })
 
+test('missing explanations outrank stale rewrites under a bounded pass', async t => {
+  const dir = await temp(t)
+  const missing = row('1', { date: '2026-10-01T00:00:00Z', ai: { ...clean, model: 'test', v: PROMPT_V } })
+  const stale = row('2', {
+    significance: 'notable', ai: { ...clean, model: 'test', v: PROMPT_V },
+    eli5: { text: 'An earlier explanation.', v: ELI5_V, src: 'old-source', model: 'test' }
+  })
+  t.mock.method(globalThis, 'fetch', async () => response({ eli5: 'The internal setting changed.' }))
+  assert.equal(await enrichEli5([stale, missing], dir, env({ CHANGELOG_ELI5_LIMIT: '1' }), { getPatch: async () => patch }), 1)
+  assert.equal(missing.eli5?.text, 'The internal setting changed.')
+  assert.equal(stale.eli5.text, 'An earlier explanation.', 'optional rewrite keeps its shipped text and spends no slot')
+})
+
 test('CLI regen-last writes both artifacts even when the writer consumes over 40% of the budget', async t => {
   const root = await temp(t), source = join(root, 'source')
   await mkdir(source)
