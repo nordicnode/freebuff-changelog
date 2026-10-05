@@ -13800,10 +13800,10 @@ index 0000000000..dddbc853e5
 +}))
 diff --git a/Apps/agent-voice/worker/README.md b/Apps/agent-voice/worker/README.md
 new file mode 100644
-index 0000000000..5f6e4920e1
+index 0000000000..efdeede455
 --- /dev/null
 +++ b/Apps/agent-voice/worker/README.md
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,158 @@
 +# License worker
 +
 +Cloudflare Worker + KV that turns a paid Paddle transaction into a signed
@@ -13905,18 +13905,33 @@ index 0000000000..5f6e4920e1
 +3. Subscribe the worker to exactly two events:
 +
 +   - `transaction.completed` — grant Pro for that `txn_…` id
-+   - `adjustment.created` — revoke when the payload's `action` is `refund` or
-+     `chargeback`
++   - `adjustment.created` and `adjustment.updated` — change a license when the
++     adjustment is final
 +
 +Anything else is acknowledged with `handled: false` and ignored.
 +
-+`adjustment.created` is Paddle Billing's only refund/chargeback signal — there
-+are no `transaction.refunded` or `transaction.chargeback` events. It is
-+deliberately an allowlist (`refund`, `chargeback`), so a goodwill credit note
-+or a `chargeback_warning` never costs a paying customer their license. The
-+known gap: a `chargeback_reverse` (a dispute Paddle won) does not re-activate
-+the license — reconciling that needs a nightly job reading the Paddle API,
-+which needs an API key this worker does not have.
++These two adjustments are Paddle Billing's only refund/chargeback signal —
++there are no `transaction.refunded` or `transaction.chargeback` events. Three
++rules decide what happens:
++
++| Condition                                                     | Result      |
++| ------------------------------------------------------------- | ----------- |
++| `action` ∈ {refund, chargeback} and `status=approved`         | **revoke**  |
++| `action` ∈ {refund, chargeback} and `status=pending_approval` | nothing     |
++| `status=rejected`                                             | **restore** |
++| anything else (credit, chargeback_warning, reversals)         | nothing     |
++
++Both the action and the status are allowlists. A refund starts at
++`pending_approval`, so revoking on `created` alone would strip Pro from a
++paying customer while Paddle still has the refund under review — and if Paddle
++then rejects it, nothing would put the license back. `restore` flips an
++existing revoked record back to active but never creates one, so a rejected
++adjustment cannot mint a license.
++
++Known gap: a `chargeback_reverse` (a dispute Paddle won) carries status
++`approved` with an action outside the allowlist, so it does not re-activate.
++Reconciling that needs a nightly job reading the Paddle API, which needs an
++API key this worker does not have.
 +
 +4. For the checkout overlay, set the Paddle client token and price id in the
 +   app build (see [`../.env.example`](../.env.example)). The app activates from
@@ -13949,10 +13964,10 @@ index 0000000000..5f6e4920e1
 +a body edited after signing) and rate limiting.
 diff --git a/Apps/agent-voice/worker/src/index.ts b/Apps/agent-voice/worker/src/index.ts
 new file mode 100644
-index 0000000000..91964ba6dc
+index 0000000000..0886a73a91
 --- /dev/null
 +++ b/Apps/agent-voice/worker/src/index.ts
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,261 @@
 +/** Cloudflare Worker: the license backend.
 + *
 + * Routes:
@@ -13969,9 +13984,11 @@ index 0000000000..91964ba6dc
 +
 +import {
 +  actionForEvent,
++  adjustmentRestores,
 +  adjustmentRevokes,
 +  expectedSignature,
 +  idsFromEvent,
++  isAdjustmentEvent,
 +  isTransactionId,
 +  licenseCodeFromEvent,
 +  parseSignatureHeader,
@@ -13985,6 +14002,7 @@ index 0000000000..91964ba6dc
 +  getLicense,
 +  isRateLimited,
 +  releaseDevice,
++  restoreLicense,
 +  revokeLicense,
 +  type KVLike,
 +} from './store'
@@ -14178,25 +14196,34 @@ index 0000000000..91964ba6dc
 +  const eventType = payload.event_type ?? ''
 +  if (!eventType) return fail('missing event_type', 400)
 +
-+  const action = actionForEvent(eventType)
-+  if (action === 'ignore') return json({ ok: true, action, handled: false })
-+
-+  // `adjustment.created` covers refunds, chargebacks *and* harmless credits, so
-+  // the action decides whether the license actually goes away.
-+  if (action === 'revoke' && !adjustmentRevokes(payload.data?.action)) {
-+    return json({ ok: true, action, handled: false })
++  // Classify. An adjustment only becomes final once Paddle approves it, and a
++  // rejected one puts a license back rather than taking it away.
++  let decision: 'activate' | 'revoke' | 'restore' | 'ignore' = 'ignore'
++  if (isAdjustmentEvent(eventType)) {
++    const status = payload.data?.status
++    if (adjustmentRestores(status)) {
++      decision = 'restore'
++    } else if (adjustmentRevokes(payload.data?.action, status)) {
++      decision = 'revoke'
++    }
++  } else if (actionForEvent(eventType) === 'activate') {
++    decision = 'activate'
 +  }
++  if (decision === 'ignore')
++    return json({ ok: true, action: decision, handled: false })
 +
 +  const licenseCode = licenseCodeFromEvent(payload)
-+  if (!licenseCode) return json({ ok: true, action, handled: false })
++  if (!licenseCode) return json({ ok: true, action: decision, handled: false })
 +
 +  const ids = idsFromEvent(payload)
-+  if (action === 'activate') {
++  if (decision === 'activate') {
 +    await activateLicense(env.LICENSES, licenseCode, nowSeconds, ids)
-+  } else {
++  } else if (decision === 'revoke') {
 +    await revokeLicense(env.LICENSES, licenseCode, nowSeconds)
++  } else {
++    await restoreLicense(env.LICENSES, licenseCode, nowSeconds)
 +  }
-+  return json({ ok: true, action, handled: true })
++  return json({ ok: true, action: decision, handled: true })
 +}
 +
 +export default {
@@ -14204,10 +14231,10 @@ index 0000000000..91964ba6dc
 +} satisfies ExportedHandler<Env>
 diff --git a/Apps/agent-voice/worker/src/paddle.ts b/Apps/agent-voice/worker/src/paddle.ts
 new file mode 100644
-index 0000000000..85d729a096
+index 0000000000..e809784fd3
 --- /dev/null
 +++ b/Apps/agent-voice/worker/src/paddle.ts
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,210 @@
 +/** Paddle webhook verification and event handling.
 + *
 + * Paddle signs each webhook with HMAC-SHA256 over
@@ -14302,19 +14329,28 @@ index 0000000000..85d729a096
 +
 +export type LicenseAction = 'activate' | 'revoke' | 'ignore'
 +
++/** Is this event an adjustment (refund / credit / chargeback) notification? */
++export function isAdjustmentEvent(eventType: string): boolean {
++  return (
++    eventType === 'adjustment.created' || eventType === 'adjustment.updated'
++  )
++}
++
 +/**
 + * Paddle Billing has no license keys — the license *is* the paid transaction,
 + * so the transaction id (`txn_…`) is the code the customer holds and the key
 + * every record is filed under.
 + *
-+ * Refunds and chargebacks do not have their own events either: Paddle emits a
-+ * single `adjustment.created` whose `action` distinguishes them.
++ * Refunds and chargebacks do not have their own events either: Paddle emits
++ * `adjustment.created` / `adjustment.updated` whose `action` distinguishes
++ * them and whose `status` says whether the decision is final.
 + */
 +export function actionForEvent(eventType: string): LicenseAction {
 +  switch (eventType) {
 +    case 'transaction.completed':
 +      return 'activate'
 +    case 'adjustment.created':
++    case 'adjustment.updated':
 +      return 'revoke'
 +    default:
 +      return 'ignore'
@@ -14322,19 +14358,41 @@ index 0000000000..85d729a096
 +}
 +
 +/**
-+ * `adjustment.created` actions that actually take the money back.
++ * `adjustment` actions that actually take the money back.
 + *
 + * Deliberately an allowlist: Paddle also emits credits, reversals and
 + * chargeback *warnings*, and an action we do not recognise must never cost a
 + * paying customer their license. `chargeback_reverse` (a dispute we won) is
-+ * the one reversal that should re-activate, and reconciliation via the Paddle
-+ * API is the path for that rather than guessing here.
++ * the one reversal that should re-activate, which is handled by
++ * [`adjustmentRestores`] rather than guessed at here.
 + */
 +const REVOKING_ADJUSTMENTS = new Set(['refund', 'chargeback'])
 +
-+/** Does this adjustment action mean the customer no longer paid? */
-+export function adjustmentRevokes(action: unknown): boolean {
-+  return typeof action === 'string' && REVOKING_ADJUSTMENTS.has(action)
++/** Paddle only considers a refund final once it is approved. */
++const APPROVED = 'approved'
++
++/**
++ * Does this adjustment mean the customer no longer paid?
++ *
++ * A refund starts at `pending_approval`, so revoking on `created` alone would
++ * strip Pro from a paying customer while Paddle still had the refund under
++ * review — and if Paddle then *rejects* it, nothing would put the license
++ * back. Only a final `approved` status revokes.
++ */
++export function adjustmentRevokes(action: unknown, status: unknown): boolean {
++  return (
++    typeof action === 'string' &&
++    REVOKING_ADJUSTMENTS.has(action) &&
++    status === APPROVED
++  )
++}
++
++/**
++ * A previously-pending refund or chargeback was `rejected`, so no money moved
++ * and a license revoked in the meantime should come back.
++ */
++export function adjustmentRestores(status: unknown): boolean {
++  return status === 'rejected'
 +}
 +
 +/** Paddle transaction ids are `txn_` + 26 lowercase base32 characters. */
@@ -14348,8 +14406,10 @@ index 0000000000..85d729a096
 +  event_type?: string
 +  data?: {
 +    id?: string
-+    /** `adjustment.created` only. */
++    /** `adjustment.*` only. */
 +    action?: string
++    /** `pending_approval` | `approved` | `rejected`. */
++    status?: string
 +    transaction_id?: string
 +    custom_data?: Record<string, string>
 +  }
@@ -14387,10 +14447,10 @@ index 0000000000..85d729a096
 +}
 diff --git a/Apps/agent-voice/worker/src/store.ts b/Apps/agent-voice/worker/src/store.ts
 new file mode 100644
-index 0000000000..43ea1b4605
+index 0000000000..cacb7a1a8d
 --- /dev/null
 +++ b/Apps/agent-voice/worker/src/store.ts
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,190 @@
 +/** KV-backed license store and rate limiting.
 + *
 + * Everything is keyed off the Paddle transaction id: Paddle mints it, hands it
@@ -14471,6 +14531,27 @@ index 0000000000..43ea1b4605
 +    paddleTransactionId: paddle.transactionId ?? existing?.paddleTransactionId,
 +    paddleAdjustmentId: paddle.adjustmentId ?? existing?.paddleAdjustmentId,
 +    createdAt: existing?.createdAt ?? nowSeconds,
++    updatedAt: nowSeconds,
++  }
++  await putLicense(kv, code, record)
++  return record
++}
++
++/**
++ * Put a revoked license back in service after a refund or chargeback was
++ * rejected. Nothing is created here — a license that never existed stays
++ * unknown, and devices are *not* resurrected: the customer re-activates.
++ */
++export async function restoreLicense(
++  kv: KVLike,
++  code: string,
++  nowSeconds: number,
++): Promise<LicenseRecord | null> {
++  const existing = await getLicense(kv, code)
++  if (!existing || existing.status === 'active') return existing
++  const record: LicenseRecord = {
++    ...existing,
++    status: 'active',
 +    updatedAt: nowSeconds,
 +  }
 +  await putLicense(kv, code, record)
@@ -14698,10 +14779,10 @@ index 0000000000..de39be898c
 +}
 diff --git a/Apps/agent-voice/worker/test/index.test.ts b/Apps/agent-voice/worker/test/index.test.ts
 new file mode 100644
-index 0000000000..7095c6f705
+index 0000000000..6ef00799e0
 --- /dev/null
 +++ b/Apps/agent-voice/worker/test/index.test.ts
-@@ -0,0 +1,428 @@
+@@ -0,0 +1,480 @@
 +import { beforeEach, describe, expect, test } from 'bun:test'
 +import { handleRequest, type Env } from '../src/index'
 +import { expectedSignature } from '../src/paddle'
@@ -14976,6 +15057,7 @@ index 0000000000..7095c6f705
 +    const res = await signedWebhook('adjustment.created', {
 +      id: 'adj_01m45q62gzqns1n98dwp38038q',
 +      action: 'refund',
++      status: 'approved',
 +      transaction_id: TXN,
 +    })
 +    expect((await json(res)).action).toBe('revoke')
@@ -14984,11 +15066,61 @@ index 0000000000..7095c6f705
 +    expect(JSON.parse((await kv.get(`license:${TXN}`))!).devices).toEqual([])
 +  })
 +
++  test('a pending refund does not touch the license', async () => {
++    await activateLicense(kv, TXN, 1)
++    await activate(TXN, 'device-1')
++
++    const res = await signedWebhook('adjustment.created', {
++      id: 'adj_1',
++      action: 'refund',
++      status: 'pending_approval',
++      transaction_id: TXN,
++    })
++    expect(await json(res)).toEqual({
++      ok: true,
++      action: 'ignore',
++      handled: false,
++    })
++    expect((await activate(TXN, 'device-2')).status).toBe(200)
++  })
++
++  test('a rejected refund puts a revoked license back', async () => {
++    await activateLicense(kv, TXN, 1)
++    await revokeLicense(kv, TXN, 2)
++    expect((await activate(TXN, 'device-1')).status).toBe(410)
++
++    const res = await signedWebhook('adjustment.updated', {
++      id: 'adj_1',
++      action: 'refund',
++      status: 'rejected',
++      transaction_id: TXN,
++    })
++    expect(await json(res)).toEqual({
++      ok: true,
++      action: 'restore',
++      handled: true,
++    })
++    expect((await activate(TXN, 'device-1')).status).toBe(200)
++  })
++
++  test('a rejected adjustment does not create a license that never existed', async () => {
++    const res = await signedWebhook('adjustment.updated', {
++      id: 'adj_1',
++      action: 'refund',
++      status: 'rejected',
++      transaction_id: TXN_UNKNOWN,
++    })
++    expect((await json(res)).handled).toBe(true)
++    expect(await kv.get(`license:${TXN_UNKNOWN}`)).toBeNull()
++    expect((await activate(TXN_UNKNOWN, 'device-1')).status).toBe(404)
++  })
++
 +  test('a chargeback adjustment revokes too', async () => {
 +    await activateLicense(kv, TXN, 1)
 +    const res = await signedWebhook('adjustment.created', {
 +      id: 'adj_1',
 +      action: 'chargeback',
++      status: 'approved',
 +      transaction_id: TXN,
 +    })
 +    expect((await json(res)).handled).toBe(true)
@@ -15001,11 +15133,12 @@ index 0000000000..7095c6f705
 +      const res = await signedWebhook('adjustment.created', {
 +        id: 'adj_1',
 +        action,
++        status: 'approved',
 +        transaction_id: TXN,
 +      })
 +      expect(await json(res)).toEqual({
 +        ok: true,
-+        action: 'revoke',
++        action: 'ignore',
 +        handled: false,
 +      })
 +      expect((await activate(TXN, 'device-1')).status).toBe(200)
@@ -15187,17 +15320,19 @@ index 0000000000..a73dafd57e
 +}
 diff --git a/Apps/agent-voice/worker/test/paddle.test.ts b/Apps/agent-voice/worker/test/paddle.test.ts
 new file mode 100644
-index 0000000000..d4e94c7cd9
+index 0000000000..d25a0e22e2
 --- /dev/null
 +++ b/Apps/agent-voice/worker/test/paddle.test.ts
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,229 @@
 +import { describe, expect, test } from 'bun:test'
 +import {
 +  SIGNATURE_TOLERANCE_SECONDS,
 +  actionForEvent,
++  adjustmentRestores,
 +  adjustmentRevokes,
 +  expectedSignature,
 +  idsFromEvent,
++  isAdjustmentEvent,
 +  isTransactionId,
 +  licenseCodeFromEvent,
 +  parseSignatureHeader,
@@ -15289,9 +15424,17 @@ index 0000000000..d4e94c7cd9
 +  })
 +
 +  test('revokes on adjustments', () => {
-+    // Refunds and chargebacks both arrive as `adjustment.created`; the
-+    // `action` field decides, see `adjustmentRevokes`.
++    // Refunds and chargebacks arrive as adjustments; `status` decides, see
++    // `adjustmentRevokes`.
 +    expect(actionForEvent('adjustment.created')).toBe('revoke')
++    expect(actionForEvent('adjustment.updated')).toBe('revoke')
++  })
++
++  test('recognises adjustment events', () => {
++    expect(isAdjustmentEvent('adjustment.created')).toBe(true)
++    expect(isAdjustmentEvent('adjustment.updated')).toBe(true)
++    expect(isAdjustmentEvent('transaction.completed')).toBe(false)
++    expect(isAdjustmentEvent('')).toBe(false)
 +  })
 +
 +  test('ignores unrelated events', () => {
@@ -15308,9 +15451,15 @@ index 0000000000..d4e94c7cd9
 +})
 +
 +describe('adjustmentRevokes', () => {
-+  test('revokes on refund and chargeback', () => {
-+    expect(adjustmentRevokes('refund')).toBe(true)
-+    expect(adjustmentRevokes('chargeback')).toBe(true)
++  test('revokes a refund or chargeback only once Paddle approves it', () => {
++    expect(adjustmentRevokes('refund', 'approved')).toBe(true)
++    expect(adjustmentRevokes('chargeback', 'approved')).toBe(true)
++  })
++
++  test('does not revoke while an adjustment is pending approval', () => {
++    // Revoking here would strip Pro from a paying customer under review.
++    expect(adjustmentRevokes('refund', 'pending_approval')).toBe(false)
++    expect(adjustmentRevokes('chargeback', 'pending_approval')).toBe(false)
 +  })
 +
 +  test('does not revoke on credits, warnings or reversals', () => {
@@ -15321,16 +15470,26 @@ index 0000000000..d4e94c7cd9
 +      'chargeback_warning_reverse',
 +      'chargeback_reverse',
 +    ]) {
-+      expect(adjustmentRevokes(action)).toBe(false)
++      expect(adjustmentRevokes(action, 'approved')).toBe(false)
 +    }
 +  })
 +
-+  test('fails safe on an unknown or missing action', () => {
-+    // An action we do not understand must never revoke a live license.
-+    expect(adjustmentRevokes(undefined)).toBe(false)
-+    expect(adjustmentRevokes('')).toBe(false)
-+    expect(adjustmentRevokes('some_future_action')).toBe(false)
-+    expect(adjustmentRevokes(42)).toBe(false)
++  test('fails safe on an unknown action or status', () => {
++    // Anything we do not understand must never revoke a live license.
++    expect(adjustmentRevokes('refund', undefined)).toBe(false)
++    expect(adjustmentRevokes('refund', 'approved_rejected')).toBe(false)
++    expect(adjustmentRevokes('some_future_action', 'approved')).toBe(false)
++    expect(adjustmentRevokes(undefined, 'approved')).toBe(false)
++    expect(adjustmentRevokes(42, 'approved')).toBe(false)
++  })
++})
++
++describe('adjustmentRestores', () => {
++  test('restores only when Paddle rejects the adjustment', () => {
++    expect(adjustmentRestores('rejected')).toBe(true)
++    for (const status of ['pending_approval', 'approved', undefined, '']) {
++      expect(adjustmentRestores(status)).toBe(false)
++    }
 +  })
 +})
 +
