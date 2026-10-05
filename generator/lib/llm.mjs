@@ -4906,6 +4906,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
         const stub = (extra) => ({
           error: shortError(err).slice(0, 200),
           ...extra,
+          ...(typeof err?.raw === 'string' && err.raw.trim() ? { raw: err.raw.replace(/\s+/g, ' ').trim().slice(0, 300) } : {}),
           attempts,
           at: new Date().toISOString()
         })
@@ -5707,6 +5708,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
         const stub = (extra) => ({
           error: shortError(err).slice(0, 200),
           ...extra,
+          ...(typeof err?.raw === 'string' && err.raw.trim() ? { raw: err.raw.replace(/\s+/g, ' ').trim().slice(0, 300) } : {}),
           attempts,
           at: new Date().toISOString()
         })

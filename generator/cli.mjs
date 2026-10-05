@@ -15,7 +15,7 @@ import {
   listCommits, isSyncCommit, analyzeSyncCommit, analyzeCommunityCommit,
   extractCleanDiff, churnLabel, testLabel, SYNC_SUBJECT, TEST_RE, extractRawDiff, EMPTY_TREE, commitNatureOf, significanceOf, securityHint,
   extractStructuredFacts, hasStructuredFacts, discoverGlossary } from './lib/analyze.mjs'
-import {  enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, verifyConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows, shortError } from './lib/llm.mjs'
+import {  enrichWithLlm, enrichEli5, eli5Eligible, eli5Done, countPendingEli5, llmConfigured, llmCallCount, llmConcurrency, llmProviderBanner, planLlmPass, rowBudgetMs, eli5RowBudgetMs, warmLlmRpmWindow, verifyConfigured, PROMPT_V, ELI5_V, RELEASE_ROLLUP_V, bumpOnly, collectReleaseContext, formatReleaseContext, aiDone, pruneStaleCache, rememberClosedPrs, enrichOpenPrs, attachPrSummaries, diffPaths, loadGlossary, enrichmentEligible, releaseFailedRows, shortError, errorRetryDelayMs } from './lib/llm.mjs'
 import { QUALITY_POLICY_V, generationState, regenUnfinished } from './lib/quality.mjs'
 import { shortHash, eli5Source } from './lib/util.mjs'
 import { EVIDENCE_WIDTH_WARN, evidenceStats, gcEvidence, liveEvidenceHashes, spillEntryEvidence, spillEvidence } from './lib/evidence.mjs'
@@ -1229,7 +1229,32 @@ async function catchUpOnce (argv, budgets = {}) {
   const queueable = entries.filter(e => !e.noise && enrichmentEligible(e, { CHANGELOG_LLM_NO_BACKFILL: '1' }))
   const isCurrent = (e) => e.ai?.title && (process.env.CHANGELOG_LLM_FORCE_REWRITE === '1' ? (e.ai?.v ?? 1) >= PROMPT_V : true)
   const unsummarized = queueable.filter(e => !isCurrent(e))
-  log(`[enrichment] ${queueable.length} total entries (${unsummarized.length} remaining to summarize)`)
+  // Name the wait, not just the count: "3 remaining" with no attempts looks
+  // stuck, when two rows are cooling until their retry window and one is
+  // parked for a named release. Read from the same cache the queue gates on.
+  {
+    const cache = await readJson(`${DATA}/ai-summaries.json`, {})
+    const cdMs = Number(process.env.CHANGELOG_LLM_ERROR_COOLDOWN_MS || 3600000)
+    const trMs = Number(process.env.CHANGELOG_LLM_TRANSIENT_RETRY_MS || 300000)
+    const maxA = Number(process.env.CHANGELOG_LLM_MAX_ATTEMPTS) > 0 ? Number(process.env.CHANGELOG_LLM_MAX_ATTEMPTS) : 3
+    let cooling = 0, parked = 0
+    for (const e of unsummarized) {
+      const recs = Object.entries(cache)
+        .filter(([k, v]) => k.split(':')[0] === e.sha && v?.error && (v?.v ?? 1) >= 1)
+        .map(([, v]) => v)
+      if (!recs.length) continue
+      if (recs.some(r => !r.error)) continue
+      const states = recs.map(r => errorRetryDelayMs(r, { errorCooldownMs: cdMs, transientRetryMs: trMs, maxAttempts: maxA }))
+      if (states.every(s => s === Infinity)) { parked++; continue }
+      const ready = recs.some(r => {
+        const d = errorRetryDelayMs(r, { errorCooldownMs: cdMs, transientRetryMs: trMs, maxAttempts: maxA })
+        return d !== Infinity && Date.now() - (Date.parse(r.at || '') || 0) >= d
+      })
+      if (!ready) cooling++
+    }
+    const eligible = unsummarized.length - cooling - parked
+    log(`[enrichment] ${queueable.length} total entries (${unsummarized.length} remaining to summarize: ${eligible} eligible, ${cooling} cooling, ${parked} parked)`)
+  }
 
   let limit = Number(process.env.CHANGELOG_LLM_LIMIT || 5)
   const limitIdx = argv.indexOf('--limit')
