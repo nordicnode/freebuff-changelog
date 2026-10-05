@@ -260,6 +260,36 @@ test('worker /api/ask: per-IP rate limiting answers 429 instead of spending', as
   assert.equal(n, 2, 'the refused ask never reaches the model')
 })
 
+test('worker /api/ask: a gateway rate limit rides out with a bounded ladder and never shows the reader the gateway page', async (t) => {
+  let n = 0
+  let mode = 'recovers'
+  const limited = () => new Response('<html>Rate limited due to many requests. Error code: 1015</html>',
+    { status: 429, headers: { 'retry-after': '0' } })
+  t.mock.method(globalThis, 'fetch', async () => {
+    n++
+    if (mode === 'recovers') return n === 1 ? limited() : sse(groundedReply)
+    return limited()
+  })
+
+  // One 429 from the provider's gateway is weather, not an answer: the ladder
+  // retries it inside the ask's budget and the reader gets the grounded reply.
+  const ok = await ask(fakeEnv(assets(), { LLM_API_KEY: 'k' }))
+  assert.equal(ok.status, 200)
+  assert.equal(n, 2, 'the first rate limit was retried, not surfaced')
+  assert.equal((await ok.json()).grounded, true)
+
+  // A gateway that stays shut fails bounded and readable: no Cloudflare HTML,
+  // no error code, and a count that proves the ladder stops.
+  n = 0
+  mode = 'stuck'
+  const stuck = await ask(fakeEnv(assets(), { LLM_API_KEY: 'k' }), { q: 'A different question?' })
+  assert.equal(stuck.status, 500)
+  const body = await stuck.json()
+  assert.match(body.error, /rate-limited right now/)
+  assert.doesNotMatch(body.error, /1015|<html>/i, "the gateway's page never reaches the answer box")
+  assert.equal(n, 3, 'bounded: the initial call plus ASK.rateRetries')
+})
+
 test('worker /api/ask: validation and abuse checks answer before any spend', async (t) => {
   let n = 0
   t.mock.method(globalThis, 'fetch', async () => { n++; return sse(groundedReply) })

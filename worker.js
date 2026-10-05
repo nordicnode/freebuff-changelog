@@ -34,7 +34,14 @@ const ASK = {
   maxQuestion: 400,
   rpm: 5,
   timeoutMs: 25000,
-  maxRetries: 1
+  maxRetries: 1,
+  // The provider's gateway sits behind its own Cloudflare zone and the relay
+  // shares this account, so an ask can land on a gateway rate limit (their
+  // error 1015) instead of on the model. Ride it out inside the ask's budget:
+  // honor Retry-After when sent, cap each wait so an interactive question never
+  // parks on someone else's window, and bound the ladder.
+  rateRetries: 2,
+  rateRetryCapMs: 4000
 }
 
 // Per-isolate state. The counters are best effort on purpose: a Map is correct
@@ -304,14 +311,33 @@ async function askModel (env, key, question, evidence, previousUngrounded) {
     signal: AbortSignal.timeout(ASK.timeoutMs)
   })
 
-  let res = await call(true)
+  const callWithRetry = async (stream) => {
+    for (let attempt = 0; ; attempt++) {
+      const r = await call(stream)
+      if (r.status !== 429 || attempt >= ASK.rateRetries) return r
+      try { await r.body?.cancel() } catch { /* nothing to drain */ }
+      const ra = r.headers.get('retry-after')
+      const raMs = ra !== null && Number.isFinite(Number(ra)) && Number(ra) >= 0
+        ? Number(ra) * 1000
+        : 1000 * (attempt + 1)
+      await new Promise((done) => setTimeout(done, Math.min(raMs, ASK.rateRetryCapMs) + Math.floor(Math.random() * 250)))
+    }
+  }
+
+  let res = await callWithRetry(true)
   if (res.status === 400) {
     const detail = await res.text().catch(() => '')
-    if (/stream/i.test(detail)) res = await call(false)
+    if (/stream/i.test(detail)) res = await callWithRetry(false)
     else return `gateway rejected the ask (${res.status}): ${detail.slice(0, 200)}`
   }
   if (!res.ok) {
     const detail = await res.text().catch(() => '')
+    if (res.status === 429) {
+      // The gateway's own words are a Cloudflare error page, not a reader's
+      // problem: keep them for the logs, hand the reader a sentence.
+      console.error(`ask: gateway rate limited after ${ASK.rateRetries + 1} attempts: ${detail.slice(0, 200)}`)
+      throw new Error('the model is rate-limited right now; try again in a few seconds')
+    }
     throw new Error(`ask failed: HTTP ${res.status} ${detail.slice(0, 200)}`)
   }
   const ctype = res.headers.get('content-type') || ''
