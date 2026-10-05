@@ -1717,18 +1717,25 @@ let rpmWarmup = null
 // cycle deadline exceeded" on every queued row. A caller that can afford to
 // spend the wait before arming its budget calls this directly (see
 // warmLlmRpmWindow); the bounded path below stays for callers that cannot.
+//
+// 15s, not 60s: relay runs start 2+ minutes after the previous run's last call
+// (checkout + cache restore alone take that long), so the previous trailing
+// window has already aged out. A full quiet minute on every process was 45s of
+// dead time per 12-minute run -- the difference between a fresh row summarizing
+// in ~4 minutes and in ~10.
 export async function warmLlmRpmWindow (env = process.env) {
   if (env.CHANGELOG_LLM_RPM_WARMUP !== '1') return
-  rpmWarmup ||= Date.now() + 60010
+  rpmWarmup ||= Date.now() + 15010
   const waitMs = rpmWarmup - Date.now()
   if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs))
 }
 
 async function waitForRpmWarmup (env) {
-  // Serialized CI jobs may use different runners/processes. A full quiet minute
-  // before each paid process protects the previous process's trailing window.
+  // Serialized CI jobs may use different runners/processes. A short quiet
+  // window before each paid process protects the previous process's trailing
+  // calls without stalling a full minute per run.
   if (env.CHANGELOG_LLM_RPM_WARMUP === '1') {
-    rpmWarmup ||= Date.now() + 60010
+    rpmWarmup ||= Date.now() + 15010
     if (Date.now() < rpmWarmup) await boundedWait(rpmWarmup - Date.now(), env)
   }
 }
@@ -1818,10 +1825,10 @@ export async function waitForLlmRpmSlot (env) {
 }
 
 // How many summaries may be in flight at once. waitForLlmRpmSlot is the real
-// throughput bound (CHANGELOG_LLM_RPM per minute); 2-3 in flight just hides
-// network latency between calls. Default 2, opt up to 6.
+// throughput bound (CHANGELOG_LLM_RPM per minute); 3 in flight just hides
+// network latency between calls. Default 3, opt up to 6.
 export function llmConcurrency (env) {
-  return Math.max(1, Math.min(6, Number(env?.CHANGELOG_LLM_CONCURRENCY || 2) || 2))
+  return Math.max(1, Math.min(6, Number(env?.CHANGELOG_LLM_CONCURRENCY || 3) || 3))
 }
 
 // A reply in prose where JSON was asked for is usually a refusal or a
@@ -1994,19 +2001,18 @@ export function rollupLlmEnv (env = process.env) {
 
 // Is this failure one a second route could fix? 5xx, connection faults,
 // response timeouts, 408 and an exhausted 429 wait say something about the
-// route. A model answering from its own training memory is also route-specific:
-// a different family (different cutoff, different memorized models) may answer
-// the same diff cleanly, while re-asking the same family returns the same
-// byte-identical memory answer. Refusals stay on the primary: the prompt
-// trigger (instruction-like product text) fails the same way on any family,
-// and a bad key must surface on the route that owns it rather than be retried
-// elsewhere.
+// route. Content-triggered deterministic failures are also route-specific:
+// a different family has a different refusal policy and a different cutoff,
+// so a prompt that refuses (or answers from memory) on the primary may answer
+// cleanly on the backup, while re-asking the same family returns the same
+// byte-identical failure. A bad key must still surface on the route that owns
+// it rather than be retried elsewhere.
 // Our own cycle guards (deadline, entry budget) are neither -- they interrupt
 // the run and say nothing about either route.
 export function isRouteFailure (err) {
   const msg = String(err?.message || err || '')
   if (/deadline|budget exceeded/i.test(msg)) return false
-  if (/answered from model memory/i.test(msg)) return true
+  if (/answered from model memory|refused the request/i.test(msg)) return true
   if (/HTTP (?:5\d\d|408|429)\b/.test(msg)) return true
   return isGatewayError(err)
 }
