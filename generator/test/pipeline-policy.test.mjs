@@ -449,8 +449,7 @@ test('backup route: auth failures stay on the primary; opt-out disables failover
   assert.deepEqual(seen, ['https://primary.test/v1/chat/completions'], 'opt-out never reaches the backup')
 })
 
-test('backup route: never loops, and a double failure names both routes', async t => {
-  let primary = 0, backup = 0
+test('backup route: never loops, and a double failure names both routes', async t => {  let primary = 0, backup = 0
   t.mock.method(globalThis, 'fetch', async url => {
     if (String(url).includes('primary.test')) { primary++; return new Response('x', { status: 504 }) }
     backup++; return new Response('y', { status: 504 })
@@ -459,6 +458,29 @@ test('backup route: never loops, and a double failure names both routes', async 
   await assert.rejects(callLlm('prompt', be, 4, x => x, { gatewayRetries: 0 }), /LLM HTTP 504; backup route: LLM HTTP 504/)
   assert.equal(primary, 1, 'one primary ask')
   assert.equal(backup, 1, 'exactly one failover, never a second')
+})
+
+test('backup route: a deterministic memory/refusal failure fails over once instead of parking', async t => {
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const u = String(url)
+    seen.push(u)
+    if (u.includes('primary.test')) {
+      // Primary answers from training memory on every rung: the validator
+      // rejects it, the ladder spends lean/stripped, then attempt>2 throws
+      // deterministic. The backup (different family) answers cleanly.
+      return response({ text: 'The latest Claude Opus model I know about is Claude Opus 4.1 as of my knowledge cutoff.' })
+    }
+    return response({ title: 'Limit capped', summary: 'Caps the limit to prevent runaway requests.', significance: 'minor', confidence: 'high' })
+  })
+  const be = { ...env, LLM_API_BASE: 'https://primary.test/v1', LLM_BACKUP_API_BASE: 'https://backup.test/v1', LLM_BACKUP_API_KEY: 'backup-key', LLM_BACKUP_MODEL: 'backup-model' }
+  const out = await callLlm('prompt', be, 1, (o) => {
+    const s = typeof o === 'string' ? o : JSON.stringify(o)
+    if (/latest Claude Opus/i.test(s)) throw new Error('answers from model memory instead of the diff: memory')
+    return o
+  })
+  assert.equal(out.title, 'Limit capped')
+  assert.ok(seen.some(u => u.includes('backup.test')), 'the backup route was tried before parking')
 })
 
 test('backup route: provenance records which route served each request and the writing model', async t => {

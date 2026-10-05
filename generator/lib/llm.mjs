@@ -2304,8 +2304,28 @@ export async function callLlm (prompt, env, attempt = 1, validate = validateLlmO
       // must say "answered from model memory", not the parse error the
       // validator happened to raise first -- and isTransientError must not
       // mistake it for a flaky JSON frame and re-queue it every 5 minutes.
-      if (refused) throw deterministicError(err, 'refused the request', text)
-      if (memoryAnswer) throw deterministicError(err, 'answered from model memory', text)
+      // A different family may answer cleanly where this one repeats itself,
+      // so deterministic failures get the same one-shot backup as route
+      // failures before they park. The backup receives the most reduced prompt
+      // reached on the primary (lean/stripped flags ride along in opts).
+      if (refused || memoryAnswer) {
+        const what = refused ? 'refused the request' : 'answered from model memory';
+        const backup = backupEnvOf(env);
+        if (backup && !opts.usedBackup) {
+          log(`LLM ${what} on the primary route: re-asking once on the backup route`);
+          try {
+            return await callLlm(prompt, backup, 1, validate, { ...opts, usedBackup: true });
+          } catch (backupErr) {
+            const combined = new Error(`${what} on both routes (primary: ${shortError(err)}; backup: ${shortError(backupErr)})`);
+            combined.deterministic = true;
+            if (backupErr.raw) combined.raw = backupErr.raw;
+            else if (text) combined.raw = String(text).replace(/\s+/g, ' ').trim().slice(0, 300);
+            throw combined;
+          }
+        }
+        if (refused) throw deterministicError(err, 'refused the request', text);
+        throw deterministicError(err, 'answered from model memory', text);
+      }
       // The refusal ladder and the repair passes share this attempt counter,
       // and the ladder spends it first: a row that refused twice before
       // answering reached its first VALID reply at attempt 3 with no repair
