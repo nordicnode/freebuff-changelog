@@ -1,0 +1,904 @@
+diff --git a/cli/src/index.tsx b/cli/src/index.tsx
+index e2d1d44f3..65c7bcd52 100644
+--- a/cli/src/index.tsx
++++ b/cli/src/index.tsx
+@@ -1,74 +1,86 @@
+ #!/usr/bin/env bun
+ 
+ // Embed tree-sitter.wasm into the bun-compile binary at a bunfs path the runtime
+ // can find. Without this, web-tree-sitter resolves the wasm via require.resolve,
+ // which (since 0.25.10's split exports map) returns the build-time absolute path
+ // of tree-sitter.cjs and fails on user machines. Must run before the SDK / code-map
+ // import chain triggers Parser.init.
+ import './pre-init/tree-sitter-wasm'
+ 
+ import fs from 'fs'
+ import os from 'os'
+ import path from 'path'
+ 
+ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
+ import { getProjectFileTree } from '@codebuff/common/project-file-tree'
+ import { getDefaultAgentDirs, getWebsiteUrl } from '@codebuff/sdk'
+-import { createCliRenderer } from '@opentui/core'
++import {
++  createCliRenderer,
++  resolveRenderLib,
++  setRenderLibPath,
++} from '@opentui/core'
+ import { createRoot } from '@opentui/react'
+ import {
+   QueryClient,
+   QueryClientProvider,
+   focusManager,
+ } from '@tanstack/react-query'
+ import { cyan, green, red, yellow } from 'picocolors'
+ import React from 'react'
+ 
+ import { App } from './app'
+ import { loadPackageVersion, parseArgs } from './cli-args'
+ import { handlePublish } from './commands/publish'
+ import { runPlainLogin } from './login/plain-login'
+ import { initializeApp } from './init/init-app'
+ import { getProjectRoot, setProjectRoot } from './project-files'
+ import { trackEvent } from './utils/analytics'
+ import { installAiSdkWarningLogger } from './utils/ai-sdk-warnings'
+ import {
+   getTrustStorePath,
+   isTruthyOptIn,
+   promptForAgentDirTrust,
+   resolveTrustedAgentDirs,
+ } from './utils/agent-dir-trust'
+ import {
+   getAuthToken,
+   getAuthTokenDetails,
+   loadStoredAuthToken,
+ } from './utils/auth'
+ import { resetCodebuffClient } from './utils/codebuff-client'
+ import { setApiClientAuthToken } from './utils/codebuff-api'
+ import { IS_FREEBUFF } from './utils/constants'
+ import { getCliEnv } from './utils/env'
++import { getConfigDir } from './utils/config-dir'
++import {
++  bunExtractionTempDir,
++  defaultRenderLibraryCacheDir,
++  ensureRenderLibrary,
++  findEmbeddedRenderLibrary,
++  sweepLeakedRenderLibraryCopies,
++} from './utils/opentui-native-library'
+ import { initializeAgentRegistry } from './utils/local-agent-registry'
+ import { trimOversizedChatLogs } from './utils/chat-history'
+ import { clearLogFile, logger } from './utils/logger'
+ import { drainClientLogs } from './utils/log-shipper'
+ import { takePreviousFatalCrash } from './utils/fatal-crash-report'
+ import { shouldShowProjectPicker } from './utils/project-picker'
+ import { saveRecentProject } from './utils/recent-projects'
+ import { startEngagementTracking } from './utils/engagement'
+ import {
+   CLI_RENDERER_EXIT_SIGNALS,
+   exitCliWithFatalError,
+   installProcessCleanupHandlers,
+ } from './utils/renderer-cleanup'
+ import { startWindowsMachineProcessCensus } from './utils/helper-process-telemetry'
+ import { startTerminalWatchdog } from './utils/terminal-watchdog'
+ import { installTerminalProtocolController } from './utils/terminal-protocol-controller'
+ import { initializeSkillRegistry } from './utils/skill-registry'
+ import { detectTerminalTheme } from './utils/terminal-color-detection'
+ import {
+   noteTerminalColorReply,
+   startClientEnvironmentProbe,
+ } from './utils/client-environment'
+ import { setOscDetectedTheme } from './utils/theme-system'
+ 
+ import type { FileTreeNode } from '@codebuff/common/util/file'
+@@ -463,50 +475,85 @@ async function main(): Promise<void> {
+   // If the renderer crashes during init, these ensure the error is visible
+   // by exiting the alternate screen buffer before printing the error.
+   const earlyFatalHandler = (error: unknown) =>
+     exitCliWithFatalError('Fatal error during startup', error)
+   process.on('uncaughtException', earlyFatalHandler)
+   process.on('unhandledRejection', earlyFatalHandler)
+ 
+   // Last line of defense for uncatchable deaths (SIGKILL, native crashes,
+   // kill sweeps that also take out the npm wrapper): a detached process
+   // (sh on POSIX, PowerShell on Windows) that resets the terminal when this
+   // process disappears. Started before the renderer begins enabling terminal
+   // modes; the clean-shutdown path (renderer-cleanup) disarms it.
+   startTerminalWatchdog()
+   // Windows only: count powershell/conhost/bash/cmd machine-wide every ten
+   // minutes and report a flood (cli.helper_process_flood) — the symptom users
+   // see in Task Manager, which nothing server-side can observe.
+   startWindowsMachineProcessCensus()
+   // Background, one-time; the descriptor reads `unknown` until it resolves.
+   if (IS_FREEBUFF) void startClientEnvironmentProbe()
+ 
+   // The SDK defaults to process.emitWarning(), which bypasses OpenTUI's
+   // console capture and overwrites whichever terminal rows were last drawn.
+   const restoreAiSdkWarnings = installAiSdkWarningLogger((warnings) =>
+     logger.warn(warnings, 'AI SDK warning'),
+   )
++  // Load the native renderer up front, so a temp directory that is full,
++  // read-only or noexec gets a fallback copy and, failing that, an actionable
++  // message instead of "Failed to initialize OpenTUI render library".
++  const renderLibrarySource = await ensureRenderLibrary({
++    resolve: resolveRenderLib,
++    setPath: setRenderLibPath,
++    embeddedFiles: () => Bun.embeddedFiles,
++    cacheDir: () => defaultRenderLibraryCacheDir(getConfigDir()),
++    tempDir: () => bunExtractionTempDir(),
++  })
++  if (renderLibrarySource === 'cache') {
++    logger.warn(
++      { tempDir: bunExtractionTempDir() },
++      'Loaded the terminal renderer from the config directory: the temp directory copy failed',
++    )
++  }
++  // Bun leaves a full copy of the renderer library in the temp directory on
++  // every launch; reclaim older ones off the startup path.
++  setTimeout(() => {
++    const library = findEmbeddedRenderLibrary(Bun.embeddedFiles)
++    if (!library) return
++    void sweepLeakedRenderLibraryCopies({
++      library,
++      tempDir: bunExtractionTempDir(),
++    })
++      .then(({ removed, bytes }) => {
++        if (removed > 0) {
++          logger.info(
++            { removed, bytes },
++            'Removed stale renderer library copies from the temp directory',
++          )
++        }
++      })
++      .catch(() => {})
++  }, 0)
+   const renderer = await createCliRenderer({
+     backgroundColor: 'transparent',
+     exitOnCtrlC: false,
+     exitSignals: CLI_RENDERER_EXIT_SIGNALS,
+     screenMode: 'alternate-screen',
+   })
+   renderer.once('destroy', restoreAiSdkWarnings)
+ 
+   // Install the renderer-aware handlers before removing the startup safety net
+   // so an installation failure still restores the terminal and reports itself.
+   installProcessCleanupHandlers(renderer)
+   const terminalProtocols = installTerminalProtocolController(renderer, {
+     onError: (error) =>
+       logger.debug(error, 'Terminal protocol transition failed'),
+   })
+   renderer.once('destroy', () => terminalProtocols.dispose())
+   process.removeListener('uncaughtException', earlyFatalHandler)
+   process.removeListener('unhandledRejection', earlyFatalHandler)
+ 
+   // Start the engaged-time heartbeat only once the interactive TUI is actually
+   // live — reaching renderer creation means this is a real session (the
+   // login/publish/smoke-test commands all exit earlier). Freebuff-only, matching
+   // the MESSAGE_SENT DAU signal. Stopped in exitCliCleanly().
+   if (IS_FREEBUFF) {
+     startEngagementTracking()
+diff --git a/cli/src/types/env.ts b/cli/src/types/env.ts
+index a8375d7e4..e9b2baef9 100644
+--- a/cli/src/types/env.ts
++++ b/cli/src/types/env.ts
+@@ -5,50 +5,53 @@
+  * - Terminal/IDE detection
+  * - Editor preferences
+  * - Binary build configuration
+  */
+ 
+ import type { BaseEnv, ClientEnv } from '@codebuff/common/types/contracts/env'
+ 
+ /**
+  * CLI-specific env vars for terminal/IDE detection and editor preferences.
+  */
+ export type CliEnv = BaseEnv & {
+   // Windows system paths
+   SystemRoot?: string
+ 
+   // Terminal detection (for tmux/screen passthrough)
+   TERM?: string
+   TMUX?: string
+   STY?: string
+ 
+   // SSH/remote session detection
+   SSH_CLIENT?: string
+   SSH_TTY?: string
+   SSH_CONNECTION?: string
+   CODESPACES?: string
+ 
++  // Where Bun extracts embedded native libraries (the terminal renderer)
++  BUN_TMPDIR?: string
++
+   // Display server detection (Linux headless check)
+   DISPLAY?: string
+   WAYLAND_DISPLAY?: string
+ 
+   // Terminal-specific
+   KITTY_WINDOW_ID?: string
+   SIXEL_SUPPORT?: string
+   ZED_NODE_ENV?: string
+   ZED_TERM?: string
+   ZED_SHELL?: string
+   COLORTERM?: string
+ 
+   // VS Code family detection
+   VSCODE_THEME_KIND?: string
+   VSCODE_COLOR_THEME_KIND?: string
+   VSCODE_GIT_IPC_HANDLE?: string
+   VSCODE_PID?: string
+   VSCODE_CWD?: string
+   VSCODE_NLS_CONFIG?: string
+ 
+   // Cursor editor detection
+   CURSOR_PORT?: string
+   CURSOR?: string
+ 
+   // JetBrains IDE detection
+diff --git a/cli/src/utils/__tests__/opentui-native-library.test.ts b/cli/src/utils/__tests__/opentui-native-library.test.ts
+new file mode 100644
+index 000000000..d77583baf
+--- /dev/null
++++ b/cli/src/utils/__tests__/opentui-native-library.test.ts
+@@ -0,0 +1,248 @@
++import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
++import {
++  existsSync,
++  mkdirSync,
++  mkdtempSync,
++  readdirSync,
++  readFileSync,
++  rmSync,
++  statSync,
++  utimesSync,
++  writeFileSync,
++} from 'fs'
++import { tmpdir } from 'os'
++import path from 'path'
++
++import { dlopen } from 'bun:ffi'
++
++import {
++  RenderLibraryLoadError,
++  bunExtractionTempDir,
++  ensureRenderLibrary,
++  findEmbeddedRenderLibrary,
++  installRenderLibrary,
++  sweepLeakedRenderLibraryCopies,
++} from '../opentui-native-library'
++
++// The two shapes `cli.fatal_crash` reports from Linux binaries.
++const EXTRACTION_FAILED =
++  'Failed to initialize OpenTUI render library: Failed to open library "/$bunfs/root/libopentui-c48jzvfh.so": /$bunfs/root/libopentui-c48jzvfh.so: cannot open shared object file: No such file or directory'
++const NOEXEC_TMP =
++  'Failed to initialize OpenTUI render library: Failed to open library "/tmp/.5bfffdeb1fb7e7d2-00000001.so": /tmp/.5bfffdeb1fb7e7d2-00000001.so: failed to map segment from shared object'
++
++function embedded(name: string, bytes: Uint8Array) {
++  return Object.assign(new Blob([bytes]), { name })
++}
++
++function fakeLibraryBytes(size = 200 * 1024, seed = 7): Uint8Array {
++  const bytes = new Uint8Array(size)
++  for (let i = 0; i < size; i++) bytes[i] = (i * 31 + seed) % 251
++  return bytes
++}
++
++/** The real native library for this platform, when it is installed. */
++async function realLibraryPath(): Promise<string | null> {
++  try {
++    const mod = await import(
++      `@opentui/core-${process.platform}-${process.arch}`
++    )
++    const libraryPath = mod.default as string
++    return existsSync(libraryPath) ? libraryPath : null
++  } catch {
++    return null
++  }
++}
++
++let workDir: string
++beforeEach(() => {
++  workDir = mkdtempSync(path.join(tmpdir(), 'freebuff-render-lib-'))
++})
++afterEach(() => {
++  rmSync(workDir, { recursive: true, force: true })
++})
++
++describe('ensureRenderLibrary', () => {
++  test('uses the bundled library when it loads', async () => {
++    let installs = 0
++    const source = await ensureRenderLibrary({
++      resolve: () => {},
++      setPath: () => {
++        installs++
++      },
++      embeddedFiles: () => [
++        embedded('libopentui-abc123.so', fakeLibraryBytes()),
++      ],
++      cacheDir: () => path.join(workDir, 'cache'),
++      tempDir: () => workDir,
++    })
++    expect(source).toBe('bundled')
++    expect(installs).toBe(0)
++    expect(existsSync(path.join(workDir, 'cache'))).toBe(false)
++  })
++
++  test('falls back to a loadable copy in the config directory when the temp copy fails', async () => {
++    const libraryPath = await realLibraryPath()
++    if (!libraryPath) return // no native package for this platform here
++    const bytes = new Uint8Array(readFileSync(libraryPath))
++    const name = `libopentui-c48jzvfh${path.extname(libraryPath)}`
++    const cacheDir = path.join(workDir, 'config', 'native')
++    let chosenPath: string | undefined
++    const resolve = () => {
++      // Reproduces the field failure: Bun could not unpack into TMPDIR, so
++      // dlopen was handed the virtual /$bunfs path.
++      if (!chosenPath) throw new Error(EXTRACTION_FAILED)
++      dlopen(chosenPath, {
++        setLogCallback: { args: ['ptr'], returns: 'void' },
++      }).close()
++    }
++
++    const source = await ensureRenderLibrary({
++      resolve,
++      setPath: (p) => {
++        chosenPath = p
++      },
++      embeddedFiles: () => [embedded(name, bytes)],
++      cacheDir: () => cacheDir,
++      tempDir: () => workDir,
++    })
++
++    expect(source).toBe('cache')
++    expect(path.dirname(chosenPath!)).toBe(cacheDir)
++    expect(readFileSync(chosenPath!).equals(Buffer.from(bytes))).toBe(true)
++  })
++
++  test('reuses the installed copy and prunes copies from older versions', async () => {
++    const cacheDir = path.join(workDir, 'native')
++    const stale = path.join(cacheDir, 'opentui-0000000000000000.so')
++    const library = embedded('libopentui-abc123.so', fakeLibraryBytes())
++
++    mkdirSync(cacheDir, { recursive: true })
++    writeFileSync(stale, 'previous CLI version')
++    const first = await installRenderLibrary(library, cacheDir)
++    const before = statSync(first).mtimeMs
++    await Bun.sleep(5)
++    const second = await installRenderLibrary(library, cacheDir)
++
++    expect(second).toBe(first)
++    expect(statSync(second).mtimeMs).toBe(before)
++    expect(readdirSync(cacheDir)).toEqual([path.basename(first)])
++    expect(existsSync(stale)).toBe(false)
++  })
++
++  test('explains a noexec temp directory instead of crashing with the raw OpenTUI error', async () => {
++    let error: unknown
++    try {
++      await ensureRenderLibrary({
++        resolve: () => {
++          throw new Error(NOEXEC_TMP)
++        },
++        setPath: () => {},
++        embeddedFiles: () => [
++          embedded('libopentui-abc123.so', fakeLibraryBytes()),
++        ],
++        cacheDir: () => path.join(workDir, 'native'),
++        tempDir: () => workDir,
++      })
++    } catch (caught) {
++      error = caught
++    }
++    expect(error).toBeInstanceOf(RenderLibraryLoadError)
++    const message = (error as Error).message
++    expect(message).toStartWith(
++      'Freebuff could not load its terminal renderer.',
++    )
++    expect(message).toContain('mounted noexec')
++    expect(message).toContain('TMPDIR')
++    expect(message).toContain(`Details: ${NOEXEC_TMP}`)
++    expect(message).toContain('Fallback copy:')
++    // The fatal handler prints `stack`; it must be the advice, not a trace.
++    expect((error as Error).stack).toBe(message)
++  })
++
++  test('names a missing temp directory when there is nothing to fall back to', async () => {
++    const missing = path.join(workDir, 'gone')
++    let message = ''
++    try {
++      await ensureRenderLibrary({
++        resolve: () => {
++          throw new Error(EXTRACTION_FAILED)
++        },
++        setPath: () => {},
++        embeddedFiles: () => [],
++        cacheDir: () => path.join(workDir, 'native'),
++        tempDir: () => missing,
++      })
++    } catch (caught) {
++      message = (caught as Error).message
++    }
++    expect(message).toContain(`Your temp directory (${missing}) does not exist`)
++    expect(message).not.toContain('Fallback copy:')
++  })
++
++  test('only matches the renderer among embedded files', () => {
++    const files = [
++      embedded('tree-sitter-zig-e78zbjpm.wasm', new Uint8Array(1)),
++      embedded('opentui-c5en9p2g.dll', new Uint8Array(1)),
++    ]
++    expect(findEmbeddedRenderLibrary(files)?.name).toBe('opentui-c5en9p2g.dll')
++    expect(findEmbeddedRenderLibrary(files.slice(0, 1))).toBeUndefined()
++  })
++
++  test('Bun extracts into BUN_TMPDIR ahead of TMPDIR', () => {
++    expect(bunExtractionTempDir({ BUN_TMPDIR: '/x' })).toBe('/x')
++    expect(bunExtractionTempDir({})).toBe(tmpdir())
++  })
++})
++
++describe('sweepLeakedRenderLibraryCopies', () => {
++  test('removes only stale byte-identical copies Bun left behind', async () => {
++    const bytes = fakeLibraryBytes()
++    const library = embedded('libopentui-abc123.so', bytes)
++    const old = Date.now() / 1000 - 3600
++    const write = (name: string, content: Uint8Array, stale = true) => {
++      const file = path.join(workDir, name)
++      writeFileSync(file, content)
++      if (stale) utimesSync(file, old, old)
++      return file
++    }
++    const leaked = write('.5bfffdeb1fb7e7d2-00000001.so', bytes)
++    const leaked2 = write('.5bfffdf09b97ddee-00000000.so', bytes)
++    const young = write('.5bfffff83dbfcffa-00000001.so', bytes, false)
++    const tampered = new Uint8Array(bytes)
++    tampered[tampered.length - 1] ^= 1
++    const otherLibrary = write('.5bfffdbb0fbf5fc3-00000001.so', tampered)
++    const otherName = write('libopentui-abc123.so', bytes)
++    const otherExt = write('.5bfffdeb1fb7e7d2-00000002.dylib', bytes)
++    const emptyFromFullDisk = write(
++      '.3dffecff73ff7df6-00000000.so',
++      new Uint8Array(0),
++    )
++    const youngEmpty = write(
++      '.3dffecff77d77ffe-00000001.so',
++      new Uint8Array(0),
++      false,
++    )
++
++    const result = await sweepLeakedRenderLibraryCopies({
++      library,
++      tempDir: workDir,
++    })
++
++    expect(result).toEqual({ removed: 3, bytes: 2 * bytes.length })
++    expect(existsSync(leaked)).toBe(false)
++    expect(existsSync(leaked2)).toBe(false)
++    expect(existsSync(emptyFromFullDisk)).toBe(false)
++    for (const kept of [young, youngEmpty, otherLibrary, otherName, otherExt]) {
++      expect(existsSync(kept)).toBe(true)
++    }
++  })
++
++  test('tolerates an unreadable temp directory', async () => {
++    expect(
++      await sweepLeakedRenderLibraryCopies({
++        library: embedded('libopentui-abc123.so', fakeLibraryBytes()),
++        tempDir: path.join(workDir, 'missing'),
++      }),
++    ).toEqual({ removed: 0, bytes: 0 })
++  })
++})
+diff --git a/cli/src/utils/env.ts b/cli/src/utils/env.ts
+index 18de2fe59..025d5adcc 100644
+--- a/cli/src/utils/env.ts
++++ b/cli/src/utils/env.ts
+@@ -12,50 +12,53 @@ import type { CliEnv } from '../types/env'
+ /**
+  * Get CLI environment values.
+  * Composes from getBaseEnv() + CLI-specific vars.
+  */
+ export const getCliEnv = (): CliEnv => ({
+   ...getBaseEnv(),
+ 
+   // Windows system paths
+   SystemRoot: process.env.SystemRoot,
+ 
+   // Display server detection (Linux headless check)
+   DISPLAY: process.env.DISPLAY,
+   WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY,
+ 
+   // Terminal detection (for tmux/screen passthrough)
+   TERM: process.env.TERM,
+   TMUX: process.env.TMUX,
+   STY: process.env.STY,
+ 
+   // SSH/remote session detection
+   SSH_CLIENT: process.env.SSH_CLIENT,
+   SSH_TTY: process.env.SSH_TTY,
+   SSH_CONNECTION: process.env.SSH_CONNECTION,
+   CODESPACES: process.env.CODESPACES,
+ 
++  // Where Bun extracts embedded native libraries (the terminal renderer)
++  BUN_TMPDIR: process.env.BUN_TMPDIR,
++
+   // Terminal detection
+   KITTY_WINDOW_ID: process.env.KITTY_WINDOW_ID,
+   SIXEL_SUPPORT: process.env.SIXEL_SUPPORT,
+   ZED_NODE_ENV: process.env.ZED_NODE_ENV,
+   ZED_TERM: process.env.ZED_TERM,
+   ZED_SHELL: process.env.ZED_SHELL,
+   COLORTERM: process.env.COLORTERM,
+ 
+   // VS Code family detection
+   VSCODE_THEME_KIND: process.env.VSCODE_THEME_KIND,
+   VSCODE_COLOR_THEME_KIND: process.env.VSCODE_COLOR_THEME_KIND,
+   VSCODE_GIT_IPC_HANDLE: process.env.VSCODE_GIT_IPC_HANDLE,
+   VSCODE_PID: process.env.VSCODE_PID,
+   VSCODE_CWD: process.env.VSCODE_CWD,
+   VSCODE_NLS_CONFIG: process.env.VSCODE_NLS_CONFIG,
+ 
+   // Cursor editor detection
+   CURSOR_PORT: process.env.CURSOR_PORT,
+   CURSOR: process.env.CURSOR,
+ 
+   // JetBrains IDE detection
+   JETBRAINS_REMOTE_RUN: process.env.JETBRAINS_REMOTE_RUN,
+   IDEA_INITIAL_DIRECTORY: process.env.IDEA_INITIAL_DIRECTORY,
+   IDE_CONFIG_DIR: process.env.IDE_CONFIG_DIR,
+   JB_IDE_CONFIG_DIR: process.env.JB_IDE_CONFIG_DIR,
+diff --git a/cli/src/utils/opentui-native-library.ts b/cli/src/utils/opentui-native-library.ts
+new file mode 100644
+index 000000000..3d20de707
+--- /dev/null
++++ b/cli/src/utils/opentui-native-library.ts
+@@ -0,0 +1,350 @@
++import { createHash } from 'crypto'
++import {
++  closeSync,
++  existsSync,
++  mkdirSync,
++  openSync,
++  readdirSync,
++  readSync,
++  renameSync,
++  rmSync,
++  statSync,
++  writeFileSync,
++} from 'fs'
++import os from 'os'
++import path from 'path'
++
++import { getCliEnv } from './env'
++
++/**
++ * OpenTUI's renderer is a native library (.so/.dylib/.dll) that `bun build
++ * --compile` embeds in the binary. Bun cannot dlopen from its virtual
++ * filesystem, so on every launch it copies the library into the temp
++ * directory (TMPDIR) and dlopens the copy. Two things follow:
++ *
++ * - If the temp directory is full or read-only the copy fails and dlopen is
++ *   handed the virtual `/$bunfs/root/libopentui-*.so` path ("cannot open
++ *   shared object file"); if it is mounted noexec the copy lands but cannot
++ *   be mapped ("failed to map segment from shared object"). Either way the
++ *   CLI died at startup with no hint that the temp directory was the cause.
++ * - Bun never deletes the copy. Every launch leaves another full-size
++ *   `.<16 hex>-<8 hex>.<ext>` file behind (measured: 3.3 MB per launch on
++ *   macOS arm64), which is itself a way to fill a small tmpfs.
++ *
++ * So: when the bundled load fails, install the library once into the CLI's
++ * own config directory (content-addressed, reused across launches) and load
++ * it from there; if that fails too, say what to fix. And after a successful
++ * start, delete stale byte-identical copies Bun left in the temp directory.
++ */
++
++const EMBEDDED_LIBRARY_NAME = /^(?:lib)?opentui-[0-9a-z]+\.(?:so|dylib|dll)$/
++const BUN_EXTRACTED_COPY_NAME = /^\.[0-9a-f]{16}-[0-9a-f]{8}\.(?:so|dylib|dll)$/
++const CACHED_LIBRARY_PREFIX = 'opentui-'
++/** A copy younger than this may belong to a launch that has not dlopened yet. */
++const STALE_COPY_AGE_MS = 10 * 60 * 1000
++const COMPARE_BYTES = 64 * 1024
++const MAX_COPIES_PER_SWEEP = 200
++
++type EmbeddedFile = Blob & { name?: string }
++
++export type RenderLibraryDeps = {
++  /** OpenTUI's `resolveRenderLib`: loads the library or throws. */
++  resolve: () => unknown
++  /** OpenTUI's `setRenderLibPath`: valid until a load has succeeded. */
++  setPath: (libraryPath: string) => void
++  embeddedFiles: () => readonly EmbeddedFile[]
++  /** Directory the fallback copy is installed into. */
++  cacheDir: () => string
++  tempDir: () => string
++}
++
++export type RenderLibrarySource = 'bundled' | 'cache'
++
++export class RenderLibraryLoadError extends Error {
++  constructor(message: string) {
++    super(message)
++    this.name = 'RenderLibraryLoadError'
++    // Shown to the user verbatim by the startup fatal handler, which prints
++    // `stack` when present; a JS stack here would only bury the advice.
++    this.stack = message
++  }
++}
++
++function errorMessage(error: unknown): string {
++  return error instanceof Error ? error.message : String(error)
++}
++
++export function findEmbeddedRenderLibrary(
++  files: readonly EmbeddedFile[],
++): EmbeddedFile | undefined {
++  return files.find(
++    (file) =>
++      typeof file.name === 'string' &&
++      EMBEDDED_LIBRARY_NAME.test(path.basename(file.name)),
++  )
++}
++
++/** Why the temp directory cannot take a new file, or null when it can. */
++function probeTempDirectory(directory: string): string | null {
++  const probePath = path.join(
++    directory,
++    `.freebuff-tmp-probe-${process.pid}-${Date.now()}`,
++  )
++  try {
++    writeFileSync(probePath, 'x'.repeat(4096), { flag: 'wx' })
++    return null
++  } catch (error) {
++    const code = (error as NodeJS.ErrnoException).code
++    if (code === 'ENOSPC' || code === 'EDQUOT') return 'is full'
++    if (code === 'EROFS' || code === 'EACCES' || code === 'EPERM') {
++      return 'is not writable'
++    }
++    if (code === 'ENOENT') return 'does not exist'
++    return `could not be written (${code ?? errorMessage(error)})`
++  } finally {
++    try {
++      rmSync(probePath, { force: true })
++    } catch {}
++  }
++}
++
++export function describeRenderLibraryFailure(
++  error: unknown,
++  tempDir: string,
++  fallbackError?: unknown,
++): RenderLibraryLoadError {
++  const detail = errorMessage(error)
++  const tempProblem = probeTempDirectory(tempDir)
++  let cause: string
++  if (tempProblem) {
++    cause = `Your temp directory (${tempDir}) ${tempProblem}, and Freebuff unpacks its terminal renderer there on every start.`
++  } else if (/failed to map segment/i.test(detail)) {
++    cause = `Your temp directory (${tempDir}) does not allow running programs (it is probably mounted noexec), and Freebuff unpacks its terminal renderer there on every start.`
++  } else {
++    cause = `Freebuff unpacks its terminal renderer into your temp directory (${tempDir}) on every start, and loading it from there failed.`
++  }
++  const lines = [
++    'Freebuff could not load its terminal renderer.',
++    '',
++    cause,
++    `Free up space there, or start Freebuff with TMPDIR pointing at a writable directory that allows programs, for example:`,
++    process.platform === 'win32'
++      ? '  set the TMPDIR environment variable to a folder such as %USERPROFILE%\\freebuff-tmp'
++      : '  mkdir -p "$HOME/.cache/freebuff-tmp" && TMPDIR="$HOME/.cache/freebuff-tmp" freebuff',
++    '',
++    `Details: ${detail}`,
++  ]
++  if (fallbackError !== undefined) {
++    lines.push(`Fallback copy: ${errorMessage(fallbackError)}`)
++  }
++  return new RenderLibraryLoadError(lines.join('\n'))
++}
++
++/**
++ * Install `library` into `directory` under a content-addressed name, reusing
++ * an existing install. Atomic: written beside the target, then renamed, so a
++ * crash mid-write never leaves a truncated library to be loaded later.
++ */
++export async function installRenderLibrary(
++  library: EmbeddedFile,
++  directory: string,
++): Promise<string> {
++  const bytes = new Uint8Array(await library.arrayBuffer())
++  const digest = createHash('sha256').update(bytes).digest('hex').slice(0, 16)
++  const extension = path.extname(library.name ?? '') || '.so'
++  const fileName = `${CACHED_LIBRARY_PREFIX}${digest}${extension}`
++  const target = path.join(directory, fileName)
++
++  if (existsSync(target) && statSync(target).size === bytes.byteLength) {
++    return target
++  }
++
++  mkdirSync(directory, { recursive: true })
++  const staging = `${target}.${process.pid}.tmp`
++  try {
++    writeFileSync(staging, bytes, { mode: 0o755 })
++    try {
++      renameSync(staging, target)
++    } catch (error) {
++      // Windows refuses to replace a DLL another Freebuff has loaded; that
++      // copy is the same content-addressed bytes, so use it.
++      if (!existsSync(target) || statSync(target).size !== bytes.byteLength) {
++        throw error
++      }
++    }
++  } finally {
++    try {
++      rmSync(staging, { force: true })
++    } catch {}
++  }
++
++  // Earlier CLI versions' copies are dead weight once this one is in place.
++  try {
++    for (const entry of readdirSync(directory)) {
++      if (entry !== fileName && entry.startsWith(CACHED_LIBRARY_PREFIX)) {
++        try {
++          rmSync(path.join(directory, entry), { force: true })
++        } catch {}
++      }
++    }
++  } catch {}
++
++  return target
++}
++
++/**
++ * Load OpenTUI's renderer, falling back to a copy in the CLI's own config
++ * directory when the temp-directory copy Bun makes cannot be loaded. Throws a
++ * `RenderLibraryLoadError` that tells the user what to change.
++ */
++export async function ensureRenderLibrary(
++  deps: RenderLibraryDeps,
++): Promise<RenderLibrarySource> {
++  let bundledError: unknown
++  try {
++    deps.resolve()
++    return 'bundled'
++  } catch (error) {
++    bundledError = error
++  }
++
++  // Only a compiled binary has an embedded copy to fall back to. From source
++  // the library is a real file in node_modules, so the failure is not ours.
++  const library = findEmbeddedRenderLibrary(deps.embeddedFiles())
++  if (!library) throw describeRenderLibraryFailure(bundledError, deps.tempDir())
++
++  let libraryPath: string
++  try {
++    libraryPath = await installRenderLibrary(library, deps.cacheDir())
++  } catch (installError) {
++    throw describeRenderLibraryFailure(
++      bundledError,
++      deps.tempDir(),
++      installError,
++    )
++  }
++
++  try {
++    deps.setPath(libraryPath)
++    deps.resolve()
++    return 'cache'
++  } catch (fallbackError) {
++    throw describeRenderLibraryFailure(
++      bundledError,
++      deps.tempDir(),
++      fallbackError,
++    )
++  }
++}
++
++function readSlice(
++  filePath: string,
++  position: number,
++  length: number,
++): Uint8Array {
++  const fd = openSync(filePath, 'r')
++  try {
++    const buffer = new Uint8Array(length)
++    const read = readSync(fd, buffer, 0, length, position)
++    return buffer.subarray(0, read)
++  } finally {
++    closeSync(fd)
++  }
++}
++
++function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
++  return Buffer.from(a.buffer, a.byteOffset, a.byteLength).equals(
++    Buffer.from(b.buffer, b.byteOffset, b.byteLength),
++  )
++}
++
++/**
++ * Delete stale copies of the renderer library that Bun extracted into the
++ * temp directory and never removed. A copy qualifies only when it carries
++ * Bun's extraction name and extension, is older than ten minutes, and is
++ * either empty (an extraction that hit a full disk) or the embedded library's
++ * exact size with identical first and last 64 KiB. Removing one is safe
++ * even while a running process has it loaded: POSIX keeps the mapping alive,
++ * and Windows refuses to delete a loaded DLL (the error is ignored). Bun never
++ * reuses a copy, so nothing ever reads these files again.
++ */
++export async function sweepLeakedRenderLibraryCopies({
++  library,
++  tempDir,
++  now = Date.now(),
++  minAgeMs = STALE_COPY_AGE_MS,
++  limit = MAX_COPIES_PER_SWEEP,
++}: {
++  library: EmbeddedFile
++  tempDir: string
++  now?: number
++  minAgeMs?: number
++  limit?: number
++}): Promise<{ removed: number; bytes: number }> {
++  const extension = path.extname(library.name ?? '')
++  const size = library.size
++  const compareLength = Math.min(COMPARE_BYTES, size)
++  const head = new Uint8Array(
++    await library.slice(0, compareLength).arrayBuffer(),
++  )
++  const tail = new Uint8Array(
++    await library.slice(size - compareLength, size).arrayBuffer(),
++  )
++
++  let entries: string[]
++  try {
++    entries = readdirSync(tempDir)
++  } catch {
++    return { removed: 0, bytes: 0 }
++  }
++
++  let removed = 0
++  let reclaimed = 0
++  for (const entry of entries) {
++    if (removed >= limit) break
++    // Runs beside the live renderer: yield between files so a large backlog
++    // never holds the event loop.
++    await new Promise<void>((resolve) => setImmediate(resolve))
++    if (!BUN_EXTRACTED_COPY_NAME.test(entry)) continue
++    if (path.extname(entry) !== extension) continue
++    const candidate = path.join(tempDir, entry)
++    try {
++      const stats = statSync(candidate)
++      if (!stats.isFile()) continue
++      if (now - stats.mtimeMs < minAgeMs) continue
++      if (stats.size === 0) {
++        // An extraction that failed on a full disk leaves an empty file.
++        rmSync(candidate, { force: true })
++        removed++
++        continue
++      }
++      if (stats.size !== size) continue
++      if (!sameBytes(readSlice(candidate, 0, compareLength), head)) continue
++      if (
++        !sameBytes(
++          readSlice(candidate, size - compareLength, compareLength),
++          tail,
++        )
++      ) {
++        continue
++      }
++      rmSync(candidate, { force: true })
++      removed++
++      reclaimed += size
++    } catch {
++      // In use (Windows), raced with another sweep, or unreadable: skip it.
++    }
++  }
++  return { removed, bytes: reclaimed }
++}
++
++export function defaultRenderLibraryCacheDir(configDir: string): string {
++  return path.join(configDir, 'native')
++}
++
++/** Where Bun extracts embedded libraries: BUN_TMPDIR, then TMPDIR, then the OS default. */
++export function bunExtractionTempDir(
++  env: { BUN_TMPDIR?: string } = getCliEnv(),
++): string {
++  return env.BUN_TMPDIR || os.tmpdir()
++}
