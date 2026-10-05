@@ -1,0 +1,1274 @@
+Date: 2026-10-05T11:04:49Z
+Category: Agents
+Areas: Agents
+Commit nature: production
+Stats: +19 / -4
+Analysis notes: Agents changes across 3 file(s) (+19/−4).
+Modified files: agents/base2/base2-free-mimo.ts, agents/base2/base2.ts, agents/base3-free-mimo.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Human model name for the prompt when the wire id is a legacy alias. - The compatibility id still says 2.5; the served model's name does not.
+Complete Source of Modified Files (for complete module context):
+- File `agents/base2/base2-free-mimo.ts` (18 lines):
+```
+import {
+  FREEBUFF_MIMO_V25_MODEL_ID,
+  getFreebuffModel,
+} from '@codebuff/common/constants/freebuff-models'
+
+import { createBase2 } from './base2'
+
+const definition = {
+  ...createBase2('free', {
+    model: FREEBUFF_MIMO_V25_MODEL_ID,
+    modelLabel: getFreebuffModel(FREEBUFF_MIMO_V25_MODEL_ID).displayName,
+  }),
+  id: 'base2-free-mimo',
+  displayName: 'Buffy the MiMo Free Orchestrator',
+}
+
+export default definition
+```
+- File `agents/base2/base2.ts` (596 lines):
+```
+import { buildArray } from '@codebuff/common/util/array'
+import { COMPOSIO_META_TOOL_NAMES } from '@codebuff/common/constants/composio'
+import {
+  FREEBUFF_GEMINI_THINKER_AGENT_ID,
+  FREEBUFF_GEMINI_THINKER_INSTRUCTIONS_PROMPT,
+  FREEBUFF_GEMINI_THINKER_SYSTEM_INSTRUCTION,
+} from '@codebuff/common/constants/freebuff-gemini-thinker'
+import { FREEBUFF_REVIEWER_AGENT_ID_BY_MODEL } from '@codebuff/common/constants/free-agents'
+import {
+  canFreebuffModelSpawnGeminiThinker,
+  FREEBUFF_MINIMAX_M3_MODEL_ID,
+  FREEBUFF_FABLE_5_1_MODEL_ID,
+} from '@codebuff/common/constants/freebuff-models'
+
+import {
+  FABLE_PROVIDER_OPTIONS,
+  FOLLOWUP_STYLE_GUIDANCE,
+  gravityIndexGuidance,
+  LITE_MODEL,
+  OPUS_MODEL,
+  publisher,
+  SKILL_DISCOVERY_GUIDANCE,
+} from '../constants'
+import {
+  PLACEHOLDER,
+  type SecretAgentDefinition,
+} from '../types/secret-agent-definition'
+
+const ENABLE_COMPOSIO_TOOLS = false
+/** base2 delegates deeper research to subagents; base3 has none, and carries
+ *  web_search/read_url itself. */
+const BASE2_DEEPER_RESEARCH =
+  ', and spawn other helpful agents like researcher-web and researcher-docs when you need more depth'
+const THINKER_SPAWN_LIMIT =
+  '[freebuff product prompt text omitted]'
+
+type Base2Mode = 'default' | 'free' | 'lite' | 'max' | 'fast'
+
+/**
+ * Free mode runs MiniMax M3 (routed through the Fireworks AI API). New Freebuff
+ * clients select an explicit free variant from the model picker; the
+ * unqualified base2-free agent covers legacy callers.
+ */
+const MODEL_BY_MODE = {
+  default: OPUS_MODEL,
+  max: OPUS_MODEL,
+  fast: OPUS_MODEL,
+  lite: LITE_MODEL,
+  free: FREEBUFF_MINIMAX_M3_MODEL_ID,
+} satisfies Record<Base2Mode, SecretAgentDefinition['model']>
+
+/**
+ * The reviewer each lean model reviews with, per product. Codebuff adds lite's
+ * own reviewer on top of the shared ones; Freebuff deliberately gets only the
+ * free-tier map, so no free session can resolve to code-reviewer-lite even if a
+ * freebuff agent were pointed at lite's model. Anything unmapped falls back to
+ * DeepSeek Flash — cheap, and allowed in a free session.
+ */
+const CODEBUFF_REVIEWER_BY_MODEL: Record<string, string> = {
+  ...FREEBUFF_REVIEWER_AGENT_ID_BY_MODEL,
+  [LITE_MODEL]: 'code-reviewer-lite',
+}
+const FALLBACK_REVIEWER_AGENT_ID = 'code-reviewer-deepseek-flash'
+
+export function createBase2(
+  mode: Base2Mode,
+  options?: {
+    hasNoValidation?: boolean
+    planOnly?: boolean
+    noAskUser?: boolean
+    noFollowups?: boolean
+    noReview?: boolean
+    noGravityIndex?: boolean
+    model?: SecretAgentDefinition['model']
+    /** Human model name for the prompt when the wire id is a legacy alias. */
+    modelLabel?: string
+    providerOptions?: SecretAgentDefinition['providerOptions']
+  },
+): Omit<SecretAgentDefinition, 'id'> {
+  const {
+    hasNoValidation = mode === 'fast',
+    planOnly = false,
+    noAskUser = false,
+    noFollowups = false,
+    noReview = false,
+    noGravityIndex = false,
+    model: modelOverride,
+    providerOptions,
+  } = options ?? {}
+  const isDefault = mode === 'default'
+  const isFast = mode === 'fast'
+  const isLite = mode === 'lite'
+  const isMax = mode === 'max'
+  // Product identity and orchestration shape used to be one flag, which told
+  // paying lite users they were "coding with AI for free" on a product they
+  // weren't using. isFreebuff picks the branding and the meta-information
+  // block; isLean picks the stripped-down shape lite shares with free mode:
+  // direct edits, a cheap reviewer, no propose_* tools.
+  const isFreebuff = mode === 'free'
+  const isLean = mode === 'free' || mode === 'lite'
+
+  const model = modelOverride ?? MODEL_BY_MODE[mode]
+  // Both lean modes can offload deeper reasoning to the Gemini thinker, which
+  // is the only sanctioned way to reach Gemini Pro.
+  //
+  // Freebuff gates it on the parent model: that set is a free-session admission
+  // rule (see canFreebuffModelSpawnGeminiThinker and free-session/public-api),
+  // limiting which free picks may pull a premium model on an unbilled path.
+  // Lite is billed, so the completions gate leaves it alone and no such
+  // restriction applies.
+  const hasGeminiThinker =
+    isLite || (isFreebuff && canFreebuffModelSpawnGeminiThinker(model))
+  const leanCodeReviewerAgentId =
+    (isFreebuff
+      ? FREEBUFF_REVIEWER_AGENT_ID_BY_MODEL
+      : CODEBUFF_REVIEWER_BY_MODEL)[model] ?? FALLBACK_REVIEWER_AGENT_ID
+  const defaultProviderOptions = getBase2ProviderOptions(model)
+
+  // The worked example is the strongest instruction in this prompt, and in plan
+  // mode it used to end with "you implement the changes using the editor agent"
+  // and a summary of the changes made. A demonstration of building beats a
+  // paragraph saying not to, which is how a PLAN turn shipped and committed a
+  // whole feature. Plan mode gets its own ending.
+  const exampleTail = planOnly
+    ? `[ You have enough context. You write the plan, wrapped in <PLAN></PLAN> tags. ]
+
+[ You do NOT implement anything: no file edits, no editor agent, no basher, no terminal command, no commit. You tell the user the plan is ready and that they can switch out of plan mode to have it built. ]
+ </reponse>
+
+</example>
+
+<example>
+
+<user>just go ahead and build it</user>
+
+<response>
+[freebuff product prompt text omitted]
+</response>
+
+</example>`
+    : `${
+        isDefault
+          ? `[ You implement the changes using the editor agent ]`
+          : isFast || isLean
+            ? '[ You implement the changes using the str_replace or write_file tools ]'
+            : '[ You implement the changes using the editor-multi-prompt agent ]'
+      }
+
+${
+  isDefault
+    ? `[ You spawn a code-reviewer, a basher to typecheck the changes, and another basher to run tests, all in parallel ]`
+    : isLean && !noReview
+      ? `[ You spawn a ${leanCodeReviewerAgentId} to review the changes, a basher to typecheck the local changes, a basher to typecheck the whole project, and another basher to run tests, all in parallel ]`
+      : isLean
+        ? `[ You spawn a basher to typecheck the local changes, a basher to typecheck the whole project, and another basher to run tests, all in parallel ]`
+        : isMax
+          ? `[  You spawn a basher to typecheck the changes, and another basher to run tests, in parallel. Then, you spawn a code-reviewer-multi-prompt to review the changes. ]`
+          : '[ You spawn a basher to typecheck the changes and another basher to run tests, all in parallel ]'
+}
+
+${
+  isDefault
+    ? `[ You fix the issues found by the code-reviewer and type/test errors ]`
+    : isLean && !noReview
+      ? `[ You fix the issues found by the ${leanCodeReviewerAgentId} and type/test errors ]`
+      : isMax
+        ? `[ You fix the issues found by the code-reviewer-multi-prompt and type/test errors ]`
+        : '[ You fix the issues found by the type/test errors and spawn more bashers to confirm ]'
+}
+
+[ All tests & typechecks pass -- you write a very short final summary of the changes you made ]
+ </reponse>
+
+</example>
+
+<example>
+
+<user>what's the best way to refactor [x]</user>
+
+<response>
+[freebuff product prompt text omitted]
+</response>
+
+</example>`
+
+  return {
+    publisher,
+    model,
+    providerOptions: providerOptions ?? defaultProviderOptions,
+    displayName: 'Buffy the Orchestrator',
+    spawnerPrompt:
+      'Advanced base agent that orchestrates planning, editing, and reviewing for complex coding tasks',
+    inputSchema: {
+      prompt: {
+        type: 'string',
+        description: 'A coding task to complete',
+      },
+      params: {
+        type: 'object',
+        properties: {
+          maxContextLength: {
+            type: 'number',
+          },
+        },
+        required: [],
+      },
+    },
+    outputMode: 'last_message',
+    includeMessageHistory: true,
+    toolNames: buildArray(
+      'spawn_agents',
+      'read_files',
+      'read_subtree',
+      !isFast && !planOnly && 'write_todos',
+      !noAskUser && !noFollowups && 'suggest_followups',
+      // Plan mode is enforced by the toolset, not only by the prompt. Prose
+      // alone lost: a user who picked PLAN got the whole feature built and
+      // committed, because every capability a build turn has was still here
+      // and the surrounding prompt still demonstrated using it.
+      !planOnly && 'str_replace',
+      !planOnly && 'write_file',
+      !isLean && !planOnly && 'propose_str_replace',
+      !isLean && !planOnly && 'propose_write_file',
+      !noAskUser && 'ask_user',
+      'read_url',
+      'skill',
+      'set_output',
+      'list_directory',
+      'glob',
+      'render_ui',
+      !noGravityIndex && 'gravity_index',
+      ENABLE_COMPOSIO_TOOLS && [...COMPOSIO_META_TOOL_NAMES],
+    ),
+    spawnableAgents: buildArray(
+      !isMax && 'file-picker',
+      isMax && 'file-picker-max',
+      'code-searcher',
+      'researcher-web',
+      'researcher-docs',
+      // basher and tmux-cli are the shell; editor writes files. All three are
+      // withheld in plan mode -- `git commit` reached the repository through
+      // basher even while the prompt said not to touch anything.
+      !planOnly && 'basher',
+      isDefault && 'thinker',
+      (isDefault || isMax) && ['opus-agent', 'gpt-5-agent'],
+      isMax && 'thinker-best-of-n-opus',
+      isDefault && !planOnly && 'editor',
+      isMax && !planOnly && 'editor-multi-prompt',
+      !planOnly &&
+        (model === FREEBUFF_FABLE_5_1_MODEL_ID ? 'tmux-cli-fable' : 'tmux-cli'),
+      'browser-use',
+      isLean && !noReview && !planOnly && leanCodeReviewerAgentId,
+      isDefault && !planOnly && 'code-reviewer',
+      isMax && !planOnly && 'code-reviewer-multi-prompt',
+      hasGeminiThinker && FREEBUFF_GEMINI_THINKER_AGENT_ID,
+      !isFreebuff && 'thinker-gpt',
+      'context-pruner',
+    ),
+
+    systemPrompt: `[freebuff product prompt text omitted]${isFreebuff ? 'Freebuff' : 'Codebuff'}[freebuff product prompt text omitted]${isFreebuff ? ' for free' : ''}[freebuff product prompt text omitted]
+
+Current date: ${PLACEHOLDER.CURRENT_DATE}.
+
+# General guidelines
+
+- **Conventions & Style:** Rigorously adhere to existing project conventions when modifying code. Analyze surrounding code, tests, and configuration first.
+- **Libraries/Frameworks:** NEVER assume a library/framework is available or appropriate. Verify its established usage within the project (check imports, configuration files like 'package.json', 'Cargo.toml', 'requirements.txt', 'build.gradle', etc., or observe neighboring files) before employing it.
+-[freebuff product prompt text omitted]
+- **Code Reuse:** Always reuse helper functions, components, classes, etc., whenever possible! Don't reimplement what already exists elsewhere in the codebase.
+- **Front end development** We want to make the UI look as good as possible. Don't hold back. Give it your all.
+    - Include as many relevant features and interactions as possible
+    - Add thoughtful details like hover states, transitions, and micro-interactions
+    - Apply design principles: hierarchy, contrast, balance, and movement
+    - Create an impressive demonstration showcasing web development capabilities
+-[freebuff product prompt text omitted]
+-[freebuff product prompt text omitted]
+${noGravityIndex ? '' : `${gravityIndexGuidance(BASE2_DEEPER_RESEARCH)}\n`}
+${
+  noAskUser
+    ? ''
+    : `
+- **Ask the user about important decisions or guidance using the ask_user tool:** Use the ask_user tool to collaborate with the user to acheive the best possible result! Prefer to gather context first before asking questions.`
+}
+-[freebuff product prompt text omitted]
+-[freebuff product prompt text omitted]
+-[freebuff product prompt text omitted]
+${SKILL_DISCOVERY_GUIDANCE}${
+      ENABLE_COMPOSIO_TOOLS
+        ? `
+-[freebuff product prompt text omitted]
+        : ''
+    }${
+      isDefault || isMax
+        ? '[freebuff product prompt text omitted]'
+        : ''
+    }
+- **Keep final summary extremely concise:** Write only a few words for each change you made in the final summary.
+
+# Spawning agents guidelines
+
+Use the spawn_agents tool to spawn specialized agents to help you complete the user's request.
+
+- **Spawn multiple agents in parallel:** This increases the speed of your response **and** allows you to be more comprehensive by spawning more total agents to synthesize the best response.
+-[freebuff product prompt text omitted]
+  ${buildArray(
+    '- Spawn context-gathering agents (file pickers, code searchers, and web/docs researchers) before making edits. Use the list_directory and glob tools directly for searching and exploring the codebase.',
+    hasGeminiThinker && FREEBUFF_GEMINI_THINKER_SYSTEM_INSTRUCTION,
+    isLite &&
+      "[freebuff product prompt text omitted]",
+    isDefault &&
+      !planOnly &&
+      '- Spawn the editor agent to implement the changes after you have gathered all the context you need.',
+    (isDefault || isMax) &&
+      `- Spawn the ${isDefault ? 'thinker' : 'thinker-best-of-n-opus'} after gathering context to solve complex problems or when the user asks you to think about a problem. (gpt-5-agent is a last resort for complex problems)`,
+    isMax &&
+      !planOnly &&
+      `[freebuff product prompt text omitted]`,
+    isLean &&
+      !noReview &&
+      !planOnly &&
+      `- Spawn a ${leanCodeReviewerAgentId} to review the code changes after you have implemented the changes.`,
+    !planOnly &&
+      '- Spawn bashers sequentially if the second command depends on the the first.',
+    isDefault &&
+      !planOnly &&
+      '- Spawn a code-reviewer to review the changes after you have implemented the changes.',
+    isMax &&
+      !planOnly &&
+      '- Spawn a code-reviewer-multi-prompt to review the changes after you have implemented the changes.',
+    planOnly &&
+      '- **Never spawn an agent that writes or runs anything:** the editor, basher and tmux-cli agents are not available to you in plan mode, and asking another agent to make the change on your behalf is the same violation as making it yourself.',
+  ).join('\n  ')}
+-[freebuff product prompt text omitted]
+- **Limit thinker spawns:** ${THINKER_SPAWN_LIMIT}
+- **Never spawn the context-pruner agent:** This agent is spawned automatically for you and you don't need to spawn it yourself.
+
+# ${isFreebuff ? 'Freebuff' : 'Codebuff'} Meta-information
+
+[freebuff product prompt text omitted]
+
+${
+  isFreebuff
+    ? 'See freebuff.com for more information about the product.'
+    : [
+        'Users send prompts to you in one of a few user-selected modes, like DEFAULT, LITE, MAX, or PLAN.',
+        "Every prompt sent consumes the user's credits, which is calculated based on the API cost of the models used.",
+        '[freebuff product prompt text omitted]',
+        '[freebuff product prompt text omitted]',
+      ].join('\n')
+}
+
+# Response examples
+
+<example>
+
+<user>please implement [a complex new feature]</user>
+
+<response>
+[ You spawn 3 file-pickers, 2 code-searchers, and a docs researcher in parallel to find relevant files and do research online. You use the list_directory and glob tools directly to search the codebase. ]
+
+[ You read a few of the relevant files using the read_files tool in two separate tool calls ]
+
+[ You spawn another file-picker and code-searcher to find more relevant files, and use glob tools ]
+
+[ You read a few other relevant files using the read_files tool ]${
+      !noAskUser
+        ? `\n\n[ You ask the user for important clarifications on their request or alternate implementation strategies using the ask_user tool ]`
+        : ''
+    }
+${exampleTail}
+
+${PLACEHOLDER.FILE_TREE_PROMPT_SMALL}
+${PLACEHOLDER.KNOWLEDGE_FILES_CONTENTS}
+${PLACEHOLDER.SYSTEM_INFO_PROMPT}
+
+# Initial Git Changes
+
+The following is the state of the git repository at the start of the conversation. Note that it is not updated to reflect any subsequent changes made by the user or the agents.
+
+${PLACEHOLDER.GIT_CHANGES_PROMPT}
+`,
+
+    instructionsPrompt: planOnly
+      ? buildPlanOnlyInstructionsPrompt({})
+      : buildImplementationInstructionsPrompt({
+          isFast,
+          isDefault,
+          isMax,
+          isLean,
+          hasGeminiThinker,
+          hasNoValidation,
+          noAskUser,
+          noFollowups,
+          noReview,
+          leanCodeReviewerAgentId,
+        }),
+    handleSteps: base2HandleSteps,
+  }
+}
+
+type Base2HandleSteps = NonNullable<SecretAgentDefinition['handleSteps']>
+
+/**
+ * Every base2 route refuses providers that may keep the data, and Claude
+ * additionally comes from Bedrock. This covers the orchestrator's own calls
+ * only — each subagent carries its own providerOptions, and most assert
+ * nothing, so the promise is not yet enforced end to end.
+ *
+ * The privacy policy commits that prompt and project data is not used to train
+ * our or a third-party provider's models unless the model is explicitly
+ * labelled for it — a promise made to every user, not just the free tier. So
+ * data_collection: 'deny' belongs on all of them; leaving it off paid modes
+ * gave paying users weaker enforcement than free ones.
+ *
+ * This used to skip the deny for paid modes on the belief that it would filter
+ * out every endpoint serving lite's model. That was never checked and is false:
+ * with data_collection: 'deny', OpenRouter still serves gpt-5.6-luna (OpenAI),
+ * gemini-3.1-pro (Google), minimax-m3 (Minimax) and claude-opus-5 (Bedrock).
+ */
+function getBase2ProviderOptions(
+  model: SecretAgentDefinition['model'],
+): SecretAgentDefinition['providerOptions'] {
+  if (model === FREEBUFF_FABLE_5_1_MODEL_ID) {
+    return FABLE_PROVIDER_OPTIONS
+  }
+  return model.startsWith('anthropic/')
+    ? { only: ['amazon-bedrock'], data_collection: 'deny' }
+    : { data_collection: 'deny' }
+}
+
+/**
+ * Serialized with .toString(), so every number arrives via `contextPruning`
+ * (resolved by the runtime from contextPrunerBudgetForModel and
+ * compactionPolicyForModel). Only DeepSeek Flash takes the compaction policy:
+ * base2 is the base3 kill-switch fallback, so every other model keeps the
+ * 30-minute gap and no floor it always had rather than the hour/140k default.
+ * Without `contextPruning` (direct drive, older runtime): 400k and 30 minutes.
+ */
+const base2HandleSteps: Base2HandleSteps = function* ({
+  params,
+  model,
+  contextPruning,
+}) {
+  const compaction =
+    model === 'deepseek/deepseek-v4-flash' && contextPruning
+      ? {
+          cacheExpiryMs: contextPruning.cacheExpiryMs,
+          cacheExpiryMinTokens: contextPruning.cacheExpiryMinTokens,
+        }
+      : { cacheExpiryMs: 30 * 60 * 1000 }
+  while (true) {
+    yield {
+      toolName: 'spawn_agent_inline',
+      input: {
+        agent_type: 'context-pruner',
+        params: {
+          maxContextLength: contextPruning?.maxContextLength ?? 400_000,
+          ...(params ?? {}),
+          ...compaction,
+        },
+      },
+      includeToolCall: false,
+    } as any
+
+    const { stepsComplete } = yield 'STEP'
+    if (stepsComplete) break
+  }
+}
+
+const EXPLORE_PROMPT = `[freebuff product prompt text omitted]`
+
+const PLAN_EXPLORE_PROMPT = EXPLORE_PROMPT.replace(
+  'file pickers, code searchers, bashers, and web/docs researchers',
+  'file pickers, code searchers, and web/docs researchers',
+)
+
+function buildImplementationInstructionsPrompt({
+  isFast,
+  isDefault,
+  isMax,
+  isLean,
+  hasGeminiThinker,
+  hasNoValidation,
+  noAskUser,
+  noFollowups,
+  noReview,
+  leanCodeReviewerAgentId,
+}: {
+  isFast: boolean
+  isDefault: boolean
+  isMax: boolean
+  isLean: boolean
+  hasGeminiThinker: boolean
+  hasNoValidation: boolean
+  noAskUser: boolean
+  noFollowups: boolean
+  noReview: boolean
+  leanCodeReviewerAgentId: string
+}) {
+  return `[freebuff product prompt text omitted]
+
+## Example response
+
+The user asks you to implement a new feature. You respond in multiple steps:
+
+${buildArray(
+  EXPLORE_PROMPT,
+  isMax &&
+    `- Important: Read as many files as could possibly be relevant to the task over several steps to improve your understanding of the user's request and produce the best possible code changes. Find more examples within the codebase similar to the user's request, dependencies that help with understanding how things work, tests, etc. This is frequently 12-20 files, depending on the task.`,
+  !noAskUser &&
+    '[freebuff product prompt text omitted]',
+  (isDefault || isMax || isLean) &&
+    `[freebuff product prompt text omitted]${isFast || noReview ? '' : '[freebuff product prompt text omitted]'}[freebuff product prompt text omitted]${hasNoValidation ? '' : '[freebuff product prompt text omitted]'}[freebuff product prompt text omitted]`,
+  `- ${THINKER_SPAWN_LIMIT}`,
+  hasGeminiThinker && FREEBUFF_GEMINI_THINKER_INSTRUCTIONS_PROMPT,
+  (isDefault || isMax) &&
+    `[freebuff product prompt text omitted]`,
+  isDefault &&
+    '[freebuff product prompt text omitted]',
+  isMax &&
+    `[freebuff product prompt text omitted]`,
+  isFast &&
+    '- Implement the changes using the str_replace or write_file tools. Implement all the changes in one go.',
+  isFast &&
+    '- Do a single typecheck targeted for your changes at most (if applicable for the project). Or skip this step if the change was small.',
+  !hasNoValidation &&
+    `[freebuff product prompt text omitted]${isMax ? '[freebuff product prompt text omitted]' : '[freebuff product prompt text omitted]'}[freebuff product prompt text omitted]`,
+  (isDefault || isMax) &&
+    `- Spawn a ${isDefault ? 'code-reviewer' : 'code-reviewer-multi-prompt'} to review the code changes after you have implemented changes. (Skip this step only if the change is extremely straightforward and obvious.)`,
+  isLean &&
+    !noReview &&
+    `- Spawn a ${leanCodeReviewerAgentId} to review the changes after you have implemented code changes. (Skip this step only if the change is extremely straightforward and obvious.)`,
+  !isFast &&
+    !noAskUser &&
+    !noFollowups &&
+    `- At the end of your turn, use the suggest_followups tool to suggest ~3 next steps the user might want to take — e.g., "Add unit tests for UserService", "Split the auth module into smaller files", "Continue with the next step". ${FOLLOWUP_STYLE_GUIDANCE}`,
+).join('\n')}`
+}
+
+function buildPlanOnlyInstructionsPrompt({}: {}) {
+  return `[freebuff product prompt text omitted]
+
+## The rules of plan mode
+
+Forbidden this turn, without exception:
+- Creating, editing, or deleting any file, by any means.
+- Running any terminal command, and above all any state-changing one: no git commit, add, checkout, branch, merge, rebase, reset, stash or push; no installs; no scripts.
+- Spawning any agent that writes files or runs commands (editor, basher, tmux-cli). They are not in your toolset in plan mode, and asking one to act on your behalf is the same violation as acting yourself.
+
+[freebuff product prompt text omitted]
+
+[freebuff product prompt text omitted]
+
+## Example response
+
+The user asks you to implement a new feature. You respond in multiple steps:
+
+${buildArray(
+  PLAN_EXPLORE_PROMPT,
+  `[freebuff product prompt text omitted]
+
+## Asking questions
+
+[freebuff product prompt text omitted]
+
+It'[freebuff product prompt text omitted]'s request.
+
+If you don'[freebuff product prompt text omitted]'s request and how to solve it. However, be sure that you never ask questions with obvious answers or questions about details that can be changed later. Focus on the most important, non-obvious aspects only.
+
+[freebuff product prompt text omitted]
+
+## Creating a spec
+
+Wrap your spec in <PLAN> and </PLAN> tags. The content inside should be markdown formatted (no code fences around the whole plan/spec). For example: <PLAN>\n# Plan\n- Item 1\n- Item 2\n</PLAN>.
+
+The spec should include:
+- A brief title and overview. For the title is preferred to call it a "Plan" rather than a "Spec".
+- A bullet point list of the requirements.
+- An optional "Notes" section detailing any key considerations or constraints or testing requirements.
+- A section with a list of relevant files.
+
+It should not include:
+- A lot of analysis.
+- Sections of actual code.
+- A list of the benefits, performance benefits, or challenges.
+- A step-by-step plan for the implementation.
+- A summary of the spec.
+
+This is more like an extremely short PRD which describes the end result of what the user wants. Think of it like fleshing out the user's prompt to make it more precise, although it should be as short as possible.
+`,
+).join('\n')}`
+}
+
+const definition = { ...createBase2('default'), id: 'base2' }
+export default definition
+```
+- File `agents/base3-free-mimo.ts` (20 lines):
+```
+import {
+  FREEBUFF_MIMO_V25_MODEL_ID,
+  getFreebuffModel,
+} from '@codebuff/common/constants/freebuff-models'
+
+import { createBase3CliRoot } from './base3'
+
+const definition = {
+  ...createBase3CliRoot({
+    model: FREEBUFF_MIMO_V25_MODEL_ID,
+    // The compatibility id still says 2.5; the served model's name does not.
+    modelLabel: getFreebuffModel(FREEBUFF_MIMO_V25_MODEL_ID).displayName,
+    isFreebuff: true,
+  }),
+  id: 'base3-free-mimo',
+  displayName: 'Buffy on MiMo',
+}
+
+export default definition
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `common/src/__tests__/freebuff-models.test.ts` (40 matching lines):
+```
+FREEBUFF_GLM_V53_FLASH_MODEL_ID,
+  FREEBUFF_WEB_LIMITED_MODEL_IDS,
+  FREEBUFF_WEB_GEO_EXEMPT_MODEL_IDS,
+  FREEBUFF_GPT_5_6_LUNA_ES_MODEL_ID,
+  FREEBUFF_GPT_5_6_LUNA_MAX_PRICE,
+  FREEBUFF_GPT_5_6_LUNA_MODEL_ID,
+  FREEBUFF_GPT_6_LUNA_MODEL_ID,
+  FREEBUFF_GPT_61_SOL_MODEL_ID,
+  isFreebuffGpt6LunaModelId,
+  FREEBUFF_GPT_5_6_LUNA_PROVIDER_ROUTE,
+  FREEBUFF_GPT_5_6_LUNA_REASONING_EFFORT,
+  FREEBUFF_KIMI_K3_ECO_MODEL_ID,
+  FREEBUFF_MIMO_V25_MODEL_ID,
+  FREEBUFF_MIMO_V26_PRO_MODEL_ID,
+  FREEBUFF_MODELS,
+  freebuffModelIdMatches,
+  FREEBUFF_MUSE_SPARK_12_CONTRIBUTOR_MODEL_ID,
+  FREEBUFF_MUSE_SPARK_13_CONTRIBUTOR_MODEL_ID,
+  FREEBUFF_MUSE_SPARK_MODEL_IDS,
+  FREEBUFF_MUSE_SPARK_REASONING_EFFORT,
+  FREEBUFF_OX_ALPHA_MODEL_ID,
+  FREEBUFF_SERVICE_ONLY_MODEL_IDS,
+  isFreebuffServiceOnlyModelId,
+  FREEBUFF_STANDARD_MODEL_IDS,
+  FREEBUFF_WEB_ALL_MODELS,
+…
+FREEBUFF_LIMITED_TIER_PLAN_ONLY_MODEL_IDS,
+  LIMITED_FREEBUFF_MODEL_MISMATCH_MESSAGE,
+  MUSE_SPARK_12_CONTRIBUTOR_UPSTREAM_MODEL_ID,
+  MUSE_SPARK_13_CONTRIBUTOR_UPSTREAM_MODEL_ID,
+  MUSE_SPARK_FALLBACK_AFTER_MS,
+  MUSE_SPARK_FALLBACK_MODEL_ID,
+  MUSE_SPARK_FALLBACK_NOTICE,
+  SUPPORTED_FREEBUFF_MODELS,
+  FREEBUFF_WEB_PREMIUM_MODEL_IDS,
+  canFreebuffModelSpawnGeminiThinker,
+  freebuffWithdrawnModelMessage,
+  getFreebuffDeploymentAvailabilityLabel,
+  getFreebuffModel,
+  getFreebuffModelImageSupport,
+  getFreebuffModelReasoningEffort,
+  getFreebuffModelSupersededBy,
+  getFreebuffModelsForAccessTier,
+  getFreebuffWebModel,
+  getRecommendedFreebuffModelId,
+  getRecommendedFreebuffWebModelId,
+  isFreebuffDeploymentHours,
+  isFreebuffRewardModelId,
+  isRewardModelRedeemableAtLimitedTier,
+  isFreebuffGlmV53FlashModelId,
+  isFreebuffGpt56LunaModelId,
+…
+// guards keep asserting on the WIRE ids even if a constant of the same name is
+// ever reintroduced.
+const FREEBUFF_MIMO_V25_PRO_MODEL_ID = 'mimo/mimo-v2.5-pro'
+const FREEBUFF_CROF_GLM_V52_MODEL_ID = 'crof/glm-5.2'
+
+const MINIMAX_M3_MODEL_ID = minimaxModels.minimaxM3
+
+describe('freebuff model availability', () => {
+  test('the default is joinable at every hour; the fallback is unlimited', () => {
+    // The two constants answer different questions: the default is the STARTING
+    // pick (leading FREEBUFF_MODELS is the only steer — nothing is badged), the
+    // fallback is what is always joinable when the premium pool is spent.
+    expect(DEFAULT_FREEBUFF_MODEL_ID).toBe(FREEBUFF_MIMO_V25_MODEL_ID)
+    expect(FALLBACK_FREEBUFF_MODEL_ID).toBe(FREEBUFF_MIMO_V25_MODEL_ID)
+
+    //
+    // THE invariant that moved the default off Flash. A default is what a new
+    // user lands on before they know the catalog exists, so it must be open at
+    // every hour — and Flash now closes for the ten-hour peak window. Asserted
+    // at both ends of that window rather than at "now", or the test passes or
+    // fails depending on what time CI runs.
+    expect(
+      isFreebuffSessionModelAvailable(
+        DEFAULT_FREEBUFF_MODEL_ID,
+        new Date('2026-08-21T02:00:00Z'),
+```
+- File `cli/src/hooks/__tests__/freebuff-multi-session.test.tsx` (21 matching lines):
+```
+existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createTestRenderer } from '@opentui/core/testing'
+import { createRoot, flushSync } from '@opentui/react'
+import React from 'react'
+import {
+  FREEBUFF_MIMO_V25_MODEL_ID,
+  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+} from '@codebuff/common/constants/freebuff-models'
+import * as auth from '../../utils/auth'
+import { useFreebuffSessionStore } from '../../state/freebuff-session-store'
+import { useFreebuffModelStore } from '../../state/freebuff-model-store'
+import { freebuffSessionMetadata } from '../../utils/freebuff-session-identity'
+import { consumeFreebuffSessionRelaunch } from '../../utils/freebuff-session-relaunch'
+import * as cli from '../use-freebuff-session'
+
+// IS_FREEBUFF is a build-time constant. Run the controller in its own Freebuff
+// process instead of mocking an already-imported constant in other CLI suites.
+if (process.env.CLI_MULTI_SESSION_TEST !== '1') {
+…
+capacity = Infinity
+    losePostResponse = false
+    loseDeleteResponse = false
+    tier = 'full'
+    configDir = mkdtempSync(join(tmpdir(), 'cli-multi-session-'))
+    configSpy = spyOn(auth, 'getConfigDir').mockReturnValue(configDir)
+    authSpy = spyOn(auth, 'getAuthTokenDetails').mockReturnValue({
+      token: 'fixture',
+      source: 'environment',
+    })
+    useFreebuffModelStore
+      .getState()
+      .setSelectedModel(FREEBUFF_MIMO_V25_MODEL_ID)
+    useFreebuffSessionStore.getState().setSession(null)
+    fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      // Like the real transport: an already-aborted signal never reaches the
+      // network. Without this, a request made on a dead controller passes.
+      if (init?.signal?.aborted)
+        throw new DOMException('The operation was aborted.', 'AbortError')
+      const headers = new Headers(init?.headers)
+      const method = init?.method ?? 'GET'
+      const path = new URL(String(input)).pathname
+…
+}
+    flushSync(() => root.render(<Controller />))
+    await until(
+      () =>
+        useFreebuffSessionStore.getState().session?.status === expectedStatus,
+    )
+  }
+
+  test('startup, admission, model switch and end never take a sibling session', async () => {
+    rows.set('desktop-sibling', active('desktop-sibling'))
+    await mount()
+    expect(requests.every((r) => r.method === 'GET')).toBe(true)
+    await cli.startFreebuffSession(FREEBUFF_MIMO_V25_MODEL_ID)
+    const first = cli.getFreebuffInstanceId()!
+    expect(rows.size).toBe(2)
+    expect(freebuffSessionMetadata(first)).toEqual({
+      freebuff_instance_id: first,
+      freebuff_multi_session: '1',
+      surface: 'cli',
+    })
+    await cli.startFreebuffSession(FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID)
+    const second = cli.getFreebuffInstanceId()!
+    expect(second).not.toBe(first)
+    expect(rows.has(first)).toBe(false)
+    expect(rows.get(second)?.model).toBe(FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID)
+```
+- File `common/src/constants/freebuff-models.ts` (7 matching lines):
+```
+// HY3 IS GONE, on every surface and every route (removed 2026-08-07). It left
+// Freebuff on 2026-08-04 but its wire ids lived on for paid/BYOK callers via
+// web/src/llm-api/hy3-fallback.ts; that file, the Atlas Cloud adapter that was
+// its paid lane, and the `tencent/hy3*` model-config entries have all been
+// deleted. Nothing routes these slugs now — a request for one falls through to
+// the ordinary unknown-model path.
+/** The MiMo row's wire id. Serves MiMo 2.6 FLASH since 2026-09-21 — the
+ *  `v2.5` in the id is history, not the model. Kept rather than minted anew for
+ *  the reason DeepSeek V4.1 kept its undated id: every installed binary, saved
+ *  pick, allowlist, fallback and the limited catalog already names this one,
+ *  and a new id would strand all of them on a row that no longer exists. The
+ *  upstream name is chosen in web/src/llm-api/mimo-request-body.ts. */
+export const FREEBUFF_MIMO_V25_MODEL_ID = mimoModels.mimoV25
+/** MiMo 2.6 Pro (2026-09-21), paid-only on every surface, 30 Freebucks. Unlike the MiMo
+ *  row above it has its own id: it is a different, dearer model, and one wire
+ *  id per entitlement is the rule (a Pro served under the Flash id would be a
+ *  30-Freebuck model sold at 10). */
+export const FREEBUFF_MIMO_V26_PRO_MODEL_ID = mimoModels.mimoV26Pro
+/** GLM 5.2, served by CrofAI's direct OpenAI-compatible API (moved off
+ *  Fireworks serverless 2026-07-29, at ~4x less than Fireworks' list price).
+ *  The `z-ai/` prefix is a wire id inherited from the Fireworks era — nothing
+ *  reaches Z.ai; CrofAI receives its native `glm-5.2` id (see CROF_MODEL_MAP).
+ *
+ *  This is the ONLY GLM 5.2 route. Unlike the other picker models it is NOT
+ *  freely available — it is unlocked by referring friends. Each qualified
+…
+// peak. Pointing Pro at Flash would send users to a model that is asleep for
+  // ten hours precisely when this one is their best option — and because
+  // `migrateSupersededFreebuffModelPreference` rewrites a SAVED pick on every
+  // load, it would do that silently and repeatedly. That exact failure is
+  // documented on MIMO_V25_MODEL; this is the same trap pointing the other way.
+  // No `isNew`. The badge exists to pull attention to a row, which is the
+  // opposite of what this one should do now.
+} as const satisfies FreebuffModelOption
+
+const MIMO_V25_MODEL = {
+  id: FREEBUFF_MIMO_V25_MODEL_ID,
+  // MiMo 2.6 Flash since 2026-09-21, under the unchanged wire id (see
+  // FREEBUFF_MIMO_V25_MODEL_ID). Same Xiaomi rate card as 2.5 to the cent
+  // ($0.14 in / $0.28 out / $0.0028 cache read per M), so nothing about this
+  // row's economics or its unmetered/fallback role moved with the name.
+  displayName: 'MiMo 2.6 Flash',
+  tagline: 'Balanced',
+  availability: 'always',
+  dataUse: 'service',
+  premium: false,
+  multimodal: true,
+  // Xiaomi exposes only disabled and high (enabled) for MiMo 2.5. Since the
+  // product has no separate thinking on/off control, there is no depth ladder
+  // to render here; low/medium/max would merely be compatibility aliases.
+  // NOT superseded as of 2026-08-18, and the reason is the whole point of the
+…
+*  Unlike the Luna and Flash defaults before it, this row carries NO
+ *  AI-training notice (`dataUse: 'service'`), so the disclosure a first-time
+ *  user sees changes — pickers still render `warning`, there is simply no
+ *  longer one to render on the default row. */
+//
+// MiMo 2.6 Flash since 2026-09-30 (product call), on every surface and tier:
+// DEFAULT_FREEBUFF_WEB_MODEL_ID and LIMITED_FREEBUFF_HERO_MODEL_ID moved with
+// it. Only the RECOMMENDATION moved. PREVIOUS_DEFAULT_FREEBUFF_MODEL_ID and
+// FREEBUFF_DEFAULT_MODEL_MIGRATION_ID were deliberately NOT bumped, so no saved
+// GLM pick is rewritten: MiMo is 10 Freebucks an hour to GLM's 5, and moving
+// an inherited GLM pick onto it would silently halve that user's hours.
+export const DEFAULT_FREEBUFF_MODEL_ID: FreebuffModelId =
+  FREEBUFF_MIMO_V25_MODEL_ID
+
+/** The default this one replaced, and the stamp of the one-time move of saved
+ *  picks off it (util/freebuff-default-model-migration.ts). Every surface
+ *  persists the model a session ran on, so a saved old default is usually
+ *  inherited, not chosen. Bump both together at the next flip. */
+export const PREVIOUS_DEFAULT_FREEBUFF_MODEL_ID: FreebuffModelId =
+  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID
+export const FREEBUFF_DEFAULT_MODEL_MIGRATION_ID = 'glm-5.3-flash-2026-09-05'
+
+/** What new Freebuff Web/Cloud users see selected in the browser pickers, and
+ *  the model a new Cloud thread starts on. DeepSeek V4.1 Flash as of
+ *  2026-09-02, moving with DEFAULT_FREEBUFF_MODEL_ID rather than independently.
+```
+- File `cli/src/components/__tests__/freebuff-model-selector.test.tsx` (6 matching lines):
+```
+import { createTestRenderer } from '@opentui/core/testing'
+import { createRoot, flushSync } from '@opentui/react'
+import React from 'react'
+
+import { FREEBUCKS_LABEL } from '../../utils/freebucks'
+import * as openUrl from '../../utils/open-url'
+import { FreebuffModelSelector } from '../freebuff-model-selector'
+import {
+  FREEBUFF_REWARD_MODEL_ID,
+  DEFAULT_FREEBUFF_MODEL_ID,
+  FALLBACK_FREEBUFF_MODEL_ID,
+  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+  FREEBUFF_MIMO_V25_MODEL_ID,
+  FREEBUFF_GLM_V53_FLASH_MODEL_ID,
+  FREEBUFF_SOLAR_MINI_4_MODEL_ID,
+  FREEBUFF_FABLE_5_1_MODEL_ID,
+  FREEBUFF_GEMINI_38_FLASH_MODEL_ID,
+  FREEBUFF_GLM_V52_MODEL_ID,
+  FREEBUFF_GPT_6_LUNA_MODEL_ID,
+  FREEBUFF_MINIMAX_M3_MODEL_ID,
+  FREEBUFF_MODELS,
+  getFreebuffModelSupersededBy,
+  isFreebuffModelId,
+  FREEBUFF_LIMITED_TIER_PLAN_ONLY_MODEL_IDS,
+  getFreebuffModel,
+  LIMITED_FREEBUFF_HERO_MODEL_ID,
+  LIMITED_FREEBUFF_MODELS,
+  FREEBUFF_ENABLE_FAST_MODE_IN_UI,
+} from '@codebuff/common/constants/freebuff-models'
+
+import { initializeThemeStore } from '../../hooks/use-theme'
+import {
+  getSelectedFreebuffModel,
+  useFreebuffModelStore,
+} from '../../state/freebuff-model-store'
+import { useFreebuffSessionStore } from '../../state/freebuff-session-store'
+…
+await Promise.resolve()
+    await setup.renderOnce()
+    await setup.renderOnce()
+
+    // Lands on the RECOMMENDATION, which is now unmetered — so unlike every
+    // version of this test since 2026-08-12 the destination is not the
+    // fallback. The user is moved off the row they cannot use and onto the one
+    // the picker leads with, rather than being demoted two steps.
+    expect(getSelectedFreebuffModel()).toBe(DEFAULT_FREEBUFF_MODEL_ID)
+    const frame = setup.captureCharFrame()
+    // `›` is the cursor: it has to be on the row Enter now commits.
+    expect(frame).toContain(
+      `› ${getFreebuffModel(DEFAULT_FREEBUFF_MODEL_ID).displayName}`,
+    )
+    // …and that row is the whole screen, exactly as for a user who is already
+    // on the recommendation. The spent rows live behind the toggle.
+    expect(frame).toContain('See all')
+    expect(frame).not.toContain('PREMIUM')
+  })
+
+  test('repairs an invalid selection to the unlimited recommendation when premium is exhausted', async () => {
+    const resetAt = new Date(FIXED_NOW_MS + 60_000).toISOString()
+    useFreebuffSessionStore.getState().setSession({
+      status: 'none',
+      accessTier: 'full',
+```
+- File `common/src/__tests__/free-agents.test.ts` (6 matching lines):
+```
+GEMINI_3_5_FLASH_LITE_MODEL_ID,
+} from '../constants/gemini'
+
+import {
+  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+  FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID,
+  SUPPORTED_FREEBUFF_MODELS,
+  FREEBUFF_GEMINI_PRO_MODEL_ID,
+  FREEBUFF_GLM_V52_MODEL_ID,
+  FREEBUFF_GPT_5_6_LUNA_MODEL_ID,
+  FREEBUFF_GPT_6_LUNA_MODEL_ID,
+  FREEBUFF_KIMI_K3_ECO_MODEL_ID,
+  FREEBUFF_MIMO_V25_MODEL_ID,
+  FALLBACK_FREEBUFF_MODEL_ID,
+  DEFAULT_FREEBUFF_MODEL_ID,
+} from '../constants/freebuff-models'
+import { minimaxModels } from '../constants/model-config'
+import { FREEBUFF_GEMINI_THINKER_AGENT_ID } from '../constants/freebuff-gemini-thinker'
+import {
+  FREEBUFF_BASE3_AGENT_IDS,
+  FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL,
+  FREEBUFF_DESKTOP_AUTORUN_AGENT_ID,
+  FREEBUFF_DESKTOP_THREAD_AGENT_IDS,
+  FREEBUFF_REVIEWER_AGENT_ID_BY_MODEL,
+  FREEBUFF_WEB_BASE3_AGENT_ID_BY_MODEL,
+…
+// these guards keep asserting on the WIRE ids and agent ids.
+const FREEBUFF_MIMO_V25_PRO_MODEL_ID = 'mimo/mimo-v2.5-pro'
+const FREEBUFF_CROF_GLM_V52_MODEL_ID = 'crof/glm-5.2'
+
+describe('free mode agent model allowlist', () => {
+  test('maps supported freebuff models to concrete root agents', () => {
+    expect(
+      getFreebuffRootAgentIdForModel(FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID),
+    ).toBe('base2-free-deepseek')
+    expect(
+      getFreebuffRootAgentIdForModel(FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID),
+    ).toBe('base2-free-deepseek-flash')
+    expect(getFreebuffRootAgentIdForModel(FREEBUFF_MIMO_V25_MODEL_ID)).toBe(
+      'base2-free-mimo',
+    )
+    expect(getFreebuffRootAgentIdForModel(MINIMAX_M3_MODEL_ID)).toBe(
+      'base2-free-minimax-m3',
+    )
+    expect(getFreebuffRootAgentIdForModel(FREEBUFF_GPT_5_6_LUNA_MODEL_ID)).toBe(
+      'base2-free-luna',
+    )
+    expect(getFreebuffRootAgentIdForModel(FREEBUFF_KIMI_K3_ECO_MODEL_ID)).toBe(
+      'base2-free-kimi-k3-eco',
+    )
+    // Root ids must also be registered, or the chat-completions hierarchy gate
+…
+FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID,
+      ),
+    ).toBe(true)
+    expect(
+      isFreeModeAllowedAgentModel(
+        'base2-free-deepseek-flash',
+        FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+      ),
+    ).toBe(true)
+    expect(
+      isFreeModeAllowedAgentModel(
+        'base2-free-mimo',
+        FREEBUFF_MIMO_V25_MODEL_ID,
+      ),
+    ).toBe(true)
+    expect(
+      isFreeModeAllowedAgentModel(
+        'base2-free-mimo',
+        FREEBUFF_MIMO_V25_PRO_MODEL_ID,
+      ),
+    ).toBe(false)
+    expect(
+      isFreeModeAllowedAgentModel(
+        'base2-free-mimo',
+        `${FREEBUFF_MIMO_V25_MODEL_ID}-20260527`,
+```
+- File `cli/src/utils/__tests__/settings.test.ts` (4 matching lines):
+```
+import fs from 'fs'
+import os from 'os'
+import path from 'path'
+
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import {
+  DEFAULT_FREEBUFF_MODEL_ID,
+  FALLBACK_FREEBUFF_MODEL_ID,
+  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+  FREEBUFF_GLM_V52_MODEL_ID,
+  FREEBUFF_MIMO_V25_MODEL_ID,
+  FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID,
+  FREEBUFF_GLM_V53_FLASH_MODEL_ID,
+  PREVIOUS_DEFAULT_FREEBUFF_MODEL_ID,
+} from '@codebuff/common/constants/freebuff-models'
+
+import * as auth from '../auth'
+import {
+  getSettingsPath,
+  hasSeenFreebucksIntro,
+  loadSettings,
+  markFreebucksIntroSeen,
+  loadFreebuffModelPreference,
+…
+path.join(testConfigDir, 'settings.json'),
+      JSON.stringify({ freebuffModel: FREEBUFF_GLM_V53_FLASH_MODEL_ID }),
+    )
+    expect(loadFreebuffModelPreference()).toBe(FREEBUFF_GLM_V53_FLASH_MODEL_ID)
+
+    // And a round-trip through save/load leaves every selectable row alone. The
+    // property is "the picker is the user's decision, not ours" — asserted
+    // across the catalog rather than on one row, because the failure mode is a
+    // notice added for ONE model quietly acquiring this behaviour.
+    for (const id of [
+      FREEBUFF_GLM_V53_FLASH_MODEL_ID,
+      FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+      FREEBUFF_MIMO_V25_MODEL_ID,
+    ]) {
+      saveFreebuffModelPreference(id)
+      expect(loadFreebuffModelPreference()).toBe(id)
+    }
+  })
+
+  test('a withdrawn pick is DROPPED, not carried or rewritten', () => {
+    testConfigDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'freebuff-settings-test-'),
+    )
+    getConfigDirSpy = spyOn(auth, 'getConfigDir').mockReturnValue(testConfigDir)
+…
+path.join(os.tmpdir(), 'freebuff-settings-test-'),
+    )
+    getConfigDirSpy = spyOn(auth, 'getConfigDir').mockReturnValue(testConfigDir)
+  }
+
+  test('a saved previous default moves; any other pick survives', () => {
+    useTempConfigDir()
+    fs.writeFileSync(
+      getSettingsPath(),
+      JSON.stringify({ freebuffModel: PREVIOUS_DEFAULT_FREEBUFF_MODEL_ID }),
+    )
+    expect(loadFreebuffModelPreference()).toBe(DEFAULT_FREEBUFF_MODEL_ID)
+    saveFreebuffModelPreference(FREEBUFF_MIMO_V25_MODEL_ID)
+    expect(loadFreebuffModelPreference()).toBe(FREEBUFF_MIMO_V25_MODEL_ID)
+  })
+
+  test('an empty file is stamped on first read, so a later pick of the old default sticks', () => {
+    useTempConfigDir()
+    expect(loadFreebuffModelPreference()).toBeUndefined()
+    saveFreebuffModelPreference(PREVIOUS_DEFAULT_FREEBUFF_MODEL_ID)
+    expect(loadFreebuffModelPreference()).toBe(
+      PREVIOUS_DEFAULT_FREEBUFF_MODEL_ID,
+    )
+  })
+})
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/agents/base2/base2-free-mimo.ts b/agents/base2/base2-free-mimo.ts
+index 51bf2de41..7a463c158 100644
+--- a/agents/base2/base2-free-mimo.ts
++++ b/agents/base2/base2-free-mimo.ts
+@@ -1,13 +1,17 @@
+-import { FREEBUFF_MIMO_V25_MODEL_ID } from '@codebuff/common/constants/freebuff-models'
++import {
++  FREEBUFF_MIMO_V25_MODEL_ID,
++  getFreebuffModel,
++} from '@codebuff/common/constants/freebuff-models'
+ 
+ import { createBase2 } from './base2'
+ 
+ const definition = {
+   ...createBase2('free', {
+     model: FREEBUFF_MIMO_V25_MODEL_ID,
++    modelLabel: getFreebuffModel(FREEBUFF_MIMO_V25_MODEL_ID).displayName,
+   }),
+   id: 'base2-free-mimo',
+   displayName: 'Buffy the MiMo Free Orchestrator',
+ }
+ 
+ export default definition
+diff --git a/agents/base2/base2.ts b/agents/base2/base2.ts
+index 0c6d35655..5d1d570e4 100644
+--- a/agents/base2/base2.ts
++++ b/agents/base2/base2.ts
+@@ -50,50 +50,52 @@ const MODEL_BY_MODE = {
+ } satisfies Record<Base2Mode, SecretAgentDefinition['model']>
+ 
+ /**
+  * The reviewer each lean model reviews with, per product. Codebuff adds lite's
+  * own reviewer on top of the shared ones; Freebuff deliberately gets only the
+  * free-tier map, so no free session can resolve to code-reviewer-lite even if a
+  * freebuff agent were pointed at lite's model. Anything unmapped falls back to
+  * DeepSeek Flash — cheap, and allowed in a free session.
+  */
+ const CODEBUFF_REVIEWER_BY_MODEL: Record<string, string> = {
+   ...FREEBUFF_REVIEWER_AGENT_ID_BY_MODEL,
+   [LITE_MODEL]: 'code-reviewer-lite',
+ }
+ const FALLBACK_REVIEWER_AGENT_ID = 'code-reviewer-deepseek-flash'
+ 
+ export function createBase2(
+   mode: Base2Mode,
+   options?: {
+     hasNoValidation?: boolean
+     planOnly?: boolean
+     noAskUser?: boolean
+     noFollowups?: boolean
+     noReview?: boolean
+     noGravityIndex?: boolean
+     model?: SecretAgentDefinition['model']
++    /** Human model name for the prompt when the wire id is a legacy alias. */
++    modelLabel?: string
+     providerOptions?: SecretAgentDefinition['providerOptions']
+   },
+ ): Omit<SecretAgentDefinition, 'id'> {
+   const {
+     hasNoValidation = mode === 'fast',
+     planOnly = false,
+     noAskUser = false,
+     noFollowups = false,
+     noReview = false,
+     noGravityIndex = false,
+     model: modelOverride,
+     providerOptions,
+   } = options ?? {}
+   const isDefault = mode === 'default'
+   const isFast = mode === 'fast'
+   const isLite = mode === 'lite'
+   const isMax = mode === 'max'
+   // Product identity and orchestration shape used to be one flag, which told
+   // paying lite users they were "coding with AI for free" on a product they
+   // weren't using. isFreebuff picks the branding and the meta-information
+   // block; isLean picks the stripped-down shape lite shares with free mode:
+   // direct edits, a cheap reviewer, no propose_* tools.
+   const isFreebuff = mode === 'free'
+   const isLean = mode === 'free' || mode === 'lite'
+ 
+@@ -312,51 +314,51 @@ Use the spawn_agents tool to spawn specialized agents to help you complete the u
+       `- Spawn the ${isDefault ? 'thinker' : 'thinker-best-of-n-opus'} after gathering context to solve complex problems or when the user asks you to think about a problem. (gpt-5-agent is a last resort for complex problems)`,
+     isMax &&
+       !planOnly &&
+       `[freebuff product prompt text omitted]`,
+     isLean &&
+       !noReview &&
+       !planOnly &&
+       `- Spawn a ${leanCodeReviewerAgentId} to review the code changes after you have implemented the changes.`,
+     !planOnly &&
+       '- Spawn bashers sequentially if the second command depends on the the first.',
+     isDefault &&
+       !planOnly &&
+       '- Spawn a code-reviewer to review the changes after you have implemented the changes.',
+     isMax &&
+       !planOnly &&
+       '- Spawn a code-reviewer-multi-prompt to review the changes after you have implemented the changes.',
+     planOnly &&
+       '- **Never spawn an agent that writes or runs anything:** the editor, basher and tmux-cli agents are not available to you in plan mode, and asking another agent to make the change on your behalf is the same violation as making it yourself.',
+   ).join('\n  ')}
+ [freebuff product prompt text omitted]
+ - **Limit thinker spawns:** ${THINKER_SPAWN_LIMIT}
+ - **Never spawn the context-pruner agent:** This agent is spawned automatically for you and you don't need to spawn it yourself.
+ 
+ # ${isFreebuff ? 'Freebuff' : 'Codebuff'} Meta-information
+ 
+-[freebuff product prompt text omitted]
++[freebuff product prompt text omitted]
+ 
+ ${
+   isFreebuff
+     ? 'See freebuff.com for more information about the product.'
+     : [
+         'Users send prompts to you in one of a few user-selected modes, like DEFAULT, LITE, MAX, or PLAN.',
+         "Every prompt sent consumes the user's credits, which is calculated based on the API cost of the models used.",
+         '[freebuff product prompt text omitted]',
+         '[freebuff product prompt text omitted]',
+       ].join('\n')
+ }
+ 
+ # Response examples
+ 
+ <example>
+ 
+ <user>please implement [a complex new feature]</user>
+ 
+ <response>
+ [ You spawn 3 file-pickers, 2 code-searchers, and a docs researcher in parallel to find relevant files and do research online. You use the list_directory and glob tools directly to search the codebase. ]
+ 
+ [ You read a few of the relevant files using the read_files tool in two separate tool calls ]
+ 
+ [ You spawn another file-picker and code-searcher to find more relevant files, and use glob tools ]
+ 
+diff --git a/agents/base3-free-mimo.ts b/agents/base3-free-mimo.ts
+index c56d301ce..110b9bb6a 100644
+--- a/agents/base3-free-mimo.ts
++++ b/agents/base3-free-mimo.ts
+@@ -1,14 +1,19 @@
+-import { FREEBUFF_MIMO_V25_MODEL_ID } from '@codebuff/common/constants/freebuff-models'
++import {
++  FREEBUFF_MIMO_V25_MODEL_ID,
++  getFreebuffModel,
++} from '@codebuff/common/constants/freebuff-models'
+ 
+ import { createBase3CliRoot } from './base3'
+ 
+ const definition = {
+   ...createBase3CliRoot({
+     model: FREEBUFF_MIMO_V25_MODEL_ID,
++    // The compatibility id still says 2.5; the served model's name does not.
++    modelLabel: getFreebuffModel(FREEBUFF_MIMO_V25_MODEL_ID).displayName,
+     isFreebuff: true,
+   }),
+   id: 'base3-free-mimo',
+   displayName: 'Buffy on MiMo',
+ }
+ 
+ export default definition
+
+```
