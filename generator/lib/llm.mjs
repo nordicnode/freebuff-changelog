@@ -24,6 +24,11 @@
 //                              45000), and it is what the plain-English row's
 //                              own model calls are charged to -- not only the
 //                              pass plan that counts rows from it.
+//   CHANGELOG_ELI5_ROLLUP_BUDGET_MS  the clock for a release roll-up line
+//                              (default: the wider of the two above, 90000). A
+//                              roll-up reads the release window and answers in
+//                              up to eight sentences; charged the per-change
+//                              share it ran out mid-answer.
 //   CHANGELOG_LLM_PREFILL_CHARS_PER_SEC  prompt chars one second of a row's clock
 //                              can pay to prefill (default 12000; measured
 //                              13,056 on this provider). See the prompt clock
@@ -215,6 +220,28 @@ export function rowBudgetMs (env = process.env) {
 export function eli5RowBudgetMs (env = process.env) {
   const v = Number(env.CHANGELOG_ELI5_ROW_BUDGET_MS)
   return Number.isFinite(v) && v > 0 ? v : DEFAULT_ELI5_ROW_BUDGET_MS
+}
+
+// A release roll-up is the one plain-English row that is not a short question.
+// It carries the release window instead of one change's hunks -- the same wide
+// evidence the *summary* ask pays CHANGELOG_LLM_ROW_BUDGET_MS to read -- and it
+// is asked for up to eight sentences rather than two to four. Charged the
+// per-change 45s it ran out mid-answer and wrote nothing, which is how a bump
+// row whose summary had just been rewritten kept failing its explanation while
+// smaller rows in the same pass finished in seconds. So a roll-up gets the wider
+// of the two clocks unless the operator states one.
+export function eli5RollupBudgetMs (env = process.env) {
+  const v = Number(env.CHANGELOG_ELI5_ROLLUP_BUDGET_MS)
+  if (Number.isFinite(v) && v > 0) return v
+  return Math.max(eli5RowBudgetMs(env), rowBudgetMs(env))
+}
+
+// The clock explainEntry charges its row to: the wide one for a roll-up, the
+// per-change one otherwise. enrichEli5 computes both before it remaps the
+// generic knob and passes them here, so the value survives that remap.
+function eli5ClockMs (env, relText) {
+  const stated = Number(relText ? env.CHANGELOG_ELI5_ROLLUP_CLOCK_MS : null)
+  return relText && Number.isFinite(stated) && stated > 0 ? stated : (relText ? eli5RollupBudgetMs(env) : eli5RowBudgetMs(env))
 }
 
 /**
@@ -5709,8 +5736,11 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
   }
   // The plain-English ask is a shorter question than the writer's, so it gets
   // its own row budget; the generic one stays the writer's. Every call in this
-  // pass (including its repair and its verifier) is charged to this clock.
-  env = { ...env, CHANGELOG_LLM_ROW_BUDGET_MS: String(eli5RowBudgetMs(env)) }
+  // pass (including its repair and its verifier) is charged to this clock, and
+  // a release roll-up is charged the wider of the two -- it is the wide ask, not
+  // the short one. Both are captured before the generic knob is remapped.
+  const rollupClockMs = eli5RollupBudgetMs(env)
+  env = { ...env, CHANGELOG_LLM_ROW_BUDGET_MS: String(eli5RowBudgetMs(env)), CHANGELOG_ELI5_ROLLUP_CLOCK_MS: String(rollupClockMs) }
   const cachePath = `${dataDir}/ai-summaries.json`
   const cache = await readJson(cachePath, {})
   // Separate knobs so the initial fill can be run down faster than the summary
@@ -5961,14 +5991,14 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
   // Same as summarizeEntry: the guard must carry dataDir, or the plain-English
   // pass -- which always calls in from outside a scope -- writes a bundle it
   // can never resolve.
-  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv, eli5RowBudgetMs(baseEnv)), () => explainEntry({ entry: e, patch, notesPatch, siblings, diffBytes, relText, prMeta, sequence, archMap, glossary, context, env: baseEnv, dataDir }))
+  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv, eli5ClockMs(baseEnv, relText)), () => explainEntry({ entry: e, patch, notesPatch, siblings, diffBytes, relText, prMeta, sequence, archMap, glossary, context, env: baseEnv, dataDir }))
   const callsAt = requestScope.getStore().calls
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
   // The diff the plain-English ask may carry is capped by this row's own clock,
   // not only by the window: see LLM_PREFILL_CHARS_PER_SEC. Sized from the
   // configured share rather than the clock's remainder so the prompt (and the
   // manifest hash recorded for it) is the same on every run of the same row.
-  const clockMs = eli5RowBudgetMs(baseEnv)
+  const clockMs = eli5ClockMs(baseEnv, relText)
   // Reuse the technical pass's accepted PR. Never reattach a rejected match.
   if (e.ai && Object.hasOwn(e.ai, 'acceptedPr')) prMeta = e.ai.acceptedPr
   else if (prMeta?.matched === 'files') prMeta = await checkPrRelevance(e, patch, prMeta, env)

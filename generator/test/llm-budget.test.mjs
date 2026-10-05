@@ -15,7 +15,7 @@ import {
   DEFAULT_LLM_API_BASE, DEFAULT_LLM_MODEL, DEFAULT_ROW_BUDGET_MS, PROMPT_V,
   enrichEli5, enrichOpenPrs, summaryBacklog, validateLlmConfig, llmCallCount, llmRouteIdentity, ELI5_V,
   buildEli5Prompt, diffRoom, promptCharsForClock, LLM_PREFILL_CHARS_PER_SEC,
-  LLM_PROMPT_CLOCK_SHARE, LLM_PROMPT_CHARS, LLM_MIN_DIFF_ROOM
+  LLM_PROMPT_CLOCK_SHARE, LLM_PROMPT_CHARS, LLM_MIN_DIFF_ROOM, eli5RollupBudgetMs, explainEntry
 } from '../lib/llm.mjs'
 import { summaryPassWindow, regenerationEli5Deadline, cmdGenerationHealth, cmdWatch } from '../cli.mjs'
 import { generationHealth } from '../lib/quality.mjs'
@@ -291,6 +291,42 @@ test('the plain-English pass charges its rows to CHANGELOG_ELI5_ROW_BUDGET_MS, n
   const other = row('2', { ai: { ...clean, model: 'test', v: PROMPT_V } })
   assert.equal(await enrichEli5([other], dir, env({ CHANGELOG_LLM_ROW_BUDGET_MS: '150' }), { retryErrors: true, getPatch: async () => patch }), 1)
   assert.equal(other.eli5.text, text.eli5)
+})
+
+test('a release roll-up is charged the wide clock, not the per-change share', async t => {
+  const dir = await temp(t)
+  // A roll-up carries the release window (the same wide evidence the summary
+  // ask pays 90s for) and answers in up to eight sentences. Charged the 45s
+  // per-change share it was aborted mid-answer and wrote nothing, which is how
+  // a bump row kept failing its explanation in production while smaller rows in
+  // the same pass finished in seconds.
+  assert.equal(eli5RollupBudgetMs({ CHANGELOG_ELI5_ROW_BUDGET_MS: '45000', CHANGELOG_LLM_ROW_BUDGET_MS: '90000' }), 90000)
+  assert.equal(eli5RollupBudgetMs({ CHANGELOG_ELI5_ROLLUP_BUDGET_MS: '120000' }), 120000)
+  assert.equal(eli5RollupBudgetMs({ CHANGELOG_ELI5_ROW_BUDGET_MS: '60000', CHANGELOG_LLM_ROW_BUDGET_MS: '60000' }), 60000, 'the wider of the two, never narrower than the per-change share')
+  assert.equal(eli5RollupBudgetMs({ CHANGELOG_ELI5_ROW_BUDGET_MS: '60000' }), 90000, 'the summary default is the wider clock when only one is stated')
+  // Sizing follows the same clock: the window is the fixed part, so a wider
+  // clock is what lets a big release window keep real hunks.
+  const window = `Updates included in this release (1.2.3 since 1.2.2):\n${'- a shipped change with a sentence of what it did\n'.repeat(3000)}`
+  // Not `bumpOnly`: such a row drops the diff from the roll-up ask entirely, so
+  // the two clocks would have nothing to differ about.
+  const bump = row('9', { version: '1.2.3', stats: { additions: 200, deletions: 10 }, files: { modified: ['a.ts'], total: 6, meaningful: 6 }, ai: { ...clean, model: 'test', v: PROMPT_V } })
+  const bigPatch = ['diff --git a/a.ts b/a.ts\n', '+export const X = 1\n'.repeat(30000)].join('')
+  const narrow = buildEli5Prompt(bump, [], { patch: bigPatch, releaseCtx: window, rowBudgetMs: 45000 })
+  const wide = buildEli5Prompt(bump, [], { patch: bigPatch, releaseCtx: window, rowBudgetMs: 90000 })
+  assert.ok(wide.length > narrow.length, 'the wide clock buys back hunks the narrow one cut')
+  assert.ok(wide.length <= promptCharsForClock(90000) + 20000, `roll-up prompt is ${wide.length} chars`)
+  // And the clock really is what the row is charged: same 1.2s answer, same
+  // 150ms plain-English share, but the roll-up row is allowed its wider clock
+  // while the per-change row is cut.
+  const text = { eli5: 'The gate reads a flag before it acts.' }
+  t.mock.method(globalThis, 'fetch', async (url, init) => await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(response(text)), 1200)
+    init.signal.addEventListener('abort', () => { clearTimeout(timer); reject(Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })) })
+  }))
+  const shared = env({ CHANGELOG_ELI5_ROW_BUDGET_MS: '150', CHANGELOG_LLM_ROW_BUDGET_MS: '90000' })
+  const rollup = await explainEntry({ entry: row('3', { version: '1.2.3' }), patch, relText: window, env: shared, dataDir: dir })
+  assert.equal(rollup.text, text.eli5)
+  await assert.rejects(explainEntry({ entry: row('4'), patch, relText: '', env: shared, dataDir: dir }), /budget exceeded|aborted/)
 })
 
 test('served probe refuses an old deploy even when the upstream head did not move', async () => {

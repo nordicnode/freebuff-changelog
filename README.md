@@ -51,6 +51,7 @@ node generator/cli.mjs override <sha>               # draft a human correction
 | `CHANGELOG_LLM_CYCLE_BUDGET_MS` | Model-call wall clock per cycle (default 300,000) |
 | `CHANGELOG_LLM_ROW_BUDGET_MS`, `CHANGELOG_ELI5_ROW_BUDGET_MS` | Wall clock one row may spend (defaults 90,000 / 45,000, and what its prompt is sized against) |
 | `CHANGELOG_LLM_PREFILL_CHARS_PER_SEC`, `CHANGELOG_LLM_PROMPT_CLOCK_SHARE` | Prefill throughput the prompt ceiling is computed from (default 12,000; measured 13,056) and how much of the row clock the prompt may own (default 0.5) |
+| `CHANGELOG_ELI5_ROLLUP_BUDGET_MS` | Clock for a release roll-up line (default: the wider of the two row budgets, 90,000). A roll-up reads the release window and answers in up to eight sentences, which the per-change share cut off mid-answer |
 | `CHANGELOG_LLM_LIMIT`, `CHANGELOG_ELI5_LIMIT` | Per-cycle row limits |
 | `CHANGELOG_LLM_STREAM` | Streams by default; `=0` disables |
 | `CHANGELOG_SYNC_STALE_MIN` | Freshness budget (default 5 minutes; the gate fails at twice this) |

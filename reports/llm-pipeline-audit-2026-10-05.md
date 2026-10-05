@@ -204,3 +204,29 @@ Still open, unchanged and intentional: ~30 `needs-repair` rows with partial evid
 objections, the historical explanation gaps outside durable admission (no backfill), provider 429/504
 bursts, and the ~160 admitted rows whose summary identity is stale under the current provider and
 are being re-asked in bounded batches.
+
+## Third finding: the roll-up line was charged the per-change clock (2026-10-05 20:2x UTC)
+
+The first relay cycle on the new runtime (`82ab8c86`) healed the four-day-old row: `d71a831b`
+got its first plain-English line at 19:59:32Z, written from a 236,917-char prompt instead of
+842,051, and the pass wrote 6 of 6 lines that cycle.
+
+One row still failed, and it was a different shape: `95ecda2e` (Freebuff CLI 0.2.14) had its
+summary rewritten at 20:01:55Z, which by design deletes the plain-English line it no longer
+matches (`eli5.src` is the hash of the title+summary it was written from). The ELI5 pass reached
+it 10 seconds later and aborted mid-answer: a release roll-up carries the release window (its
+summary prompt was 300,718 chars, the same wide evidence the summary ask pays a 90s clock to
+read) and is asked for up to eight sentences, but it was charged the 45s per-change share. Small
+rows in the same pass finished in seconds.
+
+Fix: `CHANGELOG_ELI5_ROLLUP_BUDGET_MS` defaults to the wider of the two row budgets (90,000), and
+`explainEntry` charges a roll-up row that clock, sizing its prompt from the same number. Per-change
+rows keep the 45s share. Regression test: with a 150ms per-change share, a stalled roll-up row is
+answered under the wide clock while a per-change row in the same env is still cut.
+
+This also names the churn that keeps the completeness gate red in bursts: a summary rewrite
+invalidates the plain-English line it explained, so every bulk summary re-ask (provider migration,
+prompt change) creates a set of rows that are "missing plain-English" until the ELI5 pass catches
+up, and the 30-minute gate budget is shorter than that catch-up when many rows change at once.
+The relay now closes that gap in the same cycle for the rows it rewrites, but a large bulk rewrite
+can still expose rows for one cycle. Both workflows report it honestly; neither is silent about it.
