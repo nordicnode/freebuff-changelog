@@ -784,7 +784,11 @@ function applyAskCapability (box) {
   const b = box && box.querySelector('.ask-open');
   if (!b) return;
   b.disabled = true;
-  b.textContent = 'Ask the AI (not enabled here)';
+  const label = b.querySelector('span:nth-child(2)');
+  if (label) label.textContent = 'Ask the AI (not enabled here)';
+  else b.textContent = 'Ask the AI (not enabled here)';
+  const hint = b.querySelector('.ask-hint');
+  if (hint) hint.remove();
   b.title = 'This deployment has no model credential set.';
 }
 
@@ -1341,11 +1345,11 @@ ${powerEnd}
 function askHtml (e) {
   if (!e.hasDiff) return ''
   return `<div class="ask-ai" data-sha="${esc(e.sha)}">
-<button class="ask-open" type="button" aria-expanded="false">Ask the AI about this change</button>
+<button class="ask-open" type="button" aria-expanded="false"><span class="diff-arrow">&gt;</span><span>Ask the AI about this change</span><span class="ask-hint">grounded in this diff</span></button>
 <div class="ask-body" hidden>
   <form class="ask-form" autocomplete="off">
     <input class="ask-input" type="text" maxlength="400" placeholder="What does this change actually do?" aria-label="Ask the AI about this change">
-    <button class="ask-send" type="submit">ask</button>
+    <button class="ask-send" type="submit">Ask</button>
   </form>
   <div class="ask-out" role="status" aria-live="polite" hidden></div>
 </div>

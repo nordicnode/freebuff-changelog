@@ -3162,34 +3162,46 @@ a.badge:hover{text-decoration:none;color:var(--term-cyan)}
   *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important;scroll-behavior:auto !important}
 }
 /* Ask the AI. Sits above the collapsed technical details because it is reader-
-   facing like the plain-English line, and dressed like the other controls so it
-   does not read as a third-party widget. The [hidden] overrides are required:
-   an author display rule beats the UA sheet's [hidden]{display:none}, so
-   without them the panel would render open on every row. */
-.ask-ai{margin:.7em 0 .3em}
+   facing like the plain-English line, and boxed like the other collapsible
+   blocks (technical details, file changes, inline diff) so it reads as a peer
+   rather than a floating third-party widget. The [hidden] overrides are
+   required: an author display rule beats the UA sheet's
+   [hidden]{display:none}, so without them the panel would render open on
+   every row. */
+.ask-ai{margin:10px 0 8px;border:1px solid var(--term-border);border-radius:2px;background:var(--code);overflow:hidden}
 .ask-open{
-  background:none;border:1px solid var(--term-border);border-radius:3px;
-  color:var(--term-cyan);cursor:pointer;font:inherit;font-size:.76rem;
-  padding:.25em .6em;
+  width:100%;display:flex;align-items:center;gap:6px;
+  background:var(--code);border:none;border-radius:0;
+  color:var(--txt-dim);cursor:pointer;font:inherit;font-size:.78rem;font-weight:600;
+  padding:6px 10px;text-align:left;user-select:none;
+  transition:background .12s ease, color .12s ease;
 }
-.ask-open:hover{border-color:var(--term-cyan);background:var(--cyan-tint-bg)}
-.ask-body{display:flex;flex-direction:column;gap:.45em;margin-top:.5em}
+.ask-open:hover{color:var(--txt);background:var(--panel-hover)}
+.ask-open:disabled{cursor:not-allowed;opacity:.7}
+.ask-open .diff-arrow{color:var(--txt-subtle)}
+.ask-open[aria-expanded="true"] .diff-arrow{transform:rotate(90deg);color:var(--txt)}
+.ask-open[aria-expanded="true"]{color:var(--txt)}
+.ask-ai:has(.ask-body:not([hidden])) .ask-open{border-bottom:1px solid var(--term-border)}
+.ask-hint{margin-left:auto;font-size:.72rem;font-weight:400;color:var(--txt-subtle);white-space:nowrap}
+@media (max-width:480px){.ask-hint{display:none}}
+.ask-body{display:flex;flex-direction:column;gap:.5em;padding:8px 12px;background:var(--panel)}
 .ask-body[hidden]{display:none}
-.ask-form{display:flex;gap:.4em;flex-wrap:wrap}
+.ask-form{display:flex;gap:.5em}
 .ask-input{
-  flex:1 1 16em;min-width:0;background:var(--panel);
-  border:1px solid var(--term-border);border-radius:3px;color:var(--txt);
-  font:inherit;font-size:.85rem;padding:.4em .55em;
+  flex:1 1 auto;min-width:0;background:var(--code);
+  border:1px solid var(--term-border);border-radius:2px;color:var(--txt);
+  font:inherit;font-size:.85rem;padding:.45em .6em;
 }
 .ask-input:focus{outline:none;border-color:var(--term-cyan)}
+.ask-input::placeholder{color:var(--txt-subtle)}
 .ask-send{
-  background:var(--panel);border:1px solid var(--term-border);border-radius:3px;
-  color:var(--txt-subtle);cursor:pointer;font:inherit;font-size:.8rem;padding:.4em .85em;
+  flex:none;background:var(--cyan-tint-bg);border:1px solid var(--cyan-tint-border);border-radius:2px;
+  color:var(--term-cyan);cursor:pointer;font:inherit;font-size:.8rem;font-weight:600;padding:.45em 1em;
 }
-.ask-send:hover{color:var(--term-cyan);border-color:var(--term-cyan)}
+.ask-send:hover{filter:brightness(1.15)}
 .ask-send:disabled{opacity:.5;cursor:wait}
 .ask-out{
-  border-left:3px solid var(--term-border);background:var(--panel);
+  border:1px solid var(--term-border);border-left:3px solid var(--term-border);border-radius:0 2px 2px 0;background:var(--code);
   font-size:.88rem;line-height:1.55;padding:.55em .7em;white-space:pre-wrap;
 }
 .ask-out[hidden]{display:none}

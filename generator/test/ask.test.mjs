@@ -335,7 +335,8 @@ const card = (extra) => entryCard({
 test('the Ask-the-AI widget ships on rows that have a diff, and only those', () => {
   const withDiff = card({ hasDiff: true })
   assert.match(withDiff, /class="ask-ai" data-sha="[0-9a-f]{40}"/, 'the widget carries the sha the route needs')
-  assert.match(withDiff, /<button class="ask-open" type="button" aria-expanded="false">Ask the AI about this change<\/button>/)
+  assert.match(withDiff, /<button class="ask-open" type="button" aria-expanded="false">.*Ask the AI about this change.*<\/button>/s)
+  assert.match(withDiff, /<span class="ask-hint">grounded in this diff<\/span>/, 'the toggle names its grounding so it reads as peer to the technical blocks')
   assert.match(withDiff, /<form class="ask-form"/)
   assert.match(withDiff, /maxlength="400"/, 'the input matches the route\'s question cap')
   assert.match(withDiff, /aria-live="polite"/, 'answers are announced to screen readers')
