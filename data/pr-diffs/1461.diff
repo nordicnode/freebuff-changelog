@@ -1,8 +1,8 @@
 diff --git a/sdk/README.md b/sdk/README.md
-index e9a26e214f..8a14cd0c82 100644
+index e9a26e214f..130b69d77d 100644
 --- a/sdk/README.md
 +++ b/sdk/README.md
-@@ -235,6 +235,98 @@ Each `LoadedAgentDefinition` extends `AgentDefinition` with:
+@@ -235,6 +235,102 @@ Each `LoadedAgentDefinition` extends `AgentDefinition` with:
  
  Files ending in `.d.ts` or `.test.ts` are excluded.
  
@@ -88,11 +88,15 @@ index e9a26e214f..8a14cd0c82 100644
 +Consume the stream while the run is active. It buffers at most **1,024 unread
 +events/chunks** by default; set `maxBufferedEvents` to a positive safe integer to
 +change that limit. If the buffer fills, the run is cancelled and both iteration
-+and `stream.result` reject with `RunStreamBufferOverflowError`. Events are never
-+silently dropped to make room.
++and `stream.result` reject with `RunStreamBufferOverflowError`. Overflow discards
++all unread events already in the buffer. Events are never silently dropped to
++make room while keeping the stream running.
 +
 +Unexpected execution exceptions and explicit callback failures also reject
-+iteration and `stream.result`. Runtime error events remain event data, and an
++iteration and `stream.result`. Errors from an in-flight callback still reject
++`stream.result` after cancellation has ended iteration. The first stream failure
++is preserved if cancelling the runtime produces another exception.
++Runtime error events remain event data, and an
 +agent failure can resolve `stream.result` with `output.type === 'error'`, just
 +like `run()`. Streaming skips the client's default throwing error-event handler;
 +explicit handlers retain their behavior. Await `stream.result` even when you
@@ -365,10 +369,10 @@ index 0000000000..51d7b41335
 +})
 diff --git a/sdk/src/__tests__/stream.test.ts b/sdk/src/__tests__/stream.test.ts
 new file mode 100644
-index 0000000000..49ca21b752
+index 0000000000..f1bf06f744
 --- /dev/null
 +++ b/sdk/src/__tests__/stream.test.ts
-@@ -0,0 +1,451 @@
+@@ -0,0 +1,507 @@
 +import { describe, expect, test, mock } from 'bun:test'
 +
 +import { createRunStream, RunStreamBufferOverflowError } from '../stream'
@@ -683,6 +687,62 @@ index 0000000000..49ca21b752
 +    await expect(stream.result).rejects.toBe(error)
 +  })
 +
++  test('preserves executor failures after cancellation', async () => {
++    const run = controlledRun()
++    const stream = createRunStream(options, run.execute)
++    await run.started.promise
++    stream.abort()
++    const error = new Error('Cleanup failed')
++    run.completed.reject(error)
++    await expect(stream.result).rejects.toBe(error)
++  })
++
++  test.each(['event', 'chunk'] as const)(
++    'preserves an in-flight %s callback failure after cancellation',
++    async (kind) => {
++      const run = controlledRun()
++      const callback = deferred<void>()
++      const stream = createRunStream(
++        {
++          ...options,
++          handleEvent: () => callback.promise,
++          handleStreamChunk: () => callback.promise,
++        },
++        run.execute,
++      )
++      const input = await run.started.promise
++      const pending =
++        kind === 'event'
++          ? input.handleEvent?.({ type: 'start', messageHistoryLength: 0 })
++          : input.handleStreamChunk?.('Hello')
++      const reason = new Error('Cancelled')
++      stream.abort(reason)
++      run.completed.resolve(state)
++      const error = new Error('Handler failed after cancellation')
++      callback.reject(error)
++      await pending
++      await expect(stream.result).rejects.toBe(error)
++      expect(input.signal?.reason).toBe(reason)
++    },
++  )
++
++  test('preserves buffer overflow when the executor rejects on abort', async () => {
++    const stream = createRunStream(
++      { ...options, maxBufferedEvents: 1 },
++      async (run) => {
++        await run.handleStreamChunk?.('one')
++        await run.handleStreamChunk?.('two')
++        throw new Error('Executor aborted')
++      },
++    )
++    await expect(stream.result).rejects.toBeInstanceOf(
++      RunStreamBufferOverflowError,
++    )
++    await expect(collect(stream)).rejects.toBeInstanceOf(
++      RunStreamBufferOverflowError,
++    )
++  })
++
 +  test.each(['event', 'chunk'] as const)(
 +    'cancels when a %s callback rejects',
 +    async (kind) => {
@@ -912,10 +972,10 @@ index 3474847212..7a5d0fbb6b 100644
  export * from './run-state'
 diff --git a/sdk/src/stream.ts b/sdk/src/stream.ts
 new file mode 100644
-index 0000000000..210dc71e72
+index 0000000000..56e5b8d82a
 --- /dev/null
 +++ b/sdk/src/stream.ts
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,189 @@
 +import type { CodebuffClientOptions, RunOptions } from './run'
 +import type { RunState } from './run-state'
 +import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
@@ -999,7 +1059,8 @@ index 0000000000..210dc71e72
 +  }
 +
 +  const fail = (error: unknown) => {
-+    if (closed) return
++    // Cancellation closes iteration, but an in-flight handler can still fail.
++    if (failure) return
 +    failure = { error }
 +    close(true)
 +    controller.abort(error)
@@ -1061,7 +1122,7 @@ index 0000000000..210dc71e72
 +    })
 +    .catch((error: unknown) => {
 +      fail(error)
-+      throw error
++      throw failure ? failure.error : error
 +    })
 +    .finally(() => {
 +      signal?.removeEventListener('abort', onAbort)
