@@ -3176,6 +3176,23 @@ export function pruneExpiredErrors (cache, { errorCooldownMs = 3600000, transien
   return pruned
 }
 
+// A row that has twice died with its time budget exceeded on this exact ask
+// retries the smaller question first. Measured on the relay: a hung first
+// call ate the whole 90s/45s row budget, and the retry asked the identical
+// full-size prompt -- which hung the same way, for hours (039c9076 needed 22
+// attempts over 40h before its summary landed). The lean ask keeps the diff,
+// the metadata, the headers and the structured facts and drops only the wide
+// sections, so it is the ask most likely to fit the clock the full one
+// overran. One fluke (a 504 storm) still gets its full retry; a pattern gets
+// the ask that fits. Deterministic content failures are excluded: a refusal
+// is not a size problem and the lean ask will not fix it.
+export function leadWithLean (cached, env = process.env) {
+  if (!cached?.error || cached.deterministic) return false
+  if (cached.routeIdentity && cached.routeIdentity !== llmRouteIdentity(env)) return false
+  if (Number(cached.attempts) < 2) return false
+  return /entry time budget exceeded|aborted due to timeout/i.test(String(cached.error))
+}
+
 // ---------------------------------------------------------------------------
 // Healing rows that shipped with objections.
 //
@@ -4262,12 +4279,12 @@ export function promptContextOf ({ relText = '', sequence = null, prMeta = null,
 
 // One entry, start to finish: prompt, call, grounding repair, optional
 // verification, and the record both the cache and the entry receive.
-export async function summarizeEntry ({ entry: e, patch, relText = '', sequence = null, prMeta = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env, dataDir = null }) {
+export async function summarizeEntry ({ entry: e, patch, relText = '', sequence = null, prMeta = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env, dataDir = null, leadLean = false }) {
   // dataDir rides along: without it the recursive call stores a hash-only
   // evidence bundle (storeEvidence treats a missing dir as a unit call) and
   // the material is gone forever, which is how new rows accumulated dangling
   // references while old ones resolved.
-  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv), () => summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env: baseEnv, dataDir }))
+  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv), () => summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env: baseEnv, dataDir, leadLean }))
   const callsAt = requestScope.getStore().calls
   // Tiered routing: the rows a reader opens go to LLM_MODEL_MAJOR when set.
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
@@ -4356,8 +4373,17 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     // and the delivered source context for the final semantic check.
     corpus = reduced.evidence
   } else {
+    // A row that has already burned its budget on the full ask twice leads
+    // with the lean one (see leadWithLean): the lean rung is marked used so
+    // the ladder continues to the stripped ask instead of repeating it.
+    const mainAsk = leadLean && leanPrompt ? leanPrompt : prompt
+    const mainOpts = leadLean && leanPrompt
+      ? { fallbackPrompt, leanPrompt: null, usedLean: true, onDelivery }
+      : { fallbackPrompt, leanPrompt, onDelivery }
+    // The verifier repair re-sends the ask it corrects.
+    if (mainAsk !== prompt) repairPrompt = mainAsk
     try {
-      clean = await callLlm(prompt, env, 1, validateSummary(), { fallbackPrompt, leanPrompt, onDelivery })
+      clean = await callLlm(mainAsk, env, 1, validateSummary(), mainOpts)
     } catch (err) {
       // Every rung failed on the routed model. The escalation below already
       // relies on a better model resolving what a repair loop could not, but it
@@ -4371,7 +4397,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
       const strongEnv = strongModelEnv(baseEnv, env)
       if (!strongEnv) throw err
       log(`LLM fell back to ${strongEnv.LLM_MODEL} for ${e.sha.slice(0, 8)}: every rung failed on ${env.LLM_MODEL} (${shortError(err)})`)
-      clean = await callLlm(prompt, strongEnv, 1, validateSummary(), { fallbackPrompt, leanPrompt, onDelivery })
+      clean = await callLlm(mainAsk, strongEnv, 1, validateSummary(), mainOpts)
       ranOn = strongEnv
     }
   }
@@ -4877,7 +4903,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     // loses the merge to a real summary, while `e.ai` is only ever replaced by
     // a successful record -- so a failed regeneration costs a call and nothing
     // else.
-    queue.push({ entry: e, patch, key, relText, sequence, prMeta, context, inputIdentity: inputIdentity(e, prMeta, glossary, env, relText), cf: contextFingerprint(prMeta, glossary) })
+    queue.push({ entry: e, patch, key, relText, sequence, prMeta, context, inputIdentity: inputIdentity(e, prMeta, glossary, env, relText), cf: contextFingerprint(prMeta, glossary), leadLean: !forced && leadWithLean(cached, env) })
     // Reserve one recovery slot when there is enough capacity. Sustained
     // fresh work must not indefinitely starve an admitted unchecked row.
     if (queue.length >= freshLimit) break
@@ -5023,7 +5049,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
     while (activeIndex < queue.length) {
       if (configurationError || gatewayFails >= 3 || (env.LLM_DEADLINE_AT && Date.now() >= Number(env.LLM_DEADLINE_AT))) break
       const idx = activeIndex++
-      const { entry: e, patch, key, relText = '', sequence = null, prMeta = null, cf = null, heal = null, staleContext = false, reverify = null } = queue[idx]
+      const { entry: e, patch, key, relText = '', sequence = null, prMeta = null, cf = null, heal = null, staleContext = false, reverify = null, leadLean = false } = queue[idx]
       try {
         const fullPatch = getFullPatch ? await getFullPatch(e).catch(() => '') : ''
         const context = queue[idx].context || (queue[idx].context = await gatherEntryContext(e, patch, { repoDir: options.repoDir, entries, fullPatch }))
@@ -5074,7 +5100,7 @@ export async function enrichWithLlm (entries, getPatch, dataDir, env = process.e
           if (summaryDirt(rechecked)) health.dirtyRows++
           log(`LLM re-checked ${e.sha.slice(0, 8)}: ${objected ? `the objection stands (${(verdict.issues[0] || badClaims[0]?.quote || '').slice(0, 90)})` : 'verdict now recorded'}`)
           continue
-        }          const { record } = await summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env, dataDir })
+        }          const { record } = await summarizeEntry({ entry: e, patch, relText, sequence, prMeta, archMap, glossary, context, env, dataDir, leadLean })
         gatewayFails = 0
         apiCalls++
         cacheModified = true
@@ -5927,7 +5953,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     const sequence = sequenceForEntry(byDayEntries, e, seqWindow)
     const prMeta = findPrMeta(e, prIndex)
     const reverify = !options.force?.has(e.sha) && e.enrichment?.policy === QUALITY_POLICY_V && verifyConfigured(env) && eli5Done(e, relText, relText ? RELEASE_ROLLUP_V : 0) && ['unavailable', 'stale'].includes(qualityOf(e).plainVerify) ? e.eli5 : null
-    queue.push({ entry: e, src, key, relText, sequence, prMeta, reverify })
+    queue.push({ entry: e, src, key, relText, sequence, prMeta, reverify, leadLean: !options.force?.has(e.sha) && leadWithLean(cached, env) })
     if (queue.length >= limit) break
   }
 
@@ -5941,7 +5967,7 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
     while (activeIndex < queue.length) {
       if (configurationError || gatewayFails >= 3 || (env.LLM_DEADLINE_AT && Date.now() >= Number(env.LLM_DEADLINE_AT))) break
       const idx = activeIndex++
-      const { entry: e, src, key, relText = '', sequence = null, prMeta = null } = queue[idx]
+      const { entry: e, src, key, relText = '', sequence = null, prMeta = null, leadLean = false } = queue[idx]
       try {
         const patch = await eli5Patch(e, wantDiff || !e.facts?.length ? getPatch : null)
         const fullPatch = typeof options.getFullPatch === 'function' ? await options.getFullPatch(e).catch(() => '') : ''
@@ -5981,7 +6007,8 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
           glossary,
           context,
           env,
-          dataDir
+          dataDir,
+          leadLean
         })
         gatewayFails = 0
         cache[key] = { ...record, src: shortHash(src) }
@@ -6054,11 +6081,11 @@ export async function enrichEli5 (entries, dataDir, env = process.env, options =
 // One plain-English line, start to finish. `patch` is what the model is shown
 // (may be '' when CHANGELOG_ELI5_DIFF=0); `notesPatch` is what the comments are
 // mined from, which the pass has already paid for either way.
-export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, siblings = [], diffBytes = Infinity, relText = '', prMeta = null, sequence = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env, dataDir = null }) {
+export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, siblings = [], diffBytes = Infinity, relText = '', prMeta = null, sequence = null, archMap = null, glossary = '', context = {}, env: baseEnv = process.env, dataDir = null, leadLean = false }) {
   // Same as summarizeEntry: the guard must carry dataDir, or the plain-English
   // pass -- which always calls in from outside a scope -- writes a bundle it
   // can never resolve.
-  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv, eli5ClockMs(baseEnv, relText)), () => explainEntry({ entry: e, patch, notesPatch, siblings, diffBytes, relText, prMeta, sequence, archMap, glossary, context, env: baseEnv, dataDir }))
+  if (!requestScope.getStore()) return requestScope.run(newRequestScope(baseEnv, eli5ClockMs(baseEnv, relText)), () => explainEntry({ entry: e, patch, notesPatch, siblings, diffBytes, relText, prMeta, sequence, archMap, glossary, context, env: baseEnv, dataDir, leadLean }))
   const callsAt = requestScope.getStore().calls
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
   // The diff the plain-English ask may carry is capped by this row's own clock,
@@ -6066,12 +6093,19 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
   // configured share rather than the clock's remainder so the prompt (and the
   // manifest hash recorded for it) is the same on every run of the same row.
   const clockMs = eli5ClockMs(baseEnv, relText)
+  // A diff too big to send whole is mostly removed lines on a deletion-heavy
+  // row: compact those before the prompt is built, exactly as the summary pass
+  // does, so the bytes the prompt keeps describe the change rather than the
+  // deleted implementation. Gated on size, so an ordinary row's prompt -- and
+  // its cache key, which hashes the technical summary rather than the patch --
+  // is byte-identical to before.
+  const patchShown = String(patch || '').length > mapReduceThreshold(baseEnv) ? compactDeletions(patch) : patch
   // Reuse the technical pass's accepted PR. Never reattach a rejected match.
   if (e.ai && Object.hasOwn(e.ai, 'acceptedPr')) prMeta = e.ai.acceptedPr
   else if (prMeta?.matched === 'files') prMeta = await checkPrRelevance(e, patch, prMeta, env)
   const maxChars = relText ? ELI5_ROLLUP_MAX_CHARS : ELI5_MAX_CHARS
   const allow = `${relText} ${context.releaseEvidence || ''} ${(e.facts || []).join(' ')}`
-  const corpus = groundingCorpus(e, patch, {
+  const corpus = groundingCorpus(e, patchShown, {
     structured: context.structured,
     prMeta,
     sequence,
@@ -6089,7 +6123,7 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     changedTests: context.changedTests
   })
   const promptCtx = {
-    patch,
+    patch: patchShown,
     siblings,
     diffBytes,
     rowBudgetMs: clockMs,
@@ -6112,7 +6146,7 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
   // prose (see stripDiffComments). The grounding corpus above keeps the whole
   // diff: the fallback shows the model less, never more, so everything it can
   // still name stays checkable.
-  const strippedPatch = strippedPatchOf(patch)
+  const strippedPatch = strippedPatchOf(patchShown)
   const notes = eli5Notes(e, notesPatch)
   const fallbackPrompt = strippedPatch ? buildEli5Prompt(e, notes, { ...promptCtx, patch: strippedPatch }) : null
   // The same second rung the summary ask gets, for the same failure: the plain-
@@ -6122,19 +6156,26 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
   // know about is Claude Opus 4.1..."). The ELI5 ask is answered in prose by
   // design, so that failure surfaces as a validator rejection rather than as a
   // missing JSON envelope, which is what callLlm keys the rung on.
-  const leanPrompt = buildEli5Prompt(e, notes, { ...leanPromptCtx(promptCtx), patch: strippedPatch || patch })
+  const leanPrompt = buildEli5Prompt(e, notes, { ...leanPromptCtx(promptCtx), patch: strippedPatch || patchShown })
   const eli5Prompt = buildEli5Prompt(e, notes, promptCtx)
   let checkedCorpus = deliveredEvidence(eli5Prompt)
   const onDelivery = sent => { checkedCorpus = deliveredEvidence(sent) }
   const validateEli5 = (out) => validateGroundedEli5(out, maxChars, { allow, corpus: checkedCorpus })
   const eli5Opts = { bareText: true, fallbackPrompt, leanPrompt, onDelivery, stage: 'plain-English' }
+  // Same shrink-on-retry as the summary pass (see leadWithLean): a row that
+  // has twice burned its clock on the full ask leads with the lean one, and
+  // the lean rung is marked used so the ladder continues to the stripped ask.
+  const mainAsk = leadLean && leanPrompt ? leanPrompt : eli5Prompt
+  const mainOpts = leadLean && leanPrompt
+    ? { ...eli5Opts, leanPrompt: null, usedLean: true }
+    : eli5Opts
   // Which model actually wrote the line: the escalation below moves it, and a
   // row rescued by the strong model must say so in its record (the summary
   // pass has kept this invariant since it gained escalation).
   let outEnv = env
   let text
   try {
-    text = await callLlm(eli5Prompt, env, 1, validateEli5, eli5Opts)
+    text = await callLlm(mainAsk, env, 1, validateEli5, mainOpts)
   } catch (err) {
     // The summary pass escalates a row every rung failed on; the ELI5 pass had
     // no escape hatch at all, so the same model-catalog rows that the strong
@@ -6144,10 +6185,10 @@ export async function explainEntry ({ entry: e, patch = '', notesPatch = patch, 
     const strongEnv = strongModelEnv(baseEnv, env)
     if (!strongEnv) throw err
     log(`ELI5 fell back to ${strongEnv.LLM_MODEL} for ${String(e.sha || '').slice(0, 8)}: every rung failed on ${env.LLM_MODEL} (${shortError(err)})`)
-    text = await callLlm(eli5Prompt, strongEnv, 1, validateEli5, eli5Opts)
+    text = await callLlm(mainAsk, strongEnv, 1, validateEli5, mainOpts)
     outEnv = strongEnv
   }
-  const manifest = evidenceManifest(e, patch || relText, eli5Prompt, outEnv.LLM_MODEL)
+  const manifest = evidenceManifest(e, patchShown || relText, eli5Prompt, outEnv.LLM_MODEL)
   manifest.contextHash = contextFingerprint(prMeta, glossary)
   manifest.technicalHash = e.ai ? artifactHash(e.ai) : null
   let verify = 'unavailable', verifyClaims, verifyError

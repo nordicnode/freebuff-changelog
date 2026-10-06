@@ -16,7 +16,7 @@ import {
   enrichEli5, enrichOpenPrs, summaryBacklog, validateLlmConfig, llmCallCount, llmRouteIdentity, ELI5_V,
   buildEli5Prompt, diffRoom, promptCharsForClock, LLM_PREFILL_CHARS_PER_SEC,
   LLM_PROMPT_CLOCK_SHARE, LLM_PROMPT_CHARS, LLM_MIN_DIFF_ROOM, eli5RollupBudgetMs, explainEntry,
-  mapPhaseDiffRoom, PROMPT_PREAMBLE_CHARS
+  mapPhaseDiffRoom, PROMPT_PREAMBLE_CHARS, leadWithLean, eli5Source, summarizeEntry
 } from '../lib/llm.mjs'
 import { summaryPassWindow, regenerationEli5Deadline, cmdGenerationHealth, cmdWatch } from '../cli.mjs'
 import { generationHealth, qualityOf } from '../lib/quality.mjs'
@@ -858,4 +858,117 @@ test('provider probes are per route: a gateway that rejects stream keeps its own
   await callLlm('primary', env({ LLM_API_BASE: 'https://main.test/v1' }), 1, x => x)
   assert.equal(seen.at(-1).stream, true, 'the other provider was never consulted about this')
   assert.equal(seen.at(-1).strict, true, 'and strict JSON mode still stands where it works')
+})
+
+// ---------------------------------------------------------------------------
+// Shrink-on-retry: a row that twice burned its clock on the full ask leads
+// with the lean one instead of hanging the same way every cycle.
+// ---------------------------------------------------------------------------
+
+test('leadWithLean: twice budget-exceeded retries the smaller question; anything else does not', () => {
+  const env_ = { LLM_API_BASE: 'https://example.invalid/v1', LLM_MODEL: 'm' }
+  const stub = (error, attempts, extra = {}) => ({ error, attempts, at: new Date().toISOString(), ...extra })
+  assert.equal(leadWithLean(null, env_), false)
+  assert.equal(leadWithLean({}, env_), false)
+  assert.equal(leadWithLean(stub('LLM entry time budget exceeded', 1), env_), false, 'one fluke still gets its full retry')
+  assert.equal(leadWithLean(stub('LLM entry time budget exceeded', 2), env_), true)
+  assert.equal(leadWithLean(stub('The operation was aborted due to timeout', 4), env_), true)
+  assert.equal(leadWithLean(stub('LLM HTTP 504', 5), env_), false, 'a gateway failure is not a size problem')
+  assert.equal(leadWithLean(stub('LLM cycle deadline exceeded', 3), env_), false, 'a pass-level deadline is not the ask failing')
+  assert.equal(leadWithLean(stub('LLM entry request budget exceeded', 2), env_), false, 'an exhausted call budget already tried every rung')
+  assert.equal(leadWithLean(stub('LLM entry time budget exceeded', 2, { deterministic: true }), env_), false, 'a refusal is not a size problem')
+  assert.equal(leadWithLean(stub('LLM entry time budget exceeded', 2, { routeIdentity: 'other-route' }), env_), false, 'a route change restarts with the full ask')
+})
+
+test('summarizeEntry with leadLean asks the lean prompt first', async t => {
+  const dir = await temp(t)
+  const seen = []
+  const orig = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    seen.push(JSON.parse(String(init.body)).messages.at(-1).content)
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content: JSON.stringify(clean) } }] }) }
+  }
+  t.after(() => { globalThis.fetch = orig })
+  const wide = 'Complete Source of Modified Files'
+  const ctx = { fullFiles: [{ path: 'a.ts', lines: 3, content: 'export const ALPHA = 1' }] }
+  const mk = (sha) => row(sha, { files: { modified: ['a.ts'], total: 1, meaningful: 1 } })
+  await summarizeEntry({ entry: mk('a1'), patch, context: ctx, env: env({}), dataDir: dir })
+  assert.ok(seen[0].includes(wide), 'without leadLean the full ask goes first')
+  seen.length = 0
+  await summarizeEntry({ entry: mk('a2'), patch, context: ctx, env: env({}), dataDir: dir, leadLean: true })
+  assert.ok(!seen[0].includes(wide), 'with leadLean the lean ask goes first')
+  assert.match(seen[0], /diff --git/, 'and it still carries the diff')
+})
+
+test('explainEntry with leadLean asks the lean prompt first', async t => {
+  const dir = await temp(t)
+  const seen = []
+  const orig = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    seen.push(JSON.parse(String(init.body)).messages.at(-1).content)
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ choices: [{ message: { content: JSON.stringify({ eli5: 'The gate reads a flag before it acts.' }) } }] }) }
+  }
+  t.after(() => { globalThis.fetch = orig })
+  const wide = 'Complete source of the smaller touched files'
+  const ctx = { fullFiles: [{ path: 'a.ts', lines: 3, content: 'export const ALPHA = 1' }] }
+  const mk = (sha) => row(sha, { ai: { ...clean, model: 'test', v: PROMPT_V } })
+  await explainEntry({ entry: mk('b1'), patch, context: ctx, env: env({}), dataDir: dir })
+  assert.ok(seen[0].includes(wide), 'without leadLean the full ask goes first')
+  seen.length = 0
+  const { text } = await explainEntry({ entry: mk('b2'), patch, context: ctx, env: env({}), dataDir: dir, leadLean: true })
+  assert.ok(!seen[0].includes(wide), 'with leadLean the lean ask goes first')
+  assert.match(seen[0], /diff --git/, 'and it still carries the diff')
+  assert.equal(text, 'The gate reads a flag before it acts.')
+})
+
+test('the plain-English pass leads with the lean ask after two budget-exceeded failures', async t => {
+  const dir = await temp(t)
+  const testPatch = 'diff --git a/handler.test.ts b/handler.test.ts\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/handler.test.ts\n@@ -0,0 +1,3 @@\n+test(\'caps the handler\', () => {\n+  expect(1).toBe(1)\n+})\n'
+  const prompts = []
+  let hang = true
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    prompts.push(JSON.parse(String(init.body)).messages.at(-1).content)
+    if (hang) {
+      return await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(response({ eli5: 'A test now caps the handler.' })), 10000)
+        init.signal.addEventListener('abort', () => { clearTimeout(timer); reject(Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })) })
+      })
+    }
+    return response({ eli5: 'A test now caps the handler.' })
+  })
+  const e = row('c1', { ai: { ...clean, model: 'test', v: PROMPT_V } })
+  const runEnv = env({ CHANGELOG_ELI5_ROW_BUDGET_MS: '400', CHANGELOG_LLM_TRANSIENT_RETRY_MS: '1' })
+  const opts = { retryErrors: true, getPatch: async () => testPatch }
+  // Two cycles burn the 400ms clock on the hanging full ask.
+  assert.equal(await enrichEli5([e], dir, runEnv, opts), 0)
+  assert.equal(await enrichEli5([e], dir, runEnv, opts), 0)
+  // The third cycle leads with the lean ask, which answers at once.
+  hang = false
+  prompts.length = 0
+  assert.equal(await enrichEli5([e], dir, runEnv, opts), 1)
+  assert.equal(prompts.length, 1, 'the lean ask answers on the first call')
+  assert.ok(!prompts[0].includes('Tests this commit changed'), 'the retry leads with the lean ask')
+  assert.match(prompts[0], /diff --git/, 'and it still carries the diff')
+  assert.equal(e.eli5.text, 'A test now caps the handler.')
+})
+
+test('the plain-English pass compacts deleted files on large diffs, like the summary pass', async t => {
+  const dir = await temp(t)
+  const big = 'diff --git a/old.ts b/old.ts\ndeleted file mode 100644\nindex abc..000 100644\n--- a/old.ts\n+++ /dev/null\n@@ -1,20000 +0,0 @@\n' + '-old line\n'.repeat(20000)
+  const prompts = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    prompts.push(JSON.parse(String(init.body)).messages.at(-1).content)
+    return response({ eli5: 'Old code was removed.' })
+  })
+  const e = row('d1', { ai: { ...clean, model: 'test', v: PROMPT_V } })
+  await enrichEli5([e], dir, env({ CHANGELOG_LLM_MAPREDUCE_THRESHOLD: '1000' }), { retryErrors: true, getPatch: async () => big })
+  assert.equal(prompts.length, 1)
+  assert.ok(prompts[0].includes('removed lines omitted'), 'deleted bodies are compacted before the prompt is built')
+  assert.ok(!prompts[0].includes('-old line\n-old line'), 'the 20k removed lines are not sent')
+  assert.equal(e.eli5.text, 'Old code was removed.')
+  // And an ordinary row keeps its exact prompt: the gate is size-only.
+  prompts.length = 0
+  const e2 = row('d2', { ai: { ...clean, model: 'test', v: PROMPT_V } })
+  await enrichEli5([e2], dir, env({ CHANGELOG_LLM_MAPREDUCE_THRESHOLD: '1000' }), { retryErrors: true, getPatch: async () => patch })
+  assert.match(prompts[0], /\+export const ALPHA = 1/, 'a small diff is sent uncompacted')
 })
