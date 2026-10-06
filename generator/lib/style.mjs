@@ -3415,4 +3415,81 @@ a.badge:hover{text-decoration:none;color:var(--term-cyan)}
 .ask-ok{border-left-color:var(--term-green)}
 .ask-refused{border-left-color:var(--term-red);color:var(--txt-subtle)}
 .ask-note{margin-top:.5em;font-size:.72rem;color:var(--txt-subtle);white-space:normal}
+/* Screen-reader-only text: keeps icon-only controls (bare pager arrows) labelled. */
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+/* Homepage onboarding: what Freebuff is and what this site is, linking the
+   about page that answers the rest. */
+.home-intro{
+  margin:14px 0 4px;
+  padding:10px 14px;
+  border:1px solid var(--term-border);
+  border-left:3px solid var(--term-green);
+  background:var(--panel);
+  font-size:.86rem;
+  line-height:1.6;
+  color:var(--txt-dim);
+}
+.home-intro p{margin:0}
+.home-intro a{color:var(--term-cyan)}
+/* Tiered day view: notable/security entries keep full cards; every minor entry
+   is one dense row under its area header, expanding in place. */
+.tier-hdr{margin-top:22px}
+.tier-hdr h2{color:var(--txt-dim)}
+.minor-group{margin:14px 0 4px}
+.minor-group-hdr{
+  font-size:.8rem;
+  font-weight:700;
+  letter-spacing:.04em;
+  color:var(--txt);
+  margin:0 0 6px;
+  padding-bottom:4px;
+  border-bottom:1px solid var(--term-border);
+  text-transform:uppercase;
+}
+.minor-count{
+  display:inline-block;
+  min-width:22px;
+  text-align:center;
+  font-size:.72rem;
+  color:var(--txt-subtle);
+  border:1px solid var(--term-border);
+  border-radius:10px;
+  padding:0 6px;
+  margin-left:6px;
+  vertical-align:1px;
+}
+.minor-rows{display:flex;flex-direction:column;gap:2px}
+.minor-row{border:1px solid transparent;border-radius:3px}
+.minor-row:hover{border-color:var(--term-border)}
+.minor-row[open]{border-color:var(--term-border);background:var(--panel)}
+.minor-summary{
+  list-style:none;
+  cursor:pointer;
+  display:flex;
+  align-items:baseline;
+  gap:8px;
+  padding:4px 8px;
+  font-size:.82rem;
+  line-height:1.45;
+}
+.minor-summary::-webkit-details-marker{display:none}
+.minor-summary::marker{display:none}
+.minor-row[open] > .minor-summary .entry-arrow{transform:rotate(90deg);color:var(--term-cyan)}
+.minor-summary:hover{background:var(--panel-hover)}
+.minor-summary:hover .entry-arrow{color:var(--txt)}
+.minor-title{
+  color:var(--txt-dim);
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  flex:1 1 auto;
+  min-width:0;
+}
+.minor-row[open] .minor-title{white-space:normal}
+.minor-summary .badges{margin-left:auto;flex:none}
+.minor-summary .entry-utc{flex:none}
+.minor-body{padding:2px 4px 8px}
+.minor-body .entry{border-top:1px dashed var(--term-border)}
+/* The notable-only toggle reads as pressed when active. */
+.timeline-bulk-btn.active{color:var(--term-cyan);text-decoration:underline}
 `

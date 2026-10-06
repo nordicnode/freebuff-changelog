@@ -385,7 +385,7 @@ function openHashTarget() {
       target = document.querySelector('[id^="' + short + '"]');
     }
   }
-  if (target && target.tagName === 'DETAILS' && target.classList.contains('entry')) {
+  if (target && target.tagName === 'DETAILS' && (target.classList.contains('entry') || target.classList.contains('minor-row'))) {
     target.open = true;
     scrollToEl(target, 'start');
   }
@@ -395,7 +395,10 @@ window.addEventListener('hashchange', openHashTarget);
 
 let activeEntryIdx = -1;
 function getVisibleEntries() {
-  return Array.from(document.querySelectorAll('details.entry:not([hidden])'));
+  // Top-level entry rows only: a minor row embeds its full card, and the
+  // embedded copy is not a navigable row of its own.
+  return Array.from(document.querySelectorAll('details.entry:not([hidden]), details.minor-row:not([hidden])'))
+    .filter(function (r) { return !r.closest('details.minor-row') || r.classList.contains('minor-row'); });
 }
 function setActiveEntry(idx) {
   const entries = getVisibleEntries();
@@ -540,7 +543,10 @@ document.addEventListener('click', (ev) => {
   if (!btn) return;
   const action = btn.getAttribute('data-bulk');
   const open = action === 'expand';
-  document.querySelectorAll('section.day details.entry:not([hidden])').forEach(e => {
+  document.querySelectorAll('section.day details.entry:not([hidden]), section.day details.minor-row:not([hidden])').forEach(e => {
+    // The card embedded in a minor row follows its row; toggling it separately
+    // would fight the row's own disclosure.
+    if (e.closest('details.minor-row') && !e.classList.contains('minor-row')) return;
     e.open = open;
     // [expand all] is the power-user move: it opens the folded technical
     // section too (and collapse-all folds it back).
@@ -2406,6 +2412,7 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
     <div class="timeline-bulk-toggle">
       <button type="button" class="timeline-bulk-btn" data-bulk="expand">[expand all]</button>
       <button type="button" class="timeline-bulk-btn" data-bulk="collapse">[collapse all]</button>
+      <button type="button" class="timeline-bulk-btn" id="notable-toggle" aria-pressed="false" title="Show only notable and major entries; hides minor rows and churn. Saved on this device.">[notable only]</button>
       <button type="button" class="timeline-bulk-btn timeline-reading-mode-btn" data-reading-mode title="Toggle Plain English reading mode (hides technical diffs and details, focusing on plain-language summaries)">[plain english: off]</button>
     </div>
   </div>`
@@ -2451,13 +2458,14 @@ ${[
 </section>`
     // The settled day's digest, written by the roll-up pass and read here
     // as-is. A day still in progress has none: the box is simply absent rather
-    // than showing a partial list that will change by evening.
+    // than showing a partial list that will change by evening. It sits above
+    // the entries as the read-first summary of the day.
     const dayRollup = rollups[day.day]
     const rollupHtml = dayRollup?.bullets?.length
       ? `
-<section class="day-rollup" aria-label="Day summary">
+<section class="day-rollup" aria-label="Day summary: read this first">
 <div class="day-rollup-hdr">
-  <span class="day-rollup-label">DAY_ROLLUP :: ${esc(fmtDateHuman(day.day))}</span>
+  <span class="day-rollup-label">READ THIS FIRST :: ${esc(fmtDateHuman(day.day))}</span>
   <span class="day-rollup-count">${dayRollup.bullets.length} highlight${dayRollup.bullets.length === 1 ? '' : 's'}</span>
 </div>
 <ul>${dayRollup.bullets.map(b => `<li>${esc(b)}</li>`).join('')}</ul>
@@ -2476,20 +2484,76 @@ ${[
     const churnOnlyNotice = (real === 0 && churn > 0)
       ? `\n<p class="day-churn-only">Only churn was recorded this day &mdash; ${churn} commit${churn === 1 ? '' : 's'} (${esc(churnDesc)}), nothing that changes the product. Use the <strong>churn</strong> filter above to see them.</p>`
       : ''
-    let notYetOpen = true
+    // Tiered day: the rollup (above) reads first, then notable/security entries
+    // as full cards, then every minor entry as one dense row under its area
+    // header. Minor bodies stay in the DOM inside a collapsed <details> -- one
+    // renderer, no fetch, no-JS still reads everything -- so expanding in place
+    // is native disclosure, not a second code path.
+    const effSig = (e) => e.ai?.significance || e.significance || 'minor'
+    const isLeadEntry = (e) => !e.noise && (effSig(e) === 'major' || effSig(e) === 'notable' || isSecurityEntry(e))
+    const leadEntries = []
+    const minorByArea = new Map()
+    const churnEntries = []
+    for (const e of rows) {
+      if (e.noise) { churnEntries.push(e); continue }
+      if (isLeadEntry(e)) leadEntries.push(e)
+      else {
+        const area = (e.areas && e.areas[0]) || 'Other'
+        if (!minorByArea.has(area)) minorByArea.set(area, [])
+        minorByArea.get(area).push(e)
+      }
+    }
+    const minorCount = [...minorByArea.values()].reduce((n, l) => n + l.length, 0)
+    // The newest lead entry starts open. A day of nothing but minor rows leaves
+    // them closed -- the rollup above is the read-first content either way.
+    let leadOpen = true
+    const leadHtml = leadEntries.map(e => {
+      const open = leadOpen
+      leadOpen = false
+      return entryCard(e, open, relatedIdx, cardOpts(e))
+    }).join('\n')
+    const minorRowHtml = (e) => {
+      const anchor = e.sha.slice(0, 12)
+      const time = e.date.slice(11, 16)
+      const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
+      // The row keeps the #sha anchor; the embedded card drops its id so the
+      // document never holds two elements with the same one.
+      const card = entryCard(e, false, relatedIdx, cardOpts(e)).replace(` id="${anchor}"`, '')
+      return `<details class="minor-row" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(e.significance || '')}" data-aud="${esc(e.ai?.audience || '')}">
+<summary class="minor-summary"><span class="entry-arrow">&gt;</span><span class="entry-utc" title="${esc(e.date.slice(0, 16).replace('T', ' ') + ' UTC')}">${esc(time)}</span><span class="minor-title">${title}</span><span class="badges">${badges(e)}</span></summary>
+<div class="minor-body">${card}</div>
+</details>`
+    }
+    const minorGroups = [...minorByArea.entries()]
+      .sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]))
+      .map(([area, list]) => `<div class="minor-group" data-area="${esc(categorySlug(area))}">
+  <h3 class="minor-group-hdr">${esc(area)} <span class="minor-count">${list.length}</span></h3>
+  <div class="minor-rows">${list.map(minorRowHtml).join('\n')}</div>
+</div>`).join('\n')
+    const churnHtml = churnEntries.map(e => entryCard(e, false, relatedIdx, cardOpts(e, { hideChurn: true }))).join('\n')
+    // Tier headers only when there is more than one tier to tell apart; a day
+    // that is all-notable or all-minor needs no scaffolding.
+    const tierHdr = (label, n) => `<div class="section-hdr tier-hdr"><h2>${label} (${n})</h2></div>`
     const dayHtml = `<section class="day" id="${day.day}">
 <div class="day-line">
   <h2><time datetime="${day.day}">[ ${esc(fmtDateHuman(day.day))} ]</time></h2>
   <span class="day-count">${real} change${real === 1 ? '' : 's'}${churn ? ` <span class="day-churn">+${churn} churn</span>` : ''}</span>
 </div>${churnOnlyNotice}
 ${dayStories(storyIdx, day.day).map(cluster => dayLeadHtml([cluster])).join('')}
-${rows.map(e => {
-      const open = notYetOpen && !e.noise
-      if (open) notYetOpen = false
-      return entryCard(e, open, relatedIdx, cardOpts(e, { hideChurn: true }))
-    }).join('\n')}</section>`
+${leadEntries.length && minorCount ? tierHdr('NOTABLE & SECURITY', leadEntries.length) : ''}
+${leadHtml}
+${minorCount && leadEntries.length ? tierHdr('EVERYTHING ELSE', minorCount) : ''}
+${minorGroups}
+${churnHtml}</section>`
 
-    return hero + rollupHtml + dayHtml + pagePager(i)
+    // Homepage onboarding: the front page is the newest day, and nothing on it
+    // said what Freebuff is or what this site is. Two sentences and a link to
+    // the about page that already answers the rest.
+    const homeIntro = latest ? `<section class="home-intro" aria-label="About this site">
+<p>Freebuff is the AI coding assistant built in the public <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a> repo. This site is an unofficial, fully automated changelog of that repo: an AI model summarizes every commit from its diff, and every claim links back to the code. <a href="/about/">How it is built &rarr;</a></p>
+</section>` : ''
+
+    return homeIntro + hero + rollupHtml + dayHtml + pagePager(i)
   }
 
   // Front-page filter. Every row the timeline can show is already in the DOM, so a
@@ -2507,7 +2571,11 @@ ${rows.map(e => {
   var KEY = 'fbIndexFilter';
   var sel = document.getElementById('filter-select');
   var churnBtn = document.getElementById('churn-toggle');
-  var rows = [].slice.call(document.querySelectorAll('details.entry'));
+  var notableBtn = document.getElementById('notable-toggle');
+  // Top-level rows only: a minor row embeds its full card, and the embedded
+  // copy must not count (or filter) as a row of its own.
+  var rows = [].slice.call(document.querySelectorAll('details.entry, details.minor-row'))
+    .filter(function (r) { return !r.closest('details.minor-row') || r.classList.contains('minor-row'); });
   var days = [].slice.call(document.querySelectorAll('section.day'));
   var countEl = document.getElementById('filter-count');
   var noteEl = document.querySelector('.filter-note em');
@@ -2516,10 +2584,10 @@ ${rows.map(e => {
   var HUB = (noteWrap && noteWrap.getAttribute('data-hub')) || '/archive/#categories';
   var SIG = { major: 1, notable: 1, minor: 1 };
   function optFor(v) { return sel ? sel.querySelector('option[value="' + v + '"]') : null }
-  var state = { filter: '*', churn: false };
+  var state = { filter: '*', churn: false, notable: false };
   try {
     var stored = JSON.parse(localStorage.getItem(KEY) || 'null');
-    if (stored && typeof stored.filter === 'string') state = { filter: stored.filter, churn: !!stored.churn };
+    if (stored && typeof stored.filter === 'string') state = { filter: stored.filter, churn: !!stored.churn, notable: !!stored.notable };
   } catch (e) {}
 
   function apply(save) {
@@ -2533,22 +2601,27 @@ ${rows.map(e => {
       else if (SIG[f]) want = r.getAttribute('data-sig') === f;
       else if (f.indexOf('aud:') === 0) want = r.getAttribute('data-aud') === f.slice(4);
       else want = r.getAttribute('data-cat') === f;
+      // Notable-only hides the minor tier and churn outright; it composes with
+      // the area/impact/audience filter above.
+      if (state.notable && (r.classList.contains('minor-row') || r.hasAttribute('data-churn'))) want = false;
       r.hidden = !want;
     });
     days.forEach(function (d) {
       // A churn-only day keeps its section visible even while every row is
       // hidden, because then the .day-churn-only notice is the only thing the
       // reader has to read; hiding the section would hide the explanation too.
-      d.hidden = !d.querySelector('details.entry:not([hidden])') && !d.querySelector('.day-churn-only');
+      d.hidden = !d.querySelector('details.entry:not([hidden]), details.minor-row:not([hidden])') && !d.querySelector('.day-churn-only');
     });
     // A #sha link must land on something the reader can see, even when the
     // filter would have hidden that row: revealing one entry (and its day) beats
-    // a URL that appears to go nowhere.
+    // a URL that appears to go nowhere. A minor row opens so the entry is read,
+    // not just its one-line summary.
     var hash = (location.hash || '').slice(1);
     if (hash) {
       var target = document.getElementById(hash);
-      if (target && target.classList && target.classList.contains('entry')) {
+      if (target && target.classList && (target.classList.contains('entry') || target.classList.contains('minor-row'))) {
         target.hidden = false;
+        if (target.tagName === 'DETAILS') target.open = true;
         var parent = target.closest ? target.closest('section.day') : null;
         if (parent) parent.hidden = false;
       }
@@ -2585,6 +2658,11 @@ ${rows.map(e => {
       churnBtn.classList.toggle('active', state.churn);
       churnBtn.setAttribute('aria-pressed', state.churn ? 'true' : 'false');
     }
+    if (notableBtn) {
+      notableBtn.classList.toggle('active', state.notable);
+      notableBtn.setAttribute('aria-pressed', state.notable ? 'true' : 'false');
+      notableBtn.textContent = state.notable ? '[notable only: on]' : '[notable only]';
+    }
     if (countEl) countEl.textContent = shown;
     if (noteEl) {
       var churnRows = rows.filter(function (r) { return r.hasAttribute('data-churn') }).length;
@@ -2598,6 +2676,7 @@ ${rows.map(e => {
 
   if (sel) sel.addEventListener('change', function () { state.filter = sel.value || '*'; apply(true); });
   if (churnBtn) churnBtn.addEventListener('click', function () { state.churn = !state.churn; apply(true); });
+  if (notableBtn) notableBtn.addEventListener('click', function () { state.notable = !state.notable; apply(true); });
   apply(false);
 })();
 </script>`

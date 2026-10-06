@@ -1880,6 +1880,77 @@ test('week index lists every week that gets a detail page', async (t) => {
   assert.match(idx, /data-year="all"/, 'an ALL WEEKS tab reaches every year group')
   assert.match(idx, /data-year="2026"/, 'a per-year tab reaches older weeks')
 })
+// The tiered day view: the rollup reads first, notable/security entries keep
+// full cards, and every minor entry is one dense row under its area header,
+// expanding in place. The embedded card drops its id so the row's #sha anchor
+// stays unique in the document.
+test('tiered day view: lead cards, minor rows under area headers, unique anchors', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-tiers-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const row = (sha, extra) => ({
+    kind: 'sync', sha, date: '2026-09-19T10:00:00Z', day: '2026-09-19', month: '2026-09', author: 'dev',
+    areas: ['CLI'], category: 'CLI', significance: 'minor', summary: 's', title: 't ' + sha.slice(0, 4),
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/src/x.ts'] },
+    stats: { additions: 3, deletions: 1 }, ...extra
+  })
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 7 },
+    entries: [
+      row('a1'.repeat(20), { significance: 'major', title: 'Major model swap' }),
+      row('b2'.repeat(20), { significance: 'notable', title: 'Notable CLI flag' }),
+      row('c3'.repeat(20), { title: 'Fix XSS in login form' }),
+      row('d4'.repeat(20), { title: 'Minor CLI polish one' }),
+      row('e5'.repeat(20), { title: 'Minor CLI polish two' }),
+      row('f6'.repeat(20), { title: 'Minor core tweak', areas: ['Core'], category: 'Core' }),
+      row('00'.repeat(20), { title: 'lockfile churn', noise: true, churn: 'lockfile' })
+    ]
+  }
+  const rollups = { '2026-09-19': { bullets: ['The headline of the day.', 'A second highlight.'] } }
+  await buildSite({ changelog, openPrs: [], dist, rollups })
+  const html = await readFile(join(dist, 'day/2026-09-19/index.html'), 'utf8')
+
+  assert.match(html, /READ THIS FIRST/, 'the day digest is labeled read-this-first')
+  assert.match(html, /NOTABLE & SECURITY \(3\)/, 'major + notable + security entries tier up')
+  assert.match(html, /EVERYTHING ELSE \(3\)/, 'minor entries tier down with a count')
+  assert.equal((html.match(/<details class="minor-row"/g) || []).length, 3, 'one dense row per minor entry')
+  assert.match(html, /minor-group-hdr">CLI <span class="minor-count">2<\/span>/, 'minor rows group under area headers with counts')
+  assert.match(html, /minor-group-hdr">Core <span class="minor-count">1<\/span>/)
+  // Anchors stay unique: the row owns the #sha id, the embedded card drops its.
+  for (const sha of ['a1'.repeat(20), 'b2'.repeat(20), 'c3'.repeat(20), 'd4'.repeat(20), 'e5'.repeat(20), 'f6'.repeat(20)]) {
+    const id = sha.slice(0, 12)
+    assert.equal((html.match(new RegExp(`id="${id}"`, 'g')) || []).length, 1, `${id} anchors exactly one element`)
+  }
+  // The first lead entry (newest: the security fix) starts open; a minor row never does.
+  assert.match(html, /<details class="entry[^"]*" id="c3c3c3c3c3c3"[^>]* open/, 'first lead card starts open')
+  assert.doesNotMatch(html, /<details class="minor-row"[^>]* open/, 'no minor row starts open')
+  // The notable-only toggle ships on the daily view and persists its state.
+  assert.match(html, /id="notable-toggle"/, 'notable-only toggle button renders')
+  assert.match(html, /notable: !!stored\.notable/, 'toggle state persists in localStorage')
+})
+
+test('homepage carries a short intro linking the about page', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-intro-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const mk = (sha, date) => ({
+    kind: 'sync', sha, date, day: date.slice(0, 10), month: date.slice(0, 7), author: 'dev',
+    areas: ['CLI'], category: 'CLI', significance: 'notable', summary: 's', title: 'A notable change',
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/src/x.ts'] },
+    stats: { additions: 3, deletions: 1 }
+  })
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 2 },
+    entries: [mk('a1'.repeat(20), '2026-09-18T10:00:00Z'), mk('b2'.repeat(20), '2026-09-19T10:00:00Z')]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const home = await readFile(join(dist, 'index.html'), 'utf8')
+  assert.match(home, /class="home-intro"/, 'homepage has the intro block')
+  assert.match(home, /unofficial, fully automated changelog/, 'intro says what the site is')
+  assert.match(home, /href="\/about\/"/, 'intro links the existing about page')
+  const older = await readFile(join(dist, 'day/2026-09-18/index.html'), 'utf8')
+  assert.doesNotMatch(older, /class="home-intro"/, 'older day pages do not repeat the intro')
+})
 // Both version lines get release pages now: the 1.0.x codebuff-cli line and
 // the 0.x freebuff-cli line (VERSION_TRACKS in analyze.mjs). A badge that names
 // a version must never point at a page the build did not write.
