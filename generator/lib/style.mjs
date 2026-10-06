@@ -3507,7 +3507,10 @@ a.badge:hover{text-decoration:none;color:var(--term-cyan)}
 .minor-summary .badges{margin-left:auto;flex:none}
 .minor-summary .entry-utc{flex:none}
 .minor-body{padding:2px 4px 8px}
-.minor-body .entry{border-top:1px dashed var(--term-border)}
+/* Compact rows are scanned, not read: the title leads and the chips sit back
+   until the row is hovered or opened. */
+.minor-summary .badges{opacity:.68}
+.minor-summary:hover .badges,.minor-row[open] .minor-summary .badges{opacity:1}
 /* The notable-only toggle reads as pressed when active. */
 .timeline-bulk-btn.active{color:var(--term-cyan);text-decoration:underline}
 `
