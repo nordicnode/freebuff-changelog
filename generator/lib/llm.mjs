@@ -4146,6 +4146,46 @@ export async function verifySummary (entry, patch, clean, env, cautionNames = []
   return callLlm(buildVerifyPrompt(entry, patch, clean, cautionNames, vopts), venv, 1, validate, { fallbackPrompt, leanPrompt, gatewayRetries: 0, stage: 'verification' })
 }
 
+// Deletion-heavy snapshots -- a cleanup commit that removes thousands of lines
+// -- are mostly removed bodies: bytes that describe nothing a reader needs and
+// that push the diff past what any prompt can carry. Dropping those bodies,
+// while keeping each deleted file's header, its line counts and the removed
+// declaration lines that name what went away, can shrink such a diff by an
+// order of magnitude. A removed `export function foo` line still grounds a
+// sentence that says `foo` was removed; the hundred lines of its body do not.
+//
+// The caller gates this on the patch being too big to send whole, so an
+// ordinary row's evidence never changes: a small deletion already fits, and it
+// loses nothing by keeping its body.
+const DELETED_FILE_RE = /^deleted file mode /m
+const REMOVED_DECL_RE = /^-\s*(?:export\s+|declare\s+|default\s+|async\s+|public\s+|private\s+|protected\s+|static\s+|abstract\s+|readonly\s+)*(?:function|class|interface|type|enum|const|let|var|namespace|module|def|struct|impl|trait|func|import|from|require)\b/
+export const DELETION_COMPACT_MIN_LINES = 40
+
+export function compactDeletions (patch) {
+  const src = String(patch ?? '')
+  let changed = false
+  const out = src.split(/(?=^diff --git )/m).map(part => {
+    if (!DELETED_FILE_RE.test(part)) return part
+    const kept = []
+    let dropped = 0
+    for (const line of part.split('\n')) {
+      const removedBody = line.startsWith('-') && !line.startsWith('--- ') && !REMOVED_DECL_RE.test(line)
+      if (removedBody) { dropped++; continue }
+      kept.push(line)
+    }
+    if (dropped < DELETION_COMPACT_MIN_LINES) return part
+    const at = kept.findIndex(l => l.startsWith('@@'))
+    if (at === -1) return part
+    // One marker per file, right after the first hunk header. The file's
+    // identity and line counts above it are untouched, so the change is still
+    // fully attributed; only the removed bodies are gone.
+    kept.splice(at + 1, 0, `- …[${dropped} removed lines omitted; declaration lines kept]…`)
+    changed = true
+    return kept.join('\n')
+  })
+  return changed ? out.join('') : src
+}
+
 // The diff room one chunk ask in a map-reduce row gets.
 //
 // The row's clock pays for the WHOLE map-reduce ladder, but each chunk ask used
@@ -4171,7 +4211,10 @@ export function mapPhaseDiffRoom (clockMs, chunkCount = 1, { preambleChars = PRO
 // Map-reduce orchestration: one focused call per chunk (sequential, to respect
 // the RPM budget), then a fuse call validated against the FULL diff corpus so
 // the final entry is grounded no matter which chunk a name came from.
-export async function summarizeChunked (e, patch, { promptCtx = {}, corpus = '', sig = 'minor', env = process.env } = {}) {
+export async function summarizeChunked (e, patch, { promptCtx = {}, corpus = '', sig = 'minor', env = process.env, lean = false } = {}) {
+  // The lean rung hands the whole ask to one digest-grounded call: see
+  // summarizeFromDigest.
+  if (lean) return summarizeFromDigest(e, patch, { promptCtx, sig, env })
   const clockMs = promptCtx.rowBudgetMs ?? rowBudgetMs(env)
   // Bound the map phase BEFORE chunking, so the row's allowance is spent on the
   // files that matter (budgetPatch ranks source ahead of snapshots/generated
@@ -4199,6 +4242,21 @@ export async function summarizeChunked (e, patch, { promptCtx = {}, corpus = '',
   const fuse = buildFusePrompt(e, drafts, promptCtx, buildDiffDigest(redactProductPrompts(patch)))
   const evidence = supplied.join('\n') + '\n' + deliveredEvidence(fuse).split('\nPer-chunk drafts')[0]
   const clean = await callLlm(fuse, env, 1, summaryValidator(sig, evidence, promptCtx.structured || e.structured, { requireWhy: true, release: isBumpEntry(e) && (!!promptCtx.releaseCtx || !bumpOnly(e)) }), { stage: 'fuse' })
+  return { clean, fuse, evidence }
+}
+
+// The last rung for a diff too big to read: one ask grounded on the file list,
+// the structured facts and the whole-diff digest alone -- no chunk asks at all,
+// so it costs one call and fits any clock. It gives up the hunks a chunk would
+// have carried, but a digest-grounded summary is a summary, and the alternative
+// for a row whose chunk ladder failed on every attempt is no generation at all.
+// `deliveredEvidence` includes the digest block (it follows the empty drafts
+// section), so every name this ask may use is in the corpus the validator
+// checks against -- the ask cannot smuggle a claim the digest does not support.
+export async function summarizeFromDigest (e, patch, { promptCtx = {}, sig = 'minor', env = process.env } = {}) {
+  const fuse = buildFusePrompt(e, [], promptCtx, buildDiffDigest(redactProductPrompts(patch)))
+  const evidence = deliveredEvidence(fuse)
+  const clean = await callLlm(fuse, env, 1, summaryValidator(sig, evidence, promptCtx.structured || e.structured, { requireWhy: true, release: isBumpEntry(e) && (!!promptCtx.releaseCtx || !bumpOnly(e)) }), { stage: 'fuse-lean' })
   return { clean, fuse, evidence }
 }
 
@@ -4269,6 +4327,12 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
   const callsAt = requestScope.getStore().calls
   // Tiered routing: the rows a reader opens go to LLM_MODEL_MAJOR when set.
   const env = { ...baseEnv, LLM_MODEL: modelFor(e, baseEnv, relText) }
+  // A diff too big to send whole will lose most of its hunks anyway. When it is
+  // also deletion-heavy, compact the removed bodies first so the bytes that
+  // survive describe the change rather than the implementation of what went
+  // away (see compactDeletions). Gated on size, so an ordinary row keeps the
+  // exact evidence it has today.
+  const patchShown = String(patch || '').length > mapReduceThreshold(baseEnv) ? compactDeletions(patch) : patch
   // File-set PR matches are guesses: gate them before they enter the prompt.
   // Uncertain inferred matches fail closed; exact commit/number links remain.
   let prMetaEff = prMeta
@@ -4276,13 +4340,13 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
     prMetaEff = await checkPrRelevance(e, patch, prMeta, baseEnv)
   }
   const promptCtx = promptContextOf({ relText, sequence, prMeta: prMetaEff, archMap, glossary, context, rowBudgetMs: rowBudgetMs(baseEnv) })
-  const prompt = buildPrompt(e, patch, promptCtx)
+  const prompt = buildPrompt(e, patchShown, promptCtx)
   // Validate against delivered/redacted material, never unseen full context.
   let corpus = deliveredEvidence(prompt)
   const delivered = []
   const onDelivery = sent => { corpus = deliveredEvidence(sent); delivered.push(corpus) }
   const validateSummary = () => summaryValidator(e.significance || 'minor', () => corpus, promptCtx.structured, { requireWhy: true, release: isBumpEntry(e) && (!!relText || !bumpOnly(e)) })
-  const manifest = evidenceManifest(e, patch, prompt, env.LLM_MODEL)
+  const manifest = evidenceManifest(e, patchShown, prompt, env.LLM_MODEL)
   manifest.contextHash = contextFingerprint(prMetaEff, glossary)
   manifest.sourceContextHash = shortHash(JSON.stringify(context))
   manifest.promptVersion = PROMPT_V
@@ -4299,7 +4363,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
   // Shorter ask, same question: what callLlm falls back to when the gateway
   // refuses or answers in prose. Not built for chunked rows, whose single-shot
   // prompt is the thing chunking exists to avoid.
-  const strippedPatch = needsChunking(e, patch, baseEnv) ? null : strippedPatchOf(patch)
+  const strippedPatch = needsChunking(e, patchShown, baseEnv) ? null : strippedPatchOf(patchShown)
   const fallbackPrompt = strippedPatch ? buildPrompt(e, strippedPatch, promptCtx) : null
   // The second rung, for a different failure: a row whose evidence is a model
   // catalog or an agent definition answers the material instead of summarizing
@@ -4315,13 +4379,33 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
   // this rung fires the diff, the metadata, the headers and the structured
   // facts all still reach the model -- it gives up the wide sections, not the
   // ground truth.
-  const leanPrompt = buildPrompt(e, strippedPatch || patch, leanPromptCtx(promptCtx))
+  const leanPrompt = buildPrompt(e, strippedPatch || patchShown, leanPromptCtx(promptCtx))
   // Which model actually produced the entry: the escalation paths below move
   // it, and a row rescued by the strong model must say so in its record.
   let ranOn = env
-  if (needsChunking(e, patch, baseEnv)) {
-    log(`LLM map-reduce for ${String(e.sha || '').slice(0, 8)} (${String(patch || '').length} bytes)`)
-    const reduced = await summarizeChunked(e, patch, { promptCtx, corpus, sig, env })
+  if (needsChunking(e, patchShown, baseEnv)) {
+    // The map-reduce ladder has its own rungs now: the full chunk asks, then one
+    // digest-only ask (no map calls), then the strong model on that same
+    // digest-only ask. Before this a chunked row that failed threw straight out
+    // -- no lean rung, no escalation -- so the biggest diffs, the ones that need
+    // the most help, had strictly fewer ways to answer than a small row.
+    const chunked = (runEnv, lean) => summarizeChunked(e, patchShown, { promptCtx, corpus, sig, env: runEnv, lean })
+    let reduced
+    try {
+      log(`LLM map-reduce for ${String(e.sha || '').slice(0, 8)} (${String(patchShown || '').length} bytes)`)
+      reduced = await chunked(env, false)
+    } catch (err) {
+      log(`LLM map-reduce ask failed for ${String(e.sha || '').slice(0, 8)} (${shortError(err)}): re-asking from the diff digest alone`)
+      try {
+        reduced = await chunked(env, true)
+      } catch (err2) {
+        const strongEnv = strongModelEnv(baseEnv, env)
+        if (!strongEnv) throw err2
+        log(`LLM fell back to ${strongEnv.LLM_MODEL} for ${e.sha.slice(0, 8)}: the map-reduce rungs failed on ${env.LLM_MODEL} (${shortError(err2)})`)
+        reduced = await chunked(strongEnv, true)
+        ranOn = strongEnv
+      }
+    }
     clean = reduced.clean
     repairPrompt = reduced.fuse
     // Chunk drafts are not independent evidence. Retain only actual map input
@@ -4352,7 +4436,7 @@ export async function summarizeEntry ({ entry: e, patch, relText = '', sequence 
   manifest.partial ||= /\[[^\]\n]*(?:truncated|partial evidence)|diff omitted/i.test(verifyMaterial)
   // Names the model saw ONLY through the same-day sequence block: a claim
   // leaning on one of them must attribute it to the sibling commit.
-  const cautionNames = sequenceOnlyNames(sequence, groundingCorpus(e, patch, { ...promptCtx, sequence: null }))
+  const cautionNames = sequenceOnlyNames(sequence, groundingCorpus(e, patchShown, { ...promptCtx, sequence: null }))
   const structured = promptCtx.structured
   let verify
   let verifyError

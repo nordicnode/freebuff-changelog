@@ -192,12 +192,22 @@ export function qualityOf (e = {}) {
     for (const c of dedupeClaims(plain.verifyClaims)) warnings.push(`${c.claim}${c.reason ? ` (${c.reason})` : ''}`)
   }
   if (plain.text && plain.manifest?.partial) warnings.push('The plain-English explanation uses partial evidence; some changes may be omitted.')
+  // An admitted row with no generated text yet used to render its mechanical
+  // summary with no indication that anything was coming: a reader could not
+  // tell a deterministic placeholder from the finished, checked summary. Say so
+  // quietly -- it is a status, not an objection about the text. Only when the
+  // SUMMARY itself is missing: a row that has one but no plain-English line is
+  // not showing a mechanical placeholder, and must not claim to be.
+  const generation = generationState(e)
+  if (generation.missing?.includes('summary') && e.enrichment?.policy === QUALITY_POLICY_V) {
+    notes.push('An automated summary for this change is still being generated; the text shown is the mechanical summary.')
+  }
   const uncertain = warnings.length > 0
   const confidence = ai.manifest?.partial ? 'low' : ai.confidence === 'high' && (uncertain || demoteActions) ? 'medium' : ai.confidence
   const plainNotes = notes.filter(n => /plain-English/.test(n))
   return {
     verify, plainVerify, confidence, uncertain, demoteActions,
-    generation: generationState(e),
+    generation,
     prePolicy: verify === 'pre-policy' || plainVerify === 'pre-policy',
     reviewPending: verify === 'unavailable' || plainVerify === 'unavailable',
     warnings: [...new Set(warnings)],

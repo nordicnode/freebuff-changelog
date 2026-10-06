@@ -19,7 +19,7 @@ import {
   mapPhaseDiffRoom, PROMPT_PREAMBLE_CHARS
 } from '../lib/llm.mjs'
 import { summaryPassWindow, regenerationEli5Deadline, cmdGenerationHealth, cmdWatch } from '../cli.mjs'
-import { generationHealth } from '../lib/quality.mjs'
+import { generationHealth, qualityOf } from '../lib/quality.mjs'
 import { checkDeployedHead } from '../lib/sync.mjs'
 import { resetLlmRateLimiterForTests } from '../lib/llm.mjs'
 
@@ -569,6 +569,62 @@ test('map-reduce: a diff too big for the row clock is chunked to fit instead of 
   assert.equal(oversized.length, 0, 'no chunk ask exceeds what the row clock can prefill')
   assert.equal(n, 1, 'the oversized row is still summarized')
   assert.ok(e.ai?.title && e.ai?.summary, 'and it ships a real summary rather than staying missing')
+})
+
+// A diff big enough to force the chunked path, built from file shapes the
+// entry's own summary can ground against.
+const chunkablePatch = () => {
+  const parts = ['diff --git a/a.ts b/a.ts\nindex 1111111..2222222 100644\n--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,3 @@\n+export const ALPHA = 1\n const base = 0\n']
+  let len = parts[0].length
+  for (let i = 0; len < 400000; i++) {
+    const p = `diff --git a/src/f${i}.ts b/src/f${i}.ts\nindex 1111111..2222222 100644\n--- a/src/f${i}.ts\n+++ b/src/f${i}.ts\n@@ -1,2 +1,3 @@\n+export const ALPHA = 1\n const base = ${i}\n`
+    parts.push(p); len += p.length
+  }
+  return parts.join('')
+}
+
+test('map-reduce: when the chunk asks fail, the row is still answered from the digest alone', async (t) => {
+  const dir = await temp(t)
+  let mapCalls = 0, fuseCalls = 0
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const body = JSON.parse(String(init.body))
+    const prompt = String(body.messages?.at(-1)?.content || '')
+    if (prompt.startsWith('You summarize part')) { mapCalls++; return new Response('overloaded', { status: 503 }) }
+    fuseCalls++
+    return response(clean)
+  })
+  const e = row('1')
+  const n = await enrichWithLlm([e], async () => chunkablePatch(), dir, env({ CHANGELOG_LLM_MAPREDUCE_THRESHOLD: '50000' }), { retryErrors: true })
+  assert.ok(mapCalls >= 1, 'the full chunk asks were tried first')
+  assert.equal(fuseCalls, 1, 'and the digest-only rung answered on the first try')
+  assert.equal(n, 1, 'the row is written rather than left missing')
+  assert.ok(e.ai?.title && e.ai?.summary, 'and it ships a real summary')
+})
+
+test('map-reduce: a row whose rungs all fail on the routed model is retried lean on the strong model', async (t) => {
+  const dir = await temp(t)
+  const models = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const body = JSON.parse(String(init.body))
+    models.push(body.model)
+    if (String(body.messages?.at(-1)?.content || '').startsWith('You summarize part')) return new Response('overloaded', { status: 503 })
+    return body.model === 'strong-model' ? response(clean) : new Response('overloaded', { status: 503 })
+  })
+  const e = row('1')
+  const n = await enrichWithLlm([e], async () => chunkablePatch(), dir, env({
+    CHANGELOG_LLM_MAPREDUCE_THRESHOLD: '50000', LLM_MODEL: 'weak-model', LLM_MODEL_MAJOR: 'strong-model'
+  }), { retryErrors: true })
+  assert.equal(n, 1, 'the row is written by the strong model')
+  assert.ok(models.includes('strong-model'), 'the strong model answered the lean ask')
+  assert.ok(e.ai?.title, 'and the entry carries the summary')
+})
+
+test('quality: an admitted row with no generated text discloses that the summary is still coming', () => {
+  const bare = qualityOf(row('1'))
+  assert.equal(bare.generation.status, 'missing')
+  assert.match(bare.notes.join(' '), /still being generated/, 'the pending status is stated, not left implicit')
+  assert.doesNotMatch(qualityOf(row('2', { enrichment: {} })).notes.join(' '), /still being generated/, 'a row outside admission claims nothing')
+  assert.doesNotMatch(qualityOf(row('3', { ai: clean })).notes.join(' '), /still being generated/, 'and a generated row does not warn')
 })
 
 test('the row clock is per row: a bounded row does not spend another row\'s share', async (t) => {

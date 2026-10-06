@@ -1,7 +1,7 @@
 // generator/test/llm.test.mjs - tests for the LLM enrichment module
 import test, { beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, cleanText, unescapeSlashLeak, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, chargeReverify, callUnanswered, callLlm, VERIFY_POLICY_V, releaseFailedRows } from '../lib/llm.mjs'
+import { parseLlmJson, sanitizeJsonText, buildPrompt, enrichWithLlm, enrichEli5, llmConfigured, validateLlmOut, truncateWords, cleanText, unescapeSlashLeak, budgetPatch, cacheKey, firstSentence, isTransientError, isGatewayError, pruneExpiredErrors, errorRetryDelayMs, summaryDirt, healEligible, contextFingerprint, assessLlmHealth, recordLlmHealth, llmCallCount, buildSelfCheckPrompt, summaryValidator, GAVEUP_MAX_TRIES, shortError, PROMPT_V, ELI5_V, eli5Eligible, eli5Done, eli5Source, eli5Key, normalizeEli5, buildEli5Prompt, eli5Notes, eli5Patch, loadPrIndex, findPrMeta, groupEntriesByDay, sequenceForEntry, FREEBUFF_ARCHITECTURE_MAP, FREEBUFF_DOMAIN_LEXICON, ELI5_ROLLUP_MAX_CHARS, LLM_CONTEXT_CHARS, LLM_CONTEXT_TOKENS, LLM_PROMPT_CHARS, LLM_OUTPUT_RESERVE_CHARS, LLM_MIN_DIFF_ROOM, diffRoom, perFileRoom, capSection, fitToWindow, CONTEXT_SECTION_CHARS, CONTEXT_BUDGET_SHARES, contextBudgets, extractChangedTests, buildFusePrompt, buildVerifyPrompt, rewriteScopeOf, rewriteIsCurrent, redactProductPrompts, PROMPT_REDACTION, buildChunkPrompt, leanPromptCtx, REPLY_CONTRACT, compactDeletions, summarizeEntry, explainEntry, buildDiffDigest, buildPrPrompt, DEFAULT_VERIFY_MODEL, reverifyEligible, chargeReverify, callUnanswered, callLlm, VERIFY_POLICY_V, releaseFailedRows } from '../lib/llm.mjs'
 import { resetLlmRateLimiterForTests } from '../lib/llm.mjs'
 import { shortHash } from '../lib/util.mjs'
 beforeEach(() => resetLlmRateLimiterForTests())
@@ -985,6 +985,29 @@ test('budgetPatch: single-file patch passes through under budget', () => {
   const p = 'diff --git a/x b/x\n+line\n'
   assert.equal(budgetPatch(p), p)
 })
+
+test('compactDeletions: a deleted body is dropped, its header and declarations kept', () => {
+  const body = Array.from({ length: 60 }, (_, i) => `-  body line ${i} of the removed implementation`).join('\n')
+  const deleted = `diff --git a/cli/src/gone.ts b/cli/src/gone.ts\ndeleted file mode 100644\nindex 1111111..0000000\n--- a/cli/src/gone.ts\n+++ /dev/null\n@@ -1,62 +0,0 @@\n-export function GONE_HANDLER () {}\n-export const GONE_FLAG = true\n${body}\n`
+  const kept = 'diff --git a/keep.ts b/keep.ts\n@@ -1 +1 @@\n-old\n+new\n'
+  const out = compactDeletions(deleted + kept)
+  assert.ok(out.includes('GONE_HANDLER'), 'a removed declaration stays citable')
+  assert.ok(out.includes('GONE_FLAG'))
+  assert.ok(out.includes('cli/src/gone.ts'), 'the file header and its identity stay')
+  assert.match(out, /removed lines omitted/)
+  assert.ok(out.length < deleted.length / 2, 'and the removed body is gone')
+  assert.ok(out.includes('a/keep.ts') && out.includes('+new'), 'a non-deleted file is untouched')
+  assert.ok(out.endsWith(kept), 'and the compaction does not reorder parts')
+  // A deletion small enough to fit is returned byte-identical: only an oversized
+  // diff (gated by the caller) is ever compacted.
+  const small = `diff --git a/x.ts b/x.ts\ndeleted file mode 100644\n--- a/x.ts\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-export const X = 1\n-const y = 2\n`
+  assert.equal(compactDeletions(small), small)
+  // A modified file with removals is left alone even when huge: only files that
+  // were deleted outright are compaction candidates.
+  const modified = 'diff --git a/m.ts b/m.ts\n@@ -1,3 +1,2 @@\n' + '-removed\n'.repeat(100)
+  assert.equal(compactDeletions(modified), modified)
+})
+
 
 // Golden eval: prompt must ground the model in verifiable signals.
 // A model rename buried in the diff is the classic hallucination risk:
