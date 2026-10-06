@@ -727,8 +727,10 @@ export function extractVersionBump (patch) {
 
 // The two package files whose bumps mark a shippable build. `cli/release/`
 // feeds the 1.0.x line (e.version, release pages); `freebuff/cli/release/`
-// feeds the 0.0.x line (e.freebuffVersion, ELI5 roll-up only, no release page
-// per product decision). Track identity is what lets a release-window walk
+// feeds the 0.x line (e.freebuffVersion, release pages since 2026-10-06 --
+// the earlier "no release page" decision was reversed because the 0.2.x line
+// is the current Freebuff CLI and its badges 404'd without pages).
+// Track identity is what lets a release-window walk
 // stop at the previous bump of the *same* line instead of the nearest bump of
 // either line -- the two interleave constantly.
 export const VERSION_TRACKS = {
