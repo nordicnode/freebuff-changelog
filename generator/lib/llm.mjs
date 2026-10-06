@@ -5373,7 +5373,7 @@ Structure:
 3. Everyday Impact: Explain only the everyday effects the evidence establishes, including conditions and affected users. Tests show what is asserted, not proof of a deployed capability.
 
 Rules:
-- Do not replace evidenced changes with packaging boilerplate. Name only features or mechanisms demonstrated by member source hunks or reviewed window items. File counts, filenames and scope-only items do not establish behavior, improved reliability, consistent settings, or safety gains. If the evidence does not establish a behavior, say the available release evidence is incomplete; do not make up a benefit to fill the requested structure.
+- Do not replace evidenced changes with packaging boilerplate. Name only features or mechanisms demonstrated by the listed updates. File counts, filenames and scope-only items do not establish behavior, improved reliability, consistent settings, or safety gains. If the evidence does not establish a behavior, do not make up a benefit to fill the requested structure: describe briefly what the release does establish, and only when little is established, close with one plain sentence such as "The details available for this release don't describe more than that." Never write "evidence is incomplete", "source hunks", "reviewed window items", or negative filler ("No user-facing model updates ... are established"). Lead with what shipped, never with the caveat.
 - No marketing. Never call the release or the assistant "smarter", "faster", "more capable", "more powerful", "seamless", "robust", "supercharged" or "enhanced", and never claim speed, quality, savings or reliability gains unless an item in the list above states that exact gain. Describe what each item does; let the reader judge whether it is better.
 - Never invent a closing summary sentence ("Together, these changes make...") that generalizes beyond the items. If you need a last sentence, state the single most useful concrete effect.
 - Never define the reader in an aside: write "you", not "you (the person using the CLI)".
@@ -5699,6 +5699,13 @@ export function normalizeEli5 (raw, maxChars = ELI5_MAX_CHARS, { allow = '' } = 
   }
   if (maxChars > ELI5_MAX_CHARS && /(?:simply bundles?|internal packaging marker|nothing breaks,? nothing changes|no action is required on your part|(?:workflow|project setup|outputs?)(?: [a-z,]+)* will not be (?:any )?different)/i.test(s)) {
     throw new Error(`eli5 roll-up contains no-action packaging boilerplate without describing features: ${JSON.stringify(s).slice(0, 80)}`)
+  }
+  // Pipeline wording the old roll-up ask demanded ("say the available release
+  // evidence is incomplete", "demonstrated by member source hunks"): it reads
+  // as a broken page to a non-programmer, and the ask now forbids it. Reject
+  // so a disobeying generation retries instead of shipping.
+  if (maxChars > ELI5_MAX_CHARS && /\b(?:evidence is incomplete|source hunks?|reviewed window items|are established by the (?:provided )?evidence)\b/i.test(s)) {
+    throw new Error(`eli5 roll-up leaks pipeline wording to readers: ${JSON.stringify(s).slice(0, 80)}`)
   }
   // The symmetric failure: over-selling. Roll-ups are judged on the full hype
   // list (a window of titles never says "smarter"); single rows only on the

@@ -47,7 +47,11 @@ export const ELI5_V = 7
 // a packaging-only response cannot satisfy a functional release summary.
 // v11: member source hunks back sparse windows, packaging-field boilerplate
 // is rejected, and sparse evidence never demands invented user benefits.
-export const RELEASE_ROLLUP_V = 11
+// v12: the roll-up no longer announces "evidence is incomplete" or names
+// "source hunks" / "reviewed window items" to readers -- sparse releases lead
+// with what shipped and close plainly instead. normalizeEli5 rejects the old
+// pipeline wording so disobeying generations retry rather than ship.
+export const RELEASE_ROLLUP_V = 12
 
 // The verifier's framing and evidence policy, separate from the writer's prompt
 // version because it changes what a verdict means without changing the text.

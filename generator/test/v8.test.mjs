@@ -93,6 +93,11 @@ test('buildEli5Prompt roll-up carries anti-marketing rules', () => {
   const p = buildEli5Prompt({ version: '1.0.1', ai: { title: 'x' } }, [], { releaseCtx: 'Updates included in this release:\n- 2026-09-18 A thing' })
   assert.match(p, /No marketing/)
   assert.match(p, /Together, these changes make/)
+  // Sparse releases must lead with what shipped in plain words, never with
+  // pipeline talk ("evidence is incomplete", "source hunks") that the old ask
+  // demanded and readers received verbatim.
+  assert.match(p, /Never write "evidence is incomplete"/)
+  assert.match(p, /Lead with what shipped/)
 })
 
 test('normalizeEli5: strips "you (the person ...)" asides and rejects hype', () => {
@@ -103,6 +108,18 @@ test('normalizeEli5: strips "you (the person ...)" asides and rejects hype', () 
   // "faster" is the literal content of a perf fix: allowed on single rows.
   assert.equal(normalizeEli5('Startup is faster because the index loads lazily.'), 'Startup is faster because the index loads lazily.')
   assert.ok(ELI5_HYPE_ROLLUP_RE.test('faster'))
+})
+
+test('normalizeEli5: roll-ups reject pipeline wording that reads as a broken page', () => {
+  // The old roll-up ask demanded exactly these phrases, and readers received
+  // them verbatim ("The release evidence is incomplete. The available source
+  // hunks show ..."). A disobeying generation must retry instead of ship.
+  assert.throws(() => normalizeEli5('The release evidence is incomplete. It ships a pause gate.', ELI5_ROLLUP_MAX_CHARS), /pipeline wording/)
+  assert.throws(() => normalizeEli5('The available source hunks show a queue change.', ELI5_ROLLUP_MAX_CHARS), /pipeline wording/)
+  assert.throws(() => normalizeEli5('No user-facing model updates are established by the provided evidence.', ELI5_ROLLUP_MAX_CHARS), /pipeline wording/)
+  // Plain fallbacks stay shippable, and single rows are out of scope: the
+  // per-commit ask never produced this wording.
+  assert.equal(normalizeEli5('It ships a pause gate. The details available for this release don\'t describe more than that.', ELI5_ROLLUP_MAX_CHARS), 'It ships a pause gate. The details available for this release don\'t describe more than that.')
 })
 
 test('templateEli5: test-only and docs-only rows get a fixed line; bumps, facts and shipped code do not', () => {
