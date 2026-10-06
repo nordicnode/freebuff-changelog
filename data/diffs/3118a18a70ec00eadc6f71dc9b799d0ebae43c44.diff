@@ -1,0 +1,956 @@
+diff --git a/common/src/constants/__tests__/compaction-policy.test.ts b/common/src/constants/__tests__/compaction-policy.test.ts
+new file mode 100644
+index 000000000..9bf57d4ed
+--- /dev/null
++++ b/common/src/constants/__tests__/compaction-policy.test.ts
+@@ -0,0 +1,41 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  DETERMINISTIC_COMPACTION_PERCENT,
++  usesDeterministicCompaction,
++} from '../compaction-policy'
++
++const ids = Array.from(
++  { length: 20_000 },
++  (_, i) => `00000000-0000-4000-8000-${i.toString(16).padStart(12, '0')}`,
++)
++
++describe('usesDeterministicCompaction', () => {
++  test('is sticky per user', () => {
++    for (const id of ids.slice(0, 50))
++      expect(usesDeterministicCompaction(id)).toBe(
++        usesDeterministicCompaction(id),
++      )
++  })
++
++  test('splits users close to the configured share', () => {
++    const share =
++      ids.filter((id) => usesDeterministicCompaction(id)).length / ids.length
++    expect(
++      Math.abs(share * 100 - DETERMINISTIC_COMPACTION_PERCENT),
++    ).toBeLessThan(2)
++  })
++
++  test('a larger share only adds users', () => {
++    const at25 = ids.filter((id) => usesDeterministicCompaction(id, 25))
++    for (const id of at25)
++      expect(usesDeterministicCompaction(id, 75)).toBe(true)
++  })
++
++  test('0 keeps everyone on the handoff; 100 moves everyone, signed out too', () => {
++    expect(ids.some((id) => usesDeterministicCompaction(id, 0))).toBe(false)
++    expect(ids.every((id) => usesDeterministicCompaction(id, 100))).toBe(true)
++    expect(usesDeterministicCompaction(undefined, 50)).toBe(false)
++    expect(usesDeterministicCompaction(undefined, 100)).toBe(true)
++  })
++})
+diff --git a/common/src/constants/compaction-policy.ts b/common/src/constants/compaction-policy.ts
+index 5ba8543b7..faddf06a1 100644
+--- a/common/src/constants/compaction-policy.ts
++++ b/common/src/constants/compaction-policy.ts
+@@ -1,72 +1,100 @@
+ import { FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID } from './freebuff-model-ids'
++import { fnv1a } from '../util/ad-experiment'
+ 
+ /** Leave input headroom for the model-based compaction request. */
+ export function modelCompactionThreshold(maxContextLength: number): number {
+   return Math.floor(maxContextLength * 0.8)
+ }
+ 
+ /**
+  * When a root agent rewrites its own history after an idle gap: the user
+  * comes back after `cacheExpiryMs` of silence AND the history is at least
+  * `cacheExpiryMinTokens`. Below the floor a cold cache is not enough, because
+  * compaction costs inference and some detail. The context-limit trigger
+- * ignores the floor. Model-based compaction preserves findings from tool results.
++ * ignores the floor. For the users in `usesDeterministicCompaction` every
++ * pass is mechanical (no model call); for the rest it is a model handoff with
++ * the mechanical pass as fallback.
+  *
+  * The numbers live only here. base3 roots hand the object to the runtime as
+  * `compactContext`; the runtime defaults `compactContext: true` to
+  * DEFAULT_COMPACTION_POLICY; and serialized `handleSteps` that spawn
+  * context-pruner (base2, base-chat) receive it as
+  * `AgentStepContext.contextPruning`, resolved in run-programmatic-step.ts.
+  * Exactly these two keys: `compactContext` is validated with a strict schema.
+  */
+ export type CompactionPolicy = {
+   cacheExpiryMs: number
+   cacheExpiryMinTokens: number
+ }
+ 
+ /**
+  * One hour: the idle trigger is a product knob, not a TTL tracker. Compaction
+  * never prevents the cold prefill after a gap, it only shrinks it at the price
+  * of dropped tool results, and under an hour that reads as "the model forgot
+  * everything" (a top user complaint) while the cache may still be warm.
+  *
+- * The 140k floor originated as twice the mechanical summary ceilings. Keep
+- * the idle policy stable while switching compactContext to a model handoff;
+- * small idle histories do not justify another inference request.
++ * 140k tokens is two mechanical summary ceilings (20k assistant/tool + 50k
++ * user, in compact-history.ts). Below one ceiling the budget walk evicts
++ * nothing, so a mostly-prose history comes back the same size plus the
++ * envelope; the second ceiling is margin for the two sides being measured with
++ * different rulers (`chars / 3` against a BPE count).
+  */
+ export const DEFAULT_COMPACTION_POLICY: CompactionPolicy = {
+   cacheExpiryMs: 60 * 60 * 1000,
+   cacheExpiryMinTokens: 140_000,
+ }
+ 
+ /**
+  * DeepSeek V4 Flash, whose front lane is Luminal.
+  *
+  * 15 minutes is about how long Luminal keeps a session's prefix cache. Past
+  * that the next prompt re-reads everything at full price either way, so the
+  * hour only buys a bigger cold prefill.
+  *
+  * 40k tokens rather than 140k because the hour-era floor assumed a marginal
+  * trade, and here it is not. Measured with the runtime's own pass: the
+  * per-message transforms alone strip ~87% of a tool-heavy coding history at
+  * every size, so the budget walk the 140k figure waits for never matters.
+  * What they cannot touch is the fixed prefix — ~13k tokens of tool schemas
+  * plus prompt, knowledge files and git summary, typically 15-20k — so at 40k
+  * the pass halves the cold prefill, while at 25k it removes a third at best
+  * and drops exactly the files the model will re-read. On this lane a cold
+  * input token costs ~40x a cached one, so halving a cold 60k prefill is a
+  * material share of a turn's spend; the figures behind that are in
+  * freebuff-costs.knowledge.md (private).
+  */
+ export const DEEPSEEK_FLASH_COMPACTION_POLICY: CompactionPolicy = {
+   cacheExpiryMs: 15 * 60 * 1000,
+   cacheExpiryMinTokens: 40_000,
+ }
+ 
+ export function compactionPolicyForModel(
+   model: string | null | undefined,
+ ): CompactionPolicy {
+   return model === FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID
+     ? DEEPSEEK_FLASH_COMPACTION_POLICY
+     : DEFAULT_COMPACTION_POLICY
+ }
++
++/**
++ * Percent of users whose compactions, on every trigger, run the mechanical
++ * pass (a ~12k summary plus a working set of file reads) instead of the model
++ * handoff.
++ *
++ * The cohort is sticky per user, so the two arms can be compared on
++ * `context_compaction.followup` (re-reads and repeat compactions, by `mode`).
++ * It starts small and widens; at 100 the model handoff is deleted. A larger
++ * share only adds users, so nobody flips back. Changing the salt reassigns
++ * everyone.
++ */
++export const DETERMINISTIC_COMPACTION_PERCENT = 10
++const DETERMINISTIC_COMPACTION_SALT = 'deterministic_compaction_2026_10'
++
++export function usesDeterministicCompaction(
++  userId: string | undefined,
++  percent: number = DETERMINISTIC_COMPACTION_PERCENT,
++): boolean {
++  if (percent >= 100) return true
++  if (!userId || percent <= 0) return false
++  return fnv1a(`${DETERMINISTIC_COMPACTION_SALT}:${userId}`) % 100 < percent
++}
+diff --git a/common/src/templates/initial-agents-dir/types/agent-definition.ts b/common/src/templates/initial-agents-dir/types/agent-definition.ts
+index 627e0994e..a52323082 100644
+--- a/common/src/templates/initial-agents-dir/types/agent-definition.ts
++++ b/common/src/templates/initial-agents-dir/types/agent-definition.ts
+@@ -183,55 +183,57 @@ export interface AgentDefinition {
+ 
+   /** Whether to inherit the parent agent's system prompt instead of using this agent's own systemPrompt.
+    *
+    * Defaults to false.
+    * Use this when you want to enable prompt caching by preserving the same system prompt prefix.
+    * Cannot be used together with the systemPrompt field.
+    */
+   inheritParentSystemPrompt?: boolean
+ 
+   /** Opt in to windowed file reads: read_files accepts { path, offset, limit }
+    * entries, whole-file reads are capped per file, glob results are capped, and
+    * the read_files/code_search tool descriptions teach a search-first reading
+    * style. Defaults to false, which keeps the legacy read behavior.
+    */
+   windowedFileReads?: boolean
+   /** One final verification opportunity after tool work, within the existing step budget. */
+   completionCheck?: boolean
+ 
+   /** Drop the agent-attribution trailer from the run_terminal_command commit
+    * guidance, so a commit this agent makes carries no `Co-Authored-By` or
+    * "Generated with" line. For a run that commits into somebody else's
+    * repository on their behalf. Defaults to false, which keeps the trailer.
+    */
+   suppressCommitAttribution?: boolean
+ 
+-  /** Opt in to model-based context compaction: the same model writes a handoff
+-   * through complete_compaction before continuing. Defaults to false.
++  /** Opt in to in-process context compaction. Defaults to false.
+    *
+    * Compaction reserves input headroom and also runs after an idle gap. It is
+-   * an inference request and uses the run's normal billing/provider. Pass
++   * a mechanical rewrite of the history (no model call), or, for users not yet
++   * moved to that, a handoff the same model writes through complete_compaction
++   * (an inference request on the run's normal billing/provider) with the
++   * rewrite as the fallback. Pass
+    * `{ cacheExpiryMs }` to tune that idle threshold, or `{ cacheExpiryMs: null }`
+    * to compact on the context limit only.
+    *
+    * The cold-cache pass is skipped on a context smaller than
+    * `cacheExpiryMinTokens`, since compaction always costs detail and a small
+    * history has little to reclaim. Pass null to take it at any size. The
+    * context-limit pass ignores this floor.
+    */
+   compactContext?:
+     | boolean
+     | {
+         /** Explicit input budget for a custom model, after reserving output tokens. */
+         maxContextLength?: number
+         /** The model's output token cap, when it is below 16,384. Model
+          * compaction asks for a summary that fits in it. */
+         maxOutputTokens?: number
+         cacheExpiryMs?: number | null
+         cacheExpiryMinTokens?: number | null
+       }
+ 
+   /** Background information for the agent. Fairly optional. Prefer using instructionsPrompt for agent instructions. */
+   systemPrompt?: string
+ 
+   /** Instructions for the agent.
+    *
+diff --git a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+index 19a552a96..7dc922601 100644
+--- a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+@@ -1,32 +1,33 @@
+ /**
+  * End-to-end cover for the `compactContext` flag: compact-history.test.ts
+  * proves the algorithm, and this proves the runtime actually reaches it and
+  * that the rewritten history is what the model sees.
+  */
+ 
+ import * as analytics from '@codebuff/common/analytics'
++import { usesDeterministicCompaction } from '@codebuff/common/constants/compaction-policy'
+ import { TEST_USER_ID } from '@codebuff/common/old-constants'
+ import { createTestAgentRuntimeParams } from '@codebuff/common/testing/fixtures/agent-runtime'
+ import { clearMockedModules } from '@codebuff/common/testing/mock-modules'
+ import {
+   createMockDbOperations,
+   setupDbSpies,
+ } from '@codebuff/common/testing/mocks/database'
+ import { getInitialSessionState } from '@codebuff/common/types/session-state'
+ import { promptSuccess } from '@codebuff/common/util/error'
+ import { assistantMessage, userMessage } from '@codebuff/common/util/messages'
+ import {
+   afterAll,
+   afterEach,
+   beforeEach,
+   describe,
+   expect,
+   it,
+   mock,
+   spyOn,
+ } from 'bun:test'
+ 
+ import { loopAgentSteps } from '../run-agent-step'
+ import { clearAgentGeneratorCache } from '../run-programmatic-step'
+ import { createToolCallChunk, mockFileContext } from './test-utils'
+ 
+@@ -50,294 +51,323 @@ describe('compactContext in loopAgentSteps', () => {
+   const defaultCompactionInput: unknown = {
+     summary:
+       'the first request: DISTINCTIVE PRIOR ANSWER. Continue with the live question.',
+   }
+   /** What the summarizer's `complete_compaction` call carries, or a throw. */
+   let compactionInput: unknown | (() => never) = defaultCompactionInput
+ 
+   const baseTemplate: AgentTemplate = {
+     id: 'test-agent',
+     displayName: 'Test Agent',
+     spawnerPrompt: 'Testing',
+     model: 'claude-3-5-sonnet-20241022',
+     inputSchema: {},
+     outputMode: 'last_message',
+     includeMessageHistory: true,
+     inheritParentSystemPrompt: false,
+     mcpServers: {},
+     toolNames: ['end_turn'],
+     spawnableAgents: [],
+     systemPrompt: 'Test system prompt',
+     instructionsPrompt: '',
+     stepPrompt: '',
+     handleSteps: undefined,
+   } satisfies AgentTemplate as AgentTemplate
+ 
++  /** An old read whose result is most of the history: what a mechanical pass
++   * reclaims. Without it the history is too small to shrink. At ~53k tokens
++   * it is over the 40k working-set limit, so it comes back as a stub. */
++  const bulkyRead = (body = 'BULKY FILE BODY '): Message[] => [
++    {
++      role: 'assistant',
++      content: [
++        {
++          type: 'tool-call',
++          toolCallId: 'old-read',
++          toolName: 'read_files',
++          input: { paths: ['big.ts'] },
++        },
++      ],
++      sentAt: 1_000_000,
++    },
++    {
++      role: 'tool',
++      toolName: 'read_files',
++      toolCallId: 'old-read',
++      content: [
++        {
++          type: 'json',
++          value: [{ path: 'big.ts', content: body.repeat(10_000) }],
++        },
++      ],
++    },
++  ]
++
+   /**
+    * A conversation whose last assistant message landed `gapMinutes` before the
+    * live user prompt — i.e. the prompt cache has had that long to expire.
+    */
+   const idleHistory = (gapMinutes: number): Message[] => [
+     { ...userMessage('the first request'), sentAt: 1_000_000 },
++    ...bulkyRead(),
+     {
+       ...assistantMessage('DISTINCTIVE PRIOR ANSWER '.repeat(100)),
+       sentAt: 1_000_000,
+     },
+     {
+       ...userMessage('the live question'),
+       tags: ['USER_PROMPT'],
+       sentAt: 1_000_000 + gapMinutes * MINUTE,
+     },
+   ]
+ 
+   const runLoop = async (
+     template: AgentTemplate,
+     messageHistory: Message[],
+     prompt?: string,
+     logged?: unknown[],
++    userId: string = TEST_USER_ID,
+   ) => {
+     const {
+       agentTemplate: _,
+       localAgentTemplates: __,
+       ...baseRuntimeParams
+     } = createTestAgentRuntimeParams()
+ 
+     runtimeImpl = { ...baseRuntimeParams }
+     if (logged)
+       runtimeImpl.logger = {
+         ...baseRuntimeParams.logger,
+         info: (data: unknown) => logged.push(data),
+       }
+     runtimeImpl.promptAiSdkStream = mock(async function* (params: any) {
+       if (params.tools.complete_compaction) {
+         expect(Object.keys(params.tools)).toEqual(['complete_compaction'])
+         expect(params.model).toBe(baseTemplate.model)
+         if (typeof compactionInput === 'function') compactionInput()
+         yield {
+           ...createToolCallChunk('complete_compaction', {}),
+           input: compactionInput,
+         } as ReturnType<typeof createToolCallChunk>
+         return promptSuccess('compaction-message-id')
+       }
+       seenMessages.push(params.messages)
+       yield { type: 'text' as const, text: 'ok' }
+       yield createToolCallChunk('end_turn', {})
+       return promptSuccess('mock-message-id')
+     })
+ 
+     const sessionState = getInitialSessionState(mockFileContext)
+     return loopAgentSteps({
+       ...runtimeImpl,
+       agentType: template.id,
+       localAgentTemplates: { [template.id]: template },
+       repoId: undefined,
+       repoUrl: undefined,
+       userInputId: 'test-user-input',
+       agentState: {
+         ...sessionState.mainAgentState,
+         agentId: 'test-agent-id',
+         messageHistory,
+         output: undefined,
+         stepsRemaining: 5,
+       },
+       prompt,
+       spawnParams: undefined,
+       fingerprintId: 'test-fingerprint',
+       fileContext: mockFileContext,
+-      userId: TEST_USER_ID,
++      userId,
+       clientSessionId: 'test-session',
+       ancestorRunIds: [],
+       onResponseChunk: () => {},
+       signal: new AbortController().signal,
+     } as any)
+   }
+ 
+   beforeEach(() => {
+     seenMessages = []
+     compactionInput = defaultCompactionInput
+     dbSpies = setupDbSpies(createMockDbOperations())
+     spyOn(analytics, 'trackEvent').mockImplementation(() => {})
+   })
+ 
+   afterEach(() => {
+     if (runtimeImpl) clearAgentGeneratorCache(runtimeImpl)
+     dbSpies.restore()
+     mock.restore()
+   })
+ 
+   afterAll(() => {
+     clearMockedModules()
+   })
+ 
++  /** A user `usesDeterministicCompaction` puts on the mechanical pass. */
++  const cohortUser = () => {
++    let userId = ''
++    for (let i = 0; !usesDeterministicCompaction(userId); i++)
++      userId = `cohort-user-${i}`
++    return userId
++  }
++
++  it('runs the model handoff for the test user, who is in the model cohort', () => {
++    // Every model-path case below depends on this; at 100% the handoff is gone.
++    expect(usesDeterministicCompaction(TEST_USER_ID)).toBe(false)
++  })
++
++  it('compacts mechanically at the context limit for the deterministic cohort', async () => {
++    const userId = cohortUser()
++    const logged: unknown[] = []
++    const result = await runLoop(
++      overBudget,
++      idleHistory(0),
++      undefined,
++      logged,
++      userId,
++    )
++    expect(result.output.type).not.toBe('error')
++    // The turn's own request only: no `complete_compaction` call.
++    expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(1)
++    const sent = seenMessages[0].map(textOf).join('\n')
++    expect(sent).toContain('<conversation_summary>')
++    expect(sent).toContain('the live question')
++    expect(
++      logged.filter(
++        (data) =>
++          (data as { axiomEvent?: string }).axiomEvent ===
++          'context_compaction.followup',
++      ),
++    ).toEqual([
++      expect.objectContaining({
++        mode: 'mechanical',
++        trigger_reason: 'context_limit',
++      }),
++    ])
++  })
++
+   it('leaves the history alone when the agent has not opted in', async () => {
+     await runLoop(baseTemplate, idleHistory(120))
+ 
+     const sent = seenMessages[0].map(textOf).join('\n')
+     expect(sent).toContain('DISTINCTIVE PRIOR ANSWER')
+     expect(sent).not.toContain('<conversation_summary>')
+   })
+ 
+   it('manual compaction ends after its dedicated tool and preserves the live request', async () => {
+     const result = await runLoop(baseTemplate, idleHistory(0), '/compact')
+     expect(result.output.type).not.toBe('error')
+     expect(seenMessages).toHaveLength(0)
+     expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(1)
+     const history = result.agentState.messageHistory.map(textOf).join('\n')
+     expect(history).toContain('the live question')
+     expect(history).toContain('<conversation_summary>')
+     expect(history).not.toContain('/compact')
+   })
+ 
+   // Regression: on 2026-09-23 a Freebuff Cloud run failed with
+   // `Agent run error: [{"expected":"object","code":"invalid_type",...}] ZodError
+   // at compactWithModel`. An argument object that fails the tool schema reaches
+   // the runtime as a STRING (the AI SDK's `invalid` tool call), and a strict
+   // `.parse` on it threw straight out of the agent loop.
+   it('accepts a double-encoded compaction summary instead of failing the run', async () => {
+     // What the AI SDK hands over for a model that double-encoded its
+     // arguments: the outer layer parsed, the object still a JSON string.
+     compactionInput = JSON.stringify({
+       summary: 'DOUBLE ENCODED HANDOFF for the live question.',
+     })
+     const result = await runLoop(baseTemplate, idleHistory(0), '/compact')
+     expect(result.output.type).not.toBe('error')
+     const history = result.agentState.messageHistory.map(textOf).join('\n')
+     expect(history).toContain('DOUBLE ENCODED HANDOFF')
+     expect(history).toContain('the live question')
+   })
+ 
++  // The idle trigger is mechanical, so these two reach the summarizer through
++  // the context limit: a 4k window under a ~21k-token history.
++  const overBudget = {
++    ...baseTemplate,
++    compactContext: { maxContextLength: 4096, cacheExpiryMs: null },
++  }
++
+   it('falls back to mechanical compaction when the summary is unusable', async () => {
+     // Arguments cut off by the output cap: JSON that never closes.
+     compactionInput = '{"summary": "the first request was about'
+-    // A bulky old tool result gives the mechanical pass something to reclaim.
+-    const history = idleHistory(120)
+-    history.splice(
+-      1,
+-      0,
+-      {
+-        role: 'assistant',
+-        content: [
+-          {
+-            type: 'tool-call',
+-            toolCallId: 'old-read',
+-            toolName: 'read_files',
+-            input: { paths: ['big.ts'] },
+-          },
+-        ],
+-        sentAt: 1_000_000,
+-      },
+-      {
+-        role: 'tool',
+-        toolName: 'read_files',
+-        toolCallId: 'old-read',
+-        content: [
+-          {
+-            type: 'json',
+-            value: [
+-              { path: 'big.ts', content: 'BULKY FILE BODY '.repeat(4000) },
+-            ],
+-          },
+-        ],
+-      },
+-    )
+-    const result = await runLoop(
+-      { ...baseTemplate, compactContext: { cacheExpiryMinTokens: null } },
+-      history,
+-    )
++    const result = await runLoop(overBudget, idleHistory(0))
+     expect(result.output.type).not.toBe('error')
++    expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(2)
+     const sent = seenMessages[0].map(textOf).join('\n')
+     expect(sent).toContain('<conversation_summary>')
+     expect(sent).toContain('the live question')
+     expect(sent).not.toContain('the first request was about')
+     expect(JSON.stringify(seenMessages[0])).not.toContain(
+       'BULKY FILE BODY '.repeat(50),
+     )
+   })
+ 
+-  it('closes the compaction window at run end, counting the file it dropped', async () => {
+-    const history = idleHistory(120)
+-    history.splice(
+-      1,
+-      0,
+-      {
+-        role: 'assistant',
+-        content: [
+-          {
+-            type: 'tool-call',
+-            toolCallId: 'old-read',
+-            toolName: 'read_files',
+-            input: { paths: ['big.ts'] },
+-          },
+-        ],
+-        sentAt: 1_000_000,
+-      },
+-      {
+-        role: 'tool',
+-        toolName: 'read_files',
+-        toolCallId: 'old-read',
+-        content: [
+-          {
+-            type: 'json',
+-            value: [{ path: 'big.ts', content: 'BODY '.repeat(4000) }],
+-          },
+-        ],
+-      },
+-    )
++  it('compacts mechanically on the idle trigger in the cohort: no summarizer request', async () => {
+     const logged: unknown[] = []
+-    await runLoop(
++    const result = await runLoop(
+       { ...baseTemplate, compactContext: { cacheExpiryMinTokens: null } },
+-      history,
++      idleHistory(120),
+       undefined,
+       logged,
++      cohortUser(),
+     )
+-    expect(
++    expect(result.output.type).not.toBe('error')
++    // One request, the turn itself; never a `complete_compaction` call.
++    expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(1)
++    const sent = seenMessages[0].map(textOf).join('\n')
++    expect(sent).toContain('<conversation_summary>')
++    expect(sent).toContain('inspected files: big.ts')
++    expect(JSON.stringify(seenMessages[0])).not.toContain(
++      'BULKY FILE BODY '.repeat(50),
++    )
++    const events = (name: string) =>
+       logged.filter(
+-        (data) =>
+-          (data as { axiomEvent?: string }).axiomEvent ===
+-          'context_compaction.followup',
+-      ),
+-    ).toEqual([
++        (data) => (data as { axiomEvent?: string }).axiomEvent === name,
++      )
++    expect(events('model_compaction.completed')).toEqual([])
++    expect(events('context_compaction_completed')).toEqual([
++      expect.objectContaining({ trigger_reason: 'cache_expiry' }),
++    ])
++    expect(events('context_compaction.followup')).toEqual([
+       expect.objectContaining({
+-        mode: 'model',
++        mode: 'mechanical',
+         trigger_reason: 'cache_expiry',
+         ended_by: 'run_end',
+         elided_read_paths: 1,
+         read_calls_after: 0,
+         reread_paths: 0,
+         tool_calls_after: 1,
+       }),
+     ])
+   })
+ 
+   it('a summarizer that throws never fails the turn', async () => {
+     compactionInput = () => {
+       throw new Error('provider exploded mid-compaction')
+     }
+-    const result = await runLoop(
+-      { ...baseTemplate, compactContext: { cacheExpiryMinTokens: null } },
+-      idleHistory(120),
+-    )
++    const result = await runLoop(overBudget, idleHistory(0))
+     expect(result.output.type).not.toBe('error')
+     expect(seenMessages).toHaveLength(1)
+     expect(seenMessages[0].map(textOf).join('\n')).toContain(
+       'the live question',
+     )
+   })
+ 
+   it('leaves a small conversation alone however cold the cache is', async () => {
+     // The default size floor: compaction always costs detail, and there is
+     // nothing here worth reclaiming.
+     await runLoop({ ...baseTemplate, compactContext: true }, idleHistory(600))
+ 
+     const sent = seenMessages[0].map(textOf).join('\n')
+     expect(sent).toContain('DISTINCTIVE PRIOR ANSWER')
+     expect(sent).not.toContain('<conversation_summary>')
+   })
+ 
+   it('leaves the history alone while the cache is still warm', async () => {
+     await runLoop(
+       { ...baseTemplate, compactContext: { cacheExpiryMinTokens: null } },
+       idleHistory(5),
+     )
+ 
+     const sent = seenMessages[0].map(textOf).join('\n')
+     expect(sent).toContain('DISTINCTIVE PRIOR ANSWER')
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 9af7d5533..bef57050a 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -1,68 +1,72 @@
+ import { contextPrunerBudgetForModel } from '@codebuff/common/constants/model-config'
+-import { modelCompactionThreshold } from '@codebuff/common/constants/compaction-policy'
++import {
++  modelCompactionThreshold,
++  usesDeterministicCompaction,
++} from '@codebuff/common/constants/compaction-policy'
+ import {
+   supportsAssistantPrefill,
+   supportsCacheControl,
+ } from '@codebuff/common/old-constants'
+ import { PROJECT_PROFILE_TOOL_NAME } from '@codebuff/common/constants/project-profile'
+ import { TOOLS_WHICH_WONT_FORCE_NEXT_STEP } from '@codebuff/common/tools/constants'
+ import { parseAgentId } from '@codebuff/common/util/agent-id-parsing'
+ import { buildArray } from '@codebuff/common/util/array'
+ import {
+   AbortError,
+   FETCH_IDLE_TIMEOUT_USER_MESSAGE,
+   TRANSIENT_NETWORK_ERROR_USER_MESSAGE,
+   extractApiErrorDetails,
+   getErrorObject,
+   isAbortError,
+   isFetchIdleTimeoutError,
+   isTransientNetworkError,
+ } from '@codebuff/common/util/error'
+ import { serializeCacheDebugCorrelation } from '@codebuff/common/util/cache-debug'
+ import {
+   assistantMessage,
+   dropUnansweredToolCalls,
+   systemMessage,
+   userMessage,
+ } from '@codebuff/common/util/messages'
+ import { type ToolSet } from 'ai'
+ import { cloneDeep, mapValues } from 'lodash'
+ import z from 'zod/v4'
+ 
+ import {
+   evaluateCompactionTrigger,
+   MECHANICAL_TARGET_SHARE,
+ } from './compact-history'
+ import type { CompactionTrigger } from './compact-history'
+ import {
+   closeCompactionWindow,
+   openCompactionWindow,
+ } from './compaction-followup'
+ import type { CompactionWindow } from './compaction-followup'
+ import {
+   automaticCompactionIsWorthwhile,
++  compactMechanically,
+   COMPACTION_LOW_WATER,
+   compactWithModelOrFallback,
+   compactionTools,
+ } from './model-compaction'
+ import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+ import { getMCPToolData } from './mcp'
+ import {
+   runProjectProfileReport,
+   shouldOfferProjectProfileTool,
+ } from './project-profile'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+ import { isThinkOnlyResponse } from './util/think-tags'
+ import {
+   decideFollowupTodoNudge,
+   FOLLOWUP_TODO_NUDGE_TAG,
+ } from './util/followup-todo-nudge'
+ import {
+   decideTodoProgressReminder,
+   TODO_PROGRESS_REMINDER_TAG,
+ } from './util/todo-progress-reminder'
+ import {
+   hasFileEditTool,
+   TODO_LOOP_RECOVERY_TAG,
+   TODO_LOOP_RECOVERY_THRESHOLD,
+   TODO_LOOP_STOP_THRESHOLD,
+@@ -1295,130 +1299,154 @@ export async function loopAgentSteps(
+             maxContextLength,
+             thresholdTokens,
+             fixedTokenCount,
+             maxOutputTokens: policy.maxOutputTokens,
+           })
+         ) {
+           logger.debug(
+             {
+               agentType,
+               runId,
+               contextTokenCount: currentAgentState.contextTokenCount,
+               thresholdTokens,
+               maxContextLength,
+               fixedTokenCount,
+             },
+             'Deferred compaction to the hard budget: it could not clear the threshold',
+           )
+           trigger = null
+         }
+         if (trigger) {
+           const before = currentAgentState.directCreditsUsed
+           const started = Date.now()
+           const isRoot = !initialAgentState.parentId
+           if (isRoot) params.onCompactionStart?.({ trigger })
+           let compacted: Awaited<ReturnType<typeof compactWithModelOrFallback>>
++          // An automatic pass must leave the run under its own trigger, or the
++          // next step fires it again on its output. The mechanical pass aims
++          // lower: it keeps no findings, so it needs room to work in.
++          const automatic = trigger !== 'manual'
++          const targetTokens = automatic
++            ? Math.floor(thresholdTokens * COMPACTION_LOW_WATER)
++            : undefined
++          const mechanicalTargetTokens = automatic
++            ? Math.floor(thresholdTokens * MECHANICAL_TARGET_SHARE)
++            : undefined
++          // Mechanical for the user's cohort, on every trigger. On the idle
++          // trigger the cache is already cold, so a summarizer would read the
++          // whole cold history first: it costs more than the prefill it saves
++          // and the user waits for it.
++          const deterministic = usesDeterministicCompaction(userId)
+           // Ends after the receipt, so a host never sees a gap between the
+           // pass it is showing and the handoff that replaces it.
+           try {
+-            // A compaction failure must never fail the turn: a summarizer error
+-            // or malformed handoff falls back to the mechanical pass.
+-            compacted = await compactWithModelOrFallback({
+-              messages: currentAgentState.messageHistory,
+-              system,
+-              maxContextLength,
+-              fixedTokenCount,
+-              maxOutputTokens: policy.maxOutputTokens,
+-              // An automatic pass must leave the run under its own trigger, or
+-              // the next step fires it again on the fallback's output.
+-              // The mechanical fallback aims lower still: it keeps no
+-              // findings, so it needs room to work in.
+-              ...(trigger === 'manual'
+-                ? {}
+-                : {
+-                    fallbackTargetTokens: Math.floor(
+-                      thresholdTokens * COMPACTION_LOW_WATER,
+-                    ),
+-                    mechanicalTargetTokens: Math.floor(
+-                      thresholdTokens * MECHANICAL_TARGET_SHARE,
+-                    ),
+-                  }),
+-              signal,
+-              logger,
+-              runId,
+-              model: agentTemplate.model,
+-              trigger,
+-              stream: (messages, maxOutputTokens, onFinishReason) =>
+-                getAgentStreamFromTemplate({
+-                  ...params,
+-                  agentId: agentType,
+-                  template: agentTemplate,
++            if (deterministic) {
++              try {
++                compacted = compactMechanically({
++                  messages: currentAgentState.messageHistory,
++                  maxContextLength,
++                  fixedTokenCount,
++                  targetTokens: mechanicalTargetTokens,
++                  trigger,
++                  logger,
+                   runId,
+-                  messages,
+-                  tools: compactionTools,
+-                  toolChoice: 'required',
+-                  maxOutputTokens,
+-                  onFinishReason,
+-                  onCostCalculated: async (credits) => {
+-                    currentAgentState.creditsUsed += credits
+-                    currentAgentState.directCreditsUsed += credits
+-                  },
+-                  // Compaction usage is spend, not the next root request's context.
+-                  onUsageReceived: (usage) =>
+-                    params.onAgentUsageReceived?.({
+-                      ...usage,
+-                      isRoot: false,
+-                      agentId: currentAgentState.agentId,
+-                    }),
+-                  onUsageIncomplete: params.onAgentUsageIncomplete,
+-                }),
+-            })
+-            await addAgentStep({
+-              ...params,
+-              agentRunId: runId,
+-              stepNumber: totalSteps,
+-              credits: currentAgentState.directCreditsUsed - before,
+-              childRunIds: [],
+-              messageId: null,
+-              status: 'completed',
+-              startTime,
+-            })
++                })
++              } catch {
++                // Opportunistic: a history it cannot fit is left alone.
++                compacted = null
++              }
++            } else {
++              // A compaction failure must never fail the turn: a summarizer error
++              // or malformed handoff falls back to the mechanical pass.
++              compacted = await compactWithModelOrFallback({
++                messages: currentAgentState.messageHistory,
++                system,
++                maxContextLength,
++                fixedTokenCount,
++                maxOutputTokens: policy.maxOutputTokens,
++                fallbackTargetTokens: targetTokens,
++                mechanicalTargetTokens,
++                signal,
++                logger,
++                runId,
++                model: agentTemplate.model,
++                trigger,
++                stream: (messages, maxOutputTokens, onFinishReason) =>
++                  getAgentStreamFromTemplate({
++                    ...params,
++                    agentId: agentType,
++                    template: agentTemplate,
++                    runId,
++                    messages,
++                    tools: compactionTools,
++                    toolChoice: 'required',
++                    maxOutputTokens,
++                    onFinishReason,
++                    onCostCalculated: async (credits) => {
++                      currentAgentState.creditsUsed += credits
++                      currentAgentState.directCreditsUsed += credits
++                    },
++                    // Compaction usage is spend, not the next root request's context.
++                    onUsageReceived: (usage) =>
++                      params.onAgentUsageReceived?.({
++                        ...usage,
++                        isRoot: false,
++                        agentId: currentAgentState.agentId,
++                      }),
++                    onUsageIncomplete: params.onAgentUsageIncomplete,
++                  }),
++              })
++              await addAgentStep({
++                ...params,
++                agentRunId: runId,
++                stepNumber: totalSteps,
++                credits: currentAgentState.directCreditsUsed - before,
++                childRunIds: [],
++                messageId: null,
++                status: 'completed',
++                startTime,
++              })
++            }
+             if (compacted) {
+               if (compactionWindow)
+                 closeCompactionWindow({
+                   window: compactionWindow,
+                   messages: currentAgentState.messageHistory,
+                   endedBy: 'compaction',
+                   nextTrigger: trigger,
+                   logger,
+                   runId,
+                   model: agentTemplate.model,
+                 })
+               compactionWindow = openCompactionWindow({
+                 before: currentAgentState.messageHistory,
+                 after: compacted.messages,
+-                mode: compacted.fallback ? 'fallback' : 'model',
++                mode: deterministic
++                  ? 'mechanical'
++                  : compacted.fallback
++                    ? 'fallback'
++                    : 'model',
+                 trigger,
+               })
+               currentAgentState.messageHistory = compacted.messages
+               currentAgentState.contextTokenBaseline = undefined
+               currentAgentState.contextTokenCount = compacted.postTokens
+               if (isRoot)
+                 params.onCompaction?.({
+                   trigger,
+                   thresholdTokens,
+                   summary: compacted.summary,
+                   preTokens: compacted.preTokens,
+                   postTokens: compacted.postTokens,
+                   durationMs: Date.now() - started,
+                 })
+             }
+           } finally {
+             if (isRoot) params.onCompactionEnd?.()
+           }
+           // A manual request is a maintenance operation, never a coding turn.
+           if (manualCompaction) break
+           if (
+             !compacted &&
+             currentAgentState.contextTokenCount > maxContextLength
+           ) {
+             throw new Error(
