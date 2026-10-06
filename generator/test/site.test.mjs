@@ -1268,6 +1268,32 @@ test('tiered day: a minor row embeds the entry body without a second header', as
   }
 })
 
+test('about page: the two-column grid holds complete pairs, badges sit full-width below', async () => {
+  const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-about-'))
+  try {
+    const entries = [{
+      kind: 'sync', sha: 'a'.repeat(40), url: 'https://github.com/CodebuffAI/freebuff/commit/' + 'a'.repeat(40),
+      date: '2026-09-11T10:00:00Z', day: '2026-09-11', month: '2026-09',
+      areas: ['CLI'], category: 'CLI', significance: 'minor',
+      files: { total: 1, meaningful: 1, added: [], removed: [], modified: ['a.ts'] },
+      stats: { additions: 1, deletions: 0 },
+      title: 'Title aaaaaa', summary: 'Summary aaaaaa'
+    }]
+    await buildSite({
+      changelog: { version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-11T12:00:00Z', headSha: 'a'.repeat(40), counts: { entries: entries.length }, entries },
+      openPrs: [], dist: tmpDist
+    })
+    const about = await readFile(join(tmpDist, 'about/index.html'), 'utf8')
+    const cols = about.match(/<div class="man-cols">([\s\S]*?)<\/div>\s*<h4>STATUS BADGES<\/h4>/)
+    assert.ok(cols, 'the column grid is followed by full-width status badges')
+    const secs = (cols[1].match(/<div class="man-sec">/g) || []).length
+    assert.equal(secs % 2, 0, 'the grid fills complete rows: no dangling half-column')
+    assert.doesNotMatch(cols[1], /STATUS BADGES/, 'badges live outside the grid')
+  } finally {
+    await rm(tmpDist, { recursive: true, force: true })
+  }
+})
+
 const dcEntry = () => ({
   kind: 'community', sha: 'a'.repeat(40), day: '2026-09-13', date: '2026-09-13T10:00:00.000Z',
   category: 'Model Catalog', significance: 'major', author: 'Ada', pr: 12,
