@@ -1951,6 +1951,72 @@ test('homepage carries a short intro linking the about page', async (t) => {
   const older = await readFile(join(dist, 'day/2026-09-18/index.html'), 'utf8')
   assert.doesNotMatch(older, /class="home-intro"/, 'older day pages do not repeat the intro')
 })
+test('SEO: homepage title is the site name, pages carry meta + OG tags', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-seo-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 2 },
+    entries: [
+      {
+        kind: 'sync', sha: 'a1'.repeat(20), date: '2026-09-19T10:00:00Z', day: '2026-09-19', month: '2026-09', author: 'dev',
+        areas: ['CLI'], category: 'CLI', significance: 'notable', summary: 's', title: 'A notable change', version: '1.0.5',
+        files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/release/package.json'] },
+        stats: { additions: 1, deletions: 1 }
+      },
+      {
+        kind: 'sync', sha: 'b2'.repeat(20), date: '2026-09-18T10:00:00Z', day: '2026-09-18', month: '2026-09', author: 'dev',
+        areas: ['CLI'], category: 'CLI', significance: 'minor', summary: 's', title: 'A minor change',
+        files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/src/x.ts'] },
+        stats: { additions: 2, deletions: 0 }
+      }
+    ]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const home = await readFile(join(dist, 'index.html'), 'utf8')
+  assert.match(home, /<title>Unofficial Freebuff Changelog<\/title>/, 'homepage <title> is the site name, not "Home"')
+  assert.doesNotMatch(home, /<title>Home/, 'no "Home" title anywhere on the front page')
+  for (const [file, what] of [['index.html', 'homepage'], ['day/2026-09-19/index.html', 'day page'], ['release/1.0.5/index.html', 'release page'], ['archive/index.html', 'archive']]) {
+    const html = await readFile(join(dist, file), 'utf8')
+    assert.match(html, /<meta name="description" content="[^"]+"/, `${what} has a meta description`)
+    assert.match(html, /<meta property="og:title" content="[^"]+"/, `${what} has an OG title`)
+    assert.match(html, /<meta property="og:description" content="[^"]+"/, `${what} has an OG description`)
+    assert.match(html, /<meta property="og:image" content="[^"]+"/, `${what} has an OG image`)
+  }
+})
+
+test('SEO: sitemap lists only URLs the build ships', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-sitemap-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 1 },
+    entries: [{
+      kind: 'sync', sha: 'a1'.repeat(20), date: '2026-09-19T10:00:00Z', day: '2026-09-19', month: '2026-09', author: 'dev',
+      areas: ['CLI'], category: 'CLI', significance: 'notable', summary: 's', title: 'A notable change', version: '1.0.5',
+      files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/release/package.json'] },
+      stats: { additions: 1, deletions: 1 }
+    }]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const index = await readFile(join(dist, 'sitemap.xml'), 'utf8')
+  for (const sub of ['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-pages.xml']) {
+    assert.match(index, new RegExp(sub.replace('.', '\\.')), `sitemap index references ${sub}`)
+  }
+  // Every <loc> in every sub-sitemap must resolve to a file the build wrote.
+  const exists = async (p) => readFile(join(dist, p), 'utf8').then(() => true, () => false)
+  for (const sub of ['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-pages.xml']) {
+    const xml = await readFile(join(dist, sub), 'utf8')
+    for (const m of xml.matchAll(/<loc>([^<]+)<\/loc>/g)) {
+      const url = new URL(m[1])
+      const rel = url.pathname.replace(/^\//, '') + (url.pathname.endsWith('/') ? 'index.html' : '')
+      assert.ok(await exists(rel), `${sub} lists ${url.pathname} but dist/ has no ${rel}`)
+    }
+  }
+  const relXml = await readFile(join(dist, 'sitemap-releases.xml'), 'utf8')
+  assert.match(relXml, /\/release\/1\.0\.5\//, 'the release sitemap includes the built release page')
+})
+
 // Both version lines get release pages now: the 1.0.x codebuff-cli line and
 // the 0.x freebuff-cli line (VERSION_TRACKS in analyze.mjs). A badge that names
 // a version must never point at a page the build did not write.

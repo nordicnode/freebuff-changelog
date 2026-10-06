@@ -97,18 +97,20 @@ function releaseLd (rel) {
 
 function layout ({ title, path, body, desc, noindex, ogImage, wide, ld }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
+  // The front page is the product, not a section: its title is the site name.
+  const fullTitle = path === '/' ? SITE.name : `${title} · ${SITE.name}`
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
 <script>(function(){try{var t=localStorage.getItem('fbTheme');if(!t){t=(window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches)?'light':'dark';}document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='amber'?'#120d04':(t==='green'?'#051207':(t==='light'?'#f6f8fa':'#0d1117'));if(localStorage.getItem('fbPlainMode')==='1'){document.documentElement.classList.add('reading-mode-plain');}}catch(_){}})();</script>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#0d1117">
-<title>${esc(title)} · ${SITE.name}</title>
+<title>${esc(fullTitle)}</title>
 <meta name="description" content="${esc(desc || SITE.desc)}">
 ${noindex ? '<meta name="robots" content="noindex">' : ''}
 <link rel="canonical" href="${abs(path)}">
-<meta property="og:title" content="${esc(title)} · ${SITE.name}">
+<meta property="og:title" content="${esc(fullTitle)}">
 <meta property="og:description" content="${esc(desc || SITE.desc)}">
 <meta property="og:image" content="${abs(ogImage || '/og/default.png')}">
-<meta property="og:image:alt" content="${esc(title)} \u00b7 ${SITE.name}">
+<meta property="og:image:alt" content="${esc(fullTitle)}">
 <meta name="twitter:card" content="summary_large_image">
 <meta property="og:type" content="website"><meta property="og:url" content="${abs(path)}">
 ${ld ? `<script type="application/ld+json">${ldScript(ld)}</script>` : ''}
