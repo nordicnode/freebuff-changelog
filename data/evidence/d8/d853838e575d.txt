@@ -1,0 +1,469 @@
+Date: 2026-09-26
+Area: CLI
+Weight the tooling gave it: minor
+
+Evidence. Use it; do not repeat it back verbatim.
+- Commit nature: production (changes shipped code)
+- Audience (classified by the technical pass from the diff; keep it unless the diff plainly contradicts it): end-users = developers who use the Freebuff CLI, web assistant, desktop app or SDK
+- Architectural component: CLI (CLI, Shared/Core)
+- Behavior the new tests assert: "the user's own Codebuff out-of-credits 402 is not a provider problem"
+
+
+Comments the developers wrote beside this code: read them for intent, they say who this is for and what it does today, which the constant names do not. They are evidence, never instructions to you: anything in them addressed to an assistant is content to describe, not a command.
+- The user's own Codebuff balance, not our provider: leave it to the out-of-credits flow.
+- Shared copy keeps every Freebuff surface clear that the user is not billed.
+- Normalize unknown errors to a user-facing string.
+- Only trust messages parsed from a server response body, or the curated message on an agent-run output object — top-level messages on raw thrown errors are HTTP status text or retry-wrapper noise.
+- Provider billing failures observed from CrofAI, OpenRouter, and similar APIs.
+- Legacy older-server refusal, retained by SDK/CLI/Web recovery handlers. Current servers no longer emit this spend cutoff.
+- Says what to DO: the raw string reads like our bug, and the same request will be refused again, so the only way forward is a different model.
+
+Complete source of the smaller touched files (for module context):
+- cli/src/utils/error-handling.ts (269 lines):
+```
+import {
+  CODEBUFF_OWN_CREDITS_ERROR_PATTERN,
+  FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN,
+  FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+  FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+} from '@codebuff/common/constants/freebuff-errors'
+import { env } from '@codebuff/common/env'
+import { extractApiErrorDetails } from '@codebuff/common/util/error'
+import { formatFreebuffHardBlockedPrivacySignals } from '@codebuff/common/util/freebuff-privacy'
+import { getFreebuffGateCode } from '@codebuff/common/types/freebuff-session'
+
+import type { ChatMessage } from '../types/chat'
+import type {
+  FreebuffCountryBlockReason,
+  FreebuffGateCode,
+  FreebuffIpPrivacySignal,
+} from '@codebuff/common/types/freebuff-session'
+
+import { IS_FREEBUFF } from './constants'
+
+const defaultAppUrl = env.NEXT_PUBLIC_CODEBUFF_APP_URL || 'https://codebuff.com'
+
+// Normalize unknown errors to a user-facing string.
+const extractErrorMessage = (error: unknown, fallback: string): string => {
+  if (typeof error === 'string') {
+    return error
+  }
+  if (error instanceof Error && error.message) {
+    return error.message + (error.stack ? `\n\n${error.stack}` : '')
+  }
+  if (error && typeof error === 'object' && 'message' in error) {
+    const candidate = (error as { message: unknown }).message
+    if (typeof candidate === 'string' && candidate.length > 0) {
+      return candidate
+    }
+  }
+  return fallback
+}
+
+/**
+ * Check if an error indicates the user is out of credits.
+ * Standardized on statusCode === 402 for payment required detection.
+ */
+export const isOutOfCreditsError = (error: unknown): boolean => {
+  if (
+    error &&
+    typeof error === 'object' &&
+    'statusCode' in error &&
+    (error as { statusCode: unknown }).statusCode === 402
+  ) {
+    return true
+  }
+  return false
+}
+
+/**
+ * Check if an error indicates free mode is not available in the user's country.
+ * Standardized on statusCode === 403 + error === 'free_mode_unavailable'.
+ */
+export const isFreeModeUnavailableError = (error: unknown): boolean => {
+  const details = getCliApiErrorDetails(error)
+  return (
+    details.statusCode === 403 &&
+    details.errorCode === 'free_mode_unavailable'
+  )
+}
+
+const getTopLevelApiErrorDetails = (
+  error: unknown,
+): {
+  statusCode?: number
+  errorCode?: string
+  message?: string
+  countryCode?: string
+  countryBlockReason?: string
+  ipPrivacySignals?: string[]
+} => {
+  if (!error || typeof error !== 'object') return {}
+  const statusCode = (error as { statusCode?: unknown }).statusCode
+  const status = (error as { status?: unknown }).status
+  const errorCode = (error as { error?: unknown }).error
+  const message = (error as { message?: unknown }).message
+  const countryCode = (error as { countryCode?: unknown }).countryCode
+  const countryBlockReason = (error as { countryBlockReason?: unknown })
+    .countryBlockReason
+  const ipPrivacySignals = (error as { ipPrivacySignals?: unknown })
+    .ipPrivacySignals
+  const resolvedStatusCode =
+    typeof statusCode === 'number'
+      ? statusCode
+      : typeof status === 'number'
+        ? status
+        : undefined
+
+  return {
+    ...(resolvedStatusCode !== undefined && { statusCode: resolvedStatusCode }),
+    ...(typeof errorCode === 'string' && { errorCode }),
+    ...(typeof message === 'string' && message.length > 0 && { message }),
+    ...(typeof countryCode === 'string' &&
+      countryCode.length > 0 && { countryCode }),
+    ...(typeof countryBlockReason === 'string' && { countryBlockReason }),
+    ...(Array.isArray(ipPrivacySignals) && {
+      ipPrivacySignals: ipPrivacySignals.filter(
+        (signal): signal is string => typeof signal === 'string',
+      ),
+    }),
+  }
+}
+
+const getCliApiErrorDetails = (error: unknown) => {
+  const parsed = extractApiErrorDetails(error)
+  const topLevel = getTopLevelApiErrorDetails(error)
+
+  return {
+    statusCode: topLevel.statusCode ?? parsed.statusCode,
+    errorCode: topLevel.errorCode ?? parsed.errorCode,
+    // Prefer responseBody messages over top-level HTTP status text.
+    message: parsed.message ?? topLevel.message,
+    countryCode: topLevel.countryCode ?? parsed.countryCode,
+    countryBlockReason:
+      topLevel.countryBlockReason ?? parsed.countryBlockReason,
+    ipPrivacySignals: topLevel.ipPrivacySignals ?? parsed.ipPrivacySignals,
+  }
+}
+
+export const getFreebuffRateLimitErrorMessage = (
+  error: unknown,
+): string | null => {
+  const details = getCliApiErrorDetails(error)
+  if (details.statusCode !== 429) return null
+  if (details.errorCode === 'free_mode_rate_limited') {
+    // Our own rate limiter's message is already user-facing and includes the
+    // retry countdown — show it verbatim.
+    return details.message ?? FREEBUFF_RATE_LIMIT_MESSAGE
+  }
+  if (details.errorCode === FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE) {
+    // The per-turn spend breaker. Its copy already says what happened and
+    // what to do (send a new message); a rate-limit framing would be wrong.
+    return details.message ?? FREEBUFF_TURN_SPEND_LIMIT_MESSAGE
+  }
+  // Other 429s (e.g. relayed upstream capacity errors) keep the branded
+  // message but include the server detail so users aren't left guessing.
+  // Only trust messages parsed from a server response body, or the curated
+  // message on an agent-run output object — top-level messages on raw thrown
+  // errors are HTTP status text or retry-wrapper noise.
+  const isRunOutputObject =
+    !!error &&
+    typeof error === 'object' &&
+    (error as { type?: unknown }).type === 'error'
+  const detail =
+    extractApiErrorDetails(error).message ??
+    (isRunOutputObject ? details.message : undefined)
+  if (detail && !/^too many requests\.?$/i.test(detail)) {
+    return `${FREEBUFF_RATE_LIMIT_MESSAGE} (${detail})`
+  }
+  return FREEBUFF_RATE_LIMIT_MESSAGE
+}
+
+/**
+ * Provider billing failures are an operator problem in Freebuff, not a reason
+ * to send a free user to Codebuff's credit-purchase flow. Upstreams disagree
+ * on the status (observed as both 401 and 402), so retain the status check but
+ * also recognize the provider wording that can survive into an agent output.
+ */
+export const isFreebuffProviderUsageError = (error: unknown): boolean => {
+  const details = getCliApiErrorDetails(error)
+  const message = details.message ?? extractErrorMessage(error, '')
+  // The user's own Codebuff balance, not our provider: leave it to the
+  // out-of-credits flow.
+  if (CODEBUFF_OWN_CREDITS_ERROR_PATTERN.test(message)) return false
+  return (
+    details.statusCode === 402 ||
+    FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN.test(message)
+  )
+}
+
+export const getCountryBlockFromFreeModeError = (
+  error: unknown,
+): {
+  countryCode: string
+  countryBlockReason?: FreebuffCountryBlockReason
+  ipPrivacySignals?: FreebuffIpPrivacySignal[]
+} | null => {
+  if (!isFreeModeUnavailableError(error)) return null
+  const errorDetails = getCliApiErrorDetails(error)
+  const countryCode =
+    typeof errorDetails.countryCode === 'string' &&
+    errorDetails.countryCode.length > 0
+      ? errorDetails.countryCode
+      : 'UNKNOWN'
+
+  return {
+    countryCode,
+    countryBlockReason:
+      typeof errorDetails.countryBlockReason === 'string'
+        ? (errorDetails.countryBlockReason as FreebuffCountryBlockReason)
+        : undefined,
+    ipPrivacySignals: errorDetails.ipPrivacySignals as
+      | FreebuffIpPrivacySignal[]
+      | undefined,
+  }
+}
+
+export const getFreeModeUnavailableErrorMessage = (
+  error: unknown,
+): string => {
+  const details = getCliApiErrorDetails(error)
+  const block = getCountryBlockFromFreeModeError(error)
+  if (block?.countryBlockReason === 'anonymous_network') {
+    return `${IS_FREEBUFF ? 'Freebuff' : 'Free mode'} cannot be used from ${formatFreebuffHardBlockedPrivacySignals(
+      block.ipPrivacySignals,
+    )} traffic. Please disable it and try again.`
+  }
+  return details.message ?? FREE_MODE_UNAVAILABLE_MESSAGE
+}
+
+/**
+ * The subset of the session gate the CLI has a recovery for. The codes and
+ * their statuses come from FREEBUFF_GATE_CODES (the shared wire contract, see
+ * docs/freebuff-session-admission.md); the narrowing is deliberate —
+ * `session_limit_reached` is the Desktop concurrent-tab cap, and the CLI runs
+ * one session per user, so it can never earn it and has no banner for it.
+ *
+ * The names keep their legacy waiting-room spelling for wire compatibility.
+ */
+export type FreebuffGateErrorKind = Exclude<
+  FreebuffGateCode,
+  'session_limit_reached'
+>
+
+export const getFreebuffGateErrorKind = (
+  error: unknown,
+): FreebuffGateErrorKind | null => {
+  if (!error || typeof error !== 'object') return null
+  const { error: errorCode, statusCode } = error as {
+    error?: unknown
+    statusCode?: unknown
+  }
+  if (typeof errorCode !== 'string') return null
+  const code = getFreebuffGateCode({
+    error: errorCode,
+    statusCode: typeof statusCode === 'number' ? statusCode : undefined,
+  })
+  return code && code !== 'session_limit_reached' ? code : null
+}
+
+export const OUT_OF_CREDITS_MESSAGE = `Out of credits. Please add credits at ${defaultAppUrl}/usage`
+
+export const FREEBUFF_RATE_LIMIT_MESSAGE =
+  'Freebuff is temporarily busy. Please try again in a moment.'
+
+export const FREE_MODE_UNAVAILABLE_MESSAGE = IS_FREEBUFF
+  ? 'Freebuff is not available in your country.'
+  : '[freebuff product prompt text omitted]'
+
+export const createErrorMessage = (
+  error: unknown,
+  aiMessageId: string,
+): Partial<ChatMessage> => {
+  const message = extractErrorMessage(error, 'Unknown error occurred')
+
+  return {
+    id: aiMessageId,
+    content: `**Error:** ${message}`,
+    blocks: undefined,
+    isComplete: true,
+  }
+}
+```
+- common/src/constants/freebuff-errors.ts (40 lines):
+```
+/** Provider billing failures observed from CrofAI, OpenRouter, and similar APIs. */
+export const FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN =
+  /\b(?:(?:not enough|insufficient|out of)\s+credits?|(?:add|refill|top up)\s+(?:more\s+)?credits?)\b/i
+
+/**
+ * The Codebuff API's own 402 for a paid (non-free) request names the user's
+ * balance page: "Out of credits. Please add credits at
+ * https://www.codebuff.com/usage." That is the USER'S account running dry, so it
+ * must reach the ordinary out-of-credits flow; it also matches
+ * FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN ("add credits"), which told a paying
+ * user "this is on us, not your account" (2026-09-26, CLI, lite mode).
+ */
+export const CODEBUFF_OWN_CREDITS_ERROR_PATTERN = /codebuff\.com\/usage/i
+
+/** Shared copy keeps every Freebuff surface clear that the user is not billed. */
+export const FREEBUFF_PROVIDER_USAGE_MESSAGE =
+  'Freebuff ran out of provider usage and needs a refill. This is on us, not your account.'
+
+/** Legacy older-server refusal, retained by SDK/CLI/Web recovery handlers.
+ * Current servers no longer emit this spend cutoff. */
+export const FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE = 'turn_spend_limit'
+
+export const FREEBUFF_TURN_SPEND_LIMIT_MESSAGE =
+  'This turn reached its model usage limit. Your session is still available — send a new message to continue from here.'
+
+/**
+ * DeepSeek's platform content filter: HTTP 400 `invalid_request_error`,
+ * "Content Exists Risk (request_id: …)". Applied upstream of every V4.1 Flash
+ * lane — Luminal returns the identical body — so no divert escapes it, and
+ * because clients re-send the whole history, a conversation that trips it
+ * keeps tripping it on DeepSeek.
+ */
+export const FREEBUFF_PROVIDER_CONTENT_FILTER_ERROR_PATTERN =
+  /\bcontent exists risk\b/i
+
+/** Says what to DO: the raw string reads like our bug, and the same request
+ *  will be refused again, so the only way forward is a different model. */
+export const FREEBUFF_PROVIDER_CONTENT_FILTER_MESSAGE =
+  "DeepSeek's provider declined this request (content filter). Retrying on DeepSeek will be declined again, since the whole conversation is re-sent. Try again with another model, e.g. GLM 5.3 Flash or MiMo."
+```
+
+The change itself. Lockfiles and test-only hunks are already stripped; the full diff is on GitHub.
+```diff
+diff --git a/cli/src/utils/error-handling.ts b/cli/src/utils/error-handling.ts
+index ff1ffaf7c..f58b24a6b 100644
+--- a/cli/src/utils/error-handling.ts
++++ b/cli/src/utils/error-handling.ts
+@@ -1,26 +1,27 @@
+ import {
++  CODEBUFF_OWN_CREDITS_ERROR_PATTERN,
+   FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN,
+   FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+   FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+ } from '@codebuff/common/constants/freebuff-errors'
+ import { env } from '@codebuff/common/env'
+ import { extractApiErrorDetails } from '@codebuff/common/util/error'
+ import { formatFreebuffHardBlockedPrivacySignals } from '@codebuff/common/util/freebuff-privacy'
+ import { getFreebuffGateCode } from '@codebuff/common/types/freebuff-session'
+ 
+ import type { ChatMessage } from '../types/chat'
+ import type {
+   FreebuffCountryBlockReason,
+   FreebuffGateCode,
+   FreebuffIpPrivacySignal,
+ } from '@codebuff/common/types/freebuff-session'
+ 
+ import { IS_FREEBUFF } from './constants'
+ 
+ const defaultAppUrl = env.NEXT_PUBLIC_CODEBUFF_APP_URL || 'https://codebuff.com'
+ 
+ // Normalize unknown errors to a user-facing string.
+ const extractErrorMessage = (error: unknown, fallback: string): string => {
+   if (typeof error === 'string') {
+     return error
+   }
+@@ -142,50 +143,53 @@ export const getFreebuffRateLimitErrorMessage = (
+   // Only trust messages parsed from a server response body, or the curated
+   // message on an agent-run output object — top-level messages on raw thrown
+   // errors are HTTP status text or retry-wrapper noise.
+   const isRunOutputObject =
+     !!error &&
+     typeof error === 'object' &&
+     (error as { type?: unknown }).type === 'error'
+   const detail =
+     extractApiErrorDetails(error).message ??
+     (isRunOutputObject ? details.message : undefined)
+   if (detail && !/^too many requests\.?$/i.test(detail)) {
+     return `${FREEBUFF_RATE_LIMIT_MESSAGE} (${detail})`
+   }
+   return FREEBUFF_RATE_LIMIT_MESSAGE
+ }
+ 
+ /**
+  * Provider billing failures are an operator problem in Freebuff, not a reason
+  * to send a free user to Codebuff's credit-purchase flow. Upstreams disagree
+  * on the status (observed as both 401 and 402), so retain the status check but
+  * also recognize the provider wording that can survive into an agent output.
+  */
+ export const isFreebuffProviderUsageError = (error: unknown): boolean => {
+   const details = getCliApiErrorDetails(error)
+   const message = details.message ?? extractErrorMessage(error, '')
++  // The user's own Codebuff balance, not our provider: leave it to the
++  // out-of-credits flow.
++  if (CODEBUFF_OWN_CREDITS_ERROR_PATTERN.test(message)) return false
+   return (
+     details.statusCode === 402 ||
+     FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN.test(message)
+   )
+ }
+ 
+ export const getCountryBlockFromFreeModeError = (
+   error: unknown,
+ ): {
+   countryCode: string
+   countryBlockReason?: FreebuffCountryBlockReason
+   ipPrivacySignals?: FreebuffIpPrivacySignal[]
+ } | null => {
+   if (!isFreeModeUnavailableError(error)) return null
+   const errorDetails = getCliApiErrorDetails(error)
+   const countryCode =
+     typeof errorDetails.countryCode === 'string' &&
+     errorDetails.countryCode.length > 0
+       ? errorDetails.countryCode
+       : 'UNKNOWN'
+ 
+   return {
+     countryCode,
+     countryBlockReason:
+       typeof errorDetails.countryBlockReason === 'string'
+diff --git a/common/src/constants/freebuff-errors.ts b/common/src/constants/freebuff-errors.ts
+index 6e70d5f41..327669c35 100644
+--- a/common/src/constants/freebuff-errors.ts
++++ b/common/src/constants/freebuff-errors.ts
+@@ -1,29 +1,39 @@
+ /** Provider billing failures observed from CrofAI, OpenRouter, and similar APIs. */
+ export const FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN =
+   /\b(?:(?:not enough|insufficient|out of)\s+credits?|(?:add|refill|top up)\s+(?:more\s+)?credits?)\b/i
+ 
++/**
++ * The Codebuff API's own 402 for a paid (non-free) request names the user's
++ * balance page: "Out of credits. Please add credits at
++ * https://www.codebuff.com/usage." That is the USER'S account running dry, so it
++ * must reach the ordinary out-of-credits flow; it also matches
++ * FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN ("add credits"), which told a paying
++ * user "this is on us, not your account" (2026-09-26, CLI, lite mode).
++ */
++export const CODEBUFF_OWN_CREDITS_ERROR_PATTERN = /codebuff\.com\/usage/i
++
+ /** Shared copy keeps every Freebuff surface clear that the user is not billed. */
+ export const FREEBUFF_PROVIDER_USAGE_MESSAGE =
+   'Freebuff ran out of provider usage and needs a refill. This is on us, not your account.'
+ 
+ /** Legacy older-server refusal, retained by SDK/CLI/Web recovery handlers.
+  * Current servers no longer emit this spend cutoff. */
+ export const FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE = 'turn_spend_limit'
+ 
+ export const FREEBUFF_TURN_SPEND_LIMIT_MESSAGE =
+   'This turn reached its model usage limit. Your session is still available — send a new message to continue from here.'
+ 
+ /**
+  * DeepSeek's platform content filter: HTTP 400 `invalid_request_error`,
+  * "Content Exists Risk (request_id: …)". Applied upstream of every V4.1 Flash
+  * lane — Luminal returns the identical body — so no divert escapes it, and
+  * because clients re-send the whole history, a conversation that trips it
+  * keeps tripping it on DeepSeek.
+  */
+ export const FREEBUFF_PROVIDER_CONTENT_FILTER_ERROR_PATTERN =
+   /\bcontent exists risk\b/i
+ 
+ /** Says what to DO: the raw string reads like our bug, and the same request
+  *  will be refused again, so the only way forward is a different model. */
+ export const FREEBUFF_PROVIDER_CONTENT_FILTER_MESSAGE =
+   "DeepSeek's provider declined this request (content filter). Retrying on DeepSeek will be declined again, since the whole conversation is re-sent. Try again with another model, e.g. GLM 5.3 Flash or MiMo."
+
+```
