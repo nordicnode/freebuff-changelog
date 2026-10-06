@@ -518,6 +518,16 @@ test('buildSite generates valid static site output', async () => {
     assert.match(aboutHtml, /FEEDS \+ DISCORD/)
     assert.match(aboutHtml, /class="man-dl"/, 'what is tracked is a list of surfaces, not a paragraph')
     assert.match(aboutHtml, /class="man-routes"/)
+    // The page is the site's map, so the routes and capabilities it names are a
+    // promise. Pin them: trimming copy must not quietly drop a whole page.
+    for (const [label, re] of [
+      ['the Ask-the-AI feature', /Ask the AI/],
+      ['the per-entry breakdown', /ON EACH ENTRY/],
+      ['the date-range picker', /href="\/range\/"/],
+      ['release notes', /\/release\/&lt;v&gt;\//],
+      ['the API endpoint list', /POST \/api\/ask/],
+      ['the pending-generation note', /still being generated/]
+    ]) assert.match(aboutHtml, re, `the about page names ${label}`)
     // The page explains itself; it is not allowed to become a manual again. The
     // word cap is checked in the production-size test below instead of here: this
     // fixture has four entries and three categories, so it under-measures the

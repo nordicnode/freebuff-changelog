@@ -2327,6 +2327,37 @@ details.more-rows[open]>summary{margin-bottom:6px}
     margin-bottom:8px;
   }
 }
+/* Term/description list. .man-dl above is the three-column counts table
+   (label, count, right-aligned note); this is the plain two-column glossary the
+   pipeline and per-entry sections use, where there is no count to align. */
+.man-def{
+  display:grid;
+  grid-template-columns:auto minmax(0,1fr);
+  gap:3px 14px;
+  margin:0 0 12px;
+  font-size:.86rem;
+  line-height:1.5;
+  align-items:baseline;
+}
+.man-def dt{
+  color:var(--txt);
+  font-weight:600;
+  white-space:nowrap;
+}
+.man-def dd{
+  margin:0;
+  color:var(--txt-dim);
+  text-wrap:pretty;
+}
+@media (max-width:600px){
+  .man-def{
+    grid-template-columns:1fr;
+    row-gap:1px;
+  }
+  .man-def dd{
+    margin-bottom:6px;
+  }
+}
 .man-routes{
   display:grid;
   grid-template-columns:repeat(auto-fit,minmax(210px,1fr));

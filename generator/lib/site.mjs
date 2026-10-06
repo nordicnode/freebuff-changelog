@@ -4128,25 +4128,33 @@ const loadIndex = async () => {
     </div>
     <div class="man-body">
       <h4>WHAT IS THIS?</h4>
-      <p>Commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, rebuilt from public git diffs. Upstream ships through snapshot merges with blank messages, so this mirror diffs each snapshot to extract model swaps, version bumps, slash commands and file churn. ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} commits, updated whenever upstream moves. Coverage follows that repository: Freebuff Desktop is not open sourced, so desktop-only changes are generally not picked up here; only shared code that also affects it shows up.</p>
+      <p>An unofficial, commit-by-commit changelog for <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a>, rebuilt from public git diffs. Upstream ships through snapshot merges with blank messages, so this mirror diffs each snapshot to extract model swaps, version bumps, slash commands and file churn: ${entries.length.toLocaleString()} entries from ${scannedCount.toLocaleString()} commits, refreshed whenever upstream moves.</p>
+      <p>Coverage follows that repository. Freebuff Desktop is not open-sourced, so desktop-only changes are not picked up here; only shared code that also affects it appears.</p>
 
       <h4>HOW IT WORKS: ANALYSIS PIPELINE</h4>
-      <p>Mechanical facts are extracted without a model. Model tables and slash-command registries are set-differenced from the git trees, version bumps come from <code>package.json</code>, and timestamps are normalized to UTC, so those facts are computed, not paraphrased. Code changes are then mapped onto the monorepo layout (<code>cli/</code>, <code>packages/agent-runtime/</code>, <code>common/</code>, <code>sdk/</code>, <code>docs/</code>) to name the changed layer.</p>
-      <p>The summaries are model output, and the goal is to make them traceable, not to claim they are perfect. What the model gets is bounded and checkable: the clean source diff with lockfiles and pure test hunks stripped (beyond the reserved 512k-token prompt budget it is split into file/hunk drafts and fused; partial evidence is disclosed), the computed facts above, the developers' own code comments, and, when a PR can be matched by touched files and passes a relevance check, its description and review discussion. Rows whose only changes are tests, mocks, or docs are detected mechanically and given a fixed plain-English line with no API call.</p>
-      <p>Every identifier a summary uses (backticked names, <code>CONSTANT_CASE</code> settings, camelCase and PascalCase names, versions, <code>--flags</code>, numbers) is checked against the diff and corpus as a whole word, so a truncated prefix fails too. A name that cannot be found gets one repair pass and, if still missing, is recorded as ungrounded in the Evidence block, and such a row cannot rate confidence high. Value direction is checked without a model: a constant that moved A to B but is written B to A is caught deterministically. Newly admitted entries are fact-checked claim by claim only while that pass is on; the relay runs it off, so new rows carry no verdict and never claim one. Names from a same-day sibling commit's title must be attributed explicitly; one commit may not borrow another's work. Unsupported claims trigger one rewrite, a row that still fails keeps its objection in the Evidence block rather than hiding it, breaking or migration claims get one independent second read and are demoted to unknowns when it does not confirm them, and a row still shipping ungrounded names, backwards values or flagged claims gets one rewrite on the stronger model, kept only when it is strictly cleaner. Each summary cites the diff it came from, new summaries are cached by commit SHA, diff content, delivered context, model and policy identity, and every card links to the commit, compare view and inline diff.</p>
+      <p>Facts are extracted without a model, so they are computed rather than paraphrased:</p>
+      <dl class="man-def">
+        <dt>Model catalog</dt><dd>Free-picker adds, retirements and swaps, set-differenced from the git trees</dd>
+        <dt>Commands</dt><dd>Slash commands added, renamed or retired</dd>
+        <dt>Versions</dt><dd>Bumps read from <code>package.json</code>; each release rolls up the commits in its window</dd>
+        <dt>Layers</dt><dd>Changed files mapped onto the monorepo layout (<code>cli/</code>, <code>packages/agent-runtime/</code>, <code>common/</code>, <code>sdk/</code>, <code>docs/</code>)</dd>
+        <dt>Structured facts</dt><dd>Constant old-to-new values, new env vars, flags, exports and new test titles</dd>
+      </dl>
+      <p>Summaries are model-written from a bounded brief: the clean source diff (lockfiles and pure test hunks stripped), those facts, the developers' code comments, and a matched PR's description and review thread when one is identified by touched files. A diff past the 512k-token budget is split into file drafts and fused, or, when deletion-heavy, has removed bodies compacted away; either way partial evidence is disclosed on the row. Rows that only touch tests, mocks or docs get a fixed plain-English line and no API call.</p>
+      <p><strong>Grounding.</strong> Every identifier a summary uses (backticked names, <code>CONSTANT_CASE</code> settings, camelCase and PascalCase names, versions, <code>--flags</code>, numbers) is checked against the diff as a whole word, so a truncated prefix fails too. A name that cannot be found gets one repair pass and, if still missing, is recorded as ungrounded in the Evidence block and the row cannot rate confidence high. Value direction is checked without a model: a constant that moved A to B but is written B to A is caught deterministically, and names borrowed from a same-day sibling commit must be attributed explicitly. Unsupported claims earn one rewrite; breaking or migration claims get an independent second read and are demoted to unknowns when unconfirmed.</p>
+      <p><strong>Reviews.</strong> Verification is off by operator decision, so newly admitted rows carry no verdict and never claim one; existing verdicts are kept and unconfirmed breaking or migration steps stay demoted. Older summaries are retained without paid backfill and say so in one quiet note. Objections live in the row's Evidence block and JSON record, a provider outage reads <em>automated review is pending</em>, a missing verdict prints nothing, and no row carries an unverified badge.</p>
+      <p><strong>Models.</strong> Summaries are written by <code>agnes-3.0-flash</code> through Agnes AI, with a <code>gemini-3.6-flash</code> backup read, and the answering model is recorded with each row. Ask answers use a separate credential and model.</p>
 
-      <p><strong>Quality coverage is not text coverage.</strong> Older summaries are retained without paid backfill and were never checked under the current policy, so they say so in one quiet note in their own Evidence block. Objections live in that block and the entry's JSON record; a provider outage says <em>automated review is pending</em> there, a missing verdict prints nothing, no entry carries an unverified badge, and objection text stays out of feeds, digests, Discord copy and release notes. Verification binds to the exact text, and unavailable reviewers do not clear objections. A same-family check is not a human audit; unknown motives stay unknown rather than being invented.</p>
-
-      <h4>MODELS &amp; REVIEW</h4>
-      <p>Summaries and plain-English lines are written by <code>agnes-3.0-flash</code> through Agnes AI, with one Google <code>gemini-3.6-flash</code> backup read if that route fails or answers deterministically; the answering model is recorded with the row. Requests stream because the gateway's non-streaming path times out, and the account's 60 requests per minute is the relay's ceiling.</p>
-      <p>The claim-by-claim fact-check is a second read on <code>agnes-3.0-flash</code> with quotes and reasons, and a review owed after an outage is re-read once, bounded and cooled down, while the pass is on. Since 2026-10-02 the relay runs with verification disabled by operator decision: a newly admitted row carries no verdict and never claims one, existing verdicts are kept, and unconfirmed breaking or migration steps stay demoted.</p>
-
-      <h4>USER-FACING HIGHLIGHTS</h4>
-      <p>Every entry opens with its ELI5 plain-English takeaway, fixed in shape: what changed, who it affects, what you notice day to day, no jargon. A plain-English line claims availability only when the evidence states it, and an identifier the diff never showed is repaired or left out rather than shipped. The technical explanation, holding the full summary, sits collapsed beneath it, then chips of the structured facts computed from the diff (constant old to new values, new env vars, flags, exports, new test titles), an Evidence section citing the diff lines behind the summary's names, and a collapsed note for what the diff cannot show. Version bumps roll up everything that shipped in their release window instead of reporting a bare label change; a row whose own summary names something the diff cannot ground is left out of the window entirely, and unchecked, review-flagged and value-error prose is omitted rather than reused as fact. The <code>/week/</code> pages digest each week into releases, catalog moves, and the heaviest work; cards name the first release that shipped each commit; same-day, same-topic commits are clustered into development narratives.</p>
-      <p>Every card carries an audience chip (clicking it opens that audience's feed subscription), a <code>link</code> button that copies a stable <code>/c/&lt;sha&gt;</code> permalink, and Related links picked by time proximity so an old row never points at the far future. Model pages say where each model first shipped and group its versions into lineage. The site follows your OS light-or-dark preference and remembers a manual choice.</p>
-
-      <h4>SEARCH</h4>
-      <p>Plain words match like they always did. On top of them the query box reads field syntax: <code>cat:cli</code> for a category, <code>sig:&gt;=notable</code> for an impact floor, <code>aud:end-users</code> for an audience, <code>is:release</code> <code>is:breaking</code> <code>is:security</code> <code>is:unverified</code> and the rest for flags, <code>&quot;exact phrase&quot;</code> for a phrase, and <code>-word</code> to exclude. Every search is a link: the address bar follows the box and the filters, so any result view can be shared, and the help panel lists the full grammar.</p>
+      <h4>ON EACH ENTRY</h4>
+      <dl class="man-def">
+        <dt>Plain English</dt><dd>An ELI5 plain-English takeaway first: what changed, who it affects, what you notice. It claims availability only when the evidence does.</dd>
+        <dt>Technical summary</dt><dd>Collapsed beneath it, with audience, significance and confidence</dd>
+        <dt>Structured facts</dt><dd>Chips for constant old-to-new, new env vars, flags, exports and new test titles</dd>
+        <dt>Evidence</dt><dd>The diff lines behind the summary's names, plus what the diff cannot show (unknowns)</dd>
+        <dt>Ask the AI</dt><dd>A question box per entry. Answers are generated at the edge and refused unless every claim passes a grounding gate against the stored diff</dd>
+        <dt>Share &amp; relate</dt><dd>Permalink button, Related rows by time proximity, and the first release that shipped the commit</dd>
+      </dl>
+      <p>Bump rows roll up everything in their release window rather than reporting a bare label change; a row whose summary names something the diff cannot ground is left out of that window. Same-day, same-topic commits are clustered into short narratives on the day page, and model pages group versions into lineage.</p>
 
       <h4>WHAT WE TRACK</h4>
       <dl class="man-dl">
@@ -4158,28 +4166,46 @@ const loadIndex = async () => {
         ${openPrs?.length ? `<dt>In-flight</dt><dd>${openPrs.length.toLocaleString()}</dd><dd class="man-note">Open PRs with diffstat, commits, comments, and preview</dd>` : ''}
       </dl>
 
+      <h4>SEARCH</h4>
+      <p>Plain words match as before. Above them the box reads field syntax: <code>cat:cli</code>, <code>sig:&gt;=notable</code>, <code>aud:end-users</code>, <code>is:release</code> <code>is:breaking</code> <code>is:security</code> <code>is:unverified</code>, <code>&quot;exact phrase&quot;</code>, and <code>-word</code> to exclude. Every search is a link: the address bar follows the box and filters, so any result view can be shared, and the help panel lists the full grammar.</p>
+
       <div class="man-cols">
         <div class="man-sec">
           <h4>WHERE TO GO</h4>
           <div class="man-routes">
             <span><a href="/">/</a> newest day</span>
             <span><code>/day/&lt;date&gt;/</code> single day</span>
-            <span><code>/from/&lt;date&gt;/to/&lt;date&gt;/</code> any day range</span>
+            <span><a href="/range/">/range/</a> pick a date range</span>
+            <span><code>/from/&lt;date&gt;/to/&lt;date&gt;/</code> a shareable range</span>
             <span><a href="/week/">/week/</a> weekly digests</span>
-            <span><a href="/models/">/models/</a> catalog + lineage</span>
-            <span><a href="/archive/">/archive/</a> history</span>
-            <span><a href="/search/">/search/</a> search index</span>
-            <span><a href="/stats/">/stats/</a> telemetry &amp; quality</span>
+            <span><a href="/models/">/models/</a> catalog, per-model pages and lineage</span>
+            <span><a href="/archive/">/archive/</a> history and category index</span>
+            <span><a href="/search/">/search/</a> search with field syntax</span>
+            <span><a href="/stats/">/stats/</a> telemetry, maturity and quality</span>
+            <span><code>/release/&lt;v&gt;/</code> release notes, also <code>?format=md</code></span>
             <span><code>/c/&lt;sha&gt;</code> one-entry permalink</span>
             <span><a href="/subscribe/">/subscribe/</a> feed picker + OPML</span>
-            <span><a href="/api/">/api/</a> machine API</span>
-            ${openPrs?.length ? '<span><a href="/in-flight/">/in-flight/</a> open PRs</span>' : ''}
+            ${openPrs?.length ? '<span><a href="/in-flight/">/in-flight/</a> open PRs with diff previews</span>' : ''}
+          </div>
+        </div>
+
+        <div class="man-sec">
+          <h4>API</h4>
+          <div class="man-routes">
+            <span><code>/api/entry/&lt;sha&gt;.json</code> one entry</span>
+            <span><code>/api/records/&lt;day&gt;.json</code> a day's records</span>
+            <span><code>/api/entries.json</code> recent changes</span>
+            <span><code>/api/days.json</code> day index</span>
+            <span><code>/api/status.json</code> ingestion + generation health</span>
+            <span><code>/api/traffic.json</code> clone counts</span>
+            <span><code>POST /api/ask</code> a grounded answer</span>
+            <span><a href="/api/">/api/</a> examples and schema</span>
           </div>
         </div>
 
         <div class="man-sec">
           <h4>KEYBOARD SHORTCUTS</h4>
-          <p>Single-key shortcuts for rapid navigation. Press <kbd>?</kbd> anywhere, or click <button type="button" class="theme-btn" data-kb-modal style="display:inline;color:var(--term-cyan);padding:0">[shortcuts: ?]</button> to toggle the cheat sheet.</p>
+          <p>Press <kbd>?</kbd> anywhere, or click <button type="button" class="theme-btn" data-kb-modal style="display:inline;color:var(--term-cyan);padding:0">[shortcuts: ?]</button>, for the cheat sheet.</p>
           <div class="man-routes">
             <span><kbd>j</kbd> / <kbd>k</kbd> next / prev entry</span>
             <span><kbd>o</kbd> / <kbd>Enter</kbd> expand / collapse</span>
@@ -4187,7 +4213,6 @@ const loadIndex = async () => {
             <span><kbd>c</kbd> copy Discord text</span>
             <span><kbd>n</kbd> / <kbd>p</kbd> next / prev day</span>
             <span><kbd>/</kbd> focus search</span>
-            <span><kbd>?</kbd> cheat-sheet</span>
             <span><kbd>Esc</kbd> close / blur</span>
           </div>
         </div>
@@ -4195,10 +4220,10 @@ const loadIndex = async () => {
         <div class="man-sec">
           <h4>FEEDS + DISCORD</h4>
           <ul class="man-ul">
-            <li><strong>Feeds:</strong> <a href="/feed.xml">all changes</a> &middot; <a href="/feed-major.xml">major</a> &middot; <a href="/feed-security.xml">security</a> &middot; <a href="/feed-weekly.xml">weekly</a> &middot; <a href="/feed-models.xml">models</a> &middot; <a href="/feed-releases.xml">releases</a> &middot; <a href="/feed.json">JSON</a>, plus one feed per audience. For Discord RSS bots, <code>/feed add &lt;url&gt;</code>.</li>
-            <li><strong>Subscribe:</strong> <a href="/subscribe/">/subscribe/</a> builds a personal OPML bundle of just the feeds you check, ready for any reader, and <a href="/feeds.opml">feeds.opml</a> is the everything bundle.</li>
-            <li><strong>Release notes as markdown:</strong> any release page answers <code>?format=md</code> (or <code>notes.md</code>) with clean <code>text/markdown</code>, ready to paste into a GitHub release.</li>
-            <li><strong>Webhook broadcast:</strong> <code>npm run broadcast -- --webhook &lt;url&gt;</code> posts new commits and records <code>lastBroadcastSha</code>, so nothing repeats (<code>--limit</code>, <code>--dry-run</code>).</li>
+            <li><strong>Feeds:</strong> <a href="/feed.xml">all</a> &middot; <a href="/feed-major.xml">major</a> &middot; <a href="/feed-security.xml">security</a> &middot; <a href="/feed-weekly.xml">weekly</a> &middot; <a href="/feed-models.xml">models</a> &middot; <a href="/feed-releases.xml">releases</a> &middot; <a href="/feed.json">JSON</a>, plus one per audience. For Discord RSS bots, <code>/feed add &lt;url&gt;</code>.</li>
+            <li><strong>Subscribe:</strong> <a href="/subscribe/">/subscribe/</a> builds an OPML bundle of just the feeds you check; <a href="/feeds.opml">feeds.opml</a> is the everything bundle.</li>
+            <li><strong>Release notes:</strong> any release page answers <code>?format=md</code> with clean <code>text/markdown</code>, ready for a GitHub release.</li>
+            <li><strong>Webhook:</strong> <code>npm run broadcast -- --webhook &lt;url&gt;</code> posts new commits once and records <code>lastBroadcastSha</code> (<code>--limit</code>, <code>--dry-run</code>).</li>
           </ul>
         </div>
 
@@ -4209,12 +4234,13 @@ const loadIndex = async () => {
             <img src="/badge/models.svg" alt="Models">
             <img src="/badge/status.svg" alt="Status">
             <img src="/badge/changes.svg" alt="Changes">
+            <img src="/badge/clones.svg" alt="Clones">
           </div>
         </div>
       </div>
 
       <h4>LIMITS &amp; FRESHNESS</h4>
-      <p>Snapshots squash history, so intra-snapshot ordering is approximate. Summaries and plain-English lines are AI-generated: the passes above reduce errors but do not eliminate them, so grounded identifiers are the parts to lean on and the prose is a guide. Where a row was rewritten or a check recorded an objection, the entry's Evidence block says so. Upstream is polled every 30s by a continuous relay; the site is rebuilt and redeployed on each data update, with a scheduled deploy as a backstop. Found a wrong row? <code>npm run override &lt;sha&gt;</code> drafts a human override for it, and overridden rows are marked edited.</p>
+      <p>Snapshots squash history, so intra-snapshot ordering is approximate. Summaries and plain-English lines are AI-generated: the checks above reduce errors but do not remove them, so treat grounded identifiers as fact and the prose as a guide. A row whose summary is still being generated says so. Upstream is polled every 30s by a continuous relay; the site is rebuilt and redeployed on each data update, with a scheduled deploy as a backstop. Found a wrong row? <code>npm run override &lt;sha&gt;</code> drafts a human correction, and overridden rows are marked edited.</p>
     </div>
   </div>
 </section>`
