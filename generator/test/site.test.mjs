@@ -455,7 +455,8 @@ test('buildSite generates valid static site output', async () => {
     const robotsTxt = await readFile(join(tmpDist, 'robots.txt'), 'utf8')
     assert.match(robotsTxt, /https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/sitemap\.xml/)
 
-    // Verify feeds carry enriched content (summary + facts), not titles only
+    // Verify feeds carry enriched content (summary in <description>, facts in
+    // <content:encoded>), not titles only
     assert.match(feedXml, /<content:encoded/)
     assert.match(feedXml, /New high-speed endpoint enabled\./)
 
@@ -2015,4 +2016,55 @@ test('buildSite: a dropped og card falls back to the default image instead of a 
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }
+})
+
+// Feed items used to repeat their sections: <description> carried the
+// plain-English block, the technical summary, AND a facts "Highlights" list,
+// while <content:encoded> carried the plain-English block and the summary AGAIN
+// plus the facts AGAIN under "Details:". Each block must appear exactly once
+// per item: description/summary carries the plain-English block + technical
+// summary; content(:encoded|_html) carries the technical details only.
+test('feed items emit the plain-English block and the technical block exactly once', () => {
+  const entry = {
+    day: '2026-10-06',
+    sha: 'abc123def456789012345678901234567890abcd',
+    date: '2026-10-06T12:00:00Z',
+    author: 'dev',
+    category: 'CLI',
+    significance: 'major',
+    areas: ['CLI'],
+    url: 'https://github.com/CodebuffAI/freebuff/commit/abc123',
+    title: 'Widget retries on failure',
+    ai: { summary: 'TECHSUMMARYMARKER the widget now retries on failure.' },
+    eli5: { text: 'PLAINENGLISHMARKER the button tries again if it fails.' },
+    facts: [
+      'FACTMARKERONE retries use backoff',
+      'FACTMARKERTWO timeout is 30s',
+      'FACTMARKERTHREE logs each attempt',
+      'FACTMARKERFOUR jitter added',
+      'FACTMARKERFIVE metrics emitted'
+    ],
+    modelChanges: { added: ['New Model'], removed: ['Old Model'] }
+  }
+  const titleOf = e => e.title
+  const occurrences = (s, sub) => s.split(sub).length - 1
+  const markers = ['PLAINENGLISHMARKER', 'TECHSUMMARYMARKER', 'FACTMARKERONE', 'FACTMARKERTWO',
+    'FACTMARKERTHREE', 'FACTMARKERFOUR', 'FACTMARKERFIVE']
+
+  const xml = feedItem('https://example.com', entry, titleOf)
+  for (const m of markers) {
+    assert.equal(occurrences(xml, m), 1, `feed.xml <item> repeats section: ${m}`)
+  }
+  // The enriched content is still there, just not duplicated.
+  assert.match(xml, /<content:encoded/)
+  assert.match(xml, /Details:/)
+  assert.match(xml, /In plain English/)
+
+  const json = jsonItem('https://example.com', entry, titleOf)
+  const jstr = JSON.stringify(json)
+  for (const m of markers) {
+    assert.equal(occurrences(jstr, m), 1, `feed.json item repeats section: ${m}`)
+  }
+  assert.match(json.content_html, /Details:/)
+  assert.match(json.summary, /In plain English/)
 })
