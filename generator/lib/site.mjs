@@ -3884,46 +3884,48 @@ ${weekTabsScript}`
       <span class="term-box-title">QUERY_ENGINE :: Unofficial Freebuff Changelog</span>
       <span>${entries.length.toLocaleString()} indexed entries</span>
     </div>
+    <form id="search-form" method="get" action="/search/" role="search">
     <div class="search-input-row">
       <span class="search-prompt">$ grep -i</span>
-      <input id="q" type="search" placeholder="muse, claude, CLI…" autocomplete="off" autofocus>
+      <input id="q" name="q" type="search" placeholder="muse, claude, CLI…" autocomplete="off" autofocus>
       <span class="search-hint">[press / to focus]</span>
     </div>
     <div class="filter-chips">
       <span class="filter-lbl" title="Quick searches: each chip sets the matching filter below (or the query where no filter exists)">QUICK:</span>
-      <button class="filter-chip active" data-filter="" title="Clear every filter and the query">--all</button>
-      <button class="filter-chip" data-cat="Model Catalog" title="Category filter: model catalog changes">--models</button>
-      <button class="filter-chip" data-sig="major" title="Impact filter: major only">--major</button>
-      <button class="filter-chip" data-flags="1" title="Release filter: version bumps">--releases</button>
-      <button class="filter-chip" data-cat="CLI" title="Category filter: CLI">--cli</button>
-      <button class="filter-chip" data-cat="Commands" title="Category filter: commands">--commands</button>
-      <button class="filter-chip" data-q="prompt" title="Quick query: prompt work">--prompt</button>
-      <button class="filter-chip" data-q="desktop" title="Quick query: desktop app">--desktop</button>
+      <button type="button" class="filter-chip active" data-filter="" title="Clear every filter and the query">--all</button>
+      <button type="button" class="filter-chip" data-cat="Model Catalog" title="Category filter: model catalog changes">--models</button>
+      <button type="button" class="filter-chip" data-sig="major" title="Impact filter: major only">--major</button>
+      <button type="button" class="filter-chip" data-flags="1" title="Release filter: version bumps">--releases</button>
+      <button type="button" class="filter-chip" data-cat="CLI" title="Category filter: CLI">--cli</button>
+      <button type="button" class="filter-chip" data-cat="Commands" title="Category filter: commands">--commands</button>
+      <button type="button" class="filter-chip" data-q="prompt" title="Quick query: prompt work">--prompt</button>
+      <button type="button" class="filter-chip" data-q="desktop" title="Quick query: desktop app">--desktop</button>
     </div>
     <div class="filter-row">
       <label class="filter-sel-lbl">CATEGORY:
-        <select id="fcat">
+        <select id="fcat" name="cat">
           <option value="">--all categories</option>
           ${SEARCH_CATS.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('')}
         </select>
       </label>
       <label class="filter-sel-lbl">IMPACT:
-        <select id="fsig">
+        <select id="fsig" name="sig">
           <option value="">--all levels</option>
           <option value="major">major only</option>
           <option value="notable">notable + major</option>
         </select>
       </label>
       <label class="filter-sel-lbl">AUDIENCE:
-        <select id="faud">
+        <select id="faud" name="aud">
           <option value="">--any audience</option>
           ${AUDIENCES.map(a => `<option value="${esc(a)}">${esc(a)}</option>`).join('')}
           <option value="unset">--not yet classified</option>
         </select>
       </label>
-      <label class="filter-sel-lbl"><input type="checkbox" id="frel"> releases only</label>
+      <label class="filter-sel-lbl"><input type="checkbox" id="frel" name="releases" value="1"> releases only</label>
       <span id="match-count" role="status" aria-live="polite" style="font-size:.76rem;color:var(--txt-subtle);margin-left:auto;align-self:center"></span>
     </div>
+    </form>
     <p class="search-idle">Results appear as you type, scoped by the filters above. Try <b>muse</b>, <b>cat:cli</b>, <b>is:release</b>, <b>aud:end-users</b> or <b>&quot;exact phrase&quot;</b>.</p>
     <details class="search-help">
       <summary>query syntax &mdash; everything the box understands</summary>
@@ -4229,6 +4231,11 @@ const loadIndex = async () => {
     c.classList.toggle('active', !!on);
   });
   syncChips();
+  // The controls live in a GET form so a no-JS submit (or Enter before the
+  // index arrives) reaches the worker's server-rendered results; once the
+  // index is here the submit stays client-side.
+  const form = document.getElementById('search-form');
+  if (form) form.addEventListener('submit', (e) => { e.preventDefault(); syncChips(); go(); });
   // Anything typed while the index was in flight still has to render: the
   // handlers that turn a keystroke into results only exist once it has arrived.
   if (q.value.trim()) go();

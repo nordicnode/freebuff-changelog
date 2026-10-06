@@ -162,6 +162,20 @@ async function handle (request, env) {
     if (resolved) return Response.redirect(new URL(`/day/${resolved.day}/#${resolved.key}`, request.url).toString(), 302)
   }
 
+  // /search/ with a query but no JavaScript: the page is an empty shell until
+  // its client script fetches the multi-MB search index, so crawlers and
+  // no-JS readers saw nothing. Answer the query here instead and inject the
+  // top hits into the shipped page shell (see searchSsr below). A JS reader
+  // never notices: the page boots from ?q= and re-renders the same hits over
+  // the injected ones.
+  if ((url.pathname === '/search' || url.pathname === '/search/') && request.method === 'GET') {
+    const sp = url.searchParams
+    if ((sp.get('q') || '').trim() || sp.get('cat') || sp.get('sig') || sp.get('aud') || sp.get('releases')) {
+      const ssr = await searchSsr(env, request, sp)
+      if (ssr) return ssr
+    }
+  }
+
   if (url.searchParams.get('format') === 'md') {
     const rm = /^\/release\/([^/]+)\/?$/.exec(url.pathname)
     if (rm) {
@@ -219,6 +233,179 @@ async function resolveShaKey (env, request, want) {
     : Object.keys(map).find(k => k.startsWith(want) || want.startsWith(k))
   if (!key) return null
   return { key, day: map[key] }
+}
+
+// ---- /search/ server-side rendering -------------------------------------
+// The /search/ page's client ranking lives in generator/lib/site.mjs (and is
+// unit-tested there); importing it here would drag the whole generator --
+// including its node:* imports -- into the worker bundle. This is the
+// simplified port the route above runs: the same grammar (words, "exact
+// phrases", -negations, cat:/aud:/sig:/is: filters), the same weights
+// (title 4/3 by length, plain-English 2, category/extra 1, phrase +4,
+// major +2 / notable +1), recency breaking ties, the same hit markup.
+const SSR_SRANK = { minor: 0, notable: 1, major: 2 }
+const SSR_SFLAG = { release: 1, breaking: 2, security: 4, model: 8, pr: 16, edited: 32, unverified: 64 }
+
+function ssrEsc (s) {
+  return String(s ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')
+}
+
+function ssrParseQuery (input) {
+  const words = [], phrases = [], neg = [], filters = {}
+  const tokens = String(input || '').match(/-?(?:"[^"]*"|\S+)/g) || []
+  for (let tok of tokens) {
+    let banned = false
+    if (tok.charAt(0) === '-' && tok.length > 1) { banned = true; tok = tok.slice(1) }
+    if (tok.charAt(0) === '"') {
+      const phrase = tok.replace(/"/g, '').trim().toLowerCase()
+      if (phrase) (banned ? neg : phrases).push(phrase)
+      continue
+    }
+    const m = /^([a-z]+):(.+)$/i.exec(tok)
+    if (m) {
+      const key = m[1].toLowerCase(), val = m[2].toLowerCase()
+      if (!banned && key === 'cat' && val) { filters.cat = val; continue }
+      if (!banned && key === 'aud' && val) { filters.aud = val; continue }
+      if (!banned && key === 'sig' && val) {
+        const c = /^(>=|<=|>|<|=)?([a-z]+)$/.exec(val)
+        if (c && SSR_SRANK[c[2]] !== undefined) { filters.sig = { op: c[1] || '=', value: c[2] }; continue }
+      }
+      if (!banned && key === 'is' && val) { (filters.is || (filters.is = [])).push(val); continue }
+    }
+    // Unknown key: forms fall through as plain words, like the client.
+    if (tok) (banned ? neg : words).push(tok.toLowerCase())
+  }
+  return { words, phrases, neg, filters }
+}
+
+function ssrSigOp (rowSig, op, want) {
+  const r = SSR_SRANK[rowSig] || 0, x = SSR_SRANK[want]
+  return op === '>=' ? r >= x : op === '<=' ? r <= x : op === '>' ? r > x : op === '<' ? r < x : r === x
+}
+
+// Index rows are the arrays search-index.json ships:
+// [day, title, catIdx, sha12, sigIdx, audIdx, flags, eli5, searchText].
+function ssrRank (cats, sigs, auds, ix, opts, limit) {
+  const p = ssrParseQuery(opts.q)
+  const w = p.words, phrases = p.phrases, neg = p.neg, f = p.filters, isList = f.is || []
+  const scored = []
+  for (const e of ix) {
+    const c = cats[e[2]] || '', a = sigs[e[4]] || ''
+    const au = (typeof e[5] === 'number' && e[5] >= 0) ? (auds[e[5]] || '') : ''
+    const bits = e[6] || 0
+    if (opts.cat && c !== opts.cat) continue
+    if (f.cat && c.toLowerCase() !== f.cat) continue
+    if (opts.sig && (SSR_SRANK[a] || 0) < (SSR_SRANK[opts.sig] || 0)) continue
+    if (f.sig && !ssrSigOp(a, f.sig.op, f.sig.value)) continue
+    if (opts.aud === 'unset') { if (au) continue } else if (opts.aud && au !== opts.aud) continue
+    if (f.aud && (f.aud === 'unset' ? !!au : au !== f.aud)) continue
+    if (opts.releases && !(bits & SSR_SFLAG.release)) continue
+    let isOk = true
+    for (const need of isList) {
+      if (need === 'eli5') { if (!e[7]) { isOk = false; break } continue }
+      const bit = SSR_SFLAG[need]
+      if (bit === undefined || !(bits & bit)) { isOk = false; break }
+    }
+    if (!isOk) continue
+    const t = e[1].toLowerCase(), cl = c.toLowerCase(), el = (e[7] || '').toLowerCase(), ex = (e[8] || '').toLowerCase()
+    const all = t + ' ' + el + ' ' + cl + ' ' + ex
+    let s = 0, ok = true
+    for (const x of w) {
+      if (t.includes(x)) s += x.length > 4 ? 4 : 3
+      else if (el.includes(x)) s += 2
+      else if (cl.includes(x)) s += 1
+      else if (ex.includes(x)) s += 1
+      else { ok = false; break }
+    }
+    if (!ok) continue
+    for (const ph of phrases) { if (!all.includes(ph)) { ok = false; break } s += 4 }
+    if (!ok) continue
+    if (neg.some(x => all.includes(x))) continue
+    if (a === 'major') s += 2; else if (a === 'notable') s += 1
+    scored.push([s, e[0], e])
+  }
+  scored.sort((x, y) => y[0] - x[0] || (y[1] < x[1] ? -1 : 1))
+  return { hits: scored.slice(0, limit).map(r => r[2]), total: scored.length, words: w }
+}
+
+function ssrHighlight (text, words) {
+  let s = ssrEsc(text)
+  for (const word of words) {
+    if (!word) continue
+    const escaped = word.replace(/[^a-zA-Z0-9_]/g, '\\$&')
+    try {
+      s = s.replace(new RegExp('(' + escaped + ')', 'gi'), '<mark class="search-match">$1</mark>')
+    } catch (_) {}
+  }
+  return s
+}
+
+function ssrHitHtml (e, cats, sigs, auds, words) {
+  const u = '/day/' + e[0] + '/#' + e[3]
+  const a = sigs[e[4]] || '', c = cats[e[2]] || ''
+  const au = (typeof e[5] === 'number' && e[5] >= 0) ? (auds[e[5]] || '') : ''
+  const sigTag = a === 'major' ? '<span class="badge maj">[MAJOR]</span>' : (a === 'notable' ? '<span class="badge not">[NOTABLE]</span>' : '')
+  const audTag = au ? '<span class="badge aud" title="Who this change is for">[' + ssrEsc(au.toUpperCase()) + ']</span>' : ''
+  const relTag = (e[6] & SSR_SFLAG.release) ? '<span class="badge ver">[RELEASE]</span>' : ''
+  const brkTag = (e[6] & SSR_SFLAG.breaking) ? '<span class="badge brk">[BREAKING]</span>' : ''
+  const secTag = (e[6] & SSR_SFLAG.security) ? '<span class="badge sec">[SECURITY]</span>' : ''
+  const eli5Snippet = e[7] ? '<p class="search-eli5"><span class="search-eli5-lbl">PLAIN ENGLISH:</span> ' + ssrHighlight(e[7], words) + '</p>' : ''
+  return '<article class="entry ' + a + '"><div class="entry-row">' +
+    '<span class="entry-utc" title="commit ' + ssrEsc(e[3]) + ' \u00b7 ' + ssrEsc(e[0]) + ' UTC">' + ssrEsc(e[0]) + '</span>' +
+    '<h3 class="entry-title"><a href="' + u + '">' + ssrHighlight(e[1], words) + '</a></h3>' +
+    '<div class="badges"><span class="badge cat">[' + ssrEsc(c) + ']</span>' + sigTag + audTag + relTag + brkTag + secTag + '</div>' +
+    '</div>' + eli5Snippet + '</article>'
+}
+
+// The index is the heaviest asset the site ships; the parsed copy is cached
+// for a minute so a burst of queries does not re-fetch and re-parse
+// megabytes per request. Same TTL convention as the sha-day map above.
+let searchIx = { data: null, at: 0 }
+async function loadSearchIndex (env, request) {
+  if (!searchIx.data || Date.now() - searchIx.at > 60000) {
+    let data = null
+    try {
+      const res = await env.ASSETS.fetch(new Request(new URL('/search-index.json', request.url), { method: 'GET' }))
+      if (res.ok) data = await res.json()
+    } catch (_) { data = null }
+    // A missing or corrupt index must not 500 the page: cache the miss
+    // briefly and let the caller fall through to the plain shell.
+    searchIx = { data, at: Date.now() }
+    if (!data || !Array.isArray(data.ix)) return null
+  }
+  return searchIx.data && Array.isArray(searchIx.data.ix) ? searchIx.data : null
+}
+
+// Rank the query against the shipped index and inject the top hits into the
+// shipped /search/ shell, where the client would render them. The query is
+// echoed back into the input so the no-JS form round-trips. Any miss -- no
+// index, no shell, an unrecognized shell -- returns null and the request
+// falls through to the plain shell, never worse than today.
+async function searchSsr (env, request, sp) {
+  if (!env || !env.ASSETS || typeof env.ASSETS.fetch !== 'function') return null
+  const payload = await loadSearchIndex(env, request)
+  if (!payload || !Array.isArray(payload.ix)) return null
+  const cats = payload.cats || [], sigs = payload.sigs || [], auds = payload.auds || []
+  const q = (sp.get('q') || '').trim()
+  const { hits, total, words } = ssrRank(cats, sigs, auds, payload.ix, {
+    q,
+    cat: sp.get('cat') || '',
+    sig: sp.get('sig') || '',
+    aud: sp.get('aud') || '',
+    releases: sp.get('releases') === '1'
+  }, 20)
+  const shell = await assetText(env, request, '/search/')
+  if (!shell) return null
+  const results = hits.length
+    ? '<p class="search-ssr-count" role="status">MATCHES: ' + total + ' (server-rendered; top ' + hits.length + ' shown)</p>' +
+      hits.map(e => ssrHitHtml(e, cats, sigs, auds, words)).join('')
+    : '<div class="search-empty"><p>$ No matches found for pattern.</p></div>'
+  const hitsOpen = '<div id="hits" role="region" aria-label="Search results" tabindex="-1">'
+  if (!shell.includes(hitsOpen + '</div>')) return null
+  const html = shell
+    .split(hitsOpen + '</div>').join(hitsOpen + results + '</div>')
+    .split('<input id="q" name="q" type="search"').join('<input id="q" name="q" type="search" value="' + ssrEsc(q) + '"')
+  return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } })
 }
 
 // Same-day neighbours for Ask context: the closest entries in the same day

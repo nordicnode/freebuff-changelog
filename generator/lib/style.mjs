@@ -3342,6 +3342,14 @@ a.badge:hover{text-decoration:none;color:var(--term-cyan)}
 .search-help-body code{font-size:.74rem}
 .search-empty{margin:20px 0}
 .search-empty p{margin:4px 0}
+/* Server-rendered result count (the worker answers /search/?q= for no-JS
+   readers and crawlers); the client replaces it with its live #match-count
+   on boot. */
+.search-ssr-count{
+  font-size:.76rem;
+  color:var(--txt-subtle);
+  margin:10px 0 12px;
+}
 
 /* /subscribe/: the feed checklist and the generated OPML. */
 .sub-groups{margin-top:8px}

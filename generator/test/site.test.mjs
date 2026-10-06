@@ -2424,3 +2424,52 @@ test('/models renders catalog history and model names server-side, scrubber is l
   assert.match(noScripts, /CATALOG HISTORY/, 'the catalog history section renders without JS')
   assert.match(html, /aria-label="Catalog date scrubber/, 'the date scrubber is named for assistive tech')
 })
+
+test('worker: /search/?q= server-renders ranked hits without JS', async (t) => {
+  const worker = (await import('../../worker.js')).default
+  const cats = ['CLI', 'Core'], sigs = ['minor', 'notable', 'major'], auds = ['end-users']
+  const ix = [
+    ['2026-09-19', 'Add muse model support', 0, 'a1b2c3d4e5f6', 2, 0, 0, 'plain english about muse', 'cli/src/muse.ts muse'],
+    ['2026-09-18', 'Fix prompt caching bug', 1, 'b2c3d4e5f6a7', 1, -1, 0, '', 'core/cache.ts'],
+    ['2026-09-17', 'Bump version', 0, 'c3d4e5f6a7b8', 0, -1, 1, '', '1.0.5']
+  ]
+  const shell = '<!doctype html><html><head><title>Search</title></head><body>' +
+    '<form id="search-form" method="get" action="/search/" role="search">' +
+    '<input id="q" name="q" type="search">' +
+    '</form><div id="hits" role="region" aria-label="Search results" tabindex="-1"></div></body></html>'
+  const env = {
+    ASSETS: {
+      fetch: async (req) => {
+        const u = new URL(req.url)
+        if (u.pathname === '/search-index.json') return new Response(JSON.stringify({ cats, sigs, auds, ix }), { status: 200 })
+        if (u.pathname === '/search/') return new Response(shell, { status: 200 })
+        return new Response('nf', { status: 404 })
+      }
+    }
+  }
+  const res = await worker.fetch(new Request('https://example.com/search/?q=muse'), env)
+  assert.equal(res.status, 200)
+  assert.match(res.headers.get('content-type'), /text\/html/, 'the SSR answer is HTML')
+  const html = await res.text()
+  assert.match(html, /Add <mark class="search-match">muse<\/mark> model support/i, 'the matching hit renders with its term highlighted')
+  assert.doesNotMatch(html, /prompt caching/, 'non-matching rows are absent')
+  assert.match(html, /value="muse"/, 'the query round-trips into the input')
+  assert.match(html, /MATCHES: 1 \(server-rendered/, 'the SSR count is present')
+  assert.match(html, /\/day\/2026-09-19\/#a1b2c3d4e5f6/, 'hits link at the day page #sha anchor')
+
+  // No query: the plain shell passes through untouched.
+  const plain = await worker.fetch(new Request('https://example.com/search/'), env)
+  assert.equal(await plain.text(), shell)
+
+  // Grammar travels: the is:release filter is honored server-side.
+  const rel = await worker.fetch(new Request('https://example.com/search/?q=' + encodeURIComponent('is:release')), env)
+  const relHtml = await rel.text()
+  assert.match(relHtml, /Bump version/, 'is:release finds the release row')
+  assert.doesNotMatch(relHtml, /muse model support/i, 'and excludes the rest')
+
+  // Hostile input cannot break the page: the query is attribute-escaped.
+  const evil = await worker.fetch(new Request('https://example.com/search/?q=' + encodeURIComponent('"><script>alert(1)</script>')), env)
+  const evilHtml = await evil.text()
+  assert.doesNotMatch(evilHtml, /<script>alert\(1\)/, 'raw script from the query never reaches the HTML')
+  assert.match(evilHtml, /&quot;&gt;&lt;script&gt;/, 'the query is escaped in the echoed value')
+})
