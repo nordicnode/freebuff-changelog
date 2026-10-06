@@ -2399,6 +2399,15 @@ details.more-rows[open]>summary{margin-bottom:6px}
   font-size:.90rem;
   line-height:1.55;
 }
+/* The about page is a man page: its prose holds a 92ch measure and its counts
+   table 100ch, so the box follows the content instead of the page column.
+   Otherwise ~30ch of dead space sits right of every paragraph and the page
+   reads shifted left. ch resolves at the use site, and .man-body runs at
+   .90rem, so the measure is scaled back to the body's font size. */
+.hero-about .term-box{
+  max-width:calc((var(--measure) + 12ch) * 0.9);
+  margin-inline:auto;
+}
 .man-body h4{
   margin:var(--sp-5) 0 var(--sp-3);
   padding-top:10px;
