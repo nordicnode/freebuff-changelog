@@ -1896,8 +1896,9 @@ async function cmdPreview (port = 8788) {
 
 // The dynamic routes that need one line of compute on top of the static dist/:
 // /api/entry/<sha>.json (one entry record), /release/<v>/?format=md (release
-// notes as markdown) and /from/<d>/to/<d>/ (the range shell, which is also
-// written as the `range` asset with a _redirects rewrite in production).
+// notes as markdown), /from/<d>/to/<d>/ (the range shell, which is also
+// written as the `range` asset with a _redirects rewrite in production) and
+// /c/<sha> (302 to the entry's day page, mirroring worker.js).
 // Shared shape with worker.js so preview and deploy cannot drift.
 export async function dynamicRoute (dist, pathname, searchParams) {
   const json = (obj, status = 200) => ({
@@ -1911,6 +1912,14 @@ export async function dynamicRoute (dist, pathname, searchParams) {
     if (em) {
       const record = await findEntryRecord(dist, em[1].toLowerCase())
       return record ? json(record) : json({ error: `no changelog entry records ${em[1]}` }, 404)
+    }
+    // /c/<sha> mirrors worker.js: a 302 to the day page holding the entry,
+    // resolved through api/sha-day.json. An unknown sha falls through to the
+    // static /c/ shell (or 404), exactly like production.
+    const cm = /^\/c\/([0-9a-f]{4,40})\/?$/i.exec(pathname)
+    if (cm) {
+      const resolved = await findShaDay(dist, cm[1].toLowerCase())
+      if (resolved) return { status: 302, headers: { location: `/day/${resolved.day}/#${resolved.key}` }, body: '' }
     }
     if (searchParams?.get('format') === 'md') {
       const rm = /^\/release\/([^/]+)\/?$/.exec(pathname)
@@ -1926,6 +1935,17 @@ export async function dynamicRoute (dist, pathname, searchParams) {
     return json({ error: String(err?.message || err) }, 500)
   }
   return null
+}
+
+// Short-sha -> { key, day } via api/sha-day.json, with the same prefix
+// resolution findEntryRecord uses below.
+async function findShaDay (dist, want) {
+  const map = JSON.parse(await readFile(resolve(dist, 'api/sha-day.json'), 'utf8'))
+  const key = Object.prototype.hasOwnProperty.call(map, want)
+    ? want
+    : Object.keys(map).find(k => k.startsWith(want) || want.startsWith(k))
+  if (!key) return null
+  return { key, day: map[key] }
 }
 
 // Resolve a commit prefix to its entry record via the same two-shard lookup
