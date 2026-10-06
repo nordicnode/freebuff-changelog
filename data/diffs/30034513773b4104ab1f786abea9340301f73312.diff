@@ -1,0 +1,763 @@
+diff --git a/cli/src/hooks/use-chat-streaming.ts b/cli/src/hooks/use-chat-streaming.ts
+index 8b76efdbf..4055d7984 100644
+--- a/cli/src/hooks/use-chat-streaming.ts
++++ b/cli/src/hooks/use-chat-streaming.ts
+@@ -1,41 +1,42 @@
+ /**
+  * Chat view adapter for connection status, queue presentation, and exit handling.
+  */
+ 
+ import { RECONNECTION_MESSAGE_DURATION_MS } from '@codebuff/sdk'
+ import { useQueryClient } from '@tanstack/react-query'
+ import { useCallback, useEffect, useState, useTransition } from 'react'
+ 
+ import { authQueryKeys } from './use-auth-query'
+ import { useConnectionStatus } from './use-connection-status'
+ import { useExitHandler } from './use-exit-handler'
+ import { useQueueControls } from './use-queue-controls'
+ import { useQueueUi } from './use-queue-ui'
+ import { useTimeout } from './use-timeout'
+ import { useChatRuntime } from '../contexts/chat-runtime-context'
+ import { useChatStore } from '../state/chat-store'
++import { setConnectionMonitorBusy } from '../utils/connection-monitor'
+ import {
+   sponsoredTurnHoldsQueue,
+   useSponsoredRunStore,
+ } from '../state/sponsored-run-store'
+ 
+ import type { QueuedMessage, StreamStatus } from './use-message-queue'
+ import type { PendingAttachment } from '../types/store'
+ import type { MutableRefObject } from 'react'
+ 
+ export interface UseChatStreamingOptions {
+   inputValue: string
+   setInputValue: (value: {
+     text: string
+     cursorPosition: number
+     lastEditDueToNav: boolean
+   }) => void
+   terminalWidth: number
+   separatorWidth: number
+ }
+ 
+ export interface UseChatStreamingReturn {
+   // Connection state
+   isConnected: boolean
+   showReconnectionMessage: boolean
+ 
+@@ -108,50 +109,58 @@ export function useChatStreaming({
+   const isConnected = useConnectionStatus(handleReconnection)
+ 
+   const {
+     timerStartTime,
+     queuedMessages,
+     streamStatus,
+     isWaitingForResponse,
+     isStreaming,
+     queuePaused,
+     streamMessageIdRef,
+     addToQueue,
+     setCanProcessQueue,
+     resumeQueue,
+     clearQueue,
+   } = runtime
+ 
+   // A plain message sent now joins the running task. Not during a sponsored
+   // turn: it has no steering mailbox, so messages wait in the queue.
+   const isChainInProgress = useChatStore((state) => state.isChainInProgress)
+   const sponsoredHoldsQueue = useSponsoredRunStore((state) =>
+     sponsoredTurnHoldsQueue(state.snapshot),
+   )
+   const steersRun =
+     (isStreaming || isChainInProgress) && !sponsoredHoldsQueue
+ 
++  // A turn in flight already proves the backend is reachable — its own success (or failure)
++  // is better evidence than a dedicated probe racing it for sockets/CPU. Pause the shared
++  // connection monitor's polling for the duration and let it resume right after.
++  useEffect(() => {
++    setConnectionMonitorBusy(isStreaming || isChainInProgress)
++    return () => setConnectionMonitorBusy(false)
++  }, [isStreaming, isChainInProgress])
++
+   // Queue UI
+   const {
+     queuedCount,
+     shouldShowQueuePreview,
+     inputBoxTitle,
+     inputPlaceholder,
+   } = useQueueUi({
+     queuePaused,
+     queuedMessages,
+     separatorWidth,
+     terminalWidth,
+     steersRun,
+   })
+ 
+   // Exit handling
+   const { handleCtrlC: baseHandleCtrlC, nextCtrlCWillExit } = useExitHandler({
+     inputValue,
+     setInputValue,
+   })
+ 
+   // Queue controls
+   const { handleCtrlC, ensureQueueActiveBeforeSubmit } = useQueueControls({
+     queuePaused,
+     queuedCount,
+     clearQueue,
+diff --git a/cli/src/hooks/use-connection-status.ts b/cli/src/hooks/use-connection-status.ts
+index 20647412c..667e7a825 100644
+--- a/cli/src/hooks/use-connection-status.ts
++++ b/cli/src/hooks/use-connection-status.ts
+@@ -1,153 +1,77 @@
+ import { useEffect, useRef, useState } from 'react'
+ 
+-import { getCodebuffClient } from '../utils/codebuff-client'
+-import { logger } from '../utils/logger'
+ import { useByokSelectionStore } from '../utils/byok'
+ import {
+-  failedPollDelayMs,
+-  jitterPollIntervalMs,
+-} from '../utils/polling-backoff'
++  getConnectionStatusSnapshot,
++  subscribeToConnectionStatus,
++} from '../utils/connection-monitor'
+ 
+-// Adaptive health check interval configuration
+-// Progressively increases polling interval based on consecutive successful checks
+-const HEALTH_CHECK_CONFIG = {
+-  // Healthy startup cadence (ms).
+-  INITIAL_INTERVAL: 10_000, // 10 seconds
+-  // Interval thresholds based on consecutive successful checks
+-  INTERVALS: [
+-    { successCount: 3, interval: 30_000 }, // 30 seconds after 3 successes
+-    { successCount: 6, interval: 60_000 }, // 1 minute after 6 successes
+-    { successCount: 10, interval: 120_000 }, // 2 minutes after 10 successes
+-    { successCount: 15, interval: 300_000 }, // 5 minutes after 15 successes
+-    { successCount: 20, interval: 600_000 }, // 10 minutes after 20 successes
+-  ],
+-} as const
+-
+-/**
+- * Calculates the next health check interval based on consecutive successful checks
+- * Exported for testing purposes
+- */
+-export function getNextInterval(consecutiveSuccesses: number): number {
+-  // Find the highest threshold that we've passed
+-  for (let i = HEALTH_CHECK_CONFIG.INTERVALS.length - 1; i >= 0; i--) {
+-    const { successCount, interval } = HEALTH_CHECK_CONFIG.INTERVALS[i]
+-    if (consecutiveSuccesses >= successCount) {
+-      return interval
+-    }
+-  }
+-  return HEALTH_CHECK_CONFIG.INITIAL_INTERVAL
+-}
++export { getNextInterval } from '../utils/connection-monitor'
+ 
+ /**
+  * Hook to monitor connection status to the Codebuff backend.
+- * Jitters the adaptive healthy cadence and exponentially backs off failures so
+- * a shared outage cannot synchronize every CLI into a fixed retry wave.
++ *
++ * The health-check loop itself lives in `connection-monitor.ts` as a single process-wide
++ * singleton: it starts on the first subscriber and owns its own adaptive-backoff timer,
++ * independent of any component's render or mount lifecycle. This hook only subscribes to
++ * that shared state — subscribing/unsubscribing (which can happen on every render, e.g.
++ * because `onReconnect` is a fresh closure each time) is cheap and never resets the backoff
++ * or fires a probe.
++ *
++ * It used to be the other way around: the polling loop lived inside this hook's own
++ * `useEffect`, keyed on `onReconnect`'s identity. A render during active streaming
++ * recreated that closure and tore down/restarted the effect — resetting the adaptive
++ * backoff to its 10s floor and firing an immediate request every time. That is what
++ * flooded `/api/healthz`.
+  *
+  * When the connection transitions from disconnected to connected, the optional
+  * onReconnect callback is invoked with a boolean indicating whether this was
+  * the initial connection (true) or a subsequent reconnection (false).
+  */
+ export const useConnectionStatus = (
+   onReconnect?: (isInitialConnection: boolean) => void,
+ ) => {
+   const hasSelectedByokConnection = useByokSelectionStore(
+     (state) => state.selected !== undefined,
+   )
+   const [isConnected, setIsConnected] = useState(true)
+   // null = never connected, false = was disconnected, true = was connected
+   const previousConnectedRef = useRef<boolean | null>(null)
++  // Read via a ref so an unstable callback identity never resubscribes (let alone resets
++  // the shared monitor's backoff) — only the latest callback is invoked, from the effect below.
++  const onReconnectRef = useRef(onReconnect)
++  onReconnectRef.current = onReconnect
+ 
+   useEffect(() => {
+     // A BYOK run talks directly to its selected provider. Do not probe the
+     // Codebuff backend just to paint a connection badge.
+     if (hasSelectedByokConnection) {
+       setIsConnected(true)
+       previousConnectedRef.current = true
+       return
+     }
+-    let isMounted = true
+-    let timeoutId: NodeJS.Timeout | null = null
+-    let consecutiveSuccesses = 0
+-    let consecutiveFailures = 0
+ 
+-    const scheduleNextCheck = (interval: number) => {
+-      if (!isMounted) return
+-      timeoutId = setTimeout(() => checkConnection(), interval)
+-    }
++    setIsConnected(getConnectionStatusSnapshot())
+ 
+-    const scheduleFailedCheck = (message: string, error?: unknown): void => {
+-      if (!isMounted) return
+-      setIsConnected(false)
+-      previousConnectedRef.current = false
+-      consecutiveSuccesses = 0
+-      consecutiveFailures++
+-      const delayMs = failedPollDelayMs({
+-        consecutiveFailures,
+-      })
+-      logger.debug(
+-        {
+-          ...(error === undefined ? {} : { error }),
+-          delayMs,
+-          consecutiveFailures,
+-        },
+-        message,
+-      )
+-      scheduleNextCheck(delayMs)
+-    }
++    const unsubscribe = subscribeToConnectionStatus((connected) => {
++      const prevConnected = previousConnectedRef.current
++      setIsConnected(connected)
++      previousConnectedRef.current = connected
+ 
+-    const checkConnection = async () => {
+-      try {
+-        const client = await getCodebuffClient()
+-        if (!client) {
+-          scheduleFailedCheck('Health check: No client, backing off')
+-          return
+-        }
+-
+-        const connected = await client.checkConnection()
+-        if (!isMounted) return
+-
+-        const prevConnected = previousConnectedRef.current
+-        setIsConnected(connected)
+-        previousConnectedRef.current = connected
+-
+-        if (connected) {
+-          consecutiveFailures = 0
+-          // Determine if this is the initial connection (null) or a reconnection (false)
+-          const isInitialConnection = prevConnected === null
+-          const shouldFireReconnectCallback =
+-            typeof onReconnect === 'function' && prevConnected !== true
++      if (connected) {
++        const isInitialConnection = prevConnected === null
++        const shouldFireReconnectCallback =
++          typeof onReconnectRef.current === 'function' &&
++          prevConnected !== true
+ 
+-          if (shouldFireReconnectCallback) {
+-            logger.info(
+-              { isInitialConnection },
+-              'Reconnection detected, firing onReconnect callback',
+-            )
+-            onReconnect(isInitialConnection)
+-          }
+-          consecutiveSuccesses++
+-          scheduleNextCheck(
+-            jitterPollIntervalMs({
+-              intervalMs: getNextInterval(consecutiveSuccesses),
+-            }),
+-          )
+-        } else {
+-          scheduleFailedCheck('Health check failed, backing off')
++        if (shouldFireReconnectCallback) {
++          onReconnectRef.current?.(isInitialConnection)
+         }
+-      } catch (error) {
+-        scheduleFailedCheck('Connection check failed; backing off', error)
+       }
+-    }
+-
+-    // Start first check immediately
+-    checkConnection()
++    })
+ 
+-    return () => {
+-      isMounted = false
+-      if (timeoutId) {
+-        clearTimeout(timeoutId)
+-      }
+-    }
+-  }, [hasSelectedByokConnection, onReconnect])
++    return unsubscribe
++  }, [hasSelectedByokConnection])
+ 
+   return isConnected
+ }
+diff --git a/cli/src/hooks/use-timeout.ts b/cli/src/hooks/use-timeout.ts
+index 93496eb48..b6037b024 100644
+--- a/cli/src/hooks/use-timeout.ts
++++ b/cli/src/hooks/use-timeout.ts
+@@ -59,27 +59,41 @@ export function useTimeout() {
+       const timeoutId = timeouts.get(key)
+       if (timeoutId) {
+         globalThis.clearTimeout(timeoutId)
+         timeouts.delete(key)
+       }
+     } else {
+       // Clear all timeouts
+       timeouts.forEach((timeoutId) => {
+         globalThis.clearTimeout(timeoutId)
+       })
+       timeouts.clear()
+     }
+   }, [])
+ 
+   useEffect(() => {
+     return () => {
+       // Clean up all timeouts on unmount
+       const timeouts = timeoutsRef.current
+       timeouts.forEach((timeoutId) => {
+         globalThis.clearTimeout(timeoutId)
+       })
+       timeouts.clear()
+     }
+   }, [])
+ 
+-  return { setTimeout, clearTimeout }
++  // setTimeout/clearTimeout are already stable (useCallback, no deps); keep the container
++  // object stable too (via a ref, not useMemo, so this works under the minimal test dispatcher
++  // in use-timeout.test.ts) so callers that depend on the whole returned object — e.g. inside
++  // another useCallback's deps array — get the same reference every render instead of a new
++  // object. An unstable object here previously recreated a downstream callback on every render,
++  // which reset an effect keyed on that callback's identity on every render too (see
++  // connection-monitor.ts).
++  const resultRef = useRef<{
++    setTimeout: typeof setTimeout
++    clearTimeout: typeof clearTimeout
++  } | null>(null)
++  if (!resultRef.current) {
++    resultRef.current = { setTimeout, clearTimeout }
++  }
++  return resultRef.current
+ }
+diff --git a/cli/src/utils/__tests__/connection-monitor.test.ts b/cli/src/utils/__tests__/connection-monitor.test.ts
+new file mode 100644
+index 000000000..0569144cc
+--- /dev/null
++++ b/cli/src/utils/__tests__/connection-monitor.test.ts
+@@ -0,0 +1,193 @@
++import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test'
++
++import { createConnectionMonitor, getNextInterval } from '../connection-monitor'
++
++/**
++ * Tests for the shared connection monitor.
++ *
++ * The monitor is dependency-injected (`checkConnection` is swapped in, never the
++ * `codebuff-client` module — see docs/testing.md), and its timers are driven through a mocked
++ * `globalThis.setTimeout`/`clearTimeout` so tests advance time deterministically instead of
++ * waiting on real delays.
++ */
++describe('connection-monitor', () => {
++  let originalSetTimeout: typeof setTimeout
++  let originalClearTimeout: typeof clearTimeout
++  let timers: { id: number; ms: number; fn: () => void; cleared: boolean }[]
++  let nextId: number
++
++  beforeEach(() => {
++    timers = []
++    nextId = 1
++    originalSetTimeout = globalThis.setTimeout
++    originalClearTimeout = globalThis.clearTimeout
++
++    globalThis.setTimeout = ((fn: () => void, ms?: number) => {
++      const id = nextId++
++      timers.push({ id, ms: Number(ms ?? 0), fn, cleared: false })
++      return { unref: () => {} } as unknown as ReturnType<typeof setTimeout>
++    }) as typeof setTimeout
++
++    globalThis.clearTimeout = (() => {
++      // Timers are identified by object identity in the mock above, not a numeric id, so
++      // nothing to look up here; monitor code only ever clears its own most recent timer and
++      // immediately schedules a new one, which is what the assertions below check for.
++    }) as typeof clearTimeout
++  })
++
++  afterEach(() => {
++    globalThis.setTimeout = originalSetTimeout
++    globalThis.clearTimeout = originalClearTimeout
++  })
++
++  // Flush the microtask queue so an `async check()` kicked off by `subscribe`/a timer fires
++  // reaches its `scheduleNext`/`emit` before assertions run.
++  const flush = async () => {
++    await Promise.resolve()
++    await Promise.resolve()
++    await Promise.resolve()
++  }
++
++  test('subscribing checks the connection immediately, once', async () => {
++    const checkConnection = mock(async () => true)
++    const monitor = createConnectionMonitor({ checkConnection })
++
++    monitor.subscribe(() => {})
++    await flush()
++
++    expect(checkConnection).toHaveBeenCalledTimes(1)
++  })
++
++  test('repeated subscribe/unsubscribe — simulating a component re-rendering on every streamed token — never resets the backoff or re-probes', async () => {
++    const checkConnection = mock(async () => true)
++    const monitor = createConnectionMonitor({ checkConnection })
++
++    const unsubscribe1 = monitor.subscribe(() => {})
++    await flush()
++    expect(checkConnection).toHaveBeenCalledTimes(1)
++    expect(timers.length).toBe(1)
++    const scheduledAfterFirstSuccess = timers[0]
++
++    // This is the old bug: a fresh callback identity on every render tore down and recreated
++    // the whole polling effect, firing an immediate probe each time. Simulate 50 "renders".
++    unsubscribe1()
++    for (let i = 0; i < 50; i++) {
++      const unsubscribe = monitor.subscribe(() => {})
++      unsubscribe()
++    }
++    await flush()
++
++    // No new network probes, and the original scheduled tick is still the one pending —
++    // resubscribing is just a listener add/remove, never a timer reset.
++    expect(checkConnection).toHaveBeenCalledTimes(1)
++    expect(timers.length).toBe(1)
++    expect(timers[0]).toBe(scheduledAfterFirstSuccess)
++  })
++
++  test('escalates the interval across consecutive successes, matching getNextInterval', async () => {
++    const checkConnection = mock(async () => true)
++    const monitor = createConnectionMonitor({ checkConnection })
++
++    monitor.subscribe(() => {})
++    await flush()
++    expect(checkConnection).toHaveBeenCalledTimes(1)
++    // First success: getNextInterval(1) = 10_000, jittered +/-20%.
++    expect(timers[0].ms).toBeGreaterThanOrEqual(10_000 * 0.8)
++    expect(timers[0].ms).toBeLessThanOrEqual(10_000 * 1.2)
++
++    // Fire the scheduled tick directly (advancing time) for successes 2 and 3.
++    timers[0].fn()
++    await flush()
++    timers[1].fn()
++    await flush()
++
++    expect(checkConnection).toHaveBeenCalledTimes(3)
++    // Third success crosses the successCount: 3 threshold -> 30_000ms.
++    expect(getNextInterval(3)).toBe(30_000)
++    expect(timers[2].ms).toBeGreaterThanOrEqual(30_000 * 0.8)
++    expect(timers[2].ms).toBeLessThanOrEqual(30_000 * 1.2)
++  })
++
++  test('notifies listeners false on failure and backs off', async () => {
++    const checkConnection = mock(async () => false)
++    const monitor = createConnectionMonitor({ checkConnection })
++
++    const seen: boolean[] = []
++    monitor.subscribe((connected) => seen.push(connected))
++    await flush()
++
++    expect(seen).toEqual([true, false])
++    expect(monitor.getConnected()).toBe(false)
++    // failedPollDelayMs backs off from a 20s base; it should not be using the healthy cadence.
++    expect(timers[0].ms).toBeGreaterThan(0)
++  })
++
++  test('a thrown checkConnection is treated as a failure, not an unhandled rejection', async () => {
++    const checkConnection = mock(async () => {
++      throw new Error('network down')
++    })
++    const monitor = createConnectionMonitor({ checkConnection })
++
++    monitor.subscribe(() => {})
++    await flush()
++
++    expect(monitor.getConnected()).toBe(false)
++  })
++
++  test('setBusy(true) pauses probing: the scheduled tick rechecks without hitting the network', async () => {
++    const checkConnection = mock(async () => true)
++    const monitor = createConnectionMonitor({
++      checkConnection,
++      busyRecheckIntervalMs: 5_000,
++    })
++
++    monitor.subscribe(() => {})
++    await flush()
++    expect(checkConnection).toHaveBeenCalledTimes(1)
++
++    monitor.setBusy(true)
++    timers[0].fn() // the next scheduled tick, now while busy
++    await flush()
++
++    // No second network probe — busy already proves reachability — but it did reschedule.
++    expect(checkConnection).toHaveBeenCalledTimes(1)
++    expect(timers.length).toBe(2)
++    expect(timers[1].ms).toBe(5_000)
++
++    monitor.setBusy(false)
++    timers[1].fn()
++    await flush()
++
++    expect(checkConnection).toHaveBeenCalledTimes(2)
++  })
++
++  test('stop() prevents any further probing', async () => {
++    const checkConnection = mock(async () => true)
++    const monitor = createConnectionMonitor({ checkConnection })
++
++    monitor.subscribe(() => {})
++    await flush()
++    expect(checkConnection).toHaveBeenCalledTimes(1)
++
++    monitor.stop()
++    timers[0].fn()
++    await flush()
++
++    expect(checkConnection).toHaveBeenCalledTimes(1)
++  })
++
++  test('a late subscriber gets the current snapshot immediately, without a new probe', async () => {
++    const checkConnection = mock(async () => true)
++    const monitor = createConnectionMonitor({ checkConnection })
++
++    monitor.subscribe(() => {})
++    await flush()
++    expect(checkConnection).toHaveBeenCalledTimes(1)
++
++    const seen: boolean[] = []
++    monitor.subscribe((connected) => seen.push(connected))
++
++    expect(seen).toEqual([true])
++    expect(checkConnection).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/cli/src/utils/connection-monitor.ts b/cli/src/utils/connection-monitor.ts
+new file mode 100644
+index 000000000..231b47b6e
+--- /dev/null
++++ b/cli/src/utils/connection-monitor.ts
+@@ -0,0 +1,211 @@
++import { getCodebuffClient } from './codebuff-client'
++import { logger } from './logger'
++import { failedPollDelayMs, jitterPollIntervalMs } from './polling-backoff'
++
++// Adaptive health check interval configuration.
++// Progressively increases polling interval based on consecutive successful checks.
++const HEALTH_CHECK_CONFIG = {
++  // Healthy startup cadence (ms).
++  INITIAL_INTERVAL: 10_000, // 10 seconds
++  // Interval thresholds based on consecutive successful checks
++  INTERVALS: [
++    { successCount: 3, interval: 30_000 }, // 30 seconds after 3 successes
++    { successCount: 6, interval: 60_000 }, // 1 minute after 6 successes
++    { successCount: 10, interval: 120_000 }, // 2 minutes after 10 successes
++    { successCount: 15, interval: 300_000 }, // 5 minutes after 15 successes
++    { successCount: 20, interval: 600_000 }, // 10 minutes after 20 successes
++  ],
++  // While a real request is in flight, its own success already proves the backend is up.
++  // Recheck on this short cadence (without hitting the network) rather than probing
++  // concurrently with the turn, and resume the normal schedule the moment it ends.
++  BUSY_RECHECK_INTERVAL: 5_000,
++} as const
++
++/**
++ * Calculates the next health check interval based on consecutive successful checks.
++ * Exported for testing purposes.
++ */
++export function getNextInterval(consecutiveSuccesses: number): number {
++  // Find the highest threshold that we've passed
++  for (let i = HEALTH_CHECK_CONFIG.INTERVALS.length - 1; i >= 0; i--) {
++    const { successCount, interval } = HEALTH_CHECK_CONFIG.INTERVALS[i]
++    if (consecutiveSuccesses >= successCount) {
++      return interval
++    }
++  }
++  return HEALTH_CHECK_CONFIG.INITIAL_INTERVAL
++}
++
++export type ConnectionListener = (connected: boolean) => void
++
++export interface ConnectionMonitor {
++  /** Returns the current snapshot immediately, then notifies on every subsequent check. */
++  subscribe(listener: ConnectionListener): () => void
++  getConnected(): boolean
++  /** A real request is in flight (or just finished). Its own success is stronger evidence of
++   *  connectivity than a dedicated probe, so pause probing while busy and resume right after. */
++  setBusy(busy: boolean): void
++  /** Stops the pending timer for good. Production code never calls this; tests do. */
++  stop(): void
++}
++
++export interface ConnectionMonitorOptions {
++  /** swapped in tests; the default asks the Codebuff backend through the SDK client */
++  checkConnection?: () => Promise<boolean>
++  busyRecheckIntervalMs?: number
++}
++
++const defaultCheckConnection = async (): Promise<boolean> => {
++  const client = await getCodebuffClient()
++  if (!client) return false
++  return client.checkConnection()
++}
++
++/**
++ * Creates one health-check loop. Dependency-injected (mirrors
++ * `freebuff-desktop/src/server/services/reachability.ts`'s `createReachability`) so tests can
++ * swap `checkConnection` instead of mocking the `codebuff-client` module.
++ *
++ * Production code does not call this directly — see the singleton helpers below. The loop here
++ * owns its own timer and backoff state, independent of any caller's lifecycle: subscribing adds
++ * a listener only, and never resets the timer or the backoff counters. That matters because this
++ * used to live inside `useConnectionStatus`'s `useEffect`, keyed on an `onReconnect` callback
++ * identity. A render during active streaming recreated that closure and tore down/restarted the
++ * effect — resetting the adaptive backoff to its 10s floor and firing an immediate probe on every
++ * render. During active token streaming that is many renders a second, which is what flooded
++ * `/api/healthz` (1.17B GETs/week, ~74% of all requests to the `web` Render service).
++ */
++export function createConnectionMonitor(
++  options: ConnectionMonitorOptions = {},
++): ConnectionMonitor {
++  const checkConnection = options.checkConnection ?? defaultCheckConnection
++  const busyRecheckIntervalMs =
++    options.busyRecheckIntervalMs ?? HEALTH_CHECK_CONFIG.BUSY_RECHECK_INTERVAL
++
++  const listeners = new Set<ConnectionListener>()
++  let timeoutId: ReturnType<typeof setTimeout> | null = null
++  let consecutiveSuccesses = 0
++  let consecutiveFailures = 0
++  let connected = true
++  let started = false
++  let busy = false
++  let stopped = false
++
++  const scheduleNext = (interval: number): void => {
++    if (stopped) return
++    if (timeoutId) clearTimeout(timeoutId)
++    timeoutId = setTimeout(() => void check(), interval)
++    timeoutId.unref?.()
++  }
++
++  const emit = (next: boolean): void => {
++    connected = next
++    for (const listener of [...listeners]) {
++      try {
++        listener(next)
++      } catch (error) {
++        logger.debug({ error }, 'Connection monitor listener threw')
++      }
++    }
++  }
++
++  const scheduleFailed = (message: string, error?: unknown): void => {
++    consecutiveSuccesses = 0
++    consecutiveFailures++
++    const delayMs = failedPollDelayMs({ consecutiveFailures })
++    logger.debug(
++      {
++        ...(error === undefined ? {} : { error }),
++        delayMs,
++        consecutiveFailures,
++      },
++      message,
++    )
++    emit(false)
++    scheduleNext(delayMs)
++  }
++
++  const check = async (): Promise<void> => {
++    if (stopped) return
++    if (busy) {
++      scheduleNext(busyRecheckIntervalMs)
++      return
++    }
++    try {
++      const ok = await checkConnection()
++      if (stopped) return
++      if (ok) {
++        consecutiveFailures = 0
++        consecutiveSuccesses++
++        emit(true)
++        scheduleNext(
++          jitterPollIntervalMs({
++            intervalMs: getNextInterval(consecutiveSuccesses),
++          }),
++        )
++      } else {
++        scheduleFailed('Health check failed, backing off')
++      }
++    } catch (error) {
++      scheduleFailed('Connection check failed; backing off', error)
++    }
++  }
++
++  return {
++    subscribe(listener) {
++      listeners.add(listener)
++      // Give the new subscriber the current snapshot right away so its UI doesn't flash
++      // "disconnected" waiting for the next tick.
++      listener(connected)
++      if (!started) {
++        started = true
++        void check()
++      }
++      return () => {
++        listeners.delete(listener)
++      }
++    },
++    getConnected: () => connected,
++    setBusy(next: boolean) {
++      busy = next
++    },
++    stop() {
++      stopped = true
++      listeners.clear()
++      if (timeoutId) clearTimeout(timeoutId)
++    },
++  }
++}
++
++// One process-wide instance. Lazily created on first use so importing this module never starts
++// network traffic by itself (tests, non-CLI consumers of the package, etc.).
++let singleton: ConnectionMonitor | null = null
++
++function getSingleton(): ConnectionMonitor {
++  if (!singleton) {
++    singleton = createConnectionMonitor()
++  }
++  return singleton
++}
++
++/** Subscribe to connection state. Returns an unsubscribe function. */
++export function subscribeToConnectionStatus(
++  listener: ConnectionListener,
++): () => void {
++  return getSingleton().subscribe(listener)
++}
++
++export function getConnectionStatusSnapshot(): boolean {
++  return getSingleton().getConnected()
++}
++
++/** Call with `true` while a real request/turn is in flight, `false` once it settles. */
++export function setConnectionMonitorBusy(busy: boolean): void {
++  getSingleton().setBusy(busy)
++}
++
++/** Test-only: drop the singleton so each test file gets an isolated monitor and timer. */
++export function resetConnectionMonitorForTests(): void {
++  if (singleton) singleton.stop()
++  singleton = null
++}
