@@ -295,14 +295,13 @@ export function feedItem (siteUrl, e, titleOf, storyNotes = []) {
   // - Never duplicates the title at the top of the description.
   // - Includes plain-English summary as a Discord-friendly blockquote when present.
   // - Full technical summary without harsh 300-char truncation.
-  // - Clean bulleted highlights for quick scanning.
+  // Facts live only in content:encoded (the "Details" list) so the item does
+  // not repeat its sections: description carries the plain-English block and
+  // the technical summary exactly once; content:encoded carries the technical
+  // details exactly once.
   const descParts = [...storyNotes.map(n => `> **Related access context**\n> ${n.text}`)].filter(Boolean)
   if (eli5) descParts.push(`> **In plain English**\n> ${eli5}`)
   if (summary) descParts.push(summary)
-  if (e.facts?.length) {
-    const highlights = e.facts.slice(0, 3).map(f => `• ${String(f).replace(/[*`#]/g, '').trim()}`).join('\n')
-    descParts.push(`**Highlights**\n${highlights}`)
-  }
   let desc = descParts.join('\n\n')
   // Discord description max is 4096 (standard message 2000); keep description bounded under 1800 chars cleanly
   if (desc.length > 1800) {
@@ -310,6 +309,12 @@ export function feedItem (siteUrl, e, titleOf, storyNotes = []) {
   }
 
   // Enriched HTML for readers that render content:encoded (Feedly, NetNewsWire, etc.)
+  // The plain-English block and the technical summary already live in
+  // <description>; repeating them here doubled every item, so content:encoded
+  // carries only what description does not: the model catalog delta, the
+  // "Details" facts list, and the links. Story notes stay in both on purpose:
+  // they are cross-posted related context, not duplicated sections, and a
+  // full-text reader should see them too.
   const factsHtml = (e.facts || []).slice(0, 5).map(f => `<li>${esc(String(f)).slice(0, 400)}</li>`).join('')
   const modelChangesHtml = (e.modelChanges?.added?.length || e.modelChanges?.removed?.length)
     ? `<p><b>Model catalog:</b></p><ul>`
@@ -319,8 +324,6 @@ export function feedItem (siteUrl, e, titleOf, storyNotes = []) {
     : ''
   const content = [
     ...storyNotes.map(n => `<p><b>Related access context:</b> ${esc(n.text)} <a href="${siteUrl}/day/${n.day}/#${n.anchor}">Related entry</a></p>`),
-    eli5 ? `<blockquote><p><b>In plain English:</b> ${esc(eli5)}</p></blockquote>` : '',
-    summary ? `<p>${esc(summary)}</p>` : '',
     modelChangesHtml,
     factsHtml ? `<p><b>Details:</b></p><ul>${factsHtml}</ul>` : '',
     `<p><a href="${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}">View on changelog</a> · <a href="${e.url || `https://github.com/CodebuffAI/freebuff/commit/${e.sha}`}">Commit ${e.sha.slice(0, 8)}</a>${e.prUrl ? ` · <a href="${e.prUrl}">PR #${e.pr}</a>` : ''}</p>`
@@ -397,11 +400,13 @@ export function jsonItem (siteUrl, e, titleOf, storyNotes = []) {
   const summary = String(e.ai?.summary || e.summary || '').replace(/[*`#]/g, '').trim()
   const eli5 = e.eli5?.text ? String(e.eli5.text).replace(/[*`#]/g, '').trim() : ''
   const facts = (e.facts || []).slice(0, 5).map(f => `<li>${esc(String(f)).slice(0, 400)}</li>`).join('')
+  // content_html carries only what `summary` does not: the plain-English block
+  // and the technical summary already live in `summary`, so repeating them
+  // here doubled every item. The related-access-context notes stay in both on
+  // purpose: they are cross-posted related context, not duplicated sections.
   const html = [
     ...storyNotes.map(n => `<p><b>Related access context:</b> ${esc(n.text)} <a href="${siteUrl}/day/${n.day}/#${n.anchor}">Related entry</a></p>`),
-    eli5 ? `<blockquote><p><b>In plain English:</b> ${esc(eli5)}</p></blockquote>` : '',
-    summary ? `<p>${esc(summary)}</p>` : '',
-    facts ? `<ul>${facts}</ul>` : ''
+    facts ? `<p><b>Details:</b></p><ul>${facts}</ul>` : ''
   ].filter(Boolean).join('')
 
   return {

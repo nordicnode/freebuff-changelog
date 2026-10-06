@@ -11,6 +11,7 @@ import { escapeHtml, shortHash } from '../lib/util.mjs'
 import { feedItem, jsonItem } from '../lib/feed.mjs'
 import { syncStaleMs } from '../lib/sync.mjs'
 import { planAssetRetention } from '../lib/retention.mjs'
+import worker from '../../worker.js'
 
 // _headers rules cannot override each other on Cloudflare: every rule whose
 // pattern matches a URL is applied, and a header name set twice is *joined* with
@@ -212,7 +213,7 @@ test('buildSite generates valid static site output', async () => {
     const indexHtml = await readFile(join(tmpDist, 'index.html'), 'utf8')
     // Rows now carry filter metadata, so open/hidden has to be read off the tag
     // instead of matching one fixed attribute order.
-    const rowTags = (html) => (html.match(/<details class="entry [^"]*" id="[0-9a-f]{12}"[^>]*>/g) || [])
+    const rowTags = (html) => (html.match(/<details class="(?:entry [^"]*|minor-row)" id="[0-9a-f]{12}"[^>]*>/g) || [])
     const tagOf = (html, sha) => rowTags(html).find(t => t.includes('id="' + sha + '"'))
     const isOpen = (t) => !!t && / open>$/.test(t)
     const isHidden = (t) => !!t && / hidden/.test(t)
@@ -353,8 +354,10 @@ test('buildSite generates valid static site output', async () => {
     // 360px viewport - 40 main padding - 34 box - 18 row - 6 gap - 86 for the
     // "$ grep -i" prompt = 180px of input, and a 16px monospace advance is 9.6px.
     assert.doesNotMatch(searchHtml, /placeholder="[^"]{19,}"/, 'the placeholder has to fit the narrowest phone')
-    assert.match(searchHtml, /<select id="fcat">/)
-    assert.match(searchHtml, /<select id="fsig">/)
+    assert.match(searchHtml, /<select id="fcat" name="cat">/)
+    assert.match(searchHtml, /<select id="fsig" name="sig">/)
+    assert.match(searchHtml, /<input id="q" name="q" type="search"/, 'the query box is a named GET form control for no-JS submits')
+    assert.match(searchHtml, /<form id="search-form" method="get" action="\/search\/" role="search">/)
     assert.match(searchHtml, /<option value="CLI">/)
 
     // Verify in-flight cards render diffstats and diff preview placeholders
@@ -455,7 +458,8 @@ test('buildSite generates valid static site output', async () => {
     const robotsTxt = await readFile(join(tmpDist, 'robots.txt'), 'utf8')
     assert.match(robotsTxt, /https:\/\/freebuff-changelog\.nordicnode\.workers\.dev\/sitemap\.xml/)
 
-    // Verify feeds carry enriched content (summary + facts), not titles only
+    // Verify feeds carry enriched content (summary in <description>, facts in
+    // <content:encoded>), not titles only
     assert.match(feedXml, /<content:encoded/)
     assert.match(feedXml, /New high-speed endpoint enabled\./)
 
@@ -559,7 +563,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(modelsHtml, /href="\/models\/muse-spark-1-3\/"/)
     assert.match(modelsHtml, /Muse Spark 1\.3/)
     assert.match(modelsHtml, /Muse Spark 1\.2/)
-    assert.match(modelsHtml, /CATALOG HISTORY \(1 CHANGES\)/)
+    assert.match(modelsHtml, /CATALOG HISTORY \(2 MOVES\)/)
     assert.match(modelsHtml, /\/day\/2026-09-13\/#bbbb11112222/)
     assert.match(modelsHtml, /\/models\//)
     assert.match(modelsHtml, /href="\/feed-models\.xml"/)
@@ -1039,7 +1043,7 @@ test('the timeline paginates one day per page and keeps every entry reachable', 
     // old day would yank the page out from under them.
     assert.match(latest, /class="sync-age"/)
     assert.match(d12, /class="sync-age"/)
-    assert.match(d11, /class="settled-badge">SETTLED HISTORY</)
+    assert.match(d11, /class="settled-badge">archived day</)
     assert.doesNotMatch(d11, /class="sync-val"|class="sync-age"|data-generated=/)
     assert.match(d11, /DATA AS OF \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/)
 
@@ -1179,7 +1183,7 @@ test('a settled day shows its stored roll-up above the entries, escaped, and onl
 
     const older = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
     assert.match(older, /class="day-rollup"/, 'the settled day renders the digest box')
-    assert.match(older, /DAY_ROLLUP :: Sep 13, 2026/)
+    assert.match(older, /READ THIS FIRST :: Sep 13, 2026/)
     assert.match(older, /Fixed the project picker opening behind the sidebar\./)
     assert.match(older, /2 highlights/)
     assert.match(older, /Added &lt;unsafe&gt; &amp; &quot;quoted&quot; text\./, 'stored bullets are escaped like every other text')
@@ -1789,12 +1793,268 @@ test('diff viewer escapes file paths and labels before innerHTML', async () => {
   }
 })
 
-// Every version badge used to link /release/<v>/ unconditionally, but only the
-// cli/release line gets a page: a freebuff/cli/release bump stores
-// `freebuffVersion` and deliberately writes none (VERSION_TRACKS in
-// analyze.mjs), so eleven 0.0.x links across the week pages and the model
-// lineage were 404s. The link is optional; the version is not.
-test('no release link points at a version the build never writes', async (t) => {
+// Every field the in-flight panel pulls from api.github.com must reach
+// innerHTML through escInFlight. The comment body used to take a shortcut --
+// angle brackets only, no quote/ampersand escaping -- so this pins the full
+// escaper on the least trustworthy field in the panel.
+test('in-flight live comment bodies go through escInFlight before innerHTML', async () => {
+  const changelog = {
+    version: 1, repo: 'https://github.com/CodebuffAI/freebuff',
+    generatedAt: '2026-09-19T12:00:00Z',
+    headSha: '1111222233334444555566667777888899990000',
+    counts: { entries: 1 },
+    entries: [{
+      kind: 'community', sha: 'cccc111122223333444455556666777788889999',
+      date: '2026-09-19T10:00:00Z', day: '2026-09-19', author: 'dev',
+      messageTitle: 'safe entry', title: 'safe entry', summary: 'safe entry',
+      areas: ['CLI'], category: 'CLI', significance: 'minor',
+      stats: { additions: 1, deletions: 0 },
+      files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: ['src/a.ts'], removed: [], renamed: [], modified: [] }
+    }]
+  }
+  const prs = [{ number: 101, title: 'A PR', author: 'alice', created: '2026-09-01T00:00:00Z' }]
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-xss3-'))
+  try {
+    await buildSite({ changelog, openPrs: prs, dist })
+    const html = await readFile(join(dist, 'in-flight/index.html'), 'utf8')
+    assert.match(html, /function escInFlight \(s\)/, 'the escaper ships on the page')
+    assert.match(html, /escInFlight\(\(c\.body \|\| ''\)/, 'comment bodies are escaped with escInFlight')
+    assert.doesNotMatch(html, /\(c\.body \|\| ''\)\.replace\(\/</, 'no angle-bracket-only shortcut for comment bodies')
+  } finally {
+    await rm(dist, { recursive: true, force: true })
+  }
+})
+
+// /c/<sha> resolves without JavaScript: the worker 302s to the day page that
+// holds the entry, through the single api/sha-day.json asset (no per-sha
+// files, so the asset budget is untouched). Retention-withheld diffs keep
+// their day pages -- retention only drops the stored diff -- so the redirect
+// target exists for every sha in the map.
+test('worker /c/<sha>: 302s to the entry\'s day page, unknown shas fall through', async () => {
+  const files = { '/api/sha-day.json': JSON.stringify({ abcdef123456: '2026-10-05' }) }
+  const env = { ASSETS: { fetch: async (req) => { const p = new URL(req.url).pathname; return p in files ? new Response(files[p], { status: 200 }) : new Response('not found', { status: 404 }) } } }
+  const get = (path) => worker.fetch(new Request(`https://x.test${path}`), env)
+
+  const exact = await get('/c/abcdef123456')
+  assert.equal(exact.status, 302)
+  assert.equal(exact.headers.get('location'), 'https://x.test/day/2026-10-05/#abcdef123456')
+
+  const prefix = await get('/c/abcdef')
+  assert.equal(prefix.status, 302)
+  assert.equal(prefix.headers.get('location'), 'https://x.test/day/2026-10-05/#abcdef123456')
+
+  const trailing = await get('/c/abcdef123456/')
+  assert.equal(trailing.status, 302, 'trailing slash still resolves')
+
+  const unknown = await get('/c/000000000000')
+  assert.notEqual(unknown.status, 302, 'an unknown sha falls through to the /c/ shell, not a redirect')
+})
+
+// The /week/ index once dropped weeks that had detail pages (W27/W28 were
+// seen missing while /week/2026-W27/ existed). The index and the detail pages
+// are built from the same digest list, so every emitted week must be listed;
+// the year tabs are the affordance that reaches older weeks.
+test('week index lists every week that gets a detail page', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-weeks-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const entry = (sha, date) => ({
+    kind: 'sync', sha, date, day: date.slice(0, 10), month: date.slice(0, 7), author: 'dev',
+    areas: ['CLI'], category: 'CLI', significance: 'minor', summary: 't', title: 't ' + sha.slice(0, 6),
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/src/x.ts'] },
+    stats: { additions: 5, deletions: 1 }
+  })
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-10-06T00:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 4 },
+    entries: [
+      entry('a1'.repeat(20), '2026-06-23T10:00:00Z'), // 2026-W26
+      entry('b2'.repeat(20), '2026-06-30T10:00:00Z'), // 2026-W27
+      entry('c3'.repeat(20), '2026-07-07T10:00:00Z'), // 2026-W28
+      entry('d4'.repeat(20), '2026-07-14T10:00:00Z') // 2026-W29
+    ]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const idx = await readFile(join(dist, 'week/index.html'), 'utf8')
+  for (const w of ['2026-W26', '2026-W27', '2026-W28', '2026-W29']) {
+    assert.match(idx, new RegExp(`week/${w}/`), `${w} is listed in the index`)
+    await readFile(join(dist, `week/${w}/index.html`), 'utf8')
+  }
+  assert.match(idx, /data-year="all"/, 'an ALL WEEKS tab reaches every year group')
+  assert.match(idx, /data-year="2026"/, 'a per-year tab reaches older weeks')
+})
+// The tiered day view: the rollup reads first, notable/security entries keep
+// full cards, and every minor entry is one dense row under its area header,
+// expanding in place. The embedded card drops its id so the row's #sha anchor
+// stays unique in the document.
+test('tiered day view: lead cards, minor rows under area headers, unique anchors', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-tiers-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const row = (sha, extra) => ({
+    kind: 'sync', sha, date: '2026-09-19T10:00:00Z', day: '2026-09-19', month: '2026-09', author: 'dev',
+    areas: ['CLI'], category: 'CLI', significance: 'minor', summary: 's', title: 't ' + sha.slice(0, 4),
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/src/x.ts'] },
+    stats: { additions: 3, deletions: 1 }, ...extra
+  })
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 7 },
+    entries: [
+      row('a1'.repeat(20), { significance: 'major', title: 'Major model swap' }),
+      row('b2'.repeat(20), { significance: 'notable', title: 'Notable CLI flag' }),
+      row('c3'.repeat(20), { title: 'Fix XSS in login form' }),
+      row('d4'.repeat(20), { title: 'Minor CLI polish one' }),
+      row('e5'.repeat(20), { title: 'Minor CLI polish two' }),
+      row('f6'.repeat(20), { title: 'Minor core tweak', areas: ['Core'], category: 'Core' }),
+      row('00'.repeat(20), { title: 'lockfile churn', noise: true, churn: 'lockfile' })
+    ]
+  }
+  const rollups = { '2026-09-19': { bullets: ['The headline of the day.', 'A second highlight.'] } }
+  await buildSite({ changelog, openPrs: [], dist, rollups })
+  const html = await readFile(join(dist, 'day/2026-09-19/index.html'), 'utf8')
+
+  assert.match(html, /READ THIS FIRST/, 'the day digest is labeled read-this-first')
+  assert.match(html, /NOTABLE & SECURITY \(3\)/, 'major + notable + security entries tier up')
+  assert.match(html, /EVERYTHING ELSE \(3\)/, 'minor entries tier down with a count')
+  assert.equal((html.match(/<details class="minor-row"/g) || []).length, 3, 'one dense row per minor entry')
+  assert.match(html, /minor-group-hdr">CLI <span class="minor-count">2<\/span>/, 'minor rows group under area headers with counts')
+  assert.match(html, /minor-group-hdr">Core <span class="minor-count">1<\/span>/)
+  // Anchors stay unique: the row owns the #sha id, the embedded card drops its.
+  for (const sha of ['a1'.repeat(20), 'b2'.repeat(20), 'c3'.repeat(20), 'd4'.repeat(20), 'e5'.repeat(20), 'f6'.repeat(20)]) {
+    const id = sha.slice(0, 12)
+    assert.equal((html.match(new RegExp(`id="${id}"`, 'g')) || []).length, 1, `${id} anchors exactly one element`)
+  }
+  // The first lead entry (newest: the security fix) starts open; a minor row never does.
+  assert.match(html, /<details class="entry[^"]*" id="c3c3c3c3c3c3"[^>]* open/, 'first lead card starts open')
+  assert.doesNotMatch(html, /<details class="minor-row"[^>]* open/, 'no minor row starts open')
+  // The notable-only toggle ships on the daily view and persists its state.
+  assert.match(html, /id="notable-toggle"/, 'notable-only toggle button renders')
+  assert.match(html, /notable: !!stored\.notable/, 'toggle state persists in localStorage')
+})
+
+test('homepage carries a short intro linking the about page', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-intro-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const mk = (sha, date) => ({
+    kind: 'sync', sha, date, day: date.slice(0, 10), month: date.slice(0, 7), author: 'dev',
+    areas: ['CLI'], category: 'CLI', significance: 'notable', summary: 's', title: 'A notable change',
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/src/x.ts'] },
+    stats: { additions: 3, deletions: 1 }
+  })
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 2 },
+    entries: [mk('a1'.repeat(20), '2026-09-18T10:00:00Z'), mk('b2'.repeat(20), '2026-09-19T10:00:00Z')]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const home = await readFile(join(dist, 'index.html'), 'utf8')
+  assert.match(home, /class="home-intro"/, 'homepage has the intro block')
+  assert.match(home, /unofficial, fully automated changelog/, 'intro says what the site is')
+  assert.match(home, /href="\/about\/"/, 'intro links the existing about page')
+  const older = await readFile(join(dist, 'day/2026-09-18/index.html'), 'utf8')
+  assert.doesNotMatch(older, /class="home-intro"/, 'older day pages do not repeat the intro')
+})
+test('SEO: homepage title is the site name, pages carry meta + OG tags', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-seo-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 2 },
+    entries: [
+      {
+        kind: 'sync', sha: 'a1'.repeat(20), date: '2026-09-19T10:00:00Z', day: '2026-09-19', month: '2026-09', author: 'dev',
+        areas: ['CLI'], category: 'CLI', significance: 'notable', summary: 's', title: 'A notable change', version: '1.0.5',
+        files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/release/package.json'] },
+        stats: { additions: 1, deletions: 1 }
+      },
+      {
+        kind: 'sync', sha: 'b2'.repeat(20), date: '2026-09-18T10:00:00Z', day: '2026-09-18', month: '2026-09', author: 'dev',
+        areas: ['CLI'], category: 'CLI', significance: 'minor', summary: 's', title: 'A minor change',
+        files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/src/x.ts'] },
+        stats: { additions: 2, deletions: 0 }
+      }
+    ]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const home = await readFile(join(dist, 'index.html'), 'utf8')
+  assert.match(home, /<title>Unofficial Freebuff Changelog<\/title>/, 'homepage <title> is the site name, not "Home"')
+  assert.doesNotMatch(home, /<title>Home/, 'no "Home" title anywhere on the front page')
+  for (const [file, what] of [['index.html', 'homepage'], ['day/2026-09-19/index.html', 'day page'], ['release/1.0.5/index.html', 'release page'], ['archive/index.html', 'archive']]) {
+    const html = await readFile(join(dist, file), 'utf8')
+    assert.match(html, /<meta name="description" content="[^"]+"/, `${what} has a meta description`)
+    assert.match(html, /<meta property="og:title" content="[^"]+"/, `${what} has an OG title`)
+    assert.match(html, /<meta property="og:description" content="[^"]+"/, `${what} has an OG description`)
+    assert.match(html, /<meta property="og:image" content="[^"]+"/, `${what} has an OG image`)
+  }
+})
+
+test('SEO: sitemap lists only URLs the build ships', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-sitemap-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 1 },
+    entries: [{
+      kind: 'sync', sha: 'a1'.repeat(20), date: '2026-09-19T10:00:00Z', day: '2026-09-19', month: '2026-09', author: 'dev',
+      areas: ['CLI'], category: 'CLI', significance: 'notable', summary: 's', title: 'A notable change', version: '1.0.5',
+      files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/release/package.json'] },
+      stats: { additions: 1, deletions: 1 }
+    }]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const index = await readFile(join(dist, 'sitemap.xml'), 'utf8')
+  for (const sub of ['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-pages.xml']) {
+    assert.match(index, new RegExp(sub.replace('.', '\\.')), `sitemap index references ${sub}`)
+  }
+  // Every <loc> in every sub-sitemap must resolve to a file the build wrote.
+  const exists = async (p) => readFile(join(dist, p), 'utf8').then(() => true, () => false)
+  for (const sub of ['sitemap-days.xml', 'sitemap-releases.xml', 'sitemap-models.xml', 'sitemap-pages.xml']) {
+    const xml = await readFile(join(dist, sub), 'utf8')
+    for (const m of xml.matchAll(/<loc>([^<]+)<\/loc>/g)) {
+      const url = new URL(m[1])
+      const rel = url.pathname.replace(/^\//, '') + (url.pathname.endsWith('/') ? 'index.html' : '')
+      assert.ok(await exists(rel), `${sub} lists ${url.pathname} but dist/ has no ${rel}`)
+    }
+  }
+  const relXml = await readFile(join(dist, 'sitemap-releases.xml'), 'utf8')
+  assert.match(relXml, /\/release\/1\.0\.5\//, 'the release sitemap includes the built release page')
+})
+
+// /models/ and /stats/ count the same thing the same way: catalog moves
+// (one add/remove each), not changelog rows. One entry can swap several
+// models at once, which is where the old 23-vs-40 disagreement came from.
+test('models and stats agree on the catalog-move count', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-moves-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 2 },
+    entries: [
+      {
+        kind: 'sync', sha: 'a1'.repeat(20), date: '2026-09-19T10:00:00Z', day: '2026-09-19', month: '2026-09', author: 'dev',
+        areas: ['CLI'], category: 'Model Catalog', significance: 'major', summary: 's', title: 'Model swap',
+        modelChanges: { added: ['Model A', 'Model B'], removed: ['Model C'] },
+        files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['README.md'] },
+        stats: { additions: 4, deletions: 2 }
+      },
+      {
+        kind: 'sync', sha: 'b2'.repeat(20), date: '2026-09-18T10:00:00Z', day: '2026-09-18', month: '2026-09', author: 'dev',
+        areas: ['CLI'], category: 'Model Catalog', significance: 'major', summary: 's', title: 'Model add',
+        modelChanges: { added: ['Model D'], removed: [] },
+        files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['README.md'] },
+        stats: { additions: 2, deletions: 0 }
+      }
+    ]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const models = await readFile(join(dist, 'models/index.html'), 'utf8')
+  assert.match(models, /CATALOG HISTORY \(4 MOVES\)/, '/models counts moves, not rows')
+  const stats = await readFile(join(dist, 'stats/index.html'), 'utf8')
+  assert.match(stats, /4 catalog moves across 4 models/, '/stats agrees on the move count')
+})
+// Both version lines get release pages now: the 1.0.x codebuff-cli line and
+// the 0.x freebuff-cli line (VERSION_TRACKS in analyze.mjs). A badge that names
+// a version must never point at a page the build did not write.
+test('every release link points at a version page the build writes, on both lines', async (t) => {
   const dist = await mkdtemp(join(tmpdir(), 'fbweb-relpage-'))
   t.after(() => rm(dist, { recursive: true, force: true }))
   const bump = (sha, date, extra) => ({
@@ -1824,19 +2084,50 @@ test('no release link points at a version the build never writes', async (t) => 
   await walk(dist)
 
   const linked = new Map()
-  let mentions188 = 0
   for (const page of pages) {
     const html = await readFile(page, 'utf8')
-    if (html.includes('v0.0.188')) mentions188++
     for (const m of html.matchAll(/href="\/release\/([^"/]+)\//g)) {
       const v = decodeURIComponent(m[1])
       if (!linked.has(v)) linked.set(v, await readFile(join(dist, 'release', v, 'index.html'), 'utf8').then(() => true, () => false))
       if (!(await linked.get(v))) assert.fail(`${page} links /release/${v}/ but no page was written for it`)
     }
   }
-  assert.ok(linked.has('1.0.688'), 'a version that does have a page is still linked')
-  assert.ok(!linked.has('0.0.188'), 'the 0.0.x line gets no release link')
-  assert.ok(mentions188 > 0, 'and the version is still shown, just without the dead link')
+  assert.ok(linked.has('1.0.688'), 'the 1.0.x line is linked')
+  assert.ok(linked.has('0.0.188'), 'the 0.x line is linked too')
+  // The archive's release-by-month directory lists both lines.
+  const archive = await readFile(join(dist, 'archive/index.html'), 'utf8')
+  assert.match(archive, /\/release\/0\.0\.188\//, 'archive lists the 0.x release')
+  assert.match(archive, /Two version lines ship from this repo/, 'archive explains the two lines')
+})
+
+// Release windows stop at the previous bump of the *same* line. The two lines
+// interleave, so a single date-sorted walk would hand a 0.x page the 1.0.x
+// line's window: here 0.2.4 must count the 1.0.5 bump and the commit after it
+// (both newer than 0.2.3), not just what came after 1.0.5.
+test('release windows stay inside their own version line', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-relwin-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const row = (sha, date, extra) => ({
+    kind: 'sync', sha, date, day: date.slice(0, 10), month: date.slice(0, 7), author: 'dev',
+    areas: ['CLI'], category: 'CLI', significance: 'minor', summary: 'row', title: 'row ' + sha.slice(0, 4),
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/src/x.ts'] },
+    stats: { additions: 1, deletions: 0 }, ...extra
+  })
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-20T00:00:00Z',
+    headSha: 'a'.repeat(40), counts: { entries: 4 },
+    entries: [
+      row('a1'.repeat(20), '2026-09-17T10:00:00Z', { freebuffVersion: '0.2.3', versionTrack: 'freebuff-cli', title: 'Freebuff CLI 0.2.3' }),
+      row('b2'.repeat(20), '2026-09-18T10:00:00Z', { version: '1.0.5', title: 'CLI 1.0.5' }),
+      row('c3'.repeat(20), '2026-09-19T10:00:00Z', { title: 'a commit between the bumps' }),
+      row('d4'.repeat(20), '2026-09-20T10:00:00Z', { freebuffVersion: '0.2.4', versionTrack: 'freebuff-cli', title: 'Freebuff CLI 0.2.4' })
+    ]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const page = await readFile(join(dist, 'release', '0.2.4', 'index.html'), 'utf8')
+  assert.match(page, /2 commits since previous release/, 'window runs 0.2.3 -> 0.2.4, crossing the 1.0.5 bump')
+  assert.match(page, /a commit between the bumps/)
+  assert.match(page, /Freebuff CLI v0\.2\.4/, 'the 0.x line is named as the Freebuff app CLI, not Freebuff-at-large')
 })
 
 test('stats: the golden-set eval card renders, and says so when no run exists', async (t) => {
@@ -2015,4 +2306,172 @@ test('buildSite: a dropped og card falls back to the default image instead of a 
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }
+})
+
+// Feed items used to repeat their sections: <description> carried the
+// plain-English block, the technical summary, AND a facts "Highlights" list,
+// while <content:encoded> carried the plain-English block and the summary AGAIN
+// plus the facts AGAIN under "Details:". Each block must appear exactly once
+// per item: description/summary carries the plain-English block + technical
+// summary; content(:encoded|_html) carries the technical details only.
+test('feed items emit the plain-English block and the technical block exactly once', () => {
+  const entry = {
+    day: '2026-10-06',
+    sha: 'abc123def456789012345678901234567890abcd',
+    date: '2026-10-06T12:00:00Z',
+    author: 'dev',
+    category: 'CLI',
+    significance: 'major',
+    areas: ['CLI'],
+    url: 'https://github.com/CodebuffAI/freebuff/commit/abc123',
+    title: 'Widget retries on failure',
+    ai: { summary: 'TECHSUMMARYMARKER the widget now retries on failure.' },
+    eli5: { text: 'PLAINENGLISHMARKER the button tries again if it fails.' },
+    facts: [
+      'FACTMARKERONE retries use backoff',
+      'FACTMARKERTWO timeout is 30s',
+      'FACTMARKERTHREE logs each attempt',
+      'FACTMARKERFOUR jitter added',
+      'FACTMARKERFIVE metrics emitted'
+    ],
+    modelChanges: { added: ['New Model'], removed: ['Old Model'] }
+  }
+  const titleOf = e => e.title
+  const occurrences = (s, sub) => s.split(sub).length - 1
+  const markers = ['PLAINENGLISHMARKER', 'TECHSUMMARYMARKER', 'FACTMARKERONE', 'FACTMARKERTWO',
+    'FACTMARKERTHREE', 'FACTMARKERFOUR', 'FACTMARKERFIVE']
+
+  const xml = feedItem('https://example.com', entry, titleOf)
+  for (const m of markers) {
+    assert.equal(occurrences(xml, m), 1, `feed.xml <item> repeats section: ${m}`)
+  }
+  // The enriched content is still there, just not duplicated.
+  assert.match(xml, /<content:encoded/)
+  assert.match(xml, /Details:/)
+  assert.match(xml, /In plain English/)
+
+  const json = jsonItem('https://example.com', entry, titleOf)
+  const jstr = JSON.stringify(json)
+  for (const m of markers) {
+    assert.equal(occurrences(jstr, m), 1, `feed.json item repeats section: ${m}`)
+  }
+  assert.match(json.content_html, /Details:/)
+  assert.match(json.summary, /In plain English/)
+})
+
+test('polish: file chips expand on click and "+N more" reveals the rest', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-fchips-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const files = Array.from({ length: 15 }, (_, i) => `cli/src/deeply/nested/module/file${i}.ts`)
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 1 },
+    entries: [{
+      kind: 'sync', sha: 'a1'.repeat(20), date: '2026-09-19T10:00:00Z', day: '2026-09-19', month: '2026-09', author: 'dev',
+      areas: ['CLI'], category: 'CLI', significance: 'notable', summary: 's', title: 'Many files',
+      files: { total: 15, meaningful: 15, rawMeaningful: 15, testOnly: false, added: [], removed: [], renamed: [], modified: files },
+      stats: { additions: 30, deletions: 2 }
+    }]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const html = await readFile(join(dist, 'day/2026-09-19/index.html'), 'utf8')
+  assert.match(html, /<button type="button" class="fchip mod"[^>]*data-fullpath="cli\/src\/deeply\/nested\/module\/file0\.ts"/, 'chips are buttons carrying the full path')
+  assert.match(html, /data-shortpath="cli\/…\/file0\.ts"/, 'the label is the truncated form')
+  assert.equal((html.match(/ data-extra-file>/g) || []).length, 3, 'chips past the fold render hidden')
+  assert.match(html, /<button type="button" class="fchip more" data-expand-files[^>]*>\+3 more<\/button>/, '"+N more" is a reveal control')
+})
+
+test('polish: digest pagers label their disabled arrows, no SETTLED HISTORY jargon', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-polish-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const mk = (sha, date) => ({
+    kind: 'sync', sha, date, day: date.slice(0, 10), month: date.slice(0, 7), author: 'dev',
+    areas: ['CLI'], category: 'CLI', significance: 'minor', summary: 's', title: 't',
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/src/x.ts'] },
+    stats: { additions: 1, deletions: 0 }
+  })
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 2 },
+    entries: [mk('a1'.repeat(20), '2026-09-18T10:00:00Z'), mk('b2'.repeat(20), '2026-09-19T10:00:00Z')]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const week = await readFile(join(dist, 'week/2026-W38/index.html'), 'utf8')
+  assert.match(week, /pager-disabled" title="No newer week"/, 'the newest week pager labels its disabled arrow')
+  const older = await readFile(join(dist, 'day/2026-09-18/index.html'), 'utf8')
+  assert.doesNotMatch(older, /SETTLED HISTORY/, 'the jargon is gone from day pages')
+  assert.match(older, /archived day/, 'older days say what they are in plain words')
+})
+
+test('/models renders catalog history and model names server-side, scrubber is labeled', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-modelsssr-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 1 },
+    entries: [{
+      kind: 'sync', sha: 'a1'.repeat(20), date: '2026-09-19T10:00:00Z', day: '2026-09-19', month: '2026-09', author: 'dev',
+      areas: ['CLI'], category: 'Model Catalog', significance: 'major', summary: 's', title: 'Model swap',
+      modelChanges: { added: ['Nebula Flash'], removed: ['Quasar Mini'] },
+      files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['README.md'] },
+      stats: { additions: 4, deletions: 2 }
+    }]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const html = await readFile(join(dist, 'models/index.html'), 'utf8')
+  // Strip scripts: what remains must already name the models and the history.
+  const noScripts = html.replace(/<script[\s\S]*?<\/script>/g, '')
+  assert.match(noScripts, /Nebula Flash/, 'added model name renders without JS')
+  assert.match(noScripts, /Quasar Mini/, 'removed model name renders without JS')
+  assert.match(noScripts, /CATALOG HISTORY/, 'the catalog history section renders without JS')
+  assert.match(html, /aria-label="Catalog date scrubber/, 'the date scrubber is named for assistive tech')
+})
+
+test('worker: /search/?q= server-renders ranked hits without JS', async (t) => {
+  const worker = (await import('../../worker.js')).default
+  const cats = ['CLI', 'Core'], sigs = ['minor', 'notable', 'major'], auds = ['end-users']
+  const ix = [
+    ['2026-09-19', 'Add muse model support', 0, 'a1b2c3d4e5f6', 2, 0, 0, 'plain english about muse', 'cli/src/muse.ts muse'],
+    ['2026-09-18', 'Fix prompt caching bug', 1, 'b2c3d4e5f6a7', 1, -1, 0, '', 'core/cache.ts'],
+    ['2026-09-17', 'Bump version', 0, 'c3d4e5f6a7b8', 0, -1, 1, '', '1.0.5']
+  ]
+  const shell = '<!doctype html><html><head><title>Search</title></head><body>' +
+    '<form id="search-form" method="get" action="/search/" role="search">' +
+    '<input id="q" name="q" type="search">' +
+    '</form><div id="hits" role="region" aria-label="Search results" tabindex="-1"></div></body></html>'
+  const env = {
+    ASSETS: {
+      fetch: async (req) => {
+        const u = new URL(req.url)
+        if (u.pathname === '/search-index.json') return new Response(JSON.stringify({ cats, sigs, auds, ix }), { status: 200 })
+        if (u.pathname === '/search/') return new Response(shell, { status: 200 })
+        return new Response('nf', { status: 404 })
+      }
+    }
+  }
+  const res = await worker.fetch(new Request('https://example.com/search/?q=muse'), env)
+  assert.equal(res.status, 200)
+  assert.match(res.headers.get('content-type'), /text\/html/, 'the SSR answer is HTML')
+  const html = await res.text()
+  assert.match(html, /Add <mark class="search-match">muse<\/mark> model support/i, 'the matching hit renders with its term highlighted')
+  assert.doesNotMatch(html, /prompt caching/, 'non-matching rows are absent')
+  assert.match(html, /value="muse"/, 'the query round-trips into the input')
+  assert.match(html, /MATCHES: 1 \(server-rendered/, 'the SSR count is present')
+  assert.match(html, /\/day\/2026-09-19\/#a1b2c3d4e5f6/, 'hits link at the day page #sha anchor')
+
+  // No query: the plain shell passes through untouched.
+  const plain = await worker.fetch(new Request('https://example.com/search/'), env)
+  assert.equal(await plain.text(), shell)
+
+  // Grammar travels: the is:release filter is honored server-side.
+  const rel = await worker.fetch(new Request('https://example.com/search/?q=' + encodeURIComponent('is:release')), env)
+  const relHtml = await rel.text()
+  assert.match(relHtml, /Bump version/, 'is:release finds the release row')
+  assert.doesNotMatch(relHtml, /muse model support/i, 'and excludes the rest')
+
+  // Hostile input cannot break the page: the query is attribute-escaped.
+  const evil = await worker.fetch(new Request('https://example.com/search/?q=' + encodeURIComponent('"><script>alert(1)</script>')), env)
+  const evilHtml = await evil.text()
+  assert.doesNotMatch(evilHtml, /<script>alert\(1\)/, 'raw script from the query never reaches the HTML')
+  assert.match(evilHtml, /&quot;&gt;&lt;script&gt;/, 'the query is escaped in the echoed value')
 })

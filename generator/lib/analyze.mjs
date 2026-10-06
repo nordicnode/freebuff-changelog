@@ -727,8 +727,10 @@ export function extractVersionBump (patch) {
 
 // The two package files whose bumps mark a shippable build. `cli/release/`
 // feeds the 1.0.x line (e.version, release pages); `freebuff/cli/release/`
-// feeds the 0.0.x line (e.freebuffVersion, ELI5 roll-up only, no release page
-// per product decision). Track identity is what lets a release-window walk
+// feeds the 0.x line (e.freebuffVersion, release pages since 2026-10-06 --
+// the earlier "no release page" decision was reversed because the 0.2.x line
+// is the current Freebuff CLI and its badges 404'd without pages).
+// Track identity is what lets a release-window walk
 // stop at the previous bump of the *same* line instead of the nearest bump of
 // either line -- the two interleave constantly.
 export const VERSION_TRACKS = {
@@ -1256,6 +1258,16 @@ const ENV_RE = /process\.env\.([A-Z][A-Z0-9_]{2,})|env\(['"`]([A-Z][A-Z0-9_]{2,}
 const FLAG_RE = /['"`](--[a-z][a-z0-9-]{1,40})\b/g
 const EXPORT_RE = /^([+-])\s*export\s+(?:default\s+)?(?:async\s+)?(?:function\*?|const|let|var|class|type|interface|enum)\s+([A-Za-z_$][\w$]*)/
 const TEST_NAME_RE = /^\+\s*(?:it|test|describe)(?:\.(?:only|skip|each\([^)]*\)))?\s*\(\s*(['"`])((?:(?!\1).){8,140})\1/
+// Test titles are lifted verbatim into the enrichment prompt and, for bump
+// entries, onto the homepage via deterministicSummary(). A title that still
+// carries Node/printf-style placeholders (`%s`, `%d`, `%.2f`, `%1$s`, `%%`)
+// was written for a formatter that never ran (vitest/jest `test.each`
+// positional templates render raw), so it would print literally on the site,
+// e.g. "- %s is Pacific day %s". A `%` directly after a digit is ordinary
+// prose ("100% coverage"), not a placeholder, and a bare `%` followed by a
+// space or a non-format char is prose too ("100% sure") -- so only a `%`
+// that is not digit-glued, plus a format char, counts.
+const PRINTF_PLACEHOLDER_RE = /(?<![\d%])%(?:\d+\$)?[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[sdijfoOc]|%%/
 
 function trimValue (v) {
   const s = String(v).replace(/\s+/g, ' ').trim()
@@ -1319,7 +1331,13 @@ export function extractStructuredFacts (patch) {
     }
     if (sign === '+') {
       const t = TEST_NAME_RE.exec(line)
-      if (t) tests.add(t[2].replace(/\s+/g, ' ').trim())
+      if (t) {
+        const name = t[2].replace(/\s+/g, ' ').trim()
+        // Drop titles that still carry unformatted printf-style placeholders
+        // ("- %s is Pacific day %s" would render literally on the site) and
+        // empty/whitespace-only names: they describe no behavior.
+        if (name && !PRINTF_PLACEHOLDER_RE.test(name)) tests.add(name)
+      }
     }
   }
   for (const [key, to] of addedConst) {
@@ -1399,7 +1417,11 @@ export function formatStructuredFacts (s) {
   if (s.flags.length) lines.push(`- Command-line flags newly introduced: ${s.flags.join(', ')}`)
   if (s.exportsAdded.length) lines.push(`- Exports added: ${s.exportsAdded.join(', ')}`)
   if (s.exportsRemoved.length) lines.push(`- Exports removed: ${s.exportsRemoved.join(', ')}`)
-  if (s.testNames.length) lines.push(`- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): ${s.testNames.map(t => `"${t}"`).join(' ; ')}`)
+  // The extractor drops placeholder/empty titles at capture time; filter again
+  // here so facts loaded from an older store cannot leak a literal
+  // "- %s is Pacific day %s" into the prompt and from there onto the site.
+  const cleanTestNames = (s.testNames || []).filter(t => t && !PRINTF_PLACEHOLDER_RE.test(t))
+  if (cleanTestNames.length) lines.push(`- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): ${cleanTestNames.map(t => `"${t}"`).join(' ; ')}`)
   return lines
 }
 
@@ -1483,7 +1505,11 @@ export function deterministicSummary (e) {
   if (isBumpEntry(e) && e.structured?.testNames?.length) {
     // Assertion titles describe the code's contract, not proof of production
     // availability. This is useful even before optional prose enrichment lands.
-    const candidates = e.structured.testNames.filter(t => !/\$\{|[\r\n]/.test(t) && /\s/.test(t))
+    // Titles that still carry printf placeholders or template syntax are
+    // dropped: the extractor filters them at capture time, but structured
+    // facts loaded from an older store can still carry them, and they render
+    // literally ("- %s is Pacific day %s").
+    const candidates = e.structured.testNames.filter(t => !/\$\{|[\r\n]/.test(t) && !PRINTF_PLACEHOLDER_RE.test(t) && /\s/.test(t))
     // Sample across the list rather than letting the first suite hide every
     // later topic (the affected release starts with ads and ends with safety).
     const tests = candidates.length <= 6 ? candidates : Array.from({ length: 6 }, (_, i) => candidates[Math.round(i * (candidates.length - 1) / 5)])

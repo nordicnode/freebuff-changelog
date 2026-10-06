@@ -6,68 +6,12 @@
 // so prompt edits invalidate stale entries (they re-summarize once). If no
 // provider is configured, everything still works with deterministic summaries.
 //
-// Config (env):
-//   CHANGELOG_LLM=1            enable
-//   LLM_API_KEY                bearer key
-//   LLM_API_KEYS               comma-separated bearer keys, rotated one per call
-//                              (each key its own quota; the RPM window stays global)
-//   LLM_API_BASE               default https://apihub.agnes-ai.com/v1 (any OpenAI-compatible
-//                              base works; the default is the project's provider)
-//   LLM_MODEL                  default agnes-3.0-flash
-//   LLM_TIMEOUT_MS            per-request timeout including body reads (default 60000).
-//                              Bounded further by the row budget and the pass deadline.
-//   CHANGELOG_LLM_ROW_BUDGET_MS  wall clock one row may spend on model calls
-//                              (default 90000). Bounds the repair/verifier ladder of a
-//                              single row so one slow row cannot eat the pass, and
-//                              sizes the prompt that row is asked (below).
-//   CHANGELOG_ELI5_ROW_BUDGET_MS the same for the plain-English pass (default
-//                              45000), and it is what the plain-English row's
-//                              own model calls are charged to -- not only the
-//                              pass plan that counts rows from it.
-//   CHANGELOG_ELI5_ROLLUP_BUDGET_MS  the clock for a release roll-up line
-//                              (default: the wider of the two above, 90000). A
-//                              roll-up reads the release window and answers in
-//                              up to eight sentences; charged the per-change
-//                              share it ran out mid-answer.
-//   CHANGELOG_LLM_PREFILL_CHARS_PER_SEC  prompt chars one second of a row's clock
-//                              can pay to prefill (default 12000; measured
-//                              13,056 on this provider). See the prompt clock
-//                              below: a prompt bigger than half the row's clock
-//                              can prefill is cut to fit, so no row is ever
-//                              asked a question its own budget cannot pay for.
-//   CHANGELOG_LLM_PROMPT_CLOCK_SHARE  how much of that clock the prompt may own
-//                              (default 0.5; the rest pays the answer and the
-//                              retry ladder).
-//   CHANGELOG_LLM_LIMIT        max commits summarized per run (default 60; 0 = no cap)
-//   CHANGELOG_LLM_CONCURRENCY  parallel API calls (default 2)
-//   CHANGELOG_ROLLUP_LLM_API_BASE / _API_KEY / _MODEL
-//                              a dedicated provider for the daily roll-up only
-//                              (both base and key are required to enable it).
-//                              Its plan is stated with _RPM, _MAX_PER_HOUR,
-//                              _MAX_PER_DAY and _MAX_CONCURRENT, defaulting to
-//                              20/min, 500/hour, 2,500/day, 3 in flight, and it
-//                              gets its own rolling window, no failover, and
-//                              nothing else routed through it.
-//   CHANGELOG_ELI5_LIMIT       plain-English pass budget (defaults to the above)
-//   CHANGELOG_ELI5_DIFF=0      explain from the summary only, skip the diff
-//   CHANGELOG_ELI5_DIFF_BYTES  operator cap on the diff sent to the plain-English
-//                              pass; unset means "all of it that fits the window
-//                              and the row's clock"
-//   CHANGELOG_LLM_MAX_DIFF_BYTES  the same, for the summary and verifier prompts
-//   CHANGELOG_LLM_CONTEXT_TOKENS  the model's window (default 512000). Every
-//                              prompt takes the diff last, out of what the
-//                              context sections leave, so a small row sends its
-//                              whole diff and a huge one still cannot overflow.
-//   CHANGELOG_LLM_CHURN=1      also summarize lockfile/icon-only rows, from their
-//                              raw diff (~1,900 extra calls)
-//   CHANGELOG_LLM_ERROR_COOLDOWN_MS  retry failed entries after this (default 3600000;
-//                              the delay doubles per attempt, 1h -> 2h -> ...)
-//   CHANGELOG_LLM_TRANSIENT_RETRY_MS  ...but gateway blips retry sooner (default 300000)
-//   CHANGELOG_LLM_MAX_ATTEMPTS   park a failing row for good after this many runs
-//                              (default 3; a refusal/memory answer, which is
-//                              deterministic, after 2). A prompt-version bump
-//                              changes the cache key, which releases the park.
-//   options.priorityShas       SHAs to summarize ahead of the backlog
+// Config (env): the README's "Configuration" section is the source of truth
+// for the full setting list; consult it rather than this file. Re-stated here
+// only because the code enforces them and no setting can raise them:
+//   - 60 requests/minute account ceiling (CHANGELOG_LLM_RPM may only lower it)
+//   - fixed 512,000-token context contract; prompts are sized to fit it
+//   - streaming requests by default (the non-streaming path times out)
 import { readJson, writeJson, log, pool, shortHash, eli5Source } from './util.mjs'
 import { mergeAiCache, mergeHealth } from './mergedata.mjs'
 import { AsyncLocalStorage } from 'node:async_hooks'

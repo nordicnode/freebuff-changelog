@@ -767,6 +767,24 @@ test('R10: offline audit records missing rows, checkpoints, and a failing gate w
   assert.equal((await latestResult(join(dir, 'eval/results'))).at, report.at)
 })
 
+test('R10: pre-policy stored artifacts pass the offline gate; recorded objections still fail it', async t => {
+  const dir = await temp(t)
+  const sha = 'c'.repeat(40)
+  // Stored text from before the verification policy carries no verdict and no
+  // policy stamp. quality.mjs calls that "not a failure", and the offline
+  // audit -- which cannot re-verify history -- must agree, or the gate has no
+  // path to green while the verifier stays off by operator decision.
+  const prePolicy = { ...entry(), sha, ai: { v: PROMPT_V, model: 'old', title: 'Limit changed', summary: 'The internal limit changed.' } }
+  await writeJson(join(dir, 'eval/golden.json'), { rows: [{ sha }] })
+  t.mock.method(globalThis, 'fetch', () => { throw new Error('offline audit must not fetch') })
+  const report = await runEval([prePolicy], dir, env)
+  assert.equal(report.gate.passed, true)
+  // ...but a recorded verifier objection still fails the gate.
+  const flagged = { ...prePolicy, ai: { ...prePolicy.ai, verify: 'flagged', verifyClaims: [{ claim: 'the limit', reason: 'unsupported' }] } }
+  const report2 = await runEval([flagged], dir, env)
+  assert.equal(report2.gate.passed, false)
+})
+
 test('R11/R16: durable errors, concurrent atomic checkpoints, and lock exclusion', async t => {
   const cache = { key: { error: 'bad', attempts: 2, at: '2020-01-01' } }
   pruneExpiredErrors(cache)

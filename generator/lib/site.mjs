@@ -5,7 +5,7 @@ import { writeText, writeBinary } from './util.mjs'
 import { escapeHtml as esc, fmtDateHuman, pool, shortHash } from './util.mjs'
 import { qualityOf, qualityText, generationHealth } from './quality.mjs'
 import { CSS } from './style.mjs'
-import { deterministicSummary, isBumpEntry } from './analyze.mjs'
+import { deterministicSummary, isBumpEntry, versionTrackOf } from './analyze.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg, feedsOpml } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
 import { buildStoryIndex, dayStories, dayStoryLead } from './story.mjs'
@@ -60,16 +60,36 @@ function dayItemListLd (d) {
   }
 }
 
+// A release row carries exactly one version string: `version` for the 1.0.x
+// codebuff-cli line (cli/release/package.json), `freebuffVersion` for the 0.x
+// freebuff-cli line (freebuff/cli/release/package.json). Both lines get release
+// pages; the version string is the page key either way.
+export function relVersionOf (e) {
+  return e?.version || e?.freebuffVersion || null
+}
+
+// Which release line a bump belongs to. Prefers the stored track; legacy rows
+// predate it, so fall back to whichever version field the row carries.
+export function relTrackOf (e) {
+  return versionTrackOf(e) || (e?.version ? 'codebuff-cli' : (e?.freebuffVersion ? 'freebuff-cli' : null))
+}
+
+// The reader-facing name of a release line.
+export function relLineName (e) {
+  return relTrackOf(e) === 'freebuff-cli' ? 'Freebuff CLI' : 'Freebuff'
+}
+
 // A version-bump page as SoftwareSourceCode so the release reads as a dated,
 // versioned artifact tied back to the upstream repository.
 function releaseLd (rel) {
+  const version = relVersionOf(rel)
   return {
     '@context': 'https://schema.org',
     '@type': 'SoftwareSourceCode',
-    name: `Freebuff ${rel.version}`,
-    version: rel.version,
+    name: `Freebuff ${version}`,
+    version,
     codeRepository: 'https://github.com/CodebuffAI/freebuff',
-    url: `${SITE.url}/release/${encodeURIComponent(rel.version)}/`,
+    url: `${SITE.url}/release/${encodeURIComponent(version)}/`,
     datePublished: String(rel.date || '').slice(0, 10),
     programmingLanguage: 'TypeScript'
   }
@@ -77,18 +97,20 @@ function releaseLd (rel) {
 
 function layout ({ title, path, body, desc, noindex, ogImage, wide, ld }) {
   const abs = (p) => p.startsWith('http') ? p : SITE.url + p
+  // The front page is the product, not a section: its title is the site name.
+  const fullTitle = path === '/' ? SITE.name : `${title} · ${SITE.name}`
   return `<!doctype html><html lang="en" data-theme="dark"><head><meta charset="utf-8">
 <script>(function(){try{var t=localStorage.getItem('fbTheme');if(!t){t=(window.matchMedia&&matchMedia('(prefers-color-scheme: light)').matches)?'light':'dark';}document.documentElement.setAttribute('data-theme',t);var m=document.querySelector('meta[name="theme-color"]');if(m)m.content=t==='amber'?'#120d04':(t==='green'?'#051207':(t==='light'?'#f6f8fa':'#0d1117'));if(localStorage.getItem('fbPlainMode')==='1'){document.documentElement.classList.add('reading-mode-plain');}}catch(_){}})();</script>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#0d1117">
-<title>${esc(title)} · ${SITE.name}</title>
+<title>${esc(fullTitle)}</title>
 <meta name="description" content="${esc(desc || SITE.desc)}">
 ${noindex ? '<meta name="robots" content="noindex">' : ''}
 <link rel="canonical" href="${abs(path)}">
-<meta property="og:title" content="${esc(title)} · ${SITE.name}">
+<meta property="og:title" content="${esc(fullTitle)}">
 <meta property="og:description" content="${esc(desc || SITE.desc)}">
 <meta property="og:image" content="${abs(ogImage || '/og/default.png')}">
-<meta property="og:image:alt" content="${esc(title)} \u00b7 ${SITE.name}">
+<meta property="og:image:alt" content="${esc(fullTitle)}">
 <meta name="twitter:card" content="summary_large_image">
 <meta property="og:type" content="website"><meta property="og:url" content="${abs(path)}">
 ${ld ? `<script type="application/ld+json">${ldScript(ld)}</script>` : ''}
@@ -365,7 +387,7 @@ function openHashTarget() {
       target = document.querySelector('[id^="' + short + '"]');
     }
   }
-  if (target && target.tagName === 'DETAILS' && target.classList.contains('entry')) {
+  if (target && target.tagName === 'DETAILS' && (target.classList.contains('entry') || target.classList.contains('minor-row'))) {
     target.open = true;
     scrollToEl(target, 'start');
   }
@@ -375,7 +397,10 @@ window.addEventListener('hashchange', openHashTarget);
 
 let activeEntryIdx = -1;
 function getVisibleEntries() {
-  return Array.from(document.querySelectorAll('details.entry:not([hidden])'));
+  // Top-level entry rows only: a minor row embeds its full card, and the
+  // embedded copy is not a navigable row of its own.
+  return Array.from(document.querySelectorAll('details.entry:not([hidden]), details.minor-row:not([hidden])'))
+    .filter(function (r) { return !r.closest('details.minor-row') || r.classList.contains('minor-row'); });
 }
 function setActiveEntry(idx) {
   const entries = getVisibleEntries();
@@ -514,13 +539,40 @@ document.addEventListener('click', (ev) => {
   if (modal) setKbModal(modal.hidden);
 });
 
+// File chips: a truncated path (cli/…/x.ts) expands to its full form on click,
+// and the "+N more" chip reveals the file paths past the fold in place.
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest) return;
+  const more = ev.target.closest('[data-expand-files]');
+  if (more) {
+    const wrap = more.closest('.files');
+    if (wrap) wrap.querySelectorAll('[data-extra-file]').forEach(c => { c.hidden = false; });
+    more.hidden = true;
+    return;
+  }
+  const chip = ev.target.closest('.fchip[data-fullpath]');
+  if (!chip) return;
+  const full = chip.getAttribute('data-fullpath');
+  const short = chip.getAttribute('data-shortpath');
+  if (chip.textContent === full) {
+    chip.textContent = short;
+    chip.setAttribute('title', full + ' -- click to expand');
+  } else {
+    chip.textContent = full;
+    chip.setAttribute('title', full + ' -- click to collapse');
+  }
+});
+
 // Bulk expand/collapse for timeline
 document.addEventListener('click', (ev) => {
   const btn = ev.target.closest ? ev.target.closest('[data-bulk]') : null;
   if (!btn) return;
   const action = btn.getAttribute('data-bulk');
   const open = action === 'expand';
-  document.querySelectorAll('section.day details.entry:not([hidden])').forEach(e => {
+  document.querySelectorAll('section.day details.entry:not([hidden]), section.day details.minor-row:not([hidden])').forEach(e => {
+    // The card embedded in a minor row follows its row; toggling it separately
+    // would fight the row's own disclosure.
+    if (e.closest('details.minor-row') && !e.classList.contains('minor-row')) return;
     e.open = open;
     // [expand all] is the power-user move: it opens the folded technical
     // section too (and collapse-all folds it back).
@@ -1087,7 +1139,8 @@ function badges (e) {
   if (e.ai?.breaking && !quality.demoteActions) b.push('<span class="badge brk" title="The technical pass marked this as changing existing behavior, config, an API or a command">[BREAKING]</span>')
   if (e.ai?.audience && AUDIENCE_DESC[e.ai.audience]) b.push(`<a class="badge aud" href="/subscribe/#aud-${esc(e.ai.audience)}"${stop} title="Who this change is for: ${esc(AUDIENCE_DESC[e.ai.audience])} · subscribe to this audience">[${esc(e.ai.audience.toUpperCase())}]</a>`)
   if (e.overridden) b.push('<span class="badge human" title="This entry was corrected by a human editor (data/overrides.json)">[EDITED]</span>')
-  if (e.version) b.push(`<a class="badge ver" href="/release/${e.version}/"${stop}>[v${e.version}]</a>`)
+  const rv = relVersionOf(e)
+  if (rv) b.push(`<a class="badge ver" href="/release/${esc(rv)}/"${stop} title="${esc(`Release ${rv}`)}">[v${esc(rv)}]</a>`)
   if (e.kind === 'community' && e.pr) b.push(`<span class="badge">[PR #${e.pr}]</span>`)
   b.push(`<a class="badge cat" href="/changes/${esc(categorySlug(e.category))}/"${stop}>[${esc(e.category)}]</a>`)
   return b.join('')
@@ -1154,13 +1207,16 @@ function fileChips (e) {
 
   if (!allItems.length) return ''
 
+  // Every chip is in the DOM; past the fold they start hidden and the "+N
+  // more" control reveals them in place. A chip is a real <button> so the
+  // truncated label (shortPath) can expand to the full path on click -- and on
+  // Enter/Space -- for mouse and keyboard alike.
   const maxShown = 12
-  const shownItems = allItems.slice(0, maxShown)
-  const chips = shownItems.map(item => `<span class="fchip ${item.type}" title="${esc(item.title)}">${esc(item.label)}</span>`)
+  const chips = allItems.map((item, idx) => `<button type="button" class="fchip ${item.type}" data-fullpath="${esc(item.title)}" data-shortpath="${esc(item.label)}" title="${esc(item.title)}${item.label !== item.title ? ' -- click to expand' : ''}"${idx >= maxShown ? ' hidden data-extra-file' : ''}>${esc(item.label)}</button>`)
 
   const totalFiles = Math.max(e.files.total || 0, allItems.length)
-  const extra = totalFiles - shownItems.length
-  if (extra > 0) chips.push(`<span class="fchip more">+${extra} more</span>`)
+  const extra = totalFiles - maxShown
+  if (allItems.length > maxShown) chips.push(`<button type="button" class="fchip more" data-expand-files title="Show the remaining file paths">+${extra} more</button>`)
 
   const hint = `(${totalFiles} file${totalFiles === 1 ? '' : 's'})`
 
@@ -1679,7 +1735,7 @@ function shippedInHtml (e, shipped) {
   if (!hit) return ''
   const parts = []
   if (hit['codebuff-cli']) parts.push(`<a href="/release/${esc(hit['codebuff-cli'].version)}/">CLI ${esc(hit['codebuff-cli'].version)}</a>`)
-  if (hit['freebuff-cli']) parts.push(`<a href="/day/${esc(hit['freebuff-cli'].day)}/#${esc(hit['freebuff-cli'].sha.slice(0, 12))}">Freebuff CLI ${esc(hit['freebuff-cli'].version)}</a>`)
+  if (hit['freebuff-cli']) parts.push(`<a href="/release/${esc(hit['freebuff-cli'].version)}/">Freebuff CLI ${esc(hit['freebuff-cli'].version)}</a>`)
   if (!parts.length) return ''
   return `<p class="shipped-in"><span class="shipped-lbl">SHIPPED IN</span> ${parts.join(' <span class="model-sep">&middot;</span> ')}</p>`
 }
@@ -1886,9 +1942,9 @@ export function renderBadgeSvg (label, value, color = '#2ea043') {
  * Generate GitHub Release formatted markdown for a release version.
  */
 export function generateReleaseNotesMarkdown (rel, commits = []) {
-  const version = rel?.version ? `v${rel.version}` : 'Release'
+  const version = relVersionOf(rel) ? `v${relVersionOf(rel)}` : 'Release'
   const date = (rel?.date || '').slice(0, 10)
-  const lines = [`# Freebuff ${version}${date ? ` (${date})` : ''}`, '']
+  const lines = [`# ${relLineName(rel)} ${version}${date ? ` (${date})` : ''}`, '']
 
   const features = []
   const models = []
@@ -2208,13 +2264,11 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
   const shipped = computeShippedIn(changelog.entries)
   const cardOpts = (e, extra = {}) => ({ storyNotes: storyIdx.notes.get(e.sha), shipped, ...extra })
   const modelEntries = entries.filter(e => e.modelChanges)
-  const releases = entries.filter(e => e.version)
-  // A version badge links only when a page was actually written for it. The
-  // 0.0.x freebuff-cli line stores `freebuffVersion` and deliberately gets no
-  // release page (see VERSION_TRACKS in analyze.mjs), so anchoring one of those
-  // is a guaranteed 404 -- eleven were reachable from the week pages and the
-  // model lineage. The version is the fact worth keeping; the dead link is not.
-  const releasePages = new Set(releases.map(r => r.version))
+  const releases = entries.filter(e => e.version || e.freebuffVersion)
+  // A version badge links only when a page was actually written for it. Both
+  // version lines get pages (see VERSION_TRACKS in analyze.mjs): 1.0.x from
+  // cli/release, 0.x from freebuff/cli/release.
+  const releasePages = new Set(releases.map(r => relVersionOf(r)))
   // Retention is decided by the caller, because cmdBuild owns both the diff copy
   // and the objects on disk; it is applied here, before anything renders, so the
   // cards, the day pages, the permalinks and the range view all agree with what
@@ -2227,7 +2281,7 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
     const href = releaseHref(v)
     return href
       ? `<a class="badge ver" href="${href}" title="${esc(title || `Release ${v}`)}">v${esc(v)}</a>`
-      : `<span class="badge ver" title="${esc(`Freebuff CLI ${v}: the 0.0.x line has no release page`)}">v${esc(v)}</span>`
+      : `<span class="badge ver" title="${esc(title || `Release ${v}`)}">v${esc(v)}</span>`
   }
   const verLink = (v) => {
     const href = releaseHref(v)
@@ -2331,7 +2385,7 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
     const churn = rows.length - real
     const latest = i === 0
     // The footer on `/` is a live claim: HEAD and how old the data is.
-    // Every other day is settled, so it states the stamp it was built from and
+    // Every other day is archived, so it states the stamp it was built from and
     // deliberately carries no `.sync-age`/`data-generated` hook -- that is the
     // element the shell's aging and status poll looks for, and it only runs on
     // `/`; an update chip while someone reads July 2024 would be noise.
@@ -2339,7 +2393,7 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
       ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}" data-head="${esc(changelog.headSha || '')}" data-changes="${meaningful.length}">${esc(fmtDateHuman(generated))} UTC</span></span>`
       : `<span>DATA AS OF ${esc(String(generated).slice(0, 16).replace('T', ' '))} UTC</span>
       <span class="status-sep" aria-hidden="true">&middot;</span>
-      <span class="settled-badge">SETTLED HISTORY</span>`
+      <span class="settled-badge">archived day</span>`
 
     const catCounts = new Map()
     for (const e of rows) {
@@ -2387,6 +2441,7 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
     <div class="timeline-bulk-toggle">
       <button type="button" class="timeline-bulk-btn" data-bulk="expand">[expand all]</button>
       <button type="button" class="timeline-bulk-btn" data-bulk="collapse">[collapse all]</button>
+      <button type="button" class="timeline-bulk-btn" id="notable-toggle" aria-pressed="false" title="Show only notable and major entries; hides minor rows and churn. Saved on this device.">[notable only]</button>
       <button type="button" class="timeline-bulk-btn timeline-reading-mode-btn" data-reading-mode title="Toggle Plain English reading mode (hides technical diffs and details, focusing on plain-language summaries)">[plain english: off]</button>
     </div>
   </div>`
@@ -2410,7 +2465,7 @@ ${[
     <p class="filter-note" data-hub="/archive/#categories">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page &middot; <span id="filter-all"><a href="/archive/#categories">browse all changes by category</a></span></p>
   </div>`
 
-    // The relay made visible (newest day only; older days are settled history):
+    // The relay made visible (newest day only; older days are archived history):
     // one freshness line the shell ticker ages; the telemetry counts and the
     // raw build status ride behind the single [status] link (/stats/ and
     // /api/status.json, one click away).
@@ -2432,13 +2487,14 @@ ${[
 </section>`
     // The settled day's digest, written by the roll-up pass and read here
     // as-is. A day still in progress has none: the box is simply absent rather
-    // than showing a partial list that will change by evening.
+    // than showing a partial list that will change by evening. It sits above
+    // the entries as the read-first summary of the day.
     const dayRollup = rollups[day.day]
     const rollupHtml = dayRollup?.bullets?.length
       ? `
-<section class="day-rollup" aria-label="Day summary">
+<section class="day-rollup" aria-label="Day summary: read this first">
 <div class="day-rollup-hdr">
-  <span class="day-rollup-label">DAY_ROLLUP :: ${esc(fmtDateHuman(day.day))}</span>
+  <span class="day-rollup-label">READ THIS FIRST :: ${esc(fmtDateHuman(day.day))}</span>
   <span class="day-rollup-count">${dayRollup.bullets.length} highlight${dayRollup.bullets.length === 1 ? '' : 's'}</span>
 </div>
 <ul>${dayRollup.bullets.map(b => `<li>${esc(b)}</li>`).join('')}</ul>
@@ -2457,20 +2513,76 @@ ${[
     const churnOnlyNotice = (real === 0 && churn > 0)
       ? `\n<p class="day-churn-only">Only churn was recorded this day &mdash; ${churn} commit${churn === 1 ? '' : 's'} (${esc(churnDesc)}), nothing that changes the product. Use the <strong>churn</strong> filter above to see them.</p>`
       : ''
-    let notYetOpen = true
+    // Tiered day: the rollup (above) reads first, then notable/security entries
+    // as full cards, then every minor entry as one dense row under its area
+    // header. Minor bodies stay in the DOM inside a collapsed <details> -- one
+    // renderer, no fetch, no-JS still reads everything -- so expanding in place
+    // is native disclosure, not a second code path.
+    const effSig = (e) => e.ai?.significance || e.significance || 'minor'
+    const isLeadEntry = (e) => !e.noise && (effSig(e) === 'major' || effSig(e) === 'notable' || isSecurityEntry(e))
+    const leadEntries = []
+    const minorByArea = new Map()
+    const churnEntries = []
+    for (const e of rows) {
+      if (e.noise) { churnEntries.push(e); continue }
+      if (isLeadEntry(e)) leadEntries.push(e)
+      else {
+        const area = (e.areas && e.areas[0]) || 'Other'
+        if (!minorByArea.has(area)) minorByArea.set(area, [])
+        minorByArea.get(area).push(e)
+      }
+    }
+    const minorCount = [...minorByArea.values()].reduce((n, l) => n + l.length, 0)
+    // The newest lead entry starts open. A day of nothing but minor rows leaves
+    // them closed -- the rollup above is the read-first content either way.
+    let leadOpen = true
+    const leadHtml = leadEntries.map(e => {
+      const open = leadOpen
+      leadOpen = false
+      return entryCard(e, open, relatedIdx, cardOpts(e))
+    }).join('\n')
+    const minorRowHtml = (e) => {
+      const anchor = e.sha.slice(0, 12)
+      const time = e.date.slice(11, 16)
+      const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
+      // The row keeps the #sha anchor; the embedded card drops its id so the
+      // document never holds two elements with the same one.
+      const card = entryCard(e, false, relatedIdx, cardOpts(e)).replace(` id="${anchor}"`, '')
+      return `<details class="minor-row" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(e.significance || '')}" data-aud="${esc(e.ai?.audience || '')}">
+<summary class="minor-summary"><span class="entry-arrow">&gt;</span><span class="entry-utc" title="${esc(e.date.slice(0, 16).replace('T', ' ') + ' UTC')}">${esc(time)}</span><span class="minor-title">${title}</span><span class="badges">${badges(e)}</span></summary>
+<div class="minor-body">${card}</div>
+</details>`
+    }
+    const minorGroups = [...minorByArea.entries()]
+      .sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]))
+      .map(([area, list]) => `<div class="minor-group" data-area="${esc(categorySlug(area))}">
+  <h3 class="minor-group-hdr">${esc(area)} <span class="minor-count">${list.length}</span></h3>
+  <div class="minor-rows">${list.map(minorRowHtml).join('\n')}</div>
+</div>`).join('\n')
+    const churnHtml = churnEntries.map(e => entryCard(e, false, relatedIdx, cardOpts(e, { hideChurn: true }))).join('\n')
+    // Tier headers only when there is more than one tier to tell apart; a day
+    // that is all-notable or all-minor needs no scaffolding.
+    const tierHdr = (label, n) => `<div class="section-hdr tier-hdr"><h2>${label} (${n})</h2></div>`
     const dayHtml = `<section class="day" id="${day.day}">
 <div class="day-line">
   <h2><time datetime="${day.day}">[ ${esc(fmtDateHuman(day.day))} ]</time></h2>
   <span class="day-count">${real} change${real === 1 ? '' : 's'}${churn ? ` <span class="day-churn">+${churn} churn</span>` : ''}</span>
 </div>${churnOnlyNotice}
 ${dayStories(storyIdx, day.day).map(cluster => dayLeadHtml([cluster])).join('')}
-${rows.map(e => {
-      const open = notYetOpen && !e.noise
-      if (open) notYetOpen = false
-      return entryCard(e, open, relatedIdx, cardOpts(e, { hideChurn: true }))
-    }).join('\n')}</section>`
+${leadEntries.length && minorCount ? tierHdr('NOTABLE & SECURITY', leadEntries.length) : ''}
+${leadHtml}
+${minorCount && leadEntries.length ? tierHdr('EVERYTHING ELSE', minorCount) : ''}
+${minorGroups}
+${churnHtml}</section>`
 
-    return hero + rollupHtml + dayHtml + pagePager(i)
+    // Homepage onboarding: the front page is the newest day, and nothing on it
+    // said what Freebuff is or what this site is. Two sentences and a link to
+    // the about page that already answers the rest.
+    const homeIntro = latest ? `<section class="home-intro" aria-label="About this site">
+<p>Freebuff is the AI coding assistant built in the public <a href="https://github.com/CodebuffAI/freebuff" target="_blank" rel="noopener">CodebuffAI/freebuff</a> repo. This site is an unofficial, fully automated changelog of that repo: an AI model summarizes every commit from its diff, and every claim links back to the code. <a href="/about/">How it is built &rarr;</a></p>
+</section>` : ''
+
+    return homeIntro + hero + rollupHtml + dayHtml + pagePager(i)
   }
 
   // Front-page filter. Every row the timeline can show is already in the DOM, so a
@@ -2488,7 +2600,11 @@ ${rows.map(e => {
   var KEY = 'fbIndexFilter';
   var sel = document.getElementById('filter-select');
   var churnBtn = document.getElementById('churn-toggle');
-  var rows = [].slice.call(document.querySelectorAll('details.entry'));
+  var notableBtn = document.getElementById('notable-toggle');
+  // Top-level rows only: a minor row embeds its full card, and the embedded
+  // copy must not count (or filter) as a row of its own.
+  var rows = [].slice.call(document.querySelectorAll('details.entry, details.minor-row'))
+    .filter(function (r) { return !r.closest('details.minor-row') || r.classList.contains('minor-row'); });
   var days = [].slice.call(document.querySelectorAll('section.day'));
   var countEl = document.getElementById('filter-count');
   var noteEl = document.querySelector('.filter-note em');
@@ -2497,10 +2613,10 @@ ${rows.map(e => {
   var HUB = (noteWrap && noteWrap.getAttribute('data-hub')) || '/archive/#categories';
   var SIG = { major: 1, notable: 1, minor: 1 };
   function optFor(v) { return sel ? sel.querySelector('option[value="' + v + '"]') : null }
-  var state = { filter: '*', churn: false };
+  var state = { filter: '*', churn: false, notable: false };
   try {
     var stored = JSON.parse(localStorage.getItem(KEY) || 'null');
-    if (stored && typeof stored.filter === 'string') state = { filter: stored.filter, churn: !!stored.churn };
+    if (stored && typeof stored.filter === 'string') state = { filter: stored.filter, churn: !!stored.churn, notable: !!stored.notable };
   } catch (e) {}
 
   function apply(save) {
@@ -2514,22 +2630,27 @@ ${rows.map(e => {
       else if (SIG[f]) want = r.getAttribute('data-sig') === f;
       else if (f.indexOf('aud:') === 0) want = r.getAttribute('data-aud') === f.slice(4);
       else want = r.getAttribute('data-cat') === f;
+      // Notable-only hides the minor tier and churn outright; it composes with
+      // the area/impact/audience filter above.
+      if (state.notable && (r.classList.contains('minor-row') || r.hasAttribute('data-churn'))) want = false;
       r.hidden = !want;
     });
     days.forEach(function (d) {
       // A churn-only day keeps its section visible even while every row is
       // hidden, because then the .day-churn-only notice is the only thing the
       // reader has to read; hiding the section would hide the explanation too.
-      d.hidden = !d.querySelector('details.entry:not([hidden])') && !d.querySelector('.day-churn-only');
+      d.hidden = !d.querySelector('details.entry:not([hidden]), details.minor-row:not([hidden])') && !d.querySelector('.day-churn-only');
     });
     // A #sha link must land on something the reader can see, even when the
     // filter would have hidden that row: revealing one entry (and its day) beats
-    // a URL that appears to go nowhere.
+    // a URL that appears to go nowhere. A minor row opens so the entry is read,
+    // not just its one-line summary.
     var hash = (location.hash || '').slice(1);
     if (hash) {
       var target = document.getElementById(hash);
-      if (target && target.classList && target.classList.contains('entry')) {
+      if (target && target.classList && (target.classList.contains('entry') || target.classList.contains('minor-row'))) {
         target.hidden = false;
+        if (target.tagName === 'DETAILS') target.open = true;
         var parent = target.closest ? target.closest('section.day') : null;
         if (parent) parent.hidden = false;
       }
@@ -2566,6 +2687,11 @@ ${rows.map(e => {
       churnBtn.classList.toggle('active', state.churn);
       churnBtn.setAttribute('aria-pressed', state.churn ? 'true' : 'false');
     }
+    if (notableBtn) {
+      notableBtn.classList.toggle('active', state.notable);
+      notableBtn.setAttribute('aria-pressed', state.notable ? 'true' : 'false');
+      notableBtn.textContent = state.notable ? '[notable only: on]' : '[notable only]';
+    }
     if (countEl) countEl.textContent = shown;
     if (noteEl) {
       var churnRows = rows.filter(function (r) { return r.hasAttribute('data-churn') }).length;
@@ -2579,6 +2705,7 @@ ${rows.map(e => {
 
   if (sel) sel.addEventListener('change', function () { state.filter = sel.value || '*'; apply(true); });
   if (churnBtn) churnBtn.addEventListener('click', function () { state.churn = !state.churn; apply(true); });
+  if (notableBtn) notableBtn.addEventListener('click', function () { state.notable = !state.notable; apply(true); });
   apply(false);
 })();
 </script>`
@@ -2626,15 +2753,30 @@ ${rows.map(e => {
 
   // ----- release pages (ranges precomputed once, pages written in parallel)
   const verMap = new Map()
-  for (const e of releases) verMap.set(e.version, e)
+  for (const e of releases) verMap.set(relVersionOf(e), e)
   const vers = [...verMap.values()]
   vers.sort((a, b) => a.date < b.date ? -1 : 1)
-  const relRanges = vers.map((rel, i) => {
-    const lo = i > 0 ? vers[i - 1].date : '0000'
+  // A release window stops at the previous bump of the *same* line: the two
+  // lines interleave constantly, so a single date-sorted walk would hand a
+  // 0.2.x page the 1.0.x line's window (and vice versa). Pager neighbours stay
+  // inside the line for the same reason.
+  const prevRelOf = new Map(), nextRelOf = new Map()
+  for (const track of ['codebuff-cli', 'freebuff-cli']) {
+    const line = vers.filter(r => relTrackOf(r) === track).sort((a, b) => a.date < b.date ? -1 : 1)
+    line.forEach((rel, i) => {
+      prevRelOf.set(rel.sha, i > 0 ? line[i - 1] : null)
+      nextRelOf.set(rel.sha, i < line.length - 1 ? line[i + 1] : null)
+    })
+  }
+  const relRangeOf = (rel) => {
+    const prev = prevRelOf.get(rel.sha)
+    const lo = prev ? prev.date : '0000'
     return entries.filter(e => e.date > lo && e.date <= rel.date && e.sha !== rel.sha)
-  })
-  await pool(vers.map((rel, i) => async () => {
-    const mine = relRanges[i]
+  }
+  await pool(vers.map((rel) => async () => {
+    const version = relVersionOf(rel)
+    const lineName = relLineName(rel)
+    const mine = relRangeOf(rel)
     // A release that shipped a month of work owns 1,000+ commits, and 1,000+ full
     // entry cards is a 2.6 MB page nobody scrolls. The newest 40 keep the full
     // card (body, files, diff toggle); the rest become the compact rows the
@@ -2646,22 +2788,22 @@ ${rows.map(e => {
     const relTailRows = relTail.length
       ? `<details class="more-rows"><summary>[ ${relTail.length.toLocaleString()} earlier commits in this release ]</summary>${relTail.map(changeRow).join('\n')}</details>`
       : ''
-    const prevRel = i > 0 ? vers[i - 1] : null
-    const nextRel = i < vers.length - 1 ? vers[i + 1] : null
+    const prevRel = prevRelOf.get(rel.sha)
+    const nextRel = nextRelOf.get(rel.sha)
     const relPager = `<div class="pager">` +
-      (prevRel ? `<a href="/release/${prevRel.version}/" rel="prev">&larr; v${esc(prevRel.version)}</a>` : '<span class="pager-disabled">&larr;</span>') +
-      (nextRel ? `<a href="/release/${nextRel.version}/" rel="next">v${esc(nextRel.version)} &rarr;</a>` : '<span class="pager-disabled">&rarr;</span>') +
+      (prevRel ? `<a href="/release/${relVersionOf(prevRel)}/" rel="prev">&larr; v${esc(relVersionOf(prevRel))}</a>` : '<span class="pager-disabled" title="No older release on this line">&larr;<span class="sr-only"> no older release</span></span>') +
+      (nextRel ? `<a href="/release/${relVersionOf(nextRel)}/" rel="next">v${esc(relVersionOf(nextRel))} &rarr;</a>` : '<span class="pager-disabled" title="No newer release on this line">&rarr;<span class="sr-only"> no newer release</span></span>') +
       `</div>`
     const relNotesMd = generateReleaseNotesMarkdown(rel, mineSorted)
     // The markdown is a real file too: `?format=md` on the page URL serves it
     // with a text/markdown content type (worker.js / preview), and anything
     // that just wants the notes can fetch notes.md directly.
-    await write(dist, `release/${rel.version}/notes.md`, relNotesMd)
-    await write(dist, `release/${rel.version}/index.html`, layout({
-      title: `Release ${rel.version}`, path: `/release/${rel.version}/`,
-      desc: `Freebuff v${rel.version}: ${mine.length} changes since the previous release.`,
+    await write(dist, `release/${version}/notes.md`, relNotesMd)
+    await write(dist, `release/${version}/index.html`, layout({
+      title: `Release ${version}`, path: `/release/${version}/`,
+      desc: `${lineName} v${version}: ${mine.length} changes since the previous release.`,
       ld: releaseLd(rel),
-      body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(rel.version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Freebuff v${esc(rel.version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p><div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button type="button" class="btn-copy-relnotes" onclick="navigator.clipboard.writeText(document.getElementById('relnotes-md').value).then(()=>{const b=this;b.textContent='[copied: paste into GitHub release]';setTimeout(()=>b.textContent='[copy release notes]',3000)})">[copy release notes]</button><a class="meta-link" href="/release/${esc(rel.version)}/notes.md" title="Release notes as plain markdown">[notes.md]</a><a class="meta-link" href="?format=md" title="Same notes served as text/markdown for tools and feeds">[?format=md]</a><textarea id="relnotes-md" hidden style="display:none">${esc(relNotesMd)}</textarea></div></div></section>` +
+      body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">${esc(lineName)} v${esc(version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p><div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button type="button" class="btn-copy-relnotes" onclick="navigator.clipboard.writeText(document.getElementById('relnotes-md').value).then(()=>{const b=this;b.textContent='[copied: paste into GitHub release]';setTimeout(()=>b.textContent='[copy release notes]',3000)})">[copy release notes]</button><a class="meta-link" href="/release/${esc(version)}/notes.md" title="Release notes as plain markdown">[notes.md]</a><a class="meta-link" href="?format=md" title="Same notes served as text/markdown for tools and feeds">[?format=md]</a><textarea id="relnotes-md" hidden style="display:none">${esc(relNotesMd)}</textarea></div></div></section>` +
         relPager +
         `<section class="day">${[rel, ...relHead].map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx, cardOpts(e))).join('\n')}${relTailRows}</section>` +
         relPager +
@@ -2671,6 +2813,10 @@ ${rows.map(e => {
 
   // ----- models timeline (catalog history: current lineup, retired, per-change rows)
   const { chrono: modelChrono, live: modelLive, retired: modelRetired } = modelTimeline(modelEntries)
+  // Catalog moves, not rows: one entry can swap several models at once, and the
+  // /stats/ MOST-CHANGED MODELS card counts the same way (one add/remove each),
+  // so the two pages must agree on this number.
+  const modelMoves = modelChrono.reduce((n, e) => n + (e.modelChanges?.added?.length || 0) + (e.modelChanges?.removed?.length || 0), 0)
   const modelLink = (m, cls, sign) => `<a class="${cls}" href="/models/${modelSlug(m)}/">${sign}${esc(m)}</a>`
   const modelCard = (m, cls, tag) => `<a class="model-card ${cls}" href="/models/${modelSlug(m)}/"><span class="mc-tag">${tag}</span>${esc(m)}</a>`
   const modelRows = modelChrono.map(e => {
@@ -2857,7 +3003,7 @@ ${rows.map(e => {
 
   await write(dist, 'models/index.html', layout({
     title: 'Models', path: '/models/',
-    desc: `Free model catalog history: ${modelLive.length} live, ${modelRetired.length} retired across ${modelChrono.length} changes.`,
+    desc: `Free model catalog history: ${modelLive.length} live, ${modelRetired.length} retired, ${modelMoves} catalog moves.`,
     body: `<section class="hero">
   <div class="term-box">
     <div class="term-box-hdr">
@@ -2890,7 +3036,7 @@ ${rows.map(e => {
       <div><strong>CATALOG DATE SCRUBBER:</strong> <span id="matrix-selected-date" class="matrix-date-display">${dateSnapshots.at(-1)?.date || ''}</span></div>
       <div id="matrix-active-count" class="matrix-active-count">${modelLive.length} models active</div>
     </div>
-    <input type="range" id="matrix-slider" class="matrix-slider" min="0" max="${Math.max(0, dateSnapshots.length - 1)}" value="${Math.max(0, dateSnapshots.length - 1)}">
+    <input type="range" id="matrix-slider" class="matrix-slider" min="0" max="${Math.max(0, dateSnapshots.length - 1)}" value="${Math.max(0, dateSnapshots.length - 1)}" aria-label="Catalog date scrubber: scrub through catalog snapshots over time">
     <div id="matrix-selected-event" class="matrix-selected-event"></div>
   </div>
   <div class="model-matrix-table">
@@ -2903,9 +3049,9 @@ ${([...familyOf.entries()].filter(([, ms]) => ms.length > 1).length) ? `<details
   <div class="model-history">${[...familyOf.entries()].filter(([, ms]) => ms.length > 1).map(([fam]) => `<div class="model-row"><span class="model-row-title"><a href="/models/lineage/${esc(categorySlug(fam))}/">${esc(fam)}</a></span><span class="model-row-change">${lineageChainHtml(fam)}</span></div>`).join('')}</div>
 </details>` : ''}
 <details class="more-rows">
-  <summary>[ View chronological transition stream (${modelChrono.length} changes) ]</summary>
+  <summary>[ View chronological transition stream (${modelMoves} catalog moves) ]</summary>
   <div class="section-hdr" style="margin-top:12px">
-    <h2>CATALOG HISTORY (${modelChrono.length} CHANGES)</h2>
+    <h2>CATALOG HISTORY (${modelMoves} MOVES)</h2>
   </div>
   <div class="model-history">${modelRows}</div>
 </details>
@@ -3203,7 +3349,7 @@ ${d.entries.map(changeRow).join('\n')}
   // A release is a number and a date; it never needed a card. Day-of-month only
   // -- the month is the heading of the section it sits in.
   const relBody = (list) => `<div class="rel-chips">${list.map(v =>
-    `<a class="rel-chip" href="/release/${esc(v.version)}/" title="${esc(v.date.slice(0, 10))}"><b>${esc(v.version)}</b><span>${v.date.slice(8)}</span></a>`).join('')}</div>`
+    `<a class="rel-chip" href="/release/${esc(relVersionOf(v))}/" title="${esc(v.date.slice(0, 10))}"><b>${esc(relVersionOf(v))}</b><span>${v.date.slice(8)}</span></a>`).join('')}</div>`
 
   const daysByMonth = groupByMonth(byDay, d => d.day.slice(0, 7))
   const relDesc = [...vers].reverse()
@@ -3214,7 +3360,7 @@ ${d.entries.map(changeRow).join('\n')}
       return `${days.length} day${days.length === 1 ? '' : 's'} &middot; ${n.toLocaleString()} change${n === 1 ? '' : 's'}`
     }, dayBody)
   const relSections = monthSections(relByMonth, 'rel',
-    (list) => `${list.length} release${list.length === 1 ? '' : 's'} &middot; ${esc(list.at(-1).version)} &rarr; ${esc(list[0].version)}`,
+    (list) => `${list.length} release${list.length === 1 ? '' : 's'} &middot; ${esc(relVersionOf(list.at(-1)))} &rarr; ${esc(relVersionOf(list[0]))}`,
     relBody)
 
   const archiveTabs = `<nav class="archive-tabs" id="archive-tabs" aria-label="Choose which list the archive shows">
@@ -3295,7 +3441,7 @@ ${d.entries.map(changeRow).join('\n')}
   ${daySections}
 </div>
 <div class="aview" data-view="rel" id="releases">
-  <p class="list-note">Every release page, newest first. Each version links to the commits between it and the version before.</p>
+  <p class="list-note">Every release page, newest first. Each version links to the commits between it and the version before. Two version lines ship from this repo: 1.0.x is the codebuff CLI package (cli/release/package.json), 0.2.x is the Freebuff app CLI (freebuff/cli/release/package.json) -- each line has its own release pages and windows.</p>
   <div class="section-hdr"><h2>RELEASES BY MONTH (${vers.length})</h2></div>
   ${relSections}
 </div>
@@ -3383,9 +3529,9 @@ ${archiveScript}`
     const range = formatWeekRange(w.monday, w.sunday)
 
     const pager = `<div class="pager">` +
-      (older ? `<a href="${weekHref(older)}" rel="prev">&larr; ${esc(older.key)}</a>` : '<span class="pager-disabled">&larr;</span>') +
+      (older ? `<a href="${weekHref(older)}" rel="prev">&larr; ${esc(older.key)}</a>` : '<span class="pager-disabled" title="No older week">&larr;<span class="sr-only"> no older week</span></span>') +
       `<span class="pager-page">WEEK ${esc(w.key)} &middot; ${esc(range)}</span>` +
-      (newer ? `<a href="${weekHref(newer)}" rel="next">${esc(newer.key)} &rarr;</a>` : '<span class="pager-disabled">&rarr;</span>') +
+      (newer ? `<a href="${weekHref(newer)}" rel="next">${esc(newer.key)} &rarr;</a>` : '<span class="pager-disabled" title="No newer week">&rarr;<span class="sr-only"> no newer week</span></span>') +
       `</div>`
 
     const tabs = []
@@ -3738,46 +3884,48 @@ ${weekTabsScript}`
       <span class="term-box-title">QUERY_ENGINE :: Unofficial Freebuff Changelog</span>
       <span>${entries.length.toLocaleString()} indexed entries</span>
     </div>
+    <form id="search-form" method="get" action="/search/" role="search">
     <div class="search-input-row">
       <span class="search-prompt">$ grep -i</span>
-      <input id="q" type="search" placeholder="muse, claude, CLI…" autocomplete="off" autofocus>
+      <input id="q" name="q" type="search" placeholder="muse, claude, CLI…" autocomplete="off" autofocus>
       <span class="search-hint">[press / to focus]</span>
     </div>
     <div class="filter-chips">
       <span class="filter-lbl" title="Quick searches: each chip sets the matching filter below (or the query where no filter exists)">QUICK:</span>
-      <button class="filter-chip active" data-filter="" title="Clear every filter and the query">--all</button>
-      <button class="filter-chip" data-cat="Model Catalog" title="Category filter: model catalog changes">--models</button>
-      <button class="filter-chip" data-sig="major" title="Impact filter: major only">--major</button>
-      <button class="filter-chip" data-flags="1" title="Release filter: version bumps">--releases</button>
-      <button class="filter-chip" data-cat="CLI" title="Category filter: CLI">--cli</button>
-      <button class="filter-chip" data-cat="Commands" title="Category filter: commands">--commands</button>
-      <button class="filter-chip" data-q="prompt" title="Quick query: prompt work">--prompt</button>
-      <button class="filter-chip" data-q="desktop" title="Quick query: desktop app">--desktop</button>
+      <button type="button" class="filter-chip active" data-filter="" title="Clear every filter and the query">--all</button>
+      <button type="button" class="filter-chip" data-cat="Model Catalog" title="Category filter: model catalog changes">--models</button>
+      <button type="button" class="filter-chip" data-sig="major" title="Impact filter: major only">--major</button>
+      <button type="button" class="filter-chip" data-flags="1" title="Release filter: version bumps">--releases</button>
+      <button type="button" class="filter-chip" data-cat="CLI" title="Category filter: CLI">--cli</button>
+      <button type="button" class="filter-chip" data-cat="Commands" title="Category filter: commands">--commands</button>
+      <button type="button" class="filter-chip" data-q="prompt" title="Quick query: prompt work">--prompt</button>
+      <button type="button" class="filter-chip" data-q="desktop" title="Quick query: desktop app">--desktop</button>
     </div>
     <div class="filter-row">
       <label class="filter-sel-lbl">CATEGORY:
-        <select id="fcat">
+        <select id="fcat" name="cat">
           <option value="">--all categories</option>
           ${SEARCH_CATS.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('')}
         </select>
       </label>
       <label class="filter-sel-lbl">IMPACT:
-        <select id="fsig">
+        <select id="fsig" name="sig">
           <option value="">--all levels</option>
           <option value="major">major only</option>
           <option value="notable">notable + major</option>
         </select>
       </label>
       <label class="filter-sel-lbl">AUDIENCE:
-        <select id="faud">
+        <select id="faud" name="aud">
           <option value="">--any audience</option>
           ${AUDIENCES.map(a => `<option value="${esc(a)}">${esc(a)}</option>`).join('')}
           <option value="unset">--not yet classified</option>
         </select>
       </label>
-      <label class="filter-sel-lbl"><input type="checkbox" id="frel"> releases only</label>
+      <label class="filter-sel-lbl"><input type="checkbox" id="frel" name="releases" value="1"> releases only</label>
       <span id="match-count" role="status" aria-live="polite" style="font-size:.76rem;color:var(--txt-subtle);margin-left:auto;align-self:center"></span>
     </div>
+    </form>
     <p class="search-idle">Results appear as you type, scoped by the filters above. Try <b>muse</b>, <b>cat:cli</b>, <b>is:release</b>, <b>aud:end-users</b> or <b>&quot;exact phrase&quot;</b>.</p>
     <details class="search-help">
       <summary>query syntax &mdash; everything the box understands</summary>
@@ -4083,6 +4231,11 @@ const loadIndex = async () => {
     c.classList.toggle('active', !!on);
   });
   syncChips();
+  // The controls live in a GET form so a no-JS submit (or Enter before the
+  // index arrives) reaches the worker's server-rendered results; once the
+  // index is here the submit stays client-side.
+  const form = document.getElementById('search-form');
+  if (form) form.addEventListener('submit', (e) => { e.preventDefault(); syncChips(); go(); });
   // Anything typed while the index was in flight still has to render: the
   // handlers that turn a keystroke into results only exist once it has arrived.
   if (q.value.trim()) go();
@@ -4580,13 +4733,17 @@ function escInFlight (s) {
           body.innerHTML = comments.map(function(c){
             var author = (c.user && c.user.login) ? c.user.login : 'user';
             var date = (c.created_at || '').slice(0, 16).replace('T', ' ');
-            var text = (c.body || '').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/[\\u{1F300}-\\u{1FAFF}]/gu, '');
+            // Comment bodies are the least trustworthy field in this panel: they
+            // go through the same escaper as every other API field (escInFlight
+            // covers quotes and ampersands too, not just angle brackets), and
+            // line breaks become <br> only after escaping.
+            var text = escInFlight((c.body || '').replace(/[\\u{1F300}-\\u{1FAFF}]/gu, '')).replace(/\\n/g, '<br>');
             return '<div class="pr-comment-row">' +
               '<div class="pr-comment-hdr">' +
                 '<span class="pr-comment-author">@' + escInFlight(author) + '</span>' +
                 '<a href="' + escInFlight(c.html_url || '') + '" target="_blank" rel="noopener" class="pr-comment-time">' + escInFlight(date) + '</a>' +
               '</div>' +
-              '<div class="pr-comment-body">' + text.replace(/\\n/g, '<br>') + '</div>' +
+              '<div class="pr-comment-body">' + text + '</div>' +
             '</div>';
           }).join('');
         }
@@ -4912,7 +5069,7 @@ ctx.hidden = false
   // ----- sitemap index (day pages change daily, release/pages rarely)
   const urlset = (urls) => `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.map(u => `<url><loc>${SITE.url}${u}</loc></url>`).join('')}</urlset>`
   const dayUrls = byDay.map(d => `/day/${d.day}/`)
-  const relUrls = vers.map(v => `/release/${v.version}/`)
+  const relUrls = vers.map(v => `/release/${relVersionOf(v)}/`)
   const lineageUrls = [...familyOf.entries()].filter(([, ms]) => ms.length > 1).map(([fam]) => `/models/lineage/${categorySlug(fam)}/`)
   const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`), ...lineageUrls]
   const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/week/', '/subscribe/', '/range/', '/api/', '/in-flight/', ...weeks.slice(0, 52).map(w => `/week/${w.key}/`), ...browseMonthUrls]
