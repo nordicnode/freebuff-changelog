@@ -1848,11 +1848,38 @@ test('worker /c/<sha>: 302s to the entry\'s day page, unknown shas fall through'
   assert.notEqual(unknown.status, 302, 'an unknown sha falls through to the /c/ shell, not a redirect')
 })
 
-// Every version badge used to link /release/<v>/ unconditionally, but only the
-// cli/release line gets a page: a freebuff/cli/release bump stores
-// `freebuffVersion` and deliberately writes none (VERSION_TRACKS in
-// analyze.mjs), so eleven 0.0.x links across the week pages and the model
-// lineage were 404s. The link is optional; the version is not.
+// The /week/ index once dropped weeks that had detail pages (W27/W28 were
+// seen missing while /week/2026-W27/ existed). The index and the detail pages
+// are built from the same digest list, so every emitted week must be listed;
+// the year tabs are the affordance that reaches older weeks.
+test('week index lists every week that gets a detail page', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-weeks-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const entry = (sha, date) => ({
+    kind: 'sync', sha, date, day: date.slice(0, 10), month: date.slice(0, 7), author: 'dev',
+    areas: ['CLI'], category: 'CLI', significance: 'minor', summary: 't', title: 't ' + sha.slice(0, 6),
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/src/x.ts'] },
+    stats: { additions: 5, deletions: 1 }
+  })
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-10-06T00:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 4 },
+    entries: [
+      entry('a1'.repeat(20), '2026-06-23T10:00:00Z'), // 2026-W26
+      entry('b2'.repeat(20), '2026-06-30T10:00:00Z'), // 2026-W27
+      entry('c3'.repeat(20), '2026-07-07T10:00:00Z'), // 2026-W28
+      entry('d4'.repeat(20), '2026-07-14T10:00:00Z') // 2026-W29
+    ]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const idx = await readFile(join(dist, 'week/index.html'), 'utf8')
+  for (const w of ['2026-W26', '2026-W27', '2026-W28', '2026-W29']) {
+    assert.match(idx, new RegExp(`week/${w}/`), `${w} is listed in the index`)
+    await readFile(join(dist, `week/${w}/index.html`), 'utf8')
+  }
+  assert.match(idx, /data-year="all"/, 'an ALL WEEKS tab reaches every year group')
+  assert.match(idx, /data-year="2026"/, 'a per-year tab reaches older weeks')
+})
 // Both version lines get release pages now: the 1.0.x codebuff-cli line and
 // the 0.x freebuff-cli line (VERSION_TRACKS in analyze.mjs). A badge that names
 // a version must never point at a page the build did not write.
