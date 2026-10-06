@@ -4449,16 +4449,15 @@ const loadIndex = async () => {
           </ul>
         </div>
 
-        <div class="man-sec">
-          <h4>STATUS BADGES</h4>
-          <div class="man-badges">
-            <img src="/badge/version.svg" alt="Version">
-            <img src="/badge/models.svg" alt="Models">
-            <img src="/badge/status.svg" alt="Status">
-            <img src="/badge/changes.svg" alt="Changes">
-            <img src="/badge/clones.svg" alt="Clones">
-          </div>
-        </div>
+      </div>
+
+      <h4>STATUS BADGES</h4>
+      <div class="man-badges">
+        <img src="/badge/version.svg" alt="Version">
+        <img src="/badge/models.svg" alt="Models">
+        <img src="/badge/status.svg" alt="Status">
+        <img src="/badge/changes.svg" alt="Changes">
+        <img src="/badge/clones.svg" alt="Clones">
       </div>
 
       <h4>LIMITS &amp; FRESHNESS</h4>
