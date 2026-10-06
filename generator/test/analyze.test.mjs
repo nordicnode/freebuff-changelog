@@ -8,6 +8,7 @@ import {
   areaOf, isNoiseFile, deterministicSummary, entryTitle, churnLabel, testLabel, sourceRef, isSyncCommit,
   extractCommentFacts, extractCleanDiff, extractRawDiff, extractFileHeaders, EMPTY_TREE, parseMarkdownTables, catalogFromReadme,
   diffCatalogs, commitNatureOf, analyzeCommunityCommit, analyzeSyncCommit,
+  extractStructuredFacts, formatStructuredFacts,
   MONOREPO_COMPONENTS, formatArchitectureMap, discoverMonorepoArchitecture,
   findFileHistory, extractFullOrOutlinedFiles, extractSubsystemDocs,
   extractConsumerContext, introducedSymbols, distinctiveSymbols
@@ -922,3 +923,52 @@ test('extractFullOrOutlinedFiles: a budget sends oversized files whole without c
 })
 
 
+
+test('extractStructuredFacts: drops test titles with unformatted printf placeholders and empty names', () => {
+  const patch = [
+    'diff --git a/cli/src/__tests__/fmt.test.ts b/cli/src/__tests__/fmt.test.ts',
+    '@@ -1,3 +1,10 @@',
+    "+describe('formatter', () => {",
+    "+  it('%s is Pacific day %s', () => {})",
+    "+  it('(%j, %j) answers exactly a === b', () => {})",
+    "+  it('pads %5d to width five', () => {})",
+    "+  it('escapes %% in the label text', () => {})",
+    "+  it('reports 100% coverage of branches', () => {})",
+    "+  it('retries the request on timeout', () => {})",
+    "+  it('        ', () => {})",
+    '+})'
+  ].join('\n')
+  const s = extractStructuredFacts(patch)
+  // The printf-style titles were written for a formatter that never ran: they
+  // would render literally on the site ("- %s is Pacific day %s"). A bare `%`
+  // followed by a space is ordinary prose and stays.
+  assert.deepEqual(s.testNames, ['formatter', 'reports 100% coverage of branches', 'retries the request on timeout'])
+})
+
+test('formatStructuredFacts: placeholder test titles never reach the prompt line', () => {
+  const structured = {
+    constants: [], constantsIntroduced: [], envVars: [], flags: [],
+    exportsAdded: [], exportsRemoved: [],
+    testNames: ['%s is Pacific day %s', '(%j, %j) answers exactly a === b', 'retries the request on timeout']
+  }
+  const joined = formatStructuredFacts(structured).join('\n')
+  assert.match(joined, /Behavior asserted by new tests/)
+  assert.doesNotMatch(joined, /%s is Pacific/)
+  assert.doesNotMatch(joined, /%j/)
+  assert.match(joined, /retries the request on timeout/)
+})
+
+test('deterministicSummary: bump entries drop printf-placeholder test titles from the homepage line', () => {
+  const e = {
+    freebuffVersion: '0.2.9',
+    files: { added: [], removed: [], renamed: [], modified: [], total: 1 },
+    areas: ['CLI'],
+    stats: { additions: 10, deletions: 2 },
+    structured: { testNames: ['%s is Pacific day %s', '(%j, %j) answers exactly a === b', 'retries the request on timeout'] }
+  }
+  const summary = deterministicSummary(e)
+  assert.match(summary, /Changed test assertions cover/)
+  assert.doesNotMatch(summary, /%s is Pacific/)
+  assert.doesNotMatch(summary, /%j/)
+  assert.match(summary, /retries the request on timeout/)
+})
