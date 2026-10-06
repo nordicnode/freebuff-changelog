@@ -2400,3 +2400,27 @@ test('polish: digest pagers label their disabled arrows, no SETTLED HISTORY jarg
   assert.doesNotMatch(older, /SETTLED HISTORY/, 'the jargon is gone from day pages')
   assert.match(older, /archived day/, 'older days say what they are in plain words')
 })
+
+test('/models renders catalog history and model names server-side, scrubber is labeled', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-modelsssr-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 1 },
+    entries: [{
+      kind: 'sync', sha: 'a1'.repeat(20), date: '2026-09-19T10:00:00Z', day: '2026-09-19', month: '2026-09', author: 'dev',
+      areas: ['CLI'], category: 'Model Catalog', significance: 'major', summary: 's', title: 'Model swap',
+      modelChanges: { added: ['Nebula Flash'], removed: ['Quasar Mini'] },
+      files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['README.md'] },
+      stats: { additions: 4, deletions: 2 }
+    }]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const html = await readFile(join(dist, 'models/index.html'), 'utf8')
+  // Strip scripts: what remains must already name the models and the history.
+  const noScripts = html.replace(/<script[\s\S]*?<\/script>/g, '')
+  assert.match(noScripts, /Nebula Flash/, 'added model name renders without JS')
+  assert.match(noScripts, /Quasar Mini/, 'removed model name renders without JS')
+  assert.match(noScripts, /CATALOG HISTORY/, 'the catalog history section renders without JS')
+  assert.match(html, /aria-label="Catalog date scrubber/, 'the date scrubber is named for assistive tech')
+})

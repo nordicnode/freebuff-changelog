@@ -3036,7 +3036,7 @@ ${churnHtml}</section>`
       <div><strong>CATALOG DATE SCRUBBER:</strong> <span id="matrix-selected-date" class="matrix-date-display">${dateSnapshots.at(-1)?.date || ''}</span></div>
       <div id="matrix-active-count" class="matrix-active-count">${modelLive.length} models active</div>
     </div>
-    <input type="range" id="matrix-slider" class="matrix-slider" min="0" max="${Math.max(0, dateSnapshots.length - 1)}" value="${Math.max(0, dateSnapshots.length - 1)}">
+    <input type="range" id="matrix-slider" class="matrix-slider" min="0" max="${Math.max(0, dateSnapshots.length - 1)}" value="${Math.max(0, dateSnapshots.length - 1)}" aria-label="Catalog date scrubber: scrub through catalog snapshots over time">
     <div id="matrix-selected-event" class="matrix-selected-event"></div>
   </div>
   <div class="model-matrix-table">
