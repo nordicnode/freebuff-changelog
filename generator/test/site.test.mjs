@@ -7,9 +7,10 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildSite, modelTimeline, modelSlug, scoreHit, discordText, renderBadgeSvg, generateReleaseNotesMarkdown, entryCard } from '../lib/site.mjs'
 import { loadChangelog } from '../lib/changelog-store.mjs'
-import { shortHash } from '../lib/util.mjs'
+import { escapeHtml, shortHash } from '../lib/util.mjs'
 import { feedItem, jsonItem } from '../lib/feed.mjs'
 import { syncStaleMs } from '../lib/sync.mjs'
+import { planAssetRetention } from '../lib/retention.mjs'
 
 // _headers rules cannot override each other on Cloudflare: every rule whose
 // pattern matches a URL is applied, and a header name set twice is *joined* with
@@ -321,6 +322,14 @@ test('buildSite generates valid static site output', async () => {
     assert.ok(searchHtml.includes(`const IX_V = '${shortHash(searchRaw)}';`), 'page carries the version matching the shipped index')
     assert.match(searchHtml, /indexedDB\.open\('fb-search'/, 'index is cached in IndexedDB')
     assert.ok(searchHtml.includes('loadIndex().then('), 'search boots through the cached loader, not a bare fetch chain')
+    // ...and boots it on first interest rather than on arrival. The index is the
+    // heaviest asset the site ships, so a reader who lands on /search/ to look at
+    // the box must not pay ~1.4 MB gzipped for it before they type; a deep link
+    // still resolves immediately because it is already a question.
+    assert.match(searchHtml, /let searchStarted = false;/, 'the index load sits behind a one-shot boot')
+    assert.match(searchHtml, /if \(eager\) \{\s*startSearch\(\);/, 'a deep link still boots without a keystroke')
+    assert.match(searchHtml, /addEventListener\(ev, startSearch, \{ once: true, passive: true \}\)/, 'and everything else waits for the reader')
+    assert.match(searchHtml, /\.catch\(err => \{/, 'a failed multi-MB fetch reports itself instead of vanishing')
     // The script is emitted from inside a generator template literal, where an
     // escaping slip ships a dead page silently: parse what actually shipped.
     const ixScript = [...searchHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]).find(s => s.includes('IX_V'))
@@ -331,11 +340,13 @@ test('buildSite generates valid static site output', async () => {
     // placeholder is *content* (the row grew past the box); text-size-adjust
     // because mobile browsers inflate type they judge small, and the base is 13.5px.
     assert.match(searchHtml, /#q\{[^}]*min-width:0/, 'the query input must shrink below its placeholder')
-    // The input inherited the 13.5px root (1rem) while the site's text runs
-    // .72-.82rem, so it was the largest type on the page. Pin it to the .82rem
-    // used by the models-page filter, and the prompt beside it with it.
-    assert.match(searchHtml, /#q\{[^}]*font-size:\.82rem/, 'the query input matches the site text scale')
-    assert.match(searchHtml, /\.search-prompt\{[^}]*font-size:\.82rem/, 'the prompt beside it matches too')
+    // The input inherited the 13.5px root (1rem) while the site's text ran
+    // .72-.82rem, so it was the largest type on the page. It is the page's
+    // primary control, so it sits at the .9rem the document prose uses -- one
+    // step above the .76rem body rows, and still below the .95rem plain-English
+    // line -- with the prompt beside it, so the row reads as one size.
+    assert.match(searchHtml, /#q\{[^}]*font-size:\.9rem/, 'the query input matches the site reading scale')
+    assert.match(searchHtml, /\.search-prompt\{[^}]*font-size:\.9rem/, 'the prompt beside it matches too')
     assert.match(searchHtml, /-webkit-text-size-adjust:100%/, 'no font boosting over the sheet')
     assert.match(searchHtml, /@media \(max-width:600px\)/, 'form controls go to 16px on phones so iOS does not zoom on focus')
     assert.doesNotMatch(searchHtml, /placeholder="regex/, 'the matcher is word-substring AND, not regex')
@@ -1893,4 +1904,115 @@ test('stats: the golden-set eval card renders, and says so when no run exists', 
   assert.match(html, /4\.40 \/ 5/, 'judge scores read on their own 1-5 scale')
   assert.match(html, /n=38/, 'every rate names the rows it scored')
   assert.doesNotMatch(html, /no run yet/, 'a run replaces the empty state')
+})
+
+// The retention contract, end to end. Retention is not only arithmetic: a row
+// whose stored diff gave way to the asset budget must render a card that says so
+// -- no viewer, no Ask control (the Worker refuses to ground an answer without a
+// stored diff, so offering the button would advertise a broken feature), and a
+// link to the change on GitHub -- while every surface that renders that same card
+// agrees, including the entry frags the permalink resolver and the range view
+// read. Nothing about the row's text, facts or place in the timeline changes.
+function retentionRow (sha, day, hasDiff) {
+  return {
+    kind: 'sync',
+    sha,
+    url: `https://github.com/CodebuffAI/freebuff/commit/${sha.slice(0, 4)}`,
+    compareUrl: `https://github.com/CodebuffAI/freebuff/compare/0000...${sha.slice(0, 4)}`,
+    date: `${day}T11:00:00Z`,
+    hasDiff,
+    areas: ['CLI'],
+    modelChanges: null,
+    cmdChanges: null,
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/y.ts'] },
+    stats: { additions: 10, deletions: 2 },
+    facts: [],
+    summary: `Row ${sha.slice(0, 6)}.`,
+    title: `Row ${sha.slice(0, 6)}`,
+    category: 'CLI',
+    significance: 'minor',
+    day,
+    month: day.slice(0, 7)
+  }
+}
+
+test('escapeHtml covers both quote styles, so a future single-quoted attribute cannot become markup', () => {
+  assert.equal(escapeHtml(`<a href="x" onclick='boom'>`), '&lt;a href=&quot;x&quot; onclick=&#39;boom&#39;&gt;')
+  // The order matters: & first, or the escapes introduced for < and > would be
+  // escaped again and render as literal entity text.
+  assert.equal(escapeHtml('&<>"\''), '&amp;&lt;&gt;&quot;&#39;')
+  assert.equal(escapeHtml(null), 'null', 'the helper takes anything, as its callers do')
+})
+
+test('buildSite: an archived row discloses the archived diff, drops its viewer and never offers Ask', async () => {
+  const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-retention-'))
+  try {
+    const archived = retentionRow('aaaa111122223333444455556666777788889999', '2026-09-12', true)
+    const kept = retentionRow('dddd111122223333444455556666777788889999', '2026-09-13', true)
+    // A budget with exactly one slot: the fixed families are 1,500 files of
+    // overhead plus two day pages and frags, so one of the two diffs must give way.
+    // Built through the real planner rather than a hand-made object, so the test
+    // covers the plan -> hasDiff flip -> render path the build actually runs.
+    const limits = { cap: 20000, budget: 1509, margin: 18491 }
+    const entries = [archived, kept]
+    const retention = planAssetRetention({
+      entries, days: ['2026-09-12', '2026-09-13'], releaseCount: 0, prPreviewCount: 0, limits, overheadFiles: 1500
+    })
+    assert.equal(retention.keptDiffs, 1, 'the fixture must leave exactly one slot')
+    assert.equal(retention.archivedDiffs, 1)
+    for (const e of entries) if (e.hasDiff && !retention.keep.has(e.sha)) e.hasDiff = false
+
+    await buildSite({ changelog: { version: 1, generatedAt: '2026-09-13T12:00:00Z', headSha: '1111', entries }, openPrs: [], retention, dist: tmpDist })
+
+    const archivedDay = await readFile(join(tmpDist, 'day/2026-09-12/index.html'), 'utf8')
+    assert.match(archivedDay, /no longer shipped inline/, 'the card says where the diff went')
+    assert.match(archivedDay, /View the full change on GitHub/, 'and links to it')
+    assert.doesNotMatch(archivedDay, /class="diff-viewer"/, 'the archived row has no viewer to 404')
+    assert.doesNotMatch(archivedDay, /class="ask-open"/, 'and no Ask control the Worker would refuse')
+    assert.match(archivedDay, /Row aaaa11/, 'the row itself is still published')
+
+    const keptDay = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
+    assert.match(keptDay, /class="diff-viewer"/, 'the newest row keeps its viewer')
+    assert.match(keptDay, /class="ask-open"/, 'and its Ask control')
+    assert.doesNotMatch(keptDay, /no longer shipped inline/, 'and is not labelled archived')
+
+    // The same card on the surface the permalink resolver and the range view use.
+    const frags = JSON.parse(await readFile(join(tmpDist, 'entry-frags/2026-09-12.json'), 'utf8'))
+    const fragText = JSON.stringify(frags)
+    assert.match(fragText, /no longer shipped inline/, 'the frag carries the same disclosure')
+    assert.doesNotMatch(fragText, /class=\\"diff-viewer\\"/, 'and the same absent viewer')
+
+    const status = JSON.parse(await readFile(join(tmpDist, 'api/status.json'), 'utf8'))
+    assert.equal(status.retention.archivedDiffs, 1)
+    assert.equal(status.retention.shippedDiffs, 1)
+    assert.equal(status.retention.projectedFiles, retention.projectedFiles)
+    assert.equal(status.retention.budgetFiles, limits.budget)
+    assert.equal(status.retention.oldestShippedDiffDay, '2026-09-13')
+  } finally {
+    await rm(tmpDist, { recursive: true, force: true })
+  }
+})
+
+test('buildSite: a dropped og card falls back to the default image instead of a dead URL', async () => {
+  const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-og-drop-'))
+  try {
+    const row = retentionRow('bbbb111122223333444455556666777788889999', '2026-09-12', true)
+    const retention = {
+      limits: { cap: 20000, budget: 15000, margin: 5000 },
+      archived: new Set(), keptDiffs: 1, archivedDiffs: 0, fixed: 516,
+      projectedFiles: 517, fits: true, oldestKeptDiffDay: '2026-09-12', newestArchivedDay: null,
+      dropOgDays: new Set(['2026-09-12'])
+    }
+    await buildSite({ changelog: { version: 1, generatedAt: '2026-09-12T12:00:00Z', headSha: '1111', entries: [row] }, openPrs: [], retention, dist: tmpDist })
+
+    const dayHtml = await readFile(join(tmpDist, 'day/2026-09-12/index.html'), 'utf8')
+    assert.match(dayHtml, /og:image" content="[^"]*\/og\/default\.png"/, 'the page falls back to the shared card')
+    await assert.rejects(readFile(join(tmpDist, 'og/2026-09-12.svg')), 'and the dropped card is not written')
+    // The default really is there: opening a page whose og:image 404s is the one
+    // way this tier could make things worse than not having it.
+    const png = await readFile(join(tmpDist, 'og/default.png'))
+    assert.ok(png.length > 100 && png[0] === 0x89 && png[1] === 0x50, 'og/default.png is a real PNG')
+  } finally {
+    await rm(tmpDist, { recursive: true, force: true })
+  }
 })

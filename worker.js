@@ -59,11 +59,50 @@ const ASK = {
 // cross-isolate quota would need a KV binding; until one exists this is an
 // honest anti-accident limiter, not a billing firewall, and the config knob
 // (ANSWER_RPM) is the thing to lower if abuse ever shows up.
-const askState = { used: new Map(), hits: new Map() }
+//
+// `counters` is the same kind of number and is read the same way: per-isolate,
+// so it is a floor rather than a total (one isolate among many reports only what
+// it served). It exists because this is the one route that spends money, and a
+// spend with no reading at all is a spend nobody can budget.
+const askState = { used: new Map(), hits: new Map(), counters: newAskCounters() }
+
+function newAskCounters () {
+  return { asked: 0, cacheHits: 0, refused: 0, notConfigured: 0, rateLimited: 0, errors: 0 }
+}
+
+function countAsk (name) {
+  askState.counters[name] = (askState.counters[name] || 0) + 1
+}
 
 export function resetAskStateForTests () {
   askState.used.clear()
   askState.hits.clear()
+  askState.counters = newAskCounters()
+}
+
+// Did this request come from a page on this site? The endpoint is public and
+// unauthenticated, so the question is not "who is this" but "was this addressed
+// deliberately" -- browsers send `Sec-Fetch-Site` on every request they make and
+// `Origin` on cross-origin ones, and a bare script sends neither. Both headers
+// are forgeable, so this is not authentication; it is the difference between an
+// endpoint reachable by accident and one that has to be aimed at. An `Origin`
+// that is present must still name this host, so a page on another site cannot
+// borrow a same-origin marker to reach us.
+function sameOriginRequest (request) {
+  const site = request.headers.get('sec-fetch-site')
+  const origin = request.headers.get('origin')
+  if (!site && !origin) {
+    return { ok: false, error: 'asks must come from this site: a request with no Origin or Sec-Fetch-Site header was not made from a page on it' }
+  }
+  if (site && site !== 'same-origin') {
+    return { ok: false, error: 'asks must come from this site: the request was not made from a page on it' }
+  }
+  if (origin) {
+    let host
+    try { host = new URL(origin).host } catch { return { ok: false, error: 'asks must come from this site: unreadable origin' } }
+    if (host !== new URL(request.url).host) return { ok: false, error: 'cross-origin asks are not allowed' }
+  }
+  return { ok: true }
 }
 
 export default {
@@ -195,20 +234,27 @@ async function askHandler (request, env) {
     return json({ error: 'assets binding missing: wrangler.json must set assets.binding = "ASSETS"' }, 500)
   }
   const key = env && (env.LLM_API_KEY || env.ANSWER_API_KEY)
+  // GET is a capability probe: the page asks it before it renders the widget,
+  // and it answers a boolean and the configured ceiling. It spends nothing, so
+  // it stays open to anything -- including the counters below, which are what
+  // makes the spend visible.
   if (request.method === 'GET') {
-    return json({ configured: !!key, rpm: Number(env.ANSWER_RPM) > 0 ? Number(env.ANSWER_RPM) : ASK.rpm })
+    return json({
+      configured: !!key,
+      rpm: Number(env.ANSWER_RPM) > 0 ? Number(env.ANSWER_RPM) : ASK.rpm,
+      counters: { ...askState.counters }
+    })
   }
   if (request.method !== 'POST') return json({ error: 'POST a {sha, q} body' }, 405)
 
-  // A public model proxy with no origin check is a free endpoint for anyone
-  // who finds it. Same-origin only; a browser sets this header, a naive script
-  // does not, and legitimate cross-origin use can be added deliberately later.
-  const origin = request.headers.get('origin')
-  if (origin) {
-    let host
-    try { host = new URL(origin).host } catch { return json({ error: 'unreadable origin' }, 403) }
-    if (host !== new URL(request.url).host) return json({ error: 'cross-origin asks are not allowed' }, 403)
-  }
+  // A public model proxy with no origin check is a free endpoint for anyone who
+  // finds it, and this one spends money per call. So a POST has to prove it came
+  // from a page on this site (see sameOriginRequest). The check used to run only
+  // when an `Origin` header was present, which meant a request could pass by
+  // saying nothing at all: `curl` sends neither header, reached the model, and
+  // billed the key. Absence is now a refusal.
+  const origin = sameOriginRequest(request)
+  if (!origin.ok) return json({ error: origin.error }, 403)
 
   let body
   try { body = await request.json() } catch { return json({ error: 'body must be JSON: {sha, q}' }, 400) }
@@ -231,7 +277,10 @@ async function askHandler (request, env) {
 
   const ip = (request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'local'
   const limit = await underRateLimit(env, ip)
-  if (!limit.ok) return json({ error: 'too many asks; wait a moment', retryAfterSec: limit.retryAfterSec }, 429, { 'retry-after': String(limit.retryAfterSec) })
+  if (!limit.ok) {
+    countAsk('rateLimited')
+    return json({ error: 'too many asks; wait a moment', retryAfterSec: limit.retryAfterSec }, 429, { 'retry-after': String(limit.retryAfterSec) })
+  }
 
   const loaded = await loadDayRecords(env, request, sha)
   const entry = loaded?.records.find(x => x.sha.startsWith(loaded.key) || loaded.key.startsWith(x.sha))
@@ -241,7 +290,10 @@ async function askHandler (request, env) {
   // the honest answer is "cannot be grounded" -- never a free-form one.
   const diffSha = /^[0-9a-f]{40}$/.test(String(entry.sha || '')) ? entry.sha : sha
   const diff = await assetText(env, request, `/diffs/${diffSha}.diff`)
-  if (!diff) return json({ error: 'no stored diff for this entry, so an answer cannot be grounded', grounded: false }, 422)
+  if (!diff) {
+    countAsk('refused')
+    return json({ error: 'no stored diff for this entry, so an answer cannot be grounded', grounded: false }, 422)
+  }
 
   const evidence = answerEvidence({ entry, diff, neighbors: nearbyRecords(loaded.records, entry) })
   // The cache key includes the thread: the same words after a different
@@ -250,22 +302,36 @@ async function askHandler (request, env) {
   const historyKey = history.map(h => `${h.q}\n${h.a}`).join('\n>>>\n')
   const cacheKey = `/__ask/${entry.sha}/${cacheHash(question + '\n>>>\n' + historyKey)}`
   const cached = await askCacheGet(cacheKey)
-  if (cached) return json({ ...cached, cached: true })
+  if (cached) {
+    countAsk('cacheHits')
+    return json({ ...cached, cached: true })
+  }
 
-  if (!key) return json({ error: 'Ask is not configured on this deployment: set the LLM_API_KEY Worker secret.', configured: false }, 503)
+  if (!key) {
+    countAsk('notConfigured')
+    return json({ error: 'Ask is not configured on this deployment: set the LLM_API_KEY Worker secret.', configured: false }, 503)
+  }
 
-  let answer = await askModel(env, key, question, evidence, [], history)
-  let verdict = groundAnswer(answer, evidence)
-  // One corrective re-ask, naming exactly what failed. Cheaper than a refusal
-  // for the common slip (a token copied from memory), and still bounded: a
-  // second failure is a real failure and is reported as one.
-  for (let attempt = 0; !verdict.grounded && attempt < ASK.maxRetries; attempt++) {
-    const retry = await askModel(env, key, question, evidence, verdict.ungrounded, history)
-    const recheck = groundAnswer(retry, evidence)
-    if (recheck.grounded) { answer = retry; verdict = recheck }
-    else verdict = recheck
+  let answer, verdict
+  try {
+    countAsk('asked')
+    answer = await askModel(env, key, question, evidence, [], history)
+    verdict = groundAnswer(answer, evidence)
+    // One corrective re-ask, naming exactly what failed. Cheaper than a refusal
+    // for the common slip (a token copied from memory), and still bounded: a
+    // second failure is a real failure and is reported as one.
+    for (let attempt = 0; !verdict.grounded && attempt < ASK.maxRetries; attempt++) {
+      const retry = await askModel(env, key, question, evidence, verdict.ungrounded, history)
+      const recheck = groundAnswer(retry, evidence)
+      if (recheck.grounded) { answer = retry; verdict = recheck }
+      else verdict = recheck
+    }
+  } catch (err) {
+    countAsk('errors')
+    throw err
   }
   if (!verdict.grounded) {
+    countAsk('refused')
     return json({
       error: 'Refused: the answer cited things this change does not contain.',
       grounded: false,

@@ -4,7 +4,7 @@
 //   node generator/cli.mjs generate [--repo URL] [--full]
 //   node generator/cli.mjs build
 //   node generator/cli.mjs preview [port]
-import { mkdir, readFile, rm, cp } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, readdir, rm, cp } from 'node:fs/promises'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { resolve, dirname, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -22,6 +22,8 @@ import { EVIDENCE_WIDTH_WARN, evidenceStats, gcEvidence, liveEvidenceHashes, spi
 import { changelogBytes, loadChangelog, saveChangelog } from './lib/changelog-store.mjs'
 import { forwardRollupBacklog, generateRollup, loadRollups, rollupBacklog, rollupFingerprint, ROLLUP_V } from './lib/rollup.mjs'
 import { SIZE_MAX_BYTES, SIZE_WARN_BYTES, findOverBudget, sizeText } from './lib/sizebudget.mjs'
+import { planAssetRetention } from './lib/retention.mjs'
+import { resolveAssetLimits, checkDistBudget, distBudgetMessage } from './lib/distbudget.mjs'
 import { syncReason, syncStaleMs } from './lib/sync.mjs'
 import { buildSite } from './lib/site.mjs'
 
@@ -1618,6 +1620,22 @@ async function cmdBuild () {
   // what dist/ actually holds.
   const keepDiff = diffShipFilter(changelog.entries, process.env)
   if (keepDiff) for (const e of changelog.entries) if (e.hasDiff && !keepDiff(e)) e.hasDiff = false
+  // The deploy envelope. dist/ carries one file per stored diff and upstream
+  // produces ~80 entries a day against Cloudflare's 20,000-asset-per-version
+  // cap, so older diffs give way to newer ones by budget rather than by date
+  // (see lib/retention.mjs: a date cutoff cannot promise a file count and is a
+  // function of the wall clock). Planned here because this is where the diff
+  // copy happens, and applied before render for the same reason the env trim
+  // above is: no card may advertise a viewer whose file will not ship.
+  const retention = planAssetRetention({
+    entries: changelog.entries,
+    days: [...new Set(changelog.entries.map(e => e.day))],
+    releaseCount: new Set(changelog.entries.filter(e => e.version).map(e => e.version)).size,
+    prPreviewCount: prs.length,
+    limits: resolveAssetLimits(process.env)
+  })
+  for (const e of changelog.entries) if (e.hasDiff && !retention.keep.has(e.sha)) e.hasDiff = false
+  log(`[retention] ${retention.message}`)
   const traffic = await readJson(`${DATA}/traffic.json`, null)
   // dist/ is a pure build output, regenerated in full from data/ every run, so it
   // is cleared first. Without this, any URL the generator stops emitting keeps
@@ -1644,26 +1662,36 @@ async function cmdBuild () {
   // The settled days' bullet digests, keyed by day: their pages render them
   // above the entries. Absent until the roll-up pass has run once.
   const rollups = await loadRollups(DATA)
-  await buildSite({ changelog, openPrs: prs, prMeta, traffic, dist, mergedPrs: mergedPrsDoc, overridesDoc: overrides, evalResult, llmHealth, rollups })
+  await buildSite({ changelog, openPrs: prs, retention, prMeta, traffic, dist, mergedPrs: mergedPrsDoc, overridesDoc: overrides, evalResult, llmHealth, rollups })
 
-  // data/diffs is 106 MB of a 352 MB dist. Two opt-in trims: skip the churn
-  // rows' lockfile diffs (CHANGELOG_DIST_SKIP_CHURN_DIFFS=1) and/or ship only
-  // the last N months (CHANGELOG_DIST_DIFF_MONTHS=N). Rows whose diff is not
-  // shipped lose their hasDiff flag before render, so the card shows the
-  // GitHub compare link instead of a viewer that would 404. Default: ship all.
+  // The stored diffs are the largest family in dist/ and the only one growing at
+  // the corpus's own rate, which is why retention withholds them first. Two
+  // opt-in env trims sit on top: skip the churn rows' lockfile diffs
+  // (CHANGELOG_DIST_SKIP_CHURN_DIFFS=1) and/or ship only the last N months
+  // (CHANGELOG_DIST_DIFF_MONTHS=N). Every reason a diff is withheld flips hasDiff
+  // before render, so the card links to GitHub for it instead of advertising a
+  // viewer that would 404 -- and in retention's case says so out loud.
   const distDiffs = resolve(dist, 'diffs')
   if (existsSync(dataDiffs)) {
     await mkdir(distDiffs, { recursive: true })
-    if (!keepDiff) {
+    // The bulk copy is only correct when nothing is withheld: it cannot tell an
+    // archived diff from a shipped one.
+    if (!keepDiff && !retention.archivedDiffs) {
       await cp(dataDiffs, distDiffs, { recursive: true })
     } else {
-      let shipped = 0, skipped = 0
+      let shipped = 0
+      const tasks = []
       for (const e of changelog.entries) {
+        if (!e.hasDiff) continue
         const src = resolve(dataDiffs, `${e.sha}.diff`)
         if (!existsSync(src)) continue
-        if (e.hasDiff) { await cp(src, resolve(distDiffs, `${e.sha}.diff`)); shipped++ } else skipped++
+        tasks.push(async () => {
+          await copyFile(src, resolve(distDiffs, `${e.sha}.diff`))
+          shipped++
+        })
       }
-      log(`shipped ${shipped} stored diffs to dist/, skipped ${skipped} (CHANGELOG_DIST_* trim options set)`)
+      await pool(tasks, 32)
+      log(`shipped ${shipped.toLocaleString()} stored diffs to dist/, withheld ${retention.archivedDiffs.toLocaleString()} by the asset budget${keepDiff ? ' plus the CHANGELOG_DIST_* trim options' : ''}`)
     }
   }
   const dataPrDiffs = resolve(DATA, 'pr-diffs')
@@ -1800,7 +1828,14 @@ async function cmdPreview (port = 8788) {
   const { resolve: r, join } = await import('node:path')
   const dist = resolve(ROOT, 'dist')
   createServer(async (req, res) => {
-    const url = new URL(req.url, 'http://localhost')
+    // The authority the reader is really on, port included. worker.js compares an
+    // `Origin` header against its own request URL's host, and a synthetic
+    // `http://localhost` (no port) can never match the `http://localhost:8788` a
+    // local browser sends -- so the same-origin gate would refuse exactly the
+    // request it exists to allow, and the preview would stop exercising the real
+    // gate that this route is here to exercise.
+    const authority = `http://localhost:${port}`
+    const url = new URL(req.url, authority)
     let p = decodeURIComponent(url.pathname)
     // "Ask the AI" answers through worker.js itself, not a second
     // implementation: the grounding gate, rate limit and cache are the feature,
@@ -1811,7 +1846,7 @@ async function cmdPreview (port = 8788) {
       const chunks = []
       for await (const c of req) chunks.push(c)
       const { default: worker } = await import('../worker.js')
-      const out = await worker.fetch(new Request(`http://localhost${req.url}`, {
+      const out = await worker.fetch(new Request(`${authority}${req.url}`, {
         method: req.method,
         headers: req.headers,
         body: req.method === 'POST' ? Buffer.concat(chunks).toString('utf8') : undefined
@@ -1937,6 +1972,7 @@ if (IS_MAIN) {
   else if (cmd === 'freshness') await cmdFreshness(rest)
   else if (cmd === 'generation-health') await cmdGenerationHealth(rest)
   else if (cmd === 'check-size') await cmdCheckSize(rest)
+  else if (cmd === 'check-dist') await cmdCheckDist()
   else if (cmd === 'enrich-all') await cmdEnrichAll(rest)
   else if (cmd === 'repair-entries') await cmdRepairEntries(rest)
   else if (cmd === 'retry-failed') await cmdRetryFailed(rest)
@@ -1971,6 +2007,7 @@ if (IS_MAIN) {
   node generator/cli.mjs generation-health       # offline gate: fail on overdue missing admitted text, independent of ingestion freshness
   node generator/cli.mjs generation-health --report  # the same reading as a warning, for the workflow that only publishes
   node generator/cli.mjs check-size              # CI gate: fail when a tracked file nears GitHub's 100 MiB push limit
+  node generator/cli.mjs check-dist              # CI gate: weigh dist/ against the Cloudflare Workers static-asset cap (run after build)
   node generator/cli.mjs glossary [--discover]     # list plain-English term definitions; --discover adds candidates from upstream docs
   node generator/cli.mjs eval [--seed N] [--limit N]  # offline stored-artifact audit, zero provider calls
   node generator/cli.mjs normalize-dates [--push]  # one-off: rewrite stored timestamps to UTC and fix the day/month keys
@@ -2653,6 +2690,52 @@ async function cmdCheckSize () {
   }
   process.exitCode = 1
 }
+
+/**
+ * The CI half of the deploy envelope: weigh the built dist/ against the
+ * Cloudflare Workers static-asset limits (20,000 files per Worker version on
+ * Free, 25 MiB per asset). Retention (lib/retention.mjs) is supposed to keep the
+ * count inside the budget by construction, so a failure here means the budget,
+ * the plan's estimate of the fixed asset families, or a newly added family has
+ * stopped agreeing with the others -- and the alternative to noticing now is a
+ * `wrangler deploy` that fails while every other gate stays green.
+ */
+async function cmdCheckDist () {
+  const dist = resolve(ROOT, 'dist')
+  if (!existsSync(dist)) {
+    log('[check-dist] no dist/ to weigh: run `node generator/cli.mjs build` first')
+    process.exitCode = 1
+    return
+  }
+  const limits = resolveAssetLimits(process.env)
+  const files = await distFiles(dist)
+  const reading = checkDistBudget(files, limits)
+  log(`[check-dist] ${distBudgetMessage(reading)}`)
+  if (reading.largest) log(`[check-dist] largest asset: ${relative(ROOT, reading.largest.path)} at ${sizeText(reading.largest.bytes)}`)
+  if (reading.tightMargin) log(`[check-dist] WARNING the configured envelope leaves under 10% of the cap as margin: retention plans to the budget, so an unexpected asset family has nowhere to go`)
+  if (reading.overCap || reading.overBudget) log(`[check-dist] FAIL ${distBudgetMessage(reading)}`)
+  if (reading.overBudget || reading.overCap) process.exitCode = 1
+}
+
+/**
+ * Every file under dist/, with its size. The envelope is a file count, so this
+ * walks the built tree rather than asking git for tracked bytes.
+ */
+async function distFiles (root) {
+  const out = []
+  const walk = async (dir) => {
+    let items
+    try { items = await readdir(dir, { withFileTypes: true }) } catch { return }
+    for (const it of items) {
+      const p = resolve(dir, it.name)
+      if (it.isDirectory()) await walk(p)
+      else if (it.isFile()) { try { out.push({ path: p, bytes: statSync(p).size }) } catch { /* raced with a rebuild */ } }
+    }
+  }
+  await walk(root)
+  return out
+}
+
 /**
  * One-off repair of the stored history: rewrite every timestamp to UTC and
  * recompute the day/month keys derived from it.

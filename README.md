@@ -55,10 +55,21 @@ node generator/cli.mjs override <sha>               # draft a human correction
 | `CHANGELOG_LLM_LIMIT`, `CHANGELOG_ELI5_LIMIT` | Per-cycle row limits |
 | `CHANGELOG_LLM_STREAM` | Streams by default; `=0` disables |
 | `CHANGELOG_SYNC_STALE_MIN` | Freshness budget (default 5 minutes; the gate fails at twice this) |
+| `CHANGELOG_ASSET_CAP_FILES`, `CHANGELOG_ASSET_BUDGET_FILES` | The deploy envelope: static asset files Cloudflare accepts per Worker version (default 20,000, the Free plan; set 100,000 on Workers Paid) and the budget the build holds itself to (default 75% of the cap). Retention plans to the budget, `check-dist` fails past it |
 | `SITE_URL` | Deployment and feed URL |
 | `ASK_LLM_API_KEY` (repo secret → Worker secret `LLM_API_KEY`, re-bound by the deploy workflow), `ANSWER_RPM` | Ask-the-AI at the edge: its own credential -- deliberately separate from the relay's `LLM_API_KEY` -- and asks per IP per minute (default 5). Worker-side, not relay-side |
 
 CLI commands load local environment configuration (`.env`). No setting can raise the token window or the configured RPM ceiling. Agnes rate limits are account-specific; 60 is the inherited safety cap, not a claimed Agnes entitlement. Invalid URLs and authentication failures fail the paid process without creating row failure stubs; deterministic updates publish first.
+
+## Retention and the deploy envelope
+
+dist/ is uploaded to Cloudflare Workers as static assets, and Cloudflare accepts at most **20,000 asset files per Worker version** (100,000 on Workers Paid, 25 MiB per file). dist/ carries one file per stored diff, and upstream produces ~80 entries a day, so with no policy the count reaches that wall a couple of months out. The symptom of reaching it is the worst kind: ingestion, generation and freshness all stay green while `wrangler deploy` starts refusing the upload, so the only witness is a site that quietly stops updating.
+
+So older entries give way to newer ones, **by budget rather than by date**. [generator/lib/retention.mjs](generator/lib/retention.mjs) is a pure function of the corpus and the envelope, and it runs before anything renders. A date cutoff is the obvious shape and the wrong one: it is a function of the wall clock, and it cannot promise anything about the thing that actually breaks, which is a file count.
+
+What giving way means, precisely: **the entry is untouched.** It keeps its place in `data/`, its day page, its record shard, the API, search, the feeds and the timeline. What stops shipping is the stored diff behind the inline viewer -- and with it the Ask control, because the Worker refuses to ground an answer against a diff it does not have, so offering the button would advertise a feature that cannot work. The card says so and links to the change on GitHub instead. Nothing is deleted from the repository and no text is rewritten.
+
+`node generator/cli.mjs check-dist` weighs the built dist/ against the envelope and fails both CI and the deploy when it is over the budget or over the cap. `/api/status.json` reports the plan under `retention`: the cap and budget, how many diffs ship inline, how many were archived, how far back the inline window reaches, and whether the projection fits.
 
 ## Ask the AI
 
@@ -78,7 +89,7 @@ Without the secret, `GET /api/ask` reports `configured: false`, the control disa
 
 ## CI and deployment
 
-- [generator-check](.github/workflows/generator-check.yml) runs syntax, build and the offline test suite on code changes.
+- [generator-check](.github/workflows/generator-check.yml) runs syntax, build, the deploy-envelope check and the offline test suite on code changes.
 - [changelog-sync](.github/workflows/changelog-sync.yml) polls upstream every ~30s under a ten-minute watchdog, publishes deterministic data first, then spends a bounded paid window. It runs the latest push-tested compatible generator against current data; bootstrap needs one green generator-check.
 - [deploy](.github/workflows/deploy.yml) builds and uploads static assets, then probes the served head and timestamp with bounded propagation retries.
 - Generation completeness has one hard gate, in [changelog-sync](.github/workflows/changelog-sync.yml), which owns generation: it names the overdue rows and its failure dispatches the cycle that heals them. [deploy](.github/workflows/deploy.yml) reads the same verdict, prints the same numbers and warns with the same row list, but does not fail the run: an upload that succeeded is not a failed deploy, and this workflow can neither write text nor dispatch a cycle. A stalled relay still fails the deploy's freshness gate, and that failure now also names what the relay last did, so a run cancelled before it executed is legible as a platform condition rather than a data fault. The missing-text budget runs from when the text went missing, not from durable admission: a summary rewrite changes the source of the line that explains it, so the clock restarts when that rewrite invalidates the old line rather than judging a days-old admission against a gap that only just opened. `/api/status.json` exposes admitted missing-summary/explanation counts, overdue SHAs, repair needs, and pending reviews. Intentionally unchecked text and historical rows outside admission are not missing-generation failures.

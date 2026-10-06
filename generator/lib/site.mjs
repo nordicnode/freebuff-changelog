@@ -1290,6 +1290,16 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
 </details>`
   }
 
+  // Retention (lib/retention.mjs) stops shipping the stored diff of the oldest
+  // entries once dist/ would otherwise pass the Workers static-asset budget. The
+  // row keeps every other surface -- its text, facts, day page, API record,
+  // search entry and feeds -- so the card says where the diff went rather than
+  // looking broken, and offers neither a viewer nor an Ask control that would
+  // fail for a row the Worker can no longer ground an answer against.
+  const archivedNote = (!e.hasDiff && e.diffArchived)
+    ? `<div class="diff-notice">This change is old enough that its stored diff is no longer shipped inline; the site keeps the newest changes' diffs in <code>dist/</code>. <a href="${esc(e.compareUrl || `https://github.com/CodebuffAI/freebuff/commit/${e.sha}`)}" target="_blank" rel="noopener">View the full change on GitHub &rarr;</a></div>`
+    : ''
+
   const summaryText = e.ai?.summary || e.summary
   const changes = changesHtml(e)
   const summaryHtml = (summaryText ? `<div class="summary">${miniMd(summaryText)}</div>` : '') + changes
@@ -1312,6 +1322,17 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
   const powerEnd = `</div>
 </details>`
 
+  // The technical fold is a record, not a read: the summary, then every block
+  // that backs it up. Flat, those blocks all carried the same weight and an
+  // opened entry was one wall of identically framed bars. Three labelled
+  // sections -- what changed, what backs it up, the raw code -- give the fold a
+  // shape the eye can follow and the reader a map of it. A section with nothing
+  // in it prints nothing at all, so a thin row never grows empty scaffolding.
+  const group = (label, parts) => {
+    const inner = parts.filter(Boolean).join('')
+    return inner ? `\n<section class="eb-group"><h4 class="eb-group-hdr">${label}</h4>${inner}</section>` : ''
+  }
+
   // data-cat / data-sig / data-churn are what the front-page filter toggles: every
   // row the index renders is a row the reader can narrow by area or impact, with no
   // second request.
@@ -1328,15 +1349,10 @@ ${e.eli5?.text ? `<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH</spa
 ${leadHtml}
 ${askHtml(e)}
 ${powerStart}
-${e.eli5?.text ? summaryHtml : ''}
-${migrationHtml(e)}
-${structuredChips(e)}
-${evidenceHtml(e)}
-${unknownsHtml(e)}
+${group('CHANGE', [e.eli5?.text ? summaryHtml : '', migrationHtml(e)])}
+${group('PROOF', [structuredChips(e), evidenceHtml(e), unknownsHtml(e)])}
+${group('CODE', [factsHtml(e), fileChips(e), archivedNote, diffViewer])}
 ${shippedInHtml(e, opts.shipped)}
-${factsHtml(e)}
-${fileChips(e)}
-${diffViewer}
 ${relatedLine(e, relatedIdx)}
 ${storyNoteHtml(opts.storyNotes)}
 <div class="metarow">
@@ -2049,7 +2065,7 @@ function subscribePage (feedCatalog) {
   <div class="term-box-hdr"><span class="term-box-title">YOUR OPML</span>
     <span><button type="button" class="theme-btn" id="sub-download">[download .opml]</button> <button type="button" class="theme-btn" id="sub-copy">[copy feed urls]</button></span>
   </div>
-  <textarea id="sub-opml" readonly spellcheck="false" style="width:100%;min-height:180px;background:var(--bg);color:var(--txt);border:1px solid var(--border);font-size:.74rem;padding:10px"></textarea>
+  <textarea id="sub-opml" readonly spellcheck="false" style="width:100%;min-height:180px;background:var(--bg);color:var(--txt);border:1px solid var(--term-border);font-size:.74rem;padding:10px"></textarea>
 </div>
 <script>
 (function () {
@@ -2169,7 +2185,7 @@ const RANGE_JS = `(function () {
 })();
 `
 
-export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffic = null, mergedPrs = null, overridesDoc = null, evalResult = null, llmHealth = null, rollups = {} }) {
+export async function buildSite ({ changelog, openPrs, dist, retention = null, prMeta = {}, traffic = null, mergedPrs = null, overridesDoc = null, evalResult = null, llmHealth = null, rollups = {} }) {
   const trafficCount = traffic?.count ?? 0
   const trafficUniques = traffic?.uniques ?? 0
   activeTraffic = { count: trafficCount, uniques: trafficUniques }
@@ -2199,6 +2215,13 @@ export async function buildSite ({ changelog, openPrs, dist, prMeta = {}, traffi
   // is a guaranteed 404 -- eleven were reachable from the week pages and the
   // model lineage. The version is the fact worth keeping; the dead link is not.
   const releasePages = new Set(releases.map(r => r.version))
+  // Retention is decided by the caller, because cmdBuild owns both the diff copy
+  // and the objects on disk; it is applied here, before anything renders, so the
+  // cards, the day pages, the permalinks and the range view all agree with what
+  // dist/ ends up holding. `archived` names the rows that lost a stored diff this
+  // build -- never the ones that never had one -- which is what lets a card
+  // explain the difference instead of silently losing its viewer.
+  if (retention?.archived?.size) for (const e of entries) if (retention.archived.has(e.sha)) e.diffArchived = true
   const releaseHref = (v) => (releasePages.has(v) ? `/release/${esc(v)}/` : null)
   const verBadge = (v, title) => {
     const href = releaseHref(v)
@@ -2565,6 +2588,11 @@ ${rows.map(e => {
   // in-memory data, so the pool bounds file handles rather than work.
   const timelineTasks = byDay.map((d, i) => async () => {
     const real = d.entries.filter(e => !e.noise).length
+    // The second tier of retention, reached only if the fixed asset families
+    // alone outgrow the budget, and then only for the oldest days: the day keeps
+    // its social-card slot by falling back to /og/default.png, which the build
+    // always writes.
+    const dropOg = !!retention?.dropOgDays?.has(d.day)
     const body = renderTimelineDay(d, i) + filterScript
     if (i === 0) {
       await write(dist, 'index.html', layout({ title: 'Home', path: '/', desc: SITE.desc, ld: dayItemListLd(d), body }))
@@ -2578,12 +2606,14 @@ ${rows.map(e => {
       title: i === 0 ? `Latest :: ${fmtDateHuman(d.day)}` : fmtDateHuman(d.day),
       path: `/day/${d.day}/`,
       desc: `${real.toLocaleString()} Freebuff change${real === 1 ? '' : 's'} pushed on ${d.day}.`,
-      ogImage: `/og/${d.day}.svg`,
+      ogImage: dropOg ? undefined : `/og/${d.day}.svg`,
       ld: dayItemListLd(d),
       body
     }))
-    const ogTitles = d.entries.slice(0, 3).map(e => e.ai?.title || e.title || '')
-    await write(dist, `og/${d.day}.svg`, ogCardSvg(fmtDateHuman(d.day), ogTitles, `${real} changes`))
+    if (!dropOg) {
+      const ogTitles = d.entries.slice(0, 3).map(e => e.ai?.title || e.title || '')
+      await write(dist, `og/${d.day}.svg`, ogCardSvg(fmtDateHuman(d.day), ogTitles, `${real} changes`))
+    }
     // The permalink resolver reads one card out of this array instead of
     // downloading the whole day page for it: /c/<sha> used to move ~500 KB to
     // show 2 KB. Same renderer as the day page (one source of markup), one
@@ -3625,7 +3655,7 @@ ${weekTabsScript}`
 
   // One row, one grid: label / track / figure / trend. The track is the flexible
   // column, so a long label or a wide figure can never eat the bar again.
-  const bar = (lbl, n, max, { href, trend = '', num = '', pct = -1, cls = '' } = {}) => `<div class="stat-row"><span class="stat-lbl">${href ? `<a href="${href}">${esc(lbl)}</a>` : esc(lbl)}</span><span class="stat-track"><span class="stat-fill${cls ? ' ' + cls : ''}" style="width:${Math.max(2, Math.round(n / max * 100))}%"></span></span><span class="stat-num">${num || n.toLocaleString()}${pct >= 0 ? `<i class="stat-share">${pct}%</i>` : ''}</span><span class="stat-trend">${trend}</span></div>`
+  const bar = (lbl, n, max, { href, trend = '', num = '', pct = -1, cls = '' } = {}) => `<div class="stat-row"><span class="stat-lbl">${href ? `<a href="${href}" title="${esc(lbl)}">${esc(lbl)}</a>` : esc(lbl)}</span><span class="stat-track"><span class="stat-fill${cls ? ' ' + cls : ''}" style="width:${Math.max(2, Math.round(n / max * 100))}%"></span></span><span class="stat-num">${num || n.toLocaleString()}${pct >= 0 ? `<i class="stat-share">${pct}%</i>` : ''}</span><span class="stat-trend">${trend}</span></div>`
   // Churn is two numbers, not one: +12k of new code and -12k of deleted code are
   // different work, so they get two segments of one track instead of both folded
   // into the label, which is what made the old churn rows unreadable.
@@ -3646,8 +3676,8 @@ ${weekTabsScript}`
       + `</div>`
       + `<div class="stat-grid">`
       + card('CHANGES BY CATEGORY (12-MO TREND)', `${statCats.length} categories &middot; sparkline covers ${allMonths.length} months`, statCats.map(([c, n]) => bar(c, n, catMax, { href: `/search/?cat=${encodeURIComponent(c)}`, pct: share(n, sigTotal), trend: catSpark(c) })).join(''), 'stat-span')
-      + card('CODE CHURN BY AREA', `top ${churnRows.length} of ${churnByArea.size} areas &middot; lines added / removed`, churnRows.map(churnBar).join(''))
-      + card('MOST-CHANGED MODELS', modelTotal ? `${modelTotal} catalog moves across ${modelCounts.size} models` : 'no catalog moves recorded', modelRows2.map(([m, n]) => bar(m, n, modelMax, { href: `/models/${modelSlug(m)}/`, pct: share(n, modelTotal) })).join(''))
+      + card('CODE CHURN BY AREA', `top ${churnRows.length} of ${churnByArea.size} areas &middot; lines added / removed`, churnRows.map(churnBar).join(''), 'stat-tight')
+      + card('MOST-CHANGED MODELS', modelTotal ? `${modelTotal} catalog moves across ${modelCounts.size} models` : 'no catalog moves recorded', modelRows2.map(([m, n]) => bar(m, n, modelMax, { href: `/models/${modelSlug(m)}/`, pct: share(n, modelTotal) })).join(''), 'stat-tight')
       + card('WHAT COUNTED', `${sigTotal.toLocaleString()} changes split by weight`, `<div class="sig-split">${sigRows.map(([s, n]) => `<span class="sig-seg sig-${s}" style="width:${share(n, sigTotal)}%" title="${s}: ${n.toLocaleString()}"></span>`).join('')}</div>` + sigRows.map(([s, n]) => bar(s.toUpperCase(), n, sigMax, { pct: share(n, sigTotal), cls: 'sig-' + s })).join(''), 'stat-span')
       + qualityCard(summaryQuality(entries), card, bar, share)
       + evalCard(evalResult, card, bar)
@@ -3748,6 +3778,7 @@ ${weekTabsScript}`
       <label class="filter-sel-lbl"><input type="checkbox" id="frel"> releases only</label>
       <span id="match-count" role="status" aria-live="polite" style="font-size:.76rem;color:var(--txt-subtle);margin-left:auto;align-self:center"></span>
     </div>
+    <p class="search-idle">Results appear as you type, scoped by the filters above. Try <b>muse</b>, <b>cat:cli</b>, <b>is:release</b>, <b>aud:end-users</b> or <b>&quot;exact phrase&quot;</b>.</p>
     <details class="search-help">
       <summary>query syntax &mdash; everything the box understands</summary>
       <div class="search-help-body">
@@ -3794,7 +3825,19 @@ const loadIndex = async () => {
     } catch (_) {}
     return { cats, sigs, auds, ix };
   };
-  loadIndex().then(({ cats, sigs, auds, ix })=>{
+  // The index is the heaviest thing the site ships (about 4.7 MB raw, 1.4 MB
+  // gzipped, one row per change), and it used to be fetched the moment /search/
+  // loaded -- before the reader had asked for anything. It is now fetched on
+  // first need. A deep link (?q=, #q=) or a preset still gets its results
+  // without touching anything, and everyone else pays for the index on their
+  // first keystroke instead of on arrival. IndexedDB still covers repeat visits,
+  // and the fetch keeps its own error path because a failed multi-MB request
+  // used to be an unhandled rejection with a page that just sat there.
+  let searchStarted = false;
+  const startSearch = () => {
+    if (searchStarted) return;
+    searchStarted = true;
+    loadIndex().then(({ cats, sigs, auds, ix })=>{
   let t;
   let selectedHitIdx = -1;
   const q = document.getElementById('q'), h = document.getElementById('hits'), cnt = document.getElementById('match-count');
@@ -4040,8 +4083,28 @@ const loadIndex = async () => {
     c.classList.toggle('active', !!on);
   });
   syncChips();
-  if (initialQ || initialCat || initialSig || initialAud || (frel && frel.checked)) go();
-});
+  // Anything typed while the index was in flight still has to render: the
+  // handlers that turn a keystroke into results only exist once it has arrived.
+  if (q.value.trim()) go();
+  else if (initialQ || initialCat || initialSig || initialAud || (frel && frel.checked)) go();
+  }).catch(err => {
+    if (h) h.textContent = 'Could not load the search index (' + (err && err.message ? err.message : err) + '). Reload to try again.';
+  });
+  };
+  // Boot on first interest, in the order a reader actually shows it.
+  const eager = new URLSearchParams(location.search).get('q') || location.hash.startsWith('#q=');
+  if (eager) {
+    startSearch();
+  } else {
+    const box = document.getElementById('q');
+    if (box) ['pointerdown', 'focus', 'input'].forEach(ev => box.addEventListener(ev, startSearch, { once: true, passive: true }));
+    const chipRow = document.querySelector('.filter-chips');
+    if (chipRow) chipRow.addEventListener('click', startSearch, { once: true });
+    for (const id of ['fcat', 'fsig', 'faud', 'frel']) {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('change', startSearch, { once: true });
+    }
+  }
 </script>`
   }))
 
@@ -4444,6 +4507,17 @@ const loadIndex = async () => {
     }
 
     const inFlightScript = `<script>
+// GitHub's API is a third-party, untrusted source: a commit subject or a comment
+// body can contain HTML, and this page builds its rows by string concatenation
+// into innerHTML. Every field that comes out of that response goes through this
+// before it is interpolated, exactly as the server-rendered version of the same
+// card does (esc() in renderPrCard). Local to this script rather than shared:
+// the page must not depend on the load order of another script for its safety.
+function escInFlight (s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
 (function(){
   document.querySelectorAll('.pr-tag-btn').forEach(function(btn){
     btn.addEventListener('click', function(){
@@ -4490,9 +4564,9 @@ const loadIndex = async () => {
             var date = (c.commit && c.commit.author && c.commit.author.date ? c.commit.author.date.slice(0, 10) : '');
             var url = c.html_url || ('https://github.com/CodebuffAI/freebuff/commit/' + c.sha);
             return '<div class="pr-commit-row">' +
-              '<a href="' + url + '" target="_blank" rel="noopener" class="pr-commit-sha"><code>' + sha + '</code></a> ' +
-              '<span class="pr-commit-msg">' + msg + '</span> ' +
-              '<span class="pr-commit-meta">&middot; ' + author + ' &middot; ' + date + '</span>' +
+              '<a href="' + escInFlight(url) + '" target="_blank" rel="noopener" class="pr-commit-sha"><code>' + escInFlight(sha) + '</code></a> ' +
+              '<span class="pr-commit-msg">' + escInFlight(msg) + '</span> ' +
+              '<span class="pr-commit-meta">&middot; ' + escInFlight(author) + ' &middot; ' + escInFlight(date) + '</span>' +
             '</div>';
           }).join('');
         }
@@ -4509,8 +4583,8 @@ const loadIndex = async () => {
             var text = (c.body || '').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/[\\u{1F300}-\\u{1FAFF}]/gu, '');
             return '<div class="pr-comment-row">' +
               '<div class="pr-comment-hdr">' +
-                '<span class="pr-comment-author">@' + author + '</span>' +
-                '<a href="' + (c.html_url || '') + '" target="_blank" rel="noopener" class="pr-comment-time">' + date + '</a>' +
+                '<span class="pr-comment-author">@' + escInFlight(author) + '</span>' +
+                '<a href="' + escInFlight(c.html_url || '') + '" target="_blank" rel="noopener" class="pr-comment-time">' + escInFlight(date) + '</a>' +
               '</div>' +
               '<div class="pr-comment-body">' + text.replace(/\\n/g, '<br>') + '</div>' +
             '</div>';
@@ -4729,7 +4803,24 @@ ${inFlightScript}`
     openPrs: openPrs?.length || 0,
     openPrsTotal: prMeta.total || openPrs?.length || 0,
     openPrsCheckedMinAgo: prMeta.ageMin ?? null,
-    generation: generationHealth(entries)
+    generation: generationHealth(entries),
+    // What the deploy envelope looks like on this build (lib/retention.mjs and
+    // lib/distbudget.mjs). Surfaced here because the number that breaks a deploy
+    // -- the dist/ file count against the Cloudflare Workers static-asset cap --
+    // is otherwise invisible until an upload fails, with every other gate green.
+    retention: retention
+      ? {
+          capFiles: retention.limits.cap,
+          budgetFiles: retention.limits.budget,
+          projectedFiles: retention.projectedFiles,
+          fixedFiles: retention.fixed,
+          shippedDiffs: retention.keptDiffs,
+          archivedDiffs: retention.archivedDiffs,
+          oldestShippedDiffDay: retention.oldestKeptDiffDay,
+          newestArchivedDay: retention.newestArchivedDay,
+          fits: retention.fits
+        }
+      : null
   }))
 
   // ----- stable commit permalink: /c/<sha>
@@ -4861,6 +4952,8 @@ ctx.hidden = false
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
   Cache-Control: no-cache
+  X-Frame-Options: DENY
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://api.github.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'
 /favicon.ico
   Content-Type: image/x-icon
 /favicon.svg
@@ -4906,7 +4999,7 @@ ctx.hidden = false
 `)
   await write(dist, '404.html', layout({ title: 'Not found', path: '/404', noindex: true, body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title" id="range-hdr">ERROR :: 404 NOT FOUND</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)" id="range-status">No commit or snapshot shipped at this path. <a href="/">&larr; [back to index]</a></p>
       <form action="/search/" method="get" style="margin-top:10px;display:flex;gap:8px;max-width:420px">
-        <input name="q" type="search" placeholder="search the changelog&hellip;" aria-label="Search the changelog" style="flex:1;padding:6px 8px;background:var(--bg);color:var(--txt);border:1px solid var(--border);font-family:inherit">
+        <input name="q" type="search" placeholder="search the changelog&hellip;" aria-label="Search the changelog" style="flex:1;padding:6px 8px;background:var(--bg);color:var(--txt);border:1px solid var(--term-border);font-family:inherit">
         <button type="submit" class="theme-btn">[search]</button>
       </form>
       <p style="margin:10px 0 0;font-size:.74rem;color:var(--txt-dim)">Looking for a commit? try <a href="/c/">/c/&lt;sha&gt;</a> &middot; everything else lives at <a href="/man/routes/">[routes]</a></p>

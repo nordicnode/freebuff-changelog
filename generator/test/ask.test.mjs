@@ -234,10 +234,21 @@ const assets = (diff = DIFF) => ({
   [`/diffs/${SHA}.diff`]: diff
 })
 
-const ask = (env, { sha = SHA, q = 'Where does the model name come from?', history, method = 'POST', origin = null, headers = {} } = {}) => {
+// The route requires proof that a POST came from a page on this site, and a
+// browser supplies it for free: `Sec-Fetch-Site: same-origin` on a same-origin
+// request, and `Origin` as well on a cross-origin one. The helper sends the
+// same-origin marker by default so the tests below exercise the route rather
+// than the gate; pass `secFetchSite: null` for a bare script's shape, or another
+// value to pose as a different site.
+const ask = (env, { sha = SHA, q = 'Where does the model name come from?', history, method = 'POST', origin = null, secFetchSite = 'same-origin', headers = {} } = {}) => {
   const req = new Request('https://x.test/api/ask', {
     method,
-    headers: { 'content-type': 'application/json', ...(origin ? { origin } : {}), ...headers },
+    headers: {
+      'content-type': 'application/json',
+      ...(origin ? { origin } : {}),
+      ...(secFetchSite ? { 'sec-fetch-site': secFetchSite } : {}),
+      ...headers
+    },
     ...(method === 'POST' ? { body: JSON.stringify({ sha, q, ...(history !== undefined ? { history } : {}) }) } : {})
   })
   return worker.fetch(req, env)
@@ -255,6 +266,61 @@ test('worker /api/ask: GET reports whether the feature is configured', async () 
   assert.equal((await off.json()).configured, false)
   const on = await worker.fetch(new Request('https://x.test/api/ask'), fakeEnv(assets(), { LLM_API_KEY: 'k' }))
   assert.equal((await on.json()).configured, true)
+})
+
+test('worker /api/ask: GET stays open to anything and reports the per-isolate counters', async (t) => {
+  // The probe spends nothing, so it must keep answering for the page that decides
+  // whether to render the widget -- and the counters are the only reading of what
+  // the one paying route has been doing. They are per-isolate, so this is a floor
+  // rather than a total: the point is that a spend is visible at all.
+  let n = 0
+  t.mock.method(globalThis, 'fetch', async () => { n++; return sse(groundedReply) })
+  const env = fakeEnv(assets(), { LLM_API_KEY: 'k' })
+  const probe = async (e = env) => (await worker.fetch(new Request('https://x.test/api/ask'), e)).json()
+
+  const before = await probe()
+  assert.equal(before.configured, true)
+  assert.equal(typeof before.counters, 'object')
+  for (const k of ['asked', 'cacheHits', 'refused', 'notConfigured', 'rateLimited', 'errors']) {
+    assert.equal(typeof before.counters[k], 'number', `counters.${k} is a number`)
+  }
+  assert.equal(before.counters.asked, 0)
+
+  await ask(env, { q: 'One?' })
+  await ask(env, { q: 'One?' })
+  const after = await probe()
+  assert.equal(after.counters.asked, 1, 'one ask reached the model')
+  assert.equal(after.counters.cacheHits, 1, 'the repeat was the cache, not a second call')
+  assert.equal(n, 1)
+
+  // A deployment with no credential is counted apart from a model failure, so
+  // "nothing is configured" never reads as "the model is broken".
+  const off = fakeEnv(assets())
+  await ask(off, { q: 'Two?' })
+  assert.equal((await probe(off)).counters.notConfigured, 1)
+})
+
+test('worker /api/ask: a POST that proves nothing about where it came from is refused', async (t) => {
+  // The regression this guards: the check used to run only when an Origin header
+  // was present, so a request that sent neither header passed by saying nothing
+  // at all. That is exactly the shape of a bare script -- `curl` with a body --
+  // and this route bills per call, so absence has to be a refusal.
+  let n = 0
+  t.mock.method(globalThis, 'fetch', async () => { n++; return sse(groundedReply) })
+  const env = fakeEnv(assets(), { LLM_API_KEY: 'k' })
+
+  const bare = await ask(env, { origin: null, secFetchSite: null })
+  assert.equal(bare.status, 403, 'neither header is not a pass')
+  assert.match((await bare.json()).error, /must come from this site/)
+
+  const crossSite = await ask(env, { secFetchSite: 'cross-site' })
+  assert.equal(crossSite.status, 403, 'a page on another site is not this one')
+  const sameSite = await ask(env, { secFetchSite: 'same-site' })
+  assert.equal(sameSite.status, 403, 'a sibling subdomain is still another site')
+  const opaque = await ask(env, { origin: 'not a url' })
+  assert.equal(opaque.status, 403, 'an unreadable origin proves nothing')
+
+  assert.equal(n, 0, 'none of them reached the model')
 })
 
 test('worker /api/ask: unconfigured asks fail as unconfigured, never as a model error', async () => {

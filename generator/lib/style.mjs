@@ -21,6 +21,11 @@ a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,su
   --term-red:#f85149;
   --term-amber:#d29922;
   --term-cyan:#58a6ff;
+  /* Defined in every theme, not just light: these two are used through
+     var(--term-yellow,#d29922) fallbacks, and a dark-amber fallback on the
+     amber and green backgrounds was nearly invisible. */
+  --term-yellow:#d29922;
+  --term-purple:#a371f7;
   
   --code:#0a0d13;
 
@@ -36,6 +41,33 @@ a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,su
   --eli5-bg:rgba(210,153,34,.07);
   --eli5-rule:rgba(210,153,34,.25);
   --mark-bg:rgba(88,166,255,0.22);
+}
+
+/* One scale for type, space and measure.
+   The sheet had grown a size for every component that needed one -- 22 font
+   sizes between .62 and 1.45rem, and gaps of nearly every pixel from 1 to 36 --
+   which is why two rows that do the same job could differ by a step and look
+   like different things. These are the steps the sheet already uses most; new
+   work should pick from them instead of inventing the next one. */
+:root{
+  --font-mono:ui-monospace,"SF Mono","Cascadia Mono","JetBrains Mono",Menlo,Monaco,Consolas,monospace;
+  --t-xs:.68rem;     /* badges, counts, pills */
+  --t-sm:.74rem;     /* meta, hints, controls */
+  --t-md:.8rem;      /* rows and labels */
+  --t-base:.86rem;   /* dense body copy */
+  --t-read:.95rem;   /* prose: plain-English lines and summaries */
+  --t-title:1.05rem; /* page and panel titles */
+  --measure:92ch;    /* longest line document prose is allowed to run */
+  --sp-1:4px;
+  --sp-2:6px;
+  --sp-3:8px;
+  --sp-4:12px;
+  --sp-5:16px;
+}
+/* Phones get a smaller title step, so it does not wrap to three lines above a
+   one-line description. */
+@media (max-width:640px){
+  :root{--t-title:.95rem}
 }
 
 [data-theme="amber"]{
@@ -54,6 +86,8 @@ a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,su
   --term-red:#ff6f59;
   --term-amber:#ffb84d;
   --term-cyan:#ffa726;
+  --term-yellow:#ffb84d;
+  --term-purple:#d7a8ff;
   
   --code:#0c0802;
 
@@ -87,6 +121,8 @@ a:focus-visible,button:focus-visible,select:focus-visible,input:focus-visible,su
   --term-red:#ff5e5e;
   --term-amber:#c8ff54;
   --term-cyan:#62ffc8;
+  --term-yellow:#c8ff54;
+  --term-purple:#b9a2ff;
   
   --code:#020a03;
 
@@ -291,7 +327,7 @@ nav.term-nav a.active{
 }
 .term-box-hdr{
   display:flex;
-  align-items:center;
+  align-items:baseline;
   justify-content:space-between;
   border-bottom:1px solid var(--term-border);
   padding-bottom:10px;
@@ -301,9 +337,15 @@ nav.term-nav a.active{
   flex-wrap:wrap;
   gap:8px;
 }
+/* The page (and panel) title. It used to inherit the header's .82rem, which
+   put it *below* the .88rem section labels inside the same box -- every page
+   read as if its own title were a caption. It is the largest type in the box
+   now, and the description beside it stays at the header's size. */
 .term-box-title{
   color:var(--txt);
   font-weight:700;
+  font-size:var(--t-title);
+  line-height:1.3;
 }
 .term-box-head{
   font-size:.8rem;
@@ -484,7 +526,7 @@ nav.term-nav a.active{
   display:inline-flex;
   align-items:center;
   min-height:20px;
-  font-size:.66rem;
+  font-size:var(--t-xs);
   font-weight:600;
   padding:1px 6px;
   border-radius:2px;
@@ -616,7 +658,7 @@ nav.term-nav a.active{
 .chip{
   font:inherit;
   font-size:.76rem;
-  color:var(--txt-subtle);
+  color:var(--txt-dim);
   background:transparent;
   border:1px solid var(--term-border);
   border-radius:2px;
@@ -645,7 +687,7 @@ nav.term-nav a.active{
 #filter-select option{background:var(--panel);color:var(--txt)}
 /* Month nav on the /changes/ pages: same chip dialect, but links. */
 .browse-months{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 4px}
-.bmonth{display:inline-flex;align-items:center;font:inherit;font-size:.72rem;color:var(--txt-subtle);background:transparent;border:1px solid var(--term-border);border-radius:2px;padding:2px 8px;text-decoration:none}
+.bmonth{display:inline-flex;align-items:center;font:inherit;font-size:var(--t-sm);color:var(--txt-dim);background:transparent;border:1px solid var(--term-border);border-radius:2px;padding:2px 8px;text-decoration:none}
 .bmonth:hover{color:var(--txt);border-color:var(--term-border-strong)}
 .bmonth.active{color:var(--txt);border-color:var(--term-cyan);background:var(--cyan-tint-bg)}
 .filter-note{margin:0 0 10px;font-size:.8rem;color:var(--txt-subtle);text-align:center}
@@ -666,6 +708,68 @@ nav.term-nav a.active{
   padding:10px 14px 12px;
   border-top:1px solid var(--term-border);
 }
+/* A long identifier in prose -- a 40-character constant, a path -- is one
+   unbreakable token. Inside the narrow fold it ran past the card and was
+   clipped, so the tail of the name the sentence is about was simply missing.
+   Break it instead: a wrapped token reads, a clipped one lies. */
+.entry-body code{overflow-wrap:anywhere}
+
+/* --- The technical fold -----------------------------------------------------
+   An opened entry is two things: the plain-English line, and the record behind
+   it. The record was a flat stack -- the summary, then six identically framed
+   panels in a row -- which is what made an opened entry read as a wall rather
+   than a document. It is three labelled sections now, hanging off one rail, so
+   the panels inside are visibly *inside* the fold instead of more siblings of
+   its toggle. */
+.tech-body.power-body{
+  border-left:2px solid var(--term-border);
+  padding-left:14px;
+}
+.eb-group{margin:0 0 12px}
+.eb-group:last-child{margin-bottom:0}
+.eb-group-hdr{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin:0 0 6px;
+  font-size:var(--t-xs);
+  font-weight:700;
+  letter-spacing:.1em;
+  color:var(--txt-subtle);
+}
+/* The same ":: label ---" idiom the plain-English line uses, so a section header
+   inside the fold belongs to the entry it sits in rather than announcing itself
+   as another kind of thing. */
+.eb-group-hdr::before{content:':: ';opacity:.7}
+.eb-group-hdr::after{content:'';flex:1;height:1px;background:var(--term-border)}
+/* One rhythm for whatever a section holds, replacing the four different margins
+   the panels arrived with. Specificity, not sheet order, because .tech-body's
+   own rules for these blocks are written further down the file. */
+.power-body .eb-group > *{margin-top:0;margin-bottom:6px}
+.power-body .eb-group > *:last-child{margin-bottom:0}
+/* "Not in the diff" is the one panel whose content is a caveat, and amber is the
+   sheet's existing register for a human note that needs attention. The rest stay
+   neutral: colour here means something, so it is not spent on decoration. */
+.power-body .unknowns-details{border-left-color:var(--term-amber)}
+/* Every toggle in the fold reads the same way: label on the left, its note or
+   count hard against the right edge, where the eye can compare them down the
+   column. They used to sit after the label on some rows and after the chevron on
+   others, so the counts never lined up. */
+.power-body .facts-hint,
+.power-body .evidence-hint,
+.power-body .unknowns-hint,
+.power-body .schips-hint,
+.power-body .files-hint,
+.power-body .diff-badge,
+.power-body .power-hint{margin-left:auto}
+/* The panels carry prose as well, and it holds the same measure as the rest of
+   the site's document text. The plain-English lead is left out: it is the read,
+   and it earns the full column. */
+.power-body .summary,
+.power-body .evidence-body p,
+.power-body .unknowns-body p,
+.power-body .facts,
+.power-body .changes{max-width:var(--measure)}
 
 .model-swap{
   background:var(--code);
@@ -753,7 +857,7 @@ nav.term-nav a.active{
    that was never 260px wide, so the bar got the remainder (nothing) and the
    sparkline hung out of the card. Every column is budgeted now, and the track is
    the one that flexes. */
-.stat-row{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(48px,2fr) auto minmax(0,112px);grid-template-areas:"lbl track num trend";align-items:center;gap:4px 10px;font-size:.76rem;color:var(--txt-dim)}
+.stat-row{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(48px,1.8fr) auto minmax(0,112px);grid-template-areas:"lbl track num trend";align-items:center;gap:4px 10px;font-size:.76rem;color:var(--txt-dim)}
 .stat-row:hover{color:var(--txt)}
 .stat-lbl{grid-area:lbl;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .stat-lbl a{color:var(--txt-dim);text-decoration:none}
@@ -777,6 +881,12 @@ nav.term-nav a.active{
    "enrich-all --rewrite-stale" sit on their own line instead of overflowing
    left over the numeric value. */
 .quality-card .stat-row{grid-template-columns:minmax(0,1.15fr) minmax(48px,1.6fr) auto minmax(0,1.5fr)}
+/* Two cards carry no sparkline column at all: churn is a two-number figure, and
+   the model list has no per-row history on this page. Grid hands the leftover
+   space of a fr-set to any other track's growth limit, so the empty trend span
+   was still reserving its full 112px -- a quarter of a 434px card -- while the
+   names beside it truncated. A fixed 0px track cannot grow. */
+.stat-tight .stat-row{grid-template-columns:minmax(0,1.7fr) minmax(48px,1.25fr) auto 0px}
 .stat-trend .spark{margin:0;width:100%;max-width:112px}
 .cad-spark{margin:0 0 10px}
 /* The svg carries an intrinsic width, so max-width:100% only caps it, the cadence
@@ -798,8 +908,8 @@ nav.term-nav a.active{
 
 .summary{
   margin:6px 0;
-  font-size:.9rem;
-  line-height:1.6;
+  font-size:var(--t-read);
+  line-height:1.65;
   color:var(--txt-dim);
 }
 /* The plain-English line is a different register, not a lesser status: amber like
@@ -811,8 +921,8 @@ nav.term-nav a.active{
   border-left:3px solid var(--term-amber);
   background:var(--eli5-bg);
   border-radius:0 3px 3px 0;
-  font-size:.92rem;
-  line-height:1.6;
+  font-size:var(--t-read);
+  line-height:1.65;
   color:var(--txt);
 }
 .eli5-label{
@@ -1249,6 +1359,10 @@ nav.term-nav a.active{
 .meta-links{
   display:inline-flex;
   align-items:center;
+  /* The footer holds six links and two actions. On a phone that is wider than
+     the card, and the fold it sits in clips its overflow -- so the last links
+     were cut off with no way to reach them. Wrap instead. */
+  flex-wrap:wrap;
   gap:8px;
 }
 .meta-link{
@@ -1271,6 +1385,24 @@ button.meta-link{
 button.meta-link.dc-ok{
   color:var(--term-green);
   text-decoration:none;
+}
+/* The entry footer mixes identifiers (the commit, the PR, the compare range)
+   with actions (copy as Discord, copy a link). Giving the actions a button's
+   edge keeps that row from reading as one undifferentiated ribbon of dotted
+   links, where the two things a reader can *do* were the hardest to find. */
+.metarow .meta-links{gap:10px}
+.metarow .dc-copy,
+.metarow .copy-link{
+  border:1px solid var(--term-border);
+  border-radius:2px;
+  padding:2px 7px;
+  color:var(--txt-dim);
+  text-decoration:none;
+}
+.metarow .dc-copy:hover,
+.metarow .copy-link:hover{
+  border-color:var(--term-cyan);
+  color:var(--term-cyan);
 }
 
 .models-intro{margin:0 0 12px;font-size:.82rem;color:var(--txt-dim)}
@@ -1474,8 +1606,8 @@ button.meta-link.dc-ok{
 }
 .mt-grid{
   display:grid;
-  grid-template-columns:230px minmax(0,1fr) 150px;
-  gap:14px;
+  grid-template-columns:230px minmax(0,1fr) 200px;
+  gap:6px 16px;
   align-items:center;
 }
 .model-timeline-item > .mt-milestones-details{grid-column:1/-1}
@@ -1518,26 +1650,32 @@ button.meta-link.dc-ok{
   text-decoration:underline;
 }
 .mt-cell-bar{min-width:0}
+/* The date range and the days pill are one figure, so they hold one line: at
+   150px this cell wrapped "2026-08-05 -> 2026-09-10" onto a second line, which
+   made every one of the twenty rows 42px of meta in a 90px row. */
 .mt-cell-meta{
   display:flex;
   align-items:center;
   justify-content:flex-end;
   gap:8px;
-  flex-wrap:wrap;
+  flex-wrap:nowrap;
 }
 .mt-lifespan{
   color:var(--txt-subtle);
   font-family:monospace;
-  font-size:.70rem;
+  font-size:var(--t-sm);
+  font-variant-numeric:tabular-nums;
+  white-space:nowrap;
 }
 .mt-days-pill{
   background:rgba(255,255,255,0.04);
   border:1px solid var(--term-border);
-  padding:0 5px;
+  padding:1px 5px;
   border-radius:2px;
   font-family:monospace;
-  font-size:.68rem;
+  font-size:.7rem;
   color:var(--txt-dim);
+  font-variant-numeric:tabular-nums;
 }
 .mt-bar-track{
   position:relative;
@@ -1629,7 +1767,9 @@ button.meta-link.dc-ok{
   color:var(--txt-subtle);
   font-size:.68rem;
 }
-@media (max-width:640px){
+/* Below this the three fixed columns would leave the bar under ~180px, and the
+   date range is the widest content the grid holds, so the row stacks instead. */
+@media (max-width:760px){
   .mt-grid{grid-template-columns:1fr;gap:6px}
   .mt-cell-meta{justify-content:flex-start}
   .mt-axis-hdr{display:none}
@@ -1638,13 +1778,17 @@ button.meta-link.dc-ok{
 .search-input-row{
   display:flex;
   align-items:center;
-  gap:8px;
-  margin:10px 0;
+  gap:var(--sp-3);
+  margin:12px 0 10px;
   background:var(--code);
   border:1px solid var(--term-border);
-  padding:6px 10px;
+  padding:9px 12px;
   border-radius:2px;
   min-width:0;
+  transition:border-color .12s ease;
+}
+.search-input-row:focus-within{
+  border-color:var(--term-cyan);
 }
 #q{
   /* A flex item defaults to min-width:auto, i.e. never narrower than its
@@ -1658,10 +1802,11 @@ button.meta-link.dc-ok{
   font-family:inherit;
   /* The site's text runs .72-.82rem. An input left to inherit (or set to 1rem)
      took the 13.5px root instead, which made the query box the largest type on
-     the page. Match the .82rem of the models-page filter, and keep
-     .search-prompt with it so the row still reads as one size. The 16px in the
-     phone block below stays: it is the iOS no-zoom-on-focus floor. */
-  font-size:.82rem;
+     the page. This is the page's primary control, so it sits one step above the
+     body rows -- and .search-prompt with it, so the row still reads as one
+     size. The 16px in the phone block below stays: it is the iOS
+     no-zoom-on-focus floor. */
+  font-size:.9rem;
   line-height:1.45;
   padding:1px 0;
   outline:none;
@@ -1673,7 +1818,7 @@ button.meta-link.dc-ok{
 .search-prompt{
   color:var(--term-green);
   font-weight:700;
-  font-size:.82rem;
+  font-size:.9rem;
   white-space:nowrap;
 }
 .search-hint{
@@ -1850,16 +1995,20 @@ details.amonth{
   background:var(--panel);
   border:1px solid var(--term-border);
   border-radius:2px;
-  margin:0 0 6px;
+  margin:0 0 4px;
 }
 details.amonth>summary{
   list-style:none;
   display:flex;
   flex-wrap:wrap;
   align-items:baseline;
-  gap:10px;
-  padding:7px 10px;
+  gap:8px;
+  padding:6px 10px;
   cursor:pointer;
+  transition:background .12s ease;
+}
+details.amonth>summary:hover{
+  background:var(--panel-hover);
 }
 details.amonth>summary::-webkit-details-marker{display:none}
 details.amonth>summary::before{content:'\\25B8';color:var(--txt-dim);font-size:.7rem}
@@ -1867,8 +2016,10 @@ details.amonth[open]>summary::before{content:'\\25BE'}
 details.amonth[open]>summary{border-bottom:1px solid var(--term-border)}
 details.amonth>summary:hover .am-name{color:var(--txt)}
 .am-name{font-size:.84rem;font-weight:700;color:var(--txt)}
-.am-meta{font-size:.74rem;color:var(--txt-subtle)}
-.am-body{padding:8px 10px 10px}
+/* Pushed to the right edge: the counts then form a straight column down the
+   whole year instead of restarting after a month name of a different length. */
+.am-meta{margin-left:auto;font-size:var(--t-sm);color:var(--txt-subtle);font-variant-numeric:tabular-nums}
+.am-body{padding:var(--sp-2) 10px 10px}
 /* A release window can hold a thousand commits: the tail folds into compact rows
    so the page stays openable while staying complete. Same affordance as the
    archive month folds, so the arrow reads the same way. */
@@ -2239,7 +2390,7 @@ details.more-rows[open]>summary{margin-bottom:6px}
   line-height:1.55;
 }
 .man-body h4{
-  margin:16px 0 8px;
+  margin:var(--sp-5) 0 var(--sp-3);
   padding-top:10px;
   border-top:1px solid var(--term-border);
   color:var(--term-amber);
@@ -2275,10 +2426,11 @@ details.more-rows[open]>summary{margin-bottom:6px}
   display:block;
 }
 .man-ul{
-  margin:0 0 4px;
+  margin:0 0 var(--sp-1);
   padding-left:16px;
-  font-size:.86rem;
-  line-height:1.5;
+  font-size:var(--t-base);
+  line-height:1.58;
+  max-width:var(--measure);
 }
 .man-ul li{
   margin:0 0 5px;
@@ -2294,8 +2446,11 @@ details.more-rows[open]>summary{margin-bottom:6px}
   grid-template-columns:auto minmax(3.5rem,auto) minmax(0,1fr);
   gap:4px 14px;
   margin:0 0 12px;
-  font-size:.86rem;
-  line-height:1.5;
+  /* The counts table carries a third, prose column; it gets one step more room
+     than the measure the plain glossary above it holds to. */
+  max-width:calc(var(--measure) + 8ch);
+  font-size:var(--t-base);
+  line-height:1.58;
   align-items:baseline;
 }
 .man-dl dt{
@@ -2334,10 +2489,11 @@ details.more-rows[open]>summary{margin-bottom:6px}
   display:grid;
   grid-template-columns:auto minmax(0,1fr);
   gap:3px 14px;
-  margin:0 0 12px;
-  font-size:.86rem;
-  line-height:1.5;
+  margin:0 0 var(--sp-4);
+  font-size:var(--t-base);
+  line-height:1.58;
   align-items:baseline;
+  max-width:var(--measure);
 }
 .man-def dt{
   color:var(--txt);
@@ -2377,10 +2533,13 @@ details.more-rows[open]>summary{margin-bottom:6px}
   color:var(--term-cyan);
 }
 .man-body p{
-  margin:0 0 10px;
+  margin:0 0 var(--sp-5);
   color:var(--txt-dim);
-  font-size:.88rem;
-  line-height:1.55;
+  font-size:.9rem;
+  line-height:1.62;
+  /* A document page, so it holds to a reading measure: left unbounded these
+     paragraphs ran the box's full 848px, about 116 characters a line. */
+  max-width:var(--measure);
 }
 
 .pager{
@@ -2761,7 +2920,7 @@ details.entry.kb-active .entry-arrow{
   background:none;
   border:none;
   font:inherit;
-  color:var(--txt-subtle);
+  color:var(--txt-dim);
   cursor:pointer;
   padding:0;
   font-size:.74rem;
@@ -3000,11 +3159,11 @@ mark.search-match{
 
 /* Badges added in v8: security, audience, human-edited. */
 .badge.sec{color:var(--term-red,#f85149);border-color:rgba(248,81,73,.45)}
-.badge.aud{color:var(--txt-dim);border-color:var(--border,#30363d);text-transform:uppercase}
+.badge.aud{color:var(--txt-dim);border-color:var(--term-border);text-transform:uppercase}
 .badge.human{color:var(--term-green,#3fb950);border-color:rgba(63,185,80,.45)}
 
 /* AI preview on an open PR card. */
-.pr-preview-ai{margin:10px 0 8px;padding:10px 14px;background:var(--eli5-bg);border-left:3px solid var(--term-amber);border-radius:0 3px 3px 0;font-size:.92rem;line-height:1.6;color:var(--txt)}
+.pr-preview-ai{margin:10px 0 8px;padding:10px 14px;background:var(--eli5-bg);border-left:3px solid var(--term-amber);border-radius:0 3px 3px 0;font-size:var(--t-read);line-height:1.65;color:var(--txt)}
 .pr-preview-note{display:block;margin-top:6px;font-size:.76rem;color:var(--txt-subtle)}
 
 /* Weekly digest rows reuse the compact change rows. */
@@ -3060,7 +3219,7 @@ mark.search-match{
   margin:0;
 }
 .schips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 0}
-.schip{font-size:.72rem;padding:2px 7px;border:1px solid var(--border,#30363d);border-radius:3px;color:var(--txt-dim);white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
+.schip{font-size:.72rem;padding:2px 7px;border:1px solid var(--term-border);border-radius:3px;color:var(--txt-dim);white-space:nowrap;max-width:100%;overflow:hidden;text-overflow:ellipsis}
 .schip.const{border-color:rgba(210,153,34,.45)}
 .schip.const b{color:var(--term-yellow,#d29922);font-weight:600}
 .schip.env{color:var(--term-purple,#a371f7);border-color:rgba(163,113,247,.4)}
@@ -3156,6 +3315,17 @@ a.badge{text-decoration:none}
 a.badge:hover{text-decoration:none;color:var(--term-cyan)}
 
 /* Search syntax help and the guided empty state. */
+/* What the page does while the box is empty. The results region starts blank
+   and the index is fetched lazily, so without this the screen was a small box
+   above a page of nothing. */
+.search-idle{
+  margin:10px 0 2px;
+  font-size:var(--t-md);
+  line-height:1.55;
+  color:var(--txt-subtle);
+  max-width:var(--measure);
+}
+.search-idle b{color:var(--txt-dim);font-weight:600}
 .search-help{margin-top:10px;font-size:.76rem;color:var(--txt-subtle)}
 .search-help summary{cursor:pointer;color:var(--txt-dim)}
 .search-help-body{margin-top:8px;line-height:1.9;color:var(--txt-subtle)}

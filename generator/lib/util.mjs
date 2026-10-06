@@ -89,12 +89,18 @@ export async function writeBinary (path, buf) {
   await writeFile(path, buf)
 }
 
+// Escapes both quote styles, not just the double quote. Every attribute this
+// repository emits is double-quoted today, so the single quote is belt and
+// braces -- but it is exactly the kind of thing that is silently fine until
+// someone writes `href='...'` and turns a value into markup, and the client-side
+// htmlEsc() already covers both.
 export function escapeHtml (s) {
   return String(s)
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;')
 }
 
 export function truncate (s, n) {
