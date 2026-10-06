@@ -3362,12 +3362,11 @@ a.badge:hover{text-decoration:none;color:var(--term-cyan)}
 .sub-desc{grid-column:2 / span 2;font-size:.74rem;color:var(--txt-subtle)}
 @media (max-width:640px){.sub-row{grid-template-columns:auto 1fr}.sub-path{justify-self:start;grid-column:2}.sub-desc{grid-column:2}}
 
-/* The homepage sync widget: the relay made visible. The dot breathes while the
-   data is inside the freshness budget the [fresh]/[stale] badge uses, and holds
-   amber past it; the row wraps like the status bar above it on narrow screens. */
-.sync-widget{display:flex;flex-wrap:wrap;align-items:center;gap:2px 10px;padding:4px 0 6px;font-size:.75rem;color:var(--txt-subtle);border-top:1px dotted var(--term-border)}
-.sw-dot{width:8px;height:8px;border-radius:50%;background:var(--term-green);box-shadow:0 0 6px var(--term-green);animation:sw-breathe 2.4s ease-in-out infinite}
-.sync-widget.sw-stale .sw-dot{background:var(--term-amber);box-shadow:0 0 6px var(--term-amber);animation:none}
+/* The homepage freshness signal, inline in the status row: the dot breathes
+   while the data is inside the freshness budget and holds amber past it. */
+.sync-inline{display:inline-flex;align-items:center;gap:8px}
+.sw-dot{width:8px;height:8px;border-radius:50%;background:var(--term-green);box-shadow:0 0 6px var(--term-green);animation:sw-breathe 2.4s ease-in-out infinite;flex:none}
+#sync-widget.sw-stale .sw-dot{background:var(--term-amber);box-shadow:0 0 6px var(--term-amber);animation:none}
 @keyframes sw-breathe{0%,100%{opacity:1}50%{opacity:.3}}
 .sw-item b{color:var(--txt);font-variant-numeric:tabular-nums}
 .sw-pending{color:var(--term-amber)}
