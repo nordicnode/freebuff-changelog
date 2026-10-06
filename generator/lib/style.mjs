@@ -1156,6 +1156,16 @@ nav.term-nav a.active{
   color:var(--txt-subtle);
   border-style:dashed;
 }
+/* File chips are buttons (click toggles the full path); reset the UA button
+   chrome so they read as chips, not form controls. */
+button.fchip{
+  font:inherit;
+  cursor:pointer;
+}
+button.fchip:hover{
+  border-color:var(--term-border-strong);
+  color:var(--txt);
+}
 
 .diff-viewer{
   margin:10px 0 6px;

@@ -2356,3 +2356,47 @@ test('feed items emit the plain-English block and the technical block exactly on
   assert.match(json.content_html, /Details:/)
   assert.match(json.summary, /In plain English/)
 })
+
+test('polish: file chips expand on click and "+N more" reveals the rest', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-fchips-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const files = Array.from({ length: 15 }, (_, i) => `cli/src/deeply/nested/module/file${i}.ts`)
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 1 },
+    entries: [{
+      kind: 'sync', sha: 'a1'.repeat(20), date: '2026-09-19T10:00:00Z', day: '2026-09-19', month: '2026-09', author: 'dev',
+      areas: ['CLI'], category: 'CLI', significance: 'notable', summary: 's', title: 'Many files',
+      files: { total: 15, meaningful: 15, rawMeaningful: 15, testOnly: false, added: [], removed: [], renamed: [], modified: files },
+      stats: { additions: 30, deletions: 2 }
+    }]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const html = await readFile(join(dist, 'day/2026-09-19/index.html'), 'utf8')
+  assert.match(html, /<button type="button" class="fchip mod"[^>]*data-fullpath="cli\/src\/deeply\/nested\/module\/file0\.ts"/, 'chips are buttons carrying the full path')
+  assert.match(html, /data-shortpath="cli\/…\/file0\.ts"/, 'the label is the truncated form')
+  assert.equal((html.match(/ data-extra-file>/g) || []).length, 3, 'chips past the fold render hidden')
+  assert.match(html, /<button type="button" class="fchip more" data-expand-files[^>]*>\+3 more<\/button>/, '"+N more" is a reveal control')
+})
+
+test('polish: digest pagers label their disabled arrows, no SETTLED HISTORY jargon', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-polish-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const mk = (sha, date) => ({
+    kind: 'sync', sha, date, day: date.slice(0, 10), month: date.slice(0, 7), author: 'dev',
+    areas: ['CLI'], category: 'CLI', significance: 'minor', summary: 's', title: 't',
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/src/x.ts'] },
+    stats: { additions: 1, deletions: 0 }
+  })
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 2 },
+    entries: [mk('a1'.repeat(20), '2026-09-18T10:00:00Z'), mk('b2'.repeat(20), '2026-09-19T10:00:00Z')]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const week = await readFile(join(dist, 'week/2026-W38/index.html'), 'utf8')
+  assert.match(week, /pager-disabled" title="No newer week"/, 'the newest week pager labels its disabled arrow')
+  const older = await readFile(join(dist, 'day/2026-09-18/index.html'), 'utf8')
+  assert.doesNotMatch(older, /SETTLED HISTORY/, 'the jargon is gone from day pages')
+  assert.match(older, /archived day/, 'older days say what they are in plain words')
+})

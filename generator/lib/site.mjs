@@ -539,6 +539,30 @@ document.addEventListener('click', (ev) => {
   if (modal) setKbModal(modal.hidden);
 });
 
+// File chips: a truncated path (cli/…/x.ts) expands to its full form on click,
+// and the "+N more" chip reveals the file paths past the fold in place.
+document.addEventListener('click', (ev) => {
+  if (!ev.target.closest) return;
+  const more = ev.target.closest('[data-expand-files]');
+  if (more) {
+    const wrap = more.closest('.files');
+    if (wrap) wrap.querySelectorAll('[data-extra-file]').forEach(c => { c.hidden = false; });
+    more.hidden = true;
+    return;
+  }
+  const chip = ev.target.closest('.fchip[data-fullpath]');
+  if (!chip) return;
+  const full = chip.getAttribute('data-fullpath');
+  const short = chip.getAttribute('data-shortpath');
+  if (chip.textContent === full) {
+    chip.textContent = short;
+    chip.setAttribute('title', full + ' -- click to expand');
+  } else {
+    chip.textContent = full;
+    chip.setAttribute('title', full + ' -- click to collapse');
+  }
+});
+
 // Bulk expand/collapse for timeline
 document.addEventListener('click', (ev) => {
   const btn = ev.target.closest ? ev.target.closest('[data-bulk]') : null;
@@ -1183,13 +1207,16 @@ function fileChips (e) {
 
   if (!allItems.length) return ''
 
+  // Every chip is in the DOM; past the fold they start hidden and the "+N
+  // more" control reveals them in place. A chip is a real <button> so the
+  // truncated label (shortPath) can expand to the full path on click -- and on
+  // Enter/Space -- for mouse and keyboard alike.
   const maxShown = 12
-  const shownItems = allItems.slice(0, maxShown)
-  const chips = shownItems.map(item => `<span class="fchip ${item.type}" title="${esc(item.title)}">${esc(item.label)}</span>`)
+  const chips = allItems.map((item, idx) => `<button type="button" class="fchip ${item.type}" data-fullpath="${esc(item.title)}" data-shortpath="${esc(item.label)}" title="${esc(item.title)}${item.label !== item.title ? ' -- click to expand' : ''}"${idx >= maxShown ? ' hidden data-extra-file' : ''}>${esc(item.label)}</button>`)
 
   const totalFiles = Math.max(e.files.total || 0, allItems.length)
-  const extra = totalFiles - shownItems.length
-  if (extra > 0) chips.push(`<span class="fchip more">+${extra} more</span>`)
+  const extra = totalFiles - maxShown
+  if (allItems.length > maxShown) chips.push(`<button type="button" class="fchip more" data-expand-files title="Show the remaining file paths">+${extra} more</button>`)
 
   const hint = `(${totalFiles} file${totalFiles === 1 ? '' : 's'})`
 
@@ -2358,7 +2385,7 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
     const churn = rows.length - real
     const latest = i === 0
     // The footer on `/` is a live claim: HEAD and how old the data is.
-    // Every other day is settled, so it states the stamp it was built from and
+    // Every other day is archived, so it states the stamp it was built from and
     // deliberately carries no `.sync-age`/`data-generated` hook -- that is the
     // element the shell's aging and status poll looks for, and it only runs on
     // `/`; an update chip while someone reads July 2024 would be noise.
@@ -2366,7 +2393,7 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
       ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}" data-head="${esc(changelog.headSha || '')}" data-changes="${meaningful.length}">${esc(fmtDateHuman(generated))} UTC</span></span>`
       : `<span>DATA AS OF ${esc(String(generated).slice(0, 16).replace('T', ' '))} UTC</span>
       <span class="status-sep" aria-hidden="true">&middot;</span>
-      <span class="settled-badge">SETTLED HISTORY</span>`
+      <span class="settled-badge">archived day</span>`
 
     const catCounts = new Map()
     for (const e of rows) {
@@ -2438,7 +2465,7 @@ ${[
     <p class="filter-note" data-hub="/archive/#categories">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page &middot; <span id="filter-all"><a href="/archive/#categories">browse all changes by category</a></span></p>
   </div>`
 
-    // The relay made visible (newest day only; older days are settled history):
+    // The relay made visible (newest day only; older days are archived history):
     // one freshness line the shell ticker ages; the telemetry counts and the
     // raw build status ride behind the single [status] link (/stats/ and
     // /api/status.json, one click away).
@@ -3502,9 +3529,9 @@ ${archiveScript}`
     const range = formatWeekRange(w.monday, w.sunday)
 
     const pager = `<div class="pager">` +
-      (older ? `<a href="${weekHref(older)}" rel="prev">&larr; ${esc(older.key)}</a>` : '<span class="pager-disabled">&larr;</span>') +
+      (older ? `<a href="${weekHref(older)}" rel="prev">&larr; ${esc(older.key)}</a>` : '<span class="pager-disabled" title="No older week">&larr;<span class="sr-only"> no older week</span></span>') +
       `<span class="pager-page">WEEK ${esc(w.key)} &middot; ${esc(range)}</span>` +
-      (newer ? `<a href="${weekHref(newer)}" rel="next">${esc(newer.key)} &rarr;</a>` : '<span class="pager-disabled">&rarr;</span>') +
+      (newer ? `<a href="${weekHref(newer)}" rel="next">${esc(newer.key)} &rarr;</a>` : '<span class="pager-disabled" title="No newer week">&rarr;<span class="sr-only"> no newer week</span></span>') +
       `</div>`
 
     const tabs = []
