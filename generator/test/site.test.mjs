@@ -1790,6 +1790,38 @@ test('diff viewer escapes file paths and labels before innerHTML', async () => {
   }
 })
 
+// Every field the in-flight panel pulls from api.github.com must reach
+// innerHTML through escInFlight. The comment body used to take a shortcut --
+// angle brackets only, no quote/ampersand escaping -- so this pins the full
+// escaper on the least trustworthy field in the panel.
+test('in-flight live comment bodies go through escInFlight before innerHTML', async () => {
+  const changelog = {
+    version: 1, repo: 'https://github.com/CodebuffAI/freebuff',
+    generatedAt: '2026-09-19T12:00:00Z',
+    headSha: '1111222233334444555566667777888899990000',
+    counts: { entries: 1 },
+    entries: [{
+      kind: 'community', sha: 'cccc111122223333444455556666777788889999',
+      date: '2026-09-19T10:00:00Z', day: '2026-09-19', author: 'dev',
+      messageTitle: 'safe entry', title: 'safe entry', summary: 'safe entry',
+      areas: ['CLI'], category: 'CLI', significance: 'minor',
+      stats: { additions: 1, deletions: 0 },
+      files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: ['src/a.ts'], removed: [], renamed: [], modified: [] }
+    }]
+  }
+  const prs = [{ number: 101, title: 'A PR', author: 'alice', created: '2026-09-01T00:00:00Z' }]
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-xss3-'))
+  try {
+    await buildSite({ changelog, openPrs: prs, dist })
+    const html = await readFile(join(dist, 'in-flight/index.html'), 'utf8')
+    assert.match(html, /function escInFlight \(s\)/, 'the escaper ships on the page')
+    assert.match(html, /escInFlight\(\(c\.body \|\| ''\)/, 'comment bodies are escaped with escInFlight')
+    assert.doesNotMatch(html, /\(c\.body \|\| ''\)\.replace\(\/</, 'no angle-bracket-only shortcut for comment bodies')
+  } finally {
+    await rm(dist, { recursive: true, force: true })
+  }
+})
+
 // Every version badge used to link /release/<v>/ unconditionally, but only the
 // cli/release line gets a page: a freebuff/cli/release bump stores
 // `freebuffVersion` and deliberately writes none (VERSION_TRACKS in

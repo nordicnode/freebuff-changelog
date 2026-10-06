@@ -4580,13 +4580,17 @@ function escInFlight (s) {
           body.innerHTML = comments.map(function(c){
             var author = (c.user && c.user.login) ? c.user.login : 'user';
             var date = (c.created_at || '').slice(0, 16).replace('T', ' ');
-            var text = (c.body || '').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/[\\u{1F300}-\\u{1FAFF}]/gu, '');
+            // Comment bodies are the least trustworthy field in this panel: they
+            // go through the same escaper as every other API field (escInFlight
+            // covers quotes and ampersands too, not just angle brackets), and
+            // line breaks become <br> only after escaping.
+            var text = escInFlight((c.body || '').replace(/[\\u{1F300}-\\u{1FAFF}]/gu, '')).replace(/\\n/g, '<br>');
             return '<div class="pr-comment-row">' +
               '<div class="pr-comment-hdr">' +
                 '<span class="pr-comment-author">@' + escInFlight(author) + '</span>' +
                 '<a href="' + escInFlight(c.html_url || '') + '" target="_blank" rel="noopener" class="pr-comment-time">' + escInFlight(date) + '</a>' +
               '</div>' +
-              '<div class="pr-comment-body">' + text.replace(/\\n/g, '<br>') + '</div>' +
+              '<div class="pr-comment-body">' + text + '</div>' +
             '</div>';
           }).join('');
         }
