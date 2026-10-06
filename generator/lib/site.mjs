@@ -2786,6 +2786,10 @@ ${churnHtml}</section>`
 
   // ----- models timeline (catalog history: current lineup, retired, per-change rows)
   const { chrono: modelChrono, live: modelLive, retired: modelRetired } = modelTimeline(modelEntries)
+  // Catalog moves, not rows: one entry can swap several models at once, and the
+  // /stats/ MOST-CHANGED MODELS card counts the same way (one add/remove each),
+  // so the two pages must agree on this number.
+  const modelMoves = modelChrono.reduce((n, e) => n + (e.modelChanges?.added?.length || 0) + (e.modelChanges?.removed?.length || 0), 0)
   const modelLink = (m, cls, sign) => `<a class="${cls}" href="/models/${modelSlug(m)}/">${sign}${esc(m)}</a>`
   const modelCard = (m, cls, tag) => `<a class="model-card ${cls}" href="/models/${modelSlug(m)}/"><span class="mc-tag">${tag}</span>${esc(m)}</a>`
   const modelRows = modelChrono.map(e => {
@@ -2972,7 +2976,7 @@ ${churnHtml}</section>`
 
   await write(dist, 'models/index.html', layout({
     title: 'Models', path: '/models/',
-    desc: `Free model catalog history: ${modelLive.length} live, ${modelRetired.length} retired across ${modelChrono.length} changes.`,
+    desc: `Free model catalog history: ${modelLive.length} live, ${modelRetired.length} retired, ${modelMoves} catalog moves.`,
     body: `<section class="hero">
   <div class="term-box">
     <div class="term-box-hdr">
@@ -3018,9 +3022,9 @@ ${([...familyOf.entries()].filter(([, ms]) => ms.length > 1).length) ? `<details
   <div class="model-history">${[...familyOf.entries()].filter(([, ms]) => ms.length > 1).map(([fam]) => `<div class="model-row"><span class="model-row-title"><a href="/models/lineage/${esc(categorySlug(fam))}/">${esc(fam)}</a></span><span class="model-row-change">${lineageChainHtml(fam)}</span></div>`).join('')}</div>
 </details>` : ''}
 <details class="more-rows">
-  <summary>[ View chronological transition stream (${modelChrono.length} changes) ]</summary>
+  <summary>[ View chronological transition stream (${modelMoves} catalog moves) ]</summary>
   <div class="section-hdr" style="margin-top:12px">
-    <h2>CATALOG HISTORY (${modelChrono.length} CHANGES)</h2>
+    <h2>CATALOG HISTORY (${modelMoves} MOVES)</h2>
   </div>
   <div class="model-history">${modelRows}</div>
 </details>

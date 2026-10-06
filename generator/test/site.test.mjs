@@ -2017,6 +2017,38 @@ test('SEO: sitemap lists only URLs the build ships', async (t) => {
   assert.match(relXml, /\/release\/1\.0\.5\//, 'the release sitemap includes the built release page')
 })
 
+// /models/ and /stats/ count the same thing the same way: catalog moves
+// (one add/remove each), not changelog rows. One entry can swap several
+// models at once, which is where the old 23-vs-40 disagreement came from.
+test('models and stats agree on the catalog-move count', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-moves-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-19T12:00:00Z',
+    headSha: 'f'.repeat(40), counts: { entries: 2 },
+    entries: [
+      {
+        kind: 'sync', sha: 'a1'.repeat(20), date: '2026-09-19T10:00:00Z', day: '2026-09-19', month: '2026-09', author: 'dev',
+        areas: ['CLI'], category: 'Model Catalog', significance: 'major', summary: 's', title: 'Model swap',
+        modelChanges: { added: ['Model A', 'Model B'], removed: ['Model C'] },
+        files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['README.md'] },
+        stats: { additions: 4, deletions: 2 }
+      },
+      {
+        kind: 'sync', sha: 'b2'.repeat(20), date: '2026-09-18T10:00:00Z', day: '2026-09-18', month: '2026-09', author: 'dev',
+        areas: ['CLI'], category: 'Model Catalog', significance: 'major', summary: 's', title: 'Model add',
+        modelChanges: { added: ['Model D'], removed: [] },
+        files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['README.md'] },
+        stats: { additions: 2, deletions: 0 }
+      }
+    ]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const models = await readFile(join(dist, 'models/index.html'), 'utf8')
+  assert.match(models, /CATALOG HISTORY \(4 MOVES\)/, '/models counts moves, not rows')
+  const stats = await readFile(join(dist, 'stats/index.html'), 'utf8')
+  assert.match(stats, /4 catalog moves across 4 models/, '/stats agrees on the move count')
+})
 // Both version lines get release pages now: the 1.0.x codebuff-cli line and
 // the 0.x freebuff-cli line (VERSION_TRACKS in analyze.mjs). A badge that names
 // a version must never point at a page the build did not write.
