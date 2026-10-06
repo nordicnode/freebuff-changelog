@@ -243,24 +243,12 @@ function scrollToEl (el, block) {
   sel.addEventListener('mousedown', hydrate);
 })();
 
-function updateSyncAge() {
-  const el = document.querySelector('.sync-age');
-  if (!el || !el.dataset.generated) return;
-  const ageMin = Math.max(0, Math.floor((Date.now() - Date.parse(el.dataset.generated)) / 60000));
-  // Two budgets, not a magic number: one overdue pass just means a sync is in
-  // flight, which is normal. Two missed passes means the loop is not running.
-  const budgetMin = Number(el.dataset.budgetMin) || 5;
-  const fresh = ageMin < budgetMin * 2;
-  el.textContent = el.textContent.replace(/\\s*\\[.*\\]$/, '') + (fresh ? ' [fresh]' : ' [stale ' + ageMin + 'm]');
-  el.style.color = fresh ? 'var(--term-green)' : 'var(--term-amber)';
-}
-updateSyncAge();
-
-// The homepage sync widget makes the 30s relay visible: "last sync" ticks from
-// the build stamp and the dot follows the same fresh/stale budget as the footer
-// badge, while autoUpdate's /api/status.json poll flips [update ready] when a
-// newer build lands. The counts and the raw status link that used to ride here
-// sit behind the one [status] link (/stats/ page, /api/status.json raw).
+// The homepage freshness signal is one element now: the #sync-widget span in
+// the status row ticks "synced Xm ago" every second, its dot follows the same
+// fresh/stale budget as the footer badge, and autoUpdate's /api/status.json
+// poll flips [update ready] when a newer build lands. The telemetry counts
+// and the raw build status ride behind the single [status] link (/stats/
+// page, /api/status.json raw).
 (function setupSyncWidget() {
   var w = document.getElementById('sync-widget');
   if (!w) return;
@@ -340,7 +328,7 @@ updateSyncAge();
 (function autoUpdate() {
   const path = location.pathname;
   if (path !== '/' && path !== '/index.html') return;
-  const el = document.querySelector('.sync-age');
+  const el = document.getElementById('sync-widget');
   if (!el || !el.dataset.generated) return;
   const initialGenerated = el.dataset.generated;
   const initialHead = el.dataset.head || '';
@@ -2392,11 +2380,17 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
     const latest = i === 0
     // The footer on `/` is a live claim: HEAD and how old the data is.
     // Every other day is archived, so it states the stamp it was built from and
-    // deliberately carries no `.sync-age`/`data-generated` hook -- that is the
+    // deliberately carries no `#sync-widget`/`data-generated` hook -- that is the
     // element the shell's aging and status poll looks for, and it only runs on
     // `/`; an update chip while someone reads July 2024 would be noise.
     const freshness = latest
-      ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a> &middot; updated <span class="sync-age" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}" data-head="${esc(changelog.headSha || '')}" data-changes="${meaningful.length}">${esc(fmtDateHuman(generated))} UTC</span></span>`
+      // One freshness signal, not three: the HEAD link, a live "synced Xm ago"
+      // with the fresh/stale dot, the [update ready] chip and the [status]
+      // link. The absolute build stamp rides in the title attribute for
+      // no-JS readers; the ticking relative age is the JS enhancement.
+      ? `<span>HEAD: <a href="https://github.com/CodebuffAI/freebuff/commit/${esc(changelog.headSha || '')}" target="_blank" rel="noopener">${esc((changelog.headSha || '').slice(0, 10))}</a></span>
+      <span class="status-sep" aria-hidden="true">&middot;</span>
+      <span class="sync-inline" id="sync-widget" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}" data-head="${esc(changelog.headSha || '')}" data-changes="${meaningful.length}"><span class="sw-dot" aria-hidden="true"></span><span class="sw-item" title="${esc(fmtDateHuman(generated))} UTC">synced <b class="sw-updated">${esc(fmtDateHuman(generated))} UTC</b></span><span class="sw-pending" hidden>[update ready]</span><a class="sw-api" href="/stats/" title="Telemetry on /stats/ (raw build status: /api/status.json)">[status]</a></span>`
       : `<span>DATA AS OF ${esc(String(generated).slice(0, 16).replace('T', ' '))} UTC</span>
       <span class="status-sep" aria-hidden="true">&middot;</span>
       <span class="settled-badge">archived day</span>`
@@ -2471,22 +2465,11 @@ ${[
     <p class="filter-note" data-hub="/archive/#categories">showing <b id="filter-count">${real}</b> of ${rows.length} rows on this page &middot; <span id="filter-all"><a href="/archive/#categories">browse all changes by category</a></span></p>
   </div>`
 
-    // The relay made visible (newest day only; older days are archived history):
-    // one freshness line the shell ticker ages; the telemetry counts and the
-    // raw build status ride behind the single [status] link (/stats/ and
-    // /api/status.json, one click away).
-    const syncWidget = latest ? `<div class="sync-widget" id="sync-widget" data-generated="${esc(generated)}" data-budget-min="${syncBudgetMin}">
-  <span class="sw-dot" aria-hidden="true"></span>
-  <span class="sw-item">last sync <b class="sw-updated">${esc(fmtDateHuman(generated))} UTC</b></span>
-  <span class="sw-pending" hidden>[update ready]</span>
-  <a class="sw-api" href="/stats/" title="Telemetry on /stats/ (raw build status: /api/status.json)">[status]</a>
-</div>` : ''
     const hero = `
 <section class="hero timeline-hero">
   <div class="term-box term-box-slim timeline-control">
     ${topPager}
     ${statusRow}
-    ${syncWidget}
     ${filterRow}
     ${latest ? '' : `<p class="timeline-settled-note">Reconstructed public snapshot commits pushed to CodebuffAI/freebuff on this date.</p>`}
   </div>

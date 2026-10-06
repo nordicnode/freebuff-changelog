@@ -255,7 +255,7 @@ test('buildSite generates valid static site output', async () => {
     // backfill loop owns freshness now, so "next :00" would be fiction.
     assert.match(indexHtml, new RegExp('data-budget-min="' + Math.round(syncStaleMs({}) / 60000) + '"'))
     assert.doesNotMatch(indexHtml, /setUTCHours/)
-    assert.match(indexHtml, /dataset\.budgetMin/)
+    assert.match(indexHtml, /getAttribute\('data-budget-min'\)/, 'the live age ticker keys off the sync budget, not the wall-clock hour')
     assert.match(indexHtml, /<h2><time datetime="2026-09-13">\[ Sep 13, 2026 \]<\/time><\/h2>/)
     assert.doesNotMatch(indexHtml, /== \[ Sep 13, 2026 \] ==/)
 
@@ -370,7 +370,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(inFlightStats, /View diff preview/)
 
     // Verify sync freshness badge and status API
-    assert.match(indexHtml, /class="sync-age"/)
+    assert.match(indexHtml, /id="sync-widget"/, 'the freshness signal lives in the status row')
     assert.match(indexHtml, /data-generated="2026-09-13T12:00:00Z"/)
     const feedText = await readFile(join(tmpDist, 'feed.xml'), 'utf8')
     assert.doesNotMatch(feedText, /eeee11112222/, 'churn does not appear in RSS')
@@ -424,10 +424,10 @@ test('buildSite generates valid static site output', async () => {
     // sit on an old stamp forever once the loop has moved on -- so the poll
     // repaints in place. It must never reload: the reader's scroll position,
     // open diff, and half-finished Ask-the-AI question all live in this document.
-    assert.match(indexHtml, /budgetMin \* 2/)
+    assert.match(indexHtml, /budgetMs \* 2/, 'the header widget keys its stale state off the sync budget')
     assert.doesNotMatch(indexHtml, /location\.reload\(/, 'the homepage never reloads itself')
     assert.match(indexHtml, /visibilitychange/)
-    assert.match(indexHtml, /data-head=/, 'sync-age includes commit head sha')
+    assert.match(indexHtml, /data-head=/, 'the freshness hook includes commit head sha')
     assert.match(indexHtml, /\/api\/status\.json/, 'client auto-updater polls status API')
     assert.match(indexHtml, /fbPlainMode/, 'layout head and client scripts persist plain English mode')
     assert.match(indexHtml, /reading-mode-plain/, 'reading-mode-plain is supported in layout scripts')
@@ -943,7 +943,7 @@ test('homepage ships the sync-status widget, newest day only', async () => {
     for (const [name, html] of [['/', index], ['/day/2026-09-13/', newest]]) {
       assert.ok(html.includes('id="sync-widget"'), `${name} carries the sync widget (the newest day is live, read from either URL)`)
       assert.ok(html.includes('class="sw-api" href="/stats/"'), `${name} widget links the telemetry page (raw status: /api/status.json)`)
-      assert.match(html, /last sync <b class="sw-updated">/, `${name} shows the build stamp without scripting`)
+      assert.match(html, /synced <b class="sw-updated">/, `${name} shows the build stamp without scripting`)
     }
     assert.ok(!older.includes('id="sync-widget"'), 'settled days stay settled: no widget on older day pages')
     assert.ok(index.includes('fbSyncPaint'), 'the widget is wired to the /api/status.json poll (update-ready chip)')
@@ -1038,13 +1038,13 @@ test('the timeline paginates one day per page and keeps every entry reachable', 
 
     // Freshness follows the data, not the URL: both views of the newest day are
     // live. A settled day prints the stamp it was built from and carries no
-    // `.sync-age`/`data-generated` hook, because that is what the shell's aging and
+    // `#sync-widget`/`data-generated` hook, because that is what the shell's aging and
     // reload-when-behind logic looks for -- an auto-refresh while someone reads an
     // old day would yank the page out from under them.
-    assert.match(latest, /class="sync-age"/)
-    assert.match(d12, /class="sync-age"/)
+    assert.match(latest, /id="sync-widget"/)
+    assert.match(d12, /id="sync-widget"/)
     assert.match(d11, /class="settled-badge">archived day</)
-    assert.doesNotMatch(d11, /class="sync-val"|class="sync-age"|data-generated=/)
+    assert.doesNotMatch(d11, /id="sync-widget"|data-generated=/)
     assert.match(d11, /DATA AS OF \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/)
 
     // Walking dates: older to the left (rel=prev, the site's reading order), newer
