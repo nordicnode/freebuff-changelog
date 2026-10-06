@@ -312,7 +312,9 @@ export function feedItem (siteUrl, e, titleOf, storyNotes = []) {
   // The plain-English block and the technical summary already live in
   // <description>; repeating them here doubled every item, so content:encoded
   // carries only what description does not: the model catalog delta, the
-  // "Details" facts list, and the links.
+  // "Details" facts list, and the links. Story notes stay in both on purpose:
+  // they are cross-posted related context, not duplicated sections, and a
+  // full-text reader should see them too.
   const factsHtml = (e.facts || []).slice(0, 5).map(f => `<li>${esc(String(f)).slice(0, 400)}</li>`).join('')
   const modelChangesHtml = (e.modelChanges?.added?.length || e.modelChanges?.removed?.length)
     ? `<p><b>Model catalog:</b></p><ul>`
@@ -321,6 +323,7 @@ export function feedItem (siteUrl, e, titleOf, storyNotes = []) {
       + `</ul>`
     : ''
   const content = [
+    ...storyNotes.map(n => `<p><b>Related access context:</b> ${esc(n.text)} <a href="${siteUrl}/day/${n.day}/#${n.anchor}">Related entry</a></p>`),
     modelChangesHtml,
     factsHtml ? `<p><b>Details:</b></p><ul>${factsHtml}</ul>` : '',
     `<p><a href="${siteUrl}/day/${e.day}/#${e.sha.slice(0, 12)}">View on changelog</a> · <a href="${e.url || `https://github.com/CodebuffAI/freebuff/commit/${e.sha}`}">Commit ${e.sha.slice(0, 8)}</a>${e.prUrl ? ` · <a href="${e.prUrl}">PR #${e.pr}</a>` : ''}</p>`
@@ -397,10 +400,12 @@ export function jsonItem (siteUrl, e, titleOf, storyNotes = []) {
   const summary = String(e.ai?.summary || e.summary || '').replace(/[*`#]/g, '').trim()
   const eli5 = e.eli5?.text ? String(e.eli5.text).replace(/[*`#]/g, '').trim() : ''
   const facts = (e.facts || []).slice(0, 5).map(f => `<li>${esc(String(f)).slice(0, 400)}</li>`).join('')
-  // content_html carries only what `summary` does not: the plain-English block,
-  // the technical summary, and the related-access-context notes already live
-  // in `summary`, so repeating them here doubled every item.
+  // content_html carries only what `summary` does not: the plain-English block
+  // and the technical summary already live in `summary`, so repeating them
+  // here doubled every item. The related-access-context notes stay in both on
+  // purpose: they are cross-posted related context, not duplicated sections.
   const html = [
+    ...storyNotes.map(n => `<p><b>Related access context:</b> ${esc(n.text)} <a href="${siteUrl}/day/${n.day}/#${n.anchor}">Related entry</a></p>`),
     facts ? `<p><b>Details:</b></p><ul>${facts}</ul>` : ''
   ].filter(Boolean).join('')
 
