@@ -36,10 +36,12 @@ import { resolveAssetLimits } from './distbudget.mjs'
 // its og card, and its api record shard), 2 per release (the release page and its
 // notes.md), and 1 per open-PR preview. The fixed tail is feeds, badges, the
 // category/week/model pages, the root documents and the api singletons; it
-// measured ~460 and is rounded up for margin.
+// measured ~460 and is rounded up for margin. The 2026-10-06 site work added 7
+// more fixed files (sitemap.xml + 4 sub-sitemaps, robots.txt, api/sha-day.json),
+// so the overhead moves 512 -> 520 to keep the margin honest.
 export const PER_DAY_FILES = 4
 export const PER_RELEASE_FILES = 2
-export const DIST_OVERHEAD_FILES = 512
+export const DIST_OVERHEAD_FILES = 520
 
 export function fixedAssetCount ({ dayCount = 0, releaseCount = 0, prPreviewCount = 0, overheadFiles = DIST_OVERHEAD_FILES } = {}) {
   return dayCount * PER_DAY_FILES + releaseCount * PER_RELEASE_FILES + prPreviewCount + overheadFiles

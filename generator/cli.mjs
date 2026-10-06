@@ -1630,7 +1630,11 @@ async function cmdBuild () {
   const retention = planAssetRetention({
     entries: changelog.entries,
     days: [...new Set(changelog.entries.map(e => e.day))],
-    releaseCount: new Set(changelog.entries.filter(e => e.version).map(e => e.version)).size,
+    // Both version lines: e.version is the 1.0.x codebuff-cli line, e.freebuffVersion
+    // the 0.x freebuff-cli line. Both get release pages (2 files each), so both
+    // must be counted -- counting only e.version undercounted the fixed families
+    // by every 0.x release and broke the check-dist budget gate.
+    releaseCount: new Set(changelog.entries.map(e => e.version || e.freebuffVersion).filter(Boolean)).size,
     prPreviewCount: prs.length,
     limits: resolveAssetLimits(process.env)
   })
