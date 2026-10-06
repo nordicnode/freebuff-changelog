@@ -213,7 +213,7 @@ test('buildSite generates valid static site output', async () => {
     const indexHtml = await readFile(join(tmpDist, 'index.html'), 'utf8')
     // Rows now carry filter metadata, so open/hidden has to be read off the tag
     // instead of matching one fixed attribute order.
-    const rowTags = (html) => (html.match(/<details class="entry [^"]*" id="[0-9a-f]{12}"[^>]*>/g) || [])
+    const rowTags = (html) => (html.match(/<details class="(?:entry [^"]*|minor-row)" id="[0-9a-f]{12}"[^>]*>/g) || [])
     const tagOf = (html, sha) => rowTags(html).find(t => t.includes('id="' + sha + '"'))
     const isOpen = (t) => !!t && / open>$/.test(t)
     const isHidden = (t) => !!t && / hidden/.test(t)
@@ -354,8 +354,10 @@ test('buildSite generates valid static site output', async () => {
     // 360px viewport - 40 main padding - 34 box - 18 row - 6 gap - 86 for the
     // "$ grep -i" prompt = 180px of input, and a 16px monospace advance is 9.6px.
     assert.doesNotMatch(searchHtml, /placeholder="[^"]{19,}"/, 'the placeholder has to fit the narrowest phone')
-    assert.match(searchHtml, /<select id="fcat">/)
-    assert.match(searchHtml, /<select id="fsig">/)
+    assert.match(searchHtml, /<select id="fcat" name="cat">/)
+    assert.match(searchHtml, /<select id="fsig" name="sig">/)
+    assert.match(searchHtml, /<input id="q" name="q" type="search"/, 'the query box is a named GET form control for no-JS submits')
+    assert.match(searchHtml, /<form id="search-form" method="get" action="\/search\/" role="search">/)
     assert.match(searchHtml, /<option value="CLI">/)
 
     // Verify in-flight cards render diffstats and diff preview placeholders
@@ -561,7 +563,7 @@ test('buildSite generates valid static site output', async () => {
     assert.match(modelsHtml, /href="\/models\/muse-spark-1-3\/"/)
     assert.match(modelsHtml, /Muse Spark 1\.3/)
     assert.match(modelsHtml, /Muse Spark 1\.2/)
-    assert.match(modelsHtml, /CATALOG HISTORY \(1 CHANGES\)/)
+    assert.match(modelsHtml, /CATALOG HISTORY \(2 MOVES\)/)
     assert.match(modelsHtml, /\/day\/2026-09-13\/#bbbb11112222/)
     assert.match(modelsHtml, /\/models\//)
     assert.match(modelsHtml, /href="\/feed-models\.xml"/)
@@ -1041,7 +1043,7 @@ test('the timeline paginates one day per page and keeps every entry reachable', 
     // old day would yank the page out from under them.
     assert.match(latest, /class="sync-age"/)
     assert.match(d12, /class="sync-age"/)
-    assert.match(d11, /class="settled-badge">SETTLED HISTORY</)
+    assert.match(d11, /class="settled-badge">archived day</)
     assert.doesNotMatch(d11, /class="sync-val"|class="sync-age"|data-generated=/)
     assert.match(d11, /DATA AS OF \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/)
 
@@ -1181,7 +1183,7 @@ test('a settled day shows its stored roll-up above the entries, escaped, and onl
 
     const older = await readFile(join(tmpDist, 'day/2026-09-13/index.html'), 'utf8')
     assert.match(older, /class="day-rollup"/, 'the settled day renders the digest box')
-    assert.match(older, /DAY_ROLLUP :: Sep 13, 2026/)
+    assert.match(older, /READ THIS FIRST :: Sep 13, 2026/)
     assert.match(older, /Fixed the project picker opening behind the sidebar\./)
     assert.match(older, /2 highlights/)
     assert.match(older, /Added &lt;unsafe&gt; &amp; &quot;quoted&quot; text\./, 'stored bullets are escaped like every other text')
