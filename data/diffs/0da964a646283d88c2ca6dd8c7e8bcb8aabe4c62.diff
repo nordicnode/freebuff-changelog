@@ -1,0 +1,676 @@
+diff --git a/packages/agent-runtime/src/__tests__/compact-history-now.test.ts b/packages/agent-runtime/src/__tests__/compact-history-now.test.ts
+index 51d424343..03b60f3b0 100644
+--- a/packages/agent-runtime/src/__tests__/compact-history-now.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-history-now.test.ts
+@@ -1,89 +1,93 @@
+-// The forced pass. `maybeCompactHistory` answers "is this worth doing unasked";
+-// `compactHistoryNow` is what a host calls when the user has already decided, so
+-// what it pins is that the decision is the only thing removed — the protected
+-// prefix, the fresh tool exchange and the budget are all still the shared ones —
+-// plus the two answers a caller has to be able to tell apart: a reduction, and
+-// nothing worth doing.
++// The mechanical pass on its own. `evaluateCompactionTrigger` answers "is this
++// worth doing unasked"; `compactHistoryNow` is what runs once that is settled —
++// a user's /compact, or the runtime's fallback when a model compaction fails —
++// so what it pins is that the decision is the only thing removed — the
++// protected prefix, the fresh tool exchange and the budget are all still the
++// shared ones — plus the two answers a caller has to be able to tell apart: a
++// reduction, and nothing worth doing.
+ 
+ import { describe, expect, it } from 'bun:test'
+ 
+-import { compactHistoryNow, maybeCompactHistory } from '../compact-history'
++import {
++  compactHistoryNow,
++  evaluateCompactionTrigger,
++} from '../compact-history'
+ import { countTokensMessages } from '../util/token-counter'
+ 
+ import type { JSONValue } from '@codebuff/common/types/json'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ 
+ const user = (text: string): Message => ({
+   role: 'user',
+   tags: ['USER_PROMPT'],
+   content: [{ type: 'text', text }],
+ })
+ const assistant = (text: string): Message => ({
+   role: 'assistant',
+   content: [{ type: 'text', text }],
+   sentAt: Date.now(),
+ })
+ const call = (id: string, paths: unknown[] = ['file.ts']): Message => ({
+   role: 'assistant',
+   content: [
+     { type: 'tool-call', toolCallId: id, toolName: 'read_files', input: { paths } },
+   ],
+ })
+ const tool = (id: string, value: JSONValue): Message => ({
+   role: 'tool',
+   toolCallId: id,
+   toolName: 'read_files',
+   content: [{ type: 'json', value }],
+ })
+ const read = (id: string, content: string, path = 'file.ts') =>
+   tool(id, [{ path, content, referencedBy: {} }])
+ 
+ /** A settled conversation: several exchanges, then a final assistant answer. */
+ const settledHistory = (): Message[] => [
+   user('Add a retry to the uploader.'),
+   call('a', ['uploader.ts']),
+   read('a', 'export const upload = () => {}\n'.repeat(400), 'uploader.ts'),
+   assistant('Added the retry.'),
+   user('Now document it.'),
+   call('b', ['README.md']),
+   read('b', '# docs\n'.repeat(400), 'README.md'),
+   assistant('Documented.'),
+ ]
+ 
+ describe('compactHistoryNow', () => {
+   it('compacts a history the triggers would have left alone', () => {
+     const messages = settledHistory()
+     const contextTokenCount = countTokensMessages(messages)
+     // Well under the budget and the cache is warm: nothing to trigger on.
+     expect(
+-      maybeCompactHistory({
++      evaluateCompactionTrigger({
+         messages,
+         contextTokenCount,
+         maxContextLength: 400_000,
+         cacheExpiryMs: null,
+-      }),
++      }).trigger,
+     ).toBeNull()
+ 
+     const forced = compactHistoryNow({ messages, maxContextLength: 400_000 })
+     expect(forced).not.toBeNull()
+     expect(forced!.nextTokens).toBeLessThan(forced!.previousTokens)
+     expect(countTokensMessages(forced!.messages)).toBe(forced!.nextTokens)
+     expect(JSON.stringify(forced!.messages)).not.toContain(
+       'export const upload',
+     )
+   })
+ 
+   it('keeps the last request live and the files it named in memory', () => {
+     const forced = compactHistoryNow({
+       messages: settledHistory(),
+       maxContextLength: 400_000,
+     })!
+     const live = forced.messages.filter((message) =>
+       message.tags?.includes('USER_PROMPT'),
+     )
+     expect(live).toHaveLength(1)
+     expect(JSON.stringify(live[0])).toContain('Now document it')
+     // The mechanical summary keeps what was read and edited, not its contents.
+     expect(JSON.stringify(forced.messages)).toContain('uploader.ts')
+   })
+ 
+@@ -109,26 +113,107 @@ describe('compactHistoryNow', () => {
+ 
+   it('answers null for an empty history', () => {
+     expect(
+       compactHistoryNow({ messages: [], maxContextLength: 400_000 }),
+     ).toBeNull()
+   })
+ 
+   it('subtracts the fixed overhead from the budget it fits into', () => {
+     const messages = settledHistory()
+     const forced = compactHistoryNow({
+       messages,
+       maxContextLength: 8_000,
+       fixedTokenCount: 4_000,
+     })!
+     expect(forced.nextTokens).toBeLessThanOrEqual(4_000)
+   })
+ 
+   it('throws the runtime sentence when the live request alone is over budget', () => {
+     expect(() =>
+       compactHistoryNow({
+         messages: [...settledHistory(), user('x'.repeat(20_000))],
+         maxContextLength: 1_000,
+       }),
+     ).toThrow(/exceed the configured context window/)
+   })
++
++  it('logs the trigger and the pruner-compatible stats', () => {
++    const logs: Array<Record<string, any>> = []
++    const logger = {
++      debug: () => {},
++      info: (data: Record<string, any>) => logs.push(data),
++      warn: () => {},
++      error: () => {},
++    } as any
++
++    compactHistoryNow({
++      messages: settledHistory(),
++      maxContextLength: 400_000,
++      trigger: 'cache_expiry',
++      logger,
++      runId: 'run-1',
++    })
++
++    expect(logs).toHaveLength(1)
++    const [event] = logs
++    expect(event.axiomEvent).toBe('context_compaction_completed')
++    expect(event.agent_run_id).toBe('run-1')
++    expect(event.trigger_reason).toBe('cache_expiry')
++    // Field names the context-pruner already emits, so the two can be queried
++    // as one series. Every key must be snake_case.
++    for (const key of [
++      'mid_turn',
++      'user_budget',
++      'assistant_tool_budget',
++      'previous_summary_entry_count',
++      'user_entry_count',
++      'dropped_user_entry_count',
++      'assistant_tool_entry_count',
++      'dropped_assistant_tool_entry_count',
++      'newest_entry_forced',
++      'live_user_prompt_found',
++      'summary_estimated_tokens',
++    ]) {
++      expect(event).toHaveProperty(key)
++    }
++    expect(Object.keys(event).filter((k) => /[A-Z]/.test(k))).toEqual([
++      'axiomEvent',
++    ])
++  })
++
++  it('reports a pass with no trigger as manual', () => {
++    const logs: Array<Record<string, any>> = []
++    const logger = {
++      debug: () => {},
++      info: (data: Record<string, any>) => logs.push(data),
++      warn: () => {},
++      error: () => {},
++    } as any
++
++    compactHistoryNow({
++      messages: settledHistory(),
++      maxContextLength: 400_000,
++      logger,
++    })
++
++    expect(logs[0].trigger_reason).toBe('manual')
++  })
++
++  it('never throws when the logger does', () => {
++    const brokenLogger = {
++      debug: () => {},
++      info: () => {
++        throw new Error('logger unavailable')
++      },
++      warn: () => {},
++      error: () => {},
++    } as any
++
++    expect(
++      compactHistoryNow({
++        messages: settledHistory(),
++        maxContextLength: 400_000,
++        logger: brokenLogger,
++      }),
++    ).not.toBeNull()
++  })
+ })
+diff --git a/packages/agent-runtime/src/__tests__/compact-history.test.ts b/packages/agent-runtime/src/__tests__/compact-history.test.ts
+index bc7d8874f..62934eaa0 100644
+--- a/packages/agent-runtime/src/__tests__/compact-history.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-history.test.ts
+@@ -1,33 +1,32 @@
+ import { describe, expect, it } from 'bun:test'
+ 
+ import {
+   compactMessages,
+   DEFAULT_CACHE_EXPIRY_MIN_TOKENS,
+   DEFAULT_CACHE_EXPIRY_MS,
+   evaluateCompactionTrigger,
+-  maybeCompactHistory,
+   promptCacheGapMs,
+ } from '../compact-history'
+ 
+ import { compactionPolicyForModel } from '@codebuff/common/constants/compaction-policy'
+ 
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ 
+ const MINUTE = 60 * 1000
+ 
+ const user = (text: string, tags?: string[]): Message => ({
+   role: 'user',
+   content: [{ type: 'text', text }],
+   ...(tags ? { tags } : {}),
+   sentAt: 1,
+ })
+ 
+ const assistant = (text: string): Message => ({
+   role: 'assistant',
+   content: [{ type: 'text', text }],
+   sentAt: 1,
+ })
+ 
+ const assistantToolCall = (
+   toolName: string,
+   input: Record<string, unknown>,
+@@ -438,172 +437,59 @@ describe('evaluateCompactionTrigger', () => {
+     const compacted = compact(history)
+     expect(triggerFor(compacted, WORTH_COMPACTING)).toBeNull()
+ 
+     // ...and stays gone as the turn accumulates more work.
+     expect(
+       triggerFor(
+         [...compacted, assistant('one'), assistant('two')],
+         WORTH_COMPACTING,
+       ),
+     ).toBeNull()
+   })
+ 
+   it('fires again on the next turn if the user idles again', () => {
+     const nextTurn: Message[] = [
+       ...compact(idleTurn(90)),
+       { ...assistant('done'), sentAt: 2_000_000 },
+       {
+         ...user('another question', ['USER_PROMPT']),
+         sentAt: 2_000_000 + 90 * MINUTE,
+       },
+     ]
+     expect(triggerFor(nextTurn, WORTH_COMPACTING)).toBe('cache_expiry')
+   })
+ })
+ 
+-describe('maybeCompactHistory', () => {
+-  const overBudget = {
+-    contextTokenCount: 500_000,
+-    maxContextLength: 400_000,
+-  }
+-
+-  it('returns null when no trigger fires', () => {
+-    expect(
+-      maybeCompactHistory({
+-        messages: idleTurn(5),
+-        contextTokenCount: DEFAULT_CACHE_EXPIRY_MIN_TOKENS,
+-        maxContextLength: 400_000,
+-      }),
+-    ).toBeNull()
+-  })
+-
+-  it('compacts when a trigger fires', () => {
+-    const result = maybeCompactHistory({
+-      messages: [user('question', ['USER_PROMPT']), assistant('answer')],
+-      ...overBudget,
+-    })
+-    expect(result).not.toBeNull()
+-    expect(textOf(result![0])).toContain('<conversation_summary>')
+-  })
+-
+-  it('logs the trigger, the cache gap and the pruner-compatible stats', () => {
+-    const logs: Array<Record<string, any>> = []
+-    const logger = {
+-      debug: () => {},
+-      info: (data: Record<string, any>) => logs.push(data),
+-      warn: () => {},
+-      error: () => {},
+-    } as any
+-
+-    maybeCompactHistory({
+-      messages: idleTurn(90),
+-      contextTokenCount: DEFAULT_CACHE_EXPIRY_MIN_TOKENS,
+-      maxContextLength: 400_000,
+-      logger,
+-      runId: 'run-1',
+-    })
+-
+-    expect(logs).toHaveLength(1)
+-    const [event] = logs
+-    expect(event.axiomEvent).toBe('context_compaction_completed')
+-    expect(event.agent_run_id).toBe('run-1')
+-    expect(event.trigger_reason).toBe('cache_expiry')
+-    expect(event.cache_gap_ms).toBe(90 * MINUTE)
+-    expect(event.cache_expiry_ms).toBe(DEFAULT_CACHE_EXPIRY_MS)
+-    // Field names the context-pruner already emits, so the two can be queried
+-    // as one series. Every key must be snake_case.
+-    for (const key of [
+-      'mid_turn',
+-      'user_budget',
+-      'assistant_tool_budget',
+-      'previous_summary_entry_count',
+-      'user_entry_count',
+-      'dropped_user_entry_count',
+-      'assistant_tool_entry_count',
+-      'dropped_assistant_tool_entry_count',
+-      'newest_entry_forced',
+-      'live_user_prompt_found',
+-      'summary_estimated_tokens',
+-      'cache_expiry_min_tokens',
+-    ]) {
+-      expect(event).toHaveProperty(key)
+-    }
+-    expect(Object.keys(event).filter((k) => /[A-Z]/.test(k))).toEqual([
+-      'axiomEvent',
+-    ])
+-  })
+-
+-  it('omits the cache fields when the trigger is disabled', () => {
+-    const logs: Array<Record<string, any>> = []
+-    const logger = {
+-      debug: () => {},
+-      info: (data: Record<string, any>) => logs.push(data),
+-      warn: () => {},
+-      error: () => {},
+-    } as any
+-
+-    maybeCompactHistory({
+-      messages: idleTurn(600),
+-      ...overBudget,
+-      cacheExpiryMs: null,
+-      logger,
+-    })
+-
+-    expect(logs[0].trigger_reason).toBe('context_limit')
+-    expect(logs[0]).not.toHaveProperty('cache_gap_ms')
+-    expect(logs[0]).not.toHaveProperty('cache_expiry_ms')
+-  })
+-
+-  it('never throws when the logger does', () => {
+-    const brokenLogger = {
+-      debug: () => {},
+-      info: () => {
+-        throw new Error('logger unavailable')
+-      },
+-      warn: () => {},
+-      error: () => {},
+-    } as any
+-
+-    expect(() =>
+-      maybeCompactHistory({
+-        messages: [user('question', ['USER_PROMPT']), assistant('answer')],
+-        ...overBudget,
+-        logger: brokenLogger,
+-      }),
+-    ).not.toThrow()
+-  })
+-})
+-
+-describe('per-model compaction policies at the runtime entry point', () => {
++describe('per-model compaction policies at the runtime trigger', () => {
+   const resumedHistory = (gapMinutes: number): Message[] => [
+     { ...assistant('done for now'), sentAt: 1_000_000 },
+     {
+       ...user('back after a break', ['USER_PROMPT']),
+       sentAt: 1_000_000 + gapMinutes * MINUTE,
+     },
+   ]
+   const compacts = (model: string, gapMinutes: number, tokens: number) =>
+-    maybeCompactHistory({
++    evaluateCompactionTrigger({
+       ...compactionPolicyForModel(model),
+       messages: resumedHistory(gapMinutes),
+       contextTokenCount: tokens,
+       maxContextLength: 400_000,
+-    }) !== null
++    }).trigger !== null
+ 
+   it('the runtime default floor is two summary ceilings (20k + 50k, doubled)', () => {
+     expect(DEFAULT_CACHE_EXPIRY_MIN_TOKENS).toBe(2 * (20_000 + 50_000))
+     expect(DEFAULT_CACHE_EXPIRY_MS).toBe(60 * MINUTE)
+   })
+ 
+   it('DeepSeek Flash compacts a 60k thread after 16 minutes, not 14, and never under 40k', () => {
+     const flash = 'deepseek/deepseek-v4-flash'
+     expect(compacts(flash, 16, 60_000)).toBe(true)
+     expect(compacts(flash, 14, 60_000)).toBe(false)
+     expect(compacts(flash, 30, 39_999)).toBe(false)
+   })
+ 
+   it('every other model stays on the hour / 140k', () => {
+     const pro = 'deepseek/deepseek-v4-pro'
+     expect(compacts(pro, 61, 60_000)).toBe(false)
+     expect(compacts(pro, 61, 200_000)).toBe(true)
+   })
+ })
+diff --git a/packages/agent-runtime/src/__tests__/compact-request-budget.test.ts b/packages/agent-runtime/src/__tests__/compact-request-budget.test.ts
+index 3315d9ce1..795f45238 100644
+--- a/packages/agent-runtime/src/__tests__/compact-request-budget.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-request-budget.test.ts
+@@ -1,99 +1,96 @@
+ import { describe, expect, it } from 'bun:test'
+ 
+-import { compactMessages, maybeCompactHistory } from '../compact-history'
++import { compactHistoryNow, compactMessages } from '../compact-history'
+ import { fitToolResults } from '../util/fit-tool-results'
+ import { countTokensMessages } from '../util/token-counter'
+ 
+ import type { JSONValue } from '@codebuff/common/types/json'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ 
+ const user = (text: string): Message => ({
+   role: 'user',
+   tags: ['USER_PROMPT'],
+   content: [{ type: 'text', text }],
+ })
+ const call = (
+   id: string,
+   toolName = 'read_files',
+   paths: unknown[] = ['file.ts'],
+ ): Message => ({
+   role: 'assistant',
+   content: [{ type: 'tool-call', toolCallId: id, toolName, input: { paths } }],
+ })
+ const tool = (
+   id: string,
+   value: JSONValue,
+   toolName = 'read_files',
+ ): Message => ({
+   role: 'tool',
+   toolCallId: id,
+   toolName,
+   content: [{ type: 'json', value }],
+ })
+ const read = (id: string, content: string, path = 'file.ts') =>
+   tool(id, [{ path, content, referencedBy: {} }])
+ const compact = (
+   messages: Message[],
+   maxContextLength = 4096,
+   fixedTokenCount = 500,
+ ) =>
+-  maybeCompactHistory({
+-    messages,
+-    contextTokenCount: 100_000,
+-    maxContextLength,
+-    fixedTokenCount,
+-    cacheExpiryMs: null,
+-  })!
++  compactHistoryNow({ messages, maxContextLength, fixedTokenCount })!.messages
+ 
+ describe('request-sized compaction', () => {
+   it('preserves every call/result in a parallel batch and the current prompt', () => {
+     const messages = [
+       user('older request'),
+       call('old'),
+       read('old', 'old payload '.repeat(5000)),
+       user('Edit both files, without changing their exports.'),
+       call('a', 'read_files', ['a.ts']),
+       call('b', 'read_files', ['b.ts']),
+       read('a', 'export const a = 1', 'a.ts'),
+       read('b', 'export const b = 2', 'b.ts'),
+     ]
+     const output = compact(messages)
+     expect(countTokensMessages(output) + 500).toBeLessThanOrEqual(4096)
+     expect(output.slice(-4)).toEqual(messages.slice(-4))
+     expect(
+       output.some(
+         (message) =>
+           message.tags?.includes('USER_PROMPT') &&
+           JSON.stringify(message).includes('without changing their exports'),
+       ),
+     ).toBe(true)
+     expect(JSON.stringify(output)).not.toContain('old payload')
+   })
+ 
+   it('keeps steering messages after the fresh tool batch in order', () => {
+     const messages = [
++      user('older request'),
++      call('old'),
++      read('old', 'old payload '.repeat(5000)),
+       user('Original request'),
+       call('a'),
+       read('a', 'const value = 1'),
+       user('First correction'),
+       user('Second correction'),
+     ]
+     const output = compact(messages)
+     expect(output.slice(-4)).toEqual(messages.slice(-4))
+     expect(JSON.stringify(output)).toContain('Original request')
+   })
+ 
+   it('bounds a summary even when historical user messages exceed a small model window', () => {
+     const messages = [
+       ...Array.from({ length: 3 }, (_, i) =>
+         user(
+           `Old requirements ${i}: ` +
+             'Preserve keyboard navigation and layout. '.repeat(1000),
+         ),
+       ),
+       {
+         role: 'assistant' as const,
+         content: [
+           { type: 'text' as const, text: 'Completed the prior requests.' },
+         ],
+       },
+diff --git a/packages/agent-runtime/src/compact-history.ts b/packages/agent-runtime/src/compact-history.ts
+index da6ba855a..c7e231285 100644
+--- a/packages/agent-runtime/src/compact-history.ts
++++ b/packages/agent-runtime/src/compact-history.ts
+@@ -1095,128 +1095,58 @@ export function evaluateCompactionTrigger(params: {
+     params.cacheExpiryMinTokens === undefined
+       ? DEFAULT_CACHE_EXPIRY_MIN_TOKENS
+       : params.cacheExpiryMinTokens
+ 
+   const overContextLimit = contextTokenCount > maxContextLength
+   const worthCompacting =
+     cacheExpiryMinTokens === null || contextTokenCount >= cacheExpiryMinTokens
+   const cacheGapMs =
+     cacheExpiryMs === null || !worthCompacting
+       ? null
+       : promptCacheGapMs(messages)
+   const cacheExpired =
+     cacheExpiryMs !== null && cacheGapMs !== null && cacheGapMs > cacheExpiryMs
+ 
+   const trigger: CompactionTrigger | null = overContextLimit
+     ? cacheExpired
+       ? 'context_limit_and_cache_expiry'
+       : 'context_limit'
+     : cacheExpired
+       ? 'cache_expiry'
+       : null
+ 
+   return { trigger, cacheGapMs, cacheExpiryMs, cacheExpiryMinTokens }
+ }
+ 
+-/**
+- * Runtime entry point for `compactContext` agents: decides, compacts and logs.
+- * Returns null when the history should be left alone.
+- *
+- * Never calls a model, so it cannot fail on a provider error and has no
+- * fallback path — the previous LLM-summarizing version returned the full
+- * history when the call failed, which left the context over budget.
+- */
+-export function maybeCompactHistory(params: {
+-  messages: Message[]
+-  contextTokenCount: number
+-  maxContextLength: number
+-  /** System prompt, tool schemas and next step's scaffolding, outside history. */
+-  fixedTokenCount?: number
+-  /** Pass null to compact on the context limit only. */
+-  cacheExpiryMs?: number | null
+-  /** Pass null to take the opportunistic compaction at any size. */
+-  cacheExpiryMinTokens?: number | null
+-  logger?: Logger
+-  runId?: string
+-  onCompaction?: (trigger: CompactionTrigger) => void
+-}): Message[] | null {
+-  const { messages, contextTokenCount, maxContextLength, logger, runId } =
+-    params
+-
+-  const { trigger, cacheGapMs, cacheExpiryMs, cacheExpiryMinTokens } =
+-    evaluateCompactionTrigger({
+-      messages,
+-      contextTokenCount,
+-      maxContextLength,
+-      cacheExpiryMs: params.cacheExpiryMs,
+-      cacheExpiryMinTokens: params.cacheExpiryMinTokens,
+-    })
+-  if (!trigger) return null
+-
+-  const result = compactRequestHistory(
+-    messages,
+-    maxContextLength - (params.fixedTokenCount ?? 0),
+-  )
+-  try {
+-    params.onCompaction?.(trigger)
+-  } catch {
+-    // Reporting must never block the compaction itself.
+-  }
+-
+-  // Telemetry is best-effort and must never block the compaction itself.
+-  try {
+-    logger?.info(
+-      {
+-        axiomEvent: CONTEXT_COMPACTION_COMPLETED_EVENT,
+-        agent_run_id: runId,
+-        trigger_reason: trigger,
+-        context_token_count: contextTokenCount,
+-        max_context_length: maxContextLength,
+-        ...(cacheGapMs === null ? {} : { cache_gap_ms: cacheGapMs }),
+-        ...(cacheExpiryMs === null ? {} : { cache_expiry_ms: cacheExpiryMs }),
+-        ...(cacheExpiryMinTokens === null
+-          ? {}
+-          : { cache_expiry_min_tokens: cacheExpiryMinTokens }),
+-        message_count: messages.length,
+-        ...result.stats,
+-      },
+-      'Context compaction completed',
+-    )
+-  } catch {
+-    // Ignore logging failures.
+-  }
+-
+-  return result.messages
+-}
+-
+ /**
+  * Compact once, on demand, whatever the triggers say.
+  *
+- * Same mechanical pass `maybeCompactHistory` runs — same protected prefix, same
+- * fresh tool exchange, same budget walk — with the decision removed. A user who
+- * asks for it has already decided; `evaluateCompactionTrigger` exists to answer
+- * "is this worth doing unasked", which is a different question.
++ * The mechanical pass — protected prefix, fresh tool exchange, budget walk —
++ * with no decision attached. A user who asks for it has already decided;
++ * `evaluateCompactionTrigger` exists to answer "is this worth doing unasked",
++ * which is a different question. It is also the runtime's fallback when a
++ * model compaction fails (`compactWithModelOrFallback`).
+  *
+  * Returns null when the pass would not make the history smaller. That is not a
+  * failure, it is the honest answer for a short conversation: rewriting it would
+  * break the provider's prompt cache and hand back an envelope around the same
+  * content. The caller reports it as a no-op rather than a compaction.
+  *
+  * Throws what `compactRequestHistory` throws — the live request alone over
+  * budget — with its user-presentable sentence intact.
+  */
+ export function compactHistoryNow(params: {
+   messages: Message[]
+   maxContextLength: number
+   /** System prompt, tool schemas and next step's scaffolding, outside history. */
+   fixedTokenCount?: number
+   /** Why the caller compacted; a forced pass is `manual`. */
+   trigger?: CompactionTrigger | 'manual'
+   logger?: Logger
+   runId?: string
+ }): {
+   messages: Message[]
+   /** Text of the installed summary message; '' when none fit. */
+   summaryText: string
+   previousTokens: number
+   nextTokens: number
+ } | null {
