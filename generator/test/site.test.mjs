@@ -11,6 +11,7 @@ import { escapeHtml, shortHash } from '../lib/util.mjs'
 import { feedItem, jsonItem } from '../lib/feed.mjs'
 import { syncStaleMs } from '../lib/sync.mjs'
 import { planAssetRetention } from '../lib/retention.mjs'
+import worker from '../../worker.js'
 
 // _headers rules cannot override each other on Cloudflare: every rule whose
 // pattern matches a URL is applied, and a header name set twice is *joined* with
@@ -1820,6 +1821,31 @@ test('in-flight live comment bodies go through escInFlight before innerHTML', as
   } finally {
     await rm(dist, { recursive: true, force: true })
   }
+})
+
+// /c/<sha> resolves without JavaScript: the worker 302s to the day page that
+// holds the entry, through the single api/sha-day.json asset (no per-sha
+// files, so the asset budget is untouched). Retention-withheld diffs keep
+// their day pages -- retention only drops the stored diff -- so the redirect
+// target exists for every sha in the map.
+test('worker /c/<sha>: 302s to the entry\'s day page, unknown shas fall through', async () => {
+  const files = { '/api/sha-day.json': JSON.stringify({ abcdef123456: '2026-10-05' }) }
+  const env = { ASSETS: { fetch: async (req) => { const p = new URL(req.url).pathname; return p in files ? new Response(files[p], { status: 200 }) : new Response('not found', { status: 404 }) } } }
+  const get = (path) => worker.fetch(new Request(`https://x.test${path}`), env)
+
+  const exact = await get('/c/abcdef123456')
+  assert.equal(exact.status, 302)
+  assert.equal(exact.headers.get('location'), 'https://x.test/day/2026-10-05/#abcdef123456')
+
+  const prefix = await get('/c/abcdef')
+  assert.equal(prefix.status, 302)
+  assert.equal(prefix.headers.get('location'), 'https://x.test/day/2026-10-05/#abcdef123456')
+
+  const trailing = await get('/c/abcdef123456/')
+  assert.equal(trailing.status, 302, 'trailing slash still resolves')
+
+  const unknown = await get('/c/000000000000')
+  assert.notEqual(unknown.status, 302, 'an unknown sha falls through to the /c/ shell, not a redirect')
 })
 
 // Every version badge used to link /release/<v>/ unconditionally, but only the

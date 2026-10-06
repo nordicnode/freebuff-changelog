@@ -1,11 +1,15 @@
 // worker.js - the one line of compute on top of the static dist/.
 //
-// The site is a zero-dependency static build; exactly two answers need to vary
-// per request:
+// The site is a zero-dependency static build; exactly three answers need to
+// vary per request:
 //   /api/entry/<sha>[.json]     one entry's machine-readable record
 //                               (sliced out of api/records/<day>.json via
 //                               api/sha-day.json -- per-entry files would blow
 //                               the Workers asset cap)
+//   /c/<sha>                    302 to /day/<date>#<sha> via api/sha-day.json,
+//                               so the permalink resolves without JavaScript
+//                               (crawlers, no-JS readers); unknown shas fall
+//                               through to the /c/ shell
 //   /release/<v>/?format=md     that release's notes as text/markdown
 //                               (the same bytes as release/<v>/notes.md)
 // and, belt-and-braces alongside the _redirects rule, the day-range view:
@@ -146,6 +150,18 @@ async function handle (request, env) {
       : json({ error: `no changelog entry records ${em[1]}` }, 404)
   }
 
+  // /c/<sha> without JavaScript: a 302 to the day page that holds the entry,
+  // resolved through the same short-sha -> day map the /api/entry route uses.
+  // The map is one static asset (api/sha-day.json), so this costs no per-sha
+  // files and the asset budget is untouched; crawlers and no-JS readers land
+  // on the server-rendered day page with the entry's #sha anchor. An unknown
+  // sha falls through to the /c/ shell, which explains the miss.
+  const cm = /^\/c\/([0-9a-f]{4,40})\/?$/i.exec(url.pathname)
+  if (cm) {
+    const resolved = await resolveShaKey(env, request, cm[1].toLowerCase())
+    if (resolved) return Response.redirect(new URL(`/day/${resolved.day}/#${resolved.key}`, request.url).toString(), 302)
+  }
+
   if (url.searchParams.get('format') === 'md') {
     const rm = /^\/release\/([^/]+)\/?$/.exec(url.pathname)
     if (rm) {
@@ -189,6 +205,22 @@ async function findEntryRecord (env, request, want) {
   return loaded.records.find(x => x.sha.startsWith(loaded.key) || loaded.key.startsWith(x.sha)) || null
 }
 
+// Short-sha -> day resolution shared by /api/entry and /c/<sha>. The map is
+// the build's api/sha-day.json; the parsed copy is cached for a minute because
+// an isolate warmed before a deploy would otherwise serve the old map forever.
+async function resolveShaKey (env, request, want) {
+  if (!shaDay.map || Date.now() - shaDay.at > 60000) {
+    const text = await assetText(env, request, '/api/sha-day.json')
+    shaDay = { map: text ? JSON.parse(text) : {}, at: Date.now() }
+  }
+  const map = shaDay.map
+  const key = Object.prototype.hasOwnProperty.call(map, want)
+    ? want
+    : Object.keys(map).find(k => k.startsWith(want) || want.startsWith(k))
+  if (!key) return null
+  return { key, day: map[key] }
+}
+
 // Same-day neighbours for Ask context: the closest entries in the same day
 // shard, so "is this related to X?" questions have something true to stand
 // on. Titles plus a short summary each, capped at four: the shard is already
@@ -211,18 +243,11 @@ function nearbyRecords (records, entry, n = 4) {
 }
 
 async function loadDayRecords (env, request, want) {
-  if (!shaDay.map || Date.now() - shaDay.at > 60000) {
-    const text = await assetText(env, request, '/api/sha-day.json')
-    shaDay = { map: text ? JSON.parse(text) : {}, at: Date.now() }
-  }
-  const map = shaDay.map
-  const key = Object.prototype.hasOwnProperty.call(map, want)
-    ? want
-    : Object.keys(map).find(k => k.startsWith(want) || want.startsWith(k))
-  if (!key) return null
-  const shard = await assetText(env, request, `/api/records/${map[key]}.json`)
+  const resolved = await resolveShaKey(env, request, want)
+  if (!resolved) return null
+  const shard = await assetText(env, request, `/api/records/${resolved.day}.json`)
   if (!shard) return null
-  return { key, records: JSON.parse(shard).records || [] }
+  return { key: resolved.key, records: JSON.parse(shard).records || [] }
 }
 
 // GET reports whether the feature is enabled so the page can hide or show the
