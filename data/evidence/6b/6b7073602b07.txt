@@ -1,0 +1,3534 @@
+Date: 2026-10-06T21:48:06Z
+Category: Agent Runtime
+Areas: Shared/Core, Agent Runtime
+Commit nature: production
+Stats: +277 / -148
+Analysis notes: Shared/Core, Agent Runtime changes across 3 file(s) (+277/−148).
+Modified files: common/src/constants/compaction-policy.ts, common/src/templates/initial-agents-dir/types/agent-definition.ts, packages/agent-runtime/src/run-agent-step.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Percent of users whose compactions, on every trigger, run the mechanical pass (a ~12k summary plus a working set of file reads) instead of the model handoff. - Opt in to in-process context compaction. Defaults to false. - An automatic pass must leave the run under its own trigger, or the next step fires it again on its output. The mechanical pass aims lower: it keeps no findings, so it needs room to work in. - Mechanical for the user's cohort, on every trigger. On the idle trigger the cache is already cold, so a summarizer would read the whole cold history first: it costs more than the prefill it saves and the user waits for it. - Opportunistic: a history it cannot fit is left alone. - A compaction failure must never fail the turn: a summarizer error or malformed handoff falls back to the mechanical pass.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Constants newly defined: DETERMINISTIC_COMPACTION_PERCENT = 10 ; DETERMINISTIC_COMPACTION_SALT = 'deterministic_compaction_2026_10' (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)
+- Exports added: DETERMINISTIC_COMPACTION_PERCENT, usesDeterministicCompaction
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "usesDeterministicCompaction" ; "splits users close to the configured share" ; "a larger share only adds users" ; "0 keeps everyone on the handoff; 100 moves everyone, signed out too" ; "runs the model handoff for the test user, who is in the model cohort" ; "compacts mechanically at the context limit for the deterministic cohort" ; "compacts mechanically on the idle trigger in the cohort: no summarizer request"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `common/src/constants/compaction-policy.ts`:
+```
+/** Leave input headroom for the model-based compaction request. */
+```
+- File `common/src/templates/initial-agents-dir/types/agent-definition.ts`:
+```
+/**
+ * Codebuff Agent Type Definitions
+ *
+ * This file provides TypeScript type definitions for creating custom Codebuff agents.
+ * Import these types in your agent files to get full type safety and IntelliSense.
+ *
+ * Usage in .agents/your-agent.ts:
+ *   import { AgentDefinition, ToolName, ModelName } from './types/agent-definition'
+ *
+ *   const definition: AgentDefinition = {
+ *     // ... your agent configuration with full type safety ...
+ *   }
+ *
+ *   export default definition
+ */
+```
+Complete Source of Modified Files (for complete module context):
+- File `common/src/constants/compaction-policy.ts` (101 lines):
+```
+import { FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID } from './freebuff-model-ids'
+import { fnv1a } from '../util/ad-experiment'
+
+/** Leave input headroom for the model-based compaction request. */
+export function modelCompactionThreshold(maxContextLength: number): number {
+  return Math.floor(maxContextLength * 0.8)
+}
+
+/**
+ * When a root agent rewrites its own history after an idle gap: the user
+ * comes back after `cacheExpiryMs` of silence AND the history is at least
+ * `cacheExpiryMinTokens`. Below the floor a cold cache is not enough, because
+ * compaction costs inference and some detail. The context-limit trigger
+ * ignores the floor. For the users in `usesDeterministicCompaction` every
+ * pass is mechanical (no model call); for the rest it is a model handoff with
+ * the mechanical pass as fallback.
+ *
+ * The numbers live only here. base3 roots hand the object to the runtime as
+ * `compactContext`; the runtime defaults `compactContext: true` to
+ * DEFAULT_COMPACTION_POLICY; and serialized `handleSteps` that spawn
+ * context-pruner (base2, base-chat) receive it as
+ * `AgentStepContext.contextPruning`, resolved in run-programmatic-step.ts.
+ * Exactly these two keys: `compactContext` is validated with a strict schema.
+ */
+export type CompactionPolicy = {
+  cacheExpiryMs: number
+  cacheExpiryMinTokens: number
+}
+
+/**
+ * One hour: the idle trigger is a product knob, not a TTL tracker. Compaction
+ * never prevents the cold prefill after a gap, it only shrinks it at the price
+ * of dropped tool results, and under an hour that reads as "the model forgot
+ * everything" (a top user complaint) while the cache may still be warm.
+ *
+ * 140k tokens is two mechanical summary ceilings (20k assistant/tool + 50k
+ * user, in compact-history.ts). Below one ceiling the budget walk evicts
+ * nothing, so a mostly-prose history comes back the same size plus the
+ * envelope; the second ceiling is margin for the two sides being measured with
+ * different rulers (`chars / 3` against a BPE count).
+ */
+export const DEFAULT_COMPACTION_POLICY: CompactionPolicy = {
+  cacheExpiryMs: 60 * 60 * 1000,
+  cacheExpiryMinTokens: 140_000,
+}
+
+/**
+ * DeepSeek V4 Flash, whose front lane is Luminal.
+ *
+ * 15 minutes is about how long Luminal keeps a session's prefix cache. Past
+ * that the next prompt re-reads everything at full price either way, so the
+ * hour only buys a bigger cold prefill.
+ *
+ * 40k tokens rather than 140k because the hour-era floor assumed a marginal
+ * trade, and here it is not. Measured with the runtime's own pass: the
+ * per-message transforms alone strip ~87% of a tool-heavy coding history at
+ * every size, so the budget walk the 140k figure waits for never matters.
+ * What they cannot touch is the fixed prefix — ~13k tokens of tool schemas
+ * plus prompt, knowledge files and git summary, typically 15-20k — so at 40k
+ * the pass halves the cold prefill, while at 25k it removes a third at best
+ * and drops exactly the files the model will re-read. On this lane a cold
+ * input token costs ~40x a cached one, so halving a cold 60k prefill is a
+ * material share of a turn's spend; the figures behind that are in
+ * freebuff-costs.knowledge.md (private).
+ */
+export const DEEPSEEK_FLASH_COMPACTION_POLICY: CompactionPolicy = {
+  cacheExpiryMs: 15 * 60 * 1000,
+  cacheExpiryMinTokens: 40_000,
+}
+
+export function compactionPolicyForModel(
+  model: string | null | undefined,
+): CompactionPolicy {
+  return model === FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID
+    ? DEEPSEEK_FLASH_COMPACTION_POLICY
+    : DEFAULT_COMPACTION_POLICY
+}
+
+/**
+ * Percent of users whose compactions, on every trigger, run the mechanical
+ * pass (a ~12k summary plus a working set of file reads) instead of the model
+ * handoff.
+ *
+ * The cohort is sticky per user, so the two arms can be compared on
+ * `context_compaction.followup` (re-reads and repeat compactions, by `mode`).
+ * It starts small and widens; at 100 the model handoff is deleted. A larger
+ * share only adds users, so nobody flips back. Changing the salt reassigns
+ * everyone.
+ */
+export const DETERMINISTIC_COMPACTION_PERCENT = 10
+const DETERMINISTIC_COMPACTION_SALT = 'deterministic_compaction_2026_10'
+
+export function usesDeterministicCompaction(
+  userId: string | undefined,
+  percent: number = DETERMINISTIC_COMPACTION_PERCENT,
+): boolean {
+  if (percent >= 100) return true
+  if (!userId || percent <= 0) return false
+  return fnv1a(`${DETERMINISTIC_COMPACTION_SALT}:${userId}`) % 100 < percent
+}
+```
+- File `common/src/templates/initial-agents-dir/types/agent-definition.ts` (526 lines):
+```
+/**
+ * Codebuff Agent Type Definitions
+ *
+ * This file provides TypeScript type definitions for creating custom Codebuff agents.
+ * Import these types in your agent files to get full type safety and IntelliSense.
+ *
+ * Usage in .agents/your-agent.ts:
+ *   import { AgentDefinition, ToolName, ModelName } from './types/agent-definition'
+ *
+ *   const definition: AgentDefinition = {
+ *     // ... your agent configuration with full type safety ...
+ *   }
+ *
+ *   export default definition
+ */
+
+// ============================================================================
+// Agent Definition and Utility Types
+// ============================================================================
+
+export interface AgentDefinition {
+  /** Unique identifier for this agent. Must contain only lowercase letters, numbers, and hyphens, e.g. 'code-reviewer' */
+  id: string
+
+  /** Version string (if not provided, will default to '0.0.1' and be bumped on each publish) */
+  version?: string
+
+  /** Publisher ID for the agent. Must be provided if you want to publish the agent. */
+  publisher?: string
+
+  /** Human-readable name for the agent */
+  displayName: string
+
+  /** AI model to use for this agent. Can be any model in OpenRouter: https://openrouter.ai/models */
+  model: ModelName
+
+  /**
+   * https://openrouter.ai/docs/use-cases/reasoning-tokens
+   * One of `max_tokens` or `effort` is required.
+   * If `exclude` is true, reasoning will be removed from the response. Default is false.
+   */
+  reasoningOptions?: {
+    enabled?: boolean
+    exclude?: boolean
+  } & (
+    | {
+        max_tokens: number
+      }
+    | {
+        effort: 'max' | 'xhigh' | 'high' | 'medium' | 'low' | 'minimal' | 'none'
+      }
+  )
+
+  /**
+   * Provider routing options for OpenRouter.
+   * Controls which providers to use and fallback behavior.
+   * See https://openrouter.ai/docs/features/provider-routing
+   */
+  providerOptions?: {
+    /**
+     * List of provider slugs to try in order (e.g. ["anthropic", "openai"])
+     */
+    order?: string[]
+    /**
+     * Whether to allow backup providers when primary is unavailable (default: true)
+     */
+    allow_fallbacks?: boolean
+    /**
+     * Only use providers that support all parameters in your request (default: false)
+     */
+    require_parameters?: boolean
+    /**
+     * Control whether to use providers that may store data
+     */
+    data_collection?: 'allow' | 'deny'
+    /**
+     * List of provider slugs to allow for this request
+     */
+    only?: string[]
+    /**
+     * List of provider slugs to skip for this request
+     */
+    ignore?: string[]
+    /**
+     * List of quantization levels to filter by (e.g. ["int4", "int8"])
+     */
+    quantizations?: Array<
+      | 'int4'
+      | 'int8'
+      | 'fp4'
+      | 'fp6'
+      | 'fp8'
+      | 'fp16'
+      | 'bf16'
+      | 'fp32'
+      | 'unknown'
+    >
+    /**
+     * Sort providers by price, throughput, or latency
+     */
+    sort?: 'price' | 'throughput' | 'latency'
+    /**
+     * Maximum pricing you want to pay for this request
+     */
+    max_price?: {
+      prompt?: number | string
+      completion?: number | string
+      image?: number | string
+      audio?: number | string
+      request?: number | string
+    }
+  }
+
+  // ============================================================================
+  // Tools and Subagents
+  // ============================================================================
+
+  /** MCP servers by name. Names cannot contain `/`. */
+  mcpServers?: Record<string, MCPConfig>
+
+  /**
+   * Tools this agent can use.
+   *
+   * By default, all tools are available from any specified MCP server. In
+   * order to limit the tools from a specific MCP server, add the tool name(s)
+   * in the format `'mcpServerName/toolName1'`, `'mcpServerName/toolName2'`,
+   * etc.
+   */
+  toolNames?: (ToolName | (string & {}))[]
+
+  /** Other agents this agent can spawn, like 'codebuff/file-picker@0.0.1'.
+   *
+   * Use the fully qualified agent id from the agent store, including publisher and version: 'codebuff/file-picker@0.0.1'
+   * (publisher and version are required!)
+   *
+   * Or, use the agent id from a local agent file in your .agents directory: 'file-picker'.
+   */
+  spawnableAgents?: string[]
+
+  // ============================================================================
+  // Input and Output
+  // ============================================================================
+
+  /** The input schema required to spawn the agent. Provide a prompt string and/or a params object or none.
+   * 80% of the time you want just a prompt string with a description:
+   * inputSchema: {
+   *   prompt: { type: 'string', description: 'A description of what info would be helpful to the agent' }
+   * }
+   */
+  inputSchema?: {
+    prompt?: { type: 'string'; description?: string }
+    params?: JsonObjectSchema
+  }
+
+  /** How the agent should output a response to its parent (defaults to 'last_message')
+   *
+   * last_message: The text of the agent's last turn, without reasoning. A parent receives it as a plain string in the spawn result's `value` (or an error, 'No response from agent', if that turn had no text).
+   *
+   * all_messages: All messages from the agent, including tool calls and results.
+   *
+   * structured_output: Make the agent output a JSON object. Can be used with outputSchema or without if you want freeform json output.
+   */
+  outputMode?: 'last_message' | 'all_messages' | 'structured_output'
+
+  /** JSON schema for structured output (when outputMode is 'structured_output') */
+  outputSchema?: JsonObjectSchema
+
+  // ============================================================================
+  // Prompts
+  // ============================================================================
+
+  /** Prompt for when and why to spawn this agent. Include the main purpose and use cases.
+   *
+   * This field is key if the agent is intended to be spawned by other agents. */
+  spawnerPrompt?: string
+
+  /** Whether to include conversation history from the parent agent in context.
+   *
+   * Defaults to false.
+   * Use this when the agent needs to know all the previous messages in the conversation.
+   */
+  includeMessageHistory?: boolean
+
+  /** Whether to inherit the parent agent's system prompt instead of using this agent's own systemPrompt.
+   *
+   * Defaults to false.
+   * Use this when you want to enable prompt caching by preserving the same system prompt prefix.
+   * Cannot be used together with the systemPrompt field.
+   */
+  inheritParentSystemPrompt?: boolean
+
+  /** Opt in to windowed file reads: read_files accepts { path, offset, limit }
+   * entries, whole-file reads are capped per file, glob results are capped, and
+   * the read_files/code_search tool descriptions teach a search-first reading
+   * style. Defaults to false, which keeps the legacy read behavior.
+   */
+  windowedFileReads?: boolean
+  /** One final verification opportunity after tool work, within the existing step budget. */
+  completionCheck?: boolean
+
+  /** Drop the agent-attribution trailer from the run_terminal_command commit
+   * guidance, so a commit this agent makes carries no `Co-Authored-By` or
+   * "Generated with" line. For a run that commits into somebody else's
+   * repository on their behalf. Defaults to false, which keeps the trailer.
+   */
+  suppressCommitAttribution?: boolean
+
+  /** Opt in to in-process context compaction. Defaults to false.
+   *
+   * Compaction reserves input headroom and also runs after an idle gap. It is
+   * a mechanical rewrite of the history (no model call), or, for users not yet
+   * moved to that, a handoff the same model writes through complete_compaction
+   * (an inference request on the run's normal billing/provider) with the
+   * rewrite as the fallback. Pass
+   * `{ cacheExpiryMs }` to tune that idle threshold, or `{ cacheExpiryMs: null }`
+   * to compact on the context limit only.
+   *
+   * The cold-cache pass is skipped on a context smaller than
+   * `cacheExpiryMinTokens`, since compaction always costs detail and a small
+   * history has little to reclaim. Pass null to take it at any size. The
+   * context-limit pass ignores this floor.
+   */
+  compactContext?:
+    | boolean
+    | {
+        /** Explicit input budget for a custom model, after reserving output tokens. */
+        maxContextLength?: number
+        /** The model's output token cap, when it is below 16,384. Model
+         * compaction asks for a summary that fits in it. */
+        maxOutputTokens?: number
+        cacheExpiryMs?: number | null
+        cacheExpiryMinTokens?: number | null
+      }
+
+  /** Background information for the agent. Fairly optional. Prefer using instructionsPrompt for agent instructions. */
+  systemPrompt?: string
+
+  /** Instructions for the agent.
+   *
+   * IMPORTANT: Updating this prompt is the best way to shape the agent's behavior.
+   * This prompt is inserted after each user input. */
+  instructionsPrompt?: string
+
+  /** Prompt inserted at each agent step.
+   *
+   * Powerful for changing the agent's behavior, but usually not necessary for smart models.
+   * Prefer instructionsPrompt for most instructions. */
+  stepPrompt?: string
+
+  // ============================================================================
+  // Handle Steps
+  // ============================================================================
+
+  /** Programmatically step the agent forward and run tools.
+   *
+ [freebuff product prompt text omitted]
+   * - A tool call object with toolName and input properties.
+   * - 'STEP' to run agent's model and generate one assistant message.
+   * - 'STEP_ALL' to run the agent's model until it uses the end_turn tool or stops includes no tool calls in a message.
+   *
+   * Or use 'return' to end the turn.
+   *
+   * Example 1:
+   * function* handleSteps({ agentState, prompt, params, logger }) {
+   *   logger.info('Starting file read process')
+   *   const { toolResult } = yield {
+   *     toolName: 'read_files',
+   *     input: { paths: ['file1.txt', 'file2.txt'] }
+   *   }
+   *   yield 'STEP_ALL'
+   *
+   *   // Optionally do a post-processing step here...
+   *   logger.info('Files read successfully, setting output')
+   *   yield {
+   *     toolName: 'set_output',
+   *     input: {
+   *       output: 'The files were read successfully.',
+   *     },
+   *   }
+   * }
+   *
+   * Example 2:
+   * handleSteps: function* ({ agentState, prompt, params, logger }) {
+   *   while (true) {
+   *     logger.debug('Spawning thinker agent')
+   *     yield {
+   *       toolName: 'spawn_agents',
+   *       input: {
+   *         agents: [
+   *         {
+   *           agent_type: 'thinker',
+   *           prompt: 'Think deeply about the user request',
+   *         },
+   *       ],
+   *     },
+   *   }
+   *   const { stepsComplete } = yield 'STEP'
+   *   if (stepsComplete) break
+   * }
+   * }
+   */
+  handleSteps?: (context: AgentStepContext) => Generator<
+    ToolCall | 'STEP' | 'STEP_ALL' | StepText | GenerateN,
+    void,
+    {
+      agentState: AgentState
+      toolResult: ToolResultOutput[] | undefined
+      stepsComplete: boolean
+      nResponses?: string[]
+    }
+  >
+}
+
+// ============================================================================
+// Supporting Types
+// ============================================================================
+
+export interface AgentState {
+  agentId: string
+  runId: string
+  parentId: string | undefined
+
+  /** The agent's conversation history: messages from the user and the assistant. */
+  messageHistory: Message[]
+
+  /** The last value set by the set_output tool. This is a plain object or undefined if not set. */
+  output: Record<string, any> | undefined
+
+  /** The system prompt for this agent. */
+  systemPrompt: string
+
+  /** The tool definitions for this agent. */
+  toolDefinitions: Record<
+    string,
+    { description: string | undefined; inputSchema: {} }
+  >
+
+  /**
+   * Latest model call's reported input + output tokens, adjusted with cheap
+   * length estimates for subsequent tool results and history edits. Before a
+   * receipt (or after compaction/model change), entirely a length estimate.
+   * This is context occupancy, never accumulated/billed usage across calls.
+   */
+  contextTokenCount: number
+}
+
+/**
+ * Context provided to handleSteps generator function
+ */
+export interface AgentStepContext {
+  agentState: AgentState
+  prompt?: string
+  params?: Record<string, any>
+  /**
+   * The model this step is running on, after any per-request override of the
+   * definition's `model`. `handleSteps` is serialized with `toString()`, so a
+   * generator cannot close over request-time state — read the model here
+   * instead (e.g. to size a context budget to the model's window).
+   *
+   * Supplied by the runtime; optional so a generator invoked directly (tests)
+   * or run on an older runtime degrades rather than throwing. Treat
+   * `undefined` as "unknown model" and pick a safe default.
+   */
+  model?: string
+  /**
+   * Context-pruning thresholds for `model` (budget, idle gap, token floor),
+   * resolved by the runtime. A serialized generator that spawns
+   * `context-pruner` reads them here; optional for the same reason as `model`.
+   */
+  contextPruning?: {
+    maxContextLength: number
+    cacheExpiryMs: number
+    cacheExpiryMinTokens: number
+  }
+  logger: Logger
+}
+
+export type StepText = { type: 'STEP_TEXT'; text: string }
+export type GenerateN = { type: 'GENERATE_N'; n: number }
+
+/**
+ * Tool call object for handleSteps generator
+ */
+export type ToolCall<T extends ToolName = ToolName> = {
+  [K in T]: {
+    toolName: K
+    input: GetToolParams<K>
+    includeToolCall?: boolean
+  }
+}[T]
+
+// ============================================================================
+// Available Tools
+// ============================================================================
+
+/**
+ * File operation tools
+ */
+export type FileEditingTools = 'read_files' | 'write_file' | 'str_replace'
+
+/**
+ * Code analysis tools
+ */
+export type CodeAnalysisTools = 'code_search' | 'find_files' | 'read_files'
+
+/**
+ * Terminal and system tools
+ */
+export type TerminalTools = 'run_terminal_command' | 'code_search'
+
+/**
+ * Web and browser tools
+ */
+export type WebTools = 'web_search' | 'read_docs' | 'read_url'
+
+/**
+ * Agent management tools
+ */
+export type AgentTools = 'spawn_agents'
+
+/**
+ * Output and control tools
+ */
+export type OutputTools = 'set_output'
+
+// ============================================================================
+// Available Models (see: https://openrouter.ai/models)
+// ============================================================================
+
+/**
+ * AI models available for agents. Pick from our selection of recommended models or choose any model in OpenRouter.
+ *
+ * See available models at https://openrouter.ai/models
+ */
+export type ModelName =
+  // Recommended Models
+
+  // OpenAI
+  | 'openai/gpt-5.3'
+  | 'openai/gpt-5.3-codex'
+  | 'openai/gpt-5.2'
+  | 'openai/gpt-5.1'
+  | 'openai/gpt-5.1-chat'
+  | 'openai/gpt-5-mini'
+  | 'openai/gpt-5-nano'
+
+  // Anthropic
+  | 'anthropic/claude-fable-5'
+  | 'anthropic/claude-fable-5.1'
+  | 'anthropic/claude-opus-5'
+  | 'anthropic/claude-sonnet-4.6'
+  | 'anthropic/claude-opus-4.8'
+  | 'anthropic/claude-opus-4.7'
+  | 'anthropic/claude-opus-4.6'
+  | 'anthropic/claude-opus-4.5'
+  | 'anthropic/claude-haiku-4.5'
+  | 'anthropic/claude-sonnet-4.5'
+  | 'anthropic/claude-opus-4.1'
+
+  // Gemini
+  | 'google/gemini-3.1-pro-preview'
+  | 'google/gemini-3-pro-preview'
+  | 'google/gemini-3-flash-preview'
+  | 'google/gemini-3.5-flash-lite'
+  | 'google/gemini-3.1-flash-lite'
+  | 'google/gemini-2.5-pro'
+  | 'google/gemini-2.5-flash'
+  | 'google/gemini-2.5-flash-lite'
+
+  // Qwen
+  | 'qwen/qwen3-max'
+  | 'qwen/qwen3-coder-plus'
+  | 'qwen/qwen3-coder'
+  | 'qwen/qwen3-coder:nitro'
+  | 'qwen/qwen3-coder-flash'
+  | 'qwen/qwen3-235b-a22b-2507'
+  | 'qwen/qwen3-235b-a22b-2507:nitro'
+  | 'qwen/qwen3-235b-a22b-thinking-2507'
+  | 'qwen/qwen3-235b-a22b-thinking-2507:nitro'
+  | 'qwen/qwen3-30b-a3b'
+  | 'qwen/qwen3-30b-a3b:nitro'
+
+  // DeepSeek
+  | 'deepseek/deepseek-v4-pro'
+  | 'deepseek-v4-pro'
+  | 'deepseek/deepseek-v4-flash'
+  | 'deepseek-v4-flash'
+  | 'deepseek/deepseek-chat-v3-0324'
+  | 'deepseek/deepseek-chat-v3-0324:nitro'
+  | 'deepseek/deepseek-r1-0528'
+  | 'deepseek/deepseek-r1-0528:nitro'
+
+  // Xiaomi MiMo
+  | 'mimo/mimo-v2.5'
+  | 'mimo-v2.5'
+  | 'mimo/mimo-v2.5-pro'
+  | 'mimo-v2.5-pro'
+
+  // Other open source models
+  | 'moonshotai/kimi-k2'
+  | 'moonshotai/kimi-k2:nitro'
+  | 'moonshotai/kimi-k2.6'
+  | 'moonshotai/kimi-k2.7-code'
+  | 'z-ai/glm-5'
+  | 'z-ai/glm-5.1'
+  | 'z-ai/glm-4.6'
+  | 'z-ai/glm-4.6:nitro'
+  | 'z-ai/glm-4.7'
+  | 'z-ai/glm-4.7:nitro'
+  | 'z-ai/glm-4.7-flash'
+  | 'z-ai/glm-4.7-flash:nitro'
+  | 'minimax/minimax-m2.5'
+  | 'minimax/minimax-m3'
+  | (string & {})
+
+import type { ToolName, GetToolParams } from './tools'
+import type {
+  Message,
+  ToolResultOutput,
+  JsonObjectSchema,
+  MCPConfig,
+  Logger,
+} from './util-types'
+
+export type { ToolName, GetToolParams }
+```
+- File `packages/agent-runtime/src/run-agent-step.ts` (1959 lines):
+```
+import { contextPrunerBudgetForModel } from '@codebuff/common/constants/model-config'
+import {
+  modelCompactionThreshold,
+  usesDeterministicCompaction,
+} from '@codebuff/common/constants/compaction-policy'
+import {
+  supportsAssistantPrefill,
+  supportsCacheControl,
+} from '@codebuff/common/old-constants'
+import { PROJECT_PROFILE_TOOL_NAME } from '@codebuff/common/constants/project-profile'
+import { TOOLS_WHICH_WONT_FORCE_NEXT_STEP } from '@codebuff/common/tools/constants'
+import { parseAgentId } from '@codebuff/common/util/agent-id-parsing'
+import { buildArray } from '@codebuff/common/util/array'
+import {
+  AbortError,
+  FETCH_IDLE_TIMEOUT_USER_MESSAGE,
+  TRANSIENT_NETWORK_ERROR_USER_MESSAGE,
+  extractApiErrorDetails,
+  getErrorObject,
+  isAbortError,
+  isFetchIdleTimeoutError,
+  isTransientNetworkError,
+} from '@codebuff/common/util/error'
+import { serializeCacheDebugCorrelation } from '@codebuff/common/util/cache-debug'
+import {
+  assistantMessage,
+  dropUnansweredToolCalls,
+  systemMessage,
+  userMessage,
+} from '@codebuff/common/util/messages'
+import { type ToolSet } from 'ai'
+import { cloneDeep, mapValues } from 'lodash'
+import z from 'zod/v4'
+
+import {
+  evaluateCompactionTrigger,
+  MECHANICAL_TARGET_SHARE,
+} from './compact-history'
+import type { CompactionTrigger } from './compact-history'
+import {
+  closeCompactionWindow,
+  openCompactionWindow,
+} from './compaction-followup'
+import type { CompactionWindow } from './compaction-followup'
+import {
+  automaticCompactionIsWorthwhile,
+  compactMechanically,
+  COMPACTION_LOW_WATER,
+  compactWithModelOrFallback,
+  compactionTools,
+} from './model-compaction'
+import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+import { getMCPToolData } from './mcp'
+import {
+  runProjectProfileReport,
+  shouldOfferProjectProfileTool,
+} from './project-profile'
+import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+import { isThinkOnlyResponse } from './util/think-tags'
+import {
+  decideFollowupTodoNudge,
+  FOLLOWUP_TODO_NUDGE_TAG,
+} from './util/followup-todo-nudge'
+import {
+  decideTodoProgressReminder,
+  TODO_PROGRESS_REMINDER_TAG,
+} from './util/todo-progress-reminder'
+import {
+  hasFileEditTool,
+  TODO_LOOP_RECOVERY_TAG,
+  TODO_LOOP_RECOVERY_THRESHOLD,
+  TODO_LOOP_STOP_THRESHOLD,
+  TodoLoopError,
+  todoLoopRecoveryMessage,
+  trailingIdenticalTodoCalls,
+} from './util/todo-loop'
+import {
+  clearProgrammaticRunState,
+  runProgrammaticStep,
+} from './run-programmatic-step'
+import {
+  additionalSystemPrompts,
+  isCompactCommandPrompt,
+} from './system-prompt/prompts'
+import { getAgentTemplate } from './templates/agent-registry'
+import { buildAgentToolSet, modelSpawnableAgents } from './templates/prompts'
+import { getAgentPrompt } from './templates/strings'
+import { getToolSet } from './tools/prompts'
+import { processStream } from './tools/stream-parser'
+import { getAgentOutput, outputForParent } from './util/agent-output'
+import {
+  createCacheDebugSnapshot,
+  enrichCacheDebugSnapshotWithProviderRequest,
+  enrichCacheDebugSnapshotWithUsage,
+} from './util/cache-debug'
+import {
+  withSystemInstructionTags,
+  withSystemTags as withSystemTags,
+  buildUserMessageContent,
+  expireMessages,
+  frameSteeringContent,
+} from './util/messages'
+import {
+  estimateContextTokens,
+  recordContextUsage,
+  recountContextTokens,
+} from './util/context-token-count'
+import { assertUserContentSize } from './util/context-size-guard'
+import {
+  countTokens,
+  countTokensJson,
+  countTokensMessages,
+} from './util/token-counter'
+
+import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+import type { TrackEventFn } from '@codebuff/common/types/contracts/analytics'
+import type {
+  AddAgentStepFn,
+  FinishAgentRunFn,
+  StartAgentRunFn,
+} from '@codebuff/common/types/contracts/database'
+import type {
+  AgentUsageData,
+  CacheDebugUsageData,
+  ContextCompactionData,
+  ModelUsageData,
+  PromptAiSdkFn,
+} from '@codebuff/common/types/contracts/llm'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+import type { ParamsExcluding } from '@codebuff/common/types/function-params'
+import type {
+  Message,
+  ToolMessage,
+} from '@codebuff/common/types/messages/codebuff-message'
+import type {
+  TextPart,
+  ImagePart,
+} from '@codebuff/common/types/messages/content-part'
+import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+import type {
+  AgentTemplateType,
+  AgentState,
+  AgentOutput,
+} from '@codebuff/common/types/session-state'
+import type {
+  CustomToolDefinitions,
+  ProjectFileContext,
+} from '@codebuff/common/util/file'
+import type { DrainSteeringMessages } from '@codebuff/common/types/contracts/steering'
+
+// Moved to util/to-json-schema.ts so spawn-agent-inline can use it without an
+// import cycle through run-agent-step. Re-exported here for existing importers.
+import { toTokenCountInputSchema } from './util/to-json-schema'
+export { toTokenCountInputSchema }
+
+function toolsForContextEstimate(definitions: AgentState['toolDefinitions']) {
+  return Object.entries(definitions).map(([name, def]) => ({
+    name,
+    ...(def.description && { description: def.description }),
+    input_schema: toTokenCountInputSchema(def.inputSchema),
+  }))
+}
+
+async function additionalToolDefinitions(
+  params: {
+    agentTemplate: AgentTemplate
+    fileContext: ProjectFileContext
+  } & ParamsExcluding<
+    typeof getMCPToolData,
+    'toolNames' | 'mcpServers' | 'writeTo'
+  >,
+): Promise<CustomToolDefinitions> {
+  const { agentTemplate, fileContext } = params
+
+  const defs = cloneDeep(
+    Object.fromEntries(
+      Object.entries(fileContext.customToolDefinitions).filter(([toolName]) =>
+        agentTemplate!.toolNames.includes(toolName),
+      ),
+    ),
+  )
+  return getMCPToolData({
+    ...params,
+    toolNames: agentTemplate!.toolNames,
+    mcpServers: agentTemplate!.mcpServers,
+    writeTo: defs,
+  })
+}
+
+/** Run-id prefix for runs that skip the run-tracking ledger (context-pruner).
+ *  These ids exist only in-process and must never be sent to the web API. */
+export const UNTRACKED_RUN_ID_PREFIX = 'untracked-'
+
+export const runAgentStep = async (
+  params: {
+    userId: string | undefined
+    userInputId: string
+    clientSessionId: string
+    costMode?: string
+    fingerprintId: string
+    repoId: string | undefined
+    onResponseChunk: (chunk: string | PrintModeEvent) => void
+
+    agentType: AgentTemplateType
+    agentTemplate: AgentTemplate
+    fileContext: ProjectFileContext
+    agentState: AgentState
+    localAgentTemplates: Record<string, AgentTemplate>
+
+    prompt: string | undefined
+    spawnParams: Record<string, any> | undefined
+    system: string
+    n?: number
+
+    trackEvent: TrackEventFn
+    promptAiSdk: PromptAiSdkFn
+    traceWriter?: TraceWriter
+    onAgentUsageReceived?: (usage: AgentUsageData) => void
+    onAgentUsageIncomplete?: () => void
+    onCompaction?: (data: ContextCompactionData) => void
+    /** A root-agent compaction pass began; `onCompactionEnd` follows whatever its outcome. */
+    onCompactionStart?: (data: Pick<ContextCompactionData, 'trigger'>) => void
+    onCompactionEnd?: () => void
+  } & ParamsExcluding<
+    typeof processStream,
+    | 'agentContext'
+    | 'agentState'
+    | 'agentStepId'
+    | 'agentTemplate'
+    | 'fullResponse'
+    | 'messages'
+    | 'onCostCalculated'
+    | 'repoId'
+    | 'stream'
+    | 'stopStream'
+  > &
+    ParamsExcluding<
+      typeof getAgentStreamFromTemplate,
+      | 'agentId'
+      | 'includeCacheControl'
+      | 'messages'
+      | 'onCostCalculated'
+      | 'template'
+    > &
+    ParamsExcluding<typeof getAgentTemplate, 'agentId'> &
+    ParamsExcluding<
+      typeof getAgentPrompt,
+      'agentTemplate' | 'promptType' | 'agentState' | 'agentTemplates'
+    > &
+    ParamsExcluding<
+      typeof getMCPToolData,
+      'toolNames' | 'mcpServers' | 'writeTo'
+    > &
+    ParamsExcluding<
+      PromptAiSdkFn,
+      'messages' | 'model' | 'onCostCalculated' | 'n'
+    >,
+): Promise<{
+  agentState: AgentState
+  fullResponse: string
+  shouldEndTurn: boolean
+  messageId: string | null
+  nResponses?: string[]
+  usedWorkTools?: boolean
+}> => {
+  const {
+    agentType,
+    fileContext,
+    agentTemplate,
+    localAgentTemplates,
+    logger,
+    prompt,
+    repoId,
+    spawnParams,
+    system,
+    userId,
+    userInputId,
+    onResponseChunk,
+    promptAiSdk,
+    additionalToolDefinitions,
+  } = params
+  let agentState = params.agentState
+
+  const { agentContext } = agentState
+
+  const startTime = Date.now()
+
+  // Links logs within a single step of the agent loop.
+  const agentStepId = crypto.randomUUID()
+
+  if (agentState.stepsRemaining <= 0) {
+    logger.warn(
+      `Detected too many consecutive assistant messages without user prompt`,
+    )
+
+    onResponseChunk(`${STEP_WARNING_MESSAGE}\n\n`)
+
+    // Update message history to include the warning
+    agentState = {
+      ...agentState,
+      messageHistory: [
+        ...expireMessages(agentState.messageHistory, 'userPrompt'),
+        userMessage(
+          withSystemTags(
+            `The assistant has responded too many times in a row. The assistant's turn has automatically been ended. The maximum number of responses can be configured via maxAgentSteps.`,
+          ),
+        ),
+      ],
+    }
+    return {
+      agentState,
+      fullResponse: STEP_WARNING_MESSAGE,
+      shouldEndTurn: true,
+      messageId: null,
+    }
+  }
+
+  const stepPrompt = await getAgentPrompt({
+    ...params,
+    agentTemplate,
+    promptType: { type: 'stepPrompt' },
+    fileContext,
+    agentState,
+    agentTemplates: localAgentTemplates,
+    logger,
+    additionalToolDefinitions,
+  })
+
+  // An interrupted turn can leave a tool call with no result behind, which
+  // strict providers (DeepSeek) reject with a 400. Since history is persisted
+  // and replayed, that one orphan would fail every later turn, so drop it here
+  // — the single point every step's request is built — and assign the cleaned
+  // history back so the checkpointed state is valid too.
+  const history = dropUnansweredToolCalls(
+    expireMessages(agentState.messageHistory, 'agentStep'),
+  )
+
+  const agentMessagesUntruncated = buildArray<Message>(
+    ...history,
+
+    stepPrompt &&
+      userMessage({
+        content: stepPrompt,
+        tags: ['STEP_PROMPT'],
+
+        // James: Deprecate the below, only use tags, which are not prescriptive.
+        timeToLive: 'agentStep' as const,
+        keepDuringTruncation: true,
+      }),
+  )
+
+  agentState.messageHistory = agentMessagesUntruncated
+
+  const { model } = agentTemplate
+
+  // A step can start with the history ending on an assistant message — e.g. a
+  // continuation after a think-only response for an agent with no stepPrompt.
+  // Claude 4.6+ rejects such requests as unsupported assistant prefill, so end
+  // the conversation with a user message instead.
+  const lastMessage =
+    agentState.messageHistory[agentState.messageHistory.length - 1]
+  if (lastMessage?.role === 'assistant' && !supportsAssistantPrefill(model)) {
+    agentState.messageHistory = [
+      ...agentState.messageHistory,
+      userMessage({
+        content: withSystemTags('Continue from where you left off.'),
+        timeToLive: 'agentStep' as const,
+        keepDuringTruncation: true,
+      }),
+    ]
+  }
+
+  let stepCreditsUsed = 0
+
+  const onCostCalculated = async (credits: number) => {
+    stepCreditsUsed += credits
+    agentState.creditsUsed += credits
+    agentState.directCreditsUsed += credits
+  }
+
+  const iterationNum = agentState.messageHistory.length
+  // system is a plain string; count it directly rather than JSON-stringifying
+  // it (which would add quotes and escape every newline).
+  const systemTokens = countTokens(system)
+
+  let cacheDebugCorrelation:
+    | ReturnType<typeof createCacheDebugSnapshot>
+    | undefined
+  if (CACHE_DEBUG_FULL_LOGGING) {
+    try {
+      cacheDebugCorrelation = createCacheDebugSnapshot({
+        agentType: String(agentType),
+        system,
+        toolDefinitions: params.tools
+          ? Object.fromEntries(
+              Object.entries(params.tools).map(([name, tool]) => [
+                name,
+                {
+                  description: tool.description,
+                  inputSchema: tool.inputSchema as {},
+                },
+              ]),
+            )
+          : {},
+        messages: [systemMessage(system), ...agentState.messageHistory],
+        logger,
+        projectRoot: fileContext.projectRoot,
+        runId: agentState.runId,
+        userInputId,
+        agentStepId,
+        model,
+      })
+    } catch (err) {
+      logger.warn({ error: err }, '[Cache Debug] Failed to create snapshot')
+    }
+  }
+
+  const onCacheDebugProviderRequestBuilt = cacheDebugCorrelation
+    ? ({
+        provider,
+        rawBody,
+        normalizedBody,
+      }: {
+        provider: string
+        rawBody: unknown
+        normalizedBody?: unknown
+      }) => {
+        enrichCacheDebugSnapshotWithProviderRequest({
+          correlation: cacheDebugCorrelation,
+          provider,
+          rawBody,
+          normalized: normalizedBody ?? rawBody,
+          logger,
+        })
+      }
+    : undefined
+
+  const onCacheDebugUsageReceived = cacheDebugCorrelation
+    ? (usage: CacheDebugUsageData) => {
+        enrichCacheDebugSnapshotWithUsage({
+          correlation: cacheDebugCorrelation,
+          usage,
+          logger,
+        })
+      }
+    : undefined
+
+  // Full message histories go to the trace writer, which appends each message
+  // exactly once (see TraceWriter).
+  params.traceWriter?.recordStep({
+    agentId: agentState.agentId,
+    agentType: String(agentType),
+    runId: agentState.runId,
+    userInputId,
+    step: iterationNum,
+    system,
+    messages: agentState.messageHistory,
+  })
+
+  // Log a summary only: the full message history, system prompt, and agent
+  // template are large and logging them every step bloats log files
+  // quadratically over the course of a chat.
+  logger.debug(
+    {
+      iteration: iterationNum,
+      runId: agentState.runId,
+      model,
+      duration: Date.now() - startTime,
+      contextTokenCount: agentState.contextTokenCount,
+      messageCount: agentState.messageHistory.length,
+      prompt,
+      params: spawnParams,
+      systemTokens,
+      agentTemplateId: agentTemplate.id,
+      toolNames: params.tools ? Object.keys(params.tools) : undefined,
+    },
+    `Start agent ${agentType} step ${iterationNum} (${userInputId}${prompt ? ` - Prompt: ${prompt.slice(0, 20)}` : ''})`,
+  )
+
+  // Handle n parameter for generating multiple responses
+  if (params.n !== undefined) {
+    const result = await promptAiSdk({
+      ...params,
+      messages: agentState.messageHistory,
+      model,
+      n: params.n,
+      onCostCalculated,
+      cacheDebugCorrelation: cacheDebugCorrelation
+        ? serializeCacheDebugCorrelation(cacheDebugCorrelation)
+        : undefined,
+      onCacheDebugProviderRequestBuilt,
+      onCacheDebugUsageReceived,
+    })
+
+    if (result.aborted) {
+      return {
+        agentState,
+        fullResponse: '',
+        shouldEndTurn: true,
+        messageId: null,
+        nResponses: undefined,
+      }
+    }
+
+    const responsesString = result.value
+    let nResponses: string[]
+    try {
+      nResponses = JSON.parse(responsesString) as string[]
+      if (!Array.isArray(nResponses)) {
+        if (params.n > 1) {
+          throw new Error(
+            `Expected JSON array response from LLM when n > 1, got non-array: ${responsesString.slice(0, 50)}`,
+          )
+        }
+        // If it parsed but isn't an array, treat as single response
+        nResponses = [responsesString]
+      }
+    } catch (e) {
+      if (params.n > 1) {
+        throw e
+      }
+      // If parsing fails, treat as single raw response (common for n=1)
+      nResponses = [responsesString]
+    }
+
+    return {
+      agentState,
+      fullResponse: responsesString,
+      shouldEndTurn: false,
+      messageId: null,
+      nResponses,
+    }
+  }
+
+  let fullResponse = ''
+  const toolResults: ToolMessage[] = []
+
+  // Lets processStream cancel this step's request without cancelling the run
+  // (a runaway response it has decided to stop reading).
+  const streamStop = new AbortController()
+
+  // The parser appends model output AND tool results before returning. Only
+  // the former is covered by outputTokens. The persisted anchor is scalar;
+  // this request-local snapshot neither copies text nor tokenizes it.
+  const inputHistory = [...agentState.messageHistory]
+  const contextTools = toolsForContextEstimate(agentState.toolDefinitions)
+  const estimatedInputTokens =
+    countTokensMessages(inputHistory) +
+    countTokens(system) +
+    countTokensJson(contextTools)
+  let contextUsage: ModelUsageData | undefined
+  let finishReason: string | undefined
+
+  // Raw stream from AI SDK
+  const stream = getAgentStreamFromTemplate({
+    ...params,
+    signal: AbortSignal.any([params.signal, streamStop.signal]),
+    agentId: agentState.parentId ? agentState.agentId : undefined,
+    costMode: params.costMode,
+    cacheDebugCorrelation: cacheDebugCorrelation
+      ? serializeCacheDebugCorrelation(cacheDebugCorrelation)
+      : undefined,
+    includeCacheControl: supportsCacheControl(agentTemplate.model),
+    messages: [systemMessage(system), ...agentState.messageHistory],
+    onCacheDebugProviderRequestBuilt,
+    onCacheDebugUsageReceived,
+    onUsageReceived: (usage: ModelUsageData) => {
+      contextUsage = usage
+      params.onAgentUsageReceived?.({
+        ...usage,
+        isRoot: !agentState.parentId,
+        agentId: agentState.agentId,
+      })
+    },
+    onUsageIncomplete: params.onAgentUsageIncomplete,
+    onFinishReason: (reason) => {
+      finishReason = reason
+    },
+    template: agentTemplate,
+    onCostCalculated,
+  })
+
+  const {
+    fullResponse: fullResponseAfterStream,
+    hadToolCallError,
+    messageId,
+    toolCalls,
+    toolResults: newToolResults,
+  } = await processStream({
+    ...params,
+    agentContext,
+    agentState,
+    agentStepId,
+    agentTemplate,
+    fullResponse,
+    messages: agentState.messageHistory,
+    repoId,
+    stream,
+    onCostCalculated,
+    stopStream: () => streamStop.abort(),
+    streamFinishReason: () => finishReason,
+  }).finally(() => {
+    // Inline agents can replace history (set_messages). A receipt for the old
+    // request is not a baseline for a replacement summary.
+    if (
+      contextUsage &&
+      inputHistory.every((m, i) => agentState.messageHistory[i] === m)
+    ) {
+      recordContextUsage({
+        agentState,
+        model,
+        usage: contextUsage,
+        estimatedInputTokens,
+        estimatedOutputTokens: countTokensMessages(
+          agentState.messageHistory
+            .slice(inputHistory.length)
+            .filter((m) => m.role === 'assistant'),
+        ),
+      })
+    }
+    agentState.contextTokenCount = estimateContextTokens({
+      agentState,
+      model,
+      systemPrompt: system,
+      toolsForTokenCount: contextTools,
+    })
+  })
+
+  toolResults.push(...newToolResults)
+
+  fullResponse = fullResponseAfterStream
+
+  // A successful no-op is not progress. GLM can keep emitting the same to-do
+  // list (even while acknowledging the loop in prose) until the general step
+  // budget is exhausted. Give it a chance to recover, then fail explicitly.
+  if (
+    !hadToolCallError &&
+    toolCalls.length > 0 &&
+    toolCalls.every((call) => call.toolName === 'write_todos')
+  ) {
+    const consecutive = trailingIdenticalTodoCalls(agentState.messageHistory)
+    if (consecutive >= TODO_LOOP_RECOVERY_THRESHOLD) {
+      const stopped = consecutive >= TODO_LOOP_STOP_THRESHOLD
+      logger.warn(
+        {
+          metric: stopped ? 'todo_loop_stopped' : 'todo_loop_recovery',
+          consecutive,
+          model: agentTemplate.model,
+          agentId: agentTemplate.id,
+          fileEditToolsOffered: hasFileEditTool(agentTemplate.toolNames),
+          userId,
+          runId: agentState.runId,
+        },
+        stopped
+          ? 'Stopping a turn stuck repeating an unchanged to-do list'
+          : 'Model is repeating an unchanged to-do list; adding recovery guidance',
+      )
+      if (stopped) {
+        throw new TodoLoopError()
+      }
+      agentState.messageHistory.push(
+        userMessage({
+          content: withSystemTags(
+            todoLoopRecoveryMessage(agentTemplate.toolNames),
+          ),
+          tags: [TODO_LOOP_RECOVERY_TAG],
+        }),
+      )
+    }
+  }
+
+  agentState.messageHistory = expireMessages(
+    agentState.messageHistory,
+    'agentStep',
+  )
+
+  const hasNoToolResults =
+    toolCalls.filter(
+      (call) => !TOOLS_WHICH_WONT_FORCE_NEXT_STEP.includes(call.toolName),
+    ).length === 0 &&
+    toolResults.filter(
+      (result) => !TOOLS_WHICH_WONT_FORCE_NEXT_STEP.includes(result.toolName),
+    ).length === 0 &&
+    !hadToolCallError // Tool call errors should also force another step so the agent can retry
+
+  const hasTaskCompleted = toolCalls.some(
+    (call) =>
+      call.toolName === 'task_completed' || call.toolName === 'end_turn',
+  )
+
+  // If the response is only <think>...</think> scaffolding (including orphan
+  // </think> closes that native-reasoning providers sometimes leak into
+  // content), the model was just thinking and should continue rather than end.
+  const isThinkOnly = hasNoToolResults && isThinkOnlyResponse(fullResponse)
+
+  // If the agent has the task_completed tool, it must be called to end its turn.
+  const requiresExplicitCompletion =
+    agentTemplate.toolNames.includes('task_completed')
+
+  let shouldEndTurn: boolean
+  if (requiresExplicitCompletion) {
+    // For models requiring explicit completion, only end turn when:
+    // - task_completed is called, OR
+    // - end_turn is called (backward compatibility)
+    shouldEndTurn = !hadToolCallError && hasTaskCompleted
+  } else {
+    // For other models, also end turn when there are no tool calls
+    // Exception: if the response is only <think> tags, continue the turn
+    shouldEndTurn =
+      !hadToolCallError &&
+      (hasTaskCompleted || (hasNoToolResults && !isThinkOnly))
+  }
+
+  // Ending on followup cards while the agent's own to-do list is part done
+  // stops a task the user asked to have finished (CodebuffAI/freebuff#1434).
+  // Bounded per user prompt; see util/followup-todo-nudge.ts. An explicit
+  // task_completed/end_turn is left alone.
+  if (
+    shouldEndTurn &&
+    !hasTaskCompleted &&
+    toolCalls.some((call) => call.toolName === 'suggest_followups')
+  ) {
+    const decision = decideFollowupTodoNudge(agentState.messageHistory)
+    if (decision) {
+      logger.info(
+        {
+          metric: 'followups_with_open_todos',
+          action: decision.action,
+          reason: decision.action === 'end' ? decision.reason : undefined,
+          openTodos: decision.openTodos.length,
+          nudgesSoFar: decision.nudgesSoFar,
+          model: agentTemplate.model,
+          agentId: agentTemplate.id,
+          userId,
+          runId: agentState.runId,
+        },
+        decision.action === 'nudge'
+          ? 'Turn ended on followups with unfinished to-dos; continuing'
+          : 'Turn ended on followups with unfinished to-dos; nudge limit reached',
+      )
+      if (decision.action === 'nudge') {
+        agentState.messageHistory.push(
+          userMessage({
+            content: withSystemTags(decision.message),
+            tags: [FOLLOWUP_TODO_NUDGE_TAG],
+          }),
+        )
+        shouldEndTurn = false
+      }
+    }
+  }
+
+  // A to-do list the model never ticks off reads 0/N until the turn's last
+  // step; see util/todo-progress-reminder.ts. Once per list, mid-turn only.
+  if (!shouldEndTurn) {
+    const reminder = decideTodoProgressReminder(agentState.messageHistory)
+    if (reminder) {
+      logger.info(
+        {
+          metric: 'todo_progress_reminder',
+          done: reminder.done,
+          total: reminder.total,
+          callsSinceUpdate: reminder.callsSinceUpdate,
+          model: agentTemplate.model,
+          agentId: agentTemplate.id,
+          userId,
+          runId: agentState.runId,
+        },
+        'To-do list not updated for several tool calls; reminding',
+      )
+      agentState.messageHistory.push(
+        userMessage({
+          content: withSystemTags(reminder.message),
+          tags: [TODO_PROGRESS_REMINDER_TAG],
+        }),
+      )
+    }
+  }
+
+  agentState = {
+    ...agentState,
+    stepsRemaining: agentState.stepsRemaining - 1,
+    agentContext,
+  }
+
+  // Capture the assistant response and tool results added during this step
+  params.traceWriter?.recordStep({
+    agentId: agentState.agentId,
+    agentType: String(agentType),
+    runId: agentState.runId,
+    userInputId,
+    step: iterationNum,
+    system,
+    messages: agentState.messageHistory,
+  })
+
+  logger.debug(
+    {
+      iteration: iterationNum,
+      agentId: agentState.agentId,
+      model,
+      prompt,
+      shouldEndTurn,
+      duration: Date.now() - startTime,
+      fullResponse,
+      // Summarize instead of logging the full message history: logging it
+      // every step bloats log files quadratically over the course of a chat.
+      messageCount: agentState.messageHistory.length,
+      toolCalls,
+      toolResults,
+      stepCreditsUsed,
+    },
+    `End agent ${agentType} step ${iterationNum} (${userInputId}${prompt ? ` - Prompt: ${prompt.slice(0, 20)}` : ''})`,
+  )
+
+  return {
+    agentState,
+    fullResponse,
+    shouldEndTurn,
+    messageId,
+    nResponses: undefined,
+    usedWorkTools: toolCalls.some((call) =>
+      ['run_terminal_command', 'write_file', 'str_replace'].includes(
+        call.toolName,
+      ),
+    ),
+  }
+}
+
+/**
+ * Runs the agent loop.
+ *
+ * IMPORTANT: This function mutates `params.agentState` in place throughout the
+ * run (not just at return time). Fields like `messageHistory`, `systemPrompt`,
+ * `toolDefinitions`, `creditsUsed`, and `output` are updated as work progresses
+ * so that callers holding a reference to the same object (e.g. the SDK's
+ * `sessionState.mainAgentState`) see in-progress work immediately — which
+ * matters when an error is thrown mid-run and the normal return path is
+ * skipped.
+ */
+export async function loopAgentSteps(
+  params: {
+    addAgentStep: AddAgentStepFn
+    agentState: AgentState
+    agentType: string
+    clearUserPromptMessagesAfterResponse?: boolean
+    clientSessionId: string
+    content?: Array<TextPart | ImagePart>
+    costMode?: string
+    fileContext: ProjectFileContext
+    finishAgentRun: FinishAgentRunFn
+    localAgentTemplates: Record<string, AgentTemplate>
+    logger: Logger
+    parentSystemPrompt?: string
+    parentTools?: ToolSet
+    prompt: string | undefined
+    signal: AbortSignal
+    /** Host-enforced wall-clock deadline in Unix milliseconds. */
+    deadlineAt?: number
+    /** Optional steering hook. Drained at each step boundary (after a step's LLM
+     * call + tools complete, before the next one). Any returned messages are appended
+     * to the message history as user prompts and keep the turn going, letting a
+     * host "steer" a running agent without aborting or losing the current step. */
+    drainSteeringMessages?: DrainSteeringMessages
+    spawnParams: Record<string, any> | undefined
+    startAgentRun: StartAgentRunFn
+    userId: string | undefined
+    userInputId: string
+    agentTemplate?: AgentTemplate
+  } & ParamsExcluding<typeof additionalToolDefinitions, 'agentTemplate'> &
+    ParamsExcluding<
+      typeof runProgrammaticStep,
+      | 'agentState'
+      | 'onCostCalculated'
+      | 'prompt'
+      | 'runId'
+      | 'stepNumber'
+      | 'stepsComplete'
+      | 'system'
+      | 'template'
+      | 'toolCallParams'
+      | 'tools'
+    > &
+    ParamsExcluding<typeof getAgentTemplate, 'agentId'> &
+    ParamsExcluding<
+      typeof getAgentPrompt,
+      | 'agentTemplate'
+      | 'promptType'
+      | 'agentTemplates'
+      | 'additionalToolDefinitions'
+    > &
+    ParamsExcluding<
+      typeof getMCPToolData,
+      'toolNames' | 'mcpServers' | 'writeTo'
+    > &
+    ParamsExcluding<StartAgentRunFn, 'agentId' | 'ancestorRunIds'> &
+    ParamsExcluding<
+      FinishAgentRunFn,
+      'runId' | 'status' | 'totalSteps' | 'directCredits' | 'totalCredits'
+    > &
+    ParamsExcluding<
+      typeof runAgentStep,
+      | 'additionalToolDefinitions'
+      | 'agentState'
+      | 'agentTemplate'
+      | 'prompt'
+      | 'runId'
+      | 'spawnParams'
+      | 'system'
+      | 'tools'
+    > &
+    ParamsExcluding<
+      AddAgentStepFn,
+      | 'agentRunId'
+      | 'stepNumber'
+      | 'credits'
+      | 'childRunIds'
+      | 'messageId'
+      | 'status'
+      | 'startTime'
+    >,
+): Promise<{
+  agentState: AgentState
+  output: AgentOutput
+}> {
+  let agentTemplate = params.agentTemplate
+  if (!agentTemplate) {
+    agentTemplate =
+      (await getAgentTemplate({
+        ...params,
+        agentId: params.agentType,
+      })) ?? undefined
+  }
+  if (!agentTemplate) {
+    throw new Error(`Agent template not found for type: ${params.agentType}`)
+  }
+
+  // The context pruner is a programmatic no-model-call agent spawned before
+  // every main-agent step. Recording its runs in the ledger cost three awaited
+  // web-API round trips (start/step/finish) per main-agent step, so it mints a
+  // local run id and skips run tracking entirely. Matches bundled and
+  // publisher-qualified ids ('context-pruner', 'codebuff/context-pruner@1.0.0')
+  // by agent name, never by substring: an untracked id is refused by the web
+  // API, so any model-calling agent whose id merely CONTAINED the name (e.g.
+  // 'context-pruner-test-agent') failed its first LLM call with
+  // "runId Not Found".
+  if (parseAgentId(agentTemplate.id).agentId === 'context-pruner') {
+    params = {
+      ...params,
+      startAgentRun: async () =>
+        `${UNTRACKED_RUN_ID_PREFIX}${crypto.randomUUID()}`,
+      addAgentStep: async () => null,
+      finishAgentRun: async () => {},
+    }
+  }
+
+  const {
+    addAgentStep,
+    agentState: initialAgentState,
+    agentType,
+    clearUserPromptMessagesAfterResponse = true,
+    clientSessionId,
+    content,
+    fileContext,
+    finishAgentRun,
+    localAgentTemplates,
+    logger,
+    parentSystemPrompt,
+    parentTools,
+    prompt,
+    signal,
+    spawnParams,
+    startAgentRun,
+    userId,
+    userInputId,
+    clientEnv,
+    ciEnv,
+  } = params
+
+  const offersProjectProfile = shouldOfferProjectProfileTool({
+    costMode: params.costMode,
+    isRoot: !initialAgentState.parentId,
+    toolNames: agentTemplate.toolNames,
+    getProjectProfile: params.getProjectProfile,
+    reportProjectProfile: params.reportProjectProfile,
+  })
+  if (offersProjectProfile) {
+    agentTemplate = {
+      ...agentTemplate,
+      toolNames: [...agentTemplate.toolNames, PROJECT_PROFILE_TOOL_NAME],
+    }
+  }
+
+  if (signal.aborted) {
+    return {
+      agentState: initialAgentState,
+      output: {
+        type: 'error',
+        message: 'Run cancelled by user',
+      },
+    }
+  }
+
+  const runId = await startAgentRun({
+    ...params,
+    agentId: agentTemplate.id,
+    ancestorRunIds: initialAgentState.ancestorRunIds,
+  })
+  if (!runId) {
+    // registration ends on the run's signal; an abort landing there is a cancel, not a failure
+    if (signal.aborted) {
+      return {
+        agentState: initialAgentState,
+        output: {
+          type: 'error',
+          message: 'Run cancelled by user',
+        },
+      }
+    }
+    throw new Error('Failed to start agent run')
+  }
+  initialAgentState.runId = runId
+
+  let cachedAdditionalToolDefinitions: CustomToolDefinitions | undefined
+  // Use parent's tools for prompt caching when inheritParentSystemPrompt is true
+  const useParentTools =
+    agentTemplate.inheritParentSystemPrompt && parentTools !== undefined
+
+  const manualCompaction = isCompactCommandPrompt(prompt)
+  // Initialize message history with user prompt and instructions on first iteration
+  const instructionsPrompt = await getAgentPrompt({
+    ...params,
+    agentTemplate,
+    promptType: { type: 'instructionsPrompt' },
+    agentTemplates: localAgentTemplates,
+    useParentTools,
+    additionalToolDefinitions: async () => {
+      if (!cachedAdditionalToolDefinitions) {
+        cachedAdditionalToolDefinitions = await additionalToolDefinitions({
+          ...params,
+          agentTemplate,
+        })
+      }
+      return cachedAdditionalToolDefinitions
+    },
+  })
+
+  // Build the initial message history with user prompt and instructions
+  // Generate system prompt once, using parent's if inheritParentSystemPrompt is true
+  let system: string
+  if (manualCompaction && initialAgentState.systemPrompt) {
+    system = initialAgentState.systemPrompt
+  } else if (agentTemplate.inheritParentSystemPrompt && parentSystemPrompt) {
+    system = parentSystemPrompt
+  } else {
+    const systemPrompt = await getAgentPrompt({
+      ...params,
+      agentTemplate,
+      promptType: { type: 'systemPrompt' },
+      agentTemplates: localAgentTemplates,
+      additionalToolDefinitions: async () => {
+        if (!cachedAdditionalToolDefinitions) {
+          cachedAdditionalToolDefinitions = await additionalToolDefinitions({
+            ...params,
+            agentTemplate,
+          })
+        }
+        return cachedAdditionalToolDefinitions
+      },
+    })
+    system = systemPrompt ?? ''
+  }
+
+  // Build agent tools (agents as direct tool calls) for non-inherited tools
+  const agentTools = useParentTools
+    ? {}
+    : await buildAgentToolSet({
+        ...params,
+        spawnableAgents: modelSpawnableAgents(agentTemplate),
+        agentTemplates: localAgentTemplates,
+      })
+
+  const tools = useParentTools
+    ? parentTools
+    : await getToolSet({
+        toolNames: agentTemplate.toolNames,
+        windowedFileReads: agentTemplate.windowedFileReads === true,
+        suppressCommitAttribution:
+          agentTemplate.suppressCommitAttribution === true,
+        additionalToolDefinitions: async () => {
+          if (!cachedAdditionalToolDefinitions) {
+            cachedAdditionalToolDefinitions = await additionalToolDefinitions({
+              ...params,
+              agentTemplate,
+            })
+          }
+          return cachedAdditionalToolDefinitions
+        },
+        agentTools,
+        skills: fileContext.skills ?? {},
+      })
+
+  const hasUserMessage =
+    !manualCompaction &&
+    Boolean(
+      prompt ||
+      (spawnParams && Object.keys(spawnParams).length > 0) ||
+      (content && content.length > 0),
+    )
+
+  const initialMessages = buildArray<Message>(
+    ...initialAgentState.messageHistory,
+
+    hasUserMessage && [
+      {
+        // Actual user message!
+        role: 'user' as const,
+        content: buildUserMessageContent(prompt, spawnParams, content),
+        tags: ['USER_PROMPT'],
+        sentAt: Date.now(),
+
+        // James: Deprecate the below, only use tags, which are not prescriptive.
+        keepDuringTruncation: true,
+      },
+      prompt &&
+        prompt in additionalSystemPrompts &&
+        userMessage(
+          withSystemInstructionTags(
+            additionalSystemPrompts[
+              prompt as keyof typeof additionalSystemPrompts
+            ],
+          ),
+        ),
+      ,
+    ],
+
+    instructionsPrompt &&
+      userMessage({
+        content: instructionsPrompt,
+        tags: ['INSTRUCTIONS_PROMPT'],
+
+        // James: Deprecate the below, only use tags, which are not prescriptive.
+        keepLastTags: ['INSTRUCTIONS_PROMPT'],
+      }),
+  )
+
+  // Convert tools to a serializable format for context-pruner token counting
+  // Tool definitions live in agent state (persisted, snapshotted, shipped over
+  // the wire), so every inputSchema must be plain JSON Schema: Zod instances
+  // are cyclic and break any JSON.stringify over the state.
+  const toolDefinitions =
+    manualCompaction && initialAgentState.toolDefinitions
+      ? initialAgentState.toolDefinitions
+      : mapValues(tools, (tool) => ({
+          description:
+            typeof tool.description === 'string' ? tool.description : undefined,
+          inputSchema: toTokenCountInputSchema(tool.inputSchema) ?? {},
+        }))
+
+  const additionalToolDefinitionsWithCache = async () => {
+    if (!cachedAdditionalToolDefinitions) {
+      cachedAdditionalToolDefinitions = await additionalToolDefinitions({
+        ...params,
+        agentTemplate,
+      })
+    }
+    return cachedAdditionalToolDefinitions
+  }
+
+  // Mutate initialAgentState so that in-progress work propagates back to the
+  // caller's shared reference (e.g. SDK's sessionState.mainAgentState) even if
+  // an error is thrown before we return.
+  initialAgentState.messageHistory = initialMessages
+  initialAgentState.systemPrompt = system
+  initialAgentState.toolDefinitions = toolDefinitions
+  let currentAgentState: AgentState = initialAgentState
+  if (currentAgentState.contextTokenBaseline?.model !== agentTemplate.model) {
+    currentAgentState.contextTokenBaseline = undefined
+  }
+
+  // Estimate the wire schemas, not Zod's internal object graph.
+  const toolsForTokenCount = toolsForContextEstimate(toolDefinitions)
+
+  // Keep the persisted/displayed count aligned after cancellation and TTL edits.
+  // Uses the latest receipt plus cheap deltas; never re-tokenizes the history.
+  const recountContextTokensForTurnEnd = () => {
+    currentAgentState.contextTokenCount = recountContextTokens({
+      agentState: currentAgentState,
+      model: agentTemplate.model,
+      systemPrompt: system,
+      toolsForTokenCount,
+    })
+  }
+
+  let shouldEndTurn = false
+  let hasRetriedOutputSchema = false
+  let hasCheckedCompletion = false
+  // Only the first optional check may fall back to a completed answer. Once
+  // it produces text or invokes ANY tool, its findings/effects must be kept.
+  let completionCheckpoint: Message[] | undefined
+  let usedWorkTools = false
+  let deadlineReminderLevel = 0
+  let currentPrompt = prompt
+  let currentParams = spawnParams
+  let totalSteps = 0
+  let llmStepNumber = 0
+  let nResponses: string[] | undefined = undefined
+  let compactionWindow: CompactionWindow | undefined
+
+  try {
+    while (true) {
+      totalSteps++
+      if (signal.aborted) {
+        throw new AbortError()
+      }
+
+      if (totalSteps === 1 && hasUserMessage) {
+        assertUserContentSize(
+          [
+            userMessage({
+              content: buildUserMessageContent(prompt, spawnParams, content),
+            }),
+          ],
+          agentTemplate,
+        )
+      }
+
+      const startTime = new Date()
+
+      const stepPrompt = await getAgentPrompt({
+        ...params,
+        agentTemplate,
+        promptType: { type: 'stepPrompt' },
+        fileContext,
+        agentState: currentAgentState,
+        agentTemplates: localAgentTemplates,
+        logger,
+        additionalToolDefinitions: additionalToolDefinitionsWithCache,
+      })
+      const messagesWithStepPrompt = buildArray(
+        ...currentAgentState.messageHistory,
+        stepPrompt &&
+          userMessage({
+            content: stepPrompt,
+          }),
+      )
+
+      // Each completed response supplies the baseline. Only content added or
+      // removed since then (tools, steering, step scaffolding) is estimated.
+      currentAgentState.contextTokenCount = estimateContextTokens({
+        agentState: {
+          ...currentAgentState,
+          messageHistory: messagesWithStepPrompt,
+        },
+        model: agentTemplate.model,
+        systemPrompt: system,
+        toolsForTokenCount,
+      })
+
+      if (
+        (agentTemplate.compactContext && !shouldEndTurn) ||
+        manualCompaction
+      ) {
+        const policy =
+          typeof agentTemplate.compactContext === 'object'
+            ? agentTemplate.compactContext
+            : {}
+        const maxContextLength =
+          policy.maxContextLength ??
+          contextPrunerBudgetForModel(agentTemplate.model)
+        const thresholdTokens = modelCompactionThreshold(maxContextLength)
+        let trigger: CompactionTrigger | 'manual' | null = manualCompaction
+          ? 'manual'
+          : evaluateCompactionTrigger({
+              ...policy,
+              messages: currentAgentState.messageHistory,
+              contextTokenCount: currentAgentState.contextTokenCount,
+              maxContextLength: thresholdTokens,
+            }).trigger
+        const fixedTokenCount = trigger
+          ? countTokens(system) +
+            countTokensJson(toolsForTokenCount) +
+            (stepPrompt
+              ? countTokensMessages([userMessage({ content: stepPrompt })])
+              : 0)
+          : 0
+        // The threshold is a convenience, the budget is not. When even a
+        // perfect compaction would land back near the threshold (a small
+        // BYOK window under a large fixed prompt and tool catalog), firing
+        // there compacts every few steps, each pass summarizing the last
+        // summary. Keep working until the hard budget instead.
+        if (
+          trigger &&
+          trigger !== 'manual' &&
+          currentAgentState.contextTokenCount <= maxContextLength &&
+          !automaticCompactionIsWorthwhile({
+            messages: currentAgentState.messageHistory,
+            maxContextLength,
+            thresholdTokens,
+            fixedTokenCount,
+            maxOutputTokens: policy.maxOutputTokens,
+          })
+        ) {
+          logger.debug(
+            {
+              agentType,
+              runId,
+              contextTokenCount: currentAgentState.contextTokenCount,
+              thresholdTokens,
+              maxContextLength,
+              fixedTokenCount,
+            },
+            'Deferred compaction to the hard budget: it could not clear the threshold',
+          )
+          trigger = null
+        }
+        if (trigger) {
+          const before = currentAgentState.directCreditsUsed
+          const started = Date.now()
+          const isRoot = !initialAgentState.parentId
+          if (isRoot) params.onCompactionStart?.({ trigger })
+          let compacted: Awaited<ReturnType<typeof compactWithModelOrFallback>>
+          // An automatic pass must leave the run under its own trigger, or the
+          // next step fires it again on its output. The mechanical pass aims
+          // lower: it keeps no findings, so it needs room to work in.
+          const automatic = trigger !== 'manual'
+          const targetTokens = automatic
+            ? Math.floor(thresholdTokens * COMPACTION_LOW_WATER)
+            : undefined
+          const mechanicalTargetTokens = automatic
+            ? Math.floor(thresholdTokens * MECHANICAL_TARGET_SHARE)
+            : undefined
+          // Mechanical for the user's cohort, on every trigger. On the idle
+          // trigger the cache is already cold, so a summarizer would read the
+          // whole cold history first: it costs more than the prefill it saves
+          // and the user waits for it.
+          const deterministic = usesDeterministicCompaction(userId)
+          // Ends after the receipt, so a host never sees a gap between the
+          // pass it is showing and the handoff that replaces it.
+          try {
+            if (deterministic) {
+              try {
+                compacted = compactMechanically({
+                  messages: currentAgentState.messageHistory,
+                  maxContextLength,
+                  fixedTokenCount,
+                  targetTokens: mechanicalTargetTokens,
+                  trigger,
+                  logger,
+                  runId,
+                })
+              } catch {
+                // Opportunistic: a history it cannot fit is left alone.
+                compacted = null
+              }
+            } else {
+              // A compaction failure must never fail the turn: a summarizer error
+              // or malformed handoff falls back to the mechanical pass.
+              compacted = await compactWithModelOrFallback({
+                messages: currentAgentState.messageHistory,
+                system,
+                maxContextLength,
+                fixedTokenCount,
+                maxOutputTokens: policy.maxOutputTokens,
+                fallbackTargetTokens: targetTokens,
+                mechanicalTargetTokens,
+                signal,
+                logger,
+                runId,
+                model: agentTemplate.model,
+                trigger,
+                stream: (messages, maxOutputTokens, onFinishReason) =>
+                  getAgentStreamFromTemplate({
+                    ...params,
+                    agentId: agentType,
+                    template: agentTemplate,
+                    runId,
+                    messages,
+                    tools: compactionTools,
+                    toolChoice: 'required',
+                    maxOutputTokens,
+                    onFinishReason,
+                    onCostCalculated: async (credits) => {
+                      currentAgentState.creditsUsed += credits
+                      currentAgentState.directCreditsUsed += credits
+                    },
+                    // Compaction usage is spend, not the next root request's context.
+                    onUsageReceived: (usage) =>
+                      params.onAgentUsageReceived?.({
+                        ...usage,
+                        isRoot: false,
+                        agentId: currentAgentState.agentId,
+                      }),
+                    onUsageIncomplete: params.onAgentUsageIncomplete,
+                  }),
+              })
+              await addAgentStep({
+                ...params,
+                agentRunId: runId,
+                stepNumber: totalSteps,
+                credits: currentAgentState.directCreditsUsed - before,
+                childRunIds: [],
+                messageId: null,
+                status: 'completed',
+                startTime,
+              })
+            }
+            if (compacted) {
+              if (compactionWindow)
+                closeCompactionWindow({
+                  window: compactionWindow,
+                  messages: currentAgentState.messageHistory,
+                  endedBy: 'compaction',
+                  nextTrigger: trigger,
+                  logger,
+                  runId,
+                  model: agentTemplate.model,
+                })
+              compactionWindow = openCompactionWindow({
+                before: currentAgentState.messageHistory,
+                after: compacted.messages,
+                mode: deterministic
+                  ? 'mechanical'
+                  : compacted.fallback
+                    ? 'fallback'
+                    : 'model',
+                trigger,
+              })
+              currentAgentState.messageHistory = compacted.messages
+              currentAgentState.contextTokenBaseline = undefined
+              currentAgentState.contextTokenCount = compacted.postTokens
+              if (isRoot)
+                params.onCompaction?.({
+                  trigger,
+                  thresholdTokens,
+                  summary: compacted.summary,
+                  preTokens: compacted.preTokens,
+                  postTokens: compacted.postTokens,
+                  durationMs: Date.now() - started,
+                })
+            }
+          } finally {
+            if (isRoot) params.onCompactionEnd?.()
+          }
+          // A manual request is a maintenance operation, never a coding turn.
+          if (manualCompaction) break
+          if (
+            !compacted &&
+            currentAgentState.contextTokenCount > maxContextLength
+          ) {
+            throw new Error(
+              `Compaction could not bring this conversation under the model's ${maxContextLength.toLocaleString('en-US')}-token context budget. History has been preserved. Start a new thread, or give a BYOK connection a larger context window if its model supports one.`,
+            )
+          }
+          totalSteps++
+        }
+      }
+
+      // 1. Run programmatic step first if it exists
+      let n: number | undefined = undefined
+
+      if (agentTemplate.handleSteps) {
+        const programmaticResult = await runProgrammaticStep({
+          ...params,
+
+          agentState: currentAgentState,
+          localAgentTemplates,
+          nResponses,
+          onCostCalculated: async (credits: number) => {
+            currentAgentState.creditsUsed += credits
+            currentAgentState.directCreditsUsed += credits
+          },
+          prompt: currentPrompt,
+          runId,
+          stepNumber: totalSteps,
+          stepsComplete: shouldEndTurn,
+          system,
+          tools,
+          template: agentTemplate,
+          toolCallParams: currentParams,
+        })
+        const {
+          agentState: programmaticAgentState,
+          endTurn,
+          stepNumber,
+          generateN,
+        } = programmaticResult
+        n = generateN
+
+        Object.assign(initialAgentState, programmaticAgentState)
+        currentAgentState = initialAgentState
+        totalSteps = stepNumber
+
+        shouldEndTurn = endTurn
+      }
+
+      // Check if output is required but missing
+      if (
+        agentTemplate.outputSchema &&
+        currentAgentState.output === undefined &&
+        shouldEndTurn &&
+        !hasRetriedOutputSchema
+      ) {
+        hasRetriedOutputSchema = true
+        logger.warn(
+          {
+            agentType,
+            agentId: currentAgentState.agentId,
+            runId,
+          },
+          'Agent finished without setting required output, restarting loop',
+        )
+
+        // Add system message instructing to use set_output
+        const outputSchemaMessage = withSystemTags(
+          `[freebuff product prompt text omitted]`,
+        )
+
+        currentAgentState.messageHistory = [
+          ...currentAgentState.messageHistory,
+          userMessage({
+            content: outputSchemaMessage,
+            keepDuringTruncation: true,
+          }),
+        ]
+
+        // Reset shouldEndTurn to continue the loop
+        shouldEndTurn = false
+      }
+
+      // One opportunity per invocation, only after concrete work. Keep normal
+      // step, spend, abort and deadline limits; never override a programmatic end.
+      if (
+        shouldEndTurn &&
+        agentTemplate.completionCheck &&
+        !agentTemplate.handleSteps &&
+        usedWorkTools &&
+        !hasCheckedCompletion &&
+        currentAgentState.stepsRemaining > 0 &&
+        (params.deadlineAt === undefined ||
+          !Number.isFinite(params.deadlineAt) ||
+          params.deadlineAt - Date.now() >= 120_000)
+      ) {
+        hasCheckedCompletion = true
+        // Require an actual answer, not just reasoning or end_turn.
+        if (
+          agentTemplate.outputMode === 'last_message' &&
+          typeof outputForParent(
+            getAgentOutput(currentAgentState, agentTemplate),
+          ) === 'string'
+        ) {
+          completionCheckpoint = [...currentAgentState.messageHistory]
+        }
+        currentAgentState.messageHistory.push(
+          userMessage({
+            content: withSystemTags(
+              "Final completion check: compare the actual deliverables with the user request: exact paths, interfaces, formats, correctness, and any performance requirements. If a necessary check or repair is missing, use the available tools to finish it within the remaining budget. Verify the final edited files; rerun affected checks after repairs, but do not repeat passing checks when the relevant files have not changed. Preserve the tested command's exit status when filtering output (for example, Bash pipefail or explicit status capture); a successful output filter is not a passing test. Fix causes rather than skipping tests, weakening assertions, swallowing errors, or adding type/lint suppressions just to pass. If changing a check is required by the requested behavior, explain why and verify that behavior. Respect permission boundaries, refusals, and requests to stop; if awaiting user input or genuinely blocked, report that and end. Otherwise give a concise final answer stating what was verified, which checks failed or could not run, and any remaining limitations.",
+            ),
+          }),
+        )
+        shouldEndTurn = false
+      }
+
+      // End turn if programmatic step ended turn, or if the previous runAgentStep ended turn
+      if (shouldEndTurn) {
+        break
+      }
+
+      if (
+        params.deadlineAt !== undefined &&
+        Number.isFinite(params.deadlineAt)
+      ) {
+        const seconds = Math.max(
+          0,
+          Math.ceil((params.deadlineAt - Date.now()) / 1000),
+        )
+        const level = seconds <= 60 ? 3 : seconds <= 300 ? 2 : 1
+        if (level > deadlineReminderLevel) {
+          deadlineReminderLevel = level
+          currentAgentState.messageHistory.push(
+            userMessage({
+              content: withSystemTags(
+                `Time budget: approximately ${seconds} seconds remain before the host deadline. Prioritize saving usable deliverables and checking the required contract. Avoid optional exploration or starting work that cannot finish in time.`,
+              ),
+            }),
+          )
+        }
+      }
+
+      const creditsBefore = currentAgentState.directCreditsUsed
+      const childrenBefore = currentAgentState.childRunIds.length
+      llmStepNumber++
+      const {
+        agentState: newAgentState,
+        shouldEndTurn: llmShouldEndTurn,
+        usedWorkTools: stepUsedWorkTools,
+        messageId,
+        nResponses: generatedResponses,
+      } = await runAgentStep({
+        ...params,
+
+        agentState: currentAgentState,
+        agentTemplate,
+        extraCodebuffMetadata: {
+          ...(params.extraCodebuffMetadata ?? {}),
+          llm_step_number: String(llmStepNumber),
+        },
+        n,
+        prompt: currentPrompt,
+        runId,
+        spawnParams: currentParams,
+        system,
+        tools,
+        additionalToolDefinitions: additionalToolDefinitionsWithCache,
+        onResponseChunk: (chunk) => {
+          // tool_call is emitted before execution, including custom tools.
+          // Conservatively refuse fallback even for a read-only tool or an
+          // error event: either may have uncovered a failed verification.
+          if (
+            typeof chunk === 'string'
+              ? chunk.trim().length > 0
+              : chunk.type !== 'reasoning_delta' && chunk.type !== 'start'
+          ) {
+            completionCheckpoint = undefined
+          }
+          params.onResponseChunk(chunk)
+        },
+      }).catch((error: unknown) => {
+        const { statusCode, errorCode } = extractApiErrorDetails(error)
+        const transient =
+          statusCode === 408 ||
+          (statusCode !== undefined && statusCode >= 500 && statusCode < 600) ||
+          ((statusCode === undefined || statusCode === 200) &&
+            (errorCode === 'flex_unavailable' ||
+              errorCode === 'resource_unavailable' ||
+              isTransientNetworkError(error) ||
+              isFetchIdleTimeoutError(error)))
+        // In particular, 429 can be the final per-turn spend limit, not a
+        // provider outage. Leave quota/payment/access refusals to the caller.
+        if (
+          !completionCheckpoint ||
+          !transient ||
+          signal.aborted ||
+          isAbortError(error)
+        ) {
+          throw error
+        }
+
+        const notice =
+          '\n\nThe additional completion check could not finish because the model request failed. The preceding result is preserved; no additional verification was completed.'
+        currentAgentState.messageHistory = [
+          ...completionCheckpoint,
+          assistantMessage(notice),
+        ]
+        currentAgentState.stepsRemaining--
+        logger.warn(
+          {
+            metric: 'completion_check_unavailable',
+            agentId: currentAgentState.agentId,
+            runId,
+            statusCode,
+            errorCode,
+          },
+          'Preserving completed answer after optional verification transport failure',
+        )
+        params.onResponseChunk(notice)
+        return {
+          agentState: currentAgentState,
+          shouldEndTurn: true,
+          usedWorkTools: false,
+          messageId: null,
+          nResponses: undefined,
+        }
+      })
+      completionCheckpoint = undefined
+
+      if (newAgentState.runId) {
+        await addAgentStep({
+          ...params,
+          agentRunId: newAgentState.runId,
+          stepNumber: totalSteps,
+          credits: newAgentState.directCreditsUsed - creditsBefore,
+          childRunIds: newAgentState.childRunIds.slice(childrenBefore),
+          messageId,
+          status: 'completed',
+          startTime,
+        })
+      } else {
+        logger.error('No runId found for agent state after finishing agent run')
+      }
+
+      Object.assign(initialAgentState, newAgentState)
+      currentAgentState = initialAgentState
+      shouldEndTurn = llmShouldEndTurn
+      usedWorkTools ||= stepUsedWorkTools ?? false
+      nResponses = generatedResponses
+
+      currentPrompt = undefined
+      currentParams = undefined
+
+      // Steering: if the host fed user messages while this step ran, append them
+      // now (the step's LLM call + tools have completed, so history is in a clean
+      // state) and keep the turn going so the agent responds to them next step,
+      // rather than waiting for the whole turn to finish. Each message is
+      // framed as sent mid-turn: bare, the model read it as the whole new
+      // request and dropped the one it was working on.
+      const steered = await params.drainSteeringMessages?.()
+      if (steered?.length) {
+        const messages = steered.map((message) =>
+          userMessage({
+            content: frameSteeringContent(
+              typeof message === 'string'
+                ? buildUserMessageContent(message, undefined)
+                : buildUserMessageContent(
+                    message.prompt,
+                    undefined,
+                    message.content,
+                  ),
+            ),
+            tags: ['USER_PROMPT'],
+            keepDuringTruncation: true,
+          }),
+        )
+        assertUserContentSize(messages, agentTemplate)
+        currentAgentState.messageHistory = [
+          ...currentAgentState.messageHistory,
+          ...messages,
+        ]
+        shouldEndTurn = false
+      }
+    }
+
+    const projectProfileReport =
+      offersProjectProfile &&
+      !manualCompaction &&
+      params.getProjectProfile &&
+      params.reportProjectProfile
+        ? runProjectProfileReport({
+            history: dropUnansweredToolCalls(currentAgentState.messageHistory),
+            getProjectProfile: params.getProjectProfile,
+            reportProjectProfile: params.reportProjectProfile,
+            stream: (messages, reportSignal) =>
+              getAgentStreamFromTemplate({
+                ...params,
+                agentId: undefined,
+                template: agentTemplate,
+                runId,
+                messages: [systemMessage(system), ...messages],
+                tools,
+                toolChoice: 'required',
+                includeCacheControl: supportsCacheControl(agentTemplate.model),
+                signal: reportSignal,
+                extraCodebuffMetadata: {
+                  ...(params.extraCodebuffMetadata ?? {}),
+                  llm_step_number: String(llmStepNumber + 1),
+                },
+                onCostCalculated: async () => {},
+              }),
+            logger,
+          })
+        : undefined
+
+    if (clearUserPromptMessagesAfterResponse) {
+      currentAgentState.messageHistory = expireMessages(
+        currentAgentState.messageHistory,
+        'userPrompt',
+      )
+    }
+
+    recountContextTokensForTurnEnd()
+
+    const finishCompletedRun = () =>
+      finishAgentRun({
+        ...params,
+        runId,
+        status: 'completed',
+        totalSteps,
+        directCredits: currentAgentState.directCreditsUsed,
+        totalCredits: currentAgentState.creditsUsed,
+      })
+    if (projectProfileReport) {
+      void projectProfileReport.then(finishCompletedRun)
+    } else {
+      await finishCompletedRun()
+    }
+
+    return {
+      agentState: currentAgentState,
+      output: manualCompaction
+        ? { type: 'lastMessage', value: [] }
+        : getAgentOutput(currentAgentState, agentTemplate),
+    }
+  } catch (error) {
+    // Handle user-initiated aborts separately - don't log as errors.
+    //
+    // `signal.aborted` catches the aborts `isAbortError` cannot see: a caller
+    // deadline (`AbortSignal.timeout`) rejects the fetch with a DOMException
+    // named `TimeoutError`, not `AbortError`, and that name is exactly what
+    // `isFetchIdleTimeoutError` matches below. Without this, a 20-second title
+    // deadline was reported as "no data was received from the server for 5
+    // minutes". Once the caller's own signal has fired, whatever the stream
+    // threw is the consequence of that cancellation.
+    if (isAbortError(error) || signal.aborted) {
+      if (clearUserPromptMessagesAfterResponse) {
+        currentAgentState.messageHistory = expireMessages(
+          currentAgentState.messageHistory,
+          'userPrompt',
+        )
+      }
+
+      currentAgentState.messageHistory = [
+        ...currentAgentState.messageHistory,
+        userMessage(
+          withSystemTags(
+            "User interrupted the response. The assistant's previous work has been preserved.",
+          ),
+        ),
+      ]
+
+      logger.info(
+        {
+          agentType,
+          agentId: currentAgentState.agentId,
+          runId,
+          totalSteps,
+          messageHistory: currentAgentState.messageHistory,
+        },
+        'Agent run cancelled by user (abort error)',
+      )
+
+      // Same reason as the success path, and it matters more here: the branch
+      // above just appended another message to the history the caller keeps.
+      // Not the last edit, though — the SDK's buildCancelledSessionState drops
+      // unanswered tool calls and appends again at the persistence boundary,
+      // and carries this count across those edits itself.
+      recountContextTokensForTurnEnd()
+
+      await finishAgentRun({
+        ...params,
+        runId,
+        status: 'cancelled',
+        totalSteps,
+        directCredits: currentAgentState.directCreditsUsed,
+        totalCredits: currentAgentState.creditsUsed,
+      })
+
+      return {
+        agentState: currentAgentState,
+        output: {
+          type: 'error',
+          message: 'Run cancelled by user',
+        },
+      }
+    }
+
+    logger.error(
+      {
+        error: getErrorObject(error),
+        agentType,
+        agentId: currentAgentState.agentId,
+        runId,
+        totalSteps,
+        directCreditsUsed: currentAgentState.directCreditsUsed,
+        creditsUsed: currentAgentState.creditsUsed,
+        messageHistory: currentAgentState.messageHistory,
+        systemPrompt: system,
+      },
+      'Agent execution failed',
+    )
+
+    const apiErrorDetails = extractApiErrorDetails(error)
+    const isIdleTimeout = isFetchIdleTimeoutError(error)
+    const isNetworkError = !isIdleTimeout && isTransientNetworkError(error)
+    const isTodoLoop = error instanceof TodoLoopError
+    const hasServerMessage = apiErrorDetails.message !== undefined
+    let fallbackMessage: string
+    if (isTodoLoop) {
+      fallbackMessage = error.message
+    } else if (isIdleTimeout) {
+      fallbackMessage = FETCH_IDLE_TIMEOUT_USER_MESSAGE
+    } else if (isNetworkError) {
+      fallbackMessage = TRANSIENT_NETWORK_ERROR_USER_MESSAGE
+    } else if (error instanceof Error) {
+      const includeStack =
+        apiErrorDetails.statusCode === undefined && error.stack
+      fallbackMessage =
+        error.message + (includeStack ? `\n\n${error.stack}` : '')
+    } else {
+      fallbackMessage = String(error)
+    }
+    const errorMessage = apiErrorDetails.message ?? fallbackMessage
+    const statusCode = apiErrorDetails.statusCode
+
+    const status = signal.aborted ? 'cancelled' : 'failed'
+    // A failed turn still leaves history behind, and the host still shows the
+    // user a context reading before their next message.
+    recountContextTokensForTurnEnd()
+    await finishAgentRun({
+      ...params,
+      runId,
+      status,
+      totalSteps,
+      directCredits: currentAgentState.directCreditsUsed,
+      totalCredits: currentAgentState.creditsUsed,
+      errorMessage,
+    })
+
+    // Payment required errors (402) should propagate
+    if (statusCode === 402) {
+      throw error
+    }
+
+    return {
+      agentState: currentAgentState,
+      output: {
+        type: 'error',
+        message:
+          hasServerMessage || isIdleTimeout || isNetworkError || isTodoLoop
+            ? errorMessage
+            : 'Agent run error: ' + errorMessage,
+        ...(statusCode !== undefined && { statusCode }),
+        ...(apiErrorDetails.errorCode !== undefined && {
+          error: apiErrorDetails.errorCode,
+        }),
+        ...(apiErrorDetails.countryCode !== undefined && {
+          countryCode: apiErrorDetails.countryCode,
+        }),
+        ...(apiErrorDetails.countryBlockReason !== undefined && {
+          countryBlockReason: apiErrorDetails.countryBlockReason,
+        }),
+        ...(apiErrorDetails.ipPrivacySignals !== undefined && {
+          ipPrivacySignals: apiErrorDetails.ipPrivacySignals,
+        }),
+      },
+    }
+  } finally {
+    if (compactionWindow)
+      closeCompactionWindow({
+        window: compactionWindow,
+        messages: currentAgentState.messageHistory,
+        endedBy: 'run_end',
+        logger,
+        runId,
+        model: agentTemplate.model,
+      })
+    // The endTurn path inside runProgrammaticStep handles normal completion,
+    // but abort/error exits (e.g. chat SSE disconnects) would otherwise leak
+    // the run's generator, STEP_ALL flag, and proposed file content forever.
+    clearProgrammaticRunState(runId)
+  }
+}
+
+const STEP_WARNING_MESSAGE = [
+  "I've made quite a few responses in a row.",
+  "Let me pause here to make sure we're still on the right track.",
+  "Please let me know if you'd like me to continue or if you'd like to guide me in a different direction.",
+].join(' ')
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `common/src/constants/__tests__/compaction-policy.test.ts` (13 matching lines):
+```
+import { describe, expect, test } from 'bun:test'
+
+import {
+  DETERMINISTIC_COMPACTION_PERCENT,
+  usesDeterministicCompaction,
+} from '../compaction-policy'
+
+const ids = Array.from(
+  { length: 20_000 },
+  (_, i) => `00000000-0000-4000-8000-${i.toString(16).padStart(12, '0')}`,
+)
+
+describe('usesDeterministicCompaction', () => {
+  test('is sticky per user', () => {
+    for (const id of ids.slice(0, 50))
+      expect(usesDeterministicCompaction(id)).toBe(
+        usesDeterministicCompaction(id),
+      )
+  })
+
+  test('splits users close to the configured share', () => {
+    const share =
+      ids.filter((id) => usesDeterministicCompaction(id)).length / ids.length
+    expect(
+      Math.abs(share * 100 - DETERMINISTIC_COMPACTION_PERCENT),
+```
+- File `packages/agent-runtime/src/__tests__/compact-context-loop.test.ts` (12 matching lines):
+```
+/**
+ * End-to-end cover for the `compactContext` flag: compact-history.test.ts
+ * proves the algorithm, and this proves the runtime actually reaches it and
+ * that the rewritten history is what the model sees.
+ */
+
+import * as analytics from '@codebuff/common/analytics'
+import { usesDeterministicCompaction } from '@codebuff/common/constants/compaction-policy'
+import { TEST_USER_ID } from '@codebuff/common/old-constants'
+import { createTestAgentRuntimeParams } from '@codebuff/common/testing/fixtures/agent-runtime'
+import { clearMockedModules } from '@codebuff/common/testing/mock-modules'
+import {
+  createMockDbOperations,
+  setupDbSpies,
+} from '@codebuff/common/testing/mocks/database'
+import { getInitialSessionState } from '@codebuff/common/types/session-state'
+import { promptSuccess } from '@codebuff/common/util/error'
+import { assistantMessage, userMessage } from '@codebuff/common/util/messages'
+import {
+  afterAll,
+  afterEach,
+…
+})
+
+  afterEach(() => {
+    if (runtimeImpl) clearAgentGeneratorCache(runtimeImpl)
+    dbSpies.restore()
+    mock.restore()
+  })
+
+  afterAll(() => {
+    clearMockedModules()
+  })
+
+  /** A user `usesDeterministicCompaction` puts on the mechanical pass. */
+  const cohortUser = () => {
+    let userId = ''
+    for (let i = 0; !usesDeterministicCompaction(userId); i++)
+      userId = `cohort-user-${i}`
+    return userId
+  }
+
+  it('runs the model handoff for the test user, who is in the model cohort', () => {
+    // Every model-path case below depends on this; at 100% the handoff is gone.
+    expect(usesDeterministicCompaction(TEST_USER_ID)).toBe(false)
+  })
+```
+- File `packages/agent-runtime/src/model-compaction.ts` (4 matching lines):
+```
+Math.floor(
+      (params.maxContextLength - params.fixedTokenCount - params.suffixTokens) /
+        3,
+    ),
+    Math.floor(
+      compactionOutputTokens(params.maxOutputTokens) * SUMMARY_OUTPUT_SHARE,
+    ),
+  )
+}
+
+/**
+ * The share of the trigger threshold a compaction's result may occupy for the
+ * automatic trigger to be worth firing. Above it, the next tool result or two
+ * crosses the threshold again and the run compacts its own summary.
+ */
+export const COMPACTION_LOW_WATER = 0.85
+
+/**
+ * The largest context a model compaction can leave behind: the fixed prefix
+ * (system prompt, tool schemas), the live request it keeps verbatim, and the
+ * summary budget it asks for. None of it is compactable, so when this is not
+ * comfortably under the threshold, compacting at the threshold only buys a
+ * few thousand tokens before the next one: a 32k BYOK window with ~16k of
+ * Desktop tool schemas compacted every few tool calls, each pass summarizing
+ * the last summary.
+…
+export function compactedContextCeiling(params: {
+  messages: Message[]
+  maxContextLength: number
+  fixedTokenCount: number
+  maxOutputTokens?: number
+}): number {
+  const suffixTokens = countTokensMessages(compactionSuffix(params.messages))
+  const summaryBudget = compactionSummaryBudget({ ...params, suffixTokens })
+  return params.fixedTokenCount + suffixTokens + Math.max(0, summaryBudget)
+}
+
+/**
+ * Whether an automatic compaction at `thresholdTokens` leaves real room to
+ * work in. When it cannot, the run keeps its history until the hard budget,
+ * where compaction is no longer optional.
+ */
+export function automaticCompactionIsWorthwhile(params: {
+  messages: Message[]
+  maxContextLength: number
+  thresholdTokens: number
+  fixedTokenCount: number
+  maxOutputTokens?: number
+}): boolean {
+  return (
+    compactedContextCeiling(params) <=
+…
+/** A model handoff, not a mechanical reduction of tool results. Nothing mutates
+ * the source history until every section has a valid, bounded result. */
+export async function compactWithModel(params: {
+  messages: Message[]
+  system: string
+  maxContextLength: number
+  fixedTokenCount: number
+  /** The model's output cap, when it is below COMPACTION_MAX_OUTPUT_TOKENS. */
+  maxOutputTokens?: number
+  /**
+   * The context a summary longer than requested must still leave the run
+   * under (an automatic trigger's low-water mark). Defaults to
+   * `maxContextLength`. A summary within the requested length is held only
+   * to `maxContextLength`, as before.
+   */
+  targetTokens?: number
+  signal: AbortSignal
+  stream: (
+    messages: Message[],
+    maxOutputTokens: number,
+    /** Called with the request's finish reason once the model stops. */
+    onFinishReason: (finishReason: string) => void,
+  ) => ReturnType<PromptAiSdkStreamFn>
+}): Promise<{
+```
+- File `packages/agent-runtime/src/__tests__/model-compaction.test.ts` (3 matching lines):
+```
+yield { type: 'text', text: '' }
+        return promptSuccess(null)
+      },
+    }),
+  ).rejects.toThrow()
+})
+
+// Desktop BYOK, 2026-09-24..27: a connection on the untouched 32k default
+// compacts at 80% of 90% of (32,768 - 4,096) = 20,643 tokens, and the Desktop
+// agent's prompt and tool catalog alone are ~15-20k. The best any compaction
+// can do there lands back near the threshold, so firing at it compacted every
+// few tool calls, each pass summarizing the previous summary.
+test('an automatic compaction that cannot clear its own threshold is not worthwhile', () => {
+  const byokDefault = { maxContextLength: 25_804, thresholdTokens: 20_643 }
+  expect(
+    automaticCompactionIsWorthwhile({ messages, ...byokDefault, fixedTokenCount: 16_000 }),
+  ).toBe(false)
+  // The same window with a small fixed prompt has room to work after a pass.
+  expect(
+    automaticCompactionIsWorthwhile({ messages, ...byokDefault, fixedTokenCount: 3_000 }),
+  ).toBe(true)
+  // Hosted budgets are unaffected: 400k budget, 320k threshold.
+  expect(
+    automaticCompactionIsWorthwhile({
+      messages,
+      maxContextLength: 400_000,
+      thresholdTokens: 320_000,
+      fixedTokenCount: 20_000,
+    }),
+  ).toBe(true)
+  // The ceiling is the fixed prefix, the verbatim live request and the summary budget.
+  const ceiling = compactedContextCeiling({ messages, maxContextLength: 400_000, fixedTokenCount: 20_000 })
+  expect(ceiling).toBe(20_000 + countTokensMessages([messages[0]]) + 6_000)
+})
+
+test('an automatic fallback aims below the trigger instead of refilling the whole budget', async () => {
+  const failing = async function* (): ReturnType<PromptAiSdkStreamFn> {
+    throw new Error('connection reset')
+  }
+  const params = {
+    messages,
+ [freebuff product prompt text omitted]
+    maxContextLength: 16_384,
+    fixedTokenCount: 500,
+    signal: new AbortController().signal,
+    stream: failing,
+    logger: noopLogger,
+  }
+…
+})
+  expect(result!.postTokens).toBeLessThan(result!.preTokens)
+})
+
+test('a handoff far past the requested length, or one that would leave the run over its target, is refused', async () => {
+  const runaway = `${handoff}\n${'- detail\n'.repeat(4_500)}`
+  expect(countTokens(runaway)).toBeGreaterThan(
+    6_000 * SUMMARY_OVERRUN_TOLERANCE,
+  )
+  await expect(run(() => emit(runaway), hosted)).rejects.toThrow(
+    'far longer than requested',
+  )
+  // Over the requested length AND above where an automatic pass must land.
+  await expect(
+    run(() => emit(longHandoff), { ...hosted, targetTokens: 22_000 }),
+  ).rejects.toThrow('far longer than requested')
+  // Within the requested length, the target does not apply (as before).
+  expect(
+    (await run(() => emit(handoff), { ...hosted, targetTokens: 22_000 }))
+      ?.summary,
+  ).toBe(handoff)
+
+  const warnings: unknown[] = []
+  const result = await compactWithModelOrFallback({
+    ...hosted,
+```
+- File `cli/src/hooks/use-freebuff-session.ts` (2 matching lines):
+```
+/**
+ * Admit the requested model. Chat calls this on send after any spending/switch
+ * confirmation; legacy picker callers may still admit directly. A deliberate
+ * model_locked response is handled by the poll controller below.
+ */
+export function startFreebuffSession(
+  model: string,
+  opts: { preserveQueue?: boolean; persistSelection?: boolean } = {},
+): Promise<void> {
+  if (!IS_FREEBUFF) return Promise.resolve()
+  // Chat already persists explicit picker choices. Its send path opts out of
+  // persistence so an automatic access-tier fallback cannot replace that choice.
+  const current = useFreebuffSessionStore.getState().session
+  const resolved = resolveFreebuffModelPickForSession(model, current)
+  // Remember that the next POST is a deliberate pick, so a `model_locked`
+  // rejection explains itself in chat instead of reverting silently.
+  pendingExplicitPickModel = resolved
+  useFreebuffModelStore.getState().setSelectedModel(resolved)
+  if (opts.persistSelection !== false) persistFreebuffModelPick(resolved)
+  return restartFreebuffSession('rejoin', {
+    preserveQueue: opts.preserveQueue,
+    releaseSlot: current?.status === 'active' && current.model !== resolved,
+  })
+}
+…
+? 'Your paid session is in use elsewhere. Take over to move it here and stop its current instance.'
+                : next.status === 'purchase_capacity' &&
+                    next.slotLimit === 1 &&
+                    next.accessTier === 'limited'
+                  ? 'Limited access without a subscription allows one session across CLI and Desktop. Take over to stop the other session and use it here.'
+                  : 'Your concurrent-session limit across CLI and Desktop is reached. Take over to stop another session and use its slot here.',
+          })
+          nextMethod = 'GET'
+          return
+        }
+        if (next.status === 'purchase_claim_released') {
+          // A released claim is single-use. Wait for an explicit selection;
+          // never turn a remote takeover into an automatic purchase loop.
+          claimRetired = true
+          apply(toLandingSession(currentSession))
+          setFailure({
+            type: 'other',
+            message:
+              'This session was released. Choose a model to start a new session.',
+            retry: null,
+            outcomeUnknown: false,
+          })
+          return
+        }
+        // After any successful call, default back to GET polling. The
+```
+- File `cli/src/hooks/use-timeout.ts` (2 matching lines):
+```
+import { useCallback, useEffect, useRef } from 'react'
+
+/**
+ * Hook to safely manage multiple timeouts with automatic cleanup
+ *
+ * Provides setTimeout and clearTimeout methods that manage timeouts by key,
+ * similar to TanStack Query's key-based API. All timeouts are automatically
+ * cleaned up on component unmount.
+ *
+ * @returns Object with setTimeout and clearTimeout methods
+ *
+ * @example
+ * const { setTimeout, clearTimeout } = useTimeout()
+ *
+ * // Schedule multiple timeouts with different keys
+ * setTimeout('message', () => {
+…
+export function useTimeout() {
+  const timeoutsRef = useRef<Map<string, NodeJS.Timeout>>(new Map())
+
+  const setTimeout = useCallback((key: string, callback: () => void, delay: number) => {
+    const timeouts = timeoutsRef.current
+
+    // Clear existing timeout for this key if it exists
+    const existingTimeout = timeouts.get(key)
+    if (existingTimeout) {
+      globalThis.clearTimeout(existingTimeout)
+    }
+
+    // Set new timeout with automatic cleanup after execution
+    const timeoutId = globalThis.setTimeout(() => {
+      callback()
+      timeouts.delete(key)
+    }, delay)
+    timeouts.set(key, timeoutId)
+  }, [])
+
+  const clearTimeout = useCallback((key?: string) => {
+    const timeouts = timeoutsRef.current
+
+    if (key) {
+      // Clear specific timeout
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `common/src/constants/__tests__/compaction-policy.test.ts`: "usesDeterministicCompaction"; "is sticky per user"; "splits users close to the configured share"; "a larger share only adds users"; "0 keeps everyone on the handoff; 100 moves everyone, signed out too"
+```
+import { describe, expect, test } from 'bun:test'
+import {
+  DETERMINISTIC_COMPACTION_PERCENT,
+  usesDeterministicCompaction,
+} from '../compaction-policy'
+const ids = Array.from(
+  { length: 20_000 },
+  (_, i) => `00000000-0000-4000-8000-${i.toString(16).padStart(12, '0')}`,
+)
+describe('usesDeterministicCompaction', () => {
+  test('is sticky per user', () => {
+    for (const id of ids.slice(0, 50))
+      expect(usesDeterministicCompaction(id)).toBe(
+        usesDeterministicCompaction(id),
+      )
+  })
+  test('splits users close to the configured share', () => {
+    const share =
+      ids.filter((id) => usesDeterministicCompaction(id)).length / ids.length
+    expect(
+      Math.abs(share * 100 - DETERMINISTIC_COMPACTION_PERCENT),
+    ).toBeLessThan(2)
+  })
+  test('a larger share only adds users', () => {
+    const at25 = ids.filter((id) => usesDeterministicCompaction(id, 25))
+    for (const id of at25)
+      expect(usesDeterministicCompaction(id, 75)).toBe(true)
+  })
+  test('0 keeps everyone on the handoff; 100 moves everyone, signed out too', () => {
+    expect(ids.some((id) => usesDeterministicCompaction(id, 0))).toBe(false)
+    expect(ids.every((id) => usesDeterministicCompaction(id, 100))).toBe(true)
+    expect(usesDeterministicCompaction(undefined, 50)).toBe(false)
+    expect(usesDeterministicCompaction(undefined, 100)).toBe(true)
+  })
+})
+```
+- File `packages/agent-runtime/src/__tests__/compact-context-loop.test.ts`: "runs the model handoff for the test user, who is in the model cohort"; "compacts mechanically at the context limit for the deterministic cohort"; "compacts mechanically on the idle trigger in the cohort: no summarizer request"
+```
+import { usesDeterministicCompaction } from '@codebuff/common/constants/compaction-policy'
+  /** An old read whose result is most of the history: what a mechanical pass
+   * reclaims. Without it the history is too small to shrink. At ~53k tokens
+   * it is over the 40k working-set limit, so it comes back as a stub. */
+  const bulkyRead = (body = 'BULKY FILE BODY '): Message[] => [
+    {
+      role: 'assistant',
+      content: [
+        {
+          type: 'tool-call',
+          toolCallId: 'old-read',
+          toolName: 'read_files',
+          input: { paths: ['big.ts'] },
+        },
+      ],
+      sentAt: 1_000_000,
+    },
+    {
+      role: 'tool',
+      toolName: 'read_files',
+      toolCallId: 'old-read',
+      content: [
+        {
+          type: 'json',
+          value: [{ path: 'big.ts', content: body.repeat(10_000) }],
+        },
+      ],
+    },
+  ]
+    ...bulkyRead(),
+    userId: string = TEST_USER_ID,
+      userId,
+  /** A user `usesDeterministicCompaction` puts on the mechanical pass. */
+  const cohortUser = () => {
+    let userId = ''
+    for (let i = 0; !usesDeterministicCompaction(userId); i++)
+      userId = `cohort-user-${i}`
+    return userId
+  }
+  it('runs the model handoff for the test user, who is in the model cohort', () => {
+    // Every model-path case below depends on this; at 100% the handoff is gone.
+    expect(usesDeterministicCompaction(TEST_USER_ID)).toBe(false)
+  })
+  it('compacts mechanically at the context limit for the deterministic cohort', async () => {
+    const userId = cohortUser()
+    const logged: unknown[] = []
+    const result = await runLoop(
+      overBudget,
+      idleHistory(0),
+      undefined,
+      logged,
+      userId,
+    )
+    expect(result.output.type).not.toBe('error')
+    // The turn's own request only: no `complete_compaction` call.
+    expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(1)
+    const sent = seenMessages[0].map(textOf).join('\n')
+    expect(sent).toContain('<conversation_summary>')
+    exp
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/common/src/constants/compaction-policy.ts b/common/src/constants/compaction-policy.ts
+index 5ba8543b7..faddf06a1 100644
+--- a/common/src/constants/compaction-policy.ts
++++ b/common/src/constants/compaction-policy.ts
+@@ -1,72 +1,100 @@
+ import { FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID } from './freebuff-model-ids'
++import { fnv1a } from '../util/ad-experiment'
+ 
+ /** Leave input headroom for the model-based compaction request. */
+ export function modelCompactionThreshold(maxContextLength: number): number {
+   return Math.floor(maxContextLength * 0.8)
+ }
+ 
+ /**
+  * When a root agent rewrites its own history after an idle gap: the user
+  * comes back after `cacheExpiryMs` of silence AND the history is at least
+  * `cacheExpiryMinTokens`. Below the floor a cold cache is not enough, because
+  * compaction costs inference and some detail. The context-limit trigger
+- * ignores the floor. Model-based compaction preserves findings from tool results.
++ * ignores the floor. For the users in `usesDeterministicCompaction` every
++ * pass is mechanical (no model call); for the rest it is a model handoff with
++ * the mechanical pass as fallback.
+  *
+  * The numbers live only here. base3 roots hand the object to the runtime as
+  * `compactContext`; the runtime defaults `compactContext: true` to
+  * DEFAULT_COMPACTION_POLICY; and serialized `handleSteps` that spawn
+  * context-pruner (base2, base-chat) receive it as
+  * `AgentStepContext.contextPruning`, resolved in run-programmatic-step.ts.
+  * Exactly these two keys: `compactContext` is validated with a strict schema.
+  */
+ export type CompactionPolicy = {
+   cacheExpiryMs: number
+   cacheExpiryMinTokens: number
+ }
+ 
+ /**
+  * One hour: the idle trigger is a product knob, not a TTL tracker. Compaction
+  * never prevents the cold prefill after a gap, it only shrinks it at the price
+  * of dropped tool results, and under an hour that reads as "the model forgot
+  * everything" (a top user complaint) while the cache may still be warm.
+  *
+- * The 140k floor originated as twice the mechanical summary ceilings. Keep
+- * the idle policy stable while switching compactContext to a model handoff;
+- * small idle histories do not justify another inference request.
++ * 140k tokens is two mechanical summary ceilings (20k assistant/tool + 50k
++ * user, in compact-history.ts). Below one ceiling the budget walk evicts
++ * nothing, so a mostly-prose history comes back the same size plus the
++ * envelope; the second ceiling is margin for the two sides being measured with
++ * different rulers (`chars / 3` against a BPE count).
+  */
+ export const DEFAULT_COMPACTION_POLICY: CompactionPolicy = {
+   cacheExpiryMs: 60 * 60 * 1000,
+   cacheExpiryMinTokens: 140_000,
+ }
+ 
+ /**
+  * DeepSeek V4 Flash, whose front lane is Luminal.
+  *
+  * 15 minutes is about how long Luminal keeps a session's prefix cache. Past
+  * that the next prompt re-reads everything at full price either way, so the
+  * hour only buys a bigger cold prefill.
+  *
+  * 40k tokens rather than 140k because the hour-era floor assumed a marginal
+  * trade, and here it is not. Measured with the runtime's own pass: the
+  * per-message transforms alone strip ~87% of a tool-heavy coding history at
+  * every size, so the budget walk the 140k figure waits for never matters.
+  * What they cannot touch is the fixed prefix — ~13k tokens of tool schemas
+  * plus prompt, knowledge files and git summary, typically 15-20k — so at 40k
+  * the pass halves the cold prefill, while at 25k it removes a third at best
+  * and drops exactly the files the model will re-read. On this lane a cold
+  * input token costs ~40x a cached one, so halving a cold 60k prefill is a
+  * material share of a turn's spend; the figures behind that are in
+  * freebuff-costs.knowledge.md (private).
+  */
+ export const DEEPSEEK_FLASH_COMPACTION_POLICY: CompactionPolicy = {
+   cacheExpiryMs: 15 * 60 * 1000,
+   cacheExpiryMinTokens: 40_000,
+ }
+ 
+ export function compactionPolicyForModel(
+   model: string | null | undefined,
+ ): CompactionPolicy {
+   return model === FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID
+     ? DEEPSEEK_FLASH_COMPACTION_POLICY
+     : DEFAULT_COMPACTION_POLICY
+ }
++
++/**
++ * Percent of users whose compactions, on every trigger, run the mechanical
++ * pass (a ~12k summary plus a working set of file reads) instead of the model
++ * handoff.
++ *
++ * The cohort is sticky per user, so the two arms can be compared on
++ * `context_compaction.followup` (re-reads and repeat compactions, by `mode`).
++ * It starts small and widens; at 100 the model handoff is deleted. A larger
++ * share only adds users, so nobody flips back. Changing the salt reassigns
++ * everyone.
++ */
++export const DETERMINISTIC_COMPACTION_PERCENT = 10
++const DETERMINISTIC_COMPACTION_SALT = 'deterministic_compaction_2026_10'
++
++export function usesDeterministicCompaction(
++  userId: string | undefined,
++  percent: number = DETERMINISTIC_COMPACTION_PERCENT,
++): boolean {
++  if (percent >= 100) return true
++  if (!userId || percent <= 0) return false
++  return fnv1a(`${DETERMINISTIC_COMPACTION_SALT}:${userId}`) % 100 < percent
++}
+diff --git a/common/src/templates/initial-agents-dir/types/agent-definition.ts b/common/src/templates/initial-agents-dir/types/agent-definition.ts
+index 627e0994e..a52323082 100644
+--- a/common/src/templates/initial-agents-dir/types/agent-definition.ts
++++ b/common/src/templates/initial-agents-dir/types/agent-definition.ts
+@@ -183,55 +183,57 @@ export interface AgentDefinition {
+ 
+   /** Whether to inherit the parent agent's system prompt instead of using this agent's own systemPrompt.
+    *
+    * Defaults to false.
+    * Use this when you want to enable prompt caching by preserving the same system prompt prefix.
+    * Cannot be used together with the systemPrompt field.
+    */
+   inheritParentSystemPrompt?: boolean
+ 
+   /** Opt in to windowed file reads: read_files accepts { path, offset, limit }
+    * entries, whole-file reads are capped per file, glob results are capped, and
+    * the read_files/code_search tool descriptions teach a search-first reading
+    * style. Defaults to false, which keeps the legacy read behavior.
+    */
+   windowedFileReads?: boolean
+   /** One final verification opportunity after tool work, within the existing step budget. */
+   completionCheck?: boolean
+ 
+   /** Drop the agent-attribution trailer from the run_terminal_command commit
+    * guidance, so a commit this agent makes carries no `Co-Authored-By` or
+    * "Generated with" line. For a run that commits into somebody else's
+    * repository on their behalf. Defaults to false, which keeps the trailer.
+    */
+   suppressCommitAttribution?: boolean
+ 
+-  /** Opt in to model-based context compaction: the same model writes a handoff
+-   * through complete_compaction before continuing. Defaults to false.
++  /** Opt in to in-process context compaction. Defaults to false.
+    *
+    * Compaction reserves input headroom and also runs after an idle gap. It is
+-   * an inference request and uses the run's normal billing/provider. Pass
++   * a mechanical rewrite of the history (no model call), or, for users not yet
++   * moved to that, a handoff the same model writes through complete_compaction
++   * (an inference request on the run's normal billing/provider) with the
++   * rewrite as the fallback. Pass
+    * `{ cacheExpiryMs }` to tune that idle threshold, or `{ cacheExpiryMs: null }`
+    * to compact on the context limit only.
+    *
+    * The cold-cache pass is skipped on a context smaller than
+    * `cacheExpiryMinTokens`, since compaction always costs detail and a small
+    * history has little to reclaim. Pass null to take it at any size. The
+    * context-limit pass ignores this floor.
+    */
+   compactContext?:
+     | boolean
+     | {
+         /** Explicit input budget for a custom model, after reserving output tokens. */
+         maxContextLength?: number
+         /** The model's output token cap, when it is below 16,384. Model
+          * compaction asks for a summary that fits in it. */
+         maxOutputTokens?: number
+         cacheExpiryMs?: number | null
+         cacheExpiryMinTokens?: number | null
+       }
+ 
+   /** Background information for the agent. Fairly optional. Prefer using instructionsPrompt for agent instructions. */
+   systemPrompt?: string
+ 
+   /** Instructions for the agent.
+    *
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 9af7d5533..bef57050a 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -1,68 +1,72 @@
+ import { contextPrunerBudgetForModel } from '@codebuff/common/constants/model-config'
+-import { modelCompactionThreshold } from '@codebuff/common/constants/compaction-policy'
++import {
++  modelCompactionThreshold,
++  usesDeterministicCompaction,
++} from '@codebuff/common/constants/compaction-policy'
+ import {
+   supportsAssistantPrefill,
+   supportsCacheControl,
+ } from '@codebuff/common/old-constants'
+ import { PROJECT_PROFILE_TOOL_NAME } from '@codebuff/common/constants/project-profile'
+ import { TOOLS_WHICH_WONT_FORCE_NEXT_STEP } from '@codebuff/common/tools/constants'
+ import { parseAgentId } from '@codebuff/common/util/agent-id-parsing'
+ import { buildArray } from '@codebuff/common/util/array'
+ import {
+   AbortError,
+   FETCH_IDLE_TIMEOUT_USER_MESSAGE,
+   TRANSIENT_NETWORK_ERROR_USER_MESSAGE,
+   extractApiErrorDetails,
+   getErrorObject,
+   isAbortError,
+   isFetchIdleTimeoutError,
+   isTransientNetworkError,
+ } from '@codebuff/common/util/error'
+ import { serializeCacheDebugCorrelation } from '@codebuff/common/util/cache-debug'
+ import {
+   assistantMessage,
+   dropUnansweredToolCalls,
+   systemMessage,
+   userMessage,
+ } from '@codebuff/common/util/messages'
+ import { type ToolSet } from 'ai'
+ import { cloneDeep, mapValues } from 'lodash'
+ import z from 'zod/v4'
+ 
+ import {
+   evaluateCompactionTrigger,
+   MECHANICAL_TARGET_SHARE,
+ } from './compact-history'
+ import type { CompactionTrigger } from './compact-history'
+ import {
+   closeCompactionWindow,
+   openCompactionWindow,
+ } from './compaction-followup'
+ import type { CompactionWindow } from './compaction-followup'
+ import {
+   automaticCompactionIsWorthwhile,
++  compactMechanically,
+   COMPACTION_LOW_WATER,
+   compactWithModelOrFallback,
+   compactionTools,
+ } from './model-compaction'
+ import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+ import { getMCPToolData } from './mcp'
+ import {
+   runProjectProfileReport,
+   shouldOfferProjectProfileTool,
+ } from './project-profile'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+ import { isThinkOnlyResponse } from './util/think-tags'
+ import {
+   decideFollowupTodoNudge,
+   FOLLOWUP_TODO_NUDGE_TAG,
+ } from './util/followup-todo-nudge'
+ import {
+   decideTodoProgressReminder,
+   TODO_PROGRESS_REMINDER_TAG,
+ } from './util/todo-progress-reminder'
+ import {
+   hasFileEditTool,
+   TODO_LOOP_RECOVERY_TAG,
+   TODO_LOOP_RECOVERY_THRESHOLD,
+   TODO_LOOP_STOP_THRESHOLD,
+@@ -1295,130 +1299,154 @@ export async function loopAgentSteps(
+             maxContextLength,
+             thresholdTokens,
+             fixedTokenCount,
+             maxOutputTokens: policy.maxOutputTokens,
+           })
+         ) {
+           logger.debug(
+             {
+               agentType,
+               runId,
+               contextTokenCount: currentAgentState.contextTokenCount,
+               thresholdTokens,
+               maxContextLength,
+               fixedTokenCount,
+             },
+             'Deferred compaction to the hard budget: it could not clear the threshold',
+           )
+           trigger = null
+         }
+         if (trigger) {
+           const before = currentAgentState.directCreditsUsed
+           const started = Date.now()
+           const isRoot = !initialAgentState.parentId
+           if (isRoot) params.onCompactionStart?.({ trigger })
+           let compacted: Awaited<ReturnType<typeof compactWithModelOrFallback>>
++          // An automatic pass must leave the run under its own trigger, or the
++          // next step fires it again on its output. The mechanical pass aims
++          // lower: it keeps no findings, so it needs room to work in.
++          const automatic = trigger !== 'manual'
++          const targetTokens = automatic
++            ? Math.floor(thresholdTokens * COMPACTION_LOW_WATER)
++            : undefined
++          const mechanicalTargetTokens = automatic
++            ? Math.floor(thresholdTokens * MECHANICAL_TARGET_SHARE)
++            : undefined
++          // Mechanical for the user's cohort, on every trigger. On the idle
++          // trigger the cache is already cold, so a summarizer would read the
++          // whole cold history first: it costs more than the prefill it saves
++          // and the user waits for it.
++          const deterministic = usesDeterministicCompaction(userId)
+           // Ends after the receipt, so a host never sees a gap between the
+           // pass it is showing and the handoff that replaces it.
+           try {
+-            // A compaction failure must never fail the turn: a summarizer error
+-            // or malformed handoff falls back to the mechanical pass.
+-            compacted = await compactWithModelOrFallback({
+-              messages: currentAgentState.messageHistory,
+-              system,
+-              maxContextLength,
+-              fixedTokenCount,
+-              maxOutputTokens: policy.maxOutputTokens,
+-              // An automatic pass must leave the run under its own trigger, or
+-              // the next step fires it again on the fallback's output.
+-              // The mechanical fallback aims lower still: it keeps no
+-              // findings, so it needs room to work in.
+-              ...(trigger === 'manual'
+-                ? {}
+-                : {
+-                    fallbackTargetTokens: Math.floor(
+-                      thresholdTokens * COMPACTION_LOW_WATER,
+-                    ),
+-                    mechanicalTargetTokens: Math.floor(
+-                      thresholdTokens * MECHANICAL_TARGET_SHARE,
+-                    ),
+-                  }),
+-              signal,
+-              logger,
+-              runId,
+-              model: agentTemplate.model,
+-              trigger,
+-              stream: (messages, maxOutputTokens, onFinishReason) =>
+-                getAgentStreamFromTemplate({
+-                  ...params,
+-                  agentId: agentType,
+-                  template: agentTemplate,
++            if (deterministic) {
++              try {
++                compacted = compactMechanically({
++                  messages: currentAgentState.messageHistory,
++                  maxContextLength,
++                  fixedTokenCount,
++                  targetTokens: mechanicalTargetTokens,
++                  trigger,
++                  logger,
+                   runId,
+-                  messages,
+-                  tools: compactionTools,
+-                  toolChoice: 'required',
+-                  maxOutputTokens,
+-                  onFinishReason,
+-                  onCostCalculated: async (credits) => {
+-                    currentAgentState.creditsUsed += credits
+-                    currentAgentState.directCreditsUsed += credits
+-                  },
+-                  // Compaction usage is spend, not the next root request's context.
+-                  onUsageReceived: (usage) =>
+-                    params.onAgentUsageReceived?.({
+-                      ...usage,
+-                      isRoot: false,
+-                      agentId: currentAgentState.agentId,
+-                    }),
+-                  onUsageIncomplete: params.onAgentUsageIncomplete,
+-                }),
+-            })
+-            await addAgentStep({
+-              ...params,
+-              agentRunId: runId,
+-              stepNumber: totalSteps,
+-              credits: currentAgentState.directCreditsUsed - before,
+-              childRunIds: [],
+-              messageId: null,
+-              status: 'completed',
+-              startTime,
+-            })
++                })
++              } catch {
++                // Opportunistic: a history it cannot fit is left alone.
++                compacted = null
++              }
++            } else {
++              // A compaction failure must never fail the turn: a summarizer error
++              // or malformed handoff falls back to the mechanical pass.
++              compacted = await compactWithModelOrFallback({
++                messages: currentAgentState.messageHistory,
++                system,
++                maxContextLength,
++                fixedTokenCount,
++                maxOutputTokens: policy.maxOutputTokens,
++                fallbackTargetTokens: targetTokens,
++                mechanicalTargetTokens,
++                signal,
++                logger,
++                runId,
++                model: agentTemplate.model,
++                trigger,
++                stream: (messages, maxOutputTokens, onFinishReason) =>
++                  getAgentStreamFromTemplate({
++                    ...params,
++                    agentId: agentType,
++                    template: agentTemplate,
++                    runId,
++                    messages,
++                    tools: compactionTools,
++                    toolChoice: 'required',
++                    maxOutputTokens,
++                    onFinishReason,
++                    onCostCalculated: async (credits) => {
++                      currentAgentState.creditsUsed += credits
++                      currentAgentState.directCreditsUsed += credits
++                    },
++                    // Compaction usage is spend, not the next root request's context.
++                    onUsageReceived: (usage) =>
++                      params.onAgentUsageReceived?.({
++                        ...usage,
++                        isRoot: false,
++                        agentId: currentAgentState.agentId,
++                      }),
++                    onUsageIncomplete: params.onAgentUsageIncomplete,
++                  }),
++              })
++              await addAgentStep({
++                ...params,
++                agentRunId: runId,
++                stepNumber: totalSteps,
++                credits: currentAgentState.directCreditsUsed - before,
++                childRunIds: [],
++                messageId: null,
++                status: 'completed',
++                startTime,
++              })
++            }
+             if (compacted) {
+               if (compactionWindow)
+                 closeCompactionWindow({
+                   window: compactionWindow,
+                   messages: currentAgentState.messageHistory,
+                   endedBy: 'compaction',
+                   nextTrigger: trigger,
+                   logger,
+                   runId,
+                   model: agentTemplate.model,
+                 })
+               compactionWindow = openCompactionWindow({
+                 before: currentAgentState.messageHistory,
+                 after: compacted.messages,
+-                mode: compacted.fallback ? 'fallback' : 'model',
++                mode: deterministic
++                  ? 'mechanical'
++                  : compacted.fallback
++                    ? 'fallback'
++                    : 'model',
+                 trigger,
+               })
+               currentAgentState.messageHistory = compacted.messages
+               currentAgentState.contextTokenBaseline = undefined
+               currentAgentState.contextTokenCount = compacted.postTokens
+               if (isRoot)
+                 params.onCompaction?.({
+                   trigger,
+                   thresholdTokens,
+                   summary: compacted.summary,
+                   preTokens: compacted.preTokens,
+                   postTokens: compacted.postTokens,
+                   durationMs: Date.now() - started,
+                 })
+             }
+           } finally {
+             if (isRoot) params.onCompactionEnd?.()
+           }
+           // A manual request is a maintenance operation, never a coding turn.
+           if (manualCompaction) break
+           if (
+             !compacted &&
+             currentAgentState.contextTokenCount > maxContextLength
+           ) {
+             throw new Error(
+
+```
