@@ -3521,4 +3521,21 @@ a.badge:hover{text-decoration:none;color:var(--term-cyan)}
 .minor-summary:hover .badges,.minor-row[open] .minor-summary .badges{opacity:1}
 /* The notable-only toggle reads as pressed when active. */
 .timeline-bulk-btn.active{color:var(--term-cyan);text-decoration:underline}
+/* "New since your last visit": the catch-up button glows amber when there is
+   anything unseen, and each unseen row gets a small [new] chip ahead of its
+   badges. The flash outline marks the row a jump just landed on. */
+#catchup-btn{color:var(--term-amber)}
+#catchup-btn[hidden]{display:none}
+.fresh-chip{
+  display:inline-block;
+  font-size:var(--t-xs);
+  font-weight:700;
+  color:var(--term-amber);
+  border:1px solid var(--term-amber);
+  border-radius:3px;
+  padding:0 4px;
+  margin-right:2px;
+  white-space:nowrap;
+}
+.catchup-flash{outline:1px solid var(--term-amber);outline-offset:2px}
 `

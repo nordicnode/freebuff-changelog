@@ -1232,6 +1232,40 @@ test('release page: a long window folds its tail into compact rows', async () =>
   }
 })
 
+test('catch-up: rows carry data-date hooks and the toolbar has a [new] button', async () => {
+  const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-catchup-'))
+  try {
+    const row = (sha, date, extra = {}) => ({
+      kind: 'sync', sha, url: `https://github.com/CodebuffAI/freebuff/commit/${sha}`,
+      date, day: date.slice(0, 10), month: date.slice(0, 7),
+      areas: ['CLI'], category: 'CLI', significance: 'minor',
+      files: { total: 1, meaningful: 1, added: [], removed: [], modified: ['a.ts'] },
+      stats: { additions: 1, deletions: 0 },
+      title: 'Title ' + sha.slice(0, 6), summary: 'Summary ' + sha.slice(0, 6), ...extra
+    })
+    const entries = [
+      row('a'.repeat(40), '2026-09-11T10:00:00Z', { significance: 'notable', title: 'Notable title here' }),
+      row('b'.repeat(40), '2026-09-11T09:00:00Z', { title: 'Minor title here' })
+    ]
+    await buildSite({
+      changelog: { version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-11T12:00:00Z', headSha: 'a'.repeat(40), counts: { entries: entries.length }, entries },
+      openPrs: [], dist: tmpDist
+    })
+    const index = await readFile(join(tmpDist, 'index.html'), 'utf8')
+    // Every row exposes its commit timestamp for the client-side newness check.
+    assert.match(index, /<details class="entry notable"[^>]*data-date="2026-09-11T10:00:00Z"/)
+    assert.match(index, /<details class="minor-row"[^>]*data-date="2026-09-11T09:00:00Z"/)
+    // The toolbar carries the catch-up button (hidden until JS finds new rows).
+    assert.match(index, /<button[^>]*id="catchup-btn"[^>]*hidden/)
+    // The client marks rows newer than the last homepage visit and jumps to them.
+    assert.match(index, /fbLastVisit/, 'the catch-up script tracks the last homepage visit')
+    assert.match(index, /fresh-chip/, 'unseen rows get a [new] chip')
+    assert.match(index, /catchup-flash/, 'jumping flashes the landed row')
+  } finally {
+    await rm(tmpDist, { recursive: true, force: true })
+  }
+})
+
 test('effective significance: an AI-weighted notable entry is badged and sectioned as notable', async () => {
   const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-effsig-'))
   try {

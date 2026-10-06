@@ -275,6 +275,61 @@ function scrollToEl (el, block) {
   tick();
 })();
 
+// "New since your last visit": entries dated after the previous homepage
+// visit get a [new] chip, and a [N new] button in the toolbar jumps to the
+// first one. The baseline advances only on the homepage -- opening a day
+// page never consumes newness. First visit sets the baseline silently, so
+// nothing is marked. All state stays in localStorage; the server never
+// knows who saw what.
+(function catchUp() {
+  var day = document.querySelector('section.day');
+  if (!day) return;
+  var KEY = 'fbLastVisit';
+  var isHome = location.pathname === '/' || location.pathname === '/index.html';
+  var last = 0;
+  try { last = Number(localStorage.getItem(KEY)) || 0; } catch (_) { last = 0; }
+  // Top-level rows only, mirroring getVisibleEntries: a minor row's embedded
+  // card must not count as a row of its own.
+  var rows = Array.prototype.filter.call(
+    day.querySelectorAll('details.entry[data-date], details.minor-row[data-date]'),
+    function (r) { return !r.closest('details.minor-row') || r.classList.contains('minor-row'); }
+  );
+  var fresh = last ? rows.filter(function (r) {
+    var t = Date.parse(r.getAttribute('data-date'));
+    return t && t > last;
+  }) : [];
+  fresh.forEach(function (r) {
+    r.classList.add('is-new');
+    var badges = r.querySelector(':scope > summary .badges');
+    if (badges && !badges.querySelector('.fresh-chip')) {
+      var chip = document.createElement('span');
+      chip.className = 'fresh-chip';
+      chip.textContent = '[new]';
+      badges.insertBefore(chip, badges.firstChild);
+    }
+  });
+  var btn = document.getElementById('catchup-btn');
+  if (btn) {
+    if (fresh.length) {
+      btn.hidden = false;
+      btn.textContent = '[' + fresh.length + ' new]';
+      btn.addEventListener('click', function () {
+        var first = fresh[0];
+        if (!first) return;
+        if (!first.open) first.open = true;
+        first.scrollIntoView({ block: 'start', behavior: 'smooth' });
+        first.classList.add('catchup-flash');
+        setTimeout(function () { first.classList.remove('catchup-flash'); }, 1600);
+      });
+    } else {
+      btn.hidden = true;
+    }
+  }
+  if (isHome) {
+    try { localStorage.setItem(KEY, String(Date.now())); } catch (_) {}
+  }
+})();
+
 (function setupReadingProgress() {
   var bar = document.getElementById('reading-progress');
   if (!bar) return;
@@ -1423,7 +1478,7 @@ ${powerEnd}
   // renders body-only: otherwise the title appears twice and the reader must
   // open two nested disclosures to reach the details.
   if (opts.bare) return entryBodyHtml
-  return `<details class="entry ${effSig(e)}" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(effSig(e))}" data-aud="${esc(e.ai?.audience || '')}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
+  return `<details class="entry ${effSig(e)}" id="${anchor}" data-date="${esc(e.date)}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(effSig(e))}" data-aud="${esc(e.ai?.audience || '')}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
 ${headerHtml}
 ${entryBodyHtml}
 </details>`
@@ -2445,6 +2500,7 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
     <div class="timeline-freshness">${freshness}</div>
     ${latest ? '' : `<div class="timeline-stats">${real} change${real === 1 ? '' : 's'}${churn ? ` <span class="status-sep" aria-hidden="true">&middot;</span> <span class="stats-churn">${churn} churn</span>` : ''}</div>`}
     <div class="timeline-bulk-toggle">
+      <button type="button" class="timeline-bulk-btn" id="catchup-btn" hidden title="Jump to the first entry newer than your last visit">[new]</button>
       <button type="button" class="timeline-bulk-btn" data-bulk="expand">[expand all]</button>
       <button type="button" class="timeline-bulk-btn" data-bulk="collapse">[collapse all]</button>
       <button type="button" class="timeline-bulk-btn" id="notable-toggle" aria-pressed="false" title="Show only notable and major entries; hides minor rows and churn. Saved on this device.">[notable only]</button>
@@ -2542,7 +2598,7 @@ ${[
       // The row keeps the #sha anchor and its own summary header; the embedded
       // card renders body-only (bare) so the title doesn't appear twice.
       const card = entryCard(e, false, relatedIdx, cardOpts(e, { bare: true }))
-      return `<details class="minor-row" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(effSig(e))}" data-aud="${esc(e.ai?.audience || '')}">
+      return `<details class="minor-row" id="${anchor}" data-date="${esc(e.date)}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(effSig(e))}" data-aud="${esc(e.ai?.audience || '')}">
 <summary class="minor-summary"><span class="entry-arrow">&gt;</span><span class="entry-utc" title="${esc(e.date.slice(0, 16).replace('T', ' ') + ' UTC')}">${esc(time)}</span><span class="minor-title">${title}</span><span class="badges">${badges(e)}</span></summary>
 <div class="minor-body">${card}</div>
 </details>`
