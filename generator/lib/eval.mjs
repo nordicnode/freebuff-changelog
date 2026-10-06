@@ -104,7 +104,12 @@ export function scoreRow (e, record, golden, corpusText = '') {
   const summary = record.summary || ''
   const text = `${record.title || ''} ${summary} ${record.evidence || ''}`
   const files = [...(e.files?.added || []), ...(e.files?.modified || []), ...(e.files?.removed || []), ...(e.files?.tests || [])]
-  const evidencePaths = [...(record.evidence || '').matchAll(/(?:[\w.-]+\/)+[\w.-]+\.(?:tsx?|jsx?|mjs|json|md|ya?ml)/g)].map(m => m[0])
+  // Longest extension first: this regex has no trailing anchor, so `jsx?`
+  // matches the "js" inside "json" and evidence citing
+  // freebuff/cli/release/package.json was extracted as .../package.js -- a
+  // path in no row's file list. That failed pathGrounded (and the fail-closed
+  // gate) on rows whose evidence was perfectly fine.
+  const evidencePaths = [...(record.evidence || '').matchAll(/(?:[\w.-]+\/)+[\w.-]+\.(?:json|ya?ml|tsx?|jsx?|mjs|md)/g)].map(m => m[0])
   // A row that cites no path has not passed this check, it skipped it: null
   // keeps it out of the rate instead of inflating it with vacuous truth.
   const pathGrounded = evidencePaths.length ? evidencePaths.every(p => files.some(f => f.endsWith(p) || p.endsWith(f))) : null
@@ -294,7 +299,17 @@ export async function runEval (entries, dataDir, env, { repoDir = null, getPatch
     mode: offline ? 'offline-stored' : 'provider',
     status: 'complete',
     golden: { total: golden.rows.length, expected: targets.length, verified: golden.rows.filter(r => r.verified).length, evaluated: scored.length, failed: rows.filter(r => r.failed).length, skipped: rows.filter(r => r.skipped).length },
-    gate: { passed: scored.length === targets.length && scored.length > 0 && scored.every(r => r.grounded && r.hypeFree && r.pathGrounded !== false && !r.valueErrors?.length && (offline ? !r.uncertain && r.verify === 'passed' && ['passed', 'deterministic'].includes(r.plainVerify) : true)), note: offline ? 'Stored-artifact audit, not a new semantic check or prompt comparison.' : 'Provider replay' },
+    // Fail-closed on completion and on every recorded negative signal. A missing
+    // verdict is not one of them: stored text that predates the verification
+    // policy reports 'pre-policy', which quality.mjs defines as "not a
+    // failure". Demanding verify === 'passed' made this gate unsatisfiable --
+    // the golden rows predate the policy, the verifier is off by operator
+    // decision, and the no-backfill policy forbids re-verifying history, so
+    // no offline run could ever produce the demanded verdicts. `uncertain`
+    // already carries each recorded objection (flagged, stale, or an
+    // unavailable check with claims); undisclosed-missing verdicts stay
+    // visible as statuses, not as failures.
+    gate: { passed: scored.length === targets.length && scored.length > 0 && scored.every(r => r.grounded && r.hypeFree && r.pathGrounded !== false && !r.valueErrors?.length && !r.uncertain), note: offline ? 'Stored-artifact audit, not a new semantic check or prompt comparison.' : 'Provider replay' },
     metrics: aggregate(scored),
     rows,
     outputs

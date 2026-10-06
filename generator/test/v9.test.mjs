@@ -323,3 +323,19 @@ test('eval: why detection, must-mention, row scoring, aggregation, judge validat
   assert.match(text, /grounded\s+50%\s+prev 100%\s+\(-50pt\)/)
   assert.match(text, /rows to look at/)
 })
+
+test('eval: evidence path extraction keeps the full extension (.json is not .js)', () => {
+  const e = { sha: sha('b'), files: { added: [], modified: ['freebuff/cli/release/package.json'] }, structured: null }
+  const row = scoreRow(e, {
+    title: 'Release 0.0.180',
+    summary: 'Bump because the release shipped.',
+    evidence: 'The diff modifies `freebuff/cli/release/package.json`, changing the `version` field.'
+  }, null)
+  assert.equal(row.pathGrounded, true, 'package.json must not be truncated to package.js')
+  const other = scoreRow(e, {
+    title: 'Release 0.0.180',
+    summary: 'Bump because the release shipped.',
+    evidence: 'The diff modifies `freebuff/cli/release/package.yaml`, changing the `version` field.'
+  }, null)
+  assert.equal(other.pathGrounded, false, 'a genuinely unlisted path still fails')
+})
