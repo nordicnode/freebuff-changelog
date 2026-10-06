@@ -1,0 +1,970 @@
+Date: 2026-10-06T00:45:32Z
+Category: CLI
+Areas: CLI
+Commit nature: production
+Stats: +294 / -31
+Analysis notes: CLI changes across 1 file(s) (+294/−31).
+Modified files: cli/src/utils/connection-monitor.ts
+Key facts (ground the WHY and DETAIL sentences in these): - bug: a BYOK session that unsubscribed (its hook takes the early return for `hasSelectedByokConnection`) left this loop polling the Codebuff backend forever, since unsubscribing only removed the listener and never paused the timer. - Registered before any caller awaits `request`, so it runs first and the slot is free by the time a continuation might schedule the next probe. Callers await `request` itself, so sharing adds no extra microtask hops to a check. - The generation may have moved on while this awaited — e.g. the last subscriber unsubscribed mid-check. The reading is still real, so keep it as the snapshot the next subscriber starts from (it is what `lastCheckAt` now vouches for), but a stale loop must not emit or reschedule. - Nobody's listening — pause the loop instead of polling into the void. `started` stays false so the next subscribe() restarts it; `stopped` stays false so it can.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "repeated subscribe/unsubscribe — simulating a component re-rendering on every streamed token — never re-probes or resets the success streak" ; "unsubscribing the last listener pauses the loop — no more probes once it is scheduled" ; "resubscribing after a pause resumes polling" ; "rapid unsubscribe/resubscribe cycles never trigger more than one check per initial interval" ; "an in-flight check resolving after the last listener unsubscribed does not revive the loop" ; "resubscribing while a probe from before the pause is pending adopts it instead of starting another" ; "a probe that settles while paused becomes the next subscriber’s snapshot, without emitting"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `cli/src/utils/connection-monitor.ts`:
+```
+// Adaptive health check interval configuration.
+// Progressively increases polling interval based on consecutive successful checks.
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `cli/README.md`:
+```markdown
+# @codebuff/cli
+
+A Terminal User Interface (TUI) package built with OpenTUI and React.
+
+## Installation
+
+```bash
+bun install
+```
+
+## Development
+
+Run the TUI in development mode:
+
+```bash
+bun run dev
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+bun test
+```
+
+### Interactive E2E Testing
+
+For testing interactive CLI features, install tmux:
+
+```bash
+# macOS
+brew install tmux
+
+# Ubuntu/Debian
+sudo apt-get install tmux
+
+# Windows (via WSL)
+wsl --install
+sudo apt-get install tmux
+```
+
+Then run the proof-of-concept:
+
+```bash
+bun run test:tmux-poc
+```
+
+[freebuff product prompt text omitted]
+
+```bash
+# ❌ Broken: tmux send-keys -t session "hello"
+# ✅ Works:  tmux send-keys -t session $'\e[200~hello\e[201~'
+```
+
+See [tmux.knowledge.md](tmux.knowledge.md) for comprehensive tmux documentation and [src/__tests__/README.md](src/__tests__/README.md) for testing documentation.
+
+## Build
+
+Build the package:
+
+```bash
+bun run build
+```
+
+## Run
+
+Run the built TUI:
+
+```bash
+bun run start
+```
+
+Or use the binary directly:
+
+```bash
+codebuff-tui
+```
+
+## Features
+```
+Complete Source of Modified Files (for complete module context):
+- File `cli/src/utils/connection-monitor.ts` (298 lines):
+```
+import { getCodebuffClient } from './codebuff-client'
+import { logger } from './logger'
+import { failedPollDelayMs, jitterPollIntervalMs } from './polling-backoff'
+
+// Adaptive health check interval configuration.
+// Progressively increases polling interval based on consecutive successful checks.
+const HEALTH_CHECK_CONFIG = {
+  // Healthy startup cadence (ms).
+  INITIAL_INTERVAL: 10_000, // 10 seconds
+  // Interval thresholds based on consecutive successful checks
+  INTERVALS: [
+    { successCount: 3, interval: 30_000 }, // 30 seconds after 3 successes
+    { successCount: 6, interval: 60_000 }, // 1 minute after 6 successes
+    { successCount: 10, interval: 120_000 }, // 2 minutes after 10 successes
+    { successCount: 15, interval: 300_000 }, // 5 minutes after 15 successes
+    { successCount: 20, interval: 600_000 }, // 10 minutes after 20 successes
+  ],
+  // While a real request is in flight, its own success already proves the backend is up.
+  // Recheck on this short cadence (without hitting the network) rather than probing
+  // concurrently with the turn, and resume the normal schedule the moment it ends.
+  BUSY_RECHECK_INTERVAL: 5_000,
+} as const
+
+/**
+ * Calculates the next health check interval based on consecutive successful checks.
+ * Exported for testing purposes.
+ */
+export function getNextInterval(consecutiveSuccesses: number): number {
+  // Find the highest threshold that we've passed
+  for (let i = HEALTH_CHECK_CONFIG.INTERVALS.length - 1; i >= 0; i--) {
+    const { successCount, interval } = HEALTH_CHECK_CONFIG.INTERVALS[i]
+    if (consecutiveSuccesses >= successCount) {
+      return interval
+    }
+  }
+  return HEALTH_CHECK_CONFIG.INITIAL_INTERVAL
+}
+
+export type ConnectionListener = (connected: boolean) => void
+
+export interface ConnectionMonitor {
+  /** Returns the current snapshot immediately, then notifies on every subsequent check. */
+  subscribe(listener: ConnectionListener): () => void
+  getConnected(): boolean
+  /** A real request is in flight (or just finished). Its own success is stronger evidence of
+   *  connectivity than a dedicated probe, so pause probing while busy and resume right after. */
+  setBusy(busy: boolean): void
+  /** Stops the pending timer for good. Production code never calls this; tests do. */
+  stop(): void
+}
+
+export interface ConnectionMonitorOptions {
+  /** swapped in tests; the default asks the Codebuff backend through the SDK client */
+  checkConnection?: () => Promise<boolean>
+  busyRecheckIntervalMs?: number
+}
+
+const defaultCheckConnection = async (): Promise<boolean> => {
+  const client = await getCodebuffClient()
+  if (!client) return false
+  return client.checkConnection()
+}
+
+/**
+ * Creates one health-check loop. Dependency-injected (mirrors
+ * `freebuff-desktop/src/server/services/reachability.ts`'s `createReachability`) so tests can
+ * swap `checkConnection` instead of mocking the `codebuff-client` module.
+ *
+ * Production code does not call this directly — see the singleton helpers below. The loop here
+ * owns its own timer and backoff state, independent of any caller's lifecycle: subscribing adds
+ * a listener only, and never resets the timer or the backoff counters. That matters because this
+ * used to live inside `useConnectionStatus`'s `useEffect`, keyed on an `onReconnect` callback
+ * identity. A render during active streaming recreated that closure and tore down/restarted the
+ * effect — resetting the adaptive backoff to its 10s floor and firing an immediate probe on every
+ * render. During active token streaming that is many renders a second, which is what flooded
+ * `/api/healthz` (1.17B GETs/week, ~74% of all requests to the `web` Render service).
+ */
+export function createConnectionMonitor(
+  options: ConnectionMonitorOptions = {},
+): ConnectionMonitor {
+  const checkConnection = options.checkConnection ?? defaultCheckConnection
+  const busyRecheckIntervalMs =
+    options.busyRecheckIntervalMs ?? HEALTH_CHECK_CONFIG.BUSY_RECHECK_INTERVAL
+
+  const listeners = new Set<ConnectionListener>()
+  let timeoutId: ReturnType<typeof setTimeout> | null = null
+  let consecutiveSuccesses = 0
+  let consecutiveFailures = 0
+  let connected = true
+  let started = false
+  let busy = false
+  let stopped = false
+  let lastCheckAt = 0
+  // Bumped whenever the loop pauses (last listener unsubscribes) or stops for good. A
+  // scheduled tick or an in-flight check captures the generation active when it started; if
+  // the generation has since moved on, that tick/check is stale and must not schedule another
+  // one or emit — otherwise it would revive a paused loop with nobody listening. That was the
+  // bug: a BYOK session that unsubscribed (its hook takes the early return for
+  // `hasSelectedByokConnection`) left this loop polling the Codebuff backend forever, since
+  // unsubscribing only removed the listener and never paused the timer.
+  let generation = 0
+  // The one network probe currently awaiting a response, shared by every check that wants a
+  // reading. A loop that resumes while a probe from before its pause is still pending adopts it
+  // instead of starting a second request: the generation guard discards stale continuations,
+  // but it cannot cancel their requests, so without this a fast pause/resume cycle during a
+  // slow health check would stack up concurrent probes.
+  let inFlight: Promise<boolean> | null = null
+
+  const probe = (): Promise<boolean> => {
+    if (!inFlight) {
+      let request: Promise<boolean>
+      try {
+        request = checkConnection()
+      } catch (error) {
+        request = Promise.reject(error)
+      }
+      inFlight = request
+      // Registered before any caller awaits `request`, so it runs first and the slot is free
+      // by the time a continuation might schedule the next probe. Callers await `request`
+      // itself, so sharing adds no extra microtask hops to a check.
+      const release = () => {
+        if (inFlight === request) inFlight = null
+      }
+      request.then(release, release)
+    }
+    return inFlight
+  }
+
+  const clearTimer = (): void => {
+    if (timeoutId) {
+      clearTimeout(timeoutId)
+      timeoutId = null
+    }
+  }
+
+  const scheduleNext = (interval: number, gen: number): void => {
+    if (stopped || gen !== generation) return
+    clearTimer()
+    timeoutId = setTimeout(() => void check(gen), interval)
+    timeoutId.unref?.()
+  }
+
+  const emit = (next: boolean): void => {
+    connected = next
+    for (const listener of [...listeners]) {
+      try {
+        listener(next)
+      } catch (error) {
+        logger.debug({ error }, 'Connection monitor listener threw')
+      }
+    }
+  }
+
+  const scheduleFailed = (
+    gen: number,
+    message: string,
+    error?: unknown,
+  ): void => {
+    consecutiveSuccesses = 0
+    consecutiveFailures++
+    const delayMs = failedPollDelayMs({ consecutiveFailures })
+    logger.debug(
+      {
+        ...(error === undefined ? {} : { error }),
+        delayMs,
+        consecutiveFailures,
+      },
+      message,
+    )
+    emit(false)
+    scheduleNext(delayMs, gen)
+  }
+
+  const check = async (gen: number): Promise<void> => {
+    if (stopped || gen !== generation) return
+    if (busy) {
+      scheduleNext(busyRecheckIntervalMs, gen)
+      return
+    }
+    try {
+      const ok = await probe()
+      lastCheckAt = Date.now()
+      if (stopped) return
+      // The generation may have moved on while this awaited — e.g. the last subscriber
+      // unsubscribed mid-check. The reading is still real, so keep it as the snapshot the next
+      // subscriber starts from (it is what `lastCheckAt` now vouches for), but a stale loop must
+      // not emit or reschedule.
+      if (gen !== generation) {
+        connected = ok
+        return
+      }
+      if (ok) {
+        consecutiveFailures = 0
+        consecutiveSuccesses++
+        emit(true)
+        scheduleNext(
+          jitterPollIntervalMs({
+            intervalMs: getNextInterval(consecutiveSuccesses),
+          }),
+          gen,
+        )
+      } else {
+        scheduleFailed(gen, 'Health check failed, backing off')
+      }
+    } catch (error) {
+      lastCheckAt = Date.now()
+      if (stopped) return
+      if (gen !== generation) {
+        connected = false
+        return
+      }
+      scheduleFailed(gen, 'Connection check failed; backing off', error)
+    }
+  }
+
+  return {
+    subscribe(listener) {
+      listeners.add(listener)
+      // Give the new subscriber the current snapshot right away so its UI doesn't flash
+      // "disconnected" waiting for the next tick.
+      listener(connected)
+      if (!started) {
+        started = true
+        const gen = generation
+        // Resuming shortly after a pause (e.g. a quick unsubscribe/resubscribe cycle) should
+        // not immediately refire a probe — wait out whatever's left of the last check's
+        // interval instead, so toggling quickly never triggers more than one check per
+        // INITIAL_INTERVAL. A probe still pending from before the pause is adopted, not
+        // duplicated (see `probe`).
+        const elapsedSinceLastCheck = lastCheckAt ? Date.now() - lastCheckAt : Infinity
+        if (inFlight) {
+          void check(gen)
+        } else if (elapsedSinceLastCheck < HEALTH_CHECK_CONFIG.INITIAL_INTERVAL) {
+          scheduleNext(
+            HEALTH_CHECK_CONFIG.INITIAL_INTERVAL - elapsedSinceLastCheck,
+            gen,
+          )
+        } else {
+          void check(gen)
+        }
+      }
+      return () => {
+        listeners.delete(listener)
+        // Nobody's listening — pause the loop instead of polling into the void. `started`
+        // stays false so the next subscribe() restarts it; `stopped` stays false so it can.
+        if (listeners.size === 0 && started) {
+          started = false
+          generation++
+          clearTimer()
+        }
+      }
+    },
+    getConnected: () => connected,
+    setBusy(next: boolean) {
+      busy = next
+    },
+    stop() {
+      stopped = true
+      generation++
+      listeners.clear()
+      clearTimer()
+    },
+  }
+}
+
+// One process-wide instance. Lazily created on first use so importing this module never starts
+// network traffic by itself (tests, non-CLI consumers of the package, etc.).
+let singleton: ConnectionMonitor | null = null
+
+function getSingleton(): ConnectionMonitor {
+  if (!singleton) {
+    singleton = createConnectionMonitor()
+  }
+  return singleton
+}
+
+/** Subscribe to connection state. Returns an unsubscribe function. */
+export function subscribeToConnectionStatus(
+  listener: ConnectionListener,
+): () => void {
+  return getSingleton().subscribe(listener)
+}
+
+export function getConnectionStatusSnapshot(): boolean {
+  return getSingleton().getConnected()
+}
+
+/** Call with `true` while a real request/turn is in flight, `false` once it settles. */
+export function setConnectionMonitorBusy(busy: boolean): void {
+  getSingleton().setBusy(busy)
+}
+
+/** Test-only: drop the singleton so each test file gets an isolated monitor and timer. */
+export function resetConnectionMonitorForTests(): void {
+  if (singleton) singleton.stop()
+  singleton = null
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `cli/src/utils/__tests__/connection-monitor.test.ts` (133 matching lines):
+```
+import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test'
+
+import { createConnectionMonitor, getNextInterval } from '../connection-monitor'
+
+/**
+ * Tests for the shared connection monitor.
+ *
+ * The monitor is dependency-injected (`checkConnection` is swapped in, never the
+ * `codebuff-client` module — see docs/testing.md), and its timers are driven through a mocked
+ * `globalThis.setTimeout`/`clearTimeout` so tests advance time deterministically instead of
+ * waiting on real delays.
+ */
+describe('connection-monitor', () => {
+  let originalSetTimeout: typeof setTimeout
+  let originalClearTimeout: typeof clearTimeout
+  let timers: { id: number; ms: number; fn: () => void; cleared: boolean }[]
+  let nextId: number
+
+  beforeEach(() => {
+    timers = []
+```
+- File `cli/src/hooks/__tests__/use-timeout.test.ts` (53 matching lines):
+```
+let originalDispatcher: ReactInternals['H'] | undefined
+
+  beforeEach(() => {
+    originalDispatcher = reactInternals.H
+    reactInternals.H = {
+      useRef: <T>(value: T) => ({ current: value }),
+      useCallback: <T>(callback: T) => callback,
+      useEffect: (effect: () => void) => {
+        effect()
+      },
+    }
+
+    timers = []
+    nextId = 1
+    originalSetTimeout = globalThis.setTimeout
+    originalClearTimeout = globalThis.clearTimeout
+
+    // Mock setTimeout to track all scheduled timers
+    globalThis.setTimeout = ((fn: () => void, ms?: number) => {
+      const id = nextId++
+      timers.push({ id, ms: Number(ms ?? 0), fn, cleared: false })
+      return id as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout
+
+    // Mock clearTimeout to mark timers as cleared
+    globalThis.clearTimeout = ((id?: ReturnType<typeof clearTimeout>) => {
+      const timer = timers.find((t) => t.id === (id as unknown as number))
+      if (timer) timer.cleared = true
+    }) as typeof clearTimeout
+  })
+
+  afterEach(() => {
+    reactInternals.H = originalDispatcher!
+    globalThis.setTimeout = originalSetTimeout
+    globalThis.clearTimeout = originalClearTimeout
+  })
+```
+- File `cli/src/utils/__tests__/clipboard.test.ts` (48 matching lines):
+```
+import { execSync } from 'child_process'
+
+import { createMockTimers } from '@codebuff/common/testing/mocks/timers'
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+
+import {
+  copyTextToClipboard,
+  OSC52_BLOCKED_MESSAGE,
+  showClipboardMessage,
+  subscribeClipboardMessages,
+  clearClipboardMessage,
+  registerClipboardRenderer,
+  unregisterClipboardRenderer,
+} from '../clipboard'
+import { logger } from '../logger'
+
+import type { MockTimers } from '@codebuff/common/testing/mocks/timers'
+
+/**
+ * Tests for clipboard.ts functionality.
+ *
+ * What IS tested:
+ * - Message subscription system (show, clear, timer cancellation, multiple subscribers)
+ * - Empty/whitespace text handling (early return)
+ * - Success message formatting (truncation, whitespace collapse, custom messages)
+ * - Error handling when both copy methods fail
+ * - macOS integration test (actual pbcopy when available)
+ *
+ * What is NOT fully tested (internal functions are not exported):
+ * - SSH session detection logic (isRemoteSession)
+ * - OSC52 sequence generation (buildOsc52Sequence) with tmux/screen wrapping
+ * - Platform tool selection (tryCopyViaPlatformTool) for Linux/Windows
+ * - OSC52 32KB payload size limit
+ *
+ * The copy priority behavior (local: platform tools first, remote: OSC52 first)
+ * is tested indirectly through the error handling tests.
+ */
+
+describe('clipboard', () => {
+  describe('showClipboardMessage and subscriptions', () => {
+    let mockTimers: MockTimers
+    let receivedMessages: (string | null)[]
+```
+- File `cli/src/hooks/use-activity-query.ts` (14 matching lines):
+```
+// Global fetch status per key
+  fetchingKeys: Set<string>
+}
+
+const cache: CacheState = {
+  entries: new Map(),
+  keyListeners: new Map(),
+  refCounts: new Map(),
+  fetchingKeys: new Set(),
+}
+
+// In-flight promises for request deduplication
+const inFlight = new Map<string, Promise<unknown>>()
+
+// Per-key snapshot memoization so fetching-status changes trigger rerenders
+// even if the cache entry object didn’t change.
+const snapshotMemo = new Map<
+  string,
+  {
+    entryRef: CacheEntry<unknown> | undefined
+    fetching: boolean
+    snap: KeySnapshot<unknown>
+  }
+>()
+…
+*/
+function serializeQueryKey(queryKey: readonly unknown[]): string {
+  return JSON.stringify(queryKey)
+}
+
+// Module-level map to track GC timeouts (survives component unmount)
+const gcTimeouts = new Map<string, ReturnType<typeof setTimeout>>()
+
+// Per-key retry state (so unmounting one observer doesn’t cancel retries for others)
+const retryCounts = new Map<string, number>()
+const retryTimeouts = new Map<string, ReturnType<typeof setTimeout>>()
+
+// Per-key generation to prevent "resurrecting" deleted entries from late in-flight responses
+const generations = new Map<string, number>()
+function bumpGeneration(key: string) {
+  generations.set(key, (generations.get(key) ?? 0) + 1)
+}
+function getGeneration(key: string) {
+  return generations.get(key) ?? 0
+}
+
+function clearRetryTimeout(key: string) {
+  const t = retryTimeouts.get(key)
+  if (t) clearTimeout(t)
+  retryTimeouts.delete(key)
+}
+
+function clearRetryState(key: string) {
+  clearRetryTimeout(key)
+  retryCounts.delete(key)
+}
+
+function deleteCacheEntry(key: string): void {
+  bumpGeneration(key)
+  clearRetryState(key)
+  inFlight.delete(key)
+  cache.fetchingKeys.delete(key)
+  cache.entries.delete(key)
+  cache.refCounts.delete(key)
+  snapshotMemo.delete(key)
+  notifyKeyListeners(key)
+}
+export type UseActivityQueryOptions<T> = {
+  /** Unique key for caching the query */
+  queryKey: readonly unknown[]
+  /** Function that fetches the data */
+  queryFn: () => Promise<T>
+  /** Whether the query is enabled (default: true) */
+```
+- File `cli/src/hooks/use-freebuff-session.ts` (12 matching lines):
+```
+!getFreebuffModelDirectory().isLimitedOffer(model)
+      const instanceId = multiSession
+        ? claimId
+        : (probingLegacy ?? getFreebuffInstanceId())
+      const currentSession = useFreebuffSessionStore.getState().session
+      const takeoverInstanceId =
+        currentSession?.status === 'takeover_prompt'
+          ? currentSession.currentInstanceId
+          : undefined
+      const compact =
+        method === 'GET' && previousStatus === 'active' && !needsFullActivePoll
+      const fetchController = abortController
+      const generation = restartGeneration
+      try {
+        if (method === 'POST' && multiSession) {
+          attemptedModel = model
+          useFreebuffSessionStore
+            .getState()
+            .setPendingAdmission({ instanceId: claimId, token })
+        }
+        const next = await callFreebuffSession(method, token, {
+          signal: fetchController.signal,
+          instanceId,
+          multiSession,
+          takeoverInstanceId,
+          model,
+          compact,
+        })
+        if (
+          cancelled ||
+          fetchController.signal.aborted ||
+          generation !== restartGeneration
+        ) {
+          return
+        }
+        consecutiveFailures = 0
+        if (probingLegacy !== undefined) {
+          legacyProbe = undefined
+          const adoptable =
+            next.status === 'active' &&
+            next.instanceId === probingLegacy &&
+            getFreebuffModelDirectory().isPickerModel(next.model) &&
+            !getFreebuffModelDirectory().isLimitedOffer(next.model)
+          if (!adoptable) {
+…
+const current = directory.get(next.currentModel).displayName
+            const requested = directory.get(explicitPickModel).displayName
+            let released = false
+            try {
+              const held = await callFreebuffSession('GET', token, {
+                signal: fetchController.signal,
+                instanceId,
+                multiSession,
+              })
+              if (
+                !cancelled &&
+                !fetchController.signal.aborted &&
+                generation === restartGeneration &&
+                held.status === 'active' &&
+                held.model === next.currentModel
+              ) {
+                await useFreebuffSessionStore
+                  .getState()
+                  .releaseSlot(held, fetchController.signal)
+                released = true
+              }
+            } catch {
+              // DELETE failed — fall through to the revert-with-explanation
+              // path below rather than stranding the user mid-switch.
+            }
+```
+- File `cli/src/__tests__/unit/agent-mode-toggle.test.ts` (11 matching lines):
+```
+set: (v: number) => void
+}
+
+describe('useHoverToggle timing (controller)', () => {
+  let originalSetTimeout: typeof setTimeout
+  let originalClearTimeout: typeof clearTimeout
+  let originalNow: typeof Date.now
+
+  let timers: { id: number; ms: number; fn: () => void; active: boolean }[]
+  let nextId: number
+
+  const runAll = () => {
+    for (const t of timers) {
+      if (t.active) t.fn()
+    }
+    timers = []
+  }
+
+  beforeEach(() => {
+    timers = []
+    nextId = 1
+    originalSetTimeout = setTimeout
+    originalClearTimeout = clearTimeout
+    originalNow = Date.now
+
+    let now = 1_000
+    const mockDateNow: MockDateNow = Object.assign(
+      () => now,
+      { set: (v: number) => { now = v } }
+    )
+    Date.now = mockDateNow
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `cli/src/utils/__tests__/connection-monitor.test.ts`: "repeated subscribe/unsubscribe — simulating a component re-rendering on every streamed token — never re-probes or resets the success streak"; "unsubscribing the last listener pauses the loop — no more probes once it is scheduled"; "resubscribing after a pause resumes polling"; "rapid unsubscribe/resubscribe cycles never trigger more than one check per initial interval"; "an in-flight check resolving after the last listener unsubscribed does not revive the loop"; "resubscribing while a probe from before the pause is pending adopts it instead of starting another"; "a probe that settles while paused becomes the next subscriber’s snapshot, without emitting"
+```
+  test('repeated subscribe/unsubscribe — simulating a component re-rendering on every streamed token — never re-probes or resets the success streak', async () => {
+    let currentUnsubscribe = monitor.subscribe(() => {})
+    await flush() // success #1
+    timers[timers.length - 1].fn()
+    await flush() // success #2
+    timers[timers.length - 1].fn()
+    await flush() // success #3 -> consecutiveSuccesses = 3, next tick scheduled ~30s out
+    expect(checkConnection).toHaveBeenCalledTimes(3)
+    // the whole polling effect, firing an immediate probe each time. Simulate 50 "renders" —
+    // each one unsubscribes then resubscribes within the same synchronous tick, exactly as
+    // React's effect cleanup/re-run does for an unstable `onReconnect` identity. Dropping to
+    // zero listeners between the two correctly pauses the loop (see the dedicated pause
+    // tests below); what must NOT happen is a new network probe or a reset of the streak.
+      currentUnsubscribe()
+      currentUnsubscribe = monitor.subscribe(() => {})
+    // No new network probes from the churn itself.
+    expect(checkConnection).toHaveBeenCalledTimes(3)
+    // Firing whichever tick the churn left pending makes one real probe...
+    expect(timers.length).toBeGreaterThan(0)
+    timers[timers.length - 1].fn()
+    await flush()
+    expect(checkConnection).toHaveBeenCalledTimes(4)
+    // ...and the interval scheduled after THAT success reflects a continuing streak (4
+    // successes land in the 30s bucket), not the old bug's reset to the 10s floor on every
+    // single render.
+    expect(getNextInterval(4)).toBe(30_000)
+    const nextPending = timers[timers.length - 1]
+    expect(nextPending.ms).toBeGreaterThanOrEqual(30_000 * 0.8)
+    expect(nextPending.ms).toBeLessThanOrEqual(30_000 * 1.2)
+  test('unsubscribing the last listener pauses the loop — no more probes once it is scheduled', async () => {
+    // Regression test for a bug flagged on PR #5229: unsubscribing (e.g. a BYOK session's
+    //
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/cli/src/utils/connection-monitor.ts b/cli/src/utils/connection-monitor.ts
+index 231b47b6e..e7840afb6 100644
+--- a/cli/src/utils/connection-monitor.ts
++++ b/cli/src/utils/connection-monitor.ts
+@@ -68,133 +68,219 @@ const defaultCheckConnection = async (): Promise<boolean> => {
+  *
+  * Production code does not call this directly — see the singleton helpers below. The loop here
+  * owns its own timer and backoff state, independent of any caller's lifecycle: subscribing adds
+  * a listener only, and never resets the timer or the backoff counters. That matters because this
+  * used to live inside `useConnectionStatus`'s `useEffect`, keyed on an `onReconnect` callback
+  * identity. A render during active streaming recreated that closure and tore down/restarted the
+  * effect — resetting the adaptive backoff to its 10s floor and firing an immediate probe on every
+  * render. During active token streaming that is many renders a second, which is what flooded
+  * `/api/healthz` (1.17B GETs/week, ~74% of all requests to the `web` Render service).
+  */
+ export function createConnectionMonitor(
+   options: ConnectionMonitorOptions = {},
+ ): ConnectionMonitor {
+   const checkConnection = options.checkConnection ?? defaultCheckConnection
+   const busyRecheckIntervalMs =
+     options.busyRecheckIntervalMs ?? HEALTH_CHECK_CONFIG.BUSY_RECHECK_INTERVAL
+ 
+   const listeners = new Set<ConnectionListener>()
+   let timeoutId: ReturnType<typeof setTimeout> | null = null
+   let consecutiveSuccesses = 0
+   let consecutiveFailures = 0
+   let connected = true
+   let started = false
+   let busy = false
+   let stopped = false
++  let lastCheckAt = 0
++  // Bumped whenever the loop pauses (last listener unsubscribes) or stops for good. A
++  // scheduled tick or an in-flight check captures the generation active when it started; if
++  // the generation has since moved on, that tick/check is stale and must not schedule another
++  // one or emit — otherwise it would revive a paused loop with nobody listening. That was the
++  // bug: a BYOK session that unsubscribed (its hook takes the early return for
++  // `hasSelectedByokConnection`) left this loop polling the Codebuff backend forever, since
++  // unsubscribing only removed the listener and never paused the timer.
++  let generation = 0
++  // The one network probe currently awaiting a response, shared by every check that wants a
++  // reading. A loop that resumes while a probe from before its pause is still pending adopts it
++  // instead of starting a second request: the generation guard discards stale continuations,
++  // but it cannot cancel their requests, so without this a fast pause/resume cycle during a
++  // slow health check would stack up concurrent probes.
++  let inFlight: Promise<boolean> | null = null
+ 
+-  const scheduleNext = (interval: number): void => {
+-    if (stopped) return
+-    if (timeoutId) clearTimeout(timeoutId)
+-    timeoutId = setTimeout(() => void check(), interval)
++  const probe = (): Promise<boolean> => {
++    if (!inFlight) {
++      let request: Promise<boolean>
++      try {
++        request = checkConnection()
++      } catch (error) {
++        request = Promise.reject(error)
++      }
++      inFlight = request
++      // Registered before any caller awaits `request`, so it runs first and the slot is free
++      // by the time a continuation might schedule the next probe. Callers await `request`
++      // itself, so sharing adds no extra microtask hops to a check.
++      const release = () => {
++        if (inFlight === request) inFlight = null
++      }
++      request.then(release, release)
++    }
++    return inFlight
++  }
++
++  const clearTimer = (): void => {
++    if (timeoutId) {
++      clearTimeout(timeoutId)
++      timeoutId = null
++    }
++  }
++
++  const scheduleNext = (interval: number, gen: number): void => {
++    if (stopped || gen !== generation) return
++    clearTimer()
++    timeoutId = setTimeout(() => void check(gen), interval)
+     timeoutId.unref?.()
+   }
+ 
+   const emit = (next: boolean): void => {
+     connected = next
+     for (const listener of [...listeners]) {
+       try {
+         listener(next)
+       } catch (error) {
+         logger.debug({ error }, 'Connection monitor listener threw')
+       }
+     }
+   }
+ 
+-  const scheduleFailed = (message: string, error?: unknown): void => {
++  const scheduleFailed = (
++    gen: number,
++    message: string,
++    error?: unknown,
++  ): void => {
+     consecutiveSuccesses = 0
+     consecutiveFailures++
+     const delayMs = failedPollDelayMs({ consecutiveFailures })
+     logger.debug(
+       {
+         ...(error === undefined ? {} : { error }),
+         delayMs,
+         consecutiveFailures,
+       },
+       message,
+     )
+     emit(false)
+-    scheduleNext(delayMs)
++    scheduleNext(delayMs, gen)
+   }
+ 
+-  const check = async (): Promise<void> => {
+-    if (stopped) return
++  const check = async (gen: number): Promise<void> => {
++    if (stopped || gen !== generation) return
+     if (busy) {
+-      scheduleNext(busyRecheckIntervalMs)
++      scheduleNext(busyRecheckIntervalMs, gen)
+       return
+     }
+     try {
+-      const ok = await checkConnection()
++      const ok = await probe()
++      lastCheckAt = Date.now()
+       if (stopped) return
++      // The generation may have moved on while this awaited — e.g. the last subscriber
++      // unsubscribed mid-check. The reading is still real, so keep it as the snapshot the next
++      // subscriber starts from (it is what `lastCheckAt` now vouches for), but a stale loop must
++      // not emit or reschedule.
++      if (gen !== generation) {
++        connected = ok
++        return
++      }
+       if (ok) {
+         consecutiveFailures = 0
+         consecutiveSuccesses++
+         emit(true)
+         scheduleNext(
+           jitterPollIntervalMs({
+             intervalMs: getNextInterval(consecutiveSuccesses),
+           }),
++          gen,
+         )
+       } else {
+-        scheduleFailed('Health check failed, backing off')
++        scheduleFailed(gen, 'Health check failed, backing off')
+       }
+     } catch (error) {
+-      scheduleFailed('Connection check failed; backing off', error)
++      lastCheckAt = Date.now()
++      if (stopped) return
++      if (gen !== generation) {
++        connected = false
++        return
++      }
++      scheduleFailed(gen, 'Connection check failed; backing off', error)
+     }
+   }
+ 
+   return {
+     subscribe(listener) {
+       listeners.add(listener)
+       // Give the new subscriber the current snapshot right away so its UI doesn't flash
+       // "disconnected" waiting for the next tick.
+       listener(connected)
+       if (!started) {
+         started = true
+-        void check()
++        const gen = generation
++        // Resuming shortly after a pause (e.g. a quick unsubscribe/resubscribe cycle) should
++        // not immediately refire a probe — wait out whatever's left of the last check's
++        // interval instead, so toggling quickly never triggers more than one check per
++        // INITIAL_INTERVAL. A probe still pending from before the pause is adopted, not
++        // duplicated (see `probe`).
++        const elapsedSinceLastCheck = lastCheckAt ? Date.now() - lastCheckAt : Infinity
++        if (inFlight) {
++          void check(gen)
++        } else if (elapsedSinceLastCheck < HEALTH_CHECK_CONFIG.INITIAL_INTERVAL) {
++          scheduleNext(
++            HEALTH_CHECK_CONFIG.INITIAL_INTERVAL - elapsedSinceLastCheck,
++            gen,
++          )
++        } else {
++          void check(gen)
++        }
+       }
+       return () => {
+         listeners.delete(listener)
++        // Nobody's listening — pause the loop instead of polling into the void. `started`
++        // stays false so the next subscribe() restarts it; `stopped` stays false so it can.
++        if (listeners.size === 0 && started) {
++          started = false
++          generation++
++          clearTimer()
++        }
+       }
+     },
+     getConnected: () => connected,
+     setBusy(next: boolean) {
+       busy = next
+     },
+     stop() {
+       stopped = true
++      generation++
+       listeners.clear()
+-      if (timeoutId) clearTimeout(timeoutId)
++      clearTimer()
+     },
+   }
+ }
+ 
+ // One process-wide instance. Lazily created on first use so importing this module never starts
+ // network traffic by itself (tests, non-CLI consumers of the package, etc.).
+ let singleton: ConnectionMonitor | null = null
+ 
+ function getSingleton(): ConnectionMonitor {
+   if (!singleton) {
+     singleton = createConnectionMonitor()
+   }
+   return singleton
+ }
+ 
+ /** Subscribe to connection state. Returns an unsubscribe function. */
+ export function subscribeToConnectionStatus(
+   listener: ConnectionListener,
+ ): () => void {
+   return getSingleton().subscribe(listener)
+ }
+ 
+ export function getConnectionStatusSnapshot(): boolean {
+   return getSingleton().getConnected()
+ }
+
+```
