@@ -1232,6 +1232,42 @@ test('release page: a long window folds its tail into compact rows', async () =>
   }
 })
 
+test('tiered day: a minor row embeds the entry body without a second header', async () => {
+  const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-minor-'))
+  try {
+    const row = (sha, date, extra = {}) => ({
+      kind: 'sync', sha, url: `https://github.com/CodebuffAI/freebuff/commit/${sha}`,
+      date, day: date.slice(0, 10), month: date.slice(0, 7),
+      areas: ['CLI'], category: 'CLI', significance: 'minor',
+      files: { total: 1, meaningful: 1, added: [], removed: [], modified: ['a.ts'] },
+      stats: { additions: 3, deletions: 1 },
+      title: 'Title ' + sha.slice(0, 6), summary: 'Summary ' + sha.slice(0, 6), ...extra
+    })
+    const entries = [
+      row('a'.repeat(40), '2026-09-11T10:00:00Z', { significance: 'notable', title: 'Notable title here' }),
+      row('b'.repeat(40), '2026-09-11T09:00:00Z', { title: 'Minor title here' })
+    ]
+    await buildSite({
+      changelog: { version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-11T12:00:00Z', headSha: 'a'.repeat(40), counts: { entries: entries.length }, entries },
+      openPrs: [], dist: tmpDist
+    })
+    const day = await readFile(join(tmpDist, 'day/2026-09-11/index.html'), 'utf8')
+    assert.match(day, /<details class="minor-row"/, 'the minor entry renders as a compact row')
+    // The row's own summary is the only header: no nested entry card behind a
+    // second disclosure, so expanding shows the body directly.
+    assert.equal((day.match(/<details class="entry /g) || []).length, 1,
+      'only the notable lead entry is a full card')
+    assert.equal((day.match(/<span class="minor-title">Minor title here<\/span>/g) || []).length, 1,
+      'the minor title renders once in the row header')
+    assert.equal((day.match(/<h3 class="entry-title">Minor title here<\/h3>/g) || []).length, 0,
+      'no duplicate entry header is embedded in the row')
+    assert.match(day, /<details class="minor-row"[^>]*>[\s\S]*?<div class="entry-body">/,
+      'the row still embeds the full entry body for in-place expansion')
+  } finally {
+    await rm(tmpDist, { recursive: true, force: true })
+  }
+})
+
 const dcEntry = () => ({
   kind: 'community', sha: 'a'.repeat(40), day: '2026-09-13', date: '2026-09-13T10:00:00.000Z',
   category: 'Model Catalog', significance: 'major', author: 'Ada', pr: 12,

@@ -1392,14 +1392,13 @@ export function entryCard (e, isExpanded = false, relatedIdx = null, opts = {}) 
   // data-cat / data-sig / data-churn are what the front-page filter toggles: every
   // row the index renders is a row the reader can narrow by area or impact, with no
   // second request.
-  return `<details class="entry ${e.significance}" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(e.significance || '')}" data-aud="${esc(e.ai?.audience || '')}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
-<summary class="entry-summary">
+  const headerHtml = `<summary class="entry-summary">
   <span class="entry-arrow">&gt;</span>
   <span class="entry-utc" title="${esc(time)} UTC">${esc(time)}</span>
   <h3 class="entry-title">${title}</h3>
   <div class="badges">${badges(e)}</div>
-</summary>
-<div class="entry-body">
+</summary>`
+  const entryBodyHtml = `<div class="entry-body">
 ${modelDiffLine(e)}
 ${e.eli5?.text ? `<p class="eli5"><span class="eli5-label">IN PLAIN ENGLISH</span>${esc(e.eli5.text)}</p>` : ''}
 ${leadHtml}
@@ -1425,7 +1424,14 @@ ${storyNoteHtml(opts.storyNotes)}
   </div>
 </div>
 ${powerEnd}
-</div>
+</div>`
+  // A minor row carries its own <summary> header, so the card embedded in it
+  // renders body-only: otherwise the title appears twice and the reader must
+  // open two nested disclosures to reach the details.
+  if (opts.bare) return entryBodyHtml
+  return `<details class="entry ${e.significance}" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(e.significance || '')}" data-aud="${esc(e.ai?.audience || '')}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
+${headerHtml}
+${entryBodyHtml}
 </details>`
 }
 
@@ -2545,9 +2551,9 @@ ${[
       const anchor = e.sha.slice(0, 12)
       const time = e.date.slice(11, 16)
       const title = e.ai?.title ? esc(e.ai.title) : esc(e.title || deriveTitleSafe(e))
-      // The row keeps the #sha anchor; the embedded card drops its id so the
-      // document never holds two elements with the same one.
-      const card = entryCard(e, false, relatedIdx, cardOpts(e)).replace(` id="${anchor}"`, '')
+      // The row keeps the #sha anchor and its own summary header; the embedded
+      // card renders body-only (bare) so the title doesn't appear twice.
+      const card = entryCard(e, false, relatedIdx, cardOpts(e, { bare: true }))
       return `<details class="minor-row" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(e.significance || '')}" data-aud="${esc(e.ai?.audience || '')}">
 <summary class="minor-summary"><span class="entry-arrow">&gt;</span><span class="entry-utc" title="${esc(e.date.slice(0, 16).replace('T', ' ') + ' UTC')}">${esc(time)}</span><span class="minor-title">${title}</span><span class="badges">${badges(e)}</span></summary>
 <div class="minor-body">${card}</div>
