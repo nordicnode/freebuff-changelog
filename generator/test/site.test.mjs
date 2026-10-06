@@ -1827,7 +1827,10 @@ test('in-flight live comment bodies go through escInFlight before innerHTML', as
 // `freebuffVersion` and deliberately writes none (VERSION_TRACKS in
 // analyze.mjs), so eleven 0.0.x links across the week pages and the model
 // lineage were 404s. The link is optional; the version is not.
-test('no release link points at a version the build never writes', async (t) => {
+// Both version lines get release pages now: the 1.0.x codebuff-cli line and
+// the 0.x freebuff-cli line (VERSION_TRACKS in analyze.mjs). A badge that names
+// a version must never point at a page the build did not write.
+test('every release link points at a version page the build writes, on both lines', async (t) => {
   const dist = await mkdtemp(join(tmpdir(), 'fbweb-relpage-'))
   t.after(() => rm(dist, { recursive: true, force: true }))
   const bump = (sha, date, extra) => ({
@@ -1857,19 +1860,50 @@ test('no release link points at a version the build never writes', async (t) => 
   await walk(dist)
 
   const linked = new Map()
-  let mentions188 = 0
   for (const page of pages) {
     const html = await readFile(page, 'utf8')
-    if (html.includes('v0.0.188')) mentions188++
     for (const m of html.matchAll(/href="\/release\/([^"/]+)\//g)) {
       const v = decodeURIComponent(m[1])
       if (!linked.has(v)) linked.set(v, await readFile(join(dist, 'release', v, 'index.html'), 'utf8').then(() => true, () => false))
       if (!(await linked.get(v))) assert.fail(`${page} links /release/${v}/ but no page was written for it`)
     }
   }
-  assert.ok(linked.has('1.0.688'), 'a version that does have a page is still linked')
-  assert.ok(!linked.has('0.0.188'), 'the 0.0.x line gets no release link')
-  assert.ok(mentions188 > 0, 'and the version is still shown, just without the dead link')
+  assert.ok(linked.has('1.0.688'), 'the 1.0.x line is linked')
+  assert.ok(linked.has('0.0.188'), 'the 0.x line is linked too')
+  // The archive's release-by-month directory lists both lines.
+  const archive = await readFile(join(dist, 'archive/index.html'), 'utf8')
+  assert.match(archive, /\/release\/0\.0\.188\//, 'archive lists the 0.x release')
+  assert.match(archive, /Two version lines ship from this repo/, 'archive explains the two lines')
+})
+
+// Release windows stop at the previous bump of the *same* line. The two lines
+// interleave, so a single date-sorted walk would hand a 0.x page the 1.0.x
+// line's window: here 0.2.4 must count the 1.0.5 bump and the commit after it
+// (both newer than 0.2.3), not just what came after 1.0.5.
+test('release windows stay inside their own version line', async (t) => {
+  const dist = await mkdtemp(join(tmpdir(), 'fbweb-relwin-'))
+  t.after(() => rm(dist, { recursive: true, force: true }))
+  const row = (sha, date, extra) => ({
+    kind: 'sync', sha, date, day: date.slice(0, 10), month: date.slice(0, 7), author: 'dev',
+    areas: ['CLI'], category: 'CLI', significance: 'minor', summary: 'row', title: 'row ' + sha.slice(0, 4),
+    files: { total: 1, meaningful: 1, rawMeaningful: 1, testOnly: false, added: [], removed: [], renamed: [], modified: ['cli/src/x.ts'] },
+    stats: { additions: 1, deletions: 0 }, ...extra
+  })
+  const changelog = {
+    version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-20T00:00:00Z',
+    headSha: 'a'.repeat(40), counts: { entries: 4 },
+    entries: [
+      row('a1'.repeat(20), '2026-09-17T10:00:00Z', { freebuffVersion: '0.2.3', versionTrack: 'freebuff-cli', title: 'Freebuff CLI 0.2.3' }),
+      row('b2'.repeat(20), '2026-09-18T10:00:00Z', { version: '1.0.5', title: 'CLI 1.0.5' }),
+      row('c3'.repeat(20), '2026-09-19T10:00:00Z', { title: 'a commit between the bumps' }),
+      row('d4'.repeat(20), '2026-09-20T10:00:00Z', { freebuffVersion: '0.2.4', versionTrack: 'freebuff-cli', title: 'Freebuff CLI 0.2.4' })
+    ]
+  }
+  await buildSite({ changelog, openPrs: [], dist })
+  const page = await readFile(join(dist, 'release', '0.2.4', 'index.html'), 'utf8')
+  assert.match(page, /2 commits since previous release/, 'window runs 0.2.3 -> 0.2.4, crossing the 1.0.5 bump')
+  assert.match(page, /a commit between the bumps/)
+  assert.match(page, /Freebuff CLI v0\.2\.4/, 'the 0.x line is named as the Freebuff app CLI, not Freebuff-at-large')
 })
 
 test('stats: the golden-set eval card renders, and says so when no run exists', async (t) => {

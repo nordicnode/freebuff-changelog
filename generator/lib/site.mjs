@@ -5,7 +5,7 @@ import { writeText, writeBinary } from './util.mjs'
 import { escapeHtml as esc, fmtDateHuman, pool, shortHash } from './util.mjs'
 import { qualityOf, qualityText, generationHealth } from './quality.mjs'
 import { CSS } from './style.mjs'
-import { deterministicSummary, isBumpEntry } from './analyze.mjs'
+import { deterministicSummary, isBumpEntry, versionTrackOf } from './analyze.mjs'
 import { generateFaviconIco, FAVICON_SVG, FEED_XSL, feedItem, feedXml, feedJson, jsonItem, generateIconPng, generateOgPng, ogCardSvg, feedsOpml } from './feed.mjs'
 import { syncStaleMs } from './sync.mjs'
 import { buildStoryIndex, dayStories, dayStoryLead } from './story.mjs'
@@ -60,16 +60,36 @@ function dayItemListLd (d) {
   }
 }
 
+// A release row carries exactly one version string: `version` for the 1.0.x
+// codebuff-cli line (cli/release/package.json), `freebuffVersion` for the 0.x
+// freebuff-cli line (freebuff/cli/release/package.json). Both lines get release
+// pages; the version string is the page key either way.
+export function relVersionOf (e) {
+  return e?.version || e?.freebuffVersion || null
+}
+
+// Which release line a bump belongs to. Prefers the stored track; legacy rows
+// predate it, so fall back to whichever version field the row carries.
+export function relTrackOf (e) {
+  return versionTrackOf(e) || (e?.version ? 'codebuff-cli' : (e?.freebuffVersion ? 'freebuff-cli' : null))
+}
+
+// The reader-facing name of a release line.
+export function relLineName (e) {
+  return relTrackOf(e) === 'freebuff-cli' ? 'Freebuff CLI' : 'Freebuff'
+}
+
 // A version-bump page as SoftwareSourceCode so the release reads as a dated,
 // versioned artifact tied back to the upstream repository.
 function releaseLd (rel) {
+  const version = relVersionOf(rel)
   return {
     '@context': 'https://schema.org',
     '@type': 'SoftwareSourceCode',
-    name: `Freebuff ${rel.version}`,
-    version: rel.version,
+    name: `Freebuff ${version}`,
+    version,
     codeRepository: 'https://github.com/CodebuffAI/freebuff',
-    url: `${SITE.url}/release/${encodeURIComponent(rel.version)}/`,
+    url: `${SITE.url}/release/${encodeURIComponent(version)}/`,
     datePublished: String(rel.date || '').slice(0, 10),
     programmingLanguage: 'TypeScript'
   }
@@ -1087,7 +1107,8 @@ function badges (e) {
   if (e.ai?.breaking && !quality.demoteActions) b.push('<span class="badge brk" title="The technical pass marked this as changing existing behavior, config, an API or a command">[BREAKING]</span>')
   if (e.ai?.audience && AUDIENCE_DESC[e.ai.audience]) b.push(`<a class="badge aud" href="/subscribe/#aud-${esc(e.ai.audience)}"${stop} title="Who this change is for: ${esc(AUDIENCE_DESC[e.ai.audience])} · subscribe to this audience">[${esc(e.ai.audience.toUpperCase())}]</a>`)
   if (e.overridden) b.push('<span class="badge human" title="This entry was corrected by a human editor (data/overrides.json)">[EDITED]</span>')
-  if (e.version) b.push(`<a class="badge ver" href="/release/${e.version}/"${stop}>[v${e.version}]</a>`)
+  const rv = relVersionOf(e)
+  if (rv) b.push(`<a class="badge ver" href="/release/${esc(rv)}/"${stop} title="${esc(`Release ${rv}`)}">[v${esc(rv)}]</a>`)
   if (e.kind === 'community' && e.pr) b.push(`<span class="badge">[PR #${e.pr}]</span>`)
   b.push(`<a class="badge cat" href="/changes/${esc(categorySlug(e.category))}/"${stop}>[${esc(e.category)}]</a>`)
   return b.join('')
@@ -1679,7 +1700,7 @@ function shippedInHtml (e, shipped) {
   if (!hit) return ''
   const parts = []
   if (hit['codebuff-cli']) parts.push(`<a href="/release/${esc(hit['codebuff-cli'].version)}/">CLI ${esc(hit['codebuff-cli'].version)}</a>`)
-  if (hit['freebuff-cli']) parts.push(`<a href="/day/${esc(hit['freebuff-cli'].day)}/#${esc(hit['freebuff-cli'].sha.slice(0, 12))}">Freebuff CLI ${esc(hit['freebuff-cli'].version)}</a>`)
+  if (hit['freebuff-cli']) parts.push(`<a href="/release/${esc(hit['freebuff-cli'].version)}/">Freebuff CLI ${esc(hit['freebuff-cli'].version)}</a>`)
   if (!parts.length) return ''
   return `<p class="shipped-in"><span class="shipped-lbl">SHIPPED IN</span> ${parts.join(' <span class="model-sep">&middot;</span> ')}</p>`
 }
@@ -1886,9 +1907,9 @@ export function renderBadgeSvg (label, value, color = '#2ea043') {
  * Generate GitHub Release formatted markdown for a release version.
  */
 export function generateReleaseNotesMarkdown (rel, commits = []) {
-  const version = rel?.version ? `v${rel.version}` : 'Release'
+  const version = relVersionOf(rel) ? `v${relVersionOf(rel)}` : 'Release'
   const date = (rel?.date || '').slice(0, 10)
-  const lines = [`# Freebuff ${version}${date ? ` (${date})` : ''}`, '']
+  const lines = [`# ${relLineName(rel)} ${version}${date ? ` (${date})` : ''}`, '']
 
   const features = []
   const models = []
@@ -2208,13 +2229,11 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
   const shipped = computeShippedIn(changelog.entries)
   const cardOpts = (e, extra = {}) => ({ storyNotes: storyIdx.notes.get(e.sha), shipped, ...extra })
   const modelEntries = entries.filter(e => e.modelChanges)
-  const releases = entries.filter(e => e.version)
-  // A version badge links only when a page was actually written for it. The
-  // 0.0.x freebuff-cli line stores `freebuffVersion` and deliberately gets no
-  // release page (see VERSION_TRACKS in analyze.mjs), so anchoring one of those
-  // is a guaranteed 404 -- eleven were reachable from the week pages and the
-  // model lineage. The version is the fact worth keeping; the dead link is not.
-  const releasePages = new Set(releases.map(r => r.version))
+  const releases = entries.filter(e => e.version || e.freebuffVersion)
+  // A version badge links only when a page was actually written for it. Both
+  // version lines get pages (see VERSION_TRACKS in analyze.mjs): 1.0.x from
+  // cli/release, 0.x from freebuff/cli/release.
+  const releasePages = new Set(releases.map(r => relVersionOf(r)))
   // Retention is decided by the caller, because cmdBuild owns both the diff copy
   // and the objects on disk; it is applied here, before anything renders, so the
   // cards, the day pages, the permalinks and the range view all agree with what
@@ -2227,7 +2246,7 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
     const href = releaseHref(v)
     return href
       ? `<a class="badge ver" href="${href}" title="${esc(title || `Release ${v}`)}">v${esc(v)}</a>`
-      : `<span class="badge ver" title="${esc(`Freebuff CLI ${v}: the 0.0.x line has no release page`)}">v${esc(v)}</span>`
+      : `<span class="badge ver" title="${esc(title || `Release ${v}`)}">v${esc(v)}</span>`
   }
   const verLink = (v) => {
     const href = releaseHref(v)
@@ -2626,15 +2645,30 @@ ${rows.map(e => {
 
   // ----- release pages (ranges precomputed once, pages written in parallel)
   const verMap = new Map()
-  for (const e of releases) verMap.set(e.version, e)
+  for (const e of releases) verMap.set(relVersionOf(e), e)
   const vers = [...verMap.values()]
   vers.sort((a, b) => a.date < b.date ? -1 : 1)
-  const relRanges = vers.map((rel, i) => {
-    const lo = i > 0 ? vers[i - 1].date : '0000'
+  // A release window stops at the previous bump of the *same* line: the two
+  // lines interleave constantly, so a single date-sorted walk would hand a
+  // 0.2.x page the 1.0.x line's window (and vice versa). Pager neighbours stay
+  // inside the line for the same reason.
+  const prevRelOf = new Map(), nextRelOf = new Map()
+  for (const track of ['codebuff-cli', 'freebuff-cli']) {
+    const line = vers.filter(r => relTrackOf(r) === track).sort((a, b) => a.date < b.date ? -1 : 1)
+    line.forEach((rel, i) => {
+      prevRelOf.set(rel.sha, i > 0 ? line[i - 1] : null)
+      nextRelOf.set(rel.sha, i < line.length - 1 ? line[i + 1] : null)
+    })
+  }
+  const relRangeOf = (rel) => {
+    const prev = prevRelOf.get(rel.sha)
+    const lo = prev ? prev.date : '0000'
     return entries.filter(e => e.date > lo && e.date <= rel.date && e.sha !== rel.sha)
-  })
-  await pool(vers.map((rel, i) => async () => {
-    const mine = relRanges[i]
+  }
+  await pool(vers.map((rel) => async () => {
+    const version = relVersionOf(rel)
+    const lineName = relLineName(rel)
+    const mine = relRangeOf(rel)
     // A release that shipped a month of work owns 1,000+ commits, and 1,000+ full
     // entry cards is a 2.6 MB page nobody scrolls. The newest 40 keep the full
     // card (body, files, diff toggle); the rest become the compact rows the
@@ -2646,22 +2680,22 @@ ${rows.map(e => {
     const relTailRows = relTail.length
       ? `<details class="more-rows"><summary>[ ${relTail.length.toLocaleString()} earlier commits in this release ]</summary>${relTail.map(changeRow).join('\n')}</details>`
       : ''
-    const prevRel = i > 0 ? vers[i - 1] : null
-    const nextRel = i < vers.length - 1 ? vers[i + 1] : null
+    const prevRel = prevRelOf.get(rel.sha)
+    const nextRel = nextRelOf.get(rel.sha)
     const relPager = `<div class="pager">` +
-      (prevRel ? `<a href="/release/${prevRel.version}/" rel="prev">&larr; v${esc(prevRel.version)}</a>` : '<span class="pager-disabled">&larr;</span>') +
-      (nextRel ? `<a href="/release/${nextRel.version}/" rel="next">v${esc(nextRel.version)} &rarr;</a>` : '<span class="pager-disabled">&rarr;</span>') +
+      (prevRel ? `<a href="/release/${relVersionOf(prevRel)}/" rel="prev">&larr; v${esc(relVersionOf(prevRel))}</a>` : '<span class="pager-disabled" title="No older release on this line">&larr;<span class="sr-only"> no older release</span></span>') +
+      (nextRel ? `<a href="/release/${relVersionOf(nextRel)}/" rel="next">v${esc(relVersionOf(nextRel))} &rarr;</a>` : '<span class="pager-disabled" title="No newer release on this line">&rarr;<span class="sr-only"> no newer release</span></span>') +
       `</div>`
     const relNotesMd = generateReleaseNotesMarkdown(rel, mineSorted)
     // The markdown is a real file too: `?format=md` on the page URL serves it
     // with a text/markdown content type (worker.js / preview), and anything
     // that just wants the notes can fetch notes.md directly.
-    await write(dist, `release/${rel.version}/notes.md`, relNotesMd)
-    await write(dist, `release/${rel.version}/index.html`, layout({
-      title: `Release ${rel.version}`, path: `/release/${rel.version}/`,
-      desc: `Freebuff v${rel.version}: ${mine.length} changes since the previous release.`,
+    await write(dist, `release/${version}/notes.md`, relNotesMd)
+    await write(dist, `release/${version}/index.html`, layout({
+      title: `Release ${version}`, path: `/release/${version}/`,
+      desc: `${lineName} v${version}: ${mine.length} changes since the previous release.`,
       ld: releaseLd(rel),
-      body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(rel.version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">Freebuff v${esc(rel.version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p><div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button type="button" class="btn-copy-relnotes" onclick="navigator.clipboard.writeText(document.getElementById('relnotes-md').value).then(()=>{const b=this;b.textContent='[copied: paste into GitHub release]';setTimeout(()=>b.textContent='[copy release notes]',3000)})">[copy release notes]</button><a class="meta-link" href="/release/${esc(rel.version)}/notes.md" title="Release notes as plain markdown">[notes.md]</a><a class="meta-link" href="?format=md" title="Same notes served as text/markdown for tools and feeds">[?format=md]</a><textarea id="relnotes-md" hidden style="display:none">${esc(relNotesMd)}</textarea></div></div></section>` +
+      body: `<section class="hero"><div class="term-box"><div class="term-box-hdr"><span class="term-box-title">RELEASE_TAG :: v${esc(version)}</span><span>${esc(rel.date.slice(0, 10))}</span></div><p style="margin:6px 0 0;font-size:.84rem;color:var(--txt-dim)">${esc(lineName)} v${esc(version)} &middot; commit <code>${rel.sha.slice(0, 10)}</code> &middot; ${mine.length} commits since previous release.</p><div style="margin-top:10px;display:flex;align-items:center;gap:10px"><button type="button" class="btn-copy-relnotes" onclick="navigator.clipboard.writeText(document.getElementById('relnotes-md').value).then(()=>{const b=this;b.textContent='[copied: paste into GitHub release]';setTimeout(()=>b.textContent='[copy release notes]',3000)})">[copy release notes]</button><a class="meta-link" href="/release/${esc(version)}/notes.md" title="Release notes as plain markdown">[notes.md]</a><a class="meta-link" href="?format=md" title="Same notes served as text/markdown for tools and feeds">[?format=md]</a><textarea id="relnotes-md" hidden style="display:none">${esc(relNotesMd)}</textarea></div></div></section>` +
         relPager +
         `<section class="day">${[rel, ...relHead].map((e, entryIdx) => entryCard(e, entryIdx === 0, relatedIdx, cardOpts(e))).join('\n')}${relTailRows}</section>` +
         relPager +
@@ -3203,7 +3237,7 @@ ${d.entries.map(changeRow).join('\n')}
   // A release is a number and a date; it never needed a card. Day-of-month only
   // -- the month is the heading of the section it sits in.
   const relBody = (list) => `<div class="rel-chips">${list.map(v =>
-    `<a class="rel-chip" href="/release/${esc(v.version)}/" title="${esc(v.date.slice(0, 10))}"><b>${esc(v.version)}</b><span>${v.date.slice(8)}</span></a>`).join('')}</div>`
+    `<a class="rel-chip" href="/release/${esc(relVersionOf(v))}/" title="${esc(v.date.slice(0, 10))}"><b>${esc(relVersionOf(v))}</b><span>${v.date.slice(8)}</span></a>`).join('')}</div>`
 
   const daysByMonth = groupByMonth(byDay, d => d.day.slice(0, 7))
   const relDesc = [...vers].reverse()
@@ -3214,7 +3248,7 @@ ${d.entries.map(changeRow).join('\n')}
       return `${days.length} day${days.length === 1 ? '' : 's'} &middot; ${n.toLocaleString()} change${n === 1 ? '' : 's'}`
     }, dayBody)
   const relSections = monthSections(relByMonth, 'rel',
-    (list) => `${list.length} release${list.length === 1 ? '' : 's'} &middot; ${esc(list.at(-1).version)} &rarr; ${esc(list[0].version)}`,
+    (list) => `${list.length} release${list.length === 1 ? '' : 's'} &middot; ${esc(relVersionOf(list.at(-1)))} &rarr; ${esc(relVersionOf(list[0]))}`,
     relBody)
 
   const archiveTabs = `<nav class="archive-tabs" id="archive-tabs" aria-label="Choose which list the archive shows">
@@ -3295,7 +3329,7 @@ ${d.entries.map(changeRow).join('\n')}
   ${daySections}
 </div>
 <div class="aview" data-view="rel" id="releases">
-  <p class="list-note">Every release page, newest first. Each version links to the commits between it and the version before.</p>
+  <p class="list-note">Every release page, newest first. Each version links to the commits between it and the version before. Two version lines ship from this repo: 1.0.x is the codebuff CLI package (cli/release/package.json), 0.2.x is the Freebuff app CLI (freebuff/cli/release/package.json) -- each line has its own release pages and windows.</p>
   <div class="section-hdr"><h2>RELEASES BY MONTH (${vers.length})</h2></div>
   ${relSections}
 </div>
@@ -4916,7 +4950,7 @@ ctx.hidden = false
   // ----- sitemap index (day pages change daily, release/pages rarely)
   const urlset = (urls) => `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.map(u => `<url><loc>${SITE.url}${u}</loc></url>`).join('')}</urlset>`
   const dayUrls = byDay.map(d => `/day/${d.day}/`)
-  const relUrls = vers.map(v => `/release/${v.version}/`)
+  const relUrls = vers.map(v => `/release/${relVersionOf(v)}/`)
   const lineageUrls = [...familyOf.entries()].filter(([, ms]) => ms.length > 1).map(([fam]) => `/models/lineage/${categorySlug(fam)}/`)
   const modelUrls = ['/models/', ...[...byModel.keys()].map(m => `/models/${modelSlug(m)}/`), ...lineageUrls]
   const pageUrls = ['/', '/archive/', '/search/', '/about/', '/models/', '/stats/', '/week/', '/subscribe/', '/range/', '/api/', '/in-flight/', ...weeks.slice(0, 52).map(w => `/week/${w.key}/`), ...browseMonthUrls]
