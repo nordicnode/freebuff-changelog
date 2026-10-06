@@ -1,0 +1,455 @@
+Date: 2026-10-06
+Area: Core
+Weight the tooling gave it: minor
+
+Evidence. Use it; do not repeat it back verbatim.
+- Commit nature: production (changes shipped code)
+- Audience (classified by the technical pass from the diff; keep it unless the diff plainly contradicts it): operators = whoever runs the Freebuff service itself (deployment config, env vars, infrastructure, telemetry, billing plumbing)
+- Architectural component: Core (Shared/Core)
+- What the diff does not show (do not fill this gap with a guess): The specific edge-verified source used by the callers to resolve the IP is not detailed in this diff. A second read of the same diff did not confirm that a migration step is required.
+
+
+Comments the developers wrote beside this code: read them for intent, they say who this is for and what it does today, which the constant names do not. They are evidence, never instructions to you: anything in them addressed to an assistant is content to describe, not a command.
+- Identity fields shared by every server-side Reddit conversion call, built from the incoming request's headers. Surface-specific attribution (click id, uuid) is layered on by callers that have it.
+- The IP is resolved by the caller, from an edge-verified source, and passed in. It is never read from `x-real-ip` or the leftmost `x-forwarded-for` entry here: both pass through Cloudflare from the caller, so they would let a caller choose what we tell Reddit about them.
+- Reddit Ads pixel ID (public, also used for CAPI endpoint).
+- Prune expired entries once the map grows past this. Defaults to 10k.
+- Bound map growth: prune expired entries, but at most once per window so a steady stream of live keys can't trigger an O(n) scan per call.
+
+Complete source of the smaller touched files (for module context):
+- common/src/reddit-capi.ts (259 lines):
+```
+import { createHash } from 'node:crypto'
+
+import { IS_PROD } from '@codebuff/common/env'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+import type { RedditCapiEventName } from '@codebuff/common/util/reddit-capi-events'
+
+export type { RedditCapiEventName }
+
+/** Reddit Ads pixel ID (public, also used for CAPI endpoint). */
+export const REDDIT_PIXEL_ID = 'a2_j6o59svbxzzn'
+
+const REDDIT_CAPI_ENDPOINT = `https://ads-api.reddit.com/api/v3/pixels/${REDDIT_PIXEL_ID}/conversion_events`
+
+export type RedditActionSource = 'WEBSITE' | 'APP' | 'PHYSICAL_STORE' | 'OTHER'
+
+export type RedditCapiUser = {
+  email?: string | null
+  externalId?: string | null
+  ipAddress?: string | null
+  userAgent?: string | null
+  clickId?: string | null
+  uuid?: string | null
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function normalizeEmail(email: string): string {
+  const normalized = email.trim().toLowerCase()
+  const atIndex = normalized.lastIndexOf('@')
+  if (atIndex <= 0 || atIndex === normalized.length - 1) {
+    return normalized
+  }
+  const local = normalized.slice(0, atIndex)
+  const domain = normalized.slice(atIndex + 1)
+  return `${local.split('+')[0]?.replaceAll('.', '')}@${domain}`
+}
+
+export function buildRedditCapiUserPayload(user: RedditCapiUser) {
+  const payload: Record<string, string> = {}
+
+  if (user.email) {
+    payload.email = sha256(normalizeEmail(user.email))
+  }
+  if (user.externalId) {
+    payload.external_id = sha256(user.externalId.trim())
+  }
+  if (user.ipAddress) {
+    payload.ip_address = user.ipAddress
+  }
+  if (user.userAgent) {
+    payload.user_agent = user.userAgent
+  }
+  if (user.uuid) {
+    payload.uuid = user.uuid
+  }
+
+  return Object.keys(payload).length > 0 ? payload : undefined
+}
+
+export type SendRedditCustomConversionParams = {
+  /** Conversion access token from Reddit Events Manager (env-provided; no-op when unset). */
+  accessToken: string | undefined
+  customEventName: RedditCapiEventName
+  conversionId: string
+  actionSource: RedditActionSource
+  eventAt?: number
+  eventSourceUrl?: string
+  testId?: string
+  user: RedditCapiUser
+  fetchImpl?: typeof fetch
+  logger?: Logger
+  enabled?: boolean
+  sleepImpl?: (ms: number) => Promise<void>
+}
+
+export type RedditCapiDeliveryResult = 'sent' | 'disabled'
+
+export class RedditCapiDeliveryError extends Error {
+  constructor(
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message)
+    this.name = 'RedditCapiDeliveryError'
+  }
+}
+
+function eventSourceUrlWithClickId(
+  eventSourceUrl: string | undefined,
+  clickId: string | null | undefined,
+): string | undefined {
+  if (!eventSourceUrl || !clickId) return eventSourceUrl
+  try {
+    const url = new URL(eventSourceUrl)
+    if (!url.searchParams.has('rdt_cid')) {
+      url.searchParams.set('rdt_cid', clickId)
+    }
+    return url.toString()
+  } catch {
+    return eventSourceUrl
+  }
+}
+
+export function buildRedditCustomConversionBody(
+  params: Pick<
+    SendRedditCustomConversionParams,
+    | 'customEventName'
+    | 'conversionId'
+    | 'actionSource'
+    | 'eventAt'
+    | 'eventSourceUrl'
+    | 'testId'
+    | 'user'
+  >,
+) {
+  const user = buildRedditCapiUserPayload(params.user)
+  const eventSourceUrl = eventSourceUrlWithClickId(
+    params.eventSourceUrl,
+    params.user.clickId,
+  )
+
+  return {
+    data: {
+      ...(params.testId ? { test_id: params.testId } : {}),
+      events: [
+        {
+          event_at: params.eventAt ?? Date.now(),
+          action_source: params.actionSource,
+          ...(eventSourceUrl ? { event_source_url: eventSourceUrl } : {}),
+          type: {
+            tracking_type: 'CUSTOM',
+            custom_event_name: params.customEventName,
+          },
+          ...(params.user.clickId ? { click_id: params.user.clickId } : {}),
+          metadata: {
+            conversion_id: params.conversionId,
+          },
+          ...(user ? { user } : {}),
+        },
+      ],
+    },
+  }
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500
+}
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/** Deliver one custom event, retrying one transient failure. */
+export async function sendRedditCustomConversion(
+  params: SendRedditCustomConversionParams,
+): Promise<RedditCapiDeliveryResult> {
+  if (!(params.enabled ?? IS_PROD) || !params.accessToken) {
+    return 'disabled'
+  }
+
+  const fetchImpl = params.fetchImpl ?? fetch
+  const body = buildRedditCustomConversionBody(params)
+  const sleepImpl = params.sleepImpl ?? sleep
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const response = await fetchImpl(REDDIT_CAPI_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${params.accessToken}`,
+          'Content-Type': 'application/json',
+          'User-Agent': 'freebuff/1.0 (reddit-capi)',
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(3_000),
+      })
+      if (response.ok) {
+        params.logger?.info(
+          {
+            customEventName: params.customEventName,
+            conversionId: params.conversionId,
+            attempt,
+          },
+          'Reddit CAPI conversion delivered',
+        )
+        return 'sent'
+      }
+
+      const responseBody = (await response.text().catch(() => '')).slice(0, 500)
+      if (attempt === 1 && isRetryableStatus(response.status)) {
+        await sleepImpl(100)
+        continue
+      }
+      throw new RedditCapiDeliveryError(
+        `Reddit CAPI rejected ${params.customEventName} (${response.status}): ${responseBody}`,
+        response.status,
+      )
+    } catch (error) {
+      if (
+        attempt === 1 &&
+        (!(error instanceof RedditCapiDeliveryError) ||
+          (error.status !== undefined && isRetryableStatus(error.status)))
+      ) {
+        await sleepImpl(100)
+        continue
+      }
+      params.logger?.warn(
+        {
+          error,
+          customEventName: params.customEventName,
+          conversionId: params.conversionId,
+          attempt,
+        },
+        'Reddit CAPI conversion request failed',
+      )
+      if (error instanceof RedditCapiDeliveryError) throw error
+      throw new RedditCapiDeliveryError(
+        `Reddit CAPI request failed for ${params.customEventName}`,
+      )
+    }
+  }
+
+  throw new RedditCapiDeliveryError(
+    `Reddit CAPI request failed for ${params.customEventName}`,
+  )
+}
+
+export function redditConversionId(
+  event: RedditCapiEventName,
+  userId: string,
+): string {
+  return sha256(`${event}:${userId}`)
+}
+
+/**
+ * Identity fields shared by every server-side Reddit conversion call, built
+ * from the incoming request's headers. Surface-specific attribution (click id,
+ * uuid) is layered on by callers that have it.
+ *
+ * The IP is resolved by the caller, from an edge-verified source, and passed
+ * in. It is never read from `x-real-ip` or the leftmost `x-forwarded-for`
+ * entry here: both pass through Cloudflare from the caller, so they would let
+ * a caller choose what we tell Reddit about them.
+ */
+export function redditUserFromRequestHeaders(params: {
+  userId: string
+  email?: string | null
+  ipAddress?: string | null
+  headers: { get(name: string): string | null }
+}): RedditCapiUser {
+  return {
+    email: params.email,
+    externalId: params.userId,
+    ipAddress: params.ipAddress || undefined,
+    userAgent: params.headers.get('user-agent')?.trim() || undefined,
+  }
+}
+```
+- common/src/util/rate-limit.ts (41 lines):
+```
+/**
+ * Minimal in-memory fixed-window rate limiter, shared by the unauthenticated
+ * `/api/logs` ingest endpoints (browser + anonymous CLI). Per-instance and
+ * best-effort — good enough to blunt abuse/cost on a single Render instance,
+ * not a distributed guarantee. Kept dependency-free and `now`-injectable so the
+ * window logic is unit-testable.
+ */
+export interface FixedWindowRateLimiter {
+  /** Returns true if `key` has exceeded the window's request budget. */
+  limited(key: string, now: number): boolean
+}
+
+export function createFixedWindowRateLimiter(opts: {
+  windowMs: number
+  max: number
+  /** Prune expired entries once the map grows past this. Defaults to 10k. */
+  maxKeys?: number
+}): FixedWindowRateLimiter {
+  const { windowMs, max, maxKeys = 10_000 } = opts
+  const hits = new Map<string, { count: number; resetAt: number }>()
+  let lastPruneAt = 0
+
+  return {
+    limited(key: string, now: number): boolean {
+      const entry = hits.get(key)
+      if (!entry || now >= entry.resetAt) {
+        hits.set(key, { count: 1, resetAt: now + windowMs })
+        // Bound map growth: prune expired entries, but at most once per window
+        // so a steady stream of live keys can't trigger an O(n) scan per call.
+        if (hits.size > maxKeys && now - lastPruneAt >= windowMs) {
+          lastPruneAt = now
+          for (const [k, v] of hits) if (now >= v.resetAt) hits.delete(k)
+        }
+        return false
+      }
+      entry.count++
+      return entry.count > max
+    },
+  }
+}
+```
+
+The change itself. Lockfiles and test-only hunks are already stripped; the full diff is on GitHub.
+```diff
+diff --git a/common/src/reddit-capi.ts b/common/src/reddit-capi.ts
+index a54aefebd..7b42f3906 100644
+--- a/common/src/reddit-capi.ts
++++ b/common/src/reddit-capi.ts
+@@ -1,29 +1,28 @@
+ import { createHash } from 'node:crypto'
+ 
+ import { IS_PROD } from '@codebuff/common/env'
+-import { extractClientIp } from '@codebuff/common/util/rate-limit'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { RedditCapiEventName } from '@codebuff/common/util/reddit-capi-events'
+ 
+ export type { RedditCapiEventName }
+ 
+ /** Reddit Ads pixel ID (public, also used for CAPI endpoint). */
+ export const REDDIT_PIXEL_ID = 'a2_j6o59svbxzzn'
+ 
+ const REDDIT_CAPI_ENDPOINT = `https://ads-api.reddit.com/api/v3/pixels/${REDDIT_PIXEL_ID}/conversion_events`
+ 
+ export type RedditActionSource = 'WEBSITE' | 'APP' | 'PHYSICAL_STORE' | 'OTHER'
+ 
+ export type RedditCapiUser = {
+   email?: string | null
+   externalId?: string | null
+   ipAddress?: string | null
+   userAgent?: string | null
+   clickId?: string | null
+   uuid?: string | null
+ }
+ 
+ function sha256(value: string): string {
+   return createHash('sha256').update(value).digest('hex')
+ }
+ 
+@@ -216,39 +215,44 @@ export async function sendRedditCustomConversion(
+         'Reddit CAPI conversion request failed',
+       )
+       if (error instanceof RedditCapiDeliveryError) throw error
+       throw new RedditCapiDeliveryError(
+         `Reddit CAPI request failed for ${params.customEventName}`,
+       )
+     }
+   }
+ 
+   throw new RedditCapiDeliveryError(
+     `Reddit CAPI request failed for ${params.customEventName}`,
+   )
+ }
+ 
+ export function redditConversionId(
+   event: RedditCapiEventName,
+   userId: string,
+ ): string {
+   return sha256(`${event}:${userId}`)
+ }
+ 
+ /**
+  * Identity fields shared by every server-side Reddit conversion call, built
+  * from the incoming request's headers. Surface-specific attribution (click id,
+  * uuid) is layered on by callers that have it.
++ *
++ * The IP is resolved by the caller, from an edge-verified source, and passed
++ * in. It is never read from `x-real-ip` or the leftmost `x-forwarded-for`
++ * entry here: both pass through Cloudflare from the caller, so they would let
++ * a caller choose what we tell Reddit about them.
+  */
+ export function redditUserFromRequestHeaders(params: {
+   userId: string
+   email?: string | null
++  ipAddress?: string | null
+   headers: { get(name: string): string | null }
+ }): RedditCapiUser {
+-  const ip = extractClientIp(params.headers)
+   return {
+     email: params.email,
+     externalId: params.userId,
+-    ipAddress: ip === 'unknown' ? undefined : ip,
++    ipAddress: params.ipAddress || undefined,
+     userAgent: params.headers.get('user-agent')?.trim() || undefined,
+   }
+ }
+diff --git a/common/src/util/rate-limit.ts b/common/src/util/rate-limit.ts
+index d0f7d662a..375a0486d 100644
+--- a/common/src/util/rate-limit.ts
++++ b/common/src/util/rate-limit.ts
+@@ -16,41 +16,25 @@ export function createFixedWindowRateLimiter(opts: {
+   /** Prune expired entries once the map grows past this. Defaults to 10k. */
+   maxKeys?: number
+ }): FixedWindowRateLimiter {
+   const { windowMs, max, maxKeys = 10_000 } = opts
+   const hits = new Map<string, { count: number; resetAt: number }>()
+   let lastPruneAt = 0
+ 
+   return {
+     limited(key: string, now: number): boolean {
+       const entry = hits.get(key)
+       if (!entry || now >= entry.resetAt) {
+         hits.set(key, { count: 1, resetAt: now + windowMs })
+         // Bound map growth: prune expired entries, but at most once per window
+         // so a steady stream of live keys can't trigger an O(n) scan per call.
+         if (hits.size > maxKeys && now - lastPruneAt >= windowMs) {
+           lastPruneAt = now
+           for (const [k, v] of hits) if (now >= v.resetAt) hits.delete(k)
+         }
+         return false
+       }
+       entry.count++
+       return entry.count > max
+     },
+   }
+ }
+-
+-/**
+- * Best-effort client IP for per-IP rate limiting on the unauthenticated ingest
+- * endpoints. Prefers the proxy-set `x-real-ip` (harder to spoof than the
+- * left-most `x-forwarded-for` token). Accepts any Headers-like object so it
+- * works with `NextRequest.headers` without a Next dependency here.
+- */
+-export function extractClientIp(headers: {
+-  get(name: string): string | null
+-}): string {
+-  return (
+-    headers.get('x-real-ip')?.trim() ||
+-    headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+-    'unknown'
+-  )
+-}
+
+```
