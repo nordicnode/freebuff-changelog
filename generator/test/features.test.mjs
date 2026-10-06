@@ -84,6 +84,13 @@ test('entryRecord: the /api/entry shape carries what the cards show, minus HTML'
   assert.match(rec.urls.permalink, /\/c\/abcdef012345/)
   assert.equal(entryRecord({ ...e, ai: {} }).urls.commit, 'https://github.com/CodebuffAI/freebuff/commit/abcdef0123456789')
   assert.equal(entryRecord({ ...e, ai: {}, eli5: null }).plainEnglish, undefined, 'absent fields are omitted, not nulled')
+  // Facts and structured identifiers travel too: they ground Ask answers about
+  // names the hunks never spell out. Bounded, so one verbose row cannot bloat
+  // the day shard.
+  const withCtx = entryRecord({ ...e, facts: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'], structured: { envVars: ['X'] } })
+  assert.deepEqual(withCtx.facts, ['a', 'b', 'c', 'd', 'e', 'f'], 'capped at six')
+  assert.deepEqual(withCtx.structured, { envVars: ['X'] })
+  assert.equal(entryRecord(e).facts, undefined, 'absent fields are omitted, not nulled')
 })
 
 test('feedsOpml: bundles every feed with xmlUrl and htmlUrl', () => {

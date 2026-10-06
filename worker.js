@@ -40,9 +40,11 @@ const ASK = {
   //references like "it" or "why", never counts as evidence (the grounding gate
   // still checks every claim against the stored diff). Bounded so one long
   // thread cannot push the evidence out of the prompt or time out the ask.
-  historyMax: 6,
-  historyAnswerMax: 2000,
-  historyTotalMax: 4000,
+  // Sized for the model's 270k-token window: a long thread is still a small
+  // fraction of it, so follow-ups keep their context instead of forgetting.
+  historyMax: 8,
+  historyAnswerMax: 3000,
+  historyTotalMax: 12000,
   // The provider's gateway sits behind its own Cloudflare zone, so an ask can
   // land on a gateway rate limit (their error 1015) instead of on the model. Ride it out inside the ask's budget:
   // honor Retry-After when sent, cap each wait so an interactive question never
@@ -143,6 +145,33 @@ async function assetText (env, request, path) {
 let shaDay = { map: null, at: 0 }
 
 async function findEntryRecord (env, request, want) {
+  const loaded = await loadDayRecords(env, request, want)
+  if (!loaded) return null
+  return loaded.records.find(x => x.sha.startsWith(loaded.key) || loaded.key.startsWith(x.sha)) || null
+}
+
+// Same-day neighbours for Ask context: the closest entries in the same day
+// shard, so "is this related to X?" questions have something true to stand
+// on. Titles plus a short summary each, capped at four: the shard is already
+// in hand, so this costs no extra fetch, and summaries stay snippet-length so
+// attribution cannot bleed across commits unnoticed.
+function nearbyRecords (records, entry, n = 4) {
+  const at = Date.parse(entry?.date || '')
+  const scored = []
+  for (const r of records || []) {
+    if (!r || r.sha === entry.sha || r.noise || !r.title) continue
+    const t = Date.parse(r.date || '')
+    scored.push({ r, d: Number.isFinite(at) && Number.isFinite(t) ? Math.abs(t - at) : 0 })
+  }
+  scored.sort((x, y) => x.d - y.d)
+  return scored.slice(0, n).map(({ r }) => ({
+    short: r.short || String(r.sha || '').slice(0, 12),
+    title: r.title,
+    ...(r.summary ? { summary: String(r.summary).slice(0, 600) } : {})
+  }))
+}
+
+async function loadDayRecords (env, request, want) {
   if (!shaDay.map || Date.now() - shaDay.at > 60000) {
     const text = await assetText(env, request, '/api/sha-day.json')
     shaDay = { map: text ? JSON.parse(text) : {}, at: Date.now() }
@@ -154,8 +183,7 @@ async function findEntryRecord (env, request, want) {
   if (!key) return null
   const shard = await assetText(env, request, `/api/records/${map[key]}.json`)
   if (!shard) return null
-  const records = JSON.parse(shard).records || []
-  return records.find(x => x.sha.startsWith(key) || key.startsWith(x.sha)) || null
+  return { key, records: JSON.parse(shard).records || [] }
 }
 
 // GET reports whether the feature is enabled so the page can hide or show the
@@ -205,7 +233,8 @@ async function askHandler (request, env) {
   const limit = await underRateLimit(env, ip)
   if (!limit.ok) return json({ error: 'too many asks; wait a moment', retryAfterSec: limit.retryAfterSec }, 429, { 'retry-after': String(limit.retryAfterSec) })
 
-  const entry = await findEntryRecord(env, request, sha)
+  const loaded = await loadDayRecords(env, request, sha)
+  const entry = loaded?.records.find(x => x.sha.startsWith(loaded.key) || loaded.key.startsWith(x.sha))
   if (!entry) return json({ error: `no changelog entry records ${sha}` }, 404)
 
   // Grounding needs the stored diff. No diff means no way to check a claim, so
@@ -214,7 +243,7 @@ async function askHandler (request, env) {
   const diff = await assetText(env, request, `/diffs/${diffSha}.diff`)
   if (!diff) return json({ error: 'no stored diff for this entry, so an answer cannot be grounded', grounded: false }, 422)
 
-  const evidence = answerEvidence({ entry, diff })
+  const evidence = answerEvidence({ entry, diff, neighbors: nearbyRecords(loaded.records, entry) })
   // The cache key includes the thread: the same words after a different
   // conversation are a different ask, and answering them from a first-question
   // cache would be a wrong answer, not a saving.

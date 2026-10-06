@@ -806,7 +806,7 @@ document.addEventListener('submit', (ev) => {
   // later via /entry-frags/ start empty. Only grounded answers join it:
   // refusals and errors are shown but never become "context" the model sees.
   const thread = (box._askThread = box._askThread || []);
-  const history = thread.slice(-6);
+  const history = thread.slice(-8);
   send.disabled = true;
   out.hidden = false;
   out.className = 'ask-out';
@@ -841,7 +841,7 @@ document.addEventListener('submit', (ev) => {
         note.textContent = (b.cached ? 'cached · ' : '') + 'grounded in ' + String(b.sha || box.dataset.sha).slice(0, 12) + (cites.length ? ' · ' + cites.join(', ') : '');
         aEl.appendChild(note);
         thread.push({ q: q, a: b.answer });
-        if (thread.length > 6) thread.splice(0, thread.length - 6);
+        if (thread.length > 8) thread.splice(0, thread.length - 8);
         if (input) input.focus();
       } else if (r.status === 422) {
         // Refused by the grounding gate. Naming the claims is what makes the
@@ -1998,6 +1998,12 @@ export function entryRecord (e, shipped = null) {
     quality: qualityOf(e),
     ...(e.ai?.unknowns ? { unknowns: e.ai.unknowns } : {}),
     ...(e.ai?.changes?.length ? { changes: e.ai.changes } : {}),
+    // Facts and structured identifiers ground Ask-the-AI answers about rows
+    // whose hunks never spell the name out (a flag read elsewhere in the
+    // file, a renamed export). Bounded so one verbose row cannot bloat the
+    // day shard; both were written against this entry, so both are citable.
+    ...(e.facts?.length ? { facts: e.facts.slice(0, 6).map(f => String(f).slice(0, 400)) } : {}),
+    ...(e.structured ? { structured: e.structured } : {}),
     ...(e.ai?.ungrounded?.length ? { unverifiedNames: e.ai.ungrounded } : {}),
     ...(e.version ? { version: e.version } : {}),
     ...(e.freebuffVersion ? { freebuffVersion: e.freebuffVersion } : {}),

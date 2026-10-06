@@ -66,18 +66,45 @@ export function parseDiff (diff) {
  * diff cannot make an interactive ask time out (the same sizing problem the
  * summariser solves with its row clock -- here the clock is the reader waiting).
  *
+ * The bound is sized for the model's 270k-token window: 200k characters is
+ * roughly a fifth of it, so large diffs now arrive whole instead of truncated,
+ * with room left for the follow-up thread and the answer. Small entries are
+ * unaffected -- the cap only bites on huge diffs.
+ *
  * The cut is deliberate and visible: a truncated evidence set can only make the
  * gate stricter (fewer things ground), never looser, so a bound can never turn a
  * false claim into a passing one.
  */
-export function answerEvidence ({ entry = {}, diff = '', maxChars = 48000 } = {}) {
+export function answerEvidence ({ entry = {}, diff = '', maxChars = 200000, neighbors = [] } = {}) {
   const parsed = parseDiff(diff)
+  const a = entry.ai || {}
+  // Production records carry the model's diff citations at ai.evidence; the
+  // top-level field is a legacy path. Either one counts: both were written
+  // against this entry's diff, so both are citable context for a follow-up.
+  const cited = entry.evidence || a.evidence || ''
+  const changes = Array.isArray(a.changes) ? a.changes : (Array.isArray(entry.changes) ? entry.changes : [])
+  const facts = Array.isArray(entry.facts) ? entry.facts : []
+  // Deployed /api/records shards are slim: the plain-English line lives at
+  // plainEnglish (not eli5.text) and unknowns/migration travel top-level, not
+  // under ai. Read both shapes so Ask is not blind in production to context
+  // the tests hand it nested.
+  const plain = entry.eli5?.text || entry.plainEnglish || ''
+  const unknowns = a.unknowns || entry.unknowns || ''
+  const migration = a.migration || entry.migration || ''
+  const near = (Array.isArray(neighbors) ? neighbors : []).filter(n => n && n.title).slice(0, 4)
   const parts = [
-    `TITLE: ${entry.ai?.title || entry.title || ''}`,
-    `SUMMARY: ${entry.ai?.summary || entry.summary || ''}`,
-    entry.eli5?.text ? `IN PLAIN ENGLISH: ${entry.eli5.text}` : '',
-    entry.evidence ? `EVIDENCE: ${entry.evidence}` : '',
+    `TITLE: ${a.title || entry.title || ''}`,
+    `SUMMARY: ${a.summary || entry.summary || ''}`,
+    plain ? `IN PLAIN ENGLISH: ${plain}` : '',
+    cited ? `EVIDENCE: ${cited}` : '',
+    changes.length ? `CHANGES:\n${changes.map(c => `- ${c.area ? `[${c.area}] ` : ''}${c.what || ''}${c.files?.length ? ` (${c.files.join(', ')})` : ''}`).join('\n')}` : '',
+    facts.length ? `MEASURED FACTS: ${facts.join(' | ')}` : '',
+    // What the diff does not show. Stated here so the model treats it as a
+    // boundary instead of filling the gap with general knowledge.
+    unknowns ? `NOT IN THIS CHANGE (do not present these as what the change does): ${unknowns}` : '',
+    migration ? `MIGRATION: ${migration}` : '',
     entry.structured ? `STRUCTURED FACTS: ${JSON.stringify(entry.structured)}` : '',
+    near.length ? `NEARBY CHANGES THE SAME DAY (separate commits, not this change; do not present these as what this change does):\n${near.map(n => `- ${n.short || n.sha || ''}: ${n.title}${n.summary ? ` -- ${n.summary}` : ''}`).join('\n')}` : '',
     `FILES TOUCHED: ${[...parsed.files].join(', ')}`,
     'DIFF:',
     String(diff || '')

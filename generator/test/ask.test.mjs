@@ -124,6 +124,82 @@ test('answerEvidence: bounded so one huge diff cannot make an interactive ask ti
   assert.match(ev.text, /MiMo free agents use current model/, 'the entry text survives the cut')
 })
 
+test('answerEvidence: record context the diff alone does not carry reaches the model', () => {
+  // Production records carry the summary's diff citations at ai.evidence while
+  // the top-level field is empty; facts, per-area changes, unknowns and
+  // migration sit unused beside it. All four are written against this entry,
+  // so all four are citable context for a follow-up.
+  const rich = {
+    sha: SHA,
+    title: 't',
+    ai: {
+      title: 't',
+      summary: 's',
+      evidence: 'The diff sets `MODEL.displayName` in the agent.',
+      changes: [{ area: 'CLI', what: 'Prints the current model name.', files: ['src/agents/freebuff.ts'] }],
+      unknowns: 'Whether the old name is cached elsewhere.',
+      migration: 'Restart the CLI.'
+    },
+    facts: ['`FALLBACK_LABEL` defaults to "assistant".'],
+    structured: { constants: [] }
+  }
+  const ev = answerEvidence({ entry: rich, diff: DIFF })
+  for (const re of [/EVIDENCE: The diff sets/, /CHANGES:\n- \[CLI\] Prints/, /MEASURED FACTS:/, /NOT IN THIS CHANGE/, /MIGRATION: Restart/]) {
+    assert.match(ev.text, re)
+  }
+  // And the gate honours the wider record: an identifier the record states but
+  // the hunk text never spells out is context, not invention.
+  const v = groundAnswer('It falls back via `FALLBACK_LABEL`.', ev)
+  assert.equal(v.grounded, true, JSON.stringify(v.ungrounded))
+})
+
+test('answerEvidence: the slim /api/records shape carries the same context', () => {
+  // Deployed shards are not full entries: the plain-English line is
+  // plainEnglish, unknowns/migration travel top-level, and there is no ai
+  // object at all. Ask must not go blind to those in production.
+  const slim = {
+    sha: SHA,
+    title: 't',
+    summary: 's',
+    plainEnglish: 'Plain line.',
+    evidence: 'The diff sets things up.',
+    unknowns: 'What the callers do.',
+    migration: 'Restart.',
+    changes: [{ area: 'CLI', what: 'Does a thing.', files: ['a.ts'] }]
+  }
+  const ev = answerEvidence({ entry: slim, diff: DIFF })
+  for (const re of [/IN PLAIN ENGLISH: Plain line/, /EVIDENCE: The diff sets/, /CHANGES:\n- \[CLI\] Does/, /NOT IN THIS CHANGE/, /MIGRATION: Restart/]) {
+    assert.match(ev.text, re)
+  }
+})
+
+test('answerEvidence: same-day neighbours are titled context, never the answer', () => {
+  const ev = answerEvidence({
+    entry, diff: DIFF,
+    neighbors: [
+      { short: 'bbbb11111111', title: 'Neighbour one', summary: 'First nearby summary.' },
+      { short: 'cccc22222222', title: 'Neighbour two' }
+    ]
+  })
+  assert.match(ev.text, /NEARBY CHANGES THE SAME DAY/)
+  assert.match(ev.text, /bbbb11111111: Neighbour one -- First nearby summary\./)
+  assert.match(ev.text, /cccc22222222: Neighbour two/)
+  const bare = answerEvidence({ entry, diff: DIFF })
+  assert.doesNotMatch(bare.text, /NEARBY/, 'no neighbours, no section')
+})
+
+test('answerEvidence: the default budget fits real diffs whole', () => {
+  // 48k used to truncate mid-size diffs; the 270k-token window fits ~200k
+  // characters, so a 100k diff now arrives whole and only giants are cut.
+  const big = `diff --git a/big.ts b/big.ts\n+++ b/big.ts\n@@ -1,2 +1,2 @@\n+${'x'.repeat(100000)}\n`
+  const whole = answerEvidence({ entry, diff: big })
+  assert.doesNotMatch(whole.text, /diff truncated/, 'a 100k diff is evidence, not a cut')
+  assert.equal(whole.truncated, false)
+  const giant = answerEvidence({ entry, diff: big + 'y'.repeat(150000) })
+  assert.match(giant.text, /diff truncated/, 'the bound still exists, far out')
+  assert.equal(giant.truncated, true)
+})
+
 test('ASK_INSTRUCTIONS: the contract the prompt promises is the one the gate enforces', () => {
   // If the prompt stops demanding backticks and citations while the gate keeps
   // enforcing them, every answer would be refused for a rule the reader never
@@ -306,6 +382,33 @@ test('worker /api/ask: validation and abuse checks answer before any spend', asy
   assert.equal(n, 0, 'none of them reached the model')
 })
 
+test('worker /api/ask: same-day neighbours reach the prompt, noise does not', async (t) => {
+  const calls = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    calls.push(JSON.parse(init.body))
+    return sse(groundedReply)
+  })
+  const rec = (sha, title, extra = {}) => ({ sha, short: sha.slice(0, 12), day: '2026-10-05', date: '2026-10-05T11:00:00Z', title, summary: 's', ...extra })
+  const env = fakeEnv({
+    '/api/sha-day.json': JSON.stringify({ [SHA]: '2026-10-05' }),
+    '/api/records/2026-10-05.json': JSON.stringify({ day: '2026-10-05', records: [
+      rec(SHA, 'Target change'),
+      rec('b'.repeat(40), 'Neighbour one'),
+      rec('c'.repeat(40), 'Dependency lockfile updated', { noise: true }),
+      rec('d'.repeat(40), 'Neighbour two')
+    ] }),
+    [`/diffs/${SHA}.diff`]: DIFF
+  }, { LLM_API_KEY: 'k' })
+  const res = await ask(env)
+  assert.equal(res.status, 200)
+  assert.equal(calls.length, 1)
+  const prompt = calls[0].messages[1].content
+  assert.match(prompt, /NEARBY CHANGES THE SAME DAY/)
+  assert.match(prompt, /Neighbour one -- s/, 'neighbours carry a summary snippet, not just a title')
+  assert.match(prompt, /Neighbour two/)
+  assert.doesNotMatch(prompt, /Dependency lockfile updated/, 'churn rows are not context')
+})
+
 test('worker /api/ask: no stored diff means no answer, because nothing could be grounded', async () => {
   const env = fakeEnv(assets(''), { LLM_API_KEY: 'k' })
   const res = await ask(env)
@@ -341,6 +444,20 @@ test('worker /api/ask: a follow-up question carries its thread to the model', as
   assert.match(prompt, /MODEL\.displayName/, 'the first answer is in the prompt')
   assert.match(prompt, /Why that file\?/, 'and so is the follow-up')
   assert.match(prompt, /CONVERSATION SO FAR/, 'labelled as context, not evidence')
+})
+
+test('worker /api/ask: a long thread keeps its context in a large window', async (t) => {
+  const calls = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    calls.push(JSON.parse(init.body))
+    return sse(groundedReply)
+  })
+  const history = Array.from({ length: 8 }, (_, i) => ({ q: `Thread question ${i}?`, a: groundedReply }))
+  const res = await ask(fakeEnv(assets(), { LLM_API_KEY: 'k' }), { q: 'And then?', history })
+  assert.equal(res.status, 200)
+  const prompt = calls[0].messages[1].content
+  assert.match(prompt, /Thread question 0\?/, 'the earliest turn survives')
+  assert.match(prompt, /Thread question 7\?/, 'as does the latest')
 })
 
 test('worker /api/ask: the same words after a different thread are a different cache entry', async (t) => {
