@@ -1232,6 +1232,39 @@ test('release page: a long window folds its tail into compact rows', async () =>
   }
 })
 
+test('effective significance: an AI-weighted notable entry is badged and sectioned as notable', async () => {
+  const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-effsig-'))
+  try {
+    const row = (sha, date, extra = {}) => ({
+      kind: 'sync', sha, url: `https://github.com/CodebuffAI/freebuff/commit/${sha}`,
+      date, day: date.slice(0, 10), month: date.slice(0, 7),
+      areas: ['CLI'], category: 'CLI', significance: 'minor',
+      files: { total: 1, meaningful: 1, added: [], removed: [], modified: ['a.ts'] },
+      stats: { additions: 3, deletions: 1 },
+      title: 'Title ' + sha.slice(0, 6), summary: 'Summary ' + sha.slice(0, 6), ...extra
+    })
+    // The deterministic rule says minor; the AI weighted it notable.
+    const entries = [row('a'.repeat(40), '2026-09-11T10:00:00Z',
+      { title: 'Weighted notable here', ai: { significance: 'notable', title: 'Weighted notable here' } })]
+    await buildSite({
+      changelog: { version: 1, repo: 'CodebuffAI/freebuff', generatedAt: '2026-09-11T12:00:00Z', headSha: 'a'.repeat(40), counts: { entries: entries.length }, entries },
+      openPrs: [], dist: tmpDist
+    })
+    const day = await readFile(join(tmpDist, 'day/2026-09-11/index.html'), 'utf8')
+    // It sections as a lead entry, not a compact row...
+    assert.doesNotMatch(day, /<details class="minor-row"/)
+    assert.match(day, /<details class="entry notable"/, 'the card carries the effective significance class')
+    // ...and the badge agrees with the section, explaining the AI weighting.
+    assert.match(day, /<a class="badge not" href="\/changes\/notable\/".*?>\[NOTABLE\]<\/a>/)
+    assert.match(day, /AI weighted this notable; deterministic rule said minor/)
+    // ...and the badge's target page lists it.
+    const notablePage = await readFile(join(tmpDist, 'changes/notable/index.html'), 'utf8')
+    assert.match(notablePage, /Weighted notable here/, '/changes/notable/ includes the AI-weighted entry')
+  } finally {
+    await rm(tmpDist, { recursive: true, force: true })
+  }
+})
+
 test('tiered day: a minor row embeds the entry body without a second header', async () => {
   const tmpDist = await mkdtemp(join(tmpdir(), 'fbweb-minor-'))
   try {

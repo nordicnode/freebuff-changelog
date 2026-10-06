@@ -1102,6 +1102,12 @@ function renderDiff(container, text, label, ghUrl, mode) {
 </body></html>`
 }
 
+// The significance the reader sees: the AI's weighting wins over the
+// deterministic rule. Every surface that presents or selects by significance
+// uses this -- otherwise an entry lands in "NOTABLE & SECURITY" with no
+// [NOTABLE] badge, or a badge links to a /changes/ page that doesn't list it.
+function effSig (e) { return e.ai?.significance || e.significance || 'minor' }
+
 function badges (e) {
   const b = []
   const quality = qualityOf(e)
@@ -1120,8 +1126,8 @@ function badges (e) {
   // the list a reader clicking them wants. Each row's own significance/category
   // page exists by construction (the row is in it).
   const stop = ' onclick="event.stopPropagation()"'
-  if (e.significance === 'major') b.push(`<a class="badge maj" href="/changes/major/"${stop}${tip}>[MAJOR]</a>`)
-  else if (e.significance === 'notable') b.push(`<a class="badge not" href="/changes/notable/"${stop}${tip}>[NOTABLE]</a>`)
+  if (effSig(e) === 'major') b.push(`<a class="badge maj" href="/changes/major/"${stop}${tip}>[MAJOR]</a>`)
+  else if (effSig(e) === 'notable') b.push(`<a class="badge not" href="/changes/notable/"${stop}${tip}>[NOTABLE]</a>`)
   if (e.modelChanges) b.push(`<a class="badge model" href="/models/"${stop}>[MODEL]</a>`)
   if (isSecurityEntry(e)) b.push('<span class="badge sec" title="Security-relevant: trust gates, credentials, checksums, permissions or sandboxing">[SECURITY]</span>')
   if (e.ai?.breaking && !quality.demoteActions) b.push('<span class="badge brk" title="The technical pass marked this as changing existing behavior, config, an API or a command">[BREAKING]</span>')
@@ -1417,7 +1423,7 @@ ${powerEnd}
   // renders body-only: otherwise the title appears twice and the reader must
   // open two nested disclosures to reach the details.
   if (opts.bare) return entryBodyHtml
-  return `<details class="entry ${e.significance}" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(e.significance || '')}" data-aud="${esc(e.ai?.audience || '')}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
+  return `<details class="entry ${effSig(e)}" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(effSig(e))}" data-aud="${esc(e.ai?.audience || '')}"${e.noise ? ' data-churn="1"' : ''}${(opts.hideChurn && e.noise) ? ' hidden' : ''}${isExpanded ? ' open' : ''}>
 ${headerHtml}
 ${entryBodyHtml}
 </details>`
@@ -1953,7 +1959,7 @@ export function generateReleaseNotesMarkdown (rel, commits = []) {
     const commitLink = `[\`${e.sha.slice(0, 7)}\`](${commitUrl})`
     const bullet = `- **${title}** ${commitLink}`
 
-    if (e.significance === 'major' || e.category === 'Feature') {
+    if (effSig(e) === 'major' || e.category === 'Feature') {
       features.push(bullet)
     } else if (e.category === 'Model Catalog' || e.modelChanges) {
       models.push(bullet)
@@ -2321,7 +2327,7 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
   // stats) and the per-area RSS feeds while reusing the one browse-page renderer.
   const IMPACT_LEVELS = [['major', 'Major'], ['notable', 'Notable'], ['minor', 'Minor']]
   for (const [sig, label] of IMPACT_LEVELS) {
-    const list = entries.filter(e => !e.noise && e.significance === sig)
+    const list = entries.filter(e => !e.noise && effSig(e) === sig)
     if (list.length) browseList.push({ label, slug: sig, list, impact: true })
   }
   const browseBySlug = new Map(browseList.map(b => [b.slug, b]))
@@ -2409,8 +2415,8 @@ export async function buildSite ({ changelog, openPrs, dist, retention = null, p
     // page down to nothing on an axis with no rows today.
     const sigCounts = new Map()
     for (const e of rows) {
-      if (e.noise || !e.significance) continue
-      sigCounts.set(e.significance, (sigCounts.get(e.significance) || 0) + 1)
+      if (e.noise || !(e.ai?.significance || e.significance)) continue
+      sigCounts.set(effSig(e), (sigCounts.get(effSig(e)) || 0) + 1)
     }
     const sigList = IMPACT_LEVELS
       .filter(([sig]) => sigCounts.get(sig))
@@ -2507,7 +2513,6 @@ ${[
     // header. Minor bodies stay in the DOM inside a collapsed <details> -- one
     // renderer, no fetch, no-JS still reads everything -- so expanding in place
     // is native disclosure, not a second code path.
-    const effSig = (e) => e.ai?.significance || e.significance || 'minor'
     const isLeadEntry = (e) => !e.noise && (effSig(e) === 'major' || effSig(e) === 'notable' || isSecurityEntry(e))
     const leadEntries = []
     const minorByArea = new Map()
@@ -2537,7 +2542,7 @@ ${[
       // The row keeps the #sha anchor and its own summary header; the embedded
       // card renders body-only (bare) so the title doesn't appear twice.
       const card = entryCard(e, false, relatedIdx, cardOpts(e, { bare: true }))
-      return `<details class="minor-row" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(e.significance || '')}" data-aud="${esc(e.ai?.audience || '')}">
+      return `<details class="minor-row" id="${anchor}" data-cat="${esc(categorySlug(e.category))}" data-sig="${esc(effSig(e))}" data-aud="${esc(e.ai?.audience || '')}">
 <summary class="minor-summary"><span class="entry-arrow">&gt;</span><span class="entry-utc" title="${esc(e.date.slice(0, 16).replace('T', ' ') + ' UTC')}">${esc(time)}</span><span class="minor-title">${title}</span><span class="badges">${badges(e)}</span></summary>
 <div class="minor-body">${card}</div>
 </details>`
@@ -3467,7 +3472,7 @@ ${archiveScript}`
     const sum = e.ai?.summary || e.summary || ''
     const vers = e.version || e.freebuffVersion
     const relBadge = vers ? verBadge(vers) : ''
-    const isMaj = (e.ai?.significance || e.significance) === 'major'
+    const isMaj = effSig(e) === 'major'
     const majBadge = isMaj ? `<span class="badge maj">[MAJOR]</span>` : ''
     const isSec = isSecurityEntry(e)
     const secBadge = isSec ? `<span class="badge sec" title="Security-relevant change">sec</span>` : ''
@@ -3847,7 +3852,7 @@ ${weekTabsScript}`
       (e.ai?.title || e.title || deriveTitleSafe(e)).slice(0, 90),
       SEARCH_CATS.indexOf(e.category),
       e.sha.slice(0, 12),
-      SEARCH_SIGS.indexOf(e.significance),
+      SEARCH_SIGS.indexOf(effSig(e)),
       AUDIENCES.indexOf(e.ai?.audience || ''),
       flags,
       (e.eli5?.text || '').slice(0, 160),
@@ -4816,7 +4821,7 @@ ${inFlightScript}`
   const titleOf = (e) => e.ai?.title || e.title || deriveTitleSafe(e)
   const rssItem = e => feedItem(SITE.url, e, titleOf, storyIdx.notes.get(e.sha))
   const mainItems = entries.filter(e => !e.noise).slice(0, 60).map(rssItem).join('')
-  const majorItems = entries.filter(e => !e.noise && e.significance !== 'minor').slice(0, 60).map(rssItem).join('')
+  const majorItems = entries.filter(e => !e.noise && effSig(e) !== 'minor').slice(0, 60).map(rssItem).join('')
   const modelItems = modelEntries.slice(0, 60).map(rssItem).join('')
   const releaseItems = [...vers].reverse().slice(0, 60).map(rssItem).join('')
   await write(dist, 'feed.xml', feedXml(SITE.url, SITE.name, SITE.desc, generated, 'feed.xml', SITE.name, SITE.desc, mainItems))
