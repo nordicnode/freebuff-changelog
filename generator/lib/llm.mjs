@@ -4146,18 +4146,50 @@ export async function verifySummary (entry, patch, clean, env, cautionNames = []
   return callLlm(buildVerifyPrompt(entry, patch, clean, cautionNames, vopts), venv, 1, validate, { fallbackPrompt, leanPrompt, gatewayRetries: 0, stage: 'verification' })
 }
 
+// The diff room one chunk ask in a map-reduce row gets.
+//
+// The row's clock pays for the WHOLE map-reduce ladder, but each chunk ask used
+// to be sized against the context window alone (diffRoom(40000), clock
+// unknown): an 8 MB diff -- the relay's own truncation cap -- built eight ~1 MB
+// prompts, ~80s of prefill each, so the row's 90s clock cut the second round
+// every single cycle. The row was asked and never answered, arrived as a
+// gateway timeout, kept the short transient cooldown, and stayed missing
+// forever while it spent eight failed calls a cycle. Sharing the row's own
+// prefill allowance (the same promptCharsForClock the single-shot ask is sized
+// by) across the chunk asks, each ask's fixed preamble counted, is what lets a
+// diff too big to read whole lose hunks instead of its row.
+//
+// An unbounded clock (Infinity, the callers that never had one) stays unbounded,
+// so nothing that used to send its whole diff is capped by this.
+export function mapPhaseDiffRoom (clockMs, chunkCount = 1, { preambleChars = PROMPT_PREAMBLE_CHARS } = {}) {
+  const total = promptCharsForClock(clockMs)
+  if (!Number.isFinite(total)) return Infinity
+  const n = Math.max(1, Number(chunkCount) || 1)
+  return Math.max(LLM_MIN_DIFF_ROOM, Math.floor((total - preambleChars * n) / n))
+}
+
 // Map-reduce orchestration: one focused call per chunk (sequential, to respect
 // the RPM budget), then a fuse call validated against the FULL diff corpus so
 // the final entry is grounded no matter which chunk a name came from.
 export async function summarizeChunked (e, patch, { promptCtx = {}, corpus = '', sig = 'minor', env = process.env } = {}) {
-  const chunks = chunkPatchGroups(patch)
+  const clockMs = promptCtx.rowBudgetMs ?? rowBudgetMs(env)
+  // Bound the map phase BEFORE chunking, so the row's allowance is spent on the
+  // files that matter (budgetPatch ranks source ahead of snapshots/generated
+  // files) and the chunk count can only fall. Re-chunking the bounded patch is
+  // what makes the per-ask room exact: fewer chunks means each ask may carry
+  // more, so the allowance is used rather than left on the floor.
+  const planned = chunkPatchGroups(patch)
+  const plannedRoom = mapPhaseDiffRoom(clockMs, planned.length)
+  const mapPatch = budgetPatch(patch, plannedRoom * planned.length, perFileRoom(plannedRoom))
+  const chunks = chunkPatchGroups(mapPatch)
+  const room = mapPhaseDiffRoom(clockMs, chunks.length)
   const supplied = []
   // Two map calls in flight, not one: the RPM limiter is the real bound, so
   // wall-clock drops without another request leaving early. pool preserves
   // ORDER (drafts[i] is chunk i), so the fusion prompt's section order still
   // mirrors the diff.
   const drafts = await pool(chunks.map((chunk, i) => async () => {
-    const part = budgetPatch(chunk, diffRoom(40000), diffRoom(40000))
+    const part = budgetPatch(chunk, room, perFileRoom(room))
     const files = diffPaths(chunk)
     supplied[i] = redactProductPrompts(part)
     const out = await callLlm(buildChunkPrompt(e, part, { index: i, total: chunks.length, files, structured: promptCtx.structured }), env, 1, validateChunkOut, { stage: 'map' })

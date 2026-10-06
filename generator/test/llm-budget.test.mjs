@@ -15,7 +15,8 @@ import {
   DEFAULT_LLM_API_BASE, DEFAULT_LLM_MODEL, DEFAULT_ROW_BUDGET_MS, PROMPT_V,
   enrichEli5, enrichOpenPrs, summaryBacklog, validateLlmConfig, llmCallCount, llmRouteIdentity, ELI5_V,
   buildEli5Prompt, diffRoom, promptCharsForClock, LLM_PREFILL_CHARS_PER_SEC,
-  LLM_PROMPT_CLOCK_SHARE, LLM_PROMPT_CHARS, LLM_MIN_DIFF_ROOM, eli5RollupBudgetMs, explainEntry
+  LLM_PROMPT_CLOCK_SHARE, LLM_PROMPT_CHARS, LLM_MIN_DIFF_ROOM, eli5RollupBudgetMs, explainEntry,
+  mapPhaseDiffRoom, PROMPT_PREAMBLE_CHARS
 } from '../lib/llm.mjs'
 import { summaryPassWindow, regenerationEli5Deadline, cmdGenerationHealth, cmdWatch } from '../cli.mjs'
 import { generationHealth } from '../lib/quality.mjs'
@@ -521,6 +522,53 @@ test('row budget: one slow row cannot spend the pass, and the row behind it is s
   // both are the row's own budget ending, and both stay retryable.
   assert.match(String(stub.error), /budget exceeded|timeout/i)
   assert.equal(errorRetryDelayMs(stub), 300000, 'an aborted row keeps the short cooldown rather than parking')
+})
+
+test('mapPhaseDiffRoom: the chunk asks share the row clock, so a giant diff loses hunks and not its row', () => {
+  const clock = 90000
+  const allowance = promptCharsForClock(clock)
+  const chunks = 8
+  const room = mapPhaseDiffRoom(clock, chunks)
+  // The whole ladder is charged to one clock: the diff the eight asks carry,
+  // plus each ask's fixed preamble, must fit what the row can prefill.
+  assert.ok(room * chunks + PROMPT_PREAMBLE_CHARS * chunks <= allowance, 'the map asks fit the row clock')
+  assert.ok(room >= LLM_MIN_DIFF_ROOM, 'and still send real hunks, never an empty diff')
+  // More chunks means less per ask; fewer chunks lets each carry more.
+  assert.ok(mapPhaseDiffRoom(clock, 2) > mapPhaseDiffRoom(clock, 8))
+  // No clock known: unchanged, uncapped (the old behaviour for callers without one).
+  assert.equal(mapPhaseDiffRoom(Infinity, 8), Infinity)
+})
+
+test('map-reduce: a diff too big for the row clock is chunked to fit instead of failing every cycle', async (t) => {
+  const dir = await temp(t)
+  // A diff big enough to force the chunked path (see the threshold override below),
+  // built from file shapes the entry's own summary can ground against.
+  const parts = ['diff --git a/a.ts b/a.ts\nindex 1111111..2222222 100644\n--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,3 @@\n+export const ALPHA = 1\n const base = 0\n']
+  let len = parts[0].length
+  for (let i = 0; len < 400000; i++) {
+    const p = `diff --git a/src/f${i}.ts b/src/f${i}.ts\nindex 1111111..2222222 100644\n--- a/src/f${i}.ts\n+++ b/src/f${i}.ts\n@@ -1,2 +1,3 @@\n+export const ALPHA = 1\n const base = ${i}\n`
+    parts.push(p); len += p.length
+  }
+  const big = parts.join('')
+  const clock = 20000
+  const allowance = promptCharsForClock(clock)
+  // The provider cannot answer a prompt the row's clock cannot prefill: model it
+  // as a 5xx, which is exactly how the oversized chunk asks failed in production.
+  const oversized = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    const body = JSON.parse(String(init.body))
+    const prompt = String(body.messages?.at(-1)?.content || '')
+    if (prompt.length > allowance) { oversized.push(prompt.length); return new Response('request too large to prefill in budget', { status: 504 }) }
+    return response(prompt.startsWith('You summarize part') ? { evidence: 'a.ts has it.', summary: 'Adds ALPHA in the source files.' } : clean)
+  })
+  const e = row('1')
+  const n = await enrichWithLlm([e], async () => big, dir, env({
+    CHANGELOG_LLM_MAPREDUCE_THRESHOLD: '50000',
+    CHANGELOG_LLM_ROW_BUDGET_MS: String(clock)
+  }), { retryErrors: true })
+  assert.equal(oversized.length, 0, 'no chunk ask exceeds what the row clock can prefill')
+  assert.equal(n, 1, 'the oversized row is still summarized')
+  assert.ok(e.ai?.title && e.ai?.summary, 'and it ships a real summary rather than staying missing')
 })
 
 test('the row clock is per row: a bounded row does not spend another row\'s share', async (t) => {
