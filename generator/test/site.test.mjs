@@ -1289,6 +1289,9 @@ test('about page: the two-column grid holds complete pairs, badges sit full-widt
     const secs = (cols[1].match(/<div class="man-sec">/g) || []).length
     assert.equal(secs % 2, 0, 'the grid fills complete rows: no dangling half-column')
     assert.doesNotMatch(cols[1], /STATUS BADGES/, 'badges live outside the grid')
+    // The box follows the prose measure instead of the page column, so the
+    // text doesn't read shifted left with dead space on the right.
+    assert.match(about, /<section class="hero hero-about">/, 'the about box is scoped to the content measure')
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }

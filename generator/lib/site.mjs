@@ -4325,7 +4325,7 @@ const loadIndex = async () => {
 
   await write(dist, 'about/index.html', layout({
     title: 'About', path: '/about/',
-    body: `<section class="hero">
+    body: `<section class="hero hero-about">
   <div class="term-box">
     <div class="term-box-hdr">
       <span class="term-box-title">ABOUT :: Unofficial Freebuff Changelog</span>
