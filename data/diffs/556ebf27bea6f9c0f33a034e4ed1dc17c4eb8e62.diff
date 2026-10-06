@@ -1,0 +1,219 @@
+diff --git a/packages/agent-runtime/src/__tests__/model-compaction.test.ts b/packages/agent-runtime/src/__tests__/model-compaction.test.ts
+index 0ebb174ec..799501ece 100644
+--- a/packages/agent-runtime/src/__tests__/model-compaction.test.ts
++++ b/packages/agent-runtime/src/__tests__/model-compaction.test.ts
+@@ -1,38 +1,40 @@
+ import { expect, test } from 'bun:test'
+ import {
+   automaticCompactionIsWorthwhile,
+   compactedContextCeiling,
+   compactionOutputTokens,
+   compactionSummaryBudget,
+   compactWithModel,
+   compactWithModelOrFallback,
+   COMPACTION_TAG,
+   parseCompactionSummary,
+   SUMMARY_OVERRUN_TOLERANCE,
+ } from '../model-compaction'
+ import { promptSuccess } from '@codebuff/common/util/error'
++import { DEEPSEEK_FLASH_COMPACTION_POLICY } from '@codebuff/common/constants/compaction-policy'
++import { evaluateCompactionTrigger } from '../compact-history'
+ import { countTokens, countTokensMessages } from '../util/token-counter'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ import type { PromptAiSdkStreamFn } from '@codebuff/common/types/contracts/llm'
+ 
+ const user = (text: string): Message => ({
+   role: 'user',
+   tags: ['USER_PROMPT'],
+   content: [{ type: 'text', text }],
+ })
+ const messages: Message[] = [
+   user('Compare the time units in a.ts and b.ts.'),
+   {
+     role: 'assistant',
+     content: [
+       {
+         type: 'tool-call',
+         toolCallId: 'a',
+         toolName: 'read_files',
+         input: { paths: ['a.ts'] },
+       },
+     ],
+   },
+   {
+     role: 'tool',
+     toolName: 'read_files',
+@@ -387,50 +389,111 @@ test('compactWithModelOrFallback falls back to mechanical compaction on any summ
+       maxContextLength: 16_384,
+       fixedTokenCount: 500,
+       signal: new AbortController().signal,
+       stream,
+       logger: { ...noopLogger, warn: (data: unknown) => warnings.push(data) },
+     })
+     expect(result?.fallback).toBe(true)
+     expect(result!.postTokens).toBeLessThan(result!.preTokens)
+     // The live request survives the mechanical pass.
+     expect(JSON.stringify(result!.messages)).toContain(
+       'Compare the time units in a.ts and b.ts.',
+     )
+   }
+   expect(warnings).toHaveLength(failures.length)
+   expect(warnings.map((w) => (w as { error_kind: string }).error_kind)).toEqual(
+     ['invalid_summary', 'provider_error', 'provider_error'],
+   )
+   expect(warnings[0]).toMatchObject({
+     axiomEvent: 'model_compaction.fallback',
+     fallback_applied: true,
+     fallback_failed: false,
+   })
+   expect(messages).toEqual(before)
+ })
+ 
++test('a fallback on a resumed tool exchange consumes the old idle gap', async () => {
++  // A session ended after a tool result, then the user returned the next day.
++  // The fallback must preserve that pending exchange without reusing its idle
++  // gap when the next tool output crosses Flash's 40k compaction floor.
++  const now = Date.now()
++  const yesterday = now - 24 * 60 * 60 * 1000
++  const history: Message[] = messages.map((message) =>
++    message.role === 'tool' ? structuredClone(message) : { ...message, sentAt: yesterday },
++  )
++  history[2] = {
++    role: 'tool',
++    toolName: 'read_files',
++    toolCallId: 'a',
++    content: [{ type: 'json', value: [{ path: 'a.ts', content: 'old code\n'.repeat(30_000) }] }],
++  }
++  history.push({ ...user('Investigate the failed CI run.'), sentAt: now })
++  const original = structuredClone(history)
++  const fixedTokenCount = 15_000
++  const trigger = (messages: Message[], contextTokenCount = countTokensMessages(messages) + fixedTokenCount) =>
++    evaluateCompactionTrigger({
++      ...DEEPSEEK_FLASH_COMPACTION_POLICY,
++      messages,
++      contextTokenCount,
++      maxContextLength: 320_000,
++    }).trigger
++  expect(trigger(history)).toBe('cache_expiry')
++
++  const result = await compactWithModelOrFallback({
++    messages: history,
++    system: 'You are a coding agent.',
++    maxContextLength: 400_000,
++    fixedTokenCount,
++    fallbackTargetTokens: 272_000,
++    signal: new AbortController().signal,
++    stream: async function* () {
++      throw new Error('summarizer failed')
++    },
++    logger: noopLogger,
++  })
++  expect(result?.fallback).toBe(true)
++  expect(result!.postTokens).toBeLessThan(40_000)
++  expect(history).toEqual(original)
++  const withoutTimestamp = (messages: Message[]) => messages.map(({ sentAt, ...message }) => message)
++  expect(withoutTimestamp(result!.messages.slice(-3))).toEqual(withoutTimestamp(history.slice(-3)))
++
++  const resumedAt = Date.now()
++  const continued: Message[] = [
++    ...result!.messages,
++    { role: 'assistant', sentAt: resumedAt, content: [{ type: 'tool-call', toolName: 'run_terminal_command', toolCallId: 'next', input: { command: 'git status' } }] },
++    { role: 'tool', toolName: 'run_terminal_command', toolCallId: 'next', content: [{ type: 'json', value: { stdout: 'command output '.repeat(5_000) } }] },
++  ]
++  expect(countTokensMessages(continued) + fixedTokenCount).toBeGreaterThan(40_000)
++  expect(trigger(continued)).toBeNull()
++  // Context pressure still compacts, and a genuinely new idle gap still counts.
++  expect(trigger(continued, 320_001)).toBe('context_limit')
++  expect(trigger([
++    ...continued,
++    { ...user('Continue after another break.'), sentAt: resumedAt + 16 * 60 * 1000 },
++  ])).toBe('cache_expiry')
++})
++
+ test('compactWithModelOrFallback still propagates cancellation', async () => {
+   const controller = new AbortController()
+   await expect(
+     compactWithModelOrFallback({
+       messages,
+       system: 'You are a coding agent.',
+       maxContextLength: 16_384,
+       fixedTokenCount: 500,
+       signal: controller.signal,
+       logger: noopLogger,
+       stream: async function* () {
+         controller.abort()
+         yield { type: 'text', text: '' }
+         return promptSuccess(null)
+       },
+     }),
+   ).rejects.toThrow()
+ })
+ 
+ // Desktop BYOK, 2026-09-24..27: a connection on the untouched 32k default
+ // compacts at 80% of 90% of (32,768 - 4,096) = 20,643 tokens, and the Desktop
+ // agent's prompt and tool catalog alone are ~15-20k. The best any compaction
+ // can do there lands back near the threshold, so firing at it compacted every
+ // few tool calls, each pass summarizing the previous summary.
+ test('an automatic compaction that cannot clear its own threshold is not worthwhile', () => {
+diff --git a/packages/agent-runtime/src/compact-history.ts b/packages/agent-runtime/src/compact-history.ts
+index 3266c98dd..d06ccceb7 100644
+--- a/packages/agent-runtime/src/compact-history.ts
++++ b/packages/agent-runtime/src/compact-history.ts
+@@ -977,51 +977,56 @@ function compactRequestHistory(messages: Message[], tokenBudget: number) {
+     remainingTokens -
+     countTokensMessages([
+       buildSummaryMessage(renderSummaryText([...selected]), images, now),
+     ])
+   for (let i = entries.length - 1; i >= 0; i--) {
+     if (selected.has(entries[i])) continue
+     const tokens = countTokens(
+       entries[i].parts.join(ENTRY_SEPARATOR) + ENTRY_SEPARATOR,
+     )
+     if (tokens > available) continue
+     selected.add(entries[i])
+     available -= tokens
+   }
+   const kept = entries.filter((entry) => selected.has(entry))
+   let summary = buildSummaryMessage(renderSummaryText(kept), images, now)
+   while (kept.length && countTokensMessages([summary]) > remainingTokens) {
+     const removable = kept.findIndex((entry) => entry !== historicalRequest)
+     if (removable < 0) break
+     kept.splice(removable, 1)
+     summary = buildSummaryMessage(renderSummaryText(kept), images, now)
+   }
+   const summaryInstalled = countTokensMessages([summary]) <= remainingTokens
+   const output = [
+     ...(summaryInstalled ? [summary] : []),
+     ...prefix.map((message) => ({ ...message, sentAt: now })),
+-    ...fitted,
++    // On resume, the preserved exchange can include the old assistant and the
++    // new user prompt. Reset their idle gap too, or crossing the token floor
++    // after this pass triggers another cache-expiry compaction mid-work.
++    ...fitted.map((message) =>
++      message.sentAt === undefined ? message : { ...message, sentAt: now },
++    ),
+   ]
+   if (countTokensMessages(output) > tokenBudget) {
+     throw new Error(
+       'Unable to fit the latest tool results into the configured context window. Request smaller outputs or configure a larger supported context window.',
+     )
+   }
+   return {
+     ...result,
+     messages: output,
+     // What the installed summary message actually carries, after the budget
+     // walk — not the untrimmed text `compactMessages` produced.
+     summaryText: summaryInstalled ? renderSummaryText(kept) : '',
+     stats: {
+       ...result.stats,
+       mid_turn: fresh.length > 0,
+       live_user_prompt_found: livePrompts.length > 0,
+       summary_estimated_tokens: Math.ceil(
+         renderSummaryText(kept).length / CHARS_PER_TOKEN,
+       ),
+       budget_dropped_summary_parts: entries.length - kept.length,
+       preserved_fresh_messages: fitted.length,
+     },
+   }
+ }
+ 
