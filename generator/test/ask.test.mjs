@@ -210,6 +210,9 @@ test('ASK_INSTRUCTIONS: the contract the prompt promises is the one the gate enf
   assert.match(ASK_INSTRUCTIONS, /does not contain the answer/i, 'and says what to do when it does not know')
   assert.match(ASK_INSTRUCTIONS, /plain English/i, 'answers default to non-technical language')
   assert.match(ASK_INSTRUCTIONS, /no technical jargon/i, 'rather than leading with identifiers')
+  assert.match(ASK_INSTRUCTIONS, /zero code names/i, 'a "what does this do" question never names functions or files')
+  assert.match(ASK_INSTRUCTIONS, /what does this do/i)
+  assert.match(ASK_INSTRUCTIONS, /unless the user explicitly asks how it works or where it lives/i, 'a how/where follow-up still unlocks function and file names')
   assert.match(ASK_INSTRUCTIONS, /entry wording/i, 'meta questions about the entry text are answerable, not refused')
 })
 
