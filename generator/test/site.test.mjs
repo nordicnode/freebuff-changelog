@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildSite, modelTimeline, modelSlug, scoreHit, discordText, renderBadgeSvg, generateReleaseNotesMarkdown, entryCard } from '../lib/site.mjs'
+import { CSS } from '../lib/style.mjs'
 import { loadChangelog } from '../lib/changelog-store.mjs'
 import { escapeHtml, shortHash } from '../lib/util.mjs'
 import { feedItem, jsonItem } from '../lib/feed.mjs'
@@ -1264,6 +1265,15 @@ test('catch-up: rows carry data-date hooks and the toolbar has a [new] button', 
   } finally {
     await rm(tmpDist, { recursive: true, force: true })
   }
+})
+
+test('catch-up: the [new] chip, row accent and flash have real CSS', () => {
+  // Regression: the catch-up JS added .fresh-chip/.is-new/.catchup-flash
+  // hooks but the stylesheet never defined them, so new entries had no
+  // visual indicator at all.
+  assert.match(CSS, /\.fresh-chip\s*{[^}]*color:\s*var\(--term-amber\)/, 'the [new] chip is styled amber')
+  assert.match(CSS, /details\.entry\.is-new>summary/, 'new entries get a row-level accent')
+  assert.match(CSS, /@keyframes\s+catchup-flash/, 'the jump-to flash is animated')
 })
 
 test('effective significance: an AI-weighted notable entry is badged and sectioned as notable', async () => {

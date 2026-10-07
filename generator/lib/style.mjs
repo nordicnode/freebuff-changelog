@@ -560,6 +560,34 @@ nav.term-nav a.active{
 .badge.cat{
   color:var(--txt-subtle);
 }
+/* "New since your last visit": the JS adds an amber [new] chip to fresh
+   rows plus an is-new row accent, so new entries are visible without
+   hunting for the chip. catchup-flash fires when the [N new] button jumps
+   to the first unseen entry. */
+.fresh-chip{
+  display:inline-flex;
+  align-items:center;
+  min-height:20px;
+  font-size:var(--t-xs);
+  font-weight:700;
+  padding:1px 6px;
+  border-radius:2px;
+  color:var(--term-amber);
+  border:1px solid var(--amber-tint-border);
+  background:var(--amber-tint-bg);
+}
+details.entry.is-new>summary,
+details.minor-row.is-new>summary{
+  box-shadow:inset 3px 0 0 var(--term-amber);
+}
+@keyframes catchup-flash{
+  0%,100%{background-color:transparent;}
+  30%,70%{background-color:var(--amber-tint-bg);}
+}
+details.entry.catchup-flash,
+details.minor-row.catchup-flash{
+  animation:catchup-flash 1.6s ease;
+}
 /* In the action row now (not a hover-reveal in the summary), so it looks and
    behaves like the other meta links. */
 .permalink{
