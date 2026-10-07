@@ -249,6 +249,7 @@ test('ASK_INSTRUCTIONS: the contract the prompt promises is the one the gate enf
   assert.match(ASK_INSTRUCTIONS, /what does this do/i)
   assert.match(ASK_INSTRUCTIONS, /unless the user explicitly asks how it works or where it lives/i, 'a how/where follow-up still unlocks function and file names')
   assert.match(ASK_INSTRUCTIONS, /entry wording/i, 'meta questions about the entry text are answerable, not refused')
+  assert.match(ASK_INSTRUCTIONS, /never invent a motive/i, 'a why-question with no stated reason gets honesty, not speculation')
 })
 
 // --- /api/ask ------------------------------------------------------------------
@@ -414,6 +415,40 @@ test('worker /api/ask: an ungrounded answer is corrected once, then refused', as
   assert.equal(body.grounded, false)
   assert.deepEqual(body.ungrounded, ['`RETRY_BACKOFF_MS`', '[src/gateway/retry.ts:12]'])
   assert.equal(body.answer, undefined, 'the refused text is never returned to the reader')
+})
+
+test('worker /api/ask: a prose hallucination is corrected into an honest answer', async (t) => {
+  // The real 2026-10-07 failure: asked why a field was removed, the model
+  // answered with a generic essay from training data. The gate refuses the
+  // prose, the tailored correction points at the honest alternative, and the
+  // reader gets "the change does not say" instead of confident nonsense.
+  const ESSAY = 'The latest Claude Opus model I know about is Claude Opus 4.1, which was released in August 2025. Anthropic\'s Opus line has been their most capable model tier.'
+  const HONEST = 'The change does not say why the estimate was removed.'
+  let n = 0
+  let mode = 'corrects'
+  const seen = []
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    n++
+    seen.push(JSON.parse(init.body).messages[1].content)
+    return sse(mode === 'corrects' && n > 1 ? HONEST : ESSAY)
+  })
+  const ok = await ask(fakeEnv(assets(), { LLM_API_KEY: 'k' }), { q: 'Why was it removed?' })
+  assert.equal(ok.status, 200, 'the corrective re-ask produced an honest answer')
+  const body = await ok.json()
+  assert.equal(body.answer, HONEST)
+  assert.match(seen[1], /general knowledge/, 'the correction names the real failure, not "cited things"')
+
+  // A model that doubles down on the hallucination is refused as not based on
+  // the change, with a message a reader can understand.
+  resetAskStateForTests()
+  n = 0
+  mode = 'stubborn'
+  const stubborn = await ask(fakeEnv(assets(), { LLM_API_KEY: 'k' }), { q: 'Why was it removed?' })
+  assert.equal(stubborn.status, 422)
+  const sb = await stubborn.json()
+  assert.deepEqual(sb.ungrounded, ['prose not grounded in this change'])
+  assert.equal(sb.error, 'Refused: the answer was not based on this change.')
+  assert.equal(sb.answer, undefined, 'the refused text is never returned to the reader')
 })
 
 test('worker /api/ask: an identical question is answered once and then from cache', async (t) => {

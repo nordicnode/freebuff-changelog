@@ -940,10 +940,14 @@ document.addEventListener('submit', (ev) => {
         if (input) input.focus();
       } else if (r.status === 422) {
         // Refused by the grounding gate. Naming the claims is what makes the
-        // refusal actionable instead of looking like a broken feature.
+        // refusal actionable instead of looking like a broken feature. The
+        // server's message already describes a prose failure ("the answer was
+        // not based on this change"), so the claim list is only appended for
+        // code-claim failures.
         aEl.className = 'ask-a ask-refused';
-        aEl.textContent = 'Refused: that answer cited things this change does not contain'
-          + ((b.ungrounded && b.ungrounded.length) ? ' (' + b.ungrounded.join(', ') + ')' : '') + '. Ask differently?';
+        var claims = (b.ungrounded || []).filter(function (u) { return u !== 'prose not grounded in this change'; });
+        aEl.textContent = (b.error || 'Refused: that answer cited things this change does not contain')
+          + (claims.length ? ' (' + claims.join(', ') + ')' : '') + '. Ask differently?';
       } else if (r.status === 429) {
         aEl.className = 'ask-a ask-busy';
         aEl.textContent = 'Too many questions in the last minute. Try again in ' + (b.retryAfterSec || 60) + 's.';
