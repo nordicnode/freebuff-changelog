@@ -1,0 +1,334 @@
+diff --git a/common/src/constants/agents.ts b/common/src/constants/agents.ts
+index 0770fa169..82696e43a 100644
+--- a/common/src/constants/agents.ts
++++ b/common/src/constants/agents.ts
+@@ -75,25 +75,35 @@ export type AgentName =
+ 
+ // Get unique agent names for UI display
+ export const UNIQUE_AGENT_NAMES = Array.from(
+   new Set(
+     Object.values(AGENT_PERSONAS)
+       .filter((persona) => !('hidden' in persona) || !persona.hidden)
+       .map((persona) => persona.displayName),
+   ),
+ )
+ 
+ // Map from display name back to agent types (for parsing user input)
+ export const AGENT_NAME_TO_TYPES = Object.entries(AGENT_NAMES).reduce(
+   (acc, [type, name]) => {
+     if (!acc[name]) acc[name] = []
+     acc[name].push(type)
+     return acc
+   },
+   {} as Record<string, string[]>,
+ )
+ 
+ export const MAX_AGENT_STEPS_DEFAULT = 200
+ 
+ // Programmatic tool calls can persist additional rows without consuming the
+ // LLM-call budget, so keep the transport limit separate and safely bounded.
+ export const MAX_AGENT_STEP_ROWS = 1_000
++
++/**
++ * Sent by the SDK on every agent-registry GET to say it applies the publisher
++ * trust gate (`sdk/src/agent-publisher-trust.ts`) to what comes back. The
++ * registry serves an untrusted publisher's `handleSteps` only to a request
++ * carrying it: clients released before the gate `eval` that source with no
++ * check, and they cannot send a header they never knew about.
++ */
++export const AGENT_TRUST_GATE_HEADER = 'x-codebuff-agent-trust-gate'
++export const AGENT_TRUST_GATE_HEADER_VALUE = '1'
+diff --git a/docs/agents-and-tools.md b/docs/agents-and-tools.md
+index d3600374f..57daab94d 100644
+--- a/docs/agents-and-tools.md
++++ b/docs/agents-and-tools.md
+@@ -3,50 +3,60 @@
+ ## Agents
+ 
+ - Prompt/programmatic agents live in `.agents/` (programmatic agents use `handleSteps` generators).
+ - Generator functions are NOT sandboxed: the runtime `eval`s a `handleSteps` source string in the process that runs the agent (`packages/agent-runtime/src/run-programmatic-step.ts`); agent templates define tool access and subagents.
+ 
+ ### Registry agents with executable `handleSteps` require publisher trust
+ 
+ A template fetched from the public agent registry (`--agent publisher/agent`, a
+ registry id in a local agent's `spawnableAgents`, or a bare id falling back to
+ `codebuff/<id>`) is executable code when it carries `handleSteps`: the row's
+ `handleSteps` is a source string, validation only checks that it starts with
+ `function*`, and the runtime evals it with no isolation on the user's machine.
+ The registry GET is public, any account can create a publisher and publish
+ without review, and `latest` is unpinned. So the SDK's `fetchAgentFromDatabase`
+ refuses a registry template with a string `handleSteps` unless its publisher is
+ trusted (`sdk/src/agent-publisher-trust.ts`), and throws an
+ `UntrustedAgentPublisherError` whose message names `publisher/agent@version`
+ and the knob to set. Trusted publishers are `codebuff` (our own, also bundled)
+ plus the comma-separated `CODEBUFF_TRUSTED_AGENT_PUBLISHERS` env var plus the
+ `trustedAgentPublishers` option on `CodebuffClient` / `run()`. Data-only
+ registry templates (no `handleSteps`) load as before, and local `.agents` files
+ and SDK `agentDefinitions` are never gated — they are code the user already
+ chose to run. This is a trust floor, not isolation: sandboxing the eval,
+ signing templates and pinning `latest` are separate work.
+ 
++Clients released before this gate (`codebuff` and `@codebuff/sdk` on npm) eval
++whatever the registry returns, so the registry GET routes refuse (403) a
++non-`codebuff` template with `handleSteps` unless the request carries
++`AGENT_TRUST_GATE_HEADER` (`common/src/constants/agents.ts`), which only the
++gated SDK sends (`untrustedHandleStepsRefusal` in
++`web/src/app/api/agents/_registry-guard.ts`). The server cannot see the
++caller's trusted set, so the header defers that decision to the client.
++`mcpServers` from non-`codebuff` publishers are refused outright, at publish
++and at GET, whatever the client.
++
+ ### Trust gate for repository `.agents` directories
+ 
+ `loadLocalAgents` dynamically imports every `.ts`/`.tsx`/`.js`/`.mjs`/`.cjs`
+ file under `{cwd}/.agents` and `{cwd}/../.agents`, and `loadMCPConfigSync`
+ reads an `mcp.json` there whose stdio servers are spawned on the first prompt
+ with `$VAR` env values filled from the CLI's own environment. Both execute
+ repository-supplied code, so cloning a hostile repo and running the CLI inside
+ it must not run anything without consent. The CLI therefore gates those two
+ repository-scoped directories (`cli/src/utils/agent-dir-trust.ts`):
+ 
+ - **What needs trust**: a directory containing at least one executable agent
+   file (the loader's extension filter, minus `.d.ts` and tests) or an
+   `mcp.json`. A directory holding only `skills/` markdown does not, and
+   `~/.agents` never does (it is the user's own). Skills still load from an
+   untrusted directory; only agents and `mcp.json` are withheld.
+ - **The prompt**: on an interactive launch (stdin and stdout are TTYs) the CLI
+   prints a plain-terminal prompt before the TUI mounts, listing the directory,
+   its agent files (capped at 10) and the commands or URLs its `mcp.json` would
+   start, and asks `Load and run these? [y/N]`. `y` records the directory;
+   anything else skips it for this run and prints how to trust it later.
+ - **The store**: `<configDir>/trusted-agent-dirs.json` (next to
+   `credentials.json`, written with mode `0600`), a map of the normalized
+   absolute directory path to `{ "trustedAt": "<ISO>" }`. Delete an entry to
+   be asked again.
+ - **Non-interactive runs** (no TTY, CI) never prompt: the directory is skipped
+diff --git a/sdk/src/impl/__tests__/fetch-agent-publisher-trust.test.ts b/sdk/src/impl/__tests__/fetch-agent-publisher-trust.test.ts
+index 511291dcc..f5966b36f 100644
+--- a/sdk/src/impl/__tests__/fetch-agent-publisher-trust.test.ts
++++ b/sdk/src/impl/__tests__/fetch-agent-publisher-trust.test.ts
+@@ -1,69 +1,73 @@
++import {
++  AGENT_TRUST_GATE_HEADER,
++  AGENT_TRUST_GATE_HEADER_VALUE,
++} from '@codebuff/common/constants/agents'
+ import { afterEach, describe, expect, mock, test } from 'bun:test'
+ 
+ import {
+   TRUSTED_AGENT_PUBLISHERS_ENV_VAR,
+   UntrustedAgentPublisherError,
+   parseTrustedAgentPublishers,
+   resolveTrustedAgentPublishers,
+ } from '../../agent-publisher-trust'
+ import { getAgentRuntimeImpl } from '../agent-runtime'
+ import { fetchAgentFromDatabase } from '../database'
+ 
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ 
+ /**
+  * A registry template's handleSteps is a SOURCE STRING that the runtime evals
+  * in this process, so a template from an untrusted publisher must never be
+  * handed back to the caller. Data-only templates are not code and load as
+  * before.
+  */
+ 
+ const EXECUTABLE_HANDLE_STEPS =
+   "function* () { yield { toolName: 'run_terminal_command', input: { command: 'echo pwned' } } }"
+ 
+ const makeRegistryTemplate = (overrides: Record<string, unknown> = {}) => ({
+   id: 'deployer',
+   displayName: 'Deployer',
+   model: 'anthropic/claude-sonnet-4',
+   systemPrompt: 'You deploy things.',
+   instructionsPrompt: '',
+   stepPrompt: '',
+   ...overrides,
+ })
+ 
+ const createLogger = (): Logger =>
+   ({
+     debug: mock(() => {}),
+     info: mock(() => {}),
+     warn: mock(() => {}),
+     error: mock(() => {}),
+   }) as unknown as Logger
+ 
+ /** Serves one registry row from GET /api/v1/agents/:publisher/:agent/:version */
+ const serveRegistry = (version: string, data: Record<string, unknown>) => {
+-  const fetchMock = mock(async (input: RequestInfo | URL) => {
++  const fetchMock = mock(async (input: RequestInfo | URL, _init?: RequestInit) => {
+     const url = new URL(
+       input instanceof URL
+         ? input.toString()
+         : input instanceof Request
+           ? input.url
+           : String(input),
+     )
+     expect(url.pathname).toMatch(/^\/api\/v1\/agents\//)
+     return new Response(JSON.stringify({ version, data }), { status: 200 })
+   })
+   globalThis.fetch = fetchMock as unknown as typeof fetch
+   return fetchMock
+ }
+ 
+ describe('fetchAgentFromDatabase publisher trust', () => {
+   const originalFetch = globalThis.fetch
+   const originalEnvValue = process.env[TRUSTED_AGENT_PUBLISHERS_ENV_VAR]
+ 
+   afterEach(() => {
+     globalThis.fetch = originalFetch
+     if (originalEnvValue === undefined) {
+       delete process.env[TRUSTED_AGENT_PUBLISHERS_ENV_VAR]
+     } else {
+       process.env[TRUSTED_AGENT_PUBLISHERS_ENV_VAR] = originalEnvValue
+     }
+@@ -111,50 +115,59 @@ describe('fetchAgentFromDatabase publisher trust', () => {
+     )
+     expect(error.message).toContain("trustedAgentPublishers: ['acme']")
+ 
+     // and it is loud in the log, naming the agent, not swallowed as "not found"
+     const errorCalls = (logger.error as ReturnType<typeof mock>).mock.calls
+     expect(errorCalls.length).toBe(1)
+     expect(JSON.stringify(errorCalls[0])).toContain('acme/deployer@1.2.0')
+     expect(JSON.stringify(errorCalls[0])).toContain('untrusted publisher')
+   })
+ 
+   test('the refusal names the RESOLVED version when the caller asked for latest', async () => {
+     serveRegistry(
+       '3.0.1',
+       makeRegistryTemplate({ handleSteps: EXECUTABLE_HANDLE_STEPS }),
+     )
+ 
+     const attempt = fetchAgentFromDatabase({
+       apiKey: 'test-api-key',
+       parsedAgentId: { publisherId: 'acme', agentId: 'deployer' },
+       logger: createLogger(),
+       readTrustedAgentPublishersEnv: () => undefined,
+     })
+     await expect(attempt).rejects.toThrow('acme/deployer@3.0.1')
+   })
+ 
++  test('tells the registry it applies the trust gate, so untrusted handleSteps reach this check', async () => {
++    const fetchMock = serveRegistry('1.2.0', makeRegistryTemplate())
++    await fetchAs('acme')
++    const init = fetchMock.mock.calls[0]![1]
++    expect(new Headers(init?.headers).get(AGENT_TRUST_GATE_HEADER)).toBe(
++      AGENT_TRUST_GATE_HEADER_VALUE,
++    )
++  })
++
+   test('untrusted publisher + data-only template (no handleSteps) loads', async () => {
+     serveRegistry('1.2.0', makeRegistryTemplate())
+ 
+     const template = await fetchAs('acme')
+     expect(template).not.toBeNull()
+     expect(template!.id).toBe('acme/deployer@1.2.0')
+     expect(template!.handleSteps).toBeUndefined()
+   })
+ 
+   test('untrusted publisher + mcpServers is refused: a stdio server spawns its command here', async () => {
+     serveRegistry(
+       '1.2.0',
+       makeRegistryTemplate({
+         mcpServers: {
+           helper: { type: 'stdio', command: 'sh', args: ['-c', 'echo pwned'] },
+         },
+       }),
+     )
+     await expect(fetchAs('acme')).rejects.toBeInstanceOf(
+       UntrustedAgentPublisherError,
+     )
+ 
+     serveRegistry(
+       '1.2.0',
+       makeRegistryTemplate({
+diff --git a/sdk/src/impl/database.ts b/sdk/src/impl/database.ts
+index aa8a43750..610596ca3 100644
+--- a/sdk/src/impl/database.ts
++++ b/sdk/src/impl/database.ts
+@@ -1,26 +1,30 @@
+-import { MAX_AGENT_STEP_ROWS } from '@codebuff/common/constants/agents'
++import {
++  AGENT_TRUST_GATE_HEADER,
++  AGENT_TRUST_GATE_HEADER_VALUE,
++  MAX_AGENT_STEP_ROWS,
++} from '@codebuff/common/constants/agents'
+ import { FREEBUFF_ACTING_USER_HEADER } from '@codebuff/common/constants/freebuff-models'
+ import { validateSingleAgent } from '@codebuff/common/templates/agent-validation'
+ import { DynamicAgentTemplateSchema } from '@codebuff/common/types/dynamic-agent-template'
+ import { getErrorObject } from '@codebuff/common/util/error'
+ import { truncateString } from '@codebuff/common/util/string'
+ import z from 'zod/v4'
+ 
+ import {
+   checkRemoteAgentTemplateTrust,
+   isUntrustedAgentPublisherError,
+   resolveTrustedAgentPublishers,
+ } from '../agent-publisher-trust'
+ import { getWebsiteUrl } from '../constants'
+ import { getTrustedAgentPublishersFromEnv } from '../env'
+ import {
+   createAuthError,
+   createNetworkError,
+   createServerError,
+   createHttpError,
+   isRetryableStatusCode,
+ } from '../error-utils'
+ import {
+   MAX_RETRIES_PER_MESSAGE,
+   RETRY_BACKOFF_BASE_DELAY_MS,
+   RETRY_BACKOFF_MAX_DELAY_MS,
+@@ -278,50 +282,53 @@ export async function fetchAgentFromDatabase(
+   // Each segment is held to the shape the registry assigns.
+   if (
+     !PUBLISHED_ID_SEGMENT.test(publisherId) ||
+     !PUBLISHED_ID_SEGMENT.test(agentId) ||
+     !PUBLISHED_VERSION.test(requestedVersion)
+   ) {
+     logger.error(
+       { publisherId, agentId, version },
+       'fetchAgentFromDatabase: refused malformed published agent id',
+     )
+     return null
+   }
+ 
+   const url = new URL(
+     `/api/v1/agents/${publisherId}/${agentId}/${requestedVersion}`,
+     getWebsiteUrl(),
+   )
+ 
+   try {
+     const response = await fetchWithRetry(
+       url,
+       {
+         method: 'GET',
+         headers: {
+           Authorization: `Bearer ${apiKey}`,
++          // the registry withholds untrusted handleSteps without it; this
++          // function keeps that promise with the trust check below
++          [AGENT_TRUST_GATE_HEADER]: AGENT_TRUST_GATE_HEADER_VALUE,
+         },
+       },
+       logger,
+     )
+ 
+     if (!response.ok) {
+       logger.error({ response }, 'fetchAgentFromDatabase request failed')
+       return null
+     }
+ 
+     const responseJson = await response.json()
+     const parseResult = agentsResponseSchema.safeParse(responseJson)
+     if (!parseResult.success) {
+       logger.error(
+         { responseJson, parseResult },
+         `fetchAgentFromDatabase parse error`,
+       )
+       return null
+     }
+ 
+     const agentConfig = parseResult.data
+     const rawAgentData = agentConfig.data as DynamicAgentTemplate
+ 
+     // Validate the raw agent data with the original agentId (not full identifier)
+     const validationResult = validateSingleAgent({
