@@ -1,0 +1,1751 @@
+Date: 2026-10-07T00:03:28Z
+Category: CLI
+Areas: CLI
+Commit nature: production
+Stats: +271 / -74
+Analysis notes: CLI changes across 2 file(s) (+271/−74).
+Modified files: cli/src/hooks/helpers/send-message.ts, cli/src/utils/error-handling.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Appended to the server's refund message: retrying the same model may only fail again, so name the way out. - "let's start fresh".
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Exports added: FreebuffSupersededReason, getFreebuffSupersededReason, FREEBUFF_REFUNDED_START_HINT
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "session_superseded and model_at_capacity (real server shapes)" ; "a refunded start shows the server message, suggests /model, and ends the session" ; "an hour closed before the request started relays the server message and ends the session" ; "a real takeover keeps the takeover message and terminal state" ; "a 503 model_at_capacity is shown as-is and leaves the session alone" ; "an in-band model_at_capacity chunk is shown as-is and leaves the session alone" ; "getFreebuffSupersededReason" ; "a refunded start (chat/completions, beginDesktopStart refunded)" ; "an hour that closed before the request (RefundAdmissionClosedError)" ; "a takeover, and any message naming neither, stays a takeover" ; "model_at_capacity is not a session gate" ; "neither the 503 nor the in-band shape classifies as a gate code" ; "a 503 capacity refusal is not mistaken for a rate limit or provider billing"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `cli/src/hooks/helpers/send-message.ts`:
+```
+/** Resets queue state on early return (before streaming starts). */
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `cli/README.md`:
+```markdown
+# @codebuff/cli
+
+A Terminal User Interface (TUI) package built with OpenTUI and React.
+
+## Installation
+
+```bash
+bun install
+```
+
+## Development
+
+Run the TUI in development mode:
+
+```bash
+bun run dev
+```
+
+## Testing
+
+Run the test suite:
+
+```bash
+bun test
+```
+
+### Interactive E2E Testing
+
+For testing interactive CLI features, install tmux:
+
+```bash
+# macOS
+brew install tmux
+
+# Ubuntu/Debian
+sudo apt-get install tmux
+
+# Windows (via WSL)
+wsl --install
+sudo apt-get install tmux
+```
+
+Then run the proof-of-concept:
+
+```bash
+bun run test:tmux-poc
+```
+
+[freebuff product prompt text omitted]
+
+```bash
+# ❌ Broken: tmux send-keys -t session "hello"
+# ✅ Works:  tmux send-keys -t session $'\e[200~hello\e[201~'
+```
+
+See [tmux.knowledge.md](tmux.knowledge.md) for comprehensive tmux documentation and [src/__tests__/README.md](src/__tests__/README.md) for testing documentation.
+
+## Build
+
+Build the package:
+
+```bash
+bun run build
+```
+
+## Run
+
+Run the built TUI:
+
+```bash
+bun run start
+```
+
+Or use the binary directly:
+
+```bash
+codebuff-tui
+```
+
+## Features
+```
+Complete Source of Modified Files (for complete module context):
+- File `cli/src/hooks/helpers/send-message.ts` (680 lines):
+```
+import { FREEBUFF_PROVIDER_USAGE_MESSAGE } from '@codebuff/common/constants/freebuff-errors'
+import { getErrorObject } from '@codebuff/common/util/error'
+
+import {
+  markFreebuffSessionCountryBlocked,
+  markFreebuffSessionEnded,
+  markFreebuffSessionSuperseded,
+  refreshFreebuffSession,
+} from '../use-freebuff-session'
+import { noteAdTurnFailure } from '../../ads/ad-signals'
+import { getProjectRoot } from '../../project-files'
+import { useChatStore } from '../../state/chat-store'
+import { IS_FREEBUFF } from '../../utils/constants'
+import { processBashContext } from '../../utils/bash-context-processor'
+import { markRunningAgentsAsCancelled } from '../../utils/block-operations'
+import {
+  getCountryBlockFromFreeModeError,
+  getFreeModeUnavailableErrorMessage,
+  getFreebuffGateErrorKind,
+  getFreebuffRateLimitErrorMessage,
+  getFreebuffSupersededReason,
+  isOutOfCreditsError,
+  isFreebuffProviderUsageError,
+  isFreeModeUnavailableError,
+  FREEBUFF_MODEL_UNAVAILABLE_MESSAGE,
+  FREEBUFF_REFUNDED_START_HINT,
+  OUT_OF_CREDITS_MESSAGE,
+} from '../../utils/error-handling'
+import { formatElapsedTime } from '../../utils/format-elapsed-time'
+import { processImagesForMessage } from '../../utils/image-processor'
+import { logger } from '../../utils/logger'
+import { appendInterruptionNotice } from '../../utils/message-block-helpers'
+import { getUserMessage } from '../../utils/message-history'
+import {
+  createBatchedMessageUpdater,
+  type BatchedMessageUpdater,
+} from '../../utils/message-updater'
+import { createModeDividerMessage } from '../../utils/send-message-helpers'
+import { yieldToEventLoop } from '../../utils/yield-to-event-loop'
+import { invalidateActivityQuery } from '../use-activity-query'
+import { usageQueryKeys } from '../use-usage-query'
+
+import type {
+  PendingAttachment,
+  PendingFileAttachment,
+  PendingImageAttachment,
+  PendingTextAttachment,
+} from '../../types/store'
+import type { ChatMessage } from '../../types/chat'
+import type { AgentMode } from '../../utils/constants'
+import type { FreebuffGateErrorKind } from '../../utils/error-handling'
+import type { SendMessageTimerController } from '../../utils/send-message-timer'
+import type { StreamController } from '../stream-state'
+import type { StreamStatus } from '../use-message-queue'
+import type { MessageContent, RunState } from '@codebuff/sdk'
+import type { MutableRefObject, SetStateAction } from 'react'
+
+/** Resets queue state on early return (before streaming starts). */
+export type ResetEarlyReturnStateParams = {
+  setCanProcessQueue: (can: boolean) => void
+  updateChainInProgress: (value: boolean) => void
+  isProcessingQueueRef?: MutableRefObject<boolean>
+  isQueuePausedRef?: MutableRefObject<boolean>
+}
+
+export const resetEarlyReturnState = (
+  params: ResetEarlyReturnStateParams,
+): void => {
+  const {
+    setCanProcessQueue,
+    updateChainInProgress,
+    isProcessingQueueRef,
+    isQueuePausedRef,
+  } = params
+
+  updateChainInProgress(false)
+  setCanProcessQueue(!isQueuePausedRef?.current)
+  if (isProcessingQueueRef) {
+    isProcessingQueueRef.current = false
+  }
+}
+
+/** Resets queue state after streaming completes, aborts, or errors. */
+export type FinalizeQueueStateParams = {
+  setStreamStatus: (status: StreamStatus) => void
+  setCanProcessQueue: (can: boolean) => void
+  updateChainInProgress: (value: boolean) => void
+  isProcessingQueueRef?: MutableRefObject<boolean>
+  isQueuePausedRef?: MutableRefObject<boolean>
+  resumeQueue?: () => void
+}
+
+export const finalizeQueueState = (params: FinalizeQueueStateParams): void => {
+  const {
+    setStreamStatus,
+    setCanProcessQueue,
+    updateChainInProgress,
+    isProcessingQueueRef,
+    isQueuePausedRef,
+    resumeQueue,
+  } = params
+
+  setStreamStatus('idle')
+  // Release lock here as part of normal completion flow.
+  // Also released in finally block and .catch() as safety nets (idempotent).
+  if (isProcessingQueueRef) {
+    isProcessingQueueRef.current = false
+  }
+  if (resumeQueue) {
+    resumeQueue()
+  } else {
+    setCanProcessQueue(!isQueuePausedRef?.current)
+  }
+  updateChainInProgress(false)
+}
+
+const DEFAULT_RUN_OUTPUT_ERROR_MESSAGE = 'No output from agent run'
+
+export type PrepareUserMessageDeps = {
+  setMessages: (update: SetStateAction<ChatMessage[]>) => void
+  lastMessageMode: AgentMode | null
+  setLastMessageMode: (mode: AgentMode | null) => void
+  scrollToLatest: () => void
+  setHasReceivedPlanResponse: (value: boolean) => void
+}
+
+export const prepareUserMessage = async (params: {
+  content: string
+  agentMode: AgentMode
+  postUserMessage?: (prev: ChatMessage[]) => ChatMessage[]
+  attachments?: PendingAttachment[]
+  signal?: AbortSignal
+  deps: PrepareUserMessageDeps
+}): Promise<{
+  userMessageId: string
+  messageContent: MessageContent[] | undefined
+  bashContextForPrompt: string
+  finalContent: string
+}> => {
+  const { content, agentMode, postUserMessage, attachments, signal, deps } =
+    params
+  const { setMessages, lastMessageMode, setLastMessageMode, scrollToLatest } =
+    deps
+
+  const { pendingBashMessages, clearPendingBashMessages } =
+    useChatStore.getState()
+  const { bashMessages, bashContextForPrompt } =
+    processBashContext(pendingBashMessages)
+
+  if (bashMessages.length > 0) {
+    setMessages((prev) => [...prev, ...bashMessages])
+  }
+  clearPendingBashMessages()
+
+  // Split attachments by kind
+  const allAttachments =
+    attachments ?? useChatStore.getState().pendingAttachments
+  if (!attachments && allAttachments.length > 0) {
+    useChatStore.getState().clearPendingAttachments()
+  }
+
+  const pendingImages = allAttachments.filter(
+    (a): a is PendingImageAttachment => a.kind === 'image',
+  )
+  const pendingTextAttachments = allAttachments.filter(
+    (a): a is PendingTextAttachment => a.kind === 'text',
+  )
+
+  const pendingFileAttachments = allAttachments.filter(
+    (a): a is PendingFileAttachment => a.kind === 'file',
+  )
+
+  // Append text attachments to the content
+  let finalContent = content
+  if (pendingTextAttachments.length > 0) {
+    const textAttachmentContent = pendingTextAttachments
+      .map((att) => `[Pasted Text]\n${att.content}`)
+      .join('\n\n')
+    finalContent = content
+      ? `${content}\n\n${textAttachmentContent}`
+      : textAttachmentContent
+  }
+
+  // Append file/folder attachments to the content
+  if (pendingFileAttachments.length > 0) {
+    const fileAttachmentContent = pendingFileAttachments
+      .filter((att) => att.status === 'ready')
+      .map((att) =>
+        att.isDirectory
+          ? `[Directory: ${att.path}]\n${att.content}`
+          : `[File: ${att.path}]\n${att.content}`,
+      )
+      .join('\n\n')
+    if (fileAttachmentContent) {
+      finalContent = finalContent
+        ? `${finalContent}\n\n${fileAttachmentContent}`
+        : fileAttachmentContent
+    }
+  }
+
+  const { attachments: imageAttachments, messageContent } =
+    await processImagesForMessage({
+      content: finalContent,
+      pendingImages,
+      projectRoot: getProjectRoot(),
+    })
+
+  // A chat switch can happen while image processing is awaiting filesystem
+  // work. Do not append the old prompt after the destination chat has reset.
+  if (signal?.aborted) {
+    throw new Error('Message preparation aborted')
+  }
+
+  const shouldInsertDivider =
+    lastMessageMode === null || lastMessageMode !== agentMode
+
+  // Convert pending text attachments to stored text attachments for display
+  const textAttachmentsForMessage = pendingTextAttachments.map((att) => ({
+    id: att.id,
+    content: att.content,
+    preview: att.preview,
+    charCount: att.charCount,
+  }))
+
+  // Convert pending file attachments to stored file attachments for display
+  const fileAttachmentsForMessage = pendingFileAttachments
+    .filter((att) => att.status === 'ready')
+    .map((att) => ({
+      path: att.path,
+      filename: att.filename,
+      isDirectory: att.isDirectory,
+      note: att.note,
+    }))
+
+  // Pass original content (not finalContent) for display, but finalContent goes to agent
+  const userMessage = getUserMessage(
+    content,
+    imageAttachments,
+    textAttachmentsForMessage,
+    fileAttachmentsForMessage,
+  )
+  const userMessageId = userMessage.id
+  if (imageAttachments.length > 0) {
+    userMessage.attachments = imageAttachments
+  }
+
+  setMessages((prev) => {
+    let next = [...prev]
+    if (shouldInsertDivider) {
+      next.push(createModeDividerMessage(agentMode))
+    }
+    next.push(userMessage)
+    if (postUserMessage) {
+      next = postUserMessage(next)
+    }
+    // Keep the full transcript: this array is what saveChatState persists to
+    // chat-messages.json, so trimming here would permanently lose history.
+    // Rendering stays cheap because useChatMessages paginates what's shown.
+    return next
+  })
+
+  setLastMessageMode(agentMode)
+  await yieldToEventLoop()
+  setTimeout(() => scrollToLatest(), 0)
+
+  return {
+    userMessageId,
+    messageContent,
+    bashContextForPrompt,
+    finalContent,
+  }
+}
+
+export const setupStreamingContext = (params: {
+  aiMessageId: string
+  timerController: SendMessageTimerController
+  setMessages: (updater: (messages: ChatMessage[]) => ChatMessage[]) => void
+  streamRefs: StreamController
+  abortController?: AbortController
+  setStreamStatus: (status: StreamStatus) => void
+  setCanProcessQueue: (can: boolean) => void
+  isQueuePausedRef?: MutableRefObject<boolean>
+  isProcessingQueueRef?: MutableRefObject<boolean>
+  updateChainInProgress: (value: boolean) => void
+  setIsRetrying: (value: boolean) => void
+  setStreamingAgents: (updater: (prev: Set<string>) => Set<string>) => void
+}) => {
+  const {
+    timerController,
+    setMessages,
+    streamRefs,
+    setStreamStatus,
+    setCanProcessQueue,
+    isQueuePausedRef,
+    isProcessingQueueRef,
+    updateChainInProgress,
+    setIsRetrying,
+    setStreamingAgents,
+  } = params
+  const { aiMessageId } = params
+
+  streamRefs.reset()
+  timerController.start(aiMessageId)
+  const updater = createBatchedMessageUpdater(aiMessageId, setMessages)
+  // Clear any previous UI-only error on this message when starting a new run
+  updater.clearUserError()
+  const hasReceivedContentRef = { current: false }
+  const abortController = params.abortController ?? new AbortController()
+
+  abortController.signal.addEventListener('abort', () => {
+    // Abort means the user stopped streaming; update UI with an interruption notice.
+    // Release the chain lock immediately so new messages can be sent directly instead
+    // of being queued.
+    streamRefs.setters.setWasAbortedByUser(true)
+    setIsRetrying(false)
+    timerController.stop('aborted')
+
+    // Update stream status so the UI reflects cancellation visually
+    setStreamStatus('idle')
+
+    // Clear streaming agents so cancelled status displays correctly in UI
+    setStreamingAgents(() => new Set())
+
+    // Release chain lock and queue state so new messages are sent directly
+    updateChainInProgress(false)
+    setCanProcessQueue(!isQueuePausedRef?.current)
+    if (isProcessingQueueRef) {
+      isProcessingQueueRef.current = false
+    }
+
+    updater.updateAiMessageBlocks((blocks) => {
+      const cancelledBlocks = markRunningAgentsAsCancelled(blocks)
+      return appendInterruptionNotice(cancelledBlocks)
+    })
+    updater.markComplete()
+  })
+
+  return { updater, hasReceivedContentRef, abortController }
+}
+
+export const handleRunCompletion = (params: {
+  runState: RunState
+  actualCredits: number | undefined
+  agentMode: AgentMode
+  timerController: SendMessageTimerController
+  updater: BatchedMessageUpdater
+  aiMessageId: string
+  wasAbortedByUser: boolean
+  /** Immutable inference source captured when this run started. */
+  isByokRun?: boolean
+  /** Whether the run streamed any content before finishing. A freebuff gate
+   *  rejection with no content means the prompt was consumed unprocessed —
+   *  surfaced as an inline error instead of silently looking sent. */
+  hasReceivedContent?: boolean
+  setStreamStatus: (status: StreamStatus) => void
+  setCanProcessQueue: (can: boolean) => void
+  updateChainInProgress: (value: boolean) => void
+  setHasReceivedPlanResponse: (value: boolean) => void
+  resumeQueue?: () => void
+  isProcessingQueueRef?: MutableRefObject<boolean>
+  isQueuePausedRef?: MutableRefObject<boolean>
+}) => {
+  const {
+    runState,
+    actualCredits,
+    agentMode,
+    timerController,
+    updater,
+    wasAbortedByUser,
+    isByokRun = false,
+    setStreamStatus,
+    setCanProcessQueue,
+    updateChainInProgress,
+    setHasReceivedPlanResponse,
+    resumeQueue,
+    isProcessingQueueRef,
+    isQueuePausedRef,
+  } = params
+
+  // If user aborted, the abort handler already handled UI updates and released the
+  // chain lock. Don't finalize queue state again to avoid interfering with any new
+  // run that may have started after the abort. Uses per-run abort signal (not shared
+  // streamRefs) so a newer run's reset() can't clear this flag.
+  if (wasAbortedByUser) {
+    return
+  }
+
+  const output = runState.output
+  const finalizeAfterError = () => {
+    finalizeQueueState({
+      setStreamStatus,
+      setCanProcessQueue,
+      updateChainInProgress,
+      isProcessingQueueRef,
+      isQueuePausedRef,
+    })
+    timerController.stop('error')
+  }
+
+  if (!output) {
+    if (!wasAbortedByUser) {
+      updater.setError(DEFAULT_RUN_OUTPUT_ERROR_MESSAGE)
+      finalizeAfterError()
+    }
+    return
+  }
+
+  if (output.type === 'error') {
+    // COD-757: the failure's class and time only, never its text.
+    noteAdTurnFailure(output.message)
+    if (IS_FREEBUFF && !isByokRun && isFreebuffProviderUsageError(output)) {
+      updater.setError(FREEBUFF_PROVIDER_USAGE_MESSAGE)
+      finalizeAfterError()
+      return
+    }
+
+    if (!isByokRun && isOutOfCreditsError(output)) {
+      updater.setError(OUT_OF_CREDITS_MESSAGE)
+      useChatStore.getState().setInputMode('outOfCredits')
+      invalidateActivityQuery(usageQueryKeys.current())
+      finalizeAfterError()
+      return
+    }
+
+    if (!isByokRun && isFreeModeUnavailableError(output)) {
+      updater.setError(getFreeModeUnavailableErrorMessage(output))
+      if (IS_FREEBUFF) {
+        markFreebuffSessionCountryBlocked(
+          getCountryBlockFromFreeModeError(output) ?? {
+            countryCode: 'UNKNOWN',
+          },
+        )
+      }
+      finalizeAfterError()
+      return
+    }
+
+    const gateKind = getFreebuffGateErrorKind(output)
+    if (!isByokRun && gateKind) {
+      handleFreebuffGateError(gateKind, updater, {
+        messageWasDropped: params.hasReceivedContent === false,
+        serverMessage: output.message,
+      })
+      finalizeAfterError()
+      return
+    }
+
+    const freebuffRateLimitMessage = IS_FREEBUFF && !isByokRun
+      ? getFreebuffRateLimitErrorMessage(output)
+      : null
+    if (freebuffRateLimitMessage) {
+      updater.setError(freebuffRateLimitMessage)
+      finalizeAfterError()
+      return
+    }
+
+    // Pass the raw error message to setError (displayed in UserErrorBanner without additional wrapper formatting)
+    updater.setError(output.message ?? DEFAULT_RUN_OUTPUT_ERROR_MESSAGE)
+
+    finalizeAfterError()
+    return
+  }
+
+  invalidateActivityQuery(usageQueryKeys.current())
+
+  finalizeQueueState({
+    setStreamStatus,
+    setCanProcessQueue,
+    updateChainInProgress,
+    isProcessingQueueRef,
+    isQueuePausedRef,
+    resumeQueue,
+  })
+  const timerResult = timerController.stop('success')
+
+  if (agentMode === 'PLAN') {
+    setHasReceivedPlanResponse(true)
+  }
+
+  const elapsedMs = timerResult?.elapsedMs ?? 0
+  const elapsedSeconds = Math.floor(elapsedMs / 1000)
+  let completionTime: string | undefined
+  if (elapsedSeconds > 0) {
+    completionTime = formatElapsedTime(elapsedSeconds)
+  }
+
+  updater.markComplete({
+    ...(completionTime && { completionTime }),
+    ...(actualCredits !== undefined && { credits: actualCredits }),
+    metadata: {
+      runState,
+    },
+  })
+}
+
+export const handleRunError = (params: {
+  error: unknown
+  timerController: SendMessageTimerController
+  updater: BatchedMessageUpdater
+  setIsRetrying: (value: boolean) => void
+  setStreamStatus: (status: StreamStatus) => void
+  setCanProcessQueue: (can: boolean) => void
+  updateChainInProgress: (value: boolean) => void
+  isProcessingQueueRef?: MutableRefObject<boolean>
+  isQueuePausedRef?: MutableRefObject<boolean>
+  /** See handleRunCompletion — flags an unprocessed prompt on gate errors. */
+  hasReceivedContent?: boolean
+  /** Immutable inference source captured when this run started. */
+  isByokRun?: boolean
+}) => {
+  const {
+    error,
+    timerController,
+    updater,
+    setIsRetrying,
+    setStreamStatus,
+    setCanProcessQueue,
+    updateChainInProgress,
+    isProcessingQueueRef,
+    isQueuePausedRef,
+    hasReceivedContent,
+    isByokRun = false,
+  } = params
+
+  const errorInfo = getErrorObject(error, { includeRawError: true })
+
+  logger.error({ error: errorInfo }, 'SDK client.run() failed')
+  // COD-757: the failure's class and time only, never its text.
+  noteAdTurnFailure(
+    typeof errorInfo?.message === 'string' ? errorInfo.message : undefined,
+  )
+  setIsRetrying(false)
+  finalizeQueueState({
+    setStreamStatus,
+    setCanProcessQueue,
+    updateChainInProgress,
+    isProcessingQueueRef,
+    isQueuePausedRef,
+  })
+  timerController.stop('error')
+
+  if (IS_FREEBUFF && !isByokRun && isFreebuffProviderUsageError(error)) {
+    updater.setError(FREEBUFF_PROVIDER_USAGE_MESSAGE)
+    return
+  }
+
+  if (!isByokRun && isOutOfCreditsError(error)) {
+    updater.setError(OUT_OF_CREDITS_MESSAGE)
+    useChatStore.getState().setInputMode('outOfCredits')
+    invalidateActivityQuery(usageQueryKeys.current())
+    return
+  }
+
+  if (!isByokRun && isFreeModeUnavailableError(error)) {
+    updater.setError(getFreeModeUnavailableErrorMessage(error))
+    if (IS_FREEBUFF) {
+      markFreebuffSessionCountryBlocked(
+        getCountryBlockFromFreeModeError(error) ?? {
+          countryCode: 'UNKNOWN',
+        },
+      )
+    }
+    return
+  }
+
+  const gateKind = getFreebuffGateErrorKind(error)
+  if (!isByokRun && gateKind) {
+    handleFreebuffGateError(gateKind, updater, {
+      messageWasDropped: hasReceivedContent === false,
+      serverMessage: errorInfo.message,
+    })
+    return
+  }
+
+  const freebuffRateLimitMessage = IS_FREEBUFF && !isByokRun
+    ? getFreebuffRateLimitErrorMessage(error)
+    : null
+  if (freebuffRateLimitMessage) {
+    updater.setError(freebuffRateLimitMessage)
+    return
+  }
+
+  // Use setError for all errors so they display in UserErrorBanner consistently
+  const errorMessage = errorInfo.message || 'An unexpected error occurred'
+  updater.setError(errorMessage)
+}
+
+/**
+ * Surface + recover from a session gate rejection. The server rejected
+ * the request because our session is no longer valid; update local state so
+ * the UI reflects reality and we stop sending requests until we re-admit.
+ */
+function handleFreebuffGateError(
+  kind: FreebuffGateErrorKind,
+  updater: BatchedMessageUpdater,
+  opts: { messageWasDropped?: boolean; serverMessage?: string } = {},
+) {
+  switch (kind) {
+    case 'session_expired':
+    case 'waiting_room_required':
+    case 'session_model_mismatch':
+      // Our seat is gone mid-chat. Finalize the AI message so its streaming
+      // indicator stops — otherwise `isComplete` stays false and the message
+      // keeps rendering a blinking cursor forever, making the user think the
+      // agent is still working. Also disposes the batched-updater flush
+      // interval.
+      updater.markComplete()
+      // Always say why the turn stopped. Chat-first Freebuff has no
+      // session-ended banner, so a run that got partway (say, right after the
+      // user answered an ask_user question) otherwise just stops, and the
+      // next send's admission prompt reads as the CLI refusing it. A prompt
+      // rejected before producing anything is not re-queued, so say that too.
+      updater.setError(
+        opts.messageWasDropped
+          ? 'Your free session ended before this message was processed. Send it again after starting a new session.'
+          : 'Your free session ended, so the agent stopped here. Send a message to start a new session and continue.',
+      )
+      // Flip to `ended` instead of auto re-queuing: in-flight agent work can
+      // finish under the server-side grace period, and the next send admits a
+      // new session (use-freebuff-chat-admission.ts).
+      markFreebuffSessionEnded()
+      return
+    case 'waiting_room_queued':
+      // Legacy error code: sessions are admitted immediately now, so this is
+      // only reachable in a transient race with a concurrent session request.
+      updater.setError(
+        'Your free session is still being set up. Try again in a moment.',
+      )
+      // Re-sync without resetting chat — this is a "we'll wait", not a
+      // "let's start fresh".
+      refreshFreebuffSession().catch(() => {})
+      return
+    case 'session_superseded': {
+      const reason = getFreebuffSupersededReason(opts.serverMessage)
+      if (reason !== 'taken_over') {
+        // A refunded start or an already-closed hour, not another instance:
+        // nothing is fighting us for the seat, and restarting Freebuff would
+        // not help. Say what the server said and end the session, so the next
+        // send admits a new one (possibly on another model). Both readings
+        // come from the message, so it is never empty here.
+        updater.markComplete()
+        const serverMessage = (opts.serverMessage ?? '').trim()
+        updater.setError(
+          reason === 'refunded_start'
+            ? `${serverMessage} ${FREEBUFF_REFUNDED_START_HINT}`
+            : serverMessage,
+        )
+        markFreebuffSessionEnded()
+        return
+      }
+      updater.setError(
+        'This Freebuff session was released or taken over by another instance. Restart Freebuff to start another session.',
+      )
+      // Terminal state: stop polling and flip UI to a "please restart" screen
+      // so we don't silently fight the other instance for the seat.
+      markFreebuffSessionSuperseded()
+      return
+    }
+    case 'model_unavailable':
+      // The model was withdrawn from free mode. Terminal for this request
+      // only: the session survives (`endsTheSession: false`), so neither end it
+      // nor re-admit — that is the re-admission loop the code exists to avoid.
+      // The server's message names the replacement model.
+      updater.setError(
+        opts.serverMessage?.trim() || FREEBUFF_MODEL_UNAVAILABLE_MESSAGE,
+      )
+      return
+    default: {
+      // A new gate code must get its own case, never a silent no-op.
+      const unhandled: never = kind
+      updater.setError(
+        opts.serverMessage?.trim() ||
+          'Freebuff could not run this turn on your free session.',
+      )
+      logger.warn({ kind: unhandled }, 'Unhandled freebuff gate error kind')
+      return
+    }
+  }
+}
+```
+- File `cli/src/utils/error-handling.ts` (305 lines):
+```
+import {
+  CODEBUFF_OWN_CREDITS_ERROR_PATTERN,
+  FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN,
+  FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+  FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+} from '@codebuff/common/constants/freebuff-errors'
+import { env } from '@codebuff/common/env'
+import { extractApiErrorDetails } from '@codebuff/common/util/error'
+import { formatFreebuffHardBlockedPrivacySignals } from '@codebuff/common/util/freebuff-privacy'
+import { getFreebuffGateCode } from '@codebuff/common/types/freebuff-session'
+
+import type { ChatMessage } from '../types/chat'
+import type {
+  FreebuffCountryBlockReason,
+  FreebuffGateCode,
+  FreebuffIpPrivacySignal,
+} from '@codebuff/common/types/freebuff-session'
+
+import { IS_FREEBUFF } from './constants'
+
+const defaultAppUrl = env.NEXT_PUBLIC_CODEBUFF_APP_URL || 'https://codebuff.com'
+
+// Normalize unknown errors to a user-facing string.
+const extractErrorMessage = (error: unknown, fallback: string): string => {
+  if (typeof error === 'string') {
+    return error
+  }
+  if (error instanceof Error && error.message) {
+    return error.message + (error.stack ? `\n\n${error.stack}` : '')
+  }
+  if (error && typeof error === 'object' && 'message' in error) {
+    const candidate = (error as { message: unknown }).message
+    if (typeof candidate === 'string' && candidate.length > 0) {
+      return candidate
+    }
+  }
+  return fallback
+}
+
+/**
+ * Check if an error indicates the user is out of credits.
+ * Standardized on statusCode === 402 for payment required detection.
+ */
+export const isOutOfCreditsError = (error: unknown): boolean => {
+  if (
+    error &&
+    typeof error === 'object' &&
+    'statusCode' in error &&
+    (error as { statusCode: unknown }).statusCode === 402
+  ) {
+    return true
+  }
+  return false
+}
+
+/**
+ * Check if an error indicates free mode is not available in the user's country.
+ * Standardized on statusCode === 403 + error === 'free_mode_unavailable'.
+ */
+export const isFreeModeUnavailableError = (error: unknown): boolean => {
+  const details = getCliApiErrorDetails(error)
+  return (
+    details.statusCode === 403 &&
+    details.errorCode === 'free_mode_unavailable'
+  )
+}
+
+const getTopLevelApiErrorDetails = (
+  error: unknown,
+): {
+  statusCode?: number
+  errorCode?: string
+  message?: string
+  countryCode?: string
+  countryBlockReason?: string
+  ipPrivacySignals?: string[]
+} => {
+  if (!error || typeof error !== 'object') return {}
+  const statusCode = (error as { statusCode?: unknown }).statusCode
+  const status = (error as { status?: unknown }).status
+  const errorCode = (error as { error?: unknown }).error
+  const message = (error as { message?: unknown }).message
+  const countryCode = (error as { countryCode?: unknown }).countryCode
+  const countryBlockReason = (error as { countryBlockReason?: unknown })
+    .countryBlockReason
+  const ipPrivacySignals = (error as { ipPrivacySignals?: unknown })
+    .ipPrivacySignals
+  const resolvedStatusCode =
+    typeof statusCode === 'number'
+      ? statusCode
+      : typeof status === 'number'
+        ? status
+        : undefined
+
+  return {
+    ...(resolvedStatusCode !== undefined && { statusCode: resolvedStatusCode }),
+    ...(typeof errorCode === 'string' && { errorCode }),
+    ...(typeof message === 'string' && message.length > 0 && { message }),
+    ...(typeof countryCode === 'string' &&
+      countryCode.length > 0 && { countryCode }),
+    ...(typeof countryBlockReason === 'string' && { countryBlockReason }),
+    ...(Array.isArray(ipPrivacySignals) && {
+      ipPrivacySignals: ipPrivacySignals.filter(
+        (signal): signal is string => typeof signal === 'string',
+      ),
+    }),
+  }
+}
+
+const getCliApiErrorDetails = (error: unknown) => {
+  const parsed = extractApiErrorDetails(error)
+  const topLevel = getTopLevelApiErrorDetails(error)
+
+  return {
+    statusCode: topLevel.statusCode ?? parsed.statusCode,
+    errorCode: topLevel.errorCode ?? parsed.errorCode,
+    // Prefer responseBody messages over top-level HTTP status text.
+    message: parsed.message ?? topLevel.message,
+    countryCode: topLevel.countryCode ?? parsed.countryCode,
+    countryBlockReason:
+      topLevel.countryBlockReason ?? parsed.countryBlockReason,
+    ipPrivacySignals: topLevel.ipPrivacySignals ?? parsed.ipPrivacySignals,
+  }
+}
+
+export const getFreebuffRateLimitErrorMessage = (
+  error: unknown,
+): string | null => {
+  const details = getCliApiErrorDetails(error)
+  if (details.statusCode !== 429) return null
+  if (details.errorCode === 'free_mode_rate_limited') {
+    // Our own rate limiter's message is already user-facing and includes the
+    // retry countdown — show it verbatim.
+    return details.message ?? FREEBUFF_RATE_LIMIT_MESSAGE
+  }
+  if (details.errorCode === FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE) {
+    // The per-turn spend breaker. Its copy already says what happened and
+    // what to do (send a new message); a rate-limit framing would be wrong.
+    return details.message ?? FREEBUFF_TURN_SPEND_LIMIT_MESSAGE
+  }
+  // Other 429s (e.g. relayed upstream capacity errors) keep the branded
+  // message but include the server detail so users aren't left guessing.
+  // Only trust messages parsed from a server response body, or the curated
+  // message on an agent-run output object — top-level messages on raw thrown
+  // errors are HTTP status text or retry-wrapper noise.
+  const isRunOutputObject =
+    !!error &&
+    typeof error === 'object' &&
+    (error as { type?: unknown }).type === 'error'
+  const detail =
+    extractApiErrorDetails(error).message ??
+    (isRunOutputObject ? details.message : undefined)
+  if (detail && !/^too many requests\.?$/i.test(detail)) {
+    return `${FREEBUFF_RATE_LIMIT_MESSAGE} (${detail})`
+  }
+  return FREEBUFF_RATE_LIMIT_MESSAGE
+}
+
+/**
+ * Provider billing failures are an operator problem in Freebuff, not a reason
+ * to send a free user to Codebuff's credit-purchase flow. Upstreams disagree
+ * on the status (observed as both 401 and 402), so retain the status check but
+ * also recognize the provider wording that can survive into an agent output.
+ */
+export const isFreebuffProviderUsageError = (error: unknown): boolean => {
+  const details = getCliApiErrorDetails(error)
+  const message = details.message ?? extractErrorMessage(error, '')
+  // The user's own Codebuff balance, not our provider: leave it to the
+  // out-of-credits flow.
+  if (CODEBUFF_OWN_CREDITS_ERROR_PATTERN.test(message)) return false
+  return (
+    details.statusCode === 402 ||
+    FREEBUFF_PROVIDER_USAGE_ERROR_PATTERN.test(message)
+  )
+}
+
+export const getCountryBlockFromFreeModeError = (
+  error: unknown,
+): {
+  countryCode: string
+  countryBlockReason?: FreebuffCountryBlockReason
+  ipPrivacySignals?: FreebuffIpPrivacySignal[]
+} | null => {
+  if (!isFreeModeUnavailableError(error)) return null
+  const errorDetails = getCliApiErrorDetails(error)
+  const countryCode =
+    typeof errorDetails.countryCode === 'string' &&
+    errorDetails.countryCode.length > 0
+      ? errorDetails.countryCode
+      : 'UNKNOWN'
+
+  return {
+    countryCode,
+    countryBlockReason:
+      typeof errorDetails.countryBlockReason === 'string'
+        ? (errorDetails.countryBlockReason as FreebuffCountryBlockReason)
+        : undefined,
+    ipPrivacySignals: errorDetails.ipPrivacySignals as
+      | FreebuffIpPrivacySignal[]
+      | undefined,
+  }
+}
+
+export const getFreeModeUnavailableErrorMessage = (
+  error: unknown,
+): string => {
+  const details = getCliApiErrorDetails(error)
+  const block = getCountryBlockFromFreeModeError(error)
+  if (block?.countryBlockReason === 'anonymous_network') {
+    return `${IS_FREEBUFF ? 'Freebuff' : 'Free mode'} cannot be used from ${formatFreebuffHardBlockedPrivacySignals(
+      block.ipPrivacySignals,
+    )} traffic. Please disable it and try again.`
+  }
+  return details.message ?? FREE_MODE_UNAVAILABLE_MESSAGE
+}
+
+/**
+ * The subset of the session gate the CLI has a recovery for. The codes and
+ * their statuses come from FREEBUFF_GATE_CODES (the shared wire contract, see
+ * docs/freebuff-session-admission.md); the narrowing is deliberate —
+ * `session_limit_reached` is the Desktop concurrent-tab cap, and the CLI runs
+ * one session per user, so it can never earn it and has no banner for it.
+ *
+ * The names keep their legacy waiting-room spelling for wire compatibility.
+ */
+export type FreebuffGateErrorKind = Exclude<
+  FreebuffGateCode,
+  'session_limit_reached'
+>
+
+export const getFreebuffGateErrorKind = (
+  error: unknown,
+): FreebuffGateErrorKind | null => {
+  if (!error || typeof error !== 'object') return null
+  const { error: errorCode, statusCode } = error as {
+    error?: unknown
+    statusCode?: unknown
+  }
+  if (typeof errorCode !== 'string') return null
+  const code = getFreebuffGateCode({
+    error: errorCode,
+    statusCode: typeof statusCode === 'number' ? statusCode : undefined,
+  })
+  return code && code !== 'session_limit_reached' ? code : null
+}
+
+/**
+ * What a `session_superseded` refusal actually means. The server sends that
+ * one code for three different things, and only its message tells them apart:
+ *  - a model start that failed and was REFUNDED ("This model purchase was
+ *    refunded. ..."), usually because the model is busy or down;
+ *  - an hour that had already closed when the request arrived ("Your session
+ *    ended before this request started. ...", RefundAdmissionClosedError);
+ *  - another instance TAKING OVER the session ("Another instance of freebuff
+ *    has taken over this session. ...").
+ * Only the last is a takeover. Desktop draws the same refund line
+ * (isRefundedStart in freebuff-desktop's session-errors.ts). A message that
+ * names neither keeps the takeover reading, as before.
+ */
+export type FreebuffSupersededReason =
+  | 'refunded_start'
+  | 'session_closed'
+  | 'taken_over'
+
+export const getFreebuffSupersededReason = (
+  serverMessage: string | undefined,
+): FreebuffSupersededReason => {
+  const message = serverMessage ?? ''
+  if (/refund/i.test(message)) return 'refunded_start'
+  if (/ended before this request started/i.test(message)) return 'session_closed'
+  return 'taken_over'
+}
+
+/** Appended to the server's refund message: retrying the same model may only
+ *  fail again, so name the way out. */
+export const FREEBUFF_REFUNDED_START_HINT =
+  'The model may be busy or unavailable right now: send your message again to retry, or pick another model with /model.'
+
+export const OUT_OF_CREDITS_MESSAGE =`Out of credits. Please add credits at ${defaultAppUrl}/usage`
+
+export const FREEBUFF_RATE_LIMIT_MESSAGE =
+  'Freebuff is temporarily busy. Please try again in a moment.'
+
+/** Fallback for a `model_unavailable` gate refusal without a server message. */
+export const FREEBUFF_MODEL_UNAVAILABLE_MESSAGE =
+  'This model is no longer available in Freebuff. Pick another model with /model and send your message again.'
+
+export const FREE_MODE_UNAVAILABLE_MESSAGE = IS_FREEBUFF
+  ? 'Freebuff is not available in your country.'
+  : '[freebuff product prompt text omitted]'
+
+export const createErrorMessage = (
+  error: unknown,
+  aiMessageId: string,
+): Partial<ChatMessage> => {
+  const message = extractErrorMessage(error, 'Unknown error occurred')
+
+  return {
+    id: aiMessageId,
+    content: `**Error:** ${message}`,
+    blocks: undefined,
+    isComplete: true,
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `cli/src/hooks/helpers/__tests__/send-message.test.ts` (76 matching lines):
+```
+const { useChatStore } = await import('../../../state/chat-store')
+const { IS_FREEBUFF } = await import('../../../utils/constants')
+const { createStreamController } = await import('../../stream-state')
+const {
+  setupStreamingContext,
+  handleRunCompletion,
+  handleRunError,
+  finalizeQueueState,
+  resetEarlyReturnState,
+} = await import('../send-message')
+const { createBatchedMessageUpdater } =
+  await import('../../../utils/message-updater')
+const freebuffSession = await import('../../use-freebuff-session')
+const { FREEBUFF_MODEL_UNAVAILABLE_MESSAGE, FREEBUFF_REFUNDED_START_HINT } =
+  await import('../../../utils/error-handling')
+import { createPaymentRequiredError } from '@codebuff/sdk'
+import type { RunState } from '@codebuff/sdk'
+
+const createMockTimerController = (): SendMessageTimerController & {
+  startCalls: string[]
+  stopCalls: Array<'success' | 'error' | 'aborted'>
+} => {
+  const startCalls: string[] = []
+  const stopCalls: Array<'success' | 'error' | 'aborted'> = []
+
+  return {
+…
+describe('setupStreamingContext', () => {
+  describe('abort flow', () => {
+    test('abort handler appends interruption notice, marks complete, and releases chain lock', () => {
+      let messages = createBaseMessages()
+      const streamRefs = createStreamController()
+      const timerController = createMockTimerController()
+      let streamStatus: StreamStatus = 'idle'
+      let canProcessQueue = false
+      let chainInProgress = true
+      let isRetrying = true
+
+      const { updater, abortController } = setupStreamingContext({
+        aiMessageId: 'ai-1',
+        timerController,
+        setMessages: (fn: any) => {
+          messages = fn(messages)
+        },
+        streamRefs,
+        setStreamStatus: (status: StreamStatus) => {
+          streamStatus = status
+        },
+        setCanProcessQueue: (can: boolean) => {
+          canProcessQueue = can
+        },
+```
+- File `cli/src/utils/__tests__/message-updater.test.ts` (56 matching lines):
+```
+import { describe, expect, test, beforeEach, afterEach } from 'bun:test'
+
+import {
+  createMessageUpdater,
+  createBatchedMessageUpdater,
+  DEFAULT_FLUSH_INTERVAL_MS,
+} from '../message-updater'
+
+import type { ChatMessage, ContentBlock, TextContentBlock } from '../../types/chat'
+
+// Type for metadata with runState for testing
+interface TestMessageMetadata {
+  bashCwd?: string
+  runState?: { id: string }
+}
+
+const baseMessages: ChatMessage[] = [
+  {
+    id: 'ai-1',
+…
+},
+  {
+    id: 'user-1',
+    variant: 'user',
+    content: 'hi',
+    timestamp: 'now',
+  },
+]
+
+describe('createMessageUpdater', () => {
+  test('updates only the targeted AI message', () => {
+    let state = [...baseMessages]
+    const updater = createMessageUpdater('ai-1', (fn) => {
+      state = fn(state)
+    })
+
+    updater.updateAiMessage((msg) => ({ ...msg, content: 'updated' }))
+
+    expect(state[0].content).toBe('updated')
+    expect(state[1].content).toBe('hi')
+  })
+
+  test('adds blocks and marks complete with metadata merge', () => {
+    let state = [...baseMessages]
+
+    const updater = createMessageUpdater('ai-1', (fn) => {
+      state = fn(state)
+    })
+
+    const block: ContentBlock = { type: 'text', content: 'hello' }
+    updater.addBlock(block)
+    updater.markComplete({ metadata: { runState: { id: 'run-1' } } })
+
+    expect(state[0].blocks?.[0]).toEqual(block)
+    expect(state[0].isComplete).toBe(true)
+    expect((state[0].metadata as TestMessageMetadata).runState).toEqual({ id: 'run-1' })
+  })
+```
+- File `cli/src/utils/sdk-event-handlers.ts` (15 matching lines):
+```
+updateToolBlockWithOutput,
+} from './message-block-helpers'
+import {
+  findMatchingSpawnAgent,
+  resolveSpawnAgentToReal,
+} from './spawn-agent-matcher'
+import {
+  destinationFromChunkEvent,
+  processTextChunk,
+} from './stream-chunk-processor'
+
+import type { AgentMode } from './constants'
+import type { MessageUpdater } from './message-updater'
+import type { StreamController } from '../hooks/stream-state'
+import type { StreamStatus } from '../hooks/use-message-queue'
+import type { ContentBlock, ToolContentBlock } from '../types/chat'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+import type {
+  PrintModeError,
+  PrintModeEvent as SDKEvent,
+  PrintModeFinish,
+  PrintModeSubagentFinish,
+  PrintModeSubagentStart,
+  PrintModeToolCall,
+  PrintModeToolResult,
+…
+const ensureStreaming = (state: EventHandlerState) => {
+  if (!state.message.hasReceivedContentRef.current) {
+    state.message.hasReceivedContentRef.current = true
+    state.streaming.setStreamStatus('streaming')
+  }
+}
+
+const appendRootChunk = (state: EventHandlerState, delta: TextDelta) => {
+  if (!delta.text) {
+    return
+  }
+
+  state.message.updater.updateAiMessageBlocks((blocks) =>
+    appendTextToRootStream(blocks, delta),
+  )
+
+  if (
+    state.mode.agentMode === 'PLAN' &&
+    delta.type === 'text' &&
+    !state.streaming.streamRefs.state.planExtracted &&
+    state.streaming.streamRefs.state.rootStreamBuffer.includes('</PLAN>')
+  ) {
+    const rawPlan = extractPlanFromBuffer(
+      state.streaming.streamRefs.state.rootStreamBuffer,
+    )
+    if (rawPlan !== null) {
+      state.streaming.streamRefs.setters.setPlanExtracted(true)
+      state.mode.setHasReceivedPlanResponse(true)
+      state.message.updater.updateAiMessageBlocks((blocks) =>
+        insertPlanBlock(blocks, rawPlan),
+      )
+    }
+  }
+}
+
+const updateStreamingAgents = (
+  state: EventHandlerState,
+  op: { add?: string; remove?: string },
+) => {
+  state.streaming.setStreamingAgents((prev) => {
+    const next = new Set(prev)
+```
+- File `common/src/__tests__/freebuff-models.test.ts` (11 matching lines):
+```
+expect(isFreebuffModelAllowedForAccessTier(id, 'full')).toBe(true)
+    }
+  })
+
+  test('a withdrawn model is not offered as anyone else’s switch target', () => {
+    // M3 carried a "switch to V4 Flash" nudge until it was withdrawn on
+    // 2026-08-20. Now the check runs the other way: the picker offers a
+    // one-click switch for whatever a notice names, so naming a withdrawn model
+    // would hand users a row the server refuses.
+    const all = FREEBUFF_MODELS.map((model) => model.id)
+    expect(all).not.toContain(MINIMAX_M3_MODEL_ID)
+    for (const id of all) {
+      const superseded = getFreebuffModelSupersededBy(id, all)
+      if (!superseded) continue
+      expect(superseded.modelId).not.toBe(MINIMAX_M3_MODEL_ID)
+      expect(all).toContain(superseded.modelId)
+    }
+    // The recommended default is never itself marked superseded.
+    expect(
+      getFreebuffModelSupersededBy(DEFAULT_FREEBUFF_MODEL_ID, all),
+    ).toBeUndefined()
+  })
+
+  test('does not steer users off the Luna row, which is now the recommendation', () => {
+    // Luna pointed at Flash until 2026-08-19. It cannot any more: a model
+    // cannot both BE the recommended default and carry a one-click switch away
+    // from itself, and migrateSupersededFreebuffModelPreference would have
+```
+- File `cli/src/utils/__tests__/sdk-event-handlers.test.ts` (9 matching lines):
+```
+import { describe, expect, test } from 'bun:test'
+
+import { createAgentBlock } from '../message-block-helpers'
+import { createMessageUpdater } from '../message-updater'
+import {
+  createEventHandler,
+  createStreamChunkHandler,
+} from '../sdk-event-handlers'
+
+import type { StreamStatus } from '../../hooks/use-message-queue'
+import type { AgentContentBlock, ChatMessage } from '../../types/chat'
+import type { AgentMode } from '../constants'
+import type { EventHandlerState } from '../sdk-event-handlers'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+
+// Type for spawn agent info stored in the map
+…
+id: 'ai-1',
+      variant: 'ai',
+      content: '',
+      blocks: [],
+      timestamp: 'now',
+    },
+  ]
+  let streamingAgents = new Set<string>()
+  let streamStatus: StreamStatus | null = null
+  let hasPlanResponse = false
+  const streamRefs = createStreamRefs()
+
+  const updater = createMessageUpdater(
+    'ai-1',
+    (fn: (msgs: ChatMessage[]) => ChatMessage[]) => {
+      messages = fn(messages)
+    },
+  )
+
+  const ctx: EventHandlerState = {
+    streaming: {
+      streamRefs: streamRefs.controller,
+      setStreamingAgents: (fn: (prev: Set<string>) => Set<string>) => {
+        streamingAgents = fn(streamingAgents)
+      },
+      setStreamStatus: (status: StreamStatus) => {
+        streamStatus = status
+      },
+    },
+    message: {
+      aiMessageId: 'ai-1',
+      updater,
+      hasReceivedContentRef: { current: false },
+    },
+    subagents: {
+      addActiveSubagent: () => {},
+      removeActiveSubagent: () => {},
+    },
+    mode: {
+      agentMode,
+      setHasReceivedPlanResponse: (value: boolean) => {
+        hasPlanResponse = value
+      },
+    },
+```
+- File `cli/src/utils/__tests__/error-handling.test.ts` (7 matching lines):
+```
+import { describe, test, expect } from 'bun:test'
+import {
+  FREEBUFF_PROVIDER_USAGE_MESSAGE,
+  FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+  FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+} from '@codebuff/common/constants/freebuff-errors'
+
+import {
+  getFreebuffGateErrorKind,
+  getFreebuffRateLimitErrorMessage,
+  getFreebuffSupersededReason,
+  getFreeModeUnavailableErrorMessage,
+  isOutOfCreditsError,
+  isFreeModeUnavailableError,
+  getCountryBlockFromFreeModeError,
+  OUT_OF_CREDITS_MESSAGE,
+  FREE_MODE_UNAVAILABLE_MESSAGE,
+  FREEBUFF_RATE_LIMIT_MESSAGE,
+  isFreebuffProviderUsageError,
+  createErrorMessage,
+} from '../error-handling'
+
+describe('error-handling', () => {
+…
+})
+
+  test('leaves session_limit_reached to its own handler', () => {
+    expect(
+      getFreebuffGateErrorKind({
+        error: 'session_limit_reached',
+        statusCode: 409,
+      }),
+    ).toBe(null)
+  })
+})
+
+describe('getFreebuffSupersededReason', () => {
+  // The three messages the server sends with 409 session_superseded.
+  test('a refunded start (chat/completions, beginDesktopStart refunded)', () => {
+    expect(
+      getFreebuffSupersededReason(
+        'This model purchase was refunded. Start a new session to try again.',
+      ),
+    ).toBe('refunded_start')
+  })
+
+  test('an hour that closed before the request (RefundAdmissionClosedError)', () => {
+    expect(
+      getFreebuffSupersededReason(
+        'Your session ended before this request started. Send your message again to start a new one.',
+      ),
+    ).toBe('session_closed')
+  })
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `cli/src/hooks/helpers/__tests__/send-message.test.ts`: "session_superseded and model_at_capacity (real server shapes)"; "a refunded start shows the server message, suggests /model, and ends the session"; "an hour closed before the request started relays the server message and ends the session"; "a real takeover keeps the takeover message and terminal state"; "a 503 model_at_capacity is shown as-is and leaves the session alone"; "an in-band model_at_capacity chunk is shown as-is and leaves the session alone"
+```
+const { FREEBUFF_MODEL_UNAVAILABLE_MESSAGE, FREEBUFF_REFUNDED_START_HINT } =
+  const runCompletionWith = (output: Record<string, unknown>) => {
+    const messages = baseMessage()
+    const updater = makeUpdater(messages)
+    handleRunCompletion({
+      runState: {
+        traceSessionId: 'trace-test',
+        sessionState: undefined as any,
+        output: output as any,
+      },
+      actualCredits: undefined,
+      agentMode: 'LITE',
+      timerController: createMockTimerController(),
+      updater,
+      aiMessageId: 'ai-1',
+      wasAbortedByUser: false,
+      setStreamStatus: () => {},
+      setCanProcessQueue: () => {},
+      updateChainInProgress: () => {},
+      setHasReceivedPlanResponse: () => {},
+    })
+    updater.flush()
+    return messages
+  }
+  // The run output the SDK resolves for each real `/api/v1/chat/completions`
+  // refusal: `{error, message}` JSON parsed into `error` / `message`, plus the
+  // HTTP status as `statusCode` (absent for an in-band SSE error chunk).
+  describe('session_superseded and model_at_capacity (real server shapes)', () => {
+    let ended: ReturnType<typeof spyOn>
+    let superseded: ReturnType<typeof spyOn>
+    beforeEach(() => {
+      ended = spyOn(freebuffSession, 'markFreebuffSessionEnded')
+      superseded = spyOn(freebuffSession, 'markFreebuffSessionSuperseded')
+    })
+    afterEach(() => {
+      ended.mockRestore()
+      superseded.mockRestore()
+    })
+    test('a refunded start shows the server message, suggests /model, and ends the session', () => {
+      // _post.ts, when beginDesktopStart answers 'refunded' (CLI claims ride
+      // the same multi-session path since #4017).
+      const serverMessage =
+        'This model purchase was refunded. Start a new session to try again.'
+      const messages = runCompletionWith({
+        type: 'error',
+        message: serverMessage,
+        error: 'session_superseded',
+        statusCode: 409,
+      })
+      expect(messages[0].userError).toBe(
+        `${serverMessage} ${
+```
+- File `cli/src/utils/__tests__/error-handling.test.ts`: "getFreebuffSupersededReason"; "a refunded start (chat/completions, beginDesktopStart refunded)"; "an hour that closed before the request (RefundAdmissionClosedError)"; "a takeover, and any message naming neither, stays a takeover"; "model_at_capacity is not a session gate"; "neither the 503 nor the in-band shape classifies as a gate code"; "a 503 capacity refusal is not mistaken for a rate limit or provider billing"
+```
+  getFreebuffSupersededReason,
+describe('getFreebuffSupersededReason', () => {
+  // The three messages the server sends with 409 session_superseded.
+  test('a refunded start (chat/completions, beginDesktopStart refunded)', () => {
+    expect(
+      getFreebuffSupersededReason(
+        'This model purchase was refunded. Start a new session to try again.',
+      ),
+    ).toBe('refunded_start')
+  })
+  test('an hour that closed before the request (RefundAdmissionClosedError)', () => {
+    expect(
+      getFreebuffSupersededReason(
+        'Your session ended before this request started. Send your message again to start a new one.',
+      ),
+    ).toBe('session_closed')
+  })
+  test('a takeover, and any message naming neither, stays a takeover', () => {
+    expect(
+      getFreebuffSupersededReason(
+        'Another instance of freebuff has taken over this session. Only one instance per account is allowed.',
+      ),
+    ).toBe('taken_over')
+    expect(getFreebuffSupersededReason(undefined)).toBe('taken_over')
+  })
+})
+describe('model_at_capacity is not a session gate', () => {
+  test('neither the 503 nor the in-band shape classifies as a gate code', () => {
+    expect(
+      getFreebuffGateErrorKind({ error: 'model_at_capacity', statusCode: 503 }),
+    ).toBe(null)
+    expect(getFreebuffGateErrorKind({ error: 'model_at_capacity' })).toBe(null)
+  })
+  test('a 503 capacity refusal is not mistaken for a rate limit or provider billing', () => {
+    const output = {
+      type: 'error',
+      error: 'model_at_capacity',
+      statusCode: 503,
+      message:
+        'Space Bunny is at capacity right now. Please try again in a few minutes or pick another model.',
+    }
+    expect(getFreebuffRateLimitErrorMessage(output)).toBe(null)
+    expect(isFreebuffProviderUsageError(output)).toBe(false)
+  })
+})
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/cli/src/hooks/helpers/send-message.ts b/cli/src/hooks/helpers/send-message.ts
+index 71f50f72d..f8e91a4ff 100644
+--- a/cli/src/hooks/helpers/send-message.ts
++++ b/cli/src/hooks/helpers/send-message.ts
+@@ -1,49 +1,51 @@
+ import { FREEBUFF_PROVIDER_USAGE_MESSAGE } from '@codebuff/common/constants/freebuff-errors'
+ import { getErrorObject } from '@codebuff/common/util/error'
+ 
+ import {
+   markFreebuffSessionCountryBlocked,
+   markFreebuffSessionEnded,
+   markFreebuffSessionSuperseded,
+   refreshFreebuffSession,
+ } from '../use-freebuff-session'
+ import { noteAdTurnFailure } from '../../ads/ad-signals'
+ import { getProjectRoot } from '../../project-files'
+ import { useChatStore } from '../../state/chat-store'
+ import { IS_FREEBUFF } from '../../utils/constants'
+ import { processBashContext } from '../../utils/bash-context-processor'
+ import { markRunningAgentsAsCancelled } from '../../utils/block-operations'
+ import {
+   getCountryBlockFromFreeModeError,
+   getFreeModeUnavailableErrorMessage,
+   getFreebuffGateErrorKind,
+   getFreebuffRateLimitErrorMessage,
++  getFreebuffSupersededReason,
+   isOutOfCreditsError,
+   isFreebuffProviderUsageError,
+   isFreeModeUnavailableError,
+   FREEBUFF_MODEL_UNAVAILABLE_MESSAGE,
++  FREEBUFF_REFUNDED_START_HINT,
+   OUT_OF_CREDITS_MESSAGE,
+ } from '../../utils/error-handling'
+ import { formatElapsedTime } from '../../utils/format-elapsed-time'
+ import { processImagesForMessage } from '../../utils/image-processor'
+ import { logger } from '../../utils/logger'
+ import { appendInterruptionNotice } from '../../utils/message-block-helpers'
+ import { getUserMessage } from '../../utils/message-history'
+ import {
+   createBatchedMessageUpdater,
+   type BatchedMessageUpdater,
+ } from '../../utils/message-updater'
+ import { createModeDividerMessage } from '../../utils/send-message-helpers'
+ import { yieldToEventLoop } from '../../utils/yield-to-event-loop'
+ import { invalidateActivityQuery } from '../use-activity-query'
+ import { usageQueryKeys } from '../use-usage-query'
+ 
+ import type {
+   PendingAttachment,
+   PendingFileAttachment,
+   PendingImageAttachment,
+   PendingTextAttachment,
+ } from '../../types/store'
+ import type { ChatMessage } from '../../types/chat'
+ import type { AgentMode } from '../../utils/constants'
+ import type { FreebuffGateErrorKind } from '../../utils/error-handling'
+@@ -606,54 +608,72 @@ function handleFreebuffGateError(
+       // Always say why the turn stopped. Chat-first Freebuff has no
+       // session-ended banner, so a run that got partway (say, right after the
+       // user answered an ask_user question) otherwise just stops, and the
+       // next send's admission prompt reads as the CLI refusing it. A prompt
+       // rejected before producing anything is not re-queued, so say that too.
+       updater.setError(
+         opts.messageWasDropped
+           ? 'Your free session ended before this message was processed. Send it again after starting a new session.'
+           : 'Your free session ended, so the agent stopped here. Send a message to start a new session and continue.',
+       )
+       // Flip to `ended` instead of auto re-queuing: in-flight agent work can
+       // finish under the server-side grace period, and the next send admits a
+       // new session (use-freebuff-chat-admission.ts).
+       markFreebuffSessionEnded()
+       return
+     case 'waiting_room_queued':
+       // Legacy error code: sessions are admitted immediately now, so this is
+       // only reachable in a transient race with a concurrent session request.
+       updater.setError(
+         'Your free session is still being set up. Try again in a moment.',
+       )
+       // Re-sync without resetting chat — this is a "we'll wait", not a
+       // "let's start fresh".
+       refreshFreebuffSession().catch(() => {})
+       return
+-    case 'session_superseded':
++    case 'session_superseded': {
++      const reason = getFreebuffSupersededReason(opts.serverMessage)
++      if (reason !== 'taken_over') {
++        // A refunded start or an already-closed hour, not another instance:
++        // nothing is fighting us for the seat, and restarting Freebuff would
++        // not help. Say what the server said and end the session, so the next
++        // send admits a new one (possibly on another model). Both readings
++        // come from the message, so it is never empty here.
++        updater.markComplete()
++        const serverMessage = (opts.serverMessage ?? '').trim()
++        updater.setError(
++          reason === 'refunded_start'
++            ? `${serverMessage} ${FREEBUFF_REFUNDED_START_HINT}`
++            : serverMessage,
++        )
++        markFreebuffSessionEnded()
++        return
++      }
+       updater.setError(
+         'This Freebuff session was released or taken over by another instance. Restart Freebuff to start another session.',
+       )
+       // Terminal state: stop polling and flip UI to a "please restart" screen
+       // so we don't silently fight the other instance for the seat.
+       markFreebuffSessionSuperseded()
+       return
++    }
+     case 'model_unavailable':
+       // The model was withdrawn from free mode. Terminal for this request
+       // only: the session survives (`endsTheSession: false`), so neither end it
+       // nor re-admit — that is the re-admission loop the code exists to avoid.
+       // The server's message names the replacement model.
+       updater.setError(
+         opts.serverMessage?.trim() || FREEBUFF_MODEL_UNAVAILABLE_MESSAGE,
+       )
+       return
+     default: {
+       // A new gate code must get its own case, never a silent no-op.
+       const unhandled: never = kind
+       updater.setError(
+         opts.serverMessage?.trim() ||
+           'Freebuff could not run this turn on your free session.',
+       )
+       logger.warn({ kind: unhandled }, 'Unhandled freebuff gate error kind')
+       return
+     }
+   }
+ }
+diff --git a/cli/src/utils/error-handling.ts b/cli/src/utils/error-handling.ts
+index ba7acc0b4..444d84c06 100644
+--- a/cli/src/utils/error-handling.ts
++++ b/cli/src/utils/error-handling.ts
+@@ -222,51 +222,83 @@ export const getFreeModeUnavailableErrorMessage = (
+  * one session per user, so it can never earn it and has no banner for it.
+  *
+  * The names keep their legacy waiting-room spelling for wire compatibility.
+  */
+ export type FreebuffGateErrorKind = Exclude<
+   FreebuffGateCode,
+   'session_limit_reached'
+ >
+ 
+ export const getFreebuffGateErrorKind = (
+   error: unknown,
+ ): FreebuffGateErrorKind | null => {
+   if (!error || typeof error !== 'object') return null
+   const { error: errorCode, statusCode } = error as {
+     error?: unknown
+     statusCode?: unknown
+   }
+   if (typeof errorCode !== 'string') return null
+   const code = getFreebuffGateCode({
+     error: errorCode,
+     statusCode: typeof statusCode === 'number' ? statusCode : undefined,
+   })
+   return code && code !== 'session_limit_reached' ? code : null
+ }
+ 
+-export const OUT_OF_CREDITS_MESSAGE = `Out of credits. Please add credits at ${defaultAppUrl}/usage`
++/**
++ * What a `session_superseded` refusal actually means. The server sends that
++ * one code for three different things, and only its message tells them apart:
++ *  - a model start that failed and was REFUNDED ("This model purchase was
++ *    refunded. ..."), usually because the model is busy or down;
++ *  - an hour that had already closed when the request arrived ("Your session
++ *    ended before this request started. ...", RefundAdmissionClosedError);
++ *  - another instance TAKING OVER the session ("Another instance of freebuff
++ *    has taken over this session. ...").
++ * Only the last is a takeover. Desktop draws the same refund line
++ * (isRefundedStart in freebuff-desktop's session-errors.ts). A message that
++ * names neither keeps the takeover reading, as before.
++ */
++export type FreebuffSupersededReason =
++  | 'refunded_start'
++  | 'session_closed'
++  | 'taken_over'
++
++export const getFreebuffSupersededReason = (
++  serverMessage: string | undefined,
++): FreebuffSupersededReason => {
++  const message = serverMessage ?? ''
++  if (/refund/i.test(message)) return 'refunded_start'
++  if (/ended before this request started/i.test(message)) return 'session_closed'
++  return 'taken_over'
++}
++
++/** Appended to the server's refund message: retrying the same model may only
++ *  fail again, so name the way out. */
++export const FREEBUFF_REFUNDED_START_HINT =
++  'The model may be busy or unavailable right now: send your message again to retry, or pick another model with /model.'
++
++export const OUT_OF_CREDITS_MESSAGE =`Out of credits. Please add credits at ${defaultAppUrl}/usage`
+ 
+ export const FREEBUFF_RATE_LIMIT_MESSAGE =
+   'Freebuff is temporarily busy. Please try again in a moment.'
+ 
+ /** Fallback for a `model_unavailable` gate refusal without a server message. */
+ export const FREEBUFF_MODEL_UNAVAILABLE_MESSAGE =
+   'This model is no longer available in Freebuff. Pick another model with /model and send your message again.'
+ 
+ export const FREE_MODE_UNAVAILABLE_MESSAGE = IS_FREEBUFF
+   ? 'Freebuff is not available in your country.'
+   : '[freebuff product prompt text omitted]'
+ 
+ export const createErrorMessage = (
+   error: unknown,
+   aiMessageId: string,
+ ): Partial<ChatMessage> => {
+   const message = extractErrorMessage(error, 'Unknown error occurred')
+ 
+   return {
+     id: aiMessageId,
+     content: `**Error:** ${message}`,
+     blocks: undefined,
+     isComplete: true,
+   }
+ }
+
+```
