@@ -137,7 +137,16 @@ test('groundAnswer: fluent prose from general knowledge is refused, not labeled 
     '-  spendEstimate?: number',
     ' }'
   ].join('\n')
-  const spendEv = () => answerEvidence({ entry: spendEntry, diff: spendDiff })
+  // The production failure had a noisy neighbor: a same-day "retire Opus
+  // aliases" change whose title/summary put Claude/Opus/released into the
+  // evidence. The gate must still refuse the essay -- the check is against
+  // this entry's prose, not the neighbors'.
+  const noisyNeighbors = [{
+    short: '748a97679cd4',
+    title: 'Retire Claude 3.x and Opus 4/4.1 aliases in shared model config',
+    summary: 'The shared model configuration retires the Claude 3.x and Claude Opus 4/4.1 model aliases. Anthropic released newer models, so the old aliases were removed from the picker.'
+  }]
+  const spendEv = () => answerEvidence({ entry: spendEntry, diff: spendDiff, neighbors: noisyNeighbors })
   const essay = 'The latest Claude Opus model I know about is Claude Opus 4.1, which was released in August 2025.\n\nAnthropic\'s Opus line has been their most capable model tier. Prior to Opus 4.1, there was Claude Opus 4 (released around May 2025), and before that Claude 3 Opus from early 2024. Opus 4.1 was positioned as an incremental improvement over Opus 4, particularly in areas like coding, reasoning, and agentic tasks.'
   const v = groundAnswer(essay, spendEv())
   assert.equal(v.grounded, false, 'an answer on an unrelated topic must not pass as grounded')

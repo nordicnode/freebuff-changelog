@@ -24,10 +24,14 @@
 //   3. file citations in [path/to/file.ts] form must name a file this entry
 //      touched;
 //   4. line citations in [path/to/file.ts:42] form must fall inside a hunk;
-//   5. the prose itself must be about the evidence: the answer's distinctive
-//      words must substantially overlap the evidence's vocabulary. A model that
-//      answers from general knowledge writes fluent prose with none of the
-//      change's words in it, and the four checks above cannot see that.
+//   5. the prose itself must be about this entry: the answer's distinctive
+//      words must substantially overlap the entry's own prose (title, summary,
+//      plain-English, evidence, unknowns) -- not the neighbors, not the raw
+//      diff. A model that answers from general knowledge writes fluent prose
+//      with none of the change's words in it, and the four checks above cannot
+//      see that. Neighbors are prompt context for resolving references, but
+//      they share the day's vocabulary, so they must not count as grounding:
+//      otherwise an answer about a neighbor's topic passes.
 // Check 5 is a heuristic, not a proof: it judges whether the answer is *about*
 // the evidence, not whether each prose claim is true. An answer that reuses
 // evidence words to state something false still passes it -- that remains a
@@ -100,7 +104,13 @@ export function answerEvidence ({ entry = {}, diff = '', maxChars = 200000, neig
   const unknowns = a.unknowns || entry.unknowns || ''
   const migration = a.migration || entry.migration || ''
   const near = (Array.isArray(neighbors) ? neighbors : []).filter(n => n && n.title).slice(0, 4)
-  const parts = [
+  // This entry's own prose: what the change is, in words. Kept separate from
+  // the full text because the prose grounding check must verify the answer is
+  // about THIS change: nearby changes share the day's vocabulary (same repo,
+  // same domain), so checking against the full text lets an answer about a
+  // neighbor's topic pass. The diff and file list are prompt context, not
+  // prose grounding -- code claims are checked against them separately.
+  const proseParts = [
     `TITLE: ${a.title || entry.title || ''}`,
     `SUMMARY: ${a.summary || entry.summary || ''}`,
     plain ? `IN PLAIN ENGLISH: ${plain}` : '',
@@ -111,7 +121,10 @@ export function answerEvidence ({ entry = {}, diff = '', maxChars = 200000, neig
     // boundary instead of filling the gap with general knowledge.
     unknowns ? `NOT IN THIS CHANGE (do not present these as what the change does): ${unknowns}` : '',
     migration ? `MIGRATION: ${migration}` : '',
-    entry.structured ? `STRUCTURED FACTS: ${JSON.stringify(entry.structured)}` : '',
+    entry.structured ? `STRUCTURED FACTS: ${JSON.stringify(entry.structured)}` : ''
+  ].filter(Boolean)
+  const parts = [
+    ...proseParts,
     near.length ? `NEARBY CHANGES THE SAME DAY (separate commits, not this change; do not present these as what this change does):\n${near.map(n => `- ${n.short || n.sha || ''}: ${n.title}${n.summary ? ` -- ${n.summary}` : ''}`).join('\n')}` : '',
     `FILES TOUCHED: ${[...parsed.files].join(', ')}`,
     'DIFF:',
@@ -119,7 +132,7 @@ export function answerEvidence ({ entry = {}, diff = '', maxChars = 200000, neig
   ].filter(Boolean)
   let text = parts.join('\n')
   if (text.length > maxChars) text = `${text.slice(0, maxChars)}\n[diff truncated: ${text.length - maxChars} more characters not shown, so they cannot be cited]`
-  return { text, files: parsed.files, ranges: parsed.ranges, truncated: text.endsWith(']') && text.includes('diff truncated') }
+  return { text, prose: proseParts.join('\n'), files: parsed.files, ranges: parsed.ranges, truncated: text.endsWith(']') && text.includes('diff truncated') }
 }
 
 // Extensions a citation may name. A fixed list rather than "anything with a
@@ -244,11 +257,15 @@ export function groundAnswer (answer, evidence) {
   }
 
   // 5. prose grounding: the answer's distinctive words must substantially
-  // overlap the evidence's vocabulary. Judged on the citation-stripped text so
+  // overlap THIS entry's vocabulary. Judged on the citation-stripped text so
   // backticked code and [file] citations (already checked above) do not pad
-  // the score. Short answers are exempt: an honest "the change does not show
-  // that" has too little vocabulary to judge, and refusing it would punish the
-  // exact behavior the prompt asks for.
+  // the score, and against the entry's own prose -- not the neighbors or the
+  // raw diff. Neighbors share the day's vocabulary, so a full-text check lets
+  // an answer about a neighbor's topic pass (the real 2026-10-07 failure: an
+  // Opus essay passed because a nearby "retire Opus aliases" change put those
+  // words in the evidence). Short answers are exempt: an honest "the change
+  // does not show that" has too little vocabulary to judge, and refusing it
+  // would punish the exact behavior the prompt asks for.
   const proseWords = []
   for (const m of noCitations.toLowerCase().matchAll(/[a-z]+(?:'[a-z]+)?/g)) {
     const w = m[0].replace(/'s$/, '')
@@ -256,8 +273,11 @@ export function groundAnswer (answer, evidence) {
     proseWords.push(w)
   }
   if (proseWords.length >= 6) {
+    // Older callers may hand groundAnswer an evidence object from before the
+    // prose field existed; fall back to the full text rather than crashing.
+    const ref = typeof evidence?.prose === 'string' ? evidence.prose : hay
     const evStems = new Set()
-    for (const m of hay.toLowerCase().matchAll(/[a-z]+/g)) {
+    for (const m of ref.toLowerCase().matchAll(/[a-z]+/g)) {
       if (m[0].length >= 4) evStems.add(stemWord(m[0]))
     }
     let hits = 0
