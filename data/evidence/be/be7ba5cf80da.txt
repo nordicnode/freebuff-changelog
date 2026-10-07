@@ -1,0 +1,2243 @@
+Date: 2026-10-07T09:17:14Z
+Category: Agent Runtime
+Areas: Agent Runtime
+Commit nature: production
+Stats: +87 / -49
+Analysis notes: Agent Runtime changes across 2 file(s) (+87/−49).
+Modified files: packages/agent-runtime/src/compact-history.ts, packages/agent-runtime/src/compaction-working-set.ts
+Key facts (ground the WHY and DETAIL sentences in these): - Separator between entries inside the rendered historical memory.
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Constants newly defined: MIN_HISTORY_TOKENS = 2_000 (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "still compacts at the hard budget, keeping a summary and a note for every earlier read" ; "keeps a note for every file read when the target leaves no room"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `packages/agent-runtime/src/compact-history.ts`:
+```
+/**
+ * Deterministic context compaction.
+ *
+ * This is the same algorithm the `context-pruner` agent runs, lifted out of
+ * that agent's `handleSteps` body so the runtime can call it directly. It costs
+ * no model call: the history is rewritten mechanically into a condensed
+ * `<conversation_summary>` message.
+ *
+ * That matters twice over. An LLM summarization pass is a full extra request
+ * over the whole (already oversized) history, and its output is a lossy prose
+ * retelling. The mechanical pass keeps the concrete details — every file that
+ * was read or edited, every command that was run, every user message up to the
+ * user budget — which is what a coding agent actually needs to resume.
+ *
+ * The runtime's own pass (`compactRequestHistory`, not the shared summary)
+ * adds a working set on top: the newest unedited file reads, re-provided after
+ * the live request, and an outline stub for every other file read. See
+ * compaction-working-set.ts.
+ *
+ * `agents/context-pruner.ts` cannot import this module: its `handleSteps` is
+ * serialized with `toString()` and re-evaluated standalone, and `agents/` is
+ * bundled at build time into the CLI binary, the desktop app and the freebuff
+ * web server separately — so a shared import (or a runtime-injected helper)
+ * would break on any artifact that has not been rebuilt. The pruner therefore
+ * keeps its own inlined copy. Treat this file as the source of truth and port
+ * changes across: `__tests__/context-pruner-parity.test.ts` runs both over the
+ * same histories and fails when they drift.
+ */
+```
+- File `packages/agent-runtime/src/compaction-working-set.ts`:
+```
+/**
+ * The files a mechanical compaction carries forward, so the model does not
+ * have to read them again.
+ *
+ * The summary keeps a one-line record of every tool call, but no tool output:
+ * a file the model read becomes `inspected files: a.ts`. With the contents
+ * gone the model's next move is to read the file again, and on a small window
+ * those reads refill the context until it compacts again (prod, 2026-10-05:
+ * after a mechanical pass the same run compacted again within ten minutes
+ * twice as often as after a model handoff, almost all of it on budgets under
+ * 150k tokens).
+ *
+ * So the pass re-provides the newest read of each file it can afford, as one
+ * `read_files` exchange placed after the live prompt — the shape the model
+ * already trusts for file contents. A file that was edited after its last
+ * read is never re-provided: those contents are stale. Nor is any file read
+ * before a `spawn_agents` call: the spawned agents' edits never appear in this
+ * history (the fast-mode root delegates its edits that way), so the read may
+ * be stale too. Every other file read
+ * earlier gets a stub in the same result instead: its size when read and an
+ * outline of its top-level declarations with line numbers, so the model can
+ * read one section rather than the whole file.
+ *
+ * The exchange is tagged, so the next compaction reads it back as reads
+ * (stubs included, which keeps one entry per path however many times a
+ * history is compacted) and keeps it out of the summary's own tool log.
+ */
+```
+Complete Source of Modified Files (for complete module context):
+- File `packages/agent-runtime/src/compact-history.ts` (1275 lines):
+```
+/**
+ * Deterministic context compaction.
+ *
+ * This is the same algorithm the `context-pruner` agent runs, lifted out of
+ * that agent's `handleSteps` body so the runtime can call it directly. It costs
+ * no model call: the history is rewritten mechanically into a condensed
+ * `<conversation_summary>` message.
+ *
+ * That matters twice over. An LLM summarization pass is a full extra request
+ * over the whole (already oversized) history, and its output is a lossy prose
+ * retelling. The mechanical pass keeps the concrete details — every file that
+ * was read or edited, every command that was run, every user message up to the
+ * user budget — which is what a coding agent actually needs to resume.
+ *
+ * The runtime's own pass (`compactRequestHistory`, not the shared summary)
+ * adds a working set on top: the newest unedited file reads, re-provided after
+ * the live request, and an outline stub for every other file read. See
+ * compaction-working-set.ts.
+ *
+ * `agents/context-pruner.ts` cannot import this module: its `handleSteps` is
+ * serialized with `toString()` and re-evaluated standalone, and `agents/` is
+ * bundled at build time into the CLI binary, the desktop app and the freebuff
+ * web server separately — so a shared import (or a runtime-injected helper)
+ * would break on any artifact that has not been rebuilt. The pruner therefore
+ * keeps its own inlined copy. Treat this file as the source of truth and port
+ * changes across: `__tests__/context-pruner-parity.test.ts` runs both over the
+ * same histories and fails when they drift.
+ */
+
+import { DEFAULT_COMPACTION_POLICY } from '@codebuff/common/constants/compaction-policy'
+import { CONTEXT_COMPACTION_COMPLETED_EVENT } from '@codebuff/common/util/axiom-only-log'
+import {
+  WORKING_SET_SHARE,
+  WORKING_SET_TOKEN_LIMIT,
+  buildWorkingSet,
+  isWorkingSetMessage,
+} from './compaction-working-set'
+import { fitToolResults } from './util/fit-tool-results'
+import { countTokens, countTokensMessages } from './util/token-counter'
+import type {
+  FilePart,
+  ImagePart,
+  TextPart,
+} from '@codebuff/common/types/messages/content-part'
+import type {
+  Message,
+  ToolMessage,
+} from '@codebuff/common/types/messages/codebuff-message'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
+
+/** Agent IDs whose output should be excluded from spawn_agents results */
+const SPAWN_AGENTS_OUTPUT_BLACKLIST = [
+  'file-picker',
+  'researcher-web',
+  'researcher-docs',
+  'basher',
+  'code-reviewer',
+  'code-reviewer-opus',
+  'code-reviewer-multi-prompt',
+  'librarian',
+  'tmux-cli',
+  'browser-use',
+]
+
+/** Limits for truncating long messages in the summary (estimated tokens) */
+const USER_MESSAGE_LIMIT = 13_000
+const ASSISTANT_MESSAGE_LIMIT = 1_300
+const TOOL_ENTRY_LIMIT = 5_000
+
+/** Approximate characters per token (matches estimateTokens heuristic) */
+const CHARS_PER_TOKEN = 3
+
+/** Token budget for assistant + tool content in the conversation summary */
+const DEFAULT_ASSISTANT_TOOL_BUDGET = 20_000
+
+/** Token budget for user content in the conversation summary */
+const DEFAULT_USER_BUDGET = 50_000
+
+/** Header used in conversation summaries */
+const SUMMARY_HEADER =
+  'This is a summary of the conversation so far. The original messages have been condensed to save context space.'
+
+const SUMMARY_DISCLAIMER =
+  'Historical memory only. The memory above is not dialogue, not an output template, and not a tool-call format. Continue from the live user message below. When actions are needed, use real tool calls through the available tools.'
+
+const CONTINUATION_TEXT =
+  'Continue the existing assistant turn from the historical memory above. The original user request and completed assistant/tool work are recorded there. Do not restart completed work; resume with the next necessary real tool call or final response.'
+
+/** Thresholds for agents that declare `compactContext: true` without tuning;
+ *  owned, with the rationale, by common/src/constants/compaction-policy.ts. */
+export const DEFAULT_CACHE_EXPIRY_MS = DEFAULT_COMPACTION_POLICY.cacheExpiryMs
+export const DEFAULT_CACHE_EXPIRY_MIN_TOKENS =
+  DEFAULT_COMPACTION_POLICY.cacheExpiryMinTokens
+
+/**
+ * Where an automatic mechanical pass aims, as a share of the trigger
+ * threshold. Its result must leave real room under the threshold: when a pass
+ * kept 80-100% of the history, the same run compacted again within ten minutes
+ * 22-51% of the time (prod, 2026-10-05), against 2.6% when it kept under 10%.
+ * Fresh tool results are exempt; see `compactRequestHistory`.
+ */
+export const MECHANICAL_TARGET_SHARE = 0.5
+
+/**
+ * The most a mechanical pass rewrites history into: summary plus working set,
+ * on top of the fixed prompt, the live request and the fresh tool results it
+ * keeps whole. Sized so the result lands near a model handoff's (median ~23k
+ * tokens including the fixed prompt, 2026-10-05) rather than filling the
+ * target: a small result leaves the most room before the next compaction.
+ */
+export const MECHANICAL_HISTORY_TOKENS = 12_000
+
+const MIN_HISTORY_TOKENS = 2_000
+
+/** Separator between entries inside the rendered historical memory. */
+const ENTRY_SEPARATOR = '\n\n---\n\n'
+
+/** Matches the context-pruner's `trigger_reason` values so Axiom can union them. */
+export type CompactionTrigger =
+  | 'context_limit'
+  | 'cache_expiry'
+  | 'context_limit_and_cache_expiry'
+
+type SummaryEntry = {
+  role: 'user' | 'assistant_tool'
+  parts: string[]
+}
+
+/**
+ * Truncates long text with 80% from the beginning and 20% from the end.
+ */
+function truncateLongText(text: string, limit: number): string {
+  if (text.length <= limit) {
+    return text
+  }
+  const availableChars = limit - 50 // 50 chars for the truncation notice
+  const prefixLength = Math.floor(availableChars * 0.8)
+  const suffixLength = availableChars - prefixLength
+  const prefix = text.slice(0, prefixLength)
+  const suffix = text.slice(-suffixLength)
+  const truncatedChars = text.length - prefixLength - suffixLength
+  return `${prefix}\n\n[...truncated ${truncatedChars} chars...]\n\n${suffix}`
+}
+
+/**
+ * Extracts text content from a message.
+ */
+function getTextContent(message: Message): string {
+  const content = message.content as unknown
+  if (typeof content === 'string') {
+    return content
+  }
+  if (Array.isArray(content)) {
+    return content
+      .filter(
+        (part: Record<string, unknown>) =>
+          part.type === 'text' && typeof part.text === 'string',
+      )
+      .map((part: Record<string, unknown>) => part.text as string)
+      .join('\n')
+  }
+  return ''
+}
+
+/**
+ * Summarizes a tool call into a human-readable description.
+ */
+function summarizeToolCall(
+  toolName: string,
+  input: Record<string, unknown>,
+): string {
+  switch (toolName) {
+    case 'read_files': {
+      const paths = (input.paths as unknown[] | undefined)?.map((entry) =>
+        typeof entry === 'string'
+          ? entry
+          : ((entry as { path?: string })?.path ?? ''),
+      )
+      if (paths && paths.length > 0) {
+        return `inspected files: ${paths.join(', ')}`
+      }
+      return 'inspected files'
+    }
+    case 'write_file': {
+      const path = input.path as string | undefined
+      return path ? `wrote file: ${path}` : 'wrote a file'
+    }
+    case 'str_replace': {
+      const path = input.path as string | undefined
+      return path ? `edited file: ${path}` : 'edited a file'
+    }
+    case 'propose_write_file': {
+      const path = input.path as string | undefined
+      return path ? `proposed writing: ${path}` : 'proposed a file write'
+    }
+    case 'propose_str_replace': {
+      const path = input.path as string | undefined
+      return path ? `proposed editing: ${path}` : 'proposed a file edit'
+    }
+    case 'read_subtree': {
+      const paths = input.paths as string[] | undefined
+      if (paths && paths.length > 0) {
+        return `inspected subtrees: ${paths.join(', ')}`
+      }
+      return 'inspected a subtree'
+    }
+    case 'code_search': {
+      const pattern = input.pattern as string | undefined
+      const flags = input.flags as string | undefined
+      if (pattern && flags) {
+        return `code search for "${pattern}" (${flags})`
+      }
+      return pattern ? `code search for "${pattern}"` : 'code search'
+    }
+    case 'glob': {
+      const pattern = input.pattern as string | undefined
+      return pattern ? `glob search for ${pattern}` : 'glob search'
+    }
+    case 'list_directory': {
+      const path = input.path as string | undefined
+      return path ? `listed directory: ${path}` : 'listed a directory'
+    }
+    case 'find_files': {
+      const prompt = input.prompt as string | undefined
+      return prompt
+        ? `file-finding request: "${prompt}"`
+        : 'file-finding request'
+    }
+    case 'run_terminal_command': {
+      const command = input.command as string | undefined
+      if (command) {
+        const shortCmd =
+          command.length > 50 ? command.slice(0, 50) + '...' : command
+        return `ran command: ${shortCmd}`
+      }
+      return 'ran a terminal command'
+    }
+    case 'spawn_agents':
+    case 'spawn_agent_inline': {
+      const agents = input.agents as
+        | Array<{
+            agent_type: string
+            prompt?: string
+            params?: Record<string, unknown>
+          }>
+        | undefined
+      const agentType = input.agent_type as string | undefined
+      const prompt = input.prompt as string | undefined
+      const agentParams = input.params as Record<string, unknown> | undefined
+
+      if (agents && agents.length > 0) {
+        const agentDetails = agents.map((a) => {
+          let detail = a.agent_type
+          const extras: string[] = []
+          if (a.prompt) {
+            const truncatedPrompt =
+              a.prompt.length > 1000
+                ? a.prompt.slice(0, 1000) + '...'
+                : a.prompt
+            extras.push(`prompt: "${truncatedPrompt}"`)
+          }
+          if (a.params && Object.keys(a.params).length > 0) {
+            const paramsStr = JSON.stringify(a.params)
+            const truncatedParams =
+              paramsStr.length > 1000
+                ? paramsStr.slice(0, 1000) + '...'
+                : paramsStr
+            extras.push(`params: ${truncatedParams}`)
+          }
+          if (extras.length > 0) {
+            detail += ` (${extras.join(', ')})`
+          }
+          return detail
+        })
+        return `delegated agents:\n${agentDetails.map((d) => `- ${d}`).join('\n')}`
+      }
+      if (agentType) {
+        const extras: string[] = []
+        if (prompt) {
+          const truncatedPrompt =
+            prompt.length > 1000 ? prompt.slice(0, 1000) + '...' : prompt
+          extras.push(`prompt: "${truncatedPrompt}"`)
+        }
+        if (agentParams && Object.keys(agentParams).length > 0) {
+          const paramsStr = JSON.stringify(agentParams)
+          const truncatedParams =
+            paramsStr.length > 1000
+              ? paramsStr.slice(0, 1000) + '...'
+              : paramsStr
+          extras.push(`params: ${truncatedParams}`)
+        }
+        if (extras.length > 0) {
+          return `delegated agent ${agentType} (${extras.join(', ')})`
+        }
+        return `delegated agent ${agentType}`
+      }
+      return 'delegated agent work'
+    }
+    case 'write_todos': {
+      const todos = input.todos as
+        | Array<{ task: string; completed: boolean }>
+        | undefined
+      if (todos) {
+        const completed = todos.filter((t) => t.completed).length
+        const incomplete = todos.filter((t) => !t.completed)
+        if (incomplete.length === 0) {
+          return `Todos: ${completed}/${todos.length} complete (all done!)`
+        }
+        const remainingTasks = incomplete.map((t) => `- ${t.task}`).join('\n')
+        return `Todos: ${completed}/${todos.length} complete. Remaining:\n${remainingTasks}`
+      }
+      return 'Updated todos'
+    }
+    case 'ask_user': {
+      const questions = input.questions as
+        | Array<{ question: string }>
+        | undefined
+      if (questions && questions.length > 0) {
+        const questionTexts = questions.map((q) => q.question).join('; ')
+        const truncated =
+          questionTexts.length > 200
+            ? questionTexts.slice(0, 200) + '...'
+            : questionTexts
+        return `Asked user: ${truncated}`
+      }
+      return 'Asked user question'
+    }
+    case 'suggest_followups':
+      return 'Suggested followups'
+    case 'web_search': {
+      const query = input.query as string | undefined
+      return query ? `web search for "${query}"` : 'web search'
+    }
+    case 'read_url': {
+      const url = input.url as string | undefined
+      return url ? `read URL: ${url}` : 'read a URL'
+    }
+    case 'gravity_index': {
+      const query = input.query as string | undefined
+      const action = input.action as string | undefined
+      if (query) {
+        return `Gravity Index ${action ?? 'search'} for "${query}"`
+      }
+      return action ? `Gravity Index ${action}` : 'Gravity Index use'
+    }
+    case 'read_docs': {
+      const libraryTitle = input.libraryTitle as string | undefined
+      const topic = input.topic as string | undefined
+      if (libraryTitle && topic) {
+        return `consulted docs: ${libraryTitle} - ${topic}`
+      }
+      return libraryTitle ? `consulted docs: ${libraryTitle}` : 'consulted docs'
+    }
+    case 'set_output':
+      return 'set structured output'
+    case 'set_messages':
+      return 'updated message history'
+    default:
+      return `used tool ${toolName}`
+  }
+}
+
+const SCAFFOLDING_TAGS = [
+  'INSTRUCTIONS_PROMPT',
+  'STEP_PROMPT',
+  'SUBAGENT_SPAWN',
+]
+
+/**
+ * Recognizes a memory artifact this module (or the context-pruner) produced.
+ *
+ * Both markers are required, and that is the point. A summary is dropped from
+ * the history and re-parsed into entries, so anything mistaken for one is
+ * silently eaten — and the bare `<conversation_summary>` tag is a string a user
+ * can easily send, most obviously when asking about this very code. Requiring
+ * the header too means only text that reproduces our envelope qualifies.
+ *
+ * The context-pruner matches on the tag alone. That is a deliberate divergence
+ * (see the parity test): it matters much more here, because the cache-expiry
+ * trigger compacts on ordinary idle turns rather than only near the context
+ * limit, so a user message can meet a compaction pass within minutes.
+ */
+function isConversationSummary(message: Message): boolean {
+  if (message.role !== 'user') return false
+  const text = getTextContent(message)
+  return (
+    text.includes('<conversation_summary>') && text.includes(SUMMARY_HEADER)
+  )
+}
+
+/**
+ * Real conversation, as opposed to per-step scaffolding the runtime re-adds
+ * anyway or a summary this pass is about to rebuild. Both are excluded from the
+ * historical memory, and neither counts as evidence that the assistant has
+ * started working on the live prompt.
+ */
+function isRealHistory(message: Message): boolean {
+  return (
+    !message.tags?.some((tag) => SCAFFOLDING_TAGS.includes(tag)) &&
+    !isConversationSummary(message)
+  )
+}
+
+/** The images on the most recent user message that had any. */
+function lastUserImageParts(messages: Message[]): Array<ImagePart | FilePart> {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (message.role !== 'user' || !Array.isArray(message.content)) continue
+    const imageParts = message.content.filter(
+      (part: Record<string, unknown>) =>
+        part.type === 'image' || part.type === 'media',
+    )
+    if (imageParts.length > 0) return imageParts as Array<ImagePart | FilePart>
+  }
+  return []
+}
+
+/** Pulls the historical memory back out of a summary message. */
+function extractSummaryContent(message: Message): string {
+  const text = getTextContent(message)
+  const match = text.match(
+    /<conversation_summary>([\s\S]*?)<\/conversation_summary>/,
+  )
+  if (!match) return ''
+  let content = match[1].trim()
+  if (content.startsWith(SUMMARY_HEADER)) {
+    content = content.slice(SUMMARY_HEADER.length).trim()
+  }
+  const memoryMatch = content.match(
+    /<historical_memory>([\s\S]*?)<\/historical_memory>/,
+  )
+  if (memoryMatch) {
+    content = memoryMatch[1].trim()
+  }
+  return content
+}
+
+/**
+ * Parses a previous summary text blob back into role-tagged entries, so a
+ * second compaction can re-apply the budgets over old and new history alike.
+ */
+function parseSummaryIntoEntries(summaryText: string): SummaryEntry[] {
+  if (!summaryText.trim()) return []
+
+  const chunks = summaryText.split(ENTRY_SEPARATOR).filter((c) => c.trim())
+
+  return chunks.map((chunk) => {
+    const trimmed = chunk.trim()
+    const isUser =
+      trimmed.startsWith('[USER]') ||
+      trimmed.startsWith('User request') ||
+      trimmed.startsWith('User message') ||
+      trimmed.startsWith('Current unresolved user request')
+    return {
+      role: isUser ? ('user' as const) : ('assistant_tool' as const),
+      parts: [trimmed],
+    }
+  })
+}
+
+/**
+ * Condenses each message into a role-tagged entry. Tool calls become one-line
+ * descriptions, tool results are dropped except for errors and edit outcomes,
+ * and long text is truncated head-and-tail.
+ */
+function summarizeMessagesIntoEntries(messages: Message[]): SummaryEntry[] {
+  const entries: SummaryEntry[] = []
+
+  for (const message of messages) {
+    if (message.role === 'user') {
+      let text = getTextContent(message).trim()
+      if (!text) continue
+      text = truncateLongText(text, USER_MESSAGE_LIMIT * CHARS_PER_TOKEN)
+      const hasImages =
+        Array.isArray(message.content) &&
+        message.content.some(
+          (part: Record<string, unknown>) =>
+            part.type === 'image' || part.type === 'media',
+        )
+      const imageNote = hasImages ? ' [image(s) were attached]' : ''
+      entries.push({ role: 'user', parts: [`[USER]${imageNote}\n${text}`] })
+    } else if (message.role === 'assistant') {
+      const textParts: string[] = []
+      const toolSummaries: string[] = []
+
+      if (Array.isArray(message.content)) {
+        for (const part of message.content) {
+          if (part.type === 'text' && typeof part.text === 'string') {
+            const textWithoutThinkTags = part.text
+              .replace(/<think>[\s\S]*?<\/think>/g, '')
+              .trim()
+            if (textWithoutThinkTags) {
+              textParts.push(textWithoutThinkTags)
+            }
+          } else if (part.type === 'tool-call') {
+            const input = (part.input as Record<string, unknown>) || {}
+            toolSummaries.push(summarizeToolCall(part.toolName, input))
+          }
+        }
+      }
+
+      const parts: string[] = []
+      if (textParts.length > 0) {
+        const combinedText = truncateLongText(
+          textParts.join('\n'),
+          ASSISTANT_MESSAGE_LIMIT * CHARS_PER_TOKEN,
+        )
+        parts.push(`Progress note:\n${combinedText}`)
+      }
+      if (toolSummaries.length > 0) {
+        parts.push(toolSummaries.join('\n'))
+      }
+
+      if (parts.length > 0) {
+        entries.push({ role: 'assistant_tool', parts })
+      }
+    } else if (message.role === 'tool') {
+      const entryParts = summarizeToolResult(message as ToolMessage)
+      if (entryParts.length > 0) {
+        entries.push({
+          role: 'assistant_tool',
+          parts: [
+            truncateLongText(
+              entryParts.join('\n\n'),
+              TOOL_ENTRY_LIMIT * CHARS_PER_TOKEN,
+            ),
+          ],
+        })
+      }
+    }
+  }
+
+  return entries
+}
+
+/**
+ * Tool results are dropped wholesale except for the parts an agent still needs
+ * after the fact: errors, non-zero exit codes, user answers, edit outcomes and
+ * non-blacklisted subagent output.
+ */
+function summarizeToolResult(toolMessage: ToolMessage): string[] {
+  const entryParts: string[] = []
+
+  if (Array.isArray(toolMessage.content)) {
+    for (const part of toolMessage.content) {
+      if (part.type === 'json' && part.value) {
+        const value = part.value as Record<string, unknown>
+
+        if (value.errorMessage || value.error) {
+          let errorText = String(value.errorMessage || value.error)
+          if (errorText.length > 100) {
+            errorText = errorText.slice(0, 100) + '...'
+          }
+          entryParts.push(
+            `Tool error from ${toolMessage.toolName}: ${errorText}`,
+          )
+        }
+
+        if (
+          toolMessage.toolName === 'run_terminal_command' &&
+          'exitCode' in value
+        ) {
+          const exitCode = value.exitCode as number
+          if (exitCode !== 0) {
+            entryParts.push(`Command failed with exit code: ${exitCode}`)
+          }
+        }
+
+        if (toolMessage.toolName === 'ask_user') {
+          if (value.skipped) {
+            entryParts.push('User skipped question')
+          } else if ('answers' in value) {
+            const answers = value.answers as
+              | Array<{
+                  selectedOption?: string
+                  selectedOptions?: string[]
+                  otherText?: string
+                }>
+              | undefined
+            if (answers && answers.length > 0) {
+              const answerTexts = answers
+                .map((a) => {
+                  if (a.otherText) return a.otherText
+                  if (a.selectedOptions) return a.selectedOptions.join(', ')
+                  if (a.selectedOption) return a.selectedOption
+                  return '(no answer)'
+                })
+                .join('; ')
+              const truncated =
+                answerTexts.length > 10_000
+                  ? answerTexts.slice(0, 10_000) + '...'
+                  : answerTexts
+              entryParts.push(`User answered: ${truncated}`)
+            }
+          }
+        }
+
+        if (
+          toolMessage.toolName === 'str_replace' ||
+          toolMessage.toolName === 'propose_str_replace' ||
+          toolMessage.toolName === 'write_file' ||
+          toolMessage.toolName === 'propose_write_file'
+        ) {
+          const resultStr = JSON.stringify(value)
+          const truncatedResult =
+            resultStr.length > 2000
+              ? resultStr.slice(0, 2000) + '...'
+              : resultStr
+          entryParts.push(
+            `Edit result from ${toolMessage.toolName}:\n${truncatedResult}`,
+          )
+        }
+      }
+    }
+  }
+
+  if (
+    toolMessage.toolName === 'spawn_agents' &&
+    Array.isArray(toolMessage.content)
+  ) {
+    for (const part of toolMessage.content) {
+      if (part.type === 'json' && Array.isArray(part.value)) {
+        const agentResults = part.value as Array<{
+          agentName?: string
+          agentType?: string
+          // Plain text, or an AgentOutput (structured output, older histories).
+          value?: string | { type?: string; value?: unknown }
+        }>
+        const includedResults = agentResults.filter(
+          (r) =>
+            r.agentType && !SPAWN_AGENTS_OUTPUT_BLACKLIST.includes(r.agentType),
+        )
+        if (includedResults.length > 0) {
+          const resultSummaries = includedResults.map((r) => {
+            const output =
+              typeof r.value === 'string' ? r.value : r.value?.value
+            let outputStr = ''
+            if (output !== undefined && output !== null) {
+              outputStr =
+                typeof output === 'string' ? output : JSON.stringify(output)
+              outputStr = outputStr
+                .replace(/<think>[\s\S]*?<\/think>/g, '')
+                .trim()
+              if (
+                outputStr.length >
+                ASSISTANT_MESSAGE_LIMIT * CHARS_PER_TOKEN
+              ) {
+                outputStr =
+                  outputStr.slice(
+                    0,
+                    ASSISTANT_MESSAGE_LIMIT * CHARS_PER_TOKEN,
+                  ) + '...'
+              }
+            }
+            return `- ${r.agentType}: ${outputStr || '(no output)'}`
+          })
+          entryParts.push(`Agent results:\n${resultSummaries.join('\n')}`)
+        }
+      }
+    }
+  }
+
+  return entryParts
+}
+
+/**
+ * Walks entries newest-first and keeps what fits. The two roles have separate
+ * budgets on purpose: exhausting the assistant/tool budget must not evict user
+ * prompts, and vice versa. The newest entry is always kept even when it alone
+ * blows its budget.
+ */
+function selectEntriesWithinBudget(
+  entries: SummaryEntry[],
+  budgets: { assistantToolBudget: number; userBudget: number },
+): {
+  /** Chronological order. */
+  includedEntries: SummaryEntry[]
+  newestEntryForced: boolean
+} {
+  let assistantToolTokens = 0
+  let userTokens = 0
+  let assistantToolBudgetExhausted = false
+  let userBudgetExhausted = false
+  const reverseIncluded: SummaryEntry[] = []
+
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i]
+    const entryText = entry.parts.join(ENTRY_SEPARATOR)
+    const entryTokens = Math.ceil(entryText.length / CHARS_PER_TOKEN)
+
+    if (entry.role === 'user') {
+      if (userBudgetExhausted) continue
+      if (userTokens + entryTokens > budgets.userBudget) {
+        userBudgetExhausted = true
+        continue
+      }
+      userTokens += entryTokens
+    } else {
+      if (assistantToolBudgetExhausted) continue
+      if (assistantToolTokens + entryTokens > budgets.assistantToolBudget) {
+        assistantToolBudgetExhausted = true
+        continue
+      }
+      assistantToolTokens += entryTokens
+    }
+
+    reverseIncluded.push(entry)
+  }
+
+  const newestEntry = entries[entries.length - 1]
+  let newestEntryForced = false
+  if (newestEntry && !reverseIncluded.includes(newestEntry)) {
+    reverseIncluded.unshift(newestEntry)
+    newestEntryForced = true
+  }
+
+  return { includedEntries: reverseIncluded.reverse(), newestEntryForced }
+}
+
+/** Renders chronological entries into the historical memory blob. */
+function renderSummaryText(entries: SummaryEntry[]): string {
+  return entries.flatMap((entry) => entry.parts).join(ENTRY_SEPARATOR)
+}
+
+/** Wraps the historical memory in the message the model actually sees. */
+function buildSummaryMessage(
+  summaryText: string,
+  imageParts: Array<ImagePart | FilePart>,
+  sentAt: number,
+): Message {
+  const textPart: TextPart = {
+    type: 'text',
+    text: `<conversation_summary>
+${SUMMARY_HEADER}
+
+<historical_memory>
+${summaryText}
+</historical_memory>
+</conversation_summary>
+
+${SUMMARY_DISCLAIMER}`,
+  }
+  return {
+    role: 'user',
+    content: [textPart, ...imageParts],
+    sentAt,
+  }
+}
+
+export type CompactionResult = {
+  messages: Message[]
+  summaryText: string
+  /**
+   * Snake_case on purpose: these go straight into the Axiom event, under the
+   * same field names the context-pruner logs, so both agents' compactions can
+   * be queried as one series.
+   */
+  stats: {
+    mid_turn: boolean
+    user_budget: number
+    assistant_tool_budget: number
+    previous_summary_entry_count: number
+    user_entry_count: number
+    dropped_user_entry_count: number
+    assistant_tool_entry_count: number
+    dropped_assistant_tool_entry_count: number
+    newest_entry_forced: boolean
+    live_user_prompt_found: boolean
+    summary_estimated_tokens: number
+  }
+}
+
+/**
+ * Rewrites `messages` into `[summary, instructionsPrompt?, livePromptOrContinuation]`.
+ * Pure and synchronous — no model call.
+ */
+export function compactMessages(params: {
+  messages: Message[]
+  assistantToolBudget?: number
+  userBudget?: number
+  now?: number
+}): CompactionResult {
+  const {
+    messages,
+    assistantToolBudget = DEFAULT_ASSISTANT_TOOL_BUDGET,
+    userBudget = DEFAULT_USER_BUDGET,
+    now = Date.now(),
+  } = params
+
+  // The live instructions prompt is scaffolding, not history: hold onto it and
+  // re-append it after the summary so the agent keeps its standing orders.
+  const instructionsPromptMessage =
+    messages.findLast((message) =>
+      message.tags?.includes('INSTRUCTIONS_PROMPT'),
+    ) ?? null
+
+  const previousSummary = messages.findLast(isConversationSummary)
+
+  // If compaction happens before the assistant has started responding to the
+  // current user prompt, preserve that prompt as a real message after the
+  // memory artifact. Mid-turn, the prompt goes into the memory alongside the
+  // work that followed it and a synthetic continuation prompt takes its place.
+  const livePromptIndex = messages.findLastIndex((message) =>
+    message.tags?.includes('USER_PROMPT'),
+  )
+  const livePrompt = livePromptIndex === -1 ? null : messages[livePromptIndex]
+  const isMidTurn =
+    livePrompt !== null &&
+    messages.slice(livePromptIndex + 1).some(isRealHistory)
+
+  const messagesToSummarize = messages.filter(
+    (message, index) =>
+      isRealHistory(message) && (isMidTurn || index !== livePromptIndex),
+  )
+
+  const previousSummaryEntries = parseSummaryIntoEntries(
+    previousSummary ? extractSummaryContent(previousSummary) : '',
+  )
+  const entries = [
+    ...previousSummaryEntries,
+    ...summarizeMessagesIntoEntries(messagesToSummarize),
+  ]
+  const { includedEntries, newestEntryForced } = selectEntriesWithinBudget(
+    entries,
+    { assistantToolBudget, userBudget },
+  )
+  const summaryText = renderSummaryText(includedEntries)
+
+  // Images cannot survive as text, so carry the most recent set forward.
+  const imageParts = lastUserImageParts(messagesToSummarize)
+
+  const finalMessages: Message[] = [
+    buildSummaryMessage(summaryText, imageParts, now),
+  ]
+  if (instructionsPromptMessage) {
+    // Refresh sentAt so downstream cache-expiry checks see a live timestamp.
+    finalMessages.push({ ...instructionsPromptMessage, sentAt: now })
+  }
+  finalMessages.push(
+    isMidTurn || !livePrompt
+      ? {
+          role: 'user',
+          content: [{ type: 'text', text: CONTINUATION_TEXT }],
+          sentAt: now,
+        }
+      : { ...livePrompt, sentAt: now },
+  )
+
+  const countUsers = (list: SummaryEntry[]) =>
+    list.filter((entry) => entry.role === 'user').length
+  const userEntries = countUsers(entries)
+  const includedUserEntries = countUsers(includedEntries)
+  const assistantToolEntries = entries.length - userEntries
+  const includedAssistantToolEntries =
+    includedEntries.length - includedUserEntries
+
+  return {
+    messages: finalMessages,
+    summaryText,
+    stats: {
+      mid_turn: isMidTurn,
+      user_budget: userBudget,
+      assistant_tool_budget: assistantToolBudget,
+      previous_summary_entry_count: previousSummaryEntries.length,
+      user_entry_count: userEntries,
+      dropped_user_entry_count: userEntries - includedUserEntries,
+      assistant_tool_entry_count: assistantToolEntries,
+      dropped_assistant_tool_entry_count:
+        assistantToolEntries - includedAssistantToolEntries,
+      newest_entry_forced: newestEntryForced,
+      live_user_prompt_found: livePrompt !== null,
+      summary_estimated_tokens: Math.ceil(summaryText.length / CHARS_PER_TOKEN),
+    },
+  }
+}
+
+/** The last unconsumed assistant/tool exchange, including parallel tool calls.
+ * Stream parsing appends assistant messages, then the whole tool-result batch.
+ * A later assistant response means that batch has already been consumed.
+ */
+function latestToolExchangeStart(messages: Message[]): number {
+  const lastTool = messages.findLastIndex((message) => message.role === 'tool')
+  if (
+    lastTool < 0 ||
+    messages.slice(lastTool + 1).some((message) => message.role === 'assistant')
+  ) {
+    return messages.length
+  }
+  let start = lastTool
+  while (start > 0 && messages[start - 1].role === 'tool') start--
+  const resultIds = new Set(
+    messages
+      .slice(start, lastTool + 1)
+      .flatMap((message) =>
+        message.role === 'tool' ? [message.toolCallId] : [],
+      ),
+  )
+  const calls = new Set<string>()
+  while (start > 0 && messages[start - 1].role === 'assistant') {
+    start--
+    const message = messages[start]
+    if (message.role === 'assistant') {
+      for (const part of message.content) {
+        if (part.type === 'tool-call') calls.add(part.toolCallId)
+      }
+    }
+  }
+  // Do not preserve orphan results (interrupted histories are cleaned by the
+  // request builder), or cut a call away from another result in its batch.
+  return calls.size === resultIds.size &&
+    [...calls].every((id) => resultIds.has(id))
+    ? start
+    : messages.length
+}
+
+/** Runtime-only request budgeting around the shared historical summarizer.
+ * The serialized context-pruner still uses compactMessages' summary algorithm;
+ * it does not own the parent's live model request or its fixed token overhead.
+ *
+ * `tokenBudget` is hard: the live request and the fresh tool results must fit
+ * it, clipped if they must. `targetBudget` is soft: the working set and the
+ * summary stop there, so aiming low shrinks only what this pass rewrites and
+ * never clips a result the model has not read yet.
+ */
+function compactRequestHistory(
+  messages: Message[],
+  tokenBudget: number,
+  targetBudget = tokenBudget,
+  historyBudget = Number.POSITIVE_INFINITY,
+) {
+  const tailStart = latestToolExchangeStart(messages)
+  let promptStart = messages
+    .slice(0, tailStart)
+    .findLastIndex((message) => message.tags?.includes('USER_PROMPT'))
+  // Several steering prompts may have arrived together; keep all of them.
+  while (
+    promptStart > 0 &&
+    messages[promptStart - 1].tags?.includes('USER_PROMPT')
+  )
+    promptStart--
+  const instructionIndex = messages.findLastIndex((message) =>
+    message.tags?.includes('INSTRUCTIONS_PROMPT'),
+  )
+  const livePrompts = messages
+    .slice(Math.max(0, promptStart), tailStart)
+    .filter(
+      (message) => promptStart >= 0 && message.tags?.includes('USER_PROMPT'),
+    )
+  const prefix: Message[] = [
+    ...(instructionIndex >= 0 && instructionIndex < tailStart
+      ? [messages[instructionIndex]]
+      : []),
+    ...livePrompts,
+  ]
+  if (!prefix.some((message) => message.tags?.includes('USER_PROMPT'))) {
+    prefix.push({
+      role: 'user',
+      content: [{ type: 'text', text: CONTINUATION_TEXT }],
+      sentAt: Date.now(),
+    })
+  }
+  const fresh = messages
+    .slice(tailStart)
+    .filter((message) => !message.tags?.includes('STEP_PROMPT'))
+  const protectedMessages = new Set([...prefix, ...fresh])
+  const older = messages
+    .slice(0, tailStart)
+    .filter((message) => !protectedMessages.has(message))
+  // A previous pass's working set is reads, not conversation: it feeds this
+  // pass's working set and stays out of the summary's tool log.
+  const result = compactMessages({
+    messages: older.filter((message) => !isWorkingSetMessage(message)),
+  })
+  const entries = parseSummaryIntoEntries(result.summaryText)
+  const now = Date.now()
+  // Old persisted compactions put the current request inside the summary and
+  // remove USER_PROMPT tags. Reserve that request as historical memory rather
+  // than letting a large fresh read squeeze the task itself out of context.
+  const historicalRequest =
+    livePrompts.length === 0 &&
+    !fresh.some((message) => message.tags?.includes('USER_PROMPT'))
+      ? entries.findLast(
+          (entry) =>
+            entry.role === 'user' &&
+            !entry.parts.includes(`[USER]\n${CONTINUATION_TEXT}`),
+        )
+      : undefined
+  const reservedMemory = historicalRequest
+    ? countTokensMessages([
+        buildSummaryMessage(renderSummaryText([historicalRequest]), [], now),
+      ])
+    : 0
+  const prefixTokens = countTokensMessages(prefix)
+  if (prefixTokens + reservedMemory > tokenBudget) {
+    throw new Error(
+      'The current request and agent instructions exceed the configured context window. Shorten the request/project instructions or configure a larger context window supported by your provider.',
+    )
+  }
+  const fitted = fitToolResults(
+    fresh,
+    tokenBudget - prefixTokens - reservedMemory,
+  )
+  const fittedTokens = countTokensMessages(fitted)
+  const hardRemaining = tokenBudget - prefixTokens - fittedTokens
+  // Optional content stops at the target, but never squeezes out the request
+  // reserved above.
+  const optionalTokens = Math.max(
+    Math.min(
+      hardRemaining,
+      Math.max(targetBudget - prefixTokens - fittedTokens, MIN_HISTORY_TOKENS),
+      historyBudget,
+    ),
+    reservedMemory,
+  )
+  const workingSet = buildWorkingSet({
+    older,
+    fresh,
+    tokenBudget: Math.min(
+      WORKING_SET_TOKEN_LIMIT,
+      Math.floor((optionalTokens - reservedMemory) * WORKING_SET_SHARE),
+    ),
+    noteBudget: hardRemaining - reservedMemory,
+    now,
+  })
+  const workingSetTokens = workingSet
+    ? countTokensMessages(workingSet.messages)
+    : 0
+  const remainingTokens = Math.max(
+    optionalTokens - workingSetTokens,
+    Math.min(MIN_HISTORY_TOKENS, hardRemaining - workingSetTokens),
+  )
+
+  // Keep the newest historical entries that fit the actual remainder. The
+  // 50k/20k summary budgets are ceilings, never permission to exceed a BYOK
+  // window. Count the envelope and images too, not just summary text.
+  const selected = new Set<SummaryEntry>(
+    historicalRequest ? [historicalRequest] : [],
+  )
+  let images = result.messages[0].content.filter(
+    (part): part is ImagePart | FilePart =>
+      part.type === 'image' || part.type === 'file',
+  )
+  if (
+    countTokensMessages([
+      buildSummaryMessage(renderSummaryText([...selected]), images, now),
+    ]) > remainingTokens
+  )
+    images = []
+  let available =
+    remainingTokens -
+    countTokensMessages([
+      buildSummaryMessage(renderSummaryText([...selected]), images, now),
+    ])
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (selected.has(entries[i])) continue
+    const tokens = countTokens(
+      entries[i].parts.join(ENTRY_SEPARATOR) + ENTRY_SEPARATOR,
+    )
+    if (tokens > available) continue
+    selected.add(entries[i])
+    available -= tokens
+  }
+  const kept = entries.filter((entry) => selected.has(entry))
+  let summary = buildSummaryMessage(renderSummaryText(kept), images, now)
+  while (kept.length && countTokensMessages([summary]) > remainingTokens) {
+    const removable = kept.findIndex((entry) => entry !== historicalRequest)
+    if (removable < 0) break
+    kept.splice(removable, 1)
+    summary = buildSummaryMessage(renderSummaryText(kept), images, now)
+  }
+  const summaryInstalled = countTokensMessages([summary]) <= remainingTokens
+  const output = [
+    ...(summaryInstalled ? [summary] : []),
+    ...prefix.map((message) => ({ ...message, sentAt: now })),
+    // After the live request, as if the turn had opened by reading them.
+    ...(workingSet?.messages ?? []),
+    // On resume, the preserved exchange can include the old assistant and the
+    // new user prompt. Reset their idle gap too, or crossing the token floor
+    // after this pass triggers another cache-expiry compaction mid-work.
+    ...fitted.map((message) =>
+      message.sentAt === undefined ? message : { ...message, sentAt: now },
+    ),
+  ]
+  if (countTokensMessages(output) > tokenBudget) {
+    throw new Error(
+      'Unable to fit the latest tool results into the configured context window. Request smaller outputs or configure a larger supported context window.',
+    )
+  }
+  return {
+    ...result,
+    messages: output,
+    // What the installed summary message actually carries, after the budget
+    // walk — not the untrimmed text `compactMessages` produced.
+    summaryText: summaryInstalled ? renderSummaryText(kept) : '',
+    stats: {
+      ...result.stats,
+      mid_turn: fresh.length > 0,
+      live_user_prompt_found: livePrompts.length > 0,
+      summary_estimated_tokens: Math.ceil(
+        renderSummaryText(kept).length / CHARS_PER_TOKEN,
+      ),
+      budget_dropped_summary_parts: entries.length - kept.length,
+      preserved_fresh_messages: fitted.length,
+      working_set_files: workingSet?.files ?? 0,
+      working_set_stubs: workingSet?.stubs ?? 0,
+      working_set_tokens: workingSetTokens,
+    },
+  }
+}
+
+/**
+ * How long the conversation sat idle before the live user prompt arrived, or
+ * null when the history has no pair of timestamps to measure between.
+ *
+ * The gap is measured from the last assistant message to the USER_PROMPT that
+ * follows it: that is the window in which the provider's prompt cache had to
+ * survive on its own. Tool messages carry no `sentAt`, so they are skipped.
+ */
+export function promptCacheGapMs(messages: Message[]): number | null {
+  const userPromptIndex = messages.findLastIndex((message) =>
+    message.tags?.includes('USER_PROMPT'),
+  )
+  if (userPromptIndex <= 0) return null
+
+  const userPrompt = messages[userPromptIndex]
+  if (!userPrompt.sentAt) return null
+
+  for (let i = userPromptIndex - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (message.role !== 'assistant') continue
+    return message.sentAt ? userPrompt.sentAt - message.sentAt : null
+  }
+  return null
+}
+
+/**
+ * Decides whether to compact, and why.
+ *
+ * Two triggers. The context limit is the one that must fire — the history no
+ * longer fits. Cache expiry is the opportunistic one: once the prompt cache has
+ * gone cold, the next request re-reads the whole history at full price anyway,
+ * so rewriting it costs nothing and every later step in the turn is cheaper.
+ * Compacting while the cache is warm would be the expensive mistake, which is
+ * why the TTL errs long.
+ *
+ * The opportunistic trigger additionally needs enough context to be worth the
+ * detail it destroys — see DEFAULT_CACHE_EXPIRY_MIN_TOKENS. The context limit
+ * ignores that floor.
+ */
+export function evaluateCompactionTrigger(params: {
+  messages: Message[]
+  contextTokenCount: number
+  maxContextLength: number
+  /** Pass null to disable the opportunistic cache-expiry trigger. */
+  cacheExpiryMs?: number | null
+  /** Pass null to take the opportunistic compaction at any size. */
+  cacheExpiryMinTokens?: number | null
+}): {
+  /** null means "leave the history alone". */
+  trigger: CompactionTrigger | null
+} {
+  const { messages, contextTokenCount, maxContextLength } = params
+  const cacheExpiryMs =
+    params.cacheExpiryMs === undefined
+      ? DEFAULT_CACHE_EXPIRY_MS
+      : params.cacheExpiryMs
+  const cacheExpiryMinTokens =
+    params.cacheExpiryMinTokens === undefined
+      ? DEFAULT_CACHE_EXPIRY_MIN_TOKENS
+      : params.cacheExpiryMinTokens
+
+  const overContextLimit = contextTokenCount > maxContextLength
+  const worthCompacting =
+    cacheExpiryMinTokens === null || contextTokenCount >= cacheExpiryMinTokens
+  const cacheGapMs =
+    cacheExpiryMs === null || !worthCompacting
+      ? null
+      : promptCacheGapMs(messages)
+  const cacheExpired =
+    cacheExpiryMs !== null && cacheGapMs !== null && cacheGapMs > cacheExpiryMs
+
+  const trigger: CompactionTrigger | null = overContextLimit
+    ? cacheExpired
+      ? 'context_limit_and_cache_expiry'
+      : 'context_limit'
+    : cacheExpired
+      ? 'cache_expiry'
+      : null
+
+  return { trigger }
+}
+
+/**
+ * Compact once, on demand, whatever the triggers say.
+ *
+ * The mechanical pass — protected prefix, fresh tool exchange, budget walk —
+ * with no decision attached. A user who asks for it has already decided;
+ * `evaluateCompactionTrigger` exists to answer "is this worth doing unasked",
+ * which is a different question.
+ *
+ * Since #5502 the rewritten part (summary plus working set) stops at
+ * `historyTokens`, MECHANICAL_HISTORY_TOKENS (12k) by default, however much
+ * room `maxContextLength` leaves; the live request and fresh tool results are
+ * kept whole on top. Before, it filled the budget.
+ *
+ * Returns null when the pass would not make the history smaller. That is not a
+ * failure, it is the honest answer for a short conversation: rewriting it would
+ * break the provider's prompt cache and hand back an envelope around the same
+ * content. The caller reports it as a no-op rather than a compaction.
+ *
+ * Throws what `compactRequestHistory` throws — the live request alone over
+ * budget — with its user-presentable sentence intact.
+ */
+export function compactHistoryNow(params: {
+  messages: Message[]
+  maxContextLength: number
+  /** System prompt, tool schemas and next step's scaffolding, outside history. */
+  fixedTokenCount?: number
+  /** Where the rewritten part should stop, below `maxContextLength`; see
+   * `compactRequestHistory`. Defaults to `maxContextLength`. */
+  targetTokens?: number
+  /** The most the rewritten history (summary plus working set) may take.
+   * Defaults to MECHANICAL_HISTORY_TOKENS. */
+  historyTokens?: number
+  /** Why the caller compacted; a forced pass is `manual`. */
+  trigger?: CompactionTrigger | 'manual'
+  logger?: Logger
+  runId?: string
+}): {
+  messages: Message[]
+  /** Text of the installed summary message; '' when none fit. */
+  summaryText: string
+  previousTokens: number
+  nextTokens: number
+} | null {
+  const { messages, maxContextLength, logger, runId } = params
+  const fixedTokenCount = params.fixedTokenCount ?? 0
+  const result = compactRequestHistory(
+    messages,
+    maxContextLength - fixedTokenCount,
+    Math.min(params.targetTokens ?? maxContextLength, maxContextLength) -
+      fixedTokenCount,
+    params.historyTokens ?? MECHANICAL_HISTORY_TOKENS,
+  )
+  const previousTokens = countTokensMessages(messages)
+  const nextTokens = countTokensMessages(result.messages)
+  if (nextTokens >= previousTokens) return null
+
+  // Telemetry is best-effort and must never block the compaction itself.
+  try {
+    logger?.info(
+      {
+        axiomEvent: CONTEXT_COMPACTION_COMPLETED_EVENT,
+        agent_run_id: runId,
+        trigger_reason: params.trigger ?? 'manual',
+        context_token_count: previousTokens + fixedTokenCount,
+        max_context_length: maxContextLength,
+        message_count: messages.length,
+        ...result.stats,
+        post_tokens: nextTokens + fixedTokenCount,
+      },
+      'Context compaction completed',
+    )
+  } catch {
+    // Ignore logging failures.
+  }
+
+  return {
+    messages: result.messages,
+    summaryText: result.summaryText,
+    previousTokens,
+    nextTokens,
+  }
+}
+```
+- File `packages/agent-runtime/src/compaction-working-set.ts` (293 lines):
+```
+/**
+ * The files a mechanical compaction carries forward, so the model does not
+ * have to read them again.
+ *
+ * The summary keeps a one-line record of every tool call, but no tool output:
+ * a file the model read becomes `inspected files: a.ts`. With the contents
+ * gone the model's next move is to read the file again, and on a small window
+ * those reads refill the context until it compacts again (prod, 2026-10-05:
+ * after a mechanical pass the same run compacted again within ten minutes
+ * twice as often as after a model handoff, almost all of it on budgets under
+ * 150k tokens).
+ *
+ * So the pass re-provides the newest read of each file it can afford, as one
+ * `read_files` exchange placed after the live prompt — the shape the model
+ * already trusts for file contents. A file that was edited after its last
+ * read is never re-provided: those contents are stale. Nor is any file read
+ * before a `spawn_agents` call: the spawned agents' edits never appear in this
+ * history (the fast-mode root delegates its edits that way), so the read may
+ * be stale too. Every other file read
+ * earlier gets a stub in the same result instead: its size when read and an
+ * outline of its top-level declarations with line numbers, so the model can
+ * read one section rather than the whole file.
+ *
+ * The exchange is tagged, so the next compaction reads it back as reads
+ * (stubs included, which keeps one entry per path however many times a
+ * history is compacted) and keeps it out of the summary's own tool log.
+ */
+
+import { countTokensJson, countTokensMessages } from './util/token-counter'
+
+import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+
+export const WORKING_SET_TAG = 'COMPACTION_WORKING_SET'
+
+/** Starts the content of a file the compaction did not carry. */
+export const COMPACTED_READ_MARKER =
+  '[read_files: contents dropped at compaction'
+
+/** The most file content one compaction carries, in estimated tokens. At
+ * the default `MECHANICAL_HISTORY_TOKENS` (12k) the share below binds first
+ * (under 5k); this caps a caller that passes a larger `historyTokens`. */
+export const WORKING_SET_TOKEN_LIMIT = 40_000
+
+/** Share of the room left after the live request and fresh results. The rest
+ * goes to the summary, whose user messages matter more than any one file. */
+export const WORKING_SET_SHARE = 0.4
+
+/** Stubs are cheap, but a long session reads hundreds of files. */
+const STUB_TOKEN_LIMIT = 3_000
+const OUTLINE_MAX_ENTRIES = 20
+const OUTLINE_LINE_CHARS = 80
+
+const EDIT_TOOLS = new Set([
+  'str_replace',
+  'write_file',
+  'propose_str_replace',
+  'propose_write_file',
+])
+
+/** Runs agents whose edits stay out of this history. A shell command can
+ * change files too, but it is not counted: most commands change nothing. */
+const DELEGATING_TOOLS = new Set(['spawn_agents'])
+
+/** Status results (missing, blocked, too large, error) are not contents. */
+const STATUS_PREFIXES = [
+  '[FILE_DOES_NOT_EXIST]',
+  '[BLOCKED]',
+  '[FILE_OUTSIDE_PROJECT]',
+  '[FILE_READ_ERROR]',
+  '[IMAGE]',
+]
+
+export function isWorkingSetMessage(message: Message): boolean {
+  return message.tags?.includes(WORKING_SET_TAG) ?? false
+}
+
+type Read = {
+  path: string
+  content: string
+  /** Position in the history; later reads and edits compare against it. */
+  order: number
+}
+
+function pathOf(input: unknown): string | undefined {
+  const path = (input as { path?: unknown } | undefined)?.path
+  return typeof path === 'string' && path ? path : undefined
+}
+
+/** Every read_files result and every edit, in history order. */
+function collectReadsAndEdits(messages: Message[]): {
+  reads: Read[]
+  lastEdit: Map<string, number>
+  /** The newest delegation, which may have edited any file; -1 for none. */
+  lastDelegation: number
+} {
+  const reads: Read[] = []
+  const lastEdit = new Map<string, number>()
+  let lastDelegation = -1
+  messages.forEach((message, order) => {
+    if (message.role === 'assistant') {
+      for (const part of message.content) {
+        if (part.type !== 'tool-call') continue
+        if (DELEGATING_TOOLS.has(part.toolName)) lastDelegation = order
+        if (!EDIT_TOOLS.has(part.toolName)) continue
+        const path = pathOf(part.input)
+        if (path) lastEdit.set(path, order)
+      }
+      return
+    }
+    if (message.role !== 'tool' || message.toolName !== 'read_files') return
+    for (const part of message.content) {
+      if (part.type !== 'json' || !Array.isArray(part.value)) continue
+      for (const file of part.value) {
+        if (!file || typeof file !== 'object' || Array.isArray(file)) continue
+        const { path, content } = file as { path?: unknown; content?: unknown }
+        if (typeof path !== 'string' || typeof content !== 'string') continue
+        reads.push({ path, content, order })
+      }
+    }
+  })
+  return { reads, lastEdit, lastDelegation }
+}
+
+const DECLARATION_PATTERNS = [
+  // TypeScript / JavaScript
+  /^(export\s+)?(default\s+)?(declare\s+)?(abstract\s+)?(async\s+)?(function\b|class\b|interface\b|type\s+\w|enum\b|namespace\b)/,
+  /^export\s+(const|let|var)\b/,
+  // Python
+  /^(async\s+)?def\s+\w/,
+  /^class\s+\w/,
+  // Go
+  /^func\s/,
+  /^type\s+\w+\s+(struct|interface)\b/,
+  // Rust
+  /^(pub(\([^)]*\))?\s+)?(async\s+)?(fn|struct|enum|trait|impl|mod)\b/,
+  // Markdown
+  /^#{1,3}\s+\S/,
+]
+
+/**
+ * Top-level declarations with their line numbers. A windowed read starts its
+ * numbering at the window's first line, which the read's own notice states.
+ */
+export function outlineOf(content: string): { lines: number; outline: string } {
+  const window = content.match(
+    /\[read_files: showing lines (\d+)-\d+ of (\d+)\./,
+  )
+  const firstLine = window ? Number(window[1]) : 1
+  const body = content.split('\n')
+  const lines = window ? Number(window[2]) : body.length
+  const entries: string[] = []
+  let more = 0
+  for (let i = 0; i < body.length; i++) {
+    const line = body[i]
+    if (!DECLARATION_PATTERNS.some((pattern) => pattern.test(line))) continue
+    if (entries.length >= OUTLINE_MAX_ENTRIES) {
+      more++
+      continue
+    }
+    const text = line.trim().replace(/\s*\{$/, '')
+    entries.push(
+      `L${firstLine + i} ${text.length > OUTLINE_LINE_CHARS ? text.slice(0, OUTLINE_LINE_CHARS) + '…' : text}`,
+    )
+  }
+  if (more > 0) entries.push(`… ${more} more`)
+  return { lines, outline: entries.join('\n') }
+}
+
+type StubReason = 'budget' | 'edited' | 'delegated'
+
+function stubFor(read: Read, reason: StubReason): string {
+  if (read.content.startsWith(COMPACTED_READ_MARKER)) return read.content
+  const { lines, outline } = outlineOf(read.content)
+  const why =
+    reason === 'edited'
+      ? 'You edited it after this read, so read it again before relying on it.'
+      : reason === 'delegated'
+        ? 'Agents you spawned after this read may have edited it, so read it again before relying on it.'
+        : 'Read it again (a section with offset/limit is enough) if you need it.'
+  return `${COMPACTED_READ_MARKER}. ${lines} lines when read. ${why}]${outline ? `\nOutline:\n${outline}` : ''}`
+}
+
+/**
+ * The working-set exchange for `older` (the history being summarized), or
+ * null when there is nothing to carry. `fresh` is kept verbatim by the caller:
+ * its reads are already present, and its edits make older reads stale.
+ */
+export function buildWorkingSet(params: {
+  older: Message[]
+  fresh: Message[]
+  tokenBudget: number
+  noteBudget?: number
+  now: number
+}): { messages: Message[]; files: number; stubs: number } | null {
+  const { reads, lastEdit, lastDelegation } = collectReadsAndEdits([
+    ...params.older,
+    ...params.fresh,
+  ])
+  const freshStart = params.older.length
+  const latest = new Map<string, Read>()
+  for (const read of reads) {
+    if (read.order >= freshStart) continue
+    if (STATUS_PREFIXES.some((prefix) => read.content.startsWith(prefix)))
+      continue
+    latest.set(read.path, read)
+  }
+  const freshPaths = new Set(
+    reads.filter((read) => read.order >= freshStart).map((read) => read.path),
+  )
+  // Newest first: the files the model was working with most recently.
+  const candidates = [...latest.values()]
+    .filter((read) => !freshPaths.has(read.path))
+    .sort((a, b) => b.order - a.order)
+  if (candidates.length === 0) return null
+
+  const exchange = (files: { path: string; content: string }[]): Message[] => {
+    const toolCallId = `compacted-read-${params.now.toString(36)}`
+    return [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId,
+            toolName: 'read_files',
+            input: { paths: files.map((file) => file.path) },
+          },
+        ],
+        tags: [WORKING_SET_TAG],
+        sentAt: params.now,
+      },
+      {
+        role: 'tool',
+        toolCallId,
+        toolName: 'read_files',
+        content: [{ type: 'json', value: files }],
+        tags: [WORKING_SET_TAG],
+      },
+    ]
+  }
+  // Counted per file, once: the result entry plus the path in the call.
+  const cost = (file: { path: string; content: string }) =>
+    countTokensJson(file) + countTokensJson(file.path) + 1
+  let used = countTokensMessages(exchange([]))
+
+  const carried: { path: string; content: string }[] = []
+  const left: { read: Read; reason: StubReason }[] = []
+  for (const read of candidates) {
+    const stale: StubReason | undefined =
+      (lastEdit.get(read.path) ?? -1) > read.order
+        ? 'edited'
+        : lastDelegation > read.order
+          ? 'delegated'
+          : undefined
+    const file = { path: read.path, content: read.content }
+    if (
+      !stale &&
+      !read.content.startsWith(COMPACTED_READ_MARKER) &&
+      used + cost(file) <= params.tokenBudget
+    ) {
+      carried.push(file)
+      used += cost(file)
+    } else {
+      left.push({ read, reason: stale ?? 'budget' })
+    }
+  }
+
+  let stubRoom = Math.min(STUB_TOKEN_LIMIT, params.tokenBudget - used)
+  let noteRoom = (params.noteBudget ?? params.tokenBudget) - used
+  const stubs: { path: string; content: string }[] = []
+  for (const { read, reason } of left) {
+    const stub = { path: read.path, content: stubFor(read, reason) }
+    if (cost(stub) <= Math.min(stubRoom, noteRoom)) {
+      stubs.push(stub)
+      stubRoom -= cost(stub)
+      noteRoom -= cost(stub)
+      continue
+    }
+    const note = { path: read.path, content: stub.content.split('\n')[0] }
+    if (cost(note) > noteRoom) continue
+    stubs.push(note)
+    noteRoom -= cost(note)
+  }
+
+  const files = [...carried, ...stubs]
+  if (files.length === 0) return null
+  return {
+    messages: exchange(files),
+    files: carried.length,
+    stubs: stubs.length,
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `packages/agent-runtime/src/__tests__/compaction-working-set.test.ts` (32 matching lines):
+```
+/** A long session, then the live request; filler makes the history worth compacting. */
+const session = (...work: Message[][]): Message[] => [
+  user('Make the uploader retry on 429s.'),
+  ...work.flat(),
+  said('FILLER '.repeat(30_000)),
+  user('Now add jitter.', true),
+]
+
+describe('mechanical compaction working set', () => {
+  it('re-provides a read file whole, after the live request, and still logs the read', () => {
+    const upload = source('upload', 50)
+    const compacted = compactHistoryNow({
+      messages: session(read('r1', { 'src/upload.ts': upload })),
+      maxContextLength: 400_000,
+    })!
+    const files = workingSet(compacted.messages)
+    expect(files).toEqual([{ path: 'src/upload.ts', content: upload }])
+    const order = compacted.messages.map((m) =>
+      m.tags?.includes('USER_PROMPT')
+        ? 'live'
+        : m.tags?.includes(WORKING_SET_TAG)
+          ? m.role
+          : 'other',
+    )
+    expect(order.slice(-3)).toEqual(['live', 'assistant', 'tool'])
+    expect(compacted.summaryText).toContain('inspected files: src/upload.ts')
+  })
+
+  it('never re-provides contents the model edited after reading them', () => {
+    const compacted = compactHistoryNow({
+```
+- File `common/src/util/file-read-limits.ts` (5 matching lines):
+```
+return { chars, tokens, truncated: false }
+}
+
+function limitFileReadContent(
+  content: string,
+  remainingChars: number,
+  remainingTokens: number,
+  countTokens?: (text: string) => number,
+): LimitedFileRead {
+  const charLimit = Math.min(content.length, Math.max(0, remainingChars))
+  const safeCharLimit = avoidSplittingSurrogatePair(content, charLimit)
+  const charLimitedContent = content.slice(0, safeCharLimit)
+  const tokenBudget = Math.max(0, remainingTokens)
+  const tokenLimit = countTokens
+    ? limitContentByTokens(charLimitedContent, tokenBudget, countTokens)
+    : {
+        chars: charLimitedContent.length,
+        tokens: 0,
+        truncated: false,
+      }
+  const includedChars = tokenLimit.chars
+  const includedTokens = tokenLimit.tokens
+
+  if (includedChars === content.length) {
+    return { content, includedChars, includedTokens }
+  }
+
+  let notice: string
+  if (tokenLimit.truncated) {
+    const hitAggregateLimit = remainingTokens < MAX_READ_FILES_TOKENS
+    notice = hitAggregateLimit
+      ? `${FILE_READ_STATUS.TOO_LARGE}: The combined read_files output exceeded the ${MAX_READ_FILES_TOKENS.toLocaleString()} estimated-token limit. This file was truncated after ${includedTokens.toLocaleString()} estimated tokens. Read it separately or use code_search for the relevant section.`
+      : `${FILE_READ_STATUS.TOO_LARGE}: This file exceeded the ${MAX_READ_FILES_TOKENS.toLocaleString()} estimated-token per-file limit. It was truncated after ${includedTokens.toLocaleString()} estimated tokens. Use code_search or a more targeted read for the relevant section.`
+  } else {
+    const hitAggregateLimit = remainingChars < MAX_READ_FILES_CHARS
+    notice = hitAggregateLimit
+      ? `${FILE_READ_STATUS.TOO_LARGE}: The combined read_files output exceeded the ${MAX_READ_FILES_CHARS.toLocaleString()} character hard limit. This file was truncated after ${includedChars.toLocaleString()} characters. Read it separately or use code_search for the relevant section.`
+      : `${FILE_READ_STATUS.TOO_LARGE}: This file is ${content.length.toLocaleString()} characters, exceeding the ${MAX_READ_FILES_CHARS.toLocaleString()} character hard limit. The content above has been truncated. Use code_search or a more targeted read for the relevant section.`
+  }
+
+  return {
+    content:
+…
+includedChars,
+    includedTokens,
+  }
+}
+
+/**
+ * Creates an ordered limiter for one read_files invocation. Status/error
+ * messages should bypass this limiter so they do not consume the content
+ * budget.
+ */
+export function createFileReadLimiter(options: FileReadLimiterOptions = {}) {
+  let remainingChars = MAX_READ_FILES_CHARS
+  let remainingTokens = MAX_READ_FILES_TOKENS
+
+  return {
+    limit(content: string): string {
+      const limited = limitFileReadContent(
+        content,
+        remainingChars,
+        remainingTokens,
+        options.countTokens,
+      )
+      remainingChars -= limited.includedChars
+      remainingTokens -= limited.includedTokens
+      return limited.content
+```
+- File `packages/agent-runtime/src/run-agent-step.ts` (5 matching lines):
+```
+fixedTokenCount,
+            },
+            'Deferred compaction to the hard budget: it could not clear the threshold',
+          )
+          trigger = null
+        }
+        if (trigger) {
+          const started = Date.now()
+          const isRoot = !initialAgentState.parentId
+          if (isRoot) params.onCompactionStart?.({ trigger })
+          let compacted: ReturnType<typeof compactMechanically> = null
+          try {
+            compacted = compactMechanically({
+              messages: currentAgentState.messageHistory,
+              maxContextLength,
+              fixedTokenCount,
+              targetTokens:
+                trigger === 'manual'
+                  ? undefined
+                  : Math.floor(thresholdTokens * MECHANICAL_TARGET_SHARE),
+              trigger,
+              logger,
+              runId,
+              model: agentTemplate.model,
+              contextTokenCount: currentAgentState.contextTokenCount,
+            })
+            if (compacted) {
+              if (compactionWindow)
+                closeCompactionWindow({
+                  window: compactionWindow,
+                  messages: currentAgentState.messageHistory,
+                  endedBy: 'compaction',
+                  nextTrigger: trigger,
+                  logger,
+                  runId,
+                  model: agentTemplate.model,
+                })
+              compactionWindow = openCompactionWindow({
+                before: currentAgentState.messageHistory,
+                after: compacted.messages,
+                trigger,
+              })
+              currentAgentState.messageHistory = compacted.messages
+              currentAgentState.contextTokenBaseline = undefined
+              currentAgentState.contextTokenCount = compacted.postTokens
+              if (isRoot)
+                params.onCompaction?.({
+                  trigger,
+                  thresholdTokens,
+                  summary: compacted.summary,
+                  preTokens: compacted.preTokens,
+                  postTokens: compacted.postTokens,
+                  durationMs: Date.now() - started,
+                })
+            }
+```
+- File `sdk/src/compact-run-state.ts` (5 matching lines):
+```
+if (!sessionState || !agentState) return null
+  const previousHistory = agentState.messageHistory
+  if (!previousHistory?.length) return null
+
+  // The other half of the count, recovered from what the root agent stored
+  // beside its history. An older checkpoint may carry neither, in which case
+  // this is 0 and the budget is simply the whole window — the pass still runs,
+  // it just has slightly more room than the next turn will.
+  const fixedTokenCount =
+    countTokens(agentState.systemPrompt ?? '') +
+    countTokensJson(agentState.toolDefinitions ?? {})
+
+  const compacted = compactHistoryNow({
+    messages: previousHistory,
+    maxContextLength,
+    fixedTokenCount,
+    ...(logger ? { logger } : {}),
+    ...(agentState.runId ? { runId: agentState.runId } : {}),
+  })
+  if (!compacted) return null
+
+  const next = cloneSessionState(sessionState, logger)
+  next.mainAgentState.messageHistory = compacted.messages
+  next.mainAgentState.contextTokenBaseline = undefined
+  next.mainAgentState.contextTokenCount =
+    countTokensMessages(compacted.messages) + fixedTokenCount
+  return {
+    runState: { ...runState, sessionState: next },
+    previousTokens: compacted.previousTokens + fixedTokenCount,
+    nextTokens: next.mainAgentState.contextTokenCount,
+  }
+}
+
+/**
+ * Cut a stored run's history back to the point a user edit rewinds to.
+```
+- File `packages/agent-runtime/src/__tests__/compact-history.test.ts` (4 matching lines):
+```
+).toBe('cache_expiry')
+    expect(
+      evaluateCompactionTrigger({
+        messages: idleTurn(90),
+        contextTokenCount: tiny,
+        maxContextLength: 400_000,
+        cacheExpiryMinTokens: null,
+      }).trigger,
+    ).toBe('cache_expiry')
+  })
+
+  it('the floor never blocks the context-limit trigger', () => {
+    // A context over the limit must be compacted whatever the floor says.
+    expect(
+      evaluateCompactionTrigger({
+        messages: idleTurn(45),
+        contextTokenCount: 500_000,
+        maxContextLength: 400_000,
+        cacheExpiryMinTokens: 10_000_000,
+      }).trigger,
+    ).toBe('context_limit')
+  })
+
+  it('reports both when both are true', () => {
+    expect(triggerFor(idleTurn(90), 500_000)).toBe(
+…
+it('a null TTL disables the opportunistic trigger entirely', () => {
+    expect(triggerFor(idleTurn(600), WORTH_COMPACTING, null)).toBeNull()
+    // The context limit still fires.
+    expect(triggerFor(idleTurn(600), 500_000, null)).toBe('context_limit')
+  })
+
+  it('does not re-fire on the steps that follow a cache-expiry compaction', () => {
+    const history = idleTurn(90)
+    expect(triggerFor(history, WORTH_COMPACTING)).toBe('cache_expiry')
+
+    // Compaction restamps every surviving message and drops the assistant
+    // messages that preceded the live prompt, so the gap is gone.
+    const compacted = compact(history)
+    expect(triggerFor(compacted, WORTH_COMPACTING)).toBeNull()
+
+    // ...and stays gone as the turn accumulates more work.
+    expect(
+      triggerFor(
+        [...compacted, assistant('one'), assistant('two')],
+        WORTH_COMPACTING,
+      ),
+    ).toBeNull()
+  })
+
+  it('fires again on the next turn if the user idles again', () => {
+    const nextTurn: Message[] = [
+```
+- File `sdk/src/__tests__/truncate-run-state.test.ts` (3 matching lines):
+```
+keepUserTurns: 2,
+    })
+    expect(texts(next)).toEqual([
+      'one',
+      'partial one',
+      '<system>Run cancelled by user.</system>',
+      'two',
+      '<system>Run cancelled by user.</system>',
+    ])
+  })
+
+  /** A long thread after compaction: old prompts live only in the summary. */
+  const compacted = () => [
+    {
+      role: 'user' as const,
+      tags: ['MODEL_COMPACTION'],
+      content: [
+        {
+          type: 'text' as const,
+          text: '<conversation_summary>turns one to eight</conversation_summary>',
+        },
+      ],
+    },
+    user('nine'),
+    assistant('answered nine'),
+    stopNote(),
+    user('ten'),
+    stopNote(),
+  ]
+
+  test('a compacted thread keeps its memory when a recent message is edited', () => {
+    // The transcript still shows ten user rows; the history holds two prompts.
+    // Counting from the start could not place turn ten and answered null, so
+    // the edit cleared the whole conversation.
+    const next = truncateRunStateAtUserTurn({
+      runState: runStateWith(compacted()),
+      keepUserTurns: 9,
+      totalUserTurns: 10,
+    })
+    expect(texts(next)).toEqual([
+      '<conversation_summary>turns one to eight</conversation_summary>',
+      'nine',
+      'answered nine',
+      '<system>Run cancelled by user.</system>',
+    ])
+    expect(
+      truncateRunStateAtUserTurn({
+        runState: runStateWith(compacted()),
+        keepUserTurns: 8,
+        totalUserTurns: 10,
+      }),
+    ).not.toBeNull()
+  })
+
+  test('an edit reaching into the compacted summary still answers null', () => {
+    // Turn five exists only inside the summary; no cut can remove it.
+    expect(
+      truncateRunStateAtUserTurn({
+        runState: runStateWith(compacted()),
+        keepUserTurns: 4,
+        totalUserTurns: 10,
+      }),
+    ).toBeNull()
+  })
+
+  test('counting from the end agrees with counting from the start on an aligned history', () => {
+    for (const keep of [1, 2]) {
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `packages/agent-runtime/src/__tests__/compact-context-loop.test.ts`: "still compacts at the hard budget, keeping a summary and a note for every earlier read"
+```
+    it('still compacts at the hard budget, keeping a summary and a note for every earlier read', async () => {
+      expect(sent.includes('<conversation_summary>')).toBe(true)
+      for (let i = 0; i < 7; i++) expect(sent.includes(`"path":"file${i}.ts"`)).toBe(true)
+      expect(sent.match(/contents dropped at compaction/g)).toHaveLength(7)
+```
+- File `packages/agent-runtime/src/__tests__/compaction-working-set.test.ts`: "keeps a note for every file read when the target leaves no room"
+```
+  it('keeps a note for every file read when the target leaves no room', () => {
+    const compacted = compactHistoryNow({
+      messages: longSession(),
+      maxContextLength: 40_000,
+      fixedTokenCount: 16_000,
+      targetTokens: 10_000,
+    })!
+    const paths = workingSet(compacted.messages)!.map((f) => f.path)
+    for (let i = 0; i < 40; i++)
+      expect(paths).toEqual(
+        expect.arrayContaining([`src/a${i}.ts`, `src/b${i}.ts`]),
+      )
+    expect(compacted.summaryText).toContain('Request 39')
+    expect(compacted.nextTokens + 16_000).toBeLessThanOrEqual(40_000)
+  })
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/packages/agent-runtime/src/compact-history.ts b/packages/agent-runtime/src/compact-history.ts
+index 5c5521a53..7dbc0e18a 100644
+--- a/packages/agent-runtime/src/compact-history.ts
++++ b/packages/agent-runtime/src/compact-history.ts
+@@ -88,50 +88,52 @@ const CONTINUATION_TEXT =
+ 
+ /** Thresholds for agents that declare `compactContext: true` without tuning;
+  *  owned, with the rationale, by common/src/constants/compaction-policy.ts. */
+ export const DEFAULT_CACHE_EXPIRY_MS = DEFAULT_COMPACTION_POLICY.cacheExpiryMs
+ export const DEFAULT_CACHE_EXPIRY_MIN_TOKENS =
+   DEFAULT_COMPACTION_POLICY.cacheExpiryMinTokens
+ 
+ /**
+  * Where an automatic mechanical pass aims, as a share of the trigger
+  * threshold. Its result must leave real room under the threshold: when a pass
+  * kept 80-100% of the history, the same run compacted again within ten minutes
+  * 22-51% of the time (prod, 2026-10-05), against 2.6% when it kept under 10%.
+  * Fresh tool results are exempt; see `compactRequestHistory`.
+  */
+ export const MECHANICAL_TARGET_SHARE = 0.5
+ 
+ /**
+  * The most a mechanical pass rewrites history into: summary plus working set,
+  * on top of the fixed prompt, the live request and the fresh tool results it
+  * keeps whole. Sized so the result lands near a model handoff's (median ~23k
+  * tokens including the fixed prompt, 2026-10-05) rather than filling the
+  * target: a small result leaves the most room before the next compaction.
+  */
+ export const MECHANICAL_HISTORY_TOKENS = 12_000
+ 
++const MIN_HISTORY_TOKENS = 2_000
++
+ /** Separator between entries inside the rendered historical memory. */
+ const ENTRY_SEPARATOR = '\n\n---\n\n'
+ 
+ /** Matches the context-pruner's `trigger_reason` values so Axiom can union them. */
+ export type CompactionTrigger =
+   | 'context_limit'
+   | 'cache_expiry'
+   | 'context_limit_and_cache_expiry'
+ 
+ type SummaryEntry = {
+   role: 'user' | 'assistant_tool'
+   parts: string[]
+ }
+ 
+ /**
+  * Truncates long text with 80% from the beginning and 20% from the end.
+  */
+ function truncateLongText(text: string, limit: number): string {
+   if (text.length <= limit) {
+     return text
+   }
+   const availableChars = limit - 50 // 50 chars for the truncation notice
+   const prefixLength = Math.floor(availableChars * 0.8)
+   const suffixLength = availableChars - prefixLength
+   const prefix = text.slice(0, prefixLength)
+@@ -983,68 +985,72 @@ function compactRequestHistory(
+             !entry.parts.includes(`[USER]\n${CONTINUATION_TEXT}`),
+         )
+       : undefined
+   const reservedMemory = historicalRequest
+     ? countTokensMessages([
+         buildSummaryMessage(renderSummaryText([historicalRequest]), [], now),
+       ])
+     : 0
+   const prefixTokens = countTokensMessages(prefix)
+   if (prefixTokens + reservedMemory > tokenBudget) {
+     throw new Error(
+       'The current request and agent instructions exceed the configured context window. Shorten the request/project instructions or configure a larger context window supported by your provider.',
+     )
+   }
+   const fitted = fitToolResults(
+     fresh,
+     tokenBudget - prefixTokens - reservedMemory,
+   )
+   const fittedTokens = countTokensMessages(fitted)
+   const hardRemaining = tokenBudget - prefixTokens - fittedTokens
+   // Optional content stops at the target, but never squeezes out the request
+   // reserved above.
+   const optionalTokens = Math.max(
+     Math.min(
+       hardRemaining,
+-      targetBudget - prefixTokens - fittedTokens,
++      Math.max(targetBudget - prefixTokens - fittedTokens, MIN_HISTORY_TOKENS),
+       historyBudget,
+     ),
+     reservedMemory,
+   )
+   const workingSet = buildWorkingSet({
+     older,
+     fresh,
+     tokenBudget: Math.min(
+       WORKING_SET_TOKEN_LIMIT,
+       Math.floor((optionalTokens - reservedMemory) * WORKING_SET_SHARE),
+     ),
++    noteBudget: hardRemaining - reservedMemory,
+     now,
+   })
+   const workingSetTokens = workingSet
+     ? countTokensMessages(workingSet.messages)
+     : 0
+-  const remainingTokens = optionalTokens - workingSetTokens
++  const remainingTokens = Math.max(
++    optionalTokens - workingSetTokens,
++    Math.min(MIN_HISTORY_TOKENS, hardRemaining - workingSetTokens),
++  )
+ 
+   // Keep the newest historical entries that fit the actual remainder. The
+   // 50k/20k summary budgets are ceilings, never permission to exceed a BYOK
+   // window. Count the envelope and images too, not just summary text.
+   const selected = new Set<SummaryEntry>(
+     historicalRequest ? [historicalRequest] : [],
+   )
+   let images = result.messages[0].content.filter(
+     (part): part is ImagePart | FilePart =>
+       part.type === 'image' || part.type === 'file',
+   )
+   if (
+     countTokensMessages([
+       buildSummaryMessage(renderSummaryText([...selected]), images, now),
+     ]) > remainingTokens
+   )
+     images = []
+   let available =
+     remainingTokens -
+     countTokensMessages([
+       buildSummaryMessage(renderSummaryText([...selected]), images, now),
+     ])
+   for (let i = entries.length - 1; i >= 0; i--) {
+     if (selected.has(entries[i])) continue
+     const tokens = countTokens(
+diff --git a/packages/agent-runtime/src/compaction-working-set.ts b/packages/agent-runtime/src/compaction-working-set.ts
+index 2c942eaaf..2bad18864 100644
+--- a/packages/agent-runtime/src/compaction-working-set.ts
++++ b/packages/agent-runtime/src/compaction-working-set.ts
+@@ -167,50 +167,51 @@ export function outlineOf(content: string): { lines: number; outline: string } {
+ }
+ 
+ type StubReason = 'budget' | 'edited' | 'delegated'
+ 
+ function stubFor(read: Read, reason: StubReason): string {
+   if (read.content.startsWith(COMPACTED_READ_MARKER)) return read.content
+   const { lines, outline } = outlineOf(read.content)
+   const why =
+     reason === 'edited'
+       ? 'You edited it after this read, so read it again before relying on it.'
+       : reason === 'delegated'
+         ? 'Agents you spawned after this read may have edited it, so read it again before relying on it.'
+         : 'Read it again (a section with offset/limit is enough) if you need it.'
+   return `${COMPACTED_READ_MARKER}. ${lines} lines when read. ${why}]${outline ? `\nOutline:\n${outline}` : ''}`
+ }
+ 
+ /**
+  * The working-set exchange for `older` (the history being summarized), or
+  * null when there is nothing to carry. `fresh` is kept verbatim by the caller:
+  * its reads are already present, and its edits make older reads stale.
+  */
+ export function buildWorkingSet(params: {
+   older: Message[]
+   fresh: Message[]
+   tokenBudget: number
++  noteBudget?: number
+   now: number
+ }): { messages: Message[]; files: number; stubs: number } | null {
+   const { reads, lastEdit, lastDelegation } = collectReadsAndEdits([
+     ...params.older,
+     ...params.fresh,
+   ])
+   const freshStart = params.older.length
+   const latest = new Map<string, Read>()
+   for (const read of reads) {
+     if (read.order >= freshStart) continue
+     if (STATUS_PREFIXES.some((prefix) => read.content.startsWith(prefix)))
+       continue
+     latest.set(read.path, read)
+   }
+   const freshPaths = new Set(
+     reads.filter((read) => read.order >= freshStart).map((read) => read.path),
+   )
+   // Newest first: the files the model was working with most recently.
+   const candidates = [...latest.values()]
+     .filter((read) => !freshPaths.has(read.path))
+     .sort((a, b) => b.order - a.order)
+   if (candidates.length === 0) return null
+ 
+   const exchange = (files: { path: string; content: string }[]): Message[] => {
+     const toolCallId = `compacted-read-${params.now.toString(36)}`
+@@ -243,41 +244,49 @@ export function buildWorkingSet(params: {
+   let used = countTokensMessages(exchange([]))
+ 
+   const carried: { path: string; content: string }[] = []
+   const left: { read: Read; reason: StubReason }[] = []
+   for (const read of candidates) {
+     const stale: StubReason | undefined =
+       (lastEdit.get(read.path) ?? -1) > read.order
+         ? 'edited'
+         : lastDelegation > read.order
+           ? 'delegated'
+           : undefined
+     const file = { path: read.path, content: read.content }
+     if (
+       !stale &&
+       !read.content.startsWith(COMPACTED_READ_MARKER) &&
+       used + cost(file) <= params.tokenBudget
+     ) {
+       carried.push(file)
+       used += cost(file)
+     } else {
+       left.push({ read, reason: stale ?? 'budget' })
+     }
+   }
+ 
+   let stubRoom = Math.min(STUB_TOKEN_LIMIT, params.tokenBudget - used)
++  let noteRoom = (params.noteBudget ?? params.tokenBudget) - used
+   const stubs: { path: string; content: string }[] = []
+   for (const { read, reason } of left) {
+     const stub = { path: read.path, content: stubFor(read, reason) }
+-    if (cost(stub) > stubRoom) continue
+-    stubs.push(stub)
+-    stubRoom -= cost(stub)
++    if (cost(stub) <= Math.min(stubRoom, noteRoom)) {
++      stubs.push(stub)
++      stubRoom -= cost(stub)
++      noteRoom -= cost(stub)
++      continue
++    }
++    const note = { path: read.path, content: stub.content.split('\n')[0] }
++    if (cost(note) > noteRoom) continue
++    stubs.push(note)
++    noteRoom -= cost(note)
+   }
+ 
+   const files = [...carried, ...stubs]
+   if (files.length === 0) return null
+   return {
+     messages: exchange(files),
+     files: carried.length,
+     stubs: stubs.length,
+   }
+ }
+
+```
