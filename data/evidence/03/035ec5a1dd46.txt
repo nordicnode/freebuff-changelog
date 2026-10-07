@@ -1,0 +1,1111 @@
+Date: 2026-10-07T00:24:22Z
+Category: SDK
+Areas: SDK
+Commit nature: production
+Stats: +110 / -5
+Analysis notes: SDK changes across 1 file(s) (+110/−5).
+Modified files: sdk/src/impl/model-provider.ts
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "the same capacity refusal over HTTP" ; "any other 503 is still retried"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `sdk/src/impl/model-provider.ts`:
+```
+/**
+ * Builds the language model every request runs on: the Codebuff backend,
+ * which forwards to OpenRouter.
+ */
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `sdk/README.md`:
+```markdown
+# @codebuff/sdk
+
+Official SDK for Codebuff - AI coding agent and framework
+
+## Installation
+
+```bash
+npm install @codebuff/sdk
+```
+
+## Prerequisites
+
+- Create a Codebuff account and get your [Codebuff API key here](https://www.codebuff.com/api-keys).
+
+## Usage
+
+### Basic Example
+
+```typescript
+import { CodebuffClient } from '@codebuff/sdk'
+
+async function main() {
+  const client = new CodebuffClient({
+    //[freebuff product prompt text omitted]
+    // Get one here: https://www.codebuff.com/api-keys
+    apiKey: process.env.CODEBUFF_API_KEY,
+    cwd: process.cwd(),
+  })
+
+  // First run
+  const runState1 = await client.run({
+    // The agent id. Any agent on the store (https://codebuff.com/store)
+    agent: 'codebuff/base@0.0.16',
+    prompt: 'Create a simple calculator class',
+    handleEvent: (event) => {
+      // All events that happen during the run: agent start/finish, tool calls/results, text responses, errors.
+      console.log('Codebuff Event', JSON.stringify(event))
+    },
+  })
+
+  // Continue the same session with a follow-up
+  const runOrError2 = await client.run({
+    agent: 'codebuff/base@0.0.16',
+    prompt: 'Add unit tests for the calculator',
+    previousRun: runState1, // <-- this is where your next run differs from the previous run
+    handleEvent: (event) => {
+      console.log('Codebuff Event', JSON.stringify(event))
+    },
+  })
+}
+
+main()
+```
+
+### Example 2: Custom Agents and Tools
+
+Here, we create a full agent and custom tools that can be reused between runs.
+
+```typescript
+import { z } from 'zod/v4'
+
+import { CodebuffClient, getCustomToolDefinition } from '@codebuff/sdk'
+
+import type { AgentDefinition } from '@codebuff/sdk'
+
+async function main() {
+  const client = new CodebuffClient({
+    //[freebuff product prompt text omitted]
+    // Get it here: https://www.codebuff.com/profile?tab=api-keys
+    apiKey: process.env.CODEBUFF_API_KEY,
+    // Optional directory agent runs from (if applicable).
+    cwd: process.cwd(),
+  })
+
+  // Define your own custom agents!
+  const myCustomAgent: AgentDefinition = {
+    id: 'my-custom-agent',
+    model: 'google/gemini-3.1-flash-lite',
+    displayName: 'Sentiment analyzer',
+    toolNames: ['fetch_api_data'], // Defined below!
+```
+Complete Source of Modified Files (for complete module context):
+- File `sdk/src/impl/model-provider.ts` (601 lines):
+```
+/**
+ * Builds the language model every request runs on: the Codebuff backend,
+ * which forwards to OpenRouter.
+ */
+
+import path from 'path'
+
+import { BYOK_OPENROUTER_HEADER } from '@codebuff/common/constants/byok'
+import {
+  FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+  FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+} from '@codebuff/common/constants/freebuff-errors'
+import { FREEBUFF_ACTING_USER_HEADER } from '@codebuff/common/constants/freebuff-models'
+import { FREEBUFF_GATE_CODES } from '@codebuff/common/types/freebuff-session'
+import { isAbortError, isFetchIdleTimeoutError, isTransientNetworkError } from '@codebuff/common/util/error'
+import {
+  OpenAICompatibleChatLanguageModel,
+  VERSION,
+} from '@codebuff/llm-providers/openai-compatible'
+import { APICallError } from 'ai'
+
+import { byokReasoningRetryBody, byokRequestTransform } from './byok-request'
+import { getWebsiteUrl } from '../constants'
+import { getByokOpenrouterApiKeyFromEnv } from '../env'
+import { ByokConnectionStateError, byokCompletionUrl, byokCredentialVariable } from '../byok'
+import type { ResolvedByokConnection } from '../byok'
+
+import type { LanguageModel } from 'ai'
+
+/**
+ * Parameters for requesting a model.
+ */
+export interface ModelRequestParams {
+  /** Codebuff API key for backend authentication */
+  apiKey: string
+  /** Model ID (OpenRouter format, e.g., "anthropic/claude-sonnet-4") */
+  model: string
+  /** End user represented by a trusted service-account request. */
+  userId?: string
+  /** Direct, run-scoped credential. Never stored on the model or in metadata. */
+  byok?: ResolvedByokConnection
+  /** Host-supplied headers per backend request; see CodebuffRequestHeadersProvider. */
+  requestHeaders?: CodebuffRequestHeadersProvider
+}
+
+/**
+ * Extra headers for one request to the Codebuff backend's completions
+ * endpoint, computed as the request is about to go out. `body` is the exact
+ * string the AI SDK serialized (what goes on the wire), so a host can sign it;
+ * the provider is asked again for every retry. Never consulted for a BYOK run,
+ * whose requests go to the user's own provider.
+ *
+ * Returning nothing (or throwing) adds no headers. Freebuff's catalog clients
+ * use it for their catalog headers (docs/freebuff-model-catalog.md).
+ */
+export type CodebuffRequestHeadersProvider = (request: {
+  method: string
+  url: string
+  body: string | Uint8Array | undefined
+}) =>
+  | Record<string, string>
+  | undefined
+  | Promise<Record<string, string> | undefined>
+
+// Usage accounting type for OpenRouter/Codebuff backend responses
+type OpenRouterUsageAccounting = {
+  cost: number | null
+  costDetails: {
+    upstreamInferenceCost: number | null
+  }
+}
+
+/**
+ * Notification hook for free-mode capacity deferrals. When the backend sheds
+ * a free-mode completion under saturation (HTTP 429 with
+ * `error: 'free_mode_capacity_deferred'` — see the server's
+ * free-mode-priority.ts), the AI SDK's retry loop absorbs the wait silently.
+ * Hosts (the CLI) can register here to surface a "high demand" indicator
+ * instead of an unexplained pause.
+ */
+export type FreeModeCapacityDeferral = { retryAfterSeconds: number }
+
+let freeModeCapacityDeferralListener:
+  | ((deferral: FreeModeCapacityDeferral) => void)
+  | null = null
+
+export function setFreeModeCapacityDeferralListener(
+  listener: ((deferral: FreeModeCapacityDeferral) => void) | null,
+): void {
+  freeModeCapacityDeferralListener = listener
+}
+
+function notifyCapacityDeferralFromResponse(response: Response): void {
+  if (response.status !== 429 || !freeModeCapacityDeferralListener) return
+  // Clone so the AI SDK still reads the original body for its own error
+  // handling/retry. Both the parse and the listener are best-effort: a
+  // malformed body or throwing listener must never break the request path.
+  void response
+    .clone()
+    .json()
+    .then((body: unknown) => {
+      const error =
+        body && typeof body === 'object' ? (body as any).error : undefined
+      if (error !== 'free_mode_capacity_deferred') return
+      const retryAfterHeader = Number(response.headers.get('retry-after'))
+      freeModeCapacityDeferralListener?.({
+        retryAfterSeconds:
+          Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+            ? retryAfterHeader
+            : 10,
+      })
+    })
+    .catch(() => {})
+}
+
+function requestUrlOf(input: Parameters<typeof globalThis.fetch>[0]): string {
+  return typeof input === 'string'
+    ? input
+    : input instanceof URL
+      ? input.toString()
+      : input.url
+}
+
+/** Retain recovery classification, never provider messages, URLs or raw causes. */
+export function sanitizeByokTransportError(error: unknown): Error {
+  if (isAbortError(error)) return new DOMException('BYOK request aborted', 'AbortError')
+  const safe = new Error('BYOK provider stream failed')
+  if (isFetchIdleTimeoutError(error)) {
+    Object.assign(safe, { code: 'ETIMEDOUT' })
+  } else if (isTransientNetworkError(error)) {
+    Object.assign(safe, { code: 'ECONNRESET' })
+  }
+  return safe
+}
+
+/** Preserve streaming while removing a credential even when it crosses chunks. */
+export function redactProviderStream(
+  body: ReadableStream<Uint8Array> | null,
+  secret: string,
+): ReadableStream<Uint8Array> | null {
+  if (!body || !secret) return body
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  let pending = ''
+  const retain = Math.max(0, secret.length - 1)
+  const redact = (text: string) => text.split(secret).join('[redacted]')
+  const transformed = body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      pending += decoder.decode(chunk, { stream: true })
+      let boundary = Math.max(0, pending.length - retain)
+      // Do not emit the prefix of a complete secret just because its suffix
+      // happens to be in the retained tail. Extend the safe boundary through
+      // every complete match that starts before it, then redact as one unit.
+      for (let start = pending.indexOf(secret); start !== -1; start = pending.indexOf(secret, start + secret.length)) {
+        if (start >= boundary) break
+        boundary = Math.max(boundary, start + secret.length)
+      }
+      controller.enqueue(encoder.encode(redact(pending.slice(0, boundary))))
+      pending = pending.slice(boundary)
+    },
+    flush(controller) {
+      pending += decoder.decode()
+      controller.enqueue(encoder.encode(redact(pending)))
+    },
+  }))
+  const reader = transformed.getReader()
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read()
+        if (next.done) controller.close()
+        else controller.enqueue(next.value)
+      } catch (error) {
+        controller.error(sanitizeByokTransportError(error))
+      }
+    },
+    cancel() { return reader.cancel().catch(() => {}) },
+  })
+}
+
+/**
+ * Does this provider error body say the MODEL ID is wrong?
+ *
+ * A mistyped model is the most common BYOK 400/404, and the provider usually
+ * says so plainly — DeepSeek answers `The supported API model names are
+ * deepseek-flash, deepseek-v4-pro, but you passed deepseek/deepseek-v4-flash`,
+ * OpenAI and Groq `The model \`x\` does not exist`, OpenRouter `x is not a
+ * valid model ID`. Behind the fixed "request failed (HTTP 400). Check the
+ * provider settings" line a user cannot tell that from a malformed request
+ * (support email, 2026-09-23: a DeepSeek key that "always" failed on one model
+ * id and worked on another). The body is only CLASSIFIED here; its text never
+ * reaches the message, which is built from the connection's own model id.
+ */
+export function isByokModelIdRejection(body: string): boolean {
+  if (!body) return false
+  const text = body.slice(0, 16_384)
+  return BYOK_MODEL_REJECTION_PATTERNS.some((pattern) => pattern.test(text))
+}
+
+/** Each names the MODEL as what is wrong, so an unrelated 400 that merely
+ *  mentions a model elsewhere in its body is not reclassified. */
+const BYOK_MODEL_REJECTION_PATTERNS: readonly RegExp[] = [
+  /"code"\s*:\s*"model_not_found"/i,
+  // The model — optionally followed by ONE id token (bare, quoted or
+  // `models/…`) — is itself the subject: "The model `x` does not exist",
+  // "models/gemini-9 is not found", "Model not found". Anything between the id
+  // and the verdict means something else is what failed: "model x: image
+  // input is not supported" is a capability refusal on a valid id, and
+  // calling it a bad id would send the user to fix the wrong thing.
+  /\bmodels?\b\s*[:=]?\s*(?:`[^`\n]{1,120}`|'[^'\n]{1,120}'|\\?"[^"\n]{1,120}?\\?"|[\w./:@+-]{1,120})?\s+(?:is\s+|was\s+)?(?:does not exist|not exist|not found|not supported)\b/i,
+  /\b(?:invalid|unknown|no such|not a valid|unable to access) model\b/i,
+  /\bsupported (?:api )?model(?: name)?s? (?:are|is)\b/i,
+]
+
+const MAX_MODEL_ID_IN_MESSAGE = 120
+
+/** A fixed, actionable message for a provider status. Never include upstream
+ * response text: gateways commonly echo credential fragments in error bodies.
+ * `modelRejected` is a classification of that text (isByokModelIdRejection),
+ * and `model` is the connection's own configured id — both ours to show. */
+export function getByokProviderErrorMessage(
+  status: number,
+  detail: {
+    model?: string
+    modelRejected?: boolean
+    /** The environment variable the key came from, a NAME and never a value. */
+    credentialVariable?: string
+  } = {},
+): string {
+  if (
+    detail.modelRejected &&
+    (status === 400 || status === 404 || status === 422)
+  ) {
+    const model = (detail.model ?? '').slice(0, MAX_MODEL_ID_IN_MESSAGE)
+    const named = model ? ` "${model}"` : ''
+    return `BYOK provider does not recognise the model ID${named} (HTTP ${status}). Use the exact model name from the provider's API model list and retry.`
+  }
+  if (status === 401)
+    return detail.credentialVariable
+      ? `BYOK provider rejected the API key in ${detail.credentialVariable} (HTTP 401). ${detail.credentialVariable} is set in this Freebuff process; check that it holds the key this endpoint expects, then restart Freebuff from that terminal.`
+      : 'BYOK provider rejected the API key (HTTP 401). Check or replace the key.'
+  if (status === 403)
+    return 'BYOK API key cannot access this model or account (HTTP 403). Choose an allowed model or use another key.'
+  if (status === 402)
+    return 'BYOK provider account needs credits or a supported plan (HTTP 402). Add provider credit or choose another model.'
+  if (status === 404)
+    return 'BYOK provider could not find this model or endpoint (HTTP 404). Check the model ID and provider URL.'
+  if (status === 429)
+    return 'BYOK provider rate limit reached (HTTP 429). Wait, then retry the task.'
+  if (status >= 500)
+    return `BYOK provider is temporarily unavailable (HTTP ${status}). Retry the task later.`
+  return `BYOK provider request failed (HTTP ${status}). Check the provider settings and retry.`
+}
+
+export const BYOK_CONNECTION_FAILURE_MESSAGE =
+  'Could not connect to the BYOK provider. Check the provider URL and network connection, then retry.'
+
+/**
+ * Refusals the server makes on purpose and repeats IDENTICALLY on a retry,
+ * each identified by its status AND its `error` code — never the status alone,
+ * since 409 and 429 are also ordinary, retryable answers.
+ *
+ * Left to the AI SDK, which treats every 409 and 429 as retryable, each of
+ * these was asked four times with backoff (~14s) and then failed as "Failed
+ * after 4 attempts. Last error: …". Throwing a NON-retryable APICallError
+ * stops the retry loop on the first refusal, and carrying the body lets the
+ * runtime's error parser hand the server's own copy and code to the client
+ * unchanged.
+ *
+ * - `turn_spend_limit` (429): the per-turn spend breaker is final for THIS
+ *   turn — its spend only grows, so the same run id is refused every time.
+ *   Clients read the retried failure as an ordinary rate limit and answered
+ *   it with "wait a moment or switch models", neither of which helps.
+ * - `session_superseded` (409): the start was refunded (the Desktop purchase
+ *   claim, or a refund that closed admission) or the session was taken over
+ *   by another instance. The row is gone, so every retry gets the same 409;
+ *   the user waited ~14s for the card that tells them to start a new session
+ *   (5,392 runs / 2,230 users in the 72h to 2026-10-05).
+ * - `model_at_capacity` (503): a queued free model had no slot within the
+ *   request's wait budget (web/.../model-queue.ts). Each retry re-enters the
+ *   queue and waits that budget again before the same refusal, so it is
+ *   surfaced at once — as its in-band form after the grace flush already is.
+ */
+const FINAL_REFUSALS: readonly {
+  status: number
+  error: string
+  /** Used only when the body carries no `message` of its own. */
+  fallbackMessage: string
+}[] = [
+  {
+    status: 429,
+    error: FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+    fallbackMessage: FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+  },
+  {
+    status: FREEBUFF_GATE_CODES.session_superseded.status,
+    error: 'session_superseded',
+    fallbackMessage:
+      'This Freebuff session has ended. Start a new session to try again.',
+  },
+  {
+    status: 503,
+    error: 'model_at_capacity',
+    fallbackMessage:
+      'This model is at capacity right now. Please try again in a few minutes or pick another model.',
+  },
+]
+
+async function throwIfFinalRefusal(
+  response: Response,
+  url: string,
+): Promise<void> {
+  // Only a status some refusal uses is worth reading the body for.
+  if (!FINAL_REFUSALS.some((r) => r.status === response.status)) return
+  const text = await response
+    .clone()
+    .text()
+    .catch(() => '')
+  let body: { error?: unknown; message?: unknown } | null = null
+  try {
+    body = JSON.parse(text)
+  } catch {
+    return
+  }
+  const refusal = FINAL_REFUSALS.find(
+    (r) => r.status === response.status && r.error === body?.error,
+  )
+  if (!refusal) return
+  throw new APICallError({
+    message:
+      typeof body?.message === 'string' && body.message
+        ? body.message
+        : refusal.fallbackMessage,
+    url,
+    requestBodyValues: {},
+    statusCode: response.status,
+    responseBody: text,
+    isRetryable: false,
+  })
+}
+
+/**
+ * Wrap global fetch so transient connection failures (socket closed/reset,
+ * connection refused) are rethrown as retryable APICallErrors, and the
+ * server's final refusals as non-retryable ones (see FINAL_REFUSALS).
+ *
+ * Bun's fetch throws these as plain Errors ("The socket connection was closed
+ * unexpectedly...", code ECONNRESET/ConnectionClosed), which the AI SDK does
+ * not recognize as retryable — it only auto-retries APICallError with
+ * isRetryable=true. Marking them retryable lets streamText's built-in
+ * exponential backoff (default 2 retries) absorb brief server/network blips
+ * instead of failing the whole agent run.
+ */
+function fetchWithRetryableNetworkErrors(
+  ...args: Parameters<typeof globalThis.fetch>
+): ReturnType<typeof globalThis.fetch> {
+  const url = requestUrlOf(args[0])
+  return globalThis.fetch(...args).then(
+    async (response) => {
+      notifyCapacityDeferralFromResponse(response)
+      await throwIfFinalRefusal(response, url)
+      return response
+    },
+    (error: unknown) => {
+      if (isTransientNetworkError(error)) {
+        throw new APICallError({
+          message: error instanceof Error ? error.message : String(error),
+          cause: error,
+          url,
+          requestBodyValues: {},
+          isRetryable: true,
+        })
+      }
+      throw error
+    },
+  )
+}
+
+function plainHeaders(headers: HeadersInit | undefined): Record<string, string> {
+  if (!headers) return {}
+  if (headers instanceof Headers) {
+    const out: Record<string, string> = {}
+    headers.forEach((value, key) => {
+      out[key] = value
+    })
+    return out
+  }
+  if (Array.isArray(headers)) return Object.fromEntries(headers)
+  return { ...(headers as Record<string, string>) }
+}
+
+/** `send`, with the host's extra headers merged in per request. */
+export function withCodebuffRequestHeaders(
+  provider: CodebuffRequestHeadersProvider,
+  send: (...args: Parameters<typeof globalThis.fetch>) => ReturnType<typeof globalThis.fetch>,
+): (...args: Parameters<typeof globalThis.fetch>) => ReturnType<typeof globalThis.fetch> {
+  return async (input, init) => {
+    const raw = init?.body
+    // Only a body whose exact bytes can be handed over; anything else (a
+    // stream) goes out without extra headers rather than with wrong ones.
+    if (raw != null && typeof raw !== 'string' && !(raw instanceof Uint8Array))
+      return send(input, init)
+    let extra: Record<string, string> | undefined
+    try {
+      extra = await provider({
+        method: (init?.method ?? 'GET').toUpperCase(),
+        url: requestUrlOf(input),
+        body: raw ?? undefined,
+      })
+    } catch {
+      extra = undefined
+    }
+    if (!extra || Object.keys(extra).length === 0) return send(input, init)
+    return send(input, {
+      ...init,
+      headers: { ...plainHeaders(init?.headers), ...extra },
+    })
+  }
+}
+
+/**
+ * Get the model for a request: one that routes through the Codebuff backend,
+ * which forwards to OpenRouter.
+ */
+export function getModelForRequest({
+  apiKey,
+  model,
+  userId,
+  byok,
+  requestHeaders,
+}: ModelRequestParams): LanguageModel {
+  if (byok) {
+    return new OpenAICompatibleChatLanguageModel(byok.model, {
+      provider: 'byok',
+      transformRequestBody: byokRequestTransform(byok),
+      url: () => byokCompletionUrl(byok),
+      headers: () => ({
+        Authorization: `Bearer ${byok.apiKey}`,
+        'user-agent': `ai-sdk/openai-compatible/${VERSION}/freebuff-byok`,
+      }),
+      // Check the durable revision before every provider attempt. The AI SDK
+      // invokes this again on retries and later tool-loop steps, so removing
+      // or replacing a connection stops subsequent inference immediately.
+      fetch: (async (...args: Parameters<typeof globalThis.fetch>) => {
+        // Revocation is a durable policy decision, never a transport retry.
+        try {
+          await byok.assertCurrent?.()
+        } catch (error) {
+          // Only our typed state errors carry display-safe messages. Custom
+          // resolvers and filesystem errors may contain credentials or paths.
+          throw new Error(
+            error instanceof ByokConnectionStateError
+              ? error.message
+              : 'Could not verify the saved BYOK connection. Reselect the provider and retry. If the problem persists, fully quit and restart Freebuff.',
+          )
+        }
+        try {
+          const send = (init: RequestInit | undefined) =>
+            globalThis.fetch(args[0], { ...(init ?? {}), redirect: 'error' })
+          let response = await send(args[1])
+          let errorText: string | undefined
+          if (response.status === 400 || response.status === 422) {
+            errorText = await response.text().catch(() => '')
+            // A provider or model that refuses the picked reasoning effort
+            // still answers the task: once, without the field, remembered
+            // for the connection so later steps do not ask again.
+            const retryBody = byokReasoningRetryBody(
+              byok,
+              args[1]?.body,
+              response.status,
+              errorText,
+            )
+            if (retryBody !== undefined) {
+              response = await send({ ...(args[1] ?? {}), body: retryBody })
+              errorText = undefined
+            }
+          }
+          if (!response.ok) {
+            const modelRejected =
+              response.status === 400 ||
+              response.status === 404 ||
+              response.status === 422
+                ? isByokModelIdRejection(
+                    errorText ?? (await response.text().catch(() => '')),
+                  )
+                : false
+            const headers = new Headers({ 'content-type': 'application/json' })
+            // Keep scheduling hints, but never copy arbitrary provider headers.
+            for (const name of ['retry-after', 'retry-after-ms']) {
+              const value = response.headers.get(name)
+              if (value && /^\d+(?:\.\d+)?$/.test(value)) headers.set(name, value)
+            }
+            return new Response(
+              JSON.stringify({
+                error: {
+                  message: getByokProviderErrorMessage(response.status, {
+                    model: byok.model,
+                    modelRejected,
+                    credentialVariable: byokCredentialVariable(byok),
+                  }),
+                },
+              }),
+              { status: response.status, headers },
+            )
+          }
+          return new Response(redactProviderStream(response.body, byok.apiKey), {
+            status: response.status,
+            headers: {
+              'content-type': response.headers.get('content-type') ?? 'text/event-stream',
+            },
+          })
+        } catch (error) {
+          const safe = sanitizeByokTransportError(error)
+          if (args[1]?.signal?.aborted || isAbortError(safe)) {
+            throw new DOMException('BYOK request aborted', 'AbortError')
+          }
+          throw new APICallError({
+            message: BYOK_CONNECTION_FAILURE_MESSAGE,
+            url: 'byok-provider',
+            requestBodyValues: {},
+            cause: safe,
+            isRetryable: isTransientNetworkError(safe),
+          })
+        }
+      }) as typeof globalThis.fetch,
+      includeUsage: true,
+      supportsStructuredOutputs: true,
+    })
+  }
+  const openrouterUsage: OpenRouterUsageAccounting = {
+    cost: null,
+    costDetails: {
+      upstreamInferenceCost: null,
+    },
+  }
+
+  const openrouterApiKey = getByokOpenrouterApiKeyFromEnv()
+
+  return new OpenAICompatibleChatLanguageModel(model, {
+    provider: 'codebuff',
+    url: ({ path: endpoint }) =>
+      new URL(path.join('/api/v1', endpoint), getWebsiteUrl()).toString(),
+    headers: () => ({
+      Authorization: `Bearer ${apiKey}`,
+      'user-agent': `ai-sdk/openai-compatible/${VERSION}/codebuff`,
+      ...(userId ? { [FREEBUFF_ACTING_USER_HEADER]: userId } : {}),
+      ...(openrouterApiKey && { [BYOK_OPENROUTER_HEADER]: openrouterApiKey }),
+    }),
+    metadataExtractor: {
+      extractMetadata: async ({ parsedBody }: { parsedBody: any }) => {
+        if (openrouterApiKey !== undefined) {
+          return { codebuff: { usage: openrouterUsage } }
+        }
+
+        if (typeof parsedBody?.usage?.cost === 'number') {
+          openrouterUsage.cost = parsedBody.usage.cost
+        }
+        if (
+          typeof parsedBody?.usage?.cost_details?.upstream_inference_cost ===
+          'number'
+        ) {
+          openrouterUsage.costDetails.upstreamInferenceCost =
+            parsedBody.usage.cost_details.upstream_inference_cost
+        }
+        return { codebuff: { usage: openrouterUsage } }
+      },
+      createStreamExtractor: () => ({
+        processChunk: (parsedChunk: any) => {
+          if (openrouterApiKey !== undefined) {
+            return
+          }
+
+          if (typeof parsedChunk?.usage?.cost === 'number') {
+            openrouterUsage.cost = parsedChunk.usage.cost
+          }
+          if (
+            typeof parsedChunk?.usage?.cost_details?.upstream_inference_cost ===
+            'number'
+          ) {
+            openrouterUsage.costDetails.upstreamInferenceCost =
+              parsedChunk.usage.cost_details.upstream_inference_cost
+          }
+        },
+        buildMetadata: () => {
+          return { codebuff: { usage: openrouterUsage } }
+        },
+      }),
+    },
+    // Cast: Bun's fetch type also declares a `preconnect` helper, but the AI
+    // SDK only ever invokes fetch as a plain function.
+    fetch: (requestHeaders
+      ? withCodebuffRequestHeaders(
+          requestHeaders,
+          fetchWithRetryableNetworkErrors,
+        )
+      : fetchWithRetryableNetworkErrors) as typeof globalThis.fetch,
+    includeUsage: undefined,
+    supportsStructuredOutputs: true,
+  })
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `common/src/util/__tests__/error-api-details.test.ts` (17 matching lines):
+```
+import { describe, expect, it } from 'bun:test'
+
+import {
+  extractApiErrorDetails,
+  FETCH_IDLE_TIMEOUT_USER_MESSAGE,
+  isFetchIdleTimeoutError,
+  isTransientNetworkError,
+} from '../error'
+
+describe('extractApiErrorDetails', () => {
+  it('extracts structured details from nested retry errors', () => {
+    const apiError = new Error('Conflict') as Error & {
+      statusCode: number
+      responseBody: string
+    }
+    apiError.statusCode = 409
+    apiError.responseBody = JSON.stringify({
+      error: 'session_superseded',
+      message:
+        'Another instance of freebuff has taken over this session. Only one instance per account is allowed.',
+    })
+
+    const retryError = new Error(
+      'Failed after 4 attempts. Last error: Conflict',
+    ) as Error & {
+      lastError: unknown
+      errors: unknown[]
+    }
+    retryError.name = 'AI_RetryError'
+```
+- File `sdk/src/__tests__/run-cancellation.test.ts` (15 matching lines):
+```
+email: 'test@example.com',
+      discord_id: null,
+      stripe_customer_id: null,
+      banned: false,
+      created_at: new Date('2024-01-01T00:00:00Z'),
+    })
+    spyOn(databaseModule, 'fetchAgentFromDatabase').mockResolvedValue(null)
+    spyOn(databaseModule, 'startAgentRun').mockResolvedValue('run-1')
+    spyOn(databaseModule, 'finishAgentRun').mockResolvedValue(undefined)
+    spyOn(databaseModule, 'addAgentStep').mockResolvedValue('step-1')
+
+    // Simulate AI SDK's AI_APICallError with responseBody (what the server returns for free_mode_unavailable)
+    const apiError = new Error('Forbidden') as Error & {
+      statusCode: number
+      responseBody: string
+    }
+    apiError.statusCode = 403
+    apiError.responseBody = JSON.stringify({
+      error: 'free_mode_unavailable',
+      message: 'Free mode is not available in your country.',
+      countryCode: 'US',
+      countryBlockReason: 'anonymous_network',
+      ipPrivacySignals: ['vpn', 'hosting'],
+    })
+
+    spyOn(mainPromptModule, 'callMainPrompt').mockRejectedValue(apiError)
+
+    const client = new CodebuffClient({
+      apiKey: 'test-key',
+    })
+```
+- File `sdk/src/impl/__tests__/late-failure-chunk.test.ts` (13 matching lines):
+```
+* so an upgrade could regress them silently.
+ */
+import http from 'node:http'
+
+import {
+  extractApiErrorDetails,
+  isTransientNetworkError,
+} from '@codebuff/common/util/error'
+// The vendored fork, which is what model-provider.ts actually builds the
+// backend model from. Testing against the npm @ai-sdk/openai-compatible would
+// prove nothing about the client users are running.
+import { OpenAICompatibleChatLanguageModel } from '@codebuff/llm-providers/openai-compatible'
+import { APICallError, streamText } from 'ai'
+import { afterEach, describe, expect, it } from 'bun:test'
+
+import { getModelForRequest } from '../model-provider'
+import {
+  classifyProviderErrorRecovery,
+  classifyThrownStreamRecovery,
+} from '../stream-interruption'
+
+/** Serves SSE headers, then `body`, then ends — the post-grace-flush shape. */
+const serveSse = async (body: string) => {
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+…
+})
+  })
+})
+
+describe('the same capacity refusal over HTTP', () => {
+  // Before the grace flush (a non-streaming request, or a silent stream), the
+  // queue refusal is `503 {error: 'model_at_capacity', message}` with
+  // `Retry-After: 60` (web/.../_post.ts). The AI SDK retries any 503, so left
+  // alone it re-queued the step and the user saw the refusal late, as
+  // "Failed after N attempts". Like the in-band form it must end the turn at
+  // once, with the server's copy. Served through getModelForRequest, whose
+  // fetch wrapper is what applies the SDK's final refusals.
+  const originalFetch = globalThis.fetch
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  const AT_CAPACITY = {
+    error: 'model_at_capacity',
+    message:
+      'Space Bunny is at capacity right now. Please try again in a few minutes or pick another model.',
+  }
+
+  const serve = (status: number, body: Record<string, unknown>) => {
+    let calls = 0
+    globalThis.fetch = (async () => {
+      calls += 1
+```
+- File `sdk/src/impl/__tests__/session-superseded-no-retry.test.ts` (13 matching lines):
+```
+/**
+ * The server answers HTTP 409 `{ error: 'session_superseded' }` when a start
+ * was refunded (or the session was taken over). The row is gone, so every
+ * retry gets the same answer. The AI SDK retries any 409 four times with
+ * backoff, which added ~14s before the user saw the card telling them to start
+ * a new session. The SDK must refuse it once and keep the server's copy.
+ */
+import { extractApiErrorDetails } from '@codebuff/common/util/error'
+import { APICallError, streamText } from 'ai'
+import { afterEach, describe, expect, test } from 'bun:test'
+
+import { getModelForRequest } from '../model-provider'
+
+const originalFetch = globalThis.fetch
+
+afterEach(() => {
+  globalThis.fetch = originalFetch
+})
+
+const REFUNDED = {
+  error: 'session_superseded',
+  message:
+    'This model purchase was refunded. Start a new session to try again.',
+}
+
+function serve(
+  status: number,
+  body: Record<string, unknown> | string,
+): { calls: () => number } {
+```
+- File `packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts` (11 matching lines):
+```
+import { assistantMessage, userMessage } from '@codebuff/common/util/messages'
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  mock,
+  spyOn,
+} from 'bun:test'
+import { APICallError, RetryError } from 'ai'
+import { z } from 'zod/v4'
+import { spawnSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { applyPatch } from 'diff'
+
+import { loopAgentSteps } from '../run-agent-step'
+import { frameSteeringText, STEERING_NOTE } from '../util/messages'
+import { clearAgentGeneratorCache } from '../run-programmatic-step'
+import {
+  MAX_CONSECUTIVE_STREAM_RECOVERIES,
+…
+path: 'output.txt',
+          instructions: 'Write result',
+          content: 'test',
+        })
+        return promptSuccess('limited-test')
+      },
+    })
+    expect(calls).toBe(1)
+  })
+
+  describe('completion check failure boundaries', () => {
+    const capacityError = () =>
+      new APICallError({
+        message: 'Model capacity unavailable',
+        url: 'https://example.com/responses',
+        requestBodyValues: {},
+        statusCode: 200,
+        responseBody: JSON.stringify({ error: { code: 'flex_unavailable' } }),
+        isRetryable: false,
+      })
+
+    beforeEach(() => {
+      mockTemplate.completionCheck = true
+      mockTemplate.outputMode = 'last_message'
+    })
+…
+}
+              if (failure === 'abort') controller.abort()
+              if (failure === 'bug') throw new Error('Unexpected internal bug')
+              if (failure === 'network')
+                throw Object.assign(new Error('connection reset'), {
+                  code: 'ECONNRESET',
+                })
+              if (
+                failure === 'forbidden' ||
+                failure === 'server' ||
+                failure === 'spend-limit'
+              ) {
+                throw new APICallError({
+                  message: failure,
+                  url: 'https://example.com/responses',
+                  requestBodyValues: {},
+                  statusCode:
+                    failure === 'forbidden'
+                      ? 403
+                      : failure === 'spend-limit'
+                        ? 429
+                        : 503,
+                  responseBody:
+                    failure === 'spend-limit'
+                      ? JSON.stringify({
+```
+- File `sdk/src/impl/__tests__/turn-spend-breaker.test.ts` (11 matching lines):
+```
+/** Older servers can still return a final turn_spend_limit refusal. The SDK
+ * must preserve its copy and avoid retrying it. Current servers do not. */
+import {
+  FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+  FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+} from '@codebuff/common/constants/freebuff-errors'
+import { extractApiErrorDetails } from '@codebuff/common/util/error'
+import { APICallError, streamText } from 'ai'
+import { afterEach, describe, expect, test } from 'bun:test'
+
+import { getModelForRequest } from '../model-provider'
+
+const originalFetch = globalThis.fetch
+
+afterEach(() => {
+  globalThis.fetch = originalFetch
+})
+
+function serve429(body: Record<string, unknown>): { calls: () => number } {
+  let calls = 0
+  globalThis.fetch = (async () => {
+    calls += 1
+    return new Response(JSON.stringify(body), {
+      status: 429,
+      headers: { 'content-type': 'application/json' },
+    })
+  }) as unknown as typeof fetch
+  return { calls: () => calls }
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `sdk/src/impl/__tests__/late-failure-chunk.test.ts`: "the same capacity refusal over HTTP"; "is refused once, not retried, and keeps the server copy and code"; "falls back to its own copy when the body has no message"; "any other 503 is still retried"
+```
+import {
+  extractApiErrorDetails,
+  isTransientNetworkError,
+} from '@codebuff/common/util/error'
+import { APICallError, streamText } from 'ai'
+import { afterEach, describe, expect, it } from 'bun:test'
+import { getModelForRequest } from '../model-provider'
+describe('the same capacity refusal over HTTP', () => {
+  // Before the grace flush (a non-streaming request, or a silent stream), the
+  // queue refusal is `503 {error: 'model_at_capacity', message}` with
+  // `Retry-After: 60` (web/.../_post.ts). The AI SDK retries any 503, so left
+  // alone it re-queued the step and the user saw the refusal late, as
+  // "Failed after N attempts". Like the in-band form it must end the turn at
+  // once, with the server's copy. Served through getModelForRequest, whose
+  // fetch wrapper is what applies the SDK's final refusals.
+  const originalFetch = globalThis.fetch
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+  const AT_CAPACITY = {
+    error: 'model_at_capacity',
+    message:
+      'Space Bunny is at capacity right now. Please try again in a few minutes or pick another model.',
+  }
+  const serve = (status: number, body: Record<string, unknown>) => {
+    let calls = 0
+    globalThis.fetch = (async () => {
+      calls += 1
+      return new Response(JSON.stringify(body), {
+        status,
+        headers: { 'content-type': 'application/json', 'retry-after': '60' },
+      })
+    }) as unknown as typeof fetch
+    return { calls: () => calls }
+  }
+  const failureOf = async (maxRetries: number) => {
+    const result = streamText({
+      model: getModelForRequest({ apiKey: 'k', model: 'openai/gpt-5.6-luna' }),
+      messages: [{ role: 'user', content: 'hi' }],
+      maxRetries,
+    })
+    let error: unknown
+    try {
+      for await (const part of result.stream) {
+        if (part.type === 'error') error = (part as { error: unknown }).error
+      }
+    } catch (thrown) {
+      error ??= thrown
+    }
+    await Promise.resolve(result.text).catch((thrown: unknown) =
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/sdk/src/impl/model-provider.ts b/sdk/src/impl/model-provider.ts
+index f112f6923..c65f1926c 100644
+--- a/sdk/src/impl/model-provider.ts
++++ b/sdk/src/impl/model-provider.ts
+@@ -254,68 +254,78 @@ export function getByokProviderErrorMessage(
+ 
+ export const BYOK_CONNECTION_FAILURE_MESSAGE =
+   'Could not connect to the BYOK provider. Check the provider URL and network connection, then retry.'
+ 
+ /**
+  * Refusals the server makes on purpose and repeats IDENTICALLY on a retry,
+  * each identified by its status AND its `error` code — never the status alone,
+  * since 409 and 429 are also ordinary, retryable answers.
+  *
+  * Left to the AI SDK, which treats every 409 and 429 as retryable, each of
+  * these was asked four times with backoff (~14s) and then failed as "Failed
+  * after 4 attempts. Last error: …". Throwing a NON-retryable APICallError
+  * stops the retry loop on the first refusal, and carrying the body lets the
+  * runtime's error parser hand the server's own copy and code to the client
+  * unchanged.
+  *
+  * - `turn_spend_limit` (429): the per-turn spend breaker is final for THIS
+  *   turn — its spend only grows, so the same run id is refused every time.
+  *   Clients read the retried failure as an ordinary rate limit and answered
+  *   it with "wait a moment or switch models", neither of which helps.
+  * - `session_superseded` (409): the start was refunded (the Desktop purchase
+  *   claim, or a refund that closed admission) or the session was taken over
+  *   by another instance. The row is gone, so every retry gets the same 409;
+  *   the user waited ~14s for the card that tells them to start a new session
+  *   (5,392 runs / 2,230 users in the 72h to 2026-10-05).
++ * - `model_at_capacity` (503): a queued free model had no slot within the
++ *   request's wait budget (web/.../model-queue.ts). Each retry re-enters the
++ *   queue and waits that budget again before the same refusal, so it is
++ *   surfaced at once — as its in-band form after the grace flush already is.
+  */
+ const FINAL_REFUSALS: readonly {
+   status: number
+   error: string
+   /** Used only when the body carries no `message` of its own. */
+   fallbackMessage: string
+ }[] = [
+   {
+     status: 429,
+     error: FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+     fallbackMessage: FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+   },
+   {
+     status: FREEBUFF_GATE_CODES.session_superseded.status,
+     error: 'session_superseded',
+     fallbackMessage:
+       'This Freebuff session has ended. Start a new session to try again.',
+   },
++  {
++    status: 503,
++    error: 'model_at_capacity',
++    fallbackMessage:
++      'This model is at capacity right now. Please try again in a few minutes or pick another model.',
++  },
+ ]
+ 
+ async function throwIfFinalRefusal(
+   response: Response,
+   url: string,
+ ): Promise<void> {
+   // Only a status some refusal uses is worth reading the body for.
+   if (!FINAL_REFUSALS.some((r) => r.status === response.status)) return
+   const text = await response
+     .clone()
+     .text()
+     .catch(() => '')
+   let body: { error?: unknown; message?: unknown } | null = null
+   try {
+     body = JSON.parse(text)
+   } catch {
+     return
+   }
+   const refusal = FINAL_REFUSALS.find(
+     (r) => r.status === response.status && r.error === body?.error,
+   )
+   if (!refusal) return
+   throw new APICallError({
+     message:
+       typeof body?.message === 'string' && body.message
+
+```
