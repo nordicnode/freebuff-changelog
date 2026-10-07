@@ -1967,11 +1967,11 @@ test('in-flight live comment bodies go through escInFlight before innerHTML', as
   }
 })
 
-// The worker's catch-all must not reflect the exception outward: err.message
-// can carry internal paths or upstream error text (CodeQL
-// js/stack-trace-exposure). Operators get the real error from `wrangler
-// tail`; readers get a generic 500.
-test('worker 500s never reflect the exception outward', async () => {
+// The worker's catch-all must not reflect unexpected exceptions outward:
+// err.message can carry internal paths or upstream error text (CodeQL
+// js/stack-trace-exposure). Curated reader-facing errors (UserError) keep
+// their wording; everything else gets a generic 500.
+test('worker 500s never reflect unexpected exceptions outward', async () => {
   const boom = () => { throw new Error('secret internal path /etc/foo exploded') }
   const env = { ASSETS: { fetch: boom } }
   const res = await worker.fetch(new Request('https://x.test/day/2026-10-05/'), env)
