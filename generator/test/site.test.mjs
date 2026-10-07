@@ -1967,6 +1967,20 @@ test('in-flight live comment bodies go through escInFlight before innerHTML', as
   }
 })
 
+// The worker's catch-all must not reflect the exception outward: err.message
+// can carry internal paths or upstream error text (CodeQL
+// js/stack-trace-exposure). Operators get the real error from `wrangler
+// tail`; readers get a generic 500.
+test('worker 500s never reflect the exception outward', async () => {
+  const boom = () => { throw new Error('secret internal path /etc/foo exploded') }
+  const env = { ASSETS: { fetch: boom } }
+  const res = await worker.fetch(new Request('https://x.test/day/2026-10-05/'), env)
+  assert.equal(res.status, 500)
+  const body = await res.text()
+  assert.equal(JSON.parse(body).error, 'internal error')
+  assert.ok(!body.includes('secret internal path'), 'the exception text must not leak')
+})
+
 // /c/<sha> resolves without JavaScript: the worker 302s to the day page that
 // holds the entry, through the single api/sha-day.json asset (no per-sha
 // files, so the asset budget is untouched). Retention-withheld diffs keep

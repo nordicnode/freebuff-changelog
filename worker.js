@@ -122,7 +122,11 @@ export default {
       if (handled) return handled
       return await fetchAsset(env, request)
     } catch (err) {
-      return new Response(JSON.stringify({ error: String(err?.message || err) }), { status: 500, headers: JSON_HEADERS })
+      // Never reflect the exception outward: err.message can carry internal
+      // paths or upstream error text, and this handler fronts every route.
+      // Operators get the real error from `wrangler tail`; readers get a
+      // generic 500 (CodeQL js/stack-trace-exposure).
+      return new Response(JSON.stringify({ error: 'internal error' }), { status: 500, headers: JSON_HEADERS })
     }
   }
 }
