@@ -23,6 +23,12 @@ import { answerEvidence, groundAnswer, ASK_INSTRUCTIONS } from './generator/lib/
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' }
 
+// Errors thrown with a curated reader-facing message. The top-level fetch
+// catch surfaces a UserError's message verbatim; anything else becomes a
+// generic 500 so internal paths and upstream error text never leak
+// (CodeQL js/stack-trace-exposure).
+class UserError extends Error {}
+
 // "Ask the AI" -- the one place this zone spends money and talks to a model.
 // Everything here exists because the endpoint is public and unauthenticated:
 //   - asks are same-origin only, bounded in length, and rate limited per IP;
@@ -122,7 +128,12 @@ export default {
       if (handled) return handled
       return await fetchAsset(env, request)
     } catch (err) {
-      return new Response(JSON.stringify({ error: String(err?.message || err) }), { status: 500, headers: JSON_HEADERS })
+      // A curated reader-facing message keeps its wording; anything
+      // unexpected becomes a generic 500 so internal paths and upstream
+      // error text never leak (CodeQL js/stack-trace-exposure). Operators
+      // get the real error from `wrangler tail`.
+      const msg = err instanceof UserError ? err.message : 'internal error'
+      return new Response(JSON.stringify({ error: msg }), { status: 500, headers: JSON_HEADERS })
     }
   }
 }
@@ -701,9 +712,9 @@ async function askModel (env, key, question, evidence, previousUngrounded, histo
       // The gateway's own words are a Cloudflare error page, not a reader's
       // problem: keep them for the logs, hand the reader a sentence.
       console.error(`ask: gateway rate limited after ${ASK.rateRetries + 1} attempts: ${detail.slice(0, 200)}`)
-      throw new Error('the model is rate-limited right now; try again in a few seconds')
+      throw new UserError('the model is rate-limited right now; try again in a few seconds')
     }
-    throw new Error(`ask failed: HTTP ${res.status} ${detail.slice(0, 200)}`)
+    throw new UserError(`ask failed: HTTP ${res.status} ${detail.slice(0, 200)}`)
   }
   const ctype = res.headers.get('content-type') || ''
   if (ctype.includes('event-stream') || ctype === '') {
