@@ -555,10 +555,17 @@ async function askHandler (request, env) {
   }
   if (!verdict.grounded) {
     countAsk('refused')
+    const ungrounded = [...new Set(verdict.ungrounded)].slice(0, 8)
+    // A prose failure is a different shape from a bad citation: the model
+    // answered from general knowledge rather than the evidence, so the
+    // refusal says that instead of accusing it of citing things.
+    const proseOnly = ungrounded.length === 1 && ungrounded[0] === 'prose not grounded in this change'
     return json({
-      error: 'Refused: the answer cited things this change does not contain.',
+      error: proseOnly
+        ? 'Refused: the answer was not based on this change.'
+        : 'Refused: the answer cited things this change does not contain.',
       grounded: false,
-      ungrounded: [...new Set(verdict.ungrounded)].slice(0, 8)
+      ungrounded
     }, 422)
   }
 

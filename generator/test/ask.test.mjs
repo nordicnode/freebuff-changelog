@@ -116,6 +116,41 @@ test('groundAnswer: a truncated token cannot pass as a cut of a longer name', ()
   assert.equal(v.grounded, false, JSON.stringify(v.ungrounded))
 })
 
+test('groundAnswer: fluent prose from general knowledge is refused, not labeled grounded', () => {
+  // Real failure, 2026-10-07: asked why a spend-estimate field was removed,
+  // the model answered with a generic Claude Opus 4.1 essay from training
+  // data. No backticks, no citations, no identifiers -- the token gate passed
+  // it and the UI called it "grounded".
+  const spendEntry = {
+    sha: '6c007360b85c',
+    title: 'Remove model spend estimate from recent usage type',
+    ai: { summary: 'The shared wire type for account usage summaries no longer includes the optional dollar estimate field.' },
+    plainEnglish: 'The account activity report no longer includes a rough dollar estimate for the cost of the AI models you used.'
+  }
+  const spendDiff = [
+    'diff --git a/common/src/types/freebuff-usage.ts b/common/src/types/freebuff-usage.ts',
+    '--- a/common/src/types/freebuff-usage.ts',
+    '+++ b/common/src/types/freebuff-usage.ts',
+    '@@ -12,7 +12,6 @@ export interface RecentUsage {',
+    '   messages: number',
+    '   tokens: number',
+    '-  spendEstimate?: number',
+    ' }'
+  ].join('\n')
+  const spendEv = () => answerEvidence({ entry: spendEntry, diff: spendDiff })
+  const essay = 'The latest Claude Opus model I know about is Claude Opus 4.1, which was released in August 2025.\n\nAnthropic\'s Opus line has been their most capable model tier. Prior to Opus 4.1, there was Claude Opus 4 (released around May 2025), and before that Claude 3 Opus from early 2024. Opus 4.1 was positioned as an incremental improvement over Opus 4, particularly in areas like coding, reasoning, and agentic tasks.'
+  const v = groundAnswer(essay, spendEv())
+  assert.equal(v.grounded, false, 'an answer on an unrelated topic must not pass as grounded')
+  assert.ok(v.ungrounded.includes('prose not grounded in this change'), JSON.stringify(v.ungrounded))
+  // A paraphrase in the reader's own words still passes: it shares the
+  // change's vocabulary even though it copies no sentence.
+  const paraphrase = 'The account activity report no longer shows a rough dollar estimate for the AI models you used. You will now see only message and token counts in the command-line tool, web app, and desktop app.'
+  assert.equal(groundAnswer(paraphrase, spendEv()).grounded, true, 'honest paraphrase must pass')
+  // And the short honest "not shown" answer is exempt from the vocabulary
+  // check: refusing it would punish the exact behavior the prompt asks for.
+  assert.equal(groundAnswer('The change does not say why the estimate was removed.', spendEv()).grounded, true)
+})
+
 test('answerEvidence: bounded so one huge diff cannot make an interactive ask time out', () => {
   const huge = `diff --git a/big.ts b/big.ts\n+++ b/big.ts\n@@ -1,2 +1,2 @@\n+${'x'.repeat(120000)}\n`
   const ev = answerEvidence({ entry, diff: huge, maxChars: 5000 })
