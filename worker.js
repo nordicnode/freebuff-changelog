@@ -555,10 +555,17 @@ async function askHandler (request, env) {
   }
   if (!verdict.grounded) {
     countAsk('refused')
+    const ungrounded = [...new Set(verdict.ungrounded)].slice(0, 8)
+    // A prose failure is a different shape from a bad citation: the model
+    // answered from general knowledge rather than the evidence, so the
+    // refusal says that instead of accusing it of citing things.
+    const proseOnly = ungrounded.length === 1 && ungrounded[0] === 'prose not grounded in this change'
     return json({
-      error: 'Refused: the answer cited things this change does not contain.',
+      error: proseOnly
+        ? 'Refused: the answer was not based on this change.'
+        : 'Refused: the answer cited things this change does not contain.',
       grounded: false,
-      ungrounded: [...new Set(verdict.ungrounded)].slice(0, 8)
+      ungrounded
     }, 422)
   }
 
@@ -667,8 +674,15 @@ function cacheRequest (key) {
 async function askModel (env, key, question, evidence, previousUngrounded, history = []) {
   const base = String(env.LLM_API_BASE || 'https://apihub.agnes-ai.com/v1').replace(/\/+$/, '')
   const model = env.LLM_MODEL || 'agnes-3.0-flash'
+  // A prose failure is a different mistake from a bad citation: the model drew
+  // on general knowledge instead of the evidence. The correction names that
+  // directly and points at the honest alternative, because "only answer with
+  // what the evidence contains" alone has already failed once.
+  const proseFailed = previousUngrounded.includes('prose not grounded in this change')
   const correction = previousUngrounded.length
-    ? `\n\nYour previous answer cited things this change does not contain: ${previousUngrounded.join(', ')}. Those claims were refused. Only answer with what the evidence contains.`
+    ? (proseFailed
+      ? '\n\nYour previous answer drew on general knowledge instead of the evidence below. Answer ONLY from the evidence, or say in one sentence that the evidence does not contain the answer. Do not speculate, and do not invent motives or reasons.'
+      : `\n\nYour previous answer cited things this change does not contain: ${previousUngrounded.join(', ')}. Those claims were refused. Only answer with what the evidence contains.`)
     : ''
   // Earlier turns in this widget stay in the prompt so "it", "that" and "why"
   // resolve; they are explicitly not evidence, so a client-invented prior
