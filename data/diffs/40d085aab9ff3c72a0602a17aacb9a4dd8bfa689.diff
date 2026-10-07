@@ -1,0 +1,2921 @@
+diff --git a/common/src/constants/__tests__/compaction-policy.test.ts b/common/src/constants/__tests__/compaction-policy.test.ts
+index 9bf57d4ed..455d41c04 100644
+--- a/common/src/constants/__tests__/compaction-policy.test.ts
++++ b/common/src/constants/__tests__/compaction-policy.test.ts
+@@ -1,41 +1,51 @@
+ import { describe, expect, test } from 'bun:test'
+ 
++import { BYOK_LOCAL_USER_ID } from '../byok'
+ import {
+   DETERMINISTIC_COMPACTION_PERCENT,
+   usesDeterministicCompaction,
+ } from '../compaction-policy'
+ 
+ const ids = Array.from(
+   { length: 20_000 },
+   (_, i) => `00000000-0000-4000-8000-${i.toString(16).padStart(12, '0')}`,
+ )
+ 
+ describe('usesDeterministicCompaction', () => {
+   test('is sticky per user', () => {
+     for (const id of ids.slice(0, 50))
+       expect(usesDeterministicCompaction(id)).toBe(
+         usesDeterministicCompaction(id),
+       )
+   })
+ 
+   test('splits users close to the configured share', () => {
+     const share =
+       ids.filter((id) => usesDeterministicCompaction(id)).length / ids.length
+     expect(
+       Math.abs(share * 100 - DETERMINISTIC_COMPACTION_PERCENT),
+     ).toBeLessThan(2)
+   })
+ 
+   test('a larger share only adds users', () => {
+     const at25 = ids.filter((id) => usesDeterministicCompaction(id, 25))
+     for (const id of at25)
+       expect(usesDeterministicCompaction(id, 75)).toBe(true)
+   })
+ 
+   test('0 keeps everyone on the handoff; 100 moves everyone, signed out too', () => {
+     expect(ids.some((id) => usesDeterministicCompaction(id, 0))).toBe(false)
+     expect(ids.every((id) => usesDeterministicCompaction(id, 100))).toBe(true)
+     expect(usesDeterministicCompaction(undefined, 50)).toBe(false)
+     expect(usesDeterministicCompaction(undefined, 100)).toBe(true)
+   })
++
++  test('keeps the shared BYOK placeholder id out of the cohort until 100', () => {
++    // Its hash lands under some share; every id-less BYOK user would flip there.
++    for (const percent of [1, 10, 50, 99])
++      expect(usesDeterministicCompaction(BYOK_LOCAL_USER_ID, percent)).toBe(
++        false,
++      )
++    expect(usesDeterministicCompaction(BYOK_LOCAL_USER_ID, 100)).toBe(true)
++  })
+ })
+diff --git a/common/src/constants/byok.ts b/common/src/constants/byok.ts
+index 50640d41e..d0242cff8 100644
+--- a/common/src/constants/byok.ts
++++ b/common/src/constants/byok.ts
+@@ -1,2 +1,6 @@
+ export const BYOK_OPENROUTER_HEADER = 'x-openrouter-api-key'
+ export const BYOK_OPENROUTER_ENV_VAR = 'CODEBUFF_BYOK_OPENROUTER'
++
++/** The user id an SDK BYOK run carries when its caller names none: every such
++ * run shares it, so it identifies nobody. */
++export const BYOK_LOCAL_USER_ID = 'byok-local'
+diff --git a/common/src/constants/compaction-policy.ts b/common/src/constants/compaction-policy.ts
+index faddf06a1..7f5f5b03f 100644
+--- a/common/src/constants/compaction-policy.ts
++++ b/common/src/constants/compaction-policy.ts
+@@ -1,25 +1,26 @@
++import { BYOK_LOCAL_USER_ID } from './byok'
+ import { FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID } from './freebuff-model-ids'
+ import { fnv1a } from '../util/ad-experiment'
+ 
+ /** Leave input headroom for the model-based compaction request. */
+ export function modelCompactionThreshold(maxContextLength: number): number {
+   return Math.floor(maxContextLength * 0.8)
+ }
+ 
+ /**
+  * When a root agent rewrites its own history after an idle gap: the user
+  * comes back after `cacheExpiryMs` of silence AND the history is at least
+  * `cacheExpiryMinTokens`. Below the floor a cold cache is not enough, because
+  * compaction costs inference and some detail. The context-limit trigger
+  * ignores the floor. For the users in `usesDeterministicCompaction` every
+  * pass is mechanical (no model call); for the rest it is a model handoff with
+  * the mechanical pass as fallback.
+  *
+  * The numbers live only here. base3 roots hand the object to the runtime as
+  * `compactContext`; the runtime defaults `compactContext: true` to
+  * DEFAULT_COMPACTION_POLICY; and serialized `handleSteps` that spawn
+  * context-pruner (base2, base-chat) receive it as
+  * `AgentStepContext.contextPruning`, resolved in run-programmatic-step.ts.
+  * Exactly these two keys: `compactContext` is validated with a strict schema.
+  */
+ export type CompactionPolicy = {
+@@ -60,41 +61,45 @@ export const DEFAULT_COMPACTION_POLICY: CompactionPolicy = {
+  * the pass halves the cold prefill, while at 25k it removes a third at best
+  * and drops exactly the files the model will re-read. On this lane a cold
+  * input token costs ~40x a cached one, so halving a cold 60k prefill is a
+  * material share of a turn's spend; the figures behind that are in
+  * freebuff-costs.knowledge.md (private).
+  */
+ export const DEEPSEEK_FLASH_COMPACTION_POLICY: CompactionPolicy = {
+   cacheExpiryMs: 15 * 60 * 1000,
+   cacheExpiryMinTokens: 40_000,
+ }
+ 
+ export function compactionPolicyForModel(
+   model: string | null | undefined,
+ ): CompactionPolicy {
+   return model === FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID
+     ? DEEPSEEK_FLASH_COMPACTION_POLICY
+     : DEFAULT_COMPACTION_POLICY
+ }
+ 
+ /**
+  * Percent of users whose compactions, on every trigger, run the mechanical
+  * pass (a ~12k summary plus a working set of file reads) instead of the model
+  * handoff.
+  *
+  * The cohort is sticky per user, so the two arms can be compared on
+- * `context_compaction.followup` (re-reads and repeat compactions, by `mode`).
++ * `context_compaction.followup` (re-reads and repeat compactions, by
++ * `deterministic_cohort`; see docs/logging.md).
+  * It starts small and widens; at 100 the model handoff is deleted. A larger
+  * share only adds users, so nobody flips back. Changing the salt reassigns
+  * everyone.
+  */
+ export const DETERMINISTIC_COMPACTION_PERCENT = 10
+ const DETERMINISTIC_COMPACTION_SALT = 'deterministic_compaction_2026_10'
+ 
++/** Signed-out runs, and BYOK runs that share `BYOK_LOCAL_USER_ID`, stay on
++ * the handoff until 100: hashing the shared id would flip every such user's
++ * arm at once. */
+ export function usesDeterministicCompaction(
+   userId: string | undefined,
+   percent: number = DETERMINISTIC_COMPACTION_PERCENT,
+ ): boolean {
+   if (percent >= 100) return true
+-  if (!userId || percent <= 0) return false
++  if (!userId || userId === BYOK_LOCAL_USER_ID || percent <= 0) return false
+   return fnv1a(`${DETERMINISTIC_COMPACTION_SALT}:${userId}`) % 100 < percent
+ }
+diff --git a/common/src/constants/freebuff-models.ts b/common/src/constants/freebuff-models.ts
+index 147bb5897..069e17a19 100644
+--- a/common/src/constants/freebuff-models.ts
++++ b/common/src/constants/freebuff-models.ts
+@@ -860,57 +860,62 @@ export const FREEBUFF_OX_ALPHA_MODEL_ID = 'stealth/ox-alpha'
+  * OpenRouter's `provider.max_price`.
+  *
+  * Same mechanism as FREEBUFF_GPT_5_6_LUNA_MAX_PRICE and deliberately the
+  * opposite ceiling. Luna's sits ABOVE list to leave routing headroom; this one
+  * sits exactly AT a list price of zero, so the first endpoint that charges
+  * anything stops being routable at all.
+  *
+  * Both halves verified against the live API on 2026-08-20, because a fence
+  * nobody has watched fail is not a fence: a zero ceiling serves Ox Alpha
+  * normally, and the SAME ceiling on a priced model answers 404 "No endpoints
+  * found that satisfy the max price for this request". It fails closed, loudly,
+  * before the first billed token rather than after the invoice — which is the
+  * shape of bill this repo has already paid twice (the retired OpenRouter
+  * DeepSeek lane; the Kimi/Infron unit-price doubling).
+  *
+  * This guard is why the model can sit outside every session pool. Do not widen
+  * it to "just a little headroom" without giving the row a pool in the same
+  * change: the two are one decision.
+  */
+ export const FREEBUFF_OX_ALPHA_MAX_PRICE = {
+   prompt: 0,
+   completion: 0,
+ } as const
+ 
+ /**
+- * Space Bunny Alpha — a stealth model on OpenRouter, joined every surface on
+- * 2026-09-23 as a BETA row priced 10 Freebucks.
++ * Space Bunny Alpha — a stealth model, joined every surface on 2026-09-23 as a
++ * BETA row; it launched at 10 Freebucks and has been priced 0 since that day
++ * (FREEBUCKS_SESSION_PRICES). Withdrawn on 2026-10-06
++ * (FREEBUFF_PAUSED_FREE_MODEL_IDS).
+  *
+- * The id is OpenRouter's own slug and falls through to the default OpenRouter
+- * route, like Ox Alpha, with the same zero-price fence
+- * (FREEBUFF_SPACE_BUNNY_ALPHA_MAX_PRICE). What was true of Ox Alpha is true
+- * here, and was measured again rather than inherited (2026-09-23, prod key):
++ * SERVED BY OPENCODE ZEN since OpenRouter withdrew every endpoint for it on
++ * 2026-10-05: the id is aliased to Zen's free `space-bunny-free`
++ * (web/src/llm-api/opencode-zen.ts), behind a fleet-wide queue. The id is
++ * still OpenRouter's own slug, and the OpenRouter route with the same
++ * zero-price fence as Ox Alpha (FREEBUFF_SPACE_BUNNY_ALPHA_MAX_PRICE) remains
++ * in code. The measurements below are of the OpenRouter endpoint, measured
++ * again rather than inherited from Ox Alpha (2026-09-23, prod key):
+  *
+  *  - ONE endpoint, `stealth`, listed at $0 in and out.
+  *  - REASONING IS MANDATORY (`reasoning.mandatory`): `effort: 'none'` answers
+  *    400 "Reasoning is mandatory for this endpoint and cannot be disabled",
+  *    and the provider's own default is `max`. On a debugging prompt, n=3 per
+  *    rung, every rung answered correctly; output grew from ~420 tokens / 3.3s
+  *    at `low` to ~860 / 6.8s at `high` and ~1,260 / 10s at `max`. The row
+  *    pins `high`, as Ox Alpha did, and the ladder stops at none of the rungs
+  *    the endpoint lists.
+  *  - No `stop` in `supported_parameters`, so no `require_parameters`.
+  *  - Implicit prompt caching works on the wire: a repeated 18k prefix came
+  *    back 18,418/18,420 cached.
+  *  - CAPACITY is the reason it can go on every surface at once. 200
+  *    concurrent requests, a sustained 10 req/s for 60s and 2 req/s of ~20k
+  *    token prompts all completed with ZERO 429s (TTFT p50 ~0.7-1.1s). That is
+  *    unlike the earlier stealth pool that refused two thirds of requests at
+  *    10 req/s. It is still a host we cannot see; re-measure before making it a
+  *    default.
+  *  - Prompts and completions are retained by the anonymous host, per
+  *    OpenRouter's stealth terms — the row warns about it.
+  */
+ export const FREEBUFF_SPACE_BUNNY_ALPHA_MODEL_ID = 'stealth/space-bunny-alpha'
+ /**
+  * Price ceiling for Space Bunny Alpha — ZERO, for the reason given on
+  * FREEBUFF_OX_ALPHA_MAX_PRICE: a stealth host may reprice or swap the model
+diff --git a/common/src/util/__tests__/axiom-only-log.test.ts b/common/src/util/__tests__/axiom-only-log.test.ts
+index a77da3899..9145c6380 100644
+--- a/common/src/util/__tests__/axiom-only-log.test.ts
++++ b/common/src/util/__tests__/axiom-only-log.test.ts
+@@ -1,49 +1,51 @@
+ import { describe, expect, test } from 'bun:test'
+ 
+ import {
+   ADS_FETCH_COMPLETED_EVENT,
+   ADS_FETCH_COMPLETED_FIELD_NAMES,
+   ADS_FIRST_PARTY_DECISION_EVENT,
+   ADS_FIRST_PARTY_CLICK_RECORDED_EVENT,
+   ADS_FIRST_PARTY_IMPRESSION_RECORDED_EVENT,
+   ADS_FIRST_PARTY_SETTLEMENT_EVENT,
+   ADS_FIRST_PARTY_VIEW_ACK_EVENT,
+   ADS_EXTERNAL_CONVERSION_CLICK_ID_SHAPES,
+   ADS_EXTERNAL_CONVERSION_POSTBACK_EVENT,
+   ADS_CAMPAIGN_INGRESS_EVIDENCE_EVENT,
+   ADS_ADVERTISER_REPORTING_READ_EVENT,
+   ADS_MCP_TOOL_CALL_EVENT,
+   PAID_API_REQUEST_EVENT,
+   ADS_SHOWCASE_PRESENTED_EVENT,
+   CONTEXT_PRUNING_COMPLETED_EVENT,
+   getAxiomOnlyLogEvent,
+   STREAM_RECOVERY_EVENT,
+   MODEL_COMPACTION_COMPLETED_EVENT,
+   MODEL_COMPACTION_FALLBACK_EVENT,
++  MECHANICAL_COMPACTION_SKIPPED_EVENT,
+   CONTEXT_COMPACTION_COMPLETED_EVENT,
+   COMPACTION_FOLLOWUP_EVENT,
++  TODO_PROGRESS_REMINDER_EVENT,
+   ADS_CLIENT_EVENT_HYGIENE_FIELDS,
+   ADS_FIRST_PARTY_TRACKING_FIELD_NAMES,
+   FIRST_PARTY_VIEW_ACK_FIELD_NAMES,
+ } from '../axiom-only-log'
+ 
+ describe('getAxiomOnlyLogEvent', () => {
+   test('strictly bounds client-reported Showcase presentation telemetry', () => {
+     const valid = {
+       axiomEvent: ADS_SHOWCASE_PRESENTED_EVENT,
+       gravity_showcase_version: 'gravity-showcase-v1',
+       gravity_showcase_config_id: 'gsc_abc123',
+       gravity_showcase_arm: 'treatment',
+       gravity_showcase_attempt_id: '5b32fd40-758b-4d10-8ce5-9fd098299453',
+       gravity_showcase_opportunity_id: 'opp_0123456789abcdef0123456789abcdef',
+       gravity_showcase_variant: 'curated',
+       placement_id: 'Desktop-Showcase',
+       surface: 'cli_chat',
+       format: 'showcase',
+       client_event_id: '6b32fd40-758b-4d10-8ce5-9fd098299453',
+       client_family: 'desktop',
+       token: 'private-token',
+     }
+     const result = getAxiomOnlyLogEvent(valid)
+     expect(result?.event).toBe(ADS_SHOWCASE_PRESENTED_EVENT)
+     expect(result?.data).not.toHaveProperty('token')
+@@ -295,108 +297,168 @@ describe('getAxiomOnlyLogEvent', () => {
+         model: 'z-ai/glm-5.3-flash',
+         trigger_reason: 'context_limit',
+         error_kind: 'invalid_summary',
+         error_name: 'ZodError',
+         fallback_applied: true,
+         fallback_failed: false,
+         // Not in the allowlist: may carry provider text or user content.
+         error: 'Invalid input: expected object, received string',
+         fallback_error: 'secret',
+         messageHistory: [{ role: 'user', content: 'secret' }],
+       }),
+     ).toEqual({
+       event: MODEL_COMPACTION_FALLBACK_EVENT,
+       data: {
+         agent_run_id: 'run-1',
+         model: 'z-ai/glm-5.3-flash',
+         trigger_reason: 'context_limit',
+         error_kind: 'invalid_summary',
+         error_name: 'ZodError',
+         fallback_applied: true,
+         fallback_failed: false,
+       },
+     })
+   })
+ 
++  test('a skipped cohort compaction ships a fixed error kind, never the message', () => {
++    expect(
++      getAxiomOnlyLogEvent({
++        axiomEvent: MECHANICAL_COMPACTION_SKIPPED_EVENT,
++        agent_run_id: 'run-1',
++        model: 'deepseek/deepseek-v4-flash',
++        trigger_reason: 'context_limit',
++        error_kind: 'over_budget',
++        error_name: 'Error',
++        context_token_count: 40_000,
++        max_context_length: 32_768,
++        deterministic_cohort: true,
++        // Not in the allowlist: may quote the request.
++        error: 'The current request and agent instructions exceed ...',
++      }),
++    ).toEqual({
++      event: MECHANICAL_COMPACTION_SKIPPED_EVENT,
++      data: {
++        agent_run_id: 'run-1',
++        model: 'deepseek/deepseek-v4-flash',
++        trigger_reason: 'context_limit',
++        error_kind: 'over_budget',
++        error_name: 'Error',
++        context_token_count: 40_000,
++        max_context_length: 32_768,
++        deterministic_cohort: true,
++      },
++    })
++  })
++
+   test('mechanical compaction ships its sizes and counts', () => {
+     expect(
+       getAxiomOnlyLogEvent({
+         axiomEvent: CONTEXT_COMPACTION_COMPLETED_EVENT,
+         agent_run_id: 'run-1',
+         trigger_reason: 'cache_expiry',
+         context_token_count: 212_000,
+         summary_estimated_tokens: 13_000,
+         preserved_fresh_messages: 2,
+         working_set_files: 3,
+         working_set_stubs: 9,
+         post_tokens: 41_000,
+         // Not in the allowlist: user content.
+         summaryText: '[USER]\nsecret',
+       }),
+     ).toEqual({
+       event: CONTEXT_COMPACTION_COMPLETED_EVENT,
+       data: {
+         agent_run_id: 'run-1',
+         trigger_reason: 'cache_expiry',
+         context_token_count: 212_000,
+         summary_estimated_tokens: 13_000,
+         preserved_fresh_messages: 2,
+         working_set_files: 3,
+         working_set_stubs: 9,
+         post_tokens: 41_000,
+       },
+     })
+   })
+ 
+   test('compaction follow-up ships counts, never a path', () => {
+     expect(
+       getAxiomOnlyLogEvent({
+         axiomEvent: COMPACTION_FOLLOWUP_EVENT,
+         agent_run_id: 'run-1',
+         mode: 'mechanical',
++        deterministic_cohort: true,
+         trigger_reason: 'context_limit',
+         ended_by: 'compaction',
+         elided_read_paths: 12,
+         reread_paths: 4,
+         read_tokens_after: 90_000,
+         // Not in the allowlist.
+         elidedPaths: ['src/secret.ts'],
++        userId: 'user-1',
+       }),
+     ).toEqual({
+       event: COMPACTION_FOLLOWUP_EVENT,
+       data: {
+         agent_run_id: 'run-1',
+         mode: 'mechanical',
++        deterministic_cohort: true,
+         trigger_reason: 'context_limit',
+         ended_by: 'compaction',
+         elided_read_paths: 12,
+         reread_paths: 4,
+         read_tokens_after: 90_000,
+       },
+     })
+   })
+ 
++  test('to-do progress reminder ships counts, never the to-dos or the user', () => {
++    expect(
++      getAxiomOnlyLogEvent({
++        axiomEvent: TODO_PROGRESS_REMINDER_EVENT,
++        done: 1,
++        total: 5,
++        callsSinceUpdate: 8,
++        model: 'z-ai/glm-5.3-flash',
++        agentId: 'base3',
++        runId: 'run-1',
++        // Not in the allowlist.
++        userId: 'user-1',
++        todos: ['Fix the secret thing'],
++      }),
++    ).toEqual({
++      event: TODO_PROGRESS_REMINDER_EVENT,
++      data: {
++        done: 1,
++        total: 5,
++        callsSinceUpdate: 8,
++        model: 'z-ai/glm-5.3-flash',
++        agentId: 'base3',
++        runId: 'run-1',
++      },
++    })
++  })
++
+   test('model-compaction completion ships sizes and labels, never the summary', () => {
+     expect(
+       getAxiomOnlyLogEvent({
+         axiomEvent: MODEL_COMPACTION_COMPLETED_EVENT,
+         agent_run_id: 'run-1',
+         model: 'deepseek/deepseek-v4-flash',
+         trigger_reason: 'cache_expiry',
+         summary_source: 'text',
+         summary_tokens: 7_400,
+         summary_budget: 6_000,
+         sections: 1,
+         pre_tokens: 212_000,
+         post_tokens: 31_000,
+         // Not in the allowlist: user content.
+         summary: '## Objective\n- secret',
+       }),
+     ).toEqual({
+       event: MODEL_COMPACTION_COMPLETED_EVENT,
+       data: {
+         agent_run_id: 'run-1',
+         model: 'deepseek/deepseek-v4-flash',
+         trigger_reason: 'cache_expiry',
+         summary_source: 'text',
+         summary_tokens: 7_400,
+         summary_budget: 6_000,
+diff --git a/common/src/util/axiom-only-log.ts b/common/src/util/axiom-only-log.ts
+index ae3f9de07..a992f327b 100644
+--- a/common/src/util/axiom-only-log.ts
++++ b/common/src/util/axiom-only-log.ts
+@@ -42,55 +42,66 @@ export const CONTEXT_PRUNING_COMPLETED_EVENT =
+ 
+ /** Stream-cut / output-limit recovery (sdk/src/impl/stream-interruption.ts,
+  *  packages/agent-runtime/src/tools/stream-parser.ts). `metric` distinguishes
+  *  the log sites (stream_recovery_detected / _rescued) that share this one
+  *  allowlisted event — `_gave_up` logs at error level, which already ships
+  *  raw and doesn't need the allowlist. */
+ export const STREAM_RECOVERY_EVENT = 'stream_recovery' as const
+ /** A file edit was refused because it looked cut off mid-generation
+  *  (packages/agent-runtime/src/util/truncated-write-guard.ts). `metric`
+  *  distinguishes truncated tool-call arguments from a write_file that would
+  *  replace a file with a cut-off copy of itself. Content-free: sizes, tool and
+  *  model names only, never a path or file content. */
+ export const FILE_WRITE_GUARD_EVENT = 'file_write_guard' as const
+ /** Model-based context compaction failed and the runtime fell back to the
+  *  mechanical pass (packages/agent-runtime/src/model-compaction.ts). The SDK
+  *  is otherwise silent in the Web/Cloud runner, so without an allowlisted
+  *  event a summarizer failure is invisible there. Content-free: the error is
+  *  reduced to a fixed `error_kind`, never its message. */
+ export const MODEL_COMPACTION_FALLBACK_EVENT =
+   'model_compaction.fallback' as const
+ /** A model handoff was installed. The denominator for the fallback rate:
+  *  'Context compaction completed' counts the fallback's own mechanical pass,
+  *  so it cannot serve. Content-free sizes and labels only. */
+ export const MODEL_COMPACTION_COMPLETED_EVENT =
+   'model_compaction.completed' as const
++/** A deterministic-cohort compaction that the mechanical pass did not apply:
++ *  it threw (the live request alone over budget) or could not shrink the
++ *  history. The model arm's equivalent is `model_compaction.fallback` with
++ *  `fallback_applied: false`; without this the cohort's misses were silent.
++ *  Content-free: a fixed `error_kind`, never the message. */
++export const MECHANICAL_COMPACTION_SKIPPED_EVENT =
++  'mechanical_compaction.skipped' as const
+ /** The runtime's mechanical compaction (packages/agent-runtime/src/compact-history.ts),
+  *  run on its own or as a model compaction's fallback. Shares its field names
+  *  with `context_pruning.completed`. Content-free sizes and counts only. */
+ export const CONTEXT_COMPACTION_COMPLETED_EVENT =
+   'context_compaction_completed' as const
++/** The runtime reminded a model that its to-do list had not moved for several
++ *  tool calls (packages/agent-runtime/src/util/todo-progress-reminder.ts).
++ *  Counts and labels only, never the to-dos or a user id. */
++export const TODO_PROGRESS_REMINDER_EVENT = 'todo_progress_reminder' as const
+ /** One per compaction window, closed by the next compaction or the run's end:
+  *  how much the run read after compacting, and how many of those reads were
+  *  files whose contents the compaction dropped. Counts only, never a path. */
+ export const COMPACTION_FOLLOWUP_EVENT = 'context_compaction.followup' as const
+ export const ADS_FETCH_COMPLETED_EVENT = AnalyticsEvent.ADS_FETCH_COMPLETED
+ export const ADS_FIRST_PARTY_DECISION_EVENT =
+   AnalyticsEvent.ADS_FIRST_PARTY_DECISION
+ export const ADS_FIRST_PARTY_SETTLEMENT_EVENT =
+   AnalyticsEvent.ADS_FIRST_PARTY_SETTLEMENT
+ export const ADS_FIRST_PARTY_VIEW_ACK_EVENT =
+   AnalyticsEvent.ADS_FIRST_PARTY_VIEW_ACK
+ export const ADS_FIRST_PARTY_CLICK_RECORDED_EVENT =
+   'ads.first_party_click_recorded' as const
+ export const ADS_FIRST_PARTY_IMPRESSION_RECORDED_EVENT =
+   'ads.first_party_impression_recorded' as const
+ /** Advertiser S2S conversion postbacks. This event is deliberately limited to
+  * a small, content-free operational census; partner credentials and the
+  * opaque click/event identifiers never leave the request handler. */
+ export const ADS_EXTERNAL_CONVERSION_POSTBACK_EVENT =
+   'ads.external_conversion_postback' as const
+ /**
+  * Why an authenticated S2S postback failed the click-id shape guard before
+  * body validation. Values describe only the failed predicate; the presented
+  * value, API key, advertiser, campaign, IP and request body stay out of Axiom.
+  */
+@@ -224,119 +235,152 @@ const STREAM_RECOVERY_FIELDS = {
+   metric: 'string',
+   source: 'string',
+   model: 'string',
+   agentId: 'string',
+   runId: 'string',
+   userInputId: 'string',
+   finishReason: 'string',
+   hasYieldedContent: 'boolean',
+   consecutive: 'number',
+   /** A 'provider-error' recovery's HTTP status (502, 429, ...). */
+   statusCode: 'number',
+ } as const satisfies AxiomOnlyFieldSchema
+ 
+ const FILE_WRITE_GUARD_FIELDS = {
+   metric: 'string',
+   toolName: 'string',
+   model: 'string',
+   agentId: 'string',
+   runId: 'string',
+   receivedChars: 'number',
+   oldLines: 'number',
+   newLines: 'number',
+   openBrackets: 'number',
+ } as const satisfies AxiomOnlyFieldSchema
+ 
++/** On every compaction event: whether the user is in the
++ *  `usesDeterministicCompaction` cohort, so the arms are compared by cohort
++ *  rather than by `mode` (a model-arm fallback is mechanical too). Absent when
++ *  the caller does not know (the SDK's `compactRunState`). */
++const COMPACTION_COHORT_FIELDS = {
++  deterministic_cohort: 'boolean',
++} as const satisfies AxiomOnlyFieldSchema
++
+ const MODEL_COMPACTION_FALLBACK_FIELDS = {
+   model: 'string',
+   agent_run_id: 'string',
+   trigger_reason: 'string',
+   error_kind: 'string',
+   error_name: 'string',
+   fallback_applied: 'boolean',
+   fallback_failed: 'boolean',
++  ...COMPACTION_COHORT_FIELDS,
++} as const satisfies AxiomOnlyFieldSchema
++
++const MECHANICAL_COMPACTION_SKIPPED_FIELDS = {
++  model: 'string',
++  agent_run_id: 'string',
++  trigger_reason: 'string',
++  /** `no_shrink`, `over_budget` (the live request alone does not fit) or `error`. */
++  error_kind: 'string',
++  error_name: 'string',
++  context_token_count: 'number',
++  max_context_length: 'number',
++  ...COMPACTION_COHORT_FIELDS,
+ } as const satisfies AxiomOnlyFieldSchema
+ 
+ const MODEL_COMPACTION_COMPLETED_FIELDS = {
+   model: 'string',
+   agent_run_id: 'string',
+   trigger_reason: 'string',
+   summary_source: 'string',
+   summary_tokens: 'number',
+   summary_budget: 'number',
+   sections: 'number',
+   pre_tokens: 'number',
+   post_tokens: 'number',
++  ...COMPACTION_COHORT_FIELDS,
+ } as const satisfies AxiomOnlyFieldSchema
+ 
+ const CONTEXT_COMPACTION_COMPLETED_FIELDS = {
+   agent_run_id: 'string',
+   trigger_reason: 'string',
+   context_token_count: 'number',
+   max_context_length: 'number',
+   cache_gap_ms: 'number',
+   cache_expiry_ms: 'number',
+   cache_expiry_min_tokens: 'number',
+   message_count: 'number',
+   mid_turn: 'boolean',
+   user_budget: 'number',
+   assistant_tool_budget: 'number',
+   previous_summary_entry_count: 'number',
+   user_entry_count: 'number',
+   dropped_user_entry_count: 'number',
+   assistant_tool_entry_count: 'number',
+   dropped_assistant_tool_entry_count: 'number',
+   newest_entry_forced: 'boolean',
+   live_user_prompt_found: 'boolean',
+   summary_estimated_tokens: 'number',
+   budget_dropped_summary_parts: 'number',
+   preserved_fresh_messages: 'number',
+   /** Files re-provided whole, files left as an outline stub, and their size. */
+   working_set_files: 'number',
+   working_set_stubs: 'number',
+   working_set_tokens: 'number',
+   post_tokens: 'number',
++  ...COMPACTION_COHORT_FIELDS,
+ } as const satisfies AxiomOnlyFieldSchema
+ 
+ const COMPACTION_FOLLOWUP_FIELDS = {
+   agent_run_id: 'string',
+   model: 'string',
+   /** `model`, `mechanical`, or `fallback` (a failed model pass's mechanical one). */
+   mode: 'string',
+   trigger_reason: 'string',
+   /** `compaction` (the next one) or `run_end`. */
+   ended_by: 'string',
+   next_trigger_reason: 'string',
+   /** Distinct files read before the compaction whose results it dropped. */
+   elided_read_paths: 'number',
+   read_calls_after: 'number',
+   read_paths_after: 'number',
+   /** Distinct `elided_read_paths` read again inside the window. */
+   reread_paths: 'number',
+   read_tokens_after: 'number',
+   tool_calls_after: 'number',
+   window_ms: 'number',
++  ...COMPACTION_COHORT_FIELDS,
++} as const satisfies AxiomOnlyFieldSchema
++
++const TODO_PROGRESS_REMINDER_FIELDS = {
++  model: 'string',
++  agentId: 'string',
++  runId: 'string',
++  done: 'number',
++  total: 'number',
++  callsSinceUpdate: 'number',
+ } as const satisfies AxiomOnlyFieldSchema
+ 
+ const ADS_FETCH_COMPLETED_FIELDS = {
+   outcome: 'string',
+   /**
+    * The REQUEST-grain correlation handle (`adr_`, COD-406): one per HTTP ad
+    * request on both rails. Opaque and server-minted: never derived from the
+    * prompt, the IP, or the session.
+    */
+   request_id: 'string',
+   /**
+    * The AUCTION-grain handle (`opp_`, COD-369). Since COD-406 both rails mint
+    * one per resolved placement; this event is request-grain, so it carries
+    * the FIRST placement's -- exact for the single-placement request that is
+    * the overwhelming case, and the same coarsest-honest answer it always gave
+    * for a batch. Every placement's own id is on its `ad_impression` row.
+    *
+    * Every join the first-party chain needs already hangs off
+    * `ad_impression.id`, so this is what connects an auction -- including the
+    * ones that filled nothing -- to the row the rest of that chain reaches.
+    */
+   opportunity_id: 'string',
+   /**
+    * The frozen decision policy. `policy_version` is a 12-character digest of
+    * the selection version, the deploy commit and the serving flag tuple;
+@@ -977,53 +1021,55 @@ const ADS_SPONSOR_BREAK_FIELDS = {
+   /**
+    * How long the break held the screen, clamped to an hour. Absent means
+    * UNKNOWN and is never reconstructed from timestamps -- the same rule
+    * `render_delay_ms` follows.
+    */
+   dwell_ms: 'number',
+   /** Intermission's countdown, and whether it ran out before they acted. */
+   timer_ms: 'number',
+   timer_completed: 'boolean',
+   // COD-365 hygiene, required on every client ads event by the CI guard.
+   client_event_id: 'string',
+   client_family: 'string',
+   sample_rate: 'number',
+ } as const satisfies AxiomOnlyFieldSchema
+ 
+ export const ADS_SPONSOR_BREAK_FIELD_NAMES: readonly string[] = Object.keys(
+   ADS_SPONSOR_BREAK_FIELDS,
+ )
+ 
+ export type AxiomOnlyLogEvent = {
+   event:
+     | typeof CONTEXT_PRUNING_COMPLETED_EVENT
+     | typeof STREAM_RECOVERY_EVENT
+     | typeof FILE_WRITE_GUARD_EVENT
+     | typeof MODEL_COMPACTION_FALLBACK_EVENT
++    | typeof MECHANICAL_COMPACTION_SKIPPED_EVENT
+     | typeof MODEL_COMPACTION_COMPLETED_EVENT
+     | typeof CONTEXT_COMPACTION_COMPLETED_EVENT
+     | typeof COMPACTION_FOLLOWUP_EVENT
++    | typeof TODO_PROGRESS_REMINDER_EVENT
+     | typeof ADS_FETCH_COMPLETED_EVENT
+     | typeof ADS_FIRST_PARTY_DECISION_EVENT
+     | typeof ADS_FIRST_PARTY_SETTLEMENT_EVENT
+     | typeof ADS_FIRST_PARTY_VIEW_ACK_EVENT
+     | typeof ADS_FIRST_PARTY_CLICK_RECORDED_EVENT
+     | typeof ADS_FIRST_PARTY_IMPRESSION_RECORDED_EVENT
+     | typeof ADS_EXTERNAL_CONVERSION_POSTBACK_EVENT
+     | typeof ADS_CAMPAIGN_INGRESS_EVIDENCE_EVENT
+     | typeof ADS_ADVERTISER_REPORTING_READ_EVENT
+     | typeof ADS_MCP_TOOL_CALL_EVENT
+     | typeof PAID_API_REQUEST_EVENT
+     | typeof ADS_REQUEST_REJECTED_EVENT
+     | typeof ADS_SHOWCASE_PRESENTED_EVENT
+     | SponsorBreakEvent
+   data: Record<string, string | number | boolean>
+ }
+ 
+ /** Keep only the allowlisted keys whose value matches the declared type
+  *  (strings truncated); everything else is dropped. */
+ function sanitizeAllowlistedFields(
+   record: Record<string, unknown>,
+   fields: AxiomOnlyFieldSchema,
+ ): AxiomOnlyLogEvent['data'] {
+   const sanitized: AxiomOnlyLogEvent['data'] = {}
+   for (const [key, expectedType] of Object.entries(fields)) {
+@@ -1064,74 +1110,89 @@ export function getAxiomOnlyLogEvent(
+ 
+   if (eventName === CONTEXT_PRUNING_COMPLETED_EVENT) {
+     return {
+       event: eventName,
+       data: sanitizeAllowlistedFields(record, CONTEXT_PRUNING_FIELDS),
+     }
+   }
+   if (eventName === STREAM_RECOVERY_EVENT) {
+     return {
+       event: eventName,
+       data: sanitizeAllowlistedFields(record, STREAM_RECOVERY_FIELDS),
+     }
+   }
+   if (eventName === FILE_WRITE_GUARD_EVENT) {
+     return {
+       event: eventName,
+       data: sanitizeAllowlistedFields(record, FILE_WRITE_GUARD_FIELDS),
+     }
+   }
+   if (eventName === MODEL_COMPACTION_FALLBACK_EVENT) {
+     return {
+       event: eventName,
+       data: sanitizeAllowlistedFields(record, MODEL_COMPACTION_FALLBACK_FIELDS),
+     }
+   }
++  if (eventName === MECHANICAL_COMPACTION_SKIPPED_EVENT) {
++    return {
++      event: eventName,
++      data: sanitizeAllowlistedFields(
++        record,
++        MECHANICAL_COMPACTION_SKIPPED_FIELDS,
++      ),
++    }
++  }
+   if (eventName === MODEL_COMPACTION_COMPLETED_EVENT) {
+     return {
+       event: eventName,
+       data: sanitizeAllowlistedFields(
+         record,
+         MODEL_COMPACTION_COMPLETED_FIELDS,
+       ),
+     }
+   }
+   if (eventName === CONTEXT_COMPACTION_COMPLETED_EVENT) {
+     return {
+       event: eventName,
+       data: sanitizeAllowlistedFields(
+         record,
+         CONTEXT_COMPACTION_COMPLETED_FIELDS,
+       ),
+     }
+   }
+   if (eventName === COMPACTION_FOLLOWUP_EVENT) {
+     return {
+       event: eventName,
+       data: sanitizeAllowlistedFields(record, COMPACTION_FOLLOWUP_FIELDS),
+     }
+   }
++  if (eventName === TODO_PROGRESS_REMINDER_EVENT) {
++    return {
++      event: eventName,
++      data: sanitizeAllowlistedFields(record, TODO_PROGRESS_REMINDER_FIELDS),
++    }
++  }
+   if (eventName === ADS_FETCH_COMPLETED_EVENT) {
+     return {
+       event: eventName,
+       data: sanitizeAllowlistedFields(record, ADS_FETCH_COMPLETED_FIELDS),
+     }
+   }
+   if (eventName === ADS_FIRST_PARTY_DECISION_EVENT) {
+     return {
+       event: eventName,
+       data: sanitizeAllowlistedFields(record, ADS_FIRST_PARTY_DECISION_FIELDS),
+     }
+   }
+   if (eventName === ADS_FIRST_PARTY_SETTLEMENT_EVENT) {
+     return {
+       event: eventName,
+       data: sanitizeAllowlistedFields(
+         record,
+         ADS_FIRST_PARTY_SETTLEMENT_FIELDS,
+       ),
+     }
+   }
+   if (eventName === ADS_FIRST_PARTY_VIEW_ACK_EVENT) {
+     // `axiomEvent` is the in-process marker only; it is not telemetry data.
+     const { axiomEvent: _axiomEvent, ...payload } = record
+     const telemetry = createFirstPartyViewAckTelemetry(payload)
+diff --git a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+index 7dc922601..5c4b5c794 100644
+--- a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+@@ -1,33 +1,36 @@
+ /**
+  * End-to-end cover for the `compactContext` flag: compact-history.test.ts
+  * proves the algorithm, and this proves the runtime actually reaches it and
+  * that the rewritten history is what the model sees.
+  */
+ 
+ import * as analytics from '@codebuff/common/analytics'
+-import { usesDeterministicCompaction } from '@codebuff/common/constants/compaction-policy'
++import {
++  DETERMINISTIC_COMPACTION_PERCENT,
++  usesDeterministicCompaction,
++} from '@codebuff/common/constants/compaction-policy'
+ import { TEST_USER_ID } from '@codebuff/common/old-constants'
+ import { createTestAgentRuntimeParams } from '@codebuff/common/testing/fixtures/agent-runtime'
+ import { clearMockedModules } from '@codebuff/common/testing/mock-modules'
+ import {
+   createMockDbOperations,
+   setupDbSpies,
+ } from '@codebuff/common/testing/mocks/database'
+ import { getInitialSessionState } from '@codebuff/common/types/session-state'
+ import { promptSuccess } from '@codebuff/common/util/error'
+ import { assistantMessage, userMessage } from '@codebuff/common/util/messages'
+ import {
+   afterAll,
+   afterEach,
+   beforeEach,
+   describe,
+   expect,
+   it,
+   mock,
+   spyOn,
+ } from 'bun:test'
+ 
+ import { loopAgentSteps } from '../run-agent-step'
+ import { clearAgentGeneratorCache } from '../run-programmatic-step'
+ import { createToolCallChunk, mockFileContext } from './test-utils'
+ 
+@@ -53,51 +56,52 @@ describe('compactContext in loopAgentSteps', () => {
+       'the first request: DISTINCTIVE PRIOR ANSWER. Continue with the live question.',
+   }
+   /** What the summarizer's `complete_compaction` call carries, or a throw. */
+   let compactionInput: unknown | (() => never) = defaultCompactionInput
+ 
+   const baseTemplate: AgentTemplate = {
+     id: 'test-agent',
+     displayName: 'Test Agent',
+     spawnerPrompt: 'Testing',
+     model: 'claude-3-5-sonnet-20241022',
+     inputSchema: {},
+     outputMode: 'last_message',
+     includeMessageHistory: true,
+     inheritParentSystemPrompt: false,
+     mcpServers: {},
+     toolNames: ['end_turn'],
+     spawnableAgents: [],
+     systemPrompt: 'Test system prompt',
+     instructionsPrompt: '',
+     stepPrompt: '',
+     handleSteps: undefined,
+   } satisfies AgentTemplate as AgentTemplate
+ 
+   /** An old read whose result is most of the history: what a mechanical pass
+    * reclaims. Without it the history is too small to shrink. At ~53k tokens
+-   * it is over the 40k working-set limit, so it comes back as a stub. */
++   * it is far over the working set's share of the 12k history cap (under
++   * 5k), so it comes back as a stub. */
+   const bulkyRead = (body = 'BULKY FILE BODY '): Message[] => [
+     {
+       role: 'assistant',
+       content: [
+         {
+           type: 'tool-call',
+           toolCallId: 'old-read',
+           toolName: 'read_files',
+           input: { paths: ['big.ts'] },
+         },
+       ],
+       sentAt: 1_000_000,
+     },
+     {
+       role: 'tool',
+       toolName: 'read_files',
+       toolCallId: 'old-read',
+       content: [
+         {
+           type: 'json',
+           value: [{ path: 'big.ts', content: body.repeat(10_000) }],
+         },
+       ],
+     },
+   ]
+@@ -180,86 +184,89 @@ describe('compactContext in loopAgentSteps', () => {
+       ancestorRunIds: [],
+       onResponseChunk: () => {},
+       signal: new AbortController().signal,
+     } as any)
+   }
+ 
+   beforeEach(() => {
+     seenMessages = []
+     compactionInput = defaultCompactionInput
+     dbSpies = setupDbSpies(createMockDbOperations())
+     spyOn(analytics, 'trackEvent').mockImplementation(() => {})
+   })
+ 
+   afterEach(() => {
+     if (runtimeImpl) clearAgentGeneratorCache(runtimeImpl)
+     dbSpies.restore()
+     mock.restore()
+   })
+ 
+   afterAll(() => {
+     clearMockedModules()
+   })
+ 
+   /** A user `usesDeterministicCompaction` puts on the mechanical pass. */
+   const cohortUser = () => {
+-    let userId = ''
+-    for (let i = 0; !usesDeterministicCompaction(userId); i++)
+-      userId = `cohort-user-${i}`
+-    return userId
++    for (let i = 0; i < 10_000; i++)
++      if (usesDeterministicCompaction(`cohort-user-${i}`))
++        return `cohort-user-${i}`
++    throw new Error('no user in the deterministic-compaction cohort')
+   }
++  /** At 0% (the rollback value) there is no cohort to test. */
++  const cohortIt = it.skipIf(DETERMINISTIC_COMPACTION_PERCENT <= 0)
+ 
+   it('runs the model handoff for the test user, who is in the model cohort', () => {
+     // Every model-path case below depends on this; at 100% the handoff is gone.
+     expect(usesDeterministicCompaction(TEST_USER_ID)).toBe(false)
+   })
+ 
+-  it('compacts mechanically at the context limit for the deterministic cohort', async () => {
++  cohortIt('compacts mechanically at the context limit for the deterministic cohort', async () => {
+     const userId = cohortUser()
+     const logged: unknown[] = []
+     const result = await runLoop(
+       overBudget,
+       idleHistory(0),
+       undefined,
+       logged,
+       userId,
+     )
+     expect(result.output.type).not.toBe('error')
+     // The turn's own request only: no `complete_compaction` call.
+     expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(1)
+     const sent = seenMessages[0].map(textOf).join('\n')
+     expect(sent).toContain('<conversation_summary>')
+     expect(sent).toContain('the live question')
+     expect(
+       logged.filter(
+         (data) =>
+           (data as { axiomEvent?: string }).axiomEvent ===
+           'context_compaction.followup',
+       ),
+     ).toEqual([
+       expect.objectContaining({
+         mode: 'mechanical',
++        deterministic_cohort: true,
+         trigger_reason: 'context_limit',
+       }),
+     ])
+   })
+ 
+   it('leaves the history alone when the agent has not opted in', async () => {
+     await runLoop(baseTemplate, idleHistory(120))
+ 
+     const sent = seenMessages[0].map(textOf).join('\n')
+     expect(sent).toContain('DISTINCTIVE PRIOR ANSWER')
+     expect(sent).not.toContain('<conversation_summary>')
+   })
+ 
+   it('manual compaction ends after its dedicated tool and preserves the live request', async () => {
+     const result = await runLoop(baseTemplate, idleHistory(0), '/compact')
+     expect(result.output.type).not.toBe('error')
+     expect(seenMessages).toHaveLength(0)
+     expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(1)
+     const history = result.agentState.messageHistory.map(textOf).join('\n')
+     expect(history).toContain('the live question')
+     expect(history).toContain('<conversation_summary>')
+     expect(history).not.toContain('/compact')
+   })
+ 
+   // Regression: on 2026-09-23 a Freebuff Cloud run failed with
+@@ -268,91 +275,106 @@ describe('compactContext in loopAgentSteps', () => {
+   // the runtime as a STRING (the AI SDK's `invalid` tool call), and a strict
+   // `.parse` on it threw straight out of the agent loop.
+   it('accepts a double-encoded compaction summary instead of failing the run', async () => {
+     // What the AI SDK hands over for a model that double-encoded its
+     // arguments: the outer layer parsed, the object still a JSON string.
+     compactionInput = JSON.stringify({
+       summary: 'DOUBLE ENCODED HANDOFF for the live question.',
+     })
+     const result = await runLoop(baseTemplate, idleHistory(0), '/compact')
+     expect(result.output.type).not.toBe('error')
+     const history = result.agentState.messageHistory.map(textOf).join('\n')
+     expect(history).toContain('DOUBLE ENCODED HANDOFF')
+     expect(history).toContain('the live question')
+   })
+ 
+   // The idle trigger is mechanical, so these two reach the summarizer through
+   // the context limit: a 4k window under a ~21k-token history.
+   const overBudget = {
+     ...baseTemplate,
+     compactContext: { maxContextLength: 4096, cacheExpiryMs: null },
+   }
+ 
+   it('falls back to mechanical compaction when the summary is unusable', async () => {
+     // Arguments cut off by the output cap: JSON that never closes.
+     compactionInput = '{"summary": "the first request was about'
+-    const result = await runLoop(overBudget, idleHistory(0))
++    const logged: unknown[] = []
++    const result = await runLoop(overBudget, idleHistory(0), undefined, logged)
+     expect(result.output.type).not.toBe('error')
+     expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(2)
++    // Mechanical by mode, but the model arm by cohort.
++    expect(
++      logged.filter(
++        (data) =>
++          (data as { axiomEvent?: string }).axiomEvent ===
++          'context_compaction.followup',
++      ),
++    ).toEqual([
++      expect.objectContaining({ mode: 'fallback', deterministic_cohort: false }),
++    ])
+     const sent = seenMessages[0].map(textOf).join('\n')
+     expect(sent).toContain('<conversation_summary>')
+     expect(sent).toContain('the live question')
+     expect(sent).not.toContain('the first request was about')
+     expect(JSON.stringify(seenMessages[0])).not.toContain(
+       'BULKY FILE BODY '.repeat(50),
+     )
+   })
+ 
+-  it('compacts mechanically on the idle trigger in the cohort: no summarizer request', async () => {
++  cohortIt('compacts mechanically on the idle trigger in the cohort: no summarizer request', async () => {
+     const logged: unknown[] = []
+     const result = await runLoop(
+       { ...baseTemplate, compactContext: { cacheExpiryMinTokens: null } },
+       idleHistory(120),
+       undefined,
+       logged,
+       cohortUser(),
+     )
+     expect(result.output.type).not.toBe('error')
+     // One request, the turn itself; never a `complete_compaction` call.
+     expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(1)
+     const sent = seenMessages[0].map(textOf).join('\n')
+     expect(sent).toContain('<conversation_summary>')
+     expect(sent).toContain('inspected files: big.ts')
+     expect(JSON.stringify(seenMessages[0])).not.toContain(
+       'BULKY FILE BODY '.repeat(50),
+     )
+     const events = (name: string) =>
+       logged.filter(
+         (data) => (data as { axiomEvent?: string }).axiomEvent === name,
+       )
+     expect(events('model_compaction.completed')).toEqual([])
+     expect(events('context_compaction_completed')).toEqual([
+-      expect.objectContaining({ trigger_reason: 'cache_expiry' }),
++      expect.objectContaining({
++        trigger_reason: 'cache_expiry',
++        deterministic_cohort: true,
++      }),
+     ])
+     expect(events('context_compaction.followup')).toEqual([
+       expect.objectContaining({
+         mode: 'mechanical',
++        deterministic_cohort: true,
+         trigger_reason: 'cache_expiry',
+         ended_by: 'run_end',
+         elided_read_paths: 1,
+         read_calls_after: 0,
+         reread_paths: 0,
+         tool_calls_after: 1,
+       }),
+     ])
+   })
+ 
+   it('a summarizer that throws never fails the turn', async () => {
+     compactionInput = () => {
+       throw new Error('provider exploded mid-compaction')
+     }
+     const result = await runLoop(overBudget, idleHistory(0))
+     expect(result.output.type).not.toBe('error')
+     expect(seenMessages).toHaveLength(1)
+     expect(seenMessages[0].map(textOf).join('\n')).toContain(
+       'the live question',
+     )
+   })
+ 
+   it('leaves a small conversation alone however cold the cache is', async () => {
+     // The default size floor: compaction always costs detail, and there is
+     // nothing here worth reclaiming.
+diff --git a/packages/agent-runtime/src/__tests__/compaction-followup.test.ts b/packages/agent-runtime/src/__tests__/compaction-followup.test.ts
+index 13799965f..30c696592 100644
+--- a/packages/agent-runtime/src/__tests__/compaction-followup.test.ts
++++ b/packages/agent-runtime/src/__tests__/compaction-followup.test.ts
+@@ -97,67 +97,69 @@ describe('compaction follow-up window', () => {
+       before,
+       after,
+       mode: 'model',
+       trigger: 'context_limit',
+       now: 0,
+     })
+     const now = [
+       ...after,
+       ...read('r3', ['a.ts', 'c.ts']),
+       ...read('r4', ['a.ts']),
+     ]
+     expect(measureCompactionWindow(window, now)).toMatchObject({
+       elided_read_paths: 1,
+       read_calls_after: 2,
+       read_paths_after: 2,
+       reread_paths: 1,
+       tool_calls_after: 2,
+     })
+   })
+ 
+   it('logs counts only, and never throws from a broken logger', () => {
+     const window = openCompactionWindow({
+       before,
+       after,
+       mode: 'fallback',
++      deterministicCohort: false,
+       trigger: 'cache_expiry',
+       now: 1_000,
+     })
+     const logged: Record<string, unknown>[] = []
+     closeCompactionWindow({
+       window,
+       messages: [...after, ...read('r3', ['a.ts'])],
+       endedBy: 'compaction',
+       nextTrigger: 'context_limit',
+       logger: {
+         info: (data: Record<string, unknown>) => logged.push(data),
+       } as any,
+       runId: 'run-1',
+       model: 'm',
+       now: 4_000,
+     })
+     expect(logged).toEqual([
+       expect.objectContaining({
+         axiomEvent: 'context_compaction.followup',
+         mode: 'fallback',
++        deterministic_cohort: false,
+         trigger_reason: 'cache_expiry',
+         ended_by: 'compaction',
+         next_trigger_reason: 'context_limit',
+         reread_paths: 1,
+         window_ms: 3_000,
+       }),
+     ])
+     expect(JSON.stringify(logged)).not.toContain('a.ts')
+     expect(() =>
+       closeCompactionWindow({
+         window,
+         messages: after,
+         endedBy: 'run_end',
+         logger: {
+           info: () => {
+             throw new Error('sink down')
+           },
+         } as any,
+       }),
+     ).not.toThrow()
+   })
+ })
+diff --git a/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts b/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts
+index 29ac6fda3..1bd729ddd 100644
+--- a/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts
++++ b/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts
+@@ -47,50 +47,90 @@ const read = (id: string, files: Record<string, string>): Message[] => [
+           referencedBy: {},
+         })),
+       },
+     ],
+   },
+ ]
+ const edit = (id: string, path: string): Message[] => [
+   {
+     role: 'assistant',
+     content: [
+       {
+         type: 'tool-call',
+         toolCallId: id,
+         toolName: 'str_replace',
+         input: { path, replacements: [] },
+       },
+     ],
+   },
+   {
+     role: 'tool',
+     toolCallId: id,
+     toolName: 'str_replace',
+     content: [{ type: 'json', value: { file: path, message: 'Updated' } }],
+   },
+ ]
++const spawn = (id: string): Message[] => [
++  {
++    role: 'assistant',
++    content: [
++      {
++        type: 'tool-call',
++        toolCallId: id,
++        toolName: 'spawn_agents',
++        input: {
++          agents: [{ agent_type: 'worker', prompt: 'Apply the rename.' }],
++        },
++      },
++    ],
++  },
++  {
++    role: 'tool',
++    toolCallId: id,
++    toolName: 'spawn_agents',
++    content: [{ type: 'json', value: [{ agentType: 'worker', value: 'Done' }] }],
++  },
++]
++const command = (id: string): Message[] => [
++  {
++    role: 'assistant',
++    content: [
++      {
++        type: 'tool-call',
++        toolCallId: id,
++        toolName: 'run_terminal_command',
++        input: { command: 'bun test' },
++      },
++    ],
++  },
++  {
++    role: 'tool',
++    toolCallId: id,
++    toolName: 'run_terminal_command',
++    content: [{ type: 'json', value: { stdout: 'ok' } }],
++  },
++]
+ 
+ const source = (name: string, lines: number) =>
+   [
+     `export function ${name}() {`,
+     ...Array.from({ length: lines }, (_, i) => `  // ${name} body ${i}`),
+     '}',
+   ].join('\n')
+ 
+ /** The working set's read result, as `[{ path, content }]`. */
+ const workingSet = (messages: Message[]) => {
+   const message = messages.find(
+     (m) => m.role === 'tool' && m.tags?.includes(WORKING_SET_TAG),
+   )
+   if (!message || message.role !== 'tool') return undefined
+   const part = message.content[0]
+   return part.type === 'json'
+     ? (part.value as { path: string; content: string }[])
+     : undefined
+ }
+ 
+ /** A long session, then the live request; filler makes the history worth compacting. */
+ const session = (...work: Message[][]): Message[] => [
+   user('Make the uploader retry on 429s.'),
+   ...work.flat(),
+   said('FILLER '.repeat(30_000)),
+@@ -113,50 +153,91 @@ describe('mechanical compaction working set', () => {
+           ? m.role
+           : 'other',
+     )
+     expect(order.slice(-3)).toEqual(['live', 'assistant', 'tool'])
+     expect(compacted.summaryText).toContain('inspected files: src/upload.ts')
+   })
+ 
+   it('never re-provides contents the model edited after reading them', () => {
+     const compacted = compactHistoryNow({
+       messages: session(
+         ...[edit('e0', 'a.ts')],
+         read('r1', { 'a.ts': source('a', 10), 'b.ts': source('b', 10) }),
+         edit('e1', 'b.ts'),
+       ),
+       maxContextLength: 400_000,
+     })!
+     const files = workingSet(compacted.messages)!
+     // Edited before its read: the read is current.
+     expect(files.find((f) => f.path === 'a.ts')!.content).toBe(source('a', 10))
+     const b = files.find((f) => f.path === 'b.ts')!.content
+     expect(b.startsWith(COMPACTED_READ_MARKER)).toBe(true)
+     expect(b).toContain('You edited it after this read')
+     expect(b).toContain('L1 export function b()')
+   })
+ 
++  // The fast-mode root delegates its edits through spawn_agents, and the
++  // workers' str_replace calls never reach this history.
++  it('never re-provides a read that a later spawn_agents call may have made stale', () => {
++    const compacted = compactHistoryNow({
++      messages: session(
++        read('r1', { 'a.ts': source('a', 10) }),
++        spawn('s1'),
++        read('r2', { 'b.ts': source('b', 10) }),
++      ),
++      maxContextLength: 400_000,
++    })!
++    const files = workingSet(compacted.messages)!
++    // Read after the spawn: current.
++    expect(files.find((f) => f.path === 'b.ts')!.content).toBe(source('b', 10))
++    const a = files.find((f) => f.path === 'a.ts')!.content
++    expect(a.startsWith(COMPACTED_READ_MARKER)).toBe(true)
++    expect(a).toContain('Agents you spawned after this read may have edited it')
++    expect(a).toContain('L1 export function a()')
++  })
++
++  it('treats a spawn in the fresh exchange as a delegated edit too', () => {
++    const messages = session(read('r1', { 'a.ts': source('a', 10) }))
++    // A spawn after the live request: the turn's own delegation, kept fresh.
++    const compacted = compactHistoryNow({
++      messages: [...messages, ...spawn('s1')],
++      maxContextLength: 400_000,
++    })!
++    const a = workingSet(compacted.messages)!.find((f) => f.path === 'a.ts')!
++    expect(a.content.startsWith(COMPACTED_READ_MARKER)).toBe(true)
++  })
++
++  it('still carries a read across a shell command', () => {
++    const compacted = compactHistoryNow({
++      messages: session(read('r1', { 'a.ts': source('a', 10) }), command('c1')),
++      maxContextLength: 400_000,
++    })!
++    expect(workingSet(compacted.messages)).toEqual([
++      { path: 'a.ts', content: source('a', 10) },
++    ])
++  })
++
+   it('carries the newest reads that fit and stubs the rest with an outline', () => {
+     const big = source('older', 30_000)
+     const compacted = compactHistoryNow({
+       messages: session(
+         read('r1', { 'older.ts': big }),
+         read('r2', { 'newer.ts': source('newer', 20) }),
+       ),
+       maxContextLength: 400_000,
+     })!
+     const files = workingSet(compacted.messages)!
+     expect(files.map((f) => f.path)).toEqual(['newer.ts', 'older.ts'])
+     expect(files[0].content).toBe(source('newer', 20))
+     expect(files[1].content).toStartWith(COMPACTED_READ_MARKER)
+     expect(files[1].content).toContain('30002 lines when read')
+     expect(files[1].content).toContain('L1 export function older()')
+     expect(JSON.stringify(compacted.messages)).not.toContain('older body 100')
+   })
+ 
+   it('keeps one entry per file across repeated compactions', () => {
+     const first = compactHistoryNow({
+       messages: session(
+         read('r1', { 'a.ts': source('a', 10) }),
+         read('r2', { 'b.ts': source('b', 30_000) }),
+       ),
+       maxContextLength: 400_000,
+diff --git a/packages/agent-runtime/src/__tests__/model-compaction.test.ts b/packages/agent-runtime/src/__tests__/model-compaction.test.ts
+index b466b9828..01ad05a2c 100644
+--- a/packages/agent-runtime/src/__tests__/model-compaction.test.ts
++++ b/packages/agent-runtime/src/__tests__/model-compaction.test.ts
+@@ -1,29 +1,30 @@
+ import { expect, test } from 'bun:test'
+ import {
+   automaticCompactionIsWorthwhile,
+   compactedContextCeiling,
++  compactDeterministically,
+   compactionOutputTokens,
+   compactionSummaryBudget,
+   compactWithModel,
+   compactWithModelOrFallback,
+   COMPACTION_TAG,
+   parseCompactionSummary,
+   SUMMARY_OVERRUN_TOLERANCE,
+ } from '../model-compaction'
+ import { promptSuccess } from '@codebuff/common/util/error'
+ import { DEEPSEEK_FLASH_COMPACTION_POLICY } from '@codebuff/common/constants/compaction-policy'
+ import { evaluateCompactionTrigger } from '../compact-history'
+ import { countTokens, countTokensMessages } from '../util/token-counter'
+ import type {
+   Message,
+   ToolMessage,
+ } from '@codebuff/common/types/messages/codebuff-message'
+ import type { PromptAiSdkStreamFn } from '@codebuff/common/types/contracts/llm'
+ 
+ const user = (text: string): Message => ({
+   role: 'user',
+   tags: ['USER_PROMPT'],
+   content: [{ type: 'text', text }],
+ })
+ const messages: Message[] = [
+   user('Compare the time units in a.ts and b.ts.'),
+@@ -871,25 +872,133 @@ test('an installed handoff reports its source, size and budget; a fallback does
+   expect(infos).toMatchObject([
+     {
+       axiomEvent: 'model_compaction.completed',
+       agent_run_id: 'run-1',
+       model: 'deepseek/deepseek-v4-flash',
+       trigger_reason: 'cache_expiry',
+       summary_source: 'text',
+       summary_tokens: countTokens(handoff),
+       summary_budget: 6_000,
+       sections: 1,
+     },
+   ])
+   infos.length = 0
+   await compactWithModelOrFallback({
+     ...params,
+     stream: replying('Sure, what next?'),
+   })
+   expect(
+     infos.some(
+       (i) =>
+         (i as { axiomEvent?: string }).axiomEvent ===
+         'model_compaction.completed',
+     ),
+   ).toBe(false)
+ })
++
++test('compactDeterministically logs each miss the cohort used to swallow', () => {
++  const infos: unknown[] = []
++  const warnings: unknown[] = []
++  const logger = {
++    ...noopLogger,
++    info: (data: unknown) => infos.push(data),
++    warn: (data: unknown) => warnings.push(data),
++  }
++  const common = {
++    fixedTokenCount: 500,
++    trigger: 'context_limit' as const,
++    logger,
++    runId: 'run-1',
++    model: 'deepseek/deepseek-v4-flash',
++    contextTokenCount: 9_000,
++  }
++
++  // Nothing older than the live request: the pass cannot shrink it.
++  expect(
++    compactDeterministically({
++      ...common,
++      messages: [user('Only the live request.')],
++      maxContextLength: 400_000,
++    }),
++  ).toBeNull()
++  expect(infos).toEqual([
++    {
++      axiomEvent: 'mechanical_compaction.skipped',
++      agent_run_id: 'run-1',
++      model: 'deepseek/deepseek-v4-flash',
++      trigger_reason: 'context_limit',
++      error_kind: 'no_shrink',
++      context_token_count: 9_000,
++      max_context_length: 400_000,
++      deterministic_cohort: true,
++    },
++  ])
++
++  // The live request alone over the budget: the pass throws, the run goes on.
++  expect(
++    compactDeterministically({
++      ...common,
++      messages: [user('too long '.repeat(5_000))],
++      maxContextLength: 2_000,
++    }),
++  ).toBeNull()
++  expect(warnings).toEqual([
++    expect.objectContaining({
++      axiomEvent: 'mechanical_compaction.skipped',
++      error_kind: 'over_budget',
++      error_name: 'Error',
++      deterministic_cohort: true,
++    }),
++  ])
++
++  // A pass that applies logs its completion, marked as the cohort's.
++  infos.length = 0
++  warnings.length = 0
++  const result = compactDeterministically({
++    ...common,
++    messages,
++    maxContextLength: 16_384,
++    targetTokens: 4_000,
++  })
++  expect(result!.postTokens).toBeLessThan(result!.preTokens)
++  expect(warnings).toEqual([])
++  expect(infos).toEqual([
++    expect.objectContaining({
++      axiomEvent: 'context_compaction_completed',
++      deterministic_cohort: true,
++    }),
++  ])
++})
++
++test('the model arm marks its fallback with the cohort flag', async () => {
++  const warnings: unknown[] = []
++  const infos: unknown[] = []
++  await compactWithModelOrFallback({
++    messages,
++    system: 'You are a coding agent.',
++    maxContextLength: 16_384,
++    fixedTokenCount: 500,
++    mechanicalTargetTokens: 4_000,
++    deterministicCohort: false,
++    signal: new AbortController().signal,
++    stream: async function* () {
++      throw new Error('connection reset')
++    },
++    logger: {
++      ...noopLogger,
++      info: (data: unknown) => infos.push(data),
++      warn: (data: unknown) => warnings.push(data),
++    },
++  })
++  expect(warnings).toEqual([
++    expect.objectContaining({
++      axiomEvent: 'model_compaction.fallback',
++      deterministic_cohort: false,
++    }),
++  ])
++  expect(infos).toEqual([
++    expect.objectContaining({
++      axiomEvent: 'context_compaction_completed',
++      deterministic_cohort: false,
++    }),
++  ])
++})
+diff --git a/packages/agent-runtime/src/compact-history.ts b/packages/agent-runtime/src/compact-history.ts
+index 69a29cbf4..ec35b86f8 100644
+--- a/packages/agent-runtime/src/compact-history.ts
++++ b/packages/agent-runtime/src/compact-history.ts
+@@ -1171,94 +1171,103 @@ export function evaluateCompactionTrigger(params: {
+       ? null
+       : promptCacheGapMs(messages)
+   const cacheExpired =
+     cacheExpiryMs !== null && cacheGapMs !== null && cacheGapMs > cacheExpiryMs
+ 
+   const trigger: CompactionTrigger | null = overContextLimit
+     ? cacheExpired
+       ? 'context_limit_and_cache_expiry'
+       : 'context_limit'
+     : cacheExpired
+       ? 'cache_expiry'
+       : null
+ 
+   return { trigger }
+ }
+ 
+ /**
+  * Compact once, on demand, whatever the triggers say.
+  *
+  * The mechanical pass — protected prefix, fresh tool exchange, budget walk —
+  * with no decision attached. A user who asks for it has already decided;
+  * `evaluateCompactionTrigger` exists to answer "is this worth doing unasked",
+  * which is a different question. It is also the runtime's fallback when a
+  * model compaction fails (`compactWithModelOrFallback`).
+  *
++ * Since #5502 the rewritten part (summary plus working set) stops at
++ * `historyTokens`, MECHANICAL_HISTORY_TOKENS (12k) by default, however much
++ * room `maxContextLength` leaves; the live request and fresh tool results are
++ * kept whole on top. Before, it filled the budget.
++ *
+  * Returns null when the pass would not make the history smaller. That is not a
+  * failure, it is the honest answer for a short conversation: rewriting it would
+  * break the provider's prompt cache and hand back an envelope around the same
+  * content. The caller reports it as a no-op rather than a compaction.
+  *
+  * Throws what `compactRequestHistory` throws — the live request alone over
+  * budget — with its user-presentable sentence intact.
+  */
+ export function compactHistoryNow(params: {
+   messages: Message[]
+   maxContextLength: number
+   /** System prompt, tool schemas and next step's scaffolding, outside history. */
+   fixedTokenCount?: number
+   /** Where the rewritten part should stop, below `maxContextLength`; see
+    * `compactRequestHistory`. Defaults to `maxContextLength`. */
+   targetTokens?: number
+   /** The most the rewritten history (summary plus working set) may take.
+    * Defaults to MECHANICAL_HISTORY_TOKENS. */
+   historyTokens?: number
+   /** Why the caller compacted; a forced pass is `manual`. */
+   trigger?: CompactionTrigger | 'manual'
++  /** Whether the user is in the deterministic-compaction cohort; telemetry
++   * only, omitted when the caller does not know. */
++  deterministicCohort?: boolean
+   logger?: Logger
+   runId?: string
+ }): {
+   messages: Message[]
+   /** Text of the installed summary message; '' when none fit. */
+   summaryText: string
+   previousTokens: number
+   nextTokens: number
+ } | null {
+   const { messages, maxContextLength, logger, runId } = params
+   const fixedTokenCount = params.fixedTokenCount ?? 0
+   const result = compactRequestHistory(
+     messages,
+     maxContextLength - fixedTokenCount,
+     Math.min(params.targetTokens ?? maxContextLength, maxContextLength) -
+       fixedTokenCount,
+     params.historyTokens ?? MECHANICAL_HISTORY_TOKENS,
+   )
+   const previousTokens = countTokensMessages(messages)
+   const nextTokens = countTokensMessages(result.messages)
+   if (nextTokens >= previousTokens) return null
+ 
+   // Telemetry is best-effort and must never block the compaction itself.
+   try {
+     logger?.info(
+       {
+         axiomEvent: CONTEXT_COMPACTION_COMPLETED_EVENT,
+         agent_run_id: runId,
+         trigger_reason: params.trigger ?? 'manual',
+         context_token_count: previousTokens + fixedTokenCount,
+         max_context_length: maxContextLength,
+         message_count: messages.length,
+         ...result.stats,
+         post_tokens: nextTokens + fixedTokenCount,
++        deterministic_cohort: params.deterministicCohort,
+       },
+       'Context compaction completed',
+     )
+   } catch {
+     // Ignore logging failures.
+   }
+ 
+   return {
+     messages: result.messages,
+     summaryText: result.summaryText,
+     previousTokens,
+     nextTokens,
+   }
+ }
+diff --git a/packages/agent-runtime/src/compaction-followup.ts b/packages/agent-runtime/src/compaction-followup.ts
+index 96ac9e580..7b94dd3ac 100644
+--- a/packages/agent-runtime/src/compaction-followup.ts
++++ b/packages/agent-runtime/src/compaction-followup.ts
+@@ -3,50 +3,52 @@
+  * cause read loops". A compaction opens a window; the next compaction or the
+  * end of the run closes it and logs one content-free event with how much the
+  * run read inside it, and how many of those reads were files whose contents
+  * the compaction had just dropped.
+  *
+  * Reads are told apart by tool-call id, which survives every history rewrite
+  * the runtime does, so the window needs no hook into tool execution: whatever
+  * `read_files` call is in the history at close and was not there right after
+  * the compaction happened inside the window.
+  */
+ 
+ import { COMPACTION_FOLLOWUP_EVENT } from '@codebuff/common/util/axiom-only-log'
+ 
+ import { COMPACTED_READ_MARKER } from './compaction-working-set'
+ import { countTokensJson } from './util/token-counter'
+ 
+ import type { CompactionTrigger } from './compact-history'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ 
+ /** `fallback` is the mechanical pass a failed model compaction fell back to. */
+ export type CompactionMode = 'model' | 'mechanical' | 'fallback'
+ 
+ export type CompactionWindow = {
+   mode: CompactionMode
++  /** The user's arm, which `mode` is not: a model-arm fallback is mechanical. */
++  deterministicCohort?: boolean
+   trigger: CompactionTrigger | 'manual'
+   openedAt: number
+   /** Every tool call already in the compacted history. */
+   carriedCallIds: Set<string>
+   /** Files read before the compaction whose results did not survive it. */
+   elidedPaths: Set<string>
+ }
+ 
+ type ReadCall = { toolCallId: string; paths: string[] }
+ 
+ function readCalls(messages: Message[]): ReadCall[] {
+   const calls: ReadCall[] = []
+   for (const message of messages) {
+     if (message.role !== 'assistant') continue
+     for (const part of message.content) {
+       if (part.type !== 'tool-call' || part.toolName !== 'read_files') continue
+       const raw = (part.input as { paths?: unknown } | undefined)?.paths
+       const paths = Array.isArray(raw)
+         ? raw.flatMap((entry) => {
+             const path =
+               typeof entry === 'string'
+                 ? entry
+                 : (entry as { path?: unknown } | null)?.path
+             return typeof path === 'string' && path ? [path] : []
+           })
+@@ -77,56 +79,58 @@ function heldPaths(messages: Message[]): Set<string> {
+     for (const part of message.content) {
+       if (part.type !== 'json' || !Array.isArray(part.value)) continue
+       for (const file of part.value) {
+         const { path, content } = (file ?? {}) as {
+           path?: unknown
+           content?: unknown
+         }
+         if (
+           typeof path === 'string' &&
+           !(
+             typeof content === 'string' &&
+             content.startsWith(COMPACTED_READ_MARKER)
+           )
+         )
+           held.add(path)
+       }
+     }
+   }
+   return held
+ }
+ 
+ export function openCompactionWindow(params: {
+   before: Message[]
+   after: Message[]
+   mode: CompactionMode
++  deterministicCohort?: boolean
+   trigger: CompactionTrigger | 'manual'
+   now?: number
+ }): CompactionWindow {
+   const carriedPaths = heldPaths(params.after)
+   return {
+     mode: params.mode,
++    deterministicCohort: params.deterministicCohort,
+     trigger: params.trigger,
+     openedAt: params.now ?? Date.now(),
+     carriedCallIds: toolCallIds(params.after),
+     elidedPaths: new Set(
+       readCalls(params.before)
+         .flatMap((call) => call.paths)
+         .filter((path) => !carriedPaths.has(path)),
+     ),
+   }
+ }
+ 
+ /** The numbers the window's event carries; exported for tests. */
+ export function measureCompactionWindow(
+   window: CompactionWindow,
+   messages: Message[],
+ ) {
+   const newCalls = readCalls(messages).filter(
+     (call) => !window.carriedCallIds.has(call.toolCallId),
+   )
+   const newCallIds = new Set(newCalls.map((call) => call.toolCallId))
+   const readPathsAfter = new Set(newCalls.flatMap((call) => call.paths))
+   let readTokensAfter = 0
+   for (const message of messages) {
+     if (message.role === 'tool' && newCallIds.has(message.toolCallId)) {
+       readTokensAfter += countTokensJson(message.content)
+@@ -144,37 +148,38 @@ export function measureCompactionWindow(
+       window.elidedPaths.has(path),
+     ).length,
+     read_tokens_after: readTokensAfter,
+     tool_calls_after: toolCallsAfter,
+   }
+ }
+ 
+ /** Logs the window's event. Telemetry: never throws. */
+ export function closeCompactionWindow(params: {
+   window: CompactionWindow
+   messages: Message[]
+   endedBy: 'compaction' | 'run_end'
+   nextTrigger?: CompactionTrigger | 'manual'
+   logger: Logger
+   runId?: string
+   model?: string
+   now?: number
+ }): void {
+   try {
+     params.logger.info(
+       {
+         axiomEvent: COMPACTION_FOLLOWUP_EVENT,
+         agent_run_id: params.runId,
+         model: params.model,
+         mode: params.window.mode,
++        deterministic_cohort: params.window.deterministicCohort,
+         trigger_reason: params.window.trigger,
+         ended_by: params.endedBy,
+         next_trigger_reason: params.nextTrigger,
+         ...measureCompactionWindow(params.window, params.messages),
+         window_ms: (params.now ?? Date.now()) - params.window.openedAt,
+       },
+       'Compaction follow-up',
+     )
+   } catch {
+     // Telemetry must never fail a run.
+   }
+ }
+diff --git a/packages/agent-runtime/src/compaction-working-set.ts b/packages/agent-runtime/src/compaction-working-set.ts
+index 9bec9caa4..2c942eaaf 100644
+--- a/packages/agent-runtime/src/compaction-working-set.ts
++++ b/packages/agent-runtime/src/compaction-working-set.ts
+@@ -1,202 +1,219 @@
+ /**
+  * The files a mechanical compaction carries forward, so the model does not
+  * have to read them again.
+  *
+  * The summary keeps a one-line record of every tool call, but no tool output:
+  * a file the model read becomes `inspected files: a.ts`. With the contents
+  * gone the model's next move is to read the file again, and on a small window
+  * those reads refill the context until it compacts again (prod, 2026-10-05:
+  * after a mechanical pass the same run compacted again within ten minutes
+  * twice as often as after a model handoff, almost all of it on budgets under
+  * 150k tokens).
+  *
+  * So the pass re-provides the newest read of each file it can afford, as one
+  * `read_files` exchange placed after the live prompt — the shape the model
+  * already trusts for file contents. A file that was edited after its last
+- * read is never re-provided: those contents are stale. Every other file read
++ * read is never re-provided: those contents are stale. Nor is any file read
++ * before a `spawn_agents` call: the spawned agents' edits never appear in this
++ * history (the fast-mode root delegates its edits that way), so the read may
++ * be stale too. Every other file read
+  * earlier gets a stub in the same result instead: its size when read and an
+  * outline of its top-level declarations with line numbers, so the model can
+  * read one section rather than the whole file.
+  *
+  * The exchange is tagged, so the next compaction reads it back as reads
+  * (stubs included, which keeps one entry per path however many times a
+  * history is compacted) and keeps it out of the summary's own tool log.
+  */
+ 
+ import { countTokensJson, countTokensMessages } from './util/token-counter'
+ 
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ 
+ export const WORKING_SET_TAG = 'COMPACTION_WORKING_SET'
+ 
+ /** Starts the content of a file the compaction did not carry. */
+ export const COMPACTED_READ_MARKER =
+   '[read_files: contents dropped at compaction'
+ 
+-/** The most file content one compaction carries, in estimated tokens. */
++/** The most file content one compaction carries, in estimated tokens. At
++ * the default `MECHANICAL_HISTORY_TOKENS` (12k) the share below binds first
++ * (under 5k); this caps a caller that passes a larger `historyTokens`. */
+ export const WORKING_SET_TOKEN_LIMIT = 40_000
+ 
+ /** Share of the room left after the live request and fresh results. The rest
+  * goes to the summary, whose user messages matter more than any one file. */
+ export const WORKING_SET_SHARE = 0.4
+ 
+ /** Stubs are cheap, but a long session reads hundreds of files. */
+ const STUB_TOKEN_LIMIT = 3_000
+ const OUTLINE_MAX_ENTRIES = 20
+ const OUTLINE_LINE_CHARS = 80
+ 
+ const EDIT_TOOLS = new Set([
+   'str_replace',
+   'write_file',
+   'propose_str_replace',
+   'propose_write_file',
+ ])
+ 
++/** Runs agents whose edits stay out of this history. A shell command can
++ * change files too, but it is not counted: most commands change nothing. */
++const DELEGATING_TOOLS = new Set(['spawn_agents'])
++
+ /** Status results (missing, blocked, too large, error) are not contents. */
+ const STATUS_PREFIXES = [
+   '[FILE_DOES_NOT_EXIST]',
+   '[BLOCKED]',
+   '[FILE_OUTSIDE_PROJECT]',
+   '[FILE_READ_ERROR]',
+   '[IMAGE]',
+ ]
+ 
+ export function isWorkingSetMessage(message: Message): boolean {
+   return message.tags?.includes(WORKING_SET_TAG) ?? false
+ }
+ 
+ type Read = {
+   path: string
+   content: string
+   /** Position in the history; later reads and edits compare against it. */
+   order: number
+ }
+ 
+ function pathOf(input: unknown): string | undefined {
+   const path = (input as { path?: unknown } | undefined)?.path
+   return typeof path === 'string' && path ? path : undefined
+ }
+ 
+ /** Every read_files result and every edit, in history order. */
+ function collectReadsAndEdits(messages: Message[]): {
+   reads: Read[]
+   lastEdit: Map<string, number>
++  /** The newest delegation, which may have edited any file; -1 for none. */
++  lastDelegation: number
+ } {
+   const reads: Read[] = []
+   const lastEdit = new Map<string, number>()
++  let lastDelegation = -1
+   messages.forEach((message, order) => {
+     if (message.role === 'assistant') {
+       for (const part of message.content) {
+-        if (part.type !== 'tool-call' || !EDIT_TOOLS.has(part.toolName))
+-          continue
++        if (part.type !== 'tool-call') continue
++        if (DELEGATING_TOOLS.has(part.toolName)) lastDelegation = order
++        if (!EDIT_TOOLS.has(part.toolName)) continue
+         const path = pathOf(part.input)
+         if (path) lastEdit.set(path, order)
+       }
+       return
+     }
+     if (message.role !== 'tool' || message.toolName !== 'read_files') return
+     for (const part of message.content) {
+       if (part.type !== 'json' || !Array.isArray(part.value)) continue
+       for (const file of part.value) {
+         if (!file || typeof file !== 'object' || Array.isArray(file)) continue
+         const { path, content } = file as { path?: unknown; content?: unknown }
+         if (typeof path !== 'string' || typeof content !== 'string') continue
+         reads.push({ path, content, order })
+       }
+     }
+   })
+-  return { reads, lastEdit }
++  return { reads, lastEdit, lastDelegation }
+ }
+ 
+ const DECLARATION_PATTERNS = [
+   // TypeScript / JavaScript
+   /^(export\s+)?(default\s+)?(declare\s+)?(abstract\s+)?(async\s+)?(function\b|class\b|interface\b|type\s+\w|enum\b|namespace\b)/,
+   /^export\s+(const|let|var)\b/,
+   // Python
+   /^(async\s+)?def\s+\w/,
+   /^class\s+\w/,
+   // Go
+   /^func\s/,
+   /^type\s+\w+\s+(struct|interface)\b/,
+   // Rust
+   /^(pub(\([^)]*\))?\s+)?(async\s+)?(fn|struct|enum|trait|impl|mod)\b/,
+   // Markdown
+   /^#{1,3}\s+\S/,
+ ]
+ 
+ /**
+  * Top-level declarations with their line numbers. A windowed read starts its
+  * numbering at the window's first line, which the read's own notice states.
+  */
+ export function outlineOf(content: string): { lines: number; outline: string } {
+   const window = content.match(
+     /\[read_files: showing lines (\d+)-\d+ of (\d+)\./,
+   )
+   const firstLine = window ? Number(window[1]) : 1
+   const body = content.split('\n')
+   const lines = window ? Number(window[2]) : body.length
+   const entries: string[] = []
+   let more = 0
+   for (let i = 0; i < body.length; i++) {
+     const line = body[i]
+     if (!DECLARATION_PATTERNS.some((pattern) => pattern.test(line))) continue
+     if (entries.length >= OUTLINE_MAX_ENTRIES) {
+       more++
+       continue
+     }
+     const text = line.trim().replace(/\s*\{$/, '')
+     entries.push(
+       `L${firstLine + i} ${text.length > OUTLINE_LINE_CHARS ? text.slice(0, OUTLINE_LINE_CHARS) + '…' : text}`,
+     )
+   }
+   if (more > 0) entries.push(`… ${more} more`)
+   return { lines, outline: entries.join('\n') }
+ }
+ 
+-function stubFor(read: Read, reason: 'budget' | 'edited'): string {
++type StubReason = 'budget' | 'edited' | 'delegated'
++
++function stubFor(read: Read, reason: StubReason): string {
+   if (read.content.startsWith(COMPACTED_READ_MARKER)) return read.content
+   const { lines, outline } = outlineOf(read.content)
+   const why =
+     reason === 'edited'
+       ? 'You edited it after this read, so read it again before relying on it.'
+-      : 'Read it again (a section with offset/limit is enough) if you need it.'
++      : reason === 'delegated'
++        ? 'Agents you spawned after this read may have edited it, so read it again before relying on it.'
++        : 'Read it again (a section with offset/limit is enough) if you need it.'
+   return `${COMPACTED_READ_MARKER}. ${lines} lines when read. ${why}]${outline ? `\nOutline:\n${outline}` : ''}`
+ }
+ 
+ /**
+  * The working-set exchange for `older` (the history being summarized), or
+  * null when there is nothing to carry. `fresh` is kept verbatim by the caller:
+  * its reads are already present, and its edits make older reads stale.
+  */
+ export function buildWorkingSet(params: {
+   older: Message[]
+   fresh: Message[]
+   tokenBudget: number
+   now: number
+ }): { messages: Message[]; files: number; stubs: number } | null {
+-  const { reads, lastEdit } = collectReadsAndEdits([
++  const { reads, lastEdit, lastDelegation } = collectReadsAndEdits([
+     ...params.older,
+     ...params.fresh,
+   ])
+   const freshStart = params.older.length
+   const latest = new Map<string, Read>()
+   for (const read of reads) {
+     if (read.order >= freshStart) continue
+     if (STATUS_PREFIXES.some((prefix) => read.content.startsWith(prefix)))
+       continue
+     latest.set(read.path, read)
+   }
+   const freshPaths = new Set(
+     reads.filter((read) => read.order >= freshStart).map((read) => read.path),
+   )
+   // Newest first: the files the model was working with most recently.
+   const candidates = [...latest.values()]
+     .filter((read) => !freshPaths.has(read.path))
+     .sort((a, b) => b.order - a.order)
+   if (candidates.length === 0) return null
+ 
+   const exchange = (files: { path: string; content: string }[]): Message[] => {
+     const toolCallId = `compacted-read-${params.now.toString(36)}`
+     return [
+       {
+         role: 'assistant',
+@@ -204,58 +221,63 @@ export function buildWorkingSet(params: {
+           {
+             type: 'tool-call',
+             toolCallId,
+             toolName: 'read_files',
+             input: { paths: files.map((file) => file.path) },
+           },
+         ],
+         tags: [WORKING_SET_TAG],
+         sentAt: params.now,
+       },
+       {
+         role: 'tool',
+         toolCallId,
+         toolName: 'read_files',
+         content: [{ type: 'json', value: files }],
+         tags: [WORKING_SET_TAG],
+       },
+     ]
+   }
+   // Counted per file, once: the result entry plus the path in the call.
+   const cost = (file: { path: string; content: string }) =>
+     countTokensJson(file) + countTokensJson(file.path) + 1
+   let used = countTokensMessages(exchange([]))
+ 
+   const carried: { path: string; content: string }[] = []
+-  const left: { read: Read; reason: 'budget' | 'edited' }[] = []
++  const left: { read: Read; reason: StubReason }[] = []
+   for (const read of candidates) {
+-    const edited = (lastEdit.get(read.path) ?? -1) > read.order
++    const stale: StubReason | undefined =
++      (lastEdit.get(read.path) ?? -1) > read.order
++        ? 'edited'
++        : lastDelegation > read.order
++          ? 'delegated'
++          : undefined
+     const file = { path: read.path, content: read.content }
+     if (
+-      !edited &&
++      !stale &&
+       !read.content.startsWith(COMPACTED_READ_MARKER) &&
+       used + cost(file) <= params.tokenBudget
+     ) {
+       carried.push(file)
+       used += cost(file)
+     } else {
+-      left.push({ read, reason: edited ? 'edited' : 'budget' })
++      left.push({ read, reason: stale ?? 'budget' })
+     }
+   }
+ 
+   let stubRoom = Math.min(STUB_TOKEN_LIMIT, params.tokenBudget - used)
+   const stubs: { path: string; content: string }[] = []
+   for (const { read, reason } of left) {
+     const stub = { path: read.path, content: stubFor(read, reason) }
+     if (cost(stub) > stubRoom) continue
+     stubs.push(stub)
+     stubRoom -= cost(stub)
+   }
+ 
+   const files = [...carried, ...stubs]
+   if (files.length === 0) return null
+   return {
+     messages: exchange(files),
+     files: carried.length,
+     stubs: stubs.length,
+   }
+ }
+diff --git a/packages/agent-runtime/src/model-compaction.ts b/packages/agent-runtime/src/model-compaction.ts
+index 6a896eb8f..d01e1523c 100644
+--- a/packages/agent-runtime/src/model-compaction.ts
++++ b/packages/agent-runtime/src/model-compaction.ts
+@@ -1,28 +1,29 @@
+ import { tool, type ToolSet } from 'ai'
+ import { z } from 'zod/v4'
+ import {
++  MECHANICAL_COMPACTION_SKIPPED_EVENT,
+   MODEL_COMPACTION_COMPLETED_EVENT,
+   MODEL_COMPACTION_FALLBACK_EVENT,
+ } from '@codebuff/common/util/axiom-only-log'
+ import { AbortError, isAbortError } from '@codebuff/common/util/error'
+ 
+ import { compactHistoryNow } from './compact-history'
+ import type { CompactionTrigger } from './compact-history'
+ import { COMPACTION_PROMPT } from './compaction-prompt'
+ import { countTokens, countTokensMessages } from './util/token-counter'
+ 
+ import type { PromptAiSdkStreamFn } from '@codebuff/common/types/contracts/llm'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ import type {
+   ImagePart,
+   FilePart,
+ } from '@codebuff/common/types/messages/content-part'
+ 
+ export const COMPACTION_TAG = 'MODEL_COMPACTION'
+ const SUMMARY_LIMIT = 6_000
+ /**
+  * The output cap a summarizer request asks for. A model's own, lower cap
+  * (`compactContext.maxOutputTokens`, which BYOK sets from its connection)
+  * replaces it: a provider clamps the request to that cap either way.
+  */
+@@ -629,156 +630,224 @@ function compactionErrorKind(error: unknown): string {
+   if (message.includes('unexpected tool call')) return 'unexpected_tool_call'
+   if (message.includes('output token limit')) return 'output_limit'
+   if (
+     message.includes('too little room') ||
+     message.includes('compaction context budget') ||
+     message.includes('No room for conversation history')
+   )
+     return 'budget'
+   return 'provider_error'
+ }
+ 
+ /**
+  * The mechanical pass (`compactHistoryNow`, no model call). It aims the part
+  * it rewrites at `targetTokens` and keeps the live request and fresh tool
+  * results whole within `maxContextLength`: it fills whatever room it is given,
+  * so aimed at the hard budget it lands above an automatic trigger's threshold
+  * and the very next step compacts again. Null when it cannot make the history
+  * smaller; throws only when even the hard budget cannot hold the live request.
+  */
+ export function compactMechanically(params: {
+   messages: Message[]
+   maxContextLength: number
+   fixedTokenCount: number
+   targetTokens?: number
+   trigger?: CompactionTrigger | 'manual'
++  deterministicCohort?: boolean
+   logger?: Logger
+   runId?: string
+ }): {
+   messages: Message[]
+   summary: string
+   preTokens: number
+   postTokens: number
+ } | null {
+   const result = compactHistoryNow(params)
+   if (!result) return null
+   return {
+     messages: result.messages,
+     summary: result.summaryText,
+     preTokens: result.previousTokens + params.fixedTokenCount,
+     postTokens: result.nextTokens + params.fixedTokenCount,
+   }
+ }
+ 
++/**
++ * The deterministic cohort's compaction: the mechanical pass alone, which is
++ * opportunistic, so a history it cannot fit or cannot shrink is left alone.
++ * Either miss is logged (`mechanical_compaction.skipped`), as the model arm's
++ * is (`model_compaction.fallback`), so the two arms count the same attempts.
++ */
++export function compactDeterministically(
++  params: Parameters<typeof compactMechanically>[0] & {
++    logger: Logger
++    model?: string
++    /** The run's context before compacting, for the skip event. */
++    contextTokenCount?: number
++  },
++): ReturnType<typeof compactMechanically> {
++  const { model, contextTokenCount, ...mechanicalParams } = params
++  let error: unknown
++  let result: ReturnType<typeof compactMechanically> = null
++  try {
++    result = compactMechanically({
++      ...mechanicalParams,
++      deterministicCohort: true,
++    })
++  } catch (thrown) {
++    error = thrown
++  }
++  if (result) return result
++  try {
++    const message = error instanceof Error ? error.message : String(error)
++    params.logger[error === undefined ? 'info' : 'warn'](
++      {
++        axiomEvent: MECHANICAL_COMPACTION_SKIPPED_EVENT,
++        agent_run_id: params.runId,
++        model,
++        trigger_reason: params.trigger,
++        error_kind:
++          error === undefined
++            ? 'no_shrink'
++            : message.includes('exceed the configured context window')
++              ? 'over_budget'
++              : 'error',
++        ...(error === undefined
++          ? {}
++          : {
++              error_name: error instanceof Error ? error.name : typeof error,
++              // Not allowlisted for Axiom; local/debug logs only.
++              error: message,
++            }),
++        context_token_count: contextTokenCount,
++        max_context_length: params.maxContextLength,
++        deterministic_cohort: true,
++      },
++      error === undefined
++        ? 'Mechanical compaction could not shrink the history; left unchanged'
++        : 'Mechanical compaction failed; history left unchanged',
++    )
++  } catch {
++    // Logging must never turn a skipped compaction into a failed run.
++  }
++  return null
++}
++
+ /**
+  * `compactWithModel`, but a compaction failure never fails the user's run.
+  *
+  * The model handoff is the preferred compaction, not the only one: when the
+  * summarizer errors, returns malformed arguments, or cannot be sized, the
+  * mechanical pass (`compactHistoryNow` — no model call) takes over, exactly
+  * as it ran before model compaction existed. If that also cannot shrink the
+  * history, the history is left untouched and the caller's over-budget guard
+  * decides. Only a cancellation propagates.
+  */
+ export async function compactWithModelOrFallback(
+   params: Parameters<typeof compactWithModel>[0] & {
+     logger: Logger
+     runId?: string
+     model?: string
+     trigger?: CompactionTrigger | 'manual'
+     /** The context a summary longer than requested must still leave the
+      * run under; `compactWithModel`'s `targetTokens`. */
+     fallbackTargetTokens?: number
+     /** Where the mechanical fallback aims; see `compactMechanically`.
+      * Defaults to `fallbackTargetTokens`. */
+     mechanicalTargetTokens?: number
++    /** Telemetry only; see `compactHistoryNow`. */
++    deterministicCohort?: boolean
+   },
+ ): Promise<{
+   messages: Message[]
+   summary: string
+   preTokens: number
+   postTokens: number
+   fallback?: true
+ } | null> {
+   const {
+     logger,
+     runId,
+     model,
+     trigger,
+     fallbackTargetTokens,
+     mechanicalTargetTokens = fallbackTargetTokens,
++    deterministicCohort,
+     ...modelParams
+   } = params
+   try {
+     const result = await compactWithModel({
+       targetTokens: fallbackTargetTokens,
+       ...modelParams,
+     })
+     if (result) {
+       try {
+         logger.info(
+           {
+             axiomEvent: MODEL_COMPACTION_COMPLETED_EVENT,
+             agent_run_id: runId,
+             model,
+             trigger_reason: trigger,
+             summary_source: result.summarySource,
+             summary_tokens: result.summaryTokens,
+             summary_budget: result.summaryBudget,
+             sections: result.sections,
+             pre_tokens: result.preTokens,
+             post_tokens: result.postTokens,
++            deterministic_cohort: deterministicCohort,
+           },
+           'Model compaction completed',
+         )
+       } catch {
+         // Logging must never turn a finished compaction into a failed run.
+       }
+     }
+     return result
+   } catch (error) {
+     if (params.signal.aborted || isAbortError(error)) throw error
+     const errorMessage = error instanceof Error ? error.message : String(error)
+     let fallback: ReturnType<typeof compactMechanically> = null
+     let fallbackError: string | undefined
+     try {
+       fallback = compactMechanically({
+         messages: params.messages,
+         maxContextLength: params.maxContextLength,
+         fixedTokenCount: params.fixedTokenCount,
+         targetTokens: mechanicalTargetTokens,
+         trigger,
++        deterministicCohort,
+         logger,
+         runId,
+       })
+     } catch (mechanicalError) {
+       fallbackError =
+         mechanicalError instanceof Error
+           ? mechanicalError.message
+           : String(mechanicalError)
+     }
+     try {
+       logger.warn(
+         {
+           axiomEvent: MODEL_COMPACTION_FALLBACK_EVENT,
+           agent_run_id: runId,
+           model,
+           trigger_reason: trigger,
+           error_kind: compactionErrorKind(error),
+           error_name: error instanceof Error ? error.name : typeof error,
+           fallback_applied: Boolean(fallback),
+           fallback_failed: fallbackError !== undefined,
++          deterministic_cohort: deterministicCohort,
+           // Not allowlisted for Axiom; local/debug logs only.
+           error: errorMessage,
+           ...(fallbackError ? { fallback_error: fallbackError } : {}),
+         },
+         fallback
+           ? 'Model compaction failed; used mechanical compaction'
+           : 'Model compaction failed; history left unchanged',
+       )
+     } catch {
+       // Logging must never turn a recovered compaction into a failed run.
+     }
+     if (!fallback) return null
+     return { ...fallback, fallback: true }
+   }
+ }
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index bef57050a..ab7d020f9 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -1,72 +1,73 @@
+ import { contextPrunerBudgetForModel } from '@codebuff/common/constants/model-config'
+ import {
+   modelCompactionThreshold,
+   usesDeterministicCompaction,
+ } from '@codebuff/common/constants/compaction-policy'
+ import {
+   supportsAssistantPrefill,
+   supportsCacheControl,
+ } from '@codebuff/common/old-constants'
+ import { PROJECT_PROFILE_TOOL_NAME } from '@codebuff/common/constants/project-profile'
+ import { TOOLS_WHICH_WONT_FORCE_NEXT_STEP } from '@codebuff/common/tools/constants'
+ import { parseAgentId } from '@codebuff/common/util/agent-id-parsing'
++import { TODO_PROGRESS_REMINDER_EVENT } from '@codebuff/common/util/axiom-only-log'
+ import { buildArray } from '@codebuff/common/util/array'
+ import {
+   AbortError,
+   FETCH_IDLE_TIMEOUT_USER_MESSAGE,
+   TRANSIENT_NETWORK_ERROR_USER_MESSAGE,
+   extractApiErrorDetails,
+   getErrorObject,
+   isAbortError,
+   isFetchIdleTimeoutError,
+   isTransientNetworkError,
+ } from '@codebuff/common/util/error'
+ import { serializeCacheDebugCorrelation } from '@codebuff/common/util/cache-debug'
+ import {
+   assistantMessage,
+   dropUnansweredToolCalls,
+   systemMessage,
+   userMessage,
+ } from '@codebuff/common/util/messages'
+ import { type ToolSet } from 'ai'
+ import { cloneDeep, mapValues } from 'lodash'
+ import z from 'zod/v4'
+ 
+ import {
+   evaluateCompactionTrigger,
+   MECHANICAL_TARGET_SHARE,
+ } from './compact-history'
+ import type { CompactionTrigger } from './compact-history'
+ import {
+   closeCompactionWindow,
+   openCompactionWindow,
+ } from './compaction-followup'
+ import type { CompactionWindow } from './compaction-followup'
+ import {
+   automaticCompactionIsWorthwhile,
+-  compactMechanically,
++  compactDeterministically,
+   COMPACTION_LOW_WATER,
+   compactWithModelOrFallback,
+   compactionTools,
+ } from './model-compaction'
+ import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+ import { getMCPToolData } from './mcp'
+ import {
+   runProjectProfileReport,
+   shouldOfferProjectProfileTool,
+ } from './project-profile'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+ import { isThinkOnlyResponse } from './util/think-tags'
+ import {
+   decideFollowupTodoNudge,
+   FOLLOWUP_TODO_NUDGE_TAG,
+ } from './util/followup-todo-nudge'
+ import {
+   decideTodoProgressReminder,
+   TODO_PROGRESS_REMINDER_TAG,
+ } from './util/todo-progress-reminder'
+ import {
+   hasFileEditTool,
+   TODO_LOOP_RECOVERY_TAG,
+   TODO_LOOP_RECOVERY_THRESHOLD,
+   TODO_LOOP_STOP_THRESHOLD,
+@@ -736,57 +737,56 @@ export const runAgentStep = async (
+           runId: agentState.runId,
+         },
+         decision.action === 'nudge'
+           ? 'Turn ended on followups with unfinished to-dos; continuing'
+           : 'Turn ended on followups with unfinished to-dos; nudge limit reached',
+       )
+       if (decision.action === 'nudge') {
+         agentState.messageHistory.push(
+           userMessage({
+             content: withSystemTags(decision.message),
+             tags: [FOLLOWUP_TODO_NUDGE_TAG],
+           }),
+         )
+         shouldEndTurn = false
+       }
+     }
+   }
+ 
+   // A to-do list the model never ticks off reads 0/N until the turn's last
+   // step; see util/todo-progress-reminder.ts. Once per list, mid-turn only.
+   if (!shouldEndTurn) {
+     const reminder = decideTodoProgressReminder(agentState.messageHistory)
+     if (reminder) {
+       logger.info(
+         {
+-          metric: 'todo_progress_reminder',
++          axiomEvent: TODO_PROGRESS_REMINDER_EVENT,
+           done: reminder.done,
+           total: reminder.total,
+           callsSinceUpdate: reminder.callsSinceUpdate,
+           model: agentTemplate.model,
+           agentId: agentTemplate.id,
+-          userId,
+           runId: agentState.runId,
+         },
+         'To-do list not updated for several tool calls; reminding',
+       )
+       agentState.messageHistory.push(
+         userMessage({
+           content: withSystemTags(reminder.message),
+           tags: [TODO_PROGRESS_REMINDER_TAG],
+         }),
+       )
+     }
+   }
+ 
+   agentState = {
+     ...agentState,
+     stepsRemaining: agentState.stepsRemaining - 1,
+     agentContext,
+   }
+ 
+   // Capture the assistant response and tool results added during this step
+   params.traceWriter?.recordStep({
+     agentId: agentState.agentId,
+     agentType: String(agentType),
+     runId: agentState.runId,
+     userInputId,
+@@ -1318,75 +1318,73 @@ export async function loopAgentSteps(
+         if (trigger) {
+           const before = currentAgentState.directCreditsUsed
+           const started = Date.now()
+           const isRoot = !initialAgentState.parentId
+           if (isRoot) params.onCompactionStart?.({ trigger })
+           let compacted: Awaited<ReturnType<typeof compactWithModelOrFallback>>
+           // An automatic pass must leave the run under its own trigger, or the
+           // next step fires it again on its output. The mechanical pass aims
+           // lower: it keeps no findings, so it needs room to work in.
+           const automatic = trigger !== 'manual'
+           const targetTokens = automatic
+             ? Math.floor(thresholdTokens * COMPACTION_LOW_WATER)
+             : undefined
+           const mechanicalTargetTokens = automatic
+             ? Math.floor(thresholdTokens * MECHANICAL_TARGET_SHARE)
+             : undefined
+           // Mechanical for the user's cohort, on every trigger. On the idle
+           // trigger the cache is already cold, so a summarizer would read the
+           // whole cold history first: it costs more than the prefill it saves
+           // and the user waits for it.
+           const deterministic = usesDeterministicCompaction(userId)
+           // Ends after the receipt, so a host never sees a gap between the
+           // pass it is showing and the handoff that replaces it.
+           try {
+             if (deterministic) {
+-              try {
+-                compacted = compactMechanically({
+-                  messages: currentAgentState.messageHistory,
+-                  maxContextLength,
+-                  fixedTokenCount,
+-                  targetTokens: mechanicalTargetTokens,
+-                  trigger,
+-                  logger,
+-                  runId,
+-                })
+-              } catch {
+-                // Opportunistic: a history it cannot fit is left alone.
+-                compacted = null
+-              }
++              compacted = compactDeterministically({
++                messages: currentAgentState.messageHistory,
++                maxContextLength,
++                fixedTokenCount,
++                targetTokens: mechanicalTargetTokens,
++                trigger,
++                logger,
++                runId,
++                model: agentTemplate.model,
++                contextTokenCount: currentAgentState.contextTokenCount,
++              })
+             } else {
+               // A compaction failure must never fail the turn: a summarizer error
+               // or malformed handoff falls back to the mechanical pass.
+               compacted = await compactWithModelOrFallback({
+                 messages: currentAgentState.messageHistory,
+                 system,
+                 maxContextLength,
+                 fixedTokenCount,
+                 maxOutputTokens: policy.maxOutputTokens,
+                 fallbackTargetTokens: targetTokens,
+                 mechanicalTargetTokens,
++                deterministicCohort: false,
+                 signal,
+                 logger,
+                 runId,
+                 model: agentTemplate.model,
+                 trigger,
+                 stream: (messages, maxOutputTokens, onFinishReason) =>
+                   getAgentStreamFromTemplate({
+                     ...params,
+                     agentId: agentType,
+                     template: agentTemplate,
+                     runId,
+                     messages,
+                     tools: compactionTools,
+                     toolChoice: 'required',
+                     maxOutputTokens,
+                     onFinishReason,
+                     onCostCalculated: async (credits) => {
+                       currentAgentState.creditsUsed += credits
+                       currentAgentState.directCreditsUsed += credits
+                     },
+                     // Compaction usage is spend, not the next root request's context.
+                     onUsageReceived: (usage) =>
+                       params.onAgentUsageReceived?.({
+                         ...usage,
+                         isRoot: false,
+@@ -1403,50 +1401,51 @@ export async function loopAgentSteps(
+                 childRunIds: [],
+                 messageId: null,
+                 status: 'completed',
+                 startTime,
+               })
+             }
+             if (compacted) {
+               if (compactionWindow)
+                 closeCompactionWindow({
+                   window: compactionWindow,
+                   messages: currentAgentState.messageHistory,
+                   endedBy: 'compaction',
+                   nextTrigger: trigger,
+                   logger,
+                   runId,
+                   model: agentTemplate.model,
+                 })
+               compactionWindow = openCompactionWindow({
+                 before: currentAgentState.messageHistory,
+                 after: compacted.messages,
+                 mode: deterministic
+                   ? 'mechanical'
+                   : compacted.fallback
+                     ? 'fallback'
+                     : 'model',
++                deterministicCohort: deterministic,
+                 trigger,
+               })
+               currentAgentState.messageHistory = compacted.messages
+               currentAgentState.contextTokenBaseline = undefined
+               currentAgentState.contextTokenCount = compacted.postTokens
+               if (isRoot)
+                 params.onCompaction?.({
+                   trigger,
+                   thresholdTokens,
+                   summary: compacted.summary,
+                   preTokens: compacted.preTokens,
+                   postTokens: compacted.postTokens,
+                   durationMs: Date.now() - started,
+                 })
+             }
+           } finally {
+             if (isRoot) params.onCompactionEnd?.()
+           }
+           // A manual request is a maintenance operation, never a coding turn.
+           if (manualCompaction) break
+           if (
+             !compacted &&
+             currentAgentState.contextTokenCount > maxContextLength
+           ) {
+             throw new Error(
+diff --git a/sdk/CHANGELOG.md b/sdk/CHANGELOG.md
+index 70ba9b800..ca23a8382 100644
+--- a/sdk/CHANGELOG.md
++++ b/sdk/CHANGELOG.md
+@@ -1,31 +1,33 @@
+ # Changelog
+ 
+ All notable changes to the @codebuff/sdk package will be documented in this file.
+ 
+ ## [Unreleased]
+ 
++- `compactRunState` now rewrites a run's history into at most 12k tokens (`MECHANICAL_HISTORY_TOKENS`) of summary plus a working set of file reads, whatever `maxContextLength` allows; it used to fill the budget. The newest read of each file not edited since comes back whole and every other read becomes an outline stub, so expect a much smaller `nextTokens`. The live request and the newest tool results are kept whole on top of the cap.
++
+ - **Security:** `read_url` now connects only to an address it has just validated. Resolution and the private/reserved-address check happen in the connection's own `lookup`, and the host is refused if any answer is blocked, so a hostname can no longer pass the check with one answer and connect with another. Every redirect hop is validated the same way. More non-routable ranges are refused: IPv4-compatible IPv6 (`::a.b.c.d`), 198.18.0.0/15, `fec0::/10` and `64:ff9b:1::/48`. The tool call passes only `url` and `max_chars` through to `readUrl`. Under Bun with a proxy variable set, Bun's `fetch` is still used so the proxy keeps working.
+ 
+ - **Security:** a runtime `NEXT_PUBLIC_CODEBUFF_APP_URL` / `CODEBUFF_APP_URL` override is honoured only for a `codebuff.com` / `freebuff.com` host (or a subdomain) over https, or a loopback host. Every request carrying your API key goes to that URL, so any other host now also needs `CODEBUFF_ALLOW_CUSTOM_APP_URL=1` in the environment; without it the override is ignored with a one-line warning and the bundled URL is used.
+ 
+ - **Security:** the published package no longer ships sourcemaps. They carried the full source of every bundled workspace module.
+ 
+ - Removed in an earlier unreleased change and noted here for 0.10.7 users: the `CODEBUFF_CLAUDE_OAUTH_TOKEN` environment variable (direct Claude OAuth routing) is gone; the SDK no longer reads it.
+ 
+ - `spawn_agents` results from `last_message` agents now arrive as plain text. Each result's `value` is the child's final answer (the text of its last turn, without reasoning or think tags) instead of `{ type: 'lastMessage', value: Message[] }`, and a child whose last turn has no text reports `{ type: 'error', message: 'No response from agent' }`. `handleSteps` code that walked the `lastMessage` message array must read the string instead. Structured-output results and the `output` returned by `run()` are unchanged.
+ 
+ - `run()` now returns promptly when its `signal` aborts during the user lookup or agent-run registration that precede the first model request. Those requests had no signal and retried through a backoff, so a socket that never answered held the run for the whole retry budget; they now end on abort and the run resolves with `Run cancelled by user.`
+ 
+ - Dropped `knowledge.md` from the knowledge-file priority list; the SDK now picks up `AGENTS.md` then `CLAUDE.md` (per directory, and `~/.AGENTS.md`/`~/.CLAUDE.md` in the home directory). Existing `knowledge.md` files are no longer read. The `PRIMARY_KNOWLEDGE_FILE_NAME` export was removed with it; use `KNOWLEDGE_FILE_NAMES[0]`.
+ 
+ ## [0.10.7]
+ 
+ - New code editing tool `apply_patch` which works well with Codex models (e.g. openai/gpt-5.3-codex)
+ - `write_file` is now a deterministic tool that creates or replaces the file. Previously, it also accepted edit snippet comments which could expand to keep a portion of the previous file, e.g. "// ... rest of the function ...". That behavior is removed to keep things simple. `str_replace` or `apply_patch` should be used if not overwriting the whole file.
+ 
+ ## [0.10.6]
+ 
+ Added `skillsDir` parameter to specify a directory to load skills from.
+ 
+ ## [0.10.5]
+ 
+diff --git a/sdk/src/compact-run-state.ts b/sdk/src/compact-run-state.ts
+index 3623a81f3..da5ef434d 100644
+--- a/sdk/src/compact-run-state.ts
++++ b/sdk/src/compact-run-state.ts
+@@ -18,50 +18,55 @@ import type { Logger } from '@codebuff/common/types/contracts/logger'
+  * checkpointed beside it — so they are on the same basis as the
+  * `contextTokenCount` this writes back, and their difference is the honest
+  * size of what the pass removed.
+  */
+ export type CompactedRunState = {
+   runState: RunState
+   previousTokens: number
+   nextTokens: number
+ }
+ 
+ /**
+  * Rewrite a stored run's history through the runtime's mechanical compaction,
+  * on demand.
+  *
+  * This is the seam a HOST reaches for. The runtime compacts inside a turn, when
+  * its own triggers fire and it already holds the live system prompt and tool
+  * schemas; a host holds neither — it holds a `RunState` on disk between turns,
+  * which is exactly what a user asking to reclaim context wants shrunk. The root
+  * agent checkpoints `systemPrompt` and `toolDefinitions` onto its state, so the
+  * fixed half of the count is recoverable here without rebuilding the agent.
+  *
+  * No model call, no request, no session: the pass is pure and synchronous, and
+  * the only thing it spends is the provider's prompt cache, which a compaction
+  * breaks whenever it happens.
+  *
++ * The rewritten history (summary plus the working set of file reads) is capped
++ * at the runtime's `MECHANICAL_HISTORY_TOKENS` (12k), not sized to
++ * `maxContextLength`: a large window no longer means a large result. The live
++ * request and the newest tool results are kept whole on top of it.
++ *
+  * Returns null when there is nothing to do — no session state, no history, or a
+  * pass that would not make the history smaller. A caller reports that as a
+  * no-op; it is never an error.
+  *
+  * Throws the runtime's own user-presentable sentence when the live request
+  * alone is over budget, which compaction cannot fix.
+  */
+ export function compactRunState(params: {
+   runState: RunState
+   /** The context budget the next turn will be built against. */
+   maxContextLength: number
+   logger?: Logger
+ }): CompactedRunState | null {
+   const { runState, maxContextLength, logger } = params
+   const sessionState = runState.sessionState
+   const agentState = sessionState?.mainAgentState
+   if (!sessionState || !agentState) return null
+   const previousHistory = agentState.messageHistory
+   if (!previousHistory?.length) return null
+ 
+   // The other half of the count, recovered from what the root agent stored
+   // beside its history. An older checkpoint may carry neither, in which case
+   // this is 0 and the budget is simply the whole window — the pass still runs,
+   // it just has slightly more room than the next turn will.
+   const fixedTokenCount =
+diff --git a/sdk/src/impl/agent-runtime.ts b/sdk/src/impl/agent-runtime.ts
+index ff64be4d6..b9fd80c70 100644
+--- a/sdk/src/impl/agent-runtime.ts
++++ b/sdk/src/impl/agent-runtime.ts
+@@ -1,26 +1,27 @@
+ import { trackEvent as trackCommonEvent } from '@codebuff/common/analytics'
++import { BYOK_LOCAL_USER_ID } from '@codebuff/common/constants/byok'
+ import { env as clientEnvDefault } from '@codebuff/common/env'
+ import { getCiEnv } from '@codebuff/common/env-ci'
+ import { shouldTrackAnalyticsEvent } from '@codebuff/common/util/analytics-sampling'
+ import { success } from '@codebuff/common/util/error'
+ 
+ import { getWebsiteUrl } from '../constants'
+ import type { ResolvedByokConnection } from '../byok'
+ import type { CodebuffRequestHeadersProvider } from './model-provider'
+ 
+ import {
+   addAgentStep,
+   fetchAgentFromDatabase,
+   finishAgentRun,
+   getUserInfoFromApiKey,
+   startAgentRun,
+ } from './database'
+ import { promptAiSdk, promptAiSdkStream, promptAiSdkStructured } from './llm'
+ 
+ import type {
+   AgentRuntimeDeps,
+   AgentRuntimeScopedDeps,
+ } from '@codebuff/common/types/contracts/agent-runtime'
+ import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+ import type { DatabaseAgentCache } from '@codebuff/common/types/contracts/database'
+ import type { ClientEnv } from '@codebuff/common/types/contracts/env'
+@@ -98,51 +99,51 @@ export function getAgentRuntimeImpl(
+     NEXT_PUBLIC_CODEBUFF_APP_URL: getWebsiteUrl(),
+   }
+ 
+   const trackSdkRuntimeEvent: TrackEventFn = (eventParams) => {
+     if (
+       clientEnv.NEXT_PUBLIC_CB_ENVIRONMENT === 'prod' &&
+       !shouldTrackAnalyticsEvent({
+         event: eventParams.event,
+         distinctId: eventParams.userId,
+         properties: eventParams.properties,
+       })
+     ) {
+       return
+     }
+ 
+     trackCommonEvent(eventParams)
+   }
+ 
+   return {
+     // Environment
+     clientEnv,
+     ciEnv: getCiEnv(),
+ 
+     // Database
+     getUserInfoFromApiKey: byok
+-      ? async () => ({ id: 'byok-local' }) as any
++      ? async () => ({ id: BYOK_LOCAL_USER_ID }) as any
+       : getUserInfoFromApiKey,
+     // A BYOK run only uses its local agent registry. A missing local agent is
+     // an error, never a reason to send its prompt or identity to Freebuff.
+     // Otherwise a registry template is fetched through the publisher-trust
+     // gate: its handleSteps is code this process would eval.
+     fetchAgentFromDatabase: byok || disableAgentRegistry
+       ? async () => null
+       : (fetchParams) =>
+           fetchAgentFromDatabase({ ...fetchParams, trustedAgentPublishers }),
+     startAgentRun: byok ? async () => `byok-${crypto.randomUUID()}` : startAgentRun,
+     finishAgentRun: byok ? async () => {} : finishAgentRun,
+     addAgentStep: byok ? async () => `byok-step-${crypto.randomUUID()}` : addAgentStep,
+ 
+     // Billing
+     consumeCreditsWithFallback: async () =>
+       success({
+         chargedToOrganization: false,
+       }),
+ 
+     // LLM. A BYOK run talks to the user's own provider, so the host's backend
+     // request headers never apply to it.
+     promptAiSdkStream: byok
+       ? ((params) => promptAiSdkStream({ ...params, byok } as any))
+       : requestHeaders
+         ? ((params) => promptAiSdkStream({ ...params, requestHeaders }))
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index 5162d66f7..165dd2db9 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -1,34 +1,35 @@
+ import path from 'path'
+ 
+ import { callMainPrompt } from '@codebuff/agent-runtime/main-prompt'
+ import { adjustContextTokenCountForHistoryEdit } from '@codebuff/agent-runtime/util/context-token-count'
+ import {
+   buildUserMessageContent,
+   withSystemTags,
+ } from '@codebuff/agent-runtime/util/messages'
+ import { MAX_AGENT_STEPS_DEFAULT } from '@codebuff/common/constants/agents'
++import { BYOK_LOCAL_USER_ID } from '@codebuff/common/constants/byok'
+ import { toRepoSnapshot } from '@codebuff/common/util/file'
+ import { dropUnansweredToolCalls } from '@codebuff/common/util/messages'
+ import {
+   FILE_READ_STATUS,
+   toOptionalFile,
+ } from '@codebuff/common/constants/paths'
+ import {
+   getMCPClient,
+   listMCPTools,
+   callMCPTool,
+ } from '@codebuff/common/mcp/client'
+ import {
+   COMPOSIO_META_TOOL_NAMES,
+   isComposioMetaToolName,
+ } from '@codebuff/common/constants/composio'
+ import { toolNames } from '@codebuff/common/tools/constants'
+ import { clientToolCallSchema } from '@codebuff/common/tools/list'
+ import { AgentOutputSchema } from '@codebuff/common/types/session-state'
+ import {
+   FETCH_IDLE_TIMEOUT_USER_MESSAGE,
+   TRANSIENT_NETWORK_ERROR_USER_MESSAGE,
+   extractApiErrorDetails,
+   isFetchIdleTimeoutError,
+   isTransientNetworkError,
+ } from '@codebuff/common/util/error'
+@@ -922,51 +923,51 @@ async function runOnce({
+       agentType,
+       chunk,
+       prompt,
+       forwardToPrompt = true,
+     }) => {
+       onSubagentResponseChunk({
+         type: 'subagent-response-chunk',
+         userInputId,
+         agentId,
+         agentType,
+         chunk,
+         prompt,
+         forwardToPrompt,
+       })
+     },
+   })
+ 
+   const promptId = Math.random().toString(36).substring(2, 15)
+ 
+   // Send input. The lookup rides the run's signal: a socket that never answers here held the run
+   // for the whole retry budget with the abort unable to reach it.
+   let userId: string | undefined
+   if (byok) {
+     // BYOK is intentionally auth-free: no Codebuff identity, run ledger,
+     // token-count, analytics, or helper request is necessary for inference.
+-    userId = requestedUserId ?? 'byok-local'
++    userId = requestedUserId ?? BYOK_LOCAL_USER_ID
+   } else {
+     let userInfo: { id: string } | null
+     try {
+       userInfo = await getUserInfoFromApiKey({
+         ...agentRuntimeImpl,
+         apiKey,
+         fields: ['id'],
+         signal,
+       })
+     } catch (error) {
+       if (signal?.aborted) return getCancelledRunState('Run cancelled by user.')
+       throw error
+     }
+     if (!userInfo) return getCancelledRunState('Invalid API key or user not found')
+     userId = requestedUserId ?? userInfo.id
+   }
+ 
+   if (signal?.aborted) {
+     return getCancelledRunState('Run cancelled by user.')
+   }
+ 
+   if (onStateSnapshot) {
+     // The runtime replaces mainAgentState.messageHistory with a new array at
+     // each step boundary, so reference identity is a cheap "has anything
+     // durable changed" check. Skipping unchanged ticks avoids deep-cloning a
