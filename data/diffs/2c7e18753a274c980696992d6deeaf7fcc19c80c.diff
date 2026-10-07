@@ -1,0 +1,365 @@
+diff --git a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+index 6c5d62a84..908673007 100644
+--- a/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
++++ b/packages/agent-runtime/src/__tests__/compact-context-loop.test.ts
+@@ -505,44 +505,47 @@ describe('compactContext in loopAgentSteps', () => {
+                 type: 'json',
+                 value: [
+                   {
+                     path: `file${i}.ts`,
+                     content: `READ ${i} BODY `.repeat(400),
+                   },
+                 ],
+               },
+             ],
+           },
+         )
+       }
+       return history
+     }
+ 
+     it('keeps working past the threshold instead of compacting futilely', async () => {
+       // ~15k fixed + ~6k of reads: over the 20,643 threshold, under the budget.
+       const result = await runLoop(smallWindow, withReads(4))
+       expect(runtimeImpl.promptAiSdkStream).toHaveBeenCalledTimes(1)
+       const sent = JSON.stringify(seenMessages[0])
+       expect(sent.includes('<conversation_summary>')).toBe(false)
+       expect(sent.includes('READ 0 BODY')).toBe(true)
+       expect(result.output.type).not.toBe('error')
+     })
+ 
+-    it('still compacts at the hard budget', async () => {
++    it('still compacts at the hard budget, keeping a summary and a note for every earlier read', async () => {
+       const result = await runLoop(smallWindow, withReads(8))
+       const sent = JSON.stringify(seenMessages[0])
+       expect(sent.includes('READ 0 BODY')).toBe(false)
++      expect(sent.includes('<conversation_summary>')).toBe(true)
++      for (let i = 0; i < 7; i++) expect(sent.includes(`"path":"file${i}.ts"`)).toBe(true)
++      expect(sent.match(/contents dropped at compaction/g)).toHaveLength(7)
+       expect(sent.includes('review the files')).toBe(true)
+       expect(result.output.type).not.toBe('error')
+     })
+   })
+ 
+   it('a null TTL opts out of the opportunistic trigger', async () => {
+     await runLoop(
+       { ...baseTemplate, compactContext: { cacheExpiryMs: null } },
+       idleHistory(600),
+     )
+     expect(seenMessages[0].map(textOf).join('\n')).not.toContain(
+       '<conversation_summary>',
+     )
+   })
+ })
+diff --git a/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts b/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts
+index 1bd729ddd..350d9111a 100644
+--- a/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts
++++ b/packages/agent-runtime/src/__tests__/compaction-working-set.test.ts
+@@ -316,50 +316,66 @@ describe('mechanical compaction size', () => {
+ 
+   it('rewrites history into at most MECHANICAL_HISTORY_TOKENS by default', () => {
+     const messages = longSession()
+     const compacted = compactHistoryNow({
+       messages,
+       maxContextLength: 400_000,
+       fixedTokenCount: 16_000,
+     })!
+     expect(compacted.previousTokens).toBeGreaterThan(300_000)
+     const live = countTokensMessages(messages.slice(-1))
+     expect(compacted.nextTokens - live).toBeLessThanOrEqual(
+       MECHANICAL_HISTORY_TOKENS,
+     )
+     // Still carries the newest unedited file and stubs the rest.
+     const files = workingSet(compacted.messages)!
+     expect(files[0]).toEqual({
+       path: 'src/a39.ts',
+       content: source('a39', 600),
+     })
+     expect(
+       files.slice(1).every((f) => f.content.startsWith(COMPACTED_READ_MARKER)),
+     ).toBe(true)
+     expect(compacted.summaryText).toContain('Request 39')
+   })
+ 
++  it('keeps a note for every file read when the target leaves no room', () => {
++    const compacted = compactHistoryNow({
++      messages: longSession(),
++      maxContextLength: 40_000,
++      fixedTokenCount: 16_000,
++      targetTokens: 10_000,
++    })!
++    const paths = workingSet(compacted.messages)!.map((f) => f.path)
++    for (let i = 0; i < 40; i++)
++      expect(paths).toEqual(
++        expect.arrayContaining([`src/a${i}.ts`, `src/b${i}.ts`]),
++      )
++    expect(compacted.summaryText).toContain('Request 39')
++    expect(compacted.nextTokens + 16_000).toBeLessThanOrEqual(40_000)
++  })
++
+   it('takes a larger history budget when a caller asks for one', () => {
+     const compacted = compactHistoryNow({
+       messages: longSession(),
+       maxContextLength: 400_000,
+       fixedTokenCount: 16_000,
+       historyTokens: 60_000,
+     })!
+     expect(compacted.nextTokens).toBeGreaterThan(MECHANICAL_HISTORY_TOKENS * 2)
+     expect(compacted.nextTokens).toBeLessThanOrEqual(61_000)
+   })
+ })
+ 
+ describe('outlineOf', () => {
+   it('lists top-level declarations with line numbers', () => {
+     const { lines, outline } = outlineOf(
+       [
+         "import x from 'y'",
+         'export const LIMIT = 3',
+         'const local = 1',
+         'export async function upload() {',
+         '  function inner() {}',
+         '}',
+         'class Retry {',
+         'def handler(event):',
+         'func (s *Server) Start() error {',
+diff --git a/packages/agent-runtime/src/compact-history.ts b/packages/agent-runtime/src/compact-history.ts
+index 5c5521a53..7dbc0e18a 100644
+--- a/packages/agent-runtime/src/compact-history.ts
++++ b/packages/agent-runtime/src/compact-history.ts
+@@ -88,50 +88,52 @@ const CONTINUATION_TEXT =
+ 
+ /** Thresholds for agents that declare `compactContext: true` without tuning;
+  *  owned, with the rationale, by common/src/constants/compaction-policy.ts. */
+ export const DEFAULT_CACHE_EXPIRY_MS = DEFAULT_COMPACTION_POLICY.cacheExpiryMs
+ export const DEFAULT_CACHE_EXPIRY_MIN_TOKENS =
+   DEFAULT_COMPACTION_POLICY.cacheExpiryMinTokens
+ 
+ /**
+  * Where an automatic mechanical pass aims, as a share of the trigger
+  * threshold. Its result must leave real room under the threshold: when a pass
+  * kept 80-100% of the history, the same run compacted again within ten minutes
+  * 22-51% of the time (prod, 2026-10-05), against 2.6% when it kept under 10%.
+  * Fresh tool results are exempt; see `compactRequestHistory`.
+  */
+ export const MECHANICAL_TARGET_SHARE = 0.5
+ 
+ /**
+  * The most a mechanical pass rewrites history into: summary plus working set,
+  * on top of the fixed prompt, the live request and the fresh tool results it
+  * keeps whole. Sized so the result lands near a model handoff's (median ~23k
+  * tokens including the fixed prompt, 2026-10-05) rather than filling the
+  * target: a small result leaves the most room before the next compaction.
+  */
+ export const MECHANICAL_HISTORY_TOKENS = 12_000
+ 
++const MIN_HISTORY_TOKENS = 2_000
++
+ /** Separator between entries inside the rendered historical memory. */
+ const ENTRY_SEPARATOR = '\n\n---\n\n'
+ 
+ /** Matches the context-pruner's `trigger_reason` values so Axiom can union them. */
+ export type CompactionTrigger =
+   | 'context_limit'
+   | 'cache_expiry'
+   | 'context_limit_and_cache_expiry'
+ 
+ type SummaryEntry = {
+   role: 'user' | 'assistant_tool'
+   parts: string[]
+ }
+ 
+ /**
+  * Truncates long text with 80% from the beginning and 20% from the end.
+  */
+ function truncateLongText(text: string, limit: number): string {
+   if (text.length <= limit) {
+     return text
+   }
+   const availableChars = limit - 50 // 50 chars for the truncation notice
+   const prefixLength = Math.floor(availableChars * 0.8)
+   const suffixLength = availableChars - prefixLength
+   const prefix = text.slice(0, prefixLength)
+@@ -983,68 +985,72 @@ function compactRequestHistory(
+             !entry.parts.includes(`[USER]\n${CONTINUATION_TEXT}`),
+         )
+       : undefined
+   const reservedMemory = historicalRequest
+     ? countTokensMessages([
+         buildSummaryMessage(renderSummaryText([historicalRequest]), [], now),
+       ])
+     : 0
+   const prefixTokens = countTokensMessages(prefix)
+   if (prefixTokens + reservedMemory > tokenBudget) {
+     throw new Error(
+       'The current request and agent instructions exceed the configured context window. Shorten the request/project instructions or configure a larger context window supported by your provider.',
+     )
+   }
+   const fitted = fitToolResults(
+     fresh,
+     tokenBudget - prefixTokens - reservedMemory,
+   )
+   const fittedTokens = countTokensMessages(fitted)
+   const hardRemaining = tokenBudget - prefixTokens - fittedTokens
+   // Optional content stops at the target, but never squeezes out the request
+   // reserved above.
+   const optionalTokens = Math.max(
+     Math.min(
+       hardRemaining,
+-      targetBudget - prefixTokens - fittedTokens,
++      Math.max(targetBudget - prefixTokens - fittedTokens, MIN_HISTORY_TOKENS),
+       historyBudget,
+     ),
+     reservedMemory,
+   )
+   const workingSet = buildWorkingSet({
+     older,
+     fresh,
+     tokenBudget: Math.min(
+       WORKING_SET_TOKEN_LIMIT,
+       Math.floor((optionalTokens - reservedMemory) * WORKING_SET_SHARE),
+     ),
++    noteBudget: hardRemaining - reservedMemory,
+     now,
+   })
+   const workingSetTokens = workingSet
+     ? countTokensMessages(workingSet.messages)
+     : 0
+-  const remainingTokens = optionalTokens - workingSetTokens
++  const remainingTokens = Math.max(
++    optionalTokens - workingSetTokens,
++    Math.min(MIN_HISTORY_TOKENS, hardRemaining - workingSetTokens),
++  )
+ 
+   // Keep the newest historical entries that fit the actual remainder. The
+   // 50k/20k summary budgets are ceilings, never permission to exceed a BYOK
+   // window. Count the envelope and images too, not just summary text.
+   const selected = new Set<SummaryEntry>(
+     historicalRequest ? [historicalRequest] : [],
+   )
+   let images = result.messages[0].content.filter(
+     (part): part is ImagePart | FilePart =>
+       part.type === 'image' || part.type === 'file',
+   )
+   if (
+     countTokensMessages([
+       buildSummaryMessage(renderSummaryText([...selected]), images, now),
+     ]) > remainingTokens
+   )
+     images = []
+   let available =
+     remainingTokens -
+     countTokensMessages([
+       buildSummaryMessage(renderSummaryText([...selected]), images, now),
+     ])
+   for (let i = entries.length - 1; i >= 0; i--) {
+     if (selected.has(entries[i])) continue
+     const tokens = countTokens(
+diff --git a/packages/agent-runtime/src/compaction-working-set.ts b/packages/agent-runtime/src/compaction-working-set.ts
+index 2c942eaaf..2bad18864 100644
+--- a/packages/agent-runtime/src/compaction-working-set.ts
++++ b/packages/agent-runtime/src/compaction-working-set.ts
+@@ -167,50 +167,51 @@ export function outlineOf(content: string): { lines: number; outline: string } {
+ }
+ 
+ type StubReason = 'budget' | 'edited' | 'delegated'
+ 
+ function stubFor(read: Read, reason: StubReason): string {
+   if (read.content.startsWith(COMPACTED_READ_MARKER)) return read.content
+   const { lines, outline } = outlineOf(read.content)
+   const why =
+     reason === 'edited'
+       ? 'You edited it after this read, so read it again before relying on it.'
+       : reason === 'delegated'
+         ? 'Agents you spawned after this read may have edited it, so read it again before relying on it.'
+         : 'Read it again (a section with offset/limit is enough) if you need it.'
+   return `${COMPACTED_READ_MARKER}. ${lines} lines when read. ${why}]${outline ? `\nOutline:\n${outline}` : ''}`
+ }
+ 
+ /**
+  * The working-set exchange for `older` (the history being summarized), or
+  * null when there is nothing to carry. `fresh` is kept verbatim by the caller:
+  * its reads are already present, and its edits make older reads stale.
+  */
+ export function buildWorkingSet(params: {
+   older: Message[]
+   fresh: Message[]
+   tokenBudget: number
++  noteBudget?: number
+   now: number
+ }): { messages: Message[]; files: number; stubs: number } | null {
+   const { reads, lastEdit, lastDelegation } = collectReadsAndEdits([
+     ...params.older,
+     ...params.fresh,
+   ])
+   const freshStart = params.older.length
+   const latest = new Map<string, Read>()
+   for (const read of reads) {
+     if (read.order >= freshStart) continue
+     if (STATUS_PREFIXES.some((prefix) => read.content.startsWith(prefix)))
+       continue
+     latest.set(read.path, read)
+   }
+   const freshPaths = new Set(
+     reads.filter((read) => read.order >= freshStart).map((read) => read.path),
+   )
+   // Newest first: the files the model was working with most recently.
+   const candidates = [...latest.values()]
+     .filter((read) => !freshPaths.has(read.path))
+     .sort((a, b) => b.order - a.order)
+   if (candidates.length === 0) return null
+ 
+   const exchange = (files: { path: string; content: string }[]): Message[] => {
+     const toolCallId = `compacted-read-${params.now.toString(36)}`
+@@ -243,41 +244,49 @@ export function buildWorkingSet(params: {
+   let used = countTokensMessages(exchange([]))
+ 
+   const carried: { path: string; content: string }[] = []
+   const left: { read: Read; reason: StubReason }[] = []
+   for (const read of candidates) {
+     const stale: StubReason | undefined =
+       (lastEdit.get(read.path) ?? -1) > read.order
+         ? 'edited'
+         : lastDelegation > read.order
+           ? 'delegated'
+           : undefined
+     const file = { path: read.path, content: read.content }
+     if (
+       !stale &&
+       !read.content.startsWith(COMPACTED_READ_MARKER) &&
+       used + cost(file) <= params.tokenBudget
+     ) {
+       carried.push(file)
+       used += cost(file)
+     } else {
+       left.push({ read, reason: stale ?? 'budget' })
+     }
+   }
+ 
+   let stubRoom = Math.min(STUB_TOKEN_LIMIT, params.tokenBudget - used)
++  let noteRoom = (params.noteBudget ?? params.tokenBudget) - used
+   const stubs: { path: string; content: string }[] = []
+   for (const { read, reason } of left) {
+     const stub = { path: read.path, content: stubFor(read, reason) }
+-    if (cost(stub) > stubRoom) continue
+-    stubs.push(stub)
+-    stubRoom -= cost(stub)
++    if (cost(stub) <= Math.min(stubRoom, noteRoom)) {
++      stubs.push(stub)
++      stubRoom -= cost(stub)
++      noteRoom -= cost(stub)
++      continue
++    }
++    const note = { path: read.path, content: stub.content.split('\n')[0] }
++    if (cost(note) > noteRoom) continue
++    stubs.push(note)
++    noteRoom -= cost(note)
+   }
+ 
+   const files = [...carried, ...stubs]
+   if (files.length === 0) return null
+   return {
+     messages: exchange(files),
+     files: carried.length,
+     stubs: stubs.length,
+   }
+ }
