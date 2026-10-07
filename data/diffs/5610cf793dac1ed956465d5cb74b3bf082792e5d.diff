@@ -1,0 +1,389 @@
+diff --git a/packages/agent-runtime/src/llm-api/__tests__/codebuff-web-api.test.ts b/packages/agent-runtime/src/llm-api/__tests__/codebuff-web-api.test.ts
+new file mode 100644
+index 000000000..7c45799e1
+--- /dev/null
++++ b/packages/agent-runtime/src/llm-api/__tests__/codebuff-web-api.test.ts
+@@ -0,0 +1,45 @@
++import { describe, expect, test } from 'bun:test'
++
++import {
++  HostedServiceUnavailableError,
++  callWebSearchAPI,
++} from '../codebuff-web-api'
++
++import type { ClientEnv, CiEnv } from '@codebuff/common/types/contracts/env'
++import type { Logger } from '@codebuff/common/types/contracts/logger'
++
++const logger: Logger = {
++  debug: () => {},
++  info: () => {},
++  warn: () => {},
++  error: () => {},
++}
++
++const env = {
++  clientEnv: {
++    NEXT_PUBLIC_CODEBUFF_APP_URL: 'https://example.test',
++  } as ClientEnv,
++  ciEnv: { CODEBUFF_API_KEY: 'test-key' } as CiEnv,
++}
++
++describe('callCodebuffV1 retries', () => {
++  test('a fetch that can never reach the hosted service fails on the first attempt', async () => {
++    let calls = 0
++    const fetch = (async () => {
++      calls += 1
++      throw new HostedServiceUnavailableError(
++        'Hosted service tools are unavailable in a direct BYOK run',
++      )
++    }) as unknown as typeof globalThis.fetch
++
++    const started = Date.now()
++    const result = await callWebSearchAPI({ query: 'q', fetch, logger, env })
++
++    expect(result).toEqual({
++      error: 'Hosted service tools are unavailable in a direct BYOK run',
++    })
++    expect(calls).toBe(1)
++    // The network-error path would wait 1s + 2s before giving up.
++    expect(Date.now() - started).toBeLessThan(1_000)
++  })
++})
+diff --git a/packages/agent-runtime/src/llm-api/codebuff-web-api.ts b/packages/agent-runtime/src/llm-api/codebuff-web-api.ts
+index 99e9fe8a4..40fe1e592 100644
+--- a/packages/agent-runtime/src/llm-api/codebuff-web-api.ts
++++ b/packages/agent-runtime/src/llm-api/codebuff-web-api.ts
+@@ -1,36 +1,45 @@
+ import { withTimeout } from '@codebuff/common/util/promise'
+ 
+ import type { ClientEnv, CiEnv } from '@codebuff/common/types/contracts/env'
+ import type { JSONObject } from '@codebuff/common/types/json'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ 
+ const FETCH_TIMEOUT_MS = 30_000
+ const MAX_RETRIES = 3
+ const RETRY_BASE_DELAY_MS = 1000
+ const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504])
+ 
++/**
++ * Thrown by a runtime `fetch` that will never reach the hosted service (a
++ * direct BYOK run has no Codebuff allowance). Retrying it cannot succeed, so
++ * the tool fails at once instead of after the 1s + 2s network-error backoff.
++ */
++export class HostedServiceUnavailableError extends Error {
++  override name = 'HostedServiceUnavailableError'
++}
++
+ interface CodebuffWebApiEnv {
+   clientEnv: ClientEnv
+   ciEnv: CiEnv
+ }
+ 
+ const tryParseJson = (text: string): unknown => {
+   try {
+     return JSON.parse(text)
+   } catch {
+     return null
+   }
+ }
+ 
+ const getStringField = (value: unknown, key: string): string | undefined => {
+   if (!value || typeof value !== 'object') return undefined
+   const record = value as Record<string, unknown>
+   const field = record[key]
+   return typeof field === 'string' ? field : undefined
+ }
+ 
+ const getNumberField = (value: unknown, key: string): number | undefined => {
+   if (!value || typeof value !== 'object') return undefined
+   const record = value as Record<string, unknown>
+   const field = record[key]
+   return typeof field === 'number' ? field : undefined
+@@ -99,50 +108,53 @@ const callCodebuffV1 = async (params: {
+               nextRetryDelayMs: delay,
+             },
+             `Web API ${requestName} request failed with retryable status, retrying...`,
+           )
+           await new Promise((resolve) => setTimeout(resolve, delay))
+           lastError = err
+           continue
+         }
+ 
+         logger.warn(
+           {
+             url,
+             status: res.status,
+             statusText: res.statusText,
+             body: text?.slice(0, 500),
+             attempt,
+           },
+           `Web API ${requestName} request failed`,
+         )
+         return { error: err }
+       }
+ 
+       return { json, creditsUsed: getNumberField(json, 'creditsUsed') }
+     } catch (error) {
+       lastError = error instanceof Error ? error.message : 'Network error'
++      if (error instanceof HostedServiceUnavailableError) {
++        return { error: lastError }
++      }
+ 
+       // Retry on network errors
+       if (attempt < MAX_RETRIES) {
+         const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
+         logger.warn(
+           {
+             error:
+               error instanceof Error
+                 ? { name: error.name, message: error.message }
+                 : error,
+             attempt,
+             maxRetries: MAX_RETRIES,
+             nextRetryDelayMs: delay,
+           },
+           `Web API ${requestName} network error, retrying...`,
+         )
+         await new Promise((resolve) => setTimeout(resolve, delay))
+         continue
+       }
+ 
+       logger.error(
+         {
+           error:
+             error instanceof Error
+               ? { name: error.name, message: error.message, stack: error.stack }
+diff --git a/sdk/src/__tests__/byok-run.test.ts b/sdk/src/__tests__/byok-run.test.ts
+index 21d0cacbb..63d399a9b 100644
+--- a/sdk/src/__tests__/byok-run.test.ts
++++ b/sdk/src/__tests__/byok-run.test.ts
+@@ -146,67 +146,71 @@ describe('direct BYOK SDK runs', () => {
+ 
+     const beforeSwitch = seen.length
+     const hostedHistory = { ...result, inference: { source: 'codebuff' as const } }
+     const switched = await client.run({ agent: agent.id, prompt: 'Continue with my key.', previousRun: hostedHistory })
+     expect(switched.output.type).not.toBe('error')
+     expect(switched.inference).toEqual(result.inference)
+     expect(seen.length).toBeGreaterThan(beforeSwitch)
+     expect(seen.at(-1)!.body).toContain('Create result.txt.')
+     expect(seen.slice(beforeSwitch).every(request => request.url === 'http://127.0.0.1:9876/v1/chat/completions')).toBe(true)
+     const hostedClient = new CodebuffClient({ cwd, apiKey: 'hosted-test-key', agentDefinitions: [agent] })
+     const beforeReverse = seen.length
+     const reverse = await hostedClient.run({ agent: agent.id, prompt: 'Go back.', previousRun: switched })
+     expect(reverse.output.type).toBe('error')
+     expect(seen).toHaveLength(beforeReverse)
+ 
+     const legacy = await client.run({
+       agent: agent.id, prompt: 'Legacy.', previousRun: { ...result, inference: undefined },
+     })
+     expect(legacy.output.type).toBe('error')
+     if (legacy.output.type !== 'error') throw new Error('expected legacy pin error')
+     expect(legacy.output.message).toContain('no inference source pin')
+   }, 30_000)
+ 
+   test('refuses server-side web_search without contacting a hosted backend', async () => {
+     const requests: string[] = []
++    const bodies: string[] = []
+     let step = 0
+-    globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
++    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+       requests.push(String(input))
++      bodies.push(String(init?.body))
+       step += 1
+       if (step === 1) {
+         return sse({ id: 'tool', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'search', type: 'function', function: { name: 'web_search', arguments: JSON.stringify({ query: 'test' }) } }] }, finish_reason: 'tool_calls' }] })
+       }
+       return sse({ id: 'done', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { content: 'done' }, finish_reason: 'stop' }] })
+     }) as unknown as typeof fetch
+     const client = new CodebuffClient({
+       agentDefinitions: [{ ...agent, id: 'byok-web-agent', toolNames: ['web_search'] }],
+       byok: { id: 'web-connection', revision: 1, name: 'web', provider: 'openai-compatible', baseUrl: 'http://127.0.0.1:9876/v1', model: 'm', credentialRef: 'connection:web-connection:1', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', apiKey: 'web-canary' },
+     })
+     const result = await client.run({ agent: 'byok-web-agent', prompt: 'Search.' })
+     expect(result.output.type).not.toBe('error')
+     expect(requests).toHaveLength(2)
+     expect(requests.every((url) => url === 'http://127.0.0.1:9876/v1/chat/completions')).toBe(true)
++    // The refusal is what the model sees as the tool result.
++    expect(bodies[1]).toContain('unavailable in a direct BYOK run')
+   })
+ 
+   test('explicit connection recovery retains history, repins checkpoints, and can return to hosted inference', async () => {
+     let metadata: ByokConnection[] = []
+     const keys = new Map<string, string>()
+     const store = createByokConnectionStore({
+       metadataStore: { get: async () => metadata, set: async value => { metadata = value } },
+       secretStore: { get: async ref => keys.get(ref), set: async (ref, value) => { keys.set(ref, value) }, delete: async ref => { keys.delete(ref) } },
+     })
+     const requests: Array<{ url: string; auth: string | null; body: string }> = []
+     globalThis.fetch = (async (input, init) => {
+       const url = new URL(String(input))
+       if (url.pathname === '/api/v1/me') return Response.json({ id: 'recovery-user' })
+       if (url.pathname === '/api/v1/agent-runs') return Response.json({ runId: 'recovery-run', success: true })
+       if (!url.pathname.endsWith('/chat/completions')) return new Response('Unexpected fixture request', { status: 400 })
+       requests.push({ url: url.toString(), auth: new Headers(init?.headers).get('authorization'), body: String(init?.body) })
+       return sse({ id: 'reply', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta: { role: 'assistant', content: 'Remembered.' }, finish_reason: 'stop' }] })
+     }) as typeof fetch
+ 
+     const original = await store.create({ name: 'Original', provider: 'openai-compatible', baseUrl: 'http://127.0.0.1:9876/v1', model: 'original/model', apiKey: 'original-canary' })
+     const client = new CodebuffClient({ byok: await store.resolve(original), agentDefinitions: [agent] })
+     const first = await client.run({ agent: agent.id, prompt: 'Remember the recovery marker: violet-otter.' })
+     expect(first.output.type).not.toBe('error')
+     const saved = JSON.stringify(first)
+     await store.remove(original)
+@@ -241,62 +245,66 @@ describe('direct BYOK SDK runs', () => {
+ 
+     const hosted = new CodebuffClient({ apiKey: 'hosted-recovery-canary', agentDefinitions: [agent] })
+     const returned = await hosted.run({ agent: agent.id, prompt: 'Continue with Freebuff.', previousRun: rotated, allowInferenceSourceChange: true })
+     expect(returned.output.type).not.toBe('error')
+     expect(returned.inference).toEqual({ source: 'codebuff' })
+     expect(requests.at(-1)).toMatchObject({ url: new URL('/api/v1/chat/completions', getWebsiteUrl()).toString(), auth: 'Bearer hosted-recovery-canary' })
+     expect(requests.at(-1)!.body).toContain(agent.model!)
+     expect(requests.at(-1)!.body).toContain('violet-otter')
+     expect(requests.at(-1)!.body).not.toContain('rotated-canary')
+ 
+     const legacy = await replacementClient.run({ agent: agent.id, prompt: 'Continue older history.', previousRun: { ...returned, inference: undefined }, allowInferenceSourceChange: true, byok: await store.resolve(updated) })
+     expect(legacy.output.type).not.toBe('error')
+     expect(requests.at(-1)!.body).toContain('violet-otter')
+   }, 30_000)
+ 
+   test.each([
+     [401, 'Check or replace the key.'],
+     [402, 'Add provider credit or choose another model.'],
+     [429, 'Wait, then retry the task.'],
+   ])('keeps provider HTTP %i failures local and actionable', async (status, expected) => {
+     const requests: string[] = []
+     globalThis.fetch = (async (input) => {
+       requests.push(String(input))
+       return new Response(JSON.stringify({ error: { message: 'provider-key-canary must not leak' } }), {
+         status,
+-        headers: { 'content-type': 'application/json' },
++        // The AI SDK retries a 429 three times, 2s/4s/8s apart unless the
++        // provider says otherwise; `retry-after-ms` (OpenAI's header) keeps
++        // every retry and none of the 14s wait.
++        headers: { 'content-type': 'application/json', 'retry-after-ms': '0' },
+       })
+     }) as typeof fetch
+ 
+     const client = new CodebuffClient({ agentDefinitions: [agent], byok: connection() })
+     const result = await client.run({ agent: agent.id, prompt: 'Fail safely.' })
+ 
+     expect(result.output.type).toBe('error')
+     if (result.output.type !== 'error') throw new Error('expected BYOK provider error')
+     expect(result.output.message).toContain(expected)
+     expect(result.output.message).not.toContain('provider-key-canary')
+-    expect(requests).not.toHaveLength(0)
++    // 401/402 are final; a 429 is the first try plus the AI SDK's three retries.
++    expect(requests).toHaveLength(status === 429 ? 4 : 1)
+     expect(requests.every((url) => url === 'http://127.0.0.1:9876/v1/chat/completions')).toBe(true)
+   }, 30_000)
+ 
+   test.each([
+     ['changed', 'BYOK connection changed; select its current revision to continue'],
+     ['removed', 'BYOK connection was removed; select another provider or a Freebuff model to continue'],
+     ['corrupt', 'BYOK connection metadata is corrupt; restore it before continuing'],
+     ['locked', 'BYOK settings are locked. Close other Freebuff processes and retry.'],
+     ['unknown', 'Could not verify the saved BYOK connection. Reselect the provider and retry.'],
+   ])('reports a %s local connection failure without provider dispatch', async (failure, expected) => {
+     let requests = 0
+     globalThis.fetch = (async () => {
+       requests += 1
+       return sse({ id: 'unexpected', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [] })
+     }) as unknown as typeof fetch
+     let records: ByokConnection[] = []
+     let failCheck = false
+     const store = createByokConnectionStore({
+       metadataStore: {
+         async get() { return records },
+         async set(next) { records = next },
+         async withLock(operation) {
+           if (failCheck && failure === 'locked')
+             throw new ByokConnectionStateError(expected)
+           if (failCheck && failure === 'unknown')
+diff --git a/sdk/src/impl/agent-runtime.ts b/sdk/src/impl/agent-runtime.ts
+index b9fd80c70..1c454f4dc 100644
+--- a/sdk/src/impl/agent-runtime.ts
++++ b/sdk/src/impl/agent-runtime.ts
+@@ -1,31 +1,32 @@
+ import { trackEvent as trackCommonEvent } from '@codebuff/common/analytics'
+ import { BYOK_LOCAL_USER_ID } from '@codebuff/common/constants/byok'
+ import { env as clientEnvDefault } from '@codebuff/common/env'
+ import { getCiEnv } from '@codebuff/common/env-ci'
+ import { shouldTrackAnalyticsEvent } from '@codebuff/common/util/analytics-sampling'
+ import { success } from '@codebuff/common/util/error'
++import { HostedServiceUnavailableError } from '@codebuff/agent-runtime/llm-api/codebuff-web-api'
+ 
+ import { getWebsiteUrl } from '../constants'
+ import type { ResolvedByokConnection } from '../byok'
+ import type { CodebuffRequestHeadersProvider } from './model-provider'
+ 
+ import {
+   addAgentStep,
+   fetchAgentFromDatabase,
+   finishAgentRun,
+   getUserInfoFromApiKey,
+   startAgentRun,
+ } from './database'
+ import { promptAiSdk, promptAiSdkStream, promptAiSdkStructured } from './llm'
+ 
+ import type {
+   AgentRuntimeDeps,
+   AgentRuntimeScopedDeps,
+ } from '@codebuff/common/types/contracts/agent-runtime'
+ import type { AgentTemplate } from '@codebuff/common/types/agent-template'
+ import type { DatabaseAgentCache } from '@codebuff/common/types/contracts/database'
+ import type { ClientEnv } from '@codebuff/common/types/contracts/env'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
+ import type { TrackEventFn } from '@codebuff/common/types/contracts/analytics'
+ 
+@@ -151,49 +152,49 @@ export function getAgentRuntimeImpl(
+     promptAiSdk: byok
+       ? ((params) => promptAiSdk({ ...params, byok } as any))
+       : requestHeaders
+         ? ((params) => promptAiSdk({ ...params, requestHeaders }))
+         : promptAiSdk,
+     promptAiSdkStructured: byok
+       ? ((params) => promptAiSdkStructured({ ...params, byok } as any))
+       : requestHeaders
+         ? ((params) => promptAiSdkStructured({ ...params, requestHeaders }) as any)
+         : promptAiSdkStructured,
+ 
+     // Mutable State
+     databaseAgentCache: byok ? new Map() : databaseAgentCache,
+ 
+     // Analytics
+     trackEvent: byok ? (() => {}) : trackSdkRuntimeEvent,
+ 
+     // Other
+     logger: logger ?? noopLogger,
+     traceWriter,
+     // Server-side research/Gravity helpers use this runtime fetch. BYOK has
+     // no Codebuff service allowance, so fail closed; model requests use the
+     // direct provider fetch constructed in model-provider.ts instead.
+     fetch: byok
+       ? (async () => {
+-          throw new Error('Hosted service tools are unavailable in a direct BYOK run')
++          throw new HostedServiceUnavailableError('Hosted service tools are unavailable in a direct BYOK run')
+         }) as unknown as typeof globalThis.fetch
+       : globalThis.fetch,
+ 
+     // Client (WebSocket)
+     handleStepsLogChunk,
+     requestToolCall,
+     requestMcpToolData,
+     requestFiles,
+     requestImageFile,
+     requestOptionalFile,
+     sendAction,
+     sendSubagentChunk,
+ 
+     apiKey,
+   }
+ }
+ 
+ const noopLogger: Logger = {
+   debug: () => {},
+   info: () => {},
+   warn: () => {},
+   error: () => {},
+ }
