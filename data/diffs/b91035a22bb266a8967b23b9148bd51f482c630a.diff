@@ -1,0 +1,832 @@
+diff --git a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+index 0f3b38520..fcd789b90 100644
+--- a/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
++++ b/packages/agent-runtime/src/__tests__/loop-agent-steps.test.ts
+@@ -17,50 +17,54 @@ import {
+   beforeEach,
+   describe,
+   expect,
+   it,
+   mock,
+   spyOn,
+ } from 'bun:test'
+ import { APICallError, RetryError } from 'ai'
+ import { z } from 'zod/v4'
+ import { spawnSync } from 'node:child_process'
+ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+ import { tmpdir } from 'node:os'
+ import { join } from 'node:path'
+ import { applyPatch } from 'diff'
+ 
+ import { loopAgentSteps } from '../run-agent-step'
+ import { frameSteeringText, STEERING_NOTE } from '../util/messages'
+ import { clearAgentGeneratorCache } from '../run-programmatic-step'
+ import {
+   MAX_CONSECUTIVE_STREAM_RECOVERIES,
+   OUTPUT_LIMIT_TAG,
+   REPEATED_OUTPUT_LIMIT_MESSAGE,
+   REPEATED_STREAM_INTERRUPTIONS_MESSAGE,
+   STREAM_INTERRUPTED_TAG,
+ } from '../tools/stream-parser'
++import {
++  FILE_EDIT_LOOP_RECOVERY_MESSAGE,
++  FILE_EDIT_LOOP_STOP_MESSAGE,
++} from '../util/file-edit-loop'
+ import {
+   FILE_EDIT_TOOLS_UNAVAILABLE_NOTE,
+   TODO_LOOP_RECOVERY_MESSAGE,
+   TODO_LOOP_STOP_MESSAGE,
+   WRITE_TODOS_UNCHANGED_MESSAGE,
+ } from '../util/todo-loop'
+ import {
+   FOLLOWUP_TODO_NUDGE_TAG,
+   MAX_FOLLOWUP_TODO_NUDGES,
+ } from '../util/followup-todo-nudge'
+ import { TODO_PROGRESS_REMINDER_TAG } from '../util/todo-progress-reminder'
+ import { createToolCallChunk, mockFileContext } from './test-utils'
+ 
+ import type { AgentTemplate } from '../templates/types'
+ import type { DbSpies } from '@codebuff/common/testing/mocks/database'
+ import type { StepGenerator } from '@codebuff/common/types/agent-template'
+ import type { AgentState } from '@codebuff/common/types/session-state'
+ 
+ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () => {
+   let mockTemplate: AgentTemplate
+   let mockAgentState: AgentState
+   let llmCallCount: number
+   let agentRuntimeImpl: Omit<
+     ReturnType<typeof createTestAgentRuntimeParams>,
+     'agentTemplate' | 'localAgentTemplates'
+@@ -647,50 +651,113 @@ describe('loopAgentSteps - runAgentStep vs runProgrammaticStep behavior', () =>
+   })
+ 
+   it('adds deadline reminders only when entering a new urgency threshold', async () => {
+     let now = 1000000
+     spyOn(Date, 'now').mockImplementation(() => now)
+     const prompts: string[] = []
+     await loopAgentSteps({
+       ...loopAgentStepsBaseParams,
+       deadlineAt: now + 600000,
+       promptAiSdkStream: async function* ({ messages }) {
+         prompts.push(JSON.stringify(messages))
+         if (prompts.length < 4) {
+           yield createToolCallChunk('read_files', { paths: ['file1.txt'] })
+           if (prompts.length === 2) now += 400000
+           if (prompts.length === 3) now += 150000
+         } else yield { type: 'text' as const, text: 'Done' }
+         return promptSuccess('deadline-test')
+       },
+     })
+     expect(prompts[0]).toContain('600 seconds remain')
+     expect(prompts[1].split('Time budget:')).toHaveLength(2)
+     expect(prompts[2]).toContain('200 seconds remain')
+     expect(prompts[3]).toContain('50 seconds remain')
+   })
+ 
++  it('stops a loop of identical rejected file edits after recovery attempts and can resume on a new prompt', async () => {
++    mockAgentState.stepsRemaining = 200
++    let calls = 0
++    let clientWrites = 0
++    const seenPrompts: string[] = []
++    const result = await loopAgentSteps({
++      ...loopAgentStepsBaseParams,
++      // the file already holds exactly what the model keeps sending
++      requestOptionalFile: async () => 'unchanged',
++      requestToolCall: async () => {
++        clientWrites++
++        throw new Error('a rejected write never reaches the client')
++      },
++      promptAiSdkStream: async function* ({ messages }) {
++        calls++
++        seenPrompts.push(JSON.stringify(messages))
++        yield { type: 'text', text: 'Writing the file now.' }
++        yield createToolCallChunk('write_file', {
++          path: 'output.txt',
++          instructions: `Attempt ${calls}`,
++          content: 'unchanged',
++        })
++        return promptSuccess(`edit-${calls}`)
++      },
++    })
++
++    expect(calls).toBe(6)
++    expect(clientWrites).toBe(0)
++    expect(seenPrompts[2]).not.toContain(FILE_EDIT_LOOP_RECOVERY_MESSAGE)
++    expect(seenPrompts[3]).toContain(FILE_EDIT_LOOP_RECOVERY_MESSAGE)
++    expect(result.output).toMatchObject({
++      type: 'error',
++      message: FILE_EDIT_LOOP_STOP_MESSAGE,
++    })
++    expect(
++      result.agentState.messageHistory.filter(
++        (m) => m.role === 'tool' && m.toolName === 'write_file',
++      ),
++    ).toHaveLength(6)
++
++    let resumeCalls = 0
++    const resumed = await loopAgentSteps({
++      ...loopAgentStepsBaseParams,
++      agentState: result.agentState,
++      prompt: 'Try a different approach',
++      requestOptionalFile: async () => 'unchanged',
++      promptAiSdkStream: async function* () {
++        if (++resumeCalls === 1) {
++          yield createToolCallChunk('write_file', {
++            path: 'output.txt',
++            instructions: 'once more',
++            content: 'unchanged',
++          })
++        } else {
++          yield createToolCallChunk('end_turn', {})
++        }
++        return promptSuccess(`resumed-${resumeCalls}`)
++      },
++    })
++    expect(resumeCalls).toBe(2)
++    expect(resumed.output.type).not.toBe('error')
++  })
++
+   it('stops an unchanged to-do loop after recovery attempts and can resume on a new prompt', async () => {
+     mockTemplate.toolNames.push('write_todos')
+     mockAgentState.stepsRemaining = 200
+     let calls = 0
+     const seenPrompts: string[] = []
+     const result = await loopAgentSteps({
+       ...loopAgentStepsBaseParams,
+       promptAiSdkStream: async function* ({ messages }) {
+         calls++
+         seenPrompts.push(JSON.stringify(messages))
+         yield { type: 'reasoning', text: 'I should stop repeating the list.' }
+         yield { type: 'text', text: 'Executing now.' }
+         yield createToolCallChunk('write_todos', {
+           todos: [{ task: 'x', completed: false }],
+         })
+         return promptSuccess(`todo-${calls}`)
+       },
+     })
+ 
+     expect(calls).toBe(6)
+     expect(seenPrompts[2]).not.toContain(TODO_LOOP_RECOVERY_MESSAGE)
+     expect(seenPrompts[3]).toContain(TODO_LOOP_RECOVERY_MESSAGE)
+     expect(result.output).toMatchObject({
+       type: 'error',
+       message: TODO_LOOP_STOP_MESSAGE,
+diff --git a/packages/agent-runtime/src/process-file-block.ts b/packages/agent-runtime/src/process-file-block.ts
+index 2b4a221b6..fc82b653f 100644
+--- a/packages/agent-runtime/src/process-file-block.ts
++++ b/packages/agent-runtime/src/process-file-block.ts
+@@ -7,98 +7,103 @@ import { FILE_WRITE_GUARD_EVENT } from '@codebuff/common/util/axiom-only-log'
+ import { createPatch } from 'diff'
+ 
+ import {
+   detectTruncatedRewrite,
+   truncatedRewriteMessage,
+ } from './util/truncated-write-guard'
+ 
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ 
+ type WriteFileSuccess = {
+   tool: 'write_file'
+   path: string
+   content: string
+   patch: string | undefined
+   messages: string[]
+ }
+ 
+ type WriteFileError = {
+   tool: 'write_file'
+   path: string
+   error: string
+ }
+ 
+ export type WriteFileResult = WriteFileSuccess | WriteFileError
+ 
++/** Answering a no-op write plainly matters: a model re-sending the file's
++ * current content read the bare "skipping" as an invitation to retry. */
++export const FILE_CONTENT_UNCHANGED_MESSAGE =
++  'The new content was the same as the old content, skipping. The file already has exactly this content, so do not send this write again: continue with the next task, or end your turn.'
++
+ /**
+  * Processes a file block, replacing the file content entirely or creating a new file.
+  * This is fully deterministic — the content parameter is always written as-is.
+  *
+  * Returns a PromptResult wrapping the result:
+  * - `{ aborted: false, value: WriteFileResult }` on success or recoverable error
+  */
+ export async function processFileBlock(
+   params: {
+     path: string
+     initialContentPromise: Promise<string | null>
+     newContent: string
+     logger: Logger
+   },
+ ): Promise<PromptResult<WriteFileResult>> {
+   const {
+     path,
+     initialContentPromise,
+     newContent,
+     logger,
+   } = params
+   const initialContent = await initialContentPromise
+ 
+   if (initialContent === null) {
+     const cleanContent = cleanMarkdownCodeBlock(newContent)
+ 
+     logger.debug(
+       { path, cleanContent },
+       `processFileBlock: Created new file ${path}`,
+     )
+     return promptSuccess({
+       tool: 'write_file' as const,
+       path,
+       content: cleanContent,
+       patch: undefined,
+       messages: [`Created new file ${path}`],
+     })
+   }
+ 
+   if (newContent === initialContent) {
+     logger.info(
+       { newContent },
+       `processFileBlock: New was same as old, skipping ${path}`,
+     )
+     return promptSuccess({
+       tool: 'write_file' as const,
+       path,
+-      error: 'The new content was the same as the old content, skipping.',
++      error: FILE_CONTENT_UNCHANGED_MESSAGE,
+     })
+   }
+ 
+   const lineEnding = initialContent.includes('\r\n') ? '\r\n' : '\n'
+   const normalizeLineEndings = (str: string) => str.replace(/\r\n/g, '\n')
+   const normalizedInitialContent = normalizeLineEndings(initialContent)
+   const normalizedNewContent = normalizeLineEndings(newContent)
+ 
+   // A much shorter copy of the file that stops mid-expression is a cut-off
+   // write, not a rewrite: refuse it rather than replace the file with it.
+   const truncatedRewrite = detectTruncatedRewrite(
+     normalizedInitialContent,
+     normalizedNewContent,
+   )
+   if (truncatedRewrite) {
+     logger.warn(
+       {
+         axiomEvent: FILE_WRITE_GUARD_EVENT,
+         metric: 'truncated_rewrite_refused',
+         toolName: 'write_file',
+         oldLines: truncatedRewrite.oldLines,
+         newLines: truncatedRewrite.newLines,
+         openBrackets: truncatedRewrite.openBrackets,
+       },
+       'Refused a write_file that would replace a file with a cut-off copy',
+@@ -106,51 +111,51 @@ export async function processFileBlock(
+     return promptSuccess({
+       tool: 'write_file' as const,
+       path,
+       error: truncatedRewriteMessage(path, truncatedRewrite),
+     })
+   }
+ 
+   let patch = createPatch(path, normalizedInitialContent, normalizedNewContent)
+   const lines = patch.split('\n')
+   const hunkStartIndex = lines.findIndex((line) => line.startsWith('@@'))
+   if (hunkStartIndex !== -1) {
+     patch = lines.slice(hunkStartIndex).join('\n')
+   } else {
+     logger.debug(
+       {
+         path,
+         initialContent,
+         changes: newContent,
+         patch,
+       },
+       `processFileBlock: No change to ${path}`,
+     )
+     return promptSuccess({
+       tool: 'write_file' as const,
+       path,
+-      error: 'The new content was the same as the old content, skipping.',
++      error: FILE_CONTENT_UNCHANGED_MESSAGE,
+     })
+   }
+   logger.debug(
+     {
+       path,
+       newContent,
+       patch,
+     },
+     `processFileBlock: Updated file ${path}`,
+   )
+ 
+   const patchOriginalLineEndings = patch.replaceAll('\n', lineEnding)
+   const updatedContentOriginalLineEndings = normalizedNewContent.replaceAll(
+     '\n',
+     lineEnding,
+   )
+ 
+   return promptSuccess({
+     tool: 'write_file' as const,
+     path,
+     content: updatedContentOriginalLineEndings,
+     patch: patchOriginalLineEndings,
+     messages: [],
+   })
+ }
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index 67642ed69..694188921 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -38,50 +38,59 @@ import type { CompactionTrigger } from './compact-history'
+ import {
+   closeCompactionWindow,
+   openCompactionWindow,
+ } from './compaction-followup'
+ import type { CompactionWindow } from './compaction-followup'
+ import {
+   automaticCompactionIsWorthwhile,
+   compactMechanically,
+ } from './compaction'
+ import { CACHE_DEBUG_FULL_LOGGING } from './constants'
+ import { getMCPToolData } from './mcp'
+ import {
+   runProjectProfileReport,
+   shouldOfferProjectProfileTool,
+ } from './project-profile'
+ import { getAgentStreamFromTemplate } from './prompt-agent-stream'
+ import { isThinkOnlyResponse } from './util/think-tags'
+ import {
+   decideFollowupTodoNudge,
+   FOLLOWUP_TODO_NUDGE_TAG,
+ } from './util/followup-todo-nudge'
+ import {
+   decideTodoProgressReminder,
+   TODO_PROGRESS_REMINDER_TAG,
+ } from './util/todo-progress-reminder'
++import {
++  FILE_EDIT_LOOP_RECOVERY_MESSAGE,
++  FILE_EDIT_LOOP_RECOVERY_TAG,
++  FILE_EDIT_LOOP_RECOVERY_THRESHOLD,
++  FILE_EDIT_LOOP_STOP_THRESHOLD,
++  FileEditLoopError,
++  isFileEditLoopTool,
++  trailingIdenticalRejectedEdits,
++} from './util/file-edit-loop'
+ import {
+   hasFileEditTool,
+   TODO_LOOP_RECOVERY_TAG,
+   TODO_LOOP_RECOVERY_THRESHOLD,
+   TODO_LOOP_STOP_THRESHOLD,
+   TodoLoopError,
+   todoLoopRecoveryMessage,
+   trailingIdenticalTodoCalls,
+ } from './util/todo-loop'
+ import {
+   clearProgrammaticRunState,
+   runProgrammaticStep,
+ } from './run-programmatic-step'
+ import {
+   additionalSystemPrompts,
+   isCompactCommandPrompt,
+ } from './system-prompt/prompts'
+ import { getAgentTemplate } from './templates/agent-registry'
+ import { buildAgentToolSet, modelSpawnableAgents } from './templates/prompts'
+ import { getAgentPrompt } from './templates/strings'
+ import { getToolSet } from './tools/prompts'
+ import { processStream } from './tools/stream-parser'
+ import { getAgentOutput, outputForParent } from './util/agent-output'
+ import {
+   createCacheDebugSnapshot,
+@@ -643,50 +652,90 @@ export const runAgentStep = async (
+           consecutive,
+           model: agentTemplate.model,
+           agentId: agentTemplate.id,
+           fileEditToolsOffered: hasFileEditTool(agentTemplate.toolNames),
+           userId,
+           runId: agentState.runId,
+         },
+         stopped
+           ? 'Stopping a turn stuck repeating an unchanged to-do list'
+           : 'Model is repeating an unchanged to-do list; adding recovery guidance',
+       )
+       if (stopped) {
+         throw new TodoLoopError()
+       }
+       agentState.messageHistory.push(
+         userMessage({
+           content: withSystemTags(
+             todoLoopRecoveryMessage(agentTemplate.toolNames),
+           ),
+           tags: [TODO_LOOP_RECOVERY_TAG],
+         }),
+       )
+     }
+   }
+ 
++  // The same shape with file edits: an identical write_file/str_replace is
++  // answered with the same rejection every step, each result forces another
++  // step, and the model re-sends the edit until the step budget is gone.
++  if (
++    !hadToolCallError &&
++    toolCalls.length > 0 &&
++    toolCalls.every((call) => isFileEditLoopTool(call.toolName))
++  ) {
++    const consecutive = trailingIdenticalRejectedEdits(
++      agentState.messageHistory,
++    )
++    if (consecutive >= FILE_EDIT_LOOP_RECOVERY_THRESHOLD) {
++      const stopped = consecutive >= FILE_EDIT_LOOP_STOP_THRESHOLD
++      logger.warn(
++        {
++          metric: stopped
++            ? 'file_edit_loop_stopped'
++            : 'file_edit_loop_recovery',
++          consecutive,
++          model: agentTemplate.model,
++          agentId: agentTemplate.id,
++          userId,
++          runId: agentState.runId,
++        },
++        stopped
++          ? 'Stopping a turn stuck re-sending the same rejected file edit'
++          : 'Model is re-sending the same rejected file edit; adding recovery guidance',
++      )
++      if (stopped) {
++        throw new FileEditLoopError()
++      }
++      agentState.messageHistory.push(
++        userMessage({
++          content: withSystemTags(FILE_EDIT_LOOP_RECOVERY_MESSAGE),
++          tags: [FILE_EDIT_LOOP_RECOVERY_TAG],
++        }),
++      )
++    }
++  }
++
+   agentState.messageHistory = expireMessages(
+     agentState.messageHistory,
+     'agentStep',
+   )
+ 
+   const hasNoToolResults =
+     toolCalls.filter(
+       (call) => !TOOLS_WHICH_WONT_FORCE_NEXT_STEP.includes(call.toolName),
+     ).length === 0 &&
+     toolResults.filter(
+       (result) => !TOOLS_WHICH_WONT_FORCE_NEXT_STEP.includes(result.toolName),
+     ).length === 0 &&
+     !hadToolCallError // Tool call errors should also force another step so the agent can retry
+ 
+   const hasTaskCompleted = toolCalls.some(
+     (call) =>
+       call.toolName === 'task_completed' || call.toolName === 'end_turn',
+   )
+ 
+   // If the response is only <think>...</think> scaffolding (including orphan
+   // </think> closes that native-reasoning providers sometimes leak into
+   // content), the model was just thinking and should continue rather than end.
+   const isThinkOnly = hasNoToolResults && isThinkOnlyResponse(fullResponse)
+ 
+   // If the agent has the task_completed tool, it must be called to end its turn.
+@@ -1768,95 +1817,96 @@ export async function loopAgentSteps(
+         output: {
+           type: 'error',
+           message: 'Run cancelled by user',
+         },
+       }
+     }
+ 
+     logger.error(
+       {
+         error: getErrorObject(error),
+         agentType,
+         agentId: currentAgentState.agentId,
+         runId,
+         totalSteps,
+         directCreditsUsed: currentAgentState.directCreditsUsed,
+         creditsUsed: currentAgentState.creditsUsed,
+         messageHistory: currentAgentState.messageHistory,
+         systemPrompt: system,
+       },
+       'Agent execution failed',
+     )
+ 
+     const apiErrorDetails = extractApiErrorDetails(error)
+     const isIdleTimeout = isFetchIdleTimeoutError(error)
+     const isNetworkError = !isIdleTimeout && isTransientNetworkError(error)
+-    const isTodoLoop = error instanceof TodoLoopError
++    const isModelLoop =
++      error instanceof TodoLoopError || error instanceof FileEditLoopError
+     const hasServerMessage = apiErrorDetails.message !== undefined
+     let fallbackMessage: string
+-    if (isTodoLoop) {
++    if (isModelLoop) {
+       fallbackMessage = error.message
+     } else if (isIdleTimeout) {
+       fallbackMessage = FETCH_IDLE_TIMEOUT_USER_MESSAGE
+     } else if (isNetworkError) {
+       fallbackMessage = TRANSIENT_NETWORK_ERROR_USER_MESSAGE
+     } else if (error instanceof Error) {
+       const includeStack =
+         apiErrorDetails.statusCode === undefined && error.stack
+       fallbackMessage =
+         error.message + (includeStack ? `\n\n${error.stack}` : '')
+     } else {
+       fallbackMessage = String(error)
+     }
+     const errorMessage = apiErrorDetails.message ?? fallbackMessage
+     const statusCode = apiErrorDetails.statusCode
+ 
+     const status = signal.aborted ? 'cancelled' : 'failed'
+     // A failed turn still leaves history behind, and the host still shows the
+     // user a context reading before their next message.
+     recountContextTokensForTurnEnd()
+     await finishAgentRun({
+       ...params,
+       runId,
+       status,
+       totalSteps,
+       directCredits: currentAgentState.directCreditsUsed,
+       totalCredits: currentAgentState.creditsUsed,
+       errorMessage,
+     })
+ 
+     // Payment required errors (402) should propagate
+     if (statusCode === 402) {
+       throw error
+     }
+ 
+     return {
+       agentState: currentAgentState,
+       output: {
+         type: 'error',
+         message:
+-          hasServerMessage || isIdleTimeout || isNetworkError || isTodoLoop
++          hasServerMessage || isIdleTimeout || isNetworkError || isModelLoop
+             ? errorMessage
+             : 'Agent run error: ' + errorMessage,
+         ...(statusCode !== undefined && { statusCode }),
+         ...(apiErrorDetails.errorCode !== undefined && {
+           error: apiErrorDetails.errorCode,
+         }),
+         ...(apiErrorDetails.countryCode !== undefined && {
+           countryCode: apiErrorDetails.countryCode,
+         }),
+         ...(apiErrorDetails.countryBlockReason !== undefined && {
+           countryBlockReason: apiErrorDetails.countryBlockReason,
+         }),
+         ...(apiErrorDetails.ipPrivacySignals !== undefined && {
+           ipPrivacySignals: apiErrorDetails.ipPrivacySignals,
+         }),
+       },
+     }
+   } finally {
+     if (compactionWindow)
+       closeCompactionWindow({
+         window: compactionWindow,
+         messages: currentAgentState.messageHistory,
+         endedBy: 'run_end',
+         logger,
+         runId,
+diff --git a/packages/agent-runtime/src/util/__tests__/file-edit-loop.test.ts b/packages/agent-runtime/src/util/__tests__/file-edit-loop.test.ts
+new file mode 100644
+index 000000000..ebcae1d2e
+--- /dev/null
++++ b/packages/agent-runtime/src/util/__tests__/file-edit-loop.test.ts
+@@ -0,0 +1,129 @@
++import { assistantMessage, userMessage } from '@codebuff/common/util/messages'
++import { describe, expect, it } from 'bun:test'
++
++import {
++  FILE_EDIT_LOOP_RECOVERY_TAG,
++  trailingIdenticalRejectedEdits,
++} from '../file-edit-loop'
++
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++import type { ToolCallPart } from '@codebuff/common/types/messages/content-part'
++
++const REJECTED = { file: 'a.ts', errorMessage: 'same as the old content' }
++const ACCEPTED = { file: 'a.ts', message: 'File written' }
++
++function call(
++  id: string,
++  input: Record<string, unknown> = { path: 'a.ts', content: 'x' },
++  toolName = 'write_file',
++): ToolCallPart {
++  return { type: 'tool-call', toolCallId: id, toolName, input }
++}
++
++function result(
++  id: string,
++  value: Record<string, string> = REJECTED,
++  toolName = 'write_file',
++): Message {
++  return {
++    role: 'tool',
++    toolCallId: id,
++    toolName,
++    content: [{ type: 'json', value }],
++  }
++}
++
++function edit(
++  id: string,
++  input?: Record<string, unknown>,
++  value: Record<string, string> = REJECTED,
++  toolName = 'write_file',
++): Message[] {
++  return [
++    assistantMessage(call(id, input, toolName)),
++    result(id, value, toolName),
++  ]
++}
++
++describe('trailingIdenticalRejectedEdits', () => {
++  it('counts rejected identical steps across reasoning, prose, step prompts, recovery notes and instruction wording', () => {
++    expect(
++      trailingIdenticalRejectedEdits([
++        userMessage('Write the file'),
++        ...edit('a', { path: 'a.ts', content: 'x', instructions: 'first' }),
++        assistantMessage({ type: 'reasoning', text: 'Retrying the write.' }),
++        userMessage({ content: 'Continue', tags: ['STEP_PROMPT'] }),
++        ...edit('b', { path: 'a.ts', content: 'x', instructions: 'second' }),
++        userMessage({
++          content: 'Stop repeating',
++          tags: [FILE_EDIT_LOOP_RECOVERY_TAG],
++        }),
++        assistantMessage('Writing now.'),
++        ...edit('c'),
++      ]),
++    ).toBe(3)
++  })
++
++  it('compares a whole step of edits, in any order', () => {
++    const b = { path: 'b.ts', content: 'y' }
++    expect(
++      trailingIdenticalRejectedEdits([
++        assistantMessage([call('a1'), call('b1', b)]),
++        result('a1'),
++        result('b1'),
++        assistantMessage([call('b2', b), call('a2')]),
++        result('b2'),
++        result('a2'),
++      ]),
++    ).toBe(2)
++  })
++
++  it('counts a str_replace streak too', () => {
++    const replace = (id: string) =>
++      edit(
++        id,
++        { path: 'a.ts', replacements: [{ old: 'q', new: 'r' }] },
++        { file: 'a.ts', errorMessage: 'old string not found' },
++        'str_replace',
++      )
++    expect(
++      trailingIdenticalRejectedEdits([...replace('a'), ...replace('b')]),
++    ).toBe(2)
++  })
++
++  it.each([
++    ['user steering', [userMessage('Do something else')]],
++    ['another tool', edit('read', { paths: ['a.ts'] }, {}, 'read_files')],
++    ['an accepted edit', edit('ok', undefined, ACCEPTED)],
++    ['a different edit', edit('other', { path: 'a.ts', content: 'z' })],
++    ['a different file', edit('other', { path: 'b.ts', content: 'x' })],
++    ['an unmatched call', edit('orphan').slice(0, 1)],
++  ] satisfies [string, Message[]][])('resets at %s', (_, boundary) => {
++    expect(
++      trailingIdenticalRejectedEdits([
++        ...edit('old1'),
++        ...edit('old2'),
++        ...boundary,
++        ...edit('new'),
++      ]),
++    ).toBe(1)
++  })
++
++  it('does not count a step that mixes an edit with another tool', () => {
++    expect(
++      trailingIdenticalRejectedEdits([
++        ...edit('old'),
++        assistantMessage([
++          call('a'),
++          call('r', { paths: ['a.ts'] }, 'read_files'),
++        ]),
++        result('a'),
++        result('r', {}, 'read_files'),
++      ]),
++    ).toBe(0)
++  })
++
++  it('is zero with no edits', () => {
++    expect(trailingIdenticalRejectedEdits([userMessage('hi')])).toBe(0)
++  })
++})
+diff --git a/packages/agent-runtime/src/util/file-edit-loop.ts b/packages/agent-runtime/src/util/file-edit-loop.ts
+new file mode 100644
+index 000000000..4164e0545
+--- /dev/null
++++ b/packages/agent-runtime/src/util/file-edit-loop.ts
+@@ -0,0 +1,101 @@
++import type { Message } from '@codebuff/common/types/messages/codebuff-message'
++
++export const FILE_EDIT_LOOP_RECOVERY_TAG = 'FILE_EDIT_LOOP_RECOVERY'
++export const FILE_EDIT_LOOP_RECOVERY_THRESHOLD = 3
++export const FILE_EDIT_LOOP_STOP_THRESHOLD = 6
++
++export const FILE_EDIT_LOOP_RECOVERY_MESSAGE =
++  'You have repeatedly sent the same file edit, and every attempt was rejected with the same result. Sending it again will not change anything. Read the file to see its current content, make a different edit, or explain the blocker to the user and end your turn.'
++
++export const FILE_EDIT_LOOP_STOP_MESSAGE =
++  'The model got stuck re-sending the same rejected file edit without making progress. This turn was stopped to avoid wasting more of your session. Try a different model or reasoning level, then continue.'
++
++/** The tools that share `postStreamProcessing` and its `errorMessage` result.
++ * A rejected call here is a no-op the handler already explained to the model. */
++const FILE_EDIT_LOOP_TOOL_NAMES = ['write_file', 'str_replace', 'create_plan']
++
++export function isFileEditLoopTool(toolName: string): boolean {
++  return FILE_EDIT_LOOP_TOOL_NAMES.includes(toolName)
++}
++
++export class FileEditLoopError extends Error {
++  constructor() {
++    super(FILE_EDIT_LOOP_STOP_MESSAGE)
++    this.name = 'FileEditLoopError'
++  }
++}
++
++/** A tool result is a rejection when the handler answered with `errorMessage`
++ * (content unchanged, old string not found, cut-off rewrite refused). */
++function isRejectedEdit(message: Extract<Message, { role: 'tool' }>): boolean {
++  if (!Array.isArray(message.content)) return false
++  return message.content.some(
++    (part) =>
++      part.type === 'json' &&
++      typeof part.value === 'object' &&
++      part.value !== null &&
++      typeof (part.value as Record<string, unknown>).errorMessage === 'string',
++  )
++}
++
++/** The same edit sent with a different `instructions` note is still the same
++ * edit: only the path and the content decide what the handler answers. */
++function editKey(toolName: string, input: Record<string, unknown>): string {
++  const { instructions: _instructions, ...rest } = input
++  return JSON.stringify([toolName, rest])
++}
++
++/** Count trailing steps of this user turn whose file edits were all the same
++ * calls as the step before, and all rejected. Seen 2026-10-08 on Desktop with
++ * Solar Pro 4: the model re-sent one unchanged write_file every step, each
++ * answered "same as the old content", and only the general step budget stopped
++ * it. Prose, reasoning, step prompts and the recovery note are not progress. A
++ * different edit, an accepted edit, another tool, or a user message is. Only
++ * matched, completed calls count, so a lost result cannot masquerade as this
++ * model loop. */
++export function trailingIdenticalRejectedEdits(messages: Message[]): number {
++  let count = 0
++  let latestStep: string | undefined
++  const rejected = new Set<string>()
++
++  for (let i = messages.length - 1; i >= 0; i--) {
++    const message = messages[i]!
++    if (message.role === 'user') {
++      if (
++        message.tags?.includes('STEP_PROMPT') ||
++        message.tags?.includes(FILE_EDIT_LOOP_RECOVERY_TAG)
++      ) {
++        continue
++      }
++      break
++    }
++    if (message.role === 'tool') {
++      if (!isFileEditLoopTool(message.toolName) || !isRejectedEdit(message)) {
++        break
++      }
++      rejected.add(message.toolCallId)
++      continue
++    }
++    if (message.role !== 'assistant' || !Array.isArray(message.content))
++      continue
++
++    const keys: string[] = []
++    for (const part of message.content) {
++      if (part.type !== 'tool-call') continue
++      if (
++        !isFileEditLoopTool(part.toolName) ||
++        !rejected.delete(part.toolCallId)
++      ) {
++        return count
++      }
++      keys.push(editKey(part.toolName, part.input))
++    }
++    if (keys.length === 0) continue
++    const step = JSON.stringify(keys.sort())
++    if (latestStep !== undefined && step !== latestStep) return count
++    latestStep = step
++    count++
++  }
++
++  return count
++}
