@@ -1,0 +1,216 @@
+diff --git a/common/src/util/__tests__/error-api-details.test.ts b/common/src/util/__tests__/error-api-details.test.ts
+index c71caa833..1518c34de 100644
+--- a/common/src/util/__tests__/error-api-details.test.ts
++++ b/common/src/util/__tests__/error-api-details.test.ts
+@@ -145,50 +145,64 @@ describe('FETCH_IDLE_TIMEOUT_USER_MESSAGE', () => {
+     )
+   })
+ })
+ 
+ describe('isTransientNetworkError', () => {
+   it('detects the Bun socket-close message', () => {
+     expect(
+       isTransientNetworkError(
+         new Error(
+           'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
+         ),
+       ),
+     ).toBe(true)
+   })
+ 
+   it('detects transient network error codes', () => {
+     const error = new Error('request failed') as Error & { code: string }
+     error.code = 'ECONNRESET'
+     expect(isTransientNetworkError(error)).toBe(true)
+ 
+     const bunError = new Error('request failed') as Error & { code: string }
+     bunError.code = 'ConnectionClosed'
+     expect(isTransientNetworkError(bunError)).toBe(true)
+   })
+ 
++  it("detects Bun's error for a compressed body cut mid-stream", () => {
++    // The exact shapes Bun 1.3.14's fetch throws (see the sdk test
++    // compressed-stream-cut.test.ts for the live reproduction).
++    for (const code of ['ZlibError', 'BrotliDecompressionError']) {
++      const error = Object.assign(
++        new Error(
++          `${code} fetching "https://www.codebuff.com/api/v1/chat/completions". For more information, pass \`verbose: true\` in the second argument to fetch()`,
++        ),
++        { code },
++      )
++      expect(isTransientNetworkError(error)).toBe(true)
++    }
++  })
++
+   it('detects the undici "fetch failed" TypeError', () => {
+     expect(isTransientNetworkError(new TypeError('fetch failed'))).toBe(true)
+   })
+ 
+   it('detects a socket error nested inside an AI SDK RetryError wrapper', () => {
+     const socketError = new Error(
+       'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
+     ) as Error & { code: string }
+     socketError.code = 'ECONNRESET'
+     const retryError = new Error('Failed after 3 attempts.') as Error & {
+       errors: unknown[]
+     }
+     retryError.errors = [socketError]
+     expect(isTransientNetworkError(retryError)).toBe(true)
+   })
+ 
+   it('detects a socket error in a cause chain', () => {
+     const inner = new Error('read ECONNRESET') as Error & { code: string }
+     inner.code = 'ECONNRESET'
+     const outer = new Error('Cannot connect to API')
+     ;(outer as Error & { cause: unknown }).cause = inner
+     expect(isTransientNetworkError(outer)).toBe(true)
+   })
+ 
+   it("detects undici's body-read failure on a closed socket", () => {
+diff --git a/common/src/util/error.ts b/common/src/util/error.ts
+index 92012ce9a..b7e413d5d 100644
+--- a/common/src/util/error.ts
++++ b/common/src/util/error.ts
+@@ -399,50 +399,61 @@ export const FETCH_IDLE_TIMEOUT_USER_MESSAGE =
+   'This can be a slow model start on our side, or a connection dropped in transit (VPN, proxy, firewall, or flaky network).\n\n' +
+   'Retrying your message usually works. If it keeps happening, try a different model, or check your network/VPN/proxy.'
+ 
+ /**
+  * Substrings of error messages that indicate the TCP connection died in
+  * transit (as opposed to the server returning an error response). Bun's fetch
+  * throws a plain Error with "The socket connection was closed unexpectedly..."
+  * and code ECONNRESET/ConnectionClosed; undici throws TypeError "fetch failed".
+  */
+ const TRANSIENT_NETWORK_ERROR_MESSAGE_PATTERNS = [
+   'socket connection was closed unexpectedly',
+   'fetch failed',
+   'failed to fetch',
+   'network connection was lost',
+ ]
+ 
+ const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+   'ECONNRESET',
+   'ECONNREFUSED',
+   'EPIPE',
+   'ETIMEDOUT',
+   // Bun-specific fetch error codes
+   'ConnectionClosed',
+   'ConnectionRefused',
+   'FailedToOpenSocket',
++  // Bun's fetch, when a compressed body ends before its compressed stream
++  // does: the same cut connection as above, on a gzip/br response (the
++  // chat-completions SSE body is gzipped, COD-764). Reproduced on Bun 1.3.14:
++  // a gzip SSE body whose HTTP framing ends cleanly mid-stream throws
++  // "ZlibError fetching <url>", code ZlibError; br gives
++  // BrotliDecompressionError. On 2026-10-08 every web deploy turned these
++  // into failed turns (545 in 15 minutes at 2pm PT). The same cut on an
++  // identity body is a clean end, and Node's fetch treats a truncated gzip
++  // body as one too, so both already recover.
++  'ZlibError',
++  'BrotliDecompressionError',
+   // undici (Node's fetch): the peer closed the socket. It rides as the cause
+   // of the body-read TypeError below.
+   'UND_ERR_SOCKET',
+ ])
+ 
+ /**
+  * undici's error when a response body is cut after the headers arrived:
+  * `TypeError: terminated`, cause `SocketError: other side closed`
+  * (UND_ERR_SOCKET). Bun reports the same cut as "The socket connection was
+  * closed unexpectedly". Matched on the exact message and type, because
+  * "terminated" alone is too common a word. Without this, an SDK host running
+  * on Node ended the turn in an error on a dropped model stream, where a Bun
+  * host gets the stream-interrupted continuation step.
+  */
+ function isUndiciBodyTerminated(candidate: object): boolean {
+   return (
+     candidate instanceof TypeError &&
+     (candidate as { message?: unknown }).message === 'terminated'
+   )
+ }
+ 
+ /**
+  * Detects transient connection-level failures (socket closed/reset, connection
+  * refused, etc.) where no HTTP response was received. These are safe to retry
+  * and should be shown to the user as a connectivity problem instead of a raw
+diff --git a/sdk/src/impl/__tests__/compressed-stream-cut.test.ts b/sdk/src/impl/__tests__/compressed-stream-cut.test.ts
+new file mode 100644
+index 000000000..144d04352
+--- /dev/null
++++ b/sdk/src/impl/__tests__/compressed-stream-cut.test.ts
+@@ -0,0 +1,75 @@
++/**
++ * A compressed chat-completions body cut mid-stream must recover like an
++ * uncompressed one. When a web deploy takes an instance away, the HTTP body
++ * can end cleanly before the gzip stream does. On an identity body that is a
++ * clean end, which classifyStreamEndRecovery handles; on a gzip/br body Bun's
++ * fetch throws instead (code ZlibError / BrotliDecompressionError). Before
++ * those codes counted as transient, every deploy failed several hundred
++ * turns (2026-10-08, after SSE gzip went to 100%).
++ *
++ * This serves real compressed SSE over loopback, ends the response without
++ * finishing the compressor, and reads it with the runtime's own fetch.
++ */
++import http from 'node:http'
++import {
++  constants as zlibConstants,
++  createBrotliCompress,
++  createGzip,
++} from 'node:zlib'
++
++import { describe, expect, it } from 'bun:test'
++
++import { classifyThrownStreamRecovery } from '../stream-interruption'
++
++type Encoding = 'gzip' | 'br'
++
++async function readCutCompressedBody(encoding: Encoding): Promise<unknown> {
++  const server = http.createServer((_req, res) => {
++    res.writeHead(200, {
++      'Content-Type': 'text/event-stream',
++      'Content-Encoding': encoding,
++    })
++    const compressor =
++      encoding === 'gzip'
++        ? createGzip({ flush: zlibConstants.Z_SYNC_FLUSH })
++        : createBrotliCompress({ flush: zlibConstants.BROTLI_OPERATION_FLUSH })
++    compressor.pipe(res)
++    compressor.write('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n')
++    compressor.flush(() => {
++      // End the HTTP body with the compressed stream unfinished.
++      compressor.unpipe(res)
++      setTimeout(() => res.end(), 20)
++    })
++  })
++  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
++  const { port } = server.address() as { port: number }
++  try {
++    const response = await fetch(`http://127.0.0.1:${port}/`)
++    await response.text()
++    return undefined
++  } catch (error) {
++    return error
++  } finally {
++    server.close()
++  }
++}
++
++describe('a compressed completion stream cut mid-body', () => {
++  for (const encoding of ['gzip', 'br'] as const) {
++    it(`classifies a cut ${encoding} body as stream-interrupted`, async () => {
++      const error = await readCutCompressedBody(encoding)
++      // Node's fetch ends such a body cleanly (no throw); that path is
++      // classifyStreamEndRecovery's, so there is nothing to classify here.
++      if (error === undefined) return
++      expect(
++        classifyThrownStreamRecovery({ aborted: false, error }),
++      ).not.toBeNull()
++    })
++  }
++
++  it('still leaves an aborted request alone', async () => {
++    const error = await readCutCompressedBody('gzip')
++    if (error === undefined) return
++    expect(classifyThrownStreamRecovery({ aborted: true, error })).toBeNull()
++  })
++})
