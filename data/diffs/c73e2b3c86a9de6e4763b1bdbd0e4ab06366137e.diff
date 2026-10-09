@@ -1,0 +1,232 @@
+diff --git a/common/src/constants/sse-compression.ts b/common/src/constants/sse-compression.ts
+new file mode 100644
+index 000000000..a079479a3
+--- /dev/null
++++ b/common/src/constants/sse-compression.ts
+@@ -0,0 +1,14 @@
++/**
++ * Sent by the SDK on every chat-completions request to our backend: this
++ * build recovers a gzip SSE body that ends before the gzip stream does (Bun's
++ * `ZlibError`, a cut connection during a web deploy) by continuing the turn
++ * instead of failing it (COD-764, `TRANSIENT_NETWORK_ERROR_CODES` in
++ * common/src/util/error.ts).
++ *
++ * The server gzips the stream only for requests carrying it
++ * (web/src/app/api/v1/chat/completions/sse-compression-gate.ts). Builds from
++ * before the recovery send no header and get the uncompressed stream, which a
++ * cut ends cleanly and they already continue from.
++ */
++export const FREEBUFF_SSE_GZIP_RECOVERY_HEADER = 'x-freebuff-sse-gzip-recovery'
++export const FREEBUFF_SSE_GZIP_RECOVERY_VALUE = '1'
+diff --git a/sdk/src/impl/__tests__/delegated-user-header.test.ts b/sdk/src/impl/__tests__/delegated-user-header.test.ts
+index a10d55881..ccc494dd5 100644
+--- a/sdk/src/impl/__tests__/delegated-user-header.test.ts
++++ b/sdk/src/impl/__tests__/delegated-user-header.test.ts
+@@ -1,27 +1,31 @@
+ import { isAbortError, isTransientNetworkError } from '@codebuff/common/util/error'
+ import { FREEBUFF_ACTING_USER_HEADER } from '@codebuff/common/constants/freebuff-models'
++import {
++  FREEBUFF_SSE_GZIP_RECOVERY_HEADER,
++  FREEBUFF_SSE_GZIP_RECOVERY_VALUE,
++} from '@codebuff/common/constants/sse-compression'
+ import { afterEach, describe, expect, mock, test } from 'bun:test'
+ 
+ import { addAgentStep, finishAgentRun, startAgentRun } from '../database'
+ import {
+   BYOK_CONNECTION_FAILURE_MESSAGE,
+   getByokProviderErrorMessage,
+   getModelForRequest,
+   isByokModelIdRejection,
+   redactProviderStream,
+   sanitizeByokTransportError,
+ } from '../model-provider'
+ import { streamText } from 'ai'
+ 
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ 
+ const originalFetch = globalThis.fetch
+ const logger = {
+   debug: mock(() => {}),
+   info: mock(() => {}),
+   warn: mock(() => {}),
+   error: mock(() => {}),
+ } as unknown as Logger
+ 
+ afterEach(() => {
+   globalThis.fetch = originalFetch
+@@ -211,50 +215,74 @@ describe('SDK delegated user headers', () => {
+       messages: [{ role: 'user', content: 'hello' }],
+       maxRetries: 0,
+     })
+     let message = ''
+     for await (const part of result.stream) {
+       if (part.type === 'error') message = String(part.error)
+     }
+     expect(message).toContain('rejected the API key in OMNIROUTE_API_KEY (HTTP 401)')
+     expect(message).toContain('is set in this Freebuff process')
+     expect(message).not.toContain(key)
+   })
+ 
+   test('sends userId on model requests', async () => {
+     const model = getModelForRequest({
+       apiKey: 'service-key',
+       model: 'test/model',
+       userId: 'end-user',
+     })
+ 
+     expect((model as any).config.headers()).toMatchObject({
+       Authorization: 'Bearer service-key',
+       [FREEBUFF_ACTING_USER_HEADER]: 'end-user',
+     })
+   })
+ 
++  test('tells the backend it recovers a cut gzip stream, and never tells a BYOK provider', async () => {
++    const backend = getModelForRequest({ apiKey: 'user-key', model: 'test/model' })
++    expect((backend as any).config.headers()).toMatchObject({
++      [FREEBUFF_SSE_GZIP_RECOVERY_HEADER]: FREEBUFF_SSE_GZIP_RECOVERY_VALUE,
++    })
++
++    let byokHeaders = new Headers()
++    globalThis.fetch = mock(async (_input, init) => {
++      byokHeaders = new Headers(init?.headers)
++      return new Response('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
++        headers: { 'content-type': 'text/event-stream' },
++      })
++    }) as unknown as typeof fetch
++    const result = streamText({
++      model: getModelForRequest({
++        apiKey: 'ignored', model: 'ignored',
++        byok: { id: 'conn', revision: 1, name: 'local', provider: 'openai-compatible', baseUrl: 'http://127.0.0.1:9876/v1', model: 'selected/model', credentialRef: 'connection:conn', createdAt: 'x', updatedAt: 'x', apiKey: 'key' },
++      }),
++      messages: [{ role: 'user', content: 'hello' }],
++    })
++    await result.text
++    expect(byokHeaders.has(FREEBUFF_SSE_GZIP_RECOVERY_HEADER)).toBe(false)
++  })
++
+   test('sends userId on agent run requests', async () => {
+     const requests: RequestInit[] = []
+     globalThis.fetch = mock(async (_input, init) => {
+       requests.push(init ?? {})
+       const body = JSON.parse(String(init?.body))
+       return Response.json(
+         body.action === 'START'
+           ? { runId: 'run-1' }
+           : body.stepNumber !== undefined
+             ? { stepId: 'step-1' }
+             : { success: true },
+       )
+     }) as unknown as typeof fetch
+ 
+     await startAgentRun({
+       apiKey: 'service-key',
+       userId: 'end-user',
+       agentId: 'agent',
+       ancestorRunIds: [],
+       logger,
+     })
+     await addAgentStep({
+       apiKey: 'service-key',
+       userId: 'end-user',
+       agentRunId: 'run-1',
+diff --git a/sdk/src/impl/model-provider.ts b/sdk/src/impl/model-provider.ts
+index b9eae50d9..5ab8744a8 100644
+--- a/sdk/src/impl/model-provider.ts
++++ b/sdk/src/impl/model-provider.ts
+@@ -1,38 +1,42 @@
+ /**
+  * Builds the language model every request runs on: the Codebuff backend,
+  * which forwards to OpenRouter.
+  */
+ 
+ import path from 'path'
+ 
+ import { BYOK_OPENROUTER_HEADER } from '@codebuff/common/constants/byok'
+ import {
+   FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+   FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+ } from '@codebuff/common/constants/freebuff-errors'
+ import { FREEBUFF_ACTING_USER_HEADER } from '@codebuff/common/constants/freebuff-models'
++import {
++  FREEBUFF_SSE_GZIP_RECOVERY_HEADER,
++  FREEBUFF_SSE_GZIP_RECOVERY_VALUE,
++} from '@codebuff/common/constants/sse-compression'
+ import { FREEBUFF_GATE_CODES } from '@codebuff/common/types/freebuff-session'
+ import { isAbortError, isFetchIdleTimeoutError, isTransientNetworkError } from '@codebuff/common/util/error'
+ import {
+   OpenAICompatibleChatLanguageModel,
+   VERSION,
+ } from '@codebuff/llm-providers/openai-compatible'
+ import { APICallError } from 'ai'
+ 
+ import {
+   byokReasoningReplayRetryBody,
+   byokReasoningRetryBody,
+   byokRequestTransform,
+ } from './byok-request'
+ import {
+   chatCompletionsJson,
+   chatCompletionsStream,
+   chatGptResponsesBody,
+ } from './chatgpt-responses'
+ import {
+   CHATGPT_BYOK_PROVIDER,
+   CHATGPT_CODEX_RESPONSES_URL,
+   CHATGPT_ORIGINATOR,
+   CHATGPT_SIGN_IN_AGAIN,
+   ChatGptAuthError,
+   chatGptAccountId,
+@@ -540,50 +544,53 @@ export function getModelForRequest({
+             cause: safe,
+             isRetryable: isTransientNetworkError(safe),
+           })
+         }
+       }) as typeof globalThis.fetch,
+       includeUsage: true,
+       supportsStructuredOutputs: true,
+     })
+   }
+   const openrouterUsage: OpenRouterUsageAccounting = {
+     cost: null,
+     costDetails: {
+       upstreamInferenceCost: null,
+     },
+   }
+ 
+   const openrouterApiKey = getByokOpenrouterApiKeyFromEnv()
+ 
+   return new OpenAICompatibleChatLanguageModel(model, {
+     provider: 'codebuff',
+     url: ({ path: endpoint }) =>
+       new URL(path.join('/api/v1', endpoint), getWebsiteUrl()).toString(),
+     headers: () => ({
+       Authorization: `Bearer ${apiKey}`,
+       'user-agent': `ai-sdk/openai-compatible/${VERSION}/codebuff`,
++      // This build continues a turn whose gzip stream is cut mid-body, so the
++      // backend may gzip it (common/src/constants/sse-compression.ts).
++      [FREEBUFF_SSE_GZIP_RECOVERY_HEADER]: FREEBUFF_SSE_GZIP_RECOVERY_VALUE,
+       ...(userId ? { [FREEBUFF_ACTING_USER_HEADER]: userId } : {}),
+       ...(openrouterApiKey && { [BYOK_OPENROUTER_HEADER]: openrouterApiKey }),
+     }),
+     metadataExtractor: {
+       extractMetadata: async ({ parsedBody }: { parsedBody: any }) => {
+         if (openrouterApiKey !== undefined) {
+           return { codebuff: { usage: openrouterUsage } }
+         }
+ 
+         if (typeof parsedBody?.usage?.cost === 'number') {
+           openrouterUsage.cost = parsedBody.usage.cost
+         }
+         if (
+           typeof parsedBody?.usage?.cost_details?.upstream_inference_cost ===
+           'number'
+         ) {
+           openrouterUsage.costDetails.upstreamInferenceCost =
+             parsedBody.usage.cost_details.upstream_inference_cost
+         }
+         return { codebuff: { usage: openrouterUsage } }
+       },
+       createStreamExtractor: () => ({
+         processChunk: (parsedChunk: any) => {
+           if (openrouterApiKey !== undefined) {
+             return
