@@ -1,0 +1,1288 @@
+Date: 2026-10-09T08:07:34Z
+Category: SDK
+Areas: Shared/Core, SDK
+Commit nature: production
+Stats: +96 / -43
+Analysis notes: New files: `common/src/constants/sse-compression.ts`.
+Added files: common/src/constants/sse-compression.ts
+Modified files: sdk/src/impl/model-provider.ts
+Key facts (ground the WHY and DETAIL sentences in these): - The server gzips the stream only for requests carrying it (web/src/app/api/v1/chat/completions/sse-compression-gate.ts). Builds from before the recovery send no header and get the uncompressed stream, which a cut ends cleanly and they already continue from. - This build continues a turn whose gzip stream is cut mid-body, so the backend may gzip it (common/src/constants/sse-compression.ts).
+Structured facts (extracted mechanically from the diff; copy names and values verbatim, never round or rename):
+- Constants newly defined: FREEBUFF_SSE_GZIP_RECOVERY_HEADER = 'x-freebuff-sse-gzip-recovery' ; FREEBUFF_SSE_GZIP_RECOVERY_VALUE = '1' (a definition alone changes nothing at runtime; if the diff shows no reader, say it is in place and does nothing yet)
+- Exports added: FREEBUFF_SSE_GZIP_RECOVERY_HEADER, FREEBUFF_SSE_GZIP_RECOVERY_VALUE
+- Behavior asserted by new tests (test titles, verbatim; the hunks themselves are omitted): "tells the backend it recovers a cut gzip stream, and never tells a BYOK provider"
+Module & File Purpose (ground-truth documentation from touched files):
+- File `sdk/src/impl/model-provider.ts`:
+```
+/**
+ * Builds the language model every request runs on: the Codebuff backend,
+ * which forwards to OpenRouter.
+ */
+```
+- File `common/src/constants/sse-compression.ts`:
+```
+/**
+ * Sent by the SDK on every chat-completions request to our backend: this
+ * build recovers a gzip SSE body that ends before the gzip stream does (Bun's
+ * `ZlibError`, a cut connection during a web deploy) by continuing the turn
+ * instead of failing it (COD-764, `TRANSIENT_NETWORK_ERROR_CODES` in
+ * common/src/util/error.ts).
+ *
+ * The server gzips the stream only for requests carrying it
+ * (web/src/app/api/v1/chat/completions/sse-compression-gate.ts). Builds from
+ * before the recovery send no header and get the uncompressed stream, which a
+ * cut ends cleanly and they already continue from.
+ */
+```
+Subsystem Architecture Documentation (from nearby package guides):
+- From `sdk/README.md`:
+```markdown
+# @codebuff/sdk
+
+Official SDK for Codebuff - AI coding agent and framework
+
+## Installation
+
+```bash
+npm install @codebuff/sdk
+```
+
+## Prerequisites
+
+- Create a Codebuff account and get your [Codebuff API key here](https://www.codebuff.com/api-keys).
+
+## Usage
+
+### Basic Example
+
+```typescript
+import { CodebuffClient } from '@codebuff/sdk'
+
+async function main() {
+  const client = new CodebuffClient({
+    //[freebuff product prompt text omitted]
+    // Get one here: https://www.codebuff.com/api-keys
+    apiKey: process.env.CODEBUFF_API_KEY,
+    cwd: process.cwd(),
+  })
+
+  // First run
+  const runState1 = await client.run({
+    // The agent id. Any agent on the store (https://codebuff.com/store)
+    agent: 'codebuff/base@0.0.16',
+    prompt: 'Create a simple calculator class',
+    handleEvent: (event) => {
+      // All events that happen during the run: agent start/finish, tool calls/results, text responses, errors.
+      console.log('Codebuff Event', JSON.stringify(event))
+    },
+  })
+
+  // Continue the same session with a follow-up
+  const runOrError2 = await client.run({
+    agent: 'codebuff/base@0.0.16',
+    prompt: 'Add unit tests for the calculator',
+    previousRun: runState1, // <-- this is where your next run differs from the previous run
+    handleEvent: (event) => {
+      console.log('Codebuff Event', JSON.stringify(event))
+    },
+  })
+}
+
+main()
+```
+
+### Example 2: Custom Agents and Tools
+
+Here, we create a full agent and custom tools that can be reused between runs.
+
+```typescript
+import { z } from 'zod/v4'
+
+import { CodebuffClient, getCustomToolDefinition } from '@codebuff/sdk'
+
+import type { AgentDefinition } from '@codebuff/sdk'
+
+async function main() {
+  const client = new CodebuffClient({
+    //[freebuff product prompt text omitted]
+    // Get it here: https://www.codebuff.com/profile?tab=api-keys
+    apiKey: process.env.CODEBUFF_API_KEY,
+    // Optional directory agent runs from (if applicable).
+    cwd: process.cwd(),
+  })
+
+  // Define your own custom agents!
+  const myCustomAgent: AgentDefinition = {
+    id: 'my-custom-agent',
+    model: 'google/gemini-3.1-flash-lite',
+    displayName: 'Sentiment analyzer',
+    toolNames: ['fetch_api_data'], // Defined below!
+```
+Complete Source of Modified Files (for complete module context):
+- File `sdk/src/impl/model-provider.ts` (771 lines):
+```
+/**
+ * Builds the language model every request runs on: the Codebuff backend,
+ * which forwards to OpenRouter.
+ */
+
+import path from 'path'
+
+import { BYOK_OPENROUTER_HEADER } from '@codebuff/common/constants/byok'
+import {
+  FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+  FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+} from '@codebuff/common/constants/freebuff-errors'
+import { FREEBUFF_ACTING_USER_HEADER } from '@codebuff/common/constants/freebuff-models'
+import {
+  FREEBUFF_SSE_GZIP_RECOVERY_HEADER,
+  FREEBUFF_SSE_GZIP_RECOVERY_VALUE,
+} from '@codebuff/common/constants/sse-compression'
+import { FREEBUFF_GATE_CODES } from '@codebuff/common/types/freebuff-session'
+import { isAbortError, isFetchIdleTimeoutError, isTransientNetworkError } from '@codebuff/common/util/error'
+import {
+  OpenAICompatibleChatLanguageModel,
+  VERSION,
+} from '@codebuff/llm-providers/openai-compatible'
+import { APICallError } from 'ai'
+
+import {
+  byokReasoningReplayRetryBody,
+  byokReasoningRetryBody,
+  byokRequestTransform,
+} from './byok-request'
+import {
+  chatCompletionsJson,
+  chatCompletionsStream,
+  chatGptResponsesBody,
+} from './chatgpt-responses'
+import {
+  CHATGPT_BYOK_PROVIDER,
+  CHATGPT_CODEX_RESPONSES_URL,
+  CHATGPT_ORIGINATOR,
+  CHATGPT_SIGN_IN_AGAIN,
+  ChatGptAuthError,
+  chatGptAccountId,
+} from '../chatgpt'
+import { getWebsiteUrl } from '../constants'
+import { getByokOpenrouterApiKeyFromEnv } from '../env'
+import { ByokConnectionStateError, byokCompletionUrl, byokCredentialVariable } from '../byok'
+import type { ResolvedByokConnection } from '../byok'
+
+import type { LanguageModel } from 'ai'
+
+/**
+ * Parameters for requesting a model.
+ */
+export interface ModelRequestParams {
+  /** Codebuff API key for backend authentication */
+  apiKey: string
+  /** Model ID (OpenRouter format, e.g., "anthropic/claude-sonnet-4") */
+  model: string
+  /** End user represented by a trusted service-account request. */
+  userId?: string
+  /** Direct, run-scoped credential. Never stored on the model or in metadata. */
+  byok?: ResolvedByokConnection
+  /** Host-supplied headers per backend request; see CodebuffRequestHeadersProvider. */
+  requestHeaders?: CodebuffRequestHeadersProvider
+}
+
+/**
+ * Extra headers for one request to the Codebuff backend's completions
+ * endpoint, computed as the request is about to go out. `body` is the exact
+ * string the AI SDK serialized (what goes on the wire), so a host can sign it;
+ * the provider is asked again for every retry. Never consulted for a BYOK run,
+ * whose requests go to the user's own provider.
+ *
+ * Returning nothing (or throwing) adds no headers. Freebuff's catalog clients
+ * use it for their catalog headers (docs/freebuff-model-catalog.md).
+ */
+export type CodebuffRequestHeadersProvider = (request: {
+  method: string
+  url: string
+  body: string | Uint8Array | undefined
+}) =>
+  | Record<string, string>
+  | undefined
+  | Promise<Record<string, string> | undefined>
+
+// Usage accounting type for OpenRouter/Codebuff backend responses
+type OpenRouterUsageAccounting = {
+  cost: number | null
+  costDetails: {
+    upstreamInferenceCost: number | null
+  }
+}
+
+/**
+ * Notification hook for free-mode capacity deferrals. When the backend sheds
+ * a free-mode completion under saturation (HTTP 429 with
+ * `error: 'free_mode_capacity_deferred'` — see the server's
+ * free-mode-priority.ts), the AI SDK's retry loop absorbs the wait silently.
+ * Hosts (the CLI) can register here to surface a "high demand" indicator
+ * instead of an unexplained pause.
+ */
+export type FreeModeCapacityDeferral = { retryAfterSeconds: number }
+
+let freeModeCapacityDeferralListener:
+  | ((deferral: FreeModeCapacityDeferral) => void)
+  | null = null
+
+export function setFreeModeCapacityDeferralListener(
+  listener: ((deferral: FreeModeCapacityDeferral) => void) | null,
+): void {
+  freeModeCapacityDeferralListener = listener
+}
+
+function notifyCapacityDeferralFromResponse(response: Response): void {
+  if (response.status !== 429 || !freeModeCapacityDeferralListener) return
+  // Clone so the AI SDK still reads the original body for its own error
+  // handling/retry. Both the parse and the listener are best-effort: a
+  // malformed body or throwing listener must never break the request path.
+  void response
+    .clone()
+    .json()
+    .then((body: unknown) => {
+      const error =
+        body && typeof body === 'object' ? (body as any).error : undefined
+      if (error !== 'free_mode_capacity_deferred') return
+      const retryAfterHeader = Number(response.headers.get('retry-after'))
+      freeModeCapacityDeferralListener?.({
+        retryAfterSeconds:
+          Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+            ? retryAfterHeader
+            : 10,
+      })
+    })
+    .catch(() => {})
+}
+
+function requestUrlOf(input: Parameters<typeof globalThis.fetch>[0]): string {
+  return typeof input === 'string'
+    ? input
+    : input instanceof URL
+      ? input.toString()
+      : input.url
+}
+
+/** Retain recovery classification, never provider messages, URLs or raw causes. */
+export function sanitizeByokTransportError(error: unknown): Error {
+  if (isAbortError(error)) return new DOMException('BYOK request aborted', 'AbortError')
+  const safe = new Error('BYOK provider stream failed')
+  if (isFetchIdleTimeoutError(error)) {
+    Object.assign(safe, { code: 'ETIMEDOUT' })
+  } else if (isTransientNetworkError(error)) {
+    Object.assign(safe, { code: 'ECONNRESET' })
+  }
+  return safe
+}
+
+/** Preserve streaming while removing a credential even when it crosses chunks. */
+export function redactProviderStream(
+  body: ReadableStream<Uint8Array> | null,
+  secret: string,
+): ReadableStream<Uint8Array> | null {
+  if (!body || !secret) return body
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  let pending = ''
+  const retain = Math.max(0, secret.length - 1)
+  const redact = (text: string) => text.split(secret).join('[redacted]')
+  const transformed = body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      pending += decoder.decode(chunk, { stream: true })
+      let boundary = Math.max(0, pending.length - retain)
+      // Do not emit the prefix of a complete secret just because its suffix
+      // happens to be in the retained tail. Extend the safe boundary through
+      // every complete match that starts before it, then redact as one unit.
+      for (let start = pending.indexOf(secret); start !== -1; start = pending.indexOf(secret, start + secret.length)) {
+        if (start >= boundary) break
+        boundary = Math.max(boundary, start + secret.length)
+      }
+      controller.enqueue(encoder.encode(redact(pending.slice(0, boundary))))
+      pending = pending.slice(boundary)
+    },
+    flush(controller) {
+      pending += decoder.decode()
+      controller.enqueue(encoder.encode(redact(pending)))
+    },
+  }))
+  const reader = transformed.getReader()
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read()
+        if (next.done) controller.close()
+        else controller.enqueue(next.value)
+      } catch (error) {
+        controller.error(sanitizeByokTransportError(error))
+      }
+    },
+    cancel() { return reader.cancel().catch(() => {}) },
+  })
+}
+
+/**
+ * Does this provider error body say the MODEL ID is wrong?
+ *
+ * A mistyped model is the most common BYOK 400/404, and the provider usually
+ * says so plainly — DeepSeek answers `The supported API model names are
+ * deepseek-flash, deepseek-v4-pro, but you passed deepseek/deepseek-v4-flash`,
+ * OpenAI and Groq `The model \`x\` does not exist`, OpenRouter `x is not a
+ * valid model ID`. Behind the fixed "request failed (HTTP 400). Check the
+ * provider settings" line a user cannot tell that from a malformed request
+ * (support email, 2026-09-23: a DeepSeek key that "always" failed on one model
+ * id and worked on another). The body is only CLASSIFIED here; its text never
+ * reaches the message, which is built from the connection's own model id.
+ */
+export function isByokModelIdRejection(body: string): boolean {
+  if (!body) return false
+  const text = body.slice(0, 16_384)
+  return BYOK_MODEL_REJECTION_PATTERNS.some((pattern) => pattern.test(text))
+}
+
+/** Each names the MODEL as what is wrong, so an unrelated 400 that merely
+ *  mentions a model elsewhere in its body is not reclassified. */
+const BYOK_MODEL_REJECTION_PATTERNS: readonly RegExp[] = [
+  /"code"\s*:\s*"model_not_found"/i,
+  // The model — optionally followed by ONE id token (bare, quoted or
+  // `models/…`) — is itself the subject: "The model `x` does not exist",
+  // "models/gemini-9 is not found", "Model not found". Anything between the id
+  // and the verdict means something else is what failed: "model x: image
+  // input is not supported" is a capability refusal on a valid id, and
+  // calling it a bad id would send the user to fix the wrong thing.
+  /\bmodels?\b\s*[:=]?\s*(?:`[^`\n]{1,120}`|'[^'\n]{1,120}'|\\?"[^"\n]{1,120}?\\?"|[\w./:@+-]{1,120})?\s+(?:is\s+|was\s+)?(?:does not exist|not exist|not found|not supported)\b/i,
+  /\b(?:invalid|unknown|no such|not a valid|unable to access) model\b/i,
+  /\bsupported (?:api )?model(?: name)?s? (?:are|is)\b/i,
+]
+
+const MAX_MODEL_ID_IN_MESSAGE = 120
+
+/** A fixed, actionable message for a provider status. Never include upstream
+ * response text: gateways commonly echo credential fragments in error bodies.
+ * `modelRejected` is a classification of that text (isByokModelIdRejection),
+ * and `model` is the connection's own configured id — both ours to show. */
+export function getByokProviderErrorMessage(
+  status: number,
+  detail: {
+    model?: string
+    modelRejected?: boolean
+    /** The environment variable the key came from, a NAME and never a value. */
+    credentialVariable?: string
+  } = {},
+): string {
+  if (
+    detail.modelRejected &&
+    (status === 400 || status === 404 || status === 422)
+  ) {
+    const model = (detail.model ?? '').slice(0, MAX_MODEL_ID_IN_MESSAGE)
+    const named = model ? ` "${model}"` : ''
+    return `BYOK provider does not recognise the model ID${named} (HTTP ${status}). Use the exact model name from the provider's API model list and retry.`
+  }
+  if (status === 401)
+    return detail.credentialVariable
+      ? `BYOK provider rejected the API key in ${detail.credentialVariable} (HTTP 401). ${detail.credentialVariable} is set in this Freebuff process; check that it holds the key this endpoint expects, then restart Freebuff from that terminal.`
+      : 'BYOK provider rejected the API key (HTTP 401). Check or replace the key.'
+  if (status === 403)
+    return 'BYOK API key cannot access this model or account (HTTP 403). Choose an allowed model or use another key.'
+  if (status === 402)
+    return 'BYOK provider account needs credits or a supported plan (HTTP 402). Add provider credit or choose another model.'
+  if (status === 404)
+    return 'BYOK provider could not find this model or endpoint (HTTP 404). Check the model ID and provider URL.'
+  if (status === 429)
+    return 'BYOK provider rate limit reached (HTTP 429). Wait, then retry the task.'
+  if (status >= 500)
+    return `BYOK provider is temporarily unavailable (HTTP ${status}). Retry the task later.`
+  return `BYOK provider request failed (HTTP ${status}). Check the provider settings and retry.`
+}
+
+export const BYOK_CONNECTION_FAILURE_MESSAGE =
+  'Could not connect to the BYOK provider. Check the provider URL and network connection, then retry.'
+
+/**
+ * Refusals the server makes on purpose and repeats IDENTICALLY on a retry,
+ * each identified by its status AND its `error` code — never the status alone,
+ * since 409 and 429 are also ordinary, retryable answers.
+ *
+ * Left to the AI SDK, which treats every 409 and 429 as retryable, each of
+ * these was asked four times with backoff (~14s) and then failed as "Failed
+ * after 4 attempts. Last error: …". Throwing a NON-retryable APICallError
+ * stops the retry loop on the first refusal, and carrying the body lets the
+ * runtime's error parser hand the server's own copy and code to the client
+ * unchanged.
+ *
+ * - `turn_spend_limit` (429): the per-turn spend breaker is final for THIS
+ *   turn — its spend only grows, so the same run id is refused every time.
+ *   Clients read the retried failure as an ordinary rate limit and answered
+ *   it with "wait a moment or switch models", neither of which helps.
+ * - `session_superseded` (409): the start was refunded (the Desktop purchase
+ *   claim, or a refund that closed admission) or the session was taken over
+ *   by another instance. The row is gone, so every retry gets the same 409;
+ *   the user waited ~14s for the card that tells them to start a new session
+ *   (5,392 runs / 2,230 users in the 72h to 2026-10-05).
+ * - `model_at_capacity` (503): a queued free model had no slot within the
+ *   request's wait budget (web/.../model-queue.ts). Each retry re-enters the
+ *   queue and waits that budget again before the same refusal, so it is
+ *   surfaced at once — as its in-band form after the grace flush already is.
+ */
+const FINAL_REFUSALS: readonly {
+  status: number
+  error: string
+  /** Used only when the body carries no `message` of its own. */
+  fallbackMessage: string
+}[] = [
+  {
+    status: 429,
+    error: FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+    fallbackMessage: FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+  },
+  {
+    status: FREEBUFF_GATE_CODES.session_superseded.status,
+    error: 'session_superseded',
+    fallbackMessage:
+      'This Freebuff session has ended. Start a new session to try again.',
+  },
+  {
+    status: 503,
+    error: 'model_at_capacity',
+    fallbackMessage:
+      'This model is at capacity right now. Please try again in a few minutes or pick another model.',
+  },
+]
+
+async function throwIfFinalRefusal(
+  response: Response,
+  url: string,
+): Promise<void> {
+  // Only a status some refusal uses is worth reading the body for.
+  if (!FINAL_REFUSALS.some((r) => r.status === response.status)) return
+  const text = await response
+    .clone()
+    .text()
+    .catch(() => '')
+  let body: { error?: unknown; message?: unknown } | null = null
+  try {
+    body = JSON.parse(text)
+  } catch {
+    return
+  }
+  const refusal = FINAL_REFUSALS.find(
+    (r) => r.status === response.status && r.error === body?.error,
+  )
+  if (!refusal) return
+  throw new APICallError({
+    message:
+      typeof body?.message === 'string' && body.message
+        ? body.message
+        : refusal.fallbackMessage,
+    url,
+    requestBodyValues: {},
+    statusCode: response.status,
+    responseBody: text,
+    isRetryable: false,
+  })
+}
+
+/**
+ * Wrap global fetch so transient connection failures (socket closed/reset,
+ * connection refused) are rethrown as retryable APICallErrors, and the
+ * server's final refusals as non-retryable ones (see FINAL_REFUSALS).
+ *
+ * Bun's fetch throws these as plain Errors ("The socket connection was closed
+ * unexpectedly...", code ECONNRESET/ConnectionClosed), which the AI SDK does
+ * not recognize as retryable — it only auto-retries APICallError with
+ * isRetryable=true. Marking them retryable lets streamText's built-in
+ * exponential backoff (default 2 retries) absorb brief server/network blips
+ * instead of failing the whole agent run.
+ */
+function fetchWithRetryableNetworkErrors(
+  ...args: Parameters<typeof globalThis.fetch>
+): ReturnType<typeof globalThis.fetch> {
+  const url = requestUrlOf(args[0])
+  return globalThis.fetch(...args).then(
+    async (response) => {
+      notifyCapacityDeferralFromResponse(response)
+      await throwIfFinalRefusal(response, url)
+      return response
+    },
+    (error: unknown) => {
+      if (isTransientNetworkError(error)) {
+        throw new APICallError({
+          message: error instanceof Error ? error.message : String(error),
+          cause: error,
+          url,
+          requestBodyValues: {},
+          isRetryable: true,
+        })
+      }
+      throw error
+    },
+  )
+}
+
+function plainHeaders(headers: HeadersInit | undefined): Record<string, string> {
+  if (!headers) return {}
+  if (headers instanceof Headers) {
+    const out: Record<string, string> = {}
+    headers.forEach((value, key) => {
+      out[key] = value
+    })
+    return out
+  }
+  if (Array.isArray(headers)) return Object.fromEntries(headers)
+  return { ...(headers as Record<string, string>) }
+}
+
+/** `send`, with the host's extra headers merged in per request. */
+export function withCodebuffRequestHeaders(
+  provider: CodebuffRequestHeadersProvider,
+  send: (...args: Parameters<typeof globalThis.fetch>) => ReturnType<typeof globalThis.fetch>,
+): (...args: Parameters<typeof globalThis.fetch>) => ReturnType<typeof globalThis.fetch> {
+  return async (input, init) => {
+    const raw = init?.body
+    // Only a body whose exact bytes can be handed over; anything else (a
+    // stream) goes out without extra headers rather than with wrong ones.
+    if (raw != null && typeof raw !== 'string' && !(raw instanceof Uint8Array))
+      return send(input, init)
+    let extra: Record<string, string> | undefined
+    try {
+      extra = await provider({
+        method: (init?.method ?? 'GET').toUpperCase(),
+        url: requestUrlOf(input),
+        body: raw ?? undefined,
+      })
+    } catch {
+      extra = undefined
+    }
+    if (!extra || Object.keys(extra).length === 0) return send(input, init)
+    return send(input, {
+      ...init,
+      headers: { ...plainHeaders(init?.headers), ...extra },
+    })
+  }
+}
+
+/**
+ * Get the model for a request: one that routes through the Codebuff backend,
+ * which forwards to OpenRouter.
+ */
+export function getModelForRequest({
+  apiKey,
+  model,
+  userId,
+  byok,
+  requestHeaders,
+}: ModelRequestParams): LanguageModel {
+  if (byok?.provider === CHATGPT_BYOK_PROVIDER) return chatGptModel(byok)
+  if (byok) {
+    return new OpenAICompatibleChatLanguageModel(byok.model, {
+      provider: 'byok',
+      transformRequestBody: byokRequestTransform(byok),
+      url: () => byokCompletionUrl(byok),
+      headers: () => ({
+        Authorization: `Bearer ${byok.apiKey}`,
+        'user-agent': `ai-sdk/openai-compatible/${VERSION}/freebuff-byok`,
+      }),
+      // Check the durable revision before every provider attempt. The AI SDK
+      // invokes this again on retries and later tool-loop steps, so removing
+      // or replacing a connection stops subsequent inference immediately.
+      fetch: (async (...args: Parameters<typeof globalThis.fetch>) => {
+        // Revocation is a durable policy decision, never a transport retry.
+        try {
+          await byok.assertCurrent?.()
+        } catch (error) {
+          // Only our typed state errors carry display-safe messages. Custom
+          // resolvers and filesystem errors may contain credentials or paths.
+          throw new Error(
+            error instanceof ByokConnectionStateError
+              ? error.message
+              : 'Could not verify the saved BYOK connection. Reselect the provider and retry. If the problem persists, fully quit and restart Freebuff.',
+          )
+        }
+        try {
+          const send = (init: RequestInit | undefined) =>
+            globalThis.fetch(args[0], { ...(init ?? {}), redirect: 'error' })
+          let response = await send(args[1])
+          let body = args[1]?.body
+          let errorText: string | undefined
+          // A provider or model that refuses the picked reasoning effort, or
+          // replayed reasoning on assistant messages, still answers the task:
+          // once per field, without it, remembered for the connection so
+          // later steps do not send it again.
+          for (const retry of [
+            byokReasoningRetryBody,
+            byokReasoningReplayRetryBody,
+          ]) {
+            if (response.status !== 400 && response.status !== 422) break
+            errorText ??= await response.text().catch(() => '')
+            const retryBody = retry(byok, body, response.status, errorText)
+            if (retryBody === undefined) continue
+            body = retryBody
+            response = await send({ ...(args[1] ?? {}), body })
+            errorText = undefined
+          }
+          if (!response.ok) {
+            const modelRejected =
+              response.status === 400 ||
+              response.status === 404 ||
+              response.status === 422
+                ? isByokModelIdRejection(
+                    errorText ?? (await response.text().catch(() => '')),
+                  )
+                : false
+            const headers = new Headers({ 'content-type': 'application/json' })
+            // Keep scheduling hints, but never copy arbitrary provider headers.
+            for (const name of ['retry-after', 'retry-after-ms']) {
+              const value = response.headers.get(name)
+              if (value && /^\d+(?:\.\d+)?$/.test(value)) headers.set(name, value)
+            }
+            return new Response(
+              JSON.stringify({
+                error: {
+                  message: getByokProviderErrorMessage(response.status, {
+                    model: byok.model,
+                    modelRejected,
+                    credentialVariable: byokCredentialVariable(byok),
+                  }),
+                },
+              }),
+              { status: response.status, headers },
+            )
+          }
+          return new Response(redactProviderStream(response.body, byok.apiKey), {
+            status: response.status,
+            headers: {
+              'content-type': response.headers.get('content-type') ?? 'text/event-stream',
+            },
+          })
+        } catch (error) {
+          const safe = sanitizeByokTransportError(error)
+          if (args[1]?.signal?.aborted || isAbortError(safe)) {
+            throw new DOMException('BYOK request aborted', 'AbortError')
+          }
+          throw new APICallError({
+            message: BYOK_CONNECTION_FAILURE_MESSAGE,
+            url: 'byok-provider',
+            requestBodyValues: {},
+            cause: safe,
+            isRetryable: isTransientNetworkError(safe),
+          })
+        }
+      }) as typeof globalThis.fetch,
+      includeUsage: true,
+      supportsStructuredOutputs: true,
+    })
+  }
+  const openrouterUsage: OpenRouterUsageAccounting = {
+    cost: null,
+    costDetails: {
+      upstreamInferenceCost: null,
+    },
+  }
+
+  const openrouterApiKey = getByokOpenrouterApiKeyFromEnv()
+
+  return new OpenAICompatibleChatLanguageModel(model, {
+    provider: 'codebuff',
+    url: ({ path: endpoint }) =>
+      new URL(path.join('/api/v1', endpoint), getWebsiteUrl()).toString(),
+    headers: () => ({
+      Authorization: `Bearer ${apiKey}`,
+      'user-agent': `ai-sdk/openai-compatible/${VERSION}/codebuff`,
+      // This build continues a turn whose gzip stream is cut mid-body, so the
+      // backend may gzip it (common/src/constants/sse-compression.ts).
+      [FREEBUFF_SSE_GZIP_RECOVERY_HEADER]: FREEBUFF_SSE_GZIP_RECOVERY_VALUE,
+      ...(userId ? { [FREEBUFF_ACTING_USER_HEADER]: userId } : {}),
+      ...(openrouterApiKey && { [BYOK_OPENROUTER_HEADER]: openrouterApiKey }),
+    }),
+    metadataExtractor: {
+      extractMetadata: async ({ parsedBody }: { parsedBody: any }) => {
+        if (openrouterApiKey !== undefined) {
+          return { codebuff: { usage: openrouterUsage } }
+        }
+
+        if (typeof parsedBody?.usage?.cost === 'number') {
+          openrouterUsage.cost = parsedBody.usage.cost
+        }
+        if (
+          typeof parsedBody?.usage?.cost_details?.upstream_inference_cost ===
+          'number'
+        ) {
+          openrouterUsage.costDetails.upstreamInferenceCost =
+            parsedBody.usage.cost_details.upstream_inference_cost
+        }
+        return { codebuff: { usage: openrouterUsage } }
+      },
+      createStreamExtractor: () => ({
+        processChunk: (parsedChunk: any) => {
+          if (openrouterApiKey !== undefined) {
+            return
+          }
+
+          if (typeof parsedChunk?.usage?.cost === 'number') {
+            openrouterUsage.cost = parsedChunk.usage.cost
+          }
+          if (
+            typeof parsedChunk?.usage?.cost_details?.upstream_inference_cost ===
+            'number'
+          ) {
+            openrouterUsage.costDetails.upstreamInferenceCost =
+              parsedChunk.usage.cost_details.upstream_inference_cost
+          }
+        },
+        buildMetadata: () => {
+          return { codebuff: { usage: openrouterUsage } }
+        },
+      }),
+    },
+    // Cast: Bun's fetch type also declares a `preconnect` helper, but the AI
+    // SDK only ever invokes fetch as a plain function.
+    fetch: (requestHeaders
+      ? withCodebuffRequestHeaders(
+          requestHeaders,
+          fetchWithRetryableNetworkErrors,
+        )
+      : fetchWithRetryableNetworkErrors) as typeof globalThis.fetch,
+    includeUsage: undefined,
+    supportsStructuredOutputs: true,
+  })
+}
+
+/**
+ * A fixed, actionable message for a ChatGPT-plan HTTP failure. The body is
+ * only classified, never shown: it can echo the request.
+ */
+export function getChatGptErrorMessage(
+  status: number,
+  detail: { model: string; body: string },
+): string {
+  const model = detail.model.slice(0, MAX_MODEL_ID_IN_MESSAGE)
+  if (status === 401) return CHATGPT_SIGN_IN_AGAIN
+  if (status === 429 || /usage_limit|rate_limit/i.test(detail.body))
+    return 'You have reached your ChatGPT plan’s usage limit. Wait for it to reset, or choose a Freebuff model to continue.'
+  if (status === 403)
+    return `Your ChatGPT plan cannot use "${model}" (HTTP 403). Choose another model or check your plan.`
+  if (
+    (status === 400 || status === 404) &&
+    (isByokModelIdRejection(detail.body) ||
+      /model.{0,80}(?:not supported|unsupported|not available|does not exist)/i.test(
+        detail.body.slice(0, 16_384),
+      ))
+  )
+    return `ChatGPT does not offer "${model}" on your plan (HTTP ${status}). Choose another model.`
+  if (status >= 500)
+    return `ChatGPT is temporarily unavailable (HTTP ${status}). Retry the task later.`
+  return `ChatGPT could not run this request (HTTP ${status}). Retry, or choose another model.`
+}
+
+/**
+ * The user's ChatGPT plan through the Codex backend. The request is the same
+ * Chat Completions body as any BYOK model, translated to the Responses API in
+ * this fetch; the access token is read per request, so a long run outlives
+ * the token it started with.
+ */
+function chatGptModel(byok: ResolvedByokConnection): LanguageModel {
+  const transform = byokRequestTransform(byok)
+  return new OpenAICompatibleChatLanguageModel(byok.model, {
+    provider: 'byok',
+    transformRequestBody: transform,
+    url: () => CHATGPT_CODEX_RESPONSES_URL,
+    headers: () => ({
+      'user-agent': `ai-sdk/openai-compatible/${VERSION}/freebuff-chatgpt`,
+    }),
+    fetch: (async (...args: Parameters<typeof globalThis.fetch>) => {
+      const init = args[1] ?? {}
+      let token: string
+      try {
+        await byok.assertCurrent?.()
+        token = byok.accessToken ? await byok.accessToken() : byok.apiKey
+      } catch (error) {
+        throw new Error(
+          error instanceof ByokConnectionStateError ||
+            error instanceof ChatGptAuthError
+            ? error.message
+            : 'Could not use your ChatGPT sign-in. Sign in with ChatGPT again in API provider settings.',
+        )
+      }
+      let body: Record<string, unknown>
+      try {
+        body = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>
+      } catch {
+        throw new Error('Could not prepare the ChatGPT request.')
+      }
+      const streamed = body.stream === true
+      const accountId = chatGptAccountId(token)
+      try {
+        const response = await globalThis.fetch(CHATGPT_CODEX_RESPONSES_URL, {
+          method: 'POST',
+          signal: init.signal,
+          redirect: 'error',
+          headers: {
+            'content-type': 'application/json',
+            accept: 'text/event-stream',
+            authorization: `Bearer ${token}`,
+            originator: CHATGPT_ORIGINATOR,
+            'openai-beta': 'responses=experimental',
+            'user-agent': `ai-sdk/openai-compatible/${VERSION}/freebuff-chatgpt`,
+            ...(accountId ? { 'chatgpt-account-id': accountId } : {}),
+          },
+          body: JSON.stringify(chatGptResponsesBody(body)),
+        })
+        if (!response.ok || !response.body) {
+          const text = await response.text().catch(() => '')
+          const message = getChatGptErrorMessage(response.status, {
+            model: byok.model,
+            body: text,
+          })
+          // A spent plan or a revoked sign-in answers the same on a retry.
+          if (
+            response.status === 401 ||
+            response.status === 403 ||
+            response.status === 429 ||
+            /usage_limit/i.test(text)
+          )
+            throw new APICallError({
+              message,
+              url: 'chatgpt',
+              requestBodyValues: {},
+              statusCode: response.status,
+              isRetryable: false,
+            })
+          const headers = new Headers({ 'content-type': 'application/json' })
+          for (const name of ['retry-after', 'retry-after-ms']) {
+            const value = response.headers.get(name)
+            if (value && /^\d+(?:\.\d+)?$/.test(value)) headers.set(name, value)
+          }
+          return new Response(JSON.stringify({ error: { message } }), {
+            status: response.ok ? 502 : response.status,
+            headers,
+          })
+        }
+        if (streamed)
+          return new Response(
+            redactProviderStream(chatCompletionsStream(response.body), token),
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        const completion = await chatCompletionsJson(response.body)
+        return new Response(
+          JSON.stringify(completion.json).split(token).join('[redacted]'),
+          {
+            status: completion.status,
+            headers: { 'content-type': 'application/json' },
+          },
+        )
+      } catch (error) {
+        if (error instanceof APICallError) throw error
+        const safe = sanitizeByokTransportError(error)
+        if (init.signal?.aborted || isAbortError(safe)) {
+          throw new DOMException('ChatGPT request aborted', 'AbortError')
+        }
+        throw new APICallError({
+          message:
+            'Could not connect to ChatGPT. Check your network connection, then retry.',
+          url: 'chatgpt',
+          requestBodyValues: {},
+          cause: safe,
+          isRetryable: isTransientNetworkError(safe),
+        })
+      }
+    }) as typeof globalThis.fetch,
+    includeUsage: true,
+    supportsStructuredOutputs: true,
+  })
+}
+```
+- File `common/src/constants/sse-compression.ts` (15 lines):
+```
+/**
+ * Sent by the SDK on every chat-completions request to our backend: this
+ * build recovers a gzip SSE body that ends before the gzip stream does (Bun's
+ * `ZlibError`, a cut connection during a web deploy) by continuing the turn
+ * instead of failing it (COD-764, `TRANSIENT_NETWORK_ERROR_CODES` in
+ * common/src/util/error.ts).
+ *
+ * The server gzips the stream only for requests carrying it
+ * (web/src/app/api/v1/chat/completions/sse-compression-gate.ts). Builds from
+ * before the recovery send no header and get the uncompressed stream, which a
+ * cut ends cleanly and they already continue from.
+ */
+export const FREEBUFF_SSE_GZIP_RECOVERY_HEADER = 'x-freebuff-sse-gzip-recovery'
+export const FREEBUFF_SSE_GZIP_RECOVERY_VALUE = '1'
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `sdk/src/impl/__tests__/delegated-user-header.test.ts` (6 matching lines):
+```
+import { isAbortError, isTransientNetworkError } from '@codebuff/common/util/error'
+import { FREEBUFF_ACTING_USER_HEADER } from '@codebuff/common/constants/freebuff-models'
+import {
+  FREEBUFF_SSE_GZIP_RECOVERY_HEADER,
+  FREEBUFF_SSE_GZIP_RECOVERY_VALUE,
+} from '@codebuff/common/constants/sse-compression'
+import { afterEach, describe, expect, mock, test } from 'bun:test'
+
+import { addAgentStep, finishAgentRun, startAgentRun } from '../database'
+import {
+  BYOK_CONNECTION_FAILURE_MESSAGE,
+  getByokProviderErrorMessage,
+  getModelForRequest,
+  isByokModelIdRejection,
+  redactProviderStream,
+  sanitizeByokTransportError,
+} from '../model-provider'
+import { streamText } from 'ai'
+```
+- File `cli/src/utils/image-handler.ts` (3 matching lines):
+```
+}
+
+interface CompressionResult {
+  success: boolean
+  buffer?: Buffer
+  base64?: string
+  mediaType?: string
+  width?: number
+  height?: number
+  error?: string
+}
+
+// Compression settings for iterative compression
+const COMPRESSION_QUALITIES = [85, 70, 50, 30]
+const DIMENSION_LIMITS = [1500, 1200, 800, 600]
+
+/**
+ * Normalizes a user-provided file path by handling escape sequences.
+ */
+function normalizeUserProvidedPath(filePath: string): string {
+  let normalized = filePath
+
+  // Handle unicode escape sequences (e.g., from terminal copy/paste)
+  normalized = normalized.replace(/\\u\{([0-9a-fA-F]+)\}|\\u([0-9a-fA-F]{4})/g, (_, bracedCode, shortCode) => {
+    const code = bracedCode || shortCode
+…
+return {
+          success: true,
+          buffer: testBuffer,
+          base64: testBase64,
+          mediaType: 'image/jpeg',
+          width: testImage.bitmap.width,
+          height: testImage.bitmap.height,
+        }
+      }
+    }
+  }
+
+  // No compression attempt succeeded
+  const bestSizeKB = (bestBase64Size / 1024).toFixed(1)
+  const maxKB = (MAX_IMAGE_BASE64_SIZE / 1024).toFixed(1)
+  const originalKB = (fileBuffer.toString('base64').length / 1024).toFixed(1)
+
+  return {
+    success: false,
+    error: `Image too large even after ${attemptCount} compression attempts. Original: ${originalKB}KB, best compressed: ${bestSizeKB}KB (max ${maxKB}KB). Try using a smaller image.`,
+  }
+}
+
+/**
+ * Processes an image file and converts it to base64 for upload.
+…
+const image = await Jimp.read(fileBuffer)
+      processedBuffer = Buffer.from(await image.getBuffer('image/png'))
+      finalMediaType = 'image/png'
+    } catch (error) {
+      logger.debug({ resolvedPath, error }, 'Image handler: Failed to transcode to PNG')
+      return {
+        success: false,
+        error: `Unsupported image format: ${filePath}. Convert it to PNG or JPEG and try again.`,
+      }
+    }
+  }
+
+  // Check if compression is needed
+  let base64Data = processedBuffer.toString('base64')
+  let wasCompressed = false
+
+  if (base64Data.length > MAX_IMAGE_BASE64_SIZE) {
+    const compressionResult = await compressImageToFitSize(processedBuffer)
+    
+    if (!compressionResult.success) {
+      return { success: false, error: compressionResult.error }
+    }
+
+    base64Data = compressionResult.base64!
+    processedBuffer = compressionResult.buffer!
+```
+- File `cli/src/utils/__tests__/image-dimensions.test.ts` (2 matching lines):
+```
+const color = ((r << 24) | (g << 16) | (b << 8) | a) >>> 0
+          largeImage.setPixelColor(color, x, y)
+        }
+      }
+      await largeImage.write(
+        path.join(TEST_DIR, 'large-2000x1000.png') as `${string}.${string}`,
+      )
+
+      const result = await processImageFile('large-2000x1000.png', TEST_DIR)
+
+      expect(result.success).toBe(true)
+      expect(result.imagePart).toBeDefined()
+      // Dimensions should be defined even after compression
+      expect(result.imagePart!.width).toBeDefined()
+      expect(result.imagePart!.height).toBeDefined()
+      // After compression, dimensions should be reduced
+      if (result.wasCompressed) {
+        expect(result.imagePart!.width).toBeLessThanOrEqual(1500) // Max dimension limit
+        expect(result.imagePart!.height).toBeLessThanOrEqual(1500)
+      }
+    })
+  })
+
+  describe('calculateDisplaySize', () => {
+    const CELL_ASPECT_RATIO = 2 // Terminal cells are ~2:1 height:width
+
+    test('should scale wide image to fit available width while preserving aspect ratio', () => {
+      const result = calculateDisplaySize({
+```
+- File `sdk/src/impl/__tests__/sse-gzip-incremental-decode.test.ts` (2 matching lines):
+```
+/**
+ * COD-764 client-compat check: web/src/app/api/v1/chat/completions/
+ * sse-compression.ts can gzip/br-compress the SSE body, flushing after every
+ * event so a compressed chunk is independently decodable as soon as it's
+ * sent. This file proves the OTHER half of that contract — that the client
+ * stack users actually run (the AI SDK's OpenAI-compatible provider, backed
+ * by the runtime's own `fetch`, exactly as `model-provider.ts` wires it when
+ * no custom `fetch` is supplied) decodes a `Content-Encoding: gzip` SSE
+ * response INCREMENTALLY, not by buffering the whole body until the
+ * connection closes.
+ *
+ * It serves real gzip bytes over a real loopback TCP connection — through
+ * Node's zlib with the same per-chunk `Z_SYNC_FLUSH` the server-side
+ * compressor uses — and asserts that text deltas arrive spread out over
+ * time, matching the server's artificial per-chunk delay, rather than all
+…
+},
+    ],
+  })}\n\n`
+
+const finalChunk = () =>
+  `data: ${JSON.stringify({
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+  })}\n\n`
+
+/**
+ * Serves a gzip-compressed SSE stream, one upstream "provider" chunk at a
+ * time, with a real delay and an explicit sync flush between each — the
+ * same shape sse-compression.ts produces for a real completions request.
+ */
+async function serveGzipSse(events: string[], delayMs: number) {
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Content-Encoding': 'gzip',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    })
+    const gzip = createGzip()
+    gzip.on('data', (chunk: Buffer) => res.write(chunk))
+    gzip.on('end', () => res.end())
+```
+- File `cli/src/utils/pending-attachments.ts` (1 matching line):
+```
+/**
+ * Exit image input mode if currently active.
+ * Called after successfully adding an image via paste or path.
+ */
+function exitImageModeIfActive(): void {
+  if (useChatStore.getState().inputMode === 'image') {
+    useChatStore.getState().setInputMode('default')
+  }
+}
+
+/**
+ * Process an image file and add it to the pending images state.
+ * This handles compression/resizing and caches the result so we don't
+ * need to reprocess at send time.
+ * 
+ * @param replacePlaceholder - If provided, replaces an existing placeholder entry instead of adding new
+ */
+export async function addPendingImageFromFile(
+  imagePath: string,
+  cwd: string,
+  replacePlaceholder?: string,
+): Promise<void> {
+  const filename = path.basename(imagePath)
+  
+  if (replacePlaceholder) {
+```
+- File `common/src/constants/images.ts` (1 matching line):
+```
+/**
+ * Image extensions as a regex alternation pattern (without dots)
+ * e.g., "jpg|jpeg|png|webp|gif|bmp|tiff|tif"
+ */
+export const IMAGE_EXTENSIONS_PATTERN = Object.keys(IMAGE_EXTENSION_TO_MIME)
+  .map((ext) => ext.slice(1)) // Remove leading dot
+  .join('|')
+
+// Size limits for image uploads
+// Research shows Claude/GPT-4V support up to 20MB, but we use practical limits
+// for good performance and token efficiency
+export const MAX_IMAGE_FILE_SIZE = 10 * 1024 * 1024 // 10MB - allow larger files since we can compress
+export const MAX_IMAGE_BASE64_SIZE = 1 * 1024 * 1024 // 1MB max for base64 after compression
+export const MAX_TOTAL_IMAGE_SIZE = 5 * 1024 * 1024 // 5MB total for multiple images
+```
+Tests this commit changed (added lines only; the assertions are what the change is expected to do, not a description of the feature):
+- File `sdk/src/impl/__tests__/delegated-user-header.test.ts`: "tells the backend it recovers a cut gzip stream, and never tells a BYOK provider"
+```
+import {
+  FREEBUFF_SSE_GZIP_RECOVERY_HEADER,
+  FREEBUFF_SSE_GZIP_RECOVERY_VALUE,
+} from '@codebuff/common/constants/sse-compression'
+  test('tells the backend it recovers a cut gzip stream, and never tells a BYOK provider', async () => {
+    const backend = getModelForRequest({ apiKey: 'user-key', model: 'test/model' })
+    expect((backend as any).config.headers()).toMatchObject({
+      [FREEBUFF_SSE_GZIP_RECOVERY_HEADER]: FREEBUFF_SSE_GZIP_RECOVERY_VALUE,
+    })
+    let byokHeaders = new Headers()
+    globalThis.fetch = mock(async (_input, init) => {
+      byokHeaders = new Headers(init?.headers)
+      return new Response('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    }) as unknown as typeof fetch
+    const result = streamText({
+      model: getModelForRequest({
+        apiKey: 'ignored', model: 'ignored',
+        byok: { id: 'conn', revision: 1, name: 'local', provider: 'openai-compatible', baseUrl: 'http://127.0.0.1:9876/v1', model: 'selected/model', credentialRef: 'connection:conn', createdAt: 'x', updatedAt: 'x', apiKey: 'key' },
+      }),
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    await result.text
+    expect(byokHeaders.has(FREEBUFF_SSE_GZIP_RECOVERY_HEADER)).toBe(false)
+  })
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/common/src/constants/sse-compression.ts b/common/src/constants/sse-compression.ts
+new file mode 100644
+index 000000000..a079479a3
+--- /dev/null
++++ b/common/src/constants/sse-compression.ts
+@@ -0,0 +1,14 @@
++/**
++ * Sent by the SDK on every chat-completions request to our backend: this
++ * build recovers a gzip SSE body that ends before the gzip stream does (Bun's
++ * `ZlibError`, a cut connection during a web deploy) by continuing the turn
++ * instead of failing it (COD-764, `TRANSIENT_NETWORK_ERROR_CODES` in
++ * common/src/util/error.ts).
++ *
++ * The server gzips the stream only for requests carrying it
++ * (web/src/app/api/v1/chat/completions/sse-compression-gate.ts). Builds from
++ * before the recovery send no header and get the uncompressed stream, which a
++ * cut ends cleanly and they already continue from.
++ */
++export const FREEBUFF_SSE_GZIP_RECOVERY_HEADER = 'x-freebuff-sse-gzip-recovery'
++export const FREEBUFF_SSE_GZIP_RECOVERY_VALUE = '1'
+diff --git a/sdk/src/impl/model-provider.ts b/sdk/src/impl/model-provider.ts
+index b9eae50d9..5ab8744a8 100644
+--- a/sdk/src/impl/model-provider.ts
++++ b/sdk/src/impl/model-provider.ts
+@@ -1,38 +1,42 @@
+ /**
+  * Builds the language model every request runs on: the Codebuff backend,
+  * which forwards to OpenRouter.
+  */
+ 
+ import path from 'path'
+ 
+ import { BYOK_OPENROUTER_HEADER } from '@codebuff/common/constants/byok'
+ import {
+   FREEBUFF_TURN_SPEND_LIMIT_ERROR_CODE,
+   FREEBUFF_TURN_SPEND_LIMIT_MESSAGE,
+ } from '@codebuff/common/constants/freebuff-errors'
+ import { FREEBUFF_ACTING_USER_HEADER } from '@codebuff/common/constants/freebuff-models'
++import {
++  FREEBUFF_SSE_GZIP_RECOVERY_HEADER,
++  FREEBUFF_SSE_GZIP_RECOVERY_VALUE,
++} from '@codebuff/common/constants/sse-compression'
+ import { FREEBUFF_GATE_CODES } from '@codebuff/common/types/freebuff-session'
+ import { isAbortError, isFetchIdleTimeoutError, isTransientNetworkError } from '@codebuff/common/util/error'
+ import {
+   OpenAICompatibleChatLanguageModel,
+   VERSION,
+ } from '@codebuff/llm-providers/openai-compatible'
+ import { APICallError } from 'ai'
+ 
+ import {
+   byokReasoningReplayRetryBody,
+   byokReasoningRetryBody,
+   byokRequestTransform,
+ } from './byok-request'
+ import {
+   chatCompletionsJson,
+   chatCompletionsStream,
+   chatGptResponsesBody,
+ } from './chatgpt-responses'
+ import {
+   CHATGPT_BYOK_PROVIDER,
+   CHATGPT_CODEX_RESPONSES_URL,
+   CHATGPT_ORIGINATOR,
+   CHATGPT_SIGN_IN_AGAIN,
+   ChatGptAuthError,
+   chatGptAccountId,
+@@ -540,50 +544,53 @@ export function getModelForRequest({
+             cause: safe,
+             isRetryable: isTransientNetworkError(safe),
+           })
+         }
+       }) as typeof globalThis.fetch,
+       includeUsage: true,
+       supportsStructuredOutputs: true,
+     })
+   }
+   const openrouterUsage: OpenRouterUsageAccounting = {
+     cost: null,
+     costDetails: {
+       upstreamInferenceCost: null,
+     },
+   }
+ 
+   const openrouterApiKey = getByokOpenrouterApiKeyFromEnv()
+ 
+   return new OpenAICompatibleChatLanguageModel(model, {
+     provider: 'codebuff',
+     url: ({ path: endpoint }) =>
+       new URL(path.join('/api/v1', endpoint), getWebsiteUrl()).toString(),
+     headers: () => ({
+       Authorization: `Bearer ${apiKey}`,
+       'user-agent': `ai-sdk/openai-compatible/${VERSION}/codebuff`,
++      // This build continues a turn whose gzip stream is cut mid-body, so the
++      // backend may gzip it (common/src/constants/sse-compression.ts).
++      [FREEBUFF_SSE_GZIP_RECOVERY_HEADER]: FREEBUFF_SSE_GZIP_RECOVERY_VALUE,
+       ...(userId ? { [FREEBUFF_ACTING_USER_HEADER]: userId } : {}),
+       ...(openrouterApiKey && { [BYOK_OPENROUTER_HEADER]: openrouterApiKey }),
+     }),
+     metadataExtractor: {
+       extractMetadata: async ({ parsedBody }: { parsedBody: any }) => {
+         if (openrouterApiKey !== undefined) {
+           return { codebuff: { usage: openrouterUsage } }
+         }
+ 
+         if (typeof parsedBody?.usage?.cost === 'number') {
+           openrouterUsage.cost = parsedBody.usage.cost
+         }
+         if (
+           typeof parsedBody?.usage?.cost_details?.upstream_inference_cost ===
+           'number'
+         ) {
+           openrouterUsage.costDetails.upstreamInferenceCost =
+             parsedBody.usage.cost_details.upstream_inference_cost
+         }
+         return { codebuff: { usage: openrouterUsage } }
+       },
+       createStreamExtractor: () => ({
+         processChunk: (parsedChunk: any) => {
+           if (openrouterApiKey !== undefined) {
+             return
+
+```
