@@ -1,0 +1,257 @@
+diff --git a/common/src/desktop-cloud/threads.test.ts b/common/src/desktop-cloud/threads.test.ts
+index 67f311eec..e93637d0d 100644
+--- a/common/src/desktop-cloud/threads.test.ts
++++ b/common/src/desktop-cloud/threads.test.ts
+@@ -1,28 +1,31 @@
+ import { describe, expect, test } from 'bun:test'
+ 
+ import {
++  THREAD_GROUPS,
++  arrangeThreadPanel,
++  moveThreadGroup,
+   threadDigestSchema,
+   threadGroup,
+   threadPanel,
+   threadStatusLine,
+   threadStepCount,
+   type ThreadDigest,
+ } from './threads'
+ 
+ const digest = (patch: Partial<ThreadDigest> = {}): ThreadDigest => ({
+   id: 'thread-1',
+   kind: 'cloud',
+   title: 'Fix login',
+   runState: 'idle',
+   outcome: 'completed',
+   steps: [],
+   statusLine: null,
+   lastMessage: null,
+   pendingQuestion: null,
+   pullRequest: null,
+   resolvedAt: null,
+   createdAt: '2026-10-10T00:00:00.000Z',
+   updatedAt: '2026-10-10T00:00:00.000Z',
+   ...patch,
+ })
+ 
+@@ -83,25 +86,46 @@ test('step count', () => {
+ 
+ test('panel mixes kinds in one model, newest first, with a headline', () => {
+   const panel = threadPanel([
+     digest({ id: 'a', kind: 'local', pendingQuestion: question, updatedAt: '2026-10-10T00:01:00.000Z' }),
+     digest({ id: 'b', kind: 'cloud', outcome: 'failed', updatedAt: '2026-10-10T00:02:00.000Z' }),
+     digest({ id: 'c', kind: 'local', runState: 'running' }),
+     digest({ id: 'd', kind: 'cloud', resolvedAt: '2026-10-10T00:03:00.000Z' }),
+   ])
+   expect(panel.headline).toBe('2 threads need you')
+   expect(panel.groups.map((g) => [g.label, g.threads.map((t) => t.id)])).toEqual([
+     ['Waiting on you', ['b', 'a']],
+     ['Working', ['c']],
+     ['Idle', []],
+     ['Resolved', ['d']],
+   ])
+   expect(threadPanel([digest({ runState: 'running' })]).headline).toBe('1 thread working')
+   expect(threadPanel([digest()]).headline).toBe('All clear')
+   expect(threadPanel([]).headline).toBe('No threads yet')
+ })
+ 
+ test('schema is strict and accepts both kinds', () => {
+   expect(threadDigestSchema.parse(digest({ kind: 'local' }))).toEqual(digest({ kind: 'local' }))
+   expect(threadDigestSchema.safeParse({ ...digest(), extra: 1 }).success).toBe(false)
+   expect(threadDigestSchema.safeParse(digest({ kind: 'remote' as never })).success).toBe(false)
+ })
++
++test('the viewer arranges groups and pins threads to the top of their group', () => {
++  const { groups } = threadPanel([
++    digest({ id: 'old', updatedAt: '2026-10-10T01:00:00Z' }),
++    digest({ id: 'new', updatedAt: '2026-10-10T02:00:00Z' }),
++    digest({ id: 'pinned', updatedAt: '2026-10-10T00:00:00Z' }),
++  ])
++  const arranged = arrangeThreadPanel(groups, {
++    order: ['resolved', 'idle', 'bogus'],
++    pinned: new Set(['pinned']),
++  })
++  expect(arranged.map((entry) => entry.group)).toEqual(['resolved', 'idle', 'waiting', 'working'])
++  expect(arranged[1].threads.map((entry) => entry.id)).toEqual(['pinned', 'new', 'old'])
++  expect(arrangeThreadPanel(groups).map((entry) => entry.group)).toEqual([...THREAD_GROUPS])
++})
++
++test('moving a group puts it where the target was', () => {
++  expect(moveThreadGroup(THREAD_GROUPS, 'resolved', 'waiting')).toEqual(['resolved', 'waiting', 'working', 'idle'])
++  expect(moveThreadGroup(THREAD_GROUPS, 'waiting', 'idle')).toEqual(['working', 'idle', 'waiting', 'resolved'])
++  expect(moveThreadGroup(['idle'], 'idle', 'resolved')).toEqual(['waiting', 'working', 'resolved', 'idle'])
++})
+diff --git a/common/src/desktop-cloud/threads.ts b/common/src/desktop-cloud/threads.ts
+index e22e004ad..62a576120 100644
+--- a/common/src/desktop-cloud/threads.ts
++++ b/common/src/desktop-cloud/threads.ts
+@@ -43,70 +43,101 @@ export const THREAD_DIGEST_MAX_STEPS = 50
+ export const THREAD_DIGEST_TEXT_LIMIT = 280
+ 
+ const text = z.string().max(THREAD_DIGEST_TEXT_LIMIT)
+ const isoTime = z.iso.datetime()
+ 
+ export const threadDigestStepSchema = z
+   .object({ text: text.min(1), state: z.enum(THREAD_STEP_STATES) })
+   .strict()
+ export type ThreadDigestStep = z.infer<typeof threadDigestStepSchema>
+ 
+ export const threadDigestQuestionSchema = z
+   .object({
+     id: z.string().min(1),
+     question: text.min(1),
+     options: z.array(text.min(1)).max(8),
+   })
+   .strict()
+ export type ThreadDigestQuestion = z.infer<typeof threadDigestQuestionSchema>
+ 
+ export const threadDigestPullRequestSchema = z
+   .object({
+     url: z.url(),
+     number: z.number().int().positive(),
+     state: z.enum(['open', 'merged', 'closed']),
+     conflict: z.boolean(),
++    /** Absent reads as not a draft: a producer that never asked GitHub does not say. */
++    draft: z.boolean().optional(),
+   })
+   .strict()
+ export type ThreadDigestPullRequest = z.infer<typeof threadDigestPullRequestSchema>
+ 
++/**
++ * `uncommitted` counts a shared checkout's working tree; `branch` counts everything a
++ * worktree thread's branch changed against the branch it started from, committed or not.
++ */
++export const THREAD_GIT_CHANGE_SCOPES = ['uncommitted', 'branch'] as const
++export type ThreadGitChangeScope = (typeof THREAD_GIT_CHANGE_SCOPES)[number]
++
++const gitCount = z.number().int().nonnegative()
++
++export const threadDigestGitSchema = z
++  .object({
++    /** The branch the thread works on; null for a detached or shared checkout with no branch. */
++    branch: z.string().min(1).max(THREAD_DIGEST_TEXT_LIMIT).nullable(),
++    /** Null when the producer has not measured it yet, as for a cloud thread Desktop cannot see into. */
++    changes: z
++      .object({
++        scope: z.enum(THREAD_GIT_CHANGE_SCOPES),
++        files: gitCount,
++        adds: gitCount,
++        dels: gitCount,
++      })
++      .strict()
++      .nullable(),
++  })
++  .strict()
++export type ThreadDigestGit = z.infer<typeof threadDigestGitSchema>
++
+ export const threadDigestSchema = z
+   .object({
+     /** The Desktop thread id; the Cloud chat id when the server writes it for a chat Desktop has not opened. */
+     id: z.string().min(1),
+     kind: z.enum(THREAD_KINDS),
+     title: text.min(1),
+     runState: z.enum(THREAD_RUN_STATES),
+     /** The last finished turn's outcome; null before the first turn ends. */
+     outcome: z.enum(THREAD_OUTCOMES).nullable(),
+     /** The current turn's plan, or the last turn's when idle. */
+     steps: z.array(threadDigestStepSchema).max(THREAD_DIGEST_MAX_STEPS),
+     /** Written by the producer; the panel falls back to `threadStatusLine`. */
+     statusLine: text.nullable(),
+     lastMessage: text.nullable(),
+     pendingQuestion: threadDigestQuestionSchema.nullable(),
+     pullRequest: threadDigestPullRequestSchema.nullable(),
++    /** Absent when the producer knows nothing about the thread's git (no branch, nothing measured). */
++    git: threadDigestGitSchema.optional(),
+     resolvedAt: isoTime.nullable(),
+     /** Absent reads as `freebuff`: a producer that does not say runs on Freebuff. */
+     funding: z.enum(THREAD_FUNDINGS).optional(),
+     createdAt: isoTime,
+     updatedAt: isoTime,
+   })
+   .strict()
+ export type ThreadDigest = z.infer<typeof threadDigestSchema>
+ 
+ export const THREAD_GROUPS = ['waiting', 'working', 'idle', 'resolved'] as const
+ export type ThreadGroup = (typeof THREAD_GROUPS)[number]
+ 
+ export const THREAD_GROUP_LABELS: Record<ThreadGroup, string> = {
+   waiting: 'Waiting on you',
+   working: 'Working',
+   idle: 'Idle',
+   resolved: 'Resolved',
+ }
+ 
+ /**
+  * A question, a failed turn or a conflicting PR needs the user even while a
+  * turn is still running, so waiting outranks working.
+  */
+ export function threadGroup(digest: ThreadDigest): ThreadGroup {
+   if (digest.resolvedAt !== null) return 'resolved'
+@@ -183,25 +214,67 @@ export function threadPanel(digests: readonly ThreadDigest[]): {
+   const groups = THREAD_GROUPS.map((group) => ({
+     group,
+     label: THREAD_GROUP_LABELS[group],
+     threads: byGroup
+       .get(group)!
+       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+   }))
+   return { groups, headline: threadPanelHeadline(groups) }
+ }
+ 
+ function threadPanelHeadline(groups: readonly ThreadPanelGroup[]): string {
+   const count = (group: ThreadGroup) =>
+     groups.find((entry) => entry.group === group)!.threads.length
+   const waiting = count('waiting')
+   if (waiting > 0) {
+     return `${waiting} ${waiting === 1 ? 'thread needs' : 'threads need'} you`
+   }
+   const working = count('working')
+   if (working > 0) {
+     return `${working} ${working === 1 ? 'thread' : 'threads'} working`
+   }
+   return groups.some((entry) => entry.threads.length > 0)
+     ? 'All clear'
+     : 'No threads yet'
+ }
++
++/**
++ * The panel's groups as the viewer arranged them: groups in `order` (a saved
++ * order missing a group, or naming an unknown one, still yields all four),
++ * and pinned threads first within each group, keeping newest-first otherwise.
++ */
++export function arrangeThreadPanel(
++  groups: readonly ThreadPanelGroup[],
++  {
++    order = THREAD_GROUPS,
++    pinned = new Set<string>(),
++  }: { order?: readonly string[]; pinned?: ReadonlySet<string> } = {},
++): ThreadPanelGroup[] {
++  const rank = (group: ThreadGroup) => {
++    const at = order.indexOf(group)
++    return at === -1 ? order.length + THREAD_GROUPS.indexOf(group) : at
++  }
++  return [...groups]
++    .sort((a, b) => rank(a.group) - rank(b.group))
++    .map((entry) => ({
++      ...entry,
++      threads: [
++        ...entry.threads.filter((digest) => pinned.has(digest.id)),
++        ...entry.threads.filter((digest) => !pinned.has(digest.id)),
++      ],
++    }))
++}
++
++/** `order` with `group` moved to where `target` sits; unknown groups are dropped. */
++export function moveThreadGroup(
++  order: readonly string[],
++  group: ThreadGroup,
++  target: ThreadGroup,
++): ThreadGroup[] {
++  const known = arrangeThreadPanel(
++    THREAD_GROUPS.map((entry) => ({ group: entry, label: '', threads: [] })),
++    { order },
++  ).map((entry) => entry.group)
++  const without = known.filter((entry) => entry !== group)
++  without.splice(known.indexOf(target), 0, group)
++  return without
++}
