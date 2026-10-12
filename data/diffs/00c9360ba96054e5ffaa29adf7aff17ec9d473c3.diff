@@ -1,0 +1,532 @@
+diff --git a/packages/agent-runtime/src/tools/stream-parser.ts b/packages/agent-runtime/src/tools/stream-parser.ts
+index 7960bade8..a339cfa72 100644
+--- a/packages/agent-runtime/src/tools/stream-parser.ts
++++ b/packages/agent-runtime/src/tools/stream-parser.ts
+@@ -21,65 +21,66 @@ import {
+   historyLeaksThinkTags,
+   stripThinkScaffolding,
+   ThinkTagStream,
+ } from '../util/think-tag-stream'
+ 
+ import type { CustomToolCall, ExecuteToolCallParams } from './tool-executor'
+ import type { ThinkStreamSegment } from '../util/think-tag-stream'
+ import type { AgentTemplate } from '../templates/types'
+ import type { FileProcessingState } from './handlers/tool/write-file'
+ import type { ToolName } from '@codebuff/common/tools/constants'
+ import type { CodebuffToolCall } from '@codebuff/common/tools/list'
+ import type { Logger } from '@codebuff/common/types/contracts/logger'
+ import type { StreamRecoverySource } from '@codebuff/common/types/contracts/llm'
+ import type { ParamsExcluding } from '@codebuff/common/types/function-params'
+ import type {
+   Message,
+   ToolMessage,
+ } from '@codebuff/common/types/messages/codebuff-message'
+ import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
+ import type { Subgoal } from '@codebuff/common/types/session-state'
+ import type { ProjectFileContext } from '@codebuff/common/util/file'
+ 
+ /** History tags for the notes appended when a step's stream ends without a
+  *  usable response and the loop auto-retries (see
+  *  sdk/src/impl/stream-interruption.ts for detection): the connection was cut
+- *  mid-response, or the model ended after reasoning without an answer. */
++ *  mid-response, completion metadata was missing, or the model ended after
++ *  reasoning without an answer. */
+ export const STREAM_INTERRUPTED_TAG = 'STREAM_INTERRUPTED'
+ export const OUTPUT_LIMIT_TAG = 'OUTPUT_LIMIT'
+ /** The provider reported a retryable failure (5xx, 429) mid-stream. */
+ export const PROVIDER_ERROR_TAG = 'PROVIDER_ERROR'
+ 
+ /** How many back-to-back recovery retries (nothing but the model's partial
+  *  output between them, every recovery kind combined) run before
+  *  the turn fails loudly. One covers the deploy/network blip or one-off
+  *  thinking overrun this retry exists for; a run of them means every attempt
+  *  is failing the same way. */
+ export const MAX_CONSECUTIVE_STREAM_RECOVERIES = 3
+ 
+ export const REPEATED_STREAM_INTERRUPTIONS_MESSAGE =
+-  'The connection kept dropping mid-response after several retries. Please check your network connection and try again.'
++  'Freebuff could not confirm that the provider finished its response after several retries. This can be a connection problem or an incompatible provider response. Check the provider settings or try a different model.'
+ 
+ export const REPEATED_OUTPUT_LIMIT_MESSAGE =
+   'The model kept ending after reasoning without producing a response. Try a simpler request or a different model.'
+ 
+ export const REPEATED_PROVIDER_ERRORS_MESSAGE =
+   'The model provider kept returning errors mid-response after several retries. Try again in a moment, or switch to a different model.'
+ 
+ /**
+  * Follow-up suggestion tools render a clickable card per call and do nothing
+  * else, so a model that degenerates into repeating one inside a single
+  * response has no natural brake: every call streams, executes and renders
+  * before the model ever sees a result. Seen 2026-09-22 on Freebuff Desktop
+  * (MiMo v2.5): a single response streamed suggest_prompts calls for 3.5
+  * minutes (the turn logged 90 tool calls) until the user pressed Stop. The
+  * guidance asks for two to four, one per call, so this cap leaves generous
+  * headroom for legitimate use.
+  */
+ export const FOLLOWUP_SUGGESTION_TOOL_NAMES: ReadonlySet<string> = new Set([
+   'suggest_prompts',
+   'suggest_followups',
+ ])
+ export const MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE = 8
+ export const FOLLOWUP_SUGGESTION_LIMIT_TAG = 'FOLLOWUP_SUGGESTION_LIMIT'
+ export const FOLLOWUP_SUGGESTION_LIMIT_MESSAGE = `Your previous response was cut off because it called a follow-up suggestion tool more than ${MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE} times. The first ${MAX_FOLLOWUP_SUGGESTION_CALLS_PER_RESPONSE} suggestions were shown to the user. Do not suggest more follow-ups this turn.`
+ 
+diff --git a/sdk/src/__tests__/byok-run.test.ts b/sdk/src/__tests__/byok-run.test.ts
+index 63d399a9b..3c7d66068 100644
+--- a/sdk/src/__tests__/byok-run.test.ts
++++ b/sdk/src/__tests__/byok-run.test.ts
+@@ -319,41 +319,77 @@ describe('direct BYOK SDK runs', () => {
+       },
+     })
+     const saved = await store.create({
+       name: 'Local failure test', provider: 'openrouter', model: 'scripted/model',
+       credentialRef: 'env:PROVIDER_KEY',
+     })
+     const resolved = await store.resolve(saved)
+     if (failure === 'changed') await store.update({ ...saved, patch: { model: 'new/model' } })
+     if (failure === 'removed') await store.remove(saved)
+     if (failure === 'corrupt') records = [{ ...saved, model: '' }]
+     failCheck = true
+     const client = new CodebuffClient({
+       agentDefinitions: [agent],
+       byok: resolved,
+     })
+ 
+     const result = await client.run({ agent: agent.id, prompt: 'Do not use the unavailable connection.' })
+     expect(result.output.type).toBe('error')
+     if (result.output.type !== 'error') throw new Error('expected BYOK connection error')
+     expect(result.output.message).toContain(expected)
+     expect(result.output.message).not.toContain('provider-key-canary')
+     expect(result.output.message).not.toContain('network connection')
+     expect(requests).toBe(0)
+   }, 30_000)
+ 
++  test.each(['missing-finish', 'empty', 'transport'])('reports repeated %s responses without blaming the user network', async (ending) => {
++    const requests: string[] = []
++    globalThis.fetch = (async (input) => {
++      requests.push(String(input))
++      if (ending === 'transport') {
++        return new Response(new ReadableStream<Uint8Array>({
++          start(controller) {
++            controller.error(Object.assign(new Error('provider-key-canary must not leak'), {
++              code: 'ECONNRESET',
++            }))
++          },
++        }), { headers: { 'content-type': 'text/event-stream' } })
++      }
++      // [DONE] alone is not a supported finish_reason, even when text arrived.
++      return ending === 'empty'
++        ? new Response('', { headers: { 'content-type': 'text/event-stream' } })
++        : sse({ choices: [{ delta: { content: 'Partial output.' }, finish_reason: null }] })
++    }) as typeof fetch
++    const client = new CodebuffClient({
++      agentDefinitions: [agent], byok: connection(), handleEvent: () => {},
++    })
++    const result = await client.run({ agent: agent.id, prompt: 'Fail safely on repeated incomplete responses.' })
++
++    expect(result.output.type).toBe('error')
++    if (result.output.type !== 'error') throw new Error('expected incomplete BYOK response error')
++    expect(result.output.message).toContain('could not confirm that the provider finished')
++    expect(result.output.message).toContain('connection problem or an incompatible provider response')
++    expect(result.output.message).toContain(ending === 'transport'
++      ? 'Last error: A connection-level error occurred'
++      : 'Last error: The provider response had no recognised completion status or token usage.')
++    expect(result.output.message).not.toContain('Please check your network connection')
++    expect(result.output.message).not.toContain('provider-key-canary')
++    expect(requests).toHaveLength(4)
++    expect(requests.every((url) => url === 'http://127.0.0.1:9876/v1/chat/completions')).toBe(true)
++  }, 30_000)
++
+   test('returns a local cancellation result without provider or hosted fallback requests', async () => {
+     const controller = new AbortController()
+     controller.abort(new Error('Cancelled by user'))
+     let requests = 0
+     globalThis.fetch = (async () => {
+       requests += 1
+       throw new Error('unexpected request')
+     }) as unknown as typeof fetch
+     const client = new CodebuffClient({ agentDefinitions: [agent], byok: connection() })
+ 
+     const result = await client.run({ agent: agent.id, prompt: 'Cancel.', signal: controller.signal })
+     expect(result.output).toMatchObject({ type: 'error', message: 'Cancelled by user' })
+     expect(result.inference).toMatchObject({ source: 'byok', connectionId: 'failure-connection' })
+     expect(requests).toBe(0)
+   })
+ })
+diff --git a/sdk/src/__tests__/stream-interruption.test.ts b/sdk/src/__tests__/stream-interruption.test.ts
+index c0bb099e8..619083cd2 100644
+--- a/sdk/src/__tests__/stream-interruption.test.ts
++++ b/sdk/src/__tests__/stream-interruption.test.ts
+@@ -12,50 +12,65 @@ const noYields = {
+   yieldedToolCall: false,
+ }
+ 
+ describe('classifyStreamEndRecovery', () => {
+   it('classifies a stream that ended without any finish part as interrupted', () => {
+     expect(
+       classifyStreamEndRecovery({ aborted: false, finish: undefined, ...noYields })
+         ?.source,
+     ).toBe('stream-interrupted')
+   })
+ 
+   it('classifies the flush signature (unknown reason, no usage) as interrupted', () => {
+     // The provider's TransformStream flush emits this shape when the HTTP
+     // body ends without a finish_reason chunk — the connection-cut signature.
+     expect(
+       classifyStreamEndRecovery({
+         aborted: false,
+         finish: { finishReason: 'unknown', hasUsage: false },
+         receivedReasoning: false,
+         yieldedText: true,
+         yieldedToolCall: false,
+       })?.source,
+     ).toBe('stream-interrupted')
+   })
+ 
++  it('describes missing completion metadata without claiming a connection dropped', () => {
++    for (const finish of [
++      undefined,
++      { finishReason: 'unknown', hasUsage: false },
++    ]) {
++      const recovery = classifyStreamEndRecovery({
++        aborted: false, finish, ...noYields,
++      })
++      expect(recovery?.message).toContain('without a supported completion signal')
++      expect(recovery?.message).not.toContain('connection dropped')
++      expect(recovery?.detail).toContain('completion status')
++      expect(recovery?.detail).not.toContain('connection-level error')
++    }
++  })
++
+   it('classifies a reasoning-only length stop as output-limit', () => {
+     const recovery = classifyStreamEndRecovery({
+       aborted: false,
+       finish: { finishReason: 'length', hasUsage: true },
+       ...noYields,
+     })
+     expect(recovery?.source).toBe('output-limit')
+     expect(recovery?.message).toContain('output token limit')
+   })
+ 
+   it('classifies any complete finish with reasoning but no text or tool calls', () => {
+     for (const finish of [
+       { finishReason: 'stop', hasUsage: true },
+       { finishReason: 'unknown', hasUsage: true },
+       { finishReason: 'other', hasUsage: true },
+       { finishReason: 'tool-calls', hasUsage: false },
+     ]) {
+       const recovery = classifyStreamEndRecovery({
+         aborted: false,
+         finish,
+         receivedReasoning: true,
+         yieldedText: false,
+         yieldedToolCall: false,
+       })
+       expect(recovery?.source).toBe('output-limit')
+@@ -143,50 +158,61 @@ describe('streamFinishInfoOf', () => {
+     expect(
+       streamFinishInfoOf({ finishReason: 'unknown', totalUsage: {} }),
+     ).toEqual({ finishReason: 'unknown', hasUsage: false })
+     expect(
+       streamFinishInfoOf({
+         finishReason: 'unknown',
+         totalUsage: { totalTokens: NaN },
+       }),
+     ).toEqual({ finishReason: 'unknown', hasUsage: false })
+   })
+ 
+   it('restores a v2 compatibility adapter unknown finish reason', () => {
+     expect(
+       streamFinishInfoOf(
+         {
+           finishReason: 'other',
+           totalUsage: {},
+         },
+         true,
+       ),
+     ).toEqual({ finishReason: 'unknown', hasUsage: false })
+   })
+ })
+ 
+ describe('classifyThrownStreamRecovery', () => {
++  it('identifies a transport exception without exposing its raw details', () => {
++    const error = Object.assign(new Error('secret-key at https://private.example'), {
++      code: 'ECONNRESET',
++    })
++    const recovery = classifyThrownStreamRecovery({ aborted: false, error })
++    expect(recovery?.message).toContain('connection-level error')
++    expect(recovery?.detail).toContain('connection-level error')
++    expect(JSON.stringify(recovery)).not.toContain('secret-key')
++    expect(JSON.stringify(recovery)).not.toContain('private.example')
++  })
++
+   it('classifies Bun socket-close exceptions as interrupted streams', () => {
+     const error = new Error(
+       'The socket connection was closed unexpectedly. For more information, pass `verbose: true` in the second argument to fetch()',
+     ) as Error & { code: string }
+     error.code = 'ECONNRESET'
+ 
+     expect(
+       classifyThrownStreamRecovery({ aborted: false, error })?.source,
+     ).toBe('stream-interrupted')
+   })
+ 
+   it('walks wrapped transport errors', () => {
+     const cause = Object.assign(new Error('read failed'), {
+       code: 'ConnectionClosed',
+     })
+     const error = new Error('Failed after 4 attempts', { cause })
+ 
+     expect(
+       classifyThrownStreamRecovery({ aborted: false, error })?.source,
+     ).toBe('stream-interrupted')
+   })
+ 
+   it('does not recover cancellation or unrelated exceptions', () => {
+     const networkError = Object.assign(new Error('read ECONNRESET'), {
+       code: 'ECONNRESET',
+diff --git a/sdk/src/impl/llm.ts b/sdk/src/impl/llm.ts
+index 1f3c6f2c1..9645663e5 100644
+--- a/sdk/src/impl/llm.ts
++++ b/sdk/src/impl/llm.ts
+@@ -419,52 +419,52 @@ export async function* promptAiSdkStream(
+       | OpenRouterUsageAccounting
+       | undefined
+     const costOverrideDollars = openrouterUsage
+       ? (openrouterUsage.cost ?? 0) +
+         (openrouterUsage.costDetails?.upstreamInferenceCost ?? 0)
+       : undefined
+     if (!params.onCostCalculated || !costOverrideDollars) return
+     costReported = true
+     await params.onCostCalculated(
+       calculateUsedCredits({ costDollars: costOverrideDollars }),
+     )
+   }
+ 
+   const stopSequenceHandler = new StopSequenceHandler(params.stopSequences)
+ 
+   // Track if we've yielded any content - if so, we can't safely fall back
+   let hasYieldedContent = false
+   // Native reasoning is not visible answer content, but it distinguishes a
+   // silent model stop from a legitimate empty completion.
+   let hasReceivedReasoning = false
+   // Tool calls tracked separately: a step that produced tool calls is
+   // actionable even with no text, so it is never a silent stop.
+   let hasYieldedToolCall = false
+ 
+   // A healthy stream always delivers a finish part with a real finishReason
+-  // (and usage) before ending; its absence after the loop means the
+-  // connection was cut mid-response. See stream-interruption.ts.
++  // (and usage) before ending; its absence after the loop can mean a cut
++  // connection or an incompatible provider stream. See stream-interruption.ts.
+   let finishInfo: StreamFinishInfo | undefined
+   // Bun/undici can throw when a response body is severed instead of ending the
+   // iterator cleanly. Feed that through the same capped continuation path as a
+   // clean end without a finish marker. A retryable provider error reported in
+   // band (5xx/429 error chunk) takes the same path: see
+   // classifyProviderErrorRecovery.
+   let thrownStreamRecovery: StreamEndRecovery | undefined
+   const streamIterator = response.stream[Symbol.asyncIterator]()
+   const recoverThrownStream = (
+     error: unknown,
+     classify: typeof classifyThrownStreamRecovery = classifyThrownStreamRecovery,
+   ): StreamEndRecovery | null => {
+     const recovery = classify({
+       aborted: params.signal.aborted,
+       error,
+     })
+     if (!recovery) return null
+     // These final-result promises can reject with the same transport error.
+     // Observe them now so the recovery yield below cannot leave an unhandled
+     // rejection while the consumer starts the continuation step.
+     void Promise.allSettled([
+       response.response,
+       response.request,
+       response.usage,
+       response.providerMetadata,
+diff --git a/sdk/src/impl/stream-interruption.ts b/sdk/src/impl/stream-interruption.ts
+index add0d29b1..0a4bcacbf 100644
+--- a/sdk/src/impl/stream-interruption.ts
++++ b/sdk/src/impl/stream-interruption.ts
+@@ -1,42 +1,43 @@
+ /**
+  * Classification of completion-stream endings that would otherwise silently
+- * end the turn with nothing visible to the user. Two classes:
++ * end the turn with nothing visible to the user. Three classes:
+  *
+- * **'stream-interrupted'** — the connection was cut mid-response. A healthy
++ * **'stream-interrupted'** — no supported completion signal was received. A healthy
+  * OpenAI-compatible SSE stream always ends with a chunk carrying a real
+  * `finish_reason` (and, on our backend, usage totals) before `[DONE]`. When
+  * the connection dies mid-stream — a server deploy killing the instance, a
+  * proxy timeout, a network drop — the HTTP body just ends: the AI SDK
+  * provider's flush then emits a `finish` part with raw finish reason
+  * `'unknown'` and no usage (normalized to `'other'` by AI SDK 7), and the
+  * stream otherwise looks like a normal completion. `'unknown'` alone is not
+  * proof: providers map any unrecognized `finish_reason` string to `'unknown'`
+  * too. Usage disambiguates — it arrives in the stream's final chunk, so
+  * `'unknown'` *with* usage means an odd but complete stream, while `'unknown'`
+- * *without* usage means the tail was never received. A missing finish part
+- * altogether is always an interruption.
++ * *without* usage means we cannot confirm completion. This can be a cut
++ * connection OR a provider that omits those fields, even before `[DONE]`.
++ * Missing completion metadata alone must not be described as a network error.
+  *
+  * **'output-limit'** — the model produced no text or tool calls because it
+  * either spent its output budget on reasoning (`length`) or ended the stream
+  * after emitting only native reasoning, under any finish reason the provider
+  * chose to report (a Bedrock-via-OpenRouter reasoning-only end has arrived as
+  * 'unknown' with usage). Both are complete, well-formed streams whose turns
+  * would otherwise end with nothing visible. A `length` stop after real output
+  * is the answer running long, which is not silently recoverable (retrying
+  * would duplicate output).
+  *
+  * **'provider-error'** — the provider (or our server, on its behalf) reported
+  * a retryable failure (5xx, 429) as an in-band error chunk. The same outage as
+  * a cut connection, just announced; see {@link classifyProviderErrorRecovery}.
+  *
+  * Before this existed, the first two classes read as the agent "randomly stopping"
+  * mid-thinking with no error anywhere (2026-07-17 incident).
+  */
+ 
+ import type { StreamRecoverySource } from '@codebuff/common/types/contracts/llm'
+ import { isTransientNetworkError } from '@codebuff/common/util/error'
+ import { APICallError } from 'ai'
+ 
+ export interface StreamFinishInfo {
+   finishReason: string
+   hasUsage: boolean
+@@ -66,117 +67,130 @@ export function streamFinishInfoOf(
+     hasUsage: [inputTokens, outputTokens, totalTokens].some(
+       (tokens) => typeof tokens === 'number' && Number.isFinite(tokens),
+     ),
+   }
+ }
+ 
+ export interface StreamEndRecovery {
+   source: StreamRecoverySource
+   /** Injected into the conversation (and shown to the user). Written for the
+    *  model: the retry step sees its own partial output plus this note. */
+   message: string
+   /** How long to wait before yielding the recovery, so the forced retry step
+    *  does not hit a provider that just failed or asked us to back off.
+    *  Bounded by PROVIDER_ERROR_MAX_RETRY_DELAY_MS. */
+   delayMs?: number
+   /** User-facing summary of the failure, for the error the agent loop raises
+    *  if the retries run out. */
+   detail?: string
+   /** HTTP status of a provider error, for telemetry. */
+   statusCode?: number
+ }
+ 
+ const STREAM_INTERRUPTED_RECOVERY: StreamEndRecovery = {
+   source: 'stream-interrupted',
+   message:
+-    'The connection dropped while the response was streaming, so the output above may be cut off mid-thought. Continue from where it left off (or start the step over if nothing useful arrived).',
++    'The response ended without a supported completion signal, so the output above may be incomplete. Continue from where it left off (or start the step over if nothing useful arrived).',
+ }
+ 
+ const OUTPUT_LIMIT_RECOVERY: StreamEndRecovery = {
+   source: 'output-limit',
+   // The actionable instruction is a tighter budget on the redo: finishing the
+   // same depth of reasoning would hit the same limit again.
+   message:
+     'The response hit its output token limit while still reasoning, so no answer was produced. Redo this step thinking much more briefly, and get to the response or tool calls quickly.',
+ }
+ 
+ const REASONING_ONLY_RECOVERY: StreamEndRecovery = {
+   // Keep the existing source so this follows the same bounded retry path,
+   // while the message stays truthful for a complete stream.
+   source: 'output-limit',
+   message:
+     'The response ended after reasoning without producing an answer or tool call. Continue this step, think more briefly, and get to the response or tool calls quickly.',
+ }
+ 
+ /**
+  * Decide whether a completed stream ended in a recoverable silent stop.
+  * Returns the recovery to yield as an error chunk, or null for normal
+  * endings. A user cancel (`aborted`) also ends streams early and is never a
+  * recovery.
+  */
+ export function classifyStreamEndRecovery(params: {
+   aborted: boolean
+   /** Info from the stream's `finish` part, or undefined if none arrived. */
+   finish: StreamFinishInfo | undefined
+   receivedReasoning: boolean
+   yieldedText: boolean
+   yieldedToolCall: boolean
+ }): StreamEndRecovery | null {
+   const { aborted, finish, receivedReasoning, yieldedText, yieldedToolCall } =
+     params
+   if (aborted) return null
+ 
+   const interrupted =
+     finish === undefined ||
+     (finish.finishReason === 'unknown' && !finish.hasUsage)
+-  if (interrupted) return STREAM_INTERRUPTED_RECOVERY
++  if (interrupted) {
++    return {
++      ...STREAM_INTERRUPTED_RECOVERY,
++      detail: finish === undefined
++        ? 'No completion status was received from the provider.'
++        : 'The provider response had no recognised completion status or token usage.',
++    }
++  }
+ 
+   if (yieldedText || yieldedToolCall) return null
+ 
+   if (finish.finishReason === 'length') return OUTPUT_LIMIT_RECOVERY
+ 
+   // Whatever finish reason the provider reported ('stop', 'unknown' with
+   // usage, anything else): reasoning with nothing visible after it is a
+   // silent stop.
+   if (receivedReasoning) return REASONING_ONLY_RECOVERY
+ 
+   return null
+ }
+ 
+ /**
+  * Classify an exception thrown while consuming a completion stream. Some
+  * runtimes surface a severed response body as an exception (for example Bun's
+  * `ConnectionClosed` / `ECONNRESET`) instead of the graceful-but-incomplete
+  * stream ending handled by {@link classifyStreamEndRecovery}. Both represent
+  * the same recoverable condition to the agent loop.
+  */
+ export function classifyThrownStreamRecovery(params: {
+   aborted: boolean
+   error: unknown
+ }): StreamEndRecovery | null {
+   if (params.aborted || !isTransientNetworkError(params.error)) return null
+-  return STREAM_INTERRUPTED_RECOVERY
++  // Fixed observations only: transport errors can echo credentials and URLs.
++  return {
++    source: 'stream-interrupted',
++    message:
++      'A connection-level error interrupted the provider request, so the output above may be incomplete. Continue from where it left off (or start the step over if nothing useful arrived).',
++    detail: 'A connection-level error occurred while requesting or reading the provider response.',
++  }
+ }
+ 
+ /** Upper bound on any wait before a provider-error retry, whatever the
+  *  provider asked for. The user is watching a stalled turn meanwhile, and the
+  *  retries are capped (MAX_CONSECUTIVE_STREAM_RECOVERIES), so a long
+  *  retry-after is better answered by giving up than by sitting on it. */
+ export const PROVIDER_ERROR_MAX_RETRY_DELAY_MS = 10_000
+ /** Backoff when a rate-limited provider gave no retry-after. */
+ export const PROVIDER_RATE_LIMIT_DEFAULT_DELAY_MS = 2_000
+ /** Backoff after a provider server error. */
+ export const PROVIDER_ERROR_DEFAULT_DELAY_MS = 1_000
+ 
+ /** Keeps a provider's error text from flooding the conversation note. */
+ const MAX_PROVIDER_ERROR_DETAIL_LENGTH = 500
+ 
+ /**
+  * The server's grace flush (web/src/app/api/v1/chat/completions/
+  * grace-flush.ts) reports an upstream failure that arrives after SSE headers
+  * were sent as `{error: {message: 'Upstream provider error (NNN): ...', type:
+  * 'upstream_error'}}`. That shape has nowhere structured to put the status,
+  * so it rides in the message text (and is absent when the upstream gave none).
+  */
+ const UPSTREAM_ERROR_TYPE = 'upstream_error'
+ const UPSTREAM_STATUS_IN_MESSAGE = /^Upstream provider error \((\d{3})\)/
+ 
