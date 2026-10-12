@@ -1,0 +1,417 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 698d155819..ec8befeac1 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -10,10 +10,13 @@ name: Public CI
+ 
+ on:
+   push:
+-    branches: [main]
++    branches: [main, "fix/additive-instruction-snapshot"]
+   pull_request:
+     branches: [main]
+ 
++permissions:
++  contents: read
++
+ concurrency:
+   group: public-ci-${{ github.workflow }}-${{ github.ref }}
+   cancel-in-progress: true
+@@ -35,6 +38,9 @@ jobs:
+       - name: Build SDK
+         run: bun run build:sdk
+ 
++      - name: Additive instruction regression tests
++        run: bun test sdk/src/__tests__/append-instructions.test.ts cli/src/utils/append-instructions.test.ts
++
+       - name: Build Freebuff binary
+         run: bun freebuff/cli/build.ts 0.0.0-ci
+ 
+@@ -52,3 +58,10 @@ jobs:
+           chmod +x cli/bin/freebuff
+           cli/bin/freebuff --version
+           bun cli/scripts/smoke-binary.ts cli/bin/freebuff
++
++      - name: Upload exact-head Linux prerelease (not a release)
++        uses: actions/upload-artifact@v4
++        with:
++          name: freebuff-linux-${{ github.sha }}
++          path: cli/bin/freebuff
++          retention-days: 7
+diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
+index 0bcdaedb8a..a3a0156399 100644
+--- a/cli/src/hooks/use-send-message.ts
++++ b/cli/src/hooks/use-send-message.ts
+@@ -3,6 +3,7 @@ import {
+   requestFreebuffChatAdmission,
+ } from '../state/freebuff-chat-store'
+ import { capturePendingAttachments } from '../utils/pending-attachments'
++import { AppendInstructionsError } from '../utils/append-instructions'
+ import { randomUUID } from 'node:crypto'
+ 
+ import { useCallback, useEffect, useRef } from 'react'
+@@ -565,7 +566,9 @@ export const useSendMessage = ({
+         setMessages((prev) => [
+           ...prev,
+           createErrorChatMessage(
+-            shouldUseByok
++            error instanceof AppendInstructionsError
++              ? error.message
++              : shouldUseByok
+               ? byokLoadFailureMessage(error)
+               : '⚠️ Unable to create the client. Please check your authentication and try again.',
+           ),
+diff --git a/cli/src/utils/append-instructions.test.ts b/cli/src/utils/append-instructions.test.ts
+new file mode 100644
+index 0000000000..4b555b19f0
+--- /dev/null
++++ b/cli/src/utils/append-instructions.test.ts
+@@ -0,0 +1,43 @@
++import { expect, test } from 'bun:test'
++import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { AppendInstructionsError, createAppendInstructionsSnapshot, loadAppendInstructions } from './append-instructions'
++
++test('unset is a no-op; process snapshot caches success and failure across client resets', async () => {
++  expect(await loadAppendInstructions()).toBeUndefined()
++  let reads = 0
++  const snapshot = createAppendInstructionsSnapshot(async () => { reads++; return 'first' })
++  expect(await snapshot('/first')).toBe('first')
++  expect(await snapshot('/changed')).toBe('first')
++  expect(reads).toBe(1)
++  const failed = createAppendInstructionsSnapshot(async () => { reads++; throw new AppendInstructionsError() })
++  await expect(failed('/bad')).rejects.toBeInstanceOf(AppendInstructionsError)
++  await expect(failed('/fixed')).rejects.toBeInstanceOf(AppendInstructionsError)
++  expect(reads).toBe(2)
++})
++
++test('bounded regular UTF-8 input preserves Unicode; all failures redact path/content', async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'freebuff-private-path-'))
++  try {
++    const file = join(dir, 'private-canary')
++    for (const content of ['  你好\n', 'a'.repeat(65536)]) {
++      await writeFile(file, content)
++      expect(await loadAppendInstructions(file)).toBe(content)
++    }
++    for (const content of ['', '  ', 'a\0b', Buffer.from([255]), 'a'.repeat(65537)]) {
++      await writeFile(file, content)
++      try { await loadAppendInstructions(file); throw new Error('accepted invalid input') } catch (error) {
++        expect(error).toBeInstanceOf(AppendInstructionsError)
++        expect(String(error)).not.toContain(dir)
++        expect(String(error)).not.toContain('private-canary')
++        expect((error as Error).cause).toBeUndefined()
++      }
++    }
++    await writeFile(file, 'valid')
++    const link = join(dir, 'symlink'); await symlink(file, link)
++    for (const path of [link, dir, join(dir, 'missing'), 'relative', '']) {
++      await expect(loadAppendInstructions(path)).rejects.toBeInstanceOf(AppendInstructionsError)
++    }
++  } finally { await rm(dir, { recursive: true, force: true }) }
++})
+diff --git a/cli/src/utils/append-instructions.ts b/cli/src/utils/append-instructions.ts
+new file mode 100644
+index 0000000000..187f02333e
+--- /dev/null
++++ b/cli/src/utils/append-instructions.ts
+@@ -0,0 +1,47 @@
++import { constants } from 'node:fs'
++import { open } from 'node:fs/promises'
++import { isAbsolute } from 'node:path'
++import { AppendInstructionsError, MAX_APPEND_INSTRUCTIONS_BYTES, validateAppendInstructions } from '@codebuff/common/append-instructions'
++
++export { AppendInstructionsError }
++
++/** POSIX file input. Never retain filesystem errors, paths or contents in errors. */
++export async function loadAppendInstructions(path?: string): Promise<string | undefined> {
++  if (path === undefined) return undefined
++  try {
++    if (!['linux', 'darwin'].includes(process.platform) ||
++        !isAbsolute(path) || /[\0\r\n]/.test(path) ||
++        !constants.O_NOFOLLOW || !constants.O_NONBLOCK) {
++      throw new AppendInstructionsError()
++    }
++    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
++    try {
++      const stat = await file.stat()
++      if (!stat.isFile() || stat.size === 0 || stat.size > MAX_APPEND_INSTRUCTIONS_BYTES) {
++        throw new AppendInstructionsError()
++      }
++      const bytes = Buffer.alloc(MAX_APPEND_INSTRUCTIONS_BYTES + 1)
++      let length = 0
++      while (length < bytes.length) {
++        const { bytesRead } = await file.read(bytes, length, bytes.length - length, null)
++        if (!bytesRead) break
++        length += bytesRead
++      }
++      if (length > MAX_APPEND_INSTRUCTIONS_BYTES) throw new AppendInstructionsError()
++      const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, length))
++      validateAppendInstructions(text)
++      return text
++    } finally {
++      await file.close()
++    }
++  } catch {
++    throw new AppendInstructionsError()
++  }
++}
++
++/** Cache success AND failure for process lifetime, independent of auth/client resets. */
++export function createAppendInstructionsSnapshot(loader = loadAppendInstructions) {
++  let snapshot: Promise<string | undefined> | undefined
++  return (path?: string) => snapshot ??= loader(path)
++}
++export const getProcessAppendInstructions = createAppendInstructionsSnapshot()
+diff --git a/cli/src/utils/codebuff-client.ts b/cli/src/utils/codebuff-client.ts
+index 236bfebbf3..8e4b780507 100644
+--- a/cli/src/utils/codebuff-client.ts
++++ b/cli/src/utils/codebuff-client.ts
+@@ -1,3 +1,4 @@
++import { getProcessAppendInstructions } from './append-instructions'
+ import { API_KEY_ENV_VAR } from '@codebuff/common/old-constants'
+ import { AskUserBridge } from '@codebuff/common/utils/ask-user-bridge'
+ import { CodebuffClient } from '@codebuff/sdk'
+@@ -53,6 +54,10 @@ export function resetCodebuffClient(): void {
+ export async function getCodebuffClient(
+   options: { byok?: ResolvedByokConnection } = {},
+ ): Promise<CodebuffClient | null> {
++  // Validate before auth/client admission, even when a client is already cached.
++  const appendInstructions = await getProcessAppendInstructions(
++    getSystemProcessEnv().FREEBUFF_APPEND_INSTRUCTIONS_FILE,
++  )
+   const byokIdentity = options.byok
+     ? `${options.byok.id}:${options.byok.revision}`
+     : null
+@@ -96,6 +101,7 @@ export async function getCodebuffClient(
+             }
+           : {}),
+         cwd: projectRoot,
++        ...(appendInstructions !== undefined ? { appendInstructions } : {}),
+         // Keeps the model's skill list identical to the one the registry shows
+         // (utils/skill-registry.ts). The SDK default is project-only so that a
+         // server embedding it cannot read a home directory by omission; the
+diff --git a/common/src/append-instructions.ts b/common/src/append-instructions.ts
+new file mode 100644
+index 0000000000..3d697062f1
+--- /dev/null
++++ b/common/src/append-instructions.ts
+@@ -0,0 +1,19 @@
++/** Creation-time host context; retained in ordinary native conversation history. */
++export const APPEND_INSTRUCTIONS_KEY = 'host://append-instructions'
++export const MAX_APPEND_INSTRUCTIONS_BYTES = 64 * 1024
++
++export class AppendInstructionsError extends Error {
++  constructor(message = 'Invalid append instructions configuration; use a readable UTF-8 regular file of 1–65536 bytes.') {
++    super(message)
++    this.name = 'AppendInstructionsError'
++  }
++}
++
++export function validateAppendInstructions(value: unknown): asserts value is string {
++  if (typeof value !== 'string' || !value.trim() || value.includes('\0') ||
++      new TextEncoder().encode(value).length > MAX_APPEND_INSTRUCTIONS_BYTES ||
++      // Reject unpaired UTF-16 surrogates rather than silently replacing input.
++      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value)) {
++    throw new AppendInstructionsError()
++  }
++}
+diff --git a/docs/append-instructions.md b/docs/append-instructions.md
+new file mode 100644
+index 0000000000..042864705e
+--- /dev/null
++++ b/docs/append-instructions.md
+@@ -0,0 +1,33 @@
++# Additive creation instructions
++
++Hosts can set `FREEBUFF_APPEND_INSTRUCTIONS_FILE` to an absolute UTF-8 regular
++file path on Linux or macOS. The CLI validates it before first client admission,
++not at startup. A missing, unreadable, symlink, special, empty, invalid UTF-8,
++NUL-containing or oversized file fails admission with a sanitized instruction
++configuration error. The byte limit is 65536; input is not truncated. Windows
++file input is unsupported and fails closed when configured. Unset is a no-op.
++
++The process reads the file once, including caching failure. File/environment
++changes and login/client resets do not refresh it: restart the process for a new
++snapshot. SDK hosts can pass `appendInstructions: string` to `CodebuffClient`
++or `run`. The same runtime content validation applies.
++
++A fresh conversation adds this snapshot alongside project and home knowledge
++under reserved key `host://append-instructions`. Native prompts, model selection,
++tools and permissions remain intact. Default bundled Freebuff knowledge-aware
++roots consume it; custom definitions omitting the knowledge placeholder do not.
++This is not a universal custom-agent system-prompt override.
++
++Later turns and native saved history keep the creation snapshot. Omitting the
++option preserves it; identical explicit input is accepted without duplication.
++Different input or adding it to preexisting unmarked history is rejected before
++inference: start a new conversation. Compaction does not refresh instructions.
++The text remains in ordinary local saved history and optional developer traces,
++and is sent to the selected model. This is private host context, not a secret
++store or memory-only API. Do not put credentials in it. Runtime failure reporting
++omits prompt and message-history payloads when host instructions are configured;
++this does not promise that model responses never echo instructions.
++
++This public source change is not evidence that npm Freebuff 0.2.26 supports the
++input. Qualification of a CI-built prerelease must identify its source and binary
++hash independently of the private release source.
+diff --git a/packages/agent-runtime/src/run-agent-step.ts b/packages/agent-runtime/src/run-agent-step.ts
+index c89d151f1a..2b98bf179b 100644
+--- a/packages/agent-runtime/src/run-agent-step.ts
++++ b/packages/agent-runtime/src/run-agent-step.ts
+@@ -1,3 +1,4 @@
++import { APPEND_INSTRUCTIONS_KEY } from '@codebuff/common/append-instructions'
+ import { contextPrunerBudgetForModel } from '@codebuff/common/constants/model-config'
+ import { compactionThreshold } from '@codebuff/common/constants/compaction-policy'
+ import {
+@@ -1890,8 +1891,10 @@ export async function loopAgentSteps(
+         totalSteps,
+         directCreditsUsed: currentAgentState.directCreditsUsed,
+         creditsUsed: currentAgentState.creditsUsed,
+-        messageHistory: currentAgentState.messageHistory,
+-        systemPrompt: system,
++        messageHistory: fileContext.userKnowledgeFiles?.[APPEND_INSTRUCTIONS_KEY]
++          ? '[omitted: host instructions configured]' : currentAgentState.messageHistory,
++        systemPrompt: fileContext.userKnowledgeFiles?.[APPEND_INSTRUCTIONS_KEY]
++          ? '[omitted: host instructions configured]' : system,
+       },
+       'Agent execution failed',
+     )
+diff --git a/sdk/src/__tests__/append-instructions.test.ts b/sdk/src/__tests__/append-instructions.test.ts
+new file mode 100644
+index 0000000000..3664855585
+--- /dev/null
++++ b/sdk/src/__tests__/append-instructions.test.ts
+@@ -0,0 +1,65 @@
++import { afterEach, expect, test } from 'bun:test'
++import { mkdtemp, rm, writeFile } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { CodebuffClient } from '../client'
++import { createBase3 } from '../../../agents/base3'
++import { APPEND_INSTRUCTIONS_KEY, AppendInstructionsError } from '@codebuff/common/append-instructions'
++import type { AgentDefinition } from '@codebuff/common/templates/initial-agents-dir/types/agent-definition'
++
++const originalFetch = globalThis.fetch
++const dirs: string[] = []
++afterEach(async () => { globalThis.fetch = originalFetch; for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }) })
++
++// Native bundled system prompt, not a test-only knowledge placeholder.
++const agent = { ...createBase3(), id: 'snapshot-native-root', toolNames: [], spawnableAgents: [] } as AgentDefinition
++const byok = {
++  id: 'snapshot', revision: 1, name: 'test', provider: 'openai-compatible' as const,
++  baseUrl: 'http://127.0.0.1:9876/v1', model: 'scripted/model', apiKey: 'test-only',
++  credentialRef: 'connection:snapshot:1', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
++}
++
++test('constructor snapshot reaches native provider prompt; persists across turns and compact without replacing rules', async () => {
++  const cwd = await mkdtemp(join(tmpdir(), 'freebuff-snapshot-')); dirs.push(cwd)
++  await writeFile(join(cwd, 'AGENTS.md'), 'PROJECT_RULE_CANARY')
++  const requests: any[] = []
++  globalThis.fetch = (async (_input, init) => {
++    const body = JSON.parse(String(init?.body)); requests.push(body)
++    return new Response(`data: ${JSON.stringify({ id: 'done', object: 'chat.completion.chunk', created: 1, model: body.model,
++      choices: [{ index: 0, delta: { content: 'Complete.' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } })
++  }) as typeof fetch
++  const snapshot = 'HOST_RULE_CANARY 你好'
++  const client = new CodebuffClient({ cwd, byok, appendInstructions: snapshot, agentDefinitions: [agent] })
++  const first = await client.run({ agent: agent.id, prompt: '-Create hello.txt.' })
++  expect(first.output.type).not.toBe('error')
++  const system = JSON.stringify(requests[0].messages.filter((m: any) => m.role === 'system'))
++  expect(system).toContain('You are Buffy')
++  expect(system).toContain('PROJECT_RULE_CANARY')
++  expect(system).toContain(snapshot)
++  const user = JSON.stringify(requests[0].messages.filter((m: any) => m.role === 'user'))
++  expect(user).toContain('-Create hello.txt.')
++  expect(user).not.toContain(snapshot)
++  expect(first.sessionState!.fileContext.userKnowledgeFiles![APPEND_INSTRUCTIONS_KEY]).toBe(snapshot)
++  // Preserve native home-map data without changing real developer home files.
++  first.sessionState!.fileContext.userKnowledgeFiles!['~/.AGENTS.md'] = 'USER_RULE_CANARY'
++  const saved = JSON.parse(JSON.stringify(first))
++  const plainClient = new CodebuffClient({ cwd, byok, agentDefinitions: [agent] })
++  const second = await plainClient.run({ agent: agent.id, prompt: 'Continue.', previousRun: saved })
++  expect(second.output.type).not.toBe('error')
++  const secondSystem = JSON.stringify(requests.at(-1).messages.filter((m: any) => m.role === 'system'))
++  expect(secondSystem).toContain('USER_RULE_CANARY')
++  expect(secondSystem.split(snapshot)).toHaveLength(2)
++  const compacted = await client.run({ agent: agent.id, prompt: '/compact', previousRun: second })
++  expect(compacted.output.type).not.toBe('error')
++  expect(compacted.sessionState!.fileContext.userKnowledgeFiles![APPEND_INSTRUCTIONS_KEY]).toBe(snapshot)
++  const before = requests.length
++  for (const input of ['changed', '', '\0', 'a'.repeat(65537), '\ud800', null, 42]) {
++    await expect(plainClient.run({ agent: agent.id, prompt: 'Continue.', previousRun: compacted, appendInstructions: input as string })).rejects.toBeInstanceOf(AppendInstructionsError)
++  }
++  expect(requests).toHaveLength(before)
++  const legacy = JSON.parse(JSON.stringify(first)); delete legacy.sessionState.fileContext.userKnowledgeFiles
++  await expect(client.run({ agent: agent.id, prompt: 'Retrofit.', previousRun: legacy })).rejects.toThrow('start a new conversation')
++  const defaultRun = await plainClient.run({ agent: agent.id, prompt: 'Legacy.', previousRun: legacy })
++  expect(defaultRun.output.type).not.toBe('error')
++  expect(defaultRun.sessionState!.fileContext.userKnowledgeFiles?.[APPEND_INSTRUCTIONS_KEY]).toBeUndefined()
++})
+diff --git a/sdk/src/client.ts b/sdk/src/client.ts
+index 5440ba71b4..d9c080e1a1 100644
+--- a/sdk/src/client.ts
++++ b/sdk/src/client.ts
+@@ -67,6 +67,7 @@ export class CodebuffClient {
+       // An omitted/undefined per-call config inherits the client snapshot.
+       // run() enforces the history pin unless the host explicitly authorizes a switch.
+       byok: options.byok ?? this.options.byok,
++      appendInstructions: options.appendInstructions ?? this.options.appendInstructions,
+     })
+   }
+ 
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index ede227775a..32b74928be 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -1,3 +1,4 @@
++import { APPEND_INSTRUCTIONS_KEY, AppendInstructionsError, validateAppendInstructions } from '@codebuff/common/append-instructions'
+ import path from 'path'
+ 
+ import { callMainPrompt } from '@codebuff/agent-runtime/main-prompt'
+@@ -202,6 +203,8 @@ export type CodebuffClientOptions = {
+    *  `computeProjectIndexFromFiles`). Skips the per-run tree-sitter parse;
+    *  ignored when `projectFiles` is absent. */
+   projectIndex?: ComputedProjectIndex
++  /** Immutable creation snapshot, rendered by native knowledge-aware templates. */
++  appendInstructions?: string
+   knowledgeFiles?: Record<string, string>
+   agentDefinitions?: AgentDefinition[]
+   maxAgentSteps?: number
+@@ -462,6 +465,15 @@ type RunExecutionOptions = RunOptions &
+ type RunReturnType = RunState
+ 
+ export async function run(options: RunExecutionOptions): Promise<RunState> {
++  if (options.appendInstructions !== undefined) {
++    validateAppendInstructions(options.appendInstructions)
++    if (options.previousRun?.sessionState &&
++        options.previousRun.sessionState.fileContext.userKnowledgeFiles?.[APPEND_INSTRUCTIONS_KEY] !== options.appendInstructions) {
++      throw new AppendInstructionsError(
++        'Append instructions are fixed when a conversation starts; start a new conversation.',
++      )
++    }
++  }
+   const requestedInference = options.byok
+     ? { source: 'byok' as const, connectionId: options.byok.id, revision: options.byok.revision, model: options.byok.model }
+     : { source: 'codebuff' as const }
+@@ -544,6 +556,7 @@ async function runOnce({
+   projectFiles,
+   projectIndex,
+   knowledgeFiles,
++  appendInstructions,
+   agentDefinitions,
+   maxAgentSteps = MAX_AGENT_STEPS_DEFAULT,
+   env,
+@@ -639,6 +652,12 @@ async function runOnce({
+       logger,
+     })
+   }
++  if (!previousRun?.sessionState && appendInstructions !== undefined) {
++    sessionState.fileContext.userKnowledgeFiles = {
++      ...sessionState.fileContext.userKnowledgeFiles,
++      [APPEND_INSTRUCTIONS_KEY]: appendInstructions,
++    }
++  }
+   const traceSessionId =
+     previousRun?.traceSessionId ?? traceSessionIdOption ?? crypto.randomUUID()
+   applyTerminalShell(sessionState, terminalShell)
