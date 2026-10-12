@@ -1,0 +1,834 @@
+Date: 2026-10-12T00:53:03Z
+Category: Core
+Areas: Shared/Core
+Commit nature: production
+Stats: +48 / -47
+Analysis notes: Shared/Core changes across 1 file(s) (+48/−47).
+Modified files: common/src/sites/client.ts
+Complete Source of Modified Files (for complete module context):
+- File `common/src/sites/client.ts` (373 lines):
+```
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { z } from 'zod/v4'
+import { bundleSite, readSiteSecret } from './local-files'
+
+import { SitesClientError } from './errors'
+export { SitesClientError } from './errors'
+const uuid = z.string().uuid()
+const environment = z.enum(['preview', 'production'])
+const key = z.string().regex(/^[a-zA-Z0-9_-]{8,128}$/)
+const name = z
+  .string()
+  .regex(/^[A-Z][A-Z0-9_]{0,63}$/)
+  .refine(
+    (s) =>
+      ![
+        'ASSETS',
+        'FREEBUFF_CLIENT_ID',
+        'FREEBUFF_ISSUER',
+        'APP_ORIGIN',
+      ].includes(s),
+  )
+const target = z.object({ siteId: uuid, environment })
+const invalid = (message: string) =>
+  new SitesClientError(400, 'invalid_site_request', message)
+const IDEMPOTENT_TOOLS = new Set([
+  'sites_deploy',
+  'sites_add_storage',
+  'sites_set_secret',
+  'sites_set_published',
+])
+
+export class SitesClient {
+  private context = new AsyncLocalStorage<{
+    originProjectId: string
+    originProjectType: 'local' | 'cloud'
+  }>()
+  constructor(
+    private options: {
+      getToken: () => string | null | undefined
+      originApp: 'desktop' | 'web'
+      files?: { bundle: typeof bundleSite; secret: typeof readSiteSecret }
+      host: string
+      fetcher?: (url: string, init: RequestInit) => Promise<Response>
+    },
+  ) {}
+  async request(
+    path: string,
+    method = 'GET',
+    body?: unknown,
+    idempotencyKey?: string,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const token = this.options.getToken()
+    if (!token)
+      throw new SitesClientError(
+        401,
+        'sites_sign_in_required',
+        'Sign in to Freebuff to view and deploy sites.',
+      )
+    // All callers construct a relative path from validated ids; no redirects may receive the bearer.
+    try {
+      const response = await (this.options.fetcher ?? fetch)(
+        `${this.options.host}/api/v1/sites${path}`,
+        {
+          method,
+          redirect: 'error',
+          signal: AbortSignal.any([
+            AbortSignal.timeout(120000),
+            ...(signal ? [signal] : []),
+          ]),
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'X-Freebuff-Product-Context': JSON.stringify({
+              originApp: this.options.originApp,
+              ...this.context.getStore(),
+            }),
+            ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        },
+      )
+      const data = (await response.json()) as {
+        message?: string
+        error?: string
+        operation?: unknown
+      }
+      if (!response.ok && !data.operation) {
+        const knownErrors: Record<string, string> = {
+          sites_usage_limit:
+            'Your sites have reached a hosting allowance and are paused. Open Sites to view usage and reset dates. Your data is preserved.',
+          sites_usage_unavailable:
+            'Hosting usage is being checked. Try again shortly.',
+          project_limit:
+            '[freebuff product prompt text omitted]',
+          binding_limit:
+            'Each site environment includes one database and one storage bucket. Reuse the existing binding.',
+          variable_limit:
+            'This project has reached its limit of 25 environment variables across Preview and Production. Replace or delete an existing variable.',
+          deploy_required: 'Deploy this environment first.',
+          binding_exists:
+            'That name is already used by a database or storage binding.',
+          secret_not_found: 'This variable no longer exists. Refresh the list.',
+          environment_busy:
+            'An operation is running or needs reconciliation. Refresh deployment activity before trying again.',
+          site_deleting: 'This site is being deleted.',
+        }
+        const messages: Record<number, string> = {
+          401: 'Sign in to Freebuff to use Sites.',
+          403: 'Your account cannot access Sites.',
+          404: 'Sites is not enabled on this backend, or this site was not found.',
+          409: 'The environment is busy or the request conflicts with an earlier operation.',
+          429: 'Sites usage limit reached. Try again later.',
+          503: 'Sites is not configured or is temporarily busy.',
+        }
+        throw new SitesClientError(
+          response.status,
+          'sites_request_failed',
+          knownErrors[data.error ?? ''] ??
+            messages[response.status] ??
+            'The Sites request failed. Check the deployment manifest and operation status.',
+        )
+      }
+      return data
+    } catch (error) {
+      if (error instanceof SitesClientError) throw error
+      throw new SitesClientError(
+        502,
+        'sites_connection_failed',
+        'Couldn’t reach Sites. Check your connection and try again.',
+      )
+    }
+  }
+  async setPublished(
+    siteId: string,
+    env: string,
+    published: boolean,
+    requestId: string,
+    signal?: AbortSignal,
+  ) {
+    try {
+      uuid.parse(siteId)
+      environment.parse(env)
+      key.parse(requestId)
+      z.boolean().parse(published)
+    } catch {
+      throw invalid('Use a valid site, environment and request id.')
+    }
+    return this.request(
+      `/${siteId}/environments/${env}/publication`,
+      published ? 'PUT' : 'DELETE',
+      undefined,
+      requestId,
+      signal,
+    )
+  }
+  async deleteSite(siteId: string) {
+    if (!uuid.safeParse(siteId).success) throw invalid('Use a valid site id.')
+    return this.request(`/${siteId}`, 'DELETE')
+  }
+  async writeSecret(
+    siteId: string,
+    env: string,
+    binding: string,
+    method: 'PUT' | 'DELETE',
+    raw: unknown,
+    requestId: string,
+  ) {
+    try {
+      uuid.parse(siteId)
+      environment.parse(env)
+      name.parse(binding)
+      key.parse(requestId)
+      const input =
+        method === 'PUT'
+          ? z
+              .strictObject({
+                value: z
+                  .string()
+                  .min(1)
+                  .max(5120)
+                  .refine((value) => Buffer.byteLength(value, 'utf8') <= 5120),
+              })
+              .parse(raw)
+          : undefined
+      return await this.request(
+        `/${siteId}/environments/${env}/secrets/${binding}`,
+        method,
+        input,
+        requestId,
+      )
+    } catch (error) {
+      if (error instanceof SitesClientError) throw error
+      throw invalid(
+        'Use an uppercase variable name and a non-empty value of at most 5 KB. Platform binding names are reserved.',
+      )
+    }
+  }
+  async read(parts: string[], query = new URLSearchParams()) {
+    if (parts.length === 0) return this.request('')
+    uuid.parse(parts[0])
+    if (parts.length === 1) return this.request('/' + parts[0])
+    if (parts[1] !== 'environments') throw invalid('Unknown Sites path.')
+    environment.parse(parts[2])
+    const suffix = parts.slice(3)
+    if (
+      !(
+        suffix.length === 0 ||
+        (suffix.length === 1 &&
+          ['operations', 'analytics'].includes(suffix[0])) ||
+        (suffix.length === 2 &&
+          suffix[0] === 'auth' &&
+          ['analytics', 'users'].includes(suffix[1])) ||
+        (suffix.length === 2 &&
+          suffix[0] === 'operations' &&
+          uuid.safeParse(suffix[1]).success) ||
+        (suffix.length === 3 &&
+          suffix[0] === 'storage' &&
+          name.safeParse(suffix[1]).success &&
+          ['tables', 'rows', 'objects'].includes(suffix[2]))
+      )
+    )
+      throw invalid('Unknown Sites path.')
+    const search = new URLSearchParams()
+    for (const field of ['table', 'offset', 'cursor', 'q', 'days']) {
+      const value = query.get(field)
+      if (value !== null && value.length <= 2000) search.set(field, value)
+    }
+    return this.request(
+      '/' +
+        parts.map(encodeURIComponent).join('/') +
+        (search.size ? '?' + search : ''),
+    )
+  }
+  async runToolWithContext(
+    tool: string,
+    raw: unknown,
+    cwd: string,
+    mode: string,
+    signal?: AbortSignal,
+    context?: { originProjectId: string; originProjectType: 'local' | 'cloud' },
+  ) {
+    const run = () => this.runTool(tool, raw, cwd, mode, signal)
+    return context ? this.context.run(context, run) : run()
+  }
+  private async runTool(
+    tool: string,
+    raw: unknown,
+    cwd: string,
+    mode: string,
+    signal?: AbortSignal,
+  ) {
+    try {
+      if (mode === 'plan' && !['sites_list', 'sites_inspect'].includes(tool))
+        throw invalid('Sites mutations are unavailable in plan mode.')
+      if (tool === 'sites_list')
+        return await this.request('', 'GET', undefined, undefined, signal)
+      if (tool === 'sites_create') {
+        const args = z
+          .object({ siteId: uuid, name: z.string().min(1).max(80) })
+          .strict()
+          .parse(raw)
+        return await this.request(
+          '',
+          'POST',
+          { id: args.siteId, name: args.name },
+          undefined,
+          signal,
+        )
+      }
+      const args = target.passthrough().parse(raw)
+      const path = `/${args.siteId}/environments/${args.environment}`
+      if (tool === 'sites_set_published') {
+        const input = target
+          .extend({ published: z.boolean(), requestId: key })
+          .strict()
+          .parse(raw)
+        return await this.setPublished(
+          input.siteId,
+          input.environment,
+          input.published,
+          input.requestId,
+          signal,
+        )
+      }
+      if (tool === 'sites_inspect') {
+        const [environment, activity] = await Promise.all([
+          this.request(path, 'GET', undefined, undefined, signal),
+          this.request(
+            path + '/operations',
+            'GET',
+            undefined,
+            undefined,
+            signal,
+          ),
+        ])
+        return { environment, activity }
+      }
+      if (tool === 'sites_enable_auth') {
+        const input = target
+          .extend({ localOrigin: z.string().url().optional() })
+          .strict()
+          .parse(raw)
+        return await this.request(
+          path + '/auth',
+          'POST',
+          { localOrigin: input.localOrigin },
+          undefined,
+          signal,
+        )
+      }
+      const requestId = key.parse(args.requestId)
+      if (tool === 'sites_deploy') {
+        const manifestPath = z.string().min(1).parse(args.manifestPath)
+        const bundle = await (this.options.files?.bundle ?? bundleSite)(
+          cwd,
+          manifestPath,
+        )
+        return await this.request(
+          path + '/deployments',
+          'POST',
+          bundle,
+          requestId,
+          signal,
+        )
+      }
+      if (tool === 'sites_add_storage') {
+        const kind = z.enum(['d1', 'r2']).parse(args.kind)
+        return await this.request(
+          path + '/' + kind,
+          'POST',
+          { name: name.parse(args.name) },
+          requestId,
+          signal,
+        )
+      }
+      if (tool === 'sites_set_secret') {
+        const binding = name.parse(args.name)
+        const value = await (this.options.files?.secret ?? readSiteSecret)(
+          cwd,
+          z.string().min(1).parse(args.valueFile),
+        )
+        return await this.request(
+          path + '/secrets/' + binding,
+          'PUT',
+          { value },
+          requestId,
+          signal,
+        )
+      }
+      throw invalid('Unknown Sites tool.')
+    } catch (error) {
+      // People read the connection message; an agent also needs to know an
+      // unanswered mutation may have landed and is only safe to repeat by key.
+      if (error instanceof SitesClientError)
+        return {
+          error: error.code,
+          message:
+            error.code === 'sites_connection_failed' &&
+            IDEMPOTENT_TOOLS.has(tool)
+              ? `${error.message} The operation may still be running: retry with the same requestId.`
+              : error.message,
+        }
+      // Filesystem and validator errors must never echo file contents / secret values.
+      return {
+        error: 'invalid_site_request',
+        message:
+          'Could not prepare the Sites request. Check arguments and workspace files.',
+      }
+    }
+  }
+}
+```
+Where the symbols this change introduces are used elsewhere, at this same revision (the code that reads them; this is evidence for the WHAT and the WHY, and it is the only source for who consumes this change):
+- File `cli/src/hooks/use-freebuff-session.ts` (11 matching lines):
+```
+...(freebucks !== undefined ? { freebucks } : {}),
+    ...(limitedModelOffers.length > 0 ? { limitedModelOffers } : {}),
+    ...(countryCode ? { countryCode } : {}),
+    ...(countryBlockReason ? { countryBlockReason } : {}),
+    ...(ipPrivacySignals ? { ipPrivacySignals } : {}),
+  }
+}
+
+interface RestartOpts {
+  /** Send-time admission owns a queued prompt and has already waited for the run to finish. */
+  preserveQueue?: boolean
+  resetChat?: boolean
+  /** DELETE the held slot before restarting so the next POST starts clean. */
+  releaseSlot?: boolean
+}
+
+async function restartFreebuffSession(
+  mode: RestartMode,
+  opts: RestartOpts = {},
+): Promise<void> {
+  if (!IS_FREEBUFF) return
+  // A reset changes chat ownership. Stop and checkpoint the old run before
+  // resetting its store so late deltas cannot land in the next session.
+  if (opts.resetChat || (opts.releaseSlot && !opts.preserveQueue)) {
+    stopActiveRun('session-transition')
+  }
+  // Halt the running poll loop before we touch local stores or DELETE the
+  // slot. Otherwise an in-flight GET could land mid-reset and overwrite
+  // state, or the next scheduled tick could fire between DELETE and
+  // restart() with stale assumptions. restart() re-aborts and re-arms
+  // below; the extra abort here is cheap.
+  const currentController = controller
+  const currentToken = getAuthTokenDetails().token
+  const currentSession = useFreebuffSessionStore.getState().session
+  const currentAttempt = useFreebuffSessionStore.getState().pendingAdmission
+  const stillCurrent = () =>
+    controller === currentController &&
+    getAuthTokenDetails().token === currentToken &&
+    useFreebuffSessionStore.getState().session === currentSession
+  currentController?.abort()
+  if (opts.releaseSlot) {
+```
+- File `cli/src/hooks/__tests__/freebuff-model-switch.test.tsx` (6 matching lines):
+```
+import { useFreebuffSessionStore } from '../../state/freebuff-session-store'
+import * as auth from '../../utils/auth'
+import { IS_FREEBUFF } from '../../utils/constants'
+import { startFreebuffSession, useFreebuffSession } from '../use-freebuff-session'
+
+const GLM = 'z-ai/glm-5.3-flash'
+const DEEPSEEK = 'deepseek/deepseek-v4-flash'
+
+/**
+ * The deliberate-switch path: a user on one model picks another, the server
+ * answers `model_locked`, and the CLI ends the held session before re-claiming.
+ *
+ * The DELETE it issues MUST carry the held session's instance id. Ending is
+ * instance-keyed since the 90%-refund settlement (2026-09-07) — the handler
+ * answers 400 `instance_required` without it — and for two days before that
+ * release the switch path sent a bare DELETE, so every pick of a second model
+ * died with "ending it failed" and reverted to the model already running.
+ *
+ * The id has to come off the GET rather than from this process's own state:
+ * the locked row is frequently a stale one from a CLI that crashed, whose
+ * instance this process never saw.
+ *
+ * Run with: FREEBUFF_MODE=true bun test src/hooks/__tests__/freebuff-model-switch.test.tsx
+ */
+describe.skipIf(!IS_FREEBUFF)('freebuff model switch', () => {
+  let authSpy: ReturnType<typeof spyOn>
+  let fetchSpy: ReturnType<typeof spyOn>
+…
+const switchedToDeepseek = new Promise<void>((resolve) => {
+      switched = resolve
+    })
+
+    fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
+      (async (_url: string, init: RequestInit = {}) => {
+        const method = (init.method ?? 'GET').toUpperCase()
+        const instanceId = new Headers(init.headers).get(
+          'x-freebuff-instance-id',
+        )
+        calls.push({ method, instanceId })
+
+        if (method === 'DELETE') {
+          // The whole point of the test: a bare DELETE is what production
+          // rejects, so reproduce that rejection rather than accepting it.
+          if (!instanceId) {
+            return new Response(
+              JSON.stringify({ error: 'instance_required' }),
+              { status: 400 },
+            )
+          }
+          return Response.json({ status: 'ended', freebucksRefund: 3 })
+        }
+        if (method === 'GET') {
+          return Response.json(heldSession)
+```
+- File `cli/src/hooks/__tests__/freebuff-multi-session.test.tsx` (5 matching lines):
+```
+input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      // Like the real transport: an already-aborted signal never reaches the
+      // network. Without this, a request made on a dead controller passes.
+      if (init?.signal?.aborted)
+        throw new DOMException('The operation was aborted.', 'AbortError')
+      const headers = new Headers(init?.headers)
+      const method = init?.method ?? 'GET'
+      const path = new URL(String(input)).pathname
+      requests.push({ method, headers, path })
+      // Exercise the real hook and transport against an independently keyed
+      // session service. A global GET or DELETE would affect the sibling row.
+      expect(headers.get('x-freebuff-multi-session')).toBe('1')
+      const id = headers.get('x-freebuff-instance-id')!
+      expect(id).toStartWith('cli:')
+      if (method === 'GET')
+        return Response.json(
+          rows.get(id) ?? {
+            status: 'none',
+            accessTier: tier,
+            freebucks: meter,
+          },
+        )
+      expect(headers.get('x-freebuff-desktop-attempt-id')).toBe(id.slice(4))
+      if (method === 'DELETE') {
+        expect(path).toEndWith('/session/attempt')
+        rows.delete(id)
+        if (loseDeleteResponse) {
+          loseDeleteResponse = false
+          throw new TypeError('response lost')
+        }
+        return Response.json({ status: 'ended', freebucksRefund: 0 })
+      }
+      if (rejectAdmission)
+        return Response.json({ error: 'test refusal' }, { status: 403 })
+      const model = headers.get('x-freebuff-model')!
+      const holder = [...rows.keys()].find((key) => key !== id)
+…
+const previousPid = process.env.CODEBUFF_LAUNCHER_PID
+    process.env.CODEBUFF_LAUNCHER_PID = '12345'
+    try {
+      rows.set('desktop-sibling', active('desktop-sibling'))
+      await mount()
+      await cli.startFreebuffSession(FREEBUFF_MIMO_V25_MODEL_ID)
+      const original = cli.getFreebuffInstanceId()!
+      useFreebuffSessionStore.getState().keepSlotForRelaunch()
+      await useFreebuffSessionStore.getState().releaseSlot()
+      close!()
+      close = undefined
+      expect(rows.has(original)).toBe(true)
+      expect(requests.filter((r) => r.method === 'DELETE')).toHaveLength(0)
+
+      process.env.CODEBUFF_LAUNCHER_PID = '54321'
+      expect(consumeFreebuffSessionRelaunch('fixture')).toBeUndefined()
+      process.env.CODEBUFF_LAUNCHER_PID = '12345'
+      useFreebuffSessionStore.getState().setSession(null)
+      useFreebuffSessionStore.setState({ slotKeptForRelaunch: false })
+      await mount('active')
+      expect(cli.getFreebuffInstanceId()).toBe(original)
+      expect(purchases).toBe(1)
+      expect(rows.has('desktop-sibling')).toBe(true)
+      expect(consumeFreebuffSessionRelaunch('fixture')).toBeUndefined()
+    } finally {
+```
+- File `cli/src/hooks/__tests__/freebuff-legacy-relaunch.test.tsx` (4 matching lines):
+```
+const instanceId = headers.get('x-freebuff-instance-id')
+      requests.push({ method, multi, instanceId, token })
+      const model = headers.get('x-freebuff-model')!
+      if (!multi) {
+        const held = legacy.get(token)
+        if (method === 'GET') {
+          if (failLegacyGet) throw new TypeError('network down')
+          if (!held) return Response.json({ status: 'none' })
+          if (instanceId && instanceId !== held.instanceId)
+            return Response.json({ status: 'superseded' })
+          return Response.json(held)
+        }
+        if (method === 'DELETE') {
+          legacy.delete(token)
+          return Response.json({ status: 'ended' })
+        }
+        // requestSession: an active same-model row is rotated on the same
+        // expiry (a takeover, not an admission); anything else is a purchase.
+        if (held && held.model === model) {
+          const rotated = { ...held, instanceId: randomUUID() }
+          legacy.set(token, rotated)
+          return Response.json(rotated)
+        }
+        purchases++
+        const fresh = row(randomUUID(), model)
+        legacy.set(token, fresh)
+        return Response.json(fresh)
+      }
+      const id = instanceId!
+      if (method === 'GET')
+        return Response.json(claims.get(id) ?? { status: 'none' })
+      if (method === 'DELETE') {
+        claims.delete(id)
+        return Response.json({ status: 'ended', freebucksRefund: 0 })
+      }
+      if (!claims.has(id)) {
+        purchases++
+        claims.set(id, row(id, model))
+      }
+      return Response.json(claims.get(id))
+    }) as typeof fetch)
+  })
+
+  afterEach(async () => {
+…
+expect(cli.getFreebuffInstanceId()).toBe(rotated)
+    expect(rotated).not.toBe('ea1559bb-legacy')
+    expect(requests.slice(0, 2)).toEqual([
+      {
+        method: 'GET',
+        multi: false,
+        instanceId: 'ea1559bb-legacy',
+        token: 'fixture',
+      },
+      { method: 'POST', multi: false, instanceId: null, token: 'fixture' },
+    ])
+    expect(requests.every((r) => !r.multi)).toBe(true)
+    expect(requests.some((r) => r.method === 'DELETE')).toBe(false)
+    // A later launch after THIS process dies may resume the same hour again,
+    // but never the retired instance.
+    const owner = JSON.parse(readFileSync(ownerPath(), 'utf8'))
+    expect(owner).toMatchObject({ instanceId: rotated, pid: process.pid })
+    expect(owner.tokenKey).toBe(tokenKey('fixture'))
+
+    // Ending it releases the legacy row; the next pick is an ordinary claim.
+    await cli.returnToFreebuffLanding()
+    expect(legacy.has('fixture')).toBe(false)
+    expect(requests.find((r) => r.method === 'DELETE')?.multi).toBe(false)
+    await cli.startFreebuffSession(FREEBUFF_MIMO_V25_MODEL_ID)
+    expect(cli.getFreebuffInstanceId()).toStartWith('cli:')
+```
+- File `cli/src/utils/__tests__/codebuff-api.test.ts` (3 matching lines):
+```
+})
+
+      await client.patch('/api/v1/test', { key: 'value' }, { retry: false })
+
+      const [, options] = mockFetch.mock.calls[0] as [
+        string,
+        RequestInit | undefined,
+      ]
+      expect(options?.method).toBe('PATCH')
+    })
+  })
+
+  describe('DELETE requests', () => {
+    test('should make DELETE request without body', async () => {
+      const client = createCodebuffApiClient({
+        baseUrl: 'https://test.api',
+        fetch: mockFetch as unknown as typeof fetch,
+      })
+
+      await client.delete('/api/v1/test/123', { retry: false })
+
+      const [url, options] = mockFetch.mock.calls[0] as [
+        string,
+        RequestInit | undefined,
+      ]
+      expect(url).toBe('https://test.api/api/v1/test/123')
+      expect(options?.method).toBe('DELETE')
+      expect(options?.body).toBeUndefined()
+    })
+  })
+
+  describe('response handling', () => {
+    test('should return ok response with data', async () => {
+      const responseData = { id: 'user-123', email: 'test@example.com' }
+      const mockSuccessFetch = mock<MockFetch>(() =>
+        Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(responseData),
+```
+- File `cli/src/state/freebuff-session-store.ts` (2 matching lines):
+```
+(set, get) => {
+    // Coalesce exit, unmount and explicit end for the same authenticated instance.
+    const releases = new Map<string, Promise<void>>()
+    return {
+      session: null,
+      pendingAdmission: null,
+      setPendingAdmission: (pendingAdmission) => set({ pendingAdmission }),
+      lastRefund: null,
+      pendingRefund: null,
+      refreshRefund: async () => {
+        const pending = get().pendingRefund
+        if (!pending || getAuthTokenDetails().token !== pending.token) return
+        const receipt = await callFreebuffSession('DELETE', pending.token, {
+          instanceId: pending.instanceId,
+        })
+        if (
+          get().pendingRefund !== pending ||
+          getAuthTokenDetails().token !== pending.token
+        )
+          return
+        if (receipt.status === 'ended' && !receipt.freebucksRefundPending)
+          set({ lastRefund: receipt.freebucksRefund ?? 0, pendingRefund: null })
+      },
+      slotKeptForRelaunch: false,
+      keepSlotForRelaunch: () => {
+…
+}
+        const key = JSON.stringify([token, instanceId])
+        const existing = releases.get(key)
+        if (existing) return existing
+        const owner = get().session
+        const stillOwned = () =>
+          (get().session === owner ||
+            (instanceOf(owner) !== undefined &&
+              instanceOf(get().session) === instanceOf(owner))) &&
+          getAuthTokenDetails().token === token
+        const release = (async () => {
+          try {
+            const result = await callFreebuffSession('DELETE', token, {
+              instanceId,
+              signal,
+            })
+            if (result.status !== 'ended') {
+              throw new Error(
+                'The server did not confirm that the session ended.',
+              )
+            }
+            if (get().pendingAdmission === pending)
+              set({ pendingAdmission: null })
+            if (stillOwned())
+              set({
+```
+Diff (source hunks; lockfiles and pure test hunks omitted, except in a lockfile-only commit):
+```diff
+diff --git a/common/src/sites/client.ts b/common/src/sites/client.ts
+index 72884693b..f5455685b 100644
+--- a/common/src/sites/client.ts
++++ b/common/src/sites/client.ts
+@@ -81,100 +81,105 @@ export class SitesClient {
+         },
+       )
+       const data = (await response.json()) as {
+         message?: string
+         error?: string
+         operation?: unknown
+       }
+       if (!response.ok && !data.operation) {
+         const knownErrors: Record<string, string> = {
+           sites_usage_limit:
+             'Your sites have reached a hosting allowance and are paused. Open Sites to view usage and reset dates. Your data is preserved.',
+           sites_usage_unavailable:
+             'Hosting usage is being checked. Try again shortly.',
+           project_limit:
+             '[freebuff product prompt text omitted]',
+           binding_limit:
+             'Each site environment includes one database and one storage bucket. Reuse the existing binding.',
+           variable_limit:
+             'This project has reached its limit of 25 environment variables across Preview and Production. Replace or delete an existing variable.',
+           deploy_required: 'Deploy this environment first.',
+           binding_exists:
+             'That name is already used by a database or storage binding.',
+           secret_not_found: 'This variable no longer exists. Refresh the list.',
+           environment_busy:
+             'An operation is running or needs reconciliation. Refresh deployment activity before trying again.',
++          site_deleting: 'This site is being deleted.',
+         }
+         const messages: Record<number, string> = {
+           401: 'Sign in to Freebuff to use Sites.',
+           403: 'Your account cannot access Sites.',
+           404: 'Sites is not enabled on this backend, or this site was not found.',
+           409: 'The environment is busy or the request conflicts with an earlier operation.',
+           429: 'Sites usage limit reached. Try again later.',
+           503: 'Sites is not configured or is temporarily busy.',
+         }
+         throw new SitesClientError(
+           response.status,
+           'sites_request_failed',
+           knownErrors[data.error ?? ''] ??
+             messages[response.status] ??
+             'The Sites request failed. Check the deployment manifest and operation status.',
+         )
+       }
+       return data
+     } catch (error) {
+       if (error instanceof SitesClientError) throw error
+       throw new SitesClientError(
+         502,
+         'sites_connection_failed',
+         'Couldn’t reach Sites. Check your connection and try again.',
+       )
+     }
+   }
+   async setPublished(
+     siteId: string,
+     env: string,
+     published: boolean,
+     requestId: string,
+     signal?: AbortSignal,
+   ) {
+     try {
+       uuid.parse(siteId)
+       environment.parse(env)
+       key.parse(requestId)
+       z.boolean().parse(published)
+     } catch {
+       throw invalid('Use a valid site, environment and request id.')
+     }
+     return this.request(
+       `/${siteId}/environments/${env}/publication`,
+       published ? 'PUT' : 'DELETE',
+       undefined,
+       requestId,
+       signal,
+     )
+   }
++  async deleteSite(siteId: string) {
++    if (!uuid.safeParse(siteId).success) throw invalid('Use a valid site id.')
++    return this.request(`/${siteId}`, 'DELETE')
++  }
+   async writeSecret(
+     siteId: string,
+     env: string,
+     binding: string,
+     method: 'PUT' | 'DELETE',
+     raw: unknown,
+     requestId: string,
+   ) {
+     try {
+       uuid.parse(siteId)
+       environment.parse(env)
+       name.parse(binding)
+       key.parse(requestId)
+       const input =
+         method === 'PUT'
+           ? z
+               .strictObject({
+                 value: z
+                   .string()
+                   .min(1)
+                   .max(5120)
+                   .refine((value) => Buffer.byteLength(value, 'utf8') <= 5120),
+               })
+               .parse(raw)
+           : undefined
+
+```
