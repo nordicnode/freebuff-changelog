@@ -1,5 +1,5 @@
 diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
-index 698d155819..ec8befeac1 100644
+index 698d155819..3ade308f06 100644
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
 @@ -10,10 +10,13 @@ name: Public CI
@@ -17,17 +17,40 @@ index 698d155819..ec8befeac1 100644
  concurrency:
    group: public-ci-${{ github.workflow }}-${{ github.ref }}
    cancel-in-progress: true
-@@ -35,6 +38,9 @@ jobs:
-       - name: Build SDK
+@@ -32,9 +35,31 @@ jobs:
+       - name: Install dependencies
+         run: bun install --frozen-lockfile
+ 
+-      - name: Build SDK
++      - name: Build SDK (including declarations)
++        id: sdk
++        continue-on-error: true
          run: bun run build:sdk
  
 +      - name: Additive instruction regression tests
-+        run: bun test sdk/src/__tests__/append-instructions.test.ts cli/src/utils/append-instructions.test.ts
++        run: |
++          FREEBUFF_MODE=true bun --cwd cli run scripts/prebuild-agents.ts
++          bun test sdk/src/__tests__/append-instructions.test.ts cli/src/utils/append-instructions.test.ts
++          bun test cli/src/utils/append-instructions-admission.test.ts
++
++      - name: Stock-source negative control for SDK composition
++        run: |
++          cp sdk/src/run.ts /tmp/patched-run.ts
++          git show 80c2f596b5af1a331fb2904f392a8d77485eb4f2:sdk/src/run.ts > sdk/src/run.ts
++          set +e
++          FREEBUFF_MODE=true bun --cwd cli run scripts/prebuild-agents.ts
++          bun test sdk/src/__tests__/append-instructions.test.ts > /tmp/negative-control.log 2>&1
++          result=$?
++          set -e
++          cp /tmp/patched-run.ts sdk/src/run.ts
++          cat /tmp/negative-control.log
++          test "$result" -ne 0
++          grep -q 'HOST_RULE_CANARY' /tmp/negative-control.log
 +
        - name: Build Freebuff binary
          run: bun freebuff/cli/build.ts 0.0.0-ci
  
-@@ -52,3 +58,10 @@ jobs:
+@@ -52,3 +77,14 @@ jobs:
            chmod +x cli/bin/freebuff
            cli/bin/freebuff --version
            bun cli/scripts/smoke-binary.ts cli/bin/freebuff
@@ -38,6 +61,27 @@ index 698d155819..ec8befeac1 100644
 +          name: freebuff-linux-${{ github.sha }}
 +          path: cli/bin/freebuff
 +          retention-days: 7
++
++      - name: Preserve declaration-build failure
++        if: steps.sdk.outcome == 'failure'
++        run: exit 1
+diff --git a/cli/scripts/build-binary.ts b/cli/scripts/build-binary.ts
+index 4b2ef71b7b..1a8cba383e 100644
+--- a/cli/scripts/build-binary.ts
++++ b/cli/scripts/build-binary.ts
+@@ -144,9 +144,10 @@ async function main() {
+     env: process.env,
+   })
+ 
+-  // Ensure SDK assets exist before compiling the CLI
++  // The binary consumes runtime SDK assets, not TypeScript declarations.
++  // Declaration generation remains a separate SDK CI check.
+   log('Building SDK dependencies...')
+-  runCommand('bun', ['run', '--cwd', '../sdk', 'build'], {
++  runCommand('bun', ['run', '--cwd', '../sdk', 'build', '--no-types'], {
+     cwd: cliRoot,
+     env: process.env,
+   })
 diff --git a/cli/src/hooks/use-send-message.ts b/cli/src/hooks/use-send-message.ts
 index 0bcdaedb8a..a3a0156399 100644
 --- a/cli/src/hooks/use-send-message.ts
@@ -61,12 +105,41 @@ index 0bcdaedb8a..a3a0156399 100644
                ? byokLoadFailureMessage(error)
                : '⚠️ Unable to create the client. Please check your authentication and try again.',
            ),
+diff --git a/cli/src/utils/append-instructions-admission.test.ts b/cli/src/utils/append-instructions-admission.test.ts
+new file mode 100644
+index 0000000000..3237674ed6
+--- /dev/null
++++ b/cli/src/utils/append-instructions-admission.test.ts
+@@ -0,0 +1,23 @@
++import { expect, test } from 'bun:test'
++import { getCodebuffClient, resetCodebuffClient } from './codebuff-client'
++import { AppendInstructionsError } from './append-instructions'
++
++test('invalid host input fails real CLI client admission before auth/provider and remains fail closed after reset', async () => {
++  const original = process.env.FREEBUFF_APPEND_INSTRUCTIONS_FILE
++  const originalFetch = globalThis.fetch
++  let requests = 0
++  globalThis.fetch = (async () => { requests++; throw new Error('provider must not be contacted') }) as typeof fetch
++  try {
++    process.env.FREEBUFF_APPEND_INSTRUCTIONS_FILE = '/missing-private-instruction-canary'
++    for (let attempt = 0; attempt < 2; attempt++) {
++      resetCodebuffClient()
++      await expect(getCodebuffClient()).rejects.toBeInstanceOf(AppendInstructionsError)
++      delete process.env.FREEBUFF_APPEND_INSTRUCTIONS_FILE
++    }
++    expect(requests).toBe(0)
++  } finally {
++    globalThis.fetch = originalFetch
++    if (original === undefined) delete process.env.FREEBUFF_APPEND_INSTRUCTIONS_FILE
++    else process.env.FREEBUFF_APPEND_INSTRUCTIONS_FILE = original
++  }
++})
 diff --git a/cli/src/utils/append-instructions.test.ts b/cli/src/utils/append-instructions.test.ts
 new file mode 100644
-index 0000000000..4b555b19f0
+index 0000000000..607116b27d
 --- /dev/null
 +++ b/cli/src/utils/append-instructions.test.ts
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,63 @@
 +import { expect, test } from 'bun:test'
 +import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 +import { tmpdir } from 'node:os'
@@ -110,9 +183,29 @@ index 0000000000..4b555b19f0
 +    }
 +  } finally { await rm(dir, { recursive: true, force: true }) }
 +})
++
++
++test('growth after stat remains bounded and decoder/read failures close the descriptor', async () => {
++  for (const scenario of ['growth', 'decode', 'read'] as const) {
++    let closed = 0
++    const fakeOpen = (async () => ({
++      stat: async () => ({ isFile: () => true, size: 1 }),
++      read: async (buffer: Buffer, offset: number, length: number) => {
++        expect(length).toBeLessThanOrEqual(65537)
++        if (scenario === 'read') throw new Error('private path/content must disappear')
++        if (offset) return { bytesRead: 0 }
++        buffer.fill(scenario === 'decode' ? 255 : 65)
++        return { bytesRead: scenario === 'growth' ? 65537 : 1 }
++      },
++      close: async () => { closed++ },
++    })) as unknown as Parameters<typeof loadAppendInstructions>[1]
++    await expect(loadAppendInstructions('/private-canary', fakeOpen)).rejects.toBeInstanceOf(AppendInstructionsError)
++    expect(closed).toBe(1)
++  }
++})
 diff --git a/cli/src/utils/append-instructions.ts b/cli/src/utils/append-instructions.ts
 new file mode 100644
-index 0000000000..187f02333e
+index 0000000000..ae325145f5
 --- /dev/null
 +++ b/cli/src/utils/append-instructions.ts
 @@ -0,0 +1,47 @@
@@ -124,7 +217,7 @@ index 0000000000..187f02333e
 +export { AppendInstructionsError }
 +
 +/** POSIX file input. Never retain filesystem errors, paths or contents in errors. */
-+export async function loadAppendInstructions(path?: string): Promise<string | undefined> {
++export async function loadAppendInstructions(path?: string, openFile = open): Promise<string | undefined> {
 +  if (path === undefined) return undefined
 +  try {
 +    if (!['linux', 'darwin'].includes(process.platform) ||
@@ -132,7 +225,7 @@ index 0000000000..187f02333e
 +        !constants.O_NOFOLLOW || !constants.O_NONBLOCK) {
 +      throw new AppendInstructionsError()
 +    }
-+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
++    const file = await openFile(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
 +    try {
 +      const stat = await file.stat()
 +      if (!stat.isFile() || stat.size === 0 || stat.size > MAX_APPEND_INSTRUCTIONS_BYTES) {
@@ -279,10 +372,10 @@ index c89d151f1a..2b98bf179b 100644
      )
 diff --git a/sdk/src/__tests__/append-instructions.test.ts b/sdk/src/__tests__/append-instructions.test.ts
 new file mode 100644
-index 0000000000..3664855585
+index 0000000000..697a300cac
 --- /dev/null
 +++ b/sdk/src/__tests__/append-instructions.test.ts
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,69 @@
 +import { afterEach, expect, test } from 'bun:test'
 +import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 +import { tmpdir } from 'node:os'
@@ -337,6 +430,10 @@ index 0000000000..3664855585
 +  const compacted = await client.run({ agent: agent.id, prompt: '/compact', previousRun: second })
 +  expect(compacted.output.type).not.toBe('error')
 +  expect(compacted.sessionState!.fileContext.userKnowledgeFiles![APPEND_INSTRUCTIONS_KEY]).toBe(snapshot)
++  const afterCompact = await client.run({ agent: agent.id, prompt: 'After compact.', previousRun: compacted })
++  expect(afterCompact.output.type).not.toBe('error')
++  const compactSystem = JSON.stringify(requests.at(-1).messages.filter((m: any) => m.role === 'system'))
++  expect(compactSystem.split(snapshot)).toHaveLength(2)
 +  const before = requests.length
 +  for (const input of ['changed', '', '\0', 'a'.repeat(65537), '\ud800', null, 42]) {
 +    await expect(plainClient.run({ agent: agent.id, prompt: 'Continue.', previousRun: compacted, appendInstructions: input as string })).rejects.toBeInstanceOf(AppendInstructionsError)
@@ -349,14 +446,15 @@ index 0000000000..3664855585
 +  expect(defaultRun.sessionState!.fileContext.userKnowledgeFiles?.[APPEND_INSTRUCTIONS_KEY]).toBeUndefined()
 +})
 diff --git a/sdk/src/client.ts b/sdk/src/client.ts
-index 5440ba71b4..d9c080e1a1 100644
+index 5440ba71b4..ae3e0b2630 100644
 --- a/sdk/src/client.ts
 +++ b/sdk/src/client.ts
-@@ -67,6 +67,7 @@ export class CodebuffClient {
+@@ -67,6 +67,8 @@ export class CodebuffClient {
        // An omitted/undefined per-call config inherits the client snapshot.
        // run() enforces the history pin unless the host explicitly authorizes a switch.
        byok: options.byok ?? this.options.byok,
-+      appendInstructions: options.appendInstructions ?? this.options.appendInstructions,
++      appendInstructions: options.appendInstructions === undefined
++        ? this.options.appendInstructions : options.appendInstructions,
      })
    }
  
