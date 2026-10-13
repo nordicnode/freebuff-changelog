@@ -1,0 +1,379 @@
+diff --git a/common/src/types/session-state.ts b/common/src/types/session-state.ts
+index ef2d2088a..18a78d82c 100644
+--- a/common/src/types/session-state.ts
++++ b/common/src/types/session-state.ts
+@@ -34,50 +34,53 @@ export type AgentState = {
+   subagents: AgentState[]
+   childRunIds: string[]
+   messageHistory: Message[]
+   stepsRemaining: number
+   creditsUsed: number
+   directCreditsUsed: number
+   output?: Record<string, any>
+   parentId?: string
+   systemPrompt: string
+   toolDefinitions: Record<
+     string,
+     { description: string | undefined; inputSchema: {} }
+   >
+   /**
+    * Latest model call's reported input + output tokens, adjusted with cheap
+    * length estimates for subsequent tool results and history edits. Before a
+    * receipt (or after compaction/model change), entirely a length estimate.
+    * This is context occupancy, never accumulated/billed usage across calls.
+    */
+   contextTokenCount: number
+   /** Serializable anchor; old saved sessions safely fall back to estimation. */
+   contextTokenBaseline?: {
+     model: string
+     tokens: number
+     estimatedTokens: number
++    /** Provider input tokens per estimated token in that request. Content
++     *  added since is scaled by it; absent on older anchors (scale 1). */
++    scale?: number
+   }
+ }
+ 
+ export const AgentOutputSchema = z.discriminatedUnion('type', [
+   z.object({
+     type: z.literal('structuredOutput'),
+     value: z.record(z.string(), z.any()).or(z.null()),
+   }),
+   z.object({
+     type: z.literal('lastMessage'),
+     value: z.array(z.any()), // Array of assistant and tool messages from the last turn, including tool results
+   }),
+   z.object({
+     type: z.literal('allMessages'),
+     value: z.array(z.any()),
+   }),
+   z.object({
+     type: z.literal('error'),
+     message: z.string(),
+     statusCode: z.number().optional(),
+     error: z.string().optional(),
+     countryCode: z.string().optional(),
+     countryBlockReason: z.string().optional(),
+     ipPrivacySignals: z.array(z.string()).optional(),
+   }),
+diff --git a/packages/agent-runtime/src/util/__tests__/context-token-count.test.ts b/packages/agent-runtime/src/util/__tests__/context-token-count.test.ts
+index 0dd358f91..3c26124be 100644
+--- a/packages/agent-runtime/src/util/__tests__/context-token-count.test.ts
++++ b/packages/agent-runtime/src/util/__tests__/context-token-count.test.ts
+@@ -51,65 +51,115 @@ describe('provider-anchored context size', () => {
+       agentState,
+       model: params.model,
+       usage: receipt,
+       estimatedInputTokens,
+       estimatedOutputTokens: countTokensMessages([output]),
+     })
+     return params
+   }
+ 
+   test('uses actual input + output, without adding cached input twice', () => {
+     expect(estimateContextTokens(setup())).toBe(12_500)
+   })
+ 
+   test('adds fresh tool output and survives persistence and cancellation edits', () => {
+     const params = setup()
+     const result: Message = {
+       role: 'tool',
+       toolName: 'read_files',
+       toolCallId: 'r',
+       content: [
+         { type: 'json', value: { content: 'const x = 1;\n'.repeat(1000) } },
+       ],
+     }
+     const previousHistory = [...params.agentState.messageHistory]
+     params.agentState.messageHistory.push(result)
+-    const expected = 12_500 + countTokensMessages([result])
++    const scale = params.agentState.contextTokenBaseline!.scale!
++    const expected = Math.round(12_500 + countTokensMessages([result]) * scale)
+     expect(estimateContextTokens(params)).toBe(expected)
+     const persisted = JSON.parse(JSON.stringify(params.agentState))
+     expect(estimateContextTokens({ ...params, agentState: persisted })).toBe(
+       expected,
+     )
+     expect(
+       adjustContextTokenCountForHistoryEdit({
+         contextTokenCount: 12_500,
+         previousHistory,
+         nextHistory: persisted.messageHistory,
++        scale,
+       }),
+     ).toBe(expected)
+   })
+ 
++  test("scales what was added since the receipt by the receipt's input ratio", () => {
++    const agentState: Pick<
++      AgentState,
++      'messageHistory' | 'contextTokenCount' | 'contextTokenBaseline'
++    > = { messageHistory: [...HISTORY], contextTokenCount: 0 }
++    const params = {
++      agentState,
++      model: 'test-model',
++      systemPrompt: SYSTEM,
++      toolsForTokenCount: TOOLS,
++    }
++    const estimatedInputTokens = estimateContextTokens(params)
++    // The provider read the prompt at 1.4x the estimate, as Claude Haiku 5.5
++    // reads coding histories. Reasoning output must not move the ratio.
++    recordContextUsage({
++      agentState,
++      model: params.model,
++      usage: {
++        ...receipt,
++        inputTokens: Math.round(estimatedInputTokens * 1.4),
++        outputTokens: 5_000,
++      },
++      estimatedInputTokens,
++      estimatedOutputTokens: 0,
++    })
++    expect(agentState.contextTokenBaseline!.scale).toBeCloseTo(1.4, 2)
++    const before = estimateContextTokens(params)
++    const added = text('user', 'const x = 1;\n'.repeat(500))
++    agentState.messageHistory.push(added)
++    expect(estimateContextTokens(params) - before).toBeCloseTo(
++      countTokensMessages([added]) * 1.4,
++      -1,
++    )
++  })
++
++  test('clamps an implausible ratio, and an older anchor without one adds 1:1', () => {
++    const params = setup()
++    // setup()'s receipt is ~10x its tiny estimate: not a tokenizer.
++    expect(params.agentState.contextTokenBaseline!.scale).toBe(2.5)
++    const { scale: _, ...legacy } = params.agentState.contextTokenBaseline!
++    params.agentState.contextTokenBaseline = legacy
++    const added = text('user', 'more'.repeat(500))
++    params.agentState.messageHistory.push(added)
++    expect(estimateContextTokens(params)).toBe(
++      12_500 + countTokensMessages([added]),
++    )
++  })
++
+   test('does not use a different model’s receipt and forgets it after compaction', () => {
+     const params = setup()
+     const fallback = estimateContextTokens({
+       ...params,
+       model: 'another-model',
+     })
+     expect(fallback).not.toBe(12_500)
+     params.agentState.contextTokenBaseline = undefined
+     expect(estimateContextTokens(params)).toBe(fallback)
+   })
+ 
+   test('missing, zero, negative and non-finite receipts do not erase a valid anchor', () => {
+     const params = setup()
+     for (const inputTokens of [0, -1, NaN, Infinity]) {
+       recordContextUsage({
+         agentState: params.agentState,
+         model: params.model,
+         usage: { ...receipt, inputTokens },
+         estimatedInputTokens: 1,
+         estimatedOutputTokens: 1,
+       })
+       expect(estimateContextTokens(params)).toBe(12_500)
+     }
+   })
+ })
+diff --git a/packages/agent-runtime/src/util/context-token-count.ts b/packages/agent-runtime/src/util/context-token-count.ts
+index 5d60fe512..dacc9072d 100644
+--- a/packages/agent-runtime/src/util/context-token-count.ts
++++ b/packages/agent-runtime/src/util/context-token-count.ts
+@@ -1,103 +1,136 @@
+ import {
+   countTokens,
+   countTokensJson,
+   countTokensMessages,
+ } from './token-counter'
+ 
+ import type { Message } from '@codebuff/common/types/messages/codebuff-message'
+ import type { ModelUsageData } from '@codebuff/common/types/contracts/llm'
+ import type { AgentState } from '@codebuff/common/types/session-state'
+ 
+ /** The slice of AgentState this file needs, so the SDK and the step loop can
+  *  both call in without either owning the full type. */
+ type CountableAgentState = {
+   parentId?: string
+   messageHistory: Message[]
+   contextTokenCount: number
+   contextTokenBaseline?: AgentState['contextTokenBaseline']
+ }
+ 
++/**
++ * The calibration's bounds. The estimator is one tokenizer for every model;
++ * Claude Haiku 5.5 read ~1.4x it on coding histories (buffbench, 2026-10-12)
++ * and MiniMax up to ~2x (agents/base-chat.ts). A ratio outside this is a
++ * receipt the estimate cannot describe (images, a near-empty first prompt),
++ * not a tokenizer.
++ */
++const MIN_SCALE = 0.5
++const MAX_SCALE = 2.5
++
+ /**
+  * Latest receipt plus the estimated change since it. String lengths, not
+  * tokenization, keep startup/resume/missing-usage paths cheap even for long
+  * runs of repeated characters. A model switch invalidates the anchor.
++ *
++ * The change is scaled by the anchor's own provider-to-estimate ratio, so a
++ * model whose tokenizer reads code at 1.4x the estimate is not under-counted
++ * by 40% of everything added since the last request. That error was the
++ * margin a compaction threshold had to leave below a hard limit.
+  */
+ export function estimateContextTokens(params: {
+   agentState: CountableAgentState
+   systemPrompt: string
+   toolsForTokenCount: unknown
+   model?: string
+ }): number {
+   const { agentState, systemPrompt, toolsForTokenCount } = params
+   const estimatedTokens =
+     countTokensMessages(agentState.messageHistory) +
+     countTokens(systemPrompt) +
+     countTokensJson(toolsForTokenCount)
+   const baseline = agentState.contextTokenBaseline
+   if (!baseline || baseline.model !== params.model) return estimatedTokens
+-  const adjusted = baseline.tokens + estimatedTokens - baseline.estimatedTokens
++  const adjusted = Math.round(
++    baseline.tokens +
++      (estimatedTokens - baseline.estimatedTokens) * (baseline.scale ?? 1),
++  )
+   // A legacy/external rewrite can remove more estimated tokens than the
+   // provider ever counted. Fall back rather than calling that empty context.
+   return Number.isFinite(adjusted) && adjusted >= 0 ? adjusted : estimatedTokens
+ }
+ 
+ /** Record ONE call, never cumulative session usage. Cached input is already
+  * included in inputTokens. Tool output is excluded from the anchor's estimated
+  * size, so estimateContextTokens adds it on top of the provider's receipt. */
+ export function recordContextUsage(params: {
+   agentState: CountableAgentState
+   model: string
+   usage: ModelUsageData
+   estimatedInputTokens: number
+   estimatedOutputTokens: number
+ }): void {
+   const { usage, agentState } = params
+   if (
+     !Number.isFinite(usage.inputTokens) ||
+     usage.inputTokens <= 0 ||
+     !Number.isFinite(usage.outputTokens) ||
+     usage.outputTokens < 0
+   )
+     return // Missing/malformed usage must not reset a known context to zero.
++  // Input only: output tokens can include reasoning the next prompt never
++  // carries, which would read as a denser tokenizer than the model has.
++  const scale =
++    params.estimatedInputTokens > 0
++      ? Math.min(
++          MAX_SCALE,
++          Math.max(MIN_SCALE, usage.inputTokens / params.estimatedInputTokens),
++        )
++      : 1
+   agentState.contextTokenBaseline = {
+     model: params.model,
+     tokens: usage.inputTokens + usage.outputTokens,
+     estimatedTokens: params.estimatedInputTokens + params.estimatedOutputTokens,
++    scale,
+   }
+ }
+ 
+ /** Refresh the root's displayed context on success, error and cancellation,
+  * including the last response and tool results, without retokenizing history. */
+ export function recountContextTokens(
+   params: Parameters<typeof estimateContextTokens>[0],
+ ): number {
+   if (params.agentState.parentId) return params.agentState.contextTokenCount
+   return estimateContextTokens(params)
+ }
+ 
+ /**
+  * Carry `contextTokenCount` across a history edit made after the last recount.
+  *
+  * The persistence boundary edits history the runtime has already counted: the
+  * SDK drops unanswered tool calls and appends the cancellation / error message
+  * that a resumed run starts from. Leaving the count untouched persists a number
+  * that does not describe the history stored beside it.
+  *
+  * A difference rather than a recount, because the editor holds only the
+  * history: the system prompt and tool schemas are the other half of the number
+  * and are not in scope there. Applying the delta keeps that half exactly, and
+  * the estimate stays internally consistent.
+  */
+ export function adjustContextTokenCountForHistoryEdit(params: {
+   contextTokenCount: number
+   previousHistory: Message[]
+   nextHistory: Message[]
++  /** The anchor's calibration (`contextTokenBaseline.scale`), so this edit is
++   *  counted as estimateContextTokens would count it. */
++  scale?: number
+ }): number {
+   const { contextTokenCount, previousHistory, nextHistory } = params
+   if (previousHistory === nextHistory) return contextTokenCount
+-  const delta =
+-    countTokensMessages(nextHistory) - countTokensMessages(previousHistory)
++  const delta = Math.round(
++    (countTokensMessages(nextHistory) - countTokensMessages(previousHistory)) *
++      (params.scale ?? 1),
++  )
+   // A count carried in from before this shipped need not match its history at
+   // all; a negative token count would reach the composer as a negative chip.
+   return Math.max(0, contextTokenCount + delta)
+ }
+diff --git a/sdk/src/run.ts b/sdk/src/run.ts
+index add597e31..db7c4d09d 100644
+--- a/sdk/src/run.ts
++++ b/sdk/src/run.ts
+@@ -443,50 +443,51 @@ export function buildCancelledSessionState(params: {
+   const state = cloneSessionState(sessionState, logger)
+   const previousHistory = state.mainAgentState.messageHistory
+   // A checkpoint can land after an assistant tool call is recorded but before
+   // its result arrives. Drop that half-step at the persistence boundary so a
+   // resumed run starts from structurally valid history.
+   //
+   // Copied unconditionally: dropUnansweredToolCalls returns its input when
+   // there is nothing to drop, and the appends below must not reach the array
+   // `previousHistory` names.
+   const nextHistory = [...dropUnansweredToolCalls(previousHistory)]
+ 
+   if (!runtimeMadeProgress && promptMessage) {
+     nextHistory.push(promptMessage)
+   }
+   nextHistory.push({
+     role: 'user' as const,
+     content: [{ type: 'text' as const, text: withSystemTags(message) }],
+   })
+ 
+   state.mainAgentState.messageHistory = nextHistory
+   state.mainAgentState.contextTokenCount = adjustContextTokenCountForHistoryEdit(
+     {
+       contextTokenCount: state.mainAgentState.contextTokenCount,
+       previousHistory,
+       nextHistory,
++      scale: state.mainAgentState.contextTokenBaseline?.scale,
+     },
+   )
+   return state
+ }
+ 
+ const createAbortError = (signal?: AbortSignal) => {
+   if (signal?.reason instanceof Error) {
+     return signal.reason
+   }
+   const error = new Error('Aborted')
+   error.name = 'AbortError'
+   return error
+ }
+ 
+ type RunExecutionOptions = RunOptions &
+   CodebuffClientOptions & {
+     apiKey: string
+     fingerprintId: string
+   }
+ type RunReturnType = RunState
+ 
+ export async function run(options: RunExecutionOptions): Promise<RunState> {
+   const requestedInference = options.byok
+     ? { source: 'byok' as const, connectionId: options.byok.id, revision: options.byok.revision, model: options.byok.model }
+     : { source: 'codebuff' as const }
